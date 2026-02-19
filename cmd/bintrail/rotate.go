@@ -262,9 +262,9 @@ func addFuturePartitions(ctx context.Context, db *sql.DB, dbName string, startDa
 		d := startDate.AddDate(0, 0, i)
 		nextDay := d.AddDate(0, 0, 1)
 		parts = append(parts, fmt.Sprintf(
-			"PARTITION %s VALUES LESS THAN (UNIX_TIMESTAMP('%s'))",
+			"PARTITION %s VALUES LESS THAN (TO_DAYS('%s'))",
 			partitionName(d),
-			nextDay.UTC().Format("2006-01-02 15:04:05"),
+			nextDay.UTC().Format("2006-01-02"),
 		))
 	}
 	parts = append(parts, "PARTITION p_future VALUES LESS THAN MAXVALUE")

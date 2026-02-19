@@ -4,13 +4,20 @@ import (
 	"database/sql"
 	"fmt"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 // Connect opens and verifies a MySQL connection using the given DSN.
+// parseTime=true is always injected so DATETIME columns scan into time.Time.
 // The caller is responsible for closing the returned *sql.DB.
 func Connect(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("mysql", dsn)
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("invalid DSN: %w", err)
+	}
+	cfg.ParseTime = true
+
+	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open MySQL connection: %w", err)
 	}

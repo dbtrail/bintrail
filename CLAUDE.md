@@ -56,7 +56,7 @@ Flag variable naming convention: prefixed by command abbreviation (e.g. `idxInde
 - `pk_values` is a plain `VARCHAR(512)` — pipe-delimited PK values in ordinal order (e.g. `12345` or `12345|2`). NOT JSON.
 - `pk_hash = SHA2(pk_values, 256)` is a **generated stored column** — never insert it explicitly.
 - `row_before`, `row_after`, `changed_columns` are JSON columns.
-- Partitioned by `RANGE (UNIX_TIMESTAMP(event_timestamp))`.
+- Partitioned by `RANGE (TO_DAYS(event_timestamp))` — timezone-independent; `UNIX_TIMESTAMP()` is rejected by MySQL 8.0 when `time_zone=SYSTEM` (Error 1486).
 - Daily partitions named `p_YYYYMMDD`; catch-all is always `p_future VALUES LESS THAN MAXVALUE`.
 - **PK lookup pattern**: always use both `pk_hash = SHA2(?, 256)` (index scan) AND `pk_values = ?` (collision guard).
 
@@ -107,11 +107,14 @@ Pipe-delimited, with `|` → `\|` and `\` → `\\` escaping. See `BuildPKValues`
 - These two round-trip correctly and are tested in `rotate_test.go`.
 - To add partitions: `REORGANIZE PARTITION p_future INTO (... new partitions ..., PARTITION p_future VALUES LESS THAN MAXVALUE)`. Never leave out the new `p_future`.
 - To drop partitions: `ALTER TABLE … DROP PARTITION p1, p2` — single statement for multiple partitions.
-- `PARTITION_DESCRIPTION` in `information_schema.PARTITIONS` stores the evaluated integer UNIX timestamp (not the expression string) for RANGE partitions.
+- `PARTITION_DESCRIPTION` in `information_schema.PARTITIONS` stores the evaluated integer TO_DAYS value for named partitions and `MAXVALUE` for the catch-all. `descriptionToHuman` in `status.go` converts it back to a date via `time.Unix((days-719528)*86400, 0)` (since `TO_DAYS('1970-01-01') = 719528`).
 - `TABLE_ROWS` in `information_schema.PARTITIONS` is an **estimate** for InnoDB — good enough for status display, not for exact counts.
 
 ### Getting DB name from DSN
 Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent with `init.go`, `rotate.go`, `status.go`. Do not use `SELECT DATABASE()`.
+
+### parseTime=true in connections
+`config.Connect` always injects `parseTime=true` via `mysql.ParseDSN` → `cfg.ParseTime = true` → `cfg.FormatDSN()`. Without this, go-sql-driver returns DATETIME columns as `[]uint8` (raw bytes) instead of `time.Time`, causing scan errors. Do not use raw `sql.Open("mysql", dsn)` in commands that read DATETIME columns — always go through `config.Connect`.
 
 ### Recovery SQL generation
 - Events are reversed with `slices.Reverse(rows)` before generating SQL, so the most-recent event is undone first.

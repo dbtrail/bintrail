@@ -53,7 +53,7 @@ Read `CLAUDE.md` for a detailed map of the architecture, key patterns, and gotch
 
 - **Never insert `pk_hash` explicitly** — it is a generated stored column (`SHA2(pk_values, 256)`).
 - **PK lookups** must use both `pk_hash = SHA2(?, 256)` (for the index scan) and `pk_values = ?` (as a hash collision guard).
-- **Partitions**: the catch-all `p_future VALUES LESS THAN MAXVALUE` must always exist. When adding new partitions use `REORGANIZE PARTITION p_future INTO (... new partitions ..., PARTITION p_future VALUES LESS THAN MAXVALUE)`.
+- **Partitions**: partitioned by `RANGE (TO_DAYS(event_timestamp))` — use `TO_DAYS()`, not `UNIX_TIMESTAMP()` (MySQL 8.0 rejects timezone-dependent functions when `time_zone=SYSTEM`). The catch-all `p_future VALUES LESS THAN MAXVALUE` must always exist. When adding new partitions use `REORGANIZE PARTITION p_future INTO (... new partitions ..., PARTITION p_future VALUES LESS THAN MAXVALUE)`.
 - **`schema_snapshots`**: `snapshot_id` is a group identifier (shared by all rows of one snapshot), not the auto-increment row PK (`id`). `NewResolver(db, 0)` loads the latest snapshot.
 
 ### JSON and type handling

@@ -20,11 +20,12 @@ func TestDescriptionToHuman_maxvalue(t *testing.T) {
 	}
 }
 
-func TestDescriptionToHuman_unixTimestamp(t *testing.T) {
-	// Compute a known UNIX timestamp at runtime to avoid hardcoding year-sensitive values.
+func TestDescriptionToHuman_toDaysValue(t *testing.T) {
+	// Compute a known TO_DAYS value at runtime to avoid hardcoding date-sensitive values.
+	// TO_DAYS('1970-01-01') = 719528; any midnight-UTC date d has TO_DAYS = 719528 + d.Unix()/86400.
 	knownTime := time.Date(2026, 2, 20, 0, 0, 0, 0, time.UTC)
-	ts := strconv.FormatInt(knownTime.Unix(), 10)
-	got := descriptionToHuman(ts)
+	toDaysVal := int64(719528) + knownTime.Unix()/86400
+	got := descriptionToHuman(strconv.FormatInt(toDaysVal, 10))
 	if !strings.Contains(got, "2026-02-20") {
 		t.Errorf("expected 2026-02-20 in %q", got)
 	}
@@ -41,11 +42,11 @@ func TestDescriptionToHuman_unknownString(t *testing.T) {
 	}
 }
 
-func TestDescriptionToHuman_zero(t *testing.T) {
-	// UNIX timestamp 0 is 1970-01-01 — verify it doesn't crash.
-	got := descriptionToHuman("0")
+func TestDescriptionToHuman_unixEpoch(t *testing.T) {
+	// TO_DAYS('1970-01-01') = 719528 — verify the Unix epoch converts correctly.
+	got := descriptionToHuman("719528")
 	if !strings.Contains(got, "1970") {
-		t.Errorf("expected 1970 epoch in %q", got)
+		t.Errorf("expected 1970 in %q", got)
 	}
 }
 
@@ -139,9 +140,13 @@ func TestWriteStatus_withFiles(t *testing.T) {
 }
 
 func TestWriteStatus_withPartitions(t *testing.T) {
+	// Compute TO_DAYS values dynamically: TO_DAYS('1970-01-01') = 719528.
+	toDays := func(d time.Time) string {
+		return strconv.FormatInt(int64(719528)+d.Unix()/86400, 10)
+	}
 	parts := []partitionStat{
-		{Name: "p_20260218", Description: "1740009600", TableRows: 45000, Ordinal: 1},
-		{Name: "p_20260219", Description: "1740096000", TableRows: 3401, Ordinal: 2},
+		{Name: "p_20260218", Description: toDays(time.Date(2026, 2, 19, 0, 0, 0, 0, time.UTC)), TableRows: 45000, Ordinal: 1},
+		{Name: "p_20260219", Description: toDays(time.Date(2026, 2, 20, 0, 0, 0, 0, time.UTC)), TableRows: 3401, Ordinal: 2},
 		{Name: "p_future", Description: "MAXVALUE", TableRows: 0, Ordinal: 3},
 	}
 
