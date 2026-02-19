@@ -540,6 +540,121 @@ kubectl logs -n bintrail -l job-name=bintrail-index --tail=50
 
 > The `hostPath` volume gives the indexer read-only access to the MySQL server's binlog directory on the same node. If MySQL runs as a separate pod, replace `hostPath` with a shared `PersistentVolumeClaim`.
 
+## Deploying with Ansible
+
+A simple role that installs the binary, drops credentials into a protected env file, and wires up the systemd timers.
+
+**`roles/bintrail/defaults/main.yml`**
+```yaml
+bintrail_version: latest
+bintrail_install_dir: /usr/local/bin
+bintrail_user: mysql
+bintrail_binlog_dir: /var/lib/mysql
+bintrail_retain: 7d
+bintrail_add_future: 2
+bintrail_index_interval: 5min
+bintrail_rotate_time: "01:00:00"
+```
+
+**`roles/bintrail/tasks/main.yml`**
+```yaml
+- name: Download bintrail binary
+  ansible.builtin.get_url:
+    url: "https://github.com/bintrail/bintrail/releases/latest/download/bintrail-linux-amd64"
+    dest: "{{ bintrail_install_dir }}/bintrail"
+    mode: "0755"
+
+- name: Create config directory
+  ansible.builtin.file:
+    path: /etc/bintrail
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Write credentials env file
+  ansible.builtin.template:
+    src: env.j2
+    dest: /etc/bintrail/env
+    owner: root
+    group: "{{ bintrail_user }}"
+    mode: "0640"
+  notify: Restart bintrail timers
+
+- name: Install systemd units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+  loop:
+    - bintrail-index.service
+    - bintrail-index.timer
+    - bintrail-rotate.service
+    - bintrail-rotate.timer
+  notify: Reload systemd
+
+- name: Enable and start timers
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop:
+    - bintrail-index.timer
+    - bintrail-rotate.timer
+
+- name: Run init (idempotent — safe to re-run)
+  ansible.builtin.command:
+    cmd: >
+      {{ bintrail_install_dir }}/bintrail init
+      --index-dsn "{{ bintrail_index_dsn }}"
+  changed_when: false
+```
+
+**`roles/bintrail/templates/env.j2`**
+```ini
+INDEX_DSN={{ bintrail_index_dsn }}
+SOURCE_DSN={{ bintrail_source_dsn }}
+```
+
+**`roles/bintrail/handlers/main.yml`**
+```yaml
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart bintrail timers
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: restarted
+  loop:
+    - bintrail-index.timer
+    - bintrail-rotate.timer
+```
+
+**`playbook.yml`**
+```yaml
+- hosts: mysql_replicas
+  become: true
+  roles:
+    - bintrail
+  vars:
+    bintrail_index_dsn: "user:pass@tcp(index-db:3306)/binlog_index"
+    bintrail_source_dsn: "user:pass@tcp({{ inventory_hostname }}:3306)/"
+```
+
+```sh
+# Dry run first
+ansible-playbook playbook.yml --check --diff
+
+# Deploy
+ansible-playbook playbook.yml
+```
+
+> Store `bintrail_index_dsn` and `bintrail_source_dsn` in Ansible Vault rather than plaintext vars:
+> ```sh
+> ansible-vault encrypt_string 'user:pass@tcp(index-db:3306)/binlog_index' --name bintrail_index_dsn
+> ```
+
 ## How it works
 
 ```
