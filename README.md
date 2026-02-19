@@ -273,6 +273,90 @@ If your schema changes (ALTER TABLE, etc.), re-run `snapshot` manually or add it
   --index-dsn  "$INDEX_DSN" >> /var/log/bintrail-snapshot.log 2>&1
 ```
 
+## Automating with systemd
+
+An alternative to cron is a pair of systemd units: a service + timer for indexing, and a separate timer for nightly rotation.
+
+**`/etc/systemd/system/bintrail-index.service`**
+```ini
+[Unit]
+Description=Bintrail binlog indexer
+After=network.target
+
+[Service]
+Type=oneshot
+User=mysql
+EnvironmentFile=/etc/bintrail/env
+ExecStart=/usr/local/bin/bintrail index \
+  --index-dsn  "${INDEX_DSN}" \
+  --source-dsn "${SOURCE_DSN}" \
+  --binlog-dir /var/lib/mysql \
+  --all
+StandardOutput=journal
+StandardError=journal
+```
+
+**`/etc/systemd/system/bintrail-index.timer`**
+```ini
+[Unit]
+Description=Run bintrail indexer every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
+**`/etc/systemd/system/bintrail-rotate.service`**
+```ini
+[Unit]
+Description=Bintrail partition rotation
+After=network.target
+
+[Service]
+Type=oneshot
+User=mysql
+EnvironmentFile=/etc/bintrail/env
+ExecStart=/usr/local/bin/bintrail rotate \
+  --index-dsn "${INDEX_DSN}" \
+  --retain 7d \
+  --add-future 2
+StandardOutput=journal
+StandardError=journal
+```
+
+**`/etc/systemd/system/bintrail-rotate.timer`**
+```ini
+[Unit]
+Description=Run bintrail partition rotation nightly
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
+**`/etc/bintrail/env`** (mode `0600`)
+```sh
+INDEX_DSN=user:pass@tcp(127.0.0.1:3306)/binlog_index
+SOURCE_DSN=user:pass@tcp(source:3306)/
+```
+
+Enable and start:
+
+```sh
+systemctl daemon-reload
+systemctl enable --now bintrail-index.timer bintrail-rotate.timer
+
+# Check status
+systemctl list-timers 'bintrail-*'
+journalctl -u bintrail-index.service -f
+```
+
 ## How it works
 
 ```
