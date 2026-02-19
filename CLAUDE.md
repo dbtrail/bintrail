@@ -19,8 +19,12 @@ cmd/bintrail/          # One file per command + shared helpers in query.go
   recover.go           # bintrail recover
   rotate.go            # bintrail rotate + partition helpers
   status.go            # bintrail status
-  rotate_test.go       # Unit tests for rotate helpers
-  status_test.go       # Unit tests for status helpers
+  index_test.go        # Unit tests for binlogFileRe, buildIndexFilters, resolveFiles, findBinlogFiles
+  query_test.go        # Unit tests for parseEventType, parseQueryTime, isValidFormat
+  snapshot_test.go     # Unit tests for parseSchemaList
+  rotate_test.go       # Unit tests for parseRetain, partitionDate, partitionName, nextPartitionStart
+  status_test.go       # Unit tests for descriptionToHuman, truncate, writeStatus
+  cmd_integration_test.go  # Integration tests (//go:build integration) for all DB helpers
 
 internal/
   config/config.go     # config.Connect(dsn) — opens and pings *sql.DB
@@ -29,6 +33,10 @@ internal/
   indexer/             # Batch writer to binlog_events
   query/               # Query engine + result formatters (table/json/csv)
   recovery/            # Reversal SQL generator
+  testutil/testutil.go # Shared test helpers: CreateTestDB, InitIndexTables, SkipIfNoMySQL, etc.
+
+e2e_test.go            # E2E integration test (//go:build integration) — exercises full CLI pipeline
+                       # Built with `go build -cover` for binary coverage instrumentation
 
 migrations/
   001_create_tables.sql  # Reference DDL (tables are created by `bintrail init`, not this file)
@@ -134,12 +142,50 @@ Use `any` instead of `interface{}` everywhere.
 
 ## Testing conventions
 
-- All tests are unit tests — no live DB required.
-- Recovery tests use `newGen()` helper: `func newGen() *Generator { return New(nil, nil) }` — nil DB and nil resolver triggers the all-columns WHERE fallback.
+### Test tiers
+
+There are three tiers of tests:
+
+1. **Unit tests** (no build tag) — run with `go test ./...`. No live DB required. Cover pure functions, formatting, SQL shape, regex matching, etc.
+2. **Integration tests** (`//go:build integration`) — run with `go test -tags integration ./...`. Require a Docker MySQL container named `bintrail-test-mysql` on port 13306 (user `root`, password `testroot`). Each test creates and drops its own database via `testutil.CreateTestDB`.
+3. **E2E test** (`e2e_test.go`, `//go:build integration`) — builds the `bintrail` binary with `go build -cover` and exercises the full CLI pipeline (init → snapshot → index → query → recover → status → rotate) as subprocesses. Coverage data is captured via `GOCOVERDIR` and converted with `go tool covdata textfmt`.
+
+### Running tests
+
+```bash
+# Unit tests only (no Docker needed)
+go test ./... -count=1
+
+# Full suite including integration tests (requires Docker MySQL)
+go test -tags integration ./... -count=1
+
+# E2E test only (shows binary coverage summary)
+go test -tags integration -run TestEndToEnd -v .
+
+# Full suite with coverage report
+go test -tags integration -coverprofile=cover.out ./... -count=1
+go tool cover -func=cover.out
+```
+
+### Test infrastructure
+
+- **`internal/testutil`** — shared helpers for integration tests:
+  - `SkipIfNoMySQL(t)` — gracefully skips if Docker MySQL is unreachable
+  - `CreateTestDB(t)` — creates a uniquely-named database with automatic cleanup via `t.Cleanup`
+  - `InitIndexTables(t, db)` — creates `binlog_events` (with only `p_future`), `schema_snapshots`, and `index_state`
+  - `InsertEvent(t, db, ...)` / `InsertSnapshot(t, db, ...)` — insert test data directly
+  - `MustExec(t, db, query)` — exec or fatal
+  - `SnapshotDSN(dbName)` / `IntegrationDSN(dbName)` — DSN builders for test databases
+
+### Conventions
+
+- Recovery unit tests use `newGen()` helper: `func newGen() *Generator { return New(nil, nil) }` — nil DB and nil resolver triggers the all-columns WHERE fallback.
 - `assertSQL(t, stmt, want)` helper checks `strings.Contains` for SQL fragments.
 - Do not hardcode UNIX timestamps for specific dates in tests — compute them with `time.Date(...).Unix()` to avoid year-sensitive failures.
 - `assertContains(t, s, want)` is the equivalent helper in `status_test.go`.
 - Test files in `cmd/bintrail/` are `package main` and can access all unexported helpers directly.
+- Integration test files use the `_integration_test.go` suffix and have `//go:build integration` at the top.
+- Every integration test calls `testutil.SkipIfNoMySQL(t)` or `testutil.CreateTestDB(t)` (which calls `SkipIfNoMySQL` internally) as its first action.
 
 ## Dependencies
 
