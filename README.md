@@ -238,6 +238,41 @@ Files:  2 completed, 0 in_progress, 0 failed
 Events: 21246 indexed
 ```
 
+## Automating with cron
+
+A typical setup runs two cron jobs: one to continuously index new binlog files, and one nightly rotation to drop old partitions and extend the partition range.
+
+```cron
+# /etc/cron.d/bintrail
+
+INDEX_DSN="user:pass@tcp(127.0.0.1:3306)/binlog_index"
+SOURCE_DSN="user:pass@tcp(source:3306)/"
+
+# Index new binlog files every 5 minutes
+*/5 * * * * root bintrail index \
+  --index-dsn  "$INDEX_DSN" \
+  --source-dsn "$SOURCE_DSN" \
+  --binlog-dir /var/lib/mysql \
+  --all >> /var/log/bintrail-index.log 2>&1
+
+# Nightly: drop partitions older than 7 days, add 2 new future ones
+0 1 * * * root bintrail rotate \
+  --index-dsn "$INDEX_DSN" \
+  --retain 7d \
+  --add-future 2 >> /var/log/bintrail-rotate.log 2>&1
+```
+
+The `index` command skips files already marked `completed`, so running it frequently is safe — it only processes new or unfinished files.
+
+If your schema changes (ALTER TABLE, etc.), re-run `snapshot` manually or add it to the cron schedule:
+
+```cron
+# Re-snapshot schema metadata every night before rotation
+55 0 * * * root bintrail snapshot \
+  --source-dsn "$SOURCE_DSN" \
+  --index-dsn  "$INDEX_DSN" >> /var/log/bintrail-snapshot.log 2>&1
+```
+
 ## How it works
 
 ```
