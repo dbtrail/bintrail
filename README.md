@@ -357,6 +357,82 @@ systemctl list-timers 'bintrail-*'
 journalctl -u bintrail-index.service -f
 ```
 
+## Running with Docker
+
+**`Dockerfile`**
+```dockerfile
+FROM golang:1.25-alpine AS builder
+WORKDIR /src
+COPY . .
+RUN go build -o /bintrail ./cmd/bintrail
+
+FROM alpine:3.21
+COPY --from=builder /bintrail /usr/local/bin/bintrail
+ENTRYPOINT ["bintrail"]
+```
+
+```sh
+docker build -t bintrail .
+```
+
+**One-off commands:**
+```sh
+docker run --rm \
+  -e INDEX_DSN="user:pass@tcp(host:3306)/binlog_index" \
+  bintrail init --index-dsn "$INDEX_DSN"
+
+docker run --rm \
+  bintrail status --index-dsn "user:pass@tcp(host:3306)/binlog_index"
+```
+
+**Continuous indexer with Docker Compose:**
+
+**`compose.yml`**
+```yaml
+services:
+  bintrail-index:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /var/lib/mysql:/var/lib/mysql:ro
+    command: >
+      sh -c "while true; do
+        bintrail index
+          --index-dsn  $$INDEX_DSN
+          --source-dsn $$SOURCE_DSN
+          --binlog-dir /var/lib/mysql
+          --all;
+        sleep 300;
+      done"
+
+  bintrail-rotate:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: >
+      sh -c "while true; do
+        sleep 86400;
+        bintrail rotate
+          --index-dsn $$INDEX_DSN
+          --retain 7d
+          --add-future 2;
+      done"
+```
+
+**`.env`** (not committed to version control)
+```sh
+INDEX_DSN=user:pass@tcp(host:3306)/binlog_index
+SOURCE_DSN=user:pass@tcp(source:3306)/
+```
+
+```sh
+docker compose up -d
+docker compose logs -f bintrail-index
+```
+
+> The binlog directory is mounted read-only. Bintrail never writes to or modifies the source binlog files.
+
 ## How it works
 
 ```
