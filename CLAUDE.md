@@ -40,6 +40,9 @@ e2e_test.go            # E2E integration test (//go:build integration) — exerc
 
 migrations/
   001_create_tables.sql  # Reference DDL (tables are created by `bintrail init`, not this file)
+
+docs/
+  guide.md             # Practical DBA guide — scenario walkthroughs + troubleshooting FAQ
 ```
 
 ## Commands
@@ -125,6 +128,7 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent w
 `config.Connect` always injects `parseTime=true` via `mysql.ParseDSN` → `cfg.ParseTime = true` → `cfg.FormatDSN()`. Without this, go-sql-driver returns DATETIME columns as `[]uint8` (raw bytes) instead of `time.Time`, causing scan errors. Do not use raw `sql.Open("mysql", dsn)` in commands that read DATETIME columns — always go through `config.Connect`.
 
 ### Recovery SQL generation
+- `recover` only generates SQL (`--dry-run` to stdout, `--output` to file) — it never executes against the source database. Application is always a manual step.
 - Events are reversed with `slices.Reverse(rows)` before generating SQL, so the most-recent event is undone first.
 - `pkWhereClause` uses resolver PK columns when available; falls back to `allColsWhere` (all columns) when resolver is nil or table not found. This is always correct for tables with no duplicate rows.
 - Resolver is loaded best-effort in the `recover` command — a failure logs a warning and proceeds with the all-columns fallback.
@@ -196,6 +200,11 @@ go tool cover -func=cover.out
 | `github.com/spf13/cobra` | CLI framework |
 
 Transitive deps pulled in by go-mysql: shopspring/decimal, pingcap/errors, pingcap/tidb, google/uuid, klauspost/compress, zap, etc. These are indirect — don't import them directly.
+
+## Documentation
+
+- `README.md` — project overview + Quick Start (line 56 links to `docs/guide.md` for the full DBA walkthrough)
+- `docs/guide.md` — scenario-driven guide: initial setup, daily rotation, point-in-time recovery, multi-table recovery, troubleshooting FAQ
 
 ## Common gotchas
 
