@@ -433,6 +433,113 @@ docker compose logs -f bintrail-index
 
 > The binlog directory is mounted read-only. Bintrail never writes to or modifies the source binlog files.
 
+## Running on Kubernetes
+
+Credentials are stored in a Secret. The indexer runs as a CronJob every 5 minutes; rotation runs nightly.
+
+**`bintrail-secret.yaml`**
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bintrail-dsn
+  namespace: bintrail
+type: Opaque
+stringData:
+  index-dsn:  "user:pass@tcp(mysql-index:3306)/binlog_index"
+  source-dsn: "user:pass@tcp(mysql-source:3306)/"
+```
+
+**`bintrail-index.yaml`** — indexes new binlog files every 5 minutes
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: bintrail-index
+  namespace: bintrail
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: bintrail
+              image: bintrail:latest
+              args:
+                - index
+                - --index-dsn=$(INDEX_DSN)
+                - --source-dsn=$(SOURCE_DSN)
+                - --binlog-dir=/var/lib/mysql
+                - --all
+              env:
+                - name: INDEX_DSN
+                  valueFrom:
+                    secretKeyRef:
+                      name: bintrail-dsn
+                      key: index-dsn
+                - name: SOURCE_DSN
+                  valueFrom:
+                    secretKeyRef:
+                      name: bintrail-dsn
+                      key: source-dsn
+              volumeMounts:
+                - name: binlog
+                  mountPath: /var/lib/mysql
+                  readOnly: true
+          volumes:
+            - name: binlog
+              hostPath:
+                path: /var/lib/mysql
+                type: Directory
+```
+
+**`bintrail-rotate.yaml`** — rotates partitions nightly
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: bintrail-rotate
+  namespace: bintrail
+spec:
+  schedule: "0 1 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: bintrail
+              image: bintrail:latest
+              args:
+                - rotate
+                - --index-dsn=$(INDEX_DSN)
+                - --retain=7d
+                - --add-future=2
+              env:
+                - name: INDEX_DSN
+                  valueFrom:
+                    secretKeyRef:
+                      name: bintrail-dsn
+                      key: index-dsn
+```
+
+```sh
+kubectl create namespace bintrail
+kubectl apply -f bintrail-secret.yaml
+kubectl apply -f bintrail-index.yaml
+kubectl apply -f bintrail-rotate.yaml
+
+# Check recent runs
+kubectl get jobs -n bintrail
+kubectl logs -n bintrail -l job-name=bintrail-index --tail=50
+```
+
+> The `hostPath` volume gives the indexer read-only access to the MySQL server's binlog directory on the same node. If MySQL runs as a separate pod, replace `hostPath` with a shared `PersistentVolumeClaim`.
+
 ## How it works
 
 ```
