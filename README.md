@@ -576,4 +576,4 @@ The index stores the complete before and after row images for every event, so re
 
 ## License
 
-MIT
+Apache 2.0 — see [LICENSE](LICENSE) for the full text.
