@@ -1,0 +1,259 @@
+//go:build integration
+
+package main_test
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/bintrail/bintrail/internal/testutil"
+)
+
+// TestEndToEnd_fullPipeline exercises the bintrail binary through all commands:
+// init → snapshot → index → query → recover → status → rotate.
+//
+// The binary is built with -cover so that running it with GOCOVERDIR captures
+// coverage across process boundaries (Go 1.20+). After the pipeline completes,
+// the raw coverage data is converted to Go's standard text format and the
+// output directory is logged so callers can merge it.
+//
+// It requires:
+//   - Docker container "bintrail-test-mysql" running on port 13306
+//   - go build must succeed
+func TestEndToEnd_fullPipeline(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	// ── 1. Build the bintrail binary with coverage instrumentation ──────────
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "bintrail")
+	build := exec.Command("go", "build", "-cover", "-o", binPath, "./cmd/bintrail")
+	build.Dir = projectRoot(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build -cover failed: %v\n%s", err, out)
+	}
+
+	// Create a directory for binary coverage data.
+	coverDir := filepath.Join(tmpDir, "covdata")
+	if err := os.MkdirAll(coverDir, 0755); err != nil {
+		t.Fatalf("failed to create coverage dir: %v", err)
+	}
+
+	// ── 2. Create test databases ─────────────────────────────────────────────
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	_, indexName := testutil.CreateTestDB(t)
+
+	indexDSN := testutil.SnapshotDSN(indexName)
+	sourceDSN := testutil.SnapshotDSN(sourceName)
+
+	// ── 3. bintrail init ─────────────────────────────────────────────────────
+	run(t, binPath, coverDir, "init", "--index-dsn", indexDSN, "--partitions", "7")
+
+	// ── 4. Create source table ───────────────────────────────────────────────
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id       INT PRIMARY KEY AUTO_INCREMENT,
+		customer VARCHAR(100) NOT NULL,
+		status   VARCHAR(20)  NOT NULL DEFAULT 'new',
+		amount   DECIMAL(10,2) NOT NULL
+	)`)
+
+	// ── 5. bintrail snapshot ─────────────────────────────────────────────────
+	run(t, binPath, coverDir, "snapshot",
+		"--source-dsn", sourceDSN,
+		"--index-dsn", indexDSN,
+		"--schemas", sourceName,
+	)
+
+	// ── 6. Flush to get a clean binlog boundary, then generate DML ──────
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+
+	// Note the current binlog file (the one that will receive our DML).
+	var currentBinlog, ignorePos, ignoreBinDo, ignoreBinIgn, ignoreGtid string
+	if err := sourceDB.QueryRow("SHOW MASTER STATUS").Scan(
+		&currentBinlog, &ignorePos, &ignoreBinDo, &ignoreBinIgn, &ignoreGtid,
+	); err != nil {
+		t.Fatalf("SHOW MASTER STATUS failed: %v", err)
+	}
+
+	testutil.MustExec(t, sourceDB, "INSERT INTO orders (customer, status, amount) VALUES ('Alice', 'new', 99.99)")
+	testutil.MustExec(t, sourceDB, "INSERT INTO orders (customer, status, amount) VALUES ('Bob', 'new', 50.00)")
+	testutil.MustExec(t, sourceDB, "INSERT INTO orders (customer, status, amount) VALUES ('Charlie', 'new', 75.00)")
+	testutil.MustExec(t, sourceDB, "UPDATE orders SET status = 'shipped', amount = 109.99 WHERE customer = 'Alice'")
+	testutil.MustExec(t, sourceDB, "DELETE FROM orders WHERE customer = 'Charlie'")
+
+	// Flush again to seal the binlog file.
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+
+	// ── 7. Copy only the relevant binlog file from container ─────────────
+	binlogDir := filepath.Join(tmpDir, "binlogs")
+	os.MkdirAll(binlogDir, 0755)
+
+	cpCmd := exec.Command("docker", "cp",
+		fmt.Sprintf("bintrail-test-mysql:/var/lib/mysql/%s", currentBinlog),
+		filepath.Join(binlogDir, currentBinlog),
+	)
+	if out, err := cpCmd.CombinedOutput(); err != nil {
+		t.Fatalf("docker cp %s failed: %v\n%s", currentBinlog, err, out)
+	}
+
+	// ── 8. bintrail index (only the specific binlog file) ────────────────
+	run(t, binPath, coverDir, "index",
+		"--index-dsn", indexDSN,
+		"--source-dsn", sourceDSN,
+		"--binlog-dir", binlogDir,
+		"--files", currentBinlog,
+		"--schemas", sourceName,
+	)
+
+	// ── 9. bintrail query ────────────────────────────────────────────────────
+	queryOut := run(t, binPath, coverDir, "query",
+		"--index-dsn", indexDSN,
+		"--schema", sourceName,
+		"--table", "orders",
+		"--format", "json",
+		"--limit", "100",
+	)
+
+	var events []map[string]any
+	if err := json.Unmarshal([]byte(queryOut), &events); err != nil {
+		t.Fatalf("failed to parse query JSON output: %v\n%s", err, queryOut)
+	}
+	// Should have 5 events: 3 INSERTs + 1 UPDATE + 1 DELETE.
+	if len(events) != 5 {
+		t.Errorf("expected 5 events, got %d", len(events))
+		for i, e := range events {
+			t.Logf("  event[%d]: type=%v schema=%v table=%v pk=%v",
+				i, e["event_type"], e["schema_name"], e["table_name"], e["pk_values"])
+		}
+	}
+
+	// Count by type.
+	typeCounts := map[string]int{}
+	for _, e := range events {
+		if et, ok := e["event_type"].(string); ok {
+			typeCounts[et]++
+		}
+	}
+	if typeCounts["INSERT"] != 3 {
+		t.Errorf("expected 3 INSERTs, got %d", typeCounts["INSERT"])
+	}
+	if typeCounts["UPDATE"] != 1 {
+		t.Errorf("expected 1 UPDATE, got %d", typeCounts["UPDATE"])
+	}
+	if typeCounts["DELETE"] != 1 {
+		t.Errorf("expected 1 DELETE, got %d", typeCounts["DELETE"])
+	}
+
+	// ── 10. bintrail recover (DELETE → INSERT) ──────────────────────────────
+	recoverDeleteOut := run(t, binPath, coverDir, "recover",
+		"--index-dsn", indexDSN,
+		"--schema", sourceName,
+		"--table", "orders",
+		"--event-type", "DELETE",
+		"--dry-run",
+	)
+	if !strings.Contains(recoverDeleteOut, "INSERT INTO") {
+		t.Error("expected INSERT INTO in delete recovery output")
+	}
+	if !strings.Contains(recoverDeleteOut, "Charlie") {
+		t.Errorf("expected Charlie's data in recovery output:\n%s", recoverDeleteOut)
+	}
+
+	// ── 11. bintrail recover (UPDATE → reverse) ─────────────────────────────
+	recoverUpdateOut := run(t, binPath, coverDir, "recover",
+		"--index-dsn", indexDSN,
+		"--schema", sourceName,
+		"--table", "orders",
+		"--event-type", "UPDATE",
+		"--pk", "1",
+		"--dry-run",
+	)
+	if !strings.Contains(recoverUpdateOut, "UPDATE") {
+		t.Error("expected UPDATE in update recovery output")
+	}
+	// Should restore original values (before image).
+	if !strings.Contains(recoverUpdateOut, "'new'") {
+		t.Errorf("expected original status 'new' in recovery:\n%s", recoverUpdateOut)
+	}
+
+	// ── 12. bintrail status ──────────────────────────────────────────────────
+	statusOut := run(t, binPath, coverDir, "status", "--index-dsn", indexDSN)
+	if !strings.Contains(statusOut, "=== Indexed Files ===") {
+		t.Error("expected 'Indexed Files' section in status")
+	}
+	if !strings.Contains(statusOut, "completed") {
+		t.Errorf("expected 'completed' status in output:\n%s", statusOut)
+	}
+	if !strings.Contains(statusOut, "=== Partitions ===") {
+		t.Error("expected 'Partitions' section in status")
+	}
+
+	// ── 13. bintrail rotate ──────────────────────────────────────────────────
+	rotateOut := run(t, binPath, coverDir, "rotate",
+		"--index-dsn", indexDSN,
+		"--add-future", "3",
+	)
+	if !strings.Contains(rotateOut, "partition") || !strings.Contains(strings.ToLower(rotateOut), "added") ||
+		(!strings.Contains(rotateOut, "3") && !strings.Contains(rotateOut, "partition")) {
+		// Just check that it ran without error — exact output may vary.
+		t.Logf("rotate output: %s", rotateOut)
+	}
+
+	// ── 14. Convert binary coverage data to text format ──────────────────────
+	covOut := filepath.Join(tmpDir, "cover_e2e.out")
+	conv := exec.Command("go", "tool", "covdata", "textfmt", "-i="+coverDir, "-o="+covOut)
+	if out, err := conv.CombinedOutput(); err != nil {
+		t.Logf("warning: covdata textfmt failed (non-fatal): %v\n%s", err, out)
+	} else {
+		t.Logf("E2E binary coverage written to: %s", covOut)
+		// Log summary percentages.
+		pct := exec.Command("go", "tool", "covdata", "percent", "-i="+coverDir)
+		if pctOut, err := pct.CombinedOutput(); err == nil {
+			t.Logf("E2E coverage summary:\n%s", pctOut)
+		}
+	}
+
+	t.Log("E2E pipeline completed successfully")
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// run executes the bintrail binary with args and returns stdout.
+// It fails the test if the command exits with a non-zero status.
+// When coverDir is non-empty, GOCOVERDIR is set so the instrumented binary
+// writes coverage data on exit.
+func run(t *testing.T, binPath, coverDir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(binPath, args...)
+	if coverDir != "" {
+		cmd.Env = append(os.Environ(), "GOCOVERDIR="+coverDir)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("bintrail %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+// projectRoot finds the project root by looking for go.mod.
+func projectRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("could not find go.mod in any parent directory")
+		}
+		dir = parent
+	}
+}

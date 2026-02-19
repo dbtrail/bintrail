@@ -1,6 +1,9 @@
 package parser
 
 import (
+	"bytes"
+	"log"
+	"os"
 	"testing"
 
 	"github.com/bintrail/bintrail/internal/metadata"
@@ -117,5 +120,126 @@ func TestFormatGTID_shortSID(t *testing.T) {
 	got := formatGTID([]byte{0x01, 0x02}, 1)
 	if got != "" {
 		t.Errorf("expected empty string for short SID, got %q", got)
+	}
+}
+
+// ─── Filters.Matches ─────────────────────────────────────────────────────────
+
+func TestFilters_Matches_noFilters(t *testing.T) {
+	f := Filters{} // both nil → accept all
+	if !f.Matches("any_schema", "any_table") {
+		t.Error("expected match with no filters")
+	}
+}
+
+func TestFilters_Matches_schemaAccept(t *testing.T) {
+	f := Filters{Schemas: map[string]bool{"mydb": true}}
+	if !f.Matches("mydb", "orders") {
+		t.Error("expected match for schema mydb")
+	}
+}
+
+func TestFilters_Matches_schemaReject(t *testing.T) {
+	f := Filters{Schemas: map[string]bool{"mydb": true}}
+	if f.Matches("other", "orders") {
+		t.Error("expected reject for schema other")
+	}
+}
+
+func TestFilters_Matches_tableAccept(t *testing.T) {
+	f := Filters{Tables: map[string]bool{"mydb.orders": true}}
+	if !f.Matches("mydb", "orders") {
+		t.Error("expected match for table mydb.orders")
+	}
+}
+
+func TestFilters_Matches_tableReject(t *testing.T) {
+	f := Filters{Tables: map[string]bool{"mydb.orders": true}}
+	if f.Matches("mydb", "items") {
+		t.Error("expected reject for table mydb.items")
+	}
+}
+
+func TestFilters_Matches_bothFilters(t *testing.T) {
+	f := Filters{
+		Schemas: map[string]bool{"mydb": true},
+		Tables:  map[string]bool{"mydb.orders": true},
+	}
+	// Both match
+	if !f.Matches("mydb", "orders") {
+		t.Error("expected match for mydb.orders with both filters")
+	}
+	// Schema matches but table doesn't
+	if f.Matches("mydb", "items") {
+		t.Error("expected reject: schema matches but table doesn't")
+	}
+	// Neither matches
+	if f.Matches("other", "orders") {
+		t.Error("expected reject: schema doesn't match")
+	}
+}
+
+// ─── warnOnDDL ────────────────────────────────────────────────────────────────
+
+func TestWarnOnDDL_ddlStatements(t *testing.T) {
+	// warnOnDDL uses log.Printf. Capture output via log.SetOutput.
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	origFlags := log.Flags()
+	log.SetFlags(0)
+	defer log.SetFlags(origFlags)
+
+	ddlStmts := []string{
+		"ALTER TABLE orders ADD COLUMN foo INT",
+		"CREATE TABLE new_tbl (id INT)",
+		"DROP TABLE old_tbl",
+		"TRUNCATE orders",
+		"RENAME TABLE a TO b",
+	}
+	for _, stmt := range ddlStmts {
+		buf.Reset()
+		warnOnDDL("binlog.000001", 100, stmt)
+		if buf.Len() == 0 {
+			t.Errorf("expected warning for DDL %q, got none", stmt)
+		}
+	}
+}
+
+func TestWarnOnDDL_nonDDL(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	origFlags := log.Flags()
+	log.SetFlags(0)
+	defer log.SetFlags(origFlags)
+
+	nonDDL := []string{
+		"BEGIN",
+		"COMMIT",
+		"INSERT INTO orders VALUES (1)",
+		"UPDATE orders SET status = 'done'",
+		"SELECT 1",
+	}
+	for _, stmt := range nonDDL {
+		buf.Reset()
+		warnOnDDL("binlog.000001", 100, stmt)
+		if buf.Len() != 0 {
+			t.Errorf("expected no warning for non-DDL %q, got: %s", stmt, buf.String())
+		}
+	}
+}
+
+func TestWarnOnDDL_caseInsensitive(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	origFlags := log.Flags()
+	log.SetFlags(0)
+	defer log.SetFlags(origFlags)
+
+	warnOnDDL("binlog.000001", 100, "alter table orders add column x int")
+	if buf.Len() == 0 {
+		t.Error("expected warning for lowercase DDL")
 	}
 }

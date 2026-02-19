@@ -2,7 +2,9 @@ package recovery
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -333,5 +335,109 @@ func TestGenerateSQL_noEventsMessage(t *testing.T) {
 	fmt.Fprintln(&buf, "-- No events matched the specified criteria.")
 	if !strings.Contains(buf.String(), "No events matched") {
 		t.Error("expected no-events message")
+	}
+}
+
+// ─── formatValue edge cases ──────────────────────────────────────────────────
+
+func TestFormatValue_arraySlice(t *testing.T) {
+	// JSON array column: []any should be serialised as a quoted JSON array.
+	val := []any{"a", float64(1), true}
+	got := formatValue(val)
+	if !strings.HasPrefix(got, "'") || !strings.HasSuffix(got, "'") {
+		t.Errorf("expected single-quoted JSON array, got %q", got)
+	}
+	if !strings.Contains(got, `"a"`) {
+		t.Errorf("expected array element 'a' in %q", got)
+	}
+}
+
+func TestFormatValue_jsonRawMessage(t *testing.T) {
+	raw := json.RawMessage(`{"key":"value"}`)
+	got := formatValue(raw)
+	if !strings.HasPrefix(got, "'") || !strings.HasSuffix(got, "'") {
+		t.Errorf("expected quoted JSON, got %q", got)
+	}
+	if !strings.Contains(got, "key") {
+		t.Errorf("expected JSON content in %q", got)
+	}
+}
+
+func TestFormatValue_largeFloat(t *testing.T) {
+	// float64 >= 1e15 takes the FormatFloat path (not int64 conversion).
+	// FormatFloat('f', -1) for exact whole numbers still omits the decimal,
+	// so the output looks like an integer — the guard is about int64 overflow
+	// safety, not about output format.
+	got := formatValue(float64(1e15))
+	if got != "1000000000000000" {
+		t.Errorf("expected 1000000000000000, got %q", got)
+	}
+}
+
+func TestFormatValue_veryLargeFloat(t *testing.T) {
+	// 1e18 exceeds the int64 guard but is representable in float64.
+	got := formatValue(float64(1e18))
+	if got != "1000000000000000000" {
+		t.Errorf("expected 1000000000000000000, got %q", got)
+	}
+}
+
+func TestFormatValue_beyondInt64Range(t *testing.T) {
+	// 1e19 is beyond int64 max (~9.2e18). The guard prevents int64 overflow;
+	// FormatFloat handles it correctly.
+	got := formatValue(float64(1e19))
+	if got == "" {
+		t.Error("expected non-empty result for 1e19")
+	}
+	// Should not panic — the value is too large for int64 but FormatFloat
+	// handles it safely.
+}
+
+func TestFormatValue_infinity(t *testing.T) {
+	got := formatValue(math.Inf(1))
+	if got == "NULL" {
+		t.Errorf("expected float format for +Inf, got %q", got)
+	}
+	// Should not panic — just format somehow.
+}
+
+func TestFormatValue_nan(t *testing.T) {
+	got := formatValue(math.NaN())
+	if got == "NULL" {
+		t.Errorf("expected float format for NaN, got %q", got)
+	}
+}
+
+func TestFormatValue_negativeZero(t *testing.T) {
+	got := formatValue(math.Copysign(0, -1))
+	// -0 == 0, so Trunc(-0) == -0, and -0 == -0. math.Abs(-0) = 0 < 1e15.
+	// It should format as "0" (integer format).
+	if got != "0" {
+		t.Errorf("expected '0' for negative zero, got %q", got)
+	}
+}
+
+// ─── escapeString edge cases ─────────────────────────────────────────────────
+
+func TestEscapeString_nullByte(t *testing.T) {
+	got := escapeString("hello\x00world")
+	if !strings.Contains(got, `\0`) {
+		t.Errorf("expected \\0 for null byte, got %q", got)
+	}
+	if strings.Contains(got, "\x00") {
+		t.Errorf("raw null byte should be replaced, got %q", got)
+	}
+}
+
+func TestEscapeString_combined(t *testing.T) {
+	got := escapeString("it's a \\path\x00end")
+	if !strings.Contains(got, `\'`) {
+		t.Errorf("expected escaped quote in %q", got)
+	}
+	if !strings.Contains(got, `\\`) {
+		t.Errorf("expected escaped backslash in %q", got)
+	}
+	if !strings.Contains(got, `\0`) {
+		t.Errorf("expected escaped null in %q", got)
 	}
 }

@@ -246,6 +246,25 @@ func TestWriteJSON_structure(t *testing.T) {
 
 // ─── writeCSV ─────────────────────────────────────────────────────────────────
 
+func TestBuildQuery_gtidFilter(t *testing.T) {
+	opts := Options{GTID: "3e11fa47-71ca-11e1-9e33-c80aa9429562:42", Limit: 10}
+	q, args := buildQuery(opts)
+
+	if !strings.Contains(q, "gtid = ?") {
+		t.Errorf("expected gtid = ? in query: %s", q)
+	}
+	found := false
+	for _, a := range args {
+		if a == "3e11fa47-71ca-11e1-9e33-c80aa9429562:42" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected GTID string in args, got %v", args)
+	}
+}
+
 func TestWriteCSV_headersAndRow(t *testing.T) {
 	ts := time.Date(2026, 2, 19, 14, 0, 1, 0, time.UTC)
 	rows := []ResultRow{{
