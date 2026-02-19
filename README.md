@@ -53,6 +53,8 @@ bintrail recover \
   --output recovery.sql
 ```
 
+> **New to bintrail?** See the [Practical Guide for DBAs](docs/guide.md) for scenario-based walkthroughs and troubleshooting.
+
 ## Commands
 
 ### `bintrail init`
