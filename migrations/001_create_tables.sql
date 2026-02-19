@@ -29,17 +29,17 @@ CREATE TABLE IF NOT EXISTS binlog_events (
     INDEX idx_gtid       (gtid),
     INDEX idx_file_pos   (binlog_file, start_pos)
 ) ENGINE=InnoDB
-  PARTITION BY RANGE (UNIX_TIMESTAMP(event_timestamp)) (
+  PARTITION BY RANGE (TO_DAYS(event_timestamp)) (
     -- Daily partitions are created by `bintrail init --partitions N`.
     -- The naming convention is p_YYYYMMDD; each partition holds events
-    -- with timestamps before midnight of the following day.
+    -- with event_timestamp < the following day. TO_DAYS() is timezone-independent.
     -- Example (7 days from 2026-02-19):
-    --   PARTITION p_20260219 VALUES LESS THAN (1740009600),
-    --   PARTITION p_20260220 VALUES LESS THAN (1740096000),
+    --   PARTITION p_20260219 VALUES LESS THAN (TO_DAYS('2026-02-20')),
+    --   PARTITION p_20260220 VALUES LESS THAN (TO_DAYS('2026-02-21')),
     --   ...
-    --   PARTITION p_20260225 VALUES LESS THAN (1740528000),
+    --   PARTITION p_20260225 VALUES LESS THAN (TO_DAYS('2026-02-26')),
     PARTITION p_future VALUES LESS THAN MAXVALUE
-);
+  );
 
 -- Query pattern for PK lookup (always use both columns to guard hash collisions):
 --   SELECT * FROM binlog_events

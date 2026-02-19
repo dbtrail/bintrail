@@ -213,16 +213,17 @@ func writeStatus(w io.Writer, files []indexStateRow, parts []partitionStat) {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 // descriptionToHuman converts a PARTITION_DESCRIPTION value to a readable string.
-// RANGE partitions using UNIX_TIMESTAMP() store the evaluated integer; MAXVALUE is literal.
+// RANGE partitions using TO_DAYS() store the evaluated integer day count; MAXVALUE is literal.
+// TO_DAYS('1970-01-01') = 719528, so we convert back via: time.Unix((days-719528)*86400, 0).
 func descriptionToHuman(desc string) string {
 	if desc == "" || strings.EqualFold(desc, "MAXVALUE") {
 		return "MAXVALUE"
 	}
-	ts, err := strconv.ParseInt(desc, 10, 64)
+	days, err := strconv.ParseInt(desc, 10, 64)
 	if err != nil {
 		return desc // not an integer — return raw value
 	}
-	return time.Unix(ts, 0).UTC().Format(statusTSFmt + " UTC")
+	return time.Unix((days-719528)*86400, 0).UTC().Format("2006-01-02 UTC")
 }
 
 // truncate shortens s to at most n bytes, appending "…" if truncated.

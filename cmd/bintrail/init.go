@@ -111,9 +111,9 @@ func ensureDatabase(cfg *mysql.Config, dbName string) error {
 // createBinlogEventsTable generates the CREATE TABLE with N daily partitions
 // starting from today (UTC), plus a p_future catch-all partition.
 //
-// Each partition pYYYYMMDD holds events where UNIX_TIMESTAMP(event_timestamp)
-// is less than midnight of the following day. The p_future partition catches
-// any events beyond the last pre-created partition.
+// Each partition p_YYYYMMDD holds events where TO_DAYS(event_timestamp)
+// is less than TO_DAYS of the following day (timezone-independent boundary).
+// The p_future partition catches any events beyond the last pre-created partition.
 func createBinlogEventsTable(db *sql.DB, numPartitions int) error {
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 
@@ -122,9 +122,9 @@ func createBinlogEventsTable(db *sql.DB, numPartitions int) error {
 		day := today.AddDate(0, 0, i)
 		nextDay := day.AddDate(0, 0, 1)
 		parts = append(parts, fmt.Sprintf(
-			"    PARTITION p_%s VALUES LESS THAN (%d)",
+			"    PARTITION p_%s VALUES LESS THAN (TO_DAYS('%s'))",
 			day.Format("20060102"),
-			nextDay.Unix(),
+			nextDay.UTC().Format("2006-01-02"),
 		))
 	}
 	parts = append(parts, "    PARTITION p_future VALUES LESS THAN MAXVALUE")
@@ -150,7 +150,7 @@ func createBinlogEventsTable(db *sql.DB, numPartitions int) error {
     INDEX idx_gtid       (gtid),
     INDEX idx_file_pos   (binlog_file, start_pos)
 ) ENGINE=InnoDB
-  PARTITION BY RANGE (UNIX_TIMESTAMP(event_timestamp)) (
+  PARTITION BY RANGE (TO_DAYS(event_timestamp)) (
 ` + strings.Join(parts, ",\n") + `
 )`
 
