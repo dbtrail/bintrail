@@ -232,15 +232,23 @@ func sendNotification(t *testing.T, w io.Writer, method string, params any) {
 	}
 }
 
+// readResponse reads lines until it finds a JSON-RPC response (has an "id"
+// field). Notifications (no "id") are silently skipped since the server may
+// send them asynchronously between responses.
 func readResponse(t *testing.T, r *bufio.Reader) map[string]any {
 	t.Helper()
-	line, err := r.ReadString('\n')
-	if err != nil {
-		t.Fatalf("read response: %v", err)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		var msg map[string]any
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			t.Fatalf("parse response JSON: %v\nline: %s", err, line)
+		}
+		// Notifications have no "id" field — skip them.
+		if _, hasID := msg["id"]; hasID {
+			return msg
+		}
 	}
-	var result map[string]any
-	if err := json.Unmarshal([]byte(line), &result); err != nil {
-		t.Fatalf("parse response JSON: %v\nline: %s", err, line)
-	}
-	return result
 }
