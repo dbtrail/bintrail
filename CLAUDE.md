@@ -19,10 +19,13 @@ cmd/bintrail/          # One file per command
   recover.go           # bintrail recover
   rotate.go            # bintrail rotate + partition helpers
   status.go            # bintrail status
+  stream.go            # bintrail stream (live replication indexing)
   index_test.go        # Unit tests for binlogFileRe, buildIndexFilters, resolveFiles, findBinlogFiles
   snapshot_test.go     # Unit tests for parseSchemaList
   rotate_test.go       # Unit tests for parseRetain, partitionDate, partitionName, nextPartitionStart
-  cmd_integration_test.go  # Integration tests (//go:build integration) for all DB helpers
+  stream_test.go       # Unit tests for parseSourceDSN, resolveStart
+  cmd_integration_test.go             # Integration tests (//go:build integration) for all DB helpers
+  stream_integration_test.go          # Integration tests for stream_state, streamLoop
 
 cmd/bintrail-mcp/      # MCP server (query, recover, status as read-only tools)
   main.go              # Server entry point + newServer() + tool handlers + buildQueryOptions
@@ -34,7 +37,7 @@ internal/
   cliutil/cliutil.go   # Shared filter parsers: ParseEventType, ParseTime, IsValidFormat
   config/config.go     # config.Connect(dsn) — opens and pings *sql.DB
   metadata/            # Schema snapshot loader and resolver
-  parser/              # Binlog file parser (go-mysql-org/go-mysql)
+  parser/              # Binlog file parser + StreamParser (go-mysql-org/go-mysql)
   indexer/             # Batch writer to binlog_events
   query/               # Query engine + result formatters (table/json/csv)
   recovery/            # Reversal SQL generator
@@ -64,8 +67,9 @@ docs/
 | `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000) |
 | `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future` |
 | `status` | `status.go` | `--index-dsn` (req) |
+| `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint` |
 
-Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `stIndexDSN`).
+Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `stIndexDSN`, `strmIndexDSN`).
 
 Filter helpers (`ParseEventType`, `ParseTime`, `IsValidFormat`) live in `internal/cliutil` and are shared by both `cmd/bintrail/` commands and `cmd/bintrail-mcp/`.
 
@@ -107,7 +111,17 @@ Project-level registration via `.mcp.json` uses `go run ./cmd/bintrail-mcp` — 
 - Tracks per-file indexing progress. Status: `in_progress`, `completed`, `failed`.
 - `INSERT … ON DUPLICATE KEY UPDATE` pattern for upserts (see `upsertFileState` in `index.go`).
 
+### `stream_state`
+- Single-row table (id=1, enforced by `CHECK (id = 1)`) tracking live replication position.
+- `mode`: `"position"` (file+pos) or `"gtid"` (GTID set string).
+- `INSERT … ON DUPLICATE KEY UPDATE` via `saveCheckpoint` in `stream.go` for atomic upserts.
+- Saved on a ticker (default 10s) and on graceful shutdown (SIGINT/SIGTERM).
+- In GTID mode, `gtid_set` is the full **accumulated** executed set (not just the latest single GTID), so resuming passes the full set to `syncer.StartSyncGTID`.
+- `loadStreamState` returns `nil` for an empty table — callers treat nil as "no checkpoint yet".
+
 ## Architecture: indexer pipeline
+
+### File-based (`bintrail index`)
 
 Parser and indexer run concurrently to avoid buffering entire binlog files in memory:
 
@@ -123,6 +137,22 @@ ParseFile goroutine ──► events chan ──► idx.Run (main goroutine)
 - If the indexer fails, it calls `cancel()` so the parser's `ctx.Done()` fires and it stops sending. This prevents deadlock.
 - After `idx.Run` returns, the main goroutine reads from `parseErrCh`.
 - `errors.Is(parseErr, context.Canceled)` distinguishes real parse errors from cancellation.
+
+### Replication-based (`bintrail stream`)
+
+`StreamParser` and `streamLoop` run in separate goroutines, connected via the same `chan parser.Event`:
+
+```
+StreamParser goroutine ──► events chan ──► streamLoop (main goroutine)
+     │                                           │
+     └──► parseErrCh (buffered, size 1)         │
+                                                 │ ticker → checkpoint
+                                                 │ SIGINT/SIGTERM → cancel()
+```
+
+- `StreamParser.Run` calls `streamer.GetEvent(ctx)` which blocks until an event arrives.
+- `streamLoop` uses a `time.Ticker` for periodic checkpoints rather than relying on `idx.Run`; this requires the exported `idx.InsertBatch` and `idx.BatchSize` methods.
+- Both `Parser` (file-based) and `StreamParser` share the package-level `handleRows`, `emitInserts`, `emitDeletes`, `emitUpdates` functions in `internal/parser/parser.go`.
 
 ## Key implementation details
 
@@ -151,6 +181,11 @@ Pipe-delimited, with `|` → `\|` and `\` → `\\` escaping. See `BuildPKValues`
 
 ### Getting DB name from DSN
 Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent with `init.go`, `rotate.go`, `status.go`. Do not use `SELECT DATABASE()`.
+
+### Dual MySQL imports in stream.go
+`stream.go` needs both `github.com/go-mysql-org/go-mysql/mysql` (for `Position`, `GTIDSet`, `MysqlGTIDSet`) and `github.com/go-sql-driver/mysql` (for `ParseDSN`). They are aliased:
+- `gomysql "github.com/go-mysql-org/go-mysql/mysql"` (used more heavily)
+- `drivermysql "github.com/go-sql-driver/mysql"` (only for `drivermysql.ParseDSN`)
 
 ### parseTime=true in connections
 `config.Connect` always injects `parseTime=true` via `mysql.ParseDSN` → `cfg.ParseTime = true` → `cfg.FormatDSN()`. Without this, go-sql-driver returns DATETIME columns as `[]uint8` (raw bytes) instead of `time.Time`, causing scan errors. Do not use raw `sql.Open("mysql", dsn)` in commands that read DATETIME columns — always go through `config.Connect`.

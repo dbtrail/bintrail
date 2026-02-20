@@ -118,7 +118,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			warnOnDDL(filename, binlogEv.Header.LogPos, string(ev.Query))
 
 		case *replication.RowsEvent:
-			return p.handleRowsEvent(ctx, binlogEv, ev, filename, currentGTID, events)
+			return handleRows(ctx, p.resolver, &p.filters, binlogEv, ev, filename, currentGTID, events)
 		}
 		return nil
 	})
@@ -128,8 +128,12 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 
 // ─── Row event handler ────────────────────────────────────────────────────────
 
-func (p *Parser) handleRowsEvent(
+// handleRows processes a RowsEvent, resolving column names and dispatching to
+// the appropriate emit function. It is shared by Parser.ParseFile and StreamParser.Run.
+func handleRows(
 	ctx context.Context,
+	resolver *metadata.Resolver,
+	filters *Filters,
 	binlogEv *replication.BinlogEvent,
 	rowsEv *replication.RowsEvent,
 	filename, currentGTID string,
@@ -138,11 +142,11 @@ func (p *Parser) handleRowsEvent(
 	schema := string(rowsEv.Table.Schema)
 	table := string(rowsEv.Table.Table)
 
-	if !p.filters.Matches(schema, table) {
+	if !filters.Matches(schema, table) {
 		return nil
 	}
 
-	tm, err := p.resolver.Resolve(schema, table)
+	tm, err := resolver.Resolve(schema, table)
 	if err != nil {
 		// Table not in snapshot — warn and skip all rows for this event.
 		log.Printf("WARNING [%s pos %d]: %v — skipping", filename, binlogEv.Header.LogPos, err)
@@ -169,24 +173,25 @@ func (p *Parser) handleRowsEvent(
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2:
-		return p.emitInserts(ctx, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
+		return emitInserts(ctx, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
 
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2:
-		return p.emitDeletes(ctx, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
+		return emitDeletes(ctx, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
 
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
 		replication.UPDATE_ROWS_EVENTv2:
-		return p.emitUpdates(ctx, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
+		return emitUpdates(ctx, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
 	}
 
 	return nil
 }
 
-func (p *Parser) emitInserts(
+func emitInserts(
 	ctx context.Context,
+	resolver *metadata.Resolver,
 	rows [][]any,
 	schema, table, filename, gtid string,
 	startPos, endPos uint64,
@@ -195,7 +200,7 @@ func (p *Parser) emitInserts(
 	out chan<- Event,
 ) error {
 	for _, row := range rows {
-		named, err := p.resolver.MapRow(schema, table, row)
+		named, err := resolver.MapRow(schema, table, row)
 		if err != nil {
 			log.Printf("WARNING: failed to map INSERT row for %s.%s: %v — skipping row", schema, table, err)
 			continue
@@ -216,8 +221,9 @@ func (p *Parser) emitInserts(
 	return nil
 }
 
-func (p *Parser) emitDeletes(
+func emitDeletes(
 	ctx context.Context,
+	resolver *metadata.Resolver,
 	rows [][]any,
 	schema, table, filename, gtid string,
 	startPos, endPos uint64,
@@ -226,7 +232,7 @@ func (p *Parser) emitDeletes(
 	out chan<- Event,
 ) error {
 	for _, row := range rows {
-		named, err := p.resolver.MapRow(schema, table, row)
+		named, err := resolver.MapRow(schema, table, row)
 		if err != nil {
 			log.Printf("WARNING: failed to map DELETE row for %s.%s: %v — skipping row", schema, table, err)
 			continue
@@ -247,8 +253,9 @@ func (p *Parser) emitDeletes(
 	return nil
 }
 
-func (p *Parser) emitUpdates(
+func emitUpdates(
 	ctx context.Context,
+	resolver *metadata.Resolver,
 	rows [][]any,
 	schema, table, filename, gtid string,
 	startPos, endPos uint64,
@@ -259,12 +266,12 @@ func (p *Parser) emitUpdates(
 	// go-mysql delivers UPDATE rows as interleaved before/after pairs:
 	//   rows[0]=before0, rows[1]=after0, rows[2]=before1, rows[3]=after1, ...
 	for i := 0; i+1 < len(rows); i += 2 {
-		before, err := p.resolver.MapRow(schema, table, rows[i])
+		before, err := resolver.MapRow(schema, table, rows[i])
 		if err != nil {
 			log.Printf("WARNING: failed to map UPDATE before-row for %s.%s: %v — skipping row", schema, table, err)
 			continue
 		}
-		after, err := p.resolver.MapRow(schema, table, rows[i+1])
+		after, err := resolver.MapRow(schema, table, rows[i+1])
 		if err != nil {
 			log.Printf("WARNING: failed to map UPDATE after-row for %s.%s: %v — skipping row", schema, table, err)
 			continue

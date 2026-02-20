@@ -65,6 +65,18 @@ func (idx *Indexer) Run(ctx context.Context, events <-chan parser.Event) (int64,
 	}
 }
 
+// InsertBatch writes a batch of events and returns the count of rows inserted.
+// This exported method allows callers (e.g. the stream command) that need
+// manual checkpoint control between batches.
+func (idx *Indexer) InsertBatch(batch []parser.Event) (int64, error) {
+	return idx.insertBatch(batch)
+}
+
+// BatchSize returns the configured batch size.
+func (idx *Indexer) BatchSize() int {
+	return idx.batchSize
+}
+
 // insertBatch writes a batch of events in a single multi-row INSERT.
 // event_id and pk_hash are omitted — they are AUTO_INCREMENT and STORED
 // generated respectively, so MySQL computes them on write.
