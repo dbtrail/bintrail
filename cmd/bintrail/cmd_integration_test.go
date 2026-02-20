@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/bintrail/bintrail/internal/status"
 	"github.com/bintrail/bintrail/internal/testutil"
 )
 
@@ -217,7 +218,7 @@ func TestLoadIndexState(t *testing.T) {
 		(binlog_file, file_size, last_position, events_indexed, status, started_at, error_message)
 		VALUES ('binlog.000002', 2048, 512, 50, 'failed', '2026-01-01 01:00:00', 'timeout')`)
 
-	rows, err := loadIndexState(context.Background(), db)
+	rows, err := status.LoadIndexState(context.Background(), db)
 	if err != nil {
 		t.Fatalf("loadIndexState failed: %v", err)
 	}
@@ -250,7 +251,7 @@ func TestLoadPartitionStats(t *testing.T) {
 		t.Fatalf("createBinlogEventsTable failed: %v", err)
 	}
 
-	stats, err := loadPartitionStats(context.Background(), db, dbName)
+	stats, err := status.LoadPartitionStats(context.Background(), db, dbName)
 	if err != nil {
 		t.Fatalf("loadPartitionStats failed: %v", err)
 	}
