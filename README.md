@@ -33,7 +33,7 @@ bintrail snapshot \
   --source-dsn "user:pass@tcp(source:3306)/" \
   --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 
-# 3. Index binlog files
+# 3. Index binlog files (requires access to /var/lib/mysql on the source host)
 bintrail index \
   --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
   --source-dsn "user:pass@tcp(source:3306)/" \
@@ -52,6 +52,8 @@ bintrail recover \
   --since "2026-02-19 14:00:00" --until "2026-02-19 14:05:00" \
   --output recovery.sql
 ```
+
+> **Managed MySQL (RDS, Aurora, Cloud SQL)?** Use [`bintrail stream`](#bintrail-stream) instead of `bintrail index` — it connects over the replication protocol and requires no access to binlog files on disk.
 
 > **New to bintrail?** See the [Practical Guide for DBAs](docs/guide.md) for scenario-based walkthroughs and troubleshooting.
 
@@ -97,6 +99,54 @@ Flags:
   --schemas      Only index events from these schemas (comma-separated)
   --tables       Only index these tables (e.g. mydb.orders,mydb.items)
 ```
+
+### `bintrail stream`
+
+Connects to a MySQL server as a replica over the replication protocol and indexes binlog row events in real-time into `binlog_events`. Unlike `bintrail index`, this command does not require access to binlog files on disk — it works with managed MySQL (RDS, Aurora, Cloud SQL).
+
+On the **first run**, provide a starting position via `--start-file` or `--start-gtid`. On **subsequent runs**, the saved checkpoint in `stream_state` is resumed automatically.
+
+Send `SIGINT` or `SIGTERM` to flush the current batch and write a checkpoint before exiting.
+
+```
+Flags:
+  --index-dsn    DSN for the index database (required)
+  --source-dsn   DSN for the source MySQL server (required)
+  --server-id    Unique replica server ID (required; must not conflict with any real server)
+  --start-file   Initial binlog file for the first run (mutually exclusive with --start-gtid)
+  --start-pos    Initial position within start file (default: 4)
+  --start-gtid   Initial GTID set for the first run (mutually exclusive with --start-file)
+  --batch-size   Events per batch INSERT (default: 1000)
+  --schemas      Only index events from these schemas (comma-separated)
+  --tables       Only index these tables (e.g. mydb.orders,mydb.items)
+  --checkpoint   Checkpoint interval in seconds (default: 10)
+```
+
+Examples:
+
+```sh
+# Start from a known binlog position (first run on self-managed MySQL)
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "user:pass@tcp(source:3306)/" \
+  --server-id  99999 \
+  --start-file binlog.000042
+
+# Start from a GTID set (typical for managed MySQL / replicas with GTIDs enabled)
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "rdsuser:pass@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
+  --server-id  99999 \
+  --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-1000000"
+
+# Resume automatically — no start flags needed after the first run
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "user:pass@tcp(source:3306)/" \
+  --server-id  99999
+```
+
+> **Server ID**: choose any integer not used by the source server or its existing replicas. Check with `SHOW SLAVE HOSTS` on the source.
 
 ### `bintrail query`
 
@@ -593,10 +643,17 @@ Source MySQL            Index MySQL
 Binlog files on disk ──index──►   binlog_events (partitioned)
                                   index_state
                                         │
+Replication stream   ──stream──►  binlog_events (partitioned)
+                                  stream_state (checkpoint)
+                                        │
                           query / recover ──► stdout / .sql file
 ```
 
 The index stores the complete before and after row images for every event, so recovery never requires the original binlog files.
+
+**`bintrail index`** reads binlog files directly from disk — best for self-managed MySQL where the binlog directory is accessible.
+
+**`bintrail stream`** connects as a replica over the network replication protocol — best for managed MySQL (RDS, Aurora, Cloud SQL) where binlog files are not directly accessible.
 
 **Primary key lookup** uses a generated `pk_hash = SHA2(pk_values, 256)` column for the index scan, with `pk_values` as an exact-match collision guard. Composite PKs are stored as pipe-delimited strings in column ordinal order (e.g. `12345|2`).
 
@@ -608,7 +665,8 @@ The index stores the complete before and after row images for every event, so re
 |---|---|
 | `binlog_events` | All indexed row events, range-partitioned by `event_timestamp` |
 | `schema_snapshots` | Table/column metadata from `information_schema` at snapshot time |
-| `index_state` | Per-file indexing progress and status |
+| `index_state` | Per-file indexing progress and status (`bintrail index`) |
+| `stream_state` | Single-row checkpoint for live replication position (`bintrail stream`) |
 
 ## License
 

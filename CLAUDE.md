@@ -23,9 +23,9 @@ cmd/bintrail/          # One file per command
   index_test.go        # Unit tests for binlogFileRe, buildIndexFilters, resolveFiles, findBinlogFiles
   snapshot_test.go     # Unit tests for parseSchemaList
   rotate_test.go       # Unit tests for parseRetain, partitionDate, partitionName, nextPartitionStart
-  stream_test.go       # Unit tests for parseSourceDSN, resolveStart
+  stream_test.go       # Unit tests for parseSourceDSN, resolveStart, GTID accumulation, cobra wiring
   cmd_integration_test.go             # Integration tests (//go:build integration) for all DB helpers
-  stream_integration_test.go          # Integration tests for stream_state, streamLoop
+  stream_integration_test.go          # Integration tests for stream_state persistence and streamLoop behaviour
 
 cmd/bintrail-mcp/      # MCP server (query, recover, status as read-only tools)
   main.go              # Server entry point + newServer() + tool handlers + buildQueryOptions
@@ -234,7 +234,7 @@ go test -tags integration -coverprofile=cover.out ./... -count=1
 go tool cover -func=cover.out
 ```
 
-### Coverage baseline (as of PR #3)
+### Coverage baseline (as of stream test suite)
 
 Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 
@@ -244,16 +244,16 @@ Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 | `internal/config` | 91% |
 | `internal/recovery` | 92% |
 | `internal/query` | 91% |
-| `internal/indexer` | 90% |
+| `internal/indexer` | 86% |
 | `cmd/bintrail-mcp` | 90% |
 | `internal/metadata` | 83% |
-| `internal/parser` | 81% |
+| `internal/parser` | 82% |
 | `internal/status` | 68% |
-| `cmd/bintrail` | 42% |
-| **total** | **65%** |
+| `cmd/bintrail` | 45% |
+| **total** | **63%** |
 
 **Known gaps and why:**
-- `cmd/bintrail` `run*` handlers (42%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). Unit + integration tests cover all helpers.
+- `cmd/bintrail` `run*` handlers (45%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). `runStream` is included in this gap. Unit + integration tests cover all helpers.
 - `internal/status` `LoadIndexState`/`LoadPartitionStats` (0% in cover.out): called through the MCP/CLI handlers which run as subprocesses; `WriteStatus`/`DescriptionToHuman` are 100%.
 - `cmd/bintrail-mcp` `main()` (0%): the stdio entry point is intentionally excluded — exercised by `TestMCPE2E`.
 
@@ -301,3 +301,4 @@ Transitive deps pulled in by go-mysql: shopspring/decimal, pingcap/errors, pingc
 - **Column count mismatch**: when a TABLE_MAP_EVENT's column count differs from the snapshot, the indexer logs a warning and skips that table's events — it does not fail.
 - **`p_future` must always exist**: never drop it. `REORGANIZE PARTITION` always recreates it at the end.
 - **`schema_snapshots` snapshot_id ≠ row id**: a common source of confusion. `snapshot_id` groups all rows of one snapshot; `id` is the auto-increment row primary key.
+- **go-mysql lowercases GTID UUIDs**: `MysqlGTIDSet.String()` always returns lowercase UUIDs (e.g. `3e11fa47-...`). Tests comparing GTID strings must use lowercase or `strings.ToLower` — never uppercase UUID literals.
