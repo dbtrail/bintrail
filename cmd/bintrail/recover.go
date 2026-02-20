@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
 	"github.com/bintrail/bintrail/internal/metadata"
 	"github.com/bintrail/bintrail/internal/query"
@@ -84,15 +85,15 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Parse filter values ───────────────────────────────────────────────────
-	eventType, err := parseEventType(rEventType) // defined in query.go
+	eventType, err := cliutil.ParseEventType(rEventType)
 	if err != nil {
 		return err
 	}
-	since, err := parseQueryTime(rSince) // defined in query.go
+	since, err := cliutil.ParseTime(rSince)
 	if err != nil {
 		return fmt.Errorf("--since: %w", err)
 	}
-	until, err := parseQueryTime(rUntil)
+	until, err := cliutil.ParseTime(rUntil)
 	if err != nil {
 		return fmt.Errorf("--until: %w", err)
 	}
