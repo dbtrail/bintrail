@@ -199,6 +199,29 @@ go test -tags integration -coverprofile=cover.out ./... -count=1
 go tool cover -func=cover.out
 ```
 
+### Coverage baseline (as of PR #3)
+
+Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
+
+| Package | Coverage |
+|---|---|
+| `internal/cliutil` | 100% |
+| `internal/config` | 91% |
+| `internal/recovery` | 92% |
+| `internal/query` | 91% |
+| `internal/indexer` | 90% |
+| `cmd/bintrail-mcp` | 90% |
+| `internal/metadata` | 83% |
+| `internal/parser` | 81% |
+| `internal/status` | 68% |
+| `cmd/bintrail` | 42% |
+| **total** | **65%** |
+
+**Known gaps and why:**
+- `cmd/bintrail` `run*` handlers (42%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). Unit + integration tests cover all helpers.
+- `internal/status` `LoadIndexState`/`LoadPartitionStats` (0% in cover.out): called through the MCP/CLI handlers which run as subprocesses; `WriteStatus`/`DescriptionToHuman` are 100%.
+- `cmd/bintrail-mcp` `main()` (0%): the stdio entry point is intentionally excluded — exercised by `TestMCPE2E`.
+
 ### Test infrastructure
 
 - **`internal/testutil`** — shared helpers for integration tests:
