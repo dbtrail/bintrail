@@ -6,7 +6,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -328,5 +330,286 @@ func TestStreamLoop_liveReplication(t *testing.T) {
 	}
 	if loaded == nil {
 		t.Fatal("expected checkpoint to be saved after streaming")
+	}
+}
+
+// ─── streamLoop — additional behaviour ───────────────────────────────────────
+
+// TestStreamLoop_contextCancel verifies that cancelling the context causes
+// streamLoop to flush the in-flight batch and write a checkpoint before returning.
+func TestStreamLoop_contextCancel(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	idx := indexer.New(db, 100) // large batch — events stay in batch until cancel
+
+	events := make(chan parser.Event, 10)
+	ts := time.Now().UTC()
+
+	// Enqueue 2 events but do NOT close the channel — simulates an active stream.
+	for i := range 2 {
+		events <- parser.Event{
+			BinlogFile: "binlog.000001",
+			StartPos:   uint64(i * 100),
+			EndPos:     uint64((i + 1) * 100),
+			Timestamp:  ts,
+			Schema:     "testdb",
+			Table:      "orders",
+			EventType:  parser.EventInsert,
+			PKValues:   strconv.Itoa(i + 1),
+			RowAfter:   map[string]any{"id": int64(i + 1), "amount": 9.99},
+		}
+	}
+
+	state := &streamState{mode: "position", serverID: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel after a short delay — the 2 buffered events are consumed first,
+	// then the batch sits idle until context cancellation triggers the flush.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	if err := streamLoop(ctx, events, idx, db, time.Hour, state); err != nil {
+		t.Fatalf("streamLoop: %v", err)
+	}
+
+	if state.eventsIndexed != 2 {
+		t.Errorf("expected 2 events indexed, got %d", state.eventsIndexed)
+	}
+
+	loaded, err := loadStreamState(db)
+	if err != nil {
+		t.Fatalf("loadStreamState: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected checkpoint to be saved on context cancel")
+	}
+	if loaded.eventsIndexed != 2 {
+		t.Errorf("checkpoint: expected 2 events, got %d", loaded.eventsIndexed)
+	}
+}
+
+// TestStreamLoop_tickerCheckpoint verifies that the periodic ticker fires a
+// checkpoint even when the events channel stays open and receives no further events.
+func TestStreamLoop_tickerCheckpoint(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	idx := indexer.New(db, 100)
+
+	events := make(chan parser.Event, 10)
+	ts := time.Now().UTC()
+
+	// Enqueue 1 event but keep the channel open.
+	events <- parser.Event{
+		BinlogFile: "binlog.000001",
+		StartPos:   0,
+		EndPos:     100,
+		Timestamp:  ts,
+		Schema:     "testdb",
+		Table:      "orders",
+		EventType:  parser.EventInsert,
+		PKValues:   "1",
+		RowAfter:   map[string]any{"id": int64(1), "amount": 9.99},
+	}
+
+	state := &streamState{mode: "position", serverID: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		// 5 ms interval guarantees the ticker fires well before the 50 ms sleep.
+		done <- streamLoop(ctx, events, idx, db, 5*time.Millisecond, state)
+	}()
+
+	// Wait for: (1) event consumed, (2) ticker to fire and save checkpoint.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	if err := <-done; err != nil {
+		t.Fatalf("streamLoop: %v", err)
+	}
+
+	loaded, err := loadStreamState(db)
+	if err != nil {
+		t.Fatalf("loadStreamState: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected checkpoint to be saved by ticker")
+	}
+	if loaded.eventsIndexed != 1 {
+		t.Errorf("expected 1 event in checkpoint, got %d", loaded.eventsIndexed)
+	}
+}
+
+// TestStreamLoop_positionTracking verifies that state.binlogFile and
+// state.binlogPos are updated from each event, reflecting the last event processed.
+func TestStreamLoop_positionTracking(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	idx := indexer.New(db, 100)
+
+	events := make(chan parser.Event, 10)
+	ts := time.Now().UTC()
+
+	// Three events advancing across two binlog files.
+	testEvents := []parser.Event{
+		{
+			BinlogFile: "binlog.000001", StartPos: 0, EndPos: 100, Timestamp: ts,
+			Schema: "testdb", Table: "orders", EventType: parser.EventInsert,
+			PKValues: "1", RowAfter: map[string]any{"id": int64(1)},
+		},
+		{
+			BinlogFile: "binlog.000002", StartPos: 4, EndPos: 200, Timestamp: ts,
+			Schema: "testdb", Table: "orders", EventType: parser.EventInsert,
+			PKValues: "2", RowAfter: map[string]any{"id": int64(2)},
+		},
+		{
+			BinlogFile: "binlog.000002", StartPos: 200, EndPos: 350, Timestamp: ts,
+			Schema: "testdb", Table: "orders", EventType: parser.EventInsert,
+			PKValues: "3", RowAfter: map[string]any{"id": int64(3)},
+		},
+	}
+	for _, ev := range testEvents {
+		events <- ev
+	}
+	close(events)
+
+	state := &streamState{mode: "position", serverID: 1}
+
+	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state); err != nil {
+		t.Fatalf("streamLoop: %v", err)
+	}
+
+	// Final position should reflect the last event consumed.
+	if state.binlogFile != "binlog.000002" {
+		t.Errorf("binlogFile: expected binlog.000002, got %q", state.binlogFile)
+	}
+	if state.binlogPos != 350 {
+		t.Errorf("binlogPos: expected 350, got %d", state.binlogPos)
+	}
+	if state.eventsIndexed != 3 {
+		t.Errorf("eventsIndexed: expected 3, got %d", state.eventsIndexed)
+	}
+}
+
+// TestStreamLoop_batchOverflow verifies that when the batch size is reached
+// before the channel closes, events are flushed mid-stream and all rows are written.
+func TestStreamLoop_batchOverflow(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	const batchSize = 3
+	idx := indexer.New(db, batchSize)
+
+	events := make(chan parser.Event, 20)
+	ts := time.Now().UTC()
+
+	// 7 events requires ceil(7/3) = 3 flushes (3 + 3 + 1 on close).
+	const total = 7
+	for i := range total {
+		events <- parser.Event{
+			BinlogFile: "binlog.000001",
+			StartPos:   uint64(i * 100),
+			EndPos:     uint64((i + 1) * 100),
+			Timestamp:  ts,
+			Schema:     "testdb",
+			Table:      "orders",
+			EventType:  parser.EventInsert,
+			PKValues:   strconv.Itoa(i + 1),
+			RowAfter:   map[string]any{"id": int64(i + 1)},
+		}
+	}
+	close(events)
+
+	state := &streamState{mode: "position", serverID: 1}
+
+	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state); err != nil {
+		t.Fatalf("streamLoop: %v", err)
+	}
+
+	if state.eventsIndexed != total {
+		t.Errorf("eventsIndexed: expected %d, got %d", total, state.eventsIndexed)
+	}
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM binlog_events").Scan(&count); err != nil {
+		t.Fatalf("count binlog_events: %v", err)
+	}
+	if count != total {
+		t.Errorf("binlog_events rows: expected %d, got %d", total, count)
+	}
+}
+
+// TestStreamLoop_gtidAccumulation verifies that event GTID values are accumulated
+// into state.gtidSet and persisted in the checkpoint.
+func TestStreamLoop_gtidAccumulation(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	idx := indexer.New(db, 100)
+
+	uuid := "3e11fa47-71ca-11e1-9e33-c80aa9429562" // go-mysql lowercases UUIDs
+
+	// Seed the accumulated GTID set at uuid:1.
+	gs, err := gomysql.ParseMysqlGTIDSet(uuid + ":1")
+	if err != nil {
+		t.Fatalf("ParseMysqlGTIDSet: %v", err)
+	}
+	acc := gs.(*gomysql.MysqlGTIDSet)
+
+	state := &streamState{
+		mode:    "gtid",
+		serverID: 1,
+		accGTID: acc,
+		gtidSet: uuid + ":1",
+	}
+
+	ts := time.Now().UTC()
+	events := make(chan parser.Event, 10)
+
+	// Events carry consecutive GTIDs — the loop should accumulate them.
+	for i, gno := range []int64{2, 3, 4} {
+		events <- parser.Event{
+			BinlogFile: "binlog.000001",
+			StartPos:   uint64(i * 100),
+			EndPos:     uint64((i + 1) * 100),
+			Timestamp:  ts,
+			GTID:       fmt.Sprintf("%s:%d", uuid, gno),
+			Schema:     "testdb",
+			Table:      "orders",
+			EventType:  parser.EventInsert,
+			PKValues:   strconv.Itoa(i + 1),
+			RowAfter:   map[string]any{"id": int64(i + 1)},
+		}
+	}
+	close(events)
+
+	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state); err != nil {
+		t.Fatalf("streamLoop: %v", err)
+	}
+
+	// state.gtidSet should now encode uuid:1-4 (1 from seed + 2,3,4 from events).
+	if !strings.Contains(state.gtidSet, uuid) {
+		t.Errorf("state.gtidSet: expected UUID, got %q", state.gtidSet)
+	}
+	if !strings.Contains(state.gtidSet, "1-4") {
+		t.Errorf("state.gtidSet: expected range 1-4, got %q", state.gtidSet)
+	}
+
+	// Checkpoint should also persist the accumulated GTID.
+	loaded, err := loadStreamState(db)
+	if err != nil {
+		t.Fatalf("loadStreamState: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected checkpoint to be saved")
+	}
+	if !strings.Contains(loaded.gtidSet, "1-4") {
+		t.Errorf("checkpoint gtidSet: expected 1-4 range, got %q", loaded.gtidSet)
 	}
 }

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"strings"
 	"testing"
+
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 )
 
 // ─── parseSourceDSN ──────────────────────────────────────────────────────────
@@ -61,6 +64,21 @@ func TestParseSourceDSN_invalid(t *testing.T) {
 	}
 }
 
+// TestParseSourceDSN_ipv6 verifies IPv6 addresses are parsed correctly.
+func TestParseSourceDSN_ipv6(t *testing.T) {
+	dsn := "root:pw@tcp([::1]:3306)/db"
+	host, port, _, _, err := parseSourceDSN(dsn)
+	if err != nil {
+		t.Fatalf("unexpected error for IPv6 DSN: %v", err)
+	}
+	if host != "::1" {
+		t.Errorf("host: expected ::1, got %q", host)
+	}
+	if port != 3306 {
+		t.Errorf("port: expected 3306, got %d", port)
+	}
+}
+
 // ─── resolveStart ────────────────────────────────────────────────────────────
 
 func TestResolveStart_noStateNoFlags(t *testing.T) {
@@ -98,7 +116,6 @@ func TestResolveStart_flagsOverrideSavedState(t *testing.T) {
 		binlogFile: "binlog.000010",
 		binlogPos:  9999,
 	}
-	// Providing --start-file should override the saved state.
 	mode, file, _, _, _, err := resolveStart("binlog.000020", "", 100, saved)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -177,5 +194,133 @@ func TestResolveStart_gtidFlagsNoState(t *testing.T) {
 	}
 	if accGTID == nil {
 		t.Error("expected non-nil accGTID")
+	}
+}
+
+// TestResolveStart_invalidSavedGTID verifies that a corrupt gtid_set in
+// stream_state results in a clear error (not a panic).
+func TestResolveStart_invalidSavedGTID(t *testing.T) {
+	saved := &streamState{mode: "gtid", gtidSet: "not-a-valid-gtid"}
+	_, _, _, _, _, err := resolveStart("", "", 4, saved)
+	if err == nil {
+		t.Error("expected error for invalid saved GTID set")
+	}
+}
+
+// TestResolveStart_invalidStartGTIDFlag verifies that --start-gtid with an
+// invalid GTID string is rejected with a clear error.
+func TestResolveStart_invalidStartGTIDFlag(t *testing.T) {
+	_, _, _, _, _, err := resolveStart("", "garbage-gtid", 0, nil)
+	if err == nil {
+		t.Error("expected error for invalid --start-gtid value")
+	}
+}
+
+// ─── GTID accumulation ────────────────────────────────────────────────────────
+
+// TestStreamState_gtidAccumulation verifies that accGTID.Update correctly
+// accumulates multiple GTIDs from a single server UUID into a range.
+func TestStreamState_gtidAccumulation(t *testing.T) {
+	uuid := "3e11fa47-71ca-11e1-9e33-c80aa9429562" // go-mysql lowercases UUIDs
+	gs, err := gomysql.ParseMysqlGTIDSet(uuid + ":1")
+	if err != nil {
+		t.Fatalf("ParseMysqlGTIDSet: %v", err)
+	}
+	acc := gs.(*gomysql.MysqlGTIDSet)
+
+	for _, gtid := range []string{uuid + ":2", uuid + ":3", uuid + ":4"} {
+		if err := acc.Update(gtid); err != nil {
+			t.Fatalf("Update(%q): %v", gtid, err)
+		}
+	}
+
+	got := acc.String()
+	// Should contain the UUID and a range covering 1-4.
+	if !strings.Contains(got, uuid) {
+		t.Errorf("expected UUID in GTID set string, got %q", got)
+	}
+	if !strings.Contains(got, "1-4") {
+		t.Errorf("expected range 1-4 in GTID set string, got %q", got)
+	}
+}
+
+// TestStreamState_gtidAccumulationMultiServer verifies accumulation across
+// two different server UUIDs — each gets its own range entry.
+func TestStreamState_gtidAccumulationMultiServer(t *testing.T) {
+	uuid1 := "3e11fa47-71ca-11e1-9e33-c80aa9429562" // go-mysql lowercases UUIDs
+	uuid2 := "7d93a8e1-0b3c-11e2-ab3d-0022114ef123"
+
+	gs, _ := gomysql.ParseMysqlGTIDSet(uuid1 + ":1")
+	acc := gs.(*gomysql.MysqlGTIDSet)
+
+	if err := acc.Update(uuid2 + ":1"); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if err := acc.Update(uuid1 + ":2"); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got := acc.String()
+	if !strings.Contains(got, uuid1) {
+		t.Errorf("expected %s in result, got %q", uuid1, got)
+	}
+	if !strings.Contains(got, uuid2) {
+		t.Errorf("expected %s in result, got %q", uuid2, got)
+	}
+}
+
+// ─── cobra command wiring ─────────────────────────────────────────────────────
+
+// TestStreamCmd_registered verifies that streamCmd is wired into the root command.
+func TestStreamCmd_registered(t *testing.T) {
+	found := false
+	for _, cmd := range rootCmd.Commands() {
+		if cmd.Use == "stream" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'stream' command to be registered under rootCmd")
+	}
+}
+
+// TestStreamCmd_requiredFlags verifies that the three required flags are marked
+// as required so cobra enforces them before RunE is called.
+func TestStreamCmd_requiredFlags(t *testing.T) {
+	for _, flagName := range []string{"index-dsn", "source-dsn", "server-id"} {
+		ann := streamCmd.Annotations
+		_ = ann
+		flag := streamCmd.Flag(flagName)
+		if flag == nil {
+			t.Errorf("flag --%s not registered", flagName)
+			continue
+		}
+		// cobra marks required flags in the Annotations map.
+		if streamCmd.Flag(flagName).Annotations["cobra_annotation_bash_completion_one_required_flag"] == nil {
+			t.Errorf("flag --%s is not marked required", flagName)
+		}
+	}
+}
+
+// TestStreamCmd_defaults verifies that optional flags have the expected defaults.
+func TestStreamCmd_defaults(t *testing.T) {
+	cases := []struct {
+		flag string
+		want string
+	}{
+		{"batch-size", "1000"},
+		{"checkpoint", "10"},
+		{"start-pos", "4"},
+	}
+	for _, tc := range cases {
+		f := streamCmd.Flag(tc.flag)
+		if f == nil {
+			t.Errorf("flag --%s not registered", tc.flag)
+			continue
+		}
+		if f.DefValue != tc.want {
+			t.Errorf("flag --%s: expected default %q, got %q", tc.flag, tc.want, f.DefValue)
+		}
 	}
 }
