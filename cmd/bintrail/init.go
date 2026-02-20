@@ -76,6 +76,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("  ✓ index_state")
 
+	if _, err := db.Exec(ddlStreamState); err != nil {
+		return fmt.Errorf("failed to create stream_state: %w", err)
+	}
+	fmt.Println("  ✓ stream_state")
+
 	fmt.Printf("\nInitialization complete. Index database: %s\n", dbName)
 	return nil
 }
@@ -176,6 +181,19 @@ const ddlSchemaSnapshots = `CREATE TABLE IF NOT EXISTS schema_snapshots (
     column_default   TEXT         DEFAULT NULL,
     INDEX idx_snapshot_id    (snapshot_id),
     INDEX idx_snapshot_table (snapshot_id, schema_name, table_name)
+) ENGINE=InnoDB`
+
+const ddlStreamState = `CREATE TABLE IF NOT EXISTS stream_state (
+    id               INT UNSIGNED    PRIMARY KEY DEFAULT 1,
+    mode             ENUM('position','gtid') NOT NULL,
+    binlog_file      VARCHAR(255)    NOT NULL DEFAULT '',
+    binlog_position  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    gtid_set         TEXT            DEFAULT NULL,
+    events_indexed   BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    last_event_time  DATETIME        DEFAULT NULL,
+    last_checkpoint  DATETIME        NOT NULL,
+    server_id        INT UNSIGNED    NOT NULL,
+    CONSTRAINT single_row CHECK (id = 1)
 ) ENGINE=InnoDB`
 
 const ddlIndexState = `CREATE TABLE IF NOT EXISTS index_state (

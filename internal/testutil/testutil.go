@@ -178,6 +178,19 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		completed_at   DATETIME DEFAULT NULL,
 		error_message  TEXT     DEFAULT NULL
 	) ENGINE=InnoDB`)
+
+	MustExec(t, db, `CREATE TABLE IF NOT EXISTS stream_state (
+		id               INT UNSIGNED    PRIMARY KEY DEFAULT 1,
+		mode             ENUM('position','gtid') NOT NULL,
+		binlog_file      VARCHAR(255)    NOT NULL DEFAULT '',
+		binlog_position  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		gtid_set         TEXT            DEFAULT NULL,
+		events_indexed   BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		last_event_time  DATETIME        DEFAULT NULL,
+		last_checkpoint  DATETIME        NOT NULL,
+		server_id        INT UNSIGNED    NOT NULL,
+		CONSTRAINT single_row CHECK (id = 1)
+	) ENGINE=InnoDB`)
 }
 
 // InsertEvent inserts a single event into binlog_events using raw SQL.
