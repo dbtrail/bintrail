@@ -25,8 +25,10 @@ cmd/bintrail/          # One file per command
   cmd_integration_test.go  # Integration tests (//go:build integration) for all DB helpers
 
 cmd/bintrail-mcp/      # MCP server (query, recover, status as read-only tools)
-  main.go              # Server entry point + tool handlers + buildQueryOptions
-  main_test.go         # Unit tests for buildQueryOptions
+  main.go              # Server entry point + newServer() + tool handlers + buildQueryOptions
+  main_test.go         # Unit tests for buildQueryOptions, resolveDSN, errorResult
+  integration_test.go  # Integration tests (//go:build integration) — in-memory MCP transport + live MySQL
+  e2e_test.go          # E2E test (//go:build integration) — subprocess JSON-RPC stdio protocol
 
 internal/
   cliutil/cliutil.go   # Shared filter parsers: ParseEventType, ParseTime, IsValidFormat
@@ -79,7 +81,11 @@ Filter helpers (`ParseEventType`, `ParseTime`, `IsValidFormat`) live in `interna
 
 All tools are annotated with `ReadOnlyHint: true` and `IdempotentHint: true`. DSN resolution: `index_dsn` parameter overrides `BINTRAIL_INDEX_DSN` env var.
 
-`buildQueryOptions` is the shared filter builder used by both `queryTool` and `recoverTool`. Its unit tests are in `cmd/bintrail-mcp/main_test.go`.
+`newServer() *mcp.Server` constructs and returns the configured server (extracted from `main()` so tests can call it). `buildQueryOptions` is the shared filter builder used by both `queryTool` and `recoverTool`. Both are tested in `cmd/bintrail-mcp/main_test.go`.
+
+**`jsonschema` tag format**: use plain description strings (`jsonschema:"My description"`) — NOT the old `key=value` format (`jsonschema:"description=..."`) which is rejected by jsonschema-go v0.3+.
+
+Integration tests (`integration_test.go`) use `mcp.NewInMemoryTransports()` to connect a test client to the server in-process — no subprocess or stdio framing needed. The E2E test (`e2e_test.go`) builds the binary with `go build -cover` and speaks raw newline-delimited JSON-RPC over stdin/stdout (protocol version `"2025-06-18"`).
 
 Project-level registration via `.mcp.json` uses `go run ./cmd/bintrail-mcp` — no pre-build needed.
 

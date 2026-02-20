@@ -29,7 +29,7 @@ import (
 	"github.com/bintrail/bintrail/internal/status"
 )
 
-func main() {
+func newServer() *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "bintrail",
 		Version: "v1.0.0",
@@ -76,7 +76,11 @@ func main() {
 		},
 	}, statusTool)
 
-	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+	return server
+}
+
+func main() {
+	if err := newServer().Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -84,34 +88,34 @@ func main() {
 // ─── Tool argument types ─────────────────────────────────────────────────────
 
 type queryArgs struct {
-	IndexDSN      string `json:"index_dsn,omitempty" jsonschema:"description=MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
-	Schema        string `json:"schema,omitempty" jsonschema:"description=Filter by database schema name"`
-	Table         string `json:"table,omitempty" jsonschema:"description=Filter by table name"`
-	PK            string `json:"pk,omitempty" jsonschema:"description=Filter by primary key value (pipe-delimited for composite keys e.g. 123 or 123|2)"`
-	EventType     string `json:"event_type,omitempty" jsonschema:"description=Filter by event type: INSERT UPDATE or DELETE"`
-	GTID          string `json:"gtid,omitempty" jsonschema:"description=Filter by GTID (e.g. uuid:42)"`
-	Since         string `json:"since,omitempty" jsonschema:"description=Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	Until         string `json:"until,omitempty" jsonschema:"description=Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	ChangedColumn string `json:"changed_column,omitempty" jsonschema:"description=Filter UPDATE events that modified this column"`
-	Format        string `json:"format,omitempty" jsonschema:"description=Output format: json table or csv (default: json)"`
-	Limit         int    `json:"limit,omitempty" jsonschema:"description=Maximum number of events to return (default: 100)"`
+	IndexDSN      string `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
+	Schema        string `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
+	Table         string `json:"table,omitempty" jsonschema:"Filter by table name"`
+	PK            string `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys e.g. 123 or 123|2)"`
+	EventType     string `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
+	GTID          string `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
+	Since         string `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	Until         string `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	ChangedColumn string `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
+	Format        string `json:"format,omitempty" jsonschema:"Output format: json table or csv (default: json)"`
+	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of events to return (default: 100)"`
 }
 
 type recoverArgs struct {
-	IndexDSN      string `json:"index_dsn,omitempty" jsonschema:"description=MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
-	Schema        string `json:"schema,omitempty" jsonschema:"description=Filter by database schema name"`
-	Table         string `json:"table,omitempty" jsonschema:"description=Filter by table name"`
-	PK            string `json:"pk,omitempty" jsonschema:"description=Filter by primary key value (pipe-delimited for composite keys)"`
-	EventType     string `json:"event_type,omitempty" jsonschema:"description=Filter by event type: INSERT UPDATE or DELETE"`
-	GTID          string `json:"gtid,omitempty" jsonschema:"description=Filter by GTID (e.g. uuid:42)"`
-	Since         string `json:"since,omitempty" jsonschema:"description=Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	Until         string `json:"until,omitempty" jsonschema:"description=Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	ChangedColumn string `json:"changed_column,omitempty" jsonschema:"description=Filter UPDATE events that modified this column"`
-	Limit         int    `json:"limit,omitempty" jsonschema:"description=Maximum number of events to reverse (default: 1000)"`
+	IndexDSN      string `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
+	Schema        string `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
+	Table         string `json:"table,omitempty" jsonschema:"Filter by table name"`
+	PK            string `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys)"`
+	EventType     string `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
+	GTID          string `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
+	Since         string `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	Until         string `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	ChangedColumn string `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
+	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of events to reverse (default: 1000)"`
 }
 
 type statusArgs struct {
-	IndexDSN string `json:"index_dsn,omitempty" jsonschema:"description=MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
+	IndexDSN string `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
 }
 
 // ─── Tool handlers ───────────────────────────────────────────────────────────
