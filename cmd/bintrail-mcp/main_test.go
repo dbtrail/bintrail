@@ -1,10 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/bintrail/bintrail/internal/parser"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 const defaultLimit = 100
@@ -139,5 +141,60 @@ func TestBuildQueryOptions_negativeLimitUsesDefault(t *testing.T) {
 	}
 	if opts.Limit != defaultLimit {
 		t.Errorf("expected default limit %d, got %d", defaultLimit, opts.Limit)
+	}
+}
+
+// ─── resolveDSN ──────────────────────────────────────────────────────────────
+
+func TestResolveDSN_overrideProvided(t *testing.T) {
+	dsn := "user:pass@tcp(localhost:3306)/mydb"
+	got, err := resolveDSN(dsn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != dsn {
+		t.Errorf("expected %q, got %q", dsn, got)
+	}
+}
+
+func TestResolveDSN_envVarFallback(t *testing.T) {
+	dsn := "user:pass@tcp(localhost:3306)/mydb"
+	t.Setenv("BINTRAIL_INDEX_DSN", dsn)
+	got, err := resolveDSN("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != dsn {
+		t.Errorf("expected %q from env var, got %q", dsn, got)
+	}
+}
+
+func TestResolveDSN_noOverrideNoEnv(t *testing.T) {
+	t.Setenv("BINTRAIL_INDEX_DSN", "")
+	_, err := resolveDSN("")
+	if err == nil {
+		t.Fatal("expected error when no DSN available")
+	}
+	if !strings.Contains(err.Error(), "BINTRAIL_INDEX_DSN") {
+		t.Errorf("expected error to mention BINTRAIL_INDEX_DSN, got: %v", err)
+	}
+}
+
+// ─── errorResult ─────────────────────────────────────────────────────────────
+
+func TestErrorResult(t *testing.T) {
+	result := errorResult(fmt.Errorf("broke"))
+	if !result.IsError {
+		t.Error("expected IsError to be true")
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("expected 1 content item, got %d", len(result.Content))
+	}
+	tc, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected *mcp.TextContent, got %T", result.Content[0])
+	}
+	if tc.Text != "broke" {
+		t.Errorf("expected text %q, got %q", "broke", tc.Text)
 	}
 }
