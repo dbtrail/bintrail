@@ -240,6 +240,40 @@ Files:  2 completed, 0 in_progress, 0 failed
 Events: 21246 indexed
 ```
 
+## MCP Server
+
+Bintrail ships an [MCP](https://modelcontextprotocol.io) server that exposes the same query, recover, and status operations as read-only tools — letting Claude Code (or any MCP-compatible client) explore your binlog index conversationally.
+
+**Build:**
+
+```sh
+go build ./cmd/bintrail-mcp
+```
+
+**Register with Claude Code** — the project ships `.mcp.json` which pre-registers the server using `go run` (no pre-build required):
+
+```json
+{
+  "mcpServers": {
+    "bintrail": {
+      "command": "go",
+      "args": ["run", "./cmd/bintrail-mcp"],
+      "env": { "BINTRAIL_INDEX_DSN": "user:pass@tcp(127.0.0.1:3306)/binlog_index" }
+    }
+  }
+}
+```
+
+Set `BINTRAIL_INDEX_DSN` to your index database DSN, then enable the server with `claude mcp enable bintrail`.
+
+**Available tools:**
+
+| Tool | Description |
+|---|---|
+| `query` | Search binlog events with filters (schema, table, PK, event type, time range, GTID, changed column) |
+| `recover` | Generate reversal SQL for matching events (dry-run only — never executes) |
+| `status` | Show indexed files, partition layout, and aggregate event counts |
+
 ## Automating with cron
 
 A typical setup runs two cron jobs: one to continuously index new binlog files, and one nightly rotation to drop old partitions and extend the partition range.

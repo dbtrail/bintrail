@@ -3,13 +3,11 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
-	"github.com/bintrail/bintrail/internal/parser"
 	"github.com/bintrail/bintrail/internal/query"
 )
 
@@ -78,20 +76,20 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	if qChangedCol != "" && (qSchema == "" || qTable == "") {
 		return fmt.Errorf("--changed-column requires both --schema and --table")
 	}
-	if !isValidFormat(qFormat) {
+	if !cliutil.IsValidFormat(qFormat) {
 		return fmt.Errorf("invalid --format %q; must be table, json, or csv", qFormat)
 	}
 
 	// ── Parse filter values ───────────────────────────────────────────────────
-	eventType, err := parseEventType(qEventType)
+	eventType, err := cliutil.ParseEventType(qEventType)
 	if err != nil {
 		return err
 	}
-	since, err := parseQueryTime(qSince)
+	since, err := cliutil.ParseTime(qSince)
 	if err != nil {
 		return fmt.Errorf("--since: %w", err)
 	}
-	until, err := parseQueryTime(qUntil)
+	until, err := cliutil.ParseTime(qUntil)
 	if err != nil {
 		return fmt.Errorf("--until: %w", err)
 	}
@@ -131,45 +129,3 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-// parseEventType converts an event-type string to a *parser.EventType.
-// Returns nil for an empty string (meaning "all types").
-func parseEventType(s string) (*parser.EventType, error) {
-	switch strings.ToUpper(s) {
-	case "":
-		return nil, nil
-	case "INSERT":
-		et := parser.EventInsert
-		return &et, nil
-	case "UPDATE":
-		et := parser.EventUpdate
-		return &et, nil
-	case "DELETE":
-		et := parser.EventDelete
-		return &et, nil
-	default:
-		return nil, fmt.Errorf("invalid --event-type %q; must be INSERT, UPDATE, or DELETE", s)
-	}
-}
-
-// parseQueryTime parses a datetime string in "2006-01-02 15:04:05" format
-// using the local timezone. Returns nil for an empty string.
-func parseQueryTime(s string) (*time.Time, error) {
-	if s == "" {
-		return nil, nil
-	}
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", s, time.Local)
-	if err != nil {
-		return nil, fmt.Errorf("invalid time %q; expected format: 2006-01-02 15:04:05", s)
-	}
-	return &t, nil
-}
-
-func isValidFormat(s string) bool {
-	switch strings.ToLower(s) {
-	case "table", "json", "csv":
-		return true
-	}
-	return false
-}

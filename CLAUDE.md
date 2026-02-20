@@ -10,33 +10,39 @@ Go version: 1.25.7 (all modern APIs available — see below)
 ## Project structure
 
 ```
-cmd/bintrail/          # One file per command + shared helpers in query.go
+cmd/bintrail/          # One file per command
   main.go              # Root cobra command
   init.go              # bintrail init
   snapshot.go          # bintrail snapshot
   index.go             # bintrail index (core — parser + indexer pipeline)
-  query.go             # bintrail query + shared helpers: parseEventType, parseQueryTime, isValidFormat
+  query.go             # bintrail query
   recover.go           # bintrail recover
   rotate.go            # bintrail rotate + partition helpers
   status.go            # bintrail status
   index_test.go        # Unit tests for binlogFileRe, buildIndexFilters, resolveFiles, findBinlogFiles
-  query_test.go        # Unit tests for parseEventType, parseQueryTime, isValidFormat
   snapshot_test.go     # Unit tests for parseSchemaList
   rotate_test.go       # Unit tests for parseRetain, partitionDate, partitionName, nextPartitionStart
-  status_test.go       # Unit tests for descriptionToHuman, truncate, writeStatus
   cmd_integration_test.go  # Integration tests (//go:build integration) for all DB helpers
 
+cmd/bintrail-mcp/      # MCP server (query, recover, status as read-only tools)
+  main.go              # Server entry point + tool handlers + buildQueryOptions
+  main_test.go         # Unit tests for buildQueryOptions
+
 internal/
+  cliutil/cliutil.go   # Shared filter parsers: ParseEventType, ParseTime, IsValidFormat
   config/config.go     # config.Connect(dsn) — opens and pings *sql.DB
   metadata/            # Schema snapshot loader and resolver
   parser/              # Binlog file parser (go-mysql-org/go-mysql)
   indexer/             # Batch writer to binlog_events
   query/               # Query engine + result formatters (table/json/csv)
   recovery/            # Reversal SQL generator
+  status/status.go     # Shared status types and display: LoadIndexState, LoadPartitionStats, WriteStatus
   testutil/testutil.go # Shared test helpers: CreateTestDB, InitIndexTables, SkipIfNoMySQL, etc.
 
 e2e_test.go            # E2E integration test (//go:build integration) — exercises full CLI pipeline
                        # Built with `go build -cover` for binary coverage instrumentation
+
+.mcp.json              # Project-level MCP server registration (bintrail server via go run)
 
 migrations/
   001_create_tables.sql  # Reference DDL (tables are created by `bintrail init`, not this file)
@@ -59,7 +65,23 @@ docs/
 
 Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `stIndexDSN`).
 
-`parseEventType` and `parseQueryTime` are defined in `query.go` and reused by `recover.go` — same `main` package, no duplication needed.
+Filter helpers (`ParseEventType`, `ParseTime`, `IsValidFormat`) live in `internal/cliutil` and are shared by both `cmd/bintrail/` commands and `cmd/bintrail-mcp/`.
+
+## MCP server
+
+`cmd/bintrail-mcp/` is a stdio MCP server exposing three read-only tools:
+
+| Tool | Handler | Description |
+|---|---|---|
+| `query` | `queryTool` | Search binlog events (same filters as CLI `query`) |
+| `recover` | `recoverTool` | Generate reversal SQL (dry-run only) |
+| `status` | `statusTool` | Show indexed files, partitions, summary |
+
+All tools are annotated with `ReadOnlyHint: true` and `IdempotentHint: true`. DSN resolution: `index_dsn` parameter overrides `BINTRAIL_INDEX_DSN` env var.
+
+`buildQueryOptions` is the shared filter builder used by both `queryTool` and `recoverTool`. Its unit tests are in `cmd/bintrail-mcp/main_test.go`.
+
+Project-level registration via `.mcp.json` uses `go run ./cmd/bintrail-mcp` — no pre-build needed.
 
 ## Database tables
 
@@ -186,7 +208,7 @@ go tool cover -func=cover.out
 - Recovery unit tests use `newGen()` helper: `func newGen() *Generator { return New(nil, nil) }` — nil DB and nil resolver triggers the all-columns WHERE fallback.
 - `assertSQL(t, stmt, want)` helper checks `strings.Contains` for SQL fragments.
 - Do not hardcode UNIX timestamps for specific dates in tests — compute them with `time.Date(...).Unix()` to avoid year-sensitive failures.
-- `assertContains(t, s, want)` is the equivalent helper in `status_test.go`.
+- `assertContains(t, s, want)` is the equivalent helper in `internal/status/status_test.go`.
 - Test files in `cmd/bintrail/` are `package main` and can access all unexported helpers directly.
 - Integration test files use the `_integration_test.go` suffix and have `//go:build integration` at the top.
 - Every integration test calls `testutil.SkipIfNoMySQL(t)` or `testutil.CreateTestDB(t)` (which calls `SkipIfNoMySQL` internally) as its first action.
@@ -198,6 +220,7 @@ go tool cover -func=cover.out
 | `github.com/go-mysql-org/go-mysql` | Binlog file parsing (`replication` package) |
 | `github.com/go-sql-driver/mysql` | MySQL driver + `mysql.ParseDSN` |
 | `github.com/spf13/cobra` | CLI framework |
+| `github.com/modelcontextprotocol/go-sdk` | MCP server SDK (`cmd/bintrail-mcp` only) |
 
 Transitive deps pulled in by go-mysql: shopspring/decimal, pingcap/errors, pingcap/tidb, google/uuid, klauspost/compress, zap, etc. These are indirect — don't import them directly.
 

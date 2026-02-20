@@ -23,8 +23,12 @@ All unit tests pass without a running database. If you want to test against a re
 ## Project layout
 
 ```
-cmd/bintrail/      One file per command. Shared CLI helpers live in query.go.
+cmd/bintrail/      One file per command.
+cmd/bintrail-mcp/  MCP server exposing query, recover, and status as read-only tools.
 internal/          Core packages. Each package has a _test.go alongside it.
+  cliutil/         Shared filter parsers (ParseEventType, ParseTime, IsValidFormat) — used by
+                   both cmd/bintrail/ commands and cmd/bintrail-mcp/.
+  status/          Shared index status types and display helpers.
 migrations/        Reference DDL — tables are created by `bintrail init`, not this file.
 ```
 
@@ -37,7 +41,7 @@ Read `CLAUDE.md` for a detailed map of the architecture, key patterns, and gotch
 1. Create `cmd/bintrail/<command>.go` in `package main`.
 2. Declare a `var <cmd>Cmd = &cobra.Command{...}` and register it in `init()` with `rootCmd.AddCommand(...)`.
 3. Name flag variables with a short prefix matching the command (e.g. `rotRetain` for `rotate`, `stIndexDSN` for `status`).
-4. Reuse `parseEventType` and `parseQueryTime` from `query.go` if the command accepts time or event-type filters — they are in the same package.
+4. Reuse `cliutil.ParseEventType` and `cliutil.ParseTime` from `internal/cliutil` if the command accepts time or event-type filters. The MCP server uses the same helpers.
 5. Use `mysql.ParseDSN(dsn)` to extract the database name from a DSN; don't use `SELECT DATABASE()`.
 
 ### Coding conventions

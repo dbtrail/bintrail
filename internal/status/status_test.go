@@ -1,4 +1,4 @@
-package main
+package status
 
 import (
 	"bytes"
@@ -9,13 +9,13 @@ import (
 	"time"
 )
 
-// ─── descriptionToHuman ───────────────────────────────────────────────────────
+// ─── DescriptionToHuman ───────────────────────────────────────────────────────
 
 func TestDescriptionToHuman_maxvalue(t *testing.T) {
 	for _, input := range []string{"MAXVALUE", "maxvalue", "MaxValue", ""} {
-		got := descriptionToHuman(input)
+		got := DescriptionToHuman(input)
 		if got != "MAXVALUE" {
-			t.Errorf("descriptionToHuman(%q) = %q, want MAXVALUE", input, got)
+			t.Errorf("DescriptionToHuman(%q) = %q, want MAXVALUE", input, got)
 		}
 	}
 }
@@ -25,7 +25,7 @@ func TestDescriptionToHuman_toDaysValue(t *testing.T) {
 	// TO_DAYS('1970-01-01') = 719528; any midnight-UTC date d has TO_DAYS = 719528 + d.Unix()/86400.
 	knownTime := time.Date(2026, 2, 20, 0, 0, 0, 0, time.UTC)
 	toDaysVal := int64(719528) + knownTime.Unix()/86400
-	got := descriptionToHuman(strconv.FormatInt(toDaysVal, 10))
+	got := DescriptionToHuman(strconv.FormatInt(toDaysVal, 10))
 	if !strings.Contains(got, "2026-02-20") {
 		t.Errorf("expected 2026-02-20 in %q", got)
 	}
@@ -36,7 +36,7 @@ func TestDescriptionToHuman_toDaysValue(t *testing.T) {
 
 func TestDescriptionToHuman_unknownString(t *testing.T) {
 	// A non-integer, non-MAXVALUE value should pass through unchanged.
-	got := descriptionToHuman("SOME_EXPR")
+	got := DescriptionToHuman("SOME_EXPR")
 	if got != "SOME_EXPR" {
 		t.Errorf("expected SOME_EXPR, got %q", got)
 	}
@@ -44,23 +44,23 @@ func TestDescriptionToHuman_unknownString(t *testing.T) {
 
 func TestDescriptionToHuman_unixEpoch(t *testing.T) {
 	// TO_DAYS('1970-01-01') = 719528 — verify the Unix epoch converts correctly.
-	got := descriptionToHuman("719528")
+	got := DescriptionToHuman("719528")
 	if !strings.Contains(got, "1970") {
 		t.Errorf("expected 1970 in %q", got)
 	}
 }
 
-// ─── truncate ─────────────────────────────────────────────────────────────────
+// ─── Truncate ─────────────────────────────────────────────────────────────────
 
 func TestTruncate_shortString(t *testing.T) {
-	got := truncate("hello", 10)
+	got := Truncate("hello", 10)
 	if got != "hello" {
 		t.Errorf("expected no truncation, got %q", got)
 	}
 }
 
 func TestTruncate_exactLength(t *testing.T) {
-	got := truncate("hello", 5)
+	got := Truncate("hello", 5)
 	if got != "hello" {
 		t.Errorf("expected no truncation at exact length, got %q", got)
 	}
@@ -68,13 +68,13 @@ func TestTruncate_exactLength(t *testing.T) {
 
 func TestTruncate_longString(t *testing.T) {
 	long := strings.Repeat("x", 100)
-	got := truncate(long, 20)
+	got := Truncate(long, 20)
 	if !strings.HasSuffix(got, "…") {
 		t.Errorf("expected ellipsis suffix, got %q", got)
 	}
 	if len(got) != 21 { // 20 chars + "…" (3 bytes, but counted as 1 rune display)
 		// Note: "…" is a multi-byte UTF-8 rune but len() counts bytes.
-		// Our truncate uses byte indexing, so the suffix adds 3 bytes.
+		// Our Truncate uses byte indexing, so the suffix adds 3 bytes.
 		// Just check the prefix is preserved and suffix is "…".
 		if !strings.HasPrefix(got, strings.Repeat("x", 20)) {
 			t.Errorf("expected 20 x's before ellipsis, got %q", got)
@@ -82,11 +82,11 @@ func TestTruncate_longString(t *testing.T) {
 	}
 }
 
-// ─── writeStatus output structure ────────────────────────────────────────────
+// ─── WriteStatus output structure ────────────────────────────────────────────
 
 func TestWriteStatus_noFiles_noPartitions(t *testing.T) {
 	var buf bytes.Buffer
-	writeStatus(&buf, nil, nil)
+	WriteStatus(&buf, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Indexed Files ===")
@@ -101,7 +101,7 @@ func TestWriteStatus_noFiles_noPartitions(t *testing.T) {
 
 func TestWriteStatus_withFiles(t *testing.T) {
 	ts := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
-	files := []indexStateRow{
+	files := []IndexStateRow{
 		{
 			BinlogFile:    "binlog.000042",
 			Status:        "completed",
@@ -125,7 +125,7 @@ func TestWriteStatus_withFiles(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	writeStatus(&buf, files, nil)
+	WriteStatus(&buf, files, nil)
 	out := buf.String()
 
 	assertContains(t, out, "binlog.000042")
@@ -144,14 +144,14 @@ func TestWriteStatus_withPartitions(t *testing.T) {
 	toDays := func(d time.Time) string {
 		return strconv.FormatInt(int64(719528)+d.Unix()/86400, 10)
 	}
-	parts := []partitionStat{
+	parts := []PartitionStat{
 		{Name: "p_20260218", Description: toDays(time.Date(2026, 2, 19, 0, 0, 0, 0, time.UTC)), TableRows: 45000, Ordinal: 1},
 		{Name: "p_20260219", Description: toDays(time.Date(2026, 2, 20, 0, 0, 0, 0, time.UTC)), TableRows: 3401, Ordinal: 2},
 		{Name: "p_future", Description: "MAXVALUE", TableRows: 0, Ordinal: 3},
 	}
 
 	var buf bytes.Buffer
-	writeStatus(&buf, nil, parts)
+	WriteStatus(&buf, nil, parts)
 	out := buf.String()
 
 	assertContains(t, out, "=== Partitions ===")
@@ -165,7 +165,7 @@ func TestWriteStatus_withPartitions(t *testing.T) {
 
 func TestWriteStatus_errorTruncation(t *testing.T) {
 	long := strings.Repeat("e", 100)
-	files := []indexStateRow{{
+	files := []IndexStateRow{{
 		BinlogFile:   "binlog.000001",
 		Status:       "failed",
 		StartedAt:    time.Now(),
@@ -173,7 +173,7 @@ func TestWriteStatus_errorTruncation(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	writeStatus(&buf, files, nil)
+	WriteStatus(&buf, files, nil)
 	out := buf.String()
 
 	// The error should be truncated — full 100-char string should not appear.
