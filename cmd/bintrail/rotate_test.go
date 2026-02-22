@@ -188,3 +188,70 @@ func TestPartitionSpec_shape(t *testing.T) {
 		t.Errorf("expected p_future catch-all last, got: %s", parts[3])
 	}
 }
+
+// ─── cobra command wiring ─────────────────────────────────────────────────────
+
+func TestRotateCmd_registered(t *testing.T) {
+	found := false
+	for _, cmd := range rootCmd.Commands() {
+		if cmd.Use == "rotate" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'rotate' command to be registered under rootCmd")
+	}
+}
+
+func TestRotateCmd_indexDSN_required(t *testing.T) {
+	flag := rotateCmd.Flag("index-dsn")
+	if flag == nil {
+		t.Fatal("flag --index-dsn not registered on rotateCmd")
+	}
+	if flag.Annotations["cobra_annotation_bash_completion_one_required_flag"] == nil {
+		t.Error("flag --index-dsn is not marked required on rotateCmd")
+	}
+}
+
+func TestRotateCmd_allFlagsRegistered(t *testing.T) {
+	for _, name := range []string{"index-dsn", "retain", "add-future"} {
+		if rotateCmd.Flag(name) == nil {
+			t.Errorf("flag --%s not registered on rotateCmd", name)
+		}
+	}
+}
+
+// ─── runRotate validation (no DB required) ────────────────────────────────────
+
+func TestRunRotate_noFlagsError(t *testing.T) {
+	savedRetain, savedAdd := rotRetain, rotAddFuture
+	t.Cleanup(func() { rotRetain = savedRetain; rotAddFuture = savedAdd })
+
+	rotRetain = ""
+	rotAddFuture = 0
+
+	err := runRotate(rotateCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when neither --retain nor --add-future is set, got nil")
+	}
+	if !strings.Contains(err.Error(), "--retain or --add-future") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunRotate_invalidRetain(t *testing.T) {
+	savedRetain, savedAdd := rotRetain, rotAddFuture
+	t.Cleanup(func() { rotRetain = savedRetain; rotAddFuture = savedAdd })
+
+	rotRetain = "5weeks" // invalid unit
+	rotAddFuture = 0
+
+	err := runRotate(rotateCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid --retain value, got nil")
+	}
+	if !strings.Contains(err.Error(), "--retain") {
+		t.Errorf("expected '--retain' in error, got: %v", err)
+	}
+}

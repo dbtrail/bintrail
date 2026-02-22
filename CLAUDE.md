@@ -21,8 +21,10 @@ cmd/bintrail/          # One file per command
   status.go            # bintrail status
   stream.go            # bintrail stream (live replication indexing)
   index_test.go        # Unit tests for binlogFileRe, buildIndexFilters, resolveFiles, findBinlogFiles
+  query_test.go        # Unit tests for queryCmd cobra wiring + runQuery validation logic
+  recover_test.go      # Unit tests for recoverCmd cobra wiring + runRecover validation logic
   snapshot_test.go     # Unit tests for parseSchemaList
-  rotate_test.go       # Unit tests for parseRetain, partitionDate, partitionName, nextPartitionStart
+  rotate_test.go       # Unit tests for parseRetain, partitionDate, partitionName, nextPartitionStart + cobra wiring
   stream_test.go       # Unit tests for parseSourceDSN, resolveStart, GTID accumulation, cobra wiring
   cmd_integration_test.go             # Integration tests (//go:build integration) for all DB helpers
   stream_integration_test.go          # Integration tests for stream_state persistence and streamLoop behaviour
@@ -45,6 +47,8 @@ internal/
   testutil/testutil.go # Shared test helpers: CreateTestDB, InitIndexTables, SkipIfNoMySQL, etc.
 
 e2e_test.go            # E2E integration test (//go:build integration) — exercises full CLI pipeline
+                       # init → snapshot → index → query (json/csv/table/pk/changed-column) →
+                       # recover (dry-run + file output) → status → rotate
                        # Built with `go build -cover` for binary coverage instrumentation
 
 .mcp.json              # Project-level MCP server registration (bintrail server via go run)
@@ -253,7 +257,7 @@ Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 | **total** | **63%** |
 
 **Known gaps and why:**
-- `cmd/bintrail` `run*` handlers (45%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). `runStream` is included in this gap. Unit + integration tests cover all helpers.
+- `cmd/bintrail` `run*` handlers (~50%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). `runStream` is included in this gap. Validation logic in `runQuery`/`runRecover`/`runRotate` is now covered by unit tests in `query_test.go`, `recover_test.go`, `rotate_test.go`.
 - `internal/status` `LoadIndexState`/`LoadPartitionStats` (0% in cover.out): called through the MCP/CLI handlers which run as subprocesses; `WriteStatus`/`DescriptionToHuman` are 100%.
 - `cmd/bintrail-mcp` `main()` (0%): the stdio entry point is intentionally excluded — exercised by `TestMCPE2E`.
 

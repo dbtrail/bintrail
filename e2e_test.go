@@ -148,6 +148,77 @@ func TestEndToEnd_fullPipeline(t *testing.T) {
 		t.Errorf("expected 1 DELETE, got %d", typeCounts["DELETE"])
 	}
 
+	// ── 9b. bintrail query --format csv ─────────────────────────────────────
+	csvOut := run(t, binPath, coverDir, "query",
+		"--index-dsn", indexDSN,
+		"--schema", sourceName,
+		"--table", "orders",
+		"--format", "csv",
+		"--limit", "100",
+	)
+	if !strings.HasPrefix(strings.TrimSpace(csvOut), "event_id") {
+		t.Errorf("expected CSV header starting with 'event_id':\n%s", csvOut)
+	}
+	// 5 data rows + 1 header line.
+	csvLines := strings.Split(strings.TrimSpace(csvOut), "\n")
+	if len(csvLines) != 6 {
+		t.Errorf("expected 6 CSV lines (1 header + 5 data), got %d", len(csvLines))
+	}
+
+	// ── 9c. bintrail query --format table ────────────────────────────────────
+	tableOut := run(t, binPath, coverDir, "query",
+		"--index-dsn", indexDSN,
+		"--schema", sourceName,
+		"--table", "orders",
+		"--format", "table",
+		"--limit", "100",
+	)
+	if !strings.Contains(tableOut, "TYPE") || !strings.Contains(tableOut, "PK_VALUES") {
+		t.Errorf("expected table header columns in table output:\n%s", tableOut)
+	}
+	if !strings.Contains(tableOut, "INSERT") {
+		t.Errorf("expected INSERT rows in table output:\n%s", tableOut)
+	}
+
+	// ── 9d. bintrail query --pk 1 (Alice: 1 INSERT + 1 UPDATE) ───────────────
+	pkOut := run(t, binPath, coverDir, "query",
+		"--index-dsn", indexDSN,
+		"--schema", sourceName,
+		"--table", "orders",
+		"--pk", "1",
+		"--format", "json",
+		"--limit", "100",
+	)
+	var pkEvents []map[string]any
+	if err := json.Unmarshal([]byte(pkOut), &pkEvents); err != nil {
+		t.Fatalf("failed to parse pk query JSON: %v\n%s", err, pkOut)
+	}
+	if len(pkEvents) != 2 {
+		t.Errorf("expected 2 events for pk=1 (Alice: INSERT + UPDATE), got %d", len(pkEvents))
+	}
+
+	// ── 9e. bintrail query --changed-column status (Alice UPDATE only) ────────
+	changedOut := run(t, binPath, coverDir, "query",
+		"--index-dsn", indexDSN,
+		"--schema", sourceName,
+		"--table", "orders",
+		"--changed-column", "status",
+		"--format", "json",
+		"--limit", "100",
+	)
+	var changedEvents []map[string]any
+	if err := json.Unmarshal([]byte(changedOut), &changedEvents); err != nil {
+		t.Fatalf("failed to parse changed-column query JSON: %v\n%s", err, changedOut)
+	}
+	if len(changedEvents) != 1 {
+		t.Errorf("expected 1 event with changed column 'status', got %d", len(changedEvents))
+	}
+	if len(changedEvents) == 1 {
+		if et, ok := changedEvents[0]["event_type"].(string); !ok || et != "UPDATE" {
+			t.Errorf("expected UPDATE for changed-column=status, got %v", changedEvents[0]["event_type"])
+		}
+	}
+
 	// ── 10. bintrail recover (DELETE → INSERT) ──────────────────────────────
 	recoverDeleteOut := run(t, binPath, coverDir, "recover",
 		"--index-dsn", indexDSN,
@@ -180,6 +251,26 @@ func TestEndToEnd_fullPipeline(t *testing.T) {
 		t.Errorf("expected original status 'new' in recovery:\n%s", recoverUpdateOut)
 	}
 
+	// ── 11b. bintrail recover --output (DELETE → file) ──────────────────────
+	recoverFile := filepath.Join(tmpDir, "recovery.sql")
+	run(t, binPath, coverDir, "recover",
+		"--index-dsn", indexDSN,
+		"--schema", sourceName,
+		"--table", "orders",
+		"--event-type", "DELETE",
+		"--output", recoverFile,
+	)
+	recoverContent, err := os.ReadFile(recoverFile)
+	if err != nil {
+		t.Fatalf("expected recovery.sql to be created, read failed: %v", err)
+	}
+	if !strings.Contains(string(recoverContent), "INSERT INTO") {
+		t.Errorf("expected INSERT INTO in recovery file:\n%s", string(recoverContent))
+	}
+	if !strings.Contains(string(recoverContent), "Charlie") {
+		t.Errorf("expected Charlie's data in recovery file:\n%s", string(recoverContent))
+	}
+
 	// ── 12. bintrail status ──────────────────────────────────────────────────
 	statusOut := run(t, binPath, coverDir, "status", "--index-dsn", indexDSN)
 	if !strings.Contains(statusOut, "=== Indexed Files ===") {
@@ -197,10 +288,9 @@ func TestEndToEnd_fullPipeline(t *testing.T) {
 		"--index-dsn", indexDSN,
 		"--add-future", "3",
 	)
-	if !strings.Contains(rotateOut, "partition") || !strings.Contains(strings.ToLower(rotateOut), "added") ||
-		(!strings.Contains(rotateOut, "3") && !strings.Contains(rotateOut, "partition")) {
-		// Just check that it ran without error — exact output may vary.
-		t.Logf("rotate output: %s", rotateOut)
+	// rotate writes "added partition p_YYYYMMDD" lines to stderr (captured by CombinedOutput).
+	if !strings.Contains(rotateOut, "added partition") {
+		t.Errorf("expected 'added partition' in rotate output:\n%s", rotateOut)
 	}
 
 	// ── 14. Convert binary coverage data to text format ──────────────────────
