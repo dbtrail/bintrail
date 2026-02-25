@@ -1,0 +1,57 @@
+name: bintrail-demo
+
+volumes:
+  mysql-data:
+
+services:
+
+  # ── MySQL ───────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: demo
+      MYSQL_DATABASE: bintrail_index
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/my.cnf:/etc/mysql/conf.d/bintrail.cnf:ro
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pdemo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── Traffic generator ───────────────────────────────────────
+  traffic:
+    build:
+      context: ./traffic
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASS: demo
+      MYSQL_DB:   demo
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: on-failure
+
+  # ── Bintrail (init → snapshot → stream) ─────────────────────
+  bintrail:
+    build:
+      context: ../        # repo root (go.mod lives there)
+      dockerfile: demo/bintrail/Dockerfile
+    environment:
+      INDEX_DSN:  "root:demo@tcp(mysql:3306)/bintrail_index"
+      SOURCE_DSN: "root:demo@tcp(mysql:3306)/"
+      SCHEMAS:    "demo,sbtest"
+      SERVER_ID:  "99999"
+      BATCH_SIZE: "500"
+      CHECKPOINT: "5"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: on-failure

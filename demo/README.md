@@ -1,0 +1,135 @@
+# Bintrail Demo
+
+One command spins up a self-contained environment: MySQL with binlog enabled, a traffic generator, and bintrail running init → snapshot → stream. Everything is indexed live. You query from the host.
+
+## Start
+
+```bash
+cd demo
+docker compose up --build
+```
+
+Wait ~30 seconds for MySQL to initialize and bintrail to start streaming. You'll know it's ready when you see:
+
+```
+bintrail-1  | Streaming started (server-id=99999, checkpoint=5s)
+bintrail-1  | Checkpoint saved: mysql-bin.000003 pos=... events=...
+```
+
+## Connect from the host
+
+```bash
+export BINTRAIL_INDEX_DSN='root:demo@tcp(127.0.0.1:3307)/bintrail_index'
+```
+
+MySQL is on port **3307** (not 3306) to avoid conflicts with a local MySQL.
+
+## Useful queries
+
+```bash
+# How many events are indexed?
+bintrail status --index-dsn "$BINTRAIL_INDEX_DSN"
+
+# Last 20 events across all demo tables
+bintrail query --index-dsn "$BINTRAIL_INDEX_DSN" --schema demo --format table --limit 20
+
+# Watch customer deletions (CASCADE fires across 4 tables per delete)
+bintrail query --index-dsn "$BINTRAIL_INDEX_DSN" --schema demo --table customers --event-type DELETE --format table
+
+# See the trigger-generated audit log
+bintrail query --index-dsn "$BINTRAIL_INDEX_DSN" --schema demo --table audit_log --format json --limit 5
+
+# PK-less tables (recovery uses all-columns WHERE fallback)
+bintrail query --index-dsn "$BINTRAIL_INDEX_DSN" --schema demo --table event_log --format table
+
+# Generate reversal SQL for deleted customers (most recent 10)
+bintrail recover --index-dsn "$BINTRAIL_INDEX_DSN" --schema demo --table customers --event-type DELETE --dry-run --limit 10
+
+# Same but save to a file
+bintrail recover --index-dsn "$BINTRAIL_INDEX_DSN" --schema demo --table customers --event-type DELETE --output /tmp/undo.sql
+```
+
+## MCP tools (Claude integration)
+
+The `.mcp.json` at the repo root registers bintrail as an MCP server. Set the env var and the `query`, `recover`, and `status` tools work automatically in Claude:
+
+```bash
+export BINTRAIL_INDEX_DSN='root:demo@tcp(127.0.0.1:3307)/bintrail_index'
+```
+
+## What the traffic generates
+
+Every ~5 seconds the `traffic` container runs a chaos cycle:
+
+| Step | Tables touched | Why it's interesting |
+|------|---------------|----------------------|
+| INSERT 5 customers | `customers` | Basic INSERTs |
+| INSERT orders | `orders` + `customer_stats` | Trigger `trg_orders_after_insert` fires → stats upserted in same GTID |
+| INSERT order items | `order_items` | STORED generated column `line_total` appears in binlog |
+| UPDATE 3 customers | `customers` + `audit_log` | Trigger `trg_customers_after_update` fires → JSON old/new in audit_log |
+| UPDATE order statuses | `orders` | Standard UPDATEs |
+| INSERT products | `products` | Has a VIRTUAL column (`price_with_tax`) excluded from binlog — parser logs a column-count mismatch warning, events skipped |
+| INSERT into PK-less tables | `event_log`, `metrics` | `pk_values` is empty; recovery uses all-columns WHERE clause |
+| DELETE 1 random customer | `customers` → `orders` → `order_items` + `customer_stats` | ON DELETE CASCADE: one DELETE in app → 4 tables get DELETE events with same GTID |
+| DELETE old PK-less rows | `event_log`, `metrics` | PK-less DELETEs |
+
+Sysbench runs `oltp_read_write` on the `sbtest` database (2 threads, indefinitely) in parallel.
+
+## What to look for in the logs
+
+```bash
+docker compose logs bintrail -f
+```
+
+- `Checkpoint saved: ... events=N` — events indexed since stream start, grows ~12k/5s
+- `column count mismatch` warnings — expected for the `products` table (VIRTUAL column)
+- No other warnings = everything healthy
+
+```bash
+docker compose logs traffic -f
+```
+
+- `[traffic] Chaos cycle N` — each cycle runs all 9 steps
+- sysbench throughput report every 30s
+
+## Stop and restart
+
+```bash
+# Stop, keep data
+docker compose down
+
+# Restart (bintrail resumes from saved GTID checkpoint — no re-init needed)
+docker compose up
+
+# Stop and wipe everything
+docker compose down -v
+```
+
+After a clean restart (`down` without `-v`), bintrail skips init/snapshot if the tables already exist and resumes streaming from the last checkpoint in `stream_state`.
+
+> **Note:** `down -v` wipes the MySQL data volume. Next `up --build` re-runs from scratch (init + snapshot + stream from current GTID).
+
+## Ports and credentials
+
+| | |
+|-|-|
+| MySQL host (from host machine) | `127.0.0.1:3307` |
+| MySQL host (between containers) | `mysql:3306` |
+| MySQL root password | `demo` |
+| Index database | `bintrail_index` |
+| Source databases | `demo`, `sbtest` |
+| Bintrail stream server-id | `99999` |
+
+## Troubleshooting
+
+**bintrail stuck on "Waiting for demo.customers..."**
+MySQL is still initializing. Wait a bit longer — init scripts take 10–20s on first run.
+
+**"column count mismatch" warnings for `products`**
+Expected. The `products` table has a VIRTUAL generated column (`price_with_tax`) that MySQL excludes from the binlog. The schema snapshot includes it; the binlog doesn't. Bintrail skips those events and logs a warning.
+
+**traffic container restarting**
+Run `docker compose logs traffic` to see the error. Most common cause: ran `docker compose up` without `-v` after a failed first start — the sysbench tables from the previous run already exist. Fixed automatically by `sysbench cleanup` before `prepare`. If it persists, `docker compose down -v && docker compose up`.
+
+**Port 3307 already in use**
+Change the port mapping in `compose.yml`: `"3308:3306"` and update `BINTRAIL_INDEX_DSN` accordingly.
