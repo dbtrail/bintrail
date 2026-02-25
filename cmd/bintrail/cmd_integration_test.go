@@ -125,6 +125,24 @@ func TestUpsertFileState_failed(t *testing.T) {
 	}
 }
 
+// ─── validateBinlogFormat ────────────────────────────────────────────────────
+
+func TestValidateBinlogFormat_row(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	// Docker test container should have binlog_format=ROW.
+	dsn := testutil.IntegrationDSN("")
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("failed to open: %v", err)
+	}
+	defer db.Close()
+
+	if err := validateBinlogFormat(db); err != nil {
+		t.Fatalf("expected nil error for ROW binlog_format, got: %v", err)
+	}
+}
+
 // ─── validateBinlogRowImage ──────────────────────────────────────────────────
 
 func TestValidateBinlogRowImage_full(t *testing.T) {
@@ -140,6 +158,76 @@ func TestValidateBinlogRowImage_full(t *testing.T) {
 
 	if err := validateBinlogRowImage(db); err != nil {
 		t.Fatalf("expected nil error for FULL binlog_row_image, got: %v", err)
+	}
+}
+
+// ─── validateNoFKCascades ────────────────────────────────────────────────────
+
+func TestValidateNoFKCascades_none(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+
+	testutil.MustExec(t, db, `CREATE TABLE orders (
+		id INT PRIMARY KEY AUTO_INCREMENT,
+		total DECIMAL(10,2) NOT NULL
+	)`)
+
+	if err := validateNoFKCascades(db, []string{dbName}); err != nil {
+		t.Fatalf("expected nil error for schema with no cascades, got: %v", err)
+	}
+}
+
+func TestValidateNoFKCascades_cascade(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+
+	testutil.MustExec(t, db, `CREATE TABLE orders (
+		id INT PRIMARY KEY AUTO_INCREMENT,
+		total DECIMAL(10,2) NOT NULL
+	)`)
+	testutil.MustExec(t, db, `CREATE TABLE order_items (
+		id     INT PRIMARY KEY AUTO_INCREMENT,
+		order_id INT NOT NULL,
+		CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+	)`)
+
+	if err := validateNoFKCascades(db, []string{dbName}); err == nil {
+		t.Fatal("expected error for schema with FK cascade, got nil")
+	}
+}
+
+func TestValidateNoFKCascades_updateCascade(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+
+	testutil.MustExec(t, db, `CREATE TABLE categories (
+		id INT PRIMARY KEY AUTO_INCREMENT,
+		name VARCHAR(100) NOT NULL
+	)`)
+	testutil.MustExec(t, db, `CREATE TABLE products (
+		id          INT PRIMARY KEY AUTO_INCREMENT,
+		category_id INT NOT NULL,
+		CONSTRAINT fk_cat FOREIGN KEY (category_id) REFERENCES categories(id) ON UPDATE CASCADE
+	)`)
+
+	if err := validateNoFKCascades(db, []string{dbName}); err == nil {
+		t.Fatal("expected error for schema with UPDATE CASCADE, got nil")
+	}
+}
+
+func TestValidateNoFKCascades_otherSchemaIgnored(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	otherDB, otherName := testutil.CreateTestDB(t)
+
+	// Create a cascade in otherDB.
+	testutil.MustExec(t, otherDB, `CREATE TABLE parents (id INT PRIMARY KEY)`)
+	testutil.MustExec(t, otherDB, `CREATE TABLE children (
+		id INT PRIMARY KEY,
+		parent_id INT NOT NULL,
+		CONSTRAINT fk_p FOREIGN KEY (parent_id) REFERENCES parents(id) ON DELETE CASCADE
+	)`)
+
+	// dbName has no cascades — checking only dbName should pass.
+	_ = dbName
+	if err := validateNoFKCascades(db, []string{dbName}); err != nil {
+		t.Fatalf("expected nil when cascade is only in %q (not targeted), got: %v", otherName, err)
 	}
 }
 
