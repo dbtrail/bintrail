@@ -305,10 +305,20 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}
 	defer sourceDB.Close()
 
+	if err := validateBinlogFormat(sourceDB); err != nil {
+		return err
+	}
+	fmt.Println("Source: binlog_format=ROW ✓")
+
 	if err := validateBinlogRowImage(sourceDB); err != nil {
 		return err
 	}
 	fmt.Println("Source: binlog_row_image=FULL ✓")
+
+	if err := validateNoFKCascades(sourceDB, parseSchemaList(strmSchemas)); err != nil {
+		return err
+	}
+	fmt.Println("Source: no FK cascades ✓")
 
 	// ── 3. Schema snapshot + resolver ────────────────────────────────────────
 	resolver, err := ensureResolver(indexDB, sourceDB, parseSchemaList(strmSchemas))

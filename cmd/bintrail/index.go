@@ -74,12 +74,22 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		}
 		defer sourceDB.Close()
 
+		if err := validateBinlogFormat(sourceDB); err != nil {
+			return err
+		}
+		fmt.Println("Source: binlog_format=ROW ✓")
+
 		if err := validateBinlogRowImage(sourceDB); err != nil {
 			return err
 		}
 		fmt.Println("Source: binlog_row_image=FULL ✓")
+
+		if err := validateNoFKCascades(sourceDB, parseSchemaList(idxSchemas)); err != nil {
+			return err
+		}
+		fmt.Println("Source: no FK cascades ✓")
 	} else {
-		log.Println("WARNING: --source-dsn not provided; skipping binlog_row_image validation")
+		log.Println("WARNING: --source-dsn not provided; skipping source server validation")
 	}
 
 	// ── 2. Index database connection ──────────────────────────────────────────
@@ -273,6 +283,22 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 
+// validateBinlogFormat checks that the source server has binlog_format=ROW.
+func validateBinlogFormat(db *sql.DB) error {
+	var varName, val string
+	err := db.QueryRow("SHOW VARIABLES LIKE 'binlog_format'").Scan(&varName, &val)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("binlog_format not found on source server")
+	}
+	if err != nil {
+		return fmt.Errorf("failed to query binlog_format: %w", err)
+	}
+	if !strings.EqualFold(val, "ROW") {
+		return fmt.Errorf("source server has binlog_format=%q; bintrail requires ROW", val)
+	}
+	return nil
+}
+
 // validateBinlogRowImage checks that the source server has binlog_row_image=FULL.
 func validateBinlogRowImage(db *sql.DB) error {
 	var varName, val string
@@ -285,6 +311,54 @@ func validateBinlogRowImage(db *sql.DB) error {
 	}
 	if !strings.EqualFold(val, "FULL") {
 		return fmt.Errorf("source server has binlog_row_image=%q; bintrail requires FULL", val)
+	}
+	return nil
+}
+
+// validateNoFKCascades checks that none of the targeted schemas contain foreign
+// key constraints with CASCADE rules. When schemas is empty, all non-system
+// schemas are checked. FK cascades produce invisible side-effect row changes
+// that make reversal SQL unreliable.
+func validateNoFKCascades(db *sql.DB, schemas []string) error {
+	query := `SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, DELETE_RULE, UPDATE_RULE
+		FROM information_schema.REFERENTIAL_CONSTRAINTS
+		WHERE (DELETE_RULE = 'CASCADE' OR UPDATE_RULE = 'CASCADE')`
+
+	var args []any
+	if len(schemas) > 0 {
+		placeholders := strings.Repeat("?,", len(schemas))
+		query += " AND CONSTRAINT_SCHEMA IN (" + placeholders[:len(placeholders)-1] + ")"
+		for _, s := range schemas {
+			args = append(args, s)
+		}
+	} else {
+		query += " AND CONSTRAINT_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys')"
+	}
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return fmt.Errorf("failed to query FK cascades: %w", err)
+	}
+	defer rows.Close()
+
+	type cascade struct{ schema, name, deleteRule, updateRule string }
+	var found []cascade
+	for rows.Next() {
+		var c cascade
+		if err := rows.Scan(&c.schema, &c.name, &c.deleteRule, &c.updateRule); err != nil {
+			return fmt.Errorf("failed to scan FK cascade row: %w", err)
+		}
+		found = append(found, c)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate FK cascade rows: %w", err)
+	}
+
+	if len(found) > 0 {
+		for _, c := range found {
+			log.Printf("FK cascade: %s.%s (DELETE_RULE=%s, UPDATE_RULE=%s)", c.schema, c.name, c.deleteRule, c.updateRule)
+		}
+		return fmt.Errorf("%d FK cascade constraint(s) found in indexed schemas; reversal SQL from `recover` may not correctly handle cascade side-effects", len(found))
 	}
 	return nil
 }
