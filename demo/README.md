@@ -33,7 +33,7 @@ bintrail status --index-dsn "$BINTRAIL_INDEX_DSN"
 # Last 20 events across all demo tables
 bintrail query --index-dsn "$BINTRAIL_INDEX_DSN" --schema demo --format table --limit 20
 
-# Watch customer deletions (CASCADE fires across 4 tables per delete)
+# Watch customer deletions (explicit child-first deletes across 4 tables per cycle)
 bintrail query --index-dsn "$BINTRAIL_INDEX_DSN" --schema demo --table customers --event-type DELETE --format table
 
 # See the trigger-generated audit log
@@ -70,7 +70,7 @@ Every ~5 seconds the `traffic` container runs a chaos cycle:
 | UPDATE order statuses | `orders` | Standard UPDATEs |
 | INSERT products | `products` | Has a VIRTUAL column (`price_with_tax`) excluded from binlog — parser logs a column-count mismatch warning, events skipped |
 | INSERT into PK-less tables | `event_log`, `metrics` | `pk_values` is empty; recovery uses all-columns WHERE clause |
-| DELETE 1 random customer | `customers` → `orders` → `order_items` + `customer_stats` | ON DELETE CASCADE: one DELETE in app → 4 tables get DELETE events with same GTID |
+| DELETE 1 random customer | `customers`, `orders`, `order_items`, `customer_stats` | Explicit child-first deletes in one transaction → 4 tables get DELETE events |
 | DELETE old PK-less rows | `event_log`, `metrics` | PK-less DELETEs |
 
 Sysbench runs `oltp_read_write` on the `sbtest` database (2 threads, indefinitely) in parallel.

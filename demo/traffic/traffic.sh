@@ -132,10 +132,15 @@ while true; do
                  (SELECT COUNT(*) FROM orders),
                  JSON_OBJECT('cycle', $CYCLE))"
 
-    # 8. CASCADE DELETE — delete 1 random customer
-    #    This cascades to: orders → order_items, customer_stats
+    # 8. Explicit child-first delete — removes 1 random customer and all its children
+    #    Order matters: order_items → orders → customer_stats → customers
     #    Generates DELETE events across 4 tables in one transaction
-    sql "DELETE FROM customers ORDER BY RAND() LIMIT 1;"
+    sql "
+    SET @del_id = (SELECT id FROM customers ORDER BY RAND() LIMIT 1);
+    DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE customer_id = @del_id);
+    DELETE FROM orders WHERE customer_id = @del_id;
+    DELETE FROM customer_stats WHERE customer_id = @del_id;
+    DELETE FROM customers WHERE id = @del_id;"
 
     # 9. Delete old PK-less rows (PK-less DELETE events)
     sql "DELETE FROM event_log WHERE event_type = 'cycle' ORDER BY created_at LIMIT 3"

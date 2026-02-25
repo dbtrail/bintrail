@@ -1,6 +1,6 @@
 -- ============================================================
 -- Bintrail demo schema
--- Exercises: FK CASCADE chains, triggers, generated columns
+-- Exercises: explicit child-first deletes, triggers, generated columns
 -- (STORED vs VIRTUAL), PK-less tables, sysbench OLTP
 -- ============================================================
 
@@ -25,7 +25,7 @@ CREATE TABLE orders (
     total       DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
     created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id)
-        REFERENCES customers(id) ON DELETE CASCADE
+        REFERENCES customers(id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 CREATE TABLE order_items (
@@ -37,7 +37,7 @@ CREATE TABLE order_items (
     -- STORED generated column: appears in binlog
     line_total  DECIMAL(10,2)   GENERATED ALWAYS AS (quantity * unit_price) STORED,
     CONSTRAINT fk_items_order FOREIGN KEY (order_id)
-        REFERENCES orders(id) ON DELETE CASCADE
+        REFERENCES orders(id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 -- Products table: has both STORED and VIRTUAL generated columns.
@@ -62,14 +62,14 @@ CREATE TABLE products (
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
--- Customer aggregate stats — FK to customers (CASCADE DELETE)
+-- Customer aggregate stats — FK to customers
 CREATE TABLE customer_stats (
     customer_id     INT UNSIGNED    NOT NULL PRIMARY KEY,
     order_count     INT UNSIGNED    NOT NULL DEFAULT 0,
     total_spent     DECIMAL(12,2)   NOT NULL DEFAULT 0.00,
     last_order_at   DATETIME,
     CONSTRAINT fk_stats_customer FOREIGN KEY (customer_id)
-        REFERENCES customers(id) ON DELETE CASCADE
+        REFERENCES customers(id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 -- Audit log written by trigger (no FK, append-only)
