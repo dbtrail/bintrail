@@ -30,29 +30,29 @@ func ParseEventType(s string) (*parser.EventType, error) {
 	}
 }
 
-// ParseTime parses a datetime string using the local timezone.
+// ParseTime parses a datetime string as UTC.
 // Accepts three formats (tried in order):
-//   - MySQL datetime: "2006-01-02 15:04:05"
-//   - RFC 3339:       "2006-01-02T15:04:05Z07:00"
-//   - Date-only:      "2006-01-02" (interpreted as midnight local time)
+//   - MySQL datetime: "2006-01-02 15:04:05"  (interpreted as UTC)
+//   - RFC 3339:       "2006-01-02T15:04:05Z07:00" (timezone from string)
+//   - Date-only:      "2006-01-02" (interpreted as midnight UTC)
 //
 // Returns nil for an empty string.
 func ParseTime(s string) (*time.Time, error) {
 	if s == "" {
 		return nil, nil
 	}
-	// Try MySQL datetime format first.
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", s, time.Local)
+	// Try MySQL datetime format first — always UTC to match stored timestamps.
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", s, time.UTC)
 	if err == nil {
 		return &t, nil
 	}
-	// Try RFC 3339.
+	// Try RFC 3339 (preserves explicit timezone from the string).
 	t, err = time.Parse(time.RFC3339, s)
 	if err == nil {
 		return &t, nil
 	}
-	// Try date-only (midnight local time).
-	t, err = time.ParseInLocation("2006-01-02", s, time.Local)
+	// Try date-only (midnight UTC).
+	t, err = time.ParseInLocation("2006-01-02", s, time.UTC)
 	if err == nil {
 		return &t, nil
 	}
