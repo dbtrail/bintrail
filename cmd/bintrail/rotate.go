@@ -106,13 +106,13 @@ func runRotate(cmd *cobra.Command, args []string) error {
 		}
 
 		if len(toDrop) == 0 {
-			fmt.Fprintf(os.Stderr, "no partitions older than %s to drop\n", rotRetain)
+			fmt.Fprintf(os.Stdout, "no partitions older than %s to drop\n", rotRetain)
 		} else {
 			if err := dropPartitions(ctx, db, dbName, toDrop); err != nil {
 				return fmt.Errorf("failed to drop partitions: %w", err)
 			}
 			for _, name := range toDrop {
-				fmt.Fprintf(os.Stderr, "dropped partition %s\n", name)
+				fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
 			}
 			droppedCount = len(toDrop)
 			// Refresh list so nextPartitionStart sees current state.
@@ -138,7 +138,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to add future partitions: %w", err)
 		}
 		for i := range rotAddFuture {
-			fmt.Fprintf(os.Stderr, "added partition %s\n", partitionName(startDate.AddDate(0, 0, i)))
+			fmt.Fprintf(os.Stdout, "added partition %s\n", partitionName(startDate.AddDate(0, 0, i)))
 		}
 	}
 

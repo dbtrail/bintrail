@@ -3,6 +3,7 @@
 package main_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -288,7 +289,7 @@ func TestEndToEnd_fullPipeline(t *testing.T) {
 		"--index-dsn", indexDSN,
 		"--add-future", "3",
 	)
-	// rotate writes "added partition p_YYYYMMDD" lines to stderr (captured by CombinedOutput).
+	// rotate writes "added partition p_YYYYMMDD" lines to stdout.
 	if !strings.Contains(rotateOut, "added partition") {
 		t.Errorf("expected 'added partition' in rotate output:\n%s", rotateOut)
 	}
@@ -322,11 +323,14 @@ func run(t *testing.T, binPath, coverDir string, args ...string) string {
 	if coverDir != "" {
 		cmd.Env = append(os.Environ(), "GOCOVERDIR="+coverDir)
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("bintrail %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("bintrail %s failed: %v\nstdout:\n%s\nstderr:\n%s",
+			strings.Join(args, " "), err, stdout.String(), stderr.String())
 	}
-	return string(out)
+	return stdout.String()
 }
 
 // projectRoot finds the project root by looking for go.mod.
