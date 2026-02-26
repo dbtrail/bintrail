@@ -14,6 +14,7 @@ SCHEMAS="${SCHEMAS:-demo,sbtest}"
 SERVER_ID="${SERVER_ID:-99999}"
 BATCH_SIZE="${BATCH_SIZE:-500}"
 CHECKPOINT="${CHECKPOINT:-5}"
+METRICS_ADDR="${METRICS_ADDR:-}"
 
 log() { echo "[bintrail] $(date '+%H:%M:%S') $*"; }
 
@@ -54,7 +55,8 @@ if [ -z "$START_GTID" ]; then
         --server-id   "$SERVER_ID" \
         --batch-size  "$BATCH_SIZE" \
         --checkpoint  "$CHECKPOINT" \
-        --schemas     "$SCHEMAS"
+        --schemas     "$SCHEMAS" \
+        ${METRICS_ADDR:+--metrics-addr "$METRICS_ADDR"}
 fi
 
 log "Start GTID: $START_GTID"
@@ -70,4 +72,5 @@ exec bintrail stream \
     --start-gtid  "$START_GTID" \
     --batch-size  "$BATCH_SIZE" \
     --checkpoint  "$CHECKPOINT" \
-    --schemas     "$SCHEMAS"
+    --schemas     "$SCHEMAS" \
+    ${METRICS_ADDR:+--metrics-addr "$METRICS_ADDR"}

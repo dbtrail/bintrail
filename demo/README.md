@@ -109,6 +109,16 @@ After a clean restart (`down` without `-v`), bintrail skips init/snapshot if the
 
 > **Note:** `down -v` wipes the MySQL data volume. Next `up --build` re-runs from scratch (init + snapshot + stream from current GTID).
 
+## Dashboards
+
+Once everything is running, open **http://localhost:3000** for the Bintrail Stream dashboard (no login required). It shows replication lag, event throughput, batch sizes, and errors — all updating live every 5 seconds.
+
+Raw metrics are also available directly:
+
+```bash
+curl -s 'localhost:9090/api/v1/query?query=bintrail_stream_replication_lag_seconds' | jq
+```
+
 ## Ports and credentials
 
 | | |
@@ -119,6 +129,8 @@ After a clean restart (`down` without `-v`), bintrail skips init/snapshot if the
 | Index database | `bintrail_index` |
 | Source databases | `demo`, `sbtest` |
 | Bintrail stream server-id | `99999` |
+| Grafana (dashboard) | http://localhost:3000 |
+| Prometheus (metrics) | http://localhost:9090 |
 
 ## Troubleshooting
 
