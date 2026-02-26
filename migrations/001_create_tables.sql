@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS schema_snapshots (
     data_type        VARCHAR(64)  NOT NULL,
     is_nullable      VARCHAR(3)   NOT NULL,
     column_default   TEXT         DEFAULT NULL,
+    is_generated     TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '1 if STORED or VIRTUAL generated column',
     INDEX idx_snapshot_id    (snapshot_id),
     INDEX idx_snapshot_table (snapshot_id, schema_name, table_name)
 ) ENGINE=InnoDB;

@@ -164,6 +164,7 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		data_type        VARCHAR(64)  NOT NULL,
 		is_nullable      VARCHAR(3)   NOT NULL,
 		column_default   TEXT         DEFAULT NULL,
+		is_generated     TINYINT(1)   NOT NULL DEFAULT 0,
 		INDEX idx_snapshot_id    (snapshot_id),
 		INDEX idx_snapshot_table (snapshot_id, schema_name, table_name)
 	) ENGINE=InnoDB`)
