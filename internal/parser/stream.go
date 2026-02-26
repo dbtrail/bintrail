@@ -5,6 +5,7 @@ package parser
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
@@ -17,12 +18,17 @@ import (
 type StreamParser struct {
 	resolver *metadata.Resolver
 	filters  Filters
+	logger   *slog.Logger
 }
 
 // NewStreamParser creates a StreamParser that resolves column names via
 // resolver and applies the given filters.
-func NewStreamParser(resolver *metadata.Resolver, filters Filters) *StreamParser {
-	return &StreamParser{resolver: resolver, filters: filters}
+// logger may be nil, in which case slog.Default() is used.
+func NewStreamParser(resolver *metadata.Resolver, filters Filters, logger *slog.Logger) *StreamParser {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &StreamParser{resolver: resolver, filters: filters, logger: logger}
 }
 
 // Run reads events from the streamer and sends matching row events to out.
@@ -52,10 +58,10 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			currentGTID = formatGTID(ev.SID, ev.GNO)
 
 		case *replication.QueryEvent:
-			warnOnDDL(currentFile, binlogEv.Header.LogPos, string(ev.Query))
+			warnOnDDL(sp.logger, currentFile, binlogEv.Header.LogPos, string(ev.Query))
 
 		case *replication.RowsEvent:
-			if err := handleRows(ctx, sp.resolver, &sp.filters, binlogEv, ev, currentFile, currentGTID, out); err != nil {
+			if err := handleRows(ctx, sp.logger, sp.resolver, &sp.filters, binlogEv, ev, currentFile, currentGTID, out); err != nil {
 				if ctx.Err() != nil {
 					return nil // context cancelled during row processing
 				}

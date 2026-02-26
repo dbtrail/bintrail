@@ -2,8 +2,8 @@ package parser
 
 import (
 	"bytes"
-	"log"
-	"os"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/bintrail/bintrail/internal/metadata"
@@ -181,14 +181,14 @@ func TestFilters_Matches_bothFilters(t *testing.T) {
 
 // ─── warnOnDDL ────────────────────────────────────────────────────────────────
 
+// newTestLogger returns a slog.Logger that writes text output to buf.
+func newTestLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
 func TestWarnOnDDL_ddlStatements(t *testing.T) {
-	// warnOnDDL uses log.Printf. Capture output via log.SetOutput.
 	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
-	origFlags := log.Flags()
-	log.SetFlags(0)
-	defer log.SetFlags(origFlags)
+	logger := newTestLogger(&buf)
 
 	ddlStmts := []string{
 		"ALTER TABLE orders ADD COLUMN foo INT",
@@ -199,7 +199,7 @@ func TestWarnOnDDL_ddlStatements(t *testing.T) {
 	}
 	for _, stmt := range ddlStmts {
 		buf.Reset()
-		warnOnDDL("binlog.000001", 100, stmt)
+		warnOnDDL(logger, "binlog.000001", 100, stmt)
 		if buf.Len() == 0 {
 			t.Errorf("expected warning for DDL %q, got none", stmt)
 		}
@@ -208,11 +208,7 @@ func TestWarnOnDDL_ddlStatements(t *testing.T) {
 
 func TestWarnOnDDL_nonDDL(t *testing.T) {
 	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
-	origFlags := log.Flags()
-	log.SetFlags(0)
-	defer log.SetFlags(origFlags)
+	logger := newTestLogger(&buf)
 
 	nonDDL := []string{
 		"BEGIN",
@@ -223,7 +219,7 @@ func TestWarnOnDDL_nonDDL(t *testing.T) {
 	}
 	for _, stmt := range nonDDL {
 		buf.Reset()
-		warnOnDDL("binlog.000001", 100, stmt)
+		warnOnDDL(logger, "binlog.000001", 100, stmt)
 		if buf.Len() != 0 {
 			t.Errorf("expected no warning for non-DDL %q, got: %s", stmt, buf.String())
 		}
@@ -232,14 +228,10 @@ func TestWarnOnDDL_nonDDL(t *testing.T) {
 
 func TestWarnOnDDL_caseInsensitive(t *testing.T) {
 	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
-	origFlags := log.Flags()
-	log.SetFlags(0)
-	defer log.SetFlags(origFlags)
+	logger := newTestLogger(&buf)
 
-	warnOnDDL("binlog.000001", 100, "alter table orders add column x int")
-	if buf.Len() == 0 {
-		t.Error("expected warning for lowercase DDL")
+	warnOnDDL(logger, "binlog.000001", 100, "alter table orders add column x int")
+	if !strings.Contains(buf.String(), "DDL detected") {
+		t.Errorf("expected DDL warning for lowercase DDL, got: %q", buf.String())
 	}
 }

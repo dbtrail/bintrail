@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -51,6 +52,8 @@ func init() {
 }
 
 func runRotate(cmd *cobra.Command, args []string) error {
+	start := time.Now()
+
 	if rotRetain == "" && rotAddFuture == 0 {
 		return fmt.Errorf("at least one of --retain or --add-future is required")
 	}
@@ -88,6 +91,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Drop old partitions ───────────────────────────────────────────────────
+	var droppedCount int
 	if rotRetain != "" {
 		cutoff := time.Now().UTC().Add(-retainDur).Truncate(24 * time.Hour)
 		var toDrop []string
@@ -110,6 +114,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			for _, name := range toDrop {
 				fmt.Fprintf(os.Stderr, "dropped partition %s\n", name)
 			}
+			droppedCount = len(toDrop)
 			// Refresh list so nextPartitionStart sees current state.
 			partitions, err = listPartitions(ctx, db, dbName)
 			if err != nil {
@@ -121,10 +126,9 @@ func runRotate(cmd *cobra.Command, args []string) error {
 	// ── Warn if p_future already holds data ───────────────────────────────────
 	hasFutureData, err := partitionHasData(ctx, db, dbName)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not check p_future data: %v\n", err)
+		slog.Warn("could not check p_future data", "error", err)
 	} else if hasFutureData {
-		fmt.Fprintln(os.Stderr, "warning: p_future partition contains data — events are arriving "+
-			"outside all named partition ranges; consider adding more future partitions with --add-future")
+		slog.Warn("p_future partition contains data — events are arriving outside all named partition ranges; consider adding more future partitions with --add-future")
 	}
 
 	// ── Add new future partitions ─────────────────────────────────────────────
@@ -137,6 +141,11 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "added partition %s\n", partitionName(startDate.AddDate(0, 0, i)))
 		}
 	}
+
+	slog.Info("rotation complete",
+		"partitions_dropped", droppedCount,
+		"partitions_added", rotAddFuture,
+		"duration_ms", time.Since(start).Milliseconds())
 
 	return nil
 }

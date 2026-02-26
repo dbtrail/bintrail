@@ -39,6 +39,7 @@ internal/
   cliutil/cliutil.go   # Shared filter parsers: ParseEventType, ParseTime, IsValidFormat
   config/config.go     # config.Connect(dsn) — opens and pings *sql.DB
   metadata/            # Schema snapshot loader and resolver
+  observe/             # Observability: Setup(), ParseLevel(), Nop() (slog) + Prometheus metrics for stream
   parser/              # Binlog file parser + StreamParser (go-mysql-org/go-mysql)
   indexer/             # Batch writer to binlog_events
   query/               # Query engine + result formatters (table/json/csv)
@@ -62,6 +63,10 @@ docs/
 
 ## Commands
 
+Global persistent flags (all commands via `rootCmd.PersistentFlags`):
+- `--log-level` (default `info`) — slog level: debug, info, warn, error
+- `--log-format` (default `text`) — log format: text or json (JSON for log aggregators)
+
 | Command | File | Key flags |
 |---|---|---|
 | `init` | `init.go` | `--index-dsn` (req), `--partitions` (default 7) |
@@ -71,6 +76,7 @@ docs/
 | `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000) |
 | `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future` |
 | `status` | `status.go` | `--index-dsn` (req) |
+| `stream` | `stream.go` | … + `--metrics-addr` (e.g. `:9090`; empty = disabled) |
 | `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint` |
 
 Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `stIndexDSN`, `strmIndexDSN`).
@@ -289,8 +295,52 @@ Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 | `github.com/go-sql-driver/mysql` | MySQL driver + `mysql.ParseDSN` |
 | `github.com/spf13/cobra` | CLI framework |
 | `github.com/modelcontextprotocol/go-sdk` | MCP server SDK (`cmd/bintrail-mcp` only) |
+| `github.com/prometheus/client_golang` | Prometheus metrics (`internal/observe`, `cmd/bintrail/stream.go`) |
 
 Transitive deps pulled in by go-mysql: shopspring/decimal, pingcap/errors, pingcap/tidb, google/uuid, klauspost/compress, zap, etc. These are indirect — don't import them directly.
+
+## Observability
+
+### Structured logging (`internal/observe`)
+
+All logging uses `log/slog` (stdlib, Go 1.21+). The root command configures the global logger via `PersistentPreRunE`:
+
+```
+bintrail --log-level debug --log-format json query ...
+```
+
+- `observe.Setup(w, format, level)` — creates and sets `slog.Default()`; called once in `PersistentPreRunE`
+- `observe.ParseLevel(s)` — string → `slog.Level`; unrecognised strings default to `info`
+- `observe.Nop()` — discards all output (use in tests)
+- `internal/parser`: `Parser` and `StreamParser` accept `*slog.Logger` (nil → `slog.Default()`)
+
+All commands emit structured completion log lines at `slog.Info` level:
+- `index`: `"indexing complete"` with `files_processed`, `events_indexed`
+- `query`: `"query complete"` with `results`, `format`, `duration_ms`
+- `recover`: `"recovery SQL generated"` with `statements`, `dry_run`, `duration_ms`
+- `rotate`: `"rotation complete"` with `partitions_dropped`, `partitions_added`, `duration_ms`
+
+### Prometheus metrics (`internal/observe/metrics.go`)
+
+The `stream` command exposes Prometheus metrics on an optional HTTP endpoint:
+
+```
+bintrail stream --metrics-addr :9090 ...
+curl localhost:9090/metrics | grep bintrail_stream
+```
+
+All metrics are in the `bintrail_stream_` namespace:
+
+| Metric | Type | Description |
+|---|---|---|
+| `bintrail_stream_events_received_total` | Counter | Binlog row events received |
+| `bintrail_stream_events_indexed_total` | Counter | Events written to binlog_events |
+| `bintrail_stream_batch_flushes_total` | Counter | Batch INSERT operations |
+| `bintrail_stream_checkpoint_saves_total` | Counter | Successful checkpoint writes |
+| `bintrail_stream_last_event_timestamp_seconds` | Gauge | Unix timestamp of last event |
+| `bintrail_stream_replication_lag_seconds` | Gauge | Age of last event in seconds |
+| `bintrail_stream_errors_total{type}` | Counter | Errors by type: batch_flush, checkpoint, gtid_update |
+| `bintrail_stream_batch_size` | Histogram | Events per batch flush |
 
 ## Documentation
 

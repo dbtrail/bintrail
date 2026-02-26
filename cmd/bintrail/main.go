@@ -5,6 +5,13 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/bintrail/bintrail/internal/observe"
+)
+
+var (
+	logLevel  string
+	logFormat string
 )
 
 var rootCmd = &cobra.Command{
@@ -14,6 +21,15 @@ var rootCmd = &cobra.Command{
 MySQL table with full before/after images, and provides query and recovery
 capabilities. The index is self-contained — recovery does not depend on
 binlog files still existing on disk.`,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		observe.Setup(os.Stderr, logFormat, logLevel)
+		return nil
+	},
+}
+
+func init() {
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
+	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log format: text or json")
 }
 
 func main() {

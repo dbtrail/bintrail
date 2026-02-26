@@ -6,7 +6,7 @@ package parser
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -72,12 +72,17 @@ type Parser struct {
 	binlogDir string
 	resolver  *metadata.Resolver
 	filters   Filters
+	logger    *slog.Logger
 }
 
 // New creates a Parser that reads from binlogDir, resolves column names via
 // resolver, and applies the given filters.
-func New(binlogDir string, resolver *metadata.Resolver, filters Filters) *Parser {
-	return &Parser{binlogDir: binlogDir, resolver: resolver, filters: filters}
+// logger may be nil, in which case slog.Default() is used.
+func New(binlogDir string, resolver *metadata.Resolver, filters Filters, logger *slog.Logger) *Parser {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Parser{binlogDir: binlogDir, resolver: resolver, filters: filters, logger: logger}
 }
 
 // ParseFiles parses multiple binlog files in order, sending events to the channel.
@@ -115,10 +120,10 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			currentGTID = formatGTID(ev.SID, ev.GNO)
 
 		case *replication.QueryEvent:
-			warnOnDDL(filename, binlogEv.Header.LogPos, string(ev.Query))
+			warnOnDDL(p.logger, filename, binlogEv.Header.LogPos, string(ev.Query))
 
 		case *replication.RowsEvent:
-			return handleRows(ctx, p.resolver, &p.filters, binlogEv, ev, filename, currentGTID, events)
+			return handleRows(ctx, p.logger, p.resolver, &p.filters, binlogEv, ev, filename, currentGTID, events)
 		}
 		return nil
 	})
@@ -132,6 +137,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 // the appropriate emit function. It is shared by Parser.ParseFile and StreamParser.Run.
 func handleRows(
 	ctx context.Context,
+	logger *slog.Logger,
 	resolver *metadata.Resolver,
 	filters *Filters,
 	binlogEv *replication.BinlogEvent,
@@ -149,7 +155,10 @@ func handleRows(
 	tm, err := resolver.Resolve(schema, table)
 	if err != nil {
 		// Table not in snapshot — warn and skip all rows for this event.
-		log.Printf("WARNING [%s pos %d]: %v — skipping", filename, binlogEv.Header.LogPos, err)
+		logger.Warn("table not in snapshot — skipping",
+			"file", filename,
+			"pos", binlogEv.Header.LogPos,
+			"error", err)
 		return nil
 	}
 
@@ -157,9 +166,13 @@ func handleRows(
 	// columns exist in the table at write time. If it differs from the snapshot,
 	// the column-to-name mapping would be wrong — skip and warn.
 	if int(rowsEv.Table.ColumnCount) != len(tm.Columns) {
-		log.Printf("WARNING [%s pos %d]: column count mismatch for %s.%s: binlog=%d snapshot=%d — skipping (consider re-running `bintrail snapshot`)",
-			filename, binlogEv.Header.LogPos, schema, table,
-			rowsEv.Table.ColumnCount, len(tm.Columns))
+		logger.Warn("column count mismatch — skipping (consider re-running `bintrail snapshot`)",
+			"file", filename,
+			"pos", binlogEv.Header.LogPos,
+			"schema", schema,
+			"table", table,
+			"binlog_columns", rowsEv.Table.ColumnCount,
+			"snapshot_columns", len(tm.Columns))
 		return nil
 	}
 
@@ -173,17 +186,17 @@ func handleRows(
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2:
-		return emitInserts(ctx, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
+		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
 
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2:
-		return emitDeletes(ctx, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
+		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
 
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
 		replication.UPDATE_ROWS_EVENTv2:
-		return emitUpdates(ctx, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
+		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
 	}
 
 	return nil
@@ -191,6 +204,7 @@ func handleRows(
 
 func emitInserts(
 	ctx context.Context,
+	logger *slog.Logger,
 	resolver *metadata.Resolver,
 	rows [][]any,
 	schema, table, filename, gtid string,
@@ -202,7 +216,8 @@ func emitInserts(
 	for _, row := range rows {
 		named, err := resolver.MapRow(schema, table, row)
 		if err != nil {
-			log.Printf("WARNING: failed to map INSERT row for %s.%s: %v — skipping row", schema, table, err)
+			logger.Warn("failed to map INSERT row — skipping",
+				"schema", schema, "table", table, "error", err)
 			continue
 		}
 		ev := Event{
@@ -223,6 +238,7 @@ func emitInserts(
 
 func emitDeletes(
 	ctx context.Context,
+	logger *slog.Logger,
 	resolver *metadata.Resolver,
 	rows [][]any,
 	schema, table, filename, gtid string,
@@ -234,7 +250,8 @@ func emitDeletes(
 	for _, row := range rows {
 		named, err := resolver.MapRow(schema, table, row)
 		if err != nil {
-			log.Printf("WARNING: failed to map DELETE row for %s.%s: %v — skipping row", schema, table, err)
+			logger.Warn("failed to map DELETE row — skipping",
+				"schema", schema, "table", table, "error", err)
 			continue
 		}
 		ev := Event{
@@ -255,6 +272,7 @@ func emitDeletes(
 
 func emitUpdates(
 	ctx context.Context,
+	logger *slog.Logger,
 	resolver *metadata.Resolver,
 	rows [][]any,
 	schema, table, filename, gtid string,
@@ -268,12 +286,14 @@ func emitUpdates(
 	for i := 0; i+1 < len(rows); i += 2 {
 		before, err := resolver.MapRow(schema, table, rows[i])
 		if err != nil {
-			log.Printf("WARNING: failed to map UPDATE before-row for %s.%s: %v — skipping row", schema, table, err)
+			logger.Warn("failed to map UPDATE before-row — skipping",
+				"schema", schema, "table", table, "error", err)
 			continue
 		}
 		after, err := resolver.MapRow(schema, table, rows[i+1])
 		if err != nil {
-			log.Printf("WARNING: failed to map UPDATE after-row for %s.%s: %v — skipping row", schema, table, err)
+			logger.Warn("failed to map UPDATE after-row — skipping",
+				"schema", schema, "table", table, "error", err)
 			continue
 		}
 		ev := Event{
@@ -340,7 +360,7 @@ func formatGTID(sid []byte, gno int64) string {
 
 // warnOnDDL logs a warning when a DDL statement is found in a QUERY_EVENT.
 // DDL changes table structure and may invalidate the current schema snapshot.
-func warnOnDDL(filename string, logPos uint32, query string) {
+func warnOnDDL(logger *slog.Logger, filename string, logPos uint32, query string) {
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	isDDL := strings.HasPrefix(upper, "ALTER TABLE") ||
 		strings.HasPrefix(upper, "CREATE TABLE") ||
@@ -348,7 +368,9 @@ func warnOnDDL(filename string, logPos uint32, query string) {
 		strings.HasPrefix(upper, "TRUNCATE") ||
 		strings.HasPrefix(upper, "RENAME TABLE")
 	if isDDL {
-		log.Printf("WARNING [%s pos %d]: DDL detected: %s — consider re-running `bintrail snapshot`",
-			filename, logPos, query)
+		logger.Warn("DDL detected — consider re-running `bintrail snapshot`",
+			"file", filename,
+			"pos", logPos,
+			"query", query)
 	}
 }

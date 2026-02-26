@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -89,7 +89,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Println("Source: no FK cascades ✓")
 	} else {
-		log.Println("WARNING: --source-dsn not provided; skipping source server validation")
+		slog.Warn("--source-dsn not provided; skipping source server validation")
 	}
 
 	// ── 2. Index database connection ──────────────────────────────────────────
@@ -117,7 +117,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Files to process: %d\n\n", len(files))
 
 	// ── 6. Index each file ────────────────────────────────────────────────────
-	p := parser.New(idxBinlogDir, resolver, filters)
+	p := parser.New(idxBinlogDir, resolver, filters, nil)
 	idx := indexer.New(indexDB, idxBatchSize)
 
 	var totalEvents int64
@@ -126,11 +126,12 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		totalEvents += n
 		if err != nil {
 			// Log and continue so --all processes remaining files.
-			log.Printf("ERROR [%s]: %v", filename, err)
+			slog.Error("indexing failed", "file", filename, "error", err)
 		}
 	}
 
 	fmt.Printf("\nTotal events indexed: %d\n", totalEvents)
+	slog.Info("indexing complete", "files_processed", len(files), "events_indexed", totalEvents)
 	return nil
 }
 
@@ -156,7 +157,7 @@ func indexFile(
 	info, err := os.Stat(filepath.Join(binlogDir, filename))
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("WARNING: binlog file not found: %s — skipping", filename)
+			slog.Warn("binlog file not found — skipping", "file", filename)
 			return 0, nil
 		}
 		return 0, fmt.Errorf("stat %s: %w", filename, err)
@@ -202,7 +203,7 @@ func indexFile(
 
 	default:
 		if err := upsertFileState(indexDB, filename, "completed", fileSize, fileSize, count, ""); err != nil {
-			log.Printf("WARNING: failed to mark %s completed: %v", filename, err)
+			slog.Warn("failed to mark file completed", "file", filename, "error", err)
 		}
 		fmt.Printf("[%s] done — %d events\n", filename, count)
 		return count, nil
@@ -356,7 +357,9 @@ func validateNoFKCascades(db *sql.DB, schemas []string) error {
 
 	if len(found) > 0 {
 		for _, c := range found {
-			log.Printf("FK cascade: %s.%s (DELETE_RULE=%s, UPDATE_RULE=%s)", c.schema, c.name, c.deleteRule, c.updateRule)
+			slog.Warn("FK cascade constraint found",
+				"schema", c.schema, "constraint", c.name,
+				"delete_rule", c.deleteRule, "update_rule", c.updateRule)
 		}
 		return fmt.Errorf("%d FK cascade constraint(s) found in indexed schemas; reversal SQL from `recover` may not correctly handle cascade side-effects", len(found))
 	}

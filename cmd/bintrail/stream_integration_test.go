@@ -293,7 +293,7 @@ func TestStreamLoop_liveReplication(t *testing.T) {
 	}
 	filters := buildIndexFilters(sourceName, "")
 
-	sp := parser.NewStreamParser(resolver, filters)
+	sp := parser.NewStreamParser(resolver, filters, nil)
 	idx := indexer.New(indexDB, 100)
 
 	// Run with a short deadline — just long enough to capture the 5 inserts.
