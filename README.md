@@ -4,7 +4,7 @@ A CLI tool that parses MySQL ROW-format binary logs, indexes every row event int
 
 ## Requirements
 
-- Go 1.22+
+- Go 1.24+
 - MySQL 8.0+ (index database)
 - Source MySQL server with `binlog_format = ROW` and `binlog_row_image = FULL`
 
@@ -58,6 +58,17 @@ bintrail recover \
 > **New to bintrail?** See the [Practical Guide for DBAs](docs/guide.md) for scenario-based walkthroughs and troubleshooting.
 
 ## Commands
+
+### Global flags
+
+These flags are available on every command:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--log-level` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
+| `--log-format` | `text` | Log format: `text` or `json` (use `json` for log aggregation pipelines) |
+
+> Logs go to stderr. stdout is reserved for command output (query results, recovery SQL).
 
 ### `bintrail init`
 
@@ -119,7 +130,8 @@ Flags:
   --batch-size   Events per batch INSERT (default: 1000)
   --schemas      Only index events from these schemas (comma-separated)
   --tables       Only index these tables (e.g. mydb.orders,mydb.items)
-  --checkpoint   Checkpoint interval in seconds (default: 10)
+  --checkpoint     Checkpoint interval in seconds (default: 10)
+  --metrics-addr   Address to expose Prometheus metrics (e.g. :9090); disabled by default
 ```
 
 Examples:
@@ -667,6 +679,55 @@ The index stores the complete before and after row images for every event, so re
 | `schema_snapshots` | Table/column metadata from `information_schema` at snapshot time |
 | `index_state` | Per-file indexing progress and status (`bintrail index`) |
 | `stream_state` | Single-row checkpoint for live replication position (`bintrail stream`) |
+
+## Observability
+
+### Structured logging
+
+All commands write structured log lines to **stderr** using Go's `log/slog`. Control verbosity and format with the global flags:
+
+```sh
+# Debug-level JSON logs (useful with a log aggregator or jq)
+bintrail --log-level debug --log-format json index \
+  --index-dsn "..." --binlog-dir /var/lib/mysql --all 2>debug.log
+
+# Parse with jq
+tail -f debug.log | jq 'select(.level == "ERROR")'
+```
+
+Each command emits a structured completion line at `INFO` level, e.g.:
+
+```json
+{"time":"...","level":"INFO","msg":"indexing complete","files_processed":2,"events_indexed":21246}
+{"time":"...","level":"INFO","msg":"query complete","results":5,"format":"table","duration_ms":12}
+```
+
+### Prometheus metrics (stream)
+
+The `stream` command can expose a Prometheus `/metrics` endpoint:
+
+```sh
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "user:pass@tcp(source:3306)/" \
+  --server-id  99999 \
+  --metrics-addr :9090
+
+curl localhost:9090/metrics | grep bintrail_stream
+```
+
+| Metric | Type | Description |
+|---|---|---|
+| `bintrail_stream_events_received_total` | Counter | Binlog row events received from the source |
+| `bintrail_stream_events_indexed_total` | Counter | Events successfully written to `binlog_events` |
+| `bintrail_stream_batch_flushes_total` | Counter | Batch INSERT operations completed |
+| `bintrail_stream_checkpoint_saves_total` | Counter | Successful checkpoint writes to `stream_state` |
+| `bintrail_stream_last_event_timestamp_seconds` | Gauge | Unix timestamp of the most recent event processed |
+| `bintrail_stream_replication_lag_seconds` | Gauge | Age of the last event in seconds (wall clock minus event timestamp) |
+| `bintrail_stream_errors_total{type}` | Counter | Errors by type: `batch_flush`, `checkpoint`, `gtid_update` |
+| `bintrail_stream_batch_size` | Histogram | Events per batch flush |
+
+> Alert on `bintrail_stream_replication_lag_seconds > 60` to catch indexing falling behind the source write rate.
 
 ## License
 

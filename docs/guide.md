@@ -11,8 +11,15 @@ Before you start:
 - [ ] Source MySQL server has `binlog_format = ROW` and `binlog_row_image = FULL`
 - [ ] A separate database (or schema) is available for the bintrail index — it can be on the same server or a different one
 - [ ] `bintrail` binary is installed and on your `$PATH`
-- [ ] You have filesystem read access to the source server's binlog files (local disk, NFS mount, or `docker cp`)
 - [ ] Your index DSN includes the database name: `user:pass@tcp(host:3306)/binlog_index`
+
+**If you have filesystem access to binlog files** (self-managed MySQL, direct disk or NFS mount):
+- [ ] Filesystem read access to the source server's binlog files
+
+**If you are using managed MySQL** (RDS, Aurora, Cloud SQL — no binlog file access):
+- [ ] Use `bintrail stream` instead of `bintrail index` — it connects over the replication protocol
+- [ ] Replication user with `REPLICATION SLAVE` and `REPLICATION CLIENT` privileges on the source
+- [ ] Source DSN uses TCP: `user:pass@tcp(host:3306)/` (unix socket is not supported for replication)
 
 ---
 
@@ -329,9 +336,108 @@ bintrail rotate \
 
 ---
 
+### Scenario G: Streaming from managed MySQL (RDS, Aurora, Cloud SQL)
+
+**Situation:** You're using a managed MySQL service where you have no filesystem access to binlog files. You want continuous real-time indexing using the replication protocol.
+
+**Prerequisites** — grant replication privileges on the source:
+
+```sql
+CREATE USER 'bintrail_repl'@'%' IDENTIFIED BY 'secret';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'bintrail_repl'@'%';
+FLUSH PRIVILEGES;
+```
+
+Get the current binlog position for the first run:
+
+```sql
+SHOW MASTER STATUS;
+-- Example output:
+-- File: binlog.000123  Position: 4  Executed_Gtid_Set: 3e11fa47-...:1-5000
+```
+
+**First run** — one-time setup:
+
+```sh
+# Step 1: Create index tables
+bintrail init --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
+
+# Step 2: Snapshot schema metadata
+bintrail snapshot \
+  --source-dsn "bintrail_repl:secret@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index"
+
+# Step 3: Start streaming from the current GTID position
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "bintrail_repl:secret@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
+  --server-id  99999 \
+  --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5000" \
+  --metrics-addr :9090
+```
+
+**Subsequent runs** — the checkpoint is resumed automatically:
+
+```sh
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "bintrail_repl:secret@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
+  --server-id  99999
+# No --start-gtid needed — resumed from stream_state checkpoint
+```
+
+**Monitor** replication lag and throughput:
+
+```sh
+curl -s localhost:9090/metrics | grep bintrail_stream_replication_lag_seconds
+```
+
+**Graceful shutdown** — send `SIGTERM` (or Ctrl-C). The current batch is flushed and the checkpoint is written before exit.
+
+**Run as a systemd service** for automatic restart — see the [systemd section in README](../README.md#automating-with-systemd). Use `Type=simple` and `Restart=always` since `stream` is long-running (unlike the one-shot `index` command).
+
+---
+
+### Scenario H: Debug logging
+
+**Situation:** Something isn't indexing correctly and you need verbose output to diagnose it.
+
+Enable debug-level structured logging with JSON format for easy filtering:
+
+```sh
+bintrail --log-level debug --log-format json stream \
+  --index-dsn  "..." \
+  --source-dsn "..." \
+  --server-id  99999 \
+  2>debug.log
+```
+
+Filter the log with `jq`:
+
+```sh
+# Show only errors
+tail -f debug.log | jq 'select(.level == "ERROR")'
+
+# Show only events for a specific table
+tail -f debug.log | jq 'select(.table == "orders")'
+
+# Show batch flush timing
+tail -f debug.log | jq 'select(.msg | contains("batch"))'
+```
+
+Redirect stderr only (stdout still shows query output):
+
+```sh
+bintrail --log-level debug query --index-dsn "..." --schema mydb --table orders 2>debug.log
+```
+
+---
+
 ## 4. Keeping Bintrail Running (Day-to-Day)
 
 **Re-indexing new binlog files:** Just run `index --all` again. Files already marked `completed` are skipped automatically — re-running is always safe.
+
+**Running `stream` as a service:** `bintrail stream` is a long-running process — it runs indefinitely and self-checkpoints every 10 seconds (configurable). Run it under systemd with `Type=simple` and `Restart=always` so it automatically recovers from network interruptions. On restart it resumes from the last saved checkpoint in `stream_state` — no `--start-gtid` or `--start-file` needed. See the [README](../README.md#automating-with-systemd) for a ready-to-use systemd unit template.
 
 **After schema changes:** If you ran `ALTER TABLE`, `CREATE TABLE`, or `DROP TABLE` on the source, re-run `snapshot` so the indexer has current column metadata:
 
@@ -364,6 +470,9 @@ bintrail status --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 | Recovery SQL uses `WHERE col1 = ? AND col2 = ?` for all columns (verbose) | No schema snapshot available, so bintrail falls back to matching all columns | Run `bintrail snapshot` — once a snapshot is available, recovery uses the primary key only. |
 | `failed to connect to index database: ...` | Wrong DSN, MySQL not running, or network issue | Verify the DSN is correct and test connectivity: `mysql -u user -p -h host -P 3306 binlog_index`. |
 | Index files stuck as `in_progress` | Previous `index` run crashed or was killed | Re-run `bintrail index` — `in_progress` files are retried automatically. |
+| `no start position specified; provide --start-file or --start-gtid on the first run` | First `stream` run without a starting position | Run `SHOW MASTER STATUS` on the source and pass the result as `--start-gtid` (GTID mode) or `--start-file` (position mode). On subsequent runs the checkpoint is loaded automatically. |
+| Stream replication lag growing | High write rate on source, slow index DB, or large batches | Try increasing `--batch-size` (reduces round-trips), check index DB load, and monitor `bintrail_stream_replication_lag_seconds` via Prometheus. |
+| `unix socket; binlog replication requires TCP` | Source DSN uses a unix socket path | Switch `--source-dsn` to TCP format: `user:pass@tcp(host:3306)/`. The replication protocol does not work over unix sockets. |
 
 ---
 

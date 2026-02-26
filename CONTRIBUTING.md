@@ -4,7 +4,7 @@ Thank you for your interest in contributing. This document covers how to get set
 
 ## Prerequisites
 
-- Go 1.22 or later (the codebase uses `range N`, `min()`, `slices`, and `strings.SplitSeq`)
+- Go 1.24 or later (the codebase uses `range N`, `min()`, `slices`, and `strings.SplitSeq`)
 - A MySQL 8.0+ instance for integration testing (unit tests run without a DB)
 - `git`
 
@@ -28,6 +28,7 @@ cmd/bintrail-mcp/  MCP server exposing query, recover, and status as read-only t
 internal/          Core packages. Each package has a _test.go alongside it.
   cliutil/         Shared filter parsers (ParseEventType, ParseTime, IsValidFormat) — used by
                    both cmd/bintrail/ commands and cmd/bintrail-mcp/.
+  observe/         Structured logging (slog) setup and Prometheus metrics for stream.
   status/          Shared index status types and display helpers.
 migrations/        Reference DDL — tables are created by `bintrail init`, not this file.
 ```
@@ -102,17 +103,30 @@ SET GLOBAL binlog_row_image    = FULL;
 The recommended approach is a local Docker container:
 
 ```sh
-docker run -d --name mysql-bintrail \
-  -e MYSQL_ROOT_PASSWORD=root \
-  -p 3306:3306 \
+docker run -d --name bintrail-test-mysql \
+  -e MYSQL_ROOT_PASSWORD=testroot \
+  -p 13306:3306 \
   mysql:8.0 \
   --binlog-format=ROW \
   --binlog-row-image=FULL \
-  --log-bin=mysql-bin \
+  --log-bin=binlog \
   --server-id=1
 
+# Wait for MySQL to be ready
+until docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent; do sleep 1; done
+
 # Initialise the index
-bintrail init --index-dsn "root:root@tcp(127.0.0.1:3306)/binlog_index"
+bintrail init --index-dsn "root:testroot@tcp(127.0.0.1:13306)/binlog_index"
+```
+
+Run integration tests (requires the container above):
+
+```sh
+go test -tags integration ./... -count=1
+
+# With coverage report
+go test -tags integration -coverprofile=cover.out ./... -count=1
+go tool cover -func=cover.out
 ```
 
 ## Pull request checklist
