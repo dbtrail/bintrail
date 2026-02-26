@@ -223,6 +223,56 @@ func TestGenerateSQL_withResolver(t *testing.T) {
 	}
 }
 
+func TestGenerateSQL_skipsGeneratedColumnsInInsert(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Insert snapshot with a generated column (line_total).
+	testutil.InsertSnapshot(t, db, 1, "2026-02-19 10:00:00", "shop", "order_items", "order_id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, "2026-02-19 10:00:00", "shop", "order_items", "quantity", 2, "", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, "2026-02-19 10:00:00", "shop", "order_items", "unit_price", 3, "", "decimal", "NO")
+	// Mark line_total as generated.
+	testutil.MustExec(t, db,
+		`INSERT INTO schema_snapshots
+		 (snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		  ordinal_position, column_key, data_type, is_nullable, is_generated)
+		 VALUES (1, '2026-02-19 10:00:00', 'shop', 'order_items', 'line_total', 4, '', 'decimal', 'NO', 1)`)
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver failed: %v", err)
+	}
+
+	// DELETE event: row_before includes the generated column value from the binlog.
+	testutil.InsertEvent(t, db,
+		"binlog.000001", 100, 200, "2026-02-19 14:00:00", nil,
+		"shop", "order_items", 3, "5",
+		nil,
+		[]byte(`{"order_id":5,"quantity":3,"unit_price":68.81,"line_total":206.43}`),
+		nil,
+	)
+
+	g := New(db, resolver)
+	var buf bytes.Buffer
+	n, err := g.GenerateSQL(context.Background(), query.Options{
+		Schema: "shop", Table: "order_items", Limit: 100,
+	}, &buf)
+	if err != nil {
+		t.Fatalf("GenerateSQL failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 statement, got %d", n)
+	}
+
+	out := buf.String()
+	assertContains(t, out, "INSERT INTO")
+	assertContains(t, out, "`order_id`")
+	assertContains(t, out, "`quantity`")
+	if strings.Contains(out, "line_total") {
+		t.Errorf("generated column 'line_total' must not appear in INSERT:\n%s", out)
+	}
+}
+
 func assertContains(t *testing.T, s, want string) {
 	t.Helper()
 	if !strings.Contains(s, want) {

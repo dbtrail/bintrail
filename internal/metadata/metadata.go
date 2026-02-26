@@ -15,6 +15,7 @@ type ColumnMeta struct {
 	OrdinalPosition int
 	IsPK            bool
 	DataType        string
+	IsGenerated     bool // true for STORED or VIRTUAL generated columns
 }
 
 // TableMeta holds the column mapping for a table, derived from a schema snapshot.
@@ -68,7 +69,7 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	}
 
 	rows, err := db.Query(`
-		SELECT schema_name, table_name, column_name, ordinal_position, column_key, data_type
+		SELECT schema_name, table_name, column_name, ordinal_position, column_key, data_type, is_generated
 		FROM schema_snapshots
 		WHERE snapshot_id = ?
 		ORDER BY schema_name, table_name, ordinal_position`,
@@ -83,8 +84,9 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	for rows.Next() {
 		var schemaName, tableName, columnName, columnKey, dataType string
 		var ordinalPosition int
+		var isGenerated bool
 
-		if err := rows.Scan(&schemaName, &tableName, &columnName, &ordinalPosition, &columnKey, &dataType); err != nil {
+		if err := rows.Scan(&schemaName, &tableName, &columnName, &ordinalPosition, &columnKey, &dataType, &isGenerated); err != nil {
 			return nil, fmt.Errorf("failed to scan snapshot row: %w", err)
 		}
 
@@ -100,6 +102,7 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 			OrdinalPosition: ordinalPosition,
 			IsPK:            columnKey == "PRI",
 			DataType:        dataType,
+			IsGenerated:     isGenerated,
 		}
 		tm.Columns = append(tm.Columns, col)
 		if col.IsPK {
@@ -112,6 +115,12 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	}
 
 	return r, nil
+}
+
+// NewResolverFromTables creates a Resolver directly from a pre-built table map.
+// The map key must be "schema.table". Primarily useful for testing.
+func NewResolverFromTables(snapshotID int, tables map[string]*TableMeta) *Resolver {
+	return &Resolver{snapshotID: snapshotID, tables: tables}
 }
 
 // SnapshotID returns the snapshot ID this resolver was loaded from.
@@ -172,7 +181,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	if len(schemas) == 0 {
 		query = `
 			SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
-			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA
 			FROM information_schema.COLUMNS
 			WHERE TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
 			ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`
@@ -180,7 +189,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
 		query = fmt.Sprintf(`
 			SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
-			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA
 			FROM information_schema.COLUMNS
 			WHERE TABLE_SCHEMA IN (%s)
 			ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`, placeholders)
@@ -199,6 +208,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		schemaName, tableName, columnName string
 		ordinalPosition                   int
 		columnKey, dataType, isNullable   string
+		extra                             string
 		columnDefault                     sql.NullString
 	}
 
@@ -209,7 +219,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		var c columnRow
 		if err := srcRows.Scan(
 			&c.schemaName, &c.tableName, &c.columnName,
-			&c.ordinalPosition, &c.columnKey, &c.dataType, &c.isNullable, &c.columnDefault,
+			&c.ordinalPosition, &c.columnKey, &c.dataType, &c.isNullable, &c.columnDefault, &c.extra,
 		); err != nil {
 			return SnapshotStats{}, fmt.Errorf("failed to scan column row: %w", err)
 		}
@@ -255,21 +265,22 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	for i := 0; i < len(columns); i += batchSize {
 		batch := columns[i:min(i+batchSize, len(columns))]
 
-		valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
+		valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
 		insertSQL := "INSERT INTO schema_snapshots " +
 			"(snapshot_id, snapshot_time, schema_name, table_name, column_name, " +
-			"ordinal_position, column_key, data_type, is_nullable, column_default) VALUES " +
+			"ordinal_position, column_key, data_type, is_nullable, column_default, is_generated) VALUES " +
 			valClause
 
-		insertArgs := make([]any, 0, len(batch)*10)
+		insertArgs := make([]any, 0, len(batch)*11)
 		for _, c := range batch {
 			var def any
 			if c.columnDefault.Valid {
 				def = c.columnDefault.String
 			}
+			isGenerated := strings.Contains(strings.ToUpper(c.extra), "GENERATED")
 			insertArgs = append(insertArgs,
 				nextID, snapshotTime, c.schemaName, c.tableName, c.columnName,
-				c.ordinalPosition, c.columnKey, c.dataType, c.isNullable, def,
+				c.ordinalPosition, c.columnKey, c.dataType, c.isNullable, def, isGenerated,
 			)
 		}
 

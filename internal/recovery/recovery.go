@@ -108,17 +108,19 @@ func (g *Generator) generateStatement(row query.ResultRow) (string, error) {
 }
 
 // generateInsert reverses a DELETE event: reconstruct the deleted row from
-// row_before with a full INSERT.
+// row_before with a full INSERT, skipping STORED/VIRTUAL generated columns.
 func (g *Generator) generateInsert(row query.ResultRow) (string, error) {
 	if row.RowBefore == nil {
 		return "", fmt.Errorf("row_before is nil for DELETE event (event_id=%d)", row.EventID)
 	}
-	cols := sortedKeys(row.RowBefore)
-	colParts := make([]string, len(cols))
-	valParts := make([]string, len(cols))
-	for i, col := range cols {
-		colParts[i] = quoteName(col)
-		valParts[i] = formatValue(row.RowBefore[col])
+	genCols := g.generatedCols(row.SchemaName, row.TableName)
+	var colParts, valParts []string
+	for _, col := range sortedKeys(row.RowBefore) {
+		if genCols[col] {
+			continue
+		}
+		colParts = append(colParts, quoteName(col))
+		valParts = append(valParts, formatValue(row.RowBefore[col]))
 	}
 	return fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES (%s)",
 		quoteName(row.SchemaName), quoteName(row.TableName),
@@ -127,8 +129,8 @@ func (g *Generator) generateInsert(row query.ResultRow) (string, error) {
 	), nil
 }
 
-// generateUpdate reverses an UPDATE event: SET all columns to row_before values,
-// WHERE identifies the row using row_after PK values (the current DB state).
+// generateUpdate reverses an UPDATE event: SET all columns to row_before values
+// (skipping generated columns), WHERE identifies the row using row_after PK values.
 func (g *Generator) generateUpdate(row query.ResultRow) (string, error) {
 	if row.RowBefore == nil {
 		return "", fmt.Errorf("row_before is nil for UPDATE event (event_id=%d)", row.EventID)
@@ -137,11 +139,14 @@ func (g *Generator) generateUpdate(row query.ResultRow) (string, error) {
 		return "", fmt.Errorf("row_after is nil for UPDATE event (event_id=%d)", row.EventID)
 	}
 
-	// SET clause: restore all before-image column values (full row restoration).
-	setCols := sortedKeys(row.RowBefore)
-	setParts := make([]string, len(setCols))
-	for i, col := range setCols {
-		setParts[i] = quoteName(col) + " = " + formatValue(row.RowBefore[col])
+	// SET clause: restore before-image values, skipping STORED/VIRTUAL generated columns.
+	genCols := g.generatedCols(row.SchemaName, row.TableName)
+	var setParts []string
+	for _, col := range sortedKeys(row.RowBefore) {
+		if genCols[col] {
+			continue
+		}
+		setParts = append(setParts, quoteName(col)+" = "+formatValue(row.RowBefore[col]))
 	}
 
 	// WHERE uses row_after (current state), so the UPDATE finds the right row
@@ -166,6 +171,29 @@ func (g *Generator) generateDelete(row query.ResultRow) (string, error) {
 		quoteName(row.SchemaName), quoteName(row.TableName),
 		strings.Join(whereParts, " AND "),
 	), nil
+}
+
+// generatedCols returns the set of STORED/VIRTUAL generated column names for a
+// table, using the resolver. Returns nil when the resolver is absent or the
+// table is not in the snapshot — callers treat nil as an empty set.
+func (g *Generator) generatedCols(schema, table string) map[string]bool {
+	if g.resolver == nil {
+		return nil
+	}
+	tm, err := g.resolver.Resolve(schema, table)
+	if err != nil {
+		return nil
+	}
+	var gen map[string]bool
+	for _, c := range tm.Columns {
+		if c.IsGenerated {
+			if gen == nil {
+				gen = make(map[string]bool)
+			}
+			gen[c.Name] = true
+		}
+	}
+	return gen
 }
 
 // pkWhereClause builds "pk_col = val AND ..." from the resolver snapshot.

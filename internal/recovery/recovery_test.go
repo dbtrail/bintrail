@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bintrail/bintrail/internal/metadata"
 	"github.com/bintrail/bintrail/internal/parser"
 	"github.com/bintrail/bintrail/internal/query"
 )
@@ -440,4 +441,112 @@ func TestEscapeString_combined(t *testing.T) {
 	if !strings.Contains(got, `\0`) {
 		t.Errorf("expected escaped null in %q", got)
 	}
+}
+
+// ─── Generated column filtering ──────────────────────────────────────────────
+
+// newGenWithResolver returns a Generator backed by a resolver containing a
+// table with one STORED generated column ("line_total").
+func newGenWithResolver() *Generator {
+	tm := &metadata.TableMeta{
+		Schema: "shop",
+		Table:  "order_items",
+		Columns: []metadata.ColumnMeta{
+			{Name: "order_id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+			{Name: "quantity", OrdinalPosition: 2, DataType: "int"},
+			{Name: "unit_price", OrdinalPosition: 3, DataType: "decimal"},
+			{Name: "line_total", OrdinalPosition: 4, DataType: "decimal", IsGenerated: true},
+		},
+		PKColumns: []string{"order_id"},
+	}
+	resolver := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"shop.order_items": tm,
+	})
+	return New(nil, resolver)
+}
+
+func TestGenerateInsert_skipsGeneratedColumns(t *testing.T) {
+	g := newGenWithResolver()
+	row := query.ResultRow{
+		EventID:    10,
+		SchemaName: "shop",
+		TableName:  "order_items",
+		EventType:  parser.EventDelete,
+		RowBefore: map[string]any{
+			"order_id":   float64(5),
+			"quantity":   float64(3),
+			"unit_price": float64(68.81),
+			"line_total": float64(206.43), // STORED generated — must be excluded
+		},
+	}
+	stmt, err := g.generateInsert(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertSQL(t, stmt, "INSERT INTO")
+	assertSQL(t, stmt, "`order_id`")
+	assertSQL(t, stmt, "`quantity`")
+	assertSQL(t, stmt, "`unit_price`")
+	if strings.Contains(stmt, "line_total") {
+		t.Errorf("generated column 'line_total' must not appear in INSERT: %s", stmt)
+	}
+}
+
+func TestGenerateUpdate_skipsGeneratedColumns(t *testing.T) {
+	g := newGenWithResolver()
+	row := query.ResultRow{
+		EventID:    11,
+		SchemaName: "shop",
+		TableName:  "order_items",
+		EventType:  parser.EventUpdate,
+		RowBefore: map[string]any{
+			"order_id":   float64(5),
+			"quantity":   float64(2),
+			"unit_price": float64(68.81),
+			"line_total": float64(137.62), // STORED generated — must be excluded from SET
+		},
+		RowAfter: map[string]any{
+			"order_id":   float64(5),
+			"quantity":   float64(3),
+			"unit_price": float64(68.81),
+			"line_total": float64(206.43),
+		},
+	}
+	stmt, err := g.generateUpdate(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertSQL(t, stmt, "UPDATE")
+	assertSQL(t, stmt, "SET")
+	assertSQL(t, stmt, "`quantity` = 2")
+	setIdx := strings.Index(stmt, "SET")
+	whereIdx := strings.Index(stmt, "WHERE")
+	if setIdx < 0 || whereIdx < 0 {
+		t.Fatalf("expected SET and WHERE in: %s", stmt)
+	}
+	setPart := stmt[setIdx:whereIdx]
+	if strings.Contains(setPart, "line_total") {
+		t.Errorf("generated column 'line_total' must not appear in SET clause: %s", setPart)
+	}
+}
+
+func TestGenerateInsert_noResolver_includesAllColumns(t *testing.T) {
+	// Without a resolver, all columns (including any generated ones) are emitted —
+	// the generator has no way to know which are generated.
+	g := newGen()
+	row := query.ResultRow{
+		EventID:    12,
+		SchemaName: "shop",
+		TableName:  "order_items",
+		EventType:  parser.EventDelete,
+		RowBefore: map[string]any{
+			"order_id":   float64(5),
+			"line_total": float64(206.43),
+		},
+	}
+	stmt, err := g.generateInsert(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertSQL(t, stmt, "line_total")
 }
