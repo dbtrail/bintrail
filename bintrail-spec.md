@@ -1,5 +1,7 @@
 # Bintrail — Architecture & Implementation Spec
 
+> **Historical document.** This was the original design spec. The canonical reference is [CLAUDE.md](CLAUDE.md). Key differences from this spec: partition expression uses `TO_DAYS()` not `UNIX_TIMESTAMP()`, `schema_snapshots` has separate auto-increment `id` PK (not `snapshot_id`), `stream` command and MCP server were added post-spec, observability (slog + Prometheus) was added post-spec. See [README](README.md) for the current command reference.
+
 ## Overview
 
 **Bintrail** is a CLI tool written in Go that parses MySQL ROW-format binary logs, indexes every row event into a MySQL table with full row data, and provides query and recovery capabilities. The index is self-contained — it stores complete before/after images so recovery does not depend on binlog files still existing on disk.
