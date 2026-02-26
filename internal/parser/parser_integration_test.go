@@ -99,7 +99,7 @@ func TestParseFile_realBinlog(t *testing.T) {
 
 	p := parser.New(binlogDir, resolver, parser.Filters{
 		Schemas: map[string]bool{schemaName: true},
-	})
+	}, nil)
 
 	events := make(chan parser.Event, 100)
 	errCh := make(chan error, 1)
@@ -184,7 +184,7 @@ func TestParseFile_withFilters(t *testing.T) {
 	// Use a filter for a nonexistent schema — should emit 0 events.
 	p := parser.New(binlogDir, resolver, parser.Filters{
 		Schemas: map[string]bool{"nonexistent_schema": true},
-	})
+	}, nil)
 
 	events := make(chan parser.Event, 100)
 	errCh := make(chan error, 1)
@@ -259,7 +259,7 @@ func TestParseFiles_multiple(t *testing.T) {
 
 	p := parser.New(tmpDir, resolver, parser.Filters{
 		Schemas: map[string]bool{sourceName: true},
-	})
+	}, nil)
 
 	events := make(chan parser.Event, 100)
 	errCh := make(chan error, 1)
@@ -295,7 +295,7 @@ func TestParseFile_contextCancellation(t *testing.T) {
 
 	binlogDir, binlogFile, _, resolver := setupBinlog(t)
 
-	p := parser.New(binlogDir, resolver, parser.Filters{})
+	p := parser.New(binlogDir, resolver, parser.Filters{}, nil)
 
 	// Cancel immediately.
 	ctx, cancel := context.WithCancel(context.Background())

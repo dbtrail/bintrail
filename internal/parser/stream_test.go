@@ -73,7 +73,7 @@ func feedThenCancel(t *testing.T, streamer *replication.BinlogStreamer, cancel c
 // TestStreamParser_cancelReturnNil verifies that an already-cancelled context
 // causes Run to return nil (graceful shutdown, not an error).
 func TestStreamParser_cancelReturnNil(t *testing.T) {
-	sp := NewStreamParser(nil, Filters{})
+	sp := NewStreamParser(nil, Filters{}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -93,7 +93,7 @@ func TestStreamParser_cancelReturnNil(t *testing.T) {
 // TestStreamParser_rotateEventNoError verifies that processing a RotateEvent
 // does not produce an error or output events.
 func TestStreamParser_rotateEventNoError(t *testing.T) {
-	sp := NewStreamParser(nil, Filters{})
+	sp := NewStreamParser(nil, Filters{}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -111,7 +111,7 @@ func TestStreamParser_rotateEventNoError(t *testing.T) {
 // TestStreamParser_rotateBeforeRows verifies that a RotateEvent followed by a
 // filtered RowsEvent produces no output (exercises the sequence without a resolver).
 func TestStreamParser_rotateBeforeRows(t *testing.T) {
-	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{}})
+	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{}}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -134,7 +134,7 @@ func TestStreamParser_rotateBeforeRows(t *testing.T) {
 // TestStreamParser_gtidEventNoOutput verifies that a GTIDEvent does not produce
 // output events (it only updates internal GTID state).
 func TestStreamParser_gtidEventNoOutput(t *testing.T) {
-	sp := NewStreamParser(nil, Filters{})
+	sp := NewStreamParser(nil, Filters{}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -153,7 +153,7 @@ func TestStreamParser_gtidEventNoOutput(t *testing.T) {
 // a filtered RowsEvent produces no output — the GTID is set internally but
 // discarded along with the row.
 func TestStreamParser_gtidThenFilteredRows(t *testing.T) {
-	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{"only": true}})
+	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{"only": true}}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -176,7 +176,7 @@ func TestStreamParser_gtidThenFilteredRows(t *testing.T) {
 // TestStreamParser_queryEventNonDDL verifies that a non-DDL QUERY_EVENT
 // (e.g. BEGIN) produces no error and no output.
 func TestStreamParser_queryEventNonDDL(t *testing.T) {
-	sp := NewStreamParser(nil, Filters{})
+	sp := NewStreamParser(nil, Filters{}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -194,7 +194,7 @@ func TestStreamParser_queryEventNonDDL(t *testing.T) {
 // TestStreamParser_queryEventDDL verifies that a DDL QUERY_EVENT produces a
 // warning log but no error and no output events.
 func TestStreamParser_queryEventDDL(t *testing.T) {
-	sp := NewStreamParser(nil, Filters{})
+	sp := NewStreamParser(nil, Filters{}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -215,7 +215,7 @@ func TestStreamParser_queryEventDDL(t *testing.T) {
 // not in the filter produces no output and does not invoke the resolver
 // (which is nil here — a panic would occur if resolver were called).
 func TestStreamParser_filteredRowsEvent(t *testing.T) {
-	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{"accepted": true}})
+	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{"accepted": true}}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -237,7 +237,7 @@ func TestStreamParser_emptyFilterAcceptsAll(t *testing.T) {
 	// We use a non-nil filter with a specific table that won't match the event's table.
 	sp := NewStreamParser(nil, Filters{
 		Tables: map[string]bool{"mydb.other": true},
-	})
+	}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -257,7 +257,7 @@ func TestStreamParser_emptyFilterAcceptsAll(t *testing.T) {
 // TestStreamParser_streamerError verifies that an error injected into the
 // streamer is propagated by Run as a non-nil return value.
 func TestStreamParser_streamerError(t *testing.T) {
-	sp := NewStreamParser(nil, Filters{})
+	sp := NewStreamParser(nil, Filters{}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -276,7 +276,7 @@ func TestStreamParser_streamerError(t *testing.T) {
 // before a streamer error are fully emitted and the error is then returned.
 func TestStreamParser_streamerErrorAfterEvents(t *testing.T) {
 	// Filter rejects everything — so the rotate event won't invoke a resolver.
-	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{}})
+	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{}}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
@@ -299,7 +299,7 @@ func TestStreamParser_streamerErrorAfterEvents(t *testing.T) {
 // TestStreamParser_mixedSequenceNoOutput processes a realistic sequence of
 // Rotate → GTID → Query → RowsEvent (filtered) and verifies no output, no error.
 func TestStreamParser_mixedSequenceNoOutput(t *testing.T) {
-	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{"prod": true}})
+	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{"prod": true}}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 

@@ -15,7 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -81,7 +81,8 @@ func newServer() *mcp.Server {
 
 func main() {
 	if err := newServer().Run(context.Background(), &mcp.StdioTransport{}); err != nil {
-		log.Fatal(err)
+		slog.Error("MCP server error", "error", err)
+		os.Exit(1)
 	}
 }
 

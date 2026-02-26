@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -69,6 +71,7 @@ func init() {
 }
 
 func runQuery(cmd *cobra.Command, args []string) error {
+	start := time.Now()
 	// ── Validate flag combinations ────────────────────────────────────────────
 	if qPK != "" && (qSchema == "" || qTable == "") {
 		return fmt.Errorf("--pk requires both --schema and --table")
@@ -118,6 +121,11 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	slog.Info("query complete",
+		"results", n,
+		"format", qFormat,
+		"duration_ms", time.Since(start).Milliseconds())
 
 	if qFormat == "table" {
 		// Row count summary is only useful in table mode; JSON/CSV consumers

@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -76,6 +78,7 @@ func init() {
 }
 
 func runRecover(cmd *cobra.Command, args []string) error {
+	start := time.Now()
 	// ── Validate flags ────────────────────────────────────────────────────────
 	if !rDryRun && rOutput == "" {
 		return fmt.Errorf("one of --output or --dry-run is required")
@@ -122,7 +125,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	// but always correct for tables without duplicate rows.
 	resolver, err := metadata.NewResolver(db, 0) // 0 = latest snapshot
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not load schema snapshot (%v); WHERE clauses will use all columns\n", err)
+		slog.Warn("could not load schema snapshot; WHERE clauses will use all columns", "error", err)
 		resolver = nil
 	}
 
@@ -134,6 +137,9 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+		slog.Info("recovery SQL generated",
+			"statements", n, "dry_run", true,
+			"duration_ms", time.Since(start).Milliseconds())
 		if n > 0 {
 			fmt.Fprintf(os.Stderr, "\n%d reversal statement(s) generated.\n", n)
 		}
@@ -156,6 +162,9 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to flush output file: %w", err)
 	}
 
+	slog.Info("recovery SQL generated",
+		"statements", n, "dry_run", false, "output", rOutput,
+		"duration_ms", time.Since(start).Milliseconds())
 	if n == 0 {
 		fmt.Fprintln(os.Stderr, "No events matched the specified criteria.")
 	} else {

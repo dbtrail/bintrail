@@ -5,8 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -17,10 +18,12 @@ import (
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	drivermysql "github.com/go-sql-driver/mysql"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 
 	"github.com/bintrail/bintrail/internal/config"
 	"github.com/bintrail/bintrail/internal/indexer"
+	"github.com/bintrail/bintrail/internal/observe"
 	"github.com/bintrail/bintrail/internal/parser"
 )
 
@@ -52,6 +55,7 @@ var (
 	strmSchemas    string
 	strmTables     string
 	strmCheckpoint int
+	strmMetricsAddr string
 )
 
 func init() {
@@ -65,6 +69,7 @@ func init() {
 	streamCmd.Flags().StringVar(&strmSchemas, "schemas", "", "Only index events from these schemas (comma-separated)")
 	streamCmd.Flags().StringVar(&strmTables, "tables", "", "Only index these tables (comma-separated, e.g. mydb.orders)")
 	streamCmd.Flags().IntVar(&strmCheckpoint, "checkpoint", 10, "Checkpoint interval in seconds")
+	streamCmd.Flags().StringVar(&strmMetricsAddr, "metrics-addr", "", "Address to expose Prometheus metrics (e.g. :9090); empty = disabled")
 	_ = streamCmd.MarkFlagRequired("index-dsn")
 	_ = streamCmd.MarkFlagRequired("source-dsn")
 	_ = streamCmd.MarkFlagRequired("server-id")
@@ -176,7 +181,7 @@ func resolveStart(
 
 	if startFile != "" || startGTID != "" {
 		if saved != nil {
-			log.Printf("WARNING: --start-* flag provided; overriding saved stream state")
+			slog.Warn("--start-* flag provided; overriding saved stream state")
 		}
 		if startGTID != "" {
 			gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTID)
@@ -190,14 +195,14 @@ func resolveStart(
 
 	if saved != nil {
 		if saved.mode == "gtid" {
-			log.Printf("Resuming from GTID set: %s", saved.gtidSet)
+			slog.Info("resuming from GTID set", "gtid_set", saved.gtidSet)
 			gs, parseErr := gomysql.ParseMysqlGTIDSet(saved.gtidSet)
 			if parseErr != nil {
 				return "", "", "", 0, nil, fmt.Errorf("invalid saved gtid_set %q: %w", saved.gtidSet, parseErr)
 			}
 			return "gtid", "", saved.gtidSet, 0, gs.(*gomysql.MysqlGTIDSet), nil
 		}
-		log.Printf("Resuming from %s position %d", saved.binlogFile, saved.binlogPos)
+		slog.Info("resuming from position", "file", saved.binlogFile, "pos", saved.binlogPos)
 		return "position", saved.binlogFile, "", uint32(saved.binlogPos), nil, nil
 	}
 
@@ -226,22 +231,32 @@ func streamLoop(
 		if len(batch) == 0 {
 			return nil
 		}
+		observe.StreamBatchSize.Observe(float64(len(batch)))
 		n, err := idx.InsertBatch(batch)
 		state.eventsIndexed += n
+		observe.StreamEventsIndexed.Add(float64(n))
+		observe.StreamBatchFlushes.Inc()
 		batch = batch[:0]
+		if err != nil {
+			observe.StreamErrors.WithLabelValues("batch_flush").Inc()
+		}
 		return err
 	}
 
 	checkpoint := func() {
 		if err := flush(); err != nil {
-			log.Printf("WARNING: batch flush failed: %v", err)
+			slog.Warn("batch flush failed", "error", err)
 			return
 		}
 		if err := saveCheckpoint(db, state); err != nil {
-			log.Printf("WARNING: saveCheckpoint failed: %v", err)
+			slog.Warn("saveCheckpoint failed", "error", err)
+			observe.StreamErrors.WithLabelValues("checkpoint").Inc()
 		} else {
-			log.Printf("Checkpoint saved: %s pos=%d events=%d",
-				state.binlogFile, state.binlogPos, state.eventsIndexed)
+			observe.StreamCheckpointSaves.Inc()
+			slog.Info("checkpoint saved",
+				"file", state.binlogFile,
+				"pos", state.binlogPos,
+				"events_indexed", state.eventsIndexed)
 		}
 	}
 
@@ -266,7 +281,8 @@ func streamLoop(
 			state.binlogPos = ev.EndPos
 			if ev.GTID != "" && state.accGTID != nil {
 				if err := state.accGTID.Update(ev.GTID); err != nil {
-					log.Printf("WARNING: failed to update GTID set with %q: %v", ev.GTID, err)
+					slog.Warn("failed to update GTID set", "gtid", ev.GTID, "error", err)
+					observe.StreamErrors.WithLabelValues("gtid_update").Inc()
 				} else {
 					state.gtidSet = state.accGTID.String()
 				}
@@ -274,6 +290,18 @@ func streamLoop(
 			if !ev.Timestamp.IsZero() {
 				state.lastEventTime = sql.NullTime{Time: ev.Timestamp, Valid: true}
 			}
+
+			observe.StreamEventsReceived.Inc()
+			if !ev.Timestamp.IsZero() {
+				ts := float64(ev.Timestamp.Unix())
+				observe.StreamLastEventTimestamp.Set(ts)
+				observe.StreamReplicationLag.Set(float64(time.Now().Unix()) - ts)
+			}
+			slog.Debug("event received",
+				"schema", ev.Schema,
+				"table", ev.Table,
+				"type", ev.EventType,
+				"gtid", ev.GTID)
 
 			batch = append(batch, ev)
 			if len(batch) >= idx.BatchSize() {
@@ -403,14 +431,32 @@ func runStream(cmd *cobra.Command, args []string) error {
 	go func() {
 		select {
 		case sig := <-sigCh:
-			log.Printf("Received %v — shutting down gracefully...", sig)
+			slog.Info("received signal — shutting down gracefully", "signal", sig.String())
 			cancel()
 		case <-ctx.Done():
 		}
 	}()
 
+	// ── 9b. Optional Prometheus metrics HTTP server ───────────────────────────
+	if strmMetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		metricsServer := &http.Server{Addr: strmMetricsAddr, Handler: mux}
+		go func() {
+			slog.Info("metrics server starting", "addr", strmMetricsAddr)
+			if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("metrics server error", "error", err)
+			}
+		}()
+		defer func() {
+			shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutCancel()
+			_ = metricsServer.Shutdown(shutCtx)
+		}()
+	}
+
 	// ── 10. Launch StreamParser in a goroutine ────────────────────────────────
-	sp := parser.NewStreamParser(resolver, filters)
+	sp := parser.NewStreamParser(resolver, filters, nil)
 	idx := indexer.New(indexDB, strmBatchSize)
 
 	events := make(chan parser.Event, 1000)
