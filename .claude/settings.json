@@ -2,28 +2,22 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": {
-          "tool_name": "Edit|Write",
-          "file_path": ".*\\.go$"
-        },
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
-            "command": "cd /Users/dani/bintrail && go build ./... && go vet ./..."
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/build-on-go-edit.sh"
           }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": {
-          "tool_name": "Edit|Write",
-          "file_path": "^(bintrail|bintrail-mcp|cover\\.out)$"
-        },
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Blocked: do not edit build artifacts (bintrail, bintrail-mcp, cover.out)' && exit 2"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-build-artifacts.sh"
           }
         ]
       }
