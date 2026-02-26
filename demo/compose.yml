@@ -45,13 +45,40 @@ services:
       context: ../        # repo root (go.mod lives there)
       dockerfile: demo/bintrail/Dockerfile
     environment:
-      INDEX_DSN:  "root:demo@tcp(mysql:3306)/bintrail_index"
-      SOURCE_DSN: "root:demo@tcp(mysql:3306)/"
-      SCHEMAS:    "demo,sbtest"
-      SERVER_ID:  "99999"
-      BATCH_SIZE: "500"
-      CHECKPOINT: "5"
+      INDEX_DSN:    "root:demo@tcp(mysql:3306)/bintrail_index"
+      SOURCE_DSN:   "root:demo@tcp(mysql:3306)/"
+      SCHEMAS:      "demo,sbtest"
+      SERVER_ID:    "99999"
+      BATCH_SIZE:   "500"
+      CHECKPOINT:   "5"
+      METRICS_ADDR: ":9090"
     depends_on:
       mysql:
         condition: service_healthy
     restart: on-failure
+
+  # ── Prometheus ───────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      bintrail:
+        condition: service_started
+
+  # ── Grafana ──────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.5.2
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/bintrail-stream.json"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
