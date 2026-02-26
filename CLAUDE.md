@@ -244,18 +244,19 @@ go test -tags integration -coverprofile=cover.out ./... -count=1
 go tool cover -func=cover.out
 ```
 
-### Coverage baseline (as of stream test suite)
+### Coverage baseline (as of ParseTime UTC fix + E2E stdout/stderr fix)
 
 Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 
 | Package | Coverage |
 |---|---|
 | `internal/cliutil` | 100% |
-| `internal/config` | 91% |
+| `internal/observe` | 100% |
 | `internal/recovery` | 92% |
+| `internal/config` | 91% |
 | `internal/query` | 91% |
 | `internal/indexer` | 86% |
-| `cmd/bintrail-mcp` | 90% |
+| `cmd/bintrail-mcp` | 89% |
 | `internal/metadata` | 83% |
 | `internal/parser` | 82% |
 | `internal/status` | 68% |
