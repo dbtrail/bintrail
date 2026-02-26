@@ -46,31 +46,30 @@ bintrail snapshot \
 log "Capturing GTID start position..."
 START_GTID=$(mysql_q "SELECT @@global.gtid_executed" 2>/dev/null || true)
 
-if [ -z "$START_GTID" ]; then
+# ── 5. exec bintrail stream ─────────────────────────────────
+# Build args array so optional --metrics-addr and --start-gtid are handled
+# cleanly without shell word-splitting issues.
+STREAM_ARGS=(
+    --index-dsn   "$INDEX_DSN"
+    --source-dsn  "$SOURCE_DSN"
+    --server-id   "$SERVER_ID"
+    --batch-size  "$BATCH_SIZE"
+    --checkpoint  "$CHECKPOINT"
+    --schemas     "$SCHEMAS"
+)
+
+if [ -n "$START_GTID" ]; then
+    STREAM_ARGS+=(--start-gtid "$START_GTID")
+else
     log "Warning: gtid_executed is empty — starting stream without --start-gtid"
-    log "Running: bintrail stream (no GTID)"
-    exec bintrail stream \
-        --index-dsn   "$INDEX_DSN" \
-        --source-dsn  "$SOURCE_DSN" \
-        --server-id   "$SERVER_ID" \
-        --batch-size  "$BATCH_SIZE" \
-        --checkpoint  "$CHECKPOINT" \
-        --schemas     "$SCHEMAS" \
-        ${METRICS_ADDR:+--metrics-addr "$METRICS_ADDR"}
 fi
 
-log "Start GTID: $START_GTID"
+if [ -n "$METRICS_ADDR" ]; then
+    STREAM_ARGS+=(--metrics-addr "$METRICS_ADDR")
+fi
 
-# ── 5. exec bintrail stream ─────────────────────────────────
+log "Running: bintrail stream (args: ${STREAM_ARGS[*]})"
+
 # Using 'exec' so Docker SIGTERM goes directly to bintrail (PID 1),
 # triggering its graceful shutdown + checkpoint flush.
-log "Running: bintrail stream"
-exec bintrail stream \
-    --index-dsn   "$INDEX_DSN" \
-    --source-dsn  "$SOURCE_DSN" \
-    --server-id   "$SERVER_ID" \
-    --start-gtid  "$START_GTID" \
-    --batch-size  "$BATCH_SIZE" \
-    --checkpoint  "$CHECKPOINT" \
-    --schemas     "$SCHEMAS" \
-    ${METRICS_ADDR:+--metrics-addr "$METRICS_ADDR"}
+exec bintrail stream "${STREAM_ARGS[@]}"
