@@ -2,6 +2,7 @@ package cliutil
 
 import (
 	"testing"
+	"time"
 
 	"github.com/bintrail/bintrail/internal/parser"
 )
@@ -112,7 +113,7 @@ func TestParseTime_rfc3339(t *testing.T) {
 }
 
 func TestParseTime_dateOnly(t *testing.T) {
-	// Date-only input is now accepted — parsed as midnight local time.
+	// Date-only input is now accepted — parsed as midnight UTC.
 	got, err := ParseTime("2026-02-19")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -125,6 +126,28 @@ func TestParseTime_dateOnly(t *testing.T) {
 	}
 	if got.Hour() != 0 || got.Minute() != 0 || got.Second() != 0 {
 		t.Errorf("expected midnight, got %v", got)
+	}
+}
+
+func TestParseTime_mysqlDatetime_isUTC(t *testing.T) {
+	// MySQL datetime format must be anchored to UTC, not local time,
+	// because binlog_events stores timestamps in UTC.
+	got, err := ParseTime("2026-02-19 14:30:00")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Location() != time.UTC {
+		t.Errorf("expected UTC location, got %v", got.Location())
+	}
+}
+
+func TestParseTime_dateOnly_isUTC(t *testing.T) {
+	got, err := ParseTime("2026-02-19")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Location() != time.UTC {
+		t.Errorf("expected UTC location, got %v", got.Location())
 	}
 }
 
