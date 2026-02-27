@@ -1,8 +1,12 @@
 // bintrail-mcp is an MCP (Model Context Protocol) server that exposes
 // read-only Bintrail operations as tools: query, recover, and status.
 //
-// It communicates over stdio and is designed to be launched as a subprocess
-// by an MCP-compatible client (e.g. Claude Code, Cursor, etc.).
+// By default it communicates over stdio (for use as a subprocess by Claude
+// Code, Cursor, etc.). Pass --http <addr> to start an HTTP server instead,
+// allowing any MCP client on the network to connect without a local binary.
+//
+//	bintrail-mcp                   # stdio (default)
+//	bintrail-mcp --http :8080      # HTTP on all interfaces, port 8080
 //
 // Configuration:
 //
@@ -14,8 +18,10 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -80,7 +86,27 @@ func newServer() *mcp.Server {
 }
 
 func main() {
-	if err := newServer().Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+	httpAddr := flag.String("http", "", "HTTP listen address (e.g. :8080); omit to use stdio")
+	flag.Parse()
+
+	ctx := context.Background()
+
+	if *httpAddr != "" {
+		handler := mcp.NewStreamableHTTPHandler(
+			func(_ *http.Request) *mcp.Server { return newServer() },
+			nil,
+		)
+		mux := http.NewServeMux()
+		mux.Handle("/mcp", handler)
+		slog.Info("MCP HTTP server starting", "addr", *httpAddr, "endpoint", "/mcp")
+		if err := http.ListenAndServe(*httpAddr, mux); err != nil {
+			slog.Error("MCP HTTP server error", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if err := newServer().Run(ctx, &mcp.StdioTransport{}); err != nil {
 		slog.Error("MCP server error", "error", err)
 		os.Exit(1)
 	}
