@@ -13,7 +13,7 @@ sudo usermod -aG docker "$USER"
 
 echo "==> Cloning bintrail..."
 if [ ! -d "$HOME/bintrail" ]; then
-    git clone https://github.com/bintrail/bintrail.git "$HOME/bintrail"
+    git clone git@github.com:nethalo/bintrail.git "$HOME/bintrail"
 fi
 
 echo "==> Creating .env from template..."
