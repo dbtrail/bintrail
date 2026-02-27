@@ -208,8 +208,20 @@ Use the passwords you chose here as `BINTRAIL_RDS_PASSWORD` and `TRAFFIC_RDS_PAS
 
 ## Part H — Deploy App on EC2
 
+From your laptop, copy the bootstrap script to the EC2:
+
 ```bash
-# SSH into app EC2
+scp -i key.pem ~/bintrail/deploy/setup.sh ubuntu@<APP_EC2_IP>:~
+```
+
+SSH in and run it (installs git, Docker, mysql-client):
+
+```bash
+ssh -i key.pem ubuntu@<APP_EC2_IP>
+bash ~/setup.sh
+
+# Re-login for Docker group (or run: newgrp docker)
+exit
 ssh -i key.pem ubuntu@<APP_EC2_IP>
 ```
 
@@ -227,19 +239,14 @@ ssh -i key.pem ubuntu@<APP_EC2_IP>
 > EOF
 > ```
 
+Clone the repo and create `.env`:
+
 ```bash
-# Clone repo
 git clone git@github.com:nethalo/bintrail.git ~/bintrail
-
-# Run bootstrap script (installs Docker, creates .env)
-bash ~/bintrail/deploy/setup.sh
-
-# Re-login for Docker group (or run: newgrp docker)
-exit
-ssh -i key.pem ubuntu@<APP_EC2_IP>
-
-# Edit .env
-nano ~/bintrail/deploy/.env
+cd ~/bintrail/deploy
+cp .env.example .env
+chmod 600 .env
+nano .env
 ```
 
 Fill in `.env`:

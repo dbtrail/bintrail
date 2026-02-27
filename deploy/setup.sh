@@ -12,30 +12,13 @@ echo "==> Enabling Docker..."
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$USER"
 
-echo "==> Cloning bintrail..."
-if [ ! -d "$HOME/bintrail" ]; then
-    git clone git@github.com:nethalo/bintrail.git "$HOME/bintrail"
-fi
-
-echo "==> Creating .env from template..."
-cd "$HOME/bintrail/deploy"
-if [ ! -f .env ]; then
-    cp .env.example .env
-    chmod 600 .env
-    echo "    Edit .env with your RDS endpoint and password:"
-    echo "    nano $HOME/bintrail/deploy/.env"
-else
-    echo "    .env already exists — skipping."
-fi
-
 echo ""
-echo "==> Next steps:"
+echo "==> Done. Next steps:"
 echo "  1. Log out and back in (for docker group), or run: newgrp docker"
-echo "  2. Edit .env:  nano ~/bintrail/deploy/.env"
+echo "  2. Set up a deploy key — see deploy/README.md Part H"
+echo "  3. Clone the repo:  git clone git@github.com:nethalo/bintrail.git ~/bintrail"
+echo "  4. Create .env:  cd ~/bintrail/deploy && cp .env.example .env && chmod 600 .env"
+echo "  5. Edit .env:  nano ~/bintrail/deploy/.env"
 echo "     Set RDS_ENDPOINT, BINTRAIL_RDS_USER/PASSWORD, TRAFFIC_RDS_USER/PASSWORD"
-echo "     Set INDEX_HOST/INDEX_USER/INDEX_PASSWORD (index EC2 Percona)"
-echo "     Set GRAFANA_PASSWORD"
-echo "  3. Load demo schema (from this host, since RDS is private):"
-echo "     mysql -h <RDS_ENDPOINT> -u admin -p < ~/bintrail/demo/sql/00-schema.sql"
-echo "  4. Initialize bintrail index on the index EC2 — see deploy/README.md Part F"
-echo "  5. Launch:  cd ~/bintrail/deploy && docker compose up --build -d"
+echo "     Set INDEX_HOST/INDEX_USER/INDEX_PASSWORD, GRAFANA_PASSWORD"
+echo "  6. Launch:  cd ~/bintrail/deploy && docker compose up --build -d"
