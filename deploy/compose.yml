@@ -20,7 +20,7 @@ services:
       context: ../
       dockerfile: demo/bintrail/Dockerfile
     environment:
-      INDEX_DSN:    "${RDS_USER}:${RDS_PASSWORD}@tcp(${RDS_ENDPOINT}:3306)/bintrail_index"
+      INDEX_DSN:    "${INDEX_USER}:${INDEX_PASSWORD}@tcp(${INDEX_HOST}:3306)/bintrail_index"
       SOURCE_DSN:   "${RDS_USER}:${RDS_PASSWORD}@tcp(${RDS_ENDPOINT}:3306)/"
       SCHEMAS:      ${SCHEMAS}
       SERVER_ID:    ${SERVER_ID}

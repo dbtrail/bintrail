@@ -1,6 +1,6 @@
 # Bintrail — EC2 + RDS Deployment
 
-One `docker compose up` on a Graviton EC2 instance that streams from RDS, indexes events, and shows the Grafana dashboard.
+Three-node setup: traffic and bintrail stream run on an app EC2, the bintrail index lives on a dedicated EC2 running Percona Server 8.0, and the source database is RDS MySQL 8.0.
 
 ## Architecture
 
@@ -10,28 +10,32 @@ One `docker compose up` on a Graviton EC2 instance that streams from RDS, indexe
                 SSH (22)  │  Grafana (3000)
                           ▼
 ┌─────────────────────────────────────────────────────┐
-│  EC2 (t4g.small, Graviton ARM64, Ubuntu 24.04)      │
+│  EC2 "app" (t4g.small, Ubuntu 24.04 ARM64)           │
 │                                                      │
 │  docker compose up:                                  │
-│    ├── bintrail stream ──► RDS (index + source)     │
-│    │       └── :9090 /metrics (internal only)        │
-│    ├── traffic generator ──► RDS (demo writes)      │
-│    ├── prometheus (scrapes :9090, internal only)     │
-│    └── grafana (:3000, exposed to your IP)           │
+│    ├── bintrail stream                               │
+│    │     INDEX_DSN ──► EC2 "index" (3306)           │
+│    │     SOURCE_DSN ──► RDS (3306)                  │
+│    ├── traffic ──► RDS (3306)                       │
+│    ├── prometheus (127.0.0.1:9090)                   │
+│    └── grafana (:3000)                               │
 └──────────────────────────────────────────────────────┘
          │                          │
-         │  TCP 3306 (SG-to-SG)    │  TCP 3306 (SG-to-SG)
+         │  3306 (SG-to-SG)        │  3306 (SG-to-SG)
          ▼                          ▼
-┌─────────────────────────────────────────────────────┐
-│  RDS MySQL 8.0 (db.t4g.micro, Graviton ARM64)       │
-│    ├── demo           (source — traffic writes)      │
-│    ├── sbtest         (sysbench workload)            │
-│    └── bintrail_index (index — bintrail writes)      │
-│    Public access: NO                                 │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────┐   ┌───────────────────────────┐
+│  EC2 "index"          │   │  RDS MySQL 8.0             │
+│  Percona Server 8.0   │   │    ├── demo                │
+│    └── bintrail_index │   │    └── sbtest              │
+│  Public access: NO    │   │  Public access: NO         │
+└──────────────────────┘   └───────────────────────────┘
 ```
 
-RDS has public access OFF — only reachable from EC2 via security group.
+Three security groups:
+- `bintrail-ec2-sg` — SSH 22 + TCP 3000 from your IP
+- `bintrail-index-sg` — SSH 22 from your IP, MySQL 3306 from `bintrail-ec2-sg`
+- `bintrail-rds-sg` — MySQL 3306 from `bintrail-ec2-sg`
+
 Prometheus binds to `127.0.0.1:9090` only (not internet-exposed).
 
 ---
@@ -71,7 +75,7 @@ Do this **before** creating the RDS instance.
    - Create new security group: `bintrail-rds-sg`
 8. Additional configuration:
    - DB parameter group: `bintrail-binlog` (from Part A)
-   - Initial database name: `bintrail_index`
+   - Leave "Initial database name" blank (RDS no longer hosts the index)
    - Enable automated backups: **yes** (required for binlogs on RDS)
    - Backup retention: 7 days
 9. **Create database** — wait ~5 min for status: Available
@@ -79,12 +83,29 @@ Do this **before** creating the RDS instance.
 
 ---
 
-## Part C — Create EC2 Instance
+## Part C — Create EC2 "index" Instance
+
+This instance will run Percona Server 8.0 and store the bintrail index.
 
 1. EC2 → **Launch instance**
-2. Name: `bintrail-demo`
+2. Name: `bintrail-index`
 3. AMI: **Ubuntu Server 24.04 LTS** — select the **arm64** version
-4. Instance type: **t4g.small** (2 vCPU, 2 GB RAM, Graviton2)
+4. Instance type: **t4g.micro** (1 vCPU, 1 GB RAM — index writes are light)
+5. Key pair: same as app EC2
+6. Network settings → **Create security group**: `bintrail-index-sg`
+   - SSH (22): Source = **My IP**
+   - _(MySQL 3306 rule added in Part E — needs app SG to exist first)_
+7. Storage: 20 GB gp3
+8. **Launch instance** — note the **private IP** (e.g. `10.0.1.42`)
+
+---
+
+## Part D — Create EC2 "app" Instance
+
+1. EC2 → **Launch instance**
+2. Name: `bintrail-app`
+3. AMI: **Ubuntu Server 24.04 LTS** — select the **arm64** version
+4. Instance type: **t4g.small** (2 vCPU, 2 GB RAM)
 5. Key pair: create or select existing
 6. Network settings → **Create security group**: `bintrail-ec2-sg`
    - SSH (22): Source = **My IP**
@@ -95,31 +116,60 @@ Do this **before** creating the RDS instance.
 
 ---
 
-## Part D — Connect Security Groups
+## Part E — Connect Security Groups
 
-Allow EC2 to reach RDS on port 3306:
+Three inbound rules to add:
 
+**1. App EC2 → RDS (MySQL 3306):**
 1. RDS → **bintrail-demo** → **Security** tab → click `bintrail-rds-sg`
 2. **Edit inbound rules** → **Add rule**:
-   - Type: MySQL/Aurora (3306)
-   - Source: `bintrail-ec2-sg` (select by name)
+   - Type: MySQL/Aurora (3306), Source: `bintrail-ec2-sg`
 3. **Save rules**
 
-The RDS security group should now have **exactly one inbound rule**: 3306 from `bintrail-ec2-sg`. No `0.0.0.0/0` rules.
+**2. App EC2 → Index EC2 (MySQL 3306):**
+1. EC2 → **Security Groups** → `bintrail-index-sg`
+2. **Edit inbound rules** → **Add rule**:
+   - Type: MySQL/Aurora (3306), Source: `bintrail-ec2-sg`
+3. **Save rules**
+
+Result:
+- `bintrail-rds-sg`: one inbound rule — 3306 from `bintrail-ec2-sg`
+- `bintrail-index-sg`: SSH from your IP + 3306 from `bintrail-ec2-sg`
+- No `0.0.0.0/0` rules anywhere.
 
 ---
 
-## Part E — Initialize Demo Schema on RDS
-
-Since RDS has public access OFF, connect through EC2:
+## Part F — Set Up Index EC2 (Percona Server)
 
 ```bash
-ssh -i key.pem ubuntu@<EC2_IP>
+# SSH into the index EC2
+ssh -i key.pem ubuntu@<INDEX_EC2_IP>
 
-# Install MySQL client
-sudo apt-get update && sudo apt-get install -y mysql-client
+# Download and run the setup script
+curl -fsSL https://raw.githubusercontent.com/bintrail/bintrail/main/deploy/setup-index.sh | bash
+# OR after cloning manually:
+bash ~/bintrail/deploy/setup-index.sh
+```
 
-# Test connectivity
+The script will:
+- Install Percona Server 8.0 via the official apt repository
+- Bind MySQL to `0.0.0.0` (security comes from the EC2 security group)
+- Create the `bintrail_index` database
+- Create a `bintrail` user with access only to `bintrail_index`
+- Print the private IP and next steps
+
+Note the **private IP** shown — you'll need it for `.env` in Part H.
+
+---
+
+## Part G — Initialize Demo Schema on RDS
+
+Since RDS has public access OFF, connect through the app EC2:
+
+```bash
+ssh -i key.pem ubuntu@<APP_EC2_IP>
+
+# Test connectivity to RDS
 mysql -h <RDS_ENDPOINT> -u admin -p -e "SELECT 1"
 
 # Load demo schema (creates demo + sbtest databases)
@@ -127,18 +177,16 @@ mysql -h <RDS_ENDPOINT> -u admin -p < ~/bintrail/demo/sql/00-schema.sql
 
 # Verify
 mysql -h <RDS_ENDPOINT> -u admin -p -e "SHOW DATABASES"
-# Expected: bintrail_index, demo, sbtest, ...
+# Expected: demo, sbtest, information_schema, ...
 ```
-
-> `bintrail_index` was created by RDS via the "Initial database name" setting in Part B.
 
 ---
 
-## Part F — Deploy on EC2
+## Part H — Deploy App on EC2
 
 ```bash
-# SSH into EC2
-ssh -i key.pem ubuntu@<EC2_IP>
+# SSH into app EC2
+ssh -i key.pem ubuntu@<APP_EC2_IP>
 
 # Run bootstrap script (installs Docker, clones repo, creates .env)
 curl -fsSL https://raw.githubusercontent.com/bintrail/bintrail/main/deploy/setup.sh | bash
@@ -147,7 +195,7 @@ bash ~/bintrail/deploy/setup.sh
 
 # Re-login for Docker group (or run: newgrp docker)
 exit
-ssh -i key.pem ubuntu@<EC2_IP>
+ssh -i key.pem ubuntu@<APP_EC2_IP>
 
 # Edit .env
 nano ~/bintrail/deploy/.env
@@ -155,9 +203,17 @@ nano ~/bintrail/deploy/.env
 
 Fill in `.env`:
 ```bash
+# RDS — source database
 RDS_ENDPOINT=bintrail-demo.abc123.us-east-1.rds.amazonaws.com
 RDS_USER=admin
-RDS_PASSWORD=your-strong-password
+RDS_PASSWORD=your-rds-master-password
+
+# Index EC2 — Percona Server
+INDEX_HOST=10.0.1.42          # private IP from Part C / Part F
+INDEX_USER=bintrail
+INDEX_PASSWORD=your-index-password
+
+# bintrail settings
 SCHEMAS=demo,sbtest
 SERVER_ID=99999
 BATCH_SIZE=500
@@ -165,6 +221,10 @@ CHECKPOINT=5
 ```
 
 ```bash
+# Verify connectivity to both databases before launching
+mysql -h <INDEX_HOST> -u bintrail -p -e "SHOW DATABASES"  # → bintrail_index
+mysql -h <RDS_ENDPOINT> -u admin -p -e "SHOW DATABASES"   # → demo, sbtest
+
 # Lock down credentials
 chmod 600 ~/bintrail/deploy/.env
 
@@ -178,13 +238,13 @@ docker compose logs -f bintrail   # look for "Checkpoint saved"
 
 ---
 
-## Part G — Access & Verify
+## Part I — Access & Verify
 
 **From your laptop:**
 
-- **Grafana**: `http://<EC2_PUBLIC_IP>:3000` — opens directly to the dashboard (no login)
+- **Grafana**: `http://<APP_EC2_PUBLIC_IP>:3000` — opens directly to the dashboard (no login)
 
-**From EC2 (via SSH):**
+**From app EC2 (via SSH):**
 
 ```bash
 # Prometheus targets (bintrail-stream should be UP)
@@ -204,7 +264,8 @@ docker compose logs -f bintrail   # should resume from saved GTID position
 
 - [ ] RDS **public access: No**
 - [ ] RDS security group has **only** one inbound rule: 3306 from `bintrail-ec2-sg`
-- [ ] EC2 security group has **only**: SSH (22) from your IP, TCP 3000 from your IP
+- [ ] Index EC2 security group has: SSH from your IP, 3306 from `bintrail-ec2-sg` only
+- [ ] App EC2 security group has: SSH (22) + TCP 3000 from your IP only
 - [ ] No `0.0.0.0/0` inbound rules anywhere
 - [ ] Prometheus (9090) bound to **127.0.0.1 only** in `compose.yml`
 - [ ] `.env` is `chmod 600`
@@ -218,6 +279,7 @@ docker compose logs -f bintrail   # should resume from saved GTID position
 # Stop services
 cd ~/bintrail/deploy && docker compose down
 
-# AWS Console: terminate EC2 instance + delete RDS instance
-# (delete automated backups when prompted if you don't need them)
+# AWS Console:
+#   - Terminate both EC2 instances (app + index)
+#   - Delete RDS instance (delete automated backups when prompted if not needed)
 ```
