@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
 # Bootstrap a Percona Server 8.0 index node on Ubuntu 24.04 ARM64.
-# Run as: bash setup-index.sh [bintrail-user-password]
-# If password is not given as an argument, the script prompts for it.
+# Run as: bash setup-index.sh
 set -euo pipefail
 
-BINTRAIL_PASSWORD="${1:-}"
-if [ -z "$BINTRAIL_PASSWORD" ]; then
-    read -rsp "Enter password for the 'bintrail' MySQL user: " BINTRAIL_PASSWORD
-    echo
-fi
+read -rsp "Enter password for the 'bintrail' MySQL user: " BINTRAIL_PASSWORD
+echo
 
 echo "==> Installing Percona release package..."
 TMP_DEB="$(mktemp /tmp/percona-release-XXXXXX.deb)"
@@ -20,6 +16,9 @@ rm -f "$TMP_DEB"
 
 echo "==> Setting up Percona Server 8.0 repository..."
 sudo percona-release setup ps80
+
+echo "==> Upgrading OS packages..."
+sudo apt-get upgrade -y -qq
 
 echo "==> Installing Percona Server 8.0 (this may take a few minutes)..."
 sudo apt-get install -y percona-server-server
@@ -43,7 +42,8 @@ CREATE DATABASE IF NOT EXISTS bintrail_index
 CREATE USER IF NOT EXISTS 'bintrail'@'%'
     IDENTIFIED BY '${BINTRAIL_PASSWORD}';
 
-GRANT ALL PRIVILEGES ON bintrail_index.* TO 'bintrail'@'%';
+GRANT CREATE, ALTER, DROP, SELECT, INSERT, UPDATE, DELETE
+    ON bintrail_index.* TO 'bintrail'@'%';
 
 FLUSH PRIVILEGES;
 SQL

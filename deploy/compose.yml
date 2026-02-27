@@ -9,8 +9,8 @@ services:
     environment:
       MYSQL_HOST: ${RDS_ENDPOINT}
       MYSQL_PORT: "3306"
-      MYSQL_USER: ${RDS_USER}
-      MYSQL_PASS: ${RDS_PASSWORD}
+      MYSQL_USER: ${TRAFFIC_RDS_USER}
+      MYSQL_PASS: ${TRAFFIC_RDS_PASSWORD}
       MYSQL_DB:   demo
     restart: on-failure
 
@@ -21,7 +21,7 @@ services:
       dockerfile: demo/bintrail/Dockerfile
     environment:
       INDEX_DSN:    "${INDEX_USER}:${INDEX_PASSWORD}@tcp(${INDEX_HOST}:3306)/bintrail_index"
-      SOURCE_DSN:   "${RDS_USER}:${RDS_PASSWORD}@tcp(${RDS_ENDPOINT}:3306)/"
+      SOURCE_DSN:   "${BINTRAIL_RDS_USER}:${BINTRAIL_RDS_PASSWORD}@tcp(${RDS_ENDPOINT}:3306)/"
       SCHEMAS:      ${SCHEMAS}
       SERVER_ID:    ${SERVER_ID}
       BATCH_SIZE:   ${BATCH_SIZE}
@@ -46,8 +46,9 @@ services:
     ports:
       - "3000:3000"
     environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/bintrail-stream.json"
     volumes:
       - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro

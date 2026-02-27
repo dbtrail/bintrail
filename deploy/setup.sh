@@ -5,6 +5,7 @@ set -euo pipefail
 
 echo "==> Installing packages..."
 sudo apt-get update -qq
+sudo apt-get upgrade -y -qq
 sudo apt-get install -y -qq docker.io docker-compose-v2 mysql-client git
 
 echo "==> Enabling Docker..."
@@ -31,8 +32,9 @@ echo ""
 echo "==> Next steps:"
 echo "  1. Log out and back in (for docker group), or run: newgrp docker"
 echo "  2. Edit .env:  nano ~/bintrail/deploy/.env"
-echo "     Set RDS_ENDPOINT/RDS_USER/RDS_PASSWORD (source database)"
+echo "     Set RDS_ENDPOINT, BINTRAIL_RDS_USER/PASSWORD, TRAFFIC_RDS_USER/PASSWORD"
 echo "     Set INDEX_HOST/INDEX_USER/INDEX_PASSWORD (index EC2 Percona)"
+echo "     Set GRAFANA_PASSWORD"
 echo "  3. Load demo schema (from this host, since RDS is private):"
 echo "     mysql -h <RDS_ENDPOINT> -u admin -p < ~/bintrail/demo/sql/00-schema.sql"
 echo "  4. Initialize bintrail index on the index EC2 — see deploy/README.md Part F"
