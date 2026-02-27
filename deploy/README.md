@@ -78,6 +78,7 @@ Do this **before** creating the RDS instance.
    - Leave "Initial database name" blank (RDS no longer hosts the index)
    - Enable automated backups: **yes** (required for binlogs on RDS)
    - Backup retention: 7 days
+8b. Encryption: **Enable encryption** (check "Enable encryption" under Storage → Encryption). Free, no performance penalty.
 9. **Create database** — wait ~5 min for status: Available
 10. Note the **Endpoint** (e.g. `bintrail-demo.abc123.us-east-1.rds.amazonaws.com`)
 
@@ -95,7 +96,7 @@ This instance will run Percona Server 8.0 and store the bintrail index.
 6. Network settings → **Create security group**: `bintrail-index-sg`
    - SSH (22): Source = **My IP**
    - _(MySQL 3306 rule added in Part E — needs app SG to exist first)_
-7. Storage: 20 GB gp3
+7. Storage: 20 GB gp3, **Encrypted: Yes**
 8. **Launch instance** — note the **private IP** (e.g. `10.0.1.42`)
 
 ---
@@ -111,7 +112,7 @@ This instance will run Percona Server 8.0 and store the bintrail index.
    - SSH (22): Source = **My IP**
    - Custom TCP 3000: Source = **My IP** (Grafana)
    - ⚠️ Do NOT expose 9090 — Prometheus stays internal
-7. Storage: 20 GB gp3
+7. Storage: 20 GB gp3, **Encrypted: Yes**
 8. **Launch instance** — note the public IP
 
 ---
@@ -181,13 +182,53 @@ mysql -h <RDS_ENDPOINT> -u admin -p -e "SHOW DATABASES"
 
 ---
 
+## Part G½ — Create Dedicated RDS Users
+
+Still connected to the app EC2, create least-privilege users so bintrail and the traffic generator do not share the RDS admin account:
+
+```bash
+mysql -h <RDS_ENDPOINT> -u admin -p
+```
+
+```sql
+-- For bintrail stream (reads binlogs + schema metadata)
+CREATE USER 'bintrail_reader'@'%' IDENTIFIED BY '<bintrail-reader-password>';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'bintrail_reader'@'%';
+GRANT SELECT ON demo.* TO 'bintrail_reader'@'%';
+GRANT SELECT ON sbtest.* TO 'bintrail_reader'@'%';
+
+-- For the traffic generator (DML on demo only)
+CREATE USER 'traffic'@'%' IDENTIFIED BY '<traffic-password>';
+GRANT SELECT, INSERT, UPDATE, DELETE ON demo.* TO 'traffic'@'%';
+```
+
+Use the passwords you chose here as `BINTRAIL_RDS_PASSWORD` and `TRAFFIC_RDS_PASSWORD` in `.env`.
+
+---
+
 ## Part H — Deploy App on EC2
 
 ```bash
 # SSH into app EC2
 ssh -i key.pem ubuntu@<APP_EC2_IP>
+```
 
-# Clone repo (requires SSH key or PAT with repo access)
+> **Private repo access**: generate a read-only deploy key on the EC2 rather than copying your personal SSH key:
+> ```bash
+> ssh-keygen -t ed25519 -f ~/.ssh/bintrail-deploy -N ""
+> cat ~/.ssh/bintrail-deploy.pub
+> # Add this as a deploy key: GitHub → repo Settings → Deploy keys → Add (read-only)
+> ```
+> Then configure SSH to use it:
+> ```bash
+> cat >> ~/.ssh/config <<'EOF'
+> Host github.com
+>     IdentityFile ~/.ssh/bintrail-deploy
+> EOF
+> ```
+
+```bash
+# Clone repo
 git clone git@github.com:nethalo/bintrail.git ~/bintrail
 
 # Run bootstrap script (installs Docker, creates .env)
@@ -205,13 +246,22 @@ Fill in `.env`:
 ```bash
 # RDS — source database
 RDS_ENDPOINT=bintrail-demo.abc123.us-east-1.rds.amazonaws.com
-RDS_USER=admin
-RDS_PASSWORD=your-rds-master-password
+
+# bintrail stream (replication reader — created in Part G½)
+BINTRAIL_RDS_USER=bintrail_reader
+BINTRAIL_RDS_PASSWORD=your-bintrail-reader-password
+
+# traffic generator (DML only — created in Part G½)
+TRAFFIC_RDS_USER=traffic
+TRAFFIC_RDS_PASSWORD=your-traffic-password
 
 # Index EC2 — Percona Server
 INDEX_HOST=10.0.1.42          # private IP from Part C / Part F
 INDEX_USER=bintrail
 INDEX_PASSWORD=your-index-password
+
+# Grafana
+GRAFANA_PASSWORD=your-grafana-admin-password
 
 # bintrail settings
 SCHEMAS=demo,sbtest
@@ -222,8 +272,9 @@ CHECKPOINT=5
 
 ```bash
 # Verify connectivity to both databases before launching
-mysql -h <INDEX_HOST> -u bintrail -p -e "SHOW DATABASES"  # → bintrail_index
-mysql -h <RDS_ENDPOINT> -u admin -p -e "SHOW DATABASES"   # → demo, sbtest
+mysql -h <INDEX_HOST> -u bintrail -p -e "SHOW DATABASES"             # → bintrail_index
+mysql -h <RDS_ENDPOINT> -u bintrail_reader -p -e "SELECT 1"          # → replication reader
+mysql -h <RDS_ENDPOINT> -u traffic -p -e "USE demo; SELECT 1"        # → traffic user
 
 # Lock down credentials
 chmod 600 ~/bintrail/deploy/.env
@@ -242,7 +293,7 @@ docker compose logs -f bintrail   # look for "Checkpoint saved"
 
 **From your laptop:**
 
-- **Grafana**: `http://<APP_EC2_PUBLIC_IP>:3000` — opens directly to the dashboard (no login)
+- **Grafana**: `http://<APP_EC2_PUBLIC_IP>:3000` — log in as `admin` / `GRAFANA_PASSWORD`
 
 **From app EC2 (via SSH):**
 
@@ -270,6 +321,10 @@ docker compose logs -f bintrail   # should resume from saved GTID position
 - [ ] Prometheus (9090) bound to **127.0.0.1 only** in `compose.yml`
 - [ ] `.env` is `chmod 600`
 - [ ] RDS master password is not in any committed file (`.env` is gitignored)
+- [ ] RDS and EBS volumes encrypted at rest
+- [ ] Dedicated RDS users (not admin) for bintrail and traffic
+- [ ] Deploy key (not personal SSH key) for GitHub access
+- [ ] Grafana has authentication enabled (no anonymous access)
 
 ---
 
