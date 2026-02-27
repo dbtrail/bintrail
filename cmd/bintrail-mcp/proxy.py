@@ -24,27 +24,30 @@ import urllib.error
 
 SERVER_URL = os.environ.get("BINTRAIL_SERVER", "http://localhost:8080/mcp")
 
-_session_id: str | None = None
+_session_id = None  # type: str
 _lock = threading.Lock()
 
 
-def _get_session() -> str | None:
+def _get_session():
     with _lock:
         return _session_id
 
 
-def _set_session(sid: str) -> None:
+def _set_session(sid):
     global _session_id
     with _lock:
         _session_id = sid
 
 
-def _emit(line: str) -> None:
+def _emit(line):
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
 
 
-def _error(msg_id, message: str) -> None:
+def _error(msg_id, message):
+    # Notifications have no id and expect no response — drop silently.
+    if msg_id is None:
+        return
     _emit(json.dumps({
         "jsonrpc": "2.0",
         "id": msg_id,
