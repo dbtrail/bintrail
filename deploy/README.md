@@ -142,13 +142,12 @@ Result:
 ## Part F — Set Up Index EC2 (Percona Server)
 
 ```bash
+# From your laptop (or the app EC2 after cloning in Part H):
+scp -i key.pem ~/bintrail/deploy/setup-index.sh ubuntu@<INDEX_EC2_IP>:~
+
 # SSH into the index EC2
 ssh -i key.pem ubuntu@<INDEX_EC2_IP>
-
-# Download and run the setup script
-curl -fsSL https://raw.githubusercontent.com/bintrail/bintrail/main/deploy/setup-index.sh | bash
-# OR after cloning manually:
-bash ~/bintrail/deploy/setup-index.sh
+bash ~/setup-index.sh
 ```
 
 The script will:
@@ -188,9 +187,10 @@ mysql -h <RDS_ENDPOINT> -u admin -p -e "SHOW DATABASES"
 # SSH into app EC2
 ssh -i key.pem ubuntu@<APP_EC2_IP>
 
-# Run bootstrap script (installs Docker, clones repo, creates .env)
-curl -fsSL https://raw.githubusercontent.com/bintrail/bintrail/main/deploy/setup.sh | bash
-# OR after cloning manually:
+# Clone repo (requires SSH key or PAT with repo access)
+git clone git@github.com:nethalo/bintrail.git ~/bintrail
+
+# Run bootstrap script (installs Docker, creates .env)
 bash ~/bintrail/deploy/setup.sh
 
 # Re-login for Docker group (or run: newgrp docker)
