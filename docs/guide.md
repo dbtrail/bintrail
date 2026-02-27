@@ -398,7 +398,112 @@ curl -s localhost:9090/metrics | grep bintrail_stream_replication_lag_seconds
 
 ---
 
-### Scenario H: Debug logging
+### Scenario H: Using bintrail from Claude Desktop (AI-assisted investigation)
+
+**Situation:** You want to use Claude Desktop (or Claude Code on another machine) to investigate database changes in natural language — without typing CLI commands.
+
+Bintrail ships an MCP server that exposes `query`, `recover`, and `status` as AI tools. Once configured, you can ask Claude things like:
+
+- "What got deleted in the last 10 minutes in the orders table?"
+- "Bring back customer 289"
+- "Which tables had the most activity today?"
+
+Claude calls the tools automatically and presents the results.
+
+---
+
+#### Option A: Claude Code on the same machine (automatic)
+
+If you're using Claude Code in the bintrail repo directory, the `.mcp.json` file registers the MCP server automatically. Just set the DSN:
+
+```bash
+export BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index'
+```
+
+The tools appear in Claude Code with no further configuration.
+
+---
+
+#### Option B: Claude Desktop on a different machine (via HTTP + proxy)
+
+This setup lets any machine on the same network use the bintrail tools in Claude Desktop without installing Go.
+
+**Architecture:**
+
+```
+Claude Desktop  →  proxy.py (stdio, local)  →  bintrail-mcp --http :8080  →  Index MySQL
+```
+
+**On the machine that has bintrail installed:**
+
+```bash
+# Build the binary if you haven't already
+go build -o bintrail-mcp ./cmd/bintrail-mcp
+
+# Start the HTTP MCP server with the index DSN
+BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index' \
+  ./bintrail-mcp --http :8080
+```
+
+> Use a process manager (systemd, launchd) or a `tmux` session to keep it running.
+
+**On the remote machine (where Claude Desktop runs):**
+
+1. Copy the proxy script (requires no dependencies):
+
+   ```bash
+   scp user@server:~/bintrail/cmd/bintrail-mcp/proxy.py ~/proxy.py
+   ```
+
+2. Test the connection before configuring Claude Desktop:
+
+   ```bash
+   BINTRAIL_SERVER=http://192.168.1.10:8080/mcp python3 ~/proxy.py <<'EOF'
+   {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+   {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+   EOF
+   ```
+
+   You should see two JSON responses. If you do, the server is reachable.
+
+3. Edit Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+   ```json
+   {
+     "mcpServers": {
+       "bintrail": {
+         "command": "python3",
+         "args": ["/Users/you/proxy.py"],
+         "env": { "BINTRAIL_SERVER": "http://192.168.1.10:8080/mcp" }
+       }
+     }
+   }
+   ```
+
+4. Restart Claude Desktop.
+
+**Example prompts that work well:**
+
+```
+"What tables had deletions in the last hour?"
+"Show me all changes to the orders table since 2pm today"
+"Someone deleted customer 42 — generate SQL to restore them"
+"What was the status of order 1234 before the last update?"
+"Which customer was modified the most this week?"
+```
+
+**Troubleshooting:**
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| "Both calls failed" | HTTP server not running or wrong IP | Re-run the curl test above; check firewall |
+| Tools fail after server restart | Proxy has stale `Mcp-Session-Id` | Restart Claude Desktop to reset proxy |
+| No bintrail tools in Claude Desktop | Config JSON is malformed | Validate JSON; check for missing braces |
+| Recovery SQL looks wrong | Schema snapshot is stale | Re-run `bintrail snapshot` on the source |
+
+---
+
+### Scenario J: Debug logging
 
 **Situation:** Something isn't indexing correctly and you need verbose output to diagnose it.
 
