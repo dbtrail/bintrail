@@ -18,8 +18,15 @@ METRICS_ADDR="${METRICS_ADDR:-}"
 
 log() { echo "[bintrail] $(date '+%H:%M:%S') $*"; }
 
+# Parse SOURCE_DSN (format: user:pass@tcp(host:port)/db) for mysql CLI
+SRC_USER=$(echo "$SOURCE_DSN" | sed -n 's/^\([^:]*\):.*/\1/p')
+SRC_PASS=$(echo "$SOURCE_DSN" | sed -n 's/^[^:]*:\([^@]*\)@.*/\1/p')
+SRC_HOST=$(echo "$SOURCE_DSN" | sed -n 's/.*tcp(\([^:)]*\).*/\1/p')
+SRC_PORT=$(echo "$SOURCE_DSN" | sed -n 's/.*tcp([^:]*:\([^)]*\)).*/\1/p')
+
 mysql_q() {
-    mysql -hmysql -P3306 -uroot -pdemo --protocol=tcp --silent -e "$1"
+    mysql -h"$SRC_HOST" -P"$SRC_PORT" -u"$SRC_USER" -p"$SRC_PASS" \
+          --protocol=tcp --silent -e "$1"
 }
 
 # ── 1. Wait for demo schema ─────────────────────────────────
