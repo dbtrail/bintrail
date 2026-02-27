@@ -1,0 +1,13 @@
+# Credentials — never commit
+deploy/.env
+
+# Build artifacts (compiled binaries at repo root)
+/bintrail
+/bintrail-mcp
+
+# Test coverage
+cover.out
+/tmp/bintrail-cover/
+
+# macOS
+.DS_Store

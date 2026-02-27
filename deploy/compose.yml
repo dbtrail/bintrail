@@ -1,0 +1,56 @@
+name: bintrail-deploy
+
+services:
+
+  # ── Traffic generator ───────────────────────────────────────
+  traffic:
+    build:
+      context: ../demo/traffic
+    environment:
+      MYSQL_HOST: ${RDS_ENDPOINT}
+      MYSQL_PORT: "3306"
+      MYSQL_USER: ${RDS_USER}
+      MYSQL_PASS: ${RDS_PASSWORD}
+      MYSQL_DB:   demo
+    restart: on-failure
+
+  # ── Bintrail (init → snapshot → stream) ─────────────────────
+  bintrail:
+    build:
+      context: ../
+      dockerfile: demo/bintrail/Dockerfile
+    environment:
+      INDEX_DSN:    "${RDS_USER}:${RDS_PASSWORD}@tcp(${RDS_ENDPOINT}:3306)/bintrail_index"
+      SOURCE_DSN:   "${RDS_USER}:${RDS_PASSWORD}@tcp(${RDS_ENDPOINT}:3306)/"
+      SCHEMAS:      ${SCHEMAS}
+      SERVER_ID:    ${SERVER_ID}
+      BATCH_SIZE:   ${BATCH_SIZE}
+      CHECKPOINT:   ${CHECKPOINT}
+      METRICS_ADDR: ":9090"
+    restart: on-failure
+
+  # ── Prometheus ───────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    ports:
+      - "127.0.0.1:9090:9090"   # localhost only — SSH tunnel for debugging
+    volumes:
+      - ../demo/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      bintrail:
+        condition: service_started
+
+  # ── Grafana ──────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.5.2
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/bintrail-stream.json"
+    volumes:
+      - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../demo/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
