@@ -34,6 +34,7 @@ cmd/bintrail-mcp/      # MCP server (query, recover, status as read-only tools)
   main_test.go         # Unit tests for buildQueryOptions, resolveDSN, errorResult
   integration_test.go  # Integration tests (//go:build integration) — in-memory MCP transport + live MySQL
   e2e_test.go          # E2E test (//go:build integration) — subprocess JSON-RPC stdio protocol
+  proxy.py             # Python stdio↔HTTP proxy for Claude Desktop on remote machines (stdlib only)
 
 internal/
   cliutil/cliutil.go   # Shared filter parsers: ParseEventType, ParseTime, IsValidFormat
@@ -85,7 +86,7 @@ Filter helpers (`ParseEventType`, `ParseTime`, `IsValidFormat`) live in `interna
 
 ## MCP server
 
-`cmd/bintrail-mcp/` is a stdio MCP server exposing three read-only tools:
+`cmd/bintrail-mcp/` exposes three read-only tools via two transport modes:
 
 | Tool | Handler | Description |
 |---|---|---|
@@ -95,13 +96,72 @@ Filter helpers (`ParseEventType`, `ParseTime`, `IsValidFormat`) live in `interna
 
 All tools are annotated with `ReadOnlyHint: true` and `IdempotentHint: true`. DSN resolution: `index_dsn` parameter overrides `BINTRAIL_INDEX_DSN` env var.
 
+### Transport modes
+
+| Mode | Command | When to use |
+|---|---|---|
+| **stdio** (default) | `go run ./cmd/bintrail-mcp` | Claude Code on the same machine — `.mcp.json` handles this automatically |
+| **HTTP** | `bintrail-mcp --http :8080` | Serve over the network for Claude Desktop on other machines |
+
+**stdio mode**: `.mcp.json` at the project root registers `go run ./cmd/bintrail-mcp` so Claude Code auto-starts it. No pre-build needed.
+
+**HTTP mode**: Starts a persistent `net/http` server using `mcp.NewStreamableHTTPHandler` (MCP Streamable HTTP spec 2025-03-26), serving at `/mcp`. Each incoming connection gets a fresh `newServer()` instance; the SDK manages session state via `Mcp-Session-Id` response header.
+
+```bash
+BINTRAIL_INDEX_DSN='root:pass@tcp(127.0.0.1:3306)/binlog_index' bintrail-mcp --http :8080
+```
+
+**Important**: Always start `bintrail-mcp --http` with `BINTRAIL_INDEX_DSN` set in the environment so all tools work without callers passing `index_dsn` on every call.
+
+### Remote access via proxy.py
+
+`cmd/bintrail-mcp/proxy.py` is a Python 3.7+ script (zero dependencies — stdlib only) that bridges Claude Desktop's MCP stdio protocol to the remote HTTP server:
+
+```
+Claude Desktop  →  proxy.py (stdin/stdout)  →  bintrail-mcp --http :8080  →  Index MySQL
+```
+
+**Setup on the remote machine** (the one running Claude Desktop):
+
+1. Copy `proxy.py` to the remote machine (e.g. via `scp`).
+2. Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "bintrail": {
+      "command": "python3",
+      "args": ["/Users/you/proxy.py"],
+      "env": { "BINTRAIL_SERVER": "http://192.168.1.37:8080/mcp" }
+    }
+  }
+}
+```
+
+3. Restart Claude Desktop.
+
+**Testing connectivity** from the remote machine before touching Claude Desktop config:
+
+```bash
+BINTRAIL_SERVER=http://192.168.1.37:8080/mcp python3 ~/proxy.py <<'EOF'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+EOF
+```
+
+You should get two JSON responses back. If you do, Claude Desktop will work.
+
+**Stale session gotcha**: When `bintrail-mcp --http` is restarted, all sessions are invalidated but the proxy process (started by Claude Desktop) still holds the old `Mcp-Session-Id` in memory. Result: tool calls fail with validation errors. Fix: **restart Claude Desktop** — this kills and restarts the proxy process, clearing the stale session ID.
+
+### Implementation notes
+
 `newServer() *mcp.Server` constructs and returns the configured server (extracted from `main()` so tests can call it). `buildQueryOptions` is the shared filter builder used by both `queryTool` and `recoverTool`. Both are tested in `cmd/bintrail-mcp/main_test.go`.
 
 **`jsonschema` tag format**: use plain description strings (`jsonschema:"My description"`) — NOT the old `key=value` format (`jsonschema:"description=..."`) which is rejected by jsonschema-go v0.3+.
 
 Integration tests (`integration_test.go`) use `mcp.NewInMemoryTransports()` to connect a test client to the server in-process — no subprocess or stdio framing needed. The E2E test (`e2e_test.go`) builds the binary with `go build -cover` and speaks raw newline-delimited JSON-RPC over stdin/stdout (protocol version `"2025-06-18"`).
 
-Project-level registration via `.mcp.json` uses `go run ./cmd/bintrail-mcp` — no pre-build needed.
+**proxy.py Python compatibility**: uses comment-style type annotations (`# type: str`) instead of `str | None` syntax — `str | None` requires Python 3.10+, but macOS ships Python 3.9 or older. Notifications (no `id` field) never get error responses — Claude Desktop rejects JSON-RPC errors with `null` id.
 
 ## Database tables
 

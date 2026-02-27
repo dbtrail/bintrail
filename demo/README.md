@@ -51,11 +51,67 @@ bintrail recover --index-dsn "$BINTRAIL_INDEX_DSN" --schema demo --table custome
 
 ## MCP tools (Claude integration)
 
-The `.mcp.json` at the repo root registers bintrail as an MCP server. Set the env var and the `query`, `recover`, and `status` tools work automatically in Claude:
+The `.mcp.json` at the repo root registers bintrail as an MCP server. Set the env var and the `query`, `recover`, and `status` tools work automatically in Claude Code on this machine:
 
 ```bash
 export BINTRAIL_INDEX_DSN='root:demo@tcp(127.0.0.1:3307)/bintrail_index'
 ```
+
+### Using from Claude Desktop on another machine on the same network
+
+This lets a MacBook (or any machine) on the same network use the bintrail MCP tools in Claude Desktop without installing Go or cloning the repo.
+
+**Step 1 — Start the MCP HTTP server on this machine** (in addition to the demo):
+
+```bash
+BINTRAIL_INDEX_DSN='root:demo@tcp(127.0.0.1:3307)/bintrail_index' ./bintrail-mcp --http :8080
+```
+
+> Build the binary first if needed: `go build ./cmd/bintrail-mcp`
+
+**Step 2 — Copy the proxy script to the other machine:**
+
+```bash
+# Run this on the machine running the demo
+scp ~/bintrail/cmd/bintrail-mcp/proxy.py user@<other-machine-ip>:~/proxy.py
+```
+
+**Step 3 — Test from the other machine** (before touching Claude Desktop config):
+
+```bash
+# Replace 192.168.1.37 with this machine's IP
+BINTRAIL_SERVER=http://192.168.1.37:8080/mcp python3 ~/proxy.py <<'EOF'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+EOF
+```
+
+You should see two JSON responses. If you do, proceed.
+
+**Step 4 — Configure Claude Desktop** on the other machine.
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "bintrail": {
+      "command": "python3",
+      "args": ["/Users/you/proxy.py"],
+      "env": { "BINTRAIL_SERVER": "http://192.168.1.37:8080/mcp" }
+    }
+  }
+}
+```
+
+Restart Claude Desktop. The `query`, `recover`, and `status` tools will appear automatically.
+
+**Troubleshooting remote MCP:**
+
+- **"Both calls failed"**: The MCP HTTP server is not running or unreachable. Verify with `curl` from the other machine (Step 3 above).
+- **Tools fail after server restart**: The proxy has a stale `Mcp-Session-Id`. Fix: restart Claude Desktop on the other machine.
+- **`str | None` syntax error**: Python version is older than 3.10. The proxy is written for 3.7+ and should not hit this — if you see it, you have an old version of the script; re-copy it.
+- **Port blocked**: macOS Firewall may block port 8080. Go to System Settings → Network → Firewall and allow the connection, or temporarily disable it for testing.
 
 ## What the traffic generates
 
