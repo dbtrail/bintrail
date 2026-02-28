@@ -22,7 +22,7 @@ func TestInitCmd_registered(t *testing.T) {
 }
 
 func TestInitCmd_allFlagsRegistered(t *testing.T) {
-	for _, name := range []string{"index-dsn", "partitions", "s3-bucket", "s3-region", "s3-arn"} {
+	for _, name := range []string{"index-dsn", "partitions", "encrypt", "s3-bucket", "s3-region", "s3-arn"} {
 		if initCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on initCmd", name)
 		}
@@ -59,12 +59,23 @@ func TestInitCmd_s3ARNOptional(t *testing.T) {
 	}
 }
 
+func TestInitCmd_encryptOptional(t *testing.T) {
+	f := initCmd.Flag("encrypt")
+	if f == nil {
+		t.Fatal("flag --encrypt not registered")
+	}
+	if f.Annotations["cobra_annotation_bash_completion_one_required_flag"] != nil {
+		t.Error("--encrypt should not be marked required")
+	}
+}
+
 func TestInitCmd_defaults(t *testing.T) {
 	cases := []struct {
 		flag string
 		want string
 	}{
 		{"partitions", "48"},
+		{"encrypt", "false"},
 		{"s3-region", "us-east-1"},
 		{"s3-bucket", ""},
 		{"s3-arn", ""},
@@ -78,6 +89,48 @@ func TestInitCmd_defaults(t *testing.T) {
 		if f.DefValue != tc.want {
 			t.Errorf("flag --%s default: expected %q, got %q", tc.flag, tc.want, f.DefValue)
 		}
+	}
+}
+
+// ─── buildBinlogEventsDDL ─────────────────────────────────────────────────────
+
+func TestBuildBinlogEventsDDL_noEncrypt(t *testing.T) {
+	parts := []string{"    PARTITION p_2026022814 VALUES LESS THAN (TO_SECONDS('2026-02-28 15:00:00'))",
+		"    PARTITION p_future VALUES LESS THAN MAXVALUE"}
+	ddl := buildBinlogEventsDDL(parts, false)
+
+	if strings.Contains(ddl, "ENCRYPTION") {
+		t.Error("expected no ENCRYPTION clause when encrypt=false")
+	}
+	if !strings.Contains(ddl, "ENGINE=InnoDB") {
+		t.Error("expected ENGINE=InnoDB in DDL")
+	}
+	if !strings.Contains(ddl, "p_future") {
+		t.Error("expected p_future partition in DDL")
+	}
+}
+
+func TestBuildBinlogEventsDDL_withEncrypt(t *testing.T) {
+	parts := []string{"    PARTITION p_2026022814 VALUES LESS THAN (TO_SECONDS('2026-02-28 15:00:00'))",
+		"    PARTITION p_future VALUES LESS THAN MAXVALUE"}
+	ddl := buildBinlogEventsDDL(parts, true)
+
+	if !strings.Contains(ddl, "ENCRYPTION='Y'") {
+		t.Error("expected ENCRYPTION='Y' in DDL when encrypt=true")
+	}
+	if !strings.Contains(ddl, "p_future") {
+		t.Error("expected p_future partition in DDL")
+	}
+	// Encryption clause must appear after ENGINE=InnoDB and before PARTITION BY.
+	engineIdx := strings.Index(ddl, "ENGINE=InnoDB")
+	encryptIdx := strings.Index(ddl, "ENCRYPTION='Y'")
+	partitionIdx := strings.Index(ddl, "PARTITION BY RANGE")
+	if engineIdx < 0 || encryptIdx < 0 || partitionIdx < 0 {
+		t.Fatal("DDL missing ENGINE=InnoDB, ENCRYPTION='Y', or PARTITION BY RANGE")
+	}
+	if !(engineIdx < encryptIdx && encryptIdx < partitionIdx) {
+		t.Errorf("expected ENGINE < ENCRYPTION < PARTITION BY in DDL, got positions %d, %d, %d",
+			engineIdx, encryptIdx, partitionIdx)
 	}
 }
 
