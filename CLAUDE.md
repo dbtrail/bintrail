@@ -182,8 +182,8 @@ Integration tests (`integration_test.go`) use `mcp.NewInMemoryTransports()` to c
 - `pk_values` is a plain `VARCHAR(512)` — pipe-delimited PK values in ordinal order (e.g. `12345` or `12345|2`). NOT JSON.
 - `pk_hash = SHA2(pk_values, 256)` is a **generated stored column** — never insert it explicitly.
 - `row_before`, `row_after`, `changed_columns` are JSON columns.
-- Partitioned by `RANGE (TO_DAYS(event_timestamp))` — timezone-independent; `UNIX_TIMESTAMP()` is rejected by MySQL 8.0 when `time_zone=SYSTEM` (Error 1486).
-- Daily partitions named `p_YYYYMMDD`; catch-all is always `p_future VALUES LESS THAN MAXVALUE`.
+- Partitioned by `RANGE (TO_SECONDS(event_timestamp))` — timezone-independent; `UNIX_TIMESTAMP()` is rejected by MySQL 8.0 when `time_zone=SYSTEM` (Error 1486).
+- Hourly partitions named `p_YYYYMMDDHH` (12 chars, e.g. `p_2026022814`); catch-all is always `p_future VALUES LESS THAN MAXVALUE`.
 - **PK lookup pattern**: always use both `pk_hash = SHA2(?, 256)` (index scan) AND `pk_values = ?` (collision guard).
 
 ### `schema_snapshots`
@@ -254,12 +254,12 @@ if val == math.Trunc(val) && math.Abs(val) < 1e15 {
 Pipe-delimited, with `|` → `\|` and `\` → `\\` escaping. See `BuildPKValues` in `parser/parser.go`. In practice PKs are almost always integers or UUIDs so escaping is rarely triggered.
 
 ### Partition management
-- `partitionName(d time.Time) string` → `"p_YYYYMMDD"` (uses Go reference time `20060102`)
-- `partitionDate(name string) (time.Time, bool)` → parses `p_YYYYMMDD`, returns `false` for `p_future` or malformed names
+- `partitionName(d time.Time) string` → `"p_YYYYMMDDHH"` (uses Go reference time `"p_2006010215"`)
+- `partitionDate(name string) (time.Time, bool)` → parses `p_YYYYMMDDHH` (12 chars), returns `false` for `p_future` or malformed names
 - These two round-trip correctly and are tested in `rotate_test.go`.
 - To add partitions: `REORGANIZE PARTITION p_future INTO (... new partitions ..., PARTITION p_future VALUES LESS THAN MAXVALUE)`. Never leave out the new `p_future`.
 - To drop partitions: `ALTER TABLE … DROP PARTITION p1, p2` — single statement for multiple partitions.
-- `PARTITION_DESCRIPTION` in `information_schema.PARTITIONS` stores the evaluated integer TO_DAYS value for named partitions and `MAXVALUE` for the catch-all. `descriptionToHuman` in `status.go` converts it back to a date via `time.Unix((days-719528)*86400, 0)` (since `TO_DAYS('1970-01-01') = 719528`).
+- `PARTITION_DESCRIPTION` in `information_schema.PARTITIONS` stores the evaluated integer TO_SECONDS value for named partitions and `MAXVALUE` for the catch-all. `DescriptionToHuman` in `status.go` converts it back via `time.Unix(secs-62167219200, 0)` (since `TO_SECONDS('1970-01-01 00:00:00') = 62167219200`).
 - `TABLE_ROWS` in `information_schema.PARTITIONS` is an **estimate** for InnoDB — good enough for status display, not for exact counts.
 
 ### Getting DB name from DSN
@@ -326,7 +326,7 @@ Flag variable prefix: `bsl` (e.g. `bslInput`, `bslOutput`, `bslCompression`).
 
 **Parquet metadata keys**: `bintrail.archive.partition`, `bintrail.archive.timestamp`, `bintrail.archive.version`.
 
-**Output path convention**: `<archive-dir>/p_YYYYMMDD.parquet` (set by `rotate.go`; archive package is path-agnostic).
+**Output path convention**: `<archive-dir>/p_YYYYMMDDHH.parquet` (set by `rotate.go`; archive package is path-agnostic).
 
 **`rotate --archive-dir`** triggers archiving before each `dropPartitions` call. If any archive fails, no partitions are dropped.
 

@@ -25,7 +25,7 @@ var (
 
 func init() {
 	initCmd.Flags().StringVar(&initIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
-	initCmd.Flags().IntVar(&initPartitions, "partitions", 7, "Number of daily partitions to create starting from today")
+	initCmd.Flags().IntVar(&initPartitions, "partitions", 48, "Number of hourly partitions to create starting from the current hour")
 	_ = initCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(initCmd)
@@ -60,7 +60,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to connect to index database %q: %w", dbName, err)
 	}
 
-	// Create binlog_events with dynamic daily partitions.
+	// Create binlog_events with dynamic hourly partitions.
 	if err := createBinlogEventsTable(db, initPartitions); err != nil {
 		return fmt.Errorf("failed to create binlog_events: %w", err)
 	}
@@ -113,23 +113,23 @@ func ensureDatabase(cfg *mysql.Config, dbName string) error {
 	return nil
 }
 
-// createBinlogEventsTable generates the CREATE TABLE with N daily partitions
-// starting from today (UTC), plus a p_future catch-all partition.
+// createBinlogEventsTable generates the CREATE TABLE with N hourly partitions
+// starting from the current hour (UTC), plus a p_future catch-all partition.
 //
-// Each partition p_YYYYMMDD holds events where TO_DAYS(event_timestamp)
-// is less than TO_DAYS of the following day (timezone-independent boundary).
+// Each partition p_YYYYMMDDHH holds events where TO_SECONDS(event_timestamp)
+// is less than TO_SECONDS of the following hour (timezone-independent boundary).
 // The p_future partition catches any events beyond the last pre-created partition.
 func createBinlogEventsTable(db *sql.DB, numPartitions int) error {
-	today := time.Now().UTC().Truncate(24 * time.Hour)
+	today := time.Now().UTC().Truncate(time.Hour)
 
 	parts := make([]string, 0, numPartitions+1)
 	for i := range numPartitions {
-		day := today.AddDate(0, 0, i)
-		nextDay := day.AddDate(0, 0, 1)
+		hour := today.Add(time.Duration(i) * time.Hour)
+		nextHour := hour.Add(time.Hour)
 		parts = append(parts, fmt.Sprintf(
-			"    PARTITION p_%s VALUES LESS THAN (TO_DAYS('%s'))",
-			day.Format("20060102"),
-			nextDay.UTC().Format("2006-01-02"),
+			"    PARTITION p_%s VALUES LESS THAN (TO_SECONDS('%s'))",
+			hour.Format("2006010215"),
+			nextHour.UTC().Format("2006-01-02 15:04:05"),
 		))
 	}
 	parts = append(parts, "    PARTITION p_future VALUES LESS THAN MAXVALUE")
@@ -155,7 +155,7 @@ func createBinlogEventsTable(db *sql.DB, numPartitions int) error {
     INDEX idx_gtid       (gtid),
     INDEX idx_file_pos   (binlog_file, start_pos)
 ) ENGINE=InnoDB
-  PARTITION BY RANGE (TO_DAYS(event_timestamp)) (
+  PARTITION BY RANGE (TO_SECONDS(event_timestamp)) (
 ` + strings.Join(parts, ",\n") + `
 )`
 
