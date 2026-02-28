@@ -20,14 +20,17 @@ func TestDescriptionToHuman_maxvalue(t *testing.T) {
 	}
 }
 
-func TestDescriptionToHuman_toDaysValue(t *testing.T) {
-	// Compute a known TO_DAYS value at runtime to avoid hardcoding date-sensitive values.
-	// TO_DAYS('1970-01-01') = 719528; any midnight-UTC date d has TO_DAYS = 719528 + d.Unix()/86400.
-	knownTime := time.Date(2026, 2, 20, 0, 0, 0, 0, time.UTC)
-	toDaysVal := int64(719528) + knownTime.Unix()/86400
-	got := DescriptionToHuman(strconv.FormatInt(toDaysVal, 10))
+func TestDescriptionToHuman_toSecondsValue(t *testing.T) {
+	// Compute a known TO_SECONDS value at runtime to avoid hardcoding date-sensitive values.
+	// TO_SECONDS('1970-01-01 00:00:00') = 62167219200; any UTC time t has TO_SECONDS = 62167219200 + t.Unix().
+	knownTime := time.Date(2026, 2, 20, 14, 0, 0, 0, time.UTC)
+	toSecondsVal := int64(62167219200) + knownTime.Unix()
+	got := DescriptionToHuman(strconv.FormatInt(toSecondsVal, 10))
 	if !strings.Contains(got, "2026-02-20") {
 		t.Errorf("expected 2026-02-20 in %q", got)
+	}
+	if !strings.Contains(got, "14:00") {
+		t.Errorf("expected 14:00 in %q", got)
 	}
 	if !strings.Contains(got, "UTC") {
 		t.Errorf("expected UTC suffix in %q", got)
@@ -43,8 +46,8 @@ func TestDescriptionToHuman_unknownString(t *testing.T) {
 }
 
 func TestDescriptionToHuman_unixEpoch(t *testing.T) {
-	// TO_DAYS('1970-01-01') = 719528 — verify the Unix epoch converts correctly.
-	got := DescriptionToHuman("719528")
+	// TO_SECONDS('1970-01-01 00:00:00') = 62167219200 — verify the Unix epoch converts correctly.
+	got := DescriptionToHuman("62167219200")
 	if !strings.Contains(got, "1970") {
 		t.Errorf("expected 1970 in %q", got)
 	}
@@ -140,13 +143,13 @@ func TestWriteStatus_withFiles(t *testing.T) {
 }
 
 func TestWriteStatus_withPartitions(t *testing.T) {
-	// Compute TO_DAYS values dynamically: TO_DAYS('1970-01-01') = 719528.
-	toDays := func(d time.Time) string {
-		return strconv.FormatInt(int64(719528)+d.Unix()/86400, 10)
+	// Compute TO_SECONDS values dynamically: TO_SECONDS('1970-01-01 00:00:00') = 62167219200.
+	toSeconds := func(d time.Time) string {
+		return strconv.FormatInt(int64(62167219200)+d.Unix(), 10)
 	}
 	parts := []PartitionStat{
-		{Name: "p_20260218", Description: toDays(time.Date(2026, 2, 19, 0, 0, 0, 0, time.UTC)), TableRows: 45000, Ordinal: 1},
-		{Name: "p_20260219", Description: toDays(time.Date(2026, 2, 20, 0, 0, 0, 0, time.UTC)), TableRows: 3401, Ordinal: 2},
+		{Name: "p_2026021800", Description: toSeconds(time.Date(2026, 2, 18, 1, 0, 0, 0, time.UTC)), TableRows: 45000, Ordinal: 1},
+		{Name: "p_2026021900", Description: toSeconds(time.Date(2026, 2, 19, 0, 0, 0, 0, time.UTC)), TableRows: 3401, Ordinal: 2},
 		{Name: "p_future", Description: "MAXVALUE", TableRows: 0, Ordinal: 3},
 	}
 
@@ -155,7 +158,7 @@ func TestWriteStatus_withPartitions(t *testing.T) {
 	out := buf.String()
 
 	assertContains(t, out, "=== Partitions ===")
-	assertContains(t, out, "p_20260218")
+	assertContains(t, out, "p_2026021800")
 	assertContains(t, out, "p_future")
 	assertContains(t, out, "MAXVALUE")
 	assertContains(t, out, "45000")

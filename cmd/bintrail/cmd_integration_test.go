@@ -408,7 +408,7 @@ func TestCreateBinlogEventsTable(t *testing.T) {
 		t.Fatalf("createBinlogEventsTable failed: %v", err)
 	}
 
-	// Verify the table has 4 partitions (3 daily + p_future).
+	// Verify the table has 4 partitions (3 hourly + p_future).
 	var count int
 	if err := db.QueryRow(`
 		SELECT COUNT(*) FROM information_schema.PARTITIONS
@@ -529,14 +529,14 @@ func TestAddFuturePartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db) // only p_future
 
-	startDate := time.Now().UTC().Truncate(24 * time.Hour)
+	startDate := time.Now().UTC().Truncate(time.Hour)
 
 	if err := addFuturePartitions(context.Background(), db, dbName, startDate, 3); err != nil {
 		t.Fatalf("addFuturePartitions failed: %v", err)
 	}
 
 	parts, _ := listPartitions(context.Background(), db, dbName)
-	// Should be 3 daily + p_future = 4.
+	// Should be 3 hourly + p_future = 4.
 	if len(parts) != 4 {
 		t.Fatalf("expected 4 partitions, got %d", len(parts))
 	}
@@ -546,9 +546,9 @@ func TestAddFuturePartitions(t *testing.T) {
 		t.Errorf("expected last partition p_future, got %s", parts[len(parts)-1].Name)
 	}
 
-	// First 3 should be daily partitions.
+	// First 3 should be hourly partitions.
 	for i := range 3 {
-		expected := partitionName(startDate.AddDate(0, 0, i))
+		expected := partitionName(startDate.Add(time.Duration(i) * time.Hour))
 		if parts[i].Name != expected {
 			t.Errorf("partition %d: expected %s, got %s", i, expected, parts[i].Name)
 		}

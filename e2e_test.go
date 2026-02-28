@@ -52,7 +52,7 @@ func TestEndToEnd_fullPipeline(t *testing.T) {
 	sourceDSN := testutil.SnapshotDSN(sourceName)
 
 	// ── 3. bintrail init ─────────────────────────────────────────────────────
-	run(t, binPath, coverDir, "init", "--index-dsn", indexDSN, "--partitions", "7")
+	run(t, binPath, coverDir, "init", "--index-dsn", indexDSN, "--partitions", "48")
 
 	// ── 4. Create source table ───────────────────────────────────────────────
 	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (

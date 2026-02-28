@@ -49,7 +49,7 @@ var (
 func init() {
 	rotateCmd.Flags().StringVar(&rotIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	rotateCmd.Flags().StringVar(&rotRetain, "retain", "", "Drop partitions older than this duration (e.g. 7d, 24h)")
-	rotateCmd.Flags().IntVar(&rotAddFuture, "add-future", 0, "Number of daily partitions to add for future dates")
+	rotateCmd.Flags().IntVar(&rotAddFuture, "add-future", 0, "Number of hourly partitions to add for future hours")
 	rotateCmd.Flags().StringVar(&rotArchiveDir, "archive-dir", "", "Directory to write Parquet archives before dropping partitions (empty = no archiving)")
 	rotateCmd.Flags().StringVar(&rotArchiveCompression, "archive-compression", "zstd", "Compression for archive Parquet files (zstd, snappy, gzip, none)")
 	_ = rotateCmd.MarkFlagRequired("index-dsn")
@@ -99,7 +99,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 	// ── Drop old partitions ───────────────────────────────────────────────────
 	var droppedCount int
 	if rotRetain != "" {
-		cutoff := time.Now().UTC().Add(-retainDur).Truncate(24 * time.Hour)
+		cutoff := time.Now().UTC().Add(-retainDur).Truncate(time.Hour)
 		var toDrop []string
 		for _, p := range partitions {
 			d, ok := partitionDate(p.Name)
@@ -156,7 +156,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to add future partitions: %w", err)
 		}
 		for i := range rotAddFuture {
-			fmt.Fprintf(os.Stdout, "added partition %s\n", partitionName(startDate.AddDate(0, 0, i)))
+			fmt.Fprintf(os.Stdout, "added partition %s\n", partitionName(startDate.Add(time.Duration(i)*time.Hour)))
 		}
 	}
 
@@ -223,22 +223,22 @@ func listPartitions(ctx context.Context, db *sql.DB, dbName string) ([]partition
 	return partitions, rows.Err()
 }
 
-// partitionDate parses the date from a partition name like "p_20260219".
-// Returns the date and true on success; zero and false for p_future or other names.
+// partitionDate parses the hour from a partition name like "p_2026021914".
+// Returns the time and true on success; zero and false for p_future or other names.
 func partitionDate(name string) (time.Time, bool) {
-	if len(name) != 10 || !strings.HasPrefix(name, "p_") {
+	if len(name) != 12 || !strings.HasPrefix(name, "p_") {
 		return time.Time{}, false
 	}
-	t, err := time.ParseInLocation("p_20060102", name, time.UTC)
+	t, err := time.ParseInLocation("p_2006010215", name, time.UTC)
 	if err != nil {
 		return time.Time{}, false
 	}
 	return t, true
 }
 
-// partitionName returns the partition name for a given date ("p_YYYYMMDD").
+// partitionName returns the partition name for a given hour ("p_YYYYMMDDHH").
 func partitionName(d time.Time) string {
-	return d.UTC().Format("p_20060102")
+	return d.UTC().Format("p_2006010215")
 }
 
 // dropPartitions drops one or more named partitions in a single ALTER TABLE statement.
@@ -261,9 +261,9 @@ func partitionHasData(ctx context.Context, db *sql.DB, dbName string) (bool, err
 	return err == nil, err
 }
 
-// nextPartitionStart returns the date for the first new partition to add.
-// It finds the latest p_YYYYMMDD partition and returns the following day.
-// Falls back to today (UTC) if no named daily partitions exist.
+// nextPartitionStart returns the hour for the first new partition to add.
+// It finds the latest p_YYYYMMDDHH partition and returns the following hour.
+// Falls back to the current hour (UTC) if no named hourly partitions exist.
 func nextPartitionStart(partitions []partitionInfo) time.Time {
 	var maxDate time.Time
 	for _, p := range partitions {
@@ -276,22 +276,22 @@ func nextPartitionStart(partitions []partitionInfo) time.Time {
 		}
 	}
 	if maxDate.IsZero() {
-		return time.Now().UTC().Truncate(24 * time.Hour)
+		return time.Now().UTC().Truncate(time.Hour)
 	}
-	return maxDate.AddDate(0, 0, 1)
+	return maxDate.Add(time.Hour)
 }
 
-// addFuturePartitions reorganizes p_future to insert n new daily partitions
+// addFuturePartitions reorganizes p_future to insert n new hourly partitions
 // beginning at startDate, then appends a new p_future MAXVALUE catch-all.
 func addFuturePartitions(ctx context.Context, db *sql.DB, dbName string, startDate time.Time, n int) error {
 	parts := make([]string, 0, n+1)
 	for i := range n {
-		d := startDate.AddDate(0, 0, i)
-		nextDay := d.AddDate(0, 0, 1)
+		d := startDate.Add(time.Duration(i) * time.Hour)
+		nextHour := d.Add(time.Hour)
 		parts = append(parts, fmt.Sprintf(
-			"PARTITION %s VALUES LESS THAN (TO_DAYS('%s'))",
+			"PARTITION %s VALUES LESS THAN (TO_SECONDS('%s'))",
 			partitionName(d),
-			nextDay.UTC().Format("2006-01-02"),
+			nextHour.UTC().Format("2006-01-02 15:04:05"),
 		))
 	}
 	parts = append(parts, "PARTITION p_future VALUES LESS THAN MAXVALUE")

@@ -28,7 +28,7 @@ type IndexStateRow struct {
 // PartitionStat holds one partition row from information_schema.PARTITIONS.
 type PartitionStat struct {
 	Name        string
-	Description string // LESS THAN value (integer TO_DAYS value) or "MAXVALUE"
+	Description string // LESS THAN value (integer TO_SECONDS value) or "MAXVALUE"
 	TableRows   int64  // estimate from information_schema
 	Ordinal     int
 }
@@ -150,17 +150,17 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat) {
 }
 
 // DescriptionToHuman converts a PARTITION_DESCRIPTION value to a readable string.
-// RANGE partitions using TO_DAYS() store the evaluated integer day count; MAXVALUE is literal.
-// TO_DAYS('1970-01-01') = 719528, so we convert back via: time.Unix((days-719528)*86400, 0).
+// RANGE partitions using TO_SECONDS() store the evaluated integer second count; MAXVALUE is literal.
+// TO_SECONDS('1970-01-01 00:00:00') = 62167219200, so we convert back via: time.Unix(secs-62167219200, 0).
 func DescriptionToHuman(desc string) string {
 	if desc == "" || strings.EqualFold(desc, "MAXVALUE") {
 		return "MAXVALUE"
 	}
-	days, err := strconv.ParseInt(desc, 10, 64)
+	secs, err := strconv.ParseInt(desc, 10, 64)
 	if err != nil {
 		return desc // not an integer — return raw value
 	}
-	return time.Unix((days-719528)*86400, 0).UTC().Format("2006-01-02 UTC")
+	return time.Unix(secs-62167219200, 0).UTC().Format("2006-01-02 15:00 UTC")
 }
 
 // Truncate shortens s to at most n bytes, appending "…" if truncated.

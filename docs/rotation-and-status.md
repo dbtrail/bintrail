@@ -14,7 +14,7 @@ MySQL's solution is table partitioning.
 
 ## Why Partitioning?
 
-`binlog_events` is partitioned by `RANGE (TO_DAYS(event_timestamp))`. Each partition holds one day's worth of events. This gives you two powerful properties:
+`binlog_events` is partitioned by `RANGE (TO_SECONDS(event_timestamp))`. Each partition holds one hour's worth of events. This gives you two powerful properties:
 
 **Instant deletes**: Dropping a partition is a metadata operation — MySQL removes the partition's data files directly, without scanning or logging individual row deletions. Dropping 30 days of events takes milliseconds instead of minutes.
 
@@ -22,7 +22,7 @@ MySQL's solution is table partitioning.
 
 ---
 
-## Why `TO_DAYS`, Not `UNIX_TIMESTAMP`?
+## Why `TO_SECONDS`, Not `UNIX_TIMESTAMP`?
 
 MySQL 8.0 rejects `UNIX_TIMESTAMP()` in partition expressions when `time_zone=SYSTEM`:
 
@@ -30,15 +30,15 @@ MySQL 8.0 rejects `UNIX_TIMESTAMP()` in partition expressions when `time_zone=SY
 Error 1486: Constant, random or timezone-dependent expressions in (sub)partitioning function are not allowed
 ```
 
-`TO_DAYS()` is timezone-independent — it returns the number of days since year 0, which is a pure calendar computation with no timezone involvement. This is why every partition boundary in bintrail is expressed as a `TO_DAYS` value.
+`TO_SECONDS()` is timezone-independent — it returns the number of seconds since year 0, which is a pure calendar computation with no timezone involvement. This is why every partition boundary in bintrail is expressed as a `TO_SECONDS` value.
 
 The DDL looks like:
 
 ```sql
-PARTITION p_20260219 VALUES LESS THAN (TO_DAYS('2026-02-20'))
+PARTITION p_2026021914 VALUES LESS THAN (TO_SECONDS('2026-02-19 15:00:00'))
 ```
 
-The `VALUES LESS THAN` value is the day *after* the partition's date — a row with `event_timestamp = '2026-02-19 23:59:59'` goes into `p_20260219` because `TO_DAYS('2026-02-19 23:59:59') < TO_DAYS('2026-02-20')`.
+The `VALUES LESS THAN` value is the *next* hour boundary — a row with `event_timestamp = '2026-02-19 14:59:59'` goes into `p_2026021914` because `TO_SECONDS('2026-02-19 14:59:59') < TO_SECONDS('2026-02-19 15:00:00')`.
 
 ---
 
@@ -64,9 +64,9 @@ bintrail rotate --index-dsn "..." --retain 7d
 
 The `--retain` flag accepts a duration: `7d` (days) or `24h` (hours). The command:
 
-1. Computes `cutoff = now - retain_duration` (truncated to midnight UTC).
+1. Computes `cutoff = now - retain_duration` (truncated to the current hour UTC).
 2. Lists all partitions from `information_schema.PARTITIONS`.
-3. Parses the date from each `p_YYYYMMDD` name (`p_future` is skipped automatically because `partitionDate` returns `false` for it).
+3. Parses the hour from each `p_YYYYMMDDHH` name (`p_future` is skipped automatically because `partitionDate` returns `false` for it).
 4. Collects all partitions whose date is before the cutoff.
 5. Issues a single `ALTER TABLE binlog_events DROP PARTITION p1, p2, p3` statement.
 
@@ -82,13 +82,13 @@ After dropping, the command warns if `p_future` contains data. If events are lan
 bintrail rotate --index-dsn "..." --add-future 14
 ```
 
-Adding future partitions converts the `p_future` catch-all into specific daily partitions, then appends a new `p_future` at the end. This is done with `REORGANIZE PARTITION`:
+Adding future partitions converts the `p_future` catch-all into specific hourly partitions, then appends a new `p_future` at the end. This is done with `REORGANIZE PARTITION`:
 
 ```sql
 ALTER TABLE `binlog_index`.`binlog_events`
 REORGANIZE PARTITION p_future INTO (
-    PARTITION p_20260219 VALUES LESS THAN (TO_DAYS('2026-02-20')),
-    PARTITION p_20260220 VALUES LESS THAN (TO_DAYS('2026-02-21')),
+    PARTITION p_2026021900 VALUES LESS THAN (TO_SECONDS('2026-02-19 01:00:00')),
+    PARTITION p_2026021901 VALUES LESS THAN (TO_SECONDS('2026-02-19 02:00:00')),
     ...
     PARTITION p_future VALUES LESS THAN MAXVALUE
 )
@@ -96,30 +96,30 @@ REORGANIZE PARTITION p_future INTO (
 
 `REORGANIZE PARTITION` moves data from `p_future` into the appropriate new named partitions and creates a fresh `p_future`. Any data that was already in `p_future` goes to the right named partition — nothing is lost.
 
-`nextPartitionStart` determines where to start adding partitions: it finds the latest existing `p_YYYYMMDD` partition and starts the day after. If no named partitions exist yet, it starts from today (UTC).
+`nextPartitionStart` determines where to start adding partitions: it finds the latest existing `p_YYYYMMDDHH` partition and starts the hour after. If no named partitions exist yet, it starts from the current hour (UTC).
 
 ---
 
 ## Partition Naming and Parsing
 
-Two functions handle the date ↔ name mapping:
+Two functions handle the hour ↔ name mapping:
 
 ```go
 // cmd/bintrail/rotate.go
 func partitionName(d time.Time) string {
-    return d.UTC().Format("p_20060102")  // Go reference time for YYYYMMDD
+    return d.UTC().Format("p_2006010215")  // Go reference time for YYYYMMDDHH
 }
 
 func partitionDate(name string) (time.Time, bool) {
-    if len(name) != 10 || !strings.HasPrefix(name, "p_") {
+    if len(name) != 12 || !strings.HasPrefix(name, "p_") {
         return time.Time{}, false  // rejects p_future and anything malformed
     }
-    t, err := time.ParseInLocation("p_20060102", name, time.UTC)
+    t, err := time.ParseInLocation("p_2006010215", name, time.UTC)
     ...
 }
 ```
 
-These two functions round-trip correctly: `partitionName(partitionDate("p_20260219"))` → `"p_20260219"`. Tests in `rotate_test.go` verify this.
+These two functions round-trip correctly: `partitionName(partitionDate("p_2026021914"))` → `"p_2026021914"`. Tests in `rotate_test.go` verify this.
 
 ---
 
@@ -147,8 +147,8 @@ binlog.000043     completed  8901    2026-02-19 10:00:43  2026-02-19 10:01:12  -
 === Partitions ===
 PARTITION     LESS_THAN           ROWS (est.)
 ─────────     ─────────           ───────────
-p_20260213    2026-02-14 UTC      142389
-p_20260214    2026-02-15 UTC      198234
+p_2026021300    2026-02-13 01:00 UTC   142389
+p_2026021301    2026-02-13 02:00 UTC   198234
 ...
 p_future      MAXVALUE            0
 Total events (est.): 987654
@@ -168,9 +168,9 @@ The row counts in the partitions section are **estimates** from `information_sch
 
 ## `DescriptionToHuman`: Converting Partition Boundaries
 
-MySQL stores partition boundary values as evaluated integers in `information_schema.PARTITIONS.PARTITION_DESCRIPTION`. For `TO_DAYS`-based partitions, this is the numeric `TO_DAYS` result (e.g. `738934`). For `p_future`, it's the literal string `MAXVALUE`.
+MySQL stores partition boundary values as evaluated integers in `information_schema.PARTITIONS.PARTITION_DESCRIPTION`. For `TO_SECONDS`-based partitions, this is the numeric `TO_SECONDS` result (e.g. `63786820800`). For `p_future`, it's the literal string `MAXVALUE`.
 
-`DescriptionToHuman` converts the integer back to a human-readable date:
+`DescriptionToHuman` converts the integer back to a human-readable datetime:
 
 ```go
 // internal/status/status.go
@@ -178,16 +178,16 @@ func DescriptionToHuman(desc string) string {
     if desc == "" || strings.EqualFold(desc, "MAXVALUE") {
         return "MAXVALUE"
     }
-    days, err := strconv.ParseInt(desc, 10, 64)
+    secs, err := strconv.ParseInt(desc, 10, 64)
     if err != nil {
         return desc  // not an integer — return raw
     }
-    // TO_DAYS('1970-01-01') = 719528 in MySQL 8.0
-    return time.Unix((days-719528)*86400, 0).UTC().Format("2006-01-02 UTC")
+    // TO_SECONDS('1970-01-01 00:00:00') = 62167219200 in MySQL 8.0
+    return time.Unix(secs-62167219200, 0).UTC().Format("2006-01-02 15:00 UTC")
 }
 ```
 
-The constant `719528` is MySQL 8.0's value for `TO_DAYS('1970-01-01')`. Subtracting it converts the MySQL day number to a Unix day offset; multiplying by 86400 gives a Unix timestamp; `time.Unix` converts to Go's `time.Time`.
+The constant `62167219200` is MySQL 8.0's value for `TO_SECONDS('1970-01-01 00:00:00')` (= 719528 days × 86400 seconds). Subtracting it converts the MySQL second count to a Unix timestamp; `time.Unix` converts to Go's `time.Time`.
 
 ---
 
@@ -195,7 +195,7 @@ The constant `719528` is MySQL 8.0's value for `TO_DAYS('1970-01-01')`. Subtract
 
 ```
 bintrail init
-    └── creates binlog_events (7 daily partitions + p_future)
+    └── creates binlog_events (48 hourly partitions + p_future)
         creates schema_snapshots, index_state, stream_state
 
 bintrail snapshot
@@ -227,16 +227,16 @@ bintrail recover
 
 ## Automating Rotation
 
-In production, run `bintrail rotate` from a daily cron job or systemd timer. A typical setup:
+In production, run `bintrail rotate` from an hourly cron job or systemd timer. A typical setup:
 
 ```sh
-# Drop data older than 30 days; ensure 14 days of future partitions exist
+# Drop data older than 30 days (720 hours); ensure 48 hours of future partitions exist
 bintrail rotate \
   --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --retain 30d \
-  --add-future 14
+  --retain 720h \
+  --add-future 48
 ```
 
 `--retain` and `--add-future` can be combined in one invocation. The command drops old partitions first, then adds new ones.
 
-Schedule the timer for a low-traffic window (e.g. 3am UTC). The drop operation is instant, but `REORGANIZE PARTITION` on a partition containing data does a full table scan of `p_future` to redistribute rows — if your `p_future` is empty (because you add future partitions frequently), the reorganize is also instant.
+Schedule the timer to run once per hour. The drop operation is instant, but `REORGANIZE PARTITION` on a partition containing data does a full table scan of `p_future` to redistribute rows — if your `p_future` is empty (because you add future partitions frequently), the reorganize is also instant.

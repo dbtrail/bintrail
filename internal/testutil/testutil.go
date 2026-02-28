@@ -148,7 +148,7 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		INDEX idx_gtid       (gtid),
 		INDEX idx_file_pos   (binlog_file, start_pos)
 	) ENGINE=InnoDB
-	  PARTITION BY RANGE (TO_DAYS(event_timestamp)) (
+	  PARTITION BY RANGE (TO_SECONDS(event_timestamp)) (
 		PARTITION p_future VALUES LESS THAN MAXVALUE
 	  )`)
 

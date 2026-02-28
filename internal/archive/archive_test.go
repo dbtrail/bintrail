@@ -45,13 +45,13 @@ func TestBinlogEventColumns_parquetTypes(t *testing.T) {
 // handling, and metadata embedding end-to-end.
 func TestWriteReadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	outPath := filepath.Join(dir, "p_20260219.parquet")
+	outPath := filepath.Join(dir, "p_2026021900.parquet")
 
 	cfg := baseline.WriterConfig{
 		Compression:  "none",
 		RowGroupSize: 100,
 		Metadata: map[string]string{
-			"bintrail.archive.partition": "p_20260219",
+			"bintrail.archive.partition": "p_2026021900",
 			"bintrail.archive.version":   "1.0.0",
 		},
 	}
@@ -122,8 +122,8 @@ func TestWriteReadRoundTrip(t *testing.T) {
 	got, ok := pf.Lookup("bintrail.archive.partition")
 	if !ok {
 		t.Error("expected bintrail.archive.partition metadata key")
-	} else if got != "p_20260219" {
-		t.Errorf("archive.partition = %q, want p_20260219", got)
+	} else if got != "p_2026021900" {
+		t.Errorf("archive.partition = %q, want p_2026021900", got)
 	}
 
 	if _, ok := pf.Lookup("bintrail.archive.version"); !ok {
