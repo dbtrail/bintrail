@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -117,7 +118,8 @@ func setupS3Bucket(ctx context.Context, bucket, region string) error {
 	client := s3.NewFromConfig(awsCfg)
 
 	// Create the bucket. us-east-1 rejects CreateBucketConfiguration; all other
-	// regions require it.
+	// regions require it. BucketAlreadyOwnedByYou is treated as success so that
+	// re-running bintrail init is idempotent (mirrors CREATE TABLE IF NOT EXISTS).
 	createInput := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
 	if region != "us-east-1" {
 		createInput.CreateBucketConfiguration = &types.CreateBucketConfiguration{
@@ -125,7 +127,10 @@ func setupS3Bucket(ctx context.Context, bucket, region string) error {
 		}
 	}
 	if _, err := client.CreateBucket(ctx, createInput); err != nil {
-		return fmt.Errorf("create bucket: %w", err)
+		var alreadyOwned *types.BucketAlreadyOwnedByYou
+		if !errors.As(err, &alreadyOwned) {
+			return fmt.Errorf("create bucket: %w", err)
+		}
 	}
 
 	// Block all public access.
