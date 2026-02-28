@@ -84,22 +84,26 @@ func TestInitCmd_defaults(t *testing.T) {
 
 func TestParseS3ARN_validARNs(t *testing.T) {
 	cases := []struct {
-		arn    string
-		bucket string
+		arn       string
+		bucket    string
+		partition string
 	}{
-		{"arn:aws:s3:::my-bucket", "my-bucket"},
-		{"arn:aws:s3:::acme-bintrail-archives", "acme-bintrail-archives"},
-		{"arn:aws-cn:s3:::china-bucket", "china-bucket"},
-		{"arn:aws-us-gov:s3:::gov-bucket", "gov-bucket"},
+		{"arn:aws:s3:::my-bucket", "my-bucket", "aws"},
+		{"arn:aws:s3:::acme-bintrail-archives", "acme-bintrail-archives", "aws"},
+		{"arn:aws-cn:s3:::china-bucket", "china-bucket", "aws-cn"},
+		{"arn:aws-us-gov:s3:::gov-bucket", "gov-bucket", "aws-us-gov"},
 	}
 	for _, tc := range cases {
-		got, err := parseS3ARN(tc.arn)
+		gotBucket, gotPartition, err := parseS3ARN(tc.arn)
 		if err != nil {
 			t.Errorf("parseS3ARN(%q) unexpected error: %v", tc.arn, err)
 			continue
 		}
-		if got != tc.bucket {
-			t.Errorf("parseS3ARN(%q) = %q, want %q", tc.arn, got, tc.bucket)
+		if gotBucket != tc.bucket {
+			t.Errorf("parseS3ARN(%q) bucket = %q, want %q", tc.arn, gotBucket, tc.bucket)
+		}
+		if gotPartition != tc.partition {
+			t.Errorf("parseS3ARN(%q) partition = %q, want %q", tc.arn, gotPartition, tc.partition)
 		}
 	}
 }
@@ -113,9 +117,11 @@ func TestParseS3ARN_invalidARNs(t *testing.T) {
 		{"xyz:aws:s3:::my-bucket", `must start with "arn:"`},
 		{"arn:aws:ec2:::my-bucket", `service must be "s3"`},
 		{"arn:aws:s3:::", `bucket name is empty`},
+		{"arn:aws:s3:::my-bucket/key", `contains "/"`},
+		{"arn:aws:s3:us-east-1:123456789012:my-bucket", `object or access-point ARN`},
 	}
 	for _, tc := range cases {
-		_, err := parseS3ARN(tc.arn)
+		_, _, err := parseS3ARN(tc.arn)
 		if err == nil {
 			t.Errorf("parseS3ARN(%q) expected error containing %q, got nil", tc.arn, tc.wantErr)
 			continue
@@ -129,7 +135,7 @@ func TestParseS3ARN_invalidARNs(t *testing.T) {
 // ─── s3IAMInstructions ────────────────────────────────────────────────────────
 
 func TestS3IAMInstructions_containsBucketName(t *testing.T) {
-	out := s3IAMInstructions("my-archive-bucket")
+	out := s3IAMInstructions("my-archive-bucket", "aws")
 	if !strings.Contains(out, "my-archive-bucket") {
 		t.Error("expected bucket name in IAM instructions output")
 	}
@@ -141,6 +147,16 @@ func TestS3IAMInstructions_containsBucketName(t *testing.T) {
 	}
 	if !strings.Contains(out, "s3:ListBucket") {
 		t.Error("expected s3:ListBucket in IAM instructions output")
+	}
+}
+
+func TestS3IAMInstructions_usesCorrectPartition(t *testing.T) {
+	out := s3IAMInstructions("china-bucket", "aws-cn")
+	if !strings.Contains(out, "arn:aws-cn:s3:::china-bucket") {
+		t.Error("expected aws-cn partition in resource ARN")
+	}
+	if strings.Contains(out, "arn:aws:s3:::china-bucket") {
+		t.Error("should not contain standard aws partition for aws-cn bucket")
 	}
 }
 
