@@ -19,7 +19,7 @@ tables in the target MySQL database. The database is created if it does not exis
 }
 
 var (
-	initIndexDSN  string
+	initIndexDSN   string
 	initPartitions int
 )
 

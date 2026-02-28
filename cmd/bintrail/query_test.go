@@ -117,7 +117,10 @@ func TestRunQuery_invalidFormat(t *testing.T) {
 func TestRunQuery_invalidEventType(t *testing.T) {
 	savedET, savedPK, savedCol, savedFmt := qEventType, qPK, qChangedCol, qFormat
 	t.Cleanup(func() {
-		qEventType = savedET; qPK = savedPK; qChangedCol = savedCol; qFormat = savedFmt
+		qEventType = savedET
+		qPK = savedPK
+		qChangedCol = savedCol
+		qFormat = savedFmt
 	})
 
 	qPK = ""
@@ -137,8 +140,11 @@ func TestRunQuery_invalidEventType(t *testing.T) {
 func TestRunQuery_invalidSince(t *testing.T) {
 	savedSince, savedPK, savedCol, savedFmt, savedET := qSince, qPK, qChangedCol, qFormat, qEventType
 	t.Cleanup(func() {
-		qSince = savedSince; qPK = savedPK; qChangedCol = savedCol
-		qFormat = savedFmt; qEventType = savedET
+		qSince = savedSince
+		qPK = savedPK
+		qChangedCol = savedCol
+		qFormat = savedFmt
+		qEventType = savedET
 	})
 
 	qPK = ""
@@ -160,8 +166,12 @@ func TestRunQuery_invalidUntil(t *testing.T) {
 	savedUntil, savedPK, savedCol, savedFmt, savedET, savedSince :=
 		qUntil, qPK, qChangedCol, qFormat, qEventType, qSince
 	t.Cleanup(func() {
-		qUntil = savedUntil; qPK = savedPK; qChangedCol = savedCol
-		qFormat = savedFmt; qEventType = savedET; qSince = savedSince
+		qUntil = savedUntil
+		qPK = savedPK
+		qChangedCol = savedCol
+		qFormat = savedFmt
+		qEventType = savedET
+		qSince = savedSince
 	})
 
 	qPK = ""

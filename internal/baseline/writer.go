@@ -19,20 +19,15 @@ import (
 
 // WriterConfig carries Parquet writer options.
 type WriterConfig struct {
-	Compression  string // "zstd", "snappy", "gzip", "none"
-	RowGroupSize int    // rows per row group
-	// Metadata fields
-	SnapshotTimestamp string
-	SourceDatabase    string
-	SourceTable       string
-	MydumperFormat    string // "sql" or "tab"
-	BintrailVersion   string
+	Compression  string            // "zstd", "snappy", "gzip", "none"
+	RowGroupSize int               // rows per row group
+	Metadata     map[string]string // key-value pairs written to Parquet file metadata
 }
 
 // Writer wraps a parquet.Writer for a single table's output file.
 type Writer struct {
-	pw         *parquet.Writer
-	file       *os.File
+	pw   *parquet.Writer
+	file *os.File
 	// parquetCols holds columns sorted alphabetically (Parquet column order).
 	parquetCols []Column
 	// mysqlOrder[parquetIdx] = original MySQL column index in the source data.
@@ -66,11 +61,9 @@ func NewWriter(path string, cols []Column, cfg WriterConfig) (*Writer, error) {
 	opts := []parquet.WriterOption{
 		schema,
 		parquet.MaxRowsPerRowGroup(int64(cfg.RowGroupSize)),
-		parquet.KeyValueMetadata("bintrail.snapshot_timestamp", cfg.SnapshotTimestamp),
-		parquet.KeyValueMetadata("bintrail.source_database", cfg.SourceDatabase),
-		parquet.KeyValueMetadata("bintrail.source_table", cfg.SourceTable),
-		parquet.KeyValueMetadata("bintrail.mydumper_format", cfg.MydumperFormat),
-		parquet.KeyValueMetadata("bintrail.bintrail_version", cfg.BintrailVersion),
+	}
+	for k, v := range cfg.Metadata {
+		opts = append(opts, parquet.KeyValueMetadata(k, v))
 	}
 	if codec := resolveCodec(cfg.Compression); codec != nil {
 		opts = append(opts, parquet.Compression(codec))

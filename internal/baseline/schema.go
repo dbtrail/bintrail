@@ -12,8 +12,8 @@ import (
 
 // Column describes a single column parsed from a CREATE TABLE statement.
 type Column struct {
-	Name       string
-	MySQLType  string // raw type token e.g. "int", "varchar", "datetime"
+	Name        string
+	MySQLType   string // raw type token e.g. "int", "varchar", "datetime"
 	ParquetType parquet.Node
 }
 
@@ -51,9 +51,9 @@ func ParseSchema(path string) ([]Column, error) {
 		name := m[1]
 		typeToken := strings.ToLower(m[2])
 		cols = append(cols, Column{
-			Name:       name,
-			MySQLType:  typeToken,
-			ParquetType: mysqlToParquetNode(typeToken),
+			Name:        name,
+			MySQLType:   typeToken,
+			ParquetType: MysqlToParquetNode(typeToken),
 		})
 	}
 	if err := scanner.Err(); err != nil {
@@ -74,9 +74,9 @@ func BuildParquetSchema(cols []Column) *parquet.Schema {
 	return parquet.NewSchema("row", group)
 }
 
-// mysqlToParquetNode maps a MySQL type token to the appropriate parquet-go node.
+// MysqlToParquetNode maps a MySQL type token to the appropriate parquet-go node.
 // All fields are Optional so NULL values can be represented.
-func mysqlToParquetNode(typeToken string) parquet.Node {
+func MysqlToParquetNode(typeToken string) parquet.Node {
 	switch typeToken {
 	case "tinyint", "smallint", "mediumint", "int", "integer":
 		return parquet.Optional(parquet.Int(32))

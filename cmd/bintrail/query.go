@@ -40,17 +40,17 @@ Examples:
 }
 
 var (
-	qIndexDSN     string
-	qSchema       string
-	qTable        string
-	qPK           string
-	qEventType    string
-	qGTID         string
-	qSince        string
-	qUntil        string
-	qChangedCol   string
-	qFormat       string
-	qLimit        int
+	qIndexDSN   string
+	qSchema     string
+	qTable      string
+	qPK         string
+	qEventType  string
+	qGTID       string
+	qSince      string
+	qUntil      string
+	qChangedCol string
+	qFormat     string
+	qLimit      int
 )
 
 func init() {
@@ -136,4 +136,3 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	return nil
 }
-

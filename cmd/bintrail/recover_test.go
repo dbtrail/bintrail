@@ -117,7 +117,10 @@ func TestRunRecover_invalidEventType(t *testing.T) {
 func TestRunRecover_invalidSince(t *testing.T) {
 	savedSince, savedET, savedPK, savedDry := rSince, rEventType, rPK, rDryRun
 	t.Cleanup(func() {
-		rSince = savedSince; rEventType = savedET; rPK = savedPK; rDryRun = savedDry
+		rSince = savedSince
+		rEventType = savedET
+		rPK = savedPK
+		rDryRun = savedDry
 	})
 
 	rDryRun = true
@@ -138,8 +141,11 @@ func TestRunRecover_invalidUntil(t *testing.T) {
 	savedUntil, savedSince, savedET, savedPK, savedDry :=
 		rUntil, rSince, rEventType, rPK, rDryRun
 	t.Cleanup(func() {
-		rUntil = savedUntil; rSince = savedSince; rEventType = savedET
-		rPK = savedPK; rDryRun = savedDry
+		rUntil = savedUntil
+		rSince = savedSince
+		rEventType = savedET
+		rPK = savedPK
+		rDryRun = savedDry
 	})
 
 	rDryRun = true

@@ -12,7 +12,7 @@ import (
 
 // DumpMetadata contains information parsed from a mydumper metadata file.
 type DumpMetadata struct {
-	StartedAt time.Time
+	StartedAt  time.Time
 	BinlogFile string
 	BinlogPos  int64
 	GTIDSet    string

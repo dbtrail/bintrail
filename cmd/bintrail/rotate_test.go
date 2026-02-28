@@ -215,7 +215,7 @@ func TestRotateCmd_indexDSN_required(t *testing.T) {
 }
 
 func TestRotateCmd_allFlagsRegistered(t *testing.T) {
-	for _, name := range []string{"index-dsn", "retain", "add-future"} {
+	for _, name := range []string{"index-dsn", "retain", "add-future", "archive-dir", "archive-compression"} {
 		if rotateCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on rotateCmd", name)
 		}

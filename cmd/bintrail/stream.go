@@ -45,16 +45,16 @@ a checkpoint before exiting.`,
 }
 
 var (
-	strmIndexDSN   string
-	strmSourceDSN  string
-	strmServerID   uint32
-	strmStartFile  string
-	strmStartPos   uint32
-	strmStartGTID  string
-	strmBatchSize  int
-	strmSchemas    string
-	strmTables     string
-	strmCheckpoint int
+	strmIndexDSN    string
+	strmSourceDSN   string
+	strmServerID    uint32
+	strmStartFile   string
+	strmStartPos    uint32
+	strmStartGTID   string
+	strmBatchSize   int
+	strmSchemas     string
+	strmTables      string
+	strmCheckpoint  int
 	strmMetricsAddr string
 )
 

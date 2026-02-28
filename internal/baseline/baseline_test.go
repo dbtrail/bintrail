@@ -153,8 +153,8 @@ func TestParseSchemaStopAtUniqueKey(t *testing.T) {
 
 func TestBuildParquetSchema(t *testing.T) {
 	cols := []Column{
-		{Name: "id", MySQLType: "int", ParquetType: mysqlToParquetNode("int")},
-		{Name: "name", MySQLType: "varchar", ParquetType: mysqlToParquetNode("varchar")},
+		{Name: "id", MySQLType: "int", ParquetType: MysqlToParquetNode("int")},
+		{Name: "name", MySQLType: "varchar", ParquetType: MysqlToParquetNode("varchar")},
 	}
 	schema := BuildParquetSchema(cols)
 	if schema == nil {
@@ -181,9 +181,9 @@ func TestMySQLToParquetType(t *testing.T) {
 		{"json", "STRING"},
 	}
 	for _, tc := range cases {
-		node := mysqlToParquetNode(tc.typ)
+		node := MysqlToParquetNode(tc.typ)
 		if node == nil {
-			t.Errorf("mysqlToParquetNode(%q) = nil", tc.typ)
+			t.Errorf("MysqlToParquetNode(%q) = nil", tc.typ)
 		}
 		// Just check it doesn't panic; the actual type mapping is validated
 		// end-to-end in TestWriteAndReadParquet.
@@ -671,23 +671,25 @@ func TestSortColumnsForParquet(t *testing.T) {
 
 func TestWriteAndReadParquet(t *testing.T) {
 	cols := []Column{
-		{Name: "id", MySQLType: "int", ParquetType: mysqlToParquetNode("int")},
-		{Name: "name", MySQLType: "varchar", ParquetType: mysqlToParquetNode("varchar")},
-		{Name: "score", MySQLType: "double", ParquetType: mysqlToParquetNode("double")},
-		{Name: "born", MySQLType: "date", ParquetType: mysqlToParquetNode("date")},
+		{Name: "id", MySQLType: "int", ParquetType: MysqlToParquetNode("int")},
+		{Name: "name", MySQLType: "varchar", ParquetType: MysqlToParquetNode("varchar")},
+		{Name: "score", MySQLType: "double", ParquetType: MysqlToParquetNode("double")},
+		{Name: "born", MySQLType: "date", ParquetType: MysqlToParquetNode("date")},
 	}
 
 	dir := t.TempDir()
 	outPath := filepath.Join(dir, "test.parquet")
 
 	cfg := WriterConfig{
-		Compression:       "none",
-		RowGroupSize:      100,
-		SnapshotTimestamp: "2025-02-28T00:00:00Z",
-		SourceDatabase:    "testdb",
-		SourceTable:       "testtable",
-		MydumperFormat:    "sql",
-		BintrailVersion:   "test",
+		Compression:  "none",
+		RowGroupSize: 100,
+		Metadata: map[string]string{
+			"bintrail.snapshot_timestamp": "2025-02-28T00:00:00Z",
+			"bintrail.source_database":    "testdb",
+			"bintrail.source_table":       "testtable",
+			"bintrail.mydumper_format":    "sql",
+			"bintrail.bintrail_version":   "test",
+		},
 	}
 
 	w, err := NewWriter(outPath, cols, cfg)
