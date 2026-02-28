@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/parquet-go/parquet-go"
 )
 
 // ─── ParseMetadata ────────────────────────────────────────────────────────────
@@ -37,6 +39,38 @@ func TestParseMetadataMissing(t *testing.T) {
 	_, err := ParseMetadata(t.TempDir())
 	if err == nil {
 		t.Fatal("expected error for missing metadata file")
+	}
+}
+
+func TestParseMetadataFields(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := ParseMetadata(dir)
+	if err != nil {
+		t.Fatalf("ParseMetadata: %v", err)
+	}
+	if m.BinlogFile != "binlog.000042" {
+		t.Errorf("BinlogFile = %q, want %q", m.BinlogFile, "binlog.000042")
+	}
+	if m.GTIDSet != "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100" {
+		t.Errorf("GTIDSet = %q, want %q", m.GTIDSet, "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100")
+	}
+	if m.BinlogPos != 12345 {
+		t.Errorf("BinlogPos = %d, want 12345", m.BinlogPos)
+	}
+}
+
+func TestParseMetadataMissingTimestamp(t *testing.T) {
+	const content = "SHOW MASTER STATUS:\n\tLog: binlog.000001\n\tPos: 100\n"
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "metadata"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ParseMetadata(dir)
+	if err == nil {
+		t.Error("expected error for missing 'Started dump at:' line, got nil")
 	}
 }
 
@@ -77,6 +111,54 @@ func TestParseSchema(t *testing.T) {
 		if cols[i].MySQLType != typ {
 			t.Errorf("col[%d].MySQLType = %q, want %q", i, cols[i].MySQLType, typ)
 		}
+	}
+}
+
+func TestParseSchemaEmpty(t *testing.T) {
+	// A CREATE TABLE whose first line inside the parens is PRIMARY KEY — colRe
+	// never matches before the stop condition, so no columns are found.
+	const emptySchema = "CREATE TABLE `empty` (\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.empty-schema.sql")
+	if err := os.WriteFile(path, []byte(emptySchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ParseSchema(path)
+	if err == nil {
+		t.Error("expected error for schema with no columns, got nil")
+	}
+}
+
+func TestParseSchemaStopAtUniqueKey(t *testing.T) {
+	const schema = "CREATE TABLE `users` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `email` varchar(255) NOT NULL,\n" +
+		"  UNIQUE KEY `email_unique` (`email`),\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB;\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.users-schema.sql")
+	if err := os.WriteFile(path, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cols, err := ParseSchema(path)
+	if err != nil {
+		t.Fatalf("ParseSchema: %v", err)
+	}
+	// id and email only; UNIQUE KEY line triggers the stop condition.
+	if len(cols) != 2 {
+		t.Errorf("got %d columns, want 2: %+v", len(cols), cols)
+	}
+}
+
+func TestBuildParquetSchema(t *testing.T) {
+	cols := []Column{
+		{Name: "id", MySQLType: "int", ParquetType: mysqlToParquetNode("int")},
+		{Name: "name", MySQLType: "varchar", ParquetType: mysqlToParquetNode("varchar")},
+	}
+	schema := BuildParquetSchema(cols)
+	if schema == nil {
+		t.Error("BuildParquetSchema returned nil")
 	}
 }
 
@@ -157,6 +239,61 @@ func TestReadTabRow(t *testing.T) {
 	}
 }
 
+func TestReadTabFile(t *testing.T) {
+	// 3 rows: normal, NULL in col 2, NULL in col 3.
+	const tabData = "1\tAlice\t100\n2\t\\N\t200\n3\tCharlie\t\\N\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.users.00000.dat")
+	if err := os.WriteFile(path, []byte(tabData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var rows [][]string
+	var allNulls [][]bool
+	if err := ReadTabFile(path, 3, func(values []string, nulls []bool) error {
+		rows = append(rows, append([]string(nil), values...))
+		allNulls = append(allNulls, append([]bool(nil), nulls...))
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadTabFile: %v", err)
+	}
+
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+	if rows[0][0] != "1" || rows[0][1] != "Alice" || rows[0][2] != "100" {
+		t.Errorf("row 0 = %v, want [1 Alice 100]", rows[0])
+	}
+	if !allNulls[1][1] || rows[1][2] != "200" {
+		t.Errorf("row 1 = %v nulls %v, want [2 <NULL> 200]", rows[1], allNulls[1])
+	}
+	if rows[2][1] != "Charlie" || !allNulls[2][2] {
+		t.Errorf("row 2 = %v nulls %v, want [3 Charlie <NULL>]", rows[2], allNulls[2])
+	}
+}
+
+func TestReadTabRowEscapes(t *testing.T) {
+	cases := []struct {
+		line string
+		want string
+	}{
+		{`hello\tworld`, "hello\tworld"},
+		{`line1\nline2`, "line1\nline2"},
+		{`cr\rhere`, "cr\rhere"},
+		{`back\\slash`, `back\slash`},
+	}
+	for _, tc := range cases {
+		values, _, err := parseTabRow(tc.line, 1)
+		if err != nil {
+			t.Errorf("parseTabRow(%q): %v", tc.line, err)
+			continue
+		}
+		if len(values) != 1 || values[0] != tc.want {
+			t.Errorf("parseTabRow(%q) = %v, want %q", tc.line, values, tc.want)
+		}
+	}
+}
+
 // ─── ReadSQLRow ───────────────────────────────────────────────────────────────
 
 func TestReadSQLRow(t *testing.T) {
@@ -187,6 +324,185 @@ func TestReadSQLRow(t *testing.T) {
 	// Row 1: (2, 'Bob', 42)
 	if rows[1][0] != "2" || rows[1][1] != "Bob" || rows[1][2] != "42" {
 		t.Errorf("row 1 = %v, want [2 Bob 42]", rows[1])
+	}
+}
+
+func TestReadSQLRowEscaping(t *testing.T) {
+	cases := []struct {
+		name string
+		// sql is the full INSERT statement written to the file.
+		sql  string
+		want string
+	}{
+		{
+			// \'  →  '   (backslash-escaped single quote)
+			name: "backslash-single-quote",
+			sql:  "INSERT INTO t VALUES('it\\'s fine');\n",
+			want: "it's fine",
+		},
+		{
+			// ''  →  '   (doubled single-quote escape)
+			name: "doubled-single-quote",
+			sql:  "INSERT INTO t VALUES('it''s fine');\n",
+			want: "it's fine",
+		},
+		{
+			// \n  →  newline
+			name: "newline",
+			sql:  "INSERT INTO t VALUES('line1\\nline2');\n",
+			want: "line1\nline2",
+		},
+		{
+			// \t  →  tab
+			name: "tab",
+			sql:  "INSERT INTO t VALUES('col1\\tcol2');\n",
+			want: "col1\tcol2",
+		},
+		{
+			// \\  →  single backslash
+			name: "backslash",
+			sql:  "INSERT INTO t VALUES('path\\\\file');\n",
+			want: `path\file`,
+		},
+		{
+			// \0  →  null byte
+			name: "null-byte",
+			sql:  "INSERT INTO t VALUES('\\0');\n",
+			want: "\x00",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "t.00000.sql")
+			if err := os.WriteFile(path, []byte(tc.sql), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var rows [][]string
+			if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+				rows = append(rows, append([]string(nil), values...))
+				return nil
+			}); err != nil {
+				t.Fatalf("ReadSQLFile: %v", err)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("got %d rows, want 1", len(rows))
+			}
+			if rows[0][0] != tc.want {
+				t.Errorf("col 0 = %q, want %q", rows[0][0], tc.want)
+			}
+		})
+	}
+}
+
+func TestReadSQLRowDoubleQuoted(t *testing.T) {
+	// Double-quoted strings with \" and \n escapes.
+	sql := `INSERT INTO t VALUES("hello \"world\"", "line1\nline2");` + "\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.00000.sql")
+	if err := os.WriteFile(path, []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var rows [][]string
+	if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		rows = append(rows, append([]string(nil), values...))
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadSQLFile: %v", err)
+	}
+	if len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("got rows=%v, want 1 row with 2 cols", rows)
+	}
+	if rows[0][0] != `hello "world"` {
+		t.Errorf(`col 0 = %q, want %q`, rows[0][0], `hello "world"`)
+	}
+	if rows[0][1] != "line1\nline2" {
+		t.Errorf("col 1 = %q, want embedded-newline string", rows[0][1])
+	}
+}
+
+func TestReadSQLRowHexLiteral(t *testing.T) {
+	sql := "INSERT INTO t VALUES(0x48656C6C6F, 42);\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.00000.sql")
+	if err := os.WriteFile(path, []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var rows [][]string
+	if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		rows = append(rows, append([]string(nil), values...))
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadSQLFile: %v", err)
+	}
+	if len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("got rows=%v, want 1 row with 2 cols", rows)
+	}
+	if rows[0][0] != "0x48656C6C6F" {
+		t.Errorf("hex literal = %q, want %q", rows[0][0], "0x48656C6C6F")
+	}
+	if rows[0][1] != "42" {
+		t.Errorf("col 1 = %q, want 42", rows[0][1])
+	}
+}
+
+func TestReadSQLRowNonInsertLines(t *testing.T) {
+	// Comments, SET statements, and blank lines before the INSERT should be skipped.
+	const data = "-- mydumper SQL dump\nSET NAMES utf8;\nSET TIME_ZONE='+00:00';\n\n" +
+		"INSERT INTO `orders` VALUES(1,'test');\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.orders.00000.sql")
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var rows [][]string
+	if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		rows = append(rows, append([]string(nil), values...))
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadSQLFile: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0][0] != "1" || rows[0][1] != "test" {
+		t.Errorf("row = %v, want [1 test]", rows[0])
+	}
+}
+
+func TestReadSQLRowEmpty(t *testing.T) {
+	// File with no INSERT statements → 0 rows, no error.
+	const data = "-- just comments\nSET NAMES utf8;\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.orders.00000.sql")
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		count++
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadSQLFile: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("got %d rows, want 0", count)
+	}
+}
+
+func TestReadSQLRowUnterminated(t *testing.T) {
+	// String literal that never closes should return an error.
+	const data = "INSERT INTO t VALUES('unterminated);\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.00000.sql")
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		return nil
+	})
+	if err == nil {
+		t.Error("expected error for unterminated string, got nil")
 	}
 }
 
@@ -228,6 +544,126 @@ func TestDiscoverTables(t *testing.T) {
 	}
 	if tables[1].Table != "users" || tables[1].Format != "tab" {
 		t.Errorf("tables[1] = %+v, want users/tab", tables[1])
+	}
+}
+
+// ─── Writer: convertValue, resolveCodec, sortColumnsForParquet ────────────────
+
+func TestConvertValueTypes(t *testing.T) {
+	cases := []struct {
+		mysqlType string
+		raw       string
+		check     func(t *testing.T, v parquet.Value)
+	}{
+		{"bigint", "9876543210", func(t *testing.T, v parquet.Value) {
+			if v.Int64() != 9876543210 {
+				t.Errorf("got %d, want 9876543210", v.Int64())
+			}
+		}},
+		{"float", "3.14", func(t *testing.T, v parquet.Value) {
+			if v.Float() == 0 {
+				t.Error("expected non-zero float")
+			}
+		}},
+		{"double", "2.718281828", func(t *testing.T, v parquet.Value) {
+			if v.Double() == 0 {
+				t.Error("expected non-zero double")
+			}
+		}},
+		{"datetime", "2025-01-15 12:30:00", func(t *testing.T, v parquet.Value) {
+			if v.Int64() == 0 {
+				t.Error("expected non-zero datetime microseconds")
+			}
+		}},
+		{"datetime", "2025-01-15 12:30:00.123456", func(t *testing.T, v parquet.Value) {
+			if v.Int64() == 0 {
+				t.Error("expected non-zero datetime microseconds (with fractional)")
+			}
+		}},
+		{"timestamp", "2025-01-15 12:30:00", func(t *testing.T, v parquet.Value) {
+			if v.Int64() == 0 {
+				t.Error("expected non-zero timestamp microseconds")
+			}
+		}},
+		{"year", "2025", func(t *testing.T, v parquet.Value) {
+			if v.Int32() != 2025 {
+				t.Errorf("year got %d, want 2025", v.Int32())
+			}
+		}},
+		{"decimal", "123.45", func(t *testing.T, v parquet.Value) {
+			if string(v.ByteArray()) != "123.45" {
+				t.Errorf("decimal got %q, want %q", string(v.ByteArray()), "123.45")
+			}
+		}},
+		{"blob", "binarydata", func(t *testing.T, v parquet.Value) {
+			if string(v.ByteArray()) != "binarydata" {
+				t.Errorf("blob got %q, want %q", string(v.ByteArray()), "binarydata")
+			}
+		}},
+		{"unknowntype", "fallback", func(t *testing.T, v parquet.Value) {
+			if string(v.ByteArray()) != "fallback" {
+				t.Errorf("unknown type fallback got %q, want %q", string(v.ByteArray()), "fallback")
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mysqlType+"/"+tc.raw, func(t *testing.T) {
+			col := Column{Name: "c", MySQLType: tc.mysqlType}
+			v, err := convertValue(col, tc.raw)
+			if err != nil {
+				t.Fatalf("convertValue(%q, %q): %v", tc.mysqlType, tc.raw, err)
+			}
+			tc.check(t, v)
+		})
+	}
+}
+
+func TestConvertValueError(t *testing.T) {
+	col := Column{Name: "n", MySQLType: "int"}
+	if _, err := convertValue(col, "not-a-number"); err == nil {
+		t.Error("expected error for non-numeric int value, got nil")
+	}
+}
+
+func TestResolveCodec(t *testing.T) {
+	if resolveCodec("zstd") == nil {
+		t.Error("zstd codec should not be nil")
+	}
+	// Empty string defaults to zstd.
+	if resolveCodec("") == nil {
+		t.Error("empty string should default to zstd (non-nil)")
+	}
+	if resolveCodec("snappy") == nil {
+		t.Error("snappy codec should not be nil")
+	}
+	if resolveCodec("gzip") == nil {
+		t.Error("gzip codec should not be nil")
+	}
+	if resolveCodec("none") != nil {
+		t.Error("'none' codec should be nil (no compression)")
+	}
+}
+
+func TestSortColumnsForParquet(t *testing.T) {
+	cols := []Column{
+		{Name: "zebra", MySQLType: "int"},
+		{Name: "apple", MySQLType: "varchar"},
+		{Name: "mango", MySQLType: "bigint"},
+	}
+	sorted, order := sortColumnsForParquet(cols)
+
+	wantNames := []string{"apple", "mango", "zebra"}
+	for i, want := range wantNames {
+		if sorted[i].Name != want {
+			t.Errorf("sorted[%d] = %q, want %q", i, sorted[i].Name, want)
+		}
+	}
+	// apple was MySQL index 1, mango was 2, zebra was 0.
+	wantOrder := []int{1, 2, 0}
+	for i, want := range wantOrder {
+		if order[i] != want {
+			t.Errorf("order[%d] = %d, want %d", i, order[i], want)
+		}
 	}
 }
 
@@ -278,17 +714,40 @@ func TestWriteAndReadParquet(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Verify file was created.
-	info, err := os.Stat(outPath)
+	// Read back and verify values + metadata.
+	rf, err := os.Open(outPath)
 	if err != nil {
-		t.Fatalf("stat output: %v", err)
+		t.Fatalf("open for read: %v", err)
 	}
-	if info.Size() == 0 {
-		t.Fatal("output file is empty")
+	defer rf.Close()
+	info, err := rf.Stat()
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	pf, err := parquet.OpenFile(rf, info.Size())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	if pf.NumRows() != 2 {
+		t.Errorf("NumRows = %d, want 2", pf.NumRows())
+	}
+
+	// Verify key-value metadata was written.
+	for key, want := range map[string]string{
+		"bintrail.source_database": "testdb",
+		"bintrail.source_table":    "testtable",
+		"bintrail.mydumper_format": "sql",
+	} {
+		got, ok := pf.Lookup(key)
+		if !ok {
+			t.Errorf("metadata key %q not found", key)
+		} else if got != want {
+			t.Errorf("metadata[%q] = %q, want %q", key, got, want)
+		}
 	}
 }
 
-// ─── Run (integration-lite, file-only) ────────────────────────────────────────
+// ─── Run (orchestrator) ───────────────────────────────────────────────────────
 
 func TestRun(t *testing.T) {
 	inputDir := t.TempDir()
@@ -336,5 +795,180 @@ func TestRun(t *testing.T) {
 	})
 	if !found {
 		t.Error("no .parquet file found in output directory")
+	}
+}
+
+func TestRunWithTimestampOverride(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+
+	// No metadata file — timestamp override must bypass metadata parsing.
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const sqlData = "INSERT INTO `orders` VALUES(1,10,'9.99','note','2025-01-01 00:00:00','2025-01-15');\n"
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"), []byte(sqlData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{
+		InputDir:     inputDir,
+		OutputDir:    outputDir,
+		Timestamp:    ts,
+		Compression:  "none",
+		RowGroupSize: 100,
+	}
+
+	stats, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.TablesProcessed != 1 {
+		t.Errorf("TablesProcessed = %d, want 1", stats.TablesProcessed)
+	}
+}
+
+func TestRunWithTableFilter(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Two tables: orders and users.
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const ordersData = "INSERT INTO `orders` VALUES(1,10,'9.99','note','2025-01-01 00:00:00','2025-01-15');\n"
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"), []byte(ordersData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const usersSchema = "CREATE TABLE `users` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.users-schema.sql"), []byte(usersSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.users.00000.sql"), []byte("INSERT INTO `users` VALUES(1);\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{
+		InputDir:     inputDir,
+		OutputDir:    outputDir,
+		Tables:       []string{"shop.orders"}, // filter to orders only
+		Compression:  "none",
+		RowGroupSize: 100,
+	}
+
+	stats, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.TablesProcessed != 1 {
+		t.Errorf("TablesProcessed = %d, want 1 (only orders, not users)", stats.TablesProcessed)
+	}
+}
+
+func TestRunTabFormat(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const schema2 = "CREATE TABLE `users` (\n  `id` int NOT NULL,\n  `name` varchar(100) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.users-schema.sql"), []byte(schema2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// TSV format: id TAB name; second row has NULL name.
+	const tabData = "1\tAlice\n2\t\\N\n"
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.users.00000.dat"), []byte(tabData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{
+		InputDir:     inputDir,
+		OutputDir:    outputDir,
+		Compression:  "none",
+		RowGroupSize: 100,
+	}
+
+	stats, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.TablesProcessed != 1 {
+		t.Errorf("TablesProcessed = %d, want 1", stats.TablesProcessed)
+	}
+	if stats.RowsWritten != 2 {
+		t.Errorf("RowsWritten = %d, want 2", stats.RowsWritten)
+	}
+}
+
+func TestRunMultiChunk(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Two chunk files, one row each.
+	const chunk0 = "INSERT INTO `orders` VALUES(1,10,'9.99','note','2025-01-01 00:00:00','2025-01-15');\n"
+	const chunk1 = "INSERT INTO `orders` VALUES(2,11,'19.99','note2','2025-01-02 00:00:00','2025-01-16');\n"
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"), []byte(chunk0), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00001.sql"), []byte(chunk1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{
+		InputDir:     inputDir,
+		OutputDir:    outputDir,
+		Compression:  "none",
+		RowGroupSize: 100,
+	}
+
+	stats, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.RowsWritten != 2 {
+		t.Errorf("RowsWritten = %d, want 2 (one row per chunk file)", stats.RowsWritten)
+	}
+}
+
+func TestFilterTablesNoMatch(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const sqlData = "INSERT INTO `orders` VALUES(1,10,'9.99','n','2025-01-01 00:00:00','2025-01-15');\n"
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"), []byte(sqlData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{
+		InputDir:     inputDir,
+		OutputDir:    outputDir,
+		Tables:       []string{"shop.nonexistent"}, // no match
+		Compression:  "none",
+		RowGroupSize: 100,
+	}
+
+	stats, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.TablesProcessed != 0 {
+		t.Errorf("TablesProcessed = %d, want 0 (filter matched nothing)", stats.TablesProcessed)
 	}
 }

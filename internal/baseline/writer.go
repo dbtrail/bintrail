@@ -12,6 +12,7 @@ import (
 
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress"
+	"github.com/parquet-go/parquet-go/compress/gzip"
 	"github.com/parquet-go/parquet-go/compress/snappy"
 	"github.com/parquet-go/parquet-go/compress/zstd"
 )
@@ -247,6 +248,8 @@ func resolveCodec(name string) compress.Codec {
 		return &zstd.Codec{}
 	case "snappy":
 		return &snappy.Codec{}
+	case "gzip":
+		return &gzip.Codec{}
 	default:
 		return nil
 	}

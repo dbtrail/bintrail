@@ -21,6 +21,7 @@ cmd/bintrail/          # One file per command
   status.go            # bintrail status
   stream.go            # bintrail stream (live replication indexing)
   dump.go              # bintrail dump (invoke mydumper; lockfile, schema/table filters)
+  baseline.go          # bintrail baseline (convert mydumper output → Parquet; no DB connection)
   index_test.go        # Unit tests for binlogFileRe, buildIndexFilters, resolveFiles, findBinlogFiles
   query_test.go        # Unit tests for queryCmd cobra wiring + runQuery validation logic
   recover_test.go      # Unit tests for recoverCmd cobra wiring + runRecover validation logic
@@ -28,6 +29,7 @@ cmd/bintrail/          # One file per command
   rotate_test.go       # Unit tests for parseRetain, partitionDate, partitionName, nextPartitionStart + cobra wiring
   stream_test.go       # Unit tests for parseSourceDSN, resolveStart, GTID accumulation, cobra wiring
   dump_test.go         # Unit tests for dumpCmd cobra wiring, buildMydumperArgs, lock mechanism, extractSchemasFromTables
+  baseline_test.go     # Unit tests for parseTableFilter, runBaseline timestamp parsing
   cmd_integration_test.go             # Integration tests (//go:build integration) for all DB helpers
   stream_integration_test.go          # Integration tests for stream_state persistence and streamLoop behaviour
 
@@ -48,6 +50,7 @@ internal/
   query/               # Query engine + result formatters (table/json/csv)
   recovery/            # Reversal SQL generator
   status/status.go     # Shared status types and display: LoadIndexState, LoadPartitionStats, WriteStatus
+  baseline/            # mydumper → Parquet converter: ParseMetadata, ParseSchema, DiscoverTables, Writer
   testutil/testutil.go # Shared test helpers: CreateTestDB, InitIndexTables, SkipIfNoMySQL, etc.
 
 e2e_test.go            # E2E integration test (//go:build integration) — exercises full CLI pipeline
@@ -87,6 +90,7 @@ Global persistent flags (all commands via `rootCmd.PersistentFlags`):
 | `stream` | `stream.go` | … + `--metrics-addr` (e.g. `:9090`; empty = disabled) |
 | `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint` |
 | `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path` (default `mydumper`), `--threads` (default 4) |
+| `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression` (default `zstd`), `--row-group-size` (default 500000) |
 
 Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `stIndexDSN`, `strmIndexDSN`, `dmpSourceDSN`).
 
@@ -281,6 +285,28 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent w
 - Tables → `--tables-list t1,t2`
 
 `extractSchemasFromTables(tables []string) []string` derives unique schema names from `db.table` entries (used when `--tables` is given without `--schemas`).
+
+### baseline command: mydumper → Parquet pipeline
+
+`baseline.go` (cmd) + `internal/baseline/` implement a file-only conversion requiring no DB connection:
+
+**Parsing pipeline** (`internal/baseline/`):
+- `ParseMetadata(inputDir)` reads the mydumper `metadata` file: `Started dump at:` → `DumpMetadata.StartedAt`, `\tLog:` → `BinlogFile`, `\tPos:` → `BinlogPos` (int64), `\tGTID:` → `GTIDSet`.
+- `DiscoverTables(inputDir)` scans for `db.table-schema.sql` files and pairs them with data files (`*.sql` chunks → format `"sql"`, `*.dat` chunks → format `"tab"`). Returns `[]TableFiles` sorted alphabetically.
+- `ParseSchema(schemaFile)` extracts column names and MySQL types from a mydumper `CREATE TABLE` statement. Stops at the first line matching `PRIMARY KEY`, `UNIQUE KEY`, `KEY`, or `)` to avoid false column matches.
+- `filterTables` applies the `--tables` filter (case-insensitive `db.table` match).
+
+**Parquet writer** (`writer.go`):
+- Columns are written in **alphabetical order** (parquet.Group sorts fields alphabetically). `sortColumnsForParquet` builds the MySQL→Parquet index mapping `mysqlOrder[parquetIdx] = mysqlIdx` so rows are remapped correctly.
+- `resolveCodec(name)` returns the codec: `"zstd"`/`""` → `&zstd.Codec{}`, `"snappy"` → `&snappy.Codec{}`, `"gzip"` → `&gzip.Codec{}`, anything else (incl. `"none"`) → nil (no compression).
+- `convertValue(col, raw)` maps MySQL types to parquet.Value: integers → INT32/INT64, float/double → FLOAT/DOUBLE, datetime/timestamp → INT64 (microseconds since Unix epoch, UTC), date → INT32 (days since Unix epoch), all others (decimal, varchar, blob, etc.) → BYTE_ARRAY.
+- Key-value metadata embedded: `bintrail.snapshot_timestamp`, `bintrail.source_database`, `bintrail.source_table`, `bintrail.mydumper_format`, `bintrail.bintrail_version`.
+
+**Output structure**: `<output>/<timestamp>/<database>/<table>.parquet` where timestamp uses RFC3339 with colons replaced by dashes for filesystem compatibility (e.g. `2025-02-28T00-00-00Z`).
+
+**`parseTableFilter(s string) []string`** in `baseline.go` (cmd) is the shared helper — `runBaseline` calls it instead of inlining the split loop.
+
+Flag variable prefix: `bsl` (e.g. `bslInput`, `bslOutput`, `bslCompression`).
 
 ### Recovery SQL generation
 - `recover` only generates SQL (`--dry-run` to stdout, `--output` to file) — it never executes against the source database. Application is always a manual step.
