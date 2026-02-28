@@ -374,7 +374,7 @@ go test -tags integration -coverprofile=cover.out ./... -count=1
 go tool cover -func=cover.out
 ```
 
-### Coverage baseline (as of baseline command + gzip support)
+### Coverage baseline (as of archive feature / issue #11)
 
 Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 
@@ -383,7 +383,7 @@ Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 | `internal/cliutil` | 100% |
 | `internal/observe` | 100% |
 | `internal/recovery` | 92% |
-| `internal/config` | 91% |
+| `internal/config` | 92% |
 | `internal/query` | 91% |
 | `internal/indexer` | 86% |
 | `internal/baseline` | 84% |
@@ -391,13 +391,15 @@ Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 | `internal/parser` | 82% |
 | `internal/status` | 68% |
 | `cmd/bintrail-mcp` | 79% |
-| `cmd/bintrail` | 55% |
-| **total** | **70%** |
+| `cmd/bintrail` | 54% |
+| `internal/archive` | 0% |
+| **total** | **69%** |
 
 **Known gaps and why:**
-- `cmd/bintrail` `run*` handlers (55%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). `runStream`, `runInit`, `runSnapshot`, `runStatus` are included in this gap. Validation logic in `runQuery`/`runRecover`/`runRotate` is covered by unit tests in `query_test.go`, `recover_test.go`, `rotate_test.go`.
+- `cmd/bintrail` `run*` handlers (54%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). `runStream`, `runInit`, `runSnapshot`, `runStatus` are included in this gap. Validation logic in `runQuery`/`runRecover`/`runRotate` is covered by unit tests in `query_test.go`, `recover_test.go`, `rotate_test.go`.
 - `internal/status` `LoadIndexState`/`LoadPartitionStats` (0% in cover.out): called through the MCP/CLI handlers which run as subprocesses; `WriteStatus`/`DescriptionToHuman` are 100%.
 - `cmd/bintrail-mcp` (79%): `main()` stdio entry point is intentionally excluded — exercised by `TestMCPE2E` whose coverage lands in `GOCOVERDIR`.
+- `internal/archive` (0% in cover.out): `ArchivePartition` requires a live DB; it is exercised by `TestArchivePartition` in `cmd/bintrail/cmd_integration_test.go` (package main), so coverage lands in `cmd/bintrail`'s profile, not `internal/archive`. Unit tests in `archive_test.go` cover column definitions and write/read round-trips via `baseline.NewWriter` directly.
 
 ### Test infrastructure
 
