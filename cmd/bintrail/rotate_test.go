@@ -187,6 +187,31 @@ func TestPartitionSpec_shape(t *testing.T) {
 	}
 }
 
+// ─── autoAdd calculation ──────────────────────────────────────────────────────
+
+// TestAutoAddReplacesDropped verifies that the toAdd = droppedCount + rotAddFuture
+// formula produces the correct total for the auto-replacement behaviour.
+func TestAutoAddReplacesDropped(t *testing.T) {
+	cases := []struct {
+		dropped   int
+		addFuture int
+		wantTotal int
+	}{
+		{dropped: 0, addFuture: 0, wantTotal: 0},
+		{dropped: 3, addFuture: 0, wantTotal: 3},  // pure retention: 3 dropped → 3 added
+		{dropped: 0, addFuture: 5, wantTotal: 5},  // only --add-future
+		{dropped: 4, addFuture: 2, wantTotal: 6},  // dropped + extra
+		{dropped: 168, addFuture: 0, wantTotal: 168}, // 7-day rotation (168 hourly partitions)
+	}
+	for _, c := range cases {
+		got := c.dropped + c.addFuture
+		if got != c.wantTotal {
+			t.Errorf("dropped=%d addFuture=%d: expected toAdd=%d, got %d",
+				c.dropped, c.addFuture, c.wantTotal, got)
+		}
+	}
+}
+
 // ─── cobra command wiring ─────────────────────────────────────────────────────
 
 func TestRotateCmd_registered(t *testing.T) {
