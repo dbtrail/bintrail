@@ -352,7 +352,7 @@ go test -tags integration -coverprofile=cover.out ./... -count=1
 go tool cover -func=cover.out
 ```
 
-### Coverage baseline (as of ParseTime UTC fix + E2E stdout/stderr fix)
+### Coverage baseline (as of baseline command + gzip support)
 
 Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 
@@ -364,17 +364,18 @@ Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 | `internal/config` | 91% |
 | `internal/query` | 91% |
 | `internal/indexer` | 86% |
-| `cmd/bintrail-mcp` | 89% |
+| `internal/baseline` | 84% |
 | `internal/metadata` | 83% |
 | `internal/parser` | 82% |
 | `internal/status` | 68% |
-| `cmd/bintrail` | 51% |
-| **total** | **66%** |
+| `cmd/bintrail-mcp` | 79% |
+| `cmd/bintrail` | 55% |
+| **total** | **70%** |
 
 **Known gaps and why:**
-- `cmd/bintrail` `run*` handlers (51%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). `runStream`, `runInit`, `runSnapshot`, `runStatus` are included in this gap. Validation logic in `runQuery`/`runRecover`/`runRotate` is covered by unit tests in `query_test.go`, `recover_test.go`, `rotate_test.go`.
+- `cmd/bintrail` `run*` handlers (55%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). `runStream`, `runInit`, `runSnapshot`, `runStatus` are included in this gap. Validation logic in `runQuery`/`runRecover`/`runRotate` is covered by unit tests in `query_test.go`, `recover_test.go`, `rotate_test.go`.
 - `internal/status` `LoadIndexState`/`LoadPartitionStats` (0% in cover.out): called through the MCP/CLI handlers which run as subprocesses; `WriteStatus`/`DescriptionToHuman` are 100%.
-- `cmd/bintrail-mcp` `main()` (0%): the stdio entry point is intentionally excluded — exercised by `TestMCPE2E`.
+- `cmd/bintrail-mcp` (79%): `main()` stdio entry point is intentionally excluded — exercised by `TestMCPE2E` whose coverage lands in `GOCOVERDIR`.
 
 ### Test infrastructure
 
