@@ -429,7 +429,75 @@ bintrail rotate \
 
 ---
 
-### Scenario G: Streaming from managed MySQL (RDS, Aurora, Cloud SQL)
+### Scenario G: Archiving partitions to S3
+
+**Situation:** You want to archive old `binlog_events` partitions to S3 as Parquet files before dropping them, so you retain a long-term queryable history outside the index database.
+
+**Option 1 — Let bintrail create the bucket:**
+
+```sh
+bintrail init \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --s3-bucket  my-bintrail-archives \
+  --s3-region  us-east-1
+```
+
+bintrail creates the bucket, blocks all public access, and sets a 1-year lifecycle expiry.
+
+**Option 2 — Use a bucket that already exists (pass its ARN):**
+
+```sh
+bintrail init \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --s3-arn     arn:aws:s3:::my-existing-bucket
+```
+
+bintrail verifies the bucket is reachable with the current AWS credentials. `--s3-bucket` and `--s3-arn` are mutually exclusive.
+
+**Required IAM permissions:**
+
+Whichever approach you use, the IAM role or user running bintrail needs these permissions on the bucket:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BintrailS3Access",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::my-bintrail-archives",
+        "arn:aws:s3:::my-bintrail-archives/*"
+      ]
+    }
+  ]
+}
+```
+
+If you used `--s3-bucket` to let bintrail create the bucket, it also needs `s3:CreateBucket`, `s3:PutBucketPublicAccessBlock`, and `s3:PutLifecycleConfiguration` at creation time — these can be removed from the policy afterwards.
+
+**AWS credentials:** bintrail uses the standard AWS credential chain — environment variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, or the EC2/ECS instance metadata service. No extra configuration is needed when running on an EC2 instance with an IAM instance profile that has the policy above attached.
+
+**Archive during rotation:**
+
+```sh
+bintrail rotate \
+  --index-dsn         "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain            7d \
+  --archive-dir       /mnt/archives
+```
+
+`--archive-dir` currently writes Parquet files to a local (or NFS-mounted) directory. Use an S3-backed mount (e.g. `mountpoint-s3`) to write directly to S3 without any code changes.
+
+---
+
+### Scenario I: Streaming from managed MySQL (RDS, Aurora, Cloud SQL)
 
 **Situation:** You're using a managed MySQL service where you have no filesystem access to binlog files. You want continuous real-time indexing using the replication protocol.
 
@@ -491,7 +559,7 @@ curl -s localhost:9090/metrics | grep bintrail_stream_replication_lag_seconds
 
 ---
 
-### Scenario H: Using bintrail from Claude Desktop (AI-assisted investigation)
+### Scenario J: Using bintrail from Claude Desktop (AI-assisted investigation)
 
 **Situation:** You want to use Claude Desktop (or Claude Code on another machine) to investigate database changes in natural language — without typing CLI commands.
 
@@ -596,7 +664,7 @@ BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index' \
 
 ---
 
-### Scenario J: Debug logging
+### Scenario K: Debug logging
 
 **Situation:** Something isn't indexing correctly and you need verbose output to diagnose it.
 

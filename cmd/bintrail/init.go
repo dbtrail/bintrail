@@ -30,19 +30,25 @@ var (
 	initPartitions int
 	initS3Bucket   string
 	initS3Region   string
+	initS3ARN      string
 )
 
 func init() {
 	initCmd.Flags().StringVar(&initIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	initCmd.Flags().IntVar(&initPartitions, "partitions", 48, "Number of hourly partitions to create starting from the current hour")
-	initCmd.Flags().StringVar(&initS3Bucket, "s3-bucket", "", "S3 bucket name to create for archiving (optional)")
-	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket")
+	initCmd.Flags().StringVar(&initS3Bucket, "s3-bucket", "", "S3 bucket name to create for archiving (optional; mutually exclusive with --s3-arn)")
+	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket (used with --s3-bucket or --s3-arn)")
+	initCmd.Flags().StringVar(&initS3ARN, "s3-arn", "", "ARN of an existing S3 bucket to use for archiving (optional; mutually exclusive with --s3-bucket)")
 	_ = initCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(initCmd)
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
+	if initS3Bucket != "" && initS3ARN != "" {
+		return fmt.Errorf("--s3-bucket and --s3-arn are mutually exclusive: use --s3-bucket to create a new bucket, or --s3-arn to use an existing one")
+	}
+
 	cfg, err := mysql.ParseDSN(initIndexDSN)
 	if err != nil {
 		return fmt.Errorf("invalid --index-dsn: %w", err)
@@ -99,6 +105,20 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Fprint(os.Stderr, s3Instructions(initS3Bucket, initS3Region))
 		} else {
 			fmt.Printf("  ✓ S3 bucket: %s (region: %s)\n", initS3Bucket, initS3Region)
+		}
+	}
+
+	if initS3ARN != "" {
+		bucket, err := parseS3ARN(initS3ARN)
+		if err != nil {
+			return fmt.Errorf("invalid --s3-arn: %w", err)
+		}
+		fmt.Printf("\nVerifying existing S3 bucket...\n")
+		if err := verifyS3Bucket(cmd.Context(), bucket, initS3Region); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not verify S3 bucket %q: %v\n\n", bucket, err)
+			fmt.Fprint(os.Stderr, s3IAMInstructions(bucket))
+		} else {
+			fmt.Printf("  ✓ S3 bucket: %s (ARN: %s)\n", bucket, initS3ARN)
 		}
 	}
 
@@ -166,6 +186,78 @@ func setupS3Bucket(ctx context.Context, bucket, region string) error {
 	}
 
 	return nil
+}
+
+// parseS3ARN extracts the bucket name from an S3 ARN.
+// S3 bucket ARNs have the form arn:partition:s3:::bucket-name where partition
+// is "aws", "aws-cn", or "aws-us-gov". Both region and account-id are empty
+// for bucket-level ARNs, so splitting by ":" always yields exactly 6 fields.
+func parseS3ARN(arn string) (string, error) {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) != 6 {
+		return "", fmt.Errorf("expected 6 colon-separated fields, got %d (want arn:partition:s3:::bucket-name)", len(parts))
+	}
+	if parts[0] != "arn" {
+		return "", fmt.Errorf("must start with \"arn:\", got %q", parts[0])
+	}
+	if parts[2] != "s3" {
+		return "", fmt.Errorf("service must be \"s3\", got %q", parts[2])
+	}
+	bucket := parts[5]
+	if bucket == "" {
+		return "", fmt.Errorf("bucket name is empty in ARN %q", arn)
+	}
+	return bucket, nil
+}
+
+// verifyS3Bucket checks that an S3 bucket exists and is accessible by the
+// current AWS credentials using a HeadBucket request.
+func verifyS3Bucket(ctx context.Context, bucket, region string) error {
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	if err != nil {
+		return fmt.Errorf("load AWS config: %w", err)
+	}
+	client := s3.NewFromConfig(awsCfg)
+	if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		return fmt.Errorf("head bucket: %w", err)
+	}
+	return nil
+}
+
+// s3IAMInstructions returns a human-readable IAM policy snippet the caller
+// needs to attach to the IAM role or user that runs bintrail, so it can read
+// and write Parquet archives to the bucket.
+func s3IAMInstructions(bucket string) string {
+	return fmt.Sprintf(`To allow bintrail to read and write archives in this bucket, attach the
+following IAM policy to the role or user running bintrail:
+
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "BintrailS3Access",
+        "Effect": "Allow",
+        "Action": [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:DeleteObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::%s",
+          "arn:aws:s3:::%s/*"
+        ]
+      }
+    ]
+  }
+
+Minimum permissions explained:
+  s3:PutObject    — write Parquet archive files
+  s3:GetObject    — read back archive files
+  s3:ListBucket   — enumerate archived partitions
+  s3:DeleteObject — remove superseded archives (optional but recommended)
+
+`, bucket, bucket)
 }
 
 // s3Instructions returns a human-readable string with AWS CLI and console steps
