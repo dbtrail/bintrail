@@ -51,6 +51,7 @@ internal/
   recovery/            # Reversal SQL generator
   status/status.go     # Shared status types and display: LoadIndexState, LoadPartitionStats, WriteStatus
   baseline/            # mydumper → Parquet converter: ParseMetadata, ParseSchema, DiscoverTables, Writer
+  archive/             # Partition archiver: ArchivePartition writes a binlog_events partition to Parquet
   testutil/testutil.go # Shared test helpers: CreateTestDB, InitIndexTables, SkipIfNoMySQL, etc.
 
 e2e_test.go            # E2E integration test (//go:build integration) — exercises full CLI pipeline
@@ -85,14 +86,14 @@ Global persistent flags (all commands via `rootCmd.PersistentFlags`):
 | `index` | `index.go` | `--index-dsn` (req), `--source-dsn`, `--binlog-dir` (req), `--files`, `--all`, `--batch-size`, `--schemas`, `--tables` |
 | `query` | `query.go` | `--index-dsn` (req), `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`, `--since`, `--until`, `--changed-column`, `--format`, `--limit` |
 | `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000) |
-| `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future` |
+| `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future`, `--archive-dir`, `--archive-compression` (default `zstd`) |
 | `status` | `status.go` | `--index-dsn` (req) |
 | `stream` | `stream.go` | … + `--metrics-addr` (e.g. `:9090`; empty = disabled) |
 | `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint` |
 | `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path` (default `mydumper`), `--threads` (default 4) |
 | `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression` (default `zstd`), `--row-group-size` (default 500000) |
 
-Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `stIndexDSN`, `strmIndexDSN`, `dmpSourceDSN`).
+Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `rotArchiveDir`, `rotArchiveCompression`, `stIndexDSN`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`).
 
 Filter helpers (`ParseEventType`, `ParseTime`, `IsValidFormat`) live in `internal/cliutil` and are shared by both `cmd/bintrail/` commands and `cmd/bintrail-mcp/`.
 
@@ -307,6 +308,27 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent w
 **`parseTableFilter(s string) []string`** in `baseline.go` (cmd) is the shared helper — `runBaseline` calls it instead of inlining the split loop.
 
 Flag variable prefix: `bsl` (e.g. `bslInput`, `bslOutput`, `bslCompression`).
+
+### baseline/archive package design
+
+**`WriterConfig.Metadata map[string]string`** — `NewWriter` loops over this map to emit `parquet.KeyValueMetadata` entries. Callers (baseline's `processTable` and archive's `ArchivePartition`) supply the keys themselves.
+
+**`baseline.MysqlToParquetNode(typeToken string) parquet.Node`** (exported) — maps a MySQL type token to a parquet-go node. Used by `ParseSchema` internally and by `internal/archive` to build the `binlogEventColumns` slice.
+
+### archive command: partition archiving pipeline
+
+`internal/archive/ArchivePartition(ctx, db, dbName, partition, outputPath, compression)` archives a single partition:
+- Defines 13 `binlog_events` columns (all non-generated — `pk_hash` is skipped)
+- SELECTs from `binlog_events PARTITION (<name>) ORDER BY event_id`
+- Scans typed Go vars (`uint64`, `time.Time`, `sql.NullString`, `[]byte` for JSON)
+- Converts to `[]string` + `[]bool` nulls, calls `baseline.NewWriter` / `WriteRow` / `Close`
+- On error: removes partial file before returning
+
+**Parquet metadata keys**: `bintrail.archive.partition`, `bintrail.archive.timestamp`, `bintrail.archive.version`.
+
+**Output path convention**: `<archive-dir>/p_YYYYMMDD.parquet` (set by `rotate.go`; archive package is path-agnostic).
+
+**`rotate --archive-dir`** triggers archiving before each `dropPartitions` call. If any archive fails, no partitions are dropped.
 
 ### Recovery SQL generation
 - `recover` only generates SQL (`--dry-run` to stdout, `--output` to file) — it never executes against the source database. Application is always a manual step.
