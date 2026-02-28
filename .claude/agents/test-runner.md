@@ -45,7 +45,7 @@ until docker exec bintrail-test-mysql mysql -uroot -ptestroot -e "SELECT 1" >/de
 
 ## Coverage baseline
 
-Current baseline is 66% overall. Key gaps (expected, not regressions):
+Current baseline is 70% overall. Key gaps (expected, not regressions):
 - `cmd/bintrail` run* handlers: only exercised via E2E subprocess (GOCOVERDIR, not cover.out)
 - `internal/status` Load* functions: called through CLI/MCP subprocesses
 - `cmd/bintrail-mcp` main(): stdio entry point excluded by design
@@ -55,15 +55,18 @@ A drop below these package baselines is a regression:
 | Package | Baseline |
 |---------|---------|
 | `internal/cliutil` | 100% |
+| `internal/observe` | 100% |
 | `internal/recovery` | 92% |
 | `internal/query` | 91% |
 | `internal/config` | 91% |
 | `internal/indexer` | 86% |
-| `cmd/bintrail-mcp` | 90% |
+| `internal/baseline` | 84% |
 | `internal/metadata` | 83% |
 | `internal/parser` | 82% |
-| `cmd/bintrail` | 51% |
-| **total** | **66%** |
+| `internal/status` | 68% |
+| `cmd/bintrail-mcp` | 79% |
+| `cmd/bintrail` | 55% |
+| **total** | **70%** |
 
 ## Workflow
 
