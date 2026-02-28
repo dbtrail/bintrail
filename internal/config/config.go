@@ -3,6 +3,7 @@ package config
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -16,6 +17,7 @@ func Connect(dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("invalid DSN: %w", err)
 	}
 	cfg.ParseTime = true
+	cfg.Loc = time.UTC
 
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {

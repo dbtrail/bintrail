@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bintrail/bintrail/internal/metadata"
 )
@@ -233,5 +234,18 @@ func TestWarnOnDDL_caseInsensitive(t *testing.T) {
 	warnOnDDL(logger, "binlog.000001", 100, "alter table orders add column x int")
 	if !strings.Contains(buf.String(), "DDL detected") {
 		t.Errorf("expected DDL warning for lowercase DDL, got: %q", buf.String())
+	}
+}
+
+// ─── Timestamp UTC ────────────────────────────────────────────────────────────
+
+func TestTimestampUTC(t *testing.T) {
+	epoch := int64(1_700_000_000)
+	ts := time.Unix(epoch, 0).UTC()
+	if ts.Location() != time.UTC {
+		t.Errorf("expected UTC location, got %v", ts.Location())
+	}
+	if ts.Unix() != epoch {
+		t.Errorf("expected epoch %d, got %d", epoch, ts.Unix())
 	}
 }

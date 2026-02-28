@@ -131,14 +131,14 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 		INSERT INTO stream_state
 		    (id, mode, binlog_file, binlog_position, gtid_set,
 		     events_indexed, last_event_time, last_checkpoint, server_id)
-		VALUES (1, ?, ?, ?, ?, ?, ?, NOW(), ?)
+		VALUES (1, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?)
 		ON DUPLICATE KEY UPDATE
 		    binlog_file     = VALUES(binlog_file),
 		    binlog_position = VALUES(binlog_position),
 		    gtid_set        = VALUES(gtid_set),
 		    events_indexed  = VALUES(events_indexed),
 		    last_event_time = VALUES(last_event_time),
-		    last_checkpoint = NOW(),
+		    last_checkpoint = UTC_TIMESTAMP(),
 		    server_id       = VALUES(server_id)`,
 		state.mode, state.binlogFile, state.binlogPos, gtidSet,
 		state.eventsIndexed, lastEventTime, state.serverID)

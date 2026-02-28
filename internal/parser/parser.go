@@ -179,7 +179,7 @@ func handleRows(
 	// LogPos points to the byte AFTER the event. Subtract EventSize to get start.
 	startPos := uint64(binlogEv.Header.LogPos) - uint64(binlogEv.Header.EventSize)
 	endPos := uint64(binlogEv.Header.LogPos)
-	ts := time.Unix(int64(binlogEv.Header.Timestamp), 0)
+	ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
 	pkCols := tm.PKColumnMetas()
 
 	switch binlogEv.Header.EventType {

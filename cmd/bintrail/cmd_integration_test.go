@@ -22,7 +22,7 @@ func TestGetFileStatus_existing(t *testing.T) {
 
 	testutil.MustExec(t, db, `INSERT INTO index_state
 		(binlog_file, file_size, last_position, events_indexed, status, started_at)
-		VALUES ('binlog.000042', 1024, 512, 100, 'completed', NOW())`)
+		VALUES ('binlog.000042', 1024, 512, 100, 'completed', UTC_TIMESTAMP())`)
 
 	status, err := getFileStatus(db, "binlog.000042")
 	if err != nil {

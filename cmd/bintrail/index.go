@@ -243,13 +243,13 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 		_, err := db.Exec(`
 			INSERT INTO index_state
 				(binlog_file, file_size, last_position, events_indexed, status, started_at, completed_at, error_message)
-			VALUES (?, ?, ?, ?, 'in_progress', NOW(), NULL, NULL)
+			VALUES (?, ?, ?, ?, 'in_progress', UTC_TIMESTAMP(), NULL, NULL)
 			ON DUPLICATE KEY UPDATE
 				file_size      = VALUES(file_size),
 				last_position  = VALUES(last_position),
 				events_indexed = VALUES(events_indexed),
 				status         = 'in_progress',
-				started_at     = NOW(),
+				started_at     = UTC_TIMESTAMP(),
 				completed_at   = NULL,
 				error_message  = NULL`,
 			filename, fileSize, lastPos, eventsIndexed)
@@ -261,7 +261,7 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 			SET last_position  = ?,
 			    events_indexed = ?,
 			    status         = 'completed',
-			    completed_at   = NOW(),
+			    completed_at   = UTC_TIMESTAMP(),
 			    error_message  = NULL
 			WHERE binlog_file = ?`,
 			lastPos, eventsIndexed, filename)
@@ -273,7 +273,7 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 			SET last_position  = ?,
 			    events_indexed = ?,
 			    status         = 'failed',
-			    completed_at   = NOW(),
+			    completed_at   = UTC_TIMESTAMP(),
 			    error_message  = ?
 			WHERE binlog_file = ?`,
 			lastPos, eventsIndexed, errMsgArg, filename)
