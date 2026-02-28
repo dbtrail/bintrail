@@ -398,17 +398,26 @@ bintrail status --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 
 The output shows each partition, its hour boundary, and estimated row counts. Identify how many hours of history you're holding.
 
-**Drop old partitions:**
+**Drop old partitions and reclaim space:**
 
 ```sh
-# Keep last 7 days (168 hours), add 48 new future partitions (2 days)
+# Drop partitions older than 7 days without auto-adding replacements
 bintrail rotate \
   --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --retain     168h \
-  --add-future 48
+  --retain     7d \
+  --no-replace
 ```
 
-Partitions older than the retain threshold are dropped in a single `ALTER TABLE … DROP PARTITION` statement — much faster than `DELETE` on InnoDB.
+Partitions older than the retain threshold are dropped in a single `ALTER TABLE … DROP PARTITION` statement — much faster than `DELETE` on InnoDB. Use `--no-replace` when you genuinely want to reclaim space; without it, `--retain` automatically adds back the same number of future partitions to keep the rolling window size constant.
+
+**Maintain a rolling window (same partition count):**
+
+```sh
+# Drop old partitions, auto-add the same number of replacement future ones
+bintrail rotate \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain     7d
+```
 
 **Extend the partition range** if the `p_future` catch-all is holding data:
 

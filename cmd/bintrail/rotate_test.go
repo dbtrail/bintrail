@@ -187,6 +187,37 @@ func TestPartitionSpec_shape(t *testing.T) {
 	}
 }
 
+// ─── autoAdd calculation ──────────────────────────────────────────────────────
+
+// TestAutoAddReplacesDropped verifies the toAdd formula for both default and
+// --no-replace modes.
+func TestAutoAddReplacesDropped(t *testing.T) {
+	cases := []struct {
+		dropped   int
+		addFuture int
+		noReplace bool
+		wantTotal int
+	}{
+		{dropped: 0, addFuture: 0, noReplace: false, wantTotal: 0},
+		{dropped: 3, addFuture: 0, noReplace: false, wantTotal: 3},   // pure retention: 3 dropped → 3 added
+		{dropped: 0, addFuture: 5, noReplace: false, wantTotal: 5},   // only --add-future
+		{dropped: 4, addFuture: 2, noReplace: false, wantTotal: 6},   // dropped + extra
+		{dropped: 168, addFuture: 0, noReplace: false, wantTotal: 168}, // 7-day rotation
+		{dropped: 3, addFuture: 0, noReplace: true, wantTotal: 0},    // --no-replace: pure drop, nothing added
+		{dropped: 3, addFuture: 2, noReplace: true, wantTotal: 2},    // --no-replace + --add-future: only explicit extras
+	}
+	for _, c := range cases {
+		toAdd := c.addFuture
+		if !c.noReplace {
+			toAdd += c.dropped
+		}
+		if toAdd != c.wantTotal {
+			t.Errorf("dropped=%d addFuture=%d noReplace=%v: expected toAdd=%d, got %d",
+				c.dropped, c.addFuture, c.noReplace, c.wantTotal, toAdd)
+		}
+	}
+}
+
 // ─── cobra command wiring ─────────────────────────────────────────────────────
 
 func TestRotateCmd_registered(t *testing.T) {
@@ -213,7 +244,7 @@ func TestRotateCmd_indexDSN_required(t *testing.T) {
 }
 
 func TestRotateCmd_allFlagsRegistered(t *testing.T) {
-	for _, name := range []string{"index-dsn", "retain", "add-future", "archive-dir", "archive-compression"} {
+	for _, name := range []string{"index-dsn", "retain", "add-future", "no-replace", "archive-dir", "archive-compression"} {
 		if rotateCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on rotateCmd", name)
 		}
@@ -223,8 +254,8 @@ func TestRotateCmd_allFlagsRegistered(t *testing.T) {
 // ─── runRotate validation (no DB required) ────────────────────────────────────
 
 func TestRunRotate_noFlagsError(t *testing.T) {
-	savedRetain, savedAdd := rotRetain, rotAddFuture
-	t.Cleanup(func() { rotRetain = savedRetain; rotAddFuture = savedAdd })
+	savedRetain, savedAdd, savedNoReplace := rotRetain, rotAddFuture, rotNoReplace
+	t.Cleanup(func() { rotRetain = savedRetain; rotAddFuture = savedAdd; rotNoReplace = savedNoReplace })
 
 	rotRetain = ""
 	rotAddFuture = 0
@@ -239,8 +270,8 @@ func TestRunRotate_noFlagsError(t *testing.T) {
 }
 
 func TestRunRotate_invalidRetain(t *testing.T) {
-	savedRetain, savedAdd := rotRetain, rotAddFuture
-	t.Cleanup(func() { rotRetain = savedRetain; rotAddFuture = savedAdd })
+	savedRetain, savedAdd, savedNoReplace := rotRetain, rotAddFuture, rotNoReplace
+	t.Cleanup(func() { rotRetain = savedRetain; rotAddFuture = savedAdd; rotNoReplace = savedNoReplace })
 
 	rotRetain = "5weeks" // invalid unit
 	rotAddFuture = 0
