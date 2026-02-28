@@ -72,6 +72,12 @@ The `--retain` flag accepts a duration: `7d` (days) or `24h` (hours). The comman
 
 A single `ALTER TABLE DROP PARTITION` statement for multiple partitions is more efficient than separate statements — MySQL does it in one pass.
 
+After dropping, the command automatically adds the same number of future hourly partitions to keep the rolling window size constant (e.g. dropping 168 partitions adds 168 new ones). Use `--no-replace` to suppress this auto-replacement when you genuinely want to reclaim space:
+
+```sh
+bintrail rotate --index-dsn "..." --retain 7d --no-replace
+```
+
 After dropping, the command warns if `p_future` contains data. If events are landing in `p_future`, it means events are arriving with timestamps beyond all named partition boundaries — you need to add more future partitions.
 
 ---
@@ -206,9 +212,9 @@ bintrail index / bintrail stream
     └── parses events → inserts into binlog_events partitions
         tracks progress in index_state / stream_state
 
-bintrail rotate --retain 7d --add-future 14
+bintrail rotate --retain 7d
     └── drops old partitions (instant metadata operation)
-        adds future partitions (reorganize p_future)
+        auto-adds replacement future partitions (reorganize p_future)
 
 bintrail status
     └── reads index_state, information_schema.PARTITIONS
@@ -230,13 +236,28 @@ bintrail recover
 In production, run `bintrail rotate` from an hourly cron job or systemd timer. A typical setup:
 
 ```sh
-# Drop data older than 30 days (720 hours); ensure 48 hours of future partitions exist
+# Maintain a 30-day rolling window: drop old partitions and auto-add the same count back
+bintrail rotate \
+  --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain 720h
+```
+
+`--retain` automatically replaces every dropped partition with a new future hourly partition, keeping the total partition count constant. If you also want extra future partitions beyond the replacements (e.g. 48 hours of extra headroom), use `--add-future`:
+
+```sh
 bintrail rotate \
   --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
   --retain 720h \
-  --add-future 48
+  --add-future 48   # adds 720 replacements + 48 extras = 768 new partitions total
 ```
 
-`--retain` and `--add-future` can be combined in one invocation. The command drops old partitions first, then adds new ones.
+To drop without adding anything back — useful when disk is critically full — use `--no-replace`:
+
+```sh
+bintrail rotate \
+  --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain 720h \
+  --no-replace
+```
 
 Schedule the timer to run once per hour. The drop operation is instant, but `REORGANIZE PARTITION` on a partition containing data does a full table scan of `p_future` to redistribute rows — if your `p_future` is empty (because you add future partitions frequently), the reorganize is also instant.

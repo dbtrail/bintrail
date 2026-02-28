@@ -19,22 +19,30 @@ import (
 
 var rotateCmd = &cobra.Command{
 	Use:   "rotate",
-	Short: "Drop old partitions and optionally add new future ones",
+	Short: "Drop old partitions and add replacement future ones",
 	Long: `Manage the time-range partitions on the binlog_events table.
 
-Old partitions are dropped based on the --retain threshold. New future partitions
-can be added with --add-future so upcoming events land in named partitions rather
-than the catch-all p_future partition.
+Old partitions are dropped based on the --retain threshold. For every partition
+dropped, one new hourly partition is automatically added for the future so that
+the total partition count stays constant. Use --add-future to add extra partitions
+on top of the automatic replacements. Use --no-replace to suppress auto-replacement
+and only add the explicit --add-future count (useful when storage is limited).
 
 Examples:
-  # Drop partitions older than 7 days
+  # Drop partitions older than 7 days (auto-adds 168 future hourly partitions)
   bintrail rotate --index-dsn "..." --retain 7d
 
-  # Drop old partitions and add 3 new future ones
+  # Drop old partitions and add 3 extra future ones beyond the replacements
   bintrail rotate --index-dsn "..." --retain 7d --add-future 3
 
   # Only add new future partitions (no drops)
-  bintrail rotate --index-dsn "..." --add-future 7`,
+  bintrail rotate --index-dsn "..." --add-future 7
+
+  # Drop without auto-replacing (pure drop, storage-conscious)
+  bintrail rotate --index-dsn "..." --retain 7d --no-replace
+
+  # Drop without auto-replacing but add 3 explicit extras
+  bintrail rotate --index-dsn "..." --retain 7d --no-replace --add-future 3`,
 	RunE: runRotate,
 }
 
@@ -42,6 +50,7 @@ var (
 	rotIndexDSN           string
 	rotRetain             string
 	rotAddFuture          int
+	rotNoReplace          bool
 	rotArchiveDir         string
 	rotArchiveCompression string
 )
@@ -49,7 +58,8 @@ var (
 func init() {
 	rotateCmd.Flags().StringVar(&rotIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	rotateCmd.Flags().StringVar(&rotRetain, "retain", "", "Drop partitions older than this duration (e.g. 7d, 24h)")
-	rotateCmd.Flags().IntVar(&rotAddFuture, "add-future", 0, "Number of hourly partitions to add for future hours")
+	rotateCmd.Flags().IntVar(&rotAddFuture, "add-future", 0, "Extra hourly partitions to add beyond auto-replacements (0 = only add replacements for dropped partitions)")
+	rotateCmd.Flags().BoolVar(&rotNoReplace, "no-replace", false, "Do not auto-add future partitions to replace dropped ones")
 	rotateCmd.Flags().StringVar(&rotArchiveDir, "archive-dir", "", "Directory to write Parquet archives before dropping partitions (empty = no archiving)")
 	rotateCmd.Flags().StringVar(&rotArchiveCompression, "archive-compression", "zstd", "Compression for archive Parquet files (zstd, snappy, gzip, none)")
 	_ = rotateCmd.MarkFlagRequired("index-dsn")
@@ -150,19 +160,26 @@ func runRotate(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Add new future partitions ─────────────────────────────────────────────
-	if rotAddFuture > 0 {
+	// Auto-replace every dropped partition with a new future hourly partition,
+	// plus any extras requested via --add-future.
+	// --no-replace suppresses the auto-replacement; only --add-future count is used.
+	toAdd := rotAddFuture
+	if !rotNoReplace {
+		toAdd += droppedCount
+	}
+	if toAdd > 0 {
 		startDate := nextPartitionStart(partitions)
-		if err := addFuturePartitions(ctx, db, dbName, startDate, rotAddFuture); err != nil {
+		if err := addFuturePartitions(ctx, db, dbName, startDate, toAdd); err != nil {
 			return fmt.Errorf("failed to add future partitions: %w", err)
 		}
-		for i := range rotAddFuture {
+		for i := range toAdd {
 			fmt.Fprintf(os.Stdout, "added partition %s\n", partitionName(startDate.Add(time.Duration(i)*time.Hour)))
 		}
 	}
 
 	slog.Info("rotation complete",
 		"partitions_dropped", droppedCount,
-		"partitions_added", rotAddFuture,
+		"partitions_added", toAdd,
 		"duration_ms", time.Since(start).Milliseconds())
 
 	return nil
