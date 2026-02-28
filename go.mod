@@ -6,6 +6,7 @@ require (
 	github.com/go-mysql-org/go-mysql v1.13.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/modelcontextprotocol/go-sdk v1.3.1
+	github.com/parquet-go/parquet-go v0.24.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/spf13/cobra v1.10.2
 )
@@ -24,7 +25,6 @@ require (
 	github.com/mattn/go-runewidth v0.0.15 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/olekukonko/tablewriter v0.0.5 // indirect
-	github.com/parquet-go/parquet-go v0.24.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/pingcap/errors v0.11.5-0.20250318082626-8f80e5cb09ec // indirect
 	github.com/pingcap/log v1.1.1-0.20241212030209-7e3ff8601a2a // indirect

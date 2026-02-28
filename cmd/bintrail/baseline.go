@@ -40,7 +40,7 @@ func init() {
 	baselineCmd.Flags().StringVar(&bslOutput, "output", "", "Parquet output base directory (required)")
 	baselineCmd.Flags().StringVar(&bslTimestamp, "timestamp", "", "Snapshot timestamp override (ISO 8601; default: from mydumper metadata)")
 	baselineCmd.Flags().StringVar(&bslTables, "tables", "", "Comma-separated db.table filter (e.g. mydb.orders,mydb.items; default: all)")
-	baselineCmd.Flags().StringVar(&bslCompression, "compression", "zstd", "Parquet compression codec: zstd, snappy, none")
+	baselineCmd.Flags().StringVar(&bslCompression, "compression", "zstd", "Parquet compression codec: zstd, snappy, gzip, none")
 	baselineCmd.Flags().IntVar(&bslRowGroupSize, "row-group-size", 500_000, "Rows per Parquet row group")
 	_ = baselineCmd.MarkFlagRequired("input")
 	_ = baselineCmd.MarkFlagRequired("output")
@@ -65,18 +65,11 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	var tables []string
-	for part := range strings.SplitSeq(bslTables, ",") {
-		if t := strings.TrimSpace(part); t != "" {
-			tables = append(tables, t)
-		}
-	}
-
 	cfg := baseline.Config{
 		InputDir:     bslInput,
 		OutputDir:    bslOutput,
 		Timestamp:    ts,
-		Tables:       tables,
+		Tables:       parseTableFilter(bslTables),
 		Compression:  bslCompression,
 		RowGroupSize: bslRowGroupSize,
 	}

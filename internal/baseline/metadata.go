@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -48,6 +49,11 @@ func ParseMetadata(inputDir string) (DumpMetadata, error) {
 			m.StartedAt = t
 		} else if after, ok := strings.CutPrefix(line, "\tLog: "); ok {
 			m.BinlogFile = strings.TrimSpace(after)
+		} else if after, ok := strings.CutPrefix(line, "\tPos: "); ok {
+			pos, err := strconv.ParseInt(strings.TrimSpace(after), 10, 64)
+			if err == nil {
+				m.BinlogPos = pos
+			}
 		} else if after, ok := strings.CutPrefix(line, "\tGTID: "); ok {
 			m.GTIDSet = strings.TrimSpace(after)
 		}

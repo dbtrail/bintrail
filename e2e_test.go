@@ -110,6 +110,62 @@ func TestEndToEnd_fullPipeline(t *testing.T) {
 		"--schemas", sourceName,
 	)
 
+	// ── 8b. bintrail baseline (file-only, no DB required) ────────────────────
+	mydumperDir := filepath.Join(tmpDir, "mydumper")
+	if err := os.MkdirAll(mydumperDir, 0755); err != nil {
+		t.Fatalf("create mydumper dir: %v", err)
+	}
+	mdMetadata := "Started dump at: 2025-02-28 00:00:00\n" +
+		"Finished dump at: 2025-02-28 00:01:23\n" +
+		"SHOW MASTER STATUS:\n" +
+		"\tLog: binlog.000042\n" +
+		"\tPos: 12345\n" +
+		"\tGTID: 3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100\n"
+	if err := os.WriteFile(filepath.Join(mydumperDir, "metadata"), []byte(mdMetadata), 0o644); err != nil {
+		t.Fatalf("write mydumper metadata: %v", err)
+	}
+	mdSchema := "CREATE TABLE `orders` (\n" +
+		"  `id` int NOT NULL AUTO_INCREMENT,\n" +
+		"  `customer` varchar(100) NOT NULL,\n" +
+		"  `status` varchar(20) NOT NULL DEFAULT 'new',\n" +
+		"  `amount` decimal(10,2) NOT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB;\n"
+	if err := os.WriteFile(filepath.Join(mydumperDir, sourceName+".orders-schema.sql"), []byte(mdSchema), 0o644); err != nil {
+		t.Fatalf("write mydumper schema: %v", err)
+	}
+	mdData := "INSERT INTO `orders` VALUES(1,'Alice','new',99.99),(2,'Bob','new',50.00);\n"
+	if err := os.WriteFile(filepath.Join(mydumperDir, sourceName+".orders.00000.sql"), []byte(mdData), 0o644); err != nil {
+		t.Fatalf("write mydumper data: %v", err)
+	}
+
+	parquetDir := filepath.Join(tmpDir, "parquet")
+	if err := os.MkdirAll(parquetDir, 0755); err != nil {
+		t.Fatalf("create parquet dir: %v", err)
+	}
+
+	baselineOut := run(t, binPath, coverDir, "baseline",
+		"--input", mydumperDir,
+		"--output", parquetDir,
+		"--compression", "none",
+	)
+	if !strings.Contains(baselineOut, "Baseline complete") {
+		t.Errorf("expected 'Baseline complete' in baseline output:\n%s", baselineOut)
+	}
+	if !strings.Contains(baselineOut, "tables    : 1") {
+		t.Errorf("expected 'tables    : 1' in baseline output:\n%s", baselineOut)
+	}
+	foundParquet := false
+	_ = filepath.Walk(parquetDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && filepath.Ext(path) == ".parquet" {
+			foundParquet = true
+		}
+		return nil
+	})
+	if !foundParquet {
+		t.Error("expected at least one .parquet file in parquet output directory")
+	}
+
 	// ── 9. bintrail query ────────────────────────────────────────────────────
 	queryOut := run(t, binPath, coverDir, "query",
 		"--index-dsn", indexDSN,
