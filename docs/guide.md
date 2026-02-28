@@ -35,7 +35,7 @@ Where you install and run the `bintrail` binary depends on which indexing mode y
 | Where to run bintrail | When to use it |
 |---|---|
 | On the MySQL server itself | Simplest option for self-managed MySQL. `--binlog-dir /var/lib/mysql`. |
-| On a replica host | If the replica has relay logs enabled and you want to avoid load on the primary. |
+| On a replica host | Point `--binlog-dir` at the replica's own binlog directory (requires `log_bin` enabled on the replica). Useful to avoid load on the primary. |
 | On any host with an NFS/CIFS mount | Mount the MySQL data directory read-only and point `--binlog-dir` at the mount point. |
 | Inside a Docker container | Mount the binlog directory read-only: `-v /var/lib/mysql:/var/lib/mysql:ro`. |
 | After copying files with rsync/SCP | Copy binlog files to a staging directory, run bintrail there, delete afterwards. |
@@ -69,7 +69,7 @@ bintrail stream ─────────────────────�
 
 **Bintrail can run anywhere** that has a TCP path to the source MySQL server — your laptop, a CI runner, a separate host, or a container.
 
-This is the required mode for managed MySQL services (Amazon RDS, Aurora, Google Cloud SQL, PlanetScale) where binlog files are not accessible on disk.
+This is the required mode for managed MySQL services (Amazon RDS, Aurora, Google Cloud SQL, Azure Database for MySQL) where binlog files are not accessible on disk.
 
 ---
 
