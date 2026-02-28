@@ -1,11 +1,18 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 )
@@ -21,11 +28,15 @@ tables in the target MySQL database. The database is created if it does not exis
 var (
 	initIndexDSN   string
 	initPartitions int
+	initS3Bucket   string
+	initS3Region   string
 )
 
 func init() {
 	initCmd.Flags().StringVar(&initIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	initCmd.Flags().IntVar(&initPartitions, "partitions", 48, "Number of hourly partitions to create starting from the current hour")
+	initCmd.Flags().StringVar(&initS3Bucket, "s3-bucket", "", "S3 bucket name to create for archiving (optional)")
+	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket")
 	_ = initCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(initCmd)
@@ -81,8 +92,116 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("  ✓ stream_state")
 
+	if initS3Bucket != "" {
+		fmt.Printf("\nSetting up S3 bucket...\n")
+		if err := setupS3Bucket(cmd.Context(), initS3Bucket, initS3Region); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not create S3 bucket %q: %v\n\n", initS3Bucket, err)
+			fmt.Fprint(os.Stderr, s3Instructions(initS3Bucket, initS3Region))
+		} else {
+			fmt.Printf("  ✓ S3 bucket: %s (region: %s)\n", initS3Bucket, initS3Region)
+		}
+	}
+
 	fmt.Printf("\nInitialization complete. Index database: %s\n", dbName)
 	return nil
+}
+
+// setupS3Bucket creates a private S3 bucket with a 1-year lifecycle expiry policy.
+// It loads AWS credentials from the environment, ~/.aws/credentials, or the EC2 instance
+// metadata service — whichever is available. If creation fails, the caller should print
+// s3Instructions so the user can set up the bucket manually.
+func setupS3Bucket(ctx context.Context, bucket, region string) error {
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	if err != nil {
+		return fmt.Errorf("load AWS config: %w", err)
+	}
+	client := s3.NewFromConfig(awsCfg)
+
+	// Create the bucket. us-east-1 rejects CreateBucketConfiguration; all other
+	// regions require it. BucketAlreadyOwnedByYou is treated as success so that
+	// re-running bintrail init is idempotent (mirrors CREATE TABLE IF NOT EXISTS).
+	createInput := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
+	if region != "us-east-1" {
+		createInput.CreateBucketConfiguration = &types.CreateBucketConfiguration{
+			LocationConstraint: types.BucketLocationConstraint(region),
+		}
+	}
+	if _, err := client.CreateBucket(ctx, createInput); err != nil {
+		var alreadyOwned *types.BucketAlreadyOwnedByYou
+		if !errors.As(err, &alreadyOwned) {
+			return fmt.Errorf("create bucket: %w", err)
+		}
+	}
+
+	// Block all public access.
+	if _, err := client.PutPublicAccessBlock(ctx, &s3.PutPublicAccessBlockInput{
+		Bucket: aws.String(bucket),
+		PublicAccessBlockConfiguration: &types.PublicAccessBlockConfiguration{
+			BlockPublicAcls:       aws.Bool(true),
+			IgnorePublicAcls:      aws.Bool(true),
+			BlockPublicPolicy:     aws.Bool(true),
+			RestrictPublicBuckets: aws.Bool(true),
+		},
+	}); err != nil {
+		return fmt.Errorf("block public access: %w", err)
+	}
+
+	// Add a lifecycle rule: expire all objects after 365 days.
+	if _, err := client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
+		Bucket: aws.String(bucket),
+		LifecycleConfiguration: &types.BucketLifecycleConfiguration{
+			Rules: []types.LifecycleRule{
+				{
+					ID:     aws.String("bintrail-1yr-expiry"),
+					Status: types.ExpirationStatusEnabled,
+					Filter: &types.LifecycleRuleFilter{Prefix: aws.String("")},
+					Expiration: &types.LifecycleExpiration{
+						Days: aws.Int32(365),
+					},
+				},
+			},
+		},
+	}); err != nil {
+		return fmt.Errorf("set lifecycle policy: %w", err)
+	}
+
+	return nil
+}
+
+// s3Instructions returns a human-readable string with AWS CLI and console steps
+// to manually create and configure the S3 bucket.
+func s3Instructions(bucket, region string) string {
+	var sb strings.Builder
+
+	sb.WriteString("To create the bucket manually, run the following AWS CLI commands:\n\n")
+
+	// Create bucket.
+	sb.WriteString("  aws s3api create-bucket \\\n")
+	fmt.Fprintf(&sb, "    --bucket %s \\\n", bucket)
+	fmt.Fprintf(&sb, "    --region %s", region)
+	if region != "us-east-1" {
+		fmt.Fprintf(&sb, " \\\n    --create-bucket-configuration LocationConstraint=%s", region)
+	}
+	sb.WriteString("\n\n")
+
+	// Block public access.
+	sb.WriteString("  aws s3api put-public-access-block \\\n")
+	fmt.Fprintf(&sb, "    --bucket %s \\\n", bucket)
+	sb.WriteString("    --public-access-block-configuration \"BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true\"\n\n")
+
+	// Lifecycle policy.
+	sb.WriteString("  aws s3api put-bucket-lifecycle-configuration \\\n")
+	fmt.Fprintf(&sb, "    --bucket %s \\\n", bucket)
+	sb.WriteString("    --lifecycle-configuration '{\"Rules\":[{\"ID\":\"bintrail-1yr-expiry\",\"Status\":\"Enabled\",\"Filter\":{\"Prefix\":\"\"},\"Expiration\":{\"Days\":365}}]}'\n\n")
+
+	// Console instructions.
+	sb.WriteString("Or via the AWS Console (https://s3.console.aws.amazon.com/s3/bucket/create):\n")
+	fmt.Fprintf(&sb, "  Bucket name             : %s\n", bucket)
+	fmt.Fprintf(&sb, "  Region                  : %s\n", region)
+	sb.WriteString("  Block all public access : enabled\n")
+	sb.WriteString("  Lifecycle rule          : expire all objects after 365 days\n\n")
+
+	return sb.String()
 }
 
 // ensureDatabase creates the target database if it does not already exist.
