@@ -60,6 +60,11 @@ migrations/
 
 docs/
   guide.md             # Practical DBA guide — scenario walkthroughs + troubleshooting FAQ
+  indexing.md          # Developer doc: parser/indexer pipeline, Resolver, concurrent goroutine design
+  query-and-recovery.md # Developer doc: dynamic SQL builder, PK lookup, reversal logic, float64 gotcha
+  streaming.md         # Developer doc: replication protocol, StreamParser, checkpointing, Prometheus metrics
+  rotation-and-status.md # Developer doc: partition management, TO_DAYS rationale, DescriptionToHuman
+  mcp-server.md        # Developer doc: MCP tools, transport modes, proxy.py, newServer() pattern
 ```
 
 ## Commands
