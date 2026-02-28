@@ -34,7 +34,7 @@ var (
 
 func init() {
 	initCmd.Flags().StringVar(&initIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
-	initCmd.Flags().IntVar(&initPartitions, "partitions", 48, "Number of hourly partitions to create starting from the current hour")
+	initCmd.Flags().IntVar(&initPartitions, "partitions", 48, "Number of hourly partitions to create; partitions span from N hours ago to the current hour so historical binlog events are properly distributed")
 	initCmd.Flags().StringVar(&initS3Bucket, "s3-bucket", "", "S3 bucket name to create for archiving (optional)")
 	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket")
 	_ = initCmd.MarkFlagRequired("index-dsn")
@@ -232,18 +232,22 @@ func ensureDatabase(cfg *mysql.Config, dbName string) error {
 	return nil
 }
 
-// createBinlogEventsTable generates the CREATE TABLE with N hourly partitions
-// starting from the current hour (UTC), plus a p_future catch-all partition.
+// buildPartitionDefs returns numPartitions hourly partition clauses ending at
+// the current hour (truncated from now), followed by a p_future catch-all.
 //
-// Each partition p_YYYYMMDDHH holds events where TO_SECONDS(event_timestamp)
-// is less than TO_SECONDS of the following hour (timezone-independent boundary).
-// The p_future partition catches any events beyond the last pre-created partition.
-func createBinlogEventsTable(db *sql.DB, numPartitions int) error {
-	today := time.Now().UTC().Truncate(time.Hour)
+// Partitions span backwards from the current hour so that historical binlog
+// events are distributed across the correct hourly buckets rather than
+// accumulating in a single early partition. With numPartitions=48 (the
+// default), the range covers the past 47 hours through the present hour.
+// New events arriving in future hours fall into p_future until rotate adds
+// more named partitions.
+func buildPartitionDefs(now time.Time, numPartitions int) []string {
+	now = now.UTC().Truncate(time.Hour)
+	start := now.Add(-time.Duration(numPartitions-1) * time.Hour)
 
 	parts := make([]string, 0, numPartitions+1)
 	for i := range numPartitions {
-		hour := today.Add(time.Duration(i) * time.Hour)
+		hour := start.Add(time.Duration(i) * time.Hour)
 		nextHour := hour.Add(time.Hour)
 		parts = append(parts, fmt.Sprintf(
 			"    PARTITION p_%s VALUES LESS THAN (TO_SECONDS('%s'))",
@@ -252,6 +256,17 @@ func createBinlogEventsTable(db *sql.DB, numPartitions int) error {
 		))
 	}
 	parts = append(parts, "    PARTITION p_future VALUES LESS THAN MAXVALUE")
+	return parts
+}
+
+// createBinlogEventsTable generates the CREATE TABLE with N hourly partitions
+// spanning from N hours ago to the current hour (UTC), plus a p_future
+// catch-all partition for any events arriving in subsequent hours.
+//
+// Each partition p_YYYYMMDDHH covers events where TO_SECONDS(event_timestamp)
+// is less than TO_SECONDS of the following hour (timezone-independent).
+func createBinlogEventsTable(db *sql.DB, numPartitions int) error {
+	parts := buildPartitionDefs(time.Now(), numPartitions)
 
 	ddl := `CREATE TABLE IF NOT EXISTS binlog_events (
     event_id        BIGINT UNSIGNED AUTO_INCREMENT,
