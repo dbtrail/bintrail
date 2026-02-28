@@ -34,7 +34,7 @@ var (
 
 func init() {
 	initCmd.Flags().StringVar(&initIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
-	initCmd.Flags().IntVar(&initPartitions, "partitions", 48, "Number of hourly partitions to create; partitions span from N hours ago to the current hour so historical binlog events are properly distributed")
+	initCmd.Flags().IntVar(&initPartitions, "partitions", 48, "Number of hourly partitions to create; partitions span from (N-1) hours ago to the current hour so historical binlog events are properly distributed")
 	initCmd.Flags().StringVar(&initS3Bucket, "s3-bucket", "", "S3 bucket name to create for archiving (optional)")
 	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket")
 	_ = initCmd.MarkFlagRequired("index-dsn")
@@ -260,7 +260,7 @@ func buildPartitionDefs(now time.Time, numPartitions int) []string {
 }
 
 // createBinlogEventsTable generates the CREATE TABLE with N hourly partitions
-// spanning from N hours ago to the current hour (UTC), plus a p_future
+// spanning from (N-1) hours ago to the current hour (UTC), plus a p_future
 // catch-all partition for any events arriving in subsequent hours.
 //
 // Each partition p_YYYYMMDDHH covers events where TO_SECONDS(event_timestamp)

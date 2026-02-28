@@ -70,8 +70,6 @@ func TestInitCmd_defaults(t *testing.T) {
 	}
 }
 
-// ─── s3Instructions ───────────────────────────────────────────────────────────
-
 // ─── buildPartitionDefs ───────────────────────────────────────────────────────
 
 func TestBuildPartitionDefs_countAndFuture(t *testing.T) {
