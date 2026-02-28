@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // ─── Cobra command wiring ─────────────────────────────────────────────────────
@@ -157,6 +158,69 @@ func TestS3IAMInstructions_usesCorrectPartition(t *testing.T) {
 	}
 	if strings.Contains(out, "arn:aws:s3:::china-bucket") {
 		t.Error("should not contain standard aws partition for aws-cn bucket")
+	}
+}
+
+// ─── buildPartitionDefs ───────────────────────────────────────────────────────
+
+func TestBuildPartitionDefs_countAndFuture(t *testing.T) {
+	now := time.Date(2026, 2, 28, 14, 30, 0, 0, time.UTC)
+	parts := buildPartitionDefs(now, 48)
+
+	// 48 named hourly partitions + p_future = 49
+	if len(parts) != 49 {
+		t.Fatalf("expected 49 partition defs, got %d", len(parts))
+	}
+	if !strings.Contains(parts[48], "p_future") {
+		t.Errorf("last def should be p_future, got %q", parts[48])
+	}
+}
+
+func TestBuildPartitionDefs_spansFromPastToCurrentHour(t *testing.T) {
+	// now truncated to 14:00; with 48 partitions: start = 14:00 - 47h = 2026-02-26 15:00 UTC
+	now := time.Date(2026, 2, 28, 14, 30, 0, 0, time.UTC)
+	parts := buildPartitionDefs(now, 48)
+
+	// First partition starts 47 hours before the current hour
+	if !strings.Contains(parts[0], "p_2026022615") {
+		t.Errorf("expected first partition p_2026022615 (47h ago), got %q", parts[0])
+	}
+	// Last named partition covers the current hour (14:00 UTC today)
+	if !strings.Contains(parts[47], "p_2026022814") {
+		t.Errorf("expected last named partition p_2026022814 (current hour), got %q", parts[47])
+	}
+}
+
+func TestBuildPartitionDefs_boundaryValues(t *testing.T) {
+	now := time.Date(2026, 2, 28, 14, 30, 0, 0, time.UTC)
+	parts := buildPartitionDefs(now, 3)
+
+	// 3 partitions: p_2026022812, p_2026022813, p_2026022814, p_future
+	if !strings.Contains(parts[0], "p_2026022812") {
+		t.Errorf("expected p_2026022812 (2h ago), got %q", parts[0])
+	}
+	if !strings.Contains(parts[1], "p_2026022813") {
+		t.Errorf("expected p_2026022813, got %q", parts[1])
+	}
+	if !strings.Contains(parts[2], "p_2026022814") {
+		t.Errorf("expected p_2026022814, got %q", parts[2])
+	}
+	// p_2026022812 boundary: LESS THAN TO_SECONDS('2026-02-28 13:00:00')
+	if !strings.Contains(parts[0], "2026-02-28 13:00:00") {
+		t.Errorf("expected boundary at 2026-02-28 13:00:00, got %q", parts[0])
+	}
+}
+
+func TestBuildPartitionDefs_singlePartition(t *testing.T) {
+	now := time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)
+	parts := buildPartitionDefs(now, 1)
+
+	// 1 named + p_future = 2
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 defs, got %d", len(parts))
+	}
+	if !strings.Contains(parts[0], "p_2026022810") {
+		t.Errorf("expected p_2026022810 (current hour), got %q", parts[0])
 	}
 }
 
