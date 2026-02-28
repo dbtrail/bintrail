@@ -30,19 +30,36 @@ var (
 	initPartitions int
 	initS3Bucket   string
 	initS3Region   string
+	initS3ARN      string
 )
 
 func init() {
 	initCmd.Flags().StringVar(&initIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	initCmd.Flags().IntVar(&initPartitions, "partitions", 48, "Number of hourly partitions to create; partitions span from (N-1) hours ago to the current hour so historical binlog events are properly distributed")
-	initCmd.Flags().StringVar(&initS3Bucket, "s3-bucket", "", "S3 bucket name to create for archiving (optional)")
-	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket")
+	initCmd.Flags().StringVar(&initS3Bucket, "s3-bucket", "", "S3 bucket name to create for archiving (optional; mutually exclusive with --s3-arn)")
+	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket (required with --s3-bucket; ignored with --s3-arn since the SDK resolves the bucket region automatically)")
+	initCmd.Flags().StringVar(&initS3ARN, "s3-arn", "", "ARN of an existing S3 bucket to use for archiving (optional; mutually exclusive with --s3-bucket)")
 	_ = initCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(initCmd)
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
+	if initS3Bucket != "" && initS3ARN != "" {
+		return fmt.Errorf("--s3-bucket and --s3-arn are mutually exclusive: use --s3-bucket to create a new bucket, or --s3-arn to use an existing one")
+	}
+
+	// Validate the ARN format before doing any database work so that a typo
+	// does not leave the user with a half-initialized state and a non-zero exit.
+	var s3ARNBucket, s3ARNPartition string
+	if initS3ARN != "" {
+		var err error
+		s3ARNBucket, s3ARNPartition, err = parseS3ARN(initS3ARN)
+		if err != nil {
+			return fmt.Errorf("invalid --s3-arn: %w", err)
+		}
+	}
+
 	cfg, err := mysql.ParseDSN(initIndexDSN)
 	if err != nil {
 		return fmt.Errorf("invalid --index-dsn: %w", err)
@@ -99,6 +116,16 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Fprint(os.Stderr, s3Instructions(initS3Bucket, initS3Region))
 		} else {
 			fmt.Printf("  ✓ S3 bucket: %s (region: %s)\n", initS3Bucket, initS3Region)
+		}
+	}
+
+	if initS3ARN != "" {
+		fmt.Printf("\nVerifying existing S3 bucket...\n")
+		if err := verifyS3Bucket(cmd.Context(), s3ARNBucket, initS3Region); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not verify S3 bucket %q: %v\n\n", s3ARNBucket, err)
+			fmt.Fprint(os.Stderr, s3IAMInstructions(s3ARNBucket, s3ARNPartition))
+		} else {
+			fmt.Printf("  ✓ S3 bucket: %s (ARN: %s)\n", s3ARNBucket, initS3ARN)
 		}
 	}
 
@@ -166,6 +193,86 @@ func setupS3Bucket(ctx context.Context, bucket, region string) error {
 	}
 
 	return nil
+}
+
+// parseS3ARN extracts the bucket name and partition from an S3 bucket ARN.
+// S3 bucket ARNs have the form arn:partition:s3:::bucket-name where partition
+// is "aws", "aws-cn", or "aws-us-gov". Both region (parts[3]) and account-id
+// (parts[4]) are empty for bucket-level ARNs. Object ARNs contain a "/" in the
+// resource field and are rejected to avoid a confusing HeadBucket error.
+func parseS3ARN(arn string) (bucket, partition string, err error) {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) != 6 {
+		return "", "", fmt.Errorf("expected 6 colon-separated fields, got %d (want arn:partition:s3:::bucket-name)", len(parts))
+	}
+	if parts[0] != "arn" {
+		return "", "", fmt.Errorf("must start with \"arn:\", got %q", parts[0])
+	}
+	if parts[2] != "s3" {
+		return "", "", fmt.Errorf("service must be \"s3\", got %q", parts[2])
+	}
+	if parts[3] != "" || parts[4] != "" {
+		return "", "", fmt.Errorf("S3 bucket ARNs have empty region and account fields (got %q and %q); this looks like an object or access-point ARN", parts[3], parts[4])
+	}
+	bucket = parts[5]
+	if bucket == "" {
+		return "", "", fmt.Errorf("bucket name is empty in ARN %q", arn)
+	}
+	if strings.Contains(bucket, "/") {
+		return "", "", fmt.Errorf("bucket name %q contains \"/\"; pass a bucket ARN (arn:aws:s3:::bucket-name), not an object ARN", bucket)
+	}
+	return bucket, parts[1], nil
+}
+
+// verifyS3Bucket checks that an S3 bucket exists and is accessible by the
+// current AWS credentials using a HeadBucket request.
+func verifyS3Bucket(ctx context.Context, bucket, region string) error {
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	if err != nil {
+		return fmt.Errorf("load AWS config: %w", err)
+	}
+	client := s3.NewFromConfig(awsCfg)
+	if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		return fmt.Errorf("head bucket: %w", err)
+	}
+	return nil
+}
+
+// s3IAMInstructions returns a human-readable IAM policy snippet the caller
+// needs to attach to the IAM role or user that runs bintrail, so it can read
+// and write Parquet archives to the bucket. partition must be the ARN partition
+// string ("aws", "aws-cn", or "aws-us-gov") so the resource ARNs are correct.
+func s3IAMInstructions(bucket, partition string) string {
+	return fmt.Sprintf(`To allow bintrail to read and write archives in this bucket, attach the
+following IAM policy to the role or user running bintrail:
+
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "BintrailS3Access",
+        "Effect": "Allow",
+        "Action": [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:DeleteObject"
+        ],
+        "Resource": [
+          "arn:%s:s3:::%s",
+          "arn:%s:s3:::%s/*"
+        ]
+      }
+    ]
+  }
+
+Minimum permissions explained:
+  s3:PutObject    — write Parquet archive files
+  s3:GetObject    — read back archive files
+  s3:ListBucket   — enumerate archived partitions
+  s3:DeleteObject — remove superseded archives (optional but recommended)
+
+`, partition, bucket, partition, bucket)
 }
 
 // s3Instructions returns a human-readable string with AWS CLI and console steps
