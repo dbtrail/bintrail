@@ -28,6 +28,7 @@ tables in the target MySQL database. The database is created if it does not exis
 var (
 	initIndexDSN   string
 	initPartitions int
+	initEncrypt    bool
 	initS3Bucket   string
 	initS3Region   string
 	initS3ARN      string
@@ -36,6 +37,7 @@ var (
 func init() {
 	initCmd.Flags().StringVar(&initIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	initCmd.Flags().IntVar(&initPartitions, "partitions", 48, "Number of hourly partitions to create; partitions span from (N-1) hours ago to the current hour so historical binlog events are properly distributed")
+	initCmd.Flags().BoolVar(&initEncrypt, "encrypt", false, "Enable InnoDB tablespace encryption on binlog_events (requires a keyring plugin on the MySQL server; adds ENCRYPTION='Y' to the table DDL)")
 	initCmd.Flags().StringVar(&initS3Bucket, "s3-bucket", "", "S3 bucket name to create for archiving (optional; mutually exclusive with --s3-arn)")
 	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket (required with --s3-bucket; ignored with --s3-arn since the SDK resolves the bucket region automatically)")
 	initCmd.Flags().StringVar(&initS3ARN, "s3-arn", "", "ARN of an existing S3 bucket to use for archiving (optional; mutually exclusive with --s3-bucket)")
@@ -89,7 +91,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create binlog_events with dynamic hourly partitions.
-	if err := createBinlogEventsTable(db, initPartitions); err != nil {
+	if err := createBinlogEventsTable(db, initPartitions, initEncrypt); err != nil {
 		return fmt.Errorf("failed to create binlog_events: %w", err)
 	}
 	fmt.Println("  ✓ binlog_events")
@@ -366,16 +368,16 @@ func buildPartitionDefs(now time.Time, numPartitions int) []string {
 	return parts
 }
 
-// createBinlogEventsTable generates the CREATE TABLE with N hourly partitions
-// spanning from (N-1) hours ago to the current hour (UTC), plus a p_future
-// catch-all partition for any events arriving in subsequent hours.
-//
-// Each partition p_YYYYMMDDHH covers events where TO_SECONDS(event_timestamp)
-// is less than TO_SECONDS of the following hour (timezone-independent).
-func createBinlogEventsTable(db *sql.DB, numPartitions int) error {
-	parts := buildPartitionDefs(time.Now(), numPartitions)
-
-	ddl := `CREATE TABLE IF NOT EXISTS binlog_events (
+// buildBinlogEventsDDL assembles the full CREATE TABLE statement for
+// binlog_events. When encrypt is true, ENCRYPTION='Y' is added to the table
+// options so MySQL uses InnoDB tablespace encryption (requires a keyring
+// plugin on the server).
+func buildBinlogEventsDDL(parts []string, encrypt bool) string {
+	encryptClause := ""
+	if encrypt {
+		encryptClause = " ENCRYPTION='Y'"
+	}
+	return `CREATE TABLE IF NOT EXISTS binlog_events (
     event_id        BIGINT UNSIGNED AUTO_INCREMENT,
     binlog_file     VARCHAR(255)     NOT NULL,
     start_pos       BIGINT UNSIGNED  NOT NULL,
@@ -395,11 +397,23 @@ func createBinlogEventsTable(db *sql.DB, numPartitions int) error {
     INDEX idx_pk_hash    (schema_name, table_name, pk_hash, event_timestamp),
     INDEX idx_gtid       (gtid),
     INDEX idx_file_pos   (binlog_file, start_pos)
-) ENGINE=InnoDB
+) ENGINE=InnoDB` + encryptClause + `
   PARTITION BY RANGE (TO_SECONDS(event_timestamp)) (
 ` + strings.Join(parts, ",\n") + `
 )`
+}
 
+// createBinlogEventsTable generates the CREATE TABLE with N hourly partitions
+// spanning from (N-1) hours ago to the current hour (UTC), plus a p_future
+// catch-all partition for any events arriving in subsequent hours.
+//
+// Each partition p_YYYYMMDDHH covers events where TO_SECONDS(event_timestamp)
+// is less than TO_SECONDS of the following hour (timezone-independent).
+// When encrypt is true, ENCRYPTION='Y' is added to enable InnoDB tablespace
+// encryption (requires a keyring plugin on the MySQL server).
+func createBinlogEventsTable(db *sql.DB, numPartitions int, encrypt bool) error {
+	parts := buildPartitionDefs(time.Now(), numPartitions)
+	ddl := buildBinlogEventsDDL(parts, encrypt)
 	_, err := db.Exec(ddl)
 	return err
 }

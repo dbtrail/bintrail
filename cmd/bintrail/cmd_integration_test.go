@@ -339,7 +339,7 @@ func TestLoadPartitionStats(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
 	// Create table with 3 daily partitions + p_future.
-	if err := createBinlogEventsTable(db, 3); err != nil {
+	if err := createBinlogEventsTable(db, 3, false); err != nil {
 		t.Fatalf("createBinlogEventsTable failed: %v", err)
 	}
 
@@ -404,7 +404,7 @@ func TestEnsureDatabase(t *testing.T) {
 func TestCreateBinlogEventsTable(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
-	if err := createBinlogEventsTable(db, 3); err != nil {
+	if err := createBinlogEventsTable(db, 3, false); err != nil {
 		t.Fatalf("createBinlogEventsTable failed: %v", err)
 	}
 
@@ -426,7 +426,7 @@ func TestCreateBinlogEventsTable(t *testing.T) {
 func TestListPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
-	if err := createBinlogEventsTable(db, 3); err != nil {
+	if err := createBinlogEventsTable(db, 3, false); err != nil {
 		t.Fatalf("createBinlogEventsTable failed: %v", err)
 	}
 
@@ -457,7 +457,7 @@ func TestListPartitions(t *testing.T) {
 func TestDropPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
-	if err := createBinlogEventsTable(db, 5); err != nil {
+	if err := createBinlogEventsTable(db, 5, false); err != nil {
 		t.Fatalf("createBinlogEventsTable failed: %v", err)
 	}
 
