@@ -480,6 +480,8 @@ Whichever approach you use, the IAM role or user running bintrail needs these pe
 }
 ```
 
+The example above uses the standard `aws` partition. If your bucket is in AWS China (`aws-cn`) or GovCloud (`aws-us-gov`), replace `arn:aws:s3:::` with `arn:aws-cn:s3:::` or `arn:aws-us-gov:s3:::` in both resource lines. When you use `--s3-arn`, bintrail extracts the correct partition from the ARN and prints an already-correct policy in the warning output.
+
 If you used `--s3-bucket` to let bintrail create the bucket, it also needs `s3:CreateBucket`, `s3:PutBucketPublicAccessBlock`, and `s3:PutLifecycleConfiguration` at creation time — these can be removed from the policy afterwards.
 
 **AWS credentials:** bintrail uses the standard AWS credential chain — environment variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, or the EC2/ECS instance metadata service. No extra configuration is needed when running on an EC2 instance with an IAM instance profile that has the policy above attached.

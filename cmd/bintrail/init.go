@@ -37,7 +37,7 @@ func init() {
 	initCmd.Flags().StringVar(&initIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	initCmd.Flags().IntVar(&initPartitions, "partitions", 48, "Number of hourly partitions to create starting from the current hour")
 	initCmd.Flags().StringVar(&initS3Bucket, "s3-bucket", "", "S3 bucket name to create for archiving (optional; mutually exclusive with --s3-arn)")
-	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket (used with --s3-bucket or --s3-arn)")
+	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket (required with --s3-bucket; ignored with --s3-arn since the SDK resolves the bucket region automatically)")
 	initCmd.Flags().StringVar(&initS3ARN, "s3-arn", "", "ARN of an existing S3 bucket to use for archiving (optional; mutually exclusive with --s3-bucket)")
 	_ = initCmd.MarkFlagRequired("index-dsn")
 
