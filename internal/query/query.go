@@ -42,7 +42,7 @@ type ResultRow struct {
 	StartPos       uint64
 	EndPos         uint64
 	EventTimestamp time.Time
-	GTID           *string        // nil when GTID not enabled on the source
+	GTID           *string // nil when GTID not enabled on the source
 	SchemaName     string
 	TableName      string
 	EventType      parser.EventType

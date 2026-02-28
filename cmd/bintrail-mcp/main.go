@@ -337,4 +337,3 @@ func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changed
 		Limit:         limit,
 	}, nil
 }
-

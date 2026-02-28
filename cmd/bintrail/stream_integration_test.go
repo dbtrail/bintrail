@@ -563,10 +563,10 @@ func TestStreamLoop_gtidAccumulation(t *testing.T) {
 	acc := gs.(*gomysql.MysqlGTIDSet)
 
 	state := &streamState{
-		mode:    "gtid",
+		mode:     "gtid",
 		serverID: 1,
-		accGTID: acc,
-		gtidSet: uuid + ":1",
+		accGTID:  acc,
+		gtidSet:  uuid + ":1",
 	}
 
 	ts := time.Now().UTC()

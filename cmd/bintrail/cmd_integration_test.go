@@ -5,11 +5,15 @@ package main
 import (
 	"context"
 	"database/sql"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/parquet-go/parquet-go"
 
+	"github.com/bintrail/bintrail/internal/archive"
 	"github.com/bintrail/bintrail/internal/status"
 	"github.com/bintrail/bintrail/internal/testutil"
 )
@@ -551,3 +555,85 @@ func TestAddFuturePartitions(t *testing.T) {
 	}
 }
 
+// ─── ArchivePartition ─────────────────────────────────────────────────────────
+
+func TestArchivePartition(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db) // creates binlog_events with only p_future
+
+	// Insert two events; they land in p_future since InitIndexTables creates
+	// only a p_future catch-all partition.
+	now := time.Now().UTC()
+	ts := now.Format("2006-01-02 15:04:05")
+	gtid := "abc:1"
+	testutil.InsertEvent(t, db,
+		"binlog.000001", 100, 200, ts, &gtid,
+		"mydb", "orders", 1, "42",
+		nil, nil, []byte(`{"id":42}`),
+	)
+	testutil.InsertEvent(t, db,
+		"binlog.000001", 200, 300, ts, nil,
+		"mydb", "orders", 3, "43",
+		nil, []byte(`{"id":43}`), nil,
+	)
+
+	outDir := t.TempDir()
+	outPath := filepath.Join(outDir, "p_future.parquet")
+
+	n, err := archive.ArchivePartition(context.Background(), db, dbName, "p_future", outPath, "none")
+	if err != nil {
+		t.Fatalf("ArchivePartition: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expected 2 rows archived, got %d", n)
+	}
+
+	// Verify the file exists.
+	if _, err := os.Stat(outPath); err != nil {
+		t.Fatalf("parquet file not created: %v", err)
+	}
+
+	// Read back and verify row count and metadata.
+	rf, err := os.Open(outPath)
+	if err != nil {
+		t.Fatalf("open parquet file: %v", err)
+	}
+	defer rf.Close()
+	info, _ := rf.Stat()
+	pf, err := parquet.OpenFile(rf, info.Size())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+
+	if pf.NumRows() != 2 {
+		t.Errorf("NumRows = %d, want 2", pf.NumRows())
+	}
+
+	got, ok := pf.Lookup("bintrail.archive.partition")
+	if !ok {
+		t.Error("expected bintrail.archive.partition metadata key")
+	} else if got != "p_future" {
+		t.Errorf("archive.partition = %q, want p_future", got)
+	}
+}
+
+func TestArchivePartition_empty(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	outDir := t.TempDir()
+	outPath := filepath.Join(outDir, "p_future.parquet")
+
+	n, err := archive.ArchivePartition(context.Background(), db, dbName, "p_future", outPath, "none")
+	if err != nil {
+		t.Fatalf("ArchivePartition on empty partition: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 rows for empty partition, got %d", n)
+	}
+
+	// File should still be created (valid empty Parquet).
+	if _, err := os.Stat(outPath); err != nil {
+		t.Fatalf("parquet file not created for empty partition: %v", err)
+	}
+}

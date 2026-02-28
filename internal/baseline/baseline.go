@@ -103,13 +103,15 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 
 			outPath := filepath.Join(cfg.OutputDir, tsDir, tf.Database, tf.Table+".parquet")
 			writerCfg := WriterConfig{
-				Compression:       compression,
-				RowGroupSize:      rowGroupSize,
-				SnapshotTimestamp: tsStr,
-				SourceDatabase:    tf.Database,
-				SourceTable:       tf.Table,
-				MydumperFormat:    tf.Format,
-				BintrailVersion:   Version,
+				Compression:  compression,
+				RowGroupSize: rowGroupSize,
+				Metadata: map[string]string{
+					"bintrail.snapshot_timestamp": tsStr,
+					"bintrail.source_database":    tf.Database,
+					"bintrail.source_table":       tf.Table,
+					"bintrail.mydumper_format":    tf.Format,
+					"bintrail.bintrail_version":   Version,
+				},
 			}
 
 			n, err := processTable(ctx, tf, outPath, writerCfg)
@@ -155,8 +157,8 @@ func processTable(ctx context.Context, tf TableFiles, outPath string, cfg Writer
 	var closed bool
 	defer func() {
 		if !closed {
-			w.Close()           //nolint
-			os.Remove(outPath)  // remove partial file
+			w.Close()          //nolint
+			os.Remove(outPath) // remove partial file
 		}
 	}()
 

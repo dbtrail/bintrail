@@ -27,9 +27,9 @@ func DiscoverTables(inputDir string) ([]TableFiles, error) {
 	}
 
 	type tableKey struct{ db, table string }
-	schemas := make(map[tableKey]string)       // key → schema file path
-	data := make(map[tableKey][]string)        // key → data file paths
-	formats := make(map[tableKey]string)       // key → "sql" or "tab"
+	schemas := make(map[tableKey]string) // key → schema file path
+	data := make(map[tableKey][]string)  // key → data file paths
+	formats := make(map[tableKey]string) // key → "sql" or "tab"
 
 	for _, e := range entries {
 		if e.IsDir() {

@@ -341,9 +341,15 @@ func TestEndToEnd_fullPipeline(t *testing.T) {
 	}
 
 	// ── 13. bintrail rotate ──────────────────────────────────────────────────
+	archiveDir := filepath.Join(tmpDir, "archives")
+	if err := os.MkdirAll(archiveDir, 0755); err != nil {
+		t.Fatalf("failed to create archive dir: %v", err)
+	}
 	rotateOut := run(t, binPath, coverDir, "rotate",
 		"--index-dsn", indexDSN,
 		"--add-future", "3",
+		"--archive-dir", archiveDir,
+		"--archive-compression", "none",
 	)
 	// rotate writes "added partition p_YYYYMMDD" lines to stdout.
 	if !strings.Contains(rotateOut, "added partition") {

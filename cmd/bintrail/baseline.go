@@ -27,11 +27,11 @@ Output structure:
 }
 
 var (
-	bslInput       string
-	bslOutput      string
-	bslTimestamp   string
-	bslTables      string
-	bslCompression string
+	bslInput        string
+	bslOutput       string
+	bslTimestamp    string
+	bslTables       string
+	bslCompression  string
 	bslRowGroupSize int
 )
 

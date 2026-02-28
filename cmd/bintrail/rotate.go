@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/bintrail/bintrail/internal/archive"
 	"github.com/bintrail/bintrail/internal/config"
 )
 
@@ -37,15 +39,19 @@ Examples:
 }
 
 var (
-	rotIndexDSN  string
-	rotRetain    string
-	rotAddFuture int
+	rotIndexDSN           string
+	rotRetain             string
+	rotAddFuture          int
+	rotArchiveDir         string
+	rotArchiveCompression string
 )
 
 func init() {
 	rotateCmd.Flags().StringVar(&rotIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	rotateCmd.Flags().StringVar(&rotRetain, "retain", "", "Drop partitions older than this duration (e.g. 7d, 24h)")
 	rotateCmd.Flags().IntVar(&rotAddFuture, "add-future", 0, "Number of daily partitions to add for future dates")
+	rotateCmd.Flags().StringVar(&rotArchiveDir, "archive-dir", "", "Directory to write Parquet archives before dropping partitions (empty = no archiving)")
+	rotateCmd.Flags().StringVar(&rotArchiveCompression, "archive-compression", "zstd", "Compression for archive Parquet files (zstd, snappy, gzip, none)")
 	_ = rotateCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(rotateCmd)
@@ -108,6 +114,18 @@ func runRotate(cmd *cobra.Command, args []string) error {
 		if len(toDrop) == 0 {
 			fmt.Fprintf(os.Stdout, "no partitions older than %s to drop\n", rotRetain)
 		} else {
+			// Archive partitions to Parquet before dropping, if requested.
+			if rotArchiveDir != "" {
+				for _, name := range toDrop {
+					outPath := filepath.Join(rotArchiveDir, name+".parquet")
+					n, err := archive.ArchivePartition(ctx, db, dbName, name, outPath, rotArchiveCompression)
+					if err != nil {
+						return fmt.Errorf("archive partition %s: %w", name, err)
+					}
+					fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) → %s\n", name, n, outPath)
+				}
+			}
+
 			if err := dropPartitions(ctx, db, dbName, toDrop); err != nil {
 				return fmt.Errorf("failed to drop partitions: %w", err)
 			}
