@@ -4,6 +4,90 @@ Bintrail indexes every INSERT, UPDATE, and DELETE from MySQL ROW-format binary l
 
 ---
 
+## 0. Where to Run Bintrail
+
+Where you install and run the `bintrail` binary depends on which indexing mode you use.
+
+---
+
+### Mode A: File-based indexing (`bintrail index`)
+
+`bintrail index` reads binlog files directly from the local filesystem using `--binlog-dir`. There is **no remote file access** — the path must be readable by the process running bintrail.
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Host with access to binlog files                   │
+│                                                     │
+│  /var/lib/mysql/binlog.000042   ◄──── bintrail      │
+│  /var/lib/mysql/binlog.000043         index         │
+└─────────────────────────────────────────────────────┘
+                                             │
+                                             │ TCP (MySQL protocol)
+                                             ▼
+                                    ┌─────────────────┐
+                                    │  Index Database  │
+                                    │  (binlog_index)  │
+                                    └─────────────────┘
+```
+
+**Typical deployment locations:**
+
+| Where to run bintrail | When to use it |
+|---|---|
+| On the MySQL server itself | Simplest option for self-managed MySQL. `--binlog-dir /var/lib/mysql`. |
+| On a replica host | If the replica has relay logs enabled and you want to avoid load on the primary. |
+| On any host with an NFS/CIFS mount | Mount the MySQL data directory read-only and point `--binlog-dir` at the mount point. |
+| Inside a Docker container | Mount the binlog directory read-only: `-v /var/lib/mysql:/var/lib/mysql:ro`. |
+| After copying files with rsync/SCP | Copy binlog files to a staging directory, run bintrail there, delete afterwards. |
+
+**What does NOT work:**
+
+- Pointing `--binlog-dir` at an SSH or SFTP path (`/ssh/host/var/lib/mysql`) — the flag is a plain filesystem path
+- Pointing `--binlog-dir` at a remote HTTP or object-storage URL
+- Running bintrail on a machine with no access to the binlog files and hoping `--source-dsn` provides them — `--source-dsn` is only used for schema metadata and format validation, not for reading binlog file content
+
+**Bintrail never modifies binlog files.** It opens them read-only. It is safe to point `--binlog-dir` at the live MySQL data directory.
+
+---
+
+### Mode B: Replication streaming (`bintrail stream`)
+
+`bintrail stream` connects to MySQL over the standard network replication protocol, receiving binlog events as they are committed. It requires **no access to binlog files on disk** — only a TCP connection to MySQL with a replication-privileged user.
+
+```
+                    TCP (MySQL replication protocol)
+bintrail stream ────────────────────────────────► Source MySQL
+                                                  (any location)
+       │
+       │ TCP (MySQL protocol)
+       ▼
+┌─────────────────┐
+│  Index Database  │
+│  (binlog_index)  │
+└─────────────────┘
+```
+
+**Bintrail can run anywhere** that has a TCP path to the source MySQL server — your laptop, a CI runner, a separate host, or a container.
+
+This is the required mode for managed MySQL services (Amazon RDS, Aurora, Google Cloud SQL, PlanetScale) where binlog files are not accessible on disk.
+
+---
+
+### Choosing a mode
+
+| | `bintrail index` | `bintrail stream` |
+|---|---|---|
+| **Requires filesystem access** | Yes — binlog files must be readable locally | No |
+| **Requires MySQL TCP access** | Optional (for validation + auto-snapshot) | Yes (always) |
+| **Works with managed MySQL** | No (no disk access on RDS/Aurora) | Yes |
+| **Backfills historical data** | Yes — indexes any binlog file, including archived ones | No — only events from the starting position forward |
+| **Suitable for one-off catchup** | Yes (run and exit) | No (long-running process) |
+| **Suitable for continuous indexing** | Yes (cron or timer) | Yes (runs indefinitely, self-checkpoints) |
+
+You can use **both modes together**: use `bintrail index` to backfill historical binlog files, then switch to `bintrail stream` for ongoing real-time indexing from the current position.
+
+---
+
 ## 1. Setup Checklist
 
 Before you start:
