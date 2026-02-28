@@ -121,7 +121,7 @@ Expected output:
 ```
 Database "binlog_index" created (or already exists).
 Tables created: binlog_events, schema_snapshots, index_state
-Partitions created: 7 daily partitions + p_future catch-all
+Partitions created: 48 hourly partitions + p_future catch-all
 ```
 
 **Step 2 — Snapshot schema metadata:**
@@ -396,26 +396,26 @@ The JSON output includes `row_before` and `row_after` for every event, giving a 
 bintrail status --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 ```
 
-The output shows each partition, its date range, and estimated row counts. Identify how many days of history you're holding.
+The output shows each partition, its hour boundary, and estimated row counts. Identify how many hours of history you're holding.
 
 **Drop old partitions:**
 
 ```sh
-# Keep last 7 days, add 3 new future partitions
+# Keep last 7 days (168 hours), add 48 new future partitions (2 days)
 bintrail rotate \
   --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --retain     7d \
-  --add-future 3
+  --retain     168h \
+  --add-future 48
 ```
 
-Partitions older than 7 days are dropped in a single `ALTER TABLE … DROP PARTITION` statement — much faster than `DELETE` on InnoDB.
+Partitions older than the retain threshold are dropped in a single `ALTER TABLE … DROP PARTITION` statement — much faster than `DELETE` on InnoDB.
 
 **Extend the partition range** if the `p_future` catch-all is holding data:
 
 ```sh
 bintrail rotate \
   --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --add-future 14
+  --add-future 48
 ```
 
 ---
