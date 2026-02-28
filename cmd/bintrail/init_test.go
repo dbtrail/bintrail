@@ -118,6 +118,9 @@ func TestBuildBinlogEventsDDL_withEncrypt(t *testing.T) {
 	if !strings.Contains(ddl, "ENCRYPTION='Y'") {
 		t.Error("expected ENCRYPTION='Y' in DDL when encrypt=true")
 	}
+	if !strings.Contains(ddl, "p_future") {
+		t.Error("expected p_future partition in DDL")
+	}
 	// Encryption clause must appear after ENGINE=InnoDB and before PARTITION BY.
 	engineIdx := strings.Index(ddl, "ENGINE=InnoDB")
 	encryptIdx := strings.Index(ddl, "ENCRYPTION='Y'")

@@ -94,22 +94,38 @@ func runInit(cmd *cobra.Command, args []string) error {
 	if err := createBinlogEventsTable(db, initPartitions, initEncrypt); err != nil {
 		return fmt.Errorf("failed to create binlog_events: %w", err)
 	}
-	fmt.Println("  ✓ binlog_events")
+	fmt.Println("  \u2713 binlog_events")
+
+	// If --encrypt was requested, verify that the table actually has encryption
+	// enabled. CREATE TABLE IF NOT EXISTS is a no-op when the table already
+	// exists, so a pre-existing unencrypted table will silently remain
+	// unencrypted. Warn the operator so they can encrypt it manually.
+	if initEncrypt {
+		var createOpts string
+		row := db.QueryRowContext(cmd.Context(),
+			`SELECT COALESCE(CREATE_OPTIONS, '') FROM information_schema.TABLES
+			 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'binlog_events'`)
+		if err := row.Scan(&createOpts); err == nil &&
+			!strings.Contains(strings.ToUpper(createOpts), "ENCRYPTION=Y") {
+			fmt.Fprintf(os.Stderr, "Warning: binlog_events already exists without encryption.\n"+
+				"To encrypt it, run: ALTER TABLE binlog_events ENCRYPTION='Y'\n")
+		}
+	}
 
 	if _, err := db.Exec(ddlSchemaSnapshots); err != nil {
 		return fmt.Errorf("failed to create schema_snapshots: %w", err)
 	}
-	fmt.Println("  ✓ schema_snapshots")
+	fmt.Println("  \u2713 schema_snapshots")
 
 	if _, err := db.Exec(ddlIndexState); err != nil {
 		return fmt.Errorf("failed to create index_state: %w", err)
 	}
-	fmt.Println("  ✓ index_state")
+	fmt.Println("  \u2713 index_state")
 
 	if _, err := db.Exec(ddlStreamState); err != nil {
 		return fmt.Errorf("failed to create stream_state: %w", err)
 	}
-	fmt.Println("  ✓ stream_state")
+	fmt.Println("  \u2713 stream_state")
 
 	if initS3Bucket != "" {
 		fmt.Printf("\nSetting up S3 bucket...\n")
@@ -117,7 +133,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "Warning: could not create S3 bucket %q: %v\n\n", initS3Bucket, err)
 			fmt.Fprint(os.Stderr, s3Instructions(initS3Bucket, initS3Region))
 		} else {
-			fmt.Printf("  ✓ S3 bucket: %s (region: %s)\n", initS3Bucket, initS3Region)
+			fmt.Printf("  \u2713 S3 bucket: %s (region: %s)\n", initS3Bucket, initS3Region)
 		}
 	}
 
@@ -127,7 +143,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "Warning: could not verify S3 bucket %q: %v\n\n", s3ARNBucket, err)
 			fmt.Fprint(os.Stderr, s3IAMInstructions(s3ARNBucket, s3ARNPartition))
 		} else {
-			fmt.Printf("  ✓ S3 bucket: %s (ARN: %s)\n", s3ARNBucket, initS3ARN)
+			fmt.Printf("  \u2713 S3 bucket: %s (ARN: %s)\n", s3ARNBucket, initS3ARN)
 		}
 	}
 
