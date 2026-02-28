@@ -20,12 +20,14 @@ cmd/bintrail/          # One file per command
   rotate.go            # bintrail rotate + partition helpers
   status.go            # bintrail status
   stream.go            # bintrail stream (live replication indexing)
+  dump.go              # bintrail dump (invoke mydumper; lockfile, schema/table filters)
   index_test.go        # Unit tests for binlogFileRe, buildIndexFilters, resolveFiles, findBinlogFiles
   query_test.go        # Unit tests for queryCmd cobra wiring + runQuery validation logic
   recover_test.go      # Unit tests for recoverCmd cobra wiring + runRecover validation logic
   snapshot_test.go     # Unit tests for parseSchemaList
   rotate_test.go       # Unit tests for parseRetain, partitionDate, partitionName, nextPartitionStart + cobra wiring
   stream_test.go       # Unit tests for parseSourceDSN, resolveStart, GTID accumulation, cobra wiring
+  dump_test.go         # Unit tests for dumpCmd cobra wiring, buildMydumperArgs, lock mechanism, extractSchemasFromTables
   cmd_integration_test.go             # Integration tests (//go:build integration) for all DB helpers
   stream_integration_test.go          # Integration tests for stream_state persistence and streamLoop behaviour
 
@@ -84,8 +86,9 @@ Global persistent flags (all commands via `rootCmd.PersistentFlags`):
 | `status` | `status.go` | `--index-dsn` (req) |
 | `stream` | `stream.go` | … + `--metrics-addr` (e.g. `:9090`; empty = disabled) |
 | `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint` |
+| `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path` (default `mydumper`), `--threads` (default 4) |
 
-Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `stIndexDSN`, `strmIndexDSN`).
+Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `stIndexDSN`, `strmIndexDSN`, `dmpSourceDSN`).
 
 Filter helpers (`ParseEventType`, `ParseTime`, `IsValidFormat`) live in `internal/cliutil` and are shared by both `cmd/bintrail/` commands and `cmd/bintrail-mcp/`.
 
@@ -264,6 +267,20 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent w
 
 ### parseTime=true in connections
 `config.Connect` always injects `parseTime=true` via `mysql.ParseDSN` → `cfg.ParseTime = true` → `cfg.FormatDSN()`. Without this, go-sql-driver returns DATETIME columns as `[]uint8` (raw bytes) instead of `time.Time`, causing scan errors. Do not use raw `sql.Open("mysql", dsn)` in commands that read DATETIME columns — always go through `config.Connect`.
+
+### dump command: lockfile and mydumper args
+
+`dump.go` enforces single-concurrency via a lockfile at `os.TempDir()/bintrail-dump.lock`:
+- `acquireDumpLock()` uses `O_CREATE|O_EXCL|O_WRONLY` for atomic creation and writes the current PID. On `ErrExist`, reads the PID, probes liveness with `syscall.Signal(0)`, removes stale locks, and retries once.
+- `releaseDumpLock(f)` closes and removes the file.
+- `var dumpLockDir = os.TempDir` stores the function (not its result) so tests can override it with a `t.TempDir()` closure.
+
+`buildMydumperArgs` maps Go args to mydumper CLI flags:
+- Always: `--host`, `--port`, `--user`, `--outputdir`, `--threads`, `--compress-protocol`, `--complete-insert`
+- Single schema → `--database schema`; multiple schemas → `--regex ^(s1|s2)\.`
+- Tables → `--tables-list t1,t2`
+
+`extractSchemasFromTables(tables []string) []string` derives unique schema names from `db.table` entries (used when `--tables` is given without `--schemas`).
 
 ### Recovery SQL generation
 - `recover` only generates SQL (`--dry-run` to stdout, `--output` to file) — it never executes against the source database. Application is always a manual step.
