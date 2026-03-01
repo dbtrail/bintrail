@@ -75,6 +75,40 @@ CREATE TABLE IF NOT EXISTS schema_snapshots (
 -- NewResolver(db, 0) loads the latest snapshot; NewResolver(db, N) loads snapshot N.
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Server identity tables
+-- bintrail_id is the stable, Bintrail-generated UUID for each MySQL server.
+-- Identity resolution rules absorb individual component changes (UUID regen,
+-- host migration, username rotation) while preserving the bintrail_id.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS bintrail_servers (
+    bintrail_id       CHAR(36)     NOT NULL,
+    server_uuid       CHAR(36)     NOT NULL,
+    host              VARCHAR(255) NOT NULL,
+    port              INT UNSIGNED NOT NULL DEFAULT 3306,
+    username          VARCHAR(255) NOT NULL,
+    created_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    decommissioned_at TIMESTAMP    NULL DEFAULT NULL,
+    PRIMARY KEY (bintrail_id),
+    INDEX idx_server_uuid    (server_uuid),
+    INDEX idx_host_port_user (host, port, username)
+) ENGINE=InnoDB;
+-- Note: no foreign keys — bintrail never uses FKs.
+
+CREATE TABLE IF NOT EXISTS bintrail_server_changes (
+    id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    bintrail_id   CHAR(36)        NOT NULL,
+    field_changed ENUM('server_uuid','host','port','username') NOT NULL,
+    old_value     VARCHAR(255)    NOT NULL,
+    new_value     VARCHAR(255)    NOT NULL,
+    detected_at   TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    INDEX idx_bintrail_id (bintrail_id),
+    INDEX idx_detected_at (detected_at)
+) ENGINE=InnoDB;
+-- Append-only audit trail. Never delete or update rows in this table.
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Index state table
 -- Tracks which binlog files have been indexed to prevent re-processing.
 -- ─────────────────────────────────────────────────────────────────────────────

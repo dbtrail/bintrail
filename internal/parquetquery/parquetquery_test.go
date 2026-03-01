@@ -16,11 +16,15 @@ func TestBuildGlob(t *testing.T) {
 		source string
 		want   string
 	}{
-		{"/data/archives", "/data/archives/*.parquet"},
-		{"/data/archives/", "/data/archives/*.parquet"},
-		{"/data/archives/p_2026020100.parquet", "/data/archives/p_2026020100.parquet"},
-		{"s3://bucket/prefix", "s3://bucket/prefix/*.parquet"},
-		{"s3://bucket/prefix/", "s3://bucket/prefix/*.parquet"},
+		{"/data/archives", "/data/archives/**/*.parquet"},
+		{"/data/archives/", "/data/archives/**/*.parquet"},
+		// Hive-partitioned path scoped to one server
+		{"/data/archives/bintrail_id=abc-123", "/data/archives/bintrail_id=abc-123/**/*.parquet"},
+		// Single file: returned as-is.
+		{"/data/archives/events_14.parquet", "/data/archives/events_14.parquet"},
+		{"s3://bucket/prefix", "s3://bucket/prefix/**/*.parquet"},
+		{"s3://bucket/prefix/", "s3://bucket/prefix/**/*.parquet"},
+		{"s3://bucket/prefix/bintrail_id=abc-123", "s3://bucket/prefix/bintrail_id=abc-123/**/*.parquet"},
 		{"s3://bucket/prefix/*.parquet", "s3://bucket/prefix/*.parquet"},
 	}
 	for _, tc := range tests {

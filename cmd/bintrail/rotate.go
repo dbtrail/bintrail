@@ -53,6 +53,7 @@ var (
 	rotNoReplace          bool
 	rotArchiveDir         string
 	rotArchiveCompression string
+	rotBintrailID         string
 )
 
 func init() {
@@ -60,8 +61,9 @@ func init() {
 	rotateCmd.Flags().StringVar(&rotRetain, "retain", "", "Drop partitions older than this duration (e.g. 7d, 24h)")
 	rotateCmd.Flags().IntVar(&rotAddFuture, "add-future", 0, "Extra hourly partitions to add beyond auto-replacements (0 = only add replacements for dropped partitions)")
 	rotateCmd.Flags().BoolVar(&rotNoReplace, "no-replace", false, "Do not auto-add future partitions to replace dropped ones")
-	rotateCmd.Flags().StringVar(&rotArchiveDir, "archive-dir", "", "Directory to write Parquet archives before dropping partitions (empty = no archiving)")
+	rotateCmd.Flags().StringVar(&rotArchiveDir, "archive-dir", "", "Directory to write Parquet archives before dropping partitions (required with --bintrail-id)")
 	rotateCmd.Flags().StringVar(&rotArchiveCompression, "archive-compression", "zstd", "Compression for archive Parquet files (zstd, snappy, gzip, none)")
+	rotateCmd.Flags().StringVar(&rotBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir is set); archives are written under bintrail_id=<uuid>/event_date=<date>/")
 	_ = rotateCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(rotateCmd)
@@ -72,6 +74,9 @@ func runRotate(cmd *cobra.Command, args []string) error {
 
 	if rotRetain == "" && rotAddFuture == 0 {
 		return fmt.Errorf("at least one of --retain or --add-future is required")
+	}
+	if rotArchiveDir != "" && rotBintrailID == "" {
+		return fmt.Errorf("--bintrail-id is required when --archive-dir is set")
 	}
 
 	var retainDur time.Duration
@@ -127,7 +132,13 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			// Archive partitions to Parquet before dropping, if requested.
 			if rotArchiveDir != "" {
 				for _, name := range toDrop {
-					outPath := filepath.Join(rotArchiveDir, name+".parquet")
+					outPath, err := hiveArchivePath(rotArchiveDir, rotBintrailID, name)
+					if err != nil {
+						return fmt.Errorf("build archive path for %s: %w", name, err)
+					}
+					if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+						return fmt.Errorf("create archive directory for %s: %w", name, err)
+					}
 					n, err := archive.ArchivePartition(ctx, db, dbName, name, outPath, rotArchiveCompression)
 					if err != nil {
 						return fmt.Errorf("archive partition %s: %w", name, err)
@@ -186,6 +197,26 @@ func runRotate(cmd *cobra.Command, args []string) error {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// hiveArchivePath returns the Hive-partitioned path for a binlog_events partition
+// archive. The layout is:
+//
+//	<archiveDir>/bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/events_<HH>.parquet
+//
+// Each hourly partition maps to exactly one file. The hour suffix disambiguates
+// multiple files under the same event_date= directory.
+func hiveArchivePath(archiveDir, bintrailID, partitionName string) (string, error) {
+	d, ok := partitionDate(partitionName)
+	if !ok {
+		return "", fmt.Errorf("cannot parse partition date from %q", partitionName)
+	}
+	return filepath.Join(
+		archiveDir,
+		"bintrail_id="+bintrailID,
+		"event_date="+d.UTC().Format("2006-01-02"),
+		fmt.Sprintf("events_%02d.parquet", d.UTC().Hour()),
+	), nil
+}
 
 // parseRetain parses a retain string like "7d" or "24h" into a time.Duration.
 // Supported units: 'd' (days), 'h' (hours). The number must be a positive integer.

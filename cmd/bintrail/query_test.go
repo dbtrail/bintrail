@@ -270,7 +270,7 @@ func TestRunQuery_changedColWithSchemaOnly(t *testing.T) {
 // ─── archive flag wiring ──────────────────────────────────────────────────────
 
 func TestQueryCmd_archiveFlagsRegistered(t *testing.T) {
-	for _, name := range []string{"archive-dir", "archive-s3"} {
+	for _, name := range []string{"archive-dir", "archive-s3", "bintrail-id"} {
 		if queryCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on queryCmd", name)
 		}
@@ -278,7 +278,7 @@ func TestQueryCmd_archiveFlagsRegistered(t *testing.T) {
 }
 
 func TestQueryCmd_archiveFlagDefaults(t *testing.T) {
-	for _, name := range []string{"archive-dir", "archive-s3"} {
+	for _, name := range []string{"archive-dir", "archive-s3", "bintrail-id"} {
 		f := queryCmd.Flag(name)
 		if f == nil {
 			t.Fatalf("flag --%s not registered", name)
@@ -292,31 +292,36 @@ func TestQueryCmd_archiveFlagDefaults(t *testing.T) {
 // ─── archiveSources ──────────────────────────────────────────────────────────
 
 func TestArchiveSources_both(t *testing.T) {
-	savedDir, savedS3 := qArchiveDir, qArchiveS3
-	t.Cleanup(func() { qArchiveDir = savedDir; qArchiveS3 = savedS3 })
+	savedDir, savedS3, savedID := qArchiveDir, qArchiveS3, qBintrailID
+	t.Cleanup(func() { qArchiveDir = savedDir; qArchiveS3 = savedS3; qBintrailID = savedID })
 
 	qArchiveDir = "/data/archives"
 	qArchiveS3 = "s3://bucket/prefix"
+	qBintrailID = "abc-123"
 
 	srcs := archiveSources()
 	if len(srcs) != 2 {
 		t.Fatalf("expected 2 sources, got %d: %v", len(srcs), srcs)
 	}
-	if srcs[0] != "/data/archives" || srcs[1] != "s3://bucket/prefix" {
-		t.Errorf("unexpected sources: %v", srcs)
+	if srcs[0] != "/data/archives/bintrail_id=abc-123" {
+		t.Errorf("unexpected dir source: %q", srcs[0])
+	}
+	if srcs[1] != "s3://bucket/prefix/bintrail_id=abc-123" {
+		t.Errorf("unexpected s3 source: %q", srcs[1])
 	}
 }
 
 func TestArchiveSources_dirOnly(t *testing.T) {
-	savedDir, savedS3 := qArchiveDir, qArchiveS3
-	t.Cleanup(func() { qArchiveDir = savedDir; qArchiveS3 = savedS3 })
+	savedDir, savedS3, savedID := qArchiveDir, qArchiveS3, qBintrailID
+	t.Cleanup(func() { qArchiveDir = savedDir; qArchiveS3 = savedS3; qBintrailID = savedID })
 
 	qArchiveDir = "/data/archives"
 	qArchiveS3 = ""
+	qBintrailID = "abc-123"
 
 	srcs := archiveSources()
-	if len(srcs) != 1 || srcs[0] != "/data/archives" {
-		t.Errorf("expected [/data/archives], got %v", srcs)
+	if len(srcs) != 1 || srcs[0] != "/data/archives/bintrail_id=abc-123" {
+		t.Errorf("expected [/data/archives/bintrail_id=abc-123], got %v", srcs)
 	}
 }
 
