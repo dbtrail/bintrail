@@ -40,6 +40,10 @@ func NewStreamParser(resolver *metadata.Resolver, filters Filters, logger *slog.
 func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStreamer, out chan<- Event) error {
 	var currentFile string
 	var currentGTID string
+	var schemaVersion uint32
+	if sp.resolver != nil {
+		schemaVersion = uint32(sp.resolver.SnapshotID())
+	}
 
 	for {
 		binlogEv, err := streamer.GetEvent(ctx)
@@ -58,10 +62,12 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			currentGTID = formatGTID(ev.SID, ev.GNO)
 
 		case *replication.QueryEvent:
-			warnOnDDL(sp.logger, currentFile, binlogEv.Header.LogPos, string(ev.Query))
+			if warnOnDDL(sp.logger, currentFile, binlogEv.Header.LogPos, string(ev.Query)) {
+				schemaVersion++
+			}
 
 		case *replication.RowsEvent:
-			if err := handleRows(ctx, sp.logger, sp.resolver, &sp.filters, binlogEv, ev, currentFile, currentGTID, out); err != nil {
+			if err := handleRows(ctx, sp.logger, sp.resolver, &sp.filters, binlogEv, ev, currentFile, currentGTID, schemaVersion, out); err != nil {
 				if ctx.Err() != nil {
 					return nil // context cancelled during row processing
 				}

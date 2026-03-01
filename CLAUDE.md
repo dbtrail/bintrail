@@ -318,7 +318,7 @@ Flag variable prefix: `bsl` (e.g. `bslInput`, `bslOutput`, `bslCompression`).
 ### archive command: partition archiving pipeline
 
 `internal/archive/ArchivePartition(ctx, db, dbName, partition, outputPath, compression)` archives a single partition:
-- Defines 13 `binlog_events` columns (all non-generated — `pk_hash` is skipped)
+- Defines 14 `binlog_events` columns (all non-generated — `pk_hash` is skipped)
 - SELECTs from `binlog_events PARTITION (<name>) ORDER BY event_id`
 - Scans typed Go vars (`uint64`, `time.Time`, `sql.NullString`, `[]byte` for JSON)
 - Converts to `[]string` + `[]bool` nulls, calls `baseline.NewWriter` / `WriteRow` / `Close`

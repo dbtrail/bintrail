@@ -195,14 +195,16 @@ func TestWarnOnDDL_ddlStatements(t *testing.T) {
 		"ALTER TABLE orders ADD COLUMN foo INT",
 		"CREATE TABLE new_tbl (id INT)",
 		"DROP TABLE old_tbl",
-		"TRUNCATE orders",
 		"RENAME TABLE a TO b",
 	}
 	for _, stmt := range ddlStmts {
 		buf.Reset()
-		warnOnDDL(logger, "binlog.000001", 100, stmt)
+		got := warnOnDDL(logger, "binlog.000001", 100, stmt)
 		if buf.Len() == 0 {
 			t.Errorf("expected warning for DDL %q, got none", stmt)
+		}
+		if !got {
+			t.Errorf("warnOnDDL(%q) = false, want true", stmt)
 		}
 	}
 }
@@ -217,12 +219,16 @@ func TestWarnOnDDL_nonDDL(t *testing.T) {
 		"INSERT INTO orders VALUES (1)",
 		"UPDATE orders SET status = 'done'",
 		"SELECT 1",
+		"TRUNCATE orders", // TRUNCATE does not change schema structure
 	}
 	for _, stmt := range nonDDL {
 		buf.Reset()
-		warnOnDDL(logger, "binlog.000001", 100, stmt)
+		got := warnOnDDL(logger, "binlog.000001", 100, stmt)
 		if buf.Len() != 0 {
 			t.Errorf("expected no warning for non-DDL %q, got: %s", stmt, buf.String())
+		}
+		if got {
+			t.Errorf("warnOnDDL(%q) = true, want false", stmt)
 		}
 	}
 }
@@ -231,9 +237,12 @@ func TestWarnOnDDL_caseInsensitive(t *testing.T) {
 	var buf bytes.Buffer
 	logger := newTestLogger(&buf)
 
-	warnOnDDL(logger, "binlog.000001", 100, "alter table orders add column x int")
+	got := warnOnDDL(logger, "binlog.000001", 100, "alter table orders add column x int")
 	if !strings.Contains(buf.String(), "DDL detected") {
 		t.Errorf("expected DDL warning for lowercase DDL, got: %q", buf.String())
+	}
+	if !got {
+		t.Errorf("warnOnDDL(lowercase ALTER TABLE) = false, want true")
 	}
 }
 

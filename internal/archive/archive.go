@@ -14,7 +14,7 @@ import (
 	"github.com/bintrail/bintrail/internal/baseline"
 )
 
-// binlogEventColumns defines the 13 non-generated binlog_events columns in
+// binlogEventColumns defines the 14 non-generated binlog_events columns in
 // MySQL table order (pk_hash is a stored generated column and is omitted).
 var binlogEventColumns = []baseline.Column{
 	{Name: "event_id", MySQLType: "bigint", ParquetType: baseline.MysqlToParquetNode("bigint")},
@@ -30,6 +30,7 @@ var binlogEventColumns = []baseline.Column{
 	{Name: "changed_columns", MySQLType: "json", ParquetType: baseline.MysqlToParquetNode("json")},
 	{Name: "row_before", MySQLType: "json", ParquetType: baseline.MysqlToParquetNode("json")},
 	{Name: "row_after", MySQLType: "json", ParquetType: baseline.MysqlToParquetNode("json")},
+	{Name: "schema_version", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
 }
 
 // ArchivePartition writes all rows from the named partition of binlog_events
@@ -65,7 +66,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 	q := fmt.Sprintf(
 		"SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp,"+
 			" gtid, schema_name, table_name, event_type, pk_values,"+
-			" changed_columns, row_before, row_after"+
+			" changed_columns, row_before, row_after, schema_version"+
 			" FROM `%s`.`binlog_events` PARTITION (`%s`) ORDER BY event_id",
 		dbName, partition,
 	)
@@ -91,11 +92,12 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			changedColumns []byte // nil = NULL
 			rowBefore      []byte // nil = NULL
 			rowAfter       []byte // nil = NULL
+			schemaVersion  uint32
 		)
 		if err := rows.Scan(
 			&eventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
 			&gtid, &schemaName, &tableName, &eventType, &pkValues,
-			&changedColumns, &rowBefore, &rowAfter,
+			&changedColumns, &rowBefore, &rowAfter, &schemaVersion,
 		); err != nil {
 			return rowCount, fmt.Errorf("scan row: %w", err)
 		}
@@ -114,6 +116,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			string(changedColumns),
 			string(rowBefore),
 			string(rowAfter),
+			strconv.FormatUint(uint64(schemaVersion), 10),
 		}
 		nulls := []bool{
 			false, false, false, false, false,
@@ -122,6 +125,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			changedColumns == nil,
 			rowBefore == nil,
 			rowAfter == nil,
+			false, // schema_version is NOT NULL
 		}
 
 		if err := w.WriteRow(values, nulls); err != nil {
