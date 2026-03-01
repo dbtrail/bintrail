@@ -108,6 +108,9 @@ func TestBuildBinlogEventsDDL_noEncrypt(t *testing.T) {
 	if !strings.Contains(ddl, "p_future") {
 		t.Error("expected p_future partition in DDL")
 	}
+	if !strings.Contains(ddl, "schema_version") {
+		t.Error("expected schema_version column in DDL")
+	}
 }
 
 func TestBuildBinlogEventsDDL_withEncrypt(t *testing.T) {
@@ -120,6 +123,9 @@ func TestBuildBinlogEventsDDL_withEncrypt(t *testing.T) {
 	}
 	if !strings.Contains(ddl, "p_future") {
 		t.Error("expected p_future partition in DDL")
+	}
+	if !strings.Contains(ddl, "schema_version") {
+		t.Error("expected schema_version column in DDL")
 	}
 	// Encryption clause must appear after ENGINE=InnoDB and before PARTITION BY.
 	engineIdx := strings.Index(ddl, "ENGINE=InnoDB")

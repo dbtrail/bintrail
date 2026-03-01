@@ -32,17 +32,18 @@ const (
 // Event is a fully resolved binlog row event with column names attached.
 // It carries everything the indexer needs to write one row to binlog_events.
 type Event struct {
-	BinlogFile string
-	StartPos   uint64
-	EndPos     uint64
-	Timestamp  time.Time
-	GTID       string // empty when GTID is not enabled on the source
-	Schema     string
-	Table      string
-	EventType  EventType
-	PKValues   string         // pipe-delimited PK values in ordinal order
-	RowBefore  map[string]any // nil for INSERT
-	RowAfter   map[string]any // nil for DELETE
+	BinlogFile    string
+	StartPos      uint64
+	EndPos        uint64
+	Timestamp     time.Time
+	GTID          string // empty when GTID is not enabled on the source
+	Schema        string
+	Table         string
+	EventType     EventType
+	PKValues      string         // pipe-delimited PK values in ordinal order
+	RowBefore     map[string]any // nil for INSERT
+	RowAfter      map[string]any // nil for DELETE
+	SchemaVersion int            // resolver.SnapshotID() at parse time; incremented on each DDL detection
 }
 
 // ─── Filters ─────────────────────────────────────────────────────────────────
@@ -69,10 +70,11 @@ func (f *Filters) Matches(schema, table string) bool {
 
 // Parser reads binlog files and emits Events onto a channel.
 type Parser struct {
-	binlogDir string
-	resolver  *metadata.Resolver
-	filters   Filters
-	logger    *slog.Logger
+	binlogDir     string
+	resolver      *metadata.Resolver
+	filters       Filters
+	logger        *slog.Logger
+	schemaVersion int // starts at resolver.SnapshotID(); incremented on each DDL detection
 }
 
 // New creates a Parser that reads from binlogDir, resolves column names via
@@ -82,7 +84,13 @@ func New(binlogDir string, resolver *metadata.Resolver, filters Filters, logger 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Parser{binlogDir: binlogDir, resolver: resolver, filters: filters, logger: logger}
+	return &Parser{
+		binlogDir:     binlogDir,
+		resolver:      resolver,
+		filters:       filters,
+		logger:        logger,
+		schemaVersion: resolver.SnapshotID(),
+	}
 }
 
 // ParseFiles parses multiple binlog files in order, sending events to the channel.
@@ -120,10 +128,12 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			currentGTID = formatGTID(ev.SID, ev.GNO)
 
 		case *replication.QueryEvent:
-			warnOnDDL(p.logger, filename, binlogEv.Header.LogPos, string(ev.Query))
+			if warnOnDDL(p.logger, filename, binlogEv.Header.LogPos, string(ev.Query)) {
+				p.schemaVersion++
+			}
 
 		case *replication.RowsEvent:
-			return handleRows(ctx, p.logger, p.resolver, &p.filters, binlogEv, ev, filename, currentGTID, events)
+			return handleRows(ctx, p.logger, p.resolver, &p.filters, binlogEv, ev, filename, currentGTID, p.schemaVersion, events)
 		}
 		return nil
 	})
@@ -143,6 +153,7 @@ func handleRows(
 	binlogEv *replication.BinlogEvent,
 	rowsEv *replication.RowsEvent,
 	filename, currentGTID string,
+	schemaVersion int,
 	out chan<- Event,
 ) error {
 	schema := string(rowsEv.Table.Schema)
@@ -186,17 +197,17 @@ func handleRows(
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2:
-		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
+		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, schemaVersion, out)
 
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2:
-		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
+		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, schemaVersion, out)
 
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
 		replication.UPDATE_ROWS_EVENTv2:
-		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, out)
+		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, schemaVersion, out)
 	}
 
 	return nil
@@ -211,6 +222,7 @@ func emitInserts(
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
+	schemaVersion int,
 	out chan<- Event,
 ) error {
 	for _, row := range rows {
@@ -224,8 +236,9 @@ func emitInserts(
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
 			Timestamp: ts, GTID: gtid,
 			Schema: schema, Table: table, EventType: EventInsert,
-			PKValues: BuildPKValues(pkCols, named),
-			RowAfter: named,
+			PKValues:      BuildPKValues(pkCols, named),
+			RowAfter:      named,
+			SchemaVersion: schemaVersion,
 		}
 		select {
 		case out <- ev:
@@ -245,6 +258,7 @@ func emitDeletes(
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
+	schemaVersion int,
 	out chan<- Event,
 ) error {
 	for _, row := range rows {
@@ -258,8 +272,9 @@ func emitDeletes(
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
 			Timestamp: ts, GTID: gtid,
 			Schema: schema, Table: table, EventType: EventDelete,
-			PKValues:  BuildPKValues(pkCols, named),
-			RowBefore: named,
+			PKValues:      BuildPKValues(pkCols, named),
+			RowBefore:     named,
+			SchemaVersion: schemaVersion,
 		}
 		select {
 		case out <- ev:
@@ -279,6 +294,7 @@ func emitUpdates(
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
+	schemaVersion int,
 	out chan<- Event,
 ) error {
 	// go-mysql delivers UPDATE rows as interleaved before/after pairs:
@@ -300,9 +316,10 @@ func emitUpdates(
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
 			Timestamp: ts, GTID: gtid,
 			Schema: schema, Table: table, EventType: EventUpdate,
-			PKValues:  BuildPKValues(pkCols, before), // PK from before-image
-			RowBefore: before,
-			RowAfter:  after,
+			PKValues:      BuildPKValues(pkCols, before), // PK from before-image
+			RowBefore:     before,
+			RowAfter:      after,
+			SchemaVersion: schemaVersion,
 		}
 		select {
 		case out <- ev:
@@ -360,7 +377,8 @@ func formatGTID(sid []byte, gno int64) string {
 
 // warnOnDDL logs a warning when a DDL statement is found in a QUERY_EVENT.
 // DDL changes table structure and may invalidate the current schema snapshot.
-func warnOnDDL(logger *slog.Logger, filename string, logPos uint32, query string) {
+// Returns true if the query is DDL, false otherwise.
+func warnOnDDL(logger *slog.Logger, filename string, logPos uint32, query string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	isDDL := strings.HasPrefix(upper, "ALTER TABLE") ||
 		strings.HasPrefix(upper, "CREATE TABLE") ||
@@ -373,4 +391,5 @@ func warnOnDDL(logger *slog.Logger, filename string, logPos uint32, query string
 			"pos", logPos,
 			"query", query)
 	}
+	return isDDL
 }
