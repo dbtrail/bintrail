@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// ─── DescriptionToHuman ───────────────────────────────────────────────────────
+// ─── DescriptionToHuman ───────────────────────────────────────────────────────────────────
 
 func TestDescriptionToHuman_maxvalue(t *testing.T) {
 	for _, input := range []string{"MAXVALUE", "maxvalue", "MaxValue", ""} {
@@ -53,7 +53,7 @@ func TestDescriptionToHuman_unixEpoch(t *testing.T) {
 	}
 }
 
-// ─── Truncate ─────────────────────────────────────────────────────────────────
+// ─── Truncate ─────────────────────────────────────────────────────────────────────────────
 
 func TestTruncate_shortString(t *testing.T) {
 	got := Truncate("hello", 10)
@@ -72,20 +72,20 @@ func TestTruncate_exactLength(t *testing.T) {
 func TestTruncate_longString(t *testing.T) {
 	long := strings.Repeat("x", 100)
 	got := Truncate(long, 20)
-	if !strings.HasSuffix(got, "…") {
+	if !strings.HasSuffix(got, "\u2026") {
 		t.Errorf("expected ellipsis suffix, got %q", got)
 	}
-	if len(got) != 21 { // 20 chars + "…" (3 bytes, but counted as 1 rune display)
-		// Note: "…" is a multi-byte UTF-8 rune but len() counts bytes.
+	if len(got) != 21 { // 20 chars + "\u2026" (3 bytes, but counted as 1 rune display)
+		// Note: "\u2026" is a multi-byte UTF-8 rune but len() counts bytes.
 		// Our Truncate uses byte indexing, so the suffix adds 3 bytes.
-		// Just check the prefix is preserved and suffix is "…".
+		// Just check the prefix is preserved and suffix is "\u2026".
 		if !strings.HasPrefix(got, strings.Repeat("x", 20)) {
 			t.Errorf("expected 20 x's before ellipsis, got %q", got)
 		}
 	}
 }
 
-// ─── WriteStatus output structure ────────────────────────────────────────────
+// ─── WriteStatus output structure ─────────────────────────────────────────────────────
 
 func TestWriteStatus_noFiles_noPartitions(t *testing.T) {
 	var buf bytes.Buffer
@@ -140,6 +140,8 @@ func TestWriteStatus_withFiles(t *testing.T) {
 	assertContains(t, out, "=== Summary ===")
 	assertContains(t, out, "1 completed")
 	assertContains(t, out, "1 failed")
+	// Files without bintrail_id (NULL) must be grouped under "(unknown)".
+	assertContains(t, out, "Server (unknown)")
 }
 
 func TestWriteStatus_withPartitions(t *testing.T) {
@@ -183,10 +185,10 @@ func TestWriteStatus_errorTruncation(t *testing.T) {
 	if strings.Contains(out, long) {
 		t.Error("expected long error to be truncated, but found it in full")
 	}
-	assertContains(t, out, "…")
+	assertContains(t, out, "\u2026")
 }
 
-// ─── WriteStatus: bintrail_id column and per-server summary ──────────────────
+// ─── WriteStatus: bintrail_id column and per-server summary ─────────────────────────────
 
 func TestWriteStatus_bintrailIDColumn(t *testing.T) {
 	ts := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
@@ -215,8 +217,8 @@ func TestWriteStatus_bintrailIDColumn(t *testing.T) {
 	assertContains(t, out, "BINTRAIL_ID")
 	// Known UUID must appear in the file row.
 	assertContains(t, out, "abc123de-0000-0000-0000-000000000001")
-	// NULL bintrail_id shown as dash.
-	assertContains(t, out, "-")
+	// NULL bintrail_id must be grouped as "(unknown)" in the per-server summary.
+	assertContains(t, out, "Server (unknown)")
 }
 
 func TestWriteStatus_perServerSummary_multipleServers(t *testing.T) {
@@ -261,7 +263,7 @@ func TestWriteStatus_perServerSummary_unknownID(t *testing.T) {
 	assertContains(t, out, "1 completed")
 }
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
+// ─── Helper ────────────────────────────────────────────────────────────────────────────
 
 func assertContains(t *testing.T, s, want string) {
 	t.Helper()
