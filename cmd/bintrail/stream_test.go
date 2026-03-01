@@ -79,6 +79,20 @@ func TestParseSourceDSN_ipv6(t *testing.T) {
 	}
 }
 
+// TestParseSourceDSN_portOutOfRange verifies that a port above the uint16 max
+// (65535) is rejected. go-mysql-driver accepts it syntactically, but
+// parseSourceDSN uses strconv.ParseUint with bitSize=16 to catch it.
+func TestParseSourceDSN_portOutOfRange(t *testing.T) {
+	dsn := "root@tcp(localhost:65536)/"
+	_, _, _, _, err := parseSourceDSN(dsn)
+	if err == nil {
+		t.Error("expected error for port 65536 (exceeds uint16 max), got nil")
+	}
+	if !strings.Contains(err.Error(), "port") {
+		t.Errorf("expected 'port' in error message, got: %v", err)
+	}
+}
+
 // ─── resolveStart ────────────────────────────────────────────────────────────
 
 func TestResolveStart_noStateNoFlags(t *testing.T) {
@@ -366,8 +380,58 @@ func TestResolveStart_customStartPos(t *testing.T) {
 	}
 }
 
+// TestResolveStart_fileFlagOverridesSavedGTIDState verifies that --start-file
+// wins over a saved GTID-mode state (complementary to flagsOverrideSavedState
+// which tests overriding a position-mode state).
+func TestResolveStart_fileFlagOverridesSavedGTIDState(t *testing.T) {
+	saved := &streamState{
+		mode:    "gtid",
+		gtidSet: "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100",
+	}
+	mode, file, _, pos, accGTID, err := resolveStart("binlog.000001", "", 4, saved)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != "position" {
+		t.Errorf("expected mode=position, got %q", mode)
+	}
+	if file != "binlog.000001" {
+		t.Errorf("expected file=binlog.000001, got %q", file)
+	}
+	if pos != 4 {
+		t.Errorf("expected pos=4, got %d", pos)
+	}
+	if accGTID != nil {
+		t.Error("expected nil accGTID when overriding to position mode")
+	}
+}
+
+// TestResolveStart_gtidFlagOverridesSavedGTIDState verifies that --start-gtid
+// wins over a saved GTID-mode state, resetting to the new GTID set.
+func TestResolveStart_gtidFlagOverridesSavedGTIDState(t *testing.T) {
+	saved := &streamState{
+		mode:    "gtid",
+		gtidSet: "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100",
+	}
+	newGTID := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-200"
+	mode, _, returnedGTID, _, accGTID, err := resolveStart("", newGTID, 4, saved)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != "gtid" {
+		t.Errorf("expected mode=gtid, got %q", mode)
+	}
+	if returnedGTID != newGTID {
+		t.Errorf("expected new GTID %q, got %q", newGTID, returnedGTID)
+	}
+	if accGTID == nil {
+		t.Error("expected non-nil accGTID")
+	}
+}
+
 // TestResolveStart_gtidFlagOverridesSavedState verifies that --start-gtid wins
-// over a saved position-mode state (the symmetric case to flagsOverrideSavedState).
+// over a saved position-mode state (complementary to flagsOverrideSavedState
+// which tests overriding a position-mode state).
 func TestResolveStart_gtidFlagOverridesSavedState(t *testing.T) {
 	saved := &streamState{
 		mode:       "position",
