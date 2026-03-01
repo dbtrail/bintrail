@@ -92,7 +92,7 @@ func TestInitCmd_defaults(t *testing.T) {
 	}
 }
 
-// ─── buildBinlogEventsDDL ─────────────────────────────────────────────────────
+// ─── buildBinlogEventsDDL ───────────────────────────────────────────────────
 
 func TestBuildBinlogEventsDDL_noEncrypt(t *testing.T) {
 	parts := []string{"    PARTITION p_2026022814 VALUES LESS THAN (TO_SECONDS('2026-02-28 15:00:00'))",
@@ -140,7 +140,7 @@ func TestBuildBinlogEventsDDL_withEncrypt(t *testing.T) {
 	}
 }
 
-// ─── parseS3ARN ───────────────────────────────────────────────────────────────
+// ─── parseS3ARN ──────────────────────────────────────────────────────────────
 
 func TestParseS3ARN_validARNs(t *testing.T) {
 	cases := []struct {
@@ -192,7 +192,7 @@ func TestParseS3ARN_invalidARNs(t *testing.T) {
 	}
 }
 
-// ─── s3IAMInstructions ────────────────────────────────────────────────────────
+// ─── s3IAMInstructions ───────────────────────────────────────────────────────────
 
 func TestS3IAMInstructions_containsBucketName(t *testing.T) {
 	out := s3IAMInstructions("my-archive-bucket", "aws")
@@ -220,7 +220,7 @@ func TestS3IAMInstructions_usesCorrectPartition(t *testing.T) {
 	}
 }
 
-// ─── buildPartitionDefs ───────────────────────────────────────────────────────
+// ─── buildPartitionDefs ───────────────────────────────────────────────────────────
 
 func TestBuildPartitionDefs_countAndFuture(t *testing.T) {
 	now := time.Date(2026, 2, 28, 14, 30, 0, 0, time.UTC)
@@ -283,7 +283,7 @@ func TestBuildPartitionDefs_singlePartition(t *testing.T) {
 	}
 }
 
-// ─── s3Instructions ───────────────────────────────────────────────────────────
+// ─── s3Instructions ───────────────────────────────────────────────────────────────
 
 func TestS3Instructions_usEast1_noLocationConstraint(t *testing.T) {
 	out := s3Instructions("my-bucket", "us-east-1")
@@ -400,7 +400,7 @@ func TestRunInit_missingDBName(t *testing.T) {
 	}
 }
 
-// ─── DDL content: bintrail_id columns ─────────────────────────────────────────
+// ─── DDL content: bintrail_id columns ─────────────────────────────────────────────
 
 func TestDDLIndexState_hasBintrailID(t *testing.T) {
 	if !strings.Contains(ddlIndexState, "bintrail_id") {
@@ -412,6 +412,9 @@ func TestDDLIndexState_hasBintrailID(t *testing.T) {
 	if !strings.Contains(ddlIndexState, "CHAR(36)") {
 		t.Error("ddlIndexState bintrail_id must be CHAR(36)")
 	}
+	if !strings.Contains(ddlIndexState, "NULL DEFAULT NULL") {
+		t.Error("ddlIndexState bintrail_id must be nullable (NULL DEFAULT NULL)")
+	}
 }
 
 func TestDDLStreamState_hasBintrailID(t *testing.T) {
@@ -420,5 +423,8 @@ func TestDDLStreamState_hasBintrailID(t *testing.T) {
 	}
 	if !strings.Contains(ddlStreamState, "CHAR(36)") {
 		t.Error("ddlStreamState bintrail_id must be CHAR(36)")
+	}
+	if !strings.Contains(ddlStreamState, "NULL DEFAULT NULL") {
+		t.Error("ddlStreamState bintrail_id must be nullable (NULL DEFAULT NULL)")
 	}
 }

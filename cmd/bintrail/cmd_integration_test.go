@@ -20,7 +20,7 @@ import (
 	"github.com/bintrail/bintrail/internal/testutil"
 )
 
-// ─── getFileStatus ───────────────────────────────────────────────────────────
+// ─── getFileStatus ─────────────────────────────────────────────────────────────────
 
 func TestGetFileStatus_existing(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
@@ -52,13 +52,13 @@ func TestGetFileStatus_missing(t *testing.T) {
 	}
 }
 
-// ─── upsertFileState ─────────────────────────────────────────────────────────
+// ─── upsertFileState ─────────────────────────────────────────────────────────────────
 
 func TestUpsertFileState_inProgress(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 
-	if err := upsertFileState(db, "binlog.000001", "in_progress", 2048, 0, 0, ""); err != nil {
+	if err := upsertFileState(db, "binlog.000001", "in_progress", 2048, 0, 0, "", ""); err != nil {
 		t.Fatalf("upsert in_progress failed: %v", err)
 	}
 
@@ -76,11 +76,11 @@ func TestUpsertFileState_completed(t *testing.T) {
 	testutil.InitIndexTables(t, db)
 
 	// First mark in_progress.
-	if err := upsertFileState(db, "binlog.000001", "in_progress", 2048, 0, 0, ""); err != nil {
+	if err := upsertFileState(db, "binlog.000001", "in_progress", 2048, 0, 0, "", ""); err != nil {
 		t.Fatalf("upsert in_progress failed: %v", err)
 	}
 	// Then mark completed.
-	if err := upsertFileState(db, "binlog.000001", "completed", 2048, 2048, 500, ""); err != nil {
+	if err := upsertFileState(db, "binlog.000001", "completed", 2048, 2048, 500, "", ""); err != nil {
 		t.Fatalf("upsert completed failed: %v", err)
 	}
 
@@ -106,10 +106,10 @@ func TestUpsertFileState_failed(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 
-	if err := upsertFileState(db, "binlog.000001", "in_progress", 2048, 0, 0, ""); err != nil {
+	if err := upsertFileState(db, "binlog.000001", "in_progress", 2048, 0, 0, "", ""); err != nil {
 		t.Fatalf("upsert in_progress failed: %v", err)
 	}
-	if err := upsertFileState(db, "binlog.000001", "failed", 2048, 512, 42, "connection lost"); err != nil {
+	if err := upsertFileState(db, "binlog.000001", "failed", 2048, 512, 42, "connection lost", ""); err != nil {
 		t.Fatalf("upsert failed status: %v", err)
 	}
 
@@ -131,7 +131,43 @@ func TestUpsertFileState_failed(t *testing.T) {
 	}
 }
 
-// ─── validateBinlogFormat ────────────────────────────────────────────────────
+// ─── upsertFileState: bintrail_id round-trip ──────────────────────────────────────────
+
+func TestUpsertFileState_bintrailID(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	const id = "aabbccdd-0000-0000-0000-000000000001"
+	if err := upsertFileState(db, "binlog.000001", "in_progress", 1024, 0, 0, "", id); err != nil {
+		t.Fatalf("upsert with bintrailID failed: %v", err)
+	}
+	var got sql.NullString
+	if err := db.QueryRow("SELECT bintrail_id FROM index_state WHERE binlog_file = 'binlog.000001'").Scan(&got); err != nil {
+		t.Fatalf("query bintrail_id: %v", err)
+	}
+	if !got.Valid {
+		t.Error("expected bintrail_id to be non-NULL")
+	}
+	if got.String != id {
+		t.Errorf("expected bintrail_id=%q, got %q", id, got.String)
+	}
+}
+
+func TestUpsertFileState_emptyBintrailIDStoresNULL(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := upsertFileState(db, "binlog.000001", "in_progress", 1024, 0, 0, "", ""); err != nil {
+		t.Fatalf("upsert with empty bintrailID failed: %v", err)
+	}
+	var got sql.NullString
+	if err := db.QueryRow("SELECT bintrail_id FROM index_state WHERE binlog_file = 'binlog.000001'").Scan(&got); err != nil {
+		t.Fatalf("query bintrail_id: %v", err)
+	}
+	if got.Valid {
+		t.Errorf("expected bintrail_id to be NULL, got %q", got.String)
+	}
+}
+
+// ─── validateBinlogFormat ────────────────────────────────────────────────────────────
 
 func TestValidateBinlogFormat_row(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
@@ -149,7 +185,7 @@ func TestValidateBinlogFormat_row(t *testing.T) {
 	}
 }
 
-// ─── validateBinlogRowImage ──────────────────────────────────────────────────
+// ─── validateBinlogRowImage ────────────────────────────────────────────────────────────
 
 func TestValidateBinlogRowImage_full(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
@@ -167,7 +203,7 @@ func TestValidateBinlogRowImage_full(t *testing.T) {
 	}
 }
 
-// ─── validateNoFKCascades ────────────────────────────────────────────────────
+// ─── validateNoFKCascades ────────────────────────────────────────────────────────────
 
 func TestValidateNoFKCascades_none(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
@@ -237,7 +273,7 @@ func TestValidateNoFKCascades_otherSchemaIgnored(t *testing.T) {
 	}
 }
 
-// ─── ensureResolver ──────────────────────────────────────────────────────────
+// ─── ensureResolver ──────────────────────────────────────────────────────────────────
 
 func TestEnsureResolver_autoSnapshot(t *testing.T) {
 	sourceDB, sourceName := testutil.CreateTestDB(t)
@@ -299,7 +335,7 @@ func TestEnsureResolver_existingSnapshot(t *testing.T) {
 	}
 }
 
-// ─── loadIndexState ──────────────────────────────────────────────────────────
+// ─── loadIndexState ────────────────────────────────────────────────────────────────
 
 func TestLoadIndexState(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
@@ -335,7 +371,7 @@ func TestLoadIndexState(t *testing.T) {
 	}
 }
 
-// ─── loadPartitionStats ──────────────────────────────────────────────────────
+// ─── loadPartitionStats ────────────────────────────────────────────────────────────
 
 func TestLoadPartitionStats(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
@@ -365,7 +401,7 @@ func TestLoadPartitionStats(t *testing.T) {
 	}
 }
 
-// ─── ensureDatabase ──────────────────────────────────────────────────────────
+// ─── ensureDatabase ────────────────────────────────────────────────────────────────
 
 func TestEnsureDatabase(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
@@ -401,7 +437,7 @@ func TestEnsureDatabase(t *testing.T) {
 	}
 }
 
-// ─── createBinlogEventsTable ─────────────────────────────────────────────────
+// ─── createBinlogEventsTable ─────────────────────────────────────────────────────────────
 
 func TestCreateBinlogEventsTable(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
@@ -423,7 +459,7 @@ func TestCreateBinlogEventsTable(t *testing.T) {
 	}
 }
 
-// ─── listPartitions ──────────────────────────────────────────────────────────
+// ─── listPartitions ──────────────────────────────────────────────────────────────────
 
 func TestListPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
@@ -454,7 +490,7 @@ func TestListPartitions(t *testing.T) {
 	}
 }
 
-// ─── dropPartitions ──────────────────────────────────────────────────────────
+// ─── dropPartitions ──────────────────────────────────────────────────────────────────
 
 func TestDropPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
@@ -488,7 +524,7 @@ func TestDropPartitions(t *testing.T) {
 	}
 }
 
-// ─── partitionHasData ────────────────────────────────────────────────────────
+// ─── partitionHasData ────────────────────────────────────────────────────────────────
 
 func TestPartitionHasData_empty(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
@@ -525,7 +561,7 @@ func TestPartitionHasData_withData(t *testing.T) {
 	}
 }
 
-// ─── addFuturePartitions ─────────────────────────────────────────────────────
+// ─── addFuturePartitions ─────────────────────────────────────────────────────────────
 
 func TestAddFuturePartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
@@ -557,7 +593,7 @@ func TestAddFuturePartitions(t *testing.T) {
 	}
 }
 
-// ─── ArchivePartition ─────────────────────────────────────────────────────────
+// ─── ArchivePartition ───────────────────────────────────────────────────────────────────
 
 func TestArchivePartition(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
@@ -640,7 +676,7 @@ func TestArchivePartition_empty(t *testing.T) {
 	}
 }
 
-// ─── Server identity integration tests ───────────────────────────────────────
+// ─── Server identity integration tests ─────────────────────────────────────────────
 
 // initServerTables creates bintrail_servers and bintrail_server_changes in db.
 func initServerTables(t *testing.T, db *sql.DB) {
