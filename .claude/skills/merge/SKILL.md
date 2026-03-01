@@ -55,9 +55,11 @@ Follow these steps **in order**. Do not skip steps.
    ```
    Use `-D` if `-d` refuses (squash merges are not recognized as merged by git).
 
-8. **Report**: Print a summary:
+7. **Report**: Print a summary:
    - PR #$ARGUMENTS merged (squash)
    - Local main updated
    - Remote branch `<branch>` deleted
    - Worktree `<worktree-path>` removed
    - Local branch `<branch>` deleted
+
+   If the `/exit` prompt appears saying "You have N commits on `<branch>`" — that is **expected with squash merges**. Git does not track that individual commits were squash-merged into main; it sees them as unmerged on the feature branch. The changes are already on main as one squash commit. It is always safe to choose **Remove worktree**.
