@@ -139,6 +139,21 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("  \u2713 bintrail_server_changes")
 
+	if _, err := db.Exec(ddlTableFlags); err != nil {
+		return fmt.Errorf("failed to create table_flags: %w", err)
+	}
+	fmt.Println("  \u2713 table_flags")
+
+	if _, err := db.Exec(ddlProfiles); err != nil {
+		return fmt.Errorf("failed to create profiles: %w", err)
+	}
+	fmt.Println("  \u2713 profiles")
+
+	if _, err := db.Exec(ddlAccessRules); err != nil {
+		return fmt.Errorf("failed to create access_rules: %w", err)
+	}
+	fmt.Println("  \u2713 access_rules")
+
 	if initS3Bucket != "" {
 		fmt.Printf("\nSetting up S3 bucket...\n")
 		if err := setupS3Bucket(cmd.Context(), initS3Bucket, initS3Region); err != nil {
@@ -496,6 +511,51 @@ const ddlIndexState = `CREATE TABLE IF NOT EXISTS index_state (
 // statements for the server identity tables. They live in internal/serverid
 // so that testutil and init share a single source of truth.
 var (
-	ddlBintrailServers      = serverid.DDLBintrailServers
+	ddlBintrailServers       = serverid.DDLBintrailServers
 	ddlBintrailServerChanges = serverid.DDLBintrailServerChanges
 )
+
+// ─── RBAC tables ─────────────────────────────────────────────────────────────
+
+// ddlTableFlags stores named flags on tables or individual columns.
+// column_name = '' means the flag applies to the whole table; a non-empty
+// value names the specific column that carries the flag.
+// This two-level design lets access_rules express both "deny the billing
+// table" (table-level flag) and "redact the amount column" (column-level flag)
+// using the same flag name with different column_name values.
+const ddlTableFlags = `CREATE TABLE IF NOT EXISTS table_flags (
+    id          INT UNSIGNED  AUTO_INCREMENT PRIMARY KEY,
+    schema_name VARCHAR(64)   NOT NULL,
+    table_name  VARCHAR(64)   NOT NULL,
+    column_name VARCHAR(64)   NOT NULL DEFAULT '' COMMENT 'empty = table-level flag; non-empty = column-level flag',
+    flag        VARCHAR(255)  NOT NULL,
+    created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY idx_unique (schema_name, table_name, column_name, flag),
+    INDEX idx_flag (flag)
+) ENGINE=InnoDB`
+
+// ddlProfiles stores named access profiles (e.g. "dev", "marketing").
+// Profiles are referenced by access_rules to define what flags each profile
+// may or may not access. Management is typically done from the web panel;
+// the CLI provides the 'bintrail flag' command for DBA use.
+const ddlProfiles = `CREATE TABLE IF NOT EXISTS profiles (
+    id          INT UNSIGNED  AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(255)  NOT NULL,
+    description TEXT          DEFAULT NULL,
+    created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY idx_name (name)
+) ENGINE=InnoDB`
+
+// ddlAccessRules maps a profile to a flag with an allow/deny permission.
+// Combined with table_flags this enables RBAC:
+//   - profile "dev" DENY flag "billing"  → dev users cannot see billing table events
+//   - profile "marketing" DENY flag "pii" → marketing users see events but pii columns are redacted
+const ddlAccessRules = `CREATE TABLE IF NOT EXISTS access_rules (
+    id          INT UNSIGNED  AUTO_INCREMENT PRIMARY KEY,
+    profile_id  INT UNSIGNED  NOT NULL,
+    flag        VARCHAR(255)  NOT NULL,
+    permission  ENUM('allow','deny') NOT NULL,
+    created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY idx_profile_flag (profile_id, flag),
+    CONSTRAINT fk_access_rules_profile FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE
+) ENGINE=InnoDB`

@@ -124,6 +124,7 @@ type queryArgs struct {
 	Since         string `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
 	Until         string `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
 	ChangedColumn string `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
+	Flag          string `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
 	Format        string `json:"format,omitempty" jsonschema:"Output format: json table or csv (default: json)"`
 	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of events to return (default: 100)"`
 }
@@ -138,6 +139,7 @@ type recoverArgs struct {
 	Since         string `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
 	Until         string `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
 	ChangedColumn string `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
+	Flag          string `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
 	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of events to reverse (default: 1000)"`
 }
 
@@ -155,7 +157,7 @@ func queryTool(ctx context.Context, req *mcp.CallToolRequest, args queryArgs) (*
 	defer db.Close()
 
 	opts, err := buildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
-		args.GTID, args.Since, args.Until, args.ChangedColumn, args.Limit, 100)
+		args.GTID, args.Since, args.Until, args.ChangedColumn, args.Flag, args.Limit, 100)
 	if err != nil {
 		return errorResult(err), nil, nil
 	}
@@ -196,7 +198,7 @@ func recoverTool(ctx context.Context, req *mcp.CallToolRequest, args recoverArgs
 
 	defaultLimit := 1000
 	opts, err := buildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
-		args.GTID, args.Since, args.Until, args.ChangedColumn, args.Limit, defaultLimit)
+		args.GTID, args.Since, args.Until, args.ChangedColumn, args.Flag, args.Limit, defaultLimit)
 	if err != nil {
 		return errorResult(err), nil, nil
 	}
@@ -300,7 +302,7 @@ func errorResult(err error) *mcp.CallToolResult {
 	}
 }
 
-func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol string, limit, defaultLimit int) (query.Options, error) {
+func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol, flag string, limit, defaultLimit int) (query.Options, error) {
 	if pk != "" && (schema == "" || table == "") {
 		return query.Options{}, fmt.Errorf("pk requires both schema and table")
 	}
@@ -334,6 +336,7 @@ func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changed
 		Since:         sinceT,
 		Until:         untilT,
 		ChangedColumn: changedCol,
+		Flag:          flag,
 		Limit:         limit,
 	}, nil
 }
