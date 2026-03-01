@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -42,8 +44,11 @@ Examples:
   # Drop without auto-replacing (pure drop, storage-conscious)
   bintrail rotate --index-dsn "..." --retain 7d --no-replace
 
-  # Drop without auto-replacing but add 3 explicit extras
-  bintrail rotate --index-dsn "..." --retain 7d --no-replace --add-future 3`,
+  # Run as a daemon, rotating every hour
+  bintrail rotate --index-dsn "..." --retain 7d --daemon
+
+  # Run as a daemon with a custom interval
+  bintrail rotate --index-dsn "..." --retain 7d --daemon --interval 6h`,
 	RunE: runRotate,
 }
 
@@ -57,6 +62,8 @@ var (
 	rotBintrailID         string
 	rotArchiveS3          string
 	rotArchiveS3Region    string
+	rotDaemon             bool
+	rotInterval           string
 )
 
 func init() {
@@ -69,14 +76,14 @@ func init() {
 	rotateCmd.Flags().StringVar(&rotBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir is set); archives are written under bintrail_id=<uuid>/event_date=<date>/")
 	rotateCmd.Flags().StringVar(&rotArchiveS3, "archive-s3", "", "S3 destination URL to upload Parquet archives after writing (requires --archive-dir; e.g. s3://my-bucket/archives/)")
 	rotateCmd.Flags().StringVar(&rotArchiveS3Region, "archive-s3-region", "", "AWS region for --archive-s3 (default: from AWS_REGION env var or ~/.aws/config)")
+	rotateCmd.Flags().BoolVar(&rotDaemon, "daemon", false, "Run continuously, repeating rotation on the --interval schedule until SIGINT/SIGTERM")
+	rotateCmd.Flags().StringVar(&rotInterval, "interval", "1h", "How often to run rotation in daemon mode (e.g. 1h, 30m)")
 	_ = rotateCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(rotateCmd)
 }
 
 func runRotate(cmd *cobra.Command, args []string) error {
-	start := time.Now()
-
 	if rotRetain == "" && rotAddFuture == 0 {
 		return fmt.Errorf("at least one of --retain or --add-future is required")
 	}
@@ -105,15 +112,56 @@ func runRotate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--index-dsn must include a database name (e.g. user:pass@tcp(host:3306)/binlog_index)")
 	}
 
-	db, err := config.Connect(rotIndexDSN)
-	if err != nil {
-		return fmt.Errorf("failed to connect to index database: %w", err)
+	if rotDaemon {
+		if _, err := time.ParseDuration(rotInterval); err != nil {
+			return fmt.Errorf("--interval: %w", err)
+		}
 	}
-	defer db.Close()
 
-	ctx := cmd.Context()
+	doRotation := func(ctx context.Context) error {
+		db, err := config.Connect(rotIndexDSN)
+		if err != nil {
+			return fmt.Errorf("failed to connect to index database: %w", err)
+		}
+		defer db.Close()
+		return performRotation(ctx, db, dbName, retainDur)
+	}
 
-	// ── Load current partition list ───────────────────────────────────────────
+	if !rotDaemon {
+		return doRotation(cmd.Context())
+	}
+
+	interval, _ := time.ParseDuration(rotInterval) // already validated above
+	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	slog.Info("rotate daemon started", "interval", interval)
+	if err := doRotation(ctx); err != nil && ctx.Err() == nil {
+		slog.Error("rotation failed", "error", err)
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("rotate daemon stopping")
+			return nil
+		case <-ticker.C:
+			if err := doRotation(ctx); err != nil && ctx.Err() == nil {
+				slog.Error("rotation failed", "error", err)
+			}
+		}
+	}
+}
+
+// performRotation executes one full rotation cycle against an open DB connection.
+// It uses the package-level flag vars (rotRetain, rotAddFuture, rotNoReplace, etc.)
+// so that daemon and one-shot modes share identical rotation logic.
+func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur time.Duration) error {
+	start := time.Now()
+
+	// ── Load current partition list ─────────────────────────────────────────────
 	partitions, err := listPartitions(ctx, db, dbName)
 	if err != nil {
 		return fmt.Errorf("failed to list partitions: %w", err)
@@ -121,7 +169,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 
 	// ── Drop old partitions ───────────────────────────────────────────────────
 	var droppedCount int
-	if rotRetain != "" {
+	if retainDur > 0 {
 		cutoff := time.Now().UTC().Add(-retainDur).Truncate(time.Hour)
 		var toDrop []string
 		for _, p := range partitions {
@@ -165,7 +213,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 					if err != nil {
 						return fmt.Errorf("archive partition %s: %w", name, err)
 					}
-					fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) → %s\n", name, n, outPath)
+					fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) \u2192 %s\n", name, n, outPath)
 
 					if s3Client != nil {
 						key, err := buildS3Key(rotArchiveDir, outPath, s3Prefix)
@@ -200,7 +248,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		slog.Warn("could not check p_future data", "error", err)
 	} else if hasFutureData {
-		slog.Warn("p_future partition contains data — events are arriving outside all named partition ranges; consider adding more future partitions with --add-future")
+		slog.Warn("p_future partition contains data \u2014 events are arriving outside all named partition ranges; consider adding more future partitions with --add-future")
 	}
 
 	// ── Add new future partitions ─────────────────────────────────────────────
