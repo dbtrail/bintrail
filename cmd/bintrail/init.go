@@ -493,6 +493,7 @@ const ddlStreamState = `CREATE TABLE IF NOT EXISTS stream_state (
     last_event_time  DATETIME        DEFAULT NULL,
     last_checkpoint  DATETIME        NOT NULL,
     server_id        INT UNSIGNED    NOT NULL,
+    bintrail_id      CHAR(36)        NULL DEFAULT NULL,
     CONSTRAINT single_row CHECK (id = 1)
 ) ENGINE=InnoDB`
 
@@ -504,7 +505,9 @@ const ddlIndexState = `CREATE TABLE IF NOT EXISTS index_state (
     status         ENUM('in_progress','completed','failed') NOT NULL,
     started_at     DATETIME NOT NULL,
     completed_at   DATETIME DEFAULT NULL,
-    error_message  TEXT     DEFAULT NULL
+    error_message  TEXT     DEFAULT NULL,
+    bintrail_id    CHAR(36) NULL DEFAULT NULL,
+    INDEX idx_bintrail_id (bintrail_id)
 ) ENGINE=InnoDB`
 
 // ddlBintrailServers and ddlBintrailServerChanges are the canonical DDL

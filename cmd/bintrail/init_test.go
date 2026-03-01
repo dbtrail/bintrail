@@ -399,3 +399,26 @@ func TestRunInit_missingDBName(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// ─── DDL content: bintrail_id columns ─────────────────────────────────────────
+
+func TestDDLIndexState_hasBintrailID(t *testing.T) {
+	if !strings.Contains(ddlIndexState, "bintrail_id") {
+		t.Error("ddlIndexState must contain bintrail_id column")
+	}
+	if !strings.Contains(ddlIndexState, "idx_bintrail_id") {
+		t.Error("ddlIndexState must contain idx_bintrail_id index")
+	}
+	if !strings.Contains(ddlIndexState, "CHAR(36)") {
+		t.Error("ddlIndexState bintrail_id must be CHAR(36)")
+	}
+}
+
+func TestDDLStreamState_hasBintrailID(t *testing.T) {
+	if !strings.Contains(ddlStreamState, "bintrail_id") {
+		t.Error("ddlStreamState must contain bintrail_id column")
+	}
+	if !strings.Contains(ddlStreamState, "CHAR(36)") {
+		t.Error("ddlStreamState bintrail_id must be CHAR(36)")
+	}
+}

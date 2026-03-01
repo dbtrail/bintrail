@@ -186,6 +186,81 @@ func TestWriteStatus_errorTruncation(t *testing.T) {
 	assertContains(t, out, "…")
 }
 
+// ─── WriteStatus: bintrail_id column and per-server summary ──────────────────
+
+func TestWriteStatus_bintrailIDColumn(t *testing.T) {
+	ts := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	files := []IndexStateRow{
+		{
+			BinlogFile:    "binlog.000001",
+			Status:        "completed",
+			EventsIndexed: 500,
+			StartedAt:     ts,
+			BintrailID:    sql.NullString{Valid: true, String: "abc123de-0000-0000-0000-000000000001"},
+		},
+		{
+			BinlogFile:    "binlog.000002",
+			Status:        "completed",
+			EventsIndexed: 300,
+			StartedAt:     ts.Add(time.Hour),
+			BintrailID:    sql.NullString{Valid: false}, // NULL — old row
+		},
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, files, nil)
+	out := buf.String()
+
+	// BINTRAIL_ID column header must appear.
+	assertContains(t, out, "BINTRAIL_ID")
+	// Known UUID must appear in the file row.
+	assertContains(t, out, "abc123de-0000-0000-0000-000000000001")
+	// NULL bintrail_id shown as dash.
+	assertContains(t, out, "-")
+}
+
+func TestWriteStatus_perServerSummary_multipleServers(t *testing.T) {
+	ts := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	serverA := "aaaaaaaa-0000-0000-0000-000000000001"
+	serverB := "bbbbbbbb-0000-0000-0000-000000000002"
+	files := []IndexStateRow{
+		{BinlogFile: "binlog.000001", Status: "completed", EventsIndexed: 1000, StartedAt: ts, BintrailID: sql.NullString{Valid: true, String: serverA}},
+		{BinlogFile: "binlog.000002", Status: "completed", EventsIndexed: 500, StartedAt: ts.Add(time.Hour), BintrailID: sql.NullString{Valid: true, String: serverA}},
+		{BinlogFile: "binlog.000010", Status: "completed", EventsIndexed: 200, StartedAt: ts, BintrailID: sql.NullString{Valid: true, String: serverB}},
+		{BinlogFile: "binlog.000011", Status: "failed", EventsIndexed: 0, StartedAt: ts.Add(time.Hour), BintrailID: sql.NullString{Valid: true, String: serverB}},
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, files, nil)
+	out := buf.String()
+
+	assertContains(t, out, "=== Summary ===")
+	// Both server IDs must appear as section headers.
+	assertContains(t, out, "Server "+serverA)
+	assertContains(t, out, "Server "+serverB)
+	// Server A: 2 completed, 1500 events.
+	assertContains(t, out, "2 completed")
+	assertContains(t, out, "1500")
+	// Server B: 1 completed, 1 failed, 200 events.
+	assertContains(t, out, "1 failed")
+	assertContains(t, out, "200")
+}
+
+func TestWriteStatus_perServerSummary_unknownID(t *testing.T) {
+	ts := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	files := []IndexStateRow{
+		{BinlogFile: "binlog.000001", Status: "completed", EventsIndexed: 42, StartedAt: ts, BintrailID: sql.NullString{Valid: false}},
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, files, nil)
+	out := buf.String()
+
+	// Null bintrail_id must be grouped under "(unknown)".
+	assertContains(t, out, "Server (unknown)")
+	assertContains(t, out, "1 completed")
+}
+
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
 func assertContains(t *testing.T, s, want string) {
