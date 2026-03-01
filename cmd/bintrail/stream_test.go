@@ -1,11 +1,43 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 )
+
+// selfSignedCAPEM generates a minimal self-signed CA certificate as PEM bytes.
+func selfSignedCAPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test-ca"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		IsCA:         true,
+		KeyUsage:     x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
 
 // ─── parseSourceDSN ──────────────────────────────────────────────────────────
 
@@ -283,6 +315,123 @@ func TestStreamState_gtidAccumulationMultiServer(t *testing.T) {
 	}
 }
 
+// ─── buildTLSConfig ───────────────────────────────────────────────────────────
+
+func TestBuildTLSConfig_disabled(t *testing.T) {
+	cfg, err := buildTLSConfig("disabled", "", "", "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg != nil {
+		t.Error("expected nil tls.Config for disabled mode")
+	}
+}
+
+func TestBuildTLSConfig_preferred(t *testing.T) {
+	cfg, err := buildTLSConfig("preferred", "", "", "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil tls.Config for preferred mode")
+	}
+	if !cfg.InsecureSkipVerify {
+		t.Error("expected InsecureSkipVerify=true for preferred mode")
+	}
+}
+
+func TestBuildTLSConfig_required(t *testing.T) {
+	cfg, err := buildTLSConfig("required", "", "", "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil tls.Config for required mode")
+	}
+	if !cfg.InsecureSkipVerify {
+		t.Error("expected InsecureSkipVerify=true for required mode")
+	}
+}
+
+func TestBuildTLSConfig_invalidMode(t *testing.T) {
+	_, err := buildTLSConfig("bogus", "", "", "", "")
+	if err == nil {
+		t.Error("expected error for unknown ssl-mode")
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Errorf("expected mode name in error, got: %v", err)
+	}
+}
+
+func TestBuildTLSConfig_certWithoutKey(t *testing.T) {
+	_, err := buildTLSConfig("required", "", "cert.pem", "", "")
+	if err == nil {
+		t.Error("expected error when cert provided without key")
+	}
+}
+
+func TestBuildTLSConfig_keyWithoutCert(t *testing.T) {
+	_, err := buildTLSConfig("required", "", "", "key.pem", "")
+	if err == nil {
+		t.Error("expected error when key provided without cert")
+	}
+}
+
+func TestBuildTLSConfig_nonexistentCA(t *testing.T) {
+	_, err := buildTLSConfig("verify-ca", "/nonexistent/ca.pem", "", "", "")
+	if err == nil {
+		t.Error("expected error for non-existent CA file")
+	}
+}
+
+func TestBuildTLSConfig_verifyIdentitySetsServerName(t *testing.T) {
+	cfg, err := buildTLSConfig("verify-identity", "", "", "", "db.example.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil tls.Config")
+	}
+	if cfg.ServerName != "db.example.com" {
+		t.Errorf("expected ServerName=db.example.com, got %q", cfg.ServerName)
+	}
+	if cfg.InsecureSkipVerify {
+		t.Error("expected InsecureSkipVerify=false for verify-identity")
+	}
+}
+
+func TestBuildTLSConfig_verifyCAHasVerifyConnection(t *testing.T) {
+	cfg, err := buildTLSConfig("verify-ca", "", "", "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil tls.Config")
+	}
+	if cfg.VerifyConnection == nil {
+		t.Error("expected VerifyConnection to be set for verify-ca mode")
+	}
+	if !cfg.InsecureSkipVerify {
+		t.Error("expected InsecureSkipVerify=true for verify-ca (hostname skipped via VerifyConnection)")
+	}
+}
+
+func TestBuildTLSConfig_validCAFile(t *testing.T) {
+	dir := t.TempDir()
+	caFile := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(caFile, selfSignedCAPEM(t), 0600); err != nil {
+		t.Fatalf("write CA file: %v", err)
+	}
+
+	cfg, err := buildTLSConfig("verify-ca", caFile, "", "", "")
+	if err != nil {
+		t.Fatalf("unexpected error with valid CA file: %v", err)
+	}
+	if cfg.RootCAs == nil {
+		t.Error("expected RootCAs to be set when --ssl-ca is provided")
+	}
+}
+
 // ─── cobra command wiring ─────────────────────────────────────────────────────
 
 // TestStreamCmd_registered verifies that streamCmd is wired into the root command.
@@ -323,9 +472,35 @@ func TestStreamCmd_allFlagsRegistered(t *testing.T) {
 		"index-dsn", "source-dsn", "server-id",
 		"start-file", "start-pos", "start-gtid",
 		"batch-size", "schemas", "tables", "checkpoint", "metrics-addr",
+		"ssl-mode", "ssl-ca", "ssl-cert", "ssl-key",
 	} {
 		if streamCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on streamCmd", name)
+		}
+	}
+}
+
+// TestStreamCmd_sslModeDefault verifies the default ssl-mode is "preferred".
+func TestStreamCmd_sslModeDefault(t *testing.T) {
+	f := streamCmd.Flag("ssl-mode")
+	if f == nil {
+		t.Fatal("flag --ssl-mode not registered")
+	}
+	if f.DefValue != "preferred" {
+		t.Errorf("expected default ssl-mode=preferred, got %q", f.DefValue)
+	}
+}
+
+// TestStreamCmd_sslFlagsEmptyDefaults verifies ssl-ca/cert/key default to "".
+func TestStreamCmd_sslFlagsEmptyDefaults(t *testing.T) {
+	for _, name := range []string{"ssl-ca", "ssl-cert", "ssl-key"} {
+		f := streamCmd.Flag(name)
+		if f == nil {
+			t.Errorf("flag --%s not registered", name)
+			continue
+		}
+		if f.DefValue != "" {
+			t.Errorf("flag --%s: expected empty default, got %q", name, f.DefValue)
 		}
 	}
 }
