@@ -3,6 +3,9 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/bintrail/bintrail/internal/query"
 )
 
 // ─── cobra command wiring ─────────────────────────────────────────────────────
@@ -261,5 +264,150 @@ func TestRunQuery_changedColWithSchemaOnly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--changed-column requires") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// ─── archive flag wiring ──────────────────────────────────────────────────────
+
+func TestQueryCmd_archiveFlagsRegistered(t *testing.T) {
+	for _, name := range []string{"archive-dir", "archive-s3"} {
+		if queryCmd.Flag(name) == nil {
+			t.Errorf("flag --%s not registered on queryCmd", name)
+		}
+	}
+}
+
+func TestQueryCmd_archiveFlagDefaults(t *testing.T) {
+	for _, name := range []string{"archive-dir", "archive-s3"} {
+		f := queryCmd.Flag(name)
+		if f == nil {
+			t.Fatalf("flag --%s not registered", name)
+		}
+		if f.DefValue != "" {
+			t.Errorf("flag --%s: expected empty default, got %q", name, f.DefValue)
+		}
+	}
+}
+
+// ─── archiveSources ──────────────────────────────────────────────────────────
+
+func TestArchiveSources_both(t *testing.T) {
+	savedDir, savedS3 := qArchiveDir, qArchiveS3
+	t.Cleanup(func() { qArchiveDir = savedDir; qArchiveS3 = savedS3 })
+
+	qArchiveDir = "/data/archives"
+	qArchiveS3 = "s3://bucket/prefix"
+
+	srcs := archiveSources()
+	if len(srcs) != 2 {
+		t.Fatalf("expected 2 sources, got %d: %v", len(srcs), srcs)
+	}
+	if srcs[0] != "/data/archives" || srcs[1] != "s3://bucket/prefix" {
+		t.Errorf("unexpected sources: %v", srcs)
+	}
+}
+
+func TestArchiveSources_dirOnly(t *testing.T) {
+	savedDir, savedS3 := qArchiveDir, qArchiveS3
+	t.Cleanup(func() { qArchiveDir = savedDir; qArchiveS3 = savedS3 })
+
+	qArchiveDir = "/data/archives"
+	qArchiveS3 = ""
+
+	srcs := archiveSources()
+	if len(srcs) != 1 || srcs[0] != "/data/archives" {
+		t.Errorf("expected [/data/archives], got %v", srcs)
+	}
+}
+
+func TestArchiveSources_none(t *testing.T) {
+	savedDir, savedS3 := qArchiveDir, qArchiveS3
+	t.Cleanup(func() { qArchiveDir = savedDir; qArchiveS3 = savedS3 })
+
+	qArchiveDir = ""
+	qArchiveS3 = ""
+
+	if srcs := archiveSources(); len(srcs) != 0 {
+		t.Errorf("expected empty sources, got %v", srcs)
+	}
+}
+
+// ─── mergeResults ─────────────────────────────────────────────────────────────
+
+func TestMergeResults_deduplicatesByEventID(t *testing.T) {
+	t0 := time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)
+	rows := []query.ResultRow{
+		{EventID: 1, EventTimestamp: t0, SchemaName: "db", TableName: "t"},
+		{EventID: 1, EventTimestamp: t0, SchemaName: "db", TableName: "t"}, // duplicate
+		{EventID: 2, EventTimestamp: t0.Add(time.Second), SchemaName: "db", TableName: "t"},
+	}
+	got := mergeResults(rows, 0)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 unique rows, got %d", len(got))
+	}
+}
+
+func TestMergeResults_sortsByTimestampThenEventID(t *testing.T) {
+	t0 := time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)
+	rows := []query.ResultRow{
+		{EventID: 3, EventTimestamp: t0.Add(2 * time.Second)},
+		{EventID: 1, EventTimestamp: t0},
+		{EventID: 2, EventTimestamp: t0.Add(time.Second)},
+	}
+	got := mergeResults(rows, 0)
+	if got[0].EventID != 1 || got[1].EventID != 2 || got[2].EventID != 3 {
+		t.Errorf("expected sorted by timestamp, got event IDs %d %d %d",
+			got[0].EventID, got[1].EventID, got[2].EventID)
+	}
+}
+
+// TestMergeResults_sameTimestampSortsByEventID verifies the secondary sort key
+// when two rows share the same event_timestamp.
+func TestMergeResults_sameTimestampSortsByEventID(t *testing.T) {
+	t0 := time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)
+	rows := []query.ResultRow{
+		{EventID: 5, EventTimestamp: t0},
+		{EventID: 2, EventTimestamp: t0},
+		{EventID: 8, EventTimestamp: t0},
+	}
+	got := mergeResults(rows, 0)
+	if got[0].EventID != 2 || got[1].EventID != 5 || got[2].EventID != 8 {
+		t.Errorf("expected sorted by event_id at same timestamp, got %d %d %d",
+			got[0].EventID, got[1].EventID, got[2].EventID)
+	}
+}
+
+func TestMergeResults_appliesLimit(t *testing.T) {
+	t0 := time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)
+	rows := []query.ResultRow{
+		{EventID: 1, EventTimestamp: t0},
+		{EventID: 2, EventTimestamp: t0.Add(time.Second)},
+		{EventID: 3, EventTimestamp: t0.Add(2 * time.Second)},
+	}
+	got := mergeResults(rows, 2)
+	if len(got) != 2 {
+		t.Fatalf("expected limit 2, got %d rows", len(got))
+	}
+	if got[0].EventID != 1 || got[1].EventID != 2 {
+		t.Errorf("expected first two rows, got event IDs %d %d", got[0].EventID, got[1].EventID)
+	}
+}
+
+func TestMergeResults_zeroLimitNoTruncation(t *testing.T) {
+	t0 := time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)
+	rows := []query.ResultRow{
+		{EventID: 1, EventTimestamp: t0},
+		{EventID: 2, EventTimestamp: t0.Add(time.Second)},
+		{EventID: 3, EventTimestamp: t0.Add(2 * time.Second)},
+	}
+	got := mergeResults(rows, 0)
+	if len(got) != 3 {
+		t.Errorf("expected all 3 rows when limit=0, got %d", len(got))
+	}
+}
+
+func TestMergeResults_empty(t *testing.T) {
+	if got := mergeResults(nil, 10); len(got) != 0 {
+		t.Errorf("expected empty result for nil input, got %v", got)
 	}
 }
