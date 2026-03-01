@@ -34,13 +34,14 @@ Output structure:
 }
 
 var (
-	bslInput        string
-	bslOutput       string
-	bslTimestamp    string
-	bslTables       string
-	bslCompression  string
-	bslRowGroupSize int
-	bslUpload       string
+	bslInput         string
+	bslOutput        string
+	bslTimestamp     string
+	bslTables        string
+	bslCompression   string
+	bslRowGroupSize  int
+	bslUpload        string
+	bslUploadRegion  string
 )
 
 func init() {
@@ -51,6 +52,7 @@ func init() {
 	baselineCmd.Flags().StringVar(&bslCompression, "compression", "zstd", "Parquet compression codec: zstd, snappy, gzip, none")
 	baselineCmd.Flags().IntVar(&bslRowGroupSize, "row-group-size", 500_000, "Rows per Parquet row group")
 	baselineCmd.Flags().StringVar(&bslUpload, "upload", "", "S3 destination URL to upload Parquet files after generation (e.g. s3://my-bucket/baselines/)")
+	baselineCmd.Flags().StringVar(&bslUploadRegion, "upload-region", "", "AWS region for --upload (default: from AWS_REGION env var or ~/.aws/config)")
 	_ = baselineCmd.MarkFlagRequired("input")
 	_ = baselineCmd.MarkFlagRequired("output")
 
@@ -98,7 +100,7 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 		"files_written", stats.FilesWritten)
 
 	if bslUpload != "" {
-		uploaded, err := uploadBaselineToS3(cmd.Context(), bslOutput, bslUpload)
+		uploaded, err := uploadBaselineToS3(cmd.Context(), bslOutput, bslUpload, bslUploadRegion)
 		if err != nil {
 			return fmt.Errorf("S3 upload: %w", err)
 		}
@@ -124,15 +126,20 @@ func parseS3URL(u string) (bucket, prefix string, err error) {
 }
 
 // uploadBaselineToS3 walks outputDir and uploads every file to the S3 URL,
-// preserving the relative directory structure under the prefix. Returns the
-// number of files uploaded. Uses the standard AWS credential chain.
-func uploadBaselineToS3(ctx context.Context, outputDir, s3URL string) (int, error) {
+// preserving the relative directory structure under the prefix. region is
+// optional — if empty, the AWS SDK resolves it from AWS_REGION env var or
+// ~/.aws/config. Returns the number of files uploaded.
+func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string) (int, error) {
 	bucket, prefix, err := parseS3URL(s3URL)
 	if err != nil {
 		return 0, fmt.Errorf("invalid --upload URL: %w", err)
 	}
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
+	opts := []func(*awsconfig.LoadOptions) error{}
+	if region != "" {
+		opts = append(opts, awsconfig.WithRegion(region))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return 0, fmt.Errorf("load AWS config: %w", err)
 	}
@@ -151,25 +158,35 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL string) (int, erro
 		if prefix != "" {
 			key = strings.TrimSuffix(prefix, "/") + "/" + key
 		}
-
-		f, err := os.Open(path)
-		if err != nil {
-			return fmt.Errorf("open %s: %w", path, err)
-		}
-		defer f.Close()
-
-		if _, err := client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(key),
-			Body:   f,
-		}); err != nil {
-			return fmt.Errorf("upload %s → s3://%s/%s: %w", path, bucket, key, err)
+		if err := uploadFile(ctx, client, path, bucket, key); err != nil {
+			return err
 		}
 		slog.Debug("uploaded", "file", path, "bucket", bucket, "key", key)
 		count++
 		return nil
 	})
 	return count, err
+}
+
+// uploadFile opens a single local file and uploads it to S3. It is a separate
+// function so that defer f.Close() runs when uploadFile returns — not when the
+// WalkDir callback returns — preventing file descriptor accumulation over
+// large directory trees.
+func uploadFile(ctx context.Context, client *s3.Client, path, bucket, key string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   f,
+	}); err != nil {
+		return fmt.Errorf("upload %s → s3://%s/%s: %w", path, bucket, key, err)
+	}
+	return nil
 }
 
 // parseTableFilter splits a comma-separated "db.table" list.
