@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Nil dereference in `parser.New()` when resolver is nil (crash risk)
+- MCP HTTP server now shuts down gracefully on SIGINT/SIGTERM
+- `proxy.py` SSE stream parsing crash on non-UTF-8 bytes
+- Unchecked `os.MkdirAll` error in E2E test
+
+### Changed
+- Unknown compression codecs now return an error instead of silently falling back to no compression; new `ValidateCodec()` function validates early in CLI layers
+- `config.Connect()` injects a 10-second default TCP connect timeout when the DSN does not specify one
+- `proxy.py` is now fully self-contained (inlined `log.py`); `log.py` removed
+- Partial file cleanup errors in baseline are now logged
+
 ## [0.1.0] - 2026-03-01
 
 ### Added
