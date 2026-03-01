@@ -1,9 +1,10 @@
 # Credentials — never commit
 deploy/.env
 
-# Build artifacts (compiled binaries at repo root)
+# Build artifacts (compiled binaries at repo root and cross-compilation output)
 /bintrail
 /bintrail-mcp
+/dist/
 
 # Test coverage
 cover.out
