@@ -34,17 +34,17 @@ Follow these steps **in order**. Do not skip steps.
    ```
    If this fails with "remote ref does not exist", the branch was already deleted — that's fine, continue.
 
-6. **Remove the worktree** (only if `<worktree-path>` is non-empty and exists):
-   ```bash
-   git -C <main-repo> worktree remove <worktree-path> --force
-   ```
-   Use `--force` because the branch is already merged. After this step, the session's cwd is gone — **do not run any more Bash commands that rely on a valid cwd**.
-
-7. **Delete the local branch**:
+6. **Delete the local branch** (must happen before worktree removal — removing the worktree destroys the session's cwd, which bricks all subsequent Bash commands):
    ```bash
    git -C <main-repo> branch -d <branch>
    ```
    If `-d` refuses because git doesn't recognize the branch as merged (can happen with squash merges), use `-D` instead.
+
+7. **Remove the worktree** (only if `<worktree-path>` is non-empty and exists). `cd` into `<main-repo>` first in the same command so the Bash tool's persistent CWD lands on a directory that still exists — without this, the shell bricks after the directory is deleted:
+   ```bash
+   cd <main-repo> && git worktree remove <worktree-path> --force
+   ```
+   Use `--force` because the branch is already merged.
 
 8. **Report**: Print a summary:
    - PR #$ARGUMENTS merged (squash)
