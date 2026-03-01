@@ -50,6 +50,21 @@ func TestQueryCmd_defaults(t *testing.T) {
 	}
 }
 
+func TestQueryCmd_emptyStringDefaults(t *testing.T) {
+	for _, name := range []string{
+		"schema", "table", "pk", "event-type", "gtid", "since", "until", "changed-column",
+	} {
+		f := queryCmd.Flag(name)
+		if f == nil {
+			t.Errorf("flag --%s not registered", name)
+			continue
+		}
+		if f.DefValue != "" {
+			t.Errorf("flag --%s: expected empty default, got %q", name, f.DefValue)
+		}
+	}
+}
+
 func TestQueryCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"index-dsn", "schema", "table", "pk", "event-type",
@@ -187,5 +202,64 @@ func TestRunQuery_invalidUntil(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--until") {
 		t.Errorf("expected '--until' in error, got: %v", err)
+	}
+}
+
+// ─── --pk partial flag combinations ──────────────────────────────────────────
+
+// TestRunQuery_pkWithSchemaOnly verifies that --pk + --schema (no --table)
+// is rejected — the guard uses OR, so having only one of schema/table fails.
+func TestRunQuery_pkWithSchemaOnly(t *testing.T) {
+	savedPK, savedS, savedT := qPK, qSchema, qTable
+	t.Cleanup(func() { qPK = savedPK; qSchema = savedS; qTable = savedT })
+
+	qPK = "42"
+	qSchema = "mydb"
+	qTable = ""
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --pk used with --schema but no --table, got nil")
+	}
+	if !strings.Contains(err.Error(), "--pk requires") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestRunQuery_pkWithTableOnly verifies that --pk + --table (no --schema) is
+// also rejected — the symmetric case to pkWithSchemaOnly.
+func TestRunQuery_pkWithTableOnly(t *testing.T) {
+	savedPK, savedS, savedT := qPK, qSchema, qTable
+	t.Cleanup(func() { qPK = savedPK; qSchema = savedS; qTable = savedT })
+
+	qPK = "42"
+	qSchema = ""
+	qTable = "orders"
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --pk used with --table but no --schema, got nil")
+	}
+	if !strings.Contains(err.Error(), "--pk requires") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestRunQuery_changedColWithSchemaOnly verifies that --changed-column + --schema
+// (no --table) is rejected — the OR guard applies here too.
+func TestRunQuery_changedColWithSchemaOnly(t *testing.T) {
+	savedCol, savedS, savedT := qChangedCol, qSchema, qTable
+	t.Cleanup(func() { qChangedCol = savedCol; qSchema = savedS; qTable = savedT })
+
+	qChangedCol = "status"
+	qSchema = "mydb"
+	qTable = ""
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --changed-column used with --schema but no --table, got nil")
+	}
+	if !strings.Contains(err.Error(), "--changed-column requires") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
