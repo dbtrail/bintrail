@@ -160,6 +160,8 @@ Each file gets a row in `index_state` that tracks its progress. The lifecycle is
 
 This means `bintrail index --all` is always safe to re-run. Completed files are skipped. Failed or in-progress files (e.g. from a previous crash) are retried.
 
+`index_state` also records the `bintrail_id` of the server that indexed each file. When multiple source servers share one index database, this lets `bintrail status` group indexed files by origin server. See [Server Identity](./server-identity.md) for details.
+
 ---
 
 ## Full Flow of `bintrail index`
@@ -167,6 +169,7 @@ This means `bintrail index --all` is always safe to re-run. Completed files are 
 ```
 1. --source-dsn provided?
       Yes → connect, check binlog_format=ROW, binlog_row_image=FULL, no FK cascades
+            resolve server identity → log bintrail_id
       No  → skip validation (warn)
 
 2. Connect to index database
@@ -184,7 +187,7 @@ This means `bintrail index --all` is always safe to re-run. Completed files are 
 
 6. For each file (in order):
       a. Already completed? → skip
-      b. Mark in_progress in index_state
+      b. Mark in_progress in index_state (with bintrail_id)
       c. Launch ParseFile goroutine → events channel
       d. idx.Run consumes events, inserts in batches
       e. Wait for parser to finish
@@ -195,7 +198,7 @@ This means `bintrail index --all` is always safe to re-run. Completed files are 
 
 ## Database Destination: `binlog_events`
 
-The indexed events land in `binlog_events`, which is partitioned by `RANGE (TO_DAYS(event_timestamp))`. Each daily partition holds all events whose timestamp falls within that day.
+The indexed events land in `binlog_events`, which is partitioned by `RANGE (TO_SECONDS(event_timestamp))`. Each hourly partition holds all events whose timestamp falls within that hour.
 
 Key columns:
 

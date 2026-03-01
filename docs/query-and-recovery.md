@@ -17,15 +17,16 @@ The engine is shared: the CLI `query` command, the CLI `recover` command, and th
 `buildQuery` constructs the WHERE clause incrementally. Each filter field in `Options` is optional — nil or zero-valued fields are simply omitted:
 
 | Filter | SQL condition |
-|--------|--------------|
+|--------|______________|
 | `Schema` | `schema_name = ?` |
 | `Table` | `table_name = ?` |
 | `PKValues` | `pk_hash = SHA2(?, 256) AND pk_values = ?` |
 | `EventType` | `event_type = ?` |
 | `GTID` | `gtid = ?` |
-| `Since` | `event_timestamp >= ?` |
-| `Until` | `event_timestamp <= ?` |
+| `Since` | `event_timestamp >= ?` (+ pruning hint for non-hour-aligned values) |
+| `Until` | `event_timestamp <= ?` (+ pruning hint for non-hour-aligned values) |
 | `ChangedColumn` | `JSON_CONTAINS(changed_columns, ?)` |
+| `Flag` | `EXISTS (SELECT 1 FROM table_flags WHERE schema_name = ? AND table_name = ? AND flag = ?)` |
 
 The conditions are joined with `AND`. If no filters are provided, there's no `WHERE` clause at all (subject to the `LIMIT`).
 
@@ -53,6 +54,23 @@ JSON_CONTAINS(changed_columns, '"status"')
 
 The needle is the JSON string representation of the column name (with quotes). `json.Marshal("status")` produces `"status"` — exactly the right format for `JSON_CONTAINS`.
 
+### Partition Pruning Guarantee
+
+MySQL can prune `RANGE (TO_SECONDS(event_timestamp))` partitions when it can compare the query bounds directly against the stored `TO_SECONDS` integer literals. For parameterised datetime comparisons (`event_timestamp >= ?`), the optimizer must infer this — and for non-hour-aligned values it may not.
+
+When `--since` or `--until` has non-zero minutes/seconds (e.g. `15:45:00`), `buildQuery` adds an extra condition using inlined `TO_SECONDS()` integer literals alongside the exact parameterised bound:
+
+```sql
+WHERE TO_SECONDS(event_timestamp) >= 63826647000   -- floor to hour: 15:00
+  AND event_timestamp >= ?                          -- exact lower bound
+  AND TO_SECONDS(event_timestamp) < 63826654800    -- ceil to next hour: 17:00
+  AND event_timestamp <= ?                          -- exact upper bound
+```
+
+The integer literals are evaluated at parse time, so MySQL can always prune partitions before executing the query — no optimizer inference needed. For hour-aligned ranges (e.g. `15:00:00`–`16:00:00`), no extra conditions are added.
+
+This is transparent to users. The same `--since`/`--until` flags work as before, but queries against non-hour-aligned windows now reliably skip irrelevant partitions.
+
 ### Output Formats
 
 Results can be formatted three ways:
@@ -69,21 +87,33 @@ Results can be formatted three ways:
 
 When rotated partitions have been archived (via `bintrail rotate --archive-dir` or `--archive-s3`), events are no longer in the MySQL index. The `query` command can merge results from these archives with the live index using `--archive-dir` and `--archive-s3`.
 
+**`--bintrail-id` is required** when querying archives. The archive Hive layout uses `bintrail_id=<uuid>/` as the top-level partition key; providing the UUID scopes the DuckDB glob to that server's archives and enables partition pruning at the DuckDB level.
+
+```sh
+bintrail query \
+  --index-dsn  "..." \
+  --archive-s3 s3://my-bintrail-archives/events/ \
+  --bintrail-id 3e11fa47-71ca-11e1-9e33-c80aa9429562 \
+  --schema     mydb \
+  --table      orders \
+  --since      "2026-01-01 00:00:00"
+```
+
 ### How the Merge Works
 
 When either archive flag is set, the query command takes a different path:
 
 1. **Fetch from MySQL index** — same query as usual, but with no `LIMIT` (`Limit=0` omits the LIMIT clause so no events are dropped before the merge).
-2. **Fetch from each archive source** — DuckDB opens the Parquet files via `parquet_scan('glob/*.parquet')`, applies the same filters (schema, table, PK, time range, etc.) in DuckDB SQL, and returns `[]ResultRow`.
+2. **Fetch from each archive source** — DuckDB opens the Parquet files via `parquet_scan('glob/**/*.parquet')`, applies the same filters (schema, table, PK, time range, etc.) in DuckDB SQL, and returns `[]ResultRow`.
 3. **Merge** — results from all sources are combined, deduplicated by `event_id` (MySQL wins on duplicates, since it is appended first), sorted by `(event_timestamp, event_id)`, and then the user's `--limit` is applied once.
 
 ```
-bintrail query --archive-dir /data/archives --since "2026-02-01 00:00:00"
+bintrail query --archive-s3 s3://... --bintrail-id <uuid> --since "2026-02-01 00:00:00"
                      │
           ┌──────────┴──────────┐
           ▼                     ▼
-   MySQL index            DuckDB (local Parquet)
-   (live data)            /data/archives/*.parquet
+   MySQL index            DuckDB (S3 Parquet)
+   (live data)            s3://.../bintrail_id=<uuid>/**/*.parquet
           │                     │
           └──────────┬──────────┘
                      ▼
@@ -113,7 +143,7 @@ The merge path loads **all matching rows** from all sources into memory before a
 Recovery works because bintrail stores **full before and after images** for every row event. To undo an operation, you simply reverse it:
 
 | Original operation | Reversal |
-|-------------------|---------|
+|-------------------|_________|
 | `DELETE` | `INSERT` the deleted row back (from `row_before`) |
 | `UPDATE` | `UPDATE` back to `row_before` values, `WHERE` the current state matches `row_after` |
 | `INSERT` | `DELETE` the row (using `row_after` to identify it) |
