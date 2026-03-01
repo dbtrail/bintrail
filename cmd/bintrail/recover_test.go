@@ -50,6 +50,21 @@ func TestRecoverCmd_defaults(t *testing.T) {
 	}
 }
 
+func TestRecoverCmd_emptyStringDefaults(t *testing.T) {
+	for _, name := range []string{
+		"schema", "table", "pk", "event-type", "gtid", "since", "until", "output",
+	} {
+		f := recoverCmd.Flag(name)
+		if f == nil {
+			t.Errorf("flag --%s not registered", name)
+			continue
+		}
+		if f.DefValue != "" {
+			t.Errorf("flag --%s: expected empty default, got %q", name, f.DefValue)
+		}
+	}
+}
+
 func TestRecoverCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"index-dsn", "schema", "table", "pk", "event-type",
@@ -160,5 +175,47 @@ func TestRunRecover_invalidUntil(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--until") {
 		t.Errorf("expected '--until' in error, got: %v", err)
+	}
+}
+
+// ─── --pk partial flag combinations ──────────────────────────────────────────
+
+// TestRunRecover_pkWithSchemaOnly verifies that --pk + --schema (no --table)
+// is rejected — the OR guard fires when either schema or table is missing.
+func TestRunRecover_pkWithSchemaOnly(t *testing.T) {
+	savedPK, savedS, savedT, savedDry := rPK, rSchema, rTable, rDryRun
+	t.Cleanup(func() { rPK = savedPK; rSchema = savedS; rTable = savedT; rDryRun = savedDry })
+
+	rDryRun = true // pass the output/dry-run guard
+	rPK = "42"
+	rSchema = "mydb"
+	rTable = ""
+
+	err := runRecover(recoverCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --pk used with --schema but no --table, got nil")
+	}
+	if !strings.Contains(err.Error(), "--pk requires") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestRunRecover_pkWithTableOnly verifies that --pk + --table (no --schema)
+// is also rejected — the symmetric case of pkWithSchemaOnly.
+func TestRunRecover_pkWithTableOnly(t *testing.T) {
+	savedPK, savedS, savedT, savedDry := rPK, rSchema, rTable, rDryRun
+	t.Cleanup(func() { rPK = savedPK; rSchema = savedS; rTable = savedT; rDryRun = savedDry })
+
+	rDryRun = true
+	rPK = "42"
+	rSchema = ""
+	rTable = "orders"
+
+	err := runRecover(recoverCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --pk used with --table but no --schema, got nil")
+	}
+	if !strings.Contains(err.Error(), "--pk requires") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
