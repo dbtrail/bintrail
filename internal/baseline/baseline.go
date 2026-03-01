@@ -157,8 +157,10 @@ func processTable(ctx context.Context, tf TableFiles, outPath string, cfg Writer
 	var closed bool
 	defer func() {
 		if !closed {
-			w.Close()          //nolint
-			os.Remove(outPath) // remove partial file
+			w.Close() //nolint
+			if err := os.Remove(outPath); err != nil && !os.IsNotExist(err) {
+				slog.Warn("failed to remove partial file", "path", outPath, "error", err)
+			}
 		}
 	}()
 

@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/bintrail/bintrail/internal/archive"
+	"github.com/bintrail/bintrail/internal/baseline"
 	"github.com/bintrail/bintrail/internal/config"
 )
 
@@ -92,6 +93,11 @@ func runRotate(cmd *cobra.Command, args []string) error {
 	}
 	if rotArchiveS3 != "" && rotArchiveDir == "" {
 		return fmt.Errorf("--archive-s3 requires --archive-dir")
+	}
+	if rotArchiveDir != "" {
+		if err := baseline.ValidateCodec(rotArchiveCompression); err != nil {
+			return fmt.Errorf("--archive-compression: %w", err)
+		}
 	}
 
 	var retainDur time.Duration

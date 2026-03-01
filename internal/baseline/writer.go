@@ -38,6 +38,9 @@ type Writer struct {
 // cols is the list of columns in original MySQL order.
 // The output file is created at path; parent directories are created as needed.
 func NewWriter(path string, cols []Column, cfg WriterConfig) (*Writer, error) {
+	if err := ValidateCodec(cfg.Compression); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create output directory: %w", err)
 	}
@@ -234,7 +237,19 @@ func parseDateToDays(s string) (int32, error) {
 	return int32(days), nil
 }
 
-// resolveCodec returns the compress.Codec for the given name, or nil for "none"/unknown.
+// ValidateCodec checks that the compression codec name is supported.
+// Valid values: "zstd" (default), "snappy", "gzip", "none", or "".
+func ValidateCodec(name string) error {
+	switch strings.ToLower(name) {
+	case "zstd", "", "snappy", "gzip", "none":
+		return nil
+	default:
+		return fmt.Errorf("unsupported compression codec %q; valid values: zstd, snappy, gzip, none", name)
+	}
+}
+
+// resolveCodec returns the compress.Codec for the given name, or nil for "none".
+// Callers should validate with ValidateCodec first.
 func resolveCodec(name string) compress.Codec {
 	switch strings.ToLower(name) {
 	case "zstd", "":

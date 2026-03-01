@@ -91,7 +91,9 @@ func TestEndToEnd_fullPipeline(t *testing.T) {
 
 	// ── 7. Copy only the relevant binlog file from container ─────────────
 	binlogDir := filepath.Join(tmpDir, "binlogs")
-	os.MkdirAll(binlogDir, 0755)
+	if err := os.MkdirAll(binlogDir, 0755); err != nil {
+		t.Fatalf("failed to create binlog dir: %v", err)
+	}
 
 	cpCmd := exec.Command("docker", "cp",
 		fmt.Sprintf("bintrail-test-mysql:/var/lib/mysql/%s", currentBinlog),

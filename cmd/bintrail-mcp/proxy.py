@@ -12,21 +12,38 @@ Usage — add to Claude Desktop's mcpServers config
     "env": { "BINTRAIL_SERVER": "http://192.168.1.37:8080/mcp" }
   }
 
-Requires: Python 3.7+, no third-party packages.
+Requires: Python 3.7+, no third-party packages. This file is fully
+self-contained — copy it alone to the remote machine.
 
 Set BINTRAIL_LOG_LEVEL=DEBUG to enable diagnostic output on stderr.
 """
 
 import json
+import logging
 import os
 import sys
 import threading
 import urllib.request
 import urllib.error
 
-from log import setup_logging
 
-_log = setup_logging()
+def _setup_logging():
+    # type: () -> logging.Logger
+    level_name = os.environ.get("BINTRAIL_LOG_LEVEL", "WARNING").upper()
+    level = getattr(logging, level_name, logging.WARNING)
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+
+    logger = logging.getLogger("bintrail-proxy")
+    logger.setLevel(level)
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+_log = _setup_logging()
 
 SERVER_URL = os.environ.get("BINTRAIL_SERVER", "http://localhost:8080/mcp")
 
@@ -115,7 +132,12 @@ def _post(body):
                 buf += chunk
                 while b"\n" in buf:
                     idx = buf.index(b"\n")
-                    raw = buf[:idx].decode("utf-8").rstrip("\r")
+                    try:
+                        raw = buf[:idx].decode("utf-8").rstrip("\r")
+                    except UnicodeDecodeError:
+                        _log.warning("skipping non-UTF-8 SSE line")
+                        buf = buf[idx + 1:]
+                        continue
                     buf = buf[idx + 1:]
                     if raw.startswith("data:"):
                         data = raw[5:].strip()
