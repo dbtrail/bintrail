@@ -1,15 +1,18 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
+	"github.com/bintrail/bintrail/internal/parquetquery"
 	"github.com/bintrail/bintrail/internal/query"
 )
 
@@ -51,6 +54,8 @@ var (
 	qChangedCol string
 	qFormat     string
 	qLimit      int
+	qArchiveDir string
+	qArchiveS3  string
 )
 
 func init() {
@@ -65,6 +70,8 @@ func init() {
 	queryCmd.Flags().StringVar(&qChangedCol, "changed-column", "", "Filter UPDATEs that modified this column")
 	queryCmd.Flags().StringVar(&qFormat, "format", "table", "Output format: table, json, or csv")
 	queryCmd.Flags().IntVar(&qLimit, "limit", 100, "Maximum number of rows to return")
+	queryCmd.Flags().StringVar(&qArchiveDir, "archive-dir", "", "Local directory of Parquet archive files to include when data is not in the index")
+	queryCmd.Flags().StringVar(&qArchiveS3, "archive-s3", "", "S3 URL prefix of Parquet archive files to include (e.g. s3://bucket/prefix/)")
 	_ = queryCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(queryCmd)
@@ -109,7 +116,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		Limit:         qLimit,
 	}
 
-	// ── Connect and run ───────────────────────────────────────────────────────
+	// ── Connect and fetch from the index ─────────────────────────────────────
 	db, err := config.Connect(qIndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
@@ -117,7 +124,42 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 
 	engine := query.New(db)
-	n, err := engine.Run(cmd.Context(), opts, qFormat, os.Stdout)
+
+	// When no archive sources are configured, take the fast path (fetch + format
+	// in one step, same as before this feature was added).
+	if qArchiveDir == "" && qArchiveS3 == "" {
+		n, err := engine.Run(cmd.Context(), opts, qFormat, os.Stdout)
+		if err != nil {
+			return err
+		}
+		slog.Info("query complete",
+			"results", n,
+			"format", qFormat,
+			"duration_ms", time.Since(start).Milliseconds())
+		if qFormat == "table" && n > 0 {
+			fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
+		}
+		return nil
+	}
+
+	// ── Fetch from index + archives, then merge ───────────────────────────────
+	results, err := engine.Fetch(cmd.Context(), opts)
+	if err != nil {
+		return err
+	}
+
+	for _, src := range archiveSources() {
+		ar, err := parquetquery.Fetch(cmd.Context(), opts, src)
+		if err != nil {
+			slog.Warn("archive query failed, skipping", "source", src, "error", err)
+			continue
+		}
+		results = append(results, ar...)
+	}
+
+	results = mergeResults(results, opts.Limit)
+
+	n, err := query.Format(results, qFormat, os.Stdout)
 	if err != nil {
 		return err
 	}
@@ -126,13 +168,44 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		"results", n,
 		"format", qFormat,
 		"duration_ms", time.Since(start).Milliseconds())
-
-	if qFormat == "table" {
-		// Row count summary is only useful in table mode; JSON/CSV consumers
-		// count rows programmatically.
-		if n > 0 {
-			fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
-		}
+	if qFormat == "table" && n > 0 {
+		fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
 	}
 	return nil
+}
+
+// archiveSources returns the non-empty archive source flags as a slice.
+func archiveSources() []string {
+	var sources []string
+	if qArchiveDir != "" {
+		sources = append(sources, qArchiveDir)
+	}
+	if qArchiveS3 != "" {
+		sources = append(sources, qArchiveS3)
+	}
+	return sources
+}
+
+// mergeResults deduplicates rows by event_id, sorts by (event_timestamp, event_id),
+// and applies the limit. MySQL rows are always processed first, so in the rare case
+// of a duplicate event_id the index version is kept.
+func mergeResults(rows []query.ResultRow, limit int) []query.ResultRow {
+	seen := make(map[uint64]struct{}, len(rows))
+	unique := rows[:0]
+	for _, r := range rows {
+		if _, dup := seen[r.EventID]; !dup {
+			seen[r.EventID] = struct{}{}
+			unique = append(unique, r)
+		}
+	}
+	slices.SortFunc(unique, func(a, b query.ResultRow) int {
+		if c := a.EventTimestamp.Compare(b.EventTimestamp); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.EventID, b.EventID)
+	})
+	if limit > 0 && len(unique) > limit {
+		unique = unique[:limit]
+	}
+	return unique
 }

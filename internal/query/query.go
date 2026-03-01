@@ -82,13 +82,20 @@ func (e *Engine) Run(ctx context.Context, opts Options, format string, w io.Writ
 	if err != nil {
 		return 0, err
 	}
+	return Format(results, format, w)
+}
+
+// Format writes rows to w in the chosen format (table, json, or csv).
+// It is exported so callers that fetch from multiple sources (e.g. MySQL + Parquet
+// archives) can merge rows before formatting.
+func Format(rows []ResultRow, format string, w io.Writer) (int, error) {
 	switch strings.ToLower(format) {
 	case "json":
-		return writeJSON(results, w)
+		return writeJSON(rows, w)
 	case "csv":
-		return writeCSV(results, w)
+		return writeCSV(rows, w)
 	default:
-		return writeTable(results, w)
+		return writeTable(rows, w)
 	}
 }
 
