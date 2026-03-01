@@ -536,10 +536,16 @@ aws s3 sync \
 If you haven't run `bintrail init --s3-bucket` yet, create the bucket manually:
 
 ```bash
-# Create bucket (adjust region as needed)
+# Create bucket in us-east-1
 aws s3api create-bucket \
   --bucket bintrail-audit-baselines \
   --region us-east-1
+
+# For any other region, add --create-bucket-configuration (required by AWS):
+# aws s3api create-bucket \
+#   --bucket bintrail-audit-baselines \
+#   --region eu-west-1 \
+#   --create-bucket-configuration LocationConstraint=eu-west-1
 
 # Block public access
 aws s3api put-public-access-block \
