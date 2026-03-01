@@ -31,7 +31,9 @@ test:
 lint:
 	golangci-lint run ./...
 
-# Cross-compilation (requires aarch64-linux-gnu-gcc for linux/arm64)
+# Cross-compilation — requires CGO_ENABLED=1 (DuckDB uses pre-compiled C libraries).
+# linux/arm64: requires aarch64-linux-gnu-gcc (apt install gcc-aarch64-linux-gnu)
+# darwin targets: must be built on macOS (native toolchain handles both amd64/arm64)
 build-all:
 	GOOS=linux   GOARCH=amd64 CGO_ENABLED=1 go build $(BINTRAIL_LDFLAGS) -o dist/$(BINARY_NAME)-linux-amd64 ./cmd/bintrail
 	GOOS=linux   GOARCH=arm64 CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc go build $(BINTRAIL_LDFLAGS) -o dist/$(BINARY_NAME)-linux-arm64 ./cmd/bintrail
