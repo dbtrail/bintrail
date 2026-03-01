@@ -183,6 +183,55 @@ func TestParseTableFilter_onlyCommasAndSpaces(t *testing.T) {
 	}
 }
 
+// TestParseTableFilter_threeEntries verifies the split loop handles n>2 tables.
+func TestParseTableFilter_threeEntries(t *testing.T) {
+	got := parseTableFilter("db.a, db.b, db.c")
+	want := []string{"db.a", "db.b", "db.c"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("[%d] expected %q, got %q", i, want[i], got[i])
+		}
+	}
+}
+
+// TestParseTableFilter_trailingComma verifies that a trailing comma does not
+// produce an empty string entry — the TrimSpace+empty-check drops it.
+func TestParseTableFilter_trailingComma(t *testing.T) {
+	got := parseTableFilter("db.orders,")
+	if len(got) != 1 || got[0] != "db.orders" {
+		t.Errorf("expected [db.orders], got %v", got)
+	}
+}
+
+// TestParseS3URL_emptyBucketWithPath verifies that s3:///path (three slashes,
+// empty bucket name) is rejected — strings.Cut on "/" gives bucket="" which
+// hits the "bucket name is empty" guard.
+func TestParseS3URL_emptyBucketWithPath(t *testing.T) {
+	_, _, err := parseS3URL("s3:///some/path")
+	if err == nil {
+		t.Fatal("expected error for s3:///some/path (empty bucket), got nil")
+	}
+	if !strings.Contains(err.Error(), "bucket") {
+		t.Errorf("expected 'bucket' in error, got: %v", err)
+	}
+}
+
+// TestParseS3URL_prefixRetainsTrailingSlash verifies that a prefix that ends
+// with "/" is returned as-is (the function does not strip it — callers like
+// uploadBaselineToS3 handle normalisation with TrimSuffix).
+func TestParseS3URL_prefixRetainsTrailingSlash(t *testing.T) {
+	_, prefix, err := parseS3URL("s3://my-bucket/baselines/2026/")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if prefix != "baselines/2026/" {
+		t.Errorf("expected prefix %q, got %q", "baselines/2026/", prefix)
+	}
+}
+
 func TestRunBaselineMissingInput(t *testing.T) {
 	origInput, origOutput, origTS := bslInput, bslOutput, bslTimestamp
 	t.Cleanup(func() {
@@ -198,6 +247,35 @@ func TestRunBaselineMissingInput(t *testing.T) {
 
 	if err := runBaseline(baselineCmd, nil); err == nil {
 		t.Error("expected error for nonexistent input directory, got nil")
+	}
+}
+
+// TestRunBaseline_invalidUploadURL verifies that an invalid --upload value
+// (not starting with s3://) is caught by parseS3URL inside uploadBaselineToS3
+// and surfaces as an "S3 upload" error — without requiring AWS credentials.
+// baseline.Run with an empty input dir and a valid timestamp succeeds (0 tables),
+// so execution reaches the upload block before the URL validation fires.
+func TestRunBaseline_invalidUploadURL(t *testing.T) {
+	origInput, origOutput, origTS, origUpload :=
+		bslInput, bslOutput, bslTimestamp, bslUpload
+	t.Cleanup(func() {
+		bslInput = origInput
+		bslOutput = origOutput
+		bslTimestamp = origTS
+		bslUpload = origUpload
+	})
+
+	bslInput = t.TempDir() // empty dir → 0 tables → baseline.Run succeeds
+	bslOutput = t.TempDir()
+	bslTimestamp = "2025-02-28T00:00:00Z"
+	bslUpload = "http://not-s3.example.com/bucket" // invalid: not s3://
+
+	err := runBaseline(baselineCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid --upload URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "S3 upload") {
+		t.Errorf("expected 'S3 upload' in error, got: %v", err)
 	}
 }
 
