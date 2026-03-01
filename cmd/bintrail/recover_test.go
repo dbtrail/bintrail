@@ -219,3 +219,73 @@ func TestRunRecover_pkWithTableOnly(t *testing.T) {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
+
+// ─── positive-path guard tests ────────────────────────────────────────────────
+
+// TestRunRecover_outputSetPassesOutputCheck verifies that the output/dry-run
+// guard does NOT fire when --output is non-empty (even without --dry-run).
+func TestRunRecover_outputSetPassesOutputCheck(t *testing.T) {
+	savedOut, savedDry := rOutput, rDryRun
+	t.Cleanup(func() { rOutput = savedOut; rDryRun = savedDry })
+
+	rOutput = "/tmp/recovery.sql"
+	rDryRun = false
+
+	err := runRecover(recoverCmd, nil) // fails later at config.Connect — that's fine
+	if err != nil && strings.Contains(err.Error(), "--output or --dry-run") {
+		t.Errorf("output guard should not fire when --output is set, got: %v", err)
+	}
+}
+
+// TestRunRecover_dryRunPassesOutputCheck verifies that the output/dry-run
+// guard does NOT fire when --dry-run is true (even without --output).
+func TestRunRecover_dryRunPassesOutputCheck(t *testing.T) {
+	savedOut, savedDry := rOutput, rDryRun
+	t.Cleanup(func() { rOutput = savedOut; rDryRun = savedDry })
+
+	rOutput = ""
+	rDryRun = true
+
+	err := runRecover(recoverCmd, nil) // fails later at config.Connect — that's fine
+	if err != nil && strings.Contains(err.Error(), "--output or --dry-run") {
+		t.Errorf("output guard should not fire when --dry-run is set, got: %v", err)
+	}
+}
+
+// TestRunRecover_pkWithBothSchemaAndTablePassesGuard verifies the PK guard
+// does NOT fire when --pk, --schema, and --table are all provided.
+func TestRunRecover_pkWithBothSchemaAndTablePassesGuard(t *testing.T) {
+	savedPK, savedS, savedT, savedDry := rPK, rSchema, rTable, rDryRun
+	t.Cleanup(func() { rPK = savedPK; rSchema = savedS; rTable = savedT; rDryRun = savedDry })
+
+	rDryRun = true
+	rPK = "42"
+	rSchema = "mydb"
+	rTable = "orders"
+
+	err := runRecover(recoverCmd, nil) // fails later at config.Connect — that's fine
+	if err != nil && strings.Contains(err.Error(), "--pk requires") {
+		t.Errorf("PK guard should not fire when both --schema and --table are set, got: %v", err)
+	}
+}
+
+// TestRunRecover_validEventTypes verifies that INSERT, UPDATE, and DELETE are
+// all accepted by ParseEventType and do not trigger the event-type error.
+func TestRunRecover_validEventTypes(t *testing.T) {
+	for _, et := range []string{"INSERT", "UPDATE", "DELETE"} {
+		t.Run(et, func(t *testing.T) {
+			savedET, savedDry, savedPK := rEventType, rDryRun, rPK
+			t.Cleanup(func() { rEventType = savedET; rDryRun = savedDry; rPK = savedPK })
+
+			rDryRun = true
+			rPK = ""
+			rEventType = et
+
+			err := runRecover(recoverCmd, nil) // fails later at config.Connect
+			if err != nil && strings.Contains(err.Error(), et) &&
+				strings.Contains(strings.ToLower(err.Error()), "invalid") {
+				t.Errorf("event type %q should be valid, got: %v", et, err)
+			}
+		})
+	}
+}
