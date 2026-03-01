@@ -178,6 +178,70 @@ func TestBuildQuery_sinceUntil_nonHourAligned(t *testing.T) {
 	}
 }
 
+func TestBuildQuery_sinceOnly_nonHourAligned(t *testing.T) {
+	since := time.Date(2026, 2, 19, 14, 45, 0, 0, time.UTC)
+	opts := Options{Since: &since}
+	q, args := buildQuery(opts)
+
+	outerSince := mysqlToSeconds(time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC))
+	if !strings.Contains(q, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", outerSince)) {
+		t.Errorf("expected lower-bound hint in query: %s", q)
+	}
+	// Must NOT emit an upper-bound hint when Until is nil.
+	if strings.Contains(q, "TO_SECONDS(event_timestamp) <") {
+		t.Errorf("unexpected upper-bound TO_SECONDS hint when Until is nil: %s", q)
+	}
+	if args[0] != since {
+		t.Errorf("expected args[0]=since (%v), got %v", since, args[0])
+	}
+}
+
+func TestBuildQuery_untilOnly_nonHourAligned(t *testing.T) {
+	until := time.Date(2026, 2, 19, 15, 13, 0, 0, time.UTC)
+	opts := Options{Until: &until}
+	q, args := buildQuery(opts)
+
+	outerUntil := mysqlToSeconds(time.Date(2026, 2, 19, 16, 0, 0, 0, time.UTC))
+	if !strings.Contains(q, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", outerUntil)) {
+		t.Errorf("expected upper-bound hint in query: %s", q)
+	}
+	// Must NOT emit a lower-bound hint when Since is nil.
+	if strings.Contains(q, "TO_SECONDS(event_timestamp) >=") {
+		t.Errorf("unexpected lower-bound TO_SECONDS hint when Since is nil: %s", q)
+	}
+	if args[0] != until {
+		t.Errorf("expected args[0]=until (%v), got %v", until, args[0])
+	}
+}
+
+func TestBuildQuery_sinceNonAligned_untilAligned(t *testing.T) {
+	since := time.Date(2026, 2, 19, 14, 30, 0, 0, time.UTC)
+	until := time.Date(2026, 2, 19, 15, 0, 0, 0, time.UTC) // exact hour boundary
+	opts := Options{Since: &since, Until: &until}
+	q, _ := buildQuery(opts)
+
+	if !strings.Contains(q, "TO_SECONDS(event_timestamp) >=") {
+		t.Errorf("expected lower-bound TO_SECONDS hint: %s", q)
+	}
+	if strings.Contains(q, "TO_SECONDS(event_timestamp) <") {
+		t.Errorf("unexpected upper-bound TO_SECONDS hint for aligned until: %s", q)
+	}
+}
+
+func TestBuildQuery_sinceAligned_untilNonAligned(t *testing.T) {
+	since := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC) // exact hour boundary
+	until := time.Date(2026, 2, 19, 15, 13, 0, 0, time.UTC)
+	opts := Options{Since: &since, Until: &until}
+	q, _ := buildQuery(opts)
+
+	if strings.Contains(q, "TO_SECONDS(event_timestamp) >=") {
+		t.Errorf("unexpected lower-bound TO_SECONDS hint for aligned since: %s", q)
+	}
+	if !strings.Contains(q, "TO_SECONDS(event_timestamp) <") {
+		t.Errorf("expected upper-bound TO_SECONDS hint: %s", q)
+	}
+}
+
 func TestIsHourAligned(t *testing.T) {
 	cases := []struct {
 		t    time.Time

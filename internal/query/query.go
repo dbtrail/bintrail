@@ -18,11 +18,14 @@ import (
 )
 
 // mysqlToSecondsConst is the value of MySQL's TO_SECONDS('1970-01-01 00:00:00').
-// TO_SECONDS(t) == t.Unix() + mysqlToSecondsConst for any UTC datetime t.
+// MySQL counts seconds from the proleptic Gregorian year 0, not the Unix epoch;
+// the difference is exactly 719528 days (62167219200 seconds).
+// TO_SECONDS(t) == t.Unix() + mysqlToSecondsConst for any datetime t expressed in UTC.
 const mysqlToSecondsConst = int64(62167219200)
 
 // mysqlToSeconds returns the MySQL TO_SECONDS() value for t, matching the
 // RANGE(TO_SECONDS(event_timestamp)) partition expression stored as integers.
+// t is normalised to UTC, so callers do not need to convert in advance.
 func mysqlToSeconds(t time.Time) int64 {
 	return t.UTC().Unix() + mysqlToSecondsConst
 }
@@ -158,7 +161,8 @@ func buildQuery(opts Options) (string, []any) {
 	if opts.Until != nil {
 		until := *opts.Until
 		if !isHourAligned(until) {
-			// Outer upper bound: start of the hour after until (exclusive).
+			// Outer upper bound: truncate until to the hour, then advance one hour
+			// (exclusive). E.g. 15:13 → 16:00.
 			outerUntil := mysqlToSeconds(until.Truncate(time.Hour).Add(time.Hour))
 			where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", outerUntil))
 		}
