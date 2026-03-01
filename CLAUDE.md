@@ -82,23 +82,25 @@ Global persistent flags (all commands via `rootCmd.PersistentFlags`):
 - `--log-level` (default `info`) — slog level: debug, info, warn, error
 - `--log-format` (default `text`) — log format: text or json (JSON for log aggregators)
 
+Per-command `--format` flag (default `text`): every command accepts `--format text` (human-readable) or `--format json` (structured JSON to stdout). Query is the exception — its `--format` accepts `table`, `json`, or `csv` (validated by `IsValidFormat`). All other commands use `IsValidOutputFormat` (text/json). When `--format json` is active, errors are emitted as `{"error":"message"}` on stderr. The `outputJSON(v any)` helper in `main.go` handles consistent JSON encoding; `wantsJSON(root)` inspects the invoked command's `--format` flag to decide error formatting. `SilenceErrors: true` on rootCmd lets `main()` control error output.
+
 | Command | File | Key flags |
 |---|---|---|
-| `init` | `init.go` | `--index-dsn` (req), `--partitions` (default 48), `--encrypt`, `--s3-bucket`, `--s3-region` (default `us-east-1`), `--s3-arn` |
-| `snapshot` | `snapshot.go` | `--source-dsn` (req), `--index-dsn` (req), `--schemas` |
-| `index` | `index.go` | `--index-dsn` (req), `--source-dsn`, `--binlog-dir` (req), `--files`, `--all`, `--batch-size`, `--schemas`, `--tables` |
-| `query` | `query.go` | `--index-dsn` (req), `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`, `--since`, `--until`, `--changed-column`, `--format`, `--limit`, `--archive-dir`, `--archive-s3` |
-| `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000) |
-| `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future`, `--archive-dir`, `--archive-compression` (default `zstd`) |
-| `status` | `status.go` | `--index-dsn` (req) |
-| `stream` | `stream.go` | … + `--metrics-addr` (e.g. `:9090`; empty = disabled) |
-| `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint` |
-| `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path` (default `mydumper`), `--threads` (default 4) |
-| `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression` (default `zstd`), `--row-group-size` (default 500000), `--upload` (S3 URL), `--upload-region` |
+| `init` | `init.go` | `--index-dsn` (req), `--partitions` (default 48), `--encrypt`, `--s3-bucket`, `--s3-region` (default `us-east-1`), `--s3-arn`, `--format` |
+| `snapshot` | `snapshot.go` | `--source-dsn` (req), `--index-dsn` (req), `--schemas`, `--format` |
+| `index` | `index.go` | `--index-dsn` (req), `--source-dsn`, `--binlog-dir` (req), `--files`, `--all`, `--batch-size`, `--schemas`, `--tables`, `--format` |
+| `query` | `query.go` | `--index-dsn` (req), `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`, `--since`, `--until`, `--changed-column`, `--format` (table/json/csv), `--limit`, `--archive-dir`, `--archive-s3` |
+| `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000), `--format` |
+| `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future`, `--archive-dir`, `--archive-compression` (default `zstd`), `--format` |
+| `status` | `status.go` | `--index-dsn` (req), `--format` |
+| `stream` | `stream.go` | … + `--metrics-addr` (e.g. `:9090`; empty = disabled), `--format` |
+| `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint`, `--format` |
+| `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path` (default `mydumper`), `--threads` (default 4), `--format` |
+| `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression` (default `zstd`), `--row-group-size` (default 500000), `--upload` (S3 URL), `--upload-region`, `--format` |
 
 Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `rotArchiveDir`, `rotArchiveCompression`, `stIndexDSN`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`).
 
-Filter helpers (`ParseEventType`, `ParseTime`, `IsValidFormat`) live in `internal/cliutil` and are shared by both `cmd/bintrail/` commands and `cmd/bintrail-mcp/`.
+Filter helpers (`ParseEventType`, `ParseTime`, `IsValidFormat`, `IsValidOutputFormat`) live in `internal/cliutil` and are shared by both `cmd/bintrail/` commands and `cmd/bintrail-mcp/`.
 
 ## MCP server
 

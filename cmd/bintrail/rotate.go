@@ -212,7 +212,9 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 		}
 
 		if len(toDrop) == 0 {
-			fmt.Fprintf(os.Stdout, "no partitions older than %s to drop\n", rotRetain)
+			if rotFormat != "json" {
+				fmt.Fprintf(os.Stdout, "no partitions older than %s to drop\n", rotRetain)
+			}
 		} else {
 			// Archive partitions to Parquet before dropping, if requested.
 			if rotArchiveDir != "" {
@@ -242,7 +244,9 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					if err != nil {
 						return 0, 0, fmt.Errorf("archive partition %s: %w", name, err)
 					}
-					fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) \u2192 %s\n", name, n, outPath)
+					if rotFormat != "json" {
+						fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) \u2192 %s\n", name, n, outPath)
+					}
 
 					if s3Client != nil {
 						key, err := buildS3Key(rotArchiveDir, outPath, s3Prefix)
@@ -261,7 +265,9 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 				return 0, 0, fmt.Errorf("failed to drop partitions: %w", err)
 			}
 			for _, name := range toDrop {
-				fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+				if rotFormat != "json" {
+					fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+				}
 			}
 			droppedCount = len(toDrop)
 			// Refresh list so nextPartitionStart sees current state.
@@ -294,7 +300,9 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 			return 0, 0, fmt.Errorf("failed to add future partitions: %w", err)
 		}
 		for i := range toAdd {
-			fmt.Fprintf(os.Stdout, "added partition %s\n", partitionName(startDate.Add(time.Duration(i)*time.Hour)))
+			if rotFormat != "json" {
+				fmt.Fprintf(os.Stdout, "added partition %s\n", partitionName(startDate.Add(time.Duration(i)*time.Hour)))
+			}
 		}
 	}
 
