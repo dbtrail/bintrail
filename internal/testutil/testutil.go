@@ -142,6 +142,7 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		changed_columns JSON             DEFAULT NULL,
 		row_before      JSON             DEFAULT NULL,
 		row_after       JSON             DEFAULT NULL,
+		schema_version  INT UNSIGNED     NOT NULL DEFAULT 0,
 		PRIMARY KEY (event_id, event_timestamp),
 		INDEX idx_row_lookup (schema_name, table_name, event_timestamp),
 		INDEX idx_pk_hash    (schema_name, table_name, pk_hash, event_timestamp),

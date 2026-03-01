@@ -81,14 +81,14 @@ func (idx *Indexer) BatchSize() int {
 // event_id and pk_hash are omitted — they are AUTO_INCREMENT and STORED
 // generated respectively, so MySQL computes them on write.
 func (idx *Indexer) insertBatch(batch []parser.Event) (int64, error) {
-	// 12 placeholders per row
-	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
+	// 13 placeholders per row
+	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
 	insertSQL := `INSERT INTO binlog_events ` +
 		`(binlog_file, start_pos, end_pos, event_timestamp, gtid, ` +
 		`schema_name, table_name, event_type, pk_values, ` +
-		`changed_columns, row_before, row_after) VALUES ` + valClause
+		`changed_columns, row_before, row_after, schema_version) VALUES ` + valClause
 
-	args := make([]any, 0, len(batch)*12)
+	args := make([]any, 0, len(batch)*13)
 	for i := range batch {
 		ev := &batch[i]
 
@@ -118,6 +118,7 @@ func (idx *Indexer) insertBatch(batch []parser.Event) (int64, error) {
 			changed,
 			rowBefore,
 			rowAfter,
+			ev.SchemaVersion,
 		)
 	}
 
