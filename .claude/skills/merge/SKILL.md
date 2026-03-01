@@ -34,17 +34,26 @@ Follow these steps **in order**. Do not skip steps.
    ```
    If this fails with "remote ref does not exist", the branch was already deleted — that's fine, continue.
 
-6. **Delete the local branch** (must happen before worktree removal — removing the worktree destroys the session's cwd, which bricks all subsequent Bash commands):
+6. **Remove the worktree and delete the local branch in one command** — these two steps must be combined because:
+   - Git refuses to delete a branch that is still checked out in a worktree.
+   - Removing the worktree destroys the session's CWD, bricking any subsequent Bash commands.
+   - Solving both: `cd` to `<main-repo>` first, remove the worktree, then delete the branch — all in a single shell command so the CWD lands on the main repo before the worktree directory disappears.
+
+   If `<worktree-path>` is non-empty and still registered (check with `git -C <main-repo> worktree list`):
+   ```bash
+   cd <main-repo> && git worktree remove <worktree-path> --force && git branch -D <branch>
+   ```
+
+   If git says the worktree path "does not exist" (stale metadata), prune first:
+   ```bash
+   cd <main-repo> && git worktree prune && git branch -D <branch>
+   ```
+
+   If `<worktree-path>` is empty (merge was run from main repo, not a worktree):
    ```bash
    git -C <main-repo> branch -d <branch>
    ```
-   If `-d` refuses because git doesn't recognize the branch as merged (can happen with squash merges), use `-D` instead.
-
-7. **Remove the worktree** (only if `<worktree-path>` is non-empty and exists). `cd` into `<main-repo>` first in the same command so the Bash tool's persistent CWD lands on a directory that still exists — without this, the shell bricks after the directory is deleted:
-   ```bash
-   cd <main-repo> && git worktree remove <worktree-path> --force
-   ```
-   Use `--force` because the branch is already merged.
+   Use `-D` if `-d` refuses (squash merges are not recognized as merged by git).
 
 8. **Report**: Print a summary:
    - PR #$ARGUMENTS merged (squash)
