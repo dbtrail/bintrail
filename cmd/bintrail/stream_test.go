@@ -303,6 +303,19 @@ func TestStreamCmd_requiredFlags(t *testing.T) {
 	}
 }
 
+// TestStreamCmd_allFlagsRegistered verifies that all expected flags are wired up.
+func TestStreamCmd_allFlagsRegistered(t *testing.T) {
+	for _, name := range []string{
+		"index-dsn", "source-dsn", "server-id",
+		"start-file", "start-pos", "start-gtid",
+		"batch-size", "schemas", "tables", "checkpoint", "metrics-addr",
+	} {
+		if streamCmd.Flag(name) == nil {
+			t.Errorf("flag --%s not registered on streamCmd", name)
+		}
+	}
+}
+
 // TestStreamCmd_defaults verifies that optional flags have the expected defaults.
 func TestStreamCmd_defaults(t *testing.T) {
 	cases := []struct {
@@ -322,5 +335,57 @@ func TestStreamCmd_defaults(t *testing.T) {
 		if f.DefValue != tc.want {
 			t.Errorf("flag --%s: expected default %q, got %q", tc.flag, tc.want, f.DefValue)
 		}
+	}
+}
+
+// TestStreamCmd_emptyStringDefaults verifies that optional string flags default to "".
+func TestStreamCmd_emptyStringDefaults(t *testing.T) {
+	for _, name := range []string{"start-file", "start-gtid", "schemas", "tables", "metrics-addr"} {
+		f := streamCmd.Flag(name)
+		if f == nil {
+			t.Errorf("flag --%s not registered", name)
+			continue
+		}
+		if f.DefValue != "" {
+			t.Errorf("flag --%s: expected empty default, got %q", name, f.DefValue)
+		}
+	}
+}
+
+// ─── resolveStart additional paths ───────────────────────────────────────────
+
+// TestResolveStart_customStartPos verifies that a non-default startPos is
+// preserved through the position-mode path (not hardcoded to 4).
+func TestResolveStart_customStartPos(t *testing.T) {
+	_, _, _, pos, _, err := resolveStart("binlog.000001", "", 1234, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pos != 1234 {
+		t.Errorf("expected pos=1234, got %d", pos)
+	}
+}
+
+// TestResolveStart_gtidFlagOverridesSavedState verifies that --start-gtid wins
+// over a saved position-mode state (the symmetric case to flagsOverrideSavedState).
+func TestResolveStart_gtidFlagOverridesSavedState(t *testing.T) {
+	saved := &streamState{
+		mode:       "position",
+		binlogFile: "binlog.000010",
+		binlogPos:  9999,
+	}
+	gtidSet := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5"
+	mode, _, returnedGTID, _, accGTID, err := resolveStart("", gtidSet, 4, saved)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != "gtid" {
+		t.Errorf("expected mode=gtid, got %q", mode)
+	}
+	if returnedGTID != gtidSet {
+		t.Errorf("expected GTID=%q, got %q", gtidSet, returnedGTID)
+	}
+	if accGTID == nil {
+		t.Error("expected non-nil accGTID when flag GTID overrides saved state")
 	}
 }
