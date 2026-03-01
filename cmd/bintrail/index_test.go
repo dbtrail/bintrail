@@ -3,8 +3,80 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// ─── cobra command wiring ─────────────────────────────────────────────────────
+
+func TestIndexCmd_registered(t *testing.T) {
+	found := false
+	for _, cmd := range rootCmd.Commands() {
+		if cmd.Use == "index" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'index' command to be registered under rootCmd")
+	}
+}
+
+func TestIndexCmd_requiredFlags(t *testing.T) {
+	for _, name := range []string{"index-dsn", "binlog-dir"} {
+		flag := indexCmd.Flag(name)
+		if flag == nil {
+			t.Fatalf("flag --%s not registered", name)
+		}
+		if flag.Annotations["cobra_annotation_bash_completion_one_required_flag"] == nil {
+			t.Errorf("flag --%s is not marked required", name)
+		}
+	}
+}
+
+func TestIndexCmd_allFlagsRegistered(t *testing.T) {
+	for _, name := range []string{
+		"index-dsn", "source-dsn", "binlog-dir", "files", "all", "batch-size", "schemas", "tables",
+	} {
+		if indexCmd.Flag(name) == nil {
+			t.Errorf("flag --%s not registered on indexCmd", name)
+		}
+	}
+}
+
+func TestIndexCmd_defaults(t *testing.T) {
+	cases := []struct{ flag, want string }{
+		{"batch-size", "1000"},
+		{"all", "false"},
+	}
+	for _, tc := range cases {
+		f := indexCmd.Flag(tc.flag)
+		if f == nil {
+			t.Fatalf("flag --%s not registered", tc.flag)
+		}
+		if f.DefValue != tc.want {
+			t.Errorf("flag --%s: expected default %q, got %q", tc.flag, tc.want, f.DefValue)
+		}
+	}
+}
+
+// ─── runIndex validation (no DB required) ─────────────────────────────────────
+
+func TestRunIndex_noFilesOrAll(t *testing.T) {
+	savedFiles, savedAll := idxFiles, idxAll
+	t.Cleanup(func() { idxFiles = savedFiles; idxAll = savedAll })
+
+	idxFiles = ""
+	idxAll = false
+
+	err := runIndex(indexCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when neither --files nor --all is set, got nil")
+	}
+	if !strings.Contains(err.Error(), "--files or --all") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
 
 // ─── binlogFileRe ────────────────────────────────────────────────────────────
 
@@ -183,5 +255,51 @@ func TestFindBinlogFiles_skipsDirectories(t *testing.T) {
 	}
 	if len(files) != 1 || files[0] != "binlog.000002" {
 		t.Errorf("expected [binlog.000002] (directory skipped), got %v", files)
+	}
+}
+
+// ─── binlogFileRe end-anchor ──────────────────────────────────────────────────
+
+// TestBinlogFileRe_trailingSuffix verifies that the $ anchor in binlogFileRe
+// prevents matching filenames where the digit sequence is not at the end.
+func TestBinlogFileRe_trailingSuffix(t *testing.T) {
+	cases := []struct {
+		name  string
+		match bool
+	}{
+		{"binlog.000001.bak", false},    // digits not at end
+		{"binlog.000001-relay", false},  // digits not at end
+		{"binlog.000001", true},         // digits at end — baseline check
+		{"mysql-bin.000001.gz", false},  // compressed backup
+	}
+	for _, tc := range cases {
+		got := binlogFileRe.MatchString(tc.name)
+		if got != tc.match {
+			t.Errorf("binlogFileRe.MatchString(%q) = %v, want %v", tc.name, got, tc.match)
+		}
+	}
+}
+
+// ─── resolveFiles with all=true ───────────────────────────────────────────────
+
+// TestResolveFiles_allTrue verifies that resolveFiles delegates to findBinlogFiles
+// when all=true, returning only the matching files from the directory.
+func TestResolveFiles_allTrue(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"binlog.000001", "binlog.000002", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte{}, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	files, err := resolveFiles(dir, "", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 binlog files, got %d: %v", len(files), files)
+	}
+	if files[0] != "binlog.000001" || files[1] != "binlog.000002" {
+		t.Errorf("expected [binlog.000001 binlog.000002], got %v", files)
 	}
 }
