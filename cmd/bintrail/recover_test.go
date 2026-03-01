@@ -37,6 +37,7 @@ func TestRecoverCmd_defaults(t *testing.T) {
 	}{
 		{"limit", "1000"},
 		{"dry-run", "false"},
+		{"format", "text"},
 	}
 	for _, tc := range cases {
 		f := recoverCmd.Flag(tc.flag)

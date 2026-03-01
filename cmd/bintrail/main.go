@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -32,6 +33,7 @@ binlog files still existing on disk.`,
 		observe.Setup(os.Stderr, logFormat, logLevel)
 		return nil
 	},
+	SilenceErrors: true, // we handle error output ourselves in main()
 }
 
 func init() {
@@ -42,7 +44,33 @@ func init() {
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		if wantsJSON(rootCmd) {
+			json.NewEncoder(os.Stderr).Encode(map[string]string{"error": err.Error()})
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		os.Exit(1)
 	}
+}
+
+// outputJSON encodes v as indented JSON to stdout.
+func outputJSON(v any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+// wantsJSON reports whether the active command has a --format flag set to "json".
+func wantsJSON(root *cobra.Command) bool {
+	// CalledAs returns the command that was actually invoked.
+	// Walk the command tree to find the leaf command.
+	cmd, _, _ := root.Find(os.Args[1:])
+	if cmd == nil {
+		return false
+	}
+	f := cmd.Flags().Lookup("format")
+	if f == nil {
+		return false
+	}
+	return f.Value.String() == "json"
 }
