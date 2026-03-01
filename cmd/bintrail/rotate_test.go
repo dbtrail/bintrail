@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// ─── parseRetain ─────────────────────────────────────────────────────────────
+// ─── parseRetain ───────────────────────────────────────────────────────────────
 
 func TestParseRetain_days(t *testing.T) {
 	d, err := parseRetain("7d")
@@ -55,7 +55,7 @@ func TestParseRetain_invalid(t *testing.T) {
 	}
 }
 
-// ─── partitionDate ────────────────────────────────────────────────────────────
+// ─── partitionDate ──────────────────────────────────────────────────────────────
 
 func TestPartitionDate_valid(t *testing.T) {
 	d, ok := partitionDate("p_2026021900")
@@ -94,7 +94,7 @@ func TestPartitionDate_invalid(t *testing.T) {
 	}
 }
 
-// ─── partitionName ───────────────────────────────────────────────────────────
+// ─── partitionName ──────────────────────────────────────────────────────────────
 
 func TestPartitionName(t *testing.T) {
 	d := time.Date(2026, 2, 19, 0, 0, 0, 0, time.UTC)
@@ -117,7 +117,7 @@ func TestPartitionName_roundTrip(t *testing.T) {
 	}
 }
 
-// ─── nextPartitionStart ───────────────────────────────────────────────────────
+// ─── nextPartitionStart ─────────────────────────────────────────────────────────────
 
 func TestNextPartitionStart_withNamedPartitions(t *testing.T) {
 	partitions := []partitionInfo{
@@ -153,7 +153,7 @@ func TestNextPartitionStart_empty(t *testing.T) {
 	}
 }
 
-// ─── addFuturePartitions SQL shape ───────────────────────────────────────────
+// ─── addFuturePartitions SQL shape ────────────────────────────────────────────
 
 // TestPartitionSpec_shape verifies the generated DDL looks correct without
 // needing a live database.
@@ -187,7 +187,7 @@ func TestPartitionSpec_shape(t *testing.T) {
 	}
 }
 
-// ─── autoAdd calculation ──────────────────────────────────────────────────────
+// ─── autoAdd calculation ────────────────────────────────────────────────────
 
 // TestAutoAddReplacesDropped verifies the toAdd formula for both default and
 // --no-replace modes.
@@ -218,7 +218,7 @@ func TestAutoAddReplacesDropped(t *testing.T) {
 	}
 }
 
-// ─── cobra command wiring ─────────────────────────────────────────────────────
+// ─── cobra command wiring ────────────────────────────────────────────────────
 
 func TestRotateCmd_registered(t *testing.T) {
 	found := false
@@ -254,7 +254,7 @@ func TestRotateCmd_allFlagsRegistered(t *testing.T) {
 	}
 }
 
-// ─── runRotate validation (no DB required) ────────────────────────────────────
+// ─── runRotate validation (no DB required) ──────────────────────────────────
 
 func TestRunRotate_archiveS3RequiresArchiveDir(t *testing.T) {
 	savedRetain, savedAdd, savedDSN, savedArchiveDir, savedArchiveS3 :=
@@ -331,7 +331,7 @@ func TestRunRotate_missingDBName(t *testing.T) {
 	}
 }
 
-// ─── parseRetain boundary values ─────────────────────────────────────────────
+// ─── parseRetain boundary values ─────────────────────────────────────────────────
 
 func TestParseRetain_minimumHour(t *testing.T) {
 	d, err := parseRetain("1h")
@@ -353,7 +353,7 @@ func TestParseRetain_minimumDay(t *testing.T) {
 	}
 }
 
-// ─── cobra flag defaults ──────────────────────────────────────────────────────
+// ─── cobra flag defaults ────────────────────────────────────────────────────
 
 func TestRotateCmd_defaults(t *testing.T) {
 	cases := []struct{ flag, want string }{
@@ -384,7 +384,7 @@ func TestRotateCmd_emptyStringDefaults(t *testing.T) {
 	}
 }
 
-// ─── runRotate positive-path guard tests ──────────────────────────────────────
+// ─── runRotate positive-path guard tests ────────────────────────────────────────
 
 // TestRunRotate_addFutureAlonePassesFirstGuard verifies that providing only
 // --add-future (no --retain) passes the "at least one of" guard.
@@ -421,7 +421,7 @@ func TestRunRotate_retainAlonePassesFirstGuard(t *testing.T) {
 	}
 }
 
-// ─── nextPartitionStart unsorted input ────────────────────────────────────────
+// ─── nextPartitionStart unsorted input ───────────────────────────────────────────
 
 func TestNextPartitionStart_unsortedOrder(t *testing.T) {
 	// Deliberately out of order — must find the maximum date, not the last element.
@@ -434,5 +434,53 @@ func TestNextPartitionStart_unsortedOrder(t *testing.T) {
 	next := nextPartitionStart(partitions)
 	if next.Year() != 2026 || next.Month() != 2 || next.Day() != 19 || next.Hour() != 1 {
 		t.Errorf("expected 2026-02-19 01:00 (max+1h), got %v", next)
+	}
+}
+
+// ─── daemon flag wiring ─────────────────────────────────────────────────────────
+
+func TestRotateCmd_daemonFlagRegistered(t *testing.T) {
+	f := rotateCmd.Flag("daemon")
+	if f == nil {
+		t.Fatal("flag --daemon not registered on rotateCmd")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("expected default false, got %q", f.DefValue)
+	}
+}
+
+func TestRotateCmd_intervalDefault(t *testing.T) {
+	f := rotateCmd.Flag("interval")
+	if f == nil {
+		t.Fatal("flag --interval not registered on rotateCmd")
+	}
+	if f.DefValue != "1h" {
+		t.Errorf("expected default 1h, got %q", f.DefValue)
+	}
+}
+
+func TestRunRotate_daemonInvalidInterval(t *testing.T) {
+	savedRetain, savedAdd, savedDSN, savedDaemon, savedInterval :=
+		rotRetain, rotAddFuture, rotIndexDSN, rotDaemon, rotInterval
+	t.Cleanup(func() {
+		rotRetain = savedRetain
+		rotAddFuture = savedAdd
+		rotIndexDSN = savedDSN
+		rotDaemon = savedDaemon
+		rotInterval = savedInterval
+	})
+
+	rotRetain = "7d"
+	rotAddFuture = 0
+	rotIndexDSN = "user:pass@tcp(localhost:3306)/binlog_index"
+	rotDaemon = true
+	rotInterval = "notaduration"
+
+	err := runRotate(rotateCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid --interval, got nil")
+	}
+	if !strings.Contains(err.Error(), "--interval") {
+		t.Errorf("expected '--interval' in error, got: %v", err)
 	}
 }
