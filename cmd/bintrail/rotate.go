@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
@@ -54,6 +55,8 @@ var (
 	rotArchiveDir         string
 	rotArchiveCompression string
 	rotBintrailID         string
+	rotArchiveS3          string
+	rotArchiveS3Region    string
 )
 
 func init() {
@@ -64,6 +67,8 @@ func init() {
 	rotateCmd.Flags().StringVar(&rotArchiveDir, "archive-dir", "", "Directory to write Parquet archives before dropping partitions (required with --bintrail-id)")
 	rotateCmd.Flags().StringVar(&rotArchiveCompression, "archive-compression", "zstd", "Compression for archive Parquet files (zstd, snappy, gzip, none)")
 	rotateCmd.Flags().StringVar(&rotBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir is set); archives are written under bintrail_id=<uuid>/event_date=<date>/")
+	rotateCmd.Flags().StringVar(&rotArchiveS3, "archive-s3", "", "S3 destination URL to upload Parquet archives after writing (requires --archive-dir; e.g. s3://my-bucket/archives/)")
+	rotateCmd.Flags().StringVar(&rotArchiveS3Region, "archive-s3-region", "", "AWS region for --archive-s3 (default: from AWS_REGION env var or ~/.aws/config)")
 	_ = rotateCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(rotateCmd)
@@ -77,6 +82,9 @@ func runRotate(cmd *cobra.Command, args []string) error {
 	}
 	if rotArchiveDir != "" && rotBintrailID == "" {
 		return fmt.Errorf("--bintrail-id is required when --archive-dir is set")
+	}
+	if rotArchiveS3 != "" && rotArchiveDir == "" {
+		return fmt.Errorf("--archive-s3 requires --archive-dir")
 	}
 
 	var retainDur time.Duration
@@ -131,6 +139,20 @@ func runRotate(cmd *cobra.Command, args []string) error {
 		} else {
 			// Archive partitions to Parquet before dropping, if requested.
 			if rotArchiveDir != "" {
+				// Set up S3 client once for all uploads (nil when --archive-s3 is not set).
+				var s3Client *s3.Client
+				var s3Bucket, s3Prefix string
+				if rotArchiveS3 != "" {
+					s3Bucket, s3Prefix, err = parseS3URL(rotArchiveS3)
+					if err != nil {
+						return fmt.Errorf("invalid --archive-s3: %w", err)
+					}
+					s3Client, err = newS3Client(ctx, rotArchiveS3Region)
+					if err != nil {
+						return fmt.Errorf("init S3 client: %w", err)
+					}
+				}
+
 				for _, name := range toDrop {
 					outPath, err := hiveArchivePath(rotArchiveDir, rotBintrailID, name)
 					if err != nil {
@@ -144,6 +166,18 @@ func runRotate(cmd *cobra.Command, args []string) error {
 						return fmt.Errorf("archive partition %s: %w", name, err)
 					}
 					fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) → %s\n", name, n, outPath)
+
+					if s3Client != nil {
+						rel, _ := filepath.Rel(rotArchiveDir, outPath)
+						key := filepath.ToSlash(rel)
+						if s3Prefix != "" {
+							key = strings.TrimSuffix(s3Prefix, "/") + "/" + key
+						}
+						if err := uploadFile(ctx, s3Client, outPath, s3Bucket, key); err != nil {
+							return fmt.Errorf("upload %s to S3: %w", name, err)
+						}
+						slog.Debug("uploaded archive to S3", "partition", name, "bucket", s3Bucket, "key", key)
+					}
 				}
 			}
 

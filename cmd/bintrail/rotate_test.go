@@ -244,7 +244,10 @@ func TestRotateCmd_indexDSN_required(t *testing.T) {
 }
 
 func TestRotateCmd_allFlagsRegistered(t *testing.T) {
-	for _, name := range []string{"index-dsn", "retain", "add-future", "no-replace", "archive-dir", "archive-compression"} {
+	for _, name := range []string{
+		"index-dsn", "retain", "add-future", "no-replace",
+		"archive-dir", "archive-compression", "archive-s3", "archive-s3-region",
+	} {
 		if rotateCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on rotateCmd", name)
 		}
@@ -252,6 +255,32 @@ func TestRotateCmd_allFlagsRegistered(t *testing.T) {
 }
 
 // ─── runRotate validation (no DB required) ────────────────────────────────────
+
+func TestRunRotate_archiveS3RequiresArchiveDir(t *testing.T) {
+	savedRetain, savedAdd, savedDSN, savedArchiveDir, savedArchiveS3 :=
+		rotRetain, rotAddFuture, rotIndexDSN, rotArchiveDir, rotArchiveS3
+	t.Cleanup(func() {
+		rotRetain = savedRetain
+		rotAddFuture = savedAdd
+		rotIndexDSN = savedDSN
+		rotArchiveDir = savedArchiveDir
+		rotArchiveS3 = savedArchiveS3
+	})
+
+	rotRetain = "7d"
+	rotAddFuture = 0
+	rotIndexDSN = "user:pass@tcp(localhost:3306)/binlog_index"
+	rotArchiveDir = "" // not set
+	rotArchiveS3 = "s3://my-bucket/archives/"
+
+	err := runRotate(rotateCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --archive-s3 is set without --archive-dir, got nil")
+	}
+	if !strings.Contains(err.Error(), "--archive-s3 requires --archive-dir") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
 
 func TestRunRotate_noFlagsError(t *testing.T) {
 	savedRetain, savedAdd, savedNoReplace := rotRetain, rotAddFuture, rotNoReplace
@@ -344,7 +373,7 @@ func TestRotateCmd_defaults(t *testing.T) {
 }
 
 func TestRotateCmd_emptyStringDefaults(t *testing.T) {
-	for _, name := range []string{"retain", "archive-dir"} {
+	for _, name := range []string{"retain", "archive-dir", "archive-s3", "archive-s3-region"} {
 		f := rotateCmd.Flag(name)
 		if f == nil {
 			t.Fatalf("flag --%s not registered", name)

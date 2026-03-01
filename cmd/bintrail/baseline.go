@@ -34,14 +34,14 @@ Output structure:
 }
 
 var (
-	bslInput         string
-	bslOutput        string
-	bslTimestamp     string
-	bslTables        string
-	bslCompression   string
-	bslRowGroupSize  int
-	bslUpload        string
-	bslUploadRegion  string
+	bslInput        string
+	bslOutput       string
+	bslTimestamp    string
+	bslTables       string
+	bslCompression  string
+	bslRowGroupSize int
+	bslUpload       string
+	bslUploadRegion string
 )
 
 func init() {
@@ -125,6 +125,21 @@ func parseS3URL(u string) (bucket, prefix string, err error) {
 	return bucket, prefix, nil
 }
 
+// newS3Client creates an S3 client using the default AWS credential chain.
+// region is optional — if empty, the SDK resolves it from AWS_REGION env var
+// or ~/.aws/config.
+func newS3Client(ctx context.Context, region string) (*s3.Client, error) {
+	opts := []func(*awsconfig.LoadOptions) error{}
+	if region != "" {
+		opts = append(opts, awsconfig.WithRegion(region))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+	return s3.NewFromConfig(awsCfg), nil
+}
+
 // uploadBaselineToS3 walks outputDir and uploads every file to the S3 URL,
 // preserving the relative directory structure under the prefix. region is
 // optional — if empty, the AWS SDK resolves it from AWS_REGION env var or
@@ -135,15 +150,10 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string) (i
 		return 0, fmt.Errorf("invalid --upload URL: %w", err)
 	}
 
-	opts := []func(*awsconfig.LoadOptions) error{}
-	if region != "" {
-		opts = append(opts, awsconfig.WithRegion(region))
-	}
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	client, err := newS3Client(ctx, region)
 	if err != nil {
-		return 0, fmt.Errorf("load AWS config: %w", err)
+		return 0, err
 	}
-	client := s3.NewFromConfig(awsCfg)
 
 	var count int
 	err = filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, walkErr error) error {
