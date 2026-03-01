@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-03-01
+
 ### Fixed
 - Nil dereference in `parser.New()` when resolver is nil (crash risk)
 - MCP HTTP server now shuts down gracefully on SIGINT/SIGTERM
