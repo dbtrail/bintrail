@@ -68,6 +68,37 @@ func TestRunBaselineTimestampParsing(t *testing.T) {
 	}
 }
 
+func TestParseS3URL(t *testing.T) {
+	cases := []struct {
+		input      string
+		wantBucket string
+		wantPrefix string
+		wantErr    bool
+	}{
+		{"s3://my-bucket", "my-bucket", "", false},
+		{"s3://my-bucket/", "my-bucket", "", false},
+		{"s3://my-bucket/baselines/", "my-bucket", "baselines/", false},
+		{"s3://my-bucket/prefix/sub", "my-bucket", "prefix/sub", false},
+		{"http://my-bucket/prefix", "", "", true},
+		{"s3://", "", "", true},
+	}
+	for _, tc := range cases {
+		bucket, prefix, err := parseS3URL(tc.input)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("parseS3URL(%q) error = %v, wantErr %v", tc.input, err, tc.wantErr)
+			continue
+		}
+		if !tc.wantErr {
+			if bucket != tc.wantBucket {
+				t.Errorf("parseS3URL(%q) bucket = %q, want %q", tc.input, bucket, tc.wantBucket)
+			}
+			if prefix != tc.wantPrefix {
+				t.Errorf("parseS3URL(%q) prefix = %q, want %q", tc.input, prefix, tc.wantPrefix)
+			}
+		}
+	}
+}
+
 func TestRunBaselineMissingInput(t *testing.T) {
 	origInput, origOutput, origTS := bslInput, bslOutput, bslTimestamp
 	t.Cleanup(func() {

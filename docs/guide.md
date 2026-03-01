@@ -499,6 +499,92 @@ bintrail rotate \
 
 ---
 
+### Scenario H: Uploading baseline Parquet files to S3
+
+**Situation:** You've generated a mydumper baseline and want to store the resulting Parquet files in S3 for long-term retention alongside your archived `binlog_events` partitions.
+
+**Option 1 — Generate locally and upload in one step (recommended):**
+
+```bash
+bintrail baseline \
+  --input    /path/to/mydumper-output \
+  --output   /tmp/baselines \
+  --upload   s3://bintrail-audit-baselines/baselines/
+```
+
+`--upload` writes Parquet files to `--output` first, then uploads every file to S3 preserving the relative directory structure (`timestamp/database/table.parquet`). Uses the standard AWS credential chain — environment variables, `~/.aws/credentials`, or EC2/ECS instance metadata.
+
+**Option 2 — Generate locally, upload separately with the AWS CLI:**
+
+```bash
+# Generate Parquet files
+bintrail baseline \
+  --input  /path/to/mydumper-output \
+  --output /path/to/baselines
+
+# Sync to S3
+aws s3 sync \
+  /path/to/baselines/2025-02-28T00-00-00Z/ \
+  s3://bintrail-audit-baselines/baselines/2025-02-28T00-00-00Z/ \
+  --storage-class STANDARD_IA \
+  --no-progress
+```
+
+**S3 bucket setup (one-time):**
+
+If you haven't run `bintrail init --s3-bucket` yet, create the bucket manually:
+
+```bash
+# Create bucket (adjust region as needed)
+aws s3api create-bucket \
+  --bucket bintrail-audit-baselines \
+  --region us-east-1
+
+# Block public access
+aws s3api put-public-access-block \
+  --bucket bintrail-audit-baselines \
+  --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+# Optional: move files older than 90 days to Glacier to reduce storage costs
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket bintrail-audit-baselines \
+  --lifecycle-configuration '{
+    "Rules": [{
+      "ID": "ArchiveToGlacier",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "baselines/"},
+      "Transitions": [{"Days": 90, "StorageClass": "GLACIER"}]
+    }]
+  }'
+```
+
+**IAM permissions required:**
+
+The IAM role or user running bintrail needs `s3:PutObject` (and `s3:GetObject` / `s3:ListBucket` for future reads):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
+    "Resource": [
+      "arn:aws:s3:::bintrail-audit-baselines",
+      "arn:aws:s3:::bintrail-audit-baselines/*"
+    ]
+  }]
+}
+```
+
+**Storage class notes:**
+
+- **STANDARD_IA** (Infrequent Access) is recommended for baselines written once and read occasionally during audits — significantly cheaper than STANDARD for storage, with a small per-retrieval fee.
+- **Glacier** lifecycle rule is optional — if baselines older than 90 days are rarely queried, Glacier saves substantial storage costs. Note: DuckDB/Athena cannot query Glacier directly; restore to STANDARD first (takes minutes to hours depending on tier).
+- Use `--no-progress` in scripts and cron jobs to avoid noisy output.
+
+---
+
 ### Scenario I: Streaming from managed MySQL (RDS, Aurora, Cloud SQL)
 
 **Situation:** You're using a managed MySQL service where you have no filesystem access to binlog files. You want continuous real-time indexing using the replication protocol.

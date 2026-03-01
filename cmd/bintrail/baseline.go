@@ -1,11 +1,18 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/spf13/cobra"
 
 	"github.com/bintrail/bintrail/internal/baseline"
@@ -33,6 +40,7 @@ var (
 	bslTables       string
 	bslCompression  string
 	bslRowGroupSize int
+	bslUpload       string
 )
 
 func init() {
@@ -42,6 +50,7 @@ func init() {
 	baselineCmd.Flags().StringVar(&bslTables, "tables", "", "Comma-separated db.table filter (e.g. mydb.orders,mydb.items; default: all)")
 	baselineCmd.Flags().StringVar(&bslCompression, "compression", "zstd", "Parquet compression codec: zstd, snappy, gzip, none")
 	baselineCmd.Flags().IntVar(&bslRowGroupSize, "row-group-size", 500_000, "Rows per Parquet row group")
+	baselineCmd.Flags().StringVar(&bslUpload, "upload", "", "S3 destination URL to upload Parquet files after generation (e.g. s3://my-bucket/baselines/)")
 	_ = baselineCmd.MarkFlagRequired("input")
 	_ = baselineCmd.MarkFlagRequired("output")
 
@@ -87,7 +96,80 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 		"tables", stats.TablesProcessed,
 		"rows_written", stats.RowsWritten,
 		"files_written", stats.FilesWritten)
+
+	if bslUpload != "" {
+		uploaded, err := uploadBaselineToS3(cmd.Context(), bslOutput, bslUpload)
+		if err != nil {
+			return fmt.Errorf("S3 upload: %w", err)
+		}
+		fmt.Printf("  uploaded  : %d files → %s\n", uploaded, bslUpload)
+		slog.Info("baseline S3 upload complete", "files", uploaded, "destination", bslUpload)
+	}
+
 	return nil
+}
+
+// parseS3URL parses an S3 URL of the form s3://bucket or s3://bucket/prefix
+// and returns the bucket name and prefix (without leading slash).
+func parseS3URL(u string) (bucket, prefix string, err error) {
+	if !strings.HasPrefix(u, "s3://") {
+		return "", "", fmt.Errorf("must start with s3://, got %q", u)
+	}
+	rest := strings.TrimPrefix(u, "s3://")
+	bucket, prefix, _ = strings.Cut(rest, "/")
+	if bucket == "" {
+		return "", "", fmt.Errorf("bucket name is empty in %q", u)
+	}
+	return bucket, prefix, nil
+}
+
+// uploadBaselineToS3 walks outputDir and uploads every file to the S3 URL,
+// preserving the relative directory structure under the prefix. Returns the
+// number of files uploaded. Uses the standard AWS credential chain.
+func uploadBaselineToS3(ctx context.Context, outputDir, s3URL string) (int, error) {
+	bucket, prefix, err := parseS3URL(s3URL)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --upload URL: %w", err)
+	}
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("load AWS config: %w", err)
+	}
+	client := s3.NewFromConfig(awsCfg)
+
+	var count int
+	err = filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return walkErr
+		}
+		rel, err := filepath.Rel(outputDir, path)
+		if err != nil {
+			return err
+		}
+		key := filepath.ToSlash(rel)
+		if prefix != "" {
+			key = strings.TrimSuffix(prefix, "/") + "/" + key
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("open %s: %w", path, err)
+		}
+		defer f.Close()
+
+		if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+			Body:   f,
+		}); err != nil {
+			return fmt.Errorf("upload %s → s3://%s/%s: %w", path, bucket, key, err)
+		}
+		slog.Debug("uploaded", "file", path, "bucket", bucket, "key", key)
+		count++
+		return nil
+	})
+	return count, err
 }
 
 // parseTableFilter splits a comma-separated "db.table" list.
