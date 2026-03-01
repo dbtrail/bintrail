@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -56,6 +58,10 @@ var (
 	strmTables      string
 	strmCheckpoint  int
 	strmMetricsAddr string
+	strmSSLMode     string
+	strmSSLCA       string
+	strmSSLCert     string
+	strmSSLKey      string
 )
 
 func init() {
@@ -70,6 +76,10 @@ func init() {
 	streamCmd.Flags().StringVar(&strmTables, "tables", "", "Only index these tables (comma-separated, e.g. mydb.orders)")
 	streamCmd.Flags().IntVar(&strmCheckpoint, "checkpoint", 10, "Checkpoint interval in seconds")
 	streamCmd.Flags().StringVar(&strmMetricsAddr, "metrics-addr", "", "Address to expose Prometheus metrics (e.g. :9090); empty = disabled")
+	streamCmd.Flags().StringVar(&strmSSLMode, "ssl-mode", "preferred", "TLS mode: disabled, preferred, required, verify-ca, verify-identity")
+	streamCmd.Flags().StringVar(&strmSSLCA, "ssl-ca", "", "Path to CA certificate file for TLS verification")
+	streamCmd.Flags().StringVar(&strmSSLCert, "ssl-cert", "", "Path to client certificate file for mutual TLS")
+	streamCmd.Flags().StringVar(&strmSSLKey, "ssl-key", "", "Path to client private key file for mutual TLS")
 	_ = streamCmd.MarkFlagRequired("index-dsn")
 	_ = streamCmd.MarkFlagRequired("source-dsn")
 	_ = streamCmd.MarkFlagRequired("server-id")
@@ -143,6 +153,77 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 		state.mode, state.binlogFile, state.binlogPos, gtidSet,
 		state.eventsIndexed, lastEventTime, state.serverID)
 	return err
+}
+
+// ─── TLS configuration ────────────────────────────────────────────────────────
+
+// buildTLSConfig returns a *tls.Config for the given ssl-mode, or nil for
+// "disabled". serverName is the target host (used only for verify-identity).
+func buildTLSConfig(mode, ca, cert, key, serverName string) (*tls.Config, error) {
+	if mode == "disabled" {
+		return nil, nil
+	}
+	switch mode {
+	case "preferred", "required", "verify-ca", "verify-identity":
+	default:
+		return nil, fmt.Errorf("invalid --ssl-mode %q: must be one of disabled, preferred, required, verify-ca, verify-identity", mode)
+	}
+	if (cert == "") != (key == "") {
+		return nil, fmt.Errorf("--ssl-cert and --ssl-key must both be specified together")
+	}
+
+	cfg := &tls.Config{}
+
+	// Load CA pool (optional — system CAs used when empty).
+	var caPool *x509.CertPool
+	if ca != "" {
+		pem, err := os.ReadFile(ca)
+		if err != nil {
+			return nil, fmt.Errorf("read --ssl-ca %q: %w", ca, err)
+		}
+		caPool = x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("--ssl-ca %q: no valid certificates found", ca)
+		}
+		cfg.RootCAs = caPool
+	}
+
+	// Load client certificate for mutual TLS.
+	if cert != "" {
+		kp, err := tls.LoadX509KeyPair(cert, key)
+		if err != nil {
+			return nil, fmt.Errorf("load --ssl-cert/--ssl-key: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{kp}
+	}
+
+	switch mode {
+	case "preferred", "required":
+		// Encrypt the connection but skip server certificate verification.
+		cfg.InsecureSkipVerify = true //nolint:gosec // intentional for these modes
+	case "verify-ca":
+		// Verify the certificate chain against the CA pool but not the hostname.
+		cfg.InsecureSkipVerify = true //nolint:gosec // hostname check done via VerifyConnection
+		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("server presented no certificate")
+			}
+			opts := x509.VerifyOptions{
+				Roots:         caPool, // nil → system CAs
+				Intermediates: x509.NewCertPool(),
+			}
+			for _, c := range cs.PeerCertificates[1:] {
+				opts.Intermediates.AddCert(c)
+			}
+			_, err := cs.PeerCertificates[0].Verify(opts)
+			return err
+		}
+	case "verify-identity":
+		// Full TLS verification: certificate chain + hostname.
+		cfg.ServerName = serverName
+	}
+
+	return cfg, nil
 }
 
 // ─── Start position resolution ───────────────────────────────────────────────
@@ -388,6 +469,12 @@ func runStream(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// ── 6b. Build TLS config ──────────────────────────────────────────────────
+	tlsCfg, err := buildTLSConfig(strmSSLMode, strmSSLCA, strmSSLCert, strmSSLKey, host)
+	if err != nil {
+		return err
+	}
+
 	// ── 7. Create BinlogSyncer ────────────────────────────────────────────────
 	syncerCfg := replication.BinlogSyncerConfig{
 		ServerID:             strmServerID,
@@ -398,31 +485,60 @@ func runStream(cmd *cobra.Command, args []string) error {
 		Password:             password,
 		HeartbeatPeriod:      30 * time.Second,
 		MaxReconnectAttempts: 0, // infinite retry
+		TLSConfig:            tlsCfg,
 	}
-	syncer := replication.NewBinlogSyncer(syncerCfg)
-	defer syncer.Close()
+
+	// Use a closure defer so the active syncer is always closed on exit,
+	// even if we replace it during the preferred-mode TLS fallback below.
+	var syncer *replication.BinlogSyncer
+	defer func() { syncer.Close() }()
+	syncer = replication.NewBinlogSyncer(syncerCfg)
+
+	// startStreamer starts sync from the resolved position/GTID set.
+	startStreamer := func() (*replication.BinlogStreamer, error) {
+		switch mode {
+		case "position":
+			s, startErr := syncer.StartSync(gomysql.Position{Name: startFile, Pos: startPos})
+			if startErr != nil {
+				return nil, fmt.Errorf("StartSync(%s, %d): %w", startFile, startPos, startErr)
+			}
+			return s, nil
+		case "gtid":
+			gset, parseErr := gomysql.ParseGTIDSet("mysql", startGTIDStr)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse start GTID set: %w", parseErr)
+			}
+			s, startErr := syncer.StartSyncGTID(gset)
+			if startErr != nil {
+				return nil, fmt.Errorf("StartSyncGTID: %w", startErr)
+			}
+			return s, nil
+		default:
+			return nil, fmt.Errorf("unexpected mode %q", mode)
+		}
+	}
 
 	// ── 8. Start sync ─────────────────────────────────────────────────────────
-	var streamer *replication.BinlogStreamer
+	streamer, startErr := startStreamer()
+	if startErr != nil && strmSSLMode == "preferred" {
+		// preferred: TLS attempt failed — retry without TLS.
+		slog.Warn("TLS connection failed; retrying without TLS", "error", startErr)
+		syncer.Close()
+		syncerCfg.TLSConfig = nil
+		syncer = replication.NewBinlogSyncer(syncerCfg)
+		streamer, err = startStreamer()
+		if err != nil {
+			return err
+		}
+	} else if startErr != nil {
+		return startErr
+	}
+
 	switch mode {
 	case "position":
-		streamer, err = syncer.StartSync(gomysql.Position{Name: startFile, Pos: startPos})
-		if err != nil {
-			return fmt.Errorf("StartSync(%s, %d): %w", startFile, startPos, err)
-		}
 		fmt.Printf("Streaming from %s position %d\n", startFile, startPos)
 	case "gtid":
-		gset, parseErr := gomysql.ParseGTIDSet("mysql", startGTIDStr)
-		if parseErr != nil {
-			return fmt.Errorf("parse start GTID set: %w", parseErr)
-		}
-		streamer, err = syncer.StartSyncGTID(gset)
-		if err != nil {
-			return fmt.Errorf("StartSyncGTID: %w", err)
-		}
 		fmt.Printf("Streaming from GTID set: %s\n", startGTIDStr)
-	default:
-		return fmt.Errorf("unexpected mode %q", mode)
 	}
 
 	// ── 9. Signal handler ─────────────────────────────────────────────────────
