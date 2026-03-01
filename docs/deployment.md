@@ -45,7 +45,7 @@ On-demand (DBA workstation):
 | Grafana | Dashboards and alerting | Yes |
 | Alertmanager | Routes alert notifications | Optional |
 | `bintrail query` / `recover` | DBA tools; read from index | On-demand |
-| `bintrail rotate` | Drops old partitions; adds future ones | Scheduled (daily cron) |
+| `bintrail rotate` | Drops old partitions; adds future ones | Scheduled (hourly or daily cron) |
 
 ## 2. Source MySQL Requirements
 
@@ -84,7 +84,7 @@ The `SELECT` grant is only needed during `bintrail snapshot`. If you prefer mini
 
 ### Version
 
-MySQL 8.0 or later. The `binlog_events` table uses `RANGE (TO_DAYS(...))` partitioning and generated stored columns — both require MySQL 8.0+.
+MySQL 8.0 or later. The `binlog_events` table uses `RANGE (TO_SECONDS(...))` partitioning and generated stored columns — both require MySQL 8.0+.
 
 ### Separate server recommended
 
@@ -296,7 +296,7 @@ spec:
 # 1. Provision the index database (run once)
 bintrail init \
     --index-dsn "$INDEX_DSN" \
-    --partitions 30          # 30 daily partitions + p_future
+    --partitions 30          # 30 hourly partitions + p_future
 
 # 2. Snapshot current schema (run once per schema change after this)
 bintrail snapshot \
@@ -423,18 +423,18 @@ Key log fields emitted by bintrail commands:
 
 ## 8. Partition Rotation
 
-Add a daily cron job or systemd timer:
+Add a hourly cron job or systemd timer:
 
 ```bash
 # /etc/cron.d/bintrail-rotate
-0 2 * * * bintrail /usr/local/bin/bintrail rotate \
+0 * * * * bintrail /usr/local/bin/bintrail rotate \
     --index-dsn "$INDEX_DSN" \
     --retain 30d \
     --add-future 3 \
     --log-format json >> /var/log/bintrail-rotate.log 2>&1
 ```
 
-`--retain 30d` drops partitions older than 30 days. `--add-future 3` ensures at least 3 future daily partitions exist beyond today (prevents the catch-all `p_future` from accumulating all new events).
+`--retain 30d` drops partitions older than 30 days. `--add-future 3` ensures at least 3 future hourly partitions exist beyond the current hour (prevents the catch-all `p_future` from accumulating all new events).
 
 Monitor the `p_future` row count via `bintrail status` — a growing `p_future` means rotation isn't running.
 
