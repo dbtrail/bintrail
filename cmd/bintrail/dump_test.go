@@ -250,6 +250,43 @@ func TestAcquireDumpLock_staleLock(t *testing.T) {
 
 // ─── extractSchemasFromTables ─────────────────────────────────────────────────
 
+// TestBuildMydumperArgs_threeSchemas verifies that 3+ schemas all appear in the
+// --regex value, not just the first two.
+func TestBuildMydumperArgs_threeSchemas(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2", "db3"}, nil)
+	idx := argsIndex(args, "--regex")
+	if idx < 0 || idx+1 >= len(args) {
+		t.Fatal("expected --regex in args for 3 schemas")
+	}
+	regex := args[idx+1]
+	for _, s := range []string{"db1", "db2", "db3"} {
+		if !strings.Contains(regex, s) {
+			t.Errorf("regex %q missing schema %q", regex, s)
+		}
+	}
+}
+
+// TestAcquireDumpLock_invalidPIDContent verifies that a lockfile containing
+// non-numeric text (parseErr != nil) is treated as stale — the signal check
+// is skipped and the file is removed so a fresh lock can be acquired.
+func TestAcquireDumpLock_invalidPIDContent(t *testing.T) {
+	dir := t.TempDir()
+	old := dumpLockDir
+	dumpLockDir = func() string { return dir }
+	t.Cleanup(func() { dumpLockDir = old })
+
+	lockPath := filepath.Join(dir, dumpLockFilename)
+	if err := os.WriteFile(lockPath, []byte("not-a-pid"), 0o600); err != nil {
+		t.Fatalf("failed to write stale lock file: %v", err)
+	}
+
+	f, err := acquireDumpLock()
+	if err != nil {
+		t.Fatalf("acquireDumpLock with invalid PID content: unexpected error: %v", err)
+	}
+	releaseDumpLock(f)
+}
+
 func TestExtractSchemasFromTables_basic(t *testing.T) {
 	schemas := extractSchemasFromTables([]string{"mydb.t1", "mydb.t2", "other.t3"})
 	if len(schemas) != 2 {
@@ -274,6 +311,21 @@ func TestExtractSchemasFromTables_allNoDot(t *testing.T) {
 	// All entries lack a dot — none contribute a schema, so result must be nil.
 	if schemas := extractSchemasFromTables([]string{"nodot1", "nodot2", "nodot3"}); schemas != nil {
 		t.Errorf("expected nil when all entries have no dot, got %v", schemas)
+	}
+}
+
+// TestExtractSchemasFromTables_deduplicationOrder verifies that insertion order
+// is preserved and a schema that appears in multiple entries is counted once.
+func TestExtractSchemasFromTables_deduplicationOrder(t *testing.T) {
+	got := extractSchemasFromTables([]string{"other.t1", "mydb.t1", "other.t2"})
+	want := []string{"other", "mydb"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("[%d] expected %q, got %q", i, want[i], got[i])
+		}
 	}
 }
 
