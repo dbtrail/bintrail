@@ -59,6 +59,7 @@ var (
 	rOutput    string
 	rDryRun    bool
 	rLimit     int
+	rProfile   string
 )
 
 func init() {
@@ -74,6 +75,7 @@ func init() {
 	recoverCmd.Flags().StringVar(&rOutput, "output", "", "Write recovery SQL to this file (required unless --dry-run)")
 	recoverCmd.Flags().BoolVar(&rDryRun, "dry-run", false, "Print recovery SQL to stdout instead of writing a file")
 	recoverCmd.Flags().IntVar(&rLimit, "limit", 1000, "Maximum number of events to reverse")
+	recoverCmd.Flags().StringVar(&rProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(recoverCmd)
@@ -121,6 +123,15 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
 	defer db.Close()
+
+	if rProfile != "" {
+		denyTables, redactCols, err := query.LoadProfileRules(cmd.Context(), db, rProfile)
+		if err != nil {
+			return fmt.Errorf("load profile rules for %q: %w", rProfile, err)
+		}
+		opts.DenyTables = denyTables
+		opts.RedactColumns = redactCols
+	}
 
 	// ── Load schema resolver (best-effort; non-fatal) ─────────────────────────
 	// The resolver enables PK-only WHERE clauses in recovery SQL.
