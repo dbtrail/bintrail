@@ -173,10 +173,12 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			// Suppress JSON output in daemon mode — only the initial rotation outputs JSON.
 			savedFmt := rotFormat
 			rotFormat = "text"
-			if err := doRotation(ctx); err != nil && ctx.Err() == nil {
-				slog.Error("rotation failed", "error", err)
-			}
-			rotFormat = savedFmt
+			func() {
+				defer func() { rotFormat = savedFmt }()
+				if err := doRotation(ctx); err != nil && ctx.Err() == nil {
+					slog.Error("rotation failed", "error", err)
+				}
+			}()
 		}
 	}
 }

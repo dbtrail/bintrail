@@ -124,8 +124,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 			 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'binlog_events'`)
 		if err := row.Scan(&createOpts); err == nil &&
 			!strings.Contains(strings.ToUpper(createOpts), "ENCRYPTION=Y") {
-			fmt.Fprintf(os.Stderr, "Warning: binlog_events already exists without encryption.\n"+
-				"To encrypt it, run: ALTER TABLE binlog_events ENCRYPTION='Y'\n")
+			if initFormat != "json" {
+				fmt.Fprintf(os.Stderr, "Warning: binlog_events already exists without encryption.\n"+
+					"To encrypt it, run: ALTER TABLE binlog_events ENCRYPTION='Y'\n")
+			}
 		}
 	}
 
@@ -175,8 +177,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nSetting up S3 bucket...\n")
 		}
 		if err := setupS3Bucket(cmd.Context(), initS3Bucket, initS3Region); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not create S3 bucket %q: %v\n\n", initS3Bucket, err)
 			if initFormat != "json" {
+				fmt.Fprintf(os.Stderr, "Warning: could not create S3 bucket %q: %v\n\n", initS3Bucket, err)
 				fmt.Fprint(os.Stderr, s3Instructions(initS3Bucket, initS3Region))
 			}
 		} else {
@@ -193,8 +195,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nVerifying existing S3 bucket...\n")
 		}
 		if err := verifyS3Bucket(cmd.Context(), s3ARNBucket, initS3Region); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not verify S3 bucket %q: %v\n\n", s3ARNBucket, err)
 			if initFormat != "json" {
+				fmt.Fprintf(os.Stderr, "Warning: could not verify S3 bucket %q: %v\n\n", s3ARNBucket, err)
 				fmt.Fprint(os.Stderr, s3IAMInstructions(s3ARNBucket, s3ARNPartition))
 			}
 		} else {
