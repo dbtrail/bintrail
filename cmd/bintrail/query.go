@@ -70,7 +70,7 @@ func init() {
 	queryCmd.Flags().StringVar(&qChangedCol, "changed-column", "", "Filter UPDATEs that modified this column")
 	queryCmd.Flags().StringVar(&qFormat, "format", "table", "Output format: table, json, or csv")
 	queryCmd.Flags().IntVar(&qLimit, "limit", 100, "Maximum number of rows to return")
-	queryCmd.Flags().StringVar(&qArchiveDir, "archive-dir", "", "Local directory of Parquet archive files to include when data is not in the index")
+	queryCmd.Flags().StringVar(&qArchiveDir, "archive-dir", "", "Local directory of Parquet archive files to merge with live index results")
 	queryCmd.Flags().StringVar(&qArchiveS3, "archive-s3", "", "S3 URL prefix of Parquet archive files to include (e.g. s3://bucket/prefix/)")
 	_ = queryCmd.MarkFlagRequired("index-dsn")
 
@@ -143,13 +143,19 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Fetch from index + archives, then merge ───────────────────────────────
-	results, err := engine.Fetch(cmd.Context(), opts)
+	// Each source fetches without a per-source row limit (Limit: 0) so that
+	// chronologically older events in the archives are not discarded before the
+	// merge sort. The user's --limit is applied once, after sorting.
+	fetchOpts := opts
+	fetchOpts.Limit = 0
+
+	results, err := engine.Fetch(cmd.Context(), fetchOpts)
 	if err != nil {
 		return err
 	}
 
 	for _, src := range archiveSources() {
-		ar, err := parquetquery.Fetch(cmd.Context(), opts, src)
+		ar, err := parquetquery.Fetch(cmd.Context(), fetchOpts, src)
 		if err != nil {
 			slog.Warn("archive query failed, skipping", "source", src, "error", err)
 			continue

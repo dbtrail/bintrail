@@ -139,13 +139,14 @@ func TestBuildQueryChangedColumn(t *testing.T) {
 	}
 }
 
-func TestBuildQueryDefaultLimit(t *testing.T) {
+func TestBuildQueryNoLimit(t *testing.T) {
+	// Limit=0 means "no LIMIT clause" so the merge layer can apply the real limit.
 	q, args := buildQuery("/arc/*.parquet", query.Options{})
-	assertContains(t, q, "LIMIT ?")
-	// Default limit is 100.
-	last := args[len(args)-1]
-	if last != 100 {
-		t.Errorf("expected default limit 100, got %v", last)
+	if findInStr(q, "LIMIT") {
+		t.Error("expected no LIMIT clause when Limit=0")
+	}
+	if len(args) != 0 {
+		t.Errorf("expected no args for no-limit query, got %v", args)
 	}
 }
 

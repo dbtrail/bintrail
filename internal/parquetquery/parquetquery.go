@@ -99,11 +99,6 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 		args = append(args, string(needle))
 	}
 
-	limit := opts.Limit
-	if limit <= 0 {
-		limit = 100
-	}
-
 	// Escape single quotes in the glob path to prevent SQL injection.
 	safeGlob := strings.ReplaceAll(glob, "'", "''")
 
@@ -114,8 +109,11 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
-	q += " ORDER BY event_timestamp, event_id LIMIT ?"
-	args = append(args, limit)
+	q += " ORDER BY event_timestamp, event_id"
+	if opts.Limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, opts.Limit)
+	}
 
 	return q, args
 }

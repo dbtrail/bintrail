@@ -113,11 +113,14 @@ func TestBuildQuery_changedColumn(t *testing.T) {
 	}
 }
 
-func TestBuildQuery_defaultLimit(t *testing.T) {
-	opts := Options{} // Limit=0 → should default to 100
-	_, args := buildQuery(opts)
-	if args[len(args)-1] != 100 {
-		t.Errorf("expected default limit 100, got %v", args[len(args)-1])
+func TestBuildQuery_noLimit(t *testing.T) {
+	// Limit=0 means "no LIMIT clause" — callers (CLI, MCP) apply their own defaults.
+	q, args := buildQuery(Options{})
+	if strings.Contains(q, "LIMIT") {
+		t.Error("expected no LIMIT clause when Limit=0")
+	}
+	if len(args) != 0 {
+		t.Errorf("expected no args for no-limit query, got %v", args)
 	}
 }
 
