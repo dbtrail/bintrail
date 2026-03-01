@@ -91,7 +91,7 @@ Global persistent flags (all commands via `rootCmd.PersistentFlags`):
 | `stream` | `stream.go` | … + `--metrics-addr` (e.g. `:9090`; empty = disabled) |
 | `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint` |
 | `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path` (default `mydumper`), `--threads` (default 4) |
-| `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression` (default `zstd`), `--row-group-size` (default 500000) |
+| `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression` (default `zstd`), `--row-group-size` (default 500000), `--upload` (S3 URL), `--upload-region` |
 
 Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `rotArchiveDir`, `rotArchiveCompression`, `stIndexDSN`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`).
 
