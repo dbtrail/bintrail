@@ -45,20 +45,21 @@ Examples:
 }
 
 var (
-	qIndexDSN    string
-	qSchema      string
-	qTable       string
-	qPK          string
-	qEventType   string
-	qGTID        string
-	qSince       string
-	qUntil       string
-	qChangedCol  string
-	qFormat      string
-	qLimit       int
-	qArchiveDir  string
-	qArchiveS3   string
-	qBintrailID  string
+	qIndexDSN   string
+	qSchema     string
+	qTable      string
+	qPK         string
+	qEventType  string
+	qGTID       string
+	qSince      string
+	qUntil      string
+	qChangedCol string
+	qFlag       string
+	qFormat     string
+	qLimit      int
+	qArchiveDir string
+	qArchiveS3  string
+	qBintrailID string
 )
 
 func init() {
@@ -71,6 +72,7 @@ func init() {
 	queryCmd.Flags().StringVar(&qSince, "since", "", "Filter events at or after this time (2006-01-02 15:04:05)")
 	queryCmd.Flags().StringVar(&qUntil, "until", "", "Filter events at or before this time (2006-01-02 15:04:05)")
 	queryCmd.Flags().StringVar(&qChangedCol, "changed-column", "", "Filter UPDATEs that modified this column")
+	queryCmd.Flags().StringVar(&qFlag, "flag", "", "Filter events from tables or columns carrying this flag (see 'bintrail flag list')")
 	queryCmd.Flags().StringVar(&qFormat, "format", "table", "Output format: table, json, or csv")
 	queryCmd.Flags().IntVar(&qLimit, "limit", 100, "Maximum number of rows to return")
 	queryCmd.Flags().StringVar(&qArchiveDir, "archive-dir", "", "Local root directory of Parquet archives (requires --bintrail-id)")
@@ -120,6 +122,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		Since:         since,
 		Until:         until,
 		ChangedColumn: qChangedCol,
+		Flag:          qFlag,
 		Limit:         qLimit,
 	}
 

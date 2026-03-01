@@ -198,6 +198,35 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 
 	MustExec(t, db, serverid.DDLBintrailServers)
 	MustExec(t, db, serverid.DDLBintrailServerChanges)
+
+	MustExec(t, db, `CREATE TABLE IF NOT EXISTS table_flags (
+		id          INT UNSIGNED  AUTO_INCREMENT PRIMARY KEY,
+		schema_name VARCHAR(64)   NOT NULL,
+		table_name  VARCHAR(64)   NOT NULL,
+		column_name VARCHAR(64)   NOT NULL DEFAULT '',
+		flag        VARCHAR(255)  NOT NULL,
+		created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE KEY idx_unique (schema_name, table_name, column_name, flag),
+		INDEX idx_flag (flag)
+	) ENGINE=InnoDB`)
+
+	MustExec(t, db, `CREATE TABLE IF NOT EXISTS profiles (
+		id          INT UNSIGNED  AUTO_INCREMENT PRIMARY KEY,
+		name        VARCHAR(255)  NOT NULL,
+		description TEXT          DEFAULT NULL,
+		created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE KEY idx_name (name)
+	) ENGINE=InnoDB`)
+
+	MustExec(t, db, `CREATE TABLE IF NOT EXISTS access_rules (
+		id          INT UNSIGNED  AUTO_INCREMENT PRIMARY KEY,
+		profile_id  INT UNSIGNED  NOT NULL,
+		flag        VARCHAR(255)  NOT NULL,
+		permission  ENUM('allow','deny') NOT NULL,
+		created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE KEY idx_profile_flag (profile_id, flag),
+		CONSTRAINT fk_access_rules_profile FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE
+	) ENGINE=InnoDB`)
 }
 
 // InsertEvent inserts a single event into binlog_events using raw SQL.

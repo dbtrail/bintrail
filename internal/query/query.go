@@ -30,6 +30,7 @@ type Options struct {
 	Since         *time.Time
 	Until         *time.Time
 	ChangedColumn string // column name; matched via JSON_CONTAINS
+	Flag          string // return events from tables/columns carrying this flag
 	Limit         int    // 0 → default 100
 }
 
@@ -140,6 +141,18 @@ func buildQuery(opts Options) (string, []any) {
 		needle, _ := json.Marshal(opts.ChangedColumn)
 		where = append(where, "JSON_CONTAINS(changed_columns, ?)")
 		args = append(args, string(needle))
+	}
+	if opts.Flag != "" {
+		// EXISTS subquery: match events from tables (or columns) carrying the
+		// given flag. The explicit table qualifiers (table_flags.schema_name,
+		// binlog_events.schema_name) prevent MySQL from resolving unqualified
+		// names against the subquery's own columns rather than the outer table.
+		where = append(where, `EXISTS (
+			SELECT 1 FROM table_flags
+			WHERE table_flags.schema_name = binlog_events.schema_name
+			  AND table_flags.table_name  = binlog_events.table_name
+			  AND table_flags.flag        = ?)`)
+		args = append(args, opts.Flag)
 	}
 
 	q := `SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp,

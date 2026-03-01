@@ -68,7 +68,7 @@ func TestRecoverCmd_emptyStringDefaults(t *testing.T) {
 func TestRecoverCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"index-dsn", "schema", "table", "pk", "event-type",
-		"gtid", "since", "until", "output", "dry-run", "limit",
+		"gtid", "since", "until", "flag", "output", "dry-run", "limit",
 	} {
 		if recoverCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on recoverCmd", name)

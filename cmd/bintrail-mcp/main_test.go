@@ -14,7 +14,7 @@ const defaultLimit = 100
 // ─── buildQueryOptions ───────────────────────────────────────────────────────
 
 func TestBuildQueryOptions_empty(t *testing.T) {
-	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", 0, defaultLimit)
+	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", "", 0, defaultLimit)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -35,7 +35,7 @@ func TestBuildQueryOptions_empty(t *testing.T) {
 func TestBuildQueryOptions_allFields(t *testing.T) {
 	opts, err := buildQueryOptions(
 		"mydb", "orders", "12345", "INSERT",
-		"abc:1", "2026-02-19 14:00:00", "2026-02-19 15:00:00", "status",
+		"abc:1", "2026-02-19 14:00:00", "2026-02-19 15:00:00", "status", "",
 		50, defaultLimit,
 	)
 	if err != nil {
@@ -71,7 +71,7 @@ func TestBuildQueryOptions_allFields(t *testing.T) {
 }
 
 func TestBuildQueryOptions_pkWithoutSchemaTable(t *testing.T) {
-	_, err := buildQueryOptions("", "", "12345", "", "", "", "", "", 0, defaultLimit)
+	_, err := buildQueryOptions("", "", "12345", "", "", "", "", "", "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error when pk is set without schema/table")
 	}
@@ -81,14 +81,14 @@ func TestBuildQueryOptions_pkWithoutSchemaTable(t *testing.T) {
 }
 
 func TestBuildQueryOptions_pkWithSchemaOnly(t *testing.T) {
-	_, err := buildQueryOptions("mydb", "", "12345", "", "", "", "", "", 0, defaultLimit)
+	_, err := buildQueryOptions("mydb", "", "12345", "", "", "", "", "", "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error when pk is set with schema but no table")
 	}
 }
 
 func TestBuildQueryOptions_changedColumnWithoutSchemaTable(t *testing.T) {
-	_, err := buildQueryOptions("", "", "", "", "", "", "", "status", 0, defaultLimit)
+	_, err := buildQueryOptions("", "", "", "", "", "", "", "status", "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error when changed_column is set without schema/table")
 	}
@@ -98,14 +98,14 @@ func TestBuildQueryOptions_changedColumnWithoutSchemaTable(t *testing.T) {
 }
 
 func TestBuildQueryOptions_invalidEventType(t *testing.T) {
-	_, err := buildQueryOptions("mydb", "orders", "", "UPSERT", "", "", "", "", 0, defaultLimit)
+	_, err := buildQueryOptions("mydb", "orders", "", "UPSERT", "", "", "", "", "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error for invalid event_type")
 	}
 }
 
 func TestBuildQueryOptions_invalidSince(t *testing.T) {
-	_, err := buildQueryOptions("", "", "", "", "", "not-a-date", "", "", 0, defaultLimit)
+	_, err := buildQueryOptions("", "", "", "", "", "not-a-date", "", "", "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error for invalid since")
 	}
@@ -115,7 +115,7 @@ func TestBuildQueryOptions_invalidSince(t *testing.T) {
 }
 
 func TestBuildQueryOptions_invalidUntil(t *testing.T) {
-	_, err := buildQueryOptions("", "", "", "", "", "", "not-a-date", "", 0, defaultLimit)
+	_, err := buildQueryOptions("", "", "", "", "", "", "not-a-date", "", "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error for invalid until")
 	}
@@ -125,7 +125,7 @@ func TestBuildQueryOptions_invalidUntil(t *testing.T) {
 }
 
 func TestBuildQueryOptions_limitZeroUsesDefault(t *testing.T) {
-	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", 0, defaultLimit)
+	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", "", 0, defaultLimit)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -135,12 +135,22 @@ func TestBuildQueryOptions_limitZeroUsesDefault(t *testing.T) {
 }
 
 func TestBuildQueryOptions_negativeLimitUsesDefault(t *testing.T) {
-	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", -5, defaultLimit)
+	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", "", -5, defaultLimit)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if opts.Limit != defaultLimit {
 		t.Errorf("expected default limit %d, got %d", defaultLimit, opts.Limit)
+	}
+}
+
+func TestBuildQueryOptions_flagPassedThrough(t *testing.T) {
+	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", "billing", 0, defaultLimit)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if opts.Flag != "billing" {
+		t.Errorf("expected Flag %q, got %q", "billing", opts.Flag)
 	}
 }
 

@@ -55,6 +55,7 @@ var (
 	rGTID      string
 	rSince     string
 	rUntil     string
+	rFlag      string
 	rOutput    string
 	rDryRun    bool
 	rLimit     int
@@ -69,6 +70,7 @@ func init() {
 	recoverCmd.Flags().StringVar(&rGTID, "gtid", "", "Filter by GTID (e.g. uuid:42)")
 	recoverCmd.Flags().StringVar(&rSince, "since", "", "Filter events at or after this time (2006-01-02 15:04:05)")
 	recoverCmd.Flags().StringVar(&rUntil, "until", "", "Filter events at or before this time (2006-01-02 15:04:05)")
+	recoverCmd.Flags().StringVar(&rFlag, "flag", "", "Filter events from tables or columns carrying this flag (see 'bintrail flag list')")
 	recoverCmd.Flags().StringVar(&rOutput, "output", "", "Write recovery SQL to this file (required unless --dry-run)")
 	recoverCmd.Flags().BoolVar(&rDryRun, "dry-run", false, "Print recovery SQL to stdout instead of writing a file")
 	recoverCmd.Flags().IntVar(&rLimit, "limit", 1000, "Maximum number of events to reverse")
@@ -109,6 +111,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		GTID:      rGTID,
 		Since:     since,
 		Until:     until,
+		Flag:      rFlag,
 		Limit:     rLimit,
 	}
 
