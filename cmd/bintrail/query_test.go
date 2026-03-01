@@ -55,7 +55,7 @@ func TestQueryCmd_defaults(t *testing.T) {
 
 func TestQueryCmd_emptyStringDefaults(t *testing.T) {
 	for _, name := range []string{
-		"schema", "table", "pk", "event-type", "gtid", "since", "until", "changed-column",
+		"schema", "table", "pk", "event-type", "gtid", "since", "until", "changed-column", "flag",
 	} {
 		f := queryCmd.Flag(name)
 		if f == nil {
@@ -71,7 +71,7 @@ func TestQueryCmd_emptyStringDefaults(t *testing.T) {
 func TestQueryCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"index-dsn", "schema", "table", "pk", "event-type",
-		"gtid", "since", "until", "changed-column", "format", "limit",
+		"gtid", "since", "until", "changed-column", "flag", "format", "limit",
 	} {
 		if queryCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on queryCmd", name)
