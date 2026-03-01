@@ -140,6 +140,22 @@ func newS3Client(ctx context.Context, region string) (*s3.Client, error) {
 	return s3.NewFromConfig(awsCfg), nil
 }
 
+// buildS3Key constructs the S3 object key for a file by computing its path
+// relative to baseDir and prepending prefix (if non-empty). This is the
+// shared key-building logic used by both uploadBaselineToS3 and the rotate
+// archive loop.
+func buildS3Key(baseDir, filePath, prefix string) (string, error) {
+	rel, err := filepath.Rel(baseDir, filePath)
+	if err != nil {
+		return "", err
+	}
+	key := filepath.ToSlash(rel)
+	if prefix != "" {
+		key = strings.TrimSuffix(prefix, "/") + "/" + key
+	}
+	return key, nil
+}
+
 // uploadBaselineToS3 walks outputDir and uploads every file to the S3 URL,
 // preserving the relative directory structure under the prefix. region is
 // optional — if empty, the AWS SDK resolves it from AWS_REGION env var or
@@ -160,13 +176,9 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string) (i
 		if walkErr != nil || d.IsDir() {
 			return walkErr
 		}
-		rel, err := filepath.Rel(outputDir, path)
+		key, err := buildS3Key(outputDir, path, prefix)
 		if err != nil {
 			return err
-		}
-		key := filepath.ToSlash(rel)
-		if prefix != "" {
-			key = strings.TrimSuffix(prefix, "/") + "/" + key
 		}
 		if err := uploadFile(ctx, client, path, bucket, key); err != nil {
 			return err

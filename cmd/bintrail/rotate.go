@@ -168,10 +168,9 @@ func runRotate(cmd *cobra.Command, args []string) error {
 					fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) → %s\n", name, n, outPath)
 
 					if s3Client != nil {
-						rel, _ := filepath.Rel(rotArchiveDir, outPath)
-						key := filepath.ToSlash(rel)
-						if s3Prefix != "" {
-							key = strings.TrimSuffix(s3Prefix, "/") + "/" + key
+						key, err := buildS3Key(rotArchiveDir, outPath, s3Prefix)
+						if err != nil {
+							return fmt.Errorf("build S3 key for %s: %w", name, err)
 						}
 						if err := uploadFile(ctx, s3Client, outPath, s3Bucket, key); err != nil {
 							return fmt.Errorf("upload %s to S3: %w", name, err)
