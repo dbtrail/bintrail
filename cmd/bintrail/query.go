@@ -71,7 +71,7 @@ func init() {
 	queryCmd.Flags().StringVar(&qFormat, "format", "table", "Output format: table, json, or csv")
 	queryCmd.Flags().IntVar(&qLimit, "limit", 100, "Maximum number of rows to return")
 	queryCmd.Flags().StringVar(&qArchiveDir, "archive-dir", "", "Local directory of Parquet archive files to merge with live index results")
-	queryCmd.Flags().StringVar(&qArchiveS3, "archive-s3", "", "S3 URL prefix of Parquet archive files to include (e.g. s3://bucket/prefix/)")
+	queryCmd.Flags().StringVar(&qArchiveS3, "archive-s3", "", "S3 URL prefix of Parquet archive files to merge with live index results (e.g. s3://bucket/prefix/); uses the standard AWS credential chain (env vars, ~/.aws/credentials, IAM role); requires outbound internet access to install the DuckDB httpfs extension on first use")
 	_ = queryCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(queryCmd)

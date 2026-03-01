@@ -1,6 +1,7 @@
 package parquetquery
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -34,22 +35,9 @@ func TestBuildGlob(t *testing.T) {
 
 func assertContains(t *testing.T, s, want string) {
 	t.Helper()
-	if len(s) == 0 || !containsStr(s, want) {
+	if !strings.Contains(s, want) {
 		t.Errorf("expected SQL to contain %q\ngot: %s", want, s)
 	}
-}
-
-func containsStr(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(s) > 0 && findInStr(s, sub))
-}
-
-func findInStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
 
 func TestBuildQueryNoFilters(t *testing.T) {
@@ -81,7 +69,7 @@ func TestBuildQueryPK(t *testing.T) {
 	q, args := buildQuery("/arc/*.parquet", opts)
 	assertContains(t, q, "pk_values = ?")
 	// No SHA2 — plain equality only.
-	if findInStr(q, "SHA2") {
+	if strings.Contains(q, "SHA2") {
 		t.Error("Parquet query must not use SHA2 (no index available)")
 	}
 	if args[0] != "12345" {
@@ -142,7 +130,7 @@ func TestBuildQueryChangedColumn(t *testing.T) {
 func TestBuildQueryNoLimit(t *testing.T) {
 	// Limit=0 means "no LIMIT clause" so the merge layer can apply the real limit.
 	q, args := buildQuery("/arc/*.parquet", query.Options{})
-	if findInStr(q, "LIMIT") {
+	if strings.Contains(q, "LIMIT") {
 		t.Error("expected no LIMIT clause when Limit=0")
 	}
 	if len(args) != 0 {
