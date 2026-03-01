@@ -3,6 +3,7 @@ package metadata
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -165,6 +166,15 @@ func (r *Resolver) MapRow(schema, table string, row []any) (map[string]any, erro
 
 // ─── TakeSnapshot ────────────────────────────────────────────────────────────
 
+// columnRow holds a single row from information_schema.COLUMNS as fetched by TakeSnapshot.
+type columnRow struct {
+	schemaName, tableName, columnName string
+	ordinalPosition                   int
+	columnKey, dataType, isNullable   string
+	extra                             string
+	columnDefault                     sql.NullString
+}
+
 // TakeSnapshot reads column metadata from information_schema on the source
 // server and writes it atomically into schema_snapshots in the index database.
 //
@@ -204,14 +214,6 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	}
 	defer srcRows.Close()
 
-	type columnRow struct {
-		schemaName, tableName, columnName string
-		ordinalPosition                   int
-		columnKey, dataType, isNullable   string
-		extra                             string
-		columnDefault                     sql.NullString
-	}
-
 	var columns []columnRow
 	seenTables := make(map[string]struct{})
 
@@ -234,6 +236,11 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	if len(columns) == 0 {
 		return SnapshotStats{}, fmt.Errorf(
 			"no columns found for the requested schemas; check --schemas and source server permissions")
+	}
+
+	// ── 1b. Validate: all tables must be InnoDB with explicit PKs ────────────
+	if err := validateTables(sourceDB, schemas, columns); err != nil {
+		return SnapshotStats{}, err
 	}
 
 	// ── 2. Write snapshot atomically into the index database ─────────────────
@@ -298,4 +305,94 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		TableCount:  len(seenTables),
 		ColumnCount: len(columns),
 	}, nil
+}
+
+// validateTables checks that all base tables in scope use InnoDB and have an
+// explicit primary key. Bintrail requires InnoDB for row-format binary log
+// support and needs primary keys to build pk_values for each event.
+// Returns an error listing all violations; returns nil when all tables pass.
+func validateTables(sourceDB *sql.DB, schemas []string, columns []columnRow) error {
+	var (
+		tabQuery string
+		tabArgs  []any
+	)
+	if len(schemas) == 0 {
+		tabQuery = `
+			SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE
+			FROM information_schema.TABLES
+			WHERE TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
+			  AND TABLE_TYPE = 'BASE TABLE'
+			ORDER BY TABLE_SCHEMA, TABLE_NAME`
+	} else {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
+		tabQuery = fmt.Sprintf(`
+			SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE
+			FROM information_schema.TABLES
+			WHERE TABLE_SCHEMA IN (%s)
+			  AND TABLE_TYPE = 'BASE TABLE'
+			ORDER BY TABLE_SCHEMA, TABLE_NAME`, placeholders)
+		for _, s := range schemas {
+			tabArgs = append(tabArgs, s)
+		}
+	}
+
+	tabRows, err := sourceDB.Query(tabQuery, tabArgs...)
+	if err != nil {
+		return fmt.Errorf("failed to query information_schema.TABLES: %w", err)
+	}
+	defer tabRows.Close()
+
+	baseTables := make(map[string]struct{})
+	var nonInnoDB []string
+
+	for tabRows.Next() {
+		var schemaName, tableName string
+		var engine sql.NullString
+		if err := tabRows.Scan(&schemaName, &tableName, &engine); err != nil {
+			return fmt.Errorf("failed to scan table row: %w", err)
+		}
+		key := schemaName + "." + tableName
+		baseTables[key] = struct{}{}
+		if !engine.Valid || !strings.EqualFold(engine.String, "InnoDB") {
+			nonInnoDB = append(nonInnoDB, key)
+		}
+	}
+	if err := tabRows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate tables: %w", err)
+	}
+
+	// Build the set of tables that have at least one PK column.
+	tablesWithPK := make(map[string]bool)
+	for _, c := range columns {
+		if c.columnKey == "PRI" {
+			tablesWithPK[c.schemaName+"."+c.tableName] = true
+		}
+	}
+
+	// Find base tables with no PK column.
+	var noPK []string
+	for key := range baseTables {
+		if !tablesWithPK[key] {
+			noPK = append(noPK, key)
+		}
+	}
+
+	sort.Strings(nonInnoDB)
+	sort.Strings(noPK)
+
+	if len(nonInnoDB) == 0 && len(noPK) == 0 {
+		return nil
+	}
+
+	var msgs []string
+	if len(nonInnoDB) > 0 {
+		msgs = append(msgs, fmt.Sprintf("tables not using InnoDB: %s", strings.Join(nonInnoDB, ", ")))
+	}
+	if len(noPK) > 0 {
+		msgs = append(msgs, fmt.Sprintf("tables without a primary key: %s", strings.Join(noPK, ", ")))
+	}
+	return fmt.Errorf(
+		"snapshot validation failed — bintrail requires all tables to use InnoDB with an explicit primary key\n%s",
+		strings.Join(msgs, "\n"),
+	)
 }
