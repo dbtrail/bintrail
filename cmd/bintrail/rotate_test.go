@@ -324,6 +324,74 @@ func TestParseRetain_minimumDay(t *testing.T) {
 	}
 }
 
+// ─── cobra flag defaults ──────────────────────────────────────────────────────
+
+func TestRotateCmd_defaults(t *testing.T) {
+	cases := []struct{ flag, want string }{
+		{"add-future", "0"},
+		{"no-replace", "false"},
+		{"archive-compression", "zstd"},
+	}
+	for _, tc := range cases {
+		f := rotateCmd.Flag(tc.flag)
+		if f == nil {
+			t.Fatalf("flag --%s not registered", tc.flag)
+		}
+		if f.DefValue != tc.want {
+			t.Errorf("flag --%s: expected default %q, got %q", tc.flag, tc.want, f.DefValue)
+		}
+	}
+}
+
+func TestRotateCmd_emptyStringDefaults(t *testing.T) {
+	for _, name := range []string{"retain", "archive-dir"} {
+		f := rotateCmd.Flag(name)
+		if f == nil {
+			t.Fatalf("flag --%s not registered", name)
+		}
+		if f.DefValue != "" {
+			t.Errorf("flag --%s: expected empty default, got %q", name, f.DefValue)
+		}
+	}
+}
+
+// ─── runRotate positive-path guard tests ──────────────────────────────────────
+
+// TestRunRotate_addFutureAlonePassesFirstGuard verifies that providing only
+// --add-future (no --retain) passes the "at least one of" guard.
+func TestRunRotate_addFutureAlonePassesFirstGuard(t *testing.T) {
+	savedRetain, savedAdd := rotRetain, rotAddFuture
+	t.Cleanup(func() { rotRetain = savedRetain; rotAddFuture = savedAdd })
+
+	rotRetain = ""
+	rotAddFuture = 5
+
+	err := runRotate(rotateCmd, nil) // fails later at DSN parse or config.Connect
+	if err != nil && strings.Contains(err.Error(), "--retain or --add-future") {
+		t.Errorf("first guard should not fire when --add-future is set, got: %v", err)
+	}
+}
+
+// TestRunRotate_retainAlonePassesFirstGuard verifies that providing only
+// --retain (no --add-future) passes both the "at least one of" guard and
+// the parseRetain check.
+func TestRunRotate_retainAlonePassesFirstGuard(t *testing.T) {
+	savedRetain, savedAdd, savedDSN := rotRetain, rotAddFuture, rotIndexDSN
+	t.Cleanup(func() { rotRetain = savedRetain; rotAddFuture = savedAdd; rotIndexDSN = savedDSN })
+
+	rotRetain = "7d"
+	rotAddFuture = 0
+	rotIndexDSN = "user:pass@tcp(localhost:3306)/binlog_index"
+
+	err := runRotate(rotateCmd, nil) // fails later at config.Connect — that's fine
+	if err != nil && strings.Contains(err.Error(), "--retain or --add-future") {
+		t.Errorf("first guard should not fire when --retain is set, got: %v", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "--retain:") {
+		t.Errorf("parseRetain should accept '7d', got: %v", err)
+	}
+}
+
 // ─── nextPartitionStart unsorted input ────────────────────────────────────────
 
 func TestNextPartitionStart_unsortedOrder(t *testing.T) {
