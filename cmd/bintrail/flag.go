@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -202,7 +203,8 @@ func runFlagList(cmd *cobra.Command, args []string) error {
 
 	n := 0
 	for rows.Next() {
-		var schema, table, column, flag, created string
+		var schema, table, column, flag string
+		var created time.Time
 		if err := rows.Scan(&schema, &table, &column, &flag, &created); err != nil {
 			return fmt.Errorf("failed to scan row: %w", err)
 		}
@@ -210,7 +212,7 @@ func runFlagList(cmd *cobra.Command, args []string) error {
 		if level == "" {
 			level = "(table)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", schema, table, level, flag, created)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", schema, table, level, flag, created.UTC().Format("2006-01-02 15:04:05"))
 		n++
 	}
 	if err := rows.Err(); err != nil {
