@@ -40,9 +40,9 @@ func NewStreamParser(resolver *metadata.Resolver, filters Filters, logger *slog.
 func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStreamer, out chan<- Event) error {
 	var currentFile string
 	var currentGTID string
-	schemaVersion := 0
+	var schemaVersion uint32
 	if sp.resolver != nil {
-		schemaVersion = sp.resolver.SnapshotID()
+		schemaVersion = uint32(sp.resolver.SnapshotID())
 	}
 
 	for {

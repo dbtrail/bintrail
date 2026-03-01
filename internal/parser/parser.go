@@ -43,7 +43,7 @@ type Event struct {
 	PKValues      string         // pipe-delimited PK values in ordinal order
 	RowBefore     map[string]any // nil for INSERT
 	RowAfter      map[string]any // nil for DELETE
-	SchemaVersion int            // resolver.SnapshotID() at parse time; incremented on each DDL detection
+	SchemaVersion uint32         // resolver.SnapshotID() at parse time; incremented on each DDL detection
 }
 
 // ─── Filters ─────────────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ type Parser struct {
 	resolver      *metadata.Resolver
 	filters       Filters
 	logger        *slog.Logger
-	schemaVersion int // starts at resolver.SnapshotID(); incremented on each DDL detection
+	schemaVersion uint32 // starts at resolver.SnapshotID(); incremented on each DDL detection
 }
 
 // New creates a Parser that reads from binlogDir, resolves column names via
@@ -89,7 +89,7 @@ func New(binlogDir string, resolver *metadata.Resolver, filters Filters, logger 
 		resolver:      resolver,
 		filters:       filters,
 		logger:        logger,
-		schemaVersion: resolver.SnapshotID(),
+		schemaVersion: uint32(resolver.SnapshotID()),
 	}
 }
 
@@ -153,7 +153,7 @@ func handleRows(
 	binlogEv *replication.BinlogEvent,
 	rowsEv *replication.RowsEvent,
 	filename, currentGTID string,
-	schemaVersion int,
+	schemaVersion uint32,
 	out chan<- Event,
 ) error {
 	schema := string(rowsEv.Table.Schema)
@@ -222,7 +222,7 @@ func emitInserts(
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
-	schemaVersion int,
+	schemaVersion uint32,
 	out chan<- Event,
 ) error {
 	for _, row := range rows {
@@ -258,7 +258,7 @@ func emitDeletes(
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
-	schemaVersion int,
+	schemaVersion uint32,
 	out chan<- Event,
 ) error {
 	for _, row := range rows {
@@ -294,7 +294,7 @@ func emitUpdates(
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
-	schemaVersion int,
+	schemaVersion uint32,
 	out chan<- Event,
 ) error {
 	// go-mysql delivers UPDATE rows as interleaved before/after pairs:
@@ -375,15 +375,16 @@ func formatGTID(sid []byte, gno int64) string {
 		sid[0:4], sid[4:6], sid[6:8], sid[8:10], sid[10:16], gno)
 }
 
-// warnOnDDL logs a warning when a DDL statement is found in a QUERY_EVENT.
-// DDL changes table structure and may invalidate the current schema snapshot.
-// Returns true if the query is DDL, false otherwise.
+// warnOnDDL logs a warning when a schema-changing DDL statement is found in a
+// QUERY_EVENT. DDL changes table structure and may invalidate the current schema
+// snapshot. Returns true if the query alters table structure, false otherwise.
+// Note: TRUNCATE is intentionally excluded — it removes rows but does not change
+// column structure, so it does not invalidate the snapshot.
 func warnOnDDL(logger *slog.Logger, filename string, logPos uint32, query string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	isDDL := strings.HasPrefix(upper, "ALTER TABLE") ||
 		strings.HasPrefix(upper, "CREATE TABLE") ||
 		strings.HasPrefix(upper, "DROP TABLE") ||
-		strings.HasPrefix(upper, "TRUNCATE") ||
 		strings.HasPrefix(upper, "RENAME TABLE")
 	if isDDL {
 		logger.Warn("DDL detected — consider re-running `bintrail snapshot`",
