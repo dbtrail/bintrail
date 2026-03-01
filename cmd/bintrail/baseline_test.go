@@ -5,6 +5,78 @@ import (
 	"testing"
 )
 
+// ─── cobra command wiring ─────────────────────────────────────────────────────
+
+func TestBaselineCmd_registered(t *testing.T) {
+	found := false
+	for _, cmd := range rootCmd.Commands() {
+		if cmd.Use == "baseline" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'baseline' command to be registered under rootCmd")
+	}
+}
+
+func TestBaselineCmd_requiredFlags(t *testing.T) {
+	for _, name := range []string{"input", "output"} {
+		flag := baselineCmd.Flag(name)
+		if flag == nil {
+			t.Fatalf("flag --%s not registered", name)
+		}
+		if flag.Annotations["cobra_annotation_bash_completion_one_required_flag"] == nil {
+			t.Errorf("flag --%s is not marked required", name)
+		}
+	}
+}
+
+func TestBaselineCmd_allFlagsRegistered(t *testing.T) {
+	for _, name := range []string{
+		"input", "output", "timestamp", "tables",
+		"compression", "row-group-size", "upload", "upload-region",
+	} {
+		if baselineCmd.Flag(name) == nil {
+			t.Errorf("flag --%s not registered on baselineCmd", name)
+		}
+	}
+}
+
+func TestBaselineCmd_defaults(t *testing.T) {
+	cases := []struct {
+		flag string
+		want string
+	}{
+		{"compression", "zstd"},
+		{"row-group-size", "500000"},
+	}
+	for _, tc := range cases {
+		f := baselineCmd.Flag(tc.flag)
+		if f == nil {
+			t.Fatalf("flag --%s not registered", tc.flag)
+		}
+		if f.DefValue != tc.want {
+			t.Errorf("flag --%s: expected default %q, got %q", tc.flag, tc.want, f.DefValue)
+		}
+	}
+}
+
+func TestBaselineCmd_emptyStringDefaults(t *testing.T) {
+	for _, name := range []string{"timestamp", "tables", "upload", "upload-region"} {
+		f := baselineCmd.Flag(name)
+		if f == nil {
+			t.Errorf("flag --%s not registered", name)
+			continue
+		}
+		if f.DefValue != "" {
+			t.Errorf("flag --%s: expected empty default, got %q", name, f.DefValue)
+		}
+	}
+}
+
+// ─── parseTableFilter ─────────────────────────────────────────────────────────
+
 func TestParseTableFilter(t *testing.T) {
 	cases := []struct {
 		input string
@@ -99,6 +171,18 @@ func TestParseS3URL(t *testing.T) {
 	}
 }
 
+// TestParseTableFilter_onlyCommasAndSpaces verifies that a string containing
+// only commas and whitespace (no actual table names) returns nil — the same
+// result as an empty string, but via a different code path (SplitSeq iterates
+// but every trimmed part is "").
+func TestParseTableFilter_onlyCommasAndSpaces(t *testing.T) {
+	for _, input := range []string{",", "  ,  ", ", , ,", " , "} {
+		if got := parseTableFilter(input); got != nil {
+			t.Errorf("parseTableFilter(%q) = %v, want nil", input, got)
+		}
+	}
+}
+
 func TestRunBaselineMissingInput(t *testing.T) {
 	origInput, origOutput, origTS := bslInput, bslOutput, bslTimestamp
 	t.Cleanup(func() {
@@ -114,5 +198,30 @@ func TestRunBaselineMissingInput(t *testing.T) {
 
 	if err := runBaseline(baselineCmd, nil); err == nil {
 		t.Error("expected error for nonexistent input directory, got nil")
+	}
+}
+
+// TestRunBaseline_emptyTimestamp verifies that when --timestamp is omitted,
+// runBaseline delegates timestamp resolution to baseline.Run → ParseMetadata.
+// A temp dir with no metadata file causes a "parse mydumper metadata" error —
+// proving the empty-timestamp code path is reached.
+func TestRunBaseline_emptyTimestamp(t *testing.T) {
+	origInput, origOutput, origTS := bslInput, bslOutput, bslTimestamp
+	t.Cleanup(func() {
+		bslInput = origInput
+		bslOutput = origOutput
+		bslTimestamp = origTS
+	})
+
+	bslInput = t.TempDir() // valid dir but no metadata file
+	bslOutput = t.TempDir()
+	bslTimestamp = "" // triggers ParseMetadata inside baseline.Run
+
+	err := runBaseline(baselineCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when metadata file is absent, got nil")
+	}
+	if !strings.Contains(err.Error(), "metadata") {
+		t.Errorf("expected 'metadata' in error, got: %v", err)
 	}
 }
