@@ -21,7 +21,7 @@ import (
 	"github.com/bintrail/bintrail/internal/testutil"
 )
 
-// ─── stream_state persistence ────────────────────────────────────────────────
+// ─── stream_state persistence ────────────────────────────────────────────────────────
 
 func TestStreamState_loadEmpty(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
@@ -149,7 +149,45 @@ func TestStreamState_gtidMode(t *testing.T) {
 	}
 }
 
-// ─── streamLoop (in-memory, no live replication) ─────────────────────────────
+// ─── stream_state: bintrail_id round-trip ────────────────────────────────────────────
+
+func TestStreamState_bintrailID(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	const id = "aabbccdd-0000-0000-0000-000000000002"
+	state := &streamState{mode: "position", binlogFile: "binlog.000001", binlogPos: 100, serverID: 1, bintrailID: id}
+	if err := saveCheckpoint(db, state); err != nil {
+		t.Fatalf("saveCheckpoint: %v", err)
+	}
+	loaded, err := loadStreamState(db)
+	if err != nil {
+		t.Fatalf("loadStreamState: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected non-nil state")
+	}
+	if loaded.bintrailID != id {
+		t.Errorf("bintrailID: expected %q, got %q", id, loaded.bintrailID)
+	}
+}
+
+func TestStreamState_emptyBintrailIDStoresNULL(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	state := &streamState{mode: "position", binlogFile: "binlog.000001", serverID: 1, bintrailID: ""}
+	if err := saveCheckpoint(db, state); err != nil {
+		t.Fatalf("saveCheckpoint: %v", err)
+	}
+	var got sql.NullString
+	if err := db.QueryRow("SELECT bintrail_id FROM stream_state WHERE id = 1").Scan(&got); err != nil {
+		t.Fatalf("query bintrail_id: %v", err)
+	}
+	if got.Valid {
+		t.Errorf("expected bintrail_id to be NULL, got %q", got.String)
+	}
+}
+
+// ─── streamLoop (in-memory, no live replication) ─────────────────────────────────────────
 
 // TestStreamLoop_flushAndCheckpoint verifies that streamLoop correctly batches
 // events, flushes them, and saves a checkpoint — using a live index database
@@ -220,7 +258,7 @@ func TestStreamLoop_flushAndCheckpoint(t *testing.T) {
 	}
 }
 
-// ─── streamLoop live replication ─────────────────────────────────────────────
+// ─── streamLoop live replication ───────────────────────────────────────────────────────
 
 // TestStreamLoop_liveReplication is a full end-to-end test that connects as a
 // replica to the Docker MySQL, streams events, and verifies they are indexed.
@@ -333,7 +371,7 @@ func TestStreamLoop_liveReplication(t *testing.T) {
 	}
 }
 
-// ─── streamLoop — additional behaviour ───────────────────────────────────────
+// ─── streamLoop — additional behaviour ────────────────────────────────────────────────
 
 // TestStreamLoop_contextCancel verifies that cancelling the context causes
 // streamLoop to flush the in-flight batch and write a checkpoint before returning.
