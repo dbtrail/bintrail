@@ -30,6 +30,16 @@ func TestStatusCmd_indexDSN_required(t *testing.T) {
 	}
 }
 
+func TestStatusCmd_indexDSN_emptyDefault(t *testing.T) {
+	f := statusCmd.Flag("index-dsn")
+	if f == nil {
+		t.Fatal("flag --index-dsn not registered")
+	}
+	if f.DefValue != "" {
+		t.Errorf("expected empty default for --index-dsn, got %q", f.DefValue)
+	}
+}
+
 // ─── runStatus validation (no DB required) ────────────────────────────────────
 
 // TestRunStatus_missingDBName verifies that a DSN without a database name is
@@ -46,5 +56,41 @@ func TestRunStatus_missingDBName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--index-dsn must include a database name") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestRunStatus_invalidDSN verifies that a syntactically invalid DSN is caught
+// by mysql.ParseDSN and surfaces as an "invalid --index-dsn" error — before
+// any connection is attempted.
+func TestRunStatus_invalidDSN(t *testing.T) {
+	saved := stIndexDSN
+	t.Cleanup(func() { stIndexDSN = saved })
+
+	stIndexDSN = "://this-is-not-a-valid-dsn"
+
+	err := runStatus(statusCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid DSN, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid --index-dsn") {
+		t.Errorf("expected 'invalid --index-dsn' in error, got: %v", err)
+	}
+}
+
+// TestRunStatus_validDSNPassesGuards verifies that a DSN with a database name
+// passes both pre-connection guards and fails only at config.Connect — proving
+// neither the parse guard nor the DB-name guard fires.
+func TestRunStatus_validDSNPassesGuards(t *testing.T) {
+	saved := stIndexDSN
+	t.Cleanup(func() { stIndexDSN = saved })
+
+	stIndexDSN = "user:pass@tcp(localhost:3306)/binlog_index"
+
+	err := runStatus(statusCmd, nil) // fails at config.Connect — that's fine
+	if err != nil && strings.Contains(err.Error(), "invalid --index-dsn") {
+		t.Errorf("parse guard should not fire for a valid DSN, got: %v", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "--index-dsn must include a database name") {
+		t.Errorf("DB-name guard should not fire when DB name is present, got: %v", err)
 	}
 }
