@@ -77,7 +77,7 @@ func init() {
 	streamCmd.Flags().IntVar(&strmCheckpoint, "checkpoint", 10, "Checkpoint interval in seconds")
 	streamCmd.Flags().StringVar(&strmMetricsAddr, "metrics-addr", "", "Address to expose Prometheus metrics (e.g. :9090); empty = disabled")
 	streamCmd.Flags().StringVar(&strmSSLMode, "ssl-mode", "preferred", "TLS mode: disabled, preferred, required, verify-ca, verify-identity")
-	streamCmd.Flags().StringVar(&strmSSLCA, "ssl-ca", "", "Path to CA certificate file for TLS verification")
+	streamCmd.Flags().StringVar(&strmSSLCA, "ssl-ca", "", "Path to CA certificate file for TLS verification (omit to use system CAs)")
 	streamCmd.Flags().StringVar(&strmSSLCert, "ssl-cert", "", "Path to client certificate file for mutual TLS")
 	streamCmd.Flags().StringVar(&strmSSLKey, "ssl-key", "", "Path to client private key file for mutual TLS")
 	_ = streamCmd.MarkFlagRequired("index-dsn")
@@ -528,7 +528,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 	streamer, startErr := startStreamer()
 	if startErr != nil && strmSSLMode == "preferred" {
 		// preferred: TLS attempt failed — retry without TLS.
-		slog.Warn("TLS connection failed; retrying without TLS", "error", startErr)
+		slog.Warn("initial connection failed; retrying without TLS (--ssl-mode preferred)", "error", startErr)
 		syncer.Close()
 		syncerCfg.TLSConfig = nil
 		syncer = replication.NewBinlogSyncer(syncerCfg)
