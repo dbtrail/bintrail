@@ -348,3 +348,54 @@ func TestS3Instructions_containsConsoleURL(t *testing.T) {
 		t.Error("expected 365 days mention in console instructions")
 	}
 }
+
+// ─── runInit validation (no DB required) ─────────────────────────────────────
+
+func TestRunInit_s3BucketAndARNMutuallyExclusive(t *testing.T) {
+	savedBucket, savedARN := initS3Bucket, initS3ARN
+	t.Cleanup(func() { initS3Bucket = savedBucket; initS3ARN = savedARN })
+
+	initS3Bucket = "my-bucket"
+	initS3ARN = "arn:aws:s3:::other-bucket"
+
+	err := runInit(initCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when both --s3-bucket and --s3-arn are set, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestRunInit_invalidS3ARN(t *testing.T) {
+	savedBucket, savedARN := initS3Bucket, initS3ARN
+	t.Cleanup(func() { initS3Bucket = savedBucket; initS3ARN = savedARN })
+
+	initS3Bucket = ""
+	initS3ARN = "not-an-arn"
+
+	err := runInit(initCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid --s3-arn, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid --s3-arn") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestRunInit_missingDBName(t *testing.T) {
+	savedDSN, savedBucket, savedARN := initIndexDSN, initS3Bucket, initS3ARN
+	t.Cleanup(func() { initIndexDSN = savedDSN; initS3Bucket = savedBucket; initS3ARN = savedARN })
+
+	initS3Bucket = ""
+	initS3ARN = ""
+	initIndexDSN = "user:pass@tcp(localhost:3306)/" // valid syntax, no database name
+
+	err := runInit(initCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when DSN has no database name, got nil")
+	}
+	if !strings.Contains(err.Error(), "--index-dsn must include a database name") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
