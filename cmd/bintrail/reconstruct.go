@@ -45,7 +45,7 @@ Examples:
 
   # Free-form DuckDB SQL against a baseline directory
   bintrail reconstruct \
-    --sql "SELECT * FROM read_parquet('/data/baselines/2026-02-28T00-00-00Z/mydb/orders.parquet') LIMIT 10"
+    --sql "SELECT * FROM parquet_scan('/data/baselines/2026-02-28T00-00-00Z/mydb/orders.parquet') LIMIT 10"
 
   # S3 baseline (uses standard AWS credential chain)
   bintrail reconstruct --index-dsn "..." --schema mydb --table orders \
@@ -79,7 +79,7 @@ func init() {
 	reconstructCmd.Flags().StringVar(&recBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/); uses the standard AWS credential chain")
 	reconstructCmd.Flags().BoolVar(&recBaselineOnly, "baseline-only", false, "Return the baseline row without applying binlog events (no --index-dsn needed)")
 	reconstructCmd.Flags().BoolVar(&recHistory, "history", false, "Return all intermediate states (one entry per binlog event) instead of just the final state")
-	reconstructCmd.Flags().StringVar(&recSQL, "sql", "", "Execute arbitrary DuckDB SQL and print results (bypasses all other flags except --baseline-dir/s3 and --format)")
+	reconstructCmd.Flags().StringVar(&recSQL, "sql", "", "Execute arbitrary DuckDB SQL and print results (bypasses --schema/table/pk/at; --baseline-dir/s3 only controls whether the httpfs extension is loaded for S3 access)")
 	reconstructCmd.Flags().StringVar(&recFormat, "format", "json", "Output format: json, table, or csv")
 
 	rootCmd.AddCommand(reconstructCmd)
@@ -132,8 +132,8 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Build pkFilter from --pk and --pk-columns ──────────────────────────────
-	// Note: --pk uses unescaped | as the separator (same convention as the
-	// query command). PK values containing | must be escaped as \| in --pk.
+	// Note: --pk uses | as the composite PK separator. Literal | in PK values
+	// is not supported (strings.Split cannot honour the \| escaping convention).
 	pkCols := strings.Split(recPKColumns, ",")
 	pkVals := strings.Split(recPK, "|")
 	if len(pkCols) != len(pkVals) {

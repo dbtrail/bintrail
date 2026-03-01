@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -45,7 +45,7 @@ func ReadBaselineRow(ctx context.Context, path string, pkFilter map[string]strin
 	// Build sorted conditions for deterministic SQL + arg ordering.
 	conds := buildCondsList(pkFilter)
 	safePath := strings.ReplaceAll(path, "'", "''")
-	q := "SELECT * FROM read_parquet('" + safePath + "')"
+	q := "SELECT * FROM parquet_scan('" + safePath + "')"
 	if len(conds) > 0 {
 		parts := make([]string, len(conds))
 		for i, c := range conds {
@@ -71,7 +71,7 @@ func ReadBaselineRow(ctx context.Context, path string, pkFilter map[string]strin
 		return nil, fmt.Errorf("baseline columns: %w", err)
 	}
 	if !rows.Next() {
-		return nil, nil // no matching row
+		return nil, rows.Err() // nil when simply no rows; non-nil on iteration error
 	}
 
 	vals := make([]any, len(cols))
@@ -165,7 +165,7 @@ func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string,
 		return "", time.Time{}, fmt.Errorf("no baseline snapshot found for %s.%s at or before %s in %q",
 			schema, table, at.UTC().Format(time.RFC3339), baselineDir)
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].t.After(candidates[j].t) })
+	slices.SortFunc(candidates, func(a, b candidate) int { return b.t.Compare(a.t) })
 	return candidates[0].path, candidates[0].t, nil
 }
 
@@ -216,7 +216,7 @@ func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Ti
 		return "", time.Time{}, fmt.Errorf("no baseline snapshot found for %s.%s at or before %s in %q",
 			schema, table, at.UTC().Format(time.RFC3339), s3URL)
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].t.After(candidates[j].t) })
+	slices.SortFunc(candidates, func(a, b candidate) int { return b.t.Compare(a.t) })
 	return candidates[0].path, candidates[0].t, nil
 }
 
@@ -268,6 +268,6 @@ func buildCondsList(pkFilter map[string]string) []colCond {
 	for col, val := range pkFilter {
 		conds = append(conds, colCond{col: col, value: val})
 	}
-	sort.Slice(conds, func(i, j int) bool { return conds[i].col < conds[j].col })
+	slices.SortFunc(conds, func(a, b colCond) int { return strings.Compare(a.col, b.col) })
 	return conds
 }
