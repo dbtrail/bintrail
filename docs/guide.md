@@ -486,16 +486,41 @@ If you used `--s3-bucket` to let bintrail create the bucket, it also needs `s3:C
 
 **AWS credentials:** bintrail uses the standard AWS credential chain — environment variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, or the EC2/ECS instance metadata service. No extra configuration is needed when running on an EC2 instance with an IAM instance profile that has the policy above attached.
 
-**Archive during rotation:**
+**Archive to a local directory:**
+
+```sh
+bintrail rotate \
+  --index-dsn   "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain      7d \
+  --archive-dir /mnt/archives
+```
+
+**Archive directly to S3:**
 
 ```sh
 bintrail rotate \
   --index-dsn         "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
   --retain            7d \
-  --archive-dir       /mnt/archives
+  --archive-dir       /tmp/rotate-staging \
+  --archive-s3        s3://my-bintrail-archives/events/ \
+  --archive-s3-region us-east-1
 ```
 
-`--archive-dir` currently writes Parquet files to a local (or NFS-mounted) directory. Use an S3-backed mount (e.g. `mountpoint-s3`) to write directly to S3 without any code changes.
+`--archive-dir` is still required with `--archive-s3` — files are written locally first, then uploaded. Point it at a temporary directory if you don't need local copies after upload. Archives are stored in a Hive-partitioned layout: `bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/events_<HH>.parquet`, compatible with Athena, Glue, and DuckDB.
+
+**Query archived events** using `--archive-s3` on the `query` command. Provide `--bintrail-id` to scope the archive path to your server's UUID (shown in `bintrail status`):
+
+```sh
+bintrail query \
+  --index-dsn   "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --schema      mydb \
+  --table       orders \
+  --since       "2026-01-01 00:00:00" \
+  --archive-s3  s3://my-bintrail-archives/events/ \
+  --bintrail-id abc123de-0000-0000-0000-000000000001
+```
+
+Results from the live MySQL index and from Parquet archives are merged, deduplicated, and sorted by timestamp before being returned.
 
 ---
 

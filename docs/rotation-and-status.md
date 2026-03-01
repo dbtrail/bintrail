@@ -129,6 +129,78 @@ These two functions round-trip correctly: `partitionName(partitionDate("p_202602
 
 ---
 
+## Archiving Partitions to Parquet
+
+Before dropping old partitions, bintrail can serialize each partition's events to a Parquet file. This gives you a long-term queryable record outside the index database — without requiring the original binlog files.
+
+### Archiving to a local directory
+
+Pass `--archive-dir` to write Parquet files locally before each drop:
+
+```sh
+bintrail rotate \
+  --index-dsn           "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain              7d \
+  --archive-dir         /mnt/archives \
+  --archive-compression zstd
+```
+
+Each archived partition becomes a single Parquet file: `<archive-dir>/p_YYYYMMDDHH.parquet`. If any archive write fails, no partitions are dropped — the command aborts before touching the table.
+
+`--archive-compression` accepts `zstd` (default), `snappy`, `gzip`, or `none`.
+
+### Archiving directly to S3
+
+Pass `--archive-s3` alongside `--archive-dir` to upload each Parquet file to S3 after writing it locally:
+
+```sh
+bintrail rotate \
+  --index-dsn         "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain            7d \
+  --archive-dir       /tmp/rotate-staging \
+  --archive-s3        s3://my-bintrail-archives/events/ \
+  --archive-s3-region us-east-1
+```
+
+`--archive-dir` is still required — files are written locally first, then uploaded. You can use a temporary directory if you don't need local copies after upload.
+
+**Hive-partitioned layout**: S3 objects are stored with a Hive-compatible directory structure for compatibility with Athena, Glue, and DuckDB:
+
+```
+s3://my-bintrail-archives/events/
+  bintrail_id=abc123de-0000-0000-0000-000000000001/
+    event_date=2026-02-13/
+      events_00.parquet   ← p_2026021300
+      events_01.parquet   ← p_2026021301
+      ...
+    event_date=2026-02-14/
+      events_00.parquet
+      ...
+```
+
+The `bintrail_id` partition key is the stable UUID of the bintrail server instance that indexed the data (see [Server Identity](server-identity.md)). Multiple bintrail instances indexing different MySQL sources can share the same S3 prefix without collision.
+
+**AWS credentials**: bintrail uses the standard credential chain — environment variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, or EC2/ECS instance metadata. `--archive-s3-region` is optional if `AWS_REGION` is already set.
+
+### Querying archived events
+
+Once partitions are archived to S3, query them alongside live index data with `--archive-s3` on the `query` command. Provide `--bintrail-id` to scope the archive path to a specific server:
+
+```sh
+bintrail query \
+  --index-dsn   "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --schema      mydb \
+  --table       orders \
+  --since       "2026-01-01 00:00:00" \
+  --until       "2026-01-31 23:59:59" \
+  --archive-s3  s3://my-bintrail-archives/events/ \
+  --bintrail-id abc123de-0000-0000-0000-000000000001
+```
+
+Results from the live MySQL index and from Parquet archives are merged, deduplicated by `event_id`, and sorted by timestamp before being returned. Archive query failures are non-fatal — the command logs a warning and continues with live results only.
+
+---
+
 ## Status Command: Three Sections
 
 ```sh
@@ -137,15 +209,18 @@ bintrail status --index-dsn "..."
 
 The status command produces a three-section report, implemented in `internal/status/status.go`:
 
-**Section 1 — Indexed Files**: Shows every row in `index_state`. For each binlog file that has ever been indexed (or attempted):
+**Section 1 — Indexed Files**: Shows every row in `index_state`. The `BINTRAIL_ID` column identifies which bintrail server instance indexed each file:
 
 ```
 === Indexed Files ===
-FILE              STATUS     EVENTS  STARTED_AT           COMPLETED_AT         ERROR
-────              ──────     ──────  ──────────           ────────────         ─────
-binlog.000042     completed  12345   2026-02-19 10:00:00  2026-02-19 10:00:42  -
-binlog.000043     completed  8901    2026-02-19 10:00:43  2026-02-19 10:01:12  -
+FILE              STATUS     EVENTS  STARTED_AT           COMPLETED_AT         ERROR  BINTRAIL_ID
+────              ──────     ──────  ──────────           ────────────         ─────  ───────────
+binlog.000042     completed  12345   2026-02-19 10:00:00  2026-02-19 10:00:42  -      abc123de-0000-0000-0000-000000000001
+binlog.000043     completed  8901    2026-02-19 10:00:43  2026-02-19 10:01:12  -      abc123de-0000-0000-0000-000000000001
+binlog.000001     completed  999     2026-02-01 00:00:00  2026-02-01 00:05:00  -      -
 ```
+
+Rows with `-` in `BINTRAIL_ID` were indexed before the server identity feature was introduced; their server of origin is unknown.
 
 **Section 2 — Partitions**: Shows each partition with its boundary and estimated row count:
 
@@ -160,13 +235,20 @@ p_future      MAXVALUE            0
 Total events (est.): 987654
 ```
 
-**Section 3 — Summary**: Aggregates the index_state counts:
+**Section 3 — Summary**: Groups files by server identity and aggregates counts:
 
 ```
 === Summary ===
-Files:  12 completed, 0 in_progress, 0 failed
-Events: 987654 indexed
+Server abc123de-0000-0000-0000-000000000001
+  Files:  12 completed, 0 in_progress, 0 failed
+  Events: 986655 indexed
+
+Server (unknown)
+  Files:  1 completed, 0 in_progress, 0 failed
+  Events: 999 indexed
 ```
+
+Files with a NULL `bintrail_id` are grouped under `Server (unknown)`. This is common when a shared index database receives files from multiple bintrail instances (e.g. one per replica), or when upgrading from a version predating the server identity feature.
 
 The row counts in the partitions section are **estimates** from `information_schema.PARTITIONS.TABLE_ROWS`. InnoDB doesn't maintain exact row counts, so these are good approximations for capacity planning but not for exact totals.
 
@@ -210,19 +292,21 @@ bintrail snapshot
 
 bintrail index / bintrail stream
     └── parses events → inserts into binlog_events partitions
-        tracks progress in index_state / stream_state
+        tracks progress in index_state / stream_state (with bintrail_id)
 
-bintrail rotate --retain 7d
-    └── drops old partitions (instant metadata operation)
+bintrail rotate --retain 7d [--archive-s3 s3://...]
+    └── (optional) archives each partition to Parquet → uploads to S3
+        drops old partitions (instant metadata operation)
         auto-adds replacement future partitions (reorganize p_future)
 
 bintrail status
     └── reads index_state, information_schema.PARTITIONS
-        prints three-section report
+        prints three-section report (with per-server Summary)
 
-bintrail query
+bintrail query [--archive-s3 s3://...]
     └── partition pruning: only reads relevant partitions
         pk_hash index: finds rows in microseconds
+        merges with Parquet archives when --archive-s3 is given
 
 bintrail recover
     └── generates reversal SQL from row_before / row_after
@@ -249,6 +333,17 @@ bintrail rotate \
   --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
   --retain 720h \
   --add-future 48   # adds 720 replacements + 48 extras = 768 new partitions total
+```
+
+To archive partitions to S3 before dropping:
+
+```sh
+bintrail rotate \
+  --index-dsn         "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain            720h \
+  --archive-dir       /tmp/rotate-staging \
+  --archive-s3        s3://my-bintrail-archives/events/ \
+  --archive-s3-region us-east-1
 ```
 
 To drop without adding anything back — useful when disk is critically full — use `--no-replace`:
