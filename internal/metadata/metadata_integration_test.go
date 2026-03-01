@@ -3,10 +3,75 @@
 package metadata
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/bintrail/bintrail/internal/testutil"
 )
+
+func TestTakeSnapshot_nonInnoDB(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id INT PRIMARY KEY,
+		status VARCHAR(20)
+	) ENGINE=MyISAM`)
+
+	_, err := TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err == nil {
+		t.Fatal("expected validation error for non-InnoDB table, got nil")
+	}
+	if !strings.Contains(err.Error(), "not using InnoDB") {
+		t.Errorf("expected 'not using InnoDB' in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), sourceName+".orders") {
+		t.Errorf("expected table name in error, got: %v", err)
+	}
+}
+
+func TestTakeSnapshot_noPK(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE events (
+		name VARCHAR(100),
+		value INT
+	) ENGINE=InnoDB`)
+
+	_, err := TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err == nil {
+		t.Fatal("expected validation error for table without primary key, got nil")
+	}
+	if !strings.Contains(err.Error(), "without a primary key") {
+		t.Errorf("expected 'without a primary key' in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), sourceName+".events") {
+		t.Errorf("expected table name in error, got: %v", err)
+	}
+}
+
+func TestTakeSnapshot_bothViolations(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE myisam_tbl (id INT PRIMARY KEY) ENGINE=MyISAM`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE nopk_tbl (name VARCHAR(100)) ENGINE=InnoDB`)
+
+	_, err := TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not using InnoDB") {
+		t.Errorf("expected 'not using InnoDB' in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "without a primary key") {
+		t.Errorf("expected 'without a primary key' in error, got: %v", err)
+	}
+}
 
 func TestTakeSnapshot_basic(t *testing.T) {
 	// Create two databases: source (with a real table) and index (for snapshot storage).
