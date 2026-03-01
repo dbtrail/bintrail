@@ -60,8 +60,12 @@ func TestBuildQueryNoFilters(t *testing.T) {
 // /**/*.parquet glob, not the old flat /*.parquet pattern.
 func TestBuildQueryViaGlob(t *testing.T) {
 	glob := buildGlob("/archives/bintrail_id=abc-123")
-	q, _ := buildQuery(glob, query.Options{Limit: 50})
+	q, args := buildQuery(glob, query.Options{Limit: 50})
 	assertContains(t, q, "/archives/bintrail_id=abc-123/**/*.parquet")
+	assertContains(t, q, "LIMIT ?")
+	if len(args) != 1 || args[0] != 50 {
+		t.Errorf("expected [50] args, got %v", args)
+	}
 }
 
 func TestBuildQuerySchemaTable(t *testing.T) {

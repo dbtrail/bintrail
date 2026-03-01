@@ -81,11 +81,11 @@ CREATE TABLE IF NOT EXISTS schema_snapshots (
 -- host migration, username rotation) while preserving the bintrail_id.
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS bintrail_servers (
-    bintrail_id       CHAR(36)     NOT NULL,
-    server_uuid       CHAR(36)     NOT NULL,
-    host              VARCHAR(255) NOT NULL,
-    port              INT UNSIGNED NOT NULL DEFAULT 3306,
-    username          VARCHAR(255) NOT NULL,
+    bintrail_id       CHAR(36)          NOT NULL,
+    server_uuid       CHAR(36)          NOT NULL,
+    host              VARCHAR(255)      NOT NULL,
+    port              SMALLINT UNSIGNED NOT NULL DEFAULT 3306,
+    username          VARCHAR(255)      NOT NULL,
     created_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     decommissioned_at TIMESTAMP    NULL DEFAULT NULL,

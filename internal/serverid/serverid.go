@@ -13,6 +13,37 @@ import (
 	"github.com/google/uuid"
 )
 
+// DDLBintrailServers is the canonical CREATE TABLE statement for bintrail_servers.
+// Used by `bintrail init` and by testutil.InitIndexTables to ensure a single
+// source of truth for the schema.
+const DDLBintrailServers = `CREATE TABLE IF NOT EXISTS bintrail_servers (
+    bintrail_id       CHAR(36)        NOT NULL,
+    server_uuid       CHAR(36)        NOT NULL,
+    host              VARCHAR(255)    NOT NULL,
+    port              SMALLINT UNSIGNED NOT NULL DEFAULT 3306,
+    username          VARCHAR(255)    NOT NULL,
+    created_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    decommissioned_at TIMESTAMP       NULL DEFAULT NULL,
+    PRIMARY KEY (bintrail_id),
+    INDEX idx_server_uuid    (server_uuid),
+    INDEX idx_host_port_user (host, port, username)
+) ENGINE=InnoDB`
+
+// DDLBintrailServerChanges is the canonical CREATE TABLE statement for
+// bintrail_server_changes. Append-only audit trail — never update or delete rows.
+const DDLBintrailServerChanges = `CREATE TABLE IF NOT EXISTS bintrail_server_changes (
+    id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    bintrail_id   CHAR(36)        NOT NULL,
+    field_changed ENUM('server_uuid','host','port','username') NOT NULL,
+    old_value     VARCHAR(255)    NOT NULL,
+    new_value     VARCHAR(255)    NOT NULL,
+    detected_at   TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    INDEX idx_bintrail_id (bintrail_id),
+    INDEX idx_detected_at (detected_at)
+) ENGINE=InnoDB`
+
 // ErrConflict is returned by ResolveServer when the observed server_uuid matches
 // one active record while the observed host+port+username matches a different
 // active record — a cloned-server situation that requires manual resolution.
