@@ -508,6 +508,48 @@ All metrics are in the `bintrail_stream_` namespace:
 - `README.md` — project overview + Quick Start (line 56 links to `docs/guide.md` for the full DBA walkthrough)
 - `docs/guide.md` — scenario-driven guide: initial setup, daily rotation, point-in-time recovery, multi-table recovery, troubleshooting FAQ
 
+## Build and release
+
+### Version injection
+
+Both binaries have build-time variables injected via `-ldflags -X main.VarName=value`:
+
+| Binary | Variables | Source |
+|---|---|---|
+| `bintrail` | `Version`, `CommitSHA`, `BuildDate` | `cmd/bintrail/main.go` |
+| `bintrail-mcp` | `mcpVersion` | `cmd/bintrail-mcp/main.go` |
+
+For `package main`, ldflags uses `main.VarName` (not the full import path). The Makefile reads the version from `git describe --tags`.
+
+`rootCmd.Version` is set in `init()` using `fmt.Sprintf` to compose all three values:
+```
+bintrail version v0.1.0 (commit abc1234, built 2026-03-01T00:00:00Z)
+```
+
+### Makefile
+
+`make build` builds both binaries with version injection. `make build-all` cross-compiles for linux/darwin × amd64/arm64. CGO_ENABLED=1 is required (DuckDB dependency). linux/arm64 needs `aarch64-linux-gnu-gcc`; darwin targets must be built on macOS.
+
+### GoReleaser
+
+`.goreleaser.yaml` defines two builds (`bintrail` + `bintrail-mcp`) for linux/amd64 and linux/arm64 only (macOS excluded — CGO cross-compilation to darwin is not supported on Linux CI runners). The arm64 override sets `CC=aarch64-linux-gnu-gcc` and `CXX=aarch64-linux-gnu-g++`. Both `g++` and `gcc` cross-compiler packages are required because DuckDB's pre-compiled static libs link against `libstdc++`.
+
+### Release workflow
+
+`.github/workflows/release.yaml` triggers on `v*` tags. Single `ubuntu-latest` job:
+1. Install `gcc-aarch64-linux-gnu` + `g++-aarch64-linux-gnu`
+2. Run `go test ./...`
+3. Run GoReleaser → creates GitHub Release with linux archives + checksums
+
+### Release process
+
+Use the `/release` skill or follow manually:
+1. Ensure `CHANGELOG.md` has entries under `[Unreleased]`
+2. Rename `[Unreleased]` to `[X.Y.Z] - YYYY-MM-DD`, add new empty `[Unreleased]`
+3. Run `go vet ./...` and `go test ./...`
+4. Commit changelog, create annotated tag `v X.Y.Z`, push both
+5. GitHub Actions runs GoReleaser automatically
+
 ## Common gotchas
 
 - **`go mod tidy` removes go-mysql**: if nothing in the codebase imports it yet, tidy will drop it. Re-add with `go get github.com/go-mysql-org/go-mysql@v1.13.0`.
