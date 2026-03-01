@@ -4,6 +4,51 @@ import (
 	"testing"
 )
 
+// ─── cobra command wiring ─────────────────────────────────────────────────────
+
+func TestSnapshotCmd_registered(t *testing.T) {
+	found := false
+	for _, cmd := range rootCmd.Commands() {
+		if cmd.Use == "snapshot" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'snapshot' command to be registered under rootCmd")
+	}
+}
+
+func TestSnapshotCmd_requiredFlags(t *testing.T) {
+	for _, name := range []string{"source-dsn", "index-dsn"} {
+		flag := snapshotCmd.Flag(name)
+		if flag == nil {
+			t.Fatalf("flag --%s not registered", name)
+		}
+		if flag.Annotations["cobra_annotation_bash_completion_one_required_flag"] == nil {
+			t.Errorf("flag --%s is not marked required", name)
+		}
+	}
+}
+
+func TestSnapshotCmd_allFlagsRegistered(t *testing.T) {
+	for _, name := range []string{"source-dsn", "index-dsn", "schemas"} {
+		if snapshotCmd.Flag(name) == nil {
+			t.Errorf("flag --%s not registered on snapshotCmd", name)
+		}
+	}
+}
+
+func TestSnapshotCmd_emptyStringDefault(t *testing.T) {
+	f := snapshotCmd.Flag("schemas")
+	if f == nil {
+		t.Fatal("flag --schemas not registered")
+	}
+	if f.DefValue != "" {
+		t.Errorf("flag --schemas: expected empty default, got %q", f.DefValue)
+	}
+}
+
 // ─── parseSchemaList ─────────────────────────────────────────────────────────
 
 func TestParseSchemaList_empty(t *testing.T) {
@@ -45,5 +90,14 @@ func TestParseSchemaList_allEmpty(t *testing.T) {
 	got := parseSchemaList(",,,")
 	if len(got) != 0 {
 		t.Errorf("expected empty result for all-empty entries, got %v", got)
+	}
+}
+
+// TestParseSchemaList_whitespaceOnly verifies that a non-empty string containing
+// only whitespace returns nil — the early "" guard doesn't fire, the loop runs,
+// trims the single part to "", skips it, and returns nil.
+func TestParseSchemaList_whitespaceOnly(t *testing.T) {
+	if got := parseSchemaList("   "); got != nil {
+		t.Errorf("expected nil for whitespace-only input, got %v", got)
 	}
 }
