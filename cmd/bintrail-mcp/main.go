@@ -127,6 +127,7 @@ type queryArgs struct {
 	Flag          string `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
 	Format        string `json:"format,omitempty" jsonschema:"Output format: json table or csv (default: json)"`
 	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of events to return (default: 100)"`
+	Profile       string `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
 }
 
 type recoverArgs struct {
@@ -141,6 +142,7 @@ type recoverArgs struct {
 	ChangedColumn string `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
 	Flag          string `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
 	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of events to reverse (default: 1000)"`
+	Profile       string `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
 }
 
 type statusArgs struct {
@@ -160,6 +162,15 @@ func queryTool(ctx context.Context, req *mcp.CallToolRequest, args queryArgs) (*
 		args.GTID, args.Since, args.Until, args.ChangedColumn, args.Flag, args.Limit, 100)
 	if err != nil {
 		return errorResult(err), nil, nil
+	}
+
+	if args.Profile != "" {
+		denyTables, redactCols, err := query.LoadProfileRules(ctx, db, args.Profile)
+		if err != nil {
+			return errorResult(fmt.Errorf("load profile rules: %w", err)), nil, nil
+		}
+		opts.DenyTables = denyTables
+		opts.RedactColumns = redactCols
 	}
 
 	format := args.Format
@@ -201,6 +212,15 @@ func recoverTool(ctx context.Context, req *mcp.CallToolRequest, args recoverArgs
 		args.GTID, args.Since, args.Until, args.ChangedColumn, args.Flag, args.Limit, defaultLimit)
 	if err != nil {
 		return errorResult(err), nil, nil
+	}
+
+	if args.Profile != "" {
+		denyTables, redactCols, err := query.LoadProfileRules(ctx, db, args.Profile)
+		if err != nil {
+			return errorResult(fmt.Errorf("load profile rules: %w", err)), nil, nil
+		}
+		opts.DenyTables = denyTables
+		opts.RedactColumns = redactCols
 	}
 
 	// Load schema resolver best-effort for PK-only WHERE clauses.

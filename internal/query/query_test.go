@@ -433,3 +433,96 @@ func TestWriteCSV_headersAndRow(t *testing.T) {
 		t.Errorf("expected DELETE in data row, got: %s", lines[1])
 	}
 }
+
+// ─── RBAC: buildQuery DenyTables ─────────────────────────────────────────────
+
+func TestBuildQuery_denyTables(t *testing.T) {
+	opts := Options{
+		DenyTables: []SchemaTable{{Schema: "mydb", Table: "secrets"}},
+		Limit:      10,
+	}
+	q, args := buildQuery(opts)
+
+	if !strings.Contains(q, "NOT (schema_name = ? AND table_name = ?)") {
+		t.Errorf("expected NOT deny clause in query: %s", q)
+	}
+	// Schema and table must appear as consecutive args.
+	found := false
+	for i, a := range args {
+		if a == "mydb" && i+1 < len(args) && args[i+1] == "secrets" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected mydb/secrets in args, got %v", args)
+	}
+}
+
+func TestBuildQuery_multipleDenyTables(t *testing.T) {
+	opts := Options{
+		DenyTables: []SchemaTable{
+			{Schema: "db1", Table: "t1"},
+			{Schema: "db2", Table: "t2"},
+		},
+	}
+	q, args := buildQuery(opts)
+
+	count := strings.Count(q, "NOT (schema_name = ? AND table_name = ?)")
+	if count != 2 {
+		t.Errorf("expected 2 NOT deny clauses, got %d: %s", count, q)
+	}
+	if len(args) != 4 {
+		t.Errorf("expected 4 args for 2 deny tables, got %d: %v", len(args), args)
+	}
+}
+
+// ─── RBAC: applyRedaction ─────────────────────────────────────────────────────
+
+func TestApplyRedaction(t *testing.T) {
+	rows := []ResultRow{{
+		SchemaName: "mydb",
+		TableName:  "orders",
+		RowBefore:  map[string]any{"amount": float64(100), "status": "paid"},
+		RowAfter:   map[string]any{"amount": float64(200), "status": "refunded"},
+	}}
+	redact := []SchemaTableColumn{
+		{Schema: "mydb", Table: "orders", Column: "amount"},
+	}
+	applyRedaction(rows, redact)
+
+	if rows[0].RowBefore["amount"] != nil {
+		t.Errorf("expected RowBefore[amount] to be nil, got %v", rows[0].RowBefore["amount"])
+	}
+	if rows[0].RowAfter["amount"] != nil {
+		t.Errorf("expected RowAfter[amount] to be nil, got %v", rows[0].RowAfter["amount"])
+	}
+	// Non-redacted column must be preserved.
+	if rows[0].RowBefore["status"] != "paid" {
+		t.Errorf("expected RowBefore[status]=paid, got %v", rows[0].RowBefore["status"])
+	}
+	if rows[0].RowAfter["status"] != "refunded" {
+		t.Errorf("expected RowAfter[status]=refunded, got %v", rows[0].RowAfter["status"])
+	}
+}
+
+func TestApplyRedaction_wrongTable(t *testing.T) {
+	rows := []ResultRow{{
+		SchemaName: "mydb",
+		TableName:  "products", // different table
+		RowBefore:  map[string]any{"amount": float64(50)},
+		RowAfter:   map[string]any{"amount": float64(60)},
+	}}
+	redact := []SchemaTableColumn{
+		{Schema: "mydb", Table: "orders", Column: "amount"}, // different table
+	}
+	applyRedaction(rows, redact)
+
+	// Values must be unchanged — redaction only applies to the matching table.
+	if rows[0].RowBefore["amount"] != float64(50) {
+		t.Errorf("expected RowBefore[amount]=50, got %v", rows[0].RowBefore["amount"])
+	}
+	if rows[0].RowAfter["amount"] != float64(60) {
+		t.Errorf("expected RowAfter[amount]=60, got %v", rows[0].RowAfter["amount"])
+	}
+}

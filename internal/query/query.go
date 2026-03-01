@@ -36,6 +36,76 @@ func isHourAligned(t time.Time) bool {
 	return t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0
 }
 
+// ─── RBAC types ───────────────────────────────────────────────────────────────
+
+// SchemaTable identifies a schema+table pair used in RBAC deny rules.
+type SchemaTable struct {
+	Schema string
+	Table  string
+}
+
+// SchemaTableColumn identifies a specific column used in RBAC redaction rules.
+type SchemaTableColumn struct {
+	Schema string
+	Table  string
+	Column string
+}
+
+// LoadProfileRules loads the RBAC deny rules for a named profile and returns
+// the set of tables whose events should be excluded (table-level deny) and the
+// set of columns whose values should be nulled out in query results (column-level deny).
+func LoadProfileRules(ctx context.Context, db *sql.DB, profile string) ([]SchemaTable, []SchemaTableColumn, error) {
+	// Table-level deny rules: tables flagged for 'deny' by this profile.
+	tableRows, err := db.QueryContext(ctx, `
+		SELECT DISTINCT tf.schema_name, tf.table_name
+		FROM access_rules ar
+		JOIN profiles p ON ar.profile_id = p.id
+		JOIN table_flags tf ON tf.flag = ar.flag AND tf.column_name = ''
+		WHERE p.name = ? AND ar.permission = 'deny'`, profile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load table deny rules: %w", err)
+	}
+	defer tableRows.Close()
+
+	var denyTables []SchemaTable
+	for tableRows.Next() {
+		var st SchemaTable
+		if err := tableRows.Scan(&st.Schema, &st.Table); err != nil {
+			return nil, nil, err
+		}
+		denyTables = append(denyTables, st)
+	}
+	if err := tableRows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	// Column-level deny rules: specific columns to redact in query results.
+	colRows, err := db.QueryContext(ctx, `
+		SELECT DISTINCT tf.schema_name, tf.table_name, tf.column_name
+		FROM access_rules ar
+		JOIN profiles p ON ar.profile_id = p.id
+		JOIN table_flags tf ON tf.flag = ar.flag AND tf.column_name != ''
+		WHERE p.name = ? AND ar.permission = 'deny'`, profile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load column redact rules: %w", err)
+	}
+	defer colRows.Close()
+
+	var redactCols []SchemaTableColumn
+	for colRows.Next() {
+		var stc SchemaTableColumn
+		if err := colRows.Scan(&stc.Schema, &stc.Table, &stc.Column); err != nil {
+			return nil, nil, err
+		}
+		redactCols = append(redactCols, stc)
+	}
+	if err := colRows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	return denyTables, redactCols, nil
+}
+
 // ─── Options ─────────────────────────────────────────────────────────────────
 
 // Options specifies the filter criteria for querying binlog_events.
@@ -51,6 +121,9 @@ type Options struct {
 	ChangedColumn string // column name; matched via JSON_CONTAINS
 	Flag          string // return events from tables/columns carrying this flag
 	Limit         int    // 0 → default 100
+
+	DenyTables    []SchemaTable       // tables excluded by RBAC profile
+	RedactColumns []SchemaTableColumn // column values nulled out by RBAC profile
 }
 
 // ─── ResultRow ────────────────────────────────────────────────────────────────
@@ -91,7 +164,14 @@ func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
 	defer rows.Close()
-	return scanRows(rows)
+	results, err := scanRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(opts.RedactColumns) > 0 {
+		applyRedaction(results, opts.RedactColumns)
+	}
+	return results, nil
 }
 
 // Run executes the query and writes formatted results to w.
@@ -188,6 +268,10 @@ func buildQuery(opts Options) (string, []any) {
 			  AND table_flags.flag        = ?)`)
 		args = append(args, opts.Flag)
 	}
+	for _, dt := range opts.DenyTables {
+		where = append(where, "NOT (schema_name = ? AND table_name = ?)")
+		args = append(args, dt.Schema, dt.Table)
+	}
 
 	q := `SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp,
 	             gtid, schema_name, table_name, event_type, pk_values,
@@ -203,6 +287,28 @@ func buildQuery(opts Options) (string, []any) {
 	}
 
 	return q, args
+}
+
+// applyRedaction nulls out denied column values in RowBefore and RowAfter maps.
+func applyRedaction(rows []ResultRow, redact []SchemaTableColumn) {
+	type colKey struct{ schema, table, column string }
+	set := make(map[colKey]struct{}, len(redact))
+	for _, r := range redact {
+		set[colKey{r.Schema, r.Table, r.Column}] = struct{}{}
+	}
+	for i := range rows {
+		r := &rows[i]
+		for col := range r.RowBefore {
+			if _, ok := set[colKey{r.SchemaName, r.TableName, col}]; ok {
+				r.RowBefore[col] = nil
+			}
+		}
+		for col := range r.RowAfter {
+			if _, ok := set[colKey{r.SchemaName, r.TableName, col}]; ok {
+				r.RowAfter[col] = nil
+			}
+		}
+	}
 }
 
 // ─── Row scanner ─────────────────────────────────────────────────────────────

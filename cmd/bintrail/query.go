@@ -60,6 +60,7 @@ var (
 	qArchiveDir string
 	qArchiveS3  string
 	qBintrailID string
+	qProfile    string
 )
 
 func init() {
@@ -78,6 +79,7 @@ func init() {
 	queryCmd.Flags().StringVar(&qArchiveDir, "archive-dir", "", "Local root directory of Parquet archives (requires --bintrail-id)")
 	queryCmd.Flags().StringVar(&qArchiveS3, "archive-s3", "", "S3 root URL prefix of Parquet archives (requires --bintrail-id; e.g. s3://bucket/prefix/); uses the standard AWS credential chain")
 	queryCmd.Flags().StringVar(&qBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir or --archive-s3 is set)")
+	queryCmd.Flags().StringVar(&qProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	_ = queryCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(queryCmd)
@@ -97,6 +99,9 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	if (qArchiveDir != "" || qArchiveS3 != "") && qBintrailID == "" {
 		return fmt.Errorf("--bintrail-id is required when --archive-dir or --archive-s3 is set")
+	}
+	if qProfile != "" && (qArchiveDir != "" || qArchiveS3 != "") {
+		return fmt.Errorf("--profile cannot be combined with --archive-dir or --archive-s3")
 	}
 
 	// ── Parse filter values ───────────────────────────────────────────────────
@@ -132,6 +137,15 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
 	defer db.Close()
+
+	if qProfile != "" {
+		denyTables, redactCols, err := query.LoadProfileRules(cmd.Context(), db, qProfile)
+		if err != nil {
+			return fmt.Errorf("load profile rules for %q: %w", qProfile, err)
+		}
+		opts.DenyTables = denyTables
+		opts.RedactColumns = redactCols
+	}
 
 	engine := query.New(db)
 
