@@ -17,7 +17,7 @@ The engine is shared: the CLI `query` command, the CLI `recover` command, and th
 `buildQuery` constructs the WHERE clause incrementally. Each filter field in `Options` is optional — nil or zero-valued fields are simply omitted:
 
 | Filter | SQL condition |
-|--------|______________|
+|--------|---------------|
 | `Schema` | `schema_name = ?` |
 | `Table` | `table_name = ?` |
 | `PKValues` | `pk_hash = SHA2(?, 256) AND pk_values = ?` |
@@ -26,7 +26,7 @@ The engine is shared: the CLI `query` command, the CLI `recover` command, and th
 | `Since` | `event_timestamp >= ?` (+ pruning hint for non-hour-aligned values) |
 | `Until` | `event_timestamp <= ?` (+ pruning hint for non-hour-aligned values) |
 | `ChangedColumn` | `JSON_CONTAINS(changed_columns, ?)` |
-| `Flag` | `EXISTS (SELECT 1 FROM table_flags WHERE schema_name = ? AND table_name = ? AND flag = ?)` |
+| `Flag` | `EXISTS (SELECT 1 FROM table_flags WHERE schema_name = binlog_events.schema_name AND table_name = binlog_events.table_name AND flag = ?)` |
 
 The conditions are joined with `AND`. If no filters are provided, there's no `WHERE` clause at all (subject to the `LIMIT`).
 
@@ -143,7 +143,7 @@ The merge path loads **all matching rows** from all sources into memory before a
 Recovery works because bintrail stores **full before and after images** for every row event. To undo an operation, you simply reverse it:
 
 | Original operation | Reversal |
-|-------------------|_________|
+|--------------------|----------|
 | `DELETE` | `INSERT` the deleted row back (from `row_before`) |
 | `UPDATE` | `UPDATE` back to `row_before` values, `WHERE` the current state matches `row_after` |
 | `INSERT` | `DELETE` the row (using `row_after` to identify it) |

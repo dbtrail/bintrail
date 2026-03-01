@@ -63,27 +63,32 @@ The `bintrail_id` is logged at `slog.Info` level when a command starts, so it ap
 
 ### `bintrail status` per-server view
 
-The `bintrail status` command now shows the `BINTRAIL_ID` column in the Indexed Files table and groups the Summary section by server:
+The `bintrail status` command shows the `BINTRAIL_ID` column in the Indexed Files table and groups the Summary section by server:
 
 ```
 === Indexed Files ===
-FILE              STATUS     EVENTS  STARTED_AT           BINTRAIL_ID                            ERROR
-────              ──────     ──────  ──────────           ───────────                            ─────
-binlog.000042     completed  12345   2026-02-19 10:00:00  3e11fa47-71ca-11e1-9e33-c80aa9429562  -
-binlog.000043     completed  8901    2026-02-19 10:00:43  3e11fa47-71ca-11e1-9e33-c80aa9429562  -
-binlog.000001     completed  200     2026-02-19 10:00:00  bbbbbbbb-0000-0000-0000-000000000002  -
-binlog.000002     completed  0       2026-02-19 11:00:00  -                                      -
+FILE              STATUS     EVENTS  STARTED_AT           COMPLETED_AT         ERROR  BINTRAIL_ID
+────              ──────     ──────  ──────────           ────────────         ─────  ───────────
+binlog.000042     completed  12345   2026-02-19 10:00:00  2026-02-19 10:00:42  -      3e11fa47-71ca-11e1-9e33-c80aa9429562
+binlog.000043     completed  8901    2026-02-19 10:00:43  2026-02-19 10:01:12  -      3e11fa47-71ca-11e1-9e33-c80aa9429562
+binlog.000001     completed  200     2026-02-19 10:00:00  2026-02-19 10:05:00  -      bbbbbbbb-0000-0000-0000-000000000002
+binlog.000002     completed  0       2026-02-19 11:00:00  -                    -      -
 
 === Summary ===
 Server 3e11fa47-71ca-11e1-9e33-c80aa9429562
-  2 completed, 0 failed, 21246 events
+  Files:  2 completed, 0 in_progress, 0 failed
+  Events: 21246 indexed
+
 Server bbbbbbbb-0000-0000-0000-000000000002
-  1 completed, 0 failed, 200 events
+  Files:  1 completed, 0 in_progress, 0 failed
+  Events: 200 indexed
+
 Server (unknown)
-  1 completed, 0 failed, 0 events
+  Files:  1 completed, 0 in_progress, 0 failed
+  Events: 0 indexed
 ```
 
-`-` in the `BINTRAIL_ID` column means the row was written before the server identity system was introduced — the column is `NULL DEFAULT NULL` and old rows are left unchanged.
+`-` in the `BINTRAIL_ID` column (or `COMPLETED_AT`) means the value is NULL. Rows with a NULL `bintrail_id` were written before the server identity system was introduced.
 
 ---
 
@@ -179,7 +184,7 @@ bintrail query \
   --flag      billing
 ```
 
-This returns events from any table or column that has the `billing` flag. It's equivalent to an `EXISTS` subquery against `table_flags` — the filter matches if the event's `(schema_name, table_name)` has a row in `table_flags` with `flag = 'billing'` (at the table level, column level, or both). Events are never duplicated even when a table has multiple matching flag rows.
+This returns events from any table or column that has the `billing` flag. It's equivalent to an `EXISTS` correlated subquery against `table_flags` — the filter matches if the event's `(schema_name, table_name)` has a row in `table_flags` with `flag = 'billing'` (at the table level, column level, or both). Events are never duplicated even when a table has multiple matching flag rows.
 
 The `--flag` parameter is also available on the MCP `query` and `recover` tools:
 
