@@ -119,6 +119,49 @@ func TestBuildMydumperArgs_multipleSchemas(t *testing.T) {
 	}
 }
 
+func TestBuildMydumperArgs_withPassword(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "s3cr3t", "/tmp/dump", 4, nil, nil)
+	assertArgsContainPair(t, args, "--password", "s3cr3t")
+}
+
+func TestBuildMydumperArgs_noSchemasOrTables(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil)
+	for _, flag := range []string{"--database", "--regex", "--tables-list"} {
+		if argsContain(args, flag) {
+			t.Errorf("expected %s to be absent when no schemas or tables given", flag)
+		}
+	}
+}
+
+func TestBuildMydumperArgs_regexAnchoredFormat(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2"}, nil)
+	idx := argsIndex(args, "--regex")
+	if idx < 0 || idx+1 >= len(args) {
+		t.Fatal("expected --regex in args")
+	}
+	regex := args[idx+1]
+	// Must be anchored at start and dot must be escaped.
+	if !strings.HasPrefix(regex, "^(") {
+		t.Errorf("regex should start with ^(, got %q", regex)
+	}
+	if !strings.HasSuffix(regex, `\.`) {
+		t.Errorf("regex should end with \\., got %q", regex)
+	}
+}
+
+func TestBuildMydumperArgs_schemaAndTables(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4,
+		[]string{"mydb"}, []string{"mydb.orders", "mydb.items"})
+	assertArgsContainPair(t, args, "--database", "mydb")
+	idx := argsIndex(args, "--tables-list")
+	if idx < 0 || idx+1 >= len(args) {
+		t.Fatal("expected --tables-list in args")
+	}
+	if !strings.Contains(args[idx+1], "mydb.orders") {
+		t.Errorf("--tables-list missing mydb.orders: %q", args[idx+1])
+	}
+}
+
 func TestBuildMydumperArgs_tables(t *testing.T) {
 	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, []string{"mydb.orders", "mydb.items"})
 	idx := argsIndex(args, "--tables-list")
@@ -227,6 +270,13 @@ func TestExtractSchemasFromTables_noDot(t *testing.T) {
 	}
 }
 
+func TestExtractSchemasFromTables_allNoDot(t *testing.T) {
+	// All entries lack a dot — none contribute a schema, so result must be nil.
+	if schemas := extractSchemasFromTables([]string{"nodot1", "nodot2", "nodot3"}); schemas != nil {
+		t.Errorf("expected nil when all entries have no dot, got %v", schemas)
+	}
+}
+
 func TestExtractSchemasFromTables_empty(t *testing.T) {
 	if schemas := extractSchemasFromTables(nil); schemas != nil {
 		t.Errorf("expected nil for nil input, got %v", schemas)
@@ -253,6 +303,29 @@ func TestRunDump_mydumperNotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "mydumper not found") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunDump_invalidSourceDSN(t *testing.T) {
+	// Create a fake mydumper binary (LookPath only needs it to exist and be executable).
+	dir := t.TempDir()
+	fakeBin := filepath.Join(dir, "mydumper")
+	if err := os.WriteFile(fakeBin, []byte(""), 0o755); err != nil {
+		t.Fatalf("failed to create fake mydumper: %v", err)
+	}
+
+	savedPath, savedDSN := dmpMydumperPath, dmpSourceDSN
+	t.Cleanup(func() { dmpMydumperPath = savedPath; dmpSourceDSN = savedDSN })
+
+	dmpMydumperPath = fakeBin
+	dmpSourceDSN = "root@unix(/var/run/mysqld.sock)/" // unix socket → rejected by parseSourceDSN
+
+	err := runDump(dumpCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for unix socket DSN, got nil")
+	}
+	if !strings.Contains(err.Error(), "unix socket") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
