@@ -78,6 +78,36 @@ func TestRunIndex_noFilesOrAll(t *testing.T) {
 	}
 }
 
+// TestRunIndex_allSetPassesFirstGuard verifies that --all bypasses the
+// "either --files or --all" guard; execution then fails at config.Connect.
+func TestRunIndex_allSetPassesFirstGuard(t *testing.T) {
+	savedFiles, savedAll := idxFiles, idxAll
+	t.Cleanup(func() { idxFiles = savedFiles; idxAll = savedAll })
+
+	idxFiles = ""
+	idxAll = true
+
+	err := runIndex(indexCmd, nil)
+	if err != nil && strings.Contains(err.Error(), "--files or --all") {
+		t.Errorf("first guard should not fire when --all is set, got: %v", err)
+	}
+}
+
+// TestRunIndex_filesSetPassesFirstGuard verifies that --files bypasses the
+// first guard even without --all.
+func TestRunIndex_filesSetPassesFirstGuard(t *testing.T) {
+	savedFiles, savedAll := idxFiles, idxAll
+	t.Cleanup(func() { idxFiles = savedFiles; idxAll = savedAll })
+
+	idxFiles = "binlog.000001"
+	idxAll = false
+
+	err := runIndex(indexCmd, nil) // fails later at config.Connect
+	if err != nil && strings.Contains(err.Error(), "--files or --all") {
+		t.Errorf("first guard should not fire when --files is set, got: %v", err)
+	}
+}
+
 // ─── binlogFileRe ────────────────────────────────────────────────────────────
 
 func TestBinlogFileRe(t *testing.T) {
@@ -223,6 +253,18 @@ func TestFindBinlogFiles_matchesPattern(t *testing.T) {
 	// Must be sorted ascending
 	if files[0] != "binlog.000001" || files[1] != "binlog.000002" || files[2] != "binlog.000003" {
 		t.Errorf("expected sorted [binlog.000001 binlog.000002 binlog.000003], got %v", files)
+	}
+}
+
+// TestFindBinlogFiles_nonexistentDir verifies that a nonexistent directory
+// surfaces the "failed to read binlog directory" error from os.ReadDir.
+func TestFindBinlogFiles_nonexistentDir(t *testing.T) {
+	_, err := findBinlogFiles("/nonexistent/bintrail-test-path-xyz")
+	if err == nil {
+		t.Fatal("expected error for nonexistent directory, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to read binlog directory") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
