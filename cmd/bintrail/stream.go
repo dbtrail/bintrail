@@ -490,8 +490,14 @@ func runStream(cmd *cobra.Command, args []string) error {
 
 	// Use a closure defer so the active syncer is always closed on exit,
 	// even if we replace it during the preferred-mode TLS fallback below.
+	// The nil guard prevents a panic if an early-return is added before
+	// syncer is assigned.
 	var syncer *replication.BinlogSyncer
-	defer func() { syncer.Close() }()
+	defer func() {
+		if syncer != nil {
+			syncer.Close()
+		}
+	}()
 	syncer = replication.NewBinlogSyncer(syncerCfg)
 
 	// startStreamer starts sync from the resolved position/GTID set.
@@ -526,9 +532,9 @@ func runStream(cmd *cobra.Command, args []string) error {
 		syncer.Close()
 		syncerCfg.TLSConfig = nil
 		syncer = replication.NewBinlogSyncer(syncerCfg)
-		streamer, err = startStreamer()
-		if err != nil {
-			return err
+		streamer, startErr = startStreamer()
+		if startErr != nil {
+			return startErr
 		}
 	} else if startErr != nil {
 		return startErr
