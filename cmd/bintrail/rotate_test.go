@@ -284,3 +284,58 @@ func TestRunRotate_invalidRetain(t *testing.T) {
 		t.Errorf("expected '--retain' in error, got: %v", err)
 	}
 }
+
+func TestRunRotate_missingDBName(t *testing.T) {
+	savedRetain, savedAdd, savedDSN := rotRetain, rotAddFuture, rotIndexDSN
+	t.Cleanup(func() { rotRetain = savedRetain; rotAddFuture = savedAdd; rotIndexDSN = savedDSN })
+
+	rotRetain = ""
+	rotAddFuture = 5
+	rotIndexDSN = "user:pass@tcp(localhost:3306)/" // valid DSN syntax but no database name
+
+	err := runRotate(rotateCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when DSN has no database name, got nil")
+	}
+	if !strings.Contains(err.Error(), "--index-dsn must include a database name") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// ─── parseRetain boundary values ─────────────────────────────────────────────
+
+func TestParseRetain_minimumHour(t *testing.T) {
+	d, err := parseRetain("1h")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if d != time.Hour {
+		t.Errorf("expected 1h, got %v", d)
+	}
+}
+
+func TestParseRetain_minimumDay(t *testing.T) {
+	d, err := parseRetain("1d")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if d != 24*time.Hour {
+		t.Errorf("expected 24h, got %v", d)
+	}
+}
+
+// ─── nextPartitionStart unsorted input ────────────────────────────────────────
+
+func TestNextPartitionStart_unsortedOrder(t *testing.T) {
+	// Deliberately out of order — must find the maximum date, not the last element.
+	partitions := []partitionInfo{
+		{Name: "p_2026021700"},
+		{Name: "p_2026021900"}, // latest
+		{Name: "p_2026021800"},
+		{Name: "p_future", Description: "MAXVALUE"},
+	}
+	next := nextPartitionStart(partitions)
+	if next.Year() != 2026 || next.Month() != 2 || next.Day() != 19 || next.Hour() != 1 {
+		t.Errorf("expected 2026-02-19 01:00 (max+1h), got %v", next)
+	}
+}
