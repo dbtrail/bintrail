@@ -88,7 +88,7 @@ func init() {
 	rootCmd.AddCommand(streamCmd)
 }
 
-// ─── streamState ─────────────────────────────────────────────────────────────
+// ─── streamState ───────────────────────────────────────────────────────────────────
 
 // streamState holds the current replication position and counters used for
 // checkpointing. It is persisted to stream_state after each checkpoint interval.
@@ -110,13 +110,13 @@ type streamState struct {
 // loadStreamState loads the saved stream_state row, returning nil if no row exists.
 func loadStreamState(db *sql.DB) (*streamState, error) {
 	var s streamState
-	var gtidSet sql.NullString
+	var gtidSet, bintrailID sql.NullString
 	err := db.QueryRow(`
 		SELECT mode, binlog_file, binlog_position, gtid_set,
-		       events_indexed, last_event_time, server_id
+		       events_indexed, last_event_time, server_id, bintrail_id
 		FROM stream_state WHERE id = 1`).Scan(
 		&s.mode, &s.binlogFile, &s.binlogPos, &gtidSet,
-		&s.eventsIndexed, &s.lastEventTime, &s.serverID)
+		&s.eventsIndexed, &s.lastEventTime, &s.serverID, &bintrailID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -125,6 +125,9 @@ func loadStreamState(db *sql.DB) (*streamState, error) {
 	}
 	if gtidSet.Valid {
 		s.gtidSet = gtidSet.String
+	}
+	if bintrailID.Valid {
+		s.bintrailID = bintrailID.String
 	}
 	return &s, nil
 }
@@ -162,7 +165,7 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	return err
 }
 
-// ─── TLS configuration ────────────────────────────────────────────────────────
+// ─── TLS configuration ───────────────────────────────────────────────────────────────
 
 // buildTLSConfig returns a *tls.Config for the given ssl-mode, or nil for
 // "disabled". serverName is the target host (used only for verify-identity).
@@ -299,7 +302,7 @@ func resolveStart(
 			"provide --start-file or --start-gtid to begin streaming")
 }
 
-// ─── Stream loop ─────────────────────────────────────────────────────────────
+// ─── Stream loop ────────────────────────────────────────────────────────────────
 
 // streamLoop consumes parser events, flushes batches to MySQL, and writes
 // checkpoints to stream_state at the given interval.
@@ -401,7 +404,7 @@ func streamLoop(
 	}
 }
 
-// ─── runStream ───────────────────────────────────────────────────────────────
+// ─── runStream ───────────────────────────────────────────────────────────────────
 
 func runStream(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(cmd.Context())
@@ -424,17 +427,17 @@ func runStream(cmd *cobra.Command, args []string) error {
 	if err := validateBinlogFormat(sourceDB); err != nil {
 		return err
 	}
-	fmt.Println("Source: binlog_format=ROW ✓")
+	fmt.Println("Source: binlog_format=ROW \u2713")
 
 	if err := validateBinlogRowImage(sourceDB); err != nil {
 		return err
 	}
-	fmt.Println("Source: binlog_row_image=FULL ✓")
+	fmt.Println("Source: binlog_row_image=FULL \u2713")
 
 	if err := validateNoFKCascades(sourceDB, parseSchemaList(strmSchemas)); err != nil {
 		return err
 	}
-	fmt.Println("Source: no FK cascades ✓")
+	fmt.Println("Source: no FK cascades \u2713")
 
 	// ── 3. Resolve server identity ────────────────────────────────────────────
 	bintrailID, err := resolveServerIdentity(ctx, sourceDB, indexDB, strmSourceDSN)
@@ -482,7 +485,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 		state.gtidSet = startGTIDStr
 	}
 
-	// ── 7. Parse source DSN for BinlogSyncer ─────────────────────────────────
+	// ── 7. Parse source DSN for BinlogSyncer ─────────────────────────────
 	host, port, user, password, err := parseSourceDSN(strmSourceDSN)
 	if err != nil {
 		return err
@@ -494,7 +497,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// ── 7. Create BinlogSyncer ────────────────────────────────────────────────
+	// ── 7. Create BinlogSyncer ────────────────────────────────────────────────────
 	syncerCfg := replication.BinlogSyncerConfig{
 		ServerID:             strmServerID,
 		Flavor:               "mysql",
@@ -543,7 +546,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// ── 8. Start sync ─────────────────────────────────────────────────────────
+	// ── 8. Start sync ───────────────────────────────────────────────────────────────
 	streamer, startErr := startStreamer()
 	if startErr != nil && strmSSLMode == "preferred" {
 		// preferred: TLS attempt failed — retry without TLS.
@@ -566,7 +569,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Streaming from GTID set: %s\n", startGTIDStr)
 	}
 
-	// ── 9. Signal handler ─────────────────────────────────────────────────────
+	// ── 9. Signal handler ────────────────────────────────────────────────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -578,7 +581,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// ── 9b. Optional Prometheus metrics HTTP server ───────────────────────────
+	// ── 9b. Optional Prometheus metrics HTTP server ─────────────────────────
 	if strmMetricsAddr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
@@ -596,7 +599,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	// ── 10. Launch StreamParser in a goroutine ────────────────────────────────
+	// ── 10. Launch StreamParser in a goroutine ──────────────────────────────────
 	sp := parser.NewStreamParser(resolver, filters, nil)
 	idx := indexer.New(indexDB, strmBatchSize)
 
@@ -608,14 +611,14 @@ func runStream(cmd *cobra.Command, args []string) error {
 		parseErrCh <- sp.Run(ctx, streamer, events)
 	}()
 
-	// ── 11. Run stream loop with checkpointing ────────────────────────────────
+	// ── 11. Run stream loop with checkpointing ──────────────────────────────────
 	fmt.Printf("Streaming started (server-id=%d, checkpoint=%ds)\n", strmServerID, strmCheckpoint)
 	loopErr := streamLoop(ctx, events, idx, indexDB,
 		time.Duration(strmCheckpoint)*time.Second, state)
 
 	parseErr := <-parseErrCh
 
-	// ── 12. Summary ───────────────────────────────────────────────────────────
+	// ── 12. Summary ───────────────────────────────────────────────────────────────
 	fmt.Printf("\nEvents indexed: %d\n", state.eventsIndexed)
 	fmt.Printf("Last position:  %s:%d\n", state.binlogFile, state.binlogPos)
 

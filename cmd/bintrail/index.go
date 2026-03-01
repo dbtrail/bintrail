@@ -65,7 +65,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 
 	ctx := cmd.Context()
 
-	// ── 1. Source server: validate binlog_row_image ───────────────────────────
+	// ── 1. Source server: validate binlog_row_image ─────────────────────────────────
 	var sourceDB *sql.DB
 	if idxSourceDSN != "" {
 		var err error
@@ -78,17 +78,17 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		if err := validateBinlogFormat(sourceDB); err != nil {
 			return err
 		}
-		fmt.Println("Source: binlog_format=ROW ✓")
+		fmt.Println("Source: binlog_format=ROW \u2713")
 
 		if err := validateBinlogRowImage(sourceDB); err != nil {
 			return err
 		}
-		fmt.Println("Source: binlog_row_image=FULL ✓")
+		fmt.Println("Source: binlog_row_image=FULL \u2713")
 
 		if err := validateNoFKCascades(sourceDB, parseSchemaList(idxSchemas)); err != nil {
 			return err
 		}
-		fmt.Println("Source: no FK cascades ✓")
+		fmt.Println("Source: no FK cascades \u2713")
 	} else {
 		slog.Warn("--source-dsn not provided; skipping source server validation")
 	}
@@ -114,7 +114,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 			slog.Info("server identity resolved", "bintrail_id", bintrailID)
 		}
 	}
-	// ── 4. Schema snapshot ────────────────────────────────────────────────────
+	// ── 4. Schema snapshot ───────────────────────────────────────────────────
 	resolver, err := ensureResolver(indexDB, sourceDB, parseSchemaList(idxSchemas))
 	if err != nil {
 		return err
@@ -131,7 +131,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("Files to process: %d\n\n", len(files))
 
-	// ── 6. Index each file ────────────────────────────────────────────────────
+	// ── 6. Index each file ──────────────────────────────────────────────────────────
 	p := parser.New(idxBinlogDir, resolver, filters, nil)
 	idx := indexer.New(indexDB, idxBatchSize)
 
@@ -158,13 +158,13 @@ func indexFile(
 	indexDB *sql.DB,
 	binlogDir, filename, bintrailID string,
 ) (int64, error) {
-	// ── a. Skip already-completed files ──────────────────────────────────────
+	// ── a. Skip already-completed files ──────────────────────────────────────────
 	status, err := getFileStatus(indexDB, filename)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query index_state: %w", err)
 	}
 	if status == "completed" {
-		fmt.Printf("[%s] already indexed — skipping\n", filename)
+		fmt.Printf("[%s] already indexed \u2014 skipping\n", filename)
 		return 0, nil
 	}
 
@@ -172,7 +172,7 @@ func indexFile(
 	info, err := os.Stat(filepath.Join(binlogDir, filename))
 	if err != nil {
 		if os.IsNotExist(err) {
-			slog.Warn("binlog file not found — skipping", "file", filename)
+			slog.Warn("binlog file not found \u2014 skipping", "file", filename)
 			return 0, nil
 		}
 		return 0, fmt.Errorf("stat %s: %w", filename, err)
@@ -185,7 +185,7 @@ func indexFile(
 	}
 	fmt.Printf("[%s] indexing...\n", filename)
 
-	// ── c. Run parser + indexer concurrently ──────────────────────────────────
+	// ── c. Run parser + indexer concurrently ──────────────────────────────────────────
 	// Use a child context so we can cancel the parser if the indexer fails,
 	// avoiding a goroutine leak and the associated channel deadlock.
 	ctx, cancel := context.WithCancel(ctx)
@@ -209,23 +209,23 @@ func indexFile(
 	// ── e/f. Update index_state ───────────────────────────────────────────────
 	switch {
 	case idxErr != nil:
-		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, idxErr.Error(), "")
+		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, idxErr.Error(), bintrailID)
 		return count, idxErr
 
 	case parseErr != nil && !errors.Is(parseErr, context.Canceled):
-		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, parseErr.Error(), "")
+		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, parseErr.Error(), bintrailID)
 		return count, parseErr
 
 	default:
-		if err := upsertFileState(indexDB, filename, "completed", fileSize, fileSize, count, "", ""); err != nil {
+		if err := upsertFileState(indexDB, filename, "completed", fileSize, fileSize, count, "", bintrailID); err != nil {
 			slog.Warn("failed to mark file completed", "file", filename, "error", err)
 		}
-		fmt.Printf("[%s] done — %d events\n", filename, count)
+		fmt.Printf("[%s] done \u2014 %d events\n", filename, count)
 		return count, nil
 	}
 }
 
-// ─── index_state helpers ──────────────────────────────────────────────────────
+// ─── index_state helpers ────────────────────────────────────────────────────────
 
 // getFileStatus returns the current status from index_state, or "" if no row exists.
 func getFileStatus(db *sql.DB, filename string) (string, error) {
@@ -303,7 +303,7 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 	return fmt.Errorf("upsertFileState: unknown status %q", status)
 }
 
-// ─── Validation ───────────────────────────────────────────────────────────────
+// ─── Validation ────────────────────────────────────────────────────────────────────
 
 // validateBinlogFormat checks that the source server has binlog_format=ROW.
 func validateBinlogFormat(db *sql.DB) error {
@@ -387,7 +387,7 @@ func validateNoFKCascades(db *sql.DB, schemas []string) error {
 	return nil
 }
 
-// ─── Snapshot bootstrap ───────────────────────────────────────────────────────
+// ─── Snapshot bootstrap ────────────────────────────────────────────────────────────
 
 // ensureResolver returns a Resolver loaded from the latest snapshot, taking a
 // new snapshot automatically if none exists (requires sourceDB != nil).
@@ -418,7 +418,7 @@ func ensureResolver(indexDB, sourceDB *sql.DB, schemas []string) (*metadata.Reso
 	return metadata.NewResolver(indexDB, snapshotID)
 }
 
-// ─── Filter builder ───────────────────────────────────────────────────────────
+// ─── Filter builder ───────────────────────────────────────────────────────────────
 
 func buildIndexFilters(schemas, tables string) parser.Filters {
 	var f parser.Filters
@@ -441,7 +441,7 @@ func buildIndexFilters(schemas, tables string) parser.Filters {
 	return f
 }
 
-// ─── File discovery ───────────────────────────────────────────────────────────
+// ─── File discovery ───────────────────────────────────────────────────────────────
 
 // binlogFileRe matches standard MySQL binlog filenames: any name ending in six
 // or more decimal digits after a dot (e.g. binlog.000042, mysql-bin.000001).
