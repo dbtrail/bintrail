@@ -3,6 +3,7 @@ package query
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -136,9 +137,79 @@ func TestBuildQuery_sinceUntil(t *testing.T) {
 	if !strings.Contains(q, "event_timestamp <= ?") {
 		t.Errorf("expected event_timestamp <= ? in query: %s", q)
 	}
+	// Hour-aligned: no TO_SECONDS() pruning hints should be added.
+	if strings.Contains(q, "TO_SECONDS") {
+		t.Errorf("unexpected TO_SECONDS in hour-aligned query: %s", q)
+	}
 	// since and until should both appear in args.
 	if args[0] != since || args[1] != until {
 		t.Errorf("since/until args mismatch: %v", args)
+	}
+}
+
+func TestBuildQuery_sinceUntil_nonHourAligned(t *testing.T) {
+	since := time.Date(2026, 2, 19, 14, 45, 0, 0, time.UTC)
+	until := time.Date(2026, 2, 19, 15, 13, 0, 0, time.UTC)
+	opts := Options{Since: &since, Until: &until, Limit: 10}
+	q, args := buildQuery(opts)
+
+	// Outer partition-pruning hints must be present.
+	outerSince := mysqlToSeconds(time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC))
+	outerUntil := mysqlToSeconds(time.Date(2026, 2, 19, 16, 0, 0, 0, time.UTC))
+	if !strings.Contains(q, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", outerSince)) {
+		t.Errorf("expected outer lower-bound hint in query: %s", q)
+	}
+	if !strings.Contains(q, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", outerUntil)) {
+		t.Errorf("expected outer upper-bound hint in query: %s", q)
+	}
+	// Exact parameterised bounds must still be present for correct filtering.
+	if !strings.Contains(q, "event_timestamp >= ?") {
+		t.Errorf("expected exact lower bound in query: %s", q)
+	}
+	if !strings.Contains(q, "event_timestamp <= ?") {
+		t.Errorf("expected exact upper bound in query: %s", q)
+	}
+	// Args must be the exact since/until values (not the outer bounds).
+	if args[0] != since {
+		t.Errorf("expected args[0]=since (%v), got %v", since, args[0])
+	}
+	if args[1] != until {
+		t.Errorf("expected args[1]=until (%v), got %v", until, args[1])
+	}
+}
+
+func TestIsHourAligned(t *testing.T) {
+	cases := []struct {
+		t    time.Time
+		want bool
+	}{
+		{time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC), true},
+		{time.Date(2026, 2, 19, 0, 0, 0, 0, time.UTC), true},
+		{time.Date(2026, 2, 19, 14, 45, 0, 0, time.UTC), false},
+		{time.Date(2026, 2, 19, 14, 0, 30, 0, time.UTC), false},
+		{time.Date(2026, 2, 19, 14, 0, 0, 1000, time.UTC), false},
+	}
+	for _, tc := range cases {
+		got := isHourAligned(tc.t)
+		if got != tc.want {
+			t.Errorf("isHourAligned(%v) = %v, want %v", tc.t, got, tc.want)
+		}
+	}
+}
+
+func TestMysqlToSeconds(t *testing.T) {
+	// TO_SECONDS('1970-01-01 00:00:00') = 62167219200 per MySQL 8.0.
+	epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	if got := mysqlToSeconds(epoch); got != 62167219200 {
+		t.Errorf("mysqlToSeconds(epoch) = %d, want 62167219200", got)
+	}
+	// Exact hour boundaries map to exact partition edge values.
+	// Verify round-trip: mysqlToSeconds(partition_start) must equal the
+	// TO_SECONDS integer stored as the partition upper boundary.
+	h := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	hPlus1 := h.Add(time.Hour)
+	if mysqlToSeconds(hPlus1) != mysqlToSeconds(h)+3600 {
+		t.Errorf("expected hourly increment of 3600 seconds")
 	}
 }
 

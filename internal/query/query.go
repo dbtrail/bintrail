@@ -17,6 +17,22 @@ import (
 	"github.com/bintrail/bintrail/internal/parser"
 )
 
+// mysqlToSecondsConst is the value of MySQL's TO_SECONDS('1970-01-01 00:00:00').
+// TO_SECONDS(t) == t.Unix() + mysqlToSecondsConst for any UTC datetime t.
+const mysqlToSecondsConst = int64(62167219200)
+
+// mysqlToSeconds returns the MySQL TO_SECONDS() value for t, matching the
+// RANGE(TO_SECONDS(event_timestamp)) partition expression stored as integers.
+func mysqlToSeconds(t time.Time) int64 {
+	return t.UTC().Unix() + mysqlToSecondsConst
+}
+
+// isHourAligned reports whether t falls exactly on an hour boundary
+// (zero minutes, seconds, and nanoseconds).
+func isHourAligned(t time.Time) bool {
+	return t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0
+}
+
 // ─── Options ─────────────────────────────────────────────────────────────────
 
 // Options specifies the filter criteria for querying binlog_events.
@@ -128,12 +144,26 @@ func buildQuery(opts Options) (string, []any) {
 		args = append(args, opts.GTID)
 	}
 	if opts.Since != nil {
+		since := *opts.Since
+		if !isHourAligned(since) {
+			// Add an outer hour-aligned lower bound as a TO_SECONDS integer literal so
+			// MySQL can prune to the correct partition(s) at parse time, without relying
+			// on optimizer inference from a parameterised datetime comparison.
+			outerSince := mysqlToSeconds(since.Truncate(time.Hour))
+			where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", outerSince))
+		}
 		where = append(where, "event_timestamp >= ?")
-		args = append(args, *opts.Since)
+		args = append(args, since)
 	}
 	if opts.Until != nil {
+		until := *opts.Until
+		if !isHourAligned(until) {
+			// Outer upper bound: start of the hour after until (exclusive).
+			outerUntil := mysqlToSeconds(until.Truncate(time.Hour).Add(time.Hour))
+			where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", outerUntil))
+		}
 		where = append(where, "event_timestamp <= ?")
-		args = append(args, *opts.Until)
+		args = append(args, until)
 	}
 	if opts.ChangedColumn != "" {
 		// json.Marshal produces the JSON string representation (with quotes),
