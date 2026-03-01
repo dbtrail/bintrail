@@ -65,7 +65,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 
 	ctx := cmd.Context()
 
-	// ── 1. Source server: validate binlog_row_image ───────────────────────────
+	// ── 1. Source server: validate binlog_row_image ─────────────────────────────────
 	var sourceDB *sql.DB
 	if idxSourceDSN != "" {
 		var err error
@@ -78,17 +78,17 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		if err := validateBinlogFormat(sourceDB); err != nil {
 			return err
 		}
-		fmt.Println("Source: binlog_format=ROW ✓")
+		fmt.Println("Source: binlog_format=ROW \u2713")
 
 		if err := validateBinlogRowImage(sourceDB); err != nil {
 			return err
 		}
-		fmt.Println("Source: binlog_row_image=FULL ✓")
+		fmt.Println("Source: binlog_row_image=FULL \u2713")
 
 		if err := validateNoFKCascades(sourceDB, parseSchemaList(idxSchemas)); err != nil {
 			return err
 		}
-		fmt.Println("Source: no FK cascades ✓")
+		fmt.Println("Source: no FK cascades \u2713")
 	} else {
 		slog.Warn("--source-dsn not provided; skipping source server validation")
 	}
@@ -101,18 +101,20 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	defer indexDB.Close()
 
 	// ── 3. Resolve server identity ────────────────────────────────────────────
+	var bintrailID string
 	if sourceDB != nil {
-		bintrailID, err := resolveServerIdentity(ctx, sourceDB, indexDB, idxSourceDSN)
-		if err != nil {
-			if errors.Is(err, serverid.ErrConflict) {
-				return fmt.Errorf("cannot index: %w", err)
+		var idErr error
+		bintrailID, idErr = resolveServerIdentity(ctx, sourceDB, indexDB, idxSourceDSN)
+		if idErr != nil {
+			if errors.Is(idErr, serverid.ErrConflict) {
+				return fmt.Errorf("cannot index: %w", idErr)
 			}
-			slog.Warn("server identity resolution failed; proceeding without bintrail_id", "error", err)
+			slog.Warn("server identity resolution failed; proceeding without bintrail_id", "error", idErr)
 		} else {
 			slog.Info("server identity resolved", "bintrail_id", bintrailID)
 		}
 	}
-	// ── 4. Schema snapshot ────────────────────────────────────────────────────
+	// ── 4. Schema snapshot ───────────────────────────────────────────────────
 	resolver, err := ensureResolver(indexDB, sourceDB, parseSchemaList(idxSchemas))
 	if err != nil {
 		return err
@@ -129,13 +131,13 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("Files to process: %d\n\n", len(files))
 
-	// ── 6. Index each file ────────────────────────────────────────────────────
+	// ── 6. Index each file ──────────────────────────────────────────────────────────
 	p := parser.New(idxBinlogDir, resolver, filters, nil)
 	idx := indexer.New(indexDB, idxBatchSize)
 
 	var totalEvents int64
 	for _, filename := range files {
-		n, err := indexFile(ctx, p, idx, indexDB, idxBinlogDir, filename)
+		n, err := indexFile(ctx, p, idx, indexDB, idxBinlogDir, filename, bintrailID)
 		totalEvents += n
 		if err != nil {
 			// Log and continue so --all processes remaining files.
@@ -154,15 +156,15 @@ func indexFile(
 	p *parser.Parser,
 	idx *indexer.Indexer,
 	indexDB *sql.DB,
-	binlogDir, filename string,
+	binlogDir, filename, bintrailID string,
 ) (int64, error) {
-	// ── a. Skip already-completed files ──────────────────────────────────────
+	// ── a. Skip already-completed files ──────────────────────────────────────────
 	status, err := getFileStatus(indexDB, filename)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query index_state: %w", err)
 	}
 	if status == "completed" {
-		fmt.Printf("[%s] already indexed — skipping\n", filename)
+		fmt.Printf("[%s] already indexed \u2014 skipping\n", filename)
 		return 0, nil
 	}
 
@@ -170,7 +172,7 @@ func indexFile(
 	info, err := os.Stat(filepath.Join(binlogDir, filename))
 	if err != nil {
 		if os.IsNotExist(err) {
-			slog.Warn("binlog file not found — skipping", "file", filename)
+			slog.Warn("binlog file not found \u2014 skipping", "file", filename)
 			return 0, nil
 		}
 		return 0, fmt.Errorf("stat %s: %w", filename, err)
@@ -178,12 +180,12 @@ func indexFile(
 	fileSize := info.Size()
 
 	// ── b. Mark in_progress ───────────────────────────────────────────────────
-	if err := upsertFileState(indexDB, filename, "in_progress", fileSize, 0, 0, ""); err != nil {
+	if err := upsertFileState(indexDB, filename, "in_progress", fileSize, 0, 0, "", bintrailID); err != nil {
 		return 0, fmt.Errorf("failed to mark in_progress: %w", err)
 	}
 	fmt.Printf("[%s] indexing...\n", filename)
 
-	// ── c. Run parser + indexer concurrently ──────────────────────────────────
+	// ── c. Run parser + indexer concurrently ──────────────────────────────────────────
 	// Use a child context so we can cancel the parser if the indexer fails,
 	// avoiding a goroutine leak and the associated channel deadlock.
 	ctx, cancel := context.WithCancel(ctx)
@@ -207,23 +209,23 @@ func indexFile(
 	// ── e/f. Update index_state ───────────────────────────────────────────────
 	switch {
 	case idxErr != nil:
-		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, idxErr.Error())
+		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, idxErr.Error(), bintrailID)
 		return count, idxErr
 
 	case parseErr != nil && !errors.Is(parseErr, context.Canceled):
-		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, parseErr.Error())
+		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, parseErr.Error(), bintrailID)
 		return count, parseErr
 
 	default:
-		if err := upsertFileState(indexDB, filename, "completed", fileSize, fileSize, count, ""); err != nil {
+		if err := upsertFileState(indexDB, filename, "completed", fileSize, fileSize, count, "", bintrailID); err != nil {
 			slog.Warn("failed to mark file completed", "file", filename, "error", err)
 		}
-		fmt.Printf("[%s] done — %d events\n", filename, count)
+		fmt.Printf("[%s] done \u2014 %d events\n", filename, count)
 		return count, nil
 	}
 }
 
-// ─── index_state helpers ──────────────────────────────────────────────────────
+// ─── index_state helpers ────────────────────────────────────────────────────────
 
 // getFileStatus returns the current status from index_state, or "" if no row exists.
 func getFileStatus(db *sql.DB, filename string) (string, error) {
@@ -239,10 +241,15 @@ func getFileStatus(db *sql.DB, filename string) (string, error) {
 // lastPos is the byte offset of the last processed position (0 = unknown/in-progress).
 // eventsIndexed is the count of events written so far.
 // errMsg is stored for failed status; pass "" otherwise.
-func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eventsIndexed int64, errMsg string) error {
+// bintrailID is the resolved server identity; pass "" when unknown (stored as NULL).
+func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eventsIndexed int64, errMsg, bintrailID string) error {
 	var errMsgArg any
 	if errMsg != "" {
 		errMsgArg = errMsg
+	}
+	var bintrailIDArg any
+	if bintrailID != "" {
+		bintrailIDArg = bintrailID
 	}
 
 	var completedAt any
@@ -255,8 +262,8 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 	case "in_progress":
 		_, err := db.Exec(`
 			INSERT INTO index_state
-				(binlog_file, file_size, last_position, events_indexed, status, started_at, completed_at, error_message)
-			VALUES (?, ?, ?, ?, 'in_progress', UTC_TIMESTAMP(), NULL, NULL)
+				(binlog_file, file_size, last_position, events_indexed, status, started_at, completed_at, error_message, bintrail_id)
+			VALUES (?, ?, ?, ?, 'in_progress', UTC_TIMESTAMP(), NULL, NULL, ?)
 			ON DUPLICATE KEY UPDATE
 				file_size      = VALUES(file_size),
 				last_position  = VALUES(last_position),
@@ -264,8 +271,9 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 				status         = 'in_progress',
 				started_at     = UTC_TIMESTAMP(),
 				completed_at   = NULL,
-				error_message  = NULL`,
-			filename, fileSize, lastPos, eventsIndexed)
+				error_message  = NULL,
+				bintrail_id    = VALUES(bintrail_id)`,
+			filename, fileSize, lastPos, eventsIndexed, bintrailIDArg)
 		return err
 
 	case "completed":
@@ -295,7 +303,7 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 	return fmt.Errorf("upsertFileState: unknown status %q", status)
 }
 
-// ─── Validation ───────────────────────────────────────────────────────────────
+// ─── Validation ────────────────────────────────────────────────────────────────────
 
 // validateBinlogFormat checks that the source server has binlog_format=ROW.
 func validateBinlogFormat(db *sql.DB) error {
@@ -379,7 +387,7 @@ func validateNoFKCascades(db *sql.DB, schemas []string) error {
 	return nil
 }
 
-// ─── Snapshot bootstrap ───────────────────────────────────────────────────────
+// ─── Snapshot bootstrap ────────────────────────────────────────────────────────────
 
 // ensureResolver returns a Resolver loaded from the latest snapshot, taking a
 // new snapshot automatically if none exists (requires sourceDB != nil).
@@ -410,7 +418,7 @@ func ensureResolver(indexDB, sourceDB *sql.DB, schemas []string) (*metadata.Reso
 	return metadata.NewResolver(indexDB, snapshotID)
 }
 
-// ─── Filter builder ───────────────────────────────────────────────────────────
+// ─── Filter builder ───────────────────────────────────────────────────────────────
 
 func buildIndexFilters(schemas, tables string) parser.Filters {
 	var f parser.Filters
@@ -433,7 +441,7 @@ func buildIndexFilters(schemas, tables string) parser.Filters {
 	return f
 }
 
-// ─── File discovery ───────────────────────────────────────────────────────────
+// ─── File discovery ───────────────────────────────────────────────────────────────
 
 // binlogFileRe matches standard MySQL binlog filenames: any name ending in six
 // or more decimal digits after a dot (e.g. binlog.000042, mysql-bin.000001).
