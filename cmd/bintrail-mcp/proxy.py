@@ -13,6 +13,8 @@ Usage — add to Claude Desktop's mcpServers config
   }
 
 Requires: Python 3.7+, no third-party packages.
+
+Set BINTRAIL_LOG_LEVEL=DEBUG to enable diagnostic output on stderr.
 """
 
 import json
@@ -21,6 +23,10 @@ import sys
 import threading
 import urllib.request
 import urllib.error
+
+from log import setup_logging
+
+_log = setup_logging()
 
 SERVER_URL = os.environ.get("BINTRAIL_SERVER", "http://localhost:8080/mcp")
 
@@ -47,6 +53,7 @@ def _emit(line):
 def _error(msg_id, message):
     # Notifications have no id and expect no response — drop silently.
     if msg_id is None:
+        _log.debug("dropped error for notification (no id): %s", message)
         return
     _emit(json.dumps({
         "jsonrpc": "2.0",
@@ -55,8 +62,19 @@ def _error(msg_id, message):
     }))
 
 
-def _post(body: bytes) -> None:
+def _post(body):
+    # type: (bytes) -> None
     """Send one JSON-RPC message to the HTTP server; forward all responses to stdout."""
+    try:
+        parsed = json.loads(body)
+        method = parsed.get("method", "?")
+        msg_id = parsed.get("id")
+    except Exception:
+        method = "?"
+        msg_id = None
+
+    _log.debug("-> %s (id=%s)", method, msg_id)
+
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -69,25 +87,27 @@ def _post(body: bytes) -> None:
     try:
         resp = urllib.request.urlopen(req, timeout=60)
     except urllib.error.HTTPError as e:
-        try:
-            msg_id = json.loads(body).get("id")
-        except Exception:
-            msg_id = None
-        _error(msg_id, f"HTTP {e.code}: {e.reason}")
+        _log.warning("HTTP %s %s for method %s", e.code, e.reason, method)
+        _error(msg_id, "HTTP {}: {}".format(e.code, e.reason))
         return
     except Exception as e:
-        _error(None, str(e))
+        _log.error("request failed for method %s: %s", method, e)
+        _error(msg_id, str(e))
         return
 
     with resp:
         new_sid = resp.headers.get("Mcp-Session-Id")
-        if new_sid:
+        if new_sid and new_sid != sid:
             _set_session(new_sid)
+            _log.debug("session acquired: %s", new_sid)
 
         ct = resp.headers.get("Content-Type", "")
+        _log.debug("<- %s content-type=%s", resp.status, ct)
+
         if "text/event-stream" in ct:
             # Server responded with an SSE stream — forward every data line.
             buf = b""
+            forwarded = 0
             while True:
                 chunk = resp.read(4096)
                 if not chunk:
@@ -101,13 +121,17 @@ def _post(body: bytes) -> None:
                         data = raw[5:].strip()
                         if data and data != "[DONE]":
                             _emit(data)
+                            forwarded += 1
+            _log.debug("forwarded %d SSE event(s) for method %s", forwarded, method)
         else:
             data = resp.read().decode("utf-8").strip()
             if data:
                 _emit(data)
 
 
-def main() -> None:
+def main():
+    # type: () -> None
+    _log.info("bintrail proxy starting — server=%s python=%s", SERVER_URL, sys.version.split()[0])
     for raw in sys.stdin:
         line = raw.strip()
         if line:
