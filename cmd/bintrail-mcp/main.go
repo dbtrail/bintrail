@@ -35,10 +35,13 @@ import (
 	"github.com/bintrail/bintrail/internal/status"
 )
 
+// mcpVersion is injected at build time via -ldflags.
+var mcpVersion = "dev"
+
 func newServer() *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "bintrail",
-		Version: "v1.0.0",
+		Version: mcpVersion,
 	}, &mcp.ServerOptions{
 		Instructions: "Bintrail MCP server for querying indexed MySQL binlog events, " +
 			"generating recovery SQL, and viewing index status. " +
