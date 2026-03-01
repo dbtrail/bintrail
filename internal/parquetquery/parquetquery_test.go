@@ -16,11 +16,15 @@ func TestBuildGlob(t *testing.T) {
 		source string
 		want   string
 	}{
-		{"/data/archives", "/data/archives/*.parquet"},
-		{"/data/archives/", "/data/archives/*.parquet"},
-		{"/data/archives/p_2026020100.parquet", "/data/archives/p_2026020100.parquet"},
-		{"s3://bucket/prefix", "s3://bucket/prefix/*.parquet"},
-		{"s3://bucket/prefix/", "s3://bucket/prefix/*.parquet"},
+		{"/data/archives", "/data/archives/**/*.parquet"},
+		{"/data/archives/", "/data/archives/**/*.parquet"},
+		// Hive-partitioned path scoped to one server
+		{"/data/archives/bintrail_id=abc-123", "/data/archives/bintrail_id=abc-123/**/*.parquet"},
+		// Single file: returned as-is.
+		{"/data/archives/events_14.parquet", "/data/archives/events_14.parquet"},
+		{"s3://bucket/prefix", "s3://bucket/prefix/**/*.parquet"},
+		{"s3://bucket/prefix/", "s3://bucket/prefix/**/*.parquet"},
+		{"s3://bucket/prefix/bintrail_id=abc-123", "s3://bucket/prefix/bintrail_id=abc-123/**/*.parquet"},
 		{"s3://bucket/prefix/*.parquet", "s3://bucket/prefix/*.parquet"},
 	}
 	for _, tc := range tests {
@@ -46,6 +50,19 @@ func TestBuildQueryNoFilters(t *testing.T) {
 	assertContains(t, q, "ORDER BY event_timestamp, event_id")
 	assertContains(t, q, "LIMIT ?")
 	// Only arg is the limit.
+	if len(args) != 1 || args[0] != 50 {
+		t.Errorf("expected [50] args, got %v", args)
+	}
+}
+
+// TestBuildQueryViaGlob verifies the full buildGlob→buildQuery pipeline: a
+// Hive-partitioned source path should produce SQL with the recursive
+// /**/*.parquet glob, not the old flat /*.parquet pattern.
+func TestBuildQueryViaGlob(t *testing.T) {
+	glob := buildGlob("/archives/bintrail_id=abc-123")
+	q, args := buildQuery(glob, query.Options{Limit: 50})
+	assertContains(t, q, "/archives/bintrail_id=abc-123/**/*.parquet")
+	assertContains(t, q, "LIMIT ?")
 	if len(args) != 1 || args[0] != 50 {
 		t.Errorf("expected [50] args, got %v", args)
 	}

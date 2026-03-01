@@ -18,6 +18,7 @@ import (
 	"github.com/bintrail/bintrail/internal/indexer"
 	"github.com/bintrail/bintrail/internal/metadata"
 	"github.com/bintrail/bintrail/internal/parser"
+	"github.com/bintrail/bintrail/internal/serverid"
 )
 
 var indexCmd = &cobra.Command{
@@ -99,14 +100,26 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	}
 	defer indexDB.Close()
 
-	// ── 3. Schema snapshot ────────────────────────────────────────────────────
+	// ── 3. Resolve server identity ────────────────────────────────────────────
+	if sourceDB != nil {
+		bintrailID, err := resolveServerIdentity(ctx, sourceDB, indexDB, idxSourceDSN)
+		if err != nil {
+			if errors.Is(err, serverid.ErrConflict) {
+				return fmt.Errorf("cannot index: %w", err)
+			}
+			slog.Warn("server identity resolution failed; proceeding without bintrail_id", "error", err)
+		} else {
+			slog.Info("server identity resolved", "bintrail_id", bintrailID)
+		}
+	}
+	// ── 4. Schema snapshot ────────────────────────────────────────────────────
 	resolver, err := ensureResolver(indexDB, sourceDB, parseSchemaList(idxSchemas))
 	if err != nil {
 		return err
 	}
 	fmt.Printf("Snapshot: id=%d, tables=%d\n", resolver.SnapshotID(), resolver.TableCount())
 
-	// ── 4. Filters ────────────────────────────────────────────────────────────
+	// ── 5. Filters ────────────────────────────────────────────────────────────
 	filters := buildIndexFilters(idxSchemas, idxTables)
 
 	// ── 5. File list ──────────────────────────────────────────────────────────

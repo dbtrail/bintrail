@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -43,19 +45,20 @@ Examples:
 }
 
 var (
-	qIndexDSN   string
-	qSchema     string
-	qTable      string
-	qPK         string
-	qEventType  string
-	qGTID       string
-	qSince      string
-	qUntil      string
-	qChangedCol string
-	qFormat     string
-	qLimit      int
-	qArchiveDir string
-	qArchiveS3  string
+	qIndexDSN    string
+	qSchema      string
+	qTable       string
+	qPK          string
+	qEventType   string
+	qGTID        string
+	qSince       string
+	qUntil       string
+	qChangedCol  string
+	qFormat      string
+	qLimit       int
+	qArchiveDir  string
+	qArchiveS3   string
+	qBintrailID  string
 )
 
 func init() {
@@ -70,8 +73,9 @@ func init() {
 	queryCmd.Flags().StringVar(&qChangedCol, "changed-column", "", "Filter UPDATEs that modified this column")
 	queryCmd.Flags().StringVar(&qFormat, "format", "table", "Output format: table, json, or csv")
 	queryCmd.Flags().IntVar(&qLimit, "limit", 100, "Maximum number of rows to return")
-	queryCmd.Flags().StringVar(&qArchiveDir, "archive-dir", "", "Local directory of Parquet archive files to merge with live index results")
-	queryCmd.Flags().StringVar(&qArchiveS3, "archive-s3", "", "S3 URL prefix of Parquet archive files to merge with live index results (e.g. s3://bucket/prefix/); uses the standard AWS credential chain (env vars, ~/.aws/credentials, IAM role); requires outbound internet access to install the DuckDB httpfs extension on first use")
+	queryCmd.Flags().StringVar(&qArchiveDir, "archive-dir", "", "Local root directory of Parquet archives (requires --bintrail-id)")
+	queryCmd.Flags().StringVar(&qArchiveS3, "archive-s3", "", "S3 root URL prefix of Parquet archives (requires --bintrail-id; e.g. s3://bucket/prefix/); uses the standard AWS credential chain")
+	queryCmd.Flags().StringVar(&qBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir or --archive-s3 is set)")
 	_ = queryCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(queryCmd)
@@ -88,6 +92,9 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	if !cliutil.IsValidFormat(qFormat) {
 		return fmt.Errorf("invalid --format %q; must be table, json, or csv", qFormat)
+	}
+	if (qArchiveDir != "" || qArchiveS3 != "") && qBintrailID == "" {
+		return fmt.Errorf("--bintrail-id is required when --archive-dir or --archive-s3 is set")
 	}
 
 	// ── Parse filter values ───────────────────────────────────────────────────
@@ -180,14 +187,17 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// archiveSources returns the non-empty archive source flags as a slice.
+// archiveSources returns the Hive-scoped archive source paths for the current
+// --bintrail-id. Each source points to the bintrail_id=<uuid> subdirectory so
+// DuckDB only reads files for this server.
 func archiveSources() []string {
 	var sources []string
 	if qArchiveDir != "" {
-		sources = append(sources, qArchiveDir)
+		sources = append(sources, filepath.Join(qArchiveDir, "bintrail_id="+qBintrailID))
 	}
 	if qArchiveS3 != "" {
-		sources = append(sources, qArchiveS3)
+		base := strings.TrimSuffix(qArchiveS3, "/")
+		sources = append(sources, base+"/bintrail_id="+qBintrailID)
 	}
 	return sources
 }

@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/bintrail/bintrail/internal/serverid"
 )
 
 // dbCounter ensures unique database names across calls within the same test.
@@ -193,6 +195,9 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		server_id        INT UNSIGNED    NOT NULL,
 		CONSTRAINT single_row CHECK (id = 1)
 	) ENGINE=InnoDB`)
+
+	MustExec(t, db, serverid.DDLBintrailServers)
+	MustExec(t, db, serverid.DDLBintrailServerChanges)
 }
 
 // InsertEvent inserts a single event into binlog_events using raw SQL.

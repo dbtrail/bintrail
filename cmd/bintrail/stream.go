@@ -27,6 +27,7 @@ import (
 	"github.com/bintrail/bintrail/internal/indexer"
 	"github.com/bintrail/bintrail/internal/observe"
 	"github.com/bintrail/bintrail/internal/parser"
+	"github.com/bintrail/bintrail/internal/serverid"
 )
 
 var streamCmd = &cobra.Command{
@@ -429,17 +430,28 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("Source: no FK cascades ✓")
 
-	// ── 3. Schema snapshot + resolver ────────────────────────────────────────
+	// ── 3. Resolve server identity ────────────────────────────────────────────
+	bintrailID, err := resolveServerIdentity(ctx, sourceDB, indexDB, strmSourceDSN)
+	if err != nil {
+		if errors.Is(err, serverid.ErrConflict) {
+			return fmt.Errorf("cannot stream: %w", err)
+		}
+		slog.Warn("server identity resolution failed; proceeding without bintrail_id", "error", err)
+	} else {
+		slog.Info("server identity resolved", "bintrail_id", bintrailID)
+	}
+
+	// ── 4. Schema snapshot + resolver ─────────────────────────────────────────
 	resolver, err := ensureResolver(indexDB, sourceDB, parseSchemaList(strmSchemas))
 	if err != nil {
 		return err
 	}
 	fmt.Printf("Snapshot: id=%d, tables=%d\n", resolver.SnapshotID(), resolver.TableCount())
 
-	// ── 4. Filters ────────────────────────────────────────────────────────────
+	// ── 5. Filters ────────────────────────────────────────────────────────────
 	filters := buildIndexFilters(strmSchemas, strmTables)
 
-	// ── 5. Determine start position ───────────────────────────────────────────
+	// ── 6. Determine start position ───────────────────────────────────────────
 	saved, err := loadStreamState(indexDB)
 	if err != nil {
 		return fmt.Errorf("failed to load stream state: %w", err)
@@ -463,7 +475,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 		state.gtidSet = startGTIDStr
 	}
 
-	// ── 6. Parse source DSN for BinlogSyncer ─────────────────────────────────
+	// ── 7. Parse source DSN for BinlogSyncer ─────────────────────────────────
 	host, port, user, password, err := parseSourceDSN(strmSourceDSN)
 	if err != nil {
 		return err

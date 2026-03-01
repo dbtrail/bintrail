@@ -15,6 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
+
+	"github.com/bintrail/bintrail/internal/serverid"
 )
 
 var initCmd = &cobra.Command{
@@ -126,6 +128,16 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create stream_state: %w", err)
 	}
 	fmt.Println("  \u2713 stream_state")
+
+	if _, err := db.Exec(ddlBintrailServers); err != nil {
+		return fmt.Errorf("failed to create bintrail_servers: %w", err)
+	}
+	fmt.Println("  \u2713 bintrail_servers")
+
+	if _, err := db.Exec(ddlBintrailServerChanges); err != nil {
+		return fmt.Errorf("failed to create bintrail_server_changes: %w", err)
+	}
+	fmt.Println("  \u2713 bintrail_server_changes")
 
 	if initS3Bucket != "" {
 		fmt.Printf("\nSetting up S3 bucket...\n")
@@ -479,3 +491,11 @@ const ddlIndexState = `CREATE TABLE IF NOT EXISTS index_state (
     completed_at   DATETIME DEFAULT NULL,
     error_message  TEXT     DEFAULT NULL
 ) ENGINE=InnoDB`
+
+// ddlBintrailServers and ddlBintrailServerChanges are the canonical DDL
+// statements for the server identity tables. They live in internal/serverid
+// so that testutil and init share a single source of truth.
+var (
+	ddlBintrailServers      = serverid.DDLBintrailServers
+	ddlBintrailServerChanges = serverid.DDLBintrailServerChanges
+)
