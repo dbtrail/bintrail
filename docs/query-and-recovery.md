@@ -65,6 +65,47 @@ Results can be formatted three ways:
 
 ---
 
+## Parquet Archive Queries
+
+When rotated partitions have been archived (via `bintrail rotate --archive-dir` or `--archive-s3`), events are no longer in the MySQL index. The `query` command can merge results from these archives with the live index using `--archive-dir` and `--archive-s3`.
+
+### How the Merge Works
+
+When either archive flag is set, the query command takes a different path:
+
+1. **Fetch from MySQL index** — same query as usual, but with no `LIMIT` (`Limit=0` omits the LIMIT clause so no events are dropped before the merge).
+2. **Fetch from each archive source** — DuckDB opens the Parquet files via `parquet_scan('glob/*.parquet')`, applies the same filters (schema, table, PK, time range, etc.) in DuckDB SQL, and returns `[]ResultRow`.
+3. **Merge** — results from all sources are combined, deduplicated by `event_id` (MySQL wins on duplicates, since it is appended first), sorted by `(event_timestamp, event_id)`, and then the user's `--limit` is applied once.
+
+```
+bintrail query --archive-dir /data/archives --since "2026-02-01 00:00:00"
+                     │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+   MySQL index            DuckDB (local Parquet)
+   (live data)            /data/archives/*.parquet
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+              dedup + sort + limit
+                     │
+                     ▼
+               formatted output
+```
+
+### Memory Footprint
+
+The merge path loads **all matching rows** from all sources into memory before applying the limit. Filters (schema, table, time range, etc.) bound the result set in practice. For extremely broad queries against large archives, memory usage could be significant — apply at least a `--since`/`--until` range to keep the result set manageable.
+
+### S3 Prerequisites
+
+`--archive-s3` uses DuckDB's `httpfs` extension:
+
+- **AWS credentials** — DuckDB uses the standard credential chain: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, `~/.aws/credentials`, or an IAM role. Set credentials before running the query.
+- **Outbound internet access** — on first use, DuckDB downloads the `httpfs` extension from its extension registry. In airgapped environments, pre-install it by running `duckdb -c "INSTALL httpfs;"` once on a machine with internet access and copying the extension cache.
+
+---
+
 ## Recovery: How It Works
 
 ### The Concept
