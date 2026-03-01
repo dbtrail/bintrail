@@ -84,12 +84,16 @@ func New(binlogDir string, resolver *metadata.Resolver, filters Filters, logger 
 	if logger == nil {
 		logger = slog.Default()
 	}
+	var schemaVersion uint32
+	if resolver != nil {
+		schemaVersion = uint32(resolver.SnapshotID())
+	}
 	return &Parser{
 		binlogDir:     binlogDir,
 		resolver:      resolver,
 		filters:       filters,
 		logger:        logger,
-		schemaVersion: uint32(resolver.SnapshotID()),
+		schemaVersion: schemaVersion,
 	}
 }
 

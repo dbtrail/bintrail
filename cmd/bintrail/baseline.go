@@ -60,6 +60,10 @@ func init() {
 }
 
 func runBaseline(cmd *cobra.Command, args []string) error {
+	if err := baseline.ValidateCodec(bslCompression); err != nil {
+		return fmt.Errorf("--compression: %w", err)
+	}
+
 	var ts time.Time
 	if bslTimestamp != "" {
 		var err error

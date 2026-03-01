@@ -18,11 +18,14 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -101,8 +104,22 @@ func main() {
 		)
 		mux := http.NewServeMux()
 		mux.Handle("/mcp", handler)
+
+		srv := &http.Server{Addr: *httpAddr, Handler: mux}
+
+		// Shut down gracefully on SIGINT/SIGTERM.
+		sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		go func() {
+			<-sigCtx.Done()
+			slog.Info("MCP HTTP server shutting down")
+			if err := srv.Shutdown(context.Background()); err != nil {
+				slog.Error("MCP HTTP server shutdown error", "error", err)
+			}
+		}()
+
 		slog.Info("MCP HTTP server starting", "addr", *httpAddr, "endpoint", "/mcp")
-		if err := http.ListenAndServe(*httpAddr, mux); err != nil {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("MCP HTTP server error", "error", err)
 			os.Exit(1)
 		}

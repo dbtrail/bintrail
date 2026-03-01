@@ -121,7 +121,7 @@ All tools are annotated with `ReadOnlyHint: true` and `IdempotentHint: true`. DS
 
 **stdio mode**: `.mcp.json` at the project root registers `go run ./cmd/bintrail-mcp` so Claude Code auto-starts it. No pre-build needed.
 
-**HTTP mode**: Starts a persistent `net/http` server using `mcp.NewStreamableHTTPHandler` (MCP Streamable HTTP spec 2025-03-26), serving at `/mcp`. Each incoming connection gets a fresh `newServer()` instance; the SDK manages session state via `Mcp-Session-Id` response header.
+**HTTP mode**: Starts a persistent `net/http` server using `mcp.NewStreamableHTTPHandler` (MCP Streamable HTTP spec 2025-03-26), serving at `/mcp`. Each incoming connection gets a fresh `newServer()` instance; the SDK manages session state via `Mcp-Session-Id` response header. The server handles SIGINT/SIGTERM for graceful shutdown, draining in-flight requests before exiting.
 
 ```bash
 BINTRAIL_INDEX_DSN='root:pass@tcp(127.0.0.1:3306)/binlog_index' bintrail-mcp --http :8080
@@ -131,7 +131,7 @@ BINTRAIL_INDEX_DSN='root:pass@tcp(127.0.0.1:3306)/binlog_index' bintrail-mcp --h
 
 ### Remote access via proxy.py
 
-`cmd/bintrail-mcp/proxy.py` is a Python 3.7+ script (zero dependencies — stdlib only) that bridges Claude Desktop's MCP stdio protocol to the remote HTTP server:
+`cmd/bintrail-mcp/proxy.py` is a self-contained Python 3.7+ script (zero dependencies — stdlib only, logging is inlined) that bridges Claude Desktop's MCP stdio protocol to the remote HTTP server:
 
 ```
 Claude Desktop  →  proxy.py (stdin/stdout)  →  bintrail-mcp --http :8080  →  Index MySQL
@@ -273,8 +273,10 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent w
 - `gomysql "github.com/go-mysql-org/go-mysql/mysql"` (used more heavily)
 - `drivermysql "github.com/go-sql-driver/mysql"` (only for `drivermysql.ParseDSN`)
 
-### parseTime=true in connections
+### parseTime=true and connection timeout
 `config.Connect` always injects `parseTime=true` via `mysql.ParseDSN` → `cfg.ParseTime = true` → `cfg.FormatDSN()`. Without this, go-sql-driver returns DATETIME columns as `[]uint8` (raw bytes) instead of `time.Time`, causing scan errors. Do not use raw `sql.Open("mysql", dsn)` in commands that read DATETIME columns — always go through `config.Connect`.
+
+`config.Connect` also injects a 10-second TCP connect timeout (`cfg.Timeout`) when the DSN does not specify one. This prevents indefinite hangs when MySQL is unreachable. Users can override this with the `timeout=` DSN parameter (e.g. `user:pass@tcp(host:3306)/db?timeout=30s`).
 
 ### dump command: lockfile and mydumper args
 
@@ -302,7 +304,8 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent w
 
 **Parquet writer** (`writer.go`):
 - Columns are written in **alphabetical order** (parquet.Group sorts fields alphabetically). `sortColumnsForParquet` builds the MySQL→Parquet index mapping `mysqlOrder[parquetIdx] = mysqlIdx` so rows are remapped correctly.
-- `resolveCodec(name)` returns the codec: `"zstd"`/`""` → `&zstd.Codec{}`, `"snappy"` → `&snappy.Codec{}`, `"gzip"` → `&gzip.Codec{}`, anything else (incl. `"none"`) → nil (no compression).
+- `ValidateCodec(name)` validates the compression codec name: `"zstd"`, `""`, `"snappy"`, `"gzip"`, `"none"` are accepted; unknown codecs return an error. CLI layers (`baseline.go`, `rotate.go`) call this early for fast feedback; `NewWriter` also validates.
+- `resolveCodec(name)` returns the codec: `"zstd"`/`""` → `&zstd.Codec{}`, `"snappy"` → `&snappy.Codec{}`, `"gzip"` → `&gzip.Codec{}`, `"none"` → nil (no compression).
 - `convertValue(col, raw)` maps MySQL types to parquet.Value: integers → INT32/INT64, float/double → FLOAT/DOUBLE, datetime/timestamp → INT64 (microseconds since Unix epoch, UTC), date → INT32 (days since Unix epoch), all others (decimal, varchar, blob, etc.) → BYTE_ARRAY.
 - Key-value metadata embedded: `bintrail.snapshot_timestamp`, `bintrail.source_database`, `bintrail.source_table`, `bintrail.mydumper_format`, `bintrail.bintrail_version`.
 
