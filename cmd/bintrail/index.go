@@ -101,13 +101,15 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	defer indexDB.Close()
 
 	// ── 3. Resolve server identity ────────────────────────────────────────────
+	var bintrailID string
 	if sourceDB != nil {
-		bintrailID, err := resolveServerIdentity(ctx, sourceDB, indexDB, idxSourceDSN)
-		if err != nil {
-			if errors.Is(err, serverid.ErrConflict) {
-				return fmt.Errorf("cannot index: %w", err)
+		var idErr error
+		bintrailID, idErr = resolveServerIdentity(ctx, sourceDB, indexDB, idxSourceDSN)
+		if idErr != nil {
+			if errors.Is(idErr, serverid.ErrConflict) {
+				return fmt.Errorf("cannot index: %w", idErr)
 			}
-			slog.Warn("server identity resolution failed; proceeding without bintrail_id", "error", err)
+			slog.Warn("server identity resolution failed; proceeding without bintrail_id", "error", idErr)
 		} else {
 			slog.Info("server identity resolved", "bintrail_id", bintrailID)
 		}
@@ -135,7 +137,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 
 	var totalEvents int64
 	for _, filename := range files {
-		n, err := indexFile(ctx, p, idx, indexDB, idxBinlogDir, filename)
+		n, err := indexFile(ctx, p, idx, indexDB, idxBinlogDir, filename, bintrailID)
 		totalEvents += n
 		if err != nil {
 			// Log and continue so --all processes remaining files.
@@ -154,7 +156,7 @@ func indexFile(
 	p *parser.Parser,
 	idx *indexer.Indexer,
 	indexDB *sql.DB,
-	binlogDir, filename string,
+	binlogDir, filename, bintrailID string,
 ) (int64, error) {
 	// ── a. Skip already-completed files ──────────────────────────────────────
 	status, err := getFileStatus(indexDB, filename)
@@ -178,7 +180,7 @@ func indexFile(
 	fileSize := info.Size()
 
 	// ── b. Mark in_progress ───────────────────────────────────────────────────
-	if err := upsertFileState(indexDB, filename, "in_progress", fileSize, 0, 0, ""); err != nil {
+	if err := upsertFileState(indexDB, filename, "in_progress", fileSize, 0, 0, "", bintrailID); err != nil {
 		return 0, fmt.Errorf("failed to mark in_progress: %w", err)
 	}
 	fmt.Printf("[%s] indexing...\n", filename)
@@ -207,15 +209,15 @@ func indexFile(
 	// ── e/f. Update index_state ───────────────────────────────────────────────
 	switch {
 	case idxErr != nil:
-		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, idxErr.Error())
+		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, idxErr.Error(), "")
 		return count, idxErr
 
 	case parseErr != nil && !errors.Is(parseErr, context.Canceled):
-		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, parseErr.Error())
+		_ = upsertFileState(indexDB, filename, "failed", fileSize, 0, count, parseErr.Error(), "")
 		return count, parseErr
 
 	default:
-		if err := upsertFileState(indexDB, filename, "completed", fileSize, fileSize, count, ""); err != nil {
+		if err := upsertFileState(indexDB, filename, "completed", fileSize, fileSize, count, "", ""); err != nil {
 			slog.Warn("failed to mark file completed", "file", filename, "error", err)
 		}
 		fmt.Printf("[%s] done — %d events\n", filename, count)
@@ -239,10 +241,15 @@ func getFileStatus(db *sql.DB, filename string) (string, error) {
 // lastPos is the byte offset of the last processed position (0 = unknown/in-progress).
 // eventsIndexed is the count of events written so far.
 // errMsg is stored for failed status; pass "" otherwise.
-func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eventsIndexed int64, errMsg string) error {
+// bintrailID is the resolved server identity; pass "" when unknown (stored as NULL).
+func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eventsIndexed int64, errMsg, bintrailID string) error {
 	var errMsgArg any
 	if errMsg != "" {
 		errMsgArg = errMsg
+	}
+	var bintrailIDArg any
+	if bintrailID != "" {
+		bintrailIDArg = bintrailID
 	}
 
 	var completedAt any
@@ -255,8 +262,8 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 	case "in_progress":
 		_, err := db.Exec(`
 			INSERT INTO index_state
-				(binlog_file, file_size, last_position, events_indexed, status, started_at, completed_at, error_message)
-			VALUES (?, ?, ?, ?, 'in_progress', UTC_TIMESTAMP(), NULL, NULL)
+				(binlog_file, file_size, last_position, events_indexed, status, started_at, completed_at, error_message, bintrail_id)
+			VALUES (?, ?, ?, ?, 'in_progress', UTC_TIMESTAMP(), NULL, NULL, ?)
 			ON DUPLICATE KEY UPDATE
 				file_size      = VALUES(file_size),
 				last_position  = VALUES(last_position),
@@ -264,8 +271,9 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 				status         = 'in_progress',
 				started_at     = UTC_TIMESTAMP(),
 				completed_at   = NULL,
-				error_message  = NULL`,
-			filename, fileSize, lastPos, eventsIndexed)
+				error_message  = NULL,
+				bintrail_id    = VALUES(bintrail_id)`,
+			filename, fileSize, lastPos, eventsIndexed, bintrailIDArg)
 		return err
 
 	case "completed":

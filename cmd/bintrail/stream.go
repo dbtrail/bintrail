@@ -100,6 +100,7 @@ type streamState struct {
 	eventsIndexed int64
 	lastEventTime sql.NullTime
 	serverID      uint32
+	bintrailID    string // resolved server identity (empty = unknown, stored as NULL)
 
 	// accGTID is the in-memory accumulated GTID set (GTID mode only).
 	// It is serialized to gtidSet on checkpoint.
@@ -138,11 +139,15 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	if state.lastEventTime.Valid {
 		lastEventTime = state.lastEventTime.Time
 	}
+	var bintrailIDArg any
+	if state.bintrailID != "" {
+		bintrailIDArg = state.bintrailID
+	}
 	_, err := db.Exec(`
 		INSERT INTO stream_state
 		    (id, mode, binlog_file, binlog_position, gtid_set,
-		     events_indexed, last_event_time, last_checkpoint, server_id)
-		VALUES (1, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?)
+		     events_indexed, last_event_time, last_checkpoint, server_id, bintrail_id)
+		VALUES (1, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?, ?)
 		ON DUPLICATE KEY UPDATE
 		    binlog_file     = VALUES(binlog_file),
 		    binlog_position = VALUES(binlog_position),
@@ -150,9 +155,10 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 		    events_indexed  = VALUES(events_indexed),
 		    last_event_time = VALUES(last_event_time),
 		    last_checkpoint = UTC_TIMESTAMP(),
-		    server_id       = VALUES(server_id)`,
+		    server_id       = VALUES(server_id),
+		    bintrail_id     = VALUES(bintrail_id)`,
 		state.mode, state.binlogFile, state.binlogPos, gtidSet,
-		state.eventsIndexed, lastEventTime, state.serverID)
+		state.eventsIndexed, lastEventTime, state.serverID, bintrailIDArg)
 	return err
 }
 
@@ -464,9 +470,10 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}
 
 	state := &streamState{
-		mode:     mode,
-		serverID: strmServerID,
-		accGTID:  accGTID,
+		mode:       mode,
+		serverID:   strmServerID,
+		accGTID:    accGTID,
+		bintrailID: bintrailID,
 	}
 	if saved != nil {
 		state.eventsIndexed = saved.eventsIndexed
