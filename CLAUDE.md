@@ -30,6 +30,8 @@ cmd/bintrail/          # One file per command
   stream_test.go       # Unit tests for parseSourceDSN, resolveStart, GTID accumulation, cobra wiring
   dump_test.go         # Unit tests for dumpCmd cobra wiring, buildMydumperArgs, lock mechanism, extractSchemasFromTables
   baseline_test.go     # Unit tests for parseTableFilter, runBaseline timestamp parsing
+  init_test.go         # Unit tests for initCmd cobra wiring, buildBinlogEventsDDL, buildPartitionDefs, parseS3ARN, s3Instructions, runInit validation
+  status_test.go       # Unit tests for statusCmd cobra wiring + runStatus DSN validation
   cmd_integration_test.go             # Integration tests (//go:build integration) for all DB helpers
   stream_integration_test.go          # Integration tests for stream_state persistence and streamLoop behaviour
 
@@ -52,6 +54,7 @@ internal/
   status/status.go     # Shared status types and display: LoadIndexState, LoadPartitionStats, WriteStatus
   baseline/            # mydumper → Parquet converter: ParseMetadata, ParseSchema, DiscoverTables, Writer
   archive/             # Partition archiver: ArchivePartition writes a binlog_events partition to Parquet
+  parquetquery/        # DuckDB-backed Parquet query engine: Fetch, buildGlob, buildQuery, scanRows
   testutil/testutil.go # Shared test helpers: CreateTestDB, InitIndexTables, SkipIfNoMySQL, etc.
 
 e2e_test.go            # E2E integration test (//go:build integration) — exercises full CLI pipeline
@@ -81,10 +84,10 @@ Global persistent flags (all commands via `rootCmd.PersistentFlags`):
 
 | Command | File | Key flags |
 |---|---|---|
-| `init` | `init.go` | `--index-dsn` (req), `--partitions` (default 7) |
+| `init` | `init.go` | `--index-dsn` (req), `--partitions` (default 48), `--encrypt`, `--s3-bucket`, `--s3-region` (default `us-east-1`), `--s3-arn` |
 | `snapshot` | `snapshot.go` | `--source-dsn` (req), `--index-dsn` (req), `--schemas` |
 | `index` | `index.go` | `--index-dsn` (req), `--source-dsn`, `--binlog-dir` (req), `--files`, `--all`, `--batch-size`, `--schemas`, `--tables` |
-| `query` | `query.go` | `--index-dsn` (req), `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`, `--since`, `--until`, `--changed-column`, `--format`, `--limit` |
+| `query` | `query.go` | `--index-dsn` (req), `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`, `--since`, `--until`, `--changed-column`, `--format`, `--limit`, `--archive-dir`, `--archive-s3` |
 | `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000) |
 | `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future`, `--archive-dir`, `--archive-compression` (default `zstd`) |
 | `status` | `status.go` | `--index-dsn` (req) |
@@ -330,6 +333,27 @@ Flag variable prefix: `bsl` (e.g. `bslInput`, `bslOutput`, `bslCompression`).
 
 **`rotate --archive-dir`** triggers archiving before each `dropPartitions` call. If any archive fails, no partitions are dropped.
 
+### internal/parquetquery: DuckDB-backed archive query
+
+`internal/parquetquery` provides a `Fetch(ctx, opts, source)` function that queries Parquet archive files (written by `rotate --archive-dir`) using an in-process DuckDB instance.
+
+- **`source`**: a local directory path or an S3 URL prefix (`s3://bucket/prefix/`)
+- **`buildGlob(source)`**: converts source to a glob pattern (`source/*.parquet`); if source already ends in `.parquet`, returns as-is
+- **`buildQuery(glob, opts)`**: constructs a DuckDB SQL query using `parquet_scan('...')`. The glob path is embedded directly in the SQL (DuckDB table functions don't support bind parameters for file paths); single quotes in the path are escaped as `''`.
+  - PK lookup uses plain `pk_values = ?` — no SHA2 index available in Parquet
+  - `changed_columns` filter uses DuckDB's `json_contains(changed_columns, ?)` with the JSON-encoded column name as the needle (e.g. `"status"`)
+  - `Limit: 0` means no LIMIT clause (used during merge fetches)
+- **S3 sources**: installs and loads the `httpfs` extension first (`INSTALL httpfs; LOAD httpfs;`)
+- Returns `[]query.ResultRow` — same type as `internal/query`, so results can be merged with live index results
+
+### query command: archive merge
+
+When `--archive-dir` or `--archive-s3` is given, `runQuery` fetches from both the live MySQL index and each archive source, then merges:
+- **`archiveSources()`**: returns non-empty archive source flags as a slice
+- **`mergeResults(rows, limit)`**: deduplicates by `event_id` (MySQL rows first → index version kept on collision), sorts by `(event_timestamp, event_id)`, applies `limit`
+- During fetch, `opts.Limit` is set to 0 so older archive events aren't truncated before the merge sort; the user's `--limit` is applied once after sorting
+- Archive query failures are logged as warnings and skipped (non-fatal), so a bad S3 connection doesn't block live results
+
 ### Recovery SQL generation
 - `recover` only generates SQL (`--dry-run` to stdout, `--output` to file) — it never executes against the source database. Application is always a manual step.
 - Events are reversed with `slices.Reverse(rows)` before generating SQL, so the most-recent event is undone first.
@@ -392,13 +416,15 @@ Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 | `cmd/bintrail-mcp` | 79% |
 | `internal/status` | 68% |
 | `cmd/bintrail` | 53% |
+| `internal/parquetquery` | ~80% (unit tests cover buildGlob, buildQuery; Fetch/scanRows require DuckDB) |
 | `internal/archive` | 0% |
 | **total** | **68%** |
 
 **Known gaps and why:**
-- `cmd/bintrail` `run*` handlers (53%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). `runStream`, `runInit`, `runSnapshot`, `runStatus` are included in this gap. Validation logic in `runQuery`/`runRecover`/`runRotate` is covered by unit tests in `query_test.go`, `recover_test.go`, `rotate_test.go`.
+- `cmd/bintrail` `run*` handlers (53%): cobra entry points are only exercised by the root `e2e_test.go` subprocess test, whose coverage lands in `GOCOVERDIR` (not `cover.out`). `runStream`, `runInit`, `runSnapshot`, `runStatus` are included in this gap. Validation logic in `runQuery`/`runRecover`/`runRotate` is covered by unit tests in `query_test.go`, `recover_test.go`, `rotate_test.go`. The `mergeResults`/`archiveSources` helpers in `query.go` and the `--archive-dir`/`--archive-s3` flags are not yet unit-tested.
 - `internal/status` `LoadIndexState`/`LoadPartitionStats` (0% in cover.out): called through the MCP/CLI handlers which run as subprocesses; `WriteStatus`/`DescriptionToHuman` are 100%.
 - `cmd/bintrail-mcp` (79%): `main()` stdio entry point is intentionally excluded — exercised by `TestMCPE2E` whose coverage lands in `GOCOVERDIR`.
+- `internal/parquetquery` (~80%): `buildGlob` and `buildQuery` are fully unit-tested; `Fetch` and `scanRows` require a DuckDB connection with actual Parquet files — not yet integration-tested.
 - `internal/archive` (0% in cover.out): `ArchivePartition` requires a live DB; it is exercised by `TestArchivePartition` in `cmd/bintrail/cmd_integration_test.go` (package main), so coverage lands in `cmd/bintrail`'s profile, not `internal/archive`. Unit tests in `archive_test.go` cover column definitions and write/read round-trips via `baseline.NewWriter` directly.
 
 ### Test infrastructure
@@ -430,6 +456,7 @@ Full suite (`go test -tags integration -coverprofile=cover.out ./... -count=1`):
 | `github.com/spf13/cobra` | CLI framework |
 | `github.com/modelcontextprotocol/go-sdk` | MCP server SDK (`cmd/bintrail-mcp` only) |
 | `github.com/prometheus/client_golang` | Prometheus metrics (`internal/observe`, `cmd/bintrail/stream.go`) |
+| `github.com/duckdb/duckdb-go/v2` | In-process DuckDB engine for querying Parquet archives (`internal/parquetquery`) |
 
 Transitive deps pulled in by go-mysql: shopspring/decimal, pingcap/errors, pingcap/tidb, google/uuid, klauspost/compress, zap, etc. These are indirect — don't import them directly.
 
