@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/parquet-go/parquet-go"
 
 	"github.com/bintrail/bintrail/internal/archive"
+	"github.com/bintrail/bintrail/internal/serverid"
 	"github.com/bintrail/bintrail/internal/status"
 	"github.com/bintrail/bintrail/internal/testutil"
 )
@@ -635,5 +637,177 @@ func TestArchivePartition_empty(t *testing.T) {
 	// File should still be created (valid empty Parquet).
 	if _, err := os.Stat(outPath); err != nil {
 		t.Fatalf("parquet file not created for empty partition: %v", err)
+	}
+}
+
+// ─── Server identity integration tests ───────────────────────────────────────
+
+// initServerTables creates bintrail_servers and bintrail_server_changes in db.
+func initServerTables(t *testing.T, db *sql.DB) {
+	t.Helper()
+	testutil.MustExec(t, db, ddlBintrailServers)
+	testutil.MustExec(t, db, ddlBintrailServerChanges)
+}
+
+// countChanges returns the number of rows in bintrail_server_changes for the given bintrail_id.
+func countChanges(t *testing.T, db *sql.DB, bintrailID string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM bintrail_server_changes WHERE bintrail_id = ?`, bintrailID).Scan(&n); err != nil {
+		t.Fatalf("countChanges: %v", err)
+	}
+	return n
+}
+
+// TestServerID_UUIDRegeneration verifies that when server_uuid changes but
+// host+port+username stay the same (Rule 3 — UUID regeneration), the same
+// bintrail_id is returned and the change is recorded in bintrail_server_changes.
+func TestServerID_UUIDRegeneration(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	initServerTables(t, db)
+	ctx := context.Background()
+
+	// First registration — brand new server.
+	id1, err := serverid.ResolveServer(ctx, db, "uuid-original", "db01", 3306, "bintrail")
+	if err != nil {
+		t.Fatalf("initial registration failed: %v", err)
+	}
+	if id1 == "" {
+		t.Fatal("expected non-empty bintrail_id")
+	}
+
+	// Simulate UUID regeneration: same host+port+user, new server_uuid.
+	id2, err := serverid.ResolveServer(ctx, db, "uuid-regenerated", "db01", 3306, "bintrail")
+	if err != nil {
+		t.Fatalf("uuid regen resolution failed: %v", err)
+	}
+	if id2 != id1 {
+		t.Errorf("bintrail_id changed after UUID regen: got %q, want %q", id2, id1)
+	}
+
+	// Verify the change was logged.
+	if n := countChanges(t, db, id1); n != 1 {
+		t.Errorf("expected 1 change row for uuid regen, got %d", n)
+	}
+
+	// Verify the stored server_uuid was updated.
+	var storedUUID string
+	if err := db.QueryRow(`SELECT server_uuid FROM bintrail_servers WHERE bintrail_id = ?`, id1).Scan(&storedUUID); err != nil {
+		t.Fatalf("query stored uuid: %v", err)
+	}
+	if storedUUID != "uuid-regenerated" {
+		t.Errorf("stored uuid not updated: got %q", storedUUID)
+	}
+}
+
+// TestServerID_HostMigration verifies that when server_uuid stays the same but
+// host changes (Rule 2 — migration), the same bintrail_id is returned and the
+// change is recorded.
+func TestServerID_HostMigration(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	initServerTables(t, db)
+	ctx := context.Background()
+
+	id1, err := serverid.ResolveServer(ctx, db, "uuid-stable", "db-old", 3306, "bintrail")
+	if err != nil {
+		t.Fatalf("initial registration: %v", err)
+	}
+
+	// Server migrated to a new host; UUID is unchanged.
+	id2, err := serverid.ResolveServer(ctx, db, "uuid-stable", "db-new", 3306, "bintrail")
+	if err != nil {
+		t.Fatalf("host migration resolution: %v", err)
+	}
+	if id2 != id1 {
+		t.Errorf("bintrail_id changed after host migration: got %q, want %q", id2, id1)
+	}
+	if n := countChanges(t, db, id1); n != 1 {
+		t.Errorf("expected 1 change row for host migration, got %d", n)
+	}
+
+	var storedHost string
+	if err := db.QueryRow(`SELECT host FROM bintrail_servers WHERE bintrail_id = ?`, id1).Scan(&storedHost); err != nil {
+		t.Fatalf("query stored host: %v", err)
+	}
+	if storedHost != "db-new" {
+		t.Errorf("stored host not updated: got %q", storedHost)
+	}
+}
+
+// TestServerID_CloneConflict verifies that when two servers share a server_uuid
+// (clone scenario) and host+port+user match a different record (Rule 5), an
+// ErrConflict is returned and no auto-resolution occurs.
+func TestServerID_CloneConflict(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	initServerTables(t, db)
+	ctx := context.Background()
+
+	// Register two distinct servers.
+	_, err := serverid.ResolveServer(ctx, db, "uuid-source", "db-source", 3306, "bintrail")
+	if err != nil {
+		t.Fatalf("register source server: %v", err)
+	}
+	_, err = serverid.ResolveServer(ctx, db, "uuid-clone", "db-clone", 3306, "bintrail")
+	if err != nil {
+		t.Fatalf("register clone server: %v", err)
+	}
+
+	// Now the clone presents the source's server_uuid (datadir was copied with auto.cnf).
+	// uuid-source matches db-source's record; db-clone matches the second record → conflict.
+	_, err = serverid.ResolveServer(ctx, db, "uuid-source", "db-clone", 3306, "bintrail")
+	if !errors.Is(err, serverid.ErrConflict) {
+		t.Errorf("expected ErrConflict for clone scenario, got: %v", err)
+	}
+}
+
+// TestServerID_Decommission verifies that a decommissioned server is excluded
+// from identity resolution and a new server on the same host+port gets a fresh
+// bintrail_id (Rule 4).
+func TestServerID_Decommission(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	initServerTables(t, db)
+	ctx := context.Background()
+
+	// Register and then decommission a server.
+	id1, err := serverid.ResolveServer(ctx, db, "uuid-old", "db01", 3306, "bintrail")
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := serverid.DecommissionServer(ctx, db, id1); err != nil {
+		t.Fatalf("decommission: %v", err)
+	}
+
+	// A new server initialised on the same host+port+user should get a new identity.
+	id2, err := serverid.ResolveServer(ctx, db, "uuid-new", "db01", 3306, "bintrail")
+	if err != nil {
+		t.Fatalf("register new server after decommission: %v", err)
+	}
+	if id2 == id1 {
+		t.Error("new server after decommission should have a different bintrail_id")
+	}
+	if id2 == "" {
+		t.Error("expected non-empty bintrail_id for new server")
+	}
+
+	// Verify the old record is still present with decommissioned_at set.
+	var decomAt sql.NullTime
+	if err := db.QueryRowContext(ctx,
+		`SELECT decommissioned_at FROM bintrail_servers WHERE bintrail_id = ?`, id1,
+	).Scan(&decomAt); err != nil {
+		t.Fatalf("query decommissioned_at: %v", err)
+	}
+	if !decomAt.Valid {
+		t.Error("expected decommissioned_at to be set for decommissioned server")
+	}
+
+	// Verify the new server record was persisted.
+	var stored string
+	if err := db.QueryRowContext(ctx,
+		`SELECT bintrail_id FROM bintrail_servers WHERE bintrail_id = ?`, id2,
+	).Scan(&stored); err != nil {
+		t.Fatalf("query new server record: %v", err)
+	}
+	if stored != id2 {
+		t.Errorf("expected bintrail_id %q stored, got %q", id2, stored)
 	}
 }

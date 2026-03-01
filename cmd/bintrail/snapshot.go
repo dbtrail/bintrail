@@ -1,13 +1,16 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/bintrail/bintrail/internal/config"
 	"github.com/bintrail/bintrail/internal/metadata"
+	"github.com/bintrail/bintrail/internal/serverid"
 )
 
 var snapshotCmd = &cobra.Command{
@@ -52,6 +55,17 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
 	defer indexDB.Close()
+
+	// Resolve server identity before doing any index work.
+	bintrailID, err := resolveServerIdentity(cmd.Context(), sourceDB, indexDB, snapshotSourceDSN)
+	if err != nil {
+		if errors.Is(err, serverid.ErrConflict) {
+			return fmt.Errorf("cannot snapshot: %w", err)
+		}
+		slog.Warn("server identity resolution failed; proceeding without bintrail_id", "error", err)
+	} else {
+		slog.Info("server identity resolved", "bintrail_id", bintrailID)
+	}
 
 	if len(schemas) > 0 {
 		fmt.Printf("Snapshotting schemas: %s\n", strings.Join(schemas, ", "))

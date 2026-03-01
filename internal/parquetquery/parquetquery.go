@@ -46,13 +46,14 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 }
 
 // buildGlob converts source (a directory path or S3 URL) to a glob pattern that
-// selects all Parquet archive files under that location.
+// selects all Parquet archive files under that location, including files nested
+// in Hive-partitioned subdirectories (e.g. event_date=2025-02-28/).
 func buildGlob(source string) string {
 	s := strings.TrimSuffix(source, "/")
 	if strings.HasSuffix(s, ".parquet") {
 		return source
 	}
-	return s + "/*.parquet"
+	return s + "/**/*.parquet"
 }
 
 // buildQuery constructs a DuckDB SQL query and its arguments for the given options.
