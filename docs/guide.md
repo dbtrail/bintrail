@@ -507,12 +507,13 @@ bintrail rotate \
 
 ```bash
 bintrail baseline \
-  --input    /path/to/mydumper-output \
-  --output   /tmp/baselines \
-  --upload   s3://bintrail-audit-baselines/baselines/
+  --input         /path/to/mydumper-output \
+  --output        /tmp/baselines \
+  --upload        s3://bintrail-audit-baselines/baselines/ \
+  --upload-region us-east-1
 ```
 
-`--upload` writes Parquet files to `--output` first, then uploads every file to S3 preserving the relative directory structure (`timestamp/database/table.parquet`). Uses the standard AWS credential chain — environment variables, `~/.aws/credentials`, or EC2/ECS instance metadata.
+`--upload` writes Parquet files to `--output` first, then uploads every file to S3 preserving the relative directory structure (`timestamp/database/table.parquet`). Uses the standard AWS credential chain — environment variables, `~/.aws/credentials`, or EC2/ECS instance metadata. `--upload-region` is optional if `AWS_REGION` is already set in your environment or `~/.aws/config`.
 
 **Option 2 — Generate locally, upload separately with the AWS CLI:**
 
