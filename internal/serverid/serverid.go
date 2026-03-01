@@ -23,7 +23,7 @@ type Server struct {
 	BintrailID string
 	ServerUUID string
 	Host       string
-	Port       uint
+	Port       uint16
 	Username   string
 }
 
@@ -48,7 +48,7 @@ const (
 //  3. host+port+user match one record, UUID differs → UUID regeneration (update UUID)
 //  4. No record matches either criterion → new server
 //  5. UUID matches one record AND host+port+user match a DIFFERENT record → conflict
-func resolveIdentity(servers []Server, serverUUID, host string, port uint, username string) (*Server, resolution) {
+func resolveIdentity(servers []Server, serverUUID, host string, port uint16, username string) (*Server, resolution) {
 	var uuidMatch *Server
 	var hpuMatch *Server
 	for i := range servers {
@@ -80,12 +80,21 @@ func resolveIdentity(servers []Server, serverUUID, host string, port uint, usern
 	}
 }
 
-// loadActiveServers fetches all non-decommissioned server records from the index DB.
-func loadActiveServers(ctx context.Context, db *sql.DB) ([]Server, error) {
-	rows, err := db.QueryContext(ctx,
+// loadCandidatesForUpdate fetches active server records that match either the
+// server_uuid or the host+port+username, locking them for update to prevent
+// concurrent registrations from producing duplicate active entries.
+//
+// The SELECT ... FOR UPDATE + InnoDB gap locks ensure that no other transaction
+// can insert a matching row between the SELECT and the subsequent INSERT/UPDATE
+// in this transaction.
+func loadCandidatesForUpdate(ctx context.Context, tx *sql.Tx, serverUUID, host string, port uint16, username string) ([]Server, error) {
+	rows, err := tx.QueryContext(ctx,
 		`SELECT bintrail_id, server_uuid, host, port, username
 		 FROM bintrail_servers
-		 WHERE decommissioned_at IS NULL`)
+		 WHERE (server_uuid = ? OR (host = ? AND port = ? AND username = ?))
+		   AND decommissioned_at IS NULL
+		 FOR UPDATE`,
+		serverUUID, host, port, username)
 	if err != nil {
 		return nil, err
 	}
@@ -103,8 +112,8 @@ func loadActiveServers(ctx context.Context, db *sql.DB) ([]Server, error) {
 }
 
 // logChange inserts a row into bintrail_server_changes to audit an identity component change.
-func logChange(ctx context.Context, db *sql.DB, bintrailID, field, oldVal, newVal string) error {
-	_, err := db.ExecContext(ctx,
+func logChange(ctx context.Context, tx *sql.Tx, bintrailID, field, oldVal, newVal string) error {
+	_, err := tx.ExecContext(ctx,
 		`INSERT INTO bintrail_server_changes (bintrail_id, field_changed, old_value, new_value)
 		 VALUES (?, ?, ?, ?)`,
 		bintrailID, field, oldVal, newVal)
@@ -112,17 +121,35 @@ func logChange(ctx context.Context, db *sql.DB, bintrailID, field, oldVal, newVa
 }
 
 // ResolveServer looks up or registers a server in bintrail_servers, returning its
-// stable bintrail_id. It applies the five-rule identity resolution algorithm,
-// updates changed fields in bintrail_servers, and records each change in
-// bintrail_server_changes (append-only audit trail).
+// stable bintrail_id. It runs inside a transaction with SELECT ... FOR UPDATE to
+// prevent concurrent callers from creating duplicate active entries for the same
+// server. Any detected component changes are recorded in bintrail_server_changes.
 //
 // Returns ErrConflict if server_uuid and host+port+username match two different
 // active records (cloned-server situation). The caller should log a warning and
 // refuse to operate until the conflict is resolved manually.
-func ResolveServer(ctx context.Context, db *sql.DB, serverUUID, host string, port uint, username string) (string, error) {
-	servers, err := loadActiveServers(ctx, db)
+func ResolveServer(ctx context.Context, db *sql.DB, serverUUID, host string, port uint16, username string) (string, error) {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", fmt.Errorf("load active servers: %w", err)
+		return "", fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	id, err := resolveInTx(ctx, tx, serverUUID, host, port, username)
+	if err != nil {
+		return "", err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit: %w", err)
+	}
+	return id, nil
+}
+
+func resolveInTx(ctx context.Context, tx *sql.Tx, serverUUID, host string, port uint16, username string) (string, error) {
+	servers, err := loadCandidatesForUpdate(ctx, tx, serverUUID, host, port, username)
+	if err != nil {
+		return "", fmt.Errorf("load candidates: %w", err)
 	}
 
 	matched, rule := resolveIdentity(servers, serverUUID, host, port, username)
@@ -132,7 +159,6 @@ func ResolveServer(ctx context.Context, db *sql.DB, serverUUID, host string, por
 		return matched.BintrailID, nil
 
 	case resConflict:
-		// Locate both conflicting records to include them in the error message.
 		var uuidMatch, hpuMatch *Server
 		for i := range servers {
 			s := &servers[i]
@@ -147,24 +173,23 @@ func ResolveServer(ctx context.Context, db *sql.DB, serverUUID, host string, por
 			ErrConflict, serverUUID, uuidMatch.BintrailID, host, port, username, hpuMatch.BintrailID)
 
 	case resMigration:
-		// Rule 2: UUID matched — update whichever of host/port/username changed.
 		id := matched.BintrailID
 		if matched.Host != host {
-			if err := logChange(ctx, db, id, "host", matched.Host, host); err != nil {
+			if err := logChange(ctx, tx, id, "host", matched.Host, host); err != nil {
 				return "", fmt.Errorf("log host change: %w", err)
 			}
 		}
 		if matched.Port != port {
-			if err := logChange(ctx, db, id, "port", fmt.Sprint(matched.Port), fmt.Sprint(port)); err != nil {
+			if err := logChange(ctx, tx, id, "port", fmt.Sprint(matched.Port), fmt.Sprint(port)); err != nil {
 				return "", fmt.Errorf("log port change: %w", err)
 			}
 		}
 		if matched.Username != username {
-			if err := logChange(ctx, db, id, "username", matched.Username, username); err != nil {
+			if err := logChange(ctx, tx, id, "username", matched.Username, username); err != nil {
 				return "", fmt.Errorf("log username change: %w", err)
 			}
 		}
-		if _, err := db.ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`UPDATE bintrail_servers SET host = ?, port = ?, username = ?, updated_at = UTC_TIMESTAMP()
 			 WHERE bintrail_id = ?`,
 			host, port, username, id); err != nil {
@@ -173,12 +198,11 @@ func ResolveServer(ctx context.Context, db *sql.DB, serverUUID, host string, por
 		return id, nil
 
 	case resUUIDRegen:
-		// Rule 3: host+port+user matched — update the server_uuid.
 		id := matched.BintrailID
-		if err := logChange(ctx, db, id, "server_uuid", matched.ServerUUID, serverUUID); err != nil {
+		if err := logChange(ctx, tx, id, "server_uuid", matched.ServerUUID, serverUUID); err != nil {
 			return "", fmt.Errorf("log uuid change: %w", err)
 		}
-		if _, err := db.ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`UPDATE bintrail_servers SET server_uuid = ?, updated_at = UTC_TIMESTAMP()
 			 WHERE bintrail_id = ?`,
 			serverUUID, id); err != nil {
@@ -187,9 +211,8 @@ func ResolveServer(ctx context.Context, db *sql.DB, serverUUID, host string, por
 		return id, nil
 
 	default: // resNew
-		// Rule 4: no match — generate a new stable identity.
 		id := uuid.NewString()
-		if _, err := db.ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO bintrail_servers (bintrail_id, server_uuid, host, port, username)
 			 VALUES (?, ?, ?, ?, ?)`,
 			id, serverUUID, host, port, username); err != nil {

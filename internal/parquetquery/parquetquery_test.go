@@ -55,6 +55,15 @@ func TestBuildQueryNoFilters(t *testing.T) {
 	}
 }
 
+// TestBuildQueryViaGlob verifies the full buildGlob→buildQuery pipeline: a
+// Hive-partitioned source path should produce SQL with the recursive
+// /**/*.parquet glob, not the old flat /*.parquet pattern.
+func TestBuildQueryViaGlob(t *testing.T) {
+	glob := buildGlob("/archives/bintrail_id=abc-123")
+	q, _ := buildQuery(glob, query.Options{Limit: 50})
+	assertContains(t, q, "/archives/bintrail_id=abc-123/**/*.parquet")
+}
+
 func TestBuildQuerySchemaTable(t *testing.T) {
 	opts := query.Options{Schema: "mydb", Table: "orders", Limit: 10}
 	q, args := buildQuery("/arc/*.parquet", opts)

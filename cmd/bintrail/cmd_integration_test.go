@@ -788,4 +788,26 @@ func TestServerID_Decommission(t *testing.T) {
 	if id2 == "" {
 		t.Error("expected non-empty bintrail_id for new server")
 	}
+
+	// Verify the old record is still present with decommissioned_at set.
+	var decomAt sql.NullTime
+	if err := db.QueryRowContext(ctx,
+		`SELECT decommissioned_at FROM bintrail_servers WHERE bintrail_id = ?`, id1,
+	).Scan(&decomAt); err != nil {
+		t.Fatalf("query decommissioned_at: %v", err)
+	}
+	if !decomAt.Valid {
+		t.Error("expected decommissioned_at to be set for decommissioned server")
+	}
+
+	// Verify the new server record was persisted.
+	var stored string
+	if err := db.QueryRowContext(ctx,
+		`SELECT bintrail_id FROM bintrail_servers WHERE bintrail_id = ?`, id2,
+	).Scan(&stored); err != nil {
+		t.Fatalf("query new server record: %v", err)
+	}
+	if stored != id2 {
+		t.Errorf("expected bintrail_id %q stored, got %q", id2, stored)
+	}
 }

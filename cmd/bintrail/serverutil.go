@@ -20,5 +20,5 @@ func resolveServerIdentity(ctx context.Context, sourceDB, indexDB *sql.DB, sourc
 	if err != nil {
 		return "", err
 	}
-	return serverid.ResolveServer(ctx, indexDB, serverUUID, host, uint(port), user)
+	return serverid.ResolveServer(ctx, indexDB, serverUUID, host, port, user)
 }

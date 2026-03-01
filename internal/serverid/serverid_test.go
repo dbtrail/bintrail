@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-func makeServer(bintrailID, serverUUID, host string, port uint, username string) Server {
+func makeServer(bintrailID, serverUUID, host string, port uint16, username string) Server {
 	return Server{
 		BintrailID: bintrailID,
 		ServerUUID: serverUUID,
