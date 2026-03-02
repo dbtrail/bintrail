@@ -83,7 +83,7 @@ func init() {
 	rotateCmd.Flags().BoolVar(&rotDaemon, "daemon", false, "Run continuously, repeating rotation on the --interval schedule until SIGINT/SIGTERM")
 	rotateCmd.Flags().StringVar(&rotInterval, "interval", "1h", "How often to run rotation in daemon mode (e.g. 1h, 30m)")
 	rotateCmd.Flags().StringVar(&rotFormat, "format", "text", "Output format: text or json")
-	rotateCmd.Flags().BoolVar(&rotRetry, "retry", false, "Skip archiving partitions whose Parquet file already exists")
+	rotateCmd.Flags().BoolVar(&rotRetry, "retry", false, "Skip archiving partitions whose Parquet file already exists and S3 uploads that already succeeded")
 	_ = rotateCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(rotateCmd)
@@ -281,6 +281,22 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					}
 
 					if s3Client != nil {
+						// When retrying, skip partitions already uploaded to S3.
+						if rotRetry {
+							var uploadedAt sql.NullTime
+							if err := db.QueryRowContext(ctx,
+								`SELECT s3_uploaded_at FROM archive_state
+								WHERE partition_name = ? AND bintrail_id = ?`,
+								name, rotBintrailID,
+							).Scan(&uploadedAt); err == nil && uploadedAt.Valid {
+								slog.Info("skipping existing S3 upload (--retry)", "partition", name)
+								if rotFormat != "json" {
+									fmt.Fprintf(os.Stdout, "skipped S3 upload for %s (already uploaded)\n", name)
+								}
+								continue
+							}
+						}
+
 						key, err := buildS3Key(rotArchiveDir, outPath, s3Prefix)
 						if err != nil {
 							return 0, 0, fmt.Errorf("build S3 key for %s: %w", name, err)
