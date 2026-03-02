@@ -175,3 +175,21 @@ func TestIsValidFormat_invalid(t *testing.T) {
 		}
 	}
 }
+
+// ─── IsValidOutputFormat ─────────────────────────────────────────────────────
+
+func TestIsValidOutputFormat_valid(t *testing.T) {
+	for _, f := range []string{"text", "json", "TEXT", "Json", "JSON"} {
+		if !IsValidOutputFormat(f) {
+			t.Errorf("IsValidOutputFormat(%q) = false, want true", f)
+		}
+	}
+}
+
+func TestIsValidOutputFormat_invalid(t *testing.T) {
+	for _, f := range []string{"table", "csv", "", "xml", "yaml"} {
+		if IsValidOutputFormat(f) {
+			t.Errorf("IsValidOutputFormat(%q) = true, want false", f)
+		}
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/bintrail/bintrail/internal/baseline"
+	"github.com/bintrail/bintrail/internal/cliutil"
 )
 
 var baselineCmd = &cobra.Command{
@@ -42,6 +43,7 @@ var (
 	bslRowGroupSize int
 	bslUpload       string
 	bslUploadRegion string
+	bslFormat       string
 )
 
 func init() {
@@ -53,6 +55,7 @@ func init() {
 	baselineCmd.Flags().IntVar(&bslRowGroupSize, "row-group-size", 500_000, "Rows per Parquet row group")
 	baselineCmd.Flags().StringVar(&bslUpload, "upload", "", "S3 destination URL to upload Parquet files after generation (e.g. s3://my-bucket/baselines/)")
 	baselineCmd.Flags().StringVar(&bslUploadRegion, "upload-region", "", "AWS region for --upload (default: from AWS_REGION env var or ~/.aws/config)")
+	baselineCmd.Flags().StringVar(&bslFormat, "format", "text", "Output format: text or json")
 	_ = baselineCmd.MarkFlagRequired("input")
 	_ = baselineCmd.MarkFlagRequired("output")
 
@@ -60,6 +63,9 @@ func init() {
 }
 
 func runBaseline(cmd *cobra.Command, args []string) error {
+	if !cliutil.IsValidOutputFormat(bslFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", bslFormat)
+	}
 	if err := baseline.ValidateCodec(bslCompression); err != nil {
 		return fmt.Errorf("--compression: %w", err)
 	}
@@ -94,24 +100,47 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Baseline complete.\n")
-	fmt.Printf("  tables    : %d\n", stats.TablesProcessed)
-	fmt.Printf("  rows      : %d\n", stats.RowsWritten)
-	fmt.Printf("  files     : %d\n", stats.FilesWritten)
 	slog.Info("baseline complete",
 		"tables", stats.TablesProcessed,
 		"rows_written", stats.RowsWritten,
 		"files_written", stats.FilesWritten)
 
+	var uploaded int
 	if bslUpload != "" {
-		uploaded, err := uploadBaselineToS3(cmd.Context(), bslOutput, bslUpload, bslUploadRegion)
+		var err error
+		uploaded, err = uploadBaselineToS3(cmd.Context(), bslOutput, bslUpload, bslUploadRegion)
 		if err != nil {
 			return fmt.Errorf("S3 upload: %w", err)
 		}
-		fmt.Printf("  uploaded  : %d files → %s\n", uploaded, bslUpload)
+		if bslFormat != "json" {
+			fmt.Printf("  uploaded  : %d files → %s\n", uploaded, bslUpload)
+		}
 		slog.Info("baseline S3 upload complete", "files", uploaded, "destination", bslUpload)
 	}
 
+	if bslFormat == "json" {
+		result := struct {
+			Tables       int    `json:"tables"`
+			RowsWritten  int64  `json:"rows_written"`
+			FilesWritten int    `json:"files_written"`
+			Uploaded     int    `json:"uploaded,omitempty"`
+			UploadDest   string `json:"upload_destination,omitempty"`
+		}{
+			Tables:       stats.TablesProcessed,
+			RowsWritten:  stats.RowsWritten,
+			FilesWritten: stats.FilesWritten,
+		}
+		if bslUpload != "" {
+			result.Uploaded = uploaded
+			result.UploadDest = bslUpload
+		}
+		return outputJSON(result)
+	}
+
+	fmt.Printf("Baseline complete.\n")
+	fmt.Printf("  tables    : %d\n", stats.TablesProcessed)
+	fmt.Printf("  rows      : %d\n", stats.RowsWritten)
+	fmt.Printf("  files     : %d\n", stats.FilesWritten)
 	return nil
 }
 

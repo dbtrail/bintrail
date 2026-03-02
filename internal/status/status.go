@@ -5,6 +5,7 @@ package status
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
@@ -192,4 +193,66 @@ func Truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// WriteStatusJSON writes the status data as a JSON object to w.
+func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat) error {
+	type jsonFile struct {
+		BinlogFile    string  `json:"binlog_file"`
+		Status        string  `json:"status"`
+		EventsIndexed int64   `json:"events_indexed"`
+		FileSize      int64   `json:"file_size"`
+		LastPosition  int64   `json:"last_position"`
+		StartedAt     string  `json:"started_at"`
+		CompletedAt   *string `json:"completed_at"`
+		BintrailID    *string `json:"bintrail_id"`
+		ErrorMessage  *string `json:"error_message"`
+	}
+	type jsonPartition struct {
+		Name      string `json:"name"`
+		LessThan  string `json:"less_than"`
+		TableRows int64  `json:"table_rows"`
+	}
+	type jsonSummary struct {
+		Files  []jsonFile      `json:"files"`
+		Parts  []jsonPartition `json:"partitions"`
+		Total  int64           `json:"total_events_estimate"`
+	}
+
+	jf := make([]jsonFile, len(files))
+	for i, f := range files {
+		jf[i] = jsonFile{
+			BinlogFile:    f.BinlogFile,
+			Status:        f.Status,
+			EventsIndexed: f.EventsIndexed,
+			FileSize:      f.FileSize,
+			LastPosition:  f.LastPosition,
+			StartedAt:     f.StartedAt.Format(TSFmt),
+		}
+		if f.CompletedAt.Valid {
+			s := f.CompletedAt.Time.Format(TSFmt)
+			jf[i].CompletedAt = &s
+		}
+		if f.BintrailID.Valid && f.BintrailID.String != "" {
+			jf[i].BintrailID = &f.BintrailID.String
+		}
+		if f.ErrorMessage.Valid && f.ErrorMessage.String != "" {
+			jf[i].ErrorMessage = &f.ErrorMessage.String
+		}
+	}
+
+	jp := make([]jsonPartition, len(parts))
+	var total int64
+	for i, p := range parts {
+		jp[i] = jsonPartition{
+			Name:      p.Name,
+			LessThan:  DescriptionToHuman(p.Description),
+			TableRows: p.TableRows,
+		}
+		total += p.TableRows
+	}
+
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(jsonSummary{Files: jf, Parts: jp, Total: total})
 }

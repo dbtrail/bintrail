@@ -7,6 +7,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
 	"github.com/bintrail/bintrail/internal/status"
 )
@@ -27,16 +28,24 @@ Example:
 	RunE: runStatus,
 }
 
-var stIndexDSN string
+var (
+	stIndexDSN string
+	stFormat   string
+)
 
 func init() {
 	statusCmd.Flags().StringVar(&stIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
+	statusCmd.Flags().StringVar(&stFormat, "format", "text", "Output format: text or json")
 	_ = statusCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(statusCmd)
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
+	if !cliutil.IsValidOutputFormat(stFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", stFormat)
+	}
+
 	cfg, err := mysql.ParseDSN(stIndexDSN)
 	if err != nil {
 		return fmt.Errorf("invalid --index-dsn: %w", err)
@@ -64,6 +73,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load partition info: %w", err)
 	}
 
+	if stFormat == "json" {
+		return status.WriteStatusJSON(os.Stdout, files, partStats)
+	}
 	status.WriteStatus(os.Stdout, files, partStats)
 	return nil
 }

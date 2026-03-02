@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
 	"github.com/bintrail/bintrail/internal/indexer"
 	"github.com/bintrail/bintrail/internal/metadata"
@@ -41,6 +42,7 @@ var (
 	idxBatchSize int
 	idxSchemas   string
 	idxTables    string
+	idxFormat    string
 )
 
 func init() {
@@ -52,6 +54,7 @@ func init() {
 	indexCmd.Flags().IntVar(&idxBatchSize, "batch-size", 1000, "Events per batch INSERT")
 	indexCmd.Flags().StringVar(&idxSchemas, "schemas", "", "Only index events from these schemas (comma-separated)")
 	indexCmd.Flags().StringVar(&idxTables, "tables", "", "Only index these tables (comma-separated, e.g. mydb.orders,mydb.items)")
+	indexCmd.Flags().StringVar(&idxFormat, "format", "text", "Output format: text or json")
 	_ = indexCmd.MarkFlagRequired("index-dsn")
 	_ = indexCmd.MarkFlagRequired("binlog-dir")
 
@@ -59,6 +62,9 @@ func init() {
 }
 
 func runIndex(cmd *cobra.Command, args []string) error {
+	if !cliutil.IsValidOutputFormat(idxFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", idxFormat)
+	}
 	if !idxAll && idxFiles == "" {
 		return fmt.Errorf("either --files or --all must be specified")
 	}
@@ -145,8 +151,19 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("\nTotal events indexed: %d\n", totalEvents)
 	slog.Info("indexing complete", "files_processed", len(files), "events_indexed", totalEvents)
+
+	if idxFormat == "json" {
+		return outputJSON(struct {
+			FilesProcessed int   `json:"files_processed"`
+			EventsIndexed  int64 `json:"events_indexed"`
+		}{
+			FilesProcessed: len(files),
+			EventsIndexed:  totalEvents,
+		})
+	}
+
+	fmt.Printf("\nTotal events indexed: %d\n", totalEvents)
 	return nil
 }
 

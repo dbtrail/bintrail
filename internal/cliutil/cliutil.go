@@ -59,10 +59,20 @@ func ParseTime(s string) (*time.Time, error) {
 	return nil, fmt.Errorf("invalid time %q; expected YYYY-MM-DD HH:MM:SS, RFC 3339, or YYYY-MM-DD", s)
 }
 
-// IsValidFormat reports whether s is a supported output format (table, json, or csv).
+// IsValidFormat reports whether s is a supported query output format (table, json, or csv).
 func IsValidFormat(s string) bool {
 	switch strings.ToLower(s) {
 	case "table", "json", "csv":
+		return true
+	}
+	return false
+}
+
+// IsValidOutputFormat reports whether s is a supported general output format (text or json).
+// Used by commands other than query (init, snapshot, index, status, recover, etc.).
+func IsValidOutputFormat(s string) bool {
+	switch strings.ToLower(s) {
+	case "text", "json":
 		return true
 	}
 	return false

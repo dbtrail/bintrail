@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"log/slog"
 	"os"
@@ -60,6 +61,7 @@ var (
 	rDryRun    bool
 	rLimit     int
 	rProfile   string
+	rFormat    string
 )
 
 func init() {
@@ -76,6 +78,7 @@ func init() {
 	recoverCmd.Flags().BoolVar(&rDryRun, "dry-run", false, "Print recovery SQL to stdout instead of writing a file")
 	recoverCmd.Flags().IntVar(&rLimit, "limit", 1000, "Maximum number of events to reverse")
 	recoverCmd.Flags().StringVar(&rProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
+	recoverCmd.Flags().StringVar(&rFormat, "format", "text", "Output format: text or json")
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(recoverCmd)
@@ -84,6 +87,9 @@ func init() {
 func runRecover(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 	// ── Validate flags ────────────────────────────────────────────────────────
+	if !cliutil.IsValidOutputFormat(rFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", rFormat)
+	}
 	if !rDryRun && rOutput == "" {
 		return fmt.Errorf("one of --output or --dry-run is required")
 	}
@@ -147,6 +153,23 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	gen := recovery.New(db, resolver)
 
 	if rDryRun {
+		if rFormat == "json" {
+			// Capture SQL into a buffer for JSON output.
+			var buf bytes.Buffer
+			n, err := gen.GenerateSQL(cmd.Context(), opts, &buf)
+			if err != nil {
+				return err
+			}
+			slog.Info("recovery SQL generated",
+				"statements", n, "dry_run", true,
+				"duration_ms", time.Since(start).Milliseconds())
+			return outputJSON(struct {
+				Statements int    `json:"statements"`
+				DryRun     bool   `json:"dry_run"`
+				SQL        string `json:"sql"`
+			}{Statements: n, DryRun: true, SQL: buf.String()})
+		}
+
 		n, err := gen.GenerateSQL(cmd.Context(), opts, os.Stdout)
 		if err != nil {
 			return err
@@ -179,6 +202,15 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	slog.Info("recovery SQL generated",
 		"statements", n, "dry_run", false, "output", rOutput,
 		"duration_ms", time.Since(start).Milliseconds())
+
+	if rFormat == "json" {
+		return outputJSON(struct {
+			Statements int    `json:"statements"`
+			DryRun     bool   `json:"dry_run"`
+			Output     string `json:"output"`
+		}{Statements: n, DryRun: false, Output: rOutput})
+	}
+
 	if n == 0 {
 		fmt.Fprintln(os.Stderr, "No events matched the specified criteria.")
 	} else {

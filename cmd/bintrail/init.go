@@ -16,6 +16,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/serverid"
 )
 
@@ -34,6 +35,7 @@ var (
 	initS3Bucket   string
 	initS3Region   string
 	initS3ARN      string
+	initFormat     string
 )
 
 func init() {
@@ -43,12 +45,16 @@ func init() {
 	initCmd.Flags().StringVar(&initS3Bucket, "s3-bucket", "", "S3 bucket name to create for archiving (optional; mutually exclusive with --s3-arn)")
 	initCmd.Flags().StringVar(&initS3Region, "s3-region", "us-east-1", "AWS region for the S3 bucket (required with --s3-bucket; ignored with --s3-arn since the SDK resolves the bucket region automatically)")
 	initCmd.Flags().StringVar(&initS3ARN, "s3-arn", "", "ARN of an existing S3 bucket to use for archiving (optional; mutually exclusive with --s3-bucket)")
+	initCmd.Flags().StringVar(&initFormat, "format", "text", "Output format: text or json")
 	_ = initCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(initCmd)
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
+	if !cliutil.IsValidOutputFormat(initFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", initFormat)
+	}
 	if initS3Bucket != "" && initS3ARN != "" {
 		return fmt.Errorf("--s3-bucket and --s3-arn are mutually exclusive: use --s3-bucket to create a new bucket, or --s3-arn to use an existing one")
 	}
@@ -92,11 +98,20 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to connect to index database %q: %w", dbName, err)
 	}
 
+	// Track created tables for JSON output.
+	var tablesCreated []string
+	logTable := func(name string) {
+		tablesCreated = append(tablesCreated, name)
+		if initFormat != "json" {
+			fmt.Printf("  \u2713 %s\n", name)
+		}
+	}
+
 	// Create binlog_events with dynamic hourly partitions.
 	if err := createBinlogEventsTable(db, initPartitions, initEncrypt); err != nil {
 		return fmt.Errorf("failed to create binlog_events: %w", err)
 	}
-	fmt.Println("  \u2713 binlog_events")
+	logTable("binlog_events")
 
 	// If --encrypt was requested, verify that the table actually has encryption
 	// enabled. CREATE TABLE IF NOT EXISTS is a no-op when the table already
@@ -109,69 +124,101 @@ func runInit(cmd *cobra.Command, args []string) error {
 			 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'binlog_events'`)
 		if err := row.Scan(&createOpts); err == nil &&
 			!strings.Contains(strings.ToUpper(createOpts), "ENCRYPTION=Y") {
-			fmt.Fprintf(os.Stderr, "Warning: binlog_events already exists without encryption.\n"+
-				"To encrypt it, run: ALTER TABLE binlog_events ENCRYPTION='Y'\n")
+			if initFormat != "json" {
+				fmt.Fprintf(os.Stderr, "Warning: binlog_events already exists without encryption.\n"+
+					"To encrypt it, run: ALTER TABLE binlog_events ENCRYPTION='Y'\n")
+			}
 		}
 	}
 
 	if _, err := db.Exec(ddlSchemaSnapshots); err != nil {
 		return fmt.Errorf("failed to create schema_snapshots: %w", err)
 	}
-	fmt.Println("  \u2713 schema_snapshots")
+	logTable("schema_snapshots")
 
 	if _, err := db.Exec(ddlIndexState); err != nil {
 		return fmt.Errorf("failed to create index_state: %w", err)
 	}
-	fmt.Println("  \u2713 index_state")
+	logTable("index_state")
 
 	if _, err := db.Exec(ddlStreamState); err != nil {
 		return fmt.Errorf("failed to create stream_state: %w", err)
 	}
-	fmt.Println("  \u2713 stream_state")
+	logTable("stream_state")
 
 	if _, err := db.Exec(ddlBintrailServers); err != nil {
 		return fmt.Errorf("failed to create bintrail_servers: %w", err)
 	}
-	fmt.Println("  \u2713 bintrail_servers")
+	logTable("bintrail_servers")
 
 	if _, err := db.Exec(ddlBintrailServerChanges); err != nil {
 		return fmt.Errorf("failed to create bintrail_server_changes: %w", err)
 	}
-	fmt.Println("  \u2713 bintrail_server_changes")
+	logTable("bintrail_server_changes")
 
 	if _, err := db.Exec(ddlTableFlags); err != nil {
 		return fmt.Errorf("failed to create table_flags: %w", err)
 	}
-	fmt.Println("  \u2713 table_flags")
+	logTable("table_flags")
 
 	if _, err := db.Exec(ddlProfiles); err != nil {
 		return fmt.Errorf("failed to create profiles: %w", err)
 	}
-	fmt.Println("  \u2713 profiles")
+	logTable("profiles")
 
 	if _, err := db.Exec(ddlAccessRules); err != nil {
 		return fmt.Errorf("failed to create access_rules: %w", err)
 	}
-	fmt.Println("  \u2713 access_rules")
+	logTable("access_rules")
 
+	var s3Result *string
 	if initS3Bucket != "" {
-		fmt.Printf("\nSetting up S3 bucket...\n")
+		if initFormat != "json" {
+			fmt.Printf("\nSetting up S3 bucket...\n")
+		}
 		if err := setupS3Bucket(cmd.Context(), initS3Bucket, initS3Region); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not create S3 bucket %q: %v\n\n", initS3Bucket, err)
-			fmt.Fprint(os.Stderr, s3Instructions(initS3Bucket, initS3Region))
+			if initFormat != "json" {
+				fmt.Fprintf(os.Stderr, "Warning: could not create S3 bucket %q: %v\n\n", initS3Bucket, err)
+				fmt.Fprint(os.Stderr, s3Instructions(initS3Bucket, initS3Region))
+			}
 		} else {
-			fmt.Printf("  \u2713 S3 bucket: %s (region: %s)\n", initS3Bucket, initS3Region)
+			s := fmt.Sprintf("%s (region: %s)", initS3Bucket, initS3Region)
+			s3Result = &s
+			if initFormat != "json" {
+				fmt.Printf("  \u2713 S3 bucket: %s\n", s)
+			}
 		}
 	}
 
 	if initS3ARN != "" {
-		fmt.Printf("\nVerifying existing S3 bucket...\n")
-		if err := verifyS3Bucket(cmd.Context(), s3ARNBucket, initS3Region); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not verify S3 bucket %q: %v\n\n", s3ARNBucket, err)
-			fmt.Fprint(os.Stderr, s3IAMInstructions(s3ARNBucket, s3ARNPartition))
-		} else {
-			fmt.Printf("  \u2713 S3 bucket: %s (ARN: %s)\n", s3ARNBucket, initS3ARN)
+		if initFormat != "json" {
+			fmt.Printf("\nVerifying existing S3 bucket...\n")
 		}
+		if err := verifyS3Bucket(cmd.Context(), s3ARNBucket, initS3Region); err != nil {
+			if initFormat != "json" {
+				fmt.Fprintf(os.Stderr, "Warning: could not verify S3 bucket %q: %v\n\n", s3ARNBucket, err)
+				fmt.Fprint(os.Stderr, s3IAMInstructions(s3ARNBucket, s3ARNPartition))
+			}
+		} else {
+			s := fmt.Sprintf("%s (ARN: %s)", s3ARNBucket, initS3ARN)
+			s3Result = &s
+			if initFormat != "json" {
+				fmt.Printf("  \u2713 S3 bucket: %s\n", s)
+			}
+		}
+	}
+
+	if initFormat == "json" {
+		result := struct {
+			Database      string   `json:"database"`
+			TablesCreated []string `json:"tables_created"`
+			S3Bucket      *string  `json:"s3_bucket,omitempty"`
+		}{
+			Database:      dbName,
+			TablesCreated: tablesCreated,
+			S3Bucket:      s3Result,
+		}
+		return outputJSON(result)
 	}
 
 	fmt.Printf("\nInitialization complete. Index database: %s\n", dbName)
