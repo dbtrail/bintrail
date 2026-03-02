@@ -230,6 +230,20 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		UNIQUE KEY idx_profile_flag (profile_id, flag),
 		CONSTRAINT fk_access_rules_profile FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE
 	) ENGINE=InnoDB`)
+
+	MustExec(t, db, `CREATE TABLE IF NOT EXISTS archive_state (
+		id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+		partition_name  VARCHAR(20) NOT NULL,
+		bintrail_id     VARCHAR(36),
+		local_path      VARCHAR(1024),
+		file_size_bytes BIGINT UNSIGNED,
+		row_count       BIGINT UNSIGNED,
+		s3_bucket       VARCHAR(255),
+		s3_key          VARCHAR(1024),
+		s3_uploaded_at  DATETIME,
+		archived_at     DATETIME NOT NULL DEFAULT UTC_TIMESTAMP(),
+		UNIQUE KEY uq_partition (partition_name, bintrail_id)
+	) ENGINE=InnoDB`)
 }
 
 // InsertEvent inserts a single event into binlog_events using raw SQL.
