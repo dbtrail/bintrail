@@ -303,7 +303,8 @@ func statusTool(ctx context.Context, req *mcp.CallToolRequest, args statusArgs) 
 	}
 
 	var buf bytes.Buffer
-	status.WriteStatus(&buf, files, parts)
+	// Archive stats omitted for now — can be added in a follow-up.
+	status.WriteStatus(&buf, files, parts, nil)
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
