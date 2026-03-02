@@ -67,6 +67,7 @@ var (
 	rotDaemon             bool
 	rotInterval           string
 	rotFormat             string
+	rotRetry              bool
 )
 
 func init() {
@@ -82,6 +83,7 @@ func init() {
 	rotateCmd.Flags().BoolVar(&rotDaemon, "daemon", false, "Run continuously, repeating rotation on the --interval schedule until SIGINT/SIGTERM")
 	rotateCmd.Flags().StringVar(&rotInterval, "interval", "1h", "How often to run rotation in daemon mode (e.g. 1h, 30m)")
 	rotateCmd.Flags().StringVar(&rotFormat, "format", "text", "Output format: text or json")
+	rotateCmd.Flags().BoolVar(&rotRetry, "retry", false, "Skip archiving partitions whose Parquet file already exists")
 	_ = rotateCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(rotateCmd)
@@ -240,30 +242,42 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 						return 0, 0, fmt.Errorf("create archive directory for %s: %w", name, err)
 					}
-					n, err := archive.ArchivePartition(ctx, db, dbName, name, outPath, rotArchiveCompression)
-					if err != nil {
-						return 0, 0, fmt.Errorf("archive partition %s: %w", name, err)
-					}
-					if rotFormat != "json" {
-						fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) \u2192 %s\n", name, n, outPath)
+					var n int64
+					skipped := rotRetry && fileExists(outPath)
+					if skipped {
+						slog.Info("skipping existing archive (--retry)", "partition", name, "file", outPath)
+						if rotFormat != "json" {
+							fmt.Fprintf(os.Stdout, "skipped partition %s (already archived) \u2192 %s\n", name, outPath)
+						}
+					} else {
+						n, err = archive.ArchivePartition(ctx, db, dbName, name, outPath, rotArchiveCompression)
+						if err != nil {
+							return 0, 0, fmt.Errorf("archive partition %s: %w", name, err)
+						}
+						if rotFormat != "json" {
+							fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) \u2192 %s\n", name, n, outPath)
+						}
 					}
 
-					// Record archive in archive_state.
-					var fileSize int64
-					if fi, statErr := os.Stat(outPath); statErr == nil {
-						fileSize = fi.Size()
-					}
-					if _, err := db.ExecContext(ctx,
-						`INSERT INTO archive_state
-							(partition_name, bintrail_id, local_path, file_size_bytes, row_count)
-						VALUES (?, ?, ?, ?, ?)
-						ON DUPLICATE KEY UPDATE
-							local_path = VALUES(local_path),
-							file_size_bytes = VALUES(file_size_bytes),
-							row_count = VALUES(row_count)`,
-						name, rotBintrailID, outPath, fileSize, n,
-					); err != nil {
-						return 0, 0, fmt.Errorf("record archive state for %s: %w", name, err)
+					// Record archive in archive_state (skip when retrying —
+					// the row already exists with the correct row_count).
+					if !skipped {
+						var fileSize int64
+						if fi, statErr := os.Stat(outPath); statErr == nil {
+							fileSize = fi.Size()
+						}
+						if _, err := db.ExecContext(ctx,
+							`INSERT INTO archive_state
+								(partition_name, bintrail_id, local_path, file_size_bytes, row_count)
+							VALUES (?, ?, ?, ?, ?)
+							ON DUPLICATE KEY UPDATE
+								local_path = VALUES(local_path),
+								file_size_bytes = VALUES(file_size_bytes),
+								row_count = VALUES(row_count)`,
+							name, rotBintrailID, outPath, fileSize, n,
+						); err != nil {
+							return 0, 0, fmt.Errorf("record archive state for %s: %w", name, err)
+						}
 					}
 
 					if s3Client != nil {
@@ -344,6 +358,12 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// fileExists reports whether a file exists and has a size greater than zero.
+func fileExists(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.Size() > 0
+}
 
 // hiveArchivePath returns the Hive-partitioned path for a binlog_events partition
 // archive. The layout is:

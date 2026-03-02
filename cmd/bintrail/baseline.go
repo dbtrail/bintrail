@@ -44,6 +44,7 @@ var (
 	bslUpload       string
 	bslUploadRegion string
 	bslFormat       string
+	bslRetry        bool
 )
 
 func init() {
@@ -56,6 +57,7 @@ func init() {
 	baselineCmd.Flags().StringVar(&bslUpload, "upload", "", "S3 destination URL to upload Parquet files after generation (e.g. s3://my-bucket/baselines/)")
 	baselineCmd.Flags().StringVar(&bslUploadRegion, "upload-region", "", "AWS region for --upload (default: from AWS_REGION env var or ~/.aws/config)")
 	baselineCmd.Flags().StringVar(&bslFormat, "format", "text", "Output format: text or json")
+	baselineCmd.Flags().BoolVar(&bslRetry, "retry", false, "Skip tables whose output Parquet file already exists")
 	_ = baselineCmd.MarkFlagRequired("input")
 	_ = baselineCmd.MarkFlagRequired("output")
 
@@ -93,6 +95,7 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 		Tables:       parseTableFilter(bslTables),
 		Compression:  bslCompression,
 		RowGroupSize: bslRowGroupSize,
+		Retry:        bslRetry,
 	}
 
 	stats, err := baseline.Run(cmd.Context(), cfg)
