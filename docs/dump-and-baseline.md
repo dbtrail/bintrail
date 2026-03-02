@@ -167,6 +167,7 @@ bintrail baseline \
 | `--row-group-size` | `500000` | Rows per Parquet row group |
 | `--upload` | *(disabled)* | S3 URL to upload Parquet files after generation |
 | `--upload-region` | *(from AWS env)* | AWS region for `--upload` |
+| `--retry` | `false` | Skip tables whose Parquet file already exists and S3 objects already uploaded |
 | `--format` | `text` | Output format: `text` or `json` |
 
 ### Output structure
@@ -199,6 +200,25 @@ bintrail baseline \
 ```
 
 See [Scenario I in the Practical Guide](guide.md#scenario-i-uploading-baseline-parquet-files-to-s3) for full S3 setup instructions.
+
+### Retrying after a failure
+
+If a baseline run fails partway through (e.g. network error during S3 upload, disk full), re-run with `--retry` to skip work that already completed:
+
+```sh
+bintrail baseline \
+  --input         /tmp/mydumper-output \
+  --output        /tmp/baselines \
+  --upload        s3://my-bucket/baselines/ \
+  --upload-region us-east-1 \
+  --retry
+```
+
+With `--retry`:
+- **Local Parquet files**: Tables whose output `.parquet` file already exists are skipped.
+- **S3 uploads**: Files that already exist in S3 (checked via `HeadObject`) are skipped.
+
+This makes the command safe to re-run without duplicating work.
 
 ### No database connection required
 

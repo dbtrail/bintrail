@@ -149,6 +149,44 @@ Each archived partition becomes a single Parquet file: `<archive-dir>/p_YYYYMMDD
 
 `--archive-compression` accepts `zstd` (default), `snappy`, `gzip`, or `none`.
 
+### Retrying after a failure
+
+If archiving or S3 upload fails partway through, re-run with `--retry` to skip work that already completed:
+
+```sh
+bintrail rotate \
+  --index-dsn           "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain              7d \
+  --archive-dir         /mnt/archives \
+  --archive-s3          s3://my-bintrail-archives/events/ \
+  --archive-compression zstd \
+  --retry
+```
+
+With `--retry`:
+- **Local Parquet files**: Partitions whose Parquet file already exists on disk are skipped.
+- **S3 uploads**: Partitions whose `s3_uploaded_at` is already recorded in the `archive_state` table are skipped.
+
+This makes the command safe to re-run without re-archiving or re-uploading partitions that already succeeded.
+
+### Archive state tracking
+
+Each archived partition is recorded in the `archive_state` table (created by `bintrail init`). This table tracks:
+
+| Column | Description |
+|--------|-------------|
+| `partition_name` | The partition that was archived (e.g. `p_2026021300`) |
+| `bintrail_id` | Server identity UUID |
+| `local_path` | Filesystem path of the Parquet file |
+| `file_size_bytes` | Size of the Parquet file |
+| `row_count` | Number of rows written |
+| `s3_bucket` | S3 bucket (when uploaded) |
+| `s3_key` | S3 object key (when uploaded) |
+| `s3_uploaded_at` | When the S3 upload completed |
+| `archived_at` | When the archive was created |
+
+The `--retry` flag on rotate uses this table to determine which S3 uploads can be skipped.
+
 ### Archiving directly to S3
 
 Pass `--archive-s3` alongside `--archive-dir` to upload each Parquet file to S3 after writing it locally:
@@ -201,13 +239,13 @@ Results from the live MySQL index and from Parquet archives are merged, deduplic
 
 ---
 
-## Status Command: Three Sections
+## Status Command
 
 ```sh
 bintrail status --index-dsn "..."
 ```
 
-The status command produces a three-section report, implemented in `internal/status/status.go`:
+The status command produces a multi-section report, implemented in `internal/status/status.go`:
 
 **Section 1 — Indexed Files**: Shows every row in `index_state`. The `BINTRAIL_ID` column identifies which bintrail server instance indexed each file:
 
@@ -249,6 +287,17 @@ Server (unknown)
 ```
 
 Files with a NULL `bintrail_id` are grouped under `Server (unknown)`. This is common when a shared index database receives files from multiple bintrail instances (e.g. one per replica), or when upgrading from a version predating the server identity feature.
+
+**Section 4 — Archives** (shown when `archive_state` contains data): Displays archive and S3 upload statistics:
+
+```
+=== Archives ===
+Total archived: 168 partitions
+Total size:     4.2 GB (local)
+S3 uploaded:    168 partitions
+```
+
+This section is loaded best-effort — if the `archive_state` table does not exist (older index databases created before the archiving feature), the section is silently omitted.
 
 The row counts in the partitions section are **estimates** from `information_schema.PARTITIONS.TABLE_ROWS`. InnoDB doesn't maintain exact row counts, so these are good approximations for capacity planning but not for exact totals.
 
@@ -296,12 +345,13 @@ bintrail index / bintrail stream
 
 bintrail rotate --retain 7d [--archive-s3 s3://...]
     └── (optional) archives each partition to Parquet → uploads to S3
+        records archive metadata in archive_state
         drops old partitions (instant metadata operation)
         auto-adds replacement future partitions (reorganize p_future)
 
 bintrail status
-    └── reads index_state, information_schema.PARTITIONS
-        prints three-section report (with per-server Summary)
+    └── reads index_state, information_schema.PARTITIONS, archive_state
+        prints multi-section report (files, partitions, summary, archives)
 
 bintrail query [--archive-s3 s3://...]
     └── partition pruning: only reads relevant partitions
