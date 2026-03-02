@@ -398,7 +398,8 @@ func resolveStart(
 // streamLoop consumes parser events, flushes batches to MySQL, and writes
 // checkpoints to stream_state at the given interval.
 // onDDL is called when a DDL event is received (after flushing the current batch).
-// It may be nil, in which case DDL events are skipped.
+// It may be nil, in which case no handler callback is invoked (position/GTID
+// tracking still occurs).
 func streamLoop(
 	ctx context.Context,
 	events <-chan parser.Event,
@@ -483,7 +484,8 @@ func streamLoop(
 				}
 				if onDDL != nil {
 					if err := onDDL(ev); err != nil {
-						slog.Warn("DDL handler failed", "error", err)
+						slog.Error("DDL handler failed", "error", err,
+						"file", ev.BinlogFile, "pos", ev.EndPos)
 					}
 				}
 				continue
@@ -745,8 +747,8 @@ func runStream(cmd *cobra.Command, args []string) error {
 		stats, snapErr := metadata.TakeSnapshot(sourceDB, indexDB, schemas)
 		var snapID *int
 		if snapErr != nil {
-			slog.Warn("auto-snapshot after DDL failed; continuing with existing resolver",
-				"error", snapErr)
+			slog.Error("auto-snapshot after DDL failed; subsequent events may use stale schema",
+				"error", snapErr, "ddl_type", ev.DDLType, "table", ev.Table)
 		} else {
 			snapID = &stats.SnapshotID
 			newResolver, resolverErr := metadata.NewResolver(indexDB, stats.SnapshotID)

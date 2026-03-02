@@ -194,18 +194,18 @@ func TestParseDDL_ddlStatements(t *testing.T) {
 
 	tests := []struct {
 		query   string
-		ddlType string
+		ddlType DDLKind
 		schema  string
 		table   string
 	}{
-		{"ALTER TABLE orders ADD COLUMN foo INT", "ALTER TABLE", "", "orders"},
-		{"CREATE TABLE new_tbl (id INT)", "CREATE TABLE", "", "new_tbl"},
-		{"DROP TABLE old_tbl", "DROP TABLE", "", "old_tbl"},
-		{"RENAME TABLE a TO b", "RENAME TABLE", "", "a"},
-		{"ALTER TABLE mydb.orders ADD COLUMN foo INT", "ALTER TABLE", "mydb", "orders"},
-		{"ALTER TABLE `mydb`.`orders` ADD COLUMN foo INT", "ALTER TABLE", "mydb", "orders"},
-		{"DROP TABLE IF EXISTS old_tbl", "DROP TABLE", "", "old_tbl"},
-		{"CREATE TABLE IF NOT EXISTS `mydb`.`new_tbl` (id INT)", "CREATE TABLE", "mydb", "new_tbl"},
+		{"ALTER TABLE orders ADD COLUMN foo INT", DDLAlterTable, "", "orders"},
+		{"CREATE TABLE new_tbl (id INT)", DDLCreateTable, "", "new_tbl"},
+		{"DROP TABLE old_tbl", DDLDropTable, "", "old_tbl"},
+		{"RENAME TABLE a TO b", DDLRenameTable, "", "a"},
+		{"ALTER TABLE mydb.orders ADD COLUMN foo INT", DDLAlterTable, "mydb", "orders"},
+		{"ALTER TABLE `mydb`.`orders` ADD COLUMN foo INT", DDLAlterTable, "mydb", "orders"},
+		{"DROP TABLE IF EXISTS old_tbl", DDLDropTable, "", "old_tbl"},
+		{"CREATE TABLE IF NOT EXISTS `mydb`.`new_tbl` (id INT)", DDLCreateTable, "mydb", "new_tbl"},
 	}
 
 	for _, tt := range tests {

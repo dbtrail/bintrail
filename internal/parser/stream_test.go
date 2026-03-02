@@ -214,8 +214,8 @@ func TestStreamParser_queryEventDDL(t *testing.T) {
 	if ev.Table != "orders" {
 		t.Errorf("expected table 'orders', got %q", ev.Table)
 	}
-	if ev.DDLType != "ALTER TABLE" {
-		t.Errorf("expected DDLType 'ALTER TABLE', got %q", ev.DDLType)
+	if ev.DDLType != DDLAlterTable {
+		t.Errorf("expected DDLType DDLAlterTable, got %q", ev.DDLType)
 	}
 }
 

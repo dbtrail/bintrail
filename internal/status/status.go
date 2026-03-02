@@ -64,7 +64,7 @@ type CoverageInfo struct {
 	LatestEvent       sql.NullTime
 	TotalEvents       int64
 	SchemaChanges     int
-	UncoveredDDLs     int // DDLs without an auto-snapshot (file mode)
+	UncoveredDDLs     int // DDLs without a snapshot (file mode, or failed auto-snapshot in stream mode)
 }
 
 // TSFmt is the timestamp format used in status output.
@@ -162,8 +162,8 @@ func LoadArchiveStats(ctx context.Context, db *sql.DB) (*ArchiveStats, error) {
 func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
 	var c CoverageInfo
 	err := db.QueryRowContext(ctx, `
-		SELECT COALESCE(MIN(event_timestamp), NULL),
-		       COALESCE(MAX(event_timestamp), NULL),
+		SELECT MIN(event_timestamp),
+		       MAX(event_timestamp),
 		       COUNT(*)
 		FROM binlog_events`).Scan(&c.EarliestEvent, &c.LatestEvent, &c.TotalEvents)
 	if err != nil {

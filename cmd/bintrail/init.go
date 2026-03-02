@@ -648,6 +648,6 @@ const ddlSchemaChanges = `CREATE TABLE IF NOT EXISTS schema_changes (
     table_name      VARCHAR(255) NOT NULL,
     ddl_type        VARCHAR(50) NOT NULL,
     ddl_query       TEXT NOT NULL,
-    snapshot_id     INT UNSIGNED DEFAULT NULL COMMENT 'snapshot taken after this DDL (stream mode only)',
+    snapshot_id     INT UNSIGNED DEFAULT NULL COMMENT 'auto-snapshot after DDL; NULL when not taken (file mode or snapshot failure)',
     INDEX idx_detected_at (detected_at)
 ) ENGINE=InnoDB`

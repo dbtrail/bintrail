@@ -22,7 +22,7 @@ import (
 
 // ─── Event types ─────────────────────────────────────────────────────────────
 
-// EventType represents the DML operation captured by a binlog row event.
+// EventType represents the type of operation captured by a binlog event (DML or DDL).
 type EventType uint8
 
 const (
@@ -49,7 +49,7 @@ type Event struct {
 	RowAfter      map[string]any // nil for DELETE
 	SchemaVersion uint32         // resolver.SnapshotID() at parse time; incremented on each DDL detection
 	DDLQuery      string         // original DDL statement (EventDDL only)
-	DDLType       string         // ALTER TABLE, CREATE TABLE, DROP TABLE, RENAME TABLE (EventDDL only)
+	DDLType       DDLKind        // ALTER TABLE, CREATE TABLE, DROP TABLE, RENAME TABLE (EventDDL only)
 }
 
 // ─── Filters ─────────────────────────────────────────────────────────────────
@@ -185,6 +185,13 @@ func handleRows(
 	table := string(rowsEv.Table.Table)
 
 	if !filters.Matches(schema, table) {
+		return nil
+	}
+
+	if resolver == nil {
+		logger.Warn("no resolver available — skipping event",
+			"file", filename, "pos", binlogEv.Header.LogPos,
+			"schema", schema, "table", table)
 		return nil
 	}
 
@@ -400,8 +407,18 @@ func formatGTID(sid []byte, gno int64) string {
 		sid[0:4], sid[4:6], sid[6:8], sid[8:10], sid[10:16], gno)
 }
 
+// DDLKind identifies the type of DDL statement detected in a binlog QUERY_EVENT.
+type DDLKind string
+
+const (
+	DDLAlterTable  DDLKind = "ALTER TABLE"
+	DDLCreateTable DDLKind = "CREATE TABLE"
+	DDLDropTable   DDLKind = "DROP TABLE"
+	DDLRenameTable DDLKind = "RENAME TABLE"
+)
+
 // ddlTableRe extracts the schema and table name from DDL statements.
-// Handles: ALTER TABLE [schema.]table, CREATE TABLE [schema.]table,
+// Handles: ALTER TABLE [schema.]table, CREATE TABLE [IF NOT EXISTS] [schema.]table,
 // DROP TABLE [IF EXISTS] [schema.]table, RENAME TABLE [schema.]table.
 // Backtick-quoted identifiers are supported via `([^`]+)`.
 var ddlTableRe = regexp.MustCompile(
@@ -415,16 +432,16 @@ var ddlTableRe = regexp.MustCompile(
 func parseDDL(logger *slog.Logger, filename string, logPos uint32, timestamp time.Time, gtid, queryStr string, schemaVersion uint32) (Event, bool) {
 	upper := strings.ToUpper(strings.TrimSpace(queryStr))
 
-	var ddlType string
+	var ddlType DDLKind
 	switch {
 	case strings.HasPrefix(upper, "ALTER TABLE"):
-		ddlType = "ALTER TABLE"
+		ddlType = DDLAlterTable
 	case strings.HasPrefix(upper, "CREATE TABLE"):
-		ddlType = "CREATE TABLE"
+		ddlType = DDLCreateTable
 	case strings.HasPrefix(upper, "DROP TABLE"):
-		ddlType = "DROP TABLE"
+		ddlType = DDLDropTable
 	case strings.HasPrefix(upper, "RENAME TABLE"):
-		ddlType = "RENAME TABLE"
+		ddlType = DDLRenameTable
 	default:
 		return Event{}, false
 	}
@@ -445,7 +462,7 @@ func parseDDL(logger *slog.Logger, filename string, logPos uint32, timestamp tim
 		}
 	}
 
-	startPos := uint64(logPos) - uint64(logPos) // approximate; DDL events don't have row-level start/end
+	startPos := uint64(0) // DDL events have no row-level start position
 	endPos := uint64(logPos)
 
 	logger.Warn("DDL detected",
