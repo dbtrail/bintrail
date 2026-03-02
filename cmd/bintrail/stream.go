@@ -41,7 +41,9 @@ Unlike 'bintrail index', this command does not require access to binlog files
 on disk and works with managed MySQL (RDS, Aurora, Cloud SQL).
 
 Start position must be specified on the first run via --start-file or
---start-gtid. On subsequent runs the saved checkpoint is resumed automatically.
+--start-gtid. On subsequent runs the saved checkpoint is resumed automatically,
+even if --start-file/--start-gtid are still present on the command line. This
+makes re-running the same command idempotent.
 
 Graceful shutdown: send SIGINT or SIGTERM to flush the current batch and write
 a checkpoint before exiting.`,
@@ -319,22 +321,12 @@ func resolveStart(
 		return "", "", "", 0, nil, fmt.Errorf("--start-file and --start-gtid are mutually exclusive")
 	}
 
-	if startFile != "" || startGTID != "" {
-		if saved != nil {
-			slog.Warn("--start-* flag provided; overriding saved stream state")
-		}
-		if startGTID != "" {
-			startGTID = normalizeGTIDSet(startGTID)
-			gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTID)
-			if parseErr != nil {
-				return "", "", "", 0, nil, fmt.Errorf("invalid --start-gtid: %w", parseErr)
-			}
-			return "gtid", "", startGTID, 0, gs.(*gomysql.MysqlGTIDSet), nil
-		}
-		return "position", startFile, "", startPos, nil, nil
-	}
-
+	// Saved checkpoint takes priority — makes re-running the same command
+	// idempotent (the user doesn't need to remove --start-file to resume).
 	if saved != nil {
+		if startFile != "" || startGTID != "" {
+			slog.Info("checkpoint exists; ignoring --start-file/--start-gtid and resuming from saved state")
+		}
 		if saved.mode == "gtid" {
 			normalized := normalizeGTIDSet(saved.gtidSet)
 			slog.Info("resuming from GTID set", "gtid_set", normalized)
@@ -346,6 +338,19 @@ func resolveStart(
 		}
 		slog.Info("resuming from position", "file", saved.binlogFile, "pos", saved.binlogPos)
 		return "position", saved.binlogFile, "", uint32(saved.binlogPos), nil, nil
+	}
+
+	// No checkpoint — use flags for initial start position (first run).
+	if startGTID != "" {
+		startGTID = normalizeGTIDSet(startGTID)
+		gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTID)
+		if parseErr != nil {
+			return "", "", "", 0, nil, fmt.Errorf("invalid --start-gtid: %w", parseErr)
+		}
+		return "gtid", "", startGTID, 0, gs.(*gomysql.MysqlGTIDSet), nil
+	}
+	if startFile != "" {
+		return "position", startFile, "", startPos, nil, nil
 	}
 
 	return "", "", "", 0, nil, fmt.Errorf(

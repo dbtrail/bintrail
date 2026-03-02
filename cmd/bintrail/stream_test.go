@@ -156,21 +156,24 @@ func TestResolveStart_positionFlagsNoState(t *testing.T) {
 	}
 }
 
-func TestResolveStart_flagsOverrideSavedState(t *testing.T) {
+func TestResolveStart_savedStateWinsOverFlags(t *testing.T) {
 	saved := &streamState{
 		mode:       "position",
 		binlogFile: "binlog.000010",
 		binlogPos:  9999,
 	}
-	mode, file, _, _, _, err := resolveStart("binlog.000020", "", 100, saved)
+	mode, file, _, pos, _, err := resolveStart("binlog.000020", "", 100, saved)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if mode != "position" {
 		t.Errorf("expected mode=position, got %q", mode)
 	}
-	if file != "binlog.000020" {
-		t.Errorf("expected file=binlog.000020, got %q", file)
+	if file != "binlog.000010" {
+		t.Errorf("expected saved file=binlog.000010, got %q", file)
+	}
+	if pos != 9999 {
+		t.Errorf("expected saved pos=9999, got %d", pos)
 	}
 }
 
@@ -555,35 +558,31 @@ func TestResolveStart_customStartPos(t *testing.T) {
 	}
 }
 
-// TestResolveStart_fileFlagOverridesSavedGTIDState verifies that --start-file
-// wins over a saved GTID-mode state (complementary to flagsOverrideSavedState
-// which tests overriding a position-mode state).
-func TestResolveStart_fileFlagOverridesSavedGTIDState(t *testing.T) {
+// TestResolveStart_savedGTIDWinsOverFileFlag verifies that a saved GTID-mode
+// checkpoint is used even when --start-file is provided (idempotent restart).
+func TestResolveStart_savedGTIDWinsOverFileFlag(t *testing.T) {
 	saved := &streamState{
 		mode:    "gtid",
 		gtidSet: "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100",
 	}
-	mode, file, _, pos, accGTID, err := resolveStart("binlog.000001", "", 4, saved)
+	mode, _, returnedGTID, _, accGTID, err := resolveStart("binlog.000001", "", 4, saved)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if mode != "position" {
-		t.Errorf("expected mode=position, got %q", mode)
+	if mode != "gtid" {
+		t.Errorf("expected saved mode=gtid, got %q", mode)
 	}
-	if file != "binlog.000001" {
-		t.Errorf("expected file=binlog.000001, got %q", file)
+	if returnedGTID != "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100" {
+		t.Errorf("expected saved GTID, got %q", returnedGTID)
 	}
-	if pos != 4 {
-		t.Errorf("expected pos=4, got %d", pos)
-	}
-	if accGTID != nil {
-		t.Error("expected nil accGTID when overriding to position mode")
+	if accGTID == nil {
+		t.Error("expected non-nil accGTID from saved GTID state")
 	}
 }
 
-// TestResolveStart_gtidFlagOverridesSavedGTIDState verifies that --start-gtid
-// wins over a saved GTID-mode state, resetting to the new GTID set.
-func TestResolveStart_gtidFlagOverridesSavedGTIDState(t *testing.T) {
+// TestResolveStart_savedGTIDWinsOverGTIDFlag verifies that a saved GTID-mode
+// checkpoint is used even when --start-gtid provides a different GTID set.
+func TestResolveStart_savedGTIDWinsOverGTIDFlag(t *testing.T) {
 	saved := &streamState{
 		mode:    "gtid",
 		gtidSet: "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100",
@@ -596,36 +595,38 @@ func TestResolveStart_gtidFlagOverridesSavedGTIDState(t *testing.T) {
 	if mode != "gtid" {
 		t.Errorf("expected mode=gtid, got %q", mode)
 	}
-	if returnedGTID != newGTID {
-		t.Errorf("expected new GTID %q, got %q", newGTID, returnedGTID)
+	if returnedGTID != "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100" {
+		t.Errorf("expected saved GTID, got %q", returnedGTID)
 	}
 	if accGTID == nil {
 		t.Error("expected non-nil accGTID")
 	}
 }
 
-// TestResolveStart_gtidFlagOverridesSavedState verifies that --start-gtid wins
-// over a saved position-mode state (complementary to flagsOverrideSavedState
-// which tests overriding a position-mode state).
-func TestResolveStart_gtidFlagOverridesSavedState(t *testing.T) {
+// TestResolveStart_savedPositionWinsOverGTIDFlag verifies that a saved
+// position-mode checkpoint is used even when --start-gtid is provided.
+func TestResolveStart_savedPositionWinsOverGTIDFlag(t *testing.T) {
 	saved := &streamState{
 		mode:       "position",
 		binlogFile: "binlog.000010",
 		binlogPos:  9999,
 	}
 	gtidSet := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5"
-	mode, _, returnedGTID, _, accGTID, err := resolveStart("", gtidSet, 4, saved)
+	mode, file, _, pos, accGTID, err := resolveStart("", gtidSet, 4, saved)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if mode != "gtid" {
-		t.Errorf("expected mode=gtid, got %q", mode)
+	if mode != "position" {
+		t.Errorf("expected saved mode=position, got %q", mode)
 	}
-	if returnedGTID != gtidSet {
-		t.Errorf("expected GTID=%q, got %q", gtidSet, returnedGTID)
+	if file != "binlog.000010" {
+		t.Errorf("expected saved file=binlog.000010, got %q", file)
 	}
-	if accGTID == nil {
-		t.Error("expected non-nil accGTID when flag GTID overrides saved state")
+	if pos != 9999 {
+		t.Errorf("expected saved pos=9999, got %d", pos)
+	}
+	if accGTID != nil {
+		t.Error("expected nil accGTID in position mode")
 	}
 }
 
