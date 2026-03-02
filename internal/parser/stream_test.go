@@ -191,8 +191,8 @@ func TestStreamParser_queryEventNonDDL(t *testing.T) {
 	}
 }
 
-// TestStreamParser_queryEventDDL verifies that a DDL QUERY_EVENT produces a
-// warning log but no error and no output events.
+// TestStreamParser_queryEventDDL verifies that a DDL QUERY_EVENT emits an
+// EventDDL on the output channel.
 func TestStreamParser_queryEventDDL(t *testing.T) {
 	sp := NewStreamParser(nil, Filters{}, nil)
 	streamer := replication.NewBinlogStreamer()
@@ -204,8 +204,18 @@ func TestStreamParser_queryEventDDL(t *testing.T) {
 	if err := sp.Run(ctx, streamer, out); err != nil {
 		t.Errorf("expected nil error for DDL query, got %v", err)
 	}
-	if len(out) != 0 {
-		t.Errorf("expected no events for DDL query, got %d", len(out))
+	if len(out) != 1 {
+		t.Fatalf("expected 1 DDL event, got %d", len(out))
+	}
+	ev := <-out
+	if ev.EventType != EventDDL {
+		t.Errorf("expected EventDDL (%d), got %d", EventDDL, ev.EventType)
+	}
+	if ev.Table != "orders" {
+		t.Errorf("expected table 'orders', got %q", ev.Table)
+	}
+	if ev.DDLType != DDLAlterTable {
+		t.Errorf("expected DDLType DDLAlterTable, got %q", ev.DDLType)
 	}
 }
 

@@ -81,9 +81,16 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		archives = nil
 	}
 
-	if stFormat == "json" {
-		return status.WriteStatusJSON(os.Stdout, files, partStats, archives)
+	// Best-effort: schema_changes may not exist in older index databases.
+	coverage, err := status.LoadCoverage(ctx, db)
+	if err != nil {
+		slog.Warn("could not load coverage info", "error", err)
+		coverage = nil
 	}
-	status.WriteStatus(os.Stdout, files, partStats, archives)
+
+	if stFormat == "json" {
+		return status.WriteStatusJSON(os.Stdout, files, partStats, archives, coverage)
+	}
+	status.WriteStatus(os.Stdout, files, partStats, archives, coverage)
 	return nil
 }

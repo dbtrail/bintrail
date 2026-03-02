@@ -123,9 +123,10 @@ func sanitiseDBName(testName string) string {
 	return name
 }
 
-// InitIndexTables creates the three core index tables (binlog_events with a
-// single p_future partition, schema_snapshots, and index_state) in the given
-// database. This mirrors `bintrail init` without requiring the CLI binary.
+// InitIndexTables creates all index tables (binlog_events with a single
+// p_future partition, schema_snapshots, index_state, stream_state,
+// schema_changes, and supporting tables) in the given database.
+// This mirrors `bintrail init` without requiring the CLI binary.
 func InitIndexTables(t *testing.T, db *sql.DB) {
 	t.Helper()
 
@@ -243,6 +244,20 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		s3_uploaded_at  DATETIME,
 		archived_at     DATETIME NOT NULL DEFAULT UTC_TIMESTAMP(),
 		UNIQUE KEY uq_partition (partition_name, bintrail_id)
+	) ENGINE=InnoDB`)
+
+	MustExec(t, db, `CREATE TABLE IF NOT EXISTS schema_changes (
+		id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+		detected_at     DATETIME NOT NULL,
+		binlog_file     VARCHAR(255) NOT NULL,
+		binlog_pos      BIGINT UNSIGNED NOT NULL,
+		gtid            VARCHAR(255) DEFAULT NULL,
+		schema_name     VARCHAR(64) NOT NULL,
+		table_name      VARCHAR(64) NOT NULL,
+		ddl_type        VARCHAR(50) NOT NULL,
+		ddl_query       TEXT NOT NULL,
+		snapshot_id     INT UNSIGNED DEFAULT NULL,
+		INDEX idx_detected_at (detected_at)
 	) ENGINE=InnoDB`)
 }
 

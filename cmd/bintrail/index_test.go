@@ -345,3 +345,19 @@ func TestResolveFiles_allTrue(t *testing.T) {
 		t.Errorf("expected [binlog.000001 binlog.000002], got %v", files)
 	}
 }
+
+// ─── nullOrStringVal ─────────────────────────────────────────────────────────
+
+func TestNullOrStringVal_empty(t *testing.T) {
+	got := nullOrStringVal("")
+	if got != nil {
+		t.Errorf("expected nil for empty string, got %v", got)
+	}
+}
+
+func TestNullOrStringVal_nonEmpty(t *testing.T) {
+	got := nullOrStringVal("uuid:42")
+	if got != "uuid:42" {
+		t.Errorf("expected 'uuid:42', got %v", got)
+	}
+}

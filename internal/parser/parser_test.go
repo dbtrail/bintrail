@@ -180,38 +180,66 @@ func TestFilters_Matches_bothFilters(t *testing.T) {
 	}
 }
 
-// ─── warnOnDDL ────────────────────────────────────────────────────────────────
+// ─── parseDDL ─────────────────────────────────────────────────────────────────
 
 // newTestLogger returns a slog.Logger that writes text output to buf.
 func newTestLogger(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
-func TestWarnOnDDL_ddlStatements(t *testing.T) {
+func TestParseDDL_ddlStatements(t *testing.T) {
 	var buf bytes.Buffer
 	logger := newTestLogger(&buf)
+	ts := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
-	ddlStmts := []string{
-		"ALTER TABLE orders ADD COLUMN foo INT",
-		"CREATE TABLE new_tbl (id INT)",
-		"DROP TABLE old_tbl",
-		"RENAME TABLE a TO b",
+	tests := []struct {
+		query   string
+		ddlType DDLKind
+		schema  string
+		table   string
+	}{
+		{"ALTER TABLE orders ADD COLUMN foo INT", DDLAlterTable, "", "orders"},
+		{"CREATE TABLE new_tbl (id INT)", DDLCreateTable, "", "new_tbl"},
+		{"DROP TABLE old_tbl", DDLDropTable, "", "old_tbl"},
+		{"RENAME TABLE a TO b", DDLRenameTable, "", "a"},
+		{"ALTER TABLE mydb.orders ADD COLUMN foo INT", DDLAlterTable, "mydb", "orders"},
+		{"ALTER TABLE `mydb`.`orders` ADD COLUMN foo INT", DDLAlterTable, "mydb", "orders"},
+		{"DROP TABLE IF EXISTS old_tbl", DDLDropTable, "", "old_tbl"},
+		{"CREATE TABLE IF NOT EXISTS `mydb`.`new_tbl` (id INT)", DDLCreateTable, "mydb", "new_tbl"},
 	}
-	for _, stmt := range ddlStmts {
+
+	for _, tt := range tests {
 		buf.Reset()
-		got := warnOnDDL(logger, "binlog.000001", 100, stmt)
-		if buf.Len() == 0 {
-			t.Errorf("expected warning for DDL %q, got none", stmt)
+		ev, ok := parseDDL(logger, "binlog.000001", 100, ts, "uuid:1", tt.query, 0)
+		if !ok {
+			t.Errorf("parseDDL(%q) returned false, want true", tt.query)
+			continue
 		}
-		if !got {
-			t.Errorf("warnOnDDL(%q) = false, want true", stmt)
+		if ev.DDLType != tt.ddlType {
+			t.Errorf("parseDDL(%q).DDLType = %q, want %q", tt.query, ev.DDLType, tt.ddlType)
+		}
+		if ev.Schema != tt.schema {
+			t.Errorf("parseDDL(%q).Schema = %q, want %q", tt.query, ev.Schema, tt.schema)
+		}
+		if ev.Table != tt.table {
+			t.Errorf("parseDDL(%q).Table = %q, want %q", tt.query, ev.Table, tt.table)
+		}
+		if ev.EventType != EventDDL {
+			t.Errorf("parseDDL(%q).EventType = %d, want %d", tt.query, ev.EventType, EventDDL)
+		}
+		if ev.DDLQuery != tt.query {
+			t.Errorf("parseDDL(%q).DDLQuery = %q, want same", tt.query, ev.DDLQuery)
+		}
+		if ev.GTID != "uuid:1" {
+			t.Errorf("parseDDL(%q).GTID = %q, want %q", tt.query, ev.GTID, "uuid:1")
 		}
 	}
 }
 
-func TestWarnOnDDL_nonDDL(t *testing.T) {
+func TestParseDDL_nonDDL(t *testing.T) {
 	var buf bytes.Buffer
 	logger := newTestLogger(&buf)
+	ts := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
 	nonDDL := []string{
 		"BEGIN",
@@ -223,26 +251,27 @@ func TestWarnOnDDL_nonDDL(t *testing.T) {
 	}
 	for _, stmt := range nonDDL {
 		buf.Reset()
-		got := warnOnDDL(logger, "binlog.000001", 100, stmt)
-		if buf.Len() != 0 {
-			t.Errorf("expected no warning for non-DDL %q, got: %s", stmt, buf.String())
-		}
-		if got {
-			t.Errorf("warnOnDDL(%q) = true, want false", stmt)
+		_, ok := parseDDL(logger, "binlog.000001", 100, ts, "", stmt, 0)
+		if ok {
+			t.Errorf("parseDDL(%q) returned true, want false", stmt)
 		}
 	}
 }
 
-func TestWarnOnDDL_caseInsensitive(t *testing.T) {
+func TestParseDDL_caseInsensitive(t *testing.T) {
 	var buf bytes.Buffer
 	logger := newTestLogger(&buf)
+	ts := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
-	got := warnOnDDL(logger, "binlog.000001", 100, "alter table orders add column x int")
+	ev, ok := parseDDL(logger, "binlog.000001", 100, ts, "", "alter table orders add column x int", 0)
+	if !ok {
+		t.Errorf("parseDDL(lowercase ALTER TABLE) returned false, want true")
+	}
 	if !strings.Contains(buf.String(), "DDL detected") {
 		t.Errorf("expected DDL warning for lowercase DDL, got: %q", buf.String())
 	}
-	if !got {
-		t.Errorf("warnOnDDL(lowercase ALTER TABLE) = false, want true")
+	if ev.Table != "orders" {
+		t.Errorf("parseDDL(lowercase).Table = %q, want %q", ev.Table, "orders")
 	}
 }
 

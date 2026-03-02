@@ -141,6 +141,18 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	p := parser.New(idxBinlogDir, resolver, filters, nil)
 	idx := indexer.New(indexDB, idxBatchSize)
 
+	// In file mode, DDLs are recorded but auto-snapshot is not taken because
+	// the binlog may be from a past point in time when information_schema
+	// reflected a different schema. The user must run `bintrail snapshot` manually.
+	idx.SetOnDDL(func(ev parser.Event) error {
+		slog.Warn("DDL detected in file mode — auto-snapshot not available; run `bintrail snapshot` if schema changed",
+			"file", ev.BinlogFile, "pos", ev.EndPos, "ddl_type", ev.DDLType, "query", ev.DDLQuery)
+		if err := insertSchemaChange(indexDB, ev, nil); err != nil {
+			slog.Warn("failed to record schema change", "error", err)
+		}
+		return nil
+	})
+
 	var totalEvents int64
 	for _, filename := range files {
 		n, err := indexFile(ctx, p, idx, indexDB, idxBinlogDir, filename, bintrailID)
@@ -435,6 +447,33 @@ func ensureResolver(indexDB, sourceDB *sql.DB, schemas []string) (*metadata.Reso
 	}
 
 	return metadata.NewResolver(indexDB, snapshotID)
+}
+
+// ─── DDL tracking ────────────────────────────────────────────────────────────────────────
+
+// insertSchemaChange records a DDL detection in the schema_changes table.
+// snapshotID may be nil when no auto-snapshot was taken (file mode).
+func insertSchemaChange(db *sql.DB, ev parser.Event, snapshotID *int) error {
+	var snapArg any
+	if snapshotID != nil {
+		snapArg = *snapshotID
+	}
+	_, err := db.Exec(`
+		INSERT INTO schema_changes
+			(detected_at, binlog_file, binlog_pos, gtid, schema_name, table_name, ddl_type, ddl_query, snapshot_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ev.Timestamp, ev.BinlogFile, ev.EndPos,
+		nullOrStringVal(ev.GTID), ev.Schema, ev.Table, ev.DDLType, ev.DDLQuery, snapArg)
+	return err
+}
+
+// nullOrStringVal returns nil when s is empty (stored as SQL NULL), else s.
+// Mirrors nullOrString in internal/indexer/indexer.go.
+func nullOrStringVal(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // ─── Filter builder ────────────────────────────────────────────────────────────────────────
