@@ -452,6 +452,24 @@ func TestDDLArchiveState_hasUniqueKey(t *testing.T) {
 	}
 }
 
+func TestDDLConstants_noUTCTimestampDefault(t *testing.T) {
+	ddls := map[string]string{
+		"ddlSchemaSnapshots": ddlSchemaSnapshots,
+		"ddlStreamState":     ddlStreamState,
+		"ddlIndexState":      ddlIndexState,
+		"ddlArchiveState":    ddlArchiveState,
+		"ddlTableFlags":      ddlTableFlags,
+		"ddlProfiles":        ddlProfiles,
+		"ddlAccessRules":     ddlAccessRules,
+		"ddlSchemaChanges":   ddlSchemaChanges,
+	}
+	for name, ddl := range ddls {
+		if strings.Contains(strings.ToUpper(ddl), "DEFAULT UTC_TIMESTAMP") {
+			t.Errorf("%s must not use UTC_TIMESTAMP() as a DEFAULT — MySQL rejects it in DDL; use CURRENT_TIMESTAMP instead", name)
+		}
+	}
+}
+
 // ─── ddlSchemaChanges ───────────────────────────────────────────────────────
 
 func TestDDLSchemaChanges_hasRequiredColumns(t *testing.T) {
