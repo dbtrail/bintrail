@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -13,6 +14,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/spf13/cobra"
 
 	"github.com/bintrail/bintrail/internal/baseline"
@@ -57,7 +60,7 @@ func init() {
 	baselineCmd.Flags().StringVar(&bslUpload, "upload", "", "S3 destination URL to upload Parquet files after generation (e.g. s3://my-bucket/baselines/)")
 	baselineCmd.Flags().StringVar(&bslUploadRegion, "upload-region", "", "AWS region for --upload (default: from AWS_REGION env var or ~/.aws/config)")
 	baselineCmd.Flags().StringVar(&bslFormat, "format", "text", "Output format: text or json")
-	baselineCmd.Flags().BoolVar(&bslRetry, "retry", false, "Skip tables whose output Parquet file already exists")
+	baselineCmd.Flags().BoolVar(&bslRetry, "retry", false, "Skip tables whose output Parquet file already exists and S3 objects that were already uploaded")
 	_ = baselineCmd.MarkFlagRequired("input")
 	_ = baselineCmd.MarkFlagRequired("output")
 
@@ -111,7 +114,7 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 	var uploaded int
 	if bslUpload != "" {
 		var err error
-		uploaded, err = uploadBaselineToS3(cmd.Context(), bslOutput, bslUpload, bslUploadRegion)
+		uploaded, err = uploadBaselineToS3(cmd.Context(), bslOutput, bslUpload, bslUploadRegion, bslRetry)
 		if err != nil {
 			return fmt.Errorf("S3 upload: %w", err)
 		}
@@ -195,8 +198,9 @@ func buildS3Key(baseDir, filePath, prefix string) (string, error) {
 // uploadBaselineToS3 walks outputDir and uploads every file to the S3 URL,
 // preserving the relative directory structure under the prefix. region is
 // optional — if empty, the AWS SDK resolves it from AWS_REGION env var or
-// ~/.aws/config. Returns the number of files uploaded.
-func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string) (int, error) {
+// ~/.aws/config. When retry is true, files that already exist in S3 are
+// skipped (checked via HeadObject). Returns the number of files uploaded.
+func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string, retry bool) (int, error) {
 	bucket, prefix, err := parseS3URL(s3URL)
 	if err != nil {
 		return 0, fmt.Errorf("invalid --upload URL: %w", err)
@@ -216,6 +220,16 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string) (i
 		if err != nil {
 			return err
 		}
+		if retry {
+			exists, err := s3ObjectExists(ctx, client, bucket, key)
+			if err != nil {
+				return err
+			}
+			if exists {
+				slog.Info("skipping existing S3 object (--retry)", "bucket", bucket, "key", key)
+				return nil
+			}
+		}
 		if err := uploadFile(ctx, client, path, bucket, key); err != nil {
 			return err
 		}
@@ -224,6 +238,32 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string) (i
 		return nil
 	})
 	return count, err
+}
+
+// s3ObjectExists checks whether an object already exists in S3 by issuing a
+// HeadObject request. Returns true when the object is found, false on 404,
+// and an error for any other failure.
+func s3ObjectExists(ctx context.Context, client *s3.Client, bucket, key string) (bool, error) {
+	_, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		// The SDK wraps NotFound as a modeled error type.
+		var nf *types.NotFound
+		if errors.As(err, &nf) {
+			return false, nil
+		}
+		// HeadObject also surfaces 404 as a generic HTTP 404 response error
+		// when the bucket itself has no matching key (some S3-compatible
+		// backends use this path).
+		var re *smithyhttp.ResponseError
+		if errors.As(err, &re) && re.Response.StatusCode == 404 {
+			return false, nil
+		}
+		return false, fmt.Errorf("head s3://%s/%s: %w", bucket, key, err)
+	}
+	return true, nil
 }
 
 // uploadFile opens a single local file and uploads it to S3. It is a separate
