@@ -160,6 +160,61 @@ bintrail stream \
 
 > **Server ID**: choose any integer not used by the source server or its existing replicas. Check with `SHOW SLAVE HOSTS` on the source.
 
+### `bintrail dump`
+
+Invokes [mydumper](https://github.com/mydumper/mydumper) to create a logical dump of the source MySQL instance. The output is used by `bintrail baseline` to produce Parquet snapshots. Only one dump may run at a time (enforced by a lockfile).
+
+```
+Flags:
+  --source-dsn     DSN for the source MySQL server (required)
+  --output-dir     Directory for mydumper output (required; removed and recreated each run)
+  --schemas        Comma-separated schema filter (e.g. mydb,otherdb)
+  --tables         Comma-separated table filter (e.g. mydb.orders,mydb.items)
+  --mydumper-path  Path to the mydumper binary (default: mydumper)
+  --threads        Number of parallel dump threads (default: 4)
+  --format         Output format: text (default), json
+```
+
+```sh
+bintrail dump \
+  --source-dsn "user:pass@tcp(source:3306)/" \
+  --output-dir /tmp/mydumper-output \
+  --schemas mydb
+```
+
+> **Prerequisite:** mydumper must be installed separately. See the [Dump and Baseline guide](docs/dump-and-baseline.md) for installation instructions, scheduling, and the full dump → baseline workflow.
+
+### `bintrail baseline`
+
+Converts mydumper output to Parquet baseline snapshots — one file per table. No database connection required; operates purely on files.
+
+```
+Flags:
+  --input          mydumper output directory (required)
+  --output         Parquet output base directory (required)
+  --timestamp      Snapshot timestamp override (ISO 8601; default: from mydumper metadata)
+  --tables         Comma-separated db.table filter (default: all)
+  --compression    Parquet compression codec: zstd, snappy, gzip, none (default: zstd)
+  --row-group-size Rows per Parquet row group (default: 500000)
+  --upload         S3 URL to upload Parquet files after generation
+  --upload-region  AWS region for --upload
+  --format         Output format: text (default), json
+```
+
+```sh
+# Convert mydumper output to Parquet
+bintrail baseline \
+  --input  /tmp/mydumper-output \
+  --output /data/baselines
+
+# Convert and upload to S3 in one step
+bintrail baseline \
+  --input         /tmp/mydumper-output \
+  --output        /tmp/baselines \
+  --upload        s3://my-bucket/baselines/ \
+  --upload-region us-east-1
+```
+
 ### `bintrail query`
 
 Search the index with flexible filters. Output defaults to a human-readable table; JSON and CSV are also supported.
