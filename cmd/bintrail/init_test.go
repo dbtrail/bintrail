@@ -451,3 +451,23 @@ func TestDDLArchiveState_hasUniqueKey(t *testing.T) {
 		t.Error("uq_partition must be on (partition_name, bintrail_id)")
 	}
 }
+
+// ─── ddlSchemaChanges ───────────────────────────────────────────────────────
+
+func TestDDLSchemaChanges_hasRequiredColumns(t *testing.T) {
+	for _, col := range []string{
+		"id", "detected_at", "binlog_file", "binlog_pos",
+		"gtid", "schema_name", "table_name", "ddl_type",
+		"ddl_query", "snapshot_id",
+	} {
+		if !strings.Contains(ddlSchemaChanges, col) {
+			t.Errorf("ddlSchemaChanges must contain %s column", col)
+		}
+	}
+}
+
+func TestDDLSchemaChanges_hasIndex(t *testing.T) {
+	if !strings.Contains(ddlSchemaChanges, "idx_detected_at") {
+		t.Error("ddlSchemaChanges must contain idx_detected_at index")
+	}
+}

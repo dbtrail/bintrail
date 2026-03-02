@@ -6,6 +6,8 @@ package parser
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
@@ -16,7 +18,7 @@ import (
 // events to an output channel, mirroring the interface of Parser but without
 // requiring binlog files on disk.
 type StreamParser struct {
-	resolver *metadata.Resolver
+	resolver atomic.Pointer[metadata.Resolver]
 	filters  Filters
 	logger   *slog.Logger
 }
@@ -28,7 +30,17 @@ func NewStreamParser(resolver *metadata.Resolver, filters Filters, logger *slog.
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &StreamParser{resolver: resolver, filters: filters, logger: logger}
+	sp := &StreamParser{filters: filters, logger: logger}
+	if resolver != nil {
+		sp.resolver.Store(resolver)
+	}
+	return sp
+}
+
+// SwapResolver atomically replaces the resolver used for column resolution.
+// Safe to call concurrently while Run is executing in another goroutine.
+func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
+	sp.resolver.Store(r)
 }
 
 // Run reads events from the streamer and sends matching row events to out.
@@ -41,8 +53,8 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	var currentFile string
 	var currentGTID string
 	var schemaVersion uint32
-	if sp.resolver != nil {
-		schemaVersion = uint32(sp.resolver.SnapshotID())
+	if r := sp.resolver.Load(); r != nil {
+		schemaVersion = uint32(r.SnapshotID())
 	}
 
 	for {
@@ -62,12 +74,18 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			currentGTID = formatGTID(ev.SID, ev.GNO)
 
 		case *replication.QueryEvent:
-			if warnOnDDL(sp.logger, currentFile, binlogEv.Header.LogPos, string(ev.Query)) {
+			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
+			if ddlEv, ok := parseDDL(sp.logger, currentFile, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), schemaVersion); ok {
 				schemaVersion++
+				select {
+				case out <- ddlEv:
+				case <-ctx.Done():
+					return nil
+				}
 			}
 
 		case *replication.RowsEvent:
-			if err := handleRows(ctx, sp.logger, sp.resolver, &sp.filters, binlogEv, ev, currentFile, currentGTID, schemaVersion, out); err != nil {
+			if err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, schemaVersion, out); err != nil {
 				if ctx.Err() != nil {
 					return nil // context cancelled during row processing
 				}

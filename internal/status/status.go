@@ -47,6 +47,26 @@ type ArchiveStats struct {
 	S3Buckets      []string // distinct non-empty buckets
 }
 
+// SchemaChange holds one row from the schema_changes table.
+type SchemaChange struct {
+	ID         int
+	DetectedAt time.Time
+	BinlogFile string
+	SchemaName string
+	TableName  string
+	DDLType    string
+	SnapshotID sql.NullInt32
+}
+
+// CoverageInfo summarizes the restore coverage of the index.
+type CoverageInfo struct {
+	EarliestEvent     sql.NullTime
+	LatestEvent       sql.NullTime
+	TotalEvents       int64
+	SchemaChanges     int
+	UncoveredDDLs     int // DDLs without an auto-snapshot (file mode)
+}
+
 // TSFmt is the timestamp format used in status output.
 const TSFmt = "2006-01-02 15:04:05"
 
@@ -138,8 +158,57 @@ func LoadArchiveStats(ctx context.Context, db *sql.DB) (*ArchiveStats, error) {
 	return &a, nil
 }
 
-// WriteStatus writes a multi-section status report (Indexed Files, Partitions, Archives, Summary) to w.
-func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats) {
+// LoadCoverage loads restore coverage info from binlog_events and schema_changes.
+func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
+	var c CoverageInfo
+	err := db.QueryRowContext(ctx, `
+		SELECT COALESCE(MIN(event_timestamp), NULL),
+		       COALESCE(MAX(event_timestamp), NULL),
+		       COUNT(*)
+		FROM binlog_events`).Scan(&c.EarliestEvent, &c.LatestEvent, &c.TotalEvents)
+	if err != nil {
+		return nil, fmt.Errorf("query binlog_events coverage: %w", err)
+	}
+
+	err = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_changes`).Scan(&c.SchemaChanges)
+	if err != nil {
+		return nil, fmt.Errorf("query schema_changes count: %w", err)
+	}
+
+	err = db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_changes WHERE snapshot_id IS NULL`).Scan(&c.UncoveredDDLs)
+	if err != nil {
+		return nil, fmt.Errorf("query uncovered DDLs: %w", err)
+	}
+
+	return &c, nil
+}
+
+// LoadSchemaChanges loads all schema changes ordered by detection time.
+func LoadSchemaChanges(ctx context.Context, db *sql.DB) ([]SchemaChange, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, detected_at, binlog_file, schema_name, table_name, ddl_type, snapshot_id
+		FROM schema_changes
+		ORDER BY detected_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var changes []SchemaChange
+	for rows.Next() {
+		var sc SchemaChange
+		if err := rows.Scan(&sc.ID, &sc.DetectedAt, &sc.BinlogFile,
+			&sc.SchemaName, &sc.TableName, &sc.DDLType, &sc.SnapshotID); err != nil {
+			return nil, err
+		}
+		changes = append(changes, sc)
+	}
+	return changes, rows.Err()
+}
+
+// WriteStatus writes a multi-section status report (Indexed Files, Partitions, Archives, Coverage, Summary) to w.
+func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo) {
 	// ── Section 1: Indexed Files ──────────────────────────────────────────────
 	fmt.Fprintln(w, "=== Indexed Files ===")
 	if len(files) == 0 {
@@ -203,7 +272,29 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		}
 	}
 
-	// ── Section 4: Summary (grouped by server) ────────────────────────────────
+	// ── Section 4: Restore Coverage ─────────────────────────────────────────
+	if coverage != nil {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "=== Restore Coverage ===")
+		if coverage.EarliestEvent.Valid {
+			fmt.Fprintf(w, "  Earliest event: %s\n", coverage.EarliestEvent.Time.Format(TSFmt))
+		} else {
+			fmt.Fprintln(w, "  Earliest event: (none)")
+		}
+		if coverage.LatestEvent.Valid {
+			fmt.Fprintf(w, "  Latest event:   %s\n", coverage.LatestEvent.Time.Format(TSFmt))
+		} else {
+			fmt.Fprintln(w, "  Latest event:   (none)")
+		}
+		fmt.Fprintf(w, "  Total events:   %d\n", coverage.TotalEvents)
+		fmt.Fprintf(w, "  Schema changes: %d\n", coverage.SchemaChanges)
+		if coverage.UncoveredDDLs > 0 {
+			fmt.Fprintf(w, "  Warning: %d DDL(s) detected without auto-snapshot (file mode) — recovery across these DDLs may require manual snapshot\n",
+				coverage.UncoveredDDLs)
+		}
+	}
+
+	// ── Section 5: Summary (grouped by server) ────────────────────────────────
 	if len(files) > 0 {
 		// Group files by bintrail_id; preserve insertion order for display.
 		type serverStats struct {
@@ -282,7 +373,7 @@ func Truncate(s string, n int) string {
 }
 
 // WriteStatusJSON writes the status data as a JSON object to w.
-func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats) error {
+func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo) error {
 	type jsonFile struct {
 		BinlogFile    string  `json:"binlog_file"`
 		Status        string  `json:"status"`
@@ -308,11 +399,19 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, 
 		S3Files        int      `json:"s3_files"`
 		S3Buckets      []string `json:"s3_buckets"`
 	}
+	type jsonCoverage struct {
+		EarliestEvent *string `json:"earliest_event"`
+		LatestEvent   *string `json:"latest_event"`
+		TotalEvents   int64   `json:"total_events"`
+		SchemaChanges int     `json:"schema_changes"`
+		UncoveredDDLs int     `json:"uncovered_ddls"`
+	}
 	type jsonSummary struct {
 		Files    []jsonFile      `json:"files"`
 		Parts    []jsonPartition `json:"partitions"`
 		Total    int64           `json:"total_events_estimate"`
 		Archives *jsonArchives   `json:"archives,omitempty"`
+		Coverage *jsonCoverage   `json:"coverage,omitempty"`
 	}
 
 	jf := make([]jsonFile, len(files))
@@ -359,6 +458,22 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, 
 			S3Files:        archives.S3Files,
 			S3Buckets:      archives.S3Buckets,
 		}
+	}
+	if coverage != nil {
+		jc := &jsonCoverage{
+			TotalEvents:   coverage.TotalEvents,
+			SchemaChanges: coverage.SchemaChanges,
+			UncoveredDDLs: coverage.UncoveredDDLs,
+		}
+		if coverage.EarliestEvent.Valid {
+			s := coverage.EarliestEvent.Time.Format(TSFmt)
+			jc.EarliestEvent = &s
+		}
+		if coverage.LatestEvent.Valid {
+			s := coverage.LatestEvent.Time.Format(TSFmt)
+			jc.LatestEvent = &s
+		}
+		out.Coverage = jc
 	}
 
 	enc := json.NewEncoder(w)

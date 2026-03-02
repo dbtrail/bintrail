@@ -9,8 +9,10 @@ import (
 	"log/slog"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -27,10 +29,12 @@ const (
 	EventInsert EventType = 1
 	EventUpdate EventType = 2
 	EventDelete EventType = 3
+	EventDDL    EventType = 4
 )
 
 // Event is a fully resolved binlog row event with column names attached.
 // It carries everything the indexer needs to write one row to binlog_events.
+// DDL events (EventType=4) carry DDLQuery and DDLType instead of row data.
 type Event struct {
 	BinlogFile    string
 	StartPos      uint64
@@ -44,6 +48,8 @@ type Event struct {
 	RowBefore     map[string]any // nil for INSERT
 	RowAfter      map[string]any // nil for DELETE
 	SchemaVersion uint32         // resolver.SnapshotID() at parse time; incremented on each DDL detection
+	DDLQuery      string         // original DDL statement (EventDDL only)
+	DDLType       string         // ALTER TABLE, CREATE TABLE, DROP TABLE, RENAME TABLE (EventDDL only)
 }
 
 // ─── Filters ─────────────────────────────────────────────────────────────────
@@ -71,7 +77,7 @@ func (f *Filters) Matches(schema, table string) bool {
 // Parser reads binlog files and emits Events onto a channel.
 type Parser struct {
 	binlogDir     string
-	resolver      *metadata.Resolver
+	resolver      atomic.Pointer[metadata.Resolver]
 	filters       Filters
 	logger        *slog.Logger
 	schemaVersion uint32 // starts at resolver.SnapshotID(); incremented on each DDL detection
@@ -88,13 +94,22 @@ func New(binlogDir string, resolver *metadata.Resolver, filters Filters, logger 
 	if resolver != nil {
 		schemaVersion = uint32(resolver.SnapshotID())
 	}
-	return &Parser{
+	p := &Parser{
 		binlogDir:     binlogDir,
-		resolver:      resolver,
 		filters:       filters,
 		logger:        logger,
 		schemaVersion: schemaVersion,
 	}
+	if resolver != nil {
+		p.resolver.Store(resolver)
+	}
+	return p
+}
+
+// SwapResolver atomically replaces the resolver used for column resolution.
+// Safe to call concurrently while ParseFile is running.
+func (p *Parser) SwapResolver(r *metadata.Resolver) {
+	p.resolver.Store(r)
 }
 
 // ParseFiles parses multiple binlog files in order, sending events to the channel.
@@ -132,12 +147,18 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			currentGTID = formatGTID(ev.SID, ev.GNO)
 
 		case *replication.QueryEvent:
-			if warnOnDDL(p.logger, filename, binlogEv.Header.LogPos, string(ev.Query)) {
+			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
+			if ddlEv, ok := parseDDL(p.logger, filename, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), p.schemaVersion); ok {
 				p.schemaVersion++
+				select {
+				case events <- ddlEv:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
 
 		case *replication.RowsEvent:
-			return handleRows(ctx, p.logger, p.resolver, &p.filters, binlogEv, ev, filename, currentGTID, p.schemaVersion, events)
+			return handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, p.schemaVersion, events)
 		}
 		return nil
 	})
@@ -379,22 +400,73 @@ func formatGTID(sid []byte, gno int64) string {
 		sid[0:4], sid[4:6], sid[6:8], sid[8:10], sid[10:16], gno)
 }
 
-// warnOnDDL logs a warning when a schema-changing DDL statement is found in a
-// QUERY_EVENT. DDL changes table structure and may invalidate the current schema
-// snapshot. Returns true if the query alters table structure, false otherwise.
-// Note: TRUNCATE is intentionally excluded — it removes rows but does not change
+// ddlTableRe extracts the schema and table name from DDL statements.
+// Handles: ALTER TABLE [schema.]table, CREATE TABLE [schema.]table,
+// DROP TABLE [IF EXISTS] [schema.]table, RENAME TABLE [schema.]table.
+// Backtick-quoted identifiers are supported via `([^`]+)`.
+var ddlTableRe = regexp.MustCompile(
+	`(?i)(?:ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|RENAME\s+TABLE)\s+` +
+		"(?:`([^`]+)`\\.`([^`]+)`|`([^`]+)`|(\\w+)\\.(\\w+)|(\\w+))")
+
+// parseDDL parses a QUERY_EVENT for DDL statements and returns a DDL Event.
+// Returns zero Event and false if the query is not a schema-changing DDL.
+// TRUNCATE is intentionally excluded — it removes rows but does not change
 // column structure, so it does not invalidate the snapshot.
-func warnOnDDL(logger *slog.Logger, filename string, logPos uint32, query string) bool {
-	upper := strings.ToUpper(strings.TrimSpace(query))
-	isDDL := strings.HasPrefix(upper, "ALTER TABLE") ||
-		strings.HasPrefix(upper, "CREATE TABLE") ||
-		strings.HasPrefix(upper, "DROP TABLE") ||
-		strings.HasPrefix(upper, "RENAME TABLE")
-	if isDDL {
-		logger.Warn("DDL detected — consider re-running `bintrail snapshot`",
-			"file", filename,
-			"pos", logPos,
-			"query", query)
+func parseDDL(logger *slog.Logger, filename string, logPos uint32, timestamp time.Time, gtid, queryStr string, schemaVersion uint32) (Event, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(queryStr))
+
+	var ddlType string
+	switch {
+	case strings.HasPrefix(upper, "ALTER TABLE"):
+		ddlType = "ALTER TABLE"
+	case strings.HasPrefix(upper, "CREATE TABLE"):
+		ddlType = "CREATE TABLE"
+	case strings.HasPrefix(upper, "DROP TABLE"):
+		ddlType = "DROP TABLE"
+	case strings.HasPrefix(upper, "RENAME TABLE"):
+		ddlType = "RENAME TABLE"
+	default:
+		return Event{}, false
 	}
-	return isDDL
+
+	// Extract schema and table from the DDL query.
+	var schema, table string
+	m := ddlTableRe.FindStringSubmatch(queryStr)
+	if m != nil {
+		switch {
+		case m[1] != "" && m[2] != "": // `schema`.`table`
+			schema, table = m[1], m[2]
+		case m[3] != "": // `table` (no schema)
+			table = m[3]
+		case m[4] != "" && m[5] != "": // schema.table (unquoted)
+			schema, table = m[4], m[5]
+		case m[6] != "": // table (unquoted, no schema)
+			table = m[6]
+		}
+	}
+
+	startPos := uint64(logPos) - uint64(logPos) // approximate; DDL events don't have row-level start/end
+	endPos := uint64(logPos)
+
+	logger.Warn("DDL detected",
+		"file", filename,
+		"pos", logPos,
+		"ddl_type", ddlType,
+		"schema", schema,
+		"table", table,
+		"query", queryStr)
+
+	return Event{
+		BinlogFile:    filename,
+		StartPos:      startPos,
+		EndPos:        endPos,
+		Timestamp:     timestamp,
+		GTID:          gtid,
+		Schema:        schema,
+		Table:         table,
+		EventType:     EventDDL,
+		DDLQuery:      queryStr,
+		DDLType:       ddlType,
+		SchemaVersion: schemaVersion,
+	}, true
 }
