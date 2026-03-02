@@ -524,9 +524,48 @@ Results from the live MySQL index and from Parquet archives are merged, deduplic
 
 ---
 
-### Scenario H: Uploading baseline Parquet files to S3
+### Scenario H: Creating a baseline snapshot with mydumper
 
-**Situation:** You've generated a mydumper baseline and want to store the resulting Parquet files in S3 for long-term retention alongside your archived `binlog_events` partitions.
+**Situation:** You're setting up bintrail for the first time and want to capture the current state of your tables before you start indexing binlog events. Or you need a periodic full snapshot for audit purposes.
+
+**Prerequisites:** mydumper must be installed — see the [Dump and Baseline guide](dump-and-baseline.md#installing-mydumper) for installation instructions.
+
+**Step 1 — Dump the source database:**
+
+```sh
+bintrail dump \
+  --source-dsn "user:pass@tcp(source-db:3306)/" \
+  --output-dir /tmp/mydumper-output \
+  --schemas mydb
+```
+
+This invokes mydumper to create a logical dump of the `mydb` schema. Omit `--schemas` to dump all user schemas. Use `--tables mydb.orders,mydb.items` to dump specific tables.
+
+**Step 2 — Convert to Parquet:**
+
+```sh
+bintrail baseline \
+  --input  /tmp/mydumper-output \
+  --output /data/baselines
+```
+
+No database connection needed — this reads only files. Output: `/data/baselines/<timestamp>/mydb/orders.parquet`, etc.
+
+**Step 3 — Verify:**
+
+```sh
+ls -lR /data/baselines/
+```
+
+You should see one `.parquet` file per table, organized by timestamp and schema.
+
+> For the full reference on all flags, scheduling, and troubleshooting, see [Dump and Baseline](dump-and-baseline.md).
+
+---
+
+### Scenario I: Uploading baseline Parquet files to S3
+
+**Situation:** You've generated a mydumper baseline (see [Scenario H](#scenario-h-creating-a-baseline-snapshot-with-mydumper)) and want to store the resulting Parquet files in S3 for long-term retention alongside your archived `binlog_events` partitions.
 
 **Option 1 — Generate locally and upload in one step (recommended):**
 
@@ -617,7 +656,7 @@ The IAM role or user running bintrail needs `s3:PutObject` (and `s3:GetObject` /
 
 ---
 
-### Scenario I: Streaming from managed MySQL (RDS, Aurora, Cloud SQL)
+### Scenario J: Streaming from managed MySQL (RDS, Aurora, Cloud SQL)
 
 **Situation:** You're using a managed MySQL service where you have no filesystem access to binlog files. You want continuous real-time indexing using the replication protocol.
 
@@ -679,7 +718,7 @@ curl -s localhost:9090/metrics | grep bintrail_stream_replication_lag_seconds
 
 ---
 
-### Scenario J: Using bintrail from Claude Desktop (AI-assisted investigation)
+### Scenario K: Using bintrail from Claude Desktop (AI-assisted investigation)
 
 **Situation:** You want to use Claude Desktop (or Claude Code on another machine) to investigate database changes in natural language — without typing CLI commands.
 
@@ -784,7 +823,7 @@ BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index' \
 
 ---
 
-### Scenario K: Debug logging
+### Scenario L: Debug logging
 
 **Situation:** Something isn't indexing correctly and you need verbose output to diagnose it.
 
