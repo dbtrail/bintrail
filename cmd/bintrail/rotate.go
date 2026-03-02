@@ -248,6 +248,24 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 						fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) \u2192 %s\n", name, n, outPath)
 					}
 
+					// Record archive in archive_state.
+					var fileSize int64
+					if fi, statErr := os.Stat(outPath); statErr == nil {
+						fileSize = fi.Size()
+					}
+					if _, err := db.ExecContext(ctx,
+						`INSERT INTO archive_state
+							(partition_name, bintrail_id, local_path, file_size_bytes, row_count)
+						VALUES (?, ?, ?, ?, ?)
+						ON DUPLICATE KEY UPDATE
+							local_path = VALUES(local_path),
+							file_size_bytes = VALUES(file_size_bytes),
+							row_count = VALUES(row_count)`,
+						name, rotBintrailID, outPath, fileSize, n,
+					); err != nil {
+						return 0, 0, fmt.Errorf("record archive state for %s: %w", name, err)
+					}
+
 					if s3Client != nil {
 						key, err := buildS3Key(rotArchiveDir, outPath, s3Prefix)
 						if err != nil {
@@ -256,9 +274,17 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 						if err := uploadFile(ctx, s3Client, outPath, s3Bucket, key); err != nil {
 							return 0, 0, fmt.Errorf("upload %s to S3: %w", name, err)
 						}
+						if _, err := db.ExecContext(ctx,
+							`UPDATE archive_state
+								SET s3_bucket = ?, s3_key = ?, s3_uploaded_at = UTC_TIMESTAMP()
+							WHERE partition_name = ? AND bintrail_id = ?`,
+							s3Bucket, key, name, rotBintrailID,
+						); err != nil {
+							return 0, 0, fmt.Errorf("update archive state S3 info for %s: %w", name, err)
+						}
 						slog.Info("uploaded archive to S3", "partition", name, "bucket", s3Bucket, "key", key)
 						if rotFormat != "json" {
-							fmt.Fprintf(os.Stdout, "uploaded %s → s3://%s/%s\n", name, s3Bucket, key)
+							fmt.Fprintf(os.Stdout, "uploaded %s \u2192 s3://%s/%s\n", name, s3Bucket, key)
 						}
 					}
 				}
