@@ -628,3 +628,70 @@ func TestResolveStart_gtidFlagOverridesSavedState(t *testing.T) {
 		t.Error("expected non-nil accGTID when flag GTID overrides saved state")
 	}
 }
+
+// ─── normalizeGTIDSet ────────────────────────────────────────────────────────
+
+func TestNormalizeGTIDSet_standard(t *testing.T) {
+	// Already standard 36-char UUID — no change expected.
+	input := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5"
+	got := normalizeGTIDSet(input)
+	if got != input {
+		t.Errorf("expected no change, got %q", got)
+	}
+}
+
+func TestNormalizeGTIDSet_rdsShortened(t *testing.T) {
+	// RDS-style shortened UUID (first segment 7 chars instead of 8).
+	input := "5512139-1432-11f1-8d8d-0693b428a89b:1-7594394"
+	want := "05512139-1432-11f1-8d8d-0693b428a89b:1-7594394"
+	got := normalizeGTIDSet(input)
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeGTIDSet_multipleEntries(t *testing.T) {
+	input := "5512139-1432-11f1-8d8d-0693b428a89b:1-100,ab-cdef-1234-5678-abcdefabcdef:1-5"
+	want := "05512139-1432-11f1-8d8d-0693b428a89b:1-100,000000ab-cdef-1234-5678-abcdefabcdef:1-5"
+	got := normalizeGTIDSet(input)
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeGTIDSet_parsesAfterNormalization(t *testing.T) {
+	// The RDS GTID should parse successfully after normalization.
+	input := "5512139-1432-11f1-8d8d-0693b428a89b:1-7594394"
+	normalized := normalizeGTIDSet(input)
+	_, err := gomysql.ParseMysqlGTIDSet(normalized)
+	if err != nil {
+		t.Fatalf("ParseMysqlGTIDSet failed after normalization: %v", err)
+	}
+}
+
+func TestNormalizeGTIDSet_empty(t *testing.T) {
+	got := normalizeGTIDSet("")
+	if got != "" {
+		t.Errorf("expected empty string, got %q", got)
+	}
+}
+
+func TestResolveStart_rdsShortGTID(t *testing.T) {
+	// Verify that resolveStart accepts an RDS-style shortened GTID.
+	rdsGTID := "5512139-1432-11f1-8d8d-0693b428a89b:1-7594394"
+	wantGTID := "05512139-1432-11f1-8d8d-0693b428a89b:1-7594394"
+
+	mode, _, gtidStr, _, accGTID, err := resolveStart("", rdsGTID, 0, nil)
+	if err != nil {
+		t.Fatalf("resolveStart with RDS GTID: %v", err)
+	}
+	if mode != "gtid" {
+		t.Errorf("expected mode=gtid, got %q", mode)
+	}
+	if gtidStr != wantGTID {
+		t.Errorf("expected normalized GTID %q, got %q", wantGTID, gtidStr)
+	}
+	if accGTID == nil {
+		t.Error("expected non-nil accGTID")
+	}
+}
