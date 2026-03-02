@@ -3,6 +3,7 @@ package status
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -269,5 +270,127 @@ func assertContains(t *testing.T, s, want string) {
 	t.Helper()
 	if !strings.Contains(s, want) {
 		t.Errorf("expected %q in output:\n%s", want, s)
+	}
+}
+
+// ─── WriteStatusJSON ────────────────────────────────────────────────────────
+
+func TestWriteStatusJSON_empty(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Files      []any `json:"files"`
+		Partitions []any `json:"partitions"`
+		Total      int64 `json:"total_events_estimate"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if len(result.Files) != 0 {
+		t.Errorf("expected 0 files, got %d", len(result.Files))
+	}
+	if len(result.Partitions) != 0 {
+		t.Errorf("expected 0 partitions, got %d", len(result.Partitions))
+	}
+}
+
+func TestWriteStatusJSON_withData(t *testing.T) {
+	ts := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	files := []IndexStateRow{{
+		BinlogFile:    "binlog.000042",
+		Status:        "completed",
+		EventsIndexed: 1234,
+		FileSize:      1048576,
+		LastPosition:  1048576,
+		StartedAt:     ts,
+		CompletedAt:   sql.NullTime{Valid: true, Time: ts.Add(5 * time.Minute)},
+		BintrailID:    sql.NullString{Valid: true, String: "test-uuid"},
+	}}
+	parts := []PartitionStat{{
+		Name:        "p_2026021914",
+		Description: strconv.FormatInt(int64(62167219200)+ts.Add(time.Hour).Unix(), 10),
+		TableRows:   5000,
+		Ordinal:     1,
+	}}
+
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, files, parts); err != nil {
+		t.Fatal(err)
+	}
+
+	var result struct {
+		Files []struct {
+			BinlogFile    string  `json:"binlog_file"`
+			Status        string  `json:"status"`
+			EventsIndexed int64   `json:"events_indexed"`
+			BintrailID    *string `json:"bintrail_id"`
+		} `json:"files"`
+		Partitions []struct {
+			Name      string `json:"name"`
+			TableRows int64  `json:"table_rows"`
+		} `json:"partitions"`
+		Total int64 `json:"total_events_estimate"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+
+	if len(result.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(result.Files))
+	}
+	if result.Files[0].BinlogFile != "binlog.000042" {
+		t.Errorf("wrong binlog_file: %s", result.Files[0].BinlogFile)
+	}
+	if result.Files[0].EventsIndexed != 1234 {
+		t.Errorf("wrong events_indexed: %d", result.Files[0].EventsIndexed)
+	}
+	if result.Files[0].BintrailID == nil || *result.Files[0].BintrailID != "test-uuid" {
+		t.Errorf("wrong bintrail_id: %v", result.Files[0].BintrailID)
+	}
+
+	if len(result.Partitions) != 1 {
+		t.Fatalf("expected 1 partition, got %d", len(result.Partitions))
+	}
+	if result.Partitions[0].Name != "p_2026021914" {
+		t.Errorf("wrong partition name: %s", result.Partitions[0].Name)
+	}
+	if result.Total != 5000 {
+		t.Errorf("wrong total: %d", result.Total)
+	}
+}
+
+func TestWriteStatusJSON_nullFields(t *testing.T) {
+	files := []IndexStateRow{{
+		BinlogFile: "binlog.000001",
+		Status:     "in_progress",
+		StartedAt:  time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC),
+		// CompletedAt, BintrailID, ErrorMessage all null
+	}}
+
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, files, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var result struct {
+		Files []struct {
+			CompletedAt  *string `json:"completed_at"`
+			BintrailID   *string `json:"bintrail_id"`
+			ErrorMessage *string `json:"error_message"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if result.Files[0].CompletedAt != nil {
+		t.Error("expected null completed_at")
+	}
+	if result.Files[0].BintrailID != nil {
+		t.Error("expected null bintrail_id")
+	}
+	if result.Files[0].ErrorMessage != nil {
+		t.Error("expected null error_message")
 	}
 }

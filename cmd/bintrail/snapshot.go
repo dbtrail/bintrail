@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
 	"github.com/bintrail/bintrail/internal/metadata"
 	"github.com/bintrail/bintrail/internal/serverid"
@@ -29,12 +30,14 @@ var (
 	snapshotSourceDSN string
 	snapshotIndexDSN  string
 	snapshotSchemas   string
+	snapshotFormat    string
 )
 
 func init() {
 	snapshotCmd.Flags().StringVar(&snapshotSourceDSN, "source-dsn", "", "DSN for the source MySQL server (required)")
 	snapshotCmd.Flags().StringVar(&snapshotIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	snapshotCmd.Flags().StringVar(&snapshotSchemas, "schemas", "", "Comma-separated schemas to snapshot (default: all user schemas)")
+	snapshotCmd.Flags().StringVar(&snapshotFormat, "format", "text", "Output format: text or json")
 	_ = snapshotCmd.MarkFlagRequired("source-dsn")
 	_ = snapshotCmd.MarkFlagRequired("index-dsn")
 
@@ -42,6 +45,9 @@ func init() {
 }
 
 func runSnapshot(cmd *cobra.Command, args []string) error {
+	if !cliutil.IsValidOutputFormat(snapshotFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", snapshotFormat)
+	}
 	schemas := parseSchemaList(snapshotSchemas)
 
 	sourceDB, err := config.Connect(snapshotSourceDSN)
@@ -67,15 +73,29 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 		slog.Info("server identity resolved", "bintrail_id", bintrailID)
 	}
 
-	if len(schemas) > 0 {
-		fmt.Printf("Snapshotting schemas: %s\n", strings.Join(schemas, ", "))
-	} else {
-		fmt.Println("Snapshotting all user schemas...")
+	if snapshotFormat != "json" {
+		if len(schemas) > 0 {
+			fmt.Printf("Snapshotting schemas: %s\n", strings.Join(schemas, ", "))
+		} else {
+			fmt.Println("Snapshotting all user schemas...")
+		}
 	}
 
 	stats, err := metadata.TakeSnapshot(sourceDB, indexDB, schemas)
 	if err != nil {
 		return err
+	}
+
+	if snapshotFormat == "json" {
+		return outputJSON(struct {
+			SnapshotID int `json:"snapshot_id"`
+			Tables     int `json:"tables"`
+			Columns    int `json:"columns"`
+		}{
+			SnapshotID: stats.SnapshotID,
+			Tables:     stats.TableCount,
+			Columns:    stats.ColumnCount,
+		})
 	}
 
 	fmt.Printf("Snapshot complete.\n")

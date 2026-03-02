@@ -11,6 +11,8 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+
+	"github.com/bintrail/bintrail/internal/cliutil"
 )
 
 var dumpCmd = &cobra.Command{
@@ -29,6 +31,7 @@ var (
 	dmpTables       string
 	dmpMydumperPath string
 	dmpThreads      int
+	dmpFormat       string
 )
 
 // dumpLockDir is a function returning the directory for the dump lockfile.
@@ -42,6 +45,7 @@ func init() {
 	dumpCmd.Flags().StringVar(&dmpTables, "tables", "", "Comma-separated table filter (e.g. mydb.orders,mydb.items)")
 	dumpCmd.Flags().StringVar(&dmpMydumperPath, "mydumper-path", "mydumper", "Path to the mydumper binary")
 	dumpCmd.Flags().IntVar(&dmpThreads, "threads", 4, "Number of mydumper dump threads")
+	dumpCmd.Flags().StringVar(&dmpFormat, "format", "text", "Output format: text or json")
 	_ = dumpCmd.MarkFlagRequired("source-dsn")
 	_ = dumpCmd.MarkFlagRequired("output-dir")
 
@@ -49,6 +53,10 @@ func init() {
 }
 
 func runDump(cmd *cobra.Command, args []string) error {
+	if !cliutil.IsValidOutputFormat(dmpFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", dmpFormat)
+	}
+
 	// 1. Fail fast if mydumper is not installed.
 	path, err := exec.LookPath(dmpMydumperPath)
 	if err != nil {
@@ -83,13 +91,21 @@ func runDump(cmd *cobra.Command, args []string) error {
 	// 7. Run mydumper, streaming output to the terminal.
 	slog.Info("starting dump", "path", path, "output_dir", dmpOutputDir)
 	c := exec.CommandContext(cmd.Context(), path, mydumperArgs...)
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
+	if dmpFormat != "json" {
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+	}
 	if runErr := c.Run(); runErr != nil {
 		return fmt.Errorf("mydumper failed: %w", runErr)
 	}
 
 	slog.Info("dump complete", "output_dir", dmpOutputDir)
+
+	if dmpFormat == "json" {
+		return outputJSON(struct {
+			OutputDir string `json:"output_dir"`
+		}{OutputDir: dmpOutputDir})
+	}
 	return nil
 }
 

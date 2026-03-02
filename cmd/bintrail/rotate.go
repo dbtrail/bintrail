@@ -18,6 +18,7 @@ import (
 
 	"github.com/bintrail/bintrail/internal/archive"
 	"github.com/bintrail/bintrail/internal/baseline"
+	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
 )
 
@@ -65,6 +66,7 @@ var (
 	rotArchiveS3Region    string
 	rotDaemon             bool
 	rotInterval           string
+	rotFormat             string
 )
 
 func init() {
@@ -79,12 +81,16 @@ func init() {
 	rotateCmd.Flags().StringVar(&rotArchiveS3Region, "archive-s3-region", "", "AWS region for --archive-s3 (default: from AWS_REGION env var or ~/.aws/config)")
 	rotateCmd.Flags().BoolVar(&rotDaemon, "daemon", false, "Run continuously, repeating rotation on the --interval schedule until SIGINT/SIGTERM")
 	rotateCmd.Flags().StringVar(&rotInterval, "interval", "1h", "How often to run rotation in daemon mode (e.g. 1h, 30m)")
+	rotateCmd.Flags().StringVar(&rotFormat, "format", "text", "Output format: text or json")
 	_ = rotateCmd.MarkFlagRequired("index-dsn")
 
 	rootCmd.AddCommand(rotateCmd)
 }
 
 func runRotate(cmd *cobra.Command, args []string) error {
+	if !cliutil.IsValidOutputFormat(rotFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", rotFormat)
+	}
 	if rotRetain == "" && rotAddFuture == 0 {
 		return fmt.Errorf("at least one of --retain or --add-future is required")
 	}
@@ -130,7 +136,17 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to connect to index database: %w", err)
 		}
 		defer db.Close()
-		return performRotation(ctx, db, dbName, retainDur)
+		dropped, added, err := performRotation(ctx, db, dbName, retainDur)
+		if err != nil {
+			return err
+		}
+		if rotFormat == "json" {
+			return outputJSON(struct {
+				PartitionsDropped int `json:"partitions_dropped"`
+				PartitionsAdded   int `json:"partitions_added"`
+			}{PartitionsDropped: dropped, PartitionsAdded: added})
+		}
+		return nil
 	}
 
 	if !rotDaemon {
@@ -154,9 +170,15 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			slog.Info("rotate daemon stopping")
 			return nil
 		case <-ticker.C:
-			if err := doRotation(ctx); err != nil && ctx.Err() == nil {
-				slog.Error("rotation failed", "error", err)
-			}
+			// Suppress JSON output in daemon mode — only the initial rotation outputs JSON.
+			savedFmt := rotFormat
+			rotFormat = "text"
+			func() {
+				defer func() { rotFormat = savedFmt }()
+				if err := doRotation(ctx); err != nil && ctx.Err() == nil {
+					slog.Error("rotation failed", "error", err)
+				}
+			}()
 		}
 	}
 }
@@ -164,13 +186,14 @@ func runRotate(cmd *cobra.Command, args []string) error {
 // performRotation executes one full rotation cycle against an open DB connection.
 // It uses the package-level flag vars (rotRetain, rotAddFuture, rotNoReplace, etc.)
 // so that daemon and one-shot modes share identical rotation logic.
-func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur time.Duration) error {
+// Returns (partitions_dropped, partitions_added, error).
+func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur time.Duration) (int, int, error) {
 	start := time.Now()
 
 	// ── Load current partition list ─────────────────────────────────────────────
 	partitions, err := listPartitions(ctx, db, dbName)
 	if err != nil {
-		return fmt.Errorf("failed to list partitions: %w", err)
+		return 0, 0, fmt.Errorf("failed to list partitions: %w", err)
 	}
 
 	// ── Drop old partitions ───────────────────────────────────────────────────
@@ -189,7 +212,9 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 		}
 
 		if len(toDrop) == 0 {
-			fmt.Fprintf(os.Stdout, "no partitions older than %s to drop\n", rotRetain)
+			if rotFormat != "json" {
+				fmt.Fprintf(os.Stdout, "no partitions older than %s to drop\n", rotRetain)
+			}
 		} else {
 			// Archive partitions to Parquet before dropping, if requested.
 			if rotArchiveDir != "" {
@@ -199,35 +224,37 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 				if rotArchiveS3 != "" {
 					s3Bucket, s3Prefix, err = parseS3URL(rotArchiveS3)
 					if err != nil {
-						return fmt.Errorf("invalid --archive-s3: %w", err)
+						return 0, 0, fmt.Errorf("invalid --archive-s3: %w", err)
 					}
 					s3Client, err = newS3Client(ctx, rotArchiveS3Region)
 					if err != nil {
-						return fmt.Errorf("init S3 client: %w", err)
+						return 0, 0, fmt.Errorf("init S3 client: %w", err)
 					}
 				}
 
 				for _, name := range toDrop {
 					outPath, err := hiveArchivePath(rotArchiveDir, rotBintrailID, name)
 					if err != nil {
-						return fmt.Errorf("build archive path for %s: %w", name, err)
+						return 0, 0, fmt.Errorf("build archive path for %s: %w", name, err)
 					}
 					if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-						return fmt.Errorf("create archive directory for %s: %w", name, err)
+						return 0, 0, fmt.Errorf("create archive directory for %s: %w", name, err)
 					}
 					n, err := archive.ArchivePartition(ctx, db, dbName, name, outPath, rotArchiveCompression)
 					if err != nil {
-						return fmt.Errorf("archive partition %s: %w", name, err)
+						return 0, 0, fmt.Errorf("archive partition %s: %w", name, err)
 					}
-					fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) \u2192 %s\n", name, n, outPath)
+					if rotFormat != "json" {
+						fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) \u2192 %s\n", name, n, outPath)
+					}
 
 					if s3Client != nil {
 						key, err := buildS3Key(rotArchiveDir, outPath, s3Prefix)
 						if err != nil {
-							return fmt.Errorf("build S3 key for %s: %w", name, err)
+							return 0, 0, fmt.Errorf("build S3 key for %s: %w", name, err)
 						}
 						if err := uploadFile(ctx, s3Client, outPath, s3Bucket, key); err != nil {
-							return fmt.Errorf("upload %s to S3: %w", name, err)
+							return 0, 0, fmt.Errorf("upload %s to S3: %w", name, err)
 						}
 						slog.Debug("uploaded archive to S3", "partition", name, "bucket", s3Bucket, "key", key)
 					}
@@ -235,16 +262,18 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 			}
 
 			if err := dropPartitions(ctx, db, dbName, toDrop); err != nil {
-				return fmt.Errorf("failed to drop partitions: %w", err)
+				return 0, 0, fmt.Errorf("failed to drop partitions: %w", err)
 			}
 			for _, name := range toDrop {
-				fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+				if rotFormat != "json" {
+					fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+				}
 			}
 			droppedCount = len(toDrop)
 			// Refresh list so nextPartitionStart sees current state.
 			partitions, err = listPartitions(ctx, db, dbName)
 			if err != nil {
-				return fmt.Errorf("failed to refresh partition list: %w", err)
+				return 0, 0, fmt.Errorf("failed to refresh partition list: %w", err)
 			}
 		}
 	}
@@ -268,10 +297,12 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 	if toAdd > 0 {
 		startDate := nextPartitionStart(partitions)
 		if err := addFuturePartitions(ctx, db, dbName, startDate, toAdd); err != nil {
-			return fmt.Errorf("failed to add future partitions: %w", err)
+			return 0, 0, fmt.Errorf("failed to add future partitions: %w", err)
 		}
 		for i := range toAdd {
-			fmt.Fprintf(os.Stdout, "added partition %s\n", partitionName(startDate.Add(time.Duration(i)*time.Hour)))
+			if rotFormat != "json" {
+				fmt.Fprintf(os.Stdout, "added partition %s\n", partitionName(startDate.Add(time.Duration(i)*time.Hour)))
+			}
 		}
 	}
 
@@ -280,7 +311,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 		"partitions_added", toAdd,
 		"duration_ms", time.Since(start).Milliseconds())
 
-	return nil
+	return droppedCount, toAdd, nil
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

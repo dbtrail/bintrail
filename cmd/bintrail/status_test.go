@@ -94,3 +94,32 @@ func TestRunStatus_validDSNPassesGuards(t *testing.T) {
 		t.Errorf("DB-name guard should not fire when DB name is present, got: %v", err)
 	}
 }
+
+// ─── --format validation ─────────────────────────────────────────────────────
+
+func TestStatusCmd_formatDefault(t *testing.T) {
+	f := statusCmd.Flag("format")
+	if f == nil {
+		t.Fatal("flag --format not registered on statusCmd")
+	}
+	if f.DefValue != "text" {
+		t.Errorf("expected default 'text', got %q", f.DefValue)
+	}
+}
+
+func TestRunStatus_invalidFormat(t *testing.T) {
+	saved := stIndexDSN
+	savedFmt := stFormat
+	t.Cleanup(func() { stIndexDSN = saved; stFormat = savedFmt })
+
+	stIndexDSN = "user:pass@tcp(localhost:3306)/binlog_index"
+	stFormat = "xml"
+
+	err := runStatus(statusCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid --format, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid --format") {
+		t.Errorf("expected 'invalid --format' in error, got: %v", err)
+	}
+}

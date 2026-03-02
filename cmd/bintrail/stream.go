@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 
+	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
 	"github.com/bintrail/bintrail/internal/indexer"
 	"github.com/bintrail/bintrail/internal/observe"
@@ -63,6 +64,7 @@ var (
 	strmSSLCA       string
 	strmSSLCert     string
 	strmSSLKey      string
+	strmFormat      string
 )
 
 func init() {
@@ -81,6 +83,7 @@ func init() {
 	streamCmd.Flags().StringVar(&strmSSLCA, "ssl-ca", "", "Path to CA certificate file for TLS verification (omit to use system CAs)")
 	streamCmd.Flags().StringVar(&strmSSLCert, "ssl-cert", "", "Path to client certificate file for mutual TLS")
 	streamCmd.Flags().StringVar(&strmSSLKey, "ssl-key", "", "Path to client private key file for mutual TLS")
+	streamCmd.Flags().StringVar(&strmFormat, "format", "text", "Output format: text or json")
 	_ = streamCmd.MarkFlagRequired("index-dsn")
 	_ = streamCmd.MarkFlagRequired("source-dsn")
 	_ = streamCmd.MarkFlagRequired("server-id")
@@ -407,6 +410,10 @@ func streamLoop(
 // ─── runStream ───────────────────────────────────────────────────────────────────
 
 func runStream(cmd *cobra.Command, args []string) error {
+	if !cliutil.IsValidOutputFormat(strmFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", strmFormat)
+	}
+
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
@@ -619,14 +626,26 @@ func runStream(cmd *cobra.Command, args []string) error {
 	parseErr := <-parseErrCh
 
 	// ── 12. Summary ───────────────────────────────────────────────────────────────
-	fmt.Printf("\nEvents indexed: %d\n", state.eventsIndexed)
-	fmt.Printf("Last position:  %s:%d\n", state.binlogFile, state.binlogPos)
-
 	if loopErr != nil {
 		return loopErr
 	}
 	if parseErr != nil && !errors.Is(parseErr, context.Canceled) {
 		return parseErr
 	}
+
+	if strmFormat == "json" {
+		return outputJSON(struct {
+			EventsIndexed int64  `json:"events_indexed"`
+			LastFile      string `json:"last_file"`
+			LastPosition  uint64 `json:"last_position"`
+		}{
+			EventsIndexed: state.eventsIndexed,
+			LastFile:      state.binlogFile,
+			LastPosition:  state.binlogPos,
+		})
+	}
+
+	fmt.Printf("\nEvents indexed: %d\n", state.eventsIndexed)
+	fmt.Printf("Last position:  %s:%d\n", state.binlogFile, state.binlogPos)
 	return nil
 }
