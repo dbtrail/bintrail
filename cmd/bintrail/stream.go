@@ -262,6 +262,52 @@ func parseSourceDSN(dsn string) (host string, port uint16, user, password string
 	return h, uint16(portN), cfg.User, cfg.Passwd, nil
 }
 
+// normalizeGTIDSet zero-pads each UUID in a GTID set to the standard
+// 8-4-4-4-12 format. Some MySQL-compatible services (e.g. Amazon RDS) return
+// GTIDs with leading zeros stripped from UUID segments, producing UUIDs shorter
+// than 36 characters (e.g. "5512139-1432-11f1-8d8d-0693b428a89b" instead of
+// "05512139-1432-11f1-8d8d-0693b428a89b"). The go-mysql library requires
+// standard-length UUIDs, so this function normalizes before parsing.
+func normalizeGTIDSet(s string) string {
+	// Expected segment lengths in a UUID: 8-4-4-4-12.
+	segLens := [5]int{8, 4, 4, 4, 12}
+
+	// A GTID set is comma-separated entries like "uuid:intervals,uuid:intervals".
+	entries := strings.Split(s, ",")
+	for i, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		// Split "uuid:intervals" at the first colon.
+		colon := strings.IndexByte(entry, ':')
+		if colon < 0 {
+			continue // malformed, let the parser handle it
+		}
+		uuid := entry[:colon]
+		rest := entry[colon:] // includes the ":"
+
+		parts := strings.Split(uuid, "-")
+		if len(parts) != 5 {
+			continue // not a UUID shape, let the parser handle it
+		}
+
+		changed := false
+		for j, seg := range parts {
+			if len(seg) < segLens[j] {
+				parts[j] = strings.Repeat("0", segLens[j]-len(seg)) + seg
+				changed = true
+			}
+		}
+		if changed {
+			entries[i] = strings.Join(parts, "-") + rest
+		} else {
+			entries[i] = entry
+		}
+	}
+	return strings.Join(entries, ",")
+}
+
 // resolveStart determines the start position for replication. It returns the
 // mode ("position" or "gtid"), file, GTID string, pos, and an optional
 // pre-parsed MysqlGTIDSet (non-nil only in GTID mode).
@@ -278,6 +324,7 @@ func resolveStart(
 			slog.Warn("--start-* flag provided; overriding saved stream state")
 		}
 		if startGTID != "" {
+			startGTID = normalizeGTIDSet(startGTID)
 			gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTID)
 			if parseErr != nil {
 				return "", "", "", 0, nil, fmt.Errorf("invalid --start-gtid: %w", parseErr)
@@ -289,12 +336,13 @@ func resolveStart(
 
 	if saved != nil {
 		if saved.mode == "gtid" {
-			slog.Info("resuming from GTID set", "gtid_set", saved.gtidSet)
-			gs, parseErr := gomysql.ParseMysqlGTIDSet(saved.gtidSet)
+			normalized := normalizeGTIDSet(saved.gtidSet)
+			slog.Info("resuming from GTID set", "gtid_set", normalized)
+			gs, parseErr := gomysql.ParseMysqlGTIDSet(normalized)
 			if parseErr != nil {
 				return "", "", "", 0, nil, fmt.Errorf("invalid saved gtid_set %q: %w", saved.gtidSet, parseErr)
 			}
-			return "gtid", "", saved.gtidSet, 0, gs.(*gomysql.MysqlGTIDSet), nil
+			return "gtid", "", normalized, 0, gs.(*gomysql.MysqlGTIDSet), nil
 		}
 		slog.Info("resuming from position", "file", saved.binlogFile, "pos", saved.binlogPos)
 		return "position", saved.binlogFile, "", uint32(saved.binlogPos), nil, nil
