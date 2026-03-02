@@ -34,6 +34,7 @@ binlog files still existing on disk.`,
 		return nil
 	},
 	SilenceErrors: true, // we handle error output ourselves in main()
+	SilenceUsage:  true, // don't print usage/help on errors — users can use --help
 }
 
 func init() {
