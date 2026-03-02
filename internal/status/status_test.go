@@ -90,7 +90,7 @@ func TestTruncate_longString(t *testing.T) {
 
 func TestWriteStatus_noFiles_noPartitions(t *testing.T) {
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil)
+	WriteStatus(&buf, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Indexed Files ===")
@@ -129,7 +129,7 @@ func TestWriteStatus_withFiles(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil)
+	WriteStatus(&buf, files, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "binlog.000042")
@@ -157,7 +157,7 @@ func TestWriteStatus_withPartitions(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, parts)
+	WriteStatus(&buf, nil, parts, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Partitions ===")
@@ -179,7 +179,7 @@ func TestWriteStatus_errorTruncation(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil)
+	WriteStatus(&buf, files, nil, nil)
 	out := buf.String()
 
 	// The error should be truncated — full 100-char string should not appear.
@@ -211,7 +211,7 @@ func TestWriteStatus_bintrailIDColumn(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil)
+	WriteStatus(&buf, files, nil, nil)
 	out := buf.String()
 
 	// BINTRAIL_ID column header must appear.
@@ -234,7 +234,7 @@ func TestWriteStatus_perServerSummary_multipleServers(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil)
+	WriteStatus(&buf, files, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Summary ===")
@@ -256,7 +256,7 @@ func TestWriteStatus_perServerSummary_unknownID(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil)
+	WriteStatus(&buf, files, nil, nil)
 	out := buf.String()
 
 	// Null bintrail_id must be grouped under "(unknown)".
@@ -277,7 +277,7 @@ func assertContains(t *testing.T, s, want string) {
 
 func TestWriteStatusJSON_empty(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	var result struct {
@@ -316,7 +316,7 @@ func TestWriteStatusJSON_withData(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, files, parts); err != nil {
+	if err := WriteStatusJSON(&buf, files, parts, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -370,7 +370,7 @@ func TestWriteStatusJSON_nullFields(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, files, nil); err != nil {
+	if err := WriteStatusJSON(&buf, files, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -392,5 +392,160 @@ func TestWriteStatusJSON_nullFields(t *testing.T) {
 	}
 	if result.Files[0].ErrorMessage != nil {
 		t.Error("expected null error_message")
+	}
+}
+
+// ─── formatBytes ────────────────────────────────────────────────────────────
+
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		input int64
+		want  string
+	}{
+		{0, "0 B"},
+		{512, "512 B"},
+		{1024, "1.0 KB"},
+		{1536, "1.5 KB"},
+		{1048576, "1.0 MB"},
+		{1073741824, "1.0 GB"},
+		{1288490189, "1.2 GB"},
+		{1099511627776, "1.0 TB"},
+	}
+	for _, tt := range tests {
+		got := formatBytes(tt.input)
+		if got != tt.want {
+			t.Errorf("formatBytes(%d) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+// ─── WriteStatus: archives section ──────────────────────────────────────────
+
+func TestWriteStatus_withArchives(t *testing.T) {
+	archives := &ArchiveStats{
+		TotalFiles:     42,
+		TotalRows:      84000,
+		TotalSizeBytes: 1288490189, // ~1.2 GB
+		LocalFiles:     42,
+		S3Files:        42,
+		S3Buckets:      []string{"my-bintrail-archives"},
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, archives)
+	out := buf.String()
+
+	assertContains(t, out, "=== Archives ===")
+	assertContains(t, out, "42 files")
+	assertContains(t, out, "1.2 GB")
+	assertContains(t, out, "84000 rows")
+	assertContains(t, out, "Local:  42")
+	assertContains(t, out, "S3:     42")
+	assertContains(t, out, "my-bintrail-archives")
+}
+
+func TestWriteStatus_nilArchives_omitsSection(t *testing.T) {
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil)
+	out := buf.String()
+
+	if strings.Contains(out, "=== Archives ===") {
+		t.Error("expected no Archives section when archives is nil")
+	}
+}
+
+func TestWriteStatus_zeroArchives_omitsSection(t *testing.T) {
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, &ArchiveStats{})
+	out := buf.String()
+
+	if strings.Contains(out, "=== Archives ===") {
+		t.Error("expected no Archives section when TotalFiles is 0")
+	}
+}
+
+func TestWriteStatus_archives_noS3(t *testing.T) {
+	archives := &ArchiveStats{
+		TotalFiles:     5,
+		TotalRows:      1000,
+		TotalSizeBytes: 5242880,
+		LocalFiles:     5,
+		S3Files:        0,
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, archives)
+	out := buf.String()
+
+	assertContains(t, out, "=== Archives ===")
+	assertContains(t, out, "S3:     0")
+	if strings.Contains(out, "bucket") {
+		t.Error("expected no bucket info when S3Files is 0")
+	}
+}
+
+// ─── WriteStatusJSON: archives ──────────────────────────────────────────────
+
+func TestWriteStatusJSON_withArchives(t *testing.T) {
+	archives := &ArchiveStats{
+		TotalFiles:     10,
+		TotalRows:      5000,
+		TotalSizeBytes: 1048576,
+		LocalFiles:     10,
+		S3Files:        3,
+		S3Buckets:      []string{"bucket-a"},
+	}
+
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, nil, nil, archives); err != nil {
+		t.Fatal(err)
+	}
+
+	var result struct {
+		Archives *struct {
+			TotalFiles     int      `json:"total_files"`
+			TotalRows      int64    `json:"total_rows"`
+			TotalSizeBytes int64    `json:"total_size_bytes"`
+			TotalSizeHuman string   `json:"total_size_human"`
+			LocalFiles     int      `json:"local_files"`
+			S3Files        int      `json:"s3_files"`
+			S3Buckets      []string `json:"s3_buckets"`
+		} `json:"archives"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if result.Archives == nil {
+		t.Fatal("expected archives key in JSON")
+	}
+	if result.Archives.TotalFiles != 10 {
+		t.Errorf("wrong total_files: %d", result.Archives.TotalFiles)
+	}
+	if result.Archives.TotalRows != 5000 {
+		t.Errorf("wrong total_rows: %d", result.Archives.TotalRows)
+	}
+	if result.Archives.TotalSizeHuman != "1.0 MB" {
+		t.Errorf("wrong total_size_human: %s", result.Archives.TotalSizeHuman)
+	}
+	if result.Archives.S3Files != 3 {
+		t.Errorf("wrong s3_files: %d", result.Archives.S3Files)
+	}
+	if len(result.Archives.S3Buckets) != 1 || result.Archives.S3Buckets[0] != "bucket-a" {
+		t.Errorf("wrong s3_buckets: %v", result.Archives.S3Buckets)
+	}
+}
+
+func TestWriteStatusJSON_nilArchives_omitsKey(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &raw); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if _, ok := raw["archives"]; ok {
+		t.Error("expected no 'archives' key when archives is nil")
 	}
 }

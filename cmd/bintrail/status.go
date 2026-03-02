@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/go-sql-driver/mysql"
@@ -73,9 +74,16 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load partition info: %w", err)
 	}
 
-	if stFormat == "json" {
-		return status.WriteStatusJSON(os.Stdout, files, partStats)
+	// Best-effort: archive_state may not exist in older index databases.
+	archives, err := status.LoadArchiveStats(ctx, db)
+	if err != nil {
+		slog.Warn("could not load archive stats", "error", err)
+		archives = nil
 	}
-	status.WriteStatus(os.Stdout, files, partStats)
+
+	if stFormat == "json" {
+		return status.WriteStatusJSON(os.Stdout, files, partStats, archives)
+	}
+	status.WriteStatus(os.Stdout, files, partStats, archives)
 	return nil
 }

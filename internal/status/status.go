@@ -35,6 +35,18 @@ type PartitionStat struct {
 	Ordinal     int
 }
 
+// ArchiveStats holds aggregate statistics from the archive_state table.
+// A single archive file may be both local and in S3, so
+// LocalFiles + S3Files may exceed TotalFiles.
+type ArchiveStats struct {
+	TotalFiles     int
+	TotalRows      int64
+	TotalSizeBytes int64
+	LocalFiles     int
+	S3Files        int
+	S3Buckets      []string // distinct non-empty buckets
+}
+
 // TSFmt is the timestamp format used in status output.
 const TSFmt = "2006-01-02 15:04:05"
 
@@ -89,8 +101,45 @@ func LoadPartitionStats(ctx context.Context, db *sql.DB, dbName string) ([]Parti
 	return stats, rows.Err()
 }
 
-// WriteStatus writes a three-section status report (Indexed Files, Partitions, Summary) to w.
-func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat) {
+// LoadArchiveStats loads aggregate archive statistics from the archive_state table.
+func LoadArchiveStats(ctx context.Context, db *sql.DB) (*ArchiveStats, error) {
+	var a ArchiveStats
+	err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(SUM(row_count), 0),
+		       COALESCE(SUM(file_size_bytes), 0),
+		       COALESCE(SUM(CASE WHEN local_path IS NOT NULL THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN s3_key IS NOT NULL THEN 1 ELSE 0 END), 0)
+		FROM archive_state`).Scan(
+		&a.TotalFiles, &a.TotalRows, &a.TotalSizeBytes,
+		&a.LocalFiles, &a.S3Files,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.QueryContext(ctx,
+		`SELECT DISTINCT s3_bucket FROM archive_state WHERE s3_bucket IS NOT NULL AND s3_bucket != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var bucket string
+		if err := rows.Scan(&bucket); err != nil {
+			return nil, err
+		}
+		a.S3Buckets = append(a.S3Buckets, bucket)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return &a, nil
+}
+
+// WriteStatus writes a multi-section status report (Indexed Files, Partitions, Archives, Summary) to w.
+func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats) {
 	// ── Section 1: Indexed Files ──────────────────────────────────────────────
 	fmt.Fprintln(w, "=== Indexed Files ===")
 	if len(files) == 0 {
@@ -139,7 +188,22 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat) {
 		fmt.Fprintf(w, "Total events (est.): %d\n", totalRows)
 	}
 
-	// ── Section 3: Summary (grouped by server) ────────────────────────────────
+	// ── Section 3: Archives ──────────────────────────────────────────────────
+	if archives != nil && archives.TotalFiles > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "=== Archives ===")
+		fmt.Fprintf(w, "  Total:  %d files (%s, %d rows)\n",
+			archives.TotalFiles, formatBytes(archives.TotalSizeBytes), archives.TotalRows)
+		fmt.Fprintf(w, "  Local:  %d\n", archives.LocalFiles)
+		if archives.S3Files > 0 {
+			fmt.Fprintf(w, "  S3:     %d (bucket: %s)\n",
+				archives.S3Files, strings.Join(archives.S3Buckets, ", "))
+		} else {
+			fmt.Fprintf(w, "  S3:     0\n")
+		}
+	}
+
+	// ── Section 4: Summary (grouped by server) ────────────────────────────────
 	if len(files) > 0 {
 		// Group files by bintrail_id; preserve insertion order for display.
 		type serverStats struct {
@@ -187,6 +251,28 @@ func DescriptionToHuman(desc string) string {
 	return time.Unix(secs-62167219200, 0).UTC().Format("2006-01-02 15:00 UTC")
 }
 
+// formatBytes converts a byte count to a human-readable string (e.g. "1.2 GB").
+func formatBytes(b int64) string {
+	const (
+		kb = 1024
+		mb = 1024 * kb
+		gb = 1024 * mb
+		tb = 1024 * gb
+	)
+	switch {
+	case b >= tb:
+		return fmt.Sprintf("%.1f TB", float64(b)/float64(tb))
+	case b >= gb:
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(gb))
+	case b >= mb:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(mb))
+	case b >= kb:
+		return fmt.Sprintf("%.1f KB", float64(b)/float64(kb))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
 // Truncate shortens s to at most n bytes, appending "…" if truncated.
 func Truncate(s string, n int) string {
 	if len(s) <= n {
@@ -196,7 +282,7 @@ func Truncate(s string, n int) string {
 }
 
 // WriteStatusJSON writes the status data as a JSON object to w.
-func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat) error {
+func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats) error {
 	type jsonFile struct {
 		BinlogFile    string  `json:"binlog_file"`
 		Status        string  `json:"status"`
@@ -213,10 +299,20 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat) 
 		LessThan  string `json:"less_than"`
 		TableRows int64  `json:"table_rows"`
 	}
+	type jsonArchives struct {
+		TotalFiles     int      `json:"total_files"`
+		TotalRows      int64    `json:"total_rows"`
+		TotalSizeBytes int64    `json:"total_size_bytes"`
+		TotalSizeHuman string   `json:"total_size_human"`
+		LocalFiles     int      `json:"local_files"`
+		S3Files        int      `json:"s3_files"`
+		S3Buckets      []string `json:"s3_buckets"`
+	}
 	type jsonSummary struct {
-		Files  []jsonFile      `json:"files"`
-		Parts  []jsonPartition `json:"partitions"`
-		Total  int64           `json:"total_events_estimate"`
+		Files    []jsonFile      `json:"files"`
+		Parts    []jsonPartition `json:"partitions"`
+		Total    int64           `json:"total_events_estimate"`
+		Archives *jsonArchives   `json:"archives,omitempty"`
 	}
 
 	jf := make([]jsonFile, len(files))
@@ -252,7 +348,20 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat) 
 		total += p.TableRows
 	}
 
+	out := jsonSummary{Files: jf, Parts: jp, Total: total}
+	if archives != nil && archives.TotalFiles > 0 {
+		out.Archives = &jsonArchives{
+			TotalFiles:     archives.TotalFiles,
+			TotalRows:      archives.TotalRows,
+			TotalSizeBytes: archives.TotalSizeBytes,
+			TotalSizeHuman: formatBytes(archives.TotalSizeBytes),
+			LocalFiles:     archives.LocalFiles,
+			S3Files:        archives.S3Files,
+			S3Buckets:      archives.S3Buckets,
+		}
+	}
+
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(jsonSummary{Files: jf, Parts: jp, Total: total})
+	return enc.Encode(out)
 }
