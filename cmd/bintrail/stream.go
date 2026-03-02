@@ -319,7 +319,34 @@ func resolveStart(
 ) (mode, file, gtidStr string, pos uint32, accGTID *gomysql.MysqlGTIDSet, err error) {
 	// Saved checkpoint takes priority — makes re-running the same command
 	// idempotent (the user doesn't need to remove --start-file to resume).
+	// Exception: if the user explicitly requests a *different* mode than the
+	// saved checkpoint (e.g. saved=position but --start-gtid given, or
+	// saved=gtid but --start-file given), honor the flag to allow seamless
+	// mode switching without deleting stream_state.
 	if saved != nil {
+		if startFile != "" && startGTID != "" {
+			return "", "", "", 0, nil, fmt.Errorf("--start-file and --start-gtid are mutually exclusive")
+		}
+
+		// Detect mode switch: user explicitly requests a different mode.
+		switchToGTID := saved.mode == "position" && startGTID != "" && startFile == ""
+		switchToPosition := saved.mode == "gtid" && startFile != "" && startGTID == ""
+
+		if switchToGTID {
+			slog.Warn("switching from position mode to GTID mode", "old_file", saved.binlogFile, "old_pos", saved.binlogPos)
+			startGTID = normalizeGTIDSet(startGTID)
+			gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTID)
+			if parseErr != nil {
+				return "", "", "", 0, nil, fmt.Errorf("invalid --start-gtid: %w", parseErr)
+			}
+			return "gtid", "", startGTID, 0, gs.(*gomysql.MysqlGTIDSet), nil
+		}
+		if switchToPosition {
+			slog.Warn("switching from GTID mode to position mode", "old_gtid_set", saved.gtidSet)
+			return "position", startFile, "", startPos, nil, nil
+		}
+
+		// Same mode or no flags — resume from saved state.
 		if startFile != "" || startGTID != "" {
 			slog.Warn("checkpoint exists; ignoring --start-file/--start-gtid and resuming from saved state")
 		}
