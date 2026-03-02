@@ -157,6 +157,29 @@ if ev.GTID != "" && state.accGTID != nil {
 
 **Checkpoint interval**: Default 10 seconds, configurable via `--checkpoint`. This is the maximum amount of data you'd need to re-index if the process crashes — events between the last checkpoint and the crash are re-indexed on restart (they're deduplicated naturally because the same GTID/position is just re-received from MySQL).
 
+### Mode switching
+
+The stream command supports seamless switching between position mode and GTID mode. If a saved checkpoint exists in `stream_state`, the saved mode is used regardless of which `--start-*` flags are passed on the command line. This makes restarts idempotent — you can always pass the same flags without worrying about overriding the saved state.
+
+To explicitly switch modes (e.g. from position to GTID after enabling GTIDs on the source), use the `--reset` flag:
+
+```sh
+# Switch from position mode to GTID mode
+bintrail stream \
+  --index-dsn  "..." \
+  --source-dsn "..." \
+  --server-id  99999 \
+  --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5000" \
+  --reset
+```
+
+`--reset` clears the saved checkpoint in `stream_state` before starting, forcing the command to use the `--start-file`/`--start-gtid` flags from the command line. Without `--reset`, the saved checkpoint always takes precedence.
+
+**When to use `--reset`:**
+- Switching from position mode to GTID mode (or vice versa)
+- Forcing a restart from a known position after a disaster recovery
+- Skipping ahead past corrupted binlog events
+
 ---
 
 ## Graceful Shutdown
