@@ -172,6 +172,7 @@ Flags:
   --tables         Comma-separated table filter (e.g. mydb.orders,mydb.items)
   --mydumper-path  Path to the mydumper binary (default: mydumper)
   --threads        Number of parallel dump threads (default: 4)
+  --format         Output format: text (default), json
 ```
 
 ```sh
@@ -197,6 +198,7 @@ Flags:
   --row-group-size Rows per Parquet row group (default: 500000)
   --upload         S3 URL to upload Parquet files after generation
   --upload-region  AWS region for --upload
+  --format         Output format: text (default), json
 ```
 
 ```sh
