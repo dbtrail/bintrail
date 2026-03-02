@@ -476,10 +476,22 @@ func TestStreamCmd_allFlagsRegistered(t *testing.T) {
 		"start-file", "start-pos", "start-gtid",
 		"batch-size", "schemas", "tables", "checkpoint", "metrics-addr",
 		"ssl-mode", "ssl-ca", "ssl-cert", "ssl-key",
+		"reset",
 	} {
 		if streamCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on streamCmd", name)
 		}
+	}
+}
+
+// TestStreamCmd_resetDefaultFalse verifies the --reset flag defaults to false.
+func TestStreamCmd_resetDefaultFalse(t *testing.T) {
+	f := streamCmd.Flag("reset")
+	if f == nil {
+		t.Fatal("flag --reset not registered")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("expected default reset=false, got %q", f.DefValue)
 	}
 }
 

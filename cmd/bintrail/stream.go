@@ -45,6 +45,12 @@ Start position must be specified on the first run via --start-file or
 even if --start-file/--start-gtid are still present on the command line. This
 makes re-running the same command idempotent.
 
+Use --reset to clear the saved checkpoint and force a new start position:
+
+  bintrail stream --reset --start-file mysql-bin.000500 ...
+
+Without --reset, the checkpoint always wins (idempotent behavior is preserved).
+
 Graceful shutdown: send SIGINT or SIGTERM to flush the current batch and write
 a checkpoint before exiting.`,
 	RunE: runStream,
@@ -67,6 +73,7 @@ var (
 	strmSSLCert     string
 	strmSSLKey      string
 	strmFormat      string
+	strmReset       bool
 )
 
 func init() {
@@ -86,6 +93,7 @@ func init() {
 	streamCmd.Flags().StringVar(&strmSSLCert, "ssl-cert", "", "Path to client certificate file for mutual TLS")
 	streamCmd.Flags().StringVar(&strmSSLKey, "ssl-key", "", "Path to client private key file for mutual TLS")
 	streamCmd.Flags().StringVar(&strmFormat, "format", "text", "Output format: text or json")
+	streamCmd.Flags().BoolVar(&strmReset, "reset", false, "Clear saved checkpoint before starting (forces use of --start-file/--start-gtid)")
 	_ = streamCmd.MarkFlagRequired("index-dsn")
 	_ = streamCmd.MarkFlagRequired("source-dsn")
 	_ = streamCmd.MarkFlagRequired("server-id")
@@ -550,6 +558,19 @@ func runStream(cmd *cobra.Command, args []string) error {
 	saved, err := loadStreamState(indexDB)
 	if err != nil {
 		return fmt.Errorf("failed to load stream state: %w", err)
+	}
+
+	if strmReset {
+		if saved != nil {
+			if _, err := indexDB.Exec(`DELETE FROM stream_state WHERE id = 1`); err != nil {
+				return fmt.Errorf("failed to reset stream state: %w", err)
+			}
+			slog.Warn("cleared saved checkpoint (--reset)", "old_mode", saved.mode,
+				"old_file", saved.binlogFile, "old_pos", saved.binlogPos)
+			saved = nil
+		} else {
+			slog.Info("--reset specified but no saved checkpoint exists; ignoring")
+		}
 	}
 
 	mode, startFile, startGTIDStr, startPos, accGTID, err := resolveStart(
