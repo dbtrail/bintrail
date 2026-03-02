@@ -235,18 +235,18 @@ func TestBuildPartitionDefs_countAndFuture(t *testing.T) {
 	}
 }
 
-func TestBuildPartitionDefs_spansFromPastToCurrentHour(t *testing.T) {
-	// now truncated to 14:00; with 48 partitions: start = 14:00 - 47h = 2026-02-26 15:00 UTC
+func TestBuildPartitionDefs_spansFromCurrentHourForward(t *testing.T) {
+	// now truncated to 14:00; with 48 partitions: start = 14:00, end = 14:00 + 47h = 2026-03-02 13:00 UTC
 	now := time.Date(2026, 2, 28, 14, 30, 0, 0, time.UTC)
 	parts := buildPartitionDefs(now, 48)
 
-	// First partition starts 47 hours before the current hour
-	if !strings.Contains(parts[0], "p_2026022615") {
-		t.Errorf("expected first partition p_2026022615 (47h ago), got %q", parts[0])
+	// First partition starts at the current hour
+	if !strings.Contains(parts[0], "p_2026022814") {
+		t.Errorf("expected first partition p_2026022814 (current hour), got %q", parts[0])
 	}
-	// Last named partition covers the current hour (14:00 UTC today)
-	if !strings.Contains(parts[47], "p_2026022814") {
-		t.Errorf("expected last named partition p_2026022814 (current hour), got %q", parts[47])
+	// Last named partition covers 47 hours from now
+	if !strings.Contains(parts[47], "p_2026030213") {
+		t.Errorf("expected last named partition p_2026030213 (+47h), got %q", parts[47])
 	}
 }
 
@@ -254,19 +254,19 @@ func TestBuildPartitionDefs_boundaryValues(t *testing.T) {
 	now := time.Date(2026, 2, 28, 14, 30, 0, 0, time.UTC)
 	parts := buildPartitionDefs(now, 3)
 
-	// 3 partitions: p_2026022812, p_2026022813, p_2026022814, p_future
-	if !strings.Contains(parts[0], "p_2026022812") {
-		t.Errorf("expected p_2026022812 (2h ago), got %q", parts[0])
+	// 3 partitions: p_2026022814, p_2026022815, p_2026022816, p_future
+	if !strings.Contains(parts[0], "p_2026022814") {
+		t.Errorf("expected p_2026022814 (current hour), got %q", parts[0])
 	}
-	if !strings.Contains(parts[1], "p_2026022813") {
-		t.Errorf("expected p_2026022813, got %q", parts[1])
+	if !strings.Contains(parts[1], "p_2026022815") {
+		t.Errorf("expected p_2026022815, got %q", parts[1])
 	}
-	if !strings.Contains(parts[2], "p_2026022814") {
-		t.Errorf("expected p_2026022814, got %q", parts[2])
+	if !strings.Contains(parts[2], "p_2026022816") {
+		t.Errorf("expected p_2026022816, got %q", parts[2])
 	}
-	// p_2026022812 boundary: LESS THAN TO_SECONDS('2026-02-28 13:00:00')
-	if !strings.Contains(parts[0], "2026-02-28 13:00:00") {
-		t.Errorf("expected boundary at 2026-02-28 13:00:00, got %q", parts[0])
+	// p_2026022814 boundary: LESS THAN TO_SECONDS('2026-02-28 15:00:00')
+	if !strings.Contains(parts[0], "2026-02-28 15:00:00") {
+		t.Errorf("expected boundary at 2026-02-28 15:00:00, got %q", parts[0])
 	}
 }
 
