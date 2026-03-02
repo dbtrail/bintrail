@@ -508,6 +508,20 @@ bintrail rotate \
 
 `--archive-dir` is still required with `--archive-s3` — files are written locally first, then uploaded. Point it at a temporary directory if you don't need local copies after upload. Archives are stored in a Hive-partitioned layout: `bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/events_<HH>.parquet`, compatible with Athena, Glue, and DuckDB.
 
+**Retry after a partial failure:** If archiving or S3 upload fails partway through (network error, disk full, etc.), re-run with `--retry` to pick up where it left off:
+
+```sh
+bintrail rotate \
+  --index-dsn         "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain            7d \
+  --archive-dir       /tmp/rotate-staging \
+  --archive-s3        s3://my-bintrail-archives/events/ \
+  --archive-s3-region us-east-1 \
+  --retry
+```
+
+`--retry` skips partitions whose local Parquet file already exists and S3 uploads that already succeeded (tracked in the `archive_state` table).
+
 **Query archived events** using `--archive-s3` on the `query` command. Provide `--bintrail-id` to scope the archive path to your server's UUID (shown in `bintrail status`):
 
 ```sh
@@ -578,6 +592,17 @@ bintrail baseline \
 ```
 
 `--upload` writes Parquet files to `--output` first, then uploads every file to S3 preserving the relative directory structure (`timestamp/database/table.parquet`). Uses the standard AWS credential chain — environment variables, `~/.aws/credentials`, or EC2/ECS instance metadata. `--upload-region` is optional if `AWS_REGION` is already set in your environment or `~/.aws/config`.
+
+If the upload fails partway through, re-run with `--retry` to skip files that already exist locally and in S3:
+
+```bash
+bintrail baseline \
+  --input         /path/to/mydumper-output \
+  --output        /tmp/baselines \
+  --upload        s3://bintrail-audit-baselines/baselines/ \
+  --upload-region us-east-1 \
+  --retry
+```
 
 **Option 2 — Generate locally, upload separately with the AWS CLI:**
 
@@ -705,6 +730,19 @@ bintrail stream \
   --server-id  99999
 # No --start-gtid needed — resumed from stream_state checkpoint
 ```
+
+**Force a new start position** — use `--reset` to clear the saved checkpoint and start from a specific position:
+
+```sh
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "bintrail_repl:secret@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
+  --server-id  99999 \
+  --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-8000" \
+  --reset
+```
+
+`--reset` is useful when switching between position mode and GTID mode, or when you need to skip ahead past corrupted events. Without `--reset`, the saved checkpoint always takes precedence over `--start-*` flags.
 
 **Monitor** replication lag and throughput:
 
