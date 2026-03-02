@@ -317,15 +317,11 @@ func resolveStart(
 	startFile, startGTID string, startPos uint32,
 	saved *streamState,
 ) (mode, file, gtidStr string, pos uint32, accGTID *gomysql.MysqlGTIDSet, err error) {
-	if startFile != "" && startGTID != "" {
-		return "", "", "", 0, nil, fmt.Errorf("--start-file and --start-gtid are mutually exclusive")
-	}
-
 	// Saved checkpoint takes priority — makes re-running the same command
 	// idempotent (the user doesn't need to remove --start-file to resume).
 	if saved != nil {
 		if startFile != "" || startGTID != "" {
-			slog.Info("checkpoint exists; ignoring --start-file/--start-gtid and resuming from saved state")
+			slog.Warn("checkpoint exists; ignoring --start-file/--start-gtid and resuming from saved state")
 		}
 		if saved.mode == "gtid" {
 			normalized := normalizeGTIDSet(saved.gtidSet)
@@ -341,6 +337,9 @@ func resolveStart(
 	}
 
 	// No checkpoint — use flags for initial start position (first run).
+	if startFile != "" && startGTID != "" {
+		return "", "", "", 0, nil, fmt.Errorf("--start-file and --start-gtid are mutually exclusive")
+	}
 	if startGTID != "" {
 		startGTID = normalizeGTIDSet(startGTID)
 		gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTID)
