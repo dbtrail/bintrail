@@ -26,8 +26,9 @@ mydumper is a standalone binary — it is **not** bundled with bintrail. Install
 ### Ubuntu / Debian
 
 ```sh
-# From the mydumper releases page (recommended)
-wget https://github.com/mydumper/mydumper/releases/latest/download/mydumper_0.16.7-3.jammy_amd64.deb
+# Download from the releases page — check for the latest version:
+# https://github.com/mydumper/mydumper/releases/latest
+wget https://github.com/mydumper/mydumper/releases/download/v0.16.7-3/mydumper_0.16.7-3.jammy_amd64.deb
 sudo dpkg -i mydumper_*.deb
 
 # Or from the system repository (may be older)
@@ -37,7 +38,8 @@ sudo apt-get install mydumper
 ### RHEL / CentOS / Amazon Linux
 
 ```sh
-wget https://github.com/mydumper/mydumper/releases/latest/download/mydumper-0.16.7-3.el8.x86_64.rpm
+# Check for the latest version: https://github.com/mydumper/mydumper/releases/latest
+wget https://github.com/mydumper/mydumper/releases/download/v0.16.7-3/mydumper-0.16.7-3.el8.x86_64.rpm
 sudo rpm -i mydumper-*.rpm
 ```
 
@@ -196,7 +198,7 @@ bintrail baseline \
   --upload-region us-east-1
 ```
 
-See [Scenario H in the Practical Guide](guide.md#scenario-h-uploading-baseline-parquet-files-to-s3) for full S3 setup instructions.
+See [Scenario I in the Practical Guide](guide.md#scenario-i-uploading-baseline-parquet-files-to-s3) for full S3 setup instructions.
 
 ### No database connection required
 
