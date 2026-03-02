@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -247,10 +248,50 @@ func TestRotateCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"index-dsn", "retain", "add-future", "no-replace",
 		"archive-dir", "archive-compression", "archive-s3", "archive-s3-region",
+		"retry",
 	} {
 		if rotateCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on rotateCmd", name)
 		}
+	}
+}
+
+func TestRotateCmd_retryDefaultFalse(t *testing.T) {
+	f := rotateCmd.Flag("retry")
+	if f == nil {
+		t.Fatal("flag --retry not registered")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("expected default retry=false, got %q", f.DefValue)
+	}
+}
+
+// ─── fileExists ──────────────────────────────────────────────────────────────
+
+func TestFileExists(t *testing.T) {
+	dir := t.TempDir()
+
+	// Non-existent file.
+	if fileExists(dir + "/nope.parquet") {
+		t.Error("expected false for non-existent file")
+	}
+
+	// Empty file (0 bytes).
+	empty := dir + "/empty.parquet"
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(empty) {
+		t.Error("expected false for empty file")
+	}
+
+	// Non-empty file.
+	valid := dir + "/valid.parquet"
+	if err := os.WriteFile(valid, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !fileExists(valid) {
+		t.Error("expected true for non-empty file")
 	}
 }
 
