@@ -587,7 +587,7 @@ const ddlArchiveState = `CREATE TABLE IF NOT EXISTS archive_state (
     s3_bucket       VARCHAR(255),
     s3_key          VARCHAR(1024),
     s3_uploaded_at  DATETIME,
-    archived_at     DATETIME NOT NULL DEFAULT UTC_TIMESTAMP(),
+    archived_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_partition (partition_name, bintrail_id)
 ) ENGINE=InnoDB`
 
