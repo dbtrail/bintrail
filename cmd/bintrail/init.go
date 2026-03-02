@@ -640,12 +640,12 @@ const ddlAccessRules = `CREATE TABLE IF NOT EXISTS access_rules (
 
 const ddlSchemaChanges = `CREATE TABLE IF NOT EXISTS schema_changes (
     id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    detected_at     DATETIME(6) NOT NULL,
+    detected_at     DATETIME NOT NULL,
     binlog_file     VARCHAR(255) NOT NULL,
     binlog_pos      BIGINT UNSIGNED NOT NULL,
     gtid            VARCHAR(255) DEFAULT NULL,
-    schema_name     VARCHAR(255) NOT NULL,
-    table_name      VARCHAR(255) NOT NULL,
+    schema_name     VARCHAR(64) NOT NULL,
+    table_name      VARCHAR(64) NOT NULL,
     ddl_type        VARCHAR(50) NOT NULL,
     ddl_query       TEXT NOT NULL,
     snapshot_id     INT UNSIGNED DEFAULT NULL COMMENT 'auto-snapshot after DDL; NULL when not taken (file mode or snapshot failure)',

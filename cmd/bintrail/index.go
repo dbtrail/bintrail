@@ -468,6 +468,7 @@ func insertSchemaChange(db *sql.DB, ev parser.Event, snapshotID *int) error {
 }
 
 // nullOrStringVal returns nil when s is empty (stored as SQL NULL), else s.
+// Mirrors nullOrString in internal/indexer/indexer.go.
 func nullOrStringVal(s string) any {
 	if s == "" {
 		return nil

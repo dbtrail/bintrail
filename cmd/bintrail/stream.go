@@ -739,6 +739,8 @@ func runStream(cmd *cobra.Command, args []string) error {
 
 	// ── 11. DDL auto-snapshot handler ────────────────────────────────────────────
 	schemas := parseSchemaList(strmSchemas)
+	// ddlHandler performs best-effort snapshot + recording. It always returns nil
+	// so that streaming continues even if the snapshot or recording fails.
 	ddlHandler := func(ev parser.Event) error {
 		slog.Info("DDL detected — taking auto-snapshot",
 			"file", ev.BinlogFile, "pos", ev.EndPos,
