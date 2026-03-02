@@ -558,8 +558,6 @@ func TestResolveStart_customStartPos(t *testing.T) {
 	}
 }
 
-// TestResolveStart_savedGTIDWinsOverFileFlag verifies that a saved GTID-mode
-// checkpoint is used even when --start-file is provided (idempotent restart).
 // TestResolveStart_savedGTID_fileFlagSwitchesMode verifies that a saved GTID-mode
 // checkpoint is overridden when --start-file requests a mode switch to position.
 func TestResolveStart_savedGTID_fileFlagSwitchesMode(t *testing.T) {
