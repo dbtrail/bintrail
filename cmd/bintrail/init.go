@@ -434,9 +434,9 @@ func ensureDatabase(cfg *mysql.Config, dbName string) error {
 // buildPartitionDefs returns numPartitions hourly partition clauses ending at
 // the current hour (truncated from now), followed by a p_future catch-all.
 //
-// Partitions span backwards from the current hour so that historical binlog
-// events are distributed across the correct hourly buckets rather than
-// accumulating in a single early partition. With numPartitions=48 (the
+// Partitions span forward from the current hour so that incoming events
+// land in named partitions rather than accumulating in p_future.
+// With numPartitions=48 (the
 // default), the range covers the current hour through the next 47 hours.
 // New events arriving beyond that range fall into p_future until rotate adds
 // more named partitions.
