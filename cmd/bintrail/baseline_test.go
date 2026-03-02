@@ -36,6 +36,7 @@ func TestBaselineCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"input", "output", "timestamp", "tables",
 		"compression", "row-group-size", "upload", "upload-region",
+		"retry",
 	} {
 		if baselineCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on baselineCmd", name)
@@ -72,6 +73,16 @@ func TestBaselineCmd_emptyStringDefaults(t *testing.T) {
 		if f.DefValue != "" {
 			t.Errorf("flag --%s: expected empty default, got %q", name, f.DefValue)
 		}
+	}
+}
+
+func TestBaselineCmd_retryDefaultFalse(t *testing.T) {
+	f := baselineCmd.Flag("retry")
+	if f == nil {
+		t.Fatal("flag --retry not registered")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("expected default retry=false, got %q", f.DefValue)
 	}
 }
 

@@ -974,3 +974,52 @@ func TestFilterTablesNoMatch(t *testing.T) {
 		t.Errorf("TablesProcessed = %d, want 0 (filter matched nothing)", stats.TablesProcessed)
 	}
 }
+
+func TestRunRetrySkipsExistingFiles(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+
+	// Write metadata + schema + data for one table.
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const sqlData = "INSERT INTO `orders` VALUES(1,10,'9.99','note','2025-01-01 00:00:00','2025-01-15');\n"
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"), []byte(sqlData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{
+		InputDir:     inputDir,
+		OutputDir:    outputDir,
+		Compression:  "none",
+		RowGroupSize: 100,
+	}
+
+	// First run: creates the Parquet file.
+	stats1, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if stats1.RowsWritten != 1 {
+		t.Fatalf("first Run: RowsWritten = %d, want 1", stats1.RowsWritten)
+	}
+
+	// Second run with Retry=true: should skip the existing file.
+	cfg.Retry = true
+	stats2, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("retry Run: %v", err)
+	}
+	if stats2.TablesProcessed != 1 {
+		t.Errorf("retry Run: TablesProcessed = %d, want 1", stats2.TablesProcessed)
+	}
+	if stats2.RowsWritten != 0 {
+		t.Errorf("retry Run: RowsWritten = %d, want 0 (file was skipped)", stats2.RowsWritten)
+	}
+	if stats2.FilesWritten != 1 {
+		t.Errorf("retry Run: FilesWritten = %d, want 1 (counted as existing)", stats2.FilesWritten)
+	}
+}

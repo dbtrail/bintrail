@@ -25,6 +25,7 @@ type Config struct {
 	Tables       []string  // "db.table" filter; nil = all
 	Compression  string    // "zstd", "snappy", "gzip", "none"
 	RowGroupSize int       // rows per row group
+	Retry        bool      // skip tables whose output Parquet file already exists
 }
 
 // Stats describes the outcome of a baseline run.
@@ -102,6 +103,19 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 			}
 
 			outPath := filepath.Join(cfg.OutputDir, tsDir, tf.Database, tf.Table+".parquet")
+
+			if cfg.Retry {
+				if fi, err := os.Stat(outPath); err == nil && fi.Size() > 0 {
+					slog.Info("skipping existing file (--retry)",
+						"db", tf.Database, "table", tf.Table, "file", outPath)
+					mu.Lock()
+					stats.TablesProcessed++
+					stats.FilesWritten++
+					mu.Unlock()
+					return
+				}
+			}
+
 			writerCfg := WriterConfig{
 				Compression:  compression,
 				RowGroupSize: rowGroupSize,
