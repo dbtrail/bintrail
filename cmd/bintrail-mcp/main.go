@@ -302,9 +302,16 @@ func statusTool(ctx context.Context, req *mcp.CallToolRequest, args statusArgs) 
 		return errorResult(fmt.Errorf("failed to load partition info: %w", err)), nil, nil
 	}
 
+	// Best-effort: coverage info from schema_changes table.
+	coverage, coverageErr := status.LoadCoverage(ctx, db)
+	if coverageErr != nil {
+		slog.Warn("could not load coverage info", "error", coverageErr)
+		coverage = nil
+	}
+
 	var buf bytes.Buffer
 	// Archive stats omitted for now — can be added in a follow-up.
-	status.WriteStatus(&buf, files, parts, nil)
+	status.WriteStatus(&buf, files, parts, nil, coverage)
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{

@@ -17,6 +17,7 @@ import (
 type Indexer struct {
 	db        *sql.DB
 	batchSize int
+	onDDL     func(ev parser.Event) error
 }
 
 // New creates an Indexer writing to db with the given batch size.
@@ -25,6 +26,13 @@ func New(db *sql.DB, batchSize int) *Indexer {
 		batchSize = 1000
 	}
 	return &Indexer{db: db, batchSize: batchSize}
+}
+
+// SetOnDDL registers a callback invoked when a DDL event is received.
+// The current batch is flushed before the callback is called.
+// DDL events are NOT inserted into binlog_events.
+func (idx *Indexer) SetOnDDL(fn func(parser.Event) error) {
+	idx.onDDL = fn
 }
 
 // Run reads events from the channel until it is closed or ctx is cancelled,
@@ -54,6 +62,18 @@ func (idx *Indexer) Run(ctx context.Context, events <-chan parser.Event) (int64,
 			if !ok {
 				// Channel closed — flush the final partial batch.
 				return total, flush()
+			}
+			// DDL events: flush current batch, invoke callback, skip insertion.
+			if ev.EventType == parser.EventDDL {
+				if err := flush(); err != nil {
+					return total, err
+				}
+				if idx.onDDL != nil {
+					if err := idx.onDDL(ev); err != nil {
+						return total, fmt.Errorf("onDDL callback: %w", err)
+					}
+				}
+				continue
 			}
 			batch = append(batch, ev)
 			if len(batch) >= idx.batchSize {

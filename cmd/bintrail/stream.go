@@ -26,6 +26,7 @@ import (
 	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
 	"github.com/bintrail/bintrail/internal/indexer"
+	"github.com/bintrail/bintrail/internal/metadata"
 	"github.com/bintrail/bintrail/internal/observe"
 	"github.com/bintrail/bintrail/internal/parser"
 	"github.com/bintrail/bintrail/internal/serverid"
@@ -396,6 +397,9 @@ func resolveStart(
 
 // streamLoop consumes parser events, flushes batches to MySQL, and writes
 // checkpoints to stream_state at the given interval.
+// onDDL is called when a DDL event is received (after flushing the current batch).
+// It may be nil, in which case no handler callback is invoked (position/GTID
+// tracking still occurs).
 func streamLoop(
 	ctx context.Context,
 	events <-chan parser.Event,
@@ -403,6 +407,7 @@ func streamLoop(
 	db *sql.DB,
 	checkpointInterval time.Duration,
 	state *streamState,
+	onDDL func(parser.Event) error,
 ) error {
 	batch := make([]parser.Event, 0, idx.BatchSize())
 	ticker := time.NewTicker(checkpointInterval)
@@ -470,6 +475,20 @@ func streamLoop(
 			}
 			if !ev.Timestamp.IsZero() {
 				state.lastEventTime = sql.NullTime{Time: ev.Timestamp, Valid: true}
+			}
+
+			// DDL events: flush batch, invoke handler, skip insertion.
+			if ev.EventType == parser.EventDDL {
+				if err := flush(); err != nil {
+					return err
+				}
+				if onDDL != nil {
+					if err := onDDL(ev); err != nil {
+						slog.Error("DDL handler failed", "error", err,
+						"file", ev.BinlogFile, "pos", ev.EndPos)
+					}
+				}
+				continue
 			}
 
 			observe.StreamEventsReceived.Inc()
@@ -718,10 +737,44 @@ func runStream(cmd *cobra.Command, args []string) error {
 		parseErrCh <- sp.Run(ctx, streamer, events)
 	}()
 
-	// ── 11. Run stream loop with checkpointing ──────────────────────────────────
+	// ── 11. DDL auto-snapshot handler ────────────────────────────────────────────
+	schemas := parseSchemaList(strmSchemas)
+	// ddlHandler performs best-effort snapshot + recording. It always returns nil
+	// so that streaming continues even if the snapshot or recording fails.
+	ddlHandler := func(ev parser.Event) error {
+		slog.Info("DDL detected — taking auto-snapshot",
+			"file", ev.BinlogFile, "pos", ev.EndPos,
+			"ddl_type", ev.DDLType, "schema", ev.Schema, "table", ev.Table)
+
+		stats, snapErr := metadata.TakeSnapshot(sourceDB, indexDB, schemas)
+		var snapID *int
+		if snapErr != nil {
+			slog.Error("auto-snapshot after DDL failed; subsequent events may use stale schema",
+				"error", snapErr, "ddl_type", ev.DDLType, "table", ev.Table)
+		} else {
+			snapID = &stats.SnapshotID
+			newResolver, resolverErr := metadata.NewResolver(indexDB, stats.SnapshotID)
+			if resolverErr != nil {
+				slog.Warn("failed to load new resolver after DDL snapshot", "error", resolverErr)
+			} else {
+				sp.SwapResolver(newResolver)
+				slog.Info("auto-snapshot taken; resolver updated",
+					"snapshot_id", stats.SnapshotID,
+					"tables", stats.TableCount,
+					"columns", stats.ColumnCount)
+			}
+		}
+
+		if err := insertSchemaChange(indexDB, ev, snapID); err != nil {
+			slog.Warn("failed to record schema change", "error", err)
+		}
+		return nil
+	}
+
+	// ── 12. Run stream loop with checkpointing ──────────────────────────────────
 	fmt.Printf("Streaming started (server-id=%d, checkpoint=%ds)\n", strmServerID, strmCheckpoint)
 	loopErr := streamLoop(ctx, events, idx, indexDB,
-		time.Duration(strmCheckpoint)*time.Second, state)
+		time.Duration(strmCheckpoint)*time.Second, state, ddlHandler)
 
 	parseErr := <-parseErrCh
 

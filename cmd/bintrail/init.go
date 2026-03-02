@@ -176,6 +176,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	logTable("archive_state")
 
+	if _, err := db.Exec(ddlSchemaChanges); err != nil {
+		return fmt.Errorf("failed to create schema_changes: %w", err)
+	}
+	logTable("schema_changes")
+
 	var s3Result *string
 	if initS3Bucket != "" {
 		if initFormat != "json" {
@@ -629,4 +634,20 @@ const ddlAccessRules = `CREATE TABLE IF NOT EXISTS access_rules (
     created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY idx_profile_flag (profile_id, flag),
     CONSTRAINT fk_access_rules_profile FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE
+) ENGINE=InnoDB`
+
+// ─── DDL tracking ─────────────────────────────────────────────────────────────
+
+const ddlSchemaChanges = `CREATE TABLE IF NOT EXISTS schema_changes (
+    id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    detected_at     DATETIME NOT NULL,
+    binlog_file     VARCHAR(255) NOT NULL,
+    binlog_pos      BIGINT UNSIGNED NOT NULL,
+    gtid            VARCHAR(255) DEFAULT NULL,
+    schema_name     VARCHAR(64) NOT NULL,
+    table_name      VARCHAR(64) NOT NULL,
+    ddl_type        VARCHAR(50) NOT NULL,
+    ddl_query       TEXT NOT NULL,
+    snapshot_id     INT UNSIGNED DEFAULT NULL COMMENT 'auto-snapshot after DDL; NULL when not taken (file mode or snapshot failure)',
+    INDEX idx_detected_at (detected_at)
 ) ENGINE=InnoDB`
