@@ -428,3 +428,26 @@ func TestDDLStreamState_hasBintrailID(t *testing.T) {
 		t.Error("ddlStreamState bintrail_id must be nullable (NULL DEFAULT NULL)")
 	}
 }
+
+// ─── DDL content: archive_state ───────────────────────────────────────────────
+
+func TestDDLArchiveState_hasExpectedColumns(t *testing.T) {
+	for _, col := range []string{
+		"partition_name", "bintrail_id", "local_path",
+		"file_size_bytes", "row_count",
+		"s3_bucket", "s3_key", "s3_uploaded_at", "archived_at",
+	} {
+		if !strings.Contains(ddlArchiveState, col) {
+			t.Errorf("ddlArchiveState must contain %s column", col)
+		}
+	}
+}
+
+func TestDDLArchiveState_hasUniqueKey(t *testing.T) {
+	if !strings.Contains(ddlArchiveState, "uq_partition") {
+		t.Error("ddlArchiveState must contain uq_partition unique key")
+	}
+	if !strings.Contains(ddlArchiveState, "partition_name, bintrail_id") {
+		t.Error("uq_partition must be on (partition_name, bintrail_id)")
+	}
+}

@@ -171,6 +171,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	logTable("access_rules")
 
+	if _, err := db.Exec(ddlArchiveState); err != nil {
+		return fmt.Errorf("failed to create archive_state: %w", err)
+	}
+	logTable("archive_state")
+
 	var s3Result *string
 	if initS3Bucket != "" {
 		if initFormat != "json" {
@@ -564,6 +569,22 @@ var (
 	ddlBintrailServers       = serverid.DDLBintrailServers
 	ddlBintrailServerChanges = serverid.DDLBintrailServerChanges
 )
+
+// ─── Archive tracking ─────────────────────────────────────────────────────────
+
+const ddlArchiveState = `CREATE TABLE IF NOT EXISTS archive_state (
+    id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    partition_name  VARCHAR(20) NOT NULL,
+    bintrail_id     VARCHAR(36),
+    local_path      VARCHAR(1024),
+    file_size_bytes BIGINT UNSIGNED,
+    row_count       BIGINT UNSIGNED,
+    s3_bucket       VARCHAR(255),
+    s3_key          VARCHAR(1024),
+    s3_uploaded_at  DATETIME,
+    archived_at     DATETIME NOT NULL DEFAULT UTC_TIMESTAMP(),
+    UNIQUE KEY uq_partition (partition_name, bintrail_id)
+) ENGINE=InnoDB`
 
 // ─── RBAC tables ─────────────────────────────────────────────────────────────
 
