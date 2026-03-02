@@ -256,6 +256,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 						if err := uploadFile(ctx, s3Client, outPath, s3Bucket, key); err != nil {
 							return 0, 0, fmt.Errorf("upload %s to S3: %w", name, err)
 						}
+						slog.Info("uploaded archive to S3", "partition", name, "bucket", s3Bucket, "key", key)
 						if rotFormat != "json" {
 							fmt.Fprintf(os.Stdout, "uploaded %s → s3://%s/%s\n", name, s3Bucket, key)
 						}
