@@ -86,6 +86,14 @@ func TestBuildMydumperArgs_compressAndComplete(t *testing.T) {
 	}
 }
 
+func TestBuildMydumperArgs_lockAndTrx(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil)
+	assertArgsContainPair(t, args, "--sync-thread-lock-mode", "NO_LOCK")
+	if !argsContain(args, "--trx-tables") {
+		t.Error("expected --trx-tables in args")
+	}
+}
+
 func TestBuildMydumperArgs_noPassword(t *testing.T) {
 	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil)
 	if argsContain(args, "--password") {

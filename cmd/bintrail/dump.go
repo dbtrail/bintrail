@@ -124,6 +124,8 @@ func buildMydumperArgs(host string, port uint16, user, password, outputDir strin
 		"--threads", strconv.Itoa(threads),
 		"--compress-protocol",
 		"--complete-insert",
+		"--sync-thread-lock-mode", "NO_LOCK",
+		"--trx-tables",
 	}
 
 	if password != "" {
