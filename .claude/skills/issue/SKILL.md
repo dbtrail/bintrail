@@ -55,6 +55,6 @@ Follow these steps in order:
    )"
    ```
 
-10. **Review**: Run `/code-review` to check the implementation for critical issues, bugs, and code quality problems. Fix any critical or important issues found before proceeding.
+10. **Review**: Run `/review` to check the implementation for critical issues, bugs, and code quality problems. Fix any critical or important issues found before proceeding.
 
 11. **Return PR URL**: Print the PR link so the user can review and merge. Once the PR is approved, run `/merge $ARGUMENTS` to squash-merge it, pull main, and clean up the worktree and branches.
