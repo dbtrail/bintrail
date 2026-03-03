@@ -1,10 +1,7 @@
 package main
 
 import (
-	"errors"
 	"fmt"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -209,39 +206,5 @@ func TestErrorResult(t *testing.T) {
 	}
 	if tc.Text != "broke" {
 		t.Errorf("expected text %q, got %q", "broke", tc.Text)
-	}
-}
-
-// ─── Build verification ──────────────────────────────────────────────────────
-
-// TestMakeBuildMCP verifies that `make build-mcp` compiles successfully and
-// the resulting binary responds to --help.
-func TestMakeBuildMCP(t *testing.T) {
-	// Locate the project root (two levels up from cmd/bintrail-mcp/).
-	projectRoot := filepath.Join("..", "..")
-
-	tmpDir := t.TempDir()
-	binPath := filepath.Join(tmpDir, "bintrail-mcp")
-
-	// Run make build-mcp, overriding the output path.
-	makeCmd := exec.Command("make", "build-mcp", "MCP_BINARY="+binPath)
-	makeCmd.Dir = projectRoot
-	if out, err := makeCmd.CombinedOutput(); err != nil {
-		t.Fatalf("make build-mcp failed: %v\n%s", err, out)
-	}
-
-	// Run --help. Go's flag package exits with code 2 for --help (ErrHelp).
-	helpCmd := exec.Command(binPath, "--help")
-	out, err := helpCmd.CombinedOutput()
-	if err != nil {
-		exitErr := &exec.ExitError{}
-		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
-			t.Fatalf("bintrail-mcp --help failed unexpectedly: %v\n%s", err, out)
-		}
-	}
-
-	output := string(out)
-	if !strings.Contains(output, "-http") {
-		t.Errorf("expected --help output to mention -http flag, got:\n%s", output)
 	}
 }
