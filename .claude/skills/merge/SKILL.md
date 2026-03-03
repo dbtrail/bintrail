@@ -7,7 +7,7 @@ Squash-merge PR #$ARGUMENTS and clean up the worktree and branches.
 
 Follow these steps **in order**. Do not skip steps.
 
-1. **Capture context before anything else** — all subsequent git commands depend on this:
+1. **Capture context and escape the worktree** — all subsequent steps depend on this:
    ```bash
    git worktree list --porcelain
    ```
@@ -15,6 +15,12 @@ Follow these steps **in order**. Do not skip steps.
    - The **current** worktree path is the one whose `HEAD` matches the current branch. Save it as `<worktree-path>`.
    - The current branch name is on the `branch` line (strip the `refs/heads/` prefix). Save it as `<branch>`.
    - If the session is NOT inside a worktree (i.e. only one entry), set `<worktree-path>` to empty.
+
+   **CRITICAL — immediately change the Bash tool's CWD to the main repo**:
+   ```bash
+   cd <main-repo>
+   ```
+   This MUST be a standalone Bash call (not combined with other commands) so that the Bash tool persists `<main-repo>` as the CWD for all future calls. If you skip this, later steps will fail after the worktree directory is removed — the Bash tool cannot start a shell in a non-existent directory, so even `cd` inside a command won't help.
 
 2. **Confirm PR is mergeable**: Use `gh pr view $ARGUMENTS --json state,mergeable,headRefName` to check:
    - `state` must be `"OPEN"` — abort with a clear message if already merged or closed.
@@ -34,21 +40,17 @@ Follow these steps **in order**. Do not skip steps.
    ```
    If this fails with "remote ref does not exist", the branch was already deleted — that's fine, continue.
 
-6. **Remove the worktree and delete the local branch in one command** — these two steps must be combined because:
-   - Git refuses to delete a branch that is still checked out in a worktree.
-   - Removing the worktree destroys the session's CWD, bricking any subsequent Bash commands.
-   - Solving both: `cd` to `<main-repo>` first, remove the worktree, then delete the branch — all in a single shell command so the CWD lands on the main repo before the worktree directory disappears.
-   - **CRITICAL**: Every single Bash command in this step MUST start with `cd <main-repo> &&`. The CWD may already be a deleted worktree directory, so omitting the `cd` will cause all commands to fail.
+6. **Remove the worktree and delete the local branch** — the CWD is already `<main-repo>` (set in step 1), so these commands run safely:
 
-   If `<worktree-path>` is non-empty, run this single command that handles both cases (directory exists or already deleted):
+   If `<worktree-path>` is non-empty:
    ```bash
-   cd <main-repo> && git worktree prune 2>/dev/null && (git worktree remove <worktree-path> --force 2>/dev/null || true) && git branch -D <branch>
+   git worktree prune 2>/dev/null; git worktree remove <worktree-path> --force 2>/dev/null; git branch -D <branch>
    ```
-   **Important**: `git worktree prune` prints `Error: Path "..." does not exist` to stderr when it cleans up stale entries — this is normal, not a failure. The `2>/dev/null` suppresses it. After pruning, attempt removal (ignoring errors if already gone), then delete the branch.
+   Use `;` (not `&&`) so each command runs regardless of the previous one's exit code — `prune` and `remove` may warn about already-deleted paths, which is fine.
 
    If `<worktree-path>` is empty (merge was run from main repo, not a worktree):
    ```bash
-   cd <main-repo> && git branch -D <branch>
+   git branch -D <branch>
    ```
 
 7. **Report**: Print a summary:
