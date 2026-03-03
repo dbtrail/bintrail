@@ -226,7 +226,9 @@ Snapshotting schemas: mydb, appdb, ...
 Snapshot complete: 42 tables captured (snapshot_id=1)
 ```
 
-> Re-run `snapshot` after any schema changes (`ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`).
+> **If using `bintrail stream`:** schema snapshots are taken automatically when DDL changes are detected — no manual re-run needed.
+>
+> **If using `bintrail index`** (file-based): re-run `snapshot` manually after any schema changes (`ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`).
 
 ---
 
@@ -330,6 +332,67 @@ bintrail stream \
 
 **Graceful shutdown:** Send `SIGTERM` or press Ctrl-C. The current batch is flushed and the checkpoint is written before exit — no events are lost.
 
+### TLS/SSL for managed MySQL (RDS, Aurora, Cloud SQL)
+
+Managed MySQL services often require TLS. Use `--ssl-mode` to control the connection security:
+
+| Mode | Behavior |
+|------|----------|
+| `disabled` | No TLS |
+| `preferred` (default) | Attempt TLS, fall back to unencrypted if unavailable |
+| `required` | TLS mandatory, fail if unavailable |
+| `verify-ca` | Validate server certificate against CA (no hostname check) |
+| `verify-identity` | Full verification (certificate + hostname) |
+
+**Amazon RDS example** (download the [RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html) first):
+
+```bash
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "bintrail_repl:a-strong-password@tcp(mydb.abc123.us-east-1.rds.amazonaws.com:3306)/" \
+  --server-id  99999 \
+  --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-50000" \
+  --ssl-mode   required \
+  --ssl-ca     /path/to/rds-combined-ca-bundle.pem \
+  --metrics-addr :9090
+```
+
+For **mutual TLS** (client certificate authentication), add `--ssl-cert` and `--ssl-key`:
+
+```bash
+  --ssl-cert /path/to/client-cert.pem \
+  --ssl-key  /path/to/client-key.pem
+```
+
+### Filtering schemas and tables
+
+By default, `stream` indexes all row events from all schemas. Use `--schemas` and `--tables` to limit indexing to specific databases or tables:
+
+```bash
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "bintrail_repl:a-strong-password@tcp(source-db:3306)/" \
+  --server-id  99999 \
+  --schemas    mydb,appdb \
+  --tables     mydb.orders,mydb.customers \
+  --metrics-addr :9090
+```
+
+### Resetting the checkpoint
+
+If you need to re-stream from a different position (e.g., after restoring the source from a backup), use `--reset` to clear the saved checkpoint:
+
+```bash
+bintrail stream \
+  --reset \
+  --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-75000" \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "bintrail_repl:a-strong-password@tcp(source-db:3306)/" \
+  --server-id  99999
+```
+
+Without `--reset`, the saved checkpoint always takes priority over `--start-file`/`--start-gtid` flags (idempotent behavior).
+
 ### Run as a systemd service (recommended for production)
 
 Create `/etc/bintrail/env` (mode `0600`):
@@ -429,6 +492,11 @@ This runs every hour and:
 2. Uploads the Parquet files to S3
 3. Drops the archived partitions from MySQL
 4. Adds new future partitions to replace the dropped ones
+
+**Additional flags:**
+
+- `--no-replace` — suppress automatic replacement of dropped partitions (useful when storage is limited and you only want to drop old data)
+- `--retry` — skip archiving partitions whose Parquet file already exists and S3 uploads that already succeeded (useful if a previous rotation was interrupted)
 
 ### Run as a systemd service
 
@@ -535,6 +603,22 @@ bintrail query \
 Results from all three sources (live index + local Parquet + S3 Parquet) are merged, deduplicated, and sorted.
 
 > **Note:** Archive query failures (e.g., S3 connection issues) are logged as warnings and skipped — they don't block results from the live index or local archives.
+
+### Filtering with flags and RBAC profiles
+
+Both `query` and `recover` support additional filtering:
+
+- `--flag <name>` — filter events from tables or columns carrying a specific flag (see `bintrail flag list` for available flags)
+- `--profile <name>` — apply RBAC access rules that deny access to certain tables and redact sensitive columns
+
+```bash
+bintrail query \
+  --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --schema    mydb \
+  --table     orders \
+  --flag      pii \
+  --profile   analyst
+```
 
 ---
 
@@ -651,7 +735,7 @@ Keep it running with systemd, launchd, or tmux.
 
 ## What to do next
 
-- **After schema changes** (`ALTER TABLE`, etc.): re-run `bintrail snapshot` to keep the column metadata current
+- **After schema changes** (`ALTER TABLE`, etc.): `stream` handles this automatically; if using `index` (file-based), re-run `bintrail snapshot` manually
 - **Monitor replication lag**: `curl localhost:9090/metrics | grep replication_lag`
 - **Check index health**: `bintrail status --index-dsn "..."`
 - **Recover deleted rows**: see [Practical Guide — Scenario A](guide.md#scenario-a-someone-accidentally-deleted-rows)
