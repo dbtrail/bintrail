@@ -29,6 +29,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // gatewayVersion is injected at build time via -ldflags.
@@ -40,6 +41,9 @@ func main() {
 	backendURL := flag.String("backend-url", "", "Default backend URL for single-backend mode (e.g. http://localhost:8080)")
 	tablePrefix := flag.String("table-prefix", "bintrail-oauth", "DynamoDB table name prefix")
 	issuer := flag.String("issuer", "https://mcp.dbtrail.com", "OAuth issuer URL")
+	adminToken := flag.String("admin-token", "", "Bearer token for admin API (required for /admin/* endpoints)")
+	healthInterval := flag.Duration("health-interval", 30*time.Second, "Backend health check interval (0 to disable)")
+	healthThreshold := flag.Int("health-threshold", 3, "Consecutive failures before marking a backend unhealthy")
 	flag.Parse()
 
 	origins := parseOrigins(*allowedOrigins)
@@ -64,20 +68,42 @@ func main() {
 	mux.HandleFunc("POST /oauth/authorize", oauthCfg.AuthorizeSubmitHandler)
 	mux.HandleFunc("POST /oauth/token", oauthCfg.TokenHandler)
 
-	// Health check.
+	// Health checker for backend monitoring.
+	checker := NewHealthChecker(*healthInterval, *healthThreshold)
+	if *backendURL != "" {
+		checker.RegisterBackend(*backendURL)
+	}
+
+	// Health check endpoint — includes backend health status.
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": gatewayVersion})
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":   "ok",
+			"version":  gatewayVersion,
+			"backends": checker.Status(),
+		})
 	})
 
+	// Admin API for tenant provisioning (requires --admin-token).
+	if *adminToken != "" {
+		admin := NewAdminHandler(store, *adminToken)
+		mux.Handle("/admin/tenants", admin)
+		mux.Handle("/admin/tenants/", admin)
+	}
+
 	// MCP endpoint — auth required, proxied to backend.
-	proxy := NewReverseProxy(store, *backendURL)
+	proxy := NewReverseProxy(store, *backendURL, checker)
 	mux.Handle("/mcp", AuthMiddleware(store, proxy))
 
 	// Wrap everything with CORS and origin validation.
 	handler := CORSMiddleware(origins, OriginMiddleware(origins, mux))
 
 	srv := &http.Server{Addr: *addr, Handler: handler}
+
+	// Start backend health checking in the background.
+	healthCtx, healthCancel := context.WithCancel(context.Background())
+	defer healthCancel()
+	go checker.Run(healthCtx)
 
 	// Graceful shutdown on SIGINT/SIGTERM.
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
