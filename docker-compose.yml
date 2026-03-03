@@ -34,8 +34,8 @@ services:
 
   # ── Bintrail ─────────────────────────────────────────────
   # Runs init, snapshot, then streams replication events.
-  # Replace the image with a local build if needed:
-  #   build: .
+  # To use a pre-built image instead of building locally,
+  # replace "build: ." with "image: your-registry/bintrail:v1.2.3".
   bintrail:
     build: .
     environment:
@@ -66,14 +66,13 @@ services:
             --schemas    "$$SCHEMAS"
         fi
 
+        STREAM_ARGS="--index-dsn $$INDEX_DSN --source-dsn $$SOURCE_DSN --server-id $$SERVER_ID --metrics-addr :9090 --log-format json"
+        if [ -n "$$SCHEMAS" ]; then
+          STREAM_ARGS="$$STREAM_ARGS --schemas $$SCHEMAS"
+        fi
+
         echo "Starting bintrail stream..."
-        exec bintrail stream \
-          --index-dsn    "$$INDEX_DSN" \
-          --source-dsn   "$$SOURCE_DSN" \
-          --server-id    "$$SERVER_ID" \
-          --schemas      "$$SCHEMAS" \
-          --metrics-addr ":9090" \
-          --log-format   json
+        exec bintrail stream $$STREAM_ARGS
     depends_on:
       index-mysql:
         condition: service_healthy

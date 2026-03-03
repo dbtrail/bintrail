@@ -58,9 +58,8 @@ docker run --rm bintrail query \
 docker run -d \
   --name bintrail-stream \
   --restart always \
-  -e INDEX_DSN="root:password@tcp(mysql-host:3306)/bintrail_index" \
   bintrail stream \
-    --index-dsn  "$INDEX_DSN" \
+    --index-dsn  "root:password@tcp(mysql-host:3306)/bintrail_index" \
     --source-dsn "bintrail:password@tcp(source-host:3306)/" \
     --server-id  1234 \
     --schemas    "myapp" \
