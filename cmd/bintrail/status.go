@@ -86,6 +86,17 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 	slog.Debug("loaded partition stats", "partitions", len(partStats), "duration_ms", time.Since(t).Milliseconds())
 
+	// Best-effort: bintrail_servers may not exist in older index databases.
+	slog.Debug("loading servers")
+	t = time.Now()
+	servers, err := status.LoadServers(ctx, db)
+	if err != nil {
+		slog.Warn("could not load servers", "error", err)
+		servers = nil
+	} else {
+		slog.Debug("loaded servers", "count", len(servers), "duration_ms", time.Since(t).Milliseconds())
+	}
+
 	// Best-effort: archive_state may not exist in older index databases.
 	slog.Debug("loading archive stats")
 	t = time.Now()
@@ -111,8 +122,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	slog.Info("status complete", "duration_ms", time.Since(start).Milliseconds())
 
 	if stFormat == "json" {
-		return status.WriteStatusJSON(os.Stdout, files, partStats, archives, coverage)
+		return status.WriteStatusJSON(os.Stdout, files, partStats, archives, coverage, servers)
 	}
-	status.WriteStatus(os.Stdout, files, partStats, archives, coverage)
+	status.WriteStatus(os.Stdout, files, partStats, archives, coverage, servers)
 	return nil
 }

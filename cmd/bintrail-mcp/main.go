@@ -302,6 +302,13 @@ func statusTool(ctx context.Context, req *mcp.CallToolRequest, args statusArgs) 
 		return errorResult(fmt.Errorf("failed to load partition info: %w", err)), nil, nil
 	}
 
+	// Best-effort: servers info from bintrail_servers table.
+	servers, serversErr := status.LoadServers(ctx, db)
+	if serversErr != nil {
+		slog.Warn("could not load servers", "error", serversErr)
+		servers = nil
+	}
+
 	// Best-effort: coverage info from schema_changes table.
 	coverage, coverageErr := status.LoadCoverage(ctx, db)
 	if coverageErr != nil {
@@ -311,7 +318,7 @@ func statusTool(ctx context.Context, req *mcp.CallToolRequest, args statusArgs) 
 
 	var buf bytes.Buffer
 	// Archive stats omitted for now — can be added in a follow-up.
-	status.WriteStatus(&buf, files, parts, nil, coverage)
+	status.WriteStatus(&buf, files, parts, nil, coverage, servers)
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
