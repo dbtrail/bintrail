@@ -384,10 +384,10 @@ func fileExists(path string) bool {
 // hiveArchivePath returns the Hive-partitioned path for a binlog_events partition
 // archive. The layout is:
 //
-//	<archiveDir>/bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/events_<HH>.parquet
+//	<archiveDir>/bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/event_hour=<HH>/events.parquet
 //
-// Each hourly partition maps to exactly one file. The hour suffix disambiguates
-// multiple files under the same event_date= directory.
+// Each hourly partition maps to exactly one file. The event_hour= directory level
+// enables DuckDB Hive partition pruning on hour-scoped queries.
 func hiveArchivePath(archiveDir, bintrailID, partitionName string) (string, error) {
 	d, ok := partitionDate(partitionName)
 	if !ok {
@@ -397,7 +397,8 @@ func hiveArchivePath(archiveDir, bintrailID, partitionName string) (string, erro
 		archiveDir,
 		"bintrail_id="+bintrailID,
 		"event_date="+d.UTC().Format("2006-01-02"),
-		fmt.Sprintf("events_%02d.parquet", d.UTC().Hour()),
+		fmt.Sprintf("event_hour=%02d", d.UTC().Hour()),
+		"events.parquet",
 	), nil
 }
 

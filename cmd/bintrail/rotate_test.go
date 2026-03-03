@@ -514,6 +514,37 @@ func TestNextPartitionStart_unsortedOrder(t *testing.T) {
 	}
 }
 
+// ─── hiveArchivePath ────────────────────────────────────────────────────────────
+
+func TestHiveArchivePath(t *testing.T) {
+	path, err := hiveArchivePath("/data/archives", "d7bfcfe5-651e-42df-bcab-ffb9149abecb", "p_2026030214")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "/data/archives/bintrail_id=d7bfcfe5-651e-42df-bcab-ffb9149abecb/event_date=2026-03-02/event_hour=14/events.parquet"
+	if path != want {
+		t.Errorf("hiveArchivePath mismatch\n got: %s\nwant: %s", path, want)
+	}
+}
+
+func TestHiveArchivePath_midnightHour(t *testing.T) {
+	path, err := hiveArchivePath("/data", "abc", "p_2026010100")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "/data/bintrail_id=abc/event_date=2026-01-01/event_hour=00/events.parquet"
+	if path != want {
+		t.Errorf("hiveArchivePath mismatch\n got: %s\nwant: %s", path, want)
+	}
+}
+
+func TestHiveArchivePath_invalidPartition(t *testing.T) {
+	_, err := hiveArchivePath("/data", "abc", "p_future")
+	if err == nil {
+		t.Fatal("expected error for p_future, got nil")
+	}
+}
+
 // ─── daemon flag wiring ─────────────────────────────────────────────────────────
 
 func TestRotateCmd_daemonFlagRegistered(t *testing.T) {
