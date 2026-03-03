@@ -154,6 +154,42 @@ func TestNextPartitionStart_empty(t *testing.T) {
 	}
 }
 
+// ─── cutoff logic (hourly retain) ────────────────────────────────────────────
+
+// TestCutoffDropsHourlyPartition verifies that --retain 1h correctly selects
+// the previous-hour partition for dropping. This is the exact scenario from
+// GitHub issue #96: at 00:05 UTC, "p_2026030223" (hour 23) should be eligible
+// for dropping with --retain 1h, because its start time (23:00) is before the
+// cutoff (23:05).
+func TestCutoffDropsHourlyPartition(t *testing.T) {
+	// Simulate: current time = 2026-03-03 00:05:15 UTC, --retain 1h.
+	now := time.Date(2026, 3, 3, 0, 5, 15, 0, time.UTC)
+	retainDur := time.Hour
+	cutoff := now.Add(-retainDur) // 2026-03-02 23:05:15 UTC (no Truncate!)
+
+	partitions := []struct {
+		name     string
+		wantDrop bool
+	}{
+		{"p_2026030222", true},  // hour 22 → 22:00 < 23:05 → drop
+		{"p_2026030223", true},  // hour 23 → 23:00 < 23:05 → drop (the bug was here)
+		{"p_2026030300", false}, // hour 00 → 00:00 is NOT < 23:05 → keep
+		{"p_2026030301", false}, // hour 01 → keep
+	}
+
+	for _, p := range partitions {
+		d, ok := partitionDate(p.name)
+		if !ok {
+			t.Fatalf("partitionDate(%q) returned false", p.name)
+		}
+		dropped := d.Before(cutoff)
+		if dropped != p.wantDrop {
+			t.Errorf("partition %s (date %v): Before(cutoff %v) = %v, want %v",
+				p.name, d, cutoff, dropped, p.wantDrop)
+		}
+	}
+}
+
 // ─── addFuturePartitions SQL shape ────────────────────────────────────────────
 
 // TestPartitionSpec_shape verifies the generated DDL looks correct without

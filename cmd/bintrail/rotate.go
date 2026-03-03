@@ -201,7 +201,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 	// ── Drop old partitions ───────────────────────────────────────────────────
 	var droppedCount int
 	if retainDur > 0 {
-		cutoff := time.Now().UTC().Add(-retainDur).Truncate(time.Hour)
+		cutoff := time.Now().UTC().Add(-retainDur)
 		var toDrop []string
 		for _, p := range partitions {
 			d, ok := partitionDate(p.Name)
