@@ -19,7 +19,7 @@ import (
 //
 // Reverse proxies are cached per backend URL so that HTTP connections and
 // transport pools are reused across requests to the same backend.
-func NewReverseProxy(store Store, defaultBackend string) http.Handler {
+func NewReverseProxy(store Store, defaultBackend string, health *HealthChecker) http.Handler {
 	var mu sync.RWMutex
 	proxies := make(map[string]*httputil.ReverseProxy)
 
@@ -81,11 +81,26 @@ func NewReverseProxy(store Store, defaultBackend string) http.Handler {
 			return
 		}
 
+		// Check backend health before proxying.
+		if health != nil && !health.IsHealthy(backend) {
+			slog.Warn("backend unhealthy, rejecting request",
+				"tenant_id", tenant.TenantID,
+				"backend", backend,
+			)
+			jsonError(w, "server_error", "backend is currently unhealthy", http.StatusBadGateway)
+			return
+		}
+
 		proxy, err := getProxy(backend)
 		if err != nil {
 			slog.Error("parse backend URL", "url", backend, "error", err)
 			jsonError(w, "server_error", "invalid backend URL", http.StatusBadGateway)
 			return
+		}
+
+		// Register the backend for health checking on first use.
+		if health != nil {
+			health.RegisterBackend(backend)
 		}
 
 		// Inject tenant header per-request (not in the cached Director,

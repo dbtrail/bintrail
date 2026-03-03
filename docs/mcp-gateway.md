@@ -296,6 +296,84 @@ Each customer who will use the gateway needs a row in the tenants table. A tenan
 - `backend_url` — where their `bintrail-mcp` instance is running
 - `status` — must be `active` for the tenant to work
 
+You have two ways to add tenants: the **Admin API** (recommended) or **raw DynamoDB** commands.
+
+#### Option 1: Admin API (recommended)
+
+The gateway has a built-in REST API for managing tenants. You need to start the gateway with `--admin-token` to enable it:
+
+```sh
+./mcp-gateway \
+  --addr :8443 \
+  --admin-token my-secret-admin-token \
+  ...other flags...
+```
+
+Then use curl to manage tenants:
+
+```sh
+# Create a paid tenant with a dedicated backend:
+curl -X POST http://localhost:8443/admin/tenants \
+  -H 'Authorization: Bearer my-secret-admin-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenant_id": "acme-corp",
+    "tier": "paid",
+    "backend_url": "http://10.0.1.5:8080/mcp",
+    "index_dsn": "user:pass@tcp(10.0.1.5:3306)/bintrail",
+    "status": "active"
+  }'
+# → 201 Created + JSON body with the tenant
+
+# Create a free-tier tenant on the shared backend (no backend_url):
+curl -X POST http://localhost:8443/admin/tenants \
+  -H 'Authorization: Bearer my-secret-admin-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenant_id": "startup-x",
+    "tier": "free"
+  }'
+# → 201 Created (status defaults to "active" if omitted)
+
+# List all tenants:
+curl http://localhost:8443/admin/tenants \
+  -H 'Authorization: Bearer my-secret-admin-token'
+# → JSON array of all tenants
+
+# Get one tenant:
+curl http://localhost:8443/admin/tenants/acme-corp \
+  -H 'Authorization: Bearer my-secret-admin-token'
+# → JSON object for acme-corp
+
+# Update a tenant (e.g. upgrade to paid, change backend):
+curl -X PUT http://localhost:8443/admin/tenants/startup-x \
+  -H 'Authorization: Bearer my-secret-admin-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tier": "paid",
+    "backend_url": "http://10.0.1.10:8080/mcp",
+    "status": "active"
+  }'
+# → 200 OK
+
+# Suspend a tenant (they'll get 403 Forbidden on all requests):
+curl -X PUT http://localhost:8443/admin/tenants/bad-actor \
+  -H 'Authorization: Bearer my-secret-admin-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"status": "suspended"}'
+
+# Delete a tenant permanently:
+curl -X DELETE http://localhost:8443/admin/tenants/old-customer \
+  -H 'Authorization: Bearer my-secret-admin-token'
+# → 204 No Content
+```
+
+**Important:** The `--admin-token` flag is required to enable admin endpoints. Without it, `/admin/*` routes return 404. Use a long, random string in production.
+
+#### Option 2: Raw DynamoDB (no admin API needed)
+
+If you prefer managing tenants directly in DynamoDB:
+
 ```sh
 # Paid customer with a dedicated backend:
 aws dynamodb put-item \
@@ -367,13 +445,16 @@ Run it:
   --backend-url http://10.0.1.100:8080
 ```
 
-| Flag | What it does | Example |
-|---|---|---|
-| `--addr` | Port the gateway listens on | `:8443` |
-| `--issuer` | Your public URL (used in OAuth metadata) | `https://mcp.dbtrail.com` |
-| `--allowed-origins` | Which browser origins can call the gateway | `https://claude.ai,https://claude.com` |
-| `--table-prefix` | DynamoDB table name prefix | `bintrail-oauth` (tables will be `bintrail-oauth-clients`, `bintrail-oauth-tokens`, etc.) |
-| `--backend-url` | Default backend for tenants without their own | `http://10.0.1.100:8080` |
+| Flag | What it does | Default | Example |
+|---|---|---|---|
+| `--addr` | Port the gateway listens on | `:8443` | `:8443` |
+| `--issuer` | Your public URL (used in OAuth metadata) | `https://mcp.dbtrail.com` | `https://mcp.dbtrail.com` |
+| `--allowed-origins` | Which browser origins can call the gateway | `https://claude.ai,https://claude.com` | `https://claude.ai,https://claude.com` |
+| `--table-prefix` | DynamoDB table name prefix | `bintrail-oauth` | `bintrail-oauth` |
+| `--backend-url` | Default backend for tenants without their own | (none) | `http://10.0.1.100:8080` |
+| `--admin-token` | Bearer token for admin API (`/admin/*` endpoints) | (disabled) | `my-secret-token` |
+| `--health-interval` | How often to check if backends are alive | `30s` | `30s`, `1m`, `0` (disable) |
+| `--health-threshold` | Consecutive failures before marking a backend down | `3` | `3` |
 
 **IAM permissions** — the gateway needs to read/write DynamoDB. Attach this policy to the ECS task role or EC2 instance role:
 
@@ -385,7 +466,8 @@ Run it:
     "Action": [
       "dynamodb:GetItem",
       "dynamodb:PutItem",
-      "dynamodb:DeleteItem"
+      "dynamodb:DeleteItem",
+      "dynamodb:Scan"
     ],
     "Resource": [
       "arn:aws:dynamodb:*:*:table/bintrail-oauth-*"
@@ -400,9 +482,9 @@ Run it:
 # 1. OAuth metadata discovery (should return JSON with all the endpoints)
 curl https://mcp.dbtrail.com/.well-known/oauth-authorization-server | jq .
 
-# 2. Health check
-curl https://mcp.dbtrail.com/health
-# → {"status":"ok","version":"v1.2.3"}
+# 2. Health check (now includes backend health status)
+curl https://mcp.dbtrail.com/health | jq .
+# → {"status":"ok","version":"v1.2.3","backends":{"http://10.0.1.100:8080":true}}
 
 # 3. Register a test client
 curl -X POST https://mcp.dbtrail.com/oauth/register \
@@ -481,14 +563,145 @@ PKCE (S256) prevents authorization code interception. Refresh tokens are single-
 
 ---
 
+## How Tenant Routing Works (The Full Picture)
+
+This section explains exactly what happens when a request arrives, from start to finish. You don't need to understand this to use the gateway, but it helps when debugging.
+
+### The Request Journey
+
+```
+1. Claude sends:  POST /mcp  (Authorization: Bearer <token>)
+                       │
+2. OriginMiddleware:   Is the Origin header from an allowed site?
+                       │  (claude.ai ✓, evil-site.com ✗, no Origin ✓)
+                       │
+3. CORSMiddleware:     Add Access-Control-Allow-Origin headers for browsers.
+                       │
+4. AuthMiddleware:     Validate the Bearer token.
+                       │
+                       ├── SHA-256(token) → look up in DynamoDB tokens table
+                       ├── Token expired? → 401 Unauthorized
+                       ├── Token valid → get tenant_id from the token record
+                       ├── Look up tenant in DynamoDB tenants table
+                       └── Tenant active? → inject into request context
+                                           Tenant suspended? → 403 Forbidden
+                       │
+5. ReverseProxy:       Route to the right backend.
+                       │
+                       ├── Does the tenant have a backend_url? Use it.
+                       │   (e.g. paid tenant → http://10.0.1.5:8080/mcp)
+                       │
+                       ├── No backend_url? Use the --backend-url default.
+                       │   (e.g. free tenant → http://10.0.1.100:8080/mcp)
+                       │
+                       ├── Is the backend healthy? (health checker says yes/no)
+                       │   Unhealthy → 502 "backend is currently unhealthy"
+                       │
+                       ├── Add X-Bintrail-Tenant: <tenant_id> header
+                       │   (so shared backends know which database to query)
+                       │
+                       ├── Strip the Authorization header
+                       │   (backend doesn't need the OAuth token)
+                       │
+                       └── Forward the request → return the response
+```
+
+### Paid vs Free Tier Routing
+
+**Paid tenants** get their own dedicated `bintrail-mcp` instance:
+- Their tenant row has `backend_url` set to their instance's address
+- The gateway routes directly to that address
+- No `X-Bintrail-Tenant` header needed (though it's still sent)
+- Complete isolation — their backend only serves their data
+
+**Free tenants** share a single `bintrail-mcp` instance:
+- Their tenant row has no `backend_url` (empty)
+- The gateway uses the `--backend-url` default
+- The `X-Bintrail-Tenant` header tells the shared backend which tenant this is
+- The shared backend looks up the tenant's DSN from its `--tenant-dsns` JSON file
+- Each free tenant gets a separate MySQL database — data is isolated even though the backend is shared
+
+```
+                     Paid tenants               Free tenants
+                     ───────────               ────────────
+Token → tenant_id    "acme-corp"               "startup-x"       "devshop"
+                         │                          │                 │
+DynamoDB lookup      backend_url:               backend_url:      backend_url:
+                     10.0.1.5:8080              (empty)           (empty)
+                         │                          │                 │
+Route to             ┌───┘                     ┌────┘─────────────────┘
+                     ▼                         ▼
+               ┌──────────────┐          ┌──────────────────────┐
+               │ bintrail-mcp │          │ bintrail-mcp (shared)│
+               │ (dedicated)  │          │ --tenant-dsns file:  │
+               │              │          │  startup-x → db1     │
+               │ DSN: acme's  │          │  devshop   → db2     │
+               │   database   │          │                      │
+               └──────────────┘          └──────────────────────┘
+```
+
+---
+
+## Backend Health Monitoring
+
+The gateway continuously checks whether backends are alive by pinging their `/health` endpoint. If a backend stops responding, the gateway returns 502 immediately instead of waiting for the connection to time out.
+
+### How It Works
+
+1. Every `--health-interval` (default: 30 seconds), the gateway sends `GET /health` to every known backend
+2. If a backend fails `--health-threshold` (default: 3) consecutive checks, it's marked **unhealthy**
+3. Requests to unhealthy backends get an immediate **502 Bad Gateway** with the message "backend is currently unhealthy"
+4. As soon as a health check passes again, the backend is marked **healthy** and starts receiving traffic
+
+### What Gets Checked
+
+- The `--backend-url` default backend (if set)
+- Any backend that a tenant routes to (registered on first request)
+- Health endpoint: the backend's URL with the path replaced by `/health` (e.g. `http://host:8080/mcp` → `http://host:8080/health`)
+
+### Disabling Health Checks
+
+Set `--health-interval 0` to disable. All backends are assumed healthy and the proxy always tries to connect (the old behavior).
+
+### Checking Backend Status
+
+The gateway's own `/health` endpoint includes backend health:
+
+```sh
+curl http://localhost:8443/health | jq .
+```
+
+```json
+{
+  "status": "ok",
+  "version": "dev",
+  "backends": {
+    "http://10.0.1.5:8080/mcp": true,
+    "http://10.0.1.100:8080/mcp": false
+  }
+}
+```
+
+`true` = healthy, `false` = unhealthy. Use this in your monitoring/alerting.
+
+---
+
 ## Troubleshooting
 
 ### "Gateway returns 502 Bad Gateway"
 
 The gateway can't reach the backend. Check:
 - Is `bintrail-mcp --http :8080` actually running on the backend machine?
-- Can the gateway machine reach it? `curl http://<backend-ip>:8080/mcp` from the gateway
+- Can the gateway machine reach it? `curl http://<backend-ip>:8080/health` from the gateway
 - Does the tenant row in DynamoDB have the correct `backend_url`?
+- Check the gateway's own health endpoint for backend status: `curl http://localhost:8443/health | jq .backends`
+
+### "502 with 'backend is currently unhealthy'"
+
+The health checker has marked this backend as down after consecutive failed health checks. This means:
+- The backend was unreachable for at least `--health-threshold` (default 3) consecutive checks
+- Fix the backend, and it will automatically recover on the next successful health check
+- For a quick check: `curl http://<backend-ip>:8080/health` — if this fails, the backend is genuinely down
 
 ### "OAuth flow shows 'unknown or inactive tenant'"
 

@@ -33,8 +33,12 @@ type Store interface {
 	CreateRefreshToken(ctx context.Context, rt *RefreshTokenRecord) error
 	ConsumeRefreshToken(ctx context.Context, refreshToken string) (*RefreshTokenRecord, error)
 
-	// Tenant lookup.
+	// Tenant management.
 	GetTenant(ctx context.Context, tenantID string) (*Tenant, error)
+	CreateTenant(ctx context.Context, tenant *Tenant) error
+	UpdateTenant(ctx context.Context, tenant *Tenant) error
+	DeleteTenant(ctx context.Context, tenantID string) error
+	ListTenants(ctx context.Context) ([]*Tenant, error)
 }
 
 // OAuthClient represents a dynamically registered OAuth client.
@@ -287,6 +291,64 @@ func (s *DynamoStore) GetTenant(ctx context.Context, tenantID string) (*Tenant, 
 	return &t, nil
 }
 
+func (s *DynamoStore) CreateTenant(ctx context.Context, tenant *Tenant) error {
+	item, err := attributevalue.MarshalMap(tenant)
+	if err != nil {
+		return fmt.Errorf("marshal tenant: %w", err)
+	}
+	// Fail if tenant already exists (condition: attribute_not_exists).
+	expr := "attribute_not_exists(tenant_id)"
+	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           &s.tables.tenants,
+		Item:                item,
+		ConditionExpression: &expr,
+	})
+	return err
+}
+
+func (s *DynamoStore) UpdateTenant(ctx context.Context, tenant *Tenant) error {
+	item, err := attributevalue.MarshalMap(tenant)
+	if err != nil {
+		return fmt.Errorf("marshal tenant: %w", err)
+	}
+	// Fail if tenant does not exist (condition: attribute_exists).
+	expr := "attribute_exists(tenant_id)"
+	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           &s.tables.tenants,
+		Item:                item,
+		ConditionExpression: &expr,
+	})
+	return err
+}
+
+func (s *DynamoStore) DeleteTenant(ctx context.Context, tenantID string) error {
+	_, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: &s.tables.tenants,
+		Key: map[string]types.AttributeValue{
+			"tenant_id": &types.AttributeValueMemberS{Value: tenantID},
+		},
+	})
+	return err
+}
+
+func (s *DynamoStore) ListTenants(ctx context.Context) ([]*Tenant, error) {
+	out, err := s.client.Scan(ctx, &dynamodb.ScanInput{
+		TableName: &s.tables.tenants,
+	})
+	if err != nil {
+		return nil, err
+	}
+	tenants := make([]*Tenant, 0, len(out.Items))
+	for _, item := range out.Items {
+		var t Tenant
+		if err := attributevalue.UnmarshalMap(item, &t); err != nil {
+			return nil, fmt.Errorf("unmarshal tenant: %w", err)
+		}
+		tenants = append(tenants, &t)
+	}
+	return tenants, nil
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 // HashToken returns the SHA-256 hex hash of a token string.
@@ -397,4 +459,33 @@ func (m *MemoryStore) ConsumeRefreshToken(_ context.Context, refreshToken string
 
 func (m *MemoryStore) GetTenant(_ context.Context, tenantID string) (*Tenant, error) {
 	return m.Tenants[tenantID], nil
+}
+
+func (m *MemoryStore) CreateTenant(_ context.Context, tenant *Tenant) error {
+	if _, exists := m.Tenants[tenant.TenantID]; exists {
+		return fmt.Errorf("tenant %s already exists", tenant.TenantID)
+	}
+	m.Tenants[tenant.TenantID] = tenant
+	return nil
+}
+
+func (m *MemoryStore) UpdateTenant(_ context.Context, tenant *Tenant) error {
+	if _, exists := m.Tenants[tenant.TenantID]; !exists {
+		return fmt.Errorf("tenant %s not found", tenant.TenantID)
+	}
+	m.Tenants[tenant.TenantID] = tenant
+	return nil
+}
+
+func (m *MemoryStore) DeleteTenant(_ context.Context, tenantID string) error {
+	delete(m.Tenants, tenantID)
+	return nil
+}
+
+func (m *MemoryStore) ListTenants(_ context.Context) ([]*Tenant, error) {
+	tenants := make([]*Tenant, 0, len(m.Tenants))
+	for _, t := range m.Tenants {
+		tenants = append(tenants, t)
+	}
+	return tenants, nil
 }
