@@ -75,7 +75,7 @@ func init() {
 // archivePathRe matches the Hive-partitioned archive path pattern produced by
 // rotate --archive-dir: bintrail_id=<uuid>/event_date=YYYY-MM-DD/event_hour=HH/events.parquet
 var archivePathRe = regexp.MustCompile(
-	`bintrail_id=([0-9a-f-]{36})/event_date=(\d{4}-\d{2}-\d{2})/event_hour=(\d{2})/[^/]+\.parquet$`,
+	`bintrail_id=([0-9a-f-]{36})/event_date=(\d{4}-\d{2}-\d{2})/event_hour=(0[0-9]|1[0-9]|2[0-3])/[^/]+\.parquet$`,
 )
 
 // parseArchivePath extracts the bintrail_id and partition name from a
@@ -131,7 +131,6 @@ func runUpload(cmd *cobra.Command, args []string) error {
 
 	// Collect uploaded file info for optional archive_state updates.
 	type uploadedFile struct {
-		localPath  string
 		s3Key      string
 		bintrailID string
 		partName   string
@@ -177,7 +176,6 @@ func runUpload(cmd *cobra.Command, args []string) error {
 			bintrailID, partName := parseArchivePath(path)
 			if bintrailID != "" && partName != "" {
 				dbUpdates = append(dbUpdates, uploadedFile{
-					localPath:  path,
 					s3Key:      key,
 					bintrailID: bintrailID,
 					partName:   partName,
@@ -201,15 +199,22 @@ func runUpload(cmd *cobra.Command, args []string) error {
 		defer db.Close()
 
 		for _, u := range dbUpdates {
-			if _, err := db.ExecContext(ctx,
+			res, err := db.ExecContext(ctx,
 				`UPDATE archive_state
 					SET s3_bucket = ?, s3_key = ?, s3_uploaded_at = UTC_TIMESTAMP()
 				WHERE partition_name = ? AND bintrail_id = ?`,
 				bucket, u.s3Key, u.partName, u.bintrailID,
-			); err != nil {
+			)
+			if err != nil {
 				return fmt.Errorf("update archive_state for %s: %w", u.partName, err)
 			}
-			dbUpdated++
+			n, _ := res.RowsAffected()
+			if n > 0 {
+				dbUpdated++
+			} else {
+				slog.Warn("archive_state row not found, skipping DB update",
+					"partition", u.partName, "bintrail_id", u.bintrailID)
+			}
 		}
 		slog.Info("archive_state updated", "rows", dbUpdated)
 	}

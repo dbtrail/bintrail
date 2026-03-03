@@ -179,6 +179,18 @@ func TestParseArchivePath(t *testing.T) {
 			wantID:   "",
 			wantPart: "",
 		},
+		{
+			name:     "no match - invalid hour 25",
+			path:     "/data/bintrail_id=3e11fa47-1234-5678-9abc-def012345678/event_date=2026-03-01/event_hour=25/events.parquet",
+			wantID:   "",
+			wantPart: "",
+		},
+		{
+			name:     "no match - invalid hour 99",
+			path:     "/data/bintrail_id=3e11fa47-1234-5678-9abc-def012345678/event_date=2026-03-01/event_hour=99/events.parquet",
+			wantID:   "",
+			wantPart: "",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
