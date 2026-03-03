@@ -38,22 +38,18 @@ Follow these steps **in order**. Do not skip steps.
    - Git refuses to delete a branch that is still checked out in a worktree.
    - Removing the worktree destroys the session's CWD, bricking any subsequent Bash commands.
    - Solving both: `cd` to `<main-repo>` first, remove the worktree, then delete the branch — all in a single shell command so the CWD lands on the main repo before the worktree directory disappears.
+   - **CRITICAL**: Every single Bash command in this step MUST start with `cd <main-repo> &&`. The CWD may already be a deleted worktree directory, so omitting the `cd` will cause all commands to fail.
 
-   If `<worktree-path>` is non-empty and still registered (check with `git -C <main-repo> worktree list`):
+   If `<worktree-path>` is non-empty, run this single command that handles both cases (directory exists or already deleted):
    ```bash
-   cd <main-repo> && git worktree remove <worktree-path> --force && git branch -D <branch>
+   cd <main-repo> && git worktree prune 2>/dev/null && (git worktree remove <worktree-path> --force 2>/dev/null || true) && git branch -D <branch>
    ```
-
-   If git says the worktree path "does not exist" (stale metadata), prune first:
-   ```bash
-   cd <main-repo> && git worktree prune && git branch -D <branch>
-   ```
+   **Important**: `git worktree prune` prints `Error: Path "..." does not exist` to stderr when it cleans up stale entries — this is normal, not a failure. The `2>/dev/null` suppresses it. After pruning, attempt removal (ignoring errors if already gone), then delete the branch.
 
    If `<worktree-path>` is empty (merge was run from main repo, not a worktree):
    ```bash
-   git -C <main-repo> branch -d <branch>
+   cd <main-repo> && git branch -D <branch>
    ```
-   Use `-D` if `-d` refuses (squash merges are not recognized as merged by git).
 
 7. **Report**: Print a summary:
    - PR #$ARGUMENTS merged (squash)
