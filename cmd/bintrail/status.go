@@ -108,10 +108,11 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		slog.Debug("loaded coverage info", "events", coverage.TotalEvents, "schema_changes", coverage.SchemaChanges, "duration_ms", time.Since(t).Milliseconds())
 	}
 
+	slog.Info("status complete", "duration_ms", time.Since(start).Milliseconds())
+
 	if stFormat == "json" {
 		return status.WriteStatusJSON(os.Stdout, files, partStats, archives, coverage)
 	}
 	status.WriteStatus(os.Stdout, files, partStats, archives, coverage)
-	slog.Info("status complete", "duration_ms", time.Since(start).Milliseconds())
 	return nil
 }
