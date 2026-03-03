@@ -90,7 +90,7 @@ func TestTruncate_longString(t *testing.T) {
 
 func TestWriteStatus_noFiles_noPartitions(t *testing.T) {
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, nil)
+	WriteStatus(&buf, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Indexed Files ===")
@@ -129,7 +129,7 @@ func TestWriteStatus_withFiles(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil, nil, nil)
+	WriteStatus(&buf, files, nil, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "binlog.000042")
@@ -157,7 +157,7 @@ func TestWriteStatus_withPartitions(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, parts, nil, nil)
+	WriteStatus(&buf, nil, parts, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Partitions ===")
@@ -179,7 +179,7 @@ func TestWriteStatus_errorTruncation(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil, nil, nil)
+	WriteStatus(&buf, files, nil, nil, nil, nil)
 	out := buf.String()
 
 	// The error should be truncated — full 100-char string should not appear.
@@ -211,7 +211,7 @@ func TestWriteStatus_bintrailIDColumn(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil, nil, nil)
+	WriteStatus(&buf, files, nil, nil, nil, nil)
 	out := buf.String()
 
 	// BINTRAIL_ID column header must appear.
@@ -234,7 +234,7 @@ func TestWriteStatus_perServerSummary_multipleServers(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil, nil, nil)
+	WriteStatus(&buf, files, nil, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Summary ===")
@@ -256,7 +256,7 @@ func TestWriteStatus_perServerSummary_unknownID(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil, nil, nil)
+	WriteStatus(&buf, files, nil, nil, nil, nil)
 	out := buf.String()
 
 	// Null bintrail_id must be grouped under "(unknown)".
@@ -277,7 +277,7 @@ func assertContains(t *testing.T, s, want string) {
 
 func TestWriteStatusJSON_empty(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	var result struct {
@@ -316,7 +316,7 @@ func TestWriteStatusJSON_withData(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, files, parts, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, files, parts, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -370,7 +370,7 @@ func TestWriteStatusJSON_nullFields(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, files, nil, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, files, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -432,7 +432,7 @@ func TestWriteStatus_withArchives(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, archives, nil)
+	WriteStatus(&buf, nil, nil, archives, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Archives ===")
@@ -446,7 +446,7 @@ func TestWriteStatus_withArchives(t *testing.T) {
 
 func TestWriteStatus_nilArchives_omitsSection(t *testing.T) {
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, nil)
+	WriteStatus(&buf, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	if strings.Contains(out, "=== Archives ===") {
@@ -456,7 +456,7 @@ func TestWriteStatus_nilArchives_omitsSection(t *testing.T) {
 
 func TestWriteStatus_zeroArchives_omitsSection(t *testing.T) {
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, &ArchiveStats{}, nil)
+	WriteStatus(&buf, nil, nil, &ArchiveStats{}, nil, nil)
 	out := buf.String()
 
 	if strings.Contains(out, "=== Archives ===") {
@@ -474,7 +474,7 @@ func TestWriteStatus_archives_noS3(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, archives, nil)
+	WriteStatus(&buf, nil, nil, archives, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Archives ===")
@@ -497,7 +497,7 @@ func TestWriteStatusJSON_withArchives(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, archives, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, archives, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -537,7 +537,7 @@ func TestWriteStatusJSON_withArchives(t *testing.T) {
 
 func TestWriteStatusJSON_nilArchives_omitsKey(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -564,7 +564,7 @@ func TestWriteStatus_withCoverage(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, coverage)
+	WriteStatus(&buf, nil, nil, nil, coverage, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Restore Coverage ===")
@@ -577,7 +577,7 @@ func TestWriteStatus_withCoverage(t *testing.T) {
 
 func TestWriteStatus_nilCoverage_omitsSection(t *testing.T) {
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, nil)
+	WriteStatus(&buf, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	if strings.Contains(out, "=== Restore Coverage ===") {
@@ -593,7 +593,7 @@ func TestWriteStatus_zeroCoverage_noWarning(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, coverage)
+	WriteStatus(&buf, nil, nil, nil, coverage, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Restore Coverage ===")
@@ -614,7 +614,7 @@ func TestWriteStatusJSON_withCoverage(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, nil, coverage); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil, coverage, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -646,7 +646,7 @@ func TestWriteStatusJSON_withCoverage(t *testing.T) {
 
 func TestWriteStatusJSON_nilCoverage_omitsKey(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -656,5 +656,123 @@ func TestWriteStatusJSON_nilCoverage_omitsKey(t *testing.T) {
 	}
 	if _, ok := raw["coverage"]; ok {
 		t.Error("expected no 'coverage' key when coverage is nil")
+	}
+}
+
+// ─── WriteStatus: servers section ───────────────────────────────────────────
+
+func TestWriteStatus_withServers(t *testing.T) {
+	servers := []ServerInfo{
+		{
+			BintrailID: "aaaaaaaa-0000-0000-0000-000000000001",
+			ServerUUID: "11111111-1111-1111-1111-111111111111",
+			Host:       "db-primary.example.com",
+			Port:       3306,
+			Username:   "repl",
+			CreatedAt:  time.Date(2026, 2, 19, 10, 0, 0, 0, time.UTC),
+		},
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, nil, servers)
+	out := buf.String()
+
+	assertContains(t, out, "=== Servers ===")
+	assertContains(t, out, "aaaaaaaa-0000-0000-0000-000000000001")
+	assertContains(t, out, "db-primary.example.com")
+	assertContains(t, out, "11111111-1111-1111-1111-111111111111")
+	assertContains(t, out, "active")
+}
+
+func TestWriteStatus_withDecommissionedServer(t *testing.T) {
+	servers := []ServerInfo{
+		{
+			BintrailID:       "bbbbbbbb-0000-0000-0000-000000000002",
+			ServerUUID:       "22222222-2222-2222-2222-222222222222",
+			Host:             "old-host",
+			Port:             3307,
+			Username:         "admin",
+			CreatedAt:        time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			DecommissionedAt: sql.NullTime{Valid: true, Time: time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)},
+		},
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, nil, servers)
+	out := buf.String()
+
+	assertContains(t, out, "decommissioned")
+}
+
+func TestWriteStatus_nilServers_omitsSection(t *testing.T) {
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, nil, nil)
+	out := buf.String()
+
+	if strings.Contains(out, "=== Servers ===") {
+		t.Error("expected no Servers section when servers is nil")
+	}
+}
+
+// ─── WriteStatusJSON: servers ───────────────────────────────────────────────
+
+func TestWriteStatusJSON_withServers(t *testing.T) {
+	servers := []ServerInfo{
+		{
+			BintrailID: "aaaaaaaa-0000-0000-0000-000000000001",
+			ServerUUID: "11111111-1111-1111-1111-111111111111",
+			Host:       "db-primary",
+			Port:       3306,
+			Username:   "repl",
+			CreatedAt:  time.Date(2026, 2, 19, 10, 0, 0, 0, time.UTC),
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, servers); err != nil {
+		t.Fatal(err)
+	}
+
+	var result struct {
+		Servers []struct {
+			BintrailID       string  `json:"bintrail_id"`
+			ServerUUID       string  `json:"server_uuid"`
+			Host             string  `json:"host"`
+			Port             uint16  `json:"port"`
+			DecommissionedAt *string `json:"decommissioned_at"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if len(result.Servers) != 1 {
+		t.Fatalf("expected 1 server, got %d", len(result.Servers))
+	}
+	if result.Servers[0].BintrailID != "aaaaaaaa-0000-0000-0000-000000000001" {
+		t.Errorf("wrong bintrail_id: %s", result.Servers[0].BintrailID)
+	}
+	if result.Servers[0].ServerUUID != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("wrong server_uuid: %s", result.Servers[0].ServerUUID)
+	}
+	if result.Servers[0].Port != 3306 {
+		t.Errorf("wrong port: %d", result.Servers[0].Port)
+	}
+	if result.Servers[0].DecommissionedAt != nil {
+		t.Error("expected null decommissioned_at for active server")
+	}
+}
+
+func TestWriteStatusJSON_nilServers_omitsKey(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &raw); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if _, ok := raw["servers"]; ok {
+		t.Error("expected no 'servers' key when servers is nil")
 	}
 }
