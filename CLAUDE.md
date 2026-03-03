@@ -29,6 +29,8 @@ cmd/bintrail/          # One file per command
   rotate_test.go       # Unit tests for parseRetain, partitionDate, partitionName, nextPartitionStart + cobra wiring
   stream_test.go       # Unit tests for parseSourceDSN, resolveStart, GTID accumulation, cobra wiring
   dump_test.go         # Unit tests for dumpCmd cobra wiring, buildMydumperArgs, lock mechanism, extractSchemasFromTables
+  upload.go            # bintrail upload (standalone S3 upload of Parquet files)
+  upload_test.go       # Unit tests for uploadCmd cobra wiring, parseArchivePath, runUpload validation
   baseline_test.go     # Unit tests for parseTableFilter, runBaseline timestamp parsing
   init_test.go         # Unit tests for initCmd cobra wiring, buildBinlogEventsDDL, buildPartitionDefs, parseS3ARN, s3Instructions, runInit validation
   status_test.go       # Unit tests for statusCmd cobra wiring + runStatus DSN validation
@@ -97,8 +99,9 @@ Per-command `--format` flag (default `text`): every command accepts `--format te
 | `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint`, `--format` |
 | `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path` (default `mydumper`), `--threads` (default 4), `--format` |
 | `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression` (default `zstd`), `--row-group-size` (default 500000), `--upload` (S3 URL), `--upload-region`, `--format` |
+| `upload` | `upload.go` | `--source` (req), `--destination` (req), `--region`, `--retry`, `--index-dsn`, `--format` |
 
-Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `rotArchiveDir`, `rotArchiveCompression`, `stIndexDSN`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`).
+Flag variable naming convention: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `rotArchiveDir`, `rotArchiveCompression`, `stIndexDSN`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`).
 
 Filter helpers (`ParseEventType`, `ParseTime`, `IsValidFormat`, `IsValidOutputFormat`) live in `internal/cliutil` and are shared by both `cmd/bintrail/` commands and `cmd/bintrail-mcp/`.
 
@@ -317,6 +320,17 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent w
 
 Flag variable prefix: `bsl` (e.g. `bslInput`, `bslOutput`, `bslCompression`).
 
+### upload command: standalone S3 upload
+
+`upload.go` implements a standalone Parquet-to-S3 upload command that decouples S3 uploading from file generation. It reuses the shared S3 helpers in `baseline.go` (`parseS3URL`, `newS3Client`, `buildS3Key`, `s3ObjectExists`, `uploadFile`).
+
+- Walks `--source` recursively, uploading only `*.parquet` files (non-Parquet files are silently skipped).
+- `--retry` uses `HeadObject` to skip files already present in S3 (same pattern as `uploadBaselineToS3`).
+- `--index-dsn` connects to the index DB after all uploads complete and updates `archive_state` with `s3_bucket`, `s3_key`, `s3_uploaded_at` for files matching the Hive archive path pattern.
+- `parseArchivePath(path)` extracts `bintrail_id` and `partition_name` from Hive-partitioned paths (`bintrail_id=<uuid>/event_date=YYYY-MM-DD/event_hour=HH/events.parquet`). Uses `archivePathRe` regex and `partitionName()` from rotate.go to reconstruct the partition name.
+
+Flag variable prefix: `upl` (e.g. `uplSource`, `uplDestination`, `uplRegion`).
+
 ### baseline/archive package design
 
 **`WriterConfig.Metadata map[string]string`** — `NewWriter` loops over this map to emit `parquet.KeyValueMetadata` entries. Callers (baseline's `processTable` and archive's `ArchivePartition`) supply the keys themselves.
@@ -512,6 +526,7 @@ All metrics are in the `bintrail_stream_` namespace:
 
 - `README.md` — project overview + Quick Start (line 56 links to `docs/guide.md` for the full DBA walkthrough)
 - `docs/guide.md` — scenario-driven guide: initial setup, daily rotation, point-in-time recovery, multi-table recovery, troubleshooting FAQ
+- `docs/upload.md` — upload command: flags, AWS credential configuration, examples, archive_state integration
 
 ## Build and release
 
