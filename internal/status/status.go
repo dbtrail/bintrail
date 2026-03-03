@@ -35,6 +35,17 @@ type PartitionStat struct {
 	Ordinal     int
 }
 
+// ServerInfo holds one active row from the bintrail_servers table.
+type ServerInfo struct {
+	BintrailID      string
+	ServerUUID      string
+	Host            string
+	Port            uint16
+	Username        string
+	CreatedAt       time.Time
+	DecommissionedAt sql.NullTime
+}
+
 // ArchiveStats holds aggregate statistics from the archive_state table.
 // A single archive file may be both local and in S3, so
 // LocalFiles + S3Files may exceed TotalFiles.
@@ -207,8 +218,54 @@ func LoadSchemaChanges(ctx context.Context, db *sql.DB) ([]SchemaChange, error) 
 	return changes, rows.Err()
 }
 
-// WriteStatus writes a multi-section status report (Indexed Files, Partitions, Archives, Coverage, Summary) to w.
-func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo) {
+// LoadServers loads all rows from bintrail_servers ordered by created_at.
+func LoadServers(ctx context.Context, db *sql.DB) ([]ServerInfo, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT bintrail_id, server_uuid, host, port, username,
+		       created_at, decommissioned_at
+		FROM bintrail_servers
+		ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var servers []ServerInfo
+	for rows.Next() {
+		var s ServerInfo
+		if err := rows.Scan(
+			&s.BintrailID, &s.ServerUUID, &s.Host, &s.Port, &s.Username,
+			&s.CreatedAt, &s.DecommissionedAt,
+		); err != nil {
+			return nil, err
+		}
+		servers = append(servers, s)
+	}
+	return servers, rows.Err()
+}
+
+// WriteStatus writes a multi-section status report (Servers, Indexed Files, Partitions, Archives, Coverage, Summary) to w.
+func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo) {
+	// ── Section 0: Servers ───────────────────────────────────────────────────
+	if len(servers) > 0 {
+		fmt.Fprintln(w, "=== Servers ===")
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "BINTRAIL_ID\tHOST\tPORT\tSERVER_UUID\tCREATED_AT\tSTATUS")
+		fmt.Fprintln(tw, "───────────\t────\t────\t───────────\t──────────\t──────")
+		for _, s := range servers {
+			st := "active"
+			if s.DecommissionedAt.Valid {
+				st = "decommissioned"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\n",
+				s.BintrailID, s.Host, s.Port, s.ServerUUID,
+				s.CreatedAt.Format(TSFmt), st,
+			)
+		}
+		tw.Flush()
+		fmt.Fprintln(w)
+	}
+
 	// ── Section 1: Indexed Files ──────────────────────────────────────────────
 	fmt.Fprintln(w, "=== Indexed Files ===")
 	if len(files) == 0 {
@@ -373,7 +430,7 @@ func Truncate(s string, n int) string {
 }
 
 // WriteStatusJSON writes the status data as a JSON object to w.
-func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo) error {
+func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo) error {
 	type jsonFile struct {
 		BinlogFile    string  `json:"binlog_file"`
 		Status        string  `json:"status"`
@@ -406,7 +463,17 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, 
 		SchemaChanges int     `json:"schema_changes"`
 		UncoveredDDLs int     `json:"uncovered_ddls"`
 	}
+	type jsonServer struct {
+		BintrailID       string  `json:"bintrail_id"`
+		ServerUUID       string  `json:"server_uuid"`
+		Host             string  `json:"host"`
+		Port             uint16  `json:"port"`
+		Username         string  `json:"username"`
+		CreatedAt        string  `json:"created_at"`
+		DecommissionedAt *string `json:"decommissioned_at"`
+	}
 	type jsonSummary struct {
+		Servers  []jsonServer    `json:"servers,omitempty"`
 		Files    []jsonFile      `json:"files"`
 		Parts    []jsonPartition `json:"partitions"`
 		Total    int64           `json:"total_events_estimate"`
@@ -447,7 +514,24 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, 
 		total += p.TableRows
 	}
 
-	out := jsonSummary{Files: jf, Parts: jp, Total: total}
+	var js []jsonServer
+	for _, s := range servers {
+		srv := jsonServer{
+			BintrailID: s.BintrailID,
+			ServerUUID: s.ServerUUID,
+			Host:       s.Host,
+			Port:       s.Port,
+			Username:   s.Username,
+			CreatedAt:  s.CreatedAt.Format(TSFmt),
+		}
+		if s.DecommissionedAt.Valid {
+			ts := s.DecommissionedAt.Time.Format(TSFmt)
+			srv.DecommissionedAt = &ts
+		}
+		js = append(js, srv)
+	}
+
+	out := jsonSummary{Servers: js, Files: jf, Parts: jp, Total: total}
 	if archives != nil && archives.TotalFiles > 0 {
 		out.Archives = &jsonArchives{
 			TotalFiles:     archives.TotalFiles,
