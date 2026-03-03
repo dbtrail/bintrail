@@ -49,17 +49,22 @@ services:
       SERVER_ID: "${SERVER_ID:-99999}"
     # Override the entrypoint to run init → snapshot → stream in sequence.
     entrypoint: ["/bin/sh", "-c"]
+    # Uncomment to expose Prometheus metrics outside the Docker network:
+    # ports:
+    #   - "9090:9090"
     command:
       - |
         set -e
         echo "Running bintrail init..."
         bintrail init --index-dsn "$$INDEX_DSN"
 
-        echo "Running bintrail snapshot..."
-        bintrail snapshot \
-          --source-dsn "$$SOURCE_DSN" \
-          --index-dsn  "$$INDEX_DSN" \
-          --schemas    "$$SCHEMAS"
+        if [ -n "$$SCHEMAS" ]; then
+          echo "Running bintrail snapshot..."
+          bintrail snapshot \
+            --source-dsn "$$SOURCE_DSN" \
+            --index-dsn  "$$INDEX_DSN" \
+            --schemas    "$$SCHEMAS"
+        fi
 
         echo "Starting bintrail stream..."
         exec bintrail stream \
