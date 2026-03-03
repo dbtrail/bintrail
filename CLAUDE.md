@@ -334,7 +334,7 @@ Flag variable prefix: `bsl` (e.g. `bslInput`, `bslOutput`, `bslCompression`).
 
 **Parquet metadata keys**: `bintrail.archive.partition`, `bintrail.archive.timestamp`, `bintrail.archive.version`.
 
-**Output path convention**: `<archive-dir>/p_YYYYMMDDHH.parquet` (set by `rotate.go`; archive package is path-agnostic).
+**Output path convention**: `<archive-dir>/bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/event_hour=<HH>/events.parquet` (set by `hiveArchivePath` in `rotate.go`; archive package is path-agnostic).
 
 **`rotate --archive-dir`** triggers archiving before each `dropPartitions` call. If any archive fails, no partitions are dropped.
 
