@@ -248,7 +248,6 @@ func buildMydumperArgs(host string, port uint16, user, password, outputDir strin
 		"--host", host,
 		"--port", strconv.Itoa(int(port)),
 		"--user", user,
-		"--outputdir", outputDir,
 		"--threads", strconv.Itoa(threads),
 		"--compress-protocol",
 		"--complete-insert",
@@ -283,6 +282,10 @@ func buildMydumperArgs(host string, port uint16, user, password, outputDir strin
 			"--exec-per-thread", fmt.Sprintf("openssl enc -aes-256-cbc -pbkdf2 -pass file:%s", absKey),
 			"--exec-per-thread-extension", ".enc")
 	}
+
+	// --outputdir must be last: Docker wrapper scripts commonly use ${@: -1}
+	// (the last argument) for the volume mount path.
+	args = append(args, "--outputdir", outputDir)
 
 	return args
 }
