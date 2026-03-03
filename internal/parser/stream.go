@@ -72,6 +72,21 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 
 		case *replication.GTIDEvent:
 			currentGTID = formatGTID(ev.SID, ev.GNO)
+			if currentGTID != "" {
+				ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
+				gtidEv := Event{
+					BinlogFile: currentFile,
+					EndPos:     uint64(binlogEv.Header.LogPos),
+					Timestamp:  ts,
+					GTID:       currentGTID,
+					EventType:  EventGTID,
+				}
+				select {
+				case out <- gtidEv:
+				case <-ctx.Done():
+					return nil
+				}
+			}
 
 		case *replication.QueryEvent:
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
