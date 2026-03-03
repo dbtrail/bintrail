@@ -582,6 +582,79 @@ func TestDumpCmd_mydumperImageFlag(t *testing.T) {
 	}
 }
 
+// ─── isShellScript ────────────────────────────────────────────────────────────
+
+func TestIsShellScript(t *testing.T) {
+	dir := t.TempDir()
+
+	// A file starting with #! is a script.
+	script := filepath.Join(dir, "wrapper.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/bash\nexec mydumper \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !isShellScript(script) {
+		t.Error("expected isShellScript=true for a file starting with #!")
+	}
+
+	// A file with arbitrary binary content is not a script.
+	bin := filepath.Join(dir, "mydumper")
+	if err := os.WriteFile(bin, []byte{0x7f, 'E', 'L', 'F'}, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if isShellScript(bin) {
+		t.Error("expected isShellScript=false for an ELF binary")
+	}
+
+	// An empty file is not a script.
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, []byte{}, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if isShellScript(empty) {
+		t.Error("expected isShellScript=false for an empty file")
+	}
+
+	// A nonexistent file is not a script.
+	if isShellScript(filepath.Join(dir, "nonexistent")) {
+		t.Error("expected isShellScript=false for a nonexistent file")
+	}
+}
+
+func TestResolveMydumper_shellScriptSkipped(t *testing.T) {
+	dir := t.TempDir()
+
+	// Place a shell script named "mydumper" and a fake "docker" on PATH.
+	script := filepath.Join(dir, "mydumper")
+	if err := os.WriteFile(script, []byte("#!/bin/bash\nexec docker run mydumper \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeDocker := filepath.Join(dir, "docker")
+	if err := os.WriteFile(fakeDocker, []byte{0x7f, 'E', 'L', 'F'}, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", dir)
+
+	saved := dmpMydumperImage
+	t.Cleanup(func() { dmpMydumperImage = saved })
+	dmpMydumperImage = "mydumper/mydumper:latest"
+
+	// Use a fresh command so --mydumper-path is not Changed.
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().String("mydumper-path", "mydumper", "")
+
+	res, err := resolveMydumper(cmd)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.mode != dumpModeDocker {
+		t.Errorf("expected dumpModeDocker when mydumper on PATH is a script, got %d", res.mode)
+	}
+	if res.path != fakeDocker {
+		t.Errorf("expected docker path %q, got %q", fakeDocker, res.path)
+	}
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 // argsContain reports whether args contains the string s.
