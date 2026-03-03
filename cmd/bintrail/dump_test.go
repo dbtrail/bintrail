@@ -187,6 +187,37 @@ func TestBuildMydumperArgs_tables(t *testing.T) {
 	}
 }
 
+func TestBuildMydumperArgs_outputDirIsLast(t *testing.T) {
+	// Docker wrapper scripts use ${@: -1} for the volume mount, so
+	// --outputdir must always be the last flag pair.
+	cases := []struct {
+		name    string
+		schemas []string
+		tables  []string
+		encrypt string
+	}{
+		{"no filters", nil, nil, ""},
+		{"single schema", []string{"demo"}, nil, ""},
+		{"multiple schemas", []string{"db1", "db2"}, nil, ""},
+		{"tables", nil, []string{"db.t1", "db.t2"}, ""},
+		{"schema and tables", []string{"mydb"}, []string{"mydb.t1"}, ""},
+		{"encryption", nil, nil, "/path/to/key"},
+		{"all filters plus encryption", []string{"demo"}, []string{"demo.t1"}, "/path/to/key"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := buildMydumperArgs("127.0.0.1", 3306, "root", "pw", "/data/backup", 4, tc.schemas, tc.tables, tc.encrypt)
+			n := len(args)
+			if n < 2 {
+				t.Fatalf("args too short: %v", args)
+			}
+			if args[n-2] != "--outputdir" || args[n-1] != "/data/backup" {
+				t.Errorf("expected last two args to be [--outputdir /data/backup], got %v", args[n-2:])
+			}
+		})
+	}
+}
+
 // ─── Lock mechanism ───────────────────────────────────────────────────────────
 
 func TestAcquireReleaseDumpLock(t *testing.T) {
