@@ -1,0 +1,79 @@
+# Bintrail Docker Compose template
+#
+# This template runs bintrail stream alongside an index MySQL instance.
+# Customize the environment variables below for your setup.
+#
+# Quick start:
+#   1. Copy .env.example to .env and fill in your values
+#   2. docker compose up -d
+#
+# For the full interactive demo (traffic generator, Grafana, Prometheus),
+# see demo/compose.yml instead.
+
+volumes:
+  index-mysql-data:
+
+services:
+
+  # ── Index MySQL ──────────────────────────────────────────
+  # Stores binlog_events, schema_snapshots, and stream_state.
+  # For production, consider using a managed MySQL instance instead.
+  index-mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${INDEX_MYSQL_ROOT_PASSWORD:-changeme}
+      MYSQL_DATABASE: bintrail_index
+    volumes:
+      - index-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${INDEX_MYSQL_ROOT_PASSWORD:-changeme}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Bintrail ─────────────────────────────────────────────
+  # Runs init, snapshot, then streams replication events.
+  # To use a pre-built image instead of building locally,
+  # replace "build: ." with "image: your-registry/bintrail:v1.2.3".
+  bintrail:
+    build: .
+    environment:
+      # Index MySQL connection (the container above).
+      INDEX_DSN: "root:${INDEX_MYSQL_ROOT_PASSWORD:-changeme}@tcp(index-mysql:3306)/bintrail_index"
+      # Source MySQL connection (your application database).
+      SOURCE_DSN: "${SOURCE_DSN}"
+      # Comma-separated list of schemas to track.
+      SCHEMAS: "${SCHEMAS:-}"
+      # Unique server ID for the replication connection.
+      SERVER_ID: "${SERVER_ID:-99999}"
+    # Override the entrypoint to run init → snapshot → stream in sequence.
+    entrypoint: ["/bin/sh", "-c"]
+    # Uncomment to expose Prometheus metrics outside the Docker network:
+    # ports:
+    #   - "9090:9090"
+    command:
+      - |
+        set -e
+        echo "Running bintrail init..."
+        bintrail init --index-dsn "$$INDEX_DSN"
+
+        if [ -n "$$SCHEMAS" ]; then
+          echo "Running bintrail snapshot..."
+          bintrail snapshot \
+            --source-dsn "$$SOURCE_DSN" \
+            --index-dsn  "$$INDEX_DSN" \
+            --schemas    "$$SCHEMAS"
+        fi
+
+        STREAM_ARGS="--index-dsn $$INDEX_DSN --source-dsn $$SOURCE_DSN --server-id $$SERVER_ID --metrics-addr :9090 --log-format json"
+        if [ -n "$$SCHEMAS" ]; then
+          STREAM_ARGS="$$STREAM_ARGS --schemas $$SCHEMAS"
+        fi
+
+        echo "Starting bintrail stream..."
+        exec bintrail stream $$STREAM_ARGS
+    depends_on:
+      index-mysql:
+        condition: service_healthy
+    restart: on-failure
