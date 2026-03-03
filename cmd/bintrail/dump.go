@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,13 +26,14 @@ directory is removed before the dump begins.`,
 }
 
 var (
-	dmpSourceDSN    string
-	dmpOutputDir    string
-	dmpSchemas      string
-	dmpTables       string
-	dmpMydumperPath string
-	dmpThreads      int
-	dmpFormat       string
+	dmpSourceDSN     string
+	dmpOutputDir     string
+	dmpSchemas       string
+	dmpTables        string
+	dmpMydumperPath  string
+	dmpMydumperImage string
+	dmpThreads       int
+	dmpFormat        string
 )
 
 // dumpLockDir is a function returning the directory for the dump lockfile.
@@ -44,6 +46,7 @@ func init() {
 	dumpCmd.Flags().StringVar(&dmpSchemas, "schemas", "", "Comma-separated schema filter (e.g. mydb,otherdb)")
 	dumpCmd.Flags().StringVar(&dmpTables, "tables", "", "Comma-separated table filter (e.g. mydb.orders,mydb.items)")
 	dumpCmd.Flags().StringVar(&dmpMydumperPath, "mydumper-path", "mydumper", "Path to the mydumper binary")
+	dumpCmd.Flags().StringVar(&dmpMydumperImage, "mydumper-image", "mydumper/mydumper:latest", "Docker image for mydumper (used when no local binary is found)")
 	dumpCmd.Flags().IntVar(&dmpThreads, "threads", 4, "Number of mydumper dump threads")
 	dumpCmd.Flags().StringVar(&dmpFormat, "format", "text", "Output format: text or json")
 	_ = dumpCmd.MarkFlagRequired("source-dsn")
@@ -52,15 +55,88 @@ func init() {
 	rootCmd.AddCommand(dumpCmd)
 }
 
+// dumpMode indicates how mydumper will be invoked.
+type dumpMode int
+
+const (
+	dumpModeLocal  dumpMode = iota // local binary
+	dumpModeDocker                 // docker run
+)
+
+// dumpResolution holds the result of resolving how to invoke mydumper.
+type dumpResolution struct {
+	mode  dumpMode
+	path  string // binary path (local) or docker path (docker)
+	image string // docker image (only for dumpModeDocker)
+}
+
+// resolveMydumper determines how to invoke mydumper based on flag state.
+// Priority: explicit --mydumper-path → $PATH lookup → Docker → error.
+func resolveMydumper(cmd *cobra.Command) (dumpResolution, error) {
+	if cmd.Flags().Changed("mydumper-path") {
+		path, err := exec.LookPath(dmpMydumperPath)
+		if err != nil {
+			return dumpResolution{}, fmt.Errorf("mydumper not found at %q: %w", dmpMydumperPath, err)
+		}
+		return dumpResolution{mode: dumpModeLocal, path: path}, nil
+	}
+
+	if path, err := exec.LookPath("mydumper"); err == nil {
+		return dumpResolution{mode: dumpModeLocal, path: path}, nil
+	}
+
+	dockerPath, err := exec.LookPath("docker")
+	if err == nil {
+		return dumpResolution{mode: dumpModeDocker, path: dockerPath, image: dmpMydumperImage}, nil
+	}
+
+	return dumpResolution{}, fmt.Errorf("mydumper not found on $PATH and Docker is not available; " +
+		"install mydumper (https://github.com/mydumper/mydumper), install Docker, or use --mydumper-path")
+}
+
+// buildDockerArgs constructs the full argument slice for invoking mydumper via
+// docker run. The output directory is bind-mounted at the same absolute path so
+// downstream tools need no path translation.
+func buildDockerArgs(image, outputDir, host string, mydumperArgs []string) []string {
+	absOutput, err := filepath.Abs(outputDir)
+	if err != nil {
+		absOutput = outputDir
+	}
+
+	args := []string{
+		"run", "--rm",
+		"-v", absOutput + ":" + absOutput,
+	}
+
+	if isLocalhost(host) {
+		if runtime.GOOS == "linux" {
+			args = append(args, "--network", "host")
+		} else {
+			slog.Warn("source host is localhost but --network host only works on Linux; "+
+				"use the Docker host IP (e.g. host.docker.internal) or set --source-dsn accordingly",
+				"host", host, "os", runtime.GOOS)
+		}
+	}
+
+	args = append(args, image, "mydumper")
+	args = append(args, mydumperArgs...)
+	return args
+}
+
+// isLocalhost reports whether the host refers to the local machine.
+func isLocalhost(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
 func runDump(cmd *cobra.Command, args []string) error {
 	if !cliutil.IsValidOutputFormat(dmpFormat) {
 		return fmt.Errorf("invalid --format %q; must be text or json", dmpFormat)
 	}
 
-	// 1. Fail fast if mydumper is not installed.
-	path, err := exec.LookPath(dmpMydumperPath)
+	// 1. Resolve how to invoke mydumper.
+	res, err := resolveMydumper(cmd)
 	if err != nil {
-		return fmt.Errorf("mydumper not found (%q): %w", dmpMydumperPath, err)
+		return err
 	}
 
 	// 2. Parse source DSN.
@@ -88,9 +164,18 @@ func runDump(cmd *cobra.Command, args []string) error {
 	// 6. Build mydumper args.
 	mydumperArgs := buildMydumperArgs(host, port, user, password, dmpOutputDir, dmpThreads, schemas, tables)
 
-	// 7. Run mydumper, streaming output to the terminal.
-	slog.Info("starting dump", "path", path, "output_dir", dmpOutputDir)
-	c := exec.CommandContext(cmd.Context(), path, mydumperArgs...)
+	// 7. Build the final command depending on resolution mode.
+	var c *exec.Cmd
+	switch res.mode {
+	case dumpModeDocker:
+		dockerArgs := buildDockerArgs(res.image, dmpOutputDir, host, mydumperArgs)
+		c = exec.CommandContext(cmd.Context(), res.path, dockerArgs...)
+		slog.Info("starting dump via Docker", "image", res.image, "output_dir", dmpOutputDir)
+	default:
+		c = exec.CommandContext(cmd.Context(), res.path, mydumperArgs...)
+		slog.Info("starting dump", "path", res.path, "output_dir", dmpOutputDir)
+	}
+
 	if dmpFormat != "json" {
 		c.Stdout = os.Stdout
 		c.Stderr = os.Stderr
