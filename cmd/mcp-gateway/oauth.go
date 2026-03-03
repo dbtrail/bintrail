@@ -2,11 +2,14 @@ package main
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -129,15 +132,20 @@ func (c *OAuthConfig) AuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate redirect_uri is registered.
-	if !containsString(client.RedirectURIs, redirectURI) {
+	if !slices.Contains(client.RedirectURIs, redirectURI) {
 		jsonError(w, "invalid_request", "redirect_uri not registered", http.StatusBadRequest)
 		return
 	}
 
 	// Serve the login page. The form POSTs back to /oauth/authorize with the
 	// same query params plus the user's tenant selection.
+	// HTML-escape all values to prevent XSS via crafted query parameters.
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, authorizePage, clientID, redirectURI, state, codeChallenge)
+	fmt.Fprintf(w, authorizePage,
+		html.EscapeString(clientID),
+		html.EscapeString(redirectURI),
+		html.EscapeString(state),
+		html.EscapeString(codeChallenge))
 }
 
 // AuthorizeSubmitHandler processes the login form submission.
@@ -168,6 +176,12 @@ func (c *OAuthConfig) AuthorizeSubmitHandler(w http.ResponseWriter, r *http.Requ
 	}
 	if client == nil {
 		jsonError(w, "invalid_client", "unknown client_id", http.StatusUnauthorized)
+		return
+	}
+
+	// Validate redirect_uri is registered for this client.
+	if !slices.Contains(client.RedirectURIs, redirectURI) {
+		jsonError(w, "invalid_request", "redirect_uri not registered", http.StatusBadRequest)
 		return
 	}
 
@@ -256,7 +270,7 @@ func (c *OAuthConfig) handleAuthCodeGrant(w http.ResponseWriter, r *http.Request
 		jsonError(w, "server_error", "internal error", http.StatusInternalServerError)
 		return
 	}
-	if client == nil || client.ClientSecret != clientSecret {
+	if client == nil || subtle.ConstantTimeCompare([]byte(client.ClientSecret), []byte(clientSecret)) != 1 {
 		jsonError(w, "invalid_client", "invalid client credentials", http.StatusUnauthorized)
 		return
 	}
@@ -312,7 +326,7 @@ func (c *OAuthConfig) handleRefreshGrant(w http.ResponseWriter, r *http.Request)
 		jsonError(w, "server_error", "internal error", http.StatusInternalServerError)
 		return
 	}
-	if client == nil || client.ClientSecret != clientSecret {
+	if client == nil || subtle.ConstantTimeCompare([]byte(client.ClientSecret), []byte(clientSecret)) != 1 {
 		jsonError(w, "invalid_client", "invalid client credentials", http.StatusUnauthorized)
 		return
 	}
@@ -399,15 +413,6 @@ func verifyPKCE(codeVerifier, codeChallenge string) bool {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-func containsString(ss []string, s string) bool {
-	for _, v := range ss {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
 
 func jsonError(w http.ResponseWriter, errorCode, description string, status int) {
 	w.Header().Set("Content-Type", "application/json")

@@ -110,7 +110,7 @@ func NewDynamoStore(tablePrefix string) (*DynamoStore, error) {
 	s.tables.codes = tablePrefix + "-codes"
 	s.tables.tokens = tablePrefix + "-tokens"
 	s.tables.refresh = tablePrefix + "-refresh"
-	s.tables.tenants = "bintrail-tenants"
+	s.tables.tenants = tablePrefix + "-tenants"
 	return s, nil
 }
 

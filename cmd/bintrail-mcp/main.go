@@ -159,6 +159,9 @@ func main() {
 							return newServerWithDSN(dsn)
 						}
 						slog.Warn("unknown tenant", "tenant", tenant)
+						// Return a server that will error on every tool call
+						// rather than falling through to the env-var DSN.
+						return newServerWithDSN("unknown-tenant:invalid")
 					}
 				}
 				return newServer()

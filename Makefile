@@ -49,6 +49,10 @@ build-all:
 	GOOS=linux   GOARCH=arm64 CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc go build $(MCP_LDFLAGS) -o dist/$(MCP_BINARY)-linux-arm64 ./cmd/bintrail-mcp
 	GOOS=darwin  GOARCH=amd64 CGO_ENABLED=1 go build $(MCP_LDFLAGS) -o dist/$(MCP_BINARY)-darwin-amd64 ./cmd/bintrail-mcp
 	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=1 go build $(MCP_LDFLAGS) -o dist/$(MCP_BINARY)-darwin-arm64 ./cmd/bintrail-mcp
+	GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-linux-amd64 ./cmd/mcp-gateway
+	GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-linux-arm64 ./cmd/mcp-gateway
+	GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-darwin-amd64 ./cmd/mcp-gateway
+	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-darwin-arm64 ./cmd/mcp-gateway
 
 tidy:
 	go mod tidy
