@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -55,7 +56,13 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *AdminHandler) authenticate(w http.ResponseWriter, r *http.Request) bool {
 	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != h.token {
+	if !strings.HasPrefix(auth, "Bearer ") {
+		w.Header().Set("WWW-Authenticate", `Bearer`)
+		jsonError(w, "invalid_request", "invalid or missing admin token", http.StatusUnauthorized)
+		return false
+	}
+	got := strings.TrimPrefix(auth, "Bearer ")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(h.token)) != 1 {
 		w.Header().Set("WWW-Authenticate", `Bearer`)
 		jsonError(w, "invalid_request", "invalid or missing admin token", http.StatusUnauthorized)
 		return false

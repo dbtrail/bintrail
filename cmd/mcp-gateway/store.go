@@ -80,11 +80,11 @@ type RefreshTokenRecord struct {
 
 // Tenant represents a customer's backend mapping.
 type Tenant struct {
-	TenantID   string `dynamodbav:"tenant_id"`
-	Tier       string `dynamodbav:"tier"`
-	BackendURL string `dynamodbav:"backend_url"`
-	IndexDSN   string `dynamodbav:"index_dsn"`
-	Status     string `dynamodbav:"status"`
+	TenantID   string `dynamodbav:"tenant_id" json:"tenant_id"`
+	Tier       string `dynamodbav:"tier" json:"tier"`
+	BackendURL string `dynamodbav:"backend_url" json:"backend_url"`
+	IndexDSN   string `dynamodbav:"index_dsn" json:"index_dsn"`
+	Status     string `dynamodbav:"status" json:"status"`
 }
 
 // ─── DynamoDB implementation ─────────────────────────────────────────────────
@@ -332,19 +332,28 @@ func (s *DynamoStore) DeleteTenant(ctx context.Context, tenantID string) error {
 }
 
 func (s *DynamoStore) ListTenants(ctx context.Context) ([]*Tenant, error) {
-	out, err := s.client.Scan(ctx, &dynamodb.ScanInput{
-		TableName: &s.tables.tenants,
-	})
-	if err != nil {
-		return nil, err
-	}
-	tenants := make([]*Tenant, 0, len(out.Items))
-	for _, item := range out.Items {
-		var t Tenant
-		if err := attributevalue.UnmarshalMap(item, &t); err != nil {
-			return nil, fmt.Errorf("unmarshal tenant: %w", err)
+	var tenants []*Tenant
+	var lastKey map[string]types.AttributeValue
+	for {
+		input := &dynamodb.ScanInput{
+			TableName:         &s.tables.tenants,
+			ExclusiveStartKey: lastKey,
 		}
-		tenants = append(tenants, &t)
+		out, err := s.client.Scan(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			var t Tenant
+			if err := attributevalue.UnmarshalMap(item, &t); err != nil {
+				return nil, fmt.Errorf("unmarshal tenant: %w", err)
+			}
+			tenants = append(tenants, &t)
+		}
+		if out.LastEvaluatedKey == nil {
+			break
+		}
+		lastKey = out.LastEvaluatedKey
 	}
 	return tenants, nil
 }

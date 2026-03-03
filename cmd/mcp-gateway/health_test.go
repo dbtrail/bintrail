@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -54,9 +55,10 @@ func TestHealthChecker_unhealthyBackend(t *testing.T) {
 }
 
 func TestHealthChecker_recovery(t *testing.T) {
-	healthy := true
+	var healthy atomic.Bool
+	healthy.Store(true)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if healthy {
+		if healthy.Load() {
 			w.WriteHeader(http.StatusOK)
 		} else {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -78,14 +80,14 @@ func TestHealthChecker_recovery(t *testing.T) {
 	}
 
 	// Go unhealthy.
-	healthy = false
+	healthy.Store(false)
 	time.Sleep(200 * time.Millisecond)
 	if checker.IsHealthy(backend.URL + "/mcp") {
 		t.Fatal("expected unhealthy")
 	}
 
 	// Recover.
-	healthy = true
+	healthy.Store(true)
 	time.Sleep(200 * time.Millisecond)
 	if !checker.IsHealthy(backend.URL + "/mcp") {
 		t.Error("expected healthy after recovery")

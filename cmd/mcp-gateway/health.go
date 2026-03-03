@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -198,23 +199,11 @@ func (h *HealthChecker) recordFailure(backend string, reason string) {
 // healthEndpoint derives the health check URL from a backend URL.
 // It replaces the path with /health (e.g. http://host:8080/mcp → http://host:8080/health).
 func healthEndpoint(backend string) string {
-	// Simple approach: strip path after the host and append /health.
-	// Backend URLs are like http://host:port or http://host:port/mcp.
-	u := backend
-	// Find the third slash (after scheme://).
-	idx := 0
-	slashes := 0
-	for i, c := range u {
-		if c == '/' {
-			slashes++
-			if slashes == 3 {
-				idx = i
-				break
-			}
-		}
+	u, err := url.Parse(backend)
+	if err != nil {
+		return backend + "/health"
 	}
-	if idx > 0 {
-		u = u[:idx]
-	}
-	return u + "/health"
+	u.Path = "/health"
+	u.RawQuery = ""
+	return u.String()
 }
