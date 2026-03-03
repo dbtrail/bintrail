@@ -339,8 +339,8 @@ Managed MySQL services often require TLS. Use `--ssl-mode` to control the connec
 | Mode | Behavior |
 |------|----------|
 | `disabled` | No TLS |
-| `preferred` (default) | Attempt TLS, fall back to unencrypted if unavailable |
-| `required` | TLS mandatory, fail if unavailable |
+| `preferred` (default) | Attempt TLS (no certificate verification), fall back to unencrypted if unavailable |
+| `required` | TLS mandatory (no certificate verification), fail if unavailable |
 | `verify-ca` | Validate server certificate against CA (no hostname check) |
 | `verify-identity` | Full verification (certificate + hostname) |
 
@@ -352,16 +352,22 @@ bintrail stream \
   --source-dsn "bintrail_repl:a-strong-password@tcp(mydb.abc123.us-east-1.rds.amazonaws.com:3306)/" \
   --server-id  99999 \
   --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-50000" \
-  --ssl-mode   required \
+  --ssl-mode   verify-ca \
   --ssl-ca     /path/to/rds-combined-ca-bundle.pem \
   --metrics-addr :9090
 ```
 
-For **mutual TLS** (client certificate authentication), add `--ssl-cert` and `--ssl-key`:
+For **mutual TLS** (client certificate authentication), add `--ssl-cert` and `--ssl-key` to any stream command above:
 
 ```bash
-  --ssl-cert /path/to/client-cert.pem \
-  --ssl-key  /path/to/client-key.pem
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "bintrail_repl:a-strong-password@tcp(source-db:3306)/" \
+  --server-id  99999 \
+  --ssl-mode   verify-identity \
+  --ssl-ca     /path/to/ca.pem \
+  --ssl-cert   /path/to/client-cert.pem \
+  --ssl-key    /path/to/client-key.pem
 ```
 
 ### Filtering schemas and tables
@@ -609,7 +615,7 @@ Results from all three sources (live index + local Parquet + S3 Parquet) are mer
 Both `query` and `recover` support additional filtering:
 
 - `--flag <name>` — filter events from tables or columns carrying a specific flag (see `bintrail flag list` for available flags)
-- `--profile <name>` — apply RBAC access rules that deny access to certain tables and redact sensitive columns
+- `--profile <name>` — apply RBAC access rules that deny access to certain tables and redact sensitive columns (live-index queries only; cannot be combined with `--archive-dir` or `--archive-s3`)
 
 ```bash
 bintrail query \
