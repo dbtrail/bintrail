@@ -20,6 +20,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log/slog"
@@ -50,10 +51,8 @@ func main() {
 	}
 
 	oauthCfg := &OAuthConfig{
-		Issuer:      *issuer,
-		Store:       store,
-		BackendURL:  *backendURL,
-		TablePrefix: *tablePrefix,
+		Issuer: *issuer,
+		Store:  store,
 	}
 
 	mux := http.NewServeMux()
@@ -68,7 +67,7 @@ func main() {
 	// Health check.
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok","version":"` + gatewayVersion + `"}`))
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": gatewayVersion})
 	})
 
 	// MCP endpoint — auth required, proxied to backend.

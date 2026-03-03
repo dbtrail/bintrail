@@ -9,8 +9,8 @@ import (
 	"html"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,10 +25,8 @@ const (
 
 // OAuthConfig holds the configuration for the OAuth endpoints.
 type OAuthConfig struct {
-	Issuer      string
-	Store       Store
-	BackendURL  string
-	TablePrefix string
+	Issuer string
+	Store  Store
 }
 
 // MetadataHandler serves the OAuth 2.1 authorization server metadata.
@@ -221,15 +219,18 @@ func (c *OAuthConfig) AuthorizeSubmitHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Redirect back to Claude with the authorization code.
-	sep := "?"
-	if strings.Contains(redirectURI, "?") {
-		sep = "&"
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		jsonError(w, "server_error", "invalid redirect_uri", http.StatusInternalServerError)
+		return
 	}
-	location := redirectURI + sep + "code=" + code
+	q := u.Query()
+	q.Set("code", code)
 	if state != "" {
-		location += "&state=" + state
+		q.Set("state", state)
 	}
-	http.Redirect(w, r, location, http.StatusFound)
+	u.RawQuery = q.Encode()
+	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
 // TokenHandler handles token exchange and refresh.
@@ -409,7 +410,7 @@ func (c *OAuthConfig) issueTokens(w http.ResponseWriter, r *http.Request, client
 func verifyPKCE(codeVerifier, codeChallenge string) bool {
 	h := sha256.Sum256([]byte(codeVerifier))
 	computed := base64.RawURLEncoding.EncodeToString(h[:])
-	return computed == codeChallenge
+	return subtle.ConstantTimeCompare([]byte(computed), []byte(codeChallenge)) == 1
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
