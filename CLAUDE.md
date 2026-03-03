@@ -1,5 +1,9 @@
 # Bintrail — Claude Code Guide
 
+## Tool preferences
+
+- **GitHub**: Always use the `mcp__github__*` MCP tools (e.g. `mcp__github__get_issue`, `mcp__github__create_pull_request`) instead of the `gh` CLI. The GitHub MCP server is always available in this project.
+
 ## Project overview
 
 Bintrail is a Go CLI that parses MySQL ROW-format binary logs, indexes every row event into MySQL with full before/after images, and generates reversal SQL for recovery. The index is self-contained — recovery never requires the original binlog files.
