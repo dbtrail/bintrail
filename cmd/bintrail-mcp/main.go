@@ -309,6 +309,13 @@ func statusTool(ctx context.Context, req *mcp.CallToolRequest, args statusArgs) 
 		servers = nil
 	}
 
+	// Best-effort: stream state from stream_state table.
+	stream, streamErr := status.LoadStreamState(ctx, db)
+	if streamErr != nil {
+		slog.Warn("could not load stream state", "error", streamErr)
+		stream = nil
+	}
+
 	// Best-effort: coverage info from schema_changes table.
 	coverage, coverageErr := status.LoadCoverage(ctx, db)
 	if coverageErr != nil {
@@ -318,7 +325,7 @@ func statusTool(ctx context.Context, req *mcp.CallToolRequest, args statusArgs) 
 
 	var buf bytes.Buffer
 	// Archive stats omitted for now — can be added in a follow-up.
-	status.WriteStatus(&buf, files, parts, nil, coverage, servers)
+	status.WriteStatus(&buf, files, parts, nil, coverage, servers, stream)
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
