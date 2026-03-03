@@ -31,7 +31,7 @@ Source MySQL ──replication──► bintrail stream ──► Index MySQL (b
 ```bash
 git clone https://github.com/bintrail/bintrail
 cd bintrail
-make build
+make all
 sudo cp bintrail /usr/local/bin/
 sudo cp bintrail-mcp /usr/local/bin/
 ```
