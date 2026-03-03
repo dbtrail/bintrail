@@ -359,15 +359,22 @@ Events: 21246 indexed
 
 ## MCP Server
 
-Bintrail ships an [MCP](https://modelcontextprotocol.io) server that exposes the same query, recover, and status operations as read-only tools — letting Claude Code (or any MCP-compatible client) explore your binlog index conversationally.
+Bintrail ships an [MCP](https://modelcontextprotocol.io) server that exposes the same query, recover, and status operations as read-only tools — letting Claude (or any MCP-compatible client) explore your binlog index conversationally.
 
-**Build:**
+### Claude Connector (recommended)
 
-```sh
-go build ./cmd/bintrail-mcp
-```
+The easiest way to connect — works from claude.ai, Claude Desktop, and Claude mobile:
 
-**Register with Claude Code** — the project ships `.mcp.json` which pre-registers the server using `go run` (no pre-build required):
+1. Deploy the [MCP Gateway](docs/mcp-gateway.md) (handles OAuth + tenant routing)
+2. In Claude, go to **Settings** → **Integrations** → **Add custom integration**
+3. Enter your gateway URL (e.g. `https://mcp.dbtrail.com/mcp`)
+4. Authorize with your tenant ID — done
+
+See [MCP Server docs](docs/mcp-server.md) for details and [Connector Testing](docs/connector-testing.md) for a complete integration checklist.
+
+### Claude Code (local)
+
+For local development, the project ships `.mcp.json` which pre-registers the server using `go run` (no pre-build required):
 
 ```json
 {

@@ -139,7 +139,28 @@ go newServer().Connect(ctx, t1, nil)
 
 ---
 
-## Two Transport Modes
+## Three Ways to Connect Claude
+
+| Method | Works from | Auth | Setup |
+|---|---|---|---|
+| **Claude Connector** (recommended) | claude.ai, Claude Desktop, Claude mobile | OAuth 2.1 (automatic) | Add URL in Claude Settings |
+| **stdio** | Claude Code (local) | None (trusts local user) | `.mcp.json` at project root |
+| **proxy.py** (legacy) | Claude Desktop only | None (trusts local user) | Edit `claude_desktop_config.json` |
+
+### Claude Connector (recommended — for claude.ai, Desktop, and mobile)
+
+The easiest way to connect Claude to bintrail. Requires the [MCP Gateway](./mcp-gateway.md) running at a public URL.
+
+1. Open **claude.ai** → **Settings** → **Integrations**
+2. Click **Add custom integration**
+3. Enter the gateway URL: `https://mcp.dbtrail.com/mcp`
+4. Claude auto-discovers the OAuth endpoints, opens the login page
+5. Enter your **tenant ID** and click **Authorize**
+6. Done — `query`, `recover`, and `status` tools are now available
+
+This works from the Claude web app, Claude Desktop, and Claude mobile. Token refresh happens automatically — sessions survive indefinitely without re-authenticating.
+
+For setup and deployment of the gateway itself, see [MCP Gateway docs](./mcp-gateway.md). For a comprehensive integration testing checklist, see [Connector Testing](./connector-testing.md).
 
 ### stdio (default — for Claude Code)
 
@@ -187,9 +208,11 @@ This is useful when Claude Desktop runs on your laptop but the bintrail server r
 
 ---
 
-## `proxy.py`: Bridging Claude Desktop to Remote HTTP
+## `proxy.py`: Legacy Bridge for Claude Desktop
 
-Claude Desktop only supports MCP servers via stdio (a subprocess it starts locally). To connect Claude Desktop to a remote `bintrail-mcp --http` server, `cmd/bintrail-mcp/proxy.py` acts as a bridge:
+> **Note:** For new setups, use the [Claude Connector](#claude-connector-recommended--for-claudeai-desktop-and-mobile) method instead — it's simpler, works from more clients, and supports OAuth. `proxy.py` is still available as a fallback for environments that can't use the gateway.
+
+`proxy.py` bridges Claude Desktop (which speaks stdio) to a remote `bintrail-mcp --http` server:
 
 ```
 Claude Desktop  →  proxy.py (stdio, runs locally)  →  bintrail-mcp --http :8080  →  MySQL

@@ -11,11 +11,14 @@
 //
 // Configuration:
 //
-//	--addr              Listen address (default :8443)
-//	--allowed-origins   Comma-separated allowed CORS origins
-//	--backend-url       Default backend URL (single-backend mode)
-//	--table-prefix      DynamoDB table name prefix (default "bintrail-oauth")
-//	--issuer            OAuth issuer URL (default "https://mcp.dbtrail.com")
+//	--addr                  Listen address (default :8443)
+//	--allowed-origins       Comma-separated allowed CORS origins
+//	--backend-url           Default backend URL (single-backend mode)
+//	--table-prefix          DynamoDB table name prefix (default "bintrail-oauth")
+//	--issuer                OAuth issuer URL (default "https://mcp.dbtrail.com")
+//	--rate-limit-register   Per-IP requests/min for /oauth/register (default 10, 0=off)
+//	--rate-limit-token      Per-IP requests/min for /oauth/token (default 30, 0=off)
+//	--rate-limit-authorize  Per-IP requests/min for POST /oauth/authorize (default 20, 0=off)
 package main
 
 import (
@@ -44,6 +47,9 @@ func main() {
 	adminToken := flag.String("admin-token", "", "Bearer token for admin API (required for /admin/* endpoints)")
 	healthInterval := flag.Duration("health-interval", 30*time.Second, "Backend health check interval (0 to disable)")
 	healthThreshold := flag.Int("health-threshold", 3, "Consecutive failures before marking a backend unhealthy")
+	rateLimitRegister := flag.Int("rate-limit-register", 10, "Per-IP requests/min for /oauth/register (0 to disable)")
+	rateLimitToken := flag.Int("rate-limit-token", 30, "Per-IP requests/min for /oauth/token (0 to disable)")
+	rateLimitAuthorize := flag.Int("rate-limit-authorize", 20, "Per-IP requests/min for POST /oauth/authorize (0 to disable)")
 	flag.Parse()
 
 	origins := parseOrigins(*allowedOrigins)
@@ -59,14 +65,21 @@ func main() {
 		Store:  store,
 	}
 
+	// Rate limiter for OAuth endpoints.
+	rateLimiter := NewRateLimiter(1 * time.Minute)
+	defer rateLimiter.Stop()
+
 	mux := http.NewServeMux()
 
-	// OAuth endpoints (no auth required).
+	// OAuth endpoints (no auth required, rate-limited).
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", oauthCfg.MetadataHandler)
-	mux.HandleFunc("POST /oauth/register", oauthCfg.RegisterHandler)
+	mux.Handle("POST /oauth/register", RateLimitMiddleware(rateLimiter, *rateLimitRegister,
+		http.HandlerFunc(oauthCfg.RegisterHandler)))
 	mux.HandleFunc("GET /oauth/authorize", oauthCfg.AuthorizeHandler)
-	mux.HandleFunc("POST /oauth/authorize", oauthCfg.AuthorizeSubmitHandler)
-	mux.HandleFunc("POST /oauth/token", oauthCfg.TokenHandler)
+	mux.Handle("POST /oauth/authorize", RateLimitMiddleware(rateLimiter, *rateLimitAuthorize,
+		http.HandlerFunc(oauthCfg.AuthorizeSubmitHandler)))
+	mux.Handle("POST /oauth/token", RateLimitMiddleware(rateLimiter, *rateLimitToken,
+		http.HandlerFunc(oauthCfg.TokenHandler)))
 
 	// Health checker for backend monitoring.
 	checker := NewHealthChecker(*healthInterval, *healthThreshold)
@@ -95,8 +108,10 @@ func main() {
 	proxy := NewReverseProxy(store, *backendURL, checker)
 	mux.Handle("/mcp", AuthMiddleware(store, proxy))
 
-	// Wrap everything with CORS and origin validation.
-	handler := CORSMiddleware(origins, OriginMiddleware(origins, mux))
+	// Wrap everything with logging, request IDs, CORS, and origin validation.
+	handler := RequestIDMiddleware(
+		LoggingMiddleware(
+			CORSMiddleware(origins, OriginMiddleware(origins, mux))))
 
 	srv := &http.Server{Addr: *addr, Handler: handler}
 
