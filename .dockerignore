@@ -1,0 +1,14 @@
+.git
+.github
+.claude
+.DS_Store
+demo
+dist
+docs
+*.md
+!go.mod
+!go.sum
+bintrail
+bintrail-mcp
+cover.out
+tmp
