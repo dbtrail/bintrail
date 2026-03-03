@@ -542,7 +542,7 @@ Results from the live MySQL index and from Parquet archives are merged, deduplic
 
 **Situation:** You're setting up bintrail for the first time and want to capture the current state of your tables before you start indexing binlog events. Or you need a periodic full snapshot for audit purposes.
 
-**Prerequisites:** mydumper must be installed — see the [Dump and Baseline guide](dump-and-baseline.md#installing-mydumper) for installation instructions.
+**Prerequisites:** Either mydumper or Docker must be available. If Docker is installed, no separate mydumper installation is needed — bintrail invokes it automatically via `docker run`. See the [Dump and Baseline guide](dump-and-baseline.md#getting-mydumper) for details.
 
 **Step 1 — Dump the source database:**
 

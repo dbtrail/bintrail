@@ -82,7 +82,12 @@ func resolveMydumper(cmd *cobra.Command) (dumpResolution, error) {
 	}
 
 	if path, err := exec.LookPath("mydumper"); err == nil {
-		return dumpResolution{mode: dumpModeLocal, path: path}, nil
+		if isShellScript(path) {
+			slog.Warn("found mydumper on $PATH but it appears to be a shell script wrapper; skipping in favor of Docker",
+				"path", path)
+		} else {
+			return dumpResolution{mode: dumpModeLocal, path: path}, nil
+		}
 	}
 
 	dockerPath, err := exec.LookPath("docker")
@@ -121,6 +126,19 @@ func buildDockerArgs(image, outputDir, host string, mydumperArgs []string) []str
 	args = append(args, image, "mydumper")
 	args = append(args, mydumperArgs...)
 	return args
+}
+
+// isShellScript reports whether the file at path starts with a shebang (#!),
+// indicating it is a script rather than a compiled binary.
+func isShellScript(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var buf [2]byte
+	n, err := f.Read(buf[:])
+	return n == 2 && err == nil && buf[0] == '#' && buf[1] == '!'
 }
 
 // isLocalhost reports whether the host refers to the local machine.

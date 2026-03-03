@@ -286,8 +286,8 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent w
 ### dump command: mydumper resolution, lockfile, and args
 
 **mydumper resolution** (`resolveMydumper`): determines how to invoke mydumper using a priority chain:
-1. `--mydumper-path` explicitly set (`cmd.Flags().Changed("mydumper-path")`) → use that binary or fail
-2. `mydumper` found on `$PATH` → use local binary
+1. `--mydumper-path` explicitly set (`cmd.Flags().Changed("mydumper-path")`) → use that binary or fail (no validation)
+2. `mydumper` found on `$PATH` **and is a compiled binary** → use local binary (shell scripts detected by `#!` shebang are skipped with a warning)
 3. `docker` found on `$PATH` → use `docker run` with `--mydumper-image`
 4. None available → error with install instructions
 
