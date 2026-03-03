@@ -97,7 +97,7 @@ Per-command `--format` flag (default `text`): every command accepts `--format te
 | `status` | `status.go` | `--index-dsn` (req), `--format` |
 | `stream` | `stream.go` | … + `--metrics-addr` (e.g. `:9090`; empty = disabled), `--format` |
 | `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint`, `--format` |
-| `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path` (default `mydumper`), `--threads` (default 4), `--format` |
+| `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path` (default `mydumper`), `--mydumper-image` (default `mydumper/mydumper:latest`), `--threads` (default 4), `--format` |
 | `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression` (default `zstd`), `--row-group-size` (default 500000), `--upload` (S3 URL), `--upload-region`, `--format` |
 | `upload` | `upload.go` | `--source` (req), `--destination` (req), `--region`, `--retry`, `--index-dsn`, `--format` |
 
@@ -283,9 +283,21 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql` — consistent w
 
 `config.Connect` also injects a 10-second TCP connect timeout (`cfg.Timeout`) when the DSN does not specify one. This prevents indefinite hangs when MySQL is unreachable. Users can override this with the `timeout=` DSN parameter (e.g. `user:pass@tcp(host:3306)/db?timeout=30s`).
 
-### dump command: lockfile and mydumper args
+### dump command: mydumper resolution, lockfile, and args
 
-`dump.go` enforces single-concurrency via a lockfile at `os.TempDir()/bintrail-dump.lock`:
+**mydumper resolution** (`resolveMydumper`): determines how to invoke mydumper using a priority chain:
+1. `--mydumper-path` explicitly set (`cmd.Flags().Changed("mydumper-path")`) → use that binary or fail
+2. `mydumper` found on `$PATH` → use local binary
+3. `docker` found on `$PATH` → use `docker run` with `--mydumper-image`
+4. None available → error with install instructions
+
+`dumpResolution` struct: `mode` (`dumpModeLocal`/`dumpModeDocker`), `path` (binary path), `image` (docker image for docker mode).
+
+`buildDockerArgs` wraps mydumper args in `docker run --rm -v <outputdir>:<outputdir> [--network host] <image> mydumper <args...>`. The output dir is bind-mounted at the same absolute path (no path translation needed). `--network host` is added automatically on Linux when the source host is localhost/127.0.0.1/::1; on macOS a warning is logged suggesting `host.docker.internal`.
+
+Flag variable prefix: `dmpMydumperImage` for `--mydumper-image`.
+
+**Lockfile**: `dump.go` enforces single-concurrency via a lockfile at `os.TempDir()/bintrail-dump.lock`:
 - `acquireDumpLock()` uses `O_CREATE|O_EXCL|O_WRONLY` for atomic creation and writes the current PID. On `ErrExist`, reads the PID, probes liveness with `syscall.Signal(0)`, removes stale locks, and retries once.
 - `releaseDumpLock(f)` closes and removes the file.
 - `var dumpLockDir = os.TempDir` stores the function (not its result) so tests can override it with a `t.TempDir()` closure.

@@ -2,7 +2,7 @@
 
 Bintrail uses [mydumper](https://github.com/mydumper/mydumper) to create logical dumps of MySQL databases. The dump output is then converted to Parquet files by `bintrail baseline`, producing a point-in-time snapshot of every table that can be stored alongside archived binlog event partitions for long-term audit reconstruction.
 
-This document covers installing mydumper, running dumps, converting to Parquet baselines, and scheduling.
+This document covers running dumps, converting to Parquet baselines, and scheduling.
 
 ---
 
@@ -19,9 +19,30 @@ mydumper is used instead of `mysqldump` because it:
 
 ---
 
-## Installing mydumper
+## Getting mydumper
 
-mydumper is a standalone binary — it is **not** bundled with bintrail. Install it before using `bintrail dump`.
+**No installation required** — if Docker is available on your system, `bintrail dump` will automatically use the [official mydumper Docker image](https://hub.docker.com/r/mydumper/mydumper) (`mydumper/mydumper`). This is the recommended zero-setup approach.
+
+The resolution order is:
+
+1. If `--mydumper-path` is explicitly set — use that binary
+2. If `mydumper` is found on `$PATH` — use that binary
+3. If Docker is available — invoke mydumper via `docker run`
+4. If none of the above — fail with a clear error message
+
+To pin a specific mydumper Docker image version:
+
+```sh
+bintrail dump \
+  --mydumper-image mydumper/mydumper:v0.16.7-3 \
+  --source-dsn "user:pass@tcp(source-db:3306)/" \
+  --output-dir /tmp/mydumper-output
+```
+
+<details>
+<summary>Manual mydumper installation (advanced)</summary>
+
+If you prefer to install mydumper as a local binary instead of using Docker:
 
 ### Ubuntu / Debian
 
@@ -63,6 +84,8 @@ bintrail dump --mydumper-path /opt/mydumper/bin/mydumper ...
 mydumper --version
 ```
 
+</details>
+
 ---
 
 ## The dump → baseline pipeline
@@ -101,7 +124,8 @@ This dumps all user schemas from the source server into `/tmp/mydumper-output`.
 | `--output-dir` | *(required)* | Directory for mydumper output (removed and recreated on each run) |
 | `--schemas` | *(all)* | Comma-separated schema filter (e.g. `mydb,otherdb`) |
 | `--tables` | *(all)* | Comma-separated table filter (e.g. `mydb.orders,mydb.items`) |
-| `--mydumper-path` | `mydumper` | Path to the mydumper binary |
+| `--mydumper-path` | `mydumper` | Path to the mydumper binary. When set, skips Docker fallback. |
+| `--mydumper-image` | `mydumper/mydumper:latest` | Docker image for mydumper. Used only when no local binary is found. |
 | `--threads` | `4` | Number of parallel dump threads |
 | `--format` | `text` | Output format: `text` or `json` |
 
@@ -308,8 +332,13 @@ The dump frequency depends on your recovery and audit requirements. Bintrail's b
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| `mydumper not found ("mydumper")` | mydumper is not installed or not on `$PATH` | Install mydumper (see above) or use `--mydumper-path` |
+| `mydumper not found on $PATH and Docker is not available` | Neither mydumper nor Docker is installed | Install Docker (recommended) or install mydumper manually (see above) |
+| `mydumper not found at "/custom/path"` | Explicit `--mydumper-path` points to a missing binary | Verify the path is correct and the binary is executable |
 | `another dump is already running` | A previous dump is still running or crashed | Wait for it to finish, or check if the PID in `$TMPDIR/bintrail-dump.lock` is still alive. Stale locks from crashed processes are cleaned up automatically on the next run. |
 | `mydumper failed: exit status 2` | mydumper itself encountered an error (wrong credentials, unreachable host, etc.) | Check mydumper's stderr output for details. Verify the `--source-dsn` is correct. |
+| Docker: `permission denied` on `/var/run/docker.sock` | Current user is not in the `docker` group | Run `sudo usermod -aG docker $USER` and log out/in, or use `sudo bintrail dump ...` |
+| Docker: `Cannot connect to the Docker daemon` | Docker daemon is not running | Start Docker: `sudo systemctl start docker` (Linux) or open Docker Desktop (macOS) |
+| Docker: mydumper cannot reach MySQL on localhost | On macOS/Windows, `--network host` does not work as on Linux | Use `host.docker.internal` instead of `localhost` in `--source-dsn` (e.g. `user:pass@tcp(host.docker.internal:3306)/`) |
+| Docker: volume mount permission errors | Docker cannot write to the `--output-dir` path | Ensure the output directory's parent exists and is writable. On SELinux systems, add `:z` to the volume mount or use `--security-opt label=disable`. |
 | Baseline produces no files | mydumper output directory is empty or has no table data files | Verify the dump ran successfully and the `--schemas`/`--tables` filters match existing tables. |
 | `--timestamp: expected ISO 8601 format` | Invalid timestamp override format | Use `2026-03-02T14:30:00Z` or `2026-03-02 14:30:00` format. |
