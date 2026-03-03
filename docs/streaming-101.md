@@ -406,7 +406,7 @@ bintrail status --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 Or query it directly:
 
 ```sql
-SELECT server_uuid FROM bintrail_servers LIMIT 1;
+SELECT bintrail_id FROM bintrail_servers LIMIT 1;
 ```
 
 ### Run rotation as a daemon
