@@ -25,10 +25,12 @@ mydumper is used instead of `mysqldump` because it:
 
 The resolution order is:
 
-1. If `--mydumper-path` is explicitly set — use that binary
-2. If `mydumper` is found on `$PATH` — use that binary
+1. If `--mydumper-path` is explicitly set — use that binary (no validation)
+2. If a **compiled** `mydumper` binary is found on `$PATH` — use it (shell script wrappers are skipped automatically)
 3. If Docker is available — invoke mydumper via `docker run`
 4. If none of the above — fail with a clear error message
+
+> **Note:** Do not place a shell script wrapper named `mydumper` on your PATH. Bintrail detects scripts (files starting with `#!`) and skips them to avoid argument-handling issues with volume mounts. If you need to force a specific binary, use `--mydumper-path`.
 
 To pin a specific mydumper Docker image version:
 
@@ -334,6 +336,7 @@ The dump frequency depends on your recovery and audit requirements. Bintrail's b
 |---------|-------|-----|
 | `mydumper not found on $PATH and Docker is not available` | Neither mydumper nor Docker is installed | Install Docker (recommended) or install mydumper manually (see above) |
 | `mydumper not found at "/custom/path"` | Explicit `--mydumper-path` points to a missing binary | Verify the path is correct and the binary is executable |
+| `found mydumper on $PATH but it appears to be a shell script wrapper` | A shell script named `mydumper` is on your PATH (e.g. a Docker wrapper) | Remove the wrapper script — bintrail handles Docker invocation automatically. Or use `--mydumper-path` to point to the real binary. |
 | `another dump is already running` | A previous dump is still running or crashed | Wait for it to finish, or check if the PID in `$TMPDIR/bintrail-dump.lock` is still alive. Stale locks from crashed processes are cleaned up automatically on the next run. |
 | `mydumper failed: exit status 2` | mydumper itself encountered an error (wrong credentials, unreachable host, etc.) | Check mydumper's stderr output for details. Verify the `--source-dsn` is correct. |
 | Docker: `permission denied` on `/var/run/docker.sock` | Current user is not in the `docker` group | Run `sudo usermod -aG docker $USER` and log out/in, or use `sudo bintrail dump ...` |
