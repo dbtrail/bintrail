@@ -131,9 +131,10 @@ func TestStreamParser_rotateBeforeRows(t *testing.T) {
 
 // ─── GTIDEvent ───────────────────────────────────────────────────────────────
 
-// TestStreamParser_gtidEventNoOutput verifies that a GTIDEvent does not produce
-// output events (it only updates internal GTID state).
-func TestStreamParser_gtidEventNoOutput(t *testing.T) {
+// TestStreamParser_gtidEventEmitsTrackingEvent verifies that a GTIDEvent emits
+// an EventGTID tracking event so that the GTID is accumulated by the stream
+// loop even when no row events follow (fix for issue #124).
+func TestStreamParser_gtidEventEmitsTrackingEvent(t *testing.T) {
 	sp := NewStreamParser(nil, Filters{}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
@@ -144,14 +145,21 @@ func TestStreamParser_gtidEventNoOutput(t *testing.T) {
 	if err := sp.Run(ctx, streamer, out); err != nil {
 		t.Errorf("expected nil error, got %v", err)
 	}
-	if len(out) != 0 {
-		t.Errorf("expected no events for GTIDEvent, got %d", len(out))
+	if len(out) != 1 {
+		t.Fatalf("expected 1 EventGTID tracking event, got %d", len(out))
+	}
+	ev := <-out
+	if ev.EventType != EventGTID {
+		t.Errorf("expected EventGTID (%d), got %d", EventGTID, ev.EventType)
+	}
+	if ev.GTID == "" {
+		t.Error("expected non-empty GTID on tracking event")
 	}
 }
 
 // TestStreamParser_gtidThenFilteredRows verifies that a GTIDEvent followed by
-// a filtered RowsEvent produces no output — the GTID is set internally but
-// discarded along with the row.
+// a filtered RowsEvent emits only the GTID tracking event — the row is filtered
+// but the GTID is preserved for accumulation (fix for issue #124).
 func TestStreamParser_gtidThenFilteredRows(t *testing.T) {
 	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{"only": true}}, nil)
 	streamer := replication.NewBinlogStreamer()
@@ -166,8 +174,12 @@ func TestStreamParser_gtidThenFilteredRows(t *testing.T) {
 	if err := sp.Run(ctx, streamer, out); err != nil {
 		t.Errorf("expected nil error, got %v", err)
 	}
-	if len(out) != 0 {
-		t.Errorf("expected 0 events, got %d", len(out))
+	if len(out) != 1 {
+		t.Fatalf("expected 1 EventGTID tracking event (rows filtered), got %d", len(out))
+	}
+	ev := <-out
+	if ev.EventType != EventGTID {
+		t.Errorf("expected EventGTID (%d), got %d", EventGTID, ev.EventType)
 	}
 }
 
@@ -306,9 +318,10 @@ func TestStreamParser_streamerErrorAfterEvents(t *testing.T) {
 
 // ─── Mixed event sequence ─────────────────────────────────────────────────────
 
-// TestStreamParser_mixedSequenceNoOutput processes a realistic sequence of
-// Rotate → GTID → Query → RowsEvent (filtered) and verifies no output, no error.
-func TestStreamParser_mixedSequenceNoOutput(t *testing.T) {
+// TestStreamParser_mixedSequenceGTIDOnly processes a realistic sequence of
+// Rotate → GTID → Query → RowsEvent (filtered) and verifies only a GTID
+// tracking event is emitted (rows filtered but GTID preserved).
+func TestStreamParser_mixedSequenceGTIDOnly(t *testing.T) {
 	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{"prod": true}}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
@@ -324,7 +337,11 @@ func TestStreamParser_mixedSequenceNoOutput(t *testing.T) {
 	if err := sp.Run(ctx, streamer, out); err != nil {
 		t.Errorf("expected nil error, got %v", err)
 	}
-	if len(out) != 0 {
-		t.Errorf("expected 0 events, got %d", len(out))
+	if len(out) != 1 {
+		t.Fatalf("expected 1 EventGTID tracking event (rows filtered), got %d", len(out))
+	}
+	ev := <-out
+	if ev.EventType != EventGTID {
+		t.Errorf("expected EventGTID (%d), got %d", EventGTID, ev.EventType)
 	}
 }

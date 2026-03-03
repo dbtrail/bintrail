@@ -30,6 +30,7 @@ const (
 	EventUpdate EventType = 2
 	EventDelete EventType = 3
 	EventDDL    EventType = 4
+	EventGTID   EventType = 5 // GTID-only tracking event (no row data)
 )
 
 // Event is a fully resolved binlog row event with column names attached.
