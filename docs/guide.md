@@ -506,7 +506,7 @@ bintrail rotate \
   --archive-s3-region us-east-1
 ```
 
-`--archive-dir` is still required with `--archive-s3` — files are written locally first, then uploaded. Point it at a temporary directory if you don't need local copies after upload. Archives are stored in a Hive-partitioned layout: `bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/events_<HH>.parquet`, compatible with Athena, Glue, and DuckDB.
+`--archive-dir` is still required with `--archive-s3` — files are written locally first, then uploaded. Point it at a temporary directory if you don't need local copies after upload. Archives are stored in a Hive-partitioned layout: `bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/event_hour=<HH>/events.parquet`, compatible with Athena, Glue, and DuckDB.
 
 **Retry after a partial failure:** If archiving or S3 upload fails partway through (network error, disk full, etc.), re-run with `--retry` to pick up where it left off:
 

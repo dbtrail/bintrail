@@ -145,7 +145,7 @@ bintrail rotate \
   --archive-compression zstd
 ```
 
-Each archived partition becomes a single Parquet file: `<archive-dir>/p_YYYYMMDDHH.parquet`. If any archive write fails, no partitions are dropped — the command aborts before touching the table.
+Each archived partition becomes a single Parquet file under a Hive-partitioned directory: `<archive-dir>/bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/event_hour=<HH>/events.parquet`. If any archive write fails, no partitions are dropped — the command aborts before touching the table.
 
 `--archive-compression` accepts `zstd` (default), `snappy`, `gzip`, or `none`.
 
@@ -208,11 +208,14 @@ bintrail rotate \
 s3://my-bintrail-archives/events/
   bintrail_id=abc123de-0000-0000-0000-000000000001/
     event_date=2026-02-13/
-      events_00.parquet   ← p_2026021300
-      events_01.parquet   ← p_2026021301
+      event_hour=00/
+        events.parquet    ← p_2026021300
+      event_hour=01/
+        events.parquet    ← p_2026021301
       ...
     event_date=2026-02-14/
-      events_00.parquet
+      event_hour=00/
+        events.parquet
       ...
 ```
 
