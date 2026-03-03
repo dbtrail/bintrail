@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -36,7 +39,7 @@ func TestBaselineCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"input", "output", "timestamp", "tables",
 		"compression", "row-group-size", "upload", "upload-region",
-		"retry",
+		"retry", "encrypt", "encrypt-key",
 	} {
 		if baselineCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on baselineCmd", name)
@@ -312,5 +315,80 @@ func TestRunBaseline_emptyTimestamp(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "metadata") {
 		t.Errorf("expected 'metadata' in error, got: %v", err)
+	}
+}
+
+// ─── encryption ───────────────────────────────────────────────────────────────
+
+func TestBaselineCmd_encryptDefaultFalse(t *testing.T) {
+	f := baselineCmd.Flag("encrypt")
+	if f == nil {
+		t.Fatal("flag --encrypt not registered")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("expected default encrypt=false, got %q", f.DefValue)
+	}
+}
+
+func TestDecryptDumpFiles_noEncFiles(t *testing.T) {
+	dir := t.TempDir()
+	// Create a non-.enc file to verify it's left alone.
+	os.WriteFile(filepath.Join(dir, "test.sql"), []byte("data"), 0o644)
+
+	keyPath := filepath.Join(dir, "test.key")
+	os.WriteFile(keyPath, []byte("testkey"), 0o600)
+
+	cleanup, err := decryptDumpFiles(dir, keyPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer cleanup()
+	// Should log a warning but not fail.
+}
+
+func TestDecryptDumpFiles_roundTrip(t *testing.T) {
+	// Skip if openssl is not available.
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not available on $PATH")
+	}
+
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "test.key")
+	os.WriteFile(keyPath, []byte("testpassphrase"), 0o600)
+
+	// Encrypt a file using the same openssl command that dump would use.
+	plaintext := "CREATE TABLE test (id INT PRIMARY KEY);\n"
+	plainFile := filepath.Join(dir, "mydb.test-schema.sql")
+	os.WriteFile(plainFile, []byte(plaintext), 0o644)
+
+	encFile := plainFile + ".enc"
+	cmd := exec.Command("openssl", "enc", "-aes-256-cbc", "-pbkdf2",
+		"-pass", "file:"+keyPath, "-in", plainFile, "-out", encFile)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("encrypt failed: %v\n%s", err, out)
+	}
+
+	// Remove the plain file to simulate what mydumper would produce.
+	os.Remove(plainFile)
+
+	// Decrypt.
+	cleanup, err := decryptDumpFiles(dir, keyPath)
+	if err != nil {
+		t.Fatalf("decryptDumpFiles failed: %v", err)
+	}
+
+	// Verify decrypted file exists and has correct content.
+	data, err := os.ReadFile(plainFile)
+	if err != nil {
+		t.Fatalf("decrypted file not found: %v", err)
+	}
+	if string(data) != plaintext {
+		t.Errorf("decrypted content mismatch: got %q, want %q", string(data), plaintext)
+	}
+
+	// Cleanup should remove the decrypted file.
+	cleanup()
+	if _, err := os.Stat(plainFile); !os.IsNotExist(err) {
+		t.Error("cleanup should have removed the decrypted file")
 	}
 }

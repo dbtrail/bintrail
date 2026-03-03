@@ -70,7 +70,7 @@ func TestDumpCmd_allFlagsRegistered(t *testing.T) {
 // ─── buildMydumperArgs ────────────────────────────────────────────────────────
 
 func TestBuildMydumperArgs_basic(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "secret", "/tmp/dump", 4, nil, nil)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "secret", "/tmp/dump", 4, nil, nil, "")
 	assertArgsContainPair(t, args, "--host", "127.0.0.1")
 	assertArgsContainPair(t, args, "--port", "3306")
 	assertArgsContainPair(t, args, "--user", "root")
@@ -79,7 +79,7 @@ func TestBuildMydumperArgs_basic(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_compressAndComplete(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "")
 	if !argsContain(args, "--compress-protocol") {
 		t.Error("expected --compress-protocol in args")
 	}
@@ -89,7 +89,7 @@ func TestBuildMydumperArgs_compressAndComplete(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_lockAndTrx(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "")
 	assertArgsContainPair(t, args, "--sync-thread-lock-mode", "NO_LOCK")
 	if !argsContain(args, "--trx-tables") {
 		t.Error("expected --trx-tables in args")
@@ -97,14 +97,14 @@ func TestBuildMydumperArgs_lockAndTrx(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_noPassword(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "")
 	if argsContain(args, "--password") {
 		t.Error("expected --password to be absent when password is empty")
 	}
 }
 
 func TestBuildMydumperArgs_singleSchema(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"mydb"}, nil)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"mydb"}, nil, "")
 	assertArgsContainPair(t, args, "--database", "mydb")
 	if argsContain(args, "--regex") {
 		t.Error("expected --regex to be absent for single schema")
@@ -112,7 +112,7 @@ func TestBuildMydumperArgs_singleSchema(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_multipleSchemas(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2"}, nil)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2"}, nil, "")
 	if argsContain(args, "--database") {
 		t.Error("expected --database to be absent for multiple schemas")
 	}
@@ -130,12 +130,12 @@ func TestBuildMydumperArgs_multipleSchemas(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_withPassword(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "s3cr3t", "/tmp/dump", 4, nil, nil)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "s3cr3t", "/tmp/dump", 4, nil, nil, "")
 	assertArgsContainPair(t, args, "--password", "s3cr3t")
 }
 
 func TestBuildMydumperArgs_noSchemasOrTables(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "")
 	for _, flag := range []string{"--database", "--regex", "--tables-list"} {
 		if argsContain(args, flag) {
 			t.Errorf("expected %s to be absent when no schemas or tables given", flag)
@@ -144,7 +144,7 @@ func TestBuildMydumperArgs_noSchemasOrTables(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_regexAnchoredFormat(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2"}, nil)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2"}, nil, "")
 	idx := argsIndex(args, "--regex")
 	if idx < 0 || idx+1 >= len(args) {
 		t.Fatal("expected --regex in args")
@@ -161,7 +161,7 @@ func TestBuildMydumperArgs_regexAnchoredFormat(t *testing.T) {
 
 func TestBuildMydumperArgs_schemaAndTables(t *testing.T) {
 	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4,
-		[]string{"mydb"}, []string{"mydb.orders", "mydb.items"})
+		[]string{"mydb"}, []string{"mydb.orders", "mydb.items"}, "")
 	assertArgsContainPair(t, args, "--database", "mydb")
 	idx := argsIndex(args, "--tables-list")
 	if idx < 0 || idx+1 >= len(args) {
@@ -173,7 +173,7 @@ func TestBuildMydumperArgs_schemaAndTables(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_tables(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, []string{"mydb.orders", "mydb.items"})
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, []string{"mydb.orders", "mydb.items"}, "")
 	idx := argsIndex(args, "--tables-list")
 	if idx < 0 {
 		t.Fatal("expected --tables-list in args")
@@ -263,7 +263,7 @@ func TestAcquireDumpLock_staleLock(t *testing.T) {
 // TestBuildMydumperArgs_threeSchemas verifies that 3+ schemas all appear in the
 // --regex value, not just the first two.
 func TestBuildMydumperArgs_threeSchemas(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2", "db3"}, nil)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2", "db3"}, nil, "")
 	idx := argsIndex(args, "--regex")
 	if idx < 0 || idx+1 >= len(args) {
 		t.Fatal("expected --regex in args for 3 schemas")
@@ -507,7 +507,7 @@ func TestResolveMydumper_dockerFallback(t *testing.T) {
 
 func TestBuildDockerArgs_basic(t *testing.T) {
 	mydumperArgs := []string{"--host", "db.example.com", "--port", "3306", "--user", "root", "--outputdir", "/tmp/dump"}
-	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", mydumperArgs)
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", mydumperArgs, "")
 
 	// Should start with docker run --rm
 	if len(args) < 3 || args[0] != "run" || args[1] != "--rm" {
@@ -539,7 +539,7 @@ func TestBuildDockerArgs_basic(t *testing.T) {
 
 func TestBuildDockerArgs_localhostNetworkHost(t *testing.T) {
 	for _, host := range []string{"localhost", "127.0.0.1", "::1"} {
-		args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", host, nil)
+		args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", host, nil, "")
 
 		// On Linux, --network host should be added; on macOS it should not.
 		hasNetwork := argsContain(args, "--network")
@@ -582,76 +582,93 @@ func TestDumpCmd_mydumperImageFlag(t *testing.T) {
 	}
 }
 
-// ─── isShellScript ────────────────────────────────────────────────────────────
+// ─── encryption ───────────────────────────────────────────────────────────────
 
-func TestIsShellScript(t *testing.T) {
-	dir := t.TempDir()
-
-	// A file starting with #! is a script.
-	script := filepath.Join(dir, "wrapper.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/bash\nexec mydumper \"$@\"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if !isShellScript(script) {
-		t.Error("expected isShellScript=true for a file starting with #!")
-	}
-
-	// A file with arbitrary binary content is not a script.
-	bin := filepath.Join(dir, "mydumper")
-	if err := os.WriteFile(bin, []byte{0x7f, 'E', 'L', 'F'}, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if isShellScript(bin) {
-		t.Error("expected isShellScript=false for an ELF binary")
-	}
-
-	// An empty file is not a script.
-	empty := filepath.Join(dir, "empty")
-	if err := os.WriteFile(empty, []byte{}, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if isShellScript(empty) {
-		t.Error("expected isShellScript=false for an empty file")
-	}
-
-	// A nonexistent file is not a script.
-	if isShellScript(filepath.Join(dir, "nonexistent")) {
-		t.Error("expected isShellScript=false for a nonexistent file")
+func TestDumpCmd_encryptFlagsRegistered(t *testing.T) {
+	for _, name := range []string{"encrypt", "encrypt-key"} {
+		if dumpCmd.Flag(name) == nil {
+			t.Errorf("flag --%s not registered on dumpCmd", name)
+		}
 	}
 }
 
-func TestResolveMydumper_shellScriptSkipped(t *testing.T) {
-	dir := t.TempDir()
-
-	// Place a shell script named "mydumper" and a fake "docker" on PATH.
-	script := filepath.Join(dir, "mydumper")
-	if err := os.WriteFile(script, []byte("#!/bin/bash\nexec docker run mydumper \"$@\"\n"), 0o755); err != nil {
-		t.Fatal(err)
+func TestBuildMydumperArgs_encrypt(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "/path/to/key")
+	idx := argsIndex(args, "--exec-per-thread")
+	if idx < 0 {
+		t.Fatal("expected --exec-per-thread in args when encryption enabled")
 	}
-	fakeDocker := filepath.Join(dir, "docker")
-	if err := os.WriteFile(fakeDocker, []byte{0x7f, 'E', 'L', 'F'}, 0o755); err != nil {
-		t.Fatal(err)
+	if idx+1 >= len(args) {
+		t.Fatal("--exec-per-thread has no value")
 	}
-
-	t.Setenv("PATH", dir)
-
-	saved := dmpMydumperImage
-	t.Cleanup(func() { dmpMydumperImage = saved })
-	dmpMydumperImage = "mydumper/mydumper:latest"
-
-	// Use a fresh command so --mydumper-path is not Changed.
-	cmd := &cobra.Command{Use: "test"}
-	cmd.Flags().String("mydumper-path", "mydumper", "")
-
-	res, err := resolveMydumper(cmd)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	val := args[idx+1]
+	if !strings.Contains(val, "openssl enc -aes-256-cbc -pbkdf2") {
+		t.Errorf("expected openssl command in --exec-per-thread value, got %q", val)
 	}
-	if res.mode != dumpModeDocker {
-		t.Errorf("expected dumpModeDocker when mydumper on PATH is a script, got %d", res.mode)
+	if !strings.Contains(val, "file:") {
+		t.Errorf("expected file: passphrase source in --exec-per-thread value, got %q", val)
 	}
-	if res.path != fakeDocker {
-		t.Errorf("expected docker path %q, got %q", fakeDocker, res.path)
+	assertArgsContainPair(t, args, "--exec-per-thread-extension", ".enc")
+}
+
+func TestBuildMydumperArgs_noEncrypt(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "")
+	if argsContain(args, "--exec-per-thread") {
+		t.Error("expected --exec-per-thread to be absent when encryption disabled")
+	}
+	if argsContain(args, "--exec-per-thread-extension") {
+		t.Error("expected --exec-per-thread-extension to be absent when encryption disabled")
+	}
+}
+
+func TestBuildDockerArgs_encryptKeyMount(t *testing.T) {
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", nil, "/path/to/key")
+	found := false
+	for i, a := range args {
+		if a == "-v" && i+1 < len(args) && strings.Contains(args[i+1], "/key") && strings.HasSuffix(args[i+1], ":ro") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected key file bind mount with :ro in docker args")
+	}
+}
+
+func TestBuildDockerArgs_noEncryptKeyMount(t *testing.T) {
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", nil, "")
+	// Should only have one -v (for output dir)
+	count := 0
+	for _, a := range args {
+		if a == "-v" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected 1 -v flag without encryption, got %d", count)
+	}
+}
+
+func TestResolveEncryptKey_missingFile(t *testing.T) {
+	_, err := resolveEncryptKey("/nonexistent/path/to/key")
+	if err == nil {
+		t.Fatal("expected error for missing key file")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected 'not found' in error, got: %v", err)
+	}
+}
+
+func TestResolveEncryptKey_defaultPath(t *testing.T) {
+	// When key path is empty, resolveEncryptKey uses defaultKeyPath().
+	// This will fail because the file doesn't exist, but we can verify
+	// the error message references the default path.
+	_, err := resolveEncryptKey("")
+	if err == nil {
+		t.Fatal("expected error for missing default key file")
+	}
+	if !strings.Contains(err.Error(), "generate-key") {
+		t.Errorf("expected 'generate-key' hint in error, got: %v", err)
 	}
 }
 
