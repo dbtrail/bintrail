@@ -62,6 +62,43 @@ func TestParseMetadataFields(t *testing.T) {
 	}
 }
 
+// sampleMetadataNew is the format produced by mydumper 0.16+ (TOML-like with
+// # prefixes and KEY = "value" assignments).
+const sampleMetadataNew = `# Started dump at: 2026-03-02 23:45:20
+[config]
+quote-character = BACKTICK
+
+[source]
+# executed_gtid_set = "55512139-1432-11f1-8d8d-0693b428a89b:1-11490596"
+# SOURCE_LOG_FILE = "mysql-bin-changelog.000879"
+# SOURCE_LOG_POS = 4504702
+# Finished dump at: 2026-03-02 23:45:21
+`
+
+func TestParseMetadataNewFormat(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "metadata"), []byte(sampleMetadataNew), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := ParseMetadata(dir)
+	if err != nil {
+		t.Fatalf("ParseMetadata: %v", err)
+	}
+	wantTime := time.Date(2026, 3, 2, 23, 45, 20, 0, time.UTC)
+	if !m.StartedAt.Equal(wantTime) {
+		t.Errorf("StartedAt = %v, want %v", m.StartedAt, wantTime)
+	}
+	if m.BinlogFile != "mysql-bin-changelog.000879" {
+		t.Errorf("BinlogFile = %q, want %q", m.BinlogFile, "mysql-bin-changelog.000879")
+	}
+	if m.BinlogPos != 4504702 {
+		t.Errorf("BinlogPos = %d, want 4504702", m.BinlogPos)
+	}
+	if m.GTIDSet != "55512139-1432-11f1-8d8d-0693b428a89b:1-11490596" {
+		t.Errorf("GTIDSet = %q, want %q", m.GTIDSet, "55512139-1432-11f1-8d8d-0693b428a89b:1-11490596")
+	}
+}
+
 func TestParseMetadataMissingTimestamp(t *testing.T) {
 	const content = "SHOW MASTER STATUS:\n\tLog: binlog.000001\n\tPos: 100\n"
 	dir := t.TempDir()
