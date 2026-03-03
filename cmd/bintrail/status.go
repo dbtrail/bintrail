@@ -97,6 +97,17 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		slog.Debug("loaded servers", "count", len(servers), "duration_ms", time.Since(t).Milliseconds())
 	}
 
+	// Best-effort: stream_state may not exist in older index databases.
+	slog.Debug("loading stream state")
+	t = time.Now()
+	stream, err := status.LoadStreamState(ctx, db)
+	if err != nil {
+		slog.Warn("could not load stream state", "error", err)
+		stream = nil
+	} else if stream != nil {
+		slog.Debug("loaded stream state", "mode", stream.Mode, "events", stream.EventsIndexed, "duration_ms", time.Since(t).Milliseconds())
+	}
+
 	// Best-effort: archive_state may not exist in older index databases.
 	slog.Debug("loading archive stats")
 	t = time.Now()
@@ -122,8 +133,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	slog.Info("status complete", "duration_ms", time.Since(start).Milliseconds())
 
 	if stFormat == "json" {
-		return status.WriteStatusJSON(os.Stdout, files, partStats, archives, coverage, servers)
+		return status.WriteStatusJSON(os.Stdout, files, partStats, archives, coverage, servers, stream)
 	}
-	status.WriteStatus(os.Stdout, files, partStats, archives, coverage, servers)
+	status.WriteStatus(os.Stdout, files, partStats, archives, coverage, servers, stream)
 	return nil
 }

@@ -90,7 +90,7 @@ func TestTruncate_longString(t *testing.T) {
 
 func TestWriteStatus_noFiles_noPartitions(t *testing.T) {
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, nil, nil)
+	WriteStatus(&buf, nil, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Indexed Files ===")
@@ -129,7 +129,7 @@ func TestWriteStatus_withFiles(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil, nil, nil, nil)
+	WriteStatus(&buf, files, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "binlog.000042")
@@ -157,7 +157,7 @@ func TestWriteStatus_withPartitions(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, parts, nil, nil, nil)
+	WriteStatus(&buf, nil, parts, nil, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Partitions ===")
@@ -179,7 +179,7 @@ func TestWriteStatus_errorTruncation(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil, nil, nil, nil)
+	WriteStatus(&buf, files, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	// The error should be truncated — full 100-char string should not appear.
@@ -211,7 +211,7 @@ func TestWriteStatus_bintrailIDColumn(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil, nil, nil, nil)
+	WriteStatus(&buf, files, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	// BINTRAIL_ID column header must appear.
@@ -234,7 +234,7 @@ func TestWriteStatus_perServerSummary_multipleServers(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil, nil, nil, nil)
+	WriteStatus(&buf, files, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Summary ===")
@@ -256,7 +256,7 @@ func TestWriteStatus_perServerSummary_unknownID(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, files, nil, nil, nil, nil)
+	WriteStatus(&buf, files, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	// Null bintrail_id must be grouped under "(unknown)".
@@ -277,7 +277,7 @@ func assertContains(t *testing.T, s, want string) {
 
 func TestWriteStatusJSON_empty(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	var result struct {
@@ -316,7 +316,7 @@ func TestWriteStatusJSON_withData(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, files, parts, nil, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, files, parts, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -370,7 +370,7 @@ func TestWriteStatusJSON_nullFields(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, files, nil, nil, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, files, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -432,7 +432,7 @@ func TestWriteStatus_withArchives(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, archives, nil, nil)
+	WriteStatus(&buf, nil, nil, archives, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Archives ===")
@@ -446,7 +446,7 @@ func TestWriteStatus_withArchives(t *testing.T) {
 
 func TestWriteStatus_nilArchives_omitsSection(t *testing.T) {
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, nil, nil)
+	WriteStatus(&buf, nil, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	if strings.Contains(out, "=== Archives ===") {
@@ -456,7 +456,7 @@ func TestWriteStatus_nilArchives_omitsSection(t *testing.T) {
 
 func TestWriteStatus_zeroArchives_omitsSection(t *testing.T) {
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, &ArchiveStats{}, nil, nil)
+	WriteStatus(&buf, nil, nil, &ArchiveStats{}, nil, nil, nil)
 	out := buf.String()
 
 	if strings.Contains(out, "=== Archives ===") {
@@ -474,7 +474,7 @@ func TestWriteStatus_archives_noS3(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, archives, nil, nil)
+	WriteStatus(&buf, nil, nil, archives, nil, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Archives ===")
@@ -497,7 +497,7 @@ func TestWriteStatusJSON_withArchives(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, archives, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, archives, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -537,7 +537,7 @@ func TestWriteStatusJSON_withArchives(t *testing.T) {
 
 func TestWriteStatusJSON_nilArchives_omitsKey(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -564,7 +564,7 @@ func TestWriteStatus_withCoverage(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, coverage, nil)
+	WriteStatus(&buf, nil, nil, nil, coverage, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Restore Coverage ===")
@@ -577,7 +577,7 @@ func TestWriteStatus_withCoverage(t *testing.T) {
 
 func TestWriteStatus_nilCoverage_omitsSection(t *testing.T) {
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, nil, nil)
+	WriteStatus(&buf, nil, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	if strings.Contains(out, "=== Restore Coverage ===") {
@@ -593,7 +593,7 @@ func TestWriteStatus_zeroCoverage_noWarning(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, coverage, nil)
+	WriteStatus(&buf, nil, nil, nil, coverage, nil, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Restore Coverage ===")
@@ -614,7 +614,7 @@ func TestWriteStatusJSON_withCoverage(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, nil, coverage, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil, coverage, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -646,7 +646,7 @@ func TestWriteStatusJSON_withCoverage(t *testing.T) {
 
 func TestWriteStatusJSON_nilCoverage_omitsKey(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -674,7 +674,7 @@ func TestWriteStatus_withServers(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, nil, servers)
+	WriteStatus(&buf, nil, nil, nil, nil, servers, nil)
 	out := buf.String()
 
 	assertContains(t, out, "=== Servers ===")
@@ -698,7 +698,7 @@ func TestWriteStatus_withDecommissionedServer(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, nil, servers)
+	WriteStatus(&buf, nil, nil, nil, nil, servers, nil)
 	out := buf.String()
 
 	assertContains(t, out, "decommissioned")
@@ -706,7 +706,7 @@ func TestWriteStatus_withDecommissionedServer(t *testing.T) {
 
 func TestWriteStatus_nilServers_omitsSection(t *testing.T) {
 	var buf bytes.Buffer
-	WriteStatus(&buf, nil, nil, nil, nil, nil)
+	WriteStatus(&buf, nil, nil, nil, nil, nil, nil)
 	out := buf.String()
 
 	if strings.Contains(out, "=== Servers ===") {
@@ -729,7 +729,7 @@ func TestWriteStatusJSON_withServers(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, servers); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, servers, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -764,7 +764,7 @@ func TestWriteStatusJSON_withServers(t *testing.T) {
 
 func TestWriteStatusJSON_nilServers_omitsKey(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil); err != nil {
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -774,5 +774,130 @@ func TestWriteStatusJSON_nilServers_omitsKey(t *testing.T) {
 	}
 	if _, ok := raw["servers"]; ok {
 		t.Error("expected no 'servers' key when servers is nil")
+	}
+}
+
+// ─── WriteStatus: stream section ────────────────────────────────────────────
+
+func TestWriteStatus_withStream(t *testing.T) {
+	stream := &StreamStateInfo{
+		Mode:           "gtid",
+		BinlogFile:     "binlog.000005",
+		BinlogPosition: 12345,
+		GTIDSet:        sql.NullString{Valid: true, String: "aaa-bbb:1-100"},
+		EventsIndexed:  267354,
+		LastEventTime:  sql.NullTime{Valid: true, Time: time.Date(2026, 3, 3, 16, 56, 40, 0, time.UTC)},
+		LastCheckpoint: time.Date(2026, 3, 3, 16, 56, 45, 0, time.UTC),
+		ServerID:       42,
+		BintrailID:     sql.NullString{Valid: true, String: "97adaf56-fe9e-4c1b-9794-b042f7faf197"},
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, nil, nil, stream)
+	out := buf.String()
+
+	assertContains(t, out, "=== Stream ===")
+	assertContains(t, out, "97adaf56-fe9e-4c1b-9794-b042f7faf197")
+	assertContains(t, out, "gtid")
+	assertContains(t, out, "binlog.000005:12345")
+	assertContains(t, out, "aaa-bbb:1-100")
+	assertContains(t, out, "267354")
+	assertContains(t, out, "42")
+}
+
+func TestWriteStatus_nilStream_omitsSection(t *testing.T) {
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, nil, nil, nil)
+	out := buf.String()
+
+	if strings.Contains(out, "=== Stream ===") {
+		t.Error("expected no Stream section when stream is nil")
+	}
+}
+
+func TestWriteStatus_streamNoBintrailID(t *testing.T) {
+	stream := &StreamStateInfo{
+		Mode:           "position",
+		BinlogFile:     "binlog.000001",
+		BinlogPosition: 4,
+		EventsIndexed:  0,
+		LastCheckpoint: time.Date(2026, 3, 3, 16, 0, 0, 0, time.UTC),
+		ServerID:       1,
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, nil, nil, stream)
+	out := buf.String()
+
+	assertContains(t, out, "=== Stream ===")
+	assertContains(t, out, "(none)")
+	assertContains(t, out, "position")
+}
+
+// ─── WriteStatusJSON: stream ────────────────────────────────────────────────
+
+func TestWriteStatusJSON_withStream(t *testing.T) {
+	stream := &StreamStateInfo{
+		Mode:           "gtid",
+		BinlogFile:     "binlog.000005",
+		BinlogPosition: 12345,
+		GTIDSet:        sql.NullString{Valid: true, String: "aaa-bbb:1-100"},
+		EventsIndexed:  267354,
+		LastEventTime:  sql.NullTime{Valid: true, Time: time.Date(2026, 3, 3, 16, 56, 40, 0, time.UTC)},
+		LastCheckpoint: time.Date(2026, 3, 3, 16, 56, 45, 0, time.UTC),
+		ServerID:       42,
+		BintrailID:     sql.NullString{Valid: true, String: "97adaf56-fe9e-4c1b-9794-b042f7faf197"},
+	}
+
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil, stream); err != nil {
+		t.Fatal(err)
+	}
+
+	var result struct {
+		Stream *struct {
+			BintrailID     *string `json:"bintrail_id"`
+			Mode           string  `json:"mode"`
+			BinlogFile     string  `json:"binlog_file"`
+			BinlogPosition uint64  `json:"binlog_position"`
+			GTIDSet        *string `json:"gtid_set"`
+			EventsIndexed  int64   `json:"events_indexed"`
+			LastEventTime  *string `json:"last_event_time"`
+			LastCheckpoint string  `json:"last_checkpoint"`
+			ServerID       uint32  `json:"server_id"`
+		} `json:"stream"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if result.Stream == nil {
+		t.Fatal("expected stream key in JSON")
+	}
+	if result.Stream.BintrailID == nil || *result.Stream.BintrailID != "97adaf56-fe9e-4c1b-9794-b042f7faf197" {
+		t.Errorf("wrong bintrail_id: %v", result.Stream.BintrailID)
+	}
+	if result.Stream.Mode != "gtid" {
+		t.Errorf("wrong mode: %s", result.Stream.Mode)
+	}
+	if result.Stream.EventsIndexed != 267354 {
+		t.Errorf("wrong events_indexed: %d", result.Stream.EventsIndexed)
+	}
+	if result.Stream.ServerID != 42 {
+		t.Errorf("wrong server_id: %d", result.Stream.ServerID)
+	}
+}
+
+func TestWriteStatusJSON_nilStream_omitsKey(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &raw); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if _, ok := raw["stream"]; ok {
+		t.Error("expected no 'stream' key when stream is nil")
 	}
 }

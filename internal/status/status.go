@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -67,6 +68,19 @@ type SchemaChange struct {
 	TableName  string
 	DDLType    string
 	SnapshotID sql.NullInt32
+}
+
+// StreamStateInfo holds the single row from the stream_state table.
+type StreamStateInfo struct {
+	Mode           string // "position" or "gtid"
+	BinlogFile     string
+	BinlogPosition uint64
+	GTIDSet        sql.NullString
+	EventsIndexed  int64
+	LastEventTime  sql.NullTime
+	LastCheckpoint time.Time
+	ServerID       uint32
+	BintrailID     sql.NullString
 }
 
 // CoverageInfo summarizes the restore coverage of the index.
@@ -244,8 +258,31 @@ func LoadServers(ctx context.Context, db *sql.DB) ([]ServerInfo, error) {
 	return servers, rows.Err()
 }
 
-// WriteStatus writes a multi-section status report (Servers, Indexed Files, Partitions, Archives, Coverage, Summary) to w.
-func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo) {
+// LoadStreamState loads the single row from stream_state (if any).
+// Returns nil with no error when the table is empty (no active stream).
+func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) {
+	var s StreamStateInfo
+	err := db.QueryRowContext(ctx, `
+		SELECT mode, binlog_file, binlog_position, gtid_set,
+		       events_indexed, last_event_time, last_checkpoint,
+		       server_id, bintrail_id
+		FROM stream_state
+		WHERE id = 1`).Scan(
+		&s.Mode, &s.BinlogFile, &s.BinlogPosition, &s.GTIDSet,
+		&s.EventsIndexed, &s.LastEventTime, &s.LastCheckpoint,
+		&s.ServerID, &s.BintrailID,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &s, nil
+}
+
+// WriteStatus writes a multi-section status report (Servers, Stream, Indexed Files, Partitions, Archives, Coverage, Summary) to w.
+func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo) {
 	// ── Section 0: Servers ───────────────────────────────────────────────────
 	if len(servers) > 0 {
 		fmt.Fprintln(w, "=== Servers ===")
@@ -263,6 +300,30 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 			)
 		}
 		tw.Flush()
+		fmt.Fprintln(w)
+	}
+
+	// ── Section 0b: Stream ──────────────────────────────────────────────────
+	if stream != nil {
+		fmt.Fprintln(w, "=== Stream ===")
+		bintrailID := "(none)"
+		if stream.BintrailID.Valid && stream.BintrailID.String != "" {
+			bintrailID = stream.BintrailID.String
+		}
+		fmt.Fprintf(w, "  Bintrail ID:     %s\n", bintrailID)
+		fmt.Fprintf(w, "  Mode:            %s\n", stream.Mode)
+		if stream.BinlogFile != "" {
+			fmt.Fprintf(w, "  Position:        %s:%d\n", stream.BinlogFile, stream.BinlogPosition)
+		}
+		if stream.GTIDSet.Valid && stream.GTIDSet.String != "" {
+			fmt.Fprintf(w, "  GTID set:        %s\n", stream.GTIDSet.String)
+		}
+		fmt.Fprintf(w, "  Events indexed:  %d\n", stream.EventsIndexed)
+		if stream.LastEventTime.Valid {
+			fmt.Fprintf(w, "  Last event:      %s\n", stream.LastEventTime.Time.Format(TSFmt))
+		}
+		fmt.Fprintf(w, "  Last checkpoint: %s\n", stream.LastCheckpoint.Format(TSFmt))
+		fmt.Fprintf(w, "  Server ID:       %d\n", stream.ServerID)
 		fmt.Fprintln(w)
 	}
 
@@ -430,7 +491,7 @@ func Truncate(s string, n int) string {
 }
 
 // WriteStatusJSON writes the status data as a JSON object to w.
-func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo) error {
+func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo) error {
 	type jsonFile struct {
 		BinlogFile    string  `json:"binlog_file"`
 		Status        string  `json:"status"`
@@ -472,8 +533,20 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, 
 		CreatedAt        string  `json:"created_at"`
 		DecommissionedAt *string `json:"decommissioned_at"`
 	}
+	type jsonStream struct {
+		BintrailID     *string `json:"bintrail_id"`
+		Mode           string  `json:"mode"`
+		BinlogFile     string  `json:"binlog_file,omitempty"`
+		BinlogPosition uint64  `json:"binlog_position,omitempty"`
+		GTIDSet        *string `json:"gtid_set,omitempty"`
+		EventsIndexed  int64   `json:"events_indexed"`
+		LastEventTime  *string `json:"last_event_time"`
+		LastCheckpoint string  `json:"last_checkpoint"`
+		ServerID       uint32  `json:"server_id"`
+	}
 	type jsonSummary struct {
 		Servers  []jsonServer    `json:"servers,omitempty"`
+		Stream   *jsonStream     `json:"stream,omitempty"`
 		Files    []jsonFile      `json:"files"`
 		Parts    []jsonPartition `json:"partitions"`
 		Total    int64           `json:"total_events_estimate"`
@@ -532,6 +605,27 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, 
 	}
 
 	out := jsonSummary{Servers: js, Files: jf, Parts: jp, Total: total}
+	if stream != nil {
+		jstr := &jsonStream{
+			Mode:           stream.Mode,
+			BinlogFile:     stream.BinlogFile,
+			BinlogPosition: stream.BinlogPosition,
+			EventsIndexed:  stream.EventsIndexed,
+			LastCheckpoint: stream.LastCheckpoint.Format(TSFmt),
+			ServerID:       stream.ServerID,
+		}
+		if stream.BintrailID.Valid && stream.BintrailID.String != "" {
+			jstr.BintrailID = &stream.BintrailID.String
+		}
+		if stream.GTIDSet.Valid && stream.GTIDSet.String != "" {
+			jstr.GTIDSet = &stream.GTIDSet.String
+		}
+		if stream.LastEventTime.Valid {
+			s := stream.LastEventTime.Time.Format(TSFmt)
+			jstr.LastEventTime = &s
+		}
+		out.Stream = jstr
+	}
 	if archives != nil && archives.TotalFiles > 0 {
 		out.Archives = &jsonArchives{
 			TotalFiles:     archives.TotalFiles,
