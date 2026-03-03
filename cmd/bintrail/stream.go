@@ -477,6 +477,11 @@ func streamLoop(
 				state.lastEventTime = sql.NullTime{Time: ev.Timestamp, Valid: true}
 			}
 
+			// GTID-only events: position/GTID already tracked above, skip insertion.
+			if ev.EventType == parser.EventGTID {
+				continue
+			}
+
 			// DDL events: flush batch, invoke handler, skip insertion.
 			if ev.EventType == parser.EventDDL {
 				if err := flush(); err != nil {
