@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // ─── Cobra command wiring ─────────────────────────────────────────────────────
@@ -57,7 +59,7 @@ func TestDumpCmd_defaults(t *testing.T) {
 
 func TestDumpCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
-		"source-dsn", "output-dir", "schemas", "tables", "mydumper-path", "threads",
+		"source-dsn", "output-dir", "schemas", "tables", "mydumper-path", "mydumper-image", "threads",
 	} {
 		if dumpCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on dumpCmd", name)
@@ -349,9 +351,14 @@ func TestExtractSchemasFromTables_empty(t *testing.T) {
 // ─── RunE validation ──────────────────────────────────────────────────────────
 
 func TestRunDump_mydumperNotFound(t *testing.T) {
+	// Use Flags().Set to mark --mydumper-path as Changed so resolveMydumper
+	// tries the explicit path branch.
 	savedPath := dmpMydumperPath
-	t.Cleanup(func() { dmpMydumperPath = savedPath })
-	dmpMydumperPath = "/nonexistent/path/to/mydumper"
+	t.Cleanup(func() {
+		dmpMydumperPath = savedPath
+		dumpCmd.Flags().Set("mydumper-path", savedPath)
+	})
+	dumpCmd.Flags().Set("mydumper-path", "/nonexistent/path/to/mydumper")
 
 	savedDSN := dmpSourceDSN
 	t.Cleanup(func() { dmpSourceDSN = savedDSN })
@@ -375,9 +382,13 @@ func TestRunDump_invalidSourceDSN(t *testing.T) {
 	}
 
 	savedPath, savedDSN := dmpMydumperPath, dmpSourceDSN
-	t.Cleanup(func() { dmpMydumperPath = savedPath; dmpSourceDSN = savedDSN })
+	t.Cleanup(func() {
+		dmpMydumperPath = savedPath
+		dumpCmd.Flags().Set("mydumper-path", savedPath)
+		dmpSourceDSN = savedDSN
+	})
 
-	dmpMydumperPath = fakeBin
+	dumpCmd.Flags().Set("mydumper-path", fakeBin)
 	dmpSourceDSN = "root@unix(/var/run/mysqld.sock)/" // unix socket → rejected by parseSourceDSN
 
 	err := runDump(dumpCmd, nil)
@@ -386,6 +397,188 @@ func TestRunDump_invalidSourceDSN(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unix socket") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// ─── resolveMydumper ──────────────────────────────────────────────────────────
+
+func TestResolveMydumper_explicitPathTakesPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	fakeBin := filepath.Join(dir, "mydumper")
+	if err := os.WriteFile(fakeBin, []byte(""), 0o755); err != nil {
+		t.Fatalf("failed to create fake mydumper: %v", err)
+	}
+
+	saved := dmpMydumperPath
+	t.Cleanup(func() {
+		dmpMydumperPath = saved
+		dumpCmd.Flags().Set("mydumper-path", saved)
+	})
+	dumpCmd.Flags().Set("mydumper-path", fakeBin)
+
+	res, err := resolveMydumper(dumpCmd)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.mode != dumpModeLocal {
+		t.Errorf("expected dumpModeLocal, got %d", res.mode)
+	}
+	if res.path != fakeBin {
+		t.Errorf("expected path %q, got %q", fakeBin, res.path)
+	}
+}
+
+func TestResolveMydumper_explicitPathNotFound(t *testing.T) {
+	saved := dmpMydumperPath
+	t.Cleanup(func() {
+		dmpMydumperPath = saved
+		dumpCmd.Flags().Set("mydumper-path", saved)
+	})
+	dumpCmd.Flags().Set("mydumper-path", "/nonexistent/mydumper")
+
+	_, err := resolveMydumper(dumpCmd)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mydumper not found") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestResolveMydumper_nothingAvailable(t *testing.T) {
+	// Ensure --mydumper-path is not Changed by resetting the flag.
+	saved := dmpMydumperPath
+	t.Cleanup(func() { dmpMydumperPath = saved })
+
+	// Create a fresh command with the same flags to avoid Changed state.
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().String("mydumper-path", "mydumper", "")
+
+	// Override PATH to exclude both mydumper and docker.
+	t.Setenv("PATH", t.TempDir())
+
+	_, err := resolveMydumper(cmd)
+	if err == nil {
+		t.Fatal("expected error when neither mydumper nor docker is available")
+	}
+	if !strings.Contains(err.Error(), "mydumper not found on $PATH") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Docker is not available") {
+		t.Errorf("expected Docker mentioned in error: %v", err)
+	}
+}
+
+func TestResolveMydumper_dockerFallback(t *testing.T) {
+	// Create a fake docker binary but no mydumper.
+	dir := t.TempDir()
+	fakeDocker := filepath.Join(dir, "docker")
+	if err := os.WriteFile(fakeDocker, []byte(""), 0o755); err != nil {
+		t.Fatalf("failed to create fake docker: %v", err)
+	}
+
+	// Override PATH to contain only the fake docker.
+	t.Setenv("PATH", dir)
+
+	saved := dmpMydumperImage
+	t.Cleanup(func() { dmpMydumperImage = saved })
+	dmpMydumperImage = "mydumper/mydumper:v0.16"
+
+	// Use a fresh command so --mydumper-path is not Changed.
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().String("mydumper-path", "mydumper", "")
+
+	res, err := resolveMydumper(cmd)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.mode != dumpModeDocker {
+		t.Errorf("expected dumpModeDocker, got %d", res.mode)
+	}
+	if res.path != fakeDocker {
+		t.Errorf("expected docker path %q, got %q", fakeDocker, res.path)
+	}
+	if res.image != "mydumper/mydumper:v0.16" {
+		t.Errorf("expected image %q, got %q", "mydumper/mydumper:v0.16", res.image)
+	}
+}
+
+// ─── buildDockerArgs ──────────────────────────────────────────────────────────
+
+func TestBuildDockerArgs_basic(t *testing.T) {
+	mydumperArgs := []string{"--host", "db.example.com", "--port", "3306", "--user", "root", "--outputdir", "/tmp/dump"}
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", mydumperArgs)
+
+	// Should start with docker run --rm
+	if len(args) < 3 || args[0] != "run" || args[1] != "--rm" {
+		t.Fatalf("expected args to start with [run --rm], got %v", args[:min(3, len(args))])
+	}
+
+	// Volume mount
+	assertArgsContainPair(t, args, "-v", "/tmp/dump:/tmp/dump")
+
+	// Should NOT have --network host for non-localhost
+	if argsContain(args, "--network") {
+		t.Error("expected no --network flag for non-localhost host")
+	}
+
+	// Image and mydumper command
+	imgIdx := argsIndex(args, "mydumper/mydumper:latest")
+	if imgIdx < 0 {
+		t.Fatal("expected image name in args")
+	}
+	if imgIdx+1 >= len(args) || args[imgIdx+1] != "mydumper" {
+		t.Error("expected 'mydumper' command after image name")
+	}
+
+	// mydumper args follow
+	if !argsContain(args, "--host") || !argsContain(args, "db.example.com") {
+		t.Error("expected mydumper args to be present after image + command")
+	}
+}
+
+func TestBuildDockerArgs_localhostNetworkHost(t *testing.T) {
+	for _, host := range []string{"localhost", "127.0.0.1", "::1"} {
+		args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", host, nil)
+
+		// On Linux, --network host should be added; on macOS it should not.
+		hasNetwork := argsContain(args, "--network")
+		if hasNetwork {
+			idx := argsIndex(args, "--network")
+			if idx+1 >= len(args) || args[idx+1] != "host" {
+				t.Errorf("host=%s: --network should be followed by 'host'", host)
+			}
+		}
+		// We can't assert the exact behavior since it depends on runtime.GOOS,
+		// but we can verify it doesn't panic and the structure is valid.
+	}
+}
+
+func TestIsLocalhost(t *testing.T) {
+	for _, tc := range []struct {
+		host string
+		want bool
+	}{
+		{"localhost", true},
+		{"127.0.0.1", true},
+		{"::1", true},
+		{"db.example.com", false},
+		{"192.168.1.1", false},
+		{"", false},
+	} {
+		if got := isLocalhost(tc.host); got != tc.want {
+			t.Errorf("isLocalhost(%q) = %v, want %v", tc.host, got, tc.want)
+		}
+	}
+}
+
+func TestDumpCmd_mydumperImageFlag(t *testing.T) {
+	f := dumpCmd.Flag("mydumper-image")
+	if f == nil {
+		t.Fatal("flag --mydumper-image not registered")
+	}
+	if f.DefValue != "mydumper/mydumper:latest" {
+		t.Errorf("expected default %q, got %q", "mydumper/mydumper:latest", f.DefValue)
 	}
 }
 
