@@ -34,6 +34,8 @@ var (
 	dmpMydumperImage string
 	dmpThreads       int
 	dmpFormat        string
+	dmpEncrypt       bool
+	dmpEncryptKey    string
 )
 
 // dumpLockDir is a function returning the directory for the dump lockfile.
@@ -49,6 +51,8 @@ func init() {
 	dumpCmd.Flags().StringVar(&dmpMydumperImage, "mydumper-image", "mydumper/mydumper:latest", "Docker image for mydumper (used when no local binary is found)")
 	dumpCmd.Flags().IntVar(&dmpThreads, "threads", 4, "Number of mydumper dump threads")
 	dumpCmd.Flags().StringVar(&dmpFormat, "format", "text", "Output format: text or json")
+	dumpCmd.Flags().BoolVar(&dmpEncrypt, "encrypt", false, "Encrypt dump files at rest using AES-256-CBC (requires openssl on $PATH)")
+	dumpCmd.Flags().StringVar(&dmpEncryptKey, "encrypt-key", "", "Path to encryption key file (default: ~/.config/bintrail/dump.key; generate with 'bintrail generate-key')")
 	_ = dumpCmd.MarkFlagRequired("source-dsn")
 	_ = dumpCmd.MarkFlagRequired("output-dir")
 
@@ -101,8 +105,9 @@ func resolveMydumper(cmd *cobra.Command) (dumpResolution, error) {
 
 // buildDockerArgs constructs the full argument slice for invoking mydumper via
 // docker run. The output directory is bind-mounted at the same absolute path so
-// downstream tools need no path translation.
-func buildDockerArgs(image, outputDir, host string, mydumperArgs []string) []string {
+// downstream tools need no path translation. When encryptKeyPath is non-empty,
+// the key file is also bind-mounted into the container.
+func buildDockerArgs(image, outputDir, host string, mydumperArgs []string, encryptKeyPath string) []string {
 	absOutput, err := filepath.Abs(outputDir)
 	if err != nil {
 		absOutput = outputDir
@@ -111,6 +116,14 @@ func buildDockerArgs(image, outputDir, host string, mydumperArgs []string) []str
 	args := []string{
 		"run", "--rm",
 		"-v", absOutput + ":" + absOutput,
+	}
+
+	if encryptKeyPath != "" {
+		absKey, err := filepath.Abs(encryptKeyPath)
+		if err != nil {
+			absKey = encryptKeyPath
+		}
+		args = append(args, "-v", absKey+":"+absKey+":ro")
 	}
 
 	if isLocalhost(host) {
@@ -151,6 +164,16 @@ func runDump(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --format %q; must be text or json", dmpFormat)
 	}
 
+	// 0. Resolve encryption key path.
+	var encryptKeyPath string
+	if dmpEncrypt {
+		var err error
+		encryptKeyPath, err = resolveEncryptKey(dmpEncryptKey)
+		if err != nil {
+			return err
+		}
+	}
+
 	// 1. Resolve how to invoke mydumper.
 	res, err := resolveMydumper(cmd)
 	if err != nil {
@@ -180,13 +203,13 @@ func runDump(cmd *cobra.Command, args []string) error {
 	}
 
 	// 6. Build mydumper args.
-	mydumperArgs := buildMydumperArgs(host, port, user, password, dmpOutputDir, dmpThreads, schemas, tables)
+	mydumperArgs := buildMydumperArgs(host, port, user, password, dmpOutputDir, dmpThreads, schemas, tables, encryptKeyPath)
 
 	// 7. Build the final command depending on resolution mode.
 	var c *exec.Cmd
 	switch res.mode {
 	case dumpModeDocker:
-		dockerArgs := buildDockerArgs(res.image, dmpOutputDir, host, mydumperArgs)
+		dockerArgs := buildDockerArgs(res.image, dmpOutputDir, host, mydumperArgs, encryptKeyPath)
 		c = exec.CommandContext(cmd.Context(), res.path, dockerArgs...)
 		slog.Info("starting dump via Docker", "image", res.image, "output_dir", dmpOutputDir)
 	default:
@@ -216,8 +239,10 @@ func runDump(cmd *cobra.Command, args []string) error {
 // --compress-protocol and --complete-insert are always included.
 // Schema filtering: single schema → --database; multiple → --regex.
 // Table filtering: --tables-list with a comma-joined list.
+// When encryptKeyPath is non-empty, --exec-per-thread and
+// --exec-per-thread-extension are added for AES-256-CBC encryption.
 func buildMydumperArgs(host string, port uint16, user, password, outputDir string,
-	threads int, schemas, tables []string) []string {
+	threads int, schemas, tables []string, encryptKeyPath string) []string {
 
 	args := []string{
 		"--host", host,
@@ -247,6 +272,16 @@ func buildMydumperArgs(host string, port uint16, user, password, outputDir strin
 
 	if len(tables) > 0 {
 		args = append(args, "--tables-list", strings.Join(tables, ","))
+	}
+
+	if encryptKeyPath != "" {
+		absKey, err := filepath.Abs(encryptKeyPath)
+		if err != nil {
+			absKey = encryptKeyPath
+		}
+		args = append(args,
+			"--exec-per-thread", fmt.Sprintf("openssl enc -aes-256-cbc -pbkdf2 -pass file:%s", absKey),
+			"--exec-per-thread-extension", ".enc")
 	}
 
 	return args
@@ -333,6 +368,27 @@ func writePID(f *os.File, lockPath string) (*os.File, error) {
 		return nil, fmt.Errorf("failed to write lock PID: %w", werr)
 	}
 	return f, nil
+}
+
+// resolveEncryptKey returns the absolute path to the encryption key file.
+// If keyPath is empty, defaultKeyPath() is used. The file must exist and
+// be readable. Additionally, openssl must be available on $PATH since
+// mydumper shells out to it for encryption.
+func resolveEncryptKey(keyPath string) (string, error) {
+	if keyPath == "" {
+		keyPath = defaultKeyPath()
+	}
+	absPath, err := filepath.Abs(keyPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve key path: %w", err)
+	}
+	if _, err := os.Stat(absPath); err != nil {
+		return "", fmt.Errorf("encryption key file not found at %s; generate one with 'bintrail generate-key'", absPath)
+	}
+	if _, err := exec.LookPath("openssl"); err != nil {
+		return "", fmt.Errorf("openssl not found on $PATH; it is required for dump encryption")
+	}
+	return absPath, nil
 }
 
 // releaseDumpLock closes the lockfile handle and removes the file.

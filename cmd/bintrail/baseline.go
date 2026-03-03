@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -48,6 +49,8 @@ var (
 	bslUploadRegion string
 	bslFormat       string
 	bslRetry        bool
+	bslEncrypt      bool
+	bslEncryptKey   string
 )
 
 func init() {
@@ -61,6 +64,8 @@ func init() {
 	baselineCmd.Flags().StringVar(&bslUploadRegion, "upload-region", "", "AWS region for --upload (default: from AWS_REGION env var or ~/.aws/config)")
 	baselineCmd.Flags().StringVar(&bslFormat, "format", "text", "Output format: text or json")
 	baselineCmd.Flags().BoolVar(&bslRetry, "retry", false, "Skip tables whose output Parquet file already exists and S3 objects that were already uploaded")
+	baselineCmd.Flags().BoolVar(&bslEncrypt, "encrypt", false, "Decrypt encrypted dump files before processing (requires openssl on $PATH)")
+	baselineCmd.Flags().StringVar(&bslEncryptKey, "encrypt-key", "", "Path to encryption key file (default: ~/.config/bintrail/dump.key)")
 	_ = baselineCmd.MarkFlagRequired("input")
 	_ = baselineCmd.MarkFlagRequired("output")
 
@@ -73,6 +78,19 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 	}
 	if err := baseline.ValidateCodec(bslCompression); err != nil {
 		return fmt.Errorf("--compression: %w", err)
+	}
+
+	// Decrypt encrypted dump files if --encrypt is set.
+	if bslEncrypt {
+		keyPath, err := resolveEncryptKey(bslEncryptKey)
+		if err != nil {
+			return err
+		}
+		cleanup, err := decryptDumpFiles(bslInput, keyPath)
+		if err != nil {
+			return fmt.Errorf("decrypt dump files: %w", err)
+		}
+		defer cleanup()
 	}
 
 	var ts time.Time
@@ -285,6 +303,51 @@ func uploadFile(ctx context.Context, client *s3.Client, path, bucket, key string
 		return fmt.Errorf("upload %s → s3://%s/%s: %w", path, bucket, key, err)
 	}
 	return nil
+}
+
+// decryptDumpFiles walks inputDir and decrypts every .enc file using openssl,
+// writing the decrypted output alongside with the .enc extension stripped.
+// Returns a cleanup function that removes the decrypted files.
+func decryptDumpFiles(inputDir, keyPath string) (func(), error) {
+	absKey, err := filepath.Abs(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve key path: %w", err)
+	}
+
+	entries, err := os.ReadDir(inputDir)
+	if err != nil {
+		return nil, fmt.Errorf("read input directory: %w", err)
+	}
+
+	var decrypted []string
+	cleanup := func() {
+		for _, f := range decrypted {
+			os.Remove(f)
+		}
+	}
+
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".enc") {
+			continue
+		}
+		encPath := filepath.Join(inputDir, e.Name())
+		outPath := strings.TrimSuffix(encPath, ".enc")
+
+		cmd := exec.Command("openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2",
+			"-pass", "file:"+absKey, "-in", encPath, "-out", outPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("decrypt %s: %w\n%s", e.Name(), err, output)
+		}
+		decrypted = append(decrypted, outPath)
+		slog.Debug("decrypted", "file", e.Name())
+	}
+
+	if len(decrypted) == 0 {
+		slog.Warn("no .enc files found in input directory; is the dump encrypted?", "dir", inputDir)
+	}
+
+	return cleanup, nil
 }
 
 // parseTableFilter splits a comma-separated "db.table" list.
