@@ -30,12 +30,6 @@ func mysqlToSeconds(t time.Time) int64 {
 	return t.UTC().Unix() + mysqlToSecondsConst
 }
 
-// isHourAligned reports whether t falls exactly on an hour boundary
-// (zero minutes, seconds, and nanoseconds).
-func isHourAligned(t time.Time) bool {
-	return t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0
-}
-
 // ─── RBAC types ───────────────────────────────────────────────────────────────
 
 // SchemaTable identifies a schema+table pair used in RBAC deny rules.
@@ -228,24 +222,22 @@ func buildQuery(opts Options) (string, []any) {
 	}
 	if opts.Since != nil {
 		since := *opts.Since
-		if !isHourAligned(since) {
-			// Add an outer hour-aligned lower bound as a TO_SECONDS integer literal so
-			// MySQL can prune to the correct partition(s) at parse time, without relying
-			// on optimizer inference from a parameterised datetime comparison.
-			outerSince := mysqlToSeconds(since.Truncate(time.Hour))
-			where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", outerSince))
-		}
+		// Add an hour-aligned lower bound as a TO_SECONDS integer literal so
+		// MySQL can prune to the correct partition(s) at parse time. This hint
+		// is always required — MySQL cannot infer partition pruning from
+		// parameterised datetime comparisons, even when the value is hour-aligned.
+		outerSince := mysqlToSeconds(since.Truncate(time.Hour))
+		where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", outerSince))
 		where = append(where, "event_timestamp >= ?")
 		args = append(args, since)
 	}
 	if opts.Until != nil {
 		until := *opts.Until
-		if !isHourAligned(until) {
-			// Outer upper bound: truncate until to the hour, then advance one hour
-			// (exclusive). E.g. 15:13 → 16:00.
-			outerUntil := mysqlToSeconds(until.Truncate(time.Hour).Add(time.Hour))
-			where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", outerUntil))
-		}
+		// Add an hour-aligned upper bound (exclusive) as a TO_SECONDS literal
+		// for partition pruning. Truncate to the hour, then advance one hour.
+		// E.g. 15:13 → 16:00, 15:00 → 16:00.
+		outerUntil := mysqlToSeconds(until.Truncate(time.Hour).Add(time.Hour))
+		where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", outerUntil))
 		where = append(where, "event_timestamp <= ?")
 		args = append(args, until)
 	}

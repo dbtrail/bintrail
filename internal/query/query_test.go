@@ -137,9 +137,15 @@ func TestBuildQuery_sinceUntil(t *testing.T) {
 	if !strings.Contains(q, "event_timestamp <= ?") {
 		t.Errorf("expected event_timestamp <= ? in query: %s", q)
 	}
-	// Hour-aligned: no TO_SECONDS() pruning hints should be added.
-	if strings.Contains(q, "TO_SECONDS") {
-		t.Errorf("unexpected TO_SECONDS in hour-aligned query: %s", q)
+	// TO_SECONDS pruning hints must always be present, even for hour-aligned values,
+	// because MySQL cannot infer partition pruning from parameterised datetime comparisons.
+	outerSince := mysqlToSeconds(time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC))
+	outerUntil := mysqlToSeconds(time.Date(2026, 2, 19, 16, 0, 0, 0, time.UTC))
+	if !strings.Contains(q, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", outerSince)) {
+		t.Errorf("expected lower-bound TO_SECONDS hint in query: %s", q)
+	}
+	if !strings.Contains(q, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", outerUntil)) {
+		t.Errorf("expected upper-bound TO_SECONDS hint in query: %s", q)
 	}
 	// since and until should both appear in args.
 	if args[0] != since || args[1] != until {
@@ -223,8 +229,9 @@ func TestBuildQuery_sinceNonAligned_untilAligned(t *testing.T) {
 	if !strings.Contains(q, "TO_SECONDS(event_timestamp) >=") {
 		t.Errorf("expected lower-bound TO_SECONDS hint: %s", q)
 	}
-	if strings.Contains(q, "TO_SECONDS(event_timestamp) <") {
-		t.Errorf("unexpected upper-bound TO_SECONDS hint for aligned until: %s", q)
+	// Even hour-aligned until must produce a TO_SECONDS hint.
+	if !strings.Contains(q, "TO_SECONDS(event_timestamp) <") {
+		t.Errorf("expected upper-bound TO_SECONDS hint: %s", q)
 	}
 }
 
@@ -234,30 +241,12 @@ func TestBuildQuery_sinceAligned_untilNonAligned(t *testing.T) {
 	opts := Options{Since: &since, Until: &until}
 	q, _ := buildQuery(opts)
 
-	if strings.Contains(q, "TO_SECONDS(event_timestamp) >=") {
-		t.Errorf("unexpected lower-bound TO_SECONDS hint for aligned since: %s", q)
+	// Even hour-aligned since must produce a TO_SECONDS hint.
+	if !strings.Contains(q, "TO_SECONDS(event_timestamp) >=") {
+		t.Errorf("expected lower-bound TO_SECONDS hint: %s", q)
 	}
 	if !strings.Contains(q, "TO_SECONDS(event_timestamp) <") {
 		t.Errorf("expected upper-bound TO_SECONDS hint: %s", q)
-	}
-}
-
-func TestIsHourAligned(t *testing.T) {
-	cases := []struct {
-		t    time.Time
-		want bool
-	}{
-		{time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC), true},
-		{time.Date(2026, 2, 19, 0, 0, 0, 0, time.UTC), true},
-		{time.Date(2026, 2, 19, 14, 45, 0, 0, time.UTC), false},
-		{time.Date(2026, 2, 19, 14, 0, 30, 0, time.UTC), false},
-		{time.Date(2026, 2, 19, 14, 0, 0, 1000, time.UTC), false},
-	}
-	for _, tc := range cases {
-		got := isHourAligned(tc.t)
-		if got != tc.want {
-			t.Errorf("isHourAligned(%v) = %v, want %v", tc.t, got, tc.want)
-		}
 	}
 }
 
