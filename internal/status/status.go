@@ -91,6 +91,10 @@ type CoverageInfo struct {
 	TotalEvents       int64
 	SchemaChanges     int
 	UncoveredDDLs     int // DDLs without a snapshot (file mode, or failed auto-snapshot in stream mode)
+
+	// Archive-derived fields (from archive_state partition names and row counts).
+	ArchiveEarliestHour sql.NullTime // earliest hour derived from MIN(partition_name)
+	ArchiveTotalRows    int64
 }
 
 // TSFmt is the timestamp format used in status output.
@@ -184,7 +188,10 @@ func LoadArchiveStats(ctx context.Context, db *sql.DB) (*ArchiveStats, error) {
 	return &a, nil
 }
 
-// LoadCoverage loads restore coverage info from binlog_events and schema_changes.
+// LoadCoverage loads restore coverage info from binlog_events, schema_changes,
+// and archive_state. Archive coverage is derived from partition names stored in
+// archive_state (e.g. "p_2026021914" → 2026-02-19 14:00 UTC) without reading
+// Parquet files.
 func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
 	var c CoverageInfo
 	err := db.QueryRowContext(ctx, `
@@ -207,7 +214,36 @@ func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
 		return nil, fmt.Errorf("query uncovered DDLs: %w", err)
 	}
 
+	// Extend coverage with archived partition data.
+	var minPartition sql.NullString
+	err = db.QueryRowContext(ctx, `
+		SELECT MIN(partition_name), COALESCE(SUM(row_count), 0)
+		FROM archive_state`).Scan(&minPartition, &c.ArchiveTotalRows)
+	if err != nil {
+		// archive_state may not exist in older indexes — treat as non-fatal.
+		slog.Warn("could not load archive coverage", "error", err)
+		return &c, nil
+	}
+	if minPartition.Valid {
+		if t, ok := parsePartitionName(minPartition.String); ok {
+			c.ArchiveEarliestHour = sql.NullTime{Time: t, Valid: true}
+		}
+	}
+
 	return &c, nil
+}
+
+// parsePartitionName converts a partition name like "p_2026021914" to the
+// corresponding UTC hour. Returns false for "p_future" or malformed names.
+func parsePartitionName(name string) (time.Time, bool) {
+	if len(name) != 12 || !strings.HasPrefix(name, "p_") {
+		return time.Time{}, false
+	}
+	t, err := time.ParseInLocation("p_2006010215", name, time.UTC)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // LoadSchemaChanges loads all schema changes ordered by detection time.
@@ -459,8 +495,19 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 	if coverage != nil {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "=== Restore Coverage ===")
-		if coverage.EarliestEvent.Valid {
-			fmt.Fprintf(w, "  Earliest event: %s\n", coverage.EarliestEvent.Time.Format(TSFmt))
+
+		// Determine the effective earliest event: archive may extend further back.
+		earliest := coverage.EarliestEvent
+		hasArchive := coverage.ArchiveEarliestHour.Valid
+		if hasArchive && (!earliest.Valid || coverage.ArchiveEarliestHour.Time.Before(earliest.Time)) {
+			earliest = coverage.ArchiveEarliestHour
+		}
+		if earliest.Valid {
+			label := earliest.Time.Format(TSFmt)
+			if hasArchive {
+				label += " (includes archives)"
+			}
+			fmt.Fprintf(w, "  Earliest event: %s\n", label)
 		} else {
 			fmt.Fprintln(w, "  Earliest event: (none)")
 		}
@@ -469,7 +516,14 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		} else {
 			fmt.Fprintln(w, "  Latest event:   (none)")
 		}
-		fmt.Fprintf(w, "  Total events:   %d\n", coverage.TotalEvents)
+
+		totalEvents := coverage.TotalEvents + coverage.ArchiveTotalRows
+		if coverage.ArchiveTotalRows > 0 {
+			fmt.Fprintf(w, "  Total events:   %d (%d live + %d archived)\n",
+				totalEvents, coverage.TotalEvents, coverage.ArchiveTotalRows)
+		} else {
+			fmt.Fprintf(w, "  Total events:   %d\n", totalEvents)
+		}
 		fmt.Fprintf(w, "  Schema changes: %d\n", coverage.SchemaChanges)
 		if coverage.UncoveredDDLs > 0 {
 			fmt.Fprintf(w, "  Warning: %d DDL(s) detected without auto-snapshot (file mode) — recovery across these DDLs may require manual snapshot\n",
@@ -583,11 +637,14 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, 
 		S3Buckets      []string `json:"s3_buckets"`
 	}
 	type jsonCoverage struct {
-		EarliestEvent *string `json:"earliest_event"`
-		LatestEvent   *string `json:"latest_event"`
-		TotalEvents   int64   `json:"total_events"`
-		SchemaChanges int     `json:"schema_changes"`
-		UncoveredDDLs int     `json:"uncovered_ddls"`
+		EarliestEvent        *string `json:"earliest_event"`
+		LatestEvent          *string `json:"latest_event"`
+		TotalEvents          int64   `json:"total_events"`
+		LiveEvents           int64   `json:"live_events"`
+		ArchivedEvents       int64   `json:"archived_events"`
+		ArchiveEarliestEvent *string `json:"archive_earliest_event,omitempty"`
+		SchemaChanges        int     `json:"schema_changes"`
+		UncoveredDDLs        int     `json:"uncovered_ddls"`
 	}
 	type jsonServer struct {
 		BintrailID       string  `json:"bintrail_id"`
@@ -704,17 +761,30 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, 
 	}
 	if coverage != nil {
 		jc := &jsonCoverage{
-			TotalEvents:   coverage.TotalEvents,
-			SchemaChanges: coverage.SchemaChanges,
-			UncoveredDDLs: coverage.UncoveredDDLs,
+			TotalEvents:    coverage.TotalEvents + coverage.ArchiveTotalRows,
+			LiveEvents:     coverage.TotalEvents,
+			ArchivedEvents: coverage.ArchiveTotalRows,
+			SchemaChanges:  coverage.SchemaChanges,
+			UncoveredDDLs:  coverage.UncoveredDDLs,
 		}
-		if coverage.EarliestEvent.Valid {
-			s := coverage.EarliestEvent.Time.Format(TSFmt)
+
+		// Effective earliest: archive may extend further back than live data.
+		earliest := coverage.EarliestEvent
+		if coverage.ArchiveEarliestHour.Valid &&
+			(!earliest.Valid || coverage.ArchiveEarliestHour.Time.Before(earliest.Time)) {
+			earliest = coverage.ArchiveEarliestHour
+		}
+		if earliest.Valid {
+			s := earliest.Time.Format(TSFmt)
 			jc.EarliestEvent = &s
 		}
 		if coverage.LatestEvent.Valid {
 			s := coverage.LatestEvent.Time.Format(TSFmt)
 			jc.LatestEvent = &s
+		}
+		if coverage.ArchiveEarliestHour.Valid {
+			s := coverage.ArchiveEarliestHour.Time.Format(TSFmt)
+			jc.ArchiveEarliestEvent = &s
 		}
 		out.Coverage = jc
 	}
