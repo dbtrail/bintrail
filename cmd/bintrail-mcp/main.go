@@ -377,39 +377,13 @@ func makeStatusTool(resolve resolveFunc) func(context.Context, *mcp.CallToolRequ
 		}
 		defer db.Close()
 
-		files, err := status.LoadIndexState(ctx, db)
+		data, err := status.CollectStatus(ctx, db, dbName)
 		if err != nil {
-			return errorResult(fmt.Errorf("failed to load index state: %w", err)), nil, nil
-		}
-
-		parts, err := status.LoadPartitionStats(ctx, db, dbName)
-		if err != nil {
-			return errorResult(fmt.Errorf("failed to load partition info: %w", err)), nil, nil
-		}
-
-		// Best-effort: servers info from bintrail_servers table.
-		servers, serversErr := status.LoadServers(ctx, db)
-		if serversErr != nil {
-			slog.Warn("could not load servers", "error", serversErr)
-			servers = nil
-		}
-
-		// Best-effort: stream state from stream_state table.
-		stream, streamErr := status.LoadStreamState(ctx, db)
-		if streamErr != nil {
-			slog.Warn("could not load stream state", "error", streamErr)
-			stream = nil
-		}
-
-		// Best-effort: coverage info from schema_changes table.
-		coverage, coverageErr := status.LoadCoverage(ctx, db)
-		if coverageErr != nil {
-			slog.Warn("could not load coverage info", "error", coverageErr)
-			coverage = nil
+			return errorResult(err), nil, nil
 		}
 
 		var buf bytes.Buffer
-		status.WriteStatus(&buf, files, parts, nil, coverage, servers, stream)
+		data.Write(&buf)
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{

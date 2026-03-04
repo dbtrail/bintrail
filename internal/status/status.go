@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -279,6 +280,70 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 		return nil, err
 	}
 	return &s, nil
+}
+
+// StatusData holds all data sections loaded by CollectStatus.
+type StatusData struct {
+	Files    []IndexStateRow
+	Parts    []PartitionStat
+	Archives *ArchiveStats
+	Coverage *CoverageInfo
+	Servers  []ServerInfo
+	Stream   *StreamStateInfo
+}
+
+// CollectStatus loads all status data from the index database.
+// IndexState and PartitionStats are required (errors are returned).
+// Servers, StreamState, ArchiveStats, and Coverage are best-effort
+// (failures are logged as warnings and the field is left nil).
+func CollectStatus(ctx context.Context, db *sql.DB, dbName string) (*StatusData, error) {
+	files, err := LoadIndexState(ctx, db)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load index state: %w", err)
+	}
+
+	parts, err := LoadPartitionStats(ctx, db, dbName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load partition info: %w", err)
+	}
+
+	d := &StatusData{Files: files, Parts: parts}
+
+	if servers, err := LoadServers(ctx, db); err != nil {
+		slog.Warn("could not load servers", "error", err)
+	} else {
+		d.Servers = servers
+	}
+
+	if stream, err := LoadStreamState(ctx, db); err != nil {
+		slog.Warn("could not load stream state", "error", err)
+	} else {
+		d.Stream = stream
+	}
+
+	if archives, err := LoadArchiveStats(ctx, db); err != nil {
+		slog.Warn("could not load archive stats", "error", err)
+	} else {
+		d.Archives = archives
+	}
+
+	if coverage, err := LoadCoverage(ctx, db); err != nil {
+		slog.Warn("could not load coverage info", "error", err)
+	} else {
+		d.Coverage = coverage
+	}
+
+	return d, nil
+}
+
+// Write writes the status data as a human-readable report to w.
+func (d *StatusData) Write(w io.Writer) {
+	WriteStatus(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream)
+}
+
+// WriteJSON writes the status data as JSON to w.
+func (d *StatusData) WriteJSON(w io.Writer) error {
+	return WriteStatusJSON(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream)
 }
 
 // WriteStatus writes a multi-section status report (Servers, Stream, Indexed Files, Partitions, Archives, Coverage, Summary) to w.
