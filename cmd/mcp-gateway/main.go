@@ -53,6 +53,9 @@ func main() {
 	flag.Parse()
 
 	origins := parseOrigins(*allowedOrigins)
+	// The gateway's own issuer must be allowed so browser form submissions
+	// from the authorize page (Origin: <issuer>) are not rejected.
+	origins = append(origins, *issuer)
 
 	store, err := NewDynamoStore(*tablePrefix)
 	if err != nil {
