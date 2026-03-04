@@ -901,3 +901,74 @@ func TestWriteStatusJSON_nilStream_omitsKey(t *testing.T) {
 		t.Error("expected no 'stream' key when stream is nil")
 	}
 }
+
+// ─── StatusData equivalence tests ───────────────────────────────────────────
+
+func TestStatusData_Write_equivalence(t *testing.T) {
+	ts := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	files := []IndexStateRow{{
+		BinlogFile: "binlog.000042", Status: "completed", EventsIndexed: 1234,
+		FileSize: 1048576, LastPosition: 1048576, StartedAt: ts,
+		CompletedAt: sql.NullTime{Valid: true, Time: ts.Add(5 * time.Minute)},
+		BintrailID:  sql.NullString{Valid: true, String: "test-uuid"},
+	}}
+	parts := []PartitionStat{{
+		Name: "p_2026021914", Description: strconv.FormatInt(int64(62167219200)+ts.Add(time.Hour).Unix(), 10),
+		TableRows: 5000, Ordinal: 1,
+	}}
+	archives := &ArchiveStats{TotalFiles: 10, TotalRows: 5000, TotalSizeBytes: 1048576, LocalFiles: 10, S3Files: 3, S3Buckets: []string{"bucket-a"}}
+	coverage := &CoverageInfo{
+		EarliestEvent: sql.NullTime{Valid: true, Time: ts},
+		LatestEvent:   sql.NullTime{Valid: true, Time: ts.Add(24 * time.Hour)},
+		TotalEvents:   42000, SchemaChanges: 2,
+	}
+	servers := []ServerInfo{{
+		BintrailID: "aaaaaaaa-0000-0000-0000-000000000001", ServerUUID: "11111111-1111-1111-1111-111111111111",
+		Host: "db-primary", Port: 3306, Username: "repl", CreatedAt: ts,
+	}}
+	stream := &StreamStateInfo{
+		Mode: "gtid", BinlogFile: "binlog.000005", BinlogPosition: 12345,
+		GTIDSet: sql.NullString{Valid: true, String: "aaa-bbb:1-100"},
+		EventsIndexed: 267354, LastCheckpoint: ts, ServerID: 42,
+	}
+
+	// Direct call
+	var want bytes.Buffer
+	WriteStatus(&want, files, parts, archives, coverage, servers, stream)
+
+	// Via StatusData
+	data := &StatusData{Files: files, Parts: parts, Archives: archives, Coverage: coverage, Servers: servers, Stream: stream}
+	var got bytes.Buffer
+	data.Write(&got)
+
+	if got.String() != want.String() {
+		t.Errorf("StatusData.Write output differs from WriteStatus:\ngot:\n%s\nwant:\n%s", got.String(), want.String())
+	}
+}
+
+func TestStatusData_WriteJSON_equivalence(t *testing.T) {
+	ts := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	files := []IndexStateRow{{
+		BinlogFile: "binlog.000042", Status: "completed", EventsIndexed: 1234,
+		FileSize: 1048576, LastPosition: 1048576, StartedAt: ts,
+	}}
+	parts := []PartitionStat{{Name: "p_future", Description: "MAXVALUE", TableRows: 0, Ordinal: 1}}
+	archives := &ArchiveStats{TotalFiles: 5, TotalRows: 1000, TotalSizeBytes: 5242880, LocalFiles: 5}
+
+	// Direct call
+	var want bytes.Buffer
+	if err := WriteStatusJSON(&want, files, parts, archives, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Via StatusData
+	data := &StatusData{Files: files, Parts: parts, Archives: archives}
+	var got bytes.Buffer
+	if err := data.WriteJSON(&got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.String() != want.String() {
+		t.Errorf("StatusData.WriteJSON output differs from WriteStatusJSON:\ngot:\n%s\nwant:\n%s", got.String(), want.String())
+	}
+}

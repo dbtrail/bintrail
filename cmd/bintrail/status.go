@@ -68,73 +68,16 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 	slog.Debug("connected", "duration_ms", time.Since(t).Milliseconds())
 
-	ctx := cmd.Context()
-
-	slog.Debug("loading index state")
-	t = time.Now()
-	files, err := status.LoadIndexState(ctx, db)
+	data, err := status.CollectStatus(cmd.Context(), db, dbName)
 	if err != nil {
-		return fmt.Errorf("failed to load index state: %w", err)
-	}
-	slog.Debug("loaded index state", "files", len(files), "duration_ms", time.Since(t).Milliseconds())
-
-	slog.Debug("loading partition stats", "database", dbName)
-	t = time.Now()
-	partStats, err := status.LoadPartitionStats(ctx, db, dbName)
-	if err != nil {
-		return fmt.Errorf("failed to load partition info: %w", err)
-	}
-	slog.Debug("loaded partition stats", "partitions", len(partStats), "duration_ms", time.Since(t).Milliseconds())
-
-	// Best-effort: bintrail_servers may not exist in older index databases.
-	slog.Debug("loading servers")
-	t = time.Now()
-	servers, err := status.LoadServers(ctx, db)
-	if err != nil {
-		slog.Warn("could not load servers", "error", err)
-		servers = nil
-	} else {
-		slog.Debug("loaded servers", "count", len(servers), "duration_ms", time.Since(t).Milliseconds())
-	}
-
-	// Best-effort: stream_state may not exist in older index databases.
-	slog.Debug("loading stream state")
-	t = time.Now()
-	stream, err := status.LoadStreamState(ctx, db)
-	if err != nil {
-		slog.Warn("could not load stream state", "error", err)
-		stream = nil
-	} else if stream != nil {
-		slog.Debug("loaded stream state", "mode", stream.Mode, "events", stream.EventsIndexed, "duration_ms", time.Since(t).Milliseconds())
-	}
-
-	// Best-effort: archive_state may not exist in older index databases.
-	slog.Debug("loading archive stats")
-	t = time.Now()
-	archives, err := status.LoadArchiveStats(ctx, db)
-	if err != nil {
-		slog.Warn("could not load archive stats", "error", err)
-		archives = nil
-	} else {
-		slog.Debug("loaded archive stats", "files", archives.TotalFiles, "duration_ms", time.Since(t).Milliseconds())
-	}
-
-	// Best-effort: schema_changes may not exist in older index databases.
-	slog.Debug("loading coverage info")
-	t = time.Now()
-	coverage, err := status.LoadCoverage(ctx, db)
-	if err != nil {
-		slog.Warn("could not load coverage info", "error", err)
-		coverage = nil
-	} else {
-		slog.Debug("loaded coverage info", "events", coverage.TotalEvents, "schema_changes", coverage.SchemaChanges, "duration_ms", time.Since(t).Milliseconds())
+		return err
 	}
 
 	slog.Info("status complete", "duration_ms", time.Since(start).Milliseconds())
 
 	if stFormat == "json" {
-		return status.WriteStatusJSON(os.Stdout, files, partStats, archives, coverage, servers, stream)
+		return data.WriteJSON(os.Stdout)
 	}
-	status.WriteStatus(os.Stdout, files, partStats, archives, coverage, servers, stream)
+	data.Write(os.Stdout)
 	return nil
 }
