@@ -620,11 +620,13 @@ func TestWriteStatusJSON_withCoverage(t *testing.T) {
 
 	var result struct {
 		Coverage *struct {
-			EarliestEvent string `json:"earliest_event"`
-			LatestEvent   string `json:"latest_event"`
-			TotalEvents   int64  `json:"total_events"`
-			SchemaChanges int    `json:"schema_changes"`
-			UncoveredDDLs int    `json:"uncovered_ddls"`
+			EarliestEvent  string `json:"earliest_event"`
+			LatestEvent    string `json:"latest_event"`
+			TotalEvents    int64  `json:"total_events"`
+			LiveEvents     int64  `json:"live_events"`
+			ArchivedEvents int64  `json:"archived_events"`
+			SchemaChanges  int    `json:"schema_changes"`
+			UncoveredDDLs  int    `json:"uncovered_ddls"`
 		} `json:"coverage"`
 	}
 	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
@@ -635,6 +637,12 @@ func TestWriteStatusJSON_withCoverage(t *testing.T) {
 	}
 	if result.Coverage.TotalEvents != 42000 {
 		t.Errorf("wrong total_events: %d", result.Coverage.TotalEvents)
+	}
+	if result.Coverage.LiveEvents != 42000 {
+		t.Errorf("wrong live_events: %d", result.Coverage.LiveEvents)
+	}
+	if result.Coverage.ArchivedEvents != 0 {
+		t.Errorf("wrong archived_events: %d", result.Coverage.ArchivedEvents)
 	}
 	if result.Coverage.SchemaChanges != 3 {
 		t.Errorf("wrong schema_changes: %d", result.Coverage.SchemaChanges)
@@ -656,6 +664,149 @@ func TestWriteStatusJSON_nilCoverage_omitsKey(t *testing.T) {
 	}
 	if _, ok := raw["coverage"]; ok {
 		t.Error("expected no 'coverage' key when coverage is nil")
+	}
+}
+
+// ─── parsePartitionName ─────────────────────────────────────────────────────
+
+func TestParsePartitionName_valid(t *testing.T) {
+	got, ok := parsePartitionName("p_2026030114")
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	want := time.Date(2026, 3, 1, 14, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestParsePartitionName_future(t *testing.T) {
+	_, ok := parsePartitionName("p_future")
+	if ok {
+		t.Error("expected false for p_future")
+	}
+}
+
+func TestParsePartitionName_malformed(t *testing.T) {
+	for _, name := range []string{"", "p_abc", "p_20260301", "notapartition"} {
+		if _, ok := parsePartitionName(name); ok {
+			t.Errorf("expected false for %q", name)
+		}
+	}
+}
+
+// ─── WriteStatus: coverage with archives ────────────────────────────────────
+
+func TestWriteStatus_coverageWithArchives(t *testing.T) {
+	// Live data starts at March 4, but archives go back to March 1.
+	coverage := &CoverageInfo{
+		EarliestEvent:       sql.NullTime{Valid: true, Time: time.Date(2026, 3, 4, 2, 0, 0, 0, time.UTC)},
+		LatestEvent:         sql.NullTime{Valid: true, Time: time.Date(2026, 3, 4, 10, 51, 50, 0, time.UTC)},
+		TotalEvents:         10000,
+		ArchiveEarliestHour: sql.NullTime{Valid: true, Time: time.Date(2026, 3, 1, 14, 0, 0, 0, time.UTC)},
+		ArchiveTotalRows:    5000,
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, coverage, nil, nil)
+	out := buf.String()
+
+	// Earliest should show the archive time, not the live time.
+	assertContains(t, out, "2026-03-01 14:00:00")
+	assertContains(t, out, "includes archives")
+	// Total should be live + archived.
+	assertContains(t, out, "15000")
+	assertContains(t, out, "10000 live")
+	assertContains(t, out, "5000 archived")
+}
+
+func TestWriteStatus_coverageArchiveOnly(t *testing.T) {
+	// No live events, only archives.
+	coverage := &CoverageInfo{
+		EarliestEvent:       sql.NullTime{Valid: false},
+		LatestEvent:         sql.NullTime{Valid: false},
+		TotalEvents:         0,
+		ArchiveEarliestHour: sql.NullTime{Valid: true, Time: time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)},
+		ArchiveTotalRows:    3000,
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, coverage, nil, nil)
+	out := buf.String()
+
+	assertContains(t, out, "2026-02-28 10:00:00")
+	assertContains(t, out, "includes archives")
+	assertContains(t, out, "3000")
+}
+
+func TestWriteStatus_coverageNoArchives(t *testing.T) {
+	// No archives — should display without the "includes archives" label.
+	coverage := &CoverageInfo{
+		EarliestEvent: sql.NullTime{Valid: true, Time: time.Date(2026, 3, 4, 2, 0, 0, 0, time.UTC)},
+		LatestEvent:   sql.NullTime{Valid: true, Time: time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC)},
+		TotalEvents:   8000,
+	}
+
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, coverage, nil, nil)
+	out := buf.String()
+
+	assertContains(t, out, "2026-03-04 02:00:00")
+	if strings.Contains(out, "includes archives") {
+		t.Error("should not say 'includes archives' when no archive data")
+	}
+	if strings.Contains(out, "live") {
+		t.Error("should not show live/archived breakdown when no archives")
+	}
+}
+
+// ─── WriteStatusJSON: coverage with archives ────────────────────────────────
+
+func TestWriteStatusJSON_coverageWithArchives(t *testing.T) {
+	coverage := &CoverageInfo{
+		EarliestEvent:       sql.NullTime{Valid: true, Time: time.Date(2026, 3, 4, 2, 0, 0, 0, time.UTC)},
+		LatestEvent:         sql.NullTime{Valid: true, Time: time.Date(2026, 3, 4, 10, 51, 50, 0, time.UTC)},
+		TotalEvents:         10000,
+		ArchiveEarliestHour: sql.NullTime{Valid: true, Time: time.Date(2026, 3, 1, 14, 0, 0, 0, time.UTC)},
+		ArchiveTotalRows:    5000,
+	}
+
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, nil, nil, nil, coverage, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var result struct {
+		Coverage *struct {
+			EarliestEvent        string  `json:"earliest_event"`
+			LatestEvent          string  `json:"latest_event"`
+			TotalEvents          int64   `json:"total_events"`
+			LiveEvents           int64   `json:"live_events"`
+			ArchivedEvents       int64   `json:"archived_events"`
+			ArchiveEarliestEvent *string `json:"archive_earliest_event"`
+		} `json:"coverage"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if result.Coverage == nil {
+		t.Fatal("expected coverage key in JSON")
+	}
+	// Effective earliest should be the archive time.
+	if result.Coverage.EarliestEvent != "2026-03-01 14:00:00" {
+		t.Errorf("wrong earliest_event: %s", result.Coverage.EarliestEvent)
+	}
+	if result.Coverage.TotalEvents != 15000 {
+		t.Errorf("wrong total_events: %d", result.Coverage.TotalEvents)
+	}
+	if result.Coverage.LiveEvents != 10000 {
+		t.Errorf("wrong live_events: %d", result.Coverage.LiveEvents)
+	}
+	if result.Coverage.ArchivedEvents != 5000 {
+		t.Errorf("wrong archived_events: %d", result.Coverage.ArchivedEvents)
+	}
+	if result.Coverage.ArchiveEarliestEvent == nil || *result.Coverage.ArchiveEarliestEvent != "2026-03-01 14:00:00" {
+		t.Errorf("wrong archive_earliest_event: %v", result.Coverage.ArchiveEarliestEvent)
 	}
 }
 
