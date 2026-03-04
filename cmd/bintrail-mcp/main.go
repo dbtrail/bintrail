@@ -170,6 +170,10 @@ func main() {
 		)
 		mux := http.NewServeMux()
 		mux.Handle("/mcp", handler)
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"status":"ok","version":%q}`, mcpVersion)
+		})
 
 		srv := &http.Server{Addr: *httpAddr, Handler: mux}
 
