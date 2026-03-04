@@ -135,9 +135,235 @@ The gateway is stateless — you can run multiple copies behind the ALB. All OAu
 
 ---
 
-### 1. DNS (Route 53)
+### 1. TLS Certificate (ACM)
 
-Point your domain at the ALB. Create an A record (alias type) for `mcp.dbtrail.com`:
+You need an HTTPS certificate for the ALB. AWS gives you one for free:
+
+```sh
+aws acm request-certificate \
+  --domain-name mcp.dbtrail.com \
+  --validation-method DNS \
+  --region us-east-1
+```
+
+This prints a certificate ARN. Now validate it — ACM gives you a CNAME record to add to DNS:
+
+```sh
+# See what CNAME record ACM wants you to add:
+aws acm describe-certificate \
+  --certificate-arn <CERT_ARN> \
+  --query 'Certificate.DomainValidationOptions'
+```
+
+Add that CNAME record to Route 53 (or your DNS provider). Wait a few minutes. The certificate status will change from `PENDING_VALIDATION` to `ISSUED`.
+
+**Already have a `*.dbtrail.com` wildcard cert?** Skip this step and use that ARN.
+
+### 2. Load Balancer (ALB)
+
+The ALB terminates TLS and forwards traffic to the gateway. You can set it up via the AWS Console or CLI.
+
+#### Step 1: Find your VPC and subnets
+
+You need your VPC ID and at least two public subnets in different availability zones. The ALB requires subnets in multiple AZs for high availability.
+
+```sh
+# Find your VPC ID
+aws ec2 describe-vpcs --query 'Vpcs[*].{ID:VpcId,CIDR:CidrBlock,Default:IsDefault}' --output table
+
+# List public subnets in your VPC (pick two in different AZs)
+aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=<YOUR_VPC_ID>" \
+  --query 'Subnets[*].{ID:SubnetId,AZ:AvailabilityZone,CIDR:CidrBlock,Public:MapPublicIpOnLaunch}' \
+  --output table
+```
+
+Pick two subnets where `Public` is `True` and the `AZ` values differ (e.g. `us-east-1a` and `us-east-1b`). Write down both subnet IDs — you'll need them in Step 4.
+
+#### Step 2: Create a security group for the ALB
+
+The ALB needs its own security group that allows inbound HTTPS (443) from the internet and outbound traffic to the gateway on port 8443.
+
+```sh
+# Create the security group
+aws ec2 create-security-group \
+  --group-name mcp-gateway-alb-sg \
+  --description "ALB for MCP Gateway - allows inbound HTTPS" \
+  --vpc-id <YOUR_VPC_ID>
+# → returns a GroupId like sg-0abc1234def56789
+
+# Allow inbound HTTPS (port 443) from anywhere
+aws ec2 authorize-security-group-ingress \
+  --group-id <SG_ID> \
+  --protocol tcp \
+  --port 443 \
+  --cidr 0.0.0.0/0
+
+# Allow outbound traffic to the gateway on port 8443
+# (the default outbound rule allows all traffic — if you've restricted it, add this)
+aws ec2 authorize-security-group-egress \
+  --group-id <SG_ID> \
+  --protocol tcp \
+  --port 8443 \
+  --cidr 0.0.0.0/0
+```
+
+**Also update the gateway's security group**: the EC2 instance (or ECS task) running `mcp-gateway` must allow inbound traffic on port 8443 from the ALB security group:
+
+```sh
+aws ec2 authorize-security-group-ingress \
+  --group-id <GATEWAY_INSTANCE_SG_ID> \
+  --protocol tcp \
+  --port 8443 \
+  --source-group <ALB_SG_ID>
+```
+
+#### Step 3: Create a target group
+
+The target group tells the ALB where to send traffic and how to health-check the gateway.
+
+```sh
+aws elbv2 create-target-group \
+  --name mcp-gateway-tg \
+  --protocol HTTP \
+  --port 8443 \
+  --vpc-id <YOUR_VPC_ID> \
+  --target-type ip \
+  --health-check-path /health \
+  --health-check-interval-seconds 30 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 3
+# → returns a TargetGroupArn — save this
+```
+
+| Setting | Value | Why |
+|---|---|---|
+| Protocol | HTTP | ALB terminates TLS; traffic between ALB and gateway is plaintext within the VPC |
+| Port | 8443 | The gateway's default listen port (`--addr :8443`) |
+| Target type | `ip` | Works for both EC2 and ECS/Fargate. Use `instance` if you prefer instance-ID-based targets |
+| Health check | `/health` | The gateway returns `{"status":"ok"}` on this path |
+
+Now register the gateway instance(s) as targets:
+
+```sh
+# For an EC2 instance — use the private IP (not the public IP)
+aws elbv2 register-targets \
+  --target-group-arn <TG_ARN> \
+  --targets Id=<GATEWAY_PRIVATE_IP>,Port=8443
+
+# To find the private IP of your EC2 instance:
+aws ec2 describe-instances \
+  --instance-ids <INSTANCE_ID> \
+  --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+  --output text
+```
+
+#### Step 4: Create the ALB
+
+```sh
+aws elbv2 create-load-balancer \
+  --name mcp-gateway-alb \
+  --subnets <SUBNET_1> <SUBNET_2> \
+  --security-groups <ALB_SG_ID> \
+  --scheme internet-facing \
+  --type application
+# → returns LoadBalancerArn and DNSName — save both
+```
+
+The `DNSName` (e.g. `mcp-gateway-alb-123456789.us-east-1.elb.amazonaws.com`) is what you'll point your domain at in the DNS step. The `LoadBalancerArn` is needed for the next commands.
+
+#### Step 5: Set the idle timeout to 120 seconds
+
+This is **critical** for MCP. The MCP protocol uses SSE (Server-Sent Events) streaming, and tool calls can take several seconds. The default ALB timeout is 60 seconds, which cuts off long-running requests.
+
+```sh
+aws elbv2 modify-load-balancer-attributes \
+  --load-balancer-arn <ALB_ARN> \
+  --attributes Key=idle_timeout.timeout_seconds,Value=120
+```
+
+#### Step 6: Create the HTTPS listener
+
+The listener ties the ALB to your TLS certificate (from Step 1) and routes traffic to the target group.
+
+```sh
+aws elbv2 create-listener \
+  --load-balancer-arn <ALB_ARN> \
+  --protocol HTTPS \
+  --port 443 \
+  --certificates CertificateArn=<CERT_ARN> \
+  --default-actions Type=forward,TargetGroupArn=<TG_ARN> \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06
+```
+
+The `--ssl-policy` enables TLS 1.3 and 1.2. This is the recommended policy for new ALBs — it disables older protocols like TLS 1.0 and 1.1.
+
+Optionally, add an HTTP listener that redirects to HTTPS (so `http://mcp.dbtrail.com` → `https://mcp.dbtrail.com`):
+
+```sh
+aws elbv2 create-listener \
+  --load-balancer-arn <ALB_ARN> \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions 'Type=redirect,RedirectConfig={Protocol=HTTPS,Port=443,StatusCode=HTTP_301}'
+```
+
+If you add the HTTP redirect, also open port 80 on the ALB security group:
+
+```sh
+aws ec2 authorize-security-group-ingress \
+  --group-id <ALB_SG_ID> \
+  --protocol tcp \
+  --port 80 \
+  --cidr 0.0.0.0/0
+```
+
+#### Step 7: Verify the ALB is working
+
+```sh
+# Check ALB state (should say "active" after a minute or two)
+aws elbv2 describe-load-balancers \
+  --names mcp-gateway-alb \
+  --query 'LoadBalancers[0].{State:State.Code,DNS:DNSName}' \
+  --output table
+
+# Check target health (should say "healthy" once the gateway is running)
+aws elbv2 describe-target-health \
+  --target-group-arn <TG_ARN>
+
+# Hit the health endpoint through the ALB (use the ALB DNS name)
+curl https://<ALB_DNS_NAME>/health
+```
+
+If `describe-target-health` shows `unhealthy`, check:
+- The gateway is running (`./mcp-gateway --addr :8443 ...`)
+- The gateway's security group allows inbound 8443 from the ALB's security group
+- The gateway responds to health checks: `curl http://<GATEWAY_PRIVATE_IP>:8443/health`
+
+#### Doing this from the AWS Console instead
+
+If you prefer clicking over typing:
+
+1. **EC2 > Security Groups > Create security group** — name it `mcp-gateway-alb-sg`, add inbound rule for HTTPS (443) from `0.0.0.0/0`
+2. **EC2 > Target Groups > Create target group** — choose "IP addresses", protocol HTTP, port 8443, health check path `/health`, select your VPC, then register the gateway's private IP
+3. **EC2 > Load Balancers > Create Load Balancer** — choose "Application Load Balancer", internet-facing, select two public subnets in different AZs, attach the security group from step 1
+4. **Add listener** — HTTPS on port 443, select your ACM certificate, forward to the target group from step 2
+5. **Load balancer attributes** — edit and set "Idle timeout" to `120` seconds
+6. **Done** — copy the DNS name from the load balancer details page for the Route 53 step
+
+### 3. DNS (Route 53)
+
+Now that the ALB is created, point your domain at it. You need two values from the ALB:
+
+```sh
+# Get the ALB's DNS name and hosted zone ID
+aws elbv2 describe-load-balancers \
+  --names mcp-gateway-alb \
+  --query 'LoadBalancers[0].{DNSName:DNSName,HostedZoneId:CanonicalHostedZoneId}' \
+  --output table
+```
+
+Create an A record (alias type) for `mcp.dbtrail.com`:
 
 ```sh
 aws route53 change-resource-record-sets \
@@ -158,78 +384,19 @@ aws route53 change-resource-record-sets \
   }'
 ```
 
-**How to find these values:**
-- `YOUR_ZONE_ID` — go to Route 53 > Hosted zones > click your domain > the Zone ID is at the top
-- `ALB_HOSTED_ZONE_ID` and `ALB_DNS_NAME` — you'll get these after creating the ALB in step 3
+**How to find `YOUR_ZONE_ID`:** Route 53 > Hosted zones > click your domain > the Zone ID is at the top.
 
 If you use the AWS Console instead: Route 53 > Hosted zones > your domain > Create record > toggle "Alias" on > select your ALB from the dropdown.
 
-### 2. TLS Certificate (ACM)
-
-You need an HTTPS certificate. AWS gives you one for free:
+Verify DNS is working:
 
 ```sh
-aws acm request-certificate \
-  --domain-name mcp.dbtrail.com \
-  --validation-method DNS \
-  --region us-east-1
+# Should resolve to the ALB's IP addresses (may take a few minutes to propagate)
+dig mcp.dbtrail.com
+
+# Should return the gateway health response
+curl https://mcp.dbtrail.com/health
 ```
-
-This prints a certificate ARN. Now validate it — ACM gives you a CNAME record to add to DNS:
-
-```sh
-# See what CNAME record ACM wants you to add:
-aws acm describe-certificate \
-  --certificate-arn <CERT_ARN> \
-  --query 'Certificate.DomainValidationOptions'
-```
-
-Add that CNAME record to Route 53. Wait a few minutes. The certificate status will change from `PENDING_VALIDATION` to `ISSUED`.
-
-**Already have a `*.dbtrail.com` wildcard cert?** Skip this step and use that ARN.
-
-### 3. Load Balancer (ALB)
-
-The ALB terminates TLS and forwards traffic to the gateway. Three commands:
-
-```sh
-# 1. Create a target group (where the ALB sends traffic)
-aws elbv2 create-target-group \
-  --name mcp-gateway-tg \
-  --protocol HTTP \
-  --port 8443 \
-  --vpc-id <YOUR_VPC_ID> \
-  --target-type ip \
-  --health-check-path /health \
-  --health-check-interval-seconds 30
-
-# 2. Create the ALB itself
-aws elbv2 create-load-balancer \
-  --name mcp-gateway-alb \
-  --subnets <SUBNET_1> <SUBNET_2> \
-  --security-groups <SG_ID> \
-  --scheme internet-facing
-
-# 3. IMPORTANT: Set idle timeout to 120 seconds.
-#    Default is 60s, which is too short for SSE streaming connections.
-aws elbv2 modify-load-balancer-attributes \
-  --load-balancer-arn <ALB_ARN> \
-  --attributes Key=idle_timeout.timeout_seconds,Value=120
-
-# 4. Create the HTTPS listener (ties the ALB to your certificate)
-aws elbv2 create-listener \
-  --load-balancer-arn <ALB_ARN> \
-  --protocol HTTPS \
-  --port 443 \
-  --certificates CertificateArn=<CERT_ARN> \
-  --default-actions Type=forward,TargetGroupArn=<TG_ARN>
-```
-
-**Security group rules:**
-- Inbound: allow port 443 from `0.0.0.0/0` (the internet)
-- Outbound: allow traffic to the gateway on port 8443
-
-**How to find VPC and subnet IDs:** `aws ec2 describe-vpcs` and `aws ec2 describe-subnets --filters "Name=vpc-id,Values=<VPC_ID>"`. Pick two subnets in different availability zones.
 
 ### 4. DynamoDB Tables
 
