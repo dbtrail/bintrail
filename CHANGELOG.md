@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-06
+
+### Added
+- MCP gateway with OAuth 2.1 for Claude Connector support
+- Tenant provisioning admin API and backend health monitoring for MCP gateway
+- Rate limiting and request logging for MCP gateway
+- Auto-snapshot on DDL detection with restore coverage tracking
+- `--reset` flag for `bintrail stream` to force new start position
+- Seamless mode switching between position and GTID in `bintrail stream`
+- Idempotent stream startup by preferring saved checkpoint over flags
+- S3 upload retry with `--retry` flag for `baseline` and `rotate` commands
+- Standalone `bintrail upload` command for S3 uploads
+- At-rest encryption for mydumper dump files (`dump --encrypt`)
+- Docker support: Dockerfile, docker-compose template, and mydumper Docker fallback
+- `event_hour` Hive partition level in archive path
+- `archive_state` table to track archived Parquet files
+- Archive and S3 stats in `bintrail status` output
+- `--format json` for all commands
+- `--sync-thread-lock-mode` and `--trx-tables` flags for mydumper
+- Stream state and `bintrail-id` in status output
+- `/health` endpoint for `bintrail-mcp` HTTP server
+- Debug logging for status command
+
+### Fixed
+- Always emit `TO_SECONDS` partition pruning hints for `since`/`until` queries
+- Include `archive_state` data in status restore coverage
+- Add missing Archives section to MCP status tool
+- Emit GTID tracking events to prevent gaps in accumulated GTID set
+- Place `--outputdir` last in mydumper args for Docker wrapper compatibility
+- Skip shell script wrappers when resolving mydumper on PATH
+- Remove `Truncate(time.Hour)` from rotate cutoff so hourly partitions drop correctly
+- Parse mydumper 0.16+ metadata format
+- Replace `UTC_TIMESTAMP()` with `CURRENT_TIMESTAMP` in `archive_state` DDL
+- Show S3 upload progress in rotate output
+- Create partitions from current hour forward
+- Suppress usage output on command errors
+- Normalize shortened UUIDs in GTID sets from RDS
+- Allow gateway's own issuer origin in origin middleware
+
 ## [0.1.1] - 2026-03-01
 
 ### Fixed
