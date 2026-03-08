@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -664,6 +665,12 @@ func TestBuildDockerArgs_encryptKeyMount(t *testing.T) {
 	if !found {
 		t.Error("expected key file bind mount with :ro in docker args")
 	}
+}
+
+func TestBuildDockerArgs_userFlag(t *testing.T) {
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", nil, "")
+	want := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	assertArgsContainPair(t, args, "--user", want)
 }
 
 func TestBuildDockerArgs_noEncryptKeyMount(t *testing.T) {
