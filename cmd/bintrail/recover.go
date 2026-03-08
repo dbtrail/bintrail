@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
 	"github.com/bintrail/bintrail/internal/cliutil"
@@ -49,20 +50,21 @@ Examples:
 }
 
 var (
-	rIndexDSN  string
-	rSchema    string
-	rTable     string
-	rPK        string
-	rEventType string
-	rGTID      string
-	rSince     string
-	rUntil     string
-	rFlag      string
-	rOutput    string
-	rDryRun    bool
-	rLimit     int
-	rProfile   string
-	rFormat    string
+	rIndexDSN   string
+	rSchema     string
+	rTable      string
+	rPK         string
+	rEventType  string
+	rGTID       string
+	rSince      string
+	rUntil      string
+	rFlag       string
+	rOutput     string
+	rDryRun     bool
+	rLimit      int
+	rProfile    string
+	rFormat     string
+	rNoArchive  bool
 )
 
 func init() {
@@ -80,6 +82,7 @@ func init() {
 	recoverCmd.Flags().IntVar(&rLimit, "limit", 1000, "Maximum number of events to reverse")
 	recoverCmd.Flags().StringVar(&rProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	recoverCmd.Flags().StringVar(&rFormat, "format", "text", "Output format: text or json")
+	recoverCmd.Flags().BoolVar(&rNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(recoverCmd)
 
@@ -152,21 +155,37 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Fetch events (live + archives) ────────────────────────────────────────
-	// Skip archive auto-discovery when --profile is active — archive queries
-	// do not enforce DenyTables/RedactColumns rules.
+	// Skip archive auto-discovery when --no-archive is set or --profile is
+	// active (archive queries do not enforce DenyTables/RedactColumns rules).
 	engine := query.New(db)
 	var archSources []string
-	if rProfile == "" {
+	if !rNoArchive && rProfile == "" {
 		archSources = query.ResolveArchiveSources(cmd.Context(), db)
+	}
+
+	// ── Coverage warnings and per-partition routing ───────────────────────────
+	var plan *query.QueryPlan
+	if !rNoArchive && (len(archSources) > 0 || since != nil || until != nil) {
+		cfg, parseErr := mysqldriver.ParseDSN(rIndexDSN)
+		if parseErr != nil {
+			slog.Warn("could not parse DSN for query planning", "error", parseErr)
+		} else if cfg.DBName != "" {
+			plan = query.RunPlanAndWarn(cmd.Context(), db, cfg.DBName, since, until)
+		}
 	}
 
 	var rows []query.ResultRow
 	if len(archSources) > 0 {
 		fetchOpts := opts
 		fetchOpts.Limit = 0
-		rows, err = engine.Fetch(cmd.Context(), fetchOpts)
-		if err != nil {
-			return err
+
+		if plan != nil && plan.SkipMySQL() {
+			slog.Debug("planner: skipping MySQL query (range fully archived)")
+		} else {
+			rows, err = engine.Fetch(cmd.Context(), fetchOpts)
+			if err != nil {
+				return err
+			}
 		}
 		for _, src := range archSources {
 			ar, err := parquetquery.Fetch(cmd.Context(), fetchOpts, src)
