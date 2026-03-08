@@ -107,8 +107,8 @@ func New(binlogDir string, resolver *metadata.Resolver, filters Filters, logger 
 // and updates schemaVersion to the new resolver's SnapshotID.
 // Safe to call concurrently while ParseFile is running.
 func (p *Parser) SwapResolver(r *metadata.Resolver) {
-	p.resolver.Store(r)
 	p.schemaVersion.Store(uint32(r.SnapshotID()))
+	p.resolver.Store(r)
 }
 
 // ParseFiles parses multiple binlog files in order, sending events to the channel.

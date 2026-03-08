@@ -43,8 +43,8 @@ func NewStreamParser(resolver *metadata.Resolver, filters Filters, logger *slog.
 // and updates schemaVersion to the new resolver's SnapshotID.
 // Safe to call concurrently while Run is executing in another goroutine.
 func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
-	sp.resolver.Store(r)
 	sp.schemaVersion.Store(uint32(r.SnapshotID()))
+	sp.resolver.Store(r)
 }
 
 // Run reads events from the streamer and sends matching row events to out.

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"slices"
 	"sort"
@@ -51,6 +52,8 @@ func (g *Generator) resolverForRow(row query.ResultRow) *metadata.Resolver {
 	}
 	r, err := metadata.NewResolver(g.db, int(row.SchemaVersion))
 	if err != nil {
+		slog.Warn("failed to load resolver for schema_version; using default resolver",
+			"schema_version", row.SchemaVersion, "error", err)
 		return g.resolver
 	}
 	if g.cache == nil {

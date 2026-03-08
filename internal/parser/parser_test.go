@@ -316,6 +316,13 @@ func TestParser_nilResolver_schemaVersionZero(t *testing.T) {
 	}
 }
 
+func TestStreamParser_nilResolver_schemaVersionZero(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	if got := sp.schemaVersion.Load(); got != 0 {
+		t.Errorf("nil resolver schemaVersion = %d, want 0", got)
+	}
+}
+
 // ─── Timestamp UTC ────────────────────────────────────────────────────────────
 
 func TestTimestampUTC(t *testing.T) {
