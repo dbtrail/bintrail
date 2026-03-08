@@ -18,9 +18,10 @@ import (
 // events to an output channel, mirroring the interface of Parser but without
 // requiring binlog files on disk.
 type StreamParser struct {
-	resolver atomic.Pointer[metadata.Resolver]
-	filters  Filters
-	logger   *slog.Logger
+	resolver      atomic.Pointer[metadata.Resolver]
+	filters       Filters
+	logger        *slog.Logger
+	schemaVersion atomic.Uint32 // actual snapshot_id from schema_snapshots; updated by SwapResolver
 }
 
 // NewStreamParser creates a StreamParser that resolves column names via
@@ -32,14 +33,17 @@ func NewStreamParser(resolver *metadata.Resolver, filters Filters, logger *slog.
 	}
 	sp := &StreamParser{filters: filters, logger: logger}
 	if resolver != nil {
+		sp.schemaVersion.Store(uint32(resolver.SnapshotID()))
 		sp.resolver.Store(resolver)
 	}
 	return sp
 }
 
-// SwapResolver atomically replaces the resolver used for column resolution.
+// SwapResolver atomically replaces the resolver used for column resolution
+// and updates schemaVersion to the new resolver's SnapshotID.
 // Safe to call concurrently while Run is executing in another goroutine.
 func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
+	sp.schemaVersion.Store(uint32(r.SnapshotID()))
 	sp.resolver.Store(r)
 }
 
@@ -52,10 +56,6 @@ func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
 func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStreamer, out chan<- Event) error {
 	var currentFile string
 	var currentGTID string
-	var schemaVersion uint32
-	if r := sp.resolver.Load(); r != nil {
-		schemaVersion = uint32(r.SnapshotID())
-	}
 
 	for {
 		binlogEv, err := streamer.GetEvent(ctx)
@@ -90,8 +90,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 
 		case *replication.QueryEvent:
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
-			if ddlEv, ok := parseDDL(sp.logger, currentFile, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), schemaVersion); ok {
-				schemaVersion++
+			if ddlEv, ok := parseDDL(sp.logger, currentFile, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), sp.schemaVersion.Load()); ok {
 				select {
 				case out <- ddlEv:
 				case <-ctx.Done():
@@ -100,7 +99,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			}
 
 		case *replication.RowsEvent:
-			if err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, schemaVersion, out); err != nil {
+			if err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, sp.schemaVersion.Load(), out); err != nil {
 				if ctx.Err() != nil {
 					return nil // context cancelled during row processing
 				}

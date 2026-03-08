@@ -142,13 +142,42 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	p := parser.New(idxBinlogDir, resolver, filters, nil)
 	idx := indexer.New(indexDB, idxBatchSize)
 
-	// In file mode, DDLs are recorded but auto-snapshot is not taken because
-	// the binlog may be from a past point in time when information_schema
-	// reflected a different schema. The user must run `bintrail snapshot` manually.
+	// DDL handler: auto-snapshot when --source-dsn is available; warn-only otherwise.
+	schemas := parseSchemaList(idxSchemas)
 	idx.SetOnDDL(func(ev parser.Event) error {
-		slog.Warn("DDL detected in file mode — auto-snapshot not available; run `bintrail snapshot` if schema changed",
-			"file", ev.BinlogFile, "pos", ev.EndPos, "ddl_type", ev.DDLType, "query", ev.DDLQuery)
-		if err := insertSchemaChange(indexDB, ev, nil); err != nil {
+		if sourceDB == nil {
+			slog.Warn("DDL detected but --source-dsn not provided; run `bintrail snapshot` if schema changed",
+				"file", ev.BinlogFile, "pos", ev.EndPos, "ddl_type", ev.DDLType, "query", ev.DDLQuery)
+			if err := insertSchemaChange(indexDB, ev, nil); err != nil {
+				slog.Warn("failed to record schema change", "error", err)
+			}
+			return nil
+		}
+
+		slog.Info("DDL detected — taking auto-snapshot",
+			"file", ev.BinlogFile, "pos", ev.EndPos,
+			"ddl_type", ev.DDLType, "schema", ev.Schema, "table", ev.Table)
+
+		stats, snapErr := metadata.TakeSnapshot(sourceDB, indexDB, schemas)
+		var snapID *int
+		if snapErr != nil {
+			slog.Error("auto-snapshot after DDL failed; subsequent events may use stale schema",
+				"error", snapErr, "ddl_type", ev.DDLType, "table", ev.Table)
+		} else {
+			snapID = &stats.SnapshotID
+			newResolver, resolverErr := metadata.NewResolver(indexDB, stats.SnapshotID)
+			if resolverErr != nil {
+				slog.Warn("failed to load new resolver after DDL snapshot", "error", resolverErr)
+			} else {
+				p.SwapResolver(newResolver)
+				slog.Info("auto-snapshot taken; resolver updated",
+					"snapshot_id", stats.SnapshotID,
+					"tables", stats.TableCount,
+					"columns", stats.ColumnCount)
+			}
+		}
+
+		if err := insertSchemaChange(indexDB, ev, snapID); err != nil {
 			slog.Warn("failed to record schema change", "error", err)
 		}
 		return nil

@@ -48,7 +48,7 @@ type Event struct {
 	PKValues      string         // pipe-delimited PK values in ordinal order
 	RowBefore     map[string]any // nil for INSERT
 	RowAfter      map[string]any // nil for DELETE
-	SchemaVersion uint32         // resolver.SnapshotID() at parse time; incremented on each DDL detection
+	SchemaVersion uint32         // actual snapshot_id from schema_snapshots; updated by SwapResolver on DDL
 	DDLQuery      string         // original DDL statement (EventDDL only)
 	DDLType       DDLKind        // ALTER TABLE, CREATE TABLE, DROP TABLE, RENAME TABLE (EventDDL only)
 }
@@ -81,7 +81,7 @@ type Parser struct {
 	resolver      atomic.Pointer[metadata.Resolver]
 	filters       Filters
 	logger        *slog.Logger
-	schemaVersion uint32 // starts at resolver.SnapshotID(); incremented on each DDL detection
+	schemaVersion atomic.Uint32 // actual snapshot_id from schema_snapshots; updated by SwapResolver
 }
 
 // New creates a Parser that reads from binlogDir, resolves column names via
@@ -91,25 +91,23 @@ func New(binlogDir string, resolver *metadata.Resolver, filters Filters, logger 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	var schemaVersion uint32
-	if resolver != nil {
-		schemaVersion = uint32(resolver.SnapshotID())
-	}
 	p := &Parser{
-		binlogDir:     binlogDir,
-		filters:       filters,
-		logger:        logger,
-		schemaVersion: schemaVersion,
+		binlogDir: binlogDir,
+		filters:   filters,
+		logger:    logger,
 	}
 	if resolver != nil {
+		p.schemaVersion.Store(uint32(resolver.SnapshotID()))
 		p.resolver.Store(resolver)
 	}
 	return p
 }
 
-// SwapResolver atomically replaces the resolver used for column resolution.
+// SwapResolver atomically replaces the resolver used for column resolution
+// and updates schemaVersion to the new resolver's SnapshotID.
 // Safe to call concurrently while ParseFile is running.
 func (p *Parser) SwapResolver(r *metadata.Resolver) {
+	p.schemaVersion.Store(uint32(r.SnapshotID()))
 	p.resolver.Store(r)
 }
 
@@ -149,8 +147,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 
 		case *replication.QueryEvent:
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
-			if ddlEv, ok := parseDDL(p.logger, filename, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), p.schemaVersion); ok {
-				p.schemaVersion++
+			if ddlEv, ok := parseDDL(p.logger, filename, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), p.schemaVersion.Load()); ok {
 				select {
 				case events <- ddlEv:
 				case <-ctx.Done():
@@ -159,7 +156,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			}
 
 		case *replication.RowsEvent:
-			return handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, p.schemaVersion, events)
+			return handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, p.schemaVersion.Load(), events)
 		}
 		return nil
 	})
