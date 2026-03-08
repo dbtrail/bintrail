@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,6 +58,8 @@ func runConfigInit(cmd *cobra.Command, args []string) error {
 
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("file already exists: %s\nRemove it first or edit it directly.", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("cannot check %s: %w", path, err)
 	}
 
 	content := generateEnvTemplate()
@@ -81,6 +84,8 @@ type envTemplateEntry struct {
 	Placeholder string // shown when no value is set (e.g. "user:pass@tcp(host:3306)/binlog_index")
 }
 
+// envSections defines the same env vars as envBindings (in envload.go),
+// grouped by category for template generation. Keep in sync with envBindings.
 var envSections = []envSection{
 	{
 		Header: "Database connections",

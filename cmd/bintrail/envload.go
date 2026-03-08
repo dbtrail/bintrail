@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,8 +19,9 @@ type envBinding struct {
 }
 
 // envBindings defines all flag-to-env-var mappings. Used by bindCommandEnv
-// to apply environment variables to Cobra flags and by config init to
-// generate the .bintrail.env template.
+// to apply environment variables to Cobra flags. The corresponding
+// envSections variable in config.go defines the same env vars grouped
+// by category for template generation.
 var envBindings = []envBinding{
 	{"index-dsn", "BINTRAIL_INDEX_DSN"},
 	{"source-dsn", "BINTRAIL_SOURCE_DSN"},
@@ -55,6 +58,9 @@ func loadEnvFile() {
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintf(os.Stderr, "warning: found %s but could not read it: %v\n", p, err)
+			}
 			continue
 		}
 		parseAndSetEnv(string(data))
@@ -63,10 +69,10 @@ func loadEnvFile() {
 }
 
 // parseAndSetEnv parses key=value lines from data and sets them as
-// environment variables. Lines starting with # and blank lines are
-// skipped. Values may be surrounded by single or double quotes
-// (stripped). Variables already set in the environment are not
-// overwritten.
+// environment variables. Blank lines and lines whose first non-whitespace
+// character is # are skipped. Lines without an = sign produce a warning.
+// Values may be surrounded by single or double quotes (stripped).
+// Variables already set in the environment are not overwritten.
 func parseAndSetEnv(data string) {
 	scanner := bufio.NewScanner(strings.NewReader(data))
 	for scanner.Scan() {
@@ -76,6 +82,7 @@ func parseAndSetEnv(data string) {
 		}
 		key, val, ok := strings.Cut(line, "=")
 		if !ok {
+			fmt.Fprintf(os.Stderr, "warning: skipping malformed line in env file (no '='): %s\n", line)
 			continue
 		}
 		key = strings.TrimSpace(key)
@@ -117,11 +124,15 @@ func bindCommandEnv(cmd *cobra.Command) {
 		}
 		// Try local flags first, then persistent flags.
 		if f := cmd.Flags().Lookup(b.Flag); f != nil {
-			_ = cmd.Flags().Set(b.Flag, v)
+			if err := cmd.Flags().Set(b.Flag, v); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: cannot set --%s from %s: %v\n", b.Flag, b.EnvVar, err)
+			}
 			continue
 		}
 		if cmd.PersistentFlags().Lookup(b.Flag) != nil {
-			_ = cmd.PersistentFlags().Set(b.Flag, v)
+			if err := cmd.PersistentFlags().Set(b.Flag, v); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: cannot set --%s from %s: %v\n", b.Flag, b.EnvVar, err)
+			}
 		}
 	}
 }

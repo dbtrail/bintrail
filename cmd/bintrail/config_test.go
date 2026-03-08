@@ -85,6 +85,34 @@ func TestRunConfigInit(t *testing.T) {
 	})
 }
 
+func TestEnvBindingsAndSectionsConsistency(t *testing.T) {
+	// Collect all env vars from envSections.
+	sectionVars := make(map[string]bool)
+	for _, sec := range envSections {
+		for _, entry := range sec.Bindings {
+			sectionVars[entry.EnvVar] = true
+		}
+	}
+	// Every envBinding must appear in envSections.
+	for _, b := range envBindings {
+		if !sectionVars[b.EnvVar] {
+			t.Errorf("envBindings has %s but envSections does not", b.EnvVar)
+		}
+	}
+	// Every envSection entry must appear in envBindings.
+	bindingVars := make(map[string]bool)
+	for _, b := range envBindings {
+		bindingVars[b.EnvVar] = true
+	}
+	for _, sec := range envSections {
+		for _, entry := range sec.Bindings {
+			if !bindingVars[entry.EnvVar] {
+				t.Errorf("envSections has %s (in %q) but envBindings does not", entry.EnvVar, sec.Header)
+			}
+		}
+	}
+}
+
 func TestGenerateEnvTemplate(t *testing.T) {
 	t.Run("pre-fills from environment", func(t *testing.T) {
 		t.Setenv("BINTRAIL_INDEX_DSN", "test-dsn-value")
