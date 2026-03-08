@@ -1,6 +1,6 @@
 # DDL Tracking and Auto-Snapshot
 
-This page explains how bintrail detects DDL statements (schema changes) in the binlog stream, automatically takes new schema snapshots in stream mode, and tracks restore coverage so you know what can be recovered and how far back.
+This page explains how bintrail detects DDL statements (schema changes) in the binlog stream, automatically takes new schema snapshots, and tracks restore coverage so you know what can be recovered and how far back.
 
 ---
 
@@ -13,7 +13,7 @@ Before DDL tracking, the only solution was to notice the "column count mismatch"
 DDL tracking solves three problems:
 
 1. **Detection**: The parser identifies DDL statements (`ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`, `RENAME TABLE`) and emits them as events instead of just logging warnings.
-2. **Auto-snapshot** (stream mode only): When a DDL is detected during live replication, bintrail automatically takes a new snapshot and hot-swaps the resolver — no manual intervention needed.
+2. **Auto-snapshot**: When a DDL is detected and a source database connection is available, bintrail automatically takes a new snapshot and hot-swaps the resolver — no manual intervention needed. This works in both stream mode (always has source connection) and file mode (when `--source-dsn` is provided).
 3. **Restore coverage**: The `status` command shows the time range of indexed events and warns about DDLs that weren't followed by a snapshot (file mode), so you know where recovery gaps might exist.
 
 ---
@@ -108,18 +108,22 @@ DDL detected in replication stream
 
 ### Atomic resolver swap
 
-The parser runs in a separate goroutine from the DDL handler. Swapping the resolver must be safe for concurrent access. Both `Parser` and `StreamParser` store their resolver as an `atomic.Pointer[metadata.Resolver]`:
+The parser runs in a separate goroutine from the DDL handler. Swapping the resolver must be safe for concurrent access. Both `Parser` and `StreamParser` store their resolver as an `atomic.Pointer[metadata.Resolver]` and track the schema version with an `atomic.Uint32`:
 
 ```go
 type StreamParser struct {
-    resolver atomic.Pointer[metadata.Resolver]
+    resolver      atomic.Pointer[metadata.Resolver]
+    schemaVersion atomic.Uint32 // actual snapshot_id from schema_snapshots
     // ...
 }
 
 func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
+    sp.schemaVersion.Store(uint32(r.SnapshotID()))
     sp.resolver.Store(r)
 }
 ```
+
+`SwapResolver` stores `schemaVersion` before the resolver pointer. This ordering is deliberate: if a reader observes state between the two stores, it sees the new version with the old resolver. During recovery, `resolverForRow` would then load the correct resolver for that version from the database.
 
 When `handleRows` needs the resolver, it calls `sp.resolver.Load()`. This is a classic RCU (Read-Copy-Update) pattern: the old resolver remains valid for any in-flight `handleRows` call, while new calls pick up the updated one. No locks needed.
 
@@ -135,15 +139,23 @@ ERROR DDL snapshot failed schema=mydb table=users error="connection refused"
 
 ---
 
-## File Mode: Record Only
+## File Mode: Auto-Snapshot or Record Only
 
-In file mode (`bintrail index`), a DDL in a binlog file means the schema changed at some point in the past. The current `information_schema` may have changed again since then — taking a snapshot now would capture the wrong schema. So file mode only records the DDL in `schema_changes` and logs a warning:
+In file mode (`bintrail index`), the behavior depends on whether `--source-dsn` is provided:
+
+### With `--source-dsn`: Auto-Snapshot
+
+When `--source-dsn` points to the source MySQL server, file mode behaves identically to stream mode: on DDL detection, it takes a snapshot from `information_schema`, builds a new resolver, and atomically swaps it. This is safe when indexing recent binlogs from the same server, since `information_schema` reflects the current (post-DDL) schema.
+
+### Without `--source-dsn`: Record Only
+
+When no source connection is available (e.g., indexing binlogs from a decommissioned server), bintrail records the DDL in `schema_changes` and logs a warning:
 
 ```
-WARN DDL detected in file mode — auto-snapshot not available. Run 'bintrail snapshot' if schema changed.
+WARN DDL detected but --source-dsn not provided; run `bintrail snapshot` if schema changed.
 ```
 
-The `snapshot_id` column is NULL for file-mode DDLs, which the status command uses to flag potential restore coverage gaps.
+The `snapshot_id` column is NULL for these DDLs, which the status command uses to flag potential restore coverage gaps.
 
 ---
 
@@ -171,7 +183,7 @@ Key fields:
 |---|---|
 | `ddl_type` | One of `ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`, `RENAME TABLE` |
 | `ddl_query` | The full DDL statement from the binlog |
-| `snapshot_id` | The snapshot taken after this DDL (stream mode), or NULL (file mode) |
+| `snapshot_id` | The snapshot taken after this DDL, or NULL if no source connection was available |
 
 This table is created by `bintrail init` and must exist in the index database. Older index databases (created before this feature) won't have it — the status command handles this gracefully by treating a missing table as zero schema changes.
 
@@ -221,11 +233,11 @@ Both queries use best-effort error handling: if `schema_changes` doesn't exist (
 
 ## Comparison: Stream vs File Mode
 
-| Behavior | Stream Mode | File Mode |
-|---|---|---|
-| DDL detection | Yes — from replication events | Yes — from binlog file events |
-| Auto-snapshot | Yes — immediate, from live `information_schema` | No — binlog may be stale |
-| Resolver swap | Atomic (`atomic.Pointer`) | N/A (single-threaded per file) |
-| schema_changes record | Yes, with `snapshot_id` | Yes, with `snapshot_id = NULL` |
-| User action needed | None | Run `bintrail snapshot` after DDL |
-| Restore coverage warning | No (snapshot covers the DDL) | Yes (warns about uncovered DDLs) |
+| Behavior | Stream Mode | File Mode (with `--source-dsn`) | File Mode (no `--source-dsn`) |
+|---|---|---|---|
+| DDL detection | Yes — from replication events | Yes — from binlog file events | Yes — from binlog file events |
+| Auto-snapshot | Yes — immediate | Yes — immediate | No — no source connection |
+| Resolver swap | Atomic (`atomic.Pointer`) | Atomic (`atomic.Pointer`) | N/A |
+| schema_changes record | Yes, with `snapshot_id` | Yes, with `snapshot_id` | Yes, with `snapshot_id = NULL` |
+| User action needed | None | None | Run `bintrail snapshot` after DDL |
+| Restore coverage warning | No (snapshot covers the DDL) | No (snapshot covers the DDL) | Yes (warns about uncovered DDLs) |

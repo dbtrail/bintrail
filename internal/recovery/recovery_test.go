@@ -2,11 +2,13 @@ package recovery
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bintrail/bintrail/internal/metadata"
 	"github.com/bintrail/bintrail/internal/parser"
@@ -582,6 +584,112 @@ func TestGenerateSQLFromRows_reverseOrder(t *testing.T) {
 	}
 	if deletePos > insertPos {
 		t.Errorf("expected reversed order (event 2 before event 1):\n%s", out)
+	}
+}
+
+// ─── resolverForRow ──────────────────────────────────────────────────────────
+
+func TestResolverForRow_zeroVersionReturnsFallback(t *testing.T) {
+	resolver := metadata.NewResolverFromTables(5, map[string]*metadata.TableMeta{
+		"db.t": {Schema: "db", Table: "t", Columns: []metadata.ColumnMeta{{Name: "id", IsPK: true}}},
+	})
+	g := New(nil, resolver)
+	row := query.ResultRow{SchemaVersion: 0, SchemaName: "db", TableName: "t"}
+	got := g.resolverForRow(row)
+	if got != resolver {
+		t.Error("expected fallback resolver for SchemaVersion=0")
+	}
+}
+
+func TestResolverForRow_nilDB_returnsFallback(t *testing.T) {
+	resolver := metadata.NewResolverFromTables(5, nil)
+	g := New(nil, resolver)
+	row := query.ResultRow{SchemaVersion: 99}
+	got := g.resolverForRow(row)
+	if got != resolver {
+		t.Error("expected fallback resolver when db is nil")
+	}
+}
+
+func TestResolverForRow_matchingFallback(t *testing.T) {
+	resolver := metadata.NewResolverFromTables(5, nil)
+	g := New(nil, resolver)
+	row := query.ResultRow{SchemaVersion: 5}
+	got := g.resolverForRow(row)
+	if got != resolver {
+		t.Error("expected fallback resolver when SchemaVersion matches")
+	}
+}
+
+func TestResolverForRow_cacheHit(t *testing.T) {
+	cachedResolver := metadata.NewResolverFromTables(42, map[string]*metadata.TableMeta{
+		"db.t": {Schema: "db", Table: "t", Columns: []metadata.ColumnMeta{{Name: "id", IsPK: true}}},
+	})
+	// db must be non-nil so resolverForRow doesn't short-circuit; the cache hit
+	// prevents any actual DB access.
+	g := New(new(sql.DB), nil)
+	g.cache = map[uint32]*metadata.Resolver{42: cachedResolver}
+	row := query.ResultRow{SchemaVersion: 42, SchemaName: "db", TableName: "t"}
+	got := g.resolverForRow(row)
+	if got != cachedResolver {
+		t.Error("expected cached resolver for SchemaVersion=42")
+	}
+}
+
+func TestGenerateSQLFromRows_differentSchemaVersions_differentPKs(t *testing.T) {
+	// Simulate a schema change: snapshot 10 has PK=id, snapshot 20 has PK=uuid.
+	// Rows with different SchemaVersion values should use different WHERE clauses.
+	resolver10 := metadata.NewResolverFromTables(10, map[string]*metadata.TableMeta{
+		"shop.orders": {Schema: "shop", Table: "orders", Columns: []metadata.ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true},
+			{Name: "status", OrdinalPosition: 2},
+		}},
+	})
+	resolver20 := metadata.NewResolverFromTables(20, map[string]*metadata.TableMeta{
+		"shop.orders": {Schema: "shop", Table: "orders", Columns: []metadata.ColumnMeta{
+			{Name: "uuid", OrdinalPosition: 1, IsPK: true},
+			{Name: "id", OrdinalPosition: 2},
+			{Name: "status", OrdinalPosition: 3},
+		}},
+	})
+
+	// db must be non-nil so resolverForRow doesn't short-circuit; the cache
+	// pre-population prevents any actual DB access.
+	g := New(new(sql.DB), resolver20)
+	g.cache = map[uint32]*metadata.Resolver{10: resolver10, 20: resolver20}
+
+	rows := []query.ResultRow{
+		{
+			EventID: 1, SchemaName: "shop", TableName: "orders",
+			EventType: parser.EventInsert, SchemaVersion: 10,
+			EventTimestamp: time.Now(),
+			RowAfter:       map[string]any{"id": float64(1), "status": "new"},
+		},
+		{
+			EventID: 2, SchemaName: "shop", TableName: "orders",
+			EventType: parser.EventInsert, SchemaVersion: 20,
+			EventTimestamp: time.Now(),
+			RowAfter:       map[string]any{"uuid": "abc-123", "id": float64(2), "status": "new"},
+		},
+	}
+
+	var buf bytes.Buffer
+	n, err := g.GenerateSQLFromRows(rows, &buf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected 2 statements, got %d", n)
+	}
+
+	output := buf.String()
+	// Row with SchemaVersion=10 → resolver10 (PK=id) → WHERE `id` = 1
+	if !strings.Contains(output, "WHERE `id` = 1") {
+		t.Errorf("expected WHERE `id` = 1 for SchemaVersion=10 row, got:\n%s", output)
+	}
+	// Row with SchemaVersion=20 → resolver20 (PK=uuid) → WHERE `uuid` = 'abc-123'
+	if !strings.Contains(output, "WHERE `uuid` = 'abc-123'") {
+		t.Errorf("expected WHERE `uuid` = 'abc-123' for SchemaVersion=20 row, got:\n%s", output)
 	}
 }
 
