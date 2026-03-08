@@ -14,7 +14,8 @@ Go version: 1.25.7 — uses `range N`, `min()`, `slices.Reverse`, `strings.Split
 ## Project structure
 
 ```
-cmd/bintrail/          # One file per command (init, snapshot, index, query, recover, rotate, status, stream, dump, baseline, upload, generate-key)
+cmd/bintrail/          # One file per command (init, snapshot, index, query, recover, rotate, status, stream, dump, baseline, upload, generate-key, config)
+                       # envload.go: env file loading (.bintrail.env / ~/.config/bintrail/config.env) + bindCommandEnv
                        # Test files: *_test.go (unit), *_integration_test.go (//go:build integration)
 cmd/bintrail-mcp/      # MCP server: main.go, proxy.py, tests
 internal/
@@ -24,7 +25,7 @@ internal/
   observe/             # slog setup + Prometheus metrics for stream
   parser/              # Binlog file parser + StreamParser (go-mysql-org/go-mysql)
   indexer/             # Batch writer to binlog_events
-  query/               # Query engine + result formatters (table/json/csv)
+  query/               # Query engine + result formatters (table/json/csv) + archive auto-discovery + merge + planner
   recovery/            # Reversal SQL generator
   status/              # Shared status types and display
   baseline/            # mydumper → Parquet converter
@@ -34,7 +35,7 @@ internal/
 e2e_test.go            # Full CLI pipeline E2E test (//go:build integration), built with go build -cover
 .mcp.json              # MCP server registration (go run ./cmd/bintrail-mcp)
 migrations/            # Reference DDL (tables created by `bintrail init`, not this file)
-docs/                  # guide.md, indexing.md, query-and-recovery.md, streaming.md, rotation-and-status.md, mcp-server.md, upload.md
+docs/                  # guide.md, indexing.md, query-and-recovery.md, streaming.md, rotation-and-status.md, mcp-server.md, upload.md, parquet-debugging.md, deployment.md, quickstart.md, dump-and-baseline.md, docker.md, server-identity.md, mcp-gateway.md
 ```
 
 ## Commands
@@ -48,8 +49,8 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `init` | `init.go` | `--index-dsn` (req), `--partitions` (default 48), `--encrypt`, `--s3-bucket`, `--s3-region`, `--s3-arn` |
 | `snapshot` | `snapshot.go` | `--source-dsn` (req), `--index-dsn` (req), `--schemas` |
 | `index` | `index.go` | `--index-dsn` (req), `--source-dsn`, `--binlog-dir` (req), `--files`, `--all`, `--batch-size`, `--schemas`, `--tables` |
-| `query` | `query.go` | `--index-dsn` (req), `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`, `--since`, `--until`, `--changed-column`, `--format` (table/json/csv), `--limit`, `--archive-dir`, `--archive-s3` |
-| `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000) |
+| `query` | `query.go` | `--index-dsn` (req), `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`, `--since`, `--until`, `--changed-column`, `--flag`, `--format` (table/json/csv), `--limit`, `--archive-dir`, `--archive-s3`, `--bintrail-id`, `--profile`, `--no-archive` |
+| `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000), `--profile`, `--no-archive` |
 | `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future`, `--archive-dir`, `--archive-compression` (default `zstd`) |
 | `status` | `status.go` | `--index-dsn` (req) |
 | `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint`, `--metrics-addr` |
@@ -57,8 +58,13 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression`, `--row-group-size`, `--upload`, `--upload-region`, `--encrypt`, `--encrypt-key` |
 | `generate-key` | `generate_key.go` | `--output` (default `~/.config/bintrail/dump.key`) |
 | `upload` | `upload.go` | `--source` (req), `--destination` (req), `--region`, `--retry`, `--index-dsn` |
+| `config init` | `config.go` | `--global` |
 
-Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`).
+Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`).
+
+### Environment file loading
+
+All commands load a `.bintrail.env` file (local) or `~/.config/bintrail/config.env` (global) on startup via `loadEnvFile()` in `envload.go`. Each command calls `bindCommandEnv(cmd)` in its `init()` to map `BINTRAIL_*` env vars to CLI flags. Precedence: CLI flag > environment variable > default value. The env file is loaded once (via `sync.Once`). `bintrail config init` generates a template env file with all available variables.
 
 ## MCP server
 
@@ -70,6 +76,9 @@ Key patterns:
 - **`jsonschema` tag**: use `jsonschema:"My description"` — NOT `jsonschema:"description=..."` (rejected by jsonschema-go v0.3+)
 - Integration tests use `mcp.NewInMemoryTransports()` (protocol version `"2025-06-18"`)
 - proxy.py: uses `# type: str` comments (not `str | None` — requires Python 3.10+, macOS ships 3.9)
+- **Archive auto-discovery**: `resolveArchiveSources(ctx, db)` checks `BINTRAIL_ARCHIVE_S3` + `BINTRAIL_ID` env vars first, then falls back to `query.ResolveArchiveSources(ctx, db)` (from `archive_state` table). Both `query` and `recover` tools merge results from live MySQL + Parquet archives.
+- **`no_archive` parameter**: Both `query` and `recover` MCP tools accept `no_archive` (bool) to disable archive auto-routing.
+- `recoverTool` calls `recovery.GenerateSQLFromRows(rows, w)` with pre-fetched+merged rows (not `GenerateSQL` which fetches internally).
 
 ## Database tables
 
@@ -93,6 +102,11 @@ Key patterns:
 - Single-row (id=1, `CHECK (id = 1)`) tracking replication position.
 - `mode`: `"position"` or `"gtid"`. In GTID mode, `gtid_set` is the full **accumulated** executed set.
 - `loadStreamState` returns `nil` for empty table — callers treat nil as "no checkpoint yet".
+
+### `archive_state`
+- Tracks which partitions have been archived to Parquet (local path + S3 location).
+- Used by `query.ResolveArchiveSources` for auto-discovery of archive sources.
+- Columns: `bintrail_id`, `partition_name`, `local_path`, `s3_bucket`, `s3_key`.
 
 ## Architecture: indexer pipeline
 
@@ -151,6 +165,19 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql`. Do not use `SEL
 - Never executes — only generates SQL (`--dry-run` to stdout, `--output` to file).
 - Events reversed with `slices.Reverse(rows)` — most-recent undone first.
 - `pkWhereClause` uses resolver PK columns; falls back to all-columns WHERE when resolver is nil.
+- Two entry points: `GenerateSQL(ctx, opts, w)` fetches events internally; `GenerateSQLFromRows(rows, w)` takes pre-fetched rows (used by CLI/MCP when merging live MySQL + archive results).
+
+### Archive auto-discovery and merge
+- `query.ResolveArchiveSources(ctx, db)` in `internal/query/archive.go` queries `archive_state` for distinct `bintrail_id` paths. Prefers local paths over S3 when the directory exists on disk.
+- `query.MergeResults(rows, limit)` in `internal/query/merge.go` deduplicates by `event_id` (MySQL wins), sorts by `(event_timestamp, event_id)`, applies limit.
+- `extractBasePath(path)` extracts up to and including `bintrail_id=<uuid>` from an archive file path.
+
+### Query planner
+- `query.Plan(ctx, db, dbName, since, until)` in `internal/query/planner.go` inspects live partition boundaries and `archive_state` to build a `QueryPlan`.
+- `QueryPlan.SkipMySQL()` returns true when the entire time range is covered by archives (no gaps).
+- `QueryPlan.GapHours` lists hours with no data (rotated but not archived); emitted as `slog.Warn` via `RunPlanAndWarn`.
+- `ParsePartitionName(name)` converts `"p_2026021914"` to UTC hour; returns false for `"p_future"` or malformed names.
+- `--no-archive` flag on `query`/`recover` skips archive auto-discovery entirely (MySQL-only results).
 
 ## Testing conventions
 

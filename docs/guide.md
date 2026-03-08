@@ -111,6 +111,17 @@ Before you start:
 
 Three commands to get running. Run them once on initial setup.
 
+**Optional — Generate a configuration file:**
+
+Instead of passing `--index-dsn` and `--source-dsn` on every command, you can create a `.bintrail.env` file:
+
+```sh
+bintrail config init
+# Edit .bintrail.env and set BINTRAIL_INDEX_DSN and BINTRAIL_SOURCE_DSN
+```
+
+All commands load this file automatically. CLI flags take precedence over env vars. Use `--global` to write to `~/.config/bintrail/config.env` instead.
+
 **Step 1 — Create index tables:**
 
 ```sh
@@ -522,7 +533,19 @@ bintrail rotate \
 
 `--retry` skips partitions whose local Parquet file already exists and S3 uploads that already succeeded (tracked in the `archive_state` table).
 
-**Query archived events** using `--archive-s3` on the `query` command. Provide `--bintrail-id` to scope the archive path to your server's UUID (shown in `bintrail status`):
+**Query archived events** — once you've archived partitions, `query` and `recover` automatically discover the archive locations from `archive_state`. No extra flags needed:
+
+```sh
+bintrail query \
+  --index-dsn   "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --schema      mydb \
+  --table       orders \
+  --since       "2026-01-01 00:00:00"
+```
+
+Results from the live MySQL index and from Parquet archives are merged, deduplicated, and sorted by timestamp before being returned. If a time range has been rotated out of MySQL but not archived, a coverage warning is emitted.
+
+You can also specify archive sources explicitly (skipping auto-discovery):
 
 ```sh
 bintrail query \
@@ -534,7 +557,7 @@ bintrail query \
   --bintrail-id abc123de-0000-0000-0000-000000000001
 ```
 
-Results from the live MySQL index and from Parquet archives are merged, deduplicated, and sorted by timestamp before being returned.
+To disable archive routing entirely and query only live MySQL data, use `--no-archive`.
 
 ---
 

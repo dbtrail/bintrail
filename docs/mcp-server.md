@@ -37,10 +37,12 @@ The MCP server is a thin wrapper around the same internal packages used by the C
 ```
 cmd/bintrail-mcp/main.go
        │
-       ├── queryTool  → internal/query.Engine.Run (same as query command)
-       ├── recoverTool → internal/recovery.Generator.GenerateSQL (same as recover command)
+       ├── queryTool  → resolveArchiveSources → Engine.Fetch + parquetquery.Fetch → MergeResults → Format
+       ├── recoverTool → resolveArchiveSources → Engine.Fetch + parquetquery.Fetch → MergeResults → GenerateSQLFromRows
        └── statusTool → internal/status.LoadIndexState + LoadPartitionStats + WriteStatus
 ```
+
+Both `queryTool` and `recoverTool` automatically discover Parquet archive sources from `archive_state` in the index database (or from `BINTRAIL_ARCHIVE_S3` + `BINTRAIL_ID` env vars). When archives are found, results from MySQL and Parquet are merged, deduplicated, and sorted before formatting or SQL generation. The `no_archive` parameter disables this auto-routing.
 
 `buildQueryOptions` in `cmd/bintrail-mcp/main.go` is the shared filter builder used by both `queryTool` and `recoverTool`. It calls the same `cliutil.ParseEventType` and `cliutil.ParseTime` helpers that the CLI uses:
 

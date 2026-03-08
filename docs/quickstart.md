@@ -20,6 +20,13 @@ Set a shorthand for your index DSN so you don't retype it:
 export IDX="root:secret@tcp(127.0.0.1:3306)/binlog_index"
 ```
 
+Or generate a `.bintrail.env` configuration file and set your DSN there — all commands load it automatically:
+
+```sh
+bintrail config init        # creates .bintrail.env in the current directory
+# Edit .bintrail.env and uncomment BINTRAIL_INDEX_DSN=...
+```
+
 ---
 
 ## Step 1 — Create the index tables
