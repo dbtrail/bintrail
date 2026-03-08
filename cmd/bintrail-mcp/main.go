@@ -220,6 +220,7 @@ type queryArgs struct {
 	Format        string `json:"format,omitempty" jsonschema:"Output format: json table or csv (default: json)"`
 	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of events to return (default: 100)"`
 	Profile       string `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
+	NoArchive     bool   `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
 }
 
 type recoverArgs struct {
@@ -235,6 +236,7 @@ type recoverArgs struct {
 	Flag          string `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
 	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of events to reverse (default: 1000)"`
 	Profile       string `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
+	NoArchive     bool   `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
 }
 
 type statusArgs struct {
@@ -286,10 +288,10 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 
 		engine := query.New(db)
 
-		// Skip archive auto-discovery when RBAC profile is active — archive
-		// queries do not enforce DenyTables/RedactColumns rules.
+		// Skip archive auto-discovery when --no-archive is set or when RBAC
+		// profile is active (archive queries do not enforce rules).
 		var archSources []string
-		if args.Profile == "" {
+		if !args.NoArchive && args.Profile == "" {
 			archSources = resolveArchiveSources(ctx, db)
 		}
 
@@ -369,11 +371,11 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 		}
 
 		// Fetch events from live index + archives.
-		// Skip archive auto-discovery when RBAC profile is active — archive
-		// queries do not enforce DenyTables/RedactColumns rules.
+		// Skip archive auto-discovery when --no-archive is set or when RBAC
+		// profile is active (archive queries do not enforce rules).
 		engine := query.New(db)
 		var archSources []string
-		if args.Profile == "" {
+		if !args.NoArchive && args.Profile == "" {
 			archSources = resolveArchiveSources(ctx, db)
 		}
 
