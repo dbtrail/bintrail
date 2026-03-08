@@ -30,7 +30,7 @@ Archive Parquet files contain 14 columns (the `pk_hash` stored generated column 
 | `gtid` | VARCHAR | GTID if available (nullable) |
 | `schema_name` | VARCHAR | Database name |
 | `table_name` | VARCHAR | Table name |
-| `event_type` | TINYINT | 0 = INSERT, 1 = UPDATE, 2 = DELETE |
+| `event_type` | TINYINT | 1 = INSERT, 2 = UPDATE, 3 = DELETE |
 | `pk_values` | VARCHAR | Pipe-delimited primary key values |
 | `changed_columns` | VARCHAR | JSON array of changed column names (nullable) |
 | `row_before` | VARCHAR | JSON object of the row before the event (nullable) |
@@ -240,7 +240,7 @@ ORDER BY hour;
 ```sql
 SELECT event_id, event_timestamp, pk_values, row_before
 FROM parquet_scan('/mnt/archives/**/*.parquet', hive_partitioning=true)
-WHERE event_type = 2  -- DELETE
+WHERE event_type = 3  -- DELETE
   AND schema_name = 'mydb'
   AND table_name = 'users'
 ORDER BY event_timestamp DESC
