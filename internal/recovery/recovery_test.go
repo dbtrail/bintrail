@@ -585,6 +585,40 @@ func TestGenerateSQLFromRows_reverseOrder(t *testing.T) {
 	}
 }
 
+// ─── resolverForRow ──────────────────────────────────────────────────────────
+
+func TestResolverForRow_zeroVersionReturnsFallback(t *testing.T) {
+	resolver := metadata.NewResolverFromTables(5, map[string]*metadata.TableMeta{
+		"db.t": {Schema: "db", Table: "t", Columns: []metadata.ColumnMeta{{Name: "id", IsPK: true}}},
+	})
+	g := New(nil, resolver)
+	row := query.ResultRow{SchemaVersion: 0, SchemaName: "db", TableName: "t"}
+	got := g.resolverForRow(row)
+	if got != resolver {
+		t.Error("expected fallback resolver for SchemaVersion=0")
+	}
+}
+
+func TestResolverForRow_nilDB_returnsFallback(t *testing.T) {
+	resolver := metadata.NewResolverFromTables(5, nil)
+	g := New(nil, resolver)
+	row := query.ResultRow{SchemaVersion: 99}
+	got := g.resolverForRow(row)
+	if got != resolver {
+		t.Error("expected fallback resolver when db is nil")
+	}
+}
+
+func TestResolverForRow_matchingFallback(t *testing.T) {
+	resolver := metadata.NewResolverFromTables(5, nil)
+	g := New(nil, resolver)
+	row := query.ResultRow{SchemaVersion: 5}
+	got := g.resolverForRow(row)
+	if got != resolver {
+		t.Error("expected fallback resolver when SchemaVersion matches")
+	}
+}
+
 func TestGenerateInsert_noResolver_includesAllColumns(t *testing.T) {
 	// Without a resolver, all columns (including any generated ones) are emitted —
 	// the generator has no way to know which are generated.

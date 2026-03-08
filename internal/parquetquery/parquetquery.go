@@ -105,7 +105,7 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, schema_name, table_name, event_type, pk_values," +
-		" changed_columns, row_before, row_after" +
+		" changed_columns, row_before, row_after, schema_version" +
 		" FROM parquet_scan('" + safeGlob + "')"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -137,11 +137,12 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 			changedCols    sql.NullString
 			rowBefore      sql.NullString
 			rowAfter       sql.NullString
+			schemaVersion  int32
 		)
 		if err := rows.Scan(
 			&eventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
 			&gtid, &schemaName, &tableName, &eventType, &pkValues,
-			&changedCols, &rowBefore, &rowAfter,
+			&changedCols, &rowBefore, &rowAfter, &schemaVersion,
 		); err != nil {
 			return nil, fmt.Errorf("scan parquet result: %w", err)
 		}
@@ -156,6 +157,7 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 			TableName:      tableName,
 			EventType:      parser.EventType(eventType),
 			PKValues:       pkValues,
+			SchemaVersion:  uint32(schemaVersion),
 		}
 		if gtid.Valid {
 			r.GTID = &gtid.String

@@ -24,13 +24,40 @@ import (
 // Generator produces reversal SQL from indexed binlog events.
 type Generator struct {
 	db       *sql.DB
-	resolver *metadata.Resolver // may be nil; triggers all-columns WHERE fallback
+	resolver *metadata.Resolver              // default resolver (latest snapshot); may be nil
+	cache    map[uint32]*metadata.Resolver   // per-snapshot resolvers, loaded lazily
 }
 
 // New creates a Generator. resolver may be nil — in that case, WHERE clauses
 // for UPDATE and DELETE reversals will use ALL row columns instead of just PKs.
 func New(db *sql.DB, resolver *metadata.Resolver) *Generator {
 	return &Generator{db: db, resolver: resolver}
+}
+
+// resolverForRow returns the resolver matching the row's schema version.
+// It loads resolvers lazily and caches them. Falls back to the default
+// resolver for SchemaVersion=0 (pre-migration data) or on load failure.
+func (g *Generator) resolverForRow(row query.ResultRow) *metadata.Resolver {
+	if row.SchemaVersion == 0 || g.db == nil {
+		return g.resolver
+	}
+	if g.resolver != nil && uint32(g.resolver.SnapshotID()) == row.SchemaVersion {
+		return g.resolver
+	}
+	if g.cache != nil {
+		if r, ok := g.cache[row.SchemaVersion]; ok {
+			return r
+		}
+	}
+	r, err := metadata.NewResolver(g.db, int(row.SchemaVersion))
+	if err != nil {
+		return g.resolver
+	}
+	if g.cache == nil {
+		g.cache = make(map[uint32]*metadata.Resolver)
+	}
+	g.cache[row.SchemaVersion] = r
+	return r
 }
 
 // GenerateSQL fetches events matching opts, reverses their order (most-recent
@@ -120,7 +147,8 @@ func (g *Generator) generateInsert(row query.ResultRow) (string, error) {
 	if row.RowBefore == nil {
 		return "", fmt.Errorf("row_before is nil for DELETE event (event_id=%d)", row.EventID)
 	}
-	genCols := g.generatedCols(row.SchemaName, row.TableName)
+	r := g.resolverForRow(row)
+	genCols := generatedColsFromResolver(r, row.SchemaName, row.TableName)
 	var colParts, valParts []string
 	for _, col := range sortedKeys(row.RowBefore) {
 		if genCols[col] {
@@ -147,7 +175,8 @@ func (g *Generator) generateUpdate(row query.ResultRow) (string, error) {
 	}
 
 	// SET clause: restore before-image values, skipping STORED/VIRTUAL generated columns.
-	genCols := g.generatedCols(row.SchemaName, row.TableName)
+	r := g.resolverForRow(row)
+	genCols := generatedColsFromResolver(r, row.SchemaName, row.TableName)
 	var setParts []string
 	for _, col := range sortedKeys(row.RowBefore) {
 		if genCols[col] {
@@ -158,7 +187,7 @@ func (g *Generator) generateUpdate(row query.ResultRow) (string, error) {
 
 	// WHERE uses row_after (current state), so the UPDATE finds the right row
 	// even if the PK itself was changed in the original UPDATE.
-	whereParts := g.pkWhereClause(row.SchemaName, row.TableName, row.RowAfter)
+	whereParts := pkWhereClauseFromResolver(r, row.SchemaName, row.TableName, row.RowAfter)
 
 	return fmt.Sprintf("UPDATE %s.%s SET %s WHERE %s",
 		quoteName(row.SchemaName), quoteName(row.TableName),
@@ -173,21 +202,22 @@ func (g *Generator) generateDelete(row query.ResultRow) (string, error) {
 	if row.RowAfter == nil {
 		return "", fmt.Errorf("row_after is nil for INSERT event (event_id=%d)", row.EventID)
 	}
-	whereParts := g.pkWhereClause(row.SchemaName, row.TableName, row.RowAfter)
+	r := g.resolverForRow(row)
+	whereParts := pkWhereClauseFromResolver(r, row.SchemaName, row.TableName, row.RowAfter)
 	return fmt.Sprintf("DELETE FROM %s.%s WHERE %s",
 		quoteName(row.SchemaName), quoteName(row.TableName),
 		strings.Join(whereParts, " AND "),
 	), nil
 }
 
-// generatedCols returns the set of STORED/VIRTUAL generated column names for a
-// table, using the resolver. Returns nil when the resolver is absent or the
-// table is not in the snapshot — callers treat nil as an empty set.
-func (g *Generator) generatedCols(schema, table string) map[string]bool {
-	if g.resolver == nil {
+// generatedColsFromResolver returns the set of STORED/VIRTUAL generated column
+// names for a table, using the provided resolver. Returns nil when the resolver
+// is absent or the table is not in the snapshot — callers treat nil as an empty set.
+func generatedColsFromResolver(resolver *metadata.Resolver, schema, table string) map[string]bool {
+	if resolver == nil {
 		return nil
 	}
-	tm, err := g.resolver.Resolve(schema, table)
+	tm, err := resolver.Resolve(schema, table)
 	if err != nil {
 		return nil
 	}
@@ -203,12 +233,12 @@ func (g *Generator) generatedCols(schema, table string) map[string]bool {
 	return gen
 }
 
-// pkWhereClause builds "pk_col = val AND ..." from the resolver snapshot.
+// pkWhereClauseFromResolver builds "pk_col = val AND ..." from the given resolver.
 // Falls back to ALL columns if the table cannot be resolved (e.g. table was
 // dropped, or no snapshot was loaded).
-func (g *Generator) pkWhereClause(schema, table string, row map[string]any) []string {
-	if g.resolver != nil {
-		if tm, err := g.resolver.Resolve(schema, table); err == nil {
+func pkWhereClauseFromResolver(resolver *metadata.Resolver, schema, table string, row map[string]any) []string {
+	if resolver != nil {
+		if tm, err := resolver.Resolve(schema, table); err == nil {
 			pkCols := tm.PKColumnMetas()
 			if len(pkCols) > 0 {
 				parts := make([]string, 0, len(pkCols))

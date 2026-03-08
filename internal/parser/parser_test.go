@@ -275,6 +275,47 @@ func TestParseDDL_caseInsensitive(t *testing.T) {
 	}
 }
 
+// ─── SwapResolver + schemaVersion ──────────────────────────────────────────────
+
+func TestParser_SwapResolver_updatesSchemaVersion(t *testing.T) {
+	r1 := metadata.NewResolverFromTables(5, nil)
+	p := New("/tmp", r1, Filters{}, nil)
+
+	if got := p.schemaVersion.Load(); got != 5 {
+		t.Fatalf("initial schemaVersion = %d, want 5", got)
+	}
+
+	r2 := metadata.NewResolverFromTables(12, nil)
+	p.SwapResolver(r2)
+
+	if got := p.schemaVersion.Load(); got != 12 {
+		t.Errorf("after SwapResolver schemaVersion = %d, want 12", got)
+	}
+}
+
+func TestStreamParser_SwapResolver_updatesSchemaVersion(t *testing.T) {
+	r1 := metadata.NewResolverFromTables(3, nil)
+	sp := NewStreamParser(r1, Filters{}, nil)
+
+	if got := sp.schemaVersion.Load(); got != 3 {
+		t.Fatalf("initial schemaVersion = %d, want 3", got)
+	}
+
+	r2 := metadata.NewResolverFromTables(7, nil)
+	sp.SwapResolver(r2)
+
+	if got := sp.schemaVersion.Load(); got != 7 {
+		t.Errorf("after SwapResolver schemaVersion = %d, want 7", got)
+	}
+}
+
+func TestParser_nilResolver_schemaVersionZero(t *testing.T) {
+	p := New("/tmp", nil, Filters{}, nil)
+	if got := p.schemaVersion.Load(); got != 0 {
+		t.Errorf("nil resolver schemaVersion = %d, want 0", got)
+	}
+}
+
 // ─── Timestamp UTC ────────────────────────────────────────────────────────────
 
 func TestTimestampUTC(t *testing.T) {
