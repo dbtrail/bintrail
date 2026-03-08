@@ -79,6 +79,7 @@ func init() {
 	queryCmd.Flags().StringVar(&qBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir or --archive-s3 is set)")
 	queryCmd.Flags().StringVar(&qProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	_ = queryCmd.MarkFlagRequired("index-dsn")
+	bindCommandEnv(queryCmd)
 
 	rootCmd.AddCommand(queryCmd)
 }

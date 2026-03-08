@@ -85,6 +85,7 @@ func init() {
 	rotateCmd.Flags().StringVar(&rotFormat, "format", "text", "Output format: text or json")
 	rotateCmd.Flags().BoolVar(&rotRetry, "retry", false, "Skip archiving partitions whose Parquet file already exists and S3 uploads that already succeeded")
 	_ = rotateCmd.MarkFlagRequired("index-dsn")
+	bindCommandEnv(rotateCmd)
 
 	rootCmd.AddCommand(rotateCmd)
 }
