@@ -33,8 +33,8 @@ func New(db *sql.DB, resolver *metadata.Resolver) *Generator {
 	return &Generator{db: db, resolver: resolver}
 }
 
-// GenerateSQL fetches events matching opts, reverses them in chronological
-// order, and writes a BEGIN/COMMIT-wrapped SQL script to w.
+// GenerateSQL fetches events matching opts, reverses their order (most-recent
+// first), and writes a BEGIN/COMMIT-wrapped SQL script to w.
 // Returns the number of SQL statements written (errors within a statement are
 // emitted as SQL comments rather than halting generation).
 func (g *Generator) GenerateSQL(ctx context.Context, opts query.Options, w io.Writer) (int, error) {
@@ -42,7 +42,14 @@ func (g *Generator) GenerateSQL(ctx context.Context, opts query.Options, w io.Wr
 	if err != nil {
 		return 0, fmt.Errorf("failed to fetch events: %w", err)
 	}
+	return g.GenerateSQLFromRows(rows, w)
+}
 
+// GenerateSQLFromRows generates reversal SQL from pre-fetched rows. Use this
+// when rows have already been fetched and merged from multiple sources (e.g.
+// live MySQL + Parquet archives). The rows are reversed so the most-recent
+// event is undone first.
+func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (int, error) {
 	if len(rows) == 0 {
 		fmt.Fprintln(w, "-- No events matched the specified criteria.")
 		return 0, nil
