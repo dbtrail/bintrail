@@ -13,6 +13,7 @@ import (
 	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
 	"github.com/bintrail/bintrail/internal/metadata"
+	"github.com/bintrail/bintrail/internal/parquetquery"
 	"github.com/bintrail/bintrail/internal/query"
 	"github.com/bintrail/bintrail/internal/recovery"
 )
@@ -149,6 +150,34 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		resolver = nil
 	}
 
+	// ── Fetch events (live + archives) ────────────────────────────────────────
+	engine := query.New(db)
+	archSources := query.ResolveArchiveSources(cmd.Context(), db)
+
+	var rows []query.ResultRow
+	if len(archSources) > 0 {
+		fetchOpts := opts
+		fetchOpts.Limit = 0
+		rows, err = engine.Fetch(cmd.Context(), fetchOpts)
+		if err != nil {
+			return err
+		}
+		for _, src := range archSources {
+			ar, err := parquetquery.Fetch(cmd.Context(), fetchOpts, src)
+			if err != nil {
+				slog.Warn("archive query failed, skipping", "source", src, "error", err)
+				continue
+			}
+			rows = append(rows, ar...)
+		}
+		rows = query.MergeResults(rows, opts.Limit)
+	} else {
+		rows, err = engine.Fetch(cmd.Context(), opts)
+		if err != nil {
+			return err
+		}
+	}
+
 	// ── Generate recovery SQL ─────────────────────────────────────────────────
 	gen := recovery.New(db, resolver)
 
@@ -156,7 +185,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		if rFormat == "json" {
 			// Capture SQL into a buffer for JSON output.
 			var buf bytes.Buffer
-			n, err := gen.GenerateSQL(cmd.Context(), opts, &buf)
+			n, err := gen.GenerateSQLFromRows(rows, &buf)
 			if err != nil {
 				return err
 			}
@@ -170,7 +199,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 			}{Statements: n, DryRun: true, SQL: buf.String()})
 		}
 
-		n, err := gen.GenerateSQL(cmd.Context(), opts, os.Stdout)
+		n, err := gen.GenerateSQLFromRows(rows, os.Stdout)
 		if err != nil {
 			return err
 		}
@@ -191,7 +220,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	defer f.Close()
 
 	bw := bufio.NewWriter(f)
-	n, err := gen.GenerateSQL(cmd.Context(), opts, bw)
+	n, err := gen.GenerateSQLFromRows(rows, bw)
 	if err != nil {
 		return err
 	}

@@ -1,12 +1,10 @@
 package main
 
 import (
-	"cmp"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
@@ -149,9 +147,15 @@ func runQuery(cmd *cobra.Command, args []string) error {
 
 	engine := query.New(db)
 
+	// Determine archive sources: explicit flags take precedence; otherwise auto-discover.
+	archSources := archiveSources()
+	if len(archSources) == 0 && qArchiveDir == "" && qArchiveS3 == "" {
+		archSources = query.ResolveArchiveSources(cmd.Context(), db)
+	}
+
 	// When no archive sources are configured, take the fast path (fetch + format
 	// in one step, same as before this feature was added).
-	if qArchiveDir == "" && qArchiveS3 == "" {
+	if len(archSources) == 0 {
 		n, err := engine.Run(cmd.Context(), opts, qFormat, os.Stdout)
 		if err != nil {
 			return err
@@ -178,7 +182,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	for _, src := range archiveSources() {
+	for _, src := range archSources {
 		ar, err := parquetquery.Fetch(cmd.Context(), fetchOpts, src)
 		if err != nil {
 			slog.Warn("archive query failed, skipping", "source", src, "error", err)
@@ -187,7 +191,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		results = append(results, ar...)
 	}
 
-	results = mergeResults(results, opts.Limit)
+	results = query.MergeResults(results, opts.Limit)
 
 	n, err := query.Format(results, qFormat, os.Stdout)
 	if err != nil {
@@ -219,26 +223,3 @@ func archiveSources() []string {
 	return sources
 }
 
-// mergeResults deduplicates rows by event_id, sorts by (event_timestamp, event_id),
-// and applies the limit. MySQL rows are always processed first, so in the rare case
-// of a duplicate event_id the index version is kept.
-func mergeResults(rows []query.ResultRow, limit int) []query.ResultRow {
-	seen := make(map[uint64]struct{}, len(rows))
-	unique := rows[:0]
-	for _, r := range rows {
-		if _, dup := seen[r.EventID]; !dup {
-			seen[r.EventID] = struct{}{}
-			unique = append(unique, r)
-		}
-	}
-	slices.SortFunc(unique, func(a, b query.ResultRow) int {
-		if c := a.EventTimestamp.Compare(b.EventTimestamp); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.EventID, b.EventID)
-	})
-	if limit > 0 && len(unique) > limit {
-		unique = unique[:limit]
-	}
-	return unique
-}

@@ -42,7 +42,14 @@ func (g *Generator) GenerateSQL(ctx context.Context, opts query.Options, w io.Wr
 	if err != nil {
 		return 0, fmt.Errorf("failed to fetch events: %w", err)
 	}
+	return g.GenerateSQLFromRows(rows, w)
+}
 
+// GenerateSQLFromRows generates reversal SQL from pre-fetched rows. Use this
+// when rows have already been fetched and merged from multiple sources (e.g.
+// live MySQL + Parquet archives). The rows are reversed so the most-recent
+// event is undone first.
+func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (int, error) {
 	if len(rows) == 0 {
 		fmt.Fprintln(w, "-- No events matched the specified criteria.")
 		return 0, nil

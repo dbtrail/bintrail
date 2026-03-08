@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -41,6 +42,7 @@ import (
 	"github.com/bintrail/bintrail/internal/cliutil"
 	"github.com/bintrail/bintrail/internal/config"
 	"github.com/bintrail/bintrail/internal/metadata"
+	"github.com/bintrail/bintrail/internal/parquetquery"
 	"github.com/bintrail/bintrail/internal/query"
 	"github.com/bintrail/bintrail/internal/recovery"
 	"github.com/bintrail/bintrail/internal/status"
@@ -282,11 +284,39 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 			return errorResult(fmt.Errorf("invalid format %q; must be json, table, or csv", format)), nil, nil
 		}
 
-		var buf bytes.Buffer
 		engine := query.New(db)
-		n, err := engine.Run(ctx, opts, format, &buf)
-		if err != nil {
-			return errorResult(err), nil, nil
+		archSources := resolveArchiveSources(ctx, db)
+
+		var buf bytes.Buffer
+		var n int
+
+		if len(archSources) == 0 {
+			// Fast path: no archives, fetch and format in one step.
+			n, err = engine.Run(ctx, opts, format, &buf)
+			if err != nil {
+				return errorResult(err), nil, nil
+			}
+		} else {
+			// Fetch from live index + archives, merge, then format.
+			fetchOpts := opts
+			fetchOpts.Limit = 0
+			results, err := engine.Fetch(ctx, fetchOpts)
+			if err != nil {
+				return errorResult(err), nil, nil
+			}
+			for _, src := range archSources {
+				ar, err := parquetquery.Fetch(ctx, fetchOpts, src)
+				if err != nil {
+					slog.Warn("archive query failed, skipping", "source", src, "error", err)
+					continue
+				}
+				results = append(results, ar...)
+			}
+			results = query.MergeResults(results, opts.Limit)
+			n, err = query.Format(results, format, &buf)
+			if err != nil {
+				return errorResult(err), nil, nil
+			}
 		}
 
 		text := buf.String()
@@ -332,9 +362,37 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 			resolver = nil
 		}
 
+		// Fetch events from live index + archives.
+		engine := query.New(db)
+		archSources := resolveArchiveSources(ctx, db)
+
+		var rows []query.ResultRow
+		if len(archSources) > 0 {
+			fetchOpts := opts
+			fetchOpts.Limit = 0
+			rows, err = engine.Fetch(ctx, fetchOpts)
+			if err != nil {
+				return errorResult(err), nil, nil
+			}
+			for _, src := range archSources {
+				ar, err := parquetquery.Fetch(ctx, fetchOpts, src)
+				if err != nil {
+					slog.Warn("archive query failed, skipping", "source", src, "error", err)
+					continue
+				}
+				rows = append(rows, ar...)
+			}
+			rows = query.MergeResults(rows, opts.Limit)
+		} else {
+			rows, err = engine.Fetch(ctx, opts)
+			if err != nil {
+				return errorResult(err), nil, nil
+			}
+		}
+
 		gen := recovery.New(db, resolver)
 		var buf bytes.Buffer
-		n, err := gen.GenerateSQL(ctx, opts, &buf)
+		n, err := gen.GenerateSQLFromRows(rows, &buf)
 		if err != nil {
 			return errorResult(err), nil, nil
 		}
@@ -413,6 +471,21 @@ func errorResult(err error) *mcp.CallToolResult {
 		},
 		IsError: true,
 	}
+}
+
+// resolveArchiveSources returns Parquet archive source paths for use with
+// parquetquery.Fetch. It checks env vars BINTRAIL_ARCHIVE_S3 + BINTRAIL_ID
+// first (for explicit configuration), then falls back to auto-discovery from
+// archive_state in the index database.
+func resolveArchiveSources(ctx context.Context, db *sql.DB) []string {
+	archiveS3 := os.Getenv("BINTRAIL_ARCHIVE_S3")
+	bintrailID := os.Getenv("BINTRAIL_ID")
+	if archiveS3 != "" && bintrailID != "" {
+		base := strings.TrimSuffix(archiveS3, "/") + "/bintrail_id=" + bintrailID
+		return []string{base}
+	}
+
+	return query.ResolveArchiveSources(ctx, db)
 }
 
 func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol, flagVal string, limit, defaultLimit int) (query.Options, error) {

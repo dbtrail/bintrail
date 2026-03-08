@@ -208,3 +208,57 @@ func TestErrorResult(t *testing.T) {
 		t.Errorf("expected text %q, got %q", "broke", tc.Text)
 	}
 }
+
+// ─── resolveArchiveSources ──────────────────────────────────────────────────
+
+func TestResolveArchiveSources_envVars(t *testing.T) {
+	t.Setenv("BINTRAIL_ARCHIVE_S3", "s3://my-bucket/archives/")
+	t.Setenv("BINTRAIL_ID", "97adaf56-fe9e-4c1b-9794-b042f7faf197")
+
+	// resolveArchiveSources should use env vars without touching the DB.
+	// Passing nil as db is safe because the env var path returns early.
+	sources := resolveArchiveSources(t.Context(), nil)
+	if len(sources) != 1 {
+		t.Fatalf("expected 1 source, got %d", len(sources))
+	}
+	want := "s3://my-bucket/archives/bintrail_id=97adaf56-fe9e-4c1b-9794-b042f7faf197"
+	if sources[0] != want {
+		t.Errorf("expected %q, got %q", want, sources[0])
+	}
+}
+
+func TestResolveArchiveSources_envVarsTrailingSlash(t *testing.T) {
+	t.Setenv("BINTRAIL_ARCHIVE_S3", "s3://bucket/prefix")
+	t.Setenv("BINTRAIL_ID", "abc-123")
+
+	sources := resolveArchiveSources(t.Context(), nil)
+	if len(sources) != 1 {
+		t.Fatalf("expected 1 source, got %d", len(sources))
+	}
+	want := "s3://bucket/prefix/bintrail_id=abc-123"
+	if sources[0] != want {
+		t.Errorf("expected %q, got %q", want, sources[0])
+	}
+}
+
+func TestResolveArchiveSources_noEnvNoDBReturnsNil(t *testing.T) {
+	t.Setenv("BINTRAIL_ARCHIVE_S3", "")
+	t.Setenv("BINTRAIL_ID", "")
+
+	// With no env vars and a nil DB, should return nil (no archives).
+	sources := resolveArchiveSources(t.Context(), nil)
+	if len(sources) != 0 {
+		t.Errorf("expected 0 sources, got %d", len(sources))
+	}
+}
+
+func TestResolveArchiveSources_partialEnvVarsIgnored(t *testing.T) {
+	// Only one env var set — should fall through to DB auto-discovery.
+	t.Setenv("BINTRAIL_ARCHIVE_S3", "s3://bucket/prefix")
+	t.Setenv("BINTRAIL_ID", "")
+
+	sources := resolveArchiveSources(t.Context(), nil)
+	if len(sources) != 0 {
+		t.Errorf("expected 0 sources with partial env vars, got %d", len(sources))
+	}
+}
