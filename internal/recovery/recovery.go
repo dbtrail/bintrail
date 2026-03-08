@@ -33,8 +33,8 @@ func New(db *sql.DB, resolver *metadata.Resolver) *Generator {
 	return &Generator{db: db, resolver: resolver}
 }
 
-// GenerateSQL fetches events matching opts, reverses them in chronological
-// order, and writes a BEGIN/COMMIT-wrapped SQL script to w.
+// GenerateSQL fetches events matching opts, reverses their order (most-recent
+// first), and writes a BEGIN/COMMIT-wrapped SQL script to w.
 // Returns the number of SQL statements written (errors within a statement are
 // emitted as SQL comments rather than halting generation).
 func (g *Generator) GenerateSQL(ctx context.Context, opts query.Options, w io.Writer) (int, error) {

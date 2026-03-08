@@ -13,7 +13,8 @@ import (
 // (local directory or S3 URL) that can be passed to parquetquery.Fetch.
 //
 // Local paths are preferred over S3 when the directory exists on disk.
-// Returns nil when no archives are configured or the table does not exist.
+// Returns nil when no archives are configured, the table does not exist, or
+// db is nil.
 func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 	if db == nil {
 		return nil
@@ -27,8 +28,9 @@ func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 		WHERE bintrail_id IS NOT NULL
 		GROUP BY bintrail_id`)
 	if err != nil {
-		// archive_state may not exist in older indexes.
-		slog.Debug("could not query archive_state", "error", err)
+		// archive_state may not exist in older indexes (table-not-found is
+		// expected). Other errors (permission denied, timeout) are unexpected.
+		slog.Warn("could not query archive_state", "error", err)
 		return nil
 	}
 	defer rows.Close()
@@ -38,7 +40,7 @@ func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 		var bintrailID string
 		var localPath, s3Bucket, s3Key sql.NullString
 		if err := rows.Scan(&bintrailID, &localPath, &s3Bucket, &s3Key); err != nil {
-			slog.Debug("could not scan archive_state row", "error", err)
+			slog.Warn("could not scan archive_state row", "error", err)
 			continue
 		}
 
@@ -62,7 +64,7 @@ func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		slog.Debug("archive_state iteration error", "error", err)
+		slog.Warn("archive_state iteration error", "error", err)
 	}
 
 	return sources

@@ -530,6 +530,61 @@ func TestGenerateUpdate_skipsGeneratedColumns(t *testing.T) {
 	}
 }
 
+// ─── GenerateSQLFromRows ──────────────────────────────────────────────────────
+
+func TestGenerateSQLFromRows_empty(t *testing.T) {
+	g := newGen()
+	var buf bytes.Buffer
+	n, err := g.GenerateSQLFromRows(nil, &buf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 statements, got %d", n)
+	}
+	assertSQL(t, buf.String(), "No events matched")
+}
+
+func TestGenerateSQLFromRows_reverseOrder(t *testing.T) {
+	g := newGen()
+	rows := []query.ResultRow{
+		{
+			EventID: 1, SchemaName: "db", TableName: "t", EventType: parser.EventDelete,
+			PKValues:  "10",
+			RowBefore: map[string]any{"id": float64(10), "name": "first"},
+		},
+		{
+			EventID: 2, SchemaName: "db", TableName: "t", EventType: parser.EventInsert,
+			PKValues: "20",
+			RowAfter: map[string]any{"id": float64(20), "name": "second"},
+		},
+	}
+
+	var buf bytes.Buffer
+	n, err := g.GenerateSQLFromRows(rows, &buf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expected 2 statements, got %d", n)
+	}
+
+	out := buf.String()
+	assertSQL(t, out, "BEGIN;")
+	assertSQL(t, out, "COMMIT;")
+
+	// Event 2 (INSERT → DELETE) should appear before event 1 (DELETE → INSERT)
+	// because GenerateSQLFromRows reverses the input order.
+	deletePos := strings.Index(out, "DELETE FROM")
+	insertPos := strings.Index(out, "INSERT INTO")
+	if deletePos < 0 || insertPos < 0 {
+		t.Fatalf("expected both DELETE and INSERT in output:\n%s", out)
+	}
+	if deletePos > insertPos {
+		t.Errorf("expected reversed order (event 2 before event 1):\n%s", out)
+	}
+}
+
 func TestGenerateInsert_noResolver_includesAllColumns(t *testing.T) {
 	// Without a resolver, all columns (including any generated ones) are emitted —
 	// the generator has no way to know which are generated.

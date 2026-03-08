@@ -486,14 +486,18 @@ func errorResult(err error) *mcp.CallToolResult {
 
 // resolveArchiveSources returns Parquet archive source paths for use with
 // parquetquery.Fetch. It checks env vars BINTRAIL_ARCHIVE_S3 + BINTRAIL_ID
-// first (for explicit configuration), then falls back to auto-discovery from
-// archive_state in the index database.
+// first (for explicit configuration — both must be set), then falls back to
+// auto-discovery from archive_state in the index database.
 func resolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 	archiveS3 := os.Getenv("BINTRAIL_ARCHIVE_S3")
 	bintrailID := os.Getenv("BINTRAIL_ID")
 	if archiveS3 != "" && bintrailID != "" {
 		base := strings.TrimSuffix(archiveS3, "/") + "/bintrail_id=" + bintrailID
 		return []string{base}
+	}
+	if archiveS3 != "" || bintrailID != "" {
+		slog.Warn("partial archive env var config; both BINTRAIL_ARCHIVE_S3 and BINTRAIL_ID must be set",
+			"BINTRAIL_ARCHIVE_S3", archiveS3, "BINTRAIL_ID", bintrailID)
 	}
 
 	return query.ResolveArchiveSources(ctx, db)
