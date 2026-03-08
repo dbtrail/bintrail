@@ -17,14 +17,13 @@ type TimeRange struct {
 
 // QueryPlan describes how to route a query across live MySQL partitions and
 // Parquet archives. It is produced by Plan().
+//
+// A nil plan means the planner could not run (no time range, nil DB, etc.)
+// and callers should fall back to the default unoptimised path.
 type QueryPlan struct {
 	// MySQLRanges are time ranges that should be queried against live MySQL.
 	// Empty when the entire range is covered by archives.
 	MySQLRanges []TimeRange
-
-	// ArchiveSources are the Parquet archive source paths to query.
-	// Empty when the entire range is covered by live partitions.
-	ArchiveSources []string
 
 	// GapHours are hours where data has been rotated out of MySQL and no
 	// archive exists. Callers should emit a warning for these.
@@ -35,6 +34,8 @@ type QueryPlan struct {
 // boundaries and archive_state coverage. When since or until is nil, that bound
 // is left open (no routing optimisation is applied for the open side).
 //
+// Returns (nil, nil) when planning is not applicable (nil DB, no time range).
+// Returns (nil, error) when planning fails due to a database error.
 // dbName is the MySQL database name (needed for information_schema queries).
 func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Time) (*QueryPlan, error) {
 	if db == nil || dbName == "" {
@@ -59,17 +60,24 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 	// Load live partition boundaries.
 	liveHours, err := loadLivePartitionHours(ctx, db, dbName)
 	if err != nil {
-		slog.Warn("could not load partition info for planning", "error", err)
-		return nil, nil
+		return nil, fmt.Errorf("load partition info for planning: %w", err)
 	}
 
-	// Load archived partition names.
+	// Load archived partition names. Failure is non-fatal: archive_state may
+	// not exist in older indexes. Gap detection still works from live partitions.
 	archivedHours, err := loadArchivedHours(ctx, db)
 	if err != nil {
-		slog.Warn("could not load archive coverage for planning", "error", err)
-		return nil, nil
+		slog.Debug("archive_state not available for planning", "error", err)
+		archivedHours = nil
 	}
 
+	return buildPlan(liveHours, archivedHours, rangeStart, rangeEnd), nil
+}
+
+// buildPlan is the pure-logic core of the planner. It classifies each hour in
+// [rangeStart, rangeEnd) as live, archived, or gap, then builds a QueryPlan.
+// This function is extracted from Plan() for testability.
+func buildPlan(liveHours, archivedHours []time.Time, rangeStart, rangeEnd time.Time) *QueryPlan {
 	// Build sets for fast lookup.
 	liveSet := make(map[time.Time]bool, len(liveHours))
 	for _, h := range liveHours {
@@ -80,26 +88,22 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 		archiveSet[h] = true
 	}
 
-	// If we don't have a bounded range on both sides, we can still detect
-	// gaps within the bounded portion, but we need at least one bound to
-	// enumerate hours. For a fully open range, return empty plan (no routing).
+	// If we don't have a bounded range on both sides, infer the missing end.
 	if rangeStart.IsZero() && rangeEnd.IsZero() {
-		return nil, nil
+		return nil
 	}
 
-	// For a half-open range, use live partition boundaries to infer the other end.
+	// For a half-open range, use live/archive partition boundaries to infer the other end.
 	if rangeStart.IsZero() {
-		// Use the earliest live partition as the start.
 		if len(liveHours) > 0 {
 			rangeStart = liveHours[0]
 		} else if len(archivedHours) > 0 {
 			rangeStart = archivedHours[0]
 		} else {
-			return nil, nil
+			return nil
 		}
 	}
 	if rangeEnd.IsZero() {
-		// Use the latest live partition + 1h as the end.
 		if len(liveHours) > 0 {
 			rangeEnd = liveHours[len(liveHours)-1].Add(time.Hour)
 		} else {
@@ -129,7 +133,7 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 		plan.MySQLRanges = buildContiguousRanges(liveHours, rangeStart, rangeEnd)
 	}
 
-	return plan, nil
+	return plan
 }
 
 // FormatGapWarning returns a human-readable warning string for gap hours,
@@ -151,6 +155,26 @@ func FormatGapWarning(gaps []time.Time) string {
 // could not run), ensuring MySQL is always queried when routing is uncertain.
 func (p *QueryPlan) SkipMySQL() bool {
 	return p != nil && len(p.MySQLRanges) == 0 && len(p.GapHours) == 0
+}
+
+// RunPlanAndWarn runs the planner for the given DSN and time range, emitting a
+// slog.Warn for any coverage gaps. This is the shared entry point used by
+// both the query and recover commands. Returns nil when planning is not
+// applicable or fails (callers should fall back to the default path).
+//
+// parseDSN is a function that extracts the database name from the DSN.
+func RunPlanAndWarn(ctx context.Context, db *sql.DB, dbName string, since, until *time.Time) *QueryPlan {
+	plan, err := Plan(ctx, db, dbName, since, until)
+	if err != nil {
+		slog.Warn("query planner failed; coverage gaps may not be detected", "error", err)
+		return nil
+	}
+	if plan != nil {
+		if warn := FormatGapWarning(plan.GapHours); warn != "" {
+			slog.Warn(warn)
+		}
+	}
+	return plan
 }
 
 // buildContiguousRanges collapses sorted hours into contiguous TimeRanges,

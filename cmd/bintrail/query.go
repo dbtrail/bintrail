@@ -167,26 +167,13 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Coverage warnings and per-partition routing ───────────────────────────
-	// When archive sources are available, use the planner to detect gaps and
-	// optimise routing. The planner needs the DB name from the DSN.
 	var plan *query.QueryPlan
-	if len(archSources) > 0 {
+	if !qNoArchive && (len(archSources) > 0 || since != nil || until != nil) {
 		cfg, parseErr := mysqldriver.ParseDSN(qIndexDSN)
-		if parseErr == nil && cfg.DBName != "" {
-			plan, _ = query.Plan(cmd.Context(), db, cfg.DBName, since, until)
-		}
-	}
-	// Also run the planner for coverage warnings even when archives are disabled,
-	// as long as we have a time range to check.
-	if plan == nil && (since != nil || until != nil) && !qNoArchive {
-		cfg, parseErr := mysqldriver.ParseDSN(qIndexDSN)
-		if parseErr == nil && cfg.DBName != "" {
-			plan, _ = query.Plan(cmd.Context(), db, cfg.DBName, since, until)
-		}
-	}
-	if plan != nil {
-		if warn := query.FormatGapWarning(plan.GapHours); warn != "" {
-			slog.Warn(warn)
+		if parseErr != nil {
+			slog.Warn("could not parse DSN for query planning", "error", parseErr)
+		} else if cfg.DBName != "" {
+			plan = query.RunPlanAndWarn(cmd.Context(), db, cfg.DBName, since, until)
 		}
 	}
 

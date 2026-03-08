@@ -71,6 +71,17 @@ func TestBuildContiguousRanges_filtersOutOfRange(t *testing.T) {
 	}
 }
 
+func TestBuildContiguousRanges_singleHour(t *testing.T) {
+	h := time.Date(2026, 1, 5, 10, 0, 0, 0, time.UTC)
+	ranges := buildContiguousRanges([]time.Time{h}, h, h.Add(time.Hour))
+	if len(ranges) != 1 {
+		t.Fatalf("expected 1 range, got %d", len(ranges))
+	}
+	if !ranges[0].Start.Equal(h) || !ranges[0].End.Equal(h.Add(time.Hour)) {
+		t.Errorf("range = %v – %v, want single hour", ranges[0].Start, ranges[0].End)
+	}
+}
+
 func TestBuildContiguousRanges_empty(t *testing.T) {
 	start := time.Date(2026, 1, 5, 10, 0, 0, 0, time.UTC)
 	end := start.Add(time.Hour)
@@ -162,5 +173,131 @@ func TestPlan_noTimeRange(t *testing.T) {
 	}
 	if p != nil {
 		t.Errorf("expected nil plan for no time range, got %+v", p)
+	}
+}
+
+// ─── buildPlan tests (core routing logic) ─────────────────────────────────────
+
+func h(day, hour int) time.Time {
+	return time.Date(2026, 1, day, hour, 0, 0, 0, time.UTC)
+}
+
+func TestBuildPlan_allLiveNoneArchived(t *testing.T) {
+	live := []time.Time{h(5, 10), h(5, 11), h(5, 12)}
+	plan := buildPlan(live, nil, h(5, 10), h(5, 13))
+
+	if plan == nil {
+		t.Fatal("expected non-nil plan")
+	}
+	if plan.SkipMySQL() {
+		t.Error("should not skip MySQL when all hours are live")
+	}
+	if len(plan.GapHours) != 0 {
+		t.Errorf("expected no gaps, got %d", len(plan.GapHours))
+	}
+	if len(plan.MySQLRanges) != 1 {
+		t.Fatalf("expected 1 MySQL range, got %d", len(plan.MySQLRanges))
+	}
+}
+
+func TestBuildPlan_allArchivedNoneLive(t *testing.T) {
+	archived := []time.Time{h(5, 10), h(5, 11), h(5, 12)}
+	plan := buildPlan(nil, archived, h(5, 10), h(5, 13))
+
+	if plan == nil {
+		t.Fatal("expected non-nil plan")
+	}
+	if !plan.SkipMySQL() {
+		t.Error("should skip MySQL when all hours are archived")
+	}
+	if len(plan.GapHours) != 0 {
+		t.Errorf("expected no gaps, got %d", len(plan.GapHours))
+	}
+	if len(plan.MySQLRanges) != 0 {
+		t.Errorf("expected no MySQL ranges, got %d", len(plan.MySQLRanges))
+	}
+}
+
+func TestBuildPlan_mixedLiveAndArchived(t *testing.T) {
+	live := []time.Time{h(5, 12), h(5, 13)}
+	archived := []time.Time{h(5, 10), h(5, 11)}
+	plan := buildPlan(live, archived, h(5, 10), h(5, 14))
+
+	if plan == nil {
+		t.Fatal("expected non-nil plan")
+	}
+	if plan.SkipMySQL() {
+		t.Error("should not skip MySQL in mixed scenario")
+	}
+	if len(plan.GapHours) != 0 {
+		t.Errorf("expected no gaps, got %d", len(plan.GapHours))
+	}
+	if len(plan.MySQLRanges) != 1 {
+		t.Fatalf("expected 1 MySQL range, got %d", len(plan.MySQLRanges))
+	}
+	if !plan.MySQLRanges[0].Start.Equal(h(5, 12)) || !plan.MySQLRanges[0].End.Equal(h(5, 14)) {
+		t.Errorf("MySQL range = %v – %v, want 12:00 – 14:00",
+			plan.MySQLRanges[0].Start, plan.MySQLRanges[0].End)
+	}
+}
+
+func TestBuildPlan_withGaps(t *testing.T) {
+	live := []time.Time{h(5, 10)}
+	archived := []time.Time{h(5, 13)}
+	// Range 10-14, live at 10, gap at 11-12, archived at 13
+	plan := buildPlan(live, archived, h(5, 10), h(5, 14))
+
+	if plan == nil {
+		t.Fatal("expected non-nil plan")
+	}
+	if plan.SkipMySQL() {
+		t.Error("should not skip MySQL when there are gaps")
+	}
+	if len(plan.GapHours) != 2 {
+		t.Fatalf("expected 2 gap hours, got %d: %v", len(plan.GapHours), plan.GapHours)
+	}
+	if !plan.GapHours[0].Equal(h(5, 11)) || !plan.GapHours[1].Equal(h(5, 12)) {
+		t.Errorf("gaps = %v, want [11:00, 12:00]", plan.GapHours)
+	}
+}
+
+func TestBuildPlan_overlappingLiveAndArchived(t *testing.T) {
+	// An hour exists in both live and archive — should not be a gap.
+	live := []time.Time{h(5, 10), h(5, 11)}
+	archived := []time.Time{h(5, 10), h(5, 11)}
+	plan := buildPlan(live, archived, h(5, 10), h(5, 12))
+
+	if plan == nil {
+		t.Fatal("expected non-nil plan")
+	}
+	if len(plan.GapHours) != 0 {
+		t.Errorf("expected no gaps for overlapping hours, got %d", len(plan.GapHours))
+	}
+	// MySQL is still needed because hours are live.
+	if plan.SkipMySQL() {
+		t.Error("should not skip MySQL when live hours exist")
+	}
+}
+
+func TestBuildPlan_allGaps(t *testing.T) {
+	// No live, no archived — everything is a gap.
+	plan := buildPlan(nil, nil, h(5, 10), h(5, 13))
+
+	if plan == nil {
+		t.Fatal("expected non-nil plan")
+	}
+	if len(plan.GapHours) != 3 {
+		t.Fatalf("expected 3 gap hours, got %d", len(plan.GapHours))
+	}
+	// SkipMySQL should be false because there are gaps.
+	if plan.SkipMySQL() {
+		t.Error("should not skip MySQL when there are gaps")
+	}
+}
+
+func TestBuildPlan_noBoundsReturnsNil(t *testing.T) {
+	plan := buildPlan(nil, nil, time.Time{}, time.Time{})
+	if plan != nil {
+		t.Errorf("expected nil for zero-value bounds, got %+v", plan)
 	}
 }
