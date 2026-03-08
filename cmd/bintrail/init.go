@@ -47,6 +47,7 @@ func init() {
 	initCmd.Flags().StringVar(&initS3ARN, "s3-arn", "", "ARN of an existing S3 bucket to use for archiving (optional; mutually exclusive with --s3-bucket)")
 	initCmd.Flags().StringVar(&initFormat, "format", "text", "Output format: text or json")
 	_ = initCmd.MarkFlagRequired("index-dsn")
+	bindCommandEnv(initCmd)
 
 	rootCmd.AddCommand(initCmd)
 }

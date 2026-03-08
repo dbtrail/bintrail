@@ -34,6 +34,7 @@ var (
 func init() {
 	accessCmd.PersistentFlags().StringVar(&aclIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	_ = accessCmd.MarkPersistentFlagRequired("index-dsn")
+	bindCommandEnv(accessCmd)
 
 	accessCmd.AddCommand(accessAddCmd, accessRemoveCmd, accessListCmd)
 	rootCmd.AddCommand(accessCmd)

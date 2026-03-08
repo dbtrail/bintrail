@@ -68,6 +68,7 @@ func init() {
 	baselineCmd.Flags().StringVar(&bslEncryptKey, "encrypt-key", "", "Path to encryption key file (default: ~/.config/bintrail/dump.key)")
 	_ = baselineCmd.MarkFlagRequired("input")
 	_ = baselineCmd.MarkFlagRequired("output")
+	bindCommandEnv(baselineCmd)
 
 	rootCmd.AddCommand(baselineCmd)
 }

@@ -81,6 +81,7 @@ func init() {
 	reconstructCmd.Flags().BoolVar(&recHistory, "history", false, "Return all intermediate states (one entry per binlog event) instead of just the final state")
 	reconstructCmd.Flags().StringVar(&recSQL, "sql", "", "Execute arbitrary DuckDB SQL and print results (bypasses --schema/table/pk/at; --baseline-dir/s3 only controls whether the httpfs extension is loaded for S3 access)")
 	reconstructCmd.Flags().StringVar(&recFormat, "format", "json", "Output format: json, table, or csv")
+	bindCommandEnv(reconstructCmd)
 
 	rootCmd.AddCommand(reconstructCmd)
 }

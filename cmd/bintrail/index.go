@@ -57,6 +57,7 @@ func init() {
 	indexCmd.Flags().StringVar(&idxFormat, "format", "text", "Output format: text or json")
 	_ = indexCmd.MarkFlagRequired("index-dsn")
 	_ = indexCmd.MarkFlagRequired("binlog-dir")
+	bindCommandEnv(indexCmd)
 
 	rootCmd.AddCommand(indexCmd)
 }

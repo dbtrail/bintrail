@@ -40,6 +40,7 @@ func init() {
 	snapshotCmd.Flags().StringVar(&snapshotFormat, "format", "text", "Output format: text or json")
 	_ = snapshotCmd.MarkFlagRequired("source-dsn")
 	_ = snapshotCmd.MarkFlagRequired("index-dsn")
+	bindCommandEnv(snapshotCmd)
 
 	rootCmd.AddCommand(snapshotCmd)
 }

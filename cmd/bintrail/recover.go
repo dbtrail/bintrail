@@ -81,6 +81,7 @@ func init() {
 	recoverCmd.Flags().StringVar(&rProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	recoverCmd.Flags().StringVar(&rFormat, "format", "text", "Output format: text or json")
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
+	bindCommandEnv(recoverCmd)
 
 	rootCmd.AddCommand(recoverCmd)
 }
