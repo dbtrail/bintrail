@@ -9,7 +9,7 @@ import (
 
 func TestParseAndSetEnv(t *testing.T) {
 	t.Run("basic key=value", func(t *testing.T) {
-		t.Setenv("TEST_PARSE_BASIC", "") // ensure not set
+		t.Setenv("TEST_PARSE_BASIC", "")
 		os.Unsetenv("TEST_PARSE_BASIC")
 		parseAndSetEnv("TEST_PARSE_BASIC=hello")
 		if got := os.Getenv("TEST_PARSE_BASIC"); got != "hello" {
@@ -18,6 +18,7 @@ func TestParseAndSetEnv(t *testing.T) {
 	})
 
 	t.Run("skips comments and blank lines", func(t *testing.T) {
+		t.Setenv("TEST_PARSE_SKIP", "")
 		os.Unsetenv("TEST_PARSE_SKIP")
 		parseAndSetEnv("# comment\n\n  \nTEST_PARSE_SKIP=world")
 		if got := os.Getenv("TEST_PARSE_SKIP"); got != "world" {
@@ -26,6 +27,7 @@ func TestParseAndSetEnv(t *testing.T) {
 	})
 
 	t.Run("double-quoted value", func(t *testing.T) {
+		t.Setenv("TEST_PARSE_DQ", "")
 		os.Unsetenv("TEST_PARSE_DQ")
 		parseAndSetEnv(`TEST_PARSE_DQ="hello world"`)
 		if got := os.Getenv("TEST_PARSE_DQ"); got != "hello world" {
@@ -34,6 +36,7 @@ func TestParseAndSetEnv(t *testing.T) {
 	})
 
 	t.Run("single-quoted value", func(t *testing.T) {
+		t.Setenv("TEST_PARSE_SQ", "")
 		os.Unsetenv("TEST_PARSE_SQ")
 		parseAndSetEnv("TEST_PARSE_SQ='hello world'")
 		if got := os.Getenv("TEST_PARSE_SQ"); got != "hello world" {
@@ -50,9 +53,9 @@ func TestParseAndSetEnv(t *testing.T) {
 	})
 
 	t.Run("empty value", func(t *testing.T) {
+		t.Setenv("TEST_PARSE_EMPTY", "")
 		os.Unsetenv("TEST_PARSE_EMPTY")
 		parseAndSetEnv("TEST_PARSE_EMPTY=")
-		// Empty string is still set.
 		if v, ok := os.LookupEnv("TEST_PARSE_EMPTY"); !ok {
 			t.Error("expected var to be set")
 		} else if v != "" {
@@ -61,6 +64,7 @@ func TestParseAndSetEnv(t *testing.T) {
 	})
 
 	t.Run("value containing equals sign", func(t *testing.T) {
+		t.Setenv("TEST_PARSE_EQUALS", "")
 		os.Unsetenv("TEST_PARSE_EQUALS")
 		parseAndSetEnv("TEST_PARSE_EQUALS=user:pass@tcp(host)/db?parseTime=true")
 		want := "user:pass@tcp(host)/db?parseTime=true"
@@ -70,6 +74,7 @@ func TestParseAndSetEnv(t *testing.T) {
 	})
 
 	t.Run("trims whitespace around key and value", func(t *testing.T) {
+		t.Setenv("TEST_PARSE_WS", "")
 		os.Unsetenv("TEST_PARSE_WS")
 		parseAndSetEnv("  TEST_PARSE_WS  =  trimmed  ")
 		if got := os.Getenv("TEST_PARSE_WS"); got != "trimmed" {
@@ -78,6 +83,7 @@ func TestParseAndSetEnv(t *testing.T) {
 	})
 
 	t.Run("skips lines without equals", func(t *testing.T) {
+		t.Setenv("TEST_PARSE_NOEQ", "")
 		os.Unsetenv("TEST_PARSE_NOEQ")
 		parseAndSetEnv("no equals sign here\nTEST_PARSE_NOEQ=found")
 		if got := os.Getenv("TEST_PARSE_NOEQ"); got != "found" {
@@ -93,21 +99,12 @@ func TestBindCommandEnv(t *testing.T) {
 		cmd.Flags().StringVar(&dsn, "index-dsn", "", "test flag")
 
 		t.Setenv("BINTRAIL_INDEX_DSN", "from-env")
-
-		// Manually apply binding (bypassing envOnce since we set env directly).
-		for _, b := range envBindings {
-			if v := os.Getenv(b.EnvVar); v != "" {
-				if f := cmd.Flags().Lookup(b.Flag); f != nil {
-					_ = cmd.Flags().Set(b.Flag, v)
-				}
-			}
-		}
+		bindCommandEnv(cmd)
 
 		if dsn != "from-env" {
 			t.Errorf("dsn = %q, want %q", dsn, "from-env")
 		}
-		f := cmd.Flags().Lookup("index-dsn")
-		if !f.Changed {
+		if f := cmd.Flags().Lookup("index-dsn"); !f.Changed {
 			t.Error("expected flag to be marked as Changed")
 		}
 	})
@@ -118,14 +115,7 @@ func TestBindCommandEnv(t *testing.T) {
 		cmd.Flags().StringVar(&dsn, "index-dsn", "default", "test flag")
 
 		t.Setenv("BINTRAIL_INDEX_DSN", "")
-
-		for _, b := range envBindings {
-			if v := os.Getenv(b.EnvVar); v != "" {
-				if f := cmd.Flags().Lookup(b.Flag); f != nil {
-					_ = cmd.Flags().Set(b.Flag, v)
-				}
-			}
-		}
+		bindCommandEnv(cmd)
 
 		if dsn != "default" {
 			t.Errorf("dsn = %q, want %q", dsn, "default")
@@ -138,20 +128,7 @@ func TestBindCommandEnv(t *testing.T) {
 		cmd.PersistentFlags().StringVar(&dsn, "index-dsn", "", "test flag")
 
 		t.Setenv("BINTRAIL_INDEX_DSN", "persistent-env")
-
-		for _, b := range envBindings {
-			v := os.Getenv(b.EnvVar)
-			if v == "" {
-				continue
-			}
-			if f := cmd.Flags().Lookup(b.Flag); f != nil {
-				_ = cmd.Flags().Set(b.Flag, v)
-				continue
-			}
-			if cmd.PersistentFlags().Lookup(b.Flag) != nil {
-				_ = cmd.PersistentFlags().Set(b.Flag, v)
-			}
-		}
+		bindCommandEnv(cmd)
 
 		if dsn != "persistent-env" {
 			t.Errorf("dsn = %q, want %q", dsn, "persistent-env")
@@ -164,16 +141,7 @@ func TestBindCommandEnv(t *testing.T) {
 		cmd.Flags().IntVar(&batchSize, "batch-size", 1000, "test flag")
 
 		t.Setenv("BINTRAIL_BATCH_SIZE", "5000")
-
-		for _, b := range envBindings {
-			v := os.Getenv(b.EnvVar)
-			if v == "" {
-				continue
-			}
-			if f := cmd.Flags().Lookup(b.Flag); f != nil {
-				_ = cmd.Flags().Set(b.Flag, v)
-			}
-		}
+		bindCommandEnv(cmd)
 
 		if batchSize != 5000 {
 			t.Errorf("batchSize = %d, want 5000", batchSize)
