@@ -115,6 +115,7 @@ func buildDockerArgs(image, outputDir, host string, mydumperArgs []string, encry
 
 	args := []string{
 		"run", "--rm",
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"-v", absOutput + ":" + absOutput,
 	}
 
