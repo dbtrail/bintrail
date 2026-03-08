@@ -72,6 +72,7 @@ func TestQueryCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"index-dsn", "schema", "table", "pk", "event-type",
 		"gtid", "since", "until", "changed-column", "flag", "format", "limit",
+		"no-archive",
 	} {
 		if queryCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on queryCmd", name)
@@ -286,6 +287,40 @@ func TestQueryCmd_archiveFlagDefaults(t *testing.T) {
 		if f.DefValue != "" {
 			t.Errorf("flag --%s: expected empty default, got %q", name, f.DefValue)
 		}
+	}
+}
+
+func TestQueryCmd_noArchiveDefault(t *testing.T) {
+	f := queryCmd.Flag("no-archive")
+	if f == nil {
+		t.Fatal("flag --no-archive not registered")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("expected --no-archive default %q, got %q", "false", f.DefValue)
+	}
+}
+
+func TestRunQuery_noArchiveConflictsWithArchiveDir(t *testing.T) {
+	saved := struct{ na bool; ad, as3, pk, cc, fmt string }{qNoArchive, qArchiveDir, qArchiveS3, qPK, qChangedCol, qFormat}
+	t.Cleanup(func() {
+		qNoArchive = saved.na; qArchiveDir = saved.ad; qArchiveS3 = saved.as3
+		qPK = saved.pk; qChangedCol = saved.cc; qFormat = saved.fmt
+	})
+
+	qPK = ""
+	qChangedCol = ""
+	qFormat = "table"
+	qNoArchive = true
+	qArchiveDir = "/some/dir"
+	qArchiveS3 = ""
+	qBintrailID = "abc"
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for --no-archive + --archive-dir")
+	}
+	if !strings.Contains(err.Error(), "--no-archive cannot be combined") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 

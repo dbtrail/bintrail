@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
 	"github.com/bintrail/bintrail/internal/cliutil"
@@ -59,6 +60,7 @@ var (
 	qArchiveS3  string
 	qBintrailID string
 	qProfile    string
+	qNoArchive  bool
 )
 
 func init() {
@@ -78,6 +80,7 @@ func init() {
 	queryCmd.Flags().StringVar(&qArchiveS3, "archive-s3", "", "S3 root URL prefix of Parquet archives (requires --bintrail-id; e.g. s3://bucket/prefix/); uses the standard AWS credential chain")
 	queryCmd.Flags().StringVar(&qBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir or --archive-s3 is set)")
 	queryCmd.Flags().StringVar(&qProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
+	queryCmd.Flags().BoolVar(&qNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
 	_ = queryCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(queryCmd)
 
@@ -101,6 +104,9 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	if qProfile != "" && (qArchiveDir != "" || qArchiveS3 != "") {
 		return fmt.Errorf("--profile cannot be combined with --archive-dir or --archive-s3")
+	}
+	if qNoArchive && (qArchiveDir != "" || qArchiveS3 != "") {
+		return fmt.Errorf("--no-archive cannot be combined with --archive-dir or --archive-s3")
 	}
 
 	// ── Parse filter values ───────────────────────────────────────────────────
@@ -149,12 +155,39 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	engine := query.New(db)
 
 	// Determine archive sources: explicit flags take precedence; otherwise auto-discover.
-	// Skip auto-discovery when --profile is active — archive queries do not
-	// enforce DenyTables/RedactColumns rules (explicit flags already blocked
-	// by the --profile validation above).
-	archSources := archiveSources()
-	if len(archSources) == 0 && qArchiveDir == "" && qArchiveS3 == "" && qProfile == "" {
-		archSources = query.ResolveArchiveSources(cmd.Context(), db)
+	// Skip auto-discovery when --no-archive is set, or when --profile is active
+	// (archive queries do not enforce DenyTables/RedactColumns rules; explicit
+	// archive flags are already blocked by the --profile validation above).
+	var archSources []string
+	if !qNoArchive {
+		archSources = archiveSources()
+		if len(archSources) == 0 && qArchiveDir == "" && qArchiveS3 == "" && qProfile == "" {
+			archSources = query.ResolveArchiveSources(cmd.Context(), db)
+		}
+	}
+
+	// ── Coverage warnings and per-partition routing ───────────────────────────
+	// When archive sources are available, use the planner to detect gaps and
+	// optimise routing. The planner needs the DB name from the DSN.
+	var plan *query.QueryPlan
+	if len(archSources) > 0 {
+		cfg, parseErr := mysqldriver.ParseDSN(qIndexDSN)
+		if parseErr == nil && cfg.DBName != "" {
+			plan, _ = query.Plan(cmd.Context(), db, cfg.DBName, since, until)
+		}
+	}
+	// Also run the planner for coverage warnings even when archives are disabled,
+	// as long as we have a time range to check.
+	if plan == nil && (since != nil || until != nil) && !qNoArchive {
+		cfg, parseErr := mysqldriver.ParseDSN(qIndexDSN)
+		if parseErr == nil && cfg.DBName != "" {
+			plan, _ = query.Plan(cmd.Context(), db, cfg.DBName, since, until)
+		}
+	}
+	if plan != nil {
+		if warn := query.FormatGapWarning(plan.GapHours); warn != "" {
+			slog.Warn(warn)
+		}
 	}
 
 	// When no archive sources are configured, take the fast path (fetch + format
@@ -181,9 +214,16 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	fetchOpts := opts
 	fetchOpts.Limit = 0
 
-	results, err := engine.Fetch(cmd.Context(), fetchOpts)
-	if err != nil {
-		return err
+	// When the planner says MySQL can be skipped (entire range is archived),
+	// avoid the unnecessary MySQL query.
+	var results []query.ResultRow
+	if plan != nil && plan.SkipMySQL() {
+		slog.Debug("planner: skipping MySQL query (range fully archived)")
+	} else {
+		results, err = engine.Fetch(cmd.Context(), fetchOpts)
+		if err != nil {
+			return err
+		}
 	}
 
 	for _, src := range archSources {

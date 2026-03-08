@@ -70,10 +70,21 @@ func TestRecoverCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"index-dsn", "schema", "table", "pk", "event-type",
 		"gtid", "since", "until", "flag", "output", "dry-run", "limit",
+		"no-archive",
 	} {
 		if recoverCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on recoverCmd", name)
 		}
+	}
+}
+
+func TestRecoverCmd_noArchiveDefault(t *testing.T) {
+	f := recoverCmd.Flag("no-archive")
+	if f == nil {
+		t.Fatal("flag --no-archive not registered")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("expected --no-archive default %q, got %q", "false", f.DefValue)
 	}
 }
 
