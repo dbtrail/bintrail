@@ -15,12 +15,6 @@ type TimeRange struct {
 	End   time.Time // exclusive, truncated to hour
 }
 
-// ArchiveSource pairs archive source paths with the time range they cover.
-type ArchiveSource struct {
-	Source    string
-	Range    TimeRange
-}
-
 // QueryPlan describes how to route a query across live MySQL partitions and
 // Parquet archives. It is produced by Plan().
 type QueryPlan struct {
@@ -44,12 +38,12 @@ type QueryPlan struct {
 // dbName is the MySQL database name (needed for information_schema queries).
 func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Time) (*QueryPlan, error) {
 	if db == nil || dbName == "" {
-		return &QueryPlan{}, nil
+		return nil, nil
 	}
 
 	// If no time range is specified, we can't do partition-level routing.
 	if since == nil && until == nil {
-		return &QueryPlan{}, nil
+		return nil, nil
 	}
 
 	// Determine the hour-aligned query range.
@@ -66,14 +60,14 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 	liveHours, err := loadLivePartitionHours(ctx, db, dbName)
 	if err != nil {
 		slog.Warn("could not load partition info for planning", "error", err)
-		return &QueryPlan{}, nil
+		return nil, nil
 	}
 
 	// Load archived partition names.
 	archivedHours, err := loadArchivedHours(ctx, db)
 	if err != nil {
 		slog.Warn("could not load archive coverage for planning", "error", err)
-		return &QueryPlan{}, nil
+		return nil, nil
 	}
 
 	// Build sets for fast lookup.
@@ -90,7 +84,7 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 	// gaps within the bounded portion, but we need at least one bound to
 	// enumerate hours. For a fully open range, return empty plan (no routing).
 	if rangeStart.IsZero() && rangeEnd.IsZero() {
-		return &QueryPlan{}, nil
+		return nil, nil
 	}
 
 	// For a half-open range, use live partition boundaries to infer the other end.
@@ -101,7 +95,7 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 		} else if len(archivedHours) > 0 {
 			rangeStart = archivedHours[0]
 		} else {
-			return &QueryPlan{}, nil
+			return nil, nil
 		}
 	}
 	if rangeEnd.IsZero() {
@@ -116,7 +110,6 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 	// Enumerate hours in the range and classify each.
 	var gaps []time.Time
 	needMySQL := false
-	needArchive := false
 
 	for h := rangeStart; h.Before(rangeEnd); h = h.Add(time.Hour) {
 		inLive := liveSet[h]
@@ -124,9 +117,6 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 
 		if inLive {
 			needMySQL = true
-		}
-		if inArchive {
-			needArchive = true
 		}
 		if !inLive && !inArchive {
 			gaps = append(gaps, h)
@@ -136,13 +126,7 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 	plan := &QueryPlan{GapHours: gaps}
 
 	if needMySQL {
-		// Build contiguous MySQL ranges from live hours within the query range.
 		plan.MySQLRanges = buildContiguousRanges(liveHours, rangeStart, rangeEnd)
-	}
-
-	if needArchive {
-		// We still return all archive sources — the caller resolves actual paths.
-		// The planner's value here is knowing archives ARE needed.
 	}
 
 	return plan, nil
@@ -161,13 +145,10 @@ func FormatGapWarning(gaps []time.Time) string {
 		last.Format("2006-01-02 15:00"))
 }
 
-// NeedArchive returns true when the plan indicates archive sources should be queried.
-func (p *QueryPlan) NeedArchive() bool {
-	return p != nil && len(p.MySQLRanges) == 0 && len(p.GapHours) == 0
-}
-
-// SkipMySQL returns true when the plan indicates MySQL can be skipped entirely
-// (the full time range is covered by archives).
+// SkipMySQL returns true when the planner determined that MySQL can be skipped
+// entirely (the full time range is covered by archives, with no gaps).
+// Returns false for nil plans (fallback/early-return cases where the planner
+// could not run), ensuring MySQL is always queried when routing is uncertain.
 func (p *QueryPlan) SkipMySQL() bool {
 	return p != nil && len(p.MySQLRanges) == 0 && len(p.GapHours) == 0
 }

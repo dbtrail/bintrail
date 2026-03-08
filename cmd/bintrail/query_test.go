@@ -301,10 +301,13 @@ func TestQueryCmd_noArchiveDefault(t *testing.T) {
 }
 
 func TestRunQuery_noArchiveConflictsWithArchiveDir(t *testing.T) {
-	saved := struct{ na bool; ad, as3, pk, cc, fmt string }{qNoArchive, qArchiveDir, qArchiveS3, qPK, qChangedCol, qFormat}
+	saved := struct {
+		na          bool
+		ad, as3, pk, cc, fmt, bid string
+	}{qNoArchive, qArchiveDir, qArchiveS3, qPK, qChangedCol, qFormat, qBintrailID}
 	t.Cleanup(func() {
 		qNoArchive = saved.na; qArchiveDir = saved.ad; qArchiveS3 = saved.as3
-		qPK = saved.pk; qChangedCol = saved.cc; qFormat = saved.fmt
+		qPK = saved.pk; qChangedCol = saved.cc; qFormat = saved.fmt; qBintrailID = saved.bid
 	})
 
 	qPK = ""

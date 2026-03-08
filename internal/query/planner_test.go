@@ -112,10 +112,15 @@ func TestFormatGapWarning_singleHour(t *testing.T) {
 }
 
 func TestQueryPlan_SkipMySQL(t *testing.T) {
+	// A nil plan (fallback) should NOT skip MySQL — safety default.
+	if (*QueryPlan)(nil).SkipMySQL() {
+		t.Error("expected SkipMySQL=false for nil plan")
+	}
+
 	// A plan with no MySQL ranges and no gaps means MySQL can be skipped.
 	p := &QueryPlan{}
 	if !p.SkipMySQL() {
-		t.Error("expected SkipMySQL=true for empty plan")
+		t.Error("expected SkipMySQL=true for empty (fully-archived) plan")
 	}
 
 	// If there are MySQL ranges, don't skip.
@@ -144,18 +149,18 @@ func TestPlan_nilDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.GapHours) != 0 || len(p.MySQLRanges) != 0 {
-		t.Errorf("expected empty plan for nil DB, got %+v", p)
+	if p != nil {
+		t.Errorf("expected nil plan for nil DB, got %+v", p)
 	}
 }
 
 func TestPlan_noTimeRange(t *testing.T) {
-	// Nil since and until should produce an empty plan (no routing possible).
+	// Nil since and until should produce nil plan (no routing possible).
 	p, err := Plan(t.Context(), nil, "testdb", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.GapHours) != 0 {
-		t.Errorf("expected no gaps, got %d", len(p.GapHours))
+	if p != nil {
+		t.Errorf("expected nil plan for no time range, got %+v", p)
 	}
 }
