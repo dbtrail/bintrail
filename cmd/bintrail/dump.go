@@ -55,6 +55,7 @@ func init() {
 	dumpCmd.Flags().StringVar(&dmpEncryptKey, "encrypt-key", "", "Path to encryption key file (default: ~/.config/bintrail/dump.key; generate with 'bintrail generate-key')")
 	_ = dumpCmd.MarkFlagRequired("source-dsn")
 	_ = dumpCmd.MarkFlagRequired("output-dir")
+	bindCommandEnv(dumpCmd)
 
 	rootCmd.AddCommand(dumpCmd)
 }

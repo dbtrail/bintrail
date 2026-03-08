@@ -39,6 +39,7 @@ func init() {
 	statusCmd.Flags().StringVar(&stIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	statusCmd.Flags().StringVar(&stFormat, "format", "text", "Output format: text or json")
 	_ = statusCmd.MarkFlagRequired("index-dsn")
+	bindCommandEnv(statusCmd)
 
 	rootCmd.AddCommand(statusCmd)
 }

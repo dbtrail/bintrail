@@ -39,6 +39,7 @@ func init() {
 	// --index-dsn is inherited by all subcommands via PersistentFlags.
 	flagCmd.PersistentFlags().StringVar(&flgIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	_ = flagCmd.MarkPersistentFlagRequired("index-dsn")
+	bindCommandEnv(flagCmd)
 
 	flagCmd.AddCommand(flagAddCmd, flagRemoveCmd, flagListCmd)
 	rootCmd.AddCommand(flagCmd)

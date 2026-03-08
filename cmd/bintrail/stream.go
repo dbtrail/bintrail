@@ -98,6 +98,7 @@ func init() {
 	_ = streamCmd.MarkFlagRequired("index-dsn")
 	_ = streamCmd.MarkFlagRequired("source-dsn")
 	_ = streamCmd.MarkFlagRequired("server-id")
+	bindCommandEnv(streamCmd)
 
 	rootCmd.AddCommand(streamCmd)
 }

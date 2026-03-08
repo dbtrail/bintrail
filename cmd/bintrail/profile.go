@@ -29,6 +29,7 @@ var (
 func init() {
 	profileCmd.PersistentFlags().StringVar(&proIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	_ = profileCmd.MarkPersistentFlagRequired("index-dsn")
+	bindCommandEnv(profileCmd)
 
 	profileCmd.AddCommand(profileAddCmd, profileRemoveCmd, profileListCmd)
 	rootCmd.AddCommand(profileCmd)

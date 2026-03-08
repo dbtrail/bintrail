@@ -68,6 +68,7 @@ func init() {
 	uploadCmd.Flags().BoolVar(&uplRetry, "retry", false, "Skip files that already exist in S3 (via HeadObject check)")
 	_ = uploadCmd.MarkFlagRequired("source")
 	_ = uploadCmd.MarkFlagRequired("destination")
+	bindCommandEnv(uploadCmd)
 
 	rootCmd.AddCommand(uploadCmd)
 }
