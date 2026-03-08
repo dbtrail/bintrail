@@ -51,13 +51,16 @@ func (g *Generator) resolverForRow(row query.ResultRow) *metadata.Resolver {
 		}
 	}
 	r, err := metadata.NewResolver(g.db, int(row.SchemaVersion))
+	if g.cache == nil {
+		g.cache = make(map[uint32]*metadata.Resolver)
+	}
 	if err != nil {
 		slog.Warn("failed to load resolver for schema_version; using default resolver",
 			"schema_version", row.SchemaVersion, "error", err)
+		// Cache the fallback so we don't repeat the DB query and warning
+		// for every row with this version.
+		g.cache[row.SchemaVersion] = g.resolver
 		return g.resolver
-	}
-	if g.cache == nil {
-		g.cache = make(map[uint32]*metadata.Resolver)
 	}
 	g.cache[row.SchemaVersion] = r
 	return r
@@ -222,6 +225,8 @@ func generatedColsFromResolver(resolver *metadata.Resolver, schema, table string
 	}
 	tm, err := resolver.Resolve(schema, table)
 	if err != nil {
+		slog.Warn("cannot determine generated columns; reversal INSERT may include generated columns",
+			"schema", schema, "table", table, "error", err)
 		return nil
 	}
 	var gen map[string]bool
@@ -241,7 +246,11 @@ func generatedColsFromResolver(resolver *metadata.Resolver, schema, table string
 // dropped, or no snapshot was loaded).
 func pkWhereClauseFromResolver(resolver *metadata.Resolver, schema, table string, row map[string]any) []string {
 	if resolver != nil {
-		if tm, err := resolver.Resolve(schema, table); err == nil {
+		tm, err := resolver.Resolve(schema, table)
+		if err != nil {
+			slog.Warn("cannot resolve table for PK lookup; using all-columns WHERE",
+				"schema", schema, "table", table, "error", err)
+		} else {
 			pkCols := tm.PKColumnMetas()
 			if len(pkCols) > 0 {
 				parts := make([]string, 0, len(pkCols))
