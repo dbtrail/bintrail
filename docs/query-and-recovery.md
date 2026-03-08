@@ -85,9 +85,24 @@ Results can be formatted three ways:
 
 ## Parquet Archive Queries
 
-When rotated partitions have been archived (via `bintrail rotate --archive-dir` or `--archive-s3`), events are no longer in the MySQL index. The `query` command can merge results from these archives with the live index using `--archive-dir` and `--archive-s3`.
+When rotated partitions have been archived (via `bintrail rotate --archive-dir` or `--archive-s3`), events are no longer in the MySQL index. The `query` and `recover` commands can merge results from these archives with the live index.
 
-**`--bintrail-id` is required** when querying archives. The archive Hive layout uses `bintrail_id=<uuid>/` as the top-level partition key; providing the UUID scopes the DuckDB glob to that server's archives and enables partition pruning at the DuckDB level.
+### Auto-Discovery (default)
+
+When you run `bintrail rotate --archive-dir` or `--archive-s3`, the archive locations are recorded in the `archive_state` table. Both `query` and `recover` automatically discover these sources — no extra flags needed:
+
+```sh
+# Archives are discovered from archive_state automatically
+bintrail query \
+  --index-dsn  "..." \
+  --schema     mydb \
+  --table      orders \
+  --since      "2026-01-01 00:00:00"
+```
+
+### Explicit Archive Flags (override)
+
+You can also specify archive sources explicitly with `--archive-dir` and `--archive-s3`. When these are set, auto-discovery is skipped. **`--bintrail-id` is required** with explicit flags — it scopes the DuckDB glob to that server's archives.
 
 ```sh
 bintrail query \
@@ -99,9 +114,29 @@ bintrail query \
   --since      "2026-01-01 00:00:00"
 ```
 
+### `--no-archive` Flag
+
+Use `--no-archive` to disable archive auto-discovery entirely and return MySQL-only results. This is useful when you only want live data or when archive queries are slow:
+
+```sh
+bintrail query --index-dsn "..." --schema mydb --table orders --no-archive
+```
+
+`--no-archive` cannot be combined with `--archive-dir` or `--archive-s3`.
+
+### Coverage Warnings and Query Planner
+
+When a time range is specified (`--since`/`--until`), the query planner inspects live MySQL partition boundaries and the `archive_state` table to detect coverage gaps — hours where data has been rotated out of MySQL but no archive exists. These gaps are reported as warnings:
+
+```
+WARN query covers hours with no data (rotated and not archived): 2026-02-10 00:00 – 2026-02-12 23:00
+```
+
+The planner also optimizes routing: if the entire queried time range is covered by archives (no live MySQL partitions needed), the MySQL query is skipped entirely.
+
 ### How the Merge Works
 
-When either archive flag is set, the query command takes a different path:
+When archive sources are available (via auto-discovery or explicit flags), the query command takes a different path:
 
 1. **Fetch from MySQL index** — same query as usual, but with no `LIMIT` (`Limit=0` omits the LIMIT clause so no events are dropped before the merge).
 2. **Fetch from each archive source** — DuckDB opens the Parquet files via `parquet_scan('glob/**/*.parquet')`, applies the same filters (schema, table, PK, time range, etc.) in DuckDB SQL, and returns `[]ResultRow`.
@@ -137,6 +172,8 @@ The merge path loads **all matching rows** from all sources into memory before a
 ---
 
 ## Recovery: How It Works
+
+The `recover` command also supports archive auto-discovery and the `--no-archive` flag, using the same merge logic as `query`. When archives are available, events are fetched from both MySQL and Parquet, merged, and then passed to the SQL generator via `GenerateSQLFromRows`.
 
 ### The Concept
 
@@ -263,21 +300,29 @@ bintrail query/recover
         │
         ├── parse flags → query.Options
         │
-        ├── query.Engine.Fetch(ctx, opts)
-        │       │
-        │       ├── buildQuery(opts) → SQL + args
-        │       ├── db.QueryContext → *sql.Rows
-        │       └── scanRows → []ResultRow
-        │              (json.Unmarshal row_before, row_after, changed_columns)
+        ├── resolve archive sources (auto-discovery from archive_state, or explicit flags)
+        │   └── query.ResolveArchiveSources(ctx, db) when no explicit flags and no --no-archive
         │
-        ├── [query] → format as table/json/csv → stdout
+        ├── query planner: Plan(ctx, db, dbName, since, until)
+        │   └── warns about coverage gaps, may skip MySQL if fully archived
+        │
+        ├── if no archives: fast path
+        │       └── query.Engine.Run(ctx, opts, format, w) → stdout
+        │
+        ├── if archives: merge path
+        │       ├── query.Engine.Fetch(ctx, opts) → []ResultRow (MySQL, unless planner skips)
+        │       ├── parquetquery.Fetch(ctx, opts, source) → []ResultRow (per archive)
+        │       └── query.MergeResults(all, limit) → dedup + sort + limit
+        │
+        ├── [query] → query.Format(results, format, w) → stdout
         │
         └── [recover]
-                ├── slices.Reverse(rows)
-                ├── for each row:
-                │       generateStatement(row)
-                │           DELETE → generateInsert (from row_before)
-                │           UPDATE → generateUpdate (SET row_before WHERE row_after PK)
-                │           INSERT → generateDelete (WHERE row_after PK)
+                ├── recovery.GenerateSQLFromRows(rows, w)
+                │       ├── slices.Reverse(rows)
+                │       └── for each row:
+                │               generateStatement(row)
+                │                   DELETE → generateInsert (from row_before)
+                │                   UPDATE → generateUpdate (SET row_before WHERE row_after PK)
+                │                   INSERT → generateDelete (WHERE row_after PK)
                 └── write BEGIN ... statements ... COMMIT → file or stdout
 ```

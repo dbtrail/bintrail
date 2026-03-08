@@ -443,6 +443,7 @@ Monitor the `p_future` row count via `bintrail status` — a growing `p_future` 
 ### Credential management
 
 Never pass DSN credentials as CLI arguments — they appear in `ps aux` and process tables. Use:
+- **bintrail env file**: `bintrail config init` generates a `.bintrail.env` template (mode 0600). Set `BINTRAIL_INDEX_DSN` and `BINTRAIL_SOURCE_DSN` there — all commands load it automatically. Use `--global` for `~/.config/bintrail/config.env`.
 - **systemd**: `EnvironmentFile=/etc/bintrail/stream.env` (mode 0600, owned root:root)
 - **Docker**: `env_file:` with a secrets-managed file, or Docker Swarm/BuildKit secrets
 - **Kubernetes**: `envFrom.secretRef` pointing to a `Secret` object
