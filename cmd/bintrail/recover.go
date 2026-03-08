@@ -151,8 +151,13 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Fetch events (live + archives) ────────────────────────────────────────
+	// Skip archive auto-discovery when --profile is active — archive queries
+	// do not enforce DenyTables/RedactColumns rules.
 	engine := query.New(db)
-	archSources := query.ResolveArchiveSources(cmd.Context(), db)
+	var archSources []string
+	if rProfile == "" {
+		archSources = query.ResolveArchiveSources(cmd.Context(), db)
+	}
 
 	var rows []query.ResultRow
 	if len(archSources) > 0 {

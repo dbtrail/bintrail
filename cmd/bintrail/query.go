@@ -148,8 +148,11 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	engine := query.New(db)
 
 	// Determine archive sources: explicit flags take precedence; otherwise auto-discover.
+	// Skip auto-discovery when --profile is active — archive queries do not
+	// enforce DenyTables/RedactColumns rules (explicit flags already blocked
+	// by the --profile validation above).
 	archSources := archiveSources()
-	if len(archSources) == 0 && qArchiveDir == "" && qArchiveS3 == "" {
+	if len(archSources) == 0 && qArchiveDir == "" && qArchiveS3 == "" && qProfile == "" {
 		archSources = query.ResolveArchiveSources(cmd.Context(), db)
 	}
 

@@ -285,7 +285,13 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 		}
 
 		engine := query.New(db)
-		archSources := resolveArchiveSources(ctx, db)
+
+		// Skip archive auto-discovery when RBAC profile is active — archive
+		// queries do not enforce DenyTables/RedactColumns rules.
+		var archSources []string
+		if args.Profile == "" {
+			archSources = resolveArchiveSources(ctx, db)
+		}
 
 		var buf bytes.Buffer
 		var n int
@@ -363,8 +369,13 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 		}
 
 		// Fetch events from live index + archives.
+		// Skip archive auto-discovery when RBAC profile is active — archive
+		// queries do not enforce DenyTables/RedactColumns rules.
 		engine := query.New(db)
-		archSources := resolveArchiveSources(ctx, db)
+		var archSources []string
+		if args.Profile == "" {
+			archSources = resolveArchiveSources(ctx, db)
+		}
 
 		var rows []query.ResultRow
 		if len(archSources) > 0 {
