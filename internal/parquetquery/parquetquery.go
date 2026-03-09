@@ -39,14 +39,12 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		slog.Warn("could not set DuckDB temp_directory", "error", err)
 	}
 
-	// Constrain DuckDB resource usage for container environments:
-	//  - threads=2: low parallelism to cap memory; >1 helps S3 latency
-	//    (DuckDB uses synchronous I/O for remote files)
-	//  - memory_limit=256MB: prevents OOM kills (default is 80% of RAM)
-	//  - preserve_insertion_order=false: reduces intermediate memory;
-	//    safe because our query has an explicit ORDER BY
+	// Constrain DuckDB resource usage for container environments.
+	// DuckDB requires 125MB per thread minimum; 1 thread keeps baseline
+	// low so more memory is available for data. preserve_insertion_order
+	// is safe to disable because our queries have explicit ORDER BY.
 	for _, stmt := range []string{
-		"SET threads = 2",
+		"SET threads = 1",
 		"SET memory_limit = '512MB'",
 		"SET preserve_insertion_order = false",
 	} {
@@ -76,8 +74,6 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 	// DuckDB. DuckDB's glob expansion does not work reliably on S3 paths
 	// containing Hive partition keys (= signs). For local paths, use the
 	// standard glob approach which works correctly.
-	var q string
-	var args []any
 	if strings.HasPrefix(source, "s3://") {
 		files, bucketRegion, err := listS3Parquet(ctx, source)
 		if err != nil {
@@ -100,19 +96,35 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 			slog.Warn("no .parquet files found in S3 archive source", "source", source)
 			return nil, nil
 		}
-		q, args = buildQueryFromFiles(files, opts)
+		// Query one file at a time to keep peak memory low. Each parquet
+		// file can require hundreds of MB when decompressed; processing
+		// them individually lets DuckDB release memory between files.
+		var results []query.ResultRow
+		for _, f := range files {
+			q, args := buildQueryFromFiles([]string{f}, opts)
+			rows, err := db.QueryContext(ctx, q, args...)
+			if err != nil {
+				return nil, fmt.Errorf("parquet query %s: %w", f, err)
+			}
+			batch, err := scanRows(rows)
+			rows.Close()
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, batch...)
+			slog.Debug("queried archive file", "file", f, "rows", len(batch))
+		}
+		return results, nil
 	} else {
 		glob := buildGlob(source)
-		q, args = buildQuery(glob, opts)
+		q, args := buildQuery(glob, opts)
+		rows, err := db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("parquet query: %w", err)
+		}
+		defer rows.Close()
+		return scanRows(rows)
 	}
-
-	rows, err := db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, fmt.Errorf("parquet query: %w", err)
-	}
-	defer rows.Close()
-
-	return scanRows(rows)
 }
 
 // listS3Parquet uses the AWS SDK to list all .parquet files under an S3 prefix.
