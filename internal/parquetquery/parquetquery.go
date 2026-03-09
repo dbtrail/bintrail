@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -28,10 +29,20 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 	}
 	defer db.Close()
 
-	// S3 sources require the httpfs extension.
+	// S3 sources require the httpfs extension for S3 protocol support and the
+	// aws extension for credential resolution (reads AWS_ACCESS_KEY_ID,
+	// AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_DEFAULT_REGION from env).
+	// Without aws, DuckDB attempts anonymous S3 access which silently returns
+	// zero results.
 	if strings.HasPrefix(source, "s3://") {
 		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
 			return nil, fmt.Errorf("load duckdb httpfs extension: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, "INSTALL aws; LOAD aws;"); err != nil {
+			return nil, fmt.Errorf("install/load duckdb aws extension: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, "CALL load_aws_credentials();"); err != nil {
+			slog.Warn("could not load AWS credentials into DuckDB, falling back to anonymous S3 access", "error", err)
 		}
 	}
 
