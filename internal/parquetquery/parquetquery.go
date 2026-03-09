@@ -39,6 +39,13 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		slog.Warn("could not set DuckDB temp_directory", "error", err)
 	}
 
+	// Cap DuckDB memory to avoid OOM kills in memory-constrained containers.
+	// DuckDB defaults to 80% of system RAM; with this limit it spills to the
+	// temp_directory instead.
+	if _, err := db.ExecContext(ctx, "SET memory_limit = '256MB'"); err != nil {
+		slog.Warn("could not set DuckDB memory_limit", "error", err)
+	}
+
 	// S3 sources require the httpfs extension for S3 protocol support and the
 	// aws extension for credential resolution (reads AWS_ACCESS_KEY_ID,
 	// AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_DEFAULT_REGION from env).
