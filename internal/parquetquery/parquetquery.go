@@ -19,7 +19,8 @@ import (
 
 // Fetch queries Parquet archive files (local or S3) using DuckDB and returns matching events.
 // source is either a local directory path or an S3 URL prefix (s3://bucket/prefix/).
-// Parquet files must follow the p_YYYYMMDDHH.parquet naming convention written by bintrail rotate.
+// Archives follow the Hive-partitioned layout written by bintrail rotate
+// (event_date=YYYY-MM-DD/event_hour=HH/events.parquet).
 func Fetch(ctx context.Context, opts query.Options, source string) ([]query.ResultRow, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -46,15 +47,19 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 }
 
 // buildGlob converts source (a directory path or S3 URL) to a glob pattern that
-// selects all Parquet archive files under that location, including files nested
-// in Hive-partitioned subdirectories (e.g. event_date=2025-02-28/).
+// selects Parquet archive files under that location. For local paths it uses a
+// recursive glob (**/*.parquet). For S3 paths it uses explicit single-level
+// wildcards (/*/*/*.parquet) because DuckDB's httpfs extension does not support
+// recursive globs; the source must be at the bintrail_id=<uuid> level to match
+// the expected event_date=.../event_hour=.../events.parquet layout.
 func buildGlob(source string) string {
 	s := strings.TrimSuffix(source, "/")
 	if strings.HasSuffix(s, ".parquet") {
 		return source
 	}
 	// DuckDB's httpfs extension does not support ** (recursive) globs on S3.
-	// Use explicit single-level wildcards matching the Hive partition layout:
+	// Use explicit single-level wildcards matching the two Hive partition levels
+	// below the bintrail_id=<uuid> source path:
 	//   event_date=YYYY-MM-DD/event_hour=HH/events.parquet
 	if strings.HasPrefix(s, "s3://") {
 		return s + "/*/*/*.parquet"
