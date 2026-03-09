@@ -47,7 +47,7 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 	//    safe because our query has an explicit ORDER BY
 	for _, stmt := range []string{
 		"SET threads = 2",
-		"SET memory_limit = '256MB'",
+		"SET memory_limit = '512MB'",
 		"SET preserve_insertion_order = false",
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
@@ -91,6 +91,11 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 				slog.Warn("could not set DuckDB s3_region", "region", bucketRegion, "error", err)
 			}
 		}
+		// Pre-filter files by Hive partition values (event_date/event_hour)
+		// to avoid downloading parquet files outside the requested time range.
+		// DuckDB can't map event_timestamp filters to partition columns.
+		files = filterFilesByTimeRange(files, opts.Since, opts.Until)
+		slog.Debug("files after time-range pruning", "count", len(files))
 		if len(files) == 0 {
 			slog.Warn("no .parquet files found in S3 archive source", "source", source)
 			return nil, nil
@@ -294,6 +299,55 @@ func buildFilters(opts query.Options) ([]string, []any) {
 	}
 
 	return where, args
+}
+
+// filterFilesByTimeRange prunes the file list based on Hive partition values
+// (event_date=YYYY-MM-DD/event_hour=HH) extracted from the paths. Files whose
+// hour does not overlap with [since, until] are excluded. Files without
+// parseable partition values are kept (safe fallback).
+func filterFilesByTimeRange(files []string, since, until *time.Time) []string {
+	if since == nil && until == nil {
+		return files
+	}
+	var filtered []string
+	for _, f := range files {
+		hourStart, ok := parseFileHour(f)
+		if !ok {
+			filtered = append(filtered, f) // can't determine; include to be safe
+			continue
+		}
+		hourEnd := hourStart.Add(time.Hour)
+		if since != nil && hourEnd.Before(*since) {
+			continue // entire hour is before the since cutoff
+		}
+		if until != nil && hourStart.After(*until) {
+			continue // entire hour is after the until cutoff
+		}
+		filtered = append(filtered, f)
+	}
+	return filtered
+}
+
+// parseFileHour extracts the hour start time from Hive partition path segments
+// (event_date=YYYY-MM-DD/event_hour=HH). Returns zero time and false if the
+// path does not contain both segments.
+func parseFileHour(path string) (time.Time, bool) {
+	var dateStr, hourStr string
+	for _, seg := range strings.Split(path, "/") {
+		if strings.HasPrefix(seg, "event_date=") {
+			dateStr = strings.TrimPrefix(seg, "event_date=")
+		} else if strings.HasPrefix(seg, "event_hour=") {
+			hourStr = strings.TrimPrefix(seg, "event_hour=")
+		}
+	}
+	if dateStr == "" || hourStr == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse("2006-01-02 15", dateStr+" "+hourStr)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // scanRows converts DuckDB result rows into []query.ResultRow.
