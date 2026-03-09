@@ -60,6 +60,7 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 			return nil, fmt.Errorf("list S3 archive files: %w", err)
 		}
 		if len(files) == 0 {
+			slog.Warn("no .parquet files found in S3 archive source", "source", source)
 			return nil, nil
 		}
 		q, args = buildQueryFromFiles(files, opts)
