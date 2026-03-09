@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -30,6 +31,13 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		return nil, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer db.Close()
+
+	// Use the OS temp directory for DuckDB scratch files. By default DuckDB
+	// creates a .tmp directory in the CWD, which fails in containers where
+	// the working directory (often /) is read-only.
+	if _, err := db.ExecContext(ctx, "SET temp_directory = '"+os.TempDir()+"'"); err != nil {
+		slog.Warn("could not set DuckDB temp_directory", "error", err)
+	}
 
 	// S3 sources require the httpfs extension for S3 protocol support and the
 	// aws extension for credential resolution (reads AWS_ACCESS_KEY_ID,
