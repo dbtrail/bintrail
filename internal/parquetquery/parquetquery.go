@@ -55,9 +55,17 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 	var q string
 	var args []any
 	if strings.HasPrefix(source, "s3://") {
-		files, err := listS3Parquet(ctx, source)
+		files, bucketRegion, err := listS3Parquet(ctx, source)
 		if err != nil {
 			return nil, fmt.Errorf("list S3 archive files: %w", err)
+		}
+		// Override DuckDB's S3 region so parquet_scan reads from the correct
+		// endpoint (load_aws_credentials may have set a different region).
+		if bucketRegion != "" {
+			safeRegion := strings.ReplaceAll(bucketRegion, "'", "''")
+			if _, err := db.ExecContext(ctx, "SET s3_region = '"+safeRegion+"'"); err != nil {
+				slog.Warn("could not set DuckDB s3_region", "region", bucketRegion, "error", err)
+			}
 		}
 		if len(files) == 0 {
 			slog.Warn("no .parquet files found in S3 archive source", "source", source)
@@ -80,19 +88,48 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 
 // listS3Parquet uses the AWS SDK to list all .parquet files under an S3 prefix.
 // This bypasses DuckDB's glob expansion which fails on Hive-partitioned paths.
-func listS3Parquet(ctx context.Context, source string) ([]string, error) {
+// It also auto-detects the bucket's region via GetBucketLocation to avoid 301
+// PermanentRedirect errors when AWS_DEFAULT_REGION differs from the bucket's
+// actual region. The detected region is returned so callers can configure
+// DuckDB's s3_region accordingly.
+func listS3Parquet(ctx context.Context, source string) (files []string, bucketRegion string, err error) {
 	bucket, prefix, err := parseS3Source(source)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("load AWS config: %w", err)
+		return nil, "", fmt.Errorf("load AWS config: %w", err)
 	}
-	client := s3.NewFromConfig(cfg)
 
-	var files []string
+	// Detect the bucket's actual region via GetBucketLocation (must be called
+	// from us-east-1). This prevents 301 PermanentRedirect errors when the
+	// configured region doesn't match the bucket's location.
+	bucketRegion = cfg.Region
+	locClient := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.Region = "us-east-1"
+	})
+	loc, locErr := locClient.GetBucketLocation(ctx, &s3.GetBucketLocationInput{
+		Bucket: &bucket,
+	})
+	if locErr != nil {
+		slog.Warn("could not detect S3 bucket region, using default", "bucket", bucket, "error", locErr)
+	} else {
+		r := string(loc.LocationConstraint)
+		if r == "" {
+			r = "us-east-1" // GetBucketLocation returns empty for us-east-1
+		}
+		if r != cfg.Region {
+			slog.Debug("S3 bucket in different region, switching", "bucket", bucket, "bucket_region", r, "default_region", cfg.Region)
+		}
+		bucketRegion = r
+	}
+
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.Region = bucketRegion
+	})
+
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: &bucket,
 		Prefix: &prefix,
@@ -100,7 +137,7 @@ func listS3Parquet(ctx context.Context, source string) ([]string, error) {
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("list S3 objects under s3://%s/%s: %w", bucket, prefix, err)
+			return nil, bucketRegion, fmt.Errorf("list S3 objects under s3://%s/%s: %w", bucket, prefix, err)
 		}
 		for _, obj := range page.Contents {
 			if obj.Key != nil && strings.HasSuffix(*obj.Key, ".parquet") {
@@ -109,7 +146,7 @@ func listS3Parquet(ctx context.Context, source string) ([]string, error) {
 		}
 	}
 	slog.Debug("listed S3 archive files", "source", source, "count", len(files))
-	return files, nil
+	return files, bucketRegion, nil
 }
 
 // parseS3Source extracts the bucket and prefix from an S3 URL.
