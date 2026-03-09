@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -45,7 +46,7 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 	// is safe to disable because our queries have explicit ORDER BY.
 	for _, stmt := range []string{
 		"SET threads = 1",
-		"SET memory_limit = '512MB'",
+		"SET memory_limit = '256MB'",
 		"SET preserve_insertion_order = false",
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
@@ -53,39 +54,14 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		}
 	}
 
-	// S3 sources require the httpfs extension for S3 protocol support and the
-	// aws extension for credential resolution (reads AWS_ACCESS_KEY_ID,
-	// AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_DEFAULT_REGION from env).
-	// Without aws, DuckDB attempts anonymous S3 access which silently returns
-	// zero results.
-	if strings.HasPrefix(source, "s3://") {
-		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
-			return nil, fmt.Errorf("load duckdb httpfs extension: %w", err)
-		}
-		if _, err := db.ExecContext(ctx, "INSTALL aws; LOAD aws;"); err != nil {
-			return nil, fmt.Errorf("install/load duckdb aws extension: %w", err)
-		}
-		if _, err := db.ExecContext(ctx, "CALL load_aws_credentials();"); err != nil {
-			slog.Warn("could not load AWS credentials into DuckDB, falling back to anonymous S3 access", "error", err)
-		}
-	}
-
-	// For S3, list objects via the AWS SDK and pass explicit file paths to
-	// DuckDB. DuckDB's glob expansion does not work reliably on S3 paths
-	// containing Hive partition keys (= signs). For local paths, use the
-	// standard glob approach which works correctly.
+	// For S3, download each file locally via the AWS SDK and query with
+	// DuckDB from disk. This avoids DuckDB's httpfs extension which holds
+	// entire S3 files in memory (outside memory_limit tracking), causing
+	// OOM kills in containers. Local reads use OS page cache / mmap.
 	if strings.HasPrefix(source, "s3://") {
 		files, bucketRegion, err := listS3Parquet(ctx, source)
 		if err != nil {
 			return nil, fmt.Errorf("list S3 archive files: %w", err)
-		}
-		// Override DuckDB's S3 region so parquet_scan reads from the correct
-		// endpoint (load_aws_credentials may have set a different region).
-		if bucketRegion != "" {
-			safeRegion := strings.ReplaceAll(bucketRegion, "'", "''")
-			if _, err := db.ExecContext(ctx, "SET s3_region = '"+safeRegion+"'"); err != nil {
-				slog.Warn("could not set DuckDB s3_region", "region", bucketRegion, "error", err)
-			}
 		}
 		// Pre-filter files by Hive partition values (event_date/event_hour)
 		// to avoid downloading parquet files outside the requested time range.
@@ -96,18 +72,24 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 			slog.Warn("no .parquet files found in S3 archive source", "source", source)
 			return nil, nil
 		}
-		// Query one file at a time to keep peak memory low. Each parquet
-		// file can require hundreds of MB when decompressed; processing
-		// them individually lets DuckDB release memory between files.
+		// Download and query one file at a time. DuckDB reads the local
+		// file, then we delete it before moving to the next — peak memory
+		// is one file's decompressed data, not all files combined.
 		var results []query.ResultRow
 		for _, f := range files {
-			q, args := buildQueryFromFiles([]string{f}, opts)
+			tmpPath, err := downloadS3ToTemp(ctx, f, bucketRegion)
+			if err != nil {
+				return nil, fmt.Errorf("download archive file: %w", err)
+			}
+			q, args := buildQuery(tmpPath, opts)
 			rows, err := db.QueryContext(ctx, q, args...)
 			if err != nil {
+				os.Remove(tmpPath)
 				return nil, fmt.Errorf("parquet query %s: %w", f, err)
 			}
 			batch, err := scanRows(rows)
 			rows.Close()
+			os.Remove(tmpPath)
 			if err != nil {
 				return nil, err
 			}
@@ -115,16 +97,16 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 			slog.Debug("queried archive file", "file", f, "rows", len(batch))
 		}
 		return results, nil
-	} else {
-		glob := buildGlob(source)
-		q, args := buildQuery(glob, opts)
-		rows, err := db.QueryContext(ctx, q, args...)
-		if err != nil {
-			return nil, fmt.Errorf("parquet query: %w", err)
-		}
-		defer rows.Close()
-		return scanRows(rows)
 	}
+
+	glob := buildGlob(source)
+	q, args := buildQuery(glob, opts)
+	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("parquet query: %w", err)
+	}
+	defer rows.Close()
+	return scanRows(rows)
 }
 
 // listS3Parquet uses the AWS SDK to list all .parquet files under an S3 prefix.
@@ -188,6 +170,47 @@ func listS3Parquet(ctx context.Context, source string) (files []string, bucketRe
 	}
 	slog.Debug("listed S3 archive files", "source", source, "count", len(files))
 	return files, bucketRegion, nil
+}
+
+// downloadS3ToTemp downloads an S3 parquet file to a temporary local file and
+// returns its path. The caller must os.Remove the file when done. This avoids
+// DuckDB's httpfs extension which holds entire files in memory.
+func downloadS3ToTemp(ctx context.Context, s3URL, region string) (string, error) {
+	rest := strings.TrimPrefix(s3URL, "s3://")
+	bucket, key, _ := strings.Cut(rest, "/")
+	if bucket == "" || key == "" {
+		return "", fmt.Errorf("invalid S3 URL %q", s3URL)
+	}
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		return "", fmt.Errorf("load AWS config: %w", err)
+	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.Region = region
+	})
+
+	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		return "", fmt.Errorf("download s3://%s/%s: %w", bucket, key, err)
+	}
+	defer resp.Body.Close()
+
+	tmp, err := os.CreateTemp("", "bintrail-*.parquet")
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	if _, err := io.Copy(tmp, resp.Body); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("write temp file: %w", err)
+	}
+	tmp.Close()
+	slog.Debug("downloaded archive file", "s3", s3URL, "local", tmp.Name(), "bytes", resp.ContentLength)
+	return tmp.Name(), nil
 }
 
 // parseS3Source extracts the bucket and prefix from an S3 URL.
