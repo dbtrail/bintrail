@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-03-09
+
+### Fixed
+- Pre-filter S3 archive files by Hive partition time range (`event_date`/`event_hour`) before passing to DuckDB — a 1-hour query now reads 1-2 files instead of all 10, dramatically reducing memory usage and S3 transfer
+- Bump DuckDB `memory_limit` to 512MB (was 256MB) as a safety net for larger archive scans
+
 ## [0.2.7] - 2026-03-09
 
 ### Fixed
