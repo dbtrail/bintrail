@@ -75,13 +75,16 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		// Download and query one file at a time. DuckDB reads the local
 		// file, then we delete it before moving to the next — peak memory
 		// is one file's decompressed data, not all files combined.
+		// No ORDER BY here: the caller (query.MergeResults) sorts after
+		// collecting all results. Skipping ORDER BY lets DuckDB stream
+		// matching rows without buffering the full result set.
 		var results []query.ResultRow
 		for _, f := range files {
 			tmpPath, err := downloadS3ToTemp(ctx, f, bucketRegion)
 			if err != nil {
 				return nil, fmt.Errorf("download archive file: %w", err)
 			}
-			q, args := buildQuery(tmpPath, opts)
+			q, args := buildUnsortedQuery(tmpPath, opts)
 			rows, err := db.QueryContext(ctx, q, args...)
 			if err != nil {
 				os.Remove(tmpPath)
@@ -209,7 +212,11 @@ func downloadS3ToTemp(ctx context.Context, s3URL, region string) (string, error)
 		return "", fmt.Errorf("write temp file: %w", err)
 	}
 	tmp.Close()
-	slog.Debug("downloaded archive file", "s3", s3URL, "local", tmp.Name(), "bytes", resp.ContentLength)
+	var size int64
+	if resp.ContentLength != nil {
+		size = *resp.ContentLength
+	}
+	slog.Debug("downloaded archive file", "s3", s3URL, "local", tmp.Name(), "bytes", size)
 	return tmp.Name(), nil
 }
 
@@ -267,6 +274,25 @@ func buildGlob(source string) string {
 		return source
 	}
 	return s + "/**/*.parquet"
+}
+
+// buildUnsortedQuery constructs a DuckDB query for a single local parquet file
+// without ORDER BY. Used for per-file S3 queries where the caller handles
+// sorting after collecting all results. Skipping ORDER BY lets DuckDB stream
+// rows without buffering the full result set, dramatically reducing memory.
+func buildUnsortedQuery(path string, opts query.Options) (string, []any) {
+	where, args := buildFilters(opts)
+	safePath := strings.ReplaceAll(path, "'", "''")
+
+	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
+		" gtid, schema_name, table_name, event_type, pk_values," +
+		" changed_columns, row_before, row_after, schema_version" +
+		" FROM parquet_scan('" + safePath + "')"
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+
+	return q, args
 }
 
 // buildQuery constructs a DuckDB SQL query from a glob pattern (local paths only).
