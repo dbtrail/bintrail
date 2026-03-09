@@ -39,12 +39,16 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		slog.Warn("could not set DuckDB temp_directory", "error", err)
 	}
 
-	// Constrain DuckDB resource usage for container environments. Single
-	// thread avoids parallel S3 file reads that spike memory; 256MB cap
-	// prevents OOM kills (DuckDB defaults to 80% of system RAM).
+	// Constrain DuckDB resource usage for container environments:
+	//  - threads=2: low parallelism to cap memory; >1 helps S3 latency
+	//    (DuckDB uses synchronous I/O for remote files)
+	//  - memory_limit=256MB: prevents OOM kills (default is 80% of RAM)
+	//  - preserve_insertion_order=false: reduces intermediate memory;
+	//    safe because our query has an explicit ORDER BY
 	for _, stmt := range []string{
-		"SET threads = 1",
+		"SET threads = 2",
 		"SET memory_limit = '256MB'",
+		"SET preserve_insertion_order = false",
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			slog.Warn("could not configure DuckDB", "statement", stmt, "error", err)
