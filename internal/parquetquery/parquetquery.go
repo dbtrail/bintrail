@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -37,8 +38,11 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
 			return nil, fmt.Errorf("load duckdb httpfs extension: %w", err)
 		}
-		if _, err := db.ExecContext(ctx, "INSTALL aws; LOAD aws; CALL load_aws_credentials();"); err != nil {
-			return nil, fmt.Errorf("load duckdb aws extension: %w", err)
+		if _, err := db.ExecContext(ctx, "INSTALL aws; LOAD aws;"); err != nil {
+			return nil, fmt.Errorf("install/load duckdb aws extension: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, "CALL load_aws_credentials();"); err != nil {
+			slog.Warn("could not load AWS credentials into DuckDB, falling back to anonymous S3 access", "error", err)
 		}
 	}
 
