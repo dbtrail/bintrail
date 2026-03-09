@@ -39,11 +39,16 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		slog.Warn("could not set DuckDB temp_directory", "error", err)
 	}
 
-	// Cap DuckDB memory to avoid OOM kills in memory-constrained containers.
-	// DuckDB defaults to 80% of system RAM; with this limit it spills to the
-	// temp_directory instead.
-	if _, err := db.ExecContext(ctx, "SET memory_limit = '256MB'"); err != nil {
-		slog.Warn("could not set DuckDB memory_limit", "error", err)
+	// Constrain DuckDB resource usage for container environments. Single
+	// thread avoids parallel S3 file reads that spike memory; 256MB cap
+	// prevents OOM kills (DuckDB defaults to 80% of system RAM).
+	for _, stmt := range []string{
+		"SET threads = 1",
+		"SET memory_limit = '256MB'",
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			slog.Warn("could not configure DuckDB", "statement", stmt, "error", err)
+		}
 	}
 
 	// S3 sources require the httpfs extension for S3 protocol support and the
