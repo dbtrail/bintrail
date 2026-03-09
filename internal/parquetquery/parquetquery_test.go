@@ -46,7 +46,7 @@ func assertContains(t *testing.T, s, want string) {
 
 func TestBuildQueryNoFilters(t *testing.T) {
 	q, args := buildQuery("/archives/*.parquet", query.Options{Limit: 50})
-	assertContains(t, q, "FROM parquet_scan('/archives/*.parquet')")
+	assertContains(t, q, "FROM parquet_scan('/archives/*.parquet', hive_partitioning=true)")
 	assertContains(t, q, "ORDER BY event_timestamp, event_id")
 	assertContains(t, q, "LIMIT ?")
 	// Only arg is the limit.
@@ -158,5 +158,5 @@ func TestBuildQueryNoLimit(t *testing.T) {
 func TestBuildQueryGlobEscaping(t *testing.T) {
 	// A single quote in the path must be escaped as '' to prevent SQL injection.
 	q, _ := buildQuery("/it's/archives/*.parquet", query.Options{})
-	assertContains(t, q, "/it''s/archives/*.parquet")
+	assertContains(t, q, "parquet_scan('/it''s/archives/*.parquet', hive_partitioning=true)")
 }
