@@ -106,7 +106,7 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, schema_name, table_name, event_type, pk_values," +
 		" changed_columns, row_before, row_after, schema_version" +
-		" FROM parquet_scan('" + safeGlob + "')"
+		" FROM parquet_scan('" + safeGlob + "', hive_partitioning=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
