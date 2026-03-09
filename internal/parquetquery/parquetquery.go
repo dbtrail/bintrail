@@ -53,6 +53,12 @@ func buildGlob(source string) string {
 	if strings.HasSuffix(s, ".parquet") {
 		return source
 	}
+	// DuckDB's httpfs extension does not support ** (recursive) globs on S3.
+	// Use explicit single-level wildcards matching the Hive partition layout:
+	//   event_date=YYYY-MM-DD/event_hour=HH/events.parquet
+	if strings.HasPrefix(s, "s3://") {
+		return s + "/*/*/*.parquet"
+	}
 	return s + "/**/*.parquet"
 }
 

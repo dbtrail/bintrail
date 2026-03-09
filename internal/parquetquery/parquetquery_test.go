@@ -22,9 +22,9 @@ func TestBuildGlob(t *testing.T) {
 		{"/data/archives/bintrail_id=abc-123", "/data/archives/bintrail_id=abc-123/**/*.parquet"},
 		// Single file: returned as-is.
 		{"/data/archives/events_14.parquet", "/data/archives/events_14.parquet"},
-		{"s3://bucket/prefix", "s3://bucket/prefix/**/*.parquet"},
-		{"s3://bucket/prefix/", "s3://bucket/prefix/**/*.parquet"},
-		{"s3://bucket/prefix/bintrail_id=abc-123", "s3://bucket/prefix/bintrail_id=abc-123/**/*.parquet"},
+		{"s3://bucket/prefix", "s3://bucket/prefix/*/*/*.parquet"},
+		{"s3://bucket/prefix/", "s3://bucket/prefix/*/*/*.parquet"},
+		{"s3://bucket/prefix/bintrail_id=abc-123", "s3://bucket/prefix/bintrail_id=abc-123/*/*/*.parquet"},
 		{"s3://bucket/prefix/*.parquet", "s3://bucket/prefix/*.parquet"},
 	}
 	for _, tc := range tests {
