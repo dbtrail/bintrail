@@ -218,3 +218,86 @@ func TestBuildQueryGlobEscaping(t *testing.T) {
 	q, _ := buildQuery("/it's/archives/*.parquet", query.Options{})
 	assertContains(t, q, "parquet_scan('/it''s/archives/*.parquet', hive_partitioning=true)")
 }
+
+// ─── parseFileHour ──────────────────────────────────────────────────────────
+
+func TestParseFileHour(t *testing.T) {
+	tests := []struct {
+		path   string
+		wantOK bool
+		want   time.Time
+	}{
+		{
+			"s3://bucket/events/bintrail_id=abc/event_date=2026-03-09/event_hour=11/events.parquet",
+			true,
+			time.Date(2026, 3, 9, 11, 0, 0, 0, time.UTC),
+		},
+		{
+			"/local/archives/event_date=2026-01-15/event_hour=00/events.parquet",
+			true,
+			time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC),
+		},
+		{"s3://bucket/no-hive/events.parquet", false, time.Time{}},
+		{"s3://bucket/event_date=bad/event_hour=11/e.parquet", false, time.Time{}},
+	}
+	for _, tc := range tests {
+		got, ok := parseFileHour(tc.path)
+		if ok != tc.wantOK {
+			t.Errorf("parseFileHour(%q) ok = %v, want %v", tc.path, ok, tc.wantOK)
+			continue
+		}
+		if ok && !got.Equal(tc.want) {
+			t.Errorf("parseFileHour(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+// ─── filterFilesByTimeRange ─────────────────────────────────────────────────
+
+func TestFilterFilesByTimeRange(t *testing.T) {
+	files := []string{
+		"s3://b/event_date=2026-03-09/event_hour=10/e.parquet",
+		"s3://b/event_date=2026-03-09/event_hour=11/e.parquet",
+		"s3://b/event_date=2026-03-09/event_hour=12/e.parquet",
+		"s3://b/event_date=2026-03-09/event_hour=13/e.parquet",
+	}
+
+	since := time.Date(2026, 3, 9, 11, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 3, 9, 12, 0, 0, 0, time.UTC)
+	got := filterFilesByTimeRange(files, &since, &until)
+	// hour=10 ends at 11:00 which is not Before 11:00 → included
+	// hour=11 overlaps → included
+	// hour=12 starts at 12:00 which is not After 12:00 → included
+	// hour=13 starts at 13:00 which is After 12:00 → excluded
+	if len(got) != 3 {
+		t.Fatalf("expected 3 files, got %d: %v", len(got), got)
+	}
+
+	// Since only
+	got = filterFilesByTimeRange(files, &since, nil)
+	if len(got) != 4 { // hour=10 ends at 11:00 (not before since), all included
+		t.Errorf("since-only: expected 4, got %d", len(got))
+	}
+
+	// Until only — until=10:30 should include hour=10 only
+	until1030 := time.Date(2026, 3, 9, 10, 30, 0, 0, time.UTC)
+	got = filterFilesByTimeRange(files, nil, &until1030)
+	if len(got) != 1 {
+		t.Errorf("until-only 10:30: expected 1, got %d: %v", len(got), got)
+	}
+
+	// No filters
+	got = filterFilesByTimeRange(files, nil, nil)
+	if len(got) != 4 {
+		t.Errorf("no filters: expected 4, got %d", len(got))
+	}
+}
+
+func TestFilterFilesByTimeRangeUnparseable(t *testing.T) {
+	files := []string{"s3://bucket/no-hive/events.parquet"}
+	since := time.Date(2026, 3, 9, 11, 0, 0, 0, time.UTC)
+	got := filterFilesByTimeRange(files, &since, nil)
+	if len(got) != 1 {
+		t.Errorf("unparseable files should be kept, got %d", len(got))
+	}
+}
