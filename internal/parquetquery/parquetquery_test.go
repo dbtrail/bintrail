@@ -9,7 +9,7 @@ import (
 	"github.com/bintrail/bintrail/internal/query"
 )
 
-// ─── buildGlob ────────────────────────────────────────────────────────────────
+// ─── buildGlob (local paths only — S3 uses listS3Parquet) ───────────────────
 
 func TestBuildGlob(t *testing.T) {
 	tests := []struct {
@@ -18,14 +18,8 @@ func TestBuildGlob(t *testing.T) {
 	}{
 		{"/data/archives", "/data/archives/**/*.parquet"},
 		{"/data/archives/", "/data/archives/**/*.parquet"},
-		// Hive-partitioned path scoped to one server
 		{"/data/archives/bintrail_id=abc-123", "/data/archives/bintrail_id=abc-123/**/*.parquet"},
-		// Single file: returned as-is.
 		{"/data/archives/events_14.parquet", "/data/archives/events_14.parquet"},
-		{"s3://bucket/prefix", "s3://bucket/prefix/*/*/*.parquet"},
-		{"s3://bucket/prefix/", "s3://bucket/prefix/*/*/*.parquet"},
-		{"s3://bucket/prefix/bintrail_id=abc-123", "s3://bucket/prefix/bintrail_id=abc-123/*/*/*.parquet"},
-		{"s3://bucket/prefix/*.parquet", "s3://bucket/prefix/*.parquet"},
 	}
 	for _, tc := range tests {
 		got := buildGlob(tc.source)
@@ -35,7 +29,79 @@ func TestBuildGlob(t *testing.T) {
 	}
 }
 
-// ─── buildQuery ───────────────────────────────────────────────────────────────
+// ─── parseS3Source ───────────────────────────────────────────────────────────
+
+func TestParseS3Source(t *testing.T) {
+	tests := []struct {
+		source     string
+		wantBucket string
+		wantPrefix string
+		wantErr    bool
+	}{
+		{"s3://my-bucket/events/bintrail_id=abc/", "my-bucket", "events/bintrail_id=abc/", false},
+		{"s3://my-bucket/events/bintrail_id=abc", "my-bucket", "events/bintrail_id=abc/", false},
+		{"s3://my-bucket/", "my-bucket", "", false},
+		{"s3://my-bucket", "my-bucket", "", false},
+		{"s3:///prefix", "", "", true},
+	}
+	for _, tc := range tests {
+		bucket, prefix, err := parseS3Source(tc.source)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("parseS3Source(%q) error = %v, wantErr %v", tc.source, err, tc.wantErr)
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		if bucket != tc.wantBucket {
+			t.Errorf("parseS3Source(%q) bucket = %q, want %q", tc.source, bucket, tc.wantBucket)
+		}
+		if prefix != tc.wantPrefix {
+			t.Errorf("parseS3Source(%q) prefix = %q, want %q", tc.source, prefix, tc.wantPrefix)
+		}
+	}
+}
+
+// ─── buildQueryFromFiles ────────────────────────────────────────────────────
+
+func TestBuildQueryFromFiles(t *testing.T) {
+	files := []string{
+		"s3://bucket/events/bintrail_id=abc/event_date=2026-03-09/event_hour=11/events.parquet",
+		"s3://bucket/events/bintrail_id=abc/event_date=2026-03-09/event_hour=12/events.parquet",
+	}
+	q, args := buildQueryFromFiles(files, query.Options{Limit: 50})
+	assertContains(t, q, "FROM parquet_scan([")
+	assertContains(t, q, "hive_partitioning=true)")
+	assertContains(t, q, "event_hour=11/events.parquet")
+	assertContains(t, q, "event_hour=12/events.parquet")
+	assertContains(t, q, "ORDER BY event_timestamp, event_id")
+	assertContains(t, q, "LIMIT ?")
+	if len(args) != 1 || args[0] != 50 {
+		t.Errorf("expected [50] args, got %v", args)
+	}
+}
+
+func TestBuildQueryFromFilesEscaping(t *testing.T) {
+	files := []string{"s3://bucket/it's/file.parquet"}
+	q, _ := buildQueryFromFiles(files, query.Options{})
+	assertContains(t, q, "it''s")
+}
+
+func TestBuildQueryFromFilesWithFilters(t *testing.T) {
+	files := []string{"s3://bucket/f.parquet"}
+	since := time.Date(2026, 3, 9, 11, 0, 0, 0, time.UTC)
+	opts := query.Options{Schema: "mydb", Table: "orders", Since: &since, Limit: 10}
+	q, args := buildQueryFromFiles(files, opts)
+	assertContains(t, q, "schema_name = ?")
+	assertContains(t, q, "table_name = ?")
+	assertContains(t, q, "event_timestamp >= ?")
+	// schema, table, since, limit
+	if len(args) != 4 {
+		t.Errorf("expected 4 args, got %d: %v", len(args), args)
+	}
+}
+
+// ─── buildQuery (local glob path) ───────────────────────────────────────────
 
 func assertContains(t *testing.T, s, want string) {
 	t.Helper()
@@ -49,15 +115,11 @@ func TestBuildQueryNoFilters(t *testing.T) {
 	assertContains(t, q, "FROM parquet_scan('/archives/*.parquet', hive_partitioning=true)")
 	assertContains(t, q, "ORDER BY event_timestamp, event_id")
 	assertContains(t, q, "LIMIT ?")
-	// Only arg is the limit.
 	if len(args) != 1 || args[0] != 50 {
 		t.Errorf("expected [50] args, got %v", args)
 	}
 }
 
-// TestBuildQueryViaGlob verifies the full buildGlob→buildQuery pipeline: a
-// Hive-partitioned source path should produce SQL with the recursive
-// /**/*.parquet glob, not the old flat /*.parquet pattern.
 func TestBuildQueryViaGlob(t *testing.T) {
 	glob := buildGlob("/archives/bintrail_id=abc-123")
 	q, args := buildQuery(glob, query.Options{Limit: 50})
@@ -73,7 +135,7 @@ func TestBuildQuerySchemaTable(t *testing.T) {
 	q, args := buildQuery("/arc/*.parquet", opts)
 	assertContains(t, q, "schema_name = ?")
 	assertContains(t, q, "table_name = ?")
-	if len(args) != 3 { // schema, table, limit
+	if len(args) != 3 {
 		t.Errorf("expected 3 args, got %d: %v", len(args), args)
 	}
 	if args[0] != "mydb" || args[1] != "orders" {
@@ -85,7 +147,6 @@ func TestBuildQueryPK(t *testing.T) {
 	opts := query.Options{PKValues: "12345", Limit: 100}
 	q, args := buildQuery("/arc/*.parquet", opts)
 	assertContains(t, q, "pk_values = ?")
-	// No SHA2 — plain equality only.
 	if strings.Contains(q, "SHA2") {
 		t.Error("Parquet query must not use SHA2 (no index available)")
 	}
@@ -132,7 +193,6 @@ func TestBuildQueryChangedColumn(t *testing.T) {
 	opts := query.Options{Schema: "db", Table: "t", ChangedColumn: "status", Limit: 100}
 	q, args := buildQuery("/arc/*.parquet", opts)
 	assertContains(t, q, "json_contains(changed_columns, ?)")
-	// The needle must be the JSON-encoded column name (with double quotes).
 	found := false
 	for _, a := range args {
 		if a == `"status"` {
@@ -145,7 +205,6 @@ func TestBuildQueryChangedColumn(t *testing.T) {
 }
 
 func TestBuildQueryNoLimit(t *testing.T) {
-	// Limit=0 means "no LIMIT clause" so the merge layer can apply the real limit.
 	q, args := buildQuery("/arc/*.parquet", query.Options{})
 	if strings.Contains(q, "LIMIT") {
 		t.Error("expected no LIMIT clause when Limit=0")
@@ -156,7 +215,6 @@ func TestBuildQueryNoLimit(t *testing.T) {
 }
 
 func TestBuildQueryGlobEscaping(t *testing.T) {
-	// A single quote in the path must be escaped as '' to prevent SQL injection.
 	q, _ := buildQuery("/it's/archives/*.parquet", query.Options{})
 	assertContains(t, q, "parquet_scan('/it''s/archives/*.parquet', hive_partitioning=true)")
 }

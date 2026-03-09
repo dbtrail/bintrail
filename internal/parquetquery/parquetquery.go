@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	_ "github.com/duckdb/duckdb-go/v2"
 
 	"github.com/bintrail/bintrail/internal/parser"
@@ -46,8 +48,27 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		}
 	}
 
-	glob := buildGlob(source)
-	q, args := buildQuery(glob, opts)
+	// For S3, list objects via the AWS SDK and pass explicit file paths to
+	// DuckDB. DuckDB's glob expansion does not work reliably on S3 paths
+	// containing Hive partition keys (= signs). For local paths, use the
+	// standard glob approach which works correctly.
+	var q string
+	var args []any
+	if strings.HasPrefix(source, "s3://") {
+		files, err := listS3Parquet(ctx, source)
+		if err != nil {
+			return nil, fmt.Errorf("list S3 archive files: %w", err)
+		}
+		if len(files) == 0 {
+			slog.Warn("no .parquet files found in S3 archive source", "source", source)
+			return nil, nil
+		}
+		q, args = buildQueryFromFiles(files, opts)
+	} else {
+		glob := buildGlob(source)
+		q, args = buildQuery(glob, opts)
+	}
+
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("parquet query: %w", err)
@@ -57,31 +78,123 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 	return scanRows(rows)
 }
 
-// buildGlob converts source (a directory path or S3 URL) to a glob pattern that
-// selects Parquet archive files under that location. For local paths it uses a
-// recursive glob (**/*.parquet). For S3 paths it uses explicit single-level
-// wildcards (/*/*/*.parquet) because DuckDB's httpfs extension does not support
-// recursive globs; the source must be at the bintrail_id=<uuid> level to match
-// the expected event_date=.../event_hour=.../events.parquet layout.
+// listS3Parquet uses the AWS SDK to list all .parquet files under an S3 prefix.
+// This bypasses DuckDB's glob expansion which fails on Hive-partitioned paths.
+func listS3Parquet(ctx context.Context, source string) ([]string, error) {
+	bucket, prefix, err := parseS3Source(source)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+	client := s3.NewFromConfig(cfg)
+
+	var files []string
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: &bucket,
+		Prefix: &prefix,
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list S3 objects under s3://%s/%s: %w", bucket, prefix, err)
+		}
+		for _, obj := range page.Contents {
+			if obj.Key != nil && strings.HasSuffix(*obj.Key, ".parquet") {
+				files = append(files, fmt.Sprintf("s3://%s/%s", bucket, *obj.Key))
+			}
+		}
+	}
+	slog.Debug("listed S3 archive files", "source", source, "count", len(files))
+	return files, nil
+}
+
+// parseS3Source extracts the bucket and prefix from an S3 URL.
+// The prefix always ends with "/" for listing purposes.
+func parseS3Source(source string) (bucket, prefix string, err error) {
+	rest := strings.TrimPrefix(source, "s3://")
+	bucket, prefix, _ = strings.Cut(rest, "/")
+	if bucket == "" {
+		return "", "", fmt.Errorf("empty bucket in S3 source %q", source)
+	}
+	// Ensure prefix ends with "/" so ListObjectsV2 scopes correctly.
+	prefix = strings.TrimSuffix(prefix, "/")
+	if prefix != "" {
+		prefix += "/"
+	}
+	return bucket, prefix, nil
+}
+
+// buildQueryFromFiles constructs a DuckDB SQL query using an explicit list of
+// S3 file paths instead of a glob pattern. This avoids DuckDB's broken S3 glob
+// expansion for paths containing Hive partition keys (= signs).
+func buildQueryFromFiles(files []string, opts query.Options) (string, []any) {
+	where, args := buildFilters(opts)
+
+	// Build the file list as a DuckDB array literal: ['s3://...', 's3://...']
+	var escaped []string
+	for _, f := range files {
+		escaped = append(escaped, "'"+strings.ReplaceAll(f, "'", "''")+"'")
+	}
+	fileList := "[" + strings.Join(escaped, ", ") + "]"
+
+	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
+		" gtid, schema_name, table_name, event_type, pk_values," +
+		" changed_columns, row_before, row_after, schema_version" +
+		" FROM parquet_scan(" + fileList + ", hive_partitioning=true)"
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	q += " ORDER BY event_timestamp, event_id"
+	if opts.Limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, opts.Limit)
+	}
+
+	return q, args
+}
+
+// buildGlob converts a local directory path to a glob pattern that selects all
+// Parquet archive files under that location. Only used for local paths — S3
+// sources use listS3Parquet + buildQueryFromFiles instead.
 func buildGlob(source string) string {
 	s := strings.TrimSuffix(source, "/")
 	if strings.HasSuffix(s, ".parquet") {
 		return source
 	}
-	// DuckDB's httpfs extension does not support ** (recursive) globs on S3.
-	// Use explicit single-level wildcards matching the two Hive partition levels
-	// below the bintrail_id=<uuid> source path:
-	//   event_date=YYYY-MM-DD/event_hour=HH/events.parquet
-	if strings.HasPrefix(s, "s3://") {
-		return s + "/*/*/*.parquet"
-	}
 	return s + "/**/*.parquet"
 }
 
-// buildQuery constructs a DuckDB SQL query and its arguments for the given options.
+// buildQuery constructs a DuckDB SQL query from a glob pattern (local paths only).
 // The glob is embedded directly in the SQL because DuckDB table functions do not
 // support bind parameters for the file path argument.
 func buildQuery(glob string, opts query.Options) (string, []any) {
+	where, args := buildFilters(opts)
+
+	// Escape single quotes in the glob path to prevent SQL injection.
+	safeGlob := strings.ReplaceAll(glob, "'", "''")
+
+	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
+		" gtid, schema_name, table_name, event_type, pk_values," +
+		" changed_columns, row_before, row_after, schema_version" +
+		" FROM parquet_scan('" + safeGlob + "', hive_partitioning=true)"
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	q += " ORDER BY event_timestamp, event_id"
+	if opts.Limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, opts.Limit)
+	}
+
+	return q, args
+}
+
+// buildFilters extracts WHERE clause fragments and bind args from query options.
+func buildFilters(opts query.Options) ([]string, []any) {
 	var where []string
 	var args []any
 
@@ -94,7 +207,6 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 		args = append(args, opts.Table)
 	}
 	if opts.PKValues != "" {
-		// No SHA2 index in Parquet — plain equality on pk_values.
 		where = append(where, "pk_values = ?")
 		args = append(args, opts.PKValues)
 	}
@@ -115,30 +227,12 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 		args = append(args, *opts.Until)
 	}
 	if opts.ChangedColumn != "" {
-		// Mirror the MySQL JSON_CONTAINS pattern: needle is the JSON-encoded column name,
-		// e.g. "status" → `"status"` (with double quotes), matching inside the JSON array.
 		needle, _ := json.Marshal(opts.ChangedColumn)
 		where = append(where, "json_contains(changed_columns, ?)")
 		args = append(args, string(needle))
 	}
 
-	// Escape single quotes in the glob path to prevent SQL injection.
-	safeGlob := strings.ReplaceAll(glob, "'", "''")
-
-	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
-		" gtid, schema_name, table_name, event_type, pk_values," +
-		" changed_columns, row_before, row_after, schema_version" +
-		" FROM parquet_scan('" + safeGlob + "', hive_partitioning=true)"
-	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ")
-	}
-	q += " ORDER BY event_timestamp, event_id"
-	if opts.Limit > 0 {
-		q += " LIMIT ?"
-		args = append(args, opts.Limit)
-	}
-
-	return q, args
+	return where, args
 }
 
 // scanRows converts DuckDB result rows into []query.ResultRow.
