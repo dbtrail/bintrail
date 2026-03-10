@@ -191,6 +191,9 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		if qFormat == "table" && n > 0 {
 			fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
 		}
+		if n >= qLimit {
+			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", qLimit)
+		}
 		return nil
 	}
 
@@ -234,6 +237,9 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		"duration_ms", time.Since(start).Milliseconds())
 	if qFormat == "table" && n > 0 {
 		fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
+	}
+	if n >= qLimit {
+		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", qLimit)
 	}
 	return nil
 }

@@ -233,6 +233,9 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		if n > 0 {
 			fmt.Fprintf(os.Stderr, "\n%d reversal statement(s) generated.\n", n)
 		}
+		if n >= rLimit {
+			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", rLimit)
+		}
 		return nil
 	}
 
@@ -268,6 +271,9 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr, "No events matched the specified criteria.")
 	} else {
 		fmt.Fprintf(os.Stderr, "%d reversal statement(s) written to %s\n", n, rOutput)
+	}
+	if n >= rLimit {
+		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", rLimit)
 	}
 	return nil
 }

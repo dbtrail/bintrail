@@ -330,6 +330,9 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 		if n > 0 && format != "json" {
 			text += fmt.Sprintf("\n%d row(s)\n", n)
 		}
+		if n >= opts.Limit {
+			text += fmt.Sprintf("\nWarning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
+		}
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -414,6 +417,9 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 		}
 		if n > 0 {
 			text += fmt.Sprintf("\n-- %d reversal statement(s) generated.\n", n)
+		}
+		if n >= opts.Limit {
+			text += fmt.Sprintf("\n-- Warning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
 		}
 
 		return &mcp.CallToolResult{
