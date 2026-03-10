@@ -307,7 +307,6 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 		} else {
 			// Fetch from live index + archives, merge, then format.
 			fetchOpts := opts
-			fetchOpts.Limit = 0
 			results, err := engine.Fetch(ctx, fetchOpts)
 			if err != nil {
 				return errorResult(err), nil, nil
@@ -382,7 +381,6 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 		var rows []query.ResultRow
 		if len(archSources) > 0 {
 			fetchOpts := opts
-			fetchOpts.Limit = 0
 			rows, err = engine.Fetch(ctx, fetchOpts)
 			if err != nil {
 				return errorResult(err), nil, nil

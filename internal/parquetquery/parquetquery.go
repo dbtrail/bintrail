@@ -75,16 +75,18 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		// Download and query one file at a time. DuckDB reads the local
 		// file, then we delete it before moving to the next — peak memory
 		// is one file's decompressed data, not all files combined.
-		// No ORDER BY here: the caller (query.MergeResults) sorts after
-		// collecting all results. Skipping ORDER BY lets DuckDB stream
-		// matching rows without buffering the full result set.
+		// Each file is queried with ORDER BY + LIMIT so DuckDB uses its
+		// top-N optimization (keeps only LIMIT rows in memory during sort)
+		// instead of materializing the entire result set. The caller's
+		// MergeResults merge-sorts the per-file results and re-applies
+		// the limit for the correct global top-K.
 		var results []query.ResultRow
 		for _, f := range files {
 			tmpPath, err := downloadS3ToTemp(ctx, f, bucketRegion)
 			if err != nil {
 				return nil, fmt.Errorf("download archive file: %w", err)
 			}
-			q, args := buildUnsortedQuery(tmpPath, opts)
+			q, args := buildQuery(tmpPath, opts)
 			rows, err := db.QueryContext(ctx, q, args...)
 			if err != nil {
 				os.Remove(tmpPath)
