@@ -41,11 +41,12 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 	}
 
 	// Constrain DuckDB resource usage for container environments.
-	// DuckDB requires 125MB per thread minimum; 1 thread keeps baseline
-	// low so more memory is available for data. preserve_insertion_order
-	// is safe to disable because our queries have explicit ORDER BY.
+	// DuckDB requires ~125MB per thread; 2 threads allows parallelism
+	// across row groups while staying within container memory limits.
+	// preserve_insertion_order is safe to disable because our queries
+	// have explicit ORDER BY.
 	for _, stmt := range []string{
-		"SET threads = 1",
+		"SET threads = 2",
 		"SET memory_limit = '4GB'",
 		"SET preserve_insertion_order = false",
 	} {
