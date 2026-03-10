@@ -177,7 +177,6 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	var rows []query.ResultRow
 	if len(archSources) > 0 {
 		fetchOpts := opts
-		fetchOpts.Limit = 0
 
 		if plan != nil && plan.SkipMySQL() {
 			slog.Debug("planner: skipping MySQL query (range fully archived)")

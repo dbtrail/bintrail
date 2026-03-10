@@ -195,11 +195,10 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Fetch from index + archives, then merge ───────────────────────────────
-	// Each source fetches without a per-source row limit (Limit: 0) so that
-	// chronologically older events in the archives are not discarded before the
-	// merge sort. The user's --limit is applied once, after sorting.
+	// Each source applies ORDER BY + LIMIT independently. The global top-K is
+	// always a subset of the union of per-source top-K results (all sources
+	// sort by the same key), so MergeResults correctly picks the final top-K.
 	fetchOpts := opts
-	fetchOpts.Limit = 0
 
 	// When the planner says MySQL can be skipped (entire range is archived),
 	// avoid the unnecessary MySQL query.
