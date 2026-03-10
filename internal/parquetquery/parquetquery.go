@@ -46,7 +46,7 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 	// is safe to disable because our queries have explicit ORDER BY.
 	for _, stmt := range []string{
 		"SET threads = 1",
-		"SET memory_limit = '1GB'",
+		"SET memory_limit = '4GB'",
 		"SET preserve_insertion_order = false",
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
