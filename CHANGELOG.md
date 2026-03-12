@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-12
+
+### Added
+- `list_schema_changes` MCP tool — queries the `schema_changes` table with filters (`schema`, `table`, `ddl_type`, `since`, `until`, `limit`), making DDL audit data queryable via MCP
+- TRUNCATE DDL support — `parseDDL()` now detects `TRUNCATE [TABLE]` statements and records them in `schema_changes`
+- Composite index `idx_schema_table` on `schema_changes` for efficient per-table lookups
+
+### Changed
+- Rotate now archives and drops one partition at a time instead of archiving all partitions first and then dropping in a single bulk `ALTER TABLE` — reduces disk space pressure during large rotations and ensures each partition is freed immediately after archiving
+
 ## [0.2.16] - 2026-03-10
 
 ### Added
