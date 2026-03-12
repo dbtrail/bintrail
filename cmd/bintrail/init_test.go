@@ -488,4 +488,7 @@ func TestDDLSchemaChanges_hasIndex(t *testing.T) {
 	if !strings.Contains(ddlSchemaChanges, "idx_detected_at") {
 		t.Error("ddlSchemaChanges must contain idx_detected_at index")
 	}
+	if !strings.Contains(ddlSchemaChanges, "idx_schema_table") {
+		t.Error("ddlSchemaChanges must contain idx_schema_table index")
+	}
 }

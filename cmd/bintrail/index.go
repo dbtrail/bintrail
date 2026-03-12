@@ -143,8 +143,18 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	idx := indexer.New(indexDB, idxBatchSize)
 
 	// DDL handler: auto-snapshot when --source-dsn is available; warn-only otherwise.
+	// TRUNCATE does not change schema structure, so skip snapshot for it.
 	schemas := parseSchemaList(idxSchemas)
 	idx.SetOnDDL(func(ev parser.Event) error {
+		if ev.DDLType == parser.DDLTruncateTable {
+			slog.Info("DDL detected (no snapshot needed)",
+				"file", ev.BinlogFile, "pos", ev.EndPos, "ddl_type", ev.DDLType, "query", ev.DDLQuery)
+			if err := insertSchemaChange(indexDB, ev, nil); err != nil {
+				slog.Warn("failed to record schema change", "error", err)
+			}
+			return nil
+		}
+
 		if sourceDB == nil {
 			slog.Warn("DDL detected but --source-dsn not provided; run `bintrail snapshot` if schema changed",
 				"file", ev.BinlogFile, "pos", ev.EndPos, "ddl_type", ev.DDLType, "query", ev.DDLQuery)
