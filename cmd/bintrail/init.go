@@ -650,5 +650,6 @@ const ddlSchemaChanges = `CREATE TABLE IF NOT EXISTS schema_changes (
     ddl_type        VARCHAR(50) NOT NULL,
     ddl_query       TEXT NOT NULL,
     snapshot_id     INT UNSIGNED DEFAULT NULL COMMENT 'auto-snapshot after DDL; NULL when not taken (file mode or snapshot failure)',
-    INDEX idx_detected_at (detected_at)
+    INDEX idx_detected_at (detected_at),
+    INDEX idx_schema_table (schema_name, table_name)
 ) ENGINE=InnoDB`

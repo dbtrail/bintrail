@@ -50,7 +50,7 @@ type Event struct {
 	RowAfter      map[string]any // nil for DELETE
 	SchemaVersion uint32         // actual snapshot_id from schema_snapshots; updated by SwapResolver on DDL
 	DDLQuery      string         // original DDL statement (EventDDL only)
-	DDLType       DDLKind        // ALTER TABLE, CREATE TABLE, DROP TABLE, RENAME TABLE (EventDDL only)
+	DDLType       DDLKind        // ALTER TABLE, CREATE TABLE, DROP TABLE, RENAME TABLE, TRUNCATE TABLE (EventDDL only)
 }
 
 // ─── Filters ─────────────────────────────────────────────────────────────────
@@ -409,24 +409,26 @@ func formatGTID(sid []byte, gno int64) string {
 type DDLKind string
 
 const (
-	DDLAlterTable  DDLKind = "ALTER TABLE"
-	DDLCreateTable DDLKind = "CREATE TABLE"
-	DDLDropTable   DDLKind = "DROP TABLE"
-	DDLRenameTable DDLKind = "RENAME TABLE"
+	DDLAlterTable    DDLKind = "ALTER TABLE"
+	DDLCreateTable   DDLKind = "CREATE TABLE"
+	DDLDropTable     DDLKind = "DROP TABLE"
+	DDLRenameTable   DDLKind = "RENAME TABLE"
+	DDLTruncateTable DDLKind = "TRUNCATE TABLE"
 )
 
 // ddlTableRe extracts the schema and table name from DDL statements.
 // Handles: ALTER TABLE [schema.]table, CREATE TABLE [IF NOT EXISTS] [schema.]table,
-// DROP TABLE [IF EXISTS] [schema.]table, RENAME TABLE [schema.]table.
+// DROP TABLE [IF EXISTS] [schema.]table, RENAME TABLE [schema.]table,
+// TRUNCATE [TABLE] [schema.]table.
 // Backtick-quoted identifiers are supported via `([^`]+)`.
 var ddlTableRe = regexp.MustCompile(
-	`(?i)(?:ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|RENAME\s+TABLE)\s+` +
+	`(?i)(?:ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|RENAME\s+TABLE|TRUNCATE(?:\s+TABLE)?)\s+` +
 		"(?:`([^`]+)`\\.`([^`]+)`|`([^`]+)`|(\\w+)\\.(\\w+)|(\\w+))")
 
 // parseDDL parses a QUERY_EVENT for DDL statements and returns a DDL Event.
-// Returns zero Event and false if the query is not a schema-changing DDL.
-// TRUNCATE is intentionally excluded — it removes rows but does not change
-// column structure, so it does not invalidate the snapshot.
+// Returns zero Event and false if the query is not a DDL statement.
+// TRUNCATE is included for audit purposes but does not invalidate the snapshot
+// (callers should skip auto-snapshot for DDLTruncateTable).
 func parseDDL(logger *slog.Logger, filename string, logPos uint32, timestamp time.Time, gtid, queryStr string, schemaVersion uint32) (Event, bool) {
 	upper := strings.ToUpper(strings.TrimSpace(queryStr))
 
@@ -440,6 +442,8 @@ func parseDDL(logger *slog.Logger, filename string, logPos uint32, timestamp tim
 		ddlType = DDLDropTable
 	case strings.HasPrefix(upper, "RENAME TABLE"):
 		ddlType = DDLRenameTable
+	case strings.HasPrefix(upper, "TRUNCATE"):
+		ddlType = DDLTruncateTable
 	default:
 		return Event{}, false
 	}

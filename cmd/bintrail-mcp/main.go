@@ -35,6 +35,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -124,6 +125,18 @@ func newServerWithDSN(dsnOverride string) *mcp.Server {
 			IdempotentHint: true,
 		},
 	}, makeStatusTool(resolveFn))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "list_schema_changes",
+		Description: "List DDL schema changes (CREATE, ALTER, DROP, RENAME, TRUNCATE) " +
+			"recorded during binlog indexing or streaming. " +
+			"Returns the full DDL statement, binlog coordinates, and timestamp for each change.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:          "List schema changes",
+			ReadOnlyHint:   true,
+			IdempotentHint: true,
+		},
+	}, makeSchemaChangesTool(connectFn))
 
 	return server
 }
@@ -241,6 +254,16 @@ type recoverArgs struct {
 
 type statusArgs struct {
 	IndexDSN string `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
+}
+
+type schemaChangesArgs struct {
+	IndexDSN string `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
+	Schema   string `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
+	Table    string `json:"table,omitempty" jsonschema:"Filter by table name"`
+	DDLType  string `json:"ddl_type,omitempty" jsonschema:"Filter by DDL type: CREATE ALTER DROP RENAME or TRUNCATE"`
+	Since    string `json:"since,omitempty" jsonschema:"Filter changes at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	Until    string `json:"until,omitempty" jsonschema:"Filter changes at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	Limit    int    `json:"limit,omitempty" jsonschema:"Maximum number of changes to return (default: 100)"`
 }
 
 // connectFunc abstracts DSN resolution and DB connection for tool handlers.
@@ -463,6 +486,126 @@ func makeStatusTool(resolve resolveFunc) func(context.Context, *mcp.CallToolRequ
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: buf.String()},
+			},
+		}, nil, nil
+	}
+}
+
+func makeSchemaChangesTool(connect connectFunc) func(context.Context, *mcp.CallToolRequest, schemaChangesArgs) (*mcp.CallToolResult, any, error) {
+	return func(ctx context.Context, req *mcp.CallToolRequest, args schemaChangesArgs) (*mcp.CallToolResult, any, error) {
+		// Validate inputs before connecting.
+		sinceT, err := cliutil.ParseTime(args.Since)
+		if err != nil {
+			return errorResult(fmt.Errorf("invalid since: %w", err)), nil, nil
+		}
+		untilT, err := cliutil.ParseTime(args.Until)
+		if err != nil {
+			return errorResult(fmt.Errorf("invalid until: %w", err)), nil, nil
+		}
+
+		if args.DDLType != "" {
+			upper := strings.ToUpper(args.DDLType)
+			switch upper {
+			case "CREATE", "ALTER", "DROP", "RENAME", "TRUNCATE":
+				// valid
+			default:
+				return errorResult(fmt.Errorf("invalid ddl_type %q; must be CREATE, ALTER, DROP, RENAME, or TRUNCATE", args.DDLType)), nil, nil
+			}
+		}
+
+		limit := args.Limit
+		if limit <= 0 {
+			limit = 100
+		}
+
+		db, err := connect(args.IndexDSN)
+		if err != nil {
+			return errorResult(err), nil, nil
+		}
+		defer db.Close()
+
+		q := "SELECT id, detected_at, schema_name, table_name, ddl_type, ddl_query, binlog_file, binlog_pos, gtid FROM schema_changes WHERE 1=1"
+		var params []any
+
+		if args.Schema != "" {
+			q += " AND schema_name = ?"
+			params = append(params, args.Schema)
+		}
+		if args.Table != "" {
+			q += " AND table_name = ?"
+			params = append(params, args.Table)
+		}
+		if args.DDLType != "" {
+			// Match prefix: "ALTER" matches "ALTER TABLE", etc.
+			q += " AND ddl_type LIKE ?"
+			params = append(params, strings.ToUpper(args.DDLType)+"%")
+		}
+		if sinceT != nil {
+			q += " AND detected_at >= ?"
+			params = append(params, *sinceT)
+		}
+		if untilT != nil {
+			q += " AND detected_at <= ?"
+			params = append(params, *untilT)
+		}
+		q += " ORDER BY detected_at DESC LIMIT ?"
+		params = append(params, limit)
+
+		rows, err := db.QueryContext(ctx, q, params...)
+		if err != nil {
+			return errorResult(fmt.Errorf("query schema_changes: %w", err)), nil, nil
+		}
+		defer rows.Close()
+
+		type schemaChange struct {
+			ID         int64  `json:"id"`
+			DetectedAt string `json:"detected_at"`
+			Schema     string `json:"schema_name"`
+			Table      string `json:"table_name"`
+			DDLType    string `json:"ddl_type"`
+			Statement  string `json:"statement"`
+			BinlogFile string `json:"binlog_file"`
+			BinlogPos  int64  `json:"binlog_pos"`
+			GTID       string `json:"gtid,omitempty"`
+		}
+
+		var results []schemaChange
+		for rows.Next() {
+			var sc schemaChange
+			var detectedAt time.Time
+			var gtid sql.NullString
+			if err := rows.Scan(&sc.ID, &detectedAt, &sc.Schema, &sc.Table, &sc.DDLType, &sc.Statement, &sc.BinlogFile, &sc.BinlogPos, &gtid); err != nil {
+				return errorResult(fmt.Errorf("scan: %w", err)), nil, nil
+			}
+			sc.DetectedAt = detectedAt.UTC().Format("2006-01-02 15:04:05")
+			if gtid.Valid {
+				sc.GTID = gtid.String
+			}
+			results = append(results, sc)
+		}
+		if err := rows.Err(); err != nil {
+			return errorResult(fmt.Errorf("rows iteration: %w", err)), nil, nil
+		}
+
+		out, err := json.MarshalIndent(results, "", "  ")
+		if err != nil {
+			return errorResult(fmt.Errorf("marshal: %w", err)), nil, nil
+		}
+
+		text := string(out)
+		n := len(results)
+		if n > 0 {
+			text += fmt.Sprintf("\n\n%d schema change(s)", n)
+		} else {
+			text = "No schema changes found."
+		}
+		if n >= limit {
+			text += fmt.Sprintf("\nWarning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.", limit)
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: text},
 			},
 		}, nil, nil
 	}
