@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -287,16 +288,20 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 						skipUpload := false
 						if rotRetry {
 							var uploadedAt sql.NullTime
-							if err := db.QueryRowContext(ctx,
+							err := db.QueryRowContext(ctx,
 								`SELECT s3_uploaded_at FROM archive_state
 								WHERE partition_name = ? AND bintrail_id = ?`,
 								name, rotBintrailID,
-							).Scan(&uploadedAt); err == nil && uploadedAt.Valid {
+							).Scan(&uploadedAt)
+							switch {
+							case err == nil && uploadedAt.Valid:
 								slog.Info("skipping existing S3 upload (--retry)", "partition", name)
 								if rotFormat != "json" {
 									fmt.Fprintf(os.Stdout, "skipped S3 upload for %s (already uploaded)\n", name)
 								}
 								skipUpload = true
+							case err != nil && !errors.Is(err, sql.ErrNoRows):
+								return 0, 0, fmt.Errorf("check S3 upload state for %s: %w", name, err)
 							}
 						}
 
@@ -327,6 +332,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					if err := dropPartitions(ctx, db, dbName, []string{name}); err != nil {
 						return 0, 0, fmt.Errorf("failed to drop partition %s: %w", name, err)
 					}
+					slog.Info("dropped partition", "partition", name)
 					if rotFormat != "json" {
 						fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
 					}
