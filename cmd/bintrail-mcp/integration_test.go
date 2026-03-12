@@ -74,13 +74,13 @@ func TestListTools(t *testing.T) {
 		names[tool.Name] = true
 	}
 
-	for _, want := range []string{"query", "recover", "status"} {
+	for _, want := range []string{"query", "recover", "status", "list_schema_changes"} {
 		if !names[want] {
 			t.Errorf("tool %q not found; got: %v", want, names)
 		}
 	}
-	if len(result.Tools) != 3 {
-		t.Errorf("expected 3 tools, got %d", len(result.Tools))
+	if len(result.Tools) != 4 {
+		t.Errorf("expected 4 tools, got %d", len(result.Tools))
 	}
 }
 

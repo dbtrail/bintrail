@@ -206,6 +206,10 @@ func TestParseDDL_ddlStatements(t *testing.T) {
 		{"ALTER TABLE `mydb`.`orders` ADD COLUMN foo INT", DDLAlterTable, "mydb", "orders"},
 		{"DROP TABLE IF EXISTS old_tbl", DDLDropTable, "", "old_tbl"},
 		{"CREATE TABLE IF NOT EXISTS `mydb`.`new_tbl` (id INT)", DDLCreateTable, "mydb", "new_tbl"},
+		{"TRUNCATE orders", DDLTruncateTable, "", "orders"},
+		{"TRUNCATE TABLE orders", DDLTruncateTable, "", "orders"},
+		{"TRUNCATE TABLE mydb.orders", DDLTruncateTable, "mydb", "orders"},
+		{"TRUNCATE `mydb`.`orders`", DDLTruncateTable, "mydb", "orders"},
 	}
 
 	for _, tt := range tests {
@@ -247,7 +251,6 @@ func TestParseDDL_nonDDL(t *testing.T) {
 		"INSERT INTO orders VALUES (1)",
 		"UPDATE orders SET status = 'done'",
 		"SELECT 1",
-		"TRUNCATE orders", // TRUNCATE does not change schema structure
 	}
 	for _, stmt := range nonDDL {
 		buf.Reset()

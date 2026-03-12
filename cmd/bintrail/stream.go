@@ -747,7 +747,18 @@ func runStream(cmd *cobra.Command, args []string) error {
 	schemas := parseSchemaList(strmSchemas)
 	// ddlHandler performs best-effort snapshot + recording. It always returns nil
 	// so that streaming continues even if the snapshot or recording fails.
+	// TRUNCATE does not change schema structure, so skip snapshot for it.
 	ddlHandler := func(ev parser.Event) error {
+		if ev.DDLType == parser.DDLTruncateTable {
+			slog.Info("DDL detected (no snapshot needed)",
+				"file", ev.BinlogFile, "pos", ev.EndPos,
+				"ddl_type", ev.DDLType, "schema", ev.Schema, "table", ev.Table)
+			if err := insertSchemaChange(indexDB, ev, nil); err != nil {
+				slog.Warn("failed to record schema change", "error", err)
+			}
+			return nil
+		}
+
 		slog.Info("DDL detected — taking auto-snapshot",
 			"file", ev.BinlogFile, "pos", ev.EndPos,
 			"ddl_type", ev.DDLType, "schema", ev.Schema, "table", ev.Table)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -260,5 +261,92 @@ func TestResolveArchiveSources_partialEnvVarsIgnored(t *testing.T) {
 	sources := resolveArchiveSources(t.Context(), nil)
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources with partial env vars, got %d", len(sources))
+	}
+}
+
+// ─── list_schema_changes tool ────────────────────────────────────────────────
+
+func TestNewServer_registersSchemaChangesTool(t *testing.T) {
+	// Verifies newServer() doesn't panic with the list_schema_changes tool
+	// registered (catches jsonschema tag issues at construction time).
+	server := newServer()
+	if server == nil {
+		t.Fatal("newServer() returned nil")
+	}
+}
+
+func TestSchemaChangesArgs_invalidDDLType(t *testing.T) {
+	connect := func(dsn string) (*sql.DB, error) {
+		return nil, fmt.Errorf("should not connect")
+	}
+	handler := makeSchemaChangesTool(connect)
+	result, _, _ := handler(t.Context(), nil, schemaChangesArgs{
+		IndexDSN: "user:pass@tcp(localhost)/db",
+		DDLType:  "UPSERT",
+	})
+	if !result.IsError {
+		t.Error("expected error for invalid ddl_type")
+	}
+	tc := result.Content[0].(*mcp.TextContent)
+	if !strings.Contains(tc.Text, "invalid ddl_type") {
+		t.Errorf("expected 'invalid ddl_type' in error, got: %s", tc.Text)
+	}
+}
+
+func TestSchemaChangesArgs_invalidSince(t *testing.T) {
+	connect := func(dsn string) (*sql.DB, error) {
+		return nil, fmt.Errorf("should not connect")
+	}
+	handler := makeSchemaChangesTool(connect)
+	result, _, _ := handler(t.Context(), nil, schemaChangesArgs{
+		IndexDSN: "user:pass@tcp(localhost)/db",
+		Since:    "not-a-date",
+	})
+	if !result.IsError {
+		t.Error("expected error for invalid since")
+	}
+	tc := result.Content[0].(*mcp.TextContent)
+	if !strings.Contains(tc.Text, "since") {
+		t.Errorf("expected 'since' in error, got: %s", tc.Text)
+	}
+}
+
+func TestSchemaChangesArgs_invalidUntil(t *testing.T) {
+	connect := func(dsn string) (*sql.DB, error) {
+		return nil, fmt.Errorf("should not connect")
+	}
+	handler := makeSchemaChangesTool(connect)
+	result, _, _ := handler(t.Context(), nil, schemaChangesArgs{
+		IndexDSN: "user:pass@tcp(localhost)/db",
+		Until:    "not-a-date",
+	})
+	if !result.IsError {
+		t.Error("expected error for invalid until")
+	}
+	tc := result.Content[0].(*mcp.TextContent)
+	if !strings.Contains(tc.Text, "until") {
+		t.Errorf("expected 'until' in error, got: %s", tc.Text)
+	}
+}
+
+func TestSchemaChangesArgs_validDDLTypes(t *testing.T) {
+	for _, ddlType := range []string{"CREATE", "ALTER", "DROP", "RENAME", "TRUNCATE", "create", "alter"} {
+		connect := func(dsn string) (*sql.DB, error) {
+			// Return connection error — the validation should pass before connecting.
+			return nil, fmt.Errorf("expected connect")
+		}
+		handler := makeSchemaChangesTool(connect)
+		result, _, _ := handler(t.Context(), nil, schemaChangesArgs{
+			IndexDSN: "user:pass@tcp(localhost)/db",
+			DDLType:  ddlType,
+		})
+		if !result.IsError {
+			t.Errorf("expected connect error for valid ddl_type %q (not validation error)", ddlType)
+			continue
+		}
+		tc := result.Content[0].(*mcp.TextContent)
+		if strings.Contains(tc.Text, "invalid ddl_type") {
+			t.Errorf("ddl_type %q should be valid, got: %s", ddlType, tc.Text)
+		}
 	}
 }
