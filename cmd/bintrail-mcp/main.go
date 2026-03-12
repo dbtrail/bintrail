@@ -553,6 +553,9 @@ func makeSchemaChangesTool(connect connectFunc) func(context.Context, *mcp.CallT
 
 		rows, err := db.QueryContext(ctx, q, params...)
 		if err != nil {
+			if strings.Contains(err.Error(), "doesn't exist") || strings.Contains(err.Error(), "1146") {
+				return errorResult(fmt.Errorf("schema_changes table not found; run `bintrail init` to create it")), nil, nil
+			}
 			return errorResult(fmt.Errorf("query schema_changes: %w", err)), nil, nil
 		}
 		defer rows.Close()
