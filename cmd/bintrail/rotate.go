@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -220,6 +221,8 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 			}
 		} else {
 			// Archive partitions to Parquet before dropping, if requested.
+			// Each partition is dropped immediately after archiving to free
+			// disk space incrementally and reduce the crash window.
 			if rotArchiveDir != "" {
 				// Set up S3 client once for all uploads (nil when --archive-s3 is not set).
 				var s3Client *s3.Client
@@ -248,7 +251,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					if skipped {
 						slog.Info("skipping existing archive (--retry)", "partition", name, "file", outPath)
 						if rotFormat != "json" {
-							fmt.Fprintf(os.Stdout, "skipped partition %s (already archived) \u2192 %s\n", name, outPath)
+							fmt.Fprintf(os.Stdout, "skipped partition %s (already archived) → %s\n", name, outPath)
 						}
 					} else {
 						n, err = archive.ArchivePartition(ctx, db, dbName, name, outPath, rotArchiveCompression)
@@ -256,7 +259,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 							return 0, 0, fmt.Errorf("archive partition %s: %w", name, err)
 						}
 						if rotFormat != "json" {
-							fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) \u2192 %s\n", name, n, outPath)
+							fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) → %s\n", name, n, outPath)
 						}
 					}
 
@@ -282,51 +285,67 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					}
 
 					if s3Client != nil {
-						// When retrying, skip partitions already uploaded to S3.
+						skipUpload := false
 						if rotRetry {
 							var uploadedAt sql.NullTime
-							if err := db.QueryRowContext(ctx,
+							err := db.QueryRowContext(ctx,
 								`SELECT s3_uploaded_at FROM archive_state
 								WHERE partition_name = ? AND bintrail_id = ?`,
 								name, rotBintrailID,
-							).Scan(&uploadedAt); err == nil && uploadedAt.Valid {
+							).Scan(&uploadedAt)
+							switch {
+							case err == nil && uploadedAt.Valid:
 								slog.Info("skipping existing S3 upload (--retry)", "partition", name)
 								if rotFormat != "json" {
 									fmt.Fprintf(os.Stdout, "skipped S3 upload for %s (already uploaded)\n", name)
 								}
-								continue
+								skipUpload = true
+							case err != nil && !errors.Is(err, sql.ErrNoRows):
+								return 0, 0, fmt.Errorf("check S3 upload state for %s: %w", name, err)
 							}
 						}
 
-						key, err := buildS3Key(rotArchiveDir, outPath, s3Prefix)
-						if err != nil {
-							return 0, 0, fmt.Errorf("build S3 key for %s: %w", name, err)
-						}
-						if err := uploadFile(ctx, s3Client, outPath, s3Bucket, key); err != nil {
-							return 0, 0, fmt.Errorf("upload %s to S3: %w", name, err)
-						}
-						if _, err := db.ExecContext(ctx,
-							`UPDATE archive_state
-								SET s3_bucket = ?, s3_key = ?, s3_uploaded_at = UTC_TIMESTAMP()
-							WHERE partition_name = ? AND bintrail_id = ?`,
-							s3Bucket, key, name, rotBintrailID,
-						); err != nil {
-							return 0, 0, fmt.Errorf("update archive state S3 info for %s: %w", name, err)
-						}
-						slog.Info("uploaded archive to S3", "partition", name, "bucket", s3Bucket, "key", key)
-						if rotFormat != "json" {
-							fmt.Fprintf(os.Stdout, "uploaded %s \u2192 s3://%s/%s\n", name, s3Bucket, key)
+						if !skipUpload {
+							key, err := buildS3Key(rotArchiveDir, outPath, s3Prefix)
+							if err != nil {
+								return 0, 0, fmt.Errorf("build S3 key for %s: %w", name, err)
+							}
+							if err := uploadFile(ctx, s3Client, outPath, s3Bucket, key); err != nil {
+								return 0, 0, fmt.Errorf("upload %s to S3: %w", name, err)
+							}
+							if _, err := db.ExecContext(ctx,
+								`UPDATE archive_state
+									SET s3_bucket = ?, s3_key = ?, s3_uploaded_at = UTC_TIMESTAMP()
+								WHERE partition_name = ? AND bintrail_id = ?`,
+								s3Bucket, key, name, rotBintrailID,
+							); err != nil {
+								return 0, 0, fmt.Errorf("update archive state S3 info for %s: %w", name, err)
+							}
+							slog.Info("uploaded archive to S3", "partition", name, "bucket", s3Bucket, "key", key)
+							if rotFormat != "json" {
+								fmt.Fprintf(os.Stdout, "uploaded %s → s3://%s/%s\n", name, s3Bucket, key)
+							}
 						}
 					}
-				}
-			}
 
-			if err := dropPartitions(ctx, db, dbName, toDrop); err != nil {
-				return 0, 0, fmt.Errorf("failed to drop partitions: %w", err)
-			}
-			for _, name := range toDrop {
-				if rotFormat != "json" {
-					fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+					// Drop this partition immediately after archiving.
+					if err := dropPartitions(ctx, db, dbName, []string{name}); err != nil {
+						return 0, 0, fmt.Errorf("failed to drop partition %s: %w", name, err)
+					}
+					slog.Info("dropped partition", "partition", name)
+					if rotFormat != "json" {
+						fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+					}
+				}
+			} else {
+				// No archiving — drop all expired partitions at once.
+				if err := dropPartitions(ctx, db, dbName, toDrop); err != nil {
+					return 0, 0, fmt.Errorf("failed to drop partitions: %w", err)
+				}
+				for _, name := range toDrop {
+					if rotFormat != "json" {
+						fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+					}
 				}
 			}
 			droppedCount = len(toDrop)
@@ -343,7 +362,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 	if err != nil {
 		slog.Warn("could not check p_future data", "error", err)
 	} else if hasFutureData {
-		slog.Warn("p_future partition contains data \u2014 events are arriving outside all named partition ranges; consider adding more future partitions with --add-future")
+		slog.Warn("p_future partition contains data — events are arriving outside all named partition ranges; consider adding more future partitions with --add-future")
 	}
 
 	// ── Add new future partitions ─────────────────────────────────────────────
