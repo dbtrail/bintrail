@@ -75,6 +75,28 @@ CREATE TABLE IF NOT EXISTS schema_snapshots (
 -- NewResolver(db, 0) loads the latest snapshot; NewResolver(db, N) loads snapshot N.
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Foreign key constraints table
+-- Stores FK relationships captured from INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+-- joined with REFERENTIAL_CONSTRAINTS. Populated by `bintrail snapshot` using
+-- the same snapshot_id as schema_snapshots.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS fk_constraints (
+    snapshot_id              INT UNSIGNED NOT NULL,
+    constraint_name          VARCHAR(64)  NOT NULL,
+    schema_name              VARCHAR(64)  NOT NULL,
+    table_name               VARCHAR(64)  NOT NULL,
+    column_name              VARCHAR(64)  NOT NULL,
+    ordinal_position         INT          NOT NULL,
+    referenced_schema_name   VARCHAR(64)  NOT NULL,
+    referenced_table_name    VARCHAR(64)  NOT NULL,
+    referenced_column_name   VARCHAR(64)  NOT NULL,
+    PRIMARY KEY (snapshot_id, schema_name, constraint_name, ordinal_position)
+) ENGINE=InnoDB;
+-- One row per FK column mapping. Composite FKs produce multiple rows with
+-- increasing ordinal_position. The snapshot_id ties FK data to the column
+-- metadata in schema_snapshots taken at the same time.
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Server identity tables
 -- bintrail_id is the stable, Bintrail-generated UUID for each MySQL server.
 -- Identity resolution rules absorb individual component changes (UUID regen,
