@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-03-13
+
+### Added
+- Capture foreign key constraints in schema snapshots — `bintrail snapshot` now queries `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` joined with `REFERENTIAL_CONSTRAINTS` and stores FK relationships in a new `fk_constraints` table, using the same `snapshot_id` as `schema_snapshots`
+- New `fk_constraints` table created by `bintrail init` — no additional MySQL grants required
+- Graceful upgrade path: existing installations that upgrade without re-running `bintrail init` get a warning instead of a failed snapshot
+
 ## [0.3.0] - 2026-03-12
 
 ### Added
