@@ -179,14 +179,14 @@ type columnRow struct {
 // fkRow holds a single foreign key column mapping as fetched from
 // INFORMATION_SCHEMA.KEY_COLUMN_USAGE joined with REFERENTIAL_CONSTRAINTS.
 type fkRow struct {
-	constraintName        string
-	tableSchema           string
-	tableName             string
-	columnName            string
-	ordinalPosition       int
-	referencedTableSchema string
-	referencedTableName   string
-	referencedColumnName  string
+	constraintName       string
+	schemaName           string
+	tableName            string
+	columnName           string
+	ordinalPosition      int
+	referencedSchemaName string
+	referencedTableName  string
+	referencedColumnName string
 }
 
 // TakeSnapshot reads column metadata from information_schema on the source
@@ -322,15 +322,15 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 
 		valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?),", len(batch)), ",")
 		insertSQL := "INSERT INTO fk_constraints " +
-			"(snapshot_id, constraint_name, table_schema, table_name, column_name, " +
-			"ordinal_position, referenced_table_schema, referenced_table_name, referenced_column_name) VALUES " +
+			"(snapshot_id, constraint_name, schema_name, table_name, column_name, " +
+			"ordinal_position, referenced_schema_name, referenced_table_name, referenced_column_name) VALUES " +
 			valClause
 
 		insertArgs := make([]any, 0, len(batch)*9)
 		for _, fk := range batch {
 			insertArgs = append(insertArgs,
-				nextID, fk.constraintName, fk.tableSchema, fk.tableName, fk.columnName,
-				fk.ordinalPosition, fk.referencedTableSchema, fk.referencedTableName, fk.referencedColumnName,
+				nextID, fk.constraintName, fk.schemaName, fk.tableName, fk.columnName,
+				fk.ordinalPosition, fk.referencedSchemaName, fk.referencedTableName, fk.referencedColumnName,
 			)
 		}
 
@@ -403,9 +403,9 @@ func queryFKConstraints(sourceDB *sql.DB, schemas []string) ([]fkRow, error) {
 	for rows.Next() {
 		var fk fkRow
 		if err := rows.Scan(
-			&fk.constraintName, &fk.tableSchema, &fk.tableName,
+			&fk.constraintName, &fk.schemaName, &fk.tableName,
 			&fk.columnName, &fk.ordinalPosition,
-			&fk.referencedTableSchema, &fk.referencedTableName, &fk.referencedColumnName,
+			&fk.referencedSchemaName, &fk.referencedTableName, &fk.referencedColumnName,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan FK row: %w", err)
 		}

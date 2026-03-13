@@ -247,16 +247,16 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 	) ENGINE=InnoDB`)
 
 	MustExec(t, db, `CREATE TABLE IF NOT EXISTS fk_constraints (
-		snapshot_id             BIGINT       NOT NULL,
-		constraint_name         VARCHAR(255) NOT NULL,
-		table_schema            VARCHAR(255) NOT NULL,
-		table_name              VARCHAR(255) NOT NULL,
-		column_name             VARCHAR(255) NOT NULL,
-		ordinal_position        INT          NOT NULL,
-		referenced_table_schema VARCHAR(255) NOT NULL,
-		referenced_table_name   VARCHAR(255) NOT NULL,
-		referenced_column_name  VARCHAR(255) NOT NULL,
-		PRIMARY KEY (snapshot_id, constraint_name, ordinal_position)
+		snapshot_id              INT UNSIGNED NOT NULL,
+		constraint_name          VARCHAR(255) NOT NULL,
+		schema_name              VARCHAR(255) NOT NULL,
+		table_name               VARCHAR(255) NOT NULL,
+		column_name              VARCHAR(255) NOT NULL,
+		ordinal_position         INT          NOT NULL,
+		referenced_schema_name   VARCHAR(255) NOT NULL,
+		referenced_table_name    VARCHAR(255) NOT NULL,
+		referenced_column_name   VARCHAR(255) NOT NULL,
+		PRIMARY KEY (snapshot_id, schema_name, constraint_name, ordinal_position)
 	) ENGINE=InnoDB`)
 
 	MustExec(t, db, `CREATE TABLE IF NOT EXISTS schema_changes (

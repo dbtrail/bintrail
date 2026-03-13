@@ -47,11 +47,11 @@ In the same snapshot transaction, bintrail also captures foreign key relationshi
 |--------|-------------|
 | `snapshot_id` | Same snapshot_id as the column metadata in `schema_snapshots` |
 | `constraint_name` | The FK constraint name (e.g. `fk_orders_customer`) |
-| `table_schema` | Schema of the child (referencing) table |
+| `schema_name` | Schema of the child (referencing) table |
 | `table_name` | Child table name |
 | `column_name` | Column in the child table |
 | `ordinal_position` | Position within a composite FK (1-based) |
-| `referenced_table_schema` | Schema of the parent (referenced) table |
+| `referenced_schema_name` | Schema of the parent (referenced) table |
 | `referenced_table_name` | Parent table name |
 | `referenced_column_name` | Column in the parent table |
 
