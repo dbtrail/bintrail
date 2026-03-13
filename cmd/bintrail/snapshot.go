@@ -89,20 +89,23 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 
 	if snapshotFormat == "json" {
 		return outputJSON(struct {
-			SnapshotID int `json:"snapshot_id"`
-			Tables     int `json:"tables"`
-			Columns    int `json:"columns"`
+			SnapshotID    int `json:"snapshot_id"`
+			Tables        int `json:"tables"`
+			Columns       int `json:"columns"`
+			FKConstraints int `json:"fk_constraints"`
 		}{
-			SnapshotID: stats.SnapshotID,
-			Tables:     stats.TableCount,
-			Columns:    stats.ColumnCount,
+			SnapshotID:    stats.SnapshotID,
+			Tables:        stats.TableCount,
+			Columns:       stats.ColumnCount,
+			FKConstraints: stats.FKCount,
 		})
 	}
 
 	fmt.Printf("Snapshot complete.\n")
-	fmt.Printf("  snapshot_id : %d\n", stats.SnapshotID)
-	fmt.Printf("  tables      : %d\n", stats.TableCount)
-	fmt.Printf("  columns     : %d\n", stats.ColumnCount)
+	fmt.Printf("  snapshot_id      : %d\n", stats.SnapshotID)
+	fmt.Printf("  tables           : %d\n", stats.TableCount)
+	fmt.Printf("  columns          : %d\n", stats.ColumnCount)
+	fmt.Printf("  fk constraints   : %d\n", stats.FKCount)
 	return nil
 }
 
