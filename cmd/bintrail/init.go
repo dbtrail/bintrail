@@ -182,6 +182,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	logTable("schema_changes")
 
+	if _, err := db.Exec(ddlFKConstraints); err != nil {
+		return fmt.Errorf("failed to create fk_constraints: %w", err)
+	}
+	logTable("fk_constraints")
+
 	var s3Result *string
 	if initS3Bucket != "" {
 		if initFormat != "json" {
@@ -635,6 +640,21 @@ const ddlAccessRules = `CREATE TABLE IF NOT EXISTS access_rules (
     created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY idx_profile_flag (profile_id, flag),
     CONSTRAINT fk_access_rules_profile FOREIGN KEY (profile_id) REFERENCES profiles (id) ON DELETE CASCADE
+) ENGINE=InnoDB`
+
+// ─── FK constraints ───────────────────────────────────────────────────────────
+
+const ddlFKConstraints = `CREATE TABLE IF NOT EXISTS fk_constraints (
+    snapshot_id              INT UNSIGNED NOT NULL,
+    constraint_name          VARCHAR(64)  NOT NULL,
+    schema_name              VARCHAR(64)  NOT NULL,
+    table_name               VARCHAR(64)  NOT NULL,
+    column_name              VARCHAR(64)  NOT NULL,
+    ordinal_position         INT          NOT NULL,
+    referenced_schema_name   VARCHAR(64)  NOT NULL,
+    referenced_table_name    VARCHAR(64)  NOT NULL,
+    referenced_column_name   VARCHAR(64)  NOT NULL,
+    PRIMARY KEY (snapshot_id, schema_name, constraint_name, ordinal_position)
 ) ENGINE=InnoDB`
 
 // ─── DDL tracking ─────────────────────────────────────────────────────────────

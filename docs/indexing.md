@@ -39,6 +39,36 @@ The Resolver lives in memory for the duration of the index run — one lookup pe
 
 **Column count mismatch**: If the source schema changed (an `ALTER TABLE` ran) after the snapshot was taken, the binlog column count won't match the snapshot. The parser detects this per `TABLE_MAP_EVENT` and warns, skipping that table's events rather than corrupting the data. The fix is to re-run `bintrail snapshot`.
 
+### Foreign Key Constraints
+
+In the same snapshot transaction, bintrail also captures foreign key relationships into the `fk_constraints` table. It queries `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` joined with `REFERENTIAL_CONSTRAINTS` on the source server and stores one row per FK column mapping:
+
+| Column | Description |
+|--------|-------------|
+| `snapshot_id` | Same snapshot_id as the column metadata in `schema_snapshots` |
+| `constraint_name` | The FK constraint name (e.g. `fk_orders_customer`) |
+| `schema_name` | Schema of the child (referencing) table |
+| `table_name` | Child table name |
+| `column_name` | Column in the child table |
+| `ordinal_position` | Position within a composite FK (1-based) |
+| `referenced_schema_name` | Schema of the parent (referenced) table |
+| `referenced_table_name` | Parent table name |
+| `referenced_column_name` | Column in the parent table |
+
+Composite foreign keys produce multiple rows with increasing `ordinal_position`. Tables with no foreign keys simply contribute zero rows — this is not an error.
+
+**No additional MySQL grants are required.** The same privileges that allow bintrail to read `INFORMATION_SCHEMA.COLUMNS` (which is required for column metadata) also grant visibility into `KEY_COLUMN_USAGE` and `REFERENTIAL_CONSTRAINTS`. MySQL's metadata visibility is row-level, not table-level — if you can see a table's columns, you can see its FK constraints.
+
+The snapshot output includes the FK count:
+
+```
+Snapshot complete.
+  snapshot_id      : 3
+  tables           : 42
+  columns          : 318
+  fk constraints   : 12
+```
+
 ---
 
 ## Step 2: The Parser

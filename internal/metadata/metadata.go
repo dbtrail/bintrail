@@ -3,6 +3,7 @@ package metadata
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -45,6 +46,7 @@ type SnapshotStats struct {
 	SnapshotID  int
 	TableCount  int
 	ColumnCount int
+	FKCount     int
 }
 
 // ─── Resolver ────────────────────────────────────────────────────────────────
@@ -175,8 +177,22 @@ type columnRow struct {
 	columnDefault                     sql.NullString
 }
 
-// TakeSnapshot reads column metadata from information_schema on the source
-// server and writes it atomically into schema_snapshots in the index database.
+// fkRow holds a single foreign key column mapping as fetched from
+// INFORMATION_SCHEMA.KEY_COLUMN_USAGE joined with REFERENTIAL_CONSTRAINTS.
+type fkRow struct {
+	constraintName       string
+	schemaName           string
+	tableName            string
+	columnName           string
+	ordinalPosition      int
+	referencedSchemaName string
+	referencedTableName  string
+	referencedColumnName string
+}
+
+// TakeSnapshot reads column metadata and foreign key constraints from
+// information_schema on the source server and writes them atomically into
+// schema_snapshots and fk_constraints in the index database.
 //
 // If schemas is empty, all non-system schemas are captured. The new snapshot_id
 // is allocated inside the transaction via MAX(snapshot_id)+1, so concurrent
@@ -243,6 +259,12 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		return SnapshotStats{}, err
 	}
 
+	// ── 1c. Query FK constraints from the source server ─────────────────────
+	fkRows, err := queryFKConstraints(sourceDB, schemas)
+	if err != nil {
+		return SnapshotStats{}, err
+	}
+
 	// ── 2. Write snapshot atomically into the index database ─────────────────
 	tx, err := indexDB.Begin()
 	if err != nil {
@@ -296,6 +318,48 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		}
 	}
 
+	// ── 2b. Insert FK constraint rows ───────────────────────────────────────
+	// Check that the fk_constraints table exists before inserting. Existing
+	// installations that upgrade without re-running `bintrail init` would
+	// otherwise fail the entire snapshot (including column metadata) because
+	// the transaction rolls back.
+	var fkTableExists bool
+	if err = tx.QueryRow(
+		"SELECT COUNT(*) > 0 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fk_constraints'",
+	).Scan(&fkTableExists); err != nil {
+		return SnapshotStats{}, fmt.Errorf("failed to check fk_constraints table: %w", err)
+	}
+
+	fkCount := 0
+	if !fkTableExists {
+		if len(fkRows) > 0 {
+			slog.Warn("fk_constraints table does not exist; skipping FK capture (run 'bintrail init' to create it)")
+		}
+	} else {
+		for i := 0; i < len(fkRows); i += batchSize {
+			batch := fkRows[i:min(i+batchSize, len(fkRows))]
+
+			valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?),", len(batch)), ",")
+			insertSQL := "INSERT INTO fk_constraints " +
+				"(snapshot_id, constraint_name, schema_name, table_name, column_name, " +
+				"ordinal_position, referenced_schema_name, referenced_table_name, referenced_column_name) VALUES " +
+				valClause
+
+			insertArgs := make([]any, 0, len(batch)*9)
+			for _, fk := range batch {
+				insertArgs = append(insertArgs,
+					nextID, fk.constraintName, fk.schemaName, fk.tableName, fk.columnName,
+					fk.ordinalPosition, fk.referencedSchemaName, fk.referencedTableName, fk.referencedColumnName,
+				)
+			}
+
+			if _, err = tx.Exec(insertSQL, insertArgs...); err != nil {
+				return SnapshotStats{}, fmt.Errorf("failed to insert fk_constraints batch: %w", err)
+			}
+		}
+		fkCount = len(fkRows)
+	}
+
 	if err = tx.Commit(); err != nil {
 		return SnapshotStats{}, fmt.Errorf("failed to commit snapshot: %w", err)
 	}
@@ -304,7 +368,75 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		SnapshotID:  nextID,
 		TableCount:  len(seenTables),
 		ColumnCount: len(columns),
+		FKCount:     fkCount,
 	}, nil
+}
+
+// queryFKConstraints reads foreign key constraint metadata from the source
+// database by joining KEY_COLUMN_USAGE with REFERENTIAL_CONSTRAINTS. The result
+// includes one row per FK column mapping. Returns nil (not an error) when the
+// source has no foreign keys.
+func queryFKConstraints(sourceDB *sql.DB, schemas []string) ([]fkRow, error) {
+	var (
+		query string
+		args  []any
+	)
+
+	if len(schemas) == 0 {
+		query = `
+			SELECT kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME,
+			       kcu.COLUMN_NAME, kcu.ORDINAL_POSITION,
+			       kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME,
+			       kcu.REFERENCED_COLUMN_NAME
+			FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+			JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+			    ON rc.CONSTRAINT_SCHEMA = kcu.TABLE_SCHEMA
+			    AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+			WHERE kcu.TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
+			    AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+			ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION`
+	} else {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
+		query = fmt.Sprintf(`
+			SELECT kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME,
+			       kcu.COLUMN_NAME, kcu.ORDINAL_POSITION,
+			       kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME,
+			       kcu.REFERENCED_COLUMN_NAME
+			FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+			JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+			    ON rc.CONSTRAINT_SCHEMA = kcu.TABLE_SCHEMA
+			    AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+			WHERE kcu.TABLE_SCHEMA IN (%s)
+			    AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+			ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION`, placeholders)
+		for _, s := range schemas {
+			args = append(args, s)
+		}
+	}
+
+	rows, err := sourceDB.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query FK constraints: %w", err)
+	}
+	defer rows.Close()
+
+	var fks []fkRow
+	for rows.Next() {
+		var fk fkRow
+		if err := rows.Scan(
+			&fk.constraintName, &fk.schemaName, &fk.tableName,
+			&fk.columnName, &fk.ordinalPosition,
+			&fk.referencedSchemaName, &fk.referencedTableName, &fk.referencedColumnName,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan FK row: %w", err)
+		}
+		fks = append(fks, fk)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate FK rows: %w", err)
+	}
+
+	return fks, nil
 }
 
 // validateTables checks that all base tables in scope use InnoDB and have an
