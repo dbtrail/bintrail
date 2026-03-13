@@ -190,8 +190,9 @@ type fkRow struct {
 	referencedColumnName string
 }
 
-// TakeSnapshot reads column metadata from information_schema on the source
-// server and writes it atomically into schema_snapshots in the index database.
+// TakeSnapshot reads column metadata and foreign key constraints from
+// information_schema on the source server and writes them atomically into
+// schema_snapshots and fk_constraints in the index database.
 //
 // If schemas is empty, all non-system schemas are captured. The new snapshot_id
 // is allocated inside the transaction via MAX(snapshot_id)+1, so concurrent
