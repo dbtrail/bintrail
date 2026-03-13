@@ -3,6 +3,7 @@ package metadata
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -317,26 +318,45 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	}
 
 	// ── 2b. Insert FK constraint rows ───────────────────────────────────────
-	for i := 0; i < len(fkRows); i += batchSize {
-		batch := fkRows[i:min(i+batchSize, len(fkRows))]
+	// Check that the fk_constraints table exists before inserting. Existing
+	// installations that upgrade without re-running `bintrail init` would
+	// otherwise fail the entire snapshot (including column metadata) because
+	// the transaction rolls back.
+	var fkTableExists bool
+	if err = tx.QueryRow(
+		"SELECT COUNT(*) > 0 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fk_constraints'",
+	).Scan(&fkTableExists); err != nil {
+		return SnapshotStats{}, fmt.Errorf("failed to check fk_constraints table: %w", err)
+	}
 
-		valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?),", len(batch)), ",")
-		insertSQL := "INSERT INTO fk_constraints " +
-			"(snapshot_id, constraint_name, schema_name, table_name, column_name, " +
-			"ordinal_position, referenced_schema_name, referenced_table_name, referenced_column_name) VALUES " +
-			valClause
-
-		insertArgs := make([]any, 0, len(batch)*9)
-		for _, fk := range batch {
-			insertArgs = append(insertArgs,
-				nextID, fk.constraintName, fk.schemaName, fk.tableName, fk.columnName,
-				fk.ordinalPosition, fk.referencedSchemaName, fk.referencedTableName, fk.referencedColumnName,
-			)
+	fkCount := 0
+	if !fkTableExists {
+		if len(fkRows) > 0 {
+			slog.Warn("fk_constraints table does not exist; skipping FK capture (run 'bintrail init' to create it)")
 		}
+	} else {
+		for i := 0; i < len(fkRows); i += batchSize {
+			batch := fkRows[i:min(i+batchSize, len(fkRows))]
 
-		if _, err = tx.Exec(insertSQL, insertArgs...); err != nil {
-			return SnapshotStats{}, fmt.Errorf("failed to insert fk_constraints batch: %w", err)
+			valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?),", len(batch)), ",")
+			insertSQL := "INSERT INTO fk_constraints " +
+				"(snapshot_id, constraint_name, schema_name, table_name, column_name, " +
+				"ordinal_position, referenced_schema_name, referenced_table_name, referenced_column_name) VALUES " +
+				valClause
+
+			insertArgs := make([]any, 0, len(batch)*9)
+			for _, fk := range batch {
+				insertArgs = append(insertArgs,
+					nextID, fk.constraintName, fk.schemaName, fk.tableName, fk.columnName,
+					fk.ordinalPosition, fk.referencedSchemaName, fk.referencedTableName, fk.referencedColumnName,
+				)
+			}
+
+			if _, err = tx.Exec(insertSQL, insertArgs...); err != nil {
+				return SnapshotStats{}, fmt.Errorf("failed to insert fk_constraints batch: %w", err)
+			}
 		}
+		fkCount = len(fkRows)
 	}
 
 	if err = tx.Commit(); err != nil {
@@ -347,7 +367,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		SnapshotID:  nextID,
 		TableCount:  len(seenTables),
 		ColumnCount: len(columns),
-		FKCount:     len(fkRows),
+		FKCount:     fkCount,
 	}, nil
 }
 
