@@ -495,11 +495,27 @@ func detectPositionGap(sourceDB *sql.DB, checkpointFile string, checkpointPos ui
 	}, nil
 }
 
+// gtidSetsEqual parses two GTID set strings and compares them structurally,
+// avoiding false mismatches from formatting differences (UUID case, ordering).
+func gtidSetsEqual(a, b string) bool {
+	ga, err := gomysql.ParseMysqlGTIDSet(normalizeGTIDSet(a))
+	if err != nil {
+		return false
+	}
+	gb, err := gomysql.ParseMysqlGTIDSet(normalizeGTIDSet(b))
+	if err != nil {
+		return false
+	}
+	return ga.Equal(gb)
+}
+
 // detectGTIDGap queries the source MySQL for @@gtid_purged and @@gtid_executed,
-// then checks whether the checkpoint GTID set intersects with the purged set.
+// then checks whether the checkpoint GTID set requires any purged GTIDs.
 func detectGTIDGap(sourceDB *sql.DB, checkpointGTID string) (*gapResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	checkpointGTID = normalizeGTIDSet(strings.TrimSpace(checkpointGTID))
 
 	var purgedStr, executedStr string
 	if err := sourceDB.QueryRowContext(ctx, "SELECT @@gtid_purged").Scan(&purgedStr); err != nil {
@@ -514,20 +530,18 @@ func detectGTIDGap(sourceDB *sql.DB, checkpointGTID string) (*gapResult, error) 
 
 	// If purged is empty, all GTIDs are still available.
 	if purgedStr == "" {
-		// Check if checkpoint is behind executed (fillable gap).
-		if checkpointGTID == executedStr {
+		if gtidSetsEqual(checkpointGTID, executedStr) {
 			return &gapResult{HasGap: false}, nil
 		}
 		return &gapResult{
 			HasGap:   true,
 			Fillable: true,
-			Message: fmt.Sprintf(
-				"gap detected: checkpoint GTID set is behind source @@gtid_executed; replaying missed events"),
+			Message:  "gap detected: checkpoint GTID set is behind source @@gtid_executed; replaying missed events",
 		}, nil
 	}
 
 	// Parse all three GTID sets.
-	checkpoint, err := gomysql.ParseMysqlGTIDSet(normalizeGTIDSet(checkpointGTID))
+	checkpoint, err := gomysql.ParseMysqlGTIDSet(checkpointGTID)
 	if err != nil {
 		return nil, fmt.Errorf("parse checkpoint GTID set: %w", err)
 	}
@@ -536,27 +550,40 @@ func detectGTIDGap(sourceDB *sql.DB, checkpointGTID string) (*gapResult, error) 
 		return nil, fmt.Errorf("parse @@gtid_purged: %w", err)
 	}
 
-	// Check if the checkpoint is a subset of or equal to the purged set.
-	// If checkpoint ⊆ purged, the stream needs GTIDs that have been purged.
 	cpSet := checkpoint.(*gomysql.MysqlGTIDSet)
 	purgedSet := purged.(*gomysql.MysqlGTIDSet)
 
-	// For each UUID in the checkpoint, check if the required range extends
-	// beyond what's been purged. If the checkpoint's max sequence for any UUID
-	// is less than the purged max for that UUID, those GTIDs are lost.
+	// Check if the stream would need any purged GTIDs on resume. MySQL sends
+	// all GTIDs NOT in the checkpoint set, so we must check two directions:
+	//
+	// 1. Forward: for each UUID in the checkpoint, is the checkpoint's max
+	//    below the purged max? (checkpoint needs purged GTIDs for a known UUID)
+	// 2. Reverse: are there UUIDs in the purged set that the checkpoint has
+	//    never seen? (MySQL would try to send all of that UUID's GTIDs, but
+	//    some have been purged)
 	needsPurged := false
+
+	// Direction 1: checkpoint UUIDs that are behind the purged set.
 	for uuid, cpIntervals := range cpSet.Sets {
 		purgedIntervals, exists := purgedSet.Sets[uuid]
 		if !exists {
 			continue
 		}
-		// If the checkpoint's max transaction is below the purged max,
-		// there are required GTIDs that have been purged.
 		cpMax := cpIntervals.Intervals[len(cpIntervals.Intervals)-1].Stop - 1
 		purgedMax := purgedIntervals.Intervals[len(purgedIntervals.Intervals)-1].Stop - 1
 		if cpMax < purgedMax {
 			needsPurged = true
 			break
+		}
+	}
+
+	// Direction 2: purged UUIDs the checkpoint has never seen.
+	if !needsPurged {
+		for uuid := range purgedSet.Sets {
+			if _, exists := cpSet.Sets[uuid]; !exists {
+				needsPurged = true
+				break
+			}
 		}
 	}
 
@@ -573,7 +600,7 @@ func detectGTIDGap(sourceDB *sql.DB, checkpointGTID string) (*gapResult, error) 
 	}
 
 	// Checkpoint is ahead of (or equal to) the purged set — gap is fillable.
-	if checkpointGTID == executedStr {
+	if gtidSetsEqual(checkpointGTID, executedStr) {
 		return &gapResult{HasGap: false}, nil
 	}
 	return &gapResult{

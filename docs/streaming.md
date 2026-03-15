@@ -218,7 +218,7 @@ By default, bintrail auto-advances past unfillable gaps. If you want the stream 
 bintrail stream --no-gap-fill --index-dsn "..." --source-dsn "..." --server-id 99999
 ```
 
-With `--no-gap-fill`, the stream exits with an error if any gap (fillable or unfillable) is detected. This is useful for self-hosted deployments where data loss must be explicitly acknowledged.
+With `--no-gap-fill`, the stream exits with an error if an **unfillable** gap is detected (i.e., required binlogs have been purged). Fillable gaps are always replayed automatically since no data is lost. This flag is useful for self-hosted deployments where data loss must be explicitly acknowledged.
 
 ### Binlog retention requirement
 

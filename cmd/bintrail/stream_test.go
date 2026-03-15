@@ -1116,6 +1116,85 @@ func TestDetectGTIDGap_fillableWithPurged(t *testing.T) {
 	}
 }
 
+// TestDetectGTIDGap_unfillableMissingUUID verifies an unfillable gap when the
+// purged set contains a UUID that the checkpoint has never seen.
+func TestDetectGTIDGap_unfillableMissingUUID(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	uuidA := "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+	uuidB := "7d93a8e1-0b3c-11e2-ab3d-0022114ef123"
+	mock.ExpectQuery("SELECT @@gtid_purged").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_purged"}).AddRow(uuidA + ":1-50," + uuidB + ":1-200"))
+	mock.ExpectQuery("SELECT @@gtid_executed").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow(uuidA + ":1-500," + uuidB + ":1-300"))
+
+	// Checkpoint only knows about uuidA (past its purged range), not uuidB at all.
+	gap, err := detectGTIDGap(db, uuidA+":1-100")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gap.HasGap {
+		t.Fatal("expected gap")
+	}
+	if gap.Fillable {
+		t.Error("expected unfillable gap: purged set has UUID not in checkpoint")
+	}
+}
+
+// TestDetectGTIDGap_noGapStructuralComparison verifies that GTID sets are
+// compared structurally, not by string equality (different formatting of the
+// same set should still report no gap).
+func TestDetectGTIDGap_noGapStructuralComparison(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Checkpoint uses lowercase UUID; MySQL returns uppercase.
+	checkpoint := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100"
+	executed := "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100"
+
+	mock.ExpectQuery("SELECT @@gtid_purged").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_purged"}).AddRow(""))
+	mock.ExpectQuery("SELECT @@gtid_executed").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow(executed))
+
+	gap, err := detectGTIDGap(db, checkpoint)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gap.HasGap {
+		t.Error("expected no gap: same GTID set in different case should be equal")
+	}
+}
+
+// TestGtidSetsEqual verifies structural comparison of GTID sets.
+func TestGtidSetsEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"identical", "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100", "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100", true},
+		{"case difference", "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100", "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100", true},
+		{"different range", "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100", "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-200", false},
+		{"empty both", "", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := gtidSetsEqual(tt.a, tt.b)
+			if got != tt.want {
+				t.Errorf("gtidSetsEqual(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestStreamCmd_noGapFillFlagRegistered verifies the --no-gap-fill flag exists.
 func TestStreamCmd_noGapFillFlagRegistered(t *testing.T) {
 	f := streamCmd.Flag("no-gap-fill")
