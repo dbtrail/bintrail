@@ -182,6 +182,67 @@ bintrail stream \
 
 ---
 
+## Binlog Gap Detection
+
+When a stream is restarted after downtime, MySQL may have continued generating binlog events that bintrail did not capture. On every restart from a saved checkpoint, bintrail automatically detects whether a gap exists and handles it:
+
+### How it works
+
+**Position mode** (`--start-file`/`--start-pos`):
+1. Queries `SHOW BINARY LOGS` on the source MySQL.
+2. If the checkpoint file still exists in the list, the gap is **fillable** — bintrail resumes from the checkpoint and replays all missed events before switching to live tailing.
+3. If the checkpoint file has been purged, the gap is **unfillable** — bintrail logs a warning and auto-advances to the earliest available binlog file.
+
+**GTID mode** (`--start-gtid`):
+1. Queries `@@gtid_purged` and `@@gtid_executed` from the source MySQL.
+2. If the checkpoint GTID set does not intersect with the purged set, the gap is **fillable** — MySQL still has all required binlog events.
+3. If the checkpoint includes purged GTIDs, the gap is **unfillable** — bintrail logs a warning and advances past the purged GTID set.
+
+### What happens during an unfillable gap
+
+When binlogs have been purged and the gap cannot be filled:
+
+1. A warning is logged with details about what was lost:
+   ```
+   WARN binlog gap detected but CANNOT be filled: required file mysql-bin.000038 has been purged;
+   earliest available binlog is mysql-bin.000050; events between these positions are permanently lost
+   ```
+2. The checkpoint is **immediately updated** to the new (advanced) position. This prevents a crash loop if the stream fails during startup — the next restart will not hit the same purged-binlog error.
+3. The stream resumes from the earliest available position.
+
+### The `--no-gap-fill` flag
+
+By default, bintrail auto-advances past unfillable gaps. If you want the stream to **refuse to start** when a gap is detected (so you can investigate and decide how to proceed), use:
+
+```sh
+bintrail stream --no-gap-fill --index-dsn "..." --source-dsn "..." --server-id 99999
+```
+
+With `--no-gap-fill`, the stream exits with an error if any gap (fillable or unfillable) is detected. This is useful for self-hosted deployments where data loss must be explicitly acknowledged.
+
+### Binlog retention requirement
+
+**Important:** Configure your MySQL server's binlog retention to be **at least 2 days**. This gives bintrail enough time to fill gaps after planned maintenance, restarts, or brief outages. With very short retention (seconds or minutes), binlogs may be purged before bintrail has a chance to replay them, resulting in permanent data loss.
+
+For MySQL 8.0+:
+```sql
+SET PERSIST binlog_expire_logs_seconds = 172800;  -- 2 days minimum
+```
+
+For MySQL 5.7:
+```sql
+SET GLOBAL expire_logs_days = 2;  -- 2 days minimum
+```
+
+For managed MySQL services (RDS, Aurora, Cloud SQL), check your provider's documentation for binlog retention settings. Amazon RDS defaults to `NULL` (no retention), which means binlogs are purged as soon as they are no longer needed for replication — you **must** set a retention period:
+
+```sql
+-- Amazon RDS
+CALL mysql.rds_set_configuration('binlog retention hours', 48);
+```
+
+---
+
 ## Graceful Shutdown
 
 When you send `SIGINT` or `SIGTERM` (or press Ctrl-C):

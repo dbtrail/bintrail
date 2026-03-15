@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 
 	"github.com/bintrail/bintrail/internal/parser"
@@ -478,7 +479,7 @@ func TestStreamCmd_allFlagsRegistered(t *testing.T) {
 		"start-file", "start-pos", "start-gtid",
 		"batch-size", "schemas", "tables", "checkpoint", "metrics-addr",
 		"ssl-mode", "ssl-ca", "ssl-cert", "ssl-key",
-		"reset",
+		"reset", "no-gap-fill",
 	} {
 		if streamCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on streamCmd", name)
@@ -881,5 +882,247 @@ func TestStreamLoop_gtidOnlyEventsAccumulated(t *testing.T) {
 	parts := strings.SplitN(got, ":", 2) // split off UUID
 	if len(parts) == 2 && strings.Contains(parts[1], ":") {
 		t.Errorf("GTID set has gaps: %q", got)
+	}
+}
+
+// ─── Gap detection ────────────────────────────────────────────────────────────
+
+// TestDetectPositionGap_noGap verifies that no gap is reported when the
+// checkpoint file is the current (latest) binlog file.
+func TestDetectPositionGap_noGap(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW BINARY LOGS").WillReturnRows(
+		sqlmock.NewRows([]string{"Log_name", "File_size"}).
+			AddRow("mysql-bin.000001", 1048576).
+			AddRow("mysql-bin.000002", 524288).
+			AddRow("mysql-bin.000003", 100))
+
+	gap, err := detectPositionGap(db, "mysql-bin.000003", 50)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gap.HasGap {
+		t.Error("expected no gap when checkpoint is on latest file")
+	}
+}
+
+// TestDetectPositionGap_fillable verifies that a fillable gap is reported when
+// the checkpoint file exists but is not the latest.
+func TestDetectPositionGap_fillable(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW BINARY LOGS").WillReturnRows(
+		sqlmock.NewRows([]string{"Log_name", "File_size"}).
+			AddRow("mysql-bin.000001", 1048576).
+			AddRow("mysql-bin.000002", 524288).
+			AddRow("mysql-bin.000003", 100))
+
+	gap, err := detectPositionGap(db, "mysql-bin.000001", 9999)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gap.HasGap {
+		t.Fatal("expected gap when checkpoint is behind latest file")
+	}
+	if !gap.Fillable {
+		t.Error("expected fillable gap when checkpoint file still exists")
+	}
+	if !strings.Contains(gap.Message, "mysql-bin.000001") {
+		t.Errorf("expected checkpoint file in message, got: %s", gap.Message)
+	}
+}
+
+// TestDetectPositionGap_unfillable verifies that an unfillable gap is reported
+// when the checkpoint file has been purged.
+func TestDetectPositionGap_unfillable(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW BINARY LOGS").WillReturnRows(
+		sqlmock.NewRows([]string{"Log_name", "File_size"}).
+			AddRow("mysql-bin.000050", 1048576).
+			AddRow("mysql-bin.000051", 524288))
+
+	gap, err := detectPositionGap(db, "mysql-bin.000038", 7890)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gap.HasGap {
+		t.Fatal("expected gap when checkpoint file is purged")
+	}
+	if gap.Fillable {
+		t.Error("expected unfillable gap when file is purged")
+	}
+	if gap.EarliestFile != "mysql-bin.000050" {
+		t.Errorf("expected earliest file mysql-bin.000050, got %q", gap.EarliestFile)
+	}
+	if gap.EarliestPos != 4 {
+		t.Errorf("expected earliest pos 4, got %d", gap.EarliestPos)
+	}
+	if !strings.Contains(gap.Message, "purged") {
+		t.Errorf("expected 'purged' in message, got: %s", gap.Message)
+	}
+	if !strings.Contains(gap.Message, "mysql-bin.000038") {
+		t.Errorf("expected checkpoint file in message, got: %s", gap.Message)
+	}
+}
+
+// TestDetectPositionGap_extraColumns verifies that SHOW BINARY LOGS with extra
+// columns (MySQL 8.0.14+ adds Encrypted) is handled correctly.
+func TestDetectPositionGap_extraColumns(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW BINARY LOGS").WillReturnRows(
+		sqlmock.NewRows([]string{"Log_name", "File_size", "Encrypted"}).
+			AddRow("mysql-bin.000010", 1048576, "No").
+			AddRow("mysql-bin.000011", 524288, "No"))
+
+	gap, err := detectPositionGap(db, "mysql-bin.000010", 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gap.HasGap {
+		t.Fatal("expected gap (checkpoint is not latest)")
+	}
+	if !gap.Fillable {
+		t.Error("expected fillable gap")
+	}
+}
+
+// TestDetectGTIDGap_noGap verifies no gap when checkpoint matches executed.
+func TestDetectGTIDGap_noGap(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	gtid := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100"
+	mock.ExpectQuery("SELECT @@gtid_purged").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_purged"}).AddRow(""))
+	mock.ExpectQuery("SELECT @@gtid_executed").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow(gtid))
+
+	gap, err := detectGTIDGap(db, gtid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gap.HasGap {
+		t.Error("expected no gap when checkpoint matches executed")
+	}
+}
+
+// TestDetectGTIDGap_fillable verifies a fillable gap when checkpoint is behind
+// executed but nothing is purged.
+func TestDetectGTIDGap_fillable(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT @@gtid_purged").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_purged"}).AddRow(""))
+	mock.ExpectQuery("SELECT @@gtid_executed").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-200"))
+
+	gap, err := detectGTIDGap(db, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gap.HasGap {
+		t.Fatal("expected gap when checkpoint is behind executed")
+	}
+	if !gap.Fillable {
+		t.Error("expected fillable gap when nothing is purged")
+	}
+}
+
+// TestDetectGTIDGap_unfillable verifies an unfillable gap when the checkpoint
+// includes GTIDs that have been purged.
+func TestDetectGTIDGap_unfillable(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	uuid := "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+	mock.ExpectQuery("SELECT @@gtid_purged").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_purged"}).AddRow(uuid + ":1-500"))
+	mock.ExpectQuery("SELECT @@gtid_executed").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow(uuid + ":1-1000"))
+
+	gap, err := detectGTIDGap(db, uuid+":1-100")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gap.HasGap {
+		t.Fatal("expected gap")
+	}
+	if gap.Fillable {
+		t.Error("expected unfillable gap when checkpoint is within purged range")
+	}
+	if gap.PurgedGTIDSet == "" {
+		t.Error("expected purged GTID set in result")
+	}
+	if !strings.Contains(gap.Message, "purged") {
+		t.Errorf("expected 'purged' in message, got: %s", gap.Message)
+	}
+}
+
+// TestDetectGTIDGap_fillableWithPurged verifies a fillable gap when checkpoint
+// is ahead of the purged set (common case: purged set exists but checkpoint
+// has progressed beyond it).
+func TestDetectGTIDGap_fillableWithPurged(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	uuid := "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+	mock.ExpectQuery("SELECT @@gtid_purged").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_purged"}).AddRow(uuid + ":1-50"))
+	mock.ExpectQuery("SELECT @@gtid_executed").WillReturnRows(
+		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow(uuid + ":1-1000"))
+
+	// Checkpoint at :1-200 — well past the purged range of :1-50.
+	gap, err := detectGTIDGap(db, uuid+":1-200")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gap.HasGap {
+		t.Fatal("expected gap when checkpoint is behind executed")
+	}
+	if !gap.Fillable {
+		t.Error("expected fillable gap when checkpoint is past purged range")
+	}
+}
+
+// TestStreamCmd_noGapFillFlagRegistered verifies the --no-gap-fill flag exists.
+func TestStreamCmd_noGapFillFlagRegistered(t *testing.T) {
+	f := streamCmd.Flag("no-gap-fill")
+	if f == nil {
+		t.Fatal("flag --no-gap-fill not registered on streamCmd")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("expected default no-gap-fill=false, got %q", f.DefValue)
 	}
 }
