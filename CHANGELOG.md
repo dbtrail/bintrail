@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-03-15
+
+### Added
+- Binlog gap detection on `bintrail stream` restart — position mode checks `SHOW BINARY LOGS`, GTID mode compares checkpoint against `@@gtid_purged` and `@@gtid_executed`
+- Automatic gap filling for fillable gaps; unfillable gaps auto-advance to the earliest available position with a warning logged and checkpoint updated to prevent crash loops
+- `--no-gap-fill` flag for `bintrail stream` to refuse starting when a gap is detected
+
 ## [0.3.1] - 2026-03-13
 
 ### Added
