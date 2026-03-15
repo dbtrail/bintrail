@@ -52,6 +52,14 @@ Use --reset to clear the saved checkpoint and force a new start position:
 
 Without --reset, the checkpoint always wins (idempotent behavior is preserved).
 
+Gap detection: on restart, bintrail checks whether the source still has the
+binlogs needed to resume from the checkpoint. If binlogs have been purged, it
+auto-advances to the earliest available position and logs a warning. Use
+--no-gap-fill to refuse to start when an unfillable gap is detected.
+
+Important: configure binlog retention to at least 2 days
+(binlog_expire_logs_seconds >= 172800) to give bintrail time to fill gaps.
+
 Graceful shutdown: send SIGINT or SIGTERM to flush the current batch and write
 a checkpoint before exiting.`,
 	RunE: runStream,
@@ -73,8 +81,9 @@ var (
 	strmSSLCA       string
 	strmSSLCert     string
 	strmSSLKey      string
-	strmFormat      string
-	strmReset       bool
+	strmFormat    string
+	strmReset     bool
+	strmNoGapFill bool
 )
 
 func init() {
@@ -95,6 +104,7 @@ func init() {
 	streamCmd.Flags().StringVar(&strmSSLKey, "ssl-key", "", "Path to client private key file for mutual TLS")
 	streamCmd.Flags().StringVar(&strmFormat, "format", "text", "Output format: text or json")
 	streamCmd.Flags().BoolVar(&strmReset, "reset", false, "Clear saved checkpoint before starting (forces use of --start-file/--start-gtid)")
+	streamCmd.Flags().BoolVar(&strmNoGapFill, "no-gap-fill", false, "Refuse to start if an unfillable binlog gap is detected (instead of auto-advancing past purged data)")
 	_ = streamCmd.MarkFlagRequired("index-dsn")
 	_ = streamCmd.MarkFlagRequired("source-dsn")
 	_ = streamCmd.MarkFlagRequired("server-id")
@@ -394,6 +404,256 @@ func resolveStart(
 			"provide --start-file or --start-gtid to begin streaming")
 }
 
+// ─── Gap detection ──────────────────────────────────────────────────────────────
+
+// gapResult describes a binlog gap between the saved checkpoint and the source.
+type gapResult struct {
+	HasGap   bool   // true if a gap exists between checkpoint and source
+	Fillable bool   // true if the gap can be filled (binlogs still available)
+	Message  string // human-readable description of the gap
+
+	// For unfillable gaps in position mode: the earliest available binlog.
+	EarliestFile string
+	EarliestPos  uint32
+
+	// For unfillable gaps in GTID mode: the purged GTID set to use as base.
+	PurgedGTIDSet string
+}
+
+// detectPositionGap queries the source MySQL for available binary logs and
+// checks whether the checkpoint file still exists. Returns a gapResult.
+func detectPositionGap(sourceDB *sql.DB, checkpointFile string, checkpointPos uint32) (*gapResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := sourceDB.QueryContext(ctx, "SHOW BINARY LOGS")
+	if err != nil {
+		return nil, fmt.Errorf("SHOW BINARY LOGS: %w", err)
+	}
+	defer rows.Close()
+
+	// SHOW BINARY LOGS returns varying columns across MySQL versions;
+	// we only need the first two (Log_name, File_size).
+	cols, colErr := rows.Columns()
+	if colErr != nil {
+		return nil, fmt.Errorf("SHOW BINARY LOGS columns: %w", colErr)
+	}
+	if len(cols) < 2 {
+		return nil, fmt.Errorf("SHOW BINARY LOGS returned %d columns, expected at least 2", len(cols))
+	}
+
+	type binlogEntry struct {
+		name string
+		size int64
+	}
+	var logs []binlogEntry
+	for rows.Next() {
+		var name string
+		var size int64
+		vals := make([]any, len(cols))
+		vals[0] = &name
+		vals[1] = &size
+		for i := 2; i < len(cols); i++ {
+			vals[i] = new(sql.RawBytes)
+		}
+		if err := rows.Scan(vals...); err != nil {
+			return nil, fmt.Errorf("scan SHOW BINARY LOGS: %w", err)
+		}
+		logs = append(logs, binlogEntry{name, size})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate SHOW BINARY LOGS: %w", err)
+	}
+	if len(logs) == 0 {
+		return nil, fmt.Errorf("SHOW BINARY LOGS returned no results")
+	}
+
+	// Check if the checkpoint file exists in the list.
+	for _, l := range logs {
+		if l.name == checkpointFile {
+			// File exists but checkpoint position exceeds file size — the file
+			// may have been regenerated (e.g., RESET MASTER). Treat as unfillable.
+			if int64(checkpointPos) > l.size {
+				return &gapResult{
+					HasGap:       true,
+					Fillable:     false,
+					EarliestFile: logs[0].name,
+					EarliestPos:  4,
+					Message: fmt.Sprintf(
+						"binlog gap: file %s exists but checkpoint position %d exceeds file size %d; "+
+							"file may have been regenerated after RESET MASTER",
+						checkpointFile, checkpointPos, l.size),
+				}, nil
+			}
+			// File still exists and position is valid — gap is fillable.
+			currentFile := logs[len(logs)-1].name
+			if checkpointFile == currentFile {
+				return &gapResult{HasGap: false}, nil
+			}
+			return &gapResult{
+				HasGap:   true,
+				Fillable: true,
+				Message: fmt.Sprintf(
+					"gap detected: checkpoint is at %s:%d, source is at %s; replaying missed events",
+					checkpointFile, checkpointPos, currentFile),
+			}, nil
+		}
+	}
+
+	// File not found — binlogs have been purged.
+	earliest := logs[0]
+	return &gapResult{
+		HasGap:       true,
+		Fillable:     false,
+		EarliestFile: earliest.name,
+		EarliestPos:  4, // first 4 bytes are the magic number header, not event data
+		Message: fmt.Sprintf(
+			"binlog gap detected but CANNOT be filled: required file %s has been purged; "+
+				"earliest available binlog is %s; events between these positions are permanently lost",
+			checkpointFile, earliest.name),
+	}, nil
+}
+
+// gtidSetsEqual parses two GTID set strings and compares them structurally,
+// avoiding false mismatches from formatting differences (UUID case, ordering).
+// Returns false (not an error) if either string cannot be parsed as a valid
+// GTID set — the caller should treat this as "not equal" and proceed with
+// gap detection.
+func gtidSetsEqual(a, b string) bool {
+	if a == "" && b == "" {
+		return true
+	}
+	ga, err := gomysql.ParseMysqlGTIDSet(normalizeGTIDSet(a))
+	if err != nil {
+		slog.Debug("gtidSetsEqual: failed to parse first GTID set", "gtid_set", a, "error", err)
+		return false
+	}
+	gb, err := gomysql.ParseMysqlGTIDSet(normalizeGTIDSet(b))
+	if err != nil {
+		slog.Debug("gtidSetsEqual: failed to parse second GTID set", "gtid_set", b, "error", err)
+		return false
+	}
+	return ga.Equal(gb)
+}
+
+// detectGTIDGap queries the source MySQL for @@gtid_purged and @@gtid_executed,
+// then checks whether the checkpoint GTID set requires any purged GTIDs.
+func detectGTIDGap(sourceDB *sql.DB, checkpointGTID string) (*gapResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	checkpointGTID = normalizeGTIDSet(strings.TrimSpace(checkpointGTID))
+
+	var purgedStr, executedStr string
+	if err := sourceDB.QueryRowContext(ctx, "SELECT @@gtid_purged").Scan(&purgedStr); err != nil {
+		return nil, fmt.Errorf("query @@gtid_purged: %w", err)
+	}
+	if err := sourceDB.QueryRowContext(ctx, "SELECT @@gtid_executed").Scan(&executedStr); err != nil {
+		return nil, fmt.Errorf("query @@gtid_executed: %w", err)
+	}
+
+	purgedStr = normalizeGTIDSet(strings.TrimSpace(purgedStr))
+	executedStr = normalizeGTIDSet(strings.TrimSpace(executedStr))
+
+	// If purged is empty, all GTIDs are still available.
+	if purgedStr == "" {
+		if gtidSetsEqual(checkpointGTID, executedStr) {
+			return &gapResult{HasGap: false}, nil
+		}
+		return &gapResult{
+			HasGap:   true,
+			Fillable: true,
+			Message:  "gap detected: checkpoint GTID set is behind source @@gtid_executed; replaying missed events",
+		}, nil
+	}
+
+	if checkpointGTID == "" {
+		return nil, fmt.Errorf("checkpoint GTID set is empty; cannot perform gap detection")
+	}
+
+	// Parse both GTID sets.
+	checkpoint, err := gomysql.ParseMysqlGTIDSet(checkpointGTID)
+	if err != nil {
+		return nil, fmt.Errorf("parse checkpoint GTID set: %w", err)
+	}
+	purged, err := gomysql.ParseMysqlGTIDSet(purgedStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse @@gtid_purged: %w", err)
+	}
+
+	cpSet, ok := checkpoint.(*gomysql.MysqlGTIDSet)
+	if !ok {
+		return nil, fmt.Errorf("unexpected GTID set type %T from checkpoint parse", checkpoint)
+	}
+	purgedSet, ok := purged.(*gomysql.MysqlGTIDSet)
+	if !ok {
+		return nil, fmt.Errorf("unexpected GTID set type %T from purged parse", purged)
+	}
+
+	// Check if the stream would need any purged GTIDs on resume. MySQL sends
+	// all GTIDs NOT in the checkpoint set, so we must check two directions:
+	//
+	// 1. Forward: for each UUID in the checkpoint, does the purged set contain
+	//    any transaction IDs that the checkpoint doesn't have? If so, MySQL
+	//    would need to send those GTIDs but they've been purged.
+	// 2. Reverse: are there UUIDs in the purged set that the checkpoint has
+	//    never seen? MySQL would try to send all of that UUID's GTIDs, but
+	//    some have been purged.
+	needsPurged := false
+
+	// Direction 1: for each UUID in the purged set, check if the checkpoint
+	// fully covers all purged intervals. If the checkpoint doesn't contain all
+	// purged GTIDs for a UUID, MySQL would need to send them but they're gone.
+	// This correctly handles non-contiguous intervals (e.g., checkpoint has
+	// uuid:1-100,200-300 but purged has uuid:1-150 — GTIDs 101-150 are lost).
+	//
+	// Direction 2 (inline): if a purged UUID is absent from the checkpoint
+	// entirely, MySQL would try to send all of that UUID's GTIDs.
+	for uuid, purgedIntervals := range purgedSet.Sets {
+		cpIntervals, exists := cpSet.Sets[uuid]
+		if !exists {
+			// Purged UUID the checkpoint has never seen.
+			needsPurged = true
+			break
+		}
+		if len(purgedIntervals.Intervals) == 0 {
+			continue
+		}
+		if len(cpIntervals.Intervals) == 0 {
+			needsPurged = true
+			break
+		}
+		// Check if the checkpoint's intervals fully contain the purged intervals.
+		// IntervalSlice.Contain(sub) returns true if sub is a subset of s.
+		if !cpIntervals.Intervals.Contain(purgedIntervals.Intervals) {
+			needsPurged = true
+			break
+		}
+	}
+
+	if needsPurged {
+		return &gapResult{
+			HasGap:        true,
+			Fillable:      false,
+			PurgedGTIDSet: purgedStr,
+			Message: fmt.Sprintf(
+				"GTID gap detected but CANNOT be filled: required GTIDs have been purged from the source; "+
+					"purged set: %s; events in the purged range are permanently lost",
+				purgedStr),
+		}, nil
+	}
+
+	// Checkpoint is ahead of (or equal to) the purged set — gap is fillable.
+	if gtidSetsEqual(checkpointGTID, executedStr) {
+		return &gapResult{HasGap: false}, nil
+	}
+	return &gapResult{
+		HasGap:   true,
+		Fillable: true,
+		Message:  "gap detected: checkpoint GTID set is behind source @@gtid_executed; replaying missed events",
+	}, nil
+}
+
 // ─── Stream loop ────────────────────────────────────────────────────────────────
 
 // streamLoop consumes parser events, flushes batches to MySQL, and writes
@@ -602,6 +862,91 @@ func runStream(cmd *cobra.Command, args []string) error {
 		strmStartFile, strmStartGTID, strmStartPos, saved)
 	if err != nil {
 		return err
+	}
+
+	// ── 6b. Detect binlog gap ────────────────────────────────────────────
+	// Only check for gaps when resuming from a saved checkpoint (not on first run).
+	if saved != nil {
+		var gap *gapResult
+		var gapErr error
+
+		switch mode {
+		case "position":
+			gap, gapErr = detectPositionGap(sourceDB, startFile, startPos)
+		case "gtid":
+			gap, gapErr = detectGTIDGap(sourceDB, startGTIDStr)
+		default:
+			slog.Warn("gap detection not implemented for mode", "mode", mode)
+		}
+
+		if gapErr != nil {
+			// Gap detection failure means we cannot verify whether binlogs have
+			// been purged. Fail hard — proceeding could mask data loss.
+			slog.Error("gap detection failed", "error", gapErr)
+			return fmt.Errorf("gap detection failed: %w (use --reset to skip gap detection and start from a new position)", gapErr)
+		} else if gap != nil && gap.HasGap {
+			if gap.Fillable {
+				slog.Info(gap.Message)
+				fmt.Println("Gap: fillable — replaying missed events before live tailing")
+			} else {
+				// Unfillable gap — binlogs/GTIDs have been purged.
+				slog.Warn(gap.Message)
+
+				if strmNoGapFill {
+					return fmt.Errorf("binlog gap detected and --no-gap-fill is set: %s", gap.Message)
+				}
+
+				// Auto-advance past the gap.
+				switch mode {
+				case "position":
+					slog.Warn("auto-advancing to earliest available binlog",
+						"old_file", startFile, "old_pos", startPos,
+						"new_file", gap.EarliestFile, "new_pos", gap.EarliestPos)
+					fmt.Printf("Gap: UNFILLABLE — advancing from %s:%d to %s:%d (events in between are permanently lost)\n",
+						startFile, startPos, gap.EarliestFile, gap.EarliestPos)
+					startFile = gap.EarliestFile
+					startPos = gap.EarliestPos
+
+				case "gtid":
+					slog.Warn("auto-advancing past purged GTIDs",
+						"old_gtid_set", startGTIDStr,
+						"purged_gtid_set", gap.PurgedGTIDSet)
+					fmt.Printf("Gap: UNFILLABLE — checkpoint GTID set includes purged GTIDs; advancing past purged set (events are permanently lost)\n")
+					// Use the purged set as the checkpoint GTID set — this tells
+					// MySQL we have already seen all purged GTIDs, so it will
+					// only send the non-purged GTIDs that remain in @@gtid_executed.
+					startGTIDStr = normalizeGTIDSet(gap.PurgedGTIDSet)
+					gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTIDStr)
+					if parseErr != nil {
+						return fmt.Errorf("failed to parse purged GTID set for auto-advance: %w", parseErr)
+					}
+					parsed, ok := gs.(*gomysql.MysqlGTIDSet)
+					if !ok {
+						return fmt.Errorf("unexpected GTID set type %T after parsing purged set", gs)
+					}
+					accGTID = parsed
+				}
+
+				// Persist the advanced position immediately so that if the stream
+				// crashes during startup, the next restart won't hit the same
+				// purged-binlog error again.
+				advancedState := &streamState{
+					mode:          mode,
+					binlogFile:    startFile,
+					binlogPos:     uint64(startPos),
+					gtidSet:       startGTIDStr,
+					serverID:      strmServerID,
+					bintrailID:    bintrailID,
+					eventsIndexed: saved.eventsIndexed,
+					lastEventTime: saved.lastEventTime,
+				}
+				if err := saveCheckpoint(indexDB, advancedState); err != nil {
+					return fmt.Errorf("failed to save advanced checkpoint: %w", err)
+				}
+				slog.Info("saved advanced checkpoint after gap auto-advance",
+					"file", startFile, "pos", startPos, "gtid_set", startGTIDStr)
+			}
+		}
 	}
 
 	state := &streamState{
