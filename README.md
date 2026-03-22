@@ -795,7 +795,7 @@ curl localhost:9090/metrics | grep bintrail_stream
 
 This project is licensed under the [Business Source License 1.1](LICENSE). You may use bintrail for any purpose, including production use, except offering it as part of a competing commercial hosted service or managed consulting service. Each version converts to Apache License 2.0 four years after its release.
 
-For alternative licensing arrangements, contact daniel@dbtrail.com.
+For alternative licensing arrangements, contact nethalo@gmail.com.
 
 ## Contributing
 
