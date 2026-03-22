@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bintrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/parser"
 )
 
 // ─── buildQuery ───────────────────────────────────────────────────────────────

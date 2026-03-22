@@ -8,10 +8,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/bintrail/bintrail/internal/cliutil"
-	"github.com/bintrail/bintrail/internal/config"
-	"github.com/bintrail/bintrail/internal/metadata"
-	"github.com/bintrail/bintrail/internal/serverid"
+	"github.com/dbtrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/bintrail/internal/serverid"
 )
 
 var snapshotCmd = &cobra.Command{

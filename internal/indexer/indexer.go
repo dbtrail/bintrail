@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bintrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/parser"
 )
 
 // Indexer consumes parser.Events from a channel and batch-inserts them into

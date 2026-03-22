@@ -11,13 +11,13 @@ A CLI tool that parses MySQL ROW-format binary logs, indexes every row event int
 ## Install
 
 ```sh
-go install github.com/bintrail/bintrail/cmd/bintrail@latest
+go install github.com/dbtrail/bintrail/cmd/bintrail@latest
 ```
 
 Or build from source:
 
 ```sh
-git clone https://github.com/bintrail/bintrail
+git clone https://github.com/dbtrail/bintrail
 cd bintrail
 go build ./cmd/bintrail
 ```
@@ -613,7 +613,7 @@ bintrail_rotate_time: "01:00:00"
 ```yaml
 - name: Download bintrail binary
   ansible.builtin.get_url:
-    url: "https://github.com/bintrail/bintrail/releases/latest/download/bintrail-linux-amd64"
+    url: "https://github.com/dbtrail/bintrail/releases/latest/download/bintrail-linux-amd64"
     dest: "{{ bintrail_install_dir }}/bintrail"
     mode: "0755"
 
@@ -795,7 +795,7 @@ curl localhost:9090/metrics | grep bintrail_stream
 
 This project is licensed under the [Business Source License 1.1](LICENSE). You may use bintrail for any purpose, including production use, except offering it as part of a competing commercial hosted service or managed consulting service. Each version converts to Apache License 2.0 four years after its release.
 
-For alternative licensing arrangements, contact nethalo@gmail.com.
+For alternative licensing arrangements, contact daniel@dbtrail.com.
 
 ## Contributing
 

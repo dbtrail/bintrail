@@ -13,7 +13,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
-	"github.com/bintrail/bintrail/internal/serverid"
+	"github.com/dbtrail/bintrail/internal/serverid"
 )
 
 // dbCounter ensures unique database names across calls within the same test.

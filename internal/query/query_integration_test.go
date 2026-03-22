@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bintrail/bintrail/internal/parser"
-	"github.com/bintrail/bintrail/internal/testutil"
+	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
 func TestFetch_schemaFilter(t *testing.T) {

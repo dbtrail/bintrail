@@ -19,8 +19,8 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/spf13/cobra"
 
-	"github.com/bintrail/bintrail/internal/baseline"
-	"github.com/bintrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/baseline"
+	"github.com/dbtrail/bintrail/internal/cliutil"
 )
 
 var baselineCmd = &cobra.Command{

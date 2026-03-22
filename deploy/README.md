@@ -242,7 +242,7 @@ ssh -i key.pem ubuntu@<APP_EC2_IP>
 Clone the repo and create `.env`:
 
 ```bash
-git clone git@github.com:nethalo/bintrail.git ~/bintrail
+git clone git@github.com:dbtrail/bintrail.git ~/bintrail
 cd ~/bintrail/deploy
 cp .env.example .env
 chmod 600 .env

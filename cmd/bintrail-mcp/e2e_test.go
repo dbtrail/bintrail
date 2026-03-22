@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bintrail/bintrail/internal/testutil"
+	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
 // TestMCPE2E builds the bintrail-mcp binary and exercises the full JSON-RPC
@@ -40,7 +40,7 @@ func TestMCPE2E(t *testing.T) {
 		t.Fatalf("mkdir coverDir: %v", err)
 	}
 
-	buildCmd := exec.Command("go", "build", "-cover", "-o", binPath, "github.com/bintrail/bintrail/cmd/bintrail-mcp")
+	buildCmd := exec.Command("go", "build", "-cover", "-o", binPath, "github.com/dbtrail/bintrail/cmd/bintrail-mcp")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("build failed: %v\n%s", err, out)
 	}

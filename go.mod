@@ -1,4 +1,4 @@
-module github.com/bintrail/bintrail
+module github.com/dbtrail/bintrail
 
 go 1.24.7
 

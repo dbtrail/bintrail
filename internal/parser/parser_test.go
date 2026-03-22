@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bintrail/bintrail/internal/metadata"
+	"github.com/dbtrail/bintrail/internal/metadata"
 )
 
 // ─── ChangedColumns ───────────────────────────────────────────────────────────

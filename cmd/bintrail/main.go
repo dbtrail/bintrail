@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/bintrail/bintrail/internal/observe"
+	"github.com/dbtrail/bintrail/internal/observe"
 )
 
 var (

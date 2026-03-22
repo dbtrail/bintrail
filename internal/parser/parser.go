@@ -17,7 +17,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
-	"github.com/bintrail/bintrail/internal/metadata"
+	"github.com/dbtrail/bintrail/internal/metadata"
 )
 
 // ─── Event types ─────────────────────────────────────────────────────────────

@@ -40,13 +40,13 @@ import (
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/bintrail/bintrail/internal/cliutil"
-	"github.com/bintrail/bintrail/internal/config"
-	"github.com/bintrail/bintrail/internal/metadata"
-	"github.com/bintrail/bintrail/internal/parquetquery"
-	"github.com/bintrail/bintrail/internal/query"
-	"github.com/bintrail/bintrail/internal/recovery"
-	"github.com/bintrail/bintrail/internal/status"
+	"github.com/dbtrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/bintrail/internal/parquetquery"
+	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/bintrail/internal/recovery"
+	"github.com/dbtrail/bintrail/internal/status"
 )
 
 // mcpVersion is injected at build time via -ldflags.
