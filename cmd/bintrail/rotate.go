@@ -17,10 +17,10 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
-	"github.com/bintrail/bintrail/internal/archive"
-	"github.com/bintrail/bintrail/internal/baseline"
-	"github.com/bintrail/bintrail/internal/cliutil"
-	"github.com/bintrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/archive"
+	"github.com/dbtrail/bintrail/internal/baseline"
+	"github.com/dbtrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/config"
 )
 
 var rotateCmd = &cobra.Command{

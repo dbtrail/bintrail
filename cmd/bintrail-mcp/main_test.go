@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bintrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 

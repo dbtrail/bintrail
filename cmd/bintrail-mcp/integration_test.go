@@ -11,7 +11,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/bintrail/bintrail/internal/testutil"
+	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────

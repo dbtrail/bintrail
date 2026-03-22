@@ -17,9 +17,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bintrail/bintrail/internal/metadata"
-	"github.com/bintrail/bintrail/internal/parser"
-	"github.com/bintrail/bintrail/internal/query"
+	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/query"
 )
 
 // Generator produces reversal SQL from indexed binlog events.

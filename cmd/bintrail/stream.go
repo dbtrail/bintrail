@@ -23,13 +23,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 
-	"github.com/bintrail/bintrail/internal/cliutil"
-	"github.com/bintrail/bintrail/internal/config"
-	"github.com/bintrail/bintrail/internal/indexer"
-	"github.com/bintrail/bintrail/internal/metadata"
-	"github.com/bintrail/bintrail/internal/observe"
-	"github.com/bintrail/bintrail/internal/parser"
-	"github.com/bintrail/bintrail/internal/serverid"
+	"github.com/dbtrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/bintrail/internal/observe"
+	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/serverid"
 )
 
 var streamCmd = &cobra.Command{

@@ -16,8 +16,8 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
-	"github.com/bintrail/bintrail/internal/cliutil"
-	"github.com/bintrail/bintrail/internal/serverid"
+	"github.com/dbtrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/serverid"
 )
 
 var initCmd = &cobra.Command{

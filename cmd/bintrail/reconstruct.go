@@ -10,10 +10,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/bintrail/bintrail/internal/cliutil"
-	"github.com/bintrail/bintrail/internal/config"
-	"github.com/bintrail/bintrail/internal/query"
-	"github.com/bintrail/bintrail/internal/reconstruct"
+	"github.com/dbtrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/bintrail/internal/reconstruct"
 )
 
 var reconstructCmd = &cobra.Command{

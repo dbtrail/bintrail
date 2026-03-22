@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/bintrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/spf13/cobra"
 )
 

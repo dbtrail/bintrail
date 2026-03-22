@@ -6,7 +6,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/bintrail/bintrail/internal/observe"
+	"github.com/dbtrail/bintrail/internal/observe"
 )
 
 func TestStreamMetrics_registration(t *testing.T) {

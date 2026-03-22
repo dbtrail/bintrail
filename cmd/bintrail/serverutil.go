@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/bintrail/bintrail/internal/serverid"
+	"github.com/dbtrail/bintrail/internal/serverid"
 )
 
 // resolveServerIdentity queries @@server_uuid from sourceDB, parses the host,

@@ -13,7 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/bintrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/cliutil"
 )
 
 var dumpCmd = &cobra.Command{

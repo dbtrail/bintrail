@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bintrail/bintrail/internal/parser"
-	"github.com/bintrail/bintrail/internal/query"
+	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/query"
 )
 
 // shared fixtures

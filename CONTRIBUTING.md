@@ -11,7 +11,7 @@ Thank you for your interest in contributing. This document covers how to get set
 ## Getting started
 
 ```sh
-git clone https://github.com/nethalo/bintrail
+git clone https://github.com/dbtrail/bintrail
 cd bintrail
 go mod download
 go build ./...

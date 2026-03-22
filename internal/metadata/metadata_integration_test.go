@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bintrail/bintrail/internal/testutil"
+	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
 func TestTakeSnapshot_nonInnoDB(t *testing.T) {

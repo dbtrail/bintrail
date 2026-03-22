@@ -17,8 +17,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/bintrail/bintrail/internal/parser"
-	"github.com/bintrail/bintrail/internal/query"
+	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/query"
 )
 
 // StateEntry is the row state at a single point in time.

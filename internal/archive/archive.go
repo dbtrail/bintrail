@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/bintrail/bintrail/internal/baseline"
+	"github.com/dbtrail/bintrail/internal/baseline"
 )
 
 // binlogEventColumns defines the 14 non-generated binlog_events columns in

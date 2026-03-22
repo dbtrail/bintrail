@@ -11,10 +11,10 @@ import (
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
-	"github.com/bintrail/bintrail/internal/cliutil"
-	"github.com/bintrail/bintrail/internal/config"
-	"github.com/bintrail/bintrail/internal/parquetquery"
-	"github.com/bintrail/bintrail/internal/query"
+	"github.com/dbtrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/parquetquery"
+	"github.com/dbtrail/bintrail/internal/query"
 )
 
 var queryCmd = &cobra.Command{

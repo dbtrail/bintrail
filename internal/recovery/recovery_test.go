@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bintrail/bintrail/internal/metadata"
-	"github.com/bintrail/bintrail/internal/parser"
-	"github.com/bintrail/bintrail/internal/query"
+	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/query"
 )
 
 // newGen returns a Generator with no DB and no resolver (triggers all-cols fallback).

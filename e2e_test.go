@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bintrail/bintrail/internal/testutil"
+	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
 // TestEndToEnd_fullPipeline exercises the bintrail binary through all commands:
