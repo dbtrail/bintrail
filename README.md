@@ -72,12 +72,17 @@ These flags are available on every command:
 
 ### `bintrail init`
 
-Creates the three index tables in the target MySQL database. The database is created if it does not exist. Generates daily time-range partitions on `binlog_events` for efficient rotation.
+Creates the index tables in the target MySQL database. The database is created if it does not exist. Generates hourly time-range partitions on `binlog_events` for efficient rotation.
 
 ```
 Flags:
   --index-dsn    DSN for the index database (required)
-  --partitions   Number of daily partitions to create from today (default: 7)
+  --partitions   Number of hourly partitions to create (default: 48)
+  --encrypt      Enable InnoDB tablespace encryption on binlog_events
+  --s3-bucket    S3 bucket name to create for archiving (mutually exclusive with --s3-arn)
+  --s3-region    AWS region for the S3 bucket (default: us-east-1)
+  --s3-arn       ARN of an existing S3 bucket for archiving (mutually exclusive with --s3-bucket)
+  --format       Output format: text (default), json
 ```
 
 ### `bintrail snapshot`
@@ -91,6 +96,7 @@ Flags:
   --source-dsn   DSN for the source MySQL server (required)
   --index-dsn    DSN for the index database (required)
   --schemas      Comma-separated list of schemas to snapshot (default: all user schemas)
+  --format       Output format: text (default), json
 ```
 
 ### `bintrail index`
@@ -109,6 +115,7 @@ Flags:
   --batch-size   Events per batch INSERT (default: 1000)
   --schemas      Only index events from these schemas (comma-separated)
   --tables       Only index these tables (e.g. mydb.orders,mydb.items)
+  --format       Output format: text (default), json
 ```
 
 ### `bintrail stream`
@@ -121,17 +128,24 @@ Send `SIGINT` or `SIGTERM` to flush the current batch and write a checkpoint bef
 
 ```
 Flags:
-  --index-dsn    DSN for the index database (required)
-  --source-dsn   DSN for the source MySQL server (required)
-  --server-id    Unique replica server ID (required; must not conflict with any real server)
-  --start-file   Initial binlog file for the first run (mutually exclusive with --start-gtid)
-  --start-pos    Initial position within start file (default: 4)
-  --start-gtid   Initial GTID set for the first run (mutually exclusive with --start-file)
-  --batch-size   Events per batch INSERT (default: 1000)
-  --schemas      Only index events from these schemas (comma-separated)
-  --tables       Only index these tables (e.g. mydb.orders,mydb.items)
+  --index-dsn      DSN for the index database (required)
+  --source-dsn     DSN for the source MySQL server (required)
+  --server-id      Unique replica server ID (required; must not conflict with any real server)
+  --start-file     Initial binlog file for the first run (mutually exclusive with --start-gtid)
+  --start-pos      Initial position within start file (default: 4)
+  --start-gtid     Initial GTID set for the first run (mutually exclusive with --start-file)
+  --batch-size     Events per batch INSERT (default: 1000)
+  --schemas        Only index events from these schemas (comma-separated)
+  --tables         Only index these tables (e.g. mydb.orders,mydb.items)
   --checkpoint     Checkpoint interval in seconds (default: 10)
   --metrics-addr   Address to expose Prometheus metrics (e.g. :9090); disabled by default
+  --ssl-mode       TLS mode: disabled, preferred, required, verify-ca, verify-identity (default: preferred)
+  --ssl-ca         Path to CA certificate file for TLS verification
+  --ssl-cert       Path to client certificate file for mutual TLS
+  --ssl-key        Path to client private key file for mutual TLS
+  --reset          Clear saved checkpoint before starting (forces use of --start-file/--start-gtid)
+  --no-gap-fill    Refuse to start if an unfillable binlog gap is detected
+  --format         Output format: text (default), json
 ```
 
 Examples:
@@ -160,64 +174,9 @@ bintrail stream \
 
 > **Server ID**: choose any integer not used by the source server or its existing replicas. Check with `SHOW SLAVE HOSTS` on the source.
 
-### `bintrail dump`
-
-Invokes [mydumper](https://github.com/mydumper/mydumper) to create a logical dump of the source MySQL instance. The output is used by `bintrail baseline` to produce Parquet snapshots. Only one dump may run at a time (enforced by a lockfile).
-
-```
-Flags:
-  --source-dsn     DSN for the source MySQL server (required)
-  --output-dir     Directory for mydumper output (required; removed and recreated each run)
-  --schemas        Comma-separated schema filter (e.g. mydb,otherdb)
-  --tables         Comma-separated table filter (e.g. mydb.orders,mydb.items)
-  --mydumper-path  Path to the mydumper binary (default: mydumper)
-  --threads        Number of parallel dump threads (default: 4)
-  --format         Output format: text (default), json
-```
-
-```sh
-bintrail dump \
-  --source-dsn "user:pass@tcp(source:3306)/" \
-  --output-dir /tmp/mydumper-output \
-  --schemas mydb
-```
-
-> **Prerequisite:** mydumper must be installed separately. See the [Dump and Baseline guide](docs/dump-and-baseline.md) for installation instructions, scheduling, and the full dump → baseline workflow.
-
-### `bintrail baseline`
-
-Converts mydumper output to Parquet baseline snapshots — one file per table. No database connection required; operates purely on files.
-
-```
-Flags:
-  --input          mydumper output directory (required)
-  --output         Parquet output base directory (required)
-  --timestamp      Snapshot timestamp override (ISO 8601; default: from mydumper metadata)
-  --tables         Comma-separated db.table filter (default: all)
-  --compression    Parquet compression codec: zstd, snappy, gzip, none (default: zstd)
-  --row-group-size Rows per Parquet row group (default: 500000)
-  --upload         S3 URL to upload Parquet files after generation
-  --upload-region  AWS region for --upload
-  --format         Output format: text (default), json
-```
-
-```sh
-# Convert mydumper output to Parquet
-bintrail baseline \
-  --input  /tmp/mydumper-output \
-  --output /data/baselines
-
-# Convert and upload to S3 in one step
-bintrail baseline \
-  --input         /tmp/mydumper-output \
-  --output        /tmp/baselines \
-  --upload        s3://my-bucket/baselines/ \
-  --upload-region us-east-1
-```
-
 ### `bintrail query`
 
-Search the index with flexible filters. Output defaults to a human-readable table; JSON and CSV are also supported.
+Search the index with flexible filters. Output defaults to a human-readable table; JSON and CSV are also supported. Results are automatically merged from live MySQL and Parquet archives when archive sources are configured.
 
 ```
 Flags:
@@ -230,8 +189,14 @@ Flags:
   --since           Events at or after this time (2006-01-02 15:04:05)
   --until           Events at or before this time
   --changed-column  UPDATEs that modified this column
+  --flag            Filter events from tables or columns carrying this flag
   --format          Output format: table (default), json, csv
   --limit           Max rows returned (default: 100)
+  --archive-dir     Local root directory of Parquet archives (requires --bintrail-id)
+  --archive-s3      S3 root URL prefix of Parquet archives (requires --bintrail-id)
+  --bintrail-id     Server identity UUID (required with --archive-dir or --archive-s3)
+  --profile         Apply RBAC access rules for this profile
+  --no-archive      Disable auto-routing to Parquet archives (MySQL-only results)
 ```
 
 Examples:
@@ -276,9 +241,13 @@ Flags:
   --gtid         Filter by GTID
   --since        Events at or after this time
   --until        Events at or before this time
+  --flag         Filter events from tables or columns carrying this flag
   --output       Write SQL to this file (required unless --dry-run)
   --dry-run      Print SQL to stdout instead of writing a file
   --limit        Max events to reverse (default: 1000)
+  --profile      Apply RBAC access rules for this profile
+  --no-archive   Disable auto-routing to Parquet archives (MySQL-only results)
+  --format       Output format: text (default), json
 ```
 
 Examples:
@@ -305,13 +274,23 @@ bintrail recover --index-dsn "..." \
 
 ### `bintrail rotate`
 
-Manages the time-range partitions on `binlog_events`. Drop old partitions to reclaim space; add new daily partitions so future events land in named partitions rather than the catch-all `p_future`.
+Manages the time-range partitions on `binlog_events`. Drop old partitions to reclaim space; add new hourly partitions so future events land in named partitions rather than the catch-all `p_future`. Optionally archives partitions to Parquet before dropping.
 
 ```
 Flags:
-  --index-dsn    DSN for the index database (required)
-  --retain       Drop partitions older than this duration (e.g. 7d, 24h)
-  --add-future   Number of new daily partitions to add
+  --index-dsn             DSN for the index database (required)
+  --retain                Drop partitions older than this duration (e.g. 7d, 24h)
+  --add-future            Extra hourly partitions to add beyond auto-replacements (default: 0)
+  --no-replace            Do not auto-add future partitions to replace dropped ones
+  --archive-dir           Write Parquet archives before dropping (requires --bintrail-id)
+  --archive-compression   Compression codec: zstd (default), snappy, gzip, none
+  --bintrail-id           Server identity UUID (required with --archive-dir)
+  --archive-s3            S3 destination to upload archives after writing
+  --archive-s3-region     AWS region for --archive-s3
+  --daemon                Run continuously on --interval schedule until SIGINT/SIGTERM
+  --interval              Rotation interval in daemon mode (default: 1h)
+  --retry                 Skip archiving partitions whose Parquet file already exists
+  --format                Output format: text (default), json
 ```
 
 ```sh
@@ -320,6 +299,14 @@ bintrail rotate --index-dsn "..." --retain 7d --add-future 3
 
 # Just add more future partitions without dropping anything
 bintrail rotate --index-dsn "..." --add-future 14
+
+# Archive to Parquet + S3 before dropping
+bintrail rotate --index-dsn "..." --retain 7d \
+  --archive-dir /data/archives --bintrail-id "your-uuid" \
+  --archive-s3 s3://my-bucket/archives/
+
+# Run as a daemon, rotating every hour
+bintrail rotate --index-dsn "..." --retain 7d --daemon --interval 1h
 ```
 
 ### `bintrail status`
@@ -329,6 +316,7 @@ Shows the current state of the index: which binlog files have been processed, pa
 ```
 Flags:
   --index-dsn   DSN for the index database (required)
+  --format      Output format: text (default), json
 ```
 
 ```sh
@@ -355,6 +343,207 @@ Total events (est.): 21246
 === Summary ===
 Files:  2 completed, 0 in_progress, 0 failed
 Events: 21246 indexed
+```
+
+### `bintrail reconstruct`
+
+Reconstructs the state of a row at a given point in time by combining a baseline Parquet snapshot with subsequent binlog events from the index. Can also query baselines directly with DuckDB SQL.
+
+```
+Flags:
+  --index-dsn      DSN for the index database (not required with --baseline-only or --sql)
+  --schema         Schema (database) name
+  --table          Table name
+  --pk             Primary key value(s), pipe-delimited for composite PKs
+  --pk-columns     Comma-separated PK column name(s) matching --pk order
+  --at             Target timestamp for reconstruction (default: now)
+  --baseline-dir   Local directory of baseline Parquet snapshots
+  --baseline-s3    S3 URL prefix of baseline Parquet snapshots
+  --baseline-only  Return the baseline row without applying binlog events
+  --history        Return all intermediate states instead of just the final state
+  --sql            Execute arbitrary DuckDB SQL against baselines
+  --format         Output format: json (default), table, csv
+```
+
+```sh
+# Reconstruct row state at a specific point in time
+bintrail reconstruct --index-dsn "..." \
+  --schema mydb --table orders --pk 12345 \
+  --baseline-dir /data/baselines \
+  --at "2026-02-19 14:00:00"
+
+# Show full change history for a row
+bintrail reconstruct --index-dsn "..." \
+  --schema mydb --table orders --pk 12345 \
+  --baseline-dir /data/baselines --history
+
+# Query baselines directly with DuckDB SQL
+bintrail reconstruct \
+  --baseline-dir /data/baselines \
+  --sql "SELECT * FROM parquet_scan('/data/baselines/mydb/orders/*.parquet') LIMIT 10"
+```
+
+### `bintrail dump`
+
+Invokes [mydumper](https://github.com/mydumper/mydumper) to create a logical dump of the source MySQL instance. The output is used by `bintrail baseline` to produce Parquet snapshots. Only one dump may run at a time (enforced by a lockfile).
+
+```
+Flags:
+  --source-dsn     DSN for the source MySQL server (required)
+  --output-dir     Directory for mydumper output (required; removed and recreated each run)
+  --schemas        Comma-separated schema filter (e.g. mydb,otherdb)
+  --tables         Comma-separated table filter (e.g. mydb.orders,mydb.items)
+  --mydumper-path  Path to the mydumper binary (default: mydumper)
+  --mydumper-image Docker image for mydumper (default: mydumper/mydumper:latest)
+  --threads        Number of parallel dump threads (default: 4)
+  --encrypt        Encrypt dump files at rest using AES-256-CBC
+  --encrypt-key    Path to encryption key file (default: ~/.config/bintrail/dump.key)
+  --format         Output format: text (default), json
+```
+
+```sh
+bintrail dump \
+  --source-dsn "user:pass@tcp(source:3306)/" \
+  --output-dir /tmp/mydumper-output \
+  --schemas mydb
+```
+
+> **Prerequisite:** mydumper must be installed separately. See the [Dump and Baseline guide](docs/dump-and-baseline.md) for installation instructions, scheduling, and the full dump → baseline workflow.
+
+### `bintrail baseline`
+
+Converts mydumper output to Parquet baseline snapshots — one file per table. No database connection required; operates purely on files.
+
+```
+Flags:
+  --input          mydumper output directory (required)
+  --output         Parquet output base directory (required)
+  --timestamp      Snapshot timestamp override (ISO 8601; default: from mydumper metadata)
+  --tables         Comma-separated db.table filter (default: all)
+  --compression    Parquet compression codec: zstd (default), snappy, gzip, none
+  --row-group-size Rows per Parquet row group (default: 500000)
+  --upload         S3 URL to upload Parquet files after generation
+  --upload-region  AWS region for --upload
+  --encrypt        Decrypt encrypted dump files before processing
+  --encrypt-key    Path to encryption key file (default: ~/.config/bintrail/dump.key)
+  --retry          Skip tables whose output Parquet file already exists
+  --format         Output format: text (default), json
+```
+
+```sh
+# Convert mydumper output to Parquet
+bintrail baseline \
+  --input  /tmp/mydumper-output \
+  --output /data/baselines
+
+# Convert and upload to S3 in one step
+bintrail baseline \
+  --input         /tmp/mydumper-output \
+  --output        /tmp/baselines \
+  --upload        s3://my-bucket/baselines/ \
+  --upload-region us-east-1
+```
+
+### `bintrail upload`
+
+Uploads local Parquet files to S3. Optionally updates `archive_state` in the index database so archives are auto-discovered by `query` and `recover`.
+
+```
+Flags:
+  --source       Local directory containing Parquet files to upload (required)
+  --destination  S3 destination URL, e.g. s3://my-bucket/archives/ (required)
+  --region       AWS region (default: from AWS_REGION env var or ~/.aws/config)
+  --index-dsn    Update archive_state table with S3 metadata after upload
+  --retry        Skip files that already exist in S3
+  --format       Output format: text (default), json
+```
+
+```sh
+bintrail upload \
+  --source /data/archives \
+  --destination s3://my-bucket/archives/ \
+  --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
+```
+
+### `bintrail generate-key`
+
+Generates an AES-256 encryption key for at-rest dump encryption used by `dump` and `baseline`.
+
+```
+Flags:
+  --output   Output path for the key file (default: ~/.config/bintrail/dump.key)
+  --format   Output format: text (default), json
+```
+
+```sh
+bintrail generate-key
+bintrail dump --source-dsn "..." --output-dir /tmp/dump --encrypt
+bintrail baseline --input /tmp/dump --output /data/baselines --encrypt
+```
+
+### `bintrail config init`
+
+Generates a `.bintrail.env` configuration file with all available environment variables. Commands automatically load this file on startup.
+
+```
+Flags:
+  --global   Write to ~/.config/bintrail/config.env instead of .bintrail.env
+```
+
+```sh
+# Generate local config file
+bintrail config init
+
+# Generate global config file
+bintrail config init --global
+```
+
+### `bintrail profile`
+
+Manages RBAC access profiles. Profiles are referenced by `--profile` on `query` and `recover` to apply table-level deny and column-level redaction rules.
+
+```sh
+# Create a profile
+bintrail profile add --index-dsn "..." analyst --description "Read-only analyst profile"
+
+# List profiles
+bintrail profile list --index-dsn "..."
+
+# Remove a profile
+bintrail profile remove --index-dsn "..." analyst
+```
+
+### `bintrail flag`
+
+Manages flags on tables and columns. Flags are labels (e.g. `pii`, `sensitive`) that can be referenced by access rules and query filters.
+
+```sh
+# Flag a table
+bintrail flag add --index-dsn "..." --schema mydb --table users pii
+
+# Flag a specific column
+bintrail flag add --index-dsn "..." --schema mydb --table users --column email pii
+
+# List all flags
+bintrail flag list --index-dsn "..."
+
+# Remove a flag
+bintrail flag remove --index-dsn "..." --schema mydb --table users pii
+```
+
+### `bintrail access`
+
+Manages access rules that link flags to profiles. When a profile is active via `--profile`, tables or columns carrying a denied flag are excluded or redacted from results.
+
+```sh
+# Deny a profile from seeing flagged data
+bintrail access add --index-dsn "..." --profile analyst --flag pii --permission deny
+
+# List access rules
+bintrail access list --index-dsn "..."
+
+# Remove a rule
+bintrail access remove --index-dsn "..." --profile analyst --flag pii
 ```
 
 ## MCP Server
@@ -521,7 +710,7 @@ journalctl -u bintrail-index.service -f
 
 **`Dockerfile`**
 ```dockerfile
-FROM golang:1.25-alpine AS builder
+FROM golang:1.24-alpine AS builder
 WORKDIR /src
 COPY . .
 RUN go build -o /bintrail ./cmd/bintrail
@@ -739,8 +928,16 @@ The index stores the complete before and after row images for every event, so re
 |---|---|
 | `binlog_events` | All indexed row events, range-partitioned by `event_timestamp` |
 | `schema_snapshots` | Table/column metadata from `information_schema` at snapshot time |
+| `schema_changes` | DDL change history detected during indexing |
+| `fk_constraints` | Foreign key constraint metadata captured by snapshots |
 | `index_state` | Per-file indexing progress and status (`bintrail index`) |
 | `stream_state` | Single-row checkpoint for live replication position (`bintrail stream`) |
+| `archive_state` | Tracks partitions archived to Parquet (local path + S3 location) |
+| `bintrail_servers` | Registered server identities |
+| `bintrail_server_changes` | Server identity change history |
+| `profiles` | RBAC access profiles |
+| `access_rules` | Profile-to-flag permission mappings (allow/deny) |
+| `table_flags` | Flags (labels) attached to tables and columns |
 
 ## Observability
 
