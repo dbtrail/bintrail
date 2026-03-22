@@ -149,6 +149,10 @@ exact column names and not substrings (e.g. "status" must not match
 "order_status").
 ```
 
+## Contributor License Agreement
+
+By opening a pull request, you agree to the terms of the [Contributor License Agreement](CLA.md). First-time contributors will be asked to confirm via [CLA Assistant](https://cla-assistant.io/) before their PR can be merged.
+
 ## License
 
-By contributing you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE).
+This project is licensed under the [Business Source License 1.1](LICENSE). By contributing, you grant the maintainer the rights described in the [CLA](CLA.md), which include the right to use your contributions under the current and future license terms.
