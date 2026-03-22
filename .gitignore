@@ -1,14 +1,24 @@
 # Credentials — never commit
 deploy/.env
+*.key
+*.pem
 
-# Build artifacts (compiled binaries at repo root and cross-compilation output)
+# Build artifacts
 /bintrail
 /bintrail-mcp
+/mcp-gateway
 /dist/
 
 # Test coverage
 cover.out
 /tmp/bintrail-cover/
+
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.pyc
 
 # macOS
 .DS_Store
