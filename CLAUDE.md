@@ -31,11 +31,13 @@ internal/
   baseline/            # mydumper → Parquet converter
   archive/             # Partition archiver → Parquet via baseline.Writer
   parquetquery/        # DuckDB-backed Parquet query engine
+  storage/             # Abstract storage backend interface (Backend) + S3 implementation for BYOS
+  byos/                # BYOS data separation: SplitEvent → MetadataRecord (dbtrail API) + PayloadRecord (customer S3 Parquet)
   testutil/            # Shared test helpers: CreateTestDB, InitIndexTables, SkipIfNoMySQL, etc.
 e2e_test.go            # Full CLI pipeline E2E test (//go:build integration), built with go build -cover
 .mcp.json              # MCP server registration (go run ./cmd/bintrail-mcp)
 migrations/            # Reference DDL (tables created by `bintrail init`, not this file)
-docs/                  # guide.md, indexing.md, query-and-recovery.md, streaming.md, rotation-and-status.md, mcp-server.md, upload.md, parquet-debugging.md, deployment.md, quickstart.md, dump-and-baseline.md, docker.md, server-identity.md, mcp-gateway.md
+docs/                  # guide.md, indexing.md, query-and-recovery.md, streaming.md, rotation-and-status.md, mcp-server.md, upload.md, parquet-debugging.md, deployment.md, quickstart.md, dump-and-baseline.md, docker.md, server-identity.md, mcp-gateway.md, storage.md
 ```
 
 ## Commands
@@ -178,6 +180,18 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql`. Do not use `SEL
 - `QueryPlan.GapHours` lists hours with no data (rotated but not archived); emitted as `slog.Warn` via `RunPlanAndWarn`.
 - `ParsePartitionName(name)` converts `"p_2026021914"` to UTC hour; returns false for `"p_future"` or malformed names.
 - `--no-archive` flag on `query`/`recover` skips archive auto-discovery entirely (MySQL-only results).
+
+### BYOS data separation
+- In BYOS (Bring Your Own Storage) mode, parsed events are split into two streams via `byos.SplitEvent(ev, serverID)`:
+  - **MetadataRecord**: pk_hash, schema, table, event_type, timestamp, server_id, gtid, row_count, changed_columns — sent to dbtrail API. Contains zero row-level data.
+  - **PayloadRecord**: pk_hash, pk_values, row_before, row_after, changed_columns, schema_version — written to customer's storage backend as Parquet. Never leaves customer infrastructure.
+- `byos.PKHash(pkValues)` computes SHA-256 matching MySQL's `SHA2(pk_values, 256)` generated column — the correlation key between metadata and payload.
+- `changed_columns`: for UPDATEs, sorted list of column names that differ between before/after images (via `parser.ChangedColumns`). Nil for INSERT/DELETE. Column names only, never values.
+- `SplitEvent` returns an error for unsupported event types (DDL, GTID) — callers must filter these first.
+- `SplitEvent` clones `RowBefore`, `RowAfter` (via `maps.Clone`) and `ChangedColumns` (via `slices.Clone`) to prevent shared mutation between records and the source parser event.
+- `byos.MetadataClient`: HTTP POST to `{endpoint}/v1/events` with 30s timeout. Batch sends `[]MetadataRecord` as JSON.
+- `byos.PayloadWriter`: writes Parquet files to `storage.Backend` with partitioning `{server_id}/{schema}.{table}/{date}/events_{nanos}.parquet`. Groups records by schema.table and UTC date. Uses `baseline.Writer` for Parquet output.
+- In hosted mode, the `byos` package is not used — events flow directly to the indexer as before.
 
 ## Testing conventions
 
