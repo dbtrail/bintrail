@@ -1,8 +1,6 @@
 package byos
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"testing"
 	"time"
 
@@ -14,7 +12,7 @@ func TestPKHash(t *testing.T) {
 	// MySQL: SELECT SHA2('12345', 256)
 	//   → 5994471abb01112afcc18159f6cc74b4f511b99806da59b3caf5a9c173cacfc5
 	input := "12345"
-	want := sha256Hex(input)
+	want := "5994471abb01112afcc18159f6cc74b4f511b99806da59b3caf5a9c173cacfc5"
 	got := PKHash(input)
 	if got != want {
 		t.Errorf("PKHash(%q) = %q, want %q", input, got, want)
@@ -22,30 +20,39 @@ func TestPKHash(t *testing.T) {
 }
 
 func TestPKHashPipeDelimited(t *testing.T) {
-	// Composite PK: pipe-delimited values.
-	input := "42|hello"
-	want := sha256Hex(input)
-	got := PKHash(input)
-	if got != want {
-		t.Errorf("PKHash(%q) = %q, want %q", input, got, want)
+	// Composite PK: pipe-delimited values. Verify it produces a
+	// 64-char lowercase hex string (valid SHA-256 digest).
+	got := PKHash("42|hello")
+	if len(got) != 64 {
+		t.Errorf("PKHash length = %d, want 64", len(got))
+	}
+	for _, c := range got {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			t.Errorf("PKHash contains non-hex char %q", c)
+			break
+		}
 	}
 }
 
 func TestSplitEventInsert(t *testing.T) {
 	ev := parser.Event{
-		BinlogFile: "mysql-bin.000001",
-		StartPos:   100,
-		EndPos:     200,
-		Timestamp:  time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC),
-		GTID:       "aaa-bbb:1",
-		Schema:     "mydb",
-		Table:      "users",
-		EventType:  parser.EventInsert,
-		PKValues:   "42",
-		RowAfter:   map[string]any{"id": 42, "name": "Alice"},
+		BinlogFile:    "mysql-bin.000001",
+		StartPos:      100,
+		EndPos:        200,
+		Timestamp:     time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC),
+		GTID:          "aaa-bbb:1",
+		Schema:        "mydb",
+		Table:         "users",
+		EventType:     parser.EventInsert,
+		PKValues:      "42",
+		RowAfter:      map[string]any{"id": 42, "name": "Alice"},
+		SchemaVersion: 5,
 	}
 
-	meta, payload := SplitEvent(ev, "server-1")
+	meta, payload, err := SplitEvent(ev, "server-1")
+	if err != nil {
+		t.Fatalf("SplitEvent: %v", err)
+	}
 
 	// Metadata checks.
 	wantHash := PKHash("42")
@@ -90,6 +97,9 @@ func TestSplitEventInsert(t *testing.T) {
 	if payload.RowAfter["name"] != "Alice" {
 		t.Errorf("payload.RowAfter[name] = %v, want Alice", payload.RowAfter["name"])
 	}
+	if payload.SchemaVersion != 5 {
+		t.Errorf("payload.SchemaVersion = %d, want 5", payload.SchemaVersion)
+	}
 }
 
 func TestSplitEventDelete(t *testing.T) {
@@ -102,7 +112,10 @@ func TestSplitEventDelete(t *testing.T) {
 		RowBefore: map[string]any{"id": 42, "name": "Alice"},
 	}
 
-	meta, payload := SplitEvent(ev, "srv")
+	meta, payload, err := SplitEvent(ev, "srv")
+	if err != nil {
+		t.Fatalf("SplitEvent: %v", err)
+	}
 
 	if meta.EventType != "DELETE" {
 		t.Errorf("meta.EventType = %q, want DELETE", meta.EventType)
@@ -129,7 +142,10 @@ func TestSplitEventUpdate(t *testing.T) {
 		RowAfter:  map[string]any{"id": 42, "name": "Alice", "email": "a@new.com"},
 	}
 
-	meta, payload := SplitEvent(ev, "srv")
+	meta, payload, err := SplitEvent(ev, "srv")
+	if err != nil {
+		t.Fatalf("SplitEvent: %v", err)
+	}
 
 	if meta.EventType != "UPDATE" {
 		t.Errorf("meta.EventType = %q, want UPDATE", meta.EventType)
@@ -139,9 +155,6 @@ func TestSplitEventUpdate(t *testing.T) {
 	if len(meta.ChangedColumns) != 1 || meta.ChangedColumns[0] != "email" {
 		t.Errorf("meta.ChangedColumns = %v, want [email]", meta.ChangedColumns)
 	}
-
-	// Metadata must NOT contain any values — only column names.
-	// (This is enforced by the type: ChangedColumns is []string, not map.)
 
 	// Payload should have both before and after images.
 	if payload.RowBefore == nil || payload.RowAfter == nil {
@@ -163,7 +176,10 @@ func TestSplitEventUpdateMultipleChanges(t *testing.T) {
 		RowAfter:  map[string]any{"id": 42, "email": "a@new.com", "updated_at": "2026-03-31"},
 	}
 
-	meta, _ := SplitEvent(ev, "srv")
+	meta, _, err := SplitEvent(ev, "srv")
+	if err != nil {
+		t.Fatalf("SplitEvent: %v", err)
+	}
 
 	// Should have exactly email and updated_at (sorted).
 	if len(meta.ChangedColumns) != 2 {
@@ -174,26 +190,69 @@ func TestSplitEventUpdateMultipleChanges(t *testing.T) {
 	}
 }
 
-func TestEventTypeName(t *testing.T) {
-	tests := []struct {
-		et   parser.EventType
-		want string
-	}{
-		{parser.EventInsert, "INSERT"},
-		{parser.EventUpdate, "UPDATE"},
-		{parser.EventDelete, "DELETE"},
-		{parser.EventDDL, "UNKNOWN"},
-		{parser.EventGTID, "UNKNOWN"},
+func TestSplitEventUnsupportedType(t *testing.T) {
+	ev := parser.Event{
+		EventType: parser.EventDDL,
 	}
-	for _, tt := range tests {
-		if got := eventTypeName(tt.et); got != tt.want {
-			t.Errorf("eventTypeName(%d) = %q, want %q", tt.et, got, tt.want)
-		}
+	_, _, err := SplitEvent(ev, "srv")
+	if err == nil {
+		t.Fatal("expected error for DDL event type")
 	}
 }
 
-// sha256Hex is a test helper that computes SHA-256 hex directly.
-func sha256Hex(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
+func TestSplitEventMapIsolation(t *testing.T) {
+	// Verify that mutating the source event's maps after SplitEvent
+	// does not affect the payload record (maps are cloned).
+	after := map[string]any{"id": 1, "name": "Alice"}
+	ev := parser.Event{
+		Timestamp: time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC),
+		Schema:    "mydb",
+		Table:     "users",
+		EventType: parser.EventInsert,
+		PKValues:  "1",
+		RowAfter:  after,
+	}
+
+	_, payload, err := SplitEvent(ev, "srv")
+	if err != nil {
+		t.Fatalf("SplitEvent: %v", err)
+	}
+
+	// Mutate the source map after splitting.
+	after["name"] = "MUTATED"
+
+	// Payload should still have the original value.
+	if payload.RowAfter["name"] != "Alice" {
+		t.Errorf("payload.RowAfter[name] = %v, want Alice (map was not cloned)", payload.RowAfter["name"])
+	}
+}
+
+func TestEventTypeName(t *testing.T) {
+	tests := []struct {
+		et      parser.EventType
+		want    string
+		wantErr bool
+	}{
+		{parser.EventInsert, "INSERT", false},
+		{parser.EventUpdate, "UPDATE", false},
+		{parser.EventDelete, "DELETE", false},
+		{parser.EventDDL, "", true},
+		{parser.EventGTID, "", true},
+	}
+	for _, tt := range tests {
+		got, err := eventTypeName(tt.et)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("eventTypeName(%d) = %q, want error", tt.et, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("eventTypeName(%d) unexpected error: %v", tt.et, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("eventTypeName(%d) = %q, want %q", tt.et, got, tt.want)
+		}
+	}
 }

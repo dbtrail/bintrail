@@ -81,13 +81,14 @@ func TestPayloadKey(t *testing.T) {
 }
 
 func TestPayloadKeyUTC(t *testing.T) {
-	// Timestamps in non-UTC zones should still produce UTC date in the key.
-	loc := time.FixedZone("UTC-5", -5*3600)
-	ts := time.Date(2026, 4, 1, 1, 0, 0, 0, loc) // 2026-04-01 06:00 UTC
+	// Use a timestamp where local and UTC dates differ to verify UTC conversion.
+	// UTC+5: local time is 2026-04-01 02:00, but UTC is 2026-03-31 21:00.
+	loc := time.FixedZone("UTC+5", 5*3600)
+	ts := time.Date(2026, 4, 1, 2, 0, 0, 0, loc) // 2026-03-31 21:00 UTC
 	got := PayloadKey("srv", "db", "t", ts)
 
-	if !strings.Contains(got, "2026-04-01") {
-		t.Errorf("PayloadKey = %q, expected UTC date 2026-04-01", got)
+	if !strings.Contains(got, "2026-03-31") {
+		t.Errorf("PayloadKey = %q, expected UTC date 2026-03-31 (not local 2026-04-01)", got)
 	}
 }
 
@@ -196,6 +197,42 @@ func TestPayloadWriterUpdateWithNulls(t *testing.T) {
 	keys, _ := backend.List(context.Background(), "srv-1/mydb.users/")
 	if len(keys) != 1 {
 		t.Fatalf("expected 1 file, got %d", len(keys))
+	}
+}
+
+func TestPayloadWriterGroupsByDate(t *testing.T) {
+	backend := newMemBackend()
+	w := NewPayloadWriter(backend, "srv-1")
+
+	// Records from the same table but different dates should produce
+	// separate Parquet files (one per date partition).
+	records := []PayloadRecord{
+		{
+			PKHash: PKHash("1"), PKValues: "1",
+			SchemaName: "mydb", TableName: "users",
+			EventType: "INSERT", EventTimestamp: time.Date(2026, 3, 31, 23, 59, 0, 0, time.UTC),
+			RowAfter: map[string]any{"id": 1}, SchemaVersion: 1,
+		},
+		{
+			PKHash: PKHash("2"), PKValues: "2",
+			SchemaName: "mydb", TableName: "users",
+			EventType: "INSERT", EventTimestamp: time.Date(2026, 4, 1, 0, 1, 0, 0, time.UTC),
+			RowAfter: map[string]any{"id": 2}, SchemaVersion: 1,
+		},
+	}
+
+	if err := w.WriteRecords(context.Background(), records); err != nil {
+		t.Fatalf("WriteRecords: %v", err)
+	}
+
+	mar31, _ := backend.List(context.Background(), "srv-1/mydb.users/2026-03-31/")
+	apr01, _ := backend.List(context.Background(), "srv-1/mydb.users/2026-04-01/")
+
+	if len(mar31) != 1 {
+		t.Errorf("expected 1 file for 2026-03-31, got %d", len(mar31))
+	}
+	if len(apr01) != 1 {
+		t.Errorf("expected 1 file for 2026-04-01, got %d", len(apr01))
 	}
 }
 

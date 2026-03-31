@@ -45,20 +45,22 @@ func NewPayloadWriter(backend storage.Backend, serverID string) *PayloadWriter {
 	}
 }
 
-// WriteRecords groups records by schema.table, writes each group to a
-// temporary Parquet file, and uploads it to the storage backend using the
-// partitioning scheme: {server_id}/{schema}.{table}/{date}/events_{nanos}.parquet
+// WriteRecords groups records by schema.table and date, writes each group
+// to a temporary Parquet file, and uploads it to the storage backend using
+// the partitioning scheme: {server_id}/{schema}.{table}/{date}/events_{nanos}.parquet
 func (w *PayloadWriter) WriteRecords(ctx context.Context, records []PayloadRecord) error {
-	// Group records by schema.table so each Parquet file contains a single table.
+	// Group records by schema.table and UTC date so each Parquet file
+	// contains a single table's events from a single day.
 	groups := make(map[string][]PayloadRecord)
 	for i := range records {
-		key := records[i].SchemaName + "." + records[i].TableName
+		date := records[i].EventTimestamp.UTC().Format("2006-01-02")
+		key := records[i].SchemaName + "." + records[i].TableName + "/" + date
 		groups[key] = append(groups[key], records[i])
 	}
 
-	for _, recs := range groups {
+	for groupKey, recs := range groups {
 		if err := w.writeGroup(ctx, recs); err != nil {
-			return err
+			return fmt.Errorf("write group %s: %w", groupKey, err)
 		}
 	}
 	return nil
@@ -122,8 +124,8 @@ func (w *PayloadWriter) writeGroup(ctx context.Context, records []PayloadRecord)
 	return nil
 }
 
-// PayloadKey builds the S3 object key for a payload Parquet file using the
-// partitioning scheme: {server_id}/{schema}.{table}/{date}/events_{nanos}.parquet
+// PayloadKey builds the storage object key for a payload Parquet file using
+// the partitioning scheme: {server_id}/{schema}.{table}/{date}/events_{nanos}.parquet
 //
 // The date directory comes from the event timestamp (UTC), while the filename
 // uses the current wall-clock time for uniqueness — MySQL DATETIME has only
@@ -178,7 +180,9 @@ func marshalPayloadRow(r *PayloadRecord) ([]string, []bool, error) {
 	return values, nulls, nil
 }
 
-// marshalJSON encodes v to JSON, returning nil for nil input.
+// marshalJSON encodes v to JSON. Returns nil for untyped nil. Note: typed
+// nil values (e.g. nil map[string]any passed as any) marshal to "null";
+// callers must handle null detection via the separate nulls flags.
 func marshalJSON(v any) ([]byte, error) {
 	if v == nil {
 		return nil, nil

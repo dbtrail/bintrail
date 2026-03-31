@@ -2,9 +2,11 @@
 // layer. In BYOS mode, parsed binlog events are split into two streams:
 //
 //   - Metadata — lightweight indexing records sent to the dbtrail API
-//     (pk_hash, table, schema, operation, timestamp, changed column names)
+//     (operation details, primary key hashes, and column change tracking,
+//     but never actual row values)
 //   - Payload — full row data written to the customer's storage backend
-//     as Parquet (pk_values, row_before, row_after)
+//     as Parquet (complete before/after images, primary key values, and
+//     event context)
 //
 // In hosted mode this package is not used and events flow directly to the
 // indexer as they do today.
@@ -13,6 +15,8 @@ package byos
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"maps"
 	"time"
 
 	"github.com/dbtrail/bintrail/internal/parser"
@@ -58,9 +62,16 @@ func PKHash(pkValues string) string {
 // SplitEvent splits a parsed binlog event into a metadata record (for the
 // dbtrail API) and a payload record (for the customer's storage backend).
 // serverID identifies the source MySQL server.
-func SplitEvent(ev parser.Event, serverID string) (MetadataRecord, PayloadRecord) {
+//
+// Returns an error for unsupported event types (DDL, GTID). Callers should
+// filter these before calling SplitEvent.
+func SplitEvent(ev parser.Event, serverID string) (MetadataRecord, PayloadRecord, error) {
+	typeName, err := eventTypeName(ev.EventType)
+	if err != nil {
+		return MetadataRecord{}, PayloadRecord{}, err
+	}
+
 	hash := PKHash(ev.PKValues)
-	typeName := eventTypeName(ev.EventType)
 	changed := parser.ChangedColumns(ev.RowBefore, ev.RowAfter)
 
 	meta := MetadataRecord{
@@ -82,26 +93,27 @@ func SplitEvent(ev parser.Event, serverID string) (MetadataRecord, PayloadRecord
 		TableName:      ev.Table,
 		EventType:      typeName,
 		EventTimestamp: ev.Timestamp,
-		RowBefore:      ev.RowBefore,
-		RowAfter:       ev.RowAfter,
+		RowBefore:      maps.Clone(ev.RowBefore),
+		RowAfter:       maps.Clone(ev.RowAfter),
 		ChangedColumns: changed,
 		SchemaVersion:  ev.SchemaVersion,
 	}
 
-	return meta, payload
+	return meta, payload, nil
 }
 
 // eventTypeName converts a parser.EventType to the string representation
-// used in metadata and payload records.
-func eventTypeName(et parser.EventType) string {
+// used in metadata and payload records. Returns an error for unsupported
+// event types (DDL, GTID, etc.).
+func eventTypeName(et parser.EventType) (string, error) {
 	switch et {
 	case parser.EventInsert:
-		return "INSERT"
+		return "INSERT", nil
 	case parser.EventUpdate:
-		return "UPDATE"
+		return "UPDATE", nil
 	case parser.EventDelete:
-		return "DELETE"
+		return "DELETE", nil
 	default:
-		return "UNKNOWN"
+		return "", fmt.Errorf("unsupported event type %d for BYOS split", et)
 	}
 }
