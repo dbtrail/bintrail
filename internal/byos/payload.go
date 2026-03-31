@@ -81,7 +81,10 @@ func (w *PayloadWriter) writeGroup(ctx context.Context, records []PayloadRecord)
 		return fmt.Errorf("create temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
-	tmp.Close()
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp file: %w", err)
+	}
 	defer os.Remove(tmpPath)
 
 	cfg := baseline.WriterConfig{
@@ -98,16 +101,23 @@ func (w *PayloadWriter) writeGroup(ctx context.Context, records []PayloadRecord)
 		return fmt.Errorf("create parquet writer: %w", err)
 	}
 
+	var writerClosed bool
+	defer func() {
+		if !writerClosed {
+			pw.Close()
+		}
+	}()
+
 	for i := range records {
 		values, nulls, err := marshalPayloadRow(&records[i])
 		if err != nil {
 			return fmt.Errorf("marshal payload row: %w", err)
 		}
 		if err := pw.WriteRow(values, nulls); err != nil {
-			pw.Close() //nolint
 			return fmt.Errorf("write row: %w", err)
 		}
 	}
+	writerClosed = true
 	if err := pw.Close(); err != nil {
 		return fmt.Errorf("close writer: %w", err)
 	}

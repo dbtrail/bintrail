@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
+	"slices"
 	"time"
 
 	"github.com/dbtrail/bintrail/internal/parser"
@@ -95,7 +96,7 @@ func SplitEvent(ev parser.Event, serverID string) (MetadataRecord, PayloadRecord
 		EventTimestamp: ev.Timestamp,
 		RowBefore:      maps.Clone(ev.RowBefore),
 		RowAfter:       maps.Clone(ev.RowAfter),
-		ChangedColumns: changed,
+		ChangedColumns: slices.Clone(changed),
 		SchemaVersion:  ev.SchemaVersion,
 	}
 
