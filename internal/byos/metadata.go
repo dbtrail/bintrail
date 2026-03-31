@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"time"
 )
 
 // MetadataClient sends metadata records to the dbtrail API.
@@ -20,7 +22,7 @@ type MetadataClient struct {
 func NewMetadataClient(endpoint string) *MetadataClient {
 	return &MetadataClient{
 		endpoint: endpoint,
-		http:     &http.Client{},
+		http:     &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -46,7 +48,8 @@ func (c *MetadataClient) Send(ctx context.Context, records []MetadataRecord) err
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("metadata API returned %s", resp.Status)
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("metadata API returned %s: %s", resp.Status, detail)
 	}
 	return nil
 }

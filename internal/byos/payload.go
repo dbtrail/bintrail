@@ -124,9 +124,13 @@ func (w *PayloadWriter) writeGroup(ctx context.Context, records []PayloadRecord)
 
 // PayloadKey builds the S3 object key for a payload Parquet file using the
 // partitioning scheme: {server_id}/{schema}.{table}/{date}/events_{nanos}.parquet
+//
+// The date directory comes from the event timestamp (UTC), while the filename
+// uses the current wall-clock time for uniqueness — MySQL DATETIME has only
+// second precision, so event timestamps alone would collide across batches.
 func PayloadKey(serverID, schema, table string, ts time.Time) string {
 	date := ts.UTC().Format("2006-01-02")
-	nanos := ts.UnixNano()
+	nanos := time.Now().UnixNano()
 	return fmt.Sprintf("%s/%s.%s/%s/events_%d.parquet", serverID, schema, table, date, nanos)
 }
 
