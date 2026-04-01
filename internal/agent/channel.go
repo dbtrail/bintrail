@@ -80,17 +80,32 @@ func NewChannel(cfg ChannelConfig, handler Handler, logger *slog.Logger) *Channe
 
 // Run connects to dbtrail and enters the listen/dispatch loop. It
 // reconnects automatically on failure with exponential backoff (1s, 2s,
-// 4s, … capped at MaxReconnectDelay). Run blocks until ctx is cancelled.
+// 4s, … capped at MaxReconnectDelay). Run blocks until ctx is cancelled
+// or a permanent error (e.g. auth rejection) is encountered.
 func (ch *Channel) Run(ctx context.Context) error {
 	delay := time.Second
 	for {
+		connStart := time.Now()
 		err := ch.connectAndListen(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+
+		// Abort on permanent errors (e.g. auth rejection).
+		if !isTemporary(err) {
+			ch.logger.Error("permanent connection error, not reconnecting", "error", err)
+			return err
+		}
+
 		ch.logger.Warn("connection lost, reconnecting",
 			"error", err,
 			"delay", delay.String())
+
+		// Reset backoff if the connection was stable (lasted longer than
+		// one heartbeat interval).
+		if time.Since(connStart) > ch.cfg.heartbeatInterval() {
+			delay = time.Second
+		}
 
 		select {
 		case <-ctx.Done():
@@ -182,6 +197,8 @@ func (ch *Channel) listenLoop(ctx context.Context, conn *websocket.Conn) error {
 }
 
 // heartbeatLoop sends periodic heartbeat messages until ctx is cancelled.
+// On send failure it closes the connection so listenLoop exits and
+// triggers a reconnect.
 func (ch *Channel) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
 	ticker := time.NewTicker(ch.cfg.heartbeatInterval())
 	defer ticker.Stop()
@@ -189,6 +206,7 @@ func (ch *Channel) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
 	// Send one immediately on connect.
 	if err := ch.sendHeartbeat(ctx, conn); err != nil {
 		ch.logger.Warn("heartbeat send failed", "error", err)
+		conn.CloseNow()
 		return
 	}
 
@@ -198,7 +216,8 @@ func (ch *Channel) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
 			return
 		case <-ticker.C:
 			if err := ch.sendHeartbeat(ctx, conn); err != nil {
-				ch.logger.Warn("heartbeat send failed", "error", err)
+				ch.logger.Warn("heartbeat send failed, closing connection", "error", err)
+				conn.CloseNow()
 				return
 			}
 		}
@@ -234,9 +253,9 @@ func writeJSON(ctx context.Context, conn *websocket.Conn, v any) error {
 	return conn.Write(ctx, websocket.MessageText, data)
 }
 
-// IsTemporary reports whether err is a connection-level error that should
+// isTemporary reports whether err is a connection-level error that should
 // trigger a reconnect (as opposed to a permanent auth failure).
-func IsTemporary(err error) bool {
+func isTemporary(err error) bool {
 	var closeErr websocket.CloseError
 	if errors.As(err, &closeErr) {
 		switch closeErr.Code {

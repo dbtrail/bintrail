@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -378,5 +379,74 @@ func TestAllowedForensicsQueries(t *testing.T) {
 		if _, ok := allowedForensicsQueries[name]; !ok {
 			t.Errorf("missing forensics query %q", name)
 		}
+	}
+}
+
+func TestIsTemporary(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "network error is temporary",
+			err:  fmt.Errorf("connection refused"),
+			want: true,
+		},
+		{
+			name: "auth rejection is permanent",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "unauthorized"},
+			want: false,
+		},
+		{
+			name: "server error is temporary",
+			err:  websocket.CloseError{Code: websocket.StatusInternalError, Reason: "internal"},
+			want: true,
+		},
+		{
+			name: "normal closure is temporary",
+			err:  websocket.CloseError{Code: websocket.StatusNormalClosure, Reason: "bye"},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTemporary(tt.err); got != tt.want {
+				t.Errorf("isTemporary(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestChannel_permanentErrorStopsReconnect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		// Close with PolicyViolation (auth rejected) — permanent error.
+		conn.Close(websocket.StatusPolicyViolation, "unauthorized")
+	}))
+	defer srv.Close()
+
+	cfg := ChannelConfig{
+		Endpoint:          "ws" + strings.TrimPrefix(srv.URL, "http"),
+		APIKey:            "bad-key",
+		HeartbeatInterval: time.Hour,
+		MaxReconnectDelay: 50 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ch := NewChannel(cfg, &stubHandler{}, nil)
+	err := ch.Run(ctx)
+
+	// Should return the error, not context.DeadlineExceeded.
+	if err == nil {
+		t.Fatal("expected error from Run")
+	}
+	if err == context.DeadlineExceeded {
+		t.Error("Run should have stopped on permanent error, not timed out")
 	}
 }

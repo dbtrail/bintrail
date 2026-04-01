@@ -97,6 +97,11 @@ func (h *DefaultHandler) HandleResolvePK(ctx context.Context, req ResolvePKReque
 }
 
 // resolvePKFromMySQL queries binlog_events for a single pk_hash.
+//
+// Note: the standard PK lookup pattern requires both pk_hash = SHA2(?, 256)
+// AND pk_values = ? as a collision guard. Here we only have the hash (that's
+// what we're resolving), so we query by pk_hash alone. SHA-256 collisions
+// are astronomically unlikely; callers should verify results when critical.
 func (h *DefaultHandler) resolvePKFromMySQL(ctx context.Context, item PKItem) (string, error) {
 	var pkValues string
 	err := h.IndexDB.QueryRowContext(ctx,
@@ -111,19 +116,21 @@ func (h *DefaultHandler) resolvePKFromMySQL(ctx context.Context, item PKItem) (s
 	return pkValues, err
 }
 
-// resolvePKFromArchive queries Parquet archives for a single pk_hash.
+// resolvePKFromArchive scans Parquet archive rows for the given pk_hash.
+// Since Parquet files have no SHA2 index, we fetch all rows for the
+// schema.table and compute SHA-256 client-side to find the match.
 func (h *DefaultHandler) resolvePKFromArchive(ctx context.Context, item PKItem, source string) (string, error) {
 	opts := query.Options{
 		Schema: item.Schema,
 		Table:  item.Table,
-		Limit:  1,
+		Limit:  0, // no limit — need to scan for the hash
 	}
 	rows, err := parquetquery.Fetch(ctx, opts, source)
 	if err != nil {
 		return "", err
 	}
 	for _, r := range rows {
-		if r.PKValues != "" {
+		if byosPKHash(r.PKValues) == item.PKHash {
 			return r.PKValues, nil
 		}
 	}
