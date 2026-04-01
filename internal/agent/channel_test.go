@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -379,6 +380,61 @@ func TestAllowedForensicsQueries(t *testing.T) {
 		if _, ok := allowedForensicsQueries[name]; !ok {
 			t.Errorf("missing forensics query %q", name)
 		}
+	}
+}
+
+func TestDispatch_handlerError(t *testing.T) {
+	h := &stubHandler{
+		resolvePK: func(_ context.Context, _ ResolvePKRequest) ([]PKResult, error) {
+			return nil, fmt.Errorf("db connection lost")
+		},
+	}
+	data, _ := json.Marshal(ResolvePKRequest{Items: []PKItem{{PKHash: "abc", Schema: "db", Table: "t"}}})
+	cmd := Command{ID: "err-1", Type: "resolve_pk", Data: data}
+
+	resp := dispatch(context.Background(), h, cmd)
+
+	if resp.ID != "err-1" {
+		t.Errorf("ID = %q, want %q", resp.ID, "err-1")
+	}
+	if !strings.Contains(resp.Error, "db connection lost") {
+		t.Errorf("error = %q, want to contain %q", resp.Error, "db connection lost")
+	}
+	if resp.Data != nil {
+		t.Errorf("Data should be nil on error, got %v", resp.Data)
+	}
+}
+
+func TestDefaultHandler_forensicsRejectsUnknown(t *testing.T) {
+	h := &DefaultHandler{SourceDB: &sql.DB{}} // non-nil SourceDB
+	_, err := h.HandleForensicsQuery(context.Background(), ForensicsQueryRequest{Query: "DROP TABLE users"})
+	if err == nil {
+		t.Fatal("expected error for unknown query")
+	}
+	if !strings.Contains(err.Error(), "unknown forensics query") {
+		t.Errorf("error = %q, want 'unknown forensics query'", err.Error())
+	}
+}
+
+func TestDefaultHandler_noDataSources(t *testing.T) {
+	h := &DefaultHandler{} // all nil
+
+	_, err := h.HandleResolvePK(context.Background(), ResolvePKRequest{Items: []PKItem{{PKHash: "abc"}}})
+	if err == nil || !strings.Contains(err.Error(), "no data sources") {
+		t.Errorf("HandleResolvePK error = %v, want 'no data sources'", err)
+	}
+
+	_, err = h.HandleRecover(context.Background(), RecoverRequest{Schema: "db", Table: "t"})
+	if err == nil || !strings.Contains(err.Error(), "no data sources") {
+		t.Errorf("HandleRecover error = %v, want 'no data sources'", err)
+	}
+}
+
+func TestDefaultHandler_forensicsRequiresSourceDSN(t *testing.T) {
+	h := &DefaultHandler{} // SourceDB is nil
+	_, err := h.HandleForensicsQuery(context.Background(), ForensicsQueryRequest{Query: "recent_queries"})
+	if err == nil || !strings.Contains(err.Error(), "require --source-dsn") {
+		t.Errorf("error = %v, want 'require --source-dsn'", err)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/metadata"
@@ -16,8 +17,9 @@ import (
 )
 
 // allowedForensicsQueries maps predefined query identifiers to safe SQL
-// that runs against performance_schema. Only these are allowed — the agent
-// never executes arbitrary SQL from dbtrail.
+// that runs against performance_schema and information_schema. Only these
+// are allowed — the agent never executes arbitrary SQL from dbtrail.
+// DO NOT modify at runtime — this is a security boundary.
 var allowedForensicsQueries = map[string]string{
 	"recent_queries": `SELECT DIGEST_TEXT, COUNT_STAR, SUM_TIMER_WAIT/1e12 AS total_seconds,
 		AVG_TIMER_WAIT/1e12 AS avg_seconds, LAST_SEEN
@@ -30,9 +32,9 @@ var allowedForensicsQueries = map[string]string{
 		b.trx_id AS blocking_trx,
 		b.trx_mysql_thread_id AS blocking_thread,
 		r.trx_query AS waiting_query
-		FROM information_schema.innodb_lock_waits w
-		JOIN information_schema.innodb_trx b ON b.trx_id = w.blocking_trx_id
-		JOIN information_schema.innodb_trx r ON r.trx_id = w.requesting_trx_id`,
+		FROM performance_schema.data_lock_waits w
+		JOIN information_schema.innodb_trx b ON b.trx_id = w.BLOCKING_ENGINE_TRANSACTION_ID
+		JOIN information_schema.innodb_trx r ON r.trx_id = w.REQUESTING_ENGINE_TRANSACTION_ID`,
 
 	"table_io": `SELECT OBJECT_SCHEMA, OBJECT_NAME, OBJECT_TYPE,
 		COUNT_READ, COUNT_WRITE, COUNT_FETCH, COUNT_INSERT, COUNT_UPDATE, COUNT_DELETE
@@ -54,6 +56,16 @@ type DefaultHandler struct {
 
 	// ArchiveSources lists Parquet archive paths (local dirs or s3:// URLs).
 	ArchiveSources []string
+
+	// Logger for handler operations. Nil falls back to slog.Default().
+	Logger *slog.Logger
+}
+
+func (h *DefaultHandler) logger() *slog.Logger {
+	if h.Logger != nil {
+		return h.Logger
+	}
+	return slog.Default()
 }
 
 // HandleResolvePK looks up pk_values for a list of pk_hash values from
@@ -84,7 +96,8 @@ func (h *DefaultHandler) HandleResolvePK(ctx context.Context, req ResolvePKReque
 		for _, src := range h.ArchiveSources {
 			pkVal, err := h.resolvePKFromArchive(ctx, item, src)
 			if err != nil {
-				continue // archive failures are non-fatal
+				h.logger().Warn("archive query failed, skipping", "source", src, "error", err)
+				continue
 			}
 			if pkVal != "" {
 				results[i].PKValues = pkVal
@@ -151,9 +164,10 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 		Until:  &req.TimeEnd,
 		Limit:  1000,
 	}
-	if len(req.EventTypes) > 0 {
-		// Use the first event type filter (single-type filtering per the
-		// existing query.Options design).
+	if len(req.EventTypes) > 1 {
+		return "", fmt.Errorf("only one event type filter is supported, got %d", len(req.EventTypes))
+	}
+	if len(req.EventTypes) == 1 {
 		et, err := cliutil.ParseEventType(req.EventTypes[0])
 		if err != nil {
 			return "", fmt.Errorf("invalid event type: %w", err)
@@ -174,20 +188,19 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 	for _, src := range h.ArchiveSources {
 		r, err := parquetquery.Fetch(ctx, opts, src)
 		if err != nil {
-			continue // archive failures are non-fatal
+			h.logger().Warn("archive query failed, skipping", "source", src, "error", err)
+			continue
 		}
 		rows = append(rows, r...)
 	}
 
-	if len(h.ArchiveSources) > 0 && h.IndexDB != nil {
-		rows = query.MergeResults(rows, opts.Limit)
-	}
+	rows = query.MergeResults(rows, opts.Limit)
 
 	// Filter to requested pk_hashes if specified.
 	if len(req.PKHashes) > 0 {
 		wanted := make(map[string]struct{}, len(req.PKHashes))
-		for _, h := range req.PKHashes {
-			wanted[h] = struct{}{}
+		for _, ph := range req.PKHashes {
+			wanted[ph] = struct{}{}
 		}
 		filtered := rows[:0]
 		for _, r := range rows {
@@ -202,7 +215,12 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 	// Generate reversal SQL.
 	var resolver *metadata.Resolver
 	if h.IndexDB != nil {
-		resolver, _ = metadata.NewResolver(h.IndexDB, 0)
+		var err error
+		resolver, err = metadata.NewResolver(h.IndexDB, 0)
+		if err != nil {
+			h.logger().Warn("could not load schema snapshot; WHERE clauses will use all columns", "error", err)
+			resolver = nil
+		}
 	}
 	gen := recovery.New(h.IndexDB, resolver)
 
@@ -214,7 +232,8 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 	return buf.String(), nil
 }
 
-// HandleForensicsQuery executes a predefined performance_schema query.
+// HandleForensicsQuery executes a predefined diagnostic query against
+// MySQL system tables (performance_schema, information_schema).
 func (h *DefaultHandler) HandleForensicsQuery(ctx context.Context, req ForensicsQueryRequest) (*ForensicsResult, error) {
 	if h.SourceDB == nil {
 		return nil, fmt.Errorf("forensics queries require --source-dsn")

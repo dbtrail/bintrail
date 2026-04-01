@@ -79,6 +79,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 
 	handler := &agent.DefaultHandler{
 		ArchiveSources: archiveSources,
+		Logger:         slog.Default(),
 	}
 
 	// Connect to index database if provided.

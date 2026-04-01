@@ -71,11 +71,10 @@ type RecoverRequest struct {
 }
 
 // ForensicsQueryRequest is the payload for "forensics_query" commands.
-// Query is a predefined identifier (e.g. "recent_queries", "lock_waits"),
-// NOT arbitrary SQL.
+// Query is a predefined identifier (e.g. "recent_queries", "lock_waits",
+// "table_io"), NOT arbitrary SQL.
 type ForensicsQueryRequest struct {
-	Query  string            `json:"query"`
-	Params map[string]string `json:"params,omitempty"`
+	Query string `json:"query"`
 }
 
 // ForensicsResult holds the rows returned by a forensics query.
