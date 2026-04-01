@@ -47,6 +47,59 @@ On-demand (DBA workstation):
 | `bintrail query` / `recover` | DBA tools; read from index | On-demand |
 | `bintrail rotate` | Drops old partitions; adds future ones | Scheduled (hourly or daily cron) |
 
+### BYOS architecture
+
+In BYOS (Bring Your Own Storage) mode, the customer provides an EC2 instance and S3 bucket. Row-level data never leaves the customer's infrastructure.
+
+```
+Customer EC2                                 dbtrail EC2 (dedicated)
+┌────────────────────────────┐              ┌─────────────────────────┐
+│                            │              │                         │
+│  ┌──────────────────────┐  │   WebSocket  │  ┌───────────────────┐  │
+│  │  bintrail agent      │──┼──────────────┼─►│  dbtrail service  │  │
+│  │  (stream + commands) │  │              │  └─────────┬─────────┘  │
+│  └──────────┬───────────┘  │              │            │            │
+│             │ replication  │              │  ┌─────────▼─────────┐  │
+│  ┌──────────▼───────────┐  │              │  │  Index MySQL      │  │
+│  │  Source MySQL        │  │              │  │  (metadata only:  │  │
+│  │  (customer data)     │  │              │  │   pk_hash, schema │  │
+│  └──────────────────────┘  │              │  │   timestamps)     │  │
+│                            │              │  └───────────────────┘  │
+│  ┌──────────────────────┐  │              │                         │
+│  │  In-memory buffer    │  │              └─────────────────────────┘
+│  │  (recent events)     │  │
+│  └──────────┬───────────┘  │
+│             │ Parquet      │
+│  ┌──────────▼───────────┐  │
+│  │  Customer S3 bucket  │  │
+│  │  (full event data)   │  │
+│  └──────────────────────┘  │
+│                            │
+└────────────────────────────┘
+```
+
+| Component | Location | Data |
+|-----------|----------|------|
+| Source MySQL | Customer EC2 | Customer's production data |
+| `bintrail agent` | Customer EC2 | Streams binlogs + handles dbtrail commands |
+| In-memory buffer | Customer EC2 | Last N hours of full event data |
+| Customer S3 | Customer AWS | Parquet files with pk_values, row data |
+| Index MySQL | dbtrail EC2 | Metadata only: pk_hash, timestamps, schema |
+| dbtrail service | dbtrail EC2 | Sends resolve_pk / recover commands |
+
+The agent runs as a single process combining streaming and command handling. Start it with:
+
+```bash
+bintrail agent \
+  --api-key "ak_..." \
+  --endpoint "wss://api.dbtrail.io/v1/agent" \
+  --source-dsn "user:pass@tcp(localhost:3306)/mydb" \
+  --server-id 99999 \
+  --buffer-retain "6h"
+```
+
+See `docs/storage.md` for details on the buffer, query priority, and configuration.
+
 ## 2. Source MySQL Requirements
 
 ### Version and configuration

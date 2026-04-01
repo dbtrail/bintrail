@@ -14,9 +14,10 @@ import (
 	"github.com/dbtrail/bintrail/internal/baseline"
 )
 
-// binlogEventColumns defines the 14 non-generated binlog_events columns in
+// BinlogEventColumns defines the 14 non-generated binlog_events columns in
 // MySQL table order (pk_hash is a stored generated column and is omitted).
-var binlogEventColumns = []baseline.Column{
+// Exported for reuse by the buffer package when writing Parquet files.
+var BinlogEventColumns = []baseline.Column{
 	{Name: "event_id", MySQLType: "bigint", ParquetType: baseline.MysqlToParquetNode("bigint")},
 	{Name: "binlog_file", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 	{Name: "start_pos", MySQLType: "bigint", ParquetType: baseline.MysqlToParquetNode("bigint")},
@@ -50,7 +51,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		},
 	}
 
-	w, err := baseline.NewWriter(outputPath, binlogEventColumns, cfg)
+	w, err := baseline.NewWriter(outputPath, BinlogEventColumns, cfg)
 	if err != nil {
 		return 0, fmt.Errorf("create parquet writer: %w", err)
 	}

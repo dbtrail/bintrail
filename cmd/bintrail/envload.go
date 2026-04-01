@@ -43,6 +43,8 @@ var envBindings = []envBinding{
 	{"ssl-key", "BINTRAIL_SSL_KEY"},
 	{"api-key", "BINTRAIL_API_KEY"},
 	{"endpoint", "BINTRAIL_AGENT_ENDPOINT"},
+	{"buffer-retain", "BINTRAIL_BUFFER_RETAIN"},
+	{"start-gtid", "BINTRAIL_START_GTID"},
 }
 
 var envOnce sync.Once

@@ -147,6 +147,13 @@ var envSections = []envSection{
 			{"BINTRAIL_AGENT_ENDPOINT", "wss://api.dbtrail.io/v1/agent"},
 		},
 	},
+	{
+		Header: "Local event buffer (BYOS mode)",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_BUFFER_RETAIN", "6h"},
+			{"BINTRAIL_START_GTID", ""},
+		},
+	},
 }
 
 // generateEnvTemplate builds the .bintrail.env file content. Variables

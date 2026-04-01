@@ -11,8 +11,8 @@ import (
 )
 
 func TestBinlogEventColumns_count(t *testing.T) {
-	if len(binlogEventColumns) != 14 {
-		t.Errorf("expected 14 columns, got %d", len(binlogEventColumns))
+	if len(BinlogEventColumns) != 14 {
+		t.Errorf("expected 14 columns, got %d", len(BinlogEventColumns))
 	}
 }
 
@@ -24,24 +24,24 @@ func TestBinlogEventColumns_names(t *testing.T) {
 		"schema_version",
 	}
 	for i, want := range wantNames {
-		if i >= len(binlogEventColumns) {
+		if i >= len(BinlogEventColumns) {
 			t.Fatalf("missing column at index %d, want %q", i, want)
 		}
-		if binlogEventColumns[i].Name != want {
-			t.Errorf("column[%d].Name = %q, want %q", i, binlogEventColumns[i].Name, want)
+		if BinlogEventColumns[i].Name != want {
+			t.Errorf("column[%d].Name = %q, want %q", i, BinlogEventColumns[i].Name, want)
 		}
 	}
 }
 
 func TestBinlogEventColumns_parquetTypes(t *testing.T) {
-	for _, col := range binlogEventColumns {
+	for _, col := range BinlogEventColumns {
 		if col.ParquetType == nil {
 			t.Errorf("column %q has nil ParquetType", col.Name)
 		}
 	}
 }
 
-// TestWriteReadRoundTrip verifies that binlogEventColumns can be used to write
+// TestWriteReadRoundTrip verifies that BinlogEventColumns can be used to write
 // and read a Parquet file without a DB — it tests column definitions, null
 // handling, and metadata embedding end-to-end.
 func TestWriteReadRoundTrip(t *testing.T) {
@@ -57,7 +57,7 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		},
 	}
 
-	w, err := baseline.NewWriter(outPath, binlogEventColumns, cfg)
+	w, err := baseline.NewWriter(outPath, BinlogEventColumns, cfg)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
