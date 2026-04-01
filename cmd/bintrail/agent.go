@@ -73,6 +73,7 @@ var (
 	agtS3Region      string
 	agtS3Prefix      string
 	agtFlushInterval string
+	agtValidate      bool
 )
 
 func init() {
@@ -92,6 +93,7 @@ func init() {
 	agentCmd.Flags().StringVar(&agtS3Region, "s3-region", "", "AWS region for the S3 bucket")
 	agentCmd.Flags().StringVar(&agtS3Prefix, "s3-prefix", "bintrail/", "Key prefix within the S3 bucket")
 	agentCmd.Flags().StringVar(&agtFlushInterval, "flush-interval", "5s", "Max time between metadata/payload flushes (e.g. 5s, 10s)")
+	agentCmd.Flags().BoolVar(&agtValidate, "validate", false, "Run pre-flight checks and exit without starting the agent")
 	_ = agentCmd.MarkFlagRequired("api-key")
 	_ = agentCmd.MarkFlagRequired("endpoint")
 	bindCommandEnv(agentCmd)
@@ -100,6 +102,10 @@ func init() {
 }
 
 func runAgent(cmd *cobra.Command, args []string) error {
+	if agtValidate {
+		return runAgentValidate(cmd.Context())
+	}
+
 	start := time.Now()
 
 	// Build archive sources list.

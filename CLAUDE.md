@@ -61,7 +61,7 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression`, `--row-group-size`, `--upload`, `--upload-region`, `--encrypt`, `--encrypt-key` |
 | `generate-key` | `generate_key.go` | `--output` (default `~/.config/bintrail/dump.key`) |
 | `upload` | `upload.go` | `--source` (req), `--destination` (req), `--region`, `--retry`, `--index-dsn` |
-| `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid`, `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`) |
+| `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid`, `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`), `--validate` |
 | `config init` | `config.go` | `--global` |
 
 Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`).
