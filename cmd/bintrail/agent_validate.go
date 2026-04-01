@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -201,11 +202,15 @@ func checkSchemaSnapshot(ctx context.Context, db *sql.DB) (string, error) {
 		for _, s := range schemas {
 			args = append(args, s)
 		}
-		_ = db.QueryRowContext(ctx, q, args...).Scan(&schemaCount)
+		if err := db.QueryRowContext(ctx, q, args...).Scan(&schemaCount); err != nil {
+			slog.Warn("schema count query failed", "error", err)
+		}
 	} else {
-		_ = db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT TABLE_SCHEMA) FROM information_schema.TABLES
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT TABLE_SCHEMA) FROM information_schema.TABLES
 			WHERE TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
-			AND TABLE_TYPE = 'BASE TABLE'`).Scan(&schemaCount)
+			AND TABLE_TYPE = 'BASE TABLE'`).Scan(&schemaCount); err != nil {
+			slog.Warn("schema count query failed", "error", err)
+		}
 	}
 
 	if schemaCount > 0 {
@@ -230,16 +235,15 @@ func checkS3(ctx context.Context) (string, error) {
 	if err := backend.Put(ctx, testKey, strings.NewReader("ok")); err != nil {
 		return "", fmt.Errorf("write test object: %w", err)
 	}
+	// Best-effort cleanup — ensures the test object is removed even if
+	// Get fails below.
+	defer backend.Delete(ctx, testKey)
 
 	rc, err := backend.Get(ctx, testKey)
 	if err != nil {
 		return "", fmt.Errorf("read test object: %w", err)
 	}
 	rc.Close()
-
-	if err := backend.Delete(ctx, testKey); err != nil {
-		return "", fmt.Errorf("delete test object: %w", err)
-	}
 
 	region := agtS3Region
 	if region == "" {
@@ -271,7 +275,10 @@ func checkAPI(ctx context.Context) (string, error) {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		return "", fmt.Errorf("authentication failed (HTTP %d)", resp.StatusCode)
 	case resp.StatusCode == http.StatusNotFound:
-		return "connected", nil
+		// The /v1/agent/validate endpoint may not exist on older API versions.
+		// A 404 proves connectivity but NOT that the API key is valid (the
+		// server has no reason to check auth for an unknown path).
+		return "reachable, auth not verified", nil
 	case resp.StatusCode >= 400:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
@@ -294,10 +301,13 @@ func checkWebSocket(ctx context.Context) (string, error) {
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+agtAPIKey)
 
-	conn, _, err := websocket.Dial(ctx, agtEndpoint, &websocket.DialOptions{
+	conn, resp, err := websocket.Dial(ctx, agtEndpoint, &websocket.DialOptions{
 		HTTPHeader: header,
 	})
 	if err != nil {
+		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			return "", fmt.Errorf("authentication failed (HTTP %d)", resp.StatusCode)
+		}
 		return "", fmt.Errorf("dial: %w", err)
 	}
 	conn.CloseNow()

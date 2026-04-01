@@ -10,8 +10,8 @@ User=bintrail
 Group=bintrail
 
 # Environment file with BINTRAIL_* variables. Generate a template with:
-#   bintrail config init --global
-# Then copy to /etc/bintrail/agent.env and edit.
+#   bintrail config init
+# Then copy .bintrail.env to /etc/bintrail/agent.env and edit.
 EnvironmentFile=/etc/bintrail/agent.env
 
 # Uncomment to run pre-flight validation before each start:
@@ -27,6 +27,8 @@ StandardError=journal
 SyslogIdentifier=bintrail-agent
 
 # Security hardening
+# Note: ProtectHome=yes blocks ~/.aws/credentials. For S3 access, use
+# AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY in agent.env or an instance role.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
