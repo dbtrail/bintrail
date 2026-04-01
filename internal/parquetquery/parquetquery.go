@@ -255,7 +255,7 @@ func buildQueryFromFiles(files []string, opts query.Options) (string, []any) {
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
 		" changed_columns, row_before, row_after, schema_version" +
-		" FROM parquet_scan(" + fileList + ", hive_partitioning=true)"
+		" FROM parquet_scan(" + fileList + ", hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -290,7 +290,7 @@ func buildUnsortedQuery(path string, opts query.Options) (string, []any) {
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
 		" changed_columns, row_before, row_after, schema_version" +
-		" FROM parquet_scan('" + safePath + "')"
+		" FROM parquet_scan('" + safePath + "', union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -310,7 +310,7 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
 		" changed_columns, row_before, row_after, schema_version" +
-		" FROM parquet_scan('" + safeGlob + "', hive_partitioning=true)"
+		" FROM parquet_scan('" + safeGlob + "', hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}

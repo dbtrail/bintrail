@@ -6,8 +6,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+
+	mysql "github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/bintrail/internal/parser"
 )
@@ -213,6 +216,12 @@ func EnsureSchema(db *sql.DB) error {
 	}
 	_, err = db.Exec(`ALTER TABLE binlog_events ADD COLUMN connection_id INT UNSIGNED DEFAULT NULL COMMENT 'MySQL connection ID (pseudo_thread_id) that produced this event' AFTER gtid`)
 	if err != nil {
+		// Error 1060 = "Duplicate column name": another process added it
+		// concurrently between our check and ALTER — safe to ignore.
+		var mysqlErr *mysql.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1060 {
+			return nil
+		}
 		return fmt.Errorf("add connection_id column: %w", err)
 	}
 	return nil

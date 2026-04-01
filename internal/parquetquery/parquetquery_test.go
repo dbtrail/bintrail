@@ -71,7 +71,7 @@ func TestBuildQueryFromFiles(t *testing.T) {
 	}
 	q, args := buildQueryFromFiles(files, query.Options{Limit: 50})
 	assertContains(t, q, "FROM parquet_scan([")
-	assertContains(t, q, "hive_partitioning=true)")
+	assertContains(t, q, "hive_partitioning=true, union_by_name=true)")
 	assertContains(t, q, "event_hour=11/events.parquet")
 	assertContains(t, q, "event_hour=12/events.parquet")
 	assertContains(t, q, "ORDER BY event_timestamp, event_id")
@@ -112,7 +112,7 @@ func assertContains(t *testing.T, s, want string) {
 
 func TestBuildQueryNoFilters(t *testing.T) {
 	q, args := buildQuery("/archives/*.parquet", query.Options{Limit: 50})
-	assertContains(t, q, "FROM parquet_scan('/archives/*.parquet', hive_partitioning=true)")
+	assertContains(t, q, "FROM parquet_scan('/archives/*.parquet', hive_partitioning=true, union_by_name=true)")
 	assertContains(t, q, "ORDER BY event_timestamp, event_id")
 	assertContains(t, q, "LIMIT ?")
 	if len(args) != 1 || args[0] != 50 {
@@ -216,7 +216,7 @@ func TestBuildQueryNoLimit(t *testing.T) {
 
 func TestBuildQueryGlobEscaping(t *testing.T) {
 	q, _ := buildQuery("/it's/archives/*.parquet", query.Options{})
-	assertContains(t, q, "parquet_scan('/it''s/archives/*.parquet', hive_partitioning=true)")
+	assertContains(t, q, "parquet_scan('/it''s/archives/*.parquet', hive_partitioning=true, union_by_name=true)")
 }
 
 // ─── parseFileHour ──────────────────────────────────────────────────────────

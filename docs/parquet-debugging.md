@@ -18,7 +18,7 @@ Verify with `duckdb --version`.
 
 ## Parquet Column Schema
 
-Archive Parquet files contain 14 columns (the `pk_hash` stored generated column is omitted):
+Archive Parquet files contain 15 columns (the `pk_hash` stored generated column is omitted):
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -28,6 +28,7 @@ Archive Parquet files contain 14 columns (the `pk_hash` stored generated column 
 | `end_pos` | BIGINT | Byte offset where the event ends |
 | `event_timestamp` | TIMESTAMP | When MySQL executed the event (UTC) |
 | `gtid` | VARCHAR | GTID if available (nullable) |
+| `connection_id` | INT | MySQL connection ID / pseudo_thread_id (nullable) |
 | `schema_name` | VARCHAR | Database name |
 | `table_name` | VARCHAR | Table name |
 | `event_type` | TINYINT | 1 = INSERT, 2 = UPDATE, 3 = DELETE |
