@@ -13,15 +13,18 @@ import (
 // MetadataClient sends metadata records to the dbtrail API.
 type MetadataClient struct {
 	endpoint string // base URL, e.g. "https://api.dbtrail.io"
+	apiKey   string
 	http     *http.Client
 }
 
 // NewMetadataClient creates a client that sends metadata to the given
 // dbtrail API endpoint. The endpoint should be a base URL without a
-// trailing slash (e.g. "https://api.dbtrail.io").
-func NewMetadataClient(endpoint string) *MetadataClient {
+// trailing slash (e.g. "https://api.dbtrail.io"). The apiKey is sent
+// as a Bearer token in the Authorization header.
+func NewMetadataClient(endpoint, apiKey string) *MetadataClient {
 	return &MetadataClient{
 		endpoint: endpoint,
+		apiKey:   apiKey,
 		http:     &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -40,6 +43,9 @@ func (c *MetadataClient) Send(ctx context.Context, records []MetadataRecord) err
 		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

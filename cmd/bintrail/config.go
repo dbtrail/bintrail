@@ -154,6 +154,13 @@ var envSections = []envSection{
 			{"BINTRAIL_START_GTID", ""},
 		},
 	},
+	{
+		Header: "BYOS flush pipeline",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_S3_PREFIX", "bintrail/"},
+			{"BINTRAIL_FLUSH_INTERVAL", "5s"},
+		},
+	},
 }
 
 // generateEnvTemplate builds the .bintrail.env file content. Variables

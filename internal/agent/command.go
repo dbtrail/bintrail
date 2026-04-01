@@ -37,6 +37,13 @@ type Heartbeat struct {
 	Uptime     string    `json:"uptime"`
 	BintrailID string    `json:"bintrail_id,omitempty"`
 	Timestamp  time.Time `json:"timestamp"`
+
+	// Flush pipeline status (BYOS mode only).
+	BufferEvents      *int       `json:"buffer_events,omitempty"`
+	MetadataStatus    string     `json:"metadata_status,omitempty"`    // "ok" or "degraded"
+	PayloadStatus     string     `json:"payload_status,omitempty"`     // "ok" or "degraded"
+	LastMetadataFlush *time.Time `json:"last_metadata_flush,omitempty"`
+	LastPayloadFlush  *time.Time `json:"last_payload_flush,omitempty"`
 }
 
 // ─── Command payloads ────────────────────────────────────────────────────────

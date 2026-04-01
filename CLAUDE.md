@@ -61,7 +61,7 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression`, `--row-group-size`, `--upload`, `--upload-region`, `--encrypt`, `--encrypt-key` |
 | `generate-key` | `generate_key.go` | `--output` (default `~/.config/bintrail/dump.key`) |
 | `upload` | `upload.go` | `--source` (req), `--destination` (req), `--region`, `--retry`, `--index-dsn` |
-| `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid` |
+| `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid`, `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`) |
 | `config init` | `config.go` | `--global` |
 
 Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`).
@@ -191,7 +191,7 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql`. Do not use `SEL
 - `changed_columns`: for UPDATEs, sorted list of column names that differ between before/after images (via `parser.ChangedColumns`). Nil for INSERT/DELETE. Column names only, never values.
 - `SplitEvent` returns an error for unsupported event types (DDL, GTID) — callers must filter these first.
 - `SplitEvent` clones `RowBefore`, `RowAfter` (via `maps.Clone`) and `ChangedColumns` (via `slices.Clone`) to prevent shared mutation between records and the source parser event.
-- `byos.MetadataClient`: HTTP POST to `{endpoint}/v1/events` with 30s timeout. Batch sends `[]MetadataRecord` as JSON.
+- `byos.MetadataClient`: HTTP POST to `{endpoint}/v1/events` with 30s timeout, `Authorization: Bearer <apiKey>`. Batch sends `[]MetadataRecord` as JSON.
 - `byos.PayloadWriter`: writes Parquet files to `storage.Backend` with partitioning `{server_id}/{schema}.{table}/{date}/events_{nanos}.parquet`. Groups records by schema.table and UTC date. Uses `baseline.Writer` for Parquet output.
 - In hosted mode, the `byos` package is not used — events flow directly to the indexer as before.
 
@@ -205,7 +205,11 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql`. Do not use `SEL
 - Event IDs use `idOffset = 1<<32` to avoid collisions with MySQL event_ids in `MergeResults` dedup.
 - `internal/buffer/parquet.go`: `WriteParquet(rows, path, compression)` writes `[]query.ResultRow` to Parquet using `archive.BinlogEventColumns` schema — compatible with `parquetquery.Fetch`.
 - Agent handler (`internal/agent/handler.go`): `DefaultHandler.Buffer` field. Query order: buffer → MySQL → S3 archives.
-- Agent BYOS streaming (`cmd/bintrail/agent.go`): when `--source-dsn` + `--server-id` are set, agent starts a streaming goroutine (`runBYOSStream`) that reads binlogs and populates the buffer. The `byosStreamLoop` function handles batching and periodic eviction.
+- Agent BYOS streaming (`cmd/bintrail/agent.go`): when `--source-dsn` + `--server-id` are set, agent starts a streaming goroutine (`runBYOSStream`) that reads binlogs and populates the buffer. The `byosStreamLoop` function handles batching, periodic eviction, and flush pipeline.
+- **BYOS flush pipeline** (wired in `byosStreamLoop`): when `--s3-bucket` is set, each batch is split via `SplitEvent`, metadata sent to dbtrail via `MetadataClient`, payload written to customer S3 via `PayloadWriter`. Flush triggers on batch-full or `--flush-interval` timer (default 5s). Retry: 3 attempts with exponential backoff (1s, 2s, 4s); failures are logged but never block the stream.
+- `flushPipelineState`: mutex-protected struct tracking flush health (metadata/payload status, last flush timestamps, buffer size). Exposed to heartbeat via `agent.Channel.statusProvider` callback.
+- `agent.Heartbeat` includes flush status fields: `buffer_events`, `metadata_status`, `payload_status`, `last_metadata_flush`, `last_payload_flush` (omitted when not in BYOS mode).
+- Agent flags for BYOS flush: `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`).
 
 ## Testing conventions
 
