@@ -140,6 +140,13 @@ var envSections = []envSection{
 			{"BINTRAIL_SSL_KEY", ""},
 		},
 	},
+	{
+		Header: "Agent (used by bintrail agent)",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_API_KEY", ""},
+			{"BINTRAIL_AGENT_ENDPOINT", "wss://api.dbtrail.io/v1/agent"},
+		},
+	},
 }
 
 // generateEnvTemplate builds the .bintrail.env file content. Variables

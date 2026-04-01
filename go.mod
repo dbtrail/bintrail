@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.56.0
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.2
 	github.com/aws/smithy-go v1.24.1
+	github.com/coder/websocket v1.8.14
 	github.com/duckdb/duckdb-go/v2 v2.5.5
 	github.com/go-mysql-org/go-mysql v1.13.0
 	github.com/go-sql-driver/mysql v1.9.3
