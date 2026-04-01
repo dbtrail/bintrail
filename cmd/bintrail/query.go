@@ -13,6 +13,7 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/parquetquery"
 	"github.com/dbtrail/bintrail/internal/query"
 )
@@ -142,6 +143,10 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
 	defer db.Close()
+
+	if err := indexer.EnsureSchema(db); err != nil {
+		return fmt.Errorf("schema migration: %w", err)
+	}
 
 	if qProfile != "" {
 		denyTables, redactCols, err := query.LoadProfileRules(cmd.Context(), db, qProfile)
