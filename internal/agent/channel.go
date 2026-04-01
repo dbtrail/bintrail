@@ -68,7 +68,7 @@ type Channel struct {
 // FlushStatus holds the current state of the BYOS flush pipeline,
 // reported in heartbeats so dbtrail can show degraded status.
 type FlushStatus struct {
-	BufferEvents      int
+	BufferEvents      *int
 	MetadataStatus    string // "ok" or "degraded"
 	PayloadStatus     string // "ok" or "degraded"
 	LastMetadataFlush *time.Time

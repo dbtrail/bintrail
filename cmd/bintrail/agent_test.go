@@ -246,8 +246,8 @@ func TestFlushPipelineStateToFlushStatus(t *testing.T) {
 	state.updateFlush(true, false)
 
 	status := state.toFlushStatus()
-	if status.BufferEvents != 42 {
-		t.Errorf("BufferEvents = %d, want 42", status.BufferEvents)
+	if status.BufferEvents == nil || *status.BufferEvents != 42 {
+		t.Errorf("BufferEvents = %v, want 42", status.BufferEvents)
 	}
 	if status.MetadataStatus != "ok" {
 		t.Errorf("MetadataStatus = %q, want ok", status.MetadataStatus)
@@ -256,10 +256,27 @@ func TestFlushPipelineStateToFlushStatus(t *testing.T) {
 		t.Errorf("PayloadStatus = %q, want degraded", status.PayloadStatus)
 	}
 	if status.LastMetadataFlush == nil {
-		t.Error("LastMetadataFlush should be set")
+		t.Error("LastMetadataFlush should be set when metadata succeeded")
 	}
 	if status.LastPayloadFlush != nil {
 		t.Error("LastPayloadFlush should be nil when payload failed")
+	}
+}
+
+func TestFlushPipelineStateInitialStatus(t *testing.T) {
+	state := &flushPipelineState{
+		metadataStatus: "ok",
+		payloadStatus:  "ok",
+	}
+	status := state.toFlushStatus()
+	if status.MetadataStatus != "ok" {
+		t.Errorf("initial MetadataStatus = %q, want ok", status.MetadataStatus)
+	}
+	if status.PayloadStatus != "ok" {
+		t.Errorf("initial PayloadStatus = %q, want ok", status.PayloadStatus)
+	}
+	if status.BufferEvents == nil || *status.BufferEvents != 0 {
+		t.Errorf("initial BufferEvents = %v, want 0", status.BufferEvents)
 	}
 }
 

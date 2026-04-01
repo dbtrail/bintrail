@@ -192,7 +192,10 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("invalid --flush-interval: %w", err)
 		}
 
-		flushState = &flushPipelineState{}
+		flushState = &flushPipelineState{
+			metadataStatus: "ok",
+			payloadStatus:  "ok",
+		}
 		serverIDStr := fmt.Sprint(agtServerID)
 
 		streamErrCh := make(chan error, 1)
@@ -338,8 +341,9 @@ func (s *flushPipelineState) setBufferLen(n int) {
 func (s *flushPipelineState) toFlushStatus() *agent.FlushStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	n := s.bufferEvents
 	return &agent.FlushStatus{
-		BufferEvents:      s.bufferEvents,
+		BufferEvents:      &n,
 		MetadataStatus:    s.metadataStatus,
 		PayloadStatus:     s.payloadStatus,
 		LastMetadataFlush: s.lastMetadataFlush,
@@ -469,8 +473,10 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 		buf.Insert(batch)
 		slog.Debug("BYOS batch flushed to buffer", "events", len(batch), "buffer_size", buf.Len())
 
-		// Split and flush to sinks if configured.
-		if fc != nil && (fc.metaClient != nil || fc.payloadWriter != nil) {
+		// Split and flush to sinks if configured. Skip on shutdown —
+		// the sinks would fail immediately with context.Canceled and
+		// produce misleading error logs.
+		if fc != nil && (fc.metaClient != nil || fc.payloadWriter != nil) && ctx.Err() == nil {
 			flushToSinks(ctx, batch, fc)
 		}
 		if fc != nil && fc.state != nil {
@@ -528,7 +534,11 @@ func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig
 	for i := range batch {
 		meta, payload, err := byos.SplitEvent(batch[i], fc.serverID)
 		if err != nil {
-			slog.Warn("BYOS split failed, skipping event", "error", err)
+			slog.Warn("BYOS split failed, skipping event",
+				"error", err,
+				"schema", batch[i].Schema,
+				"table", batch[i].Table,
+				"event_type", batch[i].EventType)
 			continue
 		}
 		metaBatch = append(metaBatch, meta)
