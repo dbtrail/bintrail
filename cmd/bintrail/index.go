@@ -107,6 +107,10 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	}
 	defer indexDB.Close()
 
+	if err := indexer.EnsureSchema(indexDB); err != nil {
+		return fmt.Errorf("schema migration: %w", err)
+	}
+
 	// ── 3. Resolve server identity ────────────────────────────────────────────
 	var bintrailID string
 	if sourceDB != nil {

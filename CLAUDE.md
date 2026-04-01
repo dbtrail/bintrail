@@ -89,6 +89,7 @@ Key patterns:
 ### `binlog_events` (range-partitioned)
 - `pk_values`: `VARCHAR(512)` — pipe-delimited PK values. NOT JSON.
 - `pk_hash = SHA2(pk_values, 256)`: **generated stored column** — never insert explicitly.
+- `connection_id`: `INT UNSIGNED DEFAULT NULL` — MySQL `pseudo_thread_id` (`CONNECTION_ID()`) from the transaction's QUERY(BEGIN) event. NULL for events indexed before this column was added. Extracted from `QueryEvent.SlaveProxyID` in the binlog parser.
 - `row_before`, `row_after`, `changed_columns`: JSON columns.
 - Partitioned by `RANGE (TO_SECONDS(event_timestamp))` — timezone-independent; `UNIX_TIMESTAMP()` rejected by MySQL 8.0 when `time_zone=SYSTEM` (Error 1486).
 - Hourly partitions: `p_YYYYMMDDHH` (12 chars); catch-all: `p_future VALUES LESS THAN MAXVALUE`.
@@ -113,6 +114,10 @@ Key patterns:
 - Columns: `bintrail_id`, `partition_name`, `local_path`, `s3_bucket`, `s3_key`.
 
 ## Architecture: indexer pipeline
+
+### Schema migration
+- `indexer.EnsureSchema(db)` adds columns introduced after the initial schema (e.g. `connection_id`). Idempotent — checks `information_schema.COLUMNS` before ALTER.
+- Called at startup by `index`, `stream`, and `agent` commands (before any INSERT).
 
 ### File-based (`bintrail index`)
 
@@ -185,7 +190,7 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql`. Do not use `SEL
 
 ### BYOS data separation
 - In BYOS (Bring Your Own Storage) mode, parsed events are split into two streams via `byos.SplitEvent(ev, serverID)`:
-  - **MetadataRecord**: pk_hash, schema, table, event_type, timestamp, server_id, gtid, row_count, changed_columns — sent to dbtrail API. Contains zero row-level data.
+  - **MetadataRecord**: pk_hash, schema, table, event_type, timestamp, server_id, gtid, connection_id, row_count, changed_columns — sent to dbtrail API. Contains zero row-level data.
   - **PayloadRecord**: pk_hash, pk_values, row_before, row_after, changed_columns, schema_version — written to customer's storage backend as Parquet. Never leaves customer infrastructure.
 - `byos.PKHash(pkValues)` computes SHA-256 matching MySQL's `SHA2(pk_values, 256)` generated column — the correlation key between metadata and payload.
 - `changed_columns`: for UPDATEs, sorted list of column names that differ between before/after images (via `parser.ChangedColumns`). Nil for INSERT/DELETE. Column names only, never values.

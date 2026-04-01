@@ -15,7 +15,7 @@ import (
 const tsFormat = "2006-01-02 15:04:05"
 
 // WriteParquet writes result rows to a Parquet file at outputPath using the
-// same 14-column schema as archive.ArchivePartition. The output files are
+// same 15-column schema as archive.ArchivePartition. The output files are
 // compatible with parquetquery.Fetch for querying.
 func WriteParquet(rows []query.ResultRow, outputPath, compression string) (int64, error) {
 	if len(rows) == 0 {
@@ -67,13 +67,20 @@ func WriteParquet(rows []query.ResultRow, outputPath, compression string) (int64
 
 // rowToParquet converts a ResultRow to the string values and null flags
 // expected by baseline.Writer.WriteRow. Column order matches
-// archive.BinlogEventColumns (14 columns).
+// archive.BinlogEventColumns (15 columns).
 func rowToParquet(r *query.ResultRow) ([]string, []bool, error) {
 	gtidStr := ""
 	gtidNull := true
 	if r.GTID != nil {
 		gtidStr = *r.GTID
 		gtidNull = false
+	}
+
+	connIDStr := ""
+	connIDNull := true
+	if r.ConnectionID != nil {
+		connIDStr = strconv.FormatUint(uint64(*r.ConnectionID), 10)
+		connIDNull = false
 	}
 
 	changedCols, changedNull, err := marshalJSONField(r.ChangedColumns)
@@ -96,6 +103,7 @@ func rowToParquet(r *query.ResultRow) ([]string, []bool, error) {
 		strconv.FormatUint(r.EndPos, 10),
 		r.EventTimestamp.UTC().Format(tsFormat),
 		gtidStr,
+		connIDStr,
 		r.SchemaName,
 		r.TableName,
 		strconv.FormatUint(uint64(r.EventType), 10),
@@ -109,6 +117,7 @@ func rowToParquet(r *query.ResultRow) ([]string, []bool, error) {
 	nulls := []bool{
 		false, false, false, false, false,
 		gtidNull,
+		connIDNull,
 		false, false, false, false,
 		changedNull,
 		beforeNull,

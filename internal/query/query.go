@@ -130,6 +130,7 @@ type ResultRow struct {
 	EndPos         uint64
 	EventTimestamp time.Time
 	GTID           *string // nil when GTID not enabled on the source
+	ConnectionID   *uint32 // nil for events indexed before this column was added
 	SchemaName     string
 	TableName      string
 	EventType      parser.EventType
@@ -267,7 +268,7 @@ func buildQuery(opts Options) (string, []any) {
 	}
 
 	q := `SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp,
-	             gtid, schema_name, table_name, event_type, pk_values,
+	             gtid, connection_id, schema_name, table_name, event_type, pk_values,
 	             changed_columns, row_before, row_after, schema_version
 	      FROM binlog_events`
 	if len(where) > 0 {
@@ -311,17 +312,22 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 	for rows.Next() {
 		var r ResultRow
 		var gtid sql.NullString
+		var connID sql.NullInt64
 		var changedCols, rowBefore, rowAfter []byte
 
 		if err := rows.Scan(
 			&r.EventID, &r.BinlogFile, &r.StartPos, &r.EndPos, &r.EventTimestamp,
-			&gtid, &r.SchemaName, &r.TableName, &r.EventType, &r.PKValues,
+			&gtid, &connID, &r.SchemaName, &r.TableName, &r.EventType, &r.PKValues,
 			&changedCols, &rowBefore, &rowAfter, &r.SchemaVersion,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan result row: %w", err)
 		}
 		if gtid.Valid {
 			r.GTID = &gtid.String
+		}
+		if connID.Valid {
+			v := uint32(connID.Int64)
+			r.ConnectionID = &v
 		}
 		if changedCols != nil {
 			_ = json.Unmarshal(changedCols, &r.ChangedColumns)
@@ -353,8 +359,8 @@ func writeTable(rows []ResultRow, w io.Writer) (int, error) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	defer tw.Flush()
 
-	fmt.Fprintln(tw, "ID\tTIMESTAMP\tTYPE\tSCHEMA\tTABLE\tPK_VALUES\tCHANGED_COLS\tGTID")
-	fmt.Fprintln(tw, "──\t─────────\t────\t──────\t─────\t─────────\t────────────\t────")
+	fmt.Fprintln(tw, "ID\tTIMESTAMP\tTYPE\tSCHEMA\tTABLE\tPK_VALUES\tCHANGED_COLS\tGTID\tCONN_ID")
+	fmt.Fprintln(tw, "──\t─────────\t────\t──────\t─────\t─────────\t────────────\t────\t───────")
 
 	for i := range rows {
 		r := &rows[i]
@@ -362,8 +368,12 @@ func writeTable(rows []ResultRow, w io.Writer) (int, error) {
 		if r.GTID != nil {
 			gtid = *r.GTID
 		}
+		connID := "-"
+		if r.ConnectionID != nil {
+			connID = fmt.Sprintf("%d", *r.ConnectionID)
+		}
 		changed := strings.Join(r.ChangedColumns, ",")
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			r.EventID,
 			r.EventTimestamp.Format(tsFormat),
 			eventTypeName(r.EventType),
@@ -372,6 +382,7 @@ func writeTable(rows []ResultRow, w io.Writer) (int, error) {
 			r.PKValues,
 			changed,
 			gtid,
+			connID,
 		)
 	}
 	return len(rows), nil
@@ -385,6 +396,7 @@ type jsonRow struct {
 	EndPos         uint64         `json:"end_pos"`
 	EventTimestamp string         `json:"event_timestamp"`
 	GTID           *string        `json:"gtid"`
+	ConnectionID   *uint32        `json:"connection_id"`
 	SchemaName     string         `json:"schema_name"`
 	TableName      string         `json:"table_name"`
 	EventType      string         `json:"event_type"`
@@ -404,6 +416,7 @@ func writeJSON(rows []ResultRow, w io.Writer) (int, error) {
 			EndPos:         r.EndPos,
 			EventTimestamp: r.EventTimestamp.Format(tsFormat),
 			GTID:           r.GTID,
+			ConnectionID:   r.ConnectionID,
 			SchemaName:     r.SchemaName,
 			TableName:      r.TableName,
 			EventType:      eventTypeName(r.EventType),
@@ -424,7 +437,7 @@ func writeJSON(rows []ResultRow, w io.Writer) (int, error) {
 // csvHeaders is the fixed column order for CSV output.
 var csvHeaders = []string{
 	"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
-	"gtid", "schema_name", "table_name", "event_type", "pk_values",
+	"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
 	"changed_columns", "row_before", "row_after",
 }
 
@@ -438,6 +451,10 @@ func writeCSV(rows []ResultRow, w io.Writer) (int, error) {
 		gtid := ""
 		if r.GTID != nil {
 			gtid = *r.GTID
+		}
+		connID := ""
+		if r.ConnectionID != nil {
+			connID = fmt.Sprintf("%d", *r.ConnectionID)
 		}
 		changed := ""
 		if r.ChangedColumns != nil {
@@ -461,6 +478,7 @@ func writeCSV(rows []ResultRow, w io.Writer) (int, error) {
 			fmt.Sprintf("%d", r.EndPos),
 			r.EventTimestamp.Format(tsFormat),
 			gtid,
+			connID,
 			r.SchemaName,
 			r.TableName,
 			eventTypeName(r.EventType),

@@ -56,6 +56,7 @@ func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
 func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStreamer, out chan<- Event) error {
 	var currentFile string
 	var currentGTID string
+	var currentConnectionID uint32
 
 	for {
 		binlogEv, err := streamer.GetEvent(ctx)
@@ -89,6 +90,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			}
 
 		case *replication.QueryEvent:
+			currentConnectionID = ev.SlaveProxyID
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
 			if ddlEv, ok := parseDDL(sp.logger, currentFile, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), sp.schemaVersion.Load()); ok {
 				select {
@@ -99,7 +101,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			}
 
 		case *replication.RowsEvent:
-			if err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, sp.schemaVersion.Load(), out); err != nil {
+			if err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, sp.schemaVersion.Load(), out); err != nil {
 				if ctx.Err() != nil {
 					return nil // context cancelled during row processing
 				}

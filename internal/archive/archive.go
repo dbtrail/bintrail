@@ -14,7 +14,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/baseline"
 )
 
-// BinlogEventColumns defines the 14 non-generated binlog_events columns in
+// BinlogEventColumns defines the 15 non-generated binlog_events columns in
 // MySQL table order (pk_hash is a stored generated column and is omitted).
 // Exported for reuse by the buffer package when writing Parquet files.
 var BinlogEventColumns = []baseline.Column{
@@ -24,6 +24,7 @@ var BinlogEventColumns = []baseline.Column{
 	{Name: "end_pos", MySQLType: "bigint", ParquetType: baseline.MysqlToParquetNode("bigint")},
 	{Name: "event_timestamp", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
 	{Name: "gtid", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	{Name: "connection_id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
 	{Name: "schema_name", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 	{Name: "table_name", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 	{Name: "event_type", MySQLType: "tinyint", ParquetType: baseline.MysqlToParquetNode("tinyint")},
@@ -66,7 +67,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 
 	q := fmt.Sprintf(
 		"SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp,"+
-			" gtid, schema_name, table_name, event_type, pk_values,"+
+			" gtid, connection_id, schema_name, table_name, event_type, pk_values,"+
 			" changed_columns, row_before, row_after, schema_version"+
 			" FROM `%s`.`binlog_events` PARTITION (`%s`) ORDER BY event_id",
 		dbName, partition,
@@ -86,6 +87,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			endPos         uint64
 			eventTimestamp time.Time
 			gtid           sql.NullString
+			connID         sql.NullInt64
 			schemaName     string
 			tableName      string
 			eventType      uint8
@@ -97,10 +99,15 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		)
 		if err := rows.Scan(
 			&eventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
-			&gtid, &schemaName, &tableName, &eventType, &pkValues,
+			&gtid, &connID, &schemaName, &tableName, &eventType, &pkValues,
 			&changedColumns, &rowBefore, &rowAfter, &schemaVersion,
 		); err != nil {
 			return rowCount, fmt.Errorf("scan row: %w", err)
+		}
+
+		connIDStr := ""
+		if connID.Valid {
+			connIDStr = strconv.FormatInt(connID.Int64, 10)
 		}
 
 		values := []string{
@@ -110,6 +117,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			strconv.FormatUint(endPos, 10),
 			eventTimestamp.UTC().Format("2006-01-02 15:04:05"),
 			gtid.String,
+			connIDStr,
 			schemaName,
 			tableName,
 			strconv.FormatUint(uint64(eventType), 10),
@@ -122,6 +130,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		nulls := []bool{
 			false, false, false, false, false,
 			!gtid.Valid,
+			!connID.Valid,
 			false, false, false, false,
 			changedColumns == nil,
 			rowBefore == nil,
