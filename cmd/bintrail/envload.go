@@ -41,6 +41,8 @@ var envBindings = []envBinding{
 	{"ssl-ca", "BINTRAIL_SSL_CA"},
 	{"ssl-cert", "BINTRAIL_SSL_CERT"},
 	{"ssl-key", "BINTRAIL_SSL_KEY"},
+	{"api-key", "BINTRAIL_API_KEY"},
+	{"endpoint", "BINTRAIL_AGENT_ENDPOINT"},
 }
 
 var envOnce sync.Once
