@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/dbtrail/bintrail/internal/buffer"
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parquetquery"
@@ -47,7 +48,8 @@ var allowedForensicsQueries = map[string]string{
 // and parquetquery packages.
 type DefaultHandler struct {
 	// IndexDB is the index database connection. Nil disables MySQL-based
-	// resolve_pk and recover (Parquet-only mode).
+	// resolve_pk and recover; data sources fall back to the buffer
+	// (if set) and Parquet archives.
 	IndexDB *sql.DB
 
 	// SourceDB is the source MySQL connection for forensics queries.
@@ -56,6 +58,10 @@ type DefaultHandler struct {
 
 	// ArchiveSources lists Parquet archive paths (local dirs or s3:// URLs).
 	ArchiveSources []string
+
+	// Buffer is the in-memory event buffer for BYOS mode. When set,
+	// resolve_pk and recover check the buffer first (fastest path).
+	Buffer *buffer.Buffer
 
 	// Logger for handler operations. Nil falls back to slog.Default().
 	Logger *slog.Logger
@@ -69,17 +75,26 @@ func (h *DefaultHandler) logger() *slog.Logger {
 }
 
 // HandleResolvePK looks up pk_values for a list of pk_hash values from
-// the local MySQL index and/or Parquet archives.
+// the in-memory buffer, local MySQL index, and/or Parquet archives.
 func (h *DefaultHandler) HandleResolvePK(ctx context.Context, req ResolvePKRequest) ([]PKResult, error) {
-	if h.IndexDB == nil && len(h.ArchiveSources) == 0 {
-		return nil, fmt.Errorf("no data sources configured (need --index-dsn or --archive-dir/--archive-s3)")
+	if h.IndexDB == nil && len(h.ArchiveSources) == 0 && h.Buffer == nil {
+		return nil, fmt.Errorf("no data sources configured (need --index-dsn, --archive-dir/--archive-s3, or buffer)")
 	}
 
 	results := make([]PKResult, len(req.Items))
 	for i, item := range req.Items {
 		results[i] = PKResult{PKHash: item.PKHash}
 
-		// Try MySQL index first.
+		// Try in-memory buffer first (fastest, most recent data).
+		if h.Buffer != nil {
+			if pkVal, ok := h.Buffer.ResolvePK(item.PKHash, item.Schema, item.Table); ok {
+				results[i].PKValues = pkVal
+				results[i].Found = true
+				continue
+			}
+		}
+
+		// Try MySQL index.
 		if h.IndexDB != nil {
 			pkVal, err := h.resolvePKFromMySQL(ctx, item)
 			if err != nil {
@@ -152,8 +167,8 @@ func (h *DefaultHandler) resolvePKFromArchive(ctx context.Context, item PKItem, 
 
 // HandleRecover generates reversal SQL for the specified events.
 func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) (string, error) {
-	if h.IndexDB == nil && len(h.ArchiveSources) == 0 {
-		return "", fmt.Errorf("no data sources configured (need --index-dsn or --archive-dir/--archive-s3)")
+	if h.IndexDB == nil && len(h.ArchiveSources) == 0 && h.Buffer == nil {
+		return "", fmt.Errorf("no data sources configured (need --index-dsn, --archive-dir/--archive-s3, or buffer)")
 	}
 
 	// Build query options from the recover request.
@@ -175,8 +190,12 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 		opts.EventType = et
 	}
 
-	// Fetch events from MySQL and/or archives.
+	// Fetch events from buffer, MySQL, and/or archives.
 	var rows []query.ResultRow
+	if h.Buffer != nil {
+		r := h.Buffer.Fetch(ctx, opts)
+		rows = append(rows, r...)
+	}
 	if h.IndexDB != nil {
 		engine := query.New(h.IndexDB)
 		r, err := engine.Fetch(ctx, opts)

@@ -32,6 +32,7 @@ internal/
   archive/             # Partition archiver → Parquet via baseline.Writer
   parquetquery/        # DuckDB-backed Parquet query engine
   storage/             # Abstract storage backend interface (Backend) + S3 implementation for BYOS
+  buffer/              # In-memory event buffer for BYOS mode — Insert, Fetch, ResolvePK, Evict, WriteParquet
   byos/                # BYOS data separation: SplitEvent → MetadataRecord (dbtrail API) + PayloadRecord (customer S3 Parquet)
   testutil/            # Shared test helpers: CreateTestDB, InitIndexTables, SkipIfNoMySQL, etc.
 e2e_test.go            # Full CLI pipeline E2E test (//go:build integration), built with go build -cover
@@ -60,9 +61,10 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression`, `--row-group-size`, `--upload`, `--upload-region`, `--encrypt`, `--encrypt-key` |
 | `generate-key` | `generate_key.go` | `--output` (default `~/.config/bintrail/dump.key`) |
 | `upload` | `upload.go` | `--source` (req), `--destination` (req), `--region`, `--retry`, `--index-dsn` |
+| `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid` |
 | `config init` | `config.go` | `--global` |
 
-Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`).
+Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`).
 
 ### Environment file loading
 
@@ -192,6 +194,18 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql`. Do not use `SEL
 - `byos.MetadataClient`: HTTP POST to `{endpoint}/v1/events` with 30s timeout. Batch sends `[]MetadataRecord` as JSON.
 - `byos.PayloadWriter`: writes Parquet files to `storage.Backend` with partitioning `{server_id}/{schema}.{table}/{date}/events_{nanos}.parquet`. Groups records by schema.table and UTC date. Uses `baseline.Writer` for Parquet output.
 - In hosted mode, the `byos` package is not used — events flow directly to the indexer as before.
+
+### In-memory event buffer (BYOS)
+- `internal/buffer/buffer.go`: `Buffer` type — thread-safe in-memory event store using `sync.RWMutex`.
+- `New(maxAge, logger)` creates a buffer that evicts events older than `maxAge`.
+- `Insert([]parser.Event)` converts parser events to `query.ResultRow` and appends under write lock. Computes `pkHash = SHA-256(pk_values)` per event.
+- `Fetch(ctx, query.Options)` filters events by schema, table, pk_values, event_type, time range, changed_column, limit. Returns `[]query.ResultRow` compatible with `query.MergeResults`.
+- `ResolvePK(hash, schema, table)` scans for matching pk_hash — used by agent handler for `resolve_pk` commands.
+- `Evict()` removes events older than `maxAge` from the front of the slice.
+- Event IDs use `idOffset = 1<<32` to avoid collisions with MySQL event_ids in `MergeResults` dedup.
+- `internal/buffer/parquet.go`: `WriteParquet(rows, path, compression)` writes `[]query.ResultRow` to Parquet using `archive.BinlogEventColumns` schema — compatible with `parquetquery.Fetch`.
+- Agent handler (`internal/agent/handler.go`): `DefaultHandler.Buffer` field. Query order: buffer → MySQL → S3 archives.
+- Agent BYOS streaming (`cmd/bintrail/agent.go`): when `--source-dsn` + `--server-id` are set, agent starts a streaming goroutine (`runBYOSStream`) that reads binlogs and populates the buffer. The `byosStreamLoop` function handles batching and periodic eviction.
 
 ## Testing conventions
 

@@ -126,11 +126,62 @@ The core guarantee of BYOS:
 
 ---
 
+## Local Event Buffer
+
+In BYOS mode, the agent keeps recent events in an **in-memory buffer** so that `resolve_pk` and `recover` commands don't require an S3 round-trip for events that happened in the last few hours.
+
+### How It Works
+
+When the agent runs with `--source-dsn` and `--server-id`, it enters BYOS streaming mode:
+
+```
+bintrail agent \
+  --api-key "ak_..." --endpoint "wss://api.dbtrail.io/v1/agent" \
+  --source-dsn "user:pass@tcp(host:3306)/mydb" \
+  --server-id 99999 \
+  --buffer-retain "6h"
+```
+
+The agent runs two goroutines in a single process:
+
+```
+goroutine 1 (stream):  MySQL binlog → parser → in-memory buffer
+goroutine 2 (agent):   dbtrail WebSocket → receive commands → query buffer + S3
+```
+
+### Query Priority
+
+When a `resolve_pk` or `recover` command arrives from dbtrail:
+
+1. **Buffer** (fastest) — check the in-memory buffer for recent events
+2. **MySQL index** — query the dbtrail index database if configured
+3. **S3 Parquet** — scan archived Parquet files on the customer's S3
+
+Results from all sources are merged by `event_id`, sorted by timestamp, and deduplicated.
+
+### Configuration
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--buffer-retain` | `BINTRAIL_BUFFER_RETAIN` | `6h` | How long events stay in the buffer before eviction |
+| `--server-id` | `BINTRAIL_SERVER_ID` | — | MySQL replication server ID (required for BYOS streaming) |
+| `--start-gtid` | `BINTRAIL_START_GTID` | — | GTID set to start from on first run |
+| `--batch-size` | `BINTRAIL_BATCH_SIZE` | `1000` | Events per batch flush |
+
+### Restart Behavior
+
+The buffer is in-memory — on restart it starts empty and fills up from the stream. Recent data that was flushed to S3 before the restart is still available via S3 Parquet queries. The gap between restart and buffer re-fill is covered by S3.
+
+---
+
 ## Package Structure
 
 ```
 internal/
   storage/    # Backend interface + S3 implementation
+  buffer/     # In-memory event buffer for BYOS mode
+    buffer.go     # Buffer type — Insert, Fetch, ResolvePK, Evict
+    parquet.go    # WriteParquet — write ResultRows to Parquet files
   byos/       # Data separation layer
     split.go      # MetadataRecord, PayloadRecord, SplitEvent, PKHash
     metadata.go   # MetadataClient — HTTP client for dbtrail API
