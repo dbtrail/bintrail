@@ -47,7 +47,10 @@ func WriteParquet(rows []query.ResultRow, outputPath, compression string) (int64
 	var count int64
 	for i := range rows {
 		r := &rows[i]
-		values, nulls := rowToParquet(r)
+		values, nulls, err := rowToParquet(r)
+		if err != nil {
+			return count, fmt.Errorf("marshal row %d: %w", r.EventID, err)
+		}
 		if err := w.WriteRow(values, nulls); err != nil {
 			return count, fmt.Errorf("write row: %w", err)
 		}
@@ -65,7 +68,7 @@ func WriteParquet(rows []query.ResultRow, outputPath, compression string) (int64
 // rowToParquet converts a ResultRow to the string values and null flags
 // expected by baseline.Writer.WriteRow. Column order matches
 // archive.BinlogEventColumns (14 columns).
-func rowToParquet(r *query.ResultRow) ([]string, []bool) {
+func rowToParquet(r *query.ResultRow) ([]string, []bool, error) {
 	gtidStr := ""
 	gtidNull := true
 	if r.GTID != nil {
@@ -73,9 +76,18 @@ func rowToParquet(r *query.ResultRow) ([]string, []bool) {
 		gtidNull = false
 	}
 
-	changedCols, changedNull := marshalJSONField(r.ChangedColumns)
-	rowBefore, beforeNull := marshalJSONField(r.RowBefore)
-	rowAfter, afterNull := marshalJSONField(r.RowAfter)
+	changedCols, changedNull, err := marshalJSONField(r.ChangedColumns)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal changed_columns: %w", err)
+	}
+	rowBefore, beforeNull, err := marshalJSONField(r.RowBefore)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal row_before: %w", err)
+	}
+	rowAfter, afterNull, err := marshalJSONField(r.RowAfter)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal row_after: %w", err)
+	}
 
 	values := []string{
 		strconv.FormatUint(r.EventID, 10),
@@ -104,17 +116,17 @@ func rowToParquet(r *query.ResultRow) ([]string, []bool) {
 		false,
 	}
 
-	return values, nulls
+	return values, nulls, nil
 }
 
-// marshalJSONField marshals v to JSON. Returns ("", true) when v is nil.
-func marshalJSONField(v any) (string, bool) {
+// marshalJSONField marshals v to JSON. Returns ("", true, nil) when v is nil.
+func marshalJSONField(v any) (string, bool, error) {
 	if v == nil {
-		return "", true
+		return "", true, nil
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
-		return "", true
+		return "", true, err
 	}
-	return string(b), false
+	return string(b), false, nil
 }

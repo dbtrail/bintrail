@@ -58,8 +58,6 @@ func (b *Buffer) Insert(events []parser.Event) {
 	entries := make([]entry, 0, len(events))
 	for i := range events {
 		ev := &events[i]
-		id := b.nextID // read under write lock below, but pre-compute conversion here
-		_ = id         // used after lock
 
 		var gtid *string
 		if ev.GTID != "" {

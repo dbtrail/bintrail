@@ -3,11 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -17,6 +16,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/agent"
 	"github.com/dbtrail/bintrail/internal/buffer"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parser"
 )
 
@@ -31,11 +31,10 @@ required — all communication is initiated by the agent.
 The connection auto-reconnects with exponential backoff on failure and sends
 periodic heartbeats to report agent status.
 
-In BYOS mode (when --source-dsn and --s3-bucket are provided), the agent also
+In BYOS mode (when --source-dsn and --server-id are provided), the agent also
 reads binlogs from the customer MySQL and keeps recent events in an in-memory
-buffer. Events are written to Parquet on the customer's S3 on each batch flush.
-Recovery and pk resolution queries check the buffer first (fastest, recent data),
-then fall back to S3 Parquet archives.
+buffer. Recovery and pk resolution queries check the buffer first (fastest,
+recent data), then fall back to S3 Parquet archives.
 
 Examples:
   # Start agent with index database
@@ -46,10 +45,9 @@ Examples:
   bintrail agent --api-key "ak_..." --endpoint "wss://api.dbtrail.io/v1/agent" \
     --archive-s3 "s3://my-bucket/archives/"
 
-  # BYOS mode: stream + buffer + S3
+  # BYOS mode: stream + buffer
   bintrail agent --api-key "ak_..." --endpoint "wss://api.dbtrail.io/v1/agent" \
     --source-dsn "user:pass@tcp(host:3306)/mydb" \
-    --s3-bucket "customer-bintrail" --s3-region "us-east-1" \
     --server-id 99999 --buffer-retain "6h"`,
 	RunE: runAgent,
 }
@@ -157,13 +155,23 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			streamErrCh <- runBYOSStream(ctx, handler.SourceDB, buf)
 		}()
 
-		// If the stream fails during setup, return immediately.
-		// After setup, stream errors are logged but don't kill the agent.
-		go func() {
-			if err := <-streamErrCh; err != nil && ctx.Err() == nil {
-				slog.Error("BYOS stream stopped", "error", err)
+		// Wait briefly for fast setup failures (bad credentials, wrong
+		// binlog_format, etc.) before starting the agent channel. If the
+		// stream survives setup, monitor for runtime failures in background.
+		select {
+		case err := <-streamErrCh:
+			if err != nil {
+				return fmt.Errorf("BYOS stream failed: %w", err)
 			}
-		}()
+		case <-time.After(3 * time.Second):
+			// Stream survived setup — monitor for runtime failures.
+			go func() {
+				if err := <-streamErrCh; err != nil && ctx.Err() == nil {
+					slog.Error("BYOS stream stopped unexpectedly", "error", err)
+					cancel()
+				}
+			}()
+		}
 	}
 
 	cfg := agent.ChannelConfig{
@@ -208,7 +216,7 @@ func maskDSN(dsn string) string {
 // ─── BYOS streaming ────────────────────────────────────────────────────────
 
 // runBYOSStream reads binlogs from the source MySQL and writes events to
-// the in-memory buffer. It also writes Parquet files to S3 on each batch flush.
+// the in-memory buffer.
 func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer) error {
 	// Validate binlog settings.
 	if err := validateBinlogFormat(sourceDB); err != nil {
@@ -220,12 +228,19 @@ func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer) er
 
 	slog.Info("BYOS stream: binlog_format=ROW, binlog_row_image=FULL validated")
 
+	// Build schema resolver from the source DB's information_schema.
+	// The resolver maps column indices to names so the parser can produce
+	// named column maps (RowBefore, RowAfter) and identify PK columns.
+	resolver, err := buildResolverFromSource(sourceDB, parseSchemaList(agtSchemas))
+	if err != nil {
+		return fmt.Errorf("build schema resolver: %w", err)
+	}
+	slog.Info("BYOS schema resolver built", "tables", resolver.TableCount())
+
 	// Build filters.
 	filters := buildIndexFilters(agtSchemas, agtTables)
 
-	// Create parser with nil resolver (no MySQL index for schema snapshots
-	// in pure BYOS mode; column names come from the binlog itself).
-	sp := parser.NewStreamParser(nil, filters, nil)
+	sp := parser.NewStreamParser(resolver, filters, nil)
 
 	// Parse source DSN for BinlogSyncer.
 	host, port, user, password, err := parseSourceDSN(agtSourceDSN)
@@ -247,7 +262,7 @@ func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer) er
 	defer syncer.Close()
 
 	// Determine start position.
-	streamer, err := startBYOSSyncer(syncer, agtStartGTID)
+	streamer, err := startBYOSSyncer(sourceDB, syncer, agtStartGTID)
 	if err != nil {
 		return err
 	}
@@ -273,8 +288,8 @@ func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer) er
 }
 
 // startBYOSSyncer starts the binlog syncer from the given GTID set or
-// from the server's current position if no GTID is specified.
-func startBYOSSyncer(syncer *replication.BinlogSyncer, startGTID string) (*replication.BinlogStreamer, error) {
+// from the server's current binlog position.
+func startBYOSSyncer(sourceDB *sql.DB, syncer *replication.BinlogSyncer, startGTID string) (*replication.BinlogStreamer, error) {
 	if startGTID != "" {
 		gset, err := gomysql.ParseGTIDSet("mysql", startGTID)
 		if err != nil {
@@ -282,9 +297,14 @@ func startBYOSSyncer(syncer *replication.BinlogSyncer, startGTID string) (*repli
 		}
 		return syncer.StartSyncGTID(gset)
 	}
-	// No start position — start from the current binlog position.
-	// This is safe for first run: we'll only see new events.
-	return syncer.StartSync(gomysql.Position{})
+	// No start GTID — query current position from source and start there.
+	var file string
+	var pos uint32
+	if err := sourceDB.QueryRow("SHOW MASTER STATUS").Scan(&file, &pos, new(string), new(string), new(string)); err != nil {
+		return nil, fmt.Errorf("SHOW MASTER STATUS: %w", err)
+	}
+	slog.Info("starting from current binlog position", "file", file, "pos", pos)
+	return syncer.StartSync(gomysql.Position{Name: file, Pos: pos})
 }
 
 // byosStreamLoop reads events from the parser channel and writes them to
@@ -338,43 +358,83 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 	}
 }
 
-// ─── BYOS checkpoint ───────────────────────────────────────────────────────
+// ─── Schema resolver ────────────────────────────────────────────────────────
 
-// byosCheckpoint holds the streaming position for BYOS mode.
-// Saved to a local JSON file so the agent can resume after restart.
-type byosCheckpoint struct {
-	Mode          string    `json:"mode"`
-	GTIDSet       string    `json:"gtid_set,omitempty"`
-	BinlogFile    string    `json:"binlog_file,omitempty"`
-	BinlogPos     uint64    `json:"binlog_pos,omitempty"`
-	EventsIndexed int64     `json:"events_indexed"`
-	LastEventTime time.Time `json:"last_event_time"`
-}
+// buildResolverFromSource queries information_schema.COLUMNS on the source
+// MySQL and builds an in-memory Resolver. This avoids requiring a MySQL index
+// database for schema snapshots in BYOS mode.
+func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Resolver, error) {
+	var q string
+	var args []any
 
-func saveBYOSCheckpoint(path string, cp byosCheckpoint) error {
-	data, err := json.Marshal(cp)
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0o600)
-}
-
-func loadBYOSCheckpoint(path string) (*byosCheckpoint, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
+	if len(schemas) == 0 {
+		q = `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
+		            ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, EXTRA
+		     FROM information_schema.COLUMNS
+		     WHERE TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
+		     ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`
+	} else {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
+		q = fmt.Sprintf(`SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
+		                         ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, EXTRA
+		                  FROM information_schema.COLUMNS
+		                  WHERE TABLE_SCHEMA IN (%s)
+		                  ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`, placeholders)
+		for _, s := range schemas {
+			args = append(args, s)
 		}
-		return nil, err
 	}
-	var cp byosCheckpoint
-	if err := json.Unmarshal(data, &cp); err != nil {
-		return nil, err
-	}
-	return &cp, nil
-}
 
+	rows, err := sourceDB.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query information_schema.COLUMNS: %w", err)
+	}
+	defer rows.Close()
+
+	tables := make(map[string]*metadata.TableMeta)
+	for rows.Next() {
+		var schema, table, column, colKey, dataType, extra string
+		var ordinal int
+		if err := rows.Scan(&schema, &table, &column, &ordinal, &colKey, &dataType, &extra); err != nil {
+			return nil, fmt.Errorf("scan column row: %w", err)
+		}
+
+		key := schema + "." + table
+		tm, ok := tables[key]
+		if !ok {
+			tm = &metadata.TableMeta{Schema: schema, Table: table}
+			tables[key] = tm
+		}
+
+		isGenerated := strings.Contains(extra, "STORED GENERATED") || strings.Contains(extra, "VIRTUAL GENERATED")
+		isPK := colKey == "PRI"
+
+		tm.Columns = append(tm.Columns, metadata.ColumnMeta{
+			Name:            column,
+			OrdinalPosition: ordinal,
+			IsPK:            isPK,
+			DataType:        dataType,
+			IsGenerated:     isGenerated,
+		})
+		if isPK {
+			tm.PKColumns = append(tm.PKColumns, column)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate columns: %w", err)
+	}
+
+	if len(tables) == 0 {
+		return nil, fmt.Errorf("no tables found; check --schemas and source server permissions")
+	}
+
+	// Ensure columns are sorted by ordinal position (they should be from
+	// ORDER BY, but be defensive).
+	for _, tm := range tables {
+		sort.Slice(tm.Columns, func(i, j int) bool {
+			return tm.Columns[i].OrdinalPosition < tm.Columns[j].OrdinalPosition
+		})
+	}
+
+	return metadata.NewResolverFromTables(0, tables), nil
+}
