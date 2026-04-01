@@ -1,11 +1,12 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -431,8 +432,8 @@ func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Reso
 	// Ensure columns are sorted by ordinal position (they should be from
 	// ORDER BY, but be defensive).
 	for _, tm := range tables {
-		sort.Slice(tm.Columns, func(i, j int) bool {
-			return tm.Columns[i].OrdinalPosition < tm.Columns[j].OrdinalPosition
+		slices.SortFunc(tm.Columns, func(a, b metadata.ColumnMeta) int {
+			return cmp.Compare(a.OrdinalPosition, b.OrdinalPosition)
 		})
 	}
 

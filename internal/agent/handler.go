@@ -48,7 +48,8 @@ var allowedForensicsQueries = map[string]string{
 // and parquetquery packages.
 type DefaultHandler struct {
 	// IndexDB is the index database connection. Nil disables MySQL-based
-	// resolve_pk and recover (Parquet-only mode).
+	// resolve_pk and recover; data sources fall back to the buffer
+	// (if set) and Parquet archives.
 	IndexDB *sql.DB
 
 	// SourceDB is the source MySQL connection for forensics queries.
@@ -74,7 +75,7 @@ func (h *DefaultHandler) logger() *slog.Logger {
 }
 
 // HandleResolvePK looks up pk_values for a list of pk_hash values from
-// the local MySQL index and/or Parquet archives.
+// the in-memory buffer, local MySQL index, and/or Parquet archives.
 func (h *DefaultHandler) HandleResolvePK(ctx context.Context, req ResolvePKRequest) ([]PKResult, error) {
 	if h.IndexDB == nil && len(h.ArchiveSources) == 0 && h.Buffer == nil {
 		return nil, fmt.Errorf("no data sources configured (need --index-dsn, --archive-dir/--archive-s3, or buffer)")
