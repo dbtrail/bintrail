@@ -1,0 +1,41 @@
+[Unit]
+Description=Bintrail Agent - MySQL binlog streaming to dbtrail
+Documentation=https://github.com/dbtrail/bintrail
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bintrail
+Group=bintrail
+
+# Environment file with BINTRAIL_* variables. Generate a template with:
+#   bintrail config init
+# Then copy .bintrail.env to /etc/bintrail/agent.env and edit.
+EnvironmentFile=/etc/bintrail/agent.env
+
+# Uncomment to run pre-flight validation before each start:
+# ExecStartPre=/usr/local/bin/bintrail agent --validate
+
+ExecStart=/usr/local/bin/bintrail agent
+Restart=on-failure
+RestartSec=10s
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bintrail-agent
+
+# Security hardening
+# Note: ProtectHome=yes blocks ~/.aws/credentials. For S3 access, use
+# AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY in agent.env or an instance role.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target
