@@ -169,7 +169,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		var payloadWriter *byos.PayloadWriter
 
 		if agtS3Bucket != "" {
-			metaClient = byos.NewMetadataClient(agtEndpoint, agtAPIKey)
+			metaClient = byos.NewMetadataClient(wsEndpointToHTTP(agtEndpoint), agtAPIKey)
 
 			s3Backend, err := storage.NewS3Backend(ctx, storage.S3Config{
 				Bucket: agtS3Bucket,
@@ -254,6 +254,25 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	return err
 }
 
+// wsEndpointToHTTP converts a WebSocket agent endpoint URL to an HTTP base
+// URL suitable for the metadata API. For example:
+//
+//	"wss://api.dbtrail.io/v1/agent" → "https://api.dbtrail.io"
+//	"ws://localhost:8080/v1/agent"  → "http://localhost:8080"
+func wsEndpointToHTTP(endpoint string) string {
+	// Convert scheme.
+	s := strings.Replace(endpoint, "wss://", "https://", 1)
+	s = strings.Replace(s, "ws://", "http://", 1)
+	// Strip the path — MetadataClient appends /v1/events itself.
+	if i := strings.Index(s, "://"); i != -1 {
+		rest := s[i+3:]
+		if j := strings.Index(rest, "/"); j != -1 {
+			s = s[:i+3+j]
+		}
+	}
+	return s
+}
+
 // maskDSN redacts the password from a DSN for logging.
 func maskDSN(dsn string) string {
 	for i := range dsn {
@@ -292,10 +311,9 @@ type flushPipelineState struct {
 	lastPayloadFlush  *time.Time
 }
 
-func (s *flushPipelineState) update(bufLen int, metaOK, payloadOK bool) {
+func (s *flushPipelineState) updateFlush(metaOK, payloadOK bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.bufferEvents = bufLen
 	now := time.Now().UTC()
 	if metaOK {
 		s.metadataStatus = "ok"
@@ -455,6 +473,9 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 		if fc != nil && (fc.metaClient != nil || fc.payloadWriter != nil) {
 			flushToSinks(ctx, batch, fc)
 		}
+		if fc != nil && fc.state != nil {
+			fc.state.setBufferLen(buf.Len())
+		}
 
 		batch = batch[:0]
 	}
@@ -544,7 +565,7 @@ func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig
 	}
 
 	if fc.state != nil {
-		fc.state.update(0, metaOK, payloadOK)
+		fc.state.updateFlush(metaOK, payloadOK)
 	}
 }
 

@@ -242,7 +242,8 @@ func TestByosStreamLoopContextCancellation(t *testing.T) {
 
 func TestFlushPipelineStateToFlushStatus(t *testing.T) {
 	state := &flushPipelineState{}
-	state.update(42, true, false)
+	state.setBufferLen(42)
+	state.updateFlush(true, false)
 
 	status := state.toFlushStatus()
 	if status.BufferEvents != 42 {
@@ -343,6 +344,24 @@ func splitBatch(batch []parser.Event, serverID string) ([]byos.MetadataRecord, [
 		payload = append(payload, p)
 	}
 	return meta, payload
+}
+
+func TestWsEndpointToHTTP(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"wss://api.dbtrail.io/v1/agent", "https://api.dbtrail.io"},
+		{"ws://localhost:8080/v1/agent", "http://localhost:8080"},
+		{"wss://api.dbtrail.io", "https://api.dbtrail.io"},
+		{"https://already-http.com/foo", "https://already-http.com"},
+	}
+	for _, tt := range tests {
+		got := wsEndpointToHTTP(tt.in)
+		if got != tt.want {
+			t.Errorf("wsEndpointToHTTP(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
 }
 
 func TestAgentFlagRegistration(t *testing.T) {
