@@ -58,23 +58,37 @@ func (c *ChannelConfig) maxReconnectDelay() time.Duration {
 // reconnects automatically with exponential backoff and sends periodic
 // heartbeats. Incoming commands are dispatched to the provided Handler.
 type Channel struct {
-	cfg     ChannelConfig
-	handler Handler
-	startAt time.Time
-	logger  *slog.Logger
+	cfg            ChannelConfig
+	handler        Handler
+	startAt        time.Time
+	logger         *slog.Logger
+	statusProvider func() *FlushStatus
+}
+
+// FlushStatus holds the current state of the BYOS flush pipeline,
+// reported in heartbeats so dbtrail can show degraded status.
+type FlushStatus struct {
+	BufferEvents      int
+	MetadataStatus    string // "ok" or "degraded"
+	PayloadStatus     string // "ok" or "degraded"
+	LastMetadataFlush *time.Time
+	LastPayloadFlush  *time.Time
 }
 
 // NewChannel creates a Channel. The handler is called for each command
 // received from dbtrail. If logger is nil, slog.Default() is used.
-func NewChannel(cfg ChannelConfig, handler Handler, logger *slog.Logger) *Channel {
+// statusProvider is optional — when set, its return value is included
+// in heartbeat messages so dbtrail can display flush pipeline health.
+func NewChannel(cfg ChannelConfig, handler Handler, logger *slog.Logger, statusProvider func() *FlushStatus) *Channel {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Channel{
-		cfg:     cfg,
-		handler: handler,
-		startAt: time.Now(),
-		logger:  logger,
+		cfg:            cfg,
+		handler:        handler,
+		startAt:        time.Now(),
+		logger:         logger,
+		statusProvider: statusProvider,
 	}
 }
 
@@ -231,6 +245,15 @@ func (ch *Channel) sendHeartbeat(ctx context.Context, conn *websocket.Conn) erro
 		Uptime:     time.Since(ch.startAt).Truncate(time.Second).String(),
 		BintrailID: ch.cfg.BintrailID,
 		Timestamp:  time.Now().UTC(),
+	}
+	if ch.statusProvider != nil {
+		if s := ch.statusProvider(); s != nil {
+			hb.BufferEvents = s.BufferEvents
+			hb.MetadataStatus = s.MetadataStatus
+			hb.PayloadStatus = s.PayloadStatus
+			hb.LastMetadataFlush = s.LastMetadataFlush
+			hb.LastPayloadFlush = s.LastPayloadFlush
+		}
 	}
 	return writeJSON(ctx, conn, hb)
 }

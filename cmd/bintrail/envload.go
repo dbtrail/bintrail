@@ -45,6 +45,8 @@ var envBindings = []envBinding{
 	{"endpoint", "BINTRAIL_AGENT_ENDPOINT"},
 	{"buffer-retain", "BINTRAIL_BUFFER_RETAIN"},
 	{"start-gtid", "BINTRAIL_START_GTID"},
+	{"s3-prefix", "BINTRAIL_S3_PREFIX"},
+	{"flush-interval", "BINTRAIL_FLUSH_INTERVAL"},
 }
 
 var envOnce sync.Once

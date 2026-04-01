@@ -244,7 +244,7 @@ func TestChannel_commandRoundTrip(t *testing.T) {
 
 	// Run channel in background.
 	go func() {
-		ch := NewChannel(cfg, h, nil)
+		ch := NewChannel(cfg, h, nil, nil)
 		ch.Run(ctx)
 	}()
 
@@ -303,7 +303,7 @@ func TestChannel_heartbeat(t *testing.T) {
 	defer cancel()
 
 	go func() {
-		ch := NewChannel(cfg, h, nil)
+		ch := NewChannel(cfg, h, nil, nil)
 		ch.Run(ctx)
 	}()
 
@@ -348,7 +348,7 @@ func TestChannel_authHeader(t *testing.T) {
 	defer cancel()
 
 	go func() {
-		ch := NewChannel(cfg, &stubHandler{}, nil)
+		ch := NewChannel(cfg, &stubHandler{}, nil, nil)
 		ch.Run(ctx)
 	}()
 
@@ -495,7 +495,7 @@ func TestChannel_permanentErrorStopsReconnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	ch := NewChannel(cfg, &stubHandler{}, nil)
+	ch := NewChannel(cfg, &stubHandler{}, nil, nil)
 	err := ch.Run(ctx)
 
 	// Should return the error, not context.DeadlineExceeded.

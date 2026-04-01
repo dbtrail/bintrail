@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -16,9 +17,11 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/agent"
 	"github.com/dbtrail/bintrail/internal/buffer"
+	"github.com/dbtrail/bintrail/internal/byos"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/storage"
 )
 
 var agentCmd = &cobra.Command{
@@ -65,7 +68,11 @@ var (
 	agtBatchSize    int
 	agtSchemas      string
 	agtTables       string
-	agtStartGTID    string
+	agtStartGTID     string
+	agtS3Bucket      string
+	agtS3Region      string
+	agtS3Prefix      string
+	agtFlushInterval string
 )
 
 func init() {
@@ -81,6 +88,10 @@ func init() {
 	agentCmd.Flags().StringVar(&agtSchemas, "schemas", "", "Comma-separated list of schemas to index (empty = all)")
 	agentCmd.Flags().StringVar(&agtTables, "tables", "", "Comma-separated list of tables to index (empty = all)")
 	agentCmd.Flags().StringVar(&agtStartGTID, "start-gtid", "", "GTID set to start streaming from (first run only)")
+	agentCmd.Flags().StringVar(&agtS3Bucket, "s3-bucket", "", "S3 bucket for BYOS payload storage")
+	agentCmd.Flags().StringVar(&agtS3Region, "s3-region", "", "AWS region for the S3 bucket")
+	agentCmd.Flags().StringVar(&agtS3Prefix, "s3-prefix", "bintrail/", "Key prefix within the S3 bucket")
+	agentCmd.Flags().StringVar(&agtFlushInterval, "flush-interval", "5s", "Max time between metadata/payload flushes (e.g. 5s, 10s)")
 	_ = agentCmd.MarkFlagRequired("api-key")
 	_ = agentCmd.MarkFlagRequired("endpoint")
 	bindCommandEnv(agentCmd)
@@ -137,6 +148,8 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
+	var flushState *flushPipelineState
+
 	if byosMode {
 		retain, err := parseRetain(agtBufferRetain)
 		if err != nil {
@@ -151,9 +164,46 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			"server_id", agtServerID,
 			"buffer_retain", retain.String())
 
+		// Initialize flush sinks if S3 bucket is configured.
+		var metaClient *byos.MetadataClient
+		var payloadWriter *byos.PayloadWriter
+
+		if agtS3Bucket != "" {
+			metaClient = byos.NewMetadataClient(agtEndpoint, agtAPIKey)
+
+			s3Backend, err := storage.NewS3Backend(ctx, storage.S3Config{
+				Bucket: agtS3Bucket,
+				Region: agtS3Region,
+				Prefix: agtS3Prefix,
+			})
+			if err != nil {
+				return fmt.Errorf("initialize S3 backend: %w", err)
+			}
+			payloadWriter = byos.NewPayloadWriter(s3Backend, fmt.Sprint(agtServerID))
+
+			slog.Info("BYOS flush pipeline initialized",
+				"s3_bucket", agtS3Bucket,
+				"s3_region", agtS3Region,
+				"s3_prefix", agtS3Prefix)
+		}
+
+		flushInterval, err := time.ParseDuration(agtFlushInterval)
+		if err != nil {
+			return fmt.Errorf("invalid --flush-interval: %w", err)
+		}
+
+		flushState = &flushPipelineState{}
+		serverIDStr := fmt.Sprint(agtServerID)
+
 		streamErrCh := make(chan error, 1)
 		go func() {
-			streamErrCh <- runBYOSStream(ctx, handler.SourceDB, buf)
+			streamErrCh <- runBYOSStream(ctx, handler.SourceDB, buf, &byosFlushConfig{
+				metaClient:    metaClient,
+				payloadWriter: payloadWriter,
+				serverID:      serverIDStr,
+				flushInterval: flushInterval,
+				state:         flushState,
+			})
 		}()
 
 		// Wait briefly for fast setup failures (bad credentials, wrong
@@ -182,7 +232,11 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		BintrailID: "", // TODO: resolve from index DB when server identity is available
 	}
 
-	ch := agent.NewChannel(cfg, handler, nil)
+	var statusFn func() *agent.FlushStatus
+	if flushState != nil {
+		statusFn = flushState.toFlushStatus
+	}
+	ch := agent.NewChannel(cfg, handler, nil, statusFn)
 
 	slog.Info("starting agent",
 		"endpoint", agtEndpoint,
@@ -214,11 +268,72 @@ func maskDSN(dsn string) string {
 	return dsn
 }
 
+// ─── BYOS flush pipeline state ─────────────────────────────────────────────
+
+// byosFlushConfig holds the sinks and settings for the BYOS flush pipeline.
+// All fields are optional — when metaClient and payloadWriter are nil,
+// the stream loop runs in buffer-only mode (hosted mode).
+type byosFlushConfig struct {
+	metaClient    *byos.MetadataClient
+	payloadWriter *byos.PayloadWriter
+	serverID      string
+	flushInterval time.Duration
+	state         *flushPipelineState
+}
+
+// flushPipelineState tracks the health of metadata/payload flushes.
+// Written by byosStreamLoop, read by the heartbeat's StatusProvider.
+type flushPipelineState struct {
+	mu                sync.Mutex
+	bufferEvents      int
+	metadataStatus    string // "ok" or "degraded"
+	payloadStatus     string // "ok" or "degraded"
+	lastMetadataFlush *time.Time
+	lastPayloadFlush  *time.Time
+}
+
+func (s *flushPipelineState) update(bufLen int, metaOK, payloadOK bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bufferEvents = bufLen
+	now := time.Now().UTC()
+	if metaOK {
+		s.metadataStatus = "ok"
+		s.lastMetadataFlush = &now
+	} else {
+		s.metadataStatus = "degraded"
+	}
+	if payloadOK {
+		s.payloadStatus = "ok"
+		s.lastPayloadFlush = &now
+	} else {
+		s.payloadStatus = "degraded"
+	}
+}
+
+func (s *flushPipelineState) setBufferLen(n int) {
+	s.mu.Lock()
+	s.bufferEvents = n
+	s.mu.Unlock()
+}
+
+func (s *flushPipelineState) toFlushStatus() *agent.FlushStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return &agent.FlushStatus{
+		BufferEvents:      s.bufferEvents,
+		MetadataStatus:    s.metadataStatus,
+		PayloadStatus:     s.payloadStatus,
+		LastMetadataFlush: s.lastMetadataFlush,
+		LastPayloadFlush:  s.lastPayloadFlush,
+	}
+}
+
 // ─── BYOS streaming ────────────────────────────────────────────────────────
 
 // runBYOSStream reads binlogs from the source MySQL and writes events to
-// the in-memory buffer.
-func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer) error {
+// the in-memory buffer, and optionally flushes metadata/payload to sinks.
+func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer, fc *byosFlushConfig) error {
 	// Validate binlog settings.
 	if err := validateBinlogFormat(sourceDB); err != nil {
 		return err
@@ -279,7 +394,7 @@ func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer) er
 		parseErrCh <- sp.Run(ctx, streamer, events)
 	}()
 
-	err = byosStreamLoop(ctx, events, buf, agtBatchSize)
+	err = byosStreamLoop(ctx, events, buf, agtBatchSize, fc)
 
 	parseErr := <-parseErrCh
 	if parseErr != nil && ctx.Err() == nil {
@@ -309,8 +424,9 @@ func startBYOSSyncer(sourceDB *sql.DB, syncer *replication.BinlogSyncer, startGT
 }
 
 // byosStreamLoop reads events from the parser channel and writes them to
-// the buffer. It also periodically evicts old events.
-func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer.Buffer, batchSize int) error {
+// the buffer. When flush sinks are configured (fc.metaClient / fc.payloadWriter),
+// it also splits events and flushes metadata to dbtrail and payload to S3.
+func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer.Buffer, batchSize int, fc *byosFlushConfig) error {
 	if batchSize <= 0 {
 		batchSize = 1000
 	}
@@ -319,19 +435,34 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 	evictTicker := time.NewTicker(5 * time.Minute)
 	defer evictTicker.Stop()
 
-	flush := func() {
+	flushInterval := 5 * time.Second
+	if fc != nil && fc.flushInterval > 0 {
+		flushInterval = fc.flushInterval
+	}
+	flushTicker := time.NewTicker(flushInterval)
+	defer flushTicker.Stop()
+
+	flushBatch := func() {
 		if len(batch) == 0 {
 			return
 		}
+
+		// Always insert into buffer.
 		buf.Insert(batch)
-		slog.Debug("BYOS batch flushed", "events", len(batch), "buffer_size", buf.Len())
+		slog.Debug("BYOS batch flushed to buffer", "events", len(batch), "buffer_size", buf.Len())
+
+		// Split and flush to sinks if configured.
+		if fc != nil && (fc.metaClient != nil || fc.payloadWriter != nil) {
+			flushToSinks(ctx, batch, fc)
+		}
+
 		batch = batch[:0]
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			flush()
+			flushBatch()
 			return nil
 
 		case <-evictTicker.C:
@@ -339,10 +470,17 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 			if n > 0 {
 				slog.Info("BYOS buffer eviction", "evicted", n, "remaining", buf.Len())
 			}
+			if fc != nil && fc.state != nil {
+				fc.state.setBufferLen(buf.Len())
+			}
+
+		case <-flushTicker.C:
+			// Timer-based flush to bound metadata latency.
+			flushBatch()
 
 		case ev, ok := <-events:
 			if !ok {
-				flush()
+				flushBatch()
 				return nil
 			}
 
@@ -353,10 +491,86 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 
 			batch = append(batch, ev)
 			if len(batch) >= batchSize {
-				flush()
+				flushBatch()
 			}
 		}
 	}
+}
+
+// flushToSinks splits events via byos.SplitEvent and sends metadata to
+// dbtrail and payload to S3. Retries each sink up to 3 times with
+// exponential backoff. Failures are logged but never block the stream.
+func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig) {
+	var metaBatch []byos.MetadataRecord
+	var payloadBatch []byos.PayloadRecord
+
+	for i := range batch {
+		meta, payload, err := byos.SplitEvent(batch[i], fc.serverID)
+		if err != nil {
+			slog.Warn("BYOS split failed, skipping event", "error", err)
+			continue
+		}
+		metaBatch = append(metaBatch, meta)
+		payloadBatch = append(payloadBatch, payload)
+	}
+
+	if len(metaBatch) == 0 {
+		return
+	}
+
+	metaOK := true
+	payloadOK := true
+
+	// Flush metadata to dbtrail API.
+	if fc.metaClient != nil {
+		if err := retryFlush(ctx, 3, func() error {
+			return fc.metaClient.Send(ctx, metaBatch)
+		}); err != nil {
+			slog.Error("BYOS metadata flush failed after retries",
+				"events", len(metaBatch), "error", err)
+			metaOK = false
+		}
+	}
+
+	// Flush payload to customer S3.
+	if fc.payloadWriter != nil {
+		if err := retryFlush(ctx, 3, func() error {
+			return fc.payloadWriter.WriteRecords(ctx, payloadBatch)
+		}); err != nil {
+			slog.Error("BYOS payload flush failed after retries",
+				"events", len(payloadBatch), "error", err)
+			payloadOK = false
+		}
+	}
+
+	if fc.state != nil {
+		fc.state.update(0, metaOK, payloadOK)
+	}
+}
+
+// retryFlush retries fn up to maxAttempts times with exponential backoff
+// (1s, 2s, 4s). Returns the last error on persistent failure.
+func retryFlush(ctx context.Context, maxAttempts int, fn func() error) error {
+	var err error
+	delay := time.Second
+	for attempt := range maxAttempts {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if attempt == maxAttempts-1 {
+			break
+		}
+		slog.Warn("BYOS flush attempt failed, retrying",
+			"attempt", attempt+1, "delay", delay.String(), "error", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+	return err
 }
 
 // ─── Schema resolver ────────────────────────────────────────────────────────
