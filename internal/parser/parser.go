@@ -134,9 +134,9 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	// It is updated on every GTID_LOG_EVENT and carried into every subsequent
 	// rows event until the next GTID_LOG_EVENT resets it.
 	var currentGTID string
-	// currentConnectionID holds the MySQL pseudo_thread_id (CONNECTION_ID) of
-	// the session that produced the current transaction. Captured from the
-	// QueryEvent("BEGIN") that starts each transaction.
+	// currentConnectionID holds the MySQL pseudo_thread_id from the most
+	// recent QueryEvent. For DML transactions, this is the QUERY(BEGIN)
+	// event that precedes the row events.
 	var currentConnectionID uint32
 
 	bp := replication.NewBinlogParser()

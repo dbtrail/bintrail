@@ -56,7 +56,7 @@ func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
 func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStreamer, out chan<- Event) error {
 	var currentFile string
 	var currentGTID string
-	var currentConnectionID uint32
+	var currentConnectionID uint32 // pseudo_thread_id from most recent QueryEvent
 
 	for {
 		binlogEv, err := streamer.GetEvent(ctx)

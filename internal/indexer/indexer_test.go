@@ -162,3 +162,19 @@ func TestNullOrString_nonEmpty(t *testing.T) {
 		t.Errorf("expected 'abc:42', got %v", got)
 	}
 }
+
+// ─── nullOrUint32 ───────────────────────────────────────────────────────────
+
+func TestNullOrUint32_zero(t *testing.T) {
+	got := nullOrUint32(0)
+	if got != nil {
+		t.Errorf("expected nil for 0, got %v", got)
+	}
+}
+
+func TestNullOrUint32_nonZero(t *testing.T) {
+	got := nullOrUint32(42)
+	if got != uint32(42) {
+		t.Errorf("expected uint32(42), got %v", got)
+	}
+}

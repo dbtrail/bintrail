@@ -92,6 +92,10 @@ func TestInsert_roundTrip(t *testing.T) {
 	if r.GTID == nil || *r.GTID != "abc:1" {
 		t.Errorf("GTID = %v, want abc:1", r.GTID)
 	}
+	// makeEvents does not set ConnectionID, so it should be nil (0 → nil).
+	if r.ConnectionID != nil {
+		t.Errorf("ConnectionID = %v, want nil for zero-value", r.ConnectionID)
+	}
 
 	// EventIDs should be in the offset range.
 	if r.EventID < idOffset {
@@ -117,6 +121,28 @@ func TestInsert_emptyGTID(t *testing.T) {
 	}
 	if rows[0].GTID != nil {
 		t.Errorf("GTID = %v, want nil for empty GTID", rows[0].GTID)
+	}
+}
+
+func TestInsert_connectionID(t *testing.T) {
+	buf := New(6*time.Hour, nil)
+	ev := parser.Event{
+		BinlogFile:   "binlog.000001",
+		Timestamp:    time.Now().UTC(),
+		Schema:       "mydb",
+		Table:        "t",
+		EventType:    parser.EventInsert,
+		PKValues:     "1",
+		ConnectionID: 42,
+	}
+	buf.Insert([]parser.Event{ev})
+
+	rows := buf.Fetch(context.Background(), query.Options{})
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0].ConnectionID == nil || *rows[0].ConnectionID != 42 {
+		t.Errorf("ConnectionID = %v, want 42", rows[0].ConnectionID)
 	}
 }
 
