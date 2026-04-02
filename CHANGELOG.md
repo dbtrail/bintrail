@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-01
+
+### Added
+- `bintrail agent` command — opens an outbound WebSocket to dbtrail for remote query, recovery, and forensics commands; no inbound ports required
+- BYOS (Bring Your Own Storage) mode — parsed binlog events are split into metadata (sent to dbtrail API, zero row data) and payload (written as Parquet to customer S3, never leaves customer infrastructure)
+- Abstract storage backend interface (`internal/storage`) with S3 implementation for BYOS payload writes
+- In-memory event buffer for BYOS mode — keeps recent events in memory for fast local access while S3 remains authoritative
+- BYOS flush pipeline with configurable interval (`--flush-interval`, default 5s) and retry with exponential backoff; flush health reported in agent heartbeat
+- Agent pre-flight validation (`--validate` flag) — checks MySQL connectivity, replication privileges, S3 access, schema snapshot, dbtrail API auth, and WebSocket channel in one pass
+- `connection_id` column in `binlog_events` — captures MySQL `pseudo_thread_id` from binlog `QueryEvent.SlaveProxyID`; included in all query output formats, archives, buffer, and BYOS metadata
+- Auto-migration via `indexer.EnsureSchema()` for `connection_id` column on existing installations (instant DDL in MySQL 8.0+)
+- systemd service unit (`deploy/bintrail-agent.service`) for bare metal agent installs
+
+### Changed
+- Module path moved from `github.com/nethalo/bintrail` to `github.com/dbtrail/bintrail`
+- License changed from Apache 2.0 to Business Source License 1.1
+
 ## [0.3.2] - 2026-03-15
 
 ### Added
