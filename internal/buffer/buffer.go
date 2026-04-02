@@ -65,12 +65,19 @@ func (b *Buffer) Insert(events []parser.Event) {
 			gtid = &s
 		}
 
+		var connID *uint32
+		if ev.ConnectionID != 0 {
+			v := ev.ConnectionID
+			connID = &v
+		}
+
 		row := query.ResultRow{
 			BinlogFile:     ev.BinlogFile,
 			StartPos:       ev.StartPos,
 			EndPos:         ev.EndPos,
 			EventTimestamp: ev.Timestamp.UTC(),
 			GTID:           gtid,
+			ConnectionID:   connID,
 			SchemaName:     ev.Schema,
 			TableName:      ev.Table,
 			EventType:      ev.EventType,

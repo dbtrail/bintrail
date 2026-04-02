@@ -796,6 +796,10 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}
 	defer indexDB.Close()
 
+	if err := indexer.EnsureSchema(indexDB); err != nil {
+		return fmt.Errorf("schema migration: %w", err)
+	}
+
 	// ── 2. Connect to source database: validate binlog_row_image ─────────────
 	sourceDB, err := config.Connect(strmSourceDSN)
 	if err != nil {

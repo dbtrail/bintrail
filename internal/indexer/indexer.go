@@ -6,8 +6,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+
+	mysql "github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/bintrail/internal/parser"
 )
@@ -101,14 +104,14 @@ func (idx *Indexer) BatchSize() int {
 // event_id and pk_hash are omitted — they are AUTO_INCREMENT and STORED
 // generated respectively, so MySQL computes them on write.
 func (idx *Indexer) insertBatch(batch []parser.Event) (int64, error) {
-	// 13 placeholders per row
-	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
+	// 14 placeholders per row
+	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
 	insertSQL := `INSERT INTO binlog_events ` +
-		`(binlog_file, start_pos, end_pos, event_timestamp, gtid, ` +
+		`(binlog_file, start_pos, end_pos, event_timestamp, gtid, connection_id, ` +
 		`schema_name, table_name, event_type, pk_values, ` +
 		`changed_columns, row_before, row_after, schema_version) VALUES ` + valClause
 
-	args := make([]any, 0, len(batch)*13)
+	args := make([]any, 0, len(batch)*14)
 	for i := range batch {
 		ev := &batch[i]
 
@@ -131,6 +134,7 @@ func (idx *Indexer) insertBatch(batch []parser.Event) (int64, error) {
 			ev.EndPos,
 			ev.Timestamp,
 			nullOrString(ev.GTID),
+			nullOrUint32(ev.ConnectionID),
 			ev.Schema,
 			ev.Table,
 			uint8(ev.EventType),
@@ -186,4 +190,39 @@ func nullOrString(s string) any {
 		return nil
 	}
 	return s
+}
+
+// nullOrUint32 returns nil when v is 0 (stored as SQL NULL), else v.
+func nullOrUint32(v uint32) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+// EnsureSchema adds any columns introduced after the initial schema to
+// binlog_events. It is idempotent — safe to call on every startup.
+func EnsureSchema(db *sql.DB) error {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME   = 'binlog_events'
+		  AND COLUMN_NAME  = 'connection_id'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check connection_id column: %w", err)
+	}
+	if count > 0 {
+		return nil // already present
+	}
+	_, err = db.Exec(`ALTER TABLE binlog_events ADD COLUMN connection_id INT UNSIGNED DEFAULT NULL COMMENT 'MySQL connection ID (pseudo_thread_id) that produced this event' AFTER gtid`)
+	if err != nil {
+		// Error 1060 = "Duplicate column name": another process added it
+		// concurrently between our check and ALTER — safe to ignore.
+		var mysqlErr *mysql.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1060 {
+			return nil
+		}
+		return fmt.Errorf("add connection_id column: %w", err)
+	}
+	return nil
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/buffer"
 	"github.com/dbtrail/bintrail/internal/byos"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/storage"
@@ -137,6 +138,9 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("connect to index database: %w", err)
 		}
 		defer db.Close()
+		if err := indexer.EnsureSchema(db); err != nil {
+			return fmt.Errorf("schema migration: %w", err)
+		}
 		handler.IndexDB = db
 	}
 

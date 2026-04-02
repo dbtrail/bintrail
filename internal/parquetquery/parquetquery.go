@@ -253,9 +253,9 @@ func buildQueryFromFiles(files []string, opts query.Options) (string, []any) {
 	fileList := "[" + strings.Join(escaped, ", ") + "]"
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
-		" gtid, schema_name, table_name, event_type, pk_values," +
+		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
 		" changed_columns, row_before, row_after, schema_version" +
-		" FROM parquet_scan(" + fileList + ", hive_partitioning=true)"
+		" FROM parquet_scan(" + fileList + ", hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -288,9 +288,9 @@ func buildUnsortedQuery(path string, opts query.Options) (string, []any) {
 	safePath := strings.ReplaceAll(path, "'", "''")
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
-		" gtid, schema_name, table_name, event_type, pk_values," +
+		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
 		" changed_columns, row_before, row_after, schema_version" +
-		" FROM parquet_scan('" + safePath + "')"
+		" FROM parquet_scan('" + safePath + "', union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -308,9 +308,9 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 	safeGlob := strings.ReplaceAll(glob, "'", "''")
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
-		" gtid, schema_name, table_name, event_type, pk_values," +
+		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
 		" changed_columns, row_before, row_after, schema_version" +
-		" FROM parquet_scan('" + safeGlob + "', hive_partitioning=true)"
+		" FROM parquet_scan('" + safeGlob + "', hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -425,6 +425,7 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 			endPos         int64
 			eventTimestamp time.Time
 			gtid           sql.NullString
+			connID         sql.NullInt64
 			schemaName     string
 			tableName      string
 			eventType      int32
@@ -436,7 +437,7 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 		)
 		if err := rows.Scan(
 			&eventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
-			&gtid, &schemaName, &tableName, &eventType, &pkValues,
+			&gtid, &connID, &schemaName, &tableName, &eventType, &pkValues,
 			&changedCols, &rowBefore, &rowAfter, &schemaVersion,
 		); err != nil {
 			return nil, fmt.Errorf("scan parquet result: %w", err)
@@ -456,6 +457,10 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 		}
 		if gtid.Valid {
 			r.GTID = &gtid.String
+		}
+		if connID.Valid {
+			v := uint32(connID.Int64)
+			r.ConnectionID = &v
 		}
 		if changedCols.Valid && changedCols.String != "" {
 			_ = json.Unmarshal([]byte(changedCols.String), &r.ChangedColumns)

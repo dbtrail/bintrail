@@ -490,6 +490,7 @@ func buildBinlogEventsDDL(parts []string, encrypt bool) string {
     end_pos         BIGINT UNSIGNED  NOT NULL,
     event_timestamp DATETIME         NOT NULL,
     gtid            VARCHAR(255)     DEFAULT NULL,
+    connection_id   INT UNSIGNED     DEFAULT NULL COMMENT 'MySQL connection ID (pseudo_thread_id) that produced this event',
     schema_name     VARCHAR(64)      NOT NULL,
     table_name      VARCHAR(64)      NOT NULL,
     event_type      TINYINT UNSIGNED NOT NULL COMMENT '1=INSERT, 2=UPDATE, 3=DELETE',

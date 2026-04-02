@@ -21,6 +21,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/baseline"
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/indexer"
 )
 
 var rotateCmd = &cobra.Command{
@@ -140,6 +141,9 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to connect to index database: %w", err)
 		}
 		defer db.Close()
+		if err := indexer.EnsureSchema(db); err != nil {
+			return fmt.Errorf("schema migration: %w", err)
+		}
 		dropped, added, err := performRotation(ctx, db, dbName, retainDur)
 		if err != nil {
 			return err

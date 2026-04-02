@@ -42,6 +42,7 @@ type Event struct {
 	EndPos        uint64
 	Timestamp     time.Time
 	GTID          string // empty when GTID is not enabled on the source
+	ConnectionID  uint32 // MySQL pseudo_thread_id from the transaction's QUERY(BEGIN) event; 0 = unknown
 	Schema        string
 	Table         string
 	EventType     EventType
@@ -133,6 +134,10 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	// It is updated on every GTID_LOG_EVENT and carried into every subsequent
 	// rows event until the next GTID_LOG_EVENT resets it.
 	var currentGTID string
+	// currentConnectionID holds the MySQL pseudo_thread_id from the most
+	// recent QueryEvent. For DML transactions, this is the QUERY(BEGIN)
+	// event that precedes the row events.
+	var currentConnectionID uint32
 
 	bp := replication.NewBinlogParser()
 
@@ -146,6 +151,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			currentGTID = formatGTID(ev.SID, ev.GNO)
 
 		case *replication.QueryEvent:
+			currentConnectionID = ev.SlaveProxyID
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
 			if ddlEv, ok := parseDDL(p.logger, filename, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), p.schemaVersion.Load()); ok {
 				select {
@@ -156,7 +162,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			}
 
 		case *replication.RowsEvent:
-			return handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, p.schemaVersion.Load(), events)
+			return handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, p.schemaVersion.Load(), events)
 		}
 		return nil
 	})
@@ -176,6 +182,7 @@ func handleRows(
 	binlogEv *replication.BinlogEvent,
 	rowsEv *replication.RowsEvent,
 	filename, currentGTID string,
+	connectionID uint32,
 	schemaVersion uint32,
 	out chan<- Event,
 ) error {
@@ -227,17 +234,17 @@ func handleRows(
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2:
-		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, startPos, endPos, ts, pkCols, schemaVersion, out)
 
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2:
-		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, startPos, endPos, ts, pkCols, schemaVersion, out)
 
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
 		replication.UPDATE_ROWS_EVENTv2:
-		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, startPos, endPos, ts, pkCols, schemaVersion, out)
 	}
 
 	return nil
@@ -249,6 +256,7 @@ func emitInserts(
 	resolver *metadata.Resolver,
 	rows [][]any,
 	schema, table, filename, gtid string,
+	connectionID uint32,
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
@@ -264,7 +272,7 @@ func emitInserts(
 		}
 		ev := Event{
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
-			Timestamp: ts, GTID: gtid,
+			Timestamp: ts, GTID: gtid, ConnectionID: connectionID,
 			Schema: schema, Table: table, EventType: EventInsert,
 			PKValues:      BuildPKValues(pkCols, named),
 			RowAfter:      named,
@@ -285,6 +293,7 @@ func emitDeletes(
 	resolver *metadata.Resolver,
 	rows [][]any,
 	schema, table, filename, gtid string,
+	connectionID uint32,
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
@@ -300,7 +309,7 @@ func emitDeletes(
 		}
 		ev := Event{
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
-			Timestamp: ts, GTID: gtid,
+			Timestamp: ts, GTID: gtid, ConnectionID: connectionID,
 			Schema: schema, Table: table, EventType: EventDelete,
 			PKValues:      BuildPKValues(pkCols, named),
 			RowBefore:     named,
@@ -321,6 +330,7 @@ func emitUpdates(
 	resolver *metadata.Resolver,
 	rows [][]any,
 	schema, table, filename, gtid string,
+	connectionID uint32,
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
@@ -344,7 +354,7 @@ func emitUpdates(
 		}
 		ev := Event{
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
-			Timestamp: ts, GTID: gtid,
+			Timestamp: ts, GTID: gtid, ConnectionID: connectionID,
 			Schema: schema, Table: table, EventType: EventUpdate,
 			PKValues:      BuildPKValues(pkCols, before), // PK from before-image
 			RowBefore:     before,

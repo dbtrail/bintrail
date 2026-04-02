@@ -34,6 +34,7 @@ type MetadataRecord struct {
 	EventTimestamp time.Time `json:"event_timestamp"`
 	ServerID       string    `json:"server_id"`
 	GTID           string    `json:"gtid,omitempty"`
+	ConnectionID   uint32    `json:"connection_id,omitempty"` // MySQL pseudo_thread_id; 0 = unknown
 	RowCount       int       `json:"row_count"`
 	ChangedColumns []string  `json:"changed_columns"` // nil for INSERT/DELETE
 }
@@ -83,6 +84,7 @@ func SplitEvent(ev parser.Event, serverID string) (MetadataRecord, PayloadRecord
 		EventTimestamp: ev.Timestamp,
 		ServerID:       serverID,
 		GTID:           ev.GTID,
+		ConnectionID:   ev.ConnectionID,
 		RowCount:       1,
 		ChangedColumns: changed,
 	}

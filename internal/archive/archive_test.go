@@ -11,15 +11,15 @@ import (
 )
 
 func TestBinlogEventColumns_count(t *testing.T) {
-	if len(BinlogEventColumns) != 14 {
-		t.Errorf("expected 14 columns, got %d", len(BinlogEventColumns))
+	if len(BinlogEventColumns) != 15 {
+		t.Errorf("expected 15 columns, got %d", len(BinlogEventColumns))
 	}
 }
 
 func TestBinlogEventColumns_names(t *testing.T) {
 	wantNames := []string{
 		"event_id", "binlog_file", "start_pos", "end_pos",
-		"event_timestamp", "gtid", "schema_name", "table_name",
+		"event_timestamp", "gtid", "connection_id", "schema_name", "table_name",
 		"event_type", "pk_values", "changed_columns", "row_before", "row_after",
 		"schema_version",
 	}
@@ -70,6 +70,7 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		"200",                    // end_pos
 		"2026-02-19 10:00:00",    // event_timestamp
 		"abc123:1",               // gtid
+		"12345",                  // connection_id
 		"mydb",                   // schema_name
 		"orders",                 // table_name
 		"1",                      // event_type (INSERT)
@@ -79,20 +80,21 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		`{"id":42,"new":"val2"}`, // row_after
 		"0",                      // schema_version
 	}
-	nulls1 := make([]bool, 14) // all false
+	nulls1 := make([]bool, 15) // all false
 	if err := w.WriteRow(row1, nulls1); err != nil {
 		t.Fatalf("WriteRow 1: %v", err)
 	}
 
-	// Row 2: nullable fields (gtid, changed_columns, row_before, row_after) are null.
+	// Row 2: nullable fields (gtid, connection_id, changed_columns, row_before, row_after) are null.
 	row2 := []string{
 		"2", "binlog.000001", "200", "300", "2026-02-19 10:00:01",
-		"", "mydb", "orders", "3", "43",
+		"", "", "mydb", "orders", "3", "43",
 		"", "", "", "1",
 	}
 	nulls2 := []bool{
 		false, false, false, false, false,
 		true, // gtid null
+		true, // connection_id null
 		false, false, false, false,
 		true, true, true, // changed_columns, row_before, row_after null
 		false,            // schema_version not null

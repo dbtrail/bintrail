@@ -41,6 +41,7 @@ func TestSplitEventInsert(t *testing.T) {
 		EndPos:        200,
 		Timestamp:     time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC),
 		GTID:          "aaa-bbb:1",
+		ConnectionID:  7890,
 		Schema:        "mydb",
 		Table:         "users",
 		EventType:     parser.EventInsert,
@@ -76,6 +77,9 @@ func TestSplitEventInsert(t *testing.T) {
 	}
 	if meta.RowCount != 1 {
 		t.Errorf("meta.RowCount = %d, want 1", meta.RowCount)
+	}
+	if meta.ConnectionID != 7890 {
+		t.Errorf("meta.ConnectionID = %d, want 7890", meta.ConnectionID)
 	}
 	if meta.ChangedColumns != nil {
 		t.Errorf("meta.ChangedColumns = %v, want nil for INSERT", meta.ChangedColumns)
