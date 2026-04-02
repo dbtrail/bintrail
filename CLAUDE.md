@@ -117,7 +117,7 @@ Key patterns:
 
 ### Schema migration
 - `indexer.EnsureSchema(db)` adds columns introduced after the initial schema (e.g. `connection_id`). Idempotent — checks `information_schema.COLUMNS` before ALTER.
-- Called at startup by `index`, `stream`, and `agent` commands (before any INSERT).
+- Called at startup by `index`, `stream`, `agent`, `query`, `recover`, and `rotate` commands.
 
 ### File-based (`bintrail index`)
 
