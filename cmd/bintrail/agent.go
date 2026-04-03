@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -22,6 +23,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/serverid"
 	"github.com/dbtrail/bintrail/internal/storage"
 )
 
@@ -132,6 +134,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	}
 
 	// Connect to index database if provided.
+	var indexDB *sql.DB
 	if agtIndexDSN != "" {
 		db, err := config.Connect(agtIndexDSN)
 		if err != nil {
@@ -141,17 +144,49 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		if err := indexer.EnsureSchema(db); err != nil {
 			return fmt.Errorf("schema migration: %w", err)
 		}
+		indexDB = db
 		handler.IndexDB = db
 	}
 
 	// Connect to source database if provided (for forensics queries + BYOS streaming).
+	var sourceDB *sql.DB
 	if agtSourceDSN != "" {
 		db, err := config.Connect(agtSourceDSN)
 		if err != nil {
 			return fmt.Errorf("connect to source database: %w", err)
 		}
 		defer db.Close()
+		sourceDB = db
 		handler.SourceDB = db
+	}
+
+	// Resolve bintrail_id — the stable server identifier used for metadata
+	// records and WebSocket heartbeats. Requires both source and index DBs.
+	var bintrailID string
+	if sourceDB != nil && indexDB != nil {
+		id, err := resolveServerIdentity(cmd.Context(), sourceDB, indexDB, agtSourceDSN)
+		if err != nil {
+			if errors.Is(err, serverid.ErrConflict) {
+				return fmt.Errorf("cannot start agent: %w", err)
+			}
+			// In BYOS+S3 mode, falling back to numeric server-id would
+			// create S3 partitions that cannot be correlated with future
+			// runs that resolve a proper bintrail_id.
+			if byosMode && agtS3Bucket != "" {
+				return fmt.Errorf("server identity resolution required for BYOS with S3: %w", err)
+			}
+			slog.Warn("server identity resolution failed; proceeding without bintrail_id", "error", err)
+		} else {
+			bintrailID = id
+			slog.Info("server identity resolved", "bintrail_id", bintrailID)
+		}
+	} else if byosMode {
+		if agtS3Bucket != "" {
+			return fmt.Errorf("--index-dsn is required for BYOS with S3: cannot resolve stable bintrail_id for S3 partitioning without it")
+		}
+		slog.Warn("no --index-dsn provided; using numeric server-id for BYOS metadata",
+			"server_id", fmt.Sprint(agtServerID),
+			"hint", "pass --index-dsn to enable stable bintrail_id resolution")
 	}
 
 	// BYOS streaming: start buffer + streaming goroutine.
@@ -169,9 +204,13 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		buf := buffer.New(retain, slog.Default())
 		handler.Buffer = buf
 
+		// Use bintrail_id as the server identifier when available, falling
+		// back to the numeric @@server_id.
+		serverIDStr := cmp.Or(bintrailID, fmt.Sprint(agtServerID))
+
 		slog.Info("BYOS mode enabled",
 			"source_dsn", maskDSN(agtSourceDSN),
-			"server_id", agtServerID,
+			"server_id", serverIDStr,
 			"buffer_retain", retain.String())
 
 		// Initialize flush sinks if S3 bucket is configured.
@@ -189,7 +228,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return fmt.Errorf("initialize S3 backend: %w", err)
 			}
-			payloadWriter = byos.NewPayloadWriter(s3Backend, fmt.Sprint(agtServerID))
+			payloadWriter = byos.NewPayloadWriter(s3Backend, serverIDStr)
 
 			slog.Info("BYOS flush pipeline initialized",
 				"s3_bucket", agtS3Bucket,
@@ -206,7 +245,6 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			metadataStatus: "ok",
 			payloadStatus:  "ok",
 		}
-		serverIDStr := fmt.Sprint(agtServerID)
 
 		streamErrCh := make(chan error, 1)
 		go func() {
@@ -242,7 +280,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		Endpoint:   agtEndpoint,
 		APIKey:     agtAPIKey,
 		Version:    Version,
-		BintrailID: "", // TODO: resolve from index DB when server identity is available
+		BintrailID: bintrailID,
 	}
 
 	var statusFn func() *agent.FlushStatus
