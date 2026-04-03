@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-04-03
+
+### Fixed
+- BYOS MetadataClient now sends `bintrail_id` (stable UUID) instead of numeric `@@server_id` in metadata records and WebSocket heartbeats — prevents misidentification when multiple MySQL servers share the default `server_id = 1`
+- BYOS+S3 mode now requires `--index-dsn` to ensure stable `bintrail_id` resolution for S3 partitioning — prevents orphaned partitions that cannot be correlated with future runs
+
 ## [0.4.0] - 2026-04-01
 
 ### Added
