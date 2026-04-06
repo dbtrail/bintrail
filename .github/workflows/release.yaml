@@ -22,11 +22,23 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install arm64 cross-compiler
-        # g++ required: DuckDB's pre-compiled static libs link against libstdc++
+      - name: Install Zig (cross-compiler with glibc version targeting)
+        # Zig replaces gcc/g++ for both native and cross builds.
+        # Targeting glibc 2.17 ensures the binary runs on RHEL 7+,
+        # Amazon Linux 2/2023, Ubuntu 18.04+, Debian 10+, etc.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          ZIG_VERSION=0.14.1
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" | sudo tar -xJ -C /usr/local
+          sudo ln -sf /usr/local/zig-linux-x86_64-${ZIG_VERSION}/zig /usr/local/bin/zig
+          for arch in x86_64 aarch64; do
+            for lang in cc c++; do
+              sudo tee /usr/local/bin/zig-${lang}-${arch} > /dev/null <<WRAP
+          #!/bin/sh
+          exec zig ${lang} -target ${arch}-linux-gnu.2.17 "\$@"
+          WRAP
+              sudo chmod +x /usr/local/bin/zig-${lang}-${arch}
+            done
+          done
 
       - name: Run tests
         run: go test ./...

@@ -13,11 +13,17 @@ builds:
       - arm64
     overrides:
       - goos: linux
+        goarch: amd64
+        env:
+          - CGO_ENABLED=1
+          - CC=zig-cc-x86_64
+          - CXX=zig-cxx-x86_64
+      - goos: linux
         goarch: arm64
         env:
           - CGO_ENABLED=1
-          - CC=aarch64-linux-gnu-gcc
-          - CXX=aarch64-linux-gnu-g++
+          - CC=zig-cc-aarch64
+          - CXX=zig-cxx-aarch64
     ldflags:
       - -s -w
       - -X main.Version={{.Version}}
@@ -36,11 +42,17 @@ builds:
       - arm64
     overrides:
       - goos: linux
+        goarch: amd64
+        env:
+          - CGO_ENABLED=1
+          - CC=zig-cc-x86_64
+          - CXX=zig-cxx-x86_64
+      - goos: linux
         goarch: arm64
         env:
           - CGO_ENABLED=1
-          - CC=aarch64-linux-gnu-gcc
-          - CXX=aarch64-linux-gnu-g++
+          - CC=zig-cc-aarch64
+          - CXX=zig-cxx-aarch64
     ldflags:
       - -s -w
       - -X main.mcpVersion={{.Version}}
