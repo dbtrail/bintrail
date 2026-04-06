@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-04-05
+
+### Fixed
+- Release binaries now target glibc 2.17 (via Zig linker) — fixes `GLIBC_2.38 not found` on Amazon Linux 2023, RHEL 9, and other distros with glibc < 2.39
+
 ## [0.4.1] - 2026-04-03
 
 ### Fixed
