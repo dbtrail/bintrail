@@ -60,17 +60,17 @@ Examples:
 }
 
 var (
-	agtAPIKey       string
-	agtEndpoint     string
-	agtIndexDSN     string
-	agtSourceDSN    string
-	agtArchiveDir   string
-	agtArchiveS3    string
-	agtBufferRetain string
-	agtServerID     uint32
-	agtBatchSize    int
-	agtSchemas      string
-	agtTables       string
+	agtAPIKey               string
+	agtEndpoint             string
+	agtIndexDSN             string
+	agtSourceDSN            string
+	agtArchiveDir           string
+	agtArchiveS3            string
+	agtBufferRetain         string
+	agtServerID             uint32
+	agtBatchSize            int
+	agtSchemas              string
+	agtTables               string
 	agtStartGTID            string
 	agtS3Bucket             string
 	agtS3Region             string

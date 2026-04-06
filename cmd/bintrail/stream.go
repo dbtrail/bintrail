@@ -81,10 +81,10 @@ var (
 	strmSSLCA       string
 	strmSSLCert     string
 	strmSSLKey      string
-	strmFormat     string
-	strmReset      bool
-	strmNoGapFill  bool
-	strmGapTimeout int
+	strmFormat      string
+	strmReset       bool
+	strmNoGapFill   bool
+	strmGapTimeout  int
 )
 
 func init() {
