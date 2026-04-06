@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -538,14 +539,15 @@ func TestChannel_maxReconnectAttemptsExhausted(t *testing.T) {
 	cfg := ChannelConfig{
 		Endpoint:             "ws" + strings.TrimPrefix(srv.URL, "http"),
 		APIKey:               "any",
-		HeartbeatInterval:    time.Hour,
+		HeartbeatInterval:    time.Hour, // load-bearing: prevents the stable-connection reset path from firing between rapid hijack failures, so the budget can actually exhaust
 		MaxReconnectDelay:    10 * time.Millisecond,
 		MaxReconnectAttempts: 3,
 	}
 
 	// Generous outer deadline so a test failure manifests as the wrong
-	// error type instead of a hang. With MaxReconnectDelay=10ms and 3
-	// attempts the loop should give up well under a second.
+	// error type instead of a hang. The first iteration sleeps a full
+	// 1 second (Run's initial backoff) regardless of MaxReconnectDelay,
+	// so the loop takes ~1s wall clock to give up.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -555,16 +557,120 @@ func TestChannel_maxReconnectAttemptsExhausted(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from Run after exhausting reconnect attempts")
 	}
-	if err == context.DeadlineExceeded || err == context.Canceled {
+	// Use errors.Is so a future change wrapping these sentinels in another
+	// error type still flags them correctly here.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		t.Errorf("Run should have given up on its own, got context error: %v", err)
 	}
 	if !strings.Contains(err.Error(), "reconnect budget exhausted") {
 		t.Errorf("expected error mentioning reconnect budget exhausted, got: %v", err)
+	}
+	// The budget-exhausted error must wrap the underlying transport
+	// failure with %w so callers can inspect the cause via errors.Unwrap
+	// / errors.Is. A regression to %v would lose that chain.
+	if errors.Unwrap(err) == nil {
+		t.Errorf("expected wrapped underlying error, got unwrapped: %v", err)
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	if attempts < 3 {
 		t.Errorf("expected at least 3 connect attempts, got %d", attempts)
+	}
+}
+
+// TestChannel_resetCounterOnStableConnection verifies that a connection
+// which lasts longer than one heartbeat interval resets the failed-attempt
+// counter. Without this reset, a chronically flaky link (or any
+// long-running agent that occasionally drops a connection after hours of
+// uptime) would silently exhaust the budget and exit, defeating the
+// purpose of an agent that survives transient blips.
+//
+// The test runs cycles of "accept WS handshake → stay open longer than
+// HeartbeatInterval → close" and asserts the budget is never tripped
+// inside the test deadline. With MaxReconnectAttempts=2 and no reset
+// logic, Run would exit on the second cycle's failure; with the reset,
+// Run keeps looping until ctx fires.
+func TestChannel_resetCounterOnStableConnection(t *testing.T) {
+	var cycles int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cycles++
+		mu.Unlock()
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		// Stay open well beyond HeartbeatInterval (20ms) so each
+		// completed cycle is "stable" by Run's reset criterion.
+		time.Sleep(80 * time.Millisecond)
+		conn.Close(websocket.StatusNormalClosure, "test cycle")
+	}))
+	defer srv.Close()
+
+	cfg := ChannelConfig{
+		Endpoint:             "ws" + strings.TrimPrefix(srv.URL, "http"),
+		APIKey:               "any",
+		HeartbeatInterval:    20 * time.Millisecond,
+		MaxReconnectDelay:    5 * time.Millisecond,
+		MaxReconnectAttempts: 2, // would trip on the 2nd cycle without reset
+	}
+
+	// Each cycle takes ~1.08s wall clock: 80ms connection + ~1s sleep.
+	// The 1-second sleep is Run's initial backoff (`delay := time.Second`),
+	// which the reset path also restores after every stable cycle, so
+	// MaxReconnectDelay does not shorten it. Need ≥3 cycles to prove the
+	// reset survived a prior reset, so allow ~4 seconds.
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	ch := NewChannel(cfg, &stubHandler{}, nil, nil)
+	err := ch.Run(ctx)
+
+	// Run must exit because of the test's context cancellation, not
+	// because the budget was exhausted. If the reset logic regresses,
+	// Run will return the budget-exhausted wrap instead.
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Errorf("expected Run to exit on context cancel; got %v (counter reset may be broken)", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "reconnect budget exhausted") {
+		t.Errorf("budget tripped despite stable cycles — counter reset is broken: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Need at least 3 cycles to prove the reset path actually fired
+	// (cycle 1 doesn't exercise reset; cycles 2+ do, and cycle 3 proves
+	// the reset survived a second iteration).
+	if cycles < 3 {
+		t.Errorf("expected at least 3 connect cycles to exercise reset path, got %d", cycles)
+	}
+}
+
+// TestChannelConfig_maxReconnectAttempts pins down the helper's
+// negative/zero/positive semantics so a refactor of the unlimited-retry
+// branch (e.g. tightening `< 0` to `<= 0` or vice versa) immediately
+// fails a unit test instead of silently changing the runtime behavior.
+func TestChannelConfig_maxReconnectAttempts(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"negative coerced to unlimited", -5, 0},
+		{"negative one coerced to unlimited", -1, 0},
+		{"zero stays zero (unlimited)", 0, 0},
+		{"one stays one", 1, 1},
+		{"three stays three", 3, 3},
+		{"large value preserved", 1000, 1000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &ChannelConfig{MaxReconnectAttempts: tt.in}
+			if got := cfg.maxReconnectAttempts(); got != tt.want {
+				t.Errorf("maxReconnectAttempts() = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }

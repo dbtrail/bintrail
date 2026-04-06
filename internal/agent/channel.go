@@ -116,12 +116,14 @@ func NewChannel(cfg ChannelConfig, handler Handler, logger *slog.Logger, statusP
 // a permanent error (e.g. auth rejection) is encountered, or
 // MaxReconnectAttempts consecutive reconnect failures have occurred.
 //
-// When the retry budget is exhausted, Run returns the last error instead
-// of looping forever. This lets a process supervisor (e.g. systemd
-// Restart=on-failure) respawn the agent so the entire WebSocket state
-// machine restarts cleanly. Without it, a stale in-process reconnect
-// loop can keep retrying indefinitely while the dashboard sees the
-// agent as offline.
+// When the retry budget is exhausted, Run returns an error that wraps
+// the last underlying failure with "websocket reconnect budget exhausted
+// after N attempts:" — callers wanting the underlying cause should use
+// errors.Unwrap or errors.Is. Surfacing the failure as a process exit
+// lets a supervisor (e.g. systemd Restart=on-failure) respawn the agent
+// so the entire WebSocket state machine restarts cleanly. Without it,
+// a stale in-process reconnect loop can keep retrying indefinitely
+// while the dashboard sees the agent as offline.
 func (ch *Channel) Run(ctx context.Context) error {
 	delay := time.Second
 	failedAttempts := 0
@@ -141,13 +143,18 @@ func (ch *Channel) Run(ctx context.Context) error {
 
 		// Reset both the backoff and the attempt counter if the connection
 		// was stable (lasted longer than one heartbeat interval). A stable
-		// connection that later drops should not count toward the retry
-		// budget that exists to detect "can never reconnect" failures.
+		// connection that later drops starts a fresh retry budget — the
+		// failedAttempts++ below then counts the current failure as 1 in
+		// the new budget, so a single drop after hours of uptime never
+		// trips the limit on its own.
 		if time.Since(connStart) > ch.cfg.heartbeatInterval() {
 			delay = time.Second
 			failedAttempts = 0
 		}
 
+		// Always count the current failure, even immediately after a
+		// reset above: the post-stable drop is the first failure of the
+		// fresh budget.
 		failedAttempts++
 
 		if maxAttempts > 0 && failedAttempts >= maxAttempts {

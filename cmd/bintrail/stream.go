@@ -106,7 +106,7 @@ func init() {
 	streamCmd.Flags().StringVar(&strmFormat, "format", "text", "Output format: text or json")
 	streamCmd.Flags().BoolVar(&strmReset, "reset", false, "Clear saved checkpoint before starting (forces use of --start-file/--start-gtid)")
 	streamCmd.Flags().BoolVar(&strmNoGapFill, "no-gap-fill", false, "Refuse to start if an unfillable binlog gap is detected (instead of auto-advancing past purged data)")
-	streamCmd.Flags().IntVar(&strmGapTimeout, "gap-timeout", 30, "Timeout in seconds for gap-detection queries (SHOW BINARY LOGS, @@gtid_purged, @@gtid_executed); raise on RDS instances with many binlog files")
+	streamCmd.Flags().IntVar(&strmGapTimeout, "gap-timeout", 30, "Timeout in seconds for the one-shot gap-detection queries run at startup (SHOW BINARY LOGS, @@gtid_purged, @@gtid_executed); raise on managed MySQL with many binlog files")
 	_ = streamCmd.MarkFlagRequired("index-dsn")
 	_ = streamCmd.MarkFlagRequired("source-dsn")
 	_ = streamCmd.MarkFlagRequired("server-id")
@@ -789,6 +789,13 @@ func streamLoop(
 func runStream(cmd *cobra.Command, args []string) error {
 	if !cliutil.IsValidOutputFormat(strmFormat) {
 		return fmt.Errorf("invalid --format %q; must be text or json", strmFormat)
+	}
+	// Reject non-positive --gap-timeout values: a zero or negative timeout
+	// would produce an immediately-cancelled context inside detectPositionGap
+	// / detectGTIDGap, surfacing as a misleading "context deadline exceeded"
+	// error whose recovery hint (`--reset`) discards the saved checkpoint.
+	if strmGapTimeout <= 0 {
+		return fmt.Errorf("invalid --gap-timeout %d: must be a positive number of seconds", strmGapTimeout)
 	}
 
 	ctx, cancel := context.WithCancel(cmd.Context())
