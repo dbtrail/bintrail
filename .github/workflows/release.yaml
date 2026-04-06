@@ -37,8 +37,10 @@ jobs:
           sudo ln -sf /usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 
           # Find gcc library paths for libstdc++.a
-          AMD64_GCC_LIB=$(dirname $(find /usr/lib/gcc/x86_64-linux-gnu -name 'libstdc++.a' | head -1))
-          ARM64_GCC_LIB=$(dirname $(find /usr/lib/gcc/aarch64-linux-gnu -name 'libstdc++.a' | head -1))
+          AMD64_GCC_LIB=$(dirname $(find /usr/lib/gcc/x86_64-linux-gnu -name 'libstdc++.a' 2>/dev/null | head -1))
+          ARM64_GCC_LIB=$(find /usr -path '*/aarch64-linux-gnu/libstdc++.a' 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo /usr/aarch64-linux-gnu/lib)
+          echo "AMD64_GCC_LIB=${AMD64_GCC_LIB}"
+          echo "ARM64_GCC_LIB=${ARM64_GCC_LIB}"
 
           sudo tee /usr/local/bin/zig-cc-x86_64 > /dev/null <<WRAP
           #!/bin/sh
