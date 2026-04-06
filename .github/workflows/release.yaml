@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -22,43 +22,10 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install cross-compilers and Zig
-        # DuckDB static libs need libstdc++ (C++ runtime). Zig handles glibc
-        # version targeting but doesn't ship libstdc++, so we install g++ for
-        # the native arch and the cross toolchain for arm64 to provide it.
-        # The zig wrappers add -L paths to the gcc lib dirs so lld can find
-        # libstdc++.a and link it statically into the binary.
+      - name: Install arm64 cross-compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-          ZIG_VERSION=0.15.2
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | sudo tar -xJ -C /usr/local
-          sudo ln -sf /usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
-
-          # Find gcc library paths for libstdc++.a
-          AMD64_GCC_LIB=$(dirname $(find /usr/lib/gcc/x86_64-linux-gnu -name 'libstdc++.a' 2>/dev/null | head -1))
-          ARM64_GCC_LIB=$(find /usr -path '*/aarch64-linux-gnu/libstdc++.a' 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo /usr/aarch64-linux-gnu/lib)
-          echo "AMD64_GCC_LIB=${AMD64_GCC_LIB}"
-          echo "ARM64_GCC_LIB=${ARM64_GCC_LIB}"
-
-          sudo tee /usr/local/bin/zig-cc-x86_64 > /dev/null <<WRAP
-          #!/bin/sh
-          exec zig cc -target x86_64-linux-gnu.2.17 -L${AMD64_GCC_LIB} "\$@"
-          WRAP
-          sudo tee /usr/local/bin/zig-cxx-x86_64 > /dev/null <<WRAP
-          #!/bin/sh
-          exec zig c++ -target x86_64-linux-gnu.2.17 -L${AMD64_GCC_LIB} "\$@"
-          WRAP
-          sudo tee /usr/local/bin/zig-cc-aarch64 > /dev/null <<WRAP
-          #!/bin/sh
-          exec zig cc -target aarch64-linux-gnu.2.17 -L${ARM64_GCC_LIB} "\$@"
-          WRAP
-          sudo tee /usr/local/bin/zig-cxx-aarch64 > /dev/null <<WRAP
-          #!/bin/sh
-          exec zig c++ -target aarch64-linux-gnu.2.17 -L${ARM64_GCC_LIB} "\$@"
-          WRAP
-          sudo chmod +x /usr/local/bin/zig-cc-* /usr/local/bin/zig-cxx-*
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - name: Run tests
         run: go test ./...
