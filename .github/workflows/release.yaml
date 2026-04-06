@@ -27,9 +27,9 @@ jobs:
         # Targeting glibc 2.17 ensures the binary runs on RHEL 7+,
         # Amazon Linux 2/2023, Ubuntu 18.04+, Debian 10+, etc.
         run: |
-          ZIG_VERSION=0.14.1
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" | sudo tar -xJ -C /usr/local
-          sudo ln -sf /usr/local/zig-linux-x86_64-${ZIG_VERSION}/zig /usr/local/bin/zig
+          ZIG_VERSION=0.15.2
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | sudo tar -xJ -C /usr/local
+          sudo ln -sf /usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
           for arch in x86_64 aarch64; do
             for lang in cc c++; do
               sudo tee /usr/local/bin/zig-${lang}-${arch} > /dev/null <<WRAP
