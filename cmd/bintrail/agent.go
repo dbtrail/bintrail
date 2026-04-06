@@ -60,23 +60,24 @@ Examples:
 }
 
 var (
-	agtAPIKey       string
-	agtEndpoint     string
-	agtIndexDSN     string
-	agtSourceDSN    string
-	agtArchiveDir   string
-	agtArchiveS3    string
-	agtBufferRetain string
-	agtServerID     uint32
-	agtBatchSize    int
-	agtSchemas      string
-	agtTables       string
-	agtStartGTID     string
-	agtS3Bucket      string
-	agtS3Region      string
-	agtS3Prefix      string
-	agtFlushInterval string
-	agtValidate      bool
+	agtAPIKey               string
+	agtEndpoint             string
+	agtIndexDSN             string
+	agtSourceDSN            string
+	agtArchiveDir           string
+	agtArchiveS3            string
+	agtBufferRetain         string
+	agtServerID             uint32
+	agtBatchSize            int
+	agtSchemas              string
+	agtTables               string
+	agtStartGTID            string
+	agtS3Bucket             string
+	agtS3Region             string
+	agtS3Prefix             string
+	agtFlushInterval        string
+	agtValidate             bool
+	agtMaxReconnectAttempts int
 )
 
 func init() {
@@ -97,6 +98,7 @@ func init() {
 	agentCmd.Flags().StringVar(&agtS3Prefix, "s3-prefix", "bintrail/", "Key prefix within the S3 bucket")
 	agentCmd.Flags().StringVar(&agtFlushInterval, "flush-interval", "5s", "Max time between metadata/payload flushes (e.g. 5s, 10s)")
 	agentCmd.Flags().BoolVar(&agtValidate, "validate", false, "Run pre-flight checks and exit without starting the agent")
+	agentCmd.Flags().IntVar(&agtMaxReconnectAttempts, "max-reconnect-attempts", 10, "Exit (non-zero) after this many consecutive WebSocket reconnect failures so a process supervisor (e.g. systemd Restart=on-failure) can respawn the agent. The counter resets whenever a connection stays up longer than the heartbeat interval, so transient drops on a healthy long-running agent never trip the limit. Use 0 for unlimited retries.")
 	_ = agentCmd.MarkFlagRequired("api-key")
 	_ = agentCmd.MarkFlagRequired("endpoint")
 	bindCommandEnv(agentCmd)
@@ -107,6 +109,13 @@ func init() {
 func runAgent(cmd *cobra.Command, args []string) error {
 	if agtValidate {
 		return runAgentValidate(cmd.Context())
+	}
+	// Reject negative --max-reconnect-attempts: the underlying ChannelConfig
+	// helper coerces negatives to 0 (= unlimited), which would silently
+	// re-enable the exact failure mode #191 fixes if a user typo'd `-1`
+	// expecting "give up fast". Make zero an explicit, intentional opt-in.
+	if agtMaxReconnectAttempts < 0 {
+		return fmt.Errorf("invalid --max-reconnect-attempts %d: must be >= 0 (use 0 explicitly for unlimited retries)", agtMaxReconnectAttempts)
 	}
 
 	start := time.Now()
@@ -277,10 +286,11 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := agent.ChannelConfig{
-		Endpoint:   agtEndpoint,
-		APIKey:     agtAPIKey,
-		Version:    Version,
-		BintrailID: bintrailID,
+		Endpoint:             agtEndpoint,
+		APIKey:               agtAPIKey,
+		Version:              Version,
+		BintrailID:           bintrailID,
+		MaxReconnectAttempts: agtMaxReconnectAttempts,
 	}
 
 	var statusFn func() *agent.FlushStatus

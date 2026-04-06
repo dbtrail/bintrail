@@ -98,6 +98,8 @@ bintrail agent \
   --buffer-retain "6h"
 ```
 
+> **systemd is required for the agent.** The agent's WebSocket reconnect loop will give up after `--max-reconnect-attempts` consecutive failures (default 10) and exit with a non-zero status. This is intentional: it lets a process supervisor respawn the entire process so the WebSocket state machine restarts cleanly, instead of the in-process loop spinning silently while the dashboard sees the agent as offline. The shipped unit at `deploy/bintrail-agent.service` already sets `Restart=on-failure` and `RestartSec=10s`. If you run the agent under a different supervisor, configure equivalent restart-on-failure behavior.
+
 See `docs/storage.md` for details on the buffer, query priority, and configuration.
 
 ## 2. Source MySQL Requirements

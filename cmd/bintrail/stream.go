@@ -81,9 +81,10 @@ var (
 	strmSSLCA       string
 	strmSSLCert     string
 	strmSSLKey      string
-	strmFormat    string
-	strmReset     bool
-	strmNoGapFill bool
+	strmFormat      string
+	strmReset       bool
+	strmNoGapFill   bool
+	strmGapTimeout  int
 )
 
 func init() {
@@ -105,6 +106,7 @@ func init() {
 	streamCmd.Flags().StringVar(&strmFormat, "format", "text", "Output format: text or json")
 	streamCmd.Flags().BoolVar(&strmReset, "reset", false, "Clear saved checkpoint before starting (forces use of --start-file/--start-gtid)")
 	streamCmd.Flags().BoolVar(&strmNoGapFill, "no-gap-fill", false, "Refuse to start if an unfillable binlog gap is detected (instead of auto-advancing past purged data)")
+	streamCmd.Flags().IntVar(&strmGapTimeout, "gap-timeout", 30, "Timeout in seconds for the one-shot gap-detection queries run at startup (SHOW BINARY LOGS, @@gtid_purged, @@gtid_executed); raise on managed MySQL with many binlog files")
 	_ = streamCmd.MarkFlagRequired("index-dsn")
 	_ = streamCmd.MarkFlagRequired("source-dsn")
 	_ = streamCmd.MarkFlagRequired("server-id")
@@ -422,8 +424,10 @@ type gapResult struct {
 
 // detectPositionGap queries the source MySQL for available binary logs and
 // checks whether the checkpoint file still exists. Returns a gapResult.
-func detectPositionGap(sourceDB *sql.DB, checkpointFile string, checkpointPos uint32) (*gapResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// timeout caps how long SHOW BINARY LOGS may take — RDS instances with many
+// binlog files can take >10s, so callers should pass a generous value.
+func detectPositionGap(sourceDB *sql.DB, checkpointFile string, checkpointPos uint32, timeout time.Duration) (*gapResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	rows, err := sourceDB.QueryContext(ctx, "SHOW BINARY LOGS")
@@ -538,8 +542,9 @@ func gtidSetsEqual(a, b string) bool {
 
 // detectGTIDGap queries the source MySQL for @@gtid_purged and @@gtid_executed,
 // then checks whether the checkpoint GTID set requires any purged GTIDs.
-func detectGTIDGap(sourceDB *sql.DB, checkpointGTID string) (*gapResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// timeout caps how long the GTID system-variable queries may take.
+func detectGTIDGap(sourceDB *sql.DB, checkpointGTID string, timeout time.Duration) (*gapResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	checkpointGTID = normalizeGTIDSet(strings.TrimSpace(checkpointGTID))
@@ -785,6 +790,13 @@ func runStream(cmd *cobra.Command, args []string) error {
 	if !cliutil.IsValidOutputFormat(strmFormat) {
 		return fmt.Errorf("invalid --format %q; must be text or json", strmFormat)
 	}
+	// Reject non-positive --gap-timeout values: a zero or negative timeout
+	// would produce an immediately-cancelled context inside detectPositionGap
+	// / detectGTIDGap, surfacing as a misleading "context deadline exceeded"
+	// error whose recovery hint (`--reset`) discards the saved checkpoint.
+	if strmGapTimeout <= 0 {
+		return fmt.Errorf("invalid --gap-timeout %d: must be a positive number of seconds", strmGapTimeout)
+	}
 
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
@@ -874,11 +886,13 @@ func runStream(cmd *cobra.Command, args []string) error {
 		var gap *gapResult
 		var gapErr error
 
+		gapTimeout := time.Duration(strmGapTimeout) * time.Second
+
 		switch mode {
 		case "position":
-			gap, gapErr = detectPositionGap(sourceDB, startFile, startPos)
+			gap, gapErr = detectPositionGap(sourceDB, startFile, startPos, gapTimeout)
 		case "gtid":
-			gap, gapErr = detectGTIDGap(sourceDB, startGTIDStr)
+			gap, gapErr = detectGTIDGap(sourceDB, startGTIDStr, gapTimeout)
 		default:
 			slog.Warn("gap detection not implemented for mode", "mode", mode)
 		}

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `bintrail stream --gap-timeout` flag (default 30s) configures the timeout for gap-detection queries (`SHOW BINARY LOGS`, `@@gtid_purged`, `@@gtid_executed`); raise this on managed MySQL instances with many binlog files where the default 10s was too tight (#190)
+- `bintrail agent --max-reconnect-attempts` flag (default 10) bounds the WebSocket reconnect loop so the agent exits non-zero after consecutive failures, letting a process supervisor (e.g. systemd `Restart=on-failure`) respawn it (#191)
+
+### Changed
+- `bintrail stream` gap-detection query timeout default raised from 10s to 30s — the query only runs once per resume so a higher ceiling has no ongoing cost (#190)
+
+### Fixed
+- `bintrail agent` no longer stays "active" in systemd when its WebSocket connection dies but cannot reconnect — the new retry budget surfaces the failure as a process exit so systemd can respawn the agent and the dashboard sees a fresh, healthy connection (#191)
+
 ## [0.4.2] - 2026-04-05
 
 ### Fixed

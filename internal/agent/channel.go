@@ -36,6 +36,14 @@ type ChannelConfig struct {
 
 	// MaxReconnectDelay caps the exponential backoff. Zero defaults to 60s.
 	MaxReconnectDelay time.Duration
+
+	// MaxReconnectAttempts is the number of consecutive reconnect failures
+	// after which Run gives up and returns the last error so a process
+	// supervisor (e.g. systemd Restart=on-failure) can respawn the agent
+	// instead of letting the WebSocket loop spin silently. The counter
+	// resets whenever a connection lasts longer than one heartbeat interval.
+	// Zero or negative means unlimited retries.
+	MaxReconnectAttempts int
 }
 
 func (c *ChannelConfig) heartbeatInterval() time.Duration {
@@ -50,6 +58,16 @@ func (c *ChannelConfig) maxReconnectDelay() time.Duration {
 		return c.MaxReconnectDelay
 	}
 	return 60 * time.Second
+}
+
+// maxReconnectAttempts returns the configured retry budget, or 0 if
+// retries are unlimited. Negative values are treated as unlimited so a
+// caller cannot accidentally configure an immediate-give-up behavior.
+func (c *ChannelConfig) maxReconnectAttempts() int {
+	if c.MaxReconnectAttempts < 0 {
+		return 0
+	}
+	return c.MaxReconnectAttempts
 }
 
 // ─── Channel ─────────────────────────────────────────────────────────────────
@@ -94,10 +112,22 @@ func NewChannel(cfg ChannelConfig, handler Handler, logger *slog.Logger, statusP
 
 // Run connects to dbtrail and enters the listen/dispatch loop. It
 // reconnects automatically on failure with exponential backoff (1s, 2s,
-// 4s, … capped at MaxReconnectDelay). Run blocks until ctx is cancelled
-// or a permanent error (e.g. auth rejection) is encountered.
+// 4s, … capped at MaxReconnectDelay). Run blocks until ctx is cancelled,
+// a permanent error (e.g. auth rejection) is encountered, or
+// MaxReconnectAttempts consecutive reconnect failures have occurred.
+//
+// When the retry budget is exhausted, Run returns an error that wraps
+// the last underlying failure with "websocket reconnect budget exhausted
+// after N attempts:" — callers wanting the underlying cause should use
+// errors.Unwrap or errors.Is. Surfacing the failure as a process exit
+// lets a supervisor (e.g. systemd Restart=on-failure) respawn the agent
+// so the entire WebSocket state machine restarts cleanly. Without it,
+// a stale in-process reconnect loop can keep retrying indefinitely
+// while the dashboard sees the agent as offline.
 func (ch *Channel) Run(ctx context.Context) error {
 	delay := time.Second
+	failedAttempts := 0
+	maxAttempts := ch.cfg.maxReconnectAttempts()
 	for {
 		connStart := time.Now()
 		err := ch.connectAndListen(ctx)
@@ -111,15 +141,34 @@ func (ch *Channel) Run(ctx context.Context) error {
 			return err
 		}
 
-		ch.logger.Warn("connection lost, reconnecting",
-			"error", err,
-			"delay", delay.String())
-
-		// Reset backoff if the connection was stable (lasted longer than
-		// one heartbeat interval).
+		// Reset both the backoff and the attempt counter if the connection
+		// was stable (lasted longer than one heartbeat interval). A stable
+		// connection that later drops starts a fresh retry budget — the
+		// failedAttempts++ below then counts the current failure as 1 in
+		// the new budget, so a single drop after hours of uptime never
+		// trips the limit on its own.
 		if time.Since(connStart) > ch.cfg.heartbeatInterval() {
 			delay = time.Second
+			failedAttempts = 0
 		}
+
+		// Always count the current failure, even immediately after a
+		// reset above: the post-stable drop is the first failure of the
+		// fresh budget.
+		failedAttempts++
+
+		if maxAttempts > 0 && failedAttempts >= maxAttempts {
+			ch.logger.Error("giving up on WebSocket reconnect after consecutive failures",
+				"attempts", failedAttempts,
+				"max_attempts", maxAttempts,
+				"error", err)
+			return fmt.Errorf("websocket reconnect budget exhausted after %d attempts: %w", failedAttempts, err)
+		}
+
+		ch.logger.Warn("connection lost, reconnecting",
+			"error", err,
+			"attempt", failedAttempts,
+			"delay", delay.String())
 
 		select {
 		case <-ctx.Done():
