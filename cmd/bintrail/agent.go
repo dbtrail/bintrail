@@ -190,12 +190,26 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			slog.Info("server identity resolved", "bintrail_id", bintrailID)
 		}
 	} else if byosMode {
-		if agtS3Bucket != "" {
-			return fmt.Errorf("--index-dsn is required for BYOS with S3: cannot resolve stable bintrail_id for S3 partitioning without it")
-		}
-		slog.Warn("no --index-dsn provided; using numeric server-id for BYOS metadata",
+		// BYOS without --index-dsn: fall back to using --server-id as the
+		// stable identifier for metadata records, WebSocket heartbeats, and
+		// (when S3 is configured) the parquet partition key.  The fallback
+		// at line 218 (cmp.Or(bintrailID, fmt.Sprint(agtServerID))) wires
+		// this through to all consumers.
+		//
+		// We previously refused to start in BYOS+S3 mode without an index
+		// DB on the assumption that the numeric server-id would produce
+		// inconsistent partition keys across runs.  In practice the
+		// --server-id is stable by configuration (it's set in agent.env or
+		// the customer's runbook and doesn't change between restarts), so
+		// the partitions are stable too.  Forcing customers to provision
+		// a separate MySQL just for bintrail_id persistence was an
+		// onerous requirement that the BYOS_SETUP_INSTRUCTIONS in
+		// dbtrail-saas didn't even mention — see #1133 thread for the
+		// full design discussion and bintrail-saas-architecture.md §22.10
+		// for the canonical reference.
+		slog.Info("no --index-dsn provided; using --server-id as BYOS identity",
 			"server_id", fmt.Sprint(agtServerID),
-			"hint", "pass --index-dsn to enable stable bintrail_id resolution")
+			"s3_bucket", agtS3Bucket)
 	}
 
 	// BYOS streaming: start buffer + streaming goroutine.
