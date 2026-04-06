@@ -220,6 +220,23 @@ bintrail stream --no-gap-fill --index-dsn "..." --source-dsn "..." --server-id 9
 
 With `--no-gap-fill`, the stream exits with an error if an **unfillable** gap is detected (i.e., required binlogs have been purged). Fillable gaps are always replayed automatically since no data is lost. This flag is useful for self-hosted deployments where data loss must be explicitly acknowledged.
 
+### The `--gap-timeout` flag
+
+Gap-detection queries (`SHOW BINARY LOGS`, `@@gtid_purged`, `@@gtid_executed`) run with a 30-second default timeout. On managed MySQL with **many** binlog files, `SHOW BINARY LOGS` can take longer than this — for example, an Amazon RDS `db.t4g.micro` with 24h retention and high write throughput can accumulate ~300 binlog files and take >10 seconds to enumerate them. If you see:
+
+```
+gap detection failed: SHOW BINARY LOGS: context deadline exceeded
+(use --reset to skip gap detection and start from a new position)
+```
+
+raise the timeout (it only applies to the one-shot startup query, so a higher ceiling has no ongoing cost):
+
+```sh
+bintrail stream --gap-timeout 60 --index-dsn "..." --source-dsn "..." --server-id 99999
+```
+
+Reducing binlog retention is also a valid mitigation, but loses the ability to fill larger gaps.
+
 ### Binlog retention requirement
 
 **Important:** Configure your MySQL server's binlog retention to be **at least 2 days**. This gives bintrail enough time to fill gaps after planned maintenance, restarts, or brief outages. With very short retention (seconds or minutes), binlogs may be purged before bintrail has a chance to replay them, resulting in permanent data loss.

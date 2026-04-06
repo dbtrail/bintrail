@@ -506,3 +506,65 @@ func TestChannel_permanentErrorStopsReconnect(t *testing.T) {
 		t.Error("Run should have stopped on permanent error, not timed out")
 	}
 }
+
+// TestChannel_maxReconnectAttemptsExhausted verifies that Run returns an
+// error (rather than retrying forever) once MaxReconnectAttempts consecutive
+// transient failures have occurred. This is the core fix for the silent-WS-
+// death failure mode in dbtrail/bintrail#191: when reconnect cannot recover,
+// the agent must exit so a process supervisor can respawn it.
+func TestChannel_maxReconnectAttemptsExhausted(t *testing.T) {
+	var attempts int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		mu.Unlock()
+		// Hijack and immediately close without performing the WebSocket
+		// handshake — the client sees a transient EOF / handshake error,
+		// not a permanent close code, so the reconnect loop applies.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "no hijack", http.StatusInternalServerError)
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	cfg := ChannelConfig{
+		Endpoint:             "ws" + strings.TrimPrefix(srv.URL, "http"),
+		APIKey:               "any",
+		HeartbeatInterval:    time.Hour,
+		MaxReconnectDelay:    10 * time.Millisecond,
+		MaxReconnectAttempts: 3,
+	}
+
+	// Generous outer deadline so a test failure manifests as the wrong
+	// error type instead of a hang. With MaxReconnectDelay=10ms and 3
+	// attempts the loop should give up well under a second.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ch := NewChannel(cfg, &stubHandler{}, nil, nil)
+	err := ch.Run(ctx)
+
+	if err == nil {
+		t.Fatal("expected error from Run after exhausting reconnect attempts")
+	}
+	if err == context.DeadlineExceeded || err == context.Canceled {
+		t.Errorf("Run should have given up on its own, got context error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "reconnect budget exhausted") {
+		t.Errorf("expected error mentioning reconnect budget exhausted, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts < 3 {
+		t.Errorf("expected at least 3 connect attempts, got %d", attempts)
+	}
+}

@@ -71,12 +71,13 @@ var (
 	agtBatchSize    int
 	agtSchemas      string
 	agtTables       string
-	agtStartGTID     string
-	agtS3Bucket      string
-	agtS3Region      string
-	agtS3Prefix      string
-	agtFlushInterval string
-	agtValidate      bool
+	agtStartGTID            string
+	agtS3Bucket             string
+	agtS3Region             string
+	agtS3Prefix             string
+	agtFlushInterval        string
+	agtValidate             bool
+	agtMaxReconnectAttempts int
 )
 
 func init() {
@@ -97,6 +98,7 @@ func init() {
 	agentCmd.Flags().StringVar(&agtS3Prefix, "s3-prefix", "bintrail/", "Key prefix within the S3 bucket")
 	agentCmd.Flags().StringVar(&agtFlushInterval, "flush-interval", "5s", "Max time between metadata/payload flushes (e.g. 5s, 10s)")
 	agentCmd.Flags().BoolVar(&agtValidate, "validate", false, "Run pre-flight checks and exit without starting the agent")
+	agentCmd.Flags().IntVar(&agtMaxReconnectAttempts, "max-reconnect-attempts", 10, "Exit (non-zero) after this many consecutive WebSocket reconnect failures, so a process supervisor (e.g. systemd Restart=on-failure) can respawn the agent. Use 0 for unlimited retries.")
 	_ = agentCmd.MarkFlagRequired("api-key")
 	_ = agentCmd.MarkFlagRequired("endpoint")
 	bindCommandEnv(agentCmd)
@@ -277,10 +279,11 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := agent.ChannelConfig{
-		Endpoint:   agtEndpoint,
-		APIKey:     agtAPIKey,
-		Version:    Version,
-		BintrailID: bintrailID,
+		Endpoint:             agtEndpoint,
+		APIKey:               agtAPIKey,
+		Version:              Version,
+		BintrailID:           bintrailID,
+		MaxReconnectAttempts: agtMaxReconnectAttempts,
 	}
 
 	var statusFn func() *agent.FlushStatus

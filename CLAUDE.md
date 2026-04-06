@@ -56,12 +56,12 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000), `--profile`, `--no-archive` |
 | `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future`, `--archive-dir`, `--archive-compression` (default `zstd`) |
 | `status` | `status.go` | `--index-dsn` (req) |
-| `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint`, `--metrics-addr` |
+| `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint`, `--metrics-addr`, `--reset`, `--no-gap-fill`, `--gap-timeout` (default `30`s) |
 | `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path`, `--mydumper-image`, `--threads`, `--encrypt`, `--encrypt-key` |
 | `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression`, `--row-group-size`, `--upload`, `--upload-region`, `--encrypt`, `--encrypt-key` |
 | `generate-key` | `generate_key.go` | `--output` (default `~/.config/bintrail/dump.key`) |
 | `upload` | `upload.go` | `--source` (req), `--destination` (req), `--region`, `--retry`, `--index-dsn` |
-| `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid`, `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`), `--validate` |
+| `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid`, `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`), `--max-reconnect-attempts` (default `10`), `--validate` |
 | `config init` | `config.go` | `--global` |
 
 Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`).

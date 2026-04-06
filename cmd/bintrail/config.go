@@ -129,6 +129,7 @@ var envSections = []envSection{
 			{"BINTRAIL_SERVER_ID", ""},
 			{"BINTRAIL_BATCH_SIZE", "1000"},
 			{"BINTRAIL_METRICS_ADDR", ""},
+			{"BINTRAIL_STREAM_GAP_TIMEOUT", "30"},
 		},
 	},
 	{
@@ -145,6 +146,7 @@ var envSections = []envSection{
 		Bindings: []envTemplateEntry{
 			{"BINTRAIL_API_KEY", ""},
 			{"BINTRAIL_AGENT_ENDPOINT", "wss://api.dbtrail.io/v1/agent"},
+			{"BINTRAIL_AGENT_MAX_RECONNECT_ATTEMPTS", "10"},
 		},
 	},
 	{

@@ -902,7 +902,7 @@ func TestDetectPositionGap_noGap(t *testing.T) {
 			AddRow("mysql-bin.000002", 524288).
 			AddRow("mysql-bin.000003", 100))
 
-	gap, err := detectPositionGap(db, "mysql-bin.000003", 50)
+	gap, err := detectPositionGap(db, "mysql-bin.000003", 50, 10*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -926,7 +926,7 @@ func TestDetectPositionGap_fillable(t *testing.T) {
 			AddRow("mysql-bin.000002", 524288).
 			AddRow("mysql-bin.000003", 100))
 
-	gap, err := detectPositionGap(db, "mysql-bin.000001", 9999)
+	gap, err := detectPositionGap(db, "mysql-bin.000001", 9999, 10*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -955,7 +955,7 @@ func TestDetectPositionGap_unfillable(t *testing.T) {
 			AddRow("mysql-bin.000050", 1048576).
 			AddRow("mysql-bin.000051", 524288))
 
-	gap, err := detectPositionGap(db, "mysql-bin.000038", 7890)
+	gap, err := detectPositionGap(db, "mysql-bin.000038", 7890, 10*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -993,7 +993,7 @@ func TestDetectPositionGap_extraColumns(t *testing.T) {
 			AddRow("mysql-bin.000010", 1048576, "No").
 			AddRow("mysql-bin.000011", 524288, "No"))
 
-	gap, err := detectPositionGap(db, "mysql-bin.000010", 100)
+	gap, err := detectPositionGap(db, "mysql-bin.000010", 100, 10*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1019,7 +1019,7 @@ func TestDetectGTIDGap_noGap(t *testing.T) {
 	mock.ExpectQuery("SELECT @@gtid_executed").WillReturnRows(
 		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow(gtid))
 
-	gap, err := detectGTIDGap(db, gtid)
+	gap, err := detectGTIDGap(db, gtid, 10*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1042,7 +1042,7 @@ func TestDetectGTIDGap_fillable(t *testing.T) {
 	mock.ExpectQuery("SELECT @@gtid_executed").WillReturnRows(
 		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-200"))
 
-	gap, err := detectGTIDGap(db, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100")
+	gap, err := detectGTIDGap(db, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100", 10*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1069,7 +1069,7 @@ func TestDetectGTIDGap_unfillable(t *testing.T) {
 	mock.ExpectQuery("SELECT @@gtid_executed").WillReturnRows(
 		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow(uuid + ":1-1000"))
 
-	gap, err := detectGTIDGap(db, uuid+":1-100")
+	gap, err := detectGTIDGap(db, uuid+":1-100", 10*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1104,7 +1104,7 @@ func TestDetectGTIDGap_fillableWithPurged(t *testing.T) {
 		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow(uuid + ":1-1000"))
 
 	// Checkpoint at :1-200 — well past the purged range of :1-50.
-	gap, err := detectGTIDGap(db, uuid+":1-200")
+	gap, err := detectGTIDGap(db, uuid+":1-200", 10*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1133,7 +1133,7 @@ func TestDetectGTIDGap_unfillableMissingUUID(t *testing.T) {
 		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow(uuidA + ":1-500," + uuidB + ":1-300"))
 
 	// Checkpoint only knows about uuidA (past its purged range), not uuidB at all.
-	gap, err := detectGTIDGap(db, uuidA+":1-100")
+	gap, err := detectGTIDGap(db, uuidA+":1-100", 10*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1164,7 +1164,7 @@ func TestDetectGTIDGap_noGapStructuralComparison(t *testing.T) {
 	mock.ExpectQuery("SELECT @@gtid_executed").WillReturnRows(
 		sqlmock.NewRows([]string{"@@gtid_executed"}).AddRow(executed))
 
-	gap, err := detectGTIDGap(db, checkpoint)
+	gap, err := detectGTIDGap(db, checkpoint, 10*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
