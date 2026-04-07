@@ -353,7 +353,7 @@ func splitBatch(batch []parser.Event, serverID string) ([]byos.MetadataRecord, [
 	var meta []byos.MetadataRecord
 	var payload []byos.PayloadRecord
 	for i := range batch {
-		m, p, err := byos.SplitEvent(batch[i], serverID)
+		m, p, err := byos.SplitEvent(batch[i], serverID, byos.SourceIdentity{})
 		if err != nil {
 			continue
 		}

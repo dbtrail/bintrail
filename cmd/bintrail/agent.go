@@ -169,6 +169,21 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		handler.SourceDB = db
 	}
 
+	// Capture source server identity (architecture §22.11) for BYOS metadata
+	// records. Independent of indexDB so it works in fully stateless BYOS.
+	// Hard-fail on capture failure: silently emitting events with empty
+	// server_uuid would degrade dbtrail's identity resolution to the legacy
+	// NULL-bintrail_id path for the entire agent lifetime, with no operator
+	// signal until queries return wrong results.
+	var sourceIdent byos.SourceIdentity
+	if sourceDB != nil {
+		ident, err := loadSourceIdentity(cmd.Context(), sourceDB, agtSourceDSN)
+		if err != nil {
+			return fmt.Errorf("capture source identity for BYOS metadata: %w", err)
+		}
+		sourceIdent = ident
+	}
+
 	// Resolve bintrail_id — the stable server identifier used for metadata
 	// records and WebSocket heartbeats. Requires both source and index DBs.
 	var bintrailID string
@@ -261,6 +276,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 				metaClient:    metaClient,
 				payloadWriter: payloadWriter,
 				serverID:      serverIDStr,
+				sourceIdent:   sourceIdent,
 				flushInterval: flushInterval,
 				state:         flushState,
 			})
@@ -357,6 +373,7 @@ type byosFlushConfig struct {
 	metaClient    *byos.MetadataClient
 	payloadWriter *byos.PayloadWriter
 	serverID      string
+	sourceIdent   byos.SourceIdentity
 	flushInterval time.Duration
 	state         *flushPipelineState
 }
@@ -590,7 +607,7 @@ func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig
 	var payloadBatch []byos.PayloadRecord
 
 	for i := range batch {
-		meta, payload, err := byos.SplitEvent(batch[i], fc.serverID)
+		meta, payload, err := byos.SplitEvent(batch[i], fc.serverID, fc.sourceIdent)
 		if err != nil {
 			slog.Warn("BYOS split failed, skipping event",
 				"error", err,

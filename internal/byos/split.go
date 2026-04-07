@@ -23,9 +23,26 @@ import (
 	"github.com/dbtrail/bintrail/internal/parser"
 )
 
+// SourceIdentity describes the source MySQL server that produced an event.
+// It is captured once at agent startup and stamped onto every MetadataRecord
+// so the dbtrail SaaS side can resolve a stable bintrail_id against its own
+// local bintrail_servers table — closing the identity-model asymmetry between
+// hosted and BYOS modes.  See bintrail-saas-architecture.md §22.11.
+type SourceIdentity struct {
+	ServerUUID string // @@server_uuid from the source DB
+	Host       string // host from --source-dsn
+	Port       int    // port from --source-dsn
+	User       string // user from --source-dsn
+}
+
 // MetadataRecord contains only indexing metadata — no row-level data.
 // It is sent to the dbtrail API so the hosted index can locate events
 // without ever seeing the actual row contents.
+//
+// The ServerUUID/SourceHost/SourcePort/SourceUser fields are populated from
+// SourceIdentity at SplitEvent time and let the SaaS-side ingest handler
+// resolve a stable bintrail_id (architecture §22.11). They are optional on
+// the wire so older bintrail clients remain compatible.
 type MetadataRecord struct {
 	PKHash         string    `json:"pk_hash"`
 	SchemaName     string    `json:"schema_name"`
@@ -37,6 +54,14 @@ type MetadataRecord struct {
 	ConnectionID   uint32    `json:"connection_id,omitempty"` // MySQL pseudo_thread_id; 0 = unknown
 	RowCount       int       `json:"row_count"`
 	ChangedColumns []string  `json:"changed_columns"` // nil for INSERT/DELETE
+
+	// Source identity (architecture §22.11). All four are optional; older
+	// bintrail clients omit them entirely and the SaaS side falls back to
+	// the legacy NULL-bintrail_id behavior.
+	ServerUUID string `json:"server_uuid,omitempty"`
+	SourceHost string `json:"source_host,omitempty"`
+	SourcePort int    `json:"source_port,omitempty"`
+	SourceUser string `json:"source_user,omitempty"`
 }
 
 // PayloadRecord contains full row data that stays in the customer's
@@ -63,11 +88,15 @@ func PKHash(pkValues string) string {
 
 // SplitEvent splits a parsed binlog event into a metadata record (for the
 // dbtrail API) and a payload record (for the customer's storage backend).
-// serverID identifies the source MySQL server.
+// serverID identifies the source MySQL server. ident carries the source
+// server's @@server_uuid + DSN host/port/user so the SaaS-side ingest can
+// resolve a stable bintrail_id (architecture §22.11). A zero-value ident is
+// permitted (older callers / tests) and produces a record without source
+// identity fields.
 //
 // Returns an error for unsupported event types (DDL, GTID). Callers should
 // filter these before calling SplitEvent.
-func SplitEvent(ev parser.Event, serverID string) (MetadataRecord, PayloadRecord, error) {
+func SplitEvent(ev parser.Event, serverID string, ident SourceIdentity) (MetadataRecord, PayloadRecord, error) {
 	typeName, err := eventTypeName(ev.EventType)
 	if err != nil {
 		return MetadataRecord{}, PayloadRecord{}, err
@@ -87,6 +116,10 @@ func SplitEvent(ev parser.Event, serverID string) (MetadataRecord, PayloadRecord
 		ConnectionID:   ev.ConnectionID,
 		RowCount:       1,
 		ChangedColumns: changed,
+		ServerUUID:     ident.ServerUUID,
+		SourceHost:     ident.Host,
+		SourcePort:     ident.Port,
+		SourceUser:     ident.User,
 	}
 
 	payload := PayloadRecord{
