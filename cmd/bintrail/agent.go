@@ -205,12 +205,22 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			slog.Info("server identity resolved", "bintrail_id", bintrailID)
 		}
 	} else if byosMode {
-		if agtS3Bucket != "" {
-			return fmt.Errorf("--index-dsn is required for BYOS with S3: cannot resolve stable bintrail_id for S3 partitioning without it")
-		}
-		slog.Warn("no --index-dsn provided; using numeric server-id for BYOS metadata",
-			"server_id", fmt.Sprint(agtServerID),
-			"hint", "pass --index-dsn to enable stable bintrail_id resolution")
+		// BYOS without --index-dsn: the SaaS now resolves a stable
+		// bintrail_id server-side from the @@server_uuid + host/port/user
+		// fields that loadSourceIdentity captured at line 180 and that
+		// SplitEvent stamps on every metadata record (architecture §22.11,
+		// implemented in nethalo/dbtrail#1179). The customer agent no
+		// longer needs a local index DB — the SaaS bt_<prefix>.bintrail_servers
+		// table is the canonical identity record for both hosted and BYOS.
+		//
+		// The local bintrailID stays empty in this path; the fallback at
+		// line 218 (cmp.Or(bintrailID, fmt.Sprint(agtServerID))) uses the
+		// stable --server-id for the S3 partition key and WebSocket
+		// heartbeat connection label. These are customer-local identifiers,
+		// intentionally decoupled from the SaaS-resolved bintrail_id.
+		slog.Info("BYOS without --index-dsn; SaaS will resolve bintrail_id via source identity propagation",
+			"server_uuid", sourceIdent.ServerUUID,
+			"local_server_id", fmt.Sprint(agtServerID))
 	}
 
 	// BYOS streaming: start buffer + streaming goroutine.

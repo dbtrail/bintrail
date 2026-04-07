@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- BYOS agent no longer requires `--index-dsn` when `--s3-bucket` is configured. The requirement was added in 0.4.1 to guarantee stable S3 partition keys via a locally-persisted `bintrail_id`, but it forced customers to provision a dedicated MySQL (a footgun the customer-facing setup docs never mentioned). With the source identity propagation shipped in 0.4.4 (#195), the dbtrail SaaS side now resolves a stable `bintrail_id` server-side from the `@@server_uuid` + host/port/user fields carried on every metadata record (architecture §22.11, nethalo/dbtrail#1179). The local customer agent falls back to `--server-id` for the S3 partition key and WebSocket heartbeat label, which are customer-local identifiers intentionally decoupled from the SaaS-resolved `bintrail_id`.
+
 ## [0.4.4] - 2026-04-07
 
 ### Added
