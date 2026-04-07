@@ -207,17 +207,21 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	} else if byosMode {
 		// BYOS without --index-dsn: the SaaS now resolves a stable
 		// bintrail_id server-side from the @@server_uuid + host/port/user
-		// fields that loadSourceIdentity captured at line 180 and that
-		// SplitEvent stamps on every metadata record (architecture §22.11,
+		// fields that `loadSourceIdentity` captured above and that
+		// `SplitEvent` stamps on every metadata record (architecture §22.11,
 		// implemented in nethalo/dbtrail#1179). The customer agent no
 		// longer needs a local index DB — the SaaS bt_<prefix>.bintrail_servers
 		// table is the canonical identity record for both hosted and BYOS.
 		//
-		// The local bintrailID stays empty in this path; the fallback at
-		// line 218 (cmp.Or(bintrailID, fmt.Sprint(agtServerID))) uses the
-		// stable --server-id for the S3 partition key and WebSocket
-		// heartbeat connection label. These are customer-local identifiers,
-		// intentionally decoupled from the SaaS-resolved bintrail_id.
+		// The local bintrailID stays empty in this path. Downstream call
+		// sites that previously consumed it (the S3 partition key at
+		// `NewPayloadWriter`, the WebSocket heartbeat label at
+		// `ChannelConfig.BintrailID`) now fall back to the numeric
+		// --server-id via `cmp.Or(bintrailID, fmt.Sprint(agtServerID))`.
+		// These are customer-local identifiers, intentionally decoupled
+		// from the SaaS-resolved bintrail_id: the SaaS correlates the
+		// connection by API key + the source identity on metadata
+		// records, not by the heartbeat label.
 		slog.Info("BYOS without --index-dsn; SaaS will resolve bintrail_id via source identity propagation",
 			"server_uuid", sourceIdent.ServerUUID,
 			"local_server_id", fmt.Sprint(agtServerID))
@@ -312,10 +316,15 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := agent.ChannelConfig{
-		Endpoint:             agtEndpoint,
-		APIKey:               agtAPIKey,
-		Version:              Version,
-		BintrailID:           bintrailID,
+		Endpoint: agtEndpoint,
+		APIKey:   agtAPIKey,
+		Version:  Version,
+		// Heartbeat label — fall back to the numeric --server-id when
+		// bintrailID is empty (BYOS without --index-dsn path, see above).
+		// The SaaS keys connections by APIKey, not by this field, so an
+		// empty string would technically work but degrades dashboard
+		// display. cmp.Or keeps the label stable and operator-recognizable.
+		BintrailID:           cmp.Or(bintrailID, fmt.Sprint(agtServerID)),
 		MaxReconnectAttempts: agtMaxReconnectAttempts,
 	}
 
