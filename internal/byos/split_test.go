@@ -50,7 +50,8 @@ func TestSplitEventInsert(t *testing.T) {
 		SchemaVersion: 5,
 	}
 
-	meta, payload, err := SplitEvent(ev, "server-1")
+	ident := SourceIdentity{ServerUUID: "uuid-1", Host: "10.0.0.5", Port: 3306, User: "repl"}
+	meta, payload, err := SplitEvent(ev, "server-1", ident)
 	if err != nil {
 		t.Fatalf("SplitEvent: %v", err)
 	}
@@ -85,6 +86,20 @@ func TestSplitEventInsert(t *testing.T) {
 		t.Errorf("meta.ChangedColumns = %v, want nil for INSERT", meta.ChangedColumns)
 	}
 
+	// Source identity propagation (architecture §22.11).
+	if meta.ServerUUID != "uuid-1" {
+		t.Errorf("meta.ServerUUID = %q, want %q", meta.ServerUUID, "uuid-1")
+	}
+	if meta.SourceHost != "10.0.0.5" {
+		t.Errorf("meta.SourceHost = %q, want %q", meta.SourceHost, "10.0.0.5")
+	}
+	if meta.SourcePort != 3306 {
+		t.Errorf("meta.SourcePort = %d, want 3306", meta.SourcePort)
+	}
+	if meta.SourceUser != "repl" {
+		t.Errorf("meta.SourceUser = %q, want %q", meta.SourceUser, "repl")
+	}
+
 	// Payload checks — must contain row data.
 	if payload.PKHash != wantHash {
 		t.Errorf("payload.PKHash = %q, want %q", payload.PKHash, wantHash)
@@ -116,7 +131,7 @@ func TestSplitEventDelete(t *testing.T) {
 		RowBefore: map[string]any{"id": 42, "name": "Alice"},
 	}
 
-	meta, payload, err := SplitEvent(ev, "srv")
+	meta, payload, err := SplitEvent(ev, "srv", SourceIdentity{})
 	if err != nil {
 		t.Fatalf("SplitEvent: %v", err)
 	}
@@ -146,7 +161,7 @@ func TestSplitEventUpdate(t *testing.T) {
 		RowAfter:  map[string]any{"id": 42, "name": "Alice", "email": "a@new.com"},
 	}
 
-	meta, payload, err := SplitEvent(ev, "srv")
+	meta, payload, err := SplitEvent(ev, "srv", SourceIdentity{})
 	if err != nil {
 		t.Fatalf("SplitEvent: %v", err)
 	}
@@ -180,7 +195,7 @@ func TestSplitEventUpdateMultipleChanges(t *testing.T) {
 		RowAfter:  map[string]any{"id": 42, "email": "a@new.com", "updated_at": "2026-03-31"},
 	}
 
-	meta, _, err := SplitEvent(ev, "srv")
+	meta, _, err := SplitEvent(ev, "srv", SourceIdentity{})
 	if err != nil {
 		t.Fatalf("SplitEvent: %v", err)
 	}
@@ -198,7 +213,7 @@ func TestSplitEventUnsupportedType(t *testing.T) {
 	ev := parser.Event{
 		EventType: parser.EventDDL,
 	}
-	_, _, err := SplitEvent(ev, "srv")
+	_, _, err := SplitEvent(ev, "srv", SourceIdentity{})
 	if err == nil {
 		t.Fatal("expected error for DDL event type")
 	}
@@ -217,7 +232,7 @@ func TestSplitEventMapIsolation(t *testing.T) {
 		RowAfter:  after,
 	}
 
-	_, payload, err := SplitEvent(ev, "srv")
+	_, payload, err := SplitEvent(ev, "srv", SourceIdentity{})
 	if err != nil {
 		t.Fatalf("SplitEvent: %v", err)
 	}

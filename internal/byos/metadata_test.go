@@ -44,6 +44,10 @@ func TestMetadataClientSend(t *testing.T) {
 			ServerID:       "srv-1",
 			GTID:           "aaa:1",
 			RowCount:       1,
+			ServerUUID:     "11111111-1111-1111-1111-111111111111",
+			SourceHost:     "10.0.0.5",
+			SourcePort:     3306,
+			SourceUser:     "repl",
 		},
 		{
 			PKHash:         "def456",
@@ -83,6 +87,21 @@ func TestMetadataClientSend(t *testing.T) {
 	}
 	if len(decoded[1].ChangedColumns) != 2 {
 		t.Errorf("second record changed_columns = %v, want [status updated_at]", decoded[1].ChangedColumns)
+	}
+
+	// Source identity fields (architecture §22.11) must round-trip on the
+	// wire. Older clients that omit them serialize as empty thanks to
+	// `omitempty`.
+	if decoded[0].ServerUUID != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("first record server_uuid = %q, want set", decoded[0].ServerUUID)
+	}
+	if decoded[0].SourceHost != "10.0.0.5" || decoded[0].SourcePort != 3306 || decoded[0].SourceUser != "repl" {
+		t.Errorf("first record source identity = %q:%d/%s, want 10.0.0.5:3306/repl",
+			decoded[0].SourceHost, decoded[0].SourcePort, decoded[0].SourceUser)
+	}
+	if decoded[1].ServerUUID != "" || decoded[1].SourceHost != "" {
+		t.Errorf("second record should have empty source identity (omitempty), got uuid=%q host=%q",
+			decoded[1].ServerUUID, decoded[1].SourceHost)
 	}
 }
 
