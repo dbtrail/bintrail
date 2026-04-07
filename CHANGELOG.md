@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-04-07
+
+### Added
+- BYOS agent now propagates source server identity (`server_uuid`, `source_host`, `source_port`, `source_user`) on every metadata record sent to dbtrail — lets the SaaS side register the source server and resolve a stable `bintrail_id`, closing the identity-model gap between hosted and BYOS modes (#195)
+
+### Changed
+- BYOS agent fails loud at startup if source identity capture (`@@server_uuid` query or `--source-dsn` parse) fails, instead of silently emitting metadata with an empty `server_uuid` for the process lifetime (#195)
+
 ## [0.4.3] - 2026-04-06
 
 ### Added
