@@ -171,14 +171,17 @@ func runAgent(cmd *cobra.Command, args []string) error {
 
 	// Capture source server identity (architecture §22.11) for BYOS metadata
 	// records. Independent of indexDB so it works in fully stateless BYOS.
+	// Hard-fail on capture failure: silently emitting events with empty
+	// server_uuid would degrade dbtrail's identity resolution to the legacy
+	// NULL-bintrail_id path for the entire agent lifetime, with no operator
+	// signal until queries return wrong results.
 	var sourceIdent byos.SourceIdentity
 	if sourceDB != nil {
 		ident, err := loadSourceIdentity(cmd.Context(), sourceDB, agtSourceDSN)
 		if err != nil {
-			slog.Warn("failed to capture source identity for BYOS metadata", "error", err)
-		} else {
-			sourceIdent = ident
+			return fmt.Errorf("capture source identity for BYOS metadata: %w", err)
 		}
+		sourceIdent = ident
 	}
 
 	// Resolve bintrail_id — the stable server identifier used for metadata

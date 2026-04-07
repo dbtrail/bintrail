@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -102,6 +103,21 @@ func TestMetadataClientSend(t *testing.T) {
 	if decoded[1].ServerUUID != "" || decoded[1].SourceHost != "" {
 		t.Errorf("second record should have empty source identity (omitempty), got uuid=%q host=%q",
 			decoded[1].ServerUUID, decoded[1].SourceHost)
+	}
+
+	// Raw-bytes assertion: omitempty must keep the second record's source
+	// identity fields out of the wire payload entirely (not just empty).
+	// Catches a regression where someone removes `omitempty` and silently
+	// bloats every BYOS metadata batch.
+	bodyStr := string(receivedBody)
+	if !strings.Contains(bodyStr, `"server_uuid":"11111111-1111-1111-1111-111111111111"`) {
+		t.Errorf("first record should serialize server_uuid; body = %s", bodyStr)
+	}
+	if strings.Count(bodyStr, `"server_uuid"`) != 1 {
+		t.Errorf("server_uuid should appear exactly once (omitempty on record 2); body = %s", bodyStr)
+	}
+	if strings.Count(bodyStr, `"source_host"`) != 1 {
+		t.Errorf("source_host should appear exactly once (omitempty on record 2); body = %s", bodyStr)
 	}
 }
 
