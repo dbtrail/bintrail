@@ -156,6 +156,19 @@ The index stores complete before and after row images for every event, so recove
 | [Docker](docs/docker.md) | Container images and Docker Compose |
 | [Parquet Debugging](docs/parquet-debugging.md) | Inspecting and troubleshooting Parquet archives |
 
+## Agent exit codes
+
+`bintrail agent` uses distinct process exit codes so a supervisor (e.g. systemd) can distinguish permanent failures from transient ones:
+
+| Code | Meaning | Supervisor action |
+|---|---|---|
+| 0 | Clean shutdown (SIGTERM/SIGINT) | — |
+| 64 | Fatal auth/config error (missing, invalid, or revoked API key; wrong tenant mode) | Fix credentials, restart manually |
+| 65 | Rate-limited by the server | Contact support before restarting |
+| 1 | Transient/unknown error | Safe to respawn (default systemd behavior) |
+
+For systemd, add `RestartPreventExitStatus=64 65` to the service unit so the agent is not respawned on permanent failures.
+
 ## License
 
 This project is licensed under the [Business Source License 1.1](LICENSE). You may use bintrail for any purpose, including production use, except offering it as part of a competing commercial hosted service or managed consulting service. Each version converts to Apache License 2.0 four years after its release.

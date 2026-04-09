@@ -475,6 +475,151 @@ func TestIsTemporary(t *testing.T) {
 	}
 }
 
+func TestClassifyClose(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want FatalReason
+	}{
+		{
+			name: "plain network error is not fatal",
+			err:  fmt.Errorf("connection refused"),
+			want: NotFatal,
+		},
+		{
+			name: "internal server error is not fatal",
+			err:  websocket.CloseError{Code: websocket.StatusInternalError, Reason: "internal"},
+			want: NotFatal,
+		},
+		{
+			name: "normal closure is not fatal",
+			err:  websocket.CloseError{Code: websocket.StatusNormalClosure, Reason: "bye"},
+			want: NotFatal,
+		},
+		{
+			name: "1008 missing_credentials short form",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "missing_credentials"},
+			want: FatalMissingCredentials,
+		},
+		{
+			name: "1008 Missing credentials legacy form",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "Missing credentials"},
+			want: FatalMissingCredentials,
+		},
+		{
+			name: "1008 invalid_key short form",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "invalid_key"},
+			want: FatalInvalidKey,
+		},
+		{
+			name: "1008 Invalid API key legacy form",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "Invalid API key"},
+			want: FatalInvalidKey,
+		},
+		{
+			name: "1008 wrong_tenant_mode short form",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "wrong_tenant_mode"},
+			want: FatalWrongTenantMode,
+		},
+		{
+			name: "1008 wrong tenant mode legacy form",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "WebSocket command channel is only available for BYOS tenants"},
+			want: FatalWrongTenantMode,
+		},
+		{
+			name: "1008 rate_limited short form",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "rate_limited"},
+			want: FatalRateLimited,
+		},
+		{
+			name: "1008 Too many attempts legacy form",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "Too many attempts"},
+			want: FatalRateLimited,
+		},
+		{
+			name: "1008 unknown reason is not classified as fatal (backend drift is transient)",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "something new"},
+			want: NotFatal,
+		},
+		{
+			name: "1008 empty reason is not fatal",
+			err:  websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: ""},
+			want: NotFatal,
+		},
+		{
+			name: "4401 future contract invalid_key",
+			err:  websocket.CloseError{Code: 4401, Reason: "invalid_key"},
+			want: FatalInvalidKey,
+		},
+		{
+			name: "4429 future contract rate_limited",
+			err:  websocket.CloseError{Code: 4429, Reason: "rate_limited"},
+			want: FatalRateLimited,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ClassifyClose(tt.err); got != tt.want {
+				t.Errorf("ClassifyClose(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFatalCloseError_ErrorAndUnwrap(t *testing.T) {
+	inner := fmt.Errorf("underlying close")
+	fce := &FatalCloseError{Reason: FatalInvalidKey, Err: inner}
+	if !errors.Is(fce, inner) {
+		t.Errorf("errors.Is(fce, inner) = false, want true")
+	}
+	if !strings.Contains(fce.Error(), "invalid_key") {
+		t.Errorf("Error() = %q, want it to contain reason name", fce.Error())
+	}
+	if !strings.Contains(fce.Error(), "underlying close") {
+		t.Errorf("Error() = %q, want it to contain wrapped error", fce.Error())
+	}
+	// Nil-inner branch.
+	bare := &FatalCloseError{Reason: FatalRateLimited}
+	if got := bare.Error(); !strings.Contains(got, "rate_limited") {
+		t.Errorf("Error() = %q, want it to contain reason name", got)
+	}
+}
+
+// TestChannel_permanentErrorWrapsFatalCloseError verifies that Run surfaces
+// a *FatalCloseError on permanent rejections so the agent command can map
+// it to a distinct process exit code (issue #201).
+func TestChannel_permanentErrorWrapsFatalCloseError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.Close(websocket.StatusPolicyViolation, "invalid_key")
+	}))
+	defer srv.Close()
+
+	cfg := ChannelConfig{
+		Endpoint:          "ws" + strings.TrimPrefix(srv.URL, "http"),
+		APIKey:            "bad-key",
+		HeartbeatInterval: time.Hour,
+		MaxReconnectDelay: 50 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ch := NewChannel(cfg, &stubHandler{}, nil, nil)
+	err := ch.Run(ctx)
+
+	var fce *FatalCloseError
+	if !errors.As(err, &fce) {
+		t.Fatalf("expected *FatalCloseError, got %T: %v", err, err)
+	}
+	if fce.Reason != FatalInvalidKey {
+		t.Errorf("Reason = %v, want FatalInvalidKey", fce.Reason)
+	}
+}
+
 func TestChannel_permanentErrorStopsReconnect(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)

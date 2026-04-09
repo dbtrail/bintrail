@@ -347,6 +347,11 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		"duration", time.Since(start).Truncate(time.Second).String(),
 		"error", err)
 
+	// Return the error — if it's a *agent.FatalCloseError, main() will
+	// map it to a distinct process exit code (64/65) AFTER all deferred
+	// cleanup in this function runs (buffer flush, S3 writers, source
+	// DB close, etc.). Calling os.Exit here would skip those defers.
+	// See issue #201.
 	return err
 }
 
