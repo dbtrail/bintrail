@@ -31,15 +31,17 @@ var rotateCmd = &cobra.Command{
 
 Old partitions are dropped based on the --retain threshold. For every partition
 dropped, one new hourly partition is automatically added for the future so that
-the total partition count stays constant. Use --add-future to add extra partitions
-on top of the automatic replacements. Use --no-replace to suppress auto-replacement
-and only add the explicit --add-future count (useful when storage is limited).
+the total partition count stays constant. Use --add-future N to maintain a
+declarative headroom of at least N future hourly partitions beyond the current
+hour (top-up only; already-sufficient headroom is left alone). Use --no-replace
+to suppress auto-replacement and only top up toward the --add-future target
+(useful when storage is limited).
 
 Examples:
   # Drop partitions older than 7 days (auto-adds 168 future hourly partitions)
   bintrail rotate --index-dsn "..." --retain 7d
 
-  # Drop old partitions and add 3 extra future ones beyond the replacements
+  # Drop old partitions and maintain at least 3 future partitions of headroom
   bintrail rotate --index-dsn "..." --retain 7d --add-future 3
 
   # Only add new future partitions (no drops)
@@ -75,8 +77,8 @@ var (
 func init() {
 	rotateCmd.Flags().StringVar(&rotIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	rotateCmd.Flags().StringVar(&rotRetain, "retain", "", "Drop partitions older than this duration (e.g. 7d, 24h)")
-	rotateCmd.Flags().IntVar(&rotAddFuture, "add-future", 0, "Extra hourly partitions to add beyond auto-replacements (0 = only add replacements for dropped partitions)")
-	rotateCmd.Flags().BoolVar(&rotNoReplace, "no-replace", false, "Do not auto-add future partitions to replace dropped ones")
+	rotateCmd.Flags().IntVar(&rotAddFuture, "add-future", 0, "Maintain at least N future hourly partitions beyond the current hour (declarative target; top-up only)")
+	rotateCmd.Flags().BoolVar(&rotNoReplace, "no-replace", false, "Do not auto-add future partitions to replace dropped ones (only top up toward --add-future)")
 	rotateCmd.Flags().StringVar(&rotArchiveDir, "archive-dir", "", "Directory to write Parquet archives before dropping partitions (required with --bintrail-id)")
 	rotateCmd.Flags().StringVar(&rotArchiveCompression, "archive-compression", "zstd", "Compression for archive Parquet files (zstd, snappy, gzip, none)")
 	rotateCmd.Flags().StringVar(&rotBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir is set); archives are written under bintrail_id=<uuid>/event_date=<date>/")
@@ -370,13 +372,13 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 	}
 
 	// ── Add new future partitions ─────────────────────────────────────────────
-	// Auto-replace every dropped partition with a new future hourly partition,
-	// plus any extras requested via --add-future.
-	// --no-replace suppresses the auto-replacement; only --add-future count is used.
-	toAdd := rotAddFuture
-	if !rotNoReplace {
-		toAdd += droppedCount
-	}
+	// --add-future N is declarative: maintain at least N future hourly
+	// partitions beyond the current hour. Top up only if headroom is below
+	// target; never shrink. Unless --no-replace, also add one replacement
+	// for each partition dropped this cycle.
+	nowHour := time.Now().UTC().Truncate(time.Hour)
+	futureCount := countFuturePartitions(partitions, nowHour)
+	toAdd := computeToAdd(rotAddFuture, futureCount, droppedCount, rotNoReplace)
 	if toAdd > 0 {
 		startDate := nextPartitionStart(partitions)
 		if err := addFuturePartitions(ctx, db, dbName, startDate, toAdd); err != nil {
@@ -515,6 +517,42 @@ func partitionHasData(ctx context.Context, db *sql.DB, dbName string) (bool, err
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// computeToAdd returns how many new future partitions to add in a rotation
+// cycle given the declarative --add-future target, the current future-headroom
+// count, the number of partitions dropped this cycle, and --no-replace.
+//
+// Semantics:
+//   - Top up toward `target` if `futureCount < target`; never shrink.
+//   - Unless `noReplace`, add one replacement per dropped partition on top of
+//     the top-up so a drop-and-add rotation keeps total count flat.
+func computeToAdd(target, futureCount, dropped int, noReplace bool) int {
+	toAdd := 0
+	if target > futureCount {
+		toAdd = target - futureCount
+	}
+	if !noReplace {
+		toAdd += dropped
+	}
+	return toAdd
+}
+
+// countFuturePartitions returns how many named hourly partitions start
+// strictly after the given reference hour. p_future and unrecognised names
+// are ignored.
+func countFuturePartitions(partitions []partitionInfo, ref time.Time) int {
+	n := 0
+	for _, p := range partitions {
+		d, ok := partitionDate(p.Name)
+		if !ok {
+			continue
+		}
+		if d.After(ref) {
+			n++
+		}
+	}
+	return n
 }
 
 // nextPartitionStart returns the hour for the first new partition to add.

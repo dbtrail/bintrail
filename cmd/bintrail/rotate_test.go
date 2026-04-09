@@ -224,34 +224,159 @@ func TestPartitionSpec_shape(t *testing.T) {
 	}
 }
 
-// ─── autoAdd calculation ────────────────────────────────────────────────────
+// ─── countFuturePartitions ───────────────────────────────────────────────────
 
-// TestAutoAddReplacesDropped verifies the toAdd formula for both default and
-// --no-replace modes.
-func TestAutoAddReplacesDropped(t *testing.T) {
+func TestCountFuturePartitions(t *testing.T) {
+	ref := time.Date(2026, 2, 19, 12, 0, 0, 0, time.UTC)
+	partitions := []partitionInfo{
+		{Name: "p_2026021910"}, // past
+		{Name: "p_2026021911"}, // past
+		{Name: "p_2026021912"}, // equal to ref → not strictly after
+		{Name: "p_2026021913"}, // future
+		{Name: "p_2026021914"}, // future
+		{Name: "p_future", Description: "MAXVALUE"},
+		{Name: "garbage"},
+	}
+	if got := countFuturePartitions(partitions, ref); got != 2 {
+		t.Errorf("expected 2 future partitions, got %d", got)
+	}
+	if got := countFuturePartitions(nil, ref); got != 0 {
+		t.Errorf("expected 0 for nil slice, got %d", got)
+	}
+}
+
+// ─── autoAdd calculation (declarative --add-future) ─────────────────────────
+
+// TestAutoAddDeclarative verifies the new declarative toAdd formula: --add-future
+// is a target headroom (top-up only), plus auto-replacements for drops.
+func TestAutoAddDeclarative(t *testing.T) {
 	cases := []struct {
-		dropped   int
-		addFuture int
-		noReplace bool
-		wantTotal int
+		name        string
+		addFuture   int
+		futureCount int
+		dropped     int
+		noReplace   bool
+		wantToAdd   int
 	}{
-		{dropped: 0, addFuture: 0, noReplace: false, wantTotal: 0},
-		{dropped: 3, addFuture: 0, noReplace: false, wantTotal: 3},   // pure retention: 3 dropped → 3 added
-		{dropped: 0, addFuture: 5, noReplace: false, wantTotal: 5},   // only --add-future
-		{dropped: 4, addFuture: 2, noReplace: false, wantTotal: 6},   // dropped + extra
-		{dropped: 168, addFuture: 0, noReplace: false, wantTotal: 168}, // 7-day rotation
-		{dropped: 3, addFuture: 0, noReplace: true, wantTotal: 0},    // --no-replace: pure drop, nothing added
-		{dropped: 3, addFuture: 2, noReplace: true, wantTotal: 2},    // --no-replace + --add-future: only explicit extras
+		{"steady state", 1, 1, 0, false, 0},
+		{"cold start", 3, 0, 0, false, 3},
+		{"drops with replace", 1, 1, 1, false, 1},          // 0 top-up + 1 replacement
+		{"drops no replace", 1, 1, 1, true, 0},             // 0 top-up, no replacement
+		{"over target never shrinks", 1, 5, 0, false, 0},   // futureCount > target
+		{"under target top-up", 3, 1, 0, false, 2},
+		{"under target plus drops", 3, 1, 2, false, 4},     // 2 top-up + 2 replacements
+		{"no-replace ignores drops", 3, 1, 2, true, 2},     // 2 top-up only
+		{"no flags", 0, 0, 0, false, 0},
+		{"no-replace over target ignores drops", 1, 5, 3, true, 0},
 	}
 	for _, c := range cases {
-		toAdd := c.addFuture
-		if !c.noReplace {
-			toAdd += c.dropped
+		toAdd := computeToAdd(c.addFuture, c.futureCount, c.dropped, c.noReplace)
+		if toAdd != c.wantToAdd {
+			t.Errorf("%s: expected toAdd=%d, got %d", c.name, c.wantToAdd, toAdd)
 		}
-		if toAdd != c.wantTotal {
-			t.Errorf("dropped=%d addFuture=%d noReplace=%v: expected toAdd=%d, got %d",
-				c.dropped, c.addFuture, c.noReplace, c.wantTotal, toAdd)
+	}
+}
+
+// TestAutoAddDeclarative_48CycleSimulation replays the daemon rotation loop
+// for 48 cycles to confirm the declarative formula keeps the partition count
+// stable and does not leak (regression test for issue #199).
+func TestAutoAddDeclarative_48CycleSimulation(t *testing.T) {
+	// Start: 12h retention window already populated + 1 future partition,
+	// plus p_future catch-all. Total: 13 named + 1 MAXVALUE = 14.
+	now := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	parts := []partitionInfo{}
+	for i := -11; i <= 1; i++ { // 12 past/current hours + 1 future
+		parts = append(parts, partitionInfo{Name: partitionName(now.Add(time.Duration(i) * time.Hour))})
+	}
+	parts = append(parts, partitionInfo{Name: "p_future", Description: "MAXVALUE"})
+
+	retainDur := 12 * time.Hour
+	addFuture := 1
+
+	for cycle := 0; cycle < 48; cycle++ {
+		cycleNow := now.Add(time.Duration(cycle) * time.Hour)
+		cutoff := cycleNow.Add(-retainDur)
+
+		// Drop expired.
+		dropped := 0
+		kept := parts[:0]
+		for _, p := range parts {
+			d, ok := partitionDate(p.Name)
+			if ok && d.Before(cutoff) {
+				dropped++
+				continue
+			}
+			kept = append(kept, p)
 		}
+		parts = kept
+
+		// Compute toAdd with the production helper.
+		nowHour := cycleNow.Truncate(time.Hour)
+		futureCount := countFuturePartitions(parts, nowHour)
+		toAdd := computeToAdd(addFuture, futureCount, dropped, false)
+
+		// Append new future partitions after the latest existing named one.
+		startDate := nextPartitionStart(parts)
+		// Strip p_future, re-append later.
+		withoutFuture := parts[:0]
+		for _, p := range parts {
+			if p.Name != "p_future" {
+				withoutFuture = append(withoutFuture, p)
+			}
+		}
+		parts = withoutFuture
+		for i := 0; i < toAdd; i++ {
+			parts = append(parts, partitionInfo{Name: partitionName(startDate.Add(time.Duration(i) * time.Hour))})
+		}
+		parts = append(parts, partitionInfo{Name: "p_future", Description: "MAXVALUE"})
+	}
+
+	// Expected stable count: ~15 named partitions + p_future. The important
+	// property is that the count does NOT grow linearly with cycle count
+	// (the pre-fix bug leaked +1 partition per cycle → 48+ after 48 cycles).
+	// Allow a small window around the steady state for boundary transitions.
+	if len(parts) > 17 {
+		t.Errorf("partition count leaked: got %d after 48 cycles, want ≤17 (steady state ~16)", len(parts))
+	}
+	if len(parts) < 14 {
+		t.Errorf("partition count shrank unexpectedly: got %d after 48 cycles, want ≥14", len(parts))
+	}
+
+	// Second 48-cycle run from the same state must return the same count
+	// (true steady state, no drift).
+	startCount := len(parts)
+	for cycle := 48; cycle < 96; cycle++ {
+		cycleNow := now.Add(time.Duration(cycle) * time.Hour)
+		cutoff := cycleNow.Add(-retainDur)
+		dropped := 0
+		kept := parts[:0]
+		for _, p := range parts {
+			d, ok := partitionDate(p.Name)
+			if ok && d.Before(cutoff) {
+				dropped++
+				continue
+			}
+			kept = append(kept, p)
+		}
+		parts = kept
+		nowHour := cycleNow.Truncate(time.Hour)
+		futureCount := countFuturePartitions(parts, nowHour)
+		toAdd := computeToAdd(addFuture, futureCount, dropped, false)
+		startDate := nextPartitionStart(parts)
+		withoutFuture := parts[:0]
+		for _, p := range parts {
+			if p.Name != "p_future" {
+				withoutFuture = append(withoutFuture, p)
+			}
+		}
+		parts = withoutFuture
+		for i := 0; i < toAdd; i++ {
+			parts = append(parts, partitionInfo{Name: partitionName(startDate.Add(time.Duration(i) * time.Hour))})
+		}
+		parts = append(parts, partitionInfo{Name: "p_future", Description: "MAXVALUE"})
+	}
+	if len(parts) != startCount {
+		t.Errorf("steady-state drift: cycles 48→96 changed count from %d to %d", startCount, len(parts))
 	}
 }
 
