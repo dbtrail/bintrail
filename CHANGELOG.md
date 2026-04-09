@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-04-09
+
+### Added
+- `bintrail agent` now exits with distinct process codes when the dbtrail backend rejects the WebSocket with a permanent close: **64** for auth/config failures (`missing_credentials`, `invalid_key`, `wrong_tenant_mode`) and **65** for `rate_limited`. systemd units should add `RestartPreventExitStatus=64 65` to stop respawning on permanent failures — previously every fatal close exited 1 and the supervisor kept respawning a doomed agent. Unknown reason strings on a fatal close code fall through as a transient exit (safe to respawn) so backend contract drift never silently pins the agent into a fatal loop. The permanent-error log line now includes `close_code` / `close_reason` structured fields for grep/alerting. Recognizes both canonical short forms (`invalid_key`) and legacy human strings (`Invalid API key`) for back-compat with older dbtrail versions (#201, #202).
+
 ## [0.4.6] - 2026-04-08
 
 ### Fixed
