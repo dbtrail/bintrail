@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/bintrail/internal/agent"
 	"github.com/dbtrail/bintrail/internal/observe"
 )
 
@@ -44,13 +47,53 @@ func init() {
 }
 
 func main() {
-	if err := rootCmd.Execute(); err != nil {
-		if wantsJSON(rootCmd) {
-			json.NewEncoder(os.Stderr).Encode(map[string]string{"error": err.Error()})
-		} else {
-			fmt.Fprintln(os.Stderr, err)
-		}
-		os.Exit(1)
+	err := rootCmd.Execute()
+	if err == nil {
+		return
+	}
+	// Map permanent agent WebSocket rejections to distinct exit codes so
+	// systemd (RestartPreventExitStatus=64 65) can stop respawning on
+	// permanent failures. Transient errors fall through to the default
+	// exit-1 path and are safe to respawn. See issue #201.
+	//
+	// This runs AFTER Cobra's RunE returns, which means every defer in
+	// runAgent (buffer flush, S3 writers, source DB close, metrics
+	// shutdown) has already executed — unlike calling os.Exit from
+	// within runAgent directly.
+	var fce *agent.FatalCloseError
+	if errors.As(err, &fce) {
+		code, msg := exitCodeFor(fce.Reason)
+		slog.Error("agent exit",
+			"reason", fce.Reason.String(),
+			"exit_code", code,
+			"message", msg,
+			"error", fce.Err)
+		os.Exit(code)
+	}
+	if wantsJSON(rootCmd) {
+		json.NewEncoder(os.Stderr).Encode(map[string]string{"error": err.Error()})
+	} else {
+		fmt.Fprintln(os.Stderr, err)
+	}
+	os.Exit(1)
+}
+
+// exitCodeFor maps a fatal agent close reason to a process exit code and
+// an operator-facing message. Exit codes match the contract documented in
+// README.md (Agent exit codes): 64 for auth/config failures, 65 for rate
+// limiting. systemd units should list these in RestartPreventExitStatus.
+func exitCodeFor(reason agent.FatalReason) (int, string) {
+	switch reason {
+	case agent.FatalRateLimited:
+		return 65, "agent rate-limited by server — contact support"
+	case agent.FatalMissingCredentials:
+		return 64, "missing credentials — set --api-key or BINTRAIL_API_KEY"
+	case agent.FatalWrongTenantMode:
+		return 64, "tenant is not in BYOS mode — WebSocket channel unavailable"
+	case agent.FatalInvalidKey:
+		return 64, "invalid or revoked API key"
+	default:
+		return 64, "agent rejected by server — fix credentials/config and restart manually"
 	}
 }
 

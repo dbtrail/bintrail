@@ -137,7 +137,28 @@ func (ch *Channel) Run(ctx context.Context) error {
 
 		// Abort on permanent errors (e.g. auth rejection).
 		if !isTemporary(err) {
-			ch.logger.Error("permanent connection error, not reconnecting", "error", err)
+			// Build structured log fields so operators can grep/alert
+			// on the underlying WebSocket close code + reason — a TLS
+			// or handshake failure leaves these unset, which is itself
+			// a useful signal.
+			logArgs := []any{"error", err}
+			var ce websocket.CloseError
+			if errors.As(err, &ce) {
+				logArgs = append(logArgs, "close_code", int(ce.Code), "close_reason", ce.Reason)
+			}
+			// If the close reason is one of the known fatal categories,
+			// wrap it so the caller can exit with a distinct process
+			// code (see cmd/bintrail/main.go). Unknown reasons still
+			// stop the reconnect loop (that's isTemporary's contract)
+			// but are returned unwrapped — the caller treats them as a
+			// generic exit-1 and systemd may respawn, which is the
+			// safer default when the backend contract drifts.
+			if reason := ClassifyClose(err); reason != NotFatal {
+				logArgs = append(logArgs, "reason", reason.String())
+				ch.logger.Error("permanent connection error, not reconnecting", logArgs...)
+				return &FatalCloseError{Reason: reason, Err: err}
+			}
+			ch.logger.Error("permanent connection error, not reconnecting", logArgs...)
 			return err
 		}
 
@@ -324,6 +345,105 @@ func writeJSON(ctx context.Context, conn *websocket.Conn, v any) error {
 	}
 	return conn.Write(ctx, websocket.MessageText, data)
 }
+
+// FatalReason classifies a permanent WebSocket rejection so the agent can
+// exit with a distinct process code and a process supervisor (e.g. systemd
+// with RestartPreventExitStatus=64 65) can stop respawning on permanent
+// failures — set by the dbtrail backend in the WS close reason string.
+// See issue #201.
+type FatalReason int
+
+const (
+	// NotFatal means the error is transient (network flap, server restart)
+	// and the reconnect loop should keep trying.
+	NotFatal FatalReason = iota
+	// FatalMissingCredentials — agent started without an API key.
+	FatalMissingCredentials
+	// FatalInvalidKey — API key is unknown or revoked.
+	FatalInvalidKey
+	// FatalWrongTenantMode — tenant is not configured for BYOS and the
+	// WebSocket command channel is unavailable.
+	FatalWrongTenantMode
+	// FatalRateLimited — server is throttling this agent; operator should
+	// contact support rather than respawn.
+	FatalRateLimited
+)
+
+// String returns the canonical name of the fatal reason (used in logs).
+func (r FatalReason) String() string {
+	switch r {
+	case NotFatal:
+		return "not_fatal"
+	case FatalMissingCredentials:
+		return "missing_credentials"
+	case FatalInvalidKey:
+		return "invalid_key"
+	case FatalWrongTenantMode:
+		return "wrong_tenant_mode"
+	case FatalRateLimited:
+		return "rate_limited"
+	}
+	return "unknown"
+}
+
+// ClassifyClose inspects a WebSocket error and returns the corresponding
+// FatalReason, or NotFatal if the error is transient or the reason string
+// is not recognized. It uses the close code as the primary signal (1008
+// today, 44xx reserved for a future contract) and the close reason string
+// to disambiguate the category.
+//
+// The backend (dbtrail) is the source of truth for the reason strings —
+// see nethalo/dbtrail#1214. This function accepts both the canonical short
+// forms (e.g. "invalid_key") and the legacy human-readable strings the
+// server emits today, so the CLI works against old and new backends.
+//
+// Unknown reason strings on an otherwise-fatal code are treated as
+// NotFatal: a backend typo, i18n change, or newly added category must
+// not silently pin the agent into a fatal exit loop. The caller is
+// expected to log the raw reason so operators can spot contract drift.
+func ClassifyClose(err error) FatalReason {
+	var ce websocket.CloseError
+	if !errors.As(err, &ce) {
+		return NotFatal
+	}
+	code := int(ce.Code)
+	// 1008 is the back-compat code used by the existing server. The 44xx
+	// range is reserved for a future explicit contract; accepting them now
+	// is purely defensive and does not change today's behavior.
+	if code != 1008 && code != 4400 && code != 4401 && code != 4402 && code != 4429 {
+		return NotFatal
+	}
+	switch ce.Reason {
+	case "missing_credentials", "Missing credentials":
+		return FatalMissingCredentials
+	case "wrong_tenant_mode",
+		"WebSocket command channel is only available for BYOS tenants":
+		return FatalWrongTenantMode
+	case "rate_limited", "Too many attempts":
+		return FatalRateLimited
+	case "invalid_key", "Invalid API key":
+		return FatalInvalidKey
+	default:
+		return NotFatal
+	}
+}
+
+// FatalCloseError wraps the underlying websocket error when the reconnect
+// loop gives up due to a permanent rejection. Callers (cmd/bintrail) can
+// use errors.As to extract it and map Reason to a process exit code.
+type FatalCloseError struct {
+	Reason FatalReason
+	Err    error
+}
+
+func (e *FatalCloseError) Error() string {
+	if e.Err == nil {
+		return "fatal websocket close: " + e.Reason.String()
+	}
+	return "fatal websocket close (" + e.Reason.String() + "): " + e.Err.Error()
+}
+
+func (e *FatalCloseError) Unwrap() error { return e.Err }
 
 // isTemporary reports whether err is a connection-level error that should
 // trigger a reconnect (as opposed to a permanent auth failure).
