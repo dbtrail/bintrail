@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-04-08
+
 ### Fixed
 - `bintrail rotate --add-future N` is now declarative: it maintains *at least* N future hourly partitions beyond the current hour (top-up only) instead of adding N new partitions per invocation. In daemon mode the old behaviour leaked `+N` partitions per cycle — a demo tenant running `--add-future=1 --interval=1h` accumulated 413 partitions over 17 days and blew up `SELECT DISTINCT` on `binlog_events` from sub-second to 23s. Semantics now match the documentation in `docs/deployment.md` (#199).
 
