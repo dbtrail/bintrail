@@ -497,3 +497,51 @@ func TestInsert_maxEvents_multipleInserts(t *testing.T) {
 		t.Errorf("SizeEvictions = %d, want 2", buf.SizeEvictions())
 	}
 }
+
+func TestInsert_bothCapsActive(t *testing.T) {
+	// MaxEvents=10, MaxBytes=small — the tighter cap wins.
+	buf := New(Config{MaxAge: 6 * time.Hour, MaxEvents: 10, MaxBytes: 1000})
+	now := time.Now().UTC()
+	buf.Insert(makeEvents(10, "db", "t", now))
+
+	// Byte cap should have kicked in before event cap.
+	if buf.Len() >= 10 {
+		t.Errorf("Len = %d, expected < 10 (byte cap should be tighter)", buf.Len())
+	}
+	if buf.ApproxBytes() > 1000 {
+		t.Errorf("ApproxBytes = %d, should be <= 1000", buf.ApproxBytes())
+	}
+}
+
+func TestInsert_singleEventExceedsMaxBytes(t *testing.T) {
+	// A single event larger than maxBytes should result in an empty buffer.
+	buf := New(Config{MaxAge: 6 * time.Hour, MaxBytes: 1})
+	now := time.Now().UTC()
+	buf.Insert(makeEvents(1, "db", "t", now))
+
+	// The single event exceeds 1 byte, so the buffer should be empty.
+	if buf.Len() != 0 {
+		t.Errorf("Len = %d, want 0 (single event exceeds maxBytes)", buf.Len())
+	}
+	if buf.SizeEvictions() != 1 {
+		t.Errorf("SizeEvictions = %d, want 1", buf.SizeEvictions())
+	}
+}
+
+func TestNew_negativeMaxEventsPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for negative MaxEvents")
+		}
+	}()
+	New(Config{MaxAge: time.Hour, MaxEvents: -1})
+}
+
+func TestNew_negativeMaxBytesPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for negative MaxBytes")
+		}
+	}()
+	New(Config{MaxAge: time.Hour, MaxBytes: -1})
+}

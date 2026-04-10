@@ -451,7 +451,7 @@ func TestParseByteSize(t *testing.T) {
 }
 
 func TestParseByteSize_invalid(t *testing.T) {
-	for _, input := range []string{"abc", "-1GB", "not_a_number"} {
+	for _, input := range []string{"abc", "-1GB", "not_a_number", "1.5GB", "9999999999GB"} {
 		_, err := parseByteSize(input)
 		if err == nil {
 			t.Errorf("parseByteSize(%q): expected error", input)

@@ -54,6 +54,12 @@ type Buffer struct {
 // New creates a Buffer with the given configuration. Zero values for
 // MaxEvents and MaxBytes mean unlimited (no cap).
 func New(cfg Config) *Buffer {
+	if cfg.MaxEvents < 0 {
+		panic("buffer.Config: MaxEvents must be non-negative")
+	}
+	if cfg.MaxBytes < 0 {
+		panic("buffer.Config: MaxBytes must be non-negative")
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -174,16 +180,23 @@ func (b *Buffer) Evict() int {
 	// Events are append-ordered by time, so find the first non-expired index.
 	idx := 0
 	for idx < len(b.events) && b.events[idx].row.EventTimestamp.Before(cutoff) {
-		b.curBytes -= b.events[idx].approxSize
 		idx++
 	}
 	if idx == 0 {
 		return 0
 	}
 
-	// Shift remaining events to the front to allow GC of evicted entries.
-	b.events = append([]entry(nil), b.events[idx:]...)
+	b.dropFront(idx)
 	return idx
+}
+
+// dropFront removes the first n entries from the buffer, adjusting curBytes.
+// Must be called with b.mu held for writing.
+func (b *Buffer) dropFront(n int) {
+	for _, e := range b.events[:n] {
+		b.curBytes -= e.approxSize
+	}
+	b.events = append([]entry(nil), b.events[n:]...)
 }
 
 // Snapshot returns a copy of all current events for archival purposes
@@ -264,35 +277,31 @@ func (b *Buffer) SizeEvictions() int64 {
 // enforceSizeLimits evicts the oldest entries when maxEvents or maxBytes are
 // exceeded. Must be called with b.mu held for writing.
 func (b *Buffer) enforceSizeLimits() {
-	var evicted int
+	drop := 0
 
 	// Enforce event count cap.
 	if b.maxEvents > 0 && len(b.events) > b.maxEvents {
-		drop := len(b.events) - b.maxEvents
-		for _, e := range b.events[:drop] {
-			b.curBytes -= e.approxSize
-		}
-		b.events = append([]entry(nil), b.events[drop:]...)
-		evicted += drop
+		drop = len(b.events) - b.maxEvents
 	}
 
-	// Enforce byte cap.
-	if b.maxBytes > 0 && b.curBytes > b.maxBytes {
-		drop := 0
-		for drop < len(b.events) && b.curBytes > b.maxBytes {
-			b.curBytes -= b.events[drop].approxSize
+	// Enforce byte cap — compute how many additional entries must go by
+	// simulating the curBytes decrease from the entries we already plan to drop.
+	if b.maxBytes > 0 {
+		simBytes := b.curBytes
+		for i := range drop {
+			simBytes -= b.events[i].approxSize
+		}
+		for drop < len(b.events) && simBytes > b.maxBytes {
+			simBytes -= b.events[drop].approxSize
 			drop++
 		}
-		if drop > 0 {
-			b.events = append([]entry(nil), b.events[drop:]...)
-			evicted += drop
-		}
 	}
 
-	if evicted > 0 {
-		b.sizeEvictions += int64(evicted)
+	if drop > 0 {
+		b.dropFront(drop)
+		b.sizeEvictions += int64(drop)
 		b.logger.Warn("BYOS buffer size eviction",
-			"evicted", evicted,
+			"evicted", drop,
 			"remaining", len(b.events),
 			"approx_bytes", b.curBytes,
 		)
@@ -348,6 +357,14 @@ func estimateValueSize(v any) int64 {
 		return int64(len(val))
 	case json.RawMessage:
 		return int64(len(val))
+	case map[string]any:
+		return estimateMapSize(val)
+	case []any:
+		var sz int64 = 24 // slice header
+		for _, elem := range val {
+			sz += estimateValueSize(elem)
+		}
+		return sz
 	case nil:
 		return 0
 	default:

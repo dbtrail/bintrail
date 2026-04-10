@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -241,6 +243,9 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		retain, err := parseRetain(agtBufferRetain)
 		if err != nil {
 			return fmt.Errorf("invalid --buffer-retain: %w", err)
+		}
+		if agtBufferMaxEvents < 0 {
+			return fmt.Errorf("invalid --buffer-max-events %d: must be >= 0", agtBufferMaxEvents)
 		}
 		maxBytes, err := parseByteSize(agtBufferMaxBytes)
 		if err != nil {
@@ -815,6 +820,7 @@ func parseByteSize(s string) (int64, error) {
 		return 0, nil
 	}
 
+	original := s
 	s = strings.ToUpper(s)
 
 	multiplier := int64(1)
@@ -830,9 +836,12 @@ func parseByteSize(s string) (int64, error) {
 		s = strings.TrimSuffix(s, "KB")
 	}
 
-	var n int64
-	if _, err := fmt.Sscanf(s, "%d", &n); err != nil || n < 0 {
-		return 0, fmt.Errorf("invalid byte size %q; expected a number with optional KB/MB/GB suffix, e.g. 256MB", s)
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid byte size %q; expected a number with optional KB/MB/GB suffix, e.g. 256MB", original)
+	}
+	if n > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("byte size %q overflows int64", original)
 	}
 	return n * multiplier, nil
 }

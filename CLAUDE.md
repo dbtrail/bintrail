@@ -61,7 +61,7 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression`, `--row-group-size`, `--upload`, `--upload-region`, `--encrypt`, `--encrypt-key` |
 | `generate-key` | `generate_key.go` | `--output` (default `~/.config/bintrail/dump.key`) |
 | `upload` | `upload.go` | `--source` (req), `--destination` (req), `--region`, `--retry`, `--index-dsn` |
-| `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid`, `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`), `--max-reconnect-attempts` (default `10`), `--validate` |
+| `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--buffer-max-events` (default `0`), `--buffer-max-bytes` (default `0`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid`, `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`), `--max-reconnect-attempts` (default `10`), `--validate` |
 | `config init` | `config.go` | `--global` |
 
 Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`).
@@ -202,19 +202,21 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql`. Do not use `SEL
 
 ### In-memory event buffer (BYOS)
 - `internal/buffer/buffer.go`: `Buffer` type — thread-safe in-memory event store using `sync.RWMutex`.
-- `New(maxAge, logger)` creates a buffer that evicts events older than `maxAge`.
-- `Insert([]parser.Event)` converts parser events to `query.ResultRow` and appends under write lock. Computes `pkHash = SHA-256(pk_values)` per event.
+- `New(Config)` creates a buffer. `Config` fields: `MaxAge` (age-based eviction), `MaxEvents` (event count cap, 0=unlimited), `MaxBytes` (approx byte cap, 0=unlimited), `Logger`.
+- `Insert([]parser.Event)` converts parser events to `query.ResultRow` and appends under write lock. Computes `pkHash = SHA-256(pk_values)` per event. After appending, enforces size limits via FIFO eviction from the front.
 - `Fetch(ctx, query.Options)` filters events by schema, table, pk_values, event_type, time range, changed_column, limit. Returns `[]query.ResultRow` compatible with `query.MergeResults`.
 - `ResolvePK(hash, schema, table)` scans for matching pk_hash — used by agent handler for `resolve_pk` commands.
 - `Evict()` removes events older than `maxAge` from the front of the slice.
+- `ApproxBytes()` returns approximate in-memory byte usage; `SizeEvictions()` returns cumulative size-evicted count.
 - Event IDs use `idOffset = 1<<32` to avoid collisions with MySQL event_ids in `MergeResults` dedup.
 - `internal/buffer/parquet.go`: `WriteParquet(rows, path, compression)` writes `[]query.ResultRow` to Parquet using `archive.BinlogEventColumns` schema — compatible with `parquetquery.Fetch`.
 - Agent handler (`internal/agent/handler.go`): `DefaultHandler.Buffer` field. Query order: buffer → MySQL → S3 archives.
 - Agent BYOS streaming (`cmd/bintrail/agent.go`): when `--source-dsn` + `--server-id` are set, agent starts a streaming goroutine (`runBYOSStream`) that reads binlogs and populates the buffer. The `byosStreamLoop` function handles batching, periodic eviction, and flush pipeline.
 - **BYOS flush pipeline** (wired in `byosStreamLoop`): when `--s3-bucket` is set, each batch is split via `SplitEvent`, metadata sent to dbtrail via `MetadataClient`, payload written to customer S3 via `PayloadWriter`. Flush triggers on batch-full or `--flush-interval` timer (default 5s). Retry: 3 attempts with exponential backoff (1s, 2s, 4s); failures are logged but never block the stream.
 - `flushPipelineState`: mutex-protected struct tracking flush health (metadata/payload status, last flush timestamps, buffer size). Exposed to heartbeat via `agent.Channel.statusProvider` callback.
-- `agent.Heartbeat` includes flush status fields: `buffer_events`, `metadata_status`, `payload_status`, `last_metadata_flush`, `last_payload_flush` (omitted when not in BYOS mode).
+- `agent.Heartbeat` includes flush status fields: `buffer_events`, `buffer_bytes`, `size_evictions`, `metadata_status`, `payload_status`, `last_metadata_flush`, `last_payload_flush` (omitted when not in BYOS mode).
 - Agent flags for BYOS flush: `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`).
+- Agent flags for buffer caps: `--buffer-max-events` (default 0=unlimited), `--buffer-max-bytes` (e.g. `256MB`, `1GB`, default 0=unlimited).
 
 ## Testing conventions
 
