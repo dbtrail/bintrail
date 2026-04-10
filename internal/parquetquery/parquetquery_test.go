@@ -219,6 +219,42 @@ func TestBuildQueryGlobEscaping(t *testing.T) {
 	assertContains(t, q, "parquet_scan('/it''s/archives/*.parquet', hive_partitioning=true, union_by_name=true)")
 }
 
+// ─── buildQueryForFile (single-file S3 with optional column handling) ──────
+
+func TestBuildQueryForFileAllColumns(t *testing.T) {
+	cols := map[string]bool{
+		"event_id": true, "binlog_file": true, "start_pos": true,
+		"end_pos": true, "event_timestamp": true, "gtid": true,
+		"connection_id": true, "schema_name": true, "table_name": true,
+		"event_type": true, "pk_values": true, "changed_columns": true,
+		"row_before": true, "row_after": true, "schema_version": true,
+	}
+	q, args := buildQueryForFile("/tmp/events.parquet", query.Options{Limit: 10}, cols)
+	assertContains(t, q, "connection_id,")
+	if strings.Contains(q, "NULL::INT32") {
+		t.Error("connection_id exists in file; should not use NULL fallback")
+	}
+	assertContains(t, q, "LIMIT ?")
+	if len(args) != 1 || args[0] != 10 {
+		t.Errorf("expected [10] args, got %v", args)
+	}
+}
+
+func TestBuildQueryForFileMissingConnectionID(t *testing.T) {
+	// Simulates pre-v0.4.4 parquet without connection_id.
+	cols := map[string]bool{
+		"event_id": true, "binlog_file": true, "start_pos": true,
+		"end_pos": true, "event_timestamp": true, "gtid": true,
+		"schema_name": true, "table_name": true, "event_type": true,
+		"pk_values": true, "changed_columns": true, "row_before": true,
+		"row_after": true, "schema_version": true,
+	}
+	q, _ := buildQueryForFile("/tmp/old.parquet", query.Options{Schema: "demo", Table: "customers"}, cols)
+	assertContains(t, q, "NULL::INT32 AS connection_id")
+	assertContains(t, q, "schema_name = ?")
+	assertContains(t, q, "table_name = ?")
+}
+
 // ─── parseFileHour ──────────────────────────────────────────────────────────
 
 func TestParseFileHour(t *testing.T) {

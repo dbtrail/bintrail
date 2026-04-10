@@ -87,7 +87,12 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 			if err != nil {
 				return nil, fmt.Errorf("download archive file: %w", err)
 			}
-			q, args := buildQuery(tmpPath, opts)
+			cols, colErr := parquetColumns(ctx, db, tmpPath)
+			if colErr != nil {
+				os.Remove(tmpPath)
+				return nil, fmt.Errorf("read parquet schema %s: %w", f, colErr)
+			}
+			q, args := buildQueryForFile(tmpPath, opts, cols)
 			rows, err := db.QueryContext(ctx, q, args...)
 			if err != nil {
 				os.Remove(tmpPath)
@@ -106,7 +111,11 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 	}
 
 	glob := buildGlob(source)
-	q, args := buildQuery(glob, opts)
+	cols, colErr := parquetColumns(ctx, db, glob)
+	if colErr != nil {
+		return nil, fmt.Errorf("read parquet schema: %w", colErr)
+	}
+	q, args := buildQueryForFile(glob, opts, cols)
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("parquet query: %w", err)
@@ -363,6 +372,56 @@ func buildFilters(opts query.Options) ([]string, []any) {
 	}
 
 	return where, args
+}
+
+// parquetColumns returns the set of column names present in a parquet source.
+// Works with both single files (S3 temp downloads) and glob patterns (local
+// archives). For globs, union_by_name merges schemas across all matching
+// files so the result reflects the full column superset.
+func parquetColumns(ctx context.Context, db *sql.DB, path string) (map[string]bool, error) {
+	safePath := strings.ReplaceAll(path, "'", "''")
+	rows, err := db.QueryContext(ctx, "SELECT * FROM parquet_scan('"+safePath+"', hive_partitioning=true, union_by_name=true) LIMIT 0")
+	if err != nil {
+		return nil, err
+	}
+	names, err := rows.Columns()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	cols := make(map[string]bool, len(names))
+	for _, n := range names {
+		cols[n] = true
+	}
+	return cols, nil
+}
+
+// buildQueryForFile constructs a DuckDB query for a single parquet file,
+// substituting typed NULLs for optional columns not present in the file.
+// This handles backward compatibility when reading archive files written
+// before a schema-adding release (e.g., pre-v0.4.4 files lack connection_id).
+func buildQueryForFile(path string, opts query.Options, cols map[string]bool) (string, []any) {
+	where, args := buildFilters(opts)
+	safePath := strings.ReplaceAll(path, "'", "''")
+
+	connCol := "connection_id"
+	if !cols["connection_id"] {
+		connCol = "NULL::INT32 AS connection_id"
+	}
+
+	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
+		" gtid, " + connCol + ", schema_name, table_name, event_type, pk_values," +
+		" changed_columns, row_before, row_after, schema_version" +
+		" FROM parquet_scan('" + safePath + "', hive_partitioning=true, union_by_name=true)"
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	q += " ORDER BY event_timestamp, event_id"
+	if opts.Limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, opts.Limit)
+	}
+	return q, args
 }
 
 // filterFilesByTimeRange prunes the file list based on Hive partition values
