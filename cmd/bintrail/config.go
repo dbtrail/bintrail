@@ -153,6 +153,8 @@ var envSections = []envSection{
 		Header: "Local event buffer (BYOS mode)",
 		Bindings: []envTemplateEntry{
 			{"BINTRAIL_BUFFER_RETAIN", "6h"},
+			{"BINTRAIL_BUFFER_MAX_EVENTS", "0"},
+			{"BINTRAIL_BUFFER_MAX_BYTES", "0"},
 			{"BINTRAIL_START_GTID", ""},
 		},
 	},

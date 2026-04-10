@@ -45,14 +45,14 @@ func makeUpdate(schema, table, pk string, ts time.Time) parser.Event {
 }
 
 func TestNew(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	if buf.Len() != 0 {
 		t.Errorf("new buffer Len() = %d, want 0", buf.Len())
 	}
 }
 
 func TestInsert_empty(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	buf.Insert(nil)
 	if buf.Len() != 0 {
 		t.Errorf("Len after nil insert = %d, want 0", buf.Len())
@@ -60,7 +60,7 @@ func TestInsert_empty(t *testing.T) {
 }
 
 func TestInsert_roundTrip(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	now := time.Now().UTC().Truncate(time.Second)
 	events := makeEvents(3, "mydb", "users", now)
 
@@ -104,7 +104,7 @@ func TestInsert_roundTrip(t *testing.T) {
 }
 
 func TestInsert_emptyGTID(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	ev := parser.Event{
 		BinlogFile: "binlog.000001",
 		Timestamp:  time.Now().UTC(),
@@ -125,7 +125,7 @@ func TestInsert_emptyGTID(t *testing.T) {
 }
 
 func TestInsert_connectionID(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	ev := parser.Event{
 		BinlogFile:   "binlog.000001",
 		Timestamp:    time.Now().UTC(),
@@ -147,7 +147,7 @@ func TestInsert_connectionID(t *testing.T) {
 }
 
 func TestFetch_filterBySchema(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	now := time.Now().UTC()
 	buf.Insert(makeEvents(2, "db1", "t1", now))
 	buf.Insert(makeEvents(2, "db2", "t1", now))
@@ -164,7 +164,7 @@ func TestFetch_filterBySchema(t *testing.T) {
 }
 
 func TestFetch_filterByTable(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	now := time.Now().UTC()
 	buf.Insert(makeEvents(2, "db", "users", now))
 	buf.Insert(makeEvents(2, "db", "orders", now))
@@ -176,7 +176,7 @@ func TestFetch_filterByTable(t *testing.T) {
 }
 
 func TestFetch_filterByPKValues(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	now := time.Now().UTC()
 	buf.Insert(makeEvents(5, "db", "t", now))
 
@@ -190,7 +190,7 @@ func TestFetch_filterByPKValues(t *testing.T) {
 }
 
 func TestFetch_filterByEventType(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	now := time.Now().UTC()
 	buf.Insert(makeEvents(2, "db", "t", now))
 	buf.Insert([]parser.Event{makeUpdate("db", "t", "99", now)})
@@ -206,7 +206,7 @@ func TestFetch_filterByEventType(t *testing.T) {
 }
 
 func TestFetch_filterBySinceUntil(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	base := time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC)
 	buf.Insert(makeEvents(5, "db", "t", base))
 
@@ -219,7 +219,7 @@ func TestFetch_filterBySinceUntil(t *testing.T) {
 }
 
 func TestFetch_filterByChangedColumn(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	now := time.Now().UTC()
 	buf.Insert([]parser.Event{makeUpdate("db", "t", "1", now)})
 	buf.Insert(makeEvents(1, "db", "t", now.Add(time.Second)))
@@ -234,7 +234,7 @@ func TestFetch_filterByChangedColumn(t *testing.T) {
 }
 
 func TestFetch_filterByGTID(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	now := time.Now().UTC()
 
 	ev1 := parser.Event{
@@ -257,7 +257,7 @@ func TestFetch_filterByGTID(t *testing.T) {
 }
 
 func TestFetch_limit(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	buf.Insert(makeEvents(10, "db", "t", time.Now().UTC()))
 
 	rows := buf.Fetch(context.Background(), query.Options{Limit: 3})
@@ -267,7 +267,7 @@ func TestFetch_limit(t *testing.T) {
 }
 
 func TestFetch_denyTables(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	now := time.Now().UTC()
 	buf.Insert(makeEvents(2, "db", "public_t", now))
 	buf.Insert(makeEvents(2, "db", "secret_t", now))
@@ -286,7 +286,7 @@ func TestFetch_denyTables(t *testing.T) {
 }
 
 func TestResolvePK_found(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	buf.Insert(makeEvents(3, "db", "t", time.Now().UTC()))
 
 	// The pk_values for the second event is "1" (rune '0'+1).
@@ -301,7 +301,7 @@ func TestResolvePK_found(t *testing.T) {
 }
 
 func TestResolvePK_notFound(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	buf.Insert(makeEvents(3, "db", "t", time.Now().UTC()))
 
 	_, ok := buf.ResolvePK("nonexistent_hash", "db", "t")
@@ -311,7 +311,7 @@ func TestResolvePK_notFound(t *testing.T) {
 }
 
 func TestResolvePK_wrongSchemaTable(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	buf.Insert(makeEvents(1, "db", "t", time.Now().UTC()))
 
 	hash := pkHash("0")
@@ -322,7 +322,7 @@ func TestResolvePK_wrongSchemaTable(t *testing.T) {
 }
 
 func TestEvict(t *testing.T) {
-	buf := New(1*time.Hour, nil)
+	buf := New(Config{MaxAge: 1 * time.Hour})
 	old := time.Now().UTC().Add(-2 * time.Hour)
 	recent := time.Now().UTC()
 
@@ -339,7 +339,7 @@ func TestEvict(t *testing.T) {
 }
 
 func TestEvict_nothingToEvict(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	buf.Insert(makeEvents(3, "db", "t", time.Now().UTC()))
 
 	evicted := buf.Evict()
@@ -352,14 +352,14 @@ func TestEvict_nothingToEvict(t *testing.T) {
 }
 
 func TestEvict_empty(t *testing.T) {
-	buf := New(1*time.Hour, nil)
+	buf := New(Config{MaxAge: 1 * time.Hour})
 	if buf.Evict() != 0 {
 		t.Error("evict on empty buffer should return 0")
 	}
 }
 
 func TestSnapshot(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	buf.Insert(makeEvents(5, "db", "t", time.Now().UTC()))
 
 	snap := buf.Snapshot()
@@ -375,7 +375,7 @@ func TestSnapshot(t *testing.T) {
 }
 
 func TestChangedColumns_computed(t *testing.T) {
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	buf.Insert([]parser.Event{makeUpdate("db", "t", "1", time.Now().UTC())})
 
 	rows := buf.Fetch(context.Background(), query.Options{})
@@ -385,4 +385,163 @@ func TestChangedColumns_computed(t *testing.T) {
 	if len(rows[0].ChangedColumns) != 1 || rows[0].ChangedColumns[0] != "email" {
 		t.Errorf("ChangedColumns = %v, want [email]", rows[0].ChangedColumns)
 	}
+}
+
+// ─── Size cap tests ─────────────────────────────────────────────────────────
+
+func TestInsert_maxEvents(t *testing.T) {
+	buf := New(Config{MaxAge: 6 * time.Hour, MaxEvents: 5})
+	now := time.Now().UTC()
+	buf.Insert(makeEvents(10, "db", "t", now))
+
+	if buf.Len() != 5 {
+		t.Fatalf("Len = %d, want 5 (capped)", buf.Len())
+	}
+
+	// The surviving events should be the last 5 (FIFO eviction from front).
+	rows := buf.Fetch(context.Background(), query.Options{})
+	if len(rows) != 5 {
+		t.Fatalf("Fetch got %d rows, want 5", len(rows))
+	}
+	// First surviving event is the one at index 5 from the original batch.
+	if rows[0].PKValues != string(rune('0'+5)) {
+		t.Errorf("first surviving PKValues = %q, want %q", rows[0].PKValues, string(rune('0'+5)))
+	}
+
+	if buf.SizeEvictions() != 5 {
+		t.Errorf("SizeEvictions = %d, want 5", buf.SizeEvictions())
+	}
+}
+
+func TestInsert_maxEvents_zero_unlimited(t *testing.T) {
+	buf := New(Config{MaxAge: 6 * time.Hour, MaxEvents: 0})
+	buf.Insert(makeEvents(100, "db", "t", time.Now().UTC()))
+	if buf.Len() != 100 {
+		t.Errorf("Len = %d, want 100 (unlimited)", buf.Len())
+	}
+	if buf.SizeEvictions() != 0 {
+		t.Errorf("SizeEvictions = %d, want 0", buf.SizeEvictions())
+	}
+}
+
+func TestInsert_maxBytes(t *testing.T) {
+	// Insert events and check that byte cap triggers eviction.
+	// Each event is at least ~200 bytes (overhead alone). Use a small cap.
+	buf := New(Config{MaxAge: 6 * time.Hour, MaxBytes: 1000})
+	now := time.Now().UTC()
+
+	// Insert 20 events — total bytes will exceed 1000.
+	buf.Insert(makeEvents(20, "db", "t", now))
+
+	if buf.Len() >= 20 {
+		t.Errorf("Len = %d, expected fewer than 20 due to byte cap", buf.Len())
+	}
+	if buf.ApproxBytes() > 1000 {
+		t.Errorf("ApproxBytes = %d, should be <= 1000", buf.ApproxBytes())
+	}
+	if buf.SizeEvictions() == 0 {
+		t.Error("expected SizeEvictions > 0")
+	}
+}
+
+func TestApproxBytes_tracksInsertAndEvict(t *testing.T) {
+	buf := New(Config{MaxAge: 1 * time.Hour})
+	if buf.ApproxBytes() != 0 {
+		t.Errorf("empty buffer ApproxBytes = %d, want 0", buf.ApproxBytes())
+	}
+
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	buf.Insert(makeEvents(5, "db", "t", old))
+
+	bytesAfterInsert := buf.ApproxBytes()
+	if bytesAfterInsert <= 0 {
+		t.Fatalf("ApproxBytes after insert = %d, want > 0", bytesAfterInsert)
+	}
+
+	// Age-based eviction should reduce curBytes.
+	evicted := buf.Evict()
+	if evicted != 5 {
+		t.Fatalf("evicted = %d, want 5", evicted)
+	}
+	if buf.ApproxBytes() != 0 {
+		t.Errorf("ApproxBytes after full evict = %d, want 0", buf.ApproxBytes())
+	}
+}
+
+func TestSizeEvictions_notIncrementedByAgeEvict(t *testing.T) {
+	buf := New(Config{MaxAge: 1 * time.Hour})
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	buf.Insert(makeEvents(5, "db", "t", old))
+	buf.Evict()
+
+	if buf.SizeEvictions() != 0 {
+		t.Errorf("SizeEvictions = %d, want 0 (age eviction should not count)", buf.SizeEvictions())
+	}
+}
+
+func TestInsert_maxEvents_multipleInserts(t *testing.T) {
+	buf := New(Config{MaxAge: 6 * time.Hour, MaxEvents: 5})
+	now := time.Now().UTC()
+
+	buf.Insert(makeEvents(3, "db", "t", now))
+	if buf.Len() != 3 {
+		t.Fatalf("Len = %d, want 3 after first insert", buf.Len())
+	}
+
+	// Second insert pushes over the cap.
+	buf.Insert(makeEvents(4, "db", "t", now.Add(10*time.Second)))
+	if buf.Len() != 5 {
+		t.Errorf("Len = %d, want 5 after second insert", buf.Len())
+	}
+	if buf.SizeEvictions() != 2 {
+		t.Errorf("SizeEvictions = %d, want 2", buf.SizeEvictions())
+	}
+}
+
+func TestInsert_bothCapsActive(t *testing.T) {
+	// MaxEvents=10, MaxBytes=small — the tighter cap wins.
+	buf := New(Config{MaxAge: 6 * time.Hour, MaxEvents: 10, MaxBytes: 1000})
+	now := time.Now().UTC()
+	buf.Insert(makeEvents(10, "db", "t", now))
+
+	// Byte cap should have kicked in before event cap.
+	if buf.Len() >= 10 {
+		t.Errorf("Len = %d, expected < 10 (byte cap should be tighter)", buf.Len())
+	}
+	if buf.ApproxBytes() > 1000 {
+		t.Errorf("ApproxBytes = %d, should be <= 1000", buf.ApproxBytes())
+	}
+}
+
+func TestInsert_singleEventExceedsMaxBytes(t *testing.T) {
+	// A single event larger than maxBytes should result in an empty buffer.
+	buf := New(Config{MaxAge: 6 * time.Hour, MaxBytes: 1})
+	now := time.Now().UTC()
+	buf.Insert(makeEvents(1, "db", "t", now))
+
+	// The single event exceeds 1 byte, so the buffer should be empty.
+	if buf.Len() != 0 {
+		t.Errorf("Len = %d, want 0 (single event exceeds maxBytes)", buf.Len())
+	}
+	if buf.SizeEvictions() != 1 {
+		t.Errorf("SizeEvictions = %d, want 1", buf.SizeEvictions())
+	}
+}
+
+func TestNew_negativeMaxEventsPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for negative MaxEvents")
+		}
+	}()
+	New(Config{MaxAge: time.Hour, MaxEvents: -1})
+}
+
+func TestNew_negativeMaxBytesPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for negative MaxBytes")
+		}
+	}()
+	New(Config{MaxAge: time.Hour, MaxBytes: -1})
 }

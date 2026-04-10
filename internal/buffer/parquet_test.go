@@ -27,7 +27,7 @@ func TestWriteParquet_roundTrip(t *testing.T) {
 	outPath := filepath.Join(dir, "buffer.parquet")
 
 	// Build rows from buffer.
-	buf := New(6*time.Hour, nil)
+	buf := New(Config{MaxAge: 6 * time.Hour})
 	base := time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC)
 	buf.Insert(makeEvents(3, "mydb", "users", base))
 	buf.Insert([]parser.Event{makeUpdate("mydb", "orders", "42", base)})
