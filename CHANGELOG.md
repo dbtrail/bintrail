@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-04-10
+
+### Added
+- BYOS buffer now supports size-based eviction via `--buffer-max-events` and `--buffer-max-bytes` flags (e.g. `--buffer-max-bytes 256MB`). Previously the in-memory buffer only evicted by age (`--buffer-retain`), so a write burst within the retention window could grow RAM unbounded. When a cap is exceeded, the oldest events are evicted FIFO with a `slog.Warn` for operator visibility. New heartbeat fields `buffer_bytes` and `size_evictions` report buffer pressure to dbtrail. Both caps default to 0 (unlimited) for backward compatibility (#194).
+
 ## [0.4.8] - 2026-04-10
 
 ### Fixed
