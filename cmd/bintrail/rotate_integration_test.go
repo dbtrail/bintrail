@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
@@ -131,7 +129,17 @@ func setupPartitionedTable(t *testing.T, db *sql.DB, dbName string, hours []time
 	))
 }
 
-func TestPerformRotation_S3FailureSkipsDropContinuesLoop(t *testing.T) {
+// TestPerformRotation_PendingS3BlocksDrop verifies that when a previous
+// rotation run recorded S3 upload intent (s3_bucket set) but the upload
+// did not complete (s3_uploaded_at NULL), a subsequent rotation run — even
+// without --archive-s3 — refuses to drop that partition.
+//
+// Note: the S3-upload-failure continue path (uploadFileFunc returning an error)
+// is not directly integration-tested here because performRotation creates its
+// own S3 client internally from --archive-s3 flags. The safety check tested
+// here is the defense-in-depth layer that catches any scenario where the
+// partition reaches the drop step with a pending upload.
+func TestPerformRotation_PendingS3BlocksDrop(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 
@@ -146,7 +154,9 @@ func TestPerformRotation_S3FailureSkipsDropContinuesLoop(t *testing.T) {
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
 	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ts2, nil, "testdb", "users", 1, "2", nil, nil, []byte(`{"id":2}`))
 
-	// Set up flags for archiving with S3.
+	// Pre-archive: create local Parquet files and archive_state rows
+	// simulating a previous run where S3 upload failed for h1 but
+	// succeeded for h2.
 	archiveDir := t.TempDir()
 	savedVars := saveRotateVars()
 	t.Cleanup(func() { restoreRotateVars(savedVars) })
@@ -154,40 +164,9 @@ func TestPerformRotation_S3FailureSkipsDropContinuesLoop(t *testing.T) {
 	rotArchiveDir = archiveDir
 	rotBintrailID = "test-uuid-167"
 	rotArchiveCompression = "none"
-	rotArchiveS3 = "s3://fake-bucket/archives/"
 	rotFormat = "text"
-	rotRetry = false
 	rotNoReplace = true
 	rotAddFuture = 0
-
-	// Mock uploadFile to fail on first call, succeed on second.
-	callCount := 0
-	saved := uploadFileFunc
-	t.Cleanup(func() { uploadFileFunc = saved })
-	uploadFileFunc = func(ctx context.Context, client *s3.Client, path, bucket, key string) error {
-		callCount++
-		if callCount == 1 {
-			return fmt.Errorf("simulated S3 failure")
-		}
-		return nil
-	}
-
-	// Create a dummy S3 client (won't actually be used since we mock uploadFileFunc).
-	var dummyS3 s3.Client
-
-	// Manually call the inner loop section. We need to do this at a lower level
-	// since performRotation creates its own S3 client from flags.
-	// Instead, let's test via performRotation with the mocked uploadFileFunc.
-	// The S3 client is created inside performRotation from rotArchiveS3.
-	// Since we can't inject a real S3 client, we'll test differently:
-	// We verify the hasPendingS3Upload safety check works by pre-populating
-	// archive_state and running performRotation without --archive-s3.
-	_ = dummyS3
-
-	// Reset the mock approach — test the safety check path instead.
-	// Pre-archive: create local Parquet files and archive_state rows with
-	// pending S3 upload (s3_bucket set, s3_uploaded_at NULL).
-	uploadFileFunc = saved // restore original
 
 	outPath1, _ := hiveArchivePath(archiveDir, rotBintrailID, partitionName(h1))
 	outPath2, _ := hiveArchivePath(archiveDir, rotBintrailID, partitionName(h2))

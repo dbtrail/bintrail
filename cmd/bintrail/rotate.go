@@ -334,6 +334,11 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 
 						if !skipUpload {
 							if err := uploadFileFunc(ctx, s3Client, outPath, s3Bucket, s3Key); err != nil {
+								// Propagate context cancellation (e.g. SIGINT in daemon mode)
+								// instead of logging a misleading S3 warning for every remaining partition.
+								if ctx.Err() != nil {
+									return 0, 0, fmt.Errorf("upload %s to S3: %w", name, err)
+								}
 								slog.Warn("S3 upload failed; partition will not be dropped",
 									"partition", name, "error", err)
 								if rotFormat != "json" {
@@ -465,10 +470,11 @@ var uploadFileFunc = uploadFile
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// hasPendingS3Upload reports whether archive_state records an S3 destination
-// for the given partition that has not yet been uploaded (s3_uploaded_at IS NULL).
-// When bintrailID is empty, it checks across all bintrail_ids for that partition.
-// Returns false if no archive_state row exists or if the row has no S3 bucket.
+// hasPendingS3Upload reports whether archive_state records a non-empty S3
+// destination (s3_bucket) for the given partition that has not yet been uploaded
+// (s3_uploaded_at IS NULL). When bintrailID is empty, it checks across all
+// bintrail_ids for that partition. Returns false if no archive_state row exists
+// or if the row has no S3 bucket (NULL or empty).
 func hasPendingS3Upload(ctx context.Context, db *sql.DB, partition, bintrailID string) (bool, error) {
 	var pending bool
 	var err error
