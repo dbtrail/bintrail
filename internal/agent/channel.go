@@ -87,6 +87,8 @@ type Channel struct {
 // reported in heartbeats so dbtrail can show degraded status.
 type FlushStatus struct {
 	BufferEvents      *int
+	BufferBytes       *int64
+	SizeEvictions     *int64
 	MetadataStatus    string // "ok" or "degraded"
 	PayloadStatus     string // "ok" or "degraded"
 	LastMetadataFlush *time.Time
@@ -319,6 +321,8 @@ func (ch *Channel) sendHeartbeat(ctx context.Context, conn *websocket.Conn) erro
 	if ch.statusProvider != nil {
 		if s := ch.statusProvider(); s != nil {
 			hb.BufferEvents = s.BufferEvents
+			hb.BufferBytes = s.BufferBytes
+			hb.SizeEvictions = s.SizeEvictions
 			hb.MetadataStatus = s.MetadataStatus
 			hb.PayloadStatus = s.PayloadStatus
 			hb.LastMetadataFlush = s.LastMetadataFlush

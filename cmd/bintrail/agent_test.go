@@ -86,7 +86,7 @@ func makeTestEvents(n int) []parser.Event {
 
 func TestByosStreamLoopBufferOnly(t *testing.T) {
 	// Without flush config, events should go to buffer only (hosted mode).
-	buf := buffer.New(time.Hour, nil)
+	buf := buffer.New(buffer.Config{MaxAge: time.Hour})
 	events := make(chan parser.Event, 10)
 
 	for _, ev := range makeTestEvents(3) {
@@ -104,7 +104,7 @@ func TestByosStreamLoopBufferOnly(t *testing.T) {
 }
 
 func TestByosStreamLoopFlushToSinks(t *testing.T) {
-	buf := buffer.New(time.Hour, nil)
+	buf := buffer.New(buffer.Config{MaxAge: time.Hour})
 	events := make(chan parser.Event, 10)
 
 	state := &flushPipelineState{}
@@ -180,7 +180,7 @@ func TestByosStreamLoopFlushToSinks(t *testing.T) {
 }
 
 func TestByosStreamLoopSkipsNonRowEvents(t *testing.T) {
-	buf := buffer.New(time.Hour, nil)
+	buf := buffer.New(buffer.Config{MaxAge: time.Hour})
 	events := make(chan parser.Event, 10)
 
 	events <- parser.Event{EventType: parser.EventGTID, GTID: "aaa:1"}
@@ -201,7 +201,7 @@ func TestByosStreamLoopSkipsNonRowEvents(t *testing.T) {
 }
 
 func TestByosStreamLoopFlushOnBatchSize(t *testing.T) {
-	buf := buffer.New(time.Hour, nil)
+	buf := buffer.New(buffer.Config{MaxAge: time.Hour})
 	events := make(chan parser.Event, 20)
 
 	// Send 5 events with batch size 3 — should flush twice (3 + 2).
@@ -220,7 +220,7 @@ func TestByosStreamLoopFlushOnBatchSize(t *testing.T) {
 }
 
 func TestByosStreamLoopContextCancellation(t *testing.T) {
-	buf := buffer.New(time.Hour, nil)
+	buf := buffer.New(buffer.Config{MaxAge: time.Hour})
 	events := make(chan parser.Event, 10)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -242,12 +242,18 @@ func TestByosStreamLoopContextCancellation(t *testing.T) {
 
 func TestFlushPipelineStateToFlushStatus(t *testing.T) {
 	state := &flushPipelineState{}
-	state.setBufferLen(42)
+	state.setBufferStats(42, 8192, 5)
 	state.updateFlush(true, false)
 
 	status := state.toFlushStatus()
 	if status.BufferEvents == nil || *status.BufferEvents != 42 {
 		t.Errorf("BufferEvents = %v, want 42", status.BufferEvents)
+	}
+	if status.BufferBytes == nil || *status.BufferBytes != 8192 {
+		t.Errorf("BufferBytes = %v, want 8192", status.BufferBytes)
+	}
+	if status.SizeEvictions == nil || *status.SizeEvictions != 5 {
+		t.Errorf("SizeEvictions = %v, want 5", status.SizeEvictions)
 	}
 	if status.MetadataStatus != "ok" {
 		t.Errorf("MetadataStatus = %q, want ok", status.MetadataStatus)
@@ -387,6 +393,7 @@ func TestAgentFlagRegistration(t *testing.T) {
 		"archive-dir", "archive-s3", "buffer-retain", "server-id",
 		"batch-size", "schemas", "tables", "start-gtid",
 		"s3-bucket", "s3-region", "s3-prefix", "flush-interval",
+		"buffer-max-events", "buffer-max-bytes",
 	} {
 		if agentCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on agent command", name)
@@ -403,6 +410,8 @@ func TestAgentFlagDefaults(t *testing.T) {
 		{"flush-interval", "5s"},
 		{"buffer-retain", "6h"},
 		{"batch-size", "1000"},
+		{"buffer-max-events", "0"},
+		{"buffer-max-bytes", "0"},
 	}
 	for _, tt := range tests {
 		f := agentCmd.Flag(tt.flag)
@@ -411,6 +420,41 @@ func TestAgentFlagDefaults(t *testing.T) {
 		}
 		if f.DefValue != tt.want {
 			t.Errorf("--%s default = %q, want %q", tt.flag, f.DefValue, tt.want)
+		}
+	}
+}
+
+func TestParseByteSize(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int64
+	}{
+		{"0", 0},
+		{"", 0},
+		{"1024", 1024},
+		{"256MB", 256 << 20},
+		{"256mb", 256 << 20},
+		{"1GB", 1 << 30},
+		{"1gb", 1 << 30},
+		{"512KB", 512 << 10},
+	}
+	for _, tt := range tests {
+		got, err := parseByteSize(tt.input)
+		if err != nil {
+			t.Errorf("parseByteSize(%q): unexpected error: %v", tt.input, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("parseByteSize(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestParseByteSize_invalid(t *testing.T) {
+	for _, input := range []string{"abc", "-1GB", "not_a_number"} {
+		_, err := parseByteSize(input)
+		if err == nil {
+			t.Errorf("parseByteSize(%q): expected error", input)
 		}
 	}
 }

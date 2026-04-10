@@ -44,6 +44,8 @@ var envBindings = []envBinding{
 	{"api-key", "BINTRAIL_API_KEY"},
 	{"endpoint", "BINTRAIL_AGENT_ENDPOINT"},
 	{"buffer-retain", "BINTRAIL_BUFFER_RETAIN"},
+	{"buffer-max-events", "BINTRAIL_BUFFER_MAX_EVENTS"},
+	{"buffer-max-bytes", "BINTRAIL_BUFFER_MAX_BYTES"},
 	{"start-gtid", "BINTRAIL_START_GTID"},
 	{"s3-prefix", "BINTRAIL_S3_PREFIX"},
 	{"flush-interval", "BINTRAIL_FLUSH_INTERVAL"},

@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"slices"
 	"sync"
@@ -24,28 +25,44 @@ const idOffset = uint64(1) << 32
 
 // entry is a single event stored in the buffer.
 type entry struct {
-	row    query.ResultRow
-	pkHash string // SHA-256 hex of pk_values
+	row       query.ResultRow
+	pkHash    string // SHA-256 hex of pk_values
+	approxSize int64  // estimated heap bytes
+}
+
+// Config controls buffer capacity and eviction behavior.
+type Config struct {
+	MaxAge    time.Duration // age-based eviction threshold
+	MaxEvents int           // max event count; 0 = unlimited
+	MaxBytes  int64         // max approximate byte usage; 0 = unlimited
+	Logger    *slog.Logger
 }
 
 // Buffer is a thread-safe, in-memory event store for recent binlog events.
 type Buffer struct {
-	mu     sync.RWMutex
-	events []entry
-	nextID uint64
-	maxAge time.Duration
-	logger *slog.Logger
+	mu            sync.RWMutex
+	events        []entry
+	nextID        uint64
+	maxAge        time.Duration
+	maxEvents     int
+	maxBytes      int64
+	curBytes      int64 // running total of approxSize across all entries
+	sizeEvictions int64 // cumulative events evicted by size cap
+	logger        *slog.Logger
 }
 
-// New creates a Buffer that retains events for up to maxAge.
-func New(maxAge time.Duration, logger *slog.Logger) *Buffer {
-	if logger == nil {
-		logger = slog.Default()
+// New creates a Buffer with the given configuration. Zero values for
+// MaxEvents and MaxBytes mean unlimited (no cap).
+func New(cfg Config) *Buffer {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
 	}
 	return &Buffer{
-		maxAge: maxAge,
-		nextID: 1,
-		logger: logger,
+		maxAge:    cfg.MaxAge,
+		maxEvents: cfg.MaxEvents,
+		maxBytes:  cfg.MaxBytes,
+		nextID:    1,
+		logger:    cfg.Logger,
 	}
 }
 
@@ -88,9 +105,11 @@ func (b *Buffer) Insert(events []parser.Event) {
 			SchemaVersion:  ev.SchemaVersion,
 		}
 
+		sz := estimateRowSize(&row)
 		entries = append(entries, entry{
-			row:    row,
-			pkHash: pkHash(ev.PKValues),
+			row:        row,
+			pkHash:     pkHash(ev.PKValues),
+			approxSize: sz,
 		})
 	}
 
@@ -98,8 +117,10 @@ func (b *Buffer) Insert(events []parser.Event) {
 	for i := range entries {
 		entries[i].row.EventID = b.nextID + idOffset
 		b.nextID++
+		b.curBytes += entries[i].approxSize
 	}
 	b.events = append(b.events, entries...)
+	b.enforceSizeLimits()
 	b.mu.Unlock()
 }
 
@@ -153,6 +174,7 @@ func (b *Buffer) Evict() int {
 	// Events are append-ordered by time, so find the first non-expired index.
 	idx := 0
 	for idx < len(b.events) && b.events[idx].row.EventTimestamp.Before(cutoff) {
+		b.curBytes -= b.events[idx].approxSize
 		idx++
 	}
 	if idx == 0 {
@@ -222,6 +244,115 @@ func matchesOpts(e *entry, opts query.Options) bool {
 		}
 	}
 	return true
+}
+
+// ApproxBytes returns the approximate in-memory byte usage of all buffered events.
+func (b *Buffer) ApproxBytes() int64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.curBytes
+}
+
+// SizeEvictions returns the cumulative count of events evicted due to size
+// caps (maxEvents or maxBytes) since the buffer was created.
+func (b *Buffer) SizeEvictions() int64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.sizeEvictions
+}
+
+// enforceSizeLimits evicts the oldest entries when maxEvents or maxBytes are
+// exceeded. Must be called with b.mu held for writing.
+func (b *Buffer) enforceSizeLimits() {
+	var evicted int
+
+	// Enforce event count cap.
+	if b.maxEvents > 0 && len(b.events) > b.maxEvents {
+		drop := len(b.events) - b.maxEvents
+		for _, e := range b.events[:drop] {
+			b.curBytes -= e.approxSize
+		}
+		b.events = append([]entry(nil), b.events[drop:]...)
+		evicted += drop
+	}
+
+	// Enforce byte cap.
+	if b.maxBytes > 0 && b.curBytes > b.maxBytes {
+		drop := 0
+		for drop < len(b.events) && b.curBytes > b.maxBytes {
+			b.curBytes -= b.events[drop].approxSize
+			drop++
+		}
+		if drop > 0 {
+			b.events = append([]entry(nil), b.events[drop:]...)
+			evicted += drop
+		}
+	}
+
+	if evicted > 0 {
+		b.sizeEvictions += int64(evicted)
+		b.logger.Warn("BYOS buffer size eviction",
+			"evicted", evicted,
+			"remaining", len(b.events),
+			"approx_bytes", b.curBytes,
+		)
+	}
+}
+
+// ─── Size estimation ────────────────────────────────────────────────────────
+
+// estimateRowSize returns an approximate byte cost for a ResultRow.
+// This is not exact — it sums string lengths and uses fixed estimates for
+// maps, pointers, and struct overhead. Good enough for backpressure decisions.
+func estimateRowSize(r *query.ResultRow) int64 {
+	const overhead = 200 // struct fields, pointers, slice headers
+	var n int64 = overhead
+
+	n += int64(len(r.BinlogFile))
+	n += int64(len(r.SchemaName))
+	n += int64(len(r.TableName))
+	n += int64(len(r.PKValues))
+	n += 64 // pkHash hex string
+
+	if r.GTID != nil {
+		n += int64(len(*r.GTID))
+	}
+	for _, c := range r.ChangedColumns {
+		n += int64(len(c))
+	}
+	n += estimateMapSize(r.RowBefore)
+	n += estimateMapSize(r.RowAfter)
+	return n
+}
+
+// estimateMapSize returns an approximate byte size for a map[string]any,
+// as typically found in RowBefore/RowAfter JSON column data.
+func estimateMapSize(m map[string]any) int64 {
+	if m == nil {
+		return 0
+	}
+	const perEntry = 64 // map bucket overhead per key
+	var n int64
+	for k, v := range m {
+		n += perEntry + int64(len(k))
+		n += estimateValueSize(v)
+	}
+	return n
+}
+
+func estimateValueSize(v any) int64 {
+	switch val := v.(type) {
+	case string:
+		return int64(len(val))
+	case []byte:
+		return int64(len(val))
+	case json.RawMessage:
+		return int64(len(val))
+	case nil:
+		return 0
+	default:
+		return 8 // numbers, bools
+	}
 }
 
 // pkHash computes the SHA-256 hex digest of pkValues, matching MySQL's

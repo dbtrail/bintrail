@@ -40,6 +40,8 @@ type Heartbeat struct {
 
 	// Flush pipeline status (BYOS mode only).
 	BufferEvents      *int       `json:"buffer_events,omitempty"`
+	BufferBytes       *int64     `json:"buffer_bytes,omitempty"`
+	SizeEvictions     *int64     `json:"size_evictions,omitempty"`
 	MetadataStatus    string     `json:"metadata_status,omitempty"`    // "ok" or "degraded"
 	PayloadStatus     string     `json:"payload_status,omitempty"`     // "ok" or "degraded"
 	LastMetadataFlush *time.Time `json:"last_metadata_flush,omitempty"`

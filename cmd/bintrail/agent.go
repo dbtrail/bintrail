@@ -76,6 +76,8 @@ var (
 	agtS3Region             string
 	agtS3Prefix             string
 	agtFlushInterval        string
+	agtBufferMaxEvents      int
+	agtBufferMaxBytes       string
 	agtValidate             bool
 	agtMaxReconnectAttempts int
 )
@@ -97,6 +99,8 @@ func init() {
 	agentCmd.Flags().StringVar(&agtS3Region, "s3-region", "", "AWS region for the S3 bucket")
 	agentCmd.Flags().StringVar(&agtS3Prefix, "s3-prefix", "bintrail/", "Key prefix within the S3 bucket")
 	agentCmd.Flags().StringVar(&agtFlushInterval, "flush-interval", "5s", "Max time between metadata/payload flushes (e.g. 5s, 10s)")
+	agentCmd.Flags().IntVar(&agtBufferMaxEvents, "buffer-max-events", 0, "Max events in the in-memory buffer (0 = unlimited)")
+	agentCmd.Flags().StringVar(&agtBufferMaxBytes, "buffer-max-bytes", "0", "Max approximate buffer size, e.g. 256MB, 1GB (0 = unlimited)")
 	agentCmd.Flags().BoolVar(&agtValidate, "validate", false, "Run pre-flight checks and exit without starting the agent")
 	agentCmd.Flags().IntVar(&agtMaxReconnectAttempts, "max-reconnect-attempts", 10, "Exit (non-zero) after this many consecutive WebSocket reconnect failures so a process supervisor (e.g. systemd Restart=on-failure) can respawn the agent. The counter resets whenever a connection stays up longer than the heartbeat interval, so transient drops on a healthy long-running agent never trip the limit. Use 0 for unlimited retries.")
 	_ = agentCmd.MarkFlagRequired("api-key")
@@ -238,8 +242,17 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("invalid --buffer-retain: %w", err)
 		}
+		maxBytes, err := parseByteSize(agtBufferMaxBytes)
+		if err != nil {
+			return fmt.Errorf("invalid --buffer-max-bytes: %w", err)
+		}
 
-		buf := buffer.New(retain, slog.Default())
+		buf := buffer.New(buffer.Config{
+			MaxAge:    retain,
+			MaxEvents: agtBufferMaxEvents,
+			MaxBytes:  maxBytes,
+			Logger:    slog.Default(),
+		})
 		handler.Buffer = buf
 
 		// Use bintrail_id as the server identifier when available, falling
@@ -249,7 +262,9 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		slog.Info("BYOS mode enabled",
 			"source_dsn", maskDSN(agtSourceDSN),
 			"server_id", serverIDStr,
-			"buffer_retain", retain.String())
+			"buffer_retain", retain.String(),
+			"buffer_max_events", agtBufferMaxEvents,
+			"buffer_max_bytes", agtBufferMaxBytes)
 
 		// Initialize flush sinks if S3 bucket is configured.
 		var metaClient *byos.MetadataClient
@@ -407,6 +422,8 @@ type byosFlushConfig struct {
 type flushPipelineState struct {
 	mu                sync.Mutex
 	bufferEvents      int
+	bufferBytes       int64
+	sizeEvictions     int64
 	metadataStatus    string // "ok" or "degraded"
 	payloadStatus     string // "ok" or "degraded"
 	lastMetadataFlush *time.Time
@@ -431,9 +448,11 @@ func (s *flushPipelineState) updateFlush(metaOK, payloadOK bool) {
 	}
 }
 
-func (s *flushPipelineState) setBufferLen(n int) {
+func (s *flushPipelineState) setBufferStats(events int, bytes int64, evictions int64) {
 	s.mu.Lock()
-	s.bufferEvents = n
+	s.bufferEvents = events
+	s.bufferBytes = bytes
+	s.sizeEvictions = evictions
 	s.mu.Unlock()
 }
 
@@ -441,8 +460,12 @@ func (s *flushPipelineState) toFlushStatus() *agent.FlushStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := s.bufferEvents
+	b := s.bufferBytes
+	e := s.sizeEvictions
 	return &agent.FlushStatus{
 		BufferEvents:      &n,
+		BufferBytes:       &b,
+		SizeEvictions:     &e,
 		MetadataStatus:    s.metadataStatus,
 		PayloadStatus:     s.payloadStatus,
 		LastMetadataFlush: s.lastMetadataFlush,
@@ -579,7 +602,7 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 			flushToSinks(ctx, batch, fc)
 		}
 		if fc != nil && fc.state != nil {
-			fc.state.setBufferLen(buf.Len())
+			fc.state.setBufferStats(buf.Len(), buf.ApproxBytes(), buf.SizeEvictions())
 		}
 
 		batch = batch[:0]
@@ -597,7 +620,7 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 				slog.Info("BYOS buffer eviction", "evicted", n, "remaining", buf.Len())
 			}
 			if fc != nil && fc.state != nil {
-				fc.state.setBufferLen(buf.Len())
+				fc.state.setBufferStats(buf.Len(), buf.ApproxBytes(), buf.SizeEvictions())
 			}
 
 		case <-flushTicker.C:
@@ -782,4 +805,34 @@ func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Reso
 	}
 
 	return metadata.NewResolverFromTables(0, tables), nil
+}
+
+// parseByteSize parses a human-readable byte size string like "256MB" or "1GB".
+// Plain integers are treated as bytes. Returns 0 for "0" (unlimited).
+func parseByteSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+
+	s = strings.ToUpper(s)
+
+	multiplier := int64(1)
+	switch {
+	case strings.HasSuffix(s, "GB"):
+		multiplier = 1 << 30
+		s = strings.TrimSuffix(s, "GB")
+	case strings.HasSuffix(s, "MB"):
+		multiplier = 1 << 20
+		s = strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "KB"):
+		multiplier = 1 << 10
+		s = strings.TrimSuffix(s, "KB")
+	}
+
+	var n int64
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid byte size %q; expected a number with optional KB/MB/GB suffix, e.g. 256MB", s)
+	}
+	return n * multiplier, nil
 }
