@@ -1,6 +1,7 @@
 package baseline
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,6 +45,7 @@ func DiscoverBaselines(dir string) ([]BaselineInfo, error) {
 		snapshotDir := filepath.Join(dir, entry.Name())
 		dbEntries, err := os.ReadDir(snapshotDir)
 		if err != nil {
+			slog.Warn("could not read baseline snapshot directory", "path", snapshotDir, "error", err)
 			continue
 		}
 		for _, dbEntry := range dbEntries {
@@ -54,6 +56,7 @@ func DiscoverBaselines(dir string) ([]BaselineInfo, error) {
 			tableDir := filepath.Join(snapshotDir, dbName)
 			tableFiles, err := os.ReadDir(tableDir)
 			if err != nil {
+				slog.Warn("could not read baseline table directory", "path", tableDir, "error", err)
 				continue
 			}
 			for _, tf := range tableFiles {

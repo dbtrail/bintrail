@@ -216,6 +216,9 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 
 	// Warn if there is a gap between the baseline binlog position and the
 	// first indexed event — events in that gap are missing from the reconstruction.
+	if bmeta.BinlogFile == "" && len(events) > 0 {
+		slog.Info("gap detection skipped — baseline lacks binlog position metadata; consider re-running 'bintrail baseline' to embed position data")
+	}
 	if bmeta.BinlogFile != "" && len(events) > 0 {
 		first := events[0]
 		gap := first.BinlogFile > bmeta.BinlogFile ||

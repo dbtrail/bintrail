@@ -318,17 +318,6 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 	return &s, nil
 }
 
-// BaselineInfo holds metadata about a discovered baseline Parquet file.
-// Populated externally (from baseline.DiscoverBaselines) and attached to StatusData.
-type BaselineInfo struct {
-	SnapshotTime time.Time
-	Database     string
-	Table        string
-	BinlogFile   string
-	BinlogPos    int64
-	GTIDSet      string
-}
-
 // StatusData holds all data sections loaded by CollectStatus.
 type StatusData struct {
 	Files     []IndexStateRow
@@ -338,6 +327,18 @@ type StatusData struct {
 	Servers   []ServerInfo
 	Stream    *StreamStateInfo
 	Baselines []BaselineInfo
+}
+
+// BaselineInfo holds metadata about a discovered baseline Parquet file.
+// Populated externally (from baseline.DiscoverBaselines) and attached to StatusData.
+type BaselineInfo struct {
+	SnapshotTime time.Time
+	Database     string
+	Table        string
+	BinlogFile   string
+	BinlogPos    int64
+	GTIDSet      string
+	Path         string // filesystem path; ignored by display/JSON output
 }
 
 // CollectStatus loads all status data from the index database.

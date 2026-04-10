@@ -50,7 +50,12 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		ts = meta.StartedAt
 	} else {
 		// Best-effort: try to get binlog position even with timestamp override.
-		meta, _ = ParseMetadata(cfg.InputDir)
+		var metaErr error
+		meta, metaErr = ParseMetadata(cfg.InputDir)
+		if metaErr != nil {
+			slog.Info("could not read mydumper metadata for binlog position — Parquet files will lack baseline position",
+				"input_dir", cfg.InputDir, "error", metaErr)
+		}
 	}
 
 	// Discover tables.

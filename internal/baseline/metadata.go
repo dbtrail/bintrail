@@ -3,6 +3,7 @@ package baseline
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -114,7 +115,13 @@ func ReadParquetMetadata(path string) (DumpMetadata, error) {
 		m.BinlogFile = v
 	}
 	if v, ok := pf.Lookup(MetaKeyBinlogPos); ok {
-		m.BinlogPos, _ = strconv.ParseInt(v, 10, 64)
+		pos, parseErr := strconv.ParseInt(v, 10, 64)
+		if parseErr != nil {
+			slog.Warn("corrupt baseline_binlog_position in Parquet metadata",
+				"path", path, "raw_value", v, "error", parseErr)
+		} else {
+			m.BinlogPos = pos
+		}
 	}
 	if v, ok := pf.Lookup(MetaKeyGTIDSet); ok {
 		m.GTIDSet = v

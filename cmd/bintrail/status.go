@@ -91,6 +91,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 					BinlogFile:   b.BinlogFile,
 					BinlogPos:    b.BinlogPos,
 					GTIDSet:      b.GTIDSet,
+					Path:         b.Path,
 				})
 			}
 		}

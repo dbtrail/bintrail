@@ -1170,3 +1170,113 @@ func TestReadParquetMetadata_noPosition(t *testing.T) {
 		t.Errorf("GTIDSet = %q, want empty", m.GTIDSet)
 	}
 }
+
+// ─── parseBaselineDirTimestamp ────────────────────────────────────────────────
+
+func TestParseBaselineDirTimestamp(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  time.Time
+		ok    bool
+	}{
+		{"valid UTC", "2025-02-28T00-00-00Z", time.Date(2025, 2, 28, 0, 0, 0, 0, time.UTC), true},
+		{"valid with time", "2026-03-15T14-30-00Z", time.Date(2026, 3, 15, 14, 30, 0, 0, time.UTC), true},
+		{"no T separator", "2025-02-28", time.Time{}, false},
+		{"empty", "", time.Time{}, false},
+		{"malformed time", "2025-02-28Tnot-a-time", time.Time{}, false},
+		{"random folder", "some-folder", time.Time{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseBaselineDirTimestamp(tc.input)
+			if ok != tc.ok {
+				t.Errorf("ok = %v, want %v", ok, tc.ok)
+			}
+			if ok && !got.Equal(tc.want) {
+				t.Errorf("time = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// ─── DiscoverBaselines ───────────────────────────────────────────────────────
+
+func TestDiscoverBaselines(t *testing.T) {
+	baseDir := t.TempDir()
+
+	// Create a well-formed baseline directory structure with a Parquet file.
+	snapshotDir := filepath.Join(baseDir, "2025-02-28T00-00-00Z", "mydb")
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a minimal Parquet file with binlog metadata.
+	parquetPath := filepath.Join(snapshotDir, "orders.parquet")
+	cols := []Column{
+		{Name: "id", MySQLType: "int", ParquetType: parquet.Leaf(parquet.Int32Type)},
+	}
+	w, err := NewWriter(parquetPath, cols, WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 100,
+		Metadata: map[string]string{
+			MetaKeyBinlogFile: "binlog.000042",
+			MetaKeyBinlogPos:  "12345",
+			MetaKeyGTIDSet:    "abc:1-100",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteRow([]string{"1"}, []bool{false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Also create a non-timestamp directory (should be skipped).
+	if err := os.MkdirAll(filepath.Join(baseDir, "not-a-timestamp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Discover baselines.
+	results, err := DiscoverBaselines(baseDir)
+	if err != nil {
+		t.Fatalf("DiscoverBaselines: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d baselines, want 1", len(results))
+	}
+
+	b := results[0]
+	wantTime := time.Date(2025, 2, 28, 0, 0, 0, 0, time.UTC)
+	if !b.SnapshotTime.Equal(wantTime) {
+		t.Errorf("SnapshotTime = %v, want %v", b.SnapshotTime, wantTime)
+	}
+	if b.Database != "mydb" {
+		t.Errorf("Database = %q, want %q", b.Database, "mydb")
+	}
+	if b.Table != "orders" {
+		t.Errorf("Table = %q, want %q", b.Table, "orders")
+	}
+	if b.BinlogFile != "binlog.000042" {
+		t.Errorf("BinlogFile = %q, want %q", b.BinlogFile, "binlog.000042")
+	}
+	if b.BinlogPos != 12345 {
+		t.Errorf("BinlogPos = %d, want 12345", b.BinlogPos)
+	}
+	if b.GTIDSet != "abc:1-100" {
+		t.Errorf("GTIDSet = %q, want %q", b.GTIDSet, "abc:1-100")
+	}
+}
+
+func TestDiscoverBaselines_emptyDir(t *testing.T) {
+	results, err := DiscoverBaselines(t.TempDir())
+	if err != nil {
+		t.Fatalf("DiscoverBaselines: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("got %d baselines, want 0", len(results))
+	}
+}
