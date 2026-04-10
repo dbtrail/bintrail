@@ -318,14 +318,26 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 	return &s, nil
 }
 
+// BaselineInfo holds metadata about a discovered baseline Parquet file.
+// Populated externally (from baseline.DiscoverBaselines) and attached to StatusData.
+type BaselineInfo struct {
+	SnapshotTime time.Time
+	Database     string
+	Table        string
+	BinlogFile   string
+	BinlogPos    int64
+	GTIDSet      string
+}
+
 // StatusData holds all data sections loaded by CollectStatus.
 type StatusData struct {
-	Files    []IndexStateRow
-	Parts    []PartitionStat
-	Archives *ArchiveStats
-	Coverage *CoverageInfo
-	Servers  []ServerInfo
-	Stream   *StreamStateInfo
+	Files     []IndexStateRow
+	Parts     []PartitionStat
+	Archives  *ArchiveStats
+	Coverage  *CoverageInfo
+	Servers   []ServerInfo
+	Stream    *StreamStateInfo
+	Baselines []BaselineInfo
 }
 
 // CollectStatus loads all status data from the index database.
@@ -375,11 +387,12 @@ func CollectStatus(ctx context.Context, db *sql.DB, dbName string) (*StatusData,
 // Write writes the status data as a human-readable report to w.
 func (d *StatusData) Write(w io.Writer) {
 	WriteStatus(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream)
+	writeBaselines(w, d.Baselines)
 }
 
 // WriteJSON writes the status data as JSON to w.
 func (d *StatusData) WriteJSON(w io.Writer) error {
-	return WriteStatusJSON(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream)
+	return writeStatusJSONFull(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream, d.Baselines)
 }
 
 // WriteStatus writes a multi-section status report (Servers, Stream, Indexed Files, Partitions, Archives, Coverage, Summary) to w.
@@ -611,6 +624,10 @@ func Truncate(s string, n int) string {
 
 // WriteStatusJSON writes the status data as a JSON object to w.
 func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo) error {
+	return writeStatusJSONFull(w, files, parts, archives, coverage, servers, stream, nil)
+}
+
+func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo, baselines []BaselineInfo) error {
 	type jsonFile struct {
 		BinlogFile    string  `json:"binlog_file"`
 		Status        string  `json:"status"`
@@ -666,14 +683,23 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, 
 		LastCheckpoint string  `json:"last_checkpoint"`
 		ServerID       uint32  `json:"server_id"`
 	}
+	type jsonBaseline struct {
+		SnapshotTime string  `json:"snapshot_time"`
+		Database     string  `json:"database"`
+		Table        string  `json:"table"`
+		BinlogFile   *string `json:"binlog_file,omitempty"`
+		BinlogPos    *int64  `json:"binlog_position,omitempty"`
+		GTIDSet      *string `json:"gtid_set,omitempty"`
+	}
 	type jsonSummary struct {
-		Servers  []jsonServer    `json:"servers,omitempty"`
-		Stream   *jsonStream     `json:"stream,omitempty"`
-		Files    []jsonFile      `json:"files"`
-		Parts    []jsonPartition `json:"partitions"`
-		Total    int64           `json:"total_events_estimate"`
-		Archives *jsonArchives   `json:"archives,omitempty"`
-		Coverage *jsonCoverage   `json:"coverage,omitempty"`
+		Servers   []jsonServer    `json:"servers,omitempty"`
+		Stream    *jsonStream     `json:"stream,omitempty"`
+		Files     []jsonFile      `json:"files"`
+		Parts     []jsonPartition `json:"partitions"`
+		Total     int64           `json:"total_events_estimate"`
+		Archives  *jsonArchives   `json:"archives,omitempty"`
+		Coverage  *jsonCoverage   `json:"coverage,omitempty"`
+		Baselines []jsonBaseline  `json:"baselines,omitempty"`
 	}
 
 	jf := make([]jsonFile, len(files))
@@ -789,7 +815,56 @@ func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, 
 		out.Coverage = jc
 	}
 
+	for _, b := range baselines {
+		jb := jsonBaseline{
+			SnapshotTime: b.SnapshotTime.Format(TSFmt),
+			Database:     b.Database,
+			Table:        b.Table,
+		}
+		if b.BinlogFile != "" {
+			jb.BinlogFile = &b.BinlogFile
+		}
+		if b.BinlogPos != 0 {
+			jb.BinlogPos = &b.BinlogPos
+		}
+		if b.GTIDSet != "" {
+			jb.GTIDSet = &b.GTIDSet
+		}
+		out.Baselines = append(out.Baselines, jb)
+	}
+
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
+}
+
+// writeBaselines writes the baselines section to a text status report.
+func writeBaselines(w io.Writer, baselines []BaselineInfo) {
+	if len(baselines) == 0 {
+		return
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "=== Baselines ===")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "SNAPSHOT\tDATABASE\tTABLE\tBINLOG_FILE\tBINLOG_POS\tGTID")
+	fmt.Fprintln(tw, "────────\t────────\t─────\t───────────\t──────────\t────")
+	for _, b := range baselines {
+		binlogFile := "-"
+		if b.BinlogFile != "" {
+			binlogFile = b.BinlogFile
+		}
+		binlogPos := "-"
+		if b.BinlogPos != 0 {
+			binlogPos = strconv.FormatInt(b.BinlogPos, 10)
+		}
+		gtid := "-"
+		if b.GTIDSet != "" {
+			gtid = Truncate(b.GTIDSet, 40)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			b.SnapshotTime.Format(TSFmt),
+			b.Database, b.Table,
+			binlogFile, binlogPos, gtid)
+	}
+	tw.Flush()
 }

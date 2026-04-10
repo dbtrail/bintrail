@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/bintrail/internal/baseline"
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/query"
@@ -159,6 +160,19 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 	slog.Debug("found baseline snapshot", "path", baselinePath, "snapshot_time", snapshotTime.UTC().Format(time.RFC3339))
 
+	// Read baseline binlog position metadata (local files only).
+	var bmeta baseline.DumpMetadata
+	if !strings.HasPrefix(baselinePath, "s3://") {
+		var metaErr error
+		bmeta, metaErr = baseline.ReadParquetMetadata(baselinePath)
+		if metaErr != nil {
+			slog.Warn("could not read baseline metadata", "error", metaErr)
+		} else if bmeta.BinlogFile != "" {
+			slog.Debug("baseline binlog position",
+				"file", bmeta.BinlogFile, "pos", bmeta.BinlogPos, "gtid", bmeta.GTIDSet)
+		}
+	}
+
 	baselineRow, err := reconstruct.ReadBaselineRow(cmd.Context(), baselinePath, pkFilter)
 	if err != nil {
 		return fmt.Errorf("read baseline: %w", err)
@@ -199,6 +213,22 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("fetch binlog events: %w", err)
 	}
 	slog.Debug("fetched binlog events", "count", len(events))
+
+	// Warn if there is a gap between the baseline binlog position and the
+	// first indexed event — events in that gap are missing from the reconstruction.
+	if bmeta.BinlogFile != "" && len(events) > 0 {
+		first := events[0]
+		gap := first.BinlogFile > bmeta.BinlogFile ||
+			(first.BinlogFile == bmeta.BinlogFile && first.StartPos > uint64(bmeta.BinlogPos))
+		if gap {
+			slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
+				"baseline_file", bmeta.BinlogFile,
+				"baseline_pos", bmeta.BinlogPos,
+				"baseline_gtid", bmeta.GTIDSet,
+				"first_event_file", first.BinlogFile,
+				"first_event_pos", first.StartPos)
+		}
+	}
 
 	// ── Reconstruct and format output ──────────────────────────────────────────
 	if err := writeReconstructOutput(baselineRow, events, snapshotTime, at, recHistory, recFormat, os.Stdout); err != nil {

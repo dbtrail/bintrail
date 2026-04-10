@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,14 +38,19 @@ type Stats struct {
 
 // Run converts a mydumper output directory into Parquet files.
 func Run(ctx context.Context, cfg Config) (Stats, error) {
-	// Resolve timestamp.
+	// Resolve timestamp and binlog position from mydumper metadata.
+	var meta DumpMetadata
 	ts := cfg.Timestamp
 	if ts.IsZero() {
-		meta, err := ParseMetadata(cfg.InputDir)
+		var err error
+		meta, err = ParseMetadata(cfg.InputDir)
 		if err != nil {
 			return Stats{}, fmt.Errorf("parse mydumper metadata: %w", err)
 		}
 		ts = meta.StartedAt
+	} else {
+		// Best-effort: try to get binlog position even with timestamp override.
+		meta, _ = ParseMetadata(cfg.InputDir)
 	}
 
 	// Discover tables.
@@ -116,16 +122,26 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 				}
 			}
 
+			md := map[string]string{
+				"bintrail.snapshot_timestamp": tsStr,
+				"bintrail.source_database":    tf.Database,
+				"bintrail.source_table":       tf.Table,
+				"bintrail.mydumper_format":    tf.Format,
+				"bintrail.bintrail_version":   Version,
+			}
+			if meta.BinlogFile != "" {
+				md[MetaKeyBinlogFile] = meta.BinlogFile
+			}
+			if meta.BinlogPos != 0 {
+				md[MetaKeyBinlogPos] = strconv.FormatInt(meta.BinlogPos, 10)
+			}
+			if meta.GTIDSet != "" {
+				md[MetaKeyGTIDSet] = meta.GTIDSet
+			}
 			writerCfg := WriterConfig{
 				Compression:  compression,
 				RowGroupSize: rowGroupSize,
-				Metadata: map[string]string{
-					"bintrail.snapshot_timestamp": tsStr,
-					"bintrail.source_database":    tf.Database,
-					"bintrail.source_table":       tf.Table,
-					"bintrail.mydumper_format":    tf.Format,
-					"bintrail.bintrail_version":   Version,
-				},
+				Metadata:     md,
 			}
 
 			n, err := processTable(ctx, tf, outPath, writerCfg)

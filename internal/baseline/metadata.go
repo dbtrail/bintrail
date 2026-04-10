@@ -8,6 +8,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/parquet-go/parquet-go"
+)
+
+// Parquet metadata keys for baseline binlog position.
+const (
+	MetaKeyBinlogFile = "bintrail.baseline_binlog_file"
+	MetaKeyBinlogPos  = "bintrail.baseline_binlog_position"
+	MetaKeyGTIDSet    = "bintrail.baseline_gtid_set"
 )
 
 // DumpMetadata contains information parsed from a mydumper metadata file.
@@ -76,6 +85,39 @@ func ParseMetadata(inputDir string) (DumpMetadata, error) {
 	}
 	if m.StartedAt.IsZero() {
 		return DumpMetadata{}, fmt.Errorf("metadata file missing 'Started dump at:' line")
+	}
+	return m, nil
+}
+
+// ReadParquetMetadata opens a local Parquet file and extracts the baseline
+// binlog position from its file-level key-value metadata. Returns a zero-value
+// DumpMetadata (no error) when the file lacks position metadata (older baselines).
+func ReadParquetMetadata(path string) (DumpMetadata, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return DumpMetadata{}, fmt.Errorf("open baseline file: %w", err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return DumpMetadata{}, fmt.Errorf("stat baseline file: %w", err)
+	}
+
+	pf, err := parquet.OpenFile(f, info.Size())
+	if err != nil {
+		return DumpMetadata{}, fmt.Errorf("open parquet file: %w", err)
+	}
+
+	var m DumpMetadata
+	if v, ok := pf.Lookup(MetaKeyBinlogFile); ok {
+		m.BinlogFile = v
+	}
+	if v, ok := pf.Lookup(MetaKeyBinlogPos); ok {
+		m.BinlogPos, _ = strconv.ParseInt(v, 10, 64)
+	}
+	if v, ok := pf.Lookup(MetaKeyGTIDSet); ok {
+		m.GTIDSet = v
 	}
 	return m, nil
 }

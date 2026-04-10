@@ -824,16 +824,43 @@ func TestRun(t *testing.T) {
 		t.Errorf("RowsWritten = %d, want 2", stats.RowsWritten)
 	}
 
-	// Verify at least one .parquet file exists under the output dir
-	found := false
+	// Find the output .parquet file and verify metadata.
+	var parquetPath string
 	_ = filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
 		if err == nil && filepath.Ext(path) == ".parquet" {
-			found = true
+			parquetPath = path
 		}
 		return nil
 	})
-	if !found {
-		t.Error("no .parquet file found in output directory")
+	if parquetPath == "" {
+		t.Fatal("no .parquet file found in output directory")
+	}
+
+	// Verify binlog position metadata was written.
+	rf, err := os.Open(parquetPath)
+	if err != nil {
+		t.Fatalf("open parquet: %v", err)
+	}
+	defer rf.Close()
+	info, err := rf.Stat()
+	if err != nil {
+		t.Fatalf("stat parquet: %v", err)
+	}
+	pf, err := parquet.OpenFile(rf, info.Size())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	for key, want := range map[string]string{
+		MetaKeyBinlogFile: "binlog.000042",
+		MetaKeyBinlogPos:  "12345",
+		MetaKeyGTIDSet:    "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100",
+	} {
+		got, ok := pf.Lookup(key)
+		if !ok {
+			t.Errorf("metadata key %q not found", key)
+		} else if got != want {
+			t.Errorf("metadata[%q] = %q, want %q", key, got, want)
+		}
 	}
 }
 
@@ -1058,5 +1085,88 @@ func TestRunRetrySkipsExistingFiles(t *testing.T) {
 	}
 	if stats2.FilesWritten != 1 {
 		t.Errorf("retry Run: FilesWritten = %d, want 1 (counted as existing)", stats2.FilesWritten)
+	}
+}
+
+// ─── ReadParquetMetadata ─────────────────────────────────────────────────────
+
+func TestReadParquetMetadata(t *testing.T) {
+	// Create a Parquet file with binlog position metadata via NewWriter.
+	outPath := filepath.Join(t.TempDir(), "test.parquet")
+	cols := []Column{
+		{Name: "id", MySQLType: "int", ParquetType: parquet.Leaf(parquet.Int32Type)},
+	}
+	cfg := WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 100,
+		Metadata: map[string]string{
+			MetaKeyBinlogFile: "binlog.000042",
+			MetaKeyBinlogPos:  "12345",
+			MetaKeyGTIDSet:    "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100",
+		},
+	}
+	w, err := NewWriter(outPath, cols, cfg)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.WriteRow([]string{"1"}, []bool{false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Read metadata back.
+	m, err := ReadParquetMetadata(outPath)
+	if err != nil {
+		t.Fatalf("ReadParquetMetadata: %v", err)
+	}
+	if m.BinlogFile != "binlog.000042" {
+		t.Errorf("BinlogFile = %q, want %q", m.BinlogFile, "binlog.000042")
+	}
+	if m.BinlogPos != 12345 {
+		t.Errorf("BinlogPos = %d, want 12345", m.BinlogPos)
+	}
+	if m.GTIDSet != "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100" {
+		t.Errorf("GTIDSet = %q, want %q", m.GTIDSet, "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100")
+	}
+}
+
+func TestReadParquetMetadata_noPosition(t *testing.T) {
+	// Create a Parquet file without binlog position metadata.
+	outPath := filepath.Join(t.TempDir(), "test.parquet")
+	cols := []Column{
+		{Name: "id", MySQLType: "int", ParquetType: parquet.Leaf(parquet.Int32Type)},
+	}
+	cfg := WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 100,
+		Metadata: map[string]string{
+			"bintrail.source_database": "testdb",
+		},
+	}
+	w, err := NewWriter(outPath, cols, cfg)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.WriteRow([]string{"1"}, []bool{false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	m, err := ReadParquetMetadata(outPath)
+	if err != nil {
+		t.Fatalf("ReadParquetMetadata: %v", err)
+	}
+	if m.BinlogFile != "" {
+		t.Errorf("BinlogFile = %q, want empty", m.BinlogFile)
+	}
+	if m.BinlogPos != 0 {
+		t.Errorf("BinlogPos = %d, want 0", m.BinlogPos)
+	}
+	if m.GTIDSet != "" {
+		t.Errorf("GTIDSet = %q, want empty", m.GTIDSet)
 	}
 }
