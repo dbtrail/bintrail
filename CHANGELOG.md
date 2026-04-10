@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-04-10
+
+### Fixed
+- Archive queries against pre-v0.4.4 parquet files no longer silently return 0 events. Older parquets lack the `connection_id` column added in 0.4.4; DuckDB threw a `Binder Error` when the per-file query SELECTed that column from a single file (where `union_by_name=true` is a no-op). The error was swallowed by the caller and the query returned empty. Fix: probe the parquet schema before building the SELECT and substitute `NULL::INT32 AS connection_id` when the column is absent. Applied to both the S3 per-file download path and the local glob path (#203).
+
 ## [0.4.7] - 2026-04-09
 
 ### Added
