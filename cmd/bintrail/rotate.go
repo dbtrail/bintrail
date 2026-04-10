@@ -269,22 +269,43 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 						}
 					}
 
+					// Compute S3 key early so we can record the upload intent
+					// in archive_state before the actual upload.
+					var s3Key string
+					if s3Client != nil {
+						s3Key, err = buildS3Key(rotArchiveDir, outPath, s3Prefix)
+						if err != nil {
+							return 0, 0, fmt.Errorf("build S3 key for %s: %w", name, err)
+						}
+					}
+
 					// Record archive in archive_state (skip when retrying —
 					// the row already exists with the correct row_count).
+					// When S3 is configured, s3_bucket and s3_key are recorded
+					// immediately so that future runs (even without --archive-s3)
+					// know that an S3 upload is expected before the partition can
+					// be dropped.
 					if !skipped {
 						var fileSize int64
 						if fi, statErr := os.Stat(outPath); statErr == nil {
 							fileSize = fi.Size()
 						}
+						var insertBucket, insertKey any
+						if s3Client != nil {
+							insertBucket = s3Bucket
+							insertKey = s3Key
+						}
 						if _, err := db.ExecContext(ctx,
 							`INSERT INTO archive_state
-								(partition_name, bintrail_id, local_path, file_size_bytes, row_count)
-							VALUES (?, ?, ?, ?, ?)
+								(partition_name, bintrail_id, local_path, file_size_bytes, row_count, s3_bucket, s3_key)
+							VALUES (?, ?, ?, ?, ?, ?, ?)
 							ON DUPLICATE KEY UPDATE
 								local_path = VALUES(local_path),
 								file_size_bytes = VALUES(file_size_bytes),
-								row_count = VALUES(row_count)`,
-							name, rotBintrailID, outPath, fileSize, n,
+								row_count = VALUES(row_count),
+								s3_bucket = COALESCE(VALUES(s3_bucket), s3_bucket),
+								s3_key = COALESCE(VALUES(s3_key), s3_key)`,
+							name, rotBintrailID, outPath, fileSize, n, insertBucket, insertKey,
 						); err != nil {
 							return 0, 0, fmt.Errorf("record archive state for %s: %w", name, err)
 						}
@@ -312,32 +333,56 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 						}
 
 						if !skipUpload {
-							key, err := buildS3Key(rotArchiveDir, outPath, s3Prefix)
-							if err != nil {
-								return 0, 0, fmt.Errorf("build S3 key for %s: %w", name, err)
-							}
-							if err := uploadFile(ctx, s3Client, outPath, s3Bucket, key); err != nil {
-								return 0, 0, fmt.Errorf("upload %s to S3: %w", name, err)
+							if err := uploadFileFunc(ctx, s3Client, outPath, s3Bucket, s3Key); err != nil {
+								// Propagate context cancellation (e.g. SIGINT in daemon mode)
+								// instead of logging a misleading S3 warning for every remaining partition.
+								if ctx.Err() != nil {
+									return 0, 0, fmt.Errorf("upload %s to S3: %w", name, err)
+								}
+								slog.Warn("S3 upload failed; partition will not be dropped",
+									"partition", name, "error", err)
+								if rotFormat != "json" {
+									fmt.Fprintf(os.Stdout, "warning: S3 upload failed for %s: %v\n", name, err)
+									fmt.Fprintf(os.Stdout, "  run 'bintrail rotate --retry --archive-s3 ...' to retry\n")
+								}
+								continue
 							}
 							if _, err := db.ExecContext(ctx,
 								`UPDATE archive_state
 									SET s3_bucket = ?, s3_key = ?, s3_uploaded_at = UTC_TIMESTAMP()
 								WHERE partition_name = ? AND bintrail_id = ?`,
-								s3Bucket, key, name, rotBintrailID,
+								s3Bucket, s3Key, name, rotBintrailID,
 							); err != nil {
 								return 0, 0, fmt.Errorf("update archive state S3 info for %s: %w", name, err)
 							}
-							slog.Info("uploaded archive to S3", "partition", name, "bucket", s3Bucket, "key", key)
+							slog.Info("uploaded archive to S3", "partition", name, "bucket", s3Bucket, "key", s3Key)
 							if rotFormat != "json" {
-								fmt.Fprintf(os.Stdout, "uploaded %s → s3://%s/%s\n", name, s3Bucket, key)
+								fmt.Fprintf(os.Stdout, "uploaded %s → s3://%s/%s\n", name, s3Bucket, s3Key)
 							}
 						}
+					}
+
+					// Safety check: never drop a partition that has a pending S3 upload,
+					// even if the current run does not have --archive-s3 configured.
+					pending, err := hasPendingS3Upload(ctx, db, name, rotBintrailID)
+					if err != nil {
+						return 0, 0, fmt.Errorf("check pending S3 upload for %s: %w", name, err)
+					}
+					if pending {
+						slog.Warn("partition archived locally but not yet uploaded to S3; skipping drop",
+							"partition", name)
+						if rotFormat != "json" {
+							fmt.Fprintf(os.Stdout, "skipped drop for %s (pending S3 upload)\n", name)
+							fmt.Fprintf(os.Stdout, "  run 'bintrail rotate --retry --archive-s3 ...' to retry\n")
+						}
+						continue
 					}
 
 					// Drop this partition immediately after archiving.
 					if err := dropPartitions(ctx, db, dbName, []string{name}); err != nil {
 						return 0, 0, fmt.Errorf("failed to drop partition %s: %w", name, err)
 					}
+					droppedCount++
 					slog.Info("dropped partition", "partition", name)
 					if rotFormat != "json" {
 						fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
@@ -345,16 +390,36 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 				}
 			} else {
 				// No archiving — drop all expired partitions at once.
-				if err := dropPartitions(ctx, db, dbName, toDrop); err != nil {
-					return 0, 0, fmt.Errorf("failed to drop partitions: %w", err)
-				}
+				// Filter out any partition that has a pending S3 upload from
+				// a previous archived rotation run.
+				var safeToDrop []string
 				for _, name := range toDrop {
+					pending, err := hasPendingS3Upload(ctx, db, name, rotBintrailID)
+					if err != nil {
+						return 0, 0, fmt.Errorf("check pending S3 upload for %s: %w", name, err)
+					}
+					if pending {
+						slog.Warn("partition has pending S3 upload from a previous run; skipping drop",
+							"partition", name)
+						if rotFormat != "json" {
+							fmt.Fprintf(os.Stdout, "skipped drop for %s (pending S3 upload)\n", name)
+						}
+						continue
+					}
+					safeToDrop = append(safeToDrop, name)
+				}
+				if len(safeToDrop) > 0 {
+					if err := dropPartitions(ctx, db, dbName, safeToDrop); err != nil {
+						return 0, 0, fmt.Errorf("failed to drop partitions: %w", err)
+					}
+				}
+				for _, name := range safeToDrop {
 					if rotFormat != "json" {
 						fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
 					}
 				}
+				droppedCount = len(safeToDrop)
 			}
-			droppedCount = len(toDrop)
 			// Refresh list so nextPartitionStart sees current state.
 			partitions, err = listPartitions(ctx, db, dbName)
 			if err != nil {
@@ -399,7 +464,42 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 	return droppedCount, toAdd, nil
 }
 
+// uploadFileFunc is the function used to upload a file to S3. It defaults to
+// uploadFile and can be overridden in tests to simulate S3 failures.
+var uploadFileFunc = uploadFile
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// hasPendingS3Upload reports whether archive_state records a non-empty S3
+// destination (s3_bucket) for the given partition that has not yet been uploaded
+// (s3_uploaded_at IS NULL). When bintrailID is empty, it checks across all
+// bintrail_ids for that partition. Returns false if no archive_state row exists
+// or if the row has no S3 bucket (NULL or empty).
+func hasPendingS3Upload(ctx context.Context, db *sql.DB, partition, bintrailID string) (bool, error) {
+	var pending bool
+	var err error
+	if bintrailID != "" {
+		err = db.QueryRowContext(ctx,
+			`SELECT COUNT(*) > 0 FROM archive_state
+			WHERE partition_name = ? AND bintrail_id = ?
+			  AND s3_bucket IS NOT NULL AND s3_bucket != ''
+			  AND s3_uploaded_at IS NULL`,
+			partition, bintrailID,
+		).Scan(&pending)
+	} else {
+		err = db.QueryRowContext(ctx,
+			`SELECT COUNT(*) > 0 FROM archive_state
+			WHERE partition_name = ?
+			  AND s3_bucket IS NOT NULL AND s3_bucket != ''
+			  AND s3_uploaded_at IS NULL`,
+			partition,
+		).Scan(&pending)
+	}
+	if err != nil {
+		return false, err
+	}
+	return pending, nil
+}
 
 // fileExists reports whether a file exists and has a size greater than zero.
 func fileExists(path string) bool {
