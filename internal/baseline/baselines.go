@@ -78,6 +78,8 @@ func DiscoverBaselines(dir string) ([]BaselineInfo, error) {
 					info.BinlogFile = meta.BinlogFile
 					info.BinlogPos = meta.BinlogPos
 					info.GTIDSet = meta.GTIDSet
+				} else {
+					slog.Warn("could not read Parquet metadata for baseline", "path", filePath, "error", err)
 				}
 
 				results = append(results, info)
