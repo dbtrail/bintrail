@@ -824,16 +824,43 @@ func TestRun(t *testing.T) {
 		t.Errorf("RowsWritten = %d, want 2", stats.RowsWritten)
 	}
 
-	// Verify at least one .parquet file exists under the output dir
-	found := false
+	// Find the output .parquet file and verify metadata.
+	var parquetPath string
 	_ = filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
 		if err == nil && filepath.Ext(path) == ".parquet" {
-			found = true
+			parquetPath = path
 		}
 		return nil
 	})
-	if !found {
-		t.Error("no .parquet file found in output directory")
+	if parquetPath == "" {
+		t.Fatal("no .parquet file found in output directory")
+	}
+
+	// Verify binlog position metadata was written.
+	rf, err := os.Open(parquetPath)
+	if err != nil {
+		t.Fatalf("open parquet: %v", err)
+	}
+	defer rf.Close()
+	info, err := rf.Stat()
+	if err != nil {
+		t.Fatalf("stat parquet: %v", err)
+	}
+	pf, err := parquet.OpenFile(rf, info.Size())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	for key, want := range map[string]string{
+		MetaKeyBinlogFile: "binlog.000042",
+		MetaKeyBinlogPos:  "12345",
+		MetaKeyGTIDSet:    "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100",
+	} {
+		got, ok := pf.Lookup(key)
+		if !ok {
+			t.Errorf("metadata key %q not found", key)
+		} else if got != want {
+			t.Errorf("metadata[%q] = %q, want %q", key, got, want)
+		}
 	}
 }
 
@@ -1058,5 +1085,198 @@ func TestRunRetrySkipsExistingFiles(t *testing.T) {
 	}
 	if stats2.FilesWritten != 1 {
 		t.Errorf("retry Run: FilesWritten = %d, want 1 (counted as existing)", stats2.FilesWritten)
+	}
+}
+
+// ─── ReadParquetMetadata ─────────────────────────────────────────────────────
+
+func TestReadParquetMetadata(t *testing.T) {
+	// Create a Parquet file with binlog position metadata via NewWriter.
+	outPath := filepath.Join(t.TempDir(), "test.parquet")
+	cols := []Column{
+		{Name: "id", MySQLType: "int", ParquetType: parquet.Leaf(parquet.Int32Type)},
+	}
+	cfg := WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 100,
+		Metadata: map[string]string{
+			MetaKeyBinlogFile: "binlog.000042",
+			MetaKeyBinlogPos:  "12345",
+			MetaKeyGTIDSet:    "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100",
+		},
+	}
+	w, err := NewWriter(outPath, cols, cfg)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.WriteRow([]string{"1"}, []bool{false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Read metadata back.
+	m, err := ReadParquetMetadata(outPath)
+	if err != nil {
+		t.Fatalf("ReadParquetMetadata: %v", err)
+	}
+	if m.BinlogFile != "binlog.000042" {
+		t.Errorf("BinlogFile = %q, want %q", m.BinlogFile, "binlog.000042")
+	}
+	if m.BinlogPos != 12345 {
+		t.Errorf("BinlogPos = %d, want 12345", m.BinlogPos)
+	}
+	if m.GTIDSet != "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100" {
+		t.Errorf("GTIDSet = %q, want %q", m.GTIDSet, "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100")
+	}
+}
+
+func TestReadParquetMetadata_noPosition(t *testing.T) {
+	// Create a Parquet file without binlog position metadata.
+	outPath := filepath.Join(t.TempDir(), "test.parquet")
+	cols := []Column{
+		{Name: "id", MySQLType: "int", ParquetType: parquet.Leaf(parquet.Int32Type)},
+	}
+	cfg := WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 100,
+		Metadata: map[string]string{
+			"bintrail.source_database": "testdb",
+		},
+	}
+	w, err := NewWriter(outPath, cols, cfg)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.WriteRow([]string{"1"}, []bool{false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	m, err := ReadParquetMetadata(outPath)
+	if err != nil {
+		t.Fatalf("ReadParquetMetadata: %v", err)
+	}
+	if m.BinlogFile != "" {
+		t.Errorf("BinlogFile = %q, want empty", m.BinlogFile)
+	}
+	if m.BinlogPos != 0 {
+		t.Errorf("BinlogPos = %d, want 0", m.BinlogPos)
+	}
+	if m.GTIDSet != "" {
+		t.Errorf("GTIDSet = %q, want empty", m.GTIDSet)
+	}
+}
+
+// ─── parseBaselineDirTimestamp ────────────────────────────────────────────────
+
+func TestParseBaselineDirTimestamp(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  time.Time
+		ok    bool
+	}{
+		{"valid UTC", "2025-02-28T00-00-00Z", time.Date(2025, 2, 28, 0, 0, 0, 0, time.UTC), true},
+		{"valid with time", "2026-03-15T14-30-00Z", time.Date(2026, 3, 15, 14, 30, 0, 0, time.UTC), true},
+		{"no T separator", "2025-02-28", time.Time{}, false},
+		{"empty", "", time.Time{}, false},
+		{"malformed time", "2025-02-28Tnot-a-time", time.Time{}, false},
+		{"random folder", "some-folder", time.Time{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseBaselineDirTimestamp(tc.input)
+			if ok != tc.ok {
+				t.Errorf("ok = %v, want %v", ok, tc.ok)
+			}
+			if ok && !got.Equal(tc.want) {
+				t.Errorf("time = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// ─── DiscoverBaselines ───────────────────────────────────────────────────────
+
+func TestDiscoverBaselines(t *testing.T) {
+	baseDir := t.TempDir()
+
+	// Create a well-formed baseline directory structure with a Parquet file.
+	snapshotDir := filepath.Join(baseDir, "2025-02-28T00-00-00Z", "mydb")
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a minimal Parquet file with binlog metadata.
+	parquetPath := filepath.Join(snapshotDir, "orders.parquet")
+	cols := []Column{
+		{Name: "id", MySQLType: "int", ParquetType: parquet.Leaf(parquet.Int32Type)},
+	}
+	w, err := NewWriter(parquetPath, cols, WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 100,
+		Metadata: map[string]string{
+			MetaKeyBinlogFile: "binlog.000042",
+			MetaKeyBinlogPos:  "12345",
+			MetaKeyGTIDSet:    "abc:1-100",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteRow([]string{"1"}, []bool{false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Also create a non-timestamp directory (should be skipped).
+	if err := os.MkdirAll(filepath.Join(baseDir, "not-a-timestamp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Discover baselines.
+	results, err := DiscoverBaselines(baseDir)
+	if err != nil {
+		t.Fatalf("DiscoverBaselines: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d baselines, want 1", len(results))
+	}
+
+	b := results[0]
+	wantTime := time.Date(2025, 2, 28, 0, 0, 0, 0, time.UTC)
+	if !b.SnapshotTime.Equal(wantTime) {
+		t.Errorf("SnapshotTime = %v, want %v", b.SnapshotTime, wantTime)
+	}
+	if b.Database != "mydb" {
+		t.Errorf("Database = %q, want %q", b.Database, "mydb")
+	}
+	if b.Table != "orders" {
+		t.Errorf("Table = %q, want %q", b.Table, "orders")
+	}
+	if b.BinlogFile != "binlog.000042" {
+		t.Errorf("BinlogFile = %q, want %q", b.BinlogFile, "binlog.000042")
+	}
+	if b.BinlogPos != 12345 {
+		t.Errorf("BinlogPos = %d, want 12345", b.BinlogPos)
+	}
+	if b.GTIDSet != "abc:1-100" {
+		t.Errorf("GTIDSet = %q, want %q", b.GTIDSet, "abc:1-100")
+	}
+}
+
+func TestDiscoverBaselines_emptyDir(t *testing.T) {
+	results, err := DiscoverBaselines(t.TempDir())
+	if err != nil {
+		t.Fatalf("DiscoverBaselines: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("got %d baselines, want 0", len(results))
 	}
 }

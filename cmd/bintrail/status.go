@@ -9,6 +9,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/bintrail/internal/baseline"
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/status"
@@ -31,13 +32,15 @@ Example:
 }
 
 var (
-	stIndexDSN string
-	stFormat   string
+	stIndexDSN    string
+	stFormat      string
+	stBaselineDir string
 )
 
 func init() {
 	statusCmd.Flags().StringVar(&stIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	statusCmd.Flags().StringVar(&stFormat, "format", "text", "Output format: text or json")
+	statusCmd.Flags().StringVar(&stBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots (optional, shows baseline binlog positions)")
 	_ = statusCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(statusCmd)
 
@@ -72,6 +75,26 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	data, err := status.CollectStatus(cmd.Context(), db, dbName)
 	if err != nil {
 		return err
+	}
+
+	// Discover baseline Parquet files if --baseline-dir is provided.
+	if stBaselineDir != "" {
+		baselines, bErr := baseline.DiscoverBaselines(stBaselineDir)
+		if bErr != nil {
+			slog.Warn("could not discover baselines", "dir", stBaselineDir, "error", bErr)
+		} else {
+			for _, b := range baselines {
+				data.Baselines = append(data.Baselines, status.BaselineInfo{
+					SnapshotTime: b.SnapshotTime,
+					Database:     b.Database,
+					Table:        b.Table,
+					BinlogFile:   b.BinlogFile,
+					BinlogPos:    b.BinlogPos,
+					GTIDSet:      b.GTIDSet,
+					Path:         b.Path,
+				})
+			}
+		}
 	}
 
 	slog.Info("status complete", "duration_ms", time.Since(start).Milliseconds())
