@@ -17,15 +17,17 @@ import (
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
-// TestRunReconstruct_fullTableRoundTrip is the end-to-end regression test for
-// #187: build a baseline + live events + an archived-and-dropped partition,
-// run `bintrail reconstruct --output-format mydumper`, then apply the
-// generated CREATE TABLE + INSERT files against a fresh table and verify the
-// restored row set matches the expected merged state.
+// TestRunReconstruct_fullTableRoundTrip is the end-to-end acceptance test
+// for #187 (full-table reconstruct is a brand-new feature, not a bug fix,
+// so this is an acceptance test rather than a regression test). It builds
+// a baseline + live events + an archived-and-dropped partition, runs
+// `bintrail reconstruct --output-format mydumper`, then applies the
+// generated CREATE TABLE + INSERT files against a fresh table and verifies
+// the restored row set matches the expected merged state.
 //
-// This is the functional guarantee the feature promises: "the dump directory
-// is restorable with a plain mysql client and produces the correct point-in-
-// time state."
+// Passing this test means: the dump directory is restorable with a plain
+// mysql client, the merge semantics are correct, and the archive fetch
+// path actually provides events that were dropped from live MySQL.
 func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)

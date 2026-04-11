@@ -2,6 +2,7 @@ package reconstruct
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,10 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/recovery"
 )
+
+// ErrWriterClosed is returned from MydumperWriter methods called after Close.
+// Kept as a sentinel so tests and future callers can match it with errors.Is.
+var ErrWriterClosed = errors.New("MydumperWriter: already closed")
 
 // MydumperWriter emits a full-table reconstruction as a mydumper-compatible
 // SQL dump directory. Output layout:
@@ -45,6 +50,7 @@ type MydumperWriter struct {
 	curBytes        int64
 	chunkIdx        int
 	firstRowInChunk bool
+	closed          bool // true after Close; WriteRow becomes ErrWriterClosed
 }
 
 // NewMydumperWriter creates a writer for a single table. The directory must
@@ -83,6 +89,9 @@ func NewMydumperWriter(outputDir, schema, table string, cols []string, chunkSize
 // CREATE TABLE text captured in baseline Parquet metadata. Called once, before
 // any WriteRow.
 func (w *MydumperWriter) WriteSchema(createSQL string) error {
+	if w.closed {
+		return ErrWriterClosed
+	}
 	name := fmt.Sprintf("%s.%s-schema.sql", w.schema, w.table)
 	path := filepath.Join(w.outputDir, name)
 	if err := os.WriteFile(path, []byte(createSQL), 0o644); err != nil {
@@ -96,7 +105,12 @@ func (w *MydumperWriter) WriteSchema(createSQL string) error {
 // chunk file when curBytes crosses chunkSize. values must be in the same
 // order as the cols slice passed to NewMydumperWriter; len(values) must
 // equal len(cols).
+//
+// Returns ErrWriterClosed if the writer has already been Close()d.
 func (w *MydumperWriter) WriteRow(values []any) error {
+	if w.closed {
+		return ErrWriterClosed
+	}
 	if len(values) != len(w.cols) {
 		return fmt.Errorf("MydumperWriter.WriteRow: got %d values for %d columns", len(values), len(w.cols))
 	}
@@ -141,12 +155,18 @@ func (w *MydumperWriter) WriteRow(values []any) error {
 }
 
 // Close terminates the in-progress INSERT (if any), flushes and closes the
-// current chunk file, and returns the list of files written.
+// current chunk file, and marks the writer terminal so subsequent WriteRow
+// calls return ErrWriterClosed. Idempotent.
 func (w *MydumperWriter) Close() error {
-	if w.curFile != nil {
-		return w.finishChunk()
+	if w.closed {
+		return nil
 	}
-	return nil
+	var err error
+	if w.curFile != nil {
+		err = w.finishChunk()
+	}
+	w.closed = true
+	return err
 }
 
 // Files returns every file the writer has produced so far (schema + chunks),
@@ -177,38 +197,69 @@ func (w *MydumperWriter) openChunk() error {
 }
 
 // finishChunk terminates the current INSERT statement with ";\n", flushes
-// the bufio.Writer, and closes the file.
+// the bufio.Writer, and closes the file. On any write / flush failure the
+// partially-written chunk file is removed so downstream `cat *.sql | mysql`
+// never sees a half-written statement.
 func (w *MydumperWriter) finishChunk() error {
 	if w.curFile == nil {
 		return nil
 	}
+
+	// Capture the chunk's filesystem path up-front so we can remove it on
+	// error (w.files[last] holds the relative name).
+	chunkPath := filepath.Join(w.outputDir, w.files[len(w.files)-1])
+
+	// removeChunk drops the partial file from disk AND from the files list.
+	// Called on any error below so callers never see a dangling chunk.
+	removeChunk := func() {
+		if rmErr := os.Remove(chunkPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			// Best-effort — log but don't shadow the original error. Tests
+			// rely on the file list accurately reflecting what's on disk.
+			_ = rmErr
+		}
+		w.files = w.files[:len(w.files)-1]
+	}
+
 	// Only emit the trailing semicolon if we actually wrote at least one row.
 	// An empty INSERT prefix with nothing after it would be a SQL error.
 	if !w.firstRowInChunk {
 		if _, err := w.curBuf.WriteString(";\n"); err != nil {
-			return err
+			_ = w.curFile.Close()
+			removeChunk()
+			w.resetChunkState()
+			return fmt.Errorf("finishChunk: write terminator: %w", err)
 		}
 	}
 	if err := w.curBuf.Flush(); err != nil {
-		return err
+		_ = w.curFile.Close()
+		removeChunk()
+		w.resetChunkState()
+		return fmt.Errorf("finishChunk: flush: %w", err)
 	}
 	if err := w.curFile.Close(); err != nil {
-		return err
+		removeChunk()
+		w.resetChunkState()
+		return fmt.Errorf("finishChunk: close: %w", err)
 	}
 
-	// If the chunk was empty (no rows at all), remove the file so
-	// downstream `cat *.sql | mysql` doesn't see a dangling prefix.
+	// Successful close: if the chunk was empty (INSERT prefix only, no
+	// rows), drop the file so downstream restore doesn't see a dangling
+	// "INSERT INTO ... VALUES" statement.
 	if w.firstRowInChunk {
-		// Drop the file and pop it from the files list.
-		_ = os.Remove(filepath.Join(w.outputDir, w.files[len(w.files)-1]))
-		w.files = w.files[:len(w.files)-1]
+		removeChunk()
 	}
 
+	w.resetChunkState()
+	return nil
+}
+
+// resetChunkState clears the per-chunk cursor state after a successful or
+// failed chunk close, preparing the writer for the next openChunk call.
+func (w *MydumperWriter) resetChunkState() {
 	w.curFile = nil
 	w.curBuf = nil
 	w.curBytes = 0
 	w.chunkIdx++
-	return nil
 }
 
 // WriteMetadataFile writes a mydumper-compatible top-level "metadata" file
