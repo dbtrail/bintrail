@@ -365,11 +365,13 @@ func queryArchiveSources(
 // match, uses the pattern that appears FIRST in the argument list — it is
 // argument-order precedence, not longest-match. So at position 0 of "\r\n"
 // the replacer checks "\r\n" first and matches, advancing two bytes. If the
-// bare "\r" or "\n" rule were listed before "\r\n", the replacer would
-// match "\r" at position 0, advance one byte, then match "\n" at position
-// 1, producing " |  | " — two separators instead of one. Compound patterns
-// MUST come before their components for the same reason. The CRLF and
-// multi-CRLF sub-tests in TestSanitizeArchiveErrorMessage pin this ordering.
+// bare "\r" rule were listed before "\r\n", the replacer would match "\r"
+// at position 0, advance one byte, then match "\n" at position 1, producing
+// " |  | " — two separators instead of one. The "\n" rule is safe to list
+// before "\r\n" because "\n" cannot match the "\r" byte at position 0 at
+// all, but a compound pattern must always precede any component that
+// shares its first byte. The CRLF and multi-CRLF sub-tests in
+// TestSanitizeArchiveErrorMessage pin this ordering.
 //
 // The characters covered are:
 //

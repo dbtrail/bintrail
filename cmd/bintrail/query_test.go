@@ -926,7 +926,7 @@ func TestQueryArchiveSources_emptySources(t *testing.T) {
 // broken loop, shadow the helper with a local no-op, drop the return
 // append) that would defeat behavioral tests by reaching below them.
 //
-// Mutation shapes empirically verified to trip this test during review:
+// Mutation shapes empirically verified to trip this test:
 //
 //   - Inline revert: delete the queryArchiveSources call, paste the
 //     pre-#203 `slog.Warn; continue` loop back in.
