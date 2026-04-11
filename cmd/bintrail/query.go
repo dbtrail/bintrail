@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -223,7 +225,16 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	for _, src := range archSources {
 		ar, err := parquetquery.Fetch(cmd.Context(), fetchOpts, src)
 		if err != nil {
-			slog.Warn("archive query failed, skipping", "source", src, "error", err)
+			// Issue #203: archive failures were silently swallowed into a
+			// slog.Warn, so real production outages (expired creds, DuckDB
+			// Binder errors on old schemas, S3 AccessDenied) produced empty
+			// results with exit 0 and no stderr signal. handleArchiveFetchError
+			// prints to stderr at default verbosity AND short-circuits on
+			// context cancellation so Ctrl-C doesn't iterate every remaining
+			// source printing warnings.
+			if herr := handleArchiveFetchError(cmd.Context(), src, err, os.Stderr); herr != nil {
+				return herr
+			}
 			continue
 		}
 		results = append(results, ar...)
@@ -246,6 +257,34 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	if n >= qLimit {
 		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", qLimit)
 	}
+	return nil
+}
+
+// handleArchiveFetchError decides what to do when parquetquery.Fetch fails for
+// an archive source during the query loop. It exists as a separate function so
+// unit tests can assert on stderr formatting and cancellation short-circuit
+// without needing a real database or DuckDB.
+//
+// Behavior (per issue #203):
+//
+//   - If ctx is already canceled or its deadline has exceeded, return a
+//     wrapped context error so the whole query aborts immediately instead of
+//     presenting the cancellation as a long list of "archive failed" warnings
+//     for every remaining source.
+//   - Otherwise, print a visible warning to stderr AND emit a structured
+//     slog.Warn, then return nil so the caller can continue to the next
+//     archive source. stderr is used unconditionally because slog.Warn alone
+//     is invisible under the default text log format when the operator is
+//     scanning CLI output.
+//
+// The returned error is non-nil only when the archive loop MUST stop; nil
+// means "the failure has been reported, skip this source, keep going."
+func handleArchiveFetchError(ctx context.Context, src string, fetchErr error, stderr io.Writer) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("query canceled: %w", cerr)
+	}
+	fmt.Fprintf(stderr, "Warning: archive query failed for %s: %v\n", src, fetchErr)
+	slog.Warn("archive query failed, skipping", "source", src, "error", fetchErr)
 	return nil
 }
 

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -452,5 +455,124 @@ func TestMergeResults_zeroLimitNoTruncation(t *testing.T) {
 func TestMergeResults_empty(t *testing.T) {
 	if got := query.MergeResults(nil, 10); len(got) != 0 {
 		t.Errorf("expected empty result for nil input, got %v", got)
+	}
+}
+
+// ─── handleArchiveFetchError (issue #203) ────────────────────────────────────
+//
+// These tests pin down the fix for issue #203: archive fetch failures in
+// `bintrail query` were previously swallowed by slog.Warn + continue, producing
+// empty or partial results with exit 0 and no visible stderr signal. The new
+// helper must (a) always emit a stderr line for real errors regardless of log
+// level, (b) short-circuit the loop when the context is canceled or its
+// deadline has exceeded, and (c) leave the per-source "keep going" semantics
+// untouched for non-cancellation errors so one broken archive doesn't kill the
+// whole query.
+
+func TestHandleArchiveFetchError_plainErrorWritesStderr(t *testing.T) {
+	var buf bytes.Buffer
+	err := handleArchiveFetchError(
+		context.Background(),
+		"s3://bucket/prefix/bintrail_id=abc",
+		errors.New("DuckDB Binder Error: column connection_id not found"),
+		&buf,
+	)
+	if err != nil {
+		t.Fatalf("expected nil (keep going) for plain error, got %v", err)
+	}
+	out := buf.String()
+	// The message must name the source AND include the underlying error so
+	// operators can diagnose without turning on --log-level debug. This is
+	// the visibility guarantee #203 asks for — assert it verbatim so a
+	// regression is caught on the next change.
+	if !strings.Contains(out, "Warning: archive query failed") {
+		t.Errorf("stderr missing 'Warning: archive query failed' prefix: %q", out)
+	}
+	if !strings.Contains(out, "s3://bucket/prefix/bintrail_id=abc") {
+		t.Errorf("stderr missing source path: %q", out)
+	}
+	if !strings.Contains(out, "Binder Error") {
+		t.Errorf("stderr missing underlying error detail: %q", out)
+	}
+	if !strings.HasSuffix(out, "\n") {
+		t.Errorf("stderr line must end with newline for clean CLI output: %q", out)
+	}
+}
+
+func TestHandleArchiveFetchError_canceledContextShortCircuits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled before the call
+	var buf bytes.Buffer
+	err := handleArchiveFetchError(
+		ctx,
+		"/local/archive/bintrail_id=abc",
+		// parquetquery.Fetch typically wraps the ctx error, but the helper
+		// only looks at ctx.Err(), so any fetchErr is fine here.
+		errors.New("context canceled"),
+		&buf,
+	)
+	if err == nil {
+		t.Fatal("expected non-nil error for canceled context (short-circuit), got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected errors.Is(err, context.Canceled), got %v", err)
+	}
+	if !strings.Contains(err.Error(), "query canceled") {
+		t.Errorf("expected wrapped error to mention 'query canceled', got %v", err)
+	}
+	// On cancellation we must NOT print an "archive failed" warning — the
+	// user pressed Ctrl-C, they don't want per-source noise.
+	if buf.Len() != 0 {
+		t.Errorf("expected no stderr output on cancellation, got %q", buf.String())
+	}
+}
+
+func TestHandleArchiveFetchError_deadlineExceededShortCircuits(t *testing.T) {
+	// Use a deadline in the past so ctx.Err() already reports
+	// DeadlineExceeded at the first check inside the helper.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	var buf bytes.Buffer
+	err := handleArchiveFetchError(
+		ctx,
+		"s3://bucket/prefix/bintrail_id=abc",
+		errors.New("operation took too long"),
+		&buf,
+	)
+	if err == nil {
+		t.Fatal("expected non-nil error for expired deadline, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected errors.Is(err, context.DeadlineExceeded), got %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("expected no stderr output on deadline expiry, got %q", buf.String())
+	}
+}
+
+func TestHandleArchiveFetchError_multipleSourcesKeepGoing(t *testing.T) {
+	// Simulates the common case: two broken archive sources, context still
+	// live. Both failures must be reported on stderr, helper must return
+	// nil for each, matching the "one bad source doesn't kill the query"
+	// behavior operators rely on.
+	var buf bytes.Buffer
+	ctx := context.Background()
+
+	if err := handleArchiveFetchError(ctx, "src1", errors.New("AccessDenied"), &buf); err != nil {
+		t.Fatalf("src1 unexpectedly returned error: %v", err)
+	}
+	if err := handleArchiveFetchError(ctx, "src2", errors.New("memory_limit exceeded"), &buf); err != nil {
+		t.Fatalf("src2 unexpectedly returned error: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "src1") || !strings.Contains(out, "AccessDenied") {
+		t.Errorf("stderr missing src1 failure: %q", out)
+	}
+	if !strings.Contains(out, "src2") || !strings.Contains(out, "memory_limit") {
+		t.Errorf("stderr missing src2 failure: %q", out)
+	}
+	if strings.Count(out, "Warning: archive query failed") != 2 {
+		t.Errorf("expected exactly 2 warning lines, got: %q", out)
 	}
 }
