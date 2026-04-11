@@ -21,12 +21,16 @@ type ArchiveFetcher func(ctx context.Context, opts Options, source string) ([]Re
 // AllowGaps=false. It carries the gap hours so programmatic callers can
 // inspect them via errors.As, e.g. to abort a multi-table reconstruct cleanly
 // or render a structured error to an MCP client.
+//
+// The Error() string is deliberately library-neutral (no CLI flag name). CLI
+// callers that want a flag-specific hint should unwrap with errors.As and
+// re-wrap at the call site.
 type GapError struct {
 	GapHours []time.Time
 }
 
 func (e *GapError) Error() string {
-	return FormatGapWarning(e.GapHours) + " (pass --allow-gaps to proceed with incomplete data)"
+	return FormatGapWarning(e.GapHours)
 }
 
 // FetchMergedOptions controls the behavior of FetchMerged. It is the

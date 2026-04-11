@@ -363,6 +363,81 @@ func TestFetchMerged_allArchiveSourcesFailStrict(t *testing.T) {
 	}
 }
 
+// TestFetchMerged_partialArchiveFailureDoesNotAbortStrict verifies that the
+// strict-mode all-archives-failed guard (fetchmerged.go:successfulArchives==0)
+// does NOT fire when at least one archive source succeeds. Partial failure is
+// correct behavior — we surface the broken source as an slog.Warn but keep
+// the data from the healthy ones.
+func TestFetchMerged_partialArchiveFailureDoesNotAbortStrict(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	setupPartitionedTable(t, db, dbName, []time.Time{h1})
+
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil,
+		"testdb", "orders", 1, "77", nil, nil, []byte(`{"id":77}`))
+
+	// Register TWO archive_state rows with distinct bintrail_ids so
+	// ResolveArchiveSources returns two sources. Both point at real
+	// directories so the os.Stat check in archive.go:51 passes.
+	archiveDir := t.TempDir()
+	healthyBase := filepath.Join(archiveDir, "bintrail_id=healthy")
+	brokenBase := filepath.Join(archiveDir, "bintrail_id=broken")
+	if err := os.MkdirAll(healthyBase, 0o755); err != nil {
+		t.Fatalf("mkdir healthy: %v", err)
+	}
+	if err := os.MkdirAll(brokenBase, 0o755); err != nil {
+		t.Fatalf("mkdir broken: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO archive_state
+		(partition_name, bintrail_id, local_path, row_count)
+		VALUES (?, 'healthy', ?, 0)`,
+		partitionName(h1), filepath.Join(healthyBase, "events.parquet"))
+	testutil.MustExec(t, db, `INSERT INTO archive_state
+		(partition_name, bintrail_id, local_path, row_count)
+		VALUES (?, 'broken', ?, 0)`,
+		partitionName(h1), filepath.Join(brokenBase, "events.parquet"))
+
+	brokenErr := errors.New("stub: broken archive (intentional)")
+	stubFetcher := func(_ context.Context, _ query.Options, src string) ([]query.ResultRow, error) {
+		if strings.Contains(src, "broken") {
+			return nil, brokenErr
+		}
+		// Healthy source returns zero rows with no error — successful.
+		return nil, nil
+	}
+
+	engine := query.New(db)
+	opts := query.Options{
+		Schema:   "testdb",
+		Table:    "orders",
+		PKValues: "77",
+		Since:    ptrTime(h1),
+		Until:    ptrTime(h1.Add(45 * time.Minute)),
+	}
+
+	// Strict mode: one source failed, one succeeded → successfulArchives > 0
+	// → strict guard MUST NOT fire. We still expect the live MySQL row back.
+	rows, _, err := query.FetchMerged(context.Background(), db, engine, query.FetchMergedOptions{
+		Opts:           opts,
+		DBName:         dbName,
+		NoArchive:      false,
+		AllowGaps:      false,
+		ArchiveFetcher: stubFetcher,
+	})
+	if err != nil {
+		t.Fatalf("partial archive failure under strict mode: expected success, got: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("expected 1 live row, got %d", len(rows))
+	}
+}
+
 // TestFetchMerged_noArchiveDoesNotCallFetcher is the positive replacement
 // for the deleted panic-recovery test: prove that ArchiveFetcher is never
 // invoked when NoArchive=true, even when the fetcher is non-nil.
@@ -537,62 +612,51 @@ func TestRunReconstruct_archiveAwareE2E(t *testing.T) {
 	reconstructCmd.SetContext(context.Background())
 	t.Cleanup(func() { reconstructCmd.SetContext(nil) })
 
-	// ── 5. Capture stdout and run ──────────────────────────────────────────
+	// ── 5. Capture stdout with panic-safe cleanup ──────────────────────────
+	// t.Cleanup fires even if runReconstruct panics, so stdout is restored
+	// for the rest of the test process regardless.
 	oldStdout := os.Stdout
-	r, wPipe, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("pipe: %v", err)
+	t.Cleanup(func() { os.Stdout = oldStdout })
+
+	runCapture := func() (string, error) {
+		r, wPipe, err := os.Pipe()
+		if err != nil {
+			return "", err
+		}
+		os.Stdout = wPipe
+		runErr := runReconstruct(reconstructCmd, nil)
+		wPipe.Close()
+		os.Stdout = oldStdout
+		out, _ := io.ReadAll(r)
+		return string(out), runErr
 	}
-	os.Stdout = wPipe
 
-	runErr := runReconstruct(reconstructCmd, nil)
-
-	wPipe.Close()
-	os.Stdout = oldStdout
-	outputBytes, _ := io.ReadAll(r)
-	output := string(outputBytes)
-
+	// ── 6. Smoke check: runReconstruct completes under strict mode ─────────
+	// The final-state assertion alone is NOT a strong regression test for
+	// #209 — ApplyAt copies row_after regardless of whether row_before
+	// matches, so even a reconstruction that silently missed E1 would
+	// still produce a "live-state" final from applying E2 alone. The real
+	// proof of the fix is the --history assertion below, which enumerates
+	// every event the reconstruction observed.
+	output, runErr := runCapture()
 	if runErr != nil {
 		t.Fatalf("runReconstruct failed: %v\noutput: %s", runErr, output)
 	}
-
-	// ── 6. Assert output reflects BOTH events ──────────────────────────────
-	// The final state must be "live-state" (applied from E2). Crucially,
-	// E2's row_before is "archived-state" — so for ApplyAt to reach
-	// "live-state", it had to first observe E1 (the archived event), which
-	// proves the archive was fetched. Before #209 the archived h1 partition
-	// was dropped from MySQL, so engine.Fetch alone would have returned only
-	// E2 applied against a baseline still reading "baseline" — the final
-	// state would still be "live-state" but the reconstruction would not
-	// have been semantically consistent. We assert on the final state and
-	// on the intermediate step via --history in a companion test below.
 	if !strings.Contains(output, `"live-state"`) {
 		t.Errorf("expected final state to contain live-state, got: %s", output)
 	}
-	if strings.Contains(output, `"baseline"`) {
-		t.Errorf("final state should reflect events, not raw baseline, got: %s", output)
-	}
 
-	// ── 7. Run again with --history to prove BOTH events were applied ──────
-	// history mode emits one entry per event. With E1 dropped from MySQL,
-	// history will only include E2 unless the archive path works — so this
-	// is the sharpest assertion of the #209 fix.
+	// ── 7. --history proves both events were observed ─────────────────────
+	// History mode emits one entry per event. With h1 dropped from live
+	// MySQL, the E1 entry (row_after = archived-state) can only appear if
+	// FetchMerged pulled it from the Parquet archive. Absence of
+	// "archived-state" in the history output is the sharp regression
+	// signal for #209.
 	recHistory = true
-	recFormat = "json"
-
-	r2, wPipe2, _ := os.Pipe()
-	os.Stdout = wPipe2
-	historyErr := runReconstruct(reconstructCmd, nil)
-	wPipe2.Close()
-	os.Stdout = oldStdout
-	historyBytes, _ := io.ReadAll(r2)
-	history := string(historyBytes)
-
+	history, historyErr := runCapture()
 	if historyErr != nil {
 		t.Fatalf("runReconstruct --history failed: %v\noutput: %s", historyErr, history)
 	}
-	// Expect: baseline entry + E1 (archived-state) + E2 (live-state) = three entries.
-	// If the archive is silently missed, we would see only baseline + E2.
 	if !strings.Contains(history, `"archived-state"`) {
 		t.Errorf("expected history to include the archived event's state transition, got: %s", history)
 	}

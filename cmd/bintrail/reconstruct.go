@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -240,6 +241,12 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		ArchiveFetcher: parquetquery.Fetch,
 	})
 	if err != nil {
+		// Surface the --allow-gaps hint only at the CLI layer; the library
+		// type (query.GapError) stays flag-neutral.
+		var gapErr *query.GapError
+		if errors.As(err, &gapErr) {
+			return fmt.Errorf("%w; pass --allow-gaps to proceed with an incomplete reconstruction", err)
+		}
 		return fmt.Errorf("fetch binlog events: %w", err)
 	}
 	slog.Debug("fetched binlog events", "count", len(events))

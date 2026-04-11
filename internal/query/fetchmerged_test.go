@@ -92,7 +92,12 @@ func TestGapError_errorsAs(t *testing.T) {
 	if len(gapErr.GapHours) != 2 {
 		t.Errorf("expected 2 gap hours, got %d", len(gapErr.GapHours))
 	}
-	if !strings.Contains(gapErr.Error(), "allow-gaps") {
-		t.Errorf("expected Error() to mention --allow-gaps, got: %s", gapErr.Error())
+	// The Error() string is library-neutral (no CLI flag name leaked into
+	// the internal/query package). It should still mention the gap hours.
+	if !strings.Contains(gapErr.Error(), "no data") {
+		t.Errorf("expected Error() to describe the gap, got: %s", gapErr.Error())
+	}
+	if strings.Contains(gapErr.Error(), "--") {
+		t.Errorf("GapError.Error() must not leak CLI flag names, got: %s", gapErr.Error())
 	}
 }
