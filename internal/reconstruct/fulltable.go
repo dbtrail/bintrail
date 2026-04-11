@@ -249,17 +249,18 @@ func ReconstructTable(
 	if len(pkCols) == 0 {
 		return nil, fmt.Errorf("%s.%s has no primary key in the loaded snapshot; full-table reconstruct requires a PK", schema, table)
 	}
-	// Warn about PK columns whose type is known to have encoding mismatch
-	// between the indexer and the baseline reader. This is the Phase 1
-	// mitigation for #212 — the canonicalizer handles int/string/datetime/
-	// date PKs correctly, but DECIMAL / BINARY / BLOB / BIT / JSON PKs can
-	// silently misroute events. Emit a loud warning so operators notice.
+	// Refuse to proceed when a PK column uses a type the canonicalizer
+	// cannot handle. Emitting a warning isn't enough because operators
+	// running with --log-level error won't see it and would silently get
+	// wrong output — the same class of bug #212 exists to prevent. Users
+	// with DECIMAL / BINARY / BLOB / BIT / JSON PKs must track the
+	// follow-up work on #212 for their type to be added.
 	for _, pkCol := range pkCols {
 		if !supportedPKType(pkCol.DataType) {
-			slog.Warn("full-table reconstruct: PK column type not in the supported set; "+
-				"events may silently miss the baseline (#212)",
-				"schema", schema, "table", table,
-				"column", pkCol.Name, "data_type", pkCol.DataType)
+			return nil, fmt.Errorf(
+				"full-table reconstruct: %s.%s PK column %q has type %q which is not yet supported "+
+					"(#212 tracks the supported PK type set; file a request if you need this type)",
+				schema, table, pkCol.Name, pkCol.DataType)
 		}
 	}
 
@@ -411,7 +412,10 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 		// go-mysql-formatted string (#212). The non-PK values in rowMap
 		// are left untouched — they're not used for key construction and
 		// flow unchanged into the mydumper writer below.
-		pkMap := canonicalizePKMap(rowMap, in.PKCols)
+		pkMap, err := canonicalizePKMap(rowMap, in.PKCols)
+		if err != nil {
+			return fmt.Errorf("canonicalize baseline PK for %s.%s: %w", in.Schema, in.Table, err)
+		}
 		pk := parser.BuildPKValues(in.PKCols, pkMap)
 
 		if ev, ok := in.Changes[pk]; ok {

@@ -1,50 +1,103 @@
 package reconstruct
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/dbtrail/bintrail/internal/metadata"
 )
 
-// TestCanonicalizePKValue_datetimeTime covers the core bug #212 was filed
-// for: DuckDB returns TIMESTAMP columns as time.Time, but the indexer stores
-// them as go-mysql-formatted strings. The canonicalizer must bridge the gap.
-func TestCanonicalizePKValue_datetimeTime(t *testing.T) {
+// colMeta is a small helper to build a metadata.ColumnMeta for test tables.
+func colMeta(name, dataType, columnType string) metadata.ColumnMeta {
+	return metadata.ColumnMeta{
+		Name:       name,
+		IsPK:       true,
+		DataType:   dataType,
+		ColumnType: columnType,
+	}
+}
+
+// ─── canonicalizeDatetime precision coverage ─────────────────────────────────
+
+// TestCanonicalizeDatetime_precisionAware is the #212 regression centerpiece:
+// the canonicalizer must match go-mysql's formatDatetime output at every
+// declared fractional precision (0..6), not just 0 and 6. Before this fix,
+// the Nanosecond()==0 heuristic silently broke DATETIME(6) with whole-second
+// values and DATETIME(N) with fractional values whose precision wasn't 0 or 6.
+func TestCanonicalizeDatetime_precisionAware(t *testing.T) {
 	cases := []struct {
-		name     string
-		in       time.Time
-		dataType string
-		want     string
+		name       string
+		in         time.Time
+		columnType string
+		want       string
 	}{
+		// DATETIME(0): indexer stores "YYYY-MM-DD HH:MM:SS" with no fraction.
 		{
-			name:     "datetime(0) — no subsecond",
-			in:       time.Date(2026, 4, 11, 14, 30, 45, 0, time.UTC),
-			dataType: "datetime",
-			want:     "2026-04-11 14:30:45",
+			name:       "datetime(0) whole second",
+			in:         time.Date(2026, 4, 11, 14, 30, 45, 0, time.UTC),
+			columnType: "datetime",
+			want:       "2026-04-11 14:30:45",
 		},
+		// DATETIME(6) whole second: indexer stores ".000000" tail,
+		// canonicalizer must match.
 		{
-			name:     "datetime(6) — microsecond precision",
-			in:       time.Date(2026, 4, 11, 14, 30, 45, 123456000, time.UTC),
-			dataType: "datetime",
-			want:     "2026-04-11 14:30:45.123456",
+			name:       "datetime(6) whole second",
+			in:         time.Date(2026, 4, 11, 14, 30, 45, 0, time.UTC),
+			columnType: "datetime(6)",
+			want:       "2026-04-11 14:30:45.000000",
 		},
+		// DATETIME(6) microsecond precision.
 		{
-			name:     "timestamp treated same as datetime",
-			in:       time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
-			dataType: "timestamp",
-			want:     "2020-01-01 00:00:00",
+			name:       "datetime(6) microsecond",
+			in:         time.Date(2026, 4, 11, 14, 30, 45, 123456000, time.UTC),
+			columnType: "datetime(6)",
+			want:       "2026-04-11 14:30:45.123456",
 		},
+		// DATETIME(3) millisecond precision — go-mysql truncates to 3 digits.
 		{
-			name:     "non-UTC normalised to UTC",
-			in:       time.Date(2026, 4, 11, 10, 30, 45, 0, mustLoadLocation("America/New_York")),
-			dataType: "datetime",
-			want:     "2026-04-11 14:30:45",
+			name:       "datetime(3) millisecond",
+			in:         time.Date(2026, 4, 11, 14, 30, 45, 123000000, time.UTC),
+			columnType: "datetime(3)",
+			want:       "2026-04-11 14:30:45.123",
+		},
+		// DATETIME(3) whole second: indexer stores ".000".
+		{
+			name:       "datetime(3) whole second",
+			in:         time.Date(2026, 4, 11, 14, 30, 45, 0, time.UTC),
+			columnType: "datetime(3)",
+			want:       "2026-04-11 14:30:45.000",
+		},
+		// DATETIME(1) with .1 second.
+		{
+			name:       "datetime(1) tenth second",
+			in:         time.Date(2026, 4, 11, 14, 30, 45, 100000000, time.UTC),
+			columnType: "datetime(1)",
+			want:       "2026-04-11 14:30:45.1",
+		},
+		// TIMESTAMP is treated identically to DATETIME.
+		{
+			name:       "timestamp(6) microsecond",
+			in:         time.Date(2020, 1, 1, 0, 0, 0, 500000000, time.UTC),
+			columnType: "timestamp(6)",
+			want:       "2020-01-01 00:00:00.500000",
+		},
+		// Non-UTC input normalised to UTC before formatting.
+		{
+			name:       "non-UTC normalised",
+			in:         time.Date(2026, 4, 11, 10, 30, 45, 0, mustLoadLocation("America/New_York")),
+			columnType: "datetime",
+			want:       "2026-04-11 14:30:45",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := canonicalizePKValue(tc.in, tc.dataType)
+			col := colMeta("ts", strings.TrimSuffix(strings.SplitN(tc.columnType, "(", 2)[0], ")"), tc.columnType)
+			got, err := canonicalizePKValue(tc.in, col)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
@@ -52,28 +105,119 @@ func TestCanonicalizePKValue_datetimeTime(t *testing.T) {
 	}
 }
 
-// TestCanonicalizePKValue_datetimeString covers the pass-through for
-// TIMESTAMP columns that some DuckDB configurations return as strings.
-func TestCanonicalizePKValue_datetimeString(t *testing.T) {
-	got := canonicalizePKValue("2026-04-11 14:30:45", "datetime")
+// TestCanonicalizeDatetime_fallbackHeuristic covers the pre-#212 snapshot
+// case where ColumnType is empty: the canonicalizer can still produce a
+// correct result for DATETIME(0) (the common case) via the Nanosecond()==0
+// heuristic. DATETIME(N>0) whole-second values are knowingly unreliable
+// under this fallback — document the limitation in a separate test.
+func TestCanonicalizeDatetime_fallbackHeuristic(t *testing.T) {
+	col := colMeta("ts", "datetime", "") // empty ColumnType → pre-#212 snapshot
+
+	// Nanosecond=0: fallback emits no fraction (correct for DATETIME(0))
+	got, err := canonicalizePKValue(time.Date(2026, 4, 11, 14, 30, 45, 0, time.UTC), col)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if got != "2026-04-11 14:30:45" {
-		t.Errorf("expected pass-through, got %v", got)
+		t.Errorf("fallback zero-nanosecond: got %q", got)
+	}
+
+	// Nanosecond!=0: fallback emits microsecond tail (correct for DATETIME(6))
+	got2, err2 := canonicalizePKValue(time.Date(2026, 4, 11, 14, 30, 45, 123456000, time.UTC), col)
+	if err2 != nil {
+		t.Fatalf("unexpected error: %v", err2)
+	}
+	if got2 != "2026-04-11 14:30:45.123456" {
+		t.Errorf("fallback sub-second: got %q", got2)
 	}
 }
 
-// TestCanonicalizePKValue_dateTime verifies DATE columns are formatted
-// without the time component.
-func TestCanonicalizePKValue_dateTime(t *testing.T) {
-	in := time.Date(2026, 4, 11, 23, 59, 59, 0, time.UTC)
-	got := canonicalizePKValue(in, "date")
+// TestCanonicalizeDatetime_stringPassThrough covers the branch where DuckDB
+// returns a DATETIME column as a pre-formatted string (some driver modes).
+func TestCanonicalizeDatetime_stringPassThrough(t *testing.T) {
+	col := colMeta("ts", "datetime", "datetime(6)")
+	got, err := canonicalizePKValue("2026-04-11 14:30:45.123456", col)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "2026-04-11 14:30:45.123456" {
+		t.Errorf("got %q, want pass-through", got)
+	}
+}
+
+// TestCanonicalizeDatetime_unknownTypeErrors covers the defense-in-depth
+// check: a DATETIME column whose scanned Go value is neither time.Time nor
+// string must error instead of silently passing through %v.
+func TestCanonicalizeDatetime_unknownTypeErrors(t *testing.T) {
+	col := colMeta("ts", "datetime", "datetime")
+	_, err := canonicalizePKValue(int64(1712847045), col)
+	if err == nil {
+		t.Fatal("expected error for non-time.Time DATETIME value, got nil")
+	}
+	if !strings.Contains(err.Error(), "time.Time") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// ─── canonicalizeDate ────────────────────────────────────────────────────────
+
+func TestCanonicalizeDate(t *testing.T) {
+	col := colMeta("d", "date", "date")
+
+	got, err := canonicalizePKValue(time.Date(2026, 4, 11, 23, 59, 59, 0, time.UTC), col)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if got != "2026-04-11" {
-		t.Errorf("got %q, want 2026-04-11", got)
+		t.Errorf("time.Time: got %q", got)
+	}
+
+	// String pass-through.
+	got2, err := canonicalizePKValue("2026-04-11", col)
+	if err != nil || got2 != "2026-04-11" {
+		t.Errorf("string pass-through: got %q err=%v", got2, err)
+	}
+
+	// Non-time-or-string error.
+	_, err = canonicalizePKValue(int64(12345), col)
+	if err == nil {
+		t.Fatal("expected error for non-time/string DATE value")
 	}
 }
 
-// TestCanonicalizePKValue_intPassthrough confirms that integer types flow
-// through unchanged — both the indexer and DuckDB return intN so no
-// canonicalisation is needed.
+// ─── parseDatetimePrecision ──────────────────────────────────────────────────
+
+func TestParseDatetimePrecision(t *testing.T) {
+	cases := []struct {
+		in    string
+		dec   int
+		known bool
+	}{
+		{"datetime", 0, true},
+		{"datetime(0)", 0, true},
+		{"datetime(3)", 3, true},
+		{"datetime(6)", 6, true},
+		{"timestamp", 0, true},
+		{"timestamp(6)", 6, true},
+		{"TIMESTAMP(3)", 3, true},
+		{"  datetime(6)  ", 6, true},
+		{"", 0, false}, // pre-#212 snapshot
+		{"datetime(7)", 0, false}, // out of range
+		{"datetime(abc)", 0, false}, // unparseable
+		{"varchar(64)", 0, false}, // wrong prefix
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			dec, known := parseDatetimePrecision(c.in)
+			if dec != c.dec || known != c.known {
+				t.Errorf("parse(%q) = (%d,%v), want (%d,%v)", c.in, dec, known, c.dec, c.known)
+			}
+		})
+	}
+}
+
+// ─── integer and string pass-through ────────────────────────────────────────
+
 func TestCanonicalizePKValue_intPassthrough(t *testing.T) {
 	cases := []struct {
 		dataType string
@@ -82,55 +226,93 @@ func TestCanonicalizePKValue_intPassthrough(t *testing.T) {
 		{"int", int32(42)},
 		{"bigint", int64(9876543210)},
 		{"smallint", int16(100)},
-		{"int unsigned", uint32(4_000_000_000)},
+		{"tinyint", int8(5)},
+		{"mediumint", int32(16777215)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.dataType, func(t *testing.T) {
-			got := canonicalizePKValue(tc.value, tc.dataType)
+			col := colMeta("id", tc.dataType, tc.dataType)
+			got, err := canonicalizePKValue(tc.value, col)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if got != tc.value {
-				t.Errorf("%s: got %v (%T), want %v (%T)",
-					tc.dataType, got, got, tc.value, tc.value)
+				t.Errorf("%s: got %v, want %v", tc.dataType, got, tc.value)
 			}
 		})
 	}
 }
 
-// TestCanonicalizePKValue_stringPassthrough confirms VARCHAR/CHAR/TEXT PKs
-// are returned unchanged (the indexer and DuckDB both deliver Go string).
 func TestCanonicalizePKValue_stringPassthrough(t *testing.T) {
 	for _, dt := range []string{"varchar", "char", "text", "enum", "set"} {
-		got := canonicalizePKValue("some-id", dt)
+		col := colMeta("id", dt, dt)
+		got, err := canonicalizePKValue("some-id", col)
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", dt, err)
+			continue
+		}
 		if got != "some-id" {
 			t.Errorf("%s: got %q, want some-id", dt, got)
 		}
 	}
 }
 
-// TestCanonicalizePKValue_nilReturnsNil ensures nil values aren't coerced
-// into something else.
-func TestCanonicalizePKValue_nilReturnsNil(t *testing.T) {
-	if got := canonicalizePKValue(nil, "int"); got != nil {
-		t.Errorf("got %v, want nil", got)
+// Non-string scanned into a VARCHAR PK must error — the canonicalizer has
+// no way to know what to do with it.
+func TestCanonicalizePKValue_stringTypeMismatchErrors(t *testing.T) {
+	col := colMeta("name", "varchar", "varchar(64)")
+	_, err := canonicalizePKValue(int64(42), col)
+	if err == nil {
+		t.Fatal("expected error for non-string varchar PK")
 	}
-	if got := canonicalizePKValue(nil, "datetime"); got != nil {
-		t.Errorf("datetime nil: got %v, want nil", got)
+	if !strings.Contains(err.Error(), "expected string") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
-// TestCanonicalizePKMap_onlyTouchesPKColumns verifies that non-PK columns
-// in the input map are preserved untouched — they flow into the mydumper
-// writer and must not be altered by the PK canonicalisation step.
+// ─── hard-fail paths ─────────────────────────────────────────────────────────
+
+func TestCanonicalizePKValue_nilErrors(t *testing.T) {
+	col := colMeta("id", "int", "int")
+	_, err := canonicalizePKValue(nil, col)
+	if err == nil {
+		t.Fatal("expected error for nil PK value")
+	}
+	if !strings.Contains(err.Error(), "nil PK value") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestCanonicalizePKValue_unsupportedTypeErrors(t *testing.T) {
+	for _, dt := range []string{"decimal", "binary", "blob", "bit", "json"} {
+		col := colMeta("x", dt, dt)
+		_, err := canonicalizePKValue("whatever", col)
+		if err == nil {
+			t.Errorf("%s: expected error for unsupported PK type, got nil", dt)
+			continue
+		}
+		if !strings.Contains(err.Error(), "unsupported") {
+			t.Errorf("%s: unexpected error: %v", dt, err)
+		}
+	}
+}
+
+// ─── canonicalizePKMap ───────────────────────────────────────────────────────
+
 func TestCanonicalizePKMap_onlyTouchesPKColumns(t *testing.T) {
 	pkCols := []metadata.ColumnMeta{
-		{Name: "created_at", OrdinalPosition: 1, IsPK: true, DataType: "datetime"},
+		colMeta("created_at", "datetime", "datetime"),
 	}
 	created := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
 	row := map[string]any{
 		"created_at":    created,
-		"status":        "shipped",          // non-PK; must pass through
-		"extra_payload": []byte{0xde, 0xad}, // non-PK; must pass through
+		"status":        "shipped",
+		"extra_payload": []byte{0xde, 0xad},
 	}
-	out := canonicalizePKMap(row, pkCols)
+	out, err := canonicalizePKMap(row, pkCols)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if out["created_at"] != "2026-04-11 12:00:00" {
 		t.Errorf("PK not canonicalised: got %v", out["created_at"])
@@ -138,34 +320,55 @@ func TestCanonicalizePKMap_onlyTouchesPKColumns(t *testing.T) {
 	if out["status"] != "shipped" {
 		t.Errorf("non-PK string mangled: got %v", out["status"])
 	}
-	// Non-PK []byte survives by-identity.
 	if _, ok := out["extra_payload"].([]byte); !ok {
 		t.Errorf("non-PK []byte changed type: got %T", out["extra_payload"])
 	}
-	// Source map is not mutated.
-	if row["created_at"] != created {
-		t.Error("source map was mutated; canonicalizePKMap must return a new map")
+
+	// Rigorous immutability check: input map must still hold the
+	// ORIGINAL time.Time value at the "created_at" key.
+	if gotIn, ok := row["created_at"].(time.Time); !ok {
+		t.Errorf("source map 'created_at' type changed; canonicalizePKMap must not mutate input")
+	} else if !gotIn.Equal(created) {
+		t.Errorf("source map 'created_at' value changed")
 	}
 }
 
-// TestCanonicalizePKMap_compositePK handles a PK made of multiple columns
-// with distinct types.
+func TestCanonicalizePKMap_missingColumnErrors(t *testing.T) {
+	pkCols := []metadata.ColumnMeta{
+		colMeta("id", "int", "int"),
+	}
+	row := map[string]any{
+		// "id" is missing
+		"payload": "x",
+	}
+	_, err := canonicalizePKMap(row, pkCols)
+	if err == nil {
+		t.Fatal("expected error for missing PK column, got nil")
+	}
+	if !errors.Is(err, ErrPKColumnMissing) {
+		t.Errorf("expected ErrPKColumnMissing, got: %v", err)
+	}
+}
+
 func TestCanonicalizePKMap_compositePK(t *testing.T) {
 	pkCols := []metadata.ColumnMeta{
-		{Name: "tenant", OrdinalPosition: 1, IsPK: true, DataType: "varchar"},
-		{Name: "created_at", OrdinalPosition: 2, IsPK: true, DataType: "datetime"},
-		{Name: "seq", OrdinalPosition: 3, IsPK: true, DataType: "int"},
+		colMeta("tenant", "varchar", "varchar(64)"),
+		colMeta("created_at", "datetime", "datetime(6)"),
+		colMeta("seq", "int", "int"),
 	}
 	row := map[string]any{
 		"tenant":     "acme",
-		"created_at": time.Date(2026, 4, 11, 9, 0, 0, 0, time.UTC),
+		"created_at": time.Date(2026, 4, 11, 9, 0, 0, 500000000, time.UTC),
 		"seq":        int64(1),
 	}
-	out := canonicalizePKMap(row, pkCols)
+	out, err := canonicalizePKMap(row, pkCols)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if out["tenant"] != "acme" {
 		t.Errorf("tenant: got %v", out["tenant"])
 	}
-	if out["created_at"] != "2026-04-11 09:00:00" {
+	if out["created_at"] != "2026-04-11 09:00:00.500000" {
 		t.Errorf("created_at: got %v", out["created_at"])
 	}
 	if out["seq"] != int64(1) {
@@ -173,11 +376,11 @@ func TestCanonicalizePKMap_compositePK(t *testing.T) {
 	}
 }
 
-// TestSupportedPKType covers the Phase-1 warning guard.
+// ─── supportedPKType ─────────────────────────────────────────────────────────
+
 func TestSupportedPKType(t *testing.T) {
 	supported := []string{
 		"int", "bigint", "smallint", "tinyint", "mediumint",
-		"int unsigned", "bigint unsigned",
 		"char", "varchar", "text", "tinytext", "mediumtext", "longtext",
 		"enum", "set",
 		"datetime", "timestamp", "date", "year",
@@ -200,8 +403,6 @@ func TestSupportedPKType(t *testing.T) {
 	}
 }
 
-// TestSupportedPKType_caseInsensitive confirms we handle both "DATETIME" and
-// "datetime" as the canonicalizer does.
 func TestSupportedPKType_caseInsensitive(t *testing.T) {
 	if !supportedPKType("DATETIME") {
 		t.Error("uppercase DATETIME should be supported")
