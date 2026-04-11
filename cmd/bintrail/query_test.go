@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"strings"
 	"testing"
@@ -469,9 +472,9 @@ func TestMergeResults_empty(t *testing.T) {
 // into queryArchiveSources so the exact code path production hits can be
 // driven by a fake fetcher — no DuckDB, no real DB, no integration tag.
 //
-// Each test is a regression guard for a specific contract in the helper's
-// doc comment. Read them together as the single source of truth for what
-// "archive failures must be surfaced" means for bintrail query.
+// Each test below pins a specific clause from the queryArchiveSources doc
+// comment. If you add a new clause to the contract, add a matching test
+// here. The tests are the enforceable half of the contract the doc describes.
 
 // captureSlogDefault redirects slog.Default() to a text handler writing into
 // buf for the lifetime of the test, restoring the previous default on
@@ -479,6 +482,13 @@ func TestMergeResults_empty(t *testing.T) {
 // helper — without it, a future refactor could silently delete the structured
 // log line and every stderr-only assertion would still pass, regressing the
 // "dual-channel reporting" contract from #203.
+//
+// Callers MUST NOT use t.Parallel() in conjunction with this helper.
+// slog.SetDefault mutates process-global state; two parallel tests that both
+// call captureSlogDefault would race on the default handler and produce
+// flaky assertions. Go's testing package still runs t.Cleanup on panicked
+// tests, so the restore is safe against a t.Fatalf mid-test — the hazard is
+// exclusively t.Parallel, not panics.
 func captureSlogDefault(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
@@ -492,6 +502,12 @@ func captureSlogDefault(t *testing.T) *bytes.Buffer {
 // scripted sequence of (rows, err) results and records every call. The test
 // uses the recorded calls to prove loop semantics: e.g. that a canceled
 // context halts iteration before the next source is touched.
+//
+// If a test scripts fewer responses than the helper makes calls, the excess
+// calls return a synthetic "unexpected call" error rather than panicking so
+// over-iteration bugs surface through the stderr/error assertions with a
+// clear message. Call .fn() exactly once per test — it returns a fresh
+// closure every invocation and calling it twice is a copy-paste hazard.
 type fakeFetcher struct {
 	responses []fakeResponse
 	calls     []string // sources that were actually invoked
@@ -502,7 +518,7 @@ type fakeResponse struct {
 	err  error
 }
 
-func (f *fakeFetcher) fn() func(context.Context, query.Options, string) ([]query.ResultRow, error) {
+func (f *fakeFetcher) fn() query.ArchiveFetcher {
 	return func(_ context.Context, _ query.Options, src string) ([]query.ResultRow, error) {
 		idx := len(f.calls)
 		f.calls = append(f.calls, src)
@@ -562,6 +578,9 @@ func TestQueryArchiveSources_plainErrorKeepsGoingWithDualChannel(t *testing.T) {
 	}
 	if strings.Contains(stderrOut, "/local/bintrail_id=abc") {
 		t.Errorf("stderr should NOT mention src2 (which succeeded): %q", stderrOut)
+	}
+	if !strings.HasSuffix(stderrOut, "\n") {
+		t.Errorf("stderr warning must end with a newline for clean line framing: %q", stderrOut)
 	}
 
 	// slog.Default() received the structured warning. Assert on the msg and
@@ -685,8 +704,12 @@ func TestQueryArchiveSources_wrappedCanceledFetchErrShortCircuits(t *testing.T) 
 // TestQueryArchiveSources_wrappedDeadlineExceededShortCircuits is the
 // symmetric case to the wrapped-Canceled test above. Deadline expiry can
 // also arrive wrapped in a DuckDB/S3 error chain before the ambient context
-// reports it.
+// reports it. Captures slog.Default() for the same symmetry reason the
+// canceled test does — a future refactor that emits a slog.Warn on this
+// path would break the "no output on cancel" contract without the test
+// catching it.
 func TestQueryArchiveSources_wrappedDeadlineExceededShortCircuits(t *testing.T) {
+	slogBuf := captureSlogDefault(t)
 	var stderr bytes.Buffer
 
 	f := &fakeFetcher{responses: []fakeResponse{
@@ -708,6 +731,9 @@ func TestQueryArchiveSources_wrappedDeadlineExceededShortCircuits(t *testing.T) 
 	}
 	if stderr.Len() != 0 {
 		t.Errorf("expected no stderr output, got %q", stderr.String())
+	}
+	if slogBuf.Len() != 0 {
+		t.Errorf("expected no slog output for wrapped DeadlineExceeded, got %q", slogBuf.String())
 	}
 }
 
@@ -830,25 +856,120 @@ func TestQueryArchiveSources_emptySources(t *testing.T) {
 	}
 }
 
+// TestRunQueryCallsQueryArchiveSources is a meta-test that asserts the
+// `runQuery` function in query.go actually calls `queryArchiveSources`.
+//
+// Why this test exists: every other test in this file drives
+// queryArchiveSources directly with a fake fetcher, which catches any
+// regression INSIDE the helper. But none of them would fail if someone
+// deleted the call-site invocation and pasted the original pre-#203 broken
+// loop back into runQuery. The helper would become dead code, all eight
+// contract tests would still pass, and the silent-failure bug would be
+// back in production. The pr-test-analyzer flagged this exact scenario
+// during the second-round PR review.
+//
+// This test closes that gap with a simple AST walk: parse query.go, find
+// the runQuery FuncDecl, and assert that it contains a call expression
+// whose identifier is "queryArchiveSources". It is NOT a behavioral test —
+// it cannot check that the call has the right arguments or that the
+// surrounding control flow is correct — but it DOES catch the specific
+// "inline the old broken loop and leave the helper orphaned" refactor
+// that the pr-test-analyzer mutation-tested into existence.
+//
+// The test uses go/parser at the file level so it only depends on the
+// repository checkout layout, not on any runtime state or build tags. It
+// cannot run from an installed binary without the source — which is fine,
+// test binaries are always built from the repo.
+func TestRunQueryCallsQueryArchiveSources(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "query.go", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse query.go: %v", err)
+	}
+
+	var runQueryFn *ast.FuncDecl
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fn.Name.Name == "runQuery" && fn.Recv == nil {
+			runQueryFn = fn
+			break
+		}
+	}
+	if runQueryFn == nil {
+		t.Fatal("could not find top-level func runQuery in query.go")
+	}
+
+	var found bool
+	ast.Inspect(runQueryFn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if id.Name == "queryArchiveSources" {
+			found = true
+			return false
+		}
+		return true
+	})
+
+	if !found {
+		t.Error(
+			"runQuery must call queryArchiveSources — reverting to an inline " +
+				"slog.Warn; continue loop silently re-introduces issue #203. If " +
+				"you are intentionally removing the helper, delete this test AND " +
+				"the queryArchiveSources function together, and make sure the " +
+				"replacement still pins the dual-channel stderr+slog contract " +
+				"with a runQuery-level test.")
+	}
+}
+
 // TestSanitizeArchiveErrorMessage is a focused unit test for the newline
 // sanitizer — it's trivial but the behavior is part of the stderr contract
-// and deserves a direct pin.
+// and deserves a direct pin. The CRLF and CR-only cases guard against
+// regression to a naive ReplaceAll("\n", ...) that would leave stray
+// carriage returns on stderr and break line-oriented consumers on a tty.
+// The ordering inside strings.NewReplacer is load-bearing here: "\r\n" must
+// be processed before the bare "\r" and "\n" rules, otherwise CRLF input
+// would expand to " |  | " instead of a single separator.
 func TestSanitizeArchiveErrorMessage(t *testing.T) {
 	cases := []struct {
+		name string
 		in   string
 		want string
 	}{
-		{"single line", "single line"},
-		{"two\nlines", "two | lines"},
-		{"leading\n", "leading | "},
-		{"\ntrailing", " | trailing"},
-		{"many\nlines\nhere", "many | lines | here"},
-		{"", ""},
+		{"single_line", "single line", "single line"},
+		{"lf", "two\nlines", "two | lines"},
+		{"leading_lf", "leading\n", "leading | "},
+		{"trailing_lf", "\ntrailing", " | trailing"},
+		{"many_lfs", "many\nlines\nhere", "many | lines | here"},
+		{"empty", "", ""},
+		// CRLF must collapse to a SINGLE separator — not " |  | ".
+		{"crlf", "win\r\nlf", "win | lf"},
+		{"multiple_crlf", "a\r\nb\r\nc", "a | b | c"},
+		// Bare CR alone (old Mac, partial HTTP responses) — must not
+		// leak a carriage return onto stderr where it would overwrite
+		// the line on a tty.
+		{"bare_cr", "cr\ronly", "cr | only"},
+		{"trailing_cr", "trailing\r", "trailing | "},
+		// Mixed: CRLF followed by bare CR followed by LF.
+		{"mixed", "a\r\nb\rc\nd", "a | b | c | d"},
+		// Vertical tab and form feed — rare but valid line terminators.
+		{"vtab", "a\vb", "a | b"},
+		{"formfeed", "a\fb", "a | b"},
 	}
 	for _, tc := range cases {
-		got := sanitizeArchiveErrorMessage(errors.New(tc.in))
-		if got != tc.want {
-			t.Errorf("sanitizeArchiveErrorMessage(%q): got %q, want %q", tc.in, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeArchiveErrorMessage(errors.New(tc.in))
+			if got != tc.want {
+				t.Errorf("sanitizeArchiveErrorMessage(%q): got %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }

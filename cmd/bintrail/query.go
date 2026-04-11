@@ -264,41 +264,61 @@ func runQuery(cmd *cobra.Command, args []string) error {
 // Contract:
 //
 //   - Success path: accumulates events from every source in order (no dedup —
-//     MergeResults runs at the call site) and returns (rows, nil).
+//     MergeResults runs at the call site) and returns (rows, nil). rows is
+//     nil when sources is empty or every source returns zero rows.
 //   - Plain fetch error: emits a visible stderr warning AND a structured
 //     slog.Warn for that source, then continues to the next source. Both
-//     channels must fire — the stderr line is what an operator at default
-//     verbosity sees; the slog record is what JSON-format consumers see.
-//     Operators running --log-format=text at --log-level=warn see both lines;
-//     that duplication is deliberate and is the price of the visibility
-//     guarantee.
+//     channels must fire. The stderr path exists specifically so that it
+//     does NOT depend on slog configuration — an operator who has changed
+//     --log-level, --log-format, or has a misconfigured slog.Default() must
+//     still see the warning. A log-level or log-format change must never be
+//     able to silence a #203 warning. Operators running the default text
+//     handler will see both lines; that duplication is deliberate and is the
+//     price of the visibility guarantee. This invariant is pinned by
+//     TestQueryArchiveSources_plainErrorKeepsGoingWithDualChannel; do not
+//     drop either channel without updating that test.
 //   - Context canceled / deadline exceeded: returns a wrapped context error
 //     and stops iterating. No stderr warning and no slog.Warn for the
 //     canceled source — a Ctrl-C'd query should not dump per-source noise
 //     before exiting. The caller bubbles the error through cobra to
 //     os.Exit(non-zero).
 //
+// Partial-drop on cancellation: when the helper short-circuits mid-loop, any
+// archive rows already accumulated from earlier sources are dropped along
+// with any live-MySQL rows the caller had fetched before this call. That is
+// a UX tradeoff, not an oversight — a canceled query is an incomplete query,
+// and showing partial results alongside a "canceled" error would invite the
+// operator to treat them as authoritative. If that tradeoff needs to change
+// (e.g. to flush partial rows on timeout), the change belongs at the call
+// site in runQuery, not inside this helper.
+//
 // The cancellation detection path has two checks because the fetch error
-// itself can wrap context.Canceled/DeadlineExceeded before the ambient
-// ctx.Err() transitions (child-context races, DuckDB/httpfs cancellation
-// propagation). Either signal aborts the loop; missing the second check was
-// the specific finding I1 from the PR #217 review.
+// itself can wrap context.Canceled/context.DeadlineExceeded before the
+// ambient ctx.Err() transitions (child-context races, DuckDB/httpfs
+// cancellation propagation). Either signal aborts the loop. The checks use
+// errors.Is, which walks the standard Unwrap chain — including errors.Join
+// trees — but does NOT detect custom cancel causes from
+// context.WithCancelCause. Nothing in bintrail uses WithCancelCause for the
+// query path, so that gap is only theoretical; noting it so a future
+// maintainer who adds WithCancelCause elsewhere knows to extend the check.
 //
-// The fetch parameter is injected so unit tests drive the real loop body
-// with a fake fetcher — no DuckDB, no real database, and the exact same
-// code path that production hits. Similarly stderr is an io.Writer so tests
-// capture into a bytes.Buffer without touching os.Stderr.
+// The fetch parameter is injected (typed as query.ArchiveFetcher so the
+// signature stays in lockstep with the shared FetchMerged pipeline) so unit
+// tests drive the real loop body with a fake fetcher — no DuckDB, no real
+// database, and the exact same code path that production hits. Similarly
+// stderr is an io.Writer so tests capture into a bytes.Buffer without
+// touching os.Stderr.
 //
-// Stderr messages are sanitized against embedded newlines. DuckDB
-// "Binder Error" messages and AWS SDK errors frequently span multiple
-// lines, which breaks line-oriented consumers (grep, systemd-journald
-// message framing, log shippers keyed on line prefix). Collapsing to
-// " | " separators keeps one warning = one line.
+// Stderr messages are sanitized against every line-terminator character via
+// sanitizeArchiveErrorMessage so multi-line DuckDB and AWS SDK errors do not
+// split across lines — breaking line-oriented stderr consumers (grep,
+// systemd-journald message framing, log shippers keyed on line prefix) was
+// the concrete class of regression that prompted the sanitization step.
 func queryArchiveSources(
 	ctx context.Context,
 	sources []string,
 	opts query.Options,
-	fetch func(context.Context, query.Options, string) ([]query.ResultRow, error),
+	fetch query.ArchiveFetcher,
 	stderr io.Writer,
 ) ([]query.ResultRow, error) {
 	var results []query.ResultRow
@@ -313,6 +333,12 @@ func queryArchiveSources(
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, fmt.Errorf("query canceled: %w", err)
 			}
+			// stderr gets the sanitized form (one line = one failure).
+			// slog.Warn gets the raw error so structured-log handlers can
+			// preserve the full text — a JSON handler encodes embedded
+			// newlines natively, and a future "consistency" refactor that
+			// passes the sanitized form to slog would silently degrade the
+			// primary debuggability channel.
 			fmt.Fprintf(stderr, "Warning: archive query failed for %s: %s\n",
 				src, sanitizeArchiveErrorMessage(err))
 			slog.Warn("archive query failed, skipping", "source", src, "error", err)
@@ -323,13 +349,45 @@ func queryArchiveSources(
 	return results, nil
 }
 
-// sanitizeArchiveErrorMessage collapses newlines in an error message so that
-// a single archive failure always occupies exactly one stderr line. DuckDB's
-// Binder/Parser errors and AWS SDK errors are the most common offenders.
-// Kept separate from queryArchiveSources so the substitution is reusable if
-// we add a second stderr warning in the future.
+// lineBreakReplacer rewrites every kind of line terminator that can appear in
+// a Go error message to " | " so that sanitizeArchiveErrorMessage always
+// produces a single-line result. Order matters: "\r\n" MUST be listed before
+// the bare "\r" and "\n" replacements, otherwise CRLF input would expand to
+// " |  | " instead of a single separator. strings.NewReplacer guarantees
+// left-to-right longest-match semantics so the rule is: compound first, then
+// singles.
+//
+// The characters covered are:
+//
+//   - "\r\n" and "\r" — CRLF from AWS SDK error chains that bubble through
+//     stringified *http.Response bodies; bare "\r" on a tty overwrites the
+//     stderr line and hides part of the warning.
+//   - "\n" — the common case (DuckDB Binder/Parser errors).
+//   - "\v" (vertical tab) and "\f" (form feed) — rare but can appear in
+//     errors from text/template and some validation libraries; both break
+//     line-oriented stderr consumers on some platforms.
+//
+// Unicode line separators (NEL U+0085, LS U+2028, PS U+2029) are intentionally
+// NOT handled — they only appear in error messages when the underlying error
+// embeds JSON-escaped user data, which is not a shape bintrail emits.
+var lineBreakReplacer = strings.NewReplacer(
+	"\r\n", " | ",
+	"\r", " | ",
+	"\n", " | ",
+	"\v", " | ",
+	"\f", " | ",
+)
+
+// sanitizeArchiveErrorMessage collapses every line-terminator character in an
+// error message to " | " so that a single archive failure always occupies
+// exactly one stderr line. DuckDB Binder/Parser errors and AWS SDK errors are
+// the common offenders; see lineBreakReplacer for the full character list.
+//
+// Extracted from queryArchiveSources so the behavior has its own table-driven
+// test (TestSanitizeArchiveErrorMessage) that can exercise edge cases
+// independently of the archive fetch loop.
 func sanitizeArchiveErrorMessage(err error) string {
-	return strings.ReplaceAll(err.Error(), "\n", " | ")
+	return lineBreakReplacer.Replace(err.Error())
 }
 
 // archiveSources returns the Hive-scoped archive source paths for the current
