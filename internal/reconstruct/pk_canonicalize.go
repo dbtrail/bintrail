@@ -78,7 +78,7 @@ func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 		return canonicalizeDate(raw, col)
 
 	default:
-		return nil, fmt.Errorf("canonicalizePKValue: column %q has unsupported PK type %q (#212 tracks expanding the supported set)", col.Name, col.DataType)
+		return nil, fmt.Errorf("canonicalizePKValue: column %q has unsupported PK type %q (#214 tracks expanding the supported set)", col.Name, col.DataType)
 	}
 }
 
@@ -171,11 +171,32 @@ func parseDatetimePrecision(columnType string) (int, bool) {
 	return 0, false
 }
 
-// ErrPKColumnMissing indicates a PK column declared in the resolver was
-// not found in the row map passed to canonicalizePKMap. This is always a
-// hard error: the baseline Parquet schema must contain every PK column,
-// or something is wrong with the snapshot or the Parquet file.
-var ErrPKColumnMissing = errors.New("canonicalizePKMap: PK column missing from row")
+// ErrPKColumnMissing is a sentinel matchable via errors.Is for the case
+// where a PK column declared in the resolver was not found in the row map
+// passed to canonicalizePKMap. Returned errors are always typed as
+// *MissingPKColumnError so callers that need the offending column name
+// can recover it via errors.As.
+var ErrPKColumnMissing = errors.New("PK column missing from row")
+
+// MissingPKColumnError carries the specific column name that was absent
+// from the baseline row, letting callers produce actionable error messages
+// without string-parsing. Returned wrapped as `errors.Is(err,
+// ErrPKColumnMissing)` via the Is method below.
+type MissingPKColumnError struct {
+	Column string
+}
+
+func (e *MissingPKColumnError) Error() string {
+	return fmt.Sprintf("%s: column %q not in baseline row (run `bintrail snapshot` to refresh the schema snapshot if the table has been altered)",
+		ErrPKColumnMissing.Error(), e.Column)
+}
+
+// Is returns true when target is the ErrPKColumnMissing sentinel, so
+// `errors.Is(err, ErrPKColumnMissing)` keeps working even when the
+// concrete type is *MissingPKColumnError.
+func (e *MissingPKColumnError) Is(target error) bool {
+	return target == ErrPKColumnMissing
+}
 
 // canonicalizePKMap takes a full row map and a PK column descriptor, and
 // returns a new map with only the PK columns' values canonicalised
@@ -192,8 +213,7 @@ func canonicalizePKMap(row map[string]any, pkCols []metadata.ColumnMeta) (map[st
 	for _, col := range pkCols {
 		raw, ok := out[col.Name]
 		if !ok {
-			return nil, fmt.Errorf("%w: column %q not in baseline row (run `bintrail snapshot` to refresh the schema snapshot if the table has been altered)",
-				ErrPKColumnMissing, col.Name)
+			return nil, &MissingPKColumnError{Column: col.Name}
 		}
 		val, err := canonicalizePKValue(raw, col)
 		if err != nil {

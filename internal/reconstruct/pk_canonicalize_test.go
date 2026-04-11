@@ -345,8 +345,17 @@ func TestCanonicalizePKMap_missingColumnErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing PK column, got nil")
 	}
+	// Sentinel check via errors.Is — existing callers rely on this.
 	if !errors.Is(err, ErrPKColumnMissing) {
-		t.Errorf("expected ErrPKColumnMissing, got: %v", err)
+		t.Errorf("expected errors.Is(err, ErrPKColumnMissing), got: %v", err)
+	}
+	// Typed check via errors.As — callers that want the column name.
+	var missing *MissingPKColumnError
+	if !errors.As(err, &missing) {
+		t.Fatalf("expected errors.As to unwrap *MissingPKColumnError, got: %T", err)
+	}
+	if missing.Column != "id" {
+		t.Errorf("Column = %q, want %q", missing.Column, "id")
 	}
 }
 

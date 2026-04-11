@@ -419,6 +419,121 @@ func TestRunReconstruct_fullTableRoundTrip_varcharPK(t *testing.T) {
 	}
 }
 
+// TestRunReconstruct_rejectsDecimalPK is the call-site test for the
+// unsupported-PK-type hard-error path in ReconstructTable. The canonicalizer
+// unit tests cover supportedPKType as a pure predicate, but this test pins
+// that the guard actually fires at the start of the full-table reconstruct
+// flow — a future refactor that reorders the validation block can't regress
+// to the pre-#212 silent-wrong-output behaviour without tripping this test.
+//
+// We build a schema_snapshots row with data_type=decimal and run the CLI
+// dispatcher. No baseline is needed because the reconstruct must fail
+// before any baseline work happens.
+func TestRunReconstruct_rejectsDecimalPK(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	// schema_snapshots row with a DECIMAL PK.
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+		VALUES (1, UTC_TIMESTAMP(), 'pkdecimal', 'prices', 'amount', 1, 'PRI', 'decimal', 'decimal(10,2)', 'NO', 0)`)
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+		VALUES (1, UTC_TIMESTAMP(), 'pkdecimal', 'prices', 'label', 2, '', 'varchar', 'varchar(64)', 'NO', 0)`)
+
+	// We need a baseline directory to pass the CLI validation, but the
+	// reconstruct will fail before it ever reads the baseline because
+	// the PK type check fires at ReconstructTable entry.
+	baselineDir := t.TempDir()
+	h1 := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Hour)
+	snapshotTSDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
+	parquetDir := filepath.Join(baselineDir, snapshotTSDir, "pkdecimal")
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	// Write a minimal (even invalid) baseline file so FindBaseline succeeds.
+	// Since the PK type check should abort BEFORE baseline read, the
+	// contents don't matter.
+	cols := []baseline.Column{
+		{Name: "amount", MySQLType: "decimal", ParquetType: baseline.MysqlToParquetNode("decimal")},
+		{Name: "label", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "prices.parquet"), cols, baseline.WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 10,
+		Metadata: map[string]string{
+			baseline.MetaKeyCreateTableSQL: "CREATE TABLE `prices` (...)",
+		},
+	})
+	if err != nil {
+		t.Fatalf("baseline.NewWriter: %v", err)
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("writer close: %v", err)
+	}
+
+	orig := captureRecFlags()
+	t.Cleanup(func() { applyRecFlags(orig) })
+	savedOutputFormat := recOutputFormat
+	savedOutputDir := recOutputDir
+	savedTables := recTables
+	savedChunkSize := recChunkSize
+	savedParallelism := recParallelism
+	t.Cleanup(func() {
+		recOutputFormat = savedOutputFormat
+		recOutputDir = savedOutputDir
+		recTables = savedTables
+		recChunkSize = savedChunkSize
+		recParallelism = savedParallelism
+	})
+
+	outputDir := t.TempDir()
+	recIndexDSN = testutil.SnapshotDSN(dbName)
+	recBaselineDir = baselineDir
+	recBaselineS3 = ""
+	recAllowGaps = false
+	recNoArchive = false
+	recOutputFormat = "mydumper"
+	recOutputDir = outputDir
+	recTables = "pkdecimal.prices"
+	recChunkSize = "256MB"
+	recParallelism = 1
+
+	reconstructCmd.SetContext(context.Background())
+	t.Cleanup(func() { reconstructCmd.SetContext(nil) })
+
+	err = runReconstruct(reconstructCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for DECIMAL PK, got nil")
+	}
+	if !strings.Contains(err.Error(), "decimal") {
+		t.Errorf("expected error to mention 'decimal', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not in the supported") {
+		t.Errorf("expected error to mention unsupported set, got: %v", err)
+	}
+
+	// No output files should be written — the reconstruct bailed out
+	// before any mydumper writer was opened.
+	entries, readErr := os.ReadDir(outputDir)
+	if readErr != nil {
+		t.Fatalf("read output dir: %v", readErr)
+	}
+	if len(entries) != 0 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("output dir should be empty on PK-type rejection, got: %v", names)
+	}
+
+	// Use the dbName variable so the compiler doesn't complain.
+	_ = dbName
+}
+
 // TestRunReconstruct_fullTableRoundTrip_datetime6PK is the post-review
 // regression test for the precision-aware fix. A DATETIME(6) PK with
 // whole-second values was silently broken by the v1 canonicalizer's

@@ -42,6 +42,7 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parquetquery"
 	"github.com/dbtrail/bintrail/internal/query"
@@ -372,6 +373,15 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 			return errorResult(err), nil, nil
 		}
 		defer db.Close()
+
+		// Run the idempotent schema migration before NewResolver. Since
+		// #212 NewResolver reads schema_snapshots.column_type and fails on
+		// pre-migration databases with Error 1054. Other long-running
+		// commands call EnsureSchema at startup; the MCP server opens a
+		// fresh DB per tool call, so the migration has to run here.
+		if err := indexer.EnsureSchema(db); err != nil {
+			return errorResult(fmt.Errorf("ensure index schema: %w", err)), nil, nil
+		}
 
 		defaultLimit := 1000
 		opts, err := buildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
