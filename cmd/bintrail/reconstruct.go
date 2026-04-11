@@ -205,10 +205,10 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Fetch binlog events from live MySQL + archives ────────────────────────
-	// Fix for #209: single-row reconstruct previously called engine.Fetch
-	// directly, which silently missed events that had been rotated out of
-	// MySQL and archived to Parquet. Delegating to query.FetchMerged routes
-	// through the same planner + merge pipeline as `bintrail recover`.
+	// Routed through query.FetchMerged so archived events are not silently
+	// missed — the single-row path previously called engine.Fetch directly
+	// (#209). Strict mode (AllowGaps=false) aborts on any condition that
+	// would silently degrade coverage.
 	db, err := config.Connect(recIndexDSN)
 	if err != nil {
 		return fmt.Errorf("connect to index database: %w", err)

@@ -2,8 +2,10 @@ package query
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestFetchMerged_nilArchiveFetcherRejected verifies the programming-error
@@ -23,26 +25,74 @@ func TestFetchMerged_nilArchiveFetcherRejected(t *testing.T) {
 	}
 }
 
-// TestFetchMerged_nilArchiveFetcherOKWhenNoArchive verifies the opposite:
-// callers that explicitly opt out of archives do not need to supply a fetcher.
-// We can't actually run a full query here without a *sql.DB, but we can
-// confirm the nil-check does not fire.
-func TestFetchMerged_nilArchiveFetcherOKWhenNoArchive(t *testing.T) {
-	// We pass nil db/engine so the call will fail after the nil-fetcher check
-	// but before any real DB work. The only thing we're asserting is that the
-	// ArchiveFetcher guard doesn't fire.
+// TestFetchMerged_strictModeRequiresDBName verifies that AllowGaps=false with
+// a time range set but an empty DBName is rejected at the validation stage.
+// The combination is unrepresentable — strict mode promises "abort on gap"
+// but the planner cannot detect gaps without a DBName, so the promise could
+// only be kept by silently degrading to "no gap detection," which is exactly
+// the silent-failure class this PR (#209) exists to prevent.
+func TestFetchMerged_strictModeRequiresDBName(t *testing.T) {
+	since := time.Now().UTC().Add(-24 * time.Hour)
+	until := time.Now().UTC()
+	_, _, err := FetchMerged(context.Background(), nil, nil, FetchMergedOptions{
+		Opts: Options{
+			Since: &since,
+			Until: &until,
+		},
+		DBName:         "", // missing — strict mode cannot honor its contract
+		AllowGaps:      false,
+		ArchiveFetcher: func(_ context.Context, _ Options, _ string) ([]ResultRow, error) { return nil, nil },
+	})
+	if err == nil {
+		t.Fatal("expected error for empty DBName under AllowGaps=false with a time range, got nil")
+	}
+	if !strings.Contains(err.Error(), "DBName") || !strings.Contains(err.Error(), "AllowGaps") {
+		t.Errorf("expected error to mention DBName and AllowGaps, got: %v", err)
+	}
+}
+
+// TestFetchMerged_strictModeNoTimeRangeOK verifies that strict mode with an
+// empty DBName is NOT rejected when there is no time range — gap detection
+// is moot without a range, so the validation should not fire.
+func TestFetchMerged_strictModeNoTimeRangeOK(t *testing.T) {
+	// We pass nil db/engine — the call will panic on engine.Fetch once it
+	// gets past validation. The test only asserts that validation does not
+	// reject this combination, via a deferred recover.
 	defer func() {
-		if r := recover(); r != nil {
-			// Panic is also acceptable — it proves we got past the nil
-			// fetcher guard. A nil engine.Fetch will naturally panic.
-			t.Logf("recovered from expected downstream panic: %v", r)
-		}
+		// Any panic here came from engine.Fetch — proves we passed validation.
+		_ = recover()
 	}()
 	_, _, err := FetchMerged(context.Background(), nil, nil, FetchMergedOptions{
-		NoArchive:      true,
+		DBName:         "",
+		AllowGaps:      false,
+		NoArchive:      true, // skip archive path entirely
 		ArchiveFetcher: nil,
 	})
-	if err != nil && strings.Contains(err.Error(), "ArchiveFetcher") {
-		t.Errorf("unexpected ArchiveFetcher error with NoArchive=true: %v", err)
+	// If we reached here without a panic AND without an error, that's also
+	// fine — validation simply didn't trip.
+	if err != nil && (strings.Contains(err.Error(), "DBName") || strings.Contains(err.Error(), "ArchiveFetcher")) {
+		t.Errorf("validation should not fire when no time range is set: %v", err)
+	}
+}
+
+// TestGapError_errorsAs verifies that a GapError can be unwrapped with
+// errors.As so programmatic callers (full-table reconstruct #187, MCP
+// tools) can inspect the gap hours without string-matching.
+func TestGapError_errorsAs(t *testing.T) {
+	hours := []time.Time{
+		time.Date(2026, 4, 9, 14, 0, 0, 0, time.UTC),
+		time.Date(2026, 4, 9, 15, 0, 0, 0, time.UTC),
+	}
+	var err error = &GapError{GapHours: hours}
+
+	var gapErr *GapError
+	if !errors.As(err, &gapErr) {
+		t.Fatal("errors.As failed to unwrap GapError")
+	}
+	if len(gapErr.GapHours) != 2 {
+		t.Errorf("expected 2 gap hours, got %d", len(gapErr.GapHours))
+	}
+	if !strings.Contains(gapErr.Error(), "allow-gaps") {
+		t.Errorf("expected Error() to mention --allow-gaps, got: %s", gapErr.Error())
 	}
 }
