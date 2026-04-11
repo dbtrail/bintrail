@@ -32,7 +32,7 @@ import (
 // running at a time (a goroutine is spawned for every table, but a buffered-
 // channel semaphore caps the number that actually do work).
 //
-// Supported primary-key types (#212):
+// Supported primary-key types (#212 + #214):
 //
 //   - integer: int, smallint, tinyint, mediumint, bigint (+ unsigned)
 //   - string: char, varchar, text, tinytext, mediumtext, longtext
@@ -41,11 +41,17 @@ import (
 //     go-mysql string format the indexer stores
 //   - date — canonicalized to "2006-01-02"
 //   - year
+//   - decimal, numeric — pass-through string (go-mysql delivers a
+//     pre-formatted string when useDecimal is false, which is the
+//     bintrail default; baseline stores DECIMAL as parquet.String, so
+//     both sides agree byte-for-byte)
 //
-// PK columns with any other type (DECIMAL, NUMERIC, FLOAT, DOUBLE, BINARY,
-// VARBINARY, BLOB, BIT, JSON, spatial types) are rejected at
-// ReconstructTable entry with a hard error. #214 tracks expanding the
-// supported set — file a request there if you need a specific type.
+// PK columns with any other type (FLOAT, DOUBLE, BINARY, VARBINARY, BLOB,
+// BIT, JSON, spatial types) are rejected at ReconstructTable entry with a
+// hard error. Fixing those types requires modifying parser.BuildPKValues
+// or internal/baseline/reader_sql.go — both are non-additive changes to
+// data already on disk — so they're deferred behind separate follow-up
+// issues.
 //
 // UPDATE events that mutate the primary key itself are NOT handled
 // correctly: the change map is keyed by the before-image PK, so a later

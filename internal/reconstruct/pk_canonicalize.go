@@ -35,7 +35,7 @@ import (
 // supported set. Error → the caller must abort the table reconstruction
 // rather than silently produce wrong output.
 //
-// Supported data types (v1 + #212):
+// Supported data types (v1 + #212 + #214):
 //
 //   - int, smallint, tinyint, mediumint, bigint (+ unsigned): pass-through
 //     (indexer and DuckDB both deliver intN/uintN — fmt.Sprintf("%v", ...)
@@ -47,10 +47,33 @@ import (
 //   - date: time.Time → "2006-01-02"
 //   - year: pass-through (go-mysql int, DuckDB int32 — both stringify the
 //     same via %v)
+//   - decimal, numeric: pass-through string (#214). go-mysql v1.13.0's
+//     decodeDecimal returns a pre-formatted string when useDecimal is
+//     false — and bintrail never sets useDecimal, so every DECIMAL PK
+//     lands in the indexer as a Go string like "0.00" or "-99.99". The
+//     baseline writer stores DECIMAL as parquet.String() (see
+//     internal/baseline/schema.go), fed from mydumper SQL output via
+//     parseSQLValue's default branch — which also returns the unquoted
+//     numeric literal verbatim. Both sides end up with byte-identical
+//     strings, so this branch is a pure type-check + pass-through. Zero
+//     values are safe: decodeDecimal writes "0" (not "") for zero-leading
+//     integer parts at row_event.go:1565-1567.
 //
 // Unsupported types fall through to an error. The caller runs
 // supportedPKType upstream to catch these at reconstruct-start before any
 // real work happens, but this path is the defense-in-depth check.
+//
+// Why BINARY/VARBINARY/BLOB/BIT/JSON are NOT supported here: the indexer
+// and baseline-writer representations diverge on the disk level, not just
+// at the Go-type level, so no canonicalizer can reconcile them without
+// touching one of those upstream code paths. BINARY/VARBINARY go through
+// go-mysql's decodeString → Go string of raw bytes, while mydumper emits
+// them as 0x... hex literals that baseline.parseSQLValue returns as literal
+// ASCII (reader_sql.go:134-140 does not decode hex). BLOB variants and BIT
+// have similar upstream mismatches. Fixing those requires modifying
+// parser.BuildPKValues or internal/baseline/reader_sql.go, both of which
+// are non-additive changes to data already on disk. Tracked as follow-up
+// issues.
 func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("canonicalizePKValue: nil PK value for column %q (MySQL forbids NULL in PK columns; baseline row may be missing the column after schema drift)", col.Name)
@@ -72,13 +95,27 @@ func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 		}
 		return raw, nil
 
+	case "decimal", "numeric":
+		// go-mysql returns a pre-formatted string (useDecimal=false, the
+		// bintrail default — see cmd/bintrail/stream.go and agent.go which
+		// never set it). DuckDB returns the Parquet string column as a Go
+		// string too (baseline stores DECIMAL as parquet.String to avoid
+		// precision loss). Both sides agree byte-for-byte, so pass-through
+		// is correct. Reject non-strings for the same reason as varchar
+		// above — a type mismatch here means the caller passed us raw data
+		// from a non-string Parquet column and we can't reason about it.
+		if _, ok := raw.(string); !ok {
+			return nil, fmt.Errorf("canonicalizePKValue: %s column %q: expected string, got %T", dt, col.Name, raw)
+		}
+		return raw, nil
+
 	case "datetime", "timestamp":
 		return canonicalizeDatetime(raw, col)
 	case "date":
 		return canonicalizeDate(raw, col)
 
 	default:
-		return nil, fmt.Errorf("canonicalizePKValue: column %q has unsupported PK type %q (#214 tracks expanding the supported set)", col.Name, col.DataType)
+		return nil, fmt.Errorf("canonicalizePKValue: column %q has unsupported PK type %q (BINARY/VARBINARY/BLOB/BIT/JSON/spatial PK types are not supported because the indexer and baseline-writer representations diverge on disk; file a follow-up issue if you need one)", col.Name, col.DataType)
 	}
 }
 
@@ -239,7 +276,8 @@ func supportedPKType(dataType string) bool {
 		"char", "varchar", "text", "tinytext", "mediumtext", "longtext",
 		"enum", "set",
 		"datetime", "timestamp", "date",
-		"year":
+		"year",
+		"decimal", "numeric":
 		return true
 	default:
 		return false
