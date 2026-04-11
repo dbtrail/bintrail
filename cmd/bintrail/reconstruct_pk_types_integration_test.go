@@ -529,9 +529,6 @@ func TestRunReconstruct_rejectsDecimalPK(t *testing.T) {
 		}
 		t.Errorf("output dir should be empty on PK-type rejection, got: %v", names)
 	}
-
-	// Use the dbName variable so the compiler doesn't complain.
-	_ = dbName
 }
 
 // TestRunReconstruct_fullTableRoundTrip_datetime6PK is the post-review
