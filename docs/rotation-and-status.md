@@ -238,7 +238,7 @@ bintrail query \
   --bintrail-id abc123de-0000-0000-0000-000000000001
 ```
 
-Results from the live MySQL index and from Parquet archives are merged, deduplicated by `event_id`, and sorted by timestamp before being returned. Archive query failures are non-fatal — the command logs a warning and continues with live results only.
+Results from the live MySQL index and from Parquet archives are merged, deduplicated by `event_id`, and sorted by timestamp before being returned. Per-source archive query failures (expired credentials, S3 `AccessDenied`, corrupted Parquet, etc.) are non-fatal — the command prints a `Warning: archive query failed for <src>: <err>` line to **stderr** (regardless of `--log-level` or `--log-format`) and continues with whatever other sources succeed. Context cancellation (Ctrl-C or deadline expiry) aborts the whole query with a non-zero exit instead of continuing. See [query-and-recovery.md § Archive Fetch Error Handling](query-and-recovery.md#archive-fetch-error-handling) for the full contract.
 
 ---
 
