@@ -284,7 +284,7 @@ func TestCanonicalizePKValue_nilErrors(t *testing.T) {
 }
 
 func TestCanonicalizePKValue_unsupportedTypeErrors(t *testing.T) {
-	for _, dt := range []string{"decimal", "binary", "blob", "bit", "json"} {
+	for _, dt := range []string{"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit", "json", "point", "geometry", "float", "double"} {
 		col := colMeta("x", dt, dt)
 		_, err := canonicalizePKValue("whatever", col)
 		if err == nil {
@@ -293,6 +293,71 @@ func TestCanonicalizePKValue_unsupportedTypeErrors(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "unsupported") {
 			t.Errorf("%s: unexpected error: %v", dt, err)
+		}
+	}
+}
+
+// ─── decimal / numeric pass-through (#214) ───────────────────────────────────
+
+// TestCanonicalizePKValue_decimalPassthrough pins the contract that DECIMAL
+// and NUMERIC PK columns canonicalise to themselves. go-mysql v1.13.0's
+// decodeDecimal returns a pre-formatted string when useDecimal is false —
+// and bintrail never sets useDecimal (see cmd/bintrail/stream.go and
+// agent.go). The baseline writer stores DECIMAL as parquet.String(), fed
+// from mydumper SQL output. Both sides land on a Go string, so the
+// canonicalizer is a pure type-check + identity.
+//
+// The zero-value cases below are load-bearing: if go-mysql ever regressed
+// to emit ".00" for DECIMAL(10,2) 0.00 (or mydumper emitted it that way),
+// the pass-through would silently miss every zero PK. Reading
+// decodeDecimal at row_event.go:1565-1567 confirms it writes "0" for a
+// zero-leading integer part, but this test pins the assumption so that
+// a go-mysql bump regressing the behaviour would surface here.
+func TestCanonicalizePKValue_decimalPassthrough(t *testing.T) {
+	cases := []struct {
+		dataType   string
+		columnType string
+		value      string
+	}{
+		{"decimal", "decimal(10,2)", "0.00"},
+		{"decimal", "decimal(10,2)", "-0.00"},
+		{"decimal", "decimal(10,2)", "123.45"},
+		{"decimal", "decimal(10,2)", "-99.99"},
+		{"decimal", "decimal(10,2)", "9999999.99"},
+		{"decimal", "decimal(5,1)", "0.5"},
+		{"decimal", "decimal(5,1)", "-0.5"},
+		{"decimal", "decimal(10,0)", "0"},
+		{"decimal", "decimal(10,0)", "42"},
+		{"numeric", "numeric(8,4)", "3.1416"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.columnType+"_"+tc.value, func(t *testing.T) {
+			col := colMeta("amount", tc.dataType, tc.columnType)
+			got, err := canonicalizePKValue(tc.value, col)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.value {
+				t.Errorf("got %q, want pass-through %q", got, tc.value)
+			}
+		})
+	}
+}
+
+// Non-string scanned into a DECIMAL PK must error — the canonicalizer has
+// no way to reason about a float64, shopspring/decimal, or []byte here
+// (bintrail never sets useDecimal, so go-mysql always delivers a string;
+// a non-string means the caller wired something unexpected).
+func TestCanonicalizePKValue_decimalTypeMismatchErrors(t *testing.T) {
+	col := colMeta("amount", "decimal", "decimal(10,2)")
+	for _, v := range []any{float64(123.45), int64(123), []byte("123.45")} {
+		_, err := canonicalizePKValue(v, col)
+		if err == nil {
+			t.Errorf("expected error for non-string DECIMAL value %T, got nil", v)
+			continue
+		}
+		if !strings.Contains(err.Error(), "expected string") {
+			t.Errorf("%T: unexpected error: %v", v, err)
 		}
 	}
 }
@@ -393,16 +458,25 @@ func TestSupportedPKType(t *testing.T) {
 		"char", "varchar", "text", "tinytext", "mediumtext", "longtext",
 		"enum", "set",
 		"datetime", "timestamp", "date", "year",
+		"decimal", "numeric", // #214
 	}
 	for _, dt := range supported {
 		if !supportedPKType(dt) {
 			t.Errorf("expected %q to be supported", dt)
 		}
 	}
+	// The types below are explicitly deferred — the indexer and
+	// baseline-writer representations diverge on disk (see pk_canonicalize.go
+	// doc comment). This list is a regression guard: if someone adds one
+	// to the allow-list without fixing the upstream representation, a
+	// round-trip will silently produce wrong output. Don't loosen this
+	// without a matching round-trip integration test like the one for
+	// DECIMAL in cmd/bintrail/reconstruct_pk_types_integration_test.go.
 	unsupported := []string{
-		"decimal", "numeric", "float", "double",
+		"float", "double",
 		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob",
 		"bit", "json",
+		"point", "linestring", "polygon", "geometry",
 		"", "unknown-type",
 	}
 	for _, dt := range unsupported {

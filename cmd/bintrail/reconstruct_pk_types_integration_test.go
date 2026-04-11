@@ -419,24 +419,31 @@ func TestRunReconstruct_fullTableRoundTrip_varcharPK(t *testing.T) {
 	}
 }
 
-// TestRunReconstruct_rejectsDecimalPK is the call-site test for the
-// unsupported-PK-type hard-error path in ReconstructTable. The canonicalizer
-// unit tests cover supportedPKType as a pure predicate, but this test pins
-// that the guard actually fires at the start of the full-table reconstruct
-// flow — a future refactor that reorders the validation block can't regress
-// to the pre-#212 silent-wrong-output behaviour without tripping this test.
+// TestRunReconstruct_fullTableRoundTrip_decimalPK is the #214 regression
+// test: full-table reconstruct against a table whose primary key is a
+// DECIMAL column. Before #214 the DECIMAL allow-list entry was missing,
+// so ReconstructTable rejected the table with a hard error at the
+// PK-type validation block. The fix adds "decimal"/"numeric" to
+// supportedPKType and a pass-through branch to canonicalizePKValue,
+// based on the verified invariant that go-mysql delivers DECIMAL as a
+// Go string (useDecimal=false, the bintrail default) and DuckDB reads
+// the Parquet String column as a Go string too — so both sides end up
+// with byte-identical PK strings.
 //
-// We build a schema_snapshots row with data_type=decimal and run the CLI
-// dispatcher. No baseline is needed because the reconstruct must fail
-// before any baseline work happens.
-func TestRunReconstruct_rejectsDecimalPK(t *testing.T) {
+// The test exercises a DECIMAL(10,2) PK with values covering:
+//   - the zero-integer case ("0.00"), the historical risk area from
+//     go-mysql's decodeDecimal
+//   - a positive multi-digit case ("123.45") — pass-through
+//   - a negative case ("-99.99") — the sign must round-trip
+//   - a new INSERT via an archived event ("42.42")
+func TestRunReconstruct_fullTableRoundTrip_decimalPK(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 	if err := indexer.EnsureSchema(db); err != nil {
 		t.Fatalf("EnsureSchema: %v", err)
 	}
 
-	// schema_snapshots row with a DECIMAL PK.
+	// ── 1. Populate schema_snapshots for the DECIMAL-PK table ────────────
 	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
 		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
 		VALUES (1, UTC_TIMESTAMP(), 'pkdecimal', 'prices', 'amount', 1, 'PRI', 'decimal', 'decimal(10,2)', 'NO', 0)`)
@@ -444,37 +451,100 @@ func TestRunReconstruct_rejectsDecimalPK(t *testing.T) {
 		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
 		VALUES (1, UTC_TIMESTAMP(), 'pkdecimal', 'prices', 'label', 2, '', 'varchar', 'varchar(64)', 'NO', 0)`)
 
-	// We need a baseline directory to pass the CLI validation, but the
-	// reconstruct will fail before it ever reads the baseline because
-	// the PK type check fires at ReconstructTable entry.
+	// ── 2. Write a baseline Parquet with DECIMAL PK values ──────────────
+	createSQL := "CREATE TABLE `prices` (\n" +
+		"  `amount` DECIMAL(10,2) NOT NULL,\n" +
+		"  `label` VARCHAR(64) NOT NULL,\n" +
+		"  PRIMARY KEY (`amount`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n"
+
+	// Baseline PKs — cover zero, positive, negative.
+	pkZero := "0.00"
+	pkPos := "123.45"
+	pkNeg := "-99.99"
+	pkNew := "42.42" // inserted via live event
+
 	baselineDir := t.TempDir()
-	h1 := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Hour)
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	h2 := h1.Add(time.Hour)
 	snapshotTSDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
 	parquetDir := filepath.Join(baselineDir, snapshotTSDir, "pkdecimal")
 	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
 		t.Fatalf("mkdir baseline: %v", err)
 	}
-	// Write a minimal (even invalid) baseline file so FindBaseline succeeds.
-	// Since the PK type check should abort BEFORE baseline read, the
-	// contents don't matter.
+	baselinePath := filepath.Join(parquetDir, "prices.parquet")
+
 	cols := []baseline.Column{
 		{Name: "amount", MySQLType: "decimal", ParquetType: baseline.MysqlToParquetNode("decimal")},
 		{Name: "label", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 	}
-	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "prices.parquet"), cols, baseline.WriterConfig{
-		Compression:  "none",
-		RowGroupSize: 10,
+	bw, err := baseline.NewWriter(baselinePath, cols, baseline.WriterConfig{
+		Compression:  "zstd",
+		RowGroupSize: 100,
 		Metadata: map[string]string{
-			baseline.MetaKeyCreateTableSQL: "CREATE TABLE `prices` (...)",
+			baseline.MetaKeyCreateTableSQL: createSQL,
 		},
 	})
 	if err != nil {
 		t.Fatalf("baseline.NewWriter: %v", err)
 	}
+	for _, row := range [][]string{
+		{pkZero, "free-tier"},
+		{pkPos, "pro-tier"},
+		{pkNeg, "refund-credit"},
+	} {
+		if err := bw.WriteRow(row, []bool{false, false}); err != nil {
+			t.Fatalf("WriteRow: %v", err)
+		}
+	}
 	if err := bw.Close(); err != nil {
 		t.Fatalf("writer close: %v", err)
 	}
 
+	// ── 3. Set up partitions and insert events ──────────────────────────
+	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// UPDATE the pro-tier row (pkPos) — label becomes "pro-tier-renamed"
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil,
+		"pkdecimal", "prices", 2 /* UPDATE */, pkPos, nil,
+		[]byte(`{"amount":"123.45","label":"pro-tier"}`),
+		[]byte(`{"amount":"123.45","label":"pro-tier-renamed"}`))
+	// DELETE the refund-credit row (pkNeg)
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ts1, nil,
+		"pkdecimal", "prices", 3 /* DELETE */, pkNeg, nil,
+		[]byte(`{"amount":"-99.99","label":"refund-credit"}`),
+		nil)
+	// INSERT a new row (pkNew) in live h2
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, ts2, nil,
+		"pkdecimal", "prices", 1 /* INSERT */, pkNew, nil,
+		nil,
+		[]byte(`{"amount":"42.42","label":"meaning-of-life"}`))
+
+	// ── 4. Archive h1 and drop it from live MySQL ───────────────────────
+	archiveDir := t.TempDir()
+	bintrailID := "test-214-decimal-pk"
+	outPath, err := hiveArchivePath(archiveDir, bintrailID, partitionName(h1))
+	if err != nil {
+		t.Fatalf("hiveArchivePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		t.Fatalf("mkdir archive: %v", err)
+	}
+	if _, err := archive.ArchivePartition(context.Background(), db, dbName, partitionName(h1), outPath, "zstd"); err != nil {
+		t.Fatalf("ArchivePartition: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO archive_state
+		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key, s3_uploaded_at)
+		VALUES (?, ?, ?, 2, NULL, NULL, NULL)`,
+		partitionName(h1), bintrailID, outPath)
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"ALTER TABLE `%s`.`binlog_events` DROP PARTITION `%s`",
+		dbName, partitionName(h1),
+	))
+
+	// ── 5. Run full-table reconstruct ───────────────────────────────────
 	orig := captureRecFlags()
 	t.Cleanup(func() { applyRecFlags(orig) })
 	savedOutputFormat := recOutputFormat
@@ -501,33 +571,209 @@ func TestRunReconstruct_rejectsDecimalPK(t *testing.T) {
 	recTables = "pkdecimal.prices"
 	recChunkSize = "256MB"
 	recParallelism = 1
+	recAt = h2.Add(30 * time.Minute).Format(time.RFC3339)
 
 	reconstructCmd.SetContext(context.Background())
 	t.Cleanup(func() { reconstructCmd.SetContext(nil) })
 
-	err = runReconstruct(reconstructCmd, nil)
-	if err == nil {
-		t.Fatal("expected error for DECIMAL PK, got nil")
-	}
-	if !strings.Contains(err.Error(), "decimal") {
-		t.Errorf("expected error to mention 'decimal', got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "not in the supported") {
-		t.Errorf("expected error to mention unsupported set, got: %v", err)
+	if err := runReconstruct(reconstructCmd, nil); err != nil {
+		t.Fatalf("runReconstruct: %v", err)
 	}
 
-	// No output files should be written — the reconstruct bailed out
-	// before any mydumper writer was opened.
-	entries, readErr := os.ReadDir(outputDir)
-	if readErr != nil {
-		t.Fatalf("read output dir: %v", readErr)
+	// ── 6. Apply the dump and verify the merged state ───────────────────
+	testutil.MustExec(t, db, "DROP DATABASE IF EXISTS `pkdecimal`")
+	testutil.MustExec(t, db, "CREATE DATABASE `pkdecimal`")
+	t.Cleanup(func() {
+		testutil.MustExec(t, db, "DROP DATABASE IF EXISTS `pkdecimal`")
+	})
+
+	schemaSQL, err := os.ReadFile(filepath.Join(outputDir, "pkdecimal.prices-schema.sql"))
+	if err != nil {
+		t.Fatalf("read schema file: %v", err)
 	}
-	if len(entries) != 0 {
-		var names []string
-		for _, e := range entries {
-			names = append(names, e.Name())
+	testutil.MustExec(t, db, "USE `pkdecimal`")
+	testutil.MustExec(t, db, string(schemaSQL))
+
+	chunkSQL, err := os.ReadFile(filepath.Join(outputDir, "pkdecimal.prices.00000.sql"))
+	if err != nil {
+		t.Fatalf("read chunk file: %v", err)
+	}
+	testutil.MustExec(t, db, string(chunkSQL))
+
+	rows, err := db.Query("SELECT CAST(amount AS CHAR), label FROM `pkdecimal`.`prices` ORDER BY amount")
+	if err != nil {
+		t.Fatalf("select restored: %v", err)
+	}
+	defer rows.Close()
+
+	type restoredRow struct {
+		Amount string
+		Label  string
+	}
+	var got []restoredRow
+	for rows.Next() {
+		var r restoredRow
+		if err := rows.Scan(&r.Amount, &r.Label); err != nil {
+			t.Fatalf("scan: %v", err)
 		}
-		t.Errorf("output dir should be empty on PK-type rejection, got: %v", names)
+		got = append(got, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+
+	// Expected final state (sorted ascending by amount):
+	//   -99.99: DELETED (not present)
+	//     0.00: passthrough from baseline
+	//    42.42: INSERTED by live event
+	//   123.45: UPDATED via archived event
+	want := []restoredRow{
+		{"0.00", "free-tier"},
+		{"42.42", "meaning-of-life"},
+		{"123.45", "pro-tier-renamed"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d rows, want %d; got=%+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("row %d: got %+v, want %+v", i, got[i], w)
+		}
+	}
+}
+
+// TestRunReconstruct_rejectsRemainingUnsupportedPKTypes pins the hard-error
+// path at ReconstructTable entry for the PK types that #214 did NOT land:
+// BINARY/VARBINARY/BLOB variants, BIT, JSON. Each of these has a real
+// on-disk representation mismatch between the indexer's pk_values format
+// and the baseline Parquet column (see pk_canonicalize.go doc comment).
+// Fixing them requires a non-additive change to either parser.BuildPKValues
+// or internal/baseline/reader_sql.go::parseSQLValue, which is out of scope.
+//
+// This test is the regression guard against a future drive-by "add one
+// more type to supportedPKType" PR that would silently produce wrong
+// output. A future PR that actually fixes one of these must also land a
+// round-trip integration test and remove the type from this negative list.
+func TestRunReconstruct_rejectsRemainingUnsupportedPKTypes(t *testing.T) {
+	cases := []struct {
+		name     string
+		dataType string
+		colType  string
+	}{
+		{"binary", "binary", "binary(16)"},
+		{"varbinary", "varbinary", "varbinary(32)"},
+		{"blob", "blob", "blob"},
+		{"tinyblob", "tinyblob", "tinyblob"},
+		{"mediumblob", "mediumblob", "mediumblob"},
+		{"longblob", "longblob", "longblob"},
+		{"bit", "bit", "bit(8)"},
+		{"json", "json", "json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, dbName := testutil.CreateTestDB(t)
+			testutil.InitIndexTables(t, db)
+			if err := indexer.EnsureSchema(db); err != nil {
+				t.Fatalf("EnsureSchema: %v", err)
+			}
+
+			// schema_snapshots row with the unsupported PK type.
+			schemaName := "pk" + tc.name
+			testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+				(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+				VALUES (1, UTC_TIMESTAMP(), ?, 't', 'pk_col', 1, 'PRI', ?, ?, 'NO', 0)`,
+				schemaName, tc.dataType, tc.colType)
+			testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+				(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+				VALUES (1, UTC_TIMESTAMP(), ?, 't', 'payload', 2, '', 'varchar', 'varchar(32)', 'NO', 0)`,
+				schemaName)
+
+			// Minimal baseline — contents don't matter because PK validation
+			// fires before any baseline read.
+			baselineDir := t.TempDir()
+			h1 := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Hour)
+			snapshotTSDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
+			parquetDir := filepath.Join(baselineDir, snapshotTSDir, schemaName)
+			if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+				t.Fatalf("mkdir baseline: %v", err)
+			}
+			// The type must be representable by the baseline writer for the
+			// NewWriter call to succeed — the default branch handles
+			// arbitrary types as parquet.String, which is fine here since
+			// we never actually read the file.
+			writerCols := []baseline.Column{
+				{Name: "pk_col", MySQLType: tc.dataType, ParquetType: baseline.MysqlToParquetNode(tc.dataType)},
+				{Name: "payload", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+			}
+			bw, err := baseline.NewWriter(filepath.Join(parquetDir, "t.parquet"), writerCols, baseline.WriterConfig{
+				Compression:  "none",
+				RowGroupSize: 10,
+				Metadata: map[string]string{
+					baseline.MetaKeyCreateTableSQL: "CREATE TABLE `t` (...)",
+				},
+			})
+			if err != nil {
+				t.Fatalf("baseline.NewWriter: %v", err)
+			}
+			if err := bw.Close(); err != nil {
+				t.Fatalf("writer close: %v", err)
+			}
+
+			orig := captureRecFlags()
+			t.Cleanup(func() { applyRecFlags(orig) })
+			savedOutputFormat := recOutputFormat
+			savedOutputDir := recOutputDir
+			savedTables := recTables
+			savedChunkSize := recChunkSize
+			savedParallelism := recParallelism
+			t.Cleanup(func() {
+				recOutputFormat = savedOutputFormat
+				recOutputDir = savedOutputDir
+				recTables = savedTables
+				recChunkSize = savedChunkSize
+				recParallelism = savedParallelism
+			})
+
+			outputDir := t.TempDir()
+			recIndexDSN = testutil.SnapshotDSN(dbName)
+			recBaselineDir = baselineDir
+			recBaselineS3 = ""
+			recAllowGaps = false
+			recNoArchive = false
+			recOutputFormat = "mydumper"
+			recOutputDir = outputDir
+			recTables = schemaName + ".t"
+			recChunkSize = "256MB"
+			recParallelism = 1
+
+			reconstructCmd.SetContext(context.Background())
+			t.Cleanup(func() { reconstructCmd.SetContext(nil) })
+
+			err = runReconstruct(reconstructCmd, nil)
+			if err == nil {
+				t.Fatalf("expected error for %s PK, got nil", tc.dataType)
+			}
+			if !strings.Contains(err.Error(), tc.dataType) {
+				t.Errorf("expected error to mention %q, got: %v", tc.dataType, err)
+			}
+			if !strings.Contains(err.Error(), "not in the supported") {
+				t.Errorf("expected error to mention unsupported set, got: %v", err)
+			}
+
+			// No output files should be written — the reconstruct bailed
+			// out before any mydumper writer was opened.
+			entries, readErr := os.ReadDir(outputDir)
+			if readErr != nil {
+				t.Fatalf("read output dir: %v", readErr)
+			}
+			if len(entries) != 0 {
+				var names []string
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				t.Errorf("output dir should be empty on PK-type rejection, got: %v", names)
+			}
+		})
 	}
 }
 
