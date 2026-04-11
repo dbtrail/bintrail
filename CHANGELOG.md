@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `bintrail reconstruct --pk ...` now fetches events from both live MySQL partitions **and** Parquet archives, closing a latent correctness bug where single-row reconstruction silently missed events that had been rotated out of MySQL and archived. The previous code called `engine.Fetch` directly — bypassing the query planner, archive auto-discovery, and `MergeResults` pipeline already used by `bintrail recover`. Factored out a shared `query.FetchMerged` helper that owns the live+archive orchestration so `recover`, single-row `reconstruct`, and the upcoming full-table reconstruct (#187) cannot drift. New `--no-archive` and `--allow-gaps` flags on `reconstruct` mirror `recover`'s surface area; `--allow-gaps` defaults to `false` because a silently incomplete row state is worse than a clear error for a recovery tool (#209).
+
 ## [0.4.9] - 2026-04-10
 
 ### Added

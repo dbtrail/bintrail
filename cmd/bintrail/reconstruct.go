@@ -8,11 +8,13 @@ import (
 	"strings"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/bintrail/internal/baseline"
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/parquetquery"
 	"github.com/dbtrail/bintrail/internal/query"
 	"github.com/dbtrail/bintrail/internal/reconstruct"
 )
@@ -25,6 +27,11 @@ the exact state of a row at a target timestamp.
 
 Requires a baseline directory or S3 location produced by "bintrail baseline".
 The most recent snapshot at or before --at is automatically selected.
+
+Events are fetched from both live MySQL partitions and any Parquet archives
+auto-discovered via archive_state. Pass --no-archive to query MySQL only.
+By default, a coverage gap (an hour rotated out of MySQL with no archive)
+aborts the reconstruction; pass --allow-gaps to proceed with a warning.
 
 Examples:
   # Current state of a row (baseline + all binlog events up to now)
@@ -67,6 +74,8 @@ var (
 	recHistory      bool
 	recSQL          string
 	recFormat       string
+	recNoArchive    bool
+	recAllowGaps    bool
 )
 
 func init() {
@@ -82,6 +91,8 @@ func init() {
 	reconstructCmd.Flags().BoolVar(&recHistory, "history", false, "Return all intermediate states (one entry per binlog event) instead of just the final state")
 	reconstructCmd.Flags().StringVar(&recSQL, "sql", "", "Execute arbitrary DuckDB SQL and print results (bypasses --schema/table/pk/at; --baseline-dir/s3 only controls whether the httpfs extension is loaded for S3 access)")
 	reconstructCmd.Flags().StringVar(&recFormat, "format", "json", "Output format: json, table, or csv")
+	reconstructCmd.Flags().BoolVar(&recNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only event fetch)")
+	reconstructCmd.Flags().BoolVar(&recAllowGaps, "allow-gaps", false, "Proceed even when the event index has missing hours in the baseline-to-target range (may produce incomplete reconstruction)")
 	bindCommandEnv(reconstructCmd)
 
 	rootCmd.AddCommand(reconstructCmd)
@@ -193,7 +204,11 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// ── Fetch binlog events from the index ─────────────────────────────────────
+	// ── Fetch binlog events from live MySQL + archives ────────────────────────
+	// Fix for #209: single-row reconstruct previously called engine.Fetch
+	// directly, which silently missed events that had been rotated out of
+	// MySQL and archived to Parquet. Delegating to query.FetchMerged routes
+	// through the same planner + merge pipeline as `bintrail recover`.
 	db, err := config.Connect(recIndexDSN)
 	if err != nil {
 		return fmt.Errorf("connect to index database: %w", err)
@@ -201,6 +216,15 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 
 	engine := query.New(db)
+
+	// The planner needs a database name derived from the DSN.
+	var dbName string
+	if cfg, parseErr := mysqldriver.ParseDSN(recIndexDSN); parseErr != nil {
+		slog.Warn("could not parse DSN for query planning", "error", parseErr)
+	} else {
+		dbName = cfg.DBName
+	}
+
 	opts := query.Options{
 		Schema:   recSchema,
 		Table:    recTable,
@@ -208,7 +232,13 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		Since:    &snapshotTime,
 		Until:    &at,
 	}
-	events, err := engine.Fetch(cmd.Context(), opts)
+	events, _, err := query.FetchMerged(cmd.Context(), db, engine, query.FetchMergedOptions{
+		Opts:           opts,
+		DBName:         dbName,
+		NoArchive:      recNoArchive,
+		AllowGaps:      recAllowGaps,
+		ArchiveFetcher: parquetquery.Fetch,
+	})
 	if err != nil {
 		return fmt.Errorf("fetch binlog events: %w", err)
 	}

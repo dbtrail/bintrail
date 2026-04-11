@@ -160,51 +160,31 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Fetch events (live + archives) ────────────────────────────────────────
-	// Skip archive auto-discovery when --no-archive is set or --profile is
-	// active (archive queries do not enforce DenyTables/RedactColumns rules).
+	// Archive auto-discovery, planner-based routing, and MergeResults are all
+	// delegated to query.FetchMerged so recover, reconstruct (#209), and
+	// full-table reconstruct (#187) share one pipeline.
+	//
+	// Profile mode disables archive auto-routing because archive queries do
+	// not enforce DenyTables/RedactColumns rules; that policy belongs at the
+	// caller, not inside FetchMerged.
 	engine := query.New(db)
-	var archSources []string
-	if !rNoArchive && rProfile == "" {
-		archSources = query.ResolveArchiveSources(cmd.Context(), db)
-	}
 
-	// ── Coverage warnings and per-partition routing ───────────────────────────
-	var plan *query.QueryPlan
-	if !rNoArchive && (len(archSources) > 0 || since != nil || until != nil) {
-		cfg, parseErr := mysqldriver.ParseDSN(rIndexDSN)
-		if parseErr != nil {
-			slog.Warn("could not parse DSN for query planning", "error", parseErr)
-		} else if cfg.DBName != "" {
-			plan = query.RunPlanAndWarn(cmd.Context(), db, cfg.DBName, since, until)
-		}
-	}
-
-	var rows []query.ResultRow
-	if len(archSources) > 0 {
-		fetchOpts := opts
-
-		if plan != nil && plan.SkipMySQL() {
-			slog.Debug("planner: skipping MySQL query (range fully archived)")
-		} else {
-			rows, err = engine.Fetch(cmd.Context(), fetchOpts)
-			if err != nil {
-				return err
-			}
-		}
-		for _, src := range archSources {
-			ar, err := parquetquery.Fetch(cmd.Context(), fetchOpts, src)
-			if err != nil {
-				slog.Warn("archive query failed, skipping", "source", src, "error", err)
-				continue
-			}
-			rows = append(rows, ar...)
-		}
-		rows = query.MergeResults(rows, opts.Limit)
+	var dbName string
+	if cfg, parseErr := mysqldriver.ParseDSN(rIndexDSN); parseErr != nil {
+		slog.Warn("could not parse DSN for query planning", "error", parseErr)
 	} else {
-		rows, err = engine.Fetch(cmd.Context(), opts)
-		if err != nil {
-			return err
-		}
+		dbName = cfg.DBName
+	}
+
+	rows, _, err := query.FetchMerged(cmd.Context(), db, engine, query.FetchMergedOptions{
+		Opts:           opts,
+		DBName:         dbName,
+		NoArchive:      rNoArchive || rProfile != "",
+		AllowGaps:      true, // preserve recover's warn-and-continue behavior
+		ArchiveFetcher: parquetquery.Fetch,
+	})
+	if err != nil {
+		return err
 	}
 
 	// ── Generate recovery SQL ─────────────────────────────────────────────────

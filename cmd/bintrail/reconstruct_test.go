@@ -28,6 +28,8 @@ func TestReconstructCmd_defaults(t *testing.T) {
 		{"format", "json"},
 		{"baseline-only", "false"},
 		{"history", "false"},
+		{"no-archive", "false"},
+		{"allow-gaps", "false"},
 	}
 	for _, tc := range cases {
 		f := reconstructCmd.Flag(tc.flag)
@@ -46,6 +48,7 @@ func TestReconstructCmd_allFlagsRegistered(t *testing.T) {
 		"index-dsn", "schema", "table", "pk", "pk-columns",
 		"at", "baseline-dir", "baseline-s3", "baseline-only",
 		"history", "sql", "format",
+		"no-archive", "allow-gaps",
 	} {
 		if reconstructCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on reconstructCmd", name)
@@ -57,23 +60,25 @@ func TestReconstructCmd_allFlagsRegistered(t *testing.T) {
 
 type recFlagSnapshot struct {
 	indexDSN, schema, table, pk, pkCols, at, baselineDir, baselineS3, sql, format string
-	baselineOnly, history                                                           bool
+	baselineOnly, history, noArchive, allowGaps                                   bool
 }
 
 func captureRecFlags() recFlagSnapshot {
 	return recFlagSnapshot{
-		indexDSN:    recIndexDSN,
-		schema:      recSchema,
-		table:       recTable,
-		pk:          recPK,
-		pkCols:      recPKColumns,
-		at:          recAt,
-		baselineDir: recBaselineDir,
-		baselineS3:  recBaselineS3,
+		indexDSN:     recIndexDSN,
+		schema:       recSchema,
+		table:        recTable,
+		pk:           recPK,
+		pkCols:       recPKColumns,
+		at:           recAt,
+		baselineDir:  recBaselineDir,
+		baselineS3:   recBaselineS3,
 		baselineOnly: recBaselineOnly,
-		history:     recHistory,
-		sql:         recSQL,
-		format:      recFormat,
+		history:      recHistory,
+		sql:          recSQL,
+		format:       recFormat,
+		noArchive:    recNoArchive,
+		allowGaps:    recAllowGaps,
 	}
 }
 
@@ -90,6 +95,8 @@ func applyRecFlags(s recFlagSnapshot) {
 	recHistory = s.history
 	recSQL = s.sql
 	recFormat = s.format
+	recNoArchive = s.noArchive
+	recAllowGaps = s.allowGaps
 }
 
 func TestRunReconstruct_sqlInvalidFormat(t *testing.T) {
