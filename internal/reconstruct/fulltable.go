@@ -31,21 +31,28 @@ import (
 // running at a time (a goroutine is spawned for every table, but a buffered-
 // channel semaphore caps the number that actually do work).
 //
-// Known limitations (v1):
+// Supported primary-key types (#212):
 //
-//   - Supports integer and string primary keys. DATETIME/TIMESTAMP, DECIMAL,
-//     ENUM, SET and binary PKs are not guaranteed to round-trip correctly
-//     because the PK encoder (parser.BuildPKValues) uses %v formatting and
-//     the Go type delivered by DuckDB parquet_scan may not match the type
-//     delivered by the binlog parser at indexing time.
-//   - UPDATE events that mutate the primary key itself are not handled
-//     correctly: the change map is keyed by the before-image PK, so a later
-//     event on the old PK value may overwrite the UPDATE in the map and the
-//     after-image row is dropped. Re-snapshot the baseline after schema
-//     changes that reshape PKs.
+//   - integer: int, smallint, tinyint, mediumint, bigint (+ unsigned)
+//   - string: char, varchar, text, tinytext, mediumtext, longtext
+//   - enum, set
+//   - datetime, timestamp — canonicalized from DuckDB time.Time to the
+//     go-mysql string format the indexer stores
+//   - date — canonicalized to "2006-01-02"
+//   - year
 //
-// Both limitations are tracked as follow-ups; document them in command help
-// and user-facing docs before promoting this feature out of "preview" status.
+// PKs containing DECIMAL, BINARY, VARBINARY, BLOB, BIT, or JSON columns
+// are not in the tested set; reconstruct will emit an slog.Warn at the
+// start of the run naming each offending column. The merge may still
+// produce correct output for these types if the Go type delivered by
+// DuckDB matches the one the indexer stored at parse time, but it is
+// not guaranteed. #212 tracks expanding the supported set.
+//
+// UPDATE events that mutate the primary key itself are NOT handled
+// correctly: the change map is keyed by the before-image PK, so a later
+// event on the old PK value may overwrite the UPDATE in the map and the
+// after-image row is dropped. Re-snapshot the baseline after schema
+// changes that reshape PKs.
 type FullTableConfig struct {
 	IndexDSN    string    // DSN for the bintrail index database
 	BaselineSrc string    // local directory or s3:// URL of baselines
@@ -242,6 +249,19 @@ func ReconstructTable(
 	if len(pkCols) == 0 {
 		return nil, fmt.Errorf("%s.%s has no primary key in the loaded snapshot; full-table reconstruct requires a PK", schema, table)
 	}
+	// Warn about PK columns whose type is known to have encoding mismatch
+	// between the indexer and the baseline reader. This is the Phase 1
+	// mitigation for #212 — the canonicalizer handles int/string/datetime/
+	// date PKs correctly, but DECIMAL / BINARY / BLOB / BIT / JSON PKs can
+	// silently misroute events. Emit a loud warning so operators notice.
+	for _, pkCol := range pkCols {
+		if !supportedPKType(pkCol.DataType) {
+			slog.Warn("full-table reconstruct: PK column type not in the supported set; "+
+				"events may silently miss the baseline (#212)",
+				"schema", schema, "table", table,
+				"column", pkCol.Name, "data_type", pkCol.DataType)
+		}
+	}
 
 	// ── 4. Fetch events via the shared helper (gap-aware) ──────────────────
 	fetchOpts := query.Options{
@@ -384,7 +404,15 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 			return fmt.Errorf("scan baseline row: %w", err)
 		}
 		rowMap := zipMap(dcols, scan)
-		pk := parser.BuildPKValues(in.PKCols, rowMap)
+		// Canonicalise PK values before hashing so they match what the
+		// indexer stored in binlog_events.pk_values. Without this,
+		// DATETIME/TIMESTAMP PKs silently miss the change map because
+		// DuckDB returns time.Time while the indexer stored a
+		// go-mysql-formatted string (#212). The non-PK values in rowMap
+		// are left untouched — they're not used for key construction and
+		// flow unchanged into the mydumper writer below.
+		pkMap := canonicalizePKMap(rowMap, in.PKCols)
+		pk := parser.BuildPKValues(in.PKCols, pkMap)
 
 		if ev, ok := in.Changes[pk]; ok {
 			delete(in.Changes, pk)
