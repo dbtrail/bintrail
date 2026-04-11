@@ -6,6 +6,7 @@ package recovery
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -160,11 +161,11 @@ func (g *Generator) generateInsert(row query.ResultRow) (string, error) {
 		if genCols[col] {
 			continue
 		}
-		colParts = append(colParts, quoteName(col))
-		valParts = append(valParts, formatValue(row.RowBefore[col]))
+		colParts = append(colParts, QuoteName(col))
+		valParts = append(valParts, FormatSQLValue(row.RowBefore[col]))
 	}
 	return fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES (%s)",
-		quoteName(row.SchemaName), quoteName(row.TableName),
+		QuoteName(row.SchemaName), QuoteName(row.TableName),
 		strings.Join(colParts, ", "),
 		strings.Join(valParts, ", "),
 	), nil
@@ -188,7 +189,7 @@ func (g *Generator) generateUpdate(row query.ResultRow) (string, error) {
 		if genCols[col] {
 			continue
 		}
-		setParts = append(setParts, quoteName(col)+" = "+formatValue(row.RowBefore[col]))
+		setParts = append(setParts, QuoteName(col)+" = "+FormatSQLValue(row.RowBefore[col]))
 	}
 
 	// WHERE uses row_after (current state), so the UPDATE finds the right row
@@ -196,7 +197,7 @@ func (g *Generator) generateUpdate(row query.ResultRow) (string, error) {
 	whereParts := pkWhereClauseFromResolver(r, row.SchemaName, row.TableName, row.RowAfter)
 
 	return fmt.Sprintf("UPDATE %s.%s SET %s WHERE %s",
-		quoteName(row.SchemaName), quoteName(row.TableName),
+		QuoteName(row.SchemaName), QuoteName(row.TableName),
 		strings.Join(setParts, ", "),
 		strings.Join(whereParts, " AND "),
 	), nil
@@ -211,7 +212,7 @@ func (g *Generator) generateDelete(row query.ResultRow) (string, error) {
 	r := g.resolverForRow(row)
 	whereParts := pkWhereClauseFromResolver(r, row.SchemaName, row.TableName, row.RowAfter)
 	return fmt.Sprintf("DELETE FROM %s.%s WHERE %s",
-		quoteName(row.SchemaName), quoteName(row.TableName),
+		QuoteName(row.SchemaName), QuoteName(row.TableName),
 		strings.Join(whereParts, " AND "),
 	), nil
 }
@@ -261,7 +262,7 @@ func pkWhereClauseFromResolver(resolver *metadata.Resolver, schema, table string
 						allFound = false
 						break
 					}
-					parts = append(parts, quoteName(pk.Name)+" = "+formatValue(v))
+					parts = append(parts, QuoteName(pk.Name)+" = "+FormatSQLValue(v))
 				}
 				if allFound {
 					return parts
@@ -278,20 +279,28 @@ func allColsWhere(row map[string]any) []string {
 	cols := sortedKeys(row)
 	parts := make([]string, len(cols))
 	for i, col := range cols {
-		parts[i] = quoteName(col) + " = " + formatValue(row[col])
+		parts[i] = QuoteName(col) + " = " + FormatSQLValue(row[col])
 	}
 	return parts
 }
 
 // ─── Value formatting ─────────────────────────────────────────────────────────
 
-// formatValue renders a Go value as a MySQL literal suitable for embedding in
-// a generated SQL statement.
+// FormatSQLValue renders a Go value as a MySQL literal suitable for embedding
+// in a generated SQL statement. Exported so other packages (notably the
+// mydumper writer in internal/reconstruct, #187) can reuse the exact same
+// formatting and escaping.
 //
-// After a JSON round-trip (row_before/row_after are stored as JSON and then
-// json.Unmarshal'd into map[string]any), all numeric values are float64.
-// Whole-number float64s are formatted as integers; fractional ones as decimals.
-func formatValue(v any) string {
+// Binlog-event values arrive here after a JSON round-trip
+// (row_before/row_after are stored as JSON and unmarshalled into
+// map[string]any), so all numeric values are float64. Whole-number float64s
+// are formatted as integers; fractional ones as decimals.
+//
+// DuckDB's database/sql driver (used by the full-table reconstruct path)
+// returns int64 / time.Time / []byte natively — those cases are also handled
+// here so the same function formats both JSON-round-tripped values from
+// binlog events and direct DuckDB scan values from baseline Parquet rows.
+func FormatSQLValue(v any) string {
 	if v == nil {
 		return "NULL"
 	}
@@ -302,6 +311,17 @@ func formatValue(v any) string {
 		}
 		return "0"
 
+	case int64:
+		return strconv.FormatInt(val, 10)
+	case int32:
+		return strconv.FormatInt(int64(val), 10)
+	case int:
+		return strconv.FormatInt(int64(val), 10)
+	case uint64:
+		return strconv.FormatUint(val, 10)
+	case uint32:
+		return strconv.FormatUint(uint64(val), 10)
+
 	case float64:
 		// Detect integer-valued floats (JSON round-trip converts int→float64).
 		// math.Abs guard prevents int64 overflow for very large floats.
@@ -310,39 +330,53 @@ func formatValue(v any) string {
 			return strconv.FormatInt(int64(val), 10)
 		}
 		return strconv.FormatFloat(val, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(val), 'f', -1, 32)
+
+	case time.Time:
+		// MySQL DATETIME literal with microsecond precision. UTC matches
+		// the indexer's storage convention for event_timestamp.
+		return "'" + val.UTC().Format("2006-01-02 15:04:05.000000") + "'"
+
+	case []byte:
+		// Binary/blob column. Emit as MySQL hex literal to survive
+		// arbitrary non-UTF-8 bytes. Empty slices become X'' which MySQL
+		// accepts as a zero-length BLOB.
+		return "X'" + hex.EncodeToString(val) + "'"
 
 	case string:
-		return "'" + escapeString(val) + "'"
+		return "'" + EscapeString(val) + "'"
 
 	case map[string]any:
 		// MySQL JSON column: re-serialise to JSON and store as a string literal.
 		b, _ := json.Marshal(val)
-		return "'" + escapeString(string(b)) + "'"
+		return "'" + EscapeString(string(b)) + "'"
 
 	case []any:
 		// JSON array column.
 		b, _ := json.Marshal(val)
-		return "'" + escapeString(string(b)) + "'"
+		return "'" + EscapeString(string(b)) + "'"
 
 	case json.RawMessage:
-		return "'" + escapeString(string(val)) + "'"
+		return "'" + EscapeString(string(val)) + "'"
 
 	default:
-		return "'" + escapeString(fmt.Sprintf("%v", val)) + "'"
+		return "'" + EscapeString(fmt.Sprintf("%v", val)) + "'"
 	}
 }
 
-// escapeString escapes a string for safe embedding inside a MySQL single-quoted literal.
-func escapeString(s string) string {
+// EscapeString escapes a string for safe embedding inside a MySQL
+// single-quoted literal.
+func EscapeString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `'`, `\'`)
 	s = strings.ReplaceAll(s, "\x00", `\0`)
 	return s
 }
 
-// quoteName wraps a MySQL identifier (schema, table, column) in backticks,
+// QuoteName wraps a MySQL identifier (schema, table, column) in backticks,
 // escaping any backticks in the name itself.
-func quoteName(name string) string {
+func QuoteName(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 

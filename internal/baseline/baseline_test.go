@@ -1096,13 +1096,15 @@ func TestReadParquetMetadata(t *testing.T) {
 	cols := []Column{
 		{Name: "id", MySQLType: "int", ParquetType: parquet.Leaf(parquet.Int32Type)},
 	}
+	wantCreateTableSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"
 	cfg := WriterConfig{
 		Compression:  "none",
 		RowGroupSize: 100,
 		Metadata: map[string]string{
-			MetaKeyBinlogFile: "binlog.000042",
-			MetaKeyBinlogPos:  "12345",
-			MetaKeyGTIDSet:    "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100",
+			MetaKeyBinlogFile:     "binlog.000042",
+			MetaKeyBinlogPos:      "12345",
+			MetaKeyGTIDSet:        "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100",
+			MetaKeyCreateTableSQL: wantCreateTableSQL,
 		},
 	}
 	w, err := NewWriter(outPath, cols, cfg)
@@ -1129,6 +1131,9 @@ func TestReadParquetMetadata(t *testing.T) {
 	}
 	if m.GTIDSet != "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100" {
 		t.Errorf("GTIDSet = %q, want %q", m.GTIDSet, "3e11fa47-bee9-11e4-9716-8f2e7c74b0e5:1-100")
+	}
+	if m.CreateTableSQL != wantCreateTableSQL {
+		t.Errorf("CreateTableSQL = %q, want %q", m.CreateTableSQL, wantCreateTableSQL)
 	}
 }
 

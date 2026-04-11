@@ -18,43 +18,43 @@ import (
 // newGen returns a Generator with no DB and no resolver (triggers all-cols fallback).
 func newGen() *Generator { return New(nil, nil) }
 
-// ─── formatValue ─────────────────────────────────────────────────────────────
+// ─── FormatSQLValue ─────────────────────────────────────────────────────────────
 
 func TestFormatValue_nil(t *testing.T) {
-	if got := formatValue(nil); got != "NULL" {
+	if got := FormatSQLValue(nil); got != "NULL" {
 		t.Errorf("expected NULL, got %q", got)
 	}
 }
 
 func TestFormatValue_boolTrue(t *testing.T) {
-	if got := formatValue(true); got != "1" {
+	if got := FormatSQLValue(true); got != "1" {
 		t.Errorf("expected 1, got %q", got)
 	}
 }
 
 func TestFormatValue_boolFalse(t *testing.T) {
-	if got := formatValue(false); got != "0" {
+	if got := FormatSQLValue(false); got != "0" {
 		t.Errorf("expected 0, got %q", got)
 	}
 }
 
 func TestFormatValue_integerFloat(t *testing.T) {
 	// JSON round-trip turns int64(12345) into float64(12345).
-	got := formatValue(float64(12345))
+	got := FormatSQLValue(float64(12345))
 	if got != "12345" {
 		t.Errorf("expected '12345', got %q", got)
 	}
 }
 
 func TestFormatValue_negativeInt(t *testing.T) {
-	got := formatValue(float64(-7))
+	got := FormatSQLValue(float64(-7))
 	if got != "-7" {
 		t.Errorf("expected '-7', got %q", got)
 	}
 }
 
 func TestFormatValue_decimal(t *testing.T) {
-	got := formatValue(float64(3.14))
+	got := FormatSQLValue(float64(3.14))
 	if !strings.Contains(got, ".") {
 		t.Errorf("expected decimal point in %q", got)
 	}
@@ -64,21 +64,21 @@ func TestFormatValue_decimal(t *testing.T) {
 }
 
 func TestFormatValue_string_simple(t *testing.T) {
-	got := formatValue("hello")
+	got := FormatSQLValue("hello")
 	if got != "'hello'" {
 		t.Errorf("expected \"'hello'\", got %q", got)
 	}
 }
 
 func TestFormatValue_string_singleQuote(t *testing.T) {
-	got := formatValue("it's fine")
+	got := FormatSQLValue("it's fine")
 	if !strings.Contains(got, `\'`) {
 		t.Errorf("expected escaped single quote in %q", got)
 	}
 }
 
 func TestFormatValue_string_backslash(t *testing.T) {
-	got := formatValue(`C:\path`)
+	got := FormatSQLValue(`C:\path`)
 	// Backslash must be doubled
 	if !strings.Contains(got, `\\`) {
 		t.Errorf("expected escaped backslash in %q", got)
@@ -86,7 +86,7 @@ func TestFormatValue_string_backslash(t *testing.T) {
 }
 
 func TestFormatValue_jsonObject(t *testing.T) {
-	got := formatValue(map[string]any{"key": "val"})
+	got := FormatSQLValue(map[string]any{"key": "val"})
 	// Should be a quoted JSON string
 	if !strings.HasPrefix(got, "'") || !strings.HasSuffix(got, "'") {
 		t.Errorf("expected single-quoted JSON, got %q", got)
@@ -96,30 +96,30 @@ func TestFormatValue_jsonObject(t *testing.T) {
 	}
 }
 
-// ─── quoteName ────────────────────────────────────────────────────────────────
+// ─── QuoteName ────────────────────────────────────────────────────────────────
 
 func TestQuoteName_simple(t *testing.T) {
-	if got := quoteName("orders"); got != "`orders`" {
+	if got := QuoteName("orders"); got != "`orders`" {
 		t.Errorf("expected `orders`, got %q", got)
 	}
 }
 
 func TestQuoteName_withBacktick(t *testing.T) {
-	if got := quoteName("col`name"); got != "`col``name`" {
+	if got := QuoteName("col`name"); got != "`col``name`" {
 		t.Errorf("expected `col``name`, got %q", got)
 	}
 }
 
-// ─── escapeString ─────────────────────────────────────────────────────────────
+// ─── EscapeString ─────────────────────────────────────────────────────────────
 
 func TestEscapeString_singleQuote(t *testing.T) {
-	if got := escapeString("O'Brien"); !strings.Contains(got, `\'`) {
+	if got := EscapeString("O'Brien"); !strings.Contains(got, `\'`) {
 		t.Errorf("single quote not escaped in %q", got)
 	}
 }
 
 func TestEscapeString_backslash(t *testing.T) {
-	if got := escapeString(`a\b`); !strings.Contains(got, `\\`) {
+	if got := EscapeString(`a\b`); !strings.Contains(got, `\\`) {
 		t.Errorf("backslash not escaped in %q", got)
 	}
 }
@@ -296,7 +296,7 @@ func TestGenerateSQL_noRows(t *testing.T) {
 
 func TestFormatValue_nullInRow(t *testing.T) {
 	// A NULL column (Go nil) must produce SQL NULL.
-	got := formatValue(nil)
+	got := FormatSQLValue(nil)
 	if got != "NULL" {
 		t.Errorf("expected NULL, got %q", got)
 	}
@@ -341,12 +341,12 @@ func TestGenerateSQL_noEventsMessage(t *testing.T) {
 	}
 }
 
-// ─── formatValue edge cases ──────────────────────────────────────────────────
+// ─── FormatSQLValue edge cases ──────────────────────────────────────────────────
 
 func TestFormatValue_arraySlice(t *testing.T) {
 	// JSON array column: []any should be serialised as a quoted JSON array.
 	val := []any{"a", float64(1), true}
-	got := formatValue(val)
+	got := FormatSQLValue(val)
 	if !strings.HasPrefix(got, "'") || !strings.HasSuffix(got, "'") {
 		t.Errorf("expected single-quoted JSON array, got %q", got)
 	}
@@ -357,7 +357,7 @@ func TestFormatValue_arraySlice(t *testing.T) {
 
 func TestFormatValue_jsonRawMessage(t *testing.T) {
 	raw := json.RawMessage(`{"key":"value"}`)
-	got := formatValue(raw)
+	got := FormatSQLValue(raw)
 	if !strings.HasPrefix(got, "'") || !strings.HasSuffix(got, "'") {
 		t.Errorf("expected quoted JSON, got %q", got)
 	}
@@ -371,7 +371,7 @@ func TestFormatValue_largeFloat(t *testing.T) {
 	// FormatFloat('f', -1) for exact whole numbers still omits the decimal,
 	// so the output looks like an integer — the guard is about int64 overflow
 	// safety, not about output format.
-	got := formatValue(float64(1e15))
+	got := FormatSQLValue(float64(1e15))
 	if got != "1000000000000000" {
 		t.Errorf("expected 1000000000000000, got %q", got)
 	}
@@ -379,7 +379,7 @@ func TestFormatValue_largeFloat(t *testing.T) {
 
 func TestFormatValue_veryLargeFloat(t *testing.T) {
 	// 1e18 exceeds the int64 guard but is representable in float64.
-	got := formatValue(float64(1e18))
+	got := FormatSQLValue(float64(1e18))
 	if got != "1000000000000000000" {
 		t.Errorf("expected 1000000000000000000, got %q", got)
 	}
@@ -388,7 +388,7 @@ func TestFormatValue_veryLargeFloat(t *testing.T) {
 func TestFormatValue_beyondInt64Range(t *testing.T) {
 	// 1e19 is beyond int64 max (~9.2e18). The guard prevents int64 overflow;
 	// FormatFloat handles it correctly.
-	got := formatValue(float64(1e19))
+	got := FormatSQLValue(float64(1e19))
 	if got == "" {
 		t.Error("expected non-empty result for 1e19")
 	}
@@ -397,7 +397,7 @@ func TestFormatValue_beyondInt64Range(t *testing.T) {
 }
 
 func TestFormatValue_infinity(t *testing.T) {
-	got := formatValue(math.Inf(1))
+	got := FormatSQLValue(math.Inf(1))
 	if got == "NULL" {
 		t.Errorf("expected float format for +Inf, got %q", got)
 	}
@@ -405,14 +405,14 @@ func TestFormatValue_infinity(t *testing.T) {
 }
 
 func TestFormatValue_nan(t *testing.T) {
-	got := formatValue(math.NaN())
+	got := FormatSQLValue(math.NaN())
 	if got == "NULL" {
 		t.Errorf("expected float format for NaN, got %q", got)
 	}
 }
 
 func TestFormatValue_negativeZero(t *testing.T) {
-	got := formatValue(math.Copysign(0, -1))
+	got := FormatSQLValue(math.Copysign(0, -1))
 	// -0 == 0, so Trunc(-0) == -0, and -0 == -0. math.Abs(-0) = 0 < 1e15.
 	// It should format as "0" (integer format).
 	if got != "0" {
@@ -420,10 +420,10 @@ func TestFormatValue_negativeZero(t *testing.T) {
 	}
 }
 
-// ─── escapeString edge cases ─────────────────────────────────────────────────
+// ─── EscapeString edge cases ─────────────────────────────────────────────────
 
 func TestEscapeString_nullByte(t *testing.T) {
-	got := escapeString("hello\x00world")
+	got := EscapeString("hello\x00world")
 	if !strings.Contains(got, `\0`) {
 		t.Errorf("expected \\0 for null byte, got %q", got)
 	}
@@ -433,7 +433,7 @@ func TestEscapeString_nullByte(t *testing.T) {
 }
 
 func TestEscapeString_combined(t *testing.T) {
-	got := escapeString("it's a \\path\x00end")
+	got := EscapeString("it's a \\path\x00end")
 	if !strings.Contains(got, `\'`) {
 		t.Errorf("expected escaped quote in %q", got)
 	}
@@ -712,4 +712,76 @@ func TestGenerateInsert_noResolver_includesAllColumns(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertSQL(t, stmt, "line_total")
+}
+
+// ─── FormatSQLValue extended types (DuckDB scan) ─────────────────────────────
+// These exercise the int64/time.Time/[]byte cases added for the full-table
+// reconstruct path (#187), where values come from DuckDB's database/sql driver
+// rather than a JSON round-trip.
+
+func TestFormatValue_int64(t *testing.T) {
+	if got := FormatSQLValue(int64(9876543210)); got != "9876543210" {
+		t.Errorf("int64: got %q", got)
+	}
+	if got := FormatSQLValue(int64(-42)); got != "-42" {
+		t.Errorf("negative int64: got %q", got)
+	}
+}
+
+func TestFormatValue_int32(t *testing.T) {
+	if got := FormatSQLValue(int32(12345)); got != "12345" {
+		t.Errorf("int32: got %q", got)
+	}
+}
+
+func TestFormatValue_uint64(t *testing.T) {
+	// Values above int64 max must round-trip unsigned.
+	if got := FormatSQLValue(uint64(18446744073709551615)); got != "18446744073709551615" {
+		t.Errorf("uint64: got %q", got)
+	}
+}
+
+func TestFormatValue_timeTime(t *testing.T) {
+	// Microsecond-precision UTC literal matching the indexer convention.
+	val := time.Date(2026, 4, 11, 14, 30, 45, 123456000, time.UTC)
+	got := FormatSQLValue(val)
+	if got != "'2026-04-11 14:30:45.123456'" {
+		t.Errorf("time.Time: got %q", got)
+	}
+}
+
+func TestFormatValue_timeTimeNonUTC(t *testing.T) {
+	// A time.Time in another zone must be normalised to UTC before formatting.
+	loc, _ := time.LoadLocation("America/New_York")
+	val := time.Date(2026, 4, 11, 10, 30, 45, 0, loc) // 14:30:45 UTC
+	got := FormatSQLValue(val)
+	if got != "'2026-04-11 14:30:45.000000'" {
+		t.Errorf("time.Time non-UTC: got %q", got)
+	}
+}
+
+func TestFormatValue_byteSlice(t *testing.T) {
+	// Binary blob as MySQL hex literal.
+	val := []byte{0xde, 0xad, 0xbe, 0xef}
+	got := FormatSQLValue(val)
+	if got != "X'deadbeef'" {
+		t.Errorf("[]byte: got %q", got)
+	}
+}
+
+func TestFormatValue_emptyByteSlice(t *testing.T) {
+	// Empty slice must still emit a valid MySQL hex literal.
+	got := FormatSQLValue([]byte{})
+	if got != "X''" {
+		t.Errorf("empty []byte: got %q", got)
+	}
+}
+
+func TestFormatValue_byteSliceWithNullByte(t *testing.T) {
+	// Arbitrary non-UTF-8 bytes must survive via hex encoding.
+	val := []byte{0x00, 0xff, 0x7f, 0x80}
+	got := FormatSQLValue(val)
+	if got != "X'00ff7f80'" {
+		t.Errorf("arbitrary []byte: got %q", got)
+	}
 }
