@@ -201,28 +201,49 @@ func nullOrUint32(v uint32) any {
 }
 
 // EnsureSchema adds any columns introduced after the initial schema to
-// binlog_events. It is idempotent — safe to call on every startup.
+// binlog_events and schema_snapshots. It is idempotent — safe to call on
+// every startup.
 func EnsureSchema(db *sql.DB) error {
+	if err := ensureColumn(db, "binlog_events", "connection_id",
+		`ALTER TABLE binlog_events ADD COLUMN connection_id INT UNSIGNED DEFAULT NULL COMMENT 'MySQL connection ID (pseudo_thread_id) that produced this event' AFTER gtid`,
+	); err != nil {
+		return err
+	}
+	// column_type carries the full type declaration (e.g. "datetime(6)") so
+	// full-table reconstruct (#187, #212) can tell the declared fractional
+	// precision of DATETIME/TIMESTAMP PK columns. Without this the PK
+	// canonicalizer cannot distinguish DATETIME(0) from DATETIME(6) with
+	// whole-second values.
+	if err := ensureColumn(db, "schema_snapshots", "column_type",
+		`ALTER TABLE schema_snapshots ADD COLUMN column_type VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'full type from information_schema.COLUMNS.COLUMN_TYPE' AFTER data_type`,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureColumn runs an idempotent ALTER TABLE ADD COLUMN: checks
+// information_schema, bails out if the column already exists, and swallows
+// the "duplicate column" error if a concurrent process added it between our
+// check and the ALTER.
+func ensureColumn(db *sql.DB, table, column, alterSQL string) error {
 	var count int
 	err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = DATABASE()
-		  AND TABLE_NAME   = 'binlog_events'
-		  AND COLUMN_NAME  = 'connection_id'`).Scan(&count)
+		  AND TABLE_NAME   = ?
+		  AND COLUMN_NAME  = ?`, table, column).Scan(&count)
 	if err != nil {
-		return fmt.Errorf("check connection_id column: %w", err)
+		return fmt.Errorf("check %s.%s column: %w", table, column, err)
 	}
 	if count > 0 {
-		return nil // already present
+		return nil
 	}
-	_, err = db.Exec(`ALTER TABLE binlog_events ADD COLUMN connection_id INT UNSIGNED DEFAULT NULL COMMENT 'MySQL connection ID (pseudo_thread_id) that produced this event' AFTER gtid`)
-	if err != nil {
-		// Error 1060 = "Duplicate column name": another process added it
-		// concurrently between our check and ALTER — safe to ignore.
+	if _, err := db.Exec(alterSQL); err != nil {
 		var mysqlErr *mysql.MySQLError
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1060 {
 			return nil
 		}
-		return fmt.Errorf("add connection_id column: %w", err)
+		return fmt.Errorf("add %s.%s column: %w", table, column, err)
 	}
 	return nil
 }

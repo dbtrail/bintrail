@@ -19,6 +19,7 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/baseline"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parquetquery"
 	"github.com/dbtrail/bintrail/internal/parser"
@@ -31,21 +32,26 @@ import (
 // running at a time (a goroutine is spawned for every table, but a buffered-
 // channel semaphore caps the number that actually do work).
 //
-// Known limitations (v1):
+// Supported primary-key types (#212):
 //
-//   - Supports integer and string primary keys. DATETIME/TIMESTAMP, DECIMAL,
-//     ENUM, SET and binary PKs are not guaranteed to round-trip correctly
-//     because the PK encoder (parser.BuildPKValues) uses %v formatting and
-//     the Go type delivered by DuckDB parquet_scan may not match the type
-//     delivered by the binlog parser at indexing time.
-//   - UPDATE events that mutate the primary key itself are not handled
-//     correctly: the change map is keyed by the before-image PK, so a later
-//     event on the old PK value may overwrite the UPDATE in the map and the
-//     after-image row is dropped. Re-snapshot the baseline after schema
-//     changes that reshape PKs.
+//   - integer: int, smallint, tinyint, mediumint, bigint (+ unsigned)
+//   - string: char, varchar, text, tinytext, mediumtext, longtext
+//   - enum, set
+//   - datetime, timestamp — canonicalized from DuckDB time.Time to the
+//     go-mysql string format the indexer stores
+//   - date — canonicalized to "2006-01-02"
+//   - year
 //
-// Both limitations are tracked as follow-ups; document them in command help
-// and user-facing docs before promoting this feature out of "preview" status.
+// PK columns with any other type (DECIMAL, NUMERIC, FLOAT, DOUBLE, BINARY,
+// VARBINARY, BLOB, BIT, JSON, spatial types) are rejected at
+// ReconstructTable entry with a hard error. #214 tracks expanding the
+// supported set — file a request there if you need a specific type.
+//
+// UPDATE events that mutate the primary key itself are NOT handled
+// correctly: the change map is keyed by the before-image PK, so a later
+// event on the old PK value may overwrite the UPDATE in the map and the
+// after-image row is dropped. Re-snapshot the baseline after schema
+// changes that reshape PKs.
 type FullTableConfig struct {
 	IndexDSN    string    // DSN for the bintrail index database
 	BaselineSrc string    // local directory or s3:// URL of baselines
@@ -107,6 +113,17 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	defer db.Close()
 	// Give per-table goroutines enough connections for concurrent fetches.
 	db.SetMaxOpenConns(2 * cfg.Parallelism)
+
+	// Run the idempotent schema migration before NewResolver. NewResolver
+	// reads schema_snapshots.column_type (added in #212), and pre-upgrade
+	// databases where EnsureSchema hasn't been called from some other
+	// command yet would fail with Error 1054: Unknown column 'column_type'.
+	// Every other consumer of NewResolver runs EnsureSchema first; doing it
+	// at the library boundary here means library callers (not just the CLI)
+	// also get the migration automatically.
+	if err := indexer.EnsureSchema(db); err != nil {
+		return nil, fmt.Errorf("ensure index schema: %w", err)
+	}
 
 	// Derive DBName for the query planner.
 	var dbName string
@@ -191,7 +208,11 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	}
 
 	if len(errs) > 0 {
-		return reports, errs[0]
+		// errors.Join surfaces every per-table failure so operators running
+		// with --log-level error see the full picture, not just the first
+		// one. Every error is also logged individually above, but the
+		// returned error is what the CLI wraps into its exit status.
+		return reports, errors.Join(errs...)
 	}
 	return reports, nil
 }
@@ -241,6 +262,37 @@ func ReconstructTable(
 	pkCols := tm.PKColumnMetas()
 	if len(pkCols) == 0 {
 		return nil, fmt.Errorf("%s.%s has no primary key in the loaded snapshot; full-table reconstruct requires a PK", schema, table)
+	}
+	// Refuse to proceed when a PK column uses a type the canonicalizer
+	// cannot handle. Emitting a warning isn't enough because operators
+	// running with --log-level error won't see it and would silently get
+	// wrong output — the same class of bug the full-table reconstruct
+	// hardening exists to prevent. Users with DECIMAL / BINARY / BLOB /
+	// BIT / JSON / GEOMETRY / etc. PKs must track the follow-up work for
+	// their type to be added.
+	for _, pkCol := range pkCols {
+		if !supportedPKType(pkCol.DataType) {
+			return nil, fmt.Errorf(
+				"full-table reconstruct: %s.%s PK column %q has type %q which is not in the supported PK type set; "+
+					"file a follow-up issue if you need this type",
+				schema, table, pkCol.Name, pkCol.DataType)
+		}
+	}
+
+	// For DATETIME/TIMESTAMP PK columns, warn loudly if the column_type
+	// metadata is missing — the canonicalizer will fall back to a
+	// Nanosecond()==0 heuristic that is correct for DATETIME(0) but
+	// silently wrong for DATETIME(N>0) whole-second values. Operators
+	// should re-run `bintrail snapshot` to refresh schema_snapshots with
+	// the new column_type field (added in the precision-aware PK fix).
+	for _, pkCol := range pkCols {
+		dt := strings.ToLower(strings.TrimSpace(pkCol.DataType))
+		if (dt == "datetime" || dt == "timestamp") && pkCol.ColumnType == "" {
+			slog.Warn("full-table reconstruct: DATETIME/TIMESTAMP PK column has no column_type in schema_snapshots; "+
+				"using best-effort precision heuristic — DATETIME(N>0) whole-second values may silently miss the baseline. "+
+				"Re-run `bintrail snapshot` to refresh.",
+				"schema", schema, "table", table, "column", pkCol.Name)
+		}
 	}
 
 	// ── 4. Fetch events via the shared helper (gap-aware) ──────────────────
@@ -384,7 +436,18 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 			return fmt.Errorf("scan baseline row: %w", err)
 		}
 		rowMap := zipMap(dcols, scan)
-		pk := parser.BuildPKValues(in.PKCols, rowMap)
+		// Canonicalise PK values before hashing so they match what the
+		// indexer stored in binlog_events.pk_values. Without this,
+		// DATETIME/TIMESTAMP PKs silently miss the change map because
+		// DuckDB returns time.Time while the indexer stored a
+		// go-mysql-formatted string (#212). The non-PK values in rowMap
+		// are left untouched — they're not used for key construction and
+		// flow unchanged into the mydumper writer below.
+		pkMap, err := canonicalizePKMap(rowMap, in.PKCols)
+		if err != nil {
+			return fmt.Errorf("canonicalize baseline PK for %s.%s: %w", in.Schema, in.Table, err)
+		}
+		pk := parser.BuildPKValues(in.PKCols, pkMap)
 
 		if ev, ok := in.Changes[pk]; ok {
 			delete(in.Changes, pk)

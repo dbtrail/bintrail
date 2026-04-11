@@ -2,6 +2,7 @@ package reconstruct
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -166,3 +167,36 @@ type fileInfoLike interface {
 // ensure metadata types used in compile-time checks are referenced; prevents
 // the `metadata` import from being unused in the validation test file.
 var _ = metadata.ColumnMeta{}
+
+// TestMissingPKColumnError_survivesErrorsJoin pins the contract that
+// ReconstructTables' errors.Join aggregation preserves the typed
+// *MissingPKColumnError for callers that want to recover the column name.
+// A future refactor back to errs[0] or to a single string-concatenated
+// error would fail errors.As / errors.Is through the join and this test
+// would catch it.
+func TestMissingPKColumnError_survivesErrorsJoin(t *testing.T) {
+	missing := &MissingPKColumnError{Column: "created_at"}
+	other := errors.New("other table: baseline read failed")
+	joined := errors.Join(missing, other)
+
+	// The sentinel still matches through the join.
+	if !errors.Is(joined, ErrPKColumnMissing) {
+		t.Errorf("errors.Is(joined, ErrPKColumnMissing) = false; want true")
+	}
+
+	// The typed error and its Column field are still recoverable.
+	var gotMissing *MissingPKColumnError
+	if !errors.As(joined, &gotMissing) {
+		t.Fatalf("errors.As(joined, *MissingPKColumnError) = false; want true")
+	}
+	if gotMissing.Column != "created_at" {
+		t.Errorf("recovered Column = %q, want %q", gotMissing.Column, "created_at")
+	}
+
+	// A third error that's neither the sentinel nor the typed error must
+	// NOT trip either assertion by accident.
+	unrelated := errors.New("unrelated")
+	if errors.Is(unrelated, ErrPKColumnMissing) {
+		t.Error("unrelated error incorrectly matched ErrPKColumnMissing")
+	}
+}

@@ -16,8 +16,9 @@ type ColumnMeta struct {
 	Name            string
 	OrdinalPosition int
 	IsPK            bool
-	DataType        string
-	IsGenerated     bool // true for STORED or VIRTUAL generated columns
+	DataType        string // e.g. "int", "datetime", "varchar" (information_schema.COLUMNS.DATA_TYPE)
+	ColumnType      string // full type declaration, e.g. "int(11) unsigned", "datetime(6)" (COLUMN_TYPE). Empty on pre-#212 snapshots.
+	IsGenerated     bool   // true for STORED or VIRTUAL generated columns
 }
 
 // TableMeta holds the column mapping for a table, derived from a schema snapshot.
@@ -71,8 +72,14 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 		}
 	}
 
+	// column_type was added in #212; existing snapshots may lack the column
+	// entirely. COALESCE handles the post-ALTER default empty string; for
+	// databases still on the pre-ALTER schema, the caller must run
+	// indexer.EnsureSchema first.
 	rows, err := db.Query(`
-		SELECT schema_name, table_name, column_name, ordinal_position, column_key, data_type, is_generated
+		SELECT schema_name, table_name, column_name, ordinal_position,
+		       column_key, data_type, COALESCE(column_type, '') AS column_type,
+		       is_generated
 		FROM schema_snapshots
 		WHERE snapshot_id = ?
 		ORDER BY schema_name, table_name, ordinal_position`,
@@ -85,11 +92,11 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	r := &Resolver{snapshotID: snapshotID, tables: make(map[string]*TableMeta)}
 
 	for rows.Next() {
-		var schemaName, tableName, columnName, columnKey, dataType string
+		var schemaName, tableName, columnName, columnKey, dataType, columnType string
 		var ordinalPosition int
 		var isGenerated bool
 
-		if err := rows.Scan(&schemaName, &tableName, &columnName, &ordinalPosition, &columnKey, &dataType, &isGenerated); err != nil {
+		if err := rows.Scan(&schemaName, &tableName, &columnName, &ordinalPosition, &columnKey, &dataType, &columnType, &isGenerated); err != nil {
 			return nil, fmt.Errorf("failed to scan snapshot row: %w", err)
 		}
 
@@ -105,6 +112,7 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 			OrdinalPosition: ordinalPosition,
 			IsPK:            columnKey == "PRI",
 			DataType:        dataType,
+			ColumnType:      columnType,
 			IsGenerated:     isGenerated,
 		}
 		tm.Columns = append(tm.Columns, col)
@@ -173,6 +181,7 @@ type columnRow struct {
 	schemaName, tableName, columnName string
 	ordinalPosition                   int
 	columnKey, dataType, isNullable   string
+	columnType                        string // full COLUMN_TYPE (e.g. "datetime(6)"); needed by full-table reconstruct for PK precision
 	extra                             string
 	columnDefault                     sql.NullString
 }
@@ -207,7 +216,8 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	if len(schemas) == 0 {
 		query = `
 			SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
-			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA
+			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, COLUMN_TYPE,
+			       IS_NULLABLE, COLUMN_DEFAULT, EXTRA
 			FROM information_schema.COLUMNS
 			WHERE TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
 			ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`
@@ -215,7 +225,8 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
 		query = fmt.Sprintf(`
 			SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
-			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA
+			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, COLUMN_TYPE,
+			       IS_NULLABLE, COLUMN_DEFAULT, EXTRA
 			FROM information_schema.COLUMNS
 			WHERE TABLE_SCHEMA IN (%s)
 			ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`, placeholders)
@@ -237,7 +248,8 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		var c columnRow
 		if err := srcRows.Scan(
 			&c.schemaName, &c.tableName, &c.columnName,
-			&c.ordinalPosition, &c.columnKey, &c.dataType, &c.isNullable, &c.columnDefault, &c.extra,
+			&c.ordinalPosition, &c.columnKey, &c.dataType, &c.columnType,
+			&c.isNullable, &c.columnDefault, &c.extra,
 		); err != nil {
 			return SnapshotStats{}, fmt.Errorf("failed to scan column row: %w", err)
 		}
@@ -294,13 +306,13 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	for i := 0; i < len(columns); i += batchSize {
 		batch := columns[i:min(i+batchSize, len(columns))]
 
-		valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
+		valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
 		insertSQL := "INSERT INTO schema_snapshots " +
 			"(snapshot_id, snapshot_time, schema_name, table_name, column_name, " +
-			"ordinal_position, column_key, data_type, is_nullable, column_default, is_generated) VALUES " +
+			"ordinal_position, column_key, data_type, column_type, is_nullable, column_default, is_generated) VALUES " +
 			valClause
 
-		insertArgs := make([]any, 0, len(batch)*11)
+		insertArgs := make([]any, 0, len(batch)*12)
 		for _, c := range batch {
 			var def any
 			if c.columnDefault.Valid {
@@ -309,7 +321,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 			isGenerated := strings.Contains(strings.ToUpper(c.extra), "GENERATED")
 			insertArgs = append(insertArgs,
 				nextID, snapshotTime, c.schemaName, c.tableName, c.columnName,
-				c.ordinalPosition, c.columnKey, c.dataType, c.isNullable, def, isGenerated,
+				c.ordinalPosition, c.columnKey, c.dataType, c.columnType, c.isNullable, def, isGenerated,
 			)
 		}
 

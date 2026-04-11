@@ -231,3 +231,56 @@ func TestResolver_pkColumns(t *testing.T) {
 		t.Errorf("expected PK columns [order_id, item_id], got [%s, %s]", pkCols[0].Name, pkCols[1].Name)
 	}
 }
+
+// TestTakeSnapshot_columnType is the #212 regression test for the schema-
+// snapshot side of the precision-aware PK canonicalizer. TakeSnapshot must
+// read `information_schema.COLUMNS.COLUMN_TYPE` and store the full type
+// (e.g. "datetime(6)") in `schema_snapshots.column_type`, so the reconstruct
+// canonicalizer can parse the declared fractional precision.
+//
+// Before this fix, schema_snapshots only had `data_type` (base type like
+// "datetime"), and the canonicalizer had no way to tell DATETIME(0) from
+// DATETIME(6). This test proves TakeSnapshot actually captures the precision.
+func TestTakeSnapshot_columnType(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE events (
+		id INT PRIMARY KEY,
+		created_at DATETIME(6) NOT NULL,
+		amount DECIMAL(12,4) NOT NULL,
+		slug VARCHAR(64) NOT NULL
+	)`)
+
+	stats, err := TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshot failed: %v", err)
+	}
+
+	// Pull column_type back out for each column and check it matches.
+	cases := []struct {
+		column   string
+		wantType string
+	}{
+		{"id", "int"},
+		{"created_at", "datetime(6)"},
+		{"amount", "decimal(12,4)"},
+		{"slug", "varchar(64)"},
+	}
+	for _, c := range cases {
+		var got string
+		err := indexDB.QueryRow(
+			`SELECT column_type FROM schema_snapshots
+			 WHERE snapshot_id = ? AND table_name = 'events' AND column_name = ?`,
+			stats.SnapshotID, c.column,
+		).Scan(&got)
+		if err != nil {
+			t.Errorf("query column_type for %s: %v", c.column, err)
+			continue
+		}
+		if got != c.wantType {
+			t.Errorf("column %s: got column_type=%q, want %q", c.column, got, c.wantType)
+		}
+	}
+}

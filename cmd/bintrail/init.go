@@ -540,6 +540,7 @@ const ddlSchemaSnapshots = `CREATE TABLE IF NOT EXISTS schema_snapshots (
     ordinal_position INT UNSIGNED NOT NULL,
     column_key       VARCHAR(3)   NOT NULL COMMENT 'PRI, UNI, MUL, or empty',
     data_type        VARCHAR(64)  NOT NULL,
+    column_type      VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'full type from information_schema.COLUMNS.COLUMN_TYPE, e.g. "datetime(6)" or "int unsigned"; needed by full-table reconstruct for DATETIME precision',
     is_nullable      VARCHAR(3)   NOT NULL,
     column_default   TEXT         DEFAULT NULL,
     is_generated     TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '1 if STORED or VIRTUAL generated column',
