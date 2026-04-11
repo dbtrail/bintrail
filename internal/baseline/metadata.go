@@ -2,6 +2,8 @@ package baseline
 
 import (
 	"bufio"
+	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,22 +12,26 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver for s3:// metadata reads
 	"github.com/parquet-go/parquet-go"
 )
 
-// Parquet metadata keys for baseline binlog position.
+// Parquet metadata keys for baseline binlog position and schema DDL.
 const (
-	MetaKeyBinlogFile = "bintrail.baseline_binlog_file"
-	MetaKeyBinlogPos  = "bintrail.baseline_binlog_position"
-	MetaKeyGTIDSet    = "bintrail.baseline_gtid_set"
+	MetaKeyBinlogFile     = "bintrail.baseline_binlog_file"
+	MetaKeyBinlogPos      = "bintrail.baseline_binlog_position"
+	MetaKeyGTIDSet        = "bintrail.baseline_gtid_set"
+	MetaKeyCreateTableSQL = "bintrail.create_table_sql"
 )
 
-// DumpMetadata contains information parsed from a mydumper metadata file.
+// DumpMetadata contains information parsed from a mydumper metadata file or
+// from a baseline Parquet file's key-value metadata.
 type DumpMetadata struct {
-	StartedAt  time.Time
-	BinlogFile string
-	BinlogPos  int64
-	GTIDSet    string
+	StartedAt      time.Time
+	BinlogFile     string
+	BinlogPos      int64
+	GTIDSet        string
+	CreateTableSQL string // raw mydumper -schema.sql bytes; set for baselines written after #187
 }
 
 // ParseMetadata reads the mydumper "metadata" file in inputDir and returns the
@@ -125,6 +131,70 @@ func ReadParquetMetadata(path string) (DumpMetadata, error) {
 	}
 	if v, ok := pf.Lookup(MetaKeyGTIDSet); ok {
 		m.GTIDSet = v
+	}
+	if v, ok := pf.Lookup(MetaKeyCreateTableSQL); ok {
+		m.CreateTableSQL = v
+	}
+	return m, nil
+}
+
+// ReadParquetMetadataAny reads baseline Parquet metadata from either a local
+// path or an s3:// URL. For S3 it uses DuckDB's parquet_kv_metadata() table
+// function through the httpfs extension, avoiding a direct AWS SDK dependency.
+//
+// Used by the full-table reconstruct path (#187) which needs baseline
+// metadata (CreateTableSQL in particular) from S3-resident Parquet files.
+func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, error) {
+	if !strings.HasPrefix(path, "s3://") {
+		return ReadParquetMetadata(path)
+	}
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		return DumpMetadata{}, fmt.Errorf("open duckdb: %w", err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+		return DumpMetadata{}, fmt.Errorf("load httpfs extension: %w", err)
+	}
+
+	safePath := strings.ReplaceAll(path, "'", "''")
+	q := fmt.Sprintf("SELECT key, value FROM parquet_kv_metadata('%s')", safePath)
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return DumpMetadata{}, fmt.Errorf("query parquet metadata: %w", err)
+	}
+	defer rows.Close()
+
+	var m DumpMetadata
+	for rows.Next() {
+		// DuckDB returns key/value as BLOB (BYTE_ARRAY) when the Parquet
+		// metadata column stores raw bytes. Scan as []byte to be safe.
+		var keyBytes, valBytes []byte
+		if err := rows.Scan(&keyBytes, &valBytes); err != nil {
+			return DumpMetadata{}, fmt.Errorf("scan metadata row: %w", err)
+		}
+		key := string(keyBytes)
+		val := string(valBytes)
+		switch key {
+		case MetaKeyBinlogFile:
+			m.BinlogFile = val
+		case MetaKeyBinlogPos:
+			if pos, parseErr := strconv.ParseInt(val, 10, 64); parseErr == nil {
+				m.BinlogPos = pos
+			} else {
+				slog.Warn("corrupt baseline_binlog_position in S3 Parquet metadata",
+					"path", path, "raw_value", val, "error", parseErr)
+			}
+		case MetaKeyGTIDSet:
+			m.GTIDSet = val
+		case MetaKeyCreateTableSQL:
+			m.CreateTableSQL = val
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return DumpMetadata{}, fmt.Errorf("iterate metadata rows: %w", err)
 	}
 	return m, nil
 }

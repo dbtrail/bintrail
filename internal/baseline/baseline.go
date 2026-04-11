@@ -143,6 +143,19 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 			if meta.GTIDSet != "" {
 				md[MetaKeyGTIDSet] = meta.GTIDSet
 			}
+			// Embed the raw mydumper <db>.<table>-schema.sql bytes so that
+			// full-table reconstruct (#187) can emit a faithful schema file
+			// without re-synthesising from Parquet column types. Non-fatal:
+			// an older baseline or a schema-file read error just leaves the
+			// key absent and full-table reconstruct will abort with a clear
+			// "re-run bintrail baseline" message.
+			if rawSchema, schemaErr := os.ReadFile(tf.SchemaFile); schemaErr != nil {
+				slog.Warn("could not read schema file for CREATE TABLE embed",
+					"db", tf.Database, "table", tf.Table,
+					"path", tf.SchemaFile, "error", schemaErr)
+			} else {
+				md[MetaKeyCreateTableSQL] = string(rawSchema)
+			}
 			writerCfg := WriterConfig{
 				Compression:  compression,
 				RowGroupSize: rowGroupSize,
