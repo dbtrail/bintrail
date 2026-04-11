@@ -9,6 +9,8 @@ import (
 	"go/parser"
 	"go/token"
 	"log/slog"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -493,7 +495,12 @@ func captureSlogDefault(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
 	orig := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	// Capture at Debug so the cancellation tests' `buf.Len() == 0`
+	// assertions actually prove "no output on cancel" — not just "no WARN
+	// output on cancel." A future refactor that emits slog.Info or
+	// slog.Debug from the cancellation path would silently pass a
+	// WARN-filtered handler but correctly fail a Debug-filtered one.
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(orig) })
 	return &buf
 }
@@ -506,11 +513,17 @@ func captureSlogDefault(t *testing.T) *bytes.Buffer {
 // If a test scripts fewer responses than the helper makes calls, the excess
 // calls return a synthetic "unexpected call" error rather than panicking so
 // over-iteration bugs surface through the stderr/error assertions with a
-// clear message. Call .fn() exactly once per test — it returns a fresh
-// closure every invocation and calling it twice is a copy-paste hazard.
+// clear message.
+//
+// Call .fn() exactly once per test. The method returns a fresh closure
+// every invocation, and two closures from the same fakeFetcher would share
+// the response index and calls slice — a subtle copy-paste hazard. The
+// method enforces this by panicking on the second call, turning an advisory
+// warning into a runtime contract.
 type fakeFetcher struct {
 	responses []fakeResponse
 	calls     []string // sources that were actually invoked
+	fnIssued  bool
 }
 
 type fakeResponse struct {
@@ -519,6 +532,10 @@ type fakeResponse struct {
 }
 
 func (f *fakeFetcher) fn() query.ArchiveFetcher {
+	if f.fnIssued {
+		panic("fakeFetcher.fn() called twice — each test must call .fn() exactly once")
+	}
+	f.fnIssued = true
 	return func(_ context.Context, _ query.Options, src string) ([]query.ResultRow, error) {
 		idx := len(f.calls)
 		f.calls = append(f.calls, src)
@@ -656,12 +673,12 @@ func TestQueryArchiveSources_preCanceledCtxShortCircuits(t *testing.T) {
 }
 
 // TestQueryArchiveSources_wrappedCanceledFetchErrShortCircuits guards against
-// the race condition the PR #217 review flagged as finding I1: the fetch
-// error can wrap context.Canceled before the ambient ctx.Err() has
-// transitioned (child-context races, DuckDB httpfs cancellation). The
-// helper's second check — errors.Is on the fetch error — must catch this
-// case. Without it, a canceled query would silently degrade to "archive
-// failed, keep going" per-source warnings, exactly the UX the fix prevents.
+// the race where the fetch error wraps context.Canceled before the ambient
+// ctx.Err() has transitioned — child-context races, DuckDB/httpfs
+// cancellation propagation. The helper's second check (errors.Is on the
+// fetch error chain) catches this case; without it, a canceled query would
+// silently degrade to "archive failed, keep going" per-source warnings,
+// exactly the UX the #203 fix prevents.
 func TestQueryArchiveSources_wrappedCanceledFetchErrShortCircuits(t *testing.T) {
 	slogBuf := captureSlogDefault(t)
 	var stderr bytes.Buffer
@@ -788,12 +805,15 @@ func TestQueryArchiveSources_multipleFailuresAllReported(t *testing.T) {
 }
 
 // TestQueryArchiveSources_stderrSanitizesNewlines verifies the newline
-// collapsing behavior. DuckDB Binder errors and AWS SDK errors frequently
-// contain embedded newlines, which would break line-oriented stderr
-// consumers if passed through raw. Each archive failure must occupy
-// exactly one line of stderr output, period.
+// collapsing behavior on stderr AND the complementary invariant that
+// slog.Warn receives the RAW error (with newlines intact). Together these
+// assertions pin the divergence documented at the slog.Warn call site:
+// stderr gets sanitized for line-oriented consumers, structured logs get
+// the raw text for full-fidelity debugging. A future "consistency" refactor
+// that passes sanitizeArchiveErrorMessage(err) to slog.Warn would silently
+// degrade the primary debuggability channel — this test catches it.
 func TestQueryArchiveSources_stderrSanitizesNewlines(t *testing.T) {
-	_ = captureSlogDefault(t)
+	slogBuf := captureSlogDefault(t)
 	var stderr bytes.Buffer
 
 	multiline := "line1\nline2\nline3"
@@ -814,15 +834,32 @@ func TestQueryArchiveSources_stderrSanitizesNewlines(t *testing.T) {
 	}
 
 	out := stderr.String()
-	// The " | " separator must be present.
+	// Stderr: the " | " separator must be present.
 	if !strings.Contains(out, "line1 | line2 | line3") {
 		t.Errorf("stderr did not collapse newlines to ' | ': %q", out)
 	}
-	// And the raw multiline form must be gone — no stray \n in the middle
-	// of the warning that would break line-oriented consumers.
+	// Stderr: the raw multiline form must be gone — no stray \n in the
+	// middle of the warning that would break line-oriented consumers.
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 	if len(lines) != 1 {
 		t.Errorf("expected exactly 1 stderr line for 1 failure, got %d: %q", len(lines), lines)
+	}
+
+	// Slog: the structured record MUST contain the raw text with escaped
+	// newlines preserved. slog's text handler encodes embedded newlines as
+	// the literal escape sequence `\n` inside a quoted string, so a
+	// sanitized value (" | ") and a raw value ("\\n") produce visibly
+	// different serializations. A refactor that silently swaps in
+	// sanitizeArchiveErrorMessage(err) for slog would fail the next check.
+	slogOut := slogBuf.String()
+	if !strings.Contains(slogOut, `\nline2\nline3`) {
+		t.Errorf("slog record missing raw escaped newlines — slog must "+
+			"receive the unsanitized error so structured-log consumers "+
+			"preserve the full text. got: %q", slogOut)
+	}
+	if strings.Contains(slogOut, "line1 | line2 | line3") {
+		t.Errorf("slog record contains the sanitized form — slog should "+
+			"receive the RAW error, not the stderr-sanitized one. got: %q", slogOut)
 	}
 }
 
@@ -857,34 +894,66 @@ func TestQueryArchiveSources_emptySources(t *testing.T) {
 }
 
 // TestRunQueryCallsQueryArchiveSources is a meta-test that asserts the
-// `runQuery` function in query.go actually calls `queryArchiveSources`.
+// `runQuery` function in query.go actually calls `queryArchiveSources`,
+// captures its return value, and appends that value into the merged
+// results slice. Every other test in this file drives queryArchiveSources
+// directly with a fake fetcher, so without this guard a regression at the
+// call site would leave the helper as dead code while every contract test
+// still passed.
 //
-// Why this test exists: every other test in this file drives
-// queryArchiveSources directly with a fake fetcher, which catches any
-// regression INSIDE the helper. But none of them would fail if someone
-// deleted the call-site invocation and pasted the original pre-#203 broken
-// loop back into runQuery. The helper would become dead code, all eight
-// contract tests would still pass, and the silent-failure bug would be
-// back in production. The pr-test-analyzer flagged this exact scenario
-// during the second-round PR review.
+// The AST walk enforces three structural properties against the runQuery
+// FuncDecl body (outer scope only — nested closure literals are explicitly
+// skipped so a "dead-closure stub call" mutation cannot game the test):
 //
-// This test closes that gap with a simple AST walk: parse query.go, find
-// the runQuery FuncDecl, and assert that it contains a call expression
-// whose identifier is "queryArchiveSources". It is NOT a behavioral test —
-// it cannot check that the call has the right arguments or that the
-// surrounding control flow is correct — but it DOES catch the specific
-// "inline the old broken loop and leave the helper orphaned" refactor
-// that the pr-test-analyzer mutation-tested into existence.
+//  1. The identifier "queryArchiveSources" resolves to a package-level
+//     function. A local shadow like `queryArchiveSources := func(...) {...}`
+//     creates an ast.Object with Kind == ast.Var; the real helper has
+//     Kind == ast.Fun. This is why the parser runs with object resolution
+//     enabled (no SkipObjectResolution flag).
+//  2. The call is the right-hand side of an ast.AssignStmt — not bare,
+//     not `_, _ = queryArchiveSources(...)`, not discarded. At least one
+//     LHS identifier must be a real named variable.
+//  3. Some later statement in the same outer block appends one of those
+//     LHS identifiers into a variable named "results" via a call to the
+//     builtin "append". This catches the "call helper but discard archive
+//     rows" refactor that silently drops archive data while keeping the
+//     stderr/slog warnings intact.
 //
-// The test uses go/parser at the file level so it only depends on the
-// repository checkout layout, not on any runtime state or build tags. It
-// cannot run from an installed binary without the source — which is fine,
-// test binaries are always built from the repo.
+// The test is NOT a behavioral test — it cannot verify that the arguments
+// are correct, the context is threaded properly, or the loop semantics are
+// right. For those, see the TestQueryArchiveSources_* suite. The meta-test
+// is a structural backstop: it catches mechanical reverts (inline the old
+// broken loop, shadow the helper with a local no-op, drop the return
+// append) that would defeat behavioral tests by reaching below them.
+//
+// Mutation shapes empirically verified to trip this test during review:
+//
+//   - Inline revert: delete the queryArchiveSources call, paste the
+//     pre-#203 `slog.Warn; continue` loop back in.
+//   - Dead-closure stub: keep a `_ = func() { queryArchiveSources(...) }()`
+//     call inside runQuery but inline the broken loop alongside it.
+//   - Local shadow: declare `queryArchiveSources := func(...) {...}` inside
+//     runQuery and call the shadow.
+//   - Discard-return: write `_, _ = queryArchiveSources(...)` and delete
+//     the `append(results, archResults...)` line.
+//
+// The test anchors query.go's path to this test file via runtime.Caller so
+// it works regardless of how `go test` is invoked — from the repo root,
+// from the package directory, or with -C <dir>.
 func TestRunQueryCallsQueryArchiveSources(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed — cannot locate query.go")
+	}
+	queryPath := filepath.Join(filepath.Dir(thisFile), "query.go")
+
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "query.go", nil, parser.SkipObjectResolution)
+	// Object resolution MUST be enabled (no parser.SkipObjectResolution) so
+	// the walker can distinguish a real package-level function reference
+	// from a locally-shadowed variable with the same name.
+	f, err := parser.ParseFile(fset, queryPath, nil, 0)
 	if err != nil {
-		t.Fatalf("parse query.go: %v", err)
+		t.Fatalf("parse %s: %v", queryPath, err)
 	}
 
 	var runQueryFn *ast.FuncDecl
@@ -902,31 +971,190 @@ func TestRunQueryCallsQueryArchiveSources(t *testing.T) {
 		t.Fatal("could not find top-level func runQuery in query.go")
 	}
 
-	var found bool
-	ast.Inspect(runQueryFn.Body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		id, ok := call.Fun.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		if id.Name == "queryArchiveSources" {
-			found = true
-			return false
-		}
-		return true
-	})
+	// Walk only the outer function body. ast.Inspect normally descends into
+	// *ast.FuncLit.Body, which would let a dead-closure stub call count as
+	// a match. Return false from the callback on FuncLit to prune those
+	// subtrees entirely.
+	type callSite struct {
+		assign *ast.AssignStmt
+		call   *ast.CallExpr
+		parent *ast.BlockStmt
+	}
+	var sites []callSite
 
-	if !found {
-		t.Error(
+	// Track the enclosing block for each assign statement we see, so we can
+	// look for the subsequent append in step 3. A simple outer-scope walk
+	// over runQueryFn.Body.List (plus any non-FuncLit nested blocks)
+	// suffices because #203's call site is at the top level of runQuery.
+	var walk func(block *ast.BlockStmt)
+	walk = func(block *ast.BlockStmt) {
+		for _, stmt := range block.List {
+			switch s := stmt.(type) {
+			case *ast.AssignStmt:
+				for _, rhs := range s.Rhs {
+					call, ok := rhs.(*ast.CallExpr)
+					if !ok {
+						continue
+					}
+					id, ok := call.Fun.(*ast.Ident)
+					if !ok {
+						continue
+					}
+					if id.Name != "queryArchiveSources" {
+						continue
+					}
+					// Step 1: must resolve to a real package-level function.
+					// A local shadow would give Obj.Kind == ast.Var (or a
+					// non-FuncDecl Decl); the real helper has Kind == ast.Fun.
+					if id.Obj == nil {
+						// Package-level refs sometimes come back with nil Obj
+						// because they resolve at link time, not parse time.
+						// Accept this case — there's no local shadow binding
+						// the name at the outer scope because the walker
+						// would have visited that binding first.
+					} else if id.Obj.Kind != ast.Fun {
+						continue
+					}
+					sites = append(sites, callSite{assign: s, call: call, parent: block})
+				}
+			case *ast.IfStmt:
+				if s.Body != nil {
+					walk(s.Body)
+				}
+				if elseBlock, ok := s.Else.(*ast.BlockStmt); ok {
+					walk(elseBlock)
+				}
+			case *ast.BlockStmt:
+				walk(s)
+			case *ast.ForStmt:
+				if s.Body != nil {
+					walk(s.Body)
+				}
+			case *ast.RangeStmt:
+				if s.Body != nil {
+					walk(s.Body)
+				}
+			}
+			// FuncLit and other nested constructs are intentionally NOT
+			// descended into — see the doc comment's rationale for dead
+			// closures.
+		}
+	}
+	walk(runQueryFn.Body)
+
+	if len(sites) == 0 {
+		t.Fatal(
 			"runQuery must call queryArchiveSources — reverting to an inline " +
 				"slog.Warn; continue loop silently re-introduces issue #203. If " +
 				"you are intentionally removing the helper, delete this test AND " +
 				"the queryArchiveSources function together, and make sure the " +
 				"replacement still pins the dual-channel stderr+slog contract " +
 				"with a runQuery-level test.")
+	}
+
+	// Step 2 + 3: at least one of the call sites must bind its return into
+	// a named LHS variable that is later used as an element being appended
+	// into a variable named "results".
+	appendCheckPassed := false
+	for _, site := range sites {
+		// Collect the LHS variable names (skip "_").
+		var lhsNames []string
+		for _, lhs := range site.assign.Lhs {
+			id, ok := lhs.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			if id.Name == "_" || id.Name == "err" {
+				// "err" is the conventional second return; we don't care
+				// about it for the append check — we want the first return
+				// value to land in a named slice variable.
+				continue
+			}
+			lhsNames = append(lhsNames, id.Name)
+		}
+		if len(lhsNames) == 0 {
+			continue
+		}
+
+		// Find the index of this assign in its parent block, then scan
+		// forward for an append(results, <name>...) call.
+		startIdx := -1
+		for i, stmt := range site.parent.List {
+			if stmt == site.assign {
+				startIdx = i
+				break
+			}
+		}
+		if startIdx < 0 {
+			continue
+		}
+
+		for i := startIdx + 1; i < len(site.parent.List); i++ {
+			found := false
+			ast.Inspect(site.parent.List[i], func(n ast.Node) bool {
+				// Skip nested FuncLit bodies for the same reason the outer
+				// walk does.
+				if _, isFuncLit := n.(*ast.FuncLit); isFuncLit {
+					return false
+				}
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				funcID, ok := call.Fun.(*ast.Ident)
+				if !ok || funcID.Name != "append" {
+					return true
+				}
+				if len(call.Args) < 2 {
+					return true
+				}
+				// First arg must be the identifier "results".
+				firstArg, ok := call.Args[0].(*ast.Ident)
+				if !ok || firstArg.Name != "results" {
+					return true
+				}
+				// Some later arg must reference one of our LHS names.
+				for _, arg := range call.Args[1:] {
+					var argID *ast.Ident
+					switch a := arg.(type) {
+					case *ast.Ident:
+						argID = a
+					case *ast.SliceExpr:
+						// `archResults[:]` — accept the underlying ident.
+						if id, ok := a.X.(*ast.Ident); ok {
+							argID = id
+						}
+					}
+					if argID == nil {
+						continue
+					}
+					for _, name := range lhsNames {
+						if argID.Name == name {
+							found = true
+							return false
+						}
+					}
+				}
+				return true
+			})
+			if found {
+				appendCheckPassed = true
+				break
+			}
+		}
+		if appendCheckPassed {
+			break
+		}
+	}
+
+	if !appendCheckPassed {
+		t.Error(
+			"runQuery calls queryArchiveSources but its return value is not " +
+				"appended into 'results' — reverting the append silently drops " +
+				"archive rows, a subset of the #203 silent-data-loss bug. If " +
+				"you are intentionally changing the result-handling shape, " +
+				"update this meta-test to match the new pattern AND add a " +
+				"behavioral test at the runQuery level.")
 	}
 }
 

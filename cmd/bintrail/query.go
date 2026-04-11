@@ -223,6 +223,15 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// queryArchiveSources owns the archive fetch loop. When it returns an
+	// error (context canceled or deadline exceeded), we drop any live-MySQL
+	// rows already populated above and surface the cancellation — a canceled
+	// query is an incomplete query, and showing partial results alongside a
+	// "canceled" error would invite the operator to treat them as
+	// authoritative. If that UX tradeoff ever needs to change (e.g. to flush
+	// partial rows on timeout), it belongs here at the call site, not inside
+	// the helper. The helper's doc comment documents its own half of this
+	// contract.
 	archResults, err := queryArchiveSources(
 		cmd.Context(),
 		archSources,
@@ -277,20 +286,18 @@ func runQuery(cmd *cobra.Command, args []string) error {
 //     price of the visibility guarantee. This invariant is pinned by
 //     TestQueryArchiveSources_plainErrorKeepsGoingWithDualChannel; do not
 //     drop either channel without updating that test.
-//   - Context canceled / deadline exceeded: returns a wrapped context error
+//   - Context canceled / deadline exceeded: returns (nil, wrapped-ctx-err)
 //     and stops iterating. No stderr warning and no slog.Warn for the
 //     canceled source — a Ctrl-C'd query should not dump per-source noise
-//     before exiting. The caller bubbles the error through cobra to
-//     os.Exit(non-zero).
+//     before exiting. Rows accumulated from earlier sources in the same call
+//     are discarded at the helper boundary; what the caller does with its
+//     own already-fetched rows (live-MySQL or otherwise) is the caller's
+//     decision. See runQuery's call site for the current UX policy.
 //
-// Partial-drop on cancellation: when the helper short-circuits mid-loop, any
-// archive rows already accumulated from earlier sources are dropped along
-// with any live-MySQL rows the caller had fetched before this call. That is
-// a UX tradeoff, not an oversight — a canceled query is an incomplete query,
-// and showing partial results alongside a "canceled" error would invite the
-// operator to treat them as authoritative. If that tradeoff needs to change
-// (e.g. to flush partial rows on timeout), the change belongs at the call
-// site in runQuery, not inside this helper.
+// stderr is emitted BEFORE slog.Warn for every plain fetch error. That
+// ordering is deliberate: if a custom slog.Default() handler ever panics on
+// this record, stderr has already fired, so the visibility guarantee
+// survives even a broken slog pipeline.
 //
 // The cancellation detection path has two checks because the fetch error
 // itself can wrap context.Canceled/context.DeadlineExceeded before the
@@ -351,11 +358,18 @@ func queryArchiveSources(
 
 // lineBreakReplacer rewrites every kind of line terminator that can appear in
 // a Go error message to " | " so that sanitizeArchiveErrorMessage always
-// produces a single-line result. Order matters: "\r\n" MUST be listed before
-// the bare "\r" and "\n" replacements, otherwise CRLF input would expand to
-// " |  | " instead of a single separator. strings.NewReplacer guarantees
-// left-to-right longest-match semantics so the rule is: compound first, then
-// singles.
+// produces a single-line result.
+//
+// Argument order is load-bearing. strings.NewReplacer performs a single
+// left-to-right pass and, at any position where multiple patterns could
+// match, uses the pattern that appears FIRST in the argument list — it is
+// argument-order precedence, not longest-match. So at position 0 of "\r\n"
+// the replacer checks "\r\n" first and matches, advancing two bytes. If the
+// bare "\r" or "\n" rule were listed before "\r\n", the replacer would
+// match "\r" at position 0, advance one byte, then match "\n" at position
+// 1, producing " |  | " — two separators instead of one. Compound patterns
+// MUST come before their components for the same reason. The CRLF and
+// multi-CRLF sub-tests in TestSanitizeArchiveErrorMessage pin this ordering.
 //
 // The characters covered are:
 //
