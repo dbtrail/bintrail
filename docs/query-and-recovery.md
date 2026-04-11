@@ -158,6 +158,24 @@ bintrail query --archive-s3 s3://... --bintrail-id <uuid> --since "2026-02-01 00
                formatted output
 ```
 
+### Archive Fetch Error Handling
+
+When an archive source fails — expired AWS credentials, S3 `AccessDenied`, DuckDB `memory_limit` OOM, a corrupted Parquet file, a `Binder Error` on a schema drift — `bintrail query` prints a visible warning to **stderr** regardless of `--log-level` or `--log-format`:
+
+```
+Warning: archive query failed for s3://my-bucket/events/bintrail_id=<uuid>: S3 AccessDenied: assume role failed
+```
+
+One failure always occupies exactly one stderr line: embedded newlines in the underlying error message (DuckDB Binder errors, AWS SDK error chains) are collapsed to ` | ` separators so `grep`, `systemd-journald`, and other line-oriented consumers don't split a single warning across multiple log entries.
+
+The same record is also emitted as a structured `slog.Warn` with the **raw** (unsanitized) error for JSON-log consumers and full-fidelity debugging — a `--log-format json` pipeline preserves embedded newlines natively.
+
+**Per-source failures are non-fatal.** One broken archive source does not kill the whole query — the loop continues to the next source, any other source that succeeds contributes its rows to the merged result set, and the command exits 0. This is deliberate: operators running against multi-region S3 archives shouldn't lose a regional query because one bucket is temporarily unreachable. If you need a strict all-or-nothing guarantee, use `bintrail reconstruct` (which sets `AllowGaps=false` in its shared `FetchMerged` pipeline).
+
+**Context cancellation is fatal.** If the user presses Ctrl-C, or the parent context times out, or a fetch error wraps `context.Canceled` / `context.DeadlineExceeded`, the archive loop short-circuits immediately and the command exits non-zero with `query canceled: context canceled`. No per-source warnings are printed during a canceled run — a Ctrl-C'd query should exit cleanly, not dump a warning per remaining source. When cancellation fires mid-loop, any rows already accumulated from earlier sources AND any live-MySQL rows fetched before the archive loop started are discarded: a canceled query is an incomplete query, and showing partial results alongside a "canceled" error would invite the operator to treat them as authoritative.
+
+> **History**: `bintrail` versions before 0.4.8 silently swallowed every archive fetch error into a `slog.Warn` (invisible at the default text log format) and continued. A real production incident in early 2026 caused by pre-v0.4.4 Parquet files missing the `connection_id` column produced six days of zero-result queries with exit 0 and no stderr signal — only caught when a user escalated. 0.4.8 fixed the specific `Binder Error` trigger at the `parquetquery` layer; a follow-up fix (#203) surfaced every remaining archive failure mode on stderr so future unknown failures cannot reproduce the same silent-data-loss pattern.
+
 ### Memory Footprint
 
 The merge path loads **all matching rows** from all sources into memory before applying the limit. Filters (schema, table, time range, etc.) bound the result set in practice. For extremely broad queries against large archives, memory usage could be significant — apply at least a `--since`/`--until` range to keep the result set manageable.
@@ -311,7 +329,11 @@ bintrail query/recover
         │
         ├── if archives: merge path
         │       ├── query.Engine.Fetch(ctx, opts) → []ResultRow (MySQL, unless planner skips)
-        │       ├── parquetquery.Fetch(ctx, opts, source) → []ResultRow (per archive)
+        │       ├── queryArchiveSources(ctx, sources, opts, parquetquery.Fetch, os.Stderr)
+        │       │       ├── for each source: parquetquery.Fetch(...)
+        │       │       ├── on plain error: stderr warning + slog.Warn, continue
+        │       │       └── on ctx.Err() or errors.Is(err, context.Canceled|DeadlineExceeded):
+        │       │               return (nil, wrapped-ctx-err) — short-circuit
         │       └── query.MergeResults(all, limit) → dedup + sort + limit
         │
         ├── [query] → query.Format(results, format, w) → stdout
