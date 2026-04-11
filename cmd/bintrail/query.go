@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -222,23 +223,17 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	for _, src := range archSources {
-		ar, err := parquetquery.Fetch(cmd.Context(), fetchOpts, src)
-		if err != nil {
-			// Issue #203: archive failures were silently swallowed into a
-			// slog.Warn, so real production outages (expired creds, DuckDB
-			// Binder errors on old schemas, S3 AccessDenied) produced empty
-			// results with exit 0 and no stderr signal. handleArchiveFetchError
-			// prints to stderr at default verbosity AND short-circuits on
-			// context cancellation so Ctrl-C doesn't iterate every remaining
-			// source printing warnings.
-			if herr := handleArchiveFetchError(cmd.Context(), src, err, os.Stderr); herr != nil {
-				return herr
-			}
-			continue
-		}
-		results = append(results, ar...)
+	archResults, err := queryArchiveSources(
+		cmd.Context(),
+		archSources,
+		fetchOpts,
+		parquetquery.Fetch,
+		os.Stderr,
+	)
+	if err != nil {
+		return err
 	}
+	results = append(results, archResults...)
 
 	results = query.MergeResults(results, opts.Limit)
 
@@ -260,32 +255,81 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// handleArchiveFetchError decides what to do when parquetquery.Fetch fails for
-// an archive source during the query loop. It exists as a separate function so
-// unit tests can assert on stderr formatting and cancellation short-circuit
-// without needing a real database or DuckDB.
+// queryArchiveSources is the single choke point for issue #203: it fetches
+// events from each archive source, surfaces per-source failures on stderr
+// (independent of log level), and aborts the whole query immediately on
+// context cancellation instead of iterating every remaining source printing
+// a warning for each.
 //
-// Behavior (per issue #203):
+// Contract:
 //
-//   - If ctx is already canceled or its deadline has exceeded, return a
-//     wrapped context error so the whole query aborts immediately instead of
-//     presenting the cancellation as a long list of "archive failed" warnings
-//     for every remaining source.
-//   - Otherwise, print a visible warning to stderr AND emit a structured
-//     slog.Warn, then return nil so the caller can continue to the next
-//     archive source. stderr is used unconditionally because slog.Warn alone
-//     is invisible under the default text log format when the operator is
-//     scanning CLI output.
+//   - Success path: accumulates events from every source in order (no dedup —
+//     MergeResults runs at the call site) and returns (rows, nil).
+//   - Plain fetch error: emits a visible stderr warning AND a structured
+//     slog.Warn for that source, then continues to the next source. Both
+//     channels must fire — the stderr line is what an operator at default
+//     verbosity sees; the slog record is what JSON-format consumers see.
+//     Operators running --log-format=text at --log-level=warn see both lines;
+//     that duplication is deliberate and is the price of the visibility
+//     guarantee.
+//   - Context canceled / deadline exceeded: returns a wrapped context error
+//     and stops iterating. No stderr warning and no slog.Warn for the
+//     canceled source — a Ctrl-C'd query should not dump per-source noise
+//     before exiting. The caller bubbles the error through cobra to
+//     os.Exit(non-zero).
 //
-// The returned error is non-nil only when the archive loop MUST stop; nil
-// means "the failure has been reported, skip this source, keep going."
-func handleArchiveFetchError(ctx context.Context, src string, fetchErr error, stderr io.Writer) error {
-	if cerr := ctx.Err(); cerr != nil {
-		return fmt.Errorf("query canceled: %w", cerr)
+// The cancellation detection path has two checks because the fetch error
+// itself can wrap context.Canceled/DeadlineExceeded before the ambient
+// ctx.Err() transitions (child-context races, DuckDB/httpfs cancellation
+// propagation). Either signal aborts the loop; missing the second check was
+// the specific finding I1 from the PR #217 review.
+//
+// The fetch parameter is injected so unit tests drive the real loop body
+// with a fake fetcher — no DuckDB, no real database, and the exact same
+// code path that production hits. Similarly stderr is an io.Writer so tests
+// capture into a bytes.Buffer without touching os.Stderr.
+//
+// Stderr messages are sanitized against embedded newlines. DuckDB
+// "Binder Error" messages and AWS SDK errors frequently span multiple
+// lines, which breaks line-oriented consumers (grep, systemd-journald
+// message framing, log shippers keyed on line prefix). Collapsing to
+// " | " separators keeps one warning = one line.
+func queryArchiveSources(
+	ctx context.Context,
+	sources []string,
+	opts query.Options,
+	fetch func(context.Context, query.Options, string) ([]query.ResultRow, error),
+	stderr io.Writer,
+) ([]query.ResultRow, error) {
+	var results []query.ResultRow
+	for _, src := range sources {
+		ar, err := fetch(ctx, opts, src)
+		if err != nil {
+			// Dual cancellation check: ambient ctx + the fetch error chain.
+			// See the doc comment above for the race this guards against.
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, fmt.Errorf("query canceled: %w", cerr)
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("query canceled: %w", err)
+			}
+			fmt.Fprintf(stderr, "Warning: archive query failed for %s: %s\n",
+				src, sanitizeArchiveErrorMessage(err))
+			slog.Warn("archive query failed, skipping", "source", src, "error", err)
+			continue
+		}
+		results = append(results, ar...)
 	}
-	fmt.Fprintf(stderr, "Warning: archive query failed for %s: %v\n", src, fetchErr)
-	slog.Warn("archive query failed, skipping", "source", src, "error", fetchErr)
-	return nil
+	return results, nil
+}
+
+// sanitizeArchiveErrorMessage collapses newlines in an error message so that
+// a single archive failure always occupies exactly one stderr line. DuckDB's
+// Binder/Parser errors and AWS SDK errors are the most common offenders.
+// Kept separate from queryArchiveSources so the substitution is reusable if
+// we add a second stderr warning in the future.
+func sanitizeArchiveErrorMessage(err error) string {
+	return strings.ReplaceAll(err.Error(), "\n", " | ")
 }
 
 // archiveSources returns the Hive-scoped archive source paths for the current

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -458,121 +460,395 @@ func TestMergeResults_empty(t *testing.T) {
 	}
 }
 
-// ─── handleArchiveFetchError (issue #203) ────────────────────────────────────
+// ─── queryArchiveSources (issue #203) ────────────────────────────────────────
 //
-// These tests pin down the fix for issue #203: archive fetch failures in
-// `bintrail query` were previously swallowed by slog.Warn + continue, producing
-// empty or partial results with exit 0 and no visible stderr signal. The new
-// helper must (a) always emit a stderr line for real errors regardless of log
-// level, (b) short-circuit the loop when the context is canceled or its
-// deadline has exceeded, and (c) leave the per-source "keep going" semantics
-// untouched for non-cancellation errors so one broken archive doesn't kill the
-// whole query.
+// These tests pin the silent-failure fix for #203. The production loop in
+// `runQuery` was wrapping every parquetquery.Fetch error in a slog.Warn and
+// continuing, producing empty or partial results with exit 0 and no visible
+// stderr signal at the default log level. The fix extracts the archive loop
+// into queryArchiveSources so the exact code path production hits can be
+// driven by a fake fetcher — no DuckDB, no real DB, no integration tag.
+//
+// Each test is a regression guard for a specific contract in the helper's
+// doc comment. Read them together as the single source of truth for what
+// "archive failures must be surfaced" means for bintrail query.
 
-func TestHandleArchiveFetchError_plainErrorWritesStderr(t *testing.T) {
+// captureSlogDefault redirects slog.Default() to a text handler writing into
+// buf for the lifetime of the test, restoring the previous default on
+// t.Cleanup. This lets tests assert that slog.Warn is actually emitted by the
+// helper — without it, a future refactor could silently delete the structured
+// log line and every stderr-only assertion would still pass, regressing the
+// "dual-channel reporting" contract from #203.
+func captureSlogDefault(t *testing.T) *bytes.Buffer {
+	t.Helper()
 	var buf bytes.Buffer
-	err := handleArchiveFetchError(
-		context.Background(),
-		"s3://bucket/prefix/bintrail_id=abc",
-		errors.New("DuckDB Binder Error: column connection_id not found"),
-		&buf,
-	)
-	if err != nil {
-		t.Fatalf("expected nil (keep going) for plain error, got %v", err)
-	}
-	out := buf.String()
-	// The message must name the source AND include the underlying error so
-	// operators can diagnose without turning on --log-level debug. This is
-	// the visibility guarantee #203 asks for — assert it verbatim so a
-	// regression is caught on the next change.
-	if !strings.Contains(out, "Warning: archive query failed") {
-		t.Errorf("stderr missing 'Warning: archive query failed' prefix: %q", out)
-	}
-	if !strings.Contains(out, "s3://bucket/prefix/bintrail_id=abc") {
-		t.Errorf("stderr missing source path: %q", out)
-	}
-	if !strings.Contains(out, "Binder Error") {
-		t.Errorf("stderr missing underlying error detail: %q", out)
-	}
-	if !strings.HasSuffix(out, "\n") {
-		t.Errorf("stderr line must end with newline for clean CLI output: %q", out)
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	return &buf
+}
+
+// fakeFetcher returns a parquetquery.Fetch-shaped function that replays a
+// scripted sequence of (rows, err) results and records every call. The test
+// uses the recorded calls to prove loop semantics: e.g. that a canceled
+// context halts iteration before the next source is touched.
+type fakeFetcher struct {
+	responses []fakeResponse
+	calls     []string // sources that were actually invoked
+}
+
+type fakeResponse struct {
+	rows []query.ResultRow
+	err  error
+}
+
+func (f *fakeFetcher) fn() func(context.Context, query.Options, string) ([]query.ResultRow, error) {
+	return func(_ context.Context, _ query.Options, src string) ([]query.ResultRow, error) {
+		idx := len(f.calls)
+		f.calls = append(f.calls, src)
+		if idx >= len(f.responses) {
+			return nil, fmt.Errorf("fakeFetcher: unexpected call #%d for %q", idx, src)
+		}
+		r := f.responses[idx]
+		return r.rows, r.err
 	}
 }
 
-func TestHandleArchiveFetchError_canceledContextShortCircuits(t *testing.T) {
+// TestQueryArchiveSources_plainErrorKeepsGoingWithDualChannel exercises the
+// core #203 contract: a failing source must surface on BOTH stderr and
+// slog.Warn, and the loop must continue to the next source. All three
+// regression vectors are checked in a single test because they're
+// indivisible — the whole point of the fix is that one broken archive does
+// not blind the user to the next source's rows.
+func TestQueryArchiveSources_plainErrorKeepsGoingWithDualChannel(t *testing.T) {
+	slogBuf := captureSlogDefault(t)
+	var stderr bytes.Buffer
+
+	wantRow := query.ResultRow{EventID: 42, SchemaName: "db", TableName: "t"}
+	f := &fakeFetcher{responses: []fakeResponse{
+		{err: errors.New("DuckDB Binder Error: column connection_id not found")},
+		{rows: []query.ResultRow{wantRow}},
+	}}
+
+	got, err := queryArchiveSources(
+		context.Background(),
+		[]string{"s3://bucket/bintrail_id=abc", "/local/bintrail_id=abc"},
+		query.Options{},
+		f.fn(),
+		&stderr,
+	)
+	if err != nil {
+		t.Fatalf("expected nil error for plain-error + success mix, got %v", err)
+	}
+
+	// Loop continued to src2 → rows present.
+	if len(got) != 1 || got[0].EventID != wantRow.EventID {
+		t.Errorf("expected rows from src2 in results, got %+v", got)
+	}
+	if len(f.calls) != 2 {
+		t.Errorf("expected both sources to be fetched, got %d calls: %v", len(f.calls), f.calls)
+	}
+
+	// stderr received the visible warning for src1.
+	stderrOut := stderr.String()
+	if !strings.Contains(stderrOut, "Warning: archive query failed") {
+		t.Errorf("stderr missing 'Warning: archive query failed' prefix: %q", stderrOut)
+	}
+	if !strings.Contains(stderrOut, "s3://bucket/bintrail_id=abc") {
+		t.Errorf("stderr missing src1 path: %q", stderrOut)
+	}
+	if !strings.Contains(stderrOut, "Binder Error") {
+		t.Errorf("stderr missing underlying error text: %q", stderrOut)
+	}
+	if strings.Contains(stderrOut, "/local/bintrail_id=abc") {
+		t.Errorf("stderr should NOT mention src2 (which succeeded): %q", stderrOut)
+	}
+
+	// slog.Default() received the structured warning. Assert on the msg and
+	// both attribute keys so a future refactor that drops the slog.Warn call
+	// (even while keeping the stderr line) regresses this test.
+	slogOut := slogBuf.String()
+	if !strings.Contains(slogOut, "archive query failed, skipping") {
+		t.Errorf("slog record missing: %q", slogOut)
+	}
+	if !strings.Contains(slogOut, "source=") {
+		t.Errorf("slog record missing 'source=' attribute: %q", slogOut)
+	}
+	if !strings.Contains(slogOut, "error=") {
+		t.Errorf("slog record missing 'error=' attribute: %q", slogOut)
+	}
+	if !strings.Contains(slogOut, "level=WARN") {
+		t.Errorf("slog record wrong level (expected WARN): %q", slogOut)
+	}
+}
+
+// TestQueryArchiveSources_preCanceledCtxShortCircuits verifies that a context
+// canceled BEFORE queryArchiveSources is called halts the loop on the first
+// iteration with a wrapped context.Canceled, emits NOTHING to stderr or
+// slog, and does not touch subsequent sources.
+func TestQueryArchiveSources_preCanceledCtxShortCircuits(t *testing.T) {
+	slogBuf := captureSlogDefault(t)
+	var stderr bytes.Buffer
+
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // canceled before the call
-	var buf bytes.Buffer
-	err := handleArchiveFetchError(
+	cancel()
+
+	// The fetcher will be called once for src1 — it returns a generic error
+	// because parquetquery.Fetch typically does return an error when its ctx
+	// is dead. The helper then inspects ctx.Err() and short-circuits.
+	f := &fakeFetcher{responses: []fakeResponse{
+		{err: errors.New("fetch aborted")},
+		{rows: []query.ResultRow{{EventID: 99}}}, // must never be reached
+	}}
+
+	got, err := queryArchiveSources(
 		ctx,
-		"/local/archive/bintrail_id=abc",
-		// parquetquery.Fetch typically wraps the ctx error, but the helper
-		// only looks at ctx.Err(), so any fetchErr is fine here.
-		errors.New("context canceled"),
-		&buf,
+		[]string{"src1", "src2"},
+		query.Options{},
+		f.fn(),
+		&stderr,
 	)
 	if err == nil {
-		t.Fatal("expected non-nil error for canceled context (short-circuit), got nil")
+		t.Fatal("expected error for canceled ctx, got nil")
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected errors.Is(err, context.Canceled), got %v", err)
 	}
 	if !strings.Contains(err.Error(), "query canceled") {
-		t.Errorf("expected wrapped error to mention 'query canceled', got %v", err)
+		t.Errorf("expected error to mention 'query canceled', got %v", err)
 	}
-	// On cancellation we must NOT print an "archive failed" warning — the
-	// user pressed Ctrl-C, they don't want per-source noise.
-	if buf.Len() != 0 {
-		t.Errorf("expected no stderr output on cancellation, got %q", buf.String())
+	if got != nil {
+		t.Errorf("expected nil results on cancellation, got %v", got)
+	}
+
+	// Loop must have stopped after src1 — src2 never called.
+	if len(f.calls) != 1 || f.calls[0] != "src1" {
+		t.Errorf("expected exactly 1 call (src1) before short-circuit, got %v", f.calls)
+	}
+
+	// No stderr noise on cancellation — Ctrl-C should exit clean, not dump
+	// per-source warnings for every archive that happened to be queued.
+	if stderr.Len() != 0 {
+		t.Errorf("expected no stderr output on cancellation, got %q", stderr.String())
+	}
+	if slogBuf.Len() != 0 {
+		t.Errorf("expected no slog output on cancellation, got %q", slogBuf.String())
 	}
 }
 
-func TestHandleArchiveFetchError_deadlineExceededShortCircuits(t *testing.T) {
-	// Use a deadline in the past so ctx.Err() already reports
-	// DeadlineExceeded at the first check inside the helper.
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancel()
-	var buf bytes.Buffer
-	err := handleArchiveFetchError(
+// TestQueryArchiveSources_wrappedCanceledFetchErrShortCircuits guards against
+// the race condition the PR #217 review flagged as finding I1: the fetch
+// error can wrap context.Canceled before the ambient ctx.Err() has
+// transitioned (child-context races, DuckDB httpfs cancellation). The
+// helper's second check — errors.Is on the fetch error — must catch this
+// case. Without it, a canceled query would silently degrade to "archive
+// failed, keep going" per-source warnings, exactly the UX the fix prevents.
+func TestQueryArchiveSources_wrappedCanceledFetchErrShortCircuits(t *testing.T) {
+	slogBuf := captureSlogDefault(t)
+	var stderr bytes.Buffer
+
+	// Parent ctx is live — the only signal is the wrapped error.
+	ctx := context.Background()
+
+	f := &fakeFetcher{responses: []fakeResponse{
+		{err: fmt.Errorf("duckdb: %w", context.Canceled)},
+		{rows: []query.ResultRow{{EventID: 99}}}, // must not be reached
+	}}
+
+	got, err := queryArchiveSources(
 		ctx,
-		"s3://bucket/prefix/bintrail_id=abc",
-		errors.New("operation took too long"),
-		&buf,
+		[]string{"src1", "src2"},
+		query.Options{},
+		f.fn(),
+		&stderr,
 	)
 	if err == nil {
-		t.Fatal("expected non-nil error for expired deadline, got nil")
+		t.Fatal("expected error for wrapped context.Canceled, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected errors.Is(err, context.Canceled), got %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil results on cancellation, got %v", got)
+	}
+	if len(f.calls) != 1 {
+		t.Errorf("expected short-circuit after src1, got %d calls: %v", len(f.calls), f.calls)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("expected no stderr output for wrapped cancellation, got %q", stderr.String())
+	}
+	if slogBuf.Len() != 0 {
+		t.Errorf("expected no slog output for wrapped cancellation, got %q", slogBuf.String())
+	}
+}
+
+// TestQueryArchiveSources_wrappedDeadlineExceededShortCircuits is the
+// symmetric case to the wrapped-Canceled test above. Deadline expiry can
+// also arrive wrapped in a DuckDB/S3 error chain before the ambient context
+// reports it.
+func TestQueryArchiveSources_wrappedDeadlineExceededShortCircuits(t *testing.T) {
+	var stderr bytes.Buffer
+
+	f := &fakeFetcher{responses: []fakeResponse{
+		{err: fmt.Errorf("s3: %w", context.DeadlineExceeded)},
+	}}
+
+	_, err := queryArchiveSources(
+		context.Background(),
+		[]string{"src1"},
+		query.Options{},
+		f.fn(),
+		&stderr,
+	)
+	if err == nil {
+		t.Fatal("expected error for wrapped DeadlineExceeded, got nil")
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("expected errors.Is(err, context.DeadlineExceeded), got %v", err)
 	}
-	if buf.Len() != 0 {
-		t.Errorf("expected no stderr output on deadline expiry, got %q", buf.String())
+	if stderr.Len() != 0 {
+		t.Errorf("expected no stderr output, got %q", stderr.String())
 	}
 }
 
-func TestHandleArchiveFetchError_multipleSourcesKeepGoing(t *testing.T) {
-	// Simulates the common case: two broken archive sources, context still
-	// live. Both failures must be reported on stderr, helper must return
-	// nil for each, matching the "one bad source doesn't kill the query"
-	// behavior operators rely on.
-	var buf bytes.Buffer
-	ctx := context.Background()
+// TestQueryArchiveSources_multipleFailuresAllReported exercises the UX
+// guarantee that one broken archive does not kill the whole query: when
+// every source fails with a plain (non-cancellation) error, each failure
+// gets its own stderr warning and slog record, the function returns nil
+// rows and nil error, and the caller falls through to MergeResults on the
+// (possibly live-MySQL-only) result set.
+func TestQueryArchiveSources_multipleFailuresAllReported(t *testing.T) {
+	slogBuf := captureSlogDefault(t)
+	var stderr bytes.Buffer
 
-	if err := handleArchiveFetchError(ctx, "src1", errors.New("AccessDenied"), &buf); err != nil {
-		t.Fatalf("src1 unexpectedly returned error: %v", err)
+	f := &fakeFetcher{responses: []fakeResponse{
+		{err: errors.New("AccessDenied")},
+		{err: errors.New("memory_limit exceeded")},
+		{err: errors.New("no such bucket")},
+	}}
+
+	rows, err := queryArchiveSources(
+		context.Background(),
+		[]string{"src1", "src2", "src3"},
+		query.Options{},
+		f.fn(),
+		&stderr,
+	)
+	if err != nil {
+		t.Fatalf("expected nil error for all-plain-failures, got %v", err)
 	}
-	if err := handleArchiveFetchError(ctx, "src2", errors.New("memory_limit exceeded"), &buf); err != nil {
-		t.Fatalf("src2 unexpectedly returned error: %v", err)
+	if len(rows) != 0 {
+		t.Errorf("expected empty rows, got %v", rows)
+	}
+	if len(f.calls) != 3 {
+		t.Errorf("expected all 3 sources fetched, got %v", f.calls)
 	}
 
-	out := buf.String()
-	if !strings.Contains(out, "src1") || !strings.Contains(out, "AccessDenied") {
-		t.Errorf("stderr missing src1 failure: %q", out)
+	stderrOut := stderr.String()
+	// Exact-count assertion — catches accidental dedup AND accidental
+	// double-printing in one check.
+	if got := strings.Count(stderrOut, "Warning: archive query failed"); got != 3 {
+		t.Errorf("expected exactly 3 stderr warning lines, got %d: %q", got, stderrOut)
 	}
-	if !strings.Contains(out, "src2") || !strings.Contains(out, "memory_limit") {
-		t.Errorf("stderr missing src2 failure: %q", out)
+	for _, want := range []string{"AccessDenied", "memory_limit", "no such bucket"} {
+		if !strings.Contains(stderrOut, want) {
+			t.Errorf("stderr missing %q: %q", want, stderrOut)
+		}
 	}
-	if strings.Count(out, "Warning: archive query failed") != 2 {
-		t.Errorf("expected exactly 2 warning lines, got: %q", out)
+
+	if got := strings.Count(slogBuf.String(), "archive query failed, skipping"); got != 3 {
+		t.Errorf("expected 3 slog records, got %d: %q", got, slogBuf.String())
+	}
+}
+
+// TestQueryArchiveSources_stderrSanitizesNewlines verifies the newline
+// collapsing behavior. DuckDB Binder errors and AWS SDK errors frequently
+// contain embedded newlines, which would break line-oriented stderr
+// consumers if passed through raw. Each archive failure must occupy
+// exactly one line of stderr output, period.
+func TestQueryArchiveSources_stderrSanitizesNewlines(t *testing.T) {
+	_ = captureSlogDefault(t)
+	var stderr bytes.Buffer
+
+	multiline := "line1\nline2\nline3"
+	f := &fakeFetcher{responses: []fakeResponse{
+		{err: errors.New(multiline)},
+		{rows: []query.ResultRow{}},
+	}}
+
+	_, err := queryArchiveSources(
+		context.Background(),
+		[]string{"src1", "src2"},
+		query.Options{},
+		f.fn(),
+		&stderr,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	out := stderr.String()
+	// The " | " separator must be present.
+	if !strings.Contains(out, "line1 | line2 | line3") {
+		t.Errorf("stderr did not collapse newlines to ' | ': %q", out)
+	}
+	// And the raw multiline form must be gone — no stray \n in the middle
+	// of the warning that would break line-oriented consumers.
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 1 {
+		t.Errorf("expected exactly 1 stderr line for 1 failure, got %d: %q", len(lines), lines)
+	}
+}
+
+// TestQueryArchiveSources_emptySources is a trivial-but-important base case:
+// with no archive sources configured, the helper returns (nil, nil) without
+// touching stderr or slog. Prevents an accidental nil-dereference or stray
+// warning when the whole call is a no-op.
+func TestQueryArchiveSources_emptySources(t *testing.T) {
+	slogBuf := captureSlogDefault(t)
+	var stderr bytes.Buffer
+	f := &fakeFetcher{}
+
+	rows, err := queryArchiveSources(
+		context.Background(),
+		nil,
+		query.Options{},
+		f.fn(),
+		&stderr,
+	)
+	if err != nil {
+		t.Errorf("expected nil error for empty sources, got %v", err)
+	}
+	if rows != nil {
+		t.Errorf("expected nil rows for empty sources, got %v", rows)
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("fetcher should not be called for empty sources, got %v", f.calls)
+	}
+	if stderr.Len() != 0 || slogBuf.Len() != 0 {
+		t.Errorf("expected no output for empty sources, got stderr=%q slog=%q", stderr.String(), slogBuf.String())
+	}
+}
+
+// TestSanitizeArchiveErrorMessage is a focused unit test for the newline
+// sanitizer — it's trivial but the behavior is part of the stderr contract
+// and deserves a direct pin.
+func TestSanitizeArchiveErrorMessage(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"single line", "single line"},
+		{"two\nlines", "two | lines"},
+		{"leading\n", "leading | "},
+		{"\ntrailing", " | trailing"},
+		{"many\nlines\nhere", "many | lines | here"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		got := sanitizeArchiveErrorMessage(errors.New(tc.in))
+		if got != tc.want {
+			t.Errorf("sanitizeArchiveErrorMessage(%q): got %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
