@@ -50,7 +50,11 @@ func DiscoverTables(inputDir string) ([]TableFiles, error) {
 			continue
 		}
 
-		// Data file: <db>.<table>.<chunk>.sql or <db>.<table>.<chunk>.dat
+		// Data file: <db>.<table>.<chunk>.sql, <db>.<table>.<chunk>.dat,
+		// or <db>.<table>.sql / <db>.<table>.dat (mydumper 0.10.0 — no
+		// chunk number; the table has a single data file). Both shapes
+		// must be recognized so bintrail baseline works with the
+		// apt-installed mydumper on Ubuntu 24.04 (#221).
 		var ext string
 		switch {
 		case strings.HasSuffix(name, ".sql"):
@@ -63,19 +67,24 @@ func DiscoverTables(inputDir string) ([]TableFiles, error) {
 			continue
 		}
 
-		// The remaining name should be <db>.<table>.<chunk>
+		// Try the chunked format first: <db>.<table>.<chunk>
+		// If the last dot-separated segment is numeric, split it off.
+		// Otherwise fall through to the unchunked format: <db>.<table>.
+		var db, table string
+		var ok bool
 		lastDot := strings.LastIndex(name, ".")
-		if lastDot < 0 {
-			continue
+		if lastDot >= 0 {
+			chunk := name[lastDot+1:]
+			if isNumericChunk(chunk) {
+				db, table, ok = splitDBTable(name[:lastDot])
+			}
 		}
-		chunk := name[lastDot+1:]
-		if !isNumericChunk(chunk) {
-			continue
-		}
-		dbTable := name[:lastDot]
-		db, table, ok := splitDBTable(dbTable)
 		if !ok {
-			continue
+			// Unchunked format (mydumper 0.10.0): name is just <db>.<table>.
+			db, table, ok = splitDBTable(name)
+			if !ok {
+				continue
+			}
 		}
 
 		k := tableKey{db, table}
