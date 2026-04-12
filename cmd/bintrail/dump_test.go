@@ -114,12 +114,12 @@ func TestBuildMydumperArgs_lockAndTrx_unsupported(t *testing.T) {
 	}
 }
 
-func TestMydumperVersion_parsing(t *testing.T) {
+func TestParseMydumperVersion(t *testing.T) {
 	cases := []struct {
-		name                  string
-		output                string
+		name                                string
+		output                              string
 		wantMajor, wantMinor, wantPatch int
-		wantErr               bool
+		wantErr                             bool
 	}{
 		{
 			name:      "standard_0.10.0",
@@ -132,9 +132,14 @@ func TestMydumperVersion_parsing(t *testing.T) {
 			wantMajor: 0, wantMinor: 11, wantPatch: 5,
 		},
 		{
-			name:      "standard_0.16.3",
+			name:      "standard_0.16.3_with_suffix",
 			output:    "mydumper 0.16.3-6, built against MySQL 8.4.3\n",
 			wantMajor: 0, wantMinor: 16, wantPatch: 3,
+		},
+		{
+			name:      "future_major_1",
+			output:    "mydumper 1.0.0, built against MySQL 9.0.0\n",
+			wantMajor: 1, wantMinor: 0, wantPatch: 0,
 		},
 		{
 			name:    "empty_output",
@@ -154,30 +159,15 @@ func TestMydumperVersion_parsing(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// mydumperVersion shells out to `path --version`, so we can't
-			// directly unit-test the parsing without a real binary. Instead
-			// we test the parsing logic inline here by extracting the same
-			// algorithm the function uses.
-			line := strings.SplitN(tc.output, "\n", 2)[0]
-			parts := strings.Fields(line)
-			if len(parts) < 2 {
-				if !tc.wantErr {
-					t.Errorf("expected success but got too few fields in %q", line)
-				}
-				return
-			}
-			ver := strings.TrimRight(parts[1], ",")
-			var major, minor, patch int
-			n, err := fmt.Sscanf(ver, "%d.%d.%d", &major, &minor, &patch)
-			if err != nil || n != 3 {
-				if !tc.wantErr {
-					t.Errorf("expected success but parse failed: ver=%q err=%v", ver, err)
-				}
-				return
-			}
+			major, minor, patch, err := parseMydumperVersion(tc.output)
 			if tc.wantErr {
-				t.Error("expected error but parse succeeded")
+				if err == nil {
+					t.Errorf("expected error but got %d.%d.%d", major, minor, patch)
+				}
 				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
 			}
 			if major != tc.wantMajor || minor != tc.wantMinor || patch != tc.wantPatch {
 				t.Errorf("got %d.%d.%d, want %d.%d.%d", major, minor, patch, tc.wantMajor, tc.wantMinor, tc.wantPatch)

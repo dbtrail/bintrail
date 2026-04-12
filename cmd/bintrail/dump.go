@@ -211,14 +211,14 @@ func runDump(cmd *cobra.Command, args []string) error {
 	// to ship a recent enough version.
 	supportsLockMode := true
 	if res.mode == dumpModeLocal {
-		_, minor, _, verErr := mydumperVersion(res.path)
+		major, minor, patch, verErr := mydumperVersion(res.path)
 		if verErr != nil {
 			slog.Warn("could not determine mydumper version; omitting --sync-thread-lock-mode and --trx-tables for safety",
 				"error", verErr)
 			supportsLockMode = false
-		} else if minor < 11 {
+		} else if major == 0 && minor < 11 {
 			slog.Warn("mydumper version is older than 0.11.0; omitting --sync-thread-lock-mode and --trx-tables — the dump may hold heavier locks",
-				"version", fmt.Sprintf("0.%d", minor))
+				"version", fmt.Sprintf("%d.%d.%d", major, minor, patch))
 			supportsLockMode = false
 		}
 	}
@@ -254,17 +254,23 @@ func runDump(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// mydumperVersion runs `<path> --version` and parses the major.minor.patch
-// triple from the output (e.g. "mydumper 0.10.0, built against MySQL 8.0.36"
-// → 0, 10, 0). Returns (0, 0, 0, err) on any failure — the caller should
-// treat an unparseable version conservatively (assume oldest).
+// mydumperVersion runs `<path> --version` and parses the version triple via
+// parseMydumperVersion. Returns (0, 0, 0, err) on any failure — the caller
+// should treat an unparseable version conservatively (assume oldest).
 func mydumperVersion(path string) (major, minor, patch int, err error) {
 	out, err := exec.Command(path, "--version").CombinedOutput()
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("run %s --version: %w", path, err)
 	}
-	// First line: "mydumper X.Y.Z..." — extract the version triple.
-	line := strings.SplitN(string(out), "\n", 2)[0]
+	return parseMydumperVersion(string(out))
+}
+
+// parseMydumperVersion extracts the major.minor.patch triple from mydumper
+// --version output (e.g. "mydumper 0.10.0, built against MySQL 8.0.36"
+// → 0, 10, 0). Extracted from mydumperVersion so the parsing logic is
+// directly unit-testable without shelling out to a real binary.
+func parseMydumperVersion(output string) (major, minor, patch int, err error) {
+	line := strings.SplitN(output, "\n", 2)[0]
 	parts := strings.Fields(line)
 	if len(parts) < 2 {
 		return 0, 0, 0, fmt.Errorf("unexpected --version output: %q", line)
