@@ -71,7 +71,7 @@ func TestDumpCmd_allFlagsRegistered(t *testing.T) {
 // ─── buildMydumperArgs ────────────────────────────────────────────────────────
 
 func TestBuildMydumperArgs_basic(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "secret", "/tmp/dump", 4, nil, nil, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "secret", "/tmp/dump", 4, nil, nil, "", true)
 	assertArgsContainPair(t, args, "--host", "127.0.0.1")
 	assertArgsContainPair(t, args, "--port", "3306")
 	assertArgsContainPair(t, args, "--user", "root")
@@ -80,7 +80,7 @@ func TestBuildMydumperArgs_basic(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_compressAndComplete(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "", true)
 	if !argsContain(args, "--compress-protocol") {
 		t.Error("expected --compress-protocol in args")
 	}
@@ -89,23 +89,102 @@ func TestBuildMydumperArgs_compressAndComplete(t *testing.T) {
 	}
 }
 
-func TestBuildMydumperArgs_lockAndTrx(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "")
+func TestBuildMydumperArgs_lockAndTrx_supported(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "", true)
 	assertArgsContainPair(t, args, "--sync-thread-lock-mode", "NO_LOCK")
 	if !argsContain(args, "--trx-tables") {
-		t.Error("expected --trx-tables in args")
+		t.Error("expected --trx-tables in args when supportsLockMode=true")
+	}
+}
+
+func TestBuildMydumperArgs_lockAndTrx_unsupported(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "", false)
+	if argsContain(args, "--sync-thread-lock-mode") {
+		t.Error("expected --sync-thread-lock-mode to be absent when supportsLockMode=false")
+	}
+	if argsContain(args, "--trx-tables") {
+		t.Error("expected --trx-tables to be absent when supportsLockMode=false")
+	}
+	// Other flags must still be present.
+	if !argsContain(args, "--compress-protocol") {
+		t.Error("--compress-protocol should still be present")
+	}
+	if !argsContain(args, "--complete-insert") {
+		t.Error("--complete-insert should still be present")
+	}
+}
+
+func TestParseMydumperVersion(t *testing.T) {
+	cases := []struct {
+		name                                string
+		output                              string
+		wantMajor, wantMinor, wantPatch int
+		wantErr                             bool
+	}{
+		{
+			name:      "standard_0.10.0",
+			output:    "mydumper 0.10.0, built against MySQL 8.0.36\n",
+			wantMajor: 0, wantMinor: 10, wantPatch: 0,
+		},
+		{
+			name:      "standard_0.11.5",
+			output:    "mydumper 0.11.5, built against MySQL 8.0.37\n",
+			wantMajor: 0, wantMinor: 11, wantPatch: 5,
+		},
+		{
+			name:      "standard_0.16.3_with_suffix",
+			output:    "mydumper 0.16.3-6, built against MySQL 8.4.3\n",
+			wantMajor: 0, wantMinor: 16, wantPatch: 3,
+		},
+		{
+			name:      "future_major_1",
+			output:    "mydumper 1.0.0, built against MySQL 9.0.0\n",
+			wantMajor: 1, wantMinor: 0, wantPatch: 0,
+		},
+		{
+			name:    "empty_output",
+			output:  "",
+			wantErr: true,
+		},
+		{
+			name:    "garbage",
+			output:  "not a version string at all\n",
+			wantErr: true,
+		},
+		{
+			name:    "single_word",
+			output:  "mydumper\n",
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			major, minor, patch, err := parseMydumperVersion(tc.output)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error but got %d.%d.%d", major, minor, patch)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if major != tc.wantMajor || minor != tc.wantMinor || patch != tc.wantPatch {
+				t.Errorf("got %d.%d.%d, want %d.%d.%d", major, minor, patch, tc.wantMajor, tc.wantMinor, tc.wantPatch)
+			}
+		})
 	}
 }
 
 func TestBuildMydumperArgs_noPassword(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "", true)
 	if argsContain(args, "--password") {
 		t.Error("expected --password to be absent when password is empty")
 	}
 }
 
 func TestBuildMydumperArgs_singleSchema(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"mydb"}, nil, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"mydb"}, nil, "", true)
 	assertArgsContainPair(t, args, "--database", "mydb")
 	if argsContain(args, "--regex") {
 		t.Error("expected --regex to be absent for single schema")
@@ -113,7 +192,7 @@ func TestBuildMydumperArgs_singleSchema(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_multipleSchemas(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2"}, nil, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2"}, nil, "", true)
 	if argsContain(args, "--database") {
 		t.Error("expected --database to be absent for multiple schemas")
 	}
@@ -131,12 +210,12 @@ func TestBuildMydumperArgs_multipleSchemas(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_withPassword(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "s3cr3t", "/tmp/dump", 4, nil, nil, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "s3cr3t", "/tmp/dump", 4, nil, nil, "", true)
 	assertArgsContainPair(t, args, "--password", "s3cr3t")
 }
 
 func TestBuildMydumperArgs_noSchemasOrTables(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "", true)
 	for _, flag := range []string{"--database", "--regex", "--tables-list"} {
 		if argsContain(args, flag) {
 			t.Errorf("expected %s to be absent when no schemas or tables given", flag)
@@ -145,7 +224,7 @@ func TestBuildMydumperArgs_noSchemasOrTables(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_regexAnchoredFormat(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2"}, nil, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2"}, nil, "", true)
 	idx := argsIndex(args, "--regex")
 	if idx < 0 || idx+1 >= len(args) {
 		t.Fatal("expected --regex in args")
@@ -162,7 +241,7 @@ func TestBuildMydumperArgs_regexAnchoredFormat(t *testing.T) {
 
 func TestBuildMydumperArgs_schemaAndTables(t *testing.T) {
 	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4,
-		[]string{"mydb"}, []string{"mydb.orders", "mydb.items"}, "")
+		[]string{"mydb"}, []string{"mydb.orders", "mydb.items"}, "", true)
 	assertArgsContainPair(t, args, "--database", "mydb")
 	idx := argsIndex(args, "--tables-list")
 	if idx < 0 || idx+1 >= len(args) {
@@ -174,7 +253,7 @@ func TestBuildMydumperArgs_schemaAndTables(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_tables(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, []string{"mydb.orders", "mydb.items"}, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, []string{"mydb.orders", "mydb.items"}, "", true)
 	idx := argsIndex(args, "--tables-list")
 	if idx < 0 {
 		t.Fatal("expected --tables-list in args")
@@ -207,7 +286,7 @@ func TestBuildMydumperArgs_outputDirIsLast(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			args := buildMydumperArgs("127.0.0.1", 3306, "root", "pw", "/data/backup", 4, tc.schemas, tc.tables, tc.encrypt)
+			args := buildMydumperArgs("127.0.0.1", 3306, "root", "pw", "/data/backup", 4, tc.schemas, tc.tables, tc.encrypt, true)
 			n := len(args)
 			if n < 2 {
 				t.Fatalf("args too short: %v", args)
@@ -295,7 +374,7 @@ func TestAcquireDumpLock_staleLock(t *testing.T) {
 // TestBuildMydumperArgs_threeSchemas verifies that 3+ schemas all appear in the
 // --regex value, not just the first two.
 func TestBuildMydumperArgs_threeSchemas(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2", "db3"}, nil, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"db1", "db2", "db3"}, nil, "", true)
 	idx := argsIndex(args, "--regex")
 	if idx < 0 || idx+1 >= len(args) {
 		t.Fatal("expected --regex in args for 3 schemas")
@@ -625,7 +704,7 @@ func TestDumpCmd_encryptFlagsRegistered(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_encrypt(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "/path/to/key")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "/path/to/key", true)
 	idx := argsIndex(args, "--exec-per-thread")
 	if idx < 0 {
 		t.Fatal("expected --exec-per-thread in args when encryption enabled")
@@ -644,7 +723,7 @@ func TestBuildMydumperArgs_encrypt(t *testing.T) {
 }
 
 func TestBuildMydumperArgs_noEncrypt(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "")
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "", true)
 	if argsContain(args, "--exec-per-thread") {
 		t.Error("expected --exec-per-thread to be absent when encryption disabled")
 	}

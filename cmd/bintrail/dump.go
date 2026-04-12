@@ -204,8 +204,25 @@ func runDump(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to remove existing output directory %q: %w", dmpOutputDir, err)
 	}
 
-	// 6. Build mydumper args.
-	mydumperArgs := buildMydumperArgs(host, port, user, password, dmpOutputDir, dmpThreads, schemas, tables, encryptKeyPath)
+	// 6. Probe mydumper version and build args.
+	// --sync-thread-lock-mode and --trx-tables require mydumper >= 0.11.0.
+	// Ubuntu 24.04's apt package ships 0.10.0, so we must not pass them
+	// unconditionally or the dump fails (#219). Docker images are assumed
+	// to ship a recent enough version.
+	supportsLockMode := true
+	if res.mode == dumpModeLocal {
+		major, minor, patch, verErr := mydumperVersion(res.path)
+		if verErr != nil {
+			slog.Warn("could not determine mydumper version; omitting --sync-thread-lock-mode and --trx-tables for safety",
+				"error", verErr)
+			supportsLockMode = false
+		} else if major == 0 && minor < 11 {
+			slog.Warn("mydumper version is older than 0.11.0; omitting --sync-thread-lock-mode and --trx-tables — the dump may hold heavier locks",
+				"version", fmt.Sprintf("%d.%d.%d", major, minor, patch))
+			supportsLockMode = false
+		}
+	}
+	mydumperArgs := buildMydumperArgs(host, port, user, password, dmpOutputDir, dmpThreads, schemas, tables, encryptKeyPath, supportsLockMode)
 
 	// 7. Build the final command depending on resolution mode.
 	var c *exec.Cmd
@@ -237,14 +254,47 @@ func runDump(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// mydumperVersion runs `<path> --version` and parses the version triple via
+// parseMydumperVersion. Returns (0, 0, 0, err) on any failure — the caller
+// should treat an unparseable version conservatively (assume oldest).
+func mydumperVersion(path string) (major, minor, patch int, err error) {
+	out, err := exec.Command(path, "--version").CombinedOutput()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("run %s --version: %w", path, err)
+	}
+	return parseMydumperVersion(string(out))
+}
+
+// parseMydumperVersion extracts the major.minor.patch triple from mydumper
+// --version output (e.g. "mydumper 0.10.0, built against MySQL 8.0.36"
+// → 0, 10, 0). Extracted from mydumperVersion so the parsing logic is
+// directly unit-testable without shelling out to a real binary.
+func parseMydumperVersion(output string) (major, minor, patch int, err error) {
+	line := strings.SplitN(output, "\n", 2)[0]
+	parts := strings.Fields(line)
+	if len(parts) < 2 {
+		return 0, 0, 0, fmt.Errorf("unexpected --version output: %q", line)
+	}
+	ver := strings.TrimRight(parts[1], ",")
+	n, scanErr := fmt.Sscanf(ver, "%d.%d.%d", &major, &minor, &patch)
+	if scanErr != nil || n != 3 {
+		return 0, 0, 0, fmt.Errorf("cannot parse version %q from %q", ver, line)
+	}
+	return major, minor, patch, nil
+}
+
 // buildMydumperArgs constructs the argument slice for a mydumper invocation.
 // --compress-protocol and --complete-insert are always included.
+// When supportsLockMode is true (mydumper >= 0.11.0), --sync-thread-lock-mode
+// and --trx-tables are included for lighter locking. When false (mydumper
+// 0.10.x or older), they are omitted so the dump works on Ubuntu 24.04's
+// apt-installed mydumper without error (#219).
 // Schema filtering: single schema → --database; multiple → --regex.
 // Table filtering: --tables-list with a comma-joined list.
 // When encryptKeyPath is non-empty, --exec-per-thread and
 // --exec-per-thread-extension are added for AES-256-CBC encryption.
 func buildMydumperArgs(host string, port uint16, user, password, outputDir string,
-	threads int, schemas, tables []string, encryptKeyPath string) []string {
+	threads int, schemas, tables []string, encryptKeyPath string, supportsLockMode bool) []string {
 
 	args := []string{
 		"--host", host,
@@ -253,8 +303,10 @@ func buildMydumperArgs(host string, port uint16, user, password, outputDir strin
 		"--threads", strconv.Itoa(threads),
 		"--compress-protocol",
 		"--complete-insert",
-		"--sync-thread-lock-mode", "NO_LOCK",
-		"--trx-tables",
+	}
+
+	if supportsLockMode {
+		args = append(args, "--sync-thread-lock-mode", "NO_LOCK", "--trx-tables")
 	}
 
 	if password != "" {
