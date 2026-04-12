@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-04-12
+
 ### Fixed
 - `bintrail baseline` now recognizes mydumper 0.10.0's unchunked data-file naming (`<db>.<table>.sql`) in addition to the chunked format (`<db>.<table>.<chunk>.sql`) used by mydumper >= 0.11.0. Ubuntu 24.04's apt package ships mydumper 0.10.0 which produces single data files without a numeric chunk suffix; `DiscoverTables` previously required the chunk number and silently skipped these files, producing zero Parquet output. Together with #219 (mydumper version probing in `bintrail dump`), this unblocks the entire `dump → baseline → reconstruct --output-format mydumper` pipeline on Ubuntu 24.04 (#221).
 
