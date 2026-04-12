@@ -584,6 +584,85 @@ func TestDiscoverTables(t *testing.T) {
 	}
 }
 
+// TestDiscoverTables_noChunkSuffix verifies that mydumper 0.10.0's unchunked
+// file naming (<db>.<table>.sql without the .<chunk> number) is recognized by
+// DiscoverTables. Ubuntu 24.04's apt package ships mydumper 0.10.0 which uses
+// this format; the chunked format (<db>.<table>.00000.sql) was introduced in
+// 0.11.0. Both must work so the dump → baseline pipeline succeeds regardless
+// of which mydumper version the operator has installed (#221).
+func TestDiscoverTables_noChunkSuffix(t *testing.T) {
+	dir := t.TempDir()
+	files := []string{
+		"e2e_source.orders-schema.sql",
+		"e2e_source.orders.sql", // NO chunk number — mydumper 0.10.0 format
+		"e2e_source.users-schema.sql",
+		"e2e_source.users.sql", // same
+		"e2e_source-schema-create.sql",
+		"metadata",
+	}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(""), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tables, err := DiscoverTables(dir)
+	if err != nil {
+		t.Fatalf("DiscoverTables: %v", err)
+	}
+	if len(tables) != 2 {
+		t.Fatalf("got %d tables, want 2: %+v", len(tables), tables)
+	}
+	// Sorted alphabetically: orders before users
+	if tables[0].Database != "e2e_source" || tables[0].Table != "orders" {
+		t.Errorf("tables[0] = %q.%q, want e2e_source.orders", tables[0].Database, tables[0].Table)
+	}
+	if len(tables[0].DataFiles) != 1 {
+		t.Errorf("orders has %d data files, want 1", len(tables[0].DataFiles))
+	}
+	if tables[0].Format != "sql" {
+		t.Errorf("orders format = %q, want sql", tables[0].Format)
+	}
+	if tables[1].Database != "e2e_source" || tables[1].Table != "users" {
+		t.Errorf("tables[1] = %q.%q, want e2e_source.users", tables[1].Database, tables[1].Table)
+	}
+}
+
+// TestDiscoverTables_mixedChunkAndNoChunk verifies that if a directory somehow
+// contains both chunked and unchunked files for different tables, both are
+// discovered. This isn't a realistic mydumper output but guards against the
+// fallback path accidentally breaking the chunked path.
+func TestDiscoverTables_mixedChunkAndNoChunk(t *testing.T) {
+	dir := t.TempDir()
+	files := []string{
+		"shop.orders-schema.sql",
+		"shop.orders.00000.sql", // chunked (0.11.0+)
+		"shop.orders.00001.sql",
+		"shop.users-schema.sql",
+		"shop.users.sql", // unchunked (0.10.0)
+		"metadata",
+	}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(""), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tables, err := DiscoverTables(dir)
+	if err != nil {
+		t.Fatalf("DiscoverTables: %v", err)
+	}
+	if len(tables) != 2 {
+		t.Fatalf("got %d tables, want 2: %+v", len(tables), tables)
+	}
+	if tables[0].Table != "orders" || len(tables[0].DataFiles) != 2 {
+		t.Errorf("orders: want 2 chunked files, got %d", len(tables[0].DataFiles))
+	}
+	if tables[1].Table != "users" || len(tables[1].DataFiles) != 1 {
+		t.Errorf("users: want 1 unchunked file, got %d", len(tables[1].DataFiles))
+	}
+}
+
 // ─── Writer: convertValue, resolveCodec, sortColumnsForParquet ────────────────
 
 func TestConvertValueTypes(t *testing.T) {
