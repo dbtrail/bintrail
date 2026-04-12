@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `bintrail dump` no longer passes `--sync-thread-lock-mode` and `--trx-tables` to mydumper versions older than 0.11.0. These flags were introduced in mydumper 0.11.0 but were hardcoded in `buildMydumperArgs`, so `bintrail dump` failed immediately on Ubuntu 24.04's apt-installed mydumper 0.10.0 with `Unknown option --sync-thread-lock-mode`. The fix probes the local mydumper binary's version via `mydumper --version` and conditionally includes the flags only when the version is >= 0.11.0. Docker-mode invocations (`--mydumper-image`) always include the flags since the official Docker image ships a recent version. When the version cannot be determined, the flags are omitted conservatively with a `slog.Warn`. This unblocks the entire `dump → baseline → reconstruct --output-format mydumper` pipeline on Ubuntu 24.04 (#219).
+
 ## [0.5.0] - 2026-04-11
 
 ### Added
