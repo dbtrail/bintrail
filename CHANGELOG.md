@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-04-13
+
+### Changed
+- S3 archive queries (`query --archive-s3`, `recover --archive-s3`) now use prefix-scoped S3 listing, batched concurrent downloads (4 at a time), chronological file ordering, and early termination when `--limit` is satisfied. A 24-hour query that previously took 18s+ now completes in under 5s; queries with small limits terminate after downloading only the first few files. The SaaS backend can remove its 144-chunk splitting logic entirely (#225).
+
 ## [0.5.3] - 2026-04-13
 
 ### Fixed
