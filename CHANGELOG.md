@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-04-13
+
+### Fixed
+- `bintrail reconstruct` S3 baseline discovery now works with DuckDB v1.4.4, which changed `glob()` from a scalar function to a table function. The previous `SELECT unnest(glob('s3://...'))` syntax fails with a Binder Error; replaced with `SELECT * FROM glob('s3://...')` which works across DuckDB versions (#223).
+
 ## [0.5.2] - 2026-04-12
 
 ### Fixed
