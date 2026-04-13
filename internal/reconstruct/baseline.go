@@ -186,8 +186,8 @@ func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Ti
 	globPat := prefix + "/*/" + schema + "/" + table + ".parquet"
 	safeGlob := strings.ReplaceAll(globPat, "'", "''")
 
-	// Use DuckDB's glob() to enumerate matching S3 paths without downloading data.
-	rows, err := db.QueryContext(ctx, "SELECT unnest(glob('"+safeGlob+"')) AS path")
+	// Use DuckDB's glob() table function to enumerate matching S3 paths without downloading data.
+	rows, err := db.QueryContext(ctx, "SELECT * FROM glob('"+safeGlob+"')")
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("list S3 baseline snapshots: %w", err)
 	}
