@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-04-13
+
+### Fixed
+- `bintrail baseline` now emits valid 0-row Parquet files for empty tables (tables with a schema DDL but no data rows in the mydumper dump). Previously, empty tables were silently skipped, causing `bintrail reconstruct` to fail with "no baseline snapshot found" for any table that was legitimately empty at dump time. Views are still correctly skipped via a `CREATE TABLE` vs `CREATE VIEW` heuristic on the schema SQL file (#226).
+- `bintrail reconstruct` now handles missing baselines gracefully as defense-in-depth: when no baseline Parquet exists for a table, it emits a warning and treats the table as empty instead of aborting the entire reconstruct run. This covers pre-fix baselines and tables created after the last baseline snapshot (#226).
+
 ## [0.5.4] - 2026-04-13
 
 ### Changed
