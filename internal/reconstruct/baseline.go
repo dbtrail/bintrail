@@ -3,6 +3,7 @@ package reconstruct
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,10 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
+
+// ErrNoBaseline is returned by FindBaseline when no baseline snapshot exists
+// for the requested table at or before the target time.
+var ErrNoBaseline = errors.New("no baseline snapshot found")
 
 // FindBaseline finds the most recent baseline Parquet file at or before `at`
 // for the given schema and table, returning its path and snapshot timestamp.
@@ -162,8 +167,8 @@ func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string,
 		candidates = append(candidates, candidate{t: t, path: p})
 	}
 	if len(candidates) == 0 {
-		return "", time.Time{}, fmt.Errorf("no baseline snapshot found for %s.%s at or before %s in %q",
-			schema, table, at.UTC().Format(time.RFC3339), baselineDir)
+		return "", time.Time{}, fmt.Errorf("%w: %s.%s at or before %s in %q",
+			ErrNoBaseline, schema, table, at.UTC().Format(time.RFC3339), baselineDir)
 	}
 	slices.SortFunc(candidates, func(a, b candidate) int { return b.t.Compare(a.t) })
 	return candidates[0].path, candidates[0].t, nil
@@ -213,8 +218,8 @@ func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Ti
 		return "", time.Time{}, fmt.Errorf("iterate S3 baseline list: %w", err)
 	}
 	if len(candidates) == 0 {
-		return "", time.Time{}, fmt.Errorf("no baseline snapshot found for %s.%s at or before %s in %q",
-			schema, table, at.UTC().Format(time.RFC3339), s3URL)
+		return "", time.Time{}, fmt.Errorf("%w: %s.%s at or before %s in %q",
+			ErrNoBaseline, schema, table, at.UTC().Format(time.RFC3339), s3URL)
 	}
 	slices.SortFunc(candidates, func(a, b candidate) int { return b.t.Compare(a.t) })
 	return candidates[0].path, candidates[0].t, nil

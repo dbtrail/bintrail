@@ -1,7 +1,9 @@
 package baseline
 
 import (
+	"bufio"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,8 +20,9 @@ type TableFiles struct {
 }
 
 // DiscoverTables scans the mydumper output directory and groups files by table.
-// It returns one TableFiles entry per table that has both a schema file and at
-// least one data file.
+// It returns one TableFiles entry per table that has a schema file. Tables with
+// no data files (empty at dump time) are included with an empty DataFiles slice
+// so that downstream consumers can produce 0-row baselines. Views are skipped.
 func DiscoverTables(inputDir string) ([]TableFiles, error) {
 	entries, err := os.ReadDir(inputDir)
 	if err != nil {
@@ -98,7 +101,19 @@ func DiscoverTables(inputDir string) ([]TableFiles, error) {
 	for k, schemaPath := range schemas {
 		files, ok := data[k]
 		if !ok {
-			continue // schema-only table (e.g. view)
+			if isView(schemaPath) {
+				continue // genuine view — no data to convert
+			}
+			// Empty table: schema exists but mydumper produced no data file
+			// because the table had zero rows at dump time. Emit a 0-row
+			// Parquet so that reconstruct can find a baseline for every table.
+			result = append(result, TableFiles{
+				Database:   k.db,
+				Table:      k.table,
+				SchemaFile: schemaPath,
+				Format:     "sql",
+			})
+			continue
 		}
 		sort.Strings(files)
 		result = append(result, TableFiles{
@@ -126,6 +141,36 @@ func splitDBTable(s string) (db, table string, ok bool) {
 		return "", "", false
 	}
 	return s[:dot], s[dot+1:], true
+}
+
+// isView reads a mydumper schema SQL file and returns true if it contains a
+// CREATE VIEW statement rather than CREATE TABLE. Views have no data to
+// convert, while empty tables should still produce a 0-row Parquet file.
+// Returns false (assume table) on errors — a harmless 0-row Parquet is
+// better than silently dropping a real table.
+func isView(schemaPath string) bool {
+	f, err := os.Open(schemaPath)
+	if err != nil {
+		return false // can't read → assume table (safe: 0-row Parquet is harmless)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.ToUpper(strings.TrimSpace(scanner.Text()))
+		if strings.HasPrefix(line, "CREATE") {
+			// mydumper emits either "CREATE TABLE" or
+			// "CREATE [ALGORITHM=...] [DEFINER=...] [SQL SECURITY ...] VIEW".
+			return strings.Contains(line, " VIEW ")
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		slog.Debug("I/O error reading schema file for view detection; assuming table",
+			"path", schemaPath, "error", err)
+	}
+	// No CREATE statement found or I/O error — assume table rather than
+	// silently skipping, which is the exact failure mode of issue #226.
+	return false
 }
 
 // isNumericChunk returns true if s consists only of decimal digits (e.g. "00000").

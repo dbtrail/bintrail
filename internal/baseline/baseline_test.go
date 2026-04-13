@@ -1355,6 +1355,90 @@ func TestDiscoverBaselines(t *testing.T) {
 	}
 }
 
+func TestProcessTable_EmptyDataFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a minimal schema file.
+	schemaPath := filepath.Join(dir, "shop.empty-schema.sql")
+	schema := "CREATE TABLE `empty` (\n  `id` int,\n  `name` varchar(100)\n) ENGINE=InnoDB;\n"
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	outPath := filepath.Join(dir, "output", "empty.parquet")
+
+	cfg := WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 1000,
+		Metadata: map[string]string{
+			"bintrail.snapshot_timestamp": "2026-04-13T00:00:00Z",
+			MetaKeyCreateTableSQL:         schema,
+		},
+	}
+
+	tf := TableFiles{
+		Database:   "shop",
+		Table:      "empty",
+		SchemaFile: schemaPath,
+		Format:     "sql",
+		// DataFiles intentionally empty — this is the empty-table case.
+	}
+
+	n, err := processTable(context.Background(), tf, outPath, cfg)
+	if err != nil {
+		t.Fatalf("processTable: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("row count = %d, want 0", n)
+	}
+
+	// Verify the Parquet file exists and can be read.
+	f, err := os.Open(outPath)
+	if err != nil {
+		t.Fatalf("open output: %v", err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pf, err := parquet.OpenFile(f, fi.Size())
+	if err != nil {
+		t.Fatalf("open parquet: %v", err)
+	}
+
+	if got := pf.NumRows(); got != 0 {
+		t.Errorf("parquet rows = %d, want 0", got)
+	}
+
+	// Verify columns are present (sorted alphabetically in Parquet).
+	fields := pf.Schema().Fields()
+	if len(fields) != 2 {
+		t.Fatalf("schema fields = %d, want 2", len(fields))
+	}
+	// Alphabetical: id, name.
+	if fields[0].Name() != "id" {
+		t.Errorf("field[0] = %q, want %q", fields[0].Name(), "id")
+	}
+	if fields[1].Name() != "name" {
+		t.Errorf("field[1] = %q, want %q", fields[1].Name(), "name")
+	}
+
+	// Verify metadata includes create_table_sql.
+	var foundCreateSQL bool
+	for _, kv := range pf.Metadata().KeyValueMetadata {
+		if kv.Key == MetaKeyCreateTableSQL {
+			foundCreateSQL = true
+			break
+		}
+	}
+	if !foundCreateSQL {
+		t.Error("Parquet metadata missing create_table_sql key")
+	}
+}
+
 func TestDiscoverBaselines_emptyDir(t *testing.T) {
 	results, err := DiscoverBaselines(t.TempDir())
 	if err != nil {

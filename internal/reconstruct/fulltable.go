@@ -196,20 +196,35 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	// the metadata file will reflect the first one and the rest will log
 	// a warning in ReconstructTable itself.
 	if len(reports) > 0 {
-		// Re-read the metadata of the first successful table's baseline.
-		firstTableName := reports[0].Schema + "." + reports[0].Table
-		baselinePath, _, perr := FindBaseline(ctx, cfg.BaselineSrc, reports[0].Schema, reports[0].Table, cfg.At)
-		if perr == nil {
-			bmeta, merr := baseline.ReadParquetMetadataAny(ctx, baselinePath)
-			if merr == nil {
-				if err := WriteMetadataFile(cfg.OutputDir, cfg.At,
-					bmeta.GTIDSet, bmeta.BinlogFile, bmeta.BinlogPos); err != nil {
-					slog.Warn("could not write metadata file", "error", err)
+		// Pick the first report that actually produced output files (skip
+		// tables that had no baseline and returned an empty report).
+		var metaReport *TableReport
+		for _, r := range reports {
+			if len(r.Files) > 0 {
+				metaReport = r
+				break
+			}
+		}
+		if metaReport != nil {
+			tableName := metaReport.Schema + "." + metaReport.Table
+			baselinePath, _, perr := FindBaseline(ctx, cfg.BaselineSrc, metaReport.Schema, metaReport.Table, cfg.At)
+			if perr == nil {
+				bmeta, merr := baseline.ReadParquetMetadataAny(ctx, baselinePath)
+				if merr == nil {
+					if err := WriteMetadataFile(cfg.OutputDir, cfg.At,
+						bmeta.GTIDSet, bmeta.BinlogFile, bmeta.BinlogPos); err != nil {
+						slog.Warn("could not write metadata file", "error", err)
+					}
+				} else {
+					slog.Warn("could not read baseline metadata for metadata file",
+						"table", tableName, "error", merr)
 				}
 			} else {
-				slog.Warn("could not read baseline metadata for metadata file",
-					"table", firstTableName, "error", merr)
+				slog.Warn("could not find baseline for metadata file",
+					"table", tableName, "error", perr)
 			}
+		} else {
+			slog.Warn("all reconstructed tables were empty; metadata file not written")
 		}
 	}
 
@@ -242,7 +257,18 @@ func ReconstructTable(
 	// ── 1. Find the baseline snapshot ──────────────────────────────────────
 	baselinePath, snapshotTime, err := FindBaseline(ctx, cfg.BaselineSrc, schema, table, cfg.At)
 	if err != nil {
-		return nil, fmt.Errorf("find baseline: %w", err)
+		if !errors.Is(err, ErrNoBaseline) {
+			return nil, fmt.Errorf("find baseline: %w", err)
+		}
+		// No baseline exists for this table. This can happen when: (1) the
+		// table was empty at dump time and the baseline predates 0-row
+		// Parquet support, or (2) the table was created after the last
+		// baseline snapshot. Treat as empty rather than failing the entire
+		// reconstruct run.
+		slog.Warn("no baseline found; treating table as empty at dump time",
+			"schema", schema, "table", table)
+		rep.Duration = time.Since(start)
+		return rep, nil
 	}
 	slog.Debug("baseline selected",
 		"schema", schema, "table", table,

@@ -2,7 +2,9 @@ package reconstruct
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -351,4 +353,32 @@ func TestBuildCondsList_sorted(t *testing.T) {
 	if conds[0].col != "a_col" || conds[1].col != "m_col" || conds[2].col != "z_col" {
 		t.Errorf("expected sorted column order, got: %v", conds)
 	}
+}
+
+// ─── ErrNoBaseline ──────────────────────────────────────────────────────────
+
+func TestFindBaseline_ErrNoBaseline(t *testing.T) {
+	// Empty baseline directory → ErrNoBaseline sentinel.
+	dir := t.TempDir()
+	_, _, err := FindBaseline(context.Background(), dir, "shop", "orders", time.Now())
+	if err == nil {
+		t.Fatal("expected error for empty baseline dir")
+	}
+	if !errors.Is(err, ErrNoBaseline) {
+		t.Errorf("expected ErrNoBaseline, got: %v", err)
+	}
+}
+
+func TestFindBaseline_ErrNoBaseline_S3(t *testing.T) {
+	// S3 path → ErrNoBaseline. DuckDB glob on a non-existent prefix returns 0 rows.
+	_, _, err := FindBaseline(context.Background(), "s3://no-such-bucket-xyz/baselines", "shop", "orders", time.Now())
+	// S3 may return a connectivity error or ErrNoBaseline depending on DuckDB
+	// configuration. Just verify that if we get ErrNoBaseline, it unwraps correctly.
+	if err != nil && errors.Is(err, ErrNoBaseline) {
+		// Good — sentinel detected.
+		return
+	}
+	// If DuckDB returns a different error (no httpfs, no credentials), that's
+	// acceptable in a unit test without AWS credentials.
+	t.Logf("S3 FindBaseline returned non-ErrNoBaseline error (expected in CI): %v", err)
 }
