@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -231,6 +232,18 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		slog.Info("BYOS without --index-dsn; SaaS will resolve bintrail_id via source identity propagation",
 			"server_uuid", sourceIdent.ServerUUID,
 			"local_server_id", fmt.Sprint(agtServerID))
+
+		// Log the chosen S3 partition key so it shows in the startup banner
+		// regardless of whether the marker check that follows passes.
+		// EnsurePartitionKey refuses to start the agent if a marker already
+		// exists under a different server_id (issue #198), so contrary to
+		// what an older CLI version would do, prior objects cannot be
+		// silently orphaned here — the agent will fail fast and surface a
+		// migration message instead.
+		if agtS3Bucket != "" {
+			slog.Info("BYOS+S3 without --index-dsn: S3 partition key set to numeric --server-id",
+				"partition_key", fmt.Sprint(agtServerID))
+		}
 	}
 
 	// BYOS streaming: start buffer + streaming goroutine.
@@ -286,6 +299,17 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return fmt.Errorf("initialize S3 backend: %w", err)
 			}
+
+			// Detect the silent partition-key cutover described in #198:
+			// upgrading from BYOS+S3+--index-dsn (UUID partition key) to
+			// BYOS+S3 without --index-dsn (numeric partition key) would
+			// split objects across two prefixes with no operator signal.
+			// The marker file is written on first run and validated on
+			// every subsequent run; a mismatch hard-fails with guidance.
+			if err := byos.EnsurePartitionKey(ctx, s3Backend, serverIDStr); err != nil {
+				return err
+			}
+
 			payloadWriter = byos.NewPayloadWriter(s3Backend, serverIDStr)
 
 			slog.Info("BYOS flush pipeline initialized",
@@ -304,13 +328,17 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			payloadStatus:  "ok",
 		}
 
+		identPtr := &atomic.Pointer[byos.SourceIdentity]{}
+		identPtr.Store(&sourceIdent)
+
 		streamErrCh := make(chan error, 1)
 		go func() {
 			streamErrCh <- runBYOSStream(ctx, handler.SourceDB, buf, &byosFlushConfig{
 				metaClient:    metaClient,
 				payloadWriter: payloadWriter,
 				serverID:      serverIDStr,
-				sourceIdent:   sourceIdent,
+				sourceIdent:   identPtr,
+				sourceDB:      handler.SourceDB,
 				flushInterval: flushInterval,
 				state:         flushState,
 			})
@@ -413,13 +441,20 @@ func maskDSN(dsn string) string {
 // byosFlushConfig holds the sinks and settings for the BYOS flush pipeline.
 // All fields are optional — when metaClient and payloadWriter are nil,
 // the stream loop runs in buffer-only mode (hosted mode).
+//
+// sourceIdent is an atomic pointer so the per-flush load and the periodic
+// re-capture in byosStreamLoop never observe a torn SourceIdentity value.
+// Today both operations share the stream-loop goroutine, but the atomic
+// keeps the invariant intact if flushing moves to its own goroutine later.
 type byosFlushConfig struct {
-	metaClient    *byos.MetadataClient
-	payloadWriter *byos.PayloadWriter
-	serverID      string
-	sourceIdent   byos.SourceIdentity
-	flushInterval time.Duration
-	state         *flushPipelineState
+	metaClient       *byos.MetadataClient
+	payloadWriter    *byos.PayloadWriter
+	serverID         string
+	sourceIdent      *atomic.Pointer[byos.SourceIdentity]
+	sourceDB         *sql.DB       // for periodic @@server_uuid re-capture
+	identityInterval time.Duration // re-identity cadence; 0 => default 60s
+	flushInterval    time.Duration
+	state            *flushPipelineState
 }
 
 // flushPipelineState tracks the health of metadata/payload flushes.
@@ -591,32 +626,52 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 	flushTicker := time.NewTicker(flushInterval)
 	defer flushTicker.Stop()
 
-	flushBatch := func() {
+	// Periodic source-identity re-capture (issue #196).
+	identityInterval := 60 * time.Second
+	if fc != nil && fc.identityInterval > 0 {
+		identityInterval = fc.identityInterval
+	}
+	var identityTickerC <-chan time.Time
+	if fc != nil && fc.sourceDB != nil && fc.sourceIdent != nil {
+		t := time.NewTicker(identityInterval)
+		defer t.Stop()
+		identityTickerC = t.C
+	}
+	identityFailures := 0
+
+	// flushBatch drains the pending batch to the in-memory buffer and, if
+	// sinks are configured, to the metadata/payload destinations.
+	//
+	// Returns an error only for programmer errors detected during the sink
+	// flush (nil sourceIdent pointer). Transient sink failures are logged
+	// inside flushToSinks and surfaced via flushPipelineState.
+	flushBatch := func() error {
 		if len(batch) == 0 {
-			return
+			return nil
 		}
 
-		// Always insert into buffer.
 		buf.Insert(batch)
 		slog.Debug("BYOS batch flushed to buffer", "events", len(batch), "buffer_size", buf.Len())
 
 		// Split and flush to sinks if configured. Skip on shutdown —
 		// the sinks would fail immediately with context.Canceled and
 		// produce misleading error logs.
+		var flushErr error
 		if fc != nil && (fc.metaClient != nil || fc.payloadWriter != nil) && ctx.Err() == nil {
-			flushToSinks(ctx, batch, fc)
+			flushErr = flushToSinks(ctx, batch, fc)
 		}
 		if fc != nil && fc.state != nil {
 			fc.state.setBufferStats(buf.Len(), buf.ApproxBytes(), buf.SizeEvictions())
 		}
 
 		batch = batch[:0]
+		return flushErr
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			flushBatch()
+			_ = flushBatch()
 			return nil
 
 		case <-evictTicker.C:
@@ -629,12 +684,19 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 			}
 
 		case <-flushTicker.C:
-			// Timer-based flush to bound metadata latency.
-			flushBatch()
+			if err := flushBatch(); err != nil {
+				return err
+			}
+
+		case <-identityTickerC:
+			if err := checkSourceIdentity(ctx, fc.sourceDB, fc.sourceIdent, &identityFailures); err != nil {
+				_ = flushBatch()
+				return err
+			}
 
 		case ev, ok := <-events:
 			if !ok {
-				flushBatch()
+				_ = flushBatch()
 				return nil
 			}
 
@@ -645,7 +707,9 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 
 			batch = append(batch, ev)
 			if len(batch) >= batchSize {
-				flushBatch()
+				if err := flushBatch(); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -653,13 +717,26 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 
 // flushToSinks splits events via byos.SplitEvent and sends metadata to
 // dbtrail and payload to S3. Retries each sink up to 3 times with
-// exponential backoff. Failures are logged but never block the stream.
-func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig) {
+// exponential backoff. Transient sink failures are logged but never block
+// the stream. Returns an error only for programmer-error conditions (nil
+// sourceIdent pointer) so the caller can tear down the stream rather than
+// run forever with a degraded heartbeat — consistent with how
+// checkSourceIdentity handles its "BUG" case.
+func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig) error {
+	if fc.sourceIdent == nil {
+		return fmt.Errorf("BUG: sourceIdent pointer is nil — refusing to emit metadata with empty server_uuid (batch_size=%d)", len(batch))
+	}
+	p := fc.sourceIdent.Load()
+	if p == nil {
+		return fmt.Errorf("BUG: sourceIdent pointer not initialized — refusing to emit metadata with empty server_uuid (batch_size=%d)", len(batch))
+	}
+	ident := *p
+
 	var metaBatch []byos.MetadataRecord
 	var payloadBatch []byos.PayloadRecord
 
 	for i := range batch {
-		meta, payload, err := byos.SplitEvent(batch[i], fc.serverID, fc.sourceIdent)
+		meta, payload, err := byos.SplitEvent(batch[i], fc.serverID, ident)
 		if err != nil {
 			slog.Warn("BYOS split failed, skipping event",
 				"error", err,
@@ -673,7 +750,7 @@ func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig
 	}
 
 	if len(metaBatch) == 0 {
-		return
+		return nil
 	}
 
 	metaOK := true
@@ -704,6 +781,78 @@ func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig
 	if fc.state != nil {
 		fc.state.updateFlush(metaOK, payloadOK)
 	}
+	return nil
+}
+
+// maxIdentityFailures is the number of consecutive failed re-captures that
+// will be tolerated before tearing down the stream. At the default 60s
+// cadence this is ~10 minutes — long enough to ride out a network blip
+// but short enough to surface permanent failures (revoked credentials,
+// dropped user) instead of logging WARN forever.
+const maxIdentityFailures = 10
+
+// checkSourceIdentity re-reads @@server_uuid from sourceDB and compares it to
+// the identity currently stored in prev.
+//
+// Host/port/user are not re-derived here: they come from the startup DSN
+// flag and cannot change without an agent restart, so parsing the DSN on
+// every tick would only hide real DSN-misconfiguration errors as transient.
+//
+// Return values:
+//   - UUID unchanged: nil, failures counter reset.
+//   - UUID changed:   error naming both UUIDs (operator intervention required).
+//   - DB query fails: nil for the first maxIdentityFailures consecutive calls
+//     (logged as warning); after that, returns the error so the stream tears
+//     down rather than running forever with a possibly-stale identity.
+//   - context.Canceled: nil, no log (the loop is shutting down).
+//
+// The failure counter tracks STRICT consecutive failures — a single successful
+// query resets it. A source that flaps (succeeds at least once per
+// maxIdentityFailures ticks) will log repeated warnings but never trip the
+// threshold. Permanent failures (revoked creds, dropped user) still do.
+// Rolling-window detection is out of scope; if flapping becomes a real
+// failure mode, revisit this function.
+func checkSourceIdentity(ctx context.Context, sourceDB *sql.DB, prev *atomic.Pointer[byos.SourceIdentity], failures *int) error {
+	var uuid string
+	err := sourceDB.QueryRowContext(ctx, "SELECT @@server_uuid").Scan(&uuid)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
+		*failures++
+		slog.Warn("BYOS source identity re-capture failed",
+			"error", err, "consecutive_failures", *failures, "max", maxIdentityFailures)
+		if *failures >= maxIdentityFailures {
+			return fmt.Errorf(
+				"source identity re-capture failed %d consecutive times: %w. "+
+					"This usually indicates revoked credentials, a dropped user, or a "+
+					"permanently unreachable source. The agent cannot confirm identity "+
+					"stability and is aborting rather than silently stamping metadata "+
+					"with a possibly-stale @@server_uuid",
+				*failures, err)
+		}
+		return nil
+	}
+	*failures = 0
+
+	current := prev.Load()
+	if current == nil {
+		// Programmer error: the pointer must be seeded before the stream
+		// goroutine dispatches. Tear down rather than silently stamping
+		// metadata with an empty server_uuid.
+		return fmt.Errorf("BUG: sourceIdent pointer was not initialized at agent startup")
+	}
+	if uuid != current.ServerUUID {
+		return fmt.Errorf(
+			"source server identity changed: @@server_uuid was %s, now %s. "+
+				"The source MySQL was restarted with a regenerated auto.cnf, failed "+
+				"over behind a VIP, or the DSN host now resolves to a different "+
+				"instance. Continuing would silently misattribute events to the prior "+
+				"server's bintrail_id. Verify the source and restart the agent",
+			current.ServerUUID, uuid,
+		)
+	}
+	return nil
 }
 
 // retryFlush retries fn up to maxAttempts times with exponential backoff
