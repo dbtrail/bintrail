@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -231,6 +232,20 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		slog.Info("BYOS without --index-dsn; SaaS will resolve bintrail_id via source identity propagation",
 			"server_uuid", sourceIdent.ServerUUID,
 			"local_server_id", fmt.Sprint(agtServerID))
+
+		// If S3 is configured, the partition key falls back to the numeric
+		// --server-id. A prior agent run that had --index-dsn would have used
+		// a UUID instead — objects would live under a different S3 prefix
+		// (issue #198). EnsurePartitionKey (called below when S3 is set up)
+		// will hard-fail if a mismatched marker is found, but log ahead of
+		// time so the operator sees the chosen key in the startup banner.
+		if agtS3Bucket != "" {
+			slog.Warn("BYOS+S3 without --index-dsn: S3 partition key uses numeric --server-id; "+
+				"if this agent previously ran with --index-dsn, prior objects live under the "+
+				"resolved bintrail_id prefix and will not be queried under this configuration "+
+				"unless manually migrated",
+				"partition_key", fmt.Sprint(agtServerID))
+		}
 	}
 
 	// BYOS streaming: start buffer + streaming goroutine.
@@ -286,6 +301,17 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return fmt.Errorf("initialize S3 backend: %w", err)
 			}
+
+			// Detect the silent partition-key cutover described in #198:
+			// upgrading from BYOS+S3+--index-dsn (UUID partition key) to
+			// BYOS+S3 without --index-dsn (numeric partition key) would
+			// split objects across two prefixes with no operator signal.
+			// The marker file is written on first run and validated on
+			// every subsequent run; a mismatch hard-fails with guidance.
+			if err := byos.EnsurePartitionKey(ctx, s3Backend, serverIDStr); err != nil {
+				return err
+			}
+
 			payloadWriter = byos.NewPayloadWriter(s3Backend, serverIDStr)
 
 			slog.Info("BYOS flush pipeline initialized",
@@ -304,13 +330,18 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			payloadStatus:  "ok",
 		}
 
+		identPtr := &atomic.Pointer[byos.SourceIdentity]{}
+		identPtr.Store(&sourceIdent)
+
 		streamErrCh := make(chan error, 1)
 		go func() {
 			streamErrCh <- runBYOSStream(ctx, handler.SourceDB, buf, &byosFlushConfig{
 				metaClient:    metaClient,
 				payloadWriter: payloadWriter,
 				serverID:      serverIDStr,
-				sourceIdent:   sourceIdent,
+				sourceIdent:   identPtr,
+				sourceDB:      handler.SourceDB,
+				sourceDSN:     agtSourceDSN,
 				flushInterval: flushInterval,
 				state:         flushState,
 			})
@@ -413,13 +444,20 @@ func maskDSN(dsn string) string {
 // byosFlushConfig holds the sinks and settings for the BYOS flush pipeline.
 // All fields are optional — when metaClient and payloadWriter are nil,
 // the stream loop runs in buffer-only mode (hosted mode).
+//
+// sourceIdent is an atomic pointer so the stream loop can re-capture source
+// MySQL identity on a periodic ticker (see issue #196) without racing with
+// the flush goroutine that stamps identity on every MetadataRecord.
 type byosFlushConfig struct {
-	metaClient    *byos.MetadataClient
-	payloadWriter *byos.PayloadWriter
-	serverID      string
-	sourceIdent   byos.SourceIdentity
-	flushInterval time.Duration
-	state         *flushPipelineState
+	metaClient       *byos.MetadataClient
+	payloadWriter    *byos.PayloadWriter
+	serverID         string
+	sourceIdent      *atomic.Pointer[byos.SourceIdentity]
+	sourceDB         *sql.DB       // for periodic @@server_uuid re-capture
+	sourceDSN        string        // for re-parsing host/port/user on re-capture
+	identityInterval time.Duration // re-identity cadence; 0 => default 60s
+	flushInterval    time.Duration
+	state            *flushPipelineState
 }
 
 // flushPipelineState tracks the health of metadata/payload flushes.
@@ -591,6 +629,19 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 	flushTicker := time.NewTicker(flushInterval)
 	defer flushTicker.Stop()
 
+	// Periodic source-identity re-capture (issue #196). Disabled when fc has
+	// no sourceDB (hosted mode or tests that don't wire the sourceDB path).
+	identityInterval := 60 * time.Second
+	if fc != nil && fc.identityInterval > 0 {
+		identityInterval = fc.identityInterval
+	}
+	var identityTickerC <-chan time.Time
+	if fc != nil && fc.sourceDB != nil && fc.sourceIdent != nil {
+		t := time.NewTicker(identityInterval)
+		defer t.Stop()
+		identityTickerC = t.C
+	}
+
 	flushBatch := func() {
 		if len(batch) == 0 {
 			return
@@ -632,6 +683,15 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 			// Timer-based flush to bound metadata latency.
 			flushBatch()
 
+		case <-identityTickerC:
+			// Re-capture source identity. Hard-fail on @@server_uuid
+			// change (operator intervention required); tolerate transient
+			// DB errors (the next tick will retry).
+			if err := checkSourceIdentity(ctx, fc.sourceDB, fc.sourceDSN, fc.sourceIdent); err != nil {
+				flushBatch()
+				return err
+			}
+
 		case ev, ok := <-events:
 			if !ok {
 				flushBatch()
@@ -658,8 +718,16 @@ func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig
 	var metaBatch []byos.MetadataRecord
 	var payloadBatch []byos.PayloadRecord
 
+	// Load the current source identity once per flush. The stream loop may
+	// atomically replace this pointer when it detects an identity change on
+	// the periodic re-capture ticker (issue #196).
+	var ident byos.SourceIdentity
+	if p := fc.sourceIdent.Load(); p != nil {
+		ident = *p
+	}
+
 	for i := range batch {
-		meta, payload, err := byos.SplitEvent(batch[i], fc.serverID, fc.sourceIdent)
+		meta, payload, err := byos.SplitEvent(batch[i], fc.serverID, ident)
 		if err != nil {
 			slog.Warn("BYOS split failed, skipping event",
 				"error", err,
@@ -704,6 +772,38 @@ func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig
 	if fc.state != nil {
 		fc.state.updateFlush(metaOK, payloadOK)
 	}
+}
+
+// checkSourceIdentity re-reads @@server_uuid from sourceDB and compares it to
+// the identity currently stored in prev. Returns an error when the ServerUUID
+// has changed (operator intervention required, see issue #196) and nil
+// otherwise — including on transient DB failures, which are logged as a
+// warning so the next tick can retry without tearing down the agent.
+func checkSourceIdentity(ctx context.Context, sourceDB *sql.DB, sourceDSN string, prev *atomic.Pointer[byos.SourceIdentity]) error {
+	ident, err := loadSourceIdentity(ctx, sourceDB, sourceDSN)
+	if err != nil {
+		slog.Warn("BYOS source identity re-capture failed; will retry on next tick", "error", err)
+		return nil
+	}
+	current := prev.Load()
+	if current == nil {
+		prev.Store(&ident)
+		return nil
+	}
+	if ident.ServerUUID != current.ServerUUID {
+		return fmt.Errorf(
+			"source server identity changed: @@server_uuid was %s, now %s. "+
+				"The source MySQL was restarted with a regenerated auto.cnf, failed "+
+				"over behind a VIP, or the DSN host now resolves to a different "+
+				"instance. Continuing would silently misattribute events to the prior "+
+				"server's bintrail_id. Verify the source and restart the agent",
+			current.ServerUUID, ident.ServerUUID,
+		)
+	}
+	// UUID stable; store the fresh value so host/port/user updates (via
+	// resolveServerIdentity rule 2) propagate even when the UUID didn't move.
+	prev.Store(&ident)
+	return nil
 }
 
 // retryFlush retries fn up to maxAttempts times with exponential backoff
