@@ -1,6 +1,8 @@
 package parquetquery
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -589,4 +591,45 @@ func TestCanTerminateEarly(t *testing.T) {
 			t.Error("should not terminate: no remaining files")
 		}
 	})
+}
+
+// ─── drainSlots / removeTempFile (pipeline cleanup) ─────────────────────────
+
+func TestDrainSlotsRemovesPrefetchedFiles(t *testing.T) {
+	dir := t.TempDir()
+	mkFile := func(name string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// Two slots: one with a prefetched file, one closed without value
+	// (simulates a download that was canceled before completing).
+	a, b := mkFile("a.parquet"), mkFile("b.parquet")
+	slots := []chan dlResult{
+		make(chan dlResult, 1),
+		make(chan dlResult, 1),
+		make(chan dlResult, 1),
+	}
+	slots[0] <- dlResult{path: a}
+	close(slots[0])
+	slots[1] <- dlResult{path: b}
+	close(slots[1])
+	close(slots[2]) // closed empty — no path to remove
+
+	drainSlots(slots)
+
+	for _, p := range []string{a, b} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("expected %s removed, got err=%v", p, err)
+		}
+	}
+}
+
+func TestRemoveTempFileMissingIsNoOp(t *testing.T) {
+	// Should not warn or panic on missing files.
+	removeTempFile(filepath.Join(t.TempDir(), "does-not-exist.parquet"))
+	removeTempFile("") // empty path is also a no-op
 }

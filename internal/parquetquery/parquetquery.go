@@ -81,28 +81,53 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 
 		dl := newS3Downloader(s3Client)
 
-		// Download and query in batches of 4 for concurrent S3 GETs.
-		// Peak disk usage: 4 temp files (~4-40MB). DuckDB queries each
-		// file, then we delete the batch before the next round.
-		const batchSize = 4
+		// Pipeline: prefetch up to maxInFlightDownloads files in parallel
+		// while DuckDB queries the current one. Queries remain strictly
+		// sequential — only one DuckDB query is active at a time, so peak
+		// RAM (DuckDB's per-query working set) is unchanged from a serial
+		// implementation. Peak temp files on disk: maxInFlightDownloads + 1
+		// (one being queried, the rest buffered as completed prefetches).
+		const maxInFlightDownloads = 2
+		slots := make([]chan dlResult, len(files))
+		for i := range slots {
+			slots[i] = make(chan dlResult, 1)
+		}
+		dlCtx, cancelDl := context.WithCancel(ctx)
+		defer cancelDl()
+		go dl.prefetchAll(dlCtx, files, slots, maxInFlightDownloads)
+
 		var results []query.ResultRow
-		for i := 0; i < len(files); i += batchSize {
-			end := min(i+batchSize, len(files))
-			batch := files[i:end]
-
-			batchResults, batchErr := dl.downloadAndQuery(ctx, db, batch, opts)
-			if batchErr != nil {
-				return nil, batchErr
+		for i := range files {
+			dr, ok := <-slots[i]
+			if !ok {
+				// Slot closed without a value (download canceled); stop.
+				break
 			}
-			results = append(results, batchResults...)
+			if dr.err != nil {
+				cancelDl()
+				drainSlots(slots[i+1:])
+				return nil, fmt.Errorf("download archive file %s: %w", dr.src, dr.err)
+			}
 
-			// Early termination: if we have enough results and all remaining
-			// files are from later hours, no future file can displace them.
-			if opts.Limit > 0 && len(results) >= opts.Limit && end < len(files) {
-				if canTerminateEarly(results, files[end:], opts.Limit) {
+			fileResults, qErr := queryLocalFile(ctx, db, dr.path, dr.src, opts)
+			removeTempFile(dr.path)
+			if qErr != nil {
+				cancelDl()
+				drainSlots(slots[i+1:])
+				return nil, qErr
+			}
+			results = append(results, fileResults...)
+			slog.Debug("queried archive file", "file", dr.src, "rows", len(fileResults))
+
+			// Per-file early termination: stop as soon as no remaining file
+			// can produce a row earlier than what we already have.
+			if opts.Limit > 0 && len(results) >= opts.Limit && i+1 < len(files) {
+				if canTerminateEarly(results, files[i+1:], opts.Limit) {
 					slog.Debug("early termination: collected enough results",
 						"collected", len(results), "limit", opts.Limit,
-						"remaining_files", len(files)-end)
+						"remaining_files", len(files)-i-1)
+					cancelDl()
+					drainSlots(slots[i+1:])
 					break
 				}
 			}
@@ -297,70 +322,85 @@ func (d *s3Downloader) download(ctx context.Context, s3URL string) (string, erro
 	return tmp.Name(), nil
 }
 
-// downloadAndQuery downloads a batch of S3 files concurrently, queries each
-// with DuckDB, and returns the combined results. Temp files are cleaned up
-// after querying regardless of success or failure.
-func (d *s3Downloader) downloadAndQuery(ctx context.Context, db *sql.DB, files []string, opts query.Options) ([]query.ResultRow, error) {
-	tmpPaths, dlErr := d.downloadBatch(ctx, files)
-	if dlErr != nil {
-		return nil, fmt.Errorf("download archive files: %w", dlErr)
-	}
-	defer removeTempFiles(tmpPaths)
-
-	var results []query.ResultRow
-	for j, tmpPath := range tmpPaths {
-		cols, colErr := parquetColumns(ctx, db, tmpPath)
-		if colErr != nil {
-			return nil, fmt.Errorf("read parquet schema %s: %w", files[j], colErr)
-		}
-		q, args := buildQueryForFile(tmpPath, opts, cols)
-		rows, err := db.QueryContext(ctx, q, args...)
-		if err != nil {
-			return nil, fmt.Errorf("parquet query %s: %w", files[j], err)
-		}
-		fileResults, scanErr := scanRows(rows)
-		rows.Close()
-		if scanErr != nil {
-			return nil, scanErr
-		}
-		results = append(results, fileResults...)
-		slog.Debug("queried archive file", "file", files[j], "rows", len(fileResults))
-	}
-	return results, nil
+// dlResult carries the outcome of a single S3 file download to the consumer.
+// path is the temp file path on disk (caller deletes); err is set when the
+// download itself failed.
+type dlResult struct {
+	path string
+	src  string
+	err  error
 }
 
-// downloadBatch downloads multiple S3 files concurrently and returns their
-// local temp paths. On error, cleans up all downloaded files. The caller
-// controls concurrency by limiting the batch size (typically 4).
-func (d *s3Downloader) downloadBatch(ctx context.Context, files []string) ([]string, error) {
-	paths := make([]string, len(files))
-	g, gctx := errgroup.WithContext(ctx)
+// prefetchAll downloads files into their slots with bounded parallelism.
+// Each slot is closed exactly once — by the per-file goroutine if it ran,
+// or by prefetchAll directly if cancellation prevented launch — so the
+// consumer's range/<-slots[i] always unblocks.
+func (d *s3Downloader) prefetchAll(ctx context.Context, files []string, slots []chan dlResult, maxInFlight int) {
+	sem := make(chan struct{}, maxInFlight)
+	var wg sync.WaitGroup
 	for i, f := range files {
-		g.Go(func() error {
-			p, err := d.download(gctx, f)
-			if err != nil {
-				return err
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			// Close slots we never launched so the consumer doesn't block.
+			for k := i; k < len(slots); k++ {
+				close(slots[k])
 			}
-			paths[i] = p
-			return nil
-		})
+			wg.Wait()
+			return
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer close(slots[i])
+			path, err := d.download(ctx, f)
+			if ctx.Err() != nil {
+				// Consumer is gone; clean up our temp file rather than send.
+				removeTempFile(path)
+				return
+			}
+			slots[i] <- dlResult{path: path, src: f, err: err}
+		}()
 	}
-	if err := g.Wait(); err != nil {
-		removeTempFiles(paths)
-		return nil, err
-	}
-	return paths, nil
+	wg.Wait()
 }
 
-// removeTempFiles deletes all non-empty paths in the slice.
-func removeTempFiles(paths []string) {
-	for _, p := range paths {
-		if p != "" {
-			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-				slog.Warn("failed to remove temp file", "path", p, "error", err)
-			}
+// drainSlots consumes any pending prefetched results and removes their temp
+// files. Called after the consumer stops reading (early termination or error)
+// so we don't leak files prefetched before cancellation took effect.
+func drainSlots(slots []chan dlResult) {
+	for _, ch := range slots {
+		if dr, ok := <-ch; ok {
+			removeTempFile(dr.path)
 		}
 	}
+}
+
+// removeTempFile deletes a single temp file path, ignoring missing-file errors.
+func removeTempFile(path string) {
+	if path == "" {
+		return
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to remove temp file", "path", path, "error", err)
+	}
+}
+
+// queryLocalFile runs a single DuckDB query against a downloaded parquet file
+// and returns the matching rows. The caller deletes the file after this returns.
+func queryLocalFile(ctx context.Context, db *sql.DB, path, srcURL string, opts query.Options) ([]query.ResultRow, error) {
+	cols, colErr := parquetColumns(ctx, db, path)
+	if colErr != nil {
+		return nil, fmt.Errorf("read parquet schema %s: %w", srcURL, colErr)
+	}
+	q, args := buildQueryForFile(path, opts, cols)
+	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("parquet query %s: %w", srcURL, err)
+	}
+	defer rows.Close()
+	return scanRows(rows)
 }
 
 // sortFilesByHour sorts S3 file paths chronologically by their Hive partition
