@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEnsurePartitionKey_FirstRun(t *testing.T) {
@@ -131,6 +132,34 @@ func TestEnsurePartitionKey_EmptyMarker(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "empty") {
 		t.Errorf("error should call out 'empty'; got: %v", err)
+	}
+}
+
+func TestEnsurePartitionKey_NewerVersionRejected(t *testing.T) {
+	b := newMemBackend()
+	ctx := context.Background()
+
+	// A marker written by a future agent with a higher Version must be
+	// refused — otherwise this agent might silently ignore fields the
+	// newer format relies on and re-arm the #198 cutover.
+	body, _ := json.Marshal(partitionKeyRecord{
+		Version:   partitionKeyMarkerVersion + 1,
+		ServerID:  "srv-A",
+		FirstSeen: time.Now().UTC(),
+	})
+	if err := b.Put(ctx, partitionKeyMarker, bytes.NewReader(body)); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	err := EnsurePartitionKey(ctx, b, "srv-A")
+	if err == nil {
+		t.Fatal("EnsurePartitionKey with future-version marker returned nil, want error")
+	}
+	if !strings.Contains(err.Error(), "newer agent") {
+		t.Errorf("error should call out 'newer agent'; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Upgrade this agent") {
+		t.Errorf("error should direct the operator to upgrade; got: %v", err)
 	}
 }
 

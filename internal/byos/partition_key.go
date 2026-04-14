@@ -99,6 +99,14 @@ func EnsurePartitionKey(ctx context.Context, b storage.Backend, serverID string)
 				"the cutover described in #198",
 			partitionKeyMarker)
 	}
+	if rec.Version > partitionKeyMarkerVersion {
+		return fmt.Errorf(
+			"partition-key marker at %q was written by a newer agent "+
+				"(marker version %d, this agent supports up to %d). Upgrade this agent "+
+				"before continuing — proceeding could misinterpret fields the newer "+
+				"format relies on and silently re-arm the cutover described in #198",
+			partitionKeyMarker, rec.Version, partitionKeyMarkerVersion)
+	}
 	if rec.ServerID != serverID {
 		return fmt.Errorf(
 			"partition key mismatch: prior agent runs used server_id=%q (since %s), "+

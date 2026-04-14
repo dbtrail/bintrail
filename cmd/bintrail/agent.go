@@ -639,32 +639,39 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 	}
 	identityFailures := 0
 
-	flushBatch := func() {
+	// flushBatch drains the pending batch to the in-memory buffer and, if
+	// sinks are configured, to the metadata/payload destinations.
+	//
+	// Returns an error only for programmer errors detected during the sink
+	// flush (nil sourceIdent pointer). Transient sink failures are logged
+	// inside flushToSinks and surfaced via flushPipelineState.
+	flushBatch := func() error {
 		if len(batch) == 0 {
-			return
+			return nil
 		}
 
-		// Always insert into buffer.
 		buf.Insert(batch)
 		slog.Debug("BYOS batch flushed to buffer", "events", len(batch), "buffer_size", buf.Len())
 
 		// Split and flush to sinks if configured. Skip on shutdown —
 		// the sinks would fail immediately with context.Canceled and
 		// produce misleading error logs.
+		var flushErr error
 		if fc != nil && (fc.metaClient != nil || fc.payloadWriter != nil) && ctx.Err() == nil {
-			flushToSinks(ctx, batch, fc)
+			flushErr = flushToSinks(ctx, batch, fc)
 		}
 		if fc != nil && fc.state != nil {
 			fc.state.setBufferStats(buf.Len(), buf.ApproxBytes(), buf.SizeEvictions())
 		}
 
 		batch = batch[:0]
+		return flushErr
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			flushBatch()
+			_ = flushBatch()
 			return nil
 
 		case <-evictTicker.C:
@@ -677,18 +684,19 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 			}
 
 		case <-flushTicker.C:
-			// Timer-based flush to bound metadata latency.
-			flushBatch()
+			if err := flushBatch(); err != nil {
+				return err
+			}
 
 		case <-identityTickerC:
 			if err := checkSourceIdentity(ctx, fc.sourceDB, fc.sourceIdent, &identityFailures); err != nil {
-				flushBatch()
+				_ = flushBatch()
 				return err
 			}
 
 		case ev, ok := <-events:
 			if !ok {
-				flushBatch()
+				_ = flushBatch()
 				return nil
 			}
 
@@ -699,7 +707,9 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 
 			batch = append(batch, ev)
 			if len(batch) >= batchSize {
-				flushBatch()
+				if err := flushBatch(); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -707,30 +717,18 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 
 // flushToSinks splits events via byos.SplitEvent and sends metadata to
 // dbtrail and payload to S3. Retries each sink up to 3 times with
-// exponential backoff. Failures are logged but never block the stream.
-func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig) {
-	// Snapshot the identity pointer once per flush so every record in this
-	// batch uses the same value. A nil pointer or a nil snapshot would
-	// result in metadata records going out with an empty @@server_uuid —
-	// silently misattributing events at the SaaS side. That's a programmer
-	// error, not a runtime condition; abort the flush and mark the pipeline
-	// degraded so the heartbeat surfaces the stuck state.
+// exponential backoff. Transient sink failures are logged but never block
+// the stream. Returns an error only for programmer-error conditions (nil
+// sourceIdent pointer) so the caller can tear down the stream rather than
+// run forever with a degraded heartbeat — consistent with how
+// checkSourceIdentity handles its "BUG" case.
+func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig) error {
 	if fc.sourceIdent == nil {
-		slog.Error("BYOS flush: sourceIdent pointer is nil — refusing to emit metadata with empty server_uuid",
-			"batch_size", len(batch))
-		if fc.state != nil {
-			fc.state.updateFlush(false, false)
-		}
-		return
+		return fmt.Errorf("BUG: sourceIdent pointer is nil — refusing to emit metadata with empty server_uuid (batch_size=%d)", len(batch))
 	}
 	p := fc.sourceIdent.Load()
 	if p == nil {
-		slog.Error("BYOS flush: sourceIdent not initialized — refusing to emit metadata with empty server_uuid",
-			"batch_size", len(batch))
-		if fc.state != nil {
-			fc.state.updateFlush(false, false)
-		}
-		return
+		return fmt.Errorf("BUG: sourceIdent pointer not initialized — refusing to emit metadata with empty server_uuid (batch_size=%d)", len(batch))
 	}
 	ident := *p
 
@@ -752,7 +750,7 @@ func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig
 	}
 
 	if len(metaBatch) == 0 {
-		return
+		return nil
 	}
 
 	metaOK := true
@@ -783,6 +781,7 @@ func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig
 	if fc.state != nil {
 		fc.state.updateFlush(metaOK, payloadOK)
 	}
+	return nil
 }
 
 // maxIdentityFailures is the number of consecutive failed re-captures that
@@ -806,6 +805,13 @@ const maxIdentityFailures = 10
 //     (logged as warning); after that, returns the error so the stream tears
 //     down rather than running forever with a possibly-stale identity.
 //   - context.Canceled: nil, no log (the loop is shutting down).
+//
+// The failure counter tracks STRICT consecutive failures — a single successful
+// query resets it. A source that flaps (succeeds at least once per
+// maxIdentityFailures ticks) will log repeated warnings but never trip the
+// threshold. Permanent failures (revoked creds, dropped user) still do.
+// Rolling-window detection is out of scope; if flapping becomes a real
+// failure mode, revisit this function.
 func checkSourceIdentity(ctx context.Context, sourceDB *sql.DB, prev *atomic.Pointer[byos.SourceIdentity], failures *int) error {
 	var uuid string
 	err := sourceDB.QueryRowContext(ctx, "SELECT @@server_uuid").Scan(&uuid)

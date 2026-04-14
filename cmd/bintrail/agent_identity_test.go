@@ -146,6 +146,29 @@ func TestCheckSourceIdentity_BoundedRetryAborts(t *testing.T) {
 	}
 }
 
+func TestCheckSourceIdentity_DeadlineExceededSilent(t *testing.T) {
+	// Query timeouts from config.Connect's 10s ctx budget must not count
+	// against the consecutive-failure budget or log a warning — they're
+	// routine and would otherwise trigger teardown during normal load spikes.
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT @@server_uuid").WillReturnError(context.DeadlineExceeded)
+
+	prev := newIdentPtr(byos.SourceIdentity{ServerUUID: testUUID})
+	failures := 0
+
+	if err := checkSourceIdentity(context.Background(), db, prev, &failures); err != nil {
+		t.Fatalf("DeadlineExceeded should not produce an error; got: %v", err)
+	}
+	if failures != 0 {
+		t.Errorf("DeadlineExceeded should not increment failures; got %d", failures)
+	}
+}
+
 func TestCheckSourceIdentity_ContextCanceledSilent(t *testing.T) {
 	// On shutdown the ctx is canceled mid-query. That should not be
 	// counted as a failure and should not log a spurious warning.
@@ -194,6 +217,43 @@ func TestCheckSourceIdentity_NilPointerIsBug(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "BUG") {
 		t.Errorf("error should flag the programmer error; got: %v", err)
+	}
+}
+
+func TestFlushToSinks_NilSourceIdentPointer(t *testing.T) {
+	// Programmer error: fc.sourceIdent is nil. flushToSinks must refuse
+	// to emit metadata with an empty server_uuid and return a BUG-flagged
+	// error so the stream loop can tear down, rather than log-and-continue
+	// forever with a degraded heartbeat.
+	fc := &byosFlushConfig{
+		serverID:    "srv-A",
+		sourceIdent: nil,
+	}
+	err := flushToSinks(context.Background(), []parser.Event{{}}, fc)
+	if err == nil {
+		t.Fatal("flushToSinks with nil sourceIdent returned nil, want BUG error")
+	}
+	if !strings.Contains(err.Error(), "BUG") {
+		t.Errorf("error should flag programmer error with 'BUG'; got: %v", err)
+	}
+}
+
+func TestFlushToSinks_NilIdentSnapshot(t *testing.T) {
+	// Programmer error: fc.sourceIdent is a non-nil pointer with no Store
+	// call yet. Same treatment as the nil-pointer case.
+	fc := &byosFlushConfig{
+		serverID:    "srv-A",
+		sourceIdent: &atomic.Pointer[byos.SourceIdentity]{},
+	}
+	err := flushToSinks(context.Background(), []parser.Event{{}}, fc)
+	if err == nil {
+		t.Fatal("flushToSinks with unseeded sourceIdent returned nil, want BUG error")
+	}
+	if !strings.Contains(err.Error(), "BUG") {
+		t.Errorf("error should flag programmer error with 'BUG'; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not initialized") {
+		t.Errorf("error should distinguish unseeded from nil pointer; got: %v", err)
 	}
 }
 
