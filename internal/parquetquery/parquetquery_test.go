@@ -640,21 +640,30 @@ func TestRemoveTempFileMissingIsNoOp(t *testing.T) {
 
 // ─── prefetchAll (pipeline concurrency invariants) ─────────────────────────
 
-// fakeDownloader builds a downloadFn that creates real temp files in dir,
-// optionally blocking on a per-call basis to model slow downloads. Callers
-// can cancel mid-flight to exercise cleanup paths.
+// fakeDownloader builds a downloadFn that creates real temp files in dir.
+// Two optional gates control timing:
+//   - preWriteGate: blocks BEFORE creating the file and respects ctx.
+//     Models a stuck download that returns ctx.Err on cancel.
+//   - postWriteGate: blocks AFTER creating the file and ignores ctx.
+//     Models a download that completed just as the consumer canceled —
+//     the file exists and the caller must clean it up.
+//
+// `started` lets tests wait for N calls to be in flight without time.Sleep.
 type fakeDownloader struct {
-	dir     string
-	created atomic.Int32
-	gate    chan struct{} // closed → all calls return immediately; nil → no gating
-	failOn  string        // src that should return an error instead of a path
+	dir           string
+	created       atomic.Int32
+	started       atomic.Int32
+	preWriteGate  chan struct{}
+	postWriteGate chan struct{}
+	failOn        string // src that should return an error instead of a path
 }
 
 func (f *fakeDownloader) fn() downloadFn {
 	return func(ctx context.Context, src string) (string, error) {
-		if f.gate != nil {
+		f.started.Add(1)
+		if f.preWriteGate != nil {
 			select {
-			case <-f.gate:
+			case <-f.preWriteGate:
 			case <-ctx.Done():
 				return "", ctx.Err()
 			}
@@ -666,7 +675,23 @@ func (f *fakeDownloader) fn() downloadFn {
 		if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
 			return "", err
 		}
+		if f.postWriteGate != nil {
+			<-f.postWriteGate
+		}
 		return path, nil
+	}
+}
+
+// waitForStarted polls f.started until it reaches n or the deadline elapses.
+// Replaces time.Sleep-based synchronization to avoid CI flakes.
+func (f *fakeDownloader) waitForStarted(t *testing.T, n int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for f.started.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d downloads to start (got %d)", n, f.started.Load())
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -699,7 +724,7 @@ func TestPrefetchAllClosesEverySlotOnCancel(t *testing.T) {
 	// and unlaunched slots (semaphore not yet acquired).
 	dir := t.TempDir()
 	gate := make(chan struct{}) // never closed; fake downloads will block
-	fd := &fakeDownloader{dir: dir, gate: gate}
+	fd := &fakeDownloader{dir: dir, preWriteGate: gate}
 
 	files := []string{"a", "b", "c", "d", "e"}
 	slots := makeSlots(len(files))
@@ -719,14 +744,11 @@ func TestPrefetchAllClosesEverySlotOnCancel(t *testing.T) {
 		t.Fatal("prefetchAll did not return after cancel")
 	}
 
+	// Every slot must be readable without blocking — either it has a value
+	// (received before cancel) or it's closed.
 	for i, ch := range slots {
 		select {
-		case _, ok := <-ch:
-			if ok {
-				// Receiving a value is fine (ok=true) iff a download had
-				// already completed before cancel; on the next read we'd
-				// see ok=false. The point is the channel is not blocking.
-			}
+		case <-ch:
 		default:
 			t.Errorf("slot %d not closed (would block consumer)", i)
 		}
@@ -774,13 +796,17 @@ func TestPrefetchAllNoLeakWhenConsumerAbandonsMidStream(t *testing.T) {
 }
 
 func TestPrefetchAllInFlightDownloadsCleanedUp(t *testing.T) {
-	// The trickiest race: a download that's still in flight when cancel
-	// fires. The goroutine's post-download ctx.Err() check must remove
-	// the temp file rather than send it. Use a gate that releases AFTER
-	// cancel to force this ordering.
+	// The trickiest race: a download has already written its file when
+	// ctx is canceled. The goroutine's post-download ctx.Err() branch
+	// must remove the temp file rather than send it to the slot.
+	//
+	// The fake writes the file BEFORE waiting on `gate`, so when we
+	// cancel and then release the gate, both gated downloads return
+	// (path, nil) and prefetchAll's post-download check observes
+	// ctx.Err() != nil → must call removeTempFile(path).
 	dir := t.TempDir()
 	gate := make(chan struct{})
-	fd := &fakeDownloader{dir: dir, gate: gate}
+	fd := &fakeDownloader{dir: dir, postWriteGate: gate}
 
 	files := []string{"a", "b", "c", "d"}
 	slots := makeSlots(len(files))
@@ -793,11 +819,14 @@ func TestPrefetchAllInFlightDownloadsCleanedUp(t *testing.T) {
 		close(done)
 	}()
 
-	// Cancel BEFORE releasing the gate so in-flight downloads observe
-	// ctx.Done in their fake impl AND the post-download check.
-	time.Sleep(20 * time.Millisecond) // let the first 2 enter the gate
+	// Wait deterministically for both in-flight downloads to have written
+	// their temp files and parked at the gate.
+	fd.waitForStarted(t, 2)
+	if got := fd.created.Load(); got != 2 {
+		t.Fatalf("expected 2 temp files written, got %d", got)
+	}
 	cancel()
-	close(gate) // release whatever's waiting
+	close(gate)
 
 	select {
 	case <-done:
@@ -805,10 +834,60 @@ func TestPrefetchAllInFlightDownloadsCleanedUp(t *testing.T) {
 		t.Fatal("prefetchAll did not return")
 	}
 
-	// Drain anything that managed to land in slots before cancel propagated.
+	// Drain anything that landed in slots before cancel propagated.
 	drainSlots(slots)
 
 	if leftover := remainingFiles(t, dir); len(leftover) != 0 {
 		t.Errorf("temp files leaked from in-flight downloads: %v", leftover)
+	}
+}
+
+func TestPrefetchAllPropagatesDownloadError(t *testing.T) {
+	// A failed download must surface to the consumer via dlResult.err so
+	// the consumer (Fetch) can abort and clean up. Earlier successful
+	// downloads still arrive intact; later slots may still be in flight
+	// or unstarted depending on cancellation timing.
+	dir := t.TempDir()
+	fd := &fakeDownloader{dir: dir, failOn: "b"}
+
+	files := []string{"a", "b", "c"}
+	slots := makeSlots(len(files))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		prefetchAll(ctx, files, slots, 1, fd.fn())
+		close(done)
+	}()
+
+	// Slot 0 succeeds.
+	a := <-slots[0]
+	if a.err != nil {
+		t.Fatalf("slot 0: unexpected error: %v", a.err)
+	}
+	removeTempFile(a.path)
+
+	// Slot 1 carries the simulated download error.
+	b := <-slots[1]
+	if b.err == nil {
+		t.Fatal("slot 1: expected download error, got nil")
+	}
+	if b.path != "" {
+		t.Errorf("slot 1: expected empty path on error, got %q", b.path)
+	}
+
+	// Consumer would now cancel and drain.
+	cancel()
+	drainSlots(slots[2:])
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prefetchAll did not return")
+	}
+
+	if leftover := remainingFiles(t, dir); len(leftover) != 0 {
+		t.Errorf("temp files leaked: %v", leftover)
 	}
 }

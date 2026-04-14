@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -365,9 +366,15 @@ func prefetchAll(ctx context.Context, files []string, slots []chan dlResult, max
 				// Consumer is gone; clean up our temp file rather than send.
 				// Surface the underlying download error too — without this,
 				// a real failure (403, network) that races with cancellation
-				// would be invisible.
+				// would be invisible. Distinguish: a context error coinciding
+				// with cancellation is expected (Debug); any other error
+				// (403, DNS, throttling) is a real problem and warrants Warn.
 				if err != nil {
-					slog.Debug("download error discarded after cancel", "src", f, "error", err)
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						slog.Debug("download canceled", "src", f, "error", err)
+					} else {
+						slog.Warn("download error discarded after cancel", "src", f, "error", err)
+					}
 				}
 				removeTempFile(path)
 				return
