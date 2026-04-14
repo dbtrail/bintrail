@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-04-14
+
+### Fixed
+- BYOS agent now detects two classes of silent source-identity misattribution. (1) The source `@@server_uuid` is re-read every 60 seconds and compared against the UUID captured at startup; if the source MySQL restarts with a regenerated `auto.cnf`, fails over behind a VIP, or resolves to a different instance, the agent exits with an actionable error instead of continuing to stamp the stale UUID on every `MetadataRecord`. Transient DB errors on the identity tick are tolerated with a warning. (2) `byos.EnsurePartitionKey` writes a `.bintrail-partition-key` marker to the customer S3 prefix on first run and validates it on every subsequent run; a mismatch (e.g. upgrading across the `--index-dsn` UUID-vs-numeric partition-key cutover) hard-fails with a message explaining the cutover and the operator's remediation options. An additional startup warning fires in the BYOS+S3-without-index-dsn path so the chosen partition key appears in the banner (#196, #198, #228).
+
+### Changed
+- S3 archive downloads for `query`/`recover` are now a single-pass prefetch pipeline instead of a per-batch download-then-query loop. Up to 2 files are prefetched in parallel while DuckDB queries the current one; queries remain strictly sequential (one DuckDB query at a time), so peak per-query RAM is unchanged, and peak temp files on disk drops from 4 to 3. Early termination is now checked after every file rather than at batch boundaries, so wide time-range queries with `--limit` stop as soon as the collected results cannot be displaced by any later file. S3 download errors that race with consumer cancellation are now logged at Debug for context errors and Warn for real failures (403, DNS, throttling) so production problems surface (#225, #227).
+
 ## [0.5.5] - 2026-04-13
 
 ### Fixed
