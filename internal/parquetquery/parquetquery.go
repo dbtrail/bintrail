@@ -8,7 +8,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -364,17 +363,14 @@ func prefetchAll(ctx context.Context, files []string, slots []chan dlResult, max
 			path, err := download(ctx, f)
 			if ctx.Err() != nil {
 				// Consumer is gone; clean up our temp file rather than send.
-				// Surface the underlying download error too — without this,
-				// a real failure (403, network) that races with cancellation
-				// would be invisible. Distinguish: a context error coinciding
-				// with cancellation is expected (Debug); any other error
-				// (403, DNS, throttling) is a real problem and warrants Warn.
+				// Any error here is downstream of cancellation — a real S3
+				// download error (closed connection, request canceled by the
+				// transport, etc.) often does NOT wrap context.Canceled, so
+				// classifying by error type produces false positives. Real
+				// persistent S3 problems will resurface on the consumer's
+				// next non-canceled query via dr.err.
 				if err != nil {
-					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						slog.Debug("download canceled", "src", f, "error", err)
-					} else {
-						slog.Warn("download error discarded after cancel", "src", f, "error", err)
-					}
+					slog.Debug("download discarded after cancel", "src", f, "error", err)
 				}
 				removeTempFile(path)
 				return

@@ -842,6 +842,46 @@ func TestPrefetchAllInFlightDownloadsCleanedUp(t *testing.T) {
 	}
 }
 
+func TestPrefetchAllRespectsMaxInFlight(t *testing.T) {
+	// With maxInFlight=2, only 2 downloads should be in flight at any
+	// moment. We hold all downloads at preWriteGate; the 3rd attempt
+	// blocks on the semaphore inside prefetchAll, so its goroutine never
+	// launches and `started` stays at exactly 2 until the gate releases.
+	dir := t.TempDir()
+	gate := make(chan struct{})
+	fd := &fakeDownloader{dir: dir, preWriteGate: gate}
+
+	files := []string{"a", "b", "c", "d", "e"}
+	slots := makeSlots(len(files))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		prefetchAll(ctx, files, slots, 2, fd.fn())
+		close(done)
+	}()
+
+	// First two reach the gate; the rest are blocked at the semaphore.
+	// No settle delay is needed: the outer for loop in prefetchAll cannot
+	// launch goroutine 3 until a sem token is released, which cannot
+	// happen until the gate releases.
+	fd.waitForStarted(t, 2)
+	if got := fd.started.Load(); got != 2 {
+		t.Errorf("maxInFlight=2 violated: %d downloads started, want exactly 2", got)
+	}
+
+	// Wind down cleanly.
+	cancel()
+	close(gate)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prefetchAll did not return")
+	}
+	drainSlots(slots)
+}
+
 func TestPrefetchAllPropagatesDownloadError(t *testing.T) {
 	// A failed download must surface to the consumer via dlResult.err so
 	// the consumer (Fetch) can abort and clean up. Earlier successful
