@@ -1,9 +1,13 @@
 package parquetquery
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -632,4 +636,179 @@ func TestRemoveTempFileMissingIsNoOp(t *testing.T) {
 	// Should not warn or panic on missing files.
 	removeTempFile(filepath.Join(t.TempDir(), "does-not-exist.parquet"))
 	removeTempFile("") // empty path is also a no-op
+}
+
+// ─── prefetchAll (pipeline concurrency invariants) ─────────────────────────
+
+// fakeDownloader builds a downloadFn that creates real temp files in dir,
+// optionally blocking on a per-call basis to model slow downloads. Callers
+// can cancel mid-flight to exercise cleanup paths.
+type fakeDownloader struct {
+	dir     string
+	created atomic.Int32
+	gate    chan struct{} // closed → all calls return immediately; nil → no gating
+	failOn  string        // src that should return an error instead of a path
+}
+
+func (f *fakeDownloader) fn() downloadFn {
+	return func(ctx context.Context, src string) (string, error) {
+		if f.gate != nil {
+			select {
+			case <-f.gate:
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		if src == f.failOn {
+			return "", errors.New("simulated download failure")
+		}
+		path := filepath.Join(f.dir, fmt.Sprintf("dl-%d.parquet", f.created.Add(1)))
+		if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+}
+
+// remainingFiles returns the temp files in dir that haven't been deleted —
+// used to assert pipeline cleanup did its job.
+func remainingFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, e := range entries {
+		paths = append(paths, e.Name())
+	}
+	return paths
+}
+
+func makeSlots(n int) []chan dlResult {
+	slots := make([]chan dlResult, n)
+	for i := range slots {
+		slots[i] = make(chan dlResult, 1)
+	}
+	return slots
+}
+
+func TestPrefetchAllClosesEverySlotOnCancel(t *testing.T) {
+	// Cancellation must close every slot so the consumer's <-slots[i] never
+	// blocks forever. Mix of launched-but-pending downloads (held by gate)
+	// and unlaunched slots (semaphore not yet acquired).
+	dir := t.TempDir()
+	gate := make(chan struct{}) // never closed; fake downloads will block
+	fd := &fakeDownloader{dir: dir, gate: gate}
+
+	files := []string{"a", "b", "c", "d", "e"}
+	slots := makeSlots(len(files))
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		prefetchAll(ctx, files, slots, 2, fd.fn())
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prefetchAll did not return after cancel")
+	}
+
+	for i, ch := range slots {
+		select {
+		case _, ok := <-ch:
+			if ok {
+				// Receiving a value is fine (ok=true) iff a download had
+				// already completed before cancel; on the next read we'd
+				// see ok=false. The point is the channel is not blocking.
+			}
+		default:
+			t.Errorf("slot %d not closed (would block consumer)", i)
+		}
+	}
+}
+
+func TestPrefetchAllNoLeakWhenConsumerAbandonsMidStream(t *testing.T) {
+	// Simulates the consumer breaking on early termination: it reads one
+	// slot, then cancels and drains the rest. Every temp file the fake
+	// downloader created must be removed.
+	dir := t.TempDir()
+	fd := &fakeDownloader{dir: dir} // no gate — downloads complete immediately
+
+	files := []string{"a", "b", "c", "d", "e", "f"}
+	slots := makeSlots(len(files))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		prefetchAll(ctx, files, slots, 2, fd.fn())
+		close(done)
+	}()
+
+	// Consumer reads slot 0 and cleans up the temp file it received.
+	dr := <-slots[0]
+	if dr.err != nil {
+		t.Fatalf("unexpected error: %v", dr.err)
+	}
+	removeTempFile(dr.path)
+
+	// Mimic Fetch's early-termination path.
+	cancel()
+	drainSlots(slots[1:])
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prefetchAll did not return after cancel")
+	}
+
+	if leftover := remainingFiles(t, dir); len(leftover) != 0 {
+		t.Errorf("temp files leaked: %v", leftover)
+	}
+}
+
+func TestPrefetchAllInFlightDownloadsCleanedUp(t *testing.T) {
+	// The trickiest race: a download that's still in flight when cancel
+	// fires. The goroutine's post-download ctx.Err() check must remove
+	// the temp file rather than send it. Use a gate that releases AFTER
+	// cancel to force this ordering.
+	dir := t.TempDir()
+	gate := make(chan struct{})
+	fd := &fakeDownloader{dir: dir, gate: gate}
+
+	files := []string{"a", "b", "c", "d"}
+	slots := makeSlots(len(files))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		prefetchAll(ctx, files, slots, 2, fd.fn())
+		close(done)
+	}()
+
+	// Cancel BEFORE releasing the gate so in-flight downloads observe
+	// ctx.Done in their fake impl AND the post-download check.
+	time.Sleep(20 * time.Millisecond) // let the first 2 enter the gate
+	cancel()
+	close(gate) // release whatever's waiting
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prefetchAll did not return")
+	}
+
+	// Drain anything that managed to land in slots before cancel propagated.
+	drainSlots(slots)
+
+	if leftover := remainingFiles(t, dir); len(leftover) != 0 {
+		t.Errorf("temp files leaked from in-flight downloads: %v", leftover)
+	}
 }

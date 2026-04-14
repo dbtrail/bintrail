@@ -85,8 +85,9 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		// while DuckDB queries the current one. Queries remain strictly
 		// sequential — only one DuckDB query is active at a time, so peak
 		// RAM (DuckDB's per-query working set) is unchanged from a serial
-		// implementation. Peak temp files on disk: maxInFlightDownloads + 1
-		// (one being queried, the rest buffered as completed prefetches).
+		// implementation. Peak temp files on disk at any instant:
+		// maxInFlightDownloads + 1 (one being queried, the rest buffered
+		// as completed prefetches).
 		const maxInFlightDownloads = 2
 		slots := make([]chan dlResult, len(files))
 		for i := range slots {
@@ -94,7 +95,7 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		}
 		dlCtx, cancelDl := context.WithCancel(ctx)
 		defer cancelDl()
-		go dl.prefetchAll(dlCtx, files, slots, maxInFlightDownloads)
+		go prefetchAll(dlCtx, files, slots, maxInFlightDownloads, dl.download)
 
 		var results []query.ResultRow
 		for i := range files {
@@ -323,19 +324,24 @@ func (d *s3Downloader) download(ctx context.Context, s3URL string) (string, erro
 }
 
 // dlResult carries the outcome of a single S3 file download to the consumer.
-// path is the temp file path on disk (caller deletes); err is set when the
-// download itself failed.
+// path is the temp file path on disk (caller deletes); empty when err is set.
 type dlResult struct {
 	path string
 	src  string
 	err  error
 }
 
+// downloadFn fetches a remote file to a local temp path. The implementation
+// returns ("", err) on failure or (path, nil) on success. Abstracted as a
+// function (rather than a method on *s3Downloader) so tests can inject fakes.
+type downloadFn func(ctx context.Context, src string) (string, error)
+
 // prefetchAll downloads files into their slots with bounded parallelism.
 // Each slot is closed exactly once — by the per-file goroutine if it ran,
-// or by prefetchAll directly if cancellation prevented launch — so the
-// consumer's range/<-slots[i] always unblocks.
-func (d *s3Downloader) prefetchAll(ctx context.Context, files []string, slots []chan dlResult, maxInFlight int) {
+// by prefetchAll directly if cancellation prevented launch, or by the
+// goroutine's defer when cancellation arrives after download completes —
+// so the consumer's <-slots[i] always unblocks.
+func prefetchAll(ctx context.Context, files []string, slots []chan dlResult, maxInFlight int, download downloadFn) {
 	sem := make(chan struct{}, maxInFlight)
 	var wg sync.WaitGroup
 	for i, f := range files {
@@ -354,9 +360,15 @@ func (d *s3Downloader) prefetchAll(ctx context.Context, files []string, slots []
 			defer wg.Done()
 			defer func() { <-sem }()
 			defer close(slots[i])
-			path, err := d.download(ctx, f)
+			path, err := download(ctx, f)
 			if ctx.Err() != nil {
 				// Consumer is gone; clean up our temp file rather than send.
+				// Surface the underlying download error too — without this,
+				// a real failure (403, network) that races with cancellation
+				// would be invisible.
+				if err != nil {
+					slog.Debug("download error discarded after cancel", "src", f, "error", err)
+				}
 				removeTempFile(path)
 				return
 			}
