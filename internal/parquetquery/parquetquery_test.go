@@ -182,6 +182,73 @@ func TestBuildQueryLimitPerPK(t *testing.T) {
 	}
 }
 
+// TestLimitPerPK_appliedToEveryBuilder pins the invariant that every DuckDB
+// query builder in this package emits the QUALIFY clause when LimitPerPK is
+// set. A regression here (someone adds a new builder for a schema variant and
+// forgets limitPerPKClause, or removes it from one of the existing branches)
+// would silently skip the per-PK cap for that path while the other builders
+// still enforce it — the kind of inconsistent partial-coverage bug that's
+// hardest to reproduce in production.
+func TestLimitPerPK_appliedToEveryBuilder(t *testing.T) {
+	opts := query.Options{PKValuesIn: []string{"1", "2"}, LimitPerPK: 3, Limit: 50}
+	cols := map[string]bool{"connection_id": true}
+
+	cases := []struct {
+		name string
+		q    string
+	}{
+		{"buildQuery (glob)", mustBuildQuery(opts)},
+		{"buildQueryForFile", mustBuildQueryForFile(opts, cols)},
+		{"buildQueryFromFiles", mustBuildQueryFromFiles(opts)},
+		{"buildUnsortedQuery", mustBuildUnsorted(opts)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertContains(t, tc.q, "QUALIFY ROW_NUMBER() OVER (PARTITION BY pk_values")
+			assertContains(t, tc.q, "ORDER BY event_timestamp DESC, event_id DESC")
+		})
+	}
+}
+
+// TestLimitPerPK_omittedWhenZero is the negative counterpart: every builder
+// must NOT emit QUALIFY when LimitPerPK is 0. A spurious QUALIFY would force
+// DuckDB to allocate a window over every row for queries that don't need it.
+func TestLimitPerPK_omittedWhenZero(t *testing.T) {
+	opts := query.Options{Schema: "db", Table: "t", Limit: 50}
+	cols := map[string]bool{"connection_id": true}
+
+	for _, q := range []string{
+		mustBuildQuery(opts),
+		mustBuildQueryForFile(opts, cols),
+		mustBuildQueryFromFiles(opts),
+		mustBuildUnsorted(opts),
+	} {
+		if strings.Contains(q, "QUALIFY") {
+			t.Errorf("QUALIFY must not appear when LimitPerPK=0: %s", q)
+		}
+	}
+}
+
+func mustBuildQuery(opts query.Options) string {
+	q, _ := buildQuery("/arc/*.parquet", opts)
+	return q
+}
+
+func mustBuildQueryForFile(opts query.Options, cols map[string]bool) string {
+	q, _ := buildQueryForFile("/tmp/x.parquet", opts, cols)
+	return q
+}
+
+func mustBuildQueryFromFiles(opts query.Options) string {
+	q, _ := buildQueryFromFiles([]string{"s3://b/x.parquet"}, opts)
+	return q
+}
+
+func mustBuildUnsorted(opts query.Options) string {
+	q, _ := buildUnsortedQuery("/tmp/x.parquet", opts)
+	return q
+}
+
 func TestBuildQueryEventType(t *testing.T) {
 	et := parser.EventDelete
 	opts := query.Options{EventType: &et, Limit: 100}

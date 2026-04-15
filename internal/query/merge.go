@@ -29,11 +29,39 @@ func MergeResults(rows []ResultRow, limit int) []ResultRow {
 	return unique
 }
 
-// LimitPerPK trims rows to keep at most n events per pk_values value, keeping
-// the latest n (by event_timestamp, event_id). Input is expected to be sorted
-// ascending by (event_timestamp, event_id) — the shape produced by
-// MergeResults — and the output preserves that ordering. n <= 0 returns rows
-// unchanged.
+// MergeAndTrim runs the full post-fetch pipeline: dedup+sort via MergeResults,
+// then the per-PK cap, then the global cap. The order is load-bearing —
+// applying the global cap before the per-PK cap can truncate ASC-sorted early
+// events for one PK and starve others before the per-PK trim runs.
+//
+// Used by FetchMerged and by the CLI merge path. Exposing this as a helper
+// lets unit tests pin the ordering: a future refactor that swaps the sequence
+// or drops the per-PK re-trim will fail TestMergeAndTrim_perPKBeforeGlobal.
+func MergeAndTrim(rows []ResultRow, limit, limitPerPK int) []ResultRow {
+	rows = MergeResults(rows, 0)
+	if limitPerPK > 0 {
+		rows = LimitPerPK(rows, limitPerPK)
+	}
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows
+}
+
+// LimitPerPK trims rows to keep at most n per pk_values, preserving the input
+// ordering. Implementation: walk in reverse and keep the last n positional
+// occurrences per PK, so the helper only returns the timestamp-latest events
+// when the caller has already sorted the input ascending by
+// (event_timestamp, event_id) — the shape produced by MergeResults.
+//
+// Precondition: input must be sorted ascending by (event_timestamp, event_id).
+// When violated, the function still returns at most n rows per PK, but the
+// kept rows are the last n *positionally*, not the timestamp-latest. The
+// helper does not validate the sort order: the happy-path callers in this
+// repo all feed it post-MergeResults output where the sort is guaranteed,
+// and adding a sort check would hide a caller bug under a silent re-sort.
+//
+// n <= 0 returns rows unchanged.
 //
 // Used after MergeResults when each source has applied its own per-PK cap
 // independently: the union can still exceed n per PK across sources, so a

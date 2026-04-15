@@ -327,6 +327,72 @@ func TestRunRecover_pkWithBothSchemaAndTablePassesGuard(t *testing.T) {
 	}
 }
 
+func TestRunRecover_pksRequiresSchemaTable(t *testing.T) {
+	savedPKs, savedS, savedT, savedDry := rPKs, rSchema, rTable, rDryRun
+	t.Cleanup(func() { rPKs = savedPKs; rSchema = savedS; rTable = savedT; rDryRun = savedDry })
+
+	rDryRun = true
+	rPKs = []string{"1", "2"}
+	rSchema = ""
+	rTable = ""
+
+	err := runRecover(recoverCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --pks used without --schema/--table")
+	}
+	if !strings.Contains(err.Error(), "--pks requires") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunRecover_pkAndPksMutuallyExclusive(t *testing.T) {
+	savedPK, savedPKs, savedS, savedT, savedDry := rPK, rPKs, rSchema, rTable, rDryRun
+	t.Cleanup(func() {
+		rPK = savedPK
+		rPKs = savedPKs
+		rSchema = savedS
+		rTable = savedT
+		rDryRun = savedDry
+	})
+
+	rDryRun = true
+	rPK = "42"
+	rPKs = []string{"1", "2"}
+	rSchema = "db"
+	rTable = "t"
+
+	err := runRecover(recoverCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when both --pk and --pks are set")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunRecover_limitPerPKRequiresPK(t *testing.T) {
+	savedLPP, savedPK, savedPKs, savedDry := rLimitPerPK, rPK, rPKs, rDryRun
+	t.Cleanup(func() {
+		rLimitPerPK = savedLPP
+		rPK = savedPK
+		rPKs = savedPKs
+		rDryRun = savedDry
+	})
+
+	rDryRun = true
+	rLimitPerPK = 1
+	rPK = ""
+	rPKs = nil
+
+	err := runRecover(recoverCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --limit-per-pk set without --pk/--pks")
+	}
+	if !strings.Contains(err.Error(), "--limit-per-pk requires") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
 // TestRunRecover_validEventTypes verifies that INSERT, UPDATE, and DELETE are
 // all accepted by ParseEventType and do not trigger the event-type error.
 func TestRunRecover_validEventTypes(t *testing.T) {

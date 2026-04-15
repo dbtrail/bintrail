@@ -1290,6 +1290,57 @@ func TestSanitizeArchiveErrorMessage(t *testing.T) {
 	}
 }
 
+// ─── cleanPKList ─────────────────────────────────────────────────────────────
+
+func TestCleanPKList_dedupAndTrim(t *testing.T) {
+	got, err := cleanPKList([]string{"1", " 2 ", "1", "3", "2"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"1", "2", "3"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i, v := range want {
+		if got[i] != v {
+			t.Errorf("index %d: want %q got %q", i, v, got[i])
+		}
+	}
+}
+
+func TestCleanPKList_rejectsEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []string
+	}{
+		{"empty string", []string{""}},
+		{"whitespace only", []string{"   "}},
+		{"empty in middle", []string{"1", "", "2"}},
+		{"trailing comma artifact", []string{"1", "2", ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := cleanPKList(tc.in)
+			if err == nil {
+				t.Fatalf("expected error for input %v", tc.in)
+			}
+			if !strings.Contains(err.Error(), "--pks") {
+				t.Errorf("expected error to mention --pks, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestCleanPKList_nilAndEmpty(t *testing.T) {
+	got, err := cleanPKList(nil)
+	if err != nil || got != nil {
+		t.Errorf("expected (nil, nil) for nil input, got (%v, %v)", got, err)
+	}
+	got, err = cleanPKList([]string{})
+	if err != nil || len(got) != 0 {
+		t.Errorf("expected empty result for empty input, got (%v, %v)", got, err)
+	}
+}
+
 // ─── writeGroupedJSON ────────────────────────────────────────────────────────
 
 func TestWriteGroupedJSON_preservesInputOrderAndEmits_emptyGroups(t *testing.T) {

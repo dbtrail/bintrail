@@ -216,11 +216,6 @@ func FetchMerged(
 		return nil, plan, fmt.Errorf("all %d archive source(s) failed, cannot verify coverage: %w", len(archSources), lastArchiveErr)
 	}
 
-	rows = MergeResults(rows, o.Opts.Limit)
-	// Each source applied LimitPerPK independently. After dedup+sort, enforce
-	// the cap globally so the union does not exceed N events per pk_values.
-	if o.Opts.LimitPerPK > 0 {
-		rows = LimitPerPK(rows, o.Opts.LimitPerPK)
-	}
+	rows = MergeAndTrim(rows, o.Opts.Limit, o.Opts.LimitPerPK)
 	return rows, plan, nil
 }

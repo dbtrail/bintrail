@@ -111,6 +111,11 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	if qPK != "" && len(qPKs) > 0 {
 		return fmt.Errorf("--pk and --pks are mutually exclusive; use one or the other")
 	}
+	cleanedPKs, err := cleanPKList(qPKs)
+	if err != nil {
+		return err
+	}
+	qPKs = cleanedPKs
 	if qLimitPerPK < 0 {
 		return fmt.Errorf("--limit-per-pk must be >= 0")
 	}
@@ -279,10 +284,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		results = append(results, archResults...)
 	}
 
-	results = query.MergeResults(results, opts.Limit)
-	if opts.LimitPerPK > 0 {
-		results = query.LimitPerPK(results, opts.LimitPerPK)
-	}
+	results = query.MergeAndTrim(results, opts.Limit, opts.LimitPerPK)
 
 	var n int
 	if groupedJSON {
@@ -534,6 +536,37 @@ func eventTypeJSONName(t parser.EventType) string {
 	default:
 		return "UNKNOWN"
 	}
+}
+
+// cleanPKList normalizes the values collected from a --pks StringSliceVar flag:
+// trims surrounding whitespace, rejects empty entries, and deduplicates while
+// preserving input order. Duplicates are common when callers programmatically
+// compose the list (e.g. dbtrail SaaS batching N pending PKs with repeats from
+// retries); an unfiltered list would produce duplicate groups in grouped JSON
+// output and waste bind-parameter slots in the SQL IN clause.
+//
+// Returns an error on empty entries rather than silently dropping them — a
+// --pks=,, invocation almost certainly indicates a shell interpolation bug,
+// and silently treating it as --pks with zero values would return "0 rows"
+// success output for a broken command.
+func cleanPKList(pks []string) ([]string, error) {
+	if len(pks) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(pks))
+	out := make([]string, 0, len(pks))
+	for _, pk := range pks {
+		trimmed := strings.TrimSpace(pk)
+		if trimmed == "" {
+			return nil, fmt.Errorf("--pks: empty or whitespace-only PK value (after comma-split); check for stray commas")
+		}
+		if _, dup := seen[trimmed]; dup {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out, nil
 }
 
 // archiveSources returns the Hive-scoped archive source paths for the current

@@ -114,6 +114,11 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	if rPK != "" && len(rPKs) > 0 {
 		return fmt.Errorf("--pk and --pks are mutually exclusive; use one or the other")
 	}
+	cleanedPKs, err := cleanPKList(rPKs)
+	if err != nil {
+		return err
+	}
+	rPKs = cleanedPKs
 	if rLimitPerPK < 0 {
 		return fmt.Errorf("--limit-per-pk must be >= 0")
 	}
