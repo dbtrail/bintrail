@@ -3,6 +3,7 @@ package query
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/bintrail/internal/parser"
 )
@@ -164,6 +165,21 @@ func TestNormalizeSnapshotValue_jsonContainerParses(t *testing.T) {
 	}
 	if m["status"] != "open" {
 		t.Errorf("expected {status:open}; got %v", m)
+	}
+}
+
+// TestNormalizeSnapshotValue_timeFormatsUTC pins the UTC formatting contract:
+// TIMESTAMP/DATETIME columns scanned as time.Time must render as
+// "2006-01-02 15:04:05" UTC. A silent regression to time.Local (see the
+// earlier ParseTime UTC bug) would ship timezone-shifted strings in JSON
+// output.
+func TestNormalizeSnapshotValue_timeFormatsUTC(t *testing.T) {
+	// Non-UTC input should still format as UTC.
+	loc := time.FixedZone("UTC-5", -5*3600)
+	in := time.Date(2026, 4, 15, 13, 30, 45, 0, loc)
+	got := normalizeSnapshotValue(in)
+	if got != "2026-04-15 18:30:45" {
+		t.Errorf("normalizeSnapshotValue(non-UTC time) = %v, want \"2026-04-15 18:30:45\" (UTC-adjusted)", got)
 	}
 }
 
