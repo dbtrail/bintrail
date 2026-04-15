@@ -26,9 +26,10 @@ type ColumnEq struct {
 //   - Rejects empty or unsafe column names; the allowlist matches identifier
 //     characters (letters, digits, underscore) because the column name is
 //     interpolated into a JSON path literal (MySQL does not bind JSON paths).
-//   - The literal (unquoted) value "NULL" sets IsNull=true — this matches
-//     rows where the column is explicitly JSON null. To compare against the
-//     literal four-character string "NULL", quote it as '"NULL"'.
+//   - The literal (case-sensitive) value "NULL" sets IsNull=true — this
+//     matches rows where the column is explicitly JSON null. The string
+//     "NULL" is reserved as the sentinel; matching a column whose value is
+//     the literal four-character string "NULL" is not currently supported.
 func ParseColumnEq(entry string) (ColumnEq, error) {
 	col, val, ok := strings.Cut(entry, "=")
 	if !ok {

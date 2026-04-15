@@ -193,6 +193,38 @@ func TestBuildQuery_columnEq_unsafeColumnEmitsNoMatch(t *testing.T) {
 	}
 }
 
+func TestBuildQuery_columnEq_unsafeEntryDoesNotPoisonOthers(t *testing.T) {
+	// A rejected entry must not drop trailing safe filters. Pins the `continue`
+	// semantics in buildQuery — swapping it for `return` or `break` would
+	// silently scoop rows the safe filter was meant to exclude.
+	opts := Options{
+		Schema: "db",
+		Table:  "t",
+		ColumnEq: []ColumnEq{
+			{Column: "evil'); DROP--", Value: "x"},
+			{Column: "status", Value: "active"},
+		},
+		Limit: 10,
+	}
+	q, args := buildQuery(opts)
+
+	if !strings.Contains(q, "1=0") {
+		t.Errorf("expected unsafe entry to emit 1=0: %s", q)
+	}
+	if !strings.Contains(q, "JSON_UNQUOTE(JSON_EXTRACT(row_after, '$.status'))") {
+		t.Errorf("safe trailing entry was dropped: %s", q)
+	}
+	count := 0
+	for _, a := range args {
+		if s, ok := a.(string); ok && s == "active" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected safe value bound twice, got %d (args=%v)", count, args)
+	}
+}
+
 func TestBuildQuery_columnEq_nullSentinel(t *testing.T) {
 	opts := Options{
 		Schema:   "db",

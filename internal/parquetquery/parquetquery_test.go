@@ -250,6 +250,30 @@ func TestBuildQueryColumnEq_unsafeColumnEmitsNoMatch(t *testing.T) {
 	}
 }
 
+func TestBuildQueryColumnEq_unsafeEntryDoesNotPoisonOthers(t *testing.T) {
+	opts := query.Options{
+		Schema: "db",
+		Table:  "t",
+		ColumnEq: []query.ColumnEq{
+			{Column: "evil'); DROP--", Value: "x"},
+			{Column: "status", Value: "active"},
+		},
+		Limit: 100,
+	}
+	q, args := buildQuery("/arc/*.parquet", opts)
+	assertContains(t, q, "1=0")
+	assertContains(t, q, "json_extract_string(row_after, '$.status')")
+	count := 0
+	for _, a := range args {
+		if s, ok := a.(string); ok && s == "active" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected safe value bound twice, got %d (args=%v)", count, args)
+	}
+}
+
 func TestBuildQueryColumnEq_nullSentinel(t *testing.T) {
 	opts := query.Options{
 		Schema:   "db",
