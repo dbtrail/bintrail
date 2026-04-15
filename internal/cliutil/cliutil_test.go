@@ -49,6 +49,42 @@ func TestParseEventType_delete(t *testing.T) {
 	}
 }
 
+func TestParseEventType_snapshot(t *testing.T) {
+	got, err := ParseEventType("SNAPSHOT")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil || *got != parser.EventSnapshot {
+		t.Errorf("expected EventSnapshot, got %v", got)
+	}
+}
+
+func TestParseEventType_invalidMentionsSnapshot(t *testing.T) {
+	_, err := ParseEventType("PICK")
+	if err == nil {
+		t.Fatal("expected error for unknown event type")
+	}
+	// The error message lists valid types; SNAPSHOT must appear so future
+	// contributors who add a type remember to update the message.
+	if !contains(err.Error(), "SNAPSHOT") {
+		t.Errorf("error message should list SNAPSHOT as a valid type; got %q", err.Error())
+	}
+}
+
+// contains is a tiny stdlib-avoiding helper kept local to this test to match
+// the existing style in this file (no strings import).
+func contains(haystack, needle string) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}
+
 func TestParseEventType_caseInsensitive(t *testing.T) {
 	for _, input := range []string{"insert", "Insert", "iNsErT"} {
 		got, err := ParseEventType(input)

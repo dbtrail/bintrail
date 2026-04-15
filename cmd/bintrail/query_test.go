@@ -1377,3 +1377,166 @@ func TestWriteGroupedJSON_preservesInputOrderAndEmits_emptyGroups(t *testing.T) 
 		t.Errorf("expected empty events for PK with no matches, got %d", len(got.Results[2].Events))
 	}
 }
+
+// ─── --include-snapshot flag validation ───────────────────────────────────────
+
+func TestRunQuery_includeSnapshotRequiresBaseline(t *testing.T) {
+	saved := qIncludeSnapshot
+	savedB := qBaseline
+	t.Cleanup(func() { qIncludeSnapshot = saved; qBaseline = savedB })
+
+	qIncludeSnapshot = true
+	qBaseline = ""
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --include-snapshot used without --baseline")
+	}
+	if !strings.Contains(err.Error(), "--include-snapshot requires --baseline") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunQuery_includeSnapshotRequiresSchemaTable(t *testing.T) {
+	saved := qIncludeSnapshot
+	savedB, savedS, savedT := qBaseline, qSchema, qTable
+	t.Cleanup(func() {
+		qIncludeSnapshot = saved
+		qBaseline = savedB
+		qSchema = savedS
+		qTable = savedT
+	})
+
+	qIncludeSnapshot = true
+	qBaseline = "/data/baseline.parquet"
+	qSchema = ""
+	qTable = ""
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --include-snapshot used without --schema/--table")
+	}
+	if !strings.Contains(err.Error(), "--schema and --table") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunQuery_includeSnapshotConflictsWithProfile(t *testing.T) {
+	saved := qIncludeSnapshot
+	savedB, savedS, savedT, savedP := qBaseline, qSchema, qTable, qProfile
+	t.Cleanup(func() {
+		qIncludeSnapshot = saved
+		qBaseline = savedB
+		qSchema = savedS
+		qTable = savedT
+		qProfile = savedP
+	})
+
+	qIncludeSnapshot = true
+	qBaseline = "/data/baseline.parquet"
+	qSchema = "db"
+	qTable = "t"
+	qProfile = "rbac1"
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --include-snapshot combined with --profile (silent RBAC bypass)")
+	}
+	if !strings.Contains(err.Error(), "--profile cannot be combined with --include-snapshot") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunQuery_includeSnapshotRejectsPKFilter(t *testing.T) {
+	saved := qIncludeSnapshot
+	savedB, savedS, savedT, savedPK := qBaseline, qSchema, qTable, qPK
+	t.Cleanup(func() {
+		qIncludeSnapshot = saved
+		qBaseline = savedB
+		qSchema = savedS
+		qTable = savedT
+		qPK = savedPK
+	})
+
+	qIncludeSnapshot = true
+	qBaseline = "/data/baseline.parquet"
+	qSchema = "db"
+	qTable = "t"
+	qPK = "42"
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --pk combined with --include-snapshot (snapshot rows have no pk_values)")
+	}
+	if !strings.Contains(err.Error(), "--pk and --pks are not supported with --include-snapshot") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunQuery_baselineRequiresIncludeSnapshot(t *testing.T) {
+	saved := qIncludeSnapshot
+	savedB := qBaseline
+	t.Cleanup(func() { qIncludeSnapshot = saved; qBaseline = savedB })
+
+	qIncludeSnapshot = false
+	qBaseline = "/data/baseline.parquet"
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --baseline used without --include-snapshot")
+	}
+	if !strings.Contains(err.Error(), "--baseline requires --include-snapshot") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunQuery_eventTypeSnapshotRequiresIncludeSnapshot(t *testing.T) {
+	saved := qEventType
+	savedIS := qIncludeSnapshot
+	t.Cleanup(func() { qEventType = saved; qIncludeSnapshot = savedIS })
+
+	qEventType = "SNAPSHOT"
+	qIncludeSnapshot = false
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --event-type SNAPSHOT set without --include-snapshot")
+	}
+	if !strings.Contains(err.Error(), "--event-type SNAPSHOT requires --include-snapshot") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// ─── resolveSnapshotPath ──────────────────────────────────────────────────────
+
+func TestResolveSnapshotPath(t *testing.T) {
+	cases := []struct {
+		name     string
+		baseline string
+		schema   string
+		table    string
+		want     string
+	}{
+		{"direct .parquet path passes through", "/data/baseline.parquet", "db", "t", "/data/baseline.parquet"},
+		{"local dir appends schema/table", "/data/dir", "db", "t", "/data/dir/db/t.parquet"},
+		{"trailing slash collapsed", "/data/dir/", "db", "t", "/data/dir/db/t.parquet"},
+		{"s3 prefix appends schema/table", "s3://bucket/prefix/", "db", "t", "s3://bucket/prefix/db/t.parquet"},
+		{"s3 .parquet path passes through", "s3://bucket/file.parquet", "db", "t", "s3://bucket/file.parquet"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveSnapshotPath(tc.baseline, tc.schema, tc.table)
+			if got != tc.want {
+				t.Errorf("resolveSnapshotPath(%q,%q,%q) = %q, want %q", tc.baseline, tc.schema, tc.table, got, tc.want)
+			}
+		})
+	}
+}
+
+// ─── eventTypeJSONName ────────────────────────────────────────────────────────
+
+func TestEventTypeJSONName_snapshot(t *testing.T) {
+	if got := eventTypeJSONName(binparser.EventSnapshot); got != "SNAPSHOT" {
+		t.Errorf("eventTypeJSONName(EventSnapshot) = %q, want \"SNAPSHOT\"", got)
+	}
+}

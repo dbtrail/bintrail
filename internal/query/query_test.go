@@ -276,6 +276,7 @@ func TestEventTypeName(t *testing.T) {
 		{parser.EventInsert, "INSERT"},
 		{parser.EventUpdate, "UPDATE"},
 		{parser.EventDelete, "DELETE"},
+		{parser.EventSnapshot, "SNAPSHOT"},
 		{parser.EventType(99), "UNKNOWN"},
 	}
 	for _, tc := range cases {

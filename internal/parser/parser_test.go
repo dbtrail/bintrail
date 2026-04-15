@@ -10,6 +10,33 @@ import (
 	"github.com/dbtrail/bintrail/internal/metadata"
 )
 
+// ─── EventType wire-contract pin ──────────────────────────────────────────────
+
+// TestEventType_wireContract pins the integer values of every EventType
+// constant. SaaS-side consumers key off these integers across process
+// boundaries (dbtrail #1309/#1310), so a silent renumber would corrupt every
+// downstream consumer. Failure here means a contributor changed a constant —
+// re-check the SaaS ingestion before doing so.
+func TestEventType_wireContract(t *testing.T) {
+	cases := []struct {
+		name string
+		got  EventType
+		want uint8
+	}{
+		{"EventInsert", EventInsert, 1},
+		{"EventUpdate", EventUpdate, 2},
+		{"EventDelete", EventDelete, 3},
+		{"EventDDL", EventDDL, 4},
+		{"EventGTID", EventGTID, 5},
+		{"EventSnapshot", EventSnapshot, 6},
+	}
+	for _, tc := range cases {
+		if uint8(tc.got) != tc.want {
+			t.Errorf("%s = %d, want %d (wire contract: SaaS consumers key off this integer)", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
 // ─── ChangedColumns ───────────────────────────────────────────────────────────
 
 func TestChangedColumns_noChange(t *testing.T) {

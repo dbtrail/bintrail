@@ -25,8 +25,11 @@ func ParseEventType(s string) (*parser.EventType, error) {
 	case "DELETE":
 		et := parser.EventDelete
 		return &et, nil
+	case "SNAPSHOT":
+		et := parser.EventSnapshot
+		return &et, nil
 	default:
-		return nil, fmt.Errorf("invalid event type %q; must be INSERT, UPDATE, or DELETE", s)
+		return nil, fmt.Errorf("invalid event type %q; must be INSERT, UPDATE, DELETE, or SNAPSHOT", s)
 	}
 }
 
