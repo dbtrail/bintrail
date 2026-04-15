@@ -251,6 +251,7 @@ func TestBuildQueryColumnEq_unsafeColumnEmitsNoMatch(t *testing.T) {
 }
 
 func TestBuildQueryColumnEq_unsafeEntryDoesNotPoisonOthers(t *testing.T) {
+	// Parquet-side mirror of the MySQL columneq continue-semantics pin.
 	opts := query.Options{
 		Schema: "db",
 		Table:  "t",
