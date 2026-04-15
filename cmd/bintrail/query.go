@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/parquetquery"
+	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
 )
 
@@ -48,24 +50,26 @@ Examples:
 }
 
 var (
-	qIndexDSN   string
-	qSchema     string
-	qTable      string
-	qPK         string
-	qEventType  string
-	qGTID       string
-	qSince      string
-	qUntil      string
-	qChangedCol string
-	qColumnEq   []string
-	qFlag       string
-	qFormat     string
-	qLimit      int
-	qArchiveDir string
-	qArchiveS3  string
-	qBintrailID string
-	qProfile    string
-	qNoArchive  bool
+	qIndexDSN    string
+	qSchema      string
+	qTable       string
+	qPK          string
+	qPKs         []string
+	qLimitPerPK  int
+	qEventType   string
+	qGTID        string
+	qSince       string
+	qUntil       string
+	qChangedCol  string
+	qColumnEq    []string
+	qFlag        string
+	qFormat      string
+	qLimit       int
+	qArchiveDir  string
+	qArchiveS3   string
+	qBintrailID  string
+	qProfile     string
+	qNoArchive   bool
 )
 
 func init() {
@@ -73,6 +77,8 @@ func init() {
 	queryCmd.Flags().StringVar(&qSchema, "schema", "", "Filter by schema name")
 	queryCmd.Flags().StringVar(&qTable, "table", "", "Filter by table name")
 	queryCmd.Flags().StringVar(&qPK, "pk", "", "Filter by primary key value(s), pipe-delimited for composite PKs")
+	queryCmd.Flags().StringSliceVar(&qPKs, "pks", nil, "Filter by multiple primary key values (comma-separated, or repeat the flag); requires --schema and --table; mutually exclusive with --pk")
+	queryCmd.Flags().IntVar(&qLimitPerPK, "limit-per-pk", 0, "Cap returned events per pk_values to the latest N (0 = unlimited); requires --pk or --pks")
 	queryCmd.Flags().StringVar(&qEventType, "event-type", "", "Filter by event type: INSERT, UPDATE, or DELETE")
 	queryCmd.Flags().StringVar(&qGTID, "gtid", "", "Filter by GTID (e.g. uuid:42)")
 	queryCmd.Flags().StringVar(&qSince, "since", "", "Filter events at or after this time (2006-01-02 15:04:05)")
@@ -98,6 +104,23 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	// ── Validate flag combinations ────────────────────────────────────────────
 	if qPK != "" && (qSchema == "" || qTable == "") {
 		return fmt.Errorf("--pk requires both --schema and --table")
+	}
+	if len(qPKs) > 0 && (qSchema == "" || qTable == "") {
+		return fmt.Errorf("--pks requires both --schema and --table")
+	}
+	if qPK != "" && len(qPKs) > 0 {
+		return fmt.Errorf("--pk and --pks are mutually exclusive; use one or the other")
+	}
+	cleanedPKs, err := cleanPKList(qPKs)
+	if err != nil {
+		return err
+	}
+	qPKs = cleanedPKs
+	if qLimitPerPK < 0 {
+		return fmt.Errorf("--limit-per-pk must be >= 0")
+	}
+	if qLimitPerPK > 0 && qPK == "" && len(qPKs) == 0 {
+		return fmt.Errorf("--limit-per-pk requires --pk or --pks")
 	}
 	if qChangedCol != "" && (qSchema == "" || qTable == "") {
 		return fmt.Errorf("--changed-column requires both --schema and --table")
@@ -140,6 +163,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		Schema:        qSchema,
 		Table:         qTable,
 		PKValues:      qPK,
+		PKValuesIn:    qPKs,
 		EventType:     eventType,
 		GTID:          qGTID,
 		Since:         since,
@@ -148,6 +172,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		ColumnEq:      columnEq,
 		Flag:          qFlag,
 		Limit:         qLimit,
+		LimitPerPK:    qLimitPerPK,
 	}
 
 	// ── Connect and fetch from the index ─────────────────────────────────────
@@ -196,8 +221,11 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 
 	// When no archive sources are configured, take the fast path (fetch + format
-	// in one step, same as before this feature was added).
-	if len(archSources) == 0 {
+	// in one step, same as before this feature was added). The grouped JSON
+	// output for --pks needs a separate formatting step, so fall through to
+	// the merge path when it's active.
+	groupedJSON := len(qPKs) > 0 && qFormat == "json"
+	if len(archSources) == 0 && !groupedJSON {
 		n, err := engine.Run(cmd.Context(), opts, qFormat, os.Stdout)
 		if err != nil {
 			return err
@@ -242,21 +270,28 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	// partial rows on timeout), it belongs here at the call site, not inside
 	// the helper. The helper's doc comment documents its own half of this
 	// contract.
-	archResults, err := queryArchiveSources(
-		cmd.Context(),
-		archSources,
-		fetchOpts,
-		parquetquery.Fetch,
-		os.Stderr,
-	)
-	if err != nil {
-		return err
+	if len(archSources) > 0 {
+		archResults, err := queryArchiveSources(
+			cmd.Context(),
+			archSources,
+			fetchOpts,
+			parquetquery.Fetch,
+			os.Stderr,
+		)
+		if err != nil {
+			return err
+		}
+		results = append(results, archResults...)
 	}
-	results = append(results, archResults...)
 
-	results = query.MergeResults(results, opts.Limit)
+	results = query.MergeAndTrim(results, opts.Limit, opts.LimitPerPK)
 
-	n, err := query.Format(results, qFormat, os.Stdout)
+	var n int
+	if groupedJSON {
+		n, err = writeGroupedJSON(qPKs, results, os.Stdout)
+	} else {
+		n, err = query.Format(results, qFormat, os.Stdout)
+	}
 	if err != nil {
 		return err
 	}
@@ -414,6 +449,124 @@ var lineBreakReplacer = strings.NewReplacer(
 // independently of the archive fetch loop.
 func sanitizeArchiveErrorMessage(err error) string {
 	return lineBreakReplacer.Replace(err.Error())
+}
+
+// writeGroupedJSON renders results as a JSON object grouping events by their
+// pk_values, in the order requested via --pks. PKs with no matching events
+// appear as empty groups so callers can correlate inputs to outputs without a
+// separate lookup. Returns the total number of events written across all
+// groups (matching the row-count semantic of query.Format for the truncation
+// warning at the call site).
+func writeGroupedJSON(pks []string, rows []query.ResultRow, w io.Writer) (int, error) {
+	type groupedEvent struct {
+		EventID        uint64         `json:"event_id"`
+		BinlogFile     string         `json:"binlog_file"`
+		StartPos       uint64         `json:"start_pos"`
+		EndPos         uint64         `json:"end_pos"`
+		EventTimestamp string         `json:"event_timestamp"`
+		GTID           *string        `json:"gtid"`
+		ConnectionID   *uint32        `json:"connection_id"`
+		SchemaName     string         `json:"schema_name"`
+		TableName      string         `json:"table_name"`
+		EventType      string         `json:"event_type"`
+		PKValues       string         `json:"pk_values"`
+		ChangedColumns []string       `json:"changed_columns"`
+		RowBefore      map[string]any `json:"row_before"`
+		RowAfter       map[string]any `json:"row_after"`
+	}
+	type group struct {
+		PK     string         `json:"pk"`
+		Events []groupedEvent `json:"events"`
+	}
+	type out struct {
+		Results []group `json:"results"`
+	}
+
+	byPK := make(map[string][]groupedEvent, len(pks))
+	for _, r := range rows {
+		ev := groupedEvent{
+			EventID:        r.EventID,
+			BinlogFile:     r.BinlogFile,
+			StartPos:       r.StartPos,
+			EndPos:         r.EndPos,
+			EventTimestamp: r.EventTimestamp.Format("2006-01-02 15:04:05"),
+			GTID:           r.GTID,
+			ConnectionID:   r.ConnectionID,
+			SchemaName:     r.SchemaName,
+			TableName:      r.TableName,
+			EventType:      eventTypeJSONName(r.EventType),
+			PKValues:       r.PKValues,
+			ChangedColumns: r.ChangedColumns,
+			RowBefore:      r.RowBefore,
+			RowAfter:       r.RowAfter,
+		}
+		byPK[r.PKValues] = append(byPK[r.PKValues], ev)
+	}
+
+	groups := make([]group, 0, len(pks))
+	total := 0
+	for _, pk := range pks {
+		evs := byPK[pk]
+		if evs == nil {
+			evs = []groupedEvent{}
+		}
+		groups = append(groups, group{PK: pk, Events: evs})
+		total += len(evs)
+	}
+
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(out{Results: groups}); err != nil {
+		return 0, fmt.Errorf("JSON encode failed: %w", err)
+	}
+	return total, nil
+}
+
+// eventTypeJSONName mirrors internal/query.eventTypeName (unexported) so the
+// grouped JSON output uses the same INSERT/UPDATE/DELETE strings as the flat
+// JSON formatter.
+func eventTypeJSONName(t parser.EventType) string {
+	switch t {
+	case parser.EventInsert:
+		return "INSERT"
+	case parser.EventUpdate:
+		return "UPDATE"
+	case parser.EventDelete:
+		return "DELETE"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// cleanPKList normalizes the values collected from a --pks StringSliceVar flag:
+// trims surrounding whitespace, rejects empty entries, and deduplicates while
+// preserving input order. Duplicates are common when callers programmatically
+// compose the list (e.g. dbtrail SaaS batching N pending PKs with repeats from
+// retries); an unfiltered list would produce duplicate groups in grouped JSON
+// output and waste bind-parameter slots in the SQL IN clause.
+//
+// Returns an error on empty entries rather than silently dropping them — a
+// --pks=,, invocation almost certainly indicates a shell interpolation bug,
+// and silently treating it as --pks with zero values would return "0 rows"
+// success output for a broken command.
+func cleanPKList(pks []string) ([]string, error) {
+	if len(pks) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(pks))
+	out := make([]string, 0, len(pks))
+	for _, pk := range pks {
+		trimmed := strings.TrimSpace(pk)
+		if trimmed == "" {
+			return nil, fmt.Errorf("--pks: empty or whitespace-only PK value (after comma-split); check for stray commas")
+		}
+		if _, dup := seen[trimmed]; dup {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out, nil
 }
 
 // archiveSources returns the Hive-scoped archive source paths for the current

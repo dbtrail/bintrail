@@ -216,6 +216,6 @@ func FetchMerged(
 		return nil, plan, fmt.Errorf("all %d archive source(s) failed, cannot verify coverage: %w", len(archSources), lastArchiveErr)
 	}
 
-	rows = MergeResults(rows, o.Opts.Limit)
+	rows = MergeAndTrim(rows, o.Opts.Limit, o.Opts.LimitPerPK)
 	return rows, plan, nil
 }
