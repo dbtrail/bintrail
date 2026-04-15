@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-04-15
+
 ### Added
 - `bintrail query` and `bintrail recover` now accept `--column-eq column=value`, a repeatable filter that matches events where a column inside `row_after` **or** `row_before` equals the given value. The OR across both sides covers DELETEs (value in `row_before`) and INSERTs (value in `row_after`) symmetrically. Repeating the flag composes AND. A column-name allowlist (`[A-Za-z0-9_]`) keeps the interpolated JSON path safe. The literal unquoted `NULL` sentinel matches rows where the column is explicitly JSON null (via `JSON_TYPE = 'NULL'`). The same filter is mirrored into the DuckDB archive path so merged live + archive queries stay consistent. MCP `query` and `recover` tools accept a matching `column_eq: [string]` parameter (#229).
+- `bintrail query` and `bintrail recover` now accept `--pks` (comma-separated or repeatable) and `--limit-per-pk N` for batched multi-PK lookups. On the archive path this collapses N sequential DuckDB scans into one pass with `WHERE pk_values IN (...)` and `QUALIFY ROW_NUMBER() OVER (PARTITION BY pk_values ORDER BY event_timestamp DESC, event_id DESC) <= N`; on the MySQL side a ROW_NUMBER subquery enforces the per-PK cap server-side. The primary workload is dbtrail SaaS's "find latest DELETE per PK" auto-detection pass, which now completes in a single invocation instead of N shell-outs re-opening MySQL and re-scanning the same parquet files each time. `bintrail query --pks=a,b,c --format=json` emits a grouped shape `{"results": [{"pk": "X", "events": [...]}, ...]}` preserving input order, with empty groups for PKs that had no matches so callers can correlate inputs to outputs without a second lookup. `--pk` keeps its existing SHA2-indexed fast path. `--pk` and `--pks` are mutually exclusive; `--limit-per-pk` requires one of them; empty or whitespace-only PKs in `--pks` are rejected with a clear error, and duplicates are deduplicated with first-occurrence-wins ordering. Cross-source merge applies the per-PK cap before the global `--limit` trim via a new shared `query.MergeAndTrim` helper, so a large `--limit-per-pk` cannot starve later PKs under the ASC-sorted global cutoff (#231).
 
 ## [0.5.6] - 2026-04-14
 
