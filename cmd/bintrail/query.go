@@ -70,6 +70,8 @@ var (
 	qBintrailID  string
 	qProfile     string
 	qNoArchive   bool
+	qIncludeSnapshot bool
+	qBaseline        string
 )
 
 func init() {
@@ -93,6 +95,8 @@ func init() {
 	queryCmd.Flags().StringVar(&qBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir or --archive-s3 is set)")
 	queryCmd.Flags().StringVar(&qProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	queryCmd.Flags().BoolVar(&qNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
+	queryCmd.Flags().BoolVar(&qIncludeSnapshot, "include-snapshot", false, "Also scan the mydumper baseline Parquet and emit matching rows as SNAPSHOT events (requires --baseline, --schema, --table)")
+	queryCmd.Flags().StringVar(&qBaseline, "baseline", "", "Path to a baseline Parquet file or directory containing <schema>/<table>.parquet (local path or s3:// URL); used with --include-snapshot")
 	_ = queryCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(queryCmd)
 
@@ -143,6 +147,19 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	if qNoArchive && (qArchiveDir != "" || qArchiveS3 != "") {
 		return fmt.Errorf("--no-archive cannot be combined with --archive-dir or --archive-s3")
+	}
+	if qIncludeSnapshot {
+		if qBaseline == "" {
+			return fmt.Errorf("--include-snapshot requires --baseline")
+		}
+		if qSchema == "" || qTable == "" {
+			return fmt.Errorf("--include-snapshot requires both --schema and --table")
+		}
+		if qProfile != "" {
+			return fmt.Errorf("--profile cannot be combined with --include-snapshot")
+		}
+	} else if qBaseline != "" {
+		return fmt.Errorf("--baseline requires --include-snapshot")
 	}
 
 	// ── Parse filter values ───────────────────────────────────────────────────
@@ -225,7 +242,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	// output for --pks needs a separate formatting step, so fall through to
 	// the merge path when it's active.
 	groupedJSON := len(qPKs) > 0 && qFormat == "json"
-	if len(archSources) == 0 && !groupedJSON {
+	if len(archSources) == 0 && !groupedJSON && !qIncludeSnapshot {
 		n, err := engine.Run(cmd.Context(), opts, qFormat, os.Stdout)
 		if err != nil {
 			return err
@@ -282,6 +299,15 @@ func runQuery(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		results = append(results, archResults...)
+	}
+
+	if qIncludeSnapshot {
+		snapPath := resolveSnapshotPath(qBaseline, qSchema, qTable)
+		snapRows, err := query.FetchSnapshot(cmd.Context(), snapPath, fetchOpts)
+		if err != nil {
+			return fmt.Errorf("snapshot query: %w", err)
+		}
+		results = append(results, snapRows...)
 	}
 
 	results = query.MergeAndTrim(results, opts.Limit, opts.LimitPerPK)
@@ -533,6 +559,8 @@ func eventTypeJSONName(t parser.EventType) string {
 		return "UPDATE"
 	case parser.EventDelete:
 		return "DELETE"
+	case parser.EventSnapshot:
+		return "SNAPSHOT"
 	default:
 		return "UNKNOWN"
 	}
@@ -567,6 +595,17 @@ func cleanPKList(pks []string) ([]string, error) {
 		out = append(out, trimmed)
 	}
 	return out, nil
+}
+
+// resolveSnapshotPath resolves the --baseline flag to a concrete <schema>/<table>.parquet
+// path. If the user passed a direct .parquet path, it's returned unchanged;
+// otherwise the baseline is treated as a directory (local or s3://) and
+// "/<schema>/<table>.parquet" is appended.
+func resolveSnapshotPath(baseline, schema, table string) string {
+	if strings.HasSuffix(baseline, ".parquet") {
+		return baseline
+	}
+	return strings.TrimSuffix(baseline, "/") + "/" + schema + "/" + table + ".parquet"
 }
 
 // archiveSources returns the Hive-scoped archive source paths for the current

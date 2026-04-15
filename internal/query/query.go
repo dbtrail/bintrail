@@ -572,6 +572,8 @@ func eventTypeName(et parser.EventType) string {
 		return "UPDATE"
 	case parser.EventDelete:
 		return "DELETE"
+	case parser.EventSnapshot:
+		return "SNAPSHOT"
 	default:
 		return "UNKNOWN"
 	}

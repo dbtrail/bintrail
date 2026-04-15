@@ -31,6 +31,11 @@ const (
 	EventDelete EventType = 3
 	EventDDL    EventType = 4
 	EventGTID   EventType = 5 // GTID-only tracking event (no row data)
+	// EventSnapshot is a synthetic event type emitted by query --include-snapshot
+	// for rows read from a mydumper baseline Parquet file. The parser never
+	// produces this type — it exists so baseline rows can flow through the
+	// same ResultRow pipeline as real binlog events.
+	EventSnapshot EventType = 6
 )
 
 // Event is a fully resolved binlog row event with column names attached.
