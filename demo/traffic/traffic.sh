@@ -12,9 +12,22 @@ MYSQL_USER="${MYSQL_USER:-root}"
 MYSQL_PASS="${MYSQL_PASS:-demo}"
 MYSQL_DB="${MYSQL_DB:-demo}"
 
+# Every mysql invocation is guarded against half-open TCP sockets:
+#   --connect-timeout=10    → 10s cap on the handshake
+#   --init-command=...      → 30s server-side read/write/wait timeouts +
+#                             15s cap on any SELECT via max_execution_time
+#   timeout 60 ...          → belt-and-suspenders: if mysql somehow ignores
+#                             every knob above, SIGKILL after 60s wall-clock
+#                             (catches DML hangs that max_execution_time
+#                             does not cover on MySQL 8)
+# `set -e` + compose `restart: on-failure` then cycle the container so the
+# loop recovers from transient network blips.
 mysql_cmd() {
-    mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASS" \
-          --protocol=tcp --silent "$@"
+    timeout 60 mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASS" \
+          --protocol=tcp --silent \
+          --connect-timeout=10 \
+          --init-command="SET SESSION wait_timeout=30, net_read_timeout=30, net_write_timeout=30, max_execution_time=15000" \
+          "$@"
 }
 
 sql() {
@@ -43,6 +56,10 @@ SYSBENCH_ARGS=(
     --mysql-db=sbtest
     --tables=4
     --table-size=1000
+    # Match the chaos loop's half-open TCP guard — without this, a
+    # transient blip can leave sysbench's connection pool wedged
+    # indefinitely while the chaos loop exits and restarts.
+    --mysql-connect-timeout=10
 )
 
 log "Cleaning up any existing sysbench tables (idempotent on restart)..."
