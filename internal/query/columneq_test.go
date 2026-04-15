@@ -37,6 +37,11 @@ func TestParseColumnEq_nullSentinel(t *testing.T) {
 	if !eq.IsNull {
 		t.Error("expected IsNull=true for literal NULL")
 	}
+	// Value must be cleared so a future caller that forgets to check IsNull
+	// cannot bind the literal string "NULL".
+	if eq.Value != "" {
+		t.Errorf("expected Value cleared, got %q", eq.Value)
+	}
 }
 
 func TestParseColumnEq_quotedNullIsNotSentinel(t *testing.T) {
@@ -161,6 +166,30 @@ func TestBuildQuery_columnEq_multipleEntriesAND(t *testing.T) {
 	}
 	if values != 4 {
 		t.Errorf("expected 4 value bindings, got %d (args=%v)", values, args)
+	}
+}
+
+func TestBuildQuery_columnEq_unsafeColumnEmitsNoMatch(t *testing.T) {
+	// A hand-built ColumnEq that bypassed ParseColumnEq must not reach the
+	// SQL string. The builder degrades to a no-match clause instead.
+	opts := Options{
+		Schema:   "db",
+		Table:    "t",
+		ColumnEq: []ColumnEq{{Column: "evil'); DROP--", Value: "x"}},
+		Limit:    10,
+	}
+	q, args := buildQuery(opts)
+
+	if !strings.Contains(q, "1=0") {
+		t.Errorf("expected no-match clause '1=0', got: %s", q)
+	}
+	if strings.Contains(q, "evil") {
+		t.Errorf("unsafe column name leaked into SQL: %s", q)
+	}
+	for _, a := range args {
+		if s, ok := a.(string); ok && s == "x" {
+			t.Errorf("unsafe entry's value bound: %v", args)
+		}
 	}
 }
 

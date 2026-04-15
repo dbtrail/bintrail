@@ -38,12 +38,16 @@ func ParseColumnEq(entry string) (ColumnEq, error) {
 	if col == "" {
 		return ColumnEq{}, fmt.Errorf("--column-eq entry %q has empty column name", entry)
 	}
-	if !isSafeColumnName(col) {
+	if !IsSafeColumnName(col) {
 		return ColumnEq{}, fmt.Errorf("--column-eq column name %q must match [A-Za-z0-9_]+", col)
 	}
 	eq := ColumnEq{Column: col, Value: val}
 	if val == "NULL" {
+		// Null-sentinel branch binds no positional arg; clear the value so a
+		// future caller that forgets to check IsNull cannot silently bind the
+		// literal string "NULL".
 		eq.IsNull = true
+		eq.Value = ""
 	}
 	return eq, nil
 }
@@ -64,7 +68,11 @@ func ParseColumnEqs(entries []string) ([]ColumnEq, error) {
 	return out, nil
 }
 
-func isSafeColumnName(col string) bool {
+// IsSafeColumnName reports whether col matches the JSON-path-safe allowlist
+// ([A-Za-z0-9_]+). Exposed for use as a defense-in-depth check at SQL builder
+// boundaries — `Options.ColumnEq` crosses package and process boundaries (CLI,
+// MCP), so callers other than ParseColumnEq cannot be assumed to have validated.
+func IsSafeColumnName(col string) bool {
 	if col == "" {
 		return false
 	}

@@ -231,6 +231,25 @@ func TestBuildQueryColumnEq(t *testing.T) {
 	}
 }
 
+func TestBuildQueryColumnEq_unsafeColumnEmitsNoMatch(t *testing.T) {
+	opts := query.Options{
+		Schema:   "db",
+		Table:    "t",
+		ColumnEq: []query.ColumnEq{{Column: "evil'); DROP--", Value: "x"}},
+		Limit:    100,
+	}
+	q, args := buildQuery("/arc/*.parquet", opts)
+	assertContains(t, q, "1=0")
+	if strings.Contains(q, "evil") {
+		t.Errorf("unsafe column name leaked into SQL: %s", q)
+	}
+	for _, a := range args {
+		if s, ok := a.(string); ok && s == "x" {
+			t.Errorf("unsafe entry's value bound: %v", args)
+		}
+	}
+}
+
 func TestBuildQueryColumnEq_nullSentinel(t *testing.T) {
 	opts := query.Options{
 		Schema:   "db",

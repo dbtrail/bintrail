@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -252,10 +253,20 @@ func buildQuery(opts Options) (string, []any) {
 		args = append(args, string(needle))
 	}
 	for _, ce := range opts.ColumnEq {
-		// Column name is allowlisted by ParseColumnEq to [A-Za-z0-9_], so
-		// interpolating it into the JSON path literal is safe. MySQL does not
-		// accept bind parameters for JSON paths, so the column name MUST be
-		// embedded in the SQL string.
+		// Defense-in-depth: ParseColumnEq is the canonical entry, but
+		// Options.ColumnEq is exported and crosses package/process boundaries
+		// (CLI, MCP, library callers). MySQL does not accept bind parameters
+		// for JSON paths, so the column name MUST be interpolated into the SQL
+		// string — re-validate here so a hand-built ColumnEq cannot reach the
+		// concatenation. On failure, emit "1=0" so the result set is provably
+		// empty rather than silently broader (a dropped filter would scoop
+		// rows the operator never asked for).
+		if !IsSafeColumnName(ce.Column) {
+			slog.Error("query.buildQuery: rejected unsafe column name in ColumnEq filter; emitting no-match clause",
+				"column", ce.Column)
+			where = append(where, "1=0")
+			continue
+		}
 		path := "$." + ce.Column
 		if ce.IsNull {
 			where = append(where, fmt.Sprintf(

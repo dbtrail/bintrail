@@ -82,7 +82,9 @@ JSON_UNQUOTE(JSON_EXTRACT(row_before, '$.status')) = 'active'
 bintrail query --schema mydb --table orders --column-eq deleted_at=NULL
 ```
 
-Internally this translates to `JSON_TYPE(JSON_EXTRACT(..., '$.deleted_at')) = 'NULL'` on both sides. It does **not** match rows where the column is absent from the row image (FULL row images always include every column, so absence only occurs when the source has `binlog_row_image != FULL`, which `bintrail index` rejects). To match the literal four-character string `"NULL"` instead, quote it: `--column-eq label='"NULL"'`.
+Internally this translates to `JSON_TYPE(JSON_EXTRACT(..., '$.deleted_at')) = 'NULL'` on both sides. It does **not** match rows where the column is absent from the row image (FULL row images always include every column, so absence only occurs when the source has `binlog_row_image != FULL`, which `bintrail index` rejects).
+
+The literal value `NULL` is reserved as the JSON-null sentinel — there is currently no escape for matching a column whose value is the four-character string `"NULL"`. If you need that, file an issue.
 
 The same filter is applied to DuckDB when archive auto-discovery routes the query through Parquet files (`json_extract_string` / `json_type`), so merged (live + archive) results stay consistent.
 
