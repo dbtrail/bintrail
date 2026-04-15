@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-04-15
+
+### Added
+- `bintrail query` accepts `--include-snapshot` + `--baseline <path-or-s3-url>` to merge a mydumper baseline Parquet as a third source alongside the live MySQL index and S3 archive. Baseline rows are emitted as synthetic `SNAPSHOT` events (new `parser.EventSnapshot = 6`) with the baseline's `snapshot_timestamp` metadata as their `event_timestamp`, so they flow through the existing `MergeAndTrim` pipeline and slot into sorted output before any subsequent binlog event for the same PK. Filter semantics: `--column-eq` hits the typed Parquet column via DuckDB `CAST(… AS VARCHAR) = ?` (index-friendly equality, no `JSON_EXTRACT`); `--event-type ≠ SNAPSHOT`, `--gtid`, `--changed-column`, `--flag` all exclude the snapshot source with a visible `slog.Info` reason; `--since`/`--until` compare against the baseline's recorded creation timestamp. `--include-snapshot` rejects combinations that would silently produce wrong data (`--pk`/`--pks`: snapshot rows have no `pk_values` in this release; `--profile`: RBAC rules are not applied to snapshot rows) and requires `--baseline` + `--schema` + `--table`. `--event-type SNAPSHOT` without `--include-snapshot` is rejected (previously silently returned zero rows). Unblocks dbtrail SaaS Phase 2 FK-aware cascade victim reconstruction for rows that existed before streaming began (#234).
+
 ## [0.5.7] - 2026-04-15
 
 ### Added
