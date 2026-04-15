@@ -105,6 +105,7 @@ SYSBENCH_PID=$!
 # ── Chaos loop ─────────────────────────────────────────────
 CYCLE=0
 LAST_SBTEST_K=""
+WATCHDOG_BLIND_COUNT=0
 log "Starting chaos loop..."
 
 while true; do
@@ -119,17 +120,33 @@ while true; do
     # Progress watchdog every 12 cycles (~2m).  kill -0 only detects a
     # DEAD sysbench; it cannot catch the "alive but stuck" case where the
     # worker is blocked on a half-open socket mid-query.  oltp_read_write
-    # runs `UPDATE sbtest1 SET k=k+1 WHERE id=?` as part of every
-    # transaction, so MAX(k) is a cheap, monotonic liveness signal.  If
-    # it doesn't move across two consecutive samples (~2m apart), the
-    # worker is wedged — exit and let compose cycle the container.
+    # runs `UPDATE sbtestN SET k=k+1` on every transaction (N random in
+    # 1..--tables), so SUM(MAX(k)) across all 4 tables is a cheap,
+    # monotonic liveness signal.  We also guard against the watchdog's
+    # OWN query failing permanently (CUR_K="" forever would silently
+    # disable detection): exit after 3 consecutive blind reads (~6m).
     if (( CYCLE > 0 && CYCLE % 12 == 0 )); then
-        CUR_K=$(mysql_cmd -N sbtest -e "SELECT MAX(k) FROM sbtest1" 2>/dev/null || true)
-        if [[ -n "$CUR_K" && "$CUR_K" == "$LAST_SBTEST_K" ]]; then
-            log "sysbench wedged: sbtest1.MAX(k)=$CUR_K unchanged across ~2m; exiting"
-            exit 1
+        CUR_K=$(mysql_cmd -N sbtest -e "
+            SELECT COALESCE(SUM(m), 0) FROM (
+                SELECT MAX(k) AS m FROM sbtest1
+                UNION ALL SELECT MAX(k) FROM sbtest2
+                UNION ALL SELECT MAX(k) FROM sbtest3
+                UNION ALL SELECT MAX(k) FROM sbtest4
+            ) t" 2>/dev/null || true)
+        if [[ -z "$CUR_K" ]]; then
+            WATCHDOG_BLIND_COUNT=$((WATCHDOG_BLIND_COUNT + 1))
+            if (( WATCHDOG_BLIND_COUNT >= 3 )); then
+                log "progress watchdog unreadable for 3 consecutive samples (~6m); exiting"
+                exit 1
+            fi
+        else
+            WATCHDOG_BLIND_COUNT=0
+            if [[ "$CUR_K" == "$LAST_SBTEST_K" ]]; then
+                log "sysbench wedged: SUM(MAX(k)) across sbtest1..4 = $CUR_K unchanged across ~2m; exiting"
+                exit 1
+            fi
+            LAST_SBTEST_K="$CUR_K"
         fi
-        LAST_SBTEST_K="$CUR_K"
     fi
 
     CYCLE=$((CYCLE + 1))
