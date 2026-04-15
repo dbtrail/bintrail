@@ -120,19 +120,33 @@ func TestMergeAndTrim_perPKBeforeGlobal(t *testing.T) {
 	}
 }
 
+// TestMergeAndTrim_crossSourceDedup exercises the two-step contract: dedup
+// collapses cross-source duplicates, and LimitPerPK then trims the deduped
+// set to the cap. The scenario is specifically constructed so that dedup
+// alone is NOT sufficient — PK "a" has 3 distinct events after dedup
+// (event IDs 1, 2, 3) plus duplicates of each from the archive source, and
+// LimitPerPK=2 must still fire to trim the deduped result down to 2. A
+// regression that drops LimitPerPK would leave len(got)==3 and fail this
+// test, whereas a regression that keeps the duplicates without running
+// LimitPerPK would leave len(got)==6.
 func TestMergeAndTrim_crossSourceDedup(t *testing.T) {
 	ts := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
-	// Same PK appears in both sources with the same event_id (MySQL + archive
-	// overlap). After MergeAndTrim with LimitPerPK=2 we expect the duplicate
-	// to be collapsed so the PK has at most 2 events, not 4.
 	rows := []ResultRow{
-		{EventID: 1, EventTimestamp: ts, PKValues: "a"},             // MySQL
-		{EventID: 2, EventTimestamp: ts.Add(time.Second), PKValues: "a"}, // MySQL
-		{EventID: 1, EventTimestamp: ts, PKValues: "a"},             // archive dup of 1
-		{EventID: 2, EventTimestamp: ts.Add(time.Second), PKValues: "a"}, // archive dup of 2
+		// MySQL side — three distinct events for PK "a".
+		{EventID: 1, EventTimestamp: ts, PKValues: "a"},
+		{EventID: 2, EventTimestamp: ts.Add(time.Second), PKValues: "a"},
+		{EventID: 3, EventTimestamp: ts.Add(2 * time.Second), PKValues: "a"},
+		// Archive side — duplicates of the same three events (overlap window).
+		{EventID: 1, EventTimestamp: ts, PKValues: "a"},
+		{EventID: 2, EventTimestamp: ts.Add(time.Second), PKValues: "a"},
+		{EventID: 3, EventTimestamp: ts.Add(2 * time.Second), PKValues: "a"},
 	}
 	got := MergeAndTrim(rows, 0, 2)
 	if len(got) != 2 {
-		t.Fatalf("expected 2 rows after dedup + per-PK trim, got %d", len(got))
+		t.Fatalf("expected 2 rows after dedup (3 unique) + LimitPerPK=2 trim, got %d", len(got))
+	}
+	// Latest two events kept: IDs 2 and 3 in ASC order.
+	if got[0].EventID != 2 || got[1].EventID != 3 {
+		t.Errorf("expected events [2,3] (latest 2 in ASC order), got %v", []uint64{got[0].EventID, got[1].EventID})
 	}
 }
