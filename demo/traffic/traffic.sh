@@ -12,21 +12,23 @@ MYSQL_USER="${MYSQL_USER:-root}"
 MYSQL_PASS="${MYSQL_PASS:-demo}"
 MYSQL_DB="${MYSQL_DB:-demo}"
 
-# Every mysql invocation is guarded against half-open TCP sockets:
+# Half-open TCP sockets (NAT idle, transient network blips, RDS-side
+# close) were freezing the chaos loop for hours without any error
+# surfacing.  Every mysql invocation is now guarded by four layers:
 #   --connect-timeout=10    → 10s cap on the handshake
-#   --init-command=...      → 30s server-side read/write/wait timeouts +
-#                             15s cap on any SELECT via max_execution_time
-#   timeout 60 ...          → belt-and-suspenders: if mysql somehow ignores
-#                             every knob above, SIGKILL after 60s wall-clock
-#                             (catches DML hangs that max_execution_time
-#                             does not cover on MySQL 8)
-# `set -e` + compose `restart: on-failure` then cycle the container so the
-# loop recovers from transient network blips.
+#   --init-command=...      → 30s server-side net_read_timeout /
+#                             net_write_timeout; 15s max_execution_time
+#                             cap (SELECTs only — DML is not covered on
+#                             MySQL 8, which motivates the outer wrapper)
+#   timeout 60 ...          → belt-and-suspenders: SIGKILL after 60s
+#                             wall-clock if mysql ignores every knob above
+# `set -e` + compose `restart: on-failure` then cycle the container so
+# the loop recovers from transient network blips.
 mysql_cmd() {
     timeout 60 mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASS" \
           --protocol=tcp --silent \
           --connect-timeout=10 \
-          --init-command="SET SESSION wait_timeout=30, net_read_timeout=30, net_write_timeout=30, max_execution_time=15000" \
+          --init-command="SET SESSION net_read_timeout=30, net_write_timeout=30, max_execution_time=15000" \
           "$@"
 }
 
@@ -66,7 +68,9 @@ log "Cleaning up any existing sysbench tables (idempotent on restart)..."
 sysbench oltp_read_write "${SYSBENCH_ARGS[@]}" cleanup 2>/dev/null || true
 
 log "Preparing sysbench tables..."
-sysbench oltp_read_write "${SYSBENCH_ARGS[@]}" prepare
+# 5 min cap — a half-open socket during prepare would otherwise wedge
+# container boot indefinitely with no chaos loop running at all.
+timeout 300 sysbench oltp_read_write "${SYSBENCH_ARGS[@]}" prepare
 
 log "Starting sysbench workload (background)..."
 sysbench oltp_read_write "${SYSBENCH_ARGS[@]}" \
@@ -81,6 +85,14 @@ CYCLE=0
 log "Starting chaos loop..."
 
 while true; do
+    # Guard against sysbench dying silently: if the background worker is
+    # gone, half the workload (sbtest.*) goes dark while demo.* continues
+    # looking healthy.  Exit so compose `restart: on-failure` cycles both.
+    if ! kill -0 "$SYSBENCH_PID" 2>/dev/null; then
+        log "sysbench worker (pid $SYSBENCH_PID) is gone; exiting to trigger container restart"
+        exit 1
+    fi
+
     CYCLE=$((CYCLE + 1))
     log "Chaos cycle $CYCLE"
 
