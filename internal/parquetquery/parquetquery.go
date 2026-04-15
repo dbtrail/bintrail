@@ -503,6 +503,10 @@ func buildQueryFromFiles(files []string, opts query.Options) (string, []any) {
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
+	if qual, qArgs := limitPerPKClause(opts); qual != "" {
+		q += qual
+		args = append(args, qArgs...)
+	}
 	q += " ORDER BY event_timestamp, event_id"
 	if opts.Limit > 0 {
 		q += " LIMIT ?"
@@ -538,6 +542,10 @@ func buildUnsortedQuery(path string, opts query.Options) (string, []any) {
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
+	if qual, qArgs := limitPerPKClause(opts); qual != "" {
+		q += qual
+		args = append(args, qArgs...)
+	}
 
 	return q, args
 }
@@ -558,6 +566,10 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
+	if qual, qArgs := limitPerPKClause(opts); qual != "" {
+		q += qual
+		args = append(args, qArgs...)
+	}
 	q += " ORDER BY event_timestamp, event_id"
 	if opts.Limit > 0 {
 		q += " LIMIT ?"
@@ -565,6 +577,19 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 	}
 
 	return q, args
+}
+
+// limitPerPKClause returns the DuckDB QUALIFY fragment that caps the result
+// to the latest LimitPerPK events per pk_values, plus the bind argument.
+// Returns ("", nil) when LimitPerPK is unset. Inner ORDER BY DESC mirrors
+// the MySQL ROW_NUMBER ordering in internal/query so both engines pick the
+// same events for a given filter.
+func limitPerPKClause(opts query.Options) (string, []any) {
+	if opts.LimitPerPK <= 0 {
+		return "", nil
+	}
+	return " QUALIFY ROW_NUMBER() OVER (PARTITION BY pk_values" +
+		" ORDER BY event_timestamp DESC, event_id DESC) <= ?", []any{opts.LimitPerPK}
 }
 
 // buildFilters extracts WHERE clause fragments and bind args from query options.
@@ -583,6 +608,13 @@ func buildFilters(opts query.Options) ([]string, []any) {
 	if opts.PKValues != "" {
 		where = append(where, "pk_values = ?")
 		args = append(args, opts.PKValues)
+	} else if len(opts.PKValuesIn) > 0 {
+		placeholders := make([]string, len(opts.PKValuesIn))
+		for i, v := range opts.PKValuesIn {
+			placeholders[i] = "?"
+			args = append(args, v)
+		}
+		where = append(where, "pk_values IN ("+strings.Join(placeholders, ",")+")")
 	}
 	if opts.EventType != nil {
 		where = append(where, "event_type = ?")
@@ -676,6 +708,10 @@ func buildQueryForFile(path string, opts query.Options, cols map[string]bool) (s
 		" FROM parquet_scan('" + safePath + "', hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	if qual, qArgs := limitPerPKClause(opts); qual != "" {
+		q += qual
+		args = append(args, qArgs...)
 	}
 	q += " ORDER BY event_timestamp, event_id"
 	if opts.Limit > 0 {

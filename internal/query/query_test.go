@@ -495,6 +495,90 @@ func TestApplyRedaction(t *testing.T) {
 	}
 }
 
+func TestBuildQuery_pkValuesIn(t *testing.T) {
+	opts := Options{Schema: "db", Table: "t", PKValuesIn: []string{"1", "2", "3"}, Limit: 10}
+	q, args := buildQuery(opts)
+
+	if !strings.Contains(q, "pk_values IN (?,?,?)") {
+		t.Errorf("expected pk_values IN (?,?,?) in query: %s", q)
+	}
+	if strings.Contains(q, "SHA2") {
+		t.Errorf("PKValuesIn must not use the SHA2 single-PK path: %s", q)
+	}
+	// Args order: schema, table, pk1, pk2, pk3, limit
+	wantArgs := []any{"db", "t", "1", "2", "3", 10}
+	if fmt.Sprintf("%v", args) != fmt.Sprintf("%v", wantArgs) {
+		t.Errorf("args mismatch: got %v want %v", args, wantArgs)
+	}
+}
+
+func TestBuildQuery_pkValues_winsOver_pkValuesIn(t *testing.T) {
+	// PKValues takes precedence so callers that set both (defensive callers)
+	// keep the SHA2-indexed fast path. PKValuesIn is silently ignored.
+	opts := Options{Schema: "db", Table: "t", PKValues: "42", PKValuesIn: []string{"1", "2"}, Limit: 5}
+	q, _ := buildQuery(opts)
+	if !strings.Contains(q, "pk_hash = SHA2(?, 256)") {
+		t.Errorf("PKValues must take precedence over PKValuesIn: %s", q)
+	}
+	if strings.Contains(q, "pk_values IN") {
+		t.Errorf("PKValuesIn must be ignored when PKValues is set: %s", q)
+	}
+}
+
+func TestBuildQuery_limitPerPK(t *testing.T) {
+	opts := Options{Schema: "db", Table: "t", PKValuesIn: []string{"1", "2"}, LimitPerPK: 1, Limit: 100}
+	q, args := buildQuery(opts)
+
+	if !strings.Contains(q, "ROW_NUMBER() OVER (PARTITION BY pk_values") {
+		t.Errorf("expected ROW_NUMBER window in query: %s", q)
+	}
+	if !strings.Contains(q, "ORDER BY event_timestamp DESC, event_id DESC") {
+		t.Errorf("expected DESC ordering inside window so latest events are kept: %s", q)
+	}
+	if !strings.Contains(q, "WHERE bt_rn <= ?") {
+		t.Errorf("expected outer WHERE bt_rn <= ?: %s", q)
+	}
+	// Outer ORDER BY remains ASC for stable global output.
+	if !strings.HasSuffix(strings.TrimSpace(strings.Split(q, "ORDER BY event_timestamp,")[1]), "event_id LIMIT ?") {
+		t.Errorf("expected outer ORDER BY event_timestamp, event_id ASC: %s", q)
+	}
+	// Args: schema, table, pk1, pk2, limitPerPK, limit
+	wantArgs := []any{"db", "t", "1", "2", 1, 100}
+	if fmt.Sprintf("%v", args) != fmt.Sprintf("%v", wantArgs) {
+		t.Errorf("args mismatch: got %v want %v", args, wantArgs)
+	}
+}
+
+func TestLimitPerPK_helper(t *testing.T) {
+	ts := func(s string) time.Time {
+		t, _ := time.Parse("2006-01-02 15:04:05", s)
+		return t
+	}
+	rows := []ResultRow{
+		{EventID: 1, EventTimestamp: ts("2026-04-15 10:00:00"), PKValues: "a"},
+		{EventID: 2, EventTimestamp: ts("2026-04-15 10:01:00"), PKValues: "b"},
+		{EventID: 3, EventTimestamp: ts("2026-04-15 10:02:00"), PKValues: "a"},
+		{EventID: 4, EventTimestamp: ts("2026-04-15 10:03:00"), PKValues: "a"},
+		{EventID: 5, EventTimestamp: ts("2026-04-15 10:04:00"), PKValues: "b"},
+	}
+	got := LimitPerPK(rows, 1)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 rows after limit-per-pk=1, got %d", len(got))
+	}
+	// Latest per PK: a→4, b→5; ordering preserved (ASC).
+	if got[0].EventID != 4 || got[1].EventID != 5 {
+		t.Errorf("expected events [4,5] (latest per PK in ASC order), got %v", []uint64{got[0].EventID, got[1].EventID})
+	}
+}
+
+func TestLimitPerPK_zero_passthrough(t *testing.T) {
+	rows := []ResultRow{{EventID: 1, PKValues: "a"}, {EventID: 2, PKValues: "a"}}
+	got := LimitPerPK(rows, 0)
+	if len(got) != 2 {
+		t.Errorf("LimitPerPK(_, 0) should be a passthrough, got %d rows", len(got))
+	}
+}
+
 func TestApplyRedaction_wrongTable(t *testing.T) {
 	rows := []ResultRow{{
 		SchemaName: "mydb",

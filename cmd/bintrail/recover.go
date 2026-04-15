@@ -51,22 +51,24 @@ Examples:
 }
 
 var (
-	rIndexDSN   string
-	rSchema     string
-	rTable      string
-	rPK         string
-	rEventType  string
-	rGTID       string
-	rSince      string
-	rUntil      string
-	rFlag       string
-	rOutput     string
-	rDryRun     bool
-	rLimit      int
-	rProfile    string
-	rFormat     string
-	rNoArchive  bool
-	rColumnEq   []string
+	rIndexDSN    string
+	rSchema      string
+	rTable       string
+	rPK          string
+	rPKs         []string
+	rLimitPerPK  int
+	rEventType   string
+	rGTID        string
+	rSince       string
+	rUntil       string
+	rFlag        string
+	rOutput      string
+	rDryRun      bool
+	rLimit       int
+	rProfile     string
+	rFormat      string
+	rNoArchive   bool
+	rColumnEq    []string
 )
 
 func init() {
@@ -74,6 +76,8 @@ func init() {
 	recoverCmd.Flags().StringVar(&rSchema, "schema", "", "Filter by schema name")
 	recoverCmd.Flags().StringVar(&rTable, "table", "", "Filter by table name")
 	recoverCmd.Flags().StringVar(&rPK, "pk", "", "Filter by primary key value(s), pipe-delimited for composite PKs")
+	recoverCmd.Flags().StringSliceVar(&rPKs, "pks", nil, "Filter by multiple primary key values (comma-separated, or repeat the flag); requires --schema and --table; mutually exclusive with --pk")
+	recoverCmd.Flags().IntVar(&rLimitPerPK, "limit-per-pk", 0, "Cap reversed events per pk_values to the latest N (0 = unlimited); requires --pk or --pks")
 	recoverCmd.Flags().StringVar(&rEventType, "event-type", "", "Filter by event type: INSERT, UPDATE, or DELETE")
 	recoverCmd.Flags().StringVar(&rGTID, "gtid", "", "Filter by GTID (e.g. uuid:42)")
 	recoverCmd.Flags().StringVar(&rSince, "since", "", "Filter events at or after this time (2006-01-02 15:04:05)")
@@ -104,6 +108,18 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	if rPK != "" && (rSchema == "" || rTable == "") {
 		return fmt.Errorf("--pk requires both --schema and --table")
 	}
+	if len(rPKs) > 0 && (rSchema == "" || rTable == "") {
+		return fmt.Errorf("--pks requires both --schema and --table")
+	}
+	if rPK != "" && len(rPKs) > 0 {
+		return fmt.Errorf("--pk and --pks are mutually exclusive; use one or the other")
+	}
+	if rLimitPerPK < 0 {
+		return fmt.Errorf("--limit-per-pk must be >= 0")
+	}
+	if rLimitPerPK > 0 && rPK == "" && len(rPKs) == 0 {
+		return fmt.Errorf("--limit-per-pk requires --pk or --pks")
+	}
 	if len(rColumnEq) > 0 && (rSchema == "" || rTable == "") {
 		return fmt.Errorf("--column-eq requires both --schema and --table")
 	}
@@ -127,16 +143,18 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	}
 
 	opts := query.Options{
-		Schema:    rSchema,
-		Table:     rTable,
-		PKValues:  rPK,
-		EventType: eventType,
-		GTID:      rGTID,
-		Since:     since,
-		Until:     until,
-		ColumnEq:  columnEq,
-		Flag:      rFlag,
-		Limit:     rLimit,
+		Schema:     rSchema,
+		Table:      rTable,
+		PKValues:   rPK,
+		PKValuesIn: rPKs,
+		EventType:  eventType,
+		GTID:       rGTID,
+		Since:      since,
+		Until:      until,
+		ColumnEq:   columnEq,
+		Flag:       rFlag,
+		Limit:      rLimit,
+		LimitPerPK: rLimitPerPK,
 	}
 
 	// ── Connect to index database ─────────────────────────────────────────────

@@ -109,6 +109,7 @@ type Options struct {
 	Schema        string
 	Table         string
 	PKValues      string            // pipe-delimited PK, e.g. "12345" or "12345|2"
+	PKValuesIn    []string          // multi-PK lookup (mutually exclusive with PKValues)
 	EventType     *parser.EventType // nil = all types
 	GTID          string
 	Since         *time.Time
@@ -117,6 +118,13 @@ type Options struct {
 	ColumnEq      []ColumnEq // match against values inside row_after / row_before
 	Flag          string     // return events from tables/columns carrying this flag
 	Limit         int        // 0 → default 100
+	// LimitPerPK caps the number of latest events returned per pk_values value.
+	// 0 = unlimited. Applied via ROW_NUMBER OVER (PARTITION BY pk_values
+	// ORDER BY event_timestamp DESC, event_id DESC) so the kept events are
+	// the most recent ones per PK. Only meaningful with PKValuesIn (or a
+	// single PKValues value). The outer ORDER BY remains ASC for stable
+	// global output.
+	LimitPerPK int
 
 	DenyTables    []SchemaTable       // tables excluded by RBAC profile
 	RedactColumns []SchemaTableColumn // column values nulled out by RBAC profile
@@ -215,6 +223,17 @@ func buildQuery(opts Options) (string, []any) {
 		// Use pk_hash for the index scan; pk_values for the collision guard.
 		where = append(where, "pk_hash = SHA2(?, 256) AND pk_values = ?")
 		args = append(args, opts.PKValues, opts.PKValues)
+	} else if len(opts.PKValuesIn) > 0 {
+		// Multi-PK lookup. The pk_hash generated column index can't help with
+		// IN-lists, so the planner falls back to per-partition scans pruned by
+		// (schema_name, table_name, event_timestamp). Callers supply schema
+		// and table to keep the scan bounded.
+		placeholders := make([]string, len(opts.PKValuesIn))
+		for i, v := range opts.PKValuesIn {
+			placeholders[i] = "?"
+			args = append(args, v)
+		}
+		where = append(where, "pk_values IN ("+strings.Join(placeholders, ",")+")")
 	}
 	if opts.EventType != nil {
 		where = append(where, "event_type = ?")
@@ -298,14 +317,31 @@ func buildQuery(opts Options) (string, []any) {
 		args = append(args, dt.Schema, dt.Table)
 	}
 
-	q := `SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp,
-	             gtid, connection_id, schema_name, table_name, event_type, pk_values,
-	             changed_columns, row_before, row_after, schema_version
-	      FROM binlog_events`
-	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ")
+	cols := `event_id, binlog_file, start_pos, end_pos, event_timestamp,
+	         gtid, connection_id, schema_name, table_name, event_type, pk_values,
+	         changed_columns, row_before, row_after, schema_version`
+
+	var q string
+	if opts.LimitPerPK > 0 {
+		// Per-PK cap via ROW_NUMBER. Inner ORDER BY DESC selects the latest
+		// events per pk_values; outer ORDER BY ASC keeps the global output
+		// shape identical to the no-cap path so callers don't see ordering
+		// drift between runs.
+		inner := "SELECT " + cols + ", ROW_NUMBER() OVER (PARTITION BY pk_values" +
+			" ORDER BY event_timestamp DESC, event_id DESC) AS bt_rn FROM binlog_events"
+		if len(where) > 0 {
+			inner += " WHERE " + strings.Join(where, " AND ")
+		}
+		q = "SELECT " + cols + " FROM (" + inner + ") AS t WHERE bt_rn <= ?"
+		args = append(args, opts.LimitPerPK)
+		q += " ORDER BY event_timestamp, event_id"
+	} else {
+		q = "SELECT " + cols + " FROM binlog_events"
+		if len(where) > 0 {
+			q += " WHERE " + strings.Join(where, " AND ")
+		}
+		q += " ORDER BY event_timestamp, event_id"
 	}
-	q += " ORDER BY event_timestamp, event_id"
 	if opts.Limit > 0 {
 		q += " LIMIT ?"
 		args = append(args, opts.Limit)

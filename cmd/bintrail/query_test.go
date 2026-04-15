@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	binparser "github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
 )
 
@@ -80,13 +82,65 @@ func TestQueryCmd_emptyStringDefaults(t *testing.T) {
 
 func TestQueryCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
-		"index-dsn", "schema", "table", "pk", "event-type",
+		"index-dsn", "schema", "table", "pk", "pks", "limit-per-pk", "event-type",
 		"gtid", "since", "until", "changed-column", "flag", "format", "limit",
 		"no-archive",
 	} {
 		if queryCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on queryCmd", name)
 		}
+	}
+}
+
+func TestRunQuery_pksRequiresSchemaTable(t *testing.T) {
+	saved, savedS, savedT := qPKs, qSchema, qTable
+	t.Cleanup(func() { qPKs = saved; qSchema = savedS; qTable = savedT })
+
+	qPKs = []string{"1", "2"}
+	qSchema = ""
+	qTable = ""
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --pks used without --schema/--table")
+	}
+	if !strings.Contains(err.Error(), "--pks requires") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunQuery_pkAndPksMutuallyExclusive(t *testing.T) {
+	savedPK, savedPKs, savedS, savedT := qPK, qPKs, qSchema, qTable
+	t.Cleanup(func() { qPK = savedPK; qPKs = savedPKs; qSchema = savedS; qTable = savedT })
+
+	qPK = "42"
+	qPKs = []string{"1", "2"}
+	qSchema = "db"
+	qTable = "t"
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when both --pk and --pks are set")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunQuery_limitPerPKRequiresPK(t *testing.T) {
+	savedLPP, savedPK, savedPKs := qLimitPerPK, qPK, qPKs
+	t.Cleanup(func() { qLimitPerPK = savedLPP; qPK = savedPK; qPKs = savedPKs })
+
+	qLimitPerPK = 1
+	qPK = ""
+	qPKs = nil
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --limit-per-pk set without --pk/--pks")
+	}
+	if !strings.Contains(err.Error(), "--limit-per-pk requires") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
@@ -1233,5 +1287,42 @@ func TestSanitizeArchiveErrorMessage(t *testing.T) {
 				t.Errorf("sanitizeArchiveErrorMessage(%q): got %q, want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// ─── writeGroupedJSON ────────────────────────────────────────────────────────
+
+func TestWriteGroupedJSON_preservesInputOrderAndEmits_emptyGroups(t *testing.T) {
+	rows := []query.ResultRow{
+		{EventID: 1, SchemaName: "db", TableName: "t", PKValues: "b", EventType: binparser.EventDelete},
+		{EventID: 2, SchemaName: "db", TableName: "t", PKValues: "a", EventType: binparser.EventDelete},
+	}
+	var buf bytes.Buffer
+	n, err := writeGroupedJSON([]string{"a", "b", "c"}, rows, &buf)
+	if err != nil {
+		t.Fatalf("writeGroupedJSON: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expected total=2 (one event per matched PK), got %d", n)
+	}
+
+	var got struct {
+		Results []struct {
+			PK     string           `json:"pk"`
+			Events []map[string]any `json:"events"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v\noutput: %s", err, buf.String())
+	}
+	if len(got.Results) != 3 {
+		t.Fatalf("expected 3 groups (one per input PK), got %d", len(got.Results))
+	}
+	// Input order preserved.
+	if got.Results[0].PK != "a" || got.Results[1].PK != "b" || got.Results[2].PK != "c" {
+		t.Errorf("group order mismatch: %v", []string{got.Results[0].PK, got.Results[1].PK, got.Results[2].PK})
+	}
+	if len(got.Results[2].Events) != 0 {
+		t.Errorf("expected empty events for PK with no matches, got %d", len(got.Results[2].Events))
 	}
 }

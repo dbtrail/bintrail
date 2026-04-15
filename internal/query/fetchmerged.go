@@ -217,5 +217,10 @@ func FetchMerged(
 	}
 
 	rows = MergeResults(rows, o.Opts.Limit)
+	// Each source applied LimitPerPK independently. After dedup+sort, enforce
+	// the cap globally so the union does not exceed N events per pk_values.
+	if o.Opts.LimitPerPK > 0 {
+		rows = LimitPerPK(rows, o.Opts.LimitPerPK)
+	}
 	return rows, plan, nil
 }

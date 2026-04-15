@@ -161,6 +161,27 @@ func TestBuildQueryPK(t *testing.T) {
 	}
 }
 
+func TestBuildQueryPKValuesIn(t *testing.T) {
+	opts := query.Options{PKValuesIn: []string{"1", "2", "3"}, Limit: 100}
+	q, args := buildQuery("/arc/*.parquet", opts)
+	assertContains(t, q, "pk_values IN (?,?,?)")
+	if got := args[:3]; got[0] != "1" || got[1] != "2" || got[2] != "3" {
+		t.Errorf("expected first three args [1 2 3], got %v", got)
+	}
+}
+
+func TestBuildQueryLimitPerPK(t *testing.T) {
+	opts := query.Options{PKValuesIn: []string{"1", "2"}, LimitPerPK: 1, Limit: 100}
+	q, args := buildQuery("/arc/*.parquet", opts)
+	assertContains(t, q, "QUALIFY ROW_NUMBER() OVER (PARTITION BY pk_values")
+	assertContains(t, q, "ORDER BY event_timestamp DESC, event_id DESC")
+	// Args order: pk1, pk2, limitPerPK, limit
+	wantTail := []any{1, 100}
+	if args[len(args)-2] != wantTail[0] || args[len(args)-1] != wantTail[1] {
+		t.Errorf("expected tail args [1 100], got %v", args[len(args)-2:])
+	}
+}
+
 func TestBuildQueryEventType(t *testing.T) {
 	et := parser.EventDelete
 	opts := query.Options{EventType: &et, Limit: 100}
