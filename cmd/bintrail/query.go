@@ -57,6 +57,7 @@ var (
 	qSince      string
 	qUntil      string
 	qChangedCol string
+	qColumnEq   []string
 	qFlag       string
 	qFormat     string
 	qLimit      int
@@ -77,6 +78,7 @@ func init() {
 	queryCmd.Flags().StringVar(&qSince, "since", "", "Filter events at or after this time (2006-01-02 15:04:05)")
 	queryCmd.Flags().StringVar(&qUntil, "until", "", "Filter events at or before this time (2006-01-02 15:04:05)")
 	queryCmd.Flags().StringVar(&qChangedCol, "changed-column", "", "Filter UPDATEs that modified this column")
+	queryCmd.Flags().StringArrayVar(&qColumnEq, "column-eq", nil, "Filter events where a column in row_after or row_before equals the given value (format: column=value, repeat for AND; literal NULL matches JSON null)")
 	queryCmd.Flags().StringVar(&qFlag, "flag", "", "Filter events from tables or columns carrying this flag (see 'bintrail flag list')")
 	queryCmd.Flags().StringVar(&qFormat, "format", "table", "Output format: table, json, or csv")
 	queryCmd.Flags().IntVar(&qLimit, "limit", 100, "Maximum number of rows to return")
@@ -99,6 +101,13 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	if qChangedCol != "" && (qSchema == "" || qTable == "") {
 		return fmt.Errorf("--changed-column requires both --schema and --table")
+	}
+	if len(qColumnEq) > 0 && (qSchema == "" || qTable == "") {
+		return fmt.Errorf("--column-eq requires both --schema and --table")
+	}
+	columnEq, err := query.ParseColumnEqs(qColumnEq)
+	if err != nil {
+		return err
 	}
 	if !cliutil.IsValidFormat(qFormat) {
 		return fmt.Errorf("invalid --format %q; must be table, json, or csv", qFormat)
@@ -136,6 +145,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		Since:         since,
 		Until:         until,
 		ChangedColumn: qChangedCol,
+		ColumnEq:      columnEq,
 		Flag:          qFlag,
 		Limit:         qLimit,
 	}

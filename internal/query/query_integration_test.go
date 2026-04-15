@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
@@ -145,6 +146,88 @@ func TestFetch_changedColumnFilter(t *testing.T) {
 	if len(rows) != 1 {
 		t.Errorf("expected 1 row for changed_column=status, got %d", len(rows))
 	}
+}
+
+func TestFetch_columnEqFilter(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	// InitIndexTables creates the original schema; apply the later ALTERs so
+	// the SELECT list (which includes connection_id) resolves.
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	ts := "2026-02-19 14:00:00"
+	// Event 1: INSERT with status=active in row_after.
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts, nil, "mydb", "orders", 1, "1",
+		nil, nil, []byte(`{"id":1,"status":"active","order_id":7}`))
+	// Event 2: DELETE with status=active only in row_before.
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ts, nil, "mydb", "orders", 3, "2",
+		nil, []byte(`{"id":2,"status":"active","order_id":8}`), nil)
+	// Event 3: INSERT with status=closed.
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, ts, nil, "mydb", "orders", 1, "3",
+		nil, nil, []byte(`{"id":3,"status":"closed","order_id":7}`))
+	// Event 4: UPDATE with nullable_col=null in row_after.
+	testutil.InsertEvent(t, db, "binlog.000001", 400, 500, ts, nil, "mydb", "orders", 2, "4",
+		[]byte(`["nullable_col"]`),
+		[]byte(`{"id":4,"nullable_col":"was"}`),
+		[]byte(`{"id":4,"nullable_col":null}`))
+
+	e := New(db)
+
+	// Plain match: status=active hits the INSERT (row_after) and DELETE (row_before).
+	t.Run("insertAndDelete", func(t *testing.T) {
+		rows, err := e.Fetch(context.Background(), Options{
+			Schema: "mydb", Table: "orders",
+			ColumnEq: []ColumnEq{{Column: "status", Value: "active"}},
+			Limit:    100,
+		})
+		if err != nil {
+			t.Fatalf("Fetch: %v", err)
+		}
+		if len(rows) != 2 {
+			t.Fatalf("expected 2 rows for status=active, got %d", len(rows))
+		}
+	})
+
+	// AND composition: status=active AND order_id=7 → only the INSERT.
+	t.Run("andComposition", func(t *testing.T) {
+		rows, err := e.Fetch(context.Background(), Options{
+			Schema: "mydb", Table: "orders",
+			ColumnEq: []ColumnEq{
+				{Column: "status", Value: "active"},
+				{Column: "order_id", Value: "7"},
+			},
+			Limit: 100,
+		})
+		if err != nil {
+			t.Fatalf("Fetch: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row for status=active AND order_id=7, got %d", len(rows))
+		}
+		if rows[0].PKValues != "1" {
+			t.Errorf("expected pk=1, got %q", rows[0].PKValues)
+		}
+	})
+
+	// NULL sentinel: nullable_col=NULL hits the UPDATE where row_after has JSON null.
+	t.Run("nullSentinel", func(t *testing.T) {
+		rows, err := e.Fetch(context.Background(), Options{
+			Schema: "mydb", Table: "orders",
+			ColumnEq: []ColumnEq{{Column: "nullable_col", IsNull: true}},
+			Limit:    100,
+		})
+		if err != nil {
+			t.Fatalf("Fetch: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row for nullable_col=NULL, got %d", len(rows))
+		}
+		if rows[0].PKValues != "4" {
+			t.Errorf("expected pk=4, got %q", rows[0].PKValues)
+		}
+	})
 }
 
 func TestRun_jsonFormat(t *testing.T) {

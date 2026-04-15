@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `bintrail query` and `bintrail recover` now accept `--column-eq column=value`, a repeatable filter that matches events where a column inside `row_after` **or** `row_before` equals the given value. The OR across both sides covers DELETEs (value in `row_before`) and INSERTs (value in `row_after`) symmetrically. Repeating the flag composes AND. A column-name allowlist (`[A-Za-z0-9_]`) keeps the interpolated JSON path safe. The literal unquoted `NULL` sentinel matches rows where the column is explicitly JSON null (via `JSON_TYPE = 'NULL'`). The same filter is mirrored into the DuckDB archive path so merged live + archive queries stay consistent. MCP `query` and `recover` tools accept a matching `column_eq: [string]` parameter (#229).
+
 ## [0.5.6] - 2026-04-14
 
 ### Fixed

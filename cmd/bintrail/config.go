@@ -99,6 +99,7 @@ var envSections = []envSection{
 		Bindings: []envTemplateEntry{
 			{"BINTRAIL_SCHEMAS", ""},
 			{"BINTRAIL_TABLES", ""},
+			{"BINTRAIL_COLUMN_EQ", ""},
 		},
 	},
 	{

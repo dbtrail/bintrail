@@ -66,6 +66,7 @@ var (
 	rProfile    string
 	rFormat     string
 	rNoArchive  bool
+	rColumnEq   []string
 )
 
 func init() {
@@ -78,6 +79,7 @@ func init() {
 	recoverCmd.Flags().StringVar(&rSince, "since", "", "Filter events at or after this time (2006-01-02 15:04:05)")
 	recoverCmd.Flags().StringVar(&rUntil, "until", "", "Filter events at or before this time (2006-01-02 15:04:05)")
 	recoverCmd.Flags().StringVar(&rFlag, "flag", "", "Filter events from tables or columns carrying this flag (see 'bintrail flag list')")
+	recoverCmd.Flags().StringArrayVar(&rColumnEq, "column-eq", nil, "Filter events where a column in row_after or row_before equals the given value (format: column=value, repeat for AND; literal NULL matches JSON null)")
 	recoverCmd.Flags().StringVar(&rOutput, "output", "", "Write recovery SQL to this file (required unless --dry-run)")
 	recoverCmd.Flags().BoolVar(&rDryRun, "dry-run", false, "Print recovery SQL to stdout instead of writing a file")
 	recoverCmd.Flags().IntVar(&rLimit, "limit", 1000, "Maximum number of events to reverse")
@@ -102,6 +104,13 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	if rPK != "" && (rSchema == "" || rTable == "") {
 		return fmt.Errorf("--pk requires both --schema and --table")
 	}
+	if len(rColumnEq) > 0 && (rSchema == "" || rTable == "") {
+		return fmt.Errorf("--column-eq requires both --schema and --table")
+	}
+	columnEq, err := query.ParseColumnEqs(rColumnEq)
+	if err != nil {
+		return err
+	}
 
 	// ── Parse filter values ───────────────────────────────────────────────────
 	eventType, err := cliutil.ParseEventType(rEventType)
@@ -125,6 +134,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		GTID:      rGTID,
 		Since:     since,
 		Until:     until,
+		ColumnEq:  columnEq,
 		Flag:      rFlag,
 		Limit:     rLimit,
 	}

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -113,8 +114,9 @@ type Options struct {
 	Since         *time.Time
 	Until         *time.Time
 	ChangedColumn string // column name; matched via JSON_CONTAINS
-	Flag          string // return events from tables/columns carrying this flag
-	Limit         int    // 0 → default 100
+	ColumnEq      []ColumnEq // match against values inside row_after / row_before
+	Flag          string     // return events from tables/columns carrying this flag
+	Limit         int        // 0 → default 100
 
 	DenyTables    []SchemaTable       // tables excluded by RBAC profile
 	RedactColumns []SchemaTableColumn // column values nulled out by RBAC profile
@@ -249,6 +251,35 @@ func buildQuery(opts Options) (string, []any) {
 		needle, _ := json.Marshal(opts.ChangedColumn)
 		where = append(where, "JSON_CONTAINS(changed_columns, ?)")
 		args = append(args, string(needle))
+	}
+	for _, ce := range opts.ColumnEq {
+		// Defense-in-depth: ParseColumnEq is the canonical entry, but
+		// Options.ColumnEq is exported and crosses package/process boundaries
+		// (CLI, MCP, library callers). MySQL does not accept bind parameters
+		// for JSON paths, so the column name MUST be interpolated into the SQL
+		// string — re-validate here so a hand-built ColumnEq cannot reach the
+		// concatenation. On failure, emit "1=0" so the result set is provably
+		// empty rather than silently broader (a dropped filter would scoop
+		// rows the operator never asked for).
+		if !IsSafeColumnName(ce.Column) {
+			slog.Error("query.buildQuery: rejected unsafe column name in ColumnEq filter; emitting no-match clause",
+				"column", ce.Column)
+			where = append(where, "1=0")
+			continue
+		}
+		path := "$." + ce.Column
+		if ce.IsNull {
+			where = append(where, fmt.Sprintf(
+				"(JSON_TYPE(JSON_EXTRACT(row_after, '%s')) = 'NULL' "+
+					"OR JSON_TYPE(JSON_EXTRACT(row_before, '%s')) = 'NULL')",
+				path, path))
+			continue
+		}
+		where = append(where, fmt.Sprintf(
+			"(JSON_UNQUOTE(JSON_EXTRACT(row_after, '%s')) = ? "+
+				"OR JSON_UNQUOTE(JSON_EXTRACT(row_before, '%s')) = ?)",
+			path, path))
+		args = append(args, ce.Value, ce.Value)
 	}
 	if opts.Flag != "" {
 		// EXISTS subquery: match events from tables (or columns) carrying the

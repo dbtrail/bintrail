@@ -605,6 +605,32 @@ func buildFilters(opts query.Options) ([]string, []any) {
 		where = append(where, "json_contains(changed_columns, ?)")
 		args = append(args, string(needle))
 	}
+	for _, ce := range opts.ColumnEq {
+		// DuckDB does not bind JSON paths either, so the column name is
+		// interpolated; re-validate via the shared allowlist for the same
+		// defense-in-depth reason as internal/query.buildQuery. DuckDB's
+		// json_type returns uppercase 'NULL' for JSON null, matching MySQL's
+		// JSON_TYPE — so the IsNull branch shape is identical on both engines.
+		if !query.IsSafeColumnName(ce.Column) {
+			slog.Error("parquetquery.buildFilters: rejected unsafe column name in ColumnEq filter; emitting no-match clause",
+				"column", ce.Column)
+			where = append(where, "1=0")
+			continue
+		}
+		path := "$." + ce.Column
+		if ce.IsNull {
+			where = append(where, fmt.Sprintf(
+				"(json_type(json_extract(row_after, '%s')) = 'NULL' "+
+					"OR json_type(json_extract(row_before, '%s')) = 'NULL')",
+				path, path))
+			continue
+		}
+		where = append(where, fmt.Sprintf(
+			"(json_extract_string(row_after, '%s') = ? "+
+				"OR json_extract_string(row_before, '%s') = ?)",
+			path, path))
+		args = append(args, ce.Value, ce.Value)
+	}
 
 	return where, args
 }

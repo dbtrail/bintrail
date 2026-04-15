@@ -15,7 +15,7 @@ const defaultLimit = 100
 // ─── buildQueryOptions ───────────────────────────────────────────────────────
 
 func TestBuildQueryOptions_empty(t *testing.T) {
-	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", "", 0, defaultLimit)
+	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", nil, "", 0, defaultLimit)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestBuildQueryOptions_empty(t *testing.T) {
 func TestBuildQueryOptions_allFields(t *testing.T) {
 	opts, err := buildQueryOptions(
 		"mydb", "orders", "12345", "INSERT",
-		"abc:1", "2026-02-19 14:00:00", "2026-02-19 15:00:00", "status", "",
+		"abc:1", "2026-02-19 14:00:00", "2026-02-19 15:00:00", "status", nil, "",
 		50, defaultLimit,
 	)
 	if err != nil {
@@ -72,7 +72,7 @@ func TestBuildQueryOptions_allFields(t *testing.T) {
 }
 
 func TestBuildQueryOptions_pkWithoutSchemaTable(t *testing.T) {
-	_, err := buildQueryOptions("", "", "12345", "", "", "", "", "", "", 0, defaultLimit)
+	_, err := buildQueryOptions("", "", "12345", "", "", "", "", "", nil, "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error when pk is set without schema/table")
 	}
@@ -82,14 +82,14 @@ func TestBuildQueryOptions_pkWithoutSchemaTable(t *testing.T) {
 }
 
 func TestBuildQueryOptions_pkWithSchemaOnly(t *testing.T) {
-	_, err := buildQueryOptions("mydb", "", "12345", "", "", "", "", "", "", 0, defaultLimit)
+	_, err := buildQueryOptions("mydb", "", "12345", "", "", "", "", "", nil, "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error when pk is set with schema but no table")
 	}
 }
 
 func TestBuildQueryOptions_changedColumnWithoutSchemaTable(t *testing.T) {
-	_, err := buildQueryOptions("", "", "", "", "", "", "", "status", "", 0, defaultLimit)
+	_, err := buildQueryOptions("", "", "", "", "", "", "", "status", nil, "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error when changed_column is set without schema/table")
 	}
@@ -99,14 +99,14 @@ func TestBuildQueryOptions_changedColumnWithoutSchemaTable(t *testing.T) {
 }
 
 func TestBuildQueryOptions_invalidEventType(t *testing.T) {
-	_, err := buildQueryOptions("mydb", "orders", "", "UPSERT", "", "", "", "", "", 0, defaultLimit)
+	_, err := buildQueryOptions("mydb", "orders", "", "UPSERT", "", "", "", "", nil, "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error for invalid event_type")
 	}
 }
 
 func TestBuildQueryOptions_invalidSince(t *testing.T) {
-	_, err := buildQueryOptions("", "", "", "", "", "not-a-date", "", "", "", 0, defaultLimit)
+	_, err := buildQueryOptions("", "", "", "", "", "not-a-date", "", "", nil, "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error for invalid since")
 	}
@@ -116,7 +116,7 @@ func TestBuildQueryOptions_invalidSince(t *testing.T) {
 }
 
 func TestBuildQueryOptions_invalidUntil(t *testing.T) {
-	_, err := buildQueryOptions("", "", "", "", "", "", "not-a-date", "", "", 0, defaultLimit)
+	_, err := buildQueryOptions("", "", "", "", "", "", "not-a-date", "", nil, "", 0, defaultLimit)
 	if err == nil {
 		t.Error("expected error for invalid until")
 	}
@@ -126,7 +126,7 @@ func TestBuildQueryOptions_invalidUntil(t *testing.T) {
 }
 
 func TestBuildQueryOptions_limitZeroUsesDefault(t *testing.T) {
-	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", "", 0, defaultLimit)
+	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", nil, "", 0, defaultLimit)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestBuildQueryOptions_limitZeroUsesDefault(t *testing.T) {
 }
 
 func TestBuildQueryOptions_negativeLimitUsesDefault(t *testing.T) {
-	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", "", -5, defaultLimit)
+	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", nil, "", -5, defaultLimit)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -145,8 +145,47 @@ func TestBuildQueryOptions_negativeLimitUsesDefault(t *testing.T) {
 	}
 }
 
+func TestBuildQueryOptions_columnEqPassedThrough(t *testing.T) {
+	opts, err := buildQueryOptions("mydb", "orders", "", "", "", "", "", "",
+		[]string{"status=active", "deleted_at=NULL"}, "", 0, defaultLimit)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(opts.ColumnEq) != 2 {
+		t.Fatalf("expected 2 ColumnEq entries, got %d", len(opts.ColumnEq))
+	}
+	if opts.ColumnEq[0].Column != "status" || opts.ColumnEq[0].Value != "active" {
+		t.Errorf("entry 0: got %+v", opts.ColumnEq[0])
+	}
+	if !opts.ColumnEq[1].IsNull {
+		t.Errorf("entry 1: expected IsNull, got %+v", opts.ColumnEq[1])
+	}
+}
+
+func TestBuildQueryOptions_columnEqRequiresSchemaTable(t *testing.T) {
+	_, err := buildQueryOptions("", "", "", "", "", "", "", "",
+		[]string{"status=active"}, "", 0, defaultLimit)
+	if err == nil {
+		t.Fatal("expected error when column_eq is set without schema/table")
+	}
+	if !strings.Contains(err.Error(), "schema") {
+		t.Errorf("expected schema mention in error, got: %v", err)
+	}
+}
+
+func TestBuildQueryOptions_columnEqMalformedEntry(t *testing.T) {
+	_, err := buildQueryOptions("mydb", "orders", "", "", "", "", "", "",
+		[]string{"no-equals"}, "", 0, defaultLimit)
+	if err == nil {
+		t.Fatal("expected error for malformed column_eq entry")
+	}
+	if !strings.Contains(err.Error(), "missing '='") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
 func TestBuildQueryOptions_flagPassedThrough(t *testing.T) {
-	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", "billing", 0, defaultLimit)
+	opts, err := buildQueryOptions("", "", "", "", "", "", "", "", nil, "billing", 0, defaultLimit)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

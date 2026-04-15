@@ -210,6 +210,88 @@ func TestBuildQueryChangedColumn(t *testing.T) {
 	}
 }
 
+func TestBuildQueryColumnEq(t *testing.T) {
+	opts := query.Options{
+		Schema:   "db",
+		Table:    "t",
+		ColumnEq: []query.ColumnEq{{Column: "status", Value: "active"}},
+		Limit:    100,
+	}
+	q, args := buildQuery("/arc/*.parquet", opts)
+	assertContains(t, q, "json_extract_string(row_after, '$.status')")
+	assertContains(t, q, "json_extract_string(row_before, '$.status')")
+	count := 0
+	for _, a := range args {
+		if s, ok := a.(string); ok && s == "active" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected value bound twice, got %d (args=%v)", count, args)
+	}
+}
+
+func TestBuildQueryColumnEq_unsafeColumnEmitsNoMatch(t *testing.T) {
+	opts := query.Options{
+		Schema:   "db",
+		Table:    "t",
+		ColumnEq: []query.ColumnEq{{Column: "evil'); DROP--", Value: "x"}},
+		Limit:    100,
+	}
+	q, args := buildQuery("/arc/*.parquet", opts)
+	assertContains(t, q, "1=0")
+	if strings.Contains(q, "evil") {
+		t.Errorf("unsafe column name leaked into SQL: %s", q)
+	}
+	for _, a := range args {
+		if s, ok := a.(string); ok && s == "x" {
+			t.Errorf("unsafe entry's value bound: %v", args)
+		}
+	}
+}
+
+func TestBuildQueryColumnEq_unsafeEntryDoesNotPoisonOthers(t *testing.T) {
+	// Parquet-side mirror of the MySQL columneq continue-semantics pin.
+	opts := query.Options{
+		Schema: "db",
+		Table:  "t",
+		ColumnEq: []query.ColumnEq{
+			{Column: "evil'); DROP--", Value: "x"},
+			{Column: "status", Value: "active"},
+		},
+		Limit: 100,
+	}
+	q, args := buildQuery("/arc/*.parquet", opts)
+	assertContains(t, q, "1=0")
+	assertContains(t, q, "json_extract_string(row_after, '$.status')")
+	count := 0
+	for _, a := range args {
+		if s, ok := a.(string); ok && s == "active" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected safe value bound twice, got %d (args=%v)", count, args)
+	}
+}
+
+func TestBuildQueryColumnEq_nullSentinel(t *testing.T) {
+	opts := query.Options{
+		Schema:   "db",
+		Table:    "t",
+		ColumnEq: []query.ColumnEq{{Column: "deleted_at", IsNull: true}},
+		Limit:    100,
+	}
+	q, args := buildQuery("/arc/*.parquet", opts)
+	assertContains(t, q, "json_type(json_extract(row_after, '$.deleted_at')) = 'NULL'")
+	assertContains(t, q, "json_type(json_extract(row_before, '$.deleted_at')) = 'NULL'")
+	for _, a := range args {
+		if s, ok := a.(string); ok && s == "NULL" {
+			t.Errorf("null sentinel must not bind the literal string: %v", args)
+		}
+	}
+}
+
 func TestBuildQueryNoLimit(t *testing.T) {
 	q, args := buildQuery("/arc/*.parquet", query.Options{})
 	if strings.Contains(q, "LIMIT") {

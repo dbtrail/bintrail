@@ -221,36 +221,38 @@ func main() {
 // ─── Tool argument types ─────────────────────────────────────────────────────
 
 type queryArgs struct {
-	IndexDSN      string `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
-	Schema        string `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
-	Table         string `json:"table,omitempty" jsonschema:"Filter by table name"`
-	PK            string `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys e.g. 123 or 123|2)"`
-	EventType     string `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
-	GTID          string `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
-	Since         string `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	Until         string `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	ChangedColumn string `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
-	Flag          string `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
-	Format        string `json:"format,omitempty" jsonschema:"Output format: json table or csv (default: json)"`
-	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of events to return (default: 100)"`
-	Profile       string `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
-	NoArchive     bool   `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
+	IndexDSN      string   `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
+	Schema        string   `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
+	Table         string   `json:"table,omitempty" jsonschema:"Filter by table name"`
+	PK            string   `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys e.g. 123 or 123|2)"`
+	EventType     string   `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
+	GTID          string   `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
+	Since         string   `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	Until         string   `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	ChangedColumn string   `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
+	ColumnEq      []string `json:"column_eq,omitempty" jsonschema:"Filter events where a column in row_after or row_before equals the given value. Each entry is column=value. Repeat for AND. Literal NULL matches JSON null."`
+	Flag          string   `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
+	Format        string   `json:"format,omitempty" jsonschema:"Output format: json table or csv (default: json)"`
+	Limit         int      `json:"limit,omitempty" jsonschema:"Maximum number of events to return (default: 100)"`
+	Profile       string   `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
+	NoArchive     bool     `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
 }
 
 type recoverArgs struct {
-	IndexDSN      string `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
-	Schema        string `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
-	Table         string `json:"table,omitempty" jsonschema:"Filter by table name"`
-	PK            string `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys)"`
-	EventType     string `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
-	GTID          string `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
-	Since         string `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	Until         string `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	ChangedColumn string `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
-	Flag          string `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
-	Limit         int    `json:"limit,omitempty" jsonschema:"Maximum number of events to reverse (default: 1000)"`
-	Profile       string `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
-	NoArchive     bool   `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
+	IndexDSN      string   `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
+	Schema        string   `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
+	Table         string   `json:"table,omitempty" jsonschema:"Filter by table name"`
+	PK            string   `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys)"`
+	EventType     string   `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
+	GTID          string   `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
+	Since         string   `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	Until         string   `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	ChangedColumn string   `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
+	ColumnEq      []string `json:"column_eq,omitempty" jsonschema:"Filter events where a column in row_after or row_before equals the given value. Each entry is column=value. Repeat for AND. Literal NULL matches JSON null."`
+	Flag          string   `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
+	Limit         int      `json:"limit,omitempty" jsonschema:"Maximum number of events to reverse (default: 1000)"`
+	Profile       string   `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
+	NoArchive     bool     `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
 }
 
 type statusArgs struct {
@@ -288,7 +290,7 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 		defer db.Close()
 
 		opts, err := buildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
-			args.GTID, args.Since, args.Until, args.ChangedColumn, args.Flag, args.Limit, 100)
+			args.GTID, args.Since, args.Until, args.ChangedColumn, args.ColumnEq, args.Flag, args.Limit, 100)
 		if err != nil {
 			return errorResult(err), nil, nil
 		}
@@ -385,7 +387,7 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 
 		defaultLimit := 1000
 		opts, err := buildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
-			args.GTID, args.Since, args.Until, args.ChangedColumn, args.Flag, args.Limit, defaultLimit)
+			args.GTID, args.Since, args.Until, args.ChangedColumn, args.ColumnEq, args.Flag, args.Limit, defaultLimit)
 		if err != nil {
 			return errorResult(err), nil, nil
 		}
@@ -665,12 +667,15 @@ func resolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 	return query.ResolveArchiveSources(ctx, db)
 }
 
-func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol, flagVal string, limit, defaultLimit int) (query.Options, error) {
+func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol string, columnEq []string, flagVal string, limit, defaultLimit int) (query.Options, error) {
 	if pk != "" && (schema == "" || table == "") {
 		return query.Options{}, fmt.Errorf("pk requires both schema and table")
 	}
 	if changedCol != "" && (schema == "" || table == "") {
 		return query.Options{}, fmt.Errorf("changed_column requires both schema and table")
+	}
+	if len(columnEq) > 0 && (schema == "" || table == "") {
+		return query.Options{}, fmt.Errorf("column_eq requires both schema and table")
 	}
 
 	et, err := cliutil.ParseEventType(eventType)
@@ -684,6 +689,10 @@ func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changed
 	untilT, err := cliutil.ParseTime(until)
 	if err != nil {
 		return query.Options{}, fmt.Errorf("invalid until: %w", err)
+	}
+	parsedEq, err := query.ParseColumnEqs(columnEq)
+	if err != nil {
+		return query.Options{}, err
 	}
 
 	if limit <= 0 {
@@ -699,6 +708,7 @@ func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changed
 		Since:         sinceT,
 		Until:         untilT,
 		ChangedColumn: changedCol,
+		ColumnEq:      parsedEq,
 		Flag:          flagVal,
 		Limit:         limit,
 	}, nil
