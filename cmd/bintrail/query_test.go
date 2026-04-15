@@ -109,6 +109,40 @@ func TestRunQuery_pkRequiresSchemaTable(t *testing.T) {
 	}
 }
 
+func TestRunQuery_columnEqRequiresSchemaTable(t *testing.T) {
+	saved, savedS, savedT := qColumnEq, qSchema, qTable
+	t.Cleanup(func() { qColumnEq = saved; qSchema = savedS; qTable = savedT })
+
+	qColumnEq = []string{"status=active"}
+	qSchema = ""
+	qTable = ""
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --column-eq used without --schema/--table")
+	}
+	if !strings.Contains(err.Error(), "--column-eq requires") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunQuery_columnEqMalformed(t *testing.T) {
+	saved, savedS, savedT := qColumnEq, qSchema, qTable
+	t.Cleanup(func() { qColumnEq = saved; qSchema = savedS; qTable = savedT })
+
+	qColumnEq = []string{"no-equals-sign"}
+	qSchema = "mydb"
+	qTable = "orders"
+
+	err := runQuery(queryCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for --column-eq entry without '='")
+	}
+	if !strings.Contains(err.Error(), "missing '='") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
 func TestRunQuery_changedColRequiresSchemaTable(t *testing.T) {
 	saved, savedS, savedT := qChangedCol, qSchema, qTable
 	t.Cleanup(func() { qChangedCol = saved; qSchema = savedS; qTable = savedT })

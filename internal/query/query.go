@@ -113,8 +113,9 @@ type Options struct {
 	Since         *time.Time
 	Until         *time.Time
 	ChangedColumn string // column name; matched via JSON_CONTAINS
-	Flag          string // return events from tables/columns carrying this flag
-	Limit         int    // 0 → default 100
+	ColumnEq      []ColumnEq // match against values inside row_after / row_before
+	Flag          string     // return events from tables/columns carrying this flag
+	Limit         int        // 0 → default 100
 
 	DenyTables    []SchemaTable       // tables excluded by RBAC profile
 	RedactColumns []SchemaTableColumn // column values nulled out by RBAC profile
@@ -249,6 +250,25 @@ func buildQuery(opts Options) (string, []any) {
 		needle, _ := json.Marshal(opts.ChangedColumn)
 		where = append(where, "JSON_CONTAINS(changed_columns, ?)")
 		args = append(args, string(needle))
+	}
+	for _, ce := range opts.ColumnEq {
+		// Column name is allowlisted by ParseColumnEq to [A-Za-z0-9_], so
+		// interpolating it into the JSON path literal is safe. MySQL does not
+		// accept bind parameters for JSON paths, so the column name MUST be
+		// embedded in the SQL string.
+		path := "$." + ce.Column
+		if ce.IsNull {
+			where = append(where, fmt.Sprintf(
+				"(JSON_TYPE(JSON_EXTRACT(row_after, '%s')) = 'NULL' "+
+					"OR JSON_TYPE(JSON_EXTRACT(row_before, '%s')) = 'NULL')",
+				path, path))
+			continue
+		}
+		where = append(where, fmt.Sprintf(
+			"(JSON_UNQUOTE(JSON_EXTRACT(row_after, '%s')) = ? "+
+				"OR JSON_UNQUOTE(JSON_EXTRACT(row_before, '%s')) = ?)",
+			path, path))
+		args = append(args, ce.Value, ce.Value)
 	}
 	if opts.Flag != "" {
 		// EXISTS subquery: match events from tables (or columns) carrying the

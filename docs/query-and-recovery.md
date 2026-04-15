@@ -26,6 +26,7 @@ The engine is shared: the CLI `query` command, the CLI `recover` command, and th
 | `Since` | `event_timestamp >= ?` (+ pruning hint for non-hour-aligned values) |
 | `Until` | `event_timestamp <= ?` (+ pruning hint for non-hour-aligned values) |
 | `ChangedColumn` | `JSON_CONTAINS(changed_columns, ?)` |
+| `ColumnEq` | `JSON_UNQUOTE(JSON_EXTRACT(row_after, '$.<col>')) = ? OR JSON_UNQUOTE(JSON_EXTRACT(row_before, '$.<col>')) = ?` |
 | `Flag` | `EXISTS (SELECT 1 FROM table_flags WHERE schema_name = binlog_events.schema_name AND table_name = binlog_events.table_name AND flag = ?)` |
 
 The conditions are joined with `AND`. If no filters are provided, there's no `WHERE` clause at all (subject to the `LIMIT`).
@@ -53,6 +54,37 @@ JSON_CONTAINS(changed_columns, '"status"')
 ```
 
 The needle is the JSON string representation of the column name (with quotes). `json.Marshal("status")` produces `"status"` — exactly the right format for `JSON_CONTAINS`.
+
+### `--column-eq` Filter
+
+Filters events by the value of a column inside the row image. Pass `--column-eq column=value`; repeat the flag to AND multiple entries:
+
+```sh
+bintrail query --schema mydb --table orders \
+  --column-eq status=active --column-eq order_id=7
+```
+
+The generated predicate checks both sides of the event so DELETEs match when the value is in `row_before`:
+
+```sql
+JSON_UNQUOTE(JSON_EXTRACT(row_after,  '$.status')) = 'active'
+OR
+JSON_UNQUOTE(JSON_EXTRACT(row_before, '$.status')) = 'active'
+```
+
+`--column-eq` requires `--schema` and `--table`, matching the constraint on `--changed-column`.
+
+**Column names** must match `[A-Za-z0-9_]+`. The column name is interpolated into the JSON path literal (MySQL does not accept bind parameters for paths), so the allowlist keeps the clause safe.
+
+**NULL sentinel.** The literal value `NULL` (unquoted, case-sensitive) matches rows where the column is explicitly JSON null:
+
+```sh
+bintrail query --schema mydb --table orders --column-eq deleted_at=NULL
+```
+
+Internally this translates to `JSON_TYPE(JSON_EXTRACT(..., '$.deleted_at')) = 'NULL'` on both sides. It does **not** match rows where the column is absent from the row image (FULL row images always include every column, so absence only occurs when the source has `binlog_row_image != FULL`, which `bintrail index` rejects). To match the literal four-character string `"NULL"` instead, quote it: `--column-eq label='"NULL"'`.
+
+The same filter is applied to DuckDB when archive auto-discovery routes the query through Parquet files (`json_extract_string` / `json_type`), so merged (live + archive) results stay consistent.
 
 ### Partition Pruning Guarantee
 

@@ -605,6 +605,25 @@ func buildFilters(opts query.Options) ([]string, []any) {
 		where = append(where, "json_contains(changed_columns, ?)")
 		args = append(args, string(needle))
 	}
+	for _, ce := range opts.ColumnEq {
+		// Mirrors internal/query.buildQuery's --column-eq clause. See that
+		// function's comment for the column-name safety argument; the path is
+		// always of the form "$.<identifier>". DuckDB returns uppercase
+		// json_type names ('NULL'), matching MySQL.
+		path := "$." + ce.Column
+		if ce.IsNull {
+			where = append(where, fmt.Sprintf(
+				"(json_type(json_extract(row_after, '%s')) = 'NULL' "+
+					"OR json_type(json_extract(row_before, '%s')) = 'NULL')",
+				path, path))
+			continue
+		}
+		where = append(where, fmt.Sprintf(
+			"(json_extract_string(row_after, '%s') = ? "+
+				"OR json_extract_string(row_before, '%s') = ?)",
+			path, path))
+		args = append(args, ce.Value, ce.Value)
+	}
 
 	return where, args
 }

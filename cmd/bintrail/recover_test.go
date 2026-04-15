@@ -70,7 +70,7 @@ func TestRecoverCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"index-dsn", "schema", "table", "pk", "event-type",
 		"gtid", "since", "until", "flag", "output", "dry-run", "limit",
-		"no-archive",
+		"no-archive", "column-eq",
 	} {
 		if recoverCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on recoverCmd", name)
@@ -120,6 +120,52 @@ func TestRunRecover_pkRequiresSchemaTable(t *testing.T) {
 		t.Fatal("expected error when --pk used without --schema/--table, got nil")
 	}
 	if !strings.Contains(err.Error(), "--pk requires") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunRecover_columnEqRequiresSchemaTable(t *testing.T) {
+	savedEq, savedS, savedT, savedDry := rColumnEq, rSchema, rTable, rDryRun
+	t.Cleanup(func() {
+		rColumnEq = savedEq
+		rSchema = savedS
+		rTable = savedT
+		rDryRun = savedDry
+	})
+
+	rDryRun = true
+	rColumnEq = []string{"status=active"}
+	rSchema = ""
+	rTable = ""
+
+	err := runRecover(recoverCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --column-eq used without --schema/--table")
+	}
+	if !strings.Contains(err.Error(), "--column-eq requires") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestRunRecover_columnEqMalformed(t *testing.T) {
+	savedEq, savedS, savedT, savedDry := rColumnEq, rSchema, rTable, rDryRun
+	t.Cleanup(func() {
+		rColumnEq = savedEq
+		rSchema = savedS
+		rTable = savedT
+		rDryRun = savedDry
+	})
+
+	rDryRun = true
+	rColumnEq = []string{"no-equals-sign"}
+	rSchema = "mydb"
+	rTable = "orders"
+
+	err := runRecover(recoverCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for malformed --column-eq entry")
+	}
+	if !strings.Contains(err.Error(), "missing '='") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
