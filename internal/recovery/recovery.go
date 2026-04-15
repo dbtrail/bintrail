@@ -143,6 +143,13 @@ func (g *Generator) generateStatement(row query.ResultRow) (string, error) {
 		return g.generateUpdate(row) // UPDATE → reverse UPDATE (restore before state)
 	case parser.EventInsert:
 		return g.generateDelete(row) // INSERT → DELETE (remove the inserted row)
+	case parser.EventSnapshot:
+		// Snapshot rows are read-only baseline state, not change events, so
+		// reversal SQL is undefined for them. Reject with a clear message
+		// instead of falling through to the generic "unknown event type"
+		// error — this path is only reachable if future code wires snapshots
+		// into the recover pipeline.
+		return "", fmt.Errorf("cannot generate reversal SQL for SNAPSHOT event %d (baseline rows are read-only)", row.EventID)
 	default:
 		return "", fmt.Errorf("unknown event type %d", row.EventType)
 	}

@@ -158,8 +158,19 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		if qProfile != "" {
 			return fmt.Errorf("--profile cannot be combined with --include-snapshot")
 		}
+		// Snapshot rows are emitted with empty pk_values (this PR does not
+		// extract PK columns from the baseline CREATE TABLE metadata), so
+		// PK-keyed filters would silently return wrong results. Reject the
+		// combination explicitly instead. --limit-per-pk is transitively
+		// blocked because it already requires --pk or --pks.
+		if qPK != "" || len(qPKs) > 0 {
+			return fmt.Errorf("--pk and --pks are not supported with --include-snapshot (snapshot rows have no pk_values in this release)")
+		}
 	} else if qBaseline != "" {
 		return fmt.Errorf("--baseline requires --include-snapshot")
+	}
+	if qEventType != "" && strings.EqualFold(qEventType, "SNAPSHOT") && !qIncludeSnapshot {
+		return fmt.Errorf("--event-type SNAPSHOT requires --include-snapshot")
 	}
 
 	// ── Parse filter values ───────────────────────────────────────────────────
