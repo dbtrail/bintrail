@@ -12,9 +12,24 @@ MYSQL_USER="${MYSQL_USER:-root}"
 MYSQL_PASS="${MYSQL_PASS:-demo}"
 MYSQL_DB="${MYSQL_DB:-demo}"
 
+# Half-open TCP sockets (NAT idle, transient network blips, RDS-side
+# close) were freezing the chaos loop for hours without any error
+# surfacing.  Every mysql invocation is now guarded by four layers:
+#   --connect-timeout=10    → 10s cap on the handshake
+#   --init-command=...      → 30s server-side net_read_timeout /
+#                             net_write_timeout; 15s max_execution_time
+#                             cap (SELECTs only — DML is not covered on
+#                             MySQL 8, which motivates the outer wrapper)
+#   timeout 60 ...          → belt-and-suspenders: SIGKILL after 60s
+#                             wall-clock if mysql ignores every knob above
+# `set -e` + compose `restart: on-failure` then cycle the container so
+# the loop recovers from transient network blips.
 mysql_cmd() {
-    mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASS" \
-          --protocol=tcp --silent "$@"
+    timeout 60 mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASS" \
+          --protocol=tcp --silent \
+          --connect-timeout=10 \
+          --init-command="SET SESSION net_read_timeout=30, net_write_timeout=30, max_execution_time=15000" \
+          "$@"
 }
 
 sql() {
@@ -23,17 +38,39 @@ sql() {
 
 log() { echo "[traffic] $(date '+%H:%M:%S') $*"; }
 
+# Bootstrap waits cap at 10 min each — if MYSQL_HOST is unreachable at
+# boot, the loops would otherwise spin forever with no `restart` kick-in.
+BOOTSTRAP_TIMEOUT="${BOOTSTRAP_TIMEOUT:-600}"
+
 # ── Wait for MySQL ──────────────────────────────────────────
 log "Waiting for MySQL..."
-until mysql_cmd -e "SELECT 1" &>/dev/null; do sleep 1; done
+bootstrap_start=$SECONDS
+until mysql_cmd -e "SELECT 1" &>/dev/null; do
+    if (( SECONDS - bootstrap_start > BOOTSTRAP_TIMEOUT )); then
+        log "Timed out waiting for MySQL at $MYSQL_HOST:$MYSQL_PORT after ${BOOTSTRAP_TIMEOUT}s"
+        exit 1
+    fi
+    sleep 1
+done
 log "MySQL ready."
 
 # ── Wait for demo schema ────────────────────────────────────
 log "Waiting for demo.customers..."
-until mysql_cmd demo -e "SELECT 1 FROM customers LIMIT 1" &>/dev/null; do sleep 1; done
+bootstrap_start=$SECONDS
+until mysql_cmd demo -e "SELECT 1 FROM customers LIMIT 1" &>/dev/null; do
+    if (( SECONDS - bootstrap_start > BOOTSTRAP_TIMEOUT )); then
+        log "Timed out waiting for demo.customers after ${BOOTSTRAP_TIMEOUT}s"
+        exit 1
+    fi
+    sleep 1
+done
 log "Schema ready."
 
 # ── sysbench prepare + run ──────────────────────────────────
+# sysbench 1.0.20 (Ubuntu 24.04) has no --mysql-connect/read/write-timeout
+# flags, so we can't harden sysbench's own connections at the client
+# library level.  Instead we guard with an outer `timeout` on prepare
+# and a MAX(sbtest1.k) progress watchdog in the chaos loop below.
 SYSBENCH_ARGS=(
     --db-driver=mysql
     --mysql-host="$MYSQL_HOST"
@@ -49,7 +86,13 @@ log "Cleaning up any existing sysbench tables (idempotent on restart)..."
 sysbench oltp_read_write "${SYSBENCH_ARGS[@]}" cleanup 2>/dev/null || true
 
 log "Preparing sysbench tables..."
-sysbench oltp_read_write "${SYSBENCH_ARGS[@]}" prepare
+# 5 min cap — a half-open socket during prepare would otherwise wedge
+# container boot indefinitely with no chaos loop running at all.
+timeout 300 sysbench oltp_read_write "${SYSBENCH_ARGS[@]}" prepare || {
+    rc=$?
+    log "sysbench prepare failed (rc=$rc, 124=timeout)"
+    exit 1
+}
 
 log "Starting sysbench workload (background)..."
 sysbench oltp_read_write "${SYSBENCH_ARGS[@]}" \
@@ -61,9 +104,51 @@ SYSBENCH_PID=$!
 
 # ── Chaos loop ─────────────────────────────────────────────
 CYCLE=0
+LAST_SBTEST_K=""
+WATCHDOG_BLIND_COUNT=0
 log "Starting chaos loop..."
 
 while true; do
+    # Guard against sysbench dying silently: if the background worker is
+    # gone, half the workload (sbtest.*) goes dark while demo.* continues
+    # looking healthy.  Exit so compose `restart: on-failure` cycles both.
+    if ! kill -0 "$SYSBENCH_PID" 2>/dev/null; then
+        log "sysbench worker (pid $SYSBENCH_PID) is gone; exiting to trigger container restart"
+        exit 1
+    fi
+
+    # Progress watchdog every 12 cycles (~2m).  kill -0 only detects a
+    # DEAD sysbench; it cannot catch the "alive but stuck" case where the
+    # worker is blocked on a half-open socket mid-query.  oltp_read_write
+    # runs `UPDATE sbtestN SET k=k+1` on every transaction (N random in
+    # 1..--tables), so SUM(MAX(k)) across all 4 tables is a cheap,
+    # monotonic liveness signal.  We also guard against the watchdog's
+    # OWN query failing permanently (CUR_K="" forever would silently
+    # disable detection): exit after 3 consecutive blind reads (~6m).
+    if (( CYCLE > 0 && CYCLE % 12 == 0 )); then
+        CUR_K=$(mysql_cmd -N sbtest -e "
+            SELECT COALESCE(SUM(m), 0) FROM (
+                SELECT MAX(k) AS m FROM sbtest1
+                UNION ALL SELECT MAX(k) FROM sbtest2
+                UNION ALL SELECT MAX(k) FROM sbtest3
+                UNION ALL SELECT MAX(k) FROM sbtest4
+            ) t" 2>/dev/null || true)
+        if [[ -z "$CUR_K" ]]; then
+            WATCHDOG_BLIND_COUNT=$((WATCHDOG_BLIND_COUNT + 1))
+            if (( WATCHDOG_BLIND_COUNT >= 3 )); then
+                log "progress watchdog unreadable for 3 consecutive samples (~6m); exiting"
+                exit 1
+            fi
+        else
+            WATCHDOG_BLIND_COUNT=0
+            if [[ "$CUR_K" == "$LAST_SBTEST_K" ]]; then
+                log "sysbench wedged: SUM(MAX(k)) across sbtest1..4 = $CUR_K unchanged across ~2m; exiting"
+                exit 1
+            fi
+            LAST_SBTEST_K="$CUR_K"
+        fi
+    fi
+
     CYCLE=$((CYCLE + 1))
     log "Chaos cycle $CYCLE"
 
