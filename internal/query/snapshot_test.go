@@ -7,6 +7,43 @@ import (
 	"github.com/dbtrail/bintrail/internal/parser"
 )
 
+// TestShouldSkipSnapshot is the unit-level truth table for the four always-
+// excluder filters. The DuckDB-backed FetchSnapshot path is integration-only,
+// but these branches are pure logic — this test pins them without needing a
+// real Parquet file.
+func TestShouldSkipSnapshot(t *testing.T) {
+	snapshotET := parser.EventSnapshot
+	insertET := parser.EventInsert
+
+	cases := []struct {
+		name       string
+		opts       Options
+		wantSkip   bool
+		wantReason string
+	}{
+		{"happy path — no excluders", Options{}, false, ""},
+		{"event-type SNAPSHOT keeps source", Options{EventType: &snapshotET}, false, ""},
+		{"event-type INSERT excludes", Options{EventType: &insertET}, true, "--event-type"},
+		{"gtid set excludes", Options{GTID: "uuid:42"}, true, "--gtid"},
+		{"changed-column excludes", Options{ChangedColumn: "status"}, true, "--changed-column"},
+		{"flag excludes", Options{Flag: "pii"}, true, "--flag"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, skip := shouldSkipSnapshot(tc.opts)
+			if skip != tc.wantSkip {
+				t.Fatalf("skip = %v, want %v (reason=%q)", skip, tc.wantSkip, reason)
+			}
+			if tc.wantSkip && !strings.Contains(reason, tc.wantReason) {
+				t.Errorf("reason = %q, want substring %q", reason, tc.wantReason)
+			}
+			if !tc.wantSkip && reason != "" {
+				t.Errorf("expected empty reason when not skipping; got %q", reason)
+			}
+		})
+	}
+}
+
 // TestSnapshotFilters_columnEq pins the WHERE shape: typed Parquet columns are
 // compared via CAST(... AS VARCHAR) = ? so the binlog index's
 // JSON_UNQUOTE(JSON_EXTRACT(...)) string-coercion parity is preserved.

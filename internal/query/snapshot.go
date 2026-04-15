@@ -43,20 +43,8 @@ const snapshotEventIDBase uint64 = 1 << 62
 // error. An slog.Info line is emitted at each exclusion so operators who
 // pass --include-snapshot but see "No results" can tell why.
 func FetchSnapshot(ctx context.Context, path string, opts Options) ([]ResultRow, error) {
-	if opts.EventType != nil && *opts.EventType != parser.EventSnapshot {
-		slog.Info("snapshot source excluded by filter", "reason", "--event-type ≠ SNAPSHOT")
-		return nil, nil
-	}
-	if opts.GTID != "" {
-		slog.Info("snapshot source excluded by filter", "reason", "--gtid set (baseline rows carry no GTID)")
-		return nil, nil
-	}
-	if opts.ChangedColumn != "" {
-		slog.Info("snapshot source excluded by filter", "reason", "--changed-column set (baseline rows have no changed-columns metadata)")
-		return nil, nil
-	}
-	if opts.Flag != "" {
-		slog.Info("snapshot source excluded by filter", "reason", "--flag set (baseline rows do not carry table_flags)")
+	if reason, skip := shouldSkipSnapshot(opts); skip {
+		slog.Info("snapshot source excluded by filter", "reason", reason)
 		return nil, nil
 	}
 
@@ -140,6 +128,30 @@ func FetchSnapshot(ctx context.Context, path string, opts Options) ([]ResultRow,
 		return nil, fmt.Errorf("iterate snapshot rows: %w", err)
 	}
 	return results, nil
+}
+
+// shouldSkipSnapshot reports whether any filter in opts rules out the entire
+// snapshot source before the DuckDB query runs. It is the unit-testable
+// truth table for the four always-excluder filters: wrong event-type, gtid,
+// changed-column, flag. Extracted so the branches are testable without
+// standing up DuckDB.
+//
+// Returns (reason, true) when the source must be skipped, with a
+// human-readable reason for the slog message. Returns ("", false) otherwise.
+func shouldSkipSnapshot(opts Options) (string, bool) {
+	if opts.EventType != nil && *opts.EventType != parser.EventSnapshot {
+		return "--event-type ≠ SNAPSHOT", true
+	}
+	if opts.GTID != "" {
+		return "--gtid set (baseline rows carry no GTID)", true
+	}
+	if opts.ChangedColumn != "" {
+		return "--changed-column set (baseline rows have no changed-columns metadata)", true
+	}
+	if opts.Flag != "" {
+		return "--flag set (baseline rows do not carry table_flags)", true
+	}
+	return "", false
 }
 
 // readSnapshotTimestamp extracts bintrail.snapshot_timestamp from the Parquet

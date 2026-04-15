@@ -292,6 +292,33 @@ func TestGenerateSQL_noRows(t *testing.T) {
 	assertSQL(t, out, "COMMIT;")
 }
 
+// TestGenerateStatement_snapshotRejected pins the defense-in-depth guard:
+// if a ResultRow with EventType=EventSnapshot ever reaches the reversal
+// generator, the error message must be specific ("read-only baseline rows")
+// rather than the generic "unknown event type N" fallback. Future code that
+// wires snapshot rows into the recover pipeline will fail loudly.
+func TestGenerateStatement_snapshotRejected(t *testing.T) {
+	g := newGen()
+	row := query.ResultRow{
+		EventID:    99,
+		SchemaName: "db",
+		TableName:  "tbl",
+		EventType:  parser.EventSnapshot,
+		PKValues:   "1",
+		RowAfter:   map[string]any{"id": float64(1)},
+	}
+	_, err := g.generateStatement(row)
+	if err == nil {
+		t.Fatal("expected error for SNAPSHOT event; got nil")
+	}
+	if !strings.Contains(err.Error(), "SNAPSHOT") {
+		t.Errorf("error should mention SNAPSHOT explicitly (not the generic fallback); got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "read-only") {
+		t.Errorf("error should explain baseline rows are read-only; got %q", err.Error())
+	}
+}
+
 // ─── Null / special value handling ───────────────────────────────────────────
 
 func TestFormatValue_nullInRow(t *testing.T) {
