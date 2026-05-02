@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- GitHub releases now include `dbtrail-shim` binaries (`dbtrail-shim-linux-amd64`, `dbtrail-shim-linux-arm64`, `dbtrail-shim-darwin-amd64`, `dbtrail-shim-darwin-arm64`) alongside the existing bintrail archives. The shim enables BYOS time-travel SQL via ProxySQL routing; binaries are pulled from the canonical SaaS build pipeline and re-published as release assets, so customers can `curl -LO https://github.com/dbtrail/bintrail/releases/latest/download/dbtrail-shim-linux-amd64` (#236).
+
 ## [0.5.8] - 2026-04-15
 
 ### Added
