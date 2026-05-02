@@ -255,20 +255,15 @@ func generateProxySQLSetupSQL(host string, mysqlPort, shimPort, proxysqlMySQLPor
 	fmt.Fprintf(&sb, "INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (%d, '127.0.0.1', %d);\n", shimHostgroup, shimPort)
 	sb.WriteString("\n")
 
-	// DELETE clauses union (default_hostgroup match) with (current usernames):
-	// the hostgroup match cleans rows from a previous run whose username has
-	// since been renamed in shim.yaml; the username match keeps deletion
-	// scoped to bintrail-owned rows when an operator has shared a username
-	// across hostgroups (rare).
-	sb.WriteString("DELETE FROM mysql_users WHERE default_hostgroup = ")
-	fmt.Fprintf(&sb, "%d OR username IN (", passthroughHostgroup)
-	for i, t := range tenants {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString(sqlQuote(t.MySQLUser))
-	}
-	sb.WriteString(");\n")
+	// DELETE is scoped strictly to bintrail-managed rows by default_hostgroup,
+	// never by username alone. This:
+	//   * cleans rows from a previous run whose username was renamed in
+	//     shim.yaml between runs (the old row still lives in hostgroup 990).
+	//   * does NOT destroy an operator's pre-existing user that happens to
+	//     share a name with a tenant — if there is a collision, the INSERT
+	//     below fails loudly with a PRIMARY KEY violation rather than
+	//     silently overwriting operator config.
+	fmt.Fprintf(&sb, "DELETE FROM mysql_users WHERE default_hostgroup = %d;\n", passthroughHostgroup)
 	for _, t := range tenants {
 		fmt.Fprintf(&sb, "INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES (%s, %s, %d, 1);\n",
 			sqlQuote(t.MySQLUser), sqlQuote(t.MySQLPassSHA1), passthroughHostgroup)

@@ -70,7 +70,7 @@ func TestRunProxySQLConfig(t *testing.T) {
 			"DELETE FROM mysql_servers WHERE hostgroup_id IN (990, 991);",
 			"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (990, 'db.example.com', 3306);",
 			"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (991, '127.0.0.1', 3308);",
-			"DELETE FROM mysql_users WHERE default_hostgroup = 990 OR username IN ('app_user');",
+			"DELETE FROM mysql_users WHERE default_hostgroup = 990;",
 			"INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('app_user', '*A4B6157319038724E3560894F7F932C8886EBFCF', 990, 1);",
 			"DELETE FROM mysql_query_rules WHERE rule_id IN (990001, 990002, 990003);",
 			"VALUES (990001, 1, '\\b_flashback\\.', 991, 1);",
@@ -120,8 +120,8 @@ func TestRunProxySQLConfig(t *testing.T) {
 		data, _ := os.ReadFile(filepath.Join(dir, "proxysql-setup.sql"))
 		out := string(data)
 
-		if !strings.Contains(out, "DELETE FROM mysql_users WHERE default_hostgroup = 990 OR username IN ('app_user', 'app_user2');") {
-			t.Errorf("expected combined DELETE for both users; got:\n%s", out)
+		if !strings.Contains(out, "DELETE FROM mysql_users WHERE default_hostgroup = 990;") {
+			t.Errorf("expected hostgroup-scoped DELETE; got:\n%s", out)
 		}
 		if !strings.Contains(out, "INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('app_user', ") {
 			t.Error("expected INSERT for app_user")
@@ -332,14 +332,36 @@ func TestGenerateProxySQLSetupSQLSQLInjection(t *testing.T) {
 	}
 	out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants)
 
-	wants := []string{
-		"DELETE FROM mysql_users WHERE default_hostgroup = 990 OR username IN ('ev''il');",
-		"INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('ev''il', '*A''B', 990, 1);",
+	want := "INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('ev''il', '*A''B', 990, 1);"
+	if !strings.Contains(out, want) {
+		t.Errorf("expected escaped SQL %q; got:\n%s", want, out)
 	}
-	for _, w := range wants {
-		if !strings.Contains(out, w) {
-			t.Errorf("expected escaped SQL %q; got:\n%s", w, out)
-		}
+}
+
+// TestGenerateProxySQLSetupSQLRenameIdempotent verifies that renaming a
+// tenant in shim.yaml between runs leaves no orphan row: the second
+// run's DELETE WHERE default_hostgroup = 990 catches the previous
+// tenant's row even though its username is no longer in the current
+// list. This locks in the design rationale for scoping the DELETE by
+// hostgroup rather than by username.
+func TestGenerateProxySQLSetupSQLRenameIdempotent(t *testing.T) {
+	first := generateProxySQLSetupSQL("db", 3306, 3308, 6033,
+		[]shimTenant{{MySQLUser: "old_user", MySQLPassSHA1: "*OLDHASH"}})
+	second := generateProxySQLSetupSQL("db", 3306, 3308, 6033,
+		[]shimTenant{{MySQLUser: "new_user", MySQLPassSHA1: "*NEWHASH"}})
+
+	// Both runs emit the same blanket DELETE, scoped only by hostgroup,
+	// so the second apply also removes 'old_user' even though the name
+	// no longer appears anywhere in the second SQL file.
+	wantDelete := "DELETE FROM mysql_users WHERE default_hostgroup = 990;"
+	if !strings.Contains(first, wantDelete) || !strings.Contains(second, wantDelete) {
+		t.Errorf("both runs must contain hostgroup-scoped DELETE %q", wantDelete)
+	}
+	if strings.Contains(second, "old_user") {
+		t.Error("second-run SQL must not reference the renamed-away tenant")
+	}
+	if !strings.Contains(second, "INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('new_user',") {
+		t.Errorf("second-run SQL must INSERT the new tenant; got:\n%s", second)
 	}
 }
 
