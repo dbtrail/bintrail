@@ -66,15 +66,17 @@ func TestRunProxySQLConfig(t *testing.T) {
 		wants := []string{
 			"-- Bintrail BYOS time-travel SQL",
 			"docs/byos-time-travel-sql.md",
+			"BEGIN;",
 			"DELETE FROM mysql_servers WHERE hostgroup_id IN (990, 991);",
 			"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (990, 'db.example.com', 3306);",
 			"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (991, '127.0.0.1', 3308);",
-			"DELETE FROM mysql_users WHERE username IN ('app_user');",
+			"DELETE FROM mysql_users WHERE default_hostgroup = 990 OR username IN ('app_user');",
 			"INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('app_user', '*A4B6157319038724E3560894F7F932C8886EBFCF', 990, 1);",
 			"DELETE FROM mysql_query_rules WHERE rule_id IN (990001, 990002, 990003);",
 			"VALUES (990001, 1, '\\b_flashback\\.', 991, 1);",
 			"VALUES (990002, 1, '\\b_diff\\.', 991, 1);",
 			"VALUES (990003, 1, '\\b_snapshot\\.', 991, 1);",
+			"COMMIT;",
 			"LOAD MYSQL SERVERS TO RUNTIME;",
 			"LOAD MYSQL USERS TO RUNTIME;",
 			"LOAD MYSQL QUERY RULES TO RUNTIME;",
@@ -118,7 +120,7 @@ func TestRunProxySQLConfig(t *testing.T) {
 		data, _ := os.ReadFile(filepath.Join(dir, "proxysql-setup.sql"))
 		out := string(data)
 
-		if !strings.Contains(out, "DELETE FROM mysql_users WHERE username IN ('app_user', 'app_user2');") {
+		if !strings.Contains(out, "DELETE FROM mysql_users WHERE default_hostgroup = 990 OR username IN ('app_user', 'app_user2');") {
 			t.Errorf("expected combined DELETE for both users; got:\n%s", out)
 		}
 		if !strings.Contains(out, "INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('app_user', ") {
@@ -254,8 +256,8 @@ func TestRunProxySQLConfig(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error for newline")
 		}
-		if !strings.Contains(err.Error(), "newline") {
-			t.Errorf("expected 'newline' in error, got %v", err)
+		if !strings.Contains(err.Error(), "control character") {
+			t.Errorf("expected 'control character' in error, got %v", err)
 		}
 	})
 
@@ -331,13 +333,160 @@ func TestGenerateProxySQLSetupSQLSQLInjection(t *testing.T) {
 	out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants)
 
 	wants := []string{
-		"DELETE FROM mysql_users WHERE username IN ('ev''il');",
+		"DELETE FROM mysql_users WHERE default_hostgroup = 990 OR username IN ('ev''il');",
 		"INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('ev''il', '*A''B', 990, 1);",
 	}
 	for _, w := range wants {
 		if !strings.Contains(out, w) {
 			t.Errorf("expected escaped SQL %q; got:\n%s", w, out)
 		}
+	}
+}
+
+// TestGenerateProxySQLSetupSQLHostgroupPairing locks in the
+// destination_hostgroup for each rule_id so a future swap of
+// `passthroughHostgroup` and `shimHostgroup` would be caught even if
+// individual fragment assertions still pass.
+func TestGenerateProxySQLSetupSQLHostgroupPairing(t *testing.T) {
+	tenants := []shimTenant{{MySQLUser: pcTestUser1, MySQLPassSHA1: pcTestSHA1_1}}
+	out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants)
+
+	wants := []string{
+		// passthrough server lives in passthrough hostgroup
+		"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (990,",
+		// shim server lives in shim hostgroup
+		"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (991,",
+		// users default to passthrough hostgroup (real MySQL by default)
+		"default_hostgroup, active) VALUES ('app_user', '" + pcTestSHA1_1 + "', 990, 1);",
+		// virtual-schema rules route to shim hostgroup, never passthrough
+		"VALUES (990001, 1, '\\b_flashback\\.', 991, 1);",
+		"VALUES (990002, 1, '\\b_diff\\.', 991, 1);",
+		"VALUES (990003, 1, '\\b_snapshot\\.', 991, 1);",
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("hostgroup pairing missing %q; full SQL:\n%s", w, out)
+		}
+	}
+	// And explicitly: no rule should ever route a virtual schema to the
+	// passthrough hostgroup.
+	for _, bad := range []string{
+		"VALUES (990001, 1, '\\b_flashback\\.', 990, 1)",
+		"VALUES (990002, 1, '\\b_diff\\.', 990, 1)",
+		"VALUES (990003, 1, '\\b_snapshot\\.', 990, 1)",
+	} {
+		if strings.Contains(out, bad) {
+			t.Errorf("virtual-schema rule must not target passthrough hostgroup, found %q", bad)
+		}
+	}
+}
+
+func TestRunProxySQLConfigStrictYAML(t *testing.T) {
+	// A typo in shim.yaml (mysql_user_name vs mysql_user) used to silently
+	// parse as empty, surfacing as the misleading "mysql_user is empty" error.
+	// UnmarshalStrict now reports the unknown key directly.
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(orig) })
+	os.Chdir(dir)
+
+	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+	writeShimYAML(t, dir, "tenants:\n  - mysql_user_name: app_user\n    mysql_pass_sha1: '*ABC'\n")
+	resetPCFlags()
+
+	err := runProxySQLConfig(proxysqlConfigCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for unknown YAML field")
+	}
+	if !strings.Contains(err.Error(), "mysql_user_name") {
+		t.Errorf("error should name the unknown field, got %v", err)
+	}
+}
+
+func TestParseProxySQLBackendIPv6(t *testing.T) {
+	// Bracketed IPv6 with port.
+	host, port, err := parseProxySQLBackend("u:p@tcp([2001:db8::1]:3306)/x", 3306)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "2001:db8::1" {
+		t.Errorf("got host %q, want '2001:db8::1' (without brackets)", host)
+	}
+	if port != 3306 {
+		t.Errorf("got port %d", port)
+	}
+}
+
+func TestParseProxySQLBackendEmptyHost(t *testing.T) {
+	_, _, err := parseProxySQLBackend("u:p@tcp(:3306)/x", 3306)
+	if err == nil {
+		t.Fatal("expected error for empty host")
+	}
+	if !strings.Contains(err.Error(), "empty host") {
+		t.Errorf("expected 'empty host' in error, got %v", err)
+	}
+}
+
+func TestRunProxySQLConfigPortRangeValidation(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(orig) })
+	os.Chdir(dir)
+
+	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+	writeShimYAML(t, dir, validShimYAML)
+
+	t.Run("zero port rejected", func(t *testing.T) {
+		resetPCFlags()
+		pcMySQLPort = 0
+		err := runProxySQLConfig(proxysqlConfigCmd, nil)
+		if err == nil || !strings.Contains(err.Error(), "out of range") {
+			t.Errorf("expected out-of-range error for port 0, got %v", err)
+		}
+	})
+
+	t.Run("uint16-overflow port rejected", func(t *testing.T) {
+		// 70000 used to silently truncate to uint16 → 4464, generating broken SQL.
+		resetPCFlags()
+		pcShimPort = 70000
+		err := runProxySQLConfig(proxysqlConfigCmd, nil)
+		if err == nil || !strings.Contains(err.Error(), "out of range") {
+			t.Errorf("expected out-of-range error for port 70000, got %v", err)
+		}
+	})
+}
+
+func TestLoadShimTenantsControlChars(t *testing.T) {
+	// Reject control chars beyond plain \r\n: \t in mysql_user, \0 in
+	// mysql_pass_sha1. Both would corrupt the generated SQL output.
+	cases := []struct {
+		name     string
+		yamlBody string
+		wantSub  string
+	}{
+		{
+			name:     "tab in mysql_user",
+			yamlBody: "tenants:\n  - mysql_user: \"app\\tuser\"\n    mysql_pass_sha1: '*ABC'\n",
+			wantSub:  "mysql_user contains control character",
+		},
+		{
+			name:     "null byte in pass",
+			yamlBody: "tenants:\n  - mysql_user: app_user\n    mysql_pass_sha1: \"*A\\u0000B\"\n",
+			wantSub:  "mysql_pass_sha1 contains control character",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := writeShimYAML(t, dir, tc.yamlBody)
+			_, err := loadShimTenants(path)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("expected %q in error, got %v", tc.wantSub, err)
+			}
+		})
 	}
 }
 
