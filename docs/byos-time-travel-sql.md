@@ -101,7 +101,7 @@ printf 'your-app-password' \
   | sha1sum | cut -d' ' -f1 \
   | xxd -r -p | sha1sum | cut -d' ' -f1 \
   | tr 'a-f' 'A-F' | sed 's/^/*/'
-# *2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19
+# *30D6BC64B4B66AC024BDC6551C3B28BB49320725
 ```
 
 (ProxySQL stores `mysql_native_password`'s double-SHA1 with a `*` prefix.)
@@ -118,7 +118,7 @@ Edit `shim.yaml`, uncomment the two TODO lines, and paste the values:
 
 ```yaml
     mysql_user: app_user
-    mysql_pass_sha1: '*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19'
+    mysql_pass_sha1: '*30D6BC64B4B66AC024BDC6551C3B28BB49320725'
 ```
 
 ---
@@ -277,11 +277,13 @@ The shim resolves the row to its state at that exact timestamp by replaying the 
 
 ### `ERROR 1045: Access denied for user 'app_user'@'…'`
 
-ProxySQL is rejecting your credentials. Check that the `mysql_pass_sha1` you put in `shim.yaml` matches the password your app is sending:
+ProxySQL is rejecting your credentials. Re-run the SHA1 recipe from step 2 against your app's password and compare against `mysql_pass_sha1` in `shim.yaml`:
 
 ```sh
-mysql -e "SELECT PASSWORD('your-app-password')"
-# Compare with the value in shim.yaml.
+printf 'your-app-password' \
+  | sha1sum | cut -d' ' -f1 \
+  | xxd -r -p | sha1sum | cut -d' ' -f1 \
+  | tr 'a-f' 'A-F' | sed 's/^/*/'
 ```
 
 Then re-apply the ProxySQL config (the `mysql_users` row is regenerated from `shim.yaml`):
