@@ -76,6 +76,7 @@ bintrail recover \
 | `config init` | Generate a `.bintrail.env` configuration file |
 | `init-shim` | Generate a `shim.yaml` for the BYOS time-travel SQL shim |
 | `proxysql-config` | Generate ProxySQL setup SQL for BYOS time-travel SQL routing |
+| `shim` | Run the in-process MySQL-protocol server for `_flashback`/`_diff`/`_snapshot` queries |
 | `profile` | Manage RBAC access profiles for query and recover |
 | `flag` | Label tables and columns (e.g. `pii`, `sensitive`) for access rules |
 | `access` | Link flags to profiles with allow/deny permissions |

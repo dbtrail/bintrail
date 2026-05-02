@@ -1,5 +1,5 @@
 [Unit]
-Description=dbtrail-shim - BYOS time-travel SQL backend for ProxySQL
+Description=bintrail shim - BYOS time-travel SQL backend for ProxySQL
 Documentation=https://github.com/dbtrail/bintrail/blob/main/docs/byos-time-travel-sql.md
 After=network-online.target proxysql.service
 Wants=network-online.target
@@ -7,7 +7,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/etc/bintrail
-ExecStart=/usr/local/bin/dbtrail-shim --config /etc/bintrail/shim.yaml
+EnvironmentFile=/etc/bintrail/.bintrail.env
+ExecStart=/usr/local/bin/bintrail shim --shim-config /etc/bintrail/shim.yaml
 Restart=on-failure
 RestartSec=5s
 

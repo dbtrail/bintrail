@@ -37,30 +37,3 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Attach dbtrail-shim binaries to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
-          SHIM_BUCKET_URL: https://my-bintrail-archives.s3.amazonaws.com/binary
-        run: |
-          set -euo pipefail
-          shim_version="${RELEASE_TAG#v}"
-          mkdir -p shim-dist
-          for target in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
-            src="dbtrail-shim_${shim_version}_${target}"
-            dst="shim-dist/dbtrail-shim-${target/_/-}"
-            echo "Downloading ${SHIM_BUCKET_URL}/${src}"
-            curl --fail --silent --show-error --location \
-              --connect-timeout 10 --max-time 120 \
-              --retry 3 --retry-delay 2 \
-              --output "${dst}" \
-              "${SHIM_BUCKET_URL}/${src}"
-            chmod +x "${dst}"
-          done
-          count=$(find shim-dist -name 'dbtrail-shim-*' -type f | wc -l)
-          if [ "${count}" -ne 4 ]; then
-            echo "expected 4 shim binaries, found ${count}" >&2
-            exit 1
-          fi
-          gh release upload "${RELEASE_TAG}" shim-dist/dbtrail-shim-* --clobber

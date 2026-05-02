@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- New `bintrail shim` subcommand: an in-process MySQL-protocol server that answers BYOS time-travel SQL queries (`_flashback.*`, `_diff.*`, `_snapshot.*` virtual schemas) by translating them into the existing `query.FetchMerged` engine. The shim sits behind ProxySQL on `127.0.0.1:3308` by default; ProxySQL is the password gate, the shim validates only that the connecting username appears in `shim.yaml`. Recognised statement shapes: `SELECT * FROM _flashback.<table> AS OF '<ts>' WHERE <col> = <value>`, the same shape against `_snapshot`, and `SELECT * FROM _diff.<table> BETWEEN '<t1>' AND '<t2>' WHERE <col> = <value>`. Time-range queries auto-discover S3 archives via `archive_state` so rotated-out hours resolve transparently.
+
+### Changed
+- The BYOS time-travel SQL story is now self-contained in the `bintrail` binary — there is no separate `dbtrail-shim` binary to download. `bintrail init-shim`'s output drops the `agent_url` and `agent_token` fields (no longer needed); `BINTRAIL_API_KEY` is no longer a precondition for scaffolding shim.yaml. The default `--listen` becomes `127.0.0.1:3308` so the shim is not reachable from the network unless the operator explicitly opens it. `docs/byos-time-travel-sql.md` rewritten to walk the customer through `bintrail shim` end-to-end. The systemd unit ships at `deploy/bintrail-shim.service` (renamed from `dbtrail-shim.service`).
+
+### Removed
+- The "Attach dbtrail-shim binaries to release" step in `.github/workflows/release.yaml`. That step pointed at a bucket that does not exist (the placeholder name in issue #236 was taken literally) and failed with HTTP 403 on every release. The shim now ships as a subcommand of the `bintrail` binary itself, so no cross-repo S3 pull-through is needed.
+
 ## [0.6.0] - 2026-05-02
 
 ### Added

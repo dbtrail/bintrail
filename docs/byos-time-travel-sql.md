@@ -6,26 +6,20 @@ This walkthrough takes a BYOS customer from zero to running a working time-trave
 SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
 ```
 
-The query is answered by `dbtrail-shim`, a small MySQL-protocol server that intercepts the virtual `_flashback`, `_diff`, and `_snapshot` schemas and forwards them to your local `bintrail agent`. ProxySQL sits in front of both your real MySQL and the shim, routing each query to the right backend.
+The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a subcommand of the `bintrail` binary you already have) that intercepts the virtual `_flashback`, `_diff`, and `_snapshot` schemas and resolves them against your bintrail index plus your customer-side S3 archives. ProxySQL sits in front of both your real MySQL and the shim, routing each query to the right backend.
 
 ```
 ┌─────────────┐     :6033       ┌──────────┐    real query     ┌────────────┐
 │ your app    ├────────────────►│ ProxySQL ├──────────────────►│ MySQL      │
 └─────────────┘                 │          │                   └────────────┘
                                 │          │  _flashback.*     ┌────────────┐
-                                │          ├──────────────────►│ dbtrail-   │
+                                │          ├──────────────────►│ bintrail   │
                                 │          │  _diff.*          │ shim       │
-                                │          │  _snapshot.*      │            │
-                                └──────────┘                   └─────┬──────┘
-                                                                     │ HTTP
-                                                                     ▼
-                                                              ┌────────────┐
-                                                              │ bintrail   │
-                                                              │ agent      │
-                                                              └────────────┘
+                                │          │  _snapshot.*      │ (:3308)    │
+                                └──────────┘                   └────────────┘
 ```
 
-The whole walkthrough takes about 15 minutes on a fresh Ubuntu 22.04 or Amazon Linux 2023 host.
+The whole walkthrough takes about 10 minutes on a fresh Ubuntu 22.04 or Amazon Linux 2023 host that already runs the bintrail agent.
 
 ---
 
@@ -33,45 +27,18 @@ The whole walkthrough takes about 15 minutes on a fresh Ubuntu 22.04 or Amazon L
 
 Before starting, you need:
 
-- **A running BYOS deployment.** Specifically: the `bintrail agent` is already streaming from your source MySQL into your S3 bucket and the dbtrail metadata API. If you haven't done this yet, follow [`docs/storage.md`](storage.md) (data separation) and the BYOS architecture section of [`docs/deployment.md`](deployment.md) first.
-- **A `.bintrail.env` file** with `BINTRAIL_SOURCE_DSN`, `BINTRAIL_SERVER_ID`, and `BINTRAIL_API_KEY` set. If you ran `bintrail config init` for your BYOS install you already have this.
-- **Root or `sudo` access** on the host where the shim and ProxySQL will run (typically the same EC2 instance as the agent).
+- **A running BYOS deployment.** The `bintrail agent` is already streaming from your source MySQL into your S3 bucket and the dbtrail metadata API. If you haven't done this yet, follow [`docs/storage.md`](storage.md) (data separation) and the BYOS architecture section of [`docs/deployment.md`](deployment.md) first.
+- **A `.bintrail.env` file** with `BINTRAIL_SOURCE_DSN` and `BINTRAIL_SERVER_ID` set. If you ran `bintrail config init` for your BYOS install you already have this.
+- **The `bintrail` binary** on the host (the same one running the agent). The shim is a subcommand — there is no second binary to download.
+- **Root or `sudo` access** on the host.
 - **The `mysql` client** installed on the host (used to apply ProxySQL config and to generate the password hash below).
 - **A MySQL user your application will use to connect through ProxySQL.** This is *not* the replication user the agent uses — it's a regular application user that ProxySQL authenticates against. Pick a username and a strong password; you'll need both below.
 
 ---
 
-## Step 1 — Download the shim binary
+## Step 1 — Generate `shim.yaml`
 
-The shim ships as a release asset on the `dbtrail/bintrail` GitHub repo:
-
-```sh
-# Linux x86_64
-sudo curl -fsSL -o /usr/local/bin/dbtrail-shim \
-  https://github.com/dbtrail/bintrail/releases/latest/download/dbtrail-shim-linux-amd64
-sudo chmod +x /usr/local/bin/dbtrail-shim
-```
-
-For other platforms swap the asset name:
-
-| OS / arch | Asset |
-|-----------|-------|
-| Linux x86_64 | `dbtrail-shim-linux-amd64` |
-| Linux arm64 | `dbtrail-shim-linux-arm64` |
-| macOS x86_64 | `dbtrail-shim-darwin-amd64` |
-| macOS arm64 | `dbtrail-shim-darwin-arm64` |
-
-Verify the binary runs:
-
-```sh
-dbtrail-shim --version
-```
-
----
-
-## Step 2 — Generate `shim.yaml`
-
-The shim reads its config from `shim.yaml`. `bintrail init-shim` scaffolds the file from your existing `.bintrail.env`:
+`bintrail init-shim` scaffolds the file from your existing `.bintrail.env`:
 
 ```sh
 cd /etc/bintrail   # or wherever your .bintrail.env lives
@@ -81,13 +48,11 @@ sudo bintrail init-shim --out shim.yaml
 The generated file has one tenant block populated from your `.bintrail.env`, plus two TODO lines for the application credentials:
 
 ```yaml
-listen: ':3308'
+listen: '127.0.0.1:3308'
 
 tenants:
   - server_id: '...'        # from BINTRAIL_SERVER_ID
     source_dsn: '...'       # from BINTRAIL_SOURCE_DSN
-    agent_url: 'http://localhost:8600'
-    agent_token: '...'      # from BINTRAIL_API_KEY
     # TODO: fill in your application's MySQL credentials
     # mysql_user: app_user
     # TODO: SHA1 hex of mysql_user's password
@@ -106,14 +71,6 @@ printf 'your-app-password' \
 
 (ProxySQL stores `mysql_native_password`'s double-SHA1 with a `*` prefix.)
 
-If you have a MySQL 5.7-style server handy with the legacy `PASSWORD()` function, this also works:
-
-```sh
-mysql -e "SELECT PASSWORD('your-app-password')"
-```
-
-Note that `PASSWORD()` was removed in MySQL 8.0 unless `default_authentication_plugin=mysql_native_password` is set, so the `printf | sha1sum` recipe is generally safer.
-
 Edit `shim.yaml`, uncomment the two TODO lines, and paste the values:
 
 ```yaml
@@ -121,9 +78,11 @@ Edit `shim.yaml`, uncomment the two TODO lines, and paste the values:
     mysql_pass_sha1: '*30D6BC64B4B66AC024BDC6551C3B28BB49320725'
 ```
 
+> **Auth note**: `bintrail shim` validates only the *username* against this file. ProxySQL holds the password gate (`mysql_pass_sha1`). The shim's listen address defaults to `127.0.0.1:3308` so nothing else can reach it directly — ProxySQL on the same host is the only legitimate caller.
+
 ---
 
-## Step 3 — Install ProxySQL
+## Step 2 — Install ProxySQL
 
 ProxySQL 2.6 (LTS) is the recommended release.
 
@@ -160,9 +119,9 @@ After install, ProxySQL listens on:
 
 ---
 
-## Step 4 — Apply the ProxySQL config
+## Step 3 — Apply the ProxySQL config
 
-`bintrail proxysql-config` reads `BINTRAIL_SOURCE_DSN` from `.bintrail.env` and `shim.yaml` from the previous steps and emits a deterministic SQL script:
+`bintrail proxysql-config` reads `BINTRAIL_SOURCE_DSN` from `.bintrail.env` and `shim.yaml` from the previous step and emits a deterministic SQL script:
 
 ```sh
 sudo bintrail proxysql-config --out proxysql-setup.sql
@@ -192,13 +151,13 @@ mysql -u admin -p -h 127.0.0.1 -P 6032 -e \
 
 ---
 
-## Step 5 — Run the shim under systemd
+## Step 4 — Run `bintrail shim` under systemd
 
-Create `/etc/systemd/system/dbtrail-shim.service`:
+Create `/etc/systemd/system/bintrail-shim.service`:
 
 ```ini
 [Unit]
-Description=dbtrail-shim - BYOS time-travel SQL backend for ProxySQL
+Description=bintrail shim - BYOS time-travel SQL backend for ProxySQL
 Documentation=https://github.com/dbtrail/bintrail/blob/main/docs/byos-time-travel-sql.md
 After=network-online.target proxysql.service
 Wants=network-online.target
@@ -206,7 +165,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/etc/bintrail
-ExecStart=/usr/local/bin/dbtrail-shim --config /etc/bintrail/shim.yaml
+EnvironmentFile=/etc/bintrail/.bintrail.env
+ExecStart=/usr/local/bin/bintrail shim --shim-config /etc/bintrail/shim.yaml
 Restart=on-failure
 RestartSec=5s
 
@@ -217,29 +177,31 @@ StandardError=journal
 WantedBy=multi-user.target
 ```
 
-> A copy of this unit ships at `deploy/dbtrail-shim.service` in the bintrail repo.
+> A copy of this unit ships at `deploy/bintrail-shim.service` in the bintrail repo.
+
+The unit reads `BINTRAIL_INDEX_DSN` from `/etc/bintrail/.bintrail.env` (the same file your agent uses) so the shim can answer queries against your index. Make sure that variable is set in the env file before enabling the service.
 
 Enable and start:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now dbtrail-shim
-sudo systemctl status dbtrail-shim
+sudo systemctl enable --now bintrail-shim
+sudo systemctl status bintrail-shim
 ```
 
 You should see `active (running)`. Tail the log if not:
 
 ```sh
-journalctl -u dbtrail-shim -f
+journalctl -u bintrail-shim -f
 ```
 
-The shim should report it is listening on `:3308` (or whatever you set `listen:` to in `shim.yaml`) once it has loaded its config. The `agent_url` in `shim.yaml` tells the shim where to reach the dbtrail-side service that resolves time-travel queries; the shim opens that connection lazily on the first matching query.
+The shim should report `shim listening addr=127.0.0.1:3308 tenants=N` once it has loaded `shim.yaml`.
 
 ---
 
-## Step 6 — Point your application at ProxySQL
+## Step 5 — Point your application at ProxySQL
 
-Change your application's MySQL connection string from the real MySQL port (`:3306`) to ProxySQL's MySQL port (`:6033`). The credentials are the `mysql_user` / `mysql_pass_sha1` pair from `shim.yaml` — the *plaintext* password you generated in step 2, not the SHA1.
+Change your application's MySQL connection string from the real MySQL port (`:3306`) to ProxySQL's MySQL port (`:6033`). The credentials are the `mysql_user` / `mysql_pass_sha1` pair from `shim.yaml` — the *plaintext* password you generated in step 1, not the SHA1.
 
 For example, with the Go MySQL driver:
 
@@ -255,7 +217,7 @@ Normal queries (`SELECT * FROM orders WHERE id = 1`) still go to your real MySQL
 
 ---
 
-## Step 7 — Run a time-travel query
+## Step 6 — Run a time-travel query
 
 Connect through ProxySQL:
 
@@ -263,13 +225,20 @@ Connect through ProxySQL:
 mysql -u app_user -p -h 127.0.0.1 -P 6033 myapp
 ```
 
-Run a flashback query against any table the agent has been streaming:
+Three statement shapes are recognised:
 
 ```sql
+-- Row state at a point in time:
 SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
+
+-- Same shape, reserved for future baseline-lookup integration:
+SELECT * FROM _snapshot.orders  AS OF '2026-05-02 10:00:00' WHERE id = 12345;
+
+-- All events for one row in a time window:
+SELECT * FROM _diff.orders BETWEEN '2026-05-01' AND '2026-05-02' WHERE id = 12345;
 ```
 
-The shim resolves the row to its state at that exact timestamp by replaying the relevant binlog events from the agent's buffer (or from S3 if the timestamp is older than the buffer's retention window).
+The shim resolves the row by replaying the relevant binlog events from your bintrail MySQL index. If the timestamp falls outside the index's retention (because hourly partitions have been rotated to S3), the shim auto-discovers the customer-side Parquet archives via `archive_state` and merges results from both sources — same machinery `bintrail query` and `bintrail recover` already use.
 
 ---
 
@@ -277,7 +246,7 @@ The shim resolves the row to its state at that exact timestamp by replaying the 
 
 ### `ERROR 1045: Access denied for user 'app_user'@'…'`
 
-ProxySQL is rejecting your credentials. Re-run the SHA1 recipe from step 2 against your app's password and compare against `mysql_pass_sha1` in `shim.yaml`:
+ProxySQL is rejecting your credentials. Re-run the SHA1 recipe from step 1 against your app's password and compare against `mysql_pass_sha1` in `shim.yaml`:
 
 ```sh
 printf 'your-app-password' \
@@ -294,6 +263,8 @@ sudo bintrail proxysql-config --out proxysql-setup.sql
 mysql -u admin -p -h 127.0.0.1 -P 6032 < proxysql-setup.sql
 ```
 
+If the username comes through but the connection still fails, check `bintrail shim`'s log: it logs which usernames are in the allowlist at startup, and a connection from an unknown username is rejected by `TenantAuth.CheckUsername`.
+
 ### `_flashback.t doesn't exist` (or query goes to MySQL instead of the shim)
 
 The query rule isn't matching. Inspect the routing:
@@ -305,37 +276,26 @@ mysql -u admin -p -h 127.0.0.1 -P 6032 \
 
 You should see three rows targeting hostgroup 991. If they're missing, re-apply `proxysql-setup.sql`. If they're present but the query still goes to MySQL, double-check that no operator rule with a smaller `rule_id` is intercepting `_flashback.*` first (ProxySQL evaluates rules in `rule_id` order).
 
-### `connection refused` from the shim's port
+### `connection refused` on the shim's port
 
-The shim isn't running, or it's listening on a different port than `shim.yaml`'s `listen` directive.
+`bintrail shim` isn't running, or it's listening on a different port than `shim.yaml`'s `listen` directive.
 
 ```sh
-systemctl status dbtrail-shim
+systemctl status bintrail-shim
 ss -tlnp | grep 3308
 ```
 
-If `dbtrail-shim` is dead, `journalctl -u dbtrail-shim -n 100` shows why. Common causes: missing or unreadable `shim.yaml`, agent unreachable at `agent_url`, a `mysql_pass_sha1` that's not a valid `*HEX` string.
+If `bintrail-shim` is dead, `journalctl -u bintrail-shim -n 100` shows why. Common causes: missing or unreadable `shim.yaml`, missing `BINTRAIL_INDEX_DSN`, a `mysql_pass_sha1` value that's not a valid YAML string (quote it).
 
 ### Time-travel query returns empty
 
-Either the row didn't exist at that timestamp, or the requested time falls in a gap between the agent's in-memory buffer and the S3 archive. Check the agent's recent log output:
+Either the row didn't exist at that timestamp, or the requested time falls in a gap between the live bintrail index and the S3 archive. Check the agent's recent log output:
 
 ```sh
 journalctl -u bintrail-agent -n 200
 ```
 
-The buffer retains the last `--buffer-retain` (default `6h`) and S3 has everything older that has been flushed. See [`docs/storage.md`](storage.md) for the buffer query priority and S3 flush cadence.
-
-### `agent_url` connection refused from the shim
-
-If `dbtrail-shim` reports it cannot reach the URL set in `shim.yaml`'s `agent_url`, confirm the bintrail agent is running and that nothing else is binding the same port locally:
-
-```sh
-systemctl status bintrail-agent
-ss -tlnp | grep 8600
-```
-
-If you have changed `agent_url` to point somewhere other than the default `http://localhost:8600`, double-check the shim config matches the address that service is actually bound to.
+The bintrail index retains the most recent hours via partition rotation; older data is in S3 (auto-discovered via `archive_state`). See [`docs/storage.md`](storage.md) for the buffer query priority and S3 flush cadence.
 
 ### Operator already has users in hostgroup 990
 
@@ -345,6 +305,7 @@ If you have changed `agent_url` to point somewhere other than the default `http:
 
 ## Limitations
 
-- **Single source MySQL per shim.** The current shim is one-tenant-per-instance. If you have multiple source MySQLs you want time-travel SQL against, run one shim per instance with separate listen ports and separate ProxySQL hostgroups.
-- **No TLS termination on the shim port.** The shim accepts plain MySQL protocol. If you need TLS between ProxySQL and the shim, terminate at ProxySQL or via an `stunnel` sidecar.
+- **Single source MySQL per shim.** The current `bintrail shim` is one-tenant-per-instance. If you have multiple source MySQLs you want time-travel SQL against, run one shim per instance with separate listen ports and separate ProxySQL hostgroups.
+- **No TLS termination on the shim port.** `bintrail shim` accepts plain MySQL protocol on `127.0.0.1:3308` by default. If you need TLS between ProxySQL and the shim, terminate at ProxySQL or via an `stunnel` sidecar.
+- **`_snapshot` is currently a synonym for `_flashback`.** The shim reserves the `_snapshot.*` virtual schema for a future baseline-lookup integration (the `bintrail dump` / `bintrail baseline` pipeline) so it can answer for rows that have never appeared in binlog events. Today both schemas resolve to "row state at the most recent event at-or-before the given timestamp".
 - **ProxySQL itself is not provisioned by bintrail.** `bintrail proxysql-config` only writes routing rules; you install and harden ProxySQL itself (admin password, frontend TLS, monitoring) using the standard ProxySQL docs.

@@ -24,8 +24,7 @@ func setShimEnv(t *testing.T) {
 
 func resetShimFlags() {
 	isOut = "shim.yaml"
-	isListen = ":3308"
-	isAgentURL = "http://localhost:8600"
+	isListen = "127.0.0.1:3308"
 }
 
 func TestRunInitShim(t *testing.T) {
@@ -55,13 +54,7 @@ func TestRunInitShim(t *testing.T) {
 		if !strings.Contains(content, "server_id: '"+testServerID+"'") {
 			t.Error("expected server_id in tenant block")
 		}
-		if !strings.Contains(content, "agent_token: '"+testAPIKey+"'") {
-			t.Error("expected agent_token in output")
-		}
-		if !strings.Contains(content, "agent_url: 'http://localhost:8600'") {
-			t.Error("expected default agent_url in output")
-		}
-		if !strings.Contains(content, "listen: ':3308'") {
+		if !strings.Contains(content, "listen: '127.0.0.1:3308'") {
 			t.Error("expected default listen in output")
 		}
 		if !strings.Contains(content, "# TODO") {
@@ -77,14 +70,13 @@ func TestRunInitShim(t *testing.T) {
 	t.Run("errors when env vars missing", func(t *testing.T) {
 		t.Setenv("BINTRAIL_SOURCE_DSN", "")
 		t.Setenv("BINTRAIL_SERVER_ID", "")
-		t.Setenv("BINTRAIL_API_KEY", "")
 		resetShimFlags()
 
 		err := runInitShim(initShimCmd, nil)
 		if err == nil {
 			t.Fatal("expected error when env vars missing")
 		}
-		for _, want := range []string{"BINTRAIL_SOURCE_DSN", "BINTRAIL_SERVER_ID", "BINTRAIL_API_KEY"} {
+		for _, want := range []string{"BINTRAIL_SOURCE_DSN", "BINTRAIL_SERVER_ID"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("expected %s in error, got %v", want, err)
 			}
@@ -93,14 +85,14 @@ func TestRunInitShim(t *testing.T) {
 
 	t.Run("errors when only one env var missing", func(t *testing.T) {
 		setShimEnv(t)
-		t.Setenv("BINTRAIL_API_KEY", "")
+		t.Setenv("BINTRAIL_SERVER_ID", "")
 		resetShimFlags()
 
 		err := runInitShim(initShimCmd, nil)
 		if err == nil {
-			t.Fatal("expected error when BINTRAIL_API_KEY missing")
+			t.Fatal("expected error when BINTRAIL_SERVER_ID missing")
 		}
-		if !strings.Contains(err.Error(), "BINTRAIL_API_KEY") {
+		if !strings.Contains(err.Error(), "BINTRAIL_SERVER_ID") {
 			t.Errorf("expected error to name missing var, got %v", err)
 		}
 		if strings.Contains(err.Error(), "BINTRAIL_SOURCE_DSN") {
@@ -140,15 +132,20 @@ func TestRunInitShim(t *testing.T) {
 	})
 
 	t.Run("rejects env values containing newline", func(t *testing.T) {
+		dir := t.TempDir()
+		orig, _ := os.Getwd()
+		t.Cleanup(func() { os.Chdir(orig) })
+		os.Chdir(dir)
+
 		setShimEnv(t)
-		t.Setenv("BINTRAIL_API_KEY", "tok\nwith-newline")
+		t.Setenv("BINTRAIL_SOURCE_DSN", "user:pass@tcp(host:3306)/db\nwith-newline")
 		resetShimFlags()
 
 		err := runInitShim(initShimCmd, nil)
 		if err == nil {
-			t.Fatal("expected error for newline in API key")
+			t.Fatal("expected error for newline in DSN")
 		}
-		if !strings.Contains(err.Error(), "BINTRAIL_API_KEY") || !strings.Contains(err.Error(), "newline") {
+		if !strings.Contains(err.Error(), "BINTRAIL_SOURCE_DSN") || !strings.Contains(err.Error(), "newline") {
 			t.Errorf("expected error to name the env var and 'newline', got: %v", err)
 		}
 	})
@@ -177,15 +174,15 @@ func TestRunInitShim(t *testing.T) {
 }
 
 func TestGenerateShimYAMLDeterministic(t *testing.T) {
-	a := generateShimYAML(testSourceDSN, testServerID, testAPIKey, ":3308", "http://localhost:8600")
-	b := generateShimYAML(testSourceDSN, testServerID, testAPIKey, ":3308", "http://localhost:8600")
+	a := generateShimYAML(testSourceDSN, testServerID, ":3308")
+	b := generateShimYAML(testSourceDSN, testServerID, ":3308")
 	if a != b {
 		t.Errorf("generateShimYAML must be deterministic; got two different outputs:\n--- a ---\n%s\n--- b ---\n%s", a, b)
 	}
 }
 
 func TestGenerateShimYAMLContents(t *testing.T) {
-	out := generateShimYAML(testSourceDSN, testServerID, testAPIKey, ":9999", "http://agent.local:8600")
+	out := generateShimYAML(testSourceDSN, testServerID, ":9999")
 
 	wants := []string{
 		"# Bintrail BYOS time-travel SQL",
@@ -194,8 +191,6 @@ func TestGenerateShimYAMLContents(t *testing.T) {
 		"tenants:",
 		"server_id: '" + testServerID + "'",
 		"source_dsn: '" + testSourceDSN + "'",
-		"agent_url: 'http://agent.local:8600'",
-		"agent_token: '" + testAPIKey + "'",
 		"# mysql_user:",
 		"# mysql_pass_sha1:",
 	}
@@ -206,14 +201,28 @@ func TestGenerateShimYAMLContents(t *testing.T) {
 	}
 }
 
+// TestGenerateShimYAMLContainsNoLegacyFields locks in the migration
+// to in-process bintrail shim: the `agent_url` and `agent_token`
+// fields the external dbtrail-shim required are no longer emitted.
+// LoadTenantUsers in internal/shim/auth.go still tolerates them in
+// existing files (strict YAML knows about the keys), but new
+// scaffolds shouldn't carry them.
+func TestGenerateShimYAMLContainsNoLegacyFields(t *testing.T) {
+	out := generateShimYAML(testSourceDSN, testServerID, ":3308")
+	for _, legacy := range []string{"agent_url", "agent_token"} {
+		if strings.Contains(out, legacy+":") {
+			t.Errorf("generated shim.yaml should no longer emit %s:; got:\n%s", legacy, out)
+		}
+	}
+}
+
 // TestGenerateShimYAMLQuoting locks in the YAML single-quoted scalar
 // behavior: values are wrapped in single quotes, and any embedded single
-// quotes are doubled. This protects against DSNs or API keys containing
-// ':' (followed by space), '#', '{', '[', leading whitespace, or '\''
-// from producing invalid YAML.
+// quotes are doubled. Protects against DSNs containing ':', '#', '{',
+// '[', leading whitespace, or '\''.
 func TestGenerateShimYAMLQuoting(t *testing.T) {
 	tricky := "user:pass@tcp(h#ost:3306)/db's_name"
-	out := generateShimYAML(tricky, "1", "tok", ":3308", "http://localhost:8600")
+	out := generateShimYAML(tricky, "1", ":3308")
 
 	want := "source_dsn: 'user:pass@tcp(h#ost:3306)/db''s_name'"
 	if !strings.Contains(out, want) {

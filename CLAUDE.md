@@ -63,10 +63,11 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `upload` | `upload.go` | `--source` (req), `--destination` (req), `--region`, `--retry`, `--index-dsn` |
 | `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--buffer-max-events` (default `0`), `--buffer-max-bytes` (default `0`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid`, `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`), `--max-reconnect-attempts` (default `10`), `--validate` |
 | `config init` | `config.go` | `--global` |
-| `init-shim` | `init_shim.go` | `--out` (default `shim.yaml`, `-` for stdout), `--listen` (default `:3308`), `--agent-url` (default `http://localhost:8600`); reads `BINTRAIL_SOURCE_DSN`, `BINTRAIL_SERVER_ID`, `BINTRAIL_API_KEY` |
+| `init-shim` | `init_shim.go` | `--out` (default `shim.yaml`, `-` for stdout), `--listen` (default `127.0.0.1:3308`); reads `BINTRAIL_SOURCE_DSN`, `BINTRAIL_SERVER_ID` |
 | `proxysql-config` | `proxysql_config.go` | `--out` (default `proxysql-setup.sql`, `-` for stdout), `--shim-config` (default `shim.yaml`), `--mysql-port` (default `3306`), `--shim-port` (default `3308`), `--proxysql-mysql-port` (default `6033`); reads `BINTRAIL_SOURCE_DSN` and shim.yaml; outputs SQL using hostgroups 990/991 and rule_ids 990001-990003 |
+| `shim` | `shim.go` | `--listen` (default `127.0.0.1:3308`), `--index-dsn` (req), `--shim-config` (default `shim.yaml`), `--no-archive`; in-process MySQL-protocol server for `_flashback`/`_diff`/`_snapshot` virtual schemas, sits behind ProxySQL |
 
-Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`, `isOut`, `pcOut`).
+Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`, `isOut`, `pcOut`, `shListen`).
 
 ### Environment file loading
 
