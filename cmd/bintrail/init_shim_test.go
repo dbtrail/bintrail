@@ -49,16 +49,19 @@ func TestRunInitShim(t *testing.T) {
 		}
 
 		content := string(data)
-		if !strings.Contains(content, "source_dsn: "+testSourceDSN) {
-			t.Errorf("expected source_dsn in output, got:\n%s", content)
+		if !strings.Contains(content, "source_dsn: '"+testSourceDSN+"'") {
+			t.Errorf("expected single-quoted source_dsn, got:\n%s", content)
 		}
-		if !strings.Contains(content, "agent_token: "+testAPIKey) {
+		if !strings.Contains(content, "server_id: '"+testServerID+"'") {
+			t.Error("expected server_id in tenant block")
+		}
+		if !strings.Contains(content, "agent_token: '"+testAPIKey+"'") {
 			t.Error("expected agent_token in output")
 		}
-		if !strings.Contains(content, "agent_url: http://localhost:8600") {
+		if !strings.Contains(content, "agent_url: 'http://localhost:8600'") {
 			t.Error("expected default agent_url in output")
 		}
-		if !strings.Contains(content, "listen: :3308") {
+		if !strings.Contains(content, "listen: ':3308'") {
 			t.Error("expected default listen in output")
 		}
 		if !strings.Contains(content, "# TODO") {
@@ -131,7 +134,7 @@ func TestRunInitShim(t *testing.T) {
 		w.Close()
 		out := string(<-done)
 
-		if !strings.Contains(out, "source_dsn: "+testSourceDSN) {
+		if !strings.Contains(out, "source_dsn: '"+testSourceDSN+"'") {
 			t.Errorf("stdout missing source_dsn:\n%s", out)
 		}
 	})
@@ -160,24 +163,25 @@ func TestRunInitShim(t *testing.T) {
 }
 
 func TestGenerateShimYAMLDeterministic(t *testing.T) {
-	a := generateShimYAML(testSourceDSN, testAPIKey, ":3308", "http://localhost:8600")
-	b := generateShimYAML(testSourceDSN, testAPIKey, ":3308", "http://localhost:8600")
+	a := generateShimYAML(testSourceDSN, testServerID, testAPIKey, ":3308", "http://localhost:8600")
+	b := generateShimYAML(testSourceDSN, testServerID, testAPIKey, ":3308", "http://localhost:8600")
 	if a != b {
 		t.Errorf("generateShimYAML must be deterministic; got two different outputs:\n--- a ---\n%s\n--- b ---\n%s", a, b)
 	}
 }
 
 func TestGenerateShimYAMLContents(t *testing.T) {
-	out := generateShimYAML(testSourceDSN, testAPIKey, ":9999", "http://agent.local:8600")
+	out := generateShimYAML(testSourceDSN, testServerID, testAPIKey, ":9999", "http://agent.local:8600")
 
 	wants := []string{
 		"# Bintrail BYOS time-travel SQL",
 		"docs/byos-time-travel-sql.md",
-		"listen: :9999",
+		"listen: ':9999'",
 		"tenants:",
-		"source_dsn: " + testSourceDSN,
-		"agent_url: http://agent.local:8600",
-		"agent_token: " + testAPIKey,
+		"server_id: '" + testServerID + "'",
+		"source_dsn: '" + testSourceDSN + "'",
+		"agent_url: 'http://agent.local:8600'",
+		"agent_token: '" + testAPIKey + "'",
 		"# mysql_user:",
 		"# mysql_pass_sha1:",
 	}
@@ -185,5 +189,20 @@ func TestGenerateShimYAMLContents(t *testing.T) {
 		if !strings.Contains(out, w) {
 			t.Errorf("output missing %q; full output:\n%s", w, out)
 		}
+	}
+}
+
+// TestGenerateShimYAMLQuoting locks in the YAML single-quoted scalar
+// behavior: values are wrapped in single quotes, and any embedded single
+// quotes are doubled. This protects against DSNs or API keys containing
+// ':' (followed by space), '#', '{', '[', leading whitespace, or '\''
+// from producing invalid YAML.
+func TestGenerateShimYAMLQuoting(t *testing.T) {
+	tricky := "user:pass@tcp(h#ost:3306)/db's_name"
+	out := generateShimYAML(tricky, "1", "tok", ":3308", "http://localhost:8600")
+
+	want := "source_dsn: 'user:pass@tcp(h#ost:3306)/db''s_name'"
+	if !strings.Contains(out, want) {
+		t.Errorf("expected quoted-and-escaped source_dsn line %q in output:\n%s", want, out)
 	}
 }
