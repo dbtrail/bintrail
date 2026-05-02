@@ -48,19 +48,32 @@ query shape supported is _flashback. Use --listen to change the port
 }
 
 var (
-	shListen   string
-	shIndexDSN string
+	shListen     string
+	shIndexDSN   string
+	shShimConfig string
+	shNoArchive  bool
 )
 
 func init() {
-	shimCmd.Flags().StringVar(&shListen, "listen", ":3308", "Listen address for the MySQL protocol port")
+	shimCmd.Flags().StringVar(&shListen, "listen", "127.0.0.1:3308", "Listen address for the MySQL protocol port (default: localhost-only — keep ProxySQL as the auth gate)")
 	shimCmd.Flags().StringVar(&shIndexDSN, "index-dsn", "", "DSN of the bintrail MySQL index")
+	shimCmd.Flags().StringVar(&shShimConfig, "shim-config", "shim.yaml", "Path to shim.yaml (the file produced by 'bintrail init-shim')")
+	shimCmd.Flags().BoolVar(&shNoArchive, "no-archive", false, "Skip archive auto-discovery; query only the live MySQL index")
 	_ = shimCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(shimCmd)
 	rootCmd.AddCommand(shimCmd)
 }
 
 func runShim(cmd *cobra.Command, args []string) error {
+	users, err := shim.LoadTenantUsers(shShimConfig)
+	if err != nil {
+		return err
+	}
+	auth, err := shim.NewTenantAuth(users)
+	if err != nil {
+		return err
+	}
+
 	db, err := config.Connect(shIndexDSN)
 	if err != nil {
 		return fmt.Errorf("connect to index: %w", err)
@@ -73,7 +86,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 	}
 	defer listener.Close()
 
-	slog.Info("shim listening", "addr", shListen)
+	slog.Info("shim listening", "addr", shListen, "tenants", len(users))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -88,7 +101,8 @@ func runShim(cmd *cobra.Command, args []string) error {
 		listener.Close()
 	}()
 
-	serveLoop(ctx, listener, db)
+	cfg := shim.Config{AllowGaps: true, NoArchive: shNoArchive}
+	serveLoop(ctx, listener, db, auth, cfg)
 	return nil
 }
 
@@ -96,7 +110,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 // connection runs in its own goroutine with its own Handler instance
 // (Handler holds per-connection state: the currently-selected
 // database).
-func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB) {
+func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim.TenantAuth, cfg shim.Config) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
@@ -118,7 +132,7 @@ func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB) {
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			handleConn(c, db)
+			handleConn(c, db, auth, cfg)
 		}(conn)
 	}
 }
@@ -126,12 +140,12 @@ func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB) {
 // handleConn wraps one accepted TCP connection in go-mysql/server's
 // Conn (which performs the MySQL handshake + auth) and dispatches
 // every COM_QUERY through our Handler.
-func handleConn(c net.Conn, db *sql.DB) {
+func handleConn(c net.Conn, db *sql.DB, auth shim.TenantAuth, cfg shim.Config) {
 	defer c.Close()
 
-	handler := shim.NewHandler(db, slog.Default())
+	handler := shim.NewHandlerWithConfig(db, cfg, slog.Default())
 	srv := server.NewDefaultServer()
-	mysqlConn, err := server.NewCustomizedConn(c, srv, shim.AcceptAuth{}, handler)
+	mysqlConn, err := server.NewCustomizedConn(c, srv, auth, handler)
 	if err != nil {
 		slog.Error("mysql handshake failed", "err", err, "remote", c.RemoteAddr())
 		return

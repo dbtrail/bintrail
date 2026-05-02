@@ -22,25 +22,46 @@ import (
 // and a handful of bookkeeping queries the standard MySQL clients send
 // during connection setup.
 //
-// Anything else returns a clear error to the client. The MVP does not
-// proxy non-flashback queries to the real MySQL — that's the job of
-// ProxySQL sitting in front of the shim.
+// Anything else returns a clear error to the client. The handler does
+// not proxy non-flashback queries to the real MySQL — that's the job
+// of ProxySQL sitting in front of the shim.
 type Handler struct {
 	server.EmptyHandler
 
 	indexDB *sql.DB
+	cfg     Config
 	logger  *slog.Logger
 
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
 }
 
-// NewHandler constructs a Handler bound to a bintrail index DSN.
+// Config tunes the shim's data-fetch behaviour. Zero values are valid:
+// the handler then queries only the live MySQL index (the same shape
+// the original MVP shipped with).
+type Config struct {
+	// AllowGaps mirrors query.FetchMergedOptions.AllowGaps. The shim
+	// defaults to true so coverage gaps surface as slog.Warn rather
+	// than aborting the customer's query — matches the warn-and-continue
+	// behaviour of bintrail recover.
+	AllowGaps bool
+	// NoArchive disables archive auto-discovery + the archive fetch
+	// loop, even if archive_state has rows. Defaults to false.
+	NoArchive bool
+}
+
+// NewHandler constructs a Handler bound to a bintrail index DSN with
+// default config (archives auto-discovered, gaps warned).
 func NewHandler(indexDB *sql.DB, logger *slog.Logger) *Handler {
+	return NewHandlerWithConfig(indexDB, Config{AllowGaps: true}, logger)
+}
+
+// NewHandlerWithConfig is the configurable form of NewHandler.
+func NewHandlerWithConfig(indexDB *sql.DB, cfg Config, logger *slog.Logger) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{indexDB: indexDB, logger: logger}
+	return &Handler{indexDB: indexDB, cfg: cfg, logger: logger}
 }
 
 // UseDB stores the schema the client selected. _flashback queries
@@ -105,15 +126,20 @@ func (h *Handler) runFlashback(q FlashbackQuery) (*mysql.Result, error) {
 	defer cancel()
 
 	engine := query.New(h.indexDB)
-	rows, err := engine.Fetch(ctx, query.Options{
-		Schema:   q.Schema,
-		Table:    q.Table,
-		PKValues: q.PKValue,
-		Until:    &q.AsOf,
-		Limit:    1,
+	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
+		Opts: query.Options{
+			Schema:   q.Schema,
+			Table:    q.Table,
+			PKValues: q.PKValue,
+			Until:    &q.AsOf,
+			Limit:    1,
+		},
+		DBName:    q.Schema,
+		NoArchive: h.cfg.NoArchive,
+		AllowGaps: h.cfg.AllowGaps,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("query bintrail index: %w", err)
+		return nil, fmt.Errorf("resolve _flashback: %w", err)
 	}
 
 	if len(rows) == 0 {
@@ -200,22 +226,3 @@ func isHandshakeNoise(q string) bool {
 	return false
 }
 
-// AcceptAuth is a credential provider that accepts any username and
-// password. This is MVP-only: a real deployment must validate against
-// the credentials configured in shim.yaml's mysql_user /
-// mysql_pass_sha1, the same way ProxySQL does.
-type AcceptAuth struct{}
-
-// CheckUsername implements server.CredentialProvider.
-func (AcceptAuth) CheckUsername(string) (bool, error) { return true, nil }
-
-// GetCredential implements server.CredentialProvider.
-//
-// Returning the empty plaintext + found=true tells go-mysql/server to
-// run the mysql_native_password challenge against an empty password.
-// Clients that send an empty password will succeed; clients that send
-// any password will see auth fail. This is intentionally permissive
-// for the MVP — the shim has no real authentication yet.
-func (AcceptAuth) GetCredential(string) (string, bool, error) {
-	return "", true, nil
-}

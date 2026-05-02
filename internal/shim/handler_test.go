@@ -138,7 +138,8 @@ func TestEndToEndHandshake(t *testing.T) {
 		h := NewHandler(nil, nil) // no DB needed for handshake-only test
 		h.UseDB("myapp")
 		srv := server.NewDefaultServer()
-		mc, err := server.NewCustomizedConn(c, srv, AcceptAuth{}, h)
+		auth, _ := NewTenantAuth([]string{"test"})
+		mc, err := server.NewCustomizedConn(c, srv, auth, h)
 		if err != nil {
 			serverErr <- err
 			return
@@ -216,9 +217,9 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-// Compile-time check: AcceptAuth implements the credential provider
+// Compile-time check: TenantAuth implements the credential provider
 // interface.
-var _ server.CredentialProvider = AcceptAuth{}
+var _ server.CredentialProvider = TenantAuth{}
 
 // Compile-time check: nil-safe constructor returns a real Handler.
 var _ = func() *Handler {
