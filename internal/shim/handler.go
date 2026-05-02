@@ -3,6 +3,7 @@ package shim
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 
+	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
 )
 
@@ -73,55 +75,59 @@ func (h *Handler) UseDB(dbName string) error {
 	return nil
 }
 
-// HandleQuery dispatches the incoming statement. The order matters: we
-// first try to parse it as a _flashback query; that catches every
-// statement Parse considers well-formed. Everything else falls through
-// to a small allow-list of harmless setup queries (so MySQL clients
-// don't choke during the handshake-adjacent SET/SELECT spam).
+// HandleQuery dispatches the incoming statement. We first try to
+// parse it as a time-travel query (any of _flashback, _snapshot,
+// _diff); if it's recognised but malformed we return that error to
+// the client. If it's something else entirely we fall through to a
+// small allow-list of handshake noise so MySQL clients don't choke
+// on connection setup.
 func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 	h.mu.Lock()
 	currentDB := h.db
 	h.mu.Unlock()
 
-	// Step 1: is this a _flashback query? If yes, run it; if it's
-	// recognised but malformed, return that error to the client. If
-	// it's something else entirely, fall through to step 2.
-	fq, perr := Parse(qstr, currentDB)
+	q, perr := Parse(qstr, currentDB)
 	if perr == nil {
-		return h.runFlashback(fq)
+		switch q.Type {
+		case TypeFlashback, TypeSnapshot:
+			return h.runPointInTime(q)
+		case TypeDiff:
+			return h.runDiff(q)
+		default:
+			return nil, fmt.Errorf("unsupported query type: %s", q.Type)
+		}
 	}
-	if !errors.Is(perr, ErrNotFlashback) {
+	if !errors.Is(perr, ErrNotTimeTravel) {
 		return nil, perr
 	}
 
-	// Step 2: handshake noise. Modern MySQL clients (mysql CLI,
-	// go-sql-driver) issue SET / SELECT @@variable / SHOW WARNINGS at
-	// connection time; refusing them aborts the handshake. Reply with
-	// empty success or known-safe values for the common cases.
 	if isHandshakeNoise(qstr) {
 		return &mysql.Result{Status: 2}, nil
 	}
 
 	return nil, fmt.Errorf(
-		"this server only handles `SELECT * FROM _flashback.<table> AS OF '<ts>' WHERE <col> = <value>` queries; got: %s",
+		"this server only handles _flashback / _snapshot / _diff virtual-schema queries; got: %s",
 		strings.TrimSpace(qstr),
 	)
 }
 
-// runFlashback resolves a parsed FlashbackQuery against the bintrail
-// index and reconstructs the row's state at q.AsOf.
+// runPointInTime resolves a _flashback or _snapshot query against
+// the bintrail index + archives and reconstructs the row's state at
+// q.AsOf.
 //
-// MVP semantics: this returns the row_after of the most recent event
-// for that PK at or before q.AsOf. That's the right answer for tables
-// where the latest event before the cutoff captures the row's state,
-// which holds for any INSERT/UPDATE — the core use case.
+// Semantics: returns the row_after of the most recent event for that
+// PK at-or-before q.AsOf. That's the right answer for INSERT/UPDATE
+// (the post-image is the row's state). For a DELETE, we fall back to
+// the DELETE's row_before — the row's state captured at the moment
+// of deletion. A future revision could distinguish "row didn't exist
+// at AsOf" from "row was just deleted" using event_type, but the
+// MVP treats both as "here's the most recent known state".
 //
-// Edge case (not yet handled): if the most recent event is a DELETE,
-// the row didn't exist at q.AsOf and the result should be empty. The
-// MVP returns the DELETE's row_before instead, which is technically
-// the row's state immediately *before* deletion. A proper
-// implementation would distinguish these two cases.
-func (h *Handler) runFlashback(q FlashbackQuery) (*mysql.Result, error) {
+// _flashback and _snapshot share this implementation today. _snapshot
+// is intended to grow baseline-lookup support (querying the
+// dump/baseline pipeline for rows that never appeared in binlog
+// events) — that's a future iteration.
+func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -139,7 +145,7 @@ func (h *Handler) runFlashback(q FlashbackQuery) (*mysql.Result, error) {
 		AllowGaps: h.cfg.AllowGaps,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("resolve _flashback: %w", err)
+		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)
 	}
 
 	if len(rows) == 0 {
@@ -155,8 +161,6 @@ func (h *Handler) runFlashback(q FlashbackQuery) (*mysql.Result, error) {
 	})
 	latest := rows[0]
 
-	// Prefer row_after (post-image after INSERT/UPDATE). Fall back to
-	// row_before (the row's state captured at the point of DELETE).
 	var image map[string]any
 	switch {
 	case len(latest.RowAfter) > 0:
@@ -168,6 +172,95 @@ func (h *Handler) runFlashback(q FlashbackQuery) (*mysql.Result, error) {
 	}
 
 	return imageToResult(image)
+}
+
+// runDiff resolves a _diff query: every event for the given PK
+// between q.Since and q.Until, one resultset row per event.
+//
+// Each resultset row exposes the event metadata (event_id,
+// event_timestamp, event_type, gtid) plus the row_after and
+// row_before images encoded as JSON strings. Customers run this when
+// they need an audit-style view of "what changed to this row in this
+// time window".
+func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	engine := query.New(h.indexDB)
+	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
+		Opts: query.Options{
+			Schema:   q.Schema,
+			Table:    q.Table,
+			PKValues: q.PKValue,
+			Since:    &q.Since,
+			Until:    &q.Until,
+			Limit:    diffMaxRows,
+		},
+		DBName:    q.Schema,
+		NoArchive: h.cfg.NoArchive,
+		AllowGaps: h.cfg.AllowGaps,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)
+	}
+
+	cols := []string{"event_id", "event_timestamp", "event_type", "gtid", "row_before", "row_after"}
+	values := make([][]any, 0, len(rows))
+	for _, r := range rows {
+		gtid := ""
+		if r.GTID != nil {
+			gtid = *r.GTID
+		}
+		values = append(values, []any{
+			r.EventID,
+			r.EventTimestamp.UTC().Format("2006-01-02 15:04:05"),
+			eventTypeName(r.EventType),
+			gtid,
+			marshalImage(r.RowBefore),
+			marshalImage(r.RowAfter),
+		})
+	}
+	rs, err := mysql.BuildSimpleTextResultset(cols, values)
+	if err != nil {
+		return nil, fmt.Errorf("build _diff resultset: %w", err)
+	}
+	return &mysql.Result{Resultset: rs}, nil
+}
+
+// diffMaxRows caps a single _diff response. 1000 events is enough
+// for any realistic per-PK history within a customer-facing window;
+// a hot row that exceeded this would still be queryable via repeated
+// narrower-range calls.
+const diffMaxRows = 1000
+
+// eventTypeName turns parser.EventType (a uint8) into a human-readable
+// string for the _diff resultset. The parser package does not export a
+// String() method so this lookup lives here.
+func eventTypeName(t parser.EventType) string {
+	switch t {
+	case parser.EventInsert:
+		return "INSERT"
+	case parser.EventUpdate:
+		return "UPDATE"
+	case parser.EventDelete:
+		return "DELETE"
+	}
+	return fmt.Sprintf("type_%d", t)
+}
+
+// marshalImage renders a row image as a JSON string for the _diff
+// resultset. nil maps render as the empty string so customers can
+// distinguish "no image" (INSERT lacks row_before, DELETE lacks
+// row_after) from "empty image".
+func marshalImage(image map[string]any) string {
+	if image == nil {
+		return ""
+	}
+	b, err := json.Marshal(image)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // imageToResult turns a single-row JSON object into a mysql.Result
