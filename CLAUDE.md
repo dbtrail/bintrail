@@ -63,8 +63,9 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `upload` | `upload.go` | `--source` (req), `--destination` (req), `--region`, `--retry`, `--index-dsn` |
 | `agent` | `agent.go` | `--api-key` (req), `--endpoint` (req), `--index-dsn`, `--source-dsn`, `--archive-dir`, `--archive-s3`, `--server-id`, `--buffer-retain` (default `6h`), `--buffer-max-events` (default `0`), `--buffer-max-bytes` (default `0`), `--batch-size`, `--schemas`, `--tables`, `--start-gtid`, `--s3-bucket`, `--s3-region`, `--s3-prefix` (default `bintrail/`), `--flush-interval` (default `5s`), `--max-reconnect-attempts` (default `10`), `--validate` |
 | `config init` | `config.go` | `--global` |
+| `init-shim` | `init_shim.go` | `--out` (default `shim.yaml`, `-` for stdout), `--listen` (default `:3308`), `--agent-url` (default `http://localhost:8600`); reads `BINTRAIL_SOURCE_DSN`, `BINTRAIL_SERVER_ID`, `BINTRAIL_API_KEY` |
 
-Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`).
+Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`, `isOut`).
 
 ### Environment file loading
 
