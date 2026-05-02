@@ -139,6 +139,20 @@ func TestRunInitShim(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects env values containing newline", func(t *testing.T) {
+		setShimEnv(t)
+		t.Setenv("BINTRAIL_API_KEY", "tok\nwith-newline")
+		resetShimFlags()
+
+		err := runInitShim(initShimCmd, nil)
+		if err == nil {
+			t.Fatal("expected error for newline in API key")
+		}
+		if !strings.Contains(err.Error(), "BINTRAIL_API_KEY") || !strings.Contains(err.Error(), "newline") {
+			t.Errorf("expected error to name the env var and 'newline', got: %v", err)
+		}
+	})
+
 	t.Run("refuses to overwrite existing file", func(t *testing.T) {
 		dir := t.TempDir()
 		orig, _ := os.Getwd()

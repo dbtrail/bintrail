@@ -59,6 +59,18 @@ func runInitShim(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("missing required env var(s): %s\nRun 'bintrail config init' to scaffold .bintrail.env, then set these values.", strings.Join(missing, ", "))
 	}
 
+	// YAML single-quoted scalars cannot contain literal newlines; reject
+	// rather than silently emit a malformed file.
+	for _, v := range []struct{ name, val string }{
+		{"BINTRAIL_SOURCE_DSN", sourceDSN},
+		{"BINTRAIL_SERVER_ID", serverID},
+		{"BINTRAIL_API_KEY", apiKey},
+	} {
+		if strings.ContainsAny(v.val, "\r\n") {
+			return fmt.Errorf("%s contains a newline character; remove it before generating shim.yaml", v.name)
+		}
+	}
+
 	content := generateShimYAML(sourceDSN, serverID, apiKey, isListen, isAgentURL)
 
 	if isOut == "-" {
