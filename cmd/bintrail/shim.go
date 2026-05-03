@@ -25,25 +25,37 @@ import (
 // agent on the same host; ProxySQL routes _flashback / _diff /
 // _snapshot virtual-schema queries to its --listen address.
 //
-// MVP scope:
-//   - Only `_flashback.<table> AS OF '<ts>' WHERE <col> = <value>` is
-//     answered. _diff and _snapshot are out of scope for this PR.
-//   - Auth accepts any credentials. A future revision will validate
-//     against shim.yaml's mysql_user / mysql_pass_sha1.
-//   - Reads from the bintrail MySQL index only. Buffer + S3 archive
-//     merging is wired-in by `bintrail query` already and will be
-//     hooked into the shim in a follow-up.
+// Recognised statement shapes (handled by internal/shim/parser.go):
+//   - SELECT * FROM _flashback.<table> AS OF '<ts>' WHERE <col> = <value>
+//   - SELECT * FROM _snapshot.<table>  AS OF '<ts>' WHERE <col> = <value>
+//   - SELECT * FROM _diff.<table>      BETWEEN '<t1>' AND '<t2>' WHERE <col> = <value>
+//
+// Time-range queries are answered against the live bintrail MySQL
+// index plus any S3 archives auto-discovered via archive_state — the
+// same merge pipeline `bintrail query` and `bintrail recover` use.
+//
+// Authentication: TenantAuth validates that the connecting username
+// appears in shim.yaml; password validation is delegated to ProxySQL
+// (which authenticates the application connection against
+// mysql_pass_sha1 and only then forwards to the shim hostgroup). The
+// default --listen of 127.0.0.1:3308 keeps the shim unreachable from
+// the network — only ProxySQL on the same host can connect.
 var shimCmd = &cobra.Command{
 	Use:   "shim",
-	Short: "Run the BYOS time-travel SQL MySQL-protocol server (MVP)",
-	Long: `Run an in-process MySQL-protocol server that answers
-` + "`SELECT * FROM _flashback.<table> AS OF '<ts>' WHERE <col> = <value>`" + ` queries
-by querying the bintrail MySQL index. Intended to sit behind ProxySQL —
-see docs/byos-time-travel-sql.md.
+	Short: "Run the BYOS time-travel SQL MySQL-protocol server",
+	Long: `Run an in-process MySQL-protocol server that answers BYOS
+time-travel SQL queries against the three virtual schemas
+_flashback / _snapshot / _diff. Intended to sit behind ProxySQL on the
+same host — see docs/byos-time-travel-sql.md for the end-to-end setup.
 
-This is an MVP. Authentication accepts any credentials and the only
-query shape supported is _flashback. Use --listen to change the port
-(default :3308).`,
+The shim auto-discovers S3 archives via archive_state, so queries that
+reach back beyond the live MySQL index's retention window resolve
+transparently from Parquet. Use --no-archive to disable that and stay
+index-only.
+
+Authentication validates only that the connecting username appears in
+shim.yaml. ProxySQL holds the password gate. The default --listen of
+127.0.0.1:3308 keeps the shim unreachable from the network.`,
 	RunE: runShim,
 }
 
@@ -80,13 +92,32 @@ func runShim(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
+	// Eager Ping so a misconfigured DSN fails at startup rather than at
+	// the first _flashback query the customer actually runs. config.Connect
+	// is lazy: it sets parseTime + a TCP timeout but does not exchange a
+	// packet until the first query.
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := db.PingContext(pingCtx); err != nil {
+		pingCancel()
+		return fmt.Errorf("ping index DB: %w", err)
+	}
+	pingCancel()
+
 	listener, err := net.Listen("tcp", shListen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", shListen, err)
 	}
 	defer listener.Close()
 
-	slog.Info("shim listening", "addr", shListen, "tenants", len(users))
+	if !isLoopbackAddr(listener.Addr()) {
+		slog.Warn(
+			"shim is bound to a non-loopback address; password validation is delegated to ProxySQL — "+
+				"ensure no other client has direct network access to this port",
+			"addr", listener.Addr().String(),
+		)
+	}
+
+	slog.Info("shim listening", "addr", listener.Addr().String(), "tenants", len(users))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -135,6 +166,21 @@ func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim
 			handleConn(c, db, auth, cfg)
 		}(conn)
 	}
+}
+
+// isLoopbackAddr reports whether addr resolves to a loopback address.
+// Used at startup so the operator gets a loud warning if the shim is
+// reachable from the network — the auth model assumes ProxySQL on the
+// same host is the only legitimate caller.
+func isLoopbackAddr(addr net.Addr) bool {
+	tcp, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	if tcp.IP == nil || tcp.IP.IsUnspecified() {
+		return false
+	}
+	return tcp.IP.IsLoopback()
 }
 
 // handleConn wraps one accepted TCP connection in go-mysql/server's

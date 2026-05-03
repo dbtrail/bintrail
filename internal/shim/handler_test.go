@@ -22,6 +22,8 @@ func TestHandlerHandshakeNoise(t *testing.T) {
 	cases := []string{
 		"SET NAMES 'utf8mb4'",
 		"SET autocommit=1",
+		"SET session transaction isolation level read committed",
+		"SET sql_mode = 'TRADITIONAL'",
 		"SELECT @@version",
 		"SELECT @@session.tx_isolation",
 		"SHOW WARNINGS",
@@ -35,6 +37,31 @@ func TestHandlerHandshakeNoise(t *testing.T) {
 			}
 			if res == nil {
 				t.Error("expected non-nil result")
+			}
+		})
+	}
+}
+
+// TestHandlerHandshakeNoiseRejectsPrivileged — narrow allow-listing
+// matters: an over-broad `set ` prefix would let a caller smuggle
+// privileged DDL past the shim with a fake-success response. Verify
+// the dangerous shapes are NOT silently accepted.
+func TestHandlerHandshakeNoiseRejectsPrivileged(t *testing.T) {
+	h := NewHandler(nil, nil)
+	h.UseDB("myapp")
+
+	cases := []string{
+		"SET PASSWORD = 'x'",
+		"SET ROLE admin",
+		"SET GLOBAL read_only = 0",
+		"DROP TABLE orders",
+		"INSERT INTO orders VALUES (1)",
+	}
+	for _, q := range cases {
+		t.Run(q, func(t *testing.T) {
+			_, err := h.HandleQuery(q)
+			if err == nil {
+				t.Errorf("query %q should NOT be silently accepted as handshake noise", q)
 			}
 		})
 	}
@@ -126,7 +153,10 @@ func TestEndToEndHandshake(t *testing.T) {
 
 	addr := listener.Addr().String()
 
-	// Server side: accept one connection and dispatch through our handler.
+	// Server side: accept one connection, perform handshake, then loop
+	// HandleCommand until the client disconnects. SetReadDeadline
+	// guarantees the loop unblocks even if the client's TCP close does
+	// not propagate immediately, so the test can never hang.
 	serverErr := make(chan error, 1)
 	go func() {
 		c, err := listener.Accept()
@@ -135,7 +165,8 @@ func TestEndToEndHandshake(t *testing.T) {
 			return
 		}
 		defer c.Close()
-		h := NewHandler(nil, nil) // no DB needed for handshake-only test
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		h := NewHandler(nil, nil)
 		h.UseDB("myapp")
 		srv := server.NewDefaultServer()
 		auth, _ := NewTenantAuth([]string{"test"})
@@ -144,23 +175,18 @@ func TestEndToEndHandshake(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		// Loop a few commands so the test can send query-then-quit
-		// without racing.
-		for i := 0; i < 4; i++ {
+		for {
 			if err := mc.HandleCommand(); err != nil {
 				serverErr <- nil
 				return
 			}
 		}
-		serverErr <- nil
 	}()
 
-	// Client side: hit the server with go-mysql's client lib (we
-	// already depend on it transitively, no extra dependency).
 	host, port, _ := net.SplitHostPort(addr)
 	clientErr := make(chan error, 1)
 	go func() {
-		clientErr <- driveClient(host+":"+port, "myapp")
+		clientErr <- driveClient(host + ":" + port)
 	}()
 
 	select {
@@ -173,34 +199,32 @@ func TestEndToEndHandshake(t *testing.T) {
 	}
 
 	listener.Close()
-	<-serverErr
+	select {
+	case <-serverErr:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server goroutine did not exit")
+	}
 }
 
-// driveClient connects to the shim, runs a non-flashback query, and
-// expects the shim to error out (because the MVP only handles
-// _flashback). Success of this test means the wire-protocol handshake
-// + query round-trip works.
-func driveClient(addr, dbName string) error {
-	// AcceptAuth treats every connection as authenticated against an
-	// empty password, so the test DSN sends one.
-	dsn := "test:@tcp(" + addr + ")/" + dbName
+// driveClient connects to the shim, completes the MySQL handshake via
+// go-sql-driver/mysql's Ping, then closes. Success is "the handshake
+// completed without error" — proof that bintrail can speak the wire
+// protocol to a real client. We deliberately do NOT issue further
+// queries here; the per-query handler logic is exercised by the
+// other unit tests, and adding a query here would require a real
+// indexDB.
+func driveClient(addr string) error {
+	// TenantAuth's empty-string credential means the DSN sends an
+	// empty password against the allowlisted "test" user.
+	dsn := "test:@tcp(" + addr + ")/"
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-
-	// Force the driver to actually connect (Open is lazy).
 	if err := db.Ping(); err != nil {
-		// Some clients fail Ping before HandleCommand sees anything;
-		// that's still fine for the wire-protocol test.
-		_ = err
+		return err
 	}
-
-	// This query is non-flashback → the shim returns an error to the
-	// client. We don't care about the error content here; we care
-	// that the round-trip completes (i.e., handshake worked).
-	_, _ = db.Query("SELECT 1")
 	return nil
 }
 

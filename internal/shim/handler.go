@@ -131,14 +131,21 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// LimitPerPK=1 (not Limit=1) is the right knob: query.Engine emits
+	// the global result-set in ASC order by (event_timestamp, event_id),
+	// so a plain Limit=1 would return the *earliest* event in the
+	// time window, not the latest. LimitPerPK uses an inner
+	// ROW_NUMBER OVER (PARTITION BY pk_values ORDER BY event_timestamp
+	// DESC, event_id DESC) so the kept event for each PK is the most
+	// recent one — exactly what _flashback "row state at AsOf" needs.
 	engine := query.New(h.indexDB)
 	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
 		Opts: query.Options{
-			Schema:   q.Schema,
-			Table:    q.Table,
-			PKValues: q.PKValue,
-			Until:    &q.AsOf,
-			Limit:    1,
+			Schema:     q.Schema,
+			Table:      q.Table,
+			PKValues:   q.PKValue,
+			Until:      &q.AsOf,
+			LimitPerPK: 1,
 		},
 		DBName:    q.Schema,
 		NoArchive: h.cfg.NoArchive,
@@ -152,13 +159,8 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 		return emptyResult(), nil
 	}
 
-	// Pick the most recent event by (timestamp, event_id).
-	sort.SliceStable(rows, func(i, j int) bool {
-		if !rows[i].EventTimestamp.Equal(rows[j].EventTimestamp) {
-			return rows[i].EventTimestamp.After(rows[j].EventTimestamp)
-		}
-		return rows[i].EventID > rows[j].EventID
-	})
+	// LimitPerPK=1 returns at most one row per PK; we asked for one
+	// PK, so rows[0] is the answer.
 	latest := rows[0]
 
 	var image map[string]any
@@ -299,22 +301,56 @@ func emptyResult() *mysql.Result {
 	return &mysql.Result{Resultset: rs}
 }
 
+// handshakePrefixes are the SET / SELECT @@ prefixes that real MySQL
+// clients (mysql CLI, go-sql-driver/mysql, ProxySQL backend probes)
+// fire automatically during connection setup. Allow-listing them
+// keeps the handshake happy without us implementing the statements.
+//
+// The list is deliberately narrow: an unrecognised SET (e.g. SET
+// PASSWORD, SET ROLE, SET GLOBAL) falls through to the rejection
+// path so a customer / attacker cannot pretend their privileged DDL
+// succeeded by exploiting an over-broad `SET ` prefix.
+var handshakePrefixes = []string{
+	"set names ",
+	"set autocommit",
+	"set session ",
+	"set @@session",
+	"set sql_mode",
+	"set sql_select_limit",
+	"set time_zone",
+	"set character_set_results",
+	"set transaction ",
+	"select @@version",
+	"select @@session.",
+	"select @@global.",
+	"show warnings",
+	"show variables",
+}
+
+// handshakeExact is the set of full statements (no prefix matching)
+// that we treat as setup noise.
+var handshakeExact = map[string]struct{}{
+	"select version()":  {},
+	"select database()": {},
+	"select user()":     {},
+	"select 1":          {},
+}
+
 // isHandshakeNoise matches the handful of statements MySQL clients
 // issue automatically and that have no meaningful behaviour for a
-// shim. Returning success keeps the connection alive without us having
-// to implement them.
+// shim. Returning success keeps the connection alive without us
+// having to implement them.
 func isHandshakeNoise(q string) bool {
 	q = strings.TrimSpace(strings.ToLower(q))
 	q = strings.TrimSuffix(q, ";")
-	switch {
-	case strings.HasPrefix(q, "set "):
+	q = strings.TrimSpace(q)
+	if _, ok := handshakeExact[q]; ok {
 		return true
-	case strings.HasPrefix(q, "select @@"):
-		return true
-	case strings.HasPrefix(q, "show warnings"):
-		return true
-	case q == "select version()" || q == "select database()":
-		return true
+	}
+	for _, p := range handshakePrefixes {
+		if strings.HasPrefix(q, p) {
+			return true
+		}
 	}
 	return false
 }

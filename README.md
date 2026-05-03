@@ -158,7 +158,7 @@ The index stores complete before and after row images for every event, so recove
 | [Deployment](docs/deployment.md) | cron, systemd, Ansible, and production setup |
 | [Docker](docs/docker.md) | Container images and Docker Compose |
 | [Parquet Debugging](docs/parquet-debugging.md) | Inspecting and troubleshooting Parquet archives |
-| [BYOS Time-Travel SQL](docs/byos-time-travel-sql.md) | End-to-end setup for `_flashback` / `_diff` / `_snapshot` virtual schemas via ProxySQL + dbtrail-shim |
+| [BYOS Time-Travel SQL](docs/byos-time-travel-sql.md) | End-to-end setup for `_flashback` / `_diff` / `_snapshot` virtual schemas via ProxySQL + `bintrail shim` |
 
 ## Agent exit codes
 
