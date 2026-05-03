@@ -178,6 +178,23 @@ func TestSelectImage(t *testing.T) {
 			want: before,
 		},
 		{
+			// Pin the len() > 0 vs != nil distinction. A future
+			// refactor that swapped len() for a nil-check would
+			// silently regress DELETE handling if the indexer ever
+			// emitted an empty non-nil RowAfter (defensive map
+			// allocation upstream, redaction blanking every column,
+			// etc.). Without this case the regression slips through
+			// both "delete_fallback" (RowAfter is nil there) and
+			// "both_empty" (RowBefore is also empty there).
+			name: "row_after_empty_map_falls_back_to_row_before",
+			rows: []query.ResultRow{{
+				EventType: parser.EventDelete,
+				RowAfter:  map[string]any{},
+				RowBefore: before,
+			}},
+			want: before,
+		},
+		{
 			name: "both_empty_returns_nil",
 			rows: []query.ResultRow{{
 				EventType: parser.EventUpdate,
