@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `bintrail shim` now actually authenticates ProxySQL-forwarded connections. The previous TenantAuth implementation returned an empty cleartext from `GetCredential`, so the `mysql_native_password` handshake only succeeded when the client sent an empty password — every real ProxySQL → shim connection in 0.7.0 / 0.7.1 was rejected with `Access denied`. The shim now stores the cleartext password (read from a new `mysql_password` field in `shim.yaml`) and validates the client's scrambled response against it, the same way any MySQL server does (#254).
+- `bintrail shim` virtual-schema queries no longer crash with `ArchiveFetcher is required when NoArchive is false`. `runPointInTime` and `runDiff` now wire `parquetquery.Fetch` as the archive fetcher — the same fetcher `bintrail query` and `bintrail recover` use — so S3 archive auto-discovery works out of the box without `--no-archive` (#255).
+
+### Changed (breaking, but only relative to a non-functional 0.7.1 path)
+- `shim.yaml`'s tenant block now requires `mysql_password` (cleartext) instead of `mysql_pass_sha1` (the SHA1 hex). `bintrail proxysql-config` recomputes the SHA1 from the cleartext at SQL-generation time, so operators no longer need to run a manual SHA1 recipe; the shim itself needs the cleartext to validate ProxySQL-forwarded auth (see #254). Existing `shim.yaml` files using only `mysql_pass_sha1` now error at startup with a clear migration message pointing at the new field. The legacy field is parsed (not rejected) by the strict YAML decoder so the error message can be specific.
+
 ## [0.7.1] - 2026-05-03
 
 ### Fixed

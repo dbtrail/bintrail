@@ -55,30 +55,19 @@ tenants:
     source_dsn: '...'       # from BINTRAIL_SOURCE_DSN
     # TODO: fill in your application's MySQL credentials
     # mysql_user: app_user
-    # TODO: SHA1 hex of mysql_user's password
-    # mysql_pass_sha1:
+    # mysql_password: '<cleartext>'
 ```
-
-You need to fill in **`mysql_user`** and **`mysql_pass_sha1`**. The username is whatever you want your application to use. The SHA1 is in ProxySQL's `*HEX` format. The portable way to compute it (works on any OS, no MySQL version assumptions):
-
-```sh
-printf 'your-app-password' \
-  | sha1sum | cut -d' ' -f1 \
-  | xxd -r -p | sha1sum | cut -d' ' -f1 \
-  | tr 'a-f' 'A-F' | sed 's/^/*/'
-# *30D6BC64B4B66AC024BDC6551C3B28BB49320725
-```
-
-(ProxySQL stores `mysql_native_password`'s double-SHA1 with a `*` prefix.)
 
 Edit `shim.yaml`, uncomment the two TODO lines, and paste the values:
 
 ```yaml
     mysql_user: app_user
-    mysql_pass_sha1: '*30D6BC64B4B66AC024BDC6551C3B28BB49320725'
+    mysql_password: 'your-app-password'
 ```
 
-> **Auth note**: `bintrail shim` validates only the *username* against this file. ProxySQL holds the password gate (`mysql_pass_sha1`). The shim's listen address defaults to `127.0.0.1:3308` so it is not reachable from the network — but any process on the same host with a known tenant username can still connect, so treat host-local users as trusted. ProxySQL on the same host is the legitimate caller.
+`bintrail proxysql-config` recomputes the SHA1 hash ProxySQL needs from `mysql_password` automatically — you do not need to run a manual SHA1 recipe.
+
+> **Auth note**: both `bintrail shim` and ProxySQL validate the application's password against the same `mysql_password` (the shim using cleartext directly via the MySQL native-password handshake; ProxySQL using its derived SHA1). The shim's listen address defaults to `127.0.0.1:3308` so it is not reachable from the network. Treat `shim.yaml` as you'd treat `.bintrail.env` — it contains a password and ships at 0o600.
 
 ---
 
@@ -201,7 +190,7 @@ The shim should report `shim listening addr=127.0.0.1:3308 tenants=N` once it ha
 
 ## Step 5 — Point your application at ProxySQL
 
-Change your application's MySQL connection string from the real MySQL port (`:3306`) to ProxySQL's MySQL port (`:6033`). The credentials are the `mysql_user` / `mysql_pass_sha1` pair from `shim.yaml` — the *plaintext* password you generated in step 1, not the SHA1.
+Change your application's MySQL connection string from the real MySQL port (`:3306`) to ProxySQL's MySQL port (`:6033`). The credentials are the `mysql_user` / `mysql_password` pair from `shim.yaml` (cleartext — same value the shim and ProxySQL both validate against).
 
 For example, with the Go MySQL driver:
 
@@ -248,16 +237,7 @@ The shim resolves the row by replaying the relevant binlog events from your bint
 
 ### `ERROR 1045: Access denied for user 'app_user'@'…'`
 
-ProxySQL is rejecting your credentials. Re-run the SHA1 recipe from step 1 against your app's password and compare against `mysql_pass_sha1` in `shim.yaml`:
-
-```sh
-printf 'your-app-password' \
-  | sha1sum | cut -d' ' -f1 \
-  | xxd -r -p | sha1sum | cut -d' ' -f1 \
-  | tr 'a-f' 'A-F' | sed 's/^/*/'
-```
-
-Then re-apply the ProxySQL config (the `mysql_users` row is regenerated from `shim.yaml`):
+ProxySQL is rejecting your credentials. Confirm your app is connecting with the cleartext value of `mysql_password` from `shim.yaml`. If `shim.yaml` was edited, re-apply the ProxySQL config so the regenerated SHA1 reaches the live `mysql_users` table:
 
 ```sh
 sudo rm proxysql-setup.sql
@@ -287,7 +267,7 @@ systemctl status bintrail-shim
 ss -tlnp | grep 3308
 ```
 
-If `bintrail-shim` is dead, `journalctl -u bintrail-shim -n 100` shows why. Common causes: missing or unreadable `shim.yaml`, missing `BINTRAIL_INDEX_DSN`, a `mysql_pass_sha1` value that's not a valid YAML string (quote it).
+If `bintrail-shim` is dead, `journalctl -u bintrail-shim -n 100` shows why. Common causes: missing or unreadable `shim.yaml`, missing `BINTRAIL_INDEX_DSN`, a `mysql_password` value that's not a valid YAML string (quote it).
 
 ### Time-travel query returns empty
 

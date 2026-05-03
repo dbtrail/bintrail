@@ -58,7 +58,7 @@ func TestRunInitShim(t *testing.T) {
 			t.Error("expected default listen in output")
 		}
 		if !strings.Contains(content, "# TODO") {
-			t.Error("expected TODO comments for mysql_user / mysql_pass_sha1")
+			t.Error("expected TODO comments for mysql_user / mysql_password")
 		}
 
 		info, _ := os.Stat(path)
@@ -192,7 +192,7 @@ func TestGenerateShimYAMLContents(t *testing.T) {
 		"server_id: '" + testServerID + "'",
 		"source_dsn: '" + testSourceDSN + "'",
 		"# mysql_user:",
-		"# mysql_pass_sha1:",
+		"# mysql_password:",
 	}
 	for _, w := range wants {
 		if !strings.Contains(out, w) {
@@ -204,7 +204,7 @@ func TestGenerateShimYAMLContents(t *testing.T) {
 // TestGenerateShimYAMLContainsNoLegacyFields locks in the migration
 // to in-process bintrail shim: the `agent_url` and `agent_token`
 // fields the external dbtrail-shim required are no longer emitted.
-// LoadTenantUsers in internal/shim/auth.go still tolerates them in
+// LoadTenants in internal/shim/auth.go still tolerates them in
 // existing files (strict YAML knows about the keys), but new
 // scaffolds shouldn't carry them.
 func TestGenerateShimYAMLContainsNoLegacyFields(t *testing.T) {

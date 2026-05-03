@@ -34,12 +34,15 @@ import (
 // index plus any S3 archives auto-discovered via archive_state — the
 // same merge pipeline `bintrail query` and `bintrail recover` use.
 //
-// Authentication: TenantAuth validates that the connecting username
-// appears in shim.yaml; password validation is delegated to ProxySQL
-// (which authenticates the application connection against
-// mysql_pass_sha1 and only then forwards to the shim hostgroup). The
-// default --listen of 127.0.0.1:3308 keeps the shim unreachable from
-// the network — only ProxySQL on the same host can connect.
+// Authentication: TenantAuth validates BOTH that the connecting
+// username appears in shim.yaml AND that the client's
+// mysql_native_password challenge response matches the cleartext
+// stored in mysql_password. ProxySQL is still the outer gate
+// (validating against mysql_pass_sha1 derived from the same
+// cleartext); the shim's local validation closes the gap that would
+// otherwise let any direct connection to :3308 with a known username
+// in. The default --listen of 127.0.0.1:3308 keeps the shim
+// unreachable from the network anyway.
 var shimCmd = &cobra.Command{
 	Use:   "shim",
 	Short: "Run the BYOS time-travel SQL MySQL-protocol server",
@@ -53,9 +56,10 @@ reach back beyond the live MySQL index's retention window resolve
 transparently from Parquet. Use --no-archive to disable that and stay
 index-only.
 
-Authentication validates only that the connecting username appears in
-shim.yaml. ProxySQL holds the password gate. The default --listen of
-127.0.0.1:3308 keeps the shim unreachable from the network.`,
+Authentication validates both username and password against shim.yaml's
+tenants block (mysql_user + mysql_password). ProxySQL is still the outer
+password gate against the same cleartext. The default --listen of
+127.0.0.1:3308 keeps the shim unreachable from the network anyway.`,
 	RunE: runShim,
 }
 
@@ -77,11 +81,11 @@ func init() {
 }
 
 func runShim(cmd *cobra.Command, args []string) error {
-	users, err := shim.LoadTenantUsers(shShimConfig)
+	tenants, err := shim.LoadTenants(shShimConfig)
 	if err != nil {
 		return err
 	}
-	auth, err := shim.NewTenantAuth(users)
+	auth, err := shim.NewTenantAuth(tenants)
 	if err != nil {
 		return err
 	}
@@ -111,13 +115,12 @@ func runShim(cmd *cobra.Command, args []string) error {
 
 	if !isLoopbackAddr(listener.Addr()) {
 		slog.Warn(
-			"shim is bound to a non-loopback address; password validation is delegated to ProxySQL — "+
-				"ensure no other client has direct network access to this port",
+			"shim is bound to a non-loopback address; ensure no other client has direct network access to this port",
 			"addr", listener.Addr().String(),
 		)
 	}
 
-	slog.Info("shim listening", "addr", listener.Addr().String(), "tenants", len(users))
+	slog.Info("shim listening", "addr", listener.Addr().String(), "tenants", len(tenants))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

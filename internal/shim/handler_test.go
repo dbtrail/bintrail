@@ -259,7 +259,7 @@ func TestEndToEndHandshake(t *testing.T) {
 		h := NewHandler(nil, nil)
 		h.UseDB("myapp")
 		srv := server.NewDefaultServer()
-		auth, _ := NewTenantAuth([]string{"test"})
+		auth, _ := NewTenantAuth(map[string]string{"test": ""})
 		mc, err := server.NewCustomizedConn(c, srv, auth, h)
 		if err != nil {
 			serverErr <- err

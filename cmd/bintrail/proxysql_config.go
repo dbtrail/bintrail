@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"io"
@@ -64,14 +65,24 @@ func init() {
 // shimTenant declares every field bintrail init-shim emits in a tenant
 // block. The strict YAML decoder used by loadShimTenants requires the
 // struct to know about every key — so we declare ServerID, SourceDSN,
-// AgentURL, and AgentToken (which proxysql-config does not need) just to
-// satisfy strict mode and let it catch real typos like "mysql_user_name".
+// AgentURL, AgentToken (legacy, kept for parse-compat), and MySQLPassSHA1
+// (legacy, kept for parse-compat) just to satisfy strict mode and let
+// it catch real typos like "mysql_user_name".
 type shimTenant struct {
 	ServerID      string `yaml:"server_id"`
 	SourceDSN     string `yaml:"source_dsn"`
 	AgentURL      string `yaml:"agent_url"`
 	AgentToken    string `yaml:"agent_token"`
 	MySQLUser     string `yaml:"mysql_user"`
+	MySQLPassword string `yaml:"mysql_password"`
+	// MySQLPassSHA1 is the deprecated < 0.7.2 field. It used to be the
+	// only way to declare a tenant's password, but the shim cannot use
+	// it (go-mysql/server's mysql_native_password handler needs the
+	// cleartext to validate the client's scrambled response). Now the
+	// SHA1 is recomputed from MySQLPassword at proxysql-config time.
+	// Kept here purely so UnmarshalStrict accepts shim.yaml files that
+	// still have the old field; loadShimTenants emits a clear error
+	// pointing to the migration path.
 	MySQLPassSHA1 string `yaml:"mysql_pass_sha1"`
 }
 
@@ -175,13 +186,13 @@ func parseProxySQLBackend(dsn string, fallbackPort uint16) (host string, port ui
 }
 
 // loadShimTenants reads shim.yaml from path, validates each tenant has
-// non-empty mysql_user and mysql_pass_sha1 free of newlines, and returns
+// non-empty mysql_user and mysql_password free of newlines, and returns
 // the resulting list.
 func loadShimTenants(path string) ([]shimTenant, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("shim config not found at %s\nRun 'bintrail init-shim' to scaffold one, then fill in mysql_user / mysql_pass_sha1.", path)
+			return nil, fmt.Errorf("shim config not found at %s\nRun 'bintrail init-shim' to scaffold one, then fill in mysql_user / mysql_password.", path)
 		}
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
@@ -199,17 +210,40 @@ func loadShimTenants(path string) ([]shimTenant, error) {
 		if t.MySQLUser == "" {
 			return nil, fmt.Errorf("%s tenant #%d: mysql_user is empty (uncomment and fill in the TODO line)", path, i+1)
 		}
-		if t.MySQLPassSHA1 == "" {
-			return nil, fmt.Errorf("%s tenant #%d: mysql_pass_sha1 is empty (uncomment and fill in the TODO line)", path, i+1)
+		if t.MySQLPassword == "" {
+			if t.MySQLPassSHA1 != "" {
+				return nil, fmt.Errorf(
+					"%s tenant #%d (mysql_user=%s): mysql_password is required; mysql_pass_sha1 alone is no longer accepted (>= 0.7.2). "+
+						"Replace mysql_pass_sha1 with mysql_password: '<cleartext>' — the SHA1 is recomputed here automatically",
+					path, i+1, t.MySQLUser)
+			}
+			return nil, fmt.Errorf("%s tenant #%d (mysql_user=%s): mysql_password is empty (set the cleartext password your application uses to connect)", path, i+1, t.MySQLUser)
 		}
 		if r := firstControlRune(t.MySQLUser); r >= 0 {
 			return nil, fmt.Errorf("%s tenant #%d: mysql_user contains control character U+%04X", path, i+1, r)
 		}
-		if r := firstControlRune(t.MySQLPassSHA1); r >= 0 {
-			return nil, fmt.Errorf("%s tenant #%d: mysql_pass_sha1 contains control character U+%04X", path, i+1, r)
+		if r := firstControlRune(t.MySQLPassword); r >= 0 {
+			return nil, fmt.Errorf("%s tenant #%d: mysql_password contains control character U+%04X", path, i+1, r)
 		}
 	}
 	return cfg.Tenants, nil
+}
+
+// nativePasswordHash returns ProxySQL's `*<UPPER_HEX>` storage form for
+// a cleartext mysql_native_password — i.e. SHA1(SHA1(password)). This
+// matches what `SELECT PASSWORD('<pw>')` produces in MySQL 5.7 and what
+// ProxySQL stores in mysql_users.password under default config.
+//
+// We compute the hash here (rather than asking the operator to run a
+// SHA1 recipe and paste it into shim.yaml) so shim.yaml has a single
+// source of truth: the cleartext password. The shim itself needs that
+// cleartext to validate ProxySQL-forwarded auth responses, so it has
+// to live in shim.yaml regardless; emitting the SHA1 ourselves removes
+// the manual derivation step the operator used to perform.
+func nativePasswordHash(password string) string {
+	first := sha1.Sum([]byte(password))
+	second := sha1.Sum(first[:])
+	return "*" + strings.ToUpper(fmt.Sprintf("%x", second))
 }
 
 // firstControlRune returns the first control rune in s (per
@@ -266,7 +300,7 @@ func generateProxySQLSetupSQL(host string, mysqlPort, shimPort, proxysqlMySQLPor
 	fmt.Fprintf(&sb, "DELETE FROM mysql_users WHERE default_hostgroup = %d;\n", passthroughHostgroup)
 	for _, t := range tenants {
 		fmt.Fprintf(&sb, "INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES (%s, %s, %d, 1);\n",
-			sqlQuote(t.MySQLUser), sqlQuote(t.MySQLPassSHA1), passthroughHostgroup)
+			sqlQuote(t.MySQLUser), sqlQuote(nativePasswordHash(t.MySQLPassword)), passthroughHostgroup)
 	}
 	sb.WriteString("\n")
 

@@ -14,6 +14,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 
+	"github.com/dbtrail/bintrail/internal/parquetquery"
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
 )
@@ -155,9 +156,10 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 			Until:      &q.AsOf,
 			LimitPerPK: 1,
 		},
-		DBName:    q.Schema,
-		NoArchive: h.cfg.NoArchive,
-		AllowGaps: h.cfg.AllowGaps,
+		DBName:         q.Schema,
+		NoArchive:      h.cfg.NoArchive,
+		AllowGaps:      h.cfg.AllowGaps,
+		ArchiveFetcher: parquetquery.Fetch,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)
@@ -235,9 +237,10 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 			Since:    &q.Since,
 			Until:    &q.Until,
 		},
-		DBName:    q.Schema,
-		NoArchive: h.cfg.NoArchive,
-		AllowGaps: h.cfg.AllowGaps,
+		DBName:         q.Schema,
+		NoArchive:      h.cfg.NoArchive,
+		AllowGaps:      h.cfg.AllowGaps,
+		ArchiveFetcher: parquetquery.Fetch,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)

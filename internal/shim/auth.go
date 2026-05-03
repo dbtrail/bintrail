@@ -3,53 +3,56 @@ package shim
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 
 	yaml "go.yaml.in/yaml/v2"
 )
 
-// TenantAuth implements server.CredentialProvider. It accepts only
-// usernames that appear in the loaded shim.yaml and accepts any
-// password for those users.
+// TenantAuth implements server.CredentialProvider against the
+// per-tenant cleartext password stored in shim.yaml's mysql_password
+// field. Both halves of the auth flow validate against this same
+// value: ProxySQL's frontend (which derives mysql_pass_sha1 from it
+// via bintrail proxysql-config) and the shim's backend (which hands
+// the cleartext to go-mysql/server's mysql_native_password handshake).
 //
-// Why password validation is intentionally weak: the shim's deployed
-// position is behind ProxySQL on localhost. ProxySQL authenticates
-// the application connection against `mysql_pass_sha1` (which the
-// customer wrote into shim.yaml after running `bintrail init-shim`,
-// since init-shim only emits TODO comments for that field) and only
-// then forwards the connection to the shim's hostgroup. Re-validating
-// the password at the shim would require implementing the
-// mysql_native_password challenge against the same `*HEX` value
-// ProxySQL already verified — duplicate work for no extra security.
+// Why the shim now stores cleartext: go-mysql/server's
+// CredentialProvider API requires the cleartext password to drive its
+// challenge/response check. Storing only mysql_pass_sha1 (as earlier
+// versions did) made every ProxySQL → shim connection fail because
+// the library could not validate ProxySQL-forwarded auth without the
+// cleartext. shim.yaml is operator-owned and 0o600; it already holds
+// source_dsn (which contains a MySQL password), so adding the tenant
+// cleartext alongside is a no-op against the existing trust model.
 //
-// The username allowlist is the defense-in-depth layer: even if a
-// caller bypasses ProxySQL and connects to :3308 directly, only
-// usernames the operator declared in shim.yaml are accepted. This
-// is materially better than the previous AcceptAuth, which let any
-// connection in.
+// Validation is real (not "any password accepted"): the username must
+// appear in the tenants block AND the client's wire-protocol response
+// must scramble against the stored cleartext. ProxySQL is still the
+// outer gate — the shim's role is to make sure direct connections to
+// :3308 are not silently authenticated by virtue of the username
+// alone.
 type TenantAuth struct {
-	users map[string]struct{}
+	users map[string]string // username → cleartext mysql_password
 }
 
-// NewTenantAuth builds a TenantAuth from the usernames in shim.yaml's
-// tenant list. An empty users list returns an error rather than
-// silently accepting nothing — the customer almost certainly
-// misconfigured.
-func NewTenantAuth(users []string) (TenantAuth, error) {
+// NewTenantAuth builds a TenantAuth from a map of username →
+// cleartext password. An empty map returns an error rather than
+// silently accepting nothing.
+func NewTenantAuth(users map[string]string) (TenantAuth, error) {
 	if len(users) == 0 {
-		return TenantAuth{}, errors.New("shim: no mysql_user values in shim.yaml; cannot start with empty allowlist")
+		return TenantAuth{}, errors.New("shim: no tenants in shim.yaml; cannot start with empty allowlist")
 	}
-	m := make(map[string]struct{}, len(users))
-	for _, u := range users {
+	clean := make(map[string]string, len(users))
+	for u, p := range users {
 		if u == "" {
 			continue
 		}
-		m[u] = struct{}{}
+		clean[u] = p
 	}
-	if len(m) == 0 {
+	if len(clean) == 0 {
 		return TenantAuth{}, errors.New("shim: every tenant in shim.yaml has an empty mysql_user")
 	}
-	return TenantAuth{users: m}, nil
+	return TenantAuth{users: clean}, nil
 }
 
 // CheckUsername implements server.CredentialProvider.
@@ -59,33 +62,27 @@ func (a TenantAuth) CheckUsername(u string) (bool, error) {
 }
 
 // GetCredential implements server.CredentialProvider. Returns the
-// empty plaintext + found=true so the wire-protocol challenge
-// succeeds against any password the client sends. CheckUsername has
-// already gated this on the username being in the shim.yaml
-// allowlist.
+// stored cleartext password so go-mysql/server's mysql_native_password
+// handshake can validate the client's scrambled response against it.
 func (a TenantAuth) GetCredential(u string) (password string, found bool, err error) {
-	_, ok := a.users[u]
-	return "", ok, nil
+	p, ok := a.users[u]
+	return p, ok, nil
 }
 
-// LoadTenantUsers reads shim.yaml from path and returns the
-// non-empty mysql_user values declared on each tenant. Used by the
-// `bintrail shim` subcommand to construct a TenantAuth at startup.
+// LoadTenants reads shim.yaml from path and returns username →
+// cleartext password for each tenant. Used by `bintrail shim` to
+// construct a TenantAuth at startup.
 //
-// This intentionally duplicates a small slice of cmd/bintrail/
-// proxysql_config.go's shim.yaml parser rather than importing it,
-// because internal/shim must not depend on cmd/bintrail. A future
-// refactor can lift the shared reader into this package.
-func LoadTenantUsers(path string) ([]string, error) {
+// Strict YAML parsing rejects unknown fields, so legacy fields kept
+// in the struct (agent_url, agent_token from < 0.7.0; mysql_pass_sha1
+// from < 0.7.2) parse cleanly even though they are no longer
+// load-bearing. Operators upgrading from 0.7.1 see a runtime warning
+// pointing at mysql_password.
+func LoadTenants(path string) (map[string]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	// AgentURL / AgentToken are retained here even though `bintrail
-	// init-shim` no longer emits them: they appear in shim.yaml files
-	// scaffolded by older bintrail versions, and yaml.UnmarshalStrict
-	// rejects unknown keys. Declaring them keeps customer files from
-	// earlier versions parsing cleanly during the migration window.
 	var cfg struct {
 		Tenants []struct {
 			ServerID      string `yaml:"server_id"`
@@ -93,6 +90,7 @@ func LoadTenantUsers(path string) ([]string, error) {
 			AgentURL      string `yaml:"agent_url"`
 			AgentToken    string `yaml:"agent_token"`
 			MySQLUser     string `yaml:"mysql_user"`
+			MySQLPassword string `yaml:"mysql_password"`
 			MySQLPassSHA1 string `yaml:"mysql_pass_sha1"`
 		} `yaml:"tenants"`
 		Listen string `yaml:"listen"`
@@ -103,12 +101,27 @@ func LoadTenantUsers(path string) ([]string, error) {
 	if len(cfg.Tenants) == 0 {
 		return nil, fmt.Errorf("%s has no tenants", path)
 	}
-	users := make([]string, 0, len(cfg.Tenants))
+	users := make(map[string]string, len(cfg.Tenants))
 	for i, t := range cfg.Tenants {
 		if t.MySQLUser == "" {
 			return nil, fmt.Errorf("%s tenant #%d: mysql_user is empty (uncomment and fill in the TODO line)", path, i+1)
 		}
-		users = append(users, t.MySQLUser)
+		if t.MySQLPassword == "" {
+			if t.MySQLPassSHA1 != "" {
+				return nil, fmt.Errorf(
+					"%s tenant #%d (mysql_user=%s): mysql_password is required; mysql_pass_sha1 alone is no longer accepted (>= 0.7.2). "+
+						"Replace mysql_pass_sha1 with mysql_password: '<cleartext>' — the SHA1 is recomputed by `bintrail proxysql-config`",
+					path, i+1, t.MySQLUser)
+			}
+			return nil, fmt.Errorf("%s tenant #%d (mysql_user=%s): mysql_password is empty (set the cleartext password your application uses to connect)", path, i+1, t.MySQLUser)
+		}
+		if t.MySQLPassSHA1 != "" {
+			slog.Warn(
+				"shim.yaml: mysql_pass_sha1 is no longer used by `bintrail shim` (the SHA1 is now recomputed by `bintrail proxysql-config` from mysql_password); the field is ignored",
+				"tenant", i+1, "mysql_user", t.MySQLUser,
+			)
+		}
+		users[t.MySQLUser] = t.MySQLPassword
 	}
 	return users, nil
 }

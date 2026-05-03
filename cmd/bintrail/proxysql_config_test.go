@@ -12,8 +12,14 @@ import (
 const (
 	pcTestSourceDSN = "user:pass@tcp(db.example.com:3306)/myapp"
 	pcTestUser1     = "app_user"
-	pcTestSHA1_1    = "*A4B6157319038724E3560894F7F932C8886EBFCF"
+	// Cleartext used by tests; the SHA1 ProxySQL stores is derived from
+	// this at SQL-generation time. pcTestSHA1_1 is computed lazily so
+	// the assertion in tests stays in lockstep with the production
+	// derivation in nativePasswordHash().
+	pcTestPassword1 = "testpw1"
 )
+
+var pcTestSHA1_1 = nativePasswordHash(pcTestPassword1)
 
 func writeShimYAML(t *testing.T, dir string, body string) string {
 	t.Helper()
@@ -39,7 +45,7 @@ tenants:
     agent_url: 'http://localhost:8600'
     agent_token: 'btk_abc'
     mysql_user: app_user
-    mysql_pass_sha1: '*A4B6157319038724E3560894F7F932C8886EBFCF'
+    mysql_password: 'testpw1'
 `
 
 func TestRunProxySQLConfig(t *testing.T) {
@@ -71,7 +77,7 @@ func TestRunProxySQLConfig(t *testing.T) {
 			"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (990, 'db.example.com', 3306);",
 			"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (991, '127.0.0.1', 3308);",
 			"DELETE FROM mysql_users WHERE default_hostgroup = 990;",
-			"INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('app_user', '*A4B6157319038724E3560894F7F932C8886EBFCF', 990, 1);",
+			"INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('app_user', '" + pcTestSHA1_1 + "', 990, 1);",
 			"DELETE FROM mysql_query_rules WHERE rule_id IN (990001, 990002, 990003);",
 			"VALUES (990001, 1, '\\b_flashback\\.', 991, 1);",
 			"VALUES (990002, 1, '\\b_diff\\.', 991, 1);",
@@ -102,7 +108,7 @@ func TestRunProxySQLConfig(t *testing.T) {
     agent_url: 'http://localhost:8600'
     agent_token: 'btk_xyz'
     mysql_user: app_user2
-    mysql_pass_sha1: '*BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'
+    mysql_password: 'testpw2'
 `
 		dir := t.TempDir()
 		orig, _ := os.Getwd()
@@ -192,7 +198,7 @@ func TestRunProxySQLConfig(t *testing.T) {
 		os.Chdir(dir)
 
 		t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
-		writeShimYAML(t, dir, "tenants:\n  - mysql_pass_sha1: '*ABC'\n")
+		writeShimYAML(t, dir, "tenants:\n  - mysql_password: 'p'\n")
 		resetPCFlags()
 
 		err := runProxySQLConfig(proxysqlConfigCmd, nil)
@@ -204,7 +210,7 @@ func TestRunProxySQLConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("error when tenant missing mysql_pass_sha1", func(t *testing.T) {
+	t.Run("error when tenant missing mysql_password", func(t *testing.T) {
 		dir := t.TempDir()
 		orig, _ := os.Getwd()
 		t.Cleanup(func() { os.Chdir(orig) })
@@ -218,8 +224,30 @@ func TestRunProxySQLConfig(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error")
 		}
-		if !strings.Contains(err.Error(), "mysql_pass_sha1") {
+		if !strings.Contains(err.Error(), "mysql_password") {
 			t.Errorf("error should name the missing field, got %v", err)
+		}
+	})
+
+	t.Run("legacy mysql_pass_sha1 alone rejected with migration hint", func(t *testing.T) {
+		// Operators upgrading from 0.7.0 / 0.7.1 see this clearly so they
+		// can mechanically replace the field without digging through the
+		// changelog.
+		dir := t.TempDir()
+		orig, _ := os.Getwd()
+		t.Cleanup(func() { os.Chdir(orig) })
+		os.Chdir(dir)
+
+		t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+		writeShimYAML(t, dir, "tenants:\n  - mysql_user: app_user\n    mysql_pass_sha1: '*ABC'\n")
+		resetPCFlags()
+
+		err := runProxySQLConfig(proxysqlConfigCmd, nil)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "mysql_password is required") {
+			t.Errorf("error should explain the migration, got %v", err)
 		}
 	})
 
@@ -249,7 +277,7 @@ func TestRunProxySQLConfig(t *testing.T) {
 		os.Chdir(dir)
 
 		t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
-		writeShimYAML(t, dir, "tenants:\n  - mysql_user: \"bad\\nuser\"\n    mysql_pass_sha1: '*ABC'\n")
+		writeShimYAML(t, dir, "tenants:\n  - mysql_user: \"bad\\nuser\"\n    mysql_password: 'p'\n")
 		resetPCFlags()
 
 		err := runProxySQLConfig(proxysqlConfigCmd, nil)
@@ -317,7 +345,7 @@ func TestRunProxySQLConfig(t *testing.T) {
 }
 
 func TestGenerateProxySQLSetupSQLDeterministic(t *testing.T) {
-	tenants := []shimTenant{{MySQLUser: pcTestUser1, MySQLPassSHA1: pcTestSHA1_1}}
+	tenants := []shimTenant{{MySQLUser: pcTestUser1, MySQLPassword: pcTestPassword1}}
 	a := generateProxySQLSetupSQL("db.example.com", 3306, 3308, 6033, tenants)
 	b := generateProxySQLSetupSQL("db.example.com", 3306, 3308, 6033, tenants)
 	if a != b {
@@ -326,15 +354,23 @@ func TestGenerateProxySQLSetupSQLDeterministic(t *testing.T) {
 }
 
 func TestGenerateProxySQLSetupSQLSQLInjection(t *testing.T) {
-	// A user/password containing single quotes must be safely escaped.
+	// A user containing single quotes must be safely escaped. The
+	// password is hashed before being written into SQL so the worst it
+	// can do at the SQL layer is alter the hash output — still safe to
+	// quote, and we cover that path here too.
 	tenants := []shimTenant{
-		{MySQLUser: "ev'il", MySQLPassSHA1: "*A'B"},
+		{MySQLUser: "ev'il", MySQLPassword: "p'p"},
 	}
 	out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants)
 
-	want := "INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('ev''il', '*A''B', 990, 1);"
-	if !strings.Contains(out, want) {
-		t.Errorf("expected escaped SQL %q; got:\n%s", want, out)
+	// Username is quoted with the doubled single-quote.
+	if !strings.Contains(out, "VALUES ('ev''il', '") {
+		t.Errorf("expected escaped username; got:\n%s", out)
+	}
+	// Password is the SHA1 of the cleartext, also quoted.
+	wantHash := nativePasswordHash("p'p")
+	if !strings.Contains(out, "'"+wantHash+"', 990, 1);") {
+		t.Errorf("expected hashed password %q in output; got:\n%s", wantHash, out)
 	}
 }
 
@@ -346,9 +382,9 @@ func TestGenerateProxySQLSetupSQLSQLInjection(t *testing.T) {
 // hostgroup rather than by username.
 func TestGenerateProxySQLSetupSQLRenameIdempotent(t *testing.T) {
 	first := generateProxySQLSetupSQL("db", 3306, 3308, 6033,
-		[]shimTenant{{MySQLUser: "old_user", MySQLPassSHA1: "*OLDHASH"}})
+		[]shimTenant{{MySQLUser: "old_user", MySQLPassword: "oldpw"}})
 	second := generateProxySQLSetupSQL("db", 3306, 3308, 6033,
-		[]shimTenant{{MySQLUser: "new_user", MySQLPassSHA1: "*NEWHASH"}})
+		[]shimTenant{{MySQLUser: "new_user", MySQLPassword: "newpw"}})
 
 	// Both runs emit the same blanket DELETE, scoped only by hostgroup,
 	// so the second apply also removes 'old_user' even though the name
@@ -370,7 +406,7 @@ func TestGenerateProxySQLSetupSQLRenameIdempotent(t *testing.T) {
 // `passthroughHostgroup` and `shimHostgroup` would be caught even if
 // individual fragment assertions still pass.
 func TestGenerateProxySQLSetupSQLHostgroupPairing(t *testing.T) {
-	tenants := []shimTenant{{MySQLUser: pcTestUser1, MySQLPassSHA1: pcTestSHA1_1}}
+	tenants := []shimTenant{{MySQLUser: pcTestUser1, MySQLPassword: pcTestPassword1}}
 	out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants)
 
 	wants := []string{
@@ -413,7 +449,7 @@ func TestRunProxySQLConfigStrictYAML(t *testing.T) {
 	os.Chdir(dir)
 
 	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
-	writeShimYAML(t, dir, "tenants:\n  - mysql_user_name: app_user\n    mysql_pass_sha1: '*ABC'\n")
+	writeShimYAML(t, dir, "tenants:\n  - mysql_user_name: app_user\n    mysql_password: 'p'\n")
 	resetPCFlags()
 
 	err := runProxySQLConfig(proxysqlConfigCmd, nil)
@@ -480,7 +516,7 @@ func TestRunProxySQLConfigPortRangeValidation(t *testing.T) {
 
 func TestLoadShimTenantsControlChars(t *testing.T) {
 	// Reject control chars beyond plain \r\n: \t in mysql_user, \0 in
-	// mysql_pass_sha1. Both would corrupt the generated SQL output.
+	// mysql_password. Both would corrupt the generated SQL output.
 	cases := []struct {
 		name     string
 		yamlBody string
@@ -488,13 +524,13 @@ func TestLoadShimTenantsControlChars(t *testing.T) {
 	}{
 		{
 			name:     "tab in mysql_user",
-			yamlBody: "tenants:\n  - mysql_user: \"app\\tuser\"\n    mysql_pass_sha1: '*ABC'\n",
+			yamlBody: "tenants:\n  - mysql_user: \"app\\tuser\"\n    mysql_password: 'p'\n",
 			wantSub:  "mysql_user contains control character",
 		},
 		{
 			name:     "null byte in pass",
-			yamlBody: "tenants:\n  - mysql_user: app_user\n    mysql_pass_sha1: \"*A\\u0000B\"\n",
-			wantSub:  "mysql_pass_sha1 contains control character",
+			yamlBody: "tenants:\n  - mysql_user: app_user\n    mysql_password: \"p\\u0000q\"\n",
+			wantSub:  "mysql_password contains control character",
 		},
 	}
 	for _, tc := range cases {
@@ -509,6 +545,20 @@ func TestLoadShimTenantsControlChars(t *testing.T) {
 				t.Errorf("expected %q in error, got %v", tc.wantSub, err)
 			}
 		})
+	}
+}
+
+func TestNativePasswordHash(t *testing.T) {
+	// SHA1(SHA1("password")) = *2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19
+	// — this is the well-known mysql_native_password test vector
+	// (see MySQL docs and the ProxySQL examples). Pinning it here
+	// guarantees that bintrail's hash matches what `SELECT
+	// PASSWORD('password')` produces in MySQL 5.7 / ProxySQL, so the
+	// SQL we emit interoperates with manual operator setup.
+	got := nativePasswordHash("password")
+	want := "*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19"
+	if got != want {
+		t.Errorf("nativePasswordHash(\"password\") = %s, want %s", got, want)
 	}
 }
 
