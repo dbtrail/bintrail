@@ -196,6 +196,12 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// No row cap: a _diff query is already PK-scoped + time-windowed, so the
+	// upper bound on returned events is bounded by how often that one row
+	// actually changes within the window. A silent truncation here would
+	// hand the customer a partial audit history with no signal — worse than
+	// the rare cost of a few thousand rows for an unusually hot row.
+	// Customers needing pagination can narrow the BETWEEN range.
 	engine := query.New(h.indexDB)
 	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
 		Opts: query.Options{
@@ -204,7 +210,6 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 			PKValues: q.PKValue,
 			Since:    &q.Since,
 			Until:    &q.Until,
-			Limit:    diffMaxRows,
 		},
 		DBName:    q.Schema,
 		NoArchive: h.cfg.NoArchive,
@@ -236,12 +241,6 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 	}
 	return &mysql.Result{Resultset: rs}, nil
 }
-
-// diffMaxRows caps a single _diff response. 1000 events is enough
-// for any realistic per-PK history within a customer-facing window;
-// a hot row that exceeded this would still be queryable via repeated
-// narrower-range calls.
-const diffMaxRows = 1000
 
 // eventTypeName turns parser.EventType (a uint8) into a human-readable
 // string for the _diff resultset. The parser package does not export a
