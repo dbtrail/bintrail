@@ -117,7 +117,7 @@ type Options struct {
 	ChangedColumn string // column name; matched via JSON_CONTAINS
 	ColumnEq      []ColumnEq // match against values inside row_after / row_before
 	Flag          string     // return events from tables/columns carrying this flag
-	Limit         int        // 0 → default 100
+	Limit         int        // 0 → no limit (no LIMIT clause emitted)
 	// LimitPerPK caps the number of latest events returned per pk_values value.
 	// 0 = unlimited. Applied via ROW_NUMBER OVER (PARTITION BY pk_values
 	// ORDER BY event_timestamp DESC, event_id DESC) so the kept events are
