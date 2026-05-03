@@ -1,5 +1,13 @@
 -- 002_drop_idx_file_pos.sql
 --
+-- OPERATOR-FACING ONLY. This file is NOT auto-applied by `bintrail init`,
+-- the agent, or `indexer.EnsureSchema(db)`. Apply manually per tenant
+-- against the index database with the bintrail DB selected, e.g.:
+--
+--   mysql -u<user> -p<pass> -h<host> <index_db> < 002_drop_idx_file_pos.sql
+--
+-- Same convention as 001_create_tables.sql (see header on that file).
+--
 -- Removes the dead idx_file_pos index from binlog_events. The index was
 -- declared at project inception (bintrail-spec.md:215, mid-Mar 2026) but
 -- the query/recover paths shipped using gtid, event_timestamp, and pk_hash
