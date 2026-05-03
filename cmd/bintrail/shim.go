@@ -141,10 +141,17 @@ func runShim(cmd *cobra.Command, args []string) error {
 // connection runs in its own goroutine with its own Handler instance
 // (Handler holds per-connection state: the currently-selected
 // database).
+//
+// Accept errors that aren't shutdown signals (ctx cancellation, listener
+// closed) are retried with exponential backoff so a transient kernel
+// hiccup doesn't burn CPU and a permanent listener wedge doesn't fill
+// the log at ~10 lines/sec. The backoff resets to zero on every
+// successful Accept so a brief spike doesn't poison the steady state.
 func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim.TenantAuth, cfg shim.Config) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
+	var backoff time.Duration
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -154,18 +161,55 @@ func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			slog.Error("accept failed", "err", err)
-			// Brief backoff so a persistent accept error doesn't
-			// burn CPU.
-			time.Sleep(100 * time.Millisecond)
+			backoff = nextAcceptBackoff(backoff)
+			slog.Error("accept failed", "err", err, "backoff", backoff)
+			// Sleep via select so SIGTERM can interrupt a long
+			// backoff — without this, a wedged listener at the
+			// 5s cap would keep the process alive for up to 5s
+			// after the operator pressed Ctrl+C.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 			continue
 		}
+		backoff = 0
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
 			handleConn(c, db, auth, cfg)
 		}(conn)
 	}
+}
+
+const (
+	// initialAcceptBackoff is the first sleep after a non-fatal Accept
+	// error. Short enough that a single transient blip is invisible to
+	// callers; long enough that a flapping error doesn't spin.
+	initialAcceptBackoff = 100 * time.Millisecond
+	// maxAcceptBackoff caps the exponential growth. 5s is the longest
+	// we'll let an operator wait between "listener wedged" log lines
+	// and the longest a SIGTERM can be delayed waiting on the sleep.
+	maxAcceptBackoff = 5 * time.Second
+)
+
+// nextAcceptBackoff returns the next sleep interval given the current
+// one. Doubles up to maxAcceptBackoff; the zero value (steady state
+// after a successful Accept) seeds the first retry at
+// initialAcceptBackoff.
+//
+// Pure function so the doubling + cap behaviour can be unit-tested
+// without driving a real listener through error states.
+func nextAcceptBackoff(current time.Duration) time.Duration {
+	if current <= 0 {
+		return initialAcceptBackoff
+	}
+	next := current * 2
+	if next > maxAcceptBackoff {
+		return maxAcceptBackoff
+	}
+	return next
 }
 
 // isLoopbackAddr reports whether addr resolves to a loopback address.
