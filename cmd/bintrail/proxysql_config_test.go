@@ -251,6 +251,39 @@ func TestRunProxySQLConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("both mysql_password and mysql_pass_sha1 set: cleartext wins", func(t *testing.T) {
+		// Half-migrated shim.yaml: operator added mysql_password but
+		// forgot to delete the legacy mysql_pass_sha1. The cleartext
+		// must win and the SHA1 emitted in the SQL must be derived
+		// from the cleartext, NOT the stale legacy hash. A regression
+		// here would silently use a stale hash for the new ProxySQL
+		// row.
+		dir := t.TempDir()
+		orig, _ := os.Getwd()
+		t.Cleanup(func() { os.Chdir(orig) })
+		os.Chdir(dir)
+
+		t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+		writeShimYAML(t, dir, `tenants:
+  - mysql_user: app_user
+    mysql_password: 'fresh'
+    mysql_pass_sha1: '*STALEHASH'
+`)
+		resetPCFlags()
+		if err := runProxySQLConfig(proxysqlConfigCmd, nil); err != nil {
+			t.Fatal(err)
+		}
+		out, _ := os.ReadFile(filepath.Join(dir, "proxysql-setup.sql"))
+		body := string(out)
+		freshHash := nativePasswordHash("fresh")
+		if !strings.Contains(body, freshHash) {
+			t.Errorf("expected SQL to embed the fresh-cleartext SHA1 %q; got:\n%s", freshHash, body)
+		}
+		if strings.Contains(body, "*STALEHASH") {
+			t.Errorf("stale legacy hash leaked into SQL; got:\n%s", body)
+		}
+	})
+
 	t.Run("error when shim.yaml has no tenants", func(t *testing.T) {
 		dir := t.TempDir()
 		orig, _ := os.Getwd()
@@ -549,16 +582,50 @@ func TestLoadShimTenantsControlChars(t *testing.T) {
 }
 
 func TestNativePasswordHash(t *testing.T) {
-	// SHA1(SHA1("password")) = *2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19
-	// — this is the well-known mysql_native_password test vector
-	// (see MySQL docs and the ProxySQL examples). Pinning it here
-	// guarantees that bintrail's hash matches what `SELECT
-	// PASSWORD('password')` produces in MySQL 5.7 / ProxySQL, so the
-	// SQL we emit interoperates with manual operator setup.
-	got := nativePasswordHash("password")
-	want := "*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19"
-	if got != want {
-		t.Errorf("nativePasswordHash(\"password\") = %s, want %s", got, want)
+	// Pinned vectors against `SELECT PASSWORD(...)` in MySQL 5.7 /
+	// ProxySQL — these are byte-identity checks against the canonical
+	// mysql_native_password storage form. The "password" vector is
+	// well-known across the MySQL ecosystem; the empty and UTF-8
+	// vectors guard against accidental fixes that special-case empty
+	// input or normalise input bytes (both would silently diverge
+	// from MySQL's literal SHA1).
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "well-known vector \"password\"",
+			in:   "password",
+			want: "*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19",
+		},
+		{
+			name: "empty cleartext (loadShimTenants rejects this; pinned for completeness)",
+			in:   "",
+			want: "*BE1BDEC0AA74B4DCB079943E70528096CCA985F8",
+		},
+		{
+			// Multi-byte UTF-8: MySQL hashes the raw bytes, not
+			// runes or NFC-normalised input. A well-meaning fix
+			// using `[]rune` would silently produce a different
+			// digest and break interop with any client that knows
+			// the cleartext. The expected hash is the byte-level
+			// SHA1(SHA1) of the UTF-8 encoding (10 bytes).
+			name: "UTF-8 multi-byte \"pässwörd\"",
+			in:   "pässwörd",
+			want: "*0225EC5004ABB0B8CB557541FE53DE1A5D8CC825",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := nativePasswordHash(tc.in)
+			if got != tc.want {
+				t.Errorf("nativePasswordHash(%q) = %s, want %s", tc.in, got, tc.want)
+			}
+			if !strings.HasPrefix(got, "*") || len(got) != 41 {
+				t.Errorf("expected `*` + 40 hex chars; got %q (len %d)", got, len(got))
+			}
+		})
 	}
 }
 

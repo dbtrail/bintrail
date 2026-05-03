@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -224,6 +225,17 @@ func loadShimTenants(path string) ([]shimTenant, error) {
 		}
 		if r := firstControlRune(t.MySQLPassword); r >= 0 {
 			return nil, fmt.Errorf("%s tenant #%d: mysql_password contains control character U+%04X", path, i+1, r)
+		}
+		// Mirror internal/shim/auth.go's behaviour: when both fields
+		// are set, mysql_password wins and the legacy SHA1 is silently
+		// dropped. Warn so an operator who half-migrated (added the
+		// new field but forgot to delete the old) can clean up rather
+		// than leaving stale state in shim.yaml.
+		if t.MySQLPassSHA1 != "" {
+			slog.Warn(
+				"shim.yaml: mysql_pass_sha1 is no longer used (the SHA1 is recomputed from mysql_password); the field is ignored — remove it to clean up",
+				"tenant", i+1, "mysql_user", t.MySQLUser,
+			)
 		}
 	}
 	return cfg.Tenants, nil

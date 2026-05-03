@@ -34,6 +34,11 @@ type Handler struct {
 	indexDB *sql.DB
 	cfg     Config
 	logger  *slog.Logger
+	// archiveFetcher resolves S3 / local Parquet archive sources during
+	// FetchMerged. Defaults to parquetquery.Fetch (the same fetcher
+	// `bintrail query` and `bintrail recover` use) — exposed as a field
+	// so tests can inject a fake without DuckDB or real S3.
+	archiveFetcher query.ArchiveFetcher
 
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
@@ -72,7 +77,12 @@ func NewHandlerWithConfig(indexDB *sql.DB, cfg Config, logger *slog.Logger) *Han
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{indexDB: indexDB, cfg: cfg, logger: logger}
+	return &Handler{
+		indexDB:        indexDB,
+		cfg:            cfg,
+		logger:         logger,
+		archiveFetcher: parquetquery.Fetch,
+	}
 }
 
 // UseDB stores the schema the client selected. _flashback queries
@@ -159,7 +169,7 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 		DBName:         q.Schema,
 		NoArchive:      h.cfg.NoArchive,
 		AllowGaps:      h.cfg.AllowGaps,
-		ArchiveFetcher: parquetquery.Fetch,
+		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)
@@ -240,7 +250,7 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 		DBName:         q.Schema,
 		NoArchive:      h.cfg.NoArchive,
 		AllowGaps:      h.cfg.AllowGaps,
-		ArchiveFetcher: parquetquery.Fetch,
+		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)

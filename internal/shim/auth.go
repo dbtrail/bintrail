@@ -36,8 +36,17 @@ type TenantAuth struct {
 }
 
 // NewTenantAuth builds a TenantAuth from a map of username →
-// cleartext password. An empty map returns an error rather than
-// silently accepting nothing.
+// cleartext password. An empty map, or any tenant with an empty
+// password, returns an error.
+//
+// Empty passwords are rejected at the type boundary (not just at the
+// LoadTenants entry point) because GetCredential returns whatever is
+// in the map: an empty string here would make the
+// mysql_native_password handshake accept any client that also sent
+// an empty password — recreating the exact #254 silent-auth bug for
+// any future caller that bypasses LoadTenants. Pushing the invariant
+// down into the type means tests and library callers cannot
+// accidentally weaken the auth model.
 func NewTenantAuth(users map[string]string) (TenantAuth, error) {
 	if len(users) == 0 {
 		return TenantAuth{}, errors.New("shim: no tenants in shim.yaml; cannot start with empty allowlist")
@@ -46,6 +55,9 @@ func NewTenantAuth(users map[string]string) (TenantAuth, error) {
 	for u, p := range users {
 		if u == "" {
 			continue
+		}
+		if p == "" {
+			return TenantAuth{}, fmt.Errorf("shim: tenant %q has empty mysql_password; refusing to start with effective auth bypass", u)
 		}
 		clean[u] = p
 	}

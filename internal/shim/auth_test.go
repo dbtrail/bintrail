@@ -22,6 +22,21 @@ func TestNewTenantAuthEmpty(t *testing.T) {
 	}
 }
 
+// TestNewTenantAuthRejectsEmptyPassword pins the #254 defense-in-depth
+// invariant: even a caller that bypasses LoadTenants must not be able
+// to construct a TenantAuth that authenticates known usernames with
+// any password. Empty cleartext + mysql_native_password handshake =
+// "any password accepted" — the exact bug v0.7.0 / 0.7.1 shipped.
+func TestNewTenantAuthRejectsEmptyPassword(t *testing.T) {
+	_, err := NewTenantAuth(map[string]string{"alice": ""})
+	if err == nil {
+		t.Fatal("expected error for empty password")
+	}
+	if !strings.Contains(err.Error(), "empty mysql_password") {
+		t.Errorf("error should explicitly name the missing field, got %v", err)
+	}
+}
+
 func TestTenantAuthCheckUsername(t *testing.T) {
 	a, err := NewTenantAuth(map[string]string{"alice": "alicepw", "bob": "bobpw"})
 	if err != nil {
@@ -138,6 +153,12 @@ func TestLoadTenantsErrors(t *testing.T) {
 		if !strings.Contains(err.Error(), "mysql_password is required") {
 			t.Errorf("error should explain the migration, got %v", err)
 		}
+		// Pin the migration recipe: a future shortening to "use
+		// mysql_password" would lose the operator-helpful "Replace
+		// mysql_pass_sha1" guidance.
+		if !strings.Contains(err.Error(), "Replace mysql_pass_sha1") {
+			t.Errorf("error should give the literal replacement hint, got %v", err)
+		}
 	})
 
 	t.Run("strict YAML rejects typo", func(t *testing.T) {
@@ -151,4 +172,32 @@ func TestLoadTenantsErrors(t *testing.T) {
 			t.Errorf("error should name the unknown field, got %v", err)
 		}
 	})
+}
+
+// TestLoadTenantsBothFieldsSet pins the contract that when an operator
+// has both `mysql_password` (new) and `mysql_pass_sha1` (legacy) in
+// shim.yaml — typically during a half-completed migration — the
+// cleartext wins and the SHA1 is dropped. A future "compat" refactor
+// that flipped the priority (e.g. "if SHA1 is present, prefer it for
+// backward compat") would silently re-introduce #254 because the
+// shim cannot use the SHA1 to authenticate ProxySQL-forwarded
+// connections.
+func TestLoadTenantsBothFieldsSet(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shim.yaml")
+	body := `tenants:
+  - mysql_user: alice
+    mysql_password: 'cleartext_alice'
+    mysql_pass_sha1: '*STALEHASH'
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	users, err := LoadTenants(path)
+	if err != nil {
+		t.Fatalf("expected success when both fields set; got %v", err)
+	}
+	if got := users["alice"]; got != "cleartext_alice" {
+		t.Errorf("expected cleartext to win; got %q", got)
+	}
 }

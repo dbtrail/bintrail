@@ -1,12 +1,15 @@
 package shim
 
 import (
+	"context"
 	"database/sql"
+	"log/slog"
 	"net"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	_ "github.com/go-sql-driver/mysql" // database/sql driver registration
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
@@ -230,11 +233,128 @@ func TestImageToResultEmpty(t *testing.T) {
 	}
 }
 
-// TestEndToEndHandshake — boots a real MySQL-protocol server with
-// our Handler, dials it with go-mysql's client, and drives a query
-// through. Validates the wire-protocol path end-to-end without
-// requiring a real MySQL backend.
-func TestEndToEndHandshake(t *testing.T) {
+// TestNewHandlerWiresArchiveFetcher locks in the issue #255 fix at the
+// construction boundary. Both NewHandler and NewHandlerWithConfig must
+// install a non-nil archiveFetcher; otherwise every virtual-schema
+// query crashes with "ArchiveFetcher is required when NoArchive is
+// false" because the FetchMerged contract demands either NoArchive=true
+// or a non-nil fetcher.
+//
+// A failure here means a refactor dropped the archiveFetcher wiring
+// from the constructor — the same regression class /proxysql-e2e
+// would catch end-to-end, but at unit-test speed.
+func TestNewHandlerWiresArchiveFetcher(t *testing.T) {
+	h := NewHandler(nil, nil)
+	if h.archiveFetcher == nil {
+		t.Error("NewHandler must wire a non-nil archiveFetcher; got nil")
+	}
+	h2 := NewHandlerWithConfig(nil, Config{}, nil)
+	if h2.archiveFetcher == nil {
+		t.Error("NewHandlerWithConfig must wire a non-nil archiveFetcher; got nil")
+	}
+}
+
+// TestRunPointInTimeInvokesArchiveFetcher exercises the runPointInTime
+// → FetchMerged → ArchiveFetcher path with sqlmock, asserting that the
+// shim's wiring actually delivers archive rows on virtual-schema
+// queries (the issue #255 fix). Uses a stubbed archive_state row so
+// FetchMerged calls the injected fetcher.
+func TestRunPointInTimeInvokesArchiveFetcher(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// archive_state returns one S3-backed source. The local_path is
+	// empty so ResolveArchiveSources falls through to the S3 branch
+	// (which doesn't require the directory to exist on disk for the
+	// shim host to discover it). The s3_key contains the
+	// "bintrail_id=" marker extractBasePath looks for.
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery("FROM archive_state").
+		WillReturnRows(sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}).
+			AddRow("test-id", "", "test-bucket", "bintrail_id=test-id/event_date=2026/events.parquet"))
+	// The planner queries information_schema.PARTITIONS. Stub empty
+	// so the planner returns no live hours.
+	mock.ExpectQuery("information_schema.PARTITIONS").
+		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME", "PARTITION_DESCRIPTION"}))
+	// Live MySQL fetch may or may not run depending on planner output;
+	// stub it permissive (no expected rows) so a call is fine.
+	mock.ExpectQuery("FROM binlog_events").
+		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version"}))
+
+	called := false
+	fakeFetcher := func(ctx context.Context, opts query.Options, src string) ([]query.ResultRow, error) {
+		called = true
+		return nil, nil
+	}
+
+	h := &Handler{
+		indexDB:        db,
+		cfg:            Config{AllowGaps: true},
+		logger:         slog.Default(),
+		archiveFetcher: fakeFetcher,
+	}
+
+	asof := time.Now()
+	q := TimeTravelQuery{
+		Type:    TypeFlashback,
+		Schema:  "myapp",
+		Table:   "orders",
+		PKValue: "1",
+		AsOf:    asof,
+	}
+	if _, err := h.runPointInTime(q); err != nil {
+		// runPointInTime can succeed (empty resultset) or fail with a
+		// scan error from sqlmock; both still prove the fetcher was
+		// invoked. The assertion that matters is `called`.
+		t.Logf("runPointInTime returned %v (acceptable for sqlmock-stubbed DB)", err)
+	}
+	if !called {
+		t.Error("expected archiveFetcher to be invoked when archive_state has rows; was not called")
+	}
+}
+
+// TestEndToEndHandshake_AcceptsCorrectPassword boots a real MySQL-protocol
+// server with our Handler and asserts that a client connecting with the
+// correct username AND password passes the mysql_native_password challenge.
+//
+// This is the regression guard for issue #254: the handshake exercises
+// `compareNativePasswordAuthData(salt, cleartext)` against the value
+// `TenantAuth.GetCredential` returns. A regression to the pre-fix
+// `("", true, nil)` would only let empty-password clients in — this
+// test would fail because the client sends the actual password's
+// scrambled response.
+func TestEndToEndHandshake_AcceptsCorrectPassword(t *testing.T) {
+	if err := runHandshakeTest(t, "alice", "alicepw", "alice", "alicepw"); err != nil {
+		t.Fatalf("expected handshake to succeed with matching password: %v", err)
+	}
+}
+
+// TestEndToEndHandshake_RejectsWrongPassword is the negative half: a
+// client sending the wrong password must fail authentication. This
+// catches the literal regression of #254 — without it, a pre-fix
+// `GetCredential` returning "" would still pass
+// TestEndToEndHandshake_AcceptsCorrectPassword if the server happened
+// to accept any client response (which it does NOT today, but the
+// negative case is what proves real validation is happening).
+func TestEndToEndHandshake_RejectsWrongPassword(t *testing.T) {
+	err := runHandshakeTest(t, "alice", "alicepw", "alice", "wrongpw")
+	if err == nil {
+		t.Fatal("expected handshake to fail with wrong password; got nil")
+	}
+	if !strings.Contains(err.Error(), "Access denied") {
+		t.Errorf("expected MySQL 'Access denied' error, got %v", err)
+	}
+}
+
+// runHandshakeTest spins up one shim listener, configures TenantAuth
+// with serverUser/serverPass, and dials with clientUser/clientPass.
+// Returns the client's Ping error (nil on success). Used by both the
+// positive and negative auth tests above.
+func runHandshakeTest(t *testing.T, serverUser, serverPass, clientUser, clientPass string) error {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -259,9 +379,12 @@ func TestEndToEndHandshake(t *testing.T) {
 		h := NewHandler(nil, nil)
 		h.UseDB("myapp")
 		srv := server.NewDefaultServer()
-		auth, _ := NewTenantAuth(map[string]string{"test": ""})
+		auth, _ := NewTenantAuth(map[string]string{serverUser: serverPass})
 		mc, err := server.NewCustomizedConn(c, srv, auth, h)
 		if err != nil {
+			// Auth failure surfaces here as a non-nil error from
+			// NewCustomizedConn (handshake fails before the command
+			// loop starts). Negative-auth tests rely on this.
 			serverErr <- err
 			return
 		}
@@ -276,14 +399,12 @@ func TestEndToEndHandshake(t *testing.T) {
 	host, port, _ := net.SplitHostPort(addr)
 	clientErr := make(chan error, 1)
 	go func() {
-		clientErr <- driveClient(host + ":" + port)
+		clientErr <- driveClient(host+":"+port, clientUser, clientPass)
 	}()
 
+	var pingErr error
 	select {
-	case err := <-clientErr:
-		if err != nil {
-			t.Fatalf("client failure: %v", err)
-		}
+	case pingErr = <-clientErr:
 	case <-time.After(5 * time.Second):
 		t.Fatal("client timed out")
 	}
@@ -294,19 +415,13 @@ func TestEndToEndHandshake(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("server goroutine did not exit")
 	}
+	return pingErr
 }
 
-// driveClient connects to the shim, completes the MySQL handshake via
-// go-sql-driver/mysql's Ping, then closes. Success is "the handshake
-// completed without error" — proof that bintrail can speak the wire
-// protocol to a real client. We deliberately do NOT issue further
-// queries here; the per-query handler logic is exercised by the
-// other unit tests, and adding a query here would require a real
-// indexDB.
-func driveClient(addr string) error {
-	// TenantAuth's empty-string credential means the DSN sends an
-	// empty password against the allowlisted "test" user.
-	dsn := "test:@tcp(" + addr + ")/"
+// driveClient connects to the shim with explicit credentials and
+// runs Ping. Returns the Ping error (nil on success).
+func driveClient(addr, user, password string) error {
+	dsn := user + ":" + password + "@tcp(" + addr + ")/"
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return err
