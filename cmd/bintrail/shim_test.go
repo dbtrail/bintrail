@@ -88,24 +88,27 @@ func TestAcceptBackoffSequence(t *testing.T) {
 	}
 }
 
-// TestServeLoopExitsOnContextCancel locks in the operator-shutdown
-// guarantee: a ctx cancellation must interrupt the accept loop even
-// when it's mid-sleep waiting out a backoff. Without the cancellable
-// select inside the error branch (a plain time.Sleep would block for
-// up to maxAcceptBackoff), Ctrl+C against a wedged listener could
-// take up to 5 seconds to take effect.
+// TestServeLoopExitsOnContextCancel asserts that serveLoop returns
+// within 1 second of ctx cancellation when driven against a listener
+// whose Accept never succeeds. This catches the operator-visible
+// failure mode the cancellable select was added to defend against:
+// a regression that introduces a multi-second uninterruptible sleep
+// in the error branch (e.g. `time.Sleep(maxAcceptBackoff)`) would
+// block past the 1s bound and fail.
 //
-// The test drives serveLoop with a synthetic listener whose Accept
-// always returns a non-net.ErrClosed error, so the loop is forced
-// down the backoff path on every iteration. We let it spin briefly
-// to accumulate a non-trivial backoff, then cancel the context, and
-// assert serveLoop returns well under maxAcceptBackoff.
+// What this test does NOT catch: a regression to a short fixed sleep
+// (e.g. the literal `time.Sleep(100*time.Millisecond)` from before
+// this PR). With a short sleep, the top-of-loop ctx check at the next
+// iteration still exits within ~100ms of cancel — under the bound.
+// That's a deliberate scoping choice: a 100ms shutdown delay is not
+// the operator pain point this PR addresses; a 5s wedge is. Tightening
+// the bound below ~50ms would make the test flaky on slow CI without
+// catching a meaningfully worse regression.
 func TestServeLoopExitsOnContextCancel(t *testing.T) {
 	listener := &alwaysErrorListener{}
 	defer listener.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	done := make(chan struct{})
 	go func() {
@@ -115,23 +118,29 @@ func TestServeLoopExitsOnContextCancel(t *testing.T) {
 		close(done)
 	}()
 
-	// Let the loop accumulate a couple of backoff doublings so the
-	// next sleep is meaningfully long (>= 200ms). This forces the
-	// cancel below to actually interrupt a sleep, rather than
-	// landing between iterations and exiting via the top-of-loop
-	// ctx check.
+	// Reap the goroutine deterministically on test failure so a
+	// regression that wedges serveLoop doesn't leak it past
+	// t.Fatalf into other tests.
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	// Brief spin so the loop is in a non-trivial state when cancel
+	// arrives — not load-bearing for correctness; cancellation works
+	// from any iteration.
 	time.Sleep(150 * time.Millisecond)
 	cancel()
 
-	timeout := maxAcceptBackoff - time.Second
+	const exitBound = 1 * time.Second
 	select {
 	case <-done:
 		// ok
-	case <-time.After(timeout):
+	case <-time.After(exitBound):
 		t.Fatalf(
 			"serveLoop did not exit within %v of ctx cancel; "+
-				"the cancellable select must not have fired (a plain time.Sleep would block up to %v)",
-			timeout, maxAcceptBackoff,
+				"a multi-second uninterruptible sleep regression in the error branch would block this long",
+			exitBound,
 		)
 	}
 }
