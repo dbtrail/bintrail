@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/dbtrail/bintrail/internal/shim"
 )
 
 // TestIsLoopbackAddr locks in the security-relevant guard that
@@ -81,4 +86,76 @@ func TestAcceptBackoffSequence(t *testing.T) {
 	if d != maxAcceptBackoff {
 		t.Errorf("after %d steps, got %v; want exactly %v", steps, d, maxAcceptBackoff)
 	}
+}
+
+// TestServeLoopExitsOnContextCancel locks in the operator-shutdown
+// guarantee: a ctx cancellation must interrupt the accept loop even
+// when it's mid-sleep waiting out a backoff. Without the cancellable
+// select inside the error branch (a plain time.Sleep would block for
+// up to maxAcceptBackoff), Ctrl+C against a wedged listener could
+// take up to 5 seconds to take effect.
+//
+// The test drives serveLoop with a synthetic listener whose Accept
+// always returns a non-net.ErrClosed error, so the loop is forced
+// down the backoff path on every iteration. We let it spin briefly
+// to accumulate a non-trivial backoff, then cancel the context, and
+// assert serveLoop returns well under maxAcceptBackoff.
+func TestServeLoopExitsOnContextCancel(t *testing.T) {
+	listener := &alwaysErrorListener{}
+	defer listener.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		// db / auth / cfg are unused on this path because Accept
+		// never returns a connection — handleConn is unreachable.
+		serveLoop(ctx, listener, nil, shim.TenantAuth{}, shim.Config{})
+		close(done)
+	}()
+
+	// Let the loop accumulate a couple of backoff doublings so the
+	// next sleep is meaningfully long (>= 200ms). This forces the
+	// cancel below to actually interrupt a sleep, rather than
+	// landing between iterations and exiting via the top-of-loop
+	// ctx check.
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	timeout := maxAcceptBackoff - time.Second
+	select {
+	case <-done:
+		// ok
+	case <-time.After(timeout):
+		t.Fatalf(
+			"serveLoop did not exit within %v of ctx cancel; "+
+				"the cancellable select must not have fired (a plain time.Sleep would block up to %v)",
+			timeout, maxAcceptBackoff,
+		)
+	}
+}
+
+// alwaysErrorListener is a minimal net.Listener whose Accept always
+// returns a synthetic non-net.ErrClosed error until Close is called.
+// Used by TestServeLoopExitsOnContextCancel to drive the accept
+// loop's error branch deterministically without binding a real port.
+type alwaysErrorListener struct {
+	closed atomic.Bool
+}
+
+func (l *alwaysErrorListener) Accept() (net.Conn, error) {
+	if l.closed.Load() {
+		return nil, net.ErrClosed
+	}
+	return nil, errors.New("synthetic accept failure")
+}
+
+func (l *alwaysErrorListener) Close() error {
+	l.closed.Store(true)
+	return nil
+}
+
+func (l *alwaysErrorListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
 }
