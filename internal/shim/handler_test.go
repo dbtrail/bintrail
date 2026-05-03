@@ -10,6 +10,9 @@ import (
 	_ "github.com/go-sql-driver/mysql" // database/sql driver registration
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
+
+	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/bintrail/internal/query"
 )
 
 // TestHandlerHandshakeNoise verifies the small allow-list for queries
@@ -125,6 +128,76 @@ func TestImageToResultColumnOrder(t *testing.T) {
 	}
 }
 
+// TestSelectImage covers every branch of the row-image priority rule
+// used by runPointInTime. The function is intentionally pure so it
+// can be exercised without sqlmock or a real MySQL: the rest of the
+// _flashback / _snapshot pipeline (sort, LimitPerPK, archive merge)
+// is covered by the query package's own tests.
+//
+// A future refactor that swaps the row_after / row_before priority,
+// or that mishandles a DELETE event (row_after empty by definition),
+// would silently return wrong row state to the customer. The
+// "delete_fallback" case is the tripwire for that regression.
+func TestSelectImage(t *testing.T) {
+	after := map[string]any{"id": int64(1), "name": "after"}
+	before := map[string]any{"id": int64(1), "name": "before"}
+
+	cases := []struct {
+		name string
+		rows []query.ResultRow
+		want map[string]any
+	}{
+		{
+			name: "empty_input",
+			rows: nil,
+			want: nil,
+		},
+		{
+			name: "insert_returns_row_after",
+			rows: []query.ResultRow{{
+				EventType: parser.EventInsert,
+				RowAfter:  after,
+			}},
+			want: after,
+		},
+		{
+			name: "update_prefers_row_after",
+			rows: []query.ResultRow{{
+				EventType: parser.EventUpdate,
+				RowBefore: before,
+				RowAfter:  after,
+			}},
+			want: after,
+		},
+		{
+			name: "delete_fallback_to_row_before",
+			rows: []query.ResultRow{{
+				EventType: parser.EventDelete,
+				RowBefore: before,
+			}},
+			want: before,
+		},
+		{
+			name: "both_empty_returns_nil",
+			rows: []query.ResultRow{{
+				EventType: parser.EventUpdate,
+				RowBefore: map[string]any{},
+				RowAfter:  map[string]any{},
+			}},
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := selectImage(tc.rows)
+			if !equalMaps(got, tc.want) {
+				t.Errorf("selectImage = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestImageToResultEmpty — an empty image (zero-key map) should
 // produce a resultset with no rows.
 func TestImageToResultEmpty(t *testing.T) {
@@ -235,6 +308,26 @@ func equalStrings(a, b []string) bool {
 	}
 	for i := range a {
 		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// equalMaps compares two map[string]any by length and value identity
+// (==). Sufficient for the selectImage tests because they intentionally
+// pass the same map literal as both input and expected output, so a
+// pointer-equal value comparison detects "did selectImage return the
+// expected source map?". Returning a *different* map with equal contents
+// would fail this check — which is the correct outcome, since the
+// helper's contract is to hand back the input image unchanged, not a
+// copy.
+func equalMaps(a, b map[string]any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		if vb, ok := b[k]; !ok || va != vb {
 			return false
 		}
 	}

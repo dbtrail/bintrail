@@ -163,25 +163,49 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)
 	}
 
-	if len(rows) == 0 {
+	image := selectImage(rows)
+	if image == nil {
 		return emptyResult(), nil
 	}
-
-	// LimitPerPK=1 returns at most one row per PK; we asked for one
-	// PK, so rows[0] is the answer.
-	latest := rows[0]
-
-	var image map[string]any
-	switch {
-	case len(latest.RowAfter) > 0:
-		image = latest.RowAfter
-	case len(latest.RowBefore) > 0:
-		image = latest.RowBefore
-	default:
-		return emptyResult(), nil
-	}
-
 	return imageToResult(image)
+}
+
+// selectImage picks the row image that represents the row's state at
+// the queried point in time, given the LimitPerPK=1 result of a
+// _flashback / _snapshot fetch.
+//
+// The caller passes whatever FetchMerged returned. Because we issue
+// the fetch with LimitPerPK=1 and a single PKValues filter, at most
+// one row reaches this helper — but selectImage tolerates an empty
+// or larger slice and only ever inspects rows[0], so a future caller
+// that loosens the limit cannot accidentally pick the wrong event.
+//
+// Priority: row_after wins when present (the post-image of an
+// INSERT/UPDATE is the row's state). Fall back to row_before for
+// DELETE events, where row_after is empty but row_before captures the
+// row's state at the moment of deletion. Returns nil to signal the
+// caller should respond with an empty resultset — either because
+// there were no rows, or because both images were empty (which would
+// indicate corrupted index data, treated as "no answer" rather than
+// fabricating one).
+//
+// Extracted as a pure helper specifically so the priority rule can
+// be unit-tested without spinning up a real MySQL: a future refactor
+// that swaps the row_after / row_before order would silently return
+// stale data on every UPDATE, with the regression invisible to any
+// test that doesn't exercise this exact branch.
+func selectImage(rows []query.ResultRow) map[string]any {
+	if len(rows) == 0 {
+		return nil
+	}
+	latest := rows[0]
+	if len(latest.RowAfter) > 0 {
+		return latest.RowAfter
+	}
+	if len(latest.RowBefore) > 0 {
+		return latest.RowBefore
+	}
+	return nil
 }
 
 // runDiff resolves a _diff query: every event for the given PK
