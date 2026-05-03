@@ -27,8 +27,7 @@ CREATE TABLE IF NOT EXISTS binlog_events (
     PRIMARY KEY (event_id, event_timestamp),
     INDEX idx_row_lookup (schema_name, table_name, event_timestamp),
     INDEX idx_pk_hash    (schema_name, table_name, pk_hash, event_timestamp),
-    INDEX idx_gtid       (gtid),
-    INDEX idx_file_pos   (binlog_file, start_pos)
+    INDEX idx_gtid       (gtid)
 ) ENGINE=InnoDB
   PARTITION BY RANGE (TO_SECONDS(event_timestamp)) (
     -- Hourly partitions are created by `bintrail init --partitions N`.
