@@ -38,17 +38,25 @@ type Handler struct {
 	db string // currently selected database (per COM_INIT_DB)
 }
 
-// Config tunes the shim's data-fetch behaviour. Zero values are valid:
-// the handler then queries only the live MySQL index (the same shape
-// the original MVP shipped with).
+// Config tunes the shim's data-fetch behaviour.
+//
+// Construct via NewHandler (defaults AllowGaps=true) for the standard
+// behaviour. The bare zero-value Config{AllowGaps:false, NoArchive:false}
+// is valid but strict: it queries archives AND aborts the customer's
+// query if the planner detects a coverage gap. Most operators want
+// NewHandler's defaults — only build a custom Config if you have a
+// specific reason to flip these.
 type Config struct {
-	// AllowGaps mirrors query.FetchMergedOptions.AllowGaps. The shim
-	// defaults to true so coverage gaps surface as slog.Warn rather
-	// than aborting the customer's query — matches the warn-and-continue
-	// behaviour of bintrail recover.
+	// AllowGaps mirrors query.FetchMergedOptions.AllowGaps. NewHandler
+	// sets this to true so coverage gaps surface as slog.Warn rather
+	// than aborting the customer's query — matches the
+	// warn-and-continue behaviour of bintrail recover. Setting false
+	// makes a query against a time range that includes a gap return
+	// an error to the client.
 	AllowGaps bool
 	// NoArchive disables archive auto-discovery + the archive fetch
-	// loop, even if archive_state has rows. Defaults to false.
+	// loop, even if archive_state has rows. Defaults to false (archives
+	// are queried). Independent of AllowGaps.
 	NoArchive bool
 }
 
@@ -308,18 +316,28 @@ func emptyResult() *mysql.Result {
 //
 // The list is deliberately narrow: an unrecognised SET (e.g. SET
 // PASSWORD, SET ROLE, SET GLOBAL) falls through to the rejection
-// path so a customer / attacker cannot pretend their privileged DDL
-// succeeded by exploiting an over-broad `SET ` prefix.
+// path so a customer / attacker cannot pretend their privileged
+// statement succeeded by exploiting an over-broad `SET ` prefix.
+//
+// Each prefix MUST end with a delimiter (' ' or '=') so a longer
+// keyword cannot smuggle itself in: e.g. `set autocommitfoo` no
+// longer matches `set autocommit` because the prefix `set autocommit`
+// requires a following ` ` or `=`. We list both delimiter variants
+// for the SET shapes that take an argument.
 var handshakePrefixes = []string{
 	"set names ",
-	"set autocommit",
+	"set autocommit ",
+	"set autocommit=",
 	"set session ",
 	"set @@session",
-	"set sql_mode",
-	"set sql_select_limit",
-	"set time_zone",
-	"set character_set_results",
-	"set transaction ",
+	"set sql_mode ",
+	"set sql_mode=",
+	"set sql_select_limit ",
+	"set sql_select_limit=",
+	"set time_zone ",
+	"set time_zone=",
+	"set character_set_results ",
+	"set character_set_results=",
 	"select @@version",
 	"select @@session.",
 	"select @@global.",

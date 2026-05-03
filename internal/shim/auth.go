@@ -15,11 +15,12 @@ import (
 // Why password validation is intentionally weak: the shim's deployed
 // position is behind ProxySQL on localhost. ProxySQL authenticates
 // the application connection against `mysql_pass_sha1` (which the
-// customer set with `bintrail init-shim`) and only then forwards the
-// connection to the shim's hostgroup. Re-validating the password at
-// the shim would require implementing the mysql_native_password
-// challenge against the same `*HEX` value ProxySQL already verified —
-// duplicate work for no extra security.
+// customer wrote into shim.yaml after running `bintrail init-shim`,
+// since init-shim only emits TODO comments for that field) and only
+// then forwards the connection to the shim's hostgroup. Re-validating
+// the password at the shim would require implementing the
+// mysql_native_password challenge against the same `*HEX` value
+// ProxySQL already verified — duplicate work for no extra security.
 //
 // The username allowlist is the defense-in-depth layer: even if a
 // caller bypasses ProxySQL and connects to :3308 directly, only
@@ -80,6 +81,11 @@ func LoadTenantUsers(path string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
+	// AgentURL / AgentToken are retained here even though `bintrail
+	// init-shim` no longer emits them: they appear in shim.yaml files
+	// scaffolded by older bintrail versions, and yaml.UnmarshalStrict
+	// rejects unknown keys. Declaring them keeps customer files from
+	// earlier versions parsing cleanly during the migration window.
 	var cfg struct {
 		Tenants []struct {
 			ServerID      string `yaml:"server_id"`

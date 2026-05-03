@@ -78,7 +78,7 @@ Edit `shim.yaml`, uncomment the two TODO lines, and paste the values:
     mysql_pass_sha1: '*30D6BC64B4B66AC024BDC6551C3B28BB49320725'
 ```
 
-> **Auth note**: `bintrail shim` validates only the *username* against this file. ProxySQL holds the password gate (`mysql_pass_sha1`). The shim's listen address defaults to `127.0.0.1:3308` so nothing else can reach it directly — ProxySQL on the same host is the only legitimate caller.
+> **Auth note**: `bintrail shim` validates only the *username* against this file. ProxySQL holds the password gate (`mysql_pass_sha1`). The shim's listen address defaults to `127.0.0.1:3308` so it is not reachable from the network — but any process on the same host with a known tenant username can still connect, so treat host-local users as trusted. ProxySQL on the same host is the legitimate caller.
 
 ---
 
