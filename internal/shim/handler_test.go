@@ -3,6 +3,7 @@ package shim
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"net"
 	"strings"
@@ -313,6 +314,57 @@ func TestRunPointInTimeInvokesArchiveFetcher(t *testing.T) {
 	}
 	if !called {
 		t.Error("expected archiveFetcher to be invoked when archive_state has rows; was not called")
+	}
+}
+
+// TestRunPointInTimeStrictModePropagatesArchiveError pins the issue #257
+// fix: when AllowGaps=false (the new production default) and an archive
+// source fails, runPointInTime must return an error rather than silently
+// swallowing the failure and returning a partial resultset. Without
+// propagation, the MySQL client on the wire sees a successful response
+// missing rows it should have received — the exact silent failure the
+// PR fixes.
+func TestRunPointInTimeStrictModePropagatesArchiveError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery("FROM archive_state").
+		WillReturnRows(sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}).
+			AddRow("test-id", "", "test-bucket", "bintrail_id=test-id/event_date=2026/events.parquet"))
+	mock.ExpectQuery("information_schema.PARTITIONS").
+		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME", "PARTITION_DESCRIPTION"}))
+	mock.ExpectQuery("FROM binlog_events").
+		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version"}))
+
+	archiveErr := errors.New("synthetic archive failure (e.g. S3 throttling)")
+	failingFetcher := func(ctx context.Context, opts query.Options, src string) ([]query.ResultRow, error) {
+		return nil, archiveErr
+	}
+
+	h := &Handler{
+		indexDB:        db,
+		cfg:            Config{AllowGaps: false},
+		logger:         slog.Default(),
+		archiveFetcher: failingFetcher,
+	}
+
+	q := TimeTravelQuery{
+		Type:    TypeFlashback,
+		Schema:  "myapp",
+		Table:   "orders",
+		PKValue: "1",
+		AsOf:    time.Now(),
+	}
+	_, err = h.runPointInTime(q)
+	if err == nil {
+		t.Fatal("expected runPointInTime to propagate archive failure under AllowGaps=false; got nil error")
+	}
+	if !strings.Contains(err.Error(), "archive") {
+		t.Errorf("expected error to mention archive, got %v", err)
 	}
 }
 

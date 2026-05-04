@@ -46,19 +46,20 @@ type Handler struct {
 
 // Config tunes the shim's data-fetch behaviour.
 //
-// Construct via NewHandler (defaults AllowGaps=true) for the standard
-// behaviour. The bare zero-value Config{AllowGaps:false, NoArchive:false}
-// is valid but strict: it queries archives AND aborts the customer's
-// query if the planner detects a coverage gap. Most operators want
-// NewHandler's defaults — only build a custom Config if you have a
-// specific reason to flip these.
+// The zero value is the production default: archives auto-discovered,
+// AllowGaps=false (strict — coverage gaps and archive-fetch failures
+// abort the customer's query with a wire-protocol error). Build a
+// non-zero Config only to flip NoArchive or to opt back into the
+// permissive AllowGaps=true behaviour.
 type Config struct {
-	// AllowGaps mirrors query.FetchMergedOptions.AllowGaps. NewHandler
-	// sets this to true so coverage gaps surface as slog.Warn rather
-	// than aborting the customer's query — matches the
-	// warn-and-continue behaviour of bintrail recover. Setting false
-	// makes a query against a time range that includes a gap return
-	// an error to the client.
+	// AllowGaps mirrors query.FetchMergedOptions.AllowGaps. The
+	// production default is false: coverage gaps and archive-fetch
+	// failures abort the query with an error visible to the connected
+	// MySQL client. Setting true downgrades both to slog.Warn and
+	// returns whatever rows were collected — useful for operators who
+	// prefer partial results over query failures during transient S3
+	// hiccups, but the warning is server-side only and invisible to
+	// the wire-protocol client (see #257).
 	AllowGaps bool
 	// NoArchive disables archive auto-discovery + the archive fetch
 	// loop, even if archive_state has rows. Defaults to false (archives
@@ -67,9 +68,10 @@ type Config struct {
 }
 
 // NewHandler constructs a Handler bound to a bintrail index DSN with
-// default config (archives auto-discovered, gaps warned).
+// the production default config (strict: archives auto-discovered,
+// gaps and archive failures abort the query).
 func NewHandler(indexDB *sql.DB, logger *slog.Logger) *Handler {
-	return NewHandlerWithConfig(indexDB, Config{AllowGaps: true}, logger)
+	return NewHandlerWithConfig(indexDB, Config{}, logger)
 }
 
 // NewHandlerWithConfig is the configurable form of NewHandler.

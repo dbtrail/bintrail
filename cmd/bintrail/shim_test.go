@@ -11,6 +11,25 @@ import (
 	"github.com/dbtrail/bintrail/internal/shim"
 )
 
+// TestAllowGapsDefaultIsStrict pins the load-bearing claim of issue #257:
+// the shim CLI's --allow-gaps flag defaults to false. A regression that
+// flips this default (e.g. someone copy-pasting from `bintrail recover`,
+// which is intentionally permissive) would silently re-introduce the
+// silent-partial-result bug — archive failures absorbed as slog.Warn
+// while the connecting MySQL client gets an apparently-successful
+// resultset missing rows. This test exists specifically because the
+// default value is what the issue's fix turns on; framework wiring is
+// not the load-bearing claim.
+func TestAllowGapsDefaultIsStrict(t *testing.T) {
+	flag := shimCmd.Flags().Lookup("allow-gaps")
+	if flag == nil {
+		t.Fatal("--allow-gaps flag not registered on shim command")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--allow-gaps default = %q, want %q (strict mode is the security-relevant default; see #257)", flag.DefValue, "false")
+	}
+}
+
 // TestIsLoopbackAddr locks in the security-relevant guard that
 // determines whether the shim emits the "non-loopback bind" warning
 // at startup. A regression that classified 0.0.0.0 as loopback would
