@@ -317,6 +317,20 @@ func TestRunPointInTimeInvokesArchiveFetcher(t *testing.T) {
 	}
 }
 
+// TestNewHandlerDefaultIsStrict pins the library-side counterpart of the
+// CLI default-pin in cmd/bintrail/shim_test.go: NewHandler must return a
+// Handler configured with AllowGaps=false. The CLI builds Config directly
+// via NewHandlerWithConfig, so a regression that restored the legacy
+// AllowGaps=true default in NewHandler would not break the production
+// path — but library callers (tests, future embedders) would silently
+// pick up the permissive behaviour the issue #257 fix turns off.
+func TestNewHandlerDefaultIsStrict(t *testing.T) {
+	h := NewHandler(nil, nil)
+	if h.cfg.AllowGaps {
+		t.Error("NewHandler must default AllowGaps=false (strict); got true (see #257)")
+	}
+}
+
 // TestRunPointInTimeStrictModePropagatesArchiveError pins the issue #257
 // fix: when AllowGaps=false (the new production default) and an archive
 // source fails, runPointInTime must return an error rather than silently
@@ -363,8 +377,14 @@ func TestRunPointInTimeStrictModePropagatesArchiveError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected runPointInTime to propagate archive failure under AllowGaps=false; got nil error")
 	}
-	if !strings.Contains(err.Error(), "archive") {
-		t.Errorf("expected error to mention archive, got %v", err)
+	// errors.Is over substring match: FetchMerged wraps the synthetic
+	// archiveErr with %w, so the sentinel is recoverable. Pinning the
+	// exact propagation path survives future error-message rewording —
+	// a substring check on "archive" would also pass for an unrelated
+	// archive-shaped error (e.g. validate-stage rejection) and that's
+	// not the contract this test is here to enforce.
+	if !errors.Is(err, archiveErr) {
+		t.Errorf("expected wrapped archiveErr sentinel, got %v", err)
 	}
 }
 
