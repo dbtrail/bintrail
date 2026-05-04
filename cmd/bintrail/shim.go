@@ -56,6 +56,12 @@ reach back beyond the live MySQL index's retention window resolve
 transparently from Parquet. Use --no-archive to disable that and stay
 index-only.
 
+By default, an archive fetch failure or a planner-detected coverage
+gap aborts the customer's query with a MySQL protocol error — the
+client has no stderr channel, so silent partial results are worse than
+a loud failure. Use --allow-gaps to fall back to warn-and-continue
+(matches bintrail recover's behaviour).
+
 Authentication validates both username and password against shim.yaml's
 tenants block (mysql_user + mysql_password). ProxySQL is still the outer
 password gate against the same cleartext. The default --listen of
@@ -68,6 +74,7 @@ var (
 	shIndexDSN   string
 	shShimConfig string
 	shNoArchive  bool
+	shAllowGaps  bool
 )
 
 func init() {
@@ -75,6 +82,7 @@ func init() {
 	shimCmd.Flags().StringVar(&shIndexDSN, "index-dsn", "", "DSN of the bintrail MySQL index")
 	shimCmd.Flags().StringVar(&shShimConfig, "shim-config", "shim.yaml", "Path to shim.yaml (the file produced by 'bintrail init-shim')")
 	shimCmd.Flags().BoolVar(&shNoArchive, "no-archive", false, "Skip archive auto-discovery; query only the live MySQL index")
+	shimCmd.Flags().BoolVar(&shAllowGaps, "allow-gaps", false, "Warn and continue when an archive source fails or the planner detects a coverage gap, instead of returning a MySQL protocol error to the client (default: strict, fail loudly)")
 	_ = shimCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(shimCmd)
 	rootCmd.AddCommand(shimCmd)
@@ -135,7 +143,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 		listener.Close()
 	}()
 
-	cfg := shim.Config{AllowGaps: true, NoArchive: shNoArchive}
+	cfg := shim.Config{AllowGaps: shAllowGaps, NoArchive: shNoArchive}
 	serveLoop(ctx, listener, db, auth, cfg)
 	return nil
 }
