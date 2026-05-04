@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/server"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/bintrail/internal/config"
@@ -143,7 +144,22 @@ func runShim(cmd *cobra.Command, args []string) error {
 		listener.Close()
 	}()
 
-	cfg := shim.Config{AllowGaps: shAllowGaps, NoArchive: shNoArchive}
+	// config.Connect already parsed and pinged shIndexDSN above, so a parse
+	// failure here would be a programming defect, not a configuration error
+	// — surface it loud rather than degrading silently. The empty-DBName
+	// check catches the more common operator mistake of pointing the shim
+	// at a DSN with no database path; without it, every customer query
+	// would fail at FetchMerged.validate() with an opaque wire-protocol
+	// error or, under AllowGaps=true, silently skip gap detection.
+	dsnCfg, err := mysqldriver.ParseDSN(shIndexDSN)
+	if err != nil {
+		return fmt.Errorf("parse index DSN: %w", err)
+	}
+	if dsnCfg.DBName == "" {
+		return fmt.Errorf("index DSN must include the database name (e.g. /bintrail_index)")
+	}
+
+	cfg := shim.Config{AllowGaps: shAllowGaps, NoArchive: shNoArchive, IndexDBName: dsnCfg.DBName}
 	serveLoop(ctx, listener, db, auth, cfg)
 	return nil
 }

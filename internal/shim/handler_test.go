@@ -293,7 +293,7 @@ func TestRunPointInTimeInvokesArchiveFetcher(t *testing.T) {
 
 	h := &Handler{
 		indexDB:        db,
-		cfg:            Config{AllowGaps: true},
+		cfg:            Config{AllowGaps: true, IndexDBName: "bintrail_index"},
 		logger:         slog.Default(),
 		archiveFetcher: fakeFetcher,
 	}
@@ -361,7 +361,7 @@ func TestRunPointInTimeStrictModePropagatesArchiveError(t *testing.T) {
 
 	h := &Handler{
 		indexDB:        db,
-		cfg:            Config{AllowGaps: false},
+		cfg:            Config{AllowGaps: false, IndexDBName: "bintrail_index"},
 		logger:         slog.Default(),
 		archiveFetcher: failingFetcher,
 	}
@@ -385,6 +385,105 @@ func TestRunPointInTimeStrictModePropagatesArchiveError(t *testing.T) {
 	// not the contract this test is here to enforce.
 	if !errors.Is(err, archiveErr) {
 		t.Errorf("expected wrapped archiveErr sentinel, got %v", err)
+	}
+}
+
+// TestPlannerScopesPartitionsToIndexDB pins issue #259: the planner
+// must scope information_schema.PARTITIONS to the index DB, not the
+// user query's schema. A regression that re-passes q.Schema causes
+// _flashback/_snapshot to return 0 rows (every hour misclassified as
+// a coverage gap) and _diff to abort under strict mode.
+func TestPlannerScopesPartitionsToIndexDB(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery("FROM archive_state").
+		WillReturnRows(sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}))
+	mock.ExpectQuery("information_schema.PARTITIONS").
+		WithArgs("bintrail_index").
+		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME"}).
+			AddRow("p_2026050415"))
+	mock.ExpectQuery("FROM binlog_events").
+		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version"}))
+
+	h := &Handler{
+		indexDB: db,
+		cfg: Config{
+			AllowGaps:   false,
+			NoArchive:   false,
+			IndexDBName: "bintrail_index",
+		},
+		logger:         slog.Default(),
+		archiveFetcher: func(ctx context.Context, opts query.Options, src string) ([]query.ResultRow, error) { return nil, nil },
+	}
+
+	q := TimeTravelQuery{
+		Type:    TypeFlashback,
+		Schema:  "e2e_source",
+		Table:   "orders",
+		PKValue: "1",
+		AsOf:    time.Date(2026, 5, 4, 15, 17, 52, 0, time.UTC),
+	}
+	if _, err := h.runPointInTime(q); err != nil {
+		t.Fatalf("runPointInTime: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met (the planner likely scoped to %q instead of %q): %v",
+			q.Schema, h.cfg.IndexDBName, err)
+	}
+}
+
+// TestRunDiffScopesPartitionsToIndexDB is the runDiff sibling of
+// TestPlannerScopesPartitionsToIndexDB. The two call sites do the same
+// thing today, but a future refactor that splits Config could re-break
+// _diff in isolation while leaving _flashback working — pinning each
+// call site independently catches that.
+func TestRunDiffScopesPartitionsToIndexDB(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery("FROM archive_state").
+		WillReturnRows(sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}))
+	mock.ExpectQuery("information_schema.PARTITIONS").
+		WithArgs("bintrail_index").
+		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME"}).
+			AddRow("p_2026050415"))
+	mock.ExpectQuery("FROM binlog_events").
+		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version"}))
+
+	h := &Handler{
+		indexDB: db,
+		cfg: Config{
+			AllowGaps:   false,
+			NoArchive:   false,
+			IndexDBName: "bintrail_index",
+		},
+		logger:         slog.Default(),
+		archiveFetcher: func(ctx context.Context, opts query.Options, src string) ([]query.ResultRow, error) { return nil, nil },
+	}
+
+	q := TimeTravelQuery{
+		Type:    TypeDiff,
+		Schema:  "e2e_source",
+		Table:   "orders",
+		PKValue: "1",
+		Since:   time.Date(2026, 5, 4, 15, 17, 0, 0, time.UTC),
+		Until:   time.Date(2026, 5, 4, 15, 18, 0, 0, time.UTC),
+	}
+	if _, err := h.runDiff(q); err != nil {
+		t.Fatalf("runDiff: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met (the planner likely scoped to %q instead of %q): %v",
+			q.Schema, h.cfg.IndexDBName, err)
 	}
 }
 

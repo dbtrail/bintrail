@@ -65,6 +65,10 @@ type Config struct {
 	// loop, even if archive_state has rows. Defaults to false (archives
 	// are queried). Independent of AllowGaps.
 	NoArchive bool
+	// IndexDBName is the schema where binlog_events lives. The planner
+	// scopes information_schema.PARTITIONS to it; the user query's
+	// schema is the wrong answer (every hour misclassified as a gap).
+	IndexDBName string
 }
 
 // NewHandler constructs a Handler bound to a bintrail index DSN with
@@ -168,7 +172,7 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 			Until:      &q.AsOf,
 			LimitPerPK: 1,
 		},
-		DBName:         q.Schema,
+		DBName:         h.cfg.IndexDBName,
 		NoArchive:      h.cfg.NoArchive,
 		AllowGaps:      h.cfg.AllowGaps,
 		ArchiveFetcher: h.archiveFetcher,
@@ -249,7 +253,7 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 			Since:    &q.Since,
 			Until:    &q.Until,
 		},
-		DBName:         q.Schema,
+		DBName:         h.cfg.IndexDBName,
 		NoArchive:      h.cfg.NoArchive,
 		AllowGaps:      h.cfg.AllowGaps,
 		ArchiveFetcher: h.archiveFetcher,
