@@ -14,6 +14,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 
+	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parquetquery"
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
@@ -39,6 +40,14 @@ type Handler struct {
 	// `bintrail query` and `bintrail recover` use) — exposed as a field
 	// so tests can inject a fake without DuckDB or real S3.
 	archiveFetcher query.ArchiveFetcher
+	// resolverFn returns a metadata.Resolver loaded from the latest
+	// schema_snapshots row. Production wires this to
+	// metadata.NewResolver(indexDB, 0); tests inject a fake to exercise
+	// the column-ordering paths without an indexDB. Called per query
+	// (cheap — a single SELECT against schema_snapshots) so a fresh
+	// snapshot taken after the shim started is picked up automatically
+	// without explicit cache-invalidation logic.
+	resolverFn func() (*metadata.Resolver, error)
 
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
@@ -88,6 +97,7 @@ func NewHandlerWithConfig(indexDB *sql.DB, cfg Config, logger *slog.Logger) *Han
 		cfg:            cfg,
 		logger:         logger,
 		archiveFetcher: parquetquery.Fetch,
+		resolverFn:     func() (*metadata.Resolver, error) { return metadata.NewResolver(indexDB, 0) },
 	}
 }
 
@@ -185,7 +195,42 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	if image == nil {
 		return emptyResult(), nil
 	}
-	return imageToResult(image)
+	return imageToResult(image, h.columnOrderFor(q.Schema, q.Table))
+}
+
+// columnOrderFor returns the column names of schema.table in DDL
+// (ordinal_position) order so the wire-protocol resultset matches
+// what a regular MySQL `SELECT *` would emit. Returns nil when the
+// latest schema_snapshots row is missing, fails to load, or doesn't
+// know about this table — the caller falls back to alphabetical
+// ordering of the JSON image keys.
+//
+// We swallow lookup errors at Debug level rather than failing the
+// query: missing-snapshot is a real possibility (operator hasn't
+// run `bintrail snapshot` yet, snapshot lags a brand-new ALTER
+// TABLE, etc.) and a janky-but-deterministic fallback is strictly
+// better than a hard failure on what is otherwise a working query.
+func (h *Handler) columnOrderFor(schema, table string) []string {
+	if h.resolverFn == nil {
+		return nil
+	}
+	r, err := h.resolverFn()
+	if err != nil {
+		h.logger.Debug("shim: schema_snapshots lookup failed; falling back to alphabetical column order",
+			"err", err, "schema", schema, "table", table)
+		return nil
+	}
+	tm, err := r.Resolve(schema, table)
+	if err != nil {
+		h.logger.Debug("shim: table not in latest snapshot; falling back to alphabetical column order",
+			"err", err, "schema", schema, "table", table)
+		return nil
+	}
+	cols := make([]string, 0, len(tm.Columns))
+	for _, c := range tm.Columns {
+		cols = append(cols, c.Name)
+	}
+	return cols
 }
 
 // selectImage picks the row image that represents the row's state at
@@ -316,21 +361,22 @@ func marshalImage(image map[string]any) string {
 }
 
 // imageToResult turns a single-row JSON object into a mysql.Result
-// shaped for the wire protocol. Column order is the JSON key order
-// after sorting alphabetically — deterministic, and good enough for
-// the MVP. A future revision can pick the order from the schema
-// snapshot to match the source table's DDL.
-func imageToResult(image map[string]any) (*mysql.Result, error) {
+// shaped for the wire protocol. Columns are emitted in ddlOrder
+// (the source table's column ordinal_position from the latest
+// schema_snapshots row) so a customer running
+// `SELECT * FROM _flashback.orders ...` gets the same column
+// ordering they'd get from a regular `SELECT * FROM orders` — no
+// surprising reshuffling between the two.
+//
+// ddlOrder=nil signals "no snapshot available"; in that case we
+// fall back to alphabetical key order, which is deterministic but
+// won't match the table's natural DDL order.
+func imageToResult(image map[string]any, ddlOrder []string) (*mysql.Result, error) {
 	if len(image) == 0 {
 		return emptyResult(), nil
 	}
 
-	cols := make([]string, 0, len(image))
-	for k := range image {
-		cols = append(cols, k)
-	}
-	sort.Strings(cols)
-
+	cols := orderColumns(image, ddlOrder)
 	row := make([]any, len(cols))
 	for i, c := range cols {
 		row[i] = image[c]
@@ -341,6 +387,47 @@ func imageToResult(image map[string]any) (*mysql.Result, error) {
 		return nil, fmt.Errorf("build resultset: %w", err)
 	}
 	return &mysql.Result{Resultset: rs}, nil
+}
+
+// orderColumns returns the column emission order for a row image:
+//
+//  1. Columns from ddlOrder that are present in image, in
+//     ddlOrder sequence — this is the canonical case.
+//  2. Then any columns present in image but not in ddlOrder, sorted
+//     alphabetically. Catches the edge case where the binlog event
+//     pre-dates a recent ALTER TABLE captured by the next snapshot,
+//     so the image carries a column the snapshot doesn't know about
+//     (or vice versa). Better to surface it at the end than to drop
+//     it silently.
+//
+// Pure function — extracted from imageToResult specifically so the
+// ordering rules can be unit-tested without spinning up MySQL.
+func orderColumns(image map[string]any, ddlOrder []string) []string {
+	if len(ddlOrder) == 0 {
+		cols := make([]string, 0, len(image))
+		for k := range image {
+			cols = append(cols, k)
+		}
+		sort.Strings(cols)
+		return cols
+	}
+
+	cols := make([]string, 0, len(image))
+	seen := make(map[string]bool, len(image))
+	for _, c := range ddlOrder {
+		if _, ok := image[c]; ok {
+			cols = append(cols, c)
+			seen[c] = true
+		}
+	}
+	var extras []string
+	for k := range image {
+		if !seen[k] {
+			extras = append(extras, k)
+		}
+	}
+	sort.Strings(extras)
+	return append(cols, extras...)
 }
 
 // emptyResult is the wire-protocol "zero rows" reply. We still need a

@@ -34,6 +34,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -110,11 +111,24 @@ func TestShimEndToEnd(t *testing.T) {
 	t.Run("flashback_returns_post_image_at_asof", func(t *testing.T) {
 		// AS OF 13:00 → after the 12:00 UPDATE (qty=2), before the
 		// 14:00 DELETE. Expect qty=2.
-		got := queryRowMap(t, clientDB,
+		gotCols, gotRow := queryRowMapWithCols(t, clientDB,
 			"SELECT * FROM _flashback.orders AS OF '2026-05-04 13:00:00' WHERE id = 42")
-		want := map[string]string{"id": "42", "sku": "ABC-1", "qty": "2", "note": "initial"}
-		if !maps.Equal(got, want) {
-			t.Errorf("flashback row mismatch:\n  got:  %+v\n  want: %+v", got, want)
+		wantRow := map[string]string{"id": "42", "sku": "ABC-1", "qty": "2", "note": "initial"}
+		if !maps.Equal(gotRow, wantRow) {
+			t.Errorf("flashback row mismatch:\n  got:  %+v\n  want: %+v", gotRow, wantRow)
+		}
+		// Column order must match the source table's DDL
+		// (id, sku, qty, note) so a side-by-side comparison
+		// with `SELECT * FROM appdb.orders` lines up — this
+		// is the schema_snapshots → handler.columnOrderFor
+		// path. A regression where the resolver stops being
+		// consulted would silently revert to alphabetical
+		// (id, note, qty, sku) and the row map check above
+		// would still pass.
+		wantCols := []string{"id", "sku", "qty", "note"}
+		if !slices.Equal(gotCols, wantCols) {
+			t.Errorf("flashback column order = %v, want %v\n"+
+				"if alphabetical, schema_snapshots lookup is broken", gotCols, wantCols)
 		}
 	})
 
@@ -255,18 +269,26 @@ type diffRow struct {
 	rowAfter  string
 }
 
-// queryRowMap runs a single-row SELECT and returns the result as a
-// {column → value} map. Both the shim and the passthrough backend
-// answer SELECT *, but they pick column orders that disagree:
-//   - real MySQL returns DDL order (id, sku, qty, note)
-//   - the shim's imageToResult sorts JSON keys alphabetically
-//     (id, note, qty, sku)
-//
-// Positional Scan would silently swap fields between the two paths
-// and pass with the wrong values. Map-based comparison is the only
-// safe option until imageToResult learns to honour the source DDL
-// column order.
+// queryRowMap runs a single-row SELECT and returns just the
+// {column → value} map. Use queryRowMapWithCols when the test
+// also needs to assert column ORDER (the shim now honours the
+// source DDL via schema_snapshots, so order differences across
+// shim vs passthrough are themselves a regression to catch).
 func queryRowMap(t *testing.T, db *sql.DB, q string) map[string]string {
+	t.Helper()
+	_, row := queryRowMapWithCols(t, db, q)
+	return row
+}
+
+// queryRowMapWithCols is the underlying single-row SELECT helper.
+// Returns (column-order, {column → value} map) so callers can
+// assert both shape and content. Map-based scan is mandatory:
+// positional Scan would silently swap fields between the shim
+// (DDL order via schema_snapshots) and the passthrough (DDL order
+// from MySQL itself) the moment those orders diverge — e.g. if a
+// future ALTER TABLE rebuilds the table in a different physical
+// order than the snapshot reflects.
+func queryRowMapWithCols(t *testing.T, db *sql.DB, q string) ([]string, map[string]string) {
 	t.Helper()
 	if err := db.PingContext(context.Background()); err != nil {
 		t.Fatalf("ping before query: %v", err)
@@ -313,7 +335,7 @@ func queryRowMap(t *testing.T, db *sql.DB, q string) map[string]string {
 	if rows.Next() {
 		t.Fatalf("expected exactly one row, got at least two")
 	}
-	return out
+	return cols, out
 }
 
 func assertDiff(t *testing.T, d diffRow, wantTS, wantType, wantBeforeContains, wantAfterContains string) {

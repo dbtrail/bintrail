@@ -15,6 +15,7 @@ import (
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 
+	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
 )
@@ -107,15 +108,15 @@ func TestHandlerUseDBStoresSchema(t *testing.T) {
 	}
 }
 
-// TestImageToResultColumnOrder — column order in the resultset must
-// be deterministic (alphabetical) so customers comparing two rows
-// across runs see consistent column positions.
+// TestImageToResultColumnOrder — when no DDL order is supplied
+// (snapshot missing or table unknown), columns fall back to
+// alphabetical order so the wire output stays deterministic.
 func TestImageToResultColumnOrder(t *testing.T) {
 	res, err := imageToResult(map[string]any{
 		"name":  "alice",
 		"id":    int64(42),
 		"email": "a@b.com",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,6 +130,91 @@ func TestImageToResultColumnOrder(t *testing.T) {
 	}
 	if !equalStrings(got, want) {
 		t.Errorf("column order = %v, want %v", got, want)
+	}
+}
+
+// TestImageToResultRespectsDDLOrder — when ddlOrder is supplied,
+// the wire output emits columns in DDL position so customers see
+// the same column ordering they'd get from a regular `SELECT *`.
+// Without this the time-travel queries return alphabetised columns
+// which mismatches the source table's natural order, surprising
+// any side-by-side comparison the user might run.
+func TestImageToResultRespectsDDLOrder(t *testing.T) {
+	res, err := imageToResult(
+		map[string]any{
+			"id":   int64(42),
+			"sku":  "ABC-1",
+			"qty":  int64(2),
+			"note": "initial",
+		},
+		[]string{"id", "sku", "qty", "note"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"id", "sku", "qty", "note"}
+	got := make([]string, len(res.Resultset.Fields))
+	for i, f := range res.Resultset.Fields {
+		got[i] = string(f.Name)
+	}
+	if !equalStrings(got, want) {
+		t.Errorf("column order = %v, want %v", got, want)
+	}
+}
+
+// TestOrderColumnsEdgeCases pins the merge behaviour for the
+// "image and snapshot disagree" cases. Each branch is a real
+// path the production code can hit when an ALTER TABLE happens
+// between the binlog event being indexed and the snapshot being
+// taken (or vice versa).
+func TestOrderColumnsEdgeCases(t *testing.T) {
+	cases := []struct {
+		name     string
+		image    map[string]any
+		ddlOrder []string
+		want     []string
+	}{
+		{
+			name:     "nil_ddl_order_falls_back_to_alphabetical",
+			image:    map[string]any{"sku": 1, "id": 2, "qty": 3},
+			ddlOrder: nil,
+			want:     []string{"id", "qty", "sku"},
+		},
+		{
+			name:     "empty_ddl_order_falls_back_to_alphabetical",
+			image:    map[string]any{"b": 1, "a": 2},
+			ddlOrder: []string{},
+			want:     []string{"a", "b"},
+		},
+		{
+			name:     "ddl_columns_missing_from_image_are_skipped",
+			image:    map[string]any{"id": 1, "qty": 3},
+			ddlOrder: []string{"id", "sku", "qty", "note"},
+			want:     []string{"id", "qty"},
+		},
+		{
+			name: "image_columns_missing_from_ddl_are_appended_alphabetically",
+			image: map[string]any{
+				"id": 1, "sku": 2, "qty": 3, "added_after": 4, "another_new": 5,
+			},
+			ddlOrder: []string{"id", "sku", "qty"},
+			want:     []string{"id", "sku", "qty", "added_after", "another_new"},
+		},
+		{
+			name:     "exact_match_preserves_ddl_order",
+			image:    map[string]any{"note": 4, "id": 1, "qty": 3, "sku": 2},
+			ddlOrder: []string{"id", "sku", "qty", "note"},
+			want:     []string{"id", "sku", "qty", "note"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := orderColumns(tc.image, tc.ddlOrder)
+			if !equalStrings(got, tc.want) {
+				t.Errorf("orderColumns = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -222,7 +308,7 @@ func TestSelectImage(t *testing.T) {
 // TestImageToResultEmpty — an empty image (zero-key map) should
 // produce a resultset with no rows.
 func TestImageToResultEmpty(t *testing.T) {
-	res, err := imageToResult(map[string]any{})
+	res, err := imageToResult(map[string]any{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,6 +338,80 @@ func TestNewHandlerWiresArchiveFetcher(t *testing.T) {
 	h2 := NewHandlerWithConfig(nil, Config{}, nil)
 	if h2.archiveFetcher == nil {
 		t.Error("NewHandlerWithConfig must wire a non-nil archiveFetcher; got nil")
+	}
+}
+
+// TestNewHandlerWiresResolverFn — same boundary check as for the
+// archive fetcher: both constructors must install a non-nil
+// resolverFn or every time-travel query falls back to alphabetical
+// column order silently. A failure here means a refactor dropped
+// the schema_snapshots wiring; the e2e/shim test would catch it
+// end-to-end but at much higher cost.
+func TestNewHandlerWiresResolverFn(t *testing.T) {
+	if h := NewHandler(nil, nil); h.resolverFn == nil {
+		t.Error("NewHandler must wire a non-nil resolverFn; got nil")
+	}
+	if h := NewHandlerWithConfig(nil, Config{}, nil); h.resolverFn == nil {
+		t.Error("NewHandlerWithConfig must wire a non-nil resolverFn; got nil")
+	}
+}
+
+// TestColumnOrderForFallsBackOnResolverError pins the resilience
+// contract: when the resolver fails to load (no snapshot yet, DB
+// blip, ALTER TABLE the snapshot doesn't know about), columnOrderFor
+// returns nil so imageToResult silently degrades to alphabetical
+// order rather than failing the customer's query. The opposite
+// behaviour (hard-failing on resolver error) would make brand-new
+// installs that haven't run `bintrail snapshot` yet unable to
+// answer any time-travel query.
+func TestColumnOrderForFallsBackOnResolverError(t *testing.T) {
+	cases := []struct {
+		name       string
+		resolverFn func() (*metadata.Resolver, error)
+		want       []string
+	}{
+		{
+			name:       "resolver_load_fails",
+			resolverFn: func() (*metadata.Resolver, error) { return nil, errors.New("snapshot table missing") },
+			want:       nil,
+		},
+		{
+			name: "resolver_loads_but_table_unknown",
+			resolverFn: func() (*metadata.Resolver, error) {
+				return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{}), nil
+			},
+			want: nil,
+		},
+		{
+			name: "resolver_returns_table_in_ddl_order",
+			resolverFn: func() (*metadata.Resolver, error) {
+				return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+					"appdb.orders": {
+						Schema: "appdb", Table: "orders",
+						Columns: []metadata.ColumnMeta{
+							{Name: "id", OrdinalPosition: 1},
+							{Name: "sku", OrdinalPosition: 2},
+							{Name: "qty", OrdinalPosition: 3},
+							{Name: "note", OrdinalPosition: 4},
+						},
+					},
+				}), nil
+			},
+			want: []string{"id", "sku", "qty", "note"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{
+				logger:     slog.Default(),
+				resolverFn: tc.resolverFn,
+			}
+			got := h.columnOrderFor("appdb", "orders")
+			if !equalStrings(got, tc.want) {
+				t.Errorf("columnOrderFor = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

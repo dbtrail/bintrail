@@ -87,6 +87,40 @@ CREATE TABLE binlog_events (
     PARTITION p_future VALUES LESS THAN MAXVALUE
 );
 
+-- schema_snapshots tells the shim what the source table's column
+-- ordinal_position is, so SELECT * against _flashback / _snapshot
+-- returns columns in DDL order (id, sku, qty, note) instead of
+-- the alphabetical fallback (id, note, qty, sku).
+--
+-- Without a snapshot the shim degrades silently to alphabetical
+-- key order — wire output is still valid SQL, just doesn't match
+-- what `SELECT * FROM appdb.orders` directly would return.
+CREATE TABLE schema_snapshots (
+    id               INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    snapshot_id      INT UNSIGNED NOT NULL,
+    snapshot_time    DATETIME     NOT NULL,
+    schema_name      VARCHAR(64)  NOT NULL,
+    table_name       VARCHAR(64)  NOT NULL,
+    column_name      VARCHAR(64)  NOT NULL,
+    ordinal_position INT UNSIGNED NOT NULL,
+    column_key       VARCHAR(3)   NOT NULL,
+    data_type        VARCHAR(64)  NOT NULL,
+    column_type      VARCHAR(128) NOT NULL DEFAULT '',
+    is_nullable      VARCHAR(3)   NOT NULL,
+    column_default   TEXT         DEFAULT NULL,
+    is_generated     TINYINT(1)   NOT NULL DEFAULT 0,
+    INDEX idx_snapshot_id    (snapshot_id),
+    INDEX idx_snapshot_table (snapshot_id, schema_name, table_name)
+) ENGINE=InnoDB;
+
+INSERT INTO schema_snapshots
+    (snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, column_type, is_nullable)
+VALUES
+    (1, '2026-05-04 09:00:00', 'appdb', 'orders', 'id',   1, 'PRI', 'int',     'int',         'NO'),
+    (1, '2026-05-04 09:00:00', 'appdb', 'orders', 'sku',  2, '',    'varchar', 'varchar(64)', 'NO'),
+    (1, '2026-05-04 09:00:00', 'appdb', 'orders', 'qty',  3, '',    'int',     'int',         'NO'),
+    (1, '2026-05-04 09:00:00', 'appdb', 'orders', 'note', 4, '',    'varchar', 'varchar(255)','YES');
+
 -- archive_state is read by query.Plan and query.ResolveArchiveSources.
 -- Empty: the live partitions above already cover every event hour,
 -- so the planner finds no gap. --allow-gaps on the shim command is
