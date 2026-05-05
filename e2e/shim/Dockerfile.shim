@@ -1,0 +1,28 @@
+# Build the bintrail binary (CGO + DuckDB) for the e2e/shim test rig.
+#
+# Multi-stage so the runtime image only carries the binary and its
+# minimal libc + libstdc++ deps — DuckDB's pre-compiled C++ libraries
+# are statically linked into the binary by duckdb-go's build, but
+# libstdc++ at runtime is still required.
+FROM golang:1.25-bookworm AS build
+
+WORKDIR /src
+
+# go.mod / go.sum first to keep the layer cached across source edits.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ENV CGO_ENABLED=1
+RUN go build -o /out/bintrail ./cmd/bintrail
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/bintrail /usr/local/bin/bintrail
+
+ENTRYPOINT ["/usr/local/bin/bintrail"]

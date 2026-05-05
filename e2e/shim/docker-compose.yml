@@ -1,0 +1,75 @@
+# Docker Compose stack for the bintrail shim end-to-end test.
+#
+# Topology:
+#
+#   go test (host) ──6033──► proxysql ──┬──990──► mysql:3306 (appdb, passthrough)
+#                          ┌─6032─admin │
+#                          │            └──991──► bintrail-shim:3308 ──► mysql:3306 (bintrail_index)
+#
+# - mysql holds two schemas in one container: appdb (the simulated
+#   "production" DB the customer's app would target) and bintrail_index
+#   (the bintrail row-event index, hand-seeded by seed.sql so we don't
+#   need to run a real binlog stream just to exercise the shim).
+# - bintrail-shim runs `bintrail shim` against bintrail_index.
+# - proxysql is configured at test runtime via the SQL emitted by
+#   `bintrail proxysql-config` (see e2e_test.go).
+
+services:
+  mysql:
+    image: mysql:8.0
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --server-id=1
+    environment:
+      MYSQL_ROOT_PASSWORD: testroot
+    ports:
+      - "127.0.0.1:13307:3306"
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/01-seed.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-ptestroot"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  bintrail-shim:
+    build:
+      context: ../..
+      dockerfile: e2e/shim/Dockerfile.shim
+    command:
+      - shim
+      - --listen=0.0.0.0:3308
+      - --index-dsn=root:testroot@tcp(mysql:3306)/bintrail_index
+      - --shim-config=/etc/bintrail/shim.yaml
+      - --allow-gaps
+    volumes:
+      - ./shim.yaml:/etc/bintrail/shim.yaml:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # The shim has no built-in healthcheck endpoint; we probe the MySQL
+    # protocol port from the proxysql side via depends_on instead.
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/3308 && exit 0 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  proxysql:
+    image: proxysql/proxysql:2.7.1
+    ports:
+      - "127.0.0.1:16032:6032"
+      - "127.0.0.1:16033:6033"
+    depends_on:
+      bintrail-shim:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6032 && exit 0 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

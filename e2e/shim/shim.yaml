@@ -1,0 +1,14 @@
+# Shim tenant config for the e2e test.
+#
+# The single tenant binds the wire-protocol login (testuser / testpw)
+# to the appdb schema — the shim derives the default schema from
+# source_dsn's /<db> path and seeds it into the connection at
+# handshake time, so `SELECT * FROM _flashback.orders` resolves
+# without an explicit `USE appdb`.
+listen: 0.0.0.0:3308
+
+tenants:
+  - server_id: "1"
+    source_dsn: "root:testroot@tcp(mysql:3306)/appdb"
+    mysql_user: "testuser"
+    mysql_password: "testpw"
