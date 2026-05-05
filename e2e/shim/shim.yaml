@@ -5,7 +5,7 @@
 # source_dsn's /<db> path and seeds it into the connection at
 # handshake time, so `SELECT * FROM _flashback.orders` resolves
 # without an explicit `USE appdb`.
-listen: 0.0.0.0:3308
+listen: 127.0.0.1:3308
 
 tenants:
   - server_id: "1"

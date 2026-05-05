@@ -34,19 +34,25 @@ test also skips.
   - `appdb` — the simulated production DB. `orders` table holds a
     live row with marker values (`sku=LIVE-SKU`, `qty=999`) so the
     passthrough subtest can prove ProxySQL routed there and not to
-    the shim.
+    the shim. `testuser` is granted SELECT on `appdb.*` so
+    ProxySQL can forward passthrough queries with the same
+    credentials the client uses.
   - `bintrail_index` — the bintrail row-event index. `binlog_events`
     is hand-seeded with a synthetic `INSERT → UPDATE → DELETE`
     sequence for `appdb.orders` id=42 at known timestamps
     (10:00 / 12:00 / 14:00 UTC on 2026-05-04).
-- `bintrail-shim` (built from local source): runs `bintrail shim`
-  against `bintrail_index`. Authenticates one tenant
-  (`testuser` / `testpw`).
 - `proxysql` (official 2.7 image): configured at test startup by
   applying the SQL emitted by `bintrail proxysql-config` to the
   admin port. Three rules route `_flashback`/`_diff`/`_snapshot`
   to the shim hostgroup; everything else hits the passthrough
   hostgroup pointed at the same `mysql` container.
+- `bintrail-shim`: runs `bintrail shim` against `bintrail_index`,
+  authenticating one tenant (`testuser` / `testpw`). Shares
+  `proxysql`'s network namespace (`network_mode: service:proxysql`)
+  — a sidecar pattern that mirrors the canonical prod deployment
+  and makes the `'127.0.0.1'` shim hostname that
+  `bintrail proxysql-config` hardcodes resolve correctly without
+  post-processing the SQL.
 
 The test exposes ProxySQL on host ports `127.0.0.1:16032` (admin)
 and `127.0.0.1:16033` (client) so it doesn't collide with
@@ -76,23 +82,13 @@ locally-running MySQL or ProxySQL.
   under `internal/parser` and `internal/indexer`.
 - The Parquet archive read path. `archive_state` is empty here;
   `internal/parquetquery` covers DuckDB-backed archive reads.
-- The `DBTRAIL_AT` SQL hint mentioned in issue #265. That feature
-  was part of the standalone `dbtrail-shim` PoC and was not ported
-  to the integrated `bintrail shim` subcommand. Adding it is a
-  separate piece of work.
+- A `/*+ DBTRAIL_AT='<ts>' */` hint form. The shim's parser
+  doesn't recognise it; if support is added, this test should
+  grow a subtest.
 
-## Why no fake HTTP agent
+## Why the data layer is seeded directly
 
-Issue #265 was filed when the shim was a standalone proof of
-concept that called out to a `/api/v1/{query,recover}` agent over
-HTTP. The integrated `bintrail shim` (since v0.7.0) reads directly
-from the MySQL index via `query.FetchMerged` and from S3/local
-Parquet via `parquetquery.Fetch` — no agent involved. The test
-seeds the index directly instead.
-
-## CI
-
-Not yet wired into a CI workflow — the repo has only
-`.github/workflows/release.yaml` today (no `ci.yml`). Adding the
-test-CI scaffolding is tracked as a follow-up so this PR stays
-focused on the test rig itself.
+`bintrail shim` reads from the MySQL index via `query.FetchMerged`
+and from S3/local Parquet via `parquetquery.Fetch` — there is no
+"agent" intermediary. So this test seeds `binlog_events` directly
+rather than mocking an HTTP API.

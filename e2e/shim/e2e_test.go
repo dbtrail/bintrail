@@ -28,6 +28,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -36,7 +37,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -101,25 +102,28 @@ func TestShimEndToEnd(t *testing.T) {
 	clientDB := openClientWithRetry(t, "testuser:testpw@tcp("+proxysqlClientAddr+")/appdb", 30*time.Second)
 	t.Cleanup(func() { clientDB.Close() })
 
+	// All time-travel queries use SELECT * — the shim's parser
+	// (internal/shim/parser.go) hard-requires a literal star;
+	// `SELECT id, sku, ...` falls through to "this server only
+	// handles _flashback / _snapshot / _diff" rejection.
 	t.Run("flashback_returns_post_image_at_asof", func(t *testing.T) {
 		// AS OF 13:00 → after the 12:00 UPDATE (qty=2), before the
 		// 14:00 DELETE. Expect qty=2.
-		row := queryRow(t, clientDB,
-			"SELECT id, sku, qty, note FROM _flashback.orders AS OF '2026-05-04 13:00:00' WHERE id = 42")
-		got := scanOrder(t, row)
-		want := orderRow{id: "42", sku: "ABC-1", qty: "2", note: "initial"}
-		if got != want {
+		got := queryRowMap(t, clientDB,
+			"SELECT * FROM _flashback.orders AS OF '2026-05-04 13:00:00' WHERE id = 42")
+		want := map[string]string{"id": "42", "sku": "ABC-1", "qty": "2", "note": "initial"}
+		if !mapsEqual(got, want) {
 			t.Errorf("flashback row mismatch:\n  got:  %+v\n  want: %+v", got, want)
 		}
 	})
 
 	t.Run("flashback_pre_insert_returns_empty", func(t *testing.T) {
 		// AS OF 09:00 → before the 10:00 INSERT. Expect zero rows.
-		// emptyResult uses the literal "_flashback" column header,
-		// so a column-shape mismatch from a future refactor would
-		// show up as a Scan error, not a silent pass.
+		// The shim's emptyResult returns a one-column resultset
+		// with the literal header "_flashback"; we don't scan, just
+		// verify Next() returns false.
 		rows, err := clientDB.Query(
-			"SELECT id, sku, qty, note FROM _flashback.orders AS OF '2026-05-04 09:00:00' WHERE id = 42")
+			"SELECT * FROM _flashback.orders AS OF '2026-05-04 09:00:00' WHERE id = 42")
 		if err != nil {
 			t.Fatalf("query: %v", err)
 		}
@@ -131,14 +135,17 @@ func TestShimEndToEnd(t *testing.T) {
 
 	t.Run("diff_returns_event_history", func(t *testing.T) {
 		rows, err := clientDB.Query(
-			"SELECT event_id, event_timestamp, event_type, gtid, row_before, row_after " +
-				"FROM _diff.orders BETWEEN '2026-05-04 09:00:00' AND '2026-05-04 16:00:00' " +
+			"SELECT * FROM _diff.orders BETWEEN '2026-05-04 09:00:00' AND '2026-05-04 16:00:00' " +
 				"WHERE id = 42")
 		if err != nil {
 			t.Fatalf("diff query: %v", err)
 		}
 		defer rows.Close()
 
+		// _diff's resultset shape is fixed by handler.runDiff:
+		// (event_id, event_timestamp, event_type, gtid, row_before, row_after)
+		// so positional scan is safe here — unlike the flashback
+		// case where column order is JSON-key-sorted.
 		var got []diffRow
 		for rows.Next() {
 			var d diffRow
@@ -155,24 +162,25 @@ func TestShimEndToEnd(t *testing.T) {
 			t.Fatalf("expected 3 diff rows (INSERT, UPDATE, DELETE), got %d: %+v", len(got), got)
 		}
 
-		// json.Marshal(map[string]any) emits no whitespace between
-		// keys and values, so the substring matchers must use the
-		// compact form `"qty":1` — `"qty": 1` (with space) would
-		// silently never match.
-		assertDiff(t, got[0], "2026-05-04 10:00:00", "INSERT", "", `"qty":1`)
-		assertDiff(t, got[1], "2026-05-04 12:00:00", "UPDATE", `"qty":1`, `"qty":2`)
-		assertDiff(t, got[2], "2026-05-04 14:00:00", "DELETE", `"qty":2`, "")
+		// Substring match on JSON includes a delimiter (`,` or `}`)
+		// so `"qty":1` doesn't accidentally match `"qty":10` or
+		// `"qty":100`. json.Marshal of map[string]any sorts keys
+		// alphabetically, so id < note < qty < sku — qty is never
+		// the last key here, hence the `,` boundary.
+		assertDiff(t, got[0], "2026-05-04 10:00:00", "INSERT", "", `"qty":1,`)
+		assertDiff(t, got[1], "2026-05-04 12:00:00", "UPDATE", `"qty":1,`, `"qty":2,`)
+		assertDiff(t, got[2], "2026-05-04 14:00:00", "DELETE", `"qty":2,`, "")
 	})
 
 	t.Run("snapshot_matches_flashback", func(t *testing.T) {
-		// _snapshot today is implemented as an alias of _flashback;
-		// asserting that here pins the contract so a future split
-		// (baseline-lookup support) can be reviewed deliberately.
-		row := queryRow(t, clientDB,
-			"SELECT id, sku, qty, note FROM _snapshot.orders AS OF '2026-05-04 11:00:00' WHERE id = 42")
-		got := scanOrder(t, row)
-		want := orderRow{id: "42", sku: "ABC-1", qty: "1", note: "initial"}
-		if got != want {
+		// _snapshot must return the same row image as _flashback
+		// for the same AS OF. They share an implementation today
+		// (handler.runPointInTime); pinning the contract here
+		// keeps a future split (baseline-lookup support) deliberate.
+		got := queryRowMap(t, clientDB,
+			"SELECT * FROM _snapshot.orders AS OF '2026-05-04 11:00:00' WHERE id = 42")
+		want := map[string]string{"id": "42", "sku": "ABC-1", "qty": "1", "note": "initial"}
+		if !mapsEqual(got, want) {
 			t.Errorf("snapshot row mismatch:\n  got:  %+v\n  want: %+v", got, want)
 		}
 	})
@@ -185,20 +193,15 @@ func TestShimEndToEnd(t *testing.T) {
 		// error ("this server only handles _flashback / _snapshot
 		// / _diff …") or return the historical image, neither of
 		// which match these markers.
-		row := queryRow(t, clientDB,
-			"SELECT id, sku, qty, note FROM orders WHERE id = 42")
-		got := scanOrder(t, row)
-		want := orderRow{id: "42", sku: "LIVE-SKU", qty: "999", note: "live-row-from-passthrough"}
-		if got != want {
+		got := queryRowMap(t, clientDB,
+			"SELECT * FROM orders WHERE id = 42")
+		want := map[string]string{"id": "42", "sku": "LIVE-SKU", "qty": "999", "note": "live-row-from-passthrough"}
+		if !mapsEqual(got, want) {
 			t.Errorf("passthrough row mismatch:\n  got:  %+v\n  want: %+v\n"+
 				"if this looks like a shim error, the regex in `bintrail proxysql-config` "+
 				"is over-matching", got, want)
 		}
 	})
-}
-
-type orderRow struct {
-	id, sku, qty, note string
 }
 
 type diffRow struct {
@@ -210,13 +213,73 @@ type diffRow struct {
 	rowAfter  string
 }
 
-func scanOrder(t *testing.T, row *sql.Row) orderRow {
+// queryRowMap runs a single-row SELECT and returns the result as a
+// {column → value} map. Both the shim and the passthrough backend
+// answer SELECT *, but they pick column orders that disagree:
+//   - real MySQL returns DDL order (id, sku, qty, note)
+//   - the shim's imageToResult sorts JSON keys alphabetically
+//     (id, note, qty, sku)
+//
+// Positional Scan would silently swap fields between the two paths
+// and pass with the wrong values. Map-based comparison is the only
+// safe option until imageToResult learns to honour the source DDL
+// column order.
+func queryRowMap(t *testing.T, db *sql.DB, q string) map[string]string {
 	t.Helper()
-	var o orderRow
-	if err := row.Scan(&o.id, &o.sku, &o.qty, &o.note); err != nil {
-		t.Fatalf("scan order: %v", err)
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatalf("ping before query: %v", err)
 	}
-	return o
+	rows, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("columns: %v", err)
+	}
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows err: %v", err)
+		}
+		t.Fatalf("expected exactly one row, got zero (cols=%v)", cols)
+	}
+
+	raw := make([]sql.RawBytes, len(cols))
+	dest := make([]any, len(cols))
+	for i := range raw {
+		dest[i] = &raw[i]
+	}
+	if err := rows.Scan(dest...); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	out := make(map[string]string, len(cols))
+	for i, c := range cols {
+		if raw[i] == nil {
+			out[c] = "<nil>"
+			continue
+		}
+		out[c] = string(raw[i])
+	}
+
+	if rows.Next() {
+		t.Fatalf("expected exactly one row, got at least two")
+	}
+	return out
+}
+
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func assertDiff(t *testing.T, d diffRow, wantTS, wantType, wantBeforeContains, wantAfterContains string) {
@@ -241,19 +304,6 @@ func assertDiff(t *testing.T, d diffRow, wantTS, wantType, wantBeforeContains, w
 	} else if !strings.Contains(d.rowAfter, wantAfterContains) {
 		t.Errorf("diff[%s]: row_after %q does not contain %q", wantType, d.rowAfter, wantAfterContains)
 	}
-}
-
-// queryRow wraps QueryRow with a slightly clearer failure path for
-// the multi-statement subtests — sql.QueryRow defers errors to Scan
-// time, but if the connection itself is bad (e.g. ProxySQL hasn't
-// reloaded users yet) we want the failure to point at the right
-// subtest, not at "scan: bad connection".
-func queryRow(t *testing.T, db *sql.DB, q string) *sql.Row {
-	t.Helper()
-	if err := db.PingContext(context.Background()); err != nil {
-		t.Fatalf("ping before query: %v", err)
-	}
-	return db.QueryRow(q)
 }
 
 // buildBintrailBinary builds a host-side `bintrail` binary so the
@@ -466,11 +516,14 @@ func openClientWithRetry(t *testing.T, dsn string, timeout time.Duration) *sql.D
 	return nil
 }
 
-// isAuthError matches the go-sql-driver "Error 1045" wire-protocol
-// access-denied response by message substring. Using the message
-// keeps this helper from depending on the driver's typed error,
-// which is fine here because we only need to distinguish "definitely
-// permanent" from "still warming up".
+// isAuthError reports whether err is a permanent auth-rejection
+// (vs. "ProxySQL is still warming up"). Type-checks for go-sql-driver's
+// MySQLError with code 1045 (ER_ACCESS_DENIED_ERROR) — the wire
+// code is stable across MySQL/ProxySQL wording changes, unlike a
+// substring match on "access denied" which could miss future
+// ProxySQL-specific messages or false-positive on unrelated errors
+// that happen to contain that phrase.
 func isAuthError(err error) bool {
-	return strings.Contains(strings.ToLower(err.Error()), "access denied")
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1045
 }

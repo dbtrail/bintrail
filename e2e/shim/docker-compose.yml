@@ -1,18 +1,23 @@
 # Docker Compose stack for the bintrail shim end-to-end test.
 #
-# Topology:
+# Topology — sidecar pattern (mirrors the canonical prod deployment
+# where ProxySQL and the shim run on the same host):
 #
 #   go test (host) ──6033──► proxysql ──┬──990──► mysql:3306 (appdb, passthrough)
 #                          ┌─6032─admin │
-#                          │            └──991──► bintrail-shim:3308 ──► mysql:3306 (bintrail_index)
+#                          │            └──991──► 127.0.0.1:3308
+#                                                     │
+#                                                     └─ bintrail-shim
+#                                                        (network_mode: service:proxysql)
+#                                                        ──► mysql:3306 (bintrail_index)
 #
-# - mysql holds two schemas in one container: appdb (the simulated
-#   "production" DB the customer's app would target) and bintrail_index
-#   (the bintrail row-event index, hand-seeded by seed.sql so we don't
-#   need to run a real binlog stream just to exercise the shim).
-# - bintrail-shim runs `bintrail shim` against bintrail_index.
-# - proxysql is configured at test runtime via the SQL emitted by
-#   `bintrail proxysql-config` (see e2e_test.go).
+# bintrail-shim shares ProxySQL's network namespace (`network_mode:
+# service:proxysql`). This makes ProxySQL's `127.0.0.1:3308` reach
+# the shim — which matters because `bintrail proxysql-config` hard-
+# codes `'127.0.0.1'` as the shim hostname (the prod assumption is
+# same-host shim+ProxySQL). Sidecar > separate containers here:
+# we exercise the actual proxysql-config output unmodified, instead
+# of post-processing it to swap hostnames.
 
 services:
   mysql:
@@ -37,13 +42,27 @@ services:
       timeout: 3s
       retries: 30
 
+  proxysql:
+    image: proxysql/proxysql:2.7.1
+    ports:
+      - "127.0.0.1:16032:6032"
+      - "127.0.0.1:16033:6033"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
   bintrail-shim:
     build:
       context: ../..
       dockerfile: e2e/shim/Dockerfile.shim
+    # Sidecar — share proxysql's network namespace so the shim's
+    # 127.0.0.1:3308 IS the address the proxysql-config SQL points
+    # at. Cannot declare its own `ports:` — the network is owned by
+    # proxysql.
+    network_mode: "service:proxysql"
     command:
       - shim
-      - --listen=0.0.0.0:3308
+      - --listen=127.0.0.1:3308
       - --index-dsn=root:testroot@tcp(mysql:3306)/bintrail_index
       - --shim-config=/etc/bintrail/shim.yaml
       - --allow-gaps
@@ -52,22 +71,6 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-    # No container-side healthcheck: the slim runtime image has neither
-    # bash (so /dev/tcp is unavailable — that's a bash-only feature)
-    # nor netcat, and adding either just to satisfy a probe is wasted
-    # bytes. The test's waitForPort owns the readiness signal — it
-    # dials the published host port directly, which is the only
-    # readiness signal that actually matters for the test's purposes.
-
-  proxysql:
-    image: proxysql/proxysql:2.7.1
-    ports:
-      - "127.0.0.1:16032:6032"
-      - "127.0.0.1:16033:6033"
-    depends_on:
-      bintrail-shim:
-        # service_started — not service_healthy — because we removed
-        # the shim's container-side healthcheck (see above). ProxySQL
-        # itself shrugs at backend unavailability at boot; the test's
-        # waitForPort gives the real readiness signal.
+      proxysql:
+        # network_mode:service:X requires X to be running first.
         condition: service_started

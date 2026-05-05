@@ -38,6 +38,15 @@ CREATE TABLE orders (
 INSERT INTO orders (id, sku, qty, note) VALUES
     (42, 'LIVE-SKU', 999, 'live-row-from-passthrough');
 
+-- testuser is the credential the wire-protocol client uses when it
+-- talks to ProxySQL. ProxySQL forwards the same username/password
+-- to backends — so for the passthrough hostgroup to actually reach
+-- appdb.orders, MySQL has to recognise testuser too.
+-- The shim's own backend connection uses root (--index-dsn), not
+-- testuser, so this grant is scoped to appdb only.
+CREATE USER 'testuser'@'%' IDENTIFIED WITH mysql_native_password BY 'testpw';
+GRANT SELECT ON appdb.* TO 'testuser'@'%';
+
 CREATE DATABASE IF NOT EXISTS bintrail_index CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 USE bintrail_index;
@@ -79,9 +88,10 @@ CREATE TABLE binlog_events (
 );
 
 -- archive_state is read by query.Plan and query.ResolveArchiveSources.
--- An empty table is fine — the shim runs with --allow-gaps so a
--- planner-detected gap would only warn, but here the live partitions
--- cover everything anyway.
+-- Empty: the live partitions above already cover every event hour,
+-- so the planner finds no gap. --allow-gaps on the shim command is
+-- defensive belt-and-braces in case a future seed change widens
+-- the time range without extending the partition list.
 CREATE TABLE archive_state (
     id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     partition_name  VARCHAR(20) NOT NULL,
