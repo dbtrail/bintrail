@@ -44,9 +44,14 @@ services:
 
   proxysql:
     image: proxysql/proxysql:2.7.1
+    # `--initial` discards any in-volume state so the mounted
+    # proxysql.cnf is the source of truth on every run.
+    command: ["proxysql", "-f", "--idle-threads", "-c", "/etc/proxysql.cnf", "--initial"]
     ports:
       - "127.0.0.1:16032:6032"
       - "127.0.0.1:16033:6033"
+    volumes:
+      - ./proxysql.cnf:/etc/proxysql.cnf:ro
     depends_on:
       mysql:
         condition: service_healthy

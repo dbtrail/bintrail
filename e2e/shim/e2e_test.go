@@ -146,12 +146,23 @@ func TestShimEndToEnd(t *testing.T) {
 		// (event_id, event_timestamp, event_type, gtid, row_before, row_after)
 		// so positional scan is safe here — unlike the flashback
 		// case where column order is JSON-key-sorted.
+		//
+		// row_before and row_after scan into sql.NullString because
+		// go-mysql's BuildSimpleTextResultset encodes the empty
+		// string as a NULL on the wire, and the shim deliberately
+		// emits "" for INSERTs (no before-image) and DELETEs (no
+		// after-image). diffRow normalises both back to "".
 		var got []diffRow
 		for rows.Next() {
-			var d diffRow
-			if err := rows.Scan(&d.eventID, &d.timestamp, &d.eventType, &d.gtid, &d.rowBefore, &d.rowAfter); err != nil {
+			var (
+				d                  diffRow
+				rowBefore, rowAft  sql.NullString
+			)
+			if err := rows.Scan(&d.eventID, &d.timestamp, &d.eventType, &d.gtid, &rowBefore, &rowAft); err != nil {
 				t.Fatalf("scan diff: %v", err)
 			}
+			d.rowBefore = rowBefore.String // "" when invalid (NULL on the wire)
+			d.rowAfter = rowAft.String
 			got = append(got, d)
 		}
 		if err := rows.Err(); err != nil {
@@ -394,9 +405,11 @@ func applyProxySQLConfig(t *testing.T, bintrailBin string) {
 		t.Fatalf("generate proxysql-setup.sql: %v", err)
 	}
 
-	// ProxySQL admin uses the MySQL protocol; the default credentials
-	// for the official image are admin/admin on port 6032.
-	adminDB := openAdminWithRetry(t, "admin:admin@tcp("+proxysqlAdminAddr+")/", 30*time.Second)
+	// ProxySQL admin uses the MySQL protocol on port 6032. The
+	// stock `admin:admin` user is loopback-only, so we connect as
+	// the `radminuser:radminpw` extra credential declared in
+	// proxysql.cnf (see proxysql.cnf for the rationale).
+	adminDB := openAdminWithRetry(t, "radminuser:radminpw@tcp("+proxysqlAdminAddr+")/", 30*time.Second)
 	defer adminDB.Close()
 
 	// Pin to a single connection so the BEGIN/COMMIT pair emitted by

@@ -1,0 +1,31 @@
+# Minimal ProxySQL config for the e2e test.
+#
+# The reason this file exists: ProxySQL's default admin_credentials
+# of "admin:admin" is only accepted from 127.0.0.1, so the host-side
+# Go test gets back `Error 1040 (42000): User 'admin' can only
+# connect locally` when it tries to apply the proxysql-config SQL
+# via the published 16032 port. The convention in admin_credentials
+# is that the FIRST user is loopback-only and any SUBSEQUENT users
+# may connect from anywhere — so we keep "admin:admin" for backward
+# compat (anything inside the container can still use it) and add
+# "radminuser:radminpw" for the host-side test to use.
+#
+# mysql_ifaces is bound to 0.0.0.0:6033 (the client-facing port) so
+# the test runner can reach it through the published 16033.
+
+datadir="/var/lib/proxysql"
+
+admin_variables=
+{
+    admin_credentials="admin:admin;radminuser:radminpw"
+    mysql_ifaces="0.0.0.0:6032"
+}
+
+mysql_variables=
+{
+    interfaces="0.0.0.0:6033"
+    server_version="8.0.0"
+    monitor_username="monitor"
+    monitor_password="monitor"
+    default_authentication_plugin="mysql_native_password"
+}
