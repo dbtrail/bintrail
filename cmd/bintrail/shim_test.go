@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -11,7 +12,6 @@ import (
 	"time"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
-	pingcaperrors "github.com/pingcap/errors"
 
 	"github.com/dbtrail/bintrail/internal/shim"
 )
@@ -196,7 +196,7 @@ func (l *alwaysErrorListener) Addr() net.Addr {
 // TestClassifyHandshakeErr pins the #262 log-volume invariants. A
 // future refactor that flips the cases — e.g. demoting "real" errors
 // to debug, or promoting access-denied back to ERROR — would silently
-// re-introduce either the noisy probe stack traces or the SHUNN
+// re-introduce either the noisy probe stack traces or the SHUNNED
 // alarm storm.
 //
 // EOF / mysql.ErrBadConn are go-mysql's wrapped read errors when
@@ -212,7 +212,12 @@ func TestClassifyHandshakeErr(t *testing.T) {
 	}{
 		{"raw io.EOF", io.EOF, slog.LevelDebug},
 		{"unexpected EOF", io.ErrUnexpectedEOF, slog.LevelDebug},
-		{"go-mysql wrapped ErrBadConn", pingcaperrors.Wrapf(gomysql.ErrBadConn, "io.ReadFull(header) failed. err %v", io.EOF), slog.LevelDebug},
+		// fmt.Errorf+%w produces an Unwrap-compatible chain that exercises the same
+		// errors.Is path go-mysql's pingcap-wrapped reads do. We avoid importing
+		// github.com/pingcap/errors directly per CLAUDE.md ("Do not import transitive
+		// deps directly") — the production behaviour is what matters, and errors.Is
+		// resolves both wrap shapes the same way.
+		{"wrapped ErrBadConn", fmt.Errorf("io.ReadFull(header) failed: %w", gomysql.ErrBadConn), slog.LevelDebug},
 		{"ER_ACCESS_DENIED_ERROR", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES"), slog.LevelInfo},
 		{"unrelated MyError stays error", gomysql.NewDefaultError(gomysql.ER_HANDSHAKE_ERROR), slog.LevelError},
 		{"plain unrelated error", errors.New("protocol mismatch"), slog.LevelError},

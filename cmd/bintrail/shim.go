@@ -108,9 +108,20 @@ func runShim(cmd *cobra.Command, args []string) error {
 	// have unusable DSNs that the operator should notice at startup.
 	userSchemas := buildUserSchemas(tenantCfgs)
 	if missing := len(tenantCfgs) - len(userSchemas); missing > 0 {
+		// Name the affected users so a 50-tenant deployment doesn't
+		// force the operator to grep the prior per-tenant warnings.
+		missingUsers := make([]string, 0, missing)
+		for _, t := range tenantCfgs {
+			if _, ok := userSchemas[t.MySQLUser]; !ok {
+				missingUsers = append(missingUsers, t.MySQLUser)
+			}
+		}
 		slog.Warn(
 			"shim: some tenants have no usable default schema; queries from those tenants will require explicit `USE <db>`",
-			"tenants", len(tenantCfgs), "with_default_schema", len(userSchemas), "missing", missing,
+			"tenants", len(tenantCfgs),
+			"with_default_schema", len(userSchemas),
+			"missing", missing,
+			"missing_users", missingUsers,
 		)
 	}
 	auth, err := shim.NewTenantAuth(users)
@@ -281,15 +292,20 @@ func isLoopbackAddr(addr net.Addr) bool {
 // handshake into the slog level and message we want to log it at.
 //
 // ProxySQL's monitor opens a TCP socket on the shim's listen port,
-// reads nothing, then closes — go-mysql wraps the resulting EOF read
-// with mysql.ErrBadConn (via pingcap/errors.Wrapf, whose Unwrap chain
-// is errors.Is-compatible). Treat that as the expected probe shape
-// and demote to Debug so the steady-state log isn't a stack trace per
-// probe.
+// reads nothing, then closes. go-mysql surfaces the resulting read
+// failure as either a raw io.EOF / io.ErrUnexpectedEOF (rare paths
+// outside packet/conn.go) or a pingcap-wrapped mysql.ErrBadConn (the
+// usual case — every read in packet/conn.go is wrapped this way, and
+// pingcap's Unwrap chain is errors.Is-compatible). Treat all three
+// as the expected probe shape and demote to Debug so the steady-
+// state log isn't a stack trace per probe.
 //
 // Auth failures from TenantAuth.GetCredential propagate as a
-// *mysql.MyError with code ER_ACCESS_DENIED_ERROR (1045, see the
-// translation in (*Conn).handshake). Log those at Info so an
+// *mysql.MyError with code ER_ACCESS_DENIED_ERROR (1045). Note that
+// (*Conn).handshake also rewrites ErrAccessDeniedNoPassword (1698)
+// into 1045 before returning, so checking the single 1045 code
+// covers both no-password and bad-password cases — adding a 1698
+// branch here would be dead code. Log auth failures at Info so an
 // operator can correlate ProxySQL alerts with the shim's view of the
 // failure without an alarming ERROR line per monitor probe.
 //
