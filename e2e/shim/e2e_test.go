@@ -155,9 +155,13 @@ func TestShimEndToEnd(t *testing.T) {
 			t.Fatalf("expected 3 diff rows (INSERT, UPDATE, DELETE), got %d: %+v", len(got), got)
 		}
 
-		assertDiff(t, got[0], "2026-05-04 10:00:00", "INSERT", "", `"qty": 1`)
-		assertDiff(t, got[1], "2026-05-04 12:00:00", "UPDATE", `"qty": 1`, `"qty": 2`)
-		assertDiff(t, got[2], "2026-05-04 14:00:00", "DELETE", `"qty": 2`, "")
+		// json.Marshal(map[string]any) emits no whitespace between
+		// keys and values, so the substring matchers must use the
+		// compact form `"qty":1` — `"qty": 1` (with space) would
+		// silently never match.
+		assertDiff(t, got[0], "2026-05-04 10:00:00", "INSERT", "", `"qty":1`)
+		assertDiff(t, got[1], "2026-05-04 12:00:00", "UPDATE", `"qty":1`, `"qty":2`)
+		assertDiff(t, got[2], "2026-05-04 14:00:00", "DELETE", `"qty":2`, "")
 	})
 
 	t.Run("snapshot_matches_flashback", func(t *testing.T) {
@@ -341,14 +345,26 @@ func applyProxySQLConfig(t *testing.T, bintrailBin string) {
 	}
 
 	// ProxySQL admin uses the MySQL protocol; the default credentials
-	// for the official image are admin/admin on port 6032. The setup
-	// script is idempotent (DELETE then INSERT in a transaction),
-	// so a transient retry on a not-yet-ready admin port is safe.
+	// for the official image are admin/admin on port 6032.
 	adminDB := openAdminWithRetry(t, "admin:admin@tcp("+proxysqlAdminAddr+")/", 30*time.Second)
 	defer adminDB.Close()
 
+	// Pin to a single connection so the BEGIN/COMMIT pair emitted by
+	// proxysql-config actually wraps the inner DELETE/INSERTs. Without
+	// this each Exec may pull a different conn from the pool, which
+	// silently demotes the transaction to a sequence of independent
+	// statements — and a half-applied script leaves the next run with
+	// a primary-key collision on the INSERT-after-DELETE pattern.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := adminDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire admin conn: %v", err)
+	}
+	defer conn.Close()
+
 	for _, stmt := range splitSQL(setupSQL.String()) {
-		if _, err := adminDB.Exec(stmt); err != nil {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			t.Fatalf("apply admin stmt %q: %v", abbreviate(stmt, 80), err)
 		}
 	}
@@ -359,6 +375,12 @@ func applyProxySQLConfig(t *testing.T, bintrailBin string) {
 // multi-statement Exec calls; running them one at a time is the
 // supported path. Comments and blank lines are dropped so they don't
 // turn into empty Exec calls.
+//
+// This is a naive split-on-`;`: it would mangle a statement
+// containing a `;` inside a string literal. proxysql-config's output
+// happens to contain no such literals today (the only single-quoted
+// strings are hostnames, usernames, regex patterns, and the SHA1
+// hash) — if that ever changes, replace this with a real tokenizer.
 func splitSQL(s string) []string {
 	var out []string
 	for _, raw := range strings.Split(s, ";") {

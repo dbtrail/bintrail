@@ -52,13 +52,12 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-    # The shim has no built-in healthcheck endpoint; we probe the MySQL
-    # protocol port from the proxysql side via depends_on instead.
-    healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/3308 && exit 0 || exit 1"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
+    # No container-side healthcheck: the slim runtime image has neither
+    # bash (so /dev/tcp is unavailable — that's a bash-only feature)
+    # nor netcat, and adding either just to satisfy a probe is wasted
+    # bytes. The test's waitForPort owns the readiness signal — it
+    # dials the published host port directly, which is the only
+    # readiness signal that actually matters for the test's purposes.
 
   proxysql:
     image: proxysql/proxysql:2.7.1
@@ -67,9 +66,8 @@ services:
       - "127.0.0.1:16033:6033"
     depends_on:
       bintrail-shim:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6032 && exit 0 || exit 1"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
+        # service_started — not service_healthy — because we removed
+        # the shim's container-side healthcheck (see above). ProxySQL
+        # itself shrugs at backend unavailability at boot; the test's
+        # waitForPort gives the real readiness signal.
+        condition: service_started
