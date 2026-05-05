@@ -29,6 +29,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -112,7 +113,7 @@ func TestShimEndToEnd(t *testing.T) {
 		got := queryRowMap(t, clientDB,
 			"SELECT * FROM _flashback.orders AS OF '2026-05-04 13:00:00' WHERE id = 42")
 		want := map[string]string{"id": "42", "sku": "ABC-1", "qty": "2", "note": "initial"}
-		if !mapsEqual(got, want) {
+		if !maps.Equal(got, want) {
 			t.Errorf("flashback row mismatch:\n  got:  %+v\n  want: %+v", got, want)
 		}
 	})
@@ -155,14 +156,14 @@ func TestShimEndToEnd(t *testing.T) {
 		var got []diffRow
 		for rows.Next() {
 			var (
-				d                  diffRow
-				rowBefore, rowAft  sql.NullString
+				d                   diffRow
+				rowBefore, rowAfter sql.NullString
 			)
-			if err := rows.Scan(&d.eventID, &d.timestamp, &d.eventType, &d.gtid, &rowBefore, &rowAft); err != nil {
+			if err := rows.Scan(&d.eventID, &d.timestamp, &d.eventType, &d.gtid, &rowBefore, &rowAfter); err != nil {
 				t.Fatalf("scan diff: %v", err)
 			}
 			d.rowBefore = rowBefore.String // "" when invalid (NULL on the wire)
-			d.rowAfter = rowAft.String
+			d.rowAfter = rowAfter.String
 			got = append(got, d)
 		}
 		if err := rows.Err(); err != nil {
@@ -185,14 +186,44 @@ func TestShimEndToEnd(t *testing.T) {
 
 	t.Run("snapshot_matches_flashback", func(t *testing.T) {
 		// _snapshot must return the same row image as _flashback
-		// for the same AS OF. They share an implementation today
+		// for the same AS OF. They share an implementation
 		// (handler.runPointInTime); pinning the contract here
 		// keeps a future split (baseline-lookup support) deliberate.
 		got := queryRowMap(t, clientDB,
 			"SELECT * FROM _snapshot.orders AS OF '2026-05-04 11:00:00' WHERE id = 42")
 		want := map[string]string{"id": "42", "sku": "ABC-1", "qty": "1", "note": "initial"}
-		if !mapsEqual(got, want) {
+		if !maps.Equal(got, want) {
 			t.Errorf("snapshot row mismatch:\n  got:  %+v\n  want: %+v", got, want)
+		}
+	})
+
+	t.Run("auth_rejection_returns_1045_not_1449", func(t *testing.T) {
+		// Guards against the issue #262 / v0.7.4 regression
+		// class: TenantAuth must surface bad credentials as
+		// ER_ACCESS_DENIED_ERROR (1045), not ER_NO_SUCH_USER
+		// (1449) or a generic conn-reset. ProxySQL's monitor
+		// probe SHUNNs the shim hostgroup if it sees anything
+		// other than 1045 — leaving the routing silently broken.
+		// Unit tests cannot catch this because the wire-shape
+		// rewriting happens inside go-mysql/server's handshake
+		// rather than in TenantAuth itself.
+		badDB, err := sql.Open("mysql", "wronguser:wrongpw@tcp("+proxysqlClientAddr+")/appdb")
+		if err != nil {
+			t.Fatalf("open with bad creds: %v", err)
+		}
+		defer badDB.Close()
+
+		err = badDB.Ping()
+		if err == nil {
+			t.Fatalf("expected ping with bad creds to fail, got nil")
+		}
+		var mysqlErr *mysql.MySQLError
+		if !errors.As(err, &mysqlErr) {
+			t.Fatalf("expected *mysql.MySQLError, got %T: %v", err, err)
+		}
+		if mysqlErr.Number != 1045 {
+			t.Fatalf("expected error code 1045 (ER_ACCESS_DENIED_ERROR), got %d: %s",
+				mysqlErr.Number, mysqlErr.Message)
 		}
 	})
 
@@ -207,7 +238,7 @@ func TestShimEndToEnd(t *testing.T) {
 		got := queryRowMap(t, clientDB,
 			"SELECT * FROM orders WHERE id = 42")
 		want := map[string]string{"id": "42", "sku": "LIVE-SKU", "qty": "999", "note": "live-row-from-passthrough"}
-		if !mapsEqual(got, want) {
+		if !maps.Equal(got, want) {
 			t.Errorf("passthrough row mismatch:\n  got:  %+v\n  want: %+v\n"+
 				"if this looks like a shim error, the regex in `bintrail proxysql-config` "+
 				"is over-matching", got, want)
@@ -254,7 +285,11 @@ func queryRowMap(t *testing.T, db *sql.DB, q string) map[string]string {
 		if err := rows.Err(); err != nil {
 			t.Fatalf("rows err: %v", err)
 		}
-		t.Fatalf("expected exactly one row, got zero (cols=%v)", cols)
+		// cols=[_flashback] means the shim returned its
+		// emptyResult (no matching event); cols=[id sku qty note]
+		// means the passthrough hostgroup ran the query against
+		// real MySQL and matched nothing — different bugs.
+		t.Fatalf("expected exactly one row, got zero (query=%q, cols=%v)", q, cols)
 	}
 
 	raw := make([]sql.RawBytes, len(cols))
@@ -279,18 +314,6 @@ func queryRowMap(t *testing.T, db *sql.DB, q string) map[string]string {
 		t.Fatalf("expected exactly one row, got at least two")
 	}
 	return out
-}
-
-func mapsEqual(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
 }
 
 func assertDiff(t *testing.T, d diffRow, wantTS, wantType, wantBeforeContains, wantAfterContains string) {
@@ -428,6 +451,12 @@ func applyProxySQLConfig(t *testing.T, bintrailBin string) {
 
 	for _, stmt := range splitSQL(setupSQL.String()) {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			// Dump container logs first — ProxySQL's admin
+			// rejection messages often clarify *why* a stmt
+			// failed (typo in regex, bad hostgroup id) and
+			// they live in proxysql's stdout, not in the
+			// MySQL wire error we get back here.
+			dumpComposeLogs(t)
 			t.Fatalf("apply admin stmt %q: %v", abbreviate(stmt, 80), err)
 		}
 	}

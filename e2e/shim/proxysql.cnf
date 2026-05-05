@@ -1,17 +1,21 @@
 # Minimal ProxySQL config for the e2e test.
 #
-# The reason this file exists: ProxySQL's default admin_credentials
-# of "admin:admin" is only accepted from 127.0.0.1, so the host-side
-# Go test gets back `Error 1040 (42000): User 'admin' can only
-# connect locally` when it tries to apply the proxysql-config SQL
-# via the published 16032 port. The convention in admin_credentials
-# is that the FIRST user is loopback-only and any SUBSEQUENT users
-# may connect from anywhere — so we keep "admin:admin" for backward
-# compat (anything inside the container can still use it) and add
-# "radminuser:radminpw" for the host-side test to use.
+# Carries only admin reachability and protocol bind addresses; the
+# routing config (mysql_servers / mysql_users / mysql_query_rules)
+# is loaded at test runtime by piping the SQL emitted by
+# `bintrail proxysql-config` into the admin port — that's the
+# whole point of running it through this rig.
 #
-# mysql_ifaces is bound to 0.0.0.0:6033 (the client-facing port) so
-# the test runner can reach it through the published 16033.
+# Why a custom cnf at all: ProxySQL hardcodes the literal username
+# `admin` as loopback-only, so the host-side Go test connecting
+# from the docker bridge gets `Error 1040 (42000): User 'admin'
+# can only connect locally`. Any non-`admin` username in
+# admin_credentials is accepted from wherever admin_variables.
+# mysql_ifaces listens — order in the credentials list does not
+# matter, only the literal name `admin` is special. We add
+# `radminuser:radminpw` for the host-side test and keep the
+# stock `admin:admin` so anything inside the container still
+# works the canonical way.
 
 datadir="/var/lib/proxysql"
 

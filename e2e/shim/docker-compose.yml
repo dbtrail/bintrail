@@ -44,8 +44,11 @@ services:
 
   proxysql:
     image: proxysql/proxysql:2.7.1
-    # `--initial` discards any in-volume state so the mounted
-    # proxysql.cnf is the source of truth on every run.
+    # `--initial` wipes any volume-resident SQLite config from a
+    # prior run so we start each test from a clean slate. Routing
+    # config (mysql_servers / mysql_users / mysql_query_rules) is
+    # not in proxysql.cnf — it's applied at test runtime via the
+    # SQL emitted by `bintrail proxysql-config`.
     command: ["proxysql", "-f", "--idle-threads", "-c", "/etc/proxysql.cnf", "--initial"]
     ports:
       - "127.0.0.1:16032:6032"
