@@ -3,10 +3,15 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
+	pingcaperrors "github.com/pingcap/errors"
 
 	"github.com/dbtrail/bintrail/internal/shim"
 )
@@ -186,4 +191,78 @@ func (l *alwaysErrorListener) Close() error {
 
 func (l *alwaysErrorListener) Addr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+// TestClassifyHandshakeErr pins the #262 log-volume invariants. A
+// future refactor that flips the cases — e.g. demoting "real" errors
+// to debug, or promoting access-denied back to ERROR — would silently
+// re-introduce either the noisy probe stack traces or the SHUNN
+// alarm storm.
+//
+// EOF / mysql.ErrBadConn are go-mysql's wrapped read errors when
+// ProxySQL's monitor opens a TCP socket and closes it; they must be
+// debug. ER_ACCESS_DENIED_ERROR is what TenantAuth.GetCredential
+// causes go-mysql/server to return — info, never error. Anything
+// else stays at error.
+func TestClassifyHandshakeErr(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		wantLevel slog.Level
+	}{
+		{"raw io.EOF", io.EOF, slog.LevelDebug},
+		{"unexpected EOF", io.ErrUnexpectedEOF, slog.LevelDebug},
+		{"go-mysql wrapped ErrBadConn", pingcaperrors.Wrapf(gomysql.ErrBadConn, "io.ReadFull(header) failed. err %v", io.EOF), slog.LevelDebug},
+		{"ER_ACCESS_DENIED_ERROR", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES"), slog.LevelInfo},
+		{"unrelated MyError stays error", gomysql.NewDefaultError(gomysql.ER_HANDSHAKE_ERROR), slog.LevelError},
+		{"plain unrelated error", errors.New("protocol mismatch"), slog.LevelError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			level, msg := classifyHandshakeErr(tc.err)
+			if level != tc.wantLevel {
+				t.Errorf("classifyHandshakeErr level = %v, want %v (msg=%q)", level, tc.wantLevel, msg)
+			}
+			if msg == "" {
+				t.Errorf("classifyHandshakeErr msg empty for %v", tc.err)
+			}
+		})
+	}
+}
+
+// TestBuildUserSchemas pins the #263 plumbing. Each branch of the
+// extraction is the regression surface for the original bug: a typo
+// in the DSN parse, dropping the empty-DBName guard, or skipping the
+// empty-SourceDSN early-out would all silently re-introduce the
+// "USE <db> required" failure mode for some tenant subset.
+func TestBuildUserSchemas(t *testing.T) {
+	cfgs := []shim.TenantConfig{
+		{MySQLUser: "alice", MySQLPassword: "p", SourceDSN: "u:p@tcp(db:3306)/source_a"},
+		{MySQLUser: "bob", MySQLPassword: "p", SourceDSN: "u:p@tcp(db:3306)/"}, // no DB name
+		{MySQLUser: "carol", MySQLPassword: "p", SourceDSN: ""},                // empty DSN
+		{MySQLUser: "dave", MySQLPassword: "p", SourceDSN: "::not-a-dsn::"},    // unparseable
+		{MySQLUser: "eve", MySQLPassword: "p", SourceDSN: "u:p@tcp(db:3306)/source_e?parseTime=true"},
+	}
+	got := buildUserSchemas(cfgs)
+	want := map[string]string{
+		"alice": "source_a",
+		"eve":   "source_e",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for u, schema := range want {
+		if got[u] != schema {
+			t.Errorf("buildUserSchemas[%q] = %q, want %q", u, got[u], schema)
+		}
+	}
+	// Tenants with bad/empty DSN must be ABSENT, not present-with-empty:
+	// handleConn keys off `ok` membership in the map; an empty-string
+	// entry would seed `Handler.UseDB("")` which silently breaks the
+	// pre-#263 fallback path.
+	for _, u := range []string{"bob", "carol", "dave"} {
+		if _, ok := got[u]; ok {
+			t.Errorf("buildUserSchemas[%q] should be absent (bad/empty DSN), got %q", u, got[u])
+		}
+	}
 }

@@ -98,10 +98,30 @@ func (a TenantAuth) GetCredential(u string) (password string, found bool, err er
 // tenants block. Used by `bintrail shim` so callers can recover the
 // per-tenant source_dsn (and from it, the source schema) in addition
 // to the credentials needed for TenantAuth.
+//
+// Returned only by LoadTenantConfigs — instances obtained through
+// that function carry the invariants below. Direct struct-literal
+// construction (TenantConfig{...}) bypasses validation; consumers
+// should treat that as a programmer error rather than a recoverable
+// configuration shape.
 type TenantConfig struct {
-	ServerID      string
-	SourceDSN     string
-	MySQLUser     string
+	// ServerID is the bintrail stream/agent server_id. May be empty
+	// (the shim does not require it; only the streamer does).
+	ServerID string
+	// SourceDSN is the upstream MySQL DSN for the tenant's source
+	// database. May be empty: when set with a /<db> path, `bintrail
+	// shim` derives the schema from it and pre-seeds Handler.db so
+	// fully qualified time-travel queries work without `USE <db>`
+	// (issue #263). When empty or path-less, that tenant's clients
+	// fall back to issuing `USE` themselves.
+	SourceDSN string
+	// MySQLUser is the cleartext username the application connects
+	// with through ProxySQL. Guaranteed non-empty by LoadTenantConfigs.
+	MySQLUser string
+	// MySQLPassword is the cleartext password
+	// `mysql_native_password` validates against. Guaranteed non-empty
+	// by LoadTenantConfigs — empty here is the #254 silent-auth
+	// regression and is rejected at the loader boundary.
 	MySQLPassword string
 }
 

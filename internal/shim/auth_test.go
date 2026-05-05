@@ -228,6 +228,58 @@ func TestLoadTenantConfigsReturnsSourceDSN(t *testing.T) {
 	}
 }
 
+// TestLoadTenantConfigsRejectsEmptyCredentials pins the construction-
+// time invariant that LoadTenantConfigs guarantees non-empty MySQLUser
+// and MySQLPassword. The struct fields are exported, so a future
+// caller could in principle build a TenantConfig{} directly and
+// bypass these checks — but the loader must remain the sole producer
+// of "trusted" instances, and downgrading any of these errors to a
+// warning would silently reopen the #254 empty-password regression.
+func TestLoadTenantConfigsRejectsEmptyCredentials(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("empty mysql_user", func(t *testing.T) {
+		path := filepath.Join(dir, "user.yaml")
+		if err := os.WriteFile(path, []byte("tenants:\n  - mysql_password: 'p'\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadTenantConfigs(path)
+		if err == nil || !strings.Contains(err.Error(), "mysql_user is empty") {
+			t.Errorf("expected mysql_user error, got %v", err)
+		}
+	})
+
+	t.Run("empty mysql_password", func(t *testing.T) {
+		path := filepath.Join(dir, "pw.yaml")
+		if err := os.WriteFile(path, []byte("tenants:\n  - mysql_user: alice\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadTenantConfigs(path)
+		if err == nil || !strings.Contains(err.Error(), "mysql_password is empty") {
+			t.Errorf("expected mysql_password error, got %v", err)
+		}
+	})
+
+	t.Run("empty source_dsn round-trips empty (not validated)", func(t *testing.T) {
+		// SourceDSN being empty is a legitimate runtime configuration
+		// (the tenant's clients will issue USE explicitly). Pinning
+		// this lets us evolve the loader without accidentally
+		// mandating a non-empty DSN.
+		path := filepath.Join(dir, "nodsn.yaml")
+		body := "tenants:\n  - mysql_user: alice\n    mysql_password: 'p'\n"
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfgs, err := LoadTenantConfigs(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cfgs) != 1 || cfgs[0].SourceDSN != "" {
+			t.Errorf("got %+v, want one tenant with empty SourceDSN", cfgs)
+		}
+	})
+}
+
 // TestLoadTenantsBothFieldsSet pins the contract that when an operator
 // has both `mysql_password` (new) and `mysql_pass_sha1` (legacy) in
 // shim.yaml — typically during a half-completed migration — the
