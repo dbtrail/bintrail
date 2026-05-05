@@ -1,10 +1,13 @@
 package shim
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/go-mysql-org/go-mysql/server"
 )
 
 func TestNewTenantAuthEmpty(t *testing.T) {
@@ -70,6 +73,24 @@ func TestTenantAuthGetCredentialReturnsCleartext(t *testing.T) {
 	_, found, _ = a.GetCredential("eve")
 	if found {
 		t.Error("GetCredential(eve) should not be found")
+	}
+}
+
+// TestTenantAuthGetCredentialUnknownUserReturnsAccessDenied pins the
+// #262 fix: an unknown user must surface server.ErrAccessDenied so
+// (*Conn).handshake translates it to ER_ACCESS_DENIED_ERROR (1045).
+// Returning (found=false, err=nil) instead would let go-mysql/server
+// raise ER_NO_SUCH_USER (1449) — ProxySQL reads that as "backend
+// broken" and SHUNNs the hostgroup. A future refactor that drops the
+// explicit error here would silently re-introduce the SHUNN bug.
+func TestTenantAuthGetCredentialUnknownUserReturnsAccessDenied(t *testing.T) {
+	a, _ := NewTenantAuth(map[string]string{"alice": "alicepw"})
+	_, found, err := a.GetCredential("monitor")
+	if found {
+		t.Fatal("GetCredential(monitor) should not be found")
+	}
+	if !errors.Is(err, server.ErrAccessDenied) {
+		t.Fatalf("GetCredential(monitor) err = %v, want server.ErrAccessDenied", err)
 	}
 }
 
@@ -172,6 +193,39 @@ func TestLoadTenantsErrors(t *testing.T) {
 			t.Errorf("error should name the unknown field, got %v", err)
 		}
 	})
+}
+
+// TestLoadTenantConfigsReturnsSourceDSN pins the #263 plumbing: the
+// per-tenant source_dsn must round-trip through LoadTenantConfigs so
+// `bintrail shim` can derive the schema and seed it as the default
+// database for fully qualified time-travel queries. A future refactor
+// that drops SourceDSN from the returned struct would silently
+// re-introduce the "USE <db> required" failure mode.
+func TestLoadTenantConfigsReturnsSourceDSN(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shim.yaml")
+	body := `tenants:
+  - server_id: '1'
+    source_dsn: 'u:p@tcp(db:3306)/source_schema'
+    mysql_user: alice
+    mysql_password: 'alicepw'
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgs, err := LoadTenantConfigs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfgs) != 1 {
+		t.Fatalf("got %d tenants, want 1", len(cfgs))
+	}
+	if cfgs[0].SourceDSN != "u:p@tcp(db:3306)/source_schema" {
+		t.Errorf("SourceDSN = %q, want round-trip", cfgs[0].SourceDSN)
+	}
+	if cfgs[0].MySQLUser != "alice" || cfgs[0].MySQLPassword != "alicepw" {
+		t.Errorf("creds round-trip mismatch: %+v", cfgs[0])
+	}
 }
 
 // TestLoadTenantsBothFieldsSet pins the contract that when an operator

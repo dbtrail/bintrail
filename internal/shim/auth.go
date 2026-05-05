@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/go-mysql-org/go-mysql/server"
 	yaml "go.yaml.in/yaml/v2"
 )
 
@@ -76,21 +77,62 @@ func (a TenantAuth) CheckUsername(u string) (bool, error) {
 // GetCredential implements server.CredentialProvider. Returns the
 // stored cleartext password so go-mysql/server's mysql_native_password
 // handshake can validate the client's scrambled response against it.
+//
+// Unknown usernames return server.ErrAccessDenied rather than
+// (found=false, err=nil). The library translates ErrAccessDenied into
+// ER_ACCESS_DENIED_ERROR (1045) inside (*Conn).handshake; a plain
+// found=false instead surfaces ER_NO_SUCH_USER (1449), which ProxySQL
+// reads as "backend broken" and SHUNNs the hostgroup (issue #262).
+// Returning the error explicitly routes us through the 1045 path so
+// ProxySQL's monitor probes look like normal auth failures and the
+// backend stays ONLINE.
 func (a TenantAuth) GetCredential(u string) (password string, found bool, err error) {
 	p, ok := a.users[u]
+	if !ok {
+		return "", false, server.ErrAccessDenied
+	}
 	return p, ok, nil
 }
 
+// TenantConfig is the validated form of one entry in shim.yaml's
+// tenants block. Used by `bintrail shim` so callers can recover the
+// per-tenant source_dsn (and from it, the source schema) in addition
+// to the credentials needed for TenantAuth.
+type TenantConfig struct {
+	ServerID      string
+	SourceDSN     string
+	MySQLUser     string
+	MySQLPassword string
+}
+
 // LoadTenants reads shim.yaml from path and returns username →
-// cleartext password for each tenant. Used by `bintrail shim` to
-// construct a TenantAuth at startup.
+// cleartext password for each tenant. Thin wrapper over
+// LoadTenantConfigs that exists so older callers (and the existing
+// auth tests) keep working unchanged.
+func LoadTenants(path string) (map[string]string, error) {
+	cfgs, err := LoadTenantConfigs(path)
+	if err != nil {
+		return nil, err
+	}
+	users := make(map[string]string, len(cfgs))
+	for _, t := range cfgs {
+		users[t.MySQLUser] = t.MySQLPassword
+	}
+	return users, nil
+}
+
+// LoadTenantConfigs reads shim.yaml from path and returns the full
+// validated tenants block. Used by `bintrail shim` so the per-tenant
+// source DSN reaches the connection handler — without it, fully
+// qualified time-travel queries like `SELECT * FROM _flashback.orders`
+// would still need an explicit `USE <db>` first (issue #263).
 //
 // Strict YAML parsing rejects unknown fields, so legacy fields kept
 // in the struct (agent_url, agent_token from < 0.7.0; mysql_pass_sha1
 // from < 0.7.2) parse cleanly even though they are no longer
 // load-bearing. Operators upgrading from 0.7.1 see a runtime warning
 // pointing at mysql_password.
-func LoadTenants(path string) (map[string]string, error) {
+func LoadTenantConfigs(path string) ([]TenantConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
@@ -113,7 +155,7 @@ func LoadTenants(path string) (map[string]string, error) {
 	if len(cfg.Tenants) == 0 {
 		return nil, fmt.Errorf("%s has no tenants", path)
 	}
-	users := make(map[string]string, len(cfg.Tenants))
+	out := make([]TenantConfig, 0, len(cfg.Tenants))
 	for i, t := range cfg.Tenants {
 		if t.MySQLUser == "" {
 			return nil, fmt.Errorf("%s tenant #%d: mysql_user is empty (uncomment and fill in the TODO line)", path, i+1)
@@ -133,7 +175,12 @@ func LoadTenants(path string) (map[string]string, error) {
 				"tenant", i+1, "mysql_user", t.MySQLUser,
 			)
 		}
-		users[t.MySQLUser] = t.MySQLPassword
+		out = append(out, TenantConfig{
+			ServerID:      t.ServerID,
+			SourceDSN:     t.SourceDSN,
+			MySQLUser:     t.MySQLUser,
+			MySQLPassword: t.MySQLPassword,
+		})
 	}
-	return users, nil
+	return out, nil
 }
