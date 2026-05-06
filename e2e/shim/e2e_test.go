@@ -190,12 +190,24 @@ func TestShimEndToEnd(t *testing.T) {
 
 		// Substring match on JSON includes a delimiter (`,` or `}`)
 		// so `"qty":1` doesn't accidentally match `"qty":10` or
-		// `"qty":100`. json.Marshal of map[string]any sorts keys
-		// alphabetically, so id < note < qty < sku — qty is never
-		// the last key here, hence the `,` boundary.
+		// `"qty":100`. The shim emits keys in DDL order
+		// (id, sku, qty, note) so qty is never the last key — the
+		// trailing `,` is always a stable delimiter here.
 		assertDiff(t, got[0], "2026-05-04 10:00:00", "INSERT", "", `"qty":1,`)
 		assertDiff(t, got[1], "2026-05-04 12:00:00", "UPDATE", `"qty":1,`, `"qty":2,`)
 		assertDiff(t, got[2], "2026-05-04 14:00:00", "DELETE", `"qty":2,`, "")
+
+		// Pin the JSON key ordering. Without this, a regression
+		// where marshalImageOrdered reverts to json.Marshal(map)
+		// would alphabetise keys (id, note, qty, sku) and the
+		// substring asserts above would still pass — they only
+		// check that "qty":N appears, not where it sits.
+		const wantPrefix = `{"id":42,"sku":"ABC-1",`
+		if !strings.HasPrefix(got[1].rowAfter, wantPrefix) {
+			t.Errorf("_diff JSON key order regression: row_after=%q does not start with %q\n"+
+				"if alphabetical, the marshalImageOrdered path is broken",
+				got[1].rowAfter, wantPrefix)
+		}
 	})
 
 	t.Run("snapshot_matches_flashback", func(t *testing.T) {

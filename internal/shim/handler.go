@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
@@ -19,6 +20,16 @@ import (
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
 )
+
+// resolverCacheTTL bounds how long a stale schema_snapshots view
+// can serve column-ordering lookups. 30s is short enough that a
+// fresh `bintrail snapshot` is visible within ops-monitoring time
+// (the typical "I just ran snapshot, why don't I see my new
+// column?" reaction window) and long enough to absorb any
+// reasonable shim QPS without re-loading the entire snapshot per
+// query — the previous per-query reload measurably loaded
+// information_schema-style data on every customer query.
+const resolverCacheTTL = 30 * time.Second
 
 // Handler implements server.Handler. It serves the small subset of
 // MySQL protocol the time-travel SQL story needs: USE <db>,
@@ -40,17 +51,71 @@ type Handler struct {
 	// `bintrail query` and `bintrail recover` use) — exposed as a field
 	// so tests can inject a fake without DuckDB or real S3.
 	archiveFetcher query.ArchiveFetcher
-	// resolverFn returns a metadata.Resolver loaded from the latest
+	// resolverFn loads a metadata.Resolver from the latest
 	// schema_snapshots row. Production wires this to
-	// metadata.NewResolver(indexDB, 0); tests inject a fake to exercise
-	// the column-ordering paths without an indexDB. Called per query
-	// (cheap — a single SELECT against schema_snapshots) so a fresh
-	// snapshot taken after the shim started is picked up automatically
-	// without explicit cache-invalidation logic.
-	resolverFn func() (*metadata.Resolver, error)
+	// metadata.NewResolver(indexDB, 0), which issues a MAX(snapshot_id)
+	// lookup plus a full per-snapshot row scan that materialises every
+	// table's column metadata into memory — non-trivial under load.
+	// Tests inject a fake to exercise the column-ordering paths without
+	// an indexDB.
+	//
+	// Wrapped by resolverCache below so successive queries share one
+	// load for up to resolverCacheTTL; a fresh `bintrail snapshot`
+	// becomes visible at the next cache miss without explicit
+	// invalidation. Use resolver() (not resolverFn directly) from
+	// production code so the cache + sticky-fallback policy applies.
+	resolverFn    func() (*metadata.Resolver, error)
+	resolverCache resolverCache
 
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
+}
+
+// resolverCache memoises the latest metadata.Resolver across shim
+// queries. The zero value is ready to use.
+//
+// Caching policy: on a hit-within-TTL we return the cached resolver
+// without invoking the loader. On a miss-or-expired we invoke the
+// loader; if it succeeds we replace the cache; if it fails AND we
+// still hold a valid prior resolver, we return the stale resolver
+// rather than the error — sticky fallback prevents transient
+// index-DB blips from oscillating wire-protocol column order
+// between DDL and alphabetical across consecutive customer queries.
+//
+// We do NOT extend the timestamp on a sticky-fallback hit: the next
+// query still tries to refresh, so a recovered DB picks up the new
+// snapshot at the next attempt rather than waiting another full TTL.
+type resolverCache struct {
+	mu       sync.Mutex
+	loaded   *metadata.Resolver
+	loadedAt time.Time
+}
+
+// get returns a Resolver from the cache when fresh, otherwise calls
+// load. On load error: returns the stale Resolver if we have one
+// (sticky fallback) plus a nil error so the caller treats it as a
+// successful refresh; or surfaces the error when no prior resolver
+// exists so the caller can decide between sentinel-vs-real-failure
+// handling.
+//
+// `now` is injected for deterministic tests; production passes
+// time.Now.
+func (c *resolverCache) get(now func() time.Time, ttl time.Duration, load func() (*metadata.Resolver, error)) (*metadata.Resolver, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.loaded != nil && now().Sub(c.loadedAt) < ttl {
+		return c.loaded, nil
+	}
+	r, err := load()
+	if err != nil {
+		if c.loaded != nil {
+			return c.loaded, nil
+		}
+		return nil, err
+	}
+	c.loaded = r
+	c.loadedAt = now()
+	return r, nil
 }
 
 // Config tunes the shim's data-fetch behaviour.
@@ -200,24 +265,40 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 
 // columnOrderFor returns the column names of schema.table in DDL
 // (ordinal_position) order so the wire-protocol resultset matches
-// what a regular MySQL `SELECT *` would emit. Returns nil when the
-// latest schema_snapshots row is missing, fails to load, or doesn't
-// know about this table — the caller falls back to alphabetical
-// ordering of the JSON image keys.
+// what a regular MySQL `SELECT *` would emit. Returns nil when no
+// snapshot is available or the table is missing from the latest
+// snapshot — the caller falls back to alphabetical ordering of the
+// JSON image keys.
 //
-// We swallow lookup errors at Debug level rather than failing the
-// query: missing-snapshot is a real possibility (operator hasn't
-// run `bintrail snapshot` yet, snapshot lags a brand-new ALTER
-// TABLE, etc.) and a janky-but-deterministic fallback is strictly
-// better than a hard failure on what is otherwise a working query.
+// Logging policy is split deliberately so operators can tell
+// "first-install with no snapshot yet" apart from real DB-side
+// failure:
+//
+//   - metadata.ErrNoSnapshots → Debug. Benign first-install state;
+//     the operator just hasn't run `bintrail snapshot` yet.
+//   - any other resolver-load error → Warn. Index DB is unreachable
+//     or schema_snapshots is unreadable — a real config/infra
+//     problem the operator should see at default --log-level info.
+//   - table not in snapshot → Debug. Common for tables created
+//     after the latest snapshot was taken; benign and self-fixing
+//     once a fresh snapshot runs.
+//
+// A janky-but-deterministic fallback is strictly better than a
+// hard failure on what is otherwise a working query — but the
+// fallback should be loud when it's hiding a real outage.
 func (h *Handler) columnOrderFor(schema, table string) []string {
 	if h.resolverFn == nil {
 		return nil
 	}
-	r, err := h.resolverFn()
+	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn)
 	if err != nil {
-		h.logger.Debug("shim: schema_snapshots lookup failed; falling back to alphabetical column order",
-			"err", err, "schema", schema, "table", table)
+		if errors.Is(err, metadata.ErrNoSnapshots) {
+			h.logger.Debug("shim: no snapshots yet; falling back to alphabetical column order",
+				"schema", schema, "table", table)
+		} else {
+			h.logger.Warn("shim: schema_snapshots lookup failed; falling back to alphabetical column order",
+				"err", err, "schema", schema, "table", table)
+		}
 		return nil
 	}
 	tm, err := r.Resolve(schema, table)
@@ -307,6 +388,13 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)
 	}
 
+	// Compute the source-table column order once per query so the
+	// per-row JSON images encode keys in DDL order (matching what
+	// _flashback / _snapshot return for SELECT *). Without this the
+	// row_before / row_after JSON keys would alphabetise — surprising
+	// when a customer compares _diff output side by side with the
+	// reconstructed flashback row.
+	ddlOrder := h.columnOrderFor(q.Schema, q.Table)
 	cols := []string{"event_id", "event_timestamp", "event_type", "gtid", "row_before", "row_after"}
 	values := make([][]any, 0, len(rows))
 	for _, r := range rows {
@@ -319,8 +407,8 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 			r.EventTimestamp.UTC().Format("2006-01-02 15:04:05"),
 			eventTypeName(r.EventType),
 			gtid,
-			marshalImage(r.RowBefore),
-			marshalImage(r.RowAfter),
+			marshalImageOrdered(r.RowBefore, ddlOrder),
+			marshalImageOrdered(r.RowAfter, ddlOrder),
 		})
 	}
 	rs, err := mysql.BuildSimpleTextResultset(cols, values)
@@ -345,19 +433,55 @@ func eventTypeName(t parser.EventType) string {
 	return fmt.Sprintf("type_%d", t)
 }
 
-// marshalImage renders a row image as a JSON string for the _diff
-// resultset. nil maps render as the empty string so customers can
-// distinguish "no image" (INSERT lacks row_before, DELETE lacks
-// row_after) from "empty image".
-func marshalImage(image map[string]any) string {
+// marshalImageOrdered renders a row image as a JSON string for the
+// _diff resultset, emitting keys in ddlOrder so the JSON column
+// order matches what _flashback / _snapshot return. nil maps render
+// as the empty string so customers can distinguish "no image"
+// (INSERT lacks row_before, DELETE lacks row_after) from "empty
+// image".
+//
+// ddlOrder=nil falls back to encoding/json's default
+// alphabetical-key marshalling — same degraded path as
+// imageToResult when no snapshot is available.
+//
+// Built by hand rather than via json.Marshal(map) because the stdlib
+// encoder sorts map keys alphabetically with no override hook. The
+// per-key json.Marshal calls reuse the stdlib encoder for both the
+// quoted key and the value so escaping (quotes, control chars,
+// non-printable bytes inside strings) stays correct without a
+// custom escaper here.
+func marshalImageOrdered(image map[string]any, ddlOrder []string) string {
 	if image == nil {
 		return ""
 	}
-	b, err := json.Marshal(image)
-	if err != nil {
-		return ""
+	if len(ddlOrder) == 0 {
+		b, err := json.Marshal(image)
+		if err != nil {
+			return ""
+		}
+		return string(b)
 	}
-	return string(b)
+	cols := orderColumns(image, ddlOrder)
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, c := range cols {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		keyJSON, err := json.Marshal(c)
+		if err != nil {
+			return ""
+		}
+		sb.Write(keyJSON)
+		sb.WriteByte(':')
+		valJSON, err := json.Marshal(image[c])
+		if err != nil {
+			return ""
+		}
+		sb.Write(valJSON)
+	}
+	sb.WriteByte('}')
+	return sb.String()
 }
 
 // imageToResult turns a single-row JSON object into a mysql.Result

@@ -2,12 +2,23 @@ package metadata
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
 	"time"
 )
+
+// ErrNoSnapshots signals "schema_snapshots is queryable but empty"
+// — a benign first-install state, not a real failure. Callers that
+// degrade gracefully when no snapshot exists (e.g. the shim's
+// columnOrderFor falling back to alphabetical column ordering) can
+// errors.Is against this sentinel to distinguish "operator hasn't
+// run `bintrail snapshot` yet" from a genuine DB-side failure
+// (table dropped post-upgrade, permissions revoked, connection
+// lost) — which deserve a louder log channel.
+var ErrNoSnapshots = errors.New("no snapshots found; run `bintrail snapshot` first")
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -68,7 +79,7 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 			return nil, fmt.Errorf("failed to query latest snapshot ID: %w", err)
 		}
 		if snapshotID == 0 {
-			return nil, fmt.Errorf("no snapshots found; run `bintrail snapshot` first")
+			return nil, ErrNoSnapshots
 		}
 	}
 
