@@ -43,7 +43,12 @@ services:
       retries: 30
 
   proxysql:
-    image: proxysql/proxysql:2.7.1
+    # 2.6.x is the recommended LTS line per the ProxySQL maintainers.
+    # Docker Hub does not publish a floating `2.6` tag, so we pin to
+    # the latest 2.6 patch and bump on a security release. Bump
+    # cadence is fine to be manual since the test rig isn't on the
+    # critical path.
+    image: proxysql/proxysql:2.6.6
     # `--initial` wipes any volume-resident SQLite config from a
     # prior run so we start each test from a clean slate. Routing
     # config (mysql_servers / mysql_users / mysql_query_rules) is
