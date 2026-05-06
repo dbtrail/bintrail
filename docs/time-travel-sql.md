@@ -69,6 +69,8 @@ Edit `shim.yaml`, uncomment the two TODO lines, and paste the values:
 
 > **Auth note**: both `bintrail shim` and ProxySQL validate the application's password against the same `mysql_password` (the shim using cleartext directly via the MySQL native-password handshake; ProxySQL using its derived SHA1). The shim's listen address defaults to `127.0.0.1:3308` so it is not reachable from the network. Treat `shim.yaml` as you'd treat `.bintrail.env` — it contains a password and ships at 0o600.
 
+> **Current limitation — auth scheme**: only `mysql_native_password` is supported today (both shim ↔ client and ProxySQL ↔ MySQL backend). `caching_sha2_password` — MySQL's default since 8.0, the only scheme present by default since 8.4 — is **not yet** supported. On MySQL 8.0+ instances, the application user used by ProxySQL must be created with `IDENTIFIED WITH mysql_native_password BY '<password>'`, and the server must have `mysql_native_password=ON` (default in 8.0–8.3, opt-in in 8.4). SHA2 support is tracked in [#274](https://github.com/dbtrail/bintrail/issues/274).
+
 ---
 
 ## Step 2 — Install ProxySQL
