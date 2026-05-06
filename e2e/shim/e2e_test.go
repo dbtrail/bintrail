@@ -197,16 +197,16 @@ func TestShimEndToEnd(t *testing.T) {
 		assertDiff(t, got[1], "2026-05-04 12:00:00", "UPDATE", `"qty":1,`, `"qty":2,`)
 		assertDiff(t, got[2], "2026-05-04 14:00:00", "DELETE", `"qty":2,`, "")
 
-		// Pin the JSON key ordering. Without this, a regression
-		// where marshalImageOrdered reverts to json.Marshal(map)
-		// would alphabetise keys (id, note, qty, sku) and the
-		// substring asserts above would still pass — they only
-		// check that "qty":N appears, not where it sits.
-		const wantPrefix = `{"id":42,"sku":"ABC-1",`
-		if !strings.HasPrefix(got[1].rowAfter, wantPrefix) {
-			t.Errorf("_diff JSON key order regression: row_after=%q does not start with %q\n"+
-				"if alphabetical, the marshalImageOrdered path is broken",
-				got[1].rowAfter, wantPrefix)
+		// Pin the full JSON key ordering. A prefix-only check
+		// (e.g. `{"id":42,"sku":"ABC-1",`) would only prove
+		// id < sku, leaving "alphabetised the tail" regressions
+		// undetected. Full-string equality eliminates the entire
+		// reorder-class bug.
+		const wantRowAfter = `{"id":42,"sku":"ABC-1","qty":2,"note":"initial"}`
+		if got[1].rowAfter != wantRowAfter {
+			t.Errorf("_diff JSON key order regression:\n  got:  %s\n  want: %s\n"+
+				"if columns alphabetise, the marshalImageOrdered path is broken",
+				got[1].rowAfter, wantRowAfter)
 		}
 	})
 

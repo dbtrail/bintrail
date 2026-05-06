@@ -74,47 +74,102 @@ type Handler struct {
 // resolverCache memoises the latest metadata.Resolver across shim
 // queries. The zero value is ready to use.
 //
-// Caching policy: on a hit-within-TTL we return the cached resolver
-// without invoking the loader. On a miss-or-expired we invoke the
-// loader; if it succeeds we replace the cache; if it fails AND we
-// still hold a valid prior resolver, we return the stale resolver
-// rather than the error — sticky fallback prevents transient
-// index-DB blips from oscillating wire-protocol column order
-// between DDL and alphabetical across consecutive customer queries.
+// Caching policy:
+//   - Hit-within-TTL → return cached resolver, no loader call.
+//   - Miss-or-expired → run loader OUTSIDE the mutex (so a slow
+//     index DB does not serialise concurrent shim queries),
+//     then re-acquire to publish.
+//   - Loader fails AND a prior resolver is cached → sticky
+//     fallback: return the stale resolver rather than the error
+//     so transient index-DB blips don't oscillate wire-protocol
+//     column order between DDL and alphabetical across consecutive
+//     customer queries. Logged at Warn (rate-limited to once per
+//     TTL window) so a *persistent* outage is still operator-
+//     visible — without rate limiting a hot shim would spam the
+//     log; without warning at all the outage is invisible
+//     because the wire response still looks healthy.
+//   - Loader fails AND no prior resolver → surface the error so
+//     columnOrderFor can apply its sentinel-vs-real-error split.
 //
-// We do NOT extend the timestamp on a sticky-fallback hit: the next
-// query still tries to refresh, so a recovered DB picks up the new
-// snapshot at the next attempt rather than waiting another full TTL.
+// We do NOT extend the timestamp on a sticky-fallback hit: the
+// next query still tries to refresh, so a recovered DB picks up
+// the new snapshot at the next attempt rather than waiting
+// another full TTL.
+//
+// Thundering-herd note: N concurrent cache misses do N redundant
+// loads (instead of singleflight collapsing to 1+N-1 waits). The
+// trade-off is intentional — TTL bounds miss frequency to once
+// per 30s and shim QPS is interactive (customer-driven), so the
+// extra load cost is bounded; in exchange we avoid serialising
+// every query behind one slow loader. Add singleflight if
+// profiling shows the redundant loads matter.
 type resolverCache struct {
-	mu       sync.Mutex
-	loaded   *metadata.Resolver
-	loadedAt time.Time
+	mu           sync.Mutex
+	loaded       *metadata.Resolver
+	loadedAt     time.Time
+	lastWarnedAt time.Time // sticky-fallback Warn rate-limiter
 }
 
-// get returns a Resolver from the cache when fresh, otherwise calls
-// load. On load error: returns the stale Resolver if we have one
-// (sticky fallback) plus a nil error so the caller treats it as a
-// successful refresh; or surfaces the error when no prior resolver
-// exists so the caller can decide between sentinel-vs-real-failure
-// handling.
+// get returns the cached Resolver when fresh, otherwise invokes
+// load (outside the mutex). On load error: returns the stale
+// Resolver if cached + emits a rate-limited Warn; or surfaces the
+// error when no prior resolver exists.
 //
 // `now` is injected for deterministic tests; production passes
-// time.Now.
-func (c *resolverCache) get(now func() time.Time, ttl time.Duration, load func() (*metadata.Resolver, error)) (*metadata.Resolver, error) {
+// time.Now. logger receives the sticky-fallback Warn — pass
+// slog.Default() if you don't have a per-handler logger.
+func (c *resolverCache) get(
+	now func() time.Time,
+	ttl time.Duration,
+	load func() (*metadata.Resolver, error),
+	logger *slog.Logger,
+) (*metadata.Resolver, error) {
+	// Snapshot under lock so the publish below races with us only
+	// to its own benefit (we'd see the fresher resolver on relock).
+	c.mu.Lock()
+	cached := c.loaded
+	cachedAt := c.loadedAt
+	c.mu.Unlock()
+
+	if cached != nil && now().Sub(cachedAt) < ttl {
+		return cached, nil
+	}
+
+	r, loadErr := load()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.loaded != nil && now().Sub(c.loadedAt) < ttl {
-		return c.loaded, nil
-	}
-	r, err := load()
-	if err != nil {
+
+	if loadErr != nil {
+		// Distinguish three sub-cases on the relock:
+		//   (a) another goroutine refreshed during our load → use
+		//       the fresh resolver, no warn (it's not actually
+		//       stale).
+		//   (b) cache was empty when we started AND another
+		//       goroutine populated it → same as (a).
+		//   (c) nothing changed → genuine sticky fallback. Warn
+		//       rate-limited so the operator sees a persistent
+		//       outage but the log isn't spammed at shim QPS.
+		if c.loaded != nil && !c.loadedAt.Equal(cachedAt) {
+			return c.loaded, nil // (a) or (b)
+		}
 		if c.loaded != nil {
+			if now().Sub(c.lastWarnedAt) >= ttl {
+				logger.Warn(
+					"shim: resolver refresh failed; serving stale snapshot",
+					"err", loadErr,
+					"stale_age", now().Sub(c.loadedAt).Round(time.Second),
+				)
+				c.lastWarnedAt = now()
+			}
 			return c.loaded, nil
 		}
-		return nil, err
+		return nil, loadErr
 	}
+
 	c.loaded = r
 	c.loadedAt = now()
+	c.lastWarnedAt = time.Time{} // recovered — reset rate-limit so next outage warns immediately
 	return r, nil
 }
 
@@ -290,7 +345,7 @@ func (h *Handler) columnOrderFor(schema, table string) []string {
 	if h.resolverFn == nil {
 		return nil
 	}
-	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn)
+	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger)
 	if err != nil {
 		if errors.Is(err, metadata.ErrNoSnapshots) {
 			h.logger.Debug("shim: no snapshots yet; falling back to alphabetical column order",
@@ -446,10 +501,21 @@ func eventTypeName(t parser.EventType) string {
 //
 // Built by hand rather than via json.Marshal(map) because the stdlib
 // encoder sorts map keys alphabetically with no override hook. The
-// per-key json.Marshal calls reuse the stdlib encoder for both the
-// quoted key and the value so escaping (quotes, control chars,
-// non-printable bytes inside strings) stays correct without a
-// custom escaper here.
+// per-key json.Marshal calls reuse the stdlib encoder for the
+// quoted key and the value, so string escaping (quotes, control
+// chars, non-printable bytes) stays correct without a custom
+// escaper here.
+//
+// Failure modes (all return ""):
+//   - nil image (the documented "no image" sentinel).
+//   - any inner json.Marshal error — e.g. a value of type chan,
+//     func, NaN/Inf float, or a custom type whose MarshalJSON
+//     returns an error. None of these can appear in a row image
+//     decoded from MySQL JSON columns (parser rejects them on
+//     INSERT, json.Unmarshal rejects them on read), so the failure
+//     path is theoretical for production data; if it ever fires
+//     the customer sees a missing row image rather than a partial
+//     one, matching the original marshalImage behaviour.
 func marshalImageOrdered(image map[string]any, ddlOrder []string) string {
 	if image == nil {
 		return ""

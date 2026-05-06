@@ -9,6 +9,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -417,7 +418,7 @@ func TestColumnOrderForFallsBackOnResolverError(t *testing.T) {
 	}
 }
 
-// TestResolverCacheBehaviour pins three properties of the resolver
+// TestResolverCacheBehaviour pins five properties of the resolver
 // cache that columnOrderFor relies on. Each is documented in
 // handler.go's resolverCache type comment; this test enforces them.
 //
@@ -432,6 +433,12 @@ func TestColumnOrderForFallsBackOnResolverError(t *testing.T) {
 //     prevents transient index-DB blips from oscillating wire-
 //     protocol column order between DDL and alphabetical for the
 //     same customer connection.
+//  4. Sticky-fallback emits a Warn the first time it fires, so a
+//     persistent index-DB outage is operator-visible. Without this,
+//     a 2-hour outage is invisible because the wire response still
+//     looks healthy.
+//  5. Sticky-fallback Warns are rate-limited to one per TTL window
+//     so a hot shim doesn't spam the log under sustained outage.
 func TestResolverCacheBehaviour(t *testing.T) {
 	tableMeta := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
 		"appdb.orders": {
@@ -442,6 +449,7 @@ func TestResolverCacheBehaviour(t *testing.T) {
 			},
 		},
 	})
+	silentLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	t.Run("hit_within_ttl_skips_loader", func(t *testing.T) {
 		now := time.Unix(1_700_000_000, 0)
@@ -449,10 +457,10 @@ func TestResolverCacheBehaviour(t *testing.T) {
 		c := resolverCache{}
 		load := func() (*metadata.Resolver, error) { calls++; return tableMeta, nil }
 
-		if _, err := c.get(func() time.Time { return now }, time.Minute, load); err != nil {
+		if _, err := c.get(func() time.Time { return now }, time.Minute, load, silentLogger); err != nil {
 			t.Fatalf("first get: %v", err)
 		}
-		if _, err := c.get(func() time.Time { return now.Add(30 * time.Second) }, time.Minute, load); err != nil {
+		if _, err := c.get(func() time.Time { return now.Add(30 * time.Second) }, time.Minute, load, silentLogger); err != nil {
 			t.Fatalf("second get: %v", err)
 		}
 		if calls != 1 {
@@ -466,10 +474,10 @@ func TestResolverCacheBehaviour(t *testing.T) {
 		c := resolverCache{}
 		load := func() (*metadata.Resolver, error) { calls++; return tableMeta, nil }
 
-		if _, err := c.get(func() time.Time { return now }, time.Minute, load); err != nil {
+		if _, err := c.get(func() time.Time { return now }, time.Minute, load, silentLogger); err != nil {
 			t.Fatalf("first get: %v", err)
 		}
-		if _, err := c.get(func() time.Time { return now.Add(2 * time.Minute) }, time.Minute, load); err != nil {
+		if _, err := c.get(func() time.Time { return now.Add(2 * time.Minute) }, time.Minute, load, silentLogger); err != nil {
 			t.Fatalf("second get: %v", err)
 		}
 		if calls != 2 {
@@ -483,10 +491,10 @@ func TestResolverCacheBehaviour(t *testing.T) {
 		ok := func() (*metadata.Resolver, error) { return tableMeta, nil }
 		fail := func() (*metadata.Resolver, error) { return nil, errors.New("transient db blip") }
 
-		if _, err := c.get(func() time.Time { return now }, time.Minute, ok); err != nil {
+		if _, err := c.get(func() time.Time { return now }, time.Minute, ok, silentLogger); err != nil {
 			t.Fatalf("warm-up: %v", err)
 		}
-		got, err := c.get(func() time.Time { return now.Add(2 * time.Minute) }, time.Minute, fail)
+		got, err := c.get(func() time.Time { return now.Add(2 * time.Minute) }, time.Minute, fail, silentLogger)
 		if err != nil {
 			t.Fatalf("expected sticky fallback to mask error, got: %v", err)
 		}
@@ -498,9 +506,67 @@ func TestResolverCacheBehaviour(t *testing.T) {
 	t.Run("error_with_no_prior_cache_surfaces", func(t *testing.T) {
 		c := resolverCache{}
 		want := errors.New("first-time db unreachable")
-		_, err := c.get(time.Now, time.Minute, func() (*metadata.Resolver, error) { return nil, want })
+		_, err := c.get(time.Now, time.Minute, func() (*metadata.Resolver, error) { return nil, want }, silentLogger)
 		if !errors.Is(err, want) {
 			t.Errorf("expected first-time error to surface, got: %v", err)
+		}
+	})
+
+	t.Run("sticky_fallback_warns_first_time", func(t *testing.T) {
+		now := time.Unix(1_700_000_000, 0)
+		c := resolverCache{}
+		ok := func() (*metadata.Resolver, error) { return tableMeta, nil }
+		fail := func() (*metadata.Resolver, error) { return nil, errors.New("db gone") }
+		rec := newRecordingHandler()
+		logger := slog.New(rec)
+
+		// Warm the cache so the next failure triggers sticky fallback.
+		if _, err := c.get(func() time.Time { return now }, time.Minute, ok, logger); err != nil {
+			t.Fatalf("warm-up: %v", err)
+		}
+		// Push past TTL with a failing load. Expect Warn.
+		if _, err := c.get(func() time.Time { return now.Add(2 * time.Minute) }, time.Minute, fail, logger); err != nil {
+			t.Fatalf("get during outage: %v", err)
+		}
+
+		warns := rec.atLevel(slog.LevelWarn)
+		if len(warns) != 1 {
+			t.Fatalf("expected 1 Warn record on first sticky-fallback, got %d: %v", len(warns), rec.records)
+		}
+		if !strings.Contains(warns[0].Message, "stale snapshot") {
+			t.Errorf("expected Warn about stale snapshot, got %q", warns[0].Message)
+		}
+	})
+
+	t.Run("sticky_fallback_warn_is_rate_limited_to_one_per_ttl", func(t *testing.T) {
+		now := time.Unix(1_700_000_000, 0)
+		c := resolverCache{}
+		ok := func() (*metadata.Resolver, error) { return tableMeta, nil }
+		fail := func() (*metadata.Resolver, error) { return nil, errors.New("db gone") }
+		rec := newRecordingHandler()
+		logger := slog.New(rec)
+		ttl := time.Minute
+
+		if _, err := c.get(func() time.Time { return now }, ttl, ok, logger); err != nil {
+			t.Fatalf("warm-up: %v", err)
+		}
+		// Three failing gets close together — only the first should Warn.
+		for i, dt := range []time.Duration{2 * time.Minute, 2*time.Minute + 5*time.Second, 2*time.Minute + 30*time.Second} {
+			if _, err := c.get(func() time.Time { return now.Add(dt) }, ttl, fail, logger); err != nil {
+				t.Fatalf("get #%d during outage: %v", i, err)
+			}
+		}
+
+		if got := len(rec.atLevel(slog.LevelWarn)); got != 1 {
+			t.Errorf("expected 1 Warn within TTL window, got %d", got)
+		}
+
+		// Push past the rate-limit window — expect a second Warn.
+		if _, err := c.get(func() time.Time { return now.Add(2*time.Minute + 70*time.Second) }, ttl, fail, logger); err != nil {
+			t.Fatalf("get past rate-limit: %v", err)
+		}
+		if got := len(rec.atLevel(slog.LevelWarn)); got != 2 {
+			t.Errorf("expected 2 Warns after TTL window expires, got %d", got)
 		}
 	})
 }
@@ -513,35 +579,88 @@ func TestResolverCacheBehaviour(t *testing.T) {
 //
 // Without this test a future refactor that collapsed both error
 // paths back into the same Debug log would silently un-fix the
-// observability gap that motivated the sentinel.
+// observability gap that motivated the sentinel — the recording
+// handler asserts on the actual emitted level rather than reading
+// the source.
 func TestColumnOrderForDistinguishesNoSnapshotFromRealError(t *testing.T) {
 	cases := []struct {
 		name      string
 		err       error
 		wantLevel slog.Level
+		wantMsg   string
 	}{
-		{"no_snapshots_logs_debug", metadata.ErrNoSnapshots, slog.LevelDebug},
-		{"real_error_logs_warn", errors.New("connection refused"), slog.LevelWarn},
+		{
+			name:      "no_snapshots_logs_debug",
+			err:       metadata.ErrNoSnapshots,
+			wantLevel: slog.LevelDebug,
+			wantMsg:   "no snapshots",
+		},
+		{
+			name:      "real_error_logs_warn",
+			err:       errors.New("connection refused"),
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "schema_snapshots lookup failed",
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			rec := newRecordingHandler()
 			h := &Handler{
-				logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+				logger:     slog.New(rec),
 				resolverFn: func() (*metadata.Resolver, error) { return nil, tc.err },
 			}
 			if got := h.columnOrderFor("appdb", "orders"); got != nil {
 				t.Errorf("expected nil fallback, got %v", got)
 			}
-			// Behavioural correctness covered by the above assertion;
-			// the log-level claim is verified by reading the
-			// columnOrderFor source. We can't easily intercept slog
-			// records without rebuilding the logger machinery, and
-			// the level-split is so small (one if/else branch) that
-			// a code review catches a regression as easily as a test
-			// would. This test exists to assert the *fallback* still
-			// happens regardless of which error class fires.
+			records := rec.atLevel(tc.wantLevel)
+			if len(records) != 1 {
+				t.Fatalf("expected exactly 1 record at level %s, got %d (all records: %v)",
+					tc.wantLevel, len(records), rec.records)
+			}
+			if !strings.Contains(records[0].Message, tc.wantMsg) {
+				t.Errorf("expected message containing %q, got %q", tc.wantMsg, records[0].Message)
+			}
 		})
+	}
+}
+
+// TestColumnOrderForUsesCache pins the wiring between columnOrderFor
+// and resolverCache. Without this test, a refactor that bypassed the
+// cache (e.g. called h.resolverFn() directly) would invalidate every
+// property TestResolverCacheBehaviour pins — the cache subtests would
+// still pass because they exercise the cache type directly, not the
+// integration. The test counts loader invocations across two
+// columnOrderFor calls within the TTL window and asserts the count
+// is exactly 1.
+func TestColumnOrderForUsesCache(t *testing.T) {
+	calls := 0
+	tableMeta := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"appdb.orders": {
+			Schema: "appdb", Table: "orders",
+			Columns: []metadata.ColumnMeta{
+				{Name: "id", OrdinalPosition: 1},
+				{Name: "sku", OrdinalPosition: 2},
+			},
+		},
+	})
+	h := &Handler{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolverFn: func() (*metadata.Resolver, error) {
+			calls++
+			return tableMeta, nil
+		},
+	}
+
+	if got := h.columnOrderFor("appdb", "orders"); !slices.Equal(got, []string{"id", "sku"}) {
+		t.Fatalf("first call: %v", got)
+	}
+	if got := h.columnOrderFor("appdb", "orders"); !slices.Equal(got, []string{"id", "sku"}) {
+		t.Fatalf("second call: %v", got)
+	}
+	if calls != 1 {
+		t.Errorf("expected resolverFn to be invoked exactly once across two columnOrderFor calls "+
+			"within the TTL window (cache wiring regression?), got %d calls", calls)
 	}
 }
 
@@ -960,6 +1079,45 @@ func equalMaps(a, b map[string]any) bool {
 		}
 	}
 	return true
+}
+
+// recordingHandler is a minimal slog.Handler that captures every
+// emitted record into an in-memory slice. Used by tests that need
+// to assert log levels and messages — without it we'd have to
+// either parse a TextHandler's stringly output or skip log-level
+// verification entirely (which is what the prior weakened test
+// resorted to). Concurrent-safe so it can sit behind a logger
+// shared across goroutines if a future test exercises that path.
+type recordingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func newRecordingHandler() *recordingHandler { return &recordingHandler{} }
+
+func (h *recordingHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(_ string) slog.Handler      { return h }
+
+// atLevel returns all captured records at exactly the given level.
+func (h *recordingHandler) atLevel(level slog.Level) []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []slog.Record
+	for _, r := range h.records {
+		if r.Level == level {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // Compile-time check: TenantAuth implements the credential provider
