@@ -21,6 +21,19 @@ import (
 	"github.com/dbtrail/bintrail/internal/query"
 )
 
+// fullTableRowCap bounds the buffered resultset for the full-table
+// AS OF path (issue #276) so a query against a hot table with millions
+// of distinct PKs cannot OOM the shim. 100k rows × ~512 bytes per
+// row image ≈ 50 MB worst-case, which a forensic shim instance can
+// absorb. Exceeding the cap surfaces as ER_TOO_BIG_SELECT (1104) so
+// monitoring can distinguish it from a real shim crash; operators
+// narrow the AS OF range or fall back to PK-filtered queries.
+//
+// Streaming the resultset (Conn.WriteFieldList + WriteRow per row,
+// removing the cap) is deferred per the scoping comment on #276;
+// cap+buffered is the bounded substitute for the MVP.
+const fullTableRowCap = 100_000
+
 // resolverCacheTTL bounds how long a stale schema_snapshots view
 // can serve column-ordering lookups. 30s is short enough that a
 // fresh `bintrail snapshot` is visible within ops-monitoring time
@@ -302,19 +315,29 @@ func wrapFetchError(qType QueryType, err error) error {
 // the bintrail index + archives and reconstructs the row's state at
 // q.AsOf.
 //
-// Semantics: returns the row_after of the most recent event for that
-// PK at-or-before q.AsOf. That's the right answer for INSERT/UPDATE
-// (the post-image is the row's state). For a DELETE, we fall back to
-// the DELETE's row_before — the row's state captured at the moment
-// of deletion. A future revision could distinguish "row didn't exist
-// at AsOf" from "row was just deleted" using event_type, but the
-// MVP treats both as "here's the most recent known state".
+// Two shapes are recognised, sharing this entry point:
+//   - q.PKValue != "": single-row point-lookup. Returns the latest
+//     event's image (row_after for INSERT/UPDATE, row_before for
+//     DELETE — "last known state").
+//   - q.PKValue == "": full-table reconstruction (issue #276).
+//     Dispatches to runFullTable.
+//
+// The DELETE semantics intentionally diverge between the two paths:
+// point-lookup keeps the DELETE's row_before so a forensic operator
+// asking "what was this row?" gets an answer even past its deletion;
+// full-table SKIPS DELETEs because the row didn't exist at AS OF
+// and its presence in a `SELECT *` resultset would be wrong. The
+// split is load-bearing — see TestSelectImagePinsDeleteSemantics.
 //
 // _flashback and _snapshot share this implementation today. _snapshot
 // is intended to grow baseline-lookup support (querying the
 // dump/baseline pipeline for rows that never appeared in binlog
 // events) — that's a future iteration.
 func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
+	if q.PKValue == "" {
+		return h.runFullTable(q)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -348,6 +371,111 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 		return emptyResult(), nil
 	}
 	return imageToResult(image, h.columnOrderFor(q.Schema, q.Table))
+}
+
+// runFullTable reconstructs the full row state of a table at q.AsOf
+// (issue #276). The SQL it issues is identical to the point-lookup
+// path — query.Engine with LimitPerPK=1 and Until=q.AsOf — except
+// PKValues is empty so the windowed query returns the latest event
+// per PK across the whole table.
+//
+// DELETE handling diverges from the point-lookup path: rows whose
+// latest event is a DELETE are SKIPPED because the row did not exist
+// at q.AsOf. Including them in a `SELECT *` resultset would be
+// indistinguishable from rows that did exist, breaking the
+// "AS OF returns the table's state at that instant" contract.
+//
+// Cost guardrail: queries are capped at fullTableRowCap rows. We
+// fetch one extra row (cap+1) so the overflow is detectable; if the
+// cap is exceeded we return ER_TOO_BIG_SELECT (1104). Operators
+// narrow the AS OF range or fall back to PK-filtered queries.
+//
+// Cross-row column handling: column order is taken from the latest
+// schema_snapshots row (same DDL order as point-lookup and _diff).
+// Rows whose images carry columns missing from that snapshot get
+// those columns dropped — same behaviour as a regular MySQL
+// `SELECT *` after an ALTER TABLE that removed a column.
+func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	engine := query.New(h.indexDB)
+	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
+		Opts: query.Options{
+			Schema:     q.Schema,
+			Table:      q.Table,
+			Until:      &q.AsOf,
+			LimitPerPK: 1,
+			Limit:      fullTableRowCap + 1,
+		},
+		DBName:         h.cfg.IndexDBName,
+		NoArchive:      h.cfg.NoArchive,
+		AllowGaps:      h.cfg.AllowGaps,
+		ArchiveFetcher: h.archiveFetcher,
+	})
+	if err != nil {
+		return nil, wrapFetchError(q.Type, err)
+	}
+
+	if len(rows) > fullTableRowCap {
+		return nil, mysql.NewError(mysql.ER_TOO_BIG_SELECT, fmt.Sprintf(
+			"resolve %s: %s.%s at %s would return more than %d rows; narrow the AS OF range or filter by PK",
+			q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), fullTableRowCap,
+		))
+	}
+
+	return imagesToResult(extractFullTableImages(rows), h.columnOrderFor(q.Schema, q.Table))
+}
+
+// extractFullTableImages picks the post-image of every non-DELETE
+// event in rows. The DELETE skip is what makes full-table
+// reconstruction's contract (rows that existed at AS OF) diverge from
+// selectImage's contract (last known state, including the row_before
+// of a DELETE). The two contracts are intentionally different — see
+// TestSelectImage and TestExtractFullTableImagesPinsDivergence for
+// the regression tripwires.
+func extractFullTableImages(rows []query.ResultRow) []map[string]any {
+	images := make([]map[string]any, 0, len(rows))
+	for _, r := range rows {
+		if r.EventType == parser.EventDelete {
+			continue
+		}
+		// Empty row_after (rare — corrupted index) is dropped silently
+		// rather than emitting a row of nulls that would overstate the
+		// table's row count.
+		if len(r.RowAfter) == 0 {
+			continue
+		}
+		images = append(images, r.RowAfter)
+	}
+	return images
+}
+
+// imagesToResult is the multi-row sibling of imageToResult. The
+// column list is computed once for the whole resultset (from the
+// first non-empty image and ddlOrder) so every row in the wire
+// resultset has the same shape, with NULLs where a row's image is
+// missing a column. Empty input → empty resultset.
+func imagesToResult(images []map[string]any, ddlOrder []string) (*mysql.Result, error) {
+	if len(images) == 0 {
+		return emptyResult(), nil
+	}
+	cols := orderColumns(images[0], ddlOrder)
+
+	values := make([][]any, len(images))
+	for i, img := range images {
+		row := make([]any, len(cols))
+		for j, c := range cols {
+			row[j] = img[c]
+		}
+		values[i] = row
+	}
+
+	rs, err := mysql.BuildSimpleTextResultset(cols, values)
+	if err != nil {
+		return nil, fmt.Errorf("build resultset: %w", err)
+	}
+	return &mysql.Result{Resultset: rs}, nil
 }
 
 // columnOrderFor returns the column names of schema.table in DDL

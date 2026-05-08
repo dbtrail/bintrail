@@ -29,6 +29,37 @@ func TestParseFlashbackHappyPath(t *testing.T) {
 	}
 }
 
+// TestParseFlashbackFullTable pins the WHERE-less shape introduced
+// for full-table reconstruction (issue #276). The PK fields are empty
+// so the handler can dispatch on q.PKValue == "" without parsing the
+// SQL again.
+func TestParseFlashbackFullTable(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+	}{
+		{"bare", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00'"},
+		{"trailing_semicolon", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00';"},
+		{"lower_case", "select * from _flashback.orders as of '2026-05-02 10:00:00'"},
+		{"snapshot_variant", "SELECT * FROM _snapshot.orders AS OF '2026-05-02 10:00:00'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if q.Table != "orders" {
+				t.Errorf("Table = %q, want %q", q.Table, "orders")
+			}
+			if q.PKColumn != "" || q.PKValue != "" {
+				t.Errorf("PKColumn/PKValue must be empty for full-table shape; got col=%q val=%q",
+					q.PKColumn, q.PKValue)
+			}
+		})
+	}
+}
+
 func TestParseFlashbackCaseInsensitive(t *testing.T) {
 	q, err := Parse(
 		"select * from _flashback.users as of '2026-01-01' where email = 'a@b.com'",

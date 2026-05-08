@@ -73,17 +73,34 @@ type TimeTravelQuery struct {
 
 var (
 	// flashbackRE / snapshotRE share the same shape; they differ only
-	// in the schema-prefix literal.
-	flashbackRE = mustCompileTT(`_flashback`, `\s+AS\s+OF\s+'([^']+)'`)
-	snapshotRE  = mustCompileTT(`_snapshot`, `\s+AS\s+OF\s+'([^']+)'`)
-	diffRE      = mustCompileTT(`_diff`, `\s+BETWEEN\s+'([^']+)'\s+AND\s+'([^']+)'`)
+	// in the schema-prefix literal. WHERE is optional for AS OF queries
+	// (full-table reconstruction, issue #276); the _diff path keeps it
+	// mandatory because a PK-less _diff against a hot row would be a
+	// DoS in a wire-protocol response.
+	flashbackRE = mustCompileAsOf(`_flashback`)
+	snapshotRE  = mustCompileAsOf(`_snapshot`)
+	diffRE      = mustCompileDiff()
 )
 
-func mustCompileTT(schemaPrefix, timeClause string) *regexp.Regexp {
-	pattern := `(?i)^\s*SELECT\s+\*\s+FROM\s+` + schemaPrefix + `\.([A-Za-z_][A-Za-z0-9_]*)` +
-		timeClause +
-		`\s+WHERE\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('[^']*'|-?\d+)\s*;?\s*$`
-	return regexp.MustCompile(pattern)
+// mustCompileAsOf builds a regex for `_flashback` / `_snapshot` shapes.
+// Capture groups: 1=table, 2=timestamp, 3=col (or empty), 4=value (or empty).
+// The trailing WHERE clause is in an optional non-capturing group so the
+// PK-filtered fast path and the full-table path go through the same matcher.
+func mustCompileAsOf(schemaPrefix string) *regexp.Regexp {
+	return regexp.MustCompile(
+		`(?i)^\s*SELECT\s+\*\s+FROM\s+` + schemaPrefix + `\.([A-Za-z_][A-Za-z0-9_]*)` +
+			`\s+AS\s+OF\s+'([^']+)'` +
+			`(?:\s+WHERE\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('[^']*'|-?\d+))?` +
+			`\s*;?\s*$`,
+	)
+}
+
+func mustCompileDiff() *regexp.Regexp {
+	return regexp.MustCompile(
+		`(?i)^\s*SELECT\s+\*\s+FROM\s+_diff\.([A-Za-z_][A-Za-z0-9_]*)` +
+			`\s+BETWEEN\s+'([^']+)'\s+AND\s+'([^']+)'` +
+			`\s+WHERE\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('[^']*'|-?\d+)\s*;?\s*$`,
+	)
 }
 
 // timeFormats are the formats accepted in time literals. Order

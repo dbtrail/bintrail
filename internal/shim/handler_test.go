@@ -517,6 +517,110 @@ func TestSelectImage(t *testing.T) {
 	}
 }
 
+// TestExtractFullTableImagesPinsDivergence locks in the contract
+// divergence between full-table reconstruction (#276) and the existing
+// point-lookup path. Given the SAME DELETE event:
+//   - selectImage returns the row_before — the row's last known state.
+//   - extractFullTableImages skips it — the row didn't exist at AS OF.
+//
+// A future refactor that "unifies" the two paths would silently break
+// either point-lookup forensics or full-table correctness. Pinning
+// both behaviors against the same input here turns that into a loud
+// test failure.
+func TestExtractFullTableImagesPinsDivergence(t *testing.T) {
+	deleteRow := query.ResultRow{
+		EventType: parser.EventDelete,
+		RowBefore: map[string]any{"id": int64(1), "qty": int64(5)},
+	}
+	insertRow := query.ResultRow{
+		EventType: parser.EventInsert,
+		RowAfter:  map[string]any{"id": int64(2), "qty": int64(7)},
+	}
+
+	if got := selectImage([]query.ResultRow{deleteRow}); got == nil {
+		t.Errorf("selectImage([DELETE]) must keep row_before for point-lookup; got nil")
+	}
+	if got := extractFullTableImages([]query.ResultRow{deleteRow}); len(got) != 0 {
+		t.Errorf("extractFullTableImages([DELETE]) must skip the row; got %v", got)
+	}
+
+	mixed := []query.ResultRow{insertRow, deleteRow, insertRow}
+	images := extractFullTableImages(mixed)
+	if len(images) != 2 {
+		t.Errorf("extractFullTableImages: DELETE must be skipped, kept rows = %d, want 2", len(images))
+	}
+}
+
+// TestImagesToResultBuildsResultset covers the multi-row resultset
+// builder added for #276. The single-row imageToResult path is
+// covered by TestImageToResultColumnOrder / TestImageToResultRespectsDDLOrder.
+func TestImagesToResultBuildsResultset(t *testing.T) {
+	cases := []struct {
+		name     string
+		images   []map[string]any
+		ddlOrder []string
+		wantRows int
+		wantCols []string
+	}{
+		{
+			name:     "empty_input_returns_empty_resultset",
+			images:   nil,
+			wantRows: 0,
+			wantCols: []string{"_flashback"},
+		},
+		{
+			name:     "single_row_uses_ddl_order",
+			images:   []map[string]any{{"id": 1, "sku": "ABC", "qty": 3}},
+			ddlOrder: []string{"id", "sku", "qty"},
+			wantRows: 1,
+			wantCols: []string{"id", "sku", "qty"},
+		},
+		{
+			name: "multi_row_uses_first_image_for_columns",
+			images: []map[string]any{
+				{"id": 1, "sku": "A", "qty": 1},
+				{"id": 2, "sku": "B", "qty": 2},
+				{"id": 3, "sku": "C", "qty": 3},
+			},
+			ddlOrder: []string{"id", "sku", "qty"},
+			wantRows: 3,
+			wantCols: []string{"id", "sku", "qty"},
+		},
+		{
+			// A row missing a column known to ddlOrder gets a NULL
+			// in that position rather than failing the whole query —
+			// this mirrors how MySQL itself handles a column added
+			// after some rows already existed.
+			name: "row_missing_column_yields_null",
+			images: []map[string]any{
+				{"id": 1, "sku": "A", "qty": 1},
+				{"id": 2, "sku": "B"},
+			},
+			ddlOrder: []string{"id", "sku", "qty"},
+			wantRows: 2,
+			wantCols: []string{"id", "sku", "qty"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := imagesToResult(tc.images, tc.ddlOrder)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(res.Resultset.RowDatas); got != tc.wantRows {
+				t.Errorf("rows = %d, want %d", got, tc.wantRows)
+			}
+			gotCols := make([]string, len(res.Resultset.Fields))
+			for i, f := range res.Resultset.Fields {
+				gotCols[i] = string(f.Name)
+			}
+			if !slices.Equal(gotCols, tc.wantCols) {
+				t.Errorf("cols = %v, want %v", gotCols, tc.wantCols)
+			}
+		})
+	}
+}
+
 // TestImageToResultEmpty — an empty image (zero-key map) should
 // produce a resultset with no rows.
 func TestImageToResultEmpty(t *testing.T) {

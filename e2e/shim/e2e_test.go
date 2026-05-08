@@ -253,6 +253,59 @@ func TestShimEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("flashback_full_table_no_where_at_pre_delete", func(t *testing.T) {
+		// Issue #276: SELECT * FROM _flashback.orders AS OF '...' (no
+		// WHERE) reconstructs the table's full row state at AS OF.
+		// AS OF 13:00 → after the 12:00 UPDATE (qty=2), before the
+		// 14:00 DELETE. The seed has exactly one row (id=42), so the
+		// resultset must contain exactly one row with the post-UPDATE
+		// image — pinning both the row count (full-table works) and
+		// the content (it's the right reconstructed image).
+		gotCols, rows := queryAllRowsWithCols(t, clientDB,
+			"SELECT * FROM _flashback.orders AS OF '2026-05-04 13:00:00'")
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row at AS OF 13:00, got %d: %+v", len(rows), rows)
+		}
+		want := map[string]string{"id": "42", "sku": "ABC-1", "qty": "2", "note": "initial"}
+		if !maps.Equal(rows[0], want) {
+			t.Errorf("full-table row mismatch:\n  got:  %+v\n  want: %+v", rows[0], want)
+		}
+		// DDL order must hold for the multi-row resultset shape too —
+		// alphabetical (id, note, qty, sku) would be a regression.
+		wantCols := []string{"id", "sku", "qty", "note"}
+		if !slices.Equal(gotCols, wantCols) {
+			t.Errorf("full-table column order = %v, want %v", gotCols, wantCols)
+		}
+	})
+
+	t.Run("flashback_full_table_at_post_delete", func(t *testing.T) {
+		// AS OF 15:00 → after the 14:00 DELETE. id=42 must be SKIPPED
+		// (didn't exist at AS OF), distinguishing full-table semantics
+		// from point-lookup which would return the DELETE's row_before.
+		_, rows := queryAllRowsWithCols(t, clientDB,
+			"SELECT * FROM _flashback.orders AS OF '2026-05-04 15:00:00'")
+		if len(rows) != 0 {
+			t.Fatalf("expected 0 rows after DELETE, got %d: %+v\n"+
+				"if 1 row, the full-table path is leaking row_before from DELETEs",
+				len(rows), rows)
+		}
+	})
+
+	t.Run("flashback_full_table_at_pre_update", func(t *testing.T) {
+		// AS OF 11:00 → after the 10:00 INSERT (qty=1), before the
+		// 12:00 UPDATE. Pins that the windowed query picks the latest
+		// event ≤ AS OF, not the most recent of all time.
+		_, rows := queryAllRowsWithCols(t, clientDB,
+			"SELECT * FROM _flashback.orders AS OF '2026-05-04 11:00:00'")
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row at AS OF 11:00, got %d", len(rows))
+		}
+		want := map[string]string{"id": "42", "sku": "ABC-1", "qty": "1", "note": "initial"}
+		if !maps.Equal(rows[0], want) {
+			t.Errorf("pre-UPDATE row mismatch:\n  got:  %+v\n  want: %+v", rows[0], want)
+		}
+	})
+
 	t.Run("malformed_time_travel_returns_1064_not_1105", func(t *testing.T) {
 		// Issue #277: a virtual-schema query that doesn't match any
 		// supported shape used to surface as ER_UNKNOWN_ERROR (1105),
@@ -400,6 +453,54 @@ func queryRowMapWithCols(t *testing.T, db *sql.DB, q string) ([]string, map[stri
 
 	if rows.Next() {
 		t.Fatalf("expected exactly one row, got at least two")
+	}
+	return cols, out
+}
+
+// queryAllRowsWithCols is the multi-row sibling of queryRowMapWithCols
+// for full-table _flashback queries (#276). Returns column order
+// (must match DDL) and a slice of {column → value} maps, one per
+// row. Zero rows is a valid return — the caller decides whether
+// that's correct (e.g. AS OF after DELETE) or a bug (no events
+// matched a query that should have hit data).
+func queryAllRowsWithCols(t *testing.T, db *sql.DB, q string) ([]string, []map[string]string) {
+	t.Helper()
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatalf("ping before query: %v", err)
+	}
+	rows, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("columns: %v", err)
+	}
+
+	var out []map[string]string
+	for rows.Next() {
+		raw := make([]sql.RawBytes, len(cols))
+		dest := make([]any, len(cols))
+		for i := range raw {
+			dest[i] = &raw[i]
+		}
+		if err := rows.Scan(dest...); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		row := make(map[string]string, len(cols))
+		for i, c := range cols {
+			if raw[i] == nil {
+				row[c] = "<nil>"
+				continue
+			}
+			row[c] = string(raw[i])
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows err: %v", err)
 	}
 	return cols, out
 }

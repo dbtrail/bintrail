@@ -225,8 +225,14 @@ func TestShim_MalformedTimeTravelReturnsWireError(t *testing.T) {
 			wantErrSubstr: "BETWEEN bounds out of order",
 		},
 		{
-			name:          "snapshot missing WHERE",
-			sql:           "SELECT * FROM _snapshot.users AS OF '2026-01-01 00:00:00'",
+			// Pre-#276 this case was "_snapshot AS OF without WHERE";
+			// since #276 that's now the valid full-table shape. Use
+			// _snapshot without AS OF so the regex still rejects the
+			// query and the malformed-time-travel branch fires —
+			// keeps all three virtual schemas exercised in the wire
+			// path.
+			name:          "snapshot missing AS OF",
+			sql:           "SELECT * FROM _snapshot.users WHERE id = 1",
 			wantErrSubstr: "malformed time-travel",
 		},
 	}
