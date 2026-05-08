@@ -201,7 +201,23 @@ func runShim(cmd *cobra.Command, args []string) error {
 		IndexDBName: dsnCfg.DBName,
 		AuthMethod:  shAuthMethod,
 	}
-	serveLoop(ctx, listener, db, auth, cfg, userSchemas)
+	// Build the *server.Server once at startup, not per connection:
+	//
+	//  - typo in --auth-method fails the daemon immediately rather than
+	//    silently dropping every incoming connection (which would log
+	//    server-side and look like a TCP close to the client),
+	//  - the caching_sha2_password cache is per-Server (sync.Map at
+	//    server_conf.go:58 in go-mysql v1.13.0); a per-connection
+	//    Server resets the cache on every accept and the "caching" in
+	//    the plugin name silently does nothing,
+	//  - RSA-2048 keypair generation runs once per process (~50ms) not
+	//    once per connection. *server.Server is goroutine-safe by
+	//    upstream design — per-connection state lives on *server.Conn.
+	srv, err := shim.NewMySQLServer(cfg.AuthMethod)
+	if err != nil {
+		return fmt.Errorf("auth method: %w", err)
+	}
+	serveLoop(ctx, listener, db, srv, auth, cfg, userSchemas)
 	return nil
 }
 
@@ -215,7 +231,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 // hiccup doesn't burn CPU and a permanent listener wedge doesn't fill
 // the log at ~10 lines/sec. The backoff resets to zero on every
 // successful Accept so a brief spike doesn't poison the steady state.
-func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
+func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
@@ -246,7 +262,7 @@ func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			handleConn(c, db, auth, cfg, userSchemas)
+			handleConn(c, db, srv, auth, cfg, userSchemas)
 		}(conn)
 	}
 }
@@ -384,19 +400,10 @@ func buildUserSchemas(tenantCfgs []shim.TenantConfig) map[string]string {
 // we don't know the tenant — and an explicit `USE` from the client
 // still wins because UseDB is called sequentially and overwrites the
 // seeded value.
-func handleConn(c net.Conn, db *sql.DB, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
+func handleConn(c net.Conn, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
 	defer c.Close()
 
 	handler := shim.NewHandlerWithConfig(db, cfg, slog.Default())
-	srv, err := shim.NewMySQLServer(cfg.AuthMethod)
-	if err != nil {
-		// Operator misconfiguration (unsupported AuthMethod string).
-		// Cobra's RunE catches this for the CLI path; this connection
-		// path runs per-conn so we log and drop. cfg is process-wide
-		// so the same error fires on every connection until restart.
-		slog.Error("shim: NewMySQLServer failed; closing connection", "err", err, "remote", c.RemoteAddr())
-		return
-	}
 	mysqlConn, err := server.NewCustomizedConn(c, srv, auth, handler)
 	if err != nil {
 		level, msg := classifyHandshakeErr(err)

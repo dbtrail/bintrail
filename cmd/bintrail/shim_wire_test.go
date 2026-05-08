@@ -41,6 +41,13 @@ func startTestShimWithConfig(t *testing.T, tenants map[string]string, userSchema
 	if err != nil {
 		t.Fatalf("NewTenantAuth: %v", err)
 	}
+	// Build the *server.Server in the same place runShim does so the
+	// test exercises the production lifetime: one Server per process,
+	// shared sync.Map cache across connections.
+	srv, err := shim.NewMySQLServer(cfg.AuthMethod)
+	if err != nil {
+		t.Fatalf("NewMySQLServer: %v", err)
+	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -53,7 +60,7 @@ func startTestShimWithConfig(t *testing.T, tenants map[string]string, userSchema
 		defer close(done)
 		// indexDB=nil: handler construction does not dereference it
 		// and the test queries never reach a path that would.
-		serveLoop(ctx, listener, (*sql.DB)(nil), auth, cfg, userSchemas)
+		serveLoop(ctx, listener, (*sql.DB)(nil), srv, auth, cfg, userSchemas)
 	}()
 
 	t.Cleanup(func() {
@@ -112,17 +119,18 @@ func pingWithUser(t *testing.T, addr, user, pass string) error {
 // `caching_sha2_password` instead of `mysql_native_password`.
 //
 // Why this test, not just unit tests on NewMySQLServer:
-//   - go-mysql/server's full-auth path dereferences
-//     tlsConfig.Certificates[0].PrivateKey on cache miss
-//     (auth_switch_response.go:98 in v1.13.0). A regression that
-//     handed back a tlsConfig without an RSA private key (or no
-//     tlsConfig at all) would unit-test green via NewMySQLServer
-//     returning a non-nil *Server, then NIL-deref on the first SHA2
-//     handshake. This test catches that.
+//   - go-mysql/server's full-auth path (handleAuthSwitchResponse's
+//     RSA-OAEP decrypt branch in v1.13.0) dereferences
+//     tlsConfig.Certificates[0].PrivateKey on cache miss. A
+//     regression that handed back a tlsConfig without an RSA private
+//     key (or no tlsConfig at all) would unit-test green via
+//     NewMySQLServer returning a non-nil *Server, then NIL-deref on
+//     the first SHA2 handshake. This test catches that.
 //   - TenantAuth is NOT *InMemoryProvider, so every first connection
-//     for a tenant takes the cache-miss path (fast-auth shortcut at
-//     auth.go:156 only fires for InMemoryProvider). The wire
-//     handshake here exercises that exact path.
+//     for a tenant takes the cache-miss path
+//     (compareCacheSha2PasswordAuthData's fast-auth shortcut only
+//     fires for *InMemoryProvider). The wire handshake here
+//     exercises that exact path.
 //
 // Cleartext password storage (allowCleartextPasswords=true) is
 // required by go-sql-driver when negotiating SHA2 over a non-TLS
@@ -149,6 +157,73 @@ func TestShim_CachingSha2PasswordHandshake(t *testing.T) {
 		t.Fatalf("Ping under caching_sha2_password: %v\n"+
 			"if this is a NIL-deref, generateSelfSignedTLS regressed and the "+
 			"tlsConfig no longer carries a usable RSA private key", err)
+	}
+}
+
+// TestShim_CachingSha2PasswordRejectsCrossTenant pins that credential
+// isolation between tenants — already covered for native_password by
+// TestShim_AuthCredentialMatrix — also holds under SHA2. The full-auth
+// path runs different code (RSA-OAEP decrypt → compare against
+// GetCredential's returned cleartext); a future regression where, say,
+// the decrypted bytes were compared against the wrong tenant's stored
+// password would not be caught by the native-password matrix.
+func TestShim_CachingSha2PasswordRejectsCrossTenant(t *testing.T) {
+	tenants := map[string]string{"alice": "secret_a", "bob": "secret_b"}
+	addr := startTestShimWithConfig(t, tenants, nil, shim.Config{
+		AuthMethod: "caching_sha2_password",
+	})
+
+	// alice's username + bob's password. Must surface as 1045
+	// (ER_ACCESS_DENIED_ERROR), same code as the native-password
+	// matrix — anything else (especially a successful auth) is a
+	// silent credential-leak regression.
+	dsn := fmt.Sprintf("alice:secret_b@tcp(%s)/?timeout=2s&allowCleartextPasswords=true&tls=skip-verify",
+		addr)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = db.PingContext(ctx)
+	if err == nil {
+		t.Fatal("cross-tenant Ping should fail under caching_sha2_password; got nil error (silent credential leak)")
+	}
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		t.Fatalf("expected *mysql.MySQLError, got %T: %v", err, err)
+	}
+	if mysqlErr.Number != 1045 {
+		t.Errorf("expected 1045 ER_ACCESS_DENIED_ERROR, got %d: %s", mysqlErr.Number, mysqlErr.Message)
+	}
+}
+
+// TestShim_Sha256PasswordHandshake is the wire smoke for the third
+// supported auth method. NewMySQLServer accepts it, but unlike
+// caching_sha2_password the sha256_password path uses a different
+// state machine in go-mysql/server (no caching layer). A unit test
+// "constructor returns non-nil" gives weak evidence; this end-to-end
+// Ping pins that the cert-driven full-auth round-trip works.
+func TestShim_Sha256PasswordHandshake(t *testing.T) {
+	tenants := map[string]string{"alice": "secret_a"}
+	addr := startTestShimWithConfig(t, tenants, nil, shim.Config{
+		AuthMethod: "sha256_password",
+	})
+
+	dsn := fmt.Sprintf("alice:secret_a@tcp(%s)/?timeout=2s&allowCleartextPasswords=true&tls=skip-verify",
+		addr)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("Ping under sha256_password: %v", err)
 	}
 }
 

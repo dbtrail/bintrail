@@ -16,7 +16,14 @@ import (
 )
 
 // NewMySQLServer returns a *server.Server configured for the
-// requested auth method.
+// requested auth method. Call once per shim process at startup and
+// share the result across every connection — the underlying
+// *server.Server holds the caching_sha2_password sync.Map cache that
+// makes "caching" in the plugin name actually do something. A
+// per-connection construction would reset the cache every accept and
+// silently force every auth through the full RSA-decrypt path. The
+// upstream library is goroutine-safe by design — per-connection state
+// lives on *server.Conn, not *server.Server.
 //
 //   - "" (default) → mysql_native_password via server.NewDefaultServer.
 //     Behaviour is unchanged from pre-#274 deployments.
@@ -24,14 +31,17 @@ import (
 //     opt-in.
 //   - "caching_sha2_password" / "sha256_password" → server.NewServer
 //     with an in-memory self-signed RSA keypair. The pubKey + tlsConfig
-//     pair satisfies go-mysql/server's full-auth path, which dereferences
-//     tlsConfig.Certificates[0].PrivateKey on cache miss
-//     (auth_switch_response.go:98 in v1.13.0).
+//     pair satisfies go-mysql/server's full-auth path, which
+//     dereferences tlsConfig.Certificates[0].PrivateKey on cache miss
+//     (the (*Conn).handleAuthSwitchResponse RSA-OAEP decrypt branch in
+//     go-mysql v1.13.0 — function name anchored so this comment
+//     doesn't rot if go-mysql renumbers lines).
 //
-// The keypair is regenerated on every shim restart. Clients that cache
-// the server's public key must refresh after a bounce — fine for
-// forensic shims that rarely restart; persisting the key to disk is a
-// future fix when an operator complains about the bounce churn.
+// The keypair is generated once at startup; subsequent shim restarts
+// produce a fresh keypair. Clients that cache the server's public key
+// must refresh after a bounce — fine for forensic shims that rarely
+// restart; persisting the key to disk is a future fix when an
+// operator complains about the bounce churn.
 //
 // Returns an error rather than panicking on an unsupported method so
 // the CLI can surface the message via cobra rather than fataling

@@ -227,15 +227,18 @@ type Config struct {
 	// per-tenant override would plumb through here.
 	FullTableRowCap int
 	// AuthMethod selects the MySQL auth plugin the shim advertises
-	// during the handshake (issue #274). Empty (default) keeps the
-	// historical mysql_native_password path so existing deployments
-	// see no behaviour change. mysql_native_password is deprecated
-	// in MySQL 8.0+ and disabled by default in 8.4 — operators on a
-	// fresh 8.4+ instance with the plugin disabled set this to
-	// "caching_sha2_password" (or "sha256_password") to authenticate
-	// without re-enabling deprecated auth. Requires ProxySQL 2.7+
-	// upstream of the shim (the LTS 2.6 line is not verified to
-	// negotiate SHA2 against backends).
+	// during the handshake (issue #274). Valid values are listed by
+	// NewMySQLServer; the four accepted spellings are: "" (default),
+	// "mysql_native_password", "caching_sha2_password", and
+	// "sha256_password". Empty keeps the historical mysql_native_password
+	// path so existing deployments see no behaviour change.
+	// mysql_native_password is deprecated in MySQL 8.0+ and disabled
+	// by default in 8.4 — operators on a fresh 8.4+ instance with the
+	// plugin disabled set this to "caching_sha2_password" (or
+	// "sha256_password") to authenticate without re-enabling
+	// deprecated auth. Requires ProxySQL 2.7+ upstream of the shim
+	// (the LTS 2.6 line is not verified to negotiate SHA2 against
+	// backends).
 	AuthMethod string
 }
 

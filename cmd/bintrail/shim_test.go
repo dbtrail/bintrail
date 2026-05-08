@@ -136,9 +136,9 @@ func TestServeLoopExitsOnContextCancel(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		// db / auth / cfg are unused on this path because Accept
+		// db / srv / auth / cfg are unused on this path because Accept
 		// never returns a connection — handleConn is unreachable.
-		serveLoop(ctx, listener, nil, shim.TenantAuth{}, shim.Config{}, nil)
+		serveLoop(ctx, listener, nil, nil, shim.TenantAuth{}, shim.Config{}, nil)
 		close(done)
 	}()
 
