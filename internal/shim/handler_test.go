@@ -142,6 +142,72 @@ func TestHandlerWireErrorCodes(t *testing.T) {
 			}
 		})
 	}
+
+	// The "no USE <db>" path is structurally distinct: parser sees a
+	// virtual schema prefix but no default DB and returns its own
+	// error before even attempting the regex match. Pin this case
+	// separately so a future split between "syntax error" (1064) and
+	// "session-state error" (e.g. 1046) is a deliberate decision, not
+	// a silent regression.
+	t.Run("missing_use_db_returns_1064", func(t *testing.T) {
+		h := NewHandler(nil, nil) // deliberately no UseDB
+		_, err := h.HandleQuery("SELECT * FROM _flashback.orders AS OF '2026-01-01' WHERE id = 1")
+		if err == nil {
+			t.Fatal("expected error when no schema is selected")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) {
+			t.Fatalf("expected *mysql.MyError, got %T: %v", err, err)
+		}
+		if myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Errorf("wire code = %d, want %d (msg=%q)", myErr.Code, gomysql.ER_PARSE_ERROR, myErr.Message)
+		}
+	})
+}
+
+// TestHandlerInternalErrorsKeepDefaultWireCode pins the *inverse* half
+// of #277's contract: failures inside runPointInTime / runDiff (DB
+// timeouts, FetchMerged errors, archive_state lookup failures) must
+// NOT be wrapped in *mysql.MyError so go-mysql/server emits the
+// catch-all ER_UNKNOWN_ERROR (1105). A future refactor that wraps
+// these in mysql.NewError(ER_PARSE_ERROR, ...) would silently flip
+// "the server is broken" into "your query is malformed" — exactly
+// the user-vs-server-fault confusion #277 was filed to eliminate.
+func TestHandlerInternalErrorsKeepDefaultWireCode(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// archive_state lookup is the first DB hop runPointInTime takes
+	// via FetchMerged → ResolveArchiveSources. Make it fail and the
+	// failure propagates back through runPointInTime as a plain
+	// fmt.Errorf("resolve %s: %w", ...).
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery("FROM archive_state").
+		WillReturnError(errors.New("simulated archive_state lookup failure"))
+
+	h := &Handler{
+		indexDB: db,
+		cfg:     Config{IndexDBName: "bintrail_index"},
+		logger:  slog.Default(),
+		archiveFetcher: func(ctx context.Context, opts query.Options, src string) ([]query.ResultRow, error) {
+			return nil, nil
+		},
+	}
+	h.UseDB("myapp")
+
+	_, err = h.HandleQuery("SELECT * FROM _flashback.orders AS OF '2026-01-01 00:00:00' WHERE id = 1")
+	if err == nil {
+		t.Fatal("expected error from failing archive_state lookup")
+	}
+	var myErr *gomysql.MyError
+	if errors.As(err, &myErr) {
+		t.Errorf("internal failure must NOT be wrapped in *mysql.MyError "+
+			"(go-mysql/server would then emit %d instead of the catch-all 1105); "+
+			"got code=%d msg=%q", myErr.Code, myErr.Code, myErr.Message)
+	}
 }
 
 // TestHandlerUseDBStoresSchema — the schema set via UseDB is held

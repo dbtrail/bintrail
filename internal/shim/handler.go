@@ -257,7 +257,11 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 		// (or its AS OF literal, or the missing USE <db>). Wire it as
 		// ER_PARSE_ERROR (1064) — the same code MySQL uses for any SQL
 		// syntax error — so ORMs and monitoring can tell user input from
-		// a server crash. Internal errors below keep the default 1105.
+		// a server crash. Failures from runPointInTime / runDiff (DB
+		// timeouts, FetchMerged errors, resultset-build bugs) keep
+		// returning plain fmt.Errorf so go-mysql/server emits 1105 —
+		// that is the inverse half of the contract and #277 explicitly
+		// asks to preserve it.
 		return nil, mysql.NewError(mysql.ER_PARSE_ERROR, perr.Error())
 	}
 
