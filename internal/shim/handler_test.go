@@ -94,6 +94,56 @@ func TestHandlerRejectsNonFlashbackQuery(t *testing.T) {
 	}
 }
 
+// TestHandlerWireErrorCodes pins the wire codes the shim returns to
+// MySQL clients. ORMs and monitoring rely on these to tell user input
+// errors apart from server crashes; an untyped `fmt.Errorf` collapses
+// to ER_UNKNOWN_ERROR (1105) which is the wrong signal.
+//
+//   - malformed time-travel (recognised virtual schema, bad shape) → 1064
+//   - non-time-travel routed to the shim                            → 1235
+func TestHandlerWireErrorCodes(t *testing.T) {
+	h := NewHandler(nil, nil)
+	h.UseDB("myapp")
+
+	cases := []struct {
+		name    string
+		query   string
+		wantErr uint16
+	}{
+		{
+			name:    "malformed_flashback_missing_as_of",
+			query:   "SELECT * FROM _flashback.orders WHERE id = 1",
+			wantErr: gomysql.ER_PARSE_ERROR,
+		},
+		{
+			name:    "malformed_diff_bad_between",
+			query:   "SELECT * FROM _diff.orders WHERE id = 1",
+			wantErr: gomysql.ER_PARSE_ERROR,
+		},
+		{
+			name:    "non_time_travel_query",
+			query:   "SELECT * FROM orders WHERE id = 1",
+			wantErr: gomysql.ER_NOT_SUPPORTED_YET,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := h.HandleQuery(tc.query)
+			if err == nil {
+				t.Fatalf("expected error for %q", tc.query)
+			}
+			var myErr *gomysql.MyError
+			if !errors.As(err, &myErr) {
+				t.Fatalf("expected *mysql.MyError so server emits a typed wire code, got %T: %v", err, err)
+			}
+			if myErr.Code != tc.wantErr {
+				t.Errorf("wire code = %d, want %d (msg=%q)", myErr.Code, tc.wantErr, myErr.Message)
+			}
+		})
+	}
+}
+
 // TestHandlerUseDBStoresSchema — the schema set via UseDB is held
 // for use by subsequent HandleQuery calls. The end-to-end coverage
 // for "UseDB then run flashback" lives in TestEndToEndHandshake; here

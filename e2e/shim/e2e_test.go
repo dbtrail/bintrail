@@ -253,6 +253,30 @@ func TestShimEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("malformed_time_travel_returns_1064_not_1105", func(t *testing.T) {
+		// Issue #277: a virtual-schema query that doesn't match any
+		// supported shape used to surface as ER_UNKNOWN_ERROR (1105),
+		// the catch-all "server is broken" code. ORMs and monitoring
+		// can't distinguish that from a real shim crash. The shim now
+		// emits ER_PARSE_ERROR (1064) — the same code MySQL returns
+		// for any SQL syntax error — so user typos vs. server faults
+		// are operationally distinct on the wire.
+		_, err := clientDB.Query(
+			"SELECT * FROM _flashback.orders WHERE id = 42")
+		if err == nil {
+			t.Fatalf("expected error for malformed _flashback query (no AS OF)")
+		}
+		var mysqlErr *mysql.MySQLError
+		if !errors.As(err, &mysqlErr) {
+			t.Fatalf("expected *mysql.MySQLError, got %T: %v", err, err)
+		}
+		if mysqlErr.Number != 1064 {
+			t.Fatalf("expected error code 1064 (ER_PARSE_ERROR), got %d: %s\n"+
+				"if 1105, the shim regressed to fmt.Errorf for malformed time-travel",
+				mysqlErr.Number, mysqlErr.Message)
+		}
+	})
+
 	t.Run("passthrough_query_hits_real_mysql_not_shim", func(t *testing.T) {
 		// `appdb.orders` (no virtual schema) must route to the
 		// passthrough hostgroup. The live row has marker values

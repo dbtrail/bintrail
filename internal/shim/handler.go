@@ -253,17 +253,22 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 		}
 	}
 	if !errors.Is(perr, ErrNotTimeTravel) {
-		return nil, perr
+		// Parser recognised a virtual-schema query but rejected its shape
+		// (or its AS OF literal, or the missing USE <db>). Wire it as
+		// ER_PARSE_ERROR (1064) — the same code MySQL uses for any SQL
+		// syntax error — so ORMs and monitoring can tell user input from
+		// a server crash. Internal errors below keep the default 1105.
+		return nil, mysql.NewError(mysql.ER_PARSE_ERROR, perr.Error())
 	}
 
 	if isHandshakeNoise(qstr) {
 		return &mysql.Result{Status: 2}, nil
 	}
 
-	return nil, fmt.Errorf(
+	return nil, mysql.NewError(mysql.ER_NOT_SUPPORTED_YET, fmt.Sprintf(
 		"this server only handles _flashback / _snapshot / _diff virtual-schema queries; got: %s",
 		strings.TrimSpace(qstr),
-	)
+	))
 }
 
 // runPointInTime resolves a _flashback or _snapshot query against
