@@ -1,7 +1,9 @@
 package shim
 
 import (
+	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/x509"
 	"encoding/pem"
 	"strings"
@@ -57,12 +59,20 @@ func TestNewMySQLServerRejectsUnknownMethod(t *testing.T) {
 
 // TestGenerateSelfSignedTLSProducesUsableArtifacts verifies the helper
 // returns a TLS config whose cert exposes an RSA private key (the
-// thing go-mysql/server's full-auth path dereferences at
-// auth_switch_response.go:98) and a PEM-encoded RSA public key (the
-// pubKey argument NewServer requires). A regression that returned a
-// nil tlsConfig, an EC key, or an empty PEM block would surface as a
-// nil-deref / type assertion panic on the first SHA2 cache miss —
-// catch it at unit test time instead.
+// thing go-mysql/server's RSA-OAEP decrypt branch in
+// (*Conn).handleAuthSwitchResponse dereferences) and a PEM-encoded RSA
+// public key (the pubKey argument NewServer requires). A regression
+// that returned a nil tlsConfig, an EC key, or an empty PEM block
+// would surface as a nil-deref / type assertion panic on the first
+// SHA2 cache miss — catch it at unit test time instead.
+//
+// The OAEP round-trip at the end is the load-bearing assertion: a
+// keypair-shape regression where pubKeyPEM and tlsConfig carried
+// keys with the same modulus but mismatched OAEP parameters (or a
+// future change that swapped SHA1 for a hash the upstream library
+// doesn't use) would produce a unit-green result and fail at runtime.
+// Performing the actual encrypt/decrypt the wire path performs
+// pins the contract.
 func TestGenerateSelfSignedTLSProducesUsableArtifacts(t *testing.T) {
 	pubKeyPEM, tlsConfig, err := generateSelfSignedTLS()
 	if err != nil {
@@ -90,8 +100,27 @@ func TestGenerateSelfSignedTLSProducesUsableArtifacts(t *testing.T) {
 	if !ok {
 		t.Fatalf("parsed pubKey must be *rsa.PublicKey, got %T", parsed)
 	}
-	if parsedRSA.N.Cmp(priv.PublicKey.N) != 0 {
+	if !parsedRSA.Equal(&priv.PublicKey) {
 		t.Error("pubKeyPEM does not match the private key in tlsConfig (key pair mismatch — full auth would fail to round-trip)")
+	}
+
+	// OAEP round-trip with sha1.New — this is the exact algorithm
+	// go-mysql's RSA-OAEP decrypt branch uses
+	// (rsa.DecryptOAEP(sha1.New(), rand.Reader, ...)). A regression
+	// where the keypair were mis-sized for OAEP-SHA1 — e.g. a 512-bit
+	// key would fail "message too long for RSA key size" at runtime —
+	// fails this assertion instead.
+	plaintext := []byte("password-secret_a-salt-AAAAAAAAAAAAAAAAAAAA")
+	ciphertext, err := rsa.EncryptOAEP(sha1.New(), rand.Reader, &priv.PublicKey, plaintext, nil)
+	if err != nil {
+		t.Fatalf("rsa.EncryptOAEP with returned pubKey: %v", err)
+	}
+	decrypted, err := rsa.DecryptOAEP(sha1.New(), rand.Reader, priv, ciphertext, nil)
+	if err != nil {
+		t.Fatalf("rsa.DecryptOAEP with returned privKey: %v", err)
+	}
+	if string(decrypted) != string(plaintext) {
+		t.Errorf("OAEP round-trip mismatch: got %q, want %q", decrypted, plaintext)
 	}
 }
 

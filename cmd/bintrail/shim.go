@@ -206,10 +206,10 @@ func runShim(cmd *cobra.Command, args []string) error {
 	//  - typo in --auth-method fails the daemon immediately rather than
 	//    silently dropping every incoming connection (which would log
 	//    server-side and look like a TCP close to the client),
-	//  - the caching_sha2_password cache is per-Server (sync.Map at
-	//    server_conf.go:58 in go-mysql v1.13.0); a per-connection
-	//    Server resets the cache on every accept and the "caching" in
-	//    the plugin name silently does nothing,
+	//  - the caching_sha2_password cache is per-Server (the
+	//    Server.cacheShaPassword sync.Map field in go-mysql v1.13.0);
+	//    a per-connection Server resets the cache on every accept and
+	//    the "caching" in the plugin name silently does nothing,
 	//  - RSA-2048 keypair generation runs once per process (~50ms) not
 	//    once per connection. *server.Server is goroutine-safe by
 	//    upstream design — per-connection state lives on *server.Conn.

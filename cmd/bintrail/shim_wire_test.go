@@ -119,8 +119,8 @@ func pingWithUser(t *testing.T, addr, user, pass string) error {
 // `caching_sha2_password` instead of `mysql_native_password`.
 //
 // Why this test, not just unit tests on NewMySQLServer:
-//   - go-mysql/server's full-auth path (handleAuthSwitchResponse's
-//     RSA-OAEP decrypt branch in v1.13.0) dereferences
+//   - go-mysql/server's full-auth path (the RSA-OAEP decrypt branch
+//     inside (*Conn).handleAuthSwitchResponse in v1.13.0) dereferences
 //     tlsConfig.Certificates[0].PrivateKey on cache miss. A
 //     regression that handed back a tlsConfig without an RSA private
 //     key (or no tlsConfig at all) would unit-test green via
@@ -132,19 +132,21 @@ func pingWithUser(t *testing.T, addr, user, pass string) error {
 //     fires for *InMemoryProvider). The wire handshake here
 //     exercises that exact path.
 //
-// Cleartext password storage (allowCleartextPasswords=true) is
-// required by go-sql-driver when negotiating SHA2 over a non-TLS
-// connection that uses a self-signed cert the client has no way to
-// verify. ProxySQL, the production caller, has its own backend
-// password handling and does not require this driver flag.
+// DSN deliberately omits any `tls=` / `allowCleartextPasswords` flag.
+// With TLS enabled (`tls=skip-verify`), go-mysql's SHA2 server takes
+// the cleartext-over-TLS branch and never reaches the RSA-OAEP decrypt
+// path that generateSelfSignedTLS exists to support — the test would
+// pass for the wrong reason. Forcing a non-TLS connection makes
+// go-sql-driver request the server's pubkey, encrypt the password with
+// it, and let the server decrypt via the private key in tlsConfig —
+// the load-bearing path.
 func TestShim_CachingSha2PasswordHandshake(t *testing.T) {
 	tenants := map[string]string{"alice": "secret_a"}
 	addr := startTestShimWithConfig(t, tenants, nil, shim.Config{
 		AuthMethod: "caching_sha2_password",
 	})
 
-	dsn := fmt.Sprintf("alice:secret_a@tcp(%s)/?timeout=2s&allowCleartextPasswords=true&tls=skip-verify",
-		addr)
+	dsn := fmt.Sprintf("alice:secret_a@tcp(%s)/?timeout=2s", addr)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
@@ -154,7 +156,7 @@ func TestShim_CachingSha2PasswordHandshake(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
-		t.Fatalf("Ping under caching_sha2_password: %v\n"+
+		t.Fatalf("Ping under caching_sha2_password (RSA-OAEP path): %v\n"+
 			"if this is a NIL-deref, generateSelfSignedTLS regressed and the "+
 			"tlsConfig no longer carries a usable RSA private key", err)
 	}
@@ -176,9 +178,10 @@ func TestShim_CachingSha2PasswordRejectsCrossTenant(t *testing.T) {
 	// alice's username + bob's password. Must surface as 1045
 	// (ER_ACCESS_DENIED_ERROR), same code as the native-password
 	// matrix — anything else (especially a successful auth) is a
-	// silent credential-leak regression.
-	dsn := fmt.Sprintf("alice:secret_b@tcp(%s)/?timeout=2s&allowCleartextPasswords=true&tls=skip-verify",
-		addr)
+	// silent credential-leak regression. Non-TLS DSN forces the
+	// RSA-OAEP path (see TestShim_CachingSha2PasswordHandshake for
+	// why TLS would short-circuit to the cleartext compare).
+	dsn := fmt.Sprintf("alice:secret_b@tcp(%s)/?timeout=2s", addr)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
@@ -212,8 +215,7 @@ func TestShim_Sha256PasswordHandshake(t *testing.T) {
 		AuthMethod: "sha256_password",
 	})
 
-	dsn := fmt.Sprintf("alice:secret_a@tcp(%s)/?timeout=2s&allowCleartextPasswords=true&tls=skip-verify",
-		addr)
+	dsn := fmt.Sprintf("alice:secret_a@tcp(%s)/?timeout=2s", addr)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
@@ -223,7 +225,7 @@ func TestShim_Sha256PasswordHandshake(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
-		t.Fatalf("Ping under sha256_password: %v", err)
+		t.Fatalf("Ping under sha256_password (RSA-OAEP path): %v", err)
 	}
 }
 
