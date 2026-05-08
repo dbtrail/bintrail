@@ -162,6 +162,12 @@ func TestHandlerWireErrorCodes(t *testing.T) {
 		if myErr.Code != gomysql.ER_PARSE_ERROR {
 			t.Errorf("wire code = %d, want %d (msg=%q)", myErr.Code, gomysql.ER_PARSE_ERROR, myErr.Message)
 		}
+		// The operator hint ("USE <database>") is the actionable
+		// part of this error — without it the 1064 is correctly
+		// typed but useless to the human reading it.
+		if !strings.Contains(myErr.Message, "USE") {
+			t.Errorf("error should hint at USE <database>; got %q", myErr.Message)
+		}
 	})
 }
 
@@ -180,18 +186,35 @@ func TestHandlerInternalErrorsKeepDefaultWireCode(t *testing.T) {
 	}
 	defer db.Close()
 
-	// archive_state lookup is the first DB hop runPointInTime takes
-	// via FetchMerged → ResolveArchiveSources. Make it fail and the
-	// failure propagates back through runPointInTime as a plain
-	// fmt.Errorf("resolve %s: %w", ...).
+	// We force *some* internal failure inside FetchMerged by failing
+	// the archive_state lookup. The exact propagation path is
+	// implementation detail (ResolveArchiveSources may swallow the
+	// first hit; the planner's archive_state re-query may carry it;
+	// an unmocked information_schema query may surface it instead).
+	// What matters for the contract is that whatever error reaches
+	// HandleQuery's caller is a plain Go error, not a pre-typed
+	// *mysql.MyError. The ExpectationsWereMet check below ensures
+	// the archive_state query was actually issued — a refactor that
+	// stops touching FetchMerged would fail the test loudly rather
+	// than silently keeping a passing assertion.
 	mock.MatchExpectationsInOrder(false)
 	mock.ExpectQuery("FROM archive_state").
 		WillReturnError(errors.New("simulated archive_state lookup failure"))
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectation not met — the FetchMerged path "+
+				"this test pins is no longer being exercised: %v", err)
+		}
+	})
 
 	h := &Handler{
 		indexDB: db,
-		cfg:     Config{IndexDBName: "bintrail_index"},
-		logger:  slog.Default(),
+		// AllowGaps=false is the production default and is the mode
+		// that propagates archive errors rather than degrading to a
+		// Warn. Pin it explicitly so a flip in the zero-value default
+		// doesn't quietly change which path this test exercises.
+		cfg:    Config{IndexDBName: "bintrail_index", AllowGaps: false},
+		logger: slog.Default(),
 		archiveFetcher: func(ctx context.Context, opts query.Options, src string) ([]query.ResultRow, error) {
 			return nil, nil
 		},
