@@ -284,11 +284,16 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 // matches the value you queried" — semantically identical to a bintrail
 // coverage gap. Anything else stays a plain Go error so go-mysql/server
 // emits the catch-all ER_UNKNOWN_ERROR (1105), preserving the
-// user-vs-server-fault distinction PR #282 (#277) established.
+// user-vs-server-fault distinction PR #282 established for issue #277.
+//
+// Both branches prefix qType so an operator with multiple concurrent
+// shim sessions can attribute the error to a _flashback / _diff /
+// _snapshot query without correlating logs.
 func wrapFetchError(qType QueryType, err error) error {
 	var gapErr *query.GapError
 	if errors.As(err, &gapErr) {
-		return mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, gapErr.Error())
+		return mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE,
+			fmt.Sprintf("resolve %s: %s", qType, gapErr.Error()))
 	}
 	return fmt.Errorf("resolve %s: %w", qType, err)
 }

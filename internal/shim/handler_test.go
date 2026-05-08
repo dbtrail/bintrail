@@ -293,6 +293,12 @@ func TestWrapFetchErrorClassifiesGapAsTyped(t *testing.T) {
 			if myErr.Code != tc.wantCode {
 				t.Errorf("wire code = %d, want %d (msg=%q)", myErr.Code, tc.wantCode, myErr.Message)
 			}
+			// Pin the qType prefix on both branches: operators with
+			// concurrent shim sessions need to attribute the error to
+			// a specific query type without correlating logs.
+			if !strings.Contains(myErr.Message, "flashback") {
+				t.Errorf("wire message should include qType context; got %q", myErr.Message)
+			}
 		})
 	}
 }
