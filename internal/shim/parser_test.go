@@ -31,7 +31,7 @@ func TestParseFlashbackHappyPath(t *testing.T) {
 
 // TestParseFlashbackFullTable pins the WHERE-less shape introduced
 // for full-table reconstruction (issue #276). The PK fields are empty
-// so the handler can dispatch on q.PKValue == "" without parsing the
+// so the handler can dispatch on q.PKColumn == "" without parsing the
 // SQL again.
 func TestParseFlashbackFullTable(t *testing.T) {
 	cases := []struct {

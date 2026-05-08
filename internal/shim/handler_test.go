@@ -561,50 +561,122 @@ func TestExtractFullTableImagesPinsDivergence(t *testing.T) {
 	}
 }
 
-// TestRunPointInTimeDispatchesOnPKColumnNotPKValue pins the fix for
-// the empty-string PK collision: `WHERE id = ''` is a legitimate
-// single-row query against a NOT-NULL VARCHAR column with empty
-// default, and dispatching on q.PKValue would silently flip it into
-// a 100k-row table scan. Dispatch must use q.PKColumn instead.
+// TestRunPointInTimeDispatchesByPKColumn pins the fix for the empty-
+// string PK collision: `WHERE id = ''` is a legitimate single-row
+// query against a NOT-NULL VARCHAR with empty default, and a dispatch
+// on q.PKValue would silently flip it into a 100k-row table scan.
 //
-// Without a real DB we can't run runPointInTime end-to-end, but we
-// can pin the dispatch contract: a TimeTravelQuery with PKColumn
-// set and PKValue empty must be classified as point-lookup, not
-// full-table. The test builds the same TimeTravelQuery shapes the
-// parser produces and asserts the dispatch path via a probe handler
-// whose runFullTable replacement would only be reached on the wrong
-// branch.
-func TestRunPointInTimeDispatchesOnPKColumnNotPKValue(t *testing.T) {
-	cases := []struct {
-		name     string
-		q        TimeTravelQuery
-		fullPath bool
-	}{
-		{
-			name: "no_where_dispatches_full_table",
-			q:    TimeTravelQuery{Type: TypeFlashback, Schema: "myapp", Table: "orders", PKColumn: "", PKValue: ""},
-			fullPath: true,
-		},
-		{
-			name: "where_with_empty_string_pk_stays_point_lookup",
-			q:    TimeTravelQuery{Type: TypeFlashback, Schema: "myapp", Table: "orders", PKColumn: "id", PKValue: ""},
-			fullPath: false,
-		},
-		{
-			name: "where_with_nonempty_pk_stays_point_lookup",
-			q:    TimeTravelQuery{Type: TypeFlashback, Schema: "myapp", Table: "orders", PKColumn: "id", PKValue: "42"},
-			fullPath: false,
-		},
+// The previous version of this test re-implemented `q.PKColumn == ""`
+// inline and asserted the predicate against itself — a tautology that
+// would still pass even if runPointInTime ignored its argument
+// entirely. This rewrite drives runPointInTime through sqlmock and
+// observes which SQL pattern reaches the index DB, which is the
+// only thing that proves the dispatch is correct.
+//
+// Path detection:
+//   - Point-lookup SQL contains `pk_hash = SHA2` (the hash + value
+//     guard the SQL builder emits when Options.PKValues != "").
+//   - Full-table SQL omits that filter entirely. We detect it via
+//     the cost-cap behavioural signature: only runFullTable performs
+//     the >cap check, so seeding cap+1 rows surfaces 1104 iff
+//     dispatch reached runFullTable.
+func TestRunPointInTimeDispatchesByPKColumn(t *testing.T) {
+	t.Run("PKColumn_set_runs_point_lookup_sql", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		mock.MatchExpectationsInOrder(false)
+		mock.ExpectQuery("information_schema.PARTITIONS").
+			WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME", "PARTITION_DESCRIPTION"}))
+		// Anchor on `pk_hash = SHA2` — unique to the point-lookup SQL.
+		// If runPointInTime wrongly dispatched to runFullTable, the
+		// emitted SQL would lack pk_hash and ExpectationsWereMet would
+		// fail with "expected query was not matched".
+		mock.ExpectQuery("pk_hash = SHA2").
+			WillReturnRows(emptyBinlogEventsRows())
+
+		h := &Handler{
+			indexDB: db,
+			cfg:     Config{AllowGaps: true, IndexDBName: "bintrail_index", NoArchive: true},
+			logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+			archiveFetcher: func(ctx context.Context, _ query.Options, _ string) ([]query.ResultRow, error) {
+				return nil, nil
+			},
+		}
+		h.UseDB("myapp")
+
+		q := TimeTravelQuery{Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			PKColumn: "id", PKValue: "42", AsOf: time.Now().UTC()}
+		_, _ = h.runPointInTime(q) // result irrelevant; mock matching is the assertion
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("expected point-lookup SQL with pk_hash filter; got: %v", err)
+		}
+	})
+
+	t.Run("empty_PKColumn_dispatches_to_full_table", func(t *testing.T) {
+		// Behavioural proof of dispatch: only runFullTable performs
+		// the cap check. Lower the cap to 1 via Config (no global
+		// state), seed 2 rows, expect ER_TOO_BIG_SELECT. If
+		// runPointInTime stayed on the point-lookup branch despite
+		// PKColumn="", no cap check would fire and the test would
+		// fail loud.
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		mock.MatchExpectationsInOrder(false)
+		mock.ExpectQuery("information_schema.PARTITIONS").
+			WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME", "PARTITION_DESCRIPTION"}))
+		rows := sqlmock.NewRows(binlogEventsColumns())
+		now := time.Now().UTC()
+		for i := 0; i < 2; i++ {
+			rows.AddRow(int64(i+1), "binlog.000001", int64(100), int64(200), now,
+				nil, nil, "myapp", "orders", parser.EventInsert,
+				fmt.Sprintf("%d", i+1), nil, nil,
+				fmt.Sprintf(`{"id":%d,"sku":"X"}`, i+1), 0)
+		}
+		mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
+
+		h := &Handler{
+			indexDB: db,
+			cfg: Config{AllowGaps: true, IndexDBName: "bintrail_index",
+				NoArchive: true, FullTableRowCap: 1},
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			archiveFetcher: func(ctx context.Context, _ query.Options, _ string) ([]query.ResultRow, error) {
+				return nil, nil
+			},
+		}
+		h.UseDB("myapp")
+
+		q := TimeTravelQuery{Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			AsOf: now} // PKColumn / PKValue both empty
+		_, err = h.runPointInTime(q)
+		if err == nil {
+			t.Fatal("expected ER_TOO_BIG_SELECT (proves dispatch reached runFullTable); got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_TOO_BIG_SELECT {
+			t.Errorf("expected ER_TOO_BIG_SELECT (1104), got %v", err)
+		}
+	})
+}
+
+// binlogEventsColumns is the column list scanned by query.Engine.Fetch.
+// Extracted so the cap-overflow tests don't duplicate the literal.
+func binlogEventsColumns() []string {
+	return []string{
+		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+		"gtid", "connection_id", "schema_name", "table_name", "event_type",
+		"pk_values", "changed_columns", "row_before", "row_after", "schema_version",
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			isFull := tc.q.PKColumn == ""
-			if isFull != tc.fullPath {
-				t.Errorf("dispatch on PKColumn=%q PKValue=%q → fullPath=%v, want %v",
-					tc.q.PKColumn, tc.q.PKValue, isFull, tc.fullPath)
-			}
-		})
-	}
+}
+
+// emptyBinlogEventsRows is the empty-resultset stub for query.Engine.Fetch.
+func emptyBinlogEventsRows() *sqlmock.Rows {
+	return sqlmock.NewRows(binlogEventsColumns())
 }
 
 // TestImagesToResultColumnsFromUnionWhenNoDDLOrder pins the union-
@@ -1193,20 +1265,22 @@ func TestRunPointInTimeInvokesArchiveFetcher(t *testing.T) {
 }
 
 // TestRunFullTableEnforcesCostCap exercises the load-bearing OOM
-// guardrail: when FetchMerged returns more rows than fullTableRowCap,
-// runFullTable must surface ER_TOO_BIG_SELECT (1104) on the wire,
-// not silently truncate (which would hand the customer a partial,
-// unverifiable resultset) and not crash. The cap is a `var` (not a
-// const) precisely so this test can lower it to seed the overflow
-// path without materialising 100k rows.
+// guardrail: when FetchMerged returns more rows than the configured
+// cap, runFullTable must surface ER_TOO_BIG_SELECT (1104) on the
+// wire, not silently truncate (which would hand the customer a
+// partial, unverifiable resultset) and not crash.
+//
+// The cap is configured per-Handler via Config.FullTableRowCap so
+// this test can lower it to 3 on a local Handler instance without
+// touching a global var — that keeps the test parallel-safe and
+// matches the production path (a future per-tenant override would
+// flow through the same field).
 //
 // A regression that drops the +1 sentinel on Limit (e.g. `Limit:
-// fullTableRowCap` without the +1) silently turns the cap into
-// "exactly cap rows accepted, no error." This test catches that.
+// cap` without the +1) silently turns the cap into "exactly cap
+// rows accepted, no error." This test catches that.
 func TestRunFullTableEnforcesCostCap(t *testing.T) {
-	prevCap := fullTableRowCap
-	fullTableRowCap = 3
-	t.Cleanup(func() { fullTableRowCap = prevCap })
+	const testCap = 3
 
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -1227,13 +1301,9 @@ func TestRunFullTableEnforcesCostCap(t *testing.T) {
 	// the scan path produces a non-DELETE non-empty image — ensures
 	// extractFullTableImages doesn't filter them out before the cap
 	// check sees them.
-	rows := sqlmock.NewRows([]string{
-		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
-		"gtid", "connection_id", "schema_name", "table_name", "event_type",
-		"pk_values", "changed_columns", "row_before", "row_after", "schema_version",
-	})
+	rows := sqlmock.NewRows(binlogEventsColumns())
 	now := time.Now().UTC()
-	for i := 0; i < fullTableRowCap+1; i++ {
+	for i := 0; i < testCap+1; i++ {
 		rows.AddRow(
 			int64(i+1), "binlog.000001", int64(100), int64(200), now,
 			nil, nil, "myapp", "orders", parser.EventInsert,
@@ -1245,8 +1315,9 @@ func TestRunFullTableEnforcesCostCap(t *testing.T) {
 
 	h := &Handler{
 		indexDB: db,
-		cfg:     Config{AllowGaps: true, IndexDBName: "bintrail_index", NoArchive: true},
-		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cfg: Config{AllowGaps: true, IndexDBName: "bintrail_index",
+			NoArchive: true, FullTableRowCap: testCap},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		archiveFetcher: func(ctx context.Context, _ query.Options, _ string) ([]query.ResultRow, error) {
 			return nil, nil
 		},

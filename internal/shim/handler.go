@@ -21,26 +21,26 @@ import (
 	"github.com/dbtrail/bintrail/internal/query"
 )
 
-// fullTableRowCap bounds the buffered resultset for the full-table
-// AS OF path (issue #276) so a query against a hot table with millions
-// of distinct PKs cannot OOM the shim. 100k rows at a rough estimate
-// of ~512 bytes per JSON row image ≈ 50 MB worst-case (k=1 archive
-// source — multi-archive deployments multiply the transient pre-merge
-// memory by the source count, but the post-merge enforcement still
-// caps the resultset). A forensic shim instance can absorb that;
-// exceeding it surfaces as ER_TOO_BIG_SELECT (1104) so monitoring
-// can distinguish it from a real shim crash, and operators narrow
-// the AS OF range or fall back to PK-filtered queries.
+// defaultFullTableRowCap bounds the buffered resultset for the
+// full-table AS OF path (issue #276) so a query against a hot table
+// with millions of distinct PKs cannot OOM the shim. 100k rows at a
+// rough estimate of ~512 bytes per JSON row image ≈ 50 MB worst-case
+// (k=1 archive source — multi-archive deployments multiply the
+// transient pre-merge memory by the source count, but the post-merge
+// enforcement still caps the resultset). A forensic shim instance can
+// absorb that; exceeding it surfaces as ER_TOO_BIG_SELECT (1104) so
+// monitoring can distinguish it from a real shim crash, and operators
+// narrow the AS OF range or fall back to PK-filtered queries.
 //
 // Streaming the resultset (Conn.WriteFieldList + WriteRow per row,
 // removing the cap) is deferred per the scoping comment on #276;
 // cap+buffered is the bounded substitute for the MVP.
 //
-// Declared as a var rather than a const so unit tests can lower it
-// to seed the overflow path without materialising 100k rows. Not
-// part of the configurable surface — production callers must not
-// mutate it.
-var fullTableRowCap = 100_000
+// Per-Handler override lives on Config.FullTableRowCap (zero =
+// inherit this default) so unit tests can lower it without mutating
+// global state, and a future per-tenant override is one struct field
+// away.
+const defaultFullTableRowCap = 100_000
 
 // resolverCacheTTL bounds how long a stale schema_snapshots view
 // can serve column-ordering lookups. 30s is short enough that a
@@ -219,6 +219,13 @@ type Config struct {
 	// scopes information_schema.PARTITIONS to it; the user query's
 	// schema is the wrong answer (every hour misclassified as a gap).
 	IndexDBName string
+	// FullTableRowCap caps the buffered resultset for the full-table
+	// AS OF path (issue #276). Zero (default) inherits
+	// defaultFullTableRowCap (100k). Set non-zero to override per
+	// Handler — primarily for unit tests that want to seed the
+	// overflow path without materialising 100k rows. A future
+	// per-tenant override would plumb through here.
+	FullTableRowCap int
 }
 
 // NewHandler constructs a Handler bound to a bintrail index DSN with
@@ -412,6 +419,11 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	cap := h.cfg.FullTableRowCap
+	if cap <= 0 {
+		cap = defaultFullTableRowCap
+	}
+
 	engine := query.New(h.indexDB)
 	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
 		Opts: query.Options{
@@ -419,7 +431,7 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 			Table:      q.Table,
 			Until:      &q.AsOf,
 			LimitPerPK: 1,
-			Limit:      fullTableRowCap + 1,
+			Limit:      cap + 1,
 		},
 		DBName:         h.cfg.IndexDBName,
 		NoArchive:      h.cfg.NoArchive,
@@ -430,10 +442,10 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 		return nil, wrapFetchError(q.Type, err)
 	}
 
-	if len(rows) > fullTableRowCap {
+	if len(rows) > cap {
 		return nil, mysql.NewError(mysql.ER_TOO_BIG_SELECT, fmt.Sprintf(
 			"resolve %s: %s.%s at %s would return more than %d rows; narrow the AS OF range or filter by PK",
-			q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), fullTableRowCap,
+			q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), cap,
 		))
 	}
 
@@ -474,10 +486,11 @@ func extractFullTableImages(rows []query.ResultRow) []map[string]any {
 // present, even if no image carries every column — missing values
 // become NULL on the wire, matching how MySQL itself returns rows
 // from a table that was ALTER'd to add a column. When ddlOrder is
-// empty (first install before any `bintrail snapshot`), we fall
-// back to the *union* of every image's keys (sorted) — using the
-// first image alone would silently elide columns that appeared
-// only in later events of the same query.
+// empty (no resolved snapshot for this table — first install, or
+// a snapshot that doesn't cover this schema/table), we fall back
+// to the *union* of every image's keys (sorted) — using the first
+// image alone would silently elide columns that appeared only in
+// later events of the same query.
 //
 // Empty input → empty resultset.
 func imagesToResult(images []map[string]any, ddlOrder []string) (*mysql.Result, error) {
