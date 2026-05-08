@@ -23,16 +23,24 @@ import (
 
 // fullTableRowCap bounds the buffered resultset for the full-table
 // AS OF path (issue #276) so a query against a hot table with millions
-// of distinct PKs cannot OOM the shim. 100k rows × ~512 bytes per
-// row image ≈ 50 MB worst-case, which a forensic shim instance can
-// absorb. Exceeding the cap surfaces as ER_TOO_BIG_SELECT (1104) so
-// monitoring can distinguish it from a real shim crash; operators
-// narrow the AS OF range or fall back to PK-filtered queries.
+// of distinct PKs cannot OOM the shim. 100k rows at a rough estimate
+// of ~512 bytes per JSON row image ≈ 50 MB worst-case (k=1 archive
+// source — multi-archive deployments multiply the transient pre-merge
+// memory by the source count, but the post-merge enforcement still
+// caps the resultset). A forensic shim instance can absorb that;
+// exceeding it surfaces as ER_TOO_BIG_SELECT (1104) so monitoring
+// can distinguish it from a real shim crash, and operators narrow
+// the AS OF range or fall back to PK-filtered queries.
 //
 // Streaming the resultset (Conn.WriteFieldList + WriteRow per row,
 // removing the cap) is deferred per the scoping comment on #276;
 // cap+buffered is the bounded substitute for the MVP.
-const fullTableRowCap = 100_000
+//
+// Declared as a var rather than a const so unit tests can lower it
+// to seed the overflow path without materialising 100k rows. Not
+// part of the configurable surface — production callers must not
+// mutate it.
+var fullTableRowCap = 100_000
 
 // resolverCacheTTL bounds how long a stale schema_snapshots view
 // can serve column-ordering lookups. 30s is short enough that a
@@ -316,25 +324,30 @@ func wrapFetchError(qType QueryType, err error) error {
 // q.AsOf.
 //
 // Two shapes are recognised, sharing this entry point:
-//   - q.PKValue != "": single-row point-lookup. Returns the latest
+//   - q.PKColumn != "": single-row point-lookup. Returns the latest
 //     event's image (row_after for INSERT/UPDATE, row_before for
 //     DELETE — "last known state").
-//   - q.PKValue == "": full-table reconstruction (issue #276).
+//   - q.PKColumn == "": full-table reconstruction (issue #276).
 //     Dispatches to runFullTable.
+//
+// Dispatch is on PKColumn, not PKValue, so a literal `WHERE id = ''`
+// (legitimate against a NOT-NULL VARCHAR column) stays a single-row
+// point-lookup instead of silently flipping to a 100k-row table scan.
 //
 // The DELETE semantics intentionally diverge between the two paths:
 // point-lookup keeps the DELETE's row_before so a forensic operator
 // asking "what was this row?" gets an answer even past its deletion;
 // full-table SKIPS DELETEs because the row didn't exist at AS OF
 // and its presence in a `SELECT *` resultset would be wrong. The
-// split is load-bearing — see TestSelectImagePinsDeleteSemantics.
+// split is load-bearing — see TestSelectImage and
+// TestExtractFullTableImagesPinsDivergence.
 //
 // _flashback and _snapshot share this implementation today. _snapshot
 // is intended to grow baseline-lookup support (querying the
 // dump/baseline pipeline for rows that never appeared in binlog
 // events) — that's a future iteration.
 func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
-	if q.PKValue == "" {
+	if q.PKColumn == "" {
 		return h.runFullTable(q)
 	}
 
@@ -452,15 +465,40 @@ func extractFullTableImages(rows []query.ResultRow) []map[string]any {
 }
 
 // imagesToResult is the multi-row sibling of imageToResult. The
-// column list is computed once for the whole resultset (from the
-// first non-empty image and ddlOrder) so every row in the wire
-// resultset has the same shape, with NULLs where a row's image is
-// missing a column. Empty input → empty resultset.
+// column list is computed once for the whole resultset so every row
+// in the wire resultset has the same shape, with NULL where a row's
+// image is missing a column.
+//
+// Column selection is snapshot-driven when possible: ddlOrder (taken
+// from the latest schema_snapshots row) is used verbatim when
+// present, even if no image carries every column — missing values
+// become NULL on the wire, matching how MySQL itself returns rows
+// from a table that was ALTER'd to add a column. When ddlOrder is
+// empty (first install before any `bintrail snapshot`), we fall
+// back to the *union* of every image's keys (sorted) — using the
+// first image alone would silently elide columns that appeared
+// only in later events of the same query.
+//
+// Empty input → empty resultset.
 func imagesToResult(images []map[string]any, ddlOrder []string) (*mysql.Result, error) {
 	if len(images) == 0 {
 		return emptyResult(), nil
 	}
-	cols := orderColumns(images[0], ddlOrder)
+
+	cols := ddlOrder
+	if len(cols) == 0 {
+		seen := make(map[string]struct{})
+		for _, img := range images {
+			for k := range img {
+				seen[k] = struct{}{}
+			}
+		}
+		cols = make([]string, 0, len(seen))
+		for k := range seen {
+			cols = append(cols, k)
+		}
+		sort.Strings(cols)
+	}
 
 	values := make([][]any, len(images))
 	for i, img := range images {

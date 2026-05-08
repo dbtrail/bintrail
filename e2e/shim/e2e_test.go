@@ -306,6 +306,24 @@ func TestShimEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("snapshot_full_table_matches_flashback", func(t *testing.T) {
+		// _snapshot must produce the same full-table reconstruction
+		// as _flashback for the same AS OF — they share runPointInTime
+		// + runFullTable. Pinning the contract here keeps a future
+		// _snapshot baseline-lookup branch (out-of-scope today)
+		// deliberate rather than a silent divergence. Issue #276's
+		// AC explicitly required _snapshot full-table coverage.
+		_, rows := queryAllRowsWithCols(t, clientDB,
+			"SELECT * FROM _snapshot.orders AS OF '2026-05-04 13:00:00'")
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row at _snapshot AS OF 13:00, got %d", len(rows))
+		}
+		want := map[string]string{"id": "42", "sku": "ABC-1", "qty": "2", "note": "initial"}
+		if !maps.Equal(rows[0], want) {
+			t.Errorf("snapshot full-table row mismatch:\n  got:  %+v\n  want: %+v", rows[0], want)
+		}
+	})
+
 	t.Run("malformed_time_travel_returns_1064_not_1105", func(t *testing.T) {
 		// Issue #277: a virtual-schema query that doesn't match any
 		// supported shape used to surface as ER_UNKNOWN_ERROR (1105),
