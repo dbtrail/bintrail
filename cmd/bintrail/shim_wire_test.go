@@ -260,8 +260,13 @@ func TestShim_MalformedTimeTravelReturnsWireError(t *testing.T) {
 				t.Fatalf("query took %v (>= %v); a hang regression in the parser dispatch path would manifest here", elapsed, responseBudget)
 			}
 			if err == nil {
-				rows.Close()
-				t.Fatalf("query %q succeeded; want wire error", tc.sql)
+				// Some drivers surface deferred server errors on
+				// rows.Close() rather than on QueryContext, so include
+				// it in the failure message — otherwise a regression
+				// where the error moved to that branch would look like
+				// a clean success here.
+				closeErr := rows.Close()
+				t.Fatalf("query %q succeeded (rows.Close err=%v); want wire error", tc.sql, closeErr)
 			}
 			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
 				t.Errorf("error = %q, want substring %q", err.Error(), tc.wantErrSubstr)
