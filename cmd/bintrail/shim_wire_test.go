@@ -51,7 +51,15 @@ func startTestShim(t *testing.T, tenants map[string]string, userSchemas map[stri
 	t.Cleanup(func() {
 		cancel()
 		listener.Close()
-		<-done
+		// Bound the wait so a serveLoop shutdown regression (e.g. a
+		// future change that blocks on an in-flight handleConn) shows
+		// up as a 2s test failure rather than a 10-min Go-test-timeout
+		// hang with no diagnostic.
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Errorf("serveLoop did not return within 2s of shutdown")
+		}
 	})
 	return listener.Addr().String()
 }
@@ -75,8 +83,9 @@ func pingWithUser(t *testing.T, addr, user, pass string) error {
 // TestShim_AuthCredentialMatrix is the wire-level regression guard for
 // PR #264 / issue #262 (auth → MySQL error code 1045, not 1449) and
 // for cross-tenant credential isolation (issue #269). The unit tests
-// in classifyHandshakeErr_test verify the *log* classification path;
-// this test verifies the actual wire bytes a real MySQL client sees.
+// in shim_test.go::TestClassifyHandshakeErr verify the *log*
+// classification path against synthetic errors; this test verifies the
+// actual wire bytes a real MySQL client sees.
 //
 // A regression that demoted GetCredential's server.ErrAccessDenied to
 // (found=false, err=nil) — the original #262 bug shape — would surface
@@ -97,11 +106,11 @@ func TestShim_AuthCredentialMatrix(t *testing.T) {
 	addr := startTestShim(t, tenants, nil)
 
 	cases := []struct {
-		name      string
-		user      string
-		pass      string
-		wantOK    bool
-		wantCode  uint16 // ignored when wantOK is true
+		name     string
+		user     string
+		pass     string
+		wantOK   bool
+		wantCode uint16 // ignored when wantOK is true
 	}{
 		{"alice with own password succeeds", "alice", "secret_a", true, 0},
 		{"bob with own password succeeds", "bob", "secret_b", true, 0},
@@ -145,31 +154,33 @@ func TestShim_AuthCredentialMatrix(t *testing.T) {
 // TestShim_MalformedTimeTravelReturnsWireError pins issue #268: a
 // malformed _flashback / _diff / _snapshot query must reach the client
 // as a MySQL wire-protocol error within a short bound — never hang,
-// never return rows. Each subtest opens an authenticated connection,
-// issues one malformed query, and expects an error from QueryContext.
+// never return rows. Each subtest issues one malformed query against a
+// shared authenticated *sql.DB (lazy connection pool) and expects an
+// error from QueryContext.
 //
-// "No hang" today is structurally true (Parse is pure regex; no
-// goroutines, no IO), so the bound here is tight enough to catch a
-// regression that introduced a blocking operation in the parser
-// dispatch path — a future refactor that, say, hit the index DB
-// before parsing would block on the nil DB and time out instead of
-// returning a clean parser error.
+// The bound is tight enough to catch a regression that introduced a
+// blocking operation in the parser dispatch path — a future refactor
+// that, say, hit the index DB before parsing would block on the nil
+// DB and trip the elapsed-time assertion below instead of returning
+// a clean parser error.
 func TestShim_MalformedTimeTravelReturnsWireError(t *testing.T) {
 	// Seed a default schema via userSchemas so the parser reaches the
-	// regex / shape validation path. Without this, every query is
-	// rejected with the "no schema selected" preflight before the
-	// shape-error messages we want to pin can fire.
+	// regex / shape validation path. Without this every test case
+	// would short-circuit at parser.go's "no schema selected" check
+	// (which fires after the virtual-schema sentinel screen) and
+	// return that error instead of the shape-error messages we want
+	// to pin.
 	addr := startTestShim(t,
 		map[string]string{"alice": "secret_a"},
 		map[string]string{"alice": "testdb"},
 	)
 
-	// One DSN reused across subtests — these queries never reach the
-	// indexer, so connection pooling can be left at the driver default.
-	// timeout flags bound the wire round-trip so a regression that
-	// made the handler hang surfaces as a deadline error, not a stuck
-	// test.
-	dsn := fmt.Sprintf("alice:secret_a@tcp(%s)/?timeout=2s&readTimeout=2s&writeTimeout=2s", addr)
+	// timeout=2s bounds the initial connect. readTimeout/writeTimeout are
+	// deliberately omitted so a hung handler surfaces via the ctx deadline
+	// + the elapsed-time assertion below — a driver-side i/o timeout
+	// would fire earlier and produce a generic "i/o timeout" message
+	// indistinguishable from the substring-match failure path.
+	dsn := fmt.Sprintf("alice:secret_a@tcp(%s)/?timeout=2s", addr)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
@@ -194,9 +205,14 @@ func TestShim_MalformedTimeTravelReturnsWireError(t *testing.T) {
 			wantErrSubstr: "malformed time-travel",
 		},
 		{
-			name:          "flashback unparseable timestamp",
-			sql:           "SELECT * FROM _flashback.users AS OF 'not-a-time' WHERE id = 1",
-			wantErrSubstr: "AS OF",
+			name: "flashback unparseable timestamp",
+			sql:  "SELECT * FROM _flashback.users AS OF 'not-a-time' WHERE id = 1",
+			// "invalid AS OF timestamp" is unique to parseAsOfMatch's
+			// time-parse failure path; a bare "AS OF" substring would
+			// also match the malformed-shape template, so a regression
+			// rerouting this case to the malformed branch would pass
+			// silently against the looser assertion.
+			wantErrSubstr: "invalid AS OF timestamp",
 		},
 		{
 			name:          "diff missing BETWEEN clause",
@@ -215,23 +231,33 @@ func TestShim_MalformedTimeTravelReturnsWireError(t *testing.T) {
 		},
 	}
 
-	// 5s is generous enough that a slow CI run does not flap, but
-	// well below "client deadlocked" — this bound is the load-bearing
-	// claim of the issue, so keeping it explicit guards against a
-	// regression that silently extends it.
-	const queryBound = 5 * time.Second
+	// Two bounds working together:
+	//   ctxDeadline caps the wall-clock — a true deadlock surfaces here
+	//     instead of hanging the whole test process indefinitely.
+	//   responseBudget is the assertion that actually pins the issue
+	//     #268 invariant: a healthy parser path is sub-millisecond, so
+	//     anything slower than 1s indicates a regression introduced a
+	//     blocking operation (a DB lookup, a synchronous network call,
+	//     etc.) before the regex rejection. Keeping responseBudget well
+	//     below ctxDeadline means the assertion fails with a "took N;
+	//     hang regression" message rather than the generic deadline
+	//     error you would get from ctx alone.
+	const (
+		ctxDeadline    = 5 * time.Second
+		responseBudget = 1 * time.Second
+	)
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), queryBound)
+			ctx, cancel := context.WithTimeout(context.Background(), ctxDeadline)
 			defer cancel()
 
 			start := time.Now()
 			rows, err := db.QueryContext(ctx, tc.sql)
 			elapsed := time.Since(start)
 
-			if elapsed >= queryBound {
-				t.Fatalf("query took %v (>= %v); a hang regression would manifest here", elapsed, queryBound)
+			if elapsed >= responseBudget {
+				t.Fatalf("query took %v (>= %v); a hang regression in the parser dispatch path would manifest here", elapsed, responseBudget)
 			}
 			if err == nil {
 				rows.Close()
