@@ -275,6 +275,24 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 	))
 }
 
+// wrapFetchError translates an error from query.FetchMerged into the
+// right wire shape for HandleQuery to return. A coverage gap is a
+// client-input concern (the AS OF / time range is outside what this
+// index retains) and must be distinguishable from a real internal
+// failure (DB timeout, archive S3 outage, build-resultset bug). MySQL
+// itself uses ER_NO_PARTITION_FOR_GIVEN_VALUE (1526) for "no partition
+// matches the value you queried" — semantically identical to a bintrail
+// coverage gap. Anything else stays a plain Go error so go-mysql/server
+// emits the catch-all ER_UNKNOWN_ERROR (1105), preserving the
+// user-vs-server-fault distinction PR #282 (#277) established.
+func wrapFetchError(qType QueryType, err error) error {
+	var gapErr *query.GapError
+	if errors.As(err, &gapErr) {
+		return mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, gapErr.Error())
+	}
+	return fmt.Errorf("resolve %s: %w", qType, err)
+}
+
 // runPointInTime resolves a _flashback or _snapshot query against
 // the bintrail index + archives and reconstructs the row's state at
 // q.AsOf.
@@ -317,7 +335,7 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)
+		return nil, wrapFetchError(q.Type, err)
 	}
 
 	image := selectImage(rows)
@@ -449,7 +467,7 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)
+		return nil, wrapFetchError(q.Type, err)
 	}
 
 	// Compute the source-table column order once per query so the

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -230,6 +231,69 @@ func TestHandlerInternalErrorsKeepDefaultWireCode(t *testing.T) {
 		t.Errorf("internal failure must NOT be wrapped in *mysql.MyError "+
 			"(go-mysql/server would then emit %d instead of the catch-all 1105); "+
 			"got code=%d msg=%q", myErr.Code, myErr.Code, myErr.Message)
+	}
+}
+
+// TestWrapFetchErrorClassifiesGapAsTyped pins the error-classification
+// contract that runPointInTime / runDiff use for FetchMerged failures
+// (issue #283). Coverage gaps are client-input concerns and must wire
+// as ER_NO_PARTITION_FOR_GIVEN_VALUE (1526); everything else stays a
+// plain Go error so go-mysql/server emits the catch-all 1105.
+//
+// Testing the helper directly (not via sqlmock + the planner) keeps
+// the contract pinned to the *classification rule*, not to whatever
+// query path happens to surface a GapError today.
+func TestWrapFetchErrorClassifiesGapAsTyped(t *testing.T) {
+	gap := &query.GapError{GapHours: []time.Time{time.Date(2026, 5, 4, 18, 0, 0, 0, time.UTC)}}
+
+	cases := []struct {
+		name     string
+		in       error
+		isTyped  bool
+		wantCode uint16
+	}{
+		{
+			name:     "bare_gap_error",
+			in:       gap,
+			isTyped:  true,
+			wantCode: gomysql.ER_NO_PARTITION_FOR_GIVEN_VALUE,
+		},
+		{
+			// errors.As must unwrap through %w wrappers — protects against
+			// a future refactor that wraps the planner's GapError before
+			// it reaches the shim.
+			name:     "wrapped_gap_error",
+			in:       fmt.Errorf("planner reported gaps: %w", gap),
+			isTyped:  true,
+			wantCode: gomysql.ER_NO_PARTITION_FOR_GIVEN_VALUE,
+		},
+		{
+			name:    "internal_db_failure_stays_untyped",
+			in:      errors.New("connection reset by peer"),
+			isTyped: false,
+		},
+		{
+			name:    "wrapped_internal_failure_stays_untyped",
+			in:      fmt.Errorf("planner failed: %w", errors.New("information_schema unavailable")),
+			isTyped: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := wrapFetchError(TypeFlashback, tc.in)
+			var myErr *gomysql.MyError
+			gotTyped := errors.As(out, &myErr)
+			if gotTyped != tc.isTyped {
+				t.Fatalf("isTyped = %v, want %v (out=%v)", gotTyped, tc.isTyped, out)
+			}
+			if !tc.isTyped {
+				return
+			}
+			if myErr.Code != tc.wantCode {
+				t.Errorf("wire code = %d, want %d (msg=%q)", myErr.Code, tc.wantCode, myErr.Message)
+			}
+		})
 	}
 }
 

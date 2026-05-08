@@ -277,6 +277,36 @@ func TestShimEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("coverage_gap_returns_1526_not_1105", func(t *testing.T) {
+		// Issue #283: a strict-mode query whose AS OF is outside what
+		// this index retains used to surface as ER_UNKNOWN_ERROR (1105),
+		// indistinguishable from a real shim crash. The shim now wraps
+		// the planner's *query.GapError as ER_NO_PARTITION_FOR_GIVEN_VALUE
+		// (1526) — MySQL's existing code for "no partition matches the
+		// value you queried", which is literally what a coverage gap is.
+		//
+		// The seed (e2e/shim/seed.sql) creates partitions covering 09:00
+		// to 16:00 on 2026-05-04. AS OF 18:00 lies outside that range,
+		// producing 3 gap hours (16:00, 17:00, 18:00) under default
+		// strict mode (--allow-gaps=false). Internal failures (DB down,
+		// resultset-build bug) keep emitting 1105 — see the unit tests
+		// in internal/shim/handler_test.go for that half of the contract.
+		_, err := clientDB.Query(
+			"SELECT * FROM _flashback.orders AS OF '2026-05-04 18:00:00' WHERE id = 42")
+		if err == nil {
+			t.Fatalf("expected coverage-gap error for AS OF outside partition range")
+		}
+		var mysqlErr *mysql.MySQLError
+		if !errors.As(err, &mysqlErr) {
+			t.Fatalf("expected *mysql.MySQLError, got %T: %v", err, err)
+		}
+		if mysqlErr.Number != 1526 {
+			t.Fatalf("expected error code 1526 (ER_NO_PARTITION_FOR_GIVEN_VALUE), got %d: %s\n"+
+				"if 1105, the shim regressed to fmt.Errorf for *query.GapError",
+				mysqlErr.Number, mysqlErr.Message)
+		}
+	})
+
 	t.Run("passthrough_query_hits_real_mysql_not_shim", func(t *testing.T) {
 		// `appdb.orders` (no virtual schema) must route to the
 		// passthrough hostgroup. The live row has marker values
