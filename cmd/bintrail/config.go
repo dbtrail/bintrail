@@ -166,6 +166,12 @@ var envSections = []envSection{
 			{"BINTRAIL_FLUSH_INTERVAL", "5s"},
 		},
 	},
+	{
+		Header: "Shim auth (used by bintrail shim)",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_AUTH_METHOD", ""},
+		},
+	},
 }
 
 // generateEnvTemplate builds the .bintrail.env file content. Variables

@@ -27,6 +27,14 @@ import (
 // per-tenant default-schema seeding lands on the right Handler when
 // they care; nil is fine for tests that don't.
 func startTestShim(t *testing.T, tenants map[string]string, userSchemas map[string]string) string {
+	return startTestShimWithConfig(t, tenants, userSchemas, shim.Config{})
+}
+
+// startTestShimWithConfig is the configurable form of startTestShim.
+// Existing callers go through startTestShim (zero-value Config) so
+// behaviour is unchanged; tests that exercise an opt-in Config field
+// (e.g. AuthMethod for issue #274) call this directly.
+func startTestShimWithConfig(t *testing.T, tenants map[string]string, userSchemas map[string]string, cfg shim.Config) string {
 	t.Helper()
 
 	auth, err := shim.NewTenantAuth(tenants)
@@ -45,7 +53,7 @@ func startTestShim(t *testing.T, tenants map[string]string, userSchemas map[stri
 		defer close(done)
 		// indexDB=nil: handler construction does not dereference it
 		// and the test queries never reach a path that would.
-		serveLoop(ctx, listener, (*sql.DB)(nil), auth, shim.Config{}, userSchemas)
+		serveLoop(ctx, listener, (*sql.DB)(nil), auth, cfg, userSchemas)
 	}()
 
 	t.Cleanup(func() {
@@ -98,6 +106,52 @@ func pingWithUser(t *testing.T, addr, user, pass string) error {
 // already covered by TestBuildUserSchemas in shim_test.go — the
 // wire-level claim here is narrower: a tenant cannot authenticate
 // using a different tenant's password.
+// TestShim_CachingSha2PasswordHandshake is the wire-level proof that
+// the issue #274 plumbing actually works: a real go-sql-driver client
+// successfully authenticates against a shim instance that advertises
+// `caching_sha2_password` instead of `mysql_native_password`.
+//
+// Why this test, not just unit tests on NewMySQLServer:
+//   - go-mysql/server's full-auth path dereferences
+//     tlsConfig.Certificates[0].PrivateKey on cache miss
+//     (auth_switch_response.go:98 in v1.13.0). A regression that
+//     handed back a tlsConfig without an RSA private key (or no
+//     tlsConfig at all) would unit-test green via NewMySQLServer
+//     returning a non-nil *Server, then NIL-deref on the first SHA2
+//     handshake. This test catches that.
+//   - TenantAuth is NOT *InMemoryProvider, so every first connection
+//     for a tenant takes the cache-miss path (fast-auth shortcut at
+//     auth.go:156 only fires for InMemoryProvider). The wire
+//     handshake here exercises that exact path.
+//
+// Cleartext password storage (allowCleartextPasswords=true) is
+// required by go-sql-driver when negotiating SHA2 over a non-TLS
+// connection that uses a self-signed cert the client has no way to
+// verify. ProxySQL, the production caller, has its own backend
+// password handling and does not require this driver flag.
+func TestShim_CachingSha2PasswordHandshake(t *testing.T) {
+	tenants := map[string]string{"alice": "secret_a"}
+	addr := startTestShimWithConfig(t, tenants, nil, shim.Config{
+		AuthMethod: "caching_sha2_password",
+	})
+
+	dsn := fmt.Sprintf("alice:secret_a@tcp(%s)/?timeout=2s&allowCleartextPasswords=true&tls=skip-verify",
+		addr)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("Ping under caching_sha2_password: %v\n"+
+			"if this is a NIL-deref, generateSelfSignedTLS regressed and the "+
+			"tlsConfig no longer carries a usable RSA private key", err)
+	}
+}
+
 func TestShim_AuthCredentialMatrix(t *testing.T) {
 	tenants := map[string]string{
 		"alice": "secret_a",

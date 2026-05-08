@@ -78,6 +78,7 @@ var (
 	shShimConfig string
 	shNoArchive  bool
 	shAllowGaps  bool
+	shAuthMethod string
 )
 
 func init() {
@@ -86,6 +87,7 @@ func init() {
 	shimCmd.Flags().StringVar(&shShimConfig, "shim-config", "shim.yaml", "Path to shim.yaml (the file produced by 'bintrail init-shim')")
 	shimCmd.Flags().BoolVar(&shNoArchive, "no-archive", false, "Skip archive auto-discovery; query only the live MySQL index")
 	shimCmd.Flags().BoolVar(&shAllowGaps, "allow-gaps", false, "Warn and continue when an archive source fails or the planner detects a coverage gap, instead of returning a MySQL protocol error to the client (default: strict, fail loudly)")
+	shimCmd.Flags().StringVar(&shAuthMethod, "auth-method", "", "MySQL auth plugin to advertise during the handshake. Empty (default) keeps mysql_native_password for backwards compatibility. Set to 'caching_sha2_password' or 'sha256_password' on MySQL 8.4+ instances where mysql_native_password is disabled by default. Requires ProxySQL 2.7+ upstream.")
 	_ = shimCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(shimCmd)
 	rootCmd.AddCommand(shimCmd)
@@ -193,7 +195,12 @@ func runShim(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("index DSN must include the database name (e.g. /bintrail_index)")
 	}
 
-	cfg := shim.Config{AllowGaps: shAllowGaps, NoArchive: shNoArchive, IndexDBName: dsnCfg.DBName}
+	cfg := shim.Config{
+		AllowGaps:   shAllowGaps,
+		NoArchive:   shNoArchive,
+		IndexDBName: dsnCfg.DBName,
+		AuthMethod:  shAuthMethod,
+	}
 	serveLoop(ctx, listener, db, auth, cfg, userSchemas)
 	return nil
 }
@@ -381,7 +388,15 @@ func handleConn(c net.Conn, db *sql.DB, auth shim.TenantAuth, cfg shim.Config, u
 	defer c.Close()
 
 	handler := shim.NewHandlerWithConfig(db, cfg, slog.Default())
-	srv := server.NewDefaultServer()
+	srv, err := shim.NewMySQLServer(cfg.AuthMethod)
+	if err != nil {
+		// Operator misconfiguration (unsupported AuthMethod string).
+		// Cobra's RunE catches this for the CLI path; this connection
+		// path runs per-conn so we log and drop. cfg is process-wide
+		// so the same error fires on every connection until restart.
+		slog.Error("shim: NewMySQLServer failed; closing connection", "err", err, "remote", c.RemoteAddr())
+		return
+	}
 	mysqlConn, err := server.NewCustomizedConn(c, srv, auth, handler)
 	if err != nil {
 		level, msg := classifyHandshakeErr(err)

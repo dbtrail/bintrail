@@ -226,6 +226,17 @@ type Config struct {
 	// overflow path without materialising 100k rows. A future
 	// per-tenant override would plumb through here.
 	FullTableRowCap int
+	// AuthMethod selects the MySQL auth plugin the shim advertises
+	// during the handshake (issue #274). Empty (default) keeps the
+	// historical mysql_native_password path so existing deployments
+	// see no behaviour change. mysql_native_password is deprecated
+	// in MySQL 8.0+ and disabled by default in 8.4 — operators on a
+	// fresh 8.4+ instance with the plugin disabled set this to
+	// "caching_sha2_password" (or "sha256_password") to authenticate
+	// without re-enabling deprecated auth. Requires ProxySQL 2.7+
+	// upstream of the shim (the LTS 2.6 line is not verified to
+	// negotiate SHA2 against backends).
+	AuthMethod string
 }
 
 // NewHandler constructs a Handler bound to a bintrail index DSN with

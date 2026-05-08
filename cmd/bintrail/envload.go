@@ -52,6 +52,7 @@ var envBindings = []envBinding{
 	{"gap-timeout", "BINTRAIL_STREAM_GAP_TIMEOUT"},
 	{"max-reconnect-attempts", "BINTRAIL_AGENT_MAX_RECONNECT_ATTEMPTS"},
 	{"column-eq", "BINTRAIL_COLUMN_EQ"},
+	{"auth-method", "BINTRAIL_AUTH_METHOD"},
 }
 
 var envOnce sync.Once
