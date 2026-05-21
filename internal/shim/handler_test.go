@@ -430,16 +430,16 @@ func TestOrderColumnsEdgeCases(t *testing.T) {
 	}
 }
 
-// TestSelectImage covers every branch of the row-image priority rule
-// used by runPointInTime. The function is intentionally pure so it
-// can be exercised without sqlmock or a real MySQL: the rest of the
+// TestSelectImage covers every branch of the row-image rule used by
+// runPointInTime. The function is intentionally pure so it can be
+// exercised without sqlmock or a real MySQL: the rest of the
 // _flashback / _snapshot pipeline (sort, LimitPerPK, archive merge)
 // is covered by the query package's own tests.
 //
-// A future refactor that swaps the row_after / row_before priority,
-// or that mishandles a DELETE event (row_after empty by definition),
-// would silently return wrong row state to the customer. The
-// "delete_fallback" case is the tripwire for that regression.
+// A future refactor that swaps the row_after / row_before priority on
+// non-DELETE events, or that reintroduces the row_before fallback for
+// DELETE (issue #287 regression), would silently return wrong row
+// state to the customer. The "delete_*" cases are the tripwires.
 func TestSelectImage(t *testing.T) {
 	after := map[string]any{"id": int64(1), "name": "after"}
 	before := map[string]any{"id": int64(1), "name": "before"}
@@ -472,25 +472,30 @@ func TestSelectImage(t *testing.T) {
 			want: after,
 		},
 		{
-			name: "delete_fallback_to_row_before",
+			// #287: a DELETE means the row did not exist at AsOf.
+			// Returning RowBefore here would resurrect the row for
+			// any AS OF after the deletion — the bug the issue
+			// describes. The Oracle AS OF semantic the docs already
+			// advertise (docs/time-travel-sql.md:242) demands nil.
+			name: "delete_returns_nil",
 			rows: []query.ResultRow{{
 				EventType: parser.EventDelete,
 				RowBefore: before,
 			}},
-			want: before,
+			want: nil,
 		},
 		{
-			// Pin the len() > 0 vs != nil distinction. A future
-			// refactor that swapped len() for a nil-check would
-			// silently regress DELETE handling if the indexer ever
-			// emitted an empty non-nil RowAfter (defensive map
-			// allocation upstream, redaction blanking every column,
-			// etc.). Without this case the regression slips through
-			// both "delete_fallback" (RowAfter is nil there) and
-			// "both_empty" (RowBefore is also empty there).
-			name: "row_after_empty_map_falls_back_to_row_before",
+			// Pin the len() > 0 vs != nil distinction on the
+			// non-DELETE fallback path. A future refactor that
+			// swapped len() for a nil-check would silently regress
+			// UPDATE handling if the indexer ever emitted an empty
+			// non-nil RowAfter (defensive map allocation upstream,
+			// redaction blanking every column, etc.). The DELETE
+			// cases don't cover this anymore — they short-circuit
+			// before reaching the image-presence checks.
+			name: "update_row_after_empty_map_falls_back_to_row_before",
 			rows: []query.ResultRow{{
-				EventType: parser.EventDelete,
+				EventType: parser.EventUpdate,
 				RowAfter:  map[string]any{},
 				RowBefore: before,
 			}},
@@ -517,17 +522,14 @@ func TestSelectImage(t *testing.T) {
 	}
 }
 
-// TestExtractFullTableImagesPinsDivergence locks in the contract
-// divergence between full-table reconstruction (#276) and the existing
-// point-lookup path. Given the SAME DELETE event:
-//   - selectImage returns the row_before — the row's last known state.
-//   - extractFullTableImages skips it — the row didn't exist at AS OF.
-//
-// A future refactor that "unifies" the two paths would silently break
-// either point-lookup forensics or full-table correctness. Pinning
-// both behaviors against the same input here turns that into a loud
-// test failure.
-func TestExtractFullTableImagesPinsDivergence(t *testing.T) {
+// TestExtractFullTableImages pins the two skip rules of the
+// full-table reconstruction path (#276): DELETE events are dropped
+// (the row did not exist at AS OF) and INSERTs with a nil row_after
+// are dropped (corrupted index — emitting an all-null phantom row
+// would overstate the table's row count). selectImage shares the
+// DELETE-skip rule since #287; that convergence is asserted by
+// TestSelectImage's delete_returns_nil case.
+func TestExtractFullTableImages(t *testing.T) {
 	deleteRow := query.ResultRow{
 		EventType: parser.EventDelete,
 		RowBefore: map[string]any{"id": int64(1), "qty": int64(5)},
@@ -536,17 +538,11 @@ func TestExtractFullTableImagesPinsDivergence(t *testing.T) {
 		EventType: parser.EventInsert,
 		RowAfter:  map[string]any{"id": int64(2), "qty": int64(7)},
 	}
-	// Empty row_after is the "rare — corrupted index" branch. Drop
-	// it so the resultset doesn't overstate the row count with an
-	// all-null phantom row.
 	emptyAfterRow := query.ResultRow{
 		EventType: parser.EventInsert,
 		RowAfter:  nil,
 	}
 
-	if got := selectImage([]query.ResultRow{deleteRow}); got == nil {
-		t.Errorf("selectImage([DELETE]) must keep row_before for point-lookup; got nil")
-	}
 	if got := extractFullTableImages([]query.ResultRow{deleteRow}); len(got) != 0 {
 		t.Errorf("extractFullTableImages([DELETE]) must skip the row; got %v", got)
 	}

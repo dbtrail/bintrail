@@ -346,8 +346,8 @@ func wrapFetchError(qType QueryType, err error) error {
 //
 // Two shapes are recognised, sharing this entry point:
 //   - q.PKColumn != "": single-row point-lookup. Returns the latest
-//     event's image (row_after for INSERT/UPDATE, row_before for
-//     DELETE — "last known state").
+//     INSERT/UPDATE post-image, or an empty resultset when the latest
+//     event at-or-before AsOf is a DELETE.
 //   - q.PKColumn == "": full-table reconstruction (issue #276).
 //     Dispatches to runFullTable.
 //
@@ -355,13 +355,10 @@ func wrapFetchError(qType QueryType, err error) error {
 // (legitimate against a NOT-NULL VARCHAR column) stays a single-row
 // point-lookup instead of silently flipping to a 100k-row table scan.
 //
-// The DELETE semantics intentionally diverge between the two paths:
-// point-lookup keeps the DELETE's row_before so a forensic operator
-// asking "what was this row?" gets an answer even past its deletion;
-// full-table SKIPS DELETEs because the row didn't exist at AS OF
-// and its presence in a `SELECT *` resultset would be wrong. The
-// split is load-bearing — see TestSelectImage and
-// TestExtractFullTableImagesPinsDivergence.
+// Both shapes treat DELETE as "row did not exist at AsOf" — the
+// Oracle AS OF semantic the docs call out (docs/time-travel-sql.md).
+// Forensic queries for the pre-delete image still work via _diff,
+// which exposes the full per-PK event history including row_before.
 //
 // _flashback and _snapshot share this implementation today. _snapshot
 // is intended to grow baseline-lookup support (querying the
@@ -411,13 +408,8 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 // (issue #276). The SQL it issues is identical to the point-lookup
 // path — query.Engine with LimitPerPK=1 and Until=q.AsOf — except
 // PKValues is empty so the windowed query returns the latest event
-// per PK across the whole table.
-//
-// DELETE handling diverges from the point-lookup path: rows whose
-// latest event is a DELETE are SKIPPED because the row did not exist
-// at q.AsOf. Including them in a `SELECT *` resultset would be
-// indistinguishable from rows that did exist, breaking the
-// "AS OF returns the table's state at that instant" contract.
+// per PK across the whole table. Rows whose latest event is a DELETE
+// are skipped (same semantic as the point-lookup path).
 //
 // Cost guardrail: queries are capped at fullTableRowCap rows. We
 // fetch one extra row (cap+1) so the overflow is detectable; if the
@@ -467,12 +459,9 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 }
 
 // extractFullTableImages picks the post-image of every non-DELETE
-// event in rows. The DELETE skip is what makes full-table
-// reconstruction's contract (rows that existed at AS OF) diverge from
-// selectImage's contract (last known state, including the row_before
-// of a DELETE). The two contracts are intentionally different — see
-// TestSelectImage and TestExtractFullTableImagesPinsDivergence for
-// the regression tripwires.
+// event in rows. Skipping DELETEs is what makes the resultset
+// represent the table's state at AS OF — rows whose latest event
+// was a DELETE did not exist at that instant.
 func extractFullTableImages(rows []query.ResultRow) []map[string]any {
 	images := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
@@ -604,25 +593,32 @@ func (h *Handler) columnOrderFor(schema, table string) []string {
 // or larger slice and only ever inspects rows[0], so a future caller
 // that loosens the limit cannot accidentally pick the wrong event.
 //
-// Priority: row_after wins when present (the post-image of an
-// INSERT/UPDATE is the row's state). Fall back to row_before for
-// DELETE events, where row_after is empty but row_before captures the
-// row's state at the moment of deletion. Returns nil to signal the
-// caller should respond with an empty resultset — either because
-// there were no rows, or because both images were empty (which would
-// indicate corrupted index data, treated as "no answer" rather than
-// fabricating one).
+// Returns nil — meaning the caller responds with an empty resultset —
+// in three cases: (1) no rows, (2) the latest event is a DELETE
+// (the row did not exist at AsOf; matches docs/time-travel-sql.md's
+// Oracle AS OF semantic and the full-table path), (3) both images
+// are empty on an INSERT/UPDATE (corrupted index — treated as "no
+// answer" rather than fabricating one).
 //
-// Extracted as a pure helper specifically so the priority rule can
-// be unit-tested without spinning up a real MySQL: a future refactor
-// that swaps the row_after / row_before order would silently return
-// stale data on every UPDATE, with the regression invisible to any
+// For non-DELETE events, row_after wins when present (the post-image
+// of an INSERT/UPDATE is the row's state) and row_before is the
+// fallback used only when row_after is missing — a path the regular
+// indexer pipeline doesn't exercise but kept defensively.
+//
+// Extracted as a pure helper specifically so the rule can be
+// unit-tested without spinning up a real MySQL: a future refactor
+// that reintroduced the row_before fallback for DELETE would silently
+// return stale data on every "what does this row look like AS OF
+// after its deletion?" query, with the regression invisible to any
 // test that doesn't exercise this exact branch.
 func selectImage(rows []query.ResultRow) map[string]any {
 	if len(rows) == 0 {
 		return nil
 	}
 	latest := rows[0]
+	if latest.EventType == parser.EventDelete {
+		return nil
+	}
 	if len(latest.RowAfter) > 0 {
 		return latest.RowAfter
 	}

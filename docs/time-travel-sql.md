@@ -294,7 +294,13 @@ The shim emits typed wire codes so ORMs and monitoring can distinguish *user inp
 
 ### Time-travel query returns empty
 
-The row had no event at-or-before the requested timestamp. A coverage gap or archive failure would surface as a MySQL error instead, not as an empty result (unless you started the shim with `--allow-gaps`). Widen the lookup with `_diff` to inspect the per-PK history, or check the agent is keeping up:
+Three causes produce an empty `_flashback` / `_snapshot` resultset:
+
+1. The row had no event at-or-before the requested timestamp.
+2. The latest event at-or-before the timestamp is a DELETE — the row did not exist at AS OF (Oracle `AS OF` semantic; matches the full-table path).
+3. A coverage gap or archive failure under `--allow-gaps` (without that flag the shim returns `ER_NO_PARTITION_FOR_GIVEN_VALUE` (1526) instead, so the three causes are distinguishable on the default strict configuration).
+
+To distinguish cases 1 and 2, query `_diff` for the per-PK history: it returns every event (including the DELETE's `row_before`), so a row that was deleted produces at least one row in the diff resultset while a row that never existed produces zero. Or check the agent is keeping up:
 
 ```sh
 journalctl -u bintrail-agent -n 200

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `bintrail shim` point-lookup `_flashback` / `_snapshot` now returns an empty resultset when the latest event at-or-before AS OF is a DELETE — matching the full-table reconstruction path (#276) and the Oracle `AS OF` semantic the docs already advertise (`docs/time-travel-sql.md`). Previously the PK-filtered path resurrected the row by returning the DELETE's `row_before` — a behaviour intentionally shipped in 0.7.5 ("point-lookup path is unchanged") but inconsistent with the no-`WHERE` path, the docs, and operator expectations. The forensic "what did this row look like right before deletion?" question is still answerable via `_diff`, which returns the full per-PK history including the DELETE's `row_before`. `docs/time-travel-sql.md`'s "Time-travel query returns empty" section now enumerates the DELETE cause and points operators at `_diff` for the distinction. The convergence is pinned by `TestSelectImage.delete_returns_nil` + `TestExtractFullTableImages` (#287).
+
 ## [0.7.5] - 2026-05-09
 
 ### Added
