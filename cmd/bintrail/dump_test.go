@@ -511,6 +511,58 @@ func TestRunDump_invalidSourceDSN(t *testing.T) {
 	}
 }
 
+// TestRunDump_capturesStderrOnFailure verifies the fix for the issue where
+// every mydumper failure surfaced as the opaque "mydumper failed: exit
+// status 1" message, hiding the real diagnostic (auth plugin mismatch,
+// missing privilege, full disk, etc.) emitted by mydumper on stderr.
+func TestRunDump_capturesStderrOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	fakeBin := filepath.Join(dir, "mydumper")
+	// Fake mydumper that prints a recognizable diagnostic to stderr and
+	// exits non-zero. The --version probe returns a valid version so the
+	// caller doesn't bail out before invoking the dump.
+	script := `#!/bin/bash
+if [ "$1" = "--version" ]; then
+  echo "mydumper 0.15.0 (built with foo)"
+  exit 0
+fi
+echo "CRITICAL: simulated mydumper failure (auth plugin caching_sha2_password)" >&2
+exit 1
+`
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to create fake mydumper: %v", err)
+	}
+
+	saved := struct {
+		path, dsn, outDir, format string
+	}{dmpMydumperPath, dmpSourceDSN, dmpOutputDir, dmpFormat}
+	t.Cleanup(func() {
+		dmpMydumperPath = saved.path
+		dumpCmd.Flags().Set("mydumper-path", saved.path)
+		dmpSourceDSN = saved.dsn
+		dmpOutputDir = saved.outDir
+		dmpFormat = saved.format
+	})
+
+	dumpCmd.Flags().Set("mydumper-path", fakeBin)
+	dmpSourceDSN = "root:rootpw@tcp(127.0.0.1:3306)/"
+	dmpOutputDir = filepath.Join(dir, "out")
+	dmpFormat = "text"
+
+	err := runDump(dumpCmd, nil)
+	if err == nil {
+		t.Fatal("expected error from failing mydumper, got nil")
+	}
+	if !strings.Contains(err.Error(), "mydumper failed") {
+		t.Errorf("expected error to mention 'mydumper failed', got: %v", err)
+	}
+	// The whole point of the fix: stderr from mydumper must be in the
+	// returned error so the operator can debug without re-running by hand.
+	if !strings.Contains(err.Error(), "CRITICAL") || !strings.Contains(err.Error(), "caching_sha2_password") {
+		t.Errorf("expected error to include mydumper stderr ('CRITICAL ... caching_sha2_password'), got: %v", err)
+	}
+}
+
 // ─── resolveMydumper ──────────────────────────────────────────────────────────
 
 func TestResolveMydumper_explicitPathTakesPrecedence(t *testing.T) {

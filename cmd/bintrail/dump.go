@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -236,11 +238,23 @@ func runDump(cmd *cobra.Command, args []string) error {
 		slog.Info("starting dump", "path", res.path, "output_dir", dmpOutputDir)
 	}
 
+	// Always capture stderr into a buffer so the error message can include
+	// the actual diagnostic — "exit status 1" by itself hides why mydumper
+	// failed (auth plugin mismatch, missing privilege, full disk, etc.).
+	// In text mode we ALSO passthrough to the user's terminal so they see
+	// progress live; in JSON mode the caller is parsing stdout so we keep
+	// stderr buffered only.
+	var stderrBuf bytes.Buffer
 	if dmpFormat != "json" {
 		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
+		c.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+	} else {
+		c.Stderr = &stderrBuf
 	}
 	if runErr := c.Run(); runErr != nil {
+		if stderr := strings.TrimSpace(stderrBuf.String()); stderr != "" {
+			return fmt.Errorf("mydumper failed: %w; stderr: %s", runErr, stderr)
+		}
 		return fmt.Errorf("mydumper failed: %w", runErr)
 	}
 
