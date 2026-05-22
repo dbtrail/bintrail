@@ -144,6 +144,17 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("at least one data source required: --index-dsn, --archive-dir, --archive-s3, or BYOS mode (--source-dsn + --server-id)")
 	}
 
+	// BYOS mode requires a flush sink (S3 bucket) so events are durably
+	// persisted. Without one, the in-memory buffer accumulates events
+	// with no durable destination and drops everything on restart — the
+	// agent looks healthy on the WebSocket channel while the SaaS sees
+	// zero data. Refuse to start so the misconfiguration surfaces at
+	// startup rather than as silent zero-data drift on the SaaS side.
+	// See issue #289.
+	if err := validateBYOSFlushConfig(byosMode, agtS3Bucket); err != nil {
+		return err
+	}
+
 	handler := &agent.DefaultHandler{
 		ArchiveSources: archiveSources,
 		Logger:         slog.Default(),
@@ -959,6 +970,32 @@ func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Reso
 	}
 
 	return metadata.NewResolverFromTables(0, tables), nil
+}
+
+// validateBYOSFlushConfig enforces that a BYOS-mode agent has a configured
+// flush sink. Returns an error if BYOS mode is enabled but s3Bucket is empty.
+//
+// Rationale (issue #289): when --source-dsn and --server-id are set the agent
+// reads binlogs into an in-memory buffer. The buffer is flushed to the SaaS
+// (metadata) and customer S3 (payload) only when --s3-bucket is set. Without a
+// flush sink, the agent looks healthy on the WebSocket channel while every
+// event accumulates in memory and is dropped on restart, with no operator
+// signal — the SaaS Explorer / recover / who-changed flows return empty.
+//
+// We fail fast at startup rather than warn-and-continue: most operators don't
+// read agent logs proactively, and the steady-state symptom (empty Explorer)
+// is exactly the silent-failure mode the project explicitly rejects (cf #262,
+// #277). A future --saas-managed-storage flag could default the S3 target to a
+// dbtrail-resolved location once the SaaS endpoint to resolve it exists; until
+// then, an explicit --s3-bucket is mandatory.
+func validateBYOSFlushConfig(byosMode bool, s3Bucket string) error {
+	if !byosMode {
+		return nil
+	}
+	if s3Bucket == "" {
+		return fmt.Errorf("BYOS mode (--source-dsn + --server-id) requires --s3-bucket (or BINTRAIL_S3_BUCKET) to flush events to durable storage; agent refuses to start to prevent silent data loss (the in-memory buffer would accumulate events and drop them on restart with no operator signal). See issue #289")
+	}
+	return nil
 }
 
 // parseByteSize parses a human-readable byte size string like "256MB" or "1GB".

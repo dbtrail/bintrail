@@ -8,6 +8,17 @@
 //	SELECT * FROM _snapshot.<table>  AS OF '<ts>'           WHERE <col> = <value>
 //	SELECT * FROM _diff.<table>      BETWEEN '<t1>' AND '<t2>' WHERE <col> = <value>
 //
+// A fourth, ergonomic shape — the optimizer-hint comment form —
+// is also accepted and rewritten internally to _flashback:
+//
+//	SELECT /*+ DBTRAIL_AT='<ts>' */ * FROM [<schema>.]<table> [WHERE <col> = <value>]
+//
+// This is friendlier for ORMs (Hibernate, Sequelize, etc.) that
+// can't easily rewrite the FROM clause from app code. ProxySQL's
+// docs-advertised `DBTRAIL_AT` routing rule matches this form and
+// forwards it to the shim hostgroup; the shim then transparently
+// time-travels the original table. See issue #288.
+//
 // _flashback returns the row's state at-or-before the AS OF instant.
 // _snapshot is currently identical to _flashback; the distinction is
 //   semantic: _snapshot is intended to integrate baseline lookups (the
@@ -80,6 +91,54 @@ var (
 	flashbackRE = mustCompileAsOf(`_flashback`)
 	snapshotRE  = mustCompileAsOf(`_snapshot`)
 	diffRE      = mustCompileDiff()
+
+	// hintRE matches the optimizer-hint comment form documented at
+	// https://www.dbtrail.com/docs/guides/proxysql-time-travel/ :
+	//
+	//   SELECT /*+ DBTRAIL_AT='<ts>' */ * FROM [<schema>.]<table> [WHERE <col> = <val>] [;]
+	//
+	// ProxySQL routes any statement containing DBTRAIL_AT to the shim
+	// (the rule_id 990001-990003 set written by `bintrail
+	// proxysql-config`), so the shim must recognise the hint and
+	// rewrite it into the canonical `_flashback.<table> AS OF '<ts>'`
+	// shape before the virtual-schema dispatch fires. See issue #288.
+	//
+	// The hint may sit either between `SELECT` and `*` (the form the
+	// docs example uses, which is also where MySQL itself expects an
+	// optimizer hint) or between `*` and `FROM`. Mid-query hints
+	// (between WHERE and the predicate, etc.) are intentionally not
+	// supported — they're not in the docs and add ambiguity to the
+	// rewrite path.
+	//
+	// Capture groups:
+	//   1 = timestamp (between the quotes) when hint is in the
+	//       `SELECT /*+...*/ *` position
+	//   2 = timestamp when hint is in the `SELECT * /*+...*/ FROM`
+	//       position (only one of group 1 or 2 is non-empty)
+	//   3 = schema prefix (without trailing dot) or empty
+	//   4 = table
+	//   5 = WHERE clause column (or empty)
+	//   6 = WHERE clause value, quoted or numeric (or empty)
+	hintRE = regexp.MustCompile(
+		`(?i)^\s*SELECT\s+` +
+			`(?:/\*\+\s*DBTRAIL_AT\s*=\s*'([^']*)'\s*\*/\s+\*|` +
+			`\*\s+/\*\+\s*DBTRAIL_AT\s*=\s*'([^']*)'\s*\*/)` +
+			`\s+FROM\s+(?:([A-Za-z_][A-Za-z0-9_]*)\.)?([A-Za-z_][A-Za-z0-9_]*)` +
+			`(?:\s+WHERE\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('[^']*'|-?\d+))?` +
+			`\s*;?\s*$`,
+	)
+
+	// hintProbeRE is a cheap, anchored test for "does this query look
+	// like a SELECT whose leading optimizer-hint comment is the
+	// DBTRAIL_AT form?" Anchoring to ^\s*SELECT (and requiring the
+	// hint immediately after SELECT or after `*`) means a query
+	// containing the literal text `DBTRAIL_AT` inside a string
+	// literal — `WHERE comment = '/*+ DBTRAIL_AT=foo */'` — does
+	// NOT trigger the rewrite path. Without this anchor a benign
+	// query would hit parseHintForm, fail hintRE.FindStringSubmatch,
+	// and return ER_PARSE_ERROR (1064) to the customer when the
+	// query is perfectly valid for the upstream MySQL.
+	hintProbeRE = regexp.MustCompile(`(?i)^\s*SELECT\s+(?:\*\s+)?/\*\+\s*DBTRAIL_AT\b`)
 )
 
 // mustCompileAsOf builds a regex for `_flashback` / `_snapshot` shapes.
@@ -122,6 +181,19 @@ func Parse(sql, defaultSchema string) (TimeTravelQuery, error) {
 	trimmed := strings.TrimSpace(sql)
 	if trimmed == "" {
 		return TimeTravelQuery{}, ErrNotTimeTravel
+	}
+
+	// Hint-comment form (issue #288). When the docs-advertised
+	//   SELECT /*+ DBTRAIL_AT='<ts>' */ * FROM [<schema>.]<table> [WHERE ...]
+	// shape is detected, parse it directly into a TypeFlashback
+	// TimeTravelQuery — the user-facing FROM keeps the real table
+	// name, and the shim transparently time-travels it. The hint
+	// form never reaches the `_flashback.` prefix screen below, so
+	// detection has to fire here. We probe cheaply first
+	// (case-insensitive token check) so non-hint queries pay one
+	// regex check, not the full hintRE match.
+	if hintProbeRE.MatchString(trimmed) {
+		return parseHintForm(trimmed, defaultSchema)
 	}
 
 	// Quick prefix screen so non-virtual queries pay only one
@@ -214,4 +286,56 @@ func stripQuotes(s string) string {
 		return s[1 : len(s)-1]
 	}
 	return s
+}
+
+// parseHintForm handles the optimizer-hint comment form:
+//
+//	SELECT /*+ DBTRAIL_AT='<ts>' */ * FROM [<schema>.]<table> [WHERE <col> = <val>]
+//
+// This is the form the dbtrail docs advertise (and the form
+// ProxySQL is configured to route via the `DBTRAIL_AT` match
+// rule). It rewrites internally to a TypeFlashback query with the
+// real table name and AS OF = the hint timestamp.
+//
+// On any malformed input — bad timestamp, missing FROM, etc. —
+// returns a non-ErrNotTimeTravel error so HandleQuery emits
+// ER_PARSE_ERROR (1064), the same way it does for malformed
+// `_flashback.<t> AS OF '...'` queries.
+func parseHintForm(trimmed, defaultSchema string) (TimeTravelQuery, error) {
+	m := hintRE.FindStringSubmatch(trimmed)
+	if m == nil {
+		return TimeTravelQuery{}, fmt.Errorf(
+			"malformed time-travel hint; expected:\n" +
+				"  SELECT /*+ DBTRAIL_AT='<ts>' */ * FROM [<schema>.]<table> [WHERE <col> = <value>]",
+		)
+	}
+	// Group 1 or 2 holds the timestamp depending on hint position;
+	// exactly one is non-empty. Same for the optional WHERE groups
+	// (5/6 may be empty for the full-table shape).
+	ts := m[1]
+	if ts == "" {
+		ts = m[2]
+	}
+	asOf, err := parseTimeLiteral(ts)
+	if err != nil {
+		return TimeTravelQuery{}, fmt.Errorf("invalid AS OF timestamp %q: %w", ts, err)
+	}
+	schema := m[3]
+	if schema == "" {
+		schema = defaultSchema
+	}
+	if schema == "" {
+		return TimeTravelQuery{}, fmt.Errorf(
+			"no schema selected; issue `USE <database>;` before running a time-travel query " +
+				"(or qualify the table as <schema>.<table>)",
+		)
+	}
+	return TimeTravelQuery{
+		Type:     TypeFlashback,
+		Schema:   schema,
+		Table:    m[4],
+		AsOf:     asOf,
+		PKColumn: m[5],
+		PKValue:  stripQuotes(m[6]),
+	}, nil
 }

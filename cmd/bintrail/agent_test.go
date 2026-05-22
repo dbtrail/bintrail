@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -421,6 +422,62 @@ func TestAgentFlagDefaults(t *testing.T) {
 		if f.DefValue != tt.want {
 			t.Errorf("--%s default = %q, want %q", tt.flag, f.DefValue, tt.want)
 		}
+	}
+}
+
+func TestValidateBYOSFlushConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		byosMode  bool
+		s3Bucket  string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:     "non-BYOS without bucket is fine",
+			byosMode: false,
+			s3Bucket: "",
+			wantErr:  false,
+		},
+		{
+			name:     "non-BYOS with bucket is fine",
+			byosMode: false,
+			s3Bucket: "my-bucket",
+			wantErr:  false,
+		},
+		{
+			name:      "BYOS without bucket is rejected",
+			byosMode:  true,
+			s3Bucket:  "",
+			wantErr:   true,
+			errSubstr: "--s3-bucket",
+		},
+		{
+			name:     "BYOS with bucket is accepted",
+			byosMode: true,
+			s3Bucket: "my-bucket",
+			wantErr:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateBYOSFlushConfig(tt.byosMode, tt.s3Bucket)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if tt.errSubstr != "" && !strings.Contains(err.Error(), tt.errSubstr) {
+					t.Errorf("error %q does not contain %q", err.Error(), tt.errSubstr)
+				}
+				// The error should also mention the env-var variant so
+				// operators reading agent stderr know both forms.
+				if !strings.Contains(err.Error(), "BINTRAIL_S3_BUCKET") {
+					t.Errorf("error %q should mention BINTRAIL_S3_BUCKET", err.Error())
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 

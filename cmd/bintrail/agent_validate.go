@@ -68,6 +68,15 @@ func runAgentValidate(ctx context.Context) error {
 		if err != nil {
 			failed++
 		}
+	} else if agtSourceDSN != "" && agtServerID != 0 {
+		// Mirror the runAgent invariant: BYOS mode (#289) requires
+		// --s3-bucket. If --validate said "skipped" while the real run
+		// would refuse to start, the operator would clear --validate,
+		// re-run, and hit the fail-fast — a smaller version of the same
+		// silent-misconfiguration UX the original bug filed against.
+		printCheck("BYOS flush sink", "",
+			fmt.Errorf("--s3-bucket (or BINTRAIL_S3_BUCKET) is required in BYOS mode (--source-dsn + --server-id set); without it the agent buffers events in memory and drops them on restart"))
+		failed++
 	} else {
 		printSkip("S3 bucket", "--s3-bucket not set")
 	}
