@@ -27,6 +27,19 @@ const (
 	ruleIDFlashback      = 990001
 	ruleIDDiff           = 990002
 	ruleIDSnapshot       = 990003
+	// ruleIDHint matches the optimizer-hint comment form (#288):
+	//   SELECT /*+ DBTRAIL_AT='<ts>' */ * FROM <table> ...
+	// The shim parser detects the hint, strips it, and rewrites the
+	// query as a TypeFlashback point-lookup against the real table
+	// name. Without this rule, queries using the docs-advertised
+	// hint form route to the real MySQL (which silently ignores the
+	// unknown hint) instead of the shim — the feature is undelivered
+	// end-to-end. The rule is intentionally ordered AFTER the three
+	// virtual-schema rules so that a query like
+	//   SELECT /*+ DBTRAIL_AT='...' */ * FROM _flashback.t AS OF ...
+	// (no real-world need but defensible) still routes via the more
+	// specific virtual-schema rule first.
+	ruleIDHint = 990004
 )
 
 var proxysqlConfigCmd = &cobra.Command{
@@ -279,7 +292,7 @@ func generateProxySQLSetupSQL(host string, mysqlPort, shimPort, proxysqlMySQLPor
 	sb.WriteString("-- This script manages the following ProxySQL resources, all in the\n")
 	sb.WriteString("-- 990* numeric range to avoid colliding with operator-managed rules:\n")
 	fmt.Fprintf(&sb, "--   * mysql_servers in hostgroups %d (passthrough) and %d (shim)\n", passthroughHostgroup, shimHostgroup)
-	fmt.Fprintf(&sb, "--   * mysql_query_rules with rule_id in %d..%d\n", ruleIDFlashback, ruleIDSnapshot)
+	fmt.Fprintf(&sb, "--   * mysql_query_rules with rule_id in %d..%d\n", ruleIDFlashback, ruleIDHint)
 	sb.WriteString("--   * mysql_users named in shim.yaml (these become bintrail-managed)\n")
 	sb.WriteString("--\n")
 	sb.WriteString("-- Apply this file to the ProxySQL admin port:\n")
@@ -316,10 +329,17 @@ func generateProxySQLSetupSQL(host string, mysqlPort, shimPort, proxysqlMySQLPor
 	}
 	sb.WriteString("\n")
 
-	fmt.Fprintf(&sb, "DELETE FROM mysql_query_rules WHERE rule_id IN (%d, %d, %d);\n", ruleIDFlashback, ruleIDDiff, ruleIDSnapshot)
+	fmt.Fprintf(&sb, "DELETE FROM mysql_query_rules WHERE rule_id IN (%d, %d, %d, %d);\n", ruleIDFlashback, ruleIDDiff, ruleIDSnapshot, ruleIDHint)
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '\\b_flashback\\.', %d, 1);\n", ruleIDFlashback, shimHostgroup)
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '\\b_diff\\.', %d, 1);\n", ruleIDDiff, shimHostgroup)
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '\\b_snapshot\\.', %d, 1);\n", ruleIDSnapshot, shimHostgroup)
+	// Hint-comment form (#288): the shim's parser detects
+	// /*+ DBTRAIL_AT='<ts>' */ in the leading optimizer-hint position
+	// and rewrites the query to a _flashback point-lookup. The
+	// match_pattern intentionally anchors to /\*\+\s*DBTRAIL_AT so a
+	// table or column literally named DBTRAIL_AT (or a string value
+	// containing that text) doesn't get false-routed to the shim.
+	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '/\\*\\+\\s*DBTRAIL_AT', %d, 1);\n", ruleIDHint, shimHostgroup)
 	sb.WriteString("\n")
 
 	sb.WriteString("COMMIT;\n")

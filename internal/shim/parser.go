@@ -120,7 +120,7 @@ var (
 	//   5 = WHERE clause column (or empty)
 	//   6 = WHERE clause value, quoted or numeric (or empty)
 	hintRE = regexp.MustCompile(
-		`(?is)^\s*SELECT\s+` +
+		`(?i)^\s*SELECT\s+` +
 			`(?:/\*\+\s*DBTRAIL_AT\s*=\s*'([^']*)'\s*\*/\s+\*|` +
 			`\*\s+/\*\+\s*DBTRAIL_AT\s*=\s*'([^']*)'\s*\*/)` +
 			`\s+FROM\s+(?:([A-Za-z_][A-Za-z0-9_]*)\.)?([A-Za-z_][A-Za-z0-9_]*)` +
@@ -128,12 +128,17 @@ var (
 			`\s*;?\s*$`,
 	)
 
-	// hintProbeRE is a cheap, regex-anchored test for "does this query
-	// look like the hint-comment form?" The full hintRE is too
-	// expensive to run on every non-time-travel query; this probe
-	// gates the rewrite path so the steady-state cost is one
-	// case-insensitive token check.
-	hintProbeRE = regexp.MustCompile(`(?i)/\*\+\s*DBTRAIL_AT\b`)
+	// hintProbeRE is a cheap, anchored test for "does this query look
+	// like a SELECT whose leading optimizer-hint comment is the
+	// DBTRAIL_AT form?" Anchoring to ^\s*SELECT (and requiring the
+	// hint immediately after SELECT or after `*`) means a query
+	// containing the literal text `DBTRAIL_AT` inside a string
+	// literal — `WHERE comment = '/*+ DBTRAIL_AT=foo */'` — does
+	// NOT trigger the rewrite path. Without this anchor a benign
+	// query would hit parseHintForm, fail hintRE.FindStringSubmatch,
+	// and return ER_PARSE_ERROR (1064) to the customer when the
+	// query is perfectly valid for the upstream MySQL.
+	hintProbeRE = regexp.MustCompile(`(?i)^\s*SELECT\s+(?:\*\s+)?/\*\+\s*DBTRAIL_AT\b`)
 )
 
 // mustCompileAsOf builds a regex for `_flashback` / `_snapshot` shapes.

@@ -441,6 +441,40 @@ func TestParseHintFormRequiresSchema(t *testing.T) {
 	}
 }
 
+// TestParseHintFormProbeDoesNotFireOnStringLiteral pins the
+// false-positive guard surfaced in the #294 review: a customer
+// query whose WHERE/value contains the literal text /*+ DBTRAIL_AT…
+// (e.g. an audit table where someone logged a query) must NOT
+// trigger the rewrite path. Before the probe was anchored to
+// ^\s*SELECT, the probe matched anywhere in the query — including
+// inside string literals — so parseHintForm fired and returned
+// ER_PARSE_ERROR (1064) to the customer when the query was
+// perfectly valid for the upstream MySQL.
+//
+// Expected: ErrNotTimeTravel. The shim treats this as
+// not-a-time-travel-query, HandleQuery returns the catch-all
+// ER_NOT_SUPPORTED_YET (1235) — same as any other non-time-travel
+// SELECT routed to the shim by mistake. Operators fix the routing
+// rather than blame the shim for a syntax error.
+func TestParseHintFormProbeDoesNotFireOnStringLiteral(t *testing.T) {
+	cases := []string{
+		`SELECT * FROM audit WHERE note = '/*+ DBTRAIL_AT=foo */'`,
+		`SELECT * FROM logs WHERE message = 'user ran /*+ DBTRAIL_AT=...'`,
+		`SELECT * FROM t WHERE description LIKE '%DBTRAIL_AT%'`,
+		// Hint in the WHERE position (not after SELECT) — out of
+		// spec, must not fire.
+		`SELECT * FROM t WHERE id = 1 /*+ DBTRAIL_AT='2026-01-01' */`,
+	}
+	for _, sql := range cases {
+		t.Run(sql, func(t *testing.T) {
+			_, err := Parse(sql, "myapp")
+			if !errors.Is(err, ErrNotTimeTravel) {
+				t.Errorf("Parse(%q) error = %v, want ErrNotTimeTravel (otherwise the customer gets ER_PARSE_ERROR on a valid non-hint query)", sql, err)
+			}
+		})
+	}
+}
+
 // TestParseHintFormDoesNotBreakNonHintQueries is a non-regression
 // guard: every parse case that passed before #288 must still parse
 // identically. The hint detector is gated by hintProbeRE so the
