@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Store defines the persistence interface for OAuth and tenant data.
@@ -79,12 +80,41 @@ type RefreshTokenRecord struct {
 }
 
 // Tenant represents a customer's backend mapping.
+//
+// AuthSecretHash is the bcrypt hash of the per-tenant secret submitted on the
+// OAuth authorize page. Tenants created before this field existed have an
+// empty hash and are allowed to authorize without a secret (see VerifySecret),
+// gated by a warn-level log so operators can find unmigrated tenants. The
+// cleartext secret itself is never stored or returned to API consumers.
 type Tenant struct {
-	TenantID   string `dynamodbav:"tenant_id" json:"tenant_id"`
-	Tier       string `dynamodbav:"tier" json:"tier"`
-	BackendURL string `dynamodbav:"backend_url" json:"backend_url"`
-	IndexDSN   string `dynamodbav:"index_dsn" json:"index_dsn"`
-	Status     string `dynamodbav:"status" json:"status"`
+	TenantID       string `dynamodbav:"tenant_id" json:"tenant_id"`
+	Tier           string `dynamodbav:"tier" json:"tier"`
+	BackendURL     string `dynamodbav:"backend_url" json:"backend_url"`
+	IndexDSN       string `dynamodbav:"index_dsn" json:"index_dsn"`
+	Status         string `dynamodbav:"status" json:"status"`
+	AuthSecretHash string `dynamodbav:"auth_secret_hash" json:"auth_secret_hash,omitempty"`
+}
+
+// VerifySecret checks the submitted cleartext secret against the stored
+// bcrypt hash. If AuthSecretHash is empty (legacy tenant from before this
+// field existed), VerifySecret returns true regardless of the submitted
+// value — callers are responsible for logging a warning so operators can
+// migrate the tenant. Returns false on any cleartext mismatch.
+func (t *Tenant) VerifySecret(plaintext string) bool {
+	if t.AuthSecretHash == "" {
+		return true
+	}
+	return bcrypt.CompareHashAndPassword([]byte(t.AuthSecretHash), []byte(plaintext)) == nil
+}
+
+// HashSecret bcrypt-hashes a cleartext secret for storage on a Tenant. Returns
+// an error only if bcrypt itself fails (e.g. input exceeds 72 bytes).
+func HashSecret(plaintext string) (string, error) {
+	b, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // ─── DynamoDB implementation ─────────────────────────────────────────────────

@@ -71,12 +71,19 @@ func (h *AdminHandler) authenticate(w http.ResponseWriter, r *http.Request) bool
 }
 
 // tenantRequest is the JSON body for create/update operations.
+//
+// AuthSecret is the cleartext per-tenant secret operators set when creating
+// or rotating a tenant; it is bcrypt-hashed before persistence and never
+// echoed back on a GET. On PUT, an empty AuthSecret preserves the existing
+// stored hash — clearing a secret requires an explicit admin workflow (not
+// in this PR).
 type tenantRequest struct {
 	TenantID   string `json:"tenant_id"`
 	Tier       string `json:"tier"`
 	BackendURL string `json:"backend_url"`
 	IndexDSN   string `json:"index_dsn"`
 	Status     string `json:"status"`
+	AuthSecret string `json:"auth_secret,omitempty"`
 }
 
 func (h *AdminHandler) createTenant(w http.ResponseWriter, r *http.Request) {
@@ -101,13 +108,23 @@ func (h *AdminHandler) createTenant(w http.ResponseWriter, r *http.Request) {
 		Status:     req.Status,
 	}
 
+	if req.AuthSecret != "" {
+		hash, err := HashSecret(req.AuthSecret)
+		if err != nil {
+			slog.Error("hash tenant auth_secret", "tenant_id", req.TenantID, "error", err)
+			jsonError(w, "server_error", "failed to hash auth_secret", http.StatusInternalServerError)
+			return
+		}
+		tenant.AuthSecretHash = hash
+	}
+
 	if err := h.store.CreateTenant(r.Context(), tenant); err != nil {
 		slog.Error("create tenant", "tenant_id", req.TenantID, "error", err)
 		jsonError(w, "server_error", "failed to create tenant: "+err.Error(), http.StatusConflict)
 		return
 	}
 
-	slog.Info("tenant created", "tenant_id", req.TenantID, "tier", req.Tier)
+	slog.Info("tenant created", "tenant_id", req.TenantID, "tier", req.Tier, "auth_secret_set", tenant.AuthSecretHash != "")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(tenant)
@@ -157,13 +174,39 @@ func (h *AdminHandler) updateTenant(w http.ResponseWriter, r *http.Request, id s
 		Status:     req.Status,
 	}
 
+	// Auth-secret handling: a non-empty AuthSecret in the body rotates
+	// the secret (bcrypt-hash before storing). An empty AuthSecret
+	// preserves the existing hash — the admin must use an explicit
+	// future "clear secret" workflow to remove one, otherwise a
+	// PUT that omits auth_secret would silently downgrade the tenant
+	// to legacy-no-secret mode.
+	if req.AuthSecret != "" {
+		hash, err := HashSecret(req.AuthSecret)
+		if err != nil {
+			slog.Error("hash tenant auth_secret", "tenant_id", id, "error", err)
+			jsonError(w, "server_error", "failed to hash auth_secret", http.StatusInternalServerError)
+			return
+		}
+		tenant.AuthSecretHash = hash
+	} else {
+		existing, err := h.store.GetTenant(r.Context(), id)
+		if err != nil {
+			slog.Error("load tenant for auth_secret preservation", "tenant_id", id, "error", err)
+			jsonError(w, "server_error", "failed to load tenant for update", http.StatusInternalServerError)
+			return
+		}
+		if existing != nil {
+			tenant.AuthSecretHash = existing.AuthSecretHash
+		}
+	}
+
 	if err := h.store.UpdateTenant(r.Context(), tenant); err != nil {
 		slog.Error("update tenant", "tenant_id", id, "error", err)
 		jsonError(w, "server_error", "failed to update tenant: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	slog.Info("tenant updated", "tenant_id", id)
+	slog.Info("tenant updated", "tenant_id", id, "auth_secret_rotated", req.AuthSecret != "")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(tenant)
 }

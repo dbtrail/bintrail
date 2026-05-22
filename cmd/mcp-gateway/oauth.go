@@ -159,6 +159,11 @@ func (c *OAuthConfig) AuthorizeSubmitHandler(w http.ResponseWriter, r *http.Requ
 	state := r.FormValue("state")
 	codeChallenge := r.FormValue("code_challenge")
 	tenantID := r.FormValue("tenant_id")
+	// tenant_secret is OPTIONAL on the wire so legacy tenants without
+	// an AuthSecretHash continue to authorize during the gradual
+	// rollout — see Tenant.VerifySecret in store.go. A tenant that
+	// HAS configured a secret will reject an empty submission below.
+	tenantSecret := r.FormValue("tenant_secret")
 
 	if clientID == "" || redirectURI == "" || codeChallenge == "" || tenantID == "" {
 		jsonError(w, "invalid_request", "missing required fields", http.StatusBadRequest)
@@ -193,6 +198,23 @@ func (c *OAuthConfig) AuthorizeSubmitHandler(w http.ResponseWriter, r *http.Requ
 	if tenant == nil || tenant.Status != "active" {
 		jsonError(w, "invalid_request", "unknown or inactive tenant", http.StatusBadRequest)
 		return
+	}
+
+	// Issue #132: validate the per-tenant secret. Tenants with an
+	// empty AuthSecretHash (legacy, pre-#132) pass without a secret
+	// being submitted — VerifySecret returns true on empty hash so
+	// the gradual rollout doesn't break existing installs. We emit
+	// a warn-level log on every such authorize so operators can grep
+	// their gateway logs to find the unmigrated tenants.
+	if !tenant.VerifySecret(tenantSecret) {
+		// Log the rejection (without echoing the submitted secret).
+		slog.Info("authorize rejected: tenant secret mismatch", "tenant_id", tenantID)
+		jsonError(w, "invalid_request", "tenant secret is missing or incorrect", http.StatusUnauthorized)
+		return
+	}
+	if tenant.AuthSecretHash == "" {
+		slog.Warn("authorize accepted on legacy tenant without auth_secret; set one via PUT /admin/tenants/"+tenantID+" to enable per-tenant authentication",
+			"tenant_id", tenantID)
 	}
 
 	// Generate authorization code.
@@ -438,7 +460,7 @@ var authorizePage = `<!DOCTYPE html>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 400px; margin: 80px auto; padding: 0 20px; color: #333; }
     h1 { font-size: 1.4em; }
     label { display: block; margin-top: 16px; font-weight: 600; }
-    input[type=text] { width: 100%%; padding: 8px; margin-top: 4px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+    input[type=text], input[type=password] { width: 100%%; padding: 8px; margin-top: 4px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
     button { margin-top: 20px; padding: 10px 24px; background: #2563eb; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 1em; }
     button:hover { background: #1d4ed8; }
     .note { font-size: 0.85em; color: #666; margin-top: 8px; }
@@ -455,6 +477,9 @@ var authorizePage = `<!DOCTYPE html>
     <label for="tenant_id">Tenant ID</label>
     <input type="text" id="tenant_id" name="tenant_id" required placeholder="e.g. acme-corp">
     <p class="note">This is the identifier you received when you set up Bintrail.</p>
+    <label for="tenant_secret">Tenant Secret</label>
+    <input type="password" id="tenant_secret" name="tenant_secret" placeholder="set by your tenant administrator">
+    <p class="note">Required for tenants migrated to per-tenant secrets. Legacy tenants without a secret may leave this blank.</p>
     <button type="submit">Authorize</button>
   </form>
 </body>

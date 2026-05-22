@@ -409,3 +409,179 @@ func computeS256Challenge(verifier string) string {
 	h := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(h[:])
 }
+
+// ─── #132 per-tenant auth_secret on /oauth/authorize ─────────────────────────
+
+// TestAuthorizeSubmitHandler_correctSecret pins the happy path: a
+// tenant with AuthSecretHash set, the matching cleartext submitted,
+// authorize succeeds with a 302 + code (same shape as the legacy
+// test above).
+func TestAuthorizeSubmitHandler_correctSecret(t *testing.T) {
+	hash, err := HashSecret("hunter2")
+	if err != nil {
+		t.Fatalf("HashSecret: %v", err)
+	}
+	store := NewMemoryStore()
+	store.Clients["test-client"] = &OAuthClient{
+		ClientID: "test-client", ClientSecret: "secret",
+		RedirectURIs: []string{"https://claude.ai/api/mcp/auth_callback"},
+	}
+	store.Tenants["acme-corp"] = &Tenant{
+		TenantID: "acme-corp", Status: "active", AuthSecretHash: hash,
+	}
+	cfg := &OAuthConfig{Issuer: "https://mcp.dbtrail.com", Store: store}
+
+	form := url.Values{
+		"client_id":      {"test-client"},
+		"redirect_uri":   {"https://claude.ai/api/mcp/auth_callback"},
+		"state":          {"xyz"},
+		"code_challenge": {"abc123"},
+		"tenant_id":      {"acme-corp"},
+		"tenant_secret":  {"hunter2"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	cfg.AuthorizeSubmitHandler(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAuthorizeSubmitHandler_wrongSecret pins the security-critical
+// reject case. A tenant with AuthSecretHash set + a wrong cleartext
+// must return 401 — the bug the issue fixes is that anyone guessing
+// a valid tenant ID could obtain a token without authentication.
+func TestAuthorizeSubmitHandler_wrongSecret(t *testing.T) {
+	hash, err := HashSecret("hunter2")
+	if err != nil {
+		t.Fatalf("HashSecret: %v", err)
+	}
+	store := NewMemoryStore()
+	store.Clients["test-client"] = &OAuthClient{
+		ClientID: "test-client", ClientSecret: "secret",
+		RedirectURIs: []string{"https://claude.ai/api/mcp/auth_callback"},
+	}
+	store.Tenants["acme-corp"] = &Tenant{
+		TenantID: "acme-corp", Status: "active", AuthSecretHash: hash,
+	}
+	cfg := &OAuthConfig{Issuer: "https://mcp.dbtrail.com", Store: store}
+
+	form := url.Values{
+		"client_id":      {"test-client"},
+		"redirect_uri":   {"https://claude.ai/api/mcp/auth_callback"},
+		"code_challenge": {"abc123"},
+		"tenant_id":      {"acme-corp"},
+		"tenant_secret":  {"wrong-password"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	cfg.AuthorizeSubmitHandler(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.Codes) != 0 {
+		t.Errorf("no auth code must be created on a secret mismatch, got %d", len(store.Codes))
+	}
+}
+
+// TestAuthorizeSubmitHandler_missingSecretOnConfiguredTenant pins
+// that omitting the secret entirely against a tenant that HAS one
+// is rejected (no silent fallback to legacy-no-secret behaviour).
+func TestAuthorizeSubmitHandler_missingSecretOnConfiguredTenant(t *testing.T) {
+	hash, err := HashSecret("hunter2")
+	if err != nil {
+		t.Fatalf("HashSecret: %v", err)
+	}
+	store := NewMemoryStore()
+	store.Clients["test-client"] = &OAuthClient{
+		ClientID: "test-client", ClientSecret: "secret",
+		RedirectURIs: []string{"https://claude.ai/api/mcp/auth_callback"},
+	}
+	store.Tenants["acme-corp"] = &Tenant{
+		TenantID: "acme-corp", Status: "active", AuthSecretHash: hash,
+	}
+	cfg := &OAuthConfig{Issuer: "https://mcp.dbtrail.com", Store: store}
+
+	form := url.Values{
+		"client_id":      {"test-client"},
+		"redirect_uri":   {"https://claude.ai/api/mcp/auth_callback"},
+		"code_challenge": {"abc123"},
+		"tenant_id":      {"acme-corp"},
+		// tenant_secret intentionally omitted
+	}
+	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	cfg.AuthorizeSubmitHandler(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAuthorizeSubmitHandler_legacyTenantWithoutSecret pins the
+// gradual-rollout decision: a tenant with an EMPTY AuthSecretHash
+// (created before #132) continues to authorize without a secret.
+// VerifySecret returns true on empty hash regardless of the
+// submitted value; AuthorizeSubmitHandler emits a Warn log so
+// operators can grep logs for unmigrated tenants.
+func TestAuthorizeSubmitHandler_legacyTenantWithoutSecret(t *testing.T) {
+	store := NewMemoryStore()
+	store.Clients["test-client"] = &OAuthClient{
+		ClientID: "test-client", ClientSecret: "secret",
+		RedirectURIs: []string{"https://claude.ai/api/mcp/auth_callback"},
+	}
+	store.Tenants["legacy-tenant"] = &Tenant{
+		TenantID: "legacy-tenant", Status: "active",
+		// AuthSecretHash deliberately empty
+	}
+	cfg := &OAuthConfig{Issuer: "https://mcp.dbtrail.com", Store: store}
+
+	form := url.Values{
+		"client_id":      {"test-client"},
+		"redirect_uri":   {"https://claude.ai/api/mcp/auth_callback"},
+		"code_challenge": {"abc123"},
+		"tenant_id":      {"legacy-tenant"},
+		// tenant_secret omitted — legacy path
+	}
+	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	cfg.AuthorizeSubmitHandler(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302 on legacy tenant (gradual rollout), got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHashSecretAndVerify pins the bcrypt round-trip: HashSecret
+// produces a hash that VerifySecret accepts on the correct cleartext
+// and rejects on a wrong one. Empty stored hash short-circuits to
+// true — the gradual-rollout contract the handler relies on.
+func TestHashSecretAndVerify(t *testing.T) {
+	hash, err := HashSecret("hunter2")
+	if err != nil {
+		t.Fatalf("HashSecret: %v", err)
+	}
+	if hash == "" || hash == "hunter2" {
+		t.Errorf("HashSecret must not return empty or echo cleartext, got %q", hash)
+	}
+	tenant := &Tenant{AuthSecretHash: hash}
+	if !tenant.VerifySecret("hunter2") {
+		t.Errorf("VerifySecret(correct) = false, want true")
+	}
+	if tenant.VerifySecret("wrong-password") {
+		t.Errorf("VerifySecret(wrong) = true, want false")
+	}
+	legacy := &Tenant{AuthSecretHash: ""}
+	if !legacy.VerifySecret("anything") {
+		t.Errorf("VerifySecret on legacy tenant must return true (gradual rollout)")
+	}
+	if !legacy.VerifySecret("") {
+		t.Errorf("VerifySecret on legacy tenant with empty input must return true")
+	}
+}

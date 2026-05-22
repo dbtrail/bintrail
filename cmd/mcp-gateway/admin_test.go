@@ -207,3 +207,120 @@ func TestAdmin_unauthorized(t *testing.T) {
 		})
 	}
 }
+
+// ─── #132 per-tenant auth_secret on admin CRUD ───────────────────────────────
+
+// TestAdmin_createTenantWithAuthSecret pins that POST /admin/tenants
+// accepts auth_secret, hashes it with bcrypt, and never echoes the
+// cleartext back. The store ends up with a bcrypt hash that
+// round-trips through Tenant.VerifySecret.
+func TestAdmin_createTenantWithAuthSecret(t *testing.T) {
+	store := NewMemoryStore()
+	handler := NewAdminHandler(store, "secret")
+
+	body := `{"tenant_id":"acme","tier":"paid","status":"active","auth_secret":"hunter2"}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.Tenants["acme"]
+	if stored == nil {
+		t.Fatal("tenant not stored")
+	}
+	if stored.AuthSecretHash == "" {
+		t.Fatal("expected AuthSecretHash to be set after POST with auth_secret")
+	}
+	if stored.AuthSecretHash == "hunter2" {
+		t.Fatal("AuthSecretHash must be bcrypt-hashed, not cleartext")
+	}
+	if !stored.VerifySecret("hunter2") {
+		t.Errorf("stored hash does not verify against the submitted cleartext")
+	}
+	if stored.VerifySecret("wrong") {
+		t.Errorf("stored hash verifies against the wrong cleartext")
+	}
+
+	// Response body must NOT include the raw auth_secret. The
+	// AuthSecretHash field IS exposed (json tag omitempty), but the
+	// `auth_secret` cleartext input is request-only and must not
+	// round-trip.
+	if strings.Contains(rec.Body.String(), `"auth_secret"`) {
+		t.Errorf("response body must not echo the cleartext auth_secret field; got: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "hunter2") {
+		t.Errorf("response body must never contain the cleartext password; got: %s", rec.Body.String())
+	}
+}
+
+// TestAdmin_updateTenantPreservesAuthSecret pins the PUT contract:
+// an update with an empty auth_secret must preserve the existing
+// AuthSecretHash on the tenant. Otherwise a routine update (e.g.
+// changing tier) would silently downgrade the tenant to legacy
+// no-secret mode.
+func TestAdmin_updateTenantPreservesAuthSecret(t *testing.T) {
+	hash, err := HashSecret("hunter2")
+	if err != nil {
+		t.Fatalf("HashSecret: %v", err)
+	}
+	store := NewMemoryStore()
+	store.Tenants["acme"] = &Tenant{
+		TenantID: "acme", Tier: "free", Status: "active", AuthSecretHash: hash,
+	}
+	handler := NewAdminHandler(store, "secret")
+
+	// PUT with NO auth_secret — should preserve hash.
+	body := `{"tier":"paid","status":"active"}`
+	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.Tenants["acme"]
+	if stored.AuthSecretHash != hash {
+		t.Errorf("PUT with empty auth_secret cleared the hash:\n  before: %q\n  after:  %q", hash, stored.AuthSecretHash)
+	}
+	if stored.Tier != "paid" {
+		t.Errorf("Tier update did not apply: got %q", stored.Tier)
+	}
+}
+
+// TestAdmin_updateTenantRotatesAuthSecret pins the rotation path:
+// PUT with a non-empty auth_secret replaces the existing hash.
+func TestAdmin_updateTenantRotatesAuthSecret(t *testing.T) {
+	oldHash, err := HashSecret("old-password")
+	if err != nil {
+		t.Fatalf("HashSecret: %v", err)
+	}
+	store := NewMemoryStore()
+	store.Tenants["acme"] = &Tenant{
+		TenantID: "acme", Status: "active", AuthSecretHash: oldHash,
+	}
+	handler := NewAdminHandler(store, "secret")
+
+	body := `{"status":"active","auth_secret":"new-password"}`
+	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.Tenants["acme"]
+	if stored.AuthSecretHash == oldHash {
+		t.Errorf("PUT with auth_secret did not rotate the hash")
+	}
+	if !stored.VerifySecret("new-password") {
+		t.Errorf("new hash does not verify against the rotated cleartext")
+	}
+	if stored.VerifySecret("old-password") {
+		t.Errorf("old cleartext still verifies — rotation incomplete")
+	}
+}
