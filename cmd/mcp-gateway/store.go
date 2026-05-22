@@ -82,27 +82,38 @@ type RefreshTokenRecord struct {
 // Tenant represents a customer's backend mapping.
 //
 // AuthSecretHash is the bcrypt hash of the per-tenant secret submitted on the
-// OAuth authorize page. Tenants created before this field existed have an
-// empty hash and are allowed to authorize without a secret (see VerifySecret),
-// gated by a warn-level log so operators can find unmigrated tenants. The
-// cleartext secret itself is never stored or returned to API consumers.
+// OAuth authorize page. The cleartext secret itself is never stored or
+// returned to API consumers; the hash is also excluded from JSON responses
+// (`json:"-"`) so admin GET / LIST endpoints don't expose it to offline
+// brute-force after a less-than-strict admin-token leak.
+//
+// Strict-mode invariant (revised after the #132 multi-agent review): a
+// tenant with an empty AuthSecretHash is INVALID and cannot authorize —
+// see VerifySecret. The earlier "gradual rollout" design accepted such
+// tenants to ease migration but preserved the very tenant-ID-only auth
+// vulnerability #132 was filed to close, AND added a wire-level oracle
+// (302 vs 401) attackers could use to enumerate unmigrated tenants and
+// obtain auth codes for free. Operators must set an auth_secret on every
+// active tenant before this PR is rolled out; `createTenant` rejects
+// POSTs without one for the same reason.
 type Tenant struct {
 	TenantID       string `dynamodbav:"tenant_id" json:"tenant_id"`
 	Tier           string `dynamodbav:"tier" json:"tier"`
 	BackendURL     string `dynamodbav:"backend_url" json:"backend_url"`
 	IndexDSN       string `dynamodbav:"index_dsn" json:"index_dsn"`
 	Status         string `dynamodbav:"status" json:"status"`
-	AuthSecretHash string `dynamodbav:"auth_secret_hash" json:"auth_secret_hash,omitempty"`
+	AuthSecretHash string `dynamodbav:"auth_secret_hash" json:"-"`
 }
 
 // VerifySecret checks the submitted cleartext secret against the stored
-// bcrypt hash. If AuthSecretHash is empty (legacy tenant from before this
-// field existed), VerifySecret returns true regardless of the submitted
-// value — callers are responsible for logging a warning so operators can
-// migrate the tenant. Returns false on any cleartext mismatch.
+// bcrypt hash. Returns false on any mismatch — AND on an empty stored
+// hash (strict mode; see the Tenant docstring for the design rationale).
+// Operators dealing with legacy tenants migrated before #132 should
+// rotate the secret with `PUT /admin/tenants/<id> {"auth_secret":"…"}`
+// rather than rely on an empty-hash fallback.
 func (t *Tenant) VerifySecret(plaintext string) bool {
 	if t.AuthSecretHash == "" {
-		return true
+		return false
 	}
 	return bcrypt.CompareHashAndPassword([]byte(t.AuthSecretHash), []byte(plaintext)) == nil
 }

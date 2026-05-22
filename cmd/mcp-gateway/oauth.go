@@ -200,21 +200,30 @@ func (c *OAuthConfig) AuthorizeSubmitHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Issue #132: validate the per-tenant secret. Tenants with an
-	// empty AuthSecretHash (legacy, pre-#132) pass without a secret
-	// being submitted — VerifySecret returns true on empty hash so
-	// the gradual rollout doesn't break existing installs. We emit
-	// a warn-level log on every such authorize so operators can grep
-	// their gateway logs to find the unmigrated tenants.
+	// #132 strict mode: validate the per-tenant secret. VerifySecret
+	// returns false on either a mismatched cleartext OR an empty
+	// stored hash, so legacy tenants migrated from before #132 fail
+	// closed until an admin sets a secret via
+	// PUT /admin/tenants/<id> {"auth_secret":"…"}. The earlier
+	// gradual-rollout design (legacy → 302 with auth code) was a
+	// wire-level oracle attackers could use to enumerate unmigrated
+	// tenants AND obtain free auth codes; closing the oracle is
+	// load-bearing for the security contract #132 was filed for.
+	//
+	// slog.Warn so an operator alerting on auth failures sees
+	// brute-force probes. tenant_id is passed as a structured
+	// attribute only — never interpolated into the message string —
+	// to avoid log injection (defense-in-depth on top of the
+	// tenantIDRE regex in admin.go that rejects newlines).
+	// legacy_no_secret_configured surfaces the inventory the
+	// previous gradual-rollout log used to expose, so operators
+	// can still grep gateway logs for the unmigrated tenants.
 	if !tenant.VerifySecret(tenantSecret) {
-		// Log the rejection (without echoing the submitted secret).
-		slog.Info("authorize rejected: tenant secret mismatch", "tenant_id", tenantID)
+		slog.Warn("authorize rejected: tenant secret missing or incorrect",
+			"tenant_id", tenantID,
+			"legacy_no_secret_configured", tenant.AuthSecretHash == "")
 		jsonError(w, "invalid_request", "tenant secret is missing or incorrect", http.StatusUnauthorized)
 		return
-	}
-	if tenant.AuthSecretHash == "" {
-		slog.Warn("authorize accepted on legacy tenant without auth_secret; set one via PUT /admin/tenants/"+tenantID+" to enable per-tenant authentication",
-			"tenant_id", tenantID)
 	}
 
 	// Generate authorization code.
@@ -478,8 +487,8 @@ var authorizePage = `<!DOCTYPE html>
     <input type="text" id="tenant_id" name="tenant_id" required placeholder="e.g. acme-corp">
     <p class="note">This is the identifier you received when you set up Bintrail.</p>
     <label for="tenant_secret">Tenant Secret</label>
-    <input type="password" id="tenant_secret" name="tenant_secret" placeholder="set by your tenant administrator">
-    <p class="note">Required for tenants migrated to per-tenant secrets. Legacy tenants without a secret may leave this blank.</p>
+    <input type="password" id="tenant_secret" name="tenant_secret" required placeholder="set by your tenant administrator">
+    <p class="note">Required. If you don't have one yet, ask your tenant administrator to set one via the admin API.</p>
     <button type="submit">Authorize</button>
   </form>
 </body>

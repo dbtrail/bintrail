@@ -523,13 +523,20 @@ func TestAuthorizeSubmitHandler_missingSecretOnConfiguredTenant(t *testing.T) {
 	}
 }
 
-// TestAuthorizeSubmitHandler_legacyTenantWithoutSecret pins the
-// gradual-rollout decision: a tenant with an EMPTY AuthSecretHash
-// (created before #132) continues to authorize without a secret.
-// VerifySecret returns true on empty hash regardless of the
-// submitted value; AuthorizeSubmitHandler emits a Warn log so
-// operators can grep logs for unmigrated tenants.
-func TestAuthorizeSubmitHandler_legacyTenantWithoutSecret(t *testing.T) {
+// TestAuthorizeSubmitHandler_legacyTenantRejected pins the
+// strict-mode decision from the #295 review: a tenant with an EMPTY
+// AuthSecretHash (migrated from before #132) CANNOT authorize. The
+// earlier gradual-rollout design returned 302 with an auth code in
+// this case, which was a wire-level oracle attackers could use to
+// (a) enumerate unmigrated tenants by status code and (b) obtain
+// free auth codes for them. Closing the oracle is the load-bearing
+// security fix.
+//
+// Operators discover unmigrated tenants via the
+// `legacy_no_secret_configured` structured attribute on the slog.Warn
+// the handler emits on every rejection — same inventory, no
+// wire-level signal to attackers.
+func TestAuthorizeSubmitHandler_legacyTenantRejected(t *testing.T) {
 	store := NewMemoryStore()
 	store.Clients["test-client"] = &OAuthClient{
 		ClientID: "test-client", ClientSecret: "secret",
@@ -537,7 +544,7 @@ func TestAuthorizeSubmitHandler_legacyTenantWithoutSecret(t *testing.T) {
 	}
 	store.Tenants["legacy-tenant"] = &Tenant{
 		TenantID: "legacy-tenant", Status: "active",
-		// AuthSecretHash deliberately empty
+		// AuthSecretHash deliberately empty — pre-#132 tenant
 	}
 	cfg := &OAuthConfig{Issuer: "https://mcp.dbtrail.com", Store: store}
 
@@ -546,22 +553,26 @@ func TestAuthorizeSubmitHandler_legacyTenantWithoutSecret(t *testing.T) {
 		"redirect_uri":   {"https://claude.ai/api/mcp/auth_callback"},
 		"code_challenge": {"abc123"},
 		"tenant_id":      {"legacy-tenant"},
-		// tenant_secret omitted — legacy path
+		// tenant_secret omitted
 	}
 	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	cfg.AuthorizeSubmitHandler(rec, req)
 
-	if rec.Code != http.StatusFound {
-		t.Fatalf("expected 302 on legacy tenant (gradual rollout), got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on legacy tenant (strict mode); got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.Codes) != 0 {
+		t.Errorf("no auth code must be created on a legacy-tenant reject; got %d", len(store.Codes))
 	}
 }
 
-// TestHashSecretAndVerify pins the bcrypt round-trip: HashSecret
-// produces a hash that VerifySecret accepts on the correct cleartext
-// and rejects on a wrong one. Empty stored hash short-circuits to
-// true — the gradual-rollout contract the handler relies on.
+// TestHashSecretAndVerify pins the bcrypt round-trip and the
+// strict-mode behaviour of VerifySecret: HashSecret produces a
+// valid bcrypt hash (prefix $2…), VerifySecret accepts the correct
+// cleartext and rejects everything else — including any submission
+// against an empty stored hash (#295 review).
 func TestHashSecretAndVerify(t *testing.T) {
 	hash, err := HashSecret("hunter2")
 	if err != nil {
@@ -570,6 +581,9 @@ func TestHashSecretAndVerify(t *testing.T) {
 	if hash == "" || hash == "hunter2" {
 		t.Errorf("HashSecret must not return empty or echo cleartext, got %q", hash)
 	}
+	if !strings.HasPrefix(hash, "$2") {
+		t.Errorf("HashSecret output %q lacks the bcrypt prefix $2 — algorithm-substitution regression?", hash)
+	}
 	tenant := &Tenant{AuthSecretHash: hash}
 	if !tenant.VerifySecret("hunter2") {
 		t.Errorf("VerifySecret(correct) = false, want true")
@@ -577,11 +591,12 @@ func TestHashSecretAndVerify(t *testing.T) {
 	if tenant.VerifySecret("wrong-password") {
 		t.Errorf("VerifySecret(wrong) = true, want false")
 	}
+	// Strict mode (#295): empty hash must reject any submission.
 	legacy := &Tenant{AuthSecretHash: ""}
-	if !legacy.VerifySecret("anything") {
-		t.Errorf("VerifySecret on legacy tenant must return true (gradual rollout)")
+	if legacy.VerifySecret("anything") {
+		t.Errorf("VerifySecret on legacy tenant (empty hash) must return false in strict mode")
 	}
-	if !legacy.VerifySecret("") {
-		t.Errorf("VerifySecret on legacy tenant with empty input must return true")
+	if legacy.VerifySecret("") {
+		t.Errorf("VerifySecret on legacy tenant with empty input must return false in strict mode")
 	}
 }

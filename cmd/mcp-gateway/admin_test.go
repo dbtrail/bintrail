@@ -12,7 +12,7 @@ func TestAdmin_createTenant(t *testing.T) {
 	store := NewMemoryStore()
 	handler := NewAdminHandler(store, "secret")
 
-	body := `{"tenant_id":"acme","tier":"paid","backend_url":"http://backend:8080/mcp","status":"active"}`
+	body := `{"tenant_id":"acme","tier":"paid","backend_url":"http://backend:8080/mcp","status":"active","auth_secret":"hunter2"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/tenants", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
@@ -42,7 +42,7 @@ func TestAdmin_createTenantDuplicate(t *testing.T) {
 	store.Tenants["acme"] = &Tenant{TenantID: "acme", Status: "active"}
 	handler := NewAdminHandler(store, "secret")
 
-	body := `{"tenant_id":"acme","tier":"free"}`
+	body := `{"tenant_id":"acme","tier":"free","auth_secret":"hunter2"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/tenants", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
@@ -57,7 +57,7 @@ func TestAdmin_createTenantDefaultStatus(t *testing.T) {
 	store := NewMemoryStore()
 	handler := NewAdminHandler(store, "secret")
 
-	body := `{"tenant_id":"newco","tier":"free"}`
+	body := `{"tenant_id":"newco","tier":"free","auth_secret":"hunter2"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/tenants", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
@@ -68,6 +68,53 @@ func TestAdmin_createTenantDefaultStatus(t *testing.T) {
 	}
 	if store.Tenants["newco"].Status != "active" {
 		t.Errorf("expected default status active, got %s", store.Tenants["newco"].Status)
+	}
+}
+
+// TestAdmin_createTenantRejectsMissingSecret pins the strict-mode
+// invariant from the #295 review: POST without an auth_secret is
+// rejected with 400 so no tenant is ever stored in a state where
+// VerifySecret would unconditionally fail.
+func TestAdmin_createTenantRejectsMissingSecret(t *testing.T) {
+	store := NewMemoryStore()
+	handler := NewAdminHandler(store, "secret")
+
+	body := `{"tenant_id":"acme","tier":"paid","status":"active"}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if store.Tenants["acme"] != nil {
+		t.Errorf("tenant must not be stored when auth_secret is missing; found %+v", store.Tenants["acme"])
+	}
+}
+
+// TestAdmin_createTenantRejectsBadTenantID pins the tenantIDRE
+// charset validation from the #295 review. Embedded newlines could
+// otherwise forge log lines in any future code path that string-
+// interpolates tenant_id into a message.
+func TestAdmin_createTenantRejectsBadTenantID(t *testing.T) {
+	store := NewMemoryStore()
+	handler := NewAdminHandler(store, "secret")
+
+	for _, bad := range []string{
+		"acme\nFAKE LOG: granted",
+		"has space",
+		"has/slash",
+		strings.Repeat("a", 65),
+	} {
+		body, _ := json.Marshal(map[string]string{"tenant_id": bad, "auth_secret": "hunter2"})
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants", strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("tenant_id=%q: expected 400, got %d", bad, rec.Code)
+		}
 	}
 }
 
