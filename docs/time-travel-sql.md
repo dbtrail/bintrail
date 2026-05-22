@@ -298,7 +298,7 @@ Three causes produce an empty `_flashback` / `_snapshot` resultset:
 
 1. The row had no event at-or-before the requested timestamp.
 2. The latest event at-or-before the timestamp is a DELETE — the row did not exist at AS OF (Oracle `AS OF` semantic; matches the full-table path).
-3. A coverage gap or archive failure under `--allow-gaps` (without that flag the shim returns `ER_NO_PARTITION_FOR_GIVEN_VALUE` (1526) instead, so the three causes are distinguishable on the default strict configuration).
+3. A coverage gap or archive-fetch failure under `--allow-gaps`. Without that flag the shim returns a typed MySQL error instead — `ER_NO_PARTITION_FOR_GIVEN_VALUE` (1526) for coverage gaps, `ER_UNKNOWN_ERROR` (1105) for archive-fetch failures — so on the default strict configuration the empty resultset never indicates a gap or an archive outage.
 
 To distinguish cases 1 and 2, query `_diff` for the per-PK history: it returns every event (including the DELETE's `row_before`), so a row that was deleted produces at least one row in the diff resultset while a row that never existed produces zero. Or check the agent is keeping up:
 

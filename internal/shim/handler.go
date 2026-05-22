@@ -601,9 +601,12 @@ func (h *Handler) columnOrderFor(schema, table string) []string {
 // answer" rather than fabricating one).
 //
 // For non-DELETE events, row_after wins when present (the post-image
-// of an INSERT/UPDATE is the row's state) and row_before is the
-// fallback used only when row_after is missing — a path the regular
-// indexer pipeline doesn't exercise but kept defensively.
+// is the row's state at the event — true for INSERT, UPDATE, and the
+// EventSnapshot baseline rows _snapshot will surface in a future
+// iteration). row_before is the fallback used only when row_after is
+// missing — a path the regular indexer pipeline doesn't exercise for
+// INSERT/UPDATE since marshalRow always emits row_after, but kept
+// defensively.
 //
 // Extracted as a pure helper specifically so the rule can be
 // unit-tested without spinning up a real MySQL: a future refactor

@@ -127,6 +127,94 @@ func TestRunDiff_PlannerCoversCurrentHour(t *testing.T) {
 	}
 }
 
+// TestRunPointInTime_DeleteReturnsEmpty mirrors issue #287's
+// reproduction end-to-end: seed an INSERT then a DELETE for the same
+// PK, then query AS OF *after* the DELETE. The wire response must be
+// empty (no row resurrected from the DELETE's row_before).
+//
+// The same fixture also pins the docs claim ("Time-travel query
+// returns empty" in docs/time-travel-sql.md) that _diff still
+// surfaces the DELETE — the operator-facing distinction between
+// "row never existed" and "row deleted". If _diff ever started
+// filtering DELETEs, the disambiguation path the PR's docs sell
+// would silently break and the count assertion below would fail.
+// (The downstream marshalling of row_before is exercised
+// indirectly: runDiff at handler.go:686 unconditionally passes
+// r.RowBefore through marshalImageOrdered, so any future change
+// that drops that field would also drop the row from the count.)
+func TestRunPointInTime_DeleteReturnsEmpty(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, now)
+
+	insertTS := now.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+	deleteTS := now.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	rowBefore := []byte(`{"id":2,"sku":"SKU-B","qty":2}`)
+	rowAfter := []byte(`{"id":2,"sku":"SKU-B","qty":2}`)
+
+	// INSERT then DELETE for pk=2.
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, insertTS, nil,
+		"myapp", "orders", 1, "2", nil, nil, rowAfter)
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 300, 400, deleteTS, nil,
+		"myapp", "orders", 3, "2", nil, rowBefore, nil)
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:   false,
+		NoArchive:   true,
+		IndexDBName: dbName,
+	}, slog.Default())
+
+	// Claim 1: _flashback AS OF after the DELETE → empty resultset.
+	flashbackResult, err := h.runPointInTime(TimeTravelQuery{
+		Type:    TypeFlashback,
+		Schema:  "myapp",
+		Table:   "orders",
+		PKValue: "2",
+		AsOf:    now.Add(15 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("runPointInTime: %v", err)
+	}
+	if flashbackResult == nil || flashbackResult.Resultset == nil {
+		t.Fatal("runPointInTime returned nil resultset")
+	}
+	if got := len(flashbackResult.Resultset.RowDatas); got != 0 {
+		t.Errorf("_flashback AS OF after DELETE: expected 0 rows, got %d", got)
+	}
+	// emptyResult emits a single-column "_flashback" sentinel so the
+	// client gets a well-formed reply rather than a torn one. If the
+	// fields list looks like the orders table's columns (id, sku, qty)
+	// instead, the DELETE short-circuit regressed.
+	gotFields := fieldNames(flashbackResult.Resultset.Fields)
+	if want := []string{"_flashback"}; !slices.Equal(gotFields, want) {
+		t.Errorf("_flashback empty result fields = %v, want %v (looks like the table columns leaked — DELETE short-circuit regressed)", gotFields, want)
+	}
+
+	// Claim 2: _diff over the same PK and window returns both events
+	// (INSERT + DELETE), proving DELETEs remain visible via _diff —
+	// the docs claim disambiguates "row deleted" from "row never
+	// existed" by hitting _diff and counting rows.
+	diffResult, err := h.runDiff(TimeTravelQuery{
+		Type:    TypeDiff,
+		Schema:  "myapp",
+		Table:   "orders",
+		PKValue: "2",
+		Since:   now.Add(time.Minute),
+		Until:   now.Add(15 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("runDiff: %v", err)
+	}
+	if got := len(diffResult.Resultset.RowDatas); got != 2 {
+		t.Errorf("_diff: expected 2 rows (INSERT + DELETE), got %d", got)
+	}
+}
+
 // addHourlyPartition reorganizes p_future into one named hourly partition
 // + fresh p_future, matching the layout `bintrail init` produces.
 // Format args come from time.Format so injection is impossible.
