@@ -31,6 +31,7 @@ Before starting, you need:
 - **A `.bintrail.env` file** with `BINTRAIL_SOURCE_DSN`, `BINTRAIL_INDEX_DSN`, and `BINTRAIL_SERVER_ID` set. `bintrail config init` scaffolds one.
 - **The `bintrail` binary** on the host. The shim is a subcommand — there is no second binary to download.
 - **Root or `sudo` access** on the host.
+- **A writable bintrail config directory.** The generator commands below (`bintrail init-shim`, `bintrail proxysql-config`) and the `mysql … < proxysql-setup.sql` redirect both run as the operator (not root), so the directory holding `.bintrail.env`, `shim.yaml`, and `proxysql-setup.sql` must be owned by the operator. If you keep these in a root-owned `/etc/bintrail`, run `sudo chown $(whoami):$(whoami) /etc/bintrail` once at install time.
 - **The `mysql` client** installed on the host (used to apply ProxySQL config below).
 - **A MySQL user your application will use to connect through ProxySQL.** This is *not* the replication user the streamer uses — it's a regular application user that ProxySQL authenticates against. Pick a username and a strong password; you'll need both below.
 
@@ -42,7 +43,7 @@ Before starting, you need:
 
 ```sh
 cd /etc/bintrail   # or wherever your .bintrail.env lives
-sudo bintrail init-shim --out shim.yaml
+bintrail init-shim --out shim.yaml
 ```
 
 The generated file has one tenant block populated from your `.bintrail.env`, plus two TODO lines for the application credentials:
@@ -79,9 +80,11 @@ ProxySQL 2.6 (LTS) is the recommended release.
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y wget lsb-release gnupg
-wget -qO- https://repo.proxysql.com/ProxySQL/repo_pub_key | sudo apt-key add -
-echo "deb https://repo.proxysql.com/ProxySQL/proxysql-2.6.x/$(lsb_release -sc)/ ./" \
+sudo apt-get install -y wget lsb-release gnupg ca-certificates
+sudo install -d -m 0755 /etc/apt/keyrings
+wget -qO- https://repo.proxysql.com/ProxySQL/repo_pub_key | \
+  sudo gpg --dearmor -o /etc/apt/keyrings/proxysql.gpg
+echo "deb [signed-by=/etc/apt/keyrings/proxysql.gpg] https://repo.proxysql.com/ProxySQL/proxysql-2.6.x/$(lsb_release -sc)/ ./" \
   | sudo tee /etc/apt/sources.list.d/proxysql.list
 sudo apt-get update
 sudo apt-get install -y proxysql=2.6.*
@@ -113,7 +116,7 @@ After install, ProxySQL listens on:
 `bintrail proxysql-config` reads `BINTRAIL_SOURCE_DSN` from `.bintrail.env` and `shim.yaml` from the previous step and emits a deterministic SQL script:
 
 ```sh
-sudo bintrail proxysql-config --out proxysql-setup.sql
+bintrail proxysql-config --out proxysql-setup.sql
 ```
 
 The script tells you exactly how to apply it:
@@ -129,7 +132,7 @@ If ProxySQL is on the same host (typical):
 mysql -u admin -p -h 127.0.0.1 -P 6032 < proxysql-setup.sql
 ```
 
-The script wraps its DML in `BEGIN`/`COMMIT` and finishes with `LOAD ... TO RUNTIME` and `SAVE ... TO DISK`, so the new routing is live immediately and survives a ProxySQL restart. **Re-running the script is safe** — it scopes its DELETEs to bintrail-owned hostgroups (990, 991) and rule IDs (990001-990003), so it never touches operator-managed config.
+The script wraps its DML in `BEGIN`/`COMMIT` and finishes with `LOAD ... TO RUNTIME` and `SAVE ... TO DISK`, so the new routing is live immediately and survives a ProxySQL restart. **Re-running the script is safe** — it scopes its DELETEs to bintrail-owned hostgroups (990, 991) and rule IDs (990001-990004), so it never touches operator-managed config.
 
 Verify ProxySQL accepted the config — you should see exactly two rows, one for hostgroup 990 (your real MySQL — `hostname` reflects whatever you have in `BINTRAIL_SOURCE_DSN`) and one for hostgroup 991 (the shim, always `127.0.0.1:3308`):
 
@@ -252,8 +255,8 @@ The shim resolves the row by replaying the relevant binlog events from your bint
 ProxySQL is rejecting your credentials. Confirm your app is connecting with the cleartext value of `mysql_password` from `shim.yaml`. If `shim.yaml` was edited, re-apply the ProxySQL config so the regenerated SHA1 reaches the live `mysql_users` table:
 
 ```sh
-sudo rm proxysql-setup.sql
-sudo bintrail proxysql-config --out proxysql-setup.sql
+rm -f proxysql-setup.sql
+bintrail proxysql-config --out proxysql-setup.sql
 mysql -u admin -p -h 127.0.0.1 -P 6032 < proxysql-setup.sql
 ```
 
@@ -265,10 +268,10 @@ The query rule isn't matching. Inspect the routing:
 
 ```sh
 mysql -u admin -p -h 127.0.0.1 -P 6032 \
-  -e "SELECT rule_id, match_pattern, destination_hostgroup FROM runtime_mysql_query_rules WHERE rule_id BETWEEN 990001 AND 990003;"
+  -e "SELECT rule_id, match_pattern, destination_hostgroup FROM runtime_mysql_query_rules WHERE rule_id BETWEEN 990001 AND 990004;"
 ```
 
-You should see three rows targeting hostgroup 991. If they're missing, re-apply `proxysql-setup.sql`. If they're present but the query still goes to MySQL, double-check that no operator rule with a smaller `rule_id` is intercepting `_flashback.*` first (ProxySQL evaluates rules in `rule_id` order).
+You should see four rows targeting hostgroup 991 (one each for `_flashback.*`, `_diff.*`, `_snapshot.*`, and the `/*+ DBTRAIL_AT=... */` hint-comment shape). If they're missing, re-apply `proxysql-setup.sql`. If they're present but the query still goes to MySQL, double-check that no operator rule with a smaller `rule_id` is intercepting `_flashback.*` first (ProxySQL evaluates rules in `rule_id` order).
 
 ### `connection refused` on the shim's port
 
