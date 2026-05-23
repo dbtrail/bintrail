@@ -237,6 +237,29 @@ bintrail stream --gap-timeout 60 --index-dsn "..." --source-dsn "..." --server-i
 
 Reducing binlog retention is also a valid mitigation, but loses the ability to fill larger gaps.
 
+### RDS: backup retention enables binlog
+
+**Important for AWS RDS users:** RDS for MySQL only enables binary logging when `backup-retention-period >= 1`. Even with a custom parameter group setting `binlog_format=ROW` and `binlog_row_image=FULL`, `@@log_bin` stays `0` if backup retention is `0`, and `bintrail stream` / `bintrail index` will fail with:
+
+```
+ERROR 1381 (HY000): You are not using binary logging
+```
+
+`SHOW VARIABLES` happily reports the custom parameter-group values, which makes this easy to miss. Enable binlog by raising backup retention to at least 1 day:
+
+```sh
+aws rds modify-db-instance \
+  --db-instance-identifier <id> \
+  --backup-retention-period 1 \
+  --apply-immediately
+```
+
+Wait ~2 minutes for the modification to take effect. After that, also set `binlog retention hours` (see below) so RDS keeps binlogs long enough for bintrail to index them before purge:
+
+```sql
+CALL mysql.rds_set_configuration('binlog retention hours', 48);
+```
+
 ### Binlog retention requirement
 
 **Important:** Configure your MySQL server's binlog retention to be **at least 2 days**. This gives bintrail enough time to fill gaps after planned maintenance, restarts, or brief outages. With very short retention (seconds or minutes), binlogs may be purged before bintrail has a chance to replay them, resulting in permanent data loss.
