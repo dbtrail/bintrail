@@ -237,6 +237,16 @@ bintrail stream --gap-timeout 60 --index-dsn "..." --source-dsn "..." --server-i
 
 Reducing binlog retention is also a valid mitigation, but loses the ability to fill larger gaps.
 
+### RDS: stream from the primary, not a read-replica
+
+**Important for AWS RDS users:** `bintrail stream` connects as a binlog client and registers itself as a replication slave (`COM_REGISTER_SLAVE`). RDS read-replicas are `read_only=1` by default and reject the registration with:
+
+```
+ERROR 1290 (HY000): The MySQL server is running with the --read-only option so it cannot execute this statement
+```
+
+Always point `--source-dsn` at the **primary** RDS instance, not a read-replica. If your application reads through a read-replica to spare the primary, bintrail still needs to stream from the primary — the binlog activity it adds is comparable to a single managed read-replica connection.
+
 ### RDS: backup retention enables binlog
 
 **Important for AWS RDS users:** RDS for MySQL only enables binary logging when `backup-retention-period >= 1`. Even with a custom parameter group setting `binlog_format=ROW` and `binlog_row_image=FULL`, `@@log_bin` stays `0` if backup retention is `0`, and `bintrail stream` / `bintrail index` will fail with:
@@ -254,7 +264,7 @@ aws rds modify-db-instance \
   --apply-immediately
 ```
 
-Wait ~2 minutes for the modification to take effect. After that, also set `binlog retention hours` (see below) so RDS keeps binlogs long enough for bintrail to index them before purge:
+The modification reaches the instance in ~2 minutes. After that, `SELECT @@log_bin` reports `1` but `SHOW BINARY LOGS` may still return an empty set until RDS completes its first automated snapshot (another ~30s–1min). Wait for `SHOW BINARY LOGS` to return at least one row before launching `bintrail stream` — without a starting binlog file the streamer exits with `no start position specified`. Set `binlog retention hours` (see below) so RDS keeps binlogs long enough for bintrail to index them before purge:
 
 ```sql
 CALL mysql.rds_set_configuration('binlog retention hours', 48);
@@ -280,6 +290,8 @@ For managed MySQL services (RDS, Aurora, Cloud SQL), check your provider's docum
 -- Amazon RDS
 CALL mysql.rds_set_configuration('binlog retention hours', 48);
 ```
+
+RDS caps `binlog retention hours` at **720 (30 days)**. Values above the ceiling are rejected with `ERROR 1644 (45000)`. Longer historical reach is the bintrail index's job (and `bintrail baseline` for replay anchors before the index window) — not RDS's binlog buffer.
 
 ---
 
