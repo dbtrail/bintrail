@@ -1688,6 +1688,286 @@ func (h *recordingHandler) atLevel(level slog.Level) []slog.Record {
 	return out
 }
 
+// TestValidatePKColumnRejectsNonPKWhere pins the #296 fix: the shim
+// must NOT silently match a WHERE on a non-PK column against
+// binlog_events.pk_values (which would return a row whose actual PK
+// happens to equal the user's filter value — a correctness bug).
+// Validation is wired in HandleQuery before dispatch so every parsed
+// shape (TypeFlashback, TypeSnapshot, TypeDiff, hint-comment) is
+// covered by one code path.
+//
+// The subtests below assert one behaviour each:
+//
+//   - accept: WHERE on the declared PK column passes through and
+//     reaches the runX dispatch. We assert "no 1064" without driving
+//     the full fetch path (no sqlmock binlog_events expectation) —
+//     the test would otherwise reproduce the entire FetchMerged
+//     plumbing for no extra signal.
+//   - reject single-column PK mismatch / composite PK / no PK
+//     declared: each is a distinct 1064 with a message the operator
+//     can act on.
+//   - permissive on missing snapshot / unknown table: preserves
+//     columnOrderFor's degradation contract. A broken snapshot
+//     lookup must not turn a working query into a 1064.
+//   - hint-comment + _snapshot + _diff: per-shape regression guards
+//     so a future per-type refactor can't re-introduce the bug for
+//     one shape in isolation.
+func TestValidatePKColumnRejectsNonPKWhere(t *testing.T) {
+	// ordersResolver is a minimal one-table snapshot with id as the
+	// single-column PK. PKColumns is the slice the validator consults;
+	// Columns is along for the ride so columnOrderFor (called on the
+	// runX dispatch path the accept subtest exercises) returns a
+	// non-nil order.
+	ordersResolver := func() (*metadata.Resolver, error) {
+		return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+			"myapp.orders": {
+				Schema: "myapp", Table: "orders",
+				Columns: []metadata.ColumnMeta{
+					{Name: "id", OrdinalPosition: 1, IsPK: true},
+					{Name: "customer_id", OrdinalPosition: 2},
+					{Name: "status", OrdinalPosition: 3},
+				},
+				PKColumns: []string{"id"},
+			},
+		}), nil
+	}
+
+	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("accept_pk_column_passes_validation", func(t *testing.T) {
+		// Drive the validator alone (not HandleQuery → runX) so we
+		// don't have to mock the entire FetchMerged plumbing just to
+		// prove the accept branch. A nil error is the full assertion.
+		h := &Handler{logger: silent, resolverFn: ordersResolver}
+		err := h.validatePKColumn(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			PKColumn: "id", PKValue: "42",
+		})
+		if err != nil {
+			t.Errorf("WHERE on PK column must pass validation; got %v", err)
+		}
+	})
+
+	t.Run("reject_non_pk_column_returns_1064_with_actionable_message", func(t *testing.T) {
+		// This is the literal repro from issue #296: a query that
+		// would silently return the row with id=1 because the shim
+		// joined the literal 1 against pk_values.
+		h := NewHandlerWithConfig(nil, Config{}, silent)
+		h.resolverFn = ordersResolver
+		h.UseDB("myapp")
+
+		_, err := h.HandleQuery(
+			"SELECT * FROM _flashback.orders AS OF '2026-05-23 18:20:13' WHERE customer_id=1",
+		)
+		if err == nil {
+			t.Fatal("expected 1064 for WHERE on non-PK column; got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) {
+			t.Fatalf("expected *mysql.MyError so wire code is typed, got %T: %v", err, err)
+		}
+		if myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Errorf("wire code = %d, want %d (ER_PARSE_ERROR)", myErr.Code, gomysql.ER_PARSE_ERROR)
+		}
+		// The message must name the expected PK and the user-supplied
+		// column so the operator can fix the query without reading
+		// shim source. A bare "wrong column" would be technically
+		// correct but useless in production.
+		for _, want := range []string{"customer_id", "id", "primary key", "myapp.orders"} {
+			if !strings.Contains(myErr.Message, want) {
+				t.Errorf("error message should contain %q for actionability; got %q", want, myErr.Message)
+			}
+		}
+	})
+
+	t.Run("reject_composite_pk_naming_all_pk_columns", func(t *testing.T) {
+		compositeResolver := func() (*metadata.Resolver, error) {
+			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+				"myapp.order_items": {
+					Schema: "myapp", Table: "order_items",
+					Columns: []metadata.ColumnMeta{
+						{Name: "order_id", OrdinalPosition: 1, IsPK: true},
+						{Name: "line_no", OrdinalPosition: 2, IsPK: true},
+					},
+					PKColumns: []string{"order_id", "line_no"},
+				},
+			}), nil
+		}
+		h := NewHandlerWithConfig(nil, Config{}, silent)
+		h.resolverFn = compositeResolver
+		h.UseDB("myapp")
+
+		_, err := h.HandleQuery(
+			"SELECT * FROM _flashback.order_items AS OF '2026-05-23 18:20:13' WHERE order_id=1",
+		)
+		if err == nil {
+			t.Fatal("expected 1064 for composite PK; got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Fatalf("expected ER_PARSE_ERROR, got %v", err)
+		}
+		// Must name BOTH composite PK columns so the operator
+		// understands the table's actual shape (not just "you used
+		// the wrong column").
+		for _, want := range []string{"composite", "order_id", "line_no", "single-column"} {
+			if !strings.Contains(myErr.Message, want) {
+				t.Errorf("composite PK error should contain %q; got %q", want, myErr.Message)
+			}
+		}
+	})
+
+	t.Run("reject_table_with_no_pk_declared", func(t *testing.T) {
+		// validateTables would normally reject this at snapshot time,
+		// but a snapshot rolled back from a stricter version or a
+		// hand-edited schema_snapshots row can still surface it.
+		// Rejecting is safer than answering against pk_values with no
+		// PK definition (the join semantics are undefined).
+		noPKResolver := func() (*metadata.Resolver, error) {
+			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+				"myapp.events": {
+					Schema: "myapp", Table: "events",
+					Columns: []metadata.ColumnMeta{
+						{Name: "ts", OrdinalPosition: 1},
+						{Name: "payload", OrdinalPosition: 2},
+					},
+					PKColumns: nil,
+				},
+			}), nil
+		}
+		h := NewHandlerWithConfig(nil, Config{}, silent)
+		h.resolverFn = noPKResolver
+		h.UseDB("myapp")
+
+		_, err := h.HandleQuery(
+			"SELECT * FROM _flashback.events AS OF '2026-05-23 18:20:13' WHERE ts='2026-05-23'",
+		)
+		if err == nil {
+			t.Fatal("expected 1064 for PK-less table; got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Fatalf("expected ER_PARSE_ERROR, got %v", err)
+		}
+		if !strings.Contains(myErr.Message, "no primary key") {
+			t.Errorf("PK-less error should say 'no primary key'; got %q", myErr.Message)
+		}
+	})
+
+	t.Run("permissive_when_table_missing_from_snapshot", func(t *testing.T) {
+		// A table created after the latest snapshot is the common
+		// case. Rejecting would break fresh-table queries until the
+		// next `bintrail snapshot` runs — much worse than the rare
+		// silent-wrong-row case the validator is preventing.
+		emptyResolver := func() (*metadata.Resolver, error) {
+			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{}), nil
+		}
+		h := &Handler{logger: silent, resolverFn: emptyResolver}
+		err := h.validatePKColumn(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "brand_new_table",
+			PKColumn: "anything", PKValue: "1",
+		})
+		if err != nil {
+			t.Errorf("missing-from-snapshot must NOT reject (preserves columnOrderFor degradation contract); got %v", err)
+		}
+	})
+
+	t.Run("permissive_when_resolver_load_fails", func(t *testing.T) {
+		failingResolver := func() (*metadata.Resolver, error) {
+			return nil, errors.New("transient db blip")
+		}
+		h := &Handler{logger: silent, resolverFn: failingResolver}
+		err := h.validatePKColumn(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			PKColumn: "customer_id", PKValue: "1",
+		})
+		if err != nil {
+			t.Errorf("loader failure must NOT reject (preserves graceful degradation); got %v", err)
+		}
+	})
+
+	t.Run("permissive_when_no_pk_column_in_query", func(t *testing.T) {
+		// Full-table reconstruction path (#276). Nothing to validate.
+		h := &Handler{logger: silent, resolverFn: ordersResolver}
+		err := h.validatePKColumn(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			PKColumn: "", PKValue: "",
+		})
+		if err != nil {
+			t.Errorf("full-table shape (no WHERE) must pass validation; got %v", err)
+		}
+	})
+
+	t.Run("permissive_when_resolverFn_nil", func(t *testing.T) {
+		// Bare &Handler{} (some legacy tests do this). Mirrors
+		// columnOrderFor's nil-check at the top.
+		h := &Handler{logger: silent}
+		err := h.validatePKColumn(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			PKColumn: "anything", PKValue: "1",
+		})
+		if err != nil {
+			t.Errorf("nil resolverFn must NOT panic or reject; got %v", err)
+		}
+	})
+
+	t.Run("validates_snapshot_shape", func(t *testing.T) {
+		h := NewHandlerWithConfig(nil, Config{}, silent)
+		h.resolverFn = ordersResolver
+		h.UseDB("myapp")
+
+		_, err := h.HandleQuery(
+			"SELECT * FROM _snapshot.orders AS OF '2026-05-23 18:20:13' WHERE customer_id=1",
+		)
+		if err == nil {
+			t.Fatal("_snapshot shape: expected 1064; got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Errorf("_snapshot shape: expected ER_PARSE_ERROR, got %v", err)
+		}
+	})
+
+	t.Run("validates_diff_shape", func(t *testing.T) {
+		h := NewHandlerWithConfig(nil, Config{}, silent)
+		h.resolverFn = ordersResolver
+		h.UseDB("myapp")
+
+		_, err := h.HandleQuery(
+			"SELECT * FROM _diff.orders BETWEEN '2026-05-23 18:00:00' AND '2026-05-23 19:00:00' WHERE customer_id=1",
+		)
+		if err == nil {
+			t.Fatal("_diff shape: expected 1064; got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Errorf("_diff shape: expected ER_PARSE_ERROR, got %v", err)
+		}
+	})
+
+	t.Run("validates_hint_comment_shape", func(t *testing.T) {
+		// The hint-comment form (#288) normalises into TypeFlashback
+		// but the validator must still see q.PKColumn from the hint
+		// regex's capture group 5. A future refactor that splits hint
+		// parsing into its own runX would re-introduce the bug for
+		// this shape alone — this is the regression guard.
+		h := NewHandlerWithConfig(nil, Config{}, silent)
+		h.resolverFn = ordersResolver
+		h.UseDB("myapp")
+
+		_, err := h.HandleQuery(
+			"SELECT /*+ DBTRAIL_AT='2026-05-23 18:20:13' */ * FROM orders WHERE customer_id=1",
+		)
+		if err == nil {
+			t.Fatal("hint-comment shape: expected 1064; got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Errorf("hint-comment shape: expected ER_PARSE_ERROR, got %v", err)
+		}
+	})
+}
+
 // Compile-time check: TenantAuth implements the credential provider
 // interface.
 var _ server.CredentialProvider = TenantAuth{}

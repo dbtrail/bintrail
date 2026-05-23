@@ -285,6 +285,17 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 
 	q, perr := Parse(qstr, currentDB)
 	if perr == nil {
+		// Cross-cut PK validation (#296). Applied here, not inside each
+		// runX, so all four parsed shapes (TypeFlashback, TypeSnapshot,
+		// TypeDiff, and the hint-comment form which Parse normalises
+		// into TypeFlashback) share one validation site. Returns a
+		// *mysql.MyError typed at ER_PARSE_ERROR when the user's WHERE
+		// column does not match the table's real PK — the bug the
+		// issue describes was the shim silently using the literal value
+		// against pk_values regardless of column name.
+		if verr := h.validatePKColumn(q); verr != nil {
+			return nil, verr
+		}
 		switch q.Type {
 		case TypeFlashback, TypeSnapshot:
 			return h.runPointInTime(q)
@@ -530,6 +541,96 @@ func imagesToResult(images []map[string]any, ddlOrder []string) (*mysql.Result, 
 		return nil, fmt.Errorf("build resultset: %w", err)
 	}
 	return &mysql.Result{Resultset: rs}, nil
+}
+
+// validatePKColumn rejects time-travel queries whose WHERE column
+// does not match the table's declared primary key (#296). Without
+// this check, a query like `WHERE customer_id=1` against a table
+// PK'd on `id` silently returns the row with id=1 — the shim's
+// fetch path joins the literal value against binlog_events.pk_values
+// regardless of the column name the user typed, producing a
+// schema-valid resultset for a question the user never asked.
+//
+// Validation policy (mirrors columnOrderFor's resolver semantics):
+//
+//   - q.PKColumn == "" → no WHERE clause was supplied (full-table
+//     reconstruction path, #276). Nothing to validate; return nil.
+//   - h.resolverFn == nil → constructor invariant violation; can only
+//     happen in tests that build a bare &Handler{}. Permissive so
+//     those tests stay representative of legacy paths.
+//   - resolver load fails (DB blip, ErrNoSnapshots, sticky-fallback
+//     mid-outage) → permissive. Preserves the columnOrderFor
+//     graceful-degradation contract: a broken snapshot lookup must
+//     not turn a working query into a 1064 error. The fetch still
+//     runs, the wire response still degrades to alphabetical column
+//     order, and operators see the same Debug/Warn split logs they
+//     get from columnOrderFor for the same condition.
+//   - table not in latest snapshot → permissive, same rationale.
+//     Tables created after the most recent snapshot are common and
+//     self-fix on the next `bintrail snapshot` run.
+//   - len(PKColumns) == 0 → table snapshot is present but has no PK
+//     declared. The shim can't safely correlate row state without a
+//     PK, so reject with 1064. validateTables enforces PK presence
+//     at snapshot time, so this branch is reachable only via an
+//     index that was rolled back from a stricter version, or a
+//     hand-edited schema_snapshots row.
+//   - len(PKColumns) > 1 → composite PK. The `WHERE col=val` shape
+//     can only address a single-column PK; reject with 1064 so the
+//     user gets a clear error instead of a silently-wrong row that
+//     coincidentally matches the first PK column. A future iteration
+//     may extend the parser to accept `WHERE (a,b)=(v1,v2)` — until
+//     then, the right answer is "your filter shape is unsupported
+//     for this table", not "your filter ran against the wrong column".
+//   - single-column PK that matches q.PKColumn → nil (the only
+//     accept-path).
+//   - single-column PK that does NOT match → 1064 with an actionable
+//     message naming both the expected and the user-supplied column.
+func (h *Handler) validatePKColumn(q TimeTravelQuery) error {
+	if q.PKColumn == "" {
+		return nil
+	}
+	if h.resolverFn == nil {
+		return nil
+	}
+	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger)
+	if err != nil {
+		// Same split as columnOrderFor: ErrNoSnapshots is benign
+		// first-install state; anything else is a real config/infra
+		// problem the operator should see at default log-level info.
+		if errors.Is(err, metadata.ErrNoSnapshots) {
+			h.logger.Debug("shim: no snapshots yet; skipping PK validation",
+				"schema", q.Schema, "table", q.Table)
+		} else {
+			h.logger.Warn("shim: schema_snapshots lookup failed; skipping PK validation",
+				"err", err, "schema", q.Schema, "table", q.Table)
+		}
+		return nil
+	}
+	tm, err := r.Resolve(q.Schema, q.Table)
+	if err != nil {
+		h.logger.Debug("shim: table not in latest snapshot; skipping PK validation",
+			"err", err, "schema", q.Schema, "table", q.Table)
+		return nil
+	}
+	if len(tm.PKColumns) == 0 {
+		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
+			"%s.%s has no primary key declared in the indexed snapshot; cannot resolve %s by PK",
+			q.Schema, q.Table, q.Type,
+		))
+	}
+	if len(tm.PKColumns) > 1 {
+		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
+			"%s.%s has a composite primary key (%s); WHERE %s = <value> shape supports only single-column PKs",
+			q.Schema, q.Table, strings.Join(tm.PKColumns, ", "), q.PKColumn,
+		))
+	}
+	if q.PKColumn != tm.PKColumns[0] {
+		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
+			"WHERE column must be the primary key of %s.%s (expected %s, got %s)",
+			q.Schema, q.Table, tm.PKColumns[0], q.PKColumn,
+		))
+	}
+	return nil
 }
 
 // columnOrderFor returns the column names of schema.table in DDL
