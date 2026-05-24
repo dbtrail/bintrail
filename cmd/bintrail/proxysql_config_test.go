@@ -36,6 +36,8 @@ func resetPCFlags() {
 	pcMySQLPort = 3306
 	pcShimPort = 3308
 	pcProxySQLMySQLPort = 6033
+	pcForce = false
+	pcBackendAuthPlugin = backendAuthNative
 }
 
 const validShimYAML = `listen: ':3308'
@@ -70,8 +72,10 @@ func TestRunProxySQLConfig(t *testing.T) {
 		out := string(data)
 
 		wants := []string{
-			"-- Bintrail time-travel SQL",
+			"/*",
+			"* Bintrail time-travel SQL",
 			"docs/time-travel-sql.md",
+			"*/",
 			"BEGIN;",
 			"DELETE FROM mysql_servers WHERE hostgroup_id IN (990, 991);",
 			"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (990, 'db.example.com', 3306);",
@@ -380,8 +384,8 @@ func TestRunProxySQLConfig(t *testing.T) {
 
 func TestGenerateProxySQLSetupSQLDeterministic(t *testing.T) {
 	tenants := []shimTenant{{MySQLUser: pcTestUser1, MySQLPassword: pcTestPassword1}}
-	a := generateProxySQLSetupSQL("db.example.com", 3306, 3308, 6033, tenants)
-	b := generateProxySQLSetupSQL("db.example.com", 3306, 3308, 6033, tenants)
+	a := generateProxySQLSetupSQL("db.example.com", 3306, 3308, 6033, tenants, backendAuthNative)
+	b := generateProxySQLSetupSQL("db.example.com", 3306, 3308, 6033, tenants, backendAuthNative)
 	if a != b {
 		t.Errorf("generateProxySQLSetupSQL must be deterministic; got two different outputs")
 	}
@@ -395,7 +399,7 @@ func TestGenerateProxySQLSetupSQLSQLInjection(t *testing.T) {
 	tenants := []shimTenant{
 		{MySQLUser: "ev'il", MySQLPassword: "p'p"},
 	}
-	out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants)
+	out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants, backendAuthNative)
 
 	// Username is quoted with the doubled single-quote.
 	if !strings.Contains(out, "VALUES ('ev''il', '") {
@@ -416,9 +420,9 @@ func TestGenerateProxySQLSetupSQLSQLInjection(t *testing.T) {
 // hostgroup rather than by username.
 func TestGenerateProxySQLSetupSQLRenameIdempotent(t *testing.T) {
 	first := generateProxySQLSetupSQL("db", 3306, 3308, 6033,
-		[]shimTenant{{MySQLUser: "old_user", MySQLPassword: "oldpw"}})
+		[]shimTenant{{MySQLUser: "old_user", MySQLPassword: "oldpw"}}, backendAuthNative)
 	second := generateProxySQLSetupSQL("db", 3306, 3308, 6033,
-		[]shimTenant{{MySQLUser: "new_user", MySQLPassword: "newpw"}})
+		[]shimTenant{{MySQLUser: "new_user", MySQLPassword: "newpw"}}, backendAuthNative)
 
 	// Both runs emit the same blanket DELETE, scoped only by hostgroup,
 	// so the second apply also removes 'old_user' even though the name
@@ -441,7 +445,7 @@ func TestGenerateProxySQLSetupSQLRenameIdempotent(t *testing.T) {
 // individual fragment assertions still pass.
 func TestGenerateProxySQLSetupSQLHostgroupPairing(t *testing.T) {
 	tenants := []shimTenant{{MySQLUser: pcTestUser1, MySQLPassword: pcTestPassword1}}
-	out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants)
+	out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants, backendAuthNative)
 
 	wants := []string{
 		// passthrough server lives in passthrough hostgroup
@@ -656,6 +660,146 @@ func TestParseProxySQLBackend(t *testing.T) {
 		}
 		if port != 3306 {
 			t.Errorf("got port %d, want 3306", port)
+		}
+	})
+}
+
+// TestGenerateProxySQLSetupSQLNoLineComments locks in the #309 fix:
+// every non-blank line of the generated SQL must NOT start with `-- `,
+// because ProxySQL's admin parser treats each such line as its own
+// statement and rejects the file with "ProxySQL Admin Error: not an
+// error". Block comments (`/* ... */`) parse correctly.
+func TestGenerateProxySQLSetupSQLNoLineComments(t *testing.T) {
+	tenants := []shimTenant{{MySQLUser: pcTestUser1, MySQLPassword: pcTestPassword1}}
+	out := generateProxySQLSetupSQL("db.example.com", 3306, 3308, 6033, tenants, backendAuthNative)
+
+	for i, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "--") {
+			t.Errorf("line %d starts with `--` (ProxySQL admin rejects this); line=%q\nfull SQL:\n%s",
+				i+1, line, out)
+		}
+	}
+	if !strings.Contains(out, "/*") {
+		t.Errorf("expected block-comment header `/*`; got:\n%s", out)
+	}
+	if !strings.Contains(out, "*/") {
+		t.Errorf("expected block-comment terminator `*/`; got:\n%s", out)
+	}
+}
+
+// TestGenerateProxySQLSetupSQLBackendAuthPlugin locks in the #310 fix:
+// the password column emitted into mysql_users depends on the chosen
+// backend auth plugin. native_password stores the SHA1 hash (default,
+// preserves pre-#310 behaviour); caching_sha2_password stores the
+// cleartext so ProxySQL can complete the SHA2 challenge against the
+// MySQL 8.0+ backend.
+func TestGenerateProxySQLSetupSQLBackendAuthPlugin(t *testing.T) {
+	tenants := []shimTenant{{MySQLUser: "app_user", MySQLPassword: "s3cret!"}}
+
+	t.Run("native_password stores SHA1 hash", func(t *testing.T) {
+		out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants, backendAuthNative)
+		wantHash := nativePasswordHash("s3cret!")
+		if !strings.Contains(out, "'app_user', '"+wantHash+"', 990, 1") {
+			t.Errorf("expected SHA1 hash %q in INSERT; got:\n%s", wantHash, out)
+		}
+		// Cleartext must NOT appear in the SQL — only the hash should.
+		if strings.Contains(out, "'s3cret!'") {
+			t.Errorf("cleartext leaked into native_password output:\n%s", out)
+		}
+	})
+
+	t.Run("caching_sha2_password stores cleartext", func(t *testing.T) {
+		out := generateProxySQLSetupSQL("db", 3306, 3308, 6033, tenants, backendAuthCaching)
+		if !strings.Contains(out, "'app_user', 's3cret!', 990, 1") {
+			t.Errorf("expected cleartext 's3cret!' in INSERT for caching_sha2_password; got:\n%s", out)
+		}
+		// The SHA1 hash must NOT appear when caching_sha2 is selected.
+		hash := nativePasswordHash("s3cret!")
+		if strings.Contains(out, hash) {
+			t.Errorf("SHA1 hash %q leaked into caching_sha2 output:\n%s", hash, out)
+		}
+	})
+}
+
+// TestRunProxySQLConfigBackendPluginInvalid rejects unsupported plugin
+// values rather than emitting hash-or-cleartext-or-nothing ambiguous SQL.
+func TestRunProxySQLConfigBackendPluginInvalid(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(orig) })
+	os.Chdir(dir)
+
+	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+	writeShimYAML(t, dir, validShimYAML)
+	resetPCFlags()
+	pcBackendAuthPlugin = "sha256_password" // not supported
+
+	err := runProxySQLConfig(proxysqlConfigCmd, nil)
+	if err == nil {
+		t.Fatal("expected error for unsupported plugin")
+	}
+	if !strings.Contains(err.Error(), "--backend-auth-plugin") {
+		t.Errorf("error should name the flag, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "sha256_password") {
+		t.Errorf("error should echo the bad value, got %v", err)
+	}
+}
+
+// TestRunProxySQLConfigForceOverwrites locks in the #311 fix:
+// without --force, an existing output file still errors (preserving
+// the safe default); with --force, the file is overwritten in place.
+func TestRunProxySQLConfigForceOverwrites(t *testing.T) {
+	t.Run("default still refuses to overwrite", func(t *testing.T) {
+		dir := t.TempDir()
+		orig, _ := os.Getwd()
+		t.Cleanup(func() { os.Chdir(orig) })
+		os.Chdir(dir)
+
+		t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+		writeShimYAML(t, dir, validShimYAML)
+		os.WriteFile(filepath.Join(dir, "proxysql-setup.sql"), []byte("existing"), 0o644)
+		resetPCFlags()
+
+		err := runProxySQLConfig(proxysqlConfigCmd, nil)
+		if err == nil {
+			t.Fatal("expected error when output exists and --force not set")
+		}
+		if !strings.Contains(err.Error(), "already exists") {
+			t.Errorf("expected 'already exists' in error, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "--force") {
+			t.Errorf("error should mention --force as an escape hatch, got %v", err)
+		}
+		data, _ := os.ReadFile(filepath.Join(dir, "proxysql-setup.sql"))
+		if string(data) != "existing" {
+			t.Errorf("file was modified without --force; got %q", string(data))
+		}
+	})
+
+	t.Run("--force overwrites in place", func(t *testing.T) {
+		dir := t.TempDir()
+		orig, _ := os.Getwd()
+		t.Cleanup(func() { os.Chdir(orig) })
+		os.Chdir(dir)
+
+		t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+		writeShimYAML(t, dir, validShimYAML)
+		os.WriteFile(filepath.Join(dir, "proxysql-setup.sql"), []byte("existing"), 0o644)
+		resetPCFlags()
+		pcForce = true
+
+		if err := runProxySQLConfig(proxysqlConfigCmd, nil); err != nil {
+			t.Fatalf("expected --force to overwrite cleanly, got %v", err)
+		}
+		data, _ := os.ReadFile(filepath.Join(dir, "proxysql-setup.sql"))
+		body := string(data)
+		if body == "existing" {
+			t.Error("file was not overwritten with --force")
+		}
+		if !strings.Contains(body, "INSERT INTO mysql_users") {
+			t.Errorf("--force output is missing expected SQL:\n%s", body)
 		}
 	})
 }
