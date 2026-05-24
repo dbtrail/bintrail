@@ -135,6 +135,7 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		end_pos         BIGINT UNSIGNED  NOT NULL,
 		event_timestamp DATETIME         NOT NULL,
 		gtid            VARCHAR(255)     DEFAULT NULL,
+		connection_id   INT UNSIGNED     DEFAULT NULL,
 		schema_name     VARCHAR(64)      NOT NULL,
 		table_name      VARCHAR(64)      NOT NULL,
 		event_type      TINYINT UNSIGNED NOT NULL,

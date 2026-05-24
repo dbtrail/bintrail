@@ -378,16 +378,24 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 	var results []ResultRow
 	for rows.Next() {
 		var r ResultRow
+		// binlog_file is declared NOT NULL in the migrations, but customer
+		// databases that predate that constraint (or schema_change rows
+		// inserted by external pipelines) can still surface NULL. Scan into
+		// a NullString to stay robust to schema drift.
+		var binlogFile sql.NullString
 		var gtid sql.NullString
 		var connID sql.NullInt64
 		var changedCols, rowBefore, rowAfter []byte
 
 		if err := rows.Scan(
-			&r.EventID, &r.BinlogFile, &r.StartPos, &r.EndPos, &r.EventTimestamp,
+			&r.EventID, &binlogFile, &r.StartPos, &r.EndPos, &r.EventTimestamp,
 			&gtid, &connID, &r.SchemaName, &r.TableName, &r.EventType, &r.PKValues,
 			&changedCols, &rowBefore, &rowAfter, &r.SchemaVersion,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan result row: %w", err)
+		}
+		if binlogFile.Valid {
+			r.BinlogFile = binlogFile.String
 		}
 		if gtid.Valid {
 			r.GTID = &gtid.String
