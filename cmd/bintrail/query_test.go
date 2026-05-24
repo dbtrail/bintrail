@@ -482,7 +482,7 @@ func TestMergeResults_deduplicatesByEventID(t *testing.T) {
 		{EventID: 1, EventTimestamp: t0, SchemaName: "db", TableName: "t"}, // duplicate
 		{EventID: 2, EventTimestamp: t0.Add(time.Second), SchemaName: "db", TableName: "t"},
 	}
-	got := query.MergeResults(rows, 0)
+	got := query.MergeResults(rows, 0, "")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 unique rows, got %d", len(got))
 	}
@@ -495,7 +495,7 @@ func TestMergeResults_sortsByTimestampThenEventID(t *testing.T) {
 		{EventID: 1, EventTimestamp: t0},
 		{EventID: 2, EventTimestamp: t0.Add(time.Second)},
 	}
-	got := query.MergeResults(rows, 0)
+	got := query.MergeResults(rows, 0, "")
 	if got[0].EventID != 1 || got[1].EventID != 2 || got[2].EventID != 3 {
 		t.Errorf("expected sorted by timestamp, got event IDs %d %d %d",
 			got[0].EventID, got[1].EventID, got[2].EventID)
@@ -511,7 +511,7 @@ func TestMergeResults_sameTimestampSortsByEventID(t *testing.T) {
 		{EventID: 2, EventTimestamp: t0},
 		{EventID: 8, EventTimestamp: t0},
 	}
-	got := query.MergeResults(rows, 0)
+	got := query.MergeResults(rows, 0, "")
 	if got[0].EventID != 2 || got[1].EventID != 5 || got[2].EventID != 8 {
 		t.Errorf("expected sorted by event_id at same timestamp, got %d %d %d",
 			got[0].EventID, got[1].EventID, got[2].EventID)
@@ -525,7 +525,7 @@ func TestMergeResults_appliesLimit(t *testing.T) {
 		{EventID: 2, EventTimestamp: t0.Add(time.Second)},
 		{EventID: 3, EventTimestamp: t0.Add(2 * time.Second)},
 	}
-	got := query.MergeResults(rows, 2)
+	got := query.MergeResults(rows, 2, "")
 	if len(got) != 2 {
 		t.Fatalf("expected limit 2, got %d rows", len(got))
 	}
@@ -541,14 +541,14 @@ func TestMergeResults_zeroLimitNoTruncation(t *testing.T) {
 		{EventID: 2, EventTimestamp: t0.Add(time.Second)},
 		{EventID: 3, EventTimestamp: t0.Add(2 * time.Second)},
 	}
-	got := query.MergeResults(rows, 0)
+	got := query.MergeResults(rows, 0, "")
 	if len(got) != 3 {
 		t.Errorf("expected all 3 rows when limit=0, got %d", len(got))
 	}
 }
 
 func TestMergeResults_empty(t *testing.T) {
-	if got := query.MergeResults(nil, 10); len(got) != 0 {
+	if got := query.MergeResults(nil, 10, ""); len(got) != 0 {
 		t.Errorf("expected empty result for nil input, got %v", got)
 	}
 }

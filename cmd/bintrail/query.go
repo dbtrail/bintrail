@@ -65,6 +65,7 @@ var (
 	qFlag        string
 	qFormat      string
 	qLimit       int
+	qOrder       string
 	qArchiveDir  string
 	qArchiveS3   string
 	qBintrailID  string
@@ -90,6 +91,7 @@ func init() {
 	queryCmd.Flags().StringVar(&qFlag, "flag", "", "Filter events from tables or columns carrying this flag (see 'bintrail flag list')")
 	queryCmd.Flags().StringVar(&qFormat, "format", "table", "Output format: table, json, or csv")
 	queryCmd.Flags().IntVar(&qLimit, "limit", 100, "Maximum number of rows to return")
+	queryCmd.Flags().StringVar(&qOrder, "order", "ASC", "Sort direction applied before --limit: ASC (oldest first) or DESC (newest first). The default preserves pre-#1511 behavior.")
 	queryCmd.Flags().StringVar(&qArchiveDir, "archive-dir", "", "Local root directory of Parquet archives (requires --bintrail-id)")
 	queryCmd.Flags().StringVar(&qArchiveS3, "archive-s3", "", "S3 root URL prefix of Parquet archives (requires --bintrail-id; e.g. s3://bucket/prefix/); uses the standard AWS credential chain")
 	queryCmd.Flags().StringVar(&qBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir or --archive-s3 is set)")
@@ -138,6 +140,9 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	if !cliutil.IsValidFormat(qFormat) {
 		return fmt.Errorf("invalid --format %q; must be table, json, or csv", qFormat)
+	}
+	if !strings.EqualFold(qOrder, "ASC") && !strings.EqualFold(qOrder, "DESC") {
+		return fmt.Errorf("invalid --order %q; must be ASC or DESC", qOrder)
 	}
 	if (qArchiveDir != "" || qArchiveS3 != "") && qBintrailID == "" {
 		return fmt.Errorf("--bintrail-id is required when --archive-dir or --archive-s3 is set")
@@ -201,6 +206,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		Flag:          qFlag,
 		Limit:         qLimit,
 		LimitPerPK:    qLimitPerPK,
+		Order:         qOrder,
 	}
 
 	// ── Connect and fetch from the index ─────────────────────────────────────
@@ -321,7 +327,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		results = append(results, snapRows...)
 	}
 
-	results = query.MergeAndTrim(results, opts.Limit, opts.LimitPerPK)
+	results = query.MergeAndTrim(results, opts.Limit, opts.LimitPerPK, opts.Order)
 
 	var n int
 	if groupedJSON {

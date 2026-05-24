@@ -121,10 +121,17 @@ type Options struct {
 	// LimitPerPK caps the number of latest events returned per pk_values value.
 	// 0 = unlimited. Applied via ROW_NUMBER OVER (PARTITION BY pk_values
 	// ORDER BY event_timestamp DESC, event_id DESC) so the kept events are
-	// the most recent ones per PK. Only meaningful with PKValuesIn (or a
-	// single PKValues value). The outer ORDER BY remains ASC for stable
-	// global output.
+	// the most recent ones per PK. The inner DESC ordering is fixed (it
+	// selects "latest N per PK"); only the outer ORDER BY direction follows
+	// Order.
 	LimitPerPK int
+	// Order controls the direction of the outer ORDER BY applied before
+	// LIMIT. "DESC" (case-insensitive) selects descending order; any other
+	// value (including empty) defaults to ascending — this preserves the
+	// pre-#1511 behavior for callers that don't set Order. Both sort keys
+	// (event_timestamp, event_id) get the same direction so the ordering
+	// is total and deterministic regardless of timestamp collisions.
+	Order string
 
 	DenyTables    []SchemaTable       // tables excluded by RBAC profile
 	RedactColumns []SchemaTableColumn // column values nulled out by RBAC profile
@@ -149,6 +156,18 @@ type ResultRow struct {
 	RowBefore      map[string]any // nil for INSERT
 	RowAfter       map[string]any // nil for DELETE
 	SchemaVersion  uint32         // snapshot_id at index time; 0 for pre-migration data
+}
+
+// OrderDirection normalises an Options.Order value to a SQL direction keyword
+// ("ASC" or "DESC"). It is case-insensitive on "DESC"; anything else — empty,
+// "ASC", garbage — returns "ASC" so the default behavior matches pre-#1511
+// (ascending by event_timestamp, event_id). Exposed so the parquetquery and
+// merge paths use the same normalisation rule as the MySQL SQL builder.
+func OrderDirection(order string) string {
+	if strings.EqualFold(order, "DESC") {
+		return "DESC"
+	}
+	return "ASC"
 }
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
@@ -321,12 +340,16 @@ func buildQuery(opts Options) (string, []any) {
 	         gtid, connection_id, schema_name, table_name, event_type, pk_values,
 	         changed_columns, row_before, row_after, schema_version`
 
+	dir := OrderDirection(opts.Order)
+	outerOrderBy := " ORDER BY event_timestamp " + dir + ", event_id " + dir
+
 	var q string
 	if opts.LimitPerPK > 0 {
-		// Per-PK cap via ROW_NUMBER. Inner ORDER BY DESC selects the latest
-		// events per pk_values; outer ORDER BY ASC keeps the global output
-		// shape identical to the no-cap path so callers don't see ordering
-		// drift between runs.
+		// Per-PK cap via ROW_NUMBER. Inner ORDER BY DESC is fixed: it
+		// selects "latest N events per pk_values" regardless of the
+		// requested outer direction. Only the outer ORDER BY follows
+		// opts.Order so callers can pick the most recent or the earliest
+		// page across all PKs.
 		inner := "SELECT " + cols + ", ROW_NUMBER() OVER (PARTITION BY pk_values" +
 			" ORDER BY event_timestamp DESC, event_id DESC) AS bt_rn FROM binlog_events"
 		if len(where) > 0 {
@@ -334,13 +357,13 @@ func buildQuery(opts Options) (string, []any) {
 		}
 		q = "SELECT " + cols + " FROM (" + inner + ") AS t WHERE bt_rn <= ?"
 		args = append(args, opts.LimitPerPK)
-		q += " ORDER BY event_timestamp, event_id"
+		q += outerOrderBy
 	} else {
 		q = "SELECT " + cols + " FROM binlog_events"
 		if len(where) > 0 {
 			q += " WHERE " + strings.Join(where, " AND ")
 		}
-		q += " ORDER BY event_timestamp, event_id"
+		q += outerOrderBy
 	}
 	if opts.Limit > 0 {
 		q += " LIMIT ?"

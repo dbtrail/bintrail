@@ -519,7 +519,8 @@ func buildQueryFromFiles(files []string, opts query.Options) (string, []any) {
 		q += qual
 		args = append(args, qArgs...)
 	}
-	q += " ORDER BY event_timestamp, event_id"
+	dir := query.OrderDirection(opts.Order)
+	q += " ORDER BY event_timestamp " + dir + ", event_id " + dir
 	if opts.Limit > 0 {
 		q += " LIMIT ?"
 		args = append(args, opts.Limit)
@@ -582,7 +583,8 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 		q += qual
 		args = append(args, qArgs...)
 	}
-	q += " ORDER BY event_timestamp, event_id"
+	dir := query.OrderDirection(opts.Order)
+	q += " ORDER BY event_timestamp " + dir + ", event_id " + dir
 	if opts.Limit > 0 {
 		q += " LIMIT ?"
 		args = append(args, opts.Limit)
@@ -725,7 +727,8 @@ func buildQueryForFile(path string, opts query.Options, cols map[string]bool) (s
 		q += qual
 		args = append(args, qArgs...)
 	}
-	q += " ORDER BY event_timestamp, event_id"
+	dir := query.OrderDirection(opts.Order)
+	q += " ORDER BY event_timestamp " + dir + ", event_id " + dir
 	if opts.Limit > 0 {
 		q += " LIMIT ?"
 		args = append(args, opts.Limit)

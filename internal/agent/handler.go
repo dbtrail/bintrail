@@ -213,7 +213,7 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 		rows = append(rows, r...)
 	}
 
-	rows = query.MergeResults(rows, opts.Limit)
+	rows = query.MergeResults(rows, opts.Limit, opts.Order)
 
 	// Filter to requested pk_hashes if specified.
 	if len(req.PKHashes) > 0 {

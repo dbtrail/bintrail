@@ -6,10 +6,15 @@ import (
 	"slices"
 )
 
-// MergeResults deduplicates rows by event_id, sorts by (event_timestamp, event_id),
-// and applies the limit. MySQL rows should be passed first so in the rare case of a
-// duplicate event_id the index version is kept.
-func MergeResults(rows []ResultRow, limit int) []ResultRow {
+// MergeResults deduplicates rows by event_id, sorts by (event_timestamp, event_id)
+// in the requested direction, and applies the limit. MySQL rows should be
+// passed first so in the rare case of a duplicate event_id the index version
+// is kept.
+//
+// order is normalised via OrderDirection — empty / "ASC" → ascending,
+// "DESC" (case-insensitive) → descending. The same direction is applied to
+// both sort keys so the ordering is total and deterministic.
+func MergeResults(rows []ResultRow, limit int, order string) []ResultRow {
 	seen := make(map[uint64]struct{}, len(rows))
 	unique := rows[:0]
 	for _, r := range rows {
@@ -18,11 +23,16 @@ func MergeResults(rows []ResultRow, limit int) []ResultRow {
 			unique = append(unique, r)
 		}
 	}
+	descending := OrderDirection(order) == "DESC"
 	slices.SortFunc(unique, func(a, b ResultRow) int {
-		if c := a.EventTimestamp.Compare(b.EventTimestamp); c != 0 {
-			return c
+		c := a.EventTimestamp.Compare(b.EventTimestamp)
+		if c == 0 {
+			c = cmp.Compare(a.EventID, b.EventID)
 		}
-		return cmp.Compare(a.EventID, b.EventID)
+		if descending {
+			return -c
+		}
+		return c
 	})
 	if limit > 0 && len(unique) > limit {
 		unique = unique[:limit]
@@ -30,18 +40,38 @@ func MergeResults(rows []ResultRow, limit int) []ResultRow {
 	return unique
 }
 
-// MergeAndTrim runs the full post-fetch pipeline: dedup+sort via MergeResults,
-// then the per-PK cap, then the global cap. The order is load-bearing —
-// applying the global cap before the per-PK cap can truncate ASC-sorted early
-// events for one PK and starve others before the per-PK trim runs.
+// MergeAndTrim runs the full post-fetch pipeline: dedup+sort, then the per-PK
+// cap (which means "latest N per PK"), then the global cap. The sequence is
+// load-bearing — applying the global cap before the per-PK cap can truncate
+// early events for one PK and starve others.
+//
+// Internally we always sort ASC for the LimitPerPK pass (its reverse-walk
+// "latest N per PK" semantics depend on ascending input — see LimitPerPK's
+// precondition). After the per-PK trim, the rows are re-sorted in the
+// caller's requested direction before the global cap is applied so the
+// returned slice reflects the requested page (oldest N if ASC, newest N if
+// DESC), not the wrong end of the ASC list.
 //
 // Used by FetchMerged and by the CLI merge path. Exposing this as a helper
 // lets unit tests pin the ordering: a future refactor that swaps the sequence
 // or drops the per-PK re-trim will fail TestMergeAndTrim_perPKBeforeGlobal.
-func MergeAndTrim(rows []ResultRow, limit, limitPerPK int) []ResultRow {
-	rows = MergeResults(rows, 0)
+//
+// order is passed through to MergeResults (see its doc); pre-#1511 callers
+// that pass "" get the historical ascending behavior.
+func MergeAndTrim(rows []ResultRow, limit, limitPerPK int, order string) []ResultRow {
 	if limitPerPK > 0 {
+		// LimitPerPK requires ASC-sorted input to pick the timestamp-latest
+		// events per PK.
+		rows = MergeResults(rows, 0, "ASC")
 		rows = LimitPerPK(rows, limitPerPK)
+		// Re-sort in the caller's direction before slicing — otherwise
+		// "limit N + Order=DESC" would slice from the wrong end of the
+		// ASC-ordered list.
+		if OrderDirection(order) == "DESC" {
+			rows = MergeResults(rows, 0, "DESC")
+		}
+	} else {
+		rows = MergeResults(rows, 0, order)
 	}
 	if limit > 0 && len(rows) > limit {
 		rows = rows[:limit]

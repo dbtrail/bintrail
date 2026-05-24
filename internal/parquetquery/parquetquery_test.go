@@ -80,7 +80,7 @@ func TestBuildQueryFromFiles(t *testing.T) {
 	assertContains(t, q, "hive_partitioning=true, union_by_name=true)")
 	assertContains(t, q, "event_hour=11/events.parquet")
 	assertContains(t, q, "event_hour=12/events.parquet")
-	assertContains(t, q, "ORDER BY event_timestamp, event_id")
+	assertContains(t, q, "ORDER BY event_timestamp ASC, event_id ASC")
 	assertContains(t, q, "LIMIT ?")
 	if len(args) != 1 || args[0] != 50 {
 		t.Errorf("expected [50] args, got %v", args)
@@ -119,11 +119,47 @@ func assertContains(t *testing.T, s, want string) {
 func TestBuildQueryNoFilters(t *testing.T) {
 	q, args := buildQuery("/archives/*.parquet", query.Options{Limit: 50})
 	assertContains(t, q, "FROM parquet_scan('/archives/*.parquet', hive_partitioning=true, union_by_name=true)")
-	assertContains(t, q, "ORDER BY event_timestamp, event_id")
+	assertContains(t, q, "ORDER BY event_timestamp ASC, event_id ASC")
 	assertContains(t, q, "LIMIT ?")
 	if len(args) != 1 || args[0] != 50 {
 		t.Errorf("expected [50] args, got %v", args)
 	}
+}
+
+// TestBuildQueryOrderDESC pins the #1511 fix in the DuckDB archive path:
+// Order="DESC" makes the outer ORDER BY emit DESC for both sort keys so that
+// "DESC LIMIT N" selects the newest N events in the archive — not a wrong
+// page that just happens to be sorted descending.
+func TestBuildQueryOrderDESC(t *testing.T) {
+	q, _ := buildQuery("/archives/*.parquet", query.Options{Limit: 50, Order: "DESC"})
+	assertContains(t, q, "ORDER BY event_timestamp DESC, event_id DESC")
+}
+
+// TestBuildQueryFromFilesOrderDESC pins the same #1511 fix in the S3 file-list
+// path (used by S3 archive queries — the production hot path for BYOS / hosted
+// archive lookups).
+func TestBuildQueryFromFilesOrderDESC(t *testing.T) {
+	files := []string{"s3://bucket/f.parquet"}
+	q, _ := buildQueryFromFiles(files, query.Options{Limit: 50, Order: "DESC"})
+	assertContains(t, q, "ORDER BY event_timestamp DESC, event_id DESC")
+}
+
+// TestBuildQueryForFileOrderDESC pins the third archive variant used when a
+// parquet file lacks the connection_id column (pre-v0.4.4 backwards compat).
+func TestBuildQueryForFileOrderDESC(t *testing.T) {
+	cols := map[string]bool{"connection_id": true}
+	q, _ := buildQueryForFile("/archive/f.parquet", query.Options{Limit: 50, Order: "DESC"}, cols)
+	assertContains(t, q, "ORDER BY event_timestamp DESC, event_id DESC")
+}
+
+// TestLimitPerPKClauseStaysDESC verifies the per-PK ROW_NUMBER QUALIFY clause
+// is fixed at DESC regardless of caller Order — its semantic is "latest N
+// events per PK", which is independent of the outer page direction.
+func TestLimitPerPKClauseStaysDESC(t *testing.T) {
+	qual, _ := limitPerPKClause(query.Options{LimitPerPK: 1, Order: "ASC"})
+	assertContains(t, qual, "ORDER BY event_timestamp DESC, event_id DESC")
+	qual, _ = limitPerPKClause(query.Options{LimitPerPK: 1, Order: "DESC"})
+	assertContains(t, qual, "ORDER BY event_timestamp DESC, event_id DESC")
 }
 
 func TestBuildQueryViaGlob(t *testing.T) {

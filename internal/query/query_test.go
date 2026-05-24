@@ -539,14 +539,94 @@ func TestBuildQuery_limitPerPK(t *testing.T) {
 	if !strings.Contains(q, "WHERE bt_rn <= ?") {
 		t.Errorf("expected outer WHERE bt_rn <= ?: %s", q)
 	}
-	// Outer ORDER BY remains ASC for stable global output.
-	if !strings.HasSuffix(strings.TrimSpace(strings.Split(q, "ORDER BY event_timestamp,")[1]), "event_id LIMIT ?") {
-		t.Errorf("expected outer ORDER BY event_timestamp, event_id ASC: %s", q)
+	// Outer ORDER BY follows opts.Order (default ASC for backward compat).
+	// Both keys get the same direction so the ordering is total.
+	if !strings.HasSuffix(q, "ORDER BY event_timestamp ASC, event_id ASC LIMIT ?") {
+		t.Errorf("expected outer ORDER BY event_timestamp ASC, event_id ASC LIMIT ?: %s", q)
 	}
 	// Args: schema, table, pk1, pk2, limitPerPK, limit
 	wantArgs := []any{"db", "t", "1", "2", 1, 100}
 	if fmt.Sprintf("%v", args) != fmt.Sprintf("%v", wantArgs) {
 		t.Errorf("args mismatch: got %v want %v", args, wantArgs)
+	}
+}
+
+// TestBuildQuery_orderDESC pins the #1511 fix: when Order="DESC" the outer
+// ORDER BY uses DESC for BOTH sort keys (timestamp + event_id), so that the
+// "DESC LIMIT N" page returns the newest N events — not a wrong page that
+// just happens to be sorted descending in display order. The inner
+// ROW_NUMBER window stays fixed at DESC regardless of caller direction
+// because its semantic is "latest N per PK", not "first N in requested
+// direction".
+func TestBuildQuery_orderDESC(t *testing.T) {
+	opts := Options{Schema: "db", Table: "t", Limit: 100, Order: "DESC"}
+	q, _ := buildQuery(opts)
+
+	if !strings.HasSuffix(q, "ORDER BY event_timestamp DESC, event_id DESC LIMIT ?") {
+		t.Errorf("expected ORDER BY event_timestamp DESC, event_id DESC LIMIT ? for Order=DESC, got: %s", q)
+	}
+}
+
+// TestBuildQuery_orderASC verifies explicit Order="ASC" emits ASC on both keys
+// (the default case via empty Order is already covered by TestBuildQuery_noFilters).
+func TestBuildQuery_orderASC(t *testing.T) {
+	opts := Options{Schema: "db", Table: "t", Limit: 100, Order: "ASC"}
+	q, _ := buildQuery(opts)
+
+	if !strings.HasSuffix(q, "ORDER BY event_timestamp ASC, event_id ASC LIMIT ?") {
+		t.Errorf("expected ORDER BY event_timestamp ASC, event_id ASC LIMIT ? for Order=ASC, got: %s", q)
+	}
+}
+
+// TestBuildQuery_orderDESC_limitPerPK verifies the per-PK ROW_NUMBER inner
+// ORDER BY stays DESC (semantic: "latest N per PK") while the outer ORDER BY
+// follows the requested direction.
+func TestBuildQuery_orderDESC_limitPerPK(t *testing.T) {
+	opts := Options{Schema: "db", Table: "t", PKValuesIn: []string{"1", "2"}, LimitPerPK: 1, Limit: 100, Order: "DESC"}
+	q, _ := buildQuery(opts)
+
+	if !strings.Contains(q, "ORDER BY event_timestamp DESC, event_id DESC) AS bt_rn") {
+		t.Errorf("inner ROW_NUMBER ORDER BY must stay DESC (selects latest N per PK), got: %s", q)
+	}
+	if !strings.HasSuffix(q, "ORDER BY event_timestamp DESC, event_id DESC LIMIT ?") {
+		t.Errorf("outer ORDER BY must follow opts.Order=DESC, got: %s", q)
+	}
+}
+
+// TestBuildQuery_orderCaseInsensitive locks the normalisation rule:
+// "desc"/"Desc"/"DESC" all produce DESC; "asc"/"" all produce ASC.
+func TestBuildQuery_orderCaseInsensitive(t *testing.T) {
+	for _, in := range []string{"desc", "Desc", "DESC", "dEsC"} {
+		q, _ := buildQuery(Options{Schema: "db", Table: "t", Limit: 100, Order: in})
+		if !strings.Contains(q, "ORDER BY event_timestamp DESC, event_id DESC") {
+			t.Errorf("input %q should produce DESC, got: %s", in, q)
+		}
+	}
+	for _, in := range []string{"asc", "ASC", "", "garbage"} {
+		q, _ := buildQuery(Options{Schema: "db", Table: "t", Limit: 100, Order: in})
+		if !strings.Contains(q, "ORDER BY event_timestamp ASC, event_id ASC") {
+			t.Errorf("input %q should produce ASC (default), got: %s", in, q)
+		}
+	}
+}
+
+// TestOrderDirection covers the normalisation rule directly.
+func TestOrderDirection(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"DESC", "DESC"},
+		{"desc", "DESC"},
+		{"Desc", "DESC"},
+		{"ASC", "ASC"},
+		{"asc", "ASC"},
+		{"", "ASC"},
+		{"garbage", "ASC"},
+	}
+	for _, c := range cases {
+		if got := OrderDirection(c.in); got != c.want {
+			t.Errorf("OrderDirection(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 

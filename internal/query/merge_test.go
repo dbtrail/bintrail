@@ -12,7 +12,7 @@ func TestMergeResults_dedup(t *testing.T) {
 		{EventID: 1, EventTimestamp: ts, SchemaName: "b"}, // duplicate
 		{EventID: 2, EventTimestamp: ts.Add(time.Second)},
 	}
-	got := MergeResults(rows, 0)
+	got := MergeResults(rows, 0, "")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(got))
 	}
@@ -29,7 +29,7 @@ func TestMergeResults_sort(t *testing.T) {
 		{EventID: 2, EventTimestamp: ts1},
 		{EventID: 1, EventTimestamp: ts2},
 	}
-	got := MergeResults(rows, 0)
+	got := MergeResults(rows, 0, "")
 	if got[0].EventID != 1 {
 		t.Errorf("expected event 1 first (earlier timestamp), got %d", got[0].EventID)
 	}
@@ -41,7 +41,7 @@ func TestMergeResults_sortByEventID(t *testing.T) {
 		{EventID: 5, EventTimestamp: ts},
 		{EventID: 3, EventTimestamp: ts},
 	}
-	got := MergeResults(rows, 0)
+	got := MergeResults(rows, 0, "")
 	if got[0].EventID != 3 {
 		t.Errorf("expected event 3 first (same timestamp, lower ID), got %d", got[0].EventID)
 	}
@@ -54,7 +54,7 @@ func TestMergeResults_limit(t *testing.T) {
 		{EventID: 2, EventTimestamp: ts.Add(time.Second)},
 		{EventID: 3, EventTimestamp: ts.Add(2 * time.Second)},
 	}
-	got := MergeResults(rows, 2)
+	got := MergeResults(rows, 2, "")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 rows after limit, got %d", len(got))
 	}
@@ -66,14 +66,14 @@ func TestMergeResults_zeroLimit(t *testing.T) {
 		{EventID: 1, EventTimestamp: ts},
 		{EventID: 2, EventTimestamp: ts.Add(time.Second)},
 	}
-	got := MergeResults(rows, 0)
+	got := MergeResults(rows, 0, "")
 	if len(got) != 2 {
 		t.Fatalf("expected all rows with limit=0, got %d", len(got))
 	}
 }
 
 func TestMergeResults_empty(t *testing.T) {
-	got := MergeResults(nil, 10)
+	got := MergeResults(nil, 10, "")
 	if len(got) != 0 {
 		t.Fatalf("expected 0 rows, got %d", len(got))
 	}
@@ -104,7 +104,7 @@ func TestMergeAndTrim_perPKBeforeGlobal(t *testing.T) {
 		{EventID: 8, EventTimestamp: ts(8), PKValues: "c"},
 		{EventID: 9, EventTimestamp: ts(9), PKValues: "c"},
 	}
-	got := MergeAndTrim(rows, 6, 1)
+	got := MergeAndTrim(rows, 6, 1, "")
 	if len(got) != 3 {
 		t.Fatalf("expected 3 rows (1 per PK) after correct trim ordering, got %d: %+v", len(got), got)
 	}
@@ -141,7 +141,7 @@ func TestMergeAndTrim_crossSourceDedup(t *testing.T) {
 		{EventID: 2, EventTimestamp: ts.Add(time.Second), PKValues: "a"},
 		{EventID: 3, EventTimestamp: ts.Add(2 * time.Second), PKValues: "a"},
 	}
-	got := MergeAndTrim(rows, 0, 2)
+	got := MergeAndTrim(rows, 0, 2, "")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 rows after dedup (3 unique) + LimitPerPK=2 trim, got %d", len(got))
 	}

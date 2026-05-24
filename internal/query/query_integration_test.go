@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -430,5 +431,83 @@ func TestFetch_allNullableNotNullColumns(t *testing.T) {
 		got.SchemaName != "" || got.TableName != "" || got.PKValues != "" ||
 		got.EventType != 0 || got.SchemaVersion != 0 {
 		t.Errorf("row 1 (all-NULL drift): expected all zero values, got %+v", got)
+	}
+}
+
+// TestFetch_orderDirectionDisjointRowSets pins the #1511 fix: with
+// Order=ASC + Limit=N and Order=DESC + Limit=N against a dataset with > 2N
+// rows, the returned event_ids are STRICTLY DISJOINT (the ASC page is the
+// oldest N events; the DESC page is the newest N — no overlap). This is the
+// single assertion the bug-filing user explicitly called out as "what would
+// have caught the original bug" — the pre-#1511 code returned the same
+// oldest N rows for both directions regardless of Order.
+func TestFetch_orderDirectionDisjointRowSets(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Insert 10 events with strictly increasing timestamps for the same (schema, table, pk).
+	// The event_id auto-increments in insertion order so the bug surfaces as
+	// "DESC returns event_ids 1..5 just sorted descending" instead of 6..10.
+	for i := 0; i < 10; i++ {
+		ts := time.Date(2026, 5, 24, 14, 0, i, 0, time.UTC).Format("2006-01-02 15:04:05")
+		testutil.InsertEvent(t, db, "binlog.000001", uint64(100+i*100), uint64(200+i*100), ts, nil,
+			"mydb", "orders", 1, fmt.Sprintf("%d", i+1), nil, nil, []byte(fmt.Sprintf(`{"id":%d}`, i+1)))
+	}
+
+	e := New(db)
+	ascRows, err := e.Fetch(context.Background(), Options{
+		Schema: "mydb", Table: "orders", Limit: 5, Order: "ASC",
+	})
+	if err != nil {
+		t.Fatalf("Fetch ASC failed: %v", err)
+	}
+	descRows, err := e.Fetch(context.Background(), Options{
+		Schema: "mydb", Table: "orders", Limit: 5, Order: "DESC",
+	})
+	if err != nil {
+		t.Fatalf("Fetch DESC failed: %v", err)
+	}
+
+	if len(ascRows) != 5 {
+		t.Fatalf("expected 5 ASC rows, got %d", len(ascRows))
+	}
+	if len(descRows) != 5 {
+		t.Fatalf("expected 5 DESC rows, got %d", len(descRows))
+	}
+
+	ascIDs := make(map[uint64]bool, 5)
+	for _, r := range ascRows {
+		ascIDs[r.EventID] = true
+	}
+	// The disjoint-set assertion — the bug-filing user's explicit ask.
+	for _, r := range descRows {
+		if ascIDs[r.EventID] {
+			t.Errorf("event_id %d appears in BOTH ASC and DESC pages; this is the #1511 regression "+
+				"(DESC LIMIT N returning the same oldest N rows as ASC LIMIT N). "+
+				"ascIDs=%v descIDs=%v",
+				r.EventID, ascRows, descRows)
+		}
+	}
+
+	// Stronger property: the ASC page is the timestamp-earliest 5 events, the
+	// DESC page is the timestamp-latest 5. Combined they cover all 10 inserted rows.
+	combined := make(map[uint64]bool, 10)
+	for _, r := range ascRows {
+		combined[r.EventID] = true
+	}
+	for _, r := range descRows {
+		combined[r.EventID] = true
+	}
+	if len(combined) != 10 {
+		t.Errorf("ASC + DESC pages combined should cover all 10 inserted events; got %d unique event_ids", len(combined))
+	}
+
+	// Direction sanity: ASC's first event_timestamp must be ≤ DESC's last (sanity
+	// against an inverted slice). Note we compare timestamps, not event_ids,
+	// because the bug was about row identity, not display order.
+	if !ascRows[0].EventTimestamp.Before(descRows[len(descRows)-1].EventTimestamp) &&
+		!ascRows[0].EventTimestamp.Equal(descRows[len(descRows)-1].EventTimestamp) {
+		t.Errorf("expected ASC[0] timestamp ≤ DESC[last] timestamp; got asc[0]=%v desc[last]=%v",
+			ascRows[0].EventTimestamp, descRows[len(descRows)-1].EventTimestamp)
 	}
 }

@@ -345,7 +345,7 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 				}
 				results = append(results, ar...)
 			}
-			results = query.MergeResults(results, opts.Limit)
+			results = query.MergeResults(results, opts.Limit, opts.Order)
 			n, err = query.Format(results, format, &buf)
 			if err != nil {
 				return errorResult(err), nil, nil
@@ -431,7 +431,7 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 				}
 				rows = append(rows, ar...)
 			}
-			rows = query.MergeResults(rows, opts.Limit)
+			rows = query.MergeResults(rows, opts.Limit, opts.Order)
 		} else {
 			rows, err = engine.Fetch(ctx, opts)
 			if err != nil {
