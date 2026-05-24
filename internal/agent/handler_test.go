@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -107,6 +108,65 @@ func TestHandleRecover_gtidNoMatch(t *testing.T) {
 	for _, stmt := range []string{"DELETE FROM `shop`", "INSERT INTO `shop`", "UPDATE `shop`"} {
 		if strings.Contains(sql, stmt) {
 			t.Errorf("expected no recovery statements for non-matching GTID, got %q in:\n%s", stmt, sql)
+		}
+	}
+}
+
+// TestHandleRecover_rejectsEmptyScope pins the fail-loud guard added
+// alongside #1512: a request with empty GTID and zero time bounds must
+// return an error rather than fall back to recovering the last 1000
+// events in the index (the silent shape that surfaced the original bug).
+func TestHandleRecover_rejectsEmptyScope(t *testing.T) {
+	buf := buffer.New(buffer.Config{MaxAge: time.Hour})
+	h := &DefaultHandler{Buffer: buf}
+
+	_, err := h.HandleRecover(context.Background(), RecoverRequest{
+		Schema: "shop",
+		Table:  "orders",
+		// GTID, TimeStart, TimeEnd all zero — the unscoped shape.
+	})
+	if err == nil {
+		t.Fatalf("expected error for unscoped recover, got nil")
+	}
+	if !strings.Contains(err.Error(), "recover requires gtid or time bounds") {
+		t.Errorf("expected guard error message, got: %v", err)
+	}
+}
+
+// TestHandleRecover_gtidNoMatch_largeFallback strengthens the no-match
+// guarantee in TestHandleRecover_gtidNoMatch with a buffer larger than the
+// historical Limit=1000 cap inside HandleRecover. If the GTID filter were
+// dropped on the floor again the handler would now return reversal SQL for
+// up to 1000 unrelated events; this test fails immediately in that case.
+func TestHandleRecover_gtidNoMatch_largeFallback(t *testing.T) {
+	now := time.Now().UTC()
+	buf := buffer.New(buffer.Config{MaxAge: time.Hour})
+	events := make([]parser.Event, 0, 1500)
+	for i := 0; i < 1500; i++ {
+		events = append(events, makeRecoverEvent(now, fmt.Sprintf("%d", i), fmt.Sprintf("abc:%d", i)))
+	}
+	buf.Insert(events)
+
+	h := &DefaultHandler{Buffer: buf}
+
+	// Broad time window covers every event in the buffer; only the GTID
+	// filter stands between an unscoped fallback and an empty result.
+	sql, err := h.HandleRecover(context.Background(), RecoverRequest{
+		Schema:    "shop",
+		Table:     "orders",
+		GTID:      "non-matching:9999999",
+		TimeStart: now.Add(-time.Hour),
+		TimeEnd:   now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("HandleRecover returned error: %v", err)
+	}
+
+	// No reversal statements should reference the table. A regression that
+	// drops the GTID filter would return up to 1000 statements here.
+	for _, stmt := range []string{"DELETE FROM `shop`", "INSERT INTO `shop`", "UPDATE `shop`"} {
+		if strings.Contains(sql, stmt) {
+			t.Errorf("expected no recovery statements for non-matching GTID on 1500-event buffer, got %q in:\n%s", stmt, sql)
 		}
 	}
 }

@@ -176,6 +176,13 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 	if h.IndexDB == nil && len(h.ArchiveSources) == 0 && h.Buffer == nil {
 		return "", fmt.Errorf("no data sources configured (need --index-dsn, --archive-dir/--archive-s3, or buffer)")
 	}
+	// Fail-loud guard: every recover call must scope the events somehow.
+	// Without GTID *and* without time bounds the previous code would have
+	// happily generated reversal SQL for the last 1000 events in the index —
+	// exactly the silent-fallback shape #1512 patched. Reject up front.
+	if req.GTID == "" && req.TimeStart.IsZero() && req.TimeEnd.IsZero() {
+		return "", fmt.Errorf("recover requires gtid or time bounds")
+	}
 
 	// Build query options from the recover request.
 	opts := query.Options{
