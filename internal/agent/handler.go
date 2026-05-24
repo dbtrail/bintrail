@@ -166,6 +166,12 @@ func (h *DefaultHandler) resolvePKFromArchive(ctx context.Context, item PKItem, 
 }
 
 // HandleRecover generates reversal SQL for the specified events.
+//
+// Scope precedence: when GTID is set the agent honours it as the precise
+// filter and only applies time bounds if the caller supplied them.  When
+// GTID is empty the time range becomes the primary scope and zero-value
+// TimeStart/TimeEnd are still passed verbatim (callers must populate them
+// or the query will match no events — same contract as before).
 func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) (string, error) {
 	if h.IndexDB == nil && len(h.ArchiveSources) == 0 && h.Buffer == nil {
 		return "", fmt.Errorf("no data sources configured (need --index-dsn, --archive-dir/--archive-s3, or buffer)")
@@ -175,9 +181,18 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 	opts := query.Options{
 		Schema: req.Schema,
 		Table:  req.Table,
-		Since:  &req.TimeStart,
-		Until:  &req.TimeEnd,
+		GTID:   req.GTID,
 		Limit:  1000,
+	}
+	// Pass time bounds verbatim when the caller supplied them.  Skip
+	// zero-value bounds entirely — passing year-1 to query.Fetch would
+	// still match (TO_SECONDS('0001-01-01') is small) but it's cleaner
+	// and avoids surprising parquet partition pruning.  See #1512.
+	if !req.TimeStart.IsZero() {
+		opts.Since = &req.TimeStart
+	}
+	if !req.TimeEnd.IsZero() {
+		opts.Until = &req.TimeEnd
 	}
 	if len(req.EventTypes) > 1 {
 		return "", fmt.Errorf("only one event type filter is supported, got %d", len(req.EventTypes))

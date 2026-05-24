@@ -70,6 +70,12 @@ type PKResult struct {
 }
 
 // RecoverRequest is the payload for "recover" commands.
+//
+// GTID, when non-empty, scopes recovery to a single transaction.  The agent
+// must honour it as the precise filter; the time range becomes optional
+// (callers may send zero-value TimeStart/TimeEnd alongside a GTID, expecting
+// the gtid to be the sole scope).  Dropping the GTID field silently
+// produced reversal SQL for unrelated events — see nethalo/dbtrail#1512.
 type RecoverRequest struct {
 	PKHashes   []string  `json:"pk_hashes"`
 	Schema     string    `json:"schema"`
@@ -77,6 +83,7 @@ type RecoverRequest struct {
 	TimeStart  time.Time `json:"time_start"`
 	TimeEnd    time.Time `json:"time_end"`
 	EventTypes []string  `json:"event_types,omitempty"`
+	GTID       string    `json:"gtid,omitempty"`
 }
 
 // ForensicsQueryRequest is the payload for "forensics_query" commands.
