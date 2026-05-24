@@ -355,3 +355,80 @@ func TestFetch_nullBinlogFile(t *testing.T) {
 		t.Errorf("row 1: expected BinlogFile=\"\" for NULL column, got %q", rows[1].BinlogFile)
 	}
 }
+
+// TestFetch_allNullableNotNullColumns is the dbtrail/bintrail#1484 deploy
+// verification follow-up: byos-202 surfaced NULL not just in binlog_file
+// (#318) but also in start_pos — proof that production indexes can carry
+// NULL across MANY "NOT NULL" columns simultaneously, not just one. This
+// test relaxes every defended-against column to NULL, inserts a row with
+// NULL in all of them, and asserts Fetch returns it without crashing. A
+// regression that re-introduces a bare-type scan for any one column will
+// fail with the column-specific "converting NULL to X is unsupported".
+//
+// event_timestamp is excluded because it's part of the PRIMARY KEY in
+// the partition definition — MySQL rejects NULL there regardless of the
+// column's own constraint. event_id is excluded because AUTO_INCREMENT
+// cannot return NULL on read. schema_version has DEFAULT 0 so MySQL fills
+// 0 instead of NULL on omission, but is still defended at the scan layer.
+func TestFetch_allNullableNotNullColumns(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Relax the NOT NULL on every column that the defensive scanner is
+	// supposed to handle (matches the set of sql.Null* locals in scanRows).
+	for _, alter := range []string{
+		`ALTER TABLE binlog_events MODIFY binlog_file VARCHAR(255) NULL`,
+		`ALTER TABLE binlog_events MODIFY start_pos BIGINT UNSIGNED NULL`,
+		`ALTER TABLE binlog_events MODIFY end_pos BIGINT UNSIGNED NULL`,
+		`ALTER TABLE binlog_events MODIFY schema_name VARCHAR(64) NULL`,
+		`ALTER TABLE binlog_events MODIFY table_name VARCHAR(64) NULL`,
+		`ALTER TABLE binlog_events MODIFY event_type TINYINT UNSIGNED NULL`,
+		`ALTER TABLE binlog_events MODIFY pk_values VARCHAR(512) NULL`,
+		`ALTER TABLE binlog_events MODIFY schema_version INT UNSIGNED NULL`,
+	} {
+		if _, err := db.Exec(alter); err != nil {
+			t.Fatalf("ALTER TABLE failed (%q): %v", alter, err)
+		}
+	}
+
+	// Insert one row populated for sorting + Fetch filter, and one row with
+	// NULL in every defended column. event_timestamp must be set on the
+	// drifted row because it's in the PK.
+	ts := "2026-02-19 14:00:00"
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts, nil, "mydb", "orders", 1, "1",
+		nil, nil, []byte(`{"id":1}`))
+	if _, err := db.Exec(`INSERT INTO binlog_events
+		(binlog_file, start_pos, end_pos, event_timestamp, gtid,
+		 schema_name, table_name, event_type, pk_values,
+		 changed_columns, row_before, row_after, schema_version)
+		VALUES (NULL, NULL, NULL, ?, NULL,
+		        NULL, NULL, NULL, NULL,
+		        NULL, NULL, NULL, NULL)`,
+		ts,
+	); err != nil {
+		t.Fatalf("insert all-NULL row failed: %v", err)
+	}
+
+	// Fetch without schema/table filters since the drifted row has NULL
+	// schema_name and table_name.
+	e := New(db)
+	rows, err := e.Fetch(context.Background(), Options{Limit: 100})
+	if err != nil {
+		t.Fatalf("Fetch failed: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+
+	// rows[0] is the non-NULL row (lower event_id), rows[1] is the all-NULL
+	// drift row. NULL → zero-value mapping is the documented behavior.
+	if rows[0].BinlogFile != "binlog.000001" || rows[0].SchemaName != "mydb" {
+		t.Errorf("row 0: unexpected values %+v", rows[0])
+	}
+	got := rows[1]
+	if got.BinlogFile != "" || got.StartPos != 0 || got.EndPos != 0 ||
+		got.SchemaName != "" || got.TableName != "" || got.PKValues != "" ||
+		got.EventType != 0 || got.SchemaVersion != 0 {
+		t.Errorf("row 1 (all-NULL drift): expected all zero values, got %+v", got)
+	}
+}

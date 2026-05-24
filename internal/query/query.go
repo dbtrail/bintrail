@@ -378,24 +378,48 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 	var results []ResultRow
 	for rows.Next() {
 		var r ResultRow
-		// binlog_file is declared NOT NULL in the migrations, but customer
-		// databases that predate that constraint (or schema_change rows
-		// inserted by external pipelines) can still surface NULL. Scan into
-		// a NullString to stay robust to schema drift.
-		var binlogFile sql.NullString
-		var gtid sql.NullString
-		var connID sql.NullInt64
+		// Every NOT NULL column is scanned defensively. The migrations
+		// declare them NOT NULL, but production has shown that customer
+		// indexes can carry NULL in multiple columns simultaneously —
+		// likely from external pipelines, partial-write paths, or
+		// pre-constraint backfills. The first sighting (#318) was
+		// binlog_file; #1484's deploy verification surfaced start_pos
+		// on the same byos-202 tenant. Defending the entire Scan closes
+		// the pattern. event_id stays a bare uint64 because
+		// AUTO_INCREMENT cannot return NULL on read.
+		var (
+			binlogFile     sql.NullString
+			startPos       sql.NullInt64
+			endPos         sql.NullInt64
+			eventTimestamp sql.NullTime
+			gtid           sql.NullString
+			connID         sql.NullInt64
+			schemaName     sql.NullString
+			tableName      sql.NullString
+			eventType      sql.NullInt32
+			pkValues       sql.NullString
+			schemaVersion  sql.NullInt32
+		)
 		var changedCols, rowBefore, rowAfter []byte
 
 		if err := rows.Scan(
-			&r.EventID, &binlogFile, &r.StartPos, &r.EndPos, &r.EventTimestamp,
-			&gtid, &connID, &r.SchemaName, &r.TableName, &r.EventType, &r.PKValues,
-			&changedCols, &rowBefore, &rowAfter, &r.SchemaVersion,
+			&r.EventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
+			&gtid, &connID, &schemaName, &tableName, &eventType, &pkValues,
+			&changedCols, &rowBefore, &rowAfter, &schemaVersion,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan result row: %w", err)
 		}
 		if binlogFile.Valid {
 			r.BinlogFile = binlogFile.String
+		}
+		if startPos.Valid {
+			r.StartPos = uint64(startPos.Int64)
+		}
+		if endPos.Valid {
+			r.EndPos = uint64(endPos.Int64)
+		}
+		if eventTimestamp.Valid {
+			r.EventTimestamp = eventTimestamp.Time
 		}
 		if gtid.Valid {
 			r.GTID = &gtid.String
@@ -403,6 +427,21 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 		if connID.Valid {
 			v := uint32(connID.Int64)
 			r.ConnectionID = &v
+		}
+		if schemaName.Valid {
+			r.SchemaName = schemaName.String
+		}
+		if tableName.Valid {
+			r.TableName = tableName.String
+		}
+		if eventType.Valid {
+			r.EventType = parser.EventType(eventType.Int32)
+		}
+		if pkValues.Valid {
+			r.PKValues = pkValues.String
+		}
+		if schemaVersion.Valid {
+			r.SchemaVersion = uint32(schemaVersion.Int32)
 		}
 		if changedCols != nil {
 			_ = json.Unmarshal(changedCols, &r.ChangedColumns)

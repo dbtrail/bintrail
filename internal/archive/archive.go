@@ -80,22 +80,28 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 
 	var rowCount int64
 	for rows.Next() {
+		// Every NOT NULL column is scanned defensively and its
+		// Valid bit is propagated into the nulls[] slice so the Parquet
+		// writer preserves true NULL. See dbtrail/bintrail#318 for the
+		// production observation that "NOT NULL" cannot be trusted in
+		// drifted/external-pipeline-fed indexes. event_id stays a bare
+		// uint64 since AUTO_INCREMENT cannot return NULL.
 		var (
 			eventID        uint64
 			binlogFile     sql.NullString
-			startPos       uint64
-			endPos         uint64
-			eventTimestamp time.Time
+			startPos       sql.NullInt64
+			endPos         sql.NullInt64
+			eventTimestamp sql.NullTime
 			gtid           sql.NullString
 			connID         sql.NullInt64
-			schemaName     string
-			tableName      string
-			eventType      uint8
-			pkValues       string
+			schemaName     sql.NullString
+			tableName      sql.NullString
+			eventType      sql.NullInt32
+			pkValues       sql.NullString
 			changedColumns []byte // nil = NULL
 			rowBefore      []byte // nil = NULL
 			rowAfter       []byte // nil = NULL
-			schemaVersion  uint32
+			schemaVersion  sql.NullInt32
 		)
 		if err := rows.Scan(
 			&eventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
@@ -109,35 +115,44 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		if connID.Valid {
 			connIDStr = strconv.FormatInt(connID.Int64, 10)
 		}
+		eventTimestampStr := ""
+		if eventTimestamp.Valid {
+			eventTimestampStr = eventTimestamp.Time.UTC().Format("2006-01-02 15:04:05")
+		}
 
 		values := []string{
 			strconv.FormatUint(eventID, 10),
 			binlogFile.String,
-			strconv.FormatUint(startPos, 10),
-			strconv.FormatUint(endPos, 10),
-			eventTimestamp.UTC().Format("2006-01-02 15:04:05"),
+			strconv.FormatInt(startPos.Int64, 10),
+			strconv.FormatInt(endPos.Int64, 10),
+			eventTimestampStr,
 			gtid.String,
 			connIDStr,
-			schemaName,
-			tableName,
-			strconv.FormatUint(uint64(eventType), 10),
-			pkValues,
+			schemaName.String,
+			tableName.String,
+			strconv.FormatInt(int64(eventType.Int32), 10),
+			pkValues.String,
 			string(changedColumns),
 			string(rowBefore),
 			string(rowAfter),
-			strconv.FormatUint(uint64(schemaVersion), 10),
+			strconv.FormatInt(int64(schemaVersion.Int32), 10),
 		}
 		nulls := []bool{
-			false,
-			!binlogFile.Valid, // binlog_file: preserve NULL in Parquet (dbtrail/bintrail#318)
-			false, false, false,
+			false, // event_id (AUTO_INCREMENT, cannot be NULL)
+			!binlogFile.Valid,
+			!startPos.Valid,
+			!endPos.Valid,
+			!eventTimestamp.Valid,
 			!gtid.Valid,
 			!connID.Valid,
-			false, false, false, false,
+			!schemaName.Valid,
+			!tableName.Valid,
+			!eventType.Valid,
+			!pkValues.Valid,
 			changedColumns == nil,
 			rowBefore == nil,
 			rowAfter == nil,
-			false, // schema_version is NOT NULL
+			!schemaVersion.Valid,
 		}
 
 		if err := w.WriteRow(values, nulls); err != nil {
