@@ -115,3 +115,50 @@ func TestPKColumnMetas_ordering(t *testing.T) {
 		t.Errorf("expected both id and seq in PK columns, got %v", pks)
 	}
 }
+
+// TestResolverTables pins the behaviour of Resolver.Tables added for
+// #315: returns every TableMeta whose Schema matches, sorted by Table
+// name, and excludes tables from other schemas in the same snapshot.
+// An unknown schema returns an empty (non-nil) slice.
+func TestResolverTables(t *testing.T) {
+	r := buildTestResolver(map[string]*TableMeta{
+		"appdb.users":     {Schema: "appdb", Table: "users"},
+		"appdb.orders":    {Schema: "appdb", Table: "orders"},
+		"appdb.products":  {Schema: "appdb", Table: "products"},
+		"otherdb.audits":  {Schema: "otherdb", Table: "audits"},
+		"otherdb.events":  {Schema: "otherdb", Table: "events"},
+	})
+
+	t.Run("appdb_returns_three_tables_sorted", func(t *testing.T) {
+		got := r.Tables("appdb")
+		if len(got) != 3 {
+			t.Fatalf("len = %d, want 3", len(got))
+		}
+		want := []string{"orders", "products", "users"}
+		for i, tm := range got {
+			if tm.Table != want[i] {
+				t.Errorf("got[%d] = %q, want %q (sort regression)", i, tm.Table, want[i])
+			}
+		}
+	})
+
+	t.Run("otherdb_returns_two_tables_sorted", func(t *testing.T) {
+		got := r.Tables("otherdb")
+		if len(got) != 2 {
+			t.Fatalf("len = %d, want 2", len(got))
+		}
+		if got[0].Table != "audits" || got[1].Table != "events" {
+			t.Errorf("got %v, want [audits events]", got)
+		}
+	})
+
+	t.Run("unknown_schema_returns_empty_non_nil_slice", func(t *testing.T) {
+		got := r.Tables("nope")
+		if got == nil {
+			t.Error("Tables(unknown) returned nil; want empty (non-nil) slice")
+		}
+		if len(got) != 0 {
+			t.Errorf("len = %d, want 0", len(got))
+		}
+	})
+}

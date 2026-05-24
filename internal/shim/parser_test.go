@@ -507,3 +507,149 @@ func TestQueryTypeString(t *testing.T) {
 		}
 	}
 }
+
+// ─── #313 column lists ────────────────────────────────────────────────────────
+
+// TestParseFlashbackColumnList verifies that a comma-separated column
+// list in the SELECT clause is parsed into TimeTravelQuery.Columns
+// (preserving the user's listed order). SELECT * still produces a nil
+// Columns slice — the existing "all columns in DDL order" semantic.
+func TestParseFlashbackColumnList(t *testing.T) {
+	cases := []struct {
+		name    string
+		sql     string
+		wantCol []string // nil for SELECT *
+	}{
+		{
+			"star_keeps_nil",
+			"SELECT * FROM _flashback.users AS OF '2026-05-02 10:00:00' WHERE id = 1",
+			nil,
+		},
+		{
+			"two_columns",
+			"SELECT id, name FROM _flashback.users AS OF '2026-05-02 10:00:00' WHERE id = 1",
+			[]string{"id", "name"},
+		},
+		{
+			"three_columns_extra_whitespace",
+			"SELECT id ,  email , name FROM _flashback.users AS OF '2026-05-02 10:00:00' WHERE id = 1",
+			[]string{"id", "email", "name"},
+		},
+		{
+			"single_column_full_table",
+			"SELECT id FROM _flashback.users AS OF '2026-05-02 10:00:00'",
+			[]string{"id"},
+		},
+		{
+			"snapshot_variant_with_cols",
+			"SELECT id, name FROM _snapshot.users AS OF '2026-05-02 10:00:00' WHERE id = 1",
+			[]string{"id", "name"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			if len(q.Columns) != len(tc.wantCol) {
+				t.Fatalf("Columns len = %d, want %d (cols=%v)", len(q.Columns), len(tc.wantCol), q.Columns)
+			}
+			for i, got := range q.Columns {
+				if got != tc.wantCol[i] {
+					t.Errorf("Columns[%d] = %q, want %q", i, got, tc.wantCol[i])
+				}
+			}
+			// All cases keep the same table and timestamp regardless of projection.
+			if q.Table != "users" {
+				t.Errorf("Table = %q, want users", q.Table)
+			}
+		})
+	}
+}
+
+// TestParseFlashbackRejectsUnsupportedColumnSyntax pins what the
+// minimal-scope column-list parser does NOT accept yet — these all
+// fall through to the existing "malformed time-travel query" error
+// path rather than silently mis-parsing.
+func TestParseFlashbackRejectsUnsupportedColumnSyntax(t *testing.T) {
+	cases := []string{
+		"SELECT `id`, `name` FROM _flashback.users AS OF '2026-05-02 10:00:00' WHERE id = 1", // backticks
+		"SELECT users.id, users.name FROM _flashback.users AS OF '2026-05-02 10:00:00' WHERE id = 1", // schema-qualified
+		"SELECT id AS user_id FROM _flashback.users AS OF '2026-05-02 10:00:00' WHERE id = 1",       // alias
+		"SELECT COUNT(*) FROM _flashback.users AS OF '2026-05-02 10:00:00' WHERE id = 1",            // function call
+	}
+	for _, sql := range cases {
+		t.Run(sql, func(t *testing.T) {
+			_, err := Parse(sql, "myapp")
+			if err == nil {
+				t.Errorf("Parse(%q) succeeded, want malformed-query error", sql)
+			}
+			if errors.Is(err, ErrNotTimeTravel) {
+				t.Errorf("Parse(%q) returned ErrNotTimeTravel — the query mentions _flashback. so the prefix screen MUST fire and the error must be the malformed-query error (1064), not the not-time-travel sentinel", sql)
+			}
+		})
+	}
+}
+
+// ─── #314 AS OF TIMESTAMP keyword ─────────────────────────────────────────────
+
+// TestParseFlashbackAsOfTimestampKeyword verifies that the optional
+// TIMESTAMP keyword between AS OF and the time literal parses
+// successfully (Oracle / SQL Server convention). The bare AS OF form
+// still works — it's a back-compat-preserving alternative.
+func TestParseFlashbackAsOfTimestampKeyword(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+	}{
+		{"with_keyword", "SELECT * FROM _flashback.orders AS OF TIMESTAMP '2026-05-02 10:00:00' WHERE id = 1"},
+		{"with_keyword_lower_case", "select * from _flashback.orders as of timestamp '2026-05-02 10:00:00' where id = 1"},
+		{"with_keyword_no_where", "SELECT * FROM _flashback.orders AS OF TIMESTAMP '2026-05-02 10:00:00'"},
+		{"with_keyword_and_cols", "SELECT id, name FROM _flashback.orders AS OF TIMESTAMP '2026-05-02 10:00:00' WHERE id = 1"},
+		{"snapshot_with_keyword", "SELECT * FROM _snapshot.orders AS OF TIMESTAMP '2026-05-02 10:00:00' WHERE id = 1"},
+		{"plain_as_of_still_works", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			want := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
+			if !q.AsOf.Equal(want) {
+				t.Errorf("AsOf = %v, want %v", q.AsOf, want)
+			}
+			if q.Table != "orders" {
+				t.Errorf("Table = %q, want orders", q.Table)
+			}
+		})
+	}
+}
+
+// TestParseColumnListHelper isolates the helper that converts the
+// regex projection group into a column slice. The helper is the only
+// surface where SELECT * → nil is decided.
+func TestParseColumnListHelper(t *testing.T) {
+	if got := parseColumnList("*"); got != nil {
+		t.Errorf("parseColumnList(*) = %v, want nil", got)
+	}
+	if got := parseColumnList("id"); !equalStrings(got, []string{"id"}) {
+		t.Errorf("parseColumnList(id) = %v, want [id]", got)
+	}
+	if got := parseColumnList("id, name,  email"); !equalStrings(got, []string{"id", "name", "email"}) {
+		t.Errorf("parseColumnList multi: %v", got)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

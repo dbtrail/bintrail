@@ -4,9 +4,15 @@
 //
 // Three virtual-schema statement shapes are recognised:
 //
-//	SELECT * FROM _flashback.<table> AS OF '<ts>'           WHERE <col> = <value>
-//	SELECT * FROM _snapshot.<table>  AS OF '<ts>'           WHERE <col> = <value>
-//	SELECT * FROM _diff.<table>      BETWEEN '<t1>' AND '<t2>' WHERE <col> = <value>
+//	SELECT * FROM _flashback.<table> AS OF [TIMESTAMP] '<ts>'           [WHERE <col> = <value>]
+//	SELECT * FROM _snapshot.<table>  AS OF [TIMESTAMP] '<ts>'           [WHERE <col> = <value>]
+//	SELECT * FROM _diff.<table>      BETWEEN '<t1>' AND '<t2>'          WHERE <col> = <value>
+//
+// On the AS OF shapes, `*` may be replaced with a comma-separated list
+// of column names (#313) — only those columns are projected. Missing
+// columns become NULL. The `TIMESTAMP` keyword after AS OF is optional
+// (#314) and matches the Oracle / SQL Server convention DBAs are
+// trained on; bintrail itself never required it.
 //
 // A fourth, ergonomic shape — the optimizer-hint comment form —
 // is also accepted and rewritten internally to _flashback:
@@ -71,6 +77,14 @@ func (t QueryType) String() string {
 //
 //	TypeFlashback / TypeSnapshot → AsOf set, Since/Until zero
 //	TypeDiff                     → Since/Until set, AsOf zero
+//
+// Columns reflects the user's projection: nil means SELECT * (return
+// every column in the table's DDL order). A non-nil slice means the
+// user listed columns explicitly — only those columns are projected in
+// the order they were listed, with NULL where the row image is missing
+// a column (same semantic as MySQL after an ALTER TABLE DROP COLUMN).
+// Only applies to TypeFlashback / TypeSnapshot; TypeDiff and the
+// hint-comment form keep the SELECT * shape (see #313).
 type TimeTravelQuery struct {
 	Type     QueryType
 	Schema   string // taken from the connection's USE'd database
@@ -80,6 +94,7 @@ type TimeTravelQuery struct {
 	Until    time.Time // for diff (inclusive upper bound)
 	PKColumn string
 	PKValue  string
+	Columns  []string // nil = SELECT *; otherwise user-listed projection
 }
 
 var (
@@ -142,13 +157,28 @@ var (
 )
 
 // mustCompileAsOf builds a regex for `_flashback` / `_snapshot` shapes.
-// Capture groups: 1=table, 2=timestamp, 3=col (or empty), 4=value (or empty).
+// Capture groups:
+//
+//	1 = projection: "*" OR a comma-separated identifier list (#313)
+//	2 = table
+//	3 = timestamp (the optional TIMESTAMP keyword preceding it is
+//	    a non-capturing group, #314)
+//	4 = WHERE column (or empty)
+//	5 = WHERE value (or empty)
+//
 // The trailing WHERE clause is in an optional non-capturing group so the
 // PK-filtered fast path and the full-table path go through the same matcher.
+//
+// The column-list pattern only accepts bare identifiers separated by
+// commas (e.g. `id, email, name`) — backticked, schema-qualified, and
+// aliased forms are intentionally out of scope for the demo-footgun
+// remediation (#313). They fall through to the existing "malformed
+// time-travel query" error.
 func mustCompileAsOf(schemaPrefix string) *regexp.Regexp {
 	return regexp.MustCompile(
-		`(?i)^\s*SELECT\s+\*\s+FROM\s+` + schemaPrefix + `\.([A-Za-z_][A-Za-z0-9_]*)` +
-			`\s+AS\s+OF\s+'([^']+)'` +
+		`(?i)^\s*SELECT\s+(\*|[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s+FROM\s+` +
+			schemaPrefix + `\.([A-Za-z_][A-Za-z0-9_]*)` +
+			`\s+AS\s+OF\s+(?:TIMESTAMP\s+)?'([^']+)'` +
 			`(?:\s+WHERE\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('[^']*'|-?\d+))?` +
 			`\s*;?\s*$`,
 	)
@@ -221,27 +251,51 @@ func Parse(sql, defaultSchema string) (TimeTravelQuery, error) {
 
 	return TimeTravelQuery{}, fmt.Errorf(
 		"malformed time-travel query; expected one of:\n" +
-			"  SELECT * FROM _flashback.<table> AS OF '<ts>' WHERE <col> = <value>\n" +
-			"  SELECT * FROM _snapshot.<table>  AS OF '<ts>' WHERE <col> = <value>\n" +
-			"  SELECT * FROM _diff.<table>      BETWEEN '<t1>' AND '<t2>' WHERE <col> = <value>",
+			"  SELECT (* | <col>[, <col>...]) FROM _flashback.<table> AS OF [TIMESTAMP] '<ts>' [WHERE <col> = <value>]\n" +
+			"  SELECT (* | <col>[, <col>...]) FROM _snapshot.<table>  AS OF [TIMESTAMP] '<ts>' [WHERE <col> = <value>]\n" +
+			"  SELECT * FROM _diff.<table>      BETWEEN '<t1>' AND '<t2>' WHERE <col> = <value>\n" +
+			"\n" +
+			"Notes: the TIMESTAMP keyword is optional. Column lists in the SELECT\n" +
+			"clause are supported on _flashback / _snapshot (bare identifiers only;\n" +
+			"backticks, schema.column, and aliases are not yet parsed).",
 	)
 }
 
 // parseAsOfMatch fills a TimeTravelQuery for the _flashback / _snapshot
-// shapes (capture groups: 1 table, 2 timestamp, 3 col, 4 value).
+// shapes (capture groups: 1 projection, 2 table, 3 timestamp, 4 col, 5 value).
 func parseAsOfMatch(m []string, t QueryType, schema string) (TimeTravelQuery, error) {
-	asOf, err := parseTimeLiteral(m[2])
+	asOf, err := parseTimeLiteral(m[3])
 	if err != nil {
-		return TimeTravelQuery{}, fmt.Errorf("invalid AS OF timestamp %q: %w", m[2], err)
+		return TimeTravelQuery{}, fmt.Errorf("invalid AS OF timestamp %q: %w", m[3], err)
 	}
 	return TimeTravelQuery{
 		Type:     t,
 		Schema:   schema,
-		Table:    m[1],
+		Table:    m[2],
 		AsOf:     asOf,
-		PKColumn: m[3],
-		PKValue:  stripQuotes(m[4]),
+		PKColumn: m[4],
+		PKValue:  stripQuotes(m[5]),
+		Columns:  parseColumnList(m[1]),
 	}, nil
+}
+
+// parseColumnList converts the regex-captured projection group into a
+// column-name slice. Returns nil for `*` (SELECT *), so downstream code
+// can treat nil as "the table's DDL order, every column".
+//
+// The input is guaranteed to be a valid projection by the regex (either
+// `*` or one or more bare identifiers separated by commas with optional
+// whitespace), so we can split-and-trim without re-validation.
+func parseColumnList(projection string) []string {
+	if projection == "*" {
+		return nil
+	}
+	parts := strings.Split(projection, ",")
+	cols := make([]string, 0, len(parts))
+	for _, p := range parts {
+		cols = append(cols, strings.TrimSpace(p))
+	}
+	return cols
 }
 
 // parseDiffMatch fills a TimeTravelQuery for the _diff shape

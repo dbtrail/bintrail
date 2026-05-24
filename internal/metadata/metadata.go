@@ -151,6 +151,25 @@ func (r *Resolver) SnapshotID() int { return r.snapshotID }
 // TableCount returns the number of tables in this resolver.
 func (r *Resolver) TableCount() int { return len(r.tables) }
 
+// Tables returns every TableMeta whose schema matches the argument,
+// sorted by table name for deterministic output. Used by the shim to
+// answer SHOW TABLES FROM _flashback/_diff/_snapshot (#315) and by
+// any future caller needing a list view of the snapshot.
+//
+// Returns an empty slice (not nil) when the schema is unknown — that's
+// the same shape MySQL itself returns for SHOW TABLES FROM <empty db>,
+// so callers can treat it as "nothing to display" without a nil check.
+func (r *Resolver) Tables(schema string) []*TableMeta {
+	out := make([]*TableMeta, 0)
+	for _, t := range r.tables {
+		if t.Schema == schema {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Table < out[j].Table })
+	return out
+}
+
 // Resolve returns metadata for a given schema.table.
 // Returns an error if the table is not found in the snapshot.
 func (r *Resolver) Resolve(schema, table string) (*TableMeta, error) {

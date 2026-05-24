@@ -42,6 +42,15 @@ const (
 	// (no real-world need but defensible) still routes via the more
 	// specific virtual-schema rule first.
 	ruleIDHint = 990004
+	// ruleIDShowTables matches `SHOW [FULL] TABLES FROM _flashback/_diff/_snapshot`
+	// (#315). The virtual schemas have no backend MySQL counterpart, so the
+	// query would otherwise route to passthrough and return ER_BAD_DB
+	// (1049 "Unknown database"). With this rule, the shim handler answers
+	// from the latest schema_snapshots row. Ordered AFTER the three virtual-
+	// schema rules + the hint rule so any future overlap (e.g. a SHOW
+	// containing a dotted virtual reference) routes via the more specific
+	// rule first.
+	ruleIDShowTables = 990005
 )
 
 var proxysqlConfigCmd = &cobra.Command{
@@ -484,7 +493,7 @@ func generateProxySQLSetupSQL(host string, mysqlPort, shimPort, proxysqlMySQLPor
 	sb.WriteString(" * This script manages the following ProxySQL resources, all in the\n")
 	sb.WriteString(" * 990* numeric range to avoid colliding with operator-managed rules:\n")
 	fmt.Fprintf(&sb, " *   * mysql_servers in hostgroups %d (passthrough) and %d (shim)\n", passthroughHostgroup, shimHostgroup)
-	fmt.Fprintf(&sb, " *   * mysql_query_rules with rule_id in %d..%d\n", ruleIDFlashback, ruleIDHint)
+	fmt.Fprintf(&sb, " *   * mysql_query_rules with rule_id in %d..%d\n", ruleIDFlashback, ruleIDShowTables)
 	sb.WriteString(" *   * mysql_users named in shim.yaml (these become bintrail-managed)\n")
 	sb.WriteString(" *\n")
 	sb.WriteString(" * Apply this file to the ProxySQL admin port:\n")
@@ -537,7 +546,7 @@ func generateProxySQLSetupSQL(host string, mysqlPort, shimPort, proxysqlMySQLPor
 	}
 	sb.WriteString("\n")
 
-	fmt.Fprintf(&sb, "DELETE FROM mysql_query_rules WHERE rule_id IN (%d, %d, %d, %d);\n", ruleIDFlashback, ruleIDDiff, ruleIDSnapshot, ruleIDHint)
+	fmt.Fprintf(&sb, "DELETE FROM mysql_query_rules WHERE rule_id IN (%d, %d, %d, %d, %d);\n", ruleIDFlashback, ruleIDDiff, ruleIDSnapshot, ruleIDHint, ruleIDShowTables)
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '\\b_flashback\\.', %d, 1);\n", ruleIDFlashback, shimHostgroup)
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '\\b_diff\\.', %d, 1);\n", ruleIDDiff, shimHostgroup)
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '\\b_snapshot\\.', %d, 1);\n", ruleIDSnapshot, shimHostgroup)
@@ -548,6 +557,11 @@ func generateProxySQLSetupSQL(host string, mysqlPort, shimPort, proxysqlMySQLPor
 	// table or column literally named DBTRAIL_AT (or a string value
 	// containing that text) doesn't get false-routed to the shim.
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '/\\*\\+\\s*DBTRAIL_AT', %d, 1);\n", ruleIDHint, shimHostgroup)
+	// SHOW TABLES FROM <virtual> (#315): routes interactive table-listing
+	// against the three virtual schemas to the shim, which answers from
+	// the latest schema snapshot. Without this rule the query would hit
+	// the real MySQL and get ER_BAD_DB.
+	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '^\\s*SHOW\\s+(FULL\\s+)?TABLES\\s+(FROM|IN)\\s+`?_(flashback|diff|snapshot)`?', %d, 1);\n", ruleIDShowTables, shimHostgroup)
 	sb.WriteString("\n")
 
 	sb.WriteString("COMMIT;\n")

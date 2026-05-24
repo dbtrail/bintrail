@@ -1983,3 +1983,203 @@ var _ = emptyResult().Resultset
 // Suppress unused-import lint: gomysql is referenced only for the
 // compile-time assertion below.
 var _ = gomysql.Result{}
+
+// ─── #315 SHOW TABLES FROM _flashback/_diff/_snapshot ─────────────────────────
+
+// TestHandleShowTablesFromVirtual exercises the SHOW TABLES interceptor
+// added for #315. Three properties:
+//
+//  1. Match: SHOW [FULL] TABLES FROM _flashback/_diff/_snapshot returns
+//     a resultset of the snapshot's tables in the current DB (sorted).
+//  2. Empty currentDB: ER_NO_DB_ERROR with the friendly message pointing
+//     at USE <db>.
+//  3. ErrNoSnapshots is benign — returns empty resultset, not error,
+//     matching MySQL behaviour against a fresh DB with no tables.
+func TestHandleShowTablesFromVirtual(t *testing.T) {
+	resolverFn := func() (*metadata.Resolver, error) {
+		return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+			"appdb.orders":   {Schema: "appdb", Table: "orders"},
+			"appdb.users":    {Schema: "appdb", Table: "users"},
+			"appdb.products": {Schema: "appdb", Table: "products"},
+			// Table in a different schema — must NOT appear in appdb's listing.
+			"otherdb.audits": {Schema: "otherdb", Table: "audits"},
+		}), nil
+	}
+	silentLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("happy_path_lists_tables_sorted", func(t *testing.T) {
+		h := &Handler{logger: silentLogger, resolverFn: resolverFn}
+		h.UseDB("appdb")
+
+		res, err := h.HandleQuery("SHOW TABLES FROM _flashback")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if res == nil || res.Resultset == nil {
+			t.Fatal("expected resultset, got nil")
+		}
+		if got := len(res.Resultset.RowDatas); got != 3 {
+			t.Fatalf("row count = %d, want 3 (orders/products/users)", got)
+		}
+		// Column header should be Tables_in_<virtual>.
+		if got := res.Resultset.Fields[0].Name; string(got) != "Tables_in__flashback" {
+			t.Errorf("column name = %q, want Tables_in__flashback", got)
+		}
+		// We don't decode RowDatas bytes here — the row count + the
+		// Tables() sort guarantee on the metadata side is sufficient
+		// (see TestResolverTablesSchemaFilter).
+	})
+
+	t.Run("full_tables_keyword_accepted", func(t *testing.T) {
+		h := &Handler{logger: silentLogger, resolverFn: resolverFn}
+		h.UseDB("appdb")
+		res, err := h.HandleQuery("SHOW FULL TABLES FROM _snapshot")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := len(res.Resultset.RowDatas); got != 3 {
+			t.Errorf("row count = %d, want 3", got)
+		}
+		if got := res.Resultset.Fields[0].Name; string(got) != "Tables_in__snapshot" {
+			t.Errorf("column name = %q, want Tables_in__snapshot", got)
+		}
+	})
+
+	t.Run("show_tables_in_keyword_accepted", func(t *testing.T) {
+		h := &Handler{logger: silentLogger, resolverFn: resolverFn}
+		h.UseDB("appdb")
+		res, err := h.HandleQuery("SHOW TABLES IN _diff")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := len(res.Resultset.RowDatas); got != 3 {
+			t.Errorf("row count = %d, want 3", got)
+		}
+	})
+
+	t.Run("backticked_virtual_accepted", func(t *testing.T) {
+		h := &Handler{logger: silentLogger, resolverFn: resolverFn}
+		h.UseDB("appdb")
+		res, err := h.HandleQuery("SHOW TABLES FROM `_flashback`")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := len(res.Resultset.RowDatas); got != 3 {
+			t.Errorf("row count = %d, want 3", got)
+		}
+	})
+
+	t.Run("no_current_db_friendly_error", func(t *testing.T) {
+		h := &Handler{logger: silentLogger, resolverFn: resolverFn}
+		_, err := h.HandleQuery("SHOW TABLES FROM _flashback")
+		if err == nil {
+			t.Fatal("expected error when no DB selected, got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_NO_DB_ERROR {
+			t.Errorf("expected ER_NO_DB_ERROR (1046), got %v", err)
+		}
+		if !strings.Contains(err.Error(), "USE") {
+			t.Errorf("error must mention USE; got: %v", err)
+		}
+	})
+
+	t.Run("no_snapshots_returns_empty_set", func(t *testing.T) {
+		emptyResolver := func() (*metadata.Resolver, error) {
+			return nil, metadata.ErrNoSnapshots
+		}
+		h := &Handler{logger: silentLogger, resolverFn: emptyResolver}
+		h.UseDB("appdb")
+		res, err := h.HandleQuery("SHOW TABLES FROM _flashback")
+		if err != nil {
+			t.Fatalf("expected empty set, not error: %v", err)
+		}
+		if res == nil || res.Resultset == nil {
+			t.Fatal("expected resultset (empty), got nil")
+		}
+		if got := len(res.Resultset.RowDatas); got != 0 {
+			t.Errorf("row count = %d, want 0", got)
+		}
+	})
+
+	t.Run("show_tables_from_real_db_falls_through", func(t *testing.T) {
+		h := &Handler{logger: silentLogger, resolverFn: resolverFn}
+		h.UseDB("appdb")
+		// `SHOW TABLES FROM appdb` is not one of our virtual schemas;
+		// the SHOW interceptor must NOT fire and the query must fall
+		// through to the default unsupported-query path.
+		_, err := h.HandleQuery("SHOW TABLES FROM appdb")
+		if err == nil {
+			t.Fatal("expected ER_NOT_SUPPORTED_YET, got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) {
+			t.Errorf("expected typed MyError, got %v", err)
+		}
+		if myErr.Code == gomysql.ER_NO_DB_ERROR {
+			t.Errorf("interceptor fired on real DB (ER_NO_DB_ERROR returned); must fall through to existing path")
+		}
+	})
+}
+
+// ─── #313 column projection ───────────────────────────────────────────────────
+
+// TestEffectiveColumnOrder verifies the branch point that #313 added:
+// a non-nil q.Columns short-circuits the snapshot-driven DDL ordering
+// and returns the user's listed columns verbatim; a nil q.Columns
+// preserves the previous behaviour (delegate to columnOrderFor).
+func TestEffectiveColumnOrder(t *testing.T) {
+	resolverFn := func() (*metadata.Resolver, error) {
+		return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+			"appdb.users": {
+				Schema: "appdb", Table: "users",
+				Columns: []metadata.ColumnMeta{
+					{Name: "id", OrdinalPosition: 1},
+					{Name: "email", OrdinalPosition: 2},
+					{Name: "name", OrdinalPosition: 3},
+					{Name: "created_at", OrdinalPosition: 4},
+				},
+			},
+		}), nil
+	}
+	h := &Handler{
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolverFn: resolverFn,
+	}
+
+	t.Run("nil_columns_uses_ddl_order", func(t *testing.T) {
+		q := TimeTravelQuery{Schema: "appdb", Table: "users", Columns: nil}
+		got := h.effectiveColumnOrder(q)
+		want := []string{"id", "email", "name", "created_at"}
+		if !slices.Equal(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("explicit_columns_used_verbatim", func(t *testing.T) {
+		q := TimeTravelQuery{
+			Schema: "appdb", Table: "users",
+			Columns: []string{"id", "name"}, // user-requested order
+		}
+		got := h.effectiveColumnOrder(q)
+		want := []string{"id", "name"}
+		if !slices.Equal(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("explicit_columns_can_include_unknown", func(t *testing.T) {
+		// Unknown columns surface as NULL on the wire — that's a property
+		// of imageToResult/imagesToResult, not effectiveColumnOrder.
+		// effectiveColumnOrder just returns the slice verbatim.
+		q := TimeTravelQuery{
+			Schema: "appdb", Table: "users",
+			Columns: []string{"id", "deleted_column"},
+		}
+		got := h.effectiveColumnOrder(q)
+		want := []string{"id", "deleted_column"}
+		if !slices.Equal(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+}
