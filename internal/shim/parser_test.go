@@ -623,6 +623,18 @@ func TestParseFlashbackAsOfTimestampKeyword(t *testing.T) {
 			if q.Table != "orders" {
 				t.Errorf("Table = %q, want orders", q.Table)
 			}
+			// For the combo case, pin Columns + PK explicitly: the new
+			// regex captures shift indices by +1, and a regression that
+			// drops Columns (or mis-extracts PK) would otherwise still
+			// pass the AsOf/Table assertions silently.
+			if tc.name == "with_keyword_and_cols" {
+				if !equalStrings(q.Columns, []string{"id", "name"}) {
+					t.Errorf("Columns = %v, want [id name]", q.Columns)
+				}
+				if q.PKColumn != "id" || q.PKValue != "1" {
+					t.Errorf("PK = %s=%q, want id=1", q.PKColumn, q.PKValue)
+				}
+			}
 		})
 	}
 }

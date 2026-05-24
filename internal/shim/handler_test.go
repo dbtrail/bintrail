@@ -2170,8 +2170,9 @@ func TestEffectiveColumnOrder(t *testing.T) {
 
 	t.Run("explicit_columns_can_include_unknown", func(t *testing.T) {
 		// Unknown columns surface as NULL on the wire — that's a property
-		// of imageToResult/imagesToResult, not effectiveColumnOrder.
-		// effectiveColumnOrder just returns the slice verbatim.
+		// of imageToResultVerbatim (for single-row) and imagesToResult
+		// (for multi-row). effectiveColumnOrder just returns the slice
+		// verbatim, which the verbatim sibling then projects through.
 		q := TimeTravelQuery{
 			Schema: "appdb", Table: "users",
 			Columns: []string{"id", "deleted_column"},
@@ -2180,6 +2181,75 @@ func TestEffectiveColumnOrder(t *testing.T) {
 		want := []string{"id", "deleted_column"}
 		if !slices.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+}
+
+// TestImageToResultVerbatim pins the single-row user-projection wire
+// contract added for #313. The bug this guards against: routing
+// q.Columns through imageToResult → orderColumns silently DROPS
+// missing-from-image columns and APPENDS image-only keys alphabetically.
+// The new imageToResultVerbatim path bypasses orderColumns so wire
+// fields stay verbatim and missing keys → NULL.
+//
+// This is the end-to-end test that should have caught the runPointInTime
+// regression. Three properties pinned:
+//
+//  1. Wire fields are exactly the user's cols, in the user's order.
+//  2. Image-only keys (NOT in user's projection) do NOT appear.
+//  3. User-listed columns missing from image are kept (NULL on wire).
+func TestImageToResultVerbatim(t *testing.T) {
+	t.Run("projects_only_listed_cols_in_listed_order", func(t *testing.T) {
+		image := map[string]any{
+			"id":         1,
+			"name":       "alice",
+			"email":      "a@b.com",   // image has email, user did NOT ask
+			"created_at": "2026-05-02", // image has created_at, user did NOT ask
+		}
+		res, err := imageToResultVerbatim(image, []string{"id", "name"})
+		if err != nil {
+			t.Fatalf("imageToResultVerbatim: %v", err)
+		}
+		// Wire fields are exactly [id, name]. Verifies orderColumns'
+		// "append extras alphabetically" misbehaviour is bypassed.
+		if got := len(res.Resultset.Fields); got != 2 {
+			t.Fatalf("field count = %d, want 2 (id, name only)", got)
+		}
+		if got := string(res.Resultset.Fields[0].Name); got != "id" {
+			t.Errorf("fields[0] = %q, want id", got)
+		}
+		if got := string(res.Resultset.Fields[1].Name); got != "name" {
+			t.Errorf("fields[1] = %q, want name", got)
+		}
+	})
+
+	t.Run("missing_from_image_stays_in_projection_as_null", func(t *testing.T) {
+		image := map[string]any{
+			"id":   1,
+			"name": "alice",
+		}
+		res, err := imageToResultVerbatim(image, []string{"id", "deleted_column"})
+		if err != nil {
+			t.Fatalf("imageToResultVerbatim: %v", err)
+		}
+		// Wire fields keep [id, deleted_column] verbatim. Verifies
+		// orderColumns' "drop missing" misbehaviour is bypassed.
+		if got := len(res.Resultset.Fields); got != 2 {
+			t.Fatalf("field count = %d, want 2 (id + missing deleted_column)", got)
+		}
+		if got := string(res.Resultset.Fields[1].Name); got != "deleted_column" {
+			t.Errorf("fields[1] = %q, want deleted_column (kept; value NULL on wire)", got)
+		}
+	})
+
+	t.Run("empty_projection_emits_zero_columns", func(t *testing.T) {
+		// Defensive: today the parser invariant guarantees non-empty
+		// cols when Columns != nil, but if a future caller passes
+		// []string{}, the wire row should be valid (zero columns) and
+		// not panic. BuildSimpleTextResultset on empty cols is well-defined.
+		_, err := imageToResultVerbatim(map[string]any{"id": 1}, []string{})
+		if err != nil {
+			t.Errorf("imageToResultVerbatim with empty cols: %v", err)
 		}
 	})
 }

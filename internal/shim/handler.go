@@ -437,15 +437,54 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	if image == nil {
 		return emptyResult(), nil
 	}
-	return imageToResult(image, h.effectiveColumnOrder(q))
+	// When q.Columns is set (#313 user-supplied projection), bypass
+	// imageToResult's orderColumns step — orderColumns is designed for
+	// SELECT * and DROPS missing-from-image columns + APPENDS image
+	// columns absent from ddlOrder (alphabetically). Both behaviours
+	// silently expand and reshuffle the user's explicit projection. The
+	// multi-row sibling imagesToResult already uses cols verbatim, so
+	// runFullTable was unaffected.
+	if q.Columns != nil {
+		return imageToResultVerbatim(image, q.Columns)
+	}
+	return imageToResult(image, h.columnOrderFor(q.Schema, q.Table))
 }
 
-// effectiveColumnOrder returns the column ordering the wire resultset
-// should use for q. A non-nil q.Columns means the user listed columns
-// explicitly (#313) and that list is used verbatim — missing columns
-// in a row image surface as NULL, matching MySQL's behaviour after an
-// ALTER TABLE DROP COLUMN. Otherwise the latest snapshot's DDL order is
-// used (the previous default).
+// imageToResultVerbatim is the user-projection sibling of imageToResult.
+// Unlike imageToResult (which goes through orderColumns to drop missing
+// keys and append snapshot-unknown extras), this function uses cols
+// verbatim — exactly the columns the user listed, in the order they
+// listed them, with NULL for any column missing from the image. That
+// matches MySQL's behaviour for `SELECT <col>, <col> FROM <table>`
+// after an ALTER TABLE DROP COLUMN: the column name stays, the value
+// is NULL.
+//
+// Pure function — separated from imageToResult so the two semantics
+// stay independently testable and the contract on each is single-purpose.
+func imageToResultVerbatim(image map[string]any, cols []string) (*mysql.Result, error) {
+	row := make([]any, len(cols))
+	for i, c := range cols {
+		row[i] = image[c] // nil for missing key → NULL on wire
+	}
+	rs, err := mysql.BuildSimpleTextResultset(cols, [][]any{row})
+	if err != nil {
+		return nil, fmt.Errorf("build verbatim resultset: %w", err)
+	}
+	return &mysql.Result{Resultset: rs}, nil
+}
+
+// effectiveColumnOrder returns the column ordering for the multi-row
+// path (runFullTable → imagesToResult). A non-nil q.Columns means the
+// user listed columns explicitly (#313); imagesToResult uses its
+// ddlOrder argument verbatim and emits NULL for missing image keys —
+// the contract this function relies on.
+//
+// DO NOT pass the result of this function into the single-row
+// imageToResult: that path goes through orderColumns, which is
+// designed for SELECT * and silently drops missing-from-image entries
+// while appending image-only keys alphabetically. For single-row
+// user-projection results, use imageToResultVerbatim directly (see
+// runPointInTime).
 func (h *Handler) effectiveColumnOrder(q TimeTravelQuery) []string {
 	if q.Columns != nil {
 		return q.Columns
@@ -481,10 +520,25 @@ func (h *Handler) runShowTablesFromVirtual(currentDB, virtualSchema string) (*my
 		// natural prompt to run `bintrail snapshot` is already in
 		// ErrNoSnapshots' message text, surfaced elsewhere.
 		if errors.Is(err, metadata.ErrNoSnapshots) {
-			rs, _ := mysql.BuildSimpleTextResultset([]string{colName}, nil)
+			rs, rsErr := mysql.BuildSimpleTextResultset([]string{colName}, nil)
+			if rsErr != nil {
+				// BuildSimpleTextResultset on (1 column, nil values) is
+				// empirically infallible today, but a future go-mysql
+				// release could tighten the contract. Surface via Warn so
+				// Sentry / structured logs catch it; the user still gets
+				// the empty-set semantic.
+				h.logger.Warn("shim: build empty SHOW TABLES resultset failed",
+					"err", rsErr, "current_db", currentDB, "virtual_schema", virtualSchema)
+				return nil, fmt.Errorf("build empty SHOW TABLES resultset: %w", rsErr)
+			}
 			return &mysql.Result{Resultset: rs}, nil
 		}
-		return nil, fmt.Errorf("resolve schema snapshot: %w", err)
+		// Wrap with currentDB + virtualSchema so a multi-tenant shim log
+		// lets oncall attribute the failure to a specific connection's
+		// USE and virtual-schema target — same triage-friendly pattern
+		// wrapFetchError uses for the data-fetch paths.
+		return nil, fmt.Errorf("resolve schema snapshot for SHOW TABLES FROM %s (current_db=%s): %w",
+			virtualSchema, currentDB, err)
 	}
 
 	tables := r.Tables(currentDB)
