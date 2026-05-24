@@ -12,7 +12,6 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -83,20 +82,31 @@ var (
 	shAuthMethod string
 )
 
-// monitorDeniedCount counts ER_ACCESS_DENIED_ERROR handshake failures whose
-// username matches ProxySQL's `monitor` (case-insensitive). Per-probe logs
-// stay at Debug (issue #316), but the steady-state INFO log line was
-// silenced for the entire monitor-user 1045 population — including
-// credential brute-force attempts that spoof the monitor username and
-// ProxySQL misconfigurations (rotated mysql-monitor_password) that would
-// otherwise produce zero shim-side signal. See issue #326.
+// monitorDeniedStats aggregates ER_ACCESS_DENIED_ERROR handshake failures
+// whose username matches ProxySQL's `monitor` (case-insensitive). Per-probe
+// logs stay at Debug (issue #316); this struct feeds the steady-state INFO
+// summary so credential brute-force bursts that spoof the monitor username
+// and ProxySQL misconfigurations (rotated mysql-monitor_password) surface
+// without restoring the per-probe flood. See issues #326 and the silent-
+// failure follow-up.
 //
-// A package-level atomic keeps the increment path lock-free on the hot
-// handshake-error branch. Tests that exercise classifyHandshakeErr reset
-// this counter explicitly with monitorDeniedCount.Store(0) — no
-// per-run scoping in production (only one runShim per process; the
-// counter is reset by the ticker every 5 minutes anyway).
-var monitorDeniedCount atomic.Int64
+// `count` alone (the original #326 design) couldn't distinguish "one IP
+// hammering with 3000 attempts" from "200 IPs each trying once" — exactly
+// the forensic signal an operator needs to tell credential stuffing from a
+// monitor misconfig. `distinctRemotes` is a bounded set (cap
+// monitorDeniedRemoteCap) so a wide-source burst can't blow memory; once
+// the cap is reached additional remotes are dropped (the metric becomes a
+// floor, which is the right direction for an alerting signal). Timestamps
+// bracket the interval so the emit line is self-contained.
+const monitorDeniedRemoteCap = 16
+
+var monitorDenied struct {
+	mu              sync.Mutex
+	count           int64
+	distinctRemotes map[string]struct{}
+	firstSeen       time.Time
+	lastSeen        time.Time
+}
 
 // monitorDeniedInterval is the cadence at which monitorDeniedTicker
 // emits and resets the counter. 5 minutes is short enough that a
@@ -106,6 +116,45 @@ var monitorDeniedCount atomic.Int64
 // flag-configurable on purpose: no operator will need to tune this and
 // the tunable would just be one more thing to misconfigure.
 const monitorDeniedInterval = 5 * time.Minute
+
+// monitorDeniedBump records one denied monitor probe with its source
+// remote (host portion only — same client at different ports counts as
+// one source for the distinctRemotes signal). Called from handleConn
+// after classifyHandshakeErr identifies the probe as a monitor failure.
+func monitorDeniedBump(remoteAddr string) {
+	if host, _, splitErr := net.SplitHostPort(remoteAddr); splitErr == nil {
+		remoteAddr = host
+	}
+	now := time.Now()
+	monitorDenied.mu.Lock()
+	defer monitorDenied.mu.Unlock()
+	if monitorDenied.count == 0 {
+		monitorDenied.firstSeen = now
+	}
+	monitorDenied.lastSeen = now
+	monitorDenied.count++
+	if monitorDenied.distinctRemotes == nil {
+		monitorDenied.distinctRemotes = make(map[string]struct{}, monitorDeniedRemoteCap)
+	}
+	// Bounded: a probe from a NEW remote past the cap is silently dropped
+	// from the distinct set. The count still increments; the alerting
+	// metric simply floors at the cap.
+	if len(monitorDenied.distinctRemotes) < monitorDeniedRemoteCap {
+		monitorDenied.distinctRemotes[remoteAddr] = struct{}{}
+	}
+}
+
+// monitorDeniedReset clears the aggregator. Called from runShim at startup
+// (defends against state inherited from a prior in-process test run) and
+// from emitMonitorDenied after a snapshot.
+func monitorDeniedReset() {
+	monitorDenied.mu.Lock()
+	defer monitorDenied.mu.Unlock()
+	monitorDenied.count = 0
+	clear(monitorDenied.distinctRemotes)
+	monitorDenied.firstSeen = time.Time{}
+	monitorDenied.lastSeen = time.Time{}
+}
 
 func init() {
 	shimCmd.Flags().StringVar(&shListen, "listen", "127.0.0.1:3308", "Listen address for the MySQL protocol port (default: localhost-only — keep ProxySQL as the auth gate)")
@@ -207,14 +256,26 @@ func runShim(cmd *cobra.Command, args []string) error {
 	}()
 
 	// Periodic INFO summary of denied ProxySQL monitor-user handshakes.
-	// Per-probe noise stays at Debug (#316); this counter is the only
+	// Per-probe noise stays at Debug (#316); this aggregator is the only
 	// steady-state signal at INFO so a credential probe burst or a
 	// ProxySQL misconfig (rotated mysql-monitor_password) surfaces
 	// without restoring the per-probe log flood. See issue #326. Reset
 	// to zero at startup so a fresh process never inherits stale state
 	// from a previous in-process test run.
-	monitorDeniedCount.Store(0)
-	go monitorDeniedTicker(ctx, slog.Default())
+	//
+	// The ticker is tracked with shimWG so runShim doesn't return until
+	// the ticker's final drain has emitted. Without this, the `defer
+	// cancel()` would signal cancellation but Go's runtime wouldn't
+	// wait for the goroutine before main exits, dropping up to a full
+	// interval's worth of counts on every clean shutdown — exactly the
+	// forensic loss the periodic emit was supposed to prevent.
+	monitorDeniedReset()
+	var shimWG sync.WaitGroup
+	shimWG.Add(1)
+	go func() {
+		defer shimWG.Done()
+		monitorDeniedTicker(ctx, slog.Default())
+	}()
 
 	// config.Connect already parsed and pinged shIndexDSN above, so a parse
 	// failure here would be a programming defect, not a configuration error
@@ -254,6 +315,12 @@ func runShim(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("auth method: %w", err)
 	}
 	serveLoop(ctx, listener, db, srv, auth, cfg, userSchemas)
+	// Block until the monitorDeniedTicker has run its final drain.
+	// serveLoop returning means ctx is cancelled; the ticker is
+	// observing the same ctx and will hit its `case <-ctx.Done()`
+	// branch, emitMonitorDenied, and return. Without this Wait, the
+	// process exits before the goroutine reaches the emit.
+	shimWG.Wait()
 	return nil
 }
 
@@ -383,41 +450,65 @@ func isLoopbackAddr(addr net.Addr) bool {
 // tested with synthetic errors — without it, a future refactor that
 // flips a branch would silently re-introduce the issue #262 log
 // volume regression.
-func classifyHandshakeErr(err error) (slog.Level, string) {
+// classifyHandshakeErr returns (level, msg, isMonitor). The third value
+// is true iff the error is a monitor-user 1045 — callers in handleConn
+// use it to record the source remote into monitorDenied so the periodic
+// emit carries distinct-remote forensics. Bumping inside classify would
+// hide the remote (classify only sees the error).
+func classifyHandshakeErr(err error) (slog.Level, string, bool) {
 	switch {
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, gomysql.ErrBadConn):
-		return slog.LevelDebug, "handshake aborted (likely TCP probe)"
+		return slog.LevelDebug, "handshake aborted (likely TCP probe)", false
 	}
 	var myErr *gomysql.MyError
 	if errors.As(err, &myErr) && myErr.Code == gomysql.ER_ACCESS_DENIED_ERROR {
 		if isMonitorAuthFailure(myErr.Message) {
-			// Per-probe log stays at Debug (issue #316); the
-			// counter is the only signal that surfaces at INFO,
-			// emitted every monitorDeniedInterval by
-			// monitorDeniedTicker. See issue #326.
-			monitorDeniedCount.Add(1)
-			return slog.LevelDebug, "mysql auth failed (proxysql monitor probe)"
+			return slog.LevelDebug, "mysql auth failed (proxysql monitor probe)", true
 		}
-		return slog.LevelInfo, "mysql auth failed"
+		return slog.LevelInfo, "mysql auth failed", false
 	}
-	return slog.LevelError, "mysql handshake failed"
+	return slog.LevelError, "mysql handshake failed", false
 }
 
-// emitMonitorDenied snapshots the counter, resets it, and emits an INFO
-// line if the snapshot is positive. Pulled out as a package-level
-// function (not a closure) so unit tests can drive both code paths
-// (count==0 and count>0) directly without spinning a 5-minute ticker.
+// emitMonitorDenied snapshots monitorDenied, resets it, and emits an INFO
+// line if the snapshot has at least one probe. Pulled out as a package-
+// level function (not a closure) so unit tests can drive both code paths
+// (empty and populated) directly without spinning a 5-minute ticker.
 //
-// Reset-then-emit ordering matters less than it does for a metric
-// pipeline — we don't double-count and we don't underreport. The atomic
-// Swap is the only mutation and is the canonical way to "read and
-// reset" without a mutex.
+// The snapshot is taken under monitorDenied.mu so an in-flight bump can't
+// race with the reset. Concurrent bumps that arrive AFTER the unlock land
+// in the next interval — fine, the metric is steady-state aggregate, not
+// per-second.
 func emitMonitorDenied(logger *slog.Logger) {
-	n := monitorDeniedCount.Swap(0)
-	if n == 0 {
+	monitorDenied.mu.Lock()
+	count := monitorDenied.count
+	distinct := len(monitorDenied.distinctRemotes)
+	firstSeen := monitorDenied.firstSeen
+	lastSeen := monitorDenied.lastSeen
+	monitorDenied.count = 0
+	clear(monitorDenied.distinctRemotes)
+	monitorDenied.firstSeen = time.Time{}
+	monitorDenied.lastSeen = time.Time{}
+	monitorDenied.mu.Unlock()
+
+	if count == 0 {
 		return
 	}
-	logger.Info("monitor probes denied", "count", n, "interval", monitorDeniedInterval.String())
+	attrs := []any{
+		"count", count,
+		"distinct_remotes", distinct,
+		"interval", monitorDeniedInterval.String(),
+	}
+	if !firstSeen.IsZero() {
+		attrs = append(attrs, "first_seen", firstSeen.UTC().Format(time.RFC3339))
+		attrs = append(attrs, "last_seen", lastSeen.UTC().Format(time.RFC3339))
+	}
+	if distinct == monitorDeniedRemoteCap {
+		// Signal that the set is a floor, not the true count, so an
+		// alerting query sees the saturation.
+		attrs = append(attrs, "distinct_remotes_truncated_at", monitorDeniedRemoteCap)
+	}
+	logger.Info("monitor probes denied", attrs...)
 }
 
 // monitorDeniedTicker runs emitMonitorDenied on every tick until ctx is
@@ -526,7 +617,10 @@ func handleConn(c net.Conn, db *sql.DB, srv *server.Server, auth shim.TenantAuth
 	handler := shim.NewHandlerWithConfig(db, cfg, slog.Default())
 	mysqlConn, err := server.NewCustomizedConn(c, srv, auth, handler)
 	if err != nil {
-		level, msg := classifyHandshakeErr(err)
+		level, msg, isMonitor := classifyHandshakeErr(err)
+		if isMonitor {
+			monitorDeniedBump(c.RemoteAddr().String())
+		}
 		slog.Log(context.Background(), level, msg, "err", err, "remote", c.RemoteAddr())
 		return
 	}

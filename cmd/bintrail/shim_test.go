@@ -211,34 +211,40 @@ func (l *alwaysErrorListener) Addr() net.Addr {
 // noise). Anything else stays at error.
 func TestClassifyHandshakeErr(t *testing.T) {
 	cases := []struct {
-		name      string
-		err       error
-		wantLevel slog.Level
+		name          string
+		err           error
+		wantLevel     slog.Level
+		wantIsMonitor bool
 	}{
-		{"raw io.EOF", io.EOF, slog.LevelDebug},
-		{"unexpected EOF", io.ErrUnexpectedEOF, slog.LevelDebug},
+		{"raw io.EOF", io.EOF, slog.LevelDebug, false},
+		{"unexpected EOF", io.ErrUnexpectedEOF, slog.LevelDebug, false},
 		// fmt.Errorf+%w produces an Unwrap-compatible chain that exercises the same
 		// errors.Is path go-mysql's pingcap-wrapped reads do. We avoid importing
 		// github.com/pingcap/errors directly per CLAUDE.md ("Do not import transitive
 		// deps directly") — the production behaviour is what matters, and errors.Is
 		// resolves both wrap shapes the same way.
-		{"wrapped ErrBadConn", fmt.Errorf("io.ReadFull(header) failed: %w", gomysql.ErrBadConn), slog.LevelDebug},
-		// ProxySQL monitor user → debug (issue #316).
-		{"ER_ACCESS_DENIED_ERROR monitor user is debug", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES"), slog.LevelDebug},
-		// Real tenant user → info (the load-bearing claim — without this,
-		// the #316 demote would silence every real auth failure too).
-		{"ER_ACCESS_DENIED_ERROR tenant user is info", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "alice", "127.0.0.1:46948", "YES"), slog.LevelInfo},
-		{"unrelated MyError stays error", gomysql.NewDefaultError(gomysql.ER_HANDSHAKE_ERROR), slog.LevelError},
-		{"plain unrelated error", errors.New("protocol mismatch"), slog.LevelError},
+		{"wrapped ErrBadConn", fmt.Errorf("io.ReadFull(header) failed: %w", gomysql.ErrBadConn), slog.LevelDebug, false},
+		// ProxySQL monitor user → debug + isMonitor=true (issue #316/#326).
+		{"ER_ACCESS_DENIED_ERROR monitor user is debug", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES"), slog.LevelDebug, true},
+		// Real tenant user → info, isMonitor=false (the load-bearing claim —
+		// without this, the #316 demote would silence every real auth failure
+		// too AND the monitor-denied aggregator would inflate with tenant
+		// failures, hiding actual monitor probe load).
+		{"ER_ACCESS_DENIED_ERROR tenant user is info", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "alice", "127.0.0.1:46948", "YES"), slog.LevelInfo, false},
+		{"unrelated MyError stays error", gomysql.NewDefaultError(gomysql.ER_HANDSHAKE_ERROR), slog.LevelError, false},
+		{"plain unrelated error", errors.New("protocol mismatch"), slog.LevelError, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			level, msg := classifyHandshakeErr(tc.err)
+			level, msg, isMonitor := classifyHandshakeErr(tc.err)
 			if level != tc.wantLevel {
 				t.Errorf("classifyHandshakeErr level = %v, want %v (msg=%q)", level, tc.wantLevel, msg)
 			}
 			if msg == "" {
 				t.Errorf("classifyHandshakeErr msg empty for %v", tc.err)
+			}
+			if isMonitor != tc.wantIsMonitor {
+				t.Errorf("classifyHandshakeErr isMonitor = %v, want %v (err=%v)", isMonitor, tc.wantIsMonitor, tc.err)
 			}
 		})
 	}
@@ -319,101 +325,125 @@ func TestBuildUserSchemas(t *testing.T) {
 	}
 }
 
-// TestMonitorDeniedCounterIncrements pins the #326 wiring: every
-// classifyHandshakeErr call whose error is a `monitor`-user 1045 must
-// bump the package-level counter exactly once, and other handshake
-// errors (tenant 1045, EOF, plain errors) must not. A regression that
-// detaches the counter from isMonitorAuthFailure — e.g. moving the
-// Add(1) outside the branch — would silently restore the #326 blind
-// spot once the periodic emit reset the counter at the next tick.
-//
-// The test resets the counter at start to defend against any earlier
-// tests in the package mutating it; the counter is a package-level
-// global, so this is the contract callers must honor.
-func TestMonitorDeniedCounterIncrements(t *testing.T) {
-	monitorDeniedCount.Store(0)
-	t.Cleanup(func() { monitorDeniedCount.Store(0) })
+// TestMonitorDeniedBump pins the aggregation behavior for the periodic
+// emit's forensic signal. Each bump increments the count, accumulates
+// the source remote into a bounded distinct set, and bookends with
+// first/last seen timestamps. A regression that detached count from
+// the distinct set (or vice versa) would silently lose the "one IP
+// hammering vs many IPs probing" distinction that operators need to
+// tell credential stuffing from a misconfigured ProxySQL.
+func TestMonitorDeniedBump(t *testing.T) {
+	monitorDeniedReset()
+	t.Cleanup(monitorDeniedReset)
 
-	// Monitor 1045 → counter +1.
-	monitorErr := gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES")
-	classifyHandshakeErr(monitorErr)
-	if got := monitorDeniedCount.Load(); got != 1 {
-		t.Errorf("after monitor 1045: counter = %d, want 1", got)
+	monitorDeniedBump("10.0.0.1:54321")
+	monitorDeniedBump("10.0.0.1:54322") // same host, different port — one source
+	monitorDeniedBump("10.0.0.2:60001")
+
+	monitorDenied.mu.Lock()
+	count := monitorDenied.count
+	distinct := len(monitorDenied.distinctRemotes)
+	firstSeen := monitorDenied.firstSeen
+	lastSeen := monitorDenied.lastSeen
+	monitorDenied.mu.Unlock()
+
+	if count != 3 {
+		t.Errorf("count = %d, want 3", count)
 	}
-
-	// Tenant 1045 → counter unchanged (still 1).
-	tenantErr := gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "alice", "127.0.0.1:46948", "YES")
-	classifyHandshakeErr(tenantErr)
-	if got := monitorDeniedCount.Load(); got != 1 {
-		t.Errorf("after tenant 1045: counter = %d, want 1 (only monitor failures count)", got)
+	if distinct != 2 {
+		t.Errorf("distinct = %d, want 2 (same host different ports collapses)", distinct)
 	}
-
-	// EOF (TCP probe) → counter unchanged.
-	classifyHandshakeErr(io.EOF)
-	if got := monitorDeniedCount.Load(); got != 1 {
-		t.Errorf("after io.EOF: counter = %d, want 1", got)
+	if firstSeen.IsZero() {
+		t.Error("firstSeen unset after bumps")
 	}
-
-	// Plain unrelated error → counter unchanged.
-	classifyHandshakeErr(errors.New("protocol mismatch"))
-	if got := monitorDeniedCount.Load(); got != 1 {
-		t.Errorf("after protocol mismatch: counter = %d, want 1", got)
+	if lastSeen.IsZero() {
+		t.Error("lastSeen unset after bumps")
 	}
-
-	// Second monitor 1045 → counter +1 (now 2).
-	classifyHandshakeErr(monitorErr)
-	if got := monitorDeniedCount.Load(); got != 2 {
-		t.Errorf("after second monitor 1045: counter = %d, want 2", got)
+	if lastSeen.Before(firstSeen) {
+		t.Errorf("lastSeen (%v) before firstSeen (%v)", lastSeen, firstSeen)
 	}
 }
 
-// TestMonitorDeniedCounterPeriodicEmit pins the two contract claims of
+// TestMonitorDeniedBumpRemoteCap pins the bounded-set defense. A wide-
+// source burst (e.g. credential stuffing from 200 IPs) must not blow
+// memory by retaining one entry per probe — past the cap, additional
+// distinct remotes are dropped from the set but `count` keeps climbing.
+// The emit reports `distinct_remotes_truncated_at` so alerting can
+// tell "we saw at least N sources" from "exactly N sources".
+func TestMonitorDeniedBumpRemoteCap(t *testing.T) {
+	monitorDeniedReset()
+	t.Cleanup(monitorDeniedReset)
+
+	for i := 0; i < monitorDeniedRemoteCap*3; i++ {
+		monitorDeniedBump(fmt.Sprintf("10.0.0.%d:1234", i))
+	}
+
+	monitorDenied.mu.Lock()
+	count := monitorDenied.count
+	distinct := len(monitorDenied.distinctRemotes)
+	monitorDenied.mu.Unlock()
+
+	if count != int64(monitorDeniedRemoteCap*3) {
+		t.Errorf("count = %d, want %d (count keeps climbing past cap)", count, monitorDeniedRemoteCap*3)
+	}
+	if distinct != monitorDeniedRemoteCap {
+		t.Errorf("distinct = %d, want %d (set bounded at cap)", distinct, monitorDeniedRemoteCap)
+	}
+}
+
+// TestMonitorDeniedPeriodicEmit pins the two contract claims of
 // emitMonitorDenied:
 //   - count == 0 emits nothing (no steady-state log noise when ProxySQL's
 //     monitor is configured correctly and never fails),
-//   - count >  0 emits one INFO line with the count and a non-empty
-//     interval string, then resets the counter to zero (so the next
-//     interval starts fresh — the load-bearing claim of the periodic
-//     design).
+//   - count >  0 emits one INFO line with count, distinct_remotes,
+//     first_seen, last_seen, interval — then resets state so the next
+//     interval starts fresh.
 //
 // A regression that emitted on zero (operator drowns in 5-minute
-// heartbeats) or failed to reset (counts compound forever, eventually
-// reporting absurd totals) would both silently break the design.
-func TestMonitorDeniedCounterPeriodicEmit(t *testing.T) {
-	t.Cleanup(func() { monitorDeniedCount.Store(0) })
+// heartbeats) or failed to reset (counts compound forever, reporting
+// absurd totals) would both silently break the design.
+func TestMonitorDeniedPeriodicEmit(t *testing.T) {
+	t.Cleanup(monitorDeniedReset)
+	monitorDeniedReset()
 
 	// count == 0 path: emit nothing.
-	monitorDeniedCount.Store(0)
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	emitMonitorDenied(logger)
 	if buf.Len() != 0 {
-		t.Errorf("count=0 emit: got log output %q, want empty (no steady-state noise)", buf.String())
-	}
-	if got := monitorDeniedCount.Load(); got != 0 {
-		t.Errorf("count=0 emit: counter = %d after emit, want 0", got)
+		t.Errorf("empty emit: got log output %q, want empty (no steady-state noise)", buf.String())
 	}
 
-	// count > 0 path: emit one line with count=N and reset to zero.
-	monitorDeniedCount.Store(7)
+	// Populated path: bump from two distinct hosts, emit, expect one
+	// log line that names every forensic field.
+	monitorDeniedBump("10.0.0.1:54321")
+	monitorDeniedBump("10.0.0.2:54322")
+	monitorDeniedBump("10.0.0.1:54323")
 	buf.Reset()
 	emitMonitorDenied(logger)
 	out := buf.String()
-	if !strings.Contains(out, "monitor probes denied") {
-		t.Errorf("count=7 emit: log missing msg; got %q", out)
+	for _, want := range []string{
+		"monitor probes denied",
+		"count=3",
+		"distinct_remotes=2",
+		"first_seen=",
+		"last_seen=",
+		"interval=",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("emit missing %q; got %q", want, out)
+		}
 	}
-	if !strings.Contains(out, "count=7") {
-		t.Errorf("count=7 emit: log missing count=7; got %q", out)
-	}
-	if !strings.Contains(out, "interval=") {
-		t.Errorf("count=7 emit: log missing interval=...; got %q", out)
-	}
-	if got := monitorDeniedCount.Load(); got != 0 {
-		t.Errorf("count=7 emit: counter = %d after emit, want 0 (reset is load-bearing — non-zero would compound across intervals)", got)
+	monitorDenied.mu.Lock()
+	count := monitorDenied.count
+	distinct := len(monitorDenied.distinctRemotes)
+	firstSeen := monitorDenied.firstSeen
+	monitorDenied.mu.Unlock()
+	if count != 0 || distinct != 0 || !firstSeen.IsZero() {
+		t.Errorf("state not reset after emit: count=%d distinct=%d firstSeen=%v", count, distinct, firstSeen)
 	}
 
-	// After reset, a second emit at count==0 stays silent — the
-	// reset-then-emit contract from a previous tick must hold.
+	// After reset, a second emit at count==0 stays silent.
 	buf.Reset()
 	emitMonitorDenied(logger)
 	if buf.Len() != 0 {
