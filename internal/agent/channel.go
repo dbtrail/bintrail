@@ -30,6 +30,15 @@ type ChannelConfig struct {
 	// BintrailID is the server identity reported in heartbeats.
 	BintrailID string
 
+	// ServerUUID is the optional pre-registered server UUID supplied by the
+	// operator via `bintrail agent --server-uuid <uuid>`. When non-empty it
+	// is sent in the WebSocket dial as the `X-Bintrail-Server-UUID` header
+	// so the dbtrail backend can reconcile the connection to an existing
+	// server record (created via POST /api/v1/servers) instead of
+	// auto-creating a duplicate `byos-<server-id>` row. Empty preserves the
+	// legacy behavior. See issue #317.
+	ServerUUID string
+
 	// HeartbeatInterval controls how often heartbeats are sent.
 	// Zero defaults to 30 seconds.
 	HeartbeatInterval time.Duration
@@ -234,10 +243,17 @@ func (ch *Channel) connectAndListen(ctx context.Context) error {
 }
 
 // dial opens the WebSocket connection with the API key in the
-// Authorization header.
+// Authorization header. When ServerUUID is set, the pre-registered server
+// UUID is sent as X-Bintrail-Server-UUID so the SaaS reconciles to that
+// record instead of creating a duplicate byos-<server-id>. The header is
+// omitted entirely when ServerUUID is empty so an older backend isn't
+// confused by an empty value. See issue #317.
 func (ch *Channel) dial(ctx context.Context) (*websocket.Conn, error) {
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+ch.cfg.APIKey)
+	if ch.cfg.ServerUUID != "" {
+		header.Set("X-Bintrail-Server-UUID", ch.cfg.ServerUUID)
+	}
 
 	conn, _, err := websocket.Dial(ctx, ch.cfg.Endpoint, &websocket.DialOptions{
 		HTTPHeader: header,

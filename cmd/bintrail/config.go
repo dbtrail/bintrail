@@ -106,6 +106,12 @@ var envSections = []envSection{
 		Header: "Server identity",
 		Bindings: []envTemplateEntry{
 			{"BINTRAIL_ID", ""},
+			// Optional: UUID of a pre-registered BYOS server returned by
+			// POST /api/v1/servers. When set, the agent's WebSocket connect
+			// is reconciled to that server record; when unset, the SaaS
+			// auto-creates a new byos-<server-id> record (back-compat).
+			// See issue #317.
+			{"BINTRAIL_SERVER_UUID", ""},
 		},
 	},
 	{

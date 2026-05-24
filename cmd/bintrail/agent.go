@@ -17,6 +17,7 @@ import (
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/bintrail/internal/agent"
@@ -71,6 +72,7 @@ var (
 	agtArchiveS3            string
 	agtBufferRetain         string
 	agtServerID             uint32
+	agtServerUUID           string
 	agtBatchSize            int
 	agtSchemas              string
 	agtTables               string
@@ -94,6 +96,7 @@ func init() {
 	agentCmd.Flags().StringVar(&agtArchiveS3, "archive-s3", "", "S3 path to Parquet archives (e.g. s3://bucket/prefix/)")
 	agentCmd.Flags().StringVar(&agtBufferRetain, "buffer-retain", "6h", "How long to retain events in the in-memory buffer (e.g. 6h, 24h)")
 	agentCmd.Flags().Uint32Var(&agtServerID, "server-id", 0, "MySQL server ID for replication (required for BYOS streaming)")
+	agentCmd.Flags().StringVar(&agtServerUUID, "server-uuid", "", "UUID of a pre-registered BYOS server (POST /api/v1/servers). When set, the SaaS reconciles this agent's WebSocket connection to that record; when empty, the SaaS auto-creates a new byos-<server-id> record (back-compat).")
 	agentCmd.Flags().IntVar(&agtBatchSize, "batch-size", 1000, "Number of events per batch flush")
 	agentCmd.Flags().StringVar(&agtSchemas, "schemas", "", "Comma-separated list of schemas to index (empty = all)")
 	agentCmd.Flags().StringVar(&agtTables, "tables", "", "Comma-separated list of tables to index (empty = all)")
@@ -123,6 +126,12 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	// expecting "give up fast". Make zero an explicit, intentional opt-in.
 	if agtMaxReconnectAttempts < 0 {
 		return fmt.Errorf("invalid --max-reconnect-attempts %d: must be >= 0 (use 0 explicitly for unlimited retries)", agtMaxReconnectAttempts)
+	}
+
+	// Validate --server-uuid format before any side effects. Empty preserves
+	// the legacy auto-create-on-connect behavior (back-compat). See #317.
+	if err := validateServerUUID(agtServerUUID); err != nil {
+		return err
 	}
 
 	start := time.Now()
@@ -384,6 +393,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		// empty string would technically work but degrades dashboard
 		// display. cmp.Or keeps the label stable and operator-recognizable.
 		BintrailID:           cmp.Or(bintrailID, fmt.Sprint(agtServerID)),
+		ServerUUID:           agtServerUUID,
 		MaxReconnectAttempts: agtMaxReconnectAttempts,
 	}
 
@@ -970,6 +980,21 @@ func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Reso
 	}
 
 	return metadata.NewResolverFromTables(0, tables), nil
+}
+
+// validateServerUUID enforces that --server-uuid (when supplied) is a
+// well-formed UUID. An empty string is allowed and preserves the legacy
+// auto-create-on-connect SaaS behavior (back-compat); a malformed value
+// is rejected up-front so the operator gets a clear error instead of a
+// silent mis-association on the SaaS side. See issue #317.
+func validateServerUUID(s string) error {
+	if s == "" {
+		return nil
+	}
+	if _, err := uuid.Parse(s); err != nil {
+		return fmt.Errorf("invalid --server-uuid %q: must be a valid UUID (e.g. 550e8400-e29b-41d4-a716-446655440000) or empty for back-compat: %w", s, err)
+	}
+	return nil
 }
 
 // validateBYOSFlushConfig enforces that a BYOS-mode agent has a configured

@@ -32,6 +32,7 @@ var envBindings = []envBinding{
 	{"archive-s3", "BINTRAIL_ARCHIVE_S3"},
 	{"archive-s3-region", "BINTRAIL_ARCHIVE_S3_REGION"},
 	{"server-id", "BINTRAIL_SERVER_ID"},
+	{"server-uuid", "BINTRAIL_SERVER_UUID"},
 	{"batch-size", "BINTRAIL_BATCH_SIZE"},
 	{"s3-bucket", "BINTRAIL_S3_BUCKET"},
 	{"s3-region", "BINTRAIL_S3_REGION"},

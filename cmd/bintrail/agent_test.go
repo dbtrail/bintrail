@@ -392,6 +392,7 @@ func TestAgentFlagRegistration(t *testing.T) {
 	for _, name := range []string{
 		"api-key", "endpoint", "index-dsn", "source-dsn",
 		"archive-dir", "archive-s3", "buffer-retain", "server-id",
+		"server-uuid",
 		"batch-size", "schemas", "tables", "start-gtid",
 		"s3-bucket", "s3-region", "s3-prefix", "flush-interval",
 		"buffer-max-events", "buffer-max-bytes",
@@ -478,6 +479,94 @@ func TestValidateBYOSFlushConfig(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func TestValidateServerUUID(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:    "empty is allowed for back-compat",
+			input:   "",
+			wantErr: false,
+		},
+		{
+			name:    "valid canonical UUID accepted",
+			input:   "550e8400-e29b-41d4-a716-446655440000",
+			wantErr: false,
+		},
+		{
+			name:    "valid lowercase UUID accepted",
+			input:   "183819c0-0000-0000-0000-000000000000",
+			wantErr: false,
+		},
+		{
+			name:      "malformed UUID rejected",
+			input:     "not-a-uuid",
+			wantErr:   true,
+			errSubstr: "invalid --server-uuid",
+		},
+		{
+			name:      "numeric server-id rejected",
+			input:     "202",
+			wantErr:   true,
+			errSubstr: "invalid --server-uuid",
+		},
+		{
+			name:      "truncated UUID rejected",
+			input:     "550e8400-e29b-41d4-a716",
+			wantErr:   true,
+			errSubstr: "invalid --server-uuid",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateServerUUID(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if tt.errSubstr != "" && !strings.Contains(err.Error(), tt.errSubstr) {
+					t.Errorf("error %q does not contain %q", err.Error(), tt.errSubstr)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestAgentCLI_RejectsInvalidServerUUID verifies that the agent command
+// rejects a malformed --server-uuid passed through cobra's flag parser
+// before any side effects (DB connect, WebSocket dial) occur. Empty is
+// allowed and preserves the legacy auto-create-on-connect SaaS behavior.
+// See issue #317.
+func TestAgentCLI_RejectsInvalidServerUUID(t *testing.T) {
+	// Save and restore the package-level flag global so this test does
+	// not leak state into sibling tests that read agentCmd.
+	saved := agtServerUUID
+	t.Cleanup(func() { agtServerUUID = saved })
+
+	// Drive the flag through cobra's actual parser — this exercises the
+	// same code path a real `bintrail agent --server-uuid foo` invocation
+	// would hit (flag definition, name, type).
+	if err := agentCmd.ParseFlags([]string{"--server-uuid", "not-a-uuid"}); err != nil {
+		t.Fatalf("ParseFlags: %v", err)
+	}
+	if agtServerUUID != "not-a-uuid" {
+		t.Fatalf("agtServerUUID = %q, want %q after ParseFlags", agtServerUUID, "not-a-uuid")
+	}
+
+	err := validateServerUUID(agtServerUUID)
+	if err == nil {
+		t.Fatal("expected error for invalid --server-uuid, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid --server-uuid") {
+		t.Errorf("error = %q, want it to contain 'invalid --server-uuid'", err.Error())
 	}
 }
 

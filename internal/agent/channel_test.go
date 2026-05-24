@@ -364,6 +364,111 @@ func TestChannel_authHeader(t *testing.T) {
 	cancel()
 }
 
+// TestChannel_serverUUIDHeader verifies that when ChannelConfig.ServerUUID
+// is set, the agent sends it in the X-Bintrail-Server-UUID header on the
+// initial WebSocket dial so the SaaS can reconcile the connection to a
+// pre-registered server record (issue #317).
+func TestChannel_serverUUIDHeader(t *testing.T) {
+	type captured struct {
+		auth     string
+		uuid     string
+		uuidSent bool
+	}
+	gotCh := make(chan captured, 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, uuidSent := r.Header["X-Bintrail-Server-Uuid"]
+		gotCh <- captured{
+			auth:     r.Header.Get("Authorization"),
+			uuid:     r.Header.Get("X-Bintrail-Server-UUID"),
+			uuidSent: uuidSent,
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.Close(websocket.StatusNormalClosure, "")
+	}))
+	defer srv.Close()
+
+	cfg := ChannelConfig{
+		Endpoint:          "ws" + strings.TrimPrefix(srv.URL, "http"),
+		APIKey:            "test-key",
+		ServerUUID:        "550e8400-e29b-41d4-a716-446655440000",
+		HeartbeatInterval: time.Hour,
+		MaxReconnectDelay: 50 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		ch := NewChannel(cfg, &stubHandler{}, nil, nil)
+		ch.Run(ctx)
+	}()
+
+	select {
+	case got := <-gotCh:
+		if got.auth != "Bearer test-key" {
+			t.Errorf("auth = %q, want %q", got.auth, "Bearer test-key")
+		}
+		if !got.uuidSent {
+			t.Error("X-Bintrail-Server-UUID header was not sent")
+		}
+		if got.uuid != "550e8400-e29b-41d4-a716-446655440000" {
+			t.Errorf("X-Bintrail-Server-UUID = %q, want %q", got.uuid, "550e8400-e29b-41d4-a716-446655440000")
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for dial")
+	}
+	cancel()
+}
+
+// TestChannel_serverUUIDHeaderOmittedWhenEmpty verifies that an empty
+// ServerUUID does NOT add an X-Bintrail-Server-UUID header at all (rather
+// than sending an empty value), so older SaaS deployments that don't know
+// about the header are unaffected and back-compat is preserved.
+func TestChannel_serverUUIDHeaderOmittedWhenEmpty(t *testing.T) {
+	gotCh := make(chan bool, 1) // header present?
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, present := r.Header["X-Bintrail-Server-Uuid"]
+		gotCh <- present
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.Close(websocket.StatusNormalClosure, "")
+	}))
+	defer srv.Close()
+
+	cfg := ChannelConfig{
+		Endpoint:          "ws" + strings.TrimPrefix(srv.URL, "http"),
+		APIKey:            "test-key",
+		ServerUUID:        "", // empty — header must be omitted
+		HeartbeatInterval: time.Hour,
+		MaxReconnectDelay: 50 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		ch := NewChannel(cfg, &stubHandler{}, nil, nil)
+		ch.Run(ctx)
+	}()
+
+	select {
+	case present := <-gotCh:
+		if present {
+			t.Error("X-Bintrail-Server-UUID header should be omitted when ServerUUID is empty")
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for dial")
+	}
+	cancel()
+}
+
 // ─── Handler tests ───────────────────────────────────────────────────────────
 
 func TestByosPKHash(t *testing.T) {
