@@ -129,7 +129,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		}
 		nulls := []bool{
 			false,
-			!binlogFile.Valid,
+			!binlogFile.Valid, // binlog_file: preserve NULL in Parquet (dbtrail/bintrail#318)
 			false, false, false,
 			!gtid.Valid,
 			!connID.Valid,

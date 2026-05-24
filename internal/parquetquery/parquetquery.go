@@ -776,7 +776,7 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 	for rows.Next() {
 		var (
 			eventID        int64
-			binlogFile     string
+			binlogFile     sql.NullString
 			startPos       int64
 			endPos         int64
 			eventTimestamp time.Time
@@ -801,7 +801,7 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 
 		r := query.ResultRow{
 			EventID:        uint64(eventID),
-			BinlogFile:     binlogFile,
+			BinlogFile:     binlogFile.String,
 			StartPos:       uint64(startPos),
 			EndPos:         uint64(endPos),
 			EventTimestamp: eventTimestamp,

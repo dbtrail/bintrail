@@ -291,9 +291,10 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 	if bmeta.BinlogFile != "" && len(events) > 0 {
 		first := events[0]
-		// A NULL binlog_file on the first event (mapped to "" by scanRows
-		// after dbtrail/bintrail#318) has no comparable position — skip the
-		// gap check rather than silently degrade to "no gap".
+		// A NULL binlog_file on the first event has no comparable position —
+		// skip the gap check rather than silently degrade to "no gap"
+		// (mirrors the bmeta.BinlogFile == "" branch above).
+		// See dbtrail/bintrail#318.
 		if first.BinlogFile == "" {
 			slog.Warn("gap detection skipped — first indexed event lacks binlog_file metadata",
 				"event_id", first.EventID,

@@ -141,6 +141,30 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		t.Errorf("NumRows = %d, want 3", pf.NumRows())
 	}
 
+	// Read back the rows and verify binlog_file NULL semantics: row 1 (the
+	// first non-NULL row written) carries "binlog.000001"; row 3 is the
+	// dbtrail/bintrail#318 case — must be a real Parquet NULL, not an
+	// empty string smuggled into the column. Without nulls[1]=!binlogFile.Valid
+	// in archive.go, the writer would emit "" and IsNull() would be false.
+	//
+	// parquet-go orders row values alphabetically by column name, not by
+	// schema declaration order — binlog_file sorts to index 0.
+	binlogFileIdx := parquetColumnIndex(t, pf, "binlog_file")
+	reader := parquet.NewReader(pf)
+	defer reader.Close()
+	parquetRows := make([]parquet.Row, 3)
+	if n, err := reader.ReadRows(parquetRows); err != nil || n != 3 {
+		t.Fatalf("ReadRows returned (%d, %v), want (3, nil)", n, err)
+	}
+	if parquetRows[0][binlogFileIdx].IsNull() {
+		t.Errorf("row 0 binlog_file: got NULL, want \"binlog.000001\"")
+	} else if got := parquetRows[0][binlogFileIdx].String(); got != "binlog.000001" {
+		t.Errorf("row 0 binlog_file: got %q, want \"binlog.000001\"", got)
+	}
+	if !parquetRows[2][binlogFileIdx].IsNull() {
+		t.Errorf("row 2 binlog_file: got %q, want NULL", parquetRows[2][binlogFileIdx].String())
+	}
+
 	// Verify key-value metadata was embedded.
 	got, ok := pf.Lookup("bintrail.archive.partition")
 	if !ok {
@@ -152,4 +176,20 @@ func TestWriteReadRoundTrip(t *testing.T) {
 	if _, ok := pf.Lookup("bintrail.archive.version"); !ok {
 		t.Error("expected bintrail.archive.version metadata key")
 	}
+}
+
+// parquetColumnIndex looks up the position of a column in the file's leaf
+// schema. parquet-go's NewReader returns rows whose values are ordered by
+// the schema's leaf walk (alphabetical for our flat schemas), not by the
+// order columns were passed to NewWriter — so callers that want to assert
+// on a specific column must look up its index dynamically.
+func parquetColumnIndex(t *testing.T, pf *parquet.File, name string) int {
+	t.Helper()
+	for i, col := range pf.Schema().Columns() {
+		if len(col) == 1 && col[0] == name {
+			return i
+		}
+	}
+	t.Fatalf("column %q not found in parquet schema", name)
+	return -1
 }

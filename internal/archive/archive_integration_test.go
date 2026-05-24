@@ -4,8 +4,11 @@ package archive
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/parquet-go/parquet-go"
 
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
@@ -45,5 +48,37 @@ func TestArchivePartition_nullBinlogFile(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("rowCount = %d, want 2", n)
+	}
+
+	// Verify NULL semantics at the Parquet layer: row 0 (the non-NULL row,
+	// inserted first → lower event_id → sorted first by ORDER BY event_id)
+	// must carry "binlog.000001"; row 1 must be a real Parquet NULL, not
+	// an empty string. The nulls[1]=!binlogFile.Valid line in archive.go
+	// is what makes this true — testing it specifically guards against a
+	// regression that smuggles "" into the column.
+	rf, err := os.Open(outPath)
+	if err != nil {
+		t.Fatalf("open archived parquet: %v", err)
+	}
+	defer rf.Close()
+	info, _ := rf.Stat()
+	pf, err := parquet.OpenFile(rf, info.Size())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	binlogFileIdx := parquetColumnIndex(t, pf, "binlog_file")
+	reader := parquet.NewReader(pf)
+	defer reader.Close()
+	parquetRows := make([]parquet.Row, 2)
+	if rn, err := reader.ReadRows(parquetRows); err != nil || rn != 2 {
+		t.Fatalf("ReadRows returned (%d, %v), want (2, nil)", rn, err)
+	}
+	if parquetRows[0][binlogFileIdx].IsNull() {
+		t.Errorf("row 0 binlog_file: got NULL, want \"binlog.000001\"")
+	} else if got := parquetRows[0][binlogFileIdx].String(); got != "binlog.000001" {
+		t.Errorf("row 0 binlog_file: got %q, want \"binlog.000001\"", got)
+	}
+	if !parquetRows[1][binlogFileIdx].IsNull() {
+		t.Errorf("row 1 binlog_file: got %q, want NULL", parquetRows[1][binlogFileIdx].String())
 	}
 }
