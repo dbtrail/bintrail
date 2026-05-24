@@ -765,6 +765,41 @@ func TestCanTerminateEarly(t *testing.T) {
 			t.Error("should not terminate: no remaining files")
 		}
 	})
+
+	t.Run("drift rows with zero timestamp do not pin cutoff (dbtrail/bintrail#318)", func(t *testing.T) {
+		// Drift rows from defensive scanRows have time.Time{} (year 0001).
+		// Before the guard, if limit drift rows arrived from an early file,
+		// cutoff was year 0001 → every later file appeared fully after cutoff
+		// → silent early-termination dropped real data.
+		results := []query.ResultRow{
+			mkRow(time.Time{}, 100),                                          // drift
+			mkRow(time.Time{}, 101),                                          // drift
+			mkRow(time.Date(2026, 3, 9, 13, 30, 0, 0, time.UTC), 1),          // real
+		}
+		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
+		// limit=3 means we'd need 3 real-timestamp rows to ground a cutoff,
+		// but we only have 1. Must not terminate.
+		if canTerminateEarly(results, remaining, 3) {
+			t.Error("should not terminate: only 1 non-drift row, cannot ground cutoff")
+		}
+	})
+
+	t.Run("drift rows do not poison cutoff when enough real rows exist", func(t *testing.T) {
+		// limit=2, three real rows + two drift rows. Cutoff must be based
+		// on the real rows alone: sorted real rows at limit-th=2 is 10:30.
+		// Next file is hour=11 → can terminate.
+		results := []query.ResultRow{
+			mkRow(time.Time{}, 100),                                  // drift
+			mkRow(time.Date(2026, 3, 9, 10, 30, 0, 0, time.UTC), 2),
+			mkRow(time.Time{}, 101),                                  // drift
+			mkRow(time.Date(2026, 3, 9, 10, 15, 0, 0, time.UTC), 1),
+			mkRow(time.Date(2026, 3, 9, 10, 45, 0, 0, time.UTC), 3),
+		}
+		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
+		if !canTerminateEarly(results, remaining, 2) {
+			t.Error("expected early termination: 2nd real row (10:30) is before hour=11, drift rows filtered out")
+		}
+	})
 }
 
 // ─── drainSlots / removeTempFile (pipeline cleanup) ─────────────────────────

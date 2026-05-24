@@ -448,9 +448,21 @@ func canTerminateEarly(results []query.ResultRow, remainingFiles []string, limit
 	if len(results) < limit || len(remainingFiles) == 0 {
 		return false
 	}
-	// Sort results to find the limit-th by (event_timestamp, event_id).
-	sorted := make([]query.ResultRow, len(results))
-	copy(sorted, results)
+	// Filter out drift rows with zero timestamp (dbtrail/bintrail#318).
+	// They sort to year 0001 and would otherwise pin cutoff to the past,
+	// making every remaining file's hour appear after it → early
+	// termination silently drops all later real data.
+	sorted := make([]query.ResultRow, 0, len(results))
+	for _, r := range results {
+		if !r.EventTimestamp.IsZero() {
+			sorted = append(sorted, r)
+		}
+	}
+	if len(sorted) < limit {
+		// After filtering, we don't have enough real-timestamp rows to
+		// ground a cutoff — keep reading.
+		return false
+	}
 	slices.SortFunc(sorted, func(a, b query.ResultRow) int {
 		if c := a.EventTimestamp.Compare(b.EventTimestamp); c != 0 {
 			return c

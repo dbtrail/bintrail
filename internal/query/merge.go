@@ -2,6 +2,7 @@ package query
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 )
 
@@ -75,6 +76,15 @@ func LimitPerPK(rows []ResultRow, n int) []ResultRow {
 	// Walk in reverse so the latest events per PK are seen first and kept.
 	for i := len(rows) - 1; i >= 0; i-- {
 		pk := rows[i].PKValues
+		// Drift rows (PKValues == "" from defensive scan of NULL
+		// pk_values, dbtrail/bintrail#318) would otherwise all collapse
+		// onto bucket "" and silently drop beyond the cap, AND collide
+		// with any legitimate empty-PK rows. Give each its own per-row
+		// bucket so they pass through unconditionally — the \x00
+		// prefix can never appear in a real user-supplied PK string.
+		if pk == "" {
+			pk = fmt.Sprintf("\x00drift:%d", rows[i].EventID)
+		}
 		if counts[pk] < n {
 			counts[pk]++
 			keep[i] = true

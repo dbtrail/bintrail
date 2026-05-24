@@ -150,3 +150,36 @@ func TestMergeAndTrim_crossSourceDedup(t *testing.T) {
 		t.Errorf("expected events [2,3] (latest 2 in ASC order), got %v", []uint64{got[0].EventID, got[1].EventID})
 	}
 }
+
+// TestLimitPerPK_driftRowsBucketIndependently pins the dbtrail/bintrail#318
+// guard: drift rows from the defensive scanRows have PKValues=="" and would,
+// under the original bucket-by-PK logic, all collapse onto bucket "" — the
+// first n in reverse are kept, the rest silently dropped, and they collide
+// with any legitimate empty-PK rows. The fix gives each empty-PK row its own
+// per-row bucket so all pass through, regardless of n.
+func TestLimitPerPK_driftRowsBucketIndependently(t *testing.T) {
+	ts := time.Date(2026, 5, 23, 14, 0, 0, 0, time.UTC)
+	rows := []ResultRow{
+		{EventID: 1, EventTimestamp: ts, PKValues: ""}, // drift
+		{EventID: 2, EventTimestamp: ts, PKValues: ""}, // drift
+		{EventID: 3, EventTimestamp: ts, PKValues: ""}, // drift
+		{EventID: 4, EventTimestamp: ts, PKValues: "a"},
+		{EventID: 5, EventTimestamp: ts, PKValues: "a"},
+		{EventID: 6, EventTimestamp: ts, PKValues: "a"},
+	}
+	// LimitPerPK=1 caps real PK "a" to 1, but every drift row must
+	// survive because each gets its own bucket.
+	got := LimitPerPK(rows, 1)
+	if len(got) != 4 {
+		t.Fatalf("expected 4 rows (3 drift + 1 capped real PK), got %d: %+v", len(got), got)
+	}
+	driftCount := 0
+	for _, r := range got {
+		if r.PKValues == "" {
+			driftCount++
+		}
+	}
+	if driftCount != 3 {
+		t.Errorf("expected all 3 drift rows preserved, got %d", driftCount)
+	}
+}

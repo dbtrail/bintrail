@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -292,6 +293,18 @@ func applyEvent(state map[string]any, ev query.ResultRow) map[string]any {
 		return copyMap(ev.RowAfter)
 	case parser.EventDelete:
 		return nil
+	case 0:
+		// EventType==0 is the zero value, produced by the defensive
+		// scanRows in internal/query and internal/parquetquery when the
+		// row's event_type column is NULL (dbtrail/bintrail#318 drift).
+		// Without an explicit case the default branch would silently
+		// no-op, producing wrong PITR state with no operator signal.
+		slog.Warn("reconstruct: skipping drift row with NULL event_type — PITR state may be incomplete",
+			"event_id", ev.EventID,
+			"schema", ev.SchemaName,
+			"table", ev.TableName,
+			"timestamp", ev.EventTimestamp)
+		return state
 	default:
 		return state
 	}
