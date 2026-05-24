@@ -181,6 +181,16 @@ func runProxySQLConfig(cmd *cobra.Command, args []string) error {
 		}
 		return fmt.Errorf("create %s: %w", pcOut, err)
 	}
+	// OpenFile only applies the mode arg on file *creation*. On --force
+	// overwrite the existing inode keeps its prior permissions, so a
+	// previously world-readable proxysql-setup.sql would stay world-readable
+	// even though we passed 0o600 — a real leak when --backend-auth-plugin=
+	// caching_sha2_password puts cleartext credentials in the output. Chmod
+	// unconditionally so both new and overwritten files end up at 0o600.
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return fmt.Errorf("chmod %s: %w", pcOut, err)
+	}
 	if _, err := f.WriteString(content); err != nil {
 		f.Close()
 		return fmt.Errorf("write %s: %w", pcOut, err)

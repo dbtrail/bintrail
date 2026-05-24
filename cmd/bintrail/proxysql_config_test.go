@@ -802,4 +802,37 @@ func TestRunProxySQLConfigForceOverwrites(t *testing.T) {
 			t.Errorf("--force output is missing expected SQL:\n%s", body)
 		}
 	})
+
+	// Guards against a leak: O_TRUNC preserves the pre-existing inode's
+	// permissions, so a previously 0o644 proxysql-setup.sql would stay
+	// world-readable after --force even though OpenFile is called with
+	// 0o600. With --backend-auth-plugin=caching_sha2_password the file
+	// holds cleartext credentials — must be 0o600 after overwrite.
+	t.Run("--force tightens permissions to 0o600", func(t *testing.T) {
+		dir := t.TempDir()
+		orig, _ := os.Getwd()
+		t.Cleanup(func() { os.Chdir(orig) })
+		os.Chdir(dir)
+
+		t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+		writeShimYAML(t, dir, validShimYAML)
+		outPath := filepath.Join(dir, "proxysql-setup.sql")
+		if err := os.WriteFile(outPath, []byte("existing"), 0o644); err != nil {
+			t.Fatalf("seed existing file: %v", err)
+		}
+		resetPCFlags()
+		pcForce = true
+		pcBackendAuthPlugin = backendAuthCaching
+
+		if err := runProxySQLConfig(proxysqlConfigCmd, nil); err != nil {
+			t.Fatalf("--force run failed: %v", err)
+		}
+		info, err := os.Stat(outPath)
+		if err != nil {
+			t.Fatalf("stat overwritten file: %v", err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Errorf("expected mode 0o600 after --force overwrite, got 0o%o", mode)
+		}
+	})
 }
