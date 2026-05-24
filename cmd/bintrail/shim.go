@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -332,6 +333,14 @@ func isLoopbackAddr(addr net.Addr) bool {
 // operator can correlate ProxySQL alerts with the shim's view of the
 // failure without an alarming ERROR line per monitor probe.
 //
+// Exception: ProxySQL's built-in MySQL Monitor module opens a
+// handshake every ~1-10s against every backend in its hostgroups
+// (including the shim) using the username `monitor`. The shim does
+// not — and must not — recognise this user, so the handshake fails
+// with the same 1045 every probe interval, drowning real auth
+// failures in the steady-state log. Demote `monitor` ER_ACCESS_DENIED
+// to Debug; everything else stays at Info. See issue #316.
+//
 // Anything else is unexpected (bad packet, protocol mismatch, …) and
 // stays at Error so it surfaces in alerting.
 //
@@ -346,9 +355,43 @@ func classifyHandshakeErr(err error) (slog.Level, string) {
 	}
 	var myErr *gomysql.MyError
 	if errors.As(err, &myErr) && myErr.Code == gomysql.ER_ACCESS_DENIED_ERROR {
+		if isMonitorAuthFailure(myErr.Message) {
+			return slog.LevelDebug, "mysql auth failed (proxysql monitor probe)"
+		}
 		return slog.LevelInfo, "mysql auth failed"
 	}
 	return slog.LevelError, "mysql handshake failed"
+}
+
+// isMonitorAuthFailure reports whether an ER_ACCESS_DENIED_ERROR
+// message names ProxySQL's monitor user. The 1045 message is
+// formatted as `Access denied for user '<user>'@'<host>' (using
+// password: ...)` — see mysql.MySQLErrName[ER_ACCESS_DENIED_ERROR]
+// in go-mysql v1.13.0. We extract the substring between the first
+// pair of single quotes and compare case-insensitively against
+// "monitor".
+//
+// The (*Conn).handshake path is the only producer of this exact
+// message in the shim, so the format is stable — go-mysql doesn't
+// localise mysql.MySQLErrName. A go-mysql upgrade that changes the
+// format would silently route monitor failures back through the Info
+// branch; the unit test below pins the parsing against the literal
+// error go-mysql constructs today.
+//
+// Returns false on any parse failure — we'd rather over-log a probe
+// than mistakenly silence a real auth failure for a tenant whose name
+// happens to contain quote-adjacent metacharacters.
+func isMonitorAuthFailure(msg string) bool {
+	openQuote := strings.IndexByte(msg, '\'')
+	if openQuote < 0 {
+		return false
+	}
+	rest := msg[openQuote+1:]
+	closeQuote := strings.IndexByte(rest, '\'')
+	if closeQuote < 0 {
+		return false
+	}
+	return strings.EqualFold(rest[:closeQuote], "monitor")
 }
 
 // buildUserSchemas derives the per-tenant default schema for shim

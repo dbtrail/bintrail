@@ -201,9 +201,12 @@ func (l *alwaysErrorListener) Addr() net.Addr {
 //
 // EOF / mysql.ErrBadConn are go-mysql's wrapped read errors when
 // ProxySQL's monitor opens a TCP socket and closes it; they must be
-// debug. ER_ACCESS_DENIED_ERROR is what TenantAuth.GetCredential
-// causes go-mysql/server to return — info, never error. Anything
-// else stays at error.
+// debug. ER_ACCESS_DENIED_ERROR for a real tenant user is what
+// TenantAuth.GetCredential causes go-mysql/server to return — info,
+// never error. ER_ACCESS_DENIED_ERROR for the ProxySQL `monitor`
+// user is demoted to debug per issue #316 (the monitor probes every
+// ~1-10s and would otherwise drown real auth failures in info-level
+// noise). Anything else stays at error.
 func TestClassifyHandshakeErr(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -218,7 +221,11 @@ func TestClassifyHandshakeErr(t *testing.T) {
 		// deps directly") — the production behaviour is what matters, and errors.Is
 		// resolves both wrap shapes the same way.
 		{"wrapped ErrBadConn", fmt.Errorf("io.ReadFull(header) failed: %w", gomysql.ErrBadConn), slog.LevelDebug},
-		{"ER_ACCESS_DENIED_ERROR", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES"), slog.LevelInfo},
+		// ProxySQL monitor user → debug (issue #316).
+		{"ER_ACCESS_DENIED_ERROR monitor user is debug", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES"), slog.LevelDebug},
+		// Real tenant user → info (the load-bearing claim — without this,
+		// the #316 demote would silence every real auth failure too).
+		{"ER_ACCESS_DENIED_ERROR tenant user is info", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "alice", "127.0.0.1:46948", "YES"), slog.LevelInfo},
 		{"unrelated MyError stays error", gomysql.NewDefaultError(gomysql.ER_HANDSHAKE_ERROR), slog.LevelError},
 		{"plain unrelated error", errors.New("protocol mismatch"), slog.LevelError},
 	}
@@ -230,6 +237,44 @@ func TestClassifyHandshakeErr(t *testing.T) {
 			}
 			if msg == "" {
 				t.Errorf("classifyHandshakeErr msg empty for %v", tc.err)
+			}
+		})
+	}
+}
+
+// TestIsMonitorAuthFailure pins the parser against the literal
+// ER_ACCESS_DENIED_ERROR message go-mysql v1.13.0 emits. A go-mysql
+// upgrade that changes the format would silently route monitor
+// failures back through the info branch — issue #316 would regress.
+// The case-insensitive match is deliberate: ProxySQL ships with the
+// lowercase form, but a tenant deliberately named `Monitor` would
+// also probe at the same cadence, so robust matching wins over
+// surgical case-sensitivity.
+func TestIsMonitorAuthFailure(t *testing.T) {
+	// Build the exact message classifyHandshakeErr unwraps — this is
+	// what (*Conn).handshake constructs via mysql.NewDefaultError when
+	// TenantAuth.GetCredential returns ErrAccessDenied.
+	monitorErr := gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES")
+	tenantErr := gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "alice", "127.0.0.1:46948", "YES")
+
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"production go-mysql format with monitor", monitorErr.Message, true},
+		{"production go-mysql format with tenant", tenantErr.Message, false},
+		{"uppercase monitor matches", "Access denied for user 'MONITOR'@'127.0.0.1' (using password: YES)", true},
+		{"mixed-case monitor matches", "Access denied for user 'Monitor'@'127.0.0.1' (using password: YES)", true},
+		{"monitor-prefixed user does not match", "Access denied for user 'monitor_special'@'127.0.0.1' (using password: YES)", false},
+		{"no quotes returns false (cannot parse)", "Access denied for user monitor", false},
+		{"single quote without close returns false", "Access denied for user 'monitor", false},
+		{"empty string returns false", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isMonitorAuthFailure(tc.msg); got != tc.want {
+				t.Errorf("isMonitorAuthFailure(%q) = %v, want %v", tc.msg, got, tc.want)
 			}
 		})
 	}
