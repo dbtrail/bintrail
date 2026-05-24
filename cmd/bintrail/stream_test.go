@@ -1252,6 +1252,37 @@ func TestResolveStartWithAutoDiscover_skippedWhenFlagSet(t *testing.T) {
 	}
 }
 
+// TestResolveStartWithAutoDiscover_skippedWhenGTIDFlagSet verifies the
+// symmetric guard: an explicit --start-gtid bypasses auto-discover. The
+// wrapper checks `startFile != "" || startGTID != ""` — a future
+// refactor that asymmetrically drops the startGTID check would silently
+// invoke discovery on GTID-mode first runs and overwrite the operator's
+// declared base GTID. This test catches that.
+func TestResolveStartWithAutoDiscover_skippedWhenGTIDFlagSet(t *testing.T) {
+	gtidSet := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5"
+	called := false
+	mode, _, returnedGTID, _, accGTID, err := resolveStartWithAutoDiscover("", gtidSet, 4, nil,
+		func() (string, uint32, error) {
+			called = true
+			return "should-not-be-used", 999, nil
+		})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if called {
+		t.Error("autoDiscover should not be called when --start-gtid is set")
+	}
+	if mode != "gtid" {
+		t.Errorf("mode = %q, want gtid", mode)
+	}
+	if returnedGTID != gtidSet {
+		t.Errorf("returnedGTID = %q, want %q", returnedGTID, gtidSet)
+	}
+	if accGTID == nil {
+		t.Error("expected non-nil accGTID in gtid mode")
+	}
+}
+
 // TestResolveStartWithAutoDiscover_skippedWhenSavedExists verifies that
 // a saved checkpoint bypasses auto-discover (preserves resume behavior).
 func TestResolveStartWithAutoDiscover_skippedWhenSavedExists(t *testing.T) {
