@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha1"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/dbtrail/bintrail/internal/config"
 	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	yaml "go.yaml.in/yaml/v2"
@@ -66,7 +68,13 @@ var (
 	pcProxySQLMySQLPort  uint
 	pcForce              bool
 	pcBackendAuthPlugin  string
+	pcValidate           bool
 )
+
+// pcConnect is the indirection seam for opening the source DB during
+// --validate pre-flight. Tests override it to inject a sqlmock DB without
+// requiring a live MySQL. Defaults to config.Connect.
+var pcConnect = config.Connect
 
 // Valid values for --backend-auth-plugin. Default is the SHA1
 // (mysql_native_password) form because that preserves pre-#310 behaviour
@@ -87,7 +95,14 @@ func init() {
 	proxysqlConfigCmd.Flags().UintVar(&pcProxySQLMySQLPort, "proxysql-mysql-port", 6033, "ProxySQL's client-facing MySQL protocol port (used in the help comment)")
 	proxysqlConfigCmd.Flags().BoolVarP(&pcForce, "force", "f", false, "Overwrite the output file if it already exists")
 	proxysqlConfigCmd.Flags().StringVar(&pcBackendAuthPlugin, "backend-auth-plugin", backendAuthNative,
-		"Backend MySQL auth plugin: 'mysql_native_password' stores SHA1 (default, current behaviour); 'caching_sha2_password' stores cleartext so ProxySQL can complete the backend handshake against MySQL 8.0+ defaults")
+		"Backend MySQL auth plugin: 'mysql_native_password' stores SHA1 (default, current behaviour); "+
+			"'caching_sha2_password' stores cleartext. NOTE: caching_sha2_password requires TLS between "+
+			"ProxySQL and the MySQL backend, OR the SHA2 auth cache already primed for that user. Without "+
+			"either, the ProxySQL→backend handshake fails on first connect — see ProxySQL docs.")
+	proxysqlConfigCmd.Flags().BoolVar(&pcValidate, "validate", false,
+		"Opt-in pre-flight: connect to BINTRAIL_SOURCE_DSN and verify the DSN user's auth plugin matches "+
+			"--backend-auth-plugin. Warns (does not error) on mismatch or when the probe itself fails. "+
+			"Assumes the DSN user is also the one ProxySQL will re-handshake with.")
 	bindCommandEnv(proxysqlConfigCmd)
 	rootCmd.AddCommand(proxysqlConfigCmd)
 }
@@ -156,6 +171,14 @@ func runProxySQLConfig(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Opt-in pre-flight: probe mysql.user for the DSN user's plugin and
+	// warn-and-continue when it does not match --backend-auth-plugin
+	// (#327). Validation failures never block SQL generation — the
+	// operator can still re-apply a corrected setup later.
+	if pcValidate {
+		runBackendAuthPluginValidation(sourceDSN, host, pcBackendAuthPlugin)
+	}
+
 	content := generateProxySQLSetupSQL(host, port, uint16(pcShimPort), uint16(pcProxySQLMySQLPort), tenants, pcBackendAuthPlugin)
 
 	if pcOut == "-" {
@@ -202,6 +225,70 @@ func runProxySQLConfig(cmd *cobra.Command, args []string) error {
 	fmt.Printf("ProxySQL setup SQL written to %s\n", pcOut)
 	fmt.Printf("Apply it: mysql -u admin -P 6032 -h <proxysql-host> < %s\n", pcOut)
 	return nil
+}
+
+// runBackendAuthPluginValidation orchestrates the --validate path:
+// extract user from DSN, open a connection, probe mysql.user, and emit
+// the appropriate warn log. Any failure short-circuits with a warn and
+// returns to the caller without surfacing an error — SQL generation
+// must proceed regardless (#327). Kept as a thin orchestrator so the
+// pure validation helper stays sqlmock-testable on its own.
+func runBackendAuthPluginValidation(sourceDSN, host, expected string) {
+	cfg, err := drivermysql.ParseDSN(sourceDSN)
+	if err != nil {
+		// parseProxySQLBackend already validated the DSN earlier in
+		// runProxySQLConfig, so reaching this branch implies a
+		// programming error rather than user input. Warn defensively
+		// rather than panicking.
+		slog.Warn("backend auth-plugin validation skipped: could not re-parse DSN", "err", err)
+		return
+	}
+	user := cfg.User
+	if user == "" {
+		slog.Warn("backend auth-plugin validation skipped: DSN has no user")
+		return
+	}
+	db, err := pcConnect(sourceDSN)
+	if err != nil {
+		slog.Warn("backend auth-plugin validation skipped: could not connect to source", "err", err)
+		return
+	}
+	defer db.Close()
+	actual, err := validateBackendAuthPlugin(db, user, host, expected)
+	if err != nil {
+		// Most common cause: the DSN user lacks SELECT on mysql.user
+		// (or the row is genuinely missing for that (user, host) pair).
+		// Either way we cannot verify — warn and continue.
+		slog.Warn("backend auth-plugin validation skipped: query failed",
+			"err", err, "user", user, "host", host)
+		return
+	}
+	if actual != expected {
+		slog.Warn(
+			"backend auth plugin mismatch — ProxySQL backend handshake will fail at runtime",
+			"expected", expected, "actual", actual, "user", user, "host", host,
+		)
+	}
+}
+
+// validateBackendAuthPlugin queries mysql.user for the named user's
+// authentication plugin and returns it. Matches on host = ? OR host =
+// '%' so that wildcard grants (the common case for service accounts)
+// resolve. Returns sql.ErrNoRows when no row matches either (user, host)
+// or (user, '%').
+//
+// Pure DB helper — emits no logs and makes no decisions about whether
+// the result is "right". Callers compare against the expected plugin
+// themselves so the logging happens in one place.
+func validateBackendAuthPlugin(db *sql.DB, user, host, expected string) (actual string, err error) {
+	row := db.QueryRow(
+		"SELECT plugin FROM mysql.user WHERE user = ? AND (host = ? OR host = '%') LIMIT 1",
+		user, host,
+	)
+	if err := row.Scan(&actual); err != nil {
+		return "", err
+	}
+	return actual, nil
 }
 
 // parseProxySQLBackend extracts the host and port from a go-sql-driver
