@@ -248,6 +248,15 @@ func (ch *Channel) connectAndListen(ctx context.Context) error {
 // record instead of creating a duplicate byos-<server-id>. The header is
 // omitted entirely when ServerUUID is empty so an older backend isn't
 // confused by an empty value. See issue #317.
+//
+// On HTTP error responses (4xx) the upgrade fails before any WebSocket
+// close frame is exchanged, so the standard close-code path in
+// isTemporary cannot see them. A 4xx is the SaaS's "your request is
+// permanently wrong" signal (missing auth header, revoked key, unknown
+// server UUID once #328's SaaS side lands, etc.) — retrying without
+// operator intervention just spins the reconnect loop. dial wraps the
+// raw handshake error in a *PermanentDialError so isTemporary can
+// classify it as permanent. See issue #328.
 func (ch *Channel) dial(ctx context.Context) (*websocket.Conn, error) {
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+ch.cfg.APIKey)
@@ -255,10 +264,22 @@ func (ch *Channel) dial(ctx context.Context) (*websocket.Conn, error) {
 		header.Set("X-Bintrail-Server-UUID", ch.cfg.ServerUUID)
 	}
 
-	conn, _, err := websocket.Dial(ctx, ch.cfg.Endpoint, &websocket.DialOptions{
+	conn, resp, err := websocket.Dial(ctx, ch.cfg.Endpoint, &websocket.DialOptions{
 		HTTPHeader: header,
 	})
+	// coder/websocket replaces resp.Body with an io.NopCloser on the
+	// error path (dial.go ~line 161) and documents "you never need to
+	// close resp.Body yourself", so this Close is a defensive no-op —
+	// but it's the standard net/http contract and survives a future lib
+	// change that re-introduces a real ReadCloser. Cheap insurance
+	// against an FD leak per failed dial.
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close()
+	}
 	if err != nil {
+		if resp != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return nil, &PermanentDialError{StatusCode: resp.StatusCode, Err: err}
+		}
 		return nil, err
 	}
 	return conn, nil
@@ -465,9 +486,49 @@ func (e *FatalCloseError) Error() string {
 
 func (e *FatalCloseError) Unwrap() error { return e.Err }
 
+// PermanentDialError wraps a WebSocket-upgrade failure that came back
+// with an HTTP 4xx response. 4xx during the upgrade means the SaaS
+// permanently rejected the request (bad/missing/revoked API key,
+// unknown server UUID, malformed headers, etc.) — retrying without
+// operator intervention just spins the reconnect loop until the
+// MaxReconnectAttempts budget exhausts.
+//
+// dial() returns this from the agent's WebSocket dial path so
+// isTemporary can short-circuit the reconnect loop the same way it
+// short-circuits on a permanent close-code rejection. See issue #328.
+//
+// Note this is independent of FatalCloseError: FatalCloseError covers
+// the post-handshake "server closed the WebSocket with a fatal reason
+// string" case (close code 1008 / 44xx), while PermanentDialError
+// covers the pre-handshake "server never accepted the upgrade" case.
+// Both stop the reconnect loop but only the close-code path carries a
+// FatalReason — a raw 4xx has no canonical reason category yet.
+type PermanentDialError struct {
+	StatusCode int
+	Err        error
+}
+
+func (e *PermanentDialError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("permanent dial error: HTTP %d", e.StatusCode)
+	}
+	return fmt.Sprintf("permanent dial error (HTTP %d): %s", e.StatusCode, e.Err.Error())
+}
+
+func (e *PermanentDialError) Unwrap() error { return e.Err }
+
 // isTemporary reports whether err is a connection-level error that should
 // trigger a reconnect (as opposed to a permanent auth failure).
 func isTemporary(err error) bool {
+	// 4xx on the HTTP upgrade is a permanent rejection — see
+	// PermanentDialError docs and issue #328. Checked first because a
+	// pre-handshake failure cannot also carry a CloseError, and putting
+	// the permanent classifier ahead of the existing switch keeps the
+	// existing close-code branches byte-identical.
+	var pde *PermanentDialError
+	if errors.As(err, &pde) {
+		return false
+	}
 	var closeErr websocket.CloseError
 	if errors.As(err, &closeErr) {
 		switch closeErr.Code {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -922,5 +923,153 @@ func TestChannelConfig_maxReconnectAttempts(t *testing.T) {
 				t.Errorf("maxReconnectAttempts() = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestPermanentDialError_ErrorAndUnwrap pins the wrapper-type contract so a
+// refactor (e.g. inlining the StatusCode formatting) doesn't accidentally
+// break errors.Is / errors.Unwrap callers — isTemporary uses errors.As, and
+// connectAndListen wraps with `fmt.Errorf("dial: %w", err)`, so an unwrap
+// regression would silently re-enable the reconnect loop on 4xx.
+func TestPermanentDialError_ErrorAndUnwrap(t *testing.T) {
+	inner := fmt.Errorf("upgrade rejected by server")
+	pde := &PermanentDialError{StatusCode: 401, Err: inner}
+	if !errors.Is(pde, inner) {
+		t.Errorf("errors.Is(pde, inner) = false, want true")
+	}
+	if !strings.Contains(pde.Error(), "401") {
+		t.Errorf("Error() = %q, want it to contain status code", pde.Error())
+	}
+	if !strings.Contains(pde.Error(), "upgrade rejected") {
+		t.Errorf("Error() = %q, want it to contain wrapped error", pde.Error())
+	}
+	// Nil-inner branch.
+	bare := &PermanentDialError{StatusCode: 403}
+	if got := bare.Error(); !strings.Contains(got, "403") {
+		t.Errorf("Error() = %q, want it to contain status code", got)
+	}
+}
+
+// TestIsTemporary_permanentDialError verifies that a *PermanentDialError —
+// even one wrapped by `fmt.Errorf("dial: %w", ...)` the way
+// connectAndListen does — is classified as permanent. This is the core
+// isTemporary contract used by Run to decide whether to reconnect.
+func TestIsTemporary_permanentDialError(t *testing.T) {
+	direct := &PermanentDialError{StatusCode: 401, Err: fmt.Errorf("nope")}
+	if isTemporary(direct) {
+		t.Errorf("isTemporary(direct PermanentDialError) = true, want false")
+	}
+	// Matches the production wrap site in connectAndListen.
+	wrapped := fmt.Errorf("dial: %w", direct)
+	if isTemporary(wrapped) {
+		t.Errorf("isTemporary(wrapped PermanentDialError) = true, want false")
+	}
+}
+
+// TestDial_4xxResponseIsPermanent exercises the dial path end-to-end against
+// an httptest.Server that rejects the WebSocket upgrade with 401. The
+// returned error must be a *PermanentDialError carrying the status code,
+// and isTemporary must classify it as permanent so the reconnect loop
+// stops.
+func TestDial_4xxResponseIsPermanent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Reject the upgrade — no websocket.Accept call, just a plain
+		// 401. coder/websocket will see a non-101 status and return an
+		// error with the *http.Response still populated.
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	cfg := ChannelConfig{
+		Endpoint: "ws" + strings.TrimPrefix(srv.URL, "http"),
+		APIKey:   "bad-key",
+	}
+	ch := NewChannel(cfg, &stubHandler{}, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := ch.dial(ctx)
+	if err == nil {
+		t.Fatal("expected error from dial against 401 endpoint")
+	}
+	var pde *PermanentDialError
+	if !errors.As(err, &pde) {
+		t.Fatalf("expected *PermanentDialError, got %T: %v", err, err)
+	}
+	if pde.StatusCode != http.StatusUnauthorized {
+		t.Errorf("StatusCode = %d, want %d", pde.StatusCode, http.StatusUnauthorized)
+	}
+	if isTemporary(err) {
+		t.Error("isTemporary(401 dial error) = true, want false")
+	}
+}
+
+// TestDial_5xxResponseIsTemporary verifies the current behavior on 5xx
+// (treat as transient → reconnect) is preserved. 5xx means the SaaS is
+// having a bad time but a retry might succeed; we must NOT wrap it in
+// PermanentDialError.
+func TestDial_5xxResponseIsTemporary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cfg := ChannelConfig{
+		Endpoint: "ws" + strings.TrimPrefix(srv.URL, "http"),
+		APIKey:   "any",
+	}
+	ch := NewChannel(cfg, &stubHandler{}, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := ch.dial(ctx)
+	if err == nil {
+		t.Fatal("expected error from dial against 500 endpoint")
+	}
+	var pde *PermanentDialError
+	if errors.As(err, &pde) {
+		t.Fatalf("did not expect *PermanentDialError for 5xx, got: %v", err)
+	}
+	if !isTemporary(err) {
+		t.Error("isTemporary(500 dial error) = false, want true")
+	}
+}
+
+// TestDial_NetworkErrorIsTemporary verifies that a pre-HTTP transport
+// failure (closed listener, connection refused, etc.) stays classified as
+// temporary. The *http.Response is nil in this case so dial() must not
+// dereference it.
+func TestDial_NetworkErrorIsTemporary(t *testing.T) {
+	// Bind a port, then close the listener so connection attempts to
+	// that port are refused. Using a discovered-then-closed port avoids
+	// hard-coding a hopefully-unused port number.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	cfg := ChannelConfig{
+		Endpoint: "ws://" + addr + "/",
+		APIKey:   "any",
+	}
+	ch := NewChannel(cfg, &stubHandler{}, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err = ch.dial(ctx)
+	if err == nil {
+		t.Fatal("expected error from dial against closed listener")
+	}
+	var pde *PermanentDialError
+	if errors.As(err, &pde) {
+		t.Fatalf("did not expect *PermanentDialError for network error, got: %v", err)
+	}
+	if !isTemporary(err) {
+		t.Error("isTemporary(network error) = false, want true")
 	}
 }
