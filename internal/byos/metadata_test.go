@@ -34,7 +34,7 @@ func TestMetadataClientSend(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewMetadataClient(srv.URL, "test-key")
+	client := NewMetadataClient(srv.URL, "test-key", "")
 	records := []MetadataRecord{
 		{
 			PKHash:         "abc123",
@@ -127,7 +127,7 @@ func TestMetadataClientSendError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewMetadataClient(srv.URL, "test-key")
+	client := NewMetadataClient(srv.URL, "test-key", "")
 	err := client.Send(context.Background(), []MetadataRecord{{PKHash: "x"}})
 	if err == nil {
 		t.Fatal("expected error for 500 response")
@@ -140,7 +140,7 @@ func TestMetadataClientSendContext(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewMetadataClient(srv.URL, "test-key")
+	client := NewMetadataClient(srv.URL, "test-key", "")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
@@ -148,5 +148,61 @@ func TestMetadataClientSendContext(t *testing.T) {
 	err := client.Send(ctx, []MetadataRecord{{PKHash: "x"}})
 	if err == nil {
 		t.Fatal("expected error for cancelled context")
+	}
+}
+
+// TestMetadataClientSendsServerUUIDHeader confirms that when NewMetadataClient
+// receives a non-empty serverUUID, every POST /v1/events carries
+// X-Bintrail-Server-UUID. Mirrors the WS-dial reconcile pattern in
+// internal/agent/channel.go (issue #317) so the SaaS resolves a
+// pre-registered server row by UUID on first ingest instead of creating
+// a duplicate byos-<server-id>. See issue #341 + dbtrail/dbtrail#1495.
+func TestMetadataClientSendsServerUUIDHeader(t *testing.T) {
+	const wantUUID = "550e8400-e29b-41d4-a716-446655440000"
+	var receivedUUID string
+	var headerPresent bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Header keys are canonicalized by net/http, look up via canonical form
+		_, headerPresent = r.Header["X-Bintrail-Server-Uuid"]
+		receivedUUID = r.Header.Get("X-Bintrail-Server-UUID")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewMetadataClient(srv.URL, "test-key", wantUUID)
+	if err := client.Send(context.Background(), []MetadataRecord{{PKHash: "x"}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if !headerPresent {
+		t.Error("X-Bintrail-Server-UUID header was not sent")
+	}
+	if receivedUUID != wantUUID {
+		t.Errorf("X-Bintrail-Server-UUID = %q, want %q", receivedUUID, wantUUID)
+	}
+}
+
+// TestMetadataClientOmitsServerUUIDHeaderWhenEmpty confirms that the header
+// is omitted entirely (not sent with empty value) when serverUUID is empty.
+// An older backend would not understand the new header; sending it empty
+// could be misinterpreted as "explicitly no server" rather than "agent
+// version doesn't carry one yet". Matches the WS-dial omission pattern.
+func TestMetadataClientOmitsServerUUIDHeaderWhenEmpty(t *testing.T) {
+	var headerPresent bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, headerPresent = r.Header["X-Bintrail-Server-Uuid"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewMetadataClient(srv.URL, "test-key", "")
+	if err := client.Send(context.Background(), []MetadataRecord{{PKHash: "x"}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if headerPresent {
+		t.Error("X-Bintrail-Server-UUID header should be omitted when serverUUID is empty")
 	}
 }

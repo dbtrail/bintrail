@@ -323,7 +323,11 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		var payloadWriter *byos.PayloadWriter
 
 		if agtS3Bucket != "" {
-			metaClient = byos.NewMetadataClient(wsEndpointToHTTP(agtEndpoint), agtAPIKey)
+			// Pass the canonicalized --server-uuid so the metadata client sets
+			// X-Bintrail-Server-UUID on every /v1/events POST, mirroring the
+			// WS-dial reconcile path (issue #317). Empty preserves legacy
+			// behavior. See dbtrail/bintrail#341 + dbtrail/dbtrail#1495.
+			metaClient = byos.NewMetadataClient(wsEndpointToHTTP(agtEndpoint), agtAPIKey, agtServerUUID)
 
 			s3Backend, err := storage.NewS3Backend(ctx, storage.S3Config{
 				Bucket: agtS3Bucket,

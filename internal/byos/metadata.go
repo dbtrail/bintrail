@@ -12,20 +12,30 @@ import (
 
 // MetadataClient sends metadata records to the dbtrail API.
 type MetadataClient struct {
-	endpoint string // base URL, e.g. "https://api.dbtrail.io"
-	apiKey   string
-	http     *http.Client
+	endpoint   string // base URL, e.g. "https://api.dbtrail.io"
+	apiKey     string
+	serverUUID string // pre-registered server UUID (empty for legacy back-compat)
+	http       *http.Client
 }
 
 // NewMetadataClient creates a client that sends metadata to the given
 // dbtrail API endpoint. The endpoint should be a base URL without a
 // trailing slash (e.g. "https://api.dbtrail.io"). The apiKey is sent
 // as a Bearer token in the Authorization header.
-func NewMetadataClient(endpoint, apiKey string) *MetadataClient {
+//
+// serverUUID mirrors the value the agent's WebSocket channel already
+// sends in X-Bintrail-Server-UUID on dial (see internal/agent/channel.go,
+// issue #317). When non-empty it is also sent in the same header on
+// every POST /v1/events, so the dbtrail backend can resolve a
+// dashboard-pre-registered row by UUID instead of creating a duplicate
+// byos-<server-id> on the first ingest. Empty preserves legacy behavior.
+// See issue #341.
+func NewMetadataClient(endpoint, apiKey, serverUUID string) *MetadataClient {
 	return &MetadataClient{
-		endpoint: endpoint,
-		apiKey:   apiKey,
-		http:     &http.Client{Timeout: 30 * time.Second},
+		endpoint:   endpoint,
+		apiKey:     apiKey,
+		serverUUID: serverUUID,
+		http:       &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -45,6 +55,13 @@ func (c *MetadataClient) Send(ctx context.Context, records []MetadataRecord) err
 	req.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	// Mirror the WS-handshake header so the SaaS resolves pre-registered
+	// rows by UUID on first ingest (#341). Omit entirely when empty so an
+	// older backend isn't confused by an empty value, matching the WS dial
+	// pattern in internal/agent/channel.go.
+	if c.serverUUID != "" {
+		req.Header.Set("X-Bintrail-Server-UUID", c.serverUUID)
 	}
 
 	resp, err := c.http.Do(req)
