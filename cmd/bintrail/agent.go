@@ -96,7 +96,7 @@ func init() {
 	agentCmd.Flags().StringVar(&agtArchiveS3, "archive-s3", "", "S3 path to Parquet archives (e.g. s3://bucket/prefix/)")
 	agentCmd.Flags().StringVar(&agtBufferRetain, "buffer-retain", "6h", "How long to retain events in the in-memory buffer (e.g. 6h, 24h)")
 	agentCmd.Flags().Uint32Var(&agtServerID, "server-id", 0, "MySQL server ID for replication (required for BYOS streaming)")
-	agentCmd.Flags().StringVar(&agtServerUUID, "server-uuid", "", "UUID of a pre-registered BYOS server (POST /api/v1/servers). When set, the SaaS reconciles this agent's WebSocket connection to that record; when empty, the SaaS auto-creates a new byos-<server-id> record (back-compat).")
+	agentCmd.Flags().StringVar(&agtServerUUID, "server-uuid", "", "UUID of a pre-registered BYOS server (POST /api/v1/servers). When set, the SaaS reconciles this agent's WebSocket connection to that record; when empty, the SaaS auto-creates a new byos-<server-id> record (back-compat). WARNING: a UUID that doesn't match a pre-registered server — whether because of a typo or because the SaaS predates the matching reconciliation logic — is currently *silently ignored* and the SaaS still creates a byos-<server-id> duplicate. After first connect, verify in the dbtrail dashboard that no duplicate record was created.")
 	agentCmd.Flags().IntVar(&agtBatchSize, "batch-size", 1000, "Number of events per batch flush")
 	agentCmd.Flags().StringVar(&agtSchemas, "schemas", "", "Comma-separated list of schemas to index (empty = all)")
 	agentCmd.Flags().StringVar(&agtTables, "tables", "", "Comma-separated list of tables to index (empty = all)")
@@ -132,6 +132,14 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	// the legacy auto-create-on-connect behavior (back-compat). See #317.
 	if err := validateServerUUID(agtServerUUID); err != nil {
 		return err
+	}
+	// Surface the effective UUID at startup so an env-file typo or accidental
+	// re-export is visible in the log right next to the connect line. The
+	// SaaS does not currently echo back the reconciled record, so this is the
+	// only place an operator can confirm what the agent will send. See #317
+	// silent-failure findings C2/C3.
+	if agtServerUUID != "" {
+		slog.Info("agent using --server-uuid", "server_uuid", agtServerUUID, "hint", "verify in dbtrail dashboard that no duplicate byos-<server-id> record was created after first connect")
 	}
 
 	start := time.Now()

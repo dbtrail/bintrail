@@ -570,6 +570,25 @@ func TestAgentCLI_RejectsInvalidServerUUID(t *testing.T) {
 	}
 }
 
+// TestAgentServerUUIDHelpWarnsAboutSilentIgnore guards the warning that
+// closes the SaaS-side silent-ignore window documented in #317. If the
+// dbtrail SaaS predates the matching reconciliation logic, sending a
+// --server-uuid does NOT prevent a duplicate byos-<server-id> record —
+// the help text must surface that explicitly so operators verify in the
+// dashboard rather than assuming success.
+func TestAgentServerUUIDHelpWarnsAboutSilentIgnore(t *testing.T) {
+	flag := agentCmd.Flag("server-uuid")
+	if flag == nil {
+		t.Fatal("--server-uuid flag not registered")
+	}
+	usage := flag.Usage
+	for _, want := range []string{"silently ignored", "dbtrail dashboard"} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("--server-uuid help missing %q; full usage: %s", want, usage)
+		}
+	}
+}
+
 func TestParseByteSize(t *testing.T) {
 	tests := []struct {
 		input string
