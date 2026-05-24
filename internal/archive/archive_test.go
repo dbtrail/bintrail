@@ -103,6 +103,24 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		t.Fatalf("WriteRow 2: %v", err)
 	}
 
+	// Row 3: binlog_file is null (the dbtrail/bintrail#318 case — customer
+	// indexes that predate the NOT NULL constraint or rows from external
+	// pipelines). Confirms the Parquet writer accepts NULL at column index 1.
+	row3 := []string{
+		"3", "", "300", "400", "2026-02-19 10:00:02",
+		"def456:1", "67890", "mydb", "orders", "1", "44",
+		`["col1"]`, `{"id":44}`, `{"id":44,"v":1}`, "1",
+	}
+	nulls3 := []bool{
+		false,
+		true, // binlog_file null
+		false, false, false, false, false, false, false, false, false,
+		false, false, false, false,
+	}
+	if err := w.WriteRow(row3, nulls3); err != nil {
+		t.Fatalf("WriteRow 3: %v", err)
+	}
+
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -119,8 +137,8 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		t.Fatalf("OpenFile: %v", err)
 	}
 
-	if pf.NumRows() != 2 {
-		t.Errorf("NumRows = %d, want 2", pf.NumRows())
+	if pf.NumRows() != 3 {
+		t.Errorf("NumRows = %d, want 3", pf.NumRows())
 	}
 
 	// Verify key-value metadata was embedded.

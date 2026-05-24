@@ -291,15 +291,25 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 	if bmeta.BinlogFile != "" && len(events) > 0 {
 		first := events[0]
-		gap := first.BinlogFile > bmeta.BinlogFile ||
-			(first.BinlogFile == bmeta.BinlogFile && first.StartPos > uint64(bmeta.BinlogPos))
-		if gap {
-			slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
+		// A NULL binlog_file on the first event (mapped to "" by scanRows
+		// after dbtrail/bintrail#318) has no comparable position — skip the
+		// gap check rather than silently degrade to "no gap".
+		if first.BinlogFile == "" {
+			slog.Warn("gap detection skipped — first indexed event lacks binlog_file metadata",
+				"event_id", first.EventID,
 				"baseline_file", bmeta.BinlogFile,
-				"baseline_pos", bmeta.BinlogPos,
-				"baseline_gtid", bmeta.GTIDSet,
-				"first_event_file", first.BinlogFile,
-				"first_event_pos", first.StartPos)
+				"baseline_pos", bmeta.BinlogPos)
+		} else {
+			gap := first.BinlogFile > bmeta.BinlogFile ||
+				(first.BinlogFile == bmeta.BinlogFile && first.StartPos > uint64(bmeta.BinlogPos))
+			if gap {
+				slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
+					"baseline_file", bmeta.BinlogFile,
+					"baseline_pos", bmeta.BinlogPos,
+					"baseline_gtid", bmeta.GTIDSet,
+					"first_event_file", first.BinlogFile,
+					"first_event_pos", first.StartPos)
+			}
 		}
 	}
 

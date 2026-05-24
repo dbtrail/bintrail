@@ -82,7 +82,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 	for rows.Next() {
 		var (
 			eventID        uint64
-			binlogFile     string
+			binlogFile     sql.NullString
 			startPos       uint64
 			endPos         uint64
 			eventTimestamp time.Time
@@ -112,7 +112,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 
 		values := []string{
 			strconv.FormatUint(eventID, 10),
-			binlogFile,
+			binlogFile.String,
 			strconv.FormatUint(startPos, 10),
 			strconv.FormatUint(endPos, 10),
 			eventTimestamp.UTC().Format("2006-01-02 15:04:05"),
@@ -128,7 +128,9 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			strconv.FormatUint(uint64(schemaVersion), 10),
 		}
 		nulls := []bool{
-			false, false, false, false, false,
+			false,
+			!binlogFile.Valid,
+			false, false, false,
 			!gtid.Valid,
 			!connID.Valid,
 			false, false, false, false,
