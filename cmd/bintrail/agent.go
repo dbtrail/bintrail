@@ -128,11 +128,17 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --max-reconnect-attempts %d: must be >= 0 (use 0 explicitly for unlimited retries)", agtMaxReconnectAttempts)
 	}
 
-	// Validate --server-uuid format before any side effects. Empty preserves
-	// the legacy auto-create-on-connect behavior (back-compat). See #317.
-	if err := validateServerUUID(agtServerUUID); err != nil {
+	// Validate and canonicalize --server-uuid before any side effects.
+	// Empty preserves the legacy auto-create-on-connect behavior
+	// (back-compat). See #317. Canonicalization (lowercase, hyphenated,
+	// no braces, no urn prefix) closes the silent-divergence footgun
+	// where uppercase / braced / urn-form copy-paste sources would send
+	// different header values for the same logical UUID. See #329.
+	canonical, err := validateServerUUID(agtServerUUID)
+	if err != nil {
 		return err
 	}
+	agtServerUUID = canonical
 	// Surface the effective UUID at startup so an env-file typo or accidental
 	// re-export is visible in the log right next to the connect line. The
 	// SaaS does not currently echo back the reconciled record, so this is the
@@ -418,7 +424,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		"has_buffer", byosMode,
 		"archives", len(archiveSources))
 
-	err := ch.Run(ctx)
+	err = ch.Run(ctx)
 
 	slog.Info("agent stopped",
 		"duration", time.Since(start).Truncate(time.Second).String(),
@@ -990,18 +996,28 @@ func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Reso
 }
 
 // validateServerUUID enforces that --server-uuid (when supplied) is a
-// well-formed UUID. An empty string is allowed and preserves the legacy
-// auto-create-on-connect SaaS behavior (back-compat); a malformed value
-// is rejected up-front so the operator gets a clear error instead of a
-// silent mis-association on the SaaS side. See issue #317.
-func validateServerUUID(s string) error {
+// well-formed UUID and returns its canonical (lowercase, hyphenated, no
+// braces, no urn prefix) form. An empty string is allowed and preserves
+// the legacy auto-create-on-connect SaaS behavior (back-compat); a
+// malformed value is rejected up-front so the operator gets a clear error
+// instead of a silent mis-association on the SaaS side. See issue #317.
+//
+// Canonicalization closes the silent-divergence footgun documented in
+// issue #329: uuid.Parse accepts uppercase, mixed-case, braced {…}, and
+// urn:uuid:… forms, so two operators registering the same logical server
+// from different copy-paste sources would otherwise send divergent
+// X-Bintrail-Server-UUID header values. The SaaS should also normalize
+// on receipt as defense-in-depth, but normalizing in the agent — closer
+// to the operator's input — is the right primary fix.
+func validateServerUUID(s string) (string, error) {
 	if s == "" {
-		return nil
+		return "", nil
 	}
-	if _, err := uuid.Parse(s); err != nil {
-		return fmt.Errorf("invalid --server-uuid %q: must be a valid UUID (e.g. 550e8400-e29b-41d4-a716-446655440000) or empty for back-compat: %w", s, err)
+	parsed, err := uuid.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("invalid --server-uuid %q: must be a valid UUID (e.g. 550e8400-e29b-41d4-a716-446655440000) or empty for back-compat: %w", s, err)
 	}
-	return nil
+	return parsed.String(), nil
 }
 
 // validateBYOSFlushConfig enforces that a BYOS-mode agent has a configured

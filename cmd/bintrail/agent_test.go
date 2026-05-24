@@ -486,22 +486,54 @@ func TestValidateServerUUID(t *testing.T) {
 	tests := []struct {
 		name      string
 		input     string
+		want      string // expected canonical output (only checked when wantErr is false)
 		wantErr   bool
 		errSubstr string
 	}{
 		{
 			name:    "empty is allowed for back-compat",
 			input:   "",
+			want:    "",
 			wantErr: false,
 		},
 		{
 			name:    "valid canonical UUID accepted",
 			input:   "550e8400-e29b-41d4-a716-446655440000",
+			want:    "550e8400-e29b-41d4-a716-446655440000",
 			wantErr: false,
 		},
 		{
 			name:    "valid lowercase UUID accepted",
 			input:   "183819c0-0000-0000-0000-000000000000",
+			want:    "183819c0-0000-0000-0000-000000000000",
+			wantErr: false,
+		},
+		{
+			// Issue #329: uppercase copy-paste from a dashboard URL must
+			// not send a divergent header value vs the canonical form.
+			name:    "uppercase canonical normalized to lowercase",
+			input:   "550E8400-E29B-41D4-A716-446655440000",
+			want:    "550e8400-e29b-41d4-a716-446655440000",
+			wantErr: false,
+		},
+		{
+			name:    "mixed case normalized to lowercase",
+			input:   "550e8400-E29B-41d4-A716-446655440000",
+			want:    "550e8400-e29b-41d4-a716-446655440000",
+			wantErr: false,
+		},
+		{
+			// Some clipboard managers / docs wrap UUIDs in braces.
+			name:    "braced form normalized to bare lowercase",
+			input:   "{550e8400-e29b-41d4-a716-446655440000}",
+			want:    "550e8400-e29b-41d4-a716-446655440000",
+			wantErr: false,
+		},
+		{
+			// uuid.Parse accepts urn:uuid:... but the SaaS expects bare.
+			name:    "urn:uuid prefix stripped to bare lowercase",
+			input:   "urn:uuid:550e8400-e29b-41d4-a716-446655440000",
+			want:    "550e8400-e29b-41d4-a716-446655440000",
 			wantErr: false,
 		},
 		{
@@ -525,7 +557,7 @@ func TestValidateServerUUID(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateServerUUID(tt.input)
+			got, err := validateServerUUID(tt.input)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
@@ -533,8 +565,16 @@ func TestValidateServerUUID(t *testing.T) {
 				if tt.errSubstr != "" && !strings.Contains(err.Error(), tt.errSubstr) {
 					t.Errorf("error %q does not contain %q", err.Error(), tt.errSubstr)
 				}
-			} else if err != nil {
+				if got != "" {
+					t.Errorf("on error, canonical = %q, want empty string", got)
+				}
+				return
+			}
+			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("canonical = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -561,12 +601,58 @@ func TestAgentCLI_RejectsInvalidServerUUID(t *testing.T) {
 		t.Fatalf("agtServerUUID = %q, want %q after ParseFlags", agtServerUUID, "not-a-uuid")
 	}
 
-	err := validateServerUUID(agtServerUUID)
+	_, err := validateServerUUID(agtServerUUID)
 	if err == nil {
 		t.Fatal("expected error for invalid --server-uuid, got nil")
 	}
 	if !strings.Contains(err.Error(), "invalid --server-uuid") {
 		t.Errorf("error = %q, want it to contain 'invalid --server-uuid'", err.Error())
+	}
+}
+
+// TestAgentCLI_CanonicalizesServerUUID confirms that a valid but
+// non-canonical --server-uuid (uppercase, braced, urn-prefixed) is
+// normalized to canonical lowercase-hyphenated form in agtServerUUID
+// before it flows into the WebSocket X-Bintrail-Server-UUID header.
+// Closes the silent-divergence footgun documented in issue #329.
+//
+// This test mirrors the validate-and-assign sequence in runAgent so a
+// future refactor that drops the assign-back step is caught here rather
+// than only on the SaaS side where the duplicate record symptom is
+// observable but hard to attribute.
+func TestAgentCLI_CanonicalizesServerUUID(t *testing.T) {
+	saved := agtServerUUID
+	t.Cleanup(func() { agtServerUUID = saved })
+
+	const canonical = "550e8400-e29b-41d4-a716-446655440000"
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"uppercase", "550E8400-E29B-41D4-A716-446655440000"},
+		{"braced", "{550e8400-e29b-41d4-a716-446655440000}"},
+		{"urn", "urn:uuid:550e8400-e29b-41d4-a716-446655440000"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := agentCmd.ParseFlags([]string{"--server-uuid", tc.input}); err != nil {
+				t.Fatalf("ParseFlags: %v", err)
+			}
+			if agtServerUUID != tc.input {
+				t.Fatalf("agtServerUUID = %q, want %q after ParseFlags (before canonicalization)", agtServerUUID, tc.input)
+			}
+
+			// Mirror runAgent's validate-and-assign step.
+			got, err := validateServerUUID(agtServerUUID)
+			if err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+			agtServerUUID = got
+
+			if agtServerUUID != canonical {
+				t.Errorf("agtServerUUID = %q after canonicalization, want %q", agtServerUUID, canonical)
+			}
+		})
 	}
 }
 
