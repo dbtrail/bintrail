@@ -99,46 +99,88 @@ func TestCurrentBinlogPosition_FallbackHappyPath(t *testing.T) {
 	}
 }
 
-// TestCurrentBinlogPosition_LogBinOff is the regression guard for
-// issue #325: when both statements return an empty resultset
-// (log_bin=OFF on the source), the wrapped error should mention
-// log_bin and the remediation query — not raw "sql: no rows in
-// result set" repeated twice.
+// TestCurrentBinlogPosition_LogBinOff covers the real-world shape of
+// log_bin=OFF on every supported MySQL/Percona line. The crash-loop
+// in #325 surfaced as an asymmetric error pair — exactly one branch
+// returns ErrNoRows (empty resultset because log_bin=OFF) and the
+// other returns 1064 (statement doesn't exist on that version):
+//
+//   - 5.7 / 8.0 / Percona <8.4: SHOW BINARY LOG STATUS → 1064,
+//     SHOW MASTER STATUS → ErrNoRows.
+//   - 8.4+: SHOW BINARY LOG STATUS → ErrNoRows, SHOW MASTER STATUS →
+//     1064 (removed in 8.4.0).
+//
+// Plus the degenerate sanity case where sqlmock simulates both empty.
+// All three must hit the domain error.
 func TestCurrentBinlogPosition_LogBinOff(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
+	cases := []struct {
+		name      string
+		firstErr  error
+		firstRows *sqlmock.Rows
+		fbErr     error
+		fbRows    *sqlmock.Rows
+	}{
+		{
+			name:      "pre_8.4 with log_bin=OFF: new statement is 1064, old returns empty",
+			firstErr:  &mysql.MySQLError{Number: 1064, Message: "syntax error near 'BINARY LOG STATUS'"},
+			fbRows:    sqlmock.NewRows(binlogStatusColumns),
+		},
+		{
+			name:      "8.4+ with log_bin=OFF: new returns empty, old is 1064",
+			firstRows: sqlmock.NewRows(binlogStatusColumns),
+			fbErr:     &mysql.MySQLError{Number: 1064, Message: "syntax error near 'MASTER STATUS'"},
+		},
+		{
+			name:      "both empty (sqlmock degenerate sanity)",
+			firstRows: sqlmock.NewRows(binlogStatusColumns),
+			fbRows:    sqlmock.NewRows(binlogStatusColumns),
+		},
 	}
-	defer db.Close()
 
-	mock.ExpectQuery("SHOW BINARY LOG STATUS").WillReturnRows(
-		sqlmock.NewRows(binlogStatusColumns))
-	mock.ExpectQuery("SHOW MASTER STATUS").WillReturnRows(
-		sqlmock.NewRows(binlogStatusColumns))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
 
-	_, _, err = CurrentBinlogPosition(db)
-	if err == nil {
-		t.Fatal("expected error when both statements return empty resultsets, got nil")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "log_bin") {
-		t.Errorf("error message does not mention log_bin: %q", msg)
-	}
-	if !strings.Contains(msg, "SHOW VARIABLES") {
-		t.Errorf("error message does not point at the remediation query: %q", msg)
-	}
-	// Guard against the old double-wrap diagnostic leaking through:
-	// the wrapped error must not include the generic "fallback:" pair
-	// nor the raw "no rows in result set" string that the operator
-	// would otherwise chase fruitlessly.
-	if strings.Contains(msg, "fallback:") {
-		t.Errorf("error message should not include the generic fallback diagnostic for the log_bin=OFF case: %q", msg)
-	}
-	if strings.Contains(msg, "no rows in result set") {
-		t.Errorf("error message should not leak the raw sql.ErrNoRows string for the log_bin=OFF case: %q", msg)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet expectations: %v", err)
+			firstExp := mock.ExpectQuery("SHOW BINARY LOG STATUS")
+			if tc.firstErr != nil {
+				firstExp.WillReturnError(tc.firstErr)
+			} else {
+				firstExp.WillReturnRows(tc.firstRows)
+			}
+			fbExp := mock.ExpectQuery("SHOW MASTER STATUS")
+			if tc.fbErr != nil {
+				fbExp.WillReturnError(tc.fbErr)
+			} else {
+				fbExp.WillReturnRows(tc.fbRows)
+			}
+
+			_, _, err = CurrentBinlogPosition(db)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "log_bin") {
+				t.Errorf("error message does not mention log_bin: %q", msg)
+			}
+			if !strings.Contains(msg, "SHOW VARIABLES") {
+				t.Errorf("error message does not point at the remediation query: %q", msg)
+			}
+			// Domain error must not leak the generic fallback wrap or
+			// raw ErrNoRows — operators would chase those fruitlessly.
+			if strings.Contains(msg, "fallback:") {
+				t.Errorf("domain error should not include 'fallback:' wrap: %q", msg)
+			}
+			if strings.Contains(msg, "no rows in result set") {
+				t.Errorf("domain error should not leak raw sql.ErrNoRows: %q", msg)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
 	}
 }
 

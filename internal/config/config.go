@@ -15,11 +15,20 @@ import (
 // new statement does not exist. When both fail, the wrapped error includes
 // both diagnostics so the operator does not chase the wrong syntax.
 //
-// When binary logging is disabled on the source (log_bin=OFF), both statements
-// return an empty resultset rather than an error, surfacing as sql.ErrNoRows
-// from Scan on both branches. In that specific case we return a domain-specific
-// error pointing the operator at the likely cause and the remediation query,
-// instead of the unhelpful "no rows in result set" pair.
+// When binary logging is disabled on the source (log_bin=OFF), the statement
+// that exists on this server version returns an empty resultset (sql.ErrNoRows
+// from Scan), while the statement that doesn't exist returns syntax error 1064
+// — never both ErrNoRows. The two real-world shapes are:
+//
+//   - 5.7/8.0/Percona<8.4 + log_bin=OFF: SHOW BINARY LOG STATUS → 1064,
+//     SHOW MASTER STATUS → ErrNoRows
+//   - 8.4+ + log_bin=OFF: SHOW BINARY LOG STATUS → ErrNoRows,
+//     SHOW MASTER STATUS → 1064 (removed in 8.4.0)
+//
+// So when EITHER branch returns ErrNoRows we know log_bin=OFF and emit a
+// domain-specific error. Privileges missing surfaces as 1227 (ER_SPECIFIC_
+// ACCESS_DENIED_ERROR), not ErrNoRows, so false-positive risk is essentially
+// nil.
 func CurrentBinlogPosition(db *sql.DB) (file string, pos uint32, err error) {
 	scanArgs := []any{&file, &pos, new(string), new(string), new(string)}
 	if err = db.QueryRow("SHOW BINARY LOG STATUS").Scan(scanArgs...); err == nil {
@@ -27,7 +36,7 @@ func CurrentBinlogPosition(db *sql.DB) (file string, pos uint32, err error) {
 	}
 	firstErr := err
 	if err = db.QueryRow("SHOW MASTER STATUS").Scan(scanArgs...); err != nil {
-		if errors.Is(firstErr, sql.ErrNoRows) && errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(firstErr, sql.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
 			return "", 0, fmt.Errorf("current binlog position empty — log_bin appears to be OFF on the source server (run \"SHOW VARIABLES LIKE 'log_bin'\" to confirm)")
 		}
 		return "", 0, fmt.Errorf("SHOW BINARY LOG STATUS / SHOW MASTER STATUS: %w (fallback: %w)", firstErr, err)
