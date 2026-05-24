@@ -264,7 +264,7 @@ aws rds modify-db-instance \
   --apply-immediately
 ```
 
-The modification reaches the instance in ~2 minutes. After that, `SELECT @@log_bin` reports `1` but `SHOW BINARY LOGS` may still return an empty set until RDS completes its first automated snapshot (another ~30s–1min). Wait for `SHOW BINARY LOGS` to return at least one row before launching `bintrail stream` — without a starting binlog file the streamer exits with `no start position specified`. Set `binlog retention hours` (see below) so RDS keeps binlogs long enough for bintrail to index them before purge:
+The modification reaches the instance in ~2 minutes. After that, `SELECT @@log_bin` reports `1` but `SHOW BINARY LOGS` may still return an empty set until RDS completes its first automated snapshot (another ~30s–1min). Wait for `SHOW BINARY LOGS` to return at least one row before launching `bintrail stream` — until then auto-discovery returns no row and the streamer exits with `auto-discover binlog position: ...`. Set `binlog retention hours` (see below) so RDS keeps binlogs long enough for bintrail to index them before purge:
 
 ```sql
 CALL mysql.rds_set_configuration('binlog retention hours', 48);

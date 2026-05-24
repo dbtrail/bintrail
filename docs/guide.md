@@ -716,15 +716,7 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'bintrail_repl'@'%';
 FLUSH PRIVILEGES;
 ```
 
-Get the current binlog position for the first run:
-
-```sql
-SHOW MASTER STATUS;
--- Example output:
--- File: binlog.000123  Position: 4  Executed_Gtid_Set: 3e11fa47-...:1-5000
-```
-
-**First run** — one-time setup:
+**First run** — one-time setup. `bintrail stream` auto-discovers the current binlog position from the source on first run, so no `--start-file`/`--start-gtid` is required by default:
 
 ```sh
 # Step 1: Create index tables
@@ -735,13 +727,21 @@ bintrail snapshot \
   --source-dsn "bintrail_repl:secret@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
   --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 
-# Step 3: Start streaming from the current GTID position
+# Step 3: Start streaming — auto-discovers the current binlog head
 bintrail stream \
   --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
   --source-dsn "bintrail_repl:secret@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
   --server-id  99999 \
-  --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5000" \
   --metrics-addr :9090
+```
+
+To start from an earlier position (e.g. replay a known window), query the source explicitly and pass `--start-gtid` or `--start-file`/`--start-pos`:
+
+```sql
+SHOW BINARY LOG STATUS;   -- MySQL 8.4+
+SHOW MASTER STATUS;       -- pre-8.4
+-- Example output:
+-- File: binlog.000123  Position: 4  Executed_Gtid_Set: 3e11fa47-...:1-5000
 ```
 
 **Subsequent runs** — the checkpoint is resumed automatically:
@@ -956,7 +956,7 @@ bintrail status --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 | Recovery SQL uses `WHERE col1 = ? AND col2 = ?` for all columns (verbose) | No schema snapshot available, so bintrail falls back to matching all columns | Run `bintrail snapshot` — once a snapshot is available, recovery uses the primary key only. |
 | `failed to connect to index database: ...` | Wrong DSN, MySQL not running, or network issue | Verify the DSN is correct and test connectivity: `mysql -u user -p -h host -P 3306 binlog_index`. |
 | Index files stuck as `in_progress` | Previous `index` run crashed or was killed | Re-run `bintrail index` — `in_progress` files are retried automatically. |
-| `no start position specified; provide --start-file or --start-gtid on the first run` | First `stream` run without a starting position | Run `SHOW MASTER STATUS` on the source and pass the result as `--start-gtid` (GTID mode) or `--start-file` (position mode). On subsequent runs the checkpoint is loaded automatically. |
+| `auto-discover binlog position: ...` on `bintrail stream` first run | The default auto-discovery (`SHOW BINARY LOG STATUS` / `SHOW MASTER STATUS`) failed — usually because `log_bin=OFF` on the source, or the user lacks `REPLICATION CLIENT` | Enable binary logging on the source (or override with an explicit `--start-file`/`--start-pos` or `--start-gtid`). On RDS, set `binlog_format=ROW` in the parameter group and ensure `backup-retention-period > 0`. |
 | Stream replication lag growing | High write rate on source, slow index DB, or large batches | Try increasing `--batch-size` (reduces round-trips), check index DB load, and monitor `bintrail_stream_replication_lag_seconds` via Prometheus. |
 | `unix socket; binlog replication requires TCP` | Source DSN uses a unix socket path | Switch `--source-dsn` to TCP format: `user:pass@tcp(host:3306)/`. The replication protocol does not work over unix sockets. |
 

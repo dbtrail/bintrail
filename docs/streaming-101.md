@@ -299,28 +299,21 @@ bintrail baseline \
 
 ## Step 7: Start the replication stream
 
-Get the current GTID position from the source:
-
-```sql
-SHOW MASTER STATUS;
--- Note the Executed_Gtid_Set value, e.g.:
--- 3e11fa47-71ca-11e1-9e33-c80aa9429562:1-50000
-```
-
-Start streaming (first run — provide the GTID):
+On the first run, `bintrail stream` auto-discovers the source's current binlog position via `SHOW BINARY LOG STATUS` (or `SHOW MASTER STATUS` on pre-8.4 MySQL). No flag required:
 
 ```bash
 bintrail stream \
   --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
   --source-dsn "bintrail_repl:a-strong-password@tcp(source-db:3306)/" \
   --server-id  99999 \
-  --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-50000" \
   --metrics-addr :9090
 ```
 
+To override (start from an earlier position to replay a known window) pass `--start-file mysql-bin.000001 --start-pos 4` or `--start-gtid '<gtid-set>'` explicitly.
+
 The stream runs indefinitely, indexing every row event as it happens. It saves a checkpoint every 10 seconds to `stream_state`, so it can resume from where it left off if stopped.
 
-**Subsequent runs** resume automatically from the checkpoint — no `--start-gtid` needed:
+**Subsequent runs** resume automatically from the checkpoint — no flags needed:
 
 ```bash
 bintrail stream \
