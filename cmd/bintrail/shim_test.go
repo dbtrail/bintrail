@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -314,5 +316,107 @@ func TestBuildUserSchemas(t *testing.T) {
 		if _, ok := got[u]; ok {
 			t.Errorf("buildUserSchemas[%q] should be absent (bad/empty DSN), got %q", u, got[u])
 		}
+	}
+}
+
+// TestMonitorDeniedCounterIncrements pins the #326 wiring: every
+// classifyHandshakeErr call whose error is a `monitor`-user 1045 must
+// bump the package-level counter exactly once, and other handshake
+// errors (tenant 1045, EOF, plain errors) must not. A regression that
+// detaches the counter from isMonitorAuthFailure — e.g. moving the
+// Add(1) outside the branch — would silently restore the #326 blind
+// spot once the periodic emit reset the counter at the next tick.
+//
+// The test resets the counter at start to defend against any earlier
+// tests in the package mutating it; the counter is a package-level
+// global, so this is the contract callers must honor.
+func TestMonitorDeniedCounterIncrements(t *testing.T) {
+	monitorDeniedCount.Store(0)
+	t.Cleanup(func() { monitorDeniedCount.Store(0) })
+
+	// Monitor 1045 → counter +1.
+	monitorErr := gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES")
+	classifyHandshakeErr(monitorErr)
+	if got := monitorDeniedCount.Load(); got != 1 {
+		t.Errorf("after monitor 1045: counter = %d, want 1", got)
+	}
+
+	// Tenant 1045 → counter unchanged (still 1).
+	tenantErr := gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "alice", "127.0.0.1:46948", "YES")
+	classifyHandshakeErr(tenantErr)
+	if got := monitorDeniedCount.Load(); got != 1 {
+		t.Errorf("after tenant 1045: counter = %d, want 1 (only monitor failures count)", got)
+	}
+
+	// EOF (TCP probe) → counter unchanged.
+	classifyHandshakeErr(io.EOF)
+	if got := monitorDeniedCount.Load(); got != 1 {
+		t.Errorf("after io.EOF: counter = %d, want 1", got)
+	}
+
+	// Plain unrelated error → counter unchanged.
+	classifyHandshakeErr(errors.New("protocol mismatch"))
+	if got := monitorDeniedCount.Load(); got != 1 {
+		t.Errorf("after protocol mismatch: counter = %d, want 1", got)
+	}
+
+	// Second monitor 1045 → counter +1 (now 2).
+	classifyHandshakeErr(monitorErr)
+	if got := monitorDeniedCount.Load(); got != 2 {
+		t.Errorf("after second monitor 1045: counter = %d, want 2", got)
+	}
+}
+
+// TestMonitorDeniedCounterPeriodicEmit pins the two contract claims of
+// emitMonitorDenied:
+//   - count == 0 emits nothing (no steady-state log noise when ProxySQL's
+//     monitor is configured correctly and never fails),
+//   - count >  0 emits one INFO line with the count and a non-empty
+//     interval string, then resets the counter to zero (so the next
+//     interval starts fresh — the load-bearing claim of the periodic
+//     design).
+//
+// A regression that emitted on zero (operator drowns in 5-minute
+// heartbeats) or failed to reset (counts compound forever, eventually
+// reporting absurd totals) would both silently break the design.
+func TestMonitorDeniedCounterPeriodicEmit(t *testing.T) {
+	t.Cleanup(func() { monitorDeniedCount.Store(0) })
+
+	// count == 0 path: emit nothing.
+	monitorDeniedCount.Store(0)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	emitMonitorDenied(logger)
+	if buf.Len() != 0 {
+		t.Errorf("count=0 emit: got log output %q, want empty (no steady-state noise)", buf.String())
+	}
+	if got := monitorDeniedCount.Load(); got != 0 {
+		t.Errorf("count=0 emit: counter = %d after emit, want 0", got)
+	}
+
+	// count > 0 path: emit one line with count=N and reset to zero.
+	monitorDeniedCount.Store(7)
+	buf.Reset()
+	emitMonitorDenied(logger)
+	out := buf.String()
+	if !strings.Contains(out, "monitor probes denied") {
+		t.Errorf("count=7 emit: log missing msg; got %q", out)
+	}
+	if !strings.Contains(out, "count=7") {
+		t.Errorf("count=7 emit: log missing count=7; got %q", out)
+	}
+	if !strings.Contains(out, "interval=") {
+		t.Errorf("count=7 emit: log missing interval=...; got %q", out)
+	}
+	if got := monitorDeniedCount.Load(); got != 0 {
+		t.Errorf("count=7 emit: counter = %d after emit, want 0 (reset is load-bearing — non-zero would compound across intervals)", got)
+	}
+
+	// After reset, a second emit at count==0 stays silent — the
+	// reset-then-emit contract from a previous tick must hold.
+	buf.Reset()
+	emitMonitorDenied(logger)
+	if buf.Len() != 0 {
+		t.Errorf("second emit after reset: got %q, want empty", buf.String())
 	}
 }

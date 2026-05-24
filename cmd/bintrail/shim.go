@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -81,6 +82,30 @@ var (
 	shAllowGaps  bool
 	shAuthMethod string
 )
+
+// monitorDeniedCount counts ER_ACCESS_DENIED_ERROR handshake failures whose
+// username matches ProxySQL's `monitor` (case-insensitive). Per-probe logs
+// stay at Debug (issue #316), but the steady-state INFO log line was
+// silenced for the entire monitor-user 1045 population — including
+// credential brute-force attempts that spoof the monitor username and
+// ProxySQL misconfigurations (rotated mysql-monitor_password) that would
+// otherwise produce zero shim-side signal. See issue #326.
+//
+// A package-level atomic keeps the increment path lock-free on the hot
+// handshake-error branch. Tests that exercise classifyHandshakeErr reset
+// this counter explicitly with monitorDeniedCount.Store(0) — no
+// per-run scoping in production (only one runShim per process; the
+// counter is reset by the ticker every 5 minutes anyway).
+var monitorDeniedCount atomic.Int64
+
+// monitorDeniedInterval is the cadence at which monitorDeniedTicker
+// emits and resets the counter. 5 minutes is short enough that a
+// misconfig surfaces within one operator's coffee break and long enough
+// that the steady-state log volume stays at "at most 1 line every 5
+// minutes" — versus pre-#316's ~6-360 lines/minute monitor flood. Not
+// flag-configurable on purpose: no operator will need to tune this and
+// the tunable would just be one more thing to misconfigure.
+const monitorDeniedInterval = 5 * time.Minute
 
 func init() {
 	shimCmd.Flags().StringVar(&shListen, "listen", "127.0.0.1:3308", "Listen address for the MySQL protocol port (default: localhost-only — keep ProxySQL as the auth gate)")
@@ -180,6 +205,16 @@ func runShim(cmd *cobra.Command, args []string) error {
 		cancel()
 		listener.Close()
 	}()
+
+	// Periodic INFO summary of denied ProxySQL monitor-user handshakes.
+	// Per-probe noise stays at Debug (#316); this counter is the only
+	// steady-state signal at INFO so a credential probe burst or a
+	// ProxySQL misconfig (rotated mysql-monitor_password) surfaces
+	// without restoring the per-probe log flood. See issue #326. Reset
+	// to zero at startup so a fresh process never inherits stale state
+	// from a previous in-process test run.
+	monitorDeniedCount.Store(0)
+	go monitorDeniedTicker(ctx, slog.Default())
 
 	// config.Connect already parsed and pinged shIndexDSN above, so a parse
 	// failure here would be a programming defect, not a configuration error
@@ -356,11 +391,53 @@ func classifyHandshakeErr(err error) (slog.Level, string) {
 	var myErr *gomysql.MyError
 	if errors.As(err, &myErr) && myErr.Code == gomysql.ER_ACCESS_DENIED_ERROR {
 		if isMonitorAuthFailure(myErr.Message) {
+			// Per-probe log stays at Debug (issue #316); the
+			// counter is the only signal that surfaces at INFO,
+			// emitted every monitorDeniedInterval by
+			// monitorDeniedTicker. See issue #326.
+			monitorDeniedCount.Add(1)
 			return slog.LevelDebug, "mysql auth failed (proxysql monitor probe)"
 		}
 		return slog.LevelInfo, "mysql auth failed"
 	}
 	return slog.LevelError, "mysql handshake failed"
+}
+
+// emitMonitorDenied snapshots the counter, resets it, and emits an INFO
+// line if the snapshot is positive. Pulled out as a package-level
+// function (not a closure) so unit tests can drive both code paths
+// (count==0 and count>0) directly without spinning a 5-minute ticker.
+//
+// Reset-then-emit ordering matters less than it does for a metric
+// pipeline — we don't double-count and we don't underreport. The atomic
+// Swap is the only mutation and is the canonical way to "read and
+// reset" without a mutex.
+func emitMonitorDenied(logger *slog.Logger) {
+	n := monitorDeniedCount.Swap(0)
+	if n == 0 {
+		return
+	}
+	logger.Info("monitor probes denied", "count", n, "interval", monitorDeniedInterval.String())
+}
+
+// monitorDeniedTicker runs emitMonitorDenied on every tick until ctx is
+// cancelled. Started as a goroutine from runShim; tied to the shim's
+// serve context so shutdown is clean. A final emit on shutdown drains
+// any counts accumulated since the last tick — without it, the operator
+// would lose visibility into the last partial interval on a graceful
+// SIGTERM.
+func monitorDeniedTicker(ctx context.Context, logger *slog.Logger) {
+	ticker := time.NewTicker(monitorDeniedInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			emitMonitorDenied(logger)
+			return
+		case <-ticker.C:
+			emitMonitorDenied(logger)
+		}
+	}
 }
 
 // isMonitorAuthFailure reports whether an ER_ACCESS_DENIED_ERROR
