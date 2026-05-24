@@ -41,10 +41,13 @@ indexes binlog row events in real-time into binlog_events.
 Unlike 'bintrail index', this command does not require access to binlog files
 on disk and works with managed MySQL (RDS, Aurora, Cloud SQL).
 
-Start position must be specified on the first run via --start-file or
---start-gtid. On subsequent runs the saved checkpoint is resumed automatically,
-even if --start-file/--start-gtid are still present on the command line. This
-makes re-running the same command idempotent.
+Start position on the first run: by default bintrail auto-discovers the
+source's current binlog position via SHOW BINARY LOG STATUS (falling back to
+SHOW MASTER STATUS on pre-8.4 MySQL). Pass --start-file/--start-pos or
+--start-gtid to override and start from a specific earlier position. On
+subsequent runs the saved checkpoint is resumed automatically, even if
+--start-file/--start-gtid are still present on the command line. This makes
+re-running the same command idempotent.
 
 Use --reset to clear the saved checkpoint and force a new start position:
 
@@ -404,6 +407,40 @@ func resolveStart(
 	return "", "", "", 0, nil, fmt.Errorf(
 		"no start position specified and no saved stream state found; " +
 			"provide --start-file or --start-gtid to begin streaming")
+}
+
+// resolveStartWithAutoDiscover wraps resolveStart with an auto-discover
+// fallback for the first-run, no-flags case. When neither --start-file nor
+// --start-gtid is set AND no checkpoint exists yet, the provided autoDiscover
+// callback is invoked to query the source's current binlog position (matching
+// the behavior of `bintrail agent` BYOS mode). The callback is typically
+// config.CurrentBinlogPosition(sourceDB).
+//
+// All other paths (saved checkpoint, explicit flags, mutually-exclusive flags,
+// invalid GTID, etc.) delegate to resolveStart unchanged. The wrapper exists
+// so the discovery side-effect can be unit-tested without a real *sql.DB —
+// callers pass a stub function.
+func resolveStartWithAutoDiscover(
+	startFile, startGTID string, startPos uint32,
+	saved *streamState,
+	autoDiscover func() (string, uint32, error),
+) (mode, file, gtidStr string, pos uint32, accGTID *gomysql.MysqlGTIDSet, err error) {
+	mode, file, gtidStr, pos, accGTID, err = resolveStart(startFile, startGTID, startPos, saved)
+	if err == nil {
+		return
+	}
+	// Only fall back to auto-discover when the failure is the specific
+	// "no start position" case (saved == nil and no flags). Other errors
+	// (mutually-exclusive flags, invalid GTID, corrupt saved state) must
+	// propagate so the operator sees the real problem.
+	if autoDiscover == nil || saved != nil || startFile != "" || startGTID != "" {
+		return
+	}
+	af, ap, dErr := autoDiscover()
+	if dErr != nil {
+		return "", "", "", 0, nil, fmt.Errorf("auto-discover binlog position: %w", dErr)
+	}
+	return "position", af, "", ap, nil, nil
 }
 
 // ─── Gap detection ──────────────────────────────────────────────────────────────
@@ -874,10 +911,17 @@ func runStream(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	mode, startFile, startGTIDStr, startPos, accGTID, err := resolveStart(
-		strmStartFile, strmStartGTID, strmStartPos, saved)
+	mode, startFile, startGTIDStr, startPos, accGTID, err := resolveStartWithAutoDiscover(
+		strmStartFile, strmStartGTID, strmStartPos, saved,
+		func() (string, uint32, error) { return config.CurrentBinlogPosition(sourceDB) })
 	if err != nil {
 		return err
+	}
+	// Surface the auto-discovered position when this was a first-run, no-flags
+	// invocation. Mirrors the agent BYOS startup checkmark style.
+	if saved == nil && strmStartFile == "" && strmStartGTID == "" && mode == "position" {
+		slog.Info("auto-discovered current binlog position", "file", startFile, "pos", startPos)
+		fmt.Printf("Start position: auto-discovered %s:%d ✓\n", startFile, startPos)
 	}
 
 	// ── 6b. Detect binlog gap ────────────────────────────────────────────

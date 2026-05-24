@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -1203,5 +1204,127 @@ func TestStreamCmd_noGapFillFlagRegistered(t *testing.T) {
 	}
 	if f.DefValue != "false" {
 		t.Errorf("expected default no-gap-fill=false, got %q", f.DefValue)
+	}
+}
+
+// ─── resolveStartWithAutoDiscover ────────────────────────────────────────────
+
+// TestResolveStartWithAutoDiscover_firesOnFirstRun verifies that the
+// auto-discover callback is invoked when saved is nil and no flags are set,
+// and that its result becomes the start position.
+func TestResolveStartWithAutoDiscover_firesOnFirstRun(t *testing.T) {
+	called := false
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
+		func() (string, uint32, error) {
+			called = true
+			return "mysql-bin.000042", 1234, nil
+		})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Error("expected autoDiscover to be called")
+	}
+	if mode != "position" || file != "mysql-bin.000042" || pos != 1234 {
+		t.Errorf("got mode=%q file=%q pos=%d, want position/mysql-bin.000042/1234",
+			mode, file, pos)
+	}
+}
+
+// TestResolveStartWithAutoDiscover_skippedWhenFlagSet verifies that an
+// explicit --start-file bypasses auto-discover (preserves operator override).
+func TestResolveStartWithAutoDiscover_skippedWhenFlagSet(t *testing.T) {
+	called := false
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscover("binlog.000001", "", 100, nil,
+		func() (string, uint32, error) {
+			called = true
+			return "should-not-be-used", 999, nil
+		})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if called {
+		t.Error("autoDiscover should not be called when --start-file is set")
+	}
+	if mode != "position" || file != "binlog.000001" || pos != 100 {
+		t.Errorf("got mode=%q file=%q pos=%d, want position/binlog.000001/100",
+			mode, file, pos)
+	}
+}
+
+// TestResolveStartWithAutoDiscover_skippedWhenSavedExists verifies that
+// a saved checkpoint bypasses auto-discover (preserves resume behavior).
+func TestResolveStartWithAutoDiscover_skippedWhenSavedExists(t *testing.T) {
+	saved := &streamState{
+		mode: "position", binlogFile: "saved.000007", binlogPos: 500,
+	}
+	called := false
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscover("", "", 4, saved,
+		func() (string, uint32, error) {
+			called = true
+			return "should-not-be-used", 999, nil
+		})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if called {
+		t.Error("autoDiscover should not be called when a saved checkpoint exists")
+	}
+	if mode != "position" || file != "saved.000007" || pos != 500 {
+		t.Errorf("got mode=%q file=%q pos=%d, want position/saved.000007/500",
+			mode, file, pos)
+	}
+}
+
+// TestResolveStartWithAutoDiscover_nilCallbackPreservesOriginalError verifies
+// that when no callback is wired and no flags/saved exist, the original
+// "no start position" error still surfaces (back-compat).
+func TestResolveStartWithAutoDiscover_nilCallbackPreservesOriginalError(t *testing.T) {
+	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil, nil)
+	if err == nil {
+		t.Fatal("expected error when nil callback and no flags/saved, got nil")
+	}
+	if !strings.Contains(err.Error(), "no start position specified") {
+		t.Errorf("expected original 'no start position' error, got: %v", err)
+	}
+}
+
+// TestResolveStartWithAutoDiscover_discoveryErrorWrapped verifies that an
+// auto-discover failure is surfaced (wrapped) rather than silently masked.
+func TestResolveStartWithAutoDiscover_discoveryErrorWrapped(t *testing.T) {
+	stubErr := errors.New("SHOW BINARY LOG STATUS returned no rows")
+	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
+		func() (string, uint32, error) {
+			return "", 0, stubErr
+		})
+	if err == nil {
+		t.Fatal("expected discovery error to surface, got nil")
+	}
+	if !errors.Is(err, stubErr) {
+		t.Errorf("expected wrapped stubErr via errors.Is, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "auto-discover binlog position") {
+		t.Errorf("expected error wrap prefix, got: %v", err)
+	}
+}
+
+// TestResolveStartWithAutoDiscover_mutuallyExclusiveFlagsErrorPropagates
+// verifies the wrapper does NOT swallow a real resolveStart error and try
+// auto-discover instead.
+func TestResolveStartWithAutoDiscover_mutuallyExclusiveFlagsErrorPropagates(t *testing.T) {
+	called := false
+	_, _, _, _, _, err := resolveStartWithAutoDiscover("binlog.000001", "uuid:1", 4, nil,
+		func() (string, uint32, error) {
+			called = true
+			return "", 0, nil
+		})
+	if err == nil {
+		t.Fatal("expected mutually-exclusive error, got nil")
+	}
+	if called {
+		t.Error("autoDiscover must not be called when flags are mutually exclusive")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("expected mutually-exclusive error, got: %v", err)
 	}
 }
