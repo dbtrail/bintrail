@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
@@ -73,11 +74,9 @@ func TestEndToEnd_fullPipeline(t *testing.T) {
 	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
 
 	// Note the current binlog file (the one that will receive our DML).
-	var currentBinlog, ignorePos, ignoreBinDo, ignoreBinIgn, ignoreGtid string
-	if err := sourceDB.QueryRow("SHOW MASTER STATUS").Scan(
-		&currentBinlog, &ignorePos, &ignoreBinDo, &ignoreBinIgn, &ignoreGtid,
-	); err != nil {
-		t.Fatalf("SHOW MASTER STATUS failed: %v", err)
+	currentBinlog, _, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition failed: %v", err)
 	}
 
 	testutil.MustExec(t, sourceDB, "INSERT INTO orders (customer, status, amount) VALUES ('Alice', 'new', 99.99)")

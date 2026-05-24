@@ -609,10 +609,9 @@ func startBYOSSyncer(sourceDB *sql.DB, syncer *replication.BinlogSyncer, startGT
 		return syncer.StartSyncGTID(gset)
 	}
 	// No start GTID — query current position from source and start there.
-	var file string
-	var pos uint32
-	if err := sourceDB.QueryRow("SHOW MASTER STATUS").Scan(&file, &pos, new(string), new(string), new(string)); err != nil {
-		return nil, fmt.Errorf("SHOW MASTER STATUS: %w", err)
+	file, pos, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		return nil, err
 	}
 	slog.Info("starting from current binlog position", "file", file, "pos", pos)
 	return syncer.StartSync(gomysql.Position{Name: file, Pos: pos})

@@ -15,6 +15,7 @@ import (
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 
+	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parser"
@@ -282,13 +283,9 @@ func TestStreamLoop_liveReplication(t *testing.T) {
 	}
 
 	// Capture current binlog position before any inserts.
-	var binlogFile string
-	var binlogPos uint32
-	var dummy sql.NullString
-	if err := sourceDB.QueryRow("SHOW MASTER STATUS").Scan(
-		&binlogFile, &binlogPos, &dummy, &dummy, &dummy,
-	); err != nil {
-		t.Skipf("skipping: SHOW MASTER STATUS failed: %v", err)
+	binlogFile, binlogPos, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Skipf("skipping: cannot read binlog position: %v", err)
 	}
 
 	// Take schema snapshot into the index DB.

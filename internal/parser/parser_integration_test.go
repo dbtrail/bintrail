@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/testutil"
@@ -52,11 +53,9 @@ func setupBinlog(t *testing.T) (binlogDir, binlogFile, schemaName string, resolv
 	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
 
 	// Note the current binlog file.
-	var currentBinlog, ignorePos, ignoreBinDo, ignoreBinIgn, ignoreGtid string
-	if err := sourceDB.QueryRow("SHOW MASTER STATUS").Scan(
-		&currentBinlog, &ignorePos, &ignoreBinDo, &ignoreBinIgn, &ignoreGtid,
-	); err != nil {
-		t.Fatalf("SHOW MASTER STATUS failed: %v", err)
+	currentBinlog, _, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition failed: %v", err)
 	}
 
 	// Perform DML: 2 INSERTs, 1 UPDATE, 1 DELETE = 4 events.
@@ -234,11 +233,9 @@ func TestParseFiles_multiple(t *testing.T) {
 	for batch := range 2 {
 		testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
 
-		var currentBinlog, ignorePos, ignoreBinDo, ignoreBinIgn, ignoreGtid string
-		if err := sourceDB.QueryRow("SHOW MASTER STATUS").Scan(
-			&currentBinlog, &ignorePos, &ignoreBinDo, &ignoreBinIgn, &ignoreGtid,
-		); err != nil {
-			t.Fatalf("SHOW MASTER STATUS failed: %v", err)
+		currentBinlog, _, err := config.CurrentBinlogPosition(sourceDB)
+		if err != nil {
+			t.Fatalf("CurrentBinlogPosition failed: %v", err)
 		}
 
 		testutil.MustExec(t, sourceDB,
