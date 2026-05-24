@@ -378,16 +378,24 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 	var results []ResultRow
 	for rows.Next() {
 		var r ResultRow
+		// binlog_file is nullable in practice: snapshot baseline rows,
+		// schema_change records propagated from other sources, and manually
+		// imported events have no binlog origin. Scan into NullString and copy
+		// on Valid so the empty string is preserved as "" in ResultRow / JSON.
+		var binlogFile sql.NullString
 		var gtid sql.NullString
 		var connID sql.NullInt64
 		var changedCols, rowBefore, rowAfter []byte
 
 		if err := rows.Scan(
-			&r.EventID, &r.BinlogFile, &r.StartPos, &r.EndPos, &r.EventTimestamp,
+			&r.EventID, &binlogFile, &r.StartPos, &r.EndPos, &r.EventTimestamp,
 			&gtid, &connID, &r.SchemaName, &r.TableName, &r.EventType, &r.PKValues,
 			&changedCols, &rowBefore, &rowAfter, &r.SchemaVersion,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan result row: %w", err)
+		}
+		if binlogFile.Valid {
+			r.BinlogFile = binlogFile.String
 		}
 		if gtid.Valid {
 			r.GTID = &gtid.String

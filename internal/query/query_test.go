@@ -2,12 +2,14 @@ package query
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/dbtrail/bintrail/internal/parser"
 )
 
@@ -577,6 +579,98 @@ func TestLimitPerPK_zero_passthrough(t *testing.T) {
 	got := LimitPerPK(rows, 0)
 	if len(got) != 2 {
 		t.Errorf("LimitPerPK(_, 0) should be a passthrough, got %d rows", len(got))
+	}
+}
+
+// ─── scanRows: NULL handling ─────────────────────────────────────────────────
+
+// scanRowColumns must mirror the SELECT list in buildQuery; sqlmock matches by
+// column name. Keep this in sync with the cols string in query.go.
+var scanRowColumns = []string{
+	"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+	"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
+	"changed_columns", "row_before", "row_after", "schema_version",
+}
+
+// TestFetch_nullBinlogFile is the regression guard for issue #318. NULL
+// binlog_file values are legitimate (snapshot baseline rows, schema_change
+// records propagated from other sources, manually-imported events) and must
+// not break the Scan with "converting NULL to string is unsupported".
+func TestFetch_nullBinlogFile(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	ts := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	rows := sqlmock.NewRows(scanRowColumns).
+		// Row 1: NULL binlog_file (the bug case). Other nullables also NULL.
+		AddRow(uint64(1), nil, uint64(0), uint64(0), ts,
+			nil, nil, "mydb", "orders", uint8(parser.EventSnapshot), "1",
+			nil, nil, []byte(`{"id":1}`), uint32(0)).
+		// Row 2: non-NULL binlog_file to confirm the happy path still works.
+		AddRow(uint64(2), "binlog.000042", uint64(100), uint64(200), ts,
+			nil, nil, "mydb", "orders", uint8(parser.EventInsert), "2",
+			nil, nil, []byte(`{"id":2}`), uint32(0))
+
+	mock.ExpectQuery("SELECT .* FROM binlog_events").WillReturnRows(rows)
+
+	e := New(db)
+	got, err := e.Fetch(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("Fetch failed on NULL binlog_file: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(got))
+	}
+	if got[0].BinlogFile != "" {
+		t.Errorf("expected empty BinlogFile for NULL row, got %q", got[0].BinlogFile)
+	}
+	if got[0].EventID != 1 {
+		t.Errorf("expected event_id=1 for first row, got %d", got[0].EventID)
+	}
+	if got[1].BinlogFile != "binlog.000042" {
+		t.Errorf("expected BinlogFile=binlog.000042 for second row, got %q", got[1].BinlogFile)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestFetch_nullBinlogFile_jsonOutput confirms the JSON formatter still
+// produces a clean empty string for a NULL binlog_file — no Go zero-value
+// leakage like "null" or sql.NullString-style {"String":"","Valid":false}.
+func TestFetch_nullBinlogFile_jsonOutput(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	ts := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	rows := sqlmock.NewRows(scanRowColumns).
+		AddRow(uint64(1), nil, uint64(0), uint64(0), ts,
+			nil, nil, "mydb", "orders", uint8(parser.EventSnapshot), "1",
+			nil, nil, []byte(`{"id":1}`), uint32(0))
+
+	mock.ExpectQuery("SELECT .* FROM binlog_events").WillReturnRows(rows)
+
+	e := New(db)
+	var buf bytes.Buffer
+	n, err := e.Run(context.Background(), Options{}, "json", &buf)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 row, got %d", n)
+	}
+	var out []map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if out[0]["binlog_file"] != "" {
+		t.Errorf("expected binlog_file=\"\" in JSON, got %v", out[0]["binlog_file"])
 	}
 }
 
