@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt (warning-only)
+        # The repo has pre-existing unformatted files; surface the list as a
+        # warning but do not fail CI on it. Tighten to a hard fail once the
+        # backlog is cleared.
+        run: gofmt -l . || true
+        continue-on-error: true
+
+      - name: Unit tests
+        run: go test ./... -race -count=1
+
+  integration:
+    runs-on: ubuntu-22.04
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: testroot
+        ports:
+          - 13306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -uroot -ptestroot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Matches internal/testutil.DefaultDSN — set explicitly to mirror the
+      # SaaS repo's `agent/` job and make the wiring obvious in logs.
+      BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Integration tests (-tags=integration)
+        run: go test -tags=integration -race -count=1 ./...
