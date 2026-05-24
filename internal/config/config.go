@@ -2,6 +2,7 @@ package config
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,6 +14,12 @@ import (
 // and falls back to SHOW MASTER STATUS for 5.7 / 8.0 / Percona <8.4 where the
 // new statement does not exist. When both fail, the wrapped error includes
 // both diagnostics so the operator does not chase the wrong syntax.
+//
+// When binary logging is disabled on the source (log_bin=OFF), both statements
+// return an empty resultset rather than an error, surfacing as sql.ErrNoRows
+// from Scan on both branches. In that specific case we return a domain-specific
+// error pointing the operator at the likely cause and the remediation query,
+// instead of the unhelpful "no rows in result set" pair.
 func CurrentBinlogPosition(db *sql.DB) (file string, pos uint32, err error) {
 	scanArgs := []any{&file, &pos, new(string), new(string), new(string)}
 	if err = db.QueryRow("SHOW BINARY LOG STATUS").Scan(scanArgs...); err == nil {
@@ -20,6 +27,9 @@ func CurrentBinlogPosition(db *sql.DB) (file string, pos uint32, err error) {
 	}
 	firstErr := err
 	if err = db.QueryRow("SHOW MASTER STATUS").Scan(scanArgs...); err != nil {
+		if errors.Is(firstErr, sql.ErrNoRows) && errors.Is(err, sql.ErrNoRows) {
+			return "", 0, fmt.Errorf("current binlog position empty — log_bin appears to be OFF on the source server (run \"SHOW VARIABLES LIKE 'log_bin'\" to confirm)")
+		}
 		return "", 0, fmt.Errorf("SHOW BINARY LOG STATUS / SHOW MASTER STATUS: %w (fallback: %w)", firstErr, err)
 	}
 	return file, pos, nil
