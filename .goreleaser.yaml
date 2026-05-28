@@ -46,14 +46,128 @@ builds:
       - -X main.mcpVersion={{.Version}}
 
 archives:
-  - format: tar.gz
+  - formats:
+      - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    builds:
+    ids:
       - bintrail
       - bintrail-mcp
 
 checksum:
   name_template: "checksums.txt"
+
+# Auto-detect prereleases from the tag (e.g. v0.7.12-rc1) and mark the
+# GitHub release "prerelease" so an RC never claims the "Latest" badge.
+# Pairs with skip_push: auto on the :latest Docker manifest below.
+release:
+  prerelease: auto
+
+# ── Linux packages (deb/rpm) ───────────────────────────────
+# Attached to the GitHub release as downloadable assets. No external
+# repository required, unlike the Homebrew tap below.
+nfpms:
+  - id: bintrail
+    package_name: bintrail
+    ids:
+      - bintrail
+      - bintrail-mcp
+    vendor: dbtrail
+    homepage: https://github.com/dbtrail/bintrail
+    maintainer: Daniel <daniel@dbtrail.com>
+    description: >-
+      Parse MySQL ROW-format binary logs, index every row event with full
+      before/after images, and generate reversal SQL for recovery.
+    license: BUSL-1.1
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    dependencies:
+      - ca-certificates
+
+# ── Docker images (multi-arch, published to GHCR) ──────────
+# One image per arch, then a manifest stitching them into a single
+# multi-arch tag. The arm64 image's RUN step executes under QEMU on the
+# amd64 CI runner, so the workflow sets up docker/setup-qemu-action.
+# Per-arch images carry only the version tag. Both the :{version} and
+# :latest manifests below reference these same arch images — a manifest only
+# needs the per-arch images to exist in the registry, so there's no need for
+# separate :latest-<arch> tags. This is what lets us gate :latest (see the
+# skip_push on the latest manifest) without skipping the version push too.
+dockers:
+  - id: bintrail-amd64
+    goos: linux
+    goarch: amd64
+    ids:
+      - bintrail
+      - bintrail-mcp
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail:{{ .Version }}-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
+      - "--label=org.opencontainers.image.licenses=BUSL-1.1"
+
+  - id: bintrail-arm64
+    goos: linux
+    goarch: arm64
+    ids:
+      - bintrail
+      - bintrail-mcp
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail:{{ .Version }}-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
+      - "--label=org.opencontainers.image.licenses=BUSL-1.1"
+
+docker_manifests:
+  - name_template: "ghcr.io/dbtrail/bintrail:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail:{{ .Version }}-amd64"
+      - "ghcr.io/dbtrail/bintrail:{{ .Version }}-arm64"
+  # skip_push: auto → never move :latest onto a prerelease (e.g. -rc1) tag.
+  # The version-specific images/manifest above still push on a prerelease,
+  # so an RC tag fully exercises the build+push pipeline without polluting
+  # the tag anonymous users pull.
+  - name_template: "ghcr.io/dbtrail/bintrail:latest"
+    skip_push: "auto"
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail:{{ .Version }}-amd64"
+      - "ghcr.io/dbtrail/bintrail:{{ .Version }}-arm64"
+
+# ── Homebrew tap (DEFERRED — do not uncomment until prerequisites exist) ──
+# Requires BOTH:
+#   1. A tap repository: github.com/dbtrail/homebrew-tap (must be created).
+#   2. A HOMEBREW_TAP_GITHUB_TOKEN secret on this repo — a PAT with write
+#      access to the tap repo. The default GITHUB_TOKEN CANNOT push to a
+#      different repository, so the build-in token is not enough.
+# Once both exist, uncomment this block and add the token to the workflow env.
+#
+# brews:
+#   - name: bintrail
+#     repository:
+#       owner: dbtrail
+#       name: homebrew-tap
+#       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+#     homepage: https://github.com/dbtrail/bintrail
+#     description: MySQL binlog time-travel — index row events and generate reversal SQL.
+#     license: BUSL-1.1
+#     install: |
+#       bin.install "bintrail"
+#       bin.install "bintrail-mcp"
 
 changelog:
   sort: asc
@@ -62,3 +176,32 @@ changelog:
       - "^docs:"
       - "^test:"
       - "^ci:"
+
+# ── Supply-chain attestations (separable) ──────────────────
+# SBOM generation (syft) and cosign keyless signing. These are the most
+# likely blocks to need iteration on the first release tag (OIDC / installer
+# ordering). If they fight the pipeline, they can be removed wholesale
+# without affecting the binary/archive/deb/rpm/Docker outputs above.
+sboms:
+  - artifacts: archive
+
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+docker_signs:
+  - cmd: cosign
+    artifacts: manifests
+    args:
+      - sign
+      - "${artifact}@${digest}"
+      - "--yes"
+    output: true

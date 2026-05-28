@@ -31,6 +31,27 @@ docker buildx build \
 
 > **Note:** CGO cross-compilation for `arm64` requires the `aarch64-linux-gnu-gcc` toolchain. Docker Buildx handles this automatically with QEMU emulation, though native compilation is faster.
 
+## Pre-built images (GHCR)
+
+Each tagged release publishes a multi-arch image (`linux/amd64` + `linux/arm64`) to GitHub Container Registry, so you don't need a Go toolchain or a local build:
+
+```bash
+docker pull ghcr.io/dbtrail/bintrail:latest        # latest release
+docker pull ghcr.io/dbtrail/bintrail:v0.7.12       # a specific version
+```
+
+The images and the release checksums are signed with [cosign](https://github.com/sigstore/cosign) (keyless, via GitHub OIDC). Verify an image before running it:
+
+```bash
+cosign verify ghcr.io/dbtrail/bintrail:latest \
+  --certificate-identity-regexp "https://github.com/dbtrail/bintrail/.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+```
+
+An SBOM is attached to each release archive on the GitHub Releases page.
+
+> **Maintainer note (one-time):** the first release creates the GHCR package as **private**. Anonymous `docker pull` only works once the package is made public: in the org's *Packages → bintrail → Package settings*, set visibility to **Public** and link it to this repository. Until then the `pull` commands above require `docker login ghcr.io`.
+
 ## Running with docker run
 
 ### One-off commands
@@ -114,7 +135,7 @@ To use a pre-built image instead of building locally, replace the `build: .` lin
 ```yaml
 services:
   bintrail:
-    image: your-registry/bintrail:v1.2.3
+    image: ghcr.io/dbtrail/bintrail:latest
     # build: .  # comment out or remove
 ```
 

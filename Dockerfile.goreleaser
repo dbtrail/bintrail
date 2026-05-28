@@ -1,0 +1,23 @@
+# GoReleaser-only Dockerfile.
+#
+# Unlike the root ./Dockerfile (which builds from source for `docker build`),
+# this image just copies the binaries GoReleaser already cross-compiled. The
+# build context root contains `bintrail` and `bintrail-mcp` for the target
+# arch — GoReleaser stages them there before invoking `docker build`.
+#
+# Runtime base matches the root Dockerfile (debian:bookworm-slim) so the
+# published image keeps the same contract: glibc for DuckDB's static libs, a
+# shell for debugging, and apt for installing mydumper when `dump`/`baseline`
+# are used.
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --system --no-create-home bintrail
+
+COPY bintrail /usr/local/bin/bintrail
+COPY bintrail-mcp /usr/local/bin/bintrail-mcp
+
+USER bintrail
+ENTRYPOINT ["bintrail"]
