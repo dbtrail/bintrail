@@ -25,12 +25,17 @@
 // forwards it to the shim hostgroup; the shim then transparently
 // time-travels the original table. See issue #288.
 //
-// _flashback returns the row's state at-or-before the AS OF instant.
-// _snapshot is currently identical to _flashback; the distinction is
-//   semantic: _snapshot is intended to integrate baseline lookups (the
-//   bintrail dump/baseline pipeline) so it can answer for rows that
-//   have never appeared in binlog events. For now they share an
-//   implementation and the API surface is reserved.
+// _flashback returns the row's state at-or-before the AS OF instant,
+//   resolved purely from indexed binlog events (binlog-only).
+// _snapshot is the baseline-aware sibling (#355): when `bintrail shim`
+//   is started with --baseline-dir / --baseline-s3, single-row
+//   _snapshot seeds the row state from the `bintrail baseline` Parquet
+//   snapshot and applies post-snapshot events on top, so it can answer
+//   for rows that existed at AS OF but were never touched in the
+//   retained binlog window. With no baseline source configured it
+//   degrades to the binlog-only _flashback behaviour. The two schemas
+//   are parsed identically here; the semantic split lives in the
+//   handler dispatch (runPointInTime vs runSnapshot).
 // _diff returns every event for the PK between t1 and t2, one row per
 //   event. Useful for "what changed to this row recently".
 //

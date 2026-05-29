@@ -257,6 +257,21 @@ type Config struct {
 	// (the LTS 2.6 line is not verified to negotiate SHA2 against
 	// backends).
 	AuthMethod string
+	// BaselineDir / BaselineS3 point the _snapshot baseline-lookup path
+	// (#355) at the Parquet snapshots produced by `bintrail baseline`.
+	// BaselineS3 (an s3:// URL prefix) takes precedence over BaselineDir
+	// (a local directory) when both are set. When neither is set,
+	// _snapshot behaves exactly like _flashback (binlog-only) — the
+	// pre-#355 behaviour — so existing deployments see no change until
+	// they opt in by configuring a baseline source.
+	//
+	// Only _snapshot consults these; _flashback stays binlog-only by
+	// design so the two virtual schemas have distinct, documented
+	// semantics (a row that existed at AS OF but was never touched in
+	// the retained binlog window appears under _snapshot, not under
+	// _flashback).
+	BaselineDir string
+	BaselineS3  string
 }
 
 // NewHandler constructs a Handler bound to a bintrail index DSN with
@@ -322,8 +337,10 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 			return nil, verr
 		}
 		switch q.Type {
-		case TypeFlashback, TypeSnapshot:
+		case TypeFlashback:
 			return h.runPointInTime(q)
+		case TypeSnapshot:
+			return h.runSnapshot(q)
 		case TypeDiff:
 			return h.runDiff(q)
 		default:
@@ -376,9 +393,8 @@ func wrapFetchError(qType QueryType, err error) error {
 	return fmt.Errorf("resolve %s: %w", qType, err)
 }
 
-// runPointInTime resolves a _flashback or _snapshot query against
-// the bintrail index + archives and reconstructs the row's state at
-// q.AsOf.
+// runPointInTime resolves a _flashback query (binlog-only) against the
+// bintrail index + archives and reconstructs the row's state at q.AsOf.
 //
 // Two shapes are recognised, sharing this entry point:
 //   - q.PKColumn != "": single-row point-lookup. Returns the latest
@@ -396,10 +412,11 @@ func wrapFetchError(qType QueryType, err error) error {
 // Forensic queries for the pre-delete image still work via _diff,
 // which exposes the full per-PK event history including row_before.
 //
-// _flashback and _snapshot share this implementation today. _snapshot
-// is intended to grow baseline-lookup support (querying the
-// dump/baseline pipeline for rows that never appeared in binlog
-// events) — that's a future iteration.
+// _snapshot no longer shares this entry point: it routes through
+// runSnapshot, which adds baseline-lookup (#355) on top of this
+// binlog-only path so rows that existed at AsOf but were never touched
+// in the retained binlog window still resolve. _flashback deliberately
+// stays binlog-only here.
 func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	if q.PKColumn == "" {
 		return h.runFullTable(q)

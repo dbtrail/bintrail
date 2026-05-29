@@ -74,12 +74,14 @@ password gate against the same cleartext. The default --listen of
 }
 
 var (
-	shListen     string
-	shIndexDSN   string
-	shShimConfig string
-	shNoArchive  bool
-	shAllowGaps  bool
-	shAuthMethod string
+	shListen      string
+	shIndexDSN    string
+	shShimConfig  string
+	shNoArchive   bool
+	shAllowGaps   bool
+	shAuthMethod  string
+	shBaselineDir string
+	shBaselineS3  string
 )
 
 // monitorDeniedStats aggregates ER_ACCESS_DENIED_ERROR handshake failures
@@ -163,6 +165,8 @@ func init() {
 	shimCmd.Flags().BoolVar(&shNoArchive, "no-archive", false, "Skip archive auto-discovery; query only the live MySQL index")
 	shimCmd.Flags().BoolVar(&shAllowGaps, "allow-gaps", false, "Warn and continue when an archive source fails or the planner detects a coverage gap, instead of returning a MySQL protocol error to the client (default: strict, fail loudly)")
 	shimCmd.Flags().StringVar(&shAuthMethod, "auth-method", "", "MySQL auth plugin to advertise during the handshake. Empty (default) keeps mysql_native_password for backwards compatibility. Set to 'caching_sha2_password' or 'sha256_password' on MySQL 8.4+ instances where mysql_native_password is disabled by default. Requires ProxySQL 2.7+ upstream.")
+	shimCmd.Flags().StringVar(&shBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots (from 'bintrail baseline'). Enables _snapshot baseline lookup so rows untouched within the retained binlog window still resolve at AS OF. _flashback stays binlog-only. Unset (default) makes _snapshot behave like _flashback.")
+	shimCmd.Flags().StringVar(&shBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/). Takes precedence over --baseline-dir. Uses the standard AWS credential chain. See --baseline-dir for what it enables.")
 	_ = shimCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(shimCmd)
 	rootCmd.AddCommand(shimCmd)
@@ -297,6 +301,8 @@ func runShim(cmd *cobra.Command, args []string) error {
 		NoArchive:   shNoArchive,
 		IndexDBName: dsnCfg.DBName,
 		AuthMethod:  shAuthMethod,
+		BaselineDir: shBaselineDir,
+		BaselineS3:  shBaselineS3,
 	}
 	// Build the *server.Server once at startup, not per connection:
 	//
