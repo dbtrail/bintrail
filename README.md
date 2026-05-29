@@ -12,11 +12,24 @@
 
 ## Install
 
+**Docker (no Go toolchain required):**
+
+```sh
+docker pull ghcr.io/dbtrail/bintrail:latest
+docker run --rm ghcr.io/dbtrail/bintrail:latest --version
+```
+
+Multi-arch (`linux/amd64` + `linux/arm64`), signed with cosign. The image bundles both `bintrail` and `bintrail-mcp`. See [docs/docker.md](docs/docker.md) for signature verification and `docker run` usage.
+
+**Linux packages:** `.deb` and `.rpm` for both architectures are attached to each [release](https://github.com/dbtrail/bintrail/releases).
+
+**Go install:**
+
 ```sh
 go install github.com/dbtrail/bintrail/cmd/bintrail@latest
 ```
 
-Or build from source:
+**Build from source:**
 
 ```sh
 git clone https://github.com/dbtrail/bintrail
