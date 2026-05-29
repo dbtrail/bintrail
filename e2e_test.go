@@ -346,10 +346,15 @@ func TestEndToEnd_fullPipeline(t *testing.T) {
 	if err := os.MkdirAll(archiveDir, 0755); err != nil {
 		t.Fatalf("failed to create archive dir: %v", err)
 	}
+	// --add-future is declarative: it tops up to at least N future partitions
+	// rather than always adding N. `init --partitions 48` already leaves 47
+	// future partitions, so the target must exceed that to add anything and
+	// exercise the partition-add path. 100 > 48 guarantees a top-up here.
 	rotateOut := run(t, binPath, coverDir, "rotate",
 		"--index-dsn", indexDSN,
-		"--add-future", "3",
+		"--add-future", "100",
 		"--archive-dir", archiveDir,
+		"--bintrail-id", "00000000-0000-0000-0000-000000000001",
 		"--archive-compression", "none",
 	)
 	// rotate writes "added partition p_YYYYMMDD" lines to stdout.

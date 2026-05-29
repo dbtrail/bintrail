@@ -104,8 +104,8 @@ func TestMCPE2E(t *testing.T) {
 		t.Fatalf("tools/list: expected result object, got: %v", listResp)
 	}
 	tools, _ := listResult["tools"].([]any)
-	if len(tools) != 3 {
-		t.Errorf("tools/list: expected 3 tools, got %d", len(tools))
+	if len(tools) != 4 {
+		t.Errorf("tools/list: expected 4 tools, got %d", len(tools))
 	}
 
 	toolNames := make(map[string]bool)
@@ -114,7 +114,7 @@ func TestMCPE2E(t *testing.T) {
 			toolNames[m["name"].(string)] = true
 		}
 	}
-	for _, want := range []string{"query", "recover", "status"} {
+	for _, want := range []string{"query", "recover", "status", "list_schema_changes"} {
 		if !toolNames[want] {
 			t.Errorf("tool %q not found in list", want)
 		}
