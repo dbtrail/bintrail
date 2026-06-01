@@ -413,6 +413,12 @@ type mergeInput struct {
 // Changes map: after this function returns, entries still present are rows
 // that were NOT found in the baseline (appended as new INSERTs).
 //
+// The actual merge is delegated to mergeBaselineImages so the same logic
+// backs both this writer path and the shim's in-memory full-table _snapshot
+// path (SnapshotFullTableImages). This function is the thin writer wrapper:
+// it owns the MydumperWriter and turns each emitted row map into an ordered
+// tuple the writer expects.
+//
 // The writer's Close() is deferred as a fallback: on any early return it
 // still runs and unlinks half-written chunk files, so callers never observe
 // stray partial output on disk.
@@ -438,9 +444,86 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 		return err
 	}
 
+	// emit re-orders each emitted row map into the baseline Parquet column
+	// order the writer was constructed with. For baseline pass-through rows
+	// the map is keyed by exactly those columns (so rowAfterOrdered is an
+	// order-preserving identity); for event after-images it aligns the
+	// event's row_after to the baseline schema, filling drift columns with
+	// NULL — identical to the pre-refactor behaviour.
+	stats, err := mergeBaselineImages(ctx, mergeCore{
+		LocalBaselinePath: in.LocalBaselinePath,
+		Schema:            in.Schema,
+		Table:             in.Table,
+		PKCols:            in.PKCols,
+		Changes:           in.Changes,
+	}, func(rowMap map[string]any) error {
+		return mw.WriteRow(rowAfterOrdered(rowMap, colNames, in.Schema, in.Table))
+	})
+	if err != nil {
+		return err
+	}
+	rep.BaselineRows = stats.BaselineRows
+	rep.UpdatesApplied = stats.UpdatesApplied
+	rep.InsertsEmitted = stats.InsertsEmitted
+	rep.DeletesSkipped = stats.DeletesSkipped
+
+	// Close explicitly to promote close errors into the happy-path return
+	// value (the deferred Close above is a no-op after this succeeds, and
+	// a no-op from an already-closed writer is safe).
+	if err := mw.Close(); err != nil {
+		return fmt.Errorf("close mydumper writer: %w", err)
+	}
+	rep.Files = mw.Files()
+	return nil
+}
+
+// mergeCore is the writer-agnostic input to mergeBaselineImages.
+type mergeCore struct {
+	LocalBaselinePath string
+	Schema            string
+	Table             string
+	PKCols            []metadata.ColumnMeta
+	Changes           map[string]*query.ResultRow
+}
+
+// mergeStats counts what mergeBaselineImages did, for the offline
+// TableReport. The shim path ignores it.
+type mergeStats struct {
+	BaselineRows   int64
+	UpdatesApplied int64
+	InsertsEmitted int64
+	DeletesSkipped int64
+}
+
+// mergeBaselineImages streams the local baseline Parquet via DuckDB, applies
+// the change map, and calls emit once per row of the reconstructed table, in
+// baseline Parquet column order:
+//
+//   - a baseline row not present in Changes is emitted as-is (pass-through);
+//   - a baseline row whose PK is in Changes is emitted as the event's
+//     row_after image (UPDATE/INSERT wins over the baseline), or skipped
+//     entirely when the latest event is a DELETE;
+//   - PKs left in Changes after the baseline scan are post-snapshot inserts
+//     (rows that did not exist at baseline time) and are emitted last, in
+//     deterministic PK order.
+//
+// The emitted map is keyed by column name. Pass-through rows carry the
+// baseline's values verbatim (DuckDB scan types — time.Time, []byte, …);
+// event rows carry the binlog event's row_after (JSON-decoded). Callers that
+// build a wire resultset normalise the values; the writer path re-orders them.
+// emit returning a non-nil error stops the merge and propagates that error
+// (used by the shim to enforce its row cap). Drains in.Changes.
+//
+// This is the shared core for both the offline `bintrail reconstruct` writer
+// (mergeBaselineIntoWriter) and the shim full-table _snapshot path
+// (SnapshotFullTableImages), so the two reconstruction surfaces can never
+// drift in merge semantics.
+func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string]any) error) (mergeStats, error) {
+	var stats mergeStats
+
 	ddb, err := sql.Open("duckdb", "")
 	if err != nil {
-		return fmt.Errorf("open duckdb: %w", err)
+		return stats, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer ddb.Close()
 
@@ -448,13 +531,13 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 	q := fmt.Sprintf("SELECT * FROM parquet_scan('%s')", safePath)
 	drows, err := ddb.QueryContext(ctx, q)
 	if err != nil {
-		return fmt.Errorf("duckdb baseline query: %w", err)
+		return stats, fmt.Errorf("duckdb baseline query: %w", err)
 	}
 	defer drows.Close()
 
 	dcols, err := drows.Columns()
 	if err != nil {
-		return fmt.Errorf("duckdb columns: %w", err)
+		return stats, fmt.Errorf("duckdb columns: %w", err)
 	}
 
 	scan := make([]any, len(dcols))
@@ -465,19 +548,24 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 
 	for drows.Next() {
 		if err := drows.Scan(ptrs...); err != nil {
-			return fmt.Errorf("scan baseline row: %w", err)
+			return stats, fmt.Errorf("scan baseline row: %w", err)
 		}
+		// zipMap reads the scanned values into a fresh map; database/sql
+		// clones []byte into the *any destinations and reassigns (never
+		// mutates) scan[i] on the next Next(), so the map is safe to retain
+		// past this iteration — which the shim relies on when it buffers
+		// emitted rows.
 		rowMap := zipMap(dcols, scan)
 		// Canonicalise PK values before hashing so they match what the
 		// indexer stored in binlog_events.pk_values. Without this,
 		// DATETIME/TIMESTAMP PKs silently miss the change map because
 		// DuckDB returns time.Time while the indexer stored a
-		// go-mysql-formatted string (#212). The non-PK values in rowMap
-		// are left untouched — they're not used for key construction and
-		// flow unchanged into the mydumper writer below.
+		// go-mysql-formatted string (#212). canonicalizePKMap does not
+		// mutate rowMap, so the emitted pass-through row keeps its original
+		// values.
 		pkMap, err := canonicalizePKMap(rowMap, in.PKCols)
 		if err != nil {
-			return fmt.Errorf("canonicalize baseline PK for %s.%s: %w", in.Schema, in.Table, err)
+			return stats, fmt.Errorf("canonicalize baseline PK for %s.%s: %w", in.Schema, in.Table, err)
 		}
 		pk := parser.BuildPKValues(in.PKCols, pkMap)
 
@@ -485,7 +573,7 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 			delete(in.Changes, pk)
 			switch ev.EventType {
 			case parser.EventDelete:
-				rep.DeletesSkipped++
+				stats.DeletesSkipped++
 				continue
 			case parser.EventUpdate, parser.EventInsert:
 				// Defensive: a non-DELETE event with nil RowAfter would
@@ -497,25 +585,20 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 						"event_type", ev.EventType, "event_id", ev.EventID)
 					continue
 				}
-				ordered := rowAfterOrdered(ev.RowAfter, dcols, in.Schema, in.Table)
-				if err := mw.WriteRow(ordered); err != nil {
-					return fmt.Errorf("write update row: %w", err)
+				if err := emit(ev.RowAfter); err != nil {
+					return stats, err
 				}
-				rep.UpdatesApplied++
+				stats.UpdatesApplied++
 			}
 		} else {
-			// Pass-through baseline row. Copy the scan buffer because
-			// database/sql reuses it across Scan calls.
-			rowCopy := make([]any, len(scan))
-			copy(rowCopy, scan)
-			if err := mw.WriteRow(rowCopy); err != nil {
-				return fmt.Errorf("write baseline row: %w", err)
+			if err := emit(rowMap); err != nil {
+				return stats, err
 			}
-			rep.BaselineRows++
+			stats.BaselineRows++
 		}
 	}
 	if err := drows.Err(); err != nil {
-		return fmt.Errorf("iterate baseline rows: %w", err)
+		return stats, fmt.Errorf("iterate baseline rows: %w", err)
 	}
 
 	// Append events for PKs that weren't in the baseline (rows inserted
@@ -537,21 +620,61 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 				"event_type", ev.EventType, "event_id", ev.EventID)
 			continue
 		}
-		ordered := rowAfterOrdered(ev.RowAfter, dcols, in.Schema, in.Table)
-		if err := mw.WriteRow(ordered); err != nil {
-			return fmt.Errorf("write new-row insert: %w", err)
+		if err := emit(ev.RowAfter); err != nil {
+			return stats, err
 		}
-		rep.InsertsEmitted++
+		stats.InsertsEmitted++
 	}
 
-	// Close explicitly to promote close errors into the happy-path return
-	// value (the deferred Close above is a no-op after this succeeds, and
-	// a no-op from an already-closed writer is safe).
-	if err := mw.Close(); err != nil {
-		return fmt.Errorf("close mydumper writer: %w", err)
+	return stats, nil
+}
+
+// SnapshotFullTableInput drives SnapshotFullTableImages.
+type SnapshotFullTableInput struct {
+	// BaselinePath is the baseline Parquet path from FindBaseline — either a
+	// local path or an s3:// URL (downloaded to a temp file before merge).
+	BaselinePath string
+	Schema       string
+	Table        string
+	// PKCols are the table's primary-key column metas, used to canonicalize
+	// baseline PK values so they match the indexer's pk_values strings. The
+	// caller is expected to have guarded every PKCol with SupportedPKType.
+	PKCols []metadata.ColumnMeta
+	// Changes maps pk_values string → the latest binlog event for that PK in
+	// (baseline, AsOf]. Drained by the merge.
+	Changes map[string]*query.ResultRow
+}
+
+// SnapshotFullTableImages reconstructs the full row state of a table at the
+// AsOf instant by merging the baseline snapshot with the change map, calling
+// emit once per surviving row (baseline column order, values verbatim from
+// DuckDB / the binlog event). It is the in-memory sibling of
+// mergeBaselineIntoWriter, for the shim's full-table _snapshot path: instead
+// of writing mydumper output it streams row maps to the caller, which builds
+// the wire resultset and enforces its own row cap (by returning an error from
+// emit).
+//
+// s3:// baselines are downloaded to a temp file first; the temp dir is removed
+// before return. Real failures (unreadable baseline, DuckDB error, a PK value
+// the canonicalizer can't translate) are returned as errors for the caller to
+// surface; the caller decides separately — before calling this — whether a
+// missing baseline or an unsupported PK type should instead fall back to a
+// binlog-only path.
+func SnapshotFullTableImages(ctx context.Context, in SnapshotFullTableInput, emit func(map[string]any) error) error {
+	localPath, cleanup, err := materializeBaselineLocal(ctx, in.BaselinePath)
+	if err != nil {
+		return fmt.Errorf("materialize baseline: %w", err)
 	}
-	rep.Files = mw.Files()
-	return nil
+	defer cleanup()
+
+	_, err = mergeBaselineImages(ctx, mergeCore{
+		LocalBaselinePath: localPath,
+		Schema:            in.Schema,
+		Table:             in.Table,
+		PKCols:            in.PKCols,
+		Changes:           in.Changes,
+	}, emit)
+	return err
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -631,7 +754,10 @@ func readBaselineColumns(ctx context.Context, localPath string) ([]string, error
 }
 
 // zipMap pairs cols with vals to produce a map[string]any view of a row.
-// Used only for PK key construction — not for downstream writes.
+// In mergeBaselineImages the result is used both for PK canonicalization and,
+// for a pass-through baseline row, as the emitted row itself — so the map is
+// retained downstream (see the retention-safety note in that loop). It must
+// not be backed by a buffer reused across DuckDB Scan iterations.
 func zipMap(cols []string, vals []any) map[string]any {
 	out := make(map[string]any, len(cols))
 	for i, c := range cols {

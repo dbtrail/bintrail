@@ -261,6 +261,12 @@ func canonicalizePKMap(row map[string]any, pkCols []metadata.ColumnMeta) (map[st
 	return out, nil
 }
 
+// SupportedPKType is the exported form of supportedPKType, for callers
+// outside this package (the shim's full-table _snapshot path) that need to
+// guard a PK column type before attempting a baseline merge and fall back to
+// their binlog-only path when it isn't supported.
+func SupportedPKType(dataType string) bool { return supportedPKType(dataType) }
+
 // supportedPKType returns true if dataType is in the set of PK column types
 // that canonicalizePKValue handles correctly. Callers use this at the start
 // of a reconstruct run to warn operators about edge cases.

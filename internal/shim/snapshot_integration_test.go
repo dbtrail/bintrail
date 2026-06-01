@@ -528,3 +528,417 @@ func TestSnapshotBaseline_NoBaselineFallsBackToBinlogOnly(t *testing.T) {
 		t.Errorf("_snapshot id=1 (no baseline, never touched): expected 0 rows, got %d", got)
 	}
 }
+
+// rowsByKey indexes a resultset's rows by their first column (the PK), mapping
+// it to the second column, so full-table assertions are order-independent
+// (baseline scan order vs. appended-insert order is an implementation detail).
+func rowsByKey(t *testing.T, rs *mysql.Resultset) map[string]string {
+	t.Helper()
+	out := make(map[string]string)
+	for _, cells := range rowCells(t, rs) {
+		if len(cells) < 2 {
+			t.Fatalf("rowsByKey: expected >=2 columns, got %v", cells)
+		}
+		out[cells[0]] = cells[1]
+	}
+	return out
+}
+
+// TestSnapshotBaseline_FullTableMerge is the core proof for #362: a no-WHERE
+// full-table _snapshot reconstructs the whole table at AS OF by merging the
+// baseline with post-snapshot binlog deltas — a never-touched row appears, an
+// updated row takes its latest image, a deleted row drops out, and a row
+// inserted after the baseline appears. The binlog-only full-table _flashback
+// over the same instant omits the never-touched row, which is exactly the gap
+// the baseline merge closes.
+func TestSnapshotBaseline_FullTableMerge(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	seedUsersSnapshot(t, db, snapTime)
+
+	// Baseline: id=1 alice (never touched), id=2 bob (updated), id=3 carol
+	// (deleted). id=4 is inserted only in binlog.
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "users", usersBaselineCols(), [][]string{
+		{"1", "alice"},
+		{"2", "bob"},
+		{"3", "carol"},
+	})
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "users", 2 /*update*/, "2", nil,
+		[]byte(`{"id":2,"name":"bob"}`), []byte(`{"id":2,"name":"bob2"}`))
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 200, 300, eventTS, nil,
+		"myapp", "users", 3 /*delete*/, "3", nil,
+		[]byte(`{"id":3,"name":"carol"}`), nil)
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 300, 400, eventTS, nil,
+		"myapp", "users", 1 /*insert*/, "4", nil, nil,
+		[]byte(`{"id":4,"name":"dave"}`))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:   true,
+		NoArchive:   true,
+		IndexDBName: dbName,
+		BaselineDir: baselineDir,
+	}, slog.Default())
+
+	fullTableQ := TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "users", AsOf: asOf}
+
+	res, err := h.runSnapshot(fullTableQ)
+	if err != nil {
+		t.Fatalf("full-table _snapshot: %v", err)
+	}
+	got := rowsByKey(t, res.Resultset)
+	want := map[string]string{"1": "alice", "2": "bob2", "4": "dave"}
+	if len(got) != len(want) {
+		t.Fatalf("full-table _snapshot returned %d rows %v, want %d %v", len(got), got, len(want), want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("full-table _snapshot row id=%s = %q, want %q (full map: %v)", k, got[k], v, got)
+		}
+	}
+	if _, deleted := got["3"]; deleted {
+		t.Errorf("full-table _snapshot included id=3, which was deleted after the baseline: %v", got)
+	}
+	if want, ok := got["1"]; !ok || want != "alice" {
+		t.Errorf("full-table _snapshot missing never-touched baseline row id=1 (alice): %v", got)
+	}
+	if cols := fieldNames(res.Resultset.Fields); !slices.Equal(cols, []string{"id", "name"}) {
+		t.Errorf("full-table _snapshot columns = %v, want [id name]", cols)
+	}
+
+	// Divergence: binlog-only full-table _flashback omits the never-touched row.
+	flashRes, err := h.runFullTable(TimeTravelQuery{Type: TypeFlashback, Schema: "myapp", Table: "users", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("full-table _flashback: %v", err)
+	}
+	flash := rowsByKey(t, flashRes.Resultset)
+	if _, present := flash["1"]; present {
+		t.Errorf("full-table _flashback included never-touched id=1; divergence with _snapshot lost: %v", flash)
+	}
+	if flash["2"] != "bob2" || flash["4"] != "dave" {
+		t.Errorf("full-table _flashback = %v, want id=2 bob2 and id=4 dave (rows with binlog activity)", flash)
+	}
+}
+
+// TestSnapshotBaseline_FullTableRowCap proves the cost guardrail still bites on
+// the merged path: with the cap below the reconstructed row count, full-table
+// _snapshot returns ER_TOO_BIG_SELECT rather than buffering an unbounded
+// resultset.
+func TestSnapshotBaseline_FullTableRowCap(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+
+	seedUsersSnapshot(t, db, snapTime)
+	// Three never-touched baseline rows; cap of 1 must trip.
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "users", usersBaselineCols(), [][]string{
+		{"1", "alice"},
+		{"2", "bob"},
+		{"3", "carol"},
+	})
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:       true,
+		NoArchive:       true,
+		IndexDBName:     dbName,
+		BaselineDir:     baselineDir,
+		FullTableRowCap: 1,
+	}, slog.Default())
+
+	_, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "users", AsOf: asOf})
+	if err == nil {
+		t.Fatalf("full-table _snapshot with cap=1 over 3 rows: expected ER_TOO_BIG_SELECT, got nil")
+	}
+	if me, ok := err.(*mysql.MyError); !ok || me.Code != mysql.ER_TOO_BIG_SELECT {
+		t.Errorf("full-table _snapshot cap error = %v, want ER_TOO_BIG_SELECT (1104)", err)
+	}
+}
+
+// TestSnapshotBaseline_FullTableNoBaselineFallsBack proves the "_snapshot
+// degrades to _flashback" contract for the full-table shape: with no baseline
+// source configured, full-table _snapshot returns exactly the binlog-only set
+// (rows with activity), never erroring where _flashback would succeed.
+func TestSnapshotBaseline_FullTableNoBaselineFallsBack(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	seedUsersSnapshot(t, db, snapTime)
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "users", 1 /*insert*/, "9", nil, nil,
+		[]byte(`{"id":9,"name":"heidi"}`))
+
+	// No baseline source.
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:   true,
+		NoArchive:   true,
+		IndexDBName: dbName,
+	}, slog.Default())
+
+	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "users", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("full-table _snapshot (no baseline): %v", err)
+	}
+	got := rowsByKey(t, res.Resultset)
+	if len(got) != 1 || got["9"] != "heidi" {
+		t.Errorf("full-table _snapshot (no baseline) = %v, want only id=9 heidi (binlog-only fallback)", got)
+	}
+}
+
+// TestSnapshotBaseline_FullTableHandleQueryWiring drives a real no-WHERE query
+// string through HandleQuery → Parse → dispatch, proving the full-table
+// TypeSnapshot path actually reaches runSnapshotFullTable (the other full-table
+// tests call runSnapshot directly, so a wrong dispatch arm would leave them
+// green while the feature was dead — the same gap TestSnapshotBaseline_HandleQueryWiring
+// guards for the single-row shape). It also exercises a never-touched row with a
+// DATETIME non-PK column, proving fullTableTextCell's UTC formatting end-to-end.
+func TestSnapshotBaseline_FullTableHandleQueryWiring(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+	asOfLit := asOf.Format("2006-01-02 15:04:05")
+	ts := snapTime.UTC().Format("2006-01-02 15:04:05")
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// events(id INT PK, name VARCHAR, created DATETIME, amount DECIMAL). The
+	// DECIMAL column proves a never-touched baseline row's decimal value (stored
+	// as a Parquet string → []byte) renders correctly through fullTableTextCell
+	// rather than hitting the %v last resort.
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "events", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "events", "name", 2, "", "varchar", "YES")
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "events", "created", 3, "", "datetime", "YES")
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "events", "amount", 4, "", "decimal", "YES")
+
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "name", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+		{Name: "created", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
+		{Name: "amount", MySQLType: "decimal", ParquetType: baseline.MysqlToParquetNode("decimal")},
+	}
+	// id=1 never touched (proves baseline pass-through + datetime UTC format +
+	// decimal rendering); id=2 updated after baseline.
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "events", cols, [][]string{
+		{"1", "alice", "2020-01-01 00:00:00", "12.34"},
+		{"2", "bob", "2020-02-02 00:00:00", "99.99"},
+	})
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "events", 2 /*update*/, "2", nil,
+		[]byte(`{"id":2,"name":"bob","created":"2020-02-02 00:00:00","amount":"99.99"}`),
+		[]byte(`{"id":2,"name":"bob2","created":"2020-02-02 00:00:00","amount":"99.99"}`))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:   true,
+		NoArchive:   true,
+		IndexDBName: dbName,
+		BaselineDir: baselineDir,
+	}, slog.Default())
+	if err := h.UseDB("myapp"); err != nil {
+		t.Fatalf("UseDB: %v", err)
+	}
+
+	// Full-table _snapshot must reach the baseline merge and surface the
+	// never-touched row with its datetime column formatted UTC.
+	snapRes, err := h.HandleQuery("SELECT * FROM _snapshot.events AS OF '" + asOfLit + "'")
+	if err != nil {
+		t.Fatalf("HandleQuery full-table _snapshot: %v", err)
+	}
+	var row1 []string
+	for _, cells := range rowCells(t, snapRes.Resultset) {
+		if len(cells) > 0 && cells[0] == "1" {
+			row1 = cells
+		}
+	}
+	if row1 == nil {
+		t.Fatalf("full-table _snapshot did not reach runSnapshotFullTable: never-touched id=1 absent in %v", rowCells(t, snapRes.Resultset))
+	}
+	if want := []string{"1", "alice", "2020-01-01 00:00:00", "12.34"}; !slices.Equal(row1, want) {
+		t.Errorf("full-table _snapshot id=1 = %v, want %v (datetime must format UTC; decimal must render as its string)", row1, want)
+	}
+
+	// Full-table _flashback (binlog-only) must omit the never-touched row.
+	flashRes, err := h.HandleQuery("SELECT * FROM _flashback.events AS OF '" + asOfLit + "'")
+	if err != nil {
+		t.Fatalf("HandleQuery full-table _flashback: %v", err)
+	}
+	for _, cells := range rowCells(t, flashRes.Resultset) {
+		if len(cells) > 0 && cells[0] == "1" {
+			t.Errorf("full-table _flashback included never-touched id=1; dispatch/divergence wrong: %v", cells)
+		}
+	}
+}
+
+// The three tests below close the coverage gap on the configured-but-degraded
+// full-table fallback branches of runSnapshotFullTable. Each configures a
+// baseline source (so we are past the no-source Debug branch) and asserts the
+// result equals the binlog-only set — i.e. the query degrades to runFullTable
+// rather than erroring or silently mis-merging. A never-touched baseline row
+// (present only in the baseline) being ABSENT is the discriminator that proves
+// the merge did NOT run.
+
+// TestSnapshotBaseline_FullTableUnsupportedPKDegrades: an unsupported PK type
+// (FLOAT) is rejected by reconstruct.SupportedPKType, so full-table _snapshot
+// must fall through to binlog-only even though a baseline with a never-touched
+// row exists.
+func TestSnapshotBaseline_FullTableUnsupportedPKDegrades(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+	ts := snapTime.UTC().Format("2006-01-02 15:04:05")
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// FLOAT PK — unsupported by the baseline canonicalizer.
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "readings", "k", 1, "PRI", "float", "NO")
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "readings", "v", 2, "", "varchar", "YES")
+	cols := []baseline.Column{
+		{Name: "k", MySQLType: "float", ParquetType: baseline.MysqlToParquetNode("float")},
+		{Name: "v", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	// k=1.5 never touched (would appear only if the merge ran); k=2.5 has an event.
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "readings", cols, [][]string{
+		{"1.5", "untouched"},
+	})
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "readings", 1 /*insert*/, "2.5", nil, nil,
+		[]byte(`{"k":2.5,"v":"fresh"}`))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps: true, NoArchive: true, IndexDBName: dbName, BaselineDir: baselineDir,
+	}, slog.Default())
+
+	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "readings", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("full-table _snapshot (unsupported PK) must degrade, not error: %v", err)
+	}
+	got := rowsByKey(t, res.Resultset)
+	if _, merged := got["1.5"]; merged {
+		t.Errorf("unsupported-PK full-table _snapshot merged the baseline (never-touched k=1.5 present); must degrade to binlog-only: %v", got)
+	}
+	if got["2.5"] != "fresh" {
+		t.Errorf("unsupported-PK full-table _snapshot = %v, want only the binlog row k=2.5 fresh", got)
+	}
+}
+
+// TestSnapshotBaseline_FullTableUnresolvablePKDegrades: when the table is not
+// in the schema snapshot, pkColumnMetas can't determine the PK, so full-table
+// _snapshot must fall through to binlog-only rather than merging against an
+// empty/wrong PK set.
+func TestSnapshotBaseline_FullTableUnresolvablePKDegrades(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// No schema_snapshots row for myapp.users → pkColumnMetas returns false.
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "users", usersBaselineCols(), [][]string{
+		{"1", "untouched"},
+	})
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "users", 1 /*insert*/, "2", nil, nil,
+		[]byte(`{"id":2,"name":"fresh"}`))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps: true, NoArchive: true, IndexDBName: dbName, BaselineDir: baselineDir,
+	}, slog.Default())
+
+	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "users", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("full-table _snapshot (unresolvable PK) must degrade, not error: %v", err)
+	}
+	got := rowsByKey(t, res.Resultset)
+	if _, merged := got["1"]; merged {
+		t.Errorf("unresolvable-PK full-table _snapshot merged the baseline (never-touched id=1 present); must degrade to binlog-only: %v", got)
+	}
+	if got["2"] != "fresh" {
+		t.Errorf("unresolvable-PK full-table _snapshot = %v, want only the binlog row id=2 fresh", got)
+	}
+}
+
+// TestSnapshotBaseline_FullTableNoBaselineAtOrBeforeAsOfDegrades: a baseline
+// source IS configured, the table IS in the snapshot, but the only baseline
+// snapshot is dated AFTER AsOf — so FindBaseline returns ErrNoBaseline and
+// full-table _snapshot must degrade to binlog-only (distinct from the
+// no-source-configured case in TestSnapshotBaseline_FullTableNoBaselineFallsBack).
+func TestSnapshotBaseline_FullTableNoBaselineAtOrBeforeAsOfDegrades(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	asOf := hourTop.Add(10 * time.Minute)
+	// Snapshot row at a time at-or-before AsOf so pkColumnMetas resolves the PK...
+	snapMeta := hourTop.Add(1 * time.Minute)
+	seedUsersSnapshot(t, db, snapMeta)
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// ...but the only baseline PARQUET is dated AFTER AsOf, so FindBaseline finds
+	// nothing at-or-before AsOf → ErrNoBaseline.
+	futureBaseline := asOf.Add(30 * time.Minute)
+	baselineDir := writeBaselineSnapshot(t, futureBaseline, "myapp", "users", usersBaselineCols(), [][]string{
+		{"1", "untouched"},
+	})
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "users", 1 /*insert*/, "2", nil, nil,
+		[]byte(`{"id":2,"name":"fresh"}`))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps: true, NoArchive: true, IndexDBName: dbName, BaselineDir: baselineDir,
+	}, slog.Default())
+
+	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "users", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("full-table _snapshot (no baseline at-or-before AsOf) must degrade, not error: %v", err)
+	}
+	got := rowsByKey(t, res.Resultset)
+	if _, merged := got["1"]; merged {
+		t.Errorf("no-baseline-at-or-before-AsOf full-table _snapshot merged a future baseline (id=1 present); must degrade to binlog-only: %v", got)
+	}
+	if got["2"] != "fresh" {
+		t.Errorf("no-baseline-at-or-before-AsOf full-table _snapshot = %v, want only the binlog row id=2 fresh", got)
+	}
+}

@@ -3,11 +3,13 @@ package shim
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/query"
 	"github.com/dbtrail/bintrail/internal/reconstruct"
 )
@@ -20,15 +22,13 @@ import (
 // resolves. _flashback (runPointInTime) deliberately stays binlog-only
 // so the two virtual schemas have distinct, documented semantics.
 //
-// Full-table _snapshot (q.PKColumn == "") falls through to the existing
-// binlog-only runFullTable for now — in-memory baseline merge for the
-// whole-table shape is tracked as a follow-up (see #355). Single-row
-// _snapshot is where the baseline lookup applies.
+// Full-table _snapshot (q.PKColumn == "") merges the baseline snapshot with
+// post-snapshot binlog deltas across the whole table (#362), so a never-touched
+// row appears in the resultset; single-row _snapshot (#355) does the same for
+// one PK. Both degrade to the binlog-only path when no baseline is usable.
 func (h *Handler) runSnapshot(q TimeTravelQuery) (*mysql.Result, error) {
 	if q.PKColumn == "" {
-		// Full-table baseline merge is deferred; whole-table _snapshot
-		// behaves like the binlog-only path until that lands.
-		return h.runFullTable(q)
+		return h.runSnapshotFullTable(q)
 	}
 	return h.runSnapshotPointInTime(q)
 }
@@ -42,6 +42,215 @@ func (h *Handler) baselineSource() string {
 		return h.cfg.BaselineS3
 	}
 	return h.cfg.BaselineDir
+}
+
+// errFullTableCapExceeded short-circuits the baseline merge once the buffered
+// resultset would exceed the row cap. It never escapes runSnapshotFullTable —
+// it is converted to ER_TOO_BIG_SELECT, mirroring runFullTable's cap path.
+var errFullTableCapExceeded = errors.New("full-table snapshot row cap exceeded")
+
+// runSnapshotFullTable resolves a full-table (no-WHERE) _snapshot query by
+// merging the baseline snapshot at-or-before AsOf with the post-snapshot
+// binlog deltas across the whole table (#362). The result is the table's true
+// row state at AsOf: never-touched baseline rows pass through, rows updated
+// after the baseline take their latest event image, rows deleted after the
+// baseline drop out, and rows inserted after the baseline appear — exactly what
+// the offline `bintrail reconstruct` produces, but streamed into an in-memory
+// resultset.
+//
+// It falls back to the binlog-only full-table path (runFullTable) — preserving
+// the documented "_snapshot degrades to _flashback" contract so a full-table
+// _snapshot never fails where _flashback would succeed — whenever a baseline
+// merge isn't possible:
+//   - no baseline source configured,
+//   - the table's PK can't be resolved from the schema snapshot, or it has no
+//     single/declared PK to canonicalize against,
+//   - a PK column's type isn't supported by the baseline canonicalizer,
+//   - no baseline exists for this table at-or-before AsOf.
+//
+// Real faults (baseline source unreadable, fetch failure, a PK value the
+// canonicalizer can't translate) surface as errors, the same user-vs-server
+// split the single-row path preserves.
+func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error) {
+	src := h.baselineSource()
+	if src == "" {
+		h.logger.Debug("shim: full-table _snapshot has no baseline source configured; using binlog-only path",
+			"schema", q.Schema, "table", q.Table)
+		return h.runFullTable(q)
+	}
+
+	pkCols, ok := h.pkColumnMetas(q.Schema, q.Table)
+	if !ok || len(pkCols) == 0 {
+		// A baseline source IS configured, so the operator opted into
+		// full-table completeness — but we can't determine the table's PK to
+		// canonicalize baseline rows against, so the result silently loses
+		// every never-touched baseline row. Warn (not Debug) so the
+		// degradation is visible; the usual cause is a stale/absent schema
+		// snapshot, fixable with `bintrail snapshot`.
+		h.logger.Warn("shim: full-table _snapshot cannot resolve a PK for the table; degrading to binlog-only (never-touched rows omitted)",
+			"schema", q.Schema, "table", q.Table)
+		return h.runFullTable(q)
+	}
+	for _, c := range pkCols {
+		if !reconstruct.SupportedPKType(c.DataType) {
+			h.logger.Warn("shim: full-table _snapshot PK type not supported by the baseline canonicalizer; using binlog-only path",
+				"schema", q.Schema, "table", q.Table, "pk_column", c.Name, "pk_type", c.DataType)
+			return h.runFullTable(q)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	baselinePath, snapshotTime, err := reconstruct.FindBaseline(ctx, src, q.Schema, q.Table, q.AsOf)
+	if err != nil {
+		if errors.Is(err, reconstruct.ErrNoBaseline) {
+			// Source configured but no baseline exists for this table at-or-
+			// before AsOf (not yet baselined, or table created after the last
+			// snapshot). The full-table result then silently omits any
+			// never-touched row — Warn so the operator can tell the snapshot
+			// degraded to binlog-only rather than returning a complete table.
+			h.logger.Warn("shim: full-table _snapshot found no baseline at-or-before AsOf; degrading to binlog-only (never-touched rows omitted)",
+				"schema", q.Schema, "table", q.Table,
+				"as_of", q.AsOf.UTC().Format(time.RFC3339))
+			return h.runFullTable(q)
+		}
+		// A real baseline-source failure is a server-side fault, same as the
+		// single-row path: plain error → ER_UNKNOWN_ERROR (1105).
+		return nil, err
+	}
+
+	// Fetch the latest event per PK from the snapshot instant up to AsOf.
+	// LimitPerPK=1 yields exactly the change map the merge needs (last write
+	// wins per PK); Since=snapshotTime drops pre-baseline events the baseline
+	// already supersedes. No global Limit here — the cap is enforced on the
+	// merged output below, since the table can have far more baseline rows
+	// than changed rows.
+	engine := query.New(h.indexDB)
+	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
+		Opts: query.Options{
+			Schema:     q.Schema,
+			Table:      q.Table,
+			Since:      &snapshotTime,
+			Until:      &q.AsOf,
+			LimitPerPK: 1,
+		},
+		DBName:         h.cfg.IndexDBName,
+		NoArchive:      h.cfg.NoArchive,
+		AllowGaps:      h.cfg.AllowGaps,
+		ArchiveFetcher: h.archiveFetcher,
+	})
+	if err != nil {
+		return nil, wrapFetchError(q.Type, err)
+	}
+	changes := make(map[string]*query.ResultRow, len(rows))
+	for i := range rows {
+		changes[rows[i].PKValues] = &rows[i]
+	}
+
+	rowCap := h.cfg.FullTableRowCap
+	if rowCap <= 0 {
+		rowCap = defaultFullTableRowCap
+	}
+
+	// Buffer the merged rows, coercing every value to a uniform text cell
+	// (see fullTableTextCell). This is required, not cosmetic: a baseline row
+	// carries DuckDB-native types (an int column is int32 → LONGLONG) while a
+	// post-baseline event image is JSON-decoded (the same column is float64 →
+	// DOUBLE), and BuildSimpleTextResultset rejects a column whose non-NULL
+	// rows disagree on type ("row types aren't consistent"). Rendering every
+	// cell to its text bytes makes each column uniformly VAR_STRING, lossless
+	// for large integers (unlike the event path's float64), and identical on
+	// the wire to per-value formatting. Stop at cap+1 so overflow is
+	// detectable.
+	images := make([]map[string]any, 0)
+	err = reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
+		BaselinePath: baselinePath,
+		Schema:       q.Schema,
+		Table:        q.Table,
+		PKCols:       pkCols,
+		Changes:      changes,
+	}, func(rowMap map[string]any) error {
+		img := make(map[string]any, len(rowMap))
+		for k, v := range rowMap {
+			img[k] = h.fullTableTextCell(q.Schema, q.Table, k, v)
+		}
+		images = append(images, img)
+		if len(images) > rowCap {
+			return errFullTableCapExceeded
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errFullTableCapExceeded) {
+			return nil, mysql.NewError(mysql.ER_TOO_BIG_SELECT, fmt.Sprintf(
+				"resolve %s: %s.%s at %s would return more than %d rows; narrow the AS OF range or filter by PK",
+				q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), rowCap,
+			))
+		}
+		return nil, err
+	}
+
+	return imagesToResult(images, h.effectiveColumnOrder(q))
+}
+
+// pkColumnMetas returns the primary-key column metas of schema.table from the
+// latest schema snapshot, for canonicalizing baseline PK values. The bool is
+// false when the resolver is unavailable or the table isn't in the snapshot —
+// callers treat that as "can't safely attempt a baseline merge" and fall back
+// to the binlog-only path.
+func (h *Handler) pkColumnMetas(schema, table string) ([]metadata.ColumnMeta, bool) {
+	if h.resolverFn == nil {
+		return nil, false
+	}
+	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger)
+	if err != nil {
+		return nil, false
+	}
+	tm, err := r.Resolve(schema, table)
+	if err != nil {
+		return nil, false
+	}
+	return tm.PKColumnMetas(), true
+}
+
+// fullTableTextCell renders one merged-resultset value to a uniform text cell
+// so a column's type is consistent across baseline-origin and event-origin
+// rows (see runSnapshotFullTable). NULL stays nil; everything else becomes
+// []byte:
+//   - []byte (string/JSON/blob columns from DuckDB or event images) passes
+//     through verbatim, matching the single-row _snapshot path. bintrail
+//     stores DECIMAL/NUMERIC as a Parquet string, so those arrive here as
+//     []byte too — not DuckDB's native decimal type;
+//   - time.Time (DuckDB datetime/timestamp/date scan output) is formatted UTC,
+//     since bintrail stores temporal values UTC-anchored and the full-table
+//     merge does not pin the DuckDB session;
+//   - numerics and other scalars go through go-mysql's text formatter so the
+//     bytes match what the wire protocol emits.
+//
+// Every type the bintrail baseline schema can produce (internal/baseline/
+// schema.go) is covered by one of the branches above, so the final %v
+// fallback should be unreachable. If a value ever does reach it the cell
+// would be best-effort-formatted rather than aborting the whole resultset —
+// but that is a silent degradation, so we Warn first to make it detectable.
+func (h *Handler) fullTableTextCell(schema, table, column string, v any) any {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case []byte:
+		return x
+	case string:
+		return []byte(x)
+	case time.Time:
+		return []byte(x.UTC().Format("2006-01-02 15:04:05"))
+	default:
+		if b, err := mysql.FormatTextValue(v); err == nil {
+			return b
+		}
+		h.logger.Warn("shim: full-table _snapshot cell has an unexpected Go type; best-effort formatting (value may render incorrectly)",
+			"schema", schema, "table", table, "column", column, "go_type", fmt.Sprintf("%T", v))
+		return []byte(fmt.Sprintf("%v", v))
+	}
 }
 
 // baselinePKStringMatchable reports whether a PK column of the given
