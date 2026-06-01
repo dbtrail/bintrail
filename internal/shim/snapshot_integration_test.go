@@ -316,14 +316,15 @@ func TestSnapshotBaseline_DecimalPK(t *testing.T) {
 	}
 }
 
-// TestSnapshotBaseline_DatetimePKFallsBack pins the negative half of the
-// guard: a DATETIME PK is stored as a Parquet TIMESTAMP, where DuckDB's
-// `col = '<string>'` match does not reliably hit, so baselinePKStringMatchable
-// excludes it and runSnapshot falls back to the binlog-only path instead of
-// risking a false "row never existed". The fallback must still resolve a row
-// that has binlog events. (A datetime-PK row that was never touched is a
-// known limitation — recoverable only via the offline `bintrail reconstruct`.)
-func TestSnapshotBaseline_DatetimePKFallsBack(t *testing.T) {
+// TestSnapshotBaseline_DatetimePKResolvesFromBaseline proves the positive half
+// of the guard after #359: a DATETIME PK is stored as a Parquet TIMESTAMP, and
+// with ReadBaselineRow now pinning the DuckDB session to UTC the
+// `col = '<string>'` match resolves deterministically — so baselinePKStringMatchable
+// admits datetime and a never-touched datetime-PK row resolves straight from the
+// baseline (previously this fell back to binlog-only and returned nothing). It
+// also covers the merge case: a datetime-PK row updated after the baseline has
+// the binlog event win over the baseline image.
+func TestSnapshotBaseline_DatetimePKResolvesFromBaseline(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 	if err := indexer.EnsureSchema(db); err != nil {
@@ -344,19 +345,21 @@ func TestSnapshotBaseline_DatetimePKFallsBack(t *testing.T) {
 		{Name: "at", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
 		{Name: "who", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 	}
-	pkVal := "2020-01-01 00:00:00"
-	// Baseline holds a different `who` ("stale"); if the guard wrongly used
-	// the (missing) baseline match the result could diverge. With the guard
-	// excluding datetime, only the binlog event below is consulted.
+	untouchedPK := "2020-01-01 00:00:00"
+	updatedPK := "2020-02-02 00:00:00"
+	// Baseline holds two datetime-PK rows: one never touched in binlog, one
+	// updated afterwards.
 	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "logins", cols, [][]string{
-		{pkVal, "stale"},
+		{untouchedPK, "alice"},
+		{updatedPK, "bob"},
 	})
 
-	// A binlog INSERT for the datetime-PK row. pk_values for a datetime PK is
+	// Post-baseline UPDATE on the second row. pk_values for a datetime PK is
 	// the go-mysql string form, matching what the parser hands runSnapshot.
 	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
-		"myapp", "logins", 1 /*insert*/, pkVal, nil, nil,
-		[]byte(`{"at":"2020-01-01 00:00:00","who":"fresh"}`))
+		"myapp", "logins", 2 /*update*/, updatedPK, nil,
+		[]byte(`{"at":"2020-02-02 00:00:00","who":"bob"}`),
+		[]byte(`{"at":"2020-02-02 00:00:00","who":"bob2"}`))
 
 	h := NewHandlerWithConfig(db, Config{
 		AllowGaps:   true,
@@ -365,16 +368,38 @@ func TestSnapshotBaseline_DatetimePKFallsBack(t *testing.T) {
 		BaselineDir: baselineDir,
 	}, slog.Default())
 
-	res, err := h.runSnapshot(TimeTravelQuery{
-		Type: TypeSnapshot, Schema: "myapp", Table: "logins",
-		PKColumn: "at", PKValue: pkVal, AsOf: asOf,
-	})
+	snapshotQ := func(pk string) TimeTravelQuery {
+		return TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "logins", PKColumn: "at", PKValue: pk, AsOf: asOf}
+	}
+
+	// ── never-touched datetime-PK row resolves from the baseline ──
+	res, err := h.runSnapshot(snapshotQ(untouchedPK))
 	if err != nil {
-		t.Fatalf("_snapshot datetime PK (fallback): %v", err)
+		t.Fatalf("_snapshot datetime PK (untouched): %v", err)
 	}
 	cells := rowCells(t, res.Resultset)
-	if len(cells) != 1 || cells[0][1] != "fresh" {
-		t.Errorf("_snapshot datetime PK fallback = %v, want a row with who=fresh from the binlog-only path", cells)
+	if len(cells) != 1 || cells[0][1] != "alice" {
+		t.Errorf("_snapshot datetime PK %q = %v, want a row with who=alice from the baseline (pre-#359 this fell back to binlog-only and returned nothing)", untouchedPK, cells)
+	}
+
+	// Cross-check the divergence: _flashback (binlog-only) sees nothing for the
+	// never-touched row, exactly the gap the baseline lookup closes.
+	flashRes, err := h.runPointInTime(TimeTravelQuery{Type: TypeFlashback, Schema: "myapp", Table: "logins", PKColumn: "at", PKValue: untouchedPK, AsOf: asOf})
+	if err != nil {
+		t.Fatalf("_flashback datetime PK (untouched): %v", err)
+	}
+	if got := len(flashRes.Resultset.RowDatas); got != 0 {
+		t.Errorf("_flashback datetime PK %q (never touched): expected 0 rows, got %d — divergence with _snapshot lost", untouchedPK, got)
+	}
+
+	// ── updated datetime-PK row: binlog event wins over the baseline image ──
+	res2, err := h.runSnapshot(snapshotQ(updatedPK))
+	if err != nil {
+		t.Fatalf("_snapshot datetime PK (updated): %v", err)
+	}
+	cells = rowCells(t, res2.Resultset)
+	if len(cells) != 1 || cells[0][1] != "bob2" {
+		t.Errorf("_snapshot datetime PK %q = %v, want a row with who=bob2 (post-baseline UPDATE must win)", updatedPK, cells)
 	}
 }
 

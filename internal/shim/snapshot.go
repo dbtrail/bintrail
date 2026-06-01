@@ -47,31 +47,41 @@ func (h *Handler) baselineSource() string {
 // baselinePKStringMatchable reports whether a PK column of the given
 // MySQL DATA_TYPE can be matched in the baseline Parquet by binding the
 // PK value as a string parameter to `pkColumn = ?` (what ReadBaselineRow
-// does). The single-row path does NOT canonicalize the value, so this is
-// narrower than reconstruct's full-table supportedPKType:
+// does). The single-row path does NOT canonicalize the value, so it
+// relies on DuckDB coercing the string-bound parameter to the typed
+// Parquet column:
 //
-//   - SAFE — the Parquet column is an integer (int/year → INT32/64) or a
-//     string (decimal/numeric, char/varchar/text, enum/set → STRING).
-//     DuckDB coerces a string literal to an integer column, and a string
-//     column compares byte-for-byte against the same string the indexer
-//     stored, so the match round-trips.
-//   - UNSAFE — datetime/timestamp (Parquet TIMESTAMP) and date (Parquet
-//     DATE). DuckDB's `temporal_col = 'literal'` comparison does not
-//     reliably match a string-bound parameter here, so the lookup would
-//     silently find nothing. These fall back to the binlog-only path with
-//     a Warn rather than risk a false "row never existed". Full temporal
-//     PK support needs the canonicalization the offline `bintrail
-//     reconstruct` command applies and is left to the follow-up.
+//   - integer (int/year → INT32/64) and string (decimal/numeric,
+//     char/varchar/text, enum/set → STRING): DuckDB coerces a string
+//     literal to an integer column, and a string column compares
+//     byte-for-byte against the same string the indexer stored, so the
+//     match round-trips.
+//   - datetime/timestamp (Parquet TIMESTAMP): safe now that ReadBaselineRow
+//     pins the DuckDB session to UTC (#359). The stored micros are
+//     UTC-anchored, so with a UTC session the `temporal_col = 'literal'` cast
+//     resolves the bound string to the same instant the indexer recorded, on
+//     any host TZ. Before the pin these silently missed on non-UTC hosts and
+//     were excluded here.
+//   - date (Parquet DATE): always TZ-independent — DuckDB's string→DATE cast
+//     is calendar-only, with no timezone component, so `date_col = '2020-01-01'`
+//     matches regardless of session TimeZone. DATE was never broken on non-UTC
+//     hosts; its prior exclusion was over-conservative, and the #359 UTC pin is
+//     a harmless no-op for it.
 //
-// Types reconstruct rejects outright (FLOAT, BLOB, BIT, JSON, …) are not
-// listed and therefore also fall back.
+// This set is intentionally identical to reconstruct.supportedPKType, but
+// reached by a different mechanism (DuckDB string-cast here vs. Go-side
+// canonicalization in the offline merge), so it is kept as a separate
+// matcher: a future change to one path's type support must not silently
+// move the other. Types reconstruct rejects outright (FLOAT, BLOB, BIT,
+// JSON, …) are not listed and therefore fall back to the binlog-only path.
 func baselinePKStringMatchable(dataType string) bool {
 	switch strings.ToLower(strings.TrimSpace(dataType)) {
 	case "int", "integer", "smallint", "tinyint", "mediumint", "bigint",
 		"year",
 		"decimal", "numeric",
 		"char", "varchar", "text", "tinytext", "mediumtext", "longtext",
-		"enum", "set":
+		"enum", "set",
+		"datetime", "timestamp", "date":
 		return true
 	default:
 		return false
@@ -87,8 +97,8 @@ func baselinePKStringMatchable(dataType string) bool {
 // It falls back to the binlog-only point-lookup (runPointInTime) — with
 // a log line so the degradation is visible — in four cases:
 //   - no baseline source configured (the pre-#355 default),
-//   - the PK column's type isn't one the baseline matcher canonicalizes
-//     correctly (a typed WHERE would silently miss the row),
+//   - the PK column's type isn't one the baseline matcher supports
+//     (a typed WHERE would silently miss the row),
 //   - the schema resolver is unavailable (can't determine the PK type),
 //   - no baseline exists for this table at-or-before AsOf.
 //

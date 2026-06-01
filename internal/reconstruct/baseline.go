@@ -40,6 +40,9 @@ func ReadBaselineRow(ctx context.Context, path string, pkFilter map[string]strin
 		return nil, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer db.Close()
+	if err := pinDuckDBSessionUTC(ctx, db); err != nil {
+		return nil, err
+	}
 
 	if strings.HasPrefix(path, "s3://") {
 		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
@@ -103,6 +106,9 @@ func ExecSQL(ctx context.Context, source, sqlStr string) ([]map[string]any, []st
 		return nil, nil, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer db.Close()
+	if err := pinDuckDBSessionUTC(ctx, db); err != nil {
+		return nil, nil, err
+	}
 
 	if strings.Contains(source, "s3://") || strings.Contains(sqlStr, "s3://") {
 		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
@@ -182,6 +188,9 @@ func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Ti
 		return "", time.Time{}, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer db.Close()
+	if err := pinDuckDBSessionUTC(ctx, db); err != nil {
+		return "", time.Time{}, err
+	}
 
 	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
 		return "", time.Time{}, fmt.Errorf("load httpfs extension: %w", err)
@@ -260,6 +269,27 @@ func parseDirTimestamp(name string) (time.Time, bool) {
 
 func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// pinDuckDBSessionUTC pins a freshly-opened DuckDB connection's session time
+// zone to UTC so string→timestamp casts are deterministic regardless of the
+// host OS timezone (#359).
+//
+// bintrail stores all temporal values UTC-anchored: DATETIME/TIMESTAMP land in
+// the baseline Parquet as micros-since-epoch (internal/baseline/schema.go),
+// which DuckDB reads back as TIMESTAMP WITH TIME ZONE. Without this pin,
+// ReadBaselineRow's `pkcol = ?` predicate binds the PK value as a string and
+// DuckDB casts that literal to TIMESTAMPTZ using the *session* timezone
+// inherited from the OS TZ. On a non-UTC host `'2020-01-01 00:00:00'` resolves
+// to a different UTC instant than the stored micros, so a datetime/timestamp
+// PK row silently fails to match. Pinning UTC makes the cast match the stored
+// instant on every host. The other DuckDB-opening helpers here pin it too for
+// consistency, so returned temporal values render as their UTC wall-clock.
+func pinDuckDBSessionUTC(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, "SET TimeZone='UTC'"); err != nil {
+		return fmt.Errorf("pin duckdb session to UTC: %w", err)
+	}
+	return nil
 }
 
 type colCond struct {
