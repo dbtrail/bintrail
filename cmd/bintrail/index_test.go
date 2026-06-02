@@ -361,3 +361,42 @@ func TestNullOrStringVal_nonEmpty(t *testing.T) {
 		t.Errorf("expected 'uuid:42', got %v", got)
 	}
 }
+
+// ─── buildFKCascadeQuery ─────────────────────────────────────────────────────
+
+// When schemas are named explicitly, the scan is scoped to exactly those
+// schemas via a parameterized IN list — and the bintrail-internal exclusions
+// are NOT added (an explicitly named internal schema is still policed).
+func TestBuildFKCascadeQuery_withSchemas(t *testing.T) {
+	query, args := buildFKCascadeQuery([]string{"iotcore", "billing"})
+
+	if !strings.Contains(query, "CONSTRAINT_SCHEMA IN (?,?)") {
+		t.Errorf("expected parameterized IN list, got query:\n%s", query)
+	}
+	if strings.Contains(query, "NOT IN") || strings.Contains(query, "NOT LIKE") {
+		t.Errorf("explicit --schemas must not add internal-schema exclusions, got query:\n%s", query)
+	}
+	if len(args) != 2 || args[0] != "iotcore" || args[1] != "billing" {
+		t.Errorf("expected args [iotcore billing], got %v", args)
+	}
+}
+
+// With no schemas filter the scan excludes MySQL system schemas AND bintrail's
+// own internal schemas (bintrail_index + the bt_<prefix> convention), so a
+// second agent sharing the source MySQL does not fatal-fail on the first
+// agent's internal FK cascades (#347).
+func TestBuildFKCascadeQuery_noSchemasExcludesInternal(t *testing.T) {
+	query, args := buildFKCascadeQuery(nil)
+
+	if len(args) != 0 {
+		t.Errorf("expected no args for unscoped query, got %v", args)
+	}
+	for _, want := range []string{"'mysql'", "'information_schema'", "'performance_schema'", "'sys'", "'bintrail_index'"} {
+		if !strings.Contains(query, want) {
+			t.Errorf("expected unscoped query to exclude %s, got query:\n%s", want, query)
+		}
+	}
+	if !strings.Contains(query, `CONSTRAINT_SCHEMA NOT LIKE 'bt\_%'`) {
+		t.Errorf("expected unscoped query to exclude the bt_ prefix, got query:\n%s", query)
+	}
+}

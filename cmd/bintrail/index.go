@@ -412,11 +412,17 @@ func validateBinlogRowImage(db *sql.DB) error {
 	return nil
 }
 
-// validateNoFKCascades checks that none of the targeted schemas contain foreign
-// key constraints with CASCADE rules. When schemas is empty, all non-system
-// schemas are checked. FK cascades produce invisible side-effect row changes
-// that make reversal SQL unreliable.
-func validateNoFKCascades(db *sql.DB, schemas []string) error {
+// buildFKCascadeQuery returns the REFERENTIAL_CONSTRAINTS query (and its args)
+// used to find CASCADE foreign keys. When schemas is non-empty the scan is
+// scoped to exactly those schemas — the operator explicitly asked us to index
+// them, so we police them as named. When schemas is empty we scan everything
+// except (a) MySQL's own system schemas and (b) bintrail's internal schemas
+// (the default `bintrail_index` and the SaaS `bt_<prefix>` convention). The
+// latter exclusion matters when two bintrail agents share one source MySQL:
+// without it, a second agent's pre-flight trips over the first agent's
+// internal FK cascades and fatal-fails on a schema it was never asked to index
+// (#347).
+func buildFKCascadeQuery(schemas []string) (string, []any) {
 	query := `SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, DELETE_RULE, UPDATE_RULE
 		FROM information_schema.REFERENTIAL_CONSTRAINTS
 		WHERE (DELETE_RULE = 'CASCADE' OR UPDATE_RULE = 'CASCADE')`
@@ -429,8 +435,21 @@ func validateNoFKCascades(db *sql.DB, schemas []string) error {
 			args = append(args, s)
 		}
 	} else {
-		query += " AND CONSTRAINT_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys')"
+		// `bt\_%` matches the literal `bt_` prefix (backslash is MySQL's default
+		// LIKE escape, so `\_` is a literal underscore rather than any char).
+		query += " AND CONSTRAINT_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys','bintrail_index')" +
+			` AND CONSTRAINT_SCHEMA NOT LIKE 'bt\_%'`
 	}
+	return query, args
+}
+
+// validateNoFKCascades checks that none of the targeted schemas contain foreign
+// key constraints with CASCADE rules. When schemas is empty, all non-system,
+// non-bintrail-internal schemas are checked (see buildFKCascadeQuery). FK
+// cascades produce invisible side-effect row changes that make reversal SQL
+// unreliable.
+func validateNoFKCascades(db *sql.DB, schemas []string) error {
+	query, args := buildFKCascadeQuery(schemas)
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -453,8 +472,8 @@ func validateNoFKCascades(db *sql.DB, schemas []string) error {
 
 	if len(found) > 0 {
 		for _, c := range found {
-			slog.Warn("FK cascade constraint found",
-				"schema", c.schema, "constraint", c.name,
+			slog.Warn("FK cascade constraint found on source",
+				"source_schema", c.schema, "constraint", c.name,
 				"delete_rule", c.deleteRule, "update_rule", c.updateRule)
 		}
 		return fmt.Errorf("%d FK cascade constraint(s) found in indexed schemas; reversal SQL from `recover` may not correctly handle cascade side-effects", len(found))
