@@ -70,10 +70,10 @@ def top_table_by_volume(index):
     Raises on a DB error (the caller keeps the previous hot table rather than
     treating an error as 'no activity').
 
-    This is exactly what dbtrail's count_events tool runs server-side, just
-    against your own index. The index connection is pinned to UTC because
-    bintrail stores binlog event timestamps in UTC; comparing against
-    UTC_TIMESTAMP() keeps the time window correct regardless of server tz."""
+    The whole lookup runs against your own index. The connection is pinned to
+    UTC because bintrail stores binlog event timestamps in UTC; comparing
+    against UTC_TIMESTAMP() keeps the time window correct regardless of the
+    index server's timezone."""
     sql = (
         "SELECT schema_name, table_name, COUNT(*) AS c "
         "FROM binlog_events "
