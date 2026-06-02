@@ -365,16 +365,16 @@ func TestNullOrStringVal_nonEmpty(t *testing.T) {
 // ─── buildFKCascadeQuery ─────────────────────────────────────────────────────
 
 // When schemas are named explicitly, the scan is scoped to exactly those
-// schemas via a parameterized IN list — and the bintrail-internal exclusions
-// are NOT added (an explicitly named internal schema is still policed).
+// schemas via a parameterized IN list — and the bintrail-internal exclusion is
+// NOT added (an explicitly named internal schema is still policed).
 func TestBuildFKCascadeQuery_withSchemas(t *testing.T) {
 	query, args := buildFKCascadeQuery([]string{"iotcore", "billing"})
 
 	if !strings.Contains(query, "CONSTRAINT_SCHEMA IN (?,?)") {
 		t.Errorf("expected parameterized IN list, got query:\n%s", query)
 	}
-	if strings.Contains(query, "NOT IN") || strings.Contains(query, "LEFT(") {
-		t.Errorf("explicit --schemas must not add internal-schema exclusions, got query:\n%s", query)
+	if strings.Contains(query, "NOT IN") || strings.Contains(query, "information_schema.TABLES") {
+		t.Errorf("explicit --schemas must not add the internal-schema exclusion, got query:\n%s", query)
 	}
 	if len(args) != 2 || args[0] != "iotcore" || args[1] != "billing" {
 		t.Errorf("expected args [iotcore billing], got %v", args)
@@ -382,25 +382,30 @@ func TestBuildFKCascadeQuery_withSchemas(t *testing.T) {
 }
 
 // With no schemas filter the scan excludes MySQL system schemas AND bintrail's
-// own internal schemas (the binlog_index/bintrail_index index DB + the
-// bt_<prefix> convention), so an agent sharing the source MySQL does not
-// fatal-fail on bintrail's internal FK cascades (#347). binlog_index and
-// bintrail_index are both used as the index DB name across docs/deploy tooling,
-// so both must be in the list.
+// own index schemas. The latter are recognised structurally — a schema is
+// bintrail-internal only if it holds all of binlog_events, schema_snapshots and
+// stream_state — not by name, so an agent does not fatal-fail on bintrail's own
+// index FK cascades regardless of how the index DB is named (#347/#365).
 func TestBuildFKCascadeQuery_noSchemasExcludesInternal(t *testing.T) {
 	query, args := buildFKCascadeQuery(nil)
 
 	if len(args) != 0 {
 		t.Errorf("expected no args for unscoped query, got %v", args)
 	}
-	for _, want := range []string{"'mysql'", "'information_schema'", "'performance_schema'", "'sys'", "'binlog_index'", "'bintrail_index'"} {
+	for _, want := range []string{"'mysql'", "'information_schema'", "'performance_schema'", "'sys'"} {
 		if !strings.Contains(query, want) {
-			t.Errorf("expected unscoped query to exclude %s, got query:\n%s", want, query)
+			t.Errorf("expected unscoped query to exclude system schema %s, got query:\n%s", want, query)
 		}
 	}
-	// Escape-free prefix match so it is independent of the source's sql_mode
-	// (a backslash LIKE escape is fragile under NO_BACKSLASH_ESCAPES).
-	if !strings.Contains(query, "LEFT(CONSTRAINT_SCHEMA, 3) <> 'bt_'") {
-		t.Errorf("expected unscoped query to exclude the bt_ prefix via LEFT(), got query:\n%s", query)
+	// Structural detection: subquery over information_schema.TABLES requiring all
+	// three signature tables (HAVING COUNT(DISTINCT TABLE_NAME) = 3).
+	for _, want := range []string{
+		"information_schema.TABLES",
+		"'binlog_events'", "'schema_snapshots'", "'stream_state'",
+		"GROUP BY TABLE_SCHEMA HAVING COUNT(DISTINCT TABLE_NAME) = 3",
+	} {
+		if !strings.Contains(query, want) {
+			t.Errorf("expected unscoped query to contain %q, got query:\n%s", want, query)
+		}
 	}
 }
