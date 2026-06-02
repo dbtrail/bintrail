@@ -416,12 +416,20 @@ func validateBinlogRowImage(db *sql.DB) error {
 // used to find CASCADE foreign keys. When schemas is non-empty the scan is
 // scoped to exactly those schemas — the operator explicitly asked us to index
 // them, so we police them as named. When schemas is empty we scan everything
-// except (a) MySQL's own system schemas and (b) bintrail's internal schemas
-// (the default `bintrail_index` and the SaaS `bt_<prefix>` convention). The
-// latter exclusion matters when two bintrail agents share one source MySQL:
-// without it, a second agent's pre-flight trips over the first agent's
-// internal FK cascades and fatal-fails on a schema it was never asked to index
-// (#347).
+// except (a) MySQL's own system schemas and (b) bintrail's internal schemas:
+// the index DB (named `binlog_index` in every DSN example, occasionally
+// `bintrail_index`) and the SaaS `bt_<prefix>` convention. The latter exclusion
+// matters when an agent shares one source MySQL with another agent (or with its
+// own co-located index DB): without it, the pre-flight trips over bintrail's own
+// `access_rules`→`profiles` ON DELETE CASCADE and fatal-fails on a schema it was
+// never asked to index (#347).
+//
+// This is a name-based heuristic, so it has a known hole: a user schema that
+// happens to match these names (e.g. a real `bt_orders`) has its genuine
+// cascades silently skipped here. The robust fix is to recognise a
+// bintrail-internal schema by its signature tables rather than its name —
+// tracked as a follow-up. We keep the heuristic because it covers the reported
+// topologies and the issue endorsed it.
 func buildFKCascadeQuery(schemas []string) (string, []any) {
 	query := `SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, DELETE_RULE, UPDATE_RULE
 		FROM information_schema.REFERENTIAL_CONSTRAINTS
@@ -435,10 +443,12 @@ func buildFKCascadeQuery(schemas []string) (string, []any) {
 			args = append(args, s)
 		}
 	} else {
-		// `bt\_%` matches the literal `bt_` prefix (backslash is MySQL's default
-		// LIKE escape, so `\_` is a literal underscore rather than any char).
-		query += " AND CONSTRAINT_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys','bintrail_index')" +
-			` AND CONSTRAINT_SCHEMA NOT LIKE 'bt\_%'`
+		// LEFT(...) <> 'bt_' rather than LIKE 'bt\_%' so the prefix match is
+		// independent of sql_mode: a backslash LIKE escape syntax-errors under
+		// the default mode and breaks under NO_BACKSLASH_ESCAPES, whereas LEFT
+		// has no escaping to get wrong.
+		query += " AND CONSTRAINT_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys','binlog_index','bintrail_index')" +
+			" AND LEFT(CONSTRAINT_SCHEMA, 3) <> 'bt_'"
 	}
 	return query, args
 }
@@ -476,7 +486,7 @@ func validateNoFKCascades(db *sql.DB, schemas []string) error {
 				"source_schema", c.schema, "constraint", c.name,
 				"delete_rule", c.deleteRule, "update_rule", c.updateRule)
 		}
-		return fmt.Errorf("%d FK cascade constraint(s) found in indexed schemas; reversal SQL from `recover` may not correctly handle cascade side-effects", len(found))
+		return fmt.Errorf("%d FK cascade constraint(s) found on source; reversal SQL from `recover` may not correctly handle cascade side-effects", len(found))
 	}
 	return nil
 }

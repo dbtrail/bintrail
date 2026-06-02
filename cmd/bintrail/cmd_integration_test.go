@@ -277,8 +277,8 @@ func TestValidateNoFKCascades_otherSchemaIgnored(t *testing.T) {
 // bt_<prefix> convention; testutil names every test DB bt_<TestName>). When no
 // --schemas filter is given, FK cascades inside such a schema must be ignored —
 // otherwise a second bintrail agent sharing the source MySQL fatal-fails on the
-// first agent's internal cascade (#347). This also exercises the `bt\_%` LIKE
-// escape against real MySQL.
+// first agent's internal cascade (#347). This also exercises the LEFT(...)='bt_'
+// prefix match against real MySQL.
 func TestValidateNoFKCascades_internalSchemaIgnoredWhenUnscoped(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
