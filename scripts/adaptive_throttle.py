@@ -1,44 +1,38 @@
 #!/usr/bin/env python3
 """
-Adaptive write throttle for MySQL via ProxySQL, driven by binlog change
-intelligence (dbtrail).
+Adaptive write throttle for MySQL via ProxySQL, driven by binlog change volume.
 
 Trigger:   replica apply lag (Seconds_Behind_Source) on a read replica.
-Diagnosis: which table is generating the most binlog volume right now,
-           asked to dbtrail's count_events MCP tool.
+Diagnosis: which table is generating the most binlog volume right now, read
+           straight from the bintrail index (the `binlog_events` table that
+           `bintrail stream` populates) with a plain GROUP BY.
 Action:    apply a per-rule delay in ProxySQL to the WRITE rule that matches
            the hot table.
 
-Targets:   ProxySQL 3.0.x (Stable tier), MySQL 8.4 LTS, Python 3.11+.
-Deps:      pip install pymysql requests
+This script is pure open-source: it talks to MySQL/ProxySQL only. It needs a
+running `bintrail stream` writing to a `binlog_events` index, but no hosted
+service, API key, or network calls beyond your own database and proxy.
 
-NOTE (verify against your gateway before production):
-  The dbtrail MCP endpoint (per the server code) requires an `initialize`
-  handshake that returns an `Mcp-Session-Id` header, which must be sent on
-  every subsequent `tools/call`. This script does that handshake. If your
-  gateway runs in a stateless mode, the session header is simply ignored.
+Targets:   ProxySQL 3.0.x (Stable tier), MySQL 8.4 LTS, Python 3.11+.
+Deps:      pip install pymysql
 """
 
-import json
 import re
 import signal
 import sys
 import time
-from datetime import datetime, timedelta, timezone
 
 import pymysql
-import requests
+
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 PROXYSQL = dict(host="127.0.0.1", port=6032, user="admin", password="admin")
 REPLICA = dict(host="mysql-replica", port=3306, user="monitor", password="monitor")
-
-DBTRAIL_MCP_URL = "https://api.dbtrail.com/mcp"
-DBTRAIL_TOKEN = "REPLACE_WITH_YOUR_OAUTH2_BEARER_TOKEN"   # JWT or bt_... API key
-DBTRAIL_SERVER_ID = "REPLACE_WITH_YOUR_SERVER_ID"
-MCP_PROTOCOL_VERSION = "2025-06-18"
+# The bintrail index DB: where `bintrail stream` writes the binlog_events table.
+INDEX = dict(host="127.0.0.1", port=3306, user="bintrail", password="bintrail",
+             database="bintrail_index")
 
 LAG_THRESHOLD_S = 3        # engage throttling at or above this replica lag
 CLEAR_THRESHOLD_S = 1      # release throttling at or below this (hysteresis band)
@@ -46,8 +40,7 @@ VOLUME_WINDOW_S = 60       # how far back in the binlog we look for the hot tabl
 DELAY_MS = 1               # per-query delay applied while throttling
 THROTTLE_RULE_ID = 100     # dedicated, table-targeted throttle rule
 POLL_INTERVAL_S = 1.0      # how often we check replica lag (cheap, local)
-HOTSPOT_REFRESH_S = 10     # how often we re-ask dbtrail for the hot table
-HTTP_TIMEOUT_S = 10
+HOTSPOT_REFRESH_S = 10     # how often we re-query the index for the hot table
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +49,7 @@ HTTP_TIMEOUT_S = 10
 def get_replica_lag(conn):
     """Return Seconds_Behind_Source as an int, or None when replication is not
     reporting a value. NULL is NOT zero: it means the applier thread is not
-    running, or has drained the relay log while the receiver is stopped - i.e.
+    running, or has drained the relay log while the receiver is stopped, i.e.
     replication may be broken. Callers must treat None as 'unknown', not 'caught
     up'."""
     with conn.cursor() as cur:
@@ -69,116 +62,32 @@ def get_replica_lag(conn):
 
 
 # ---------------------------------------------------------------------------
-# Diagnosis: dbtrail MCP client (session-aware) + hot-table lookup
+# Diagnosis: hottest table by binlog volume, from the bintrail index
 # ---------------------------------------------------------------------------
-class DbtrailMCP:
-    """Minimal HTTP JSON-RPC client for the dbtrail MCP gateway.
+def top_table_by_volume(index):
+    """Return (schema, table) for the table with the most binlog events in the
+    last VOLUME_WINDOW_S seconds, or None if the window was genuinely empty.
+    Raises on a DB error (the caller keeps the previous hot table rather than
+    treating an error as 'no activity').
 
-    Performs the `initialize` handshake and carries the Mcp-Session-Id on
-    subsequent calls. Adapt auth / protocol version to your gateway."""
-
-    def __init__(self, url, token):
-        self.url = url
-        self.token = token
-        self.http = requests.Session()
-        self.session_id = None
-        self._req_id = 0
-
-    def _headers(self):
-        h = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        if self.session_id:
-            h["Mcp-Session-Id"] = self.session_id
-        return h
-
-    def _rpc(self, method, params=None):
-        self._req_id += 1
-        body = {"jsonrpc": "2.0", "id": self._req_id, "method": method}
-        if params is not None:
-            body["params"] = params
-        resp = self.http.post(
-            self.url, json=body, headers=self._headers(), timeout=HTTP_TIMEOUT_S
-        )
-        sid = resp.headers.get("Mcp-Session-Id")
-        if sid:
-            self.session_id = sid
-        resp.raise_for_status()
-        return resp.json()
-
-    def initialize(self):
-        self._rpc(
-            "initialize",
-            {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "proxysql-throttle", "version": "1.0"},
-            },
-        )
-        # The MCP spec expects an `initialized` notification before tools/call.
-        # It's a notification (no id, no response). Best-effort.
-        body = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        self.http.post(
-            self.url, json=body, headers=self._headers(), timeout=HTTP_TIMEOUT_S
-        )
-
-    def count_events(self, server_id, group_by, since, until):
-        resp = self._rpc(
-            "tools/call",
-            {
-                "name": "count_events",
-                "arguments": {
-                    "server_id": server_id,
-                    "group_by": group_by,
-                    "since": since,
-                    "until": until,
-                },
-            },
-        )
-        return _extract_groups(resp)
-
-
-def _extract_groups(rpc_response):
-    """Pull count_events groups[] out of the MCP response, and RAISE on any
-    error rather than masking it as 'no data'. A masked error would silently
-    stop throttling while the replica keeps lagging - the opposite of what we
-    want."""
-    if "error" in rpc_response:                      # JSON-RPC transport error
-        raise RuntimeError(f"dbtrail RPC error: {rpc_response['error']}")
-    result = rpc_response.get("result", {})
-    if isinstance(result, dict) and result.get("isError"):
-        text = "".join(b.get("text", "") for b in result.get("content", []))
-        raise RuntimeError(f"dbtrail tool error: {text or 'unknown'}")
-    if isinstance(result, dict) and "groups" in result:
-        return result["groups"]
-    for block in result.get("content", []):
-        if block.get("type") == "text":
-            parsed = json.loads(block["text"])       # let a parse failure raise
-            if "groups" in parsed:
-                return parsed["groups"]
-    return []   # only for a genuinely valid, empty response
-
-
-def top_table_by_volume(mcp):
-    """Return (schema, table) for the hottest table in the last VOLUME_WINDOW_S
-    seconds, or None if the window was genuinely empty. Raises on transport /
-    tool error (caller decides whether to keep stale state).
-
-    count_events returns absolute counts, not a rate; we sort DESC ourselves
-    instead of trusting response ordering (the MCP layer does not guarantee it).
-    Pydantic on the server side accepts ISO-8601 with a +00:00 offset and
-    normalizes to UTC, so datetime.isoformat() is fine."""
-    now = datetime.now(timezone.utc)
-    since = (now - timedelta(seconds=VOLUME_WINDOW_S)).isoformat()
-    until = now.isoformat()
-    groups = mcp.count_events(DBTRAIL_SERVER_ID, ["schema", "table"], since, until)
-    if not groups:
+    This is exactly what dbtrail's count_events tool runs server-side, just
+    against your own index. The index connection is pinned to UTC because
+    bintrail stores binlog event timestamps in UTC; comparing against
+    UTC_TIMESTAMP() keeps the time window correct regardless of server tz."""
+    sql = (
+        "SELECT schema_name, table_name, COUNT(*) AS c "
+        "FROM binlog_events "
+        "WHERE event_timestamp >= UTC_TIMESTAMP() - INTERVAL %s SECOND "
+        "GROUP BY schema_name, table_name "
+        "ORDER BY c DESC LIMIT 1"
+    )
+    index.ping(reconnect=True)
+    with index.cursor() as cur:
+        cur.execute(sql, (VOLUME_WINDOW_S,))
+        row = cur.fetchone()
+    if not row:
         return None
-    groups.sort(key=lambda g: g.get("count", 0), reverse=True)
-    top = groups[0]
-    return top.get("schema"), top.get("table")
+    return row[0], row[1]
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +155,7 @@ def rule_hits(conn):
 # ---------------------------------------------------------------------------
 # Loop
 # ---------------------------------------------------------------------------
-def tick(proxysql, replica, mcp, state):
+def tick(proxysql, replica, index, state):
     """One control iteration. Raises on any unexpected failure; main() catches,
     logs, and retries so a transient blip never kills the daemon."""
     replica.ping(reconnect=True)
@@ -268,14 +177,14 @@ def tick(proxysql, replica, mcp, state):
     if lag >= LAG_THRESHOLD_S:
         now = time.monotonic()
         if state["hot"] is None or (now - state["last_hotspot"]) >= HOTSPOT_REFRESH_S:
-            # Stamp the time BEFORE the call so a dbtrail outage backs off on the
+            # Stamp the time BEFORE the call so an index outage backs off on the
             # HOTSPOT_REFRESH_S cadence instead of hammering every POLL_INTERVAL_S.
             state["last_hotspot"] = now
-            new_hot = top_table_by_volume(mcp)   # raises on error -> caught by main
+            new_hot = top_table_by_volume(index)   # raises on error -> caught by main
             if new_hot is not None:
                 state["hot"] = new_hot
             else:
-                print(f"WARN: dbtrail returned no hot table; keeping {state['hot']}",
+                print(f"WARN: index shows no recent writes; keeping {state['hot']}",
                       file=sys.stderr)
             if state["throttling"]:
                 # Sanity: is the live rule actually matching traffic?
@@ -309,12 +218,11 @@ def main():
     replica = pymysql.connect(
         autocommit=True, cursorclass=pymysql.cursors.DictCursor, **REPLICA
     )
-    mcp = DbtrailMCP(DBTRAIL_MCP_URL, DBTRAIL_TOKEN)
-    try:
-        mcp.initialize()
-    except Exception as exc:
-        print(f"FATAL: dbtrail MCP initialize failed: {exc}", file=sys.stderr)
-        sys.exit(1)
+    # Pin the index session to UTC so the time window matches the stored
+    # (UTC) binlog event timestamps.
+    index = pymysql.connect(
+        autocommit=True, init_command="SET time_zone = '+00:00'", **INDEX
+    )
 
     state = {"throttling": False, "hot": None, "rule_table": None,
              "last_hotspot": 0.0, "last_hits": 0}
@@ -333,6 +241,7 @@ def main():
         finally:
             proxysql.close()
             replica.close()
+            index.close()
         print("throttle cleared, bye")
         sys.exit(0)
 
@@ -341,7 +250,7 @@ def main():
 
     while True:
         try:
-            tick(proxysql, replica, mcp, state)
+            tick(proxysql, replica, index, state)
         except Exception as exc:
             print(f"WARN: iteration failed, will retry: {exc}", file=sys.stderr)
         time.sleep(POLL_INTERVAL_S)
