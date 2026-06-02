@@ -384,8 +384,9 @@ func TestBuildFKCascadeQuery_withSchemas(t *testing.T) {
 // With no schemas filter the scan excludes MySQL system schemas AND bintrail's
 // own internal schemas (the binlog_index/bintrail_index index DB + the
 // bt_<prefix> convention), so an agent sharing the source MySQL does not
-// fatal-fail on bintrail's internal FK cascades (#347). binlog_index is the
-// name used in every DSN example, so it must be in the list.
+// fatal-fail on bintrail's internal FK cascades (#347). binlog_index and
+// bintrail_index are both used as the index DB name across docs/deploy tooling,
+// so both must be in the list.
 func TestBuildFKCascadeQuery_noSchemasExcludesInternal(t *testing.T) {
 	query, args := buildFKCascadeQuery(nil)
 

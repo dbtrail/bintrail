@@ -417,19 +417,20 @@ func validateBinlogRowImage(db *sql.DB) error {
 // scoped to exactly those schemas — the operator explicitly asked us to index
 // them, so we police them as named. When schemas is empty we scan everything
 // except (a) MySQL's own system schemas and (b) bintrail's internal schemas:
-// the index DB (named `binlog_index` in every DSN example, occasionally
-// `bintrail_index`) and the SaaS `bt_<prefix>` convention. The latter exclusion
-// matters when an agent shares one source MySQL with another agent (or with its
-// own co-located index DB): without it, the pre-flight trips over bintrail's own
-// `access_rules`→`profiles` ON DELETE CASCADE and fatal-fails on a schema it was
-// never asked to index (#347).
+// the index DB (named `binlog_index` or `bintrail_index` across our docs and
+// deploy tooling — the #347 incident itself used `bintrail_index`) and the SaaS
+// `bt_<prefix>` convention. The latter exclusion matters when an agent shares
+// one source MySQL with another agent (or with its own co-located index DB):
+// without it, the pre-flight trips over bintrail's own `access_rules`→`profiles`
+// ON DELETE CASCADE and fatal-fails on a schema it was never asked to index
+// (#347).
 //
 // This is a name-based heuristic, so it has a known hole: a user schema that
 // happens to match these names (e.g. a real `bt_orders`) has its genuine
-// cascades silently skipped here. The robust fix is to recognise a
-// bintrail-internal schema by its signature tables rather than its name —
-// tracked as a follow-up. We keep the heuristic because it covers the reported
-// topologies and the issue endorsed it.
+// cascades silently skipped here, and a custom-named index DB is not excluded.
+// The robust fix is to recognise a bintrail-internal schema by its signature
+// tables rather than its name — tracked in #365. We keep the heuristic because
+// it covers the reported topologies and the issue endorsed it.
 func buildFKCascadeQuery(schemas []string) (string, []any) {
 	query := `SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, DELETE_RULE, UPDATE_RULE
 		FROM information_schema.REFERENTIAL_CONSTRAINTS
@@ -443,10 +444,12 @@ func buildFKCascadeQuery(schemas []string) (string, []any) {
 			args = append(args, s)
 		}
 	} else {
-		// LEFT(...) <> 'bt_' rather than LIKE 'bt\_%' so the prefix match is
-		// independent of sql_mode: a backslash LIKE escape syntax-errors under
-		// the default mode and breaks under NO_BACKSLASH_ESCAPES, whereas LEFT
-		// has no escaping to get wrong.
+		// LEFT(...) <> 'bt_' rather than LIKE 'bt\_%': under the
+		// NO_BACKSLASH_ESCAPES sql_mode the `\_` stops being an escaped literal
+		// underscore, so a LIKE pattern silently stops matching bt_-prefixed
+		// schemas. (And the obvious fix — an explicit ESCAPE '\' clause —
+		// syntax-errors under the default mode.) LEFT has no escaping to get
+		// wrong, so it behaves identically under any sql_mode.
 		query += " AND CONSTRAINT_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys','binlog_index','bintrail_index')" +
 			" AND LEFT(CONSTRAINT_SCHEMA, 3) <> 'bt_'"
 	}
@@ -460,6 +463,15 @@ func buildFKCascadeQuery(schemas []string) (string, []any) {
 // unreliable.
 func validateNoFKCascades(db *sql.DB, schemas []string) error {
 	query, args := buildFKCascadeQuery(schemas)
+
+	// The unscoped scan deliberately skips bintrail's own internal schemas by
+	// name (see buildFKCascadeQuery). Unlike the system-schema exclusions, this
+	// is a heuristic that can wrongly skip a user schema sharing those names, so
+	// disclose it: a "no FK cascades" pass below does not cover excluded schemas.
+	if len(schemas) == 0 {
+		slog.Info("FK cascade pre-flight excludes bintrail-internal schemas from the unscoped scan",
+			"excluded", "binlog_index, bintrail_index, bt_*")
+	}
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
