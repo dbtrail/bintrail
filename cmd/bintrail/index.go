@@ -462,11 +462,15 @@ func buildFKCascadeQuery(schemas []string) (string, []any) {
 func validateNoFKCascades(db *sql.DB, schemas []string) error {
 	query, args := buildFKCascadeQuery(schemas)
 
-	// The unscoped scan skips bintrail's own index schemas (recognised by their
-	// signature tables; see buildFKCascadeQuery), so a "no FK cascades" pass below
-	// does not cover them. Disclose it.
+	// The unscoped scan skips schemas that look like a bintrail index — those
+	// holding all of bintrail's signature tables (see buildFKCascadeQuery) — so a
+	// clean result does not cover them. Disclose the rule, naming the signature
+	// tables rather than asserting the skipped schemas are definitely bintrail's:
+	// a user schema that replicated those table names would be skipped too, and
+	// the operator should be able to recognise that case.
 	if len(schemas) == 0 {
-		slog.Info("FK cascade pre-flight skips bintrail's own index schemas (identified by signature tables)")
+		slog.Info("FK cascade pre-flight skips schemas that look like a bintrail index DB " +
+			"(those containing binlog_events, schema_snapshots and stream_state); a clean result does not cover them")
 	}
 
 	rows, err := db.Query(query, args...)

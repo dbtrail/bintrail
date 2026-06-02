@@ -364,6 +364,34 @@ func TestValidateNoFKCascades_userSchemaCaughtWhenUnscoped(t *testing.T) {
 	}
 }
 
+// A schema with only SOME of the signature tables (here 2 of 3) is NOT a
+// bintrail index — its real CASCADE must still be CAUGHT when unscoped. This
+// pins the exactness of HAVING COUNT(DISTINCT TABLE_NAME) = 3: a regression to
+// >= 1 (or a shorter IN-list) would silently skip this real user cascade,
+// reopening the #347-class silent-skip bug. (The existing "caught" test above
+// uses zero signature tables, so it would not detect such a loosening.)
+func TestValidateNoFKCascades_partialSignatureCaughtWhenUnscoped(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+
+	const userSchema = "fkcascade_partial"
+	testutil.MustExec(t, db, "DROP DATABASE IF EXISTS `"+userSchema+"`")
+	testutil.MustExec(t, db, "CREATE DATABASE `"+userSchema+"`")
+	t.Cleanup(func() { _, _ = db.Exec("DROP DATABASE IF EXISTS `" + userSchema + "`") })
+
+	// Two of the three signature names, but not all three.
+	testutil.MustExec(t, db, "CREATE TABLE `"+userSchema+"`.binlog_events (id INT PRIMARY KEY)")
+	testutil.MustExec(t, db, "CREATE TABLE `"+userSchema+"`.stream_state (id INT PRIMARY KEY)")
+	// ...plus a genuine cascade that must be caught.
+	testutil.MustExec(t, db, "CREATE TABLE `"+userSchema+"`.parents (id INT PRIMARY KEY)")
+	testutil.MustExec(t, db, "CREATE TABLE `"+userSchema+"`.children ("+
+		"id INT PRIMARY KEY, parent_id INT NOT NULL, "+
+		"CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES `"+userSchema+"`.parents(id) ON DELETE CASCADE)")
+
+	if !unscopedFKCascadeSchemas(t, db)[userSchema] {
+		t.Fatalf("expected partial-signature schema %q (2 of 3 signature tables) to be flagged by the unscoped scan, but it was not", userSchema)
+	}
+}
+
 // ─── ensureResolver ──────────────────────────────────────────────────────────────────
 
 func TestEnsureResolver_autoSnapshot(t *testing.T) {
