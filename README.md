@@ -216,9 +216,7 @@ For systemd, add `RestartPreventExitStatus=64 65` to the service unit so the age
 
 ## License
 
-This project is licensed under the [Business Source License 1.1](LICENSE). You may use bintrail for any purpose, including production use, except offering it as part of a competing commercial hosted service or managed consulting service. Each version converts to Apache License 2.0 four years after its release.
-
-For alternative licensing arrangements, contact daniel@dbtrail.com.
+This project is licensed under the [Apache License, Version 2.0](LICENSE). You may use, modify, and redistribute bintrail for any purpose, including commercial and production use, subject to the terms of that license. See the [NOTICE](NOTICE) file for attribution requirements.
 
 ## Contributing
 

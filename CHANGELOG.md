@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **License changed from Business Source License 1.1 to the Apache License, Version 2.0.** `LICENSE` now carries the verbatim Apache-2.0 text and a new `NOTICE` file records the copyright attribution (`(c) 2025 Daniel Guzman Burgos`), as is conventional under Apache-2.0. The README and CONTRIBUTING license sections and the `.goreleaser.yaml` package/image `license` metadata (`nfpms`, OCI `org.opencontainers.image.licenses` labels) are updated to `Apache-2.0`. This drops the BUSL Additional Use Grant restrictions and the four-year Change Date — bintrail is now permissively licensed for any use, including commercial. The CLA already reserved the maintainer's right to relicense, so existing contributions are covered.
+
 ## [0.7.13] - 2026-06-01
 
 ### Added

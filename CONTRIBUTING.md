@@ -155,4 +155,4 @@ By opening a pull request, you agree to the terms of the [Contributor License Ag
 
 ## License
 
-This project is licensed under the [Business Source License 1.1](LICENSE). By contributing, you grant the maintainer the rights described in the [CLA](CLA.md), which include the right to use your contributions under the current and future license terms.
+This project is licensed under the [Apache License, Version 2.0](LICENSE). By contributing, you grant the maintainer the rights described in the [CLA](CLA.md), which include the right to use your contributions under the current and future license terms.

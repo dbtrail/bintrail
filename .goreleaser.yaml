@@ -77,7 +77,7 @@ nfpms:
     description: >-
       Parse MySQL ROW-format binary logs, index every row event with full
       before/after images, and generate reversal SQL for recovery.
-    license: BUSL-1.1
+    license: Apache-2.0
     formats:
       - deb
       - rpm
@@ -112,7 +112,7 @@ dockers:
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
       - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
-      - "--label=org.opencontainers.image.licenses=BUSL-1.1"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
   - id: bintrail-arm64
     goos: linux
@@ -131,7 +131,7 @@ dockers:
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
       - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
-      - "--label=org.opencontainers.image.licenses=BUSL-1.1"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
 docker_manifests:
   - name_template: "ghcr.io/dbtrail/bintrail:{{ .Version }}"
@@ -164,7 +164,7 @@ docker_manifests:
 #       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
 #     homepage: https://github.com/dbtrail/bintrail
 #     description: MySQL binlog time-travel — index row events and generate reversal SQL.
-#     license: BUSL-1.1
+#     license: Apache-2.0
 #     install: |
 #       bin.install "bintrail"
 #       bin.install "bintrail-mcp"
