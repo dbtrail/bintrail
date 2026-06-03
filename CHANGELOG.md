@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **License changed from Business Source License 1.1 to the GNU Affero General Public License v3.0 (AGPL-3.0).** `LICENSE` now carries the verbatim AGPLv3 text, replacing the BUSL parameters (Additional Use Grant, four-year Apache-2.0 Change Date). The README and CONTRIBUTING license sections and the `.goreleaser.yaml` package/image `license` metadata (`nfpms`, OCI `org.opencontainers.image.licenses` labels) are updated to `AGPL-3.0`. The CLA already reserved the maintainer's right to relicense, so existing contributions are covered; alternative commercial licensing remains available via daniel@dbtrail.com.
+
 ## [0.7.13] - 2026-06-01
 
 ### Added
