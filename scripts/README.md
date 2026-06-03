@@ -6,11 +6,19 @@ Companion scripts that build on bintrail. These are examples, not part of the
 ## adaptive_throttle.py
 
 Adaptive write throttle for MySQL through ProxySQL, driven by binlog change
-volume. The trigger is replica apply lag (`Seconds_Behind_Source`); when the
+volume. The trigger is replica apply lag (`Seconds_Behind_Source`); when a
 replica falls behind, the script asks the bintrail index which table is
 producing the most binlog change right now, and installs a per-rule `delay` in
 ProxySQL that throttles writes to that one table. It clears the throttle when
-the replica catches up.
+the replicas catch up.
+
+It watches one or more replicas of the same primary. Because every replica
+replays the same primary's binlog, the hot table and the ProxySQL target are
+shared, so only the lag trigger is per-replica: it engages when the **worst**
+replica crosses the lag threshold and releases when **every** replica is back
+under it. A replica that is unreachable is logged and skipped, never aborting
+the others, and it reconnects on its own when it comes back. (This assumes one
+primary; replicas of different primaries would need a throttle per primary.)
 
 It is pure open-source: it talks only to your own MySQL, your ProxySQL admin
 interface, and the bintrail index database. No hosted service, no API key, no
@@ -40,7 +48,8 @@ Dependencies and assumptions:
 - A ProxySQL admin interface (default port 6032). On ProxySQL 3.0 the default
   `admin` user only connects locally, so run this on the ProxySQL host or add a
   non-local admin credential.
-- A read replica reachable for `SHOW REPLICA STATUS` (MySQL 8.0.22+ / 8.4).
+- One or more read replicas reachable for `SHOW REPLICA STATUS` (MySQL
+  8.0.22+ / 8.4), listed in `REPLICAS`.
 
-Edit the config block at the top (`PROXYSQL`, `REPLICA`, `INDEX`, thresholds)
+Edit the config block at the top (`PROXYSQL`, `REPLICAS`, `INDEX`, thresholds)
 before running. See the companion blog post for the full write-up.

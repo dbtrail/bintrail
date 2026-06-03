@@ -2,12 +2,21 @@
 """
 Adaptive write throttle for MySQL via ProxySQL, driven by binlog change volume.
 
-Trigger:   replica apply lag (Seconds_Behind_Source) on a read replica.
+Trigger:   replica apply lag (Seconds_Behind_Source) on one or more read
+           replicas of the same primary.
 Diagnosis: which table is generating the most binlog volume right now, read
            straight from the bintrail index (the `binlog_events` table that
            `bintrail stream` populates) with a plain GROUP BY.
 Action:    apply a per-rule delay in ProxySQL to the WRITE rule that matches
            the hot table.
+
+With several replicas the diagnosis and the action stay shared: every replica
+replays the same primary's binlog, so the hot table is the same, and there is
+one ProxySQL in front of that primary. Only the trigger is per-replica. We
+engage when the WORST replica crosses the lag threshold and release when EVERY
+replica is back under it. A replica that is unreachable is logged and skipped,
+never aborting the others (this assumes one primary; replicas of different
+primaries would need a throttle per primary).
 
 This script is pure open-source: it talks to MySQL/ProxySQL only. It needs a
 running `bintrail stream` writing to a `binlog_events` index, but no hosted
@@ -29,7 +38,12 @@ import pymysql
 # Config
 # ---------------------------------------------------------------------------
 PROXYSQL = dict(host="127.0.0.1", port=6032, user="admin", password="admin")
-REPLICA = dict(host="mysql-replica", port=3306, user="monitor", password="monitor")
+# One entry per replica to watch. All must replicate from the SAME primary
+# (the one ProxySQL fronts and bintrail indexes).
+REPLICAS = [
+    dict(host="mysql-replica-a", port=3306, user="monitor", password="monitor"),
+    dict(host="mysql-replica-b", port=3306, user="monitor", password="monitor"),
+]
 # The bintrail index DB: where `bintrail stream` writes the binlog_events table.
 INDEX = dict(host="127.0.0.1", port=3306, user="bintrail", password="bintrail",
              database="bintrail_index")
@@ -59,6 +73,60 @@ def get_replica_lag(conn):
         return None
     val = row.get("Seconds_Behind_Source")
     return int(val) if val is not None else None
+
+
+class Replica:
+    """A watched replica that connects lazily. A replica that is down at startup
+    (or that drops and comes back) does not stop the daemon: we (re)connect on
+    demand and raise on failure so the caller can mark it broken for this tick."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.label = f"{cfg['host']}:{cfg.get('port', 3306)}"
+        self.conn = None
+
+    def lag(self):
+        if self.conn is None:
+            self.conn = pymysql.connect(
+                autocommit=True, cursorclass=pymysql.cursors.DictCursor, **self.cfg
+            )
+        try:
+            self.conn.ping(reconnect=True)
+            return get_replica_lag(self.conn)
+        except Exception:
+            try:
+                self.conn.close()
+            finally:
+                self.conn = None       # force a fresh connect next tick
+            raise
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+
+def worst_replica_lag(replicas):
+    """Read every replica's lag. Returns (worst_lag, laggard_label, broken):
+    worst_lag is the highest numeric Seconds_Behind_Source seen this tick (None
+    if no replica reported a number), laggard_label names that replica, and
+    broken is a list of (label, reason) for replicas that returned NULL or were
+    unreachable. One bad replica never aborts the others."""
+    lags, broken = [], []
+    for rep in replicas:
+        try:
+            lag = rep.lag()
+        except Exception as exc:
+            broken.append((rep.label, str(exc) or "unreachable"))
+            continue
+        if lag is None:
+            broken.append((rep.label, "NULL / not applying"))
+        else:
+            lags.append((lag, rep.label))
+    if not lags:
+        return None, None, broken
+    worst_lag, label = max(lags)        # the worst (highest) lag drives the decision
+    return worst_lag, label, broken
 
 
 # ---------------------------------------------------------------------------
@@ -155,24 +223,25 @@ def rule_hits(conn):
 # ---------------------------------------------------------------------------
 # Loop
 # ---------------------------------------------------------------------------
-def tick(proxysql, replica, index, state):
-    """One control iteration. Raises on any unexpected failure; main() catches,
-    logs, and retries so a transient blip never kills the daemon."""
-    replica.ping(reconnect=True)
-    lag = get_replica_lag(replica)
+def tick(proxysql, replicas, index, state):
+    """One control iteration across all replicas. Engage when the worst replica
+    lag crosses the threshold; release when every replica is back under it.
+    Raises on an unexpected ProxySQL/index failure; main() catches and retries."""
+    lag, laggard, broken = worst_replica_lag(replicas)
+    for label, why in broken:
+        print(f"WARN: replica {label} lag unknown ({why})", file=sys.stderr)
 
-    # Broken / unknown replication: surface loudly and drop any active throttle
-    # (lag-based throttling is meaningless when the replica isn't applying).
+    # No replica reported a numeric lag: we have no lag signal at all. Throttling
+    # on no signal is wrong, so drop any active throttle and wait.
     if lag is None:
-        print("WARN: replica lag is NULL - replication stopped/broken", file=sys.stderr)
         if state["throttling"]:
             proxysql.ping(reconnect=True)
             clear_throttle(proxysql)
             state.update(throttling=False, hot=None, rule_table=None)
-            print("cleared throttle (lag unknown)")
+            print("cleared throttle (no replica lag signal)")
         return
 
-    print(f"lag={lag}s")
+    print(f"worst lag={lag}s ({laggard})")
 
     if lag >= LAG_THRESHOLD_S:
         now = time.monotonic()
@@ -206,18 +275,17 @@ def tick(proxysql, replica, index, state):
                 print(f"throttling {schema}.{table} by {DELAY_MS}ms")
 
     elif state["throttling"] and lag <= CLEAR_THRESHOLD_S:
+        # worst lag <= clear threshold means EVERY replica is back under it.
         proxysql.ping(reconnect=True)
         clear_throttle(proxysql)
         state.update(throttling=False, hot=None, rule_table=None)
-        print(f"lag back to {lag}s, throttle removed")
+        print(f"all replicas back to <= {CLEAR_THRESHOLD_S}s (worst {lag}s), throttle removed")
     # Band CLEAR_THRESHOLD_S < lag < LAG_THRESHOLD_S: hold current state.
 
 
 def main():
     proxysql = pymysql.connect(autocommit=True, **PROXYSQL)
-    replica = pymysql.connect(
-        autocommit=True, cursorclass=pymysql.cursors.DictCursor, **REPLICA
-    )
+    replicas = [Replica(cfg) for cfg in REPLICAS]
     # Pin the index session to UTC so the time window matches the stored
     # (UTC) binlog event timestamps.
     index = pymysql.connect(
@@ -240,7 +308,8 @@ def main():
             sys.exit(1)
         finally:
             proxysql.close()
-            replica.close()
+            for rep in replicas:
+                rep.close()
             index.close()
         print("throttle cleared, bye")
         sys.exit(0)
@@ -250,7 +319,7 @@ def main():
 
     while True:
         try:
-            tick(proxysql, replica, index, state)
+            tick(proxysql, replicas, index, state)
         except Exception as exc:
             print(f"WARN: iteration failed, will retry: {exc}", file=sys.stderr)
         time.sleep(POLL_INTERVAL_S)
