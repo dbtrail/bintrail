@@ -2,14 +2,21 @@ package main
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/console"
+	"github.com/dbtrail/bintrail/internal/indexer"
 )
 
 var upCmd = &cobra.Command{
@@ -50,6 +57,10 @@ var (
 	upPartitions  int
 	upSkipDoctor  bool
 	upFormat      string
+
+	upConsole       bool
+	upConsoleListen string
+	upConsoleToken  string
 )
 
 func init() {
@@ -64,6 +75,9 @@ func init() {
 	upCmd.Flags().IntVar(&upPartitions, "partitions", 48, "Hourly partitions to create on first init")
 	upCmd.Flags().BoolVar(&upSkipDoctor, "skip-doctor", false, "Skip the preflight checks (useful when you've already verified with `bintrail doctor`)")
 	upCmd.Flags().StringVar(&upFormat, "format", "text", "Output format: text or json")
+	upCmd.Flags().BoolVar(&upConsole, "console", false, "Also serve the read-only web console alongside the stream")
+	upCmd.Flags().StringVar(&upConsoleListen, "console-listen", "127.0.0.1:8090", "Console bind address when --console is set")
+	upCmd.Flags().StringVar(&upConsoleToken, "console-token", "", "Console access token (auto-generated for loopback binds when empty)")
 	_ = upCmd.MarkFlagRequired("source-dsn")
 	_ = upCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(upCmd)
@@ -127,7 +141,94 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Auto-derived server-id from source DSN: %d\n", serverID)
 	}
 	populateStreamFlags(serverID)
-	return runStream(cmd, args)
+
+	if !upConsole {
+		return runStream(cmd, args)
+	}
+	return runUpStreamWithConsole(cmd, args)
+}
+
+// runUpStreamWithConsole serves the read-only web console in this same process,
+// alongside the live stream. Both share one SIGINT/SIGTERM lifecycle: the signal
+// cancels the context the console runs on, and it also propagates to runStream's
+// child context, so a single Ctrl-C drains both. The console gets its own index
+// DB connection (the stream owns its own).
+func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
+	// Console-specific env vars, flag > env > default (mirrors runConsole).
+	if !cmd.Flags().Changed("console-listen") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_LISTEN"); v != "" {
+			upConsoleListen = v
+		}
+	}
+	if !cmd.Flags().Changed("console-token") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_TOKEN"); v != "" {
+			upConsoleToken = v
+		}
+	}
+
+	db, err := config.Connect(upIndexDSN)
+	if err != nil {
+		return fmt.Errorf("console: connect index database: %w", err)
+	}
+	defer db.Close()
+
+	// Bring the index schema up to date before serving — runStream also does
+	// this, but it runs after the console goroutine starts, so a legacy index DB
+	// missing newer columns (e.g. connection_id) could fail early /api/events
+	// requests in the startup window.
+	if err := indexer.EnsureSchema(db); err != nil {
+		return fmt.Errorf("console: schema migration: %w", err)
+	}
+
+	cfg, err := upConsoleConfig(db, upIndexDSN, upConsoleListen, upConsoleToken)
+	if err != nil {
+		return err
+	}
+	srv, err := console.New(cfg)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	cmd.SetContext(ctx)
+
+	// Bind synchronously so a port conflict fails `up` fast — otherwise the
+	// console would report "running" while the stream blocks for hours over a
+	// server that never bound.
+	ln, err := srv.Listen()
+	if err != nil {
+		return fmt.Errorf("console: cannot bind %s: %w", upConsoleListen, err)
+	}
+	consoleErr := make(chan error, 1)
+	go func() { consoleErr <- srv.Serve(ctx, ln) }()
+	fmt.Fprintf(os.Stderr, "\nConsole (read-only) is running. Open:\n\n    %s\n\n", srv.URL())
+
+	streamErr := runStream(cmd, args)
+	stop() // ensure the console shuts down even if the stream returned without a signal
+	if cErr := <-consoleErr; cErr != nil {
+		slog.Warn("console server exited with error", "error", cErr)
+	}
+	return streamErr
+}
+
+// upConsoleConfig builds the console configuration for `up --console`. It serves
+// the Phase 1 surface (events/recover/status) over the live index — no baseline
+// or profile. Extracted for testability (dbName extraction + DSN validation).
+func upConsoleConfig(db *sql.DB, indexDSN, listen, token string) (console.Config, error) {
+	cfg, err := mysql.ParseDSN(indexDSN)
+	if err != nil {
+		return console.Config{}, fmt.Errorf("invalid --index-dsn: %w", err)
+	}
+	if cfg.DBName == "" {
+		return console.Config{}, fmt.Errorf("--index-dsn must include a database name (e.g. user:pass@tcp(host:3306)/binlog_index)")
+	}
+	return console.Config{
+		DB:     db,
+		DBName: cfg.DBName,
+		Listen: listen,
+		Token:  token,
+	}, nil
 }
 
 // populateStreamFlags copies every up* package global into the corresponding

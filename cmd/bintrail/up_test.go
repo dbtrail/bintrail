@@ -20,10 +20,10 @@ func TestPopulateStreamFlags(t *testing.T) {
 		uBatch, uChk                       int
 		// strm* side
 		sSrc, sIdx, sFile, sGTID, sSch, sTbl, sMet, sFmt, sSSL, sCA, sCert, sKey string
-		sSID                                                                    uint32
-		sPos                                                                    uint32
-		sBatch, sChk, sGap                                                      int
-		sReset, sNoGap                                                          bool
+		sSID                                                                     uint32
+		sPos                                                                     uint32
+		sBatch, sChk, sGap                                                       int
+		sReset, sNoGap                                                           bool
 	}{
 		uSrc: upSourceDSN, uIdx: upIndexDSN, uSID: upServerID,
 		uSch: upSchemas, uTbl: upTables, uBatch: upBatchSize,
@@ -106,5 +106,31 @@ func assertStr(t *testing.T, name, got, want string) {
 	t.Helper()
 	if got != want {
 		t.Errorf("%s = %q, want %q", name, got, want)
+	}
+}
+
+func TestUpConsoleConfig(t *testing.T) {
+	cfg, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", "127.0.0.1:8090", "tok")
+	if err != nil {
+		t.Fatalf("upConsoleConfig: %v", err)
+	}
+	if cfg.DBName != "binlog_index" {
+		t.Errorf("DBName = %q, want binlog_index", cfg.DBName)
+	}
+	if cfg.Listen != "127.0.0.1:8090" || cfg.Token != "tok" {
+		t.Errorf("Listen=%q Token=%q, want 127.0.0.1:8090 / tok", cfg.Listen, cfg.Token)
+	}
+	// up --console serves the Phase 1 surface only — no baseline/profile.
+	if cfg.BaselineDir != "" || cfg.BaselineS3 != "" || cfg.NoArchive {
+		t.Errorf("up console config should not set baseline/no-archive: %+v", cfg)
+	}
+	// Invalid DSN (no '/') must error, not silently produce an empty dbName.
+	if _, err := upConsoleConfig(nil, "invalid", "127.0.0.1:8090", ""); err == nil {
+		t.Error("invalid --index-dsn should error")
+	}
+	// A DSN with no database name must error (parity with runConsole) rather
+	// than starting a console that feeds an empty schema to the planner.
+	if _, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/", "127.0.0.1:8090", ""); err == nil {
+		t.Error("--index-dsn without a database name should error")
 	}
 }

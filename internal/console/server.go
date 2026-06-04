@@ -197,19 +197,25 @@ func (s *Server) URL() string {
 	return fmt.Sprintf("http://%s/?token=%s", displayHost(s.listen), s.token)
 }
 
-// Run starts the HTTP server and blocks until ctx is cancelled, then shuts the
-// server down gracefully (5s drain). Returns the listen error, or nil on a
-// clean shutdown.
-func (s *Server) Run(ctx context.Context) error {
+// Listen binds the configured address and returns the listener synchronously,
+// so a caller can fail fast on a port conflict before reporting the server as
+// ready (the standalone command blocks on Run, but `bintrail up --console`
+// starts the server in a goroutine and must surface a bind error up front).
+func (s *Server) Listen() (net.Listener, error) {
+	return net.Listen("tcp", s.listen)
+}
+
+// Serve serves on ln and blocks until ctx is cancelled, then shuts the server
+// down gracefully (5s drain). It takes ownership of ln (Shutdown closes it).
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
-		Addr:              s.listen,
 		Handler:           s.mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}
@@ -224,6 +230,16 @@ func (s *Server) Run(ctx context.Context) error {
 		defer cancel()
 		return srv.Shutdown(shutCtx)
 	}
+}
+
+// Run binds and serves, blocking until ctx is cancelled, then shuts down
+// gracefully. Returns the bind/serve error, or nil on a clean shutdown.
+func (s *Server) Run(ctx context.Context) error {
+	ln, err := s.Listen()
+	if err != nil {
+		return err
+	}
+	return s.Serve(ctx, ln)
 }
 
 // displayHost turns a bind address into a browser-reachable host:port,

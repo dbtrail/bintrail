@@ -114,10 +114,12 @@ Bintrail console (read-only) is running. Open:
     http://127.0.0.1:8090/?token=ab12cd34ef56ab12cd34ef56ab12cd34
 ```
 
+Or serve it alongside a live stream in one process: `bintrail up --source-dsn "$SRC" --index-dsn "$IDX" --console`.
+
 Three screens:
 
 - **Recover** — filter by schema / table / PK / time, preview the affected rows with before→after diffs, then generate undo SQL to copy or download.
-- **Events** — browse every indexed change with full before/after images.
+- **Events** — browse every indexed change with full before/after images; download results as JSON or CSV.
 - **Status** — index health: partitions, coverage, stream lag, archives.
 
 It **never executes SQL** — recover produces a script you review and apply yourself, exactly like `bintrail recover --dry-run`. It binds to loopback with an auto-generated access token by default; binding to a non-loopback address requires an explicit `--token`. See [Web console](docs/console.md) for the security model and HTTP API.

@@ -29,6 +29,18 @@ Bintrail console (read-only) is running. Open:
     http://127.0.0.1:8090/?token=ab12cd34ef56ab12cd34ef56ab12cd34
 ```
 
+Or serve it **alongside a live stream** in one process with `bintrail up --console`:
+
+```sh
+bintrail up --source-dsn "$SRC" --index-dsn "$IDX" --console
+```
+
+`--console-listen` / `--console-token` (or `BINTRAIL_CONSOLE_LISTEN` /
+`BINTRAIL_CONSOLE_TOKEN`) customize the bind and token; a single Ctrl-C drains
+both the stream and the console. (This serves the Phase 1 surface —
+events/recover/status; baseline-gated Time-travel is for the standalone
+`bintrail console`.)
+
 Open that URL in a browser. Four tabs (Time-travel appears only when a baseline
 is configured):
 
@@ -36,6 +48,10 @@ is configured):
    affected rows with before→after diffs, then **Generate undo SQL** and
    copy/download the script.
 2. **Events** — broader filters (event type, changed column, GTID, limit).
+   Results carry **Download JSON / Download CSV** buttons (also on the Recover
+   preview). Export is client-side over the rows already on screen, so it stays
+   within the result caps and — like the on-screen rows — never includes
+   `connection_id`.
 3. **Status** — index health: partitions, coverage, stream lag, archives.
 4. **Time-travel** — single-row point-in-time reconstruct. Appears **only when a
    baseline is configured** (`--baseline-dir`/`--baseline-s3`); otherwise the tab

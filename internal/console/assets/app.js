@@ -123,12 +123,18 @@ function renderDiff(ev) {
 
 function renderEvents(container, data) {
   clear(container);
-  container.appendChild(el("div", { class: "meta-line" },
-    `${data.count} event(s) · limit ${data.limit}`));
+  const meta = el("div", { class: "meta-line" }, `${data.count} event(s) · limit ${data.limit}`);
   if (!data.events || data.events.length === 0) {
+    container.appendChild(meta);
     container.appendChild(el("div", { class: "empty" }, "No events matched these filters."));
     return;
   }
+  // Export toolbar — client-side, over the already-fetched (redacted) DTOs, so
+  // it carries no connection_id and only the capped result set.
+  meta.appendChild(el("span", { class: "export-bar" },
+    el("button", { type: "button", class: "export-btn", onclick: () => downloadEventsJSON(data.events) }, "Download JSON"),
+    el("button", { type: "button", class: "export-btn", onclick: () => downloadEventsCSV(data.events) }, "Download CSV")));
+  container.appendChild(meta);
   const tbody = el("tbody");
   data.events.forEach((ev) => {
     const row = el("tr", { class: "event-row" },
@@ -208,13 +214,53 @@ function copySQL() {
     .catch(() => toast("copy failed"));
 }
 
+// downloadBlob triggers a client-side file download, surfacing failures as a
+// toast (parity with copySQL) rather than only an uncaught console exception.
+function downloadBlob(filename, content, mime) {
+  try {
+    const a = el("a", {
+      href: URL.createObjectURL(new Blob([content], { type: mime })),
+      download: filename,
+    });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+  } catch (err) {
+    toast("download failed: " + (err.message || err));
+  }
+}
+
 function downloadSQL() {
-  const blob = new Blob([lastSQL], { type: "application/sql" });
-  const a = el("a", { href: URL.createObjectURL(blob), download: "bintrail-undo.sql" });
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(a.href);
+  downloadBlob("bintrail-undo.sql", lastSQL, "application/sql");
+}
+
+// ── events export (client-side, over the redacted eventDTOs) ──────────────────
+// Flat CSV columns; row_before/row_after and changed_columns are emitted as JSON
+// strings. connection_id is intentionally absent — these DTOs never carried it.
+const EVENT_CSV_COLUMNS = [
+  "event_id", "event_timestamp", "schema_name", "table_name", "event_type",
+  "pk_values", "changed_columns", "gtid", "binlog_file", "start_pos", "end_pos",
+  "row_before", "row_after",
+];
+
+function csvCell(v) {
+  let s;
+  if (v === null || v === undefined) s = "";
+  else if (typeof v === "object") s = JSON.stringify(v); // arrays + maps
+  else s = String(v);
+  if (/[",\r\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function downloadEventsJSON(events) {
+  downloadBlob("bintrail-events.json", JSON.stringify(events, null, 2), "application/json");
+}
+
+function downloadEventsCSV(events) {
+  const lines = [EVENT_CSV_COLUMNS.join(",")];
+  events.forEach((ev) => lines.push(EVENT_CSV_COLUMNS.map((c) => csvCell(ev[c])).join(",")));
+  downloadBlob("bintrail-events.csv", lines.join("\r\n"), "text/csv");
 }
 
 // ── status tab ───────────────────────────────────────────────────────────────

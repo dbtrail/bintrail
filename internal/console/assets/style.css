@@ -190,6 +190,17 @@ table.events tr.event-row:hover td { background: var(--panel); }
 .diff .changed { background: rgba(91, 157, 255, 0.07); }
 
 .meta-line { color: var(--muted); margin: 14px 0 4px; font-size: 13px; }
+.export-bar { display: inline-flex; gap: 8px; margin-left: 16px; }
+.export-btn {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+}
+.export-btn:hover { border-color: var(--accent); }
 
 .sql-toolbar {
   display: flex;
