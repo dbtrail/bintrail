@@ -2,11 +2,18 @@
 
 // ── token bootstrap ────────────────────────────────────────────────────────
 // The page itself loads without a token; the API requires one. We read it from
-// the ?token= query param the CLI prints, keep it in memory, and strip it from
-// the visible URL so it isn't left sitting in the address bar / history.
-const TOKEN = new URLSearchParams(location.search).get("token") || "";
+// the ?token= query param the CLI prints, persist it in sessionStorage, and
+// strip it from the visible URL so it isn't left sitting in the address bar /
+// history. On a reload the param is gone, so we recover the token from
+// sessionStorage — otherwise a refresh would drop it and every request would
+// 401. sessionStorage is per-tab and cleared when the tab closes.
+const TOKEN_KEY = "bintrail_console_token";
+let TOKEN = new URLSearchParams(location.search).get("token") || "";
 if (TOKEN) {
+  try { sessionStorage.setItem(TOKEN_KEY, TOKEN); } catch (e) { /* storage unavailable */ }
   history.replaceState(null, "", location.pathname);
+} else {
+  try { TOKEN = sessionStorage.getItem(TOKEN_KEY) || ""; } catch (e) { TOKEN = ""; }
 }
 
 let lastSQL = "";
