@@ -179,6 +179,32 @@ The script is wrapped in `BEGIN`/`COMMIT` and reverses events in reverse chronol
 
 ---
 
+## Step 5½ — Or do steps 4–5 from a browser
+
+Steps 4 and 5 (query + recover) are also available as a read-only web UI — same binary, no extra setup:
+
+```sh
+bintrail console --index-dsn "$IDX"
+```
+
+It prints a tokenized loopback URL; open it in a browser:
+
+```
+Bintrail console (read-only) is running. Open:
+
+    http://127.0.0.1:8090/?token=ab12cd34ef56ab12cd34ef56ab12cd34
+```
+
+Three screens:
+
+- **Recover** — filter by schema / table / PK / time, preview the affected rows with before→after diffs, then generate undo SQL to copy or download.
+- **Events** — browse every indexed change with full before/after images.
+- **Status** — index health: partitions, coverage, stream lag, archives.
+
+Like `recover --dry-run`, the console **never executes SQL** — you review and apply the script yourself. It binds to loopback with an auto-generated access token by default; a non-loopback bind requires an explicit `--token`. See [Web console](./console.md) for the security model and HTTP API.
+
+---
+
 ## Step 6 — Keep the index clean
 
 The `binlog_events` table will keep growing. Drop old data with `rotate`:
@@ -245,12 +271,15 @@ bintrail rotate        ← run hourly to drop old partitions and stay clean
 bintrail status        ← check at any time
 ```
 
+> Prefer clicking to typing? `bintrail console` exposes the query + recover steps as a read-only web UI.
+
 ---
 
 ## Next Steps
 
 | Want to... | Read... |
 |---|---|
+| Browse changes and generate undo SQL from a browser | [Web console](./console.md) |
 | Use RDS, Aurora, or Cloud SQL | [Streaming](./streaming.md) |
 | Understand the query and recovery options in depth | [Query and Recovery](./query-and-recovery.md) |
 | Archive old events to S3 before dropping | [Rotation and Status](./rotation-and-status.md#archiving-partitions-to-parquet) |

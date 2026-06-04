@@ -69,6 +69,8 @@ bintrail recover \
   --output recovery.sql
 ```
 
+> **Prefer a browser?** `bintrail console --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"` opens a read-only web UI to browse changes with before/after diffs and generate undo SQL — no extra infrastructure. See [Web console](#web-console).
+
 > **Managed MySQL (RDS, Aurora, Cloud SQL)?** `bintrail up` connects over the replication protocol — no disk access to binlogs required. See [Streaming](docs/streaming.md).
 
 > **Want manual control of each step?** See [Step-by-step setup](#step-by-step-setup) below for the underlying `init` / `snapshot` / `stream` commands.
@@ -96,7 +98,29 @@ bintrail stream --source-dsn "$SRC" --index-dsn "$IDX" --server-id 12345
 bintrail index --binlog-dir /var/lib/mysql --source-dsn "$SRC" --index-dsn "$IDX" --all
 ```
 
-## Commands
+## Web console
+
+Prefer a browser to the CLI? `bintrail console` serves a **read-only, single-operator web UI** over your index — same single binary, no extra infrastructure. Think of it as the MCP server with a web face: browse every change, see before/after diffs, and generate undo SQL from a browser.
+
+```sh
+bintrail console --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
+```
+
+It prints a tokenized loopback URL to open:
+
+```
+Bintrail console (read-only) is running. Open:
+
+    http://127.0.0.1:8090/?token=ab12cd34ef56ab12cd34ef56ab12cd34
+```
+
+Three screens:
+
+- **Recover** — filter by schema / table / PK / time, preview the affected rows with before→after diffs, then generate undo SQL to copy or download.
+- **Events** — browse every indexed change with full before/after images.
+- **Status** — index health: partitions, coverage, stream lag, archives.
+
+It **never executes SQL** — recover produces a script you review and apply yourself, exactly like `bintrail recover --dry-run`. It binds to loopback with an auto-generated access token by default; binding to a non-loopback address requires an explicit `--token`. See [Web console](docs/console.md) for the security model and HTTP API.
 
 | Command | Description |
 |---|---|
@@ -108,6 +132,7 @@ bintrail index --binlog-dir /var/lib/mysql --source-dsn "$SRC" --index-dsn "$IDX
 | `stream` | Connect as a replica and index row events in real-time |
 | `query` | Search the index with flexible filters (schema, table, PK, time range, GTID) |
 | `recover` | Generate reversal SQL for matching events |
+| `console` | Serve a read-only web UI to browse changes and generate undo SQL from a browser |
 | `reconstruct` | Rebuild row state at a point in time from baselines + binlog events |
 | `rotate` | Drop old partitions, add new ones, optionally archive to Parquet |
 | `status` | Show indexed files, partition sizes, and event counts |
@@ -189,6 +214,7 @@ The index stores complete before and after row images for every event, so recove
 | [Streaming](docs/streaming.md) | Real-time replication indexing |
 | [Streaming 101](docs/streaming-101.md) | Getting started with stream |
 | [Query and Recovery](docs/query-and-recovery.md) | Filters, output formats, and recovery workflows |
+| [Web console](docs/console.md) | Read-only browser UI: browse changes, diffs, and generate undo SQL |
 | [Rotation and Status](docs/rotation-and-status.md) | Partition management and monitoring |
 | [Dump and Baseline](docs/dump-and-baseline.md) | mydumper workflow and Parquet baselines |
 | [DDL Tracking](docs/ddl-tracking.md) | Schema change detection and handling |
