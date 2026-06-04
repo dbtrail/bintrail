@@ -133,22 +133,23 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 
 // fetch runs the shared cross-source fetch (live MySQL + Parquet archives).
 //
-// allowGaps trades safety for tolerance. Events browsing passes true: a coverage
-// gap (or an archive that fails to load) becomes a warning and the browser shows
-// whatever could be fetched. Recover passes false: a detected coverage gap or a
-// total archive failure becomes a hard error, because silently generating an
-// INCOMPLETE undo script and presenting it as success is worse than refusing.
+// AllowGaps is true for both events and recover, matching the CLI `recover`
+// (warn-and-continue — a human reviews the script). Coverage gaps the planner
+// detects are returned in the QueryPlan and surfaced to the caller as warnings
+// via gapWarnings(plan); the recover UI renders them prominently, so an
+// incomplete-coverage undo is never presented as a clean success.
 //
-// Note one residual case FetchMerged does not expose either way: when several
-// archive sources are configured and only SOME fail, it logs and continues
-// (matching the CLI `recover`). The console cannot surface that today because
-// FetchMerged returns no per-source failure signal; see docs/console.md.
-func (s *Server) fetch(ctx context.Context, opts query.Options, allowGaps bool) ([]query.ResultRow, *query.QueryPlan, error) {
+// One residual case FetchMerged does not expose: when several archive sources
+// are configured and only SOME fail to load, it logs the failure server-side
+// and continues (again, matching the CLI). The console cannot surface that to
+// the browser today because FetchMerged returns no per-source failure signal;
+// this limitation is documented in docs/console.md.
+func (s *Server) fetch(ctx context.Context, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
 	return query.FetchMerged(ctx, s.db, s.engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         s.dbName,
 		NoArchive:      s.noArchive,
-		AllowGaps:      allowGaps,
+		AllowGaps:      true,
 		ArchiveFetcher: parquetquery.Fetch,
 	})
 }
@@ -173,8 +174,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Browsing tolerates gaps: surface them as warnings, don't fail.
-	rows, plan, err := s.fetch(r.Context(), opts, true)
+	rows, plan, err := s.fetch(r.Context(), opts)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -226,16 +226,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// Forcing ASC here also makes the LIMIT select the oldest N, matching the CLI.
 	opts.Order = ""
 
-	// allowGaps=false: a coverage gap or total archive failure must abort with a
-	// clear error rather than silently producing an incomplete undo script.
-	rows, plan, err := s.fetch(r.Context(), opts, false)
+	// Coverage gaps come back in plan.GapHours and are surfaced as warnings
+	// below — the recover UI renders them, so an incomplete-coverage undo is
+	// flagged to the operator rather than silently presented as complete.
+	rows, plan, err := s.fetch(r.Context(), opts)
 	if err != nil {
-		var gapErr *query.GapError
-		if errors.As(err, &gapErr) {
-			writeJSONError(w, http.StatusUnprocessableEntity,
-				"refusing to generate an incomplete undo script — "+err.Error())
-			return
-		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

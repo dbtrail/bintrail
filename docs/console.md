@@ -102,21 +102,19 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 
 ### Coverage gaps and incomplete data
 
-The two surfaces treat missing coverage differently, on purpose:
-
-- **Events** browsing tolerates gaps: hours rotated out of MySQL with no archive
-  are reported in a `warnings` array, and the browser shows whatever could be
-  fetched.
-- **Recover** refuses to generate a partial undo: a detected coverage gap, or a
-  total archive-fetch failure, returns an error (HTTP 422 / 500) instead of a
-  silently-incomplete script. You can't accidentally apply half an undo.
+Both `/api/events` and `/api/recover` report coverage gaps (hours rotated out of
+MySQL with no archive) in a `warnings` array rather than failing the request —
+matching the CLI `recover`, which warns and continues so a human can review the
+script. The recover screen renders those warnings prominently, so an
+incomplete-coverage undo is flagged to the operator rather than silently
+presented as complete.
 
 One residual limitation: when *several* archive sources are configured and only
 *some* fail to load, `query.FetchMerged` logs the failure server-side and
-continues with the rest (this matches the CLI `recover`). The console cannot yet
-surface that per-source failure to the browser, because `FetchMerged` returns no
-per-source failure signal. Watch the server log if you run with multiple archive
-sources.
+continues with the rest (this too matches the CLI `recover`). The console cannot
+yet surface that per-source failure to the browser, because `FetchMerged`
+returns no per-source failure signal. Watch the server log if you run with
+multiple archive sources.
 
 ## Build
 

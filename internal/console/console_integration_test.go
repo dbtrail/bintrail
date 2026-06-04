@@ -155,6 +155,33 @@ func TestIntegrationRecoverMatchesGenerator(t *testing.T) {
 	}
 }
 
+// TestIntegrationRecoverWithTimeRangeSurfacesGap exercises the planner-active
+// recover path. testutil.InitIndexTables creates only the p_future partition,
+// so loadLivePartitionHours is empty and every hour in a bounded query range is
+// classified as a gap. Recover must still SUCCEED (200) with the undo
+// statements and surface the gap as a warning — never hard-fail. This locks in
+// AllowGaps=true for recover: a former AllowGaps=false would have returned 422
+// here, diverging from the CLI `recover` the issue requires it to match.
+func TestIntegrationRecoverWithTimeRangeSurfacesGap(t *testing.T) {
+	srv, _ := seedConsoleData(t)
+
+	body := `{"schema":"app","table":"users","since":"2026-06-01 00:00:00","until":"2026-06-02 00:00:00"}`
+	rec, raw := doReq(t, srv, "POST", "/api/recover", body)
+	if rec.Code != 200 {
+		t.Fatalf("recover with time range code = %d, body = %s", rec.Code, raw)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatementCount != 2 {
+		t.Errorf("statement_count = %d, want 2 (undo still generated despite gap)", resp.StatementCount)
+	}
+	if len(resp.Warnings) == 0 {
+		t.Error("expected a coverage-gap warning (only p_future exists, so the bounded range is all gap)")
+	}
+}
+
 // statements extracts the executable SQL lines (ignoring comments, blanks, and
 // the BEGIN/COMMIT wrapper) so two scripts can be compared without their
 // timestamped header comment.
