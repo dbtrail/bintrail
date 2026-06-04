@@ -40,6 +40,17 @@ func TestMuxAPIRequiresToken(t *testing.T) {
 			t.Errorf("%s without token: code = %d, want 401", path, rec.Code)
 		}
 	}
+
+	// POST /api/recover must also require the token — the bearer-header
+	// requirement exists specifically to stop a cross-site form POST from
+	// reaching it with ambient credentials (see auth.go).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8090/api/recover",
+		strings.NewReader(`{"schema":"app"}`))
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Errorf("POST /api/recover without token: code = %d, want 401", rec.Code)
+	}
 }
 
 func TestMuxServesAssets(t *testing.T) {
@@ -89,9 +100,11 @@ func TestURLContainsToken(t *testing.T) {
 
 func TestDisplayHostRewritesWildcard(t *testing.T) {
 	cases := map[string]string{
-		"0.0.0.0:8090":   "127.0.0.1:8090",
-		"127.0.0.1:8090": "127.0.0.1:8090",
-		"::":             "::", // no port → returned as-is
+		"0.0.0.0:8090":      "127.0.0.1:8090",
+		"127.0.0.1:8090":    "127.0.0.1:8090",
+		"[::]:8090":         "[::1]:8090",        // wildcard IPv6 → loopback
+		"[2001:db8::1]:443": "[2001:db8::1]:443", // IPv6 literal kept, bracketed
+		"::":                "::",                // no port → returned as-is
 	}
 	for in, want := range cases {
 		if got := displayHost(in); got != want {

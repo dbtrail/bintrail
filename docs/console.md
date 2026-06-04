@@ -98,7 +98,7 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `GET /api/status` | Index status (same payload as `bintrail status --format json`). |
 | `GET /api/schemas` | Distinct schemas. `?schema=<name>` → that schema's tables. |
 | `GET /api/events` | Event browser. Query params: `schema, table, pk, event_type, gtid, since, until, changed_column, order, limit`. |
-| `POST /api/recover` | Undo-SQL generation. JSON body with the same filter fields (requires at least `schema`). Returns `{sql, statement_count, row_count, warnings}`. |
+| `POST /api/recover` | Undo-SQL generation. JSON body with the same filter fields (requires at least `schema`; an `order` field is accepted but ignored — recover always processes oldest-first). Returns `{sql, statement_count, row_count, warnings}`. |
 
 ### Coverage gaps and incomplete data
 
@@ -109,12 +109,15 @@ script. The recover screen renders those warnings prominently, so an
 incomplete-coverage undo is flagged to the operator rather than silently
 presented as complete.
 
-One residual limitation: when *several* archive sources are configured and only
-*some* fail to load, `query.FetchMerged` logs the failure server-side and
-continues with the rest (this too matches the CLI `recover`). The console cannot
-yet surface that per-source failure to the browser, because `FetchMerged`
-returns no per-source failure signal. Watch the server log if you run with
-multiple archive sources.
+One residual limitation: a few failure modes are logged server-side but not
+surfaced to the browser, because `query.FetchMerged` exposes no signal for them
+(this matches the CLI `recover`, which warns to stderr and continues):
+
+- some of several configured archive sources fail to load, and
+- the query planner itself fails to run (gap detection is skipped entirely).
+
+In both cases you get results without a coverage caveat in the response. Watch
+the server log when running with archives configured.
 
 ## Build
 

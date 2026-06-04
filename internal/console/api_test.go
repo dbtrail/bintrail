@@ -3,6 +3,7 @@ package console
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,87 @@ func TestBuildOptionsValues(t *testing.T) {
 	asc, _ := s.buildOptions(filterParams{Order: "asc"}, 100, 1000)
 	if asc.Order != "ASC" {
 		t.Errorf("Order = %q, want ASC", asc.Order)
+	}
+}
+
+// TestBuildOptionsAttachesRBAC guards that the server's profile rules (deny
+// tables / redact columns) are attached to every query.Options buildOptions
+// produces — a refactor that drops this wiring would silently bypass RBAC.
+func TestBuildOptionsAttachesRBAC(t *testing.T) {
+	deny := []query.SchemaTable{{Schema: "app", Table: "secrets"}}
+	redact := []query.SchemaTableColumn{{Schema: "app", Table: "users", Column: "ssn"}}
+	s := &Server{denyTables: deny, redactCols: redact}
+
+	opts, err := s.buildOptions(filterParams{Schema: "app"}, 100, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(opts.DenyTables, deny) {
+		t.Errorf("DenyTables not attached to options: %+v", opts.DenyTables)
+	}
+	if !reflect.DeepEqual(opts.RedactColumns, redact) {
+		t.Errorf("RedactColumns not attached to options: %+v", opts.RedactColumns)
+	}
+}
+
+// TestEventsHandlerOmitsConnectionID exercises handleEvents at the HTTP layer
+// with sqlmock and asserts the open-core boundary holds over real data flow:
+// the source row carries connection_id, the response must not.
+func TestEventsHandlerOmitsConnectionID(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	cols := []string{
+		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
+		"changed_columns", "row_before", "row_after", "schema_version",
+	}
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	rows := sqlmock.NewRows(cols).AddRow(
+		int64(1), "bin.000001", int64(4), int64(40), ts,
+		nil, int64(4242), "app", "users", int64(parser.EventUpdate), "7",
+		[]byte(`["email"]`), []byte(`{"email":"a@x"}`), []byte(`{"email":"b@x"}`), int64(0),
+	)
+	mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
+
+	s := &Server{db: db, engine: query.New(db), dbName: "", noArchive: true, token: "t"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/events?schema=app&table=users", nil)
+	s.handleEvents(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("events status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "connection_id") || strings.Contains(body, "4242") {
+		t.Errorf("events HTTP response leaked connection_id: %s", body)
+	}
+	var resp eventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Count != 1 {
+		t.Errorf("count = %d, want 1", resp.Count)
+	}
+	if resp.Limit != eventsDefaultLimit {
+		t.Errorf("limit = %d, want default %d", resp.Limit, eventsDefaultLimit)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestRecoverInvalidJSON: a malformed (non-empty) body is a 400, not a panic.
+func TestRecoverInvalidJSON(t *testing.T) {
+	s := &Server{token: "t"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/recover", strings.NewReader(`{bad`))
+	s.handleRecover(rec, req)
+	if rec.Code != 400 {
+		t.Errorf("invalid JSON body: code = %d, want 400", rec.Code)
 	}
 }
 

@@ -2,6 +2,8 @@ package console
 
 import (
 	"encoding/json"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -79,5 +81,45 @@ func TestEventTypeName(t *testing.T) {
 func TestToEventDTOsNonNil(t *testing.T) {
 	if got := toEventDTOs(nil); got == nil {
 		t.Error("toEventDTOs(nil) should return a non-nil empty slice (JSON []), got nil")
+	}
+}
+
+// TestEventDTOFieldAllowlist guards the open-core boundary as an allowlist
+// rather than a denylist: it pins the EXACT set of JSON keys the events surface
+// may expose. A new field added to eventDTO (or a future sensitive field on
+// query.ResultRow copied through toEventDTO) fails this test until the allowlist
+// is consciously updated — catching a leak that name-specific checks would miss.
+func TestEventDTOFieldAllowlist(t *testing.T) {
+	cid := uint32(1)
+	gtid := "g:1"
+	dto := toEventDTO(query.ResultRow{
+		GTID:           &gtid,
+		ConnectionID:   &cid,
+		ChangedColumns: []string{"a"},
+		RowBefore:      map[string]any{"a": 1},
+		RowAfter:       map[string]any{"a": 2},
+	})
+	b, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(m))
+	for k := range m {
+		got = append(got, k)
+	}
+	sort.Strings(got)
+
+	want := []string{
+		"binlog_file", "changed_columns", "end_pos", "event_id",
+		"event_timestamp", "event_type", "gtid", "pk_values",
+		"row_after", "row_before", "schema_name", "start_pos", "table_name",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("eventDTO JSON keys = %v\nwant exactly %v\n"+
+			"(a new key here may cross the free/paid boundary — add it to the allowlist only on purpose)", got, want)
 	}
 }

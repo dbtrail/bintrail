@@ -51,7 +51,9 @@ func bearerToken(r *http.Request) string {
 }
 
 // tokenMiddleware requires a valid bearer token on every wrapped request.
-// The comparison is constant-time to avoid leaking the token via timing.
+// The comparison is constant-time for equal-length inputs (subtle returns 0
+// immediately on a length mismatch, so token *length* is not hidden — that's
+// fine here, the token is a fixed 32 hex chars).
 //
 // The token is required in the Authorization header specifically (not a
 // cookie): a browser fetch() must opt in to sending it, which keeps a

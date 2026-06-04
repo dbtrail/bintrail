@@ -182,6 +182,52 @@ func TestIntegrationRecoverWithTimeRangeSurfacesGap(t *testing.T) {
 	}
 }
 
+// TestIntegrationProfileRBAC verifies end-to-end that profile RBAC rules are
+// enforced on the console's events surface: a denied table never appears, and a
+// redacted column's value is nulled while its siblings remain. It also confirms
+// New forces NoArchive when RBAC rules are present (archives don't apply RBAC).
+func TestIntegrationProfileRBAC(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	testutil.InsertEvent(t, db, "bin.000001", 4, 40, "2026-06-01 12:00:00", nil,
+		"app", "users", 1 /*INSERT*/, "1",
+		nil, nil, []byte(`{"id":1,"email":"alice@x","ssn":"111-22-3333"}`))
+	testutil.InsertEvent(t, db, "bin.000001", 40, 80, "2026-06-01 12:01:00", nil,
+		"app", "secrets", 1 /*INSERT*/, "1",
+		nil, nil, []byte(`{"id":1,"value":"topsecret"}`))
+
+	srv, err := New(Config{
+		DB:            db,
+		DBName:        dbName,
+		Listen:        "127.0.0.1:8090",
+		Token:         intToken,
+		DenyTables:    []query.SchemaTable{{Schema: "app", Table: "secrets"}},
+		RedactColumns: []query.SchemaTableColumn{{Schema: "app", Table: "users", Column: "ssn"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !srv.noArchive {
+		t.Error("New must force noArchive when RBAC rules are present (archives don't enforce RBAC)")
+	}
+
+	// Denied table: querying it returns nothing and never leaks its data.
+	_, body := doReq(t, srv, "GET", "/api/events?schema=app&table=secrets", "")
+	if strings.Contains(string(body), "topsecret") {
+		t.Errorf("denied table app.secrets leaked into the events response: %s", body)
+	}
+
+	// Redacted column nulled; non-redacted sibling still present.
+	_, body = doReq(t, srv, "GET", "/api/events?schema=app&table=users", "")
+	if strings.Contains(string(body), "111-22-3333") {
+		t.Errorf("redacted column ssn leaked: %s", body)
+	}
+	if !strings.Contains(string(body), "alice@x") {
+		t.Errorf("non-redacted column email should remain present: %s", body)
+	}
+}
+
 // statements extracts the executable SQL lines (ignoring comments, blanks, and
 // the BEGIN/COMMIT wrapper) so two scripts can be compared without their
 // timestamped header comment.

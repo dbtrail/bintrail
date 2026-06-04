@@ -55,8 +55,11 @@ type recoverRequest struct {
 	Since         string `json:"since"`
 	Until         string `json:"until"`
 	ChangedColumn string `json:"changed_column"`
-	Order         string `json:"order"`
-	Limit         int    `json:"limit"`
+	// Order is accepted for request symmetry with /api/events but IGNORED by
+	// recover: handleRecover forces oldest-first (ASC) input, which the undo
+	// generator requires. A client-supplied value has no effect.
+	Order string `json:"order"`
+	Limit int    `json:"limit"`
 }
 
 type eventsResponse struct {
@@ -268,7 +271,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(buf.Bytes())
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		slog.Error("console: status write failed", "error", err)
+	}
 }
 
 // handleSchemas serves GET /api/schemas. Without a ?schema= param it returns
@@ -348,13 +353,13 @@ func scanStrings(rows *sql.Rows) ([]string, error) {
 }
 
 // clampLimit enforces the default/maximum result caps: a non-positive request
-// becomes the default; an oversized request is capped at max.
-func clampLimit(n, def, max int) int {
+// becomes the default; an oversized request is capped at the maximum.
+func clampLimit(n, def, maxLimit int) int {
 	if n <= 0 {
 		return def
 	}
-	if n > max {
-		return max
+	if n > maxLimit {
+		return maxLimit
 	}
 	return n
 }

@@ -100,6 +100,16 @@ func New(cfg Config) (*Server, error) {
 		allowedHosts: cfg.AllowedHosts,
 	}
 
+	// Safety coupling enforced here so it holds for every caller, not just the
+	// CLI: Parquet archives do not apply RBAC rules, so the presence of any
+	// deny-table / redact-column rule must also disable archive auto-discovery
+	// — otherwise redacted data could leak in from archives. cmd/bintrail also
+	// sets NoArchive when a profile is active; this makes the invariant
+	// structural rather than caller-dependent.
+	if len(s.denyTables) > 0 || len(s.redactCols) > 0 {
+		s.noArchive = true
+	}
+
 	// Load the latest schema snapshot for recovery WHERE-clause generation.
 	// Best-effort: a missing snapshot just means recovery falls back to
 	// all-column WHERE clauses, which is correct (if more verbose).
