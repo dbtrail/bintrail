@@ -14,7 +14,7 @@ Go version: 1.25.7 — uses `range N`, `min()`, `slices.Reverse`, `strings.Split
 ## Project structure
 
 ```
-cmd/bintrail/          # One file per command (init, snapshot, index, query, recover, rotate, status, stream, dump, baseline, upload, generate-key, config)
+cmd/bintrail/          # One file per command (init, snapshot, index, query, recover, rotate, status, console, stream, dump, baseline, upload, generate-key, config)
                        # envload.go: env file loading (.bintrail.env / ~/.config/bintrail/config.env) + bindCommandEnv
                        # Test files: *_test.go (unit), *_integration_test.go (//go:build integration)
 cmd/bintrail-mcp/      # MCP server: main.go, proxy.py, tests
@@ -38,7 +38,7 @@ internal/
 e2e_test.go            # Full CLI pipeline E2E test (//go:build integration), built with go build -cover
 .mcp.json              # MCP server registration (go run ./cmd/bintrail-mcp)
 migrations/            # Reference DDL (tables created by `bintrail init`, not this file)
-docs/                  # guide.md, indexing.md, query-and-recovery.md, streaming.md, rotation-and-status.md, mcp-server.md, upload.md, parquet-debugging.md, deployment.md, quickstart.md, dump-and-baseline.md, docker.md, server-identity.md, mcp-gateway.md, storage.md
+docs/                  # guide.md, indexing.md, query-and-recovery.md, streaming.md, rotation-and-status.md, mcp-server.md, upload.md, parquet-debugging.md, deployment.md, quickstart.md, dump-and-baseline.md, docker.md, server-identity.md, mcp-gateway.md, storage.md, console.md
 ```
 
 ## Commands
@@ -56,6 +56,7 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000), `--profile`, `--no-archive` |
 | `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future`, `--archive-dir`, `--archive-compression` (default `zstd`) |
 | `status` | `status.go` | `--index-dsn` (req) |
+| `console` | `console.go` | `--index-dsn` (req), `--listen` (default `127.0.0.1:8090`), `--token` (auto-gen for loopback; required for non-loopback), `--no-archive`, `--profile` (forces `--no-archive`); read-only web UI over the index (events/recover/status) — the MCP server with a web face, implemented in `internal/console/` (server/api/auth/dto/assets + `//go:embed` vanilla frontend, zero JS deps). NEVER executes SQL. Open-core boundary: `eventDTO` omits `connection_id` (free `query_explorer` surface, not paid `forensics`). Env `BINTRAIL_CONSOLE_LISTEN`/`BINTRAIL_CONSOLE_TOKEN` are read directly in `runConsole`, NOT via the shared `envBindings` slice (`--listen` collides with `shim`/`init-shim`). Security: token in `Authorization: Bearer` (`subtle.ConstantTimeCompare`), Host-header allowlist (DNS-rebinding defense), no CORS, result caps (events 100/1000, recover 1000/10000), `/api/healthz` unauthenticated. |
 | `stream` | `stream.go` | `--index-dsn` (req), `--source-dsn` (req), `--server-id` (req), `--start-file`, `--start-pos`, `--start-gtid`, `--batch-size`, `--schemas`, `--tables`, `--checkpoint`, `--metrics-addr`, `--reset`, `--no-gap-fill`, `--gap-timeout` (default `30`s) |
 | `dump` | `dump.go` | `--source-dsn` (req), `--output-dir` (req), `--schemas`, `--tables`, `--mydumper-path`, `--mydumper-image`, `--threads`, `--encrypt`, `--encrypt-key` |
 | `baseline` | `baseline.go` | `--input` (req), `--output` (req), `--timestamp`, `--tables`, `--compression`, `--row-group-size`, `--upload`, `--upload-region`, `--encrypt`, `--encrypt-key` |

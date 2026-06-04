@@ -1,0 +1,101 @@
+package console
+
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	// DB is nil: these tests exercise routing/middleware/assets only, never a
+	// data handler.
+	srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv
+}
+
+func TestMuxHealthzUnauthenticated(t *testing.T) {
+	srv := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8090/api/healthz", nil)
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("healthz code = %d, want 200 (no token required)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "ok") {
+		t.Errorf("healthz body = %q", rec.Body.String())
+	}
+}
+
+func TestMuxAPIRequiresToken(t *testing.T) {
+	srv := newTestServer(t)
+	for _, path := range []string{"/api/status", "/api/events", "/api/schemas"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+path, nil)
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != 401 {
+			t.Errorf("%s without token: code = %d, want 401", path, rec.Code)
+		}
+	}
+}
+
+func TestMuxServesAssets(t *testing.T) {
+	srv := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8090/", nil)
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("/ code = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "bintrail console") {
+		t.Error("index.html (with 'bintrail console') was not served at /")
+	}
+}
+
+func TestMuxRejectsForeignHost(t *testing.T) {
+	srv := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8090/", nil)
+	req.Host = "attacker.example" // DNS-rebinding attempt
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != 403 {
+		t.Errorf("foreign Host code = %d, want 403", rec.Code)
+	}
+}
+
+func TestMuxNoCORSHeaders(t *testing.T) {
+	srv := newTestServer(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8090/api/healthz", nil)
+	srv.Handler().ServeHTTP(rec, req)
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want empty (no CORS)", got)
+	}
+}
+
+func TestURLContainsToken(t *testing.T) {
+	srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "http://127.0.0.1:8090/?token=abc123"
+	if srv.URL() != want {
+		t.Errorf("URL() = %q, want %q", srv.URL(), want)
+	}
+}
+
+func TestDisplayHostRewritesWildcard(t *testing.T) {
+	cases := map[string]string{
+		"0.0.0.0:8090":   "127.0.0.1:8090",
+		"127.0.0.1:8090": "127.0.0.1:8090",
+		"::":             "::", // no port → returned as-is
+	}
+	for in, want := range cases {
+		if got := displayHost(in); got != want {
+			t.Errorf("displayHost(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bintrail console</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">bintrail</span>
+      <span class="sub">console</span>
+      <span class="readonly" title="This console never executes SQL.">read-only</span>
+    </div>
+    <nav id="tabs">
+      <button class="tab active" data-panel="recover">Recover</button>
+      <button class="tab" data-panel="events">Events</button>
+      <button class="tab" data-panel="status">Status</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ── Recover ─────────────────────────────────────────────── -->
+    <section id="recover" class="panel active">
+      <p class="hint">Filter the changes you want to undo, preview the affected
+        rows, then generate reversal SQL. Nothing is ever executed — copy or
+        download the script and apply it yourself after review.</p>
+      <form id="recover-form" class="filters">
+        <label>Schema
+          <select name="schema" class="schema-select" required></select>
+        </label>
+        <label>Table
+          <select name="table" class="table-select"></select>
+        </label>
+        <label>PK <input name="pk" placeholder="e.g. 42 or 42|7"></label>
+        <label>Since <input name="since" placeholder="YYYY-MM-DD HH:MM:SS"></label>
+        <label>Until <input name="until" placeholder="YYYY-MM-DD HH:MM:SS"></label>
+        <div class="actions">
+          <button type="submit" class="primary">Generate undo SQL</button>
+          <button type="button" class="preview-btn">Preview affected rows</button>
+        </div>
+      </form>
+      <div id="recover-warnings" class="warnings"></div>
+      <div id="recover-preview"></div>
+      <div id="recover-sql-wrap" hidden>
+        <div class="sql-toolbar">
+          <span id="recover-meta"></span>
+          <span class="spacer"></span>
+          <button type="button" id="copy-sql">Copy</button>
+          <button type="button" id="download-sql">Download</button>
+        </div>
+        <pre id="recover-sql"></pre>
+      </div>
+    </section>
+
+    <!-- ── Events ──────────────────────────────────────────────── -->
+    <section id="events" class="panel">
+      <p class="hint">Browse indexed row events with full before/after images.</p>
+      <form id="events-form" class="filters">
+        <label>Schema
+          <select name="schema" class="schema-select"></select>
+        </label>
+        <label>Table
+          <select name="table" class="table-select"></select>
+        </label>
+        <label>PK <input name="pk" placeholder="e.g. 42"></label>
+        <label>Type
+          <select name="event_type">
+            <option value="">any</option>
+            <option>INSERT</option>
+            <option>UPDATE</option>
+            <option>DELETE</option>
+          </select>
+        </label>
+        <label>Changed column <input name="changed_column" placeholder="e.g. email"></label>
+        <label>GTID <input name="gtid" placeholder="uuid:1-100"></label>
+        <label>Since <input name="since" placeholder="YYYY-MM-DD HH:MM:SS"></label>
+        <label>Until <input name="until" placeholder="YYYY-MM-DD HH:MM:SS"></label>
+        <label>Limit <input name="limit" type="number" min="1" placeholder="100"></label>
+        <div class="actions">
+          <button type="submit" class="primary">Run</button>
+        </div>
+      </form>
+      <div id="events-warnings" class="warnings"></div>
+      <div id="events-result"></div>
+    </section>
+
+    <!-- ── Status ──────────────────────────────────────────────── -->
+    <section id="status" class="panel">
+      <div class="actions">
+        <button type="button" id="status-refresh" class="primary">Refresh status</button>
+      </div>
+      <div id="status-result"></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>
