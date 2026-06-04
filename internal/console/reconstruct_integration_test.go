@@ -58,6 +58,10 @@ func seedReconstruct(t *testing.T) *Server {
 		[]byte(`["name"]`), []byte(`{"id":1,"name":"alicia"}`), []byte(`{"id":1,"name":"alex"}`))
 	testutil.InsertEvent(t, db, "bin.000001", 80, 120, "2026-06-01 14:00:00", nil, "app", "users", 3, "1",
 		nil, []byte(`{"id":1,"name":"alex"}`), nil)
+	// id=2 has NO baseline row — it is INSERTed after the baseline. Reconstruct
+	// must still return its state (the post-baseline-INSERT case).
+	testutil.InsertEvent(t, db, "bin.000001", 120, 160, "2026-06-01 11:00:00", nil, "app", "users", 1, "2",
+		nil, nil, []byte(`{"id":2,"name":"bob"}`))
 
 	baseDir := t.TempDir()
 	writeBaselineParquet(t, baseDir, "app", "users", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), "1", "alice")
@@ -102,6 +106,11 @@ func TestIntegrationReconstructValueAsOf(t *testing.T) {
 	r = reconstructAt(t, srv, "schema=app&table=users&pk=1&at=2026-06-01%2012:30:00&allow_gaps=true")
 	if fmt.Sprint(r.State["name"]) != "alicia" {
 		t.Errorf("at 12:30: name=%v, want alicia", r.State["name"])
+	}
+	// The allow_gaps override surfaces the skipped-coverage warning so the
+	// operator knows the result may be incomplete (the window is all gap here).
+	if len(r.Warnings) == 0 {
+		t.Error("at 12:30 with allow_gaps: expected a coverage-gap warning in the response")
 	}
 
 	// After the second UPDATE → alex.
@@ -150,10 +159,58 @@ func TestIntegrationReconstructGapRefused(t *testing.T) {
 
 func TestIntegrationReconstructUnknownPK(t *testing.T) {
 	srv := seedReconstruct(t)
-	// No baseline row for pk=999 → clean found=false, not a 500.
+	// pk=999 has no baseline row AND no deltas in the window → genuinely never
+	// existed → clean found=false, not a 500. (allow_gaps=true because the
+	// handler now fetches deltas before deciding, and the window is all gap.)
 	r := reconstructAt(t, srv, "schema=app&table=users&pk=999&allow_gaps=true")
 	if r.Found {
 		t.Errorf("unknown pk: found=%v, want false", r.Found)
+	}
+}
+
+// TestIntegrationReconstructPostBaselineInsert: a row created AFTER the baseline
+// has no baseline entry but still exists as of T — it must reconstruct from the
+// deltas, not be mislabeled "not found". (Regression guard for the review fix.)
+func TestIntegrationReconstructPostBaselineInsert(t *testing.T) {
+	srv := seedReconstruct(t)
+	r := reconstructAt(t, srv, "schema=app&table=users&pk=2&at=2026-06-01%2012:00:00&allow_gaps=true")
+	if !r.Found || r.Deleted {
+		t.Fatalf("post-baseline INSERT (pk=2): found=%v deleted=%v, want found+not-deleted", r.Found, r.Deleted)
+	}
+	if got := fmt.Sprint(r.State["name"]); got != "bob" {
+		t.Errorf("post-baseline INSERT (pk=2): name=%v, want bob", got)
+	}
+}
+
+// TestIntegrationReconstructHistoryDeleted exercises the history path through a
+// DELETE: the final entry must be a DELETE transition with deleted=true / state
+// nil, while the baseline entry is NOT mislabeled deleted.
+func TestIntegrationReconstructHistoryDeleted(t *testing.T) {
+	srv := seedReconstruct(t)
+	r := reconstructAt(t, srv, "schema=app&table=users&pk=1&at=2026-06-01%2015:00:00&history=true&allow_gaps=true")
+	if len(r.History) != 4 {
+		t.Fatalf("history len=%d, want 4 (baseline + 2 updates + delete)", len(r.History))
+	}
+	if r.History[0].Deleted {
+		t.Error("baseline entry must not be labeled deleted")
+	}
+	last := r.History[len(r.History)-1]
+	if last.Source != "DELETE" || !last.Deleted || last.State != nil {
+		t.Errorf("last entry: source=%q deleted=%v state=%v, want DELETE/true/nil", last.Source, last.Deleted, last.State)
+	}
+}
+
+// TestIntegrationReconstructEventCap: more events than the cap in [baseline, at]
+// must refuse (422) rather than fold from a truncated prefix.
+func TestIntegrationReconstructEventCap(t *testing.T) {
+	srv := seedReconstruct(t)
+	orig := reconstructMaxEvents
+	reconstructMaxEvents = 2 // pk=1 has 3 deltas through 15:00
+	defer func() { reconstructMaxEvents = orig }()
+
+	rec, body := doReq(t, srv, "GET", "/api/reconstruct?schema=app&table=users&pk=1&at=2026-06-01%2015:00:00&allow_gaps=true", "")
+	if rec.Code != 422 {
+		t.Errorf("event cap exceeded: code=%d, want 422 (body=%s)", rec.Code, body)
 	}
 }
 

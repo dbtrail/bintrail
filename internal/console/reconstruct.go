@@ -17,8 +17,9 @@ import (
 // [baseline, at] window. Reconstruct is scoped to one PK, so this is generous;
 // exceeding it means the window is too busy to reconstruct safely, and we refuse
 // rather than fold from a truncated event prefix — which would be wrong state,
-// not merely incomplete.
-const reconstructMaxEvents = 10000
+// not merely incomplete. A var (not const) so tests can lower it to exercise the
+// refusal without seeding tens of thousands of rows.
+var reconstructMaxEvents = 10000
 
 type capabilitiesResponse struct {
 	Reconstruct bool `json:"reconstruct"`
@@ -42,7 +43,10 @@ type stateEntryDTO struct {
 }
 
 // reconstructResponse distinguishes three outcomes: a row with state, a row
-// deleted as of `at` (Deleted=true), and no baseline row for the PK (Found=false).
+// deleted/absent as of `at` (Found=true, Deleted=true), and a row that never
+// existed in the window (Found=false). Deleted and State are point-in-time
+// fields only — in history mode they are left zero; read per-entry Deleted from
+// History instead.
 type reconstructResponse struct {
 	Schema       string          `json:"schema"`
 	Table        string          `json:"table"`
@@ -62,11 +66,12 @@ type reconstructResponse struct {
 // history. Read-only: it computes state, it never writes.
 func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	// The endpoint is the real boundary (the UI merely hides the tab): refuse
-	// when reconstruct is not configured — no baseline, or an RBAC profile is
-	// active (baseline reads bypass redaction; see Server.baselineConfigured).
+	// when reconstruct is not configured — no baseline, an RBAC profile is
+	// active, or --no-archive is set (all collapse into baselineConfigured; see
+	// Server.baselineConfigured for why archive access is required).
 	if !s.baselineConfigured {
 		writeJSONError(w, http.StatusNotFound,
-			"reconstruct is not available (no baseline configured, or an RBAC profile is active)")
+			"reconstruct is not available (no baseline configured, an RBAC profile is active, or --no-archive is set)")
 		return
 	}
 
@@ -121,22 +126,14 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := reconstructResponse{
-		Schema: schema, Table: table, PK: pk,
-		At:           atTime.Format(consoleTSFormat),
-		BaselineTime: snapshotTime.Format(consoleTSFormat),
-	}
-	if baselineRow == nil {
-		// No baseline row for this PK: a clean "not found", not an error.
-		writeJSON(w, http.StatusOK, resp)
-		return
-	}
-	resp.Found = true
-
-	// 2. Fetch this PK's binlog events in (baseline, at], oldest-first.
+	// 2. Fetch this PK's binlog deltas in [baseline, at], oldest-first.
 	//    AllowGaps defaults FALSE — the opposite of events/recover: a coverage
-	//    gap here means a silently-wrong reconstruction, not a few missing
-	//    deltas in a script a human reviews. The window is bounded both ends.
+	//    gap here means a silently-wrong reconstruction, not a few missing deltas
+	//    in a script a human reviews. The window is bounded both ends.
+	//    We fetch even when baselineRow == nil: a row created AFTER the baseline
+	//    has no baseline entry yet still exists as of `at`, and ApplyAt(nil,
+	//    deltas, at) reconstructs it correctly. Reporting found=false before
+	//    fetching would mislabel that common case as "never existed".
 	opts := query.Options{
 		Schema:   schema,
 		Table:    table,
@@ -168,16 +165,31 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("too many events (>%d) for this row between the baseline and the target time to reconstruct safely; narrow the time or use the offline `bintrail reconstruct`", reconstructMaxEvents))
 		return
 	}
-	resp.EventCount = len(rows)
-	resp.Warnings = gapWarnings(plan)
 
-	// 3. Fold to point-in-time state, or trace the full history.
+	resp := reconstructResponse{
+		Schema: schema, Table: table, PK: pk,
+		At:           atTime.Format(consoleTSFormat),
+		BaselineTime: snapshotTime.Format(consoleTSFormat),
+		EventCount:   len(rows),
+		Warnings:     gapWarnings(plan),
+	}
+
+	// 3. Fold baseline + deltas. baselineRow may be nil. "existed" = the row was
+	//    present at some point in the window (baseline row, or any delta). Three
+	//    outcomes: present-with-state / existed-then-deleted-as-of-`at` / never.
+	existed := baselineRow != nil || len(rows) > 0
 	if history {
+		resp.Found = existed
 		resp.History = toStateEntryDTOs(reconstruct.BuildHistory(baselineRow, snapshotTime, rows, atTime))
-	} else if state := reconstruct.ApplyAt(baselineRow, rows, atTime); state == nil {
-		resp.Deleted = true // deleted as of `at` — distinct from Found=false
 	} else {
-		resp.State = state
+		switch state := reconstruct.ApplyAt(baselineRow, rows, atTime); {
+		case state != nil:
+			resp.Found, resp.State = true, state
+		case existed:
+			resp.Found, resp.Deleted = true, true // existed, then deleted as of `at`
+		default:
+			resp.Found = false // never present in [baseline, at]
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -224,7 +236,9 @@ func toStateEntryDTOs(entries []reconstruct.StateEntry) []stateEntryDTO {
 			Source:  e.Source,
 			EventID: e.EventID,
 			GTID:    e.GTID,
-			Deleted: e.State == nil,
+			// A nil baseline entry means "row absent at baseline" (created
+			// later), NOT deleted — only a real DELETE transition is "deleted".
+			Deleted: e.State == nil && e.Source != "baseline",
 			State:   e.State,
 		}
 	}

@@ -29,7 +29,8 @@ Bintrail console (read-only) is running. Open:
     http://127.0.0.1:8090/?token=ab12cd34ef56ab12cd34ef56ab12cd34
 ```
 
-Open that URL in a browser. Three tabs:
+Open that URL in a browser. Four tabs (Time-travel appears only when a baseline
+is configured):
 
 1. **Recover** (landing) — filter schema / table / PK / time, preview the
    affected rows with before→after diffs, then **Generate undo SQL** and
@@ -120,7 +121,7 @@ composite keys). The response cleanly distinguishes three outcomes: the row's
 state, the row *deleted as of T* (`deleted: true`), and *no baseline row* for
 that PK (`found: false`).
 
-Two gates protect it, both enforced at the endpoint (not just by hiding the tab):
+Three gates protect it, all enforced at the endpoint (not just by hiding the tab):
 
 - **Baseline required** — without `--baseline-dir`/`--baseline-s3`, `GET
   /api/reconstruct` returns 404 and the tab is hidden.
@@ -139,6 +140,15 @@ from a script. Pass `allow_gaps=true` to override (best-effort), mirroring the
 CLI's `--allow-gaps`. A single row touched by more than 10,000 events in the
 `[baseline, at]` window is also refused (422) rather than reconstructed from a
 truncated prefix.
+
+> **Known hole in fail-loud (shared with the CLI):** when *several* archive
+> sources are configured and only *some* fail to load, `query.FetchMerged` logs
+> the failure server-side and continues (it only hard-fails when *every* source
+> fails). A reconstruct could then fold an incomplete delta set and return 200.
+> This is a pre-existing limitation of the shared fetch path, not specific to the
+> console; closing it needs a `FetchMerged` change that also affects the CLI and
+> shim. Until then, watch the server log when running with multiple archive
+> sources. (Tracked: #377.)
 
 ### Coverage gaps and incomplete data
 

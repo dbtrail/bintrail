@@ -345,7 +345,7 @@ function renderReconstructState(container, data) {
   container.appendChild(reconstructMeta(data, "as of " + data.at));
   if (!data.found) {
     container.appendChild(el("div", { class: "deleted-note" },
-      "No row with this primary key exists in the baseline snapshot."));
+      "No row with this primary key existed at or before the selected time."));
     return;
   }
   if (data.deleted) {
@@ -365,7 +365,7 @@ function renderReconstructHistory(container, data) {
   container.appendChild(reconstructMeta(data, `history through ${data.at} · ${entries.length} state(s)`));
   if (!data.found) {
     container.appendChild(el("div", { class: "deleted-note" },
-      "No row with this primary key exists in the baseline snapshot."));
+      "No row with this primary key existed at or before the selected time."));
     return;
   }
   const tl = el("div", { class: "timeline" });
