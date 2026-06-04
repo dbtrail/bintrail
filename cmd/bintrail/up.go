@@ -200,15 +200,21 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("console: cannot bind %s: %w", upConsoleListen, err)
 	}
-	consoleErr := make(chan error, 1)
-	go func() { consoleErr <- srv.Serve(ctx, ln) }()
+	// The console is the secondary job: log a mid-run crash when it happens (not
+	// only at shutdown), but NEVER let it take down the stream, which is the
+	// primary data-capture job.
+	consoleDone := make(chan struct{}, 1)
+	go func() {
+		if err := srv.Serve(ctx, ln); err != nil {
+			slog.Warn("console server exited with error", "error", err)
+		}
+		consoleDone <- struct{}{}
+	}()
 	fmt.Fprintf(os.Stderr, "\nConsole (read-only) is running. Open:\n\n    %s\n\n", srv.URL())
 
 	streamErr := runStream(cmd, args)
-	stop() // ensure the console shuts down even if the stream returned without a signal
-	if cErr := <-consoleErr; cErr != nil {
-		slog.Warn("console server exited with error", "error", cErr)
-	}
+	stop()        // drain the console even if the stream returned without a signal
+	<-consoleDone // order the console goroutine's exit before the deferred db.Close()
 	return streamErr
 }
 

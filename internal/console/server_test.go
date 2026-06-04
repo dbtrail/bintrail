@@ -1,10 +1,40 @@
 package console
 
 import (
+	"context"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestServeShutsDownOnContextCancel covers the Listen()/Serve() split (the only
+// path that binds a real socket and drains on ctx cancel — the rest of the
+// suite goes through Handler()). It binds an ephemeral port, then asserts Serve
+// returns nil (clean shutdown, not an error) once the context is cancelled.
+func TestServeShutsDownOnContextCancel(t *testing.T) {
+	srv, err := New(Config{Listen: "127.0.0.1:0", Token: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := srv.Listen()
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, ln) }()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve returned %v, want nil on context cancel", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve did not return within 10s of context cancellation")
+	}
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
