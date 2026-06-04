@@ -240,3 +240,59 @@ pre#recover-sql {
   font-size: 13px;
   z-index: 100;
 }
+
+/* Capability gating: elements are hidden until JS confirms the capability is
+   enabled (it then removes the data-capability attribute to reveal them). This
+   means an un-configured surface — e.g. reconstruct with no baseline — never
+   flashes on screen. */
+[data-capability] { display: none; }
+
+.filters label.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* ── Reconstruct: as-of state table + history timeline ── */
+table.statetable {
+  border-collapse: collapse;
+  margin-top: 16px;
+  font-size: 13px;
+  min-width: 360px;
+}
+table.statetable th, table.statetable td {
+  text-align: left;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+}
+table.statetable th { color: var(--muted); font-weight: 600; width: 1%; white-space: nowrap; }
+table.statetable td { font-family: var(--mono); white-space: pre-wrap; word-break: break-word; }
+
+.deleted-note {
+  margin-top: 16px;
+  color: var(--del);
+  border: 1px solid var(--del);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 13px;
+}
+
+.timeline { margin-top: 16px; border-left: 2px solid var(--border); padding-left: 18px; }
+.tl-entry { position: relative; padding: 8px 0 14px; }
+.tl-entry::before {
+  content: "";
+  position: absolute;
+  left: -25px;
+  top: 12px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+}
+.tl-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.tl-time { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.tl-state { font-family: var(--mono); font-size: 12px; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.badge.baseline { color: var(--muted); border: 1px solid var(--muted); }

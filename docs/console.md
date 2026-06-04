@@ -10,9 +10,10 @@ The console **never executes SQL**. Recover produces a transaction-wrapped
 script you copy or download and apply yourself after review, exactly like
 `bintrail recover --dry-run`.
 
-> **Scope (MVP):** event browsing, recovery-SQL generation, and index status.
-> Point-in-time full-table reconstruction (baseline + deltas) is **not** part of
-> the console yet — use the offline `bintrail reconstruct` for that.
+> **Scope:** event browsing, recovery-SQL generation, index status, and — when a
+> baseline is configured — **single-row point-in-time reconstruct** (a row's full
+> state "as of T" plus its history). Full-*table* reconstruction (mydumper output)
+> stays in the offline `bintrail reconstruct` CLI.
 
 ## Usage
 
@@ -35,6 +36,9 @@ Open that URL in a browser. Three tabs:
    copy/download the script.
 2. **Events** — broader filters (event type, changed column, GTID, limit).
 3. **Status** — index health: partitions, coverage, stream lag, archives.
+4. **Time-travel** — single-row point-in-time reconstruct. Appears **only when a
+   baseline is configured** (`--baseline-dir`/`--baseline-s3`); otherwise the tab
+   is hidden, never shown empty. See [Time-travel](#time-travel-reconstruct).
 
 ## Flags
 
@@ -43,15 +47,19 @@ Open that URL in a browser. Three tabs:
 | `--index-dsn` | — (required) | DSN for the index MySQL database. |
 | `--listen` | `127.0.0.1:8090` | Bind address. `:8090` avoids the MCP server's `:8080`. |
 | `--token` | auto-generated | Access token. Auto-generated for loopback binds; **required** for non-loopback. |
-| `--no-archive` | `false` | Disable Parquet archive auto-discovery (MySQL-only results). |
-| `--profile` | — | RBAC profile: deny tables / redact columns. Forces `--no-archive`. |
+| `--no-archive` | `false` | Disable Parquet archive auto-discovery (MySQL-only results). Also **disables Time-travel** — reconstruct needs archive access to verify coverage. |
+| `--profile` | — | RBAC profile: deny tables / redact columns. Forces `--no-archive` and **disables Time-travel** (baseline reads bypass redaction). |
 | `--allowed-hosts` | — | Extra hostnames accepted in the `Host` header (for reverse-proxy setups). IP literals and `localhost` are always allowed. |
+| `--baseline-dir` | — | Local directory of baseline Parquet snapshots. Enables the Time-travel (reconstruct) surface. |
+| `--baseline-s3` | — | S3 prefix of baseline snapshots (`s3://bucket/prefix/`). Enables Time-travel. |
 
 ### Environment variables
 
 - `BINTRAIL_INDEX_DSN` — same as `--index-dsn` (shared with other commands).
 - `BINTRAIL_CONSOLE_LISTEN` — same as `--listen`.
 - `BINTRAIL_CONSOLE_TOKEN` — same as `--token`.
+- `BINTRAIL_CONSOLE_BASELINE_DIR` — same as `--baseline-dir`.
+- `BINTRAIL_CONSOLE_BASELINE_S3` — same as `--baseline-s3`.
 
 Precedence is the usual CLI flag > environment variable > default.
 
@@ -99,6 +107,38 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `GET /api/schemas` | Distinct schemas. `?schema=<name>` → that schema's tables. |
 | `GET /api/events` | Event browser. Query params: `schema, table, pk, event_type, gtid, since, until, changed_column, order, limit`. |
 | `POST /api/recover` | Undo-SQL generation. JSON body with the same filter fields (requires at least `schema`; an `order` field is accepted but ignored — recover always processes oldest-first). Returns `{sql, statement_count, row_count, warnings}`. |
+| `GET /api/capabilities` | Reports enabled optional surfaces, e.g. `{"reconstruct": true}`. The frontend uses it to show/hide baseline-gated tabs. |
+| `GET /api/reconstruct` | Single-row point-in-time reconstruct (baseline-gated; 404 when not configured). Query params: `schema, table, pk, at, history, allow_gaps`. Returns `{found, deleted, state, history, baseline_time, event_count, warnings}`. |
+
+### Time-travel (reconstruct)
+
+When `--baseline-dir` or `--baseline-s3` is set, the console can reconstruct a
+single row's **full state at a point in time** — the baseline snapshot merged
+with the binlog deltas after it — and show the row's history. PK column names are
+read from the schema snapshot, so you only pass the value(s) (pipe-delimited for
+composite keys). The response cleanly distinguishes three outcomes: the row's
+state, the row *deleted as of T* (`deleted: true`), and *no baseline row* for
+that PK (`found: false`).
+
+Two gates protect it, both enforced at the endpoint (not just by hiding the tab):
+
+- **Baseline required** — without `--baseline-dir`/`--baseline-s3`, `GET
+  /api/reconstruct` returns 404 and the tab is hidden.
+- **No active RBAC profile** — the baseline row is read directly (it does not
+  pass through the query engine's column redaction), so a `--profile` disables
+  reconstruct, mirroring the way a profile forces `--no-archive`.
+- **Archives enabled** — `--no-archive` disables reconstruct. The gap check that
+  makes reconstruct fail loud can only verify coverage of rotated-out hours if
+  their archives are actually fetched; with archives off, an archived-but-rotated
+  hour would be skipped yet counted as covered, producing a silently-wrong state.
+
+Unlike events/recover browsing, reconstruct treats a coverage gap between the
+baseline and the target time as a **hard error (422)**, not a warning: a missing
+hour means a silently-wrong reconstructed state, not just a few deltas missing
+from a script. Pass `allow_gaps=true` to override (best-effort), mirroring the
+CLI's `--allow-gaps`. A single row touched by more than 10,000 events in the
+`[baseline, at]` window is also refused (422) rather than reconstructed from a
+truncated prefix.
 
 ### Coverage gaps and incomplete data
 

@@ -301,6 +301,102 @@ async function loadTables(form) {
   }
 }
 
+// ── reconstruct (time-travel) tab ────────────────────────────────────────────
+async function runReconstruct(history) {
+  const form = document.getElementById("reconstruct-form");
+  const warns = document.getElementById("reconstruct-warnings");
+  const container = document.getElementById("reconstruct-result");
+  const p = formParams(form);
+  if (!p.schema || !p.table || !p.pk) {
+    clear(warns);
+    renderError(container, new Error("schema, table, and pk are required"));
+    return;
+  }
+  const params = new URLSearchParams({ schema: p.schema, table: p.table, pk: p.pk });
+  if (p.at) params.set("at", p.at);
+  if (p.allow_gaps) params.set("allow_gaps", "true");
+  if (history) params.set("history", "true");
+  try {
+    const data = await api("/api/reconstruct?" + params.toString());
+    renderWarnings(warns, data.warnings);
+    if (history) renderReconstructHistory(container, data);
+    else renderReconstructState(container, data);
+  } catch (err) {
+    clear(warns);
+    renderError(container, err);
+  }
+}
+
+function reconstructMeta(data, label) {
+  return el("div", { class: "meta-line" },
+    `${data.schema}.${data.table} pk=${data.pk} · ${label} · baseline ${data.baseline_time} · ${data.event_count} event(s)`);
+}
+
+function stateTable(state) {
+  const tbody = el("tbody");
+  Object.keys(state || {}).forEach((k) => {
+    tbody.appendChild(el("tr", null, el("th", null, k), el("td", null, valueToString(state[k]))));
+  });
+  return el("table", { class: "statetable" }, tbody);
+}
+
+function renderReconstructState(container, data) {
+  clear(container);
+  container.appendChild(reconstructMeta(data, "as of " + data.at));
+  if (!data.found) {
+    container.appendChild(el("div", { class: "deleted-note" },
+      "No row with this primary key exists in the baseline snapshot."));
+    return;
+  }
+  if (data.deleted) {
+    container.appendChild(el("div", { class: "deleted-note" }, "Row was deleted as of " + data.at + "."));
+    return;
+  }
+  container.appendChild(stateTable(data.state));
+}
+
+function compactState(state) {
+  return Object.keys(state || {}).map((k) => `${k}=${valueToString(state[k])}`).join("   ");
+}
+
+function renderReconstructHistory(container, data) {
+  clear(container);
+  const entries = data.history || [];
+  container.appendChild(reconstructMeta(data, `history through ${data.at} · ${entries.length} state(s)`));
+  if (!data.found) {
+    container.appendChild(el("div", { class: "deleted-note" },
+      "No row with this primary key exists in the baseline snapshot."));
+    return;
+  }
+  const tl = el("div", { class: "timeline" });
+  entries.forEach((e) => {
+    const badgeClass = "badge " + (e.source === "baseline" ? "baseline" : e.source);
+    const head = el("div", { class: "tl-head" },
+      el("span", { class: badgeClass }, e.source),
+      el("span", { class: "tl-time" }, e.time));
+    const body = e.deleted
+      ? el("div", { class: "tl-state" }, "(row deleted)")
+      : el("div", { class: "tl-state" }, compactState(e.state));
+    tl.appendChild(el("div", { class: "tl-entry" }, head, body));
+  });
+  container.appendChild(tl);
+}
+
+// gateCapabilities reveals capability-gated tabs/panels that the server reports
+// as enabled. Anything not enabled stays hidden (the elements default to
+// display:none via CSS), so an un-configured surface never flashes on screen.
+async function gateCapabilities() {
+  let caps = {};
+  try {
+    caps = await api("/api/capabilities");
+  } catch {
+    return; // leave gated elements hidden
+  }
+  document.querySelectorAll("[data-capability]").forEach((node) => {
+    if (caps[node.dataset.capability]) node.removeAttribute("data-capability");
+  });
+}
+
 // ── wiring ───────────────────────────────────────────────────────────────────
 function init() {
   document.querySelectorAll(".tab").forEach((t) => {
@@ -319,6 +415,12 @@ function init() {
   document.getElementById("download-sql").addEventListener("click", downloadSQL);
   document.getElementById("status-refresh").addEventListener("click", refreshStatus);
 
+  document.getElementById("reconstruct-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    runReconstruct(false);
+  });
+  document.querySelector("#reconstruct-form .preview-btn").addEventListener("click", () => runReconstruct(true));
+
   document.querySelectorAll(".schema-select").forEach((sel) => {
     sel.addEventListener("change", () => loadTables(sel.closest("form")));
   });
@@ -326,6 +428,7 @@ function init() {
   if (!TOKEN) {
     toast("No token in URL — open the link printed by `bintrail console`.");
   }
+  gateCapabilities();
   populateSchemas();
 }
 

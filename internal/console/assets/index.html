@@ -17,6 +17,7 @@
       <button class="tab active" data-panel="recover">Recover</button>
       <button class="tab" data-panel="events">Events</button>
       <button class="tab" data-panel="status">Status</button>
+      <button class="tab" data-panel="reconstruct" data-capability="reconstruct">Time-travel</button>
     </nav>
   </header>
 
@@ -92,6 +93,30 @@
         <button type="button" id="status-refresh" class="primary">Refresh status</button>
       </div>
       <div id="status-result"></div>
+    </section>
+
+    <!-- ── Time-travel (reconstruct) — only shown when a baseline is configured ── -->
+    <section id="reconstruct" class="panel" data-capability="reconstruct">
+      <p class="hint">Reconstruct a single row's full state as of a point in time
+        — baseline snapshot + binlog deltas. Pick a row and a moment; see its
+        value then, or its complete change history.</p>
+      <form id="reconstruct-form" class="filters">
+        <label>Schema
+          <select name="schema" class="schema-select" required></select>
+        </label>
+        <label>Table
+          <select name="table" class="table-select" required></select>
+        </label>
+        <label>PK <input name="pk" placeholder="e.g. 42 or 42|7" required></label>
+        <label>As of <input name="at" placeholder="YYYY-MM-DD HH:MM:SS (default: now)"></label>
+        <label class="checkbox"><input type="checkbox" name="allow_gaps"> Allow coverage gaps</label>
+        <div class="actions">
+          <button type="submit" class="primary" data-mode="at">Value as of T</button>
+          <button type="button" class="preview-btn" data-mode="history">Full history</button>
+        </div>
+      </form>
+      <div id="reconstruct-warnings" class="warnings"></div>
+      <div id="reconstruct-result"></div>
     </section>
   </main>
 

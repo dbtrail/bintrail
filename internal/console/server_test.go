@@ -32,7 +32,7 @@ func TestMuxHealthzUnauthenticated(t *testing.T) {
 
 func TestMuxAPIRequiresToken(t *testing.T) {
 	srv := newTestServer(t)
-	for _, path := range []string{"/api/status", "/api/events", "/api/schemas"} {
+	for _, path := range []string{"/api/status", "/api/events", "/api/schemas", "/api/capabilities", "/api/reconstruct"} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+path, nil)
 		srv.Handler().ServeHTTP(rec, req)

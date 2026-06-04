@@ -186,6 +186,8 @@ var envSections = []envSection{
 		Bindings: []envTemplateEntry{
 			{"BINTRAIL_CONSOLE_LISTEN", "127.0.0.1:8090"},
 			{"BINTRAIL_CONSOLE_TOKEN", ""},
+			{"BINTRAIL_CONSOLE_BASELINE_DIR", ""},
+			{"BINTRAIL_CONSOLE_BASELINE_S3", "s3://my-bucket/baselines/"},
 		},
 	},
 }

@@ -51,6 +51,11 @@ type Config struct {
 	// header (in addition to IP literals and localhost), for operators who
 	// front the console with a DNS name.
 	AllowedHosts []string
+	// BaselineDir / BaselineS3 enable point-in-time reconstruct (Phase 2). When
+	// either is set (and no RBAC profile is active), the "Reconstruct" surface
+	// is exposed. BaselineDir takes precedence; BaselineS3 is an s3:// prefix.
+	BaselineDir string
+	BaselineS3  string
 }
 
 // Server is a configured, ready-to-run console HTTP server.
@@ -65,7 +70,13 @@ type Server struct {
 	engine       *query.Engine
 	resolver     *metadata.Resolver
 	allowedHosts []string
-	mux          http.Handler
+	// baselineSrc is the resolved reconstruct baseline source (local dir or
+	// s3:// prefix), empty when reconstruct is not configured.
+	baselineSrc string
+	// baselineConfigured gates the reconstruct surface: a baseline is present
+	// AND no RBAC profile is active (baseline reads bypass redaction).
+	baselineConfigured bool
+	mux                http.Handler
 }
 
 // New validates the config, loads the schema resolver, and assembles the
@@ -110,6 +121,29 @@ func New(cfg Config) (*Server, error) {
 		s.noArchive = true
 	}
 
+	// Reconstruct (Phase 2) is gated on three conditions; baselineSrc prefers the
+	// local dir over S3:
+	//   1. a baseline must be configured;
+	//   2. no RBAC profile may be active — ReadBaselineRow reads the baseline
+	//      Parquet directly (bypassing engine.Fetch redaction), so under a
+	//      profile it could leak redacted columns; and
+	//   3. archives must not be disabled — reconstruct fetches deltas with
+	//      AllowGaps=false and relies on the planner to turn a coverage gap into
+	//      a hard error, but the planner can only verify coverage of archived,
+	//      rotated-out hours if those archives are actually fetched. Under
+	//      --no-archive the planner would mark an archived-but-rotated-out hour
+	//      "covered" while its deltas are skipped, yielding a silently-wrong
+	//      reconstruction. Disabling reconstruct there keeps the fail-loud
+	//      guarantee intact.
+	// Conditions 2 and 3 both collapse into !s.noArchive: an active profile has
+	// already forced noArchive=true above, and an explicit --no-archive sets it
+	// too.
+	s.baselineSrc = cfg.BaselineDir
+	if s.baselineSrc == "" {
+		s.baselineSrc = cfg.BaselineS3
+	}
+	s.baselineConfigured = s.baselineSrc != "" && !s.noArchive
+
 	// Load the latest schema snapshot for recovery WHERE-clause generation.
 	// Best-effort: a missing snapshot just means recovery falls back to
 	// all-column WHERE clauses, which is correct (if more verbose).
@@ -140,6 +174,8 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("GET /api/schemas", s.handleSchemas)
 	api.HandleFunc("GET /api/events", s.handleEvents)
 	api.HandleFunc("POST /api/recover", s.handleRecover)
+	api.HandleFunc("GET /api/capabilities", s.handleCapabilities)
+	api.HandleFunc("GET /api/reconstruct", s.handleReconstruct)
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /api/healthz", s.handleHealthz) // unauthenticated liveness

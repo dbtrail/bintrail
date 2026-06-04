@@ -100,14 +100,16 @@ func TestEnvBindingsAndSectionsConsistency(t *testing.T) {
 		}
 	}
 	// Console env vars are intentionally template-only: `bintrail console` reads
-	// BINTRAIL_CONSOLE_LISTEN / BINTRAIL_CONSOLE_TOKEN directly in runConsole
-	// rather than via the shared bindCommandEnv. The --listen flag name is also
-	// used by shim/init-shim, so a global envBinding keyed on the flag name
-	// would cross-wire the console's address into those commands. They still
-	// belong in the generated template, hence this documented exception.
+	// them directly in runConsole rather than via the shared bindCommandEnv. The
+	// --listen flag name is also used by shim/init-shim, so a global envBinding
+	// keyed on the flag name would cross-wire the console's settings into those
+	// commands. They still belong in the generated template, hence this
+	// documented exception.
 	templateOnly := map[string]bool{
-		"BINTRAIL_CONSOLE_LISTEN": true,
-		"BINTRAIL_CONSOLE_TOKEN":  true,
+		"BINTRAIL_CONSOLE_LISTEN":       true,
+		"BINTRAIL_CONSOLE_TOKEN":        true,
+		"BINTRAIL_CONSOLE_BASELINE_DIR": true,
+		"BINTRAIL_CONSOLE_BASELINE_S3":  true,
 	}
 	// Every other envSection entry must appear in envBindings.
 	bindingVars := make(map[string]bool)

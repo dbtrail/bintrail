@@ -43,6 +43,8 @@ var (
 	conNoArchive    bool
 	conProfile      string
 	conAllowedHosts []string
+	conBaselineDir  string
+	conBaselineS3   string
 )
 
 func init() {
@@ -52,6 +54,8 @@ func init() {
 	consoleCmd.Flags().BoolVar(&conNoArchive, "no-archive", false, "Disable Parquet archive auto-discovery (MySQL-only)")
 	consoleCmd.Flags().StringVar(&conProfile, "profile", "", "RBAC profile: deny tables / redact columns; forces --no-archive")
 	consoleCmd.Flags().StringSliceVar(&conAllowedHosts, "allowed-hosts", nil, "Extra hostnames allowed in the Host header (for reverse-proxy setups; IP literals and localhost are always allowed)")
+	consoleCmd.Flags().StringVar(&conBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the point-in-time Reconstruct surface")
+	consoleCmd.Flags().StringVar(&conBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
 	_ = consoleCmd.MarkFlagRequired("index-dsn")
 	// bindCommandEnv wires the shared BINTRAIL_* env vars (notably
 	// BINTRAIL_INDEX_DSN). The console-specific BINTRAIL_CONSOLE_LISTEN /
@@ -73,6 +77,16 @@ func runConsole(cmd *cobra.Command, args []string) error {
 	if !cmd.Flags().Changed("token") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_TOKEN"); v != "" {
 			conToken = v
+		}
+	}
+	if !cmd.Flags().Changed("baseline-dir") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_DIR"); v != "" {
+			conBaselineDir = v
+		}
+	}
+	if !cmd.Flags().Changed("baseline-s3") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_S3"); v != "" {
+			conBaselineS3 = v
 		}
 	}
 
@@ -117,6 +131,8 @@ func runConsole(cmd *cobra.Command, args []string) error {
 		DenyTables:    denyTables,
 		RedactColumns: redactCols,
 		AllowedHosts:  conAllowedHosts,
+		BaselineDir:   conBaselineDir,
+		BaselineS3:    conBaselineS3,
 	})
 	if err != nil {
 		return err
