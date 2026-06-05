@@ -664,7 +664,15 @@ func resolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 			"BINTRAIL_ARCHIVE_S3", archiveS3, "BINTRAIL_ID", bintrailID)
 	}
 
-	return query.ResolveArchiveSources(ctx, db)
+	sources, err := query.ResolveArchiveSources(ctx, db)
+	if err != nil {
+		// The MCP tools are deliberately permissive (their own per-source
+		// fetch loops warn-and-continue too) — log and serve without
+		// archives rather than failing the tool call.
+		slog.Warn("archive auto-discovery failed; proceeding without archives", "error", err)
+		return nil
+	}
+	return sources
 }
 
 func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol string, columnEq []string, flagVal string, limit, defaultLimit int) (query.Options, error) {

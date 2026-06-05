@@ -140,7 +140,17 @@ func FetchMerged(
 
 	var archSources []string
 	if !o.NoArchive {
-		archSources = ResolveArchiveSources(ctx, db)
+		srcs, err := ResolveArchiveSources(ctx, db)
+		if err != nil {
+			// A failed registry read means an unknown set of sources is
+			// missing while the planner (below) would still claim their
+			// hours as covered. Strict mode cannot proceed on that.
+			if !o.AllowGaps {
+				return nil, nil, fmt.Errorf("resolve archive sources, cannot verify coverage: %w", err)
+			}
+			slog.Warn("archive source discovery failed; proceeding without archives", "error", err)
+		}
+		archSources = srcs
 	}
 
 	// The query planner runs whenever the caller supplied a DBName and either

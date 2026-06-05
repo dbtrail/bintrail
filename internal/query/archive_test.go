@@ -2,11 +2,13 @@ package query
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-sql-driver/mysql"
 )
 
 // TestResolveArchiveSourcesRouting pins the per-row routing decisions (#383):
@@ -64,7 +66,10 @@ func TestResolveArchiveSourcesRouting(t *testing.T) {
 		// nothing to fail on).
 		AddRow("gone-orphan", filepath.Join(dir, "bintrail_id=gone-orphan", "events.parquet"), nil, nil))
 
-	got := ResolveArchiveSources(context.Background(), db)
+	got, rerr := ResolveArchiveSources(context.Background(), db)
+	if rerr != nil {
+		t.Fatalf("unexpected resolver error: %v", rerr)
+	}
 	want := []string{
 		dataBase,
 		"s3://bkt/events/bintrail_id=pruned",
@@ -199,4 +204,46 @@ func TestExtractBasePath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResolveArchiveSourcesErrors pins the #383 error-transport contract:
+// MySQL error 1146 (archive_state doesn't exist — legitimate on
+// pre-archive indexes) stays a silent empty result, while any OTHER
+// registry-read failure is returned instead of silently shrinking the
+// source list out from under the planner's coverage claims.
+func TestResolveArchiveSourcesErrors(t *testing.T) {
+	t.Run("1146 table-not-found stays swallowed (back-compat)", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		mock.ExpectQuery("FROM archive_state").WillReturnError(
+			&mysql.MySQLError{Number: 1146, Message: "Table 'idx.archive_state' doesn't exist"})
+		got, rerr := ResolveArchiveSources(context.Background(), db)
+		if rerr != nil || got != nil {
+			t.Fatalf("pre-archive index must resolve to (nil, nil), got (%v, %v)", got, rerr)
+		}
+	})
+
+	t.Run("any other query error propagates", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		forced := &mysql.MySQLError{Number: 1142, Message: "SELECT command denied"}
+		mock.ExpectQuery("FROM archive_state").WillReturnError(forced)
+		_, rerr := ResolveArchiveSources(context.Background(), db)
+		if !errors.Is(rerr, forced) {
+			t.Fatalf("expected wrapped registry error, got %v", rerr)
+		}
+	})
+
+	t.Run("nil db stays (nil, nil)", func(t *testing.T) {
+		got, rerr := ResolveArchiveSources(context.Background(), nil)
+		if got != nil || rerr != nil {
+			t.Fatalf("nil db must resolve to (nil, nil), got (%v, %v)", got, rerr)
+		}
+	})
 }

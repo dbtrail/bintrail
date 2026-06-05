@@ -4,11 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // ResolveArchiveSources auto-discovers Parquet archive source paths from the
@@ -21,11 +24,17 @@ import (
 // registered source is never omitted from the result: the planner counts
 // archived hours straight from archive_state, so omission would make strict
 // mode (#377) silently miss the coverage hole.
-// Returns nil when no archives are configured, the table does not exist, or
-// db is nil.
-func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
+// Returns (nil, nil) when no archives are configured, the archive_state
+// table does not exist (MySQL error 1146 — legitimate on indexes created
+// before the archive feature; deliberately NOT an error so MySQL-only
+// deployments keep working), or db is nil. Any OTHER registry-read failure
+// (permission denied, timeout, corrupt row) is returned as an error
+// (#383): silently returning a shorter source list would leave the planner
+// claiming coverage with nothing behind it — strict-mode callers
+// (AllowGaps=false) must abort, permissive ones warn and continue.
+func ResolveArchiveSources(ctx context.Context, db *sql.DB) ([]string, error) {
 	if db == nil {
-		return nil
+		return nil, nil
 	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT bintrail_id,
@@ -36,10 +45,14 @@ func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 		WHERE bintrail_id IS NOT NULL
 		GROUP BY bintrail_id`)
 	if err != nil {
-		// archive_state may not exist in older indexes (table-not-found is
-		// expected). Other errors (permission denied, timeout) are unexpected.
-		slog.Warn("could not query archive_state", "error", err)
-		return nil
+		// 1146 = ER_NO_SUCH_TABLE: archive_state legitimately absent on
+		// pre-archive indexes (same gate idiom as the indexer's 1060
+		// duplicate-column check).
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1146 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("query archive_state: %w", err)
 	}
 	defer rows.Close()
 
@@ -48,8 +61,9 @@ func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 		var bintrailID string
 		var localPath, s3Bucket, s3Key sql.NullString
 		if err := rows.Scan(&bintrailID, &localPath, &s3Bucket, &s3Key); err != nil {
-			slog.Warn("could not scan archive_state row", "error", err)
-			continue
+			// A row we cannot read is a source we cannot resolve — the
+			// silent-omission class #383 exists to close.
+			return nil, fmt.Errorf("scan archive_state row: %w", err)
 		}
 
 		var localBase string
@@ -109,10 +123,10 @@ func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 		// contributes nothing, as before.
 	}
 	if err := rows.Err(); err != nil {
-		slog.Warn("archive_state iteration error", "error", err)
+		return nil, fmt.Errorf("iterate archive_state rows: %w", err)
 	}
 
-	return sources
+	return sources, nil
 }
 
 // errFoundParquet is the sentinel localBaseHasParquet uses to stop the walk

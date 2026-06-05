@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-sql-driver/mysql"
 )
 
 // TestFetchMerged_nilArchiveFetcherRejected verifies the programming-error
@@ -179,4 +180,53 @@ func TestGapError_errorsAs(t *testing.T) {
 	if strings.Contains(gapErr.Error(), "--") {
 		t.Errorf("GapError.Error() must not leak CLI flag names, got: %s", gapErr.Error())
 	}
+}
+
+// TestFetchMergedResolverFailure pins #383's last piece at the orchestrator:
+// a failed archive_state read means an UNKNOWN set of sources is missing
+// while the planner still claims their hours — strict mode must abort,
+// permissive mode warns and proceeds without archives.
+func TestFetchMergedResolverFailure(t *testing.T) {
+	forced := &mysql.MySQLError{Number: 1142, Message: "SELECT command denied (intentional)"}
+
+	t.Run("strict aborts", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		mock.ExpectQuery("FROM archive_state").WillReturnError(forced)
+		_, _, err = FetchMerged(context.Background(), db, New(db), FetchMergedOptions{
+			AllowGaps:      false,
+			ArchiveFetcher: func(_ context.Context, _ Options, _ string) ([]ResultRow, error) { return nil, nil },
+		})
+		if !errors.Is(err, forced) {
+			t.Fatalf("strict mode must propagate the resolver error, got %v", err)
+		}
+	})
+
+	t.Run("permissive proceeds without archives", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		mock.ExpectQuery("FROM archive_state").WillReturnError(forced)
+		// No archives resolved → fast path → one live MySQL fetch.
+		mock.ExpectQuery("FROM binlog_events").WillReturnRows(sqlmock.NewRows([]string{"event_id"}))
+		fetcherCalled := false
+		_, _, err = FetchMerged(context.Background(), db, New(db), FetchMergedOptions{
+			AllowGaps: true,
+			ArchiveFetcher: func(_ context.Context, _ Options, _ string) ([]ResultRow, error) {
+				fetcherCalled = true
+				return nil, nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("permissive mode must warn and continue, got %v", err)
+		}
+		if fetcherCalled {
+			t.Error("no sources resolved — the archive fetcher must not run")
+		}
+	})
 }

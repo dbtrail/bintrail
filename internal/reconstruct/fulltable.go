@@ -148,7 +148,13 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	engine := query.New(db)
 
 	// Resolve archive sources once — the same set is used for every table.
-	archSources := query.ResolveArchiveSources(ctx, db)
+	archSources, archErr := query.ResolveArchiveSources(ctx, db)
+	if archErr != nil {
+		if !cfg.AllowGaps {
+			return nil, fmt.Errorf("resolve archive sources, cannot verify coverage: %w", archErr)
+		}
+		slog.Warn("archive source discovery failed; proceeding without archives", "error", archErr)
+	}
 
 	// Report slice is protected by a mutex for the parallel goroutines.
 	reports := make([]*TableReport, 0, len(cfg.Tables))

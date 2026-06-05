@@ -239,7 +239,16 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	if !qNoArchive {
 		archSources = archiveSources()
 		if len(archSources) == 0 && qArchiveDir == "" && qArchiveS3 == "" && qProfile == "" {
-			archSources = query.ResolveArchiveSources(cmd.Context(), db)
+			var rerr error
+			archSources, rerr = query.ResolveArchiveSources(cmd.Context(), db)
+			if rerr != nil {
+				// bintrail query is deliberately permissive (multi-region
+				// operators shouldn't lose a query to one bad registry
+				// read) — but the failure is surfaced on both channels,
+				// like per-source fetch failures.
+				fmt.Fprintf(os.Stderr, "Warning: archive auto-discovery failed: %s\n", sanitizeArchiveErrorMessage(rerr))
+				slog.Warn("archive auto-discovery failed; proceeding without archives", "error", rerr)
+			}
 		}
 	}
 
