@@ -18,39 +18,49 @@ func TestNewBaselineGating(t *testing.T) {
 		}
 		return s
 	}
-
-	if s := mk(Config{BaselineDir: "/tmp/b"}); !s.baselineConfigured || s.baselineSrc != "/tmp/b" {
-		t.Errorf("baseline dir: configured=%v src=%q, want true /tmp/b", s.baselineConfigured, s.baselineSrc)
+	// The gates now live on the boot bundle (per-server); nil boot — no DB and
+	// no baseline configured — is equivalently "not configured".
+	configured := func(s *Server) bool { return s.cm.boot != nil && s.cm.boot.baselineConfigured }
+	src := func(s *Server) string {
+		if s.cm.boot == nil {
+			return ""
+		}
+		return s.cm.boot.baselineSrc
 	}
-	if s := mk(Config{BaselineS3: "s3://x/"}); !s.baselineConfigured || s.baselineSrc != "s3://x/" {
-		t.Errorf("baseline s3: configured=%v src=%q, want true s3://x/", s.baselineConfigured, s.baselineSrc)
+
+	if s := mk(Config{BaselineDir: "/tmp/b"}); !configured(s) || src(s) != "/tmp/b" {
+		t.Errorf("baseline dir: configured=%v src=%q, want true /tmp/b", configured(s), src(s))
+	}
+	if s := mk(Config{BaselineS3: "s3://x/"}); !configured(s) || src(s) != "s3://x/" {
+		t.Errorf("baseline s3: configured=%v src=%q, want true s3://x/", configured(s), src(s))
 	}
 	// Dir takes precedence over S3.
-	if s := mk(Config{BaselineDir: "/tmp/b", BaselineS3: "s3://x/"}); s.baselineSrc != "/tmp/b" {
-		t.Errorf("dir should win over s3: src=%q", s.baselineSrc)
+	if s := mk(Config{BaselineDir: "/tmp/b", BaselineS3: "s3://x/"}); src(s) != "/tmp/b" {
+		t.Errorf("dir should win over s3: src=%q", src(s))
 	}
 	// No baseline → disabled.
-	if s := mk(Config{}); s.baselineConfigured {
+	if s := mk(Config{}); configured(s) {
 		t.Error("no baseline → reconstruct must be disabled")
 	}
 	// Active RBAC profile disables reconstruct even with a baseline (baseline
 	// reads bypass redaction).
-	if s := mk(Config{BaselineDir: "/tmp/b", RedactColumns: []query.SchemaTableColumn{{Schema: "a", Table: "b", Column: "c"}}}); s.baselineConfigured {
+	if s := mk(Config{BaselineDir: "/tmp/b", RedactColumns: []query.SchemaTableColumn{{Schema: "a", Table: "b", Column: "c"}}}); configured(s) {
 		t.Error("active profile must disable reconstruct")
 	}
-	if s := mk(Config{BaselineDir: "/tmp/b", DenyTables: []query.SchemaTable{{Schema: "a", Table: "b"}}}); s.baselineConfigured {
+	if s := mk(Config{BaselineDir: "/tmp/b", DenyTables: []query.SchemaTable{{Schema: "a", Table: "b"}}}); configured(s) {
 		t.Error("deny rules must disable reconstruct")
 	}
 	// --no-archive disables reconstruct: without archive access the planner can't
 	// verify coverage of rotated-out hours, so AllowGaps=false can't fail loud.
-	if s := mk(Config{BaselineDir: "/tmp/b", NoArchive: true}); s.baselineConfigured {
+	if s := mk(Config{BaselineDir: "/tmp/b", NoArchive: true}); configured(s) {
 		t.Error("--no-archive must disable reconstruct (planner cannot verify archived-hour coverage)")
 	}
 }
 
 func TestHandleCapabilities(t *testing.T) {
 	for _, configured := range []bool{true, false} {
-		s := &Server{baselineConfigured: configured}
+		s := newBootServer(nil)
+		s.cm.boot.baselineConfigured = configured
 		rec := httptest.NewRecorder()
 		s.handleCapabilities(rec, httptest.NewRequest("GET", "/api/capabilities", nil))
 		if rec.Code != 200 {
@@ -69,7 +79,7 @@ func TestHandleCapabilities(t *testing.T) {
 // TestHandleReconstructGatedOff: the endpoint is the boundary, not just the UI —
 // it must refuse when reconstruct is not configured.
 func TestHandleReconstructGatedOff(t *testing.T) {
-	s := &Server{baselineConfigured: false}
+	s := newBootServer(nil) // baselineConfigured defaults to false
 	rec := httptest.NewRecorder()
 	s.handleReconstruct(rec, httptest.NewRequest("GET", "/api/reconstruct?schema=app&table=users&pk=1", nil))
 	if rec.Code != 404 {
@@ -78,7 +88,9 @@ func TestHandleReconstructGatedOff(t *testing.T) {
 }
 
 func TestHandleReconstructRequiresParams(t *testing.T) {
-	s := &Server{baselineConfigured: true, baselineSrc: "/tmp/b"}
+	s := newBootServer(nil)
+	s.cm.boot.baselineConfigured = true
+	s.cm.boot.baselineSrc = "/tmp/b"
 	rec := httptest.NewRecorder()
 	s.handleReconstruct(rec, httptest.NewRequest("GET", "/api/reconstruct?schema=app", nil))
 	if rec.Code != 400 {
@@ -101,8 +113,8 @@ func TestBuildPKFilter(t *testing.T) {
 }
 
 func TestPKColumnsNoResolver(t *testing.T) {
-	s := &Server{}
-	if _, err := s.pkColumns("app", "users"); err == nil {
+	b := &bundle{}
+	if _, err := b.pkColumns("app", "users"); err == nil {
 		t.Error("nil resolver must produce a clear error, not a panic")
 	}
 }

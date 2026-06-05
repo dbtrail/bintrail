@@ -11,7 +11,11 @@
     <div class="brand">
       <span class="logo">bintrail</span>
       <span class="sub">console</span>
-      <span class="readonly" title="This console never executes SQL.">read-only</span>
+      <span class="readonly" title="This console never executes SQL against your data.">read-only</span>
+      <div class="server-ctl">
+        <select id="server-select" title="Active server"></select>
+        <button type="button" id="manage-servers" title="Add, edit, or remove servers">Servers</button>
+      </div>
     </div>
     <nav id="tabs">
       <button class="tab active" data-panel="recover">Recover</button>
@@ -119,6 +123,43 @@
       <div id="reconstruct-result"></div>
     </section>
   </main>
+
+  <!-- ── Servers modal — manage the local connection registry ── -->
+  <div id="servers-modal" class="modal" hidden>
+    <div class="modal-dialog">
+      <div class="modal-head">
+        <h2>Servers</h2>
+        <span class="spacer"></span>
+        <button type="button" id="servers-close" class="modal-close" title="Close">&times;</button>
+      </div>
+      <p class="hint">Named connections to bintrail index databases, stored in a
+        local file on the console host. Adding a server here only registers the
+        connection — monitoring still starts with <code>bintrail up</code> on
+        that server, as usual.</p>
+      <div id="servers-list"></div>
+      <div class="actions" id="server-add-wrap">
+        <button type="button" id="server-add" class="primary">+ Add server</button>
+      </div>
+      <form id="server-form" class="filters server-form" hidden>
+        <input type="hidden" name="id">
+        <label>Name <input name="name" required placeholder="prod-db-01"></label>
+        <label>Host <input name="host" required placeholder="127.0.0.1"></label>
+        <label>Port <input name="port" type="number" min="1" max="65535" placeholder="3306"></label>
+        <label>User <input name="user" required placeholder="bintrail"></label>
+        <label>Password <input name="password" type="password" autocomplete="new-password"></label>
+        <label>Index database <input name="dbname" required placeholder="binlog_index"></label>
+        <label>Baseline dir <input name="baseline_dir" placeholder="(optional) enables Time-travel"></label>
+        <label>Baseline S3 <input name="baseline_s3" placeholder="s3://bucket/prefix/"></label>
+        <label class="checkbox"><input type="checkbox" name="no_archive"> Disable archive auto-discovery</label>
+        <div class="actions">
+          <button type="submit" class="primary">Save</button>
+          <button type="button" id="server-test">Test connection</button>
+          <button type="button" id="server-cancel">Cancel</button>
+        </div>
+        <div id="server-form-msg" class="form-msg"></div>
+      </form>
+    </div>
+  </div>
 
   <div id="toast" class="toast" hidden></div>
   <script src="app.js"></script>

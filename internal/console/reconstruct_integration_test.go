@@ -70,7 +70,7 @@ func seedReconstruct(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !srv.baselineConfigured {
+	if srv.cm.boot == nil || !srv.cm.boot.baselineConfigured {
 		t.Fatal("expected reconstruct to be enabled with a baseline dir")
 	}
 	return srv

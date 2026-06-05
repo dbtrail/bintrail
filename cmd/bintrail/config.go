@@ -190,6 +190,7 @@ var envSections = []envSection{
 			{"BINTRAIL_CONSOLE_TOKEN", ""},
 			{"BINTRAIL_CONSOLE_BASELINE_DIR", ""},
 			{"BINTRAIL_CONSOLE_BASELINE_S3", "s3://my-bucket/baselines/"},
+			{"BINTRAIL_CONSOLE_SERVERS", "~/.config/bintrail/console-servers.yaml"},
 		},
 	},
 }

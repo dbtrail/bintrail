@@ -110,6 +110,7 @@ func TestEnvBindingsAndSectionsConsistency(t *testing.T) {
 		"BINTRAIL_CONSOLE_TOKEN":        true,
 		"BINTRAIL_CONSOLE_BASELINE_DIR": true,
 		"BINTRAIL_CONSOLE_BASELINE_S3":  true,
+		"BINTRAIL_CONSOLE_SERVERS":      true,
 	}
 	// Every other envSection entry must appear in envBindings.
 	bindingVars := make(map[string]bool)

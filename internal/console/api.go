@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/go-sql-driver/mysql"
+
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/parquetquery"
 	"github.com/dbtrail/bintrail/internal/query"
@@ -134,7 +136,8 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 	}, nil
 }
 
-// fetch runs the shared cross-source fetch (live MySQL + Parquet archives).
+// fetch runs the shared cross-source fetch (live MySQL + Parquet archives)
+// against the request's selected server bundle.
 //
 // AllowGaps is true for both events and recover, matching the CLI `recover`
 // (warn-and-continue — a human reviews the script). Coverage gaps the planner
@@ -148,11 +151,11 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 // deliberate AllowGaps=true trade-off, not a missing signal — under
 // AllowGaps=false (the reconstruct endpoint) any source failure aborts the
 // fetch (#377). The trade-off is documented in docs/console.md.
-func (s *Server) fetch(ctx context.Context, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
-	return query.FetchMerged(ctx, s.db, s.engine, query.FetchMergedOptions{
+func (s *Server) fetch(ctx context.Context, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
+	return query.FetchMerged(ctx, b.db, b.engine, query.FetchMergedOptions{
 		Opts:           opts,
-		DBName:         s.dbName,
-		NoArchive:      s.noArchive,
+		DBName:         b.dbName,
+		NoArchive:      b.noArchive,
 		AllowGaps:      true,
 		ArchiveFetcher: parquetquery.Fetch,
 	})
@@ -160,6 +163,10 @@ func (s *Server) fetch(ctx context.Context, opts query.Options) ([]query.ResultR
 
 // handleEvents serves GET /api/events — the events browser.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	b := s.resolveOr(w, r)
+	if b == nil {
+		return
+	}
 	q := r.URL.Query()
 	p := filterParams{
 		Schema:        q.Get("schema"),
@@ -178,9 +185,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rows, plan, err := s.fetch(r.Context(), opts)
+	rows, plan, err := s.fetch(r.Context(), b, opts)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeFetchError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, eventsResponse{
@@ -195,6 +202,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 // executes the SQL: rows are fetched (read-only), reversed into a buffer, and
 // the script is returned as text for the operator to review and apply.
 func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
+	b := s.resolveOr(w, r)
+	if b == nil {
+		return
+	}
 	var body recoverRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
@@ -233,14 +244,14 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// Coverage gaps come back in plan.GapHours and are surfaced as warnings
 	// below — the recover UI renders them, so an incomplete-coverage undo is
 	// flagged to the operator rather than silently presented as complete.
-	rows, plan, err := s.fetch(r.Context(), opts)
+	rows, plan, err := s.fetch(r.Context(), b, opts)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeFetchError(w, err)
 		return
 	}
 
 	var buf bytes.Buffer
-	n, err := recovery.New(s.db, s.resolver).GenerateSQLFromRows(rows, &buf)
+	n, err := recovery.New(b.db, b.resolver).GenerateSQLFromRows(rows, &buf)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -258,7 +269,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 // that surface exposes only aggregate server metadata, never per-event actor
 // attribution, so it stays inside the free query_explorer boundary.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	data, err := status.CollectStatus(r.Context(), s.db, s.dbName)
+	b := s.resolveOr(w, r)
+	if b == nil {
+		return
+	}
+	data, err := status.CollectStatus(r.Context(), b.db, b.dbName)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -281,9 +296,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // the distinct schemas present in the index; with one it returns that schema's
 // tables (snapshot-authoritative, falling back to distinct observed tables).
 func (s *Server) handleSchemas(w http.ResponseWriter, r *http.Request) {
+	b := s.resolveOr(w, r)
+	if b == nil {
+		return
+	}
 	schema := r.URL.Query().Get("schema")
 	if schema == "" {
-		names, err := s.distinctSchemas(r.Context())
+		names, err := b.distinctSchemas(r.Context())
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -291,7 +310,7 @@ func (s *Server) handleSchemas(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, schemasResponse{Schemas: names})
 		return
 	}
-	tables, err := s.tablesForSchema(r.Context(), schema)
+	tables, err := b.tablesForSchema(r.Context(), schema)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -304,9 +323,9 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// distinctSchemas lists the schemas observed in binlog_events.
-func (s *Server) distinctSchemas(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT DISTINCT schema_name FROM binlog_events ORDER BY schema_name")
+// distinctSchemas lists the schemas observed in this server's binlog_events.
+func (b *bundle) distinctSchemas(ctx context.Context) ([]string, error) {
+	rows, err := b.db.QueryContext(ctx, "SELECT DISTINCT schema_name FROM binlog_events ORDER BY schema_name")
 	if err != nil {
 		return nil, err
 	}
@@ -318,9 +337,9 @@ func (s *Server) distinctSchemas(ctx context.Context) ([]string, error) {
 // snapshot (authoritative, includes tables with no recent events) and falls
 // back to the distinct tables observed in binlog_events when no snapshot covers
 // the schema.
-func (s *Server) tablesForSchema(ctx context.Context, schema string) ([]string, error) {
-	if s.resolver != nil {
-		if metas := s.resolver.Tables(schema); len(metas) > 0 {
+func (b *bundle) tablesForSchema(ctx context.Context, schema string) ([]string, error) {
+	if b.resolver != nil {
+		if metas := b.resolver.Tables(schema); len(metas) > 0 {
 			out := make([]string, len(metas))
 			for i, m := range metas {
 				out[i] = m.Table
@@ -328,7 +347,7 @@ func (s *Server) tablesForSchema(ctx context.Context, schema string) ([]string, 
 			return out, nil
 		}
 	}
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := b.db.QueryContext(ctx,
 		"SELECT DISTINCT table_name FROM binlog_events WHERE schema_name = ? ORDER BY table_name", schema)
 	if err != nil {
 		return nil, err
@@ -375,6 +394,23 @@ func atoiDefault(s string, def int) int {
 		return def
 	}
 	return n
+}
+
+// writeFetchError maps a cross-source fetch failure onto the right HTTP
+// response. The interesting case: a registry index that predates the
+// connection_id column fails the events SELECT with MySQL error 1054. The
+// console deliberately never migrates registry servers (EnsureSchema — an
+// ALTER — is confined to the command-line DSN), so instead of a cryptic 500 we
+// return an actionable 422 telling the operator how to migrate.
+func writeFetchError(w http.ResponseWriter, err error) {
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) && myErr.Number == 1054 && strings.Contains(myErr.Message, "connection_id") {
+		writeJSONError(w, http.StatusUnprocessableEntity,
+			"this index predates the connection_id column, and the console never migrates servers added in the UI; "+
+				"run a writer command against it once (bintrail index / stream / agent), or start a console with --index-dsn pointing at it")
+		return
+	}
+	writeJSONError(w, http.StatusInternalServerError, err.Error())
 }
 
 // gapWarnings renders coverage-gap hours from a query plan into a warning list

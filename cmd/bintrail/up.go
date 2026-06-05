@@ -63,6 +63,7 @@ var (
 	upConsoleToken       string
 	upConsoleBaselineDir string
 	upConsoleBaselineS3  string
+	upConsoleServersFile string
 )
 
 func init() {
@@ -82,6 +83,7 @@ func init() {
 	upCmd.Flags().StringVar(&upConsoleToken, "console-token", "", "Console access token (auto-generated for loopback binds when empty)")
 	upCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface when --console is set")
 	upCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct when --console is set")
+	upCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML when --console is set (default ~/.config/bintrail/console-servers.yaml)")
 	_ = upCmd.MarkFlagRequired("source-dsn")
 	_ = upCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(upCmd)
@@ -174,10 +176,25 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("console: schema migration: %w", err)
 	}
 
+	// The server registry gives `up --console` the same UI-managed switcher as
+	// the standalone console; the stream's own index is the ephemeral default.
+	// A corrupt file fails loud — `--console` is an explicit opt-in, and
+	// silently starting without the operator's saved servers would look like
+	// data loss.
+	serversPath := upConsoleServersFile
+	if serversPath == "" {
+		serversPath = console.DefaultRegistryPath()
+	}
+	registry, err := console.LoadRegistry(serversPath)
+	if err != nil {
+		return fmt.Errorf("console: %w", err)
+	}
+
 	cfg, err := upConsoleConfig(db, upIndexDSN, upConsoleListen, upConsoleToken, upConsoleBaselineDir, upConsoleBaselineS3)
 	if err != nil {
 		return err
 	}
+	cfg.Registry = registry
 	srv, err := console.New(cfg)
 	if err != nil {
 		return err
@@ -240,6 +257,11 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 			upConsoleBaselineS3 = v
 		}
 	}
+	if !cmd.Flags().Changed("console-servers-file") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_SERVERS"); v != "" {
+			upConsoleServersFile = v
+		}
+	}
 }
 
 // upConsoleConfig builds the console configuration for `up --console`. It serves
@@ -260,6 +282,7 @@ func upConsoleConfig(db *sql.DB, indexDSN, listen, token, baselineDir, baselineS
 	return console.Config{
 		DB:          db,
 		DBName:      cfg.DBName,
+		BootDSN:     indexDSN,
 		Listen:      listen,
 		Token:       token,
 		BaselineDir: baselineDir,

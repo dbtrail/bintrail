@@ -51,7 +51,8 @@ time using the ambient AWS credential chain — same as the standalone console,
 but note `up` didn't need AWS credentials before.
 
 Open that URL in a browser. Four tabs (Time-travel appears only when a baseline
-is configured):
+is configured), plus a **server switcher** in the header (see
+[Managing servers](#managing-servers)):
 
 1. **Recover** (landing) — filter schema / table / PK / time, preview the
    affected rows with before→after diffs, then **Generate undo SQL** and
@@ -66,11 +67,64 @@ is configured):
    baseline is configured** (`--baseline-dir`/`--baseline-s3`); otherwise the tab
    is hidden, never shown empty. See [Time-travel](#time-travel-reconstruct).
 
+## Managing servers
+
+The header has a server switcher and a **Servers** button: add, edit, and
+remove named connections to bintrail index databases, and switch every tab
+between them. The registry is a **local YAML file on the console host**
+(`~/.config/bintrail/console-servers.yaml` by default, override with
+`--servers-file` / `BINTRAIL_CONSOLE_SERVERS`) — adding a server registers a
+connection for browsing; it does **not** start monitoring. Monitoring still
+starts with `bintrail up` / `stream` against that server, as always.
+
+How it behaves:
+
+- **The command-line entry.** `--index-dsn` (or `up --console`'s stream index)
+  appears as an ephemeral `default (cli)` entry: it is the initial selection,
+  is never written to the registry file, and cannot be edited or deleted from
+  the UI. With at least one saved server, `--index-dsn` becomes optional — the
+  console can start registry-only.
+- **Lazy connections.** Saved servers connect on first selection (with an
+  eager ping, so a dead server fails the moment you switch to it, not on your
+  first query). Editing a server's connection details closes and reopens its
+  connection; editing only its baseline/archive settings keeps it.
+- **Per-server selection is per-tab.** The selection rides an
+  `X-Bintrail-Server` header on each request — there is no server-side "active
+  server" — so two browser tabs can watch two different servers.
+- **Per-server Time-travel.** The reconstruct gate (baseline configured, no
+  RBAC profile, archives enabled) is evaluated per server; the Time-travel tab
+  appears and disappears as you switch.
+- **Test connection.** Each server (saved or being typed) has a write-free
+  probe: ping, MySQL version, latency, whether the database looks like a
+  bintrail index, and whether its schema is current.
+
+Security notes specific to the registry:
+
+- The registry file stores full DSNs **including passwords** (`0600`, directory
+  `0700`) — the same secret-at-rest class as `shim.yaml` and `dump.key`.
+- Passwords never travel to the browser. List/get responses carry parsed
+  non-secret fields plus `has_password`; leaving the password blank on an edit
+  keeps the stored one.
+- **The console never migrates servers added in the UI.** The one schema
+  migration (`EnsureSchema`, an idempotent ALTER) runs at startup on the DSN
+  you typed on the command line — never on a DSN typed into a browser form. A
+  registry index that predates the `connection_id` column returns an
+  actionable `422` (run a writer command against it once) instead of being
+  silently ALTERed.
+- The registry file is the only thing the console ever writes. Its write
+  endpoints sit behind the same bearer token and Host-header guard as
+  everything else.
+
+The registry file is versioned and forward-compatible: fields written by a
+newer bintrail (e.g. a future control-plane's `source_dsn`) survive
+load→edit→save round-trips on an older binary, and a file written by a newer
+*schema* version loads read-only rather than being rewritten lossily.
+
 ## Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--index-dsn` | — (required) | DSN for the index MySQL database. |
+| `--index-dsn` | — | DSN for the index MySQL database. Becomes the ephemeral `default` entry. Required only when the server registry is empty. |
 | `--listen` | `127.0.0.1:8090` | Bind address. `:8090` avoids the MCP server's `:8080`. |
 | `--token` | auto-generated | Access token. Auto-generated for loopback binds; **required** for non-loopback. |
 | `--no-archive` | `false` | Disable Parquet archive auto-discovery (MySQL-only results). Also **disables Time-travel** — reconstruct needs archive access to verify coverage. |
@@ -78,6 +132,7 @@ is configured):
 | `--allowed-hosts` | — | Extra hostnames accepted in the `Host` header (for reverse-proxy setups). IP literals and `localhost` are always allowed. |
 | `--baseline-dir` | — | Local directory of baseline Parquet snapshots. Enables the Time-travel (reconstruct) surface. |
 | `--baseline-s3` | — | S3 prefix of baseline snapshots (`s3://bucket/prefix/`). Enables Time-travel. |
+| `--servers-file` | `~/.config/bintrail/console-servers.yaml` | Path to the server registry YAML managed from the UI. |
 
 ### Environment variables
 
@@ -86,11 +141,12 @@ is configured):
 - `BINTRAIL_CONSOLE_TOKEN` — same as `--token`.
 - `BINTRAIL_CONSOLE_BASELINE_DIR` — same as `--baseline-dir`.
 - `BINTRAIL_CONSOLE_BASELINE_S3` — same as `--baseline-s3`.
+- `BINTRAIL_CONSOLE_SERVERS` — same as `--servers-file`.
 
-Precedence is the usual CLI flag > environment variable > default. The four
+Precedence is the usual CLI flag > environment variable > default. The five
 `BINTRAIL_CONSOLE_*` variables apply equally to `bintrail up --console` (where
 the matching flags are `--console-listen`, `--console-token`, `--baseline-dir`,
-`--baseline-s3`).
+`--baseline-s3`, `--console-servers-file`).
 
 ## Security model
 
@@ -136,8 +192,19 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `GET /api/schemas` | Distinct schemas. `?schema=<name>` → that schema's tables. |
 | `GET /api/events` | Event browser. Query params: `schema, table, pk, event_type, gtid, since, until, changed_column, order, limit`. |
 | `POST /api/recover` | Undo-SQL generation. JSON body with the same filter fields (requires at least `schema`; an `order` field is accepted but ignored — recover always processes oldest-first). Returns `{sql, statement_count, row_count, warnings}`. |
-| `GET /api/capabilities` | Reports enabled optional surfaces, e.g. `{"reconstruct": true}`. The frontend uses it to show/hide baseline-gated tabs. |
-| `GET /api/reconstruct` | Single-row point-in-time reconstruct (baseline-gated; 404 when not configured). Query params: `schema, table, pk, at, history, allow_gaps`. Returns `{found, deleted, state, history, baseline_time, event_count, warnings}`. |
+| `GET /api/capabilities` | Reports enabled optional surfaces for the **selected server**, e.g. `{"reconstruct": true}`. The frontend uses it to show/hide baseline-gated tabs on every switch. |
+| `GET /api/reconstruct` | Single-row point-in-time reconstruct (baseline-gated **per server**; 404 when not configured). Query params: `schema, table, pk, at, history, allow_gaps`. Returns `{found, deleted, state, history, baseline_time, event_count, warnings}`. |
+| `GET /api/servers` | List servers (masked: parsed host/port/user/dbname + `has_password`, never a DSN or password) plus `default_id`. |
+| `POST /api/servers` | Add a server to the registry (validates, does not connect; never runs DDL). |
+| `GET /api/servers/{id}` | One masked entry (prefills the edit form). |
+| `PUT /api/servers/{id}` | Edit. Omitted password = keep stored; `""` = clear; value = replace. `409` for the command-line entry. |
+| `DELETE /api/servers/{id}` | Remove from the registry and close its cached connection. `409` for the command-line entry. |
+| `POST /api/servers/{id}/test`, `POST /api/servers/test` | Write-free reachability probe (short timeout): `{ok, server_version, dbname, latency_ms, has_index, schema_current}`. Accepts an unsaved candidate body; with `{id}`, a blank password merges the stored one. |
+
+Every data endpoint (`status`, `schemas`, `events`, `recover`, `capabilities`,
+`reconstruct`) targets the server named by the `X-Bintrail-Server` request
+header; without the header they target the default entry. Selection is
+stateless — concurrent clients can each target a different server.
 
 ### Time-travel (reconstruct)
 

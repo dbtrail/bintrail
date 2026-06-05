@@ -253,10 +253,11 @@ pre#recover-sql {
 }
 
 /* Capability gating: elements are hidden until JS confirms the capability is
-   enabled (it then removes the data-capability attribute to reveal them). This
-   means an un-configured surface — e.g. reconstruct with no baseline — never
-   flashes on screen. */
-[data-capability] { display: none; }
+   enabled for the SELECTED server (it then adds the cap-on class). The
+   attribute is kept so the gate re-evaluates on every server switch — a server
+   with Time-travel can be followed by one without. !important outranks
+   .panel.active, so switching away from a capable server hides an open tab. */
+[data-capability]:not(.cap-on) { display: none !important; }
 
 .filters label.checkbox {
   flex-direction: row;
@@ -289,6 +290,124 @@ table.statetable td { font-family: var(--mono); white-space: pre-wrap; word-brea
   padding: 10px 12px;
   font-size: 13px;
 }
+
+/* ── Server switcher (header) + management modal ── */
+.server-ctl { display: flex; align-items: center; gap: 6px; margin-left: 18px; }
+.server-ctl select {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12.5px;
+  max-width: 220px;
+}
+.server-ctl select:focus { outline: none; border-color: var(--accent); }
+.server-ctl button {
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+}
+.server-ctl button:hover { border-color: var(--accent); }
+
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 50;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 60px 16px;
+  overflow-y: auto;
+}
+.modal-dialog {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: 760px;
+  max-width: 100%;
+  padding: 20px;
+}
+.modal-head { display: flex; align-items: center; gap: 8px; }
+.modal-head h2 { margin: 0; font-size: 16px; }
+.modal-head .spacer { flex: 1; }
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.modal-close:hover { color: var(--text); }
+.modal .hint code {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--panel-2);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.server-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.server-row .srv-name { font-weight: 600; }
+.server-row .srv-desc {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.server-row .srv-status { font-size: 12px; color: var(--muted); }
+.server-row .srv-status.ok { color: var(--ok); }
+.server-row .srv-status.err { color: var(--del); }
+
+.health-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: none;
+  background: var(--muted);
+}
+.health-dot.ok { background: var(--ok); }
+
+.badge.cli { color: var(--warn); border: 1px solid var(--warn); }
+.badge.tt { color: var(--accent); border: 1px solid var(--accent); }
+
+.row-btn {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+}
+.row-btn:hover:not(:disabled) { border-color: var(--accent); }
+.row-btn.danger:hover:not(:disabled) { border-color: var(--del); color: var(--del); }
+.row-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.server-form { margin-top: 14px; }
+.form-msg { width: 100%; font-size: 12.5px; min-height: 1em; }
+.form-msg.err { color: var(--del); }
+.form-msg.ok { color: var(--ok); }
+
+#server-add-wrap { margin-top: 12px; }
 
 .timeline { margin-top: 16px; border-left: 2px solid var(--border); padding-left: 18px; }
 .tl-entry { position: relative; padding: 8px 0 14px; }

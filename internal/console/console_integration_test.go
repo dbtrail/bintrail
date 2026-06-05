@@ -147,7 +147,7 @@ func TestIntegrationRecoverMatchesGenerator(t *testing.T) {
 	// recover path — so the two scripts must match statement-for-statement.
 	var buf bytes.Buffer
 	opts := query.Options{Schema: "app", Table: "users", Order: "", Limit: recoverDefaultLimit}
-	if _, err := recovery.New(srv.db, srv.resolver).GenerateSQL(context.Background(), opts, &buf); err != nil {
+	if _, err := recovery.New(srv.cm.boot.db, srv.cm.boot.resolver).GenerateSQL(context.Background(), opts, &buf); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := stmts, statements(buf.String()); !equalStrings(got, want) {
@@ -208,7 +208,7 @@ func TestIntegrationProfileRBAC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !srv.noArchive {
+	if !srv.cm.boot.noArchive {
 		t.Error("New must force noArchive when RBAC rules are present (archives don't enforce RBAC)")
 	}
 
@@ -225,6 +225,279 @@ func TestIntegrationProfileRBAC(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "alice@x") {
 		t.Errorf("non-redacted column email should remain present: %s", body)
+	}
+}
+
+// doReqOn is doReq with an explicit X-Bintrail-Server selection header.
+func doReqOn(t *testing.T, srv *Server, serverID, method, path, body string) (*httptest.ResponseRecorder, []byte) {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, "http://127.0.0.1:8090"+path, r)
+	req.Host = "127.0.0.1:8090"
+	req.Header.Set("Authorization", "Bearer "+intToken)
+	if serverID != "" {
+		req.Header.Set("X-Bintrail-Server", serverID)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec, rec.Body.Bytes()
+}
+
+// seedSecondIndex creates another test index seeded with one shop.orders event
+// and returns its database name (its DSN comes from testutil.IntegrationDSN).
+func seedSecondIndex(t *testing.T) string {
+	t.Helper()
+	db2, dbName2 := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db2)
+	testutil.InsertEvent(t, db2, "bin.000009", 4, 40, "2026-06-02 09:00:00", nil,
+		"shop", "orders", 1 /*INSERT*/, "1001",
+		nil, nil, []byte(`{"id":1001,"status":"pending"}`))
+	return dbName2
+}
+
+// TestIntegrationServerSwitching is the feature's end-to-end check: a second
+// index registered through the API, every data surface re-scoped by the
+// selection header, and per-server capability gating.
+func TestIntegrationServerSwitching(t *testing.T) {
+	srv, _ := seedConsoleData(t) // boot: app.users events
+	t.Cleanup(srv.cm.CloseAll)
+	dbName2 := seedSecondIndex(t) // registry: shop.orders events
+
+	// Register the second index via the API (lazy: no connection yet).
+	rec, body := doReq(t, srv, "POST", "/api/servers",
+		`{"name":"second","dsn":"`+testutil.IntegrationDSN(dbName2)+`"}`)
+	if rec.Code != 201 {
+		t.Fatalf("create server: code=%d body=%s", rec.Code, body)
+	}
+	var created serverDTO
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default (no header) → boot index: app schema, no shop events.
+	_, body = doReq(t, srv, "GET", "/api/schemas", "")
+	var sr schemasResponse
+	if err := json.Unmarshal(body, &sr); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(sr.Schemas, "app") || contains(sr.Schemas, "shop") {
+		t.Errorf("boot schemas = %v, want app without shop", sr.Schemas)
+	}
+
+	// Selection header → second index: shop schema and its event, scoped.
+	_, body = doReqOn(t, srv, created.ID, "GET", "/api/schemas", "")
+	if err := json.Unmarshal(body, &sr); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(sr.Schemas, "shop") || contains(sr.Schemas, "app") {
+		t.Errorf("registry-server schemas = %v, want shop without app", sr.Schemas)
+	}
+	rec, body = doReqOn(t, srv, created.ID, "GET", "/api/events?schema=shop&table=orders", "")
+	if rec.Code != 200 {
+		t.Fatalf("events on second server: code=%d body=%s", rec.Code, body)
+	}
+	var er eventsResponse
+	if err := json.Unmarshal(body, &er); err != nil {
+		t.Fatal(err)
+	}
+	if er.Count != 1 {
+		t.Errorf("second-server event count = %d, want 1", er.Count)
+	}
+	// The same query against the boot index must see nothing — scoping holds.
+	_, body = doReq(t, srv, "GET", "/api/events?schema=shop&table=orders", "")
+	if err := json.Unmarshal(body, &er); err != nil {
+		t.Fatal(err)
+	}
+	if er.Count != 0 {
+		t.Errorf("boot index leaked %d shop events", er.Count)
+	}
+
+	// Per-server capabilities: boot has no baseline (false); give the registry
+	// entry a baseline dir (keep-password PUT, structured fields) → true.
+	_, body = doReq(t, srv, "GET", "/api/capabilities", "")
+	var caps capabilitiesResponse
+	if err := json.Unmarshal(body, &caps); err != nil {
+		t.Fatal(err)
+	}
+	if caps.Reconstruct {
+		t.Error("boot entry must report reconstruct=false (no baseline)")
+	}
+	rec, body = doReqOn(t, srv, "", "PUT", "/api/servers/"+created.ID,
+		`{"name":"second","host":"`+created.Host+`","port":"`+created.Port+`","user":"`+created.User+`","dbname":"`+created.DBName+`","baseline_dir":"/tmp/baselines"}`)
+	if rec.Code != 200 {
+		t.Fatalf("baseline edit: code=%d body=%s", rec.Code, body)
+	}
+	rec, body = doReqOn(t, srv, created.ID, "GET", "/api/capabilities", "")
+	if rec.Code != 200 {
+		t.Fatalf("capabilities on second server: code=%d body=%s (keep-password merge must keep the DSN working)", rec.Code, body)
+	}
+	if err := json.Unmarshal(body, &caps); err != nil {
+		t.Fatal(err)
+	}
+	if !caps.Reconstruct {
+		t.Error("registry entry with baseline_dir must report reconstruct=true")
+	}
+}
+
+// TestIntegrationRegistryServerNeverMigrated locks the read-only boundary: a
+// registry index missing the connection_id column is NEVER ALTERed by the
+// console — the query fails with an actionable 422 and the schema stays put.
+func TestIntegrationRegistryServerNeverMigrated(t *testing.T) {
+	srv, _ := seedConsoleData(t)
+	t.Cleanup(srv.cm.CloseAll)
+
+	db2, dbName2 := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db2)
+	if _, err := db2.Exec("ALTER TABLE binlog_events DROP COLUMN connection_id"); err != nil {
+		t.Fatalf("simulate legacy index: %v", err)
+	}
+
+	rec, body := doReq(t, srv, "POST", "/api/servers",
+		`{"name":"legacy","dsn":"`+testutil.IntegrationDSN(dbName2)+`"}`)
+	if rec.Code != 201 {
+		t.Fatalf("create: code=%d body=%s", rec.Code, body)
+	}
+	var created serverDTO
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+
+	// The probe is write-free and reports the stale schema.
+	rec, body = doReq(t, srv, "POST", "/api/servers/"+created.ID+"/test", "")
+	if rec.Code != 200 {
+		t.Fatalf("test probe: code=%d body=%s", rec.Code, body)
+	}
+	var probe testResponse
+	if err := json.Unmarshal(body, &probe); err != nil {
+		t.Fatal(err)
+	}
+	if !probe.OK || !probe.HasIndex || probe.SchemaCurrent {
+		t.Errorf("probe = %+v, want ok+has_index+schema_current=false", probe)
+	}
+
+	// Querying it fails with the actionable 422, not a silent migration.
+	rec, body = doReqOn(t, srv, created.ID, "GET", "/api/events?schema=shop", "")
+	if rec.Code != 422 {
+		t.Fatalf("legacy index query: code=%d, want 422 (body=%s)", rec.Code, body)
+	}
+	if !strings.Contains(string(body), "writer command") {
+		t.Errorf("422 must name the fix (a writer command): %s", body)
+	}
+
+	// The console must not have ALTERed the table back.
+	var n int
+	if err := db2.QueryRow(
+		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events' AND COLUMN_NAME = 'connection_id'",
+		dbName2).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Error("console ran EnsureSchema on a registry server — the read-only boundary is broken")
+	}
+}
+
+// TestIntegrationEvictOnDSNEdit: editing an entry's DSN closes the cached
+// connection; a baseline-only edit keeps it open.
+func TestIntegrationEvictOnDSNEdit(t *testing.T) {
+	srv, _ := seedConsoleData(t)
+	t.Cleanup(srv.cm.CloseAll)
+	dbName2 := seedSecondIndex(t)
+
+	_, body := doReq(t, srv, "POST", "/api/servers",
+		`{"name":"second","dsn":"`+testutil.IntegrationDSN(dbName2)+`"}`)
+	var created serverDTO
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+
+	// First selection opens and caches the bundle.
+	if rec, b := doReqOn(t, srv, created.ID, "GET", "/api/capabilities", ""); rec.Code != 200 {
+		t.Fatalf("warm-up: code=%d body=%s", rec.Code, b)
+	}
+	srv.cm.mu.Lock()
+	oldBundle := srv.cm.bundles[created.ID]
+	srv.cm.mu.Unlock()
+	if oldBundle == nil {
+		t.Fatal("bundle not cached after first selection")
+	}
+
+	// Baseline-only edit (structured fields unchanged) keeps the same db.
+	doReqOn(t, srv, "", "PUT", "/api/servers/"+created.ID,
+		`{"name":"second","host":"`+created.Host+`","port":"`+created.Port+`","user":"`+created.User+`","dbname":"`+created.DBName+`","baseline_s3":"s3://b/"}`)
+	srv.cm.mu.Lock()
+	rebuilt := srv.cm.bundles[created.ID]
+	srv.cm.mu.Unlock()
+	if rebuilt == nil || rebuilt.db != oldBundle.db {
+		t.Error("baseline-only edit must keep the open *sql.DB (no re-Ping)")
+	}
+	if rebuilt != nil && !rebuilt.baselineConfigured {
+		t.Error("baseline-only edit must flip baselineConfigured on the cached bundle")
+	}
+	if err := oldBundle.db.Ping(); err != nil {
+		t.Errorf("db must still be open after a baseline-only edit: %v", err)
+	}
+
+	// DSN change (raw dsn with an extra param) evicts and closes.
+	rec, b := doReqOn(t, srv, "", "PUT", "/api/servers/"+created.ID,
+		`{"name":"second","dsn":"`+testutil.IntegrationDSN(dbName2)+`&timeout=30s"}`)
+	if rec.Code != 200 {
+		t.Fatalf("dsn edit: code=%d body=%s", rec.Code, b)
+	}
+	srv.cm.mu.Lock()
+	_, stillCached := srv.cm.bundles[created.ID]
+	srv.cm.mu.Unlock()
+	if stillCached {
+		t.Error("DSN edit must evict the cached bundle")
+	}
+	if err := oldBundle.db.Ping(); err == nil {
+		t.Error("DSN edit must Close the evicted connection")
+	}
+
+	// And the next selection lazily reopens against the new DSN.
+	if rec, b := doReqOn(t, srv, created.ID, "GET", "/api/capabilities", ""); rec.Code != 200 {
+		t.Errorf("reopen after DSN edit: code=%d body=%s", rec.Code, b)
+	}
+}
+
+// TestIntegrationRegistryOnlyConsole: no --index-dsn at all — the first saved
+// server is the default and serves every surface.
+func TestIntegrationRegistryOnlyConsole(t *testing.T) {
+	dbName2 := seedSecondIndex(t)
+
+	reg, err := LoadRegistry(t.TempDir() + "/console-servers.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Add(ServerEntry{Name: "only", DSN: testutil.IntegrationDSN(dbName2)}); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{Listen: "127.0.0.1:8090", Token: intToken, Registry: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.cm.CloseAll)
+
+	rec, body := doReq(t, srv, "GET", "/api/events?schema=shop&table=orders", "")
+	if rec.Code != 200 {
+		t.Fatalf("registry-only events: code=%d body=%s", rec.Code, body)
+	}
+	var er eventsResponse
+	if err := json.Unmarshal(body, &er); err != nil {
+		t.Fatal(err)
+	}
+	if er.Count != 1 {
+		t.Errorf("registry-only count = %d, want 1", er.Count)
+	}
+	var resp serversResponse
+	_, body = doReq(t, srv, "GET", "/api/servers", "")
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Servers) != 1 || resp.DefaultID != resp.Servers[0].ID {
+		t.Errorf("registry-only list = %+v, want the single entry as default", resp)
 	}
 }
 

@@ -124,7 +124,7 @@ func TestEventsHandlerOmitsConnectionID(t *testing.T) {
 	)
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
 
-	s := &Server{db: db, engine: query.New(db), dbName: "", noArchive: true, token: "t"}
+	s := newBootServer(db)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/api/events?schema=app&table=users", nil)
 	s.handleEvents(rec, req)
@@ -153,7 +153,7 @@ func TestEventsHandlerOmitsConnectionID(t *testing.T) {
 
 // TestRecoverInvalidJSON: a malformed (non-empty) body is a 400, not a panic.
 func TestRecoverInvalidJSON(t *testing.T) {
-	s := &Server{token: "t"}
+	s := newBootServer(nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/recover", strings.NewReader(`{bad`))
 	s.handleRecover(rec, req)
@@ -189,14 +189,9 @@ func TestRecoverIsReadOnly(t *testing.T) {
 	)
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(resultRows)
 
-	s := &Server{
-		db:        db,
-		engine:    query.New(db),
-		dbName:    "", // empty disables the planner → no archive_state query
-		noArchive: true,
-		resolver:  nil,
-		token:     "t",
-	}
+	// newBootServer leaves dbName empty (disables the planner → no
+	// archive_state query) and the resolver nil (all-column WHERE fallback).
+	s := newBootServer(db)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/recover", strings.NewReader(`{"schema":"app","table":"users"}`))
@@ -225,7 +220,7 @@ func TestRecoverIsReadOnly(t *testing.T) {
 
 // TestRecoverRequiresSchema ensures recover refuses to undo the whole index.
 func TestRecoverRequiresSchema(t *testing.T) {
-	s := &Server{token: "t"}
+	s := newBootServer(nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/recover", strings.NewReader(`{}`))
 	s.handleRecover(rec, req)

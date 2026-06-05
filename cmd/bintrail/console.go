@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
@@ -45,10 +46,11 @@ var (
 	conAllowedHosts []string
 	conBaselineDir  string
 	conBaselineS3   string
+	conServersFile  string
 )
 
 func init() {
-	consoleCmd.Flags().StringVar(&conIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
+	consoleCmd.Flags().StringVar(&conIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required unless the server registry has entries)")
 	consoleCmd.Flags().StringVar(&conListen, "listen", "127.0.0.1:8090", "Address to listen on (host:port)")
 	consoleCmd.Flags().StringVar(&conToken, "token", "", "Access token (auto-generated for loopback binds when empty)")
 	consoleCmd.Flags().BoolVar(&conNoArchive, "no-archive", false, "Disable Parquet archive auto-discovery (MySQL-only)")
@@ -56,13 +58,18 @@ func init() {
 	consoleCmd.Flags().StringSliceVar(&conAllowedHosts, "allowed-hosts", nil, "Extra hostnames allowed in the Host header (for reverse-proxy setups; IP literals and localhost are always allowed)")
 	consoleCmd.Flags().StringVar(&conBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the point-in-time Reconstruct surface")
 	consoleCmd.Flags().StringVar(&conBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
-	_ = consoleCmd.MarkFlagRequired("index-dsn")
+	consoleCmd.Flags().StringVar(&conServersFile, "servers-file", "", "Path to the server registry YAML managed by the UI (default ~/.config/bintrail/console-servers.yaml)")
+	// --index-dsn is NOT MarkFlagRequired anymore: a console whose server
+	// registry has entries can start registry-only. runConsole enforces
+	// "either a DSN or a non-empty registry".
+	//
 	// bindCommandEnv wires the shared BINTRAIL_* env vars (notably
 	// BINTRAIL_INDEX_DSN). The console-specific BINTRAIL_CONSOLE_LISTEN /
-	// BINTRAIL_CONSOLE_TOKEN are handled in runConsole rather than added to the
-	// global envBindings slice: that slice matches by flag name, and --listen is
-	// also used by `shim`/`init-shim`, so a global binding would leak the
-	// console's listen address into those commands.
+	// BINTRAIL_CONSOLE_TOKEN / BINTRAIL_CONSOLE_SERVERS are handled in
+	// runConsole rather than added to the global envBindings slice: that slice
+	// matches by flag name, and --listen is also used by `shim`/`init-shim`,
+	// so a global binding would leak the console's listen address into those
+	// commands.
 	bindCommandEnv(consoleCmd)
 	rootCmd.AddCommand(consoleCmd)
 }
@@ -89,26 +96,60 @@ func runConsole(cmd *cobra.Command, args []string) error {
 			conBaselineS3 = v
 		}
 	}
+	if !cmd.Flags().Changed("servers-file") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_SERVERS"); v != "" {
+			conServersFile = v
+		}
+	}
 
-	cfg, err := mysql.ParseDSN(conIndexDSN)
+	// The server registry: the named connections managed from the UI. A
+	// corrupt file fails loud — silently starting without the operator's
+	// saved servers would look like data loss.
+	serversPath := conServersFile
+	if serversPath == "" {
+		serversPath = console.DefaultRegistryPath()
+	}
+	registry, err := console.LoadRegistry(serversPath)
 	if err != nil {
-		return fmt.Errorf("invalid --index-dsn: %w", err)
-	}
-	dbName := cfg.DBName
-	if dbName == "" {
-		return fmt.Errorf("--index-dsn must include a database name (e.g. user:pass@tcp(host:3306)/binlog_index)")
+		return err
 	}
 
-	db, err := config.Connect(conIndexDSN)
-	if err != nil {
-		return fmt.Errorf("failed to connect to index database: %w", err)
+	// Either a command-line DSN or at least one saved server must exist.
+	if conIndexDSN == "" && registry.Len() == 0 {
+		return fmt.Errorf("either --index-dsn (or BINTRAIL_INDEX_DSN) or at least one server in %s is required", serversPath)
 	}
-	defer db.Close()
+	// Profile rules are loaded from the command-line index; without one there
+	// is no DB to read them from.
+	if conProfile != "" && conIndexDSN == "" {
+		return fmt.Errorf("--profile requires --index-dsn: the profile's rules are loaded from that index database")
+	}
 
-	// Run startup migrations once here (not per request), keeping request
-	// handlers free of DDL — the recover path is then provably read-only.
-	if err := indexer.EnsureSchema(db); err != nil {
-		return fmt.Errorf("schema migration: %w", err)
+	// The command-line DSN becomes the ephemeral "default" entry: connected
+	// eagerly (fail-fast preserved) and schema-migrated here, at startup, on
+	// the one DSN the operator typed in their shell. Servers added in the UI
+	// are NEVER migrated — request handlers stay free of DDL, so the recover
+	// path remains provably read-only.
+	var db *sql.DB
+	var dbName string
+	if conIndexDSN != "" {
+		cfg, err := mysql.ParseDSN(conIndexDSN)
+		if err != nil {
+			return fmt.Errorf("invalid --index-dsn: %w", err)
+		}
+		dbName = cfg.DBName
+		if dbName == "" {
+			return fmt.Errorf("--index-dsn must include a database name (e.g. user:pass@tcp(host:3306)/binlog_index)")
+		}
+
+		db, err = config.Connect(conIndexDSN)
+		if err != nil {
+			return fmt.Errorf("failed to connect to index database: %w", err)
+		}
+		defer db.Close()
+
+		if err := indexer.EnsureSchema(db); err != nil {
+			return fmt.Errorf("schema migration: %w", err)
+		}
 	}
 
 	// Resolve profile RBAC rules up front. Archives don't enforce RBAC, so a
@@ -125,6 +166,8 @@ func runConsole(cmd *cobra.Command, args []string) error {
 	srv, err := console.New(console.Config{
 		DB:            db,
 		DBName:        dbName,
+		BootDSN:       conIndexDSN,
+		Registry:      registry,
 		Listen:        conListen,
 		Token:         conToken,
 		NoArchive:     conNoArchive || conProfile != "",

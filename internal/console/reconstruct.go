@@ -25,10 +25,17 @@ type capabilitiesResponse struct {
 	Reconstruct bool `json:"reconstruct"`
 }
 
-// handleCapabilities reports which optional console surfaces are enabled so the
-// frontend can show/hide them. Today that is just reconstruct (baseline-gated).
+// handleCapabilities reports which optional console surfaces are enabled for
+// the SELECTED server, so the frontend can show/hide them per server. Today
+// that is just reconstruct (baseline-gated). Resolving the bundle here is
+// deliberate: it lazily opens the connection on switch, so a dead entry fails
+// the moment the operator selects it, not on their first query.
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, capabilitiesResponse{Reconstruct: s.baselineConfigured})
+	b := s.resolveOr(w, r)
+	if b == nil {
+		return
+	}
+	writeJSON(w, http.StatusOK, capabilitiesResponse{Reconstruct: b.baselineConfigured})
 }
 
 // stateEntryDTO is the wire view of a reconstruct.StateEntry (that struct has no
@@ -65,13 +72,19 @@ type reconstructResponse struct {
 // — a single row's full state "as of T" (baseline + binlog deltas), or its
 // history. Read-only: it computes state, it never writes.
 func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
+	b := s.resolveOr(w, r)
+	if b == nil {
+		return
+	}
 	// The endpoint is the real boundary (the UI merely hides the tab): refuse
-	// when reconstruct is not configured — no baseline, an RBAC profile is
-	// active, or --no-archive is set (all collapse into baselineConfigured; see
-	// Server.baselineConfigured for why archive access is required).
-	if !s.baselineConfigured {
+	// when reconstruct is not configured FOR THE SELECTED SERVER — no baseline,
+	// an RBAC profile is active, or no-archive is set (all collapse into the
+	// bundle's baselineConfigured; see newBundleDerived for why archive access
+	// is required). Per-server enforcement matters: baseline reads bypass RBAC
+	// redaction, so the gate must not leak from one server's config to another.
+	if !b.baselineConfigured {
 		writeJSONError(w, http.StatusNotFound,
-			"reconstruct is not available (no baseline configured, an RBAC profile is active, or --no-archive is set)")
+			"reconstruct is not available for this server (no baseline configured, an RBAC profile is active, or no-archive is set)")
 		return
 	}
 
@@ -96,7 +109,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 
 	// Primary-key column names come from the schema snapshot (ordinal order),
 	// so the caller only supplies pipe-delimited values, matching the CLI.
-	pkCols, err := s.pkColumns(schema, table)
+	pkCols, err := b.pkColumns(schema, table)
 	if err != nil {
 		writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
 		return
@@ -110,7 +123,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// 1. Locate the baseline at-or-before `at` and read the row's initial state.
-	path, snapshotTime, err := reconstruct.FindBaseline(ctx, s.baselineSrc, schema, table, atTime)
+	path, snapshotTime, err := reconstruct.FindBaseline(ctx, b.baselineSrc, schema, table, atTime)
 	if err != nil {
 		if errors.Is(err, reconstruct.ErrNoBaseline) {
 			writeJSONError(w, http.StatusNotFound,
@@ -143,10 +156,10 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		Order:    "", // ASC: ApplyAt/BuildHistory require chronological input.
 		Limit:    reconstructMaxEvents + 1,
 	}
-	rows, plan, err := query.FetchMerged(ctx, s.db, s.engine, query.FetchMergedOptions{
+	rows, plan, err := query.FetchMerged(ctx, b.db, b.engine, query.FetchMergedOptions{
 		Opts:           opts,
-		DBName:         s.dbName,
-		NoArchive:      s.noArchive,
+		DBName:         b.dbName,
+		NoArchive:      b.noArchive,
 		AllowGaps:      allowGaps,
 		ArchiveFetcher: parquetquery.Fetch,
 	})
@@ -157,7 +170,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 				"refusing to reconstruct over a coverage gap — "+err.Error()+" (pass allow_gaps=true to override)")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeFetchError(w, err)
 		return
 	}
 	if len(rows) > reconstructMaxEvents {
@@ -195,12 +208,12 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 }
 
 // pkColumns returns the primary-key column names for schema.table from the
-// loaded snapshot, in ordinal order.
-func (s *Server) pkColumns(schema, table string) ([]string, error) {
-	if s.resolver == nil {
+// selected server's loaded snapshot, in ordinal order.
+func (b *bundle) pkColumns(schema, table string) ([]string, error) {
+	if b.resolver == nil {
 		return nil, errors.New("no schema snapshot available to determine primary-key columns; run `bintrail snapshot`")
 	}
-	tm, err := s.resolver.Resolve(schema, table)
+	tm, err := b.resolver.Resolve(schema, table)
 	if err != nil {
 		return nil, fmt.Errorf("no schema snapshot for %s.%s: %w", schema, table, err)
 	}

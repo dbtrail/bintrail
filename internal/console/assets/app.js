@@ -18,6 +18,23 @@ if (TOKEN) {
 
 let lastSQL = "";
 
+// ── server selection ─────────────────────────────────────────────────────────
+// currentServer is the id of the server every API call targets, sent as the
+// X-Bintrail-Server header (captured at dispatch time inside api(), so an
+// in-flight request keeps the server it was fired for even if the operator
+// switches mid-flight). Empty = the backend's default (the --index-dsn entry,
+// else the first saved server). Persisted per-tab like the token, so two tabs
+// can watch two different servers.
+const SERVER_KEY = "bintrail_console_server";
+let currentServer = "";
+try { currentServer = sessionStorage.getItem(SERVER_KEY) || ""; } catch (e) { /* storage unavailable */ }
+let defaultServerId = "";
+
+function setCurrentServer(id) {
+  currentServer = id || "";
+  try { sessionStorage.setItem(SERVER_KEY, currentServer); } catch (e) { /* storage unavailable */ }
+}
+
 // ── tiny DOM helper (builds nodes; never injects data as HTML) ───────────────
 function el(tag, attrs, ...kids) {
   const n = document.createElement(tag);
@@ -66,6 +83,7 @@ function toast(msg) {
 // ── API wrapper ──────────────────────────────────────────────────────────────
 async function api(path, opts = {}) {
   const headers = { Authorization: "Bearer " + TOKEN };
+  if (currentServer) headers["X-Bintrail-Server"] = currentServer;
   if (opts.body) headers["Content-Type"] = "application/json";
   const res = await fetch(path, {
     method: opts.method || "GET",
@@ -435,19 +453,246 @@ function renderReconstructHistory(container, data) {
   container.appendChild(tl);
 }
 
-// gateCapabilities reveals capability-gated tabs/panels that the server reports
-// as enabled. Anything not enabled stays hidden (the elements default to
-// display:none via CSS), so an un-configured surface never flashes on screen.
+// gateCapabilities toggles capability-gated tabs/panels per the SELECTED
+// server's report. Gated elements keep their data-capability attribute and are
+// shown/hidden via the cap-on class, so the gate re-evaluates on every server
+// switch (a server with Time-travel can be followed by one without). Anything
+// not enabled stays hidden (display:none via CSS), so an un-configured surface
+// never flashes on screen.
 async function gateCapabilities() {
   let caps = {};
   try {
     caps = await api("/api/capabilities");
   } catch {
-    return; // leave gated elements hidden
+    caps = {}; // unreachable/unknown server → no optional surfaces
   }
   document.querySelectorAll("[data-capability]").forEach((node) => {
-    if (caps[node.dataset.capability]) node.removeAttribute("data-capability");
+    node.classList.toggle("cap-on", !!caps[node.dataset.capability]);
   });
+  // If the active tab just lost its capability on a switch, fall back to the
+  // landing tab rather than leaving a blank main area.
+  const active = document.querySelector(".tab.active");
+  if (active && active.dataset.capability && !caps[active.dataset.capability]) {
+    const home = document.querySelector('.tab[data-panel="recover"]');
+    if (home) home.click();
+  }
+}
+
+// ── server switcher + management modal ───────────────────────────────────────
+function serverLabel(s) {
+  return s.kind === "ephemeral" ? s.name + " (cli)" : s.name;
+}
+
+// loadServers refreshes the header dropdown from /api/servers and reconciles a
+// stale per-tab selection (e.g. the server was deleted from another tab).
+async function loadServers() {
+  const data = await api("/api/servers");
+  defaultServerId = data.default_id || "";
+  const servers = data.servers || [];
+  if (currentServer && !servers.some((s) => s.id === currentServer)) {
+    setCurrentServer(""); // deleted under us → fall back to the default
+  }
+  const sel = document.getElementById("server-select");
+  clear(sel);
+  servers.forEach((s) => sel.appendChild(opt(s.id, serverLabel(s))));
+  sel.value = currentServer || defaultServerId;
+  return servers;
+}
+
+// clearResults wipes every per-server result so nothing from the previous
+// server lingers after a switch (stale rows would read as the new server's).
+function clearResults() {
+  ["events-result", "events-warnings", "recover-preview", "recover-warnings",
+    "reconstruct-result", "reconstruct-warnings", "status-result"].forEach((id) => {
+    const n = document.getElementById(id);
+    if (n) clear(n);
+  });
+  document.getElementById("recover-sql-wrap").hidden = true;
+  lastSQL = "";
+}
+
+async function switchServer(id) {
+  setCurrentServer(id);
+  clearResults();
+  await gateCapabilities();
+  populateSchemas();
+}
+
+function openServersModal() {
+  document.getElementById("servers-modal").hidden = false;
+  hideServerForm();
+  refreshServersList();
+}
+
+function closeServersModal() {
+  document.getElementById("servers-modal").hidden = true;
+}
+
+async function refreshServersList() {
+  const list = document.getElementById("servers-list");
+  let servers = [];
+  try {
+    servers = await loadServers();
+  } catch (err) {
+    renderError(list, err);
+    return;
+  }
+  clear(list);
+  if (servers.length === 0) {
+    list.appendChild(el("div", { class: "empty" }, "No servers yet — add your first connection."));
+    return;
+  }
+  servers.forEach((s) => {
+    const desc = s.host ? `${s.user}@${s.host}:${s.port || "3306"}/${s.dbname}` : s.dbname || "";
+    const row = el("div", { class: "server-row" },
+      el("span", { class: "health-dot" + (s.connected ? " ok" : ""), title: s.connected ? "connected" : "not connected yet" }),
+      el("span", { class: "srv-name" }, serverLabel(s)),
+      s.kind === "ephemeral" ? el("span", { class: "badge cli", title: "From --index-dsn; managed by the command line" }, "CLI") : null,
+      s.reconstruct ? el("span", { class: "badge tt", title: "Baseline configured: Time-travel available" }, "TT") : null,
+      el("span", { class: "srv-desc" }, desc),
+      el("span", { class: "srv-status", id: "srv-status-" + s.id }),
+      el("button", { type: "button", class: "row-btn", onclick: () => testServerRow(s.id) }, "Test"),
+      el("button", { type: "button", class: "row-btn", disabled: s.editable ? null : "", onclick: () => editServer(s.id) }, "Edit"),
+      el("button", { type: "button", class: "row-btn danger", disabled: s.deletable ? null : "", onclick: () => deleteServer(s) }, "Delete"),
+    );
+    list.appendChild(row);
+  });
+}
+
+function formMsg(text, isError) {
+  const n = document.getElementById("server-form-msg");
+  n.className = "form-msg " + (isError ? "err" : "ok");
+  n.textContent = text;
+}
+
+function showServerForm(prefill) {
+  const f = document.getElementById("server-form");
+  f.reset();
+  formMsg("", false);
+  f.elements.id.value = prefill ? prefill.id : "";
+  if (prefill) {
+    f.elements.name.value = prefill.name || "";
+    f.elements.host.value = prefill.host || "";
+    f.elements.port.value = prefill.port || "";
+    f.elements.user.value = prefill.user || "";
+    f.elements.dbname.value = prefill.dbname || "";
+    f.elements.baseline_dir.value = prefill.baseline_dir || "";
+    f.elements.baseline_s3.value = prefill.baseline_s3 || "";
+    f.elements.no_archive.checked = !!prefill.no_archive;
+    f.elements.password.placeholder = prefill.has_password ? "(unchanged — leave blank to keep)" : "(none)";
+  } else {
+    f.elements.password.placeholder = "";
+  }
+  document.getElementById("server-add-wrap").hidden = true;
+  f.hidden = false;
+  f.elements.name.focus();
+}
+
+function hideServerForm() {
+  document.getElementById("server-form").hidden = true;
+  document.getElementById("server-add-wrap").hidden = false;
+}
+
+async function editServer(id) {
+  try {
+    const s = await api("/api/servers/" + encodeURIComponent(id));
+    showServerForm(s);
+  } catch (err) {
+    toast("failed to load server: " + (err.message || err));
+  }
+}
+
+// serverFormBody collects the form into a request body. The password is only
+// included when the operator typed one — an omitted password means "keep the
+// stored secret" on edit (the server merges it; the browser never sees it).
+function serverFormBody(f) {
+  const body = {
+    name: f.elements.name.value.trim(),
+    host: f.elements.host.value.trim(),
+    port: f.elements.port.value.trim(),
+    user: f.elements.user.value.trim(),
+    dbname: f.elements.dbname.value.trim(),
+    baseline_dir: f.elements.baseline_dir.value.trim(),
+    baseline_s3: f.elements.baseline_s3.value.trim(),
+    no_archive: f.elements.no_archive.checked,
+  };
+  if (f.elements.password.value !== "") body.password = f.elements.password.value;
+  return body;
+}
+
+async function saveServer(e) {
+  e.preventDefault();
+  const f = e.target;
+  const id = f.elements.id.value;
+  try {
+    if (id) {
+      await api("/api/servers/" + encodeURIComponent(id), { method: "PUT", body: serverFormBody(f) });
+    } else {
+      await api("/api/servers", { method: "POST", body: serverFormBody(f) });
+    }
+    hideServerForm();
+    await refreshServersList();
+    toast(id ? "Server updated" : "Server added");
+  } catch (err) {
+    formMsg(err.message || String(err), true);
+  }
+}
+
+async function deleteServer(s) {
+  if (!window.confirm(`Remove server "${s.name}"? This only removes the saved connection — nothing happens to the server itself.`)) return;
+  try {
+    await api("/api/servers/" + encodeURIComponent(s.id), { method: "DELETE" });
+    if (currentServer === s.id) {
+      await switchServer(""); // deleted the selected server → back to default
+      document.getElementById("server-select").value = defaultServerId;
+    }
+    await refreshServersList();
+    toast("Server removed");
+  } catch (err) {
+    toast("delete failed: " + (err.message || err));
+  }
+}
+
+function testResultText(res) {
+  if (!res.ok) return "✗ " + (res.error || "unreachable");
+  let txt = `✓ ok · ${res.latency_ms} ms`;
+  if (res.server_version) txt += " · MySQL " + res.server_version;
+  if (!res.has_index) txt += " · no binlog_events table (not a bintrail index?)";
+  else if (!res.schema_current) txt += " · index schema outdated (run bintrail index/stream once)";
+  return txt;
+}
+
+// testServerForm probes the (possibly unsaved) form values; with an id the
+// backend merges the stored password when the field was left blank.
+async function testServerForm() {
+  const f = document.getElementById("server-form");
+  const id = f.elements.id.value;
+  const path = id ? "/api/servers/" + encodeURIComponent(id) + "/test" : "/api/servers/test";
+  formMsg("testing…", false);
+  try {
+    const res = await api(path, { method: "POST", body: serverFormBody(f) });
+    formMsg(testResultText(res), !res.ok);
+  } catch (err) {
+    formMsg(err.message || String(err), true);
+  }
+}
+
+// testServerRow probes a saved entry as-is (no body → stored DSN).
+async function testServerRow(id) {
+  const slot = document.getElementById("srv-status-" + id);
+  if (slot) slot.textContent = "testing…";
+  try {
+    const res = await api("/api/servers/" + encodeURIComponent(id) + "/test", { method: "POST", body: {} });
+    if (slot) {
+      slot.textContent = testResultText(res);
+      slot.className = "srv-status " + (res.ok ? "ok" : "err");
+    }
+  } catch (err) {
+    if (slot) {
+      slot.textContent = "✗ " + (err.message || err);
+      slot.className = "srv-status err";
+    }
+  }
 }
 
 // ── wiring ───────────────────────────────────────────────────────────────────
@@ -478,11 +723,30 @@ function init() {
     sel.addEventListener("change", () => loadTables(sel.closest("form")));
   });
 
+  // Server switcher + management modal.
+  document.getElementById("server-select").addEventListener("change", (e) => {
+    switchServer(e.target.value);
+  });
+  document.getElementById("manage-servers").addEventListener("click", openServersModal);
+  document.getElementById("servers-close").addEventListener("click", closeServersModal);
+  document.getElementById("servers-modal").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) closeServersModal(); // click on the backdrop
+  });
+  document.getElementById("server-add").addEventListener("click", () => showServerForm(null));
+  document.getElementById("server-form").addEventListener("submit", saveServer);
+  document.getElementById("server-cancel").addEventListener("click", hideServerForm);
+  document.getElementById("server-test").addEventListener("click", testServerForm);
+
   if (!TOKEN) {
     toast("No token in URL — open the link printed by `bintrail console`.");
   }
-  gateCapabilities();
-  populateSchemas();
+  // Load the server list first so a stale per-tab selection is reconciled
+  // before the capability gate and schema dropdowns fire against it.
+  (async () => {
+    try { await loadServers(); } catch (e) { /* default server still works */ }
+    gateCapabilities();
+    populateSchemas();
+  })();
 }
 
 document.addEventListener("DOMContentLoaded", init);
