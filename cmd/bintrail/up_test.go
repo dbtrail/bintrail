@@ -223,12 +223,15 @@ func TestResolveUpConsoleEnv(t *testing.T) {
 	// Exported-but-EMPTY env vars must be a no-op (the `v != ""` guard):
 	// a refactor to os.LookupEnv-with-ok would make an empty export clobber
 	// a non-empty default like console-listen's 127.0.0.1:8090 with "".
+	// NOTE: newCmd() must run BEFORE seeding the globals — StringVar resets
+	// each bound variable to its default at registration time.
+	cmd = newCmd()
 	t.Setenv("BINTRAIL_CONSOLE_LISTEN", "")
 	t.Setenv("BINTRAIL_CONSOLE_TOKEN", "")
 	t.Setenv("BINTRAIL_CONSOLE_BASELINE_DIR", "")
 	t.Setenv("BINTRAIL_CONSOLE_BASELINE_S3", "")
 	upConsoleListen, upConsoleToken, upConsoleBaselineDir, upConsoleBaselineS3 = "127.0.0.1:8090", "tok", "/dir", "s3://b/p/"
-	resolveUpConsoleEnv(newCmd())
+	resolveUpConsoleEnv(cmd)
 	assertStr(t, "upConsoleListen (empty env)", upConsoleListen, "127.0.0.1:8090")
 	assertStr(t, "upConsoleToken (empty env)", upConsoleToken, "tok")
 	assertStr(t, "upConsoleBaselineDir (empty env)", upConsoleBaselineDir, "/dir")
