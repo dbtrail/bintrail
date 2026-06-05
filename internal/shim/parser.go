@@ -48,6 +48,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -206,6 +207,15 @@ var timeFormats = []string{
 	"2006-01-02",
 }
 
+// relativeTimeRE accepts human-friendly relative literals — `'90 seconds
+// ago'`, `'5 minutes ago'`, `'2 hours ago'`, `'1 day ago'` — resolved
+// against the wall clock at parse time (#350: the appliance demo would
+// otherwise force evaluators to compute absolute timestamps by hand
+// before their first time-travel query). Weeks/months/years are
+// deliberately absent: binlog retention windows are measured in hours
+// and days, and month arithmetic is calendar-ambiguous.
+var relativeTimeRE = regexp.MustCompile(`(?i)^\s*(\d+)\s+(second|minute|hour|day)s?\s+ago\s*$`)
+
 // Parse turns a raw SQL string into a TimeTravelQuery.
 //
 // defaultSchema is the connection's currently-selected database. If
@@ -337,7 +347,32 @@ func parseTimeLiteral(s string) (time.Time, error) {
 			return t.UTC(), nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("must be one of: %s", strings.Join(timeFormats, ", "))
+	if strings.EqualFold(strings.TrimSpace(s), "now") {
+		// 'now' is mainly useful as a _diff upper bound:
+		//   BETWEEN '10 minutes ago' AND 'now'
+		return time.Now().UTC(), nil
+	}
+	if m := relativeTimeRE.FindStringSubmatch(s); m != nil {
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			// \d+ matched but exceeds int range ("99999999999999999999
+			// hours ago") — reject rather than silently truncating.
+			return time.Time{}, fmt.Errorf("relative time amount %q out of range", m[1])
+		}
+		var unit time.Duration
+		switch strings.ToLower(m[2]) {
+		case "second":
+			unit = time.Second
+		case "minute":
+			unit = time.Minute
+		case "hour":
+			unit = time.Hour
+		case "day":
+			unit = 24 * time.Hour
+		}
+		return time.Now().UTC().Add(-time.Duration(n) * unit), nil
+	}
+	return time.Time{}, fmt.Errorf("must be one of: %s, or a relative literal like '5 minutes ago'", strings.Join(timeFormats, ", "))
 }
 
 func stripQuotes(s string) string {

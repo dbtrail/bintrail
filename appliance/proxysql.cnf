@@ -1,0 +1,29 @@
+# Minimal ProxySQL config for the bintrail appliance (evaluation-only).
+#
+# Carries only admin reachability and protocol bind addresses; the
+# routing config (mysql_servers / mysql_users / mysql_query_rules) is
+# generated at container boot by `bintrail proxysql-config` and piped
+# into the admin port by entrypoint.sh.
+#
+# The stock admin:admin credential is hardcoded loopback-only by
+# ProxySQL itself — fine here, because the entrypoint applies the
+# routing SQL from inside the container and port 6032 is bound to
+# loopback anyway.
+
+datadir="/var/lib/proxysql"
+
+admin_variables=
+{
+    admin_credentials="admin:admin"
+    mysql_ifaces="127.0.0.1:6032"
+}
+
+mysql_variables=
+{
+    interfaces="0.0.0.0:6033"
+    server_version="8.0.0"
+    default_authentication_plugin="mysql_native_password"
+    # No monitor user is provisioned in MySQL; disable the monitor so
+    # the MySQL error log isn't spammed with denied 'monitor' logins.
+    monitor_enabled="false"
+}

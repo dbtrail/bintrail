@@ -1,5 +1,10 @@
 # Bintrail Demo
 
+> **Want the 30-second version?** The [appliance image](../docs/appliance.md)
+> packs this whole rig (minus Grafana) into one `docker run` — MySQL, bintrail,
+> ProxySQL and traffic, preconfigured for Time Travel SQL.
+
+
 One command spins up a self-contained environment: MySQL with binlog enabled, a traffic generator, and bintrail running init → snapshot → stream. Everything is indexed live. You query from the host.
 
 ## Start

@@ -1,0 +1,18 @@
+# Shim tenant config for the bintrail appliance (evaluation-only).
+#
+# The single tenant binds the wire-protocol login (demo / demo) to the
+# demo schema — the shim derives the default schema from source_dsn's
+# /<db> path and seeds it into the connection at handshake time, so
+# `SELECT * FROM _flashback.orders ...` resolves without an explicit
+# `USE demo`.
+#
+# mysql_password is cleartext by design (>= 0.7.2): the shim validates
+# the wire login against it, and `bintrail proxysql-config` derives the
+# SHA1 ProxySQL needs. These are fixed throwaway demo credentials.
+listen: 127.0.0.1:3308
+
+tenants:
+  - server_id: "99999"
+    source_dsn: "demo:demo@tcp(127.0.0.1:3306)/demo"
+    mysql_user: "demo"
+    mysql_password: "demo"

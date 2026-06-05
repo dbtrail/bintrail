@@ -196,6 +196,62 @@ func TestParseNegativePK(t *testing.T) {
 	}
 }
 
+// TestParseRelativeTimeLiterals covers the relative AS OF forms added for
+// the appliance demo (#350): '<n> <unit>s ago' resolves against the wall
+// clock at parse time. Assertions use a tolerance window because the parse
+// happens between the two time.Now() reference reads.
+func TestParseRelativeTimeLiterals(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want time.Duration // expected distance in the past
+	}{
+		{"SELECT * FROM _flashback.orders AS OF '90 seconds ago' WHERE id = 1", 90 * time.Second},
+		{"SELECT * FROM _flashback.orders AS OF '1 minute ago' WHERE id = 1", time.Minute},
+		{"SELECT * FROM _flashback.orders AS OF '5 MINUTES AGO' WHERE id = 1", 5 * time.Minute},
+		{"SELECT * FROM _snapshot.orders AS OF '2 hours ago'", 2 * time.Hour},
+		{"SELECT /*+ DBTRAIL_AT='1 day ago' */ * FROM orders WHERE id = 42", 24 * time.Hour},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			before := time.Now().UTC().Add(-tc.want)
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			after := time.Now().UTC().Add(-tc.want)
+			if q.AsOf.Before(before) || q.AsOf.After(after) {
+				t.Errorf("AsOf = %v, want within [%v, %v]", q.AsOf, before, after)
+			}
+		})
+	}
+
+	// 'now' is accepted anywhere a literal is — mainly as a _diff upper
+	// bound: BETWEEN '10 minutes ago' AND 'now'.
+	before := time.Now().UTC()
+	q, err := Parse("SELECT * FROM _diff.orders BETWEEN '10 minutes ago' AND 'NOW' WHERE id = 1", "myapp")
+	if err != nil {
+		t.Fatalf("'now' literal: %v", err)
+	}
+	after := time.Now().UTC()
+	if q.Until.Before(before) || q.Until.After(after) {
+		t.Errorf("Until = %v, want within [%v, %v]", q.Until, before, after)
+	}
+	if wantSince := q.Until.Add(-10 * time.Minute); q.Since.After(wantSince.Add(time.Second)) || q.Since.Before(wantSince.Add(-time.Second)) {
+		t.Errorf("Since = %v, want ~%v", q.Since, wantSince)
+	}
+
+	// Unsupported relative shapes still error through the normal path.
+	for _, sql := range []string{
+		"SELECT * FROM _flashback.orders AS OF '3 weeks ago' WHERE id = 1",
+		"SELECT * FROM _flashback.orders AS OF 'a minute ago' WHERE id = 1",
+		"SELECT * FROM _flashback.orders AS OF 'ago' WHERE id = 1",
+	} {
+		if _, err := Parse(sql, "myapp"); err == nil || !strings.Contains(err.Error(), "invalid AS OF timestamp") {
+			t.Errorf("Parse(%q) error = %v, want invalid-AS-OF error", sql, err)
+		}
+	}
+}
+
 func TestParseNotTimeTravelReturnsSentinel(t *testing.T) {
 	cases := []string{
 		"SELECT * FROM orders WHERE id = 1",

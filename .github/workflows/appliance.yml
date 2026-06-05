@@ -1,0 +1,66 @@
+# Builds and publishes the bintrail-appliance evaluation image (#350).
+#
+# Separate from the GoReleaser pipeline on purpose: the appliance image
+# apt-installs MySQL + ProxySQL (slow under QEMU for arm64), and an
+# appliance build failure must not block a bintrail release. Runs when a
+# release is published (after GoReleaser has done its part) or manually.
+#
+# NOTE: like ghcr.io/dbtrail/bintrail, the bintrail-appliance package is
+# created PRIVATE on first push and needs a one-time manual flip to
+# public before anonymous `docker run` works (see docs/docker.md).
+name: appliance
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write # cosign keyless signing via GitHub OIDC
+
+jobs:
+  build-push:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: sigstore/cosign-installer@v3
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/dbtrail/bintrail-appliance
+          tags: |
+            type=semver,pattern={{version}},value=${{ github.event.release.tag_name || github.ref_name }}
+            # :latest stays off prereleases, mirroring skip_push: auto on
+            # the main image's manifest in .goreleaser.yaml.
+            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: appliance/Dockerfile
+          # amd64-only: MySQL's apt repo ships no arm64 packages for
+          # Debian. Apple Silicon evaluators run it via Rosetta/QEMU.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Sign image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/dbtrail/bintrail-appliance@${DIGEST}"

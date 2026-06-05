@@ -1,0 +1,107 @@
+# bintrail appliance — 30-second evaluation
+
+`ghcr.io/dbtrail/bintrail-appliance` is a **single-container, evaluation-only**
+demo: MySQL 8.0, bintrail, ProxySQL, and a traffic generator, preconfigured so
+your first Time Travel SQL query is one `docker run` away.
+
+```sh
+docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-appliance
+```
+
+Wait for the banner (~30 s boot), give the traffic generator a minute to build
+history, then query the past:
+
+```sh
+mysql -h 127.0.0.1 -P 6033 -u demo -pdemo demo \
+  -e "SELECT * FROM _flashback.orders AS OF '1 minute ago' WHERE id = 1"
+```
+
+Compare with the live row — the traffic generator mutates `orders id=1` every
+few seconds, so the two always differ:
+
+```sh
+mysql -h 127.0.0.1 -P 6033 -u demo -pdemo demo \
+  -e "SELECT * FROM orders WHERE id = 1"
+```
+
+> **Evaluation only.** Stateless by design — `docker stop` + `docker run` =
+> fresh demo. No tuning, no persistence, no security hardening. For real
+> deployments see [deployment.md](deployment.md) and
+> [time-travel-sql.md](time-travel-sql.md).
+
+> **amd64-only.** MySQL's apt repo ships no arm64 packages for Debian, so the
+> image is `linux/amd64`; Apple Silicon runs it transparently via Rosetta —
+> fine for an evaluation.
+
+## What's inside
+
+One container, five processes, supervised by the entrypoint (if any one dies,
+the container exits — a half-working demo never lingers):
+
+| Component | Role |
+|---|---|
+| MySQL 8.0 | Source **and** index in one instance: the `demo` schema takes writes; `bintrail_index` holds the row-event index. Binlog preconfigured (`ROW`, `FULL`, GTID). |
+| `bintrail up` | Streams the `demo` schema's binlog into `bintrail_index` — the same one-command quickstart you'd run against your own MySQL. |
+| `bintrail shim` | Answers `_flashback`/`_snapshot`/`_diff` time-travel queries over the MySQL wire protocol (loopback `:3308`). |
+| ProxySQL | The front door on `:6033`. Routes time-travel shapes to the shim and everything else straight to MySQL — one connection, both worlds. |
+| Traffic generator | Mixed INSERT/UPDATE/DELETE chaos on the `demo` schema, including a deterministic `orders id=1` mutation every cycle so the example query always has history. |
+
+## Ports and credentials
+
+| Port | What | Credentials |
+|---|---|---|
+| `6033` | ProxySQL — Time Travel SQL entry point | `demo` / `demo` |
+| `3306` | Raw MySQL (optional `-p 3306:3306`) | `demo` / `demo` (DML on `demo.*`), `root` (no password, in-container only) |
+
+## Queries to try
+
+The shim accepts these shapes through port 6033 (see
+[time-travel-sql.md](time-travel-sql.md) for the full grammar):
+
+```sql
+-- Row state at a point in time (relative or absolute)
+SELECT * FROM _flashback.orders AS OF '5 minutes ago' WHERE id = 1;
+SELECT * FROM _flashback.orders AS OF '2026-06-05 14:00:00' WHERE id = 1;
+
+-- Optimizer-hint form: time-travel a real table name (ORM-friendly)
+SELECT /*+ DBTRAIL_AT='5 minutes ago' */ * FROM orders WHERE id = 1;
+
+-- Every change to a row between two instants, one row per event
+SELECT * FROM _diff.orders BETWEEN '10 minutes ago' AND 'now' WHERE id = 1;
+
+-- Full-table state at an instant (rows with binlog activity)
+SELECT * FROM _flashback.orders AS OF '2 minutes ago';
+```
+
+Make your own history: the `demo` user can write, so UPDATE a row through port
+6033, wait a few seconds, and flashback to before your change.
+
+## Building locally
+
+```sh
+docker build -f appliance/Dockerfile -t bintrail-appliance .
+docker run --rm -p 6033:6033 bintrail-appliance
+```
+
+`appliance/smoke-test.sh` builds, boots, and asserts the acceptance flow
+(time-travel returns a previous `orders id=1` state distinct from the live
+row). It needs Docker and ~3 minutes; it is not part of `go test ./...`.
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `Empty set` from an `AS OF` query | The timestamp predates the stream start (history only accumulates while the appliance runs) or the row wasn't touched yet — wait a minute and retry. |
+| `ERROR 1064` | The query shape isn't in the shim grammar — see the supported forms above (note the hint form only supports `SELECT *`). The same query without time-travel syntax goes straight to MySQL. |
+| Historical ENUM shows a number (`2` instead of `processing`) | The binlog row image stores ENUMs as their ordinal; live rows render the label, historical images render the ordinal. |
+| `ERROR 1045` | Wrong credentials — port 6033 takes `demo` / `demo`. |
+| Container exits during boot | A component failed; `docker logs` shows which. The appliance dies loudly rather than half-working. |
+
+## Publishing notes (maintainers)
+
+`.github/workflows/appliance.yml` builds and pushes
+`ghcr.io/dbtrail/bintrail-appliance` (amd64 + arm64, cosign-signed) when a
+release is published, separately from GoReleaser so an appliance build failure
+never blocks a release. Like the main image, the GHCR package is created
+private on first push and needs a one-time flip to public (see
+[docker.md](docker.md)).
