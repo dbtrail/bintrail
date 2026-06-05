@@ -73,6 +73,14 @@ jobs:
           # amd64-only: MySQL's apt repo ships no arm64 packages for
           # Debian. Apple Silicon evaluators run it via Rosetta/QEMU.
           platforms: linux/amd64
+          # No provenance attestation: it turns the pushed artifact into
+          # an OCI *index* (image + attestation manifest), and on an ARM
+          # host `docker run` resolves the index, finds no arm64 entry,
+          # and errors with "no matching manifest" instead of falling
+          # back to Rosetta. A plain single-platform manifest emulates
+          # with just a warning — which is the README's promised UX.
+          # Supply-chain integrity still comes from the cosign signature.
+          provenance: false
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
