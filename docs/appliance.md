@@ -100,8 +100,10 @@ row). It needs Docker and ~3 minutes; it is not part of `go test ./...`.
 ## Publishing notes (maintainers)
 
 `.github/workflows/appliance.yml` builds and pushes
-`ghcr.io/dbtrail/bintrail-appliance` (amd64, cosign-signed) when a
-release is published, separately from GoReleaser so an appliance build failure
-never blocks a release. Like the main image, the GHCR package is created
+`ghcr.io/dbtrail/bintrail-appliance` (amd64, cosign-signed) on every `v*` tag
+push, separately from GoReleaser so an appliance build failure never blocks a
+release. (Not `release: published`: GoReleaser creates the release with the
+default `GITHUB_TOKEN`, whose events never trigger other workflows.) Manual
+runs take an explicit existing tag as a `workflow_dispatch` input. Like the main image, the GHCR package is created
 private on first push and needs a one-time flip to public (see
 [docker.md](docker.md)).
