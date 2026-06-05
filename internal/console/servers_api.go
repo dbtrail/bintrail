@@ -342,7 +342,15 @@ func buildDSN(req serverRequest, stored string) (string, error) {
 			}
 		}
 		if port == "" {
-			port = "3306"
+			// Host-only change: keep the stored port (symmetric with the
+			// host recovery above — defaulting here would silently rewrite a
+			// non-default port like :3307 to :3306). 3306 only when the
+			// stored address genuinely has no port (or this is a create).
+			if _, p, err := net.SplitHostPort(cfg.Addr); err == nil && p != "" {
+				port = p
+			} else {
+				port = "3306"
+			}
 		}
 		cfg.Net = "tcp"
 		cfg.Addr = net.JoinHostPort(host, port)

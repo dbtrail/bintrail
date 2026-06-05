@@ -35,6 +35,13 @@ function setCurrentServer(id) {
   try { sessionStorage.setItem(SERVER_KEY, currentServer); } catch (e) { /* storage unavailable */ }
 }
 
+// serverGen invalidates in-flight renders across server switches. api()
+// captures the header at dispatch, so a slow request keeps QUERYING the right
+// server — but its response must not repaint a panel that now shows another
+// server. Handlers snapshot the generation before awaiting and drop the render
+// when a switch happened underneath them.
+let serverGen = 0;
+
 // ── tiny DOM helper (builds nodes; never injects data as HTML) ───────────────
 function el(tag, attrs, ...kids) {
   const n = document.createElement(tag);
@@ -187,14 +194,17 @@ function renderEvents(container, data) {
 // ── events tab ───────────────────────────────────────────────────────────────
 async function runEvents(e) {
   e.preventDefault();
+  const gen = serverGen;
   const container = document.getElementById("events-result");
   const warns = document.getElementById("events-warnings");
   try {
     const params = new URLSearchParams(formParams(e.target));
     const data = await api("/api/events?" + params.toString());
+    if (gen !== serverGen) return; // switched servers mid-flight
     renderWarnings(warns, data.warnings);
     renderEvents(container, data);
   } catch (err) {
+    if (gen !== serverGen) return;
     clear(warns);
     renderError(container, err);
   }
@@ -202,24 +212,29 @@ async function runEvents(e) {
 
 // ── recover tab ──────────────────────────────────────────────────────────────
 async function previewRecover() {
+  const gen = serverGen;
   const container = document.getElementById("recover-preview");
   try {
     const params = new URLSearchParams(formParams(document.getElementById("recover-form")));
     const data = await api("/api/events?" + params.toString());
+    if (gen !== serverGen) return; // switched servers mid-flight
     renderEvents(container, data);
   } catch (err) {
+    if (gen !== serverGen) return;
     renderError(container, err);
   }
 }
 
 async function generateUndo(e) {
   e.preventDefault();
+  const gen = serverGen;
   const warns = document.getElementById("recover-warnings");
   const wrap = document.getElementById("recover-sql-wrap");
   try {
     const body = formParams(e.target);
     if (body.limit) body.limit = Number(body.limit);
     const data = await api("/api/recover", { method: "POST", body });
+    if (gen !== serverGen) return; // an undo script must never show under another server
     renderWarnings(warns, data.warnings);
     lastSQL = data.sql || "";
     document.getElementById("recover-sql").textContent = lastSQL;
@@ -227,6 +242,7 @@ async function generateUndo(e) {
       `${data.statement_count} statement(s) from ${data.row_count} event(s)`;
     wrap.hidden = false;
   } catch (err) {
+    if (gen !== serverGen) return;
     clear(warns);
     wrap.hidden = true;
     renderError(document.getElementById("recover-preview"), err);
@@ -296,9 +312,11 @@ function kv(k, v) {
 }
 
 async function refreshStatus() {
+  const gen = serverGen;
   const c = document.getElementById("status-result");
   try {
     const s = await api("/api/status");
+    if (gen !== serverGen) return; // switched servers mid-flight
     clear(c);
     const grid = el("div", { class: "status-grid" });
     grid.appendChild(el("div", { class: "card" },
@@ -331,23 +349,27 @@ async function refreshStatus() {
     }
     c.appendChild(grid);
   } catch (err) {
+    if (gen !== serverGen) return;
     renderError(c, err);
   }
 }
 
 // ── schema / table dropdowns ─────────────────────────────────────────────────
 async function populateSchemas() {
+  const gen = serverGen;
   let schemas = [];
   try {
     const data = await api("/api/schemas");
     schemas = data.schemas || [];
   } catch (err) {
+    if (gen !== serverGen) return;
     document.querySelectorAll(".schema-select").forEach((sel) => {
       clear(sel);
       sel.appendChild(opt("", "(error: " + (err.message || err) + ")"));
     });
     return;
   }
+  if (gen !== serverGen) return; // a newer switch's populateSchemas owns the dropdowns
   document.querySelectorAll(".schema-select").forEach((sel) => {
     clear(sel);
     sel.appendChild(opt("", "— select —"));
@@ -356,6 +378,7 @@ async function populateSchemas() {
 }
 
 async function loadTables(form) {
+  const gen = serverGen;
   const schema = form.querySelector(".schema-select").value;
   const tsel = form.querySelector(".table-select");
   clear(tsel);
@@ -363,8 +386,10 @@ async function loadTables(form) {
   if (!schema) return;
   try {
     const data = await api("/api/schemas?schema=" + encodeURIComponent(schema));
+    if (gen !== serverGen) return; // switched servers mid-flight
     (data.tables || []).forEach((t) => tsel.appendChild(opt(t, t)));
   } catch (err) {
+    if (gen !== serverGen) return;
     // Surface the failure (like populateSchemas) so an empty dropdown isn't
     // mistaken for "this schema has no tables". Table is still optional.
     tsel.appendChild(opt("", "(error loading tables)"));
@@ -387,12 +412,15 @@ async function runReconstruct(history) {
   if (p.at) params.set("at", p.at);
   if (p.allow_gaps) params.set("allow_gaps", "true");
   if (history) params.set("history", "true");
+  const gen = serverGen;
   try {
     const data = await api("/api/reconstruct?" + params.toString());
+    if (gen !== serverGen) return; // switched servers mid-flight
     renderWarnings(warns, data.warnings);
     if (history) renderReconstructHistory(container, data);
     else renderReconstructState(container, data);
   } catch (err) {
+    if (gen !== serverGen) return;
     clear(warns);
     renderError(container, err);
   }
@@ -460,12 +488,14 @@ function renderReconstructHistory(container, data) {
 // not enabled stays hidden (display:none via CSS), so an un-configured surface
 // never flashes on screen.
 async function gateCapabilities() {
+  const gen = serverGen;
   let caps = {};
   try {
     caps = await api("/api/capabilities");
   } catch {
     caps = {}; // unreachable/unknown server → no optional surfaces
   }
+  if (gen !== serverGen) return; // a newer switch's gate owns the tabs
   document.querySelectorAll("[data-capability]").forEach((node) => {
     node.classList.toggle("cap-on", !!caps[node.dataset.capability]);
   });
@@ -513,6 +543,7 @@ function clearResults() {
 
 async function switchServer(id) {
   setCurrentServer(id);
+  serverGen++; // anything still in flight for the previous server must not render
   clearResults();
   await gateCapabilities();
   populateSchemas();

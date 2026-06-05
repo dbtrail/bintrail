@@ -123,6 +123,13 @@ func runConsole(cmd *cobra.Command, args []string) error {
 	if conProfile != "" && conIndexDSN == "" {
 		return fmt.Errorf("--profile requires --index-dsn: the profile's rules are loaded from that index database")
 	}
+	// The baseline flags describe the command-line entry; without a DSN there
+	// is no boot index to merge deltas from (baseline + deltas → state), and
+	// seeding a DB-less boot entry would crash its first query. Registry
+	// servers carry their own per-server baseline settings instead.
+	if (conBaselineDir != "" || conBaselineS3 != "") && conIndexDSN == "" {
+		return fmt.Errorf("--baseline-dir/--baseline-s3 require --index-dsn: reconstruct merges the baseline with binlog deltas from that index (registry servers configure their baseline per entry in the UI)")
+	}
 
 	// The command-line DSN becomes the ephemeral "default" entry: connected
 	// eagerly (fail-fast preserved) and schema-migrated here, at startup, on

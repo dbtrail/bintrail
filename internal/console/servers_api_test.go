@@ -331,6 +331,26 @@ func TestBuildDSNMerge(t *testing.T) {
 		t.Errorf("default port: addr = %q, want h:3306", cfg.Addr)
 	}
 
+	// Host-only edit keeps a stored NON-default port (the merge is symmetric:
+	// a port-only edit keeps the host, a host-only edit keeps the port —
+	// defaulting to 3306 here would silently rewrite :3307 connections).
+	got, err = buildDSN(serverRequest{Name: "x", Host: "newhost"}, "u:p@tcp(db.internal:3307)/binlog_index")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg, _ := mysql.ParseDSN(got); cfg.Addr != "newhost:3307" {
+		t.Errorf("host-only edit: addr = %q, want newhost:3307 (stored port preserved)", cfg.Addr)
+	}
+
+	// Port-only edit keeps the stored host (the pre-existing symmetric case).
+	got, err = buildDSN(serverRequest{Name: "x", Port: "3308"}, "u:p@tcp(db.internal:3307)/binlog_index")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg, _ := mysql.ParseDSN(got); cfg.Addr != "db.internal:3308" {
+		t.Errorf("port-only edit: addr = %q, want db.internal:3308 (stored host preserved)", cfg.Addr)
+	}
+
 	// Raw DSN wins over structured fields and must name a database.
 	if _, err := buildDSN(serverRequest{DSN: "u:p@tcp(h:3306)/"}, ""); err == nil {
 		t.Error("raw DSN without dbname must be rejected")
