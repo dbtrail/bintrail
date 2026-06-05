@@ -179,10 +179,12 @@ var envSections = []envSection{
 		},
 	},
 	{
-		// These are read directly by `bintrail console` (see runConsole), not
-		// via the shared envBindings slice — --listen is also used by shim, so
-		// a global binding would cross-wire the commands.
-		Header: "Console (used by bintrail console)",
+		// These are read directly by `bintrail console` (see runConsole) and
+		// `bintrail up --console` (see resolveUpConsoleEnv), not via the shared
+		// envBindings slice — --listen is also used by shim, and --baseline-dir/
+		// --baseline-s3 by reconstruct, so a global binding would cross-wire
+		// the commands.
+		Header: "Console (used by bintrail console and bintrail up --console)",
 		Bindings: []envTemplateEntry{
 			{"BINTRAIL_CONSOLE_LISTEN", "127.0.0.1:8090"},
 			{"BINTRAIL_CONSOLE_TOKEN", ""},

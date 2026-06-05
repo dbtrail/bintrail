@@ -3,9 +3,13 @@ package query
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 // TestFetchMerged_nilArchiveFetcherRejected verifies the programming-error
@@ -72,6 +76,81 @@ func TestFetchMerged_strictModeNoTimeRangeOK(t *testing.T) {
 	// fine — validation simply didn't trip.
 	if err != nil && (strings.Contains(err.Error(), "DBName") || strings.Contains(err.Error(), "ArchiveFetcher")) {
 		t.Errorf("validation should not fire when no time range is set: %v", err)
+	}
+}
+
+// TestFetchMerged_partialArchiveFailureAbortsStrictUnit mirrors the
+// integration test of the same name (cmd/bintrail) one tier down: the
+// any-source-fails strict contract (#377) would otherwise be pinned only
+// behind the Docker-gated integration tier, so a revert to the old
+// all-sources-must-fail guard would keep `go test ./...` green. sqlmock
+// stands in for MySQL: one query feeds ResolveArchiveSources two sources
+// (local base dirs must exist on disk — the resolver os.Stat's them),
+// one query feeds engine.Fetch zero live rows. No DBName and no time
+// range keeps the planner out of the way (validation allows that).
+func TestFetchMerged_partialArchiveFailureAbortsStrictUnit(t *testing.T) {
+	dir := t.TempDir()
+	healthyBase := filepath.Join(dir, "bintrail_id=healthy")
+	brokenBase := filepath.Join(dir, "bintrail_id=broken")
+	for _, d := range []string{healthyBase, brokenBase} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+
+	brokenErr := errors.New("stub: broken archive (intentional)")
+	stubFetcher := func(_ context.Context, _ Options, src string) ([]ResultRow, error) {
+		if strings.Contains(src, "broken") {
+			return nil, brokenErr
+		}
+		return nil, nil
+	}
+
+	// expectQueries arms one round of FetchMerged's two DB touches:
+	// the archive_state resolution and the live binlog_events fetch.
+	expectQueries := func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("FROM archive_state").WillReturnRows(
+			sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}).
+				AddRow("healthy", filepath.Join(healthyBase, "events.parquet"), nil, nil).
+				AddRow("broken", filepath.Join(brokenBase, "events.parquet"), nil, nil))
+		mock.ExpectQuery("FROM binlog_events").WillReturnRows(
+			sqlmock.NewRows([]string{"event_id"}))
+	}
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Strict mode: the broken source aborts the fetch even though the
+	// healthy source succeeded.
+	expectQueries(mock)
+	_, _, err = FetchMerged(context.Background(), db, New(db), FetchMergedOptions{
+		AllowGaps:      false,
+		ArchiveFetcher: stubFetcher,
+	})
+	if err == nil {
+		t.Fatal("partial archive failure under strict mode: expected error, got nil")
+	}
+	if !errors.Is(err, brokenErr) {
+		t.Errorf("expected wrapped broken-source error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "archive source") || !strings.Contains(err.Error(), "broken") {
+		t.Errorf("expected error to name the broken archive source, got: %v", err)
+	}
+
+	// Permissive mode: same partial failure stays warn-and-continue.
+	expectQueries(mock)
+	if _, _, err = FetchMerged(context.Background(), db, New(db), FetchMergedOptions{
+		AllowGaps:      true,
+		ArchiveFetcher: stubFetcher,
+	}); err != nil {
+		t.Fatalf("partial archive failure under permissive mode: expected success, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
 

@@ -37,9 +37,18 @@ bintrail up --source-dsn "$SRC" --index-dsn "$IDX" --console
 
 `--console-listen` / `--console-token` (or `BINTRAIL_CONSOLE_LISTEN` /
 `BINTRAIL_CONSOLE_TOKEN`) customize the bind and token; a single Ctrl-C drains
-both the stream and the console. (This serves the Phase 1 surface —
-events/recover/status; baseline-gated Time-travel is for the standalone
-`bintrail console`.)
+both the stream and the console. Passing `--baseline-dir` or `--baseline-s3`
+(or `BINTRAIL_CONSOLE_BASELINE_DIR` / `BINTRAIL_CONSOLE_BASELINE_S3`) enables
+the baseline-gated Time-travel surface here too, so one process serves the live
+stream **and** point-in-time reconstruct:
+
+```sh
+bintrail up --source-dsn "$SRC" --index-dsn "$IDX" --console --baseline-dir /var/bintrail/baselines
+```
+
+With an S3 baseline (`--baseline-s3`), the `up` process reads S3 at request
+time using the ambient AWS credential chain — same as the standalone console,
+but note `up` didn't need AWS credentials before.
 
 Open that URL in a browser. Four tabs (Time-travel appears only when a baseline
 is configured):
@@ -78,7 +87,10 @@ is configured):
 - `BINTRAIL_CONSOLE_BASELINE_DIR` — same as `--baseline-dir`.
 - `BINTRAIL_CONSOLE_BASELINE_S3` — same as `--baseline-s3`.
 
-Precedence is the usual CLI flag > environment variable > default.
+Precedence is the usual CLI flag > environment variable > default. The four
+`BINTRAIL_CONSOLE_*` variables apply equally to `bintrail up --console` (where
+the matching flags are `--console-listen`, `--console-token`, `--baseline-dir`,
+`--baseline-s3`).
 
 ## Security model
 
@@ -157,14 +169,11 @@ CLI's `--allow-gaps`. A single row touched by more than 10,000 events in the
 `[baseline, at]` window is also refused (422) rather than reconstructed from a
 truncated prefix.
 
-> **Known hole in fail-loud (shared with the CLI):** when *several* archive
-> sources are configured and only *some* fail to load, `query.FetchMerged` logs
-> the failure server-side and continues (it only hard-fails when *every* source
-> fails). A reconstruct could then fold an incomplete delta set and return 200.
-> This is a pre-existing limitation of the shared fetch path, not specific to the
-> console; closing it needs a `FetchMerged` change that also affects the CLI and
-> shim. Until then, watch the server log when running with multiple archive
-> sources. (Tracked: #377.)
+> **Archive-source failures fail loudly here (#377):** when several archive
+> sources are configured and *any* of them fails to load, `query.FetchMerged`
+> aborts the strict-mode (`allow_gaps=false`) fetch — the request returns 500
+> naming the failed source — instead of folding an incomplete delta set into a
+> 200. Pass `allow_gaps=true` to fall back to warn-and-continue.
 
 ### Coverage gaps and incomplete data
 
@@ -176,8 +185,9 @@ incomplete-coverage undo is flagged to the operator rather than silently
 presented as complete.
 
 One residual limitation: a few failure modes are logged server-side but not
-surfaced to the browser, because `query.FetchMerged` exposes no signal for them
-(this matches the CLI `recover`, which warns to stderr and continues):
+surfaced to the browser (this matches the CLI `recover`, which warns to stderr
+and continues; both apply only to these permissive `AllowGaps=true` endpoints —
+the reconstruct endpoint fails loudly instead, see above):
 
 - some of several configured archive sources fail to load, and
 - the query planner itself fails to run (gap detection is skipped entirely).

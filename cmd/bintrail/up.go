@@ -58,9 +58,11 @@ var (
 	upSkipDoctor  bool
 	upFormat      string
 
-	upConsole       bool
-	upConsoleListen string
-	upConsoleToken  string
+	upConsole            bool
+	upConsoleListen      string
+	upConsoleToken       string
+	upConsoleBaselineDir string
+	upConsoleBaselineS3  string
 )
 
 func init() {
@@ -78,6 +80,8 @@ func init() {
 	upCmd.Flags().BoolVar(&upConsole, "console", false, "Also serve the read-only web console alongside the stream")
 	upCmd.Flags().StringVar(&upConsoleListen, "console-listen", "127.0.0.1:8090", "Console bind address when --console is set")
 	upCmd.Flags().StringVar(&upConsoleToken, "console-token", "", "Console access token (auto-generated for loopback binds when empty)")
+	upCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface when --console is set")
+	upCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct when --console is set")
 	_ = upCmd.MarkFlagRequired("source-dsn")
 	_ = upCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(upCmd)
@@ -154,17 +158,7 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 // child context, so a single Ctrl-C drains both. The console gets its own index
 // DB connection (the stream owns its own).
 func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
-	// Console-specific env vars, flag > env > default (mirrors runConsole).
-	if !cmd.Flags().Changed("console-listen") {
-		if v := os.Getenv("BINTRAIL_CONSOLE_LISTEN"); v != "" {
-			upConsoleListen = v
-		}
-	}
-	if !cmd.Flags().Changed("console-token") {
-		if v := os.Getenv("BINTRAIL_CONSOLE_TOKEN"); v != "" {
-			upConsoleToken = v
-		}
-	}
+	resolveUpConsoleEnv(cmd)
 
 	db, err := config.Connect(upIndexDSN)
 	if err != nil {
@@ -180,7 +174,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("console: schema migration: %w", err)
 	}
 
-	cfg, err := upConsoleConfig(db, upIndexDSN, upConsoleListen, upConsoleToken)
+	cfg, err := upConsoleConfig(db, upIndexDSN, upConsoleListen, upConsoleToken, upConsoleBaselineDir, upConsoleBaselineS3)
 	if err != nil {
 		return err
 	}
@@ -218,10 +212,44 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	return streamErr
 }
 
+// resolveUpConsoleEnv applies the console-specific env vars to the upConsole*
+// globals with flag > env > default precedence (mirrors runConsole). These are
+// read directly rather than via the shared envBindings slice: that slice
+// matches by flag name, and --baseline-dir/--baseline-s3 are also defined by
+// `reconstruct` (as --listen is by `shim`/`init-shim`), so a global binding
+// would leak the console's env vars into those commands. Extracted from
+// runUpStreamWithConsole so the precedence dance is unit-testable.
+func resolveUpConsoleEnv(cmd *cobra.Command) {
+	if !cmd.Flags().Changed("console-listen") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_LISTEN"); v != "" {
+			upConsoleListen = v
+		}
+	}
+	if !cmd.Flags().Changed("console-token") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_TOKEN"); v != "" {
+			upConsoleToken = v
+		}
+	}
+	if !cmd.Flags().Changed("baseline-dir") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_DIR"); v != "" {
+			upConsoleBaselineDir = v
+		}
+	}
+	if !cmd.Flags().Changed("baseline-s3") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_S3"); v != "" {
+			upConsoleBaselineS3 = v
+		}
+	}
+}
+
 // upConsoleConfig builds the console configuration for `up --console`. It serves
-// the Phase 1 surface (events/recover/status) over the live index — no baseline
-// or profile. Extracted for testability (dbName extraction + DSN validation).
-func upConsoleConfig(db *sql.DB, indexDSN, listen, token string) (console.Config, error) {
+// the Phase 1 surface (events/recover/status) over the live index, plus the
+// baseline-gated Reconstruct (Time-travel) surface when a baseline source is
+// supplied — still no profile or --no-archive, so the reconstruct gate
+// (baselineConfigured in internal/console/server.go, which owns dir-over-s3
+// precedence) reduces to baseline presence. Extracted for testability (dbName
+// extraction + DSN validation).
+func upConsoleConfig(db *sql.DB, indexDSN, listen, token, baselineDir, baselineS3 string) (console.Config, error) {
 	cfg, err := mysql.ParseDSN(indexDSN)
 	if err != nil {
 		return console.Config{}, fmt.Errorf("invalid --index-dsn: %w", err)
@@ -230,10 +258,12 @@ func upConsoleConfig(db *sql.DB, indexDSN, listen, token string) (console.Config
 		return console.Config{}, fmt.Errorf("--index-dsn must include a database name (e.g. user:pass@tcp(host:3306)/binlog_index)")
 	}
 	return console.Config{
-		DB:     db,
-		DBName: cfg.DBName,
-		Listen: listen,
-		Token:  token,
+		DB:          db,
+		DBName:      cfg.DBName,
+		Listen:      listen,
+		Token:       token,
+		BaselineDir: baselineDir,
+		BaselineS3:  baselineS3,
 	}, nil
 }
 
