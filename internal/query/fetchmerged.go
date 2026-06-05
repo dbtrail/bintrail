@@ -72,7 +72,7 @@ type FetchMergedOptions struct {
 
 	// AllowGaps controls what happens when the planner reports coverage gaps
 	// (hours rotated out of MySQL with no archive) or when the planner cannot
-	// run or all archive sources fail. When false, FetchMerged returns an
+	// run or any archive source fails. When false, FetchMerged returns an
 	// error (a *GapError for planner gaps, a wrapped error for planner /
 	// archive failures). When true, every such condition becomes an slog.Warn
 	// and the function proceeds with whatever data it could fetch.
@@ -122,8 +122,8 @@ func (o FetchMergedOptions) validate() error {
 //   - Planner gap hours under AllowGaps=false → *GapError containing the
 //     gap hours; inspect with errors.As.
 //   - Planner DB error under AllowGaps=false → wrapped error.
-//   - All archive sources fail under AllowGaps=false → wrapped error
-//     naming the last archive source error.
+//   - Any archive source fails under AllowGaps=false → wrapped error
+//     naming the failed archive source.
 //   - engine.Fetch failure → wrapped error.
 //
 // Under AllowGaps=true every non-fatal condition above becomes an slog.Warn
@@ -192,28 +192,23 @@ func FetchMerged(
 		rows = r
 	}
 
-	successfulArchives := 0
-	var lastArchiveErr error
 	for _, src := range archSources {
 		ar, err := o.ArchiveFetcher(ctx, o.Opts, src)
 		if err != nil {
-			// A broken archive must not silently block the entire query.
-			// Log and move on, but remember the error so we can surface it
-			// if every source fails under strict mode.
+			// In strict mode any broken archive source is fatal: each source
+			// is a distinct bintrail_id whose deltas no other source carries,
+			// and the planner validated archive_state coverage BEFORE this
+			// fetch — so skipping the source would return an incomplete
+			// result the caller has no way to detect (#377).
+			if !o.AllowGaps {
+				return nil, plan, fmt.Errorf("archive source %s failed under strict mode, cannot verify coverage: %w", src, err)
+			}
+			// Permissive mode: a broken archive must not block the entire
+			// query. Log and move on.
 			slog.Warn("archive query failed, skipping", "source", src, "error", err)
-			lastArchiveErr = err
 			continue
 		}
-		successfulArchives++
 		rows = append(rows, ar...)
-	}
-
-	// If the caller is in strict mode and every archive source we tried
-	// failed, treat that as a hard error: we cannot verify that the archive
-	// range is covered. Under AllowGaps=true we swallow the failure and
-	// return whatever we got from live MySQL.
-	if successfulArchives == 0 && lastArchiveErr != nil && !o.AllowGaps {
-		return nil, plan, fmt.Errorf("all %d archive source(s) failed, cannot verify coverage: %w", len(archSources), lastArchiveErr)
 	}
 
 	rows = MergeAndTrim(rows, o.Opts.Limit, o.Opts.LimitPerPK, o.Opts.Order)

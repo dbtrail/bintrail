@@ -35,6 +35,24 @@ func TestBuildGlob(t *testing.T) {
 	}
 }
 
+// TestFetchEmptyLocalSourceErrors locks a deliberate fail-loud decision
+// (#377 review): a registered local source whose base directory EXISTS but
+// holds zero .parquet files is broken state, not an empty archive —
+// ArchivePartition always writes a file (even for a 0-row partition), so a
+// fileless tree can only mean the Parquet files were deleted after
+// archive_state was written. Fetch must surface DuckDB's "No files found"
+// as an error so strict-mode (AllowGaps=false) callers abort instead of
+// folding a silently incomplete result. (The S3 branch returns (nil, nil)
+// for a no-match listing — that asymmetric latent hole and the resolver's
+// local-shadows-S3 preference are tracked in a follow-up issue.)
+func TestFetchEmptyLocalSourceErrors(t *testing.T) {
+	dir := t.TempDir() // exists (passes the resolver's os.Stat), no .parquet files
+	_, err := Fetch(context.Background(), query.Options{}, dir)
+	if err == nil {
+		t.Fatal("Fetch on an existing-but-empty source dir: expected error, got nil")
+	}
+}
+
 // ─── parseS3Source ───────────────────────────────────────────────────────────
 
 func TestParseS3Source(t *testing.T) {
