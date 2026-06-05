@@ -406,6 +406,41 @@ func (r mockSQLScalar) apply(exp *sqlmock.ExpectedQuery, col string) {
 	exp.WillReturnRows(sqlmock.NewRows([]string{col}).AddRow(r.value))
 }
 
+// TestCheckIndexWriteAccessOnNeverDropsPreexistingDB is the data-loss guard
+// for #384's probe cleanup: when the database PRE-EXISTS (SCHEMATA finds it),
+// no DROP DATABASE may ever be issued. The trick: register a DROP DATABASE
+// expectation and assert ExpectationsWereMet() ERRORS with it unfulfilled —
+// a spurious drop would fulfil it and turn this test red. (The production
+// dropErr is swallowed into slog.Warn, so an unexpected-call error from
+// sqlmock would otherwise be invisible to assertions.)
+func TestCheckIndexWriteAccessOnNeverDropsPreexistingDB(t *testing.T) {
+	const dbName = "binlog_index"
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
+		WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}).AddRow(dbName))
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("DROP TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
+	// Sentinel: must remain UNFULFILLED.
+	mock.ExpectExec("DROP DATABASE").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	got := checkIndexWriteAccessOn(t.Context(), db, dbName)
+	if got.Status != statusPass {
+		t.Fatalf("Status = %q, want pass (detail=%q)", got.Status, got.Detail)
+	}
+	err = mock.ExpectationsWereMet()
+	if err == nil {
+		t.Fatal("DROP DATABASE expectation was fulfilled — a pre-existing database was dropped by the probe")
+	}
+	if !strings.Contains(err.Error(), "DROP DATABASE") {
+		t.Fatalf("expected the unmet expectation to be DROP DATABASE, got: %v", err)
+	}
+}
+
 // TestIsUnknownDatabaseErr pins the 1049 detection (#384): it must see
 // through config.Connect's %w wrapping and must NOT match other MySQL
 // errors or plain errors.

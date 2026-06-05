@@ -539,19 +539,27 @@ func checkIndexConnection(ctx context.Context, dsn, dbName string) checkResult {
 		// Error 1049 means only the DATABASE is absent — init creates it,
 		// so verify the SERVER is reachable instead of failing (#384).
 		if isUnknownDatabaseErr(err) {
-			if serverDB, serverErr := connectWithoutDB(dsn); serverErr == nil {
+			serverDB, serverErr := connectWithoutDB(dsn)
+			if serverErr == nil {
 				defer serverDB.Close()
 				var version string
-				if vErr := serverDB.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); vErr == nil {
+				vErr := serverDB.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version)
+				if vErr == nil {
 					return checkResult{
 						Name:   "Index MySQL connection",
 						Status: statusPass,
 						Detail: fmt.Sprintf("MySQL %s, database=%s (does not exist yet — `bintrail init` will create it)", version, dbName),
 					}
 				}
+				serverErr = vErr
 			}
-			// Server-level connect/probe also failed: fall through to the
-			// FAIL below with the original, more specific error.
+			// The database is absent AND the server-level probe failed too.
+			// Surface BOTH errors: 1049 alone would mislead — its remediation
+			// says "init will create it" — when the real, newer problem is
+			// e.g. max_user_connections, a timeout, or the server going away
+			// between the two connects. A diagnostic must not swallow the
+			// diagnostic.
+			err = fmt.Errorf("%w (server-level probe also failed: %v)", err, serverErr)
 		}
 		return checkResult{
 			Name:   "Index MySQL connection",
@@ -588,12 +596,14 @@ func checkIndexWriteAccess(ctx context.Context, dsn, dbName string) checkResult 
 		// checkIndexWriteAccessOn's SCHEMATA lookup then exercises the
 		// CREATE DATABASE privilege path this check exists to verify (#384).
 		if isUnknownDatabaseErr(err) {
-			if serverDB, serverErr := connectWithoutDB(dsn); serverErr == nil {
+			serverDB, serverErr := connectWithoutDB(dsn)
+			if serverErr == nil {
 				defer serverDB.Close()
 				return checkIndexWriteAccessOn(ctx, serverDB, dbName)
 			}
-			// Server-level connect also failed: fall through to the FAIL
-			// below with the original, more specific error.
+			// Surface both errors — see checkIndexConnection for why 1049
+			// alone would mislead here.
+			err = fmt.Errorf("%w (server-level probe also failed: %v)", err, serverErr)
 		}
 		return checkResult{
 			Name:   "Index write access",
@@ -632,9 +642,12 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) che
 			}
 		}
 		createdByProbe = true
-		// A diagnostic must not leave server state behind: drop the
-		// probe-created database on every exit path (#384). init re-creates
-		// it for real (CREATE DATABASE IF NOT EXISTS), so nothing is lost.
+		// A diagnostic must not leave server state behind: best-effort drop
+		// of the probe-created database on exit (#384). A drop failure is
+		// logged, not surfaced — it can only happen when the user also
+		// lacks DROP, which the table probe below already reports as FAIL —
+		// and init re-creates the database for real (CREATE DATABASE IF NOT
+		// EXISTS), so a leftover costs nothing.
 		defer func() {
 			if _, dropErr := db.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName)); dropErr != nil {
 				slog.Warn("doctor: could not drop probe-created database", "database", dbName, "error", dropErr)
@@ -677,9 +690,12 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) che
 				"  DROP TABLE %s;", dbName, probeTable),
 		}
 	}
+	// Deliberately no "(probe database dropped)" claim here: the deferred
+	// drop runs AFTER this return value is built, so the Detail cannot
+	// honestly assert the drop happened.
 	detail := "CREATE/DROP TABLE OK"
 	if createdByProbe {
-		detail = fmt.Sprintf("database %q does not exist yet — CREATE DATABASE privilege verified; CREATE/DROP TABLE OK (probe database dropped)", dbName)
+		detail = fmt.Sprintf("database %q does not exist yet — CREATE DATABASE privilege verified; CREATE/DROP TABLE OK", dbName)
 	}
 	return checkResult{
 		Name:   "Index write access",
