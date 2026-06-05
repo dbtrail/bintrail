@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`bintrail up --console` can now serve the Time-travel (point-in-time reconstruct) surface** (#379). `up` gained `--baseline-dir` / `--baseline-s3` (env: `BINTRAIL_CONSOLE_BASELINE_DIR` / `BINTRAIL_CONSOLE_BASELINE_S3`, flag > env > default), threaded into the embedded console's configuration exactly as the standalone `bintrail console` does — so a single `bintrail up --console --baseline-dir <dir>` process streams live *and* answers baseline-gated reconstruct queries from the browser, instead of requiring a second standalone-console process on another port. The gating is reused verbatim (`baselineConfigured` in `internal/console/server.go`, enforced at the endpoint); `up` defines no `--profile`/`--no-archive`, so the gate reduces to baseline presence. The read-only, token-auth, and result-cap invariants are unchanged.
+
 ### Changed
 - **License changed from Business Source License 1.1 to the Apache License, Version 2.0.** `LICENSE` now carries the verbatim Apache-2.0 text and a new `NOTICE` file records the copyright attribution (`(c) 2025 Daniel Guzman Burgos`), as is conventional under Apache-2.0. The README and CONTRIBUTING license sections and the `.goreleaser.yaml` package/image `license` metadata (`nfpms`, OCI `org.opencontainers.image.licenses` labels) are updated to `Apache-2.0`. This drops the BUSL Additional Use Grant restrictions and the four-year Change Date — bintrail is now permissively licensed for any use, including commercial. The CLA already reserved the maintainer's right to relicense, so existing contributions are covered.
 
