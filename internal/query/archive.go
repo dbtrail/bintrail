@@ -3,8 +3,11 @@ package query
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -12,7 +15,12 @@ import (
 // archive_state table. For each distinct bintrail_id it returns the base path
 // (local directory or S3 URL) that can be passed to parquetquery.Fetch.
 //
-// Local paths are preferred over S3 when the directory exists on disk.
+// Local paths are preferred over S3 when the directory exists on disk AND
+// holds at least one .parquet file — an empty local tree (files pruned after
+// upload) falls back to the S3 copy instead of shadowing it (#383). A
+// registered source is never omitted from the result: the planner counts
+// archived hours straight from archive_state, so omission would make strict
+// mode (#377) silently miss the coverage hole.
 // Returns nil when no archives are configured, the table does not exist, or
 // db is nil.
 func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
@@ -44,30 +52,85 @@ func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 			continue
 		}
 
-		// Prefer local path if the base directory exists on disk.
+		var localBase string
 		if localPath.Valid && localPath.String != "" {
-			base := extractBasePath(localPath.String)
-			if base != "" {
-				if _, err := os.Stat(base); err == nil {
-					sources = append(sources, base)
-					continue
-				}
+			localBase = extractBasePath(localPath.String)
+		}
+		var s3Source string
+		if s3Bucket.Valid && s3Bucket.String != "" && s3Key.Valid && s3Key.String != "" {
+			if base := extractBasePath(s3Key.String); base != "" {
+				s3Source = "s3://" + s3Bucket.String + "/" + base
 			}
 		}
 
-		// Fall back to S3.
-		if s3Bucket.Valid && s3Bucket.String != "" && s3Key.Valid && s3Key.String != "" {
-			base := extractBasePath(s3Key.String)
-			if base != "" {
-				sources = append(sources, "s3://"+s3Bucket.String+"/"+base)
+		// Prefer the local copy only when it actually holds data. A base
+		// dir that exists but contains no .parquet files — the "archive
+		// locally → upload to S3 → prune the local files, keep the tree"
+		// cleanup pattern; rotate writes BOTH paths into the same
+		// archive_state row — must not shadow a healthy S3 copy (#383).
+		localExists := false
+		localUsable := false
+		if localBase != "" {
+			if _, err := os.Stat(localBase); err == nil {
+				localExists = true
+				localUsable = localBaseHasParquet(localBase)
 			}
 		}
+
+		switch {
+		case localUsable:
+			sources = append(sources, localBase)
+		case s3Source != "":
+			// Warn only for the surprising shadow case (dir exists but is
+			// fileless); a fully-pruned local path falling back to S3 is
+			// the normal post-cleanup state and stays quiet, as before.
+			if localExists {
+				slog.Warn("local archive base has no parquet files; falling back to S3",
+					"bintrail_id", bintrailID, "local_base", localBase, "s3_source", s3Source)
+			}
+			sources = append(sources, s3Source)
+		case localBase != "":
+			// NEVER omit a registered source: the planner counts these
+			// hours as covered straight from archive_state (independent of
+			// this list), so dropping the source would leave strict mode
+			// (#377) nothing to fail on — a silently incomplete result.
+			// Keep the unusable local base; the fetch fails loud instead
+			// (DuckDB "No files found" / stat error).
+			sources = append(sources, localBase)
+		}
+		// A row with neither a parseable local base nor S3 columns
+		// contributes nothing, as before.
 	}
 	if err := rows.Err(); err != nil {
 		slog.Warn("archive_state iteration error", "error", err)
 	}
 
 	return sources
+}
+
+// errFoundParquet is the sentinel localBaseHasParquet uses to stop the walk
+// at the first hit.
+var errFoundParquet = errors.New("found parquet")
+
+// localBaseHasParquet reports whether base contains at least one .parquet
+// file anywhere under it (layout-agnostic — fixtures place files directly
+// under the base, rotate uses event_date=/event_hour= subtrees). It is a
+// routing HINT, not a correctness gate: parquetquery.Fetch is the real
+// fail-loud guard, so races between this check and the fetch (files pruned
+// in between) are harmless — worst case the fetch errors and strict mode
+// (#377) reports it.
+func localBaseHasParquet(base string) bool {
+	err := filepath.WalkDir(base, func(_ string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// Unreadable entry: skip it, keep scanning the rest.
+			return nil
+		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".parquet") {
+			return errFoundParquet
+		}
+		return nil
+	})
+	return errors.Is(err, errFoundParquet)
 }
 
 // extractBasePath returns the portion of an archive file path up to and

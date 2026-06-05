@@ -42,9 +42,12 @@ func TestBuildGlob(t *testing.T) {
 // fileless tree can only mean the Parquet files were deleted after
 // archive_state was written. Fetch must surface DuckDB's "No files found"
 // as an error so strict-mode (AllowGaps=false) callers abort instead of
-// folding a silently incomplete result. (The S3 branch returns (nil, nil)
-// for a no-match listing — that asymmetric latent hole and the resolver's
-// local-shadows-S3 preference are tracked in a follow-up issue.)
+// folding a silently incomplete result. (#383 fixed the resolver's
+// local-shadows-S3 preference — an empty local tree now falls back to the
+// S3 copy, so this error path fires only when nothing usable remains. The
+// S3 branch's (nil, nil) on a no-match listing is still open in #383:
+// the listing is date-scoped, so a naive zero-files check can't tell a
+// vanished source from a legitimately empty date range.)
 func TestFetchEmptyLocalSourceErrors(t *testing.T) {
 	dir := t.TempDir() // exists (passes the resolver's os.Stat), no .parquet files
 	_, err := Fetch(context.Background(), query.Options{}, dir)

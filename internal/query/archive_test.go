@@ -1,6 +1,130 @@
 package query
 
-import "testing"
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
+)
+
+// TestResolveArchiveSourcesRouting pins the per-row routing decisions (#383):
+// a local base is preferred only when it actually HOLDS parquet data; an
+// existing-but-fileless local tree (post-cleanup: files pruned after S3
+// upload, tree left behind) falls back to the S3 copy instead of shadowing
+// it; and a registered source is NEVER omitted — when nothing usable
+// remains, the unusable local base is returned anyway so the fetch (not
+// silence) reports the problem under strict mode (#377).
+func TestResolveArchiveSourcesRouting(t *testing.T) {
+	dir := t.TempDir()
+
+	// Base with real data — local wins.
+	dataBase := filepath.Join(dir, "bintrail_id=with-data")
+	if err := os.MkdirAll(filepath.Join(dataBase, "event_date=2026-06-05", "event_hour=10"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataBase, "event_date=2026-06-05", "event_hour=10", "events.parquet"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Base that exists but holds no parquet files — the shadow case.
+	emptyBase := filepath.Join(dir, "bintrail_id=pruned")
+	if err := os.MkdirAll(filepath.Join(emptyBase, "event_date=2026-06-05"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same fileless shape, but with no S3 columns to fall back to.
+	orphanBase := filepath.Join(dir, "bintrail_id=orphan")
+	if err := os.MkdirAll(orphanBase, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Local path entirely gone (stat fails).
+	goneBase := filepath.Join(dir, "bintrail_id=gone") // never created
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	cols := []string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}
+	mock.ExpectQuery("FROM archive_state").WillReturnRows(sqlmock.NewRows(cols).
+		// (1) data present locally + S3 registered → local wins.
+		AddRow("with-data", filepath.Join(dataBase, "events.parquet"), "bkt", "events/bintrail_id=with-data/f.parquet").
+		// (2) local tree exists but fileless + S3 registered → S3.
+		AddRow("pruned", filepath.Join(emptyBase, "events.parquet"), "bkt", "events/bintrail_id=pruned/f.parquet").
+		// (3) fileless local, NO S3 → keep the local base (never omit).
+		AddRow("orphan", filepath.Join(orphanBase, "events.parquet"), nil, nil).
+		// (4) local gone entirely + S3 → S3 (pre-#383 behavior preserved).
+		AddRow("gone", filepath.Join(goneBase, "events.parquet"), "bkt", "events/bintrail_id=gone/f.parquet").
+		// (5) local gone entirely, NO S3 → keep the local base (NEW: was
+		// silently omitted, leaving the planner-claimed coverage with
+		// nothing to fail on).
+		AddRow("gone-orphan", filepath.Join(dir, "bintrail_id=gone-orphan", "events.parquet"), nil, nil))
+
+	got := ResolveArchiveSources(context.Background(), db)
+	want := []string{
+		dataBase,
+		"s3://bkt/events/bintrail_id=pruned",
+		orphanBase,
+		"s3://bkt/events/bintrail_id=gone",
+		filepath.Join(dir, "bintrail_id=gone-orphan"),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d sources %v, want %d %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("sources[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestLocalBaseHasParquet(t *testing.T) {
+	dir := t.TempDir()
+
+	// Empty dir → false.
+	if localBaseHasParquet(dir) {
+		t.Error("empty dir: want false")
+	}
+	// Non-parquet files only → false.
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if localBaseHasParquet(dir) {
+		t.Error("dir with only non-parquet files: want false")
+	}
+	// Parquet directly under base (test-fixture layout) → true.
+	if err := os.WriteFile(filepath.Join(dir, "events.parquet"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !localBaseHasParquet(dir) {
+		t.Error("parquet directly under base: want true")
+	}
+
+	// Parquet nested in the rotate layout → true.
+	nested := t.TempDir()
+	sub := filepath.Join(nested, "event_date=2026-06-05", "event_hour=10")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "events.parquet"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !localBaseHasParquet(nested) {
+		t.Error("nested parquet: want true")
+	}
+
+	// Nonexistent base → false.
+	if localBaseHasParquet(filepath.Join(dir, "nope")) {
+		t.Error("nonexistent base: want false")
+	}
+}
 
 func TestExtractBasePath(t *testing.T) {
 	tests := []struct {
