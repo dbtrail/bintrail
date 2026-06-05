@@ -142,8 +142,8 @@ cat <<'BANNER'
   │  Give the traffic generator ~1 minute to build history, then:      │
   │                                                                     │
   │    mysql -h 127.0.0.1 -P 6033 -u demo -pdemo demo \                 │
-  │      -e "SELECT * FROM _flashback.orders AS OF '1 minute ago'      │
-  │          WHERE id = 1"                                              │
+  │      -e "SELECT * FROM orders WHERE id = 1                          │
+  │          AS OF '1 minute ago'"                                      │
   │                                                                     │
   │  Compare with the live row:                                         │
   │                                                                     │

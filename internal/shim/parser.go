@@ -19,6 +19,12 @@
 //
 //	SELECT /*+ DBTRAIL_AT='<ts>' */ * FROM [<schema>.]<table> [WHERE <col> = <value>]
 //
+// And a fifth (#385), the bare README-tagline form — time-travel
+// syntax directly on a real table, with the AS OF clause ENDING the
+// statement — also rewritten to _flashback:
+//
+//	SELECT * FROM [<schema>.]<table> [WHERE <col> = <value>] AS OF [TIMESTAMP] '<ts>'
+//
 // This is friendlier for ORMs (Hibernate, Sequelize, etc.) that
 // can't easily rewrite the FROM clause from app code. ProxySQL's
 // docs-advertised `DBTRAIL_AT` routing rule matches this form and
@@ -119,7 +125,7 @@ var (
 	//   SELECT /*+ DBTRAIL_AT='<ts>' */ * FROM [<schema>.]<table> [WHERE <col> = <val>] [;]
 	//
 	// ProxySQL routes any statement containing DBTRAIL_AT to the shim
-	// (the rule_id 990001-990003 set written by `bintrail
+	// (the rule_id 990001-990006 set written by `bintrail
 	// proxysql-config`), so the shim must recognise the hint and
 	// rewrite it into the canonical `_flashback.<table> AS OF '<ts>'`
 	// shape before the virtual-schema dispatch fires. See issue #288.
@@ -160,6 +166,38 @@ var (
 	// and return ER_PARSE_ERROR (1064) to the customer when the
 	// query is perfectly valid for the upstream MySQL.
 	hintProbeRE = regexp.MustCompile(`(?i)^\s*SELECT\s+(?:\*\s+)?/\*\+\s*DBTRAIL_AT\b`)
+
+	// asOfRealProbeRE gates the bare-AS-OF-on-a-real-table form (#385):
+	//
+	//	SELECT * FROM [<schema>.]<table> [WHERE <col> = <val>] AS OF [TIMESTAMP] '<ts>'
+	//
+	// It is END-ANCHORED — the statement must *finish* with the AS OF
+	// clause — for the same reason hintProbeRE is start-anchored
+	// (#288's lesson): "AS OF" inside an arbitrary string literal in
+	// the middle of a benign query must not trigger the rewrite path.
+	// Deliberately the same semantic as the ProxySQL routing rule
+	// (rule_id 990006), so the shim and the router always agree on
+	// which statements are this shape. A probe hit with a full-matcher
+	// miss IS treated as an intended-but-malformed time-travel query
+	// (1064 with grammar help): a statement that *ends* in AS OF '…'
+	// unambiguously wanted time travel.
+	asOfRealProbeRE = regexp.MustCompile(`(?i)\bAS\s+OF\s+(?:TIMESTAMP\s+)?'[^']*'\s*;?\s*$`)
+
+	// asOfRealRE is the full matcher for the bare form. Capture groups:
+	//   1 = schema prefix (without trailing dot) or empty
+	//   2 = table
+	//   3 = WHERE column (or empty — full-table shape)
+	//   4 = WHERE value, quoted or numeric (or empty)
+	//   5 = timestamp (between the quotes)
+	// Projection is hard-coded `*` (like the hint form; #313's column
+	// lists are virtual-schema-only); WHERE precedes AS OF (trailing-only
+	// — an AS-OF-before-WHERE variant would foreclose the end anchor,
+	// the single strongest false-positive defense).
+	asOfRealRE = regexp.MustCompile(
+		`(?i)^\s*SELECT\s+\*\s+FROM\s+(?:([A-Za-z_][A-Za-z0-9_]*)\.)?([A-Za-z_][A-Za-z0-9_]*)` +
+			`(?:\s+WHERE\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('[^']*'|-?\d+))?` +
+			`\s+AS\s+OF\s+(?:TIMESTAMP\s+)?'([^']+)'\s*;?\s*$`,
+	)
 )
 
 // mustCompileAsOf builds a regex for `_flashback` / `_snapshot` shapes.
@@ -247,6 +285,15 @@ func Parse(sql, defaultSchema string) (TimeTravelQuery, error) {
 	if !strings.Contains(lower, "_flashback.") &&
 		!strings.Contains(lower, "_snapshot.") &&
 		!strings.Contains(lower, "_diff.") {
+		// Bare AS OF on a real table (#385). Deliberately gated INSIDE
+		// the non-virtual branch: `_flashback.orders AS OF '…'` would
+		// otherwise also match asOfRealRE (identifiers may start with
+		// `_`, and Go regexp has no negative lookahead) and be
+		// misparsed with schema="_flashback". Virtual queries are
+		// always claimed by the matchers below instead.
+		if asOfRealProbeRE.MatchString(trimmed) {
+			return parseAsOfRealTable(trimmed, defaultSchema)
+		}
 		return TimeTravelQuery{}, ErrNotTimeTravel
 	}
 
@@ -380,6 +427,52 @@ func stripQuotes(s string) string {
 		return s[1 : len(s)-1]
 	}
 	return s
+}
+
+// parseAsOfRealTable handles the bare time-travel form on a real table
+// name (#385) — the README-tagline shape:
+//
+//	SELECT * FROM [<schema>.]<table> [WHERE <col> = <val>] AS OF [TIMESTAMP] '<ts>'
+//
+// Like the hint form it rewrites to a TypeFlashback query (binlog-only;
+// it does not gain _snapshot's baseline awareness). Only called when the
+// end-anchored probe matched, so a full-matcher miss here is an
+// intended-but-malformed time-travel statement → non-ErrNotTimeTravel
+// error → ER_PARSE_ERROR (1064) with grammar help.
+func parseAsOfRealTable(trimmed, defaultSchema string) (TimeTravelQuery, error) {
+	m := asOfRealRE.FindStringSubmatch(trimmed)
+	if m == nil {
+		return TimeTravelQuery{}, fmt.Errorf(
+			"malformed time-travel query; expected:\n" +
+				"  SELECT * FROM [<schema>.]<table> [WHERE <col> = <value>] AS OF [TIMESTAMP] '<ts>'\n" +
+				"\n" +
+				"Notes: the projection must be `*` (column lists are supported only on\n" +
+				"the _flashback/_snapshot virtual schemas), and the AS OF clause must\n" +
+				"end the statement.",
+		)
+	}
+	asOf, err := parseTimeLiteral(m[5])
+	if err != nil {
+		return TimeTravelQuery{}, fmt.Errorf("invalid AS OF timestamp %q: %w", m[5], err)
+	}
+	schema := m[1]
+	if schema == "" {
+		schema = defaultSchema
+	}
+	if schema == "" {
+		return TimeTravelQuery{}, fmt.Errorf(
+			"no schema selected; issue `USE <database>;` before running a time-travel query " +
+				"(or qualify the table as <schema>.<table>)",
+		)
+	}
+	return TimeTravelQuery{
+		Type:     TypeFlashback,
+		Schema:   schema,
+		Table:    m[2],
+		AsOf:     asOf,
+		PKColumn: m[3],
+		PKValue:  stripQuotes(m[4]),
+	}, nil
 }
 
 // parseHintForm handles the optimizer-hint comment form:

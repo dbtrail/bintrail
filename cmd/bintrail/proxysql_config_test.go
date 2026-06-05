@@ -89,12 +89,13 @@ func TestRunProxySQLConfig(t *testing.T) {
 			"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (991, '127.0.0.1', 3308);",
 			"DELETE FROM mysql_users WHERE default_hostgroup = 990;",
 			"INSERT INTO mysql_users (username, password, default_hostgroup, active) VALUES ('app_user', '" + pcTestSHA1_1 + "', 990, 1);",
-			"DELETE FROM mysql_query_rules WHERE rule_id IN (990001, 990002, 990003, 990004, 990005);",
+			"DELETE FROM mysql_query_rules WHERE rule_id IN (990001, 990002, 990003, 990004, 990005, 990006);",
 			"VALUES (990001, 1, '\\b_flashback\\.', 991, 1);",
 			"VALUES (990002, 1, '\\b_diff\\.', 991, 1);",
 			"VALUES (990003, 1, '\\b_snapshot\\.', 991, 1);",
 			"VALUES (990004, 1, '/\\*\\+\\s*DBTRAIL_AT', 991, 1);",
 			"VALUES (990005, 1, '^\\s*SHOW\\s+(FULL\\s+)?TABLES\\s+(FROM|IN)\\s+`?_(flashback|diff|snapshot)`?', 991, 1);",
+			"VALUES (990006, 1, '\\bAS\\s+OF\\s+(TIMESTAMP\\s+)?''[^'']*''\\s*\\x3b?\\s*$', 991, 1);",
 			"COMMIT;",
 			"LOAD MYSQL SERVERS TO RUNTIME;",
 			"LOAD MYSQL USERS TO RUNTIME;",
@@ -468,6 +469,8 @@ func TestGenerateProxySQLSetupSQLHostgroupPairing(t *testing.T) {
 		"VALUES (990003, 1, '\\b_snapshot\\.', 991, 1);",
 		// hint-comment form (#288) also routes to shim hostgroup
 		"VALUES (990004, 1, '/\\*\\+\\s*DBTRAIL_AT', 991, 1);",
+		// bare AS OF on a real table (#385) also routes to shim hostgroup
+		"VALUES (990006, 1, '\\bAS\\s+OF\\s+(TIMESTAMP\\s+)?''[^'']*''\\s*\\x3b?\\s*$', 991, 1);",
 	}
 	for _, w := range wants {
 		if !strings.Contains(out, w) {
@@ -481,6 +484,7 @@ func TestGenerateProxySQLSetupSQLHostgroupPairing(t *testing.T) {
 		"VALUES (990002, 1, '\\b_diff\\.', 990, 1)",
 		"VALUES (990003, 1, '\\b_snapshot\\.', 990, 1)",
 		"VALUES (990004, 1, '/\\*\\+\\s*DBTRAIL_AT', 990, 1)",
+		"VALUES (990006, 1, '\\bAS\\s+OF\\s+(TIMESTAMP\\s+)?''[^'']*''\\s*\\x3b?\\s*$', 990, 1)",
 	} {
 		if strings.Contains(out, bad) {
 			t.Errorf("virtual-schema rule must not target passthrough hostgroup, found %q", bad)

@@ -104,10 +104,10 @@ func TestShimEndToEnd(t *testing.T) {
 	clientDB := openClientWithRetry(t, "testuser:testpw@tcp("+proxysqlClientAddr+")/appdb", 30*time.Second)
 	t.Cleanup(func() { clientDB.Close() })
 
-	// All time-travel queries use SELECT * — the shim's parser
-	// (internal/shim/parser.go) hard-requires a literal star;
-	// `SELECT id, sku, ...` falls through to "this server only
-	// handles _flashback / _snapshot / _diff" rejection.
+	// Most time-travel queries here use SELECT * for side-by-side
+	// comparability with the live table. (Column lists are supported
+	// on the virtual schemas since #313; the hint and bare-AS-OF
+	// forms remain `*`-only.)
 	t.Run("flashback_returns_post_image_at_asof", func(t *testing.T) {
 		// AS OF 13:00 → after the 12:00 UPDATE (qty=2), before the
 		// 14:00 DELETE. Expect qty=2.
@@ -357,9 +357,13 @@ func TestShimEndToEnd(t *testing.T) {
 		// value you queried", which is literally what a coverage gap is.
 		//
 		// The seed (e2e/shim/seed.sql) creates partitions covering 09:00
-		// to 16:00 on 2026-05-04. AS OF 18:00 lies outside that range,
-		// producing 3 gap hours (16:00, 17:00, 18:00) under default
-		// strict mode (--allow-gaps=false). Internal failures (DB down,
+		// to 18:00 on 2026-05-04. AS OF 18:00 lies just past the last
+		// real partition (p_future is not coverage), producing one gap
+		// hour under default strict mode — which the compose preserves
+		// by NOT passing --allow-gaps (it did until #385's rig fix,
+		// silently demoting this gap to a WARN and an empty success,
+		// i.e. this subtest could never have passed as written).
+		// Internal failures (DB down,
 		// resultset-build bug) keep emitting 1105 — see the unit tests
 		// in internal/shim/handler_test.go for that half of the contract.
 		_, err := clientDB.Query(
@@ -393,6 +397,39 @@ func TestShimEndToEnd(t *testing.T) {
 			t.Errorf("passthrough row mismatch:\n  got:  %+v\n  want: %+v\n"+
 				"if this looks like a shim error, the regex in `bintrail proxysql-config` "+
 				"is over-matching", got, want)
+		}
+	})
+
+	t.Run("bare_asof_real_table_routes_to_shim", func(t *testing.T) {
+		// The README-tagline form (#385): time-travel syntax on the REAL
+		// table name, AS OF clause ending the statement. ProxySQL's
+		// end-anchored rule 990006 must route this to the shim, which
+		// rewrites it to TypeFlashback. AS OF 13:00 → the post-UPDATE
+		// image (qty=2), NOT the live marker row — returning
+		// sku=LIVE-SKU here means the rule didn't route.
+		got := queryRowMap(t, clientDB,
+			"SELECT * FROM orders WHERE id = 42 AS OF '2026-05-04 13:00:00'")
+		want := map[string]string{"id": "42", "sku": "ABC-1", "qty": "2", "note": "initial"}
+		if !maps.Equal(got, want) {
+			t.Errorf("bare AS OF row mismatch:\n  got:  %+v\n  want: %+v\n"+
+				"if this is the LIVE-SKU marker row, rule 990006 did not route to the shim", got, want)
+		}
+	})
+
+	t.Run("bare_asof_anchor_guard_mid_literal_stays_passthrough", func(t *testing.T) {
+		// The false-positive guard for rule 990006 (#385): "AS OF '…'"
+		// inside a string literal that does NOT end the statement must
+		// stay on passthrough. Empirical proof that ProxySQL's PCRE `$`
+		// behaves as end-of-string under the default re_modifiers — the
+		// load-bearing assumption behind shipping the rule on-by-default.
+		// The trailing predicate moves the literal off the statement end.
+		got := queryRowMap(t, clientDB,
+			"SELECT * FROM orders WHERE note = 'AS OF ''2026-01-01''' OR id = 42")
+		want := map[string]string{"id": "42", "sku": "LIVE-SKU", "qty": "999", "note": "live-row-from-passthrough"}
+		if !maps.Equal(got, want) {
+			t.Errorf("mid-literal AS OF mismatch:\n  got:  %+v\n  want: %+v\n"+
+				"if this errored or returned a historical image, rule 990006's "+
+				"end anchor is not holding on real ProxySQL", got, want)
 		}
 	})
 }

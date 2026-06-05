@@ -320,6 +320,158 @@ func TestParseRequiresSchema(t *testing.T) {
 	}
 }
 
+// ─── bare AS OF on a real table (issue #385) ─────────────────────────────────
+
+// TestParseBareAsOfHappyPath pins the README-tagline shape: time-travel
+// syntax directly on a real table name, AS OF clause ending the statement,
+// rewritten to a TypeFlashback query exactly like the hint form.
+func TestParseBareAsOfHappyPath(t *testing.T) {
+	q, err := Parse(
+		"SELECT * FROM orders WHERE id = 1 AS OF '2026-06-05 12:00:00'",
+		"myapp",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if q.Type != TypeFlashback {
+		t.Errorf("Type = %v, want TypeFlashback", q.Type)
+	}
+	if q.Schema != "myapp" || q.Table != "orders" || q.PKColumn != "id" || q.PKValue != "1" {
+		t.Errorf("unexpected: %+v", q)
+	}
+	want := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	if !q.AsOf.Equal(want) {
+		t.Errorf("AsOf = %v, want %v", q.AsOf, want)
+	}
+	if q.Columns != nil {
+		t.Errorf("Columns must be nil (SELECT *), got %v", q.Columns)
+	}
+}
+
+func TestParseBareAsOfVariants(t *testing.T) {
+	cases := []struct {
+		name       string
+		sql        string
+		wantSchema string
+		wantTable  string
+		wantPKCol  string
+		wantPKVal  string
+	}{
+		{"qualified table", "SELECT * FROM demo.orders WHERE id = 1 AS OF '2026-06-05'", "demo", "orders", "id", "1"},
+		{"full-table no WHERE", "SELECT * FROM orders AS OF '2026-06-05 10:00:00'", "myapp", "orders", "", ""},
+		{"TIMESTAMP keyword", "SELECT * FROM orders WHERE id = 7 AS OF TIMESTAMP '2026-06-05 10:00:00'", "myapp", "orders", "id", "7"},
+		{"trailing semicolon + lowercase", "select * from orders where id = 9 as of '2026-06-05';", "myapp", "orders", "id", "9"},
+		{"string PK", "SELECT * FROM users WHERE uuid = 'abc-123' AS OF '2026-06-05'", "myapp", "users", "uuid", "abc-123"},
+		{"relative literal", "SELECT * FROM orders WHERE id = 1 AS OF '5 minutes ago'", "myapp", "orders", "id", "1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if q.Type != TypeFlashback {
+				t.Errorf("Type = %v, want TypeFlashback", q.Type)
+			}
+			if q.Schema != tc.wantSchema || q.Table != tc.wantTable ||
+				q.PKColumn != tc.wantPKCol || q.PKValue != tc.wantPKVal {
+				t.Errorf("unexpected: %+v", q)
+			}
+		})
+	}
+}
+
+// TestParseBareAsOfLiteralGuard is the false-positive guard (the #288
+// lesson, end-anchored edition): "AS OF" inside a string literal that does
+// NOT end the statement must return ErrNotTimeTravel — the query is benign
+// and, symmetrically, the end-anchored ProxySQL rule would not route it to
+// the shim either.
+func TestParseBareAsOfLiteralGuard(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT * FROM logs WHERE note = 'as of yesterday' ORDER BY id",
+		"SELECT * FROM logs WHERE note = 'x AS OF ''2020''' AND id = 1",
+		"INSERT INTO logs (note) VALUES ('AS OF ''2026-01-01''')",
+		"SELECT * FROM orders WHERE id = 1", // no AS OF at all
+	} {
+		if _, err := Parse(sql, "myapp"); !errors.Is(err, ErrNotTimeTravel) {
+			t.Errorf("Parse(%q) error = %v, want ErrNotTimeTravel", sql, err)
+		}
+	}
+}
+
+// TestParseBareAsOfDispatchRegression proves the dispatch-order trap is
+// handled: identifiers may start with `_`, so a naive bare-AS-OF matcher
+// would claim `_flashback.orders AS OF '…'` with schema="_flashback". The
+// virtual-schema matchers must win.
+func TestParseBareAsOfDispatchRegression(t *testing.T) {
+	q, err := Parse("SELECT * FROM _flashback.orders AS OF '2026-06-05 10:00:00' WHERE id = 1", "myapp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if q.Type != TypeFlashback || q.Schema != "myapp" || q.Table != "orders" {
+		t.Errorf("virtual query misparsed by the bare-AS-OF shape: %+v", q)
+	}
+	if q.Schema == "_flashback" {
+		t.Error("schema captured as _flashback — bare-AS-OF matcher ran before the virtual matchers")
+	}
+
+	// _snapshot must stay TypeSnapshot (the bare form always rewrites to
+	// TypeFlashback, so a misroute would change semantics, not just names).
+	q, err = Parse("SELECT * FROM _snapshot.orders AS OF '2026-06-05 10:00:00'", "myapp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if q.Type != TypeSnapshot {
+		t.Errorf("Type = %v, want TypeSnapshot", q.Type)
+	}
+}
+
+// TestParseBareAsOfMalformed: a statement that ENDS with AS OF '…'
+// unambiguously wanted time travel, so probe-hit-but-matcher-miss is a
+// helpful 1064-class error (non-ErrNotTimeTravel), not silence. Column
+// lists are virtual-schema-only — the bare form is `*`-only like the hint.
+func TestParseBareAsOfMalformed(t *testing.T) {
+	cases := []struct {
+		sql     string
+		wantSub string
+	}{
+		{"SELECT id, total FROM orders WHERE id = 1 AS OF '2026-06-05'", "malformed time-travel query"},
+		{"SELECT * FROM orders WHERE id = 1 AS OF 'not-a-time'", "invalid AS OF timestamp"},
+		{"SELECT * FROM orders WHERE id IN (1,2) AS OF '2026-06-05'", "malformed time-travel query"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			_, err := Parse(tc.sql, "myapp")
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if errors.Is(err, ErrNotTimeTravel) {
+				t.Fatalf("got ErrNotTimeTravel; an end-anchored AS OF statement must produce a parse error, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %v, want containing %q", err, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestParseBareAsOfRequiresSchema mirrors the hint form: unqualified table
+// with no USE'd database errors with the qualify-or-USE hint.
+func TestParseBareAsOfRequiresSchema(t *testing.T) {
+	_, err := Parse("SELECT * FROM orders WHERE id = 1 AS OF '2026-06-05'", "")
+	if err == nil || !strings.Contains(err.Error(), "no schema selected") {
+		t.Errorf("error = %v, want no-schema hint", err)
+	}
+	// Qualified form works without a default schema.
+	q, err := Parse("SELECT * FROM demo.orders WHERE id = 1 AS OF '2026-06-05'", "")
+	if err != nil {
+		t.Fatalf("qualified form should not need a default schema: %v", err)
+	}
+	if q.Schema != "demo" {
+		t.Errorf("Schema = %q, want demo", q.Schema)
+	}
+}
+
 // ─── hint-comment form (issue #288) ──────────────────────────────────────────
 
 // TestParseHintFormHappyPath pins the docs-advertised optimizer-hint

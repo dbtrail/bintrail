@@ -51,6 +51,19 @@ const (
 	// containing a dotted virtual reference) routes via the more specific
 	// rule first.
 	ruleIDShowTables = 990005
+	// ruleIDAsOf matches the bare time-travel form on a real table (#385):
+	//   SELECT * FROM [<schema>.]<table> [WHERE <col> = <val>] AS OF '<ts>'
+	// — the README-tagline shape. The pattern is END-ANCHORED ($ = end of
+	// statement; ProxySQL match_pattern is PCRE with multiline OFF by
+	// default, so $ means end-of-string): only statements that FINISH with
+	// the AS OF clause route to the shim. That anchor is the load-bearing
+	// false-positive defense — the shim has no passthrough, so a benign
+	// query mis-routed here breaks for the client. Residual surface: a
+	// statement whose final token is a string literal of the exact form
+	// `AS OF '<text>'` (rare; documented in docs/time-travel-sql.md).
+	// Ordered LAST so the virtual-schema forms (which can also end in
+	// AS OF '<ts>') route via their more specific rules first.
+	ruleIDAsOf = 990006
 )
 
 var proxysqlConfigCmd = &cobra.Command{
@@ -493,7 +506,7 @@ func generateProxySQLSetupSQL(host string, mysqlPort, shimPort, proxysqlMySQLPor
 	sb.WriteString(" * This script manages the following ProxySQL resources, all in the\n")
 	sb.WriteString(" * 990* numeric range to avoid colliding with operator-managed rules:\n")
 	fmt.Fprintf(&sb, " *   * mysql_servers in hostgroups %d (passthrough) and %d (shim)\n", passthroughHostgroup, shimHostgroup)
-	fmt.Fprintf(&sb, " *   * mysql_query_rules with rule_id in %d..%d\n", ruleIDFlashback, ruleIDShowTables)
+	fmt.Fprintf(&sb, " *   * mysql_query_rules with rule_id in %d..%d\n", ruleIDFlashback, ruleIDAsOf)
 	sb.WriteString(" *   * mysql_users named in shim.yaml (these become bintrail-managed)\n")
 	sb.WriteString(" *\n")
 	sb.WriteString(" * Apply this file to the ProxySQL admin port:\n")
@@ -546,7 +559,7 @@ func generateProxySQLSetupSQL(host string, mysqlPort, shimPort, proxysqlMySQLPor
 	}
 	sb.WriteString("\n")
 
-	fmt.Fprintf(&sb, "DELETE FROM mysql_query_rules WHERE rule_id IN (%d, %d, %d, %d, %d);\n", ruleIDFlashback, ruleIDDiff, ruleIDSnapshot, ruleIDHint, ruleIDShowTables)
+	fmt.Fprintf(&sb, "DELETE FROM mysql_query_rules WHERE rule_id IN (%d, %d, %d, %d, %d, %d);\n", ruleIDFlashback, ruleIDDiff, ruleIDSnapshot, ruleIDHint, ruleIDShowTables, ruleIDAsOf)
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '\\b_flashback\\.', %d, 1);\n", ruleIDFlashback, shimHostgroup)
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '\\b_diff\\.', %d, 1);\n", ruleIDDiff, shimHostgroup)
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '\\b_snapshot\\.', %d, 1);\n", ruleIDSnapshot, shimHostgroup)
@@ -562,6 +575,17 @@ func generateProxySQLSetupSQL(host string, mysqlPort, shimPort, proxysqlMySQLPor
 	// the latest schema snapshot. Without this rule the query would hit
 	// the real MySQL and get ER_BAD_DB.
 	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '^\\s*SHOW\\s+(FULL\\s+)?TABLES\\s+(FROM|IN)\\s+`?_(flashback|diff|snapshot)`?', %d, 1);\n", ruleIDShowTables, shimHostgroup)
+	// Bare AS OF on a real table (#385): END-ANCHORED — only statements
+	// that FINISH with the AS OF clause route to the shim, so "AS OF"
+	// inside a string literal mid-query stays on passthrough. Matches the
+	// shim parser's asOfRealProbeRE semantic exactly, so router and shim
+	// always agree on which statements are this shape. (The '' doubling is
+	// SQL string escaping; the stored PCRE contains single quotes. The
+	// optional trailing semicolon is written \x3b — PCRE hex escape for
+	// ';' — because a literal ';' inside the pattern splits the statement
+	// in half under any per-';' statement splitter, e.g. the e2e harness
+	// or an operator's apply script.)
+	fmt.Fprintf(&sb, "INSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply) VALUES (%d, 1, '\\bAS\\s+OF\\s+(TIMESTAMP\\s+)?''[^'']*''\\s*\\x3b?\\s*$', %d, 1);\n", ruleIDAsOf, shimHostgroup)
 	sb.WriteString("\n")
 
 	sb.WriteString("COMMIT;\n")

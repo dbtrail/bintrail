@@ -13,7 +13,7 @@ history, then query the past:
 
 ```sh
 mysql -h 127.0.0.1 -P 6033 -u demo -pdemo demo \
-  -e "SELECT * FROM _flashback.orders AS OF '1 minute ago' WHERE id = 1"
+  -e "SELECT * FROM orders WHERE id = 1 AS OF '1 minute ago'"
 ```
 
 Compare with the live row — the traffic generator mutates `orders id=1` every
@@ -63,6 +63,9 @@ The shim accepts these shapes through port 6033 (see
 SELECT * FROM _flashback.orders AS OF '5 minutes ago' WHERE id = 1;
 SELECT * FROM _flashback.orders AS OF '2026-06-05 14:00:00' WHERE id = 1;
 
+-- Bare form on the real table name — AS OF must end the statement
+SELECT * FROM orders WHERE id = 1 AS OF '5 minutes ago';
+
 -- Optimizer-hint form: time-travel a real table name (ORM-friendly)
 SELECT /*+ DBTRAIL_AT='5 minutes ago' */ * FROM orders WHERE id = 1;
 
@@ -92,7 +95,7 @@ row). It needs Docker and ~3 minutes; it is not part of `go test ./...`.
 | Symptom | Cause |
 |---|---|
 | `Empty set` from an `AS OF` query | The timestamp predates the stream start (history only accumulates while the appliance runs) or the row wasn't touched yet — wait a minute and retry. |
-| `ERROR 1064` | The query shape isn't in the shim grammar — see the supported forms above (note the hint form only supports `SELECT *`). The same query without time-travel syntax goes straight to MySQL. |
+| `ERROR 1064` | The query shape isn't in the shim grammar — see the supported forms above (the hint and bare-AS-OF forms only support `SELECT *`, and bare `AS OF` must end the statement). The same query without time-travel syntax goes straight to MySQL. |
 | Historical ENUM shows a number (`2` instead of `processing`) | The binlog row image stores ENUMs as their ordinal; live rows render the label, historical images render the ordinal. |
 | `ERROR 1045` | Wrong credentials — port 6033 takes `demo` / `demo`. |
 | Container exits during boot | A component failed; `docker logs` shows which. The appliance dies loudly rather than half-working. |

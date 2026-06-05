@@ -51,7 +51,7 @@ Wait for the banner, give the traffic a minute to build history, then:
 
 ```sh
 mysql -h 127.0.0.1 -P 6033 -u demo -pdemo demo \
-  -e "SELECT * FROM _flashback.orders AS OF '1 minute ago' WHERE id = 1"
+  -e "SELECT * FROM orders WHERE id = 1 AS OF '1 minute ago'"
 ```
 
 …returns the row as it was a minute ago — compare with

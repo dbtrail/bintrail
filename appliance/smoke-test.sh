@@ -55,6 +55,16 @@ log "live row:        ${LIVE:-<empty>}"
 [ -n "$LIVE" ] || { log "FAIL: live row missing"; exit 1; }
 
 PAST=$(mysql_demo "SELECT status, total FROM _flashback.orders AS OF '1 minute ago' WHERE id = 1")
+log "row 1 minute ago (virtual): ${PAST:-<empty>}"
+
+# The bare tagline form (#385): time-travel on the REAL table name —
+# the literal acceptance query of issue #350. NOTE: the bare form is
+# `*`-only (column lists stay on the virtual schemas); bare↔virtual
+# equality is pinned deterministically in e2e/shim, so non-empty is
+# the right assertion here.
+BARE=$(mysql_demo "SELECT * FROM orders WHERE id = 1 AS OF '1 minute ago'" || true)
+[ -n "$BARE" ] || { log "FAIL: bare AS OF form returned no row"; docker logs "$NAME" | tail -40; exit 1; }
+log "bare AS OF row:   $BARE"
 log "row 1 minute ago: ${PAST:-<empty>}"
 [ -n "$PAST" ] || { log "FAIL: time-travel query returned no row"; docker logs "$NAME" | tail -40; exit 1; }
 

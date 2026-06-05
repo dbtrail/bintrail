@@ -84,6 +84,8 @@ CREATE TABLE binlog_events (
     PARTITION p_2026050413 VALUES LESS THAN (TO_SECONDS('2026-05-04 14:00:00')),
     PARTITION p_2026050414 VALUES LESS THAN (TO_SECONDS('2026-05-04 15:00:00')),
     PARTITION p_2026050415 VALUES LESS THAN (TO_SECONDS('2026-05-04 16:00:00')),
+    PARTITION p_2026050416 VALUES LESS THAN (TO_SECONDS('2026-05-04 17:00:00')),
+    PARTITION p_2026050417 VALUES LESS THAN (TO_SECONDS('2026-05-04 18:00:00')),
     PARTITION p_future VALUES LESS THAN MAXVALUE
 );
 
@@ -122,10 +124,13 @@ VALUES
     (1, '2026-05-04 09:00:00', 'appdb', 'orders', 'note', 4, '',    'varchar', 'varchar(255)','YES');
 
 -- archive_state is read by query.Plan and query.ResolveArchiveSources.
--- Empty: the live partitions above already cover every event hour,
--- so the planner finds no gap. --allow-gaps on the shim command is
--- defensive belt-and-braces in case a future seed change widens
--- the time range without extending the partition list.
+-- Empty: the live partitions above cover hours 09:00-17:59, which
+-- includes every event hour AND every hour the non-gap subtests query
+-- (the _diff BETWEEN upper bound 16:00 rounds up to 17:00). The shim
+-- runs STRICT (--allow-gaps deliberately NOT passed in compose): the
+-- coverage_gap subtest pins gap->1526, which a permissive shim can
+-- never produce. AS OF 18:00 lands past the last real partition
+-- (p_future doesn't count as coverage), producing exactly one gap hour.
 CREATE TABLE archive_state (
     id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     partition_name  VARCHAR(20) NOT NULL,

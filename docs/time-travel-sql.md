@@ -132,7 +132,7 @@ If ProxySQL is on the same host (typical):
 mysql -u admin -p -h 127.0.0.1 -P 6032 < proxysql-setup.sql
 ```
 
-The script wraps its DML in `BEGIN`/`COMMIT` and finishes with `LOAD ... TO RUNTIME` and `SAVE ... TO DISK`, so the new routing is live immediately and survives a ProxySQL restart. **Re-running the script is safe** — it scopes its DELETEs to bintrail-owned hostgroups (990, 991) and rule IDs (990001-990004), so it never touches operator-managed config.
+The script wraps its DML in `BEGIN`/`COMMIT` and finishes with `LOAD ... TO RUNTIME` and `SAVE ... TO DISK`, so the new routing is live immediately and survives a ProxySQL restart. **Re-running the script is safe** — it scopes its DELETEs to bintrail-owned hostgroups (990, 991) and rule IDs (990001-990006), so it never touches operator-managed config.
 
 Verify ProxySQL accepted the config — you should see exactly two rows, one for hostgroup 990 (your real MySQL — `hostname` reflects whatever you have in `BINTRAIL_SOURCE_DSN`) and one for hostgroup 991 (the shim, always `127.0.0.1:3308`):
 
@@ -225,11 +225,15 @@ Connect through ProxySQL:
 mysql -u app_user -p -h 127.0.0.1 -P 6033 myapp
 ```
 
-Four statement shapes are recognised:
+Five statement shapes are recognised:
 
 ```sql
 -- Row state at a point in time (point-lookup, fast):
 SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
+
+-- The same, on the REAL table name — the AS OF clause must END the
+-- statement (#385). Rewritten internally to _flashback (binlog-only):
+SELECT * FROM orders WHERE id = 12345 AS OF '2026-05-02 10:00:00';
 
 -- Full-table reconstruction at AS OF (no WHERE). Against _snapshot (with a
 -- baseline configured) this is every row that existed at that instant;
@@ -287,10 +291,10 @@ The query rule isn't matching. Inspect the routing:
 
 ```sh
 mysql -u admin -p -h 127.0.0.1 -P 6032 \
-  -e "SELECT rule_id, match_pattern, destination_hostgroup FROM runtime_mysql_query_rules WHERE rule_id BETWEEN 990001 AND 990004;"
+  -e "SELECT rule_id, match_pattern, destination_hostgroup FROM runtime_mysql_query_rules WHERE rule_id BETWEEN 990001 AND 990006;"
 ```
 
-You should see four rows targeting hostgroup 991 (one each for `_flashback.*`, `_diff.*`, `_snapshot.*`, and the `/*+ DBTRAIL_AT=... */` hint-comment shape). If they're missing, re-apply `proxysql-setup.sql`. If they're present but the query still goes to MySQL, double-check that no operator rule with a smaller `rule_id` is intercepting `_flashback.*` first (ProxySQL evaluates rules in `rule_id` order).
+You should see six rows targeting hostgroup 991 (one each for `_flashback.*`, `_diff.*`, `_snapshot.*`, the `/*+ DBTRAIL_AT=... */` hint-comment shape, `SHOW TABLES FROM` the virtual schemas, and the end-anchored bare `... AS OF '<ts>'` shape). If they're missing, re-apply `proxysql-setup.sql`. If they're present but the query still goes to MySQL, double-check that no operator rule with a smaller `rule_id` is intercepting `_flashback.*` first (ProxySQL evaluates rules in `rule_id` order).
 
 ### `connection refused` on the shim's port
 
@@ -344,3 +348,5 @@ The bintrail index retains the most recent hours via partition rotation; older d
 - **Full-table reconstruction is buffered, not streamed.** The MVP buffers up to 100,000 rows per query and surfaces overflow as `ER_TOO_BIG_SELECT` (1104). A streaming wire-protocol path (no row cap) is deferred until an operator reports the cap as a real bottleneck. PK-filtered point-lookups are unaffected.
 - **No JOINs, aggregations, or non-PK WHERE filters inside the shim.** Run them outside on the resultset (`duckdb`, `pandas`, `awk`). The shim's job is to deliver correct historical row state; SQL execution against that state is the operator's tool of choice.
 - **ProxySQL itself is not provisioned by bintrail.** `bintrail proxysql-config` only writes routing rules; you install and harden ProxySQL itself (admin password, frontend TLS, monitoring) using the standard ProxySQL docs.
+- **The bare `AS OF` rule (990006) has a small residual false-positive surface.** The rule is end-anchored — only statements that *finish* with `AS OF '<text>'` route to the shim, so `AS OF` inside a string literal mid-query stays on passthrough (covered by an e2e guard test against real ProxySQL). The irreducible residue: a benign statement whose **final token** is a string literal of the exact form `AS OF '<text>'` would route to the shim and fail (the shim has no passthrough). If you hit that in practice, parenthesise or reorder the predicate — or delete rule 990006 from `mysql_query_rules` and use the `_flashback.`/hint forms instead. Note ProxySQL's `$` anchor assumes the default `re_modifiers` (CASELESS, no multiline); adding `GLOBAL`/multiline modifiers to the rule weakens the anchor to end-of-line.
+- **The bare `AS OF` form is `*`-only and trailing-only.** Column lists stay on the `_flashback`/`_snapshot` virtual schemas, and the AS OF clause must end the statement (an AS-OF-before-WHERE variant would forfeit the end anchor — the false-positive defense above). The bare form rewrites to `_flashback` (binlog-only); for baseline-aware lookups use `_snapshot`.

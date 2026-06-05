@@ -78,7 +78,10 @@ services:
       - --listen=127.0.0.1:3308
       - --index-dsn=root:testroot@tcp(mysql:3306)/bintrail_index
       - --shim-config=/etc/bintrail/shim.yaml
-      - --allow-gaps
+      # STRICT mode (no --allow-gaps): the coverage_gap subtest pins the
+      # gap->1526 contract, which only fires under the default strict
+      # mode. The seed's partition list covers every hour the other
+      # subtests touch, so strictness costs them nothing.
     volumes:
       - ./shim.yaml:/etc/bintrail/shim.yaml:ro
     depends_on:
