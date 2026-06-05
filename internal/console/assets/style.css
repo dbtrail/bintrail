@@ -16,6 +16,12 @@
 
 * { box-sizing: border-box; }
 
+/* The hidden attribute must always win. The UA sheet's [hidden]{display:none}
+   loses to any class that sets display (.modal's flex, .filters' flex, ...) —
+   without this rule a "hidden" full-viewport modal still swallows every click
+   on the page, and a "hidden" form stays on screen. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
