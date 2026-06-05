@@ -88,23 +88,23 @@ func TestResolveArchiveSourcesRouting(t *testing.T) {
 func TestLocalBaseHasParquet(t *testing.T) {
 	dir := t.TempDir()
 
-	// Empty dir → false.
-	if localBaseHasParquet(dir) {
-		t.Error("empty dir: want false")
+	// Empty dir → false, no root error.
+	if found, rootErr := localBaseHasParquet(dir); found || rootErr != nil {
+		t.Errorf("empty dir: found=%v rootErr=%v, want false/nil", found, rootErr)
 	}
 	// Non-parquet files only → false.
 	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if localBaseHasParquet(dir) {
+	if found, _ := localBaseHasParquet(dir); found {
 		t.Error("dir with only non-parquet files: want false")
 	}
 	// Parquet directly under base (test-fixture layout) → true.
 	if err := os.WriteFile(filepath.Join(dir, "events.parquet"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !localBaseHasParquet(dir) {
-		t.Error("parquet directly under base: want true")
+	if found, rootErr := localBaseHasParquet(dir); !found || rootErr != nil {
+		t.Errorf("parquet directly under base: found=%v rootErr=%v, want true/nil", found, rootErr)
 	}
 
 	// Parquet nested in the rotate layout → true.
@@ -116,13 +116,35 @@ func TestLocalBaseHasParquet(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sub, "events.parquet"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !localBaseHasParquet(nested) {
+	if found, _ := localBaseHasParquet(nested); !found {
 		t.Error("nested parquet: want true")
 	}
 
-	// Nonexistent base → false.
-	if localBaseHasParquet(filepath.Join(dir, "nope")) {
-		t.Error("nonexistent base: want false")
+	// Nonexistent base → false with a root error (callers distinguish
+	// "unreadable" from "legitimately pruned" — #383 review).
+	if found, rootErr := localBaseHasParquet(filepath.Join(dir, "nope")); found || rootErr == nil {
+		t.Errorf("nonexistent base: found=%v rootErr=%v, want false/non-nil", found, rootErr)
+	}
+
+	// Unreadable base (no permission bits) → false with a root error.
+	// Skipped for root, who bypasses permissions.
+	if os.Getuid() != 0 {
+		locked := t.TempDir()
+		lockedBase := filepath.Join(locked, "bintrail_id=locked")
+		if err := os.MkdirAll(lockedBase, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(lockedBase, "events.parquet"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(lockedBase, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(lockedBase, 0o755) })
+		found, rootErr := localBaseHasParquet(lockedBase)
+		if found || rootErr == nil {
+			t.Errorf("unreadable base: found=%v rootErr=%v, want false/non-nil", found, rootErr)
+		}
 	}
 }
 

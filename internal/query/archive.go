@@ -70,10 +70,11 @@ func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 		// archive_state row — must not shadow a healthy S3 copy (#383).
 		localExists := false
 		localUsable := false
+		var localRootErr error
 		if localBase != "" {
 			if _, err := os.Stat(localBase); err == nil {
 				localExists = true
-				localUsable = localBaseHasParquet(localBase)
+				localUsable, localRootErr = localBaseHasParquet(localBase)
 			}
 		}
 
@@ -81,10 +82,16 @@ func ResolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 		case localUsable:
 			sources = append(sources, localBase)
 		case s3Source != "":
-			// Warn only for the surprising shadow case (dir exists but is
-			// fileless); a fully-pruned local path falling back to S3 is
-			// the normal post-cleanup state and stays quiet, as before.
-			if localExists {
+			// Warn only for the surprising cases: an UNREADABLE base (a
+			// real local misconfiguration the fallback would otherwise
+			// hide indefinitely) or an existing-but-fileless tree (the
+			// shadow case). A fully-pruned local path falling back to S3
+			// is the normal post-cleanup state and stays quiet, as before.
+			switch {
+			case localRootErr != nil:
+				slog.Warn("local archive base is unreadable; falling back to S3",
+					"bintrail_id", bintrailID, "local_base", localBase, "s3_source", s3Source, "error", localRootErr)
+			case localExists:
 				slog.Warn("local archive base has no parquet files; falling back to S3",
 					"bintrail_id", bintrailID, "local_base", localBase, "s3_source", s3Source)
 			}
@@ -119,10 +126,22 @@ var errFoundParquet = errors.New("found parquet")
 // fail-loud guard, so races between this check and the fetch (files pruned
 // in between) are harmless — worst case the fetch errors and strict mode
 // (#377) reports it.
-func localBaseHasParquet(base string) bool {
-	err := filepath.WalkDir(base, func(_ string, d fs.DirEntry, walkErr error) error {
+//
+// rootErr is non-nil when the BASE ITSELF could not be walked (EACCES,
+// not-a-dir, broken symlink): callers must distinguish "unreadable" from
+// "legitimately pruned" — silently demoting a permission problem to the
+// S3 fallback would hide a real local misconfiguration indefinitely.
+// Unreadable entries DEEPER in the tree are skipped (a routing hint must
+// not abort on one bad leaf); the worst case there is a false "fileless"
+// that the keep-or-fallback routing handles safely.
+func localBaseHasParquet(base string) (found bool, rootErr error) {
+	err := filepath.WalkDir(base, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			// Unreadable entry: skip it, keep scanning the rest.
+			if path == base {
+				// Root unreadable — propagate, don't swallow.
+				return walkErr
+			}
+			// Unreadable entry deeper in: skip it, keep scanning.
 			return nil
 		}
 		if !d.IsDir() && strings.HasSuffix(d.Name(), ".parquet") {
@@ -130,7 +149,10 @@ func localBaseHasParquet(base string) bool {
 		}
 		return nil
 	})
-	return errors.Is(err, errFoundParquet)
+	if errors.Is(err, errFoundParquet) {
+		return true, nil
+	}
+	return false, err
 }
 
 // extractBasePath returns the portion of an archive file path up to and
