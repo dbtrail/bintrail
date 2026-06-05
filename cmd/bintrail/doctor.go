@@ -108,6 +108,31 @@ func queryErrorRemediation(query string) string {
 		"  - Server overloaded — raise the per-check timeout or check server load"
 }
 
+// isUnknownDatabaseErr reports whether err (possibly wrapped) is MySQL error
+// 1049 (ER_BAD_DB, "Unknown database ..."): the DSN names a database that
+// doesn't exist yet. `bintrail init` (and therefore `up`) creates the index
+// database itself, so the index checks must treat 1049 as "probe the server
+// instead", not as a hard failure — the remediation text already promised as
+// much before the behavior matched it (#384).
+func isUnknownDatabaseErr(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1049
+}
+
+// connectWithoutDB reconnects to the DSN's server with the database name
+// stripped (the same DBName="" + FormatDSN pattern as init.go's
+// ensureDatabase, but routed through config.Connect to keep parseTime and
+// the connect timeout), for checks that must run before the index database
+// exists.
+func connectWithoutDB(dsn string) (*sql.DB, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DBName = ""
+	return config.Connect(cfg.FormatDSN())
+}
+
 // runDoctorTo is the testable core of the doctor command. It runs every check
 // against sourceDSN (and optionally indexDSN), renders the report to w using
 // format ("text" or "json"), and returns a non-nil error iff any required
@@ -511,6 +536,23 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) ch
 func checkIndexConnection(ctx context.Context, dsn, dbName string) checkResult {
 	db, err := config.Connect(dsn)
 	if err != nil {
+		// Error 1049 means only the DATABASE is absent — init creates it,
+		// so verify the SERVER is reachable instead of failing (#384).
+		if isUnknownDatabaseErr(err) {
+			if serverDB, serverErr := connectWithoutDB(dsn); serverErr == nil {
+				defer serverDB.Close()
+				var version string
+				if vErr := serverDB.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); vErr == nil {
+					return checkResult{
+						Name:   "Index MySQL connection",
+						Status: statusPass,
+						Detail: fmt.Sprintf("MySQL %s, database=%s (does not exist yet — `bintrail init` will create it)", version, dbName),
+					}
+				}
+			}
+			// Server-level connect/probe also failed: fall through to the
+			// FAIL below with the original, more specific error.
+		}
 		return checkResult{
 			Name:   "Index MySQL connection",
 			Status: statusFail,
@@ -542,6 +584,17 @@ func checkIndexConnection(ctx context.Context, dsn, dbName string) checkResult {
 func checkIndexWriteAccess(ctx context.Context, dsn, dbName string) checkResult {
 	db, err := config.Connect(dsn)
 	if err != nil {
+		// Error 1049: the database is absent. Probe at the server level —
+		// checkIndexWriteAccessOn's SCHEMATA lookup then exercises the
+		// CREATE DATABASE privilege path this check exists to verify (#384).
+		if isUnknownDatabaseErr(err) {
+			if serverDB, serverErr := connectWithoutDB(dsn); serverErr == nil {
+				defer serverDB.Close()
+				return checkIndexWriteAccessOn(ctx, serverDB, dbName)
+			}
+			// Server-level connect also failed: fall through to the FAIL
+			// below with the original, more specific error.
+		}
 		return checkResult{
 			Name:   "Index write access",
 			Status: statusFail,
@@ -559,6 +612,7 @@ func checkIndexWriteAccess(ctx context.Context, dsn, dbName string) checkResult 
 // against an already-open *sql.DB.
 func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) checkResult {
 	// First ensure the database exists. If it doesn't, we need CREATE DATABASE privilege.
+	createdByProbe := false
 	var dbExists string
 	dbErr := db.QueryRowContext(ctx,
 		"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
@@ -577,6 +631,15 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) che
 					"  GRANT ALL PRIVILEGES ON `%s`.* TO <bintrail-user>;", dbName, dbName),
 			}
 		}
+		createdByProbe = true
+		// A diagnostic must not leave server state behind: drop the
+		// probe-created database on every exit path (#384). init re-creates
+		// it for real (CREATE DATABASE IF NOT EXISTS), so nothing is lost.
+		defer func() {
+			if _, dropErr := db.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName)); dropErr != nil {
+				slog.Warn("doctor: could not drop probe-created database", "database", dbName, "error", dropErr)
+			}
+		}()
 	} else if dbErr != nil {
 		return checkResult{
 			Name:   "Index write access",
@@ -614,10 +677,14 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) che
 				"  DROP TABLE %s;", dbName, probeTable),
 		}
 	}
+	detail := "CREATE/DROP TABLE OK"
+	if createdByProbe {
+		detail = fmt.Sprintf("database %q does not exist yet — CREATE DATABASE privilege verified; CREATE/DROP TABLE OK (probe database dropped)", dbName)
+	}
 	return checkResult{
 		Name:   "Index write access",
 		Status: statusPass,
-		Detail: "CREATE/DROP TABLE OK",
+		Detail: detail,
 	}
 }
 

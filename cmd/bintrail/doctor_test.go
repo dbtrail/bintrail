@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-sql-driver/mysql"
 )
 
 func TestExtractGrantUser(t *testing.T) {
@@ -405,6 +406,30 @@ func (r mockSQLScalar) apply(exp *sqlmock.ExpectedQuery, col string) {
 	exp.WillReturnRows(sqlmock.NewRows([]string{col}).AddRow(r.value))
 }
 
+// TestIsUnknownDatabaseErr pins the 1049 detection (#384): it must see
+// through config.Connect's %w wrapping and must NOT match other MySQL
+// errors or plain errors.
+func TestIsUnknownDatabaseErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"wrapped 1049", fmt.Errorf("failed to ping MySQL: %w", &mysql.MySQLError{Number: 1049, Message: "Unknown database 'binlog_index'"}), true},
+		{"bare 1049", &mysql.MySQLError{Number: 1049}, true},
+		{"other mysql error", &mysql.MySQLError{Number: 1064}, false},
+		{"plain error", errors.New("connection refused"), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isUnknownDatabaseErr(tc.err); got != tc.want {
+				t.Errorf("isUnknownDatabaseErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCheckIndexWriteAccessOn(t *testing.T) {
 	const dbName = "binlog_index"
 
@@ -429,16 +454,33 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 			wantDetailFrag: "CREATE/DROP TABLE OK",
 		},
 		{
-			name: "db missing, create database succeeds, then create+drop OK",
+			name: "db missing, create database succeeds, then create+drop OK, probe db dropped",
 			setup: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
 					WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}))
 				m.ExpectExec("CREATE DATABASE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 				m.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 				m.ExpectExec("DROP TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
+				// A diagnostic must not leave server state behind (#384):
+				// the probe-created database is dropped via defer.
+				m.ExpectExec("DROP DATABASE IF EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 			},
 			wantStatus:     statusPass,
 			wantDetailFrag: "CREATE/DROP TABLE OK",
+		},
+		{
+			name: "db missing, created by probe, CREATE TABLE denied — probe db still dropped",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
+					WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}))
+				m.ExpectExec("CREATE DATABASE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+				m.ExpectExec("CREATE TABLE IF NOT EXISTS").
+					WillReturnError(errors.New("CREATE command denied"))
+				// Cleanup runs on the FAIL path too (#384).
+				m.ExpectExec("DROP DATABASE IF EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+			},
+			wantStatus:     statusFail,
+			wantDetailFrag: "cannot CREATE TABLE",
 		},
 		{
 			name: "db missing, create database denied",

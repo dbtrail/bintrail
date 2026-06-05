@@ -18,12 +18,6 @@
 CREATE USER 'bintrail'@'127.0.0.1' IDENTIFIED WITH mysql_native_password BY 'bintrail';
 GRANT ALL PRIVILEGES ON *.* TO 'bintrail'@'127.0.0.1';
 
--- Pre-create the index DB: `bintrail doctor` (run by `up`) pings the
--- full index DSN and fails on Error 1049 when the database named in it
--- doesn't exist yet — despite init being able to create it. (Doctor
--- contradiction tracked upstream; pre-creating costs nothing here.)
-CREATE DATABASE IF NOT EXISTS bintrail_index;
-
 CREATE USER 'demo'@'%' IDENTIFIED WITH mysql_native_password BY 'demo';
 
 CREATE DATABASE IF NOT EXISTS demo;
