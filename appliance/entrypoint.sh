@@ -146,7 +146,12 @@ cat <<'BANNER'
 BANNER
 
 # ── Supervise ───────────────────────────────────────────────
-# If any component exits, the demo is broken — die loudly.
-wait -n
-log "A component exited unexpectedly; shutting the appliance down."
+# If any component exits, the demo is broken — die loudly. The `|| rc=$?`
+# guard matters: a child crashing non-zero would otherwise trip set -e AT
+# the `wait -n` line itself, skipping the diagnostic below and exiting
+# with the child's code — exactly the silent half-failure this block
+# exists to prevent.
+rc=0
+wait -n || rc=$?
+log "A component exited unexpectedly (status ${rc}); shutting the appliance down."
 exit 1

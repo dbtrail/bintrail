@@ -27,8 +27,15 @@ mysql_cmd() {
           "$@"
 }
 
+# Churn is best-effort: a transient failure (lock-wait timeout, brief
+# connection blip, the outer `timeout 60` firing) must NOT abort the
+# loop — under set -e an unguarded failure would exit this script, and
+# the entrypoint's fail-loud supervisor would then tear down the whole
+# appliance over a hiccup in non-essential traffic. Log and keep going;
+# the next cycle retries the same statement shapes anyway.
 sql() {
-    mysql_cmd "$MYSQL_DB" -e "$1"
+    mysql_cmd "$MYSQL_DB" -e "$1" \
+        || log "statement failed (rc=$?, transient?), continuing"
 }
 
 log() { echo "[traffic] $(date '+%H:%M:%S') $*"; }
