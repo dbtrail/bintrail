@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-sql-driver/mysql"
 )
 
 func TestExtractGrantUser(t *testing.T) {
@@ -405,6 +406,65 @@ func (r mockSQLScalar) apply(exp *sqlmock.ExpectedQuery, col string) {
 	exp.WillReturnRows(sqlmock.NewRows([]string{col}).AddRow(r.value))
 }
 
+// TestCheckIndexWriteAccessOnNeverDropsPreexistingDB is the data-loss guard
+// for #384's probe cleanup: when the database PRE-EXISTS (SCHEMATA finds it),
+// no DROP DATABASE may ever be issued. The trick: register a DROP DATABASE
+// expectation and assert ExpectationsWereMet() ERRORS with it unfulfilled —
+// a spurious drop would fulfil it and turn this test red. (The production
+// dropErr is swallowed into slog.Warn, so an unexpected-call error from
+// sqlmock would otherwise be invisible to assertions.)
+func TestCheckIndexWriteAccessOnNeverDropsPreexistingDB(t *testing.T) {
+	const dbName = "binlog_index"
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
+		WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}).AddRow(dbName))
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("DROP TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
+	// Sentinel: must remain UNFULFILLED.
+	mock.ExpectExec("DROP DATABASE").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	got := checkIndexWriteAccessOn(t.Context(), db, dbName)
+	if got.Status != statusPass {
+		t.Fatalf("Status = %q, want pass (detail=%q)", got.Status, got.Detail)
+	}
+	err = mock.ExpectationsWereMet()
+	if err == nil {
+		t.Fatal("DROP DATABASE expectation was fulfilled — a pre-existing database was dropped by the probe")
+	}
+	if !strings.Contains(err.Error(), "DROP DATABASE") {
+		t.Fatalf("expected the unmet expectation to be DROP DATABASE, got: %v", err)
+	}
+}
+
+// TestIsUnknownDatabaseErr pins the 1049 detection (#384): it must see
+// through config.Connect's %w wrapping and must NOT match other MySQL
+// errors or plain errors.
+func TestIsUnknownDatabaseErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"wrapped 1049", fmt.Errorf("failed to ping MySQL: %w", &mysql.MySQLError{Number: 1049, Message: "Unknown database 'binlog_index'"}), true},
+		{"bare 1049", &mysql.MySQLError{Number: 1049}, true},
+		{"other mysql error", &mysql.MySQLError{Number: 1064}, false},
+		{"plain error", errors.New("connection refused"), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isUnknownDatabaseErr(tc.err); got != tc.want {
+				t.Errorf("isUnknownDatabaseErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCheckIndexWriteAccessOn(t *testing.T) {
 	const dbName = "binlog_index"
 
@@ -429,16 +489,33 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 			wantDetailFrag: "CREATE/DROP TABLE OK",
 		},
 		{
-			name: "db missing, create database succeeds, then create+drop OK",
+			name: "db missing, create database succeeds, then create+drop OK, probe db dropped",
 			setup: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
 					WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}))
 				m.ExpectExec("CREATE DATABASE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 				m.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 				m.ExpectExec("DROP TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
+				// A diagnostic must not leave server state behind (#384):
+				// the probe-created database is dropped via defer.
+				m.ExpectExec("DROP DATABASE IF EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 			},
 			wantStatus:     statusPass,
 			wantDetailFrag: "CREATE/DROP TABLE OK",
+		},
+		{
+			name: "db missing, created by probe, CREATE TABLE denied — probe db still dropped",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
+					WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}))
+				m.ExpectExec("CREATE DATABASE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+				m.ExpectExec("CREATE TABLE IF NOT EXISTS").
+					WillReturnError(errors.New("CREATE command denied"))
+				// Cleanup runs on the FAIL path too (#384).
+				m.ExpectExec("DROP DATABASE IF EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+			},
+			wantStatus:     statusFail,
+			wantDetailFrag: "cannot CREATE TABLE",
 		},
 		{
 			name: "db missing, create database denied",
