@@ -167,6 +167,17 @@ func TestResolveUpConsoleEnv(t *testing.T) {
 		upConsoleListen, upConsoleToken, upConsoleBaselineDir, upConsoleBaselineS3 = saved[0], saved[1], saved[2], saved[3]
 	})
 
+	// The four flag names below must exist on the REAL upCmd, or this test
+	// would happily pass against a synthetic clone while production drifted
+	// (a rename in init() not mirrored in resolveUpConsoleEnv would make
+	// Changed() return false for the real flag → env silently overriding an
+	// explicit flag). Pin the names to upCmd before exercising the resolver.
+	for _, name := range []string{"console-listen", "console-token", "baseline-dir", "baseline-s3"} {
+		if upCmd.Flags().Lookup(name) == nil {
+			t.Fatalf("flag --%s not registered on upCmd; resolveUpConsoleEnv's Changed(%q) would always be false", name, name)
+		}
+	}
+
 	// newCmd registers the same flag names as upCmd, bound to the same
 	// globals, so Changed() reflects what cobra would see in a real run.
 	newCmd := func() *cobra.Command {
@@ -208,4 +219,18 @@ func TestResolveUpConsoleEnv(t *testing.T) {
 	assertStr(t, "upConsoleToken (flag)", upConsoleToken, "flag-tok")
 	assertStr(t, "upConsoleBaselineDir (flag)", upConsoleBaselineDir, "/flag/baselines")
 	assertStr(t, "upConsoleBaselineS3 (flag)", upConsoleBaselineS3, "s3://flag-bucket/p/")
+
+	// Exported-but-EMPTY env vars must be a no-op (the `v != ""` guard):
+	// a refactor to os.LookupEnv-with-ok would make an empty export clobber
+	// a non-empty default like console-listen's 127.0.0.1:8090 with "".
+	t.Setenv("BINTRAIL_CONSOLE_LISTEN", "")
+	t.Setenv("BINTRAIL_CONSOLE_TOKEN", "")
+	t.Setenv("BINTRAIL_CONSOLE_BASELINE_DIR", "")
+	t.Setenv("BINTRAIL_CONSOLE_BASELINE_S3", "")
+	upConsoleListen, upConsoleToken, upConsoleBaselineDir, upConsoleBaselineS3 = "127.0.0.1:8090", "tok", "/dir", "s3://b/p/"
+	resolveUpConsoleEnv(newCmd())
+	assertStr(t, "upConsoleListen (empty env)", upConsoleListen, "127.0.0.1:8090")
+	assertStr(t, "upConsoleToken (empty env)", upConsoleToken, "tok")
+	assertStr(t, "upConsoleBaselineDir (empty env)", upConsoleBaselineDir, "/dir")
+	assertStr(t, "upConsoleBaselineS3 (empty env)", upConsoleBaselineS3, "s3://b/p/")
 }
