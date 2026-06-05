@@ -19,17 +19,18 @@
 //
 //	SELECT /*+ DBTRAIL_AT='<ts>' */ * FROM [<schema>.]<table> [WHERE <col> = <value>]
 //
-// And a fifth (#385), the bare README-tagline form — time-travel
-// syntax directly on a real table, with the AS OF clause ENDING the
-// statement — also rewritten to _flashback:
-//
-//	SELECT * FROM [<schema>.]<table> [WHERE <col> = <value>] AS OF [TIMESTAMP] '<ts>'
-//
 // This is friendlier for ORMs (Hibernate, Sequelize, etc.) that
 // can't easily rewrite the FROM clause from app code. ProxySQL's
 // docs-advertised `DBTRAIL_AT` routing rule matches this form and
 // forwards it to the shim hostgroup; the shim then transparently
 // time-travels the original table. See issue #288.
+//
+// And a fifth, the bare README-tagline form — time-travel syntax
+// directly on a real table, with the AS OF clause ENDING the
+// statement — also rewritten to _flashback. Routed by the
+// end-anchored ProxySQL rule 990006; see issue #385:
+//
+//	SELECT * FROM [<schema>.]<table> [WHERE <col> = <value>] AS OF [TIMESTAMP] '<ts>'
 //
 // _flashback returns the row's state at-or-before the AS OF instant,
 //   resolved purely from indexed binlog events (binlog-only).
@@ -198,6 +199,11 @@ var (
 			`(?:\s+WHERE\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('[^']*'|-?\d+))?` +
 			`\s+AS\s+OF\s+(?:TIMESTAMP\s+)?'([^']+)'\s*;?\s*$`,
 	)
+
+	// virtualFromRE is Parse()'s virtual-schema screen, anchored to FROM
+	// position so a `_<virtual>.` substring inside a string literal cannot
+	// divert a non-virtual query away from the bare-AS-OF path (#385).
+	virtualFromRE = regexp.MustCompile(`(?i)\bfrom\s+_(flashback|snapshot|diff)\.`)
 )
 
 // mustCompileAsOf builds a regex for `_flashback` / `_snapshot` shapes.
@@ -279,12 +285,14 @@ func Parse(sql, defaultSchema string) (TimeTravelQuery, error) {
 		return parseHintForm(trimmed, defaultSchema)
 	}
 
-	// Quick prefix screen so non-virtual queries pay only one
-	// strings.Contains, not three regex matches.
-	lower := strings.ToLower(trimmed)
-	if !strings.Contains(lower, "_flashback.") &&
-		!strings.Contains(lower, "_snapshot.") &&
-		!strings.Contains(lower, "_diff.") {
+	// Virtual-schema screen, confined to FROM position. A plain
+	// strings.Contains screen would fire on `_flashback.`/`_snapshot.`/
+	// `_diff.` ANYWHERE — including inside a WHERE-clause string literal —
+	// and divert a well-formed bare AS OF query (#385) into the virtual
+	// matchers below, which all miss → 1064, even though ProxySQL rule
+	// 990006 routed it here expecting time travel. All three virtual
+	// matchers require the prefix in FROM position anyway.
+	if !virtualFromRE.MatchString(trimmed) {
 		// Bare AS OF on a real table (#385). Deliberately gated INSIDE
 		// the non-virtual branch: `_flashback.orders AS OF '…'` would
 		// otherwise also match asOfRealRE (identifiers may start with

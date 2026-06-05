@@ -399,6 +399,41 @@ func TestParseBareAsOfLiteralGuard(t *testing.T) {
 	}
 }
 
+// TestParseBareAsOfVirtualSubstringInLiteral covers the review finding on
+// the old strings.Contains screen: a bare AS OF query whose WHERE value
+// contains `_diff.`/`_snapshot.`/`_flashback.` inside a string literal must
+// still parse as the bare form — the virtual screen is confined to FROM
+// position (virtualFromRE), because ProxySQL rule 990006 routes these to
+// the shim expecting time travel and the old screen diverted them into the
+// virtual matchers (all miss → 1064).
+func TestParseBareAsOfVirtualSubstringInLiteral(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT * FROM reports WHERE filename = 'data_diff.csv' AS OF '2026-01-01'",
+		"SELECT * FROM reports WHERE path = '_snapshot.json' AS OF '2026-01-01'",
+		"SELECT * FROM logs WHERE msg = 'see _flashback.txt' AS OF '2026-01-01'",
+	} {
+		q, err := Parse(sql, "myapp")
+		if err != nil {
+			t.Errorf("Parse(%q) error = %v, want bare-form parse", sql, err)
+			continue
+		}
+		if q.Type != TypeFlashback || q.Schema != "myapp" {
+			t.Errorf("Parse(%q) = %+v, want bare TypeFlashback in myapp", sql, q)
+		}
+	}
+
+	// Without AS OF, the same literals stay ErrNotTimeTravel (benign
+	// queries — and rule 990006 would not route them either).
+	for _, sql := range []string{
+		"SELECT * FROM logs WHERE msg = 'see _flashback.txt'",
+		"SELECT * FROM reports WHERE filename = 'data_diff.csv' ORDER BY id",
+	} {
+		if _, err := Parse(sql, "myapp"); !errors.Is(err, ErrNotTimeTravel) {
+			t.Errorf("Parse(%q) error = %v, want ErrNotTimeTravel", sql, err)
+		}
+	}
+}
+
 // TestParseBareAsOfDispatchRegression proves the dispatch-order trap is
 // handled: identifiers may start with `_`, so a naive bare-AS-OF matcher
 // would claim `_flashback.orders AS OF '…'` with schema="_flashback". The
@@ -438,6 +473,10 @@ func TestParseBareAsOfMalformed(t *testing.T) {
 		{"SELECT id, total FROM orders WHERE id = 1 AS OF '2026-06-05'", "malformed time-travel query"},
 		{"SELECT * FROM orders WHERE id = 1 AS OF 'not-a-time'", "invalid AS OF timestamp"},
 		{"SELECT * FROM orders WHERE id IN (1,2) AS OF '2026-06-05'", "malformed time-travel query"},
+		// Aggregates and backticked identifiers are out of the bare
+		// grammar — clean 1064 with grammar help, never a misparse.
+		{"SELECT COUNT(*) FROM orders AS OF '2026-06-05'", "malformed time-travel query"},
+		{"SELECT * FROM `orders` WHERE id = 1 AS OF '2026-06-05'", "malformed time-travel query"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.sql, func(t *testing.T) {
