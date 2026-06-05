@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
 )
@@ -1192,4 +1194,82 @@ func TestPrefetchAllPropagatesDownloadError(t *testing.T) {
 	if leftover := remainingFiles(t, dir); len(leftover) != 0 {
 		t.Errorf("temp files leaked: %v", leftover)
 	}
+}
+
+// ─── classifyEmptyS3Listing (#383 stale-registration probe) ──────────────────
+
+// TestClassifyEmptyS3Listing pins the zero-files decision table for S3
+// sources. The probe is faked via the s3BaseHasParquet package var (the
+// downloadFn precedent); the real probe's pagination is plain ListObjectsV2
+// iteration validated by inspection — what matters behaviorally is what
+// Fetch DOES with the probe's answer, which is what this table covers.
+func TestClassifyEmptyS3Listing(t *testing.T) {
+	const source = "s3://bkt/events/bintrail_id=abc"
+	since := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)
+	saved := s3BaseHasParquet
+	t.Cleanup(func() { s3BaseHasParquet = saved })
+
+	t.Run("scoped listing, probe finds parquet → healthy empty range", func(t *testing.T) {
+		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, bucket, prefix string) (bool, error) {
+			if bucket != "bkt" || !strings.HasPrefix(prefix, "events/bintrail_id=abc") {
+				t.Errorf("probe got bucket=%q prefix=%q", bucket, prefix)
+			}
+			return true, nil
+		}
+		rows, err := classifyEmptyS3Listing(context.Background(), nil, source, &since, &until)
+		if err != nil || rows != nil {
+			t.Errorf("got rows=%v err=%v, want nil/nil (legitimately empty range)", rows, err)
+		}
+	})
+
+	t.Run("scoped listing, probe finds nothing → stale registration", func(t *testing.T) {
+		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) { return false, nil }
+		_, err := classifyEmptyS3Listing(context.Background(), nil, source, &since, &until)
+		var emptyErr *query.SourceEmptyError
+		if !errors.As(err, &emptyErr) {
+			t.Fatalf("err = %v, want *query.SourceEmptyError", err)
+		}
+		if emptyErr.Source != source {
+			t.Errorf("Source = %q, want %q", emptyErr.Source, source)
+		}
+	})
+
+	t.Run("scoped listing, probe errors → transient error, NOT SourceEmpty", func(t *testing.T) {
+		probeErr := errors.New("AccessDenied (intentional)")
+		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) { return false, probeErr }
+		_, err := classifyEmptyS3Listing(context.Background(), nil, source, &since, &until)
+		if !errors.Is(err, probeErr) {
+			t.Fatalf("err = %v, want wrapped probe error", err)
+		}
+		var emptyErr *query.SourceEmptyError
+		if errors.As(err, &emptyErr) {
+			t.Error("a transient probe failure must not be classified as SourceEmpty")
+		}
+	})
+
+	t.Run("unscoped listing (nil bounds) → SourceEmpty directly, probe NOT called", func(t *testing.T) {
+		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) {
+			t.Fatal("probe must not run when the listing was already unscoped")
+			return false, nil
+		}
+		_, err := classifyEmptyS3Listing(context.Background(), nil, source, nil, nil)
+		var emptyErr *query.SourceEmptyError
+		if !errors.As(err, &emptyErr) {
+			t.Fatalf("err = %v, want *query.SourceEmptyError", err)
+		}
+	})
+
+	t.Run("unscoped listing (range > maxScopedDays) → SourceEmpty directly", func(t *testing.T) {
+		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) {
+			t.Fatal("probe must not run for an unscoped wide range")
+			return false, nil
+		}
+		wideSince := until.AddDate(0, 0, -(maxScopedDays + 5))
+		_, err := classifyEmptyS3Listing(context.Background(), nil, source, &wideSince, &until)
+		var emptyErr *query.SourceEmptyError
+		if !errors.As(err, &emptyErr) {
+			t.Fatalf("err = %v, want *query.SourceEmptyError", err)
+		}
+	})
 }

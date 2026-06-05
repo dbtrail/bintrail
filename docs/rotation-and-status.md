@@ -242,6 +242,48 @@ Results from the live MySQL index and from Parquet archives are merged, deduplic
 
 ---
 
+## Reconciling `archive_state` With Reality
+
+`archive_state` is a **rebuildable cache** over the self-describing archive
+layout, not a fragile source of truth. If the registry and the files drift —
+the index database was rebuilt (rows lost), or archived Parquet files were
+pruned while their rows remained — `bintrail archive reconcile` re-syncs them:
+
+```sh
+# cron drift monitor: read-only, exits non-zero when drift exists
+bintrail archive reconcile --index-dsn "$IDX" \
+  --archive-dir /var/lib/bintrail/archives --archive-s3 s3://bkt/archives/
+
+# rebuild the registry after an index loss
+bintrail archive reconcile --index-dsn "$IDX" --archive-s3 s3://bkt/archives/ --repair
+
+# also delete registrations whose files are gone from every referenced backend
+bintrail archive reconcile --index-dsn "$IDX" \
+  --archive-dir /var/lib/bintrail/archives --archive-s3 s3://bkt/archives/ \
+  --repair --prune
+```
+
+It scans the given backends for `bintrail_id=<uuid>/event_date=<d>/event_hour=<h>/*.parquet`
+files and diffs against `archive_state` in three buckets: **files without
+rows** (`--repair` re-registers them — sizes from the listing/stat, row counts
+from the Parquet footer for local files), **rows without files** (`--prune`
+deletes the registry row; data files are never touched), and **metadata
+drift** (`--repair` updates; row-count verification of existing rows costs a
+footer read per file and is gated behind `--deep`).
+
+Safety rules worth knowing:
+
+- **Backend-scoped:** a row is only a prune candidate when *every* backend it
+  references was scanned by this invocation and held no file. An S3-referenced
+  row during an `--archive-dir`-only run is reported as *unverified*, never
+  pruned — and repair never touches the columns of a backend it didn't scan.
+- **Concurrency margin:** rows younger than `--prune-min-age` (default `1h`)
+  are never pruned; a concurrent `rotate` may still be mid-write.
+- **No phantom pending uploads:** when reconcile confirms an S3 object, it
+  stamps `s3_uploaded_at` — a row with `s3_bucket` set but no stamp reads as
+  an upload still in flight, which makes `rotate` refuse to drop that
+  partition.
+
 ## Status Command
 
 ```sh

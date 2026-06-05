@@ -75,8 +75,7 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 		files = sortFilesByHour(files)
 		slog.Debug("files after time-range pruning", "count", len(files))
 		if len(files) == 0 {
-			slog.Warn("no .parquet files found in S3 archive source", "source", source)
-			return nil, nil
+			return classifyEmptyS3Listing(ctx, s3Client, source, opts.Since, opts.Until)
 		}
 
 		dl := newS3Downloader(s3Client)
@@ -275,6 +274,69 @@ func generateDatePrefixes(basePrefix string, since, until *time.Time) []string {
 		prefixes = append(prefixes, basePrefix+"event_date="+day.Format("2006-01-02")+"/")
 	}
 	return prefixes
+}
+
+// classifyEmptyS3Listing decides what a zero-file S3 listing means (#383).
+// The listing is DATE-SCOPED when the query has a usable time range, so
+// "no files" is ambiguous: a healthy source with a legitimately empty
+// range (fine — empty result), or a REGISTERED source whose objects
+// vanished after archive_state was written (stale registration — must
+// fail loud: the planner already counted these hours as covered).
+// Disambiguates with one unscoped probe of the base prefix. When the
+// listing was NOT scoped (nil bounds, or range > maxScopedDays per
+// generateDatePrefixes), zero files already IS the unscoped truth — the
+// source is empty, no probe needed.
+//
+// Extracted from Fetch's S3 branch so the decision table is unit-testable
+// with a faked s3BaseHasParquet (the function itself never touches the
+// client — it only forwards it to the probe).
+func classifyEmptyS3Listing(ctx context.Context, client *s3.Client, source string, since, until *time.Time) ([]query.ResultRow, error) {
+	bucket, prefix, err := parseS3Source(source)
+	if err != nil {
+		return nil, fmt.Errorf("parse S3 archive source: %w", err)
+	}
+	if generateDatePrefixes(prefix, since, until) != nil {
+		has, probeErr := s3BaseHasParquet(ctx, client, bucket, prefix)
+		if probeErr != nil {
+			return nil, fmt.Errorf("probe S3 archive source %s: %w", source, probeErr)
+		}
+		if has {
+			slog.Warn("no .parquet files in the queried date range (source itself is healthy)", "source", source)
+			return nil, nil
+		}
+	}
+	return nil, &query.SourceEmptyError{Source: source}
+}
+
+// s3BaseHasParquet reports whether ANY .parquet object exists under
+// bucket/prefix, regardless of date. It is the stale-registration probe
+// (#383): a registered source whose date-scoped listing came back empty is
+// only healthy if the base prefix still holds parquet somewhere. It
+// paginates past non-parquet keys — a MaxKeys=1 shortcut would false-report
+// "empty" when the lexicographically-first key is a _SUCCESS marker, a
+// cosign .sig, or an inventory manifest. Package var so tests can inject a
+// fake (the downloadFn precedent — the real client needs live S3).
+var s3BaseHasParquet = func(ctx context.Context, client *s3.Client, bucket, prefix string) (bool, error) {
+	var token *string
+	for {
+		out, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            &bucket,
+			Prefix:            &prefix,
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return false, err
+		}
+		for _, obj := range out.Contents {
+			if obj.Key != nil && strings.HasSuffix(*obj.Key, ".parquet") {
+				return true, nil
+			}
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			return false, nil
+		}
+		token = out.NextContinuationToken
+	}
 }
 
 // s3Downloader holds a reusable S3 client to avoid re-creating AWS config

@@ -33,6 +33,29 @@ func (e *GapError) Error() string {
 	return FormatGapWarning(e.GapHours)
 }
 
+// SourceEmptyError is returned by an ArchiveFetcher when a REGISTERED
+// archive source (an archive_state row) turns out to hold no Parquet data
+// at all — distinct from a source that is healthy but has no data in the
+// queried date range (which is an empty result, not an error). It signals
+// stale registration: the files were deleted or moved after archive_state
+// was written (#383). Under AllowGaps=false this aborts the query like any
+// archive-source failure; programmatic callers can detect it with
+// errors.As to attach remediation (e.g. `bintrail archive reconcile`).
+//
+// Like GapError, the Error() string is library-neutral (no CLI command or
+// flag names) — CLI callers re-wrap with their own hint at the call site.
+//
+// Defined here rather than in parquetquery because parquetquery imports
+// this package (ResultRow/Options) — the reverse import would cycle.
+type SourceEmptyError struct {
+	// Source is the archive source path (local base dir or s3:// prefix).
+	Source string
+}
+
+func (e *SourceEmptyError) Error() string {
+	return fmt.Sprintf("registered archive source %s contains no parquet data (stale archive_state registration?)", e.Source)
+}
+
 // FetchMergedOptions controls the behavior of FetchMerged. It is the
 // cross-source orchestrator layer on top of Engine.Fetch + an injected
 // archive fetcher, used by bintrail recover, single-row bintrail reconstruct,
