@@ -75,8 +75,17 @@ func init() {
 
 // archivePathRe matches the Hive-partitioned archive path pattern produced by
 // rotate --archive-dir: bintrail_id=<uuid>/event_date=YYYY-MM-DD/event_hour=HH/events.parquet
+// archivePathRe accepts ANY non-empty id segment — exactly what the writer
+// produces: rotate's --bintrail-id takes an arbitrary string verbatim, and
+// the discovery side (extractBasePath, buildGlob) matches on the
+// `bintrail_id=` marker alone. A scanner stricter than the writer (this
+// regex used to demand a 36-char lowercase UUID) silently skipped every
+// file under an uppercase or human-named id — harmless for upload's
+// UPDATE-only flow, but blinding for `archive reconcile`, where a blind
+// scan plus --prune would wipe the registry of healthy archives (#392
+// review).
 var archivePathRe = regexp.MustCompile(
-	`bintrail_id=([0-9a-f-]{36})/event_date=(\d{4}-\d{2}-\d{2})/event_hour=(0[0-9]|1[0-9]|2[0-3])/[^/]+\.parquet$`,
+	`bintrail_id=([^/]+)/event_date=(\d{4}-\d{2}-\d{2})/event_hour=(0[0-9]|1[0-9]|2[0-3])/[^/]+\.parquet$`,
 )
 
 // parseArchivePath extracts the bintrail_id and partition name from a

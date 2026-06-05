@@ -472,6 +472,13 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 	}
 	reports, err := reconstruct.ReconstructTables(cmd.Context(), cfg)
 	if err != nil {
+		// Same CLI-layer hint as single-row reconstruct (the %w chain
+		// survives ReconstructTables' errors.Join, so errors.As still
+		// unwraps the library type).
+		var emptyErr *query.SourceEmptyError
+		if errors.As(err, &emptyErr) {
+			return fmt.Errorf("full-table reconstruct: %w; run `bintrail archive reconcile` to re-sync archive_state with storage, or pass --allow-gaps to proceed without that source", err)
+		}
 		return fmt.Errorf("full-table reconstruct: %w", err)
 	}
 

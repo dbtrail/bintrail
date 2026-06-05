@@ -149,8 +149,19 @@ func TestArchiveReconcilePruneGates(t *testing.T) {
 		(partition_name, bintrail_id, local_path, row_count, archived_at)
 		VALUES ('p_2026060412', 'recent-orphan-aaa-aaaa-aaaaaaaaaaaa', '/nonexistent2/bintrail_id=y/events.parquet', 5, UTC_TIMESTAMP())`)
 
-	emptyDir := t.TempDir() // local scan finds nothing
-	files, err := scanLocalArchive(emptyDir)
+	// The scan dir holds ONE unrelated layout file: testimony that the
+	// scanner can see the layout (an empty scan refuses to prune — the
+	// blind-scanner gate).
+	scanDir := t.TempDir()
+	witness := filepath.Join(scanDir, "bintrail_id=witness-id-0000-0000-000000000000",
+		"event_date=2026-06-04", "event_hour=09", "events.parquet")
+	if err := os.MkdirAll(filepath.Dir(witness), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(witness, []byte("not-a-real-parquet"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files, err := scanLocalArchive(scanDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,6 +173,9 @@ func TestArchiveReconcilePruneGates(t *testing.T) {
 	rep := archive.Diff(files, rows, archive.DiffOptions{
 		ScannedLocal: true, ScannedS3: false, PruneMinAge: time.Hour, Now: time.Now().UTC(),
 	})
+	if rep.Inserts != 1 { // the witness file has no row — expected
+		t.Errorf("witness should be an insert candidate, got %+v", rep)
+	}
 	if rep.SkippedUnverified != 1 {
 		t.Errorf("S3-only row under a local-only scan must be skip-unverified, got %+v", rep)
 	}

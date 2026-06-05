@@ -167,17 +167,32 @@ func TestDiffPruneSafety(t *testing.T) {
 		}
 	})
 
-	t.Run("full scan, nothing found → prune candidate", func(t *testing.T) {
-		rep := Diff(nil, []StateRow{s3OnlyRow}, bothScanned())
+	t.Run("full scan with testimony, target's files gone → prune candidate", func(t *testing.T) {
+		// An unrelated S3 file proves the scan can see the layout
+		// (testimony); the target row's own files are gone → prunable.
+		witness := s3File("p_2026060409", "other-id", "bkt", "w/events.parquet", 1)
+		rep := Diff([]ScannedFile{witness}, []StateRow{s3OnlyRow}, bothScanned())
 		if rep.Prunes != 1 {
 			t.Fatalf("want prune candidate, got %+v", rep)
+		}
+	})
+
+	t.Run("blind scanner: zero files seen in the referenced backend → never pruned", func(t *testing.T) {
+		// The scan ran (flag present) but saw NOTHING — wrong directory,
+		// or a scanner blind spot. It cannot distinguish "all orphaned"
+		// from "I am blind", so pruning on its testimony is forbidden
+		// (the registry-wipe trap from the #392 adversarial review).
+		rep := Diff(nil, []StateRow{s3OnlyRow}, bothScanned())
+		if rep.Prunes != 0 || rep.SkippedUnverified != 1 {
+			t.Fatalf("empty-scan prune must be refused, got %+v", rep)
 		}
 	})
 
 	t.Run("recent row inside the margin → skip-recent", func(t *testing.T) {
 		recent := s3OnlyRow
 		recent.ArchivedAt = tNow.Add(-10 * time.Minute)
-		rep := Diff(nil, []StateRow{recent}, bothScanned())
+		witness := s3File("p_2026060409", "other-id", "bkt", "w/events.parquet", 1)
+		rep := Diff([]ScannedFile{witness}, []StateRow{recent}, bothScanned())
 		if rep.Prunes != 0 || rep.SkippedRecent != 1 {
 			t.Fatalf("recent row must be skip-recent, got %+v", rep)
 		}

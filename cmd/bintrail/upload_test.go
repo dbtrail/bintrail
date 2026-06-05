@@ -162,6 +162,22 @@ func TestParseArchivePath(t *testing.T) {
 			wantPart: "p_2026123123",
 		},
 		{
+			// The id segment accepts anything the writer accepts: rotate's
+			// --bintrail-id is an arbitrary string. A scanner stricter than
+			// the writer blinded `archive reconcile` (#392 review) — these
+			// pin the alignment.
+			name:     "uppercase UUID (writer-aligned)",
+			path:     "/d/bintrail_id=550E8400-E29B-41D4-A716-446655440000/event_date=2026-03-01/event_hour=14/events.parquet",
+			wantID:   "550E8400-E29B-41D4-A716-446655440000",
+			wantPart: "p_2026030114",
+		},
+		{
+			name:     "human-named id (writer-aligned)",
+			path:     "/d/bintrail_id=prod-db-1/event_date=2026-03-01/event_hour=14/events.parquet",
+			wantID:   "prod-db-1",
+			wantPart: "p_2026030114",
+		},
+		{
 			name:     "no match - baseline path",
 			path:     "/data/baselines/2026-03-01T00-00-00Z/mydb/orders.parquet",
 			wantID:   "",

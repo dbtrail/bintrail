@@ -169,6 +169,22 @@ func Diff(files []ScannedFile, rows []StateRow, opts DiffOptions) Report {
 		stateByKey[key{r.PartitionName, r.BintrailID}] = r
 	}
 
+	// Per-backend scan testimony: did the scan SEE any layout file at all?
+	// A scan that found zero files cannot distinguish "everything is
+	// orphaned" from "wrong --archive-dir/--archive-s3, or a scanner blind
+	// spot" — and the latter plus --prune would wipe the registry of
+	// healthy archives. Pruning on a backend's testimony requires that
+	// backend's scan to have proven it can see the layout (≥1 file).
+	localSaw, s3Saw := false, false
+	for i := range files {
+		switch files[i].Backend {
+		case BackendLocal:
+			localSaw = true
+		case BackendS3:
+			s3Saw = true
+		}
+	}
+
 	var report Report
 
 	// Pass 1: scanned files → inserts for keys with no row, updates for
@@ -212,6 +228,15 @@ func Diff(files []ScannedFile, rows []StateRow, opts DiffOptions) Report {
 			report.add(Action{
 				Kind: ActionSkipUnverified, PartitionName: k.partition, BintrailID: k.bintrailID,
 				Reason: "row references a backend this invocation did not scan; rescan with that backend before pruning",
+			})
+			continue
+		}
+		// Blind-scanner gate: a scanned backend whose scan saw ZERO layout
+		// files anywhere provides no testimony — refuse to prune on it.
+		if (refsLocal && !localSaw) || (refsS3 && !s3Saw) {
+			report.add(Action{
+				Kind: ActionSkipUnverified, PartitionName: k.partition, BintrailID: k.bintrailID,
+				Reason: "the scan found no archive-layout files at all in a referenced backend (wrong --archive-dir/--archive-s3?); refusing to prune on an empty scan",
 			})
 			continue
 		}

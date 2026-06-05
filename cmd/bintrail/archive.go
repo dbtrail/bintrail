@@ -155,15 +155,20 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 		// Dry-run: non-zero exit on any drift (the cron monitor contract).
 		return report.Err()
 	}
-	// Execute mode: only UNEXECUTED drift remains an error (e.g. prune
-	// candidates without --prune, unverified/recent skips).
-	remaining := report.Prunes
-	if arcPrune {
-		remaining = 0
+	// Execute mode: exit 0 ⟺ no unaddressed drift remains. EVERY action
+	// this invocation's flags didn't execute counts — --prune without
+	// --repair must not silently mask insert/update drift the dry-run
+	// would have flagged (and vice versa).
+	pendingRepairs, pendingPrunes := 0, 0
+	if !arcRepair {
+		pendingRepairs = report.Inserts + report.Updates
 	}
-	if remaining+report.SkippedUnverified+report.SkippedRecent > 0 {
-		return fmt.Errorf("drift remains: %d prune candidate(s) (need --prune), %d unverified, %d too recent",
-			remaining, report.SkippedUnverified, report.SkippedRecent)
+	if !arcPrune {
+		pendingPrunes = report.Prunes
+	}
+	if pendingRepairs+pendingPrunes+report.SkippedUnverified+report.SkippedRecent > 0 {
+		return fmt.Errorf("drift remains: %d insert/update(s) (need --repair), %d prune candidate(s) (need --prune), %d unverified, %d too recent",
+			pendingRepairs, pendingPrunes, report.SkippedUnverified, report.SkippedRecent)
 	}
 	return nil
 }
