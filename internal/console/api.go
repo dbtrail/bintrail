@@ -142,11 +142,12 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 // via gapWarnings(plan); the recover UI renders them prominently, so an
 // incomplete-coverage undo is never presented as a clean success.
 //
-// One residual case FetchMerged does not expose: when several archive sources
-// are configured and only SOME fail to load, it logs the failure server-side
-// and continues (again, matching the CLI). The console cannot surface that to
-// the browser today because FetchMerged returns no per-source failure signal;
-// this limitation is documented in docs/console.md.
+// One residual case for these permissive endpoints: when several archive
+// sources are configured and only SOME fail to load, FetchMerged logs the
+// failure server-side and continues (again, matching the CLI). That is a
+// deliberate AllowGaps=true trade-off, not a missing signal — under
+// AllowGaps=false (the reconstruct endpoint) any source failure aborts the
+// fetch (#377). The trade-off is documented in docs/console.md.
 func (s *Server) fetch(ctx context.Context, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
 	return query.FetchMerged(ctx, s.db, s.engine, query.FetchMergedOptions{
 		Opts:           opts,

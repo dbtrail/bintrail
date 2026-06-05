@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Strict-mode (`AllowGaps=false`) cross-source fetches now abort when *any* archive source fails to load, not only when every source fails** (#377). `query.FetchMerged` previously hard-failed only when *all* archive sources errored; with two or more sources (one per `bintrail_id` in `archive_state`), a single broken source was demoted to an `slog.Warn` and its deltas silently dropped — undetectable downstream, because the planner validates `archive_state` coverage *before* the fetch, so the affected hours still read as "covered". Affected strict-mode callers — `bintrail reconstruct` (single-row and full-table), the `bintrail shim` virtual schemas (default `--allow-gaps=false`), and the console's `GET /api/reconstruct` — could fold an incomplete delta set and report success. Any archive-source failure under strict mode is now a hard error naming the failed source. Permissive callers (`bintrail recover`, console events/recover, and `bintrail query`'s own warn-and-continue archive loop) keep their best-effort behavior unchanged.
+
 ### Changed
 - **License changed from Business Source License 1.1 to the Apache License, Version 2.0.** `LICENSE` now carries the verbatim Apache-2.0 text and a new `NOTICE` file records the copyright attribution (`(c) 2025 Daniel Guzman Burgos`), as is conventional under Apache-2.0. The README and CONTRIBUTING license sections and the `.goreleaser.yaml` package/image `license` metadata (`nfpms`, OCI `org.opencontainers.image.licenses` labels) are updated to `Apache-2.0`. This drops the BUSL Additional Use Grant restrictions and the four-year Change Date — bintrail is now permissively licensed for any use, including commercial. The CLA already reserved the maintainer's right to relicense, so existing contributions are covered.
 

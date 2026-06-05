@@ -363,12 +363,13 @@ func TestFetchMerged_allArchiveSourcesFailStrict(t *testing.T) {
 	}
 }
 
-// TestFetchMerged_partialArchiveFailureDoesNotAbortStrict verifies that the
-// strict-mode all-archives-failed guard (fetchmerged.go:successfulArchives==0)
-// does NOT fire when at least one archive source succeeds. Partial failure is
-// correct behavior — we surface the broken source as an slog.Warn but keep
-// the data from the healthy ones.
-func TestFetchMerged_partialArchiveFailureDoesNotAbortStrict(t *testing.T) {
+// TestFetchMerged_partialArchiveFailureAbortsStrict covers #377: each archive
+// source is a distinct bintrail_id whose deltas no other source carries, so
+// under AllowGaps=false a SINGLE broken source must abort the fetch even when
+// other sources succeed — the old guard only fired when every source failed,
+// silently dropping the broken source's deltas. Under AllowGaps=true the
+// failure stays warn-and-continue.
+func TestFetchMerged_partialArchiveFailureAbortsStrict(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 	if err := indexer.EnsureSchema(db); err != nil {
@@ -421,20 +422,43 @@ func TestFetchMerged_partialArchiveFailureDoesNotAbortStrict(t *testing.T) {
 		Until:    ptrTime(h1.Add(45 * time.Minute)),
 	}
 
-	// Strict mode: one source failed, one succeeded → successfulArchives > 0
-	// → strict guard MUST NOT fire. We still expect the live MySQL row back.
-	rows, _, err := query.FetchMerged(context.Background(), db, engine, query.FetchMergedOptions{
+	// Strict mode: one source failed, one succeeded → the failure is fatal.
+	// The broken source's deltas cannot be supplied by the healthy source,
+	// so a partial result would be silently incomplete.
+	_, _, err := query.FetchMerged(context.Background(), db, engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         dbName,
 		NoArchive:      false,
 		AllowGaps:      false,
 		ArchiveFetcher: stubFetcher,
 	})
+	if err == nil {
+		t.Fatal("partial archive failure under strict mode: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "archive source") {
+		t.Errorf("expected error message to mention the archive source, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "broken") {
+		t.Errorf("expected error message to name the failed source, got: %v", err)
+	}
+	if !errors.Is(err, brokenErr) {
+		t.Errorf("expected wrapped broken-source error, got: %v", err)
+	}
+
+	// Permissive mode: same partial failure stays warn-and-continue — the
+	// live MySQL row comes back despite the broken source.
+	rows, _, err := query.FetchMerged(context.Background(), db, engine, query.FetchMergedOptions{
+		Opts:           opts,
+		DBName:         dbName,
+		NoArchive:      false,
+		AllowGaps:      true,
+		ArchiveFetcher: stubFetcher,
+	})
 	if err != nil {
-		t.Fatalf("partial archive failure under strict mode: expected success, got: %v", err)
+		t.Fatalf("partial archive failure under permissive mode: expected success, got: %v", err)
 	}
 	if len(rows) != 1 {
-		t.Errorf("expected 1 live row, got %d", len(rows))
+		t.Errorf("permissive mode: expected 1 live row, got %d", len(rows))
 	}
 }
 
