@@ -45,8 +45,12 @@ jobs:
           tags: |
             type=semver,pattern={{version}},value=${{ github.event.release.tag_name || github.ref_name }}
             # :latest stays off prereleases, mirroring skip_push: auto on
-            # the main image's manifest in .goreleaser.yaml.
-            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+            # the main image's manifest in .goreleaser.yaml. It is also
+            # release-event-only: a workflow_dispatch from a non-tag ref
+            # yields no semver tag, and letting it claim :latest would
+            # silently point :latest at an unversioned branch build —
+            # such a dispatch now fails loudly (empty tag list) instead.
+            type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
 
       - id: build
         uses: docker/build-push-action@v6

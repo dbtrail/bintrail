@@ -99,6 +99,12 @@ for _ in $(seq 1 30); do
     (exec 3<>/dev/tcp/127.0.0.1/3308) 2>/dev/null && { exec 3>&-; break; }
     sleep 1
 done
+# Definitive post-loop probe (mirrors the MySQL/stream waits): without
+# it, a shim that never binds (bad shim.yaml, port contention) would
+# boot a half-working appliance whose time-travel queries fail with an
+# opaque ProxySQL routing error at query time.
+(exec 3<>/dev/tcp/127.0.0.1/3308) 2>/dev/null && exec 3>&- \
+    || { log "shim never started listening on 127.0.0.1:3308"; exit 1; }
 
 # ── 5. ProxySQL ─────────────────────────────────────────────
 # Routing SQL is generated at boot (not baked at image build) so the
@@ -116,6 +122,10 @@ for _ in $(seq 1 30); do
     (exec 3<>/dev/tcp/127.0.0.1/6032) 2>/dev/null && { exec 3>&-; break; }
     sleep 1
 done
+# Same post-loop probe: the mysql load below would also fail under
+# set -e, but with a raw "can't connect" instead of naming the culprit.
+(exec 3<>/dev/tcp/127.0.0.1/6032) 2>/dev/null && exec 3>&- \
+    || { log "ProxySQL admin never came up on 127.0.0.1:6032"; exit 1; }
 log "Loading routing config into ProxySQL admin..."
 mysql --protocol=tcp -h127.0.0.1 -P6032 -uadmin -padmin < /tmp/proxysql-setup.sql
 
