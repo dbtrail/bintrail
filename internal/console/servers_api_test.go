@@ -1,6 +1,7 @@
 package console
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
@@ -461,13 +462,79 @@ func TestBuildSourceDSNValidation(t *testing.T) {
 
 func strPtr(s string) *string { return &s }
 
-// TestCapabilityMonitorGate: only a supervisor process (Config.Monitor, set by
-// `up --console`) advertises the monitor capability; the standalone read-only
-// console never does.
+// stubMonitorCtrl is a recording MonitorController for unit tests.
+type stubMonitorCtrl struct {
+	derived   string
+	deriveErr error
+	report    *DoctorReport
+	status    MonitorStatus
+	started   []string
+	stopped   []string
+	startErr  error
+}
+
+func (c *stubMonitorCtrl) DeriveIndexDSN(entryID string) (string, error) {
+	if c.deriveErr != nil {
+		return "", c.deriveErr
+	}
+	if c.derived != "" {
+		return c.derived, nil
+	}
+	return "mon:pw@tcp(idx:3306)/bintrail_idx_" + entryID, nil
+}
+func (c *stubMonitorCtrl) Doctor(_ context.Context, _ ServerEntry) (*DoctorReport, error) {
+	if c.report != nil {
+		return c.report, nil
+	}
+	return &DoctorReport{Passed: 1, Checks: []DoctorCheck{{Name: "ok", Status: "pass"}}}, nil
+}
+func (c *stubMonitorCtrl) Start(_ context.Context, e ServerEntry) error {
+	if c.startErr != nil {
+		return c.startErr
+	}
+	c.started = append(c.started, e.ID)
+	c.status = MonitorStatus{State: "running"}
+	return nil
+}
+func (c *stubMonitorCtrl) Stop(_ context.Context, id string) error {
+	c.stopped = append(c.stopped, id)
+	c.status = MonitorStatus{State: "stopped"}
+	return nil
+}
+func (c *stubMonitorCtrl) Status(string) MonitorStatus {
+	if c.status.State == "" {
+		return MonitorStatus{State: "stopped"}
+	}
+	return c.status
+}
+
+// newSupervisorServer builds a Server wired with a stub controller over a
+// file-backed registry — the unit harness for the monitor verbs.
+func newSupervisorServer(t *testing.T) (*Server, *stubMonitorCtrl) {
+	t.Helper()
+	reg, err := LoadRegistry(t.TempDir() + "/console-servers.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrl := &stubMonitorCtrl{}
+	srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg, MonitorCtrl: ctrl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv, ctrl
+}
+
+// TestCapabilityMonitorGate: only a supervisor process (Config.MonitorCtrl,
+// wired by `up --console`) advertises the monitor capability; the standalone
+// read-only console never does.
 func TestCapabilityMonitorGate(t *testing.T) {
 	for _, monitor := range []bool{true, false} {
 		reg, _ := LoadRegistry("")
-		srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg, Monitor: monitor})
+		cfg := Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg}
+		if monitor {
+			cfg.MonitorCtrl = &stubMonitorCtrl{}
+		}
+		srv, err := New(cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -483,6 +550,185 @@ func TestCapabilityMonitorGate(t *testing.T) {
 		if caps.Monitor != monitor {
 			t.Errorf("monitor capability = %v, want %v", caps.Monitor, monitor)
 		}
+	}
+}
+
+// TestMonitorVerbsRefuseOnStandaloneConsole: without a supervisor wired in,
+// every monitor verb is 403 — the standalone console stays powerless even if
+// a client crafts the requests by hand.
+func TestMonitorVerbsRefuseOnStandaloneConsole(t *testing.T) {
+	srv := newRegistryServer(t) // no MonitorCtrl
+	for _, m := range []struct{ method, path string }{
+		{"POST", "/api/servers/abc/monitor/start"},
+		{"POST", "/api/servers/abc/monitor/stop"},
+		{"GET", "/api/servers/abc/monitor"},
+	} {
+		rec, body := doServersReq(t, srv, m.method, m.path, "{}")
+		if rec.Code != 403 {
+			t.Errorf("%s %s on standalone console: code=%d body=%s, want 403", m.method, m.path, rec.Code, body)
+		}
+	}
+}
+
+// TestMonitorStartFlow: the zero-terminal path — create with source only
+// (index DSN derived), doctor green → desired recorded → stream started; stop
+// → desired cleared.
+func TestMonitorStartFlow(t *testing.T) {
+	srv, ctrl := newSupervisorServer(t)
+
+	// Source-only create: index DSN must be derived via the controller.
+	rec, body := doServersReq(t, srv, "POST", "/api/servers",
+		`{"name":"prod","source_host":"db.prod","source_user":"repl","source_password":"`+secretPW+`"}`)
+	if rec.Code != 201 {
+		t.Fatalf("source-only create: code=%d body=%s", rec.Code, body)
+	}
+	if strings.Contains(string(body), secretPW) {
+		t.Fatalf("create leaked the source password: %s", body)
+	}
+	var created serverDTO
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := srv.cm.reg.Get(created.ID)
+	if e.DSN != "mon:pw@tcp(idx:3306)/bintrail_idx_"+created.ID {
+		t.Fatalf("index DSN not derived: %q", e.DSN)
+	}
+	if created.DBName != "bintrail_idx_"+created.ID {
+		t.Errorf("DTO should show the derived index db: %+v", created)
+	}
+
+	// Start: doctor pass (stub default) → started, desired persisted.
+	rec, body = doServersReq(t, srv, "POST", "/api/servers/"+created.ID+"/monitor/start", "")
+	if rec.Code != 200 {
+		t.Fatalf("start: code=%d body=%s", rec.Code, body)
+	}
+	var startResp monitorStartResponse
+	if err := json.Unmarshal(body, &startResp); err != nil {
+		t.Fatal(err)
+	}
+	if !startResp.Started || startResp.Monitor.State != "running" || startResp.Doctor == nil {
+		t.Errorf("start response wrong: %+v", startResp)
+	}
+	if len(ctrl.started) != 1 || ctrl.started[0] != created.ID {
+		t.Errorf("controller Start not invoked correctly: %v", ctrl.started)
+	}
+	if e, _ := srv.cm.reg.Get(created.ID); !e.MonitorDesired {
+		t.Error("monitor_desired must be persisted before the stream starts (boot reconcile depends on it)")
+	}
+
+	// The list DTO carries the live state.
+	_, body = doServersReq(t, srv, "GET", "/api/servers/"+created.ID, "")
+	var dto serverDTO
+	if err := json.Unmarshal(body, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if dto.MonitorState != "running" || !dto.MonitorDesired {
+		t.Errorf("DTO monitor view wrong: %+v", dto)
+	}
+
+	// Stop: desired cleared FIRST (crash-safety), controller stopped.
+	rec, body = doServersReq(t, srv, "POST", "/api/servers/"+created.ID+"/monitor/stop", "")
+	if rec.Code != 200 {
+		t.Fatalf("stop: code=%d body=%s", rec.Code, body)
+	}
+	if len(ctrl.stopped) != 1 || ctrl.stopped[0] != created.ID {
+		t.Errorf("controller Stop not invoked: %v", ctrl.stopped)
+	}
+	if e, _ := srv.cm.reg.Get(created.ID); e.MonitorDesired {
+		t.Error("stop must clear monitor_desired")
+	}
+}
+
+// TestMonitorStartDoctorFailure: a failed required check means NOTHING starts
+// — no desired flag, no controller call — and the remediation cards return.
+func TestMonitorStartDoctorFailure(t *testing.T) {
+	srv, ctrl := newSupervisorServer(t)
+	ctrl.report = &DoctorReport{
+		Failed: 1,
+		Checks: []DoctorCheck{{Name: "Source MySQL connection", Status: "fail", Detail: "refused", Remediation: "open the firewall"}},
+	}
+	_, body := doServersReq(t, srv, "POST", "/api/servers",
+		`{"name":"prod","source_host":"db.prod","source_user":"repl"}`)
+	var created serverDTO
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	rec, body := doServersReq(t, srv, "POST", "/api/servers/"+created.ID+"/monitor/start", "")
+	if rec.Code != 200 {
+		t.Fatalf("start with failing doctor: code=%d body=%s", rec.Code, body)
+	}
+	var resp monitorStartResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Started || len(ctrl.started) != 0 {
+		t.Error("a failed doctor must not start anything")
+	}
+	if len(resp.Doctor.Checks) == 0 || resp.Doctor.Checks[0].Remediation == "" {
+		t.Errorf("remediation cards must come back: %+v", resp.Doctor)
+	}
+	if e, _ := srv.cm.reg.Get(created.ID); e.MonitorDesired {
+		t.Error("a failed doctor must not record monitoring intent")
+	}
+}
+
+// TestMonitorStartRequiresSource: starting a view-only entry is a 400.
+func TestMonitorStartRequiresSource(t *testing.T) {
+	srv, _ := newSupervisorServer(t)
+	_, body := doServersReq(t, srv, "POST", "/api/servers",
+		`{"name":"viewonly","host":"h","user":"u","dbname":"db"}`)
+	var created serverDTO
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers/"+created.ID+"/monitor/start", "")
+	if rec.Code != 400 {
+		t.Errorf("start without source: code=%d, want 400", rec.Code)
+	}
+}
+
+// TestMonitorGuardsOnEditAndDelete: a live stream blocks source changes and
+// deletion until an explicit stop.
+func TestMonitorGuardsOnEditAndDelete(t *testing.T) {
+	srv, ctrl := newSupervisorServer(t)
+	_, body := doServersReq(t, srv, "POST", "/api/servers",
+		`{"name":"prod","source_host":"db.prod","source_user":"repl"}`)
+	var created serverDTO
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	ctrl.status = MonitorStatus{State: "running"}
+
+	rec, _ := doServersReq(t, srv, "PUT", "/api/servers/"+created.ID,
+		`{"name":"prod","source_host":"OTHER.host","source_user":"repl"}`)
+	if rec.Code != 409 {
+		t.Errorf("source edit while running: code=%d, want 409", rec.Code)
+	}
+	rec, _ = doServersReq(t, srv, "DELETE", "/api/servers/"+created.ID, "")
+	if rec.Code != 409 {
+		t.Errorf("delete while running: code=%d, want 409", rec.Code)
+	}
+
+	// A non-source edit (rename) stays allowed while running.
+	rec, b := doServersReq(t, srv, "PUT", "/api/servers/"+created.ID,
+		`{"name":"prod-renamed"}`)
+	if rec.Code != 200 {
+		t.Errorf("rename while running: code=%d body=%s, want 200", rec.Code, b)
+	}
+}
+
+// TestCreateDeriveFailureRollsBack: when the index DSN cannot be derived the
+// half-created entry must not survive.
+func TestCreateDeriveFailureRollsBack(t *testing.T) {
+	srv, ctrl := newSupervisorServer(t)
+	ctrl.deriveErr = errors.New("boom")
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers",
+		`{"name":"prod","source_host":"db.prod","source_user":"repl"}`)
+	if rec.Code != 500 {
+		t.Fatalf("derive failure: code=%d, want 500", rec.Code)
+	}
+	if srv.cm.reg.Len() != 0 {
+		t.Error("half-created entry must be rolled back")
 	}
 }
 

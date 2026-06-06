@@ -1,0 +1,66 @@
+package console
+
+import "context"
+
+// This file defines the seam between the console (which renders and gates the
+// monitoring surface) and the control-plane supervisor (which actually runs
+// streams). The supervisor lives in cmd/bintrail and is wired in ONLY by
+// `bintrail up --console` — the write-capable daemon. The standalone
+// read-only console never constructs one, so every monitor verb refuses
+// there at the endpoint, mirroring how reconstruct gates on
+// baselineConfigured.
+
+// DoctorCheck is one preflight check result, JSON-shaped for the UI's
+// remediation cards. Status is pass|fail|warn|skip.
+type DoctorCheck struct {
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Detail      string `json:"detail,omitempty"`
+	Remediation string `json:"remediation,omitempty"`
+}
+
+// DoctorReport aggregates the preflight checks for one source.
+type DoctorReport struct {
+	Checks   []DoctorCheck `json:"checks"`
+	Passed   int           `json:"passed"`
+	Failed   int           `json:"failed"`
+	Warnings int           `json:"warnings"`
+	Skipped  int           `json:"skipped"`
+}
+
+// MonitorStatus is the supervisor's view of one entry's stream.
+type MonitorStatus struct {
+	// State: "stopped" | "pending" | "running" | "failed".
+	// "failed" carries LastError and the supervisor keeps retrying with
+	// backoff — it is "unhealthy, recovering", not terminal.
+	State     string `json:"state"`
+	LastError string `json:"last_error,omitempty"`
+	// Since is when the state was entered (RFC3339), empty for stopped.
+	Since string `json:"since,omitempty"`
+}
+
+// MonitorController is the control-plane supervisor as the console sees it.
+// All methods must be safe for concurrent use. Errors returned to handlers
+// are written into HTTP responses — implementations must pre-scrub DSN
+// secrets out of them.
+type MonitorController interface {
+	// DeriveIndexDSN returns the index DSN a monitored entry should use — a
+	// dedicated per-source database on the daemon's index MySQL server. It
+	// does not create anything; Start does.
+	DeriveIndexDSN(entryID string) (string, error)
+	// Doctor runs the preflight checks against the entry's source (and its
+	// index DSN, which may not exist yet — that is a pass, init creates it).
+	Doctor(ctx context.Context, e ServerEntry) (*DoctorReport, error)
+	// Start provisions the entry's index database (CREATE DATABASE + tables +
+	// schema migration — the supervisor is a WRITER, the same role the cmd
+	// layer plays for the boot DSN, so the console's never-migrates invariant
+	// holds) and launches the supervised stream. Idempotent for an already
+	// running entry. ctx bounds only the synchronous provisioning; the stream
+	// itself lives on the daemon's lifecycle.
+	Start(ctx context.Context, e ServerEntry) error
+	// Stop cancels the entry's stream and releases its advisory lock.
+	// Idempotent for an already stopped entry.
+	Stop(ctx context.Context, entryID string) error
+	// Status reports the entry's current monitor state.
+	Status(entryID string) MonitorStatus
+}

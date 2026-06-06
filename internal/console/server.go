@@ -59,13 +59,12 @@ type Config struct {
 	// header (in addition to IP literals and localhost), for operators who
 	// front the console with a DNS name.
 	AllowedHosts []string
-	// Monitor reports whether THIS PROCESS is a control-plane supervisor that
-	// can start/stop monitoring (true only under `bintrail up --console`,
-	// which is the write-capable daemon). The standalone read-only console
-	// never sets it: /api/capabilities reports monitor:false there and the
-	// monitor verbs (phase 3) refuse at the endpoint, mirroring how
-	// reconstruct gates on baselineConfigured.
-	Monitor bool
+	// MonitorCtrl is the control-plane supervisor, wired in ONLY by
+	// `bintrail up --console` (the write-capable daemon). nil on the
+	// standalone read-only console: /api/capabilities reports monitor:false
+	// there and every monitor verb refuses at the endpoint with 403,
+	// mirroring how reconstruct gates on baselineConfigured.
+	MonitorCtrl MonitorController
 	// BaselineDir / BaselineS3 enable point-in-time reconstruct (Phase 2) on
 	// the boot entry. When either is set (and no RBAC profile is active), the
 	// "Reconstruct" surface is exposed. BaselineDir takes precedence;
@@ -84,10 +83,11 @@ type Server struct {
 	denyTables   []query.SchemaTable
 	redactCols   []query.SchemaTableColumn
 	allowedHosts []string
-	// monitor: this process is a control-plane supervisor (see Config.Monitor).
-	monitor bool
-	cm      *connManager
-	mux     http.Handler
+	// monitorCtrl: non-nil only when this process is a control-plane
+	// supervisor (see Config.MonitorCtrl).
+	monitorCtrl MonitorController
+	cm          *connManager
+	mux         http.Handler
 }
 
 // serverHeader selects the target server per request. Selection is stateless —
@@ -130,7 +130,7 @@ func New(cfg Config) (*Server, error) {
 		denyTables:   cfg.DenyTables,
 		redactCols:   cfg.RedactColumns,
 		allowedHosts: cfg.AllowedHosts,
-		monitor:      cfg.Monitor,
+		monitorCtrl:  cfg.MonitorCtrl,
 		cm:           newConnManager(cfg.Registry, profileActive),
 	}
 
@@ -199,6 +199,11 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("PUT /api/servers/{id}", s.handleServersUpdate)
 	api.HandleFunc("DELETE /api/servers/{id}", s.handleServersDelete)
 	api.HandleFunc("POST /api/servers/{id}/test", s.handleServersTest)
+	// Monitor verbs: 403 unless this process is a control-plane supervisor
+	// (`bintrail up --console`). The standalone console stays read-only.
+	api.HandleFunc("POST /api/servers/{id}/monitor/start", s.handleMonitorStart)
+	api.HandleFunc("POST /api/servers/{id}/monitor/stop", s.handleMonitorStop)
+	api.HandleFunc("GET /api/servers/{id}/monitor", s.handleMonitorStatus)
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /api/healthz", s.handleHealthz) // unauthenticated liveness

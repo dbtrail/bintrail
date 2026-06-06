@@ -195,14 +195,21 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	cfg.Registry = registry
-	srv, err := console.New(cfg)
-	if err != nil {
-		return err
-	}
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	cmd.SetContext(ctx)
+
+	// The control-plane supervisor: "+ Add server" in the console starts real
+	// monitoring through it. Streams live on the daemon context (ctx), not on
+	// the HTTP requests that start them.
+	supervisor := newMonitorSupervisor(ctx, upIndexDSN)
+	cfg.MonitorCtrl = supervisor
+
+	srv, err := console.New(cfg)
+	if err != nil {
+		return err
+	}
 
 	// Bind synchronously so a port conflict fails `up` fast — otherwise the
 	// console would report "running" while the stream blocks for hours over a
@@ -223,9 +230,15 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	}()
 	fmt.Fprintf(os.Stderr, "\nConsole (read-only) is running. Open:\n\n    %s\n\n", srv.URL())
 
+	// Resume whatever the operator had monitoring before the restart —
+	// desired state lives in the registry, positions in each per-source
+	// stream_state checkpoint.
+	go supervisor.Reconcile(registry)
+
 	streamErr := runStream(cmd, args)
-	stop()        // drain the console even if the stream returned without a signal
-	<-consoleDone // order the console goroutine's exit before the deferred db.Close()
+	stop()                // drain the console even if the stream returned without a signal
+	<-consoleDone         // order the console goroutine's exit before the deferred db.Close()
+	supervisor.Shutdown() // final checkpoints for every monitored stream
 	return streamErr
 }
 
@@ -287,9 +300,9 @@ func upConsoleConfig(db *sql.DB, indexDSN, listen, token, baselineDir, baselineS
 		Token:       token,
 		BaselineDir: baselineDir,
 		BaselineS3:  baselineS3,
-		// `up` is the write-capable daemon — the only process that may become
-		// a control-plane supervisor. The standalone console never sets this.
-		Monitor: true,
+		// MonitorCtrl (the control-plane supervisor) is wired by the caller —
+		// runUpStreamWithConsole — because it needs the registry and the
+		// daemon lifecycle context, which this config builder doesn't have.
 	}, nil
 }
 

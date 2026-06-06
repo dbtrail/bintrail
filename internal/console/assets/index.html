@@ -133,9 +133,11 @@
         <button type="button" id="servers-close" class="modal-close" title="Close">&times;</button>
       </div>
       <p class="hint">Named connections to bintrail index databases, stored in a
-        local file on the console host. Adding a server here only registers the
-        connection — monitoring still starts with <code>bintrail up</code> on
-        that server, as usual.</p>
+        local file on the console host.
+        <span data-capability="monitor">This process can also <strong>monitor</strong>
+        a source MySQL: add one below and bintrail runs the preflight checks,
+        provisions an index for it, and starts streaming — no terminal
+        needed.</span></p>
       <div id="servers-list"></div>
       <div class="actions" id="server-add-wrap">
         <button type="button" id="server-add" class="primary">+ Add server</button>
@@ -143,20 +145,35 @@
       <form id="server-form" class="filters server-form" hidden>
         <input type="hidden" name="id">
         <label>Name <input name="name" required placeholder="prod-db-01"></label>
-        <label>Host <input name="host" required placeholder="127.0.0.1"></label>
-        <label>Port <input name="port" type="number" min="1" max="65535" placeholder="3306"></label>
-        <label>User <input name="user" required placeholder="bintrail"></label>
-        <label>Password <input name="password" type="password" autocomplete="new-password"></label>
-        <label>Index database <input name="dbname" required placeholder="binlog_index"></label>
-        <label>Baseline dir <input name="baseline_dir" placeholder="(optional) enables Time-travel"></label>
-        <label>Baseline S3 <input name="baseline_s3" placeholder="s3://bucket/prefix/"></label>
-        <label class="checkbox"><input type="checkbox" name="no_archive"> Disable archive auto-discovery</label>
+        <fieldset class="form-fieldset" data-capability="monitor">
+          <legend>Monitor a source MySQL</legend>
+          <p class="fieldset-hint">Paste the server to watch — bintrail runs the
+            preflight checks, provisions an index for it, and starts streaming.
+            Leave the index section empty; it is created automatically.</p>
+          <label>Source host <input name="source_host" placeholder="db.example.com"></label>
+          <label>Source port <input name="source_port" type="number" min="1" max="65535" placeholder="3306"></label>
+          <label>Source user <input name="source_user" placeholder="repl"></label>
+          <label>Source password <input name="source_password" type="password" autocomplete="new-password"></label>
+          <label>Schemas <input name="schemas" placeholder="(optional) shop,billing"></label>
+        </fieldset>
+        <fieldset class="form-fieldset">
+          <legend>Index connection</legend>
+          <label>Host <input name="host" placeholder="127.0.0.1"></label>
+          <label>Port <input name="port" type="number" min="1" max="65535" placeholder="3306"></label>
+          <label>User <input name="user" placeholder="bintrail"></label>
+          <label>Password <input name="password" type="password" autocomplete="new-password"></label>
+          <label>Index database <input name="dbname" placeholder="binlog_index"></label>
+          <label>Baseline dir <input name="baseline_dir" placeholder="(optional) enables Time-travel"></label>
+          <label>Baseline S3 <input name="baseline_s3" placeholder="s3://bucket/prefix/"></label>
+          <label class="checkbox"><input type="checkbox" name="no_archive"> Disable archive auto-discovery</label>
+        </fieldset>
         <div class="actions">
           <button type="submit" class="primary">Save</button>
           <button type="button" id="server-test">Test connection</button>
           <button type="button" id="server-cancel">Cancel</button>
         </div>
         <div id="server-form-msg" class="form-msg"></div>
+        <div id="doctor-cards"></div>
       </form>
     </div>
   </div>

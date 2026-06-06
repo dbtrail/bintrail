@@ -140,6 +140,18 @@ func connectWithoutDB(dsn string) (*sql.DB, error) {
 // preflight output to stderr to keep stdout clean for streaming) pass their
 // own writer here instead of going through the cobra entry point.
 func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDSN, schemasCSV string) error {
+	report := buildDoctorReport(parent, sourceDSN, indexDSN, schemasCSV)
+	if err := report.Write(w, format); err != nil {
+		return fmt.Errorf("write report: %w", err)
+	}
+	return report.Err()
+}
+
+// buildDoctorReport runs every preflight check and returns the structured
+// report without rendering it — the seam the control-plane supervisor uses to
+// surface doctor results as cards in the console UI (runDoctorTo keeps the
+// CLI's write-and-exit behavior on top of it).
+func buildDoctorReport(parent context.Context, sourceDSN, indexDSN, schemasCSV string) *doctorReport {
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 
@@ -156,8 +168,7 @@ func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDS
 			Remediation: "Verify --source-dsn is reachable: try `mysql -h<host> -P<port> -u<user> -p<pass>`.\n" +
 				"For RDS/Aurora: ensure the security group allows ingress from bintrail's IP on port 3306.",
 		})
-		_ = report.Write(w, format)
-		return report.Err()
+		return report
 	}
 	defer sourceDB.Close()
 
@@ -199,10 +210,7 @@ func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDS
 		})
 	}
 
-	if err := report.Write(w, format); err != nil {
-		return fmt.Errorf("write report: %w", err)
-	}
-	return report.Err()
+	return report
 }
 
 func checkSourceConnection(ctx context.Context, db *sql.DB) checkResult {

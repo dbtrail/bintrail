@@ -120,18 +120,35 @@ newer bintrail survive load→edit→save round-trips on an older binary, and a
 file written by a newer *schema* version loads read-only rather than being
 rewritten lossily.
 
-### Source-monitoring fields (control plane, in progress)
+### Monitoring a source from the UI (the control plane)
 
-Registry entries can additionally carry a **source** configuration —
-`source_dsn` (replication credentials, a secret with the same masking and
-keep-password discipline as the index DSN), `source_server_id`, `schemas`,
-and `monitor_desired`. These are accepted and persisted by the API today
-(`source_host`/`source_port`/`source_user`/`source_password` structured
-fields, or a raw `source_dsn`; `source_dsn: ""` clears the config), and
-`GET /api/capabilities` reports a `monitor` capability that is true only
-under `bintrail up --console` — the write-capable daemon. The verbs that
-actually start/stop monitoring ship with the supervisor; the standalone
-read-only console will never offer them.
+Under **`bintrail up --console`** — and only there — the console is also a
+control plane: "+ Add server" with a **source MySQL** (host/user/password,
+optional schema filter) runs the `bintrail doctor` preflight inline
+(failures come back as remediation cards), provisions a dedicated index
+database for that source (`bintrail_idx_<id>` on the daemon's index server:
+`CREATE DATABASE` + tables + schema migration, done by the daemon — the
+console's request handlers still never migrate anything), and starts a
+supervised binlog stream. Auto-start: a green preflight starts streaming
+immediately; warnings (e.g. short binlog retention) show but don't block.
+
+- Each monitored source gets **its own index database** — per-source state
+  (checkpoints, snapshots) stays structurally isolated, and the server
+  switcher lists it like any other connection.
+- The supervisor reconciles **desired state** (`monitor_desired` in the
+  registry) at boot: restart the daemon and monitoring resumes from each
+  stream's saved checkpoint.
+- A per-entry **advisory lock** (`GET_LOCK`) on the index server makes a
+  second daemon refuse to double-stream the same entry.
+- A failing stream is retried with exponential backoff (15s → 5m) and shows
+  as `FAILED` with the scrubbed error; `Stop` requires an explicit click, and
+  deleting or re-pointing a *running* entry is refused (409) until stopped.
+- Registry fields: `source_dsn` (replication credentials — a secret with the
+  same masking/keep-password discipline as the index DSN; `source_dsn: ""`
+  clears it), `source_server_id` (0 = derived), `schemas`, `monitor_desired`.
+
+The standalone read-only `bintrail console` never offers any of this: the
+`monitor` capability is false and the verbs return 403 there.
 
 ## Flags
 
@@ -213,6 +230,9 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `PUT /api/servers/{id}` | Edit. Omitted password = keep stored; `""` = clear; value = replace. `409` for the command-line entry. |
 | `DELETE /api/servers/{id}` | Remove from the registry and close its cached connection. `409` for the command-line entry. |
 | `POST /api/servers/{id}/test`, `POST /api/servers/test` | Write-free reachability probe (short timeout): `{ok, server_version, dbname, latency_ms, has_index, schema_current}`. Accepts an unsaved candidate body; with `{id}`, a blank password merges the stored one. |
+| `POST /api/servers/{id}/monitor/start` | Supervisor only (403 on the standalone console): doctor preflight → on green, record intent + provision + stream. Returns `{doctor, started, monitor}`. |
+| `POST /api/servers/{id}/monitor/stop` | Supervisor only: clear intent, drain the stream (final checkpoint), release the advisory lock. |
+| `GET /api/servers/{id}/monitor` | Supervisor only: `{monitor: {state, last_error, since}}` — `stopped\|pending\|running\|failed`. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`, `capabilities`,
 `reconstruct`) targets the server named by the `X-Bintrail-Server` request

@@ -487,6 +487,10 @@ function renderReconstructHistory(container, data) {
 // switch (a server with Time-travel can be followed by one without). Anything
 // not enabled stays hidden (display:none via CSS), so an un-configured surface
 // never flashes on screen.
+// capsCache holds the last capability report (per selected server) so the
+// servers modal can gate monitor controls without refetching.
+let capsCache = {};
+
 async function gateCapabilities() {
   const gen = serverGen;
   let caps = {};
@@ -496,6 +500,7 @@ async function gateCapabilities() {
     caps = {}; // unreachable/unknown server → no optional surfaces
   }
   if (gen !== serverGen) return; // a newer switch's gate owns the tabs
+  capsCache = caps;
   document.querySelectorAll("[data-capability]").forEach((node) => {
     node.classList.toggle("cap-on", !!caps[node.dataset.capability]);
   });
@@ -574,20 +579,85 @@ async function refreshServersList() {
     return;
   }
   servers.forEach((s) => {
-    const desc = s.host ? `${s.user}@${s.host}:${s.port || "3306"}/${s.dbname}` : s.dbname || "";
+    const desc = s.has_source && s.source_host
+      ? `watching ${s.source_user}@${s.source_host}:${s.source_port || "3306"}${s.schemas ? " [" + s.schemas + "]" : ""}`
+      : (s.host ? `${s.user}@${s.host}:${s.port || "3306"}/${s.dbname}` : s.dbname || "");
+    const monitorable = capsCache.monitor && s.has_source && s.kind !== "ephemeral";
+    const running = s.monitor_state === "running" || s.monitor_state === "pending";
     const row = el("div", { class: "server-row" },
       el("span", { class: "health-dot" + (s.connected ? " ok" : ""), title: s.connected ? "connected" : "not connected yet" }),
       el("span", { class: "srv-name" }, serverLabel(s)),
       s.kind === "ephemeral" ? el("span", { class: "badge cli", title: "From --index-dsn; managed by the command line" }, "CLI") : null,
       s.reconstruct ? el("span", { class: "badge tt", title: "Baseline configured: Time-travel available" }, "TT") : null,
+      s.monitor_state ? el("span", {
+        class: "badge mon-" + s.monitor_state,
+        title: s.monitor_state === "failed" ? "stream failing — retrying with backoff; press Start for details" : "monitoring " + s.monitor_state,
+      }, s.monitor_state.toUpperCase()) : null,
       el("span", { class: "srv-desc" }, desc),
       el("span", { class: "srv-status", id: "srv-status-" + s.id }),
+      monitorable ? el("button", {
+        type: "button", class: "row-btn" + (running ? "" : " primaryish"),
+        onclick: () => (running ? stopMonitorRow(s.id) : startMonitorRow(s.id)),
+      }, running ? "Stop" : "Start") : null,
       el("button", { type: "button", class: "row-btn", onclick: () => testServerRow(s.id) }, "Test"),
       el("button", { type: "button", class: "row-btn", disabled: s.editable ? null : "", onclick: () => editServer(s.id) }, "Edit"),
       el("button", { type: "button", class: "row-btn danger", disabled: s.deletable ? null : "", onclick: () => deleteServer(s) }, "Delete"),
     );
     list.appendChild(row);
   });
+}
+
+// renderDoctor paints the preflight report as remediation cards inside the
+// form — the 3am operator gets the exact fix, not a log pointer.
+function renderDoctor(report) {
+  const c = document.getElementById("doctor-cards");
+  clear(c);
+  if (!report || !report.checks) return;
+  report.checks.forEach((chk) => {
+    const mark = chk.status === "pass" ? "✓" : chk.status === "fail" ? "✗" : chk.status === "warn" ? "!" : "–";
+    c.appendChild(el("div", { class: "doctor-card " + chk.status },
+      el("span", { class: "dc-mark" }, mark),
+      el("div", { class: "dc-body" },
+        el("div", { class: "dc-name" }, chk.name + (chk.detail ? " — " + chk.detail : "")),
+        chk.remediation ? el("pre", { class: "dc-rem" }, chk.remediation) : null)));
+  });
+}
+
+// startMonitor runs the doctor-then-stream flow for one entry and reports the
+// outcome. Returns the start response (or null on transport error).
+async function startMonitor(id) {
+  try {
+    return await api("/api/servers/" + encodeURIComponent(id) + "/monitor/start", { method: "POST", body: {} });
+  } catch (err) {
+    toast("start failed: " + (err.message || err));
+    return null;
+  }
+}
+
+async function startMonitorRow(id) {
+  const slot = document.getElementById("srv-status-" + id);
+  if (slot) slot.textContent = "running checks…";
+  const res = await startMonitor(id);
+  await refreshServersList();
+  if (!res) return;
+  if (res.started) {
+    toast("Monitoring started");
+  } else {
+    // Preflight failed — open the editor so the remediation cards are visible.
+    await editServer(id);
+    renderDoctor(res.doctor);
+    formMsg("preflight failed — fix the items below, Save, and Start again", true);
+  }
+}
+
+async function stopMonitorRow(id) {
+  try {
+    await api("/api/servers/" + encodeURIComponent(id) + "/monitor/stop", { method: "POST", body: {} });
+    toast("Monitoring stopped");
+  } catch (err) {
+    toast("stop failed: " + (err.message || err));
+  }
+  await refreshServersList();
 }
 
 function formMsg(text, isError) {
@@ -600,6 +670,7 @@ function showServerForm(prefill) {
   const f = document.getElementById("server-form");
   f.reset();
   formMsg("", false);
+  clear(document.getElementById("doctor-cards"));
   f.elements.id.value = prefill ? prefill.id : "";
   if (prefill) {
     f.elements.name.value = prefill.name || "";
@@ -611,8 +682,14 @@ function showServerForm(prefill) {
     f.elements.baseline_s3.value = prefill.baseline_s3 || "";
     f.elements.no_archive.checked = !!prefill.no_archive;
     f.elements.password.placeholder = prefill.has_password ? "(unchanged — leave blank to keep)" : "(none)";
+    f.elements.source_host.value = prefill.source_host || "";
+    f.elements.source_port.value = prefill.source_port || "";
+    f.elements.source_user.value = prefill.source_user || "";
+    f.elements.schemas.value = prefill.schemas || "";
+    f.elements.source_password.placeholder = prefill.has_source_password ? "(unchanged — leave blank to keep)" : "";
   } else {
     f.elements.password.placeholder = "";
+    f.elements.source_password.placeholder = "";
   }
   document.getElementById("server-add-wrap").hidden = true;
   f.hidden = false;
@@ -646,8 +723,13 @@ function serverFormBody(f) {
     baseline_dir: f.elements.baseline_dir.value.trim(),
     baseline_s3: f.elements.baseline_s3.value.trim(),
     no_archive: f.elements.no_archive.checked,
+    source_host: f.elements.source_host.value.trim(),
+    source_port: f.elements.source_port.value.trim(),
+    source_user: f.elements.source_user.value.trim(),
+    schemas: f.elements.schemas.value.trim(),
   };
   if (f.elements.password.value !== "") body.password = f.elements.password.value;
+  if (f.elements.source_password.value !== "") body.source_password = f.elements.source_password.value;
   return body;
 }
 
@@ -655,18 +737,38 @@ async function saveServer(e) {
   e.preventDefault();
   const f = e.target;
   const id = f.elements.id.value;
+  let saved;
   try {
     if (id) {
-      await api("/api/servers/" + encodeURIComponent(id), { method: "PUT", body: serverFormBody(f) });
+      saved = await api("/api/servers/" + encodeURIComponent(id), { method: "PUT", body: serverFormBody(f) });
     } else {
-      await api("/api/servers", { method: "POST", body: serverFormBody(f) });
+      saved = await api("/api/servers", { method: "POST", body: serverFormBody(f) });
     }
-    hideServerForm();
-    await refreshServersList();
-    toast(id ? "Server updated" : "Server added");
   } catch (err) {
     formMsg(err.message || String(err), true);
+    return;
   }
+
+  // The zero-terminal flow: a saved server with a source goes straight into
+  // doctor → stream (auto-start on green). The form stays open on a failed
+  // preflight so the remediation cards are right there.
+  if (capsCache.monitor && saved.has_source && saved.monitor_state !== "running") {
+    formMsg("running preflight checks…", false);
+    const res = await startMonitor(saved.id);
+    await refreshServersList();
+    if (res && res.started) {
+      hideServerForm();
+      toast("Monitoring started — events will appear within a minute");
+    } else if (res) {
+      renderDoctor(res.doctor);
+      formMsg("preflight failed — fix the items below and Save again", true);
+    }
+    return;
+  }
+
+  hideServerForm();
+  await refreshServersList();
+  toast(id ? "Server updated" : "Server added");
 }
 
 async function deleteServer(s) {

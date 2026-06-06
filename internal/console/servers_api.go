@@ -49,6 +49,9 @@ type serverDTO struct {
 	SourceServerID    uint32 `json:"source_server_id,omitempty"`
 	Schemas           string `json:"schemas,omitempty"`
 	MonitorDesired    bool   `json:"monitor_desired"`
+	// MonitorState is the supervisor's live view (stopped|pending|running|
+	// failed); present only on a supervisor process for entries with a source.
+	MonitorState string `json:"monitor_state,omitempty"`
 	// Reconstruct is the per-server Time-travel capability, derived from pure
 	// config (no connection is opened to compute it).
 	Reconstruct bool `json:"reconstruct"`
@@ -151,15 +154,16 @@ func (s *Server) handleServersGet(w http.ResponseWriter, r *http.Request) {
 // handleServersCreate serves POST /api/servers. It validates and persists the
 // entry — it does NOT connect (opens are lazy, on first selection) and runs no
 // DDL, ever.
+//
+// Monitor-first creation: when the body configures a SOURCE but no index
+// connection at all, and this process is a supervisor, the entry's index DSN
+// is derived automatically (a dedicated per-source database on the daemon's
+// index server, created later by monitor start). That is the zero-terminal
+// "+ Add server" path: the DBA types only the source.
 func (s *Server) handleServersCreate(w http.ResponseWriter, r *http.Request) {
 	var req serverRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
-		return
-	}
-	dsn, err := buildDSN(req, "")
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	sourceDSN, err := buildSourceDSN(req, "")
@@ -167,6 +171,17 @@ func (s *Server) handleServersCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	deriveIndex := req.DSN == "" && req.Host == "" && req.DBName == "" && sourceDSN != "" && s.monitorCtrl != nil
+	var dsn string
+	if !deriveIndex {
+		dsn, err = buildDSN(req, "")
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
 	entry := ServerEntry{
 		Name:           strings.TrimSpace(req.Name),
 		DSN:            dsn,
@@ -181,6 +196,21 @@ func (s *Server) handleServersCreate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSONError(w, registryErrStatus(err), err.Error())
 		return
+	}
+	if deriveIndex {
+		// The id is minted by Add, so the derived DSN lands in a follow-up
+		// update. A failure here rolls the entry back rather than leaving a
+		// half-configured server.
+		derived, dErr := s.monitorCtrl.DeriveIndexDSN(added.ID)
+		if dErr == nil {
+			added.DSN = derived
+			dErr = s.cm.reg.Update(added)
+		}
+		if dErr != nil {
+			_ = s.cm.reg.Delete(added.ID)
+			writeJSONError(w, http.StatusInternalServerError, "derive index DSN: "+dErr.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusCreated, s.entryDTO(added))
 }
@@ -213,6 +243,13 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 	sourceDSN, err := buildSourceDSN(req, old.SourceDSN)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Changing the SOURCE of a live stream mid-flight would silently re-point
+	// replication; demand an explicit stop first so the 3am operator sees
+	// what they're doing.
+	if sourceDSN != old.SourceDSN && s.monitorActive(id) {
+		writeJSONError(w, http.StatusConflict, "this server is being monitored; stop monitoring before changing its source")
 		return
 	}
 	entry := ServerEntry{
@@ -248,12 +285,141 @@ func (s *Server) handleServersDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusConflict, "the command-line server cannot be deleted; stop the console instead")
 		return
 	}
+	if s.monitorActive(id) {
+		writeJSONError(w, http.StatusConflict, "this server is being monitored; stop monitoring before deleting it")
+		return
+	}
 	if err := s.cm.reg.Delete(id); err != nil {
 		writeJSONError(w, registryErrStatus(err), err.Error())
 		return
 	}
 	s.cm.evict(id)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// monitorActive reports whether the supervisor has a live (running or
+// starting) stream for the entry. Always false on the standalone console.
+func (s *Server) monitorActive(id string) bool {
+	if s.monitorCtrl == nil {
+		return false
+	}
+	switch s.monitorCtrl.Status(id).State {
+	case "running", "pending":
+		return true
+	}
+	return false
+}
+
+// ─── monitor verbs ───────────────────────────────────────────────────────────
+
+type monitorStartResponse struct {
+	Doctor *DoctorReport `json:"doctor"`
+	// Started reports whether the stream was actually launched. False when
+	// the doctor failed a required check — the response then carries the
+	// remediation cards and nothing was touched.
+	Started bool          `json:"started"`
+	Monitor MonitorStatus `json:"monitor"`
+}
+
+// requireMonitorEntry centralizes the verb gates: a supervisor must be wired
+// (403 on the standalone read-only console), the entry must exist (404), and
+// — for start — must have a source configured (400, checked by the caller).
+func (s *Server) requireMonitorEntry(w http.ResponseWriter, id string) (ServerEntry, bool) {
+	if s.monitorCtrl == nil {
+		writeJSONError(w, http.StatusForbidden,
+			"this console is read-only; monitoring is controlled from the `bintrail up --console` process")
+		return ServerEntry{}, false
+	}
+	if id == bootServerID {
+		writeJSONError(w, http.StatusConflict,
+			"the command-line server is already streamed by this process; monitor verbs apply to registry servers")
+		return ServerEntry{}, false
+	}
+	e, ok := s.cm.reg.Get(id)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, ErrUnknownServer.Error())
+		return ServerEntry{}, false
+	}
+	return e, true
+}
+
+// handleMonitorStart serves POST /api/servers/{id}/monitor/start: doctor
+// preflight → (auto-start policy) launch the supervised stream. When any
+// required check fails, nothing starts and the report's remediation cards
+// come back for the UI — the operator fixes and retries.
+func (s *Server) handleMonitorStart(w http.ResponseWriter, r *http.Request) {
+	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	if e.SourceDSN == "" {
+		writeJSONError(w, http.StatusBadRequest,
+			"this server has no source configured; set the source connection first")
+		return
+	}
+
+	report, err := s.monitorCtrl.Doctor(r.Context(), e)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "doctor: "+err.Error())
+		return
+	}
+	if report.Failed > 0 {
+		writeJSON(w, http.StatusOK, monitorStartResponse{
+			Doctor:  report,
+			Started: false,
+			Monitor: s.monitorCtrl.Status(e.ID),
+		})
+		return
+	}
+
+	// Doctor green → record intent first (the supervisor reconciles desired
+	// state at boot, so a crash right after this line still resumes), then
+	// launch.
+	e.MonitorDesired = true
+	if err := s.cm.reg.Update(e); err != nil {
+		writeJSONError(w, registryErrStatus(err), err.Error())
+		return
+	}
+	if err := s.monitorCtrl.Start(r.Context(), e); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "start monitoring: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, monitorStartResponse{
+		Doctor:  report,
+		Started: true,
+		Monitor: s.monitorCtrl.Status(e.ID),
+	})
+}
+
+// handleMonitorStop serves POST /api/servers/{id}/monitor/stop.
+func (s *Server) handleMonitorStop(w http.ResponseWriter, r *http.Request) {
+	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	// Clear intent first: if the process dies mid-stop, boot reconciliation
+	// must not resurrect a stream the operator asked to stop.
+	if e.MonitorDesired {
+		e.MonitorDesired = false
+		if err := s.cm.reg.Update(e); err != nil {
+			writeJSONError(w, registryErrStatus(err), err.Error())
+			return
+		}
+	}
+	if err := s.monitorCtrl.Stop(r.Context(), e.ID); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "stop monitoring: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"monitor": s.monitorCtrl.Status(e.ID)})
+}
+
+// handleMonitorStatus serves GET /api/servers/{id}/monitor.
+func (s *Server) handleMonitorStatus(w http.ResponseWriter, r *http.Request) {
+	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"monitor": s.monitorCtrl.Status(e.ID)})
 }
 
 // handleServersTest serves POST /api/servers/test (unsaved candidate) and
@@ -539,6 +705,9 @@ func (s *Server) entryDTO(e ServerEntry) serverDTO {
 	}
 	fillDSNParts(&dto, e.DSN)
 	fillSourceDSNParts(&dto, e.SourceDSN)
+	if s.monitorCtrl != nil && e.SourceDSN != "" {
+		dto.MonitorState = s.monitorCtrl.Status(e.ID).State
+	}
 	return dto
 }
 

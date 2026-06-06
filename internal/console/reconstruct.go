@@ -39,7 +39,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	if b == nil {
 		return
 	}
-	writeJSON(w, http.StatusOK, capabilitiesResponse{Reconstruct: b.baselineConfigured, Monitor: s.monitor})
+	writeJSON(w, http.StatusOK, capabilitiesResponse{Reconstruct: b.baselineConfigured, Monitor: s.monitorCtrl != nil})
 }
 
 // stateEntryDTO is the wire view of a reconstruct.StateEntry (that struct has no

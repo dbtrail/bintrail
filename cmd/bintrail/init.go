@@ -108,84 +108,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Create binlog_events with dynamic hourly partitions.
-	if err := createBinlogEventsTable(db, initPartitions, initEncrypt); err != nil {
-		return fmt.Errorf("failed to create binlog_events: %w", err)
+	// Create the full index table set (shared with the control-plane
+	// supervisor, which provisions a per-source index DB the same way).
+	if err := createIndexTables(cmd.Context(), db, initPartitions, initEncrypt, logTable); err != nil {
+		return err
 	}
-	logTable("binlog_events")
-
-	// If --encrypt was requested, verify that the table actually has encryption
-	// enabled. CREATE TABLE IF NOT EXISTS is a no-op when the table already
-	// exists, so a pre-existing unencrypted table will silently remain
-	// unencrypted. Warn the operator so they can encrypt it manually.
-	if initEncrypt {
-		var createOpts string
-		row := db.QueryRowContext(cmd.Context(),
-			`SELECT COALESCE(CREATE_OPTIONS, '') FROM information_schema.TABLES
-			 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'binlog_events'`)
-		if err := row.Scan(&createOpts); err == nil &&
-			!strings.Contains(strings.ToUpper(createOpts), "ENCRYPTION=Y") {
-			if initFormat != "json" {
-				fmt.Fprintf(os.Stderr, "Warning: binlog_events already exists without encryption.\n"+
-					"To encrypt it, run: ALTER TABLE binlog_events ENCRYPTION='Y'\n")
-			}
-		}
-	}
-
-	if _, err := db.Exec(ddlSchemaSnapshots); err != nil {
-		return fmt.Errorf("failed to create schema_snapshots: %w", err)
-	}
-	logTable("schema_snapshots")
-
-	if _, err := db.Exec(ddlIndexState); err != nil {
-		return fmt.Errorf("failed to create index_state: %w", err)
-	}
-	logTable("index_state")
-
-	if _, err := db.Exec(ddlStreamState); err != nil {
-		return fmt.Errorf("failed to create stream_state: %w", err)
-	}
-	logTable("stream_state")
-
-	if _, err := db.Exec(ddlBintrailServers); err != nil {
-		return fmt.Errorf("failed to create bintrail_servers: %w", err)
-	}
-	logTable("bintrail_servers")
-
-	if _, err := db.Exec(ddlBintrailServerChanges); err != nil {
-		return fmt.Errorf("failed to create bintrail_server_changes: %w", err)
-	}
-	logTable("bintrail_server_changes")
-
-	if _, err := db.Exec(ddlTableFlags); err != nil {
-		return fmt.Errorf("failed to create table_flags: %w", err)
-	}
-	logTable("table_flags")
-
-	if _, err := db.Exec(ddlProfiles); err != nil {
-		return fmt.Errorf("failed to create profiles: %w", err)
-	}
-	logTable("profiles")
-
-	if _, err := db.Exec(ddlAccessRules); err != nil {
-		return fmt.Errorf("failed to create access_rules: %w", err)
-	}
-	logTable("access_rules")
-
-	if _, err := db.Exec(ddlArchiveState); err != nil {
-		return fmt.Errorf("failed to create archive_state: %w", err)
-	}
-	logTable("archive_state")
-
-	if _, err := db.Exec(ddlSchemaChanges); err != nil {
-		return fmt.Errorf("failed to create schema_changes: %w", err)
-	}
-	logTable("schema_changes")
-
-	if _, err := db.Exec(ddlFKConstraints); err != nil {
-		return fmt.Errorf("failed to create fk_constraints: %w", err)
-	}
-	logTable("fk_constraints")
 
 	var s3Result *string
 	if initS3Bucket != "" {
@@ -421,6 +348,63 @@ func s3Instructions(bucket, region string) string {
 
 // ensureDatabase creates the target database if it does not already exist.
 // It connects without a database name so the CREATE DATABASE always succeeds.
+// createIndexTables creates every index table (idempotent — all DDL is
+// CREATE TABLE IF NOT EXISTS). Shared by `bintrail init` and the
+// control-plane supervisor, which provisions a per-source index database with
+// the same set. logTable is invoked per table for progress output; nil is
+// allowed (no output).
+func createIndexTables(ctx context.Context, db *sql.DB, partitions int, encrypt bool, logTable func(string)) error {
+	if logTable == nil {
+		logTable = func(string) {}
+	}
+
+	// Create binlog_events with dynamic hourly partitions.
+	if err := createBinlogEventsTable(db, partitions, encrypt); err != nil {
+		return fmt.Errorf("failed to create binlog_events: %w", err)
+	}
+	logTable("binlog_events")
+
+	// If encryption was requested, verify that the table actually has it
+	// enabled. CREATE TABLE IF NOT EXISTS is a no-op when the table already
+	// exists, so a pre-existing unencrypted table will silently remain
+	// unencrypted. Warn the operator so they can encrypt it manually.
+	if encrypt {
+		var createOpts string
+		row := db.QueryRowContext(ctx,
+			`SELECT COALESCE(CREATE_OPTIONS, '') FROM information_schema.TABLES
+			 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'binlog_events'`)
+		if err := row.Scan(&createOpts); err == nil &&
+			!strings.Contains(strings.ToUpper(createOpts), "ENCRYPTION=Y") {
+			fmt.Fprintf(os.Stderr, "Warning: binlog_events already exists without encryption.\n"+
+				"To encrypt it, run: ALTER TABLE binlog_events ENCRYPTION='Y'\n")
+		}
+	}
+
+	ddls := []struct {
+		name string
+		ddl  string
+	}{
+		{"schema_snapshots", ddlSchemaSnapshots},
+		{"index_state", ddlIndexState},
+		{"stream_state", ddlStreamState},
+		{"bintrail_servers", ddlBintrailServers},
+		{"bintrail_server_changes", ddlBintrailServerChanges},
+		{"table_flags", ddlTableFlags},
+		{"profiles", ddlProfiles},
+		{"access_rules", ddlAccessRules},
+		{"archive_state", ddlArchiveState},
+		{"schema_changes", ddlSchemaChanges},
+		{"fk_constraints", ddlFKConstraints},
+	}
+	for _, t := range ddls {
+		if _, err := db.Exec(t.ddl); err != nil {
+			return fmt.Errorf("failed to create %s: %w", t.name, err)
+		}
+		logTable(t.name)
+	}
+	return nil
+}
+
 func ensureDatabase(cfg *mysql.Config, dbName string) error {
 	serverCfg := *cfg
 	serverCfg.DBName = ""
