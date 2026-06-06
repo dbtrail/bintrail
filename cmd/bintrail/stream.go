@@ -715,6 +715,8 @@ func streamLoop(
 	db *sql.DB,
 	checkpointInterval time.Duration,
 	state *streamState,
+	m *observe.StreamMetrics,
+	hooks *streamHooks,
 ) error {
 	batch := make([]parser.Event, 0, idx.BatchSize())
 	ticker := time.NewTicker(checkpointInterval)
@@ -724,16 +726,20 @@ func streamLoop(
 		if len(batch) == 0 {
 			return nil
 		}
-		observe.StreamBatchSize.Observe(float64(len(batch)))
+		m.BatchSize.Observe(float64(len(batch)))
 		n, err := idx.InsertBatch(batch)
 		state.eventsIndexed += n
-		observe.StreamEventsIndexed.Add(float64(n))
-		observe.StreamBatchFlushes.Inc()
+		m.EventsIndexed.Add(float64(n))
+		m.BatchFlushes.Inc()
 		batch = batch[:0]
 		if err != nil {
-			observe.StreamErrors.WithLabelValues("batch_flush").Inc()
+			m.Errors.WithLabelValues("batch_flush").Inc()
+			return err
 		}
-		return err
+		if n > 0 && hooks != nil && hooks.OnIndexed != nil {
+			hooks.OnIndexed(n)
+		}
+		return nil
 	}
 
 	checkpoint := func() {
@@ -743,9 +749,12 @@ func streamLoop(
 		}
 		if err := saveCheckpoint(db, state); err != nil {
 			slog.Warn("saveCheckpoint failed", "error", err)
-			observe.StreamErrors.WithLabelValues("checkpoint").Inc()
+			m.Errors.WithLabelValues("checkpoint").Inc()
 		} else {
-			observe.StreamCheckpointSaves.Inc()
+			m.CheckpointSaves.Inc()
+			if hooks != nil && hooks.OnCheckpoint != nil {
+				hooks.OnCheckpoint()
+			}
 			slog.Info("checkpoint saved",
 				"file", state.binlogFile,
 				"pos", state.binlogPos,
@@ -775,7 +784,7 @@ func streamLoop(
 			if ev.GTID != "" && state.accGTID != nil {
 				if err := state.accGTID.Update(ev.GTID); err != nil {
 					slog.Warn("failed to update GTID set", "gtid", ev.GTID, "error", err)
-					observe.StreamErrors.WithLabelValues("gtid_update").Inc()
+					m.Errors.WithLabelValues("gtid_update").Inc()
 				} else {
 					state.gtidSet = state.accGTID.String()
 				}
@@ -798,11 +807,11 @@ func streamLoop(
 				continue
 			}
 
-			observe.StreamEventsReceived.Inc()
+			m.EventsReceived.Inc()
 			if !ev.Timestamp.IsZero() {
 				ts := float64(ev.Timestamp.Unix())
-				observe.StreamLastEventTimestamp.Set(ts)
-				observe.StreamReplicationLag.Set(float64(time.Now().Unix()) - ts)
+				m.LastEventTimestamp.Set(ts)
+				m.ReplicationLag.Set(float64(time.Now().Unix()) - ts)
 			}
 			slog.Debug("event received",
 				"schema", ev.Schema,
@@ -823,11 +832,12 @@ func streamLoop(
 // ─── streamConfig / streamOne ───────────────────────────────────────────────
 
 // streamConfig carries everything ONE replication stream needs — the by-value
-// equivalent of the strm* package globals. It exists so the future control
-// plane can run N streams concurrently in one process (each with its own
-// config), while `bintrail stream` keeps wiring its flags through a single
-// instance unchanged. Plain data, no behavior: the zero value is invalid;
-// build it from flags via streamConfigFromFlags or populate it explicitly.
+// equivalent of the strm* package globals. It exists so the control plane can
+// run N streams concurrently in one process (each with its own config), while
+// `bintrail stream` keeps wiring its flags through a single instance
+// unchanged. Plain data plus optional observer hooks: the zero value is
+// invalid; build it from flags via streamConfigFromFlags or populate it
+// explicitly.
 type streamConfig struct {
 	IndexDSN    string
 	SourceDSN   string
@@ -840,14 +850,37 @@ type streamConfig struct {
 	Tables      string
 	Checkpoint  int // seconds
 	MetricsAddr string
-	SSLMode     string
-	SSLCA       string
-	SSLCert     string
-	SSLKey      string
-	Format      string
-	Reset       bool
-	NoGapFill   bool
-	GapTimeout  int // seconds
+	// MetricsSource is the value of the Prometheus "source" label for this
+	// stream — the supervisor sets it to the registry entry ID so N
+	// concurrent streams stay distinguishable on one /metrics endpoint.
+	// Empty = fall back to the resolved bintrail_id (or "default").
+	MetricsSource string
+	SSLMode       string
+	SSLCA         string
+	SSLCert       string
+	SSLKey        string
+	Format        string
+	Reset         bool
+	NoGapFill     bool
+	GapTimeout    int // seconds
+	// Hooks, when non-nil, lets a supervisor observe this stream's liveness
+	// without polling. Plain `bintrail stream` leaves it nil.
+	Hooks *streamHooks
+}
+
+// streamHooks are liveness callbacks a supervisor attaches to one stream.
+// All fields are optional. They are invoked synchronously from the stream
+// loop — implementations must be fast and non-blocking.
+type streamHooks struct {
+	// OnCheckpoint fires after every successful checkpoint save — the
+	// "attached and healthy" signal (the ticker checkpoints even with zero
+	// events, so an idle source still reports progress).
+	OnCheckpoint func()
+	// OnIndexed fires after every successful batch flush with rows written.
+	OnIndexed func(n int64)
+	// OnGapAutoAdvance fires when an unfillable binlog gap forced the stream
+	// to advance past purged events — data in the gap is permanently lost.
+	OnGapAutoAdvance func(detail string)
 }
 
 // streamConfigFromFlags snapshots the strm* package globals into a config.
@@ -1096,12 +1129,24 @@ func streamOne(ctx context.Context, cfg streamConfig) error {
 				}
 				slog.Info("saved advanced checkpoint after gap auto-advance",
 					"file", startFile, "pos", startPos, "gtid_set", startGTIDStr)
+				// Tell the supervisor events were lost — without this the
+				// auto-advance is only a log line and the console shows a
+				// healthy RUNNING badge over a stream that silently skipped
+				// data (#402).
+				if cfg.Hooks != nil && cfg.Hooks.OnGapAutoAdvance != nil {
+					cfg.Hooks.OnGapAutoAdvance(gap.Message)
+				}
 			}
 		}
 	}
 
 	state := &streamState{
-		mode:       mode,
+		mode: mode,
+		// Seed the position with the resolved start so the first ticker
+		// checkpoint (which fires even before any event arrives) persists a
+		// valid resume point instead of an empty file / position 0.
+		binlogFile: startFile,
+		binlogPos:  uint64(startPos),
 		serverID:   cfg.ServerID,
 		accGTID:    accGTID,
 		bintrailID: bintrailID,
@@ -1202,22 +1247,20 @@ func streamOne(ctx context.Context, cfg streamConfig) error {
 	// lifecycle without competing signal handlers.)
 
 	// ── 9. Optional Prometheus metrics HTTP server ─────────────────────────
+	// Under `up --console` the daemon serves one endpoint for all streams
+	// instead (cfg.MetricsAddr is empty there) — the registry is process-
+	// global, so one handler exposes every per-source series.
 	if cfg.MetricsAddr != "" {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.Handler())
-		metricsServer := &http.Server{Addr: cfg.MetricsAddr, Handler: mux}
-		go func() {
-			slog.Info("metrics server starting", "addr", cfg.MetricsAddr)
-			if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				slog.Error("metrics server error", "error", err)
-			}
-		}()
-		defer func() {
-			shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer shutCancel()
-			_ = metricsServer.Shutdown(shutCtx)
-		}()
+		defer startMetricsServer(cfg.MetricsAddr)()
 	}
+
+	// All stream metrics carry a "source" label: the supervisor's entry ID
+	// when monitored, else the resolved bintrail_id ("default" if unknown).
+	metricsSource := cfg.MetricsSource
+	if metricsSource == "" {
+		metricsSource = bintrailID
+	}
+	metrics := observe.ForSource(metricsSource)
 
 	// ── 10. StreamParser + its synchronous DDL hook ──────────────────────────
 	sp := parser.NewStreamParser(resolver, filters, nil)
@@ -1283,7 +1326,7 @@ func streamOne(ctx context.Context, cfg streamConfig) error {
 	// ── 12. Run stream loop with checkpointing ──────────────────────────────────
 	fmt.Printf("Streaming started (server-id=%d, checkpoint=%ds)\n", cfg.ServerID, cfg.Checkpoint)
 	loopErr := streamLoop(ctx, events, idx, indexDB,
-		time.Duration(cfg.Checkpoint)*time.Second, state)
+		time.Duration(cfg.Checkpoint)*time.Second, state, metrics, cfg.Hooks)
 
 	parseErr := <-parseErrCh
 
@@ -1310,4 +1353,26 @@ func streamOne(ctx context.Context, cfg streamConfig) error {
 	fmt.Printf("\nEvents indexed: %d\n", state.eventsIndexed)
 	fmt.Printf("Last position:  %s:%d\n", state.binlogFile, state.binlogPos)
 	return nil
+}
+
+// startMetricsServer binds the Prometheus /metrics endpoint asynchronously
+// and returns a shutdown func. Serve errors are logged, never fatal — metrics
+// are observability, not the data path. Shared by `bintrail stream` (one
+// endpoint per stream process) and the `up --console` daemon (one endpoint
+// for all supervised streams; the default registry is process-global).
+func startMetricsServer(addr string) (shutdown func()) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		slog.Info("metrics server starting", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("metrics server error", "error", err)
+		}
+	}()
+	return func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}
 }

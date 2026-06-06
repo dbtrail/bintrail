@@ -523,6 +523,22 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) ch
 		if len(schemas) > 0 {
 			filter = strings.Join(schemas, ", ")
 		}
+		// Zero tables has two very different causes: the schema genuinely
+		// has no tables yet (fix: create one) vs. bintrail cannot see it at
+		// all (fix: grants / schema-name typo). Telling the operator to
+		// GRANT when the schema is simply empty sends them down the wrong
+		// path (#402).
+		if n, err := countVisibleSchemas(ctx, db, schemas); err == nil && n > 0 {
+			return checkResult{
+				Name:   "Schema visibility",
+				Status: statusFail,
+				Detail: "schema visible but contains no tables yet: " + filter,
+				Remediation: "Bintrail snapshots table schemas when monitoring starts and cannot monitor\n" +
+					"an empty schema. Create at least one table first:\n\n" +
+					"  CREATE TABLE <schema>.<table> (id INT PRIMARY KEY, ...);\n\n" +
+					"Then start monitoring again.",
+			}
+		}
 		return checkResult{
 			Name:   "Schema visibility",
 			Status: statusFail,
@@ -531,7 +547,8 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) ch
 				"Grant minimum read access:\n\n" +
 				"  GRANT SELECT ON *.* TO <bintrail-user>;\n\n" +
 				"Or scope to the schemas you want indexed:\n\n" +
-				"  GRANT SELECT ON <schema>.* TO <bintrail-user>;",
+				"  GRANT SELECT ON <schema>.* TO <bintrail-user>;\n\n" +
+				"Also double-check the schema names for typos.",
 		}
 	}
 	return checkResult{
@@ -539,6 +556,29 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) ch
 		Status: statusPass,
 		Detail: fmt.Sprintf("%d tables across %d schemas", tableCount, schemaCount),
 	}
+}
+
+// countVisibleSchemas reports how many of the requested schemas exist and are
+// visible to the doctor's connection (all non-system schemas when the filter
+// is empty). It distinguishes "schema is empty" from "schema is invisible"
+// in checkSchemaVisibility.
+func countVisibleSchemas(ctx context.Context, db *sql.DB, schemas []string) (int, error) {
+	var query string
+	var args []any
+	if len(schemas) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
+		query = fmt.Sprintf(`SELECT COUNT(*) FROM information_schema.SCHEMATA
+			WHERE SCHEMA_NAME IN (%s)`, placeholders)
+		for _, s := range schemas {
+			args = append(args, s)
+		}
+	} else {
+		query = `SELECT COUNT(*) FROM information_schema.SCHEMATA
+			WHERE SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys')`
+	}
+	var n int
+	err := db.QueryRowContext(ctx, query, args...).Scan(&n)
+	return n, err
 }
 
 func checkIndexConnection(ctx context.Context, dsn, dbName string) checkResult {

@@ -439,6 +439,8 @@ table.statetable td { font-family: var(--mono); white-space: pre-wrap; word-brea
 .badge.mon-pending { color: var(--warn); border: 1px solid var(--warn); }
 .badge.mon-failed { color: var(--del); border: 1px solid var(--del); }
 .badge.mon-stopped { color: var(--muted); border: 1px solid var(--muted); }
+.badge.mon-stalled { color: var(--warn); border: 1px solid var(--warn); }
+.badge.mon-lost_position { color: var(--del); border: 1px solid var(--del); }
 
 .row-btn.primaryish { border-color: var(--accent-2); color: var(--accent); }
 

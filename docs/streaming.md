@@ -324,7 +324,13 @@ When `--metrics-addr :9090` is set, a Prometheus HTTP endpoint starts at `/metri
 | `bintrail_stream_errors_total{type}` | Counter | Errors by type: `batch_flush`, `checkpoint`, `gtid_update` |
 | `bintrail_stream_batch_size` | Histogram | Distribution of events per batch flush |
 
-`replication_lag_seconds` is the most useful metric for monitoring — it tells you how far behind the stream is relative to real time. If it grows steadily, the index database can't keep up with the write rate.
+Every metric carries a `source` label so concurrent streams in one process stay
+distinguishable. For a standalone `bintrail stream` it is the server's resolved
+`bintrail_id` (`default` if unresolved); under `bintrail up --console` it is the
+monitored entry's ID, and the **daemon** serves one `/metrics` endpoint covering
+all supervised streams (per-stream endpoints would fight over the bind).
+
+`replication_lag_seconds` is the most useful metric for monitoring — it tells you how far behind the stream is relative to real time. If it grows steadily, the index database can't keep up with the write rate. With multiple sources, alert per label: `bintrail_stream_replication_lag_seconds{source="<entry-id>"}`.
 
 The metrics HTTP server shuts down gracefully (5-second timeout) on command exit.
 

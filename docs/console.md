@@ -140,9 +140,27 @@ immediately; warnings (e.g. short binlog retention) show but don't block.
   stream's saved checkpoint.
 - A per-entry **advisory lock** (`GET_LOCK`) on the index server makes a
   second daemon refuse to double-stream the same entry.
+- **Stream states**: `PENDING` covers launch through the stream's first
+  checkpoint (connecting, snapshotting, finding the start position) — the
+  badge only says `RUNNING` once the stream has proven it is attached and
+  writing. Two unhealthy-but-alive variants surface what used to be silent:
+  `STALLED` (connected but no checkpoint/batch progress for 5+ minutes) and
+  `LOST POSITION` (binlogs were purged past the saved position while
+  monitoring was down — the stream auto-advanced and events in the gap are
+  permanently lost; sticky until you Stop + Start the entry).
 - A failing stream is retried with exponential backoff (15s → 5m) and shows
   as `FAILED` with the scrubbed error; `Stop` requires an explicit click, and
   deleting or re-pointing a *running* entry is refused (409) until stopped.
+  A stream that crash-loops continuously for 6 hours stops retrying
+  (permanent `FAILED`, the message says it gave up) — press Start to re-arm
+  it after fixing the cause.
+- The add-server preflight warns (amber, never blocks) when the new source
+  **looks like a replica or duplicate of an already-monitored one** — GTID
+  lineage comparison; monitoring both would double-index the same changes.
+  Detection needs `gtid_mode=ON`; in position mode the check is skipped.
+- With `--metrics-addr`, the daemon serves one Prometheus `/metrics` endpoint
+  for all supervised streams; every series carries a `source` label set to
+  the entry ID (see [streaming.md](streaming.md)).
 - Registry fields: `source_dsn` (replication credentials — a secret with the
   same masking/keep-password discipline as the index DSN; `source_dsn: ""`
   clears it), `source_server_id` (0 = derived), `schemas`, `monitor_desired`.
@@ -232,7 +250,7 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `POST /api/servers/{id}/test`, `POST /api/servers/test` | Write-free reachability probe (short timeout): `{ok, server_version, dbname, latency_ms, has_index, schema_current}`. Accepts an unsaved candidate body; with `{id}`, a blank password merges the stored one. |
 | `POST /api/servers/{id}/monitor/start` | Supervisor only (403 on the standalone console): doctor preflight → on green, record intent + provision + stream. Returns `{doctor, started, monitor}`. |
 | `POST /api/servers/{id}/monitor/stop` | Supervisor only: clear intent, drain the stream (final checkpoint), release the advisory lock. |
-| `GET /api/servers/{id}/monitor` | Supervisor only: `{monitor: {state, last_error, since}}` — `stopped\|pending\|running\|failed`. |
+| `GET /api/servers/{id}/monitor` | Supervisor only: `{monitor: {state, last_error, since}}` — `stopped\|pending\|running\|stalled\|lost_position\|failed`. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`, `capabilities`,
 `reconstruct`) targets the server named by the `X-Bintrail-Server` request

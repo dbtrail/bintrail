@@ -50,7 +50,8 @@ type serverDTO struct {
 	Schemas           string `json:"schemas,omitempty"`
 	MonitorDesired    bool   `json:"monitor_desired"`
 	// MonitorState is the supervisor's live view (stopped|pending|running|
-	// failed); present only on a supervisor process for entries with a source.
+	// stalled|lost_position|failed — see console.MonitorStatus); present only
+	// on a supervisor process for entries with a source.
 	MonitorState string `json:"monitor_state,omitempty"`
 	// Reconstruct is the per-server Time-travel capability, derived from pure
 	// config (no connection is opened to compute it).

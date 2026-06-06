@@ -293,7 +293,8 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 
 	if len(columns) == 0 {
 		return SnapshotStats{}, fmt.Errorf(
-			"no columns found for the requested schemas; check --schemas and source server permissions")
+			"no columns found for the requested schemas — if the schema has no tables yet, " +
+				"create at least one table first; otherwise check --schemas and source server permissions")
 	}
 
 	// ── 1b. Validate: all tables must be InnoDB with explicit PKs ────────────

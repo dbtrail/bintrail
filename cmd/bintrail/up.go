@@ -217,7 +217,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	supervisor := newMonitorSupervisor(ctx, upIndexDSN)
+	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry)
 	cfg.MonitorCtrl = supervisor
 
 	srv, err := console.New(cfg)
@@ -227,6 +227,14 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	ln, err := srv.Listen()
 	if err != nil {
 		return fmt.Errorf("console: cannot bind %s: %w", upConsoleListen, err)
+	}
+
+	// One daemon-level /metrics endpoint for ALL supervised streams — the
+	// Prometheus registry is process-global and every stream metric carries
+	// a "source" label (the entry ID), so per-stream servers are unnecessary
+	// (and would fight over the bind).
+	if upMetricsAddr != "" {
+		defer startMetricsServer(upMetricsAddr)()
 	}
 
 	fmt.Fprintf(os.Stderr, "\nConsole is running — open it and add the MySQL servers to watch:\n\n    %s\n\n", srv.URL())
@@ -324,8 +332,17 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// The control-plane supervisor: "+ Add server" in the console starts real
 	// monitoring through it. Streams live on the daemon context (ctx), not on
 	// the HTTP requests that start them.
-	supervisor := newMonitorSupervisor(ctx, upIndexDSN)
+	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry)
 	cfg.MonitorCtrl = supervisor
+
+	// With the console comes the multi-stream control plane, so /metrics is
+	// served once at the daemon level (per-source "source" labels keep the
+	// series apart). Clear the flag fan-out so the main stream does not
+	// double-bind the same address inside streamOne.
+	if upMetricsAddr != "" {
+		defer startMetricsServer(upMetricsAddr)()
+		strmMetricsAddr = ""
+	}
 
 	srv, err := console.New(cfg)
 	if err != nil {

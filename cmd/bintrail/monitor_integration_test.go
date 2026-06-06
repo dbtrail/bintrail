@@ -79,7 +79,7 @@ func TestIntegrationMonitorSupervisor(t *testing.T) {
 	t.Cleanup(func() { _, _ = srcDB.Exec("DROP DATABASE IF EXISTS " + srcSchema) })
 	mustExec("CREATE TABLE " + srcSchema + ".items (id INT PRIMARY KEY, qty INT)")
 
-	sup := newMonitorSupervisor(ctx, bootDSN)
+	sup := newMonitorSupervisor(ctx, bootDSN, nil)
 	entry := console.ServerEntry{
 		ID:        fmt.Sprintf("itest%d", time.Now().UnixNano()%1e9),
 		Name:      "integration",
@@ -139,7 +139,7 @@ func TestIntegrationMonitorSupervisor(t *testing.T) {
 	waitStreamLive(t, srcDB, idxDB, srcSchema, "items", "id")
 
 	// The advisory lock: a second supervisor (second daemon) must refuse.
-	sup2 := newMonitorSupervisor(ctx, bootDSN)
+	sup2 := newMonitorSupervisor(ctx, bootDSN, nil)
 	if err := sup2.Start(ctx, entry); err == nil || !strings.Contains(err.Error(), "already monitoring") {
 		t.Fatalf("second daemon Start: err=%v, want advisory-lock refusal", err)
 	}
@@ -209,7 +209,7 @@ func TestIntegrationDDLThenImmediateInserts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sup := newMonitorSupervisor(ctx, bootDSN)
+	sup := newMonitorSupervisor(ctx, bootDSN, nil)
 	entry := console.ServerEntry{
 		ID:        fmt.Sprintf("ddlrace%d", time.Now().UnixNano()%1e9),
 		Name:      "ddl-race",
