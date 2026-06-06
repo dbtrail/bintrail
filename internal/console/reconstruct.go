@@ -23,6 +23,10 @@ var reconstructMaxEvents = 10000
 
 type capabilitiesResponse struct {
 	Reconstruct bool `json:"reconstruct"`
+	// Monitor: this process can start/stop monitoring (a control-plane
+	// supervisor — `bintrail up --console`). Process-global, not per-server:
+	// it is about what the PROCESS is, not about the selected connection.
+	Monitor bool `json:"monitor"`
 }
 
 // handleCapabilities reports which optional console surfaces are enabled for
@@ -35,7 +39,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	if b == nil {
 		return
 	}
-	writeJSON(w, http.StatusOK, capabilitiesResponse{Reconstruct: b.baselineConfigured})
+	writeJSON(w, http.StatusOK, capabilitiesResponse{Reconstruct: b.baselineConfigured, Monitor: s.monitor})
 }
 
 // stateEntryDTO is the wire view of a reconstruct.StateEntry (that struct has no

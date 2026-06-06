@@ -59,6 +59,13 @@ type Config struct {
 	// header (in addition to IP literals and localhost), for operators who
 	// front the console with a DNS name.
 	AllowedHosts []string
+	// Monitor reports whether THIS PROCESS is a control-plane supervisor that
+	// can start/stop monitoring (true only under `bintrail up --console`,
+	// which is the write-capable daemon). The standalone read-only console
+	// never sets it: /api/capabilities reports monitor:false there and the
+	// monitor verbs (phase 3) refuse at the endpoint, mirroring how
+	// reconstruct gates on baselineConfigured.
+	Monitor bool
 	// BaselineDir / BaselineS3 enable point-in-time reconstruct (Phase 2) on
 	// the boot entry. When either is set (and no RBAC profile is active), the
 	// "Reconstruct" surface is exposed. BaselineDir takes precedence;
@@ -77,8 +84,10 @@ type Server struct {
 	denyTables   []query.SchemaTable
 	redactCols   []query.SchemaTableColumn
 	allowedHosts []string
-	cm           *connManager
-	mux          http.Handler
+	// monitor: this process is a control-plane supervisor (see Config.Monitor).
+	monitor bool
+	cm      *connManager
+	mux     http.Handler
 }
 
 // serverHeader selects the target server per request. Selection is stateless —
@@ -121,6 +130,7 @@ func New(cfg Config) (*Server, error) {
 		denyTables:   cfg.DenyTables,
 		redactCols:   cfg.RedactColumns,
 		allowedHosts: cfg.AllowedHosts,
+		monitor:      cfg.Monitor,
 		cm:           newConnManager(cfg.Registry, profileActive),
 	}
 

@@ -38,6 +38,17 @@ type serverDTO struct {
 	BaselineDir string            `json:"baseline_dir,omitempty"`
 	BaselineS3  string            `json:"baseline_s3,omitempty"`
 	NoArchive   bool              `json:"no_archive"`
+	// Source-monitoring config (control plane). HasSource reports whether a
+	// source DSN is configured at all; the parts are its masked view — the
+	// source DSN itself (replication credentials) never leaves the process.
+	HasSource         bool   `json:"has_source"`
+	SourceHost        string `json:"source_host,omitempty"`
+	SourcePort        string `json:"source_port,omitempty"`
+	SourceUser        string `json:"source_user,omitempty"`
+	HasSourcePassword bool   `json:"has_source_password,omitempty"`
+	SourceServerID    uint32 `json:"source_server_id,omitempty"`
+	Schemas           string `json:"schemas,omitempty"`
+	MonitorDesired    bool   `json:"monitor_desired"`
 	// Reconstruct is the per-server Time-travel capability, derived from pure
 	// config (no connection is opened to compute it).
 	Reconstruct bool `json:"reconstruct"`
@@ -58,6 +69,11 @@ type serversResponse struct {
 // serverRequest is the JSON body for POST/PUT /api/servers and test probes.
 // Either a full dsn or the structured fields. Password is a *string so PUT
 // distinguishes "omitted = keep the stored password" from `"" = clear it`.
+//
+// The source-monitoring config mirrors the index-DSN discipline one level up:
+// SourceDSN is a *string — omitted/null builds from the structured source
+// fields over the stored source DSN (keep semantics), "" clears the source
+// config entirely (back to a view-only entry), a value replaces it verbatim.
 type serverRequest struct {
 	Name        string  `json:"name"`
 	DSN         string  `json:"dsn"`
@@ -69,6 +85,14 @@ type serverRequest struct {
 	BaselineDir string  `json:"baseline_dir"`
 	BaselineS3  string  `json:"baseline_s3"`
 	NoArchive   bool    `json:"no_archive"`
+
+	SourceDSN      *string `json:"source_dsn"`
+	SourceHost     string  `json:"source_host"`
+	SourcePort     string  `json:"source_port"`
+	SourceUser     string  `json:"source_user"`
+	SourcePassword *string `json:"source_password"`
+	SourceServerID uint32  `json:"source_server_id"`
+	Schemas        string  `json:"schemas"`
 }
 
 // testResponse is the probe result. HasIndex/SchemaCurrent are tri-state
@@ -138,12 +162,20 @@ func (s *Server) handleServersCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	sourceDSN, err := buildSourceDSN(req, "")
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	entry := ServerEntry{
-		Name:        strings.TrimSpace(req.Name),
-		DSN:         dsn,
-		BaselineDir: req.BaselineDir,
-		BaselineS3:  req.BaselineS3,
-		NoArchive:   req.NoArchive,
+		Name:           strings.TrimSpace(req.Name),
+		DSN:            dsn,
+		BaselineDir:    req.BaselineDir,
+		BaselineS3:     req.BaselineS3,
+		NoArchive:      req.NoArchive,
+		SourceDSN:      sourceDSN,
+		SourceServerID: req.SourceServerID,
+		Schemas:        req.Schemas,
 	}
 	added, err := s.cm.reg.Add(entry)
 	if err != nil {
@@ -178,6 +210,11 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	sourceDSN, err := buildSourceDSN(req, old.SourceDSN)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	entry := ServerEntry{
 		ID:          id,
 		Name:        strings.TrimSpace(req.Name),
@@ -185,6 +222,12 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 		BaselineDir: req.BaselineDir,
 		BaselineS3:  req.BaselineS3,
 		NoArchive:   req.NoArchive,
+		SourceDSN:   sourceDSN,
+		// The verbs that flip monitoring intent arrive with the supervisor
+		// (phase 3); a plain edit must not silently start or stop anything.
+		MonitorDesired: old.MonitorDesired,
+		SourceServerID: req.SourceServerID,
+		Schemas:        req.Schemas,
 	}
 	if err := s.cm.reg.Update(entry); err != nil {
 		writeJSONError(w, registryErrStatus(err), err.Error())
@@ -397,23 +440,127 @@ func buildDSN(req serverRequest, stored string) (string, error) {
 	return cfg.FormatDSN(), nil
 }
 
+// buildSourceDSN assembles the stored SOURCE DSN (replication credentials)
+// for a create/update request. Tri-state on req.SourceDSN: nil → build from
+// the structured source fields layered over the stored source DSN (keep
+// semantics, password merged via req.SourcePassword's own tri-state); "" →
+// clear the source config entirely (back to a view-only entry); a value →
+// used verbatim. Validation differs from the index DSN: replication needs a
+// TCP address and a user, but NO database name (a source DSN is server-level,
+// e.g. user:pass@tcp(host:3306)/).
+func buildSourceDSN(req serverRequest, stored string) (string, error) {
+	if req.SourceDSN != nil {
+		raw := *req.SourceDSN
+		if raw == "" {
+			return "", nil // explicit clear
+		}
+		if req.SourcePassword != nil {
+			return "", errors.New("specify either source_dsn or the structured source_password field, not both (a dsn carries its own password)")
+		}
+		cfg, err := mysql.ParseDSN(raw)
+		if err != nil {
+			return "", fmt.Errorf("invalid source_dsn: %s", scrubDSNError(err, raw))
+		}
+		if strings.EqualFold(cfg.Net, "unix") {
+			return "", errors.New("source_dsn uses a unix socket; binlog replication requires a TCP address")
+		}
+		return raw, nil
+	}
+
+	// No raw DSN and no structured fields → keep the stored config as-is.
+	if req.SourceHost == "" && req.SourcePort == "" && req.SourceUser == "" && req.SourcePassword == nil {
+		return stored, nil
+	}
+
+	var cfg *mysql.Config
+	if stored != "" {
+		parsed, err := mysql.ParseDSN(stored)
+		if err != nil {
+			return "", fmt.Errorf("stored source DSN is invalid; resubmit with a full source_dsn: %s", scrubDSNError(err, stored))
+		}
+		cfg = parsed
+	} else {
+		cfg = mysql.NewConfig()
+		cfg.Net = "tcp"
+	}
+
+	host, port := req.SourceHost, req.SourcePort
+	if host != "" || port != "" {
+		if host == "" {
+			if h, _, err := net.SplitHostPort(cfg.Addr); err == nil {
+				host = h
+			} else {
+				host = cfg.Addr
+			}
+		}
+		if port == "" {
+			// Host-only edit keeps the stored port (same symmetry as buildDSN).
+			if _, p, err := net.SplitHostPort(cfg.Addr); err == nil && p != "" {
+				port = p
+			} else {
+				port = "3306"
+			}
+		}
+		cfg.Net = "tcp"
+		cfg.Addr = net.JoinHostPort(host, port)
+	}
+	if req.SourceUser != "" {
+		cfg.User = req.SourceUser
+	}
+	if req.SourcePassword != nil {
+		cfg.Passwd = *req.SourcePassword
+	}
+	if cfg.Addr == "" {
+		return "", errors.New("source_host is required")
+	}
+	if cfg.User == "" {
+		return "", errors.New("source_user is required")
+	}
+	return cfg.FormatDSN(), nil
+}
+
 // entryDTO masks a registry entry for the wire: parsed non-secret DSN parts
 // plus has_password. The DSN string itself never leaves the process.
 func (s *Server) entryDTO(e ServerEntry) serverDTO {
 	dto := serverDTO{
-		ID:          e.ID,
-		Name:        e.Name,
-		Kind:        "registry",
-		BaselineDir: e.BaselineDir,
-		BaselineS3:  e.BaselineS3,
-		NoArchive:   e.NoArchive,
-		Reconstruct: s.cm.capability(e),
-		Editable:    !s.cm.reg.ReadOnly(),
-		Deletable:   !s.cm.reg.ReadOnly(),
-		Connected:   s.cm.cached(e.ID),
+		ID:             e.ID,
+		Name:           e.Name,
+		Kind:           "registry",
+		BaselineDir:    e.BaselineDir,
+		BaselineS3:     e.BaselineS3,
+		NoArchive:      e.NoArchive,
+		Reconstruct:    s.cm.capability(e),
+		Editable:       !s.cm.reg.ReadOnly(),
+		Deletable:      !s.cm.reg.ReadOnly(),
+		Connected:      s.cm.cached(e.ID),
+		SourceServerID: e.SourceServerID,
+		Schemas:        e.Schemas,
+		MonitorDesired: e.MonitorDesired,
 	}
 	fillDSNParts(&dto, e.DSN)
+	fillSourceDSNParts(&dto, e.SourceDSN)
 	return dto
+}
+
+// fillSourceDSNParts decomposes the source DSN into the masked DTO fields —
+// the replication credentials themselves never leave the process. Parse
+// failures leave the parts blank rather than leaking the raw string.
+func fillSourceDSNParts(dto *serverDTO, dsn string) {
+	if dsn == "" {
+		return
+	}
+	dto.HasSource = true
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return
+	}
+	if h, p, err := net.SplitHostPort(cfg.Addr); err == nil {
+		dto.SourceHost, dto.SourcePort = h, p
+	} else {
+		dto.SourceHost = cfg.Addr
+	}
+	dto.SourceUser = cfg.User
+	dto.HasSourcePassword = cfg.Passwd != ""
 }
 
 // bootDTO renders the ephemeral command-line entry, when one exists.

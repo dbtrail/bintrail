@@ -287,6 +287,9 @@ func upConsoleConfig(db *sql.DB, indexDSN, listen, token, baselineDir, baselineS
 		Token:       token,
 		BaselineDir: baselineDir,
 		BaselineS3:  baselineS3,
+		// `up` is the write-capable daemon — the only process that may become
+		// a control-plane supervisor. The standalone console never sets this.
+		Monitor: true,
 	}, nil
 }
 

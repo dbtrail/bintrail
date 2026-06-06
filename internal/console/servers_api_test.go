@@ -360,6 +360,132 @@ func TestBuildDSNMerge(t *testing.T) {
 	}
 }
 
+// TestServersAPISourceSecrecy: the source DSN carries REPLICATION credentials
+// — the masking discipline must hold for it exactly as for the index DSN, on
+// create, get, list, and across keep/clear/replace edits.
+func TestServersAPISourceSecrecy(t *testing.T) {
+	srv := newRegistryServer(t)
+
+	rec, body := doServersReq(t, srv, "POST", "/api/servers",
+		`{"name":"prod","host":"h","user":"u","password":"idxpw","dbname":"db",`+
+			`"source_host":"db.prod","source_port":"3307","source_user":"repl","source_password":"`+secretPW+`","schemas":"shop"}`)
+	if rec.Code != 201 {
+		t.Fatalf("create: code=%d body=%s", rec.Code, body)
+	}
+	if strings.Contains(string(body), secretPW) || strings.Contains(string(body), "@tcp(") {
+		t.Fatalf("create response leaked a source secret: %s", body)
+	}
+	var created serverDTO
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	if !created.HasSource || created.SourceHost != "db.prod" || created.SourcePort != "3307" ||
+		created.SourceUser != "repl" || !created.HasSourcePassword || created.Schemas != "shop" {
+		t.Errorf("masked source parts wrong: %+v", created)
+	}
+	if created.MonitorDesired {
+		t.Error("a plain create must not set monitor_desired (the verbs arrive in phase 3)")
+	}
+
+	storedSource := func() string {
+		e, _ := srv.cm.reg.Get(created.ID)
+		return e.SourceDSN
+	}
+
+	// Keep semantics: an edit that omits every source field keeps the config.
+	doServersReq(t, srv, "PUT", "/api/servers/"+created.ID,
+		`{"name":"prod-2","host":"h","user":"u","dbname":"db","schemas":"shop"}`)
+	if got := storedSource(); !strings.Contains(got, "repl:"+secretPW+"@tcp(db.prod:3307)/") {
+		t.Errorf("source config must survive an unrelated edit; got %q", got)
+	}
+
+	// Source password keep: structured source edit without source_password.
+	doServersReq(t, srv, "PUT", "/api/servers/"+created.ID,
+		`{"name":"prod-2","host":"h","user":"u","dbname":"db","source_host":"db2.prod","schemas":"shop"}`)
+	got := storedSource()
+	cfg, err := mysql.ParseDSN(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Passwd != secretPW {
+		t.Errorf("source password must be kept on a structured edit; got %q", cfg.Passwd)
+	}
+	if cfg.Addr != "db2.prod:3307" {
+		t.Errorf("host-only source edit must keep the stored port; addr=%q", cfg.Addr)
+	}
+
+	// Explicit clear: source_dsn "" returns the entry to view-only.
+	rec, body = doServersReq(t, srv, "PUT", "/api/servers/"+created.ID,
+		`{"name":"prod-2","host":"h","user":"u","dbname":"db","source_dsn":""}`)
+	if rec.Code != 200 {
+		t.Fatalf("clear: code=%d body=%s", rec.Code, body)
+	}
+	if got := storedSource(); got != "" {
+		t.Errorf("source_dsn:\"\" must clear the source config; got %q", got)
+	}
+	var cleared serverDTO
+	if err := json.Unmarshal(body, &cleared); err != nil {
+		t.Fatal(err)
+	}
+	if cleared.HasSource {
+		t.Error("cleared entry must report has_source=false")
+	}
+}
+
+func TestBuildSourceDSNValidation(t *testing.T) {
+	pw := "x"
+	cases := []struct {
+		name string
+		req  serverRequest
+	}{
+		{"raw + structured password", serverRequest{SourceDSN: strPtr("u:p@tcp(h:3306)/"), SourcePassword: &pw}},
+		{"unix socket", serverRequest{SourceDSN: strPtr("u:p@unix(/var/run/mysqld.sock)/")}},
+		{"structured without host", serverRequest{SourceUser: "repl"}},
+		{"structured without user", serverRequest{SourceHost: "h"}},
+	}
+	for _, tc := range cases {
+		if _, err := buildSourceDSN(tc.req, ""); err == nil {
+			t.Errorf("%s: expected error", tc.name)
+		}
+	}
+
+	// A source DSN needs NO database name (server-level), unlike the index DSN.
+	got, err := buildSourceDSN(serverRequest{SourceHost: "h", SourceUser: "repl"}, "")
+	if err != nil {
+		t.Fatalf("dbname-less source must be valid: %v", err)
+	}
+	if cfg, _ := mysql.ParseDSN(got); cfg.DBName != "" || cfg.Addr != "h:3306" {
+		t.Errorf("structured source build wrong: %q", got)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+// TestCapabilityMonitorGate: only a supervisor process (Config.Monitor, set by
+// `up --console`) advertises the monitor capability; the standalone read-only
+// console never does.
+func TestCapabilityMonitorGate(t *testing.T) {
+	for _, monitor := range []bool{true, false} {
+		reg, _ := LoadRegistry("")
+		srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg, Monitor: monitor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.cm.boot = &bundle{} // a resolvable default so capabilities answers
+		rec, body := doServersReq(t, srv, "GET", "/api/capabilities", "")
+		if rec.Code != 200 {
+			t.Fatalf("capabilities: code=%d body=%s", rec.Code, body)
+		}
+		var caps capabilitiesResponse
+		if err := json.Unmarshal(body, &caps); err != nil {
+			t.Fatal(err)
+		}
+		if caps.Monitor != monitor {
+			t.Errorf("monitor capability = %v, want %v", caps.Monitor, monitor)
+		}
+	}
+}
+
 // TestResolveNoServers: an empty console (no boot entry, empty registry) must
 // return the user-facing errNoServers, which the HTTP layer maps to 404.
 func TestResolveNoServers(t *testing.T) {

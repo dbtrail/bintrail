@@ -190,6 +190,36 @@ func TestRegistryFilePerms(t *testing.T) {
 	}
 }
 
+// TestRegistrySourceFieldsRoundTrip: the control-plane fields (source DSN,
+// server id, schemas, monitor intent) persist and reload like every other
+// typed field.
+func TestRegistrySourceFieldsRoundTrip(t *testing.T) {
+	r, path := tmpRegistry(t)
+	added, err := r.Add(ServerEntry{
+		Name:           "prod",
+		DSN:            "u:p@tcp(h:3306)/binlog_index",
+		SourceDSN:      "repl:" + secretPW + "@tcp(db.prod:3306)/",
+		SourceServerID: 4242,
+		Schemas:        "shop,billing",
+		MonitorDesired: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := r2.Get(added.ID)
+	if !ok {
+		t.Fatal("entry lost")
+	}
+	if got.SourceDSN != "repl:"+secretPW+"@tcp(db.prod:3306)/" ||
+		got.SourceServerID != 4242 || got.Schemas != "shop,billing" || !got.MonitorDesired {
+		t.Errorf("source fields round-trip mismatch: %+v", got)
+	}
+}
+
 // TestRegistryCorruptFileFailsLoud: the cmd layer's fail-loud stance rests on
 // LoadRegistry erroring for garbage — silently starting with zero servers
 // would look like data loss.

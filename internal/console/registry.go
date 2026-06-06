@@ -52,6 +52,25 @@ type ServerEntry struct {
 	BaselineS3  string `yaml:"baseline_s3,omitempty"`
 	NoArchive   bool   `yaml:"no_archive,omitempty"`
 
+	// ── Control-plane fields (phase 2 of the approved blueprint) ──
+	// These configure MONITORING of a source MySQL; the supervisor in
+	// `bintrail up --console` consumes them (phase 3). On binaries that
+	// predate them they round-trip untouched through Extra.
+
+	// SourceDSN is the source MySQL to monitor — replication credentials,
+	// a secret exactly like DSN, never serialized to any HTTP response.
+	// Empty = a view-only entry (no monitoring configured).
+	SourceDSN string `yaml:"source_dsn,omitempty"`
+	// SourceServerID overrides the auto-derived replica server id (0 = derive
+	// from the source DSN, the same rule as `bintrail up`).
+	SourceServerID uint32 `yaml:"source_server_id,omitempty"`
+	// Schemas is the optional comma-separated schema filter for monitoring.
+	Schemas string `yaml:"schemas,omitempty"`
+	// MonitorDesired records the operator's intent to monitor this source.
+	// The supervisor reconciles running streams against it at boot and on
+	// every edit; nothing reads it until phase 3.
+	MonitorDesired bool `yaml:"monitor_desired,omitempty"`
+
 	// Extra is the forward-compat catch-all: unknown fields written by a NEWER
 	// bintrail (e.g. the phase-2 control plane's source_dsn / server_id /
 	// monitor_state) land here on load and re-emit verbatim on save, so an

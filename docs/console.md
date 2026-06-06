@@ -116,9 +116,22 @@ Security notes specific to the registry:
   everything else.
 
 The registry file is versioned and forward-compatible: fields written by a
-newer bintrail (e.g. a future control-plane's `source_dsn`) survive
-load→edit→save round-trips on an older binary, and a file written by a newer
-*schema* version loads read-only rather than being rewritten lossily.
+newer bintrail survive load→edit→save round-trips on an older binary, and a
+file written by a newer *schema* version loads read-only rather than being
+rewritten lossily.
+
+### Source-monitoring fields (control plane, in progress)
+
+Registry entries can additionally carry a **source** configuration —
+`source_dsn` (replication credentials, a secret with the same masking and
+keep-password discipline as the index DSN), `source_server_id`, `schemas`,
+and `monitor_desired`. These are accepted and persisted by the API today
+(`source_host`/`source_port`/`source_user`/`source_password` structured
+fields, or a raw `source_dsn`; `source_dsn: ""` clears the config), and
+`GET /api/capabilities` reports a `monitor` capability that is true only
+under `bintrail up --console` — the write-capable daemon. The verbs that
+actually start/stop monitoring ship with the supervisor; the standalone
+read-only console will never offer them.
 
 ## Flags
 
