@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
+
+	"github.com/dbtrail/bintrail/internal/metadata"
 )
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -343,5 +345,77 @@ func TestStreamParser_mixedSequenceGTIDOnly(t *testing.T) {
 	ev := <-out
 	if ev.EventType != EventGTID {
 		t.Errorf("expected EventGTID (%d), got %d", EventGTID, ev.EventType)
+	}
+}
+
+// ─── Synchronous DDL hook (#396) ──────────────────────────────────────────────
+
+// TestStreamParser_syncDDLHookOrdering locks the #396 fix: the hook runs
+// synchronously inside Run — after the DDL is emitted, before ANY subsequent
+// event is decoded. Observable two ways: (1) when the hook runs, the output
+// channel holds exactly the DDL (the following event cannot have been
+// processed yet); (2) a resolver swapped inside the hook is what stamps the
+// NEXT event's SchemaVersion.
+func TestStreamParser_syncDDLHookOrdering(t *testing.T) {
+	r1 := metadata.NewResolverFromTables(1, nil)
+	sp := NewStreamParser(r1, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	hookRuns := 0
+	sp.SetSyncDDLHook(func(ev Event) {
+		hookRuns++
+		if ev.EventType != EventDDL {
+			t.Errorf("hook received %v, want EventDDL", ev.EventType)
+		}
+		if ev.SchemaVersion != 1 {
+			t.Errorf("first DDL SchemaVersion = %d, want pre-swap 1", ev.SchemaVersion)
+		}
+		// The DDL itself is emitted; the event AFTER it must not be yet.
+		if got := len(out); got != 1 {
+			t.Errorf("hook must run before the next event is processed; out holds %d events", got)
+		}
+		// The snapshot-refresh stand-in: the very next decode must see this.
+		sp.SwapResolver(metadata.NewResolverFromTables(99, nil))
+		sp.SetSyncDDLHook(nil) // only assert the first DDL
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel,
+		makeQueryEvent("CREATE TABLE mydb.orders (id INT)"),
+		makeQueryEvent("ALTER TABLE mydb.orders ADD COLUMN qty INT"),
+	)
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if hookRuns != 1 {
+		t.Fatalf("hook ran %d times, want 1 (unregistered after the first DDL)", hookRuns)
+	}
+	close(out)
+	var evs []Event
+	for ev := range out {
+		evs = append(evs, ev)
+	}
+	if len(evs) != 2 {
+		t.Fatalf("expected 2 DDL events, got %d", len(evs))
+	}
+	if evs[1].SchemaVersion != 99 {
+		t.Errorf("post-hook event SchemaVersion = %d, want 99 (the in-hook swap must land before the next decode)", evs[1].SchemaVersion)
+	}
+}
+
+// TestStreamParser_nilHookUnaffected: without a hook the DDL path behaves as
+// before (agent and tests that never register one).
+func TestStreamParser_nilHookUnaffected(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel, makeQueryEvent("CREATE TABLE mydb.t (id INT)"))
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(out) != 1 {
+		t.Errorf("expected the DDL event, got %d events", len(out))
 	}
 }

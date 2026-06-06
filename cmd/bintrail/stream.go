@@ -700,9 +700,14 @@ func detectGTIDGap(sourceDB *sql.DB, checkpointGTID string, timeout time.Duratio
 
 // streamLoop consumes parser events, flushes batches to MySQL, and writes
 // checkpoints to stream_state at the given interval.
-// onDDL is called when a DDL event is received (after flushing the current batch).
-// It may be nil, in which case no handler callback is invoked (position/GTID
-// tracking still occurs).
+//
+// DDL events flush the current batch and are never inserted. The DDL
+// HANDLING (auto-snapshot + resolver swap + schema_changes record) is NOT
+// done here on purpose: this loop runs behind the parser through a buffered
+// channel, so by the time a DDL reaches it the parser has already decoded —
+// and, for a new table, skipped — the rows that followed the DDL in the
+// binlog. That work lives in the parser's synchronous DDL hook
+// (StreamParser.SetSyncDDLHook, #396).
 func streamLoop(
 	ctx context.Context,
 	events <-chan parser.Event,
@@ -710,7 +715,6 @@ func streamLoop(
 	db *sql.DB,
 	checkpointInterval time.Duration,
 	state *streamState,
-	onDDL func(parser.Event) error,
 ) error {
 	batch := make([]parser.Event, 0, idx.BatchSize())
 	ticker := time.NewTicker(checkpointInterval)
@@ -785,16 +789,11 @@ func streamLoop(
 				continue
 			}
 
-			// DDL events: flush batch, invoke handler, skip insertion.
+			// DDL events: flush batch, skip insertion (handled by the
+			// parser's synchronous hook — see the function comment).
 			if ev.EventType == parser.EventDDL {
 				if err := flush(); err != nil {
 					return err
-				}
-				if onDDL != nil {
-					if err := onDDL(ev); err != nil {
-						slog.Error("DDL handler failed", "error", err,
-						"file", ev.BinlogFile, "pos", ev.EndPos)
-					}
 				}
 				continue
 			}
@@ -1220,24 +1219,21 @@ func streamOne(ctx context.Context, cfg streamConfig) error {
 		}()
 	}
 
-	// ── 10. Launch StreamParser in a goroutine ──────────────────────────────────
+	// ── 10. StreamParser + its synchronous DDL hook ──────────────────────────
 	sp := parser.NewStreamParser(resolver, filters, nil)
 	idx := indexer.New(indexDB, cfg.BatchSize)
 
-	events := make(chan parser.Event, 1000)
-	parseErrCh := make(chan error, 1)
-
-	go func() {
-		defer close(events)
-		parseErrCh <- sp.Run(ctx, streamer, events)
-	}()
-
-	// ── 11. DDL auto-snapshot handler ────────────────────────────────────────────
+	// ── 11. DDL auto-snapshot hook — registered BEFORE Run starts so even a
+	// DDL arriving in the first events cannot miss it ─────────────────────────
+	// Registered on the parser, not on streamLoop: the binlog is sequential
+	// (`CREATE TABLE t; INSERT INTO t;`), so the resolver must be refreshed
+	// before the parser decodes the events that FOLLOW the DDL — a
+	// consumer-side handler ran too late and the trailing rows were skipped
+	// as "table not in snapshot" (#396). Best-effort: failures are logged and
+	// streaming continues with the previous schema.
+	// TRUNCATE does not change schema structure, so it only records the change.
 	schemas := parseSchemaList(cfg.Schemas)
-	// ddlHandler performs best-effort snapshot + recording. It always returns nil
-	// so that streaming continues even if the snapshot or recording fails.
-	// TRUNCATE does not change schema structure, so skip snapshot for it.
-	ddlHandler := func(ev parser.Event) error {
+	sp.SetSyncDDLHook(func(ev parser.Event) {
 		if ev.DDLType == parser.DDLTruncateTable {
 			slog.Info("DDL detected (no snapshot needed)",
 				"file", ev.BinlogFile, "pos", ev.EndPos,
@@ -1245,7 +1241,7 @@ func streamOne(ctx context.Context, cfg streamConfig) error {
 			if err := insertSchemaChange(indexDB, ev, nil); err != nil {
 				slog.Warn("failed to record schema change", "error", err)
 			}
-			return nil
+			return
 		}
 
 		slog.Info("DDL detected — taking auto-snapshot",
@@ -1274,13 +1270,20 @@ func streamOne(ctx context.Context, cfg streamConfig) error {
 		if err := insertSchemaChange(indexDB, ev, snapID); err != nil {
 			slog.Warn("failed to record schema change", "error", err)
 		}
-		return nil
-	}
+	})
+
+	events := make(chan parser.Event, 1000)
+	parseErrCh := make(chan error, 1)
+
+	go func() {
+		defer close(events)
+		parseErrCh <- sp.Run(ctx, streamer, events)
+	}()
 
 	// ── 12. Run stream loop with checkpointing ──────────────────────────────────
 	fmt.Printf("Streaming started (server-id=%d, checkpoint=%ds)\n", cfg.ServerID, cfg.Checkpoint)
 	loopErr := streamLoop(ctx, events, idx, indexDB,
-		time.Duration(cfg.Checkpoint)*time.Second, state, ddlHandler)
+		time.Duration(cfg.Checkpoint)*time.Second, state)
 
 	parseErr := <-parseErrCh
 

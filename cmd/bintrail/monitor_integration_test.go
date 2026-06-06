@@ -142,3 +142,112 @@ func TestIntegrationMonitorSupervisor(t *testing.T) {
 	}
 	_, _ = idxDB.Exec("SELECT RELEASE_LOCK(?)", "bintrail_monitor_"+entry.ID)
 }
+
+// TestIntegrationDDLThenImmediateInserts is the #396 regression: a
+// `CREATE TABLE …; INSERT …; UPDATE …; DELETE …;` burst against a LIVE stream
+// must index every trailing row event. Before the synchronous parser-side DDL
+// hook, the consumer-side auto-snapshot raced the parser and the rows that
+// followed the DDL in the binlog were silently skipped ("table not in
+// snapshot") and permanently lost.
+func TestIntegrationDDLThenImmediateInserts(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, bootName := testutil.CreateTestDB(t)
+	bootDSN := testutil.IntegrationDSN(bootName)
+
+	srcDB, err := sql.Open("mysql", testutil.BaseDSN()+"/?parseTime=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srcDB.Close()
+	srcSchema := fmt.Sprintf("ddlrace_%d", time.Now().UnixNano()%1e9)
+	if _, err := srcDB.Exec("CREATE DATABASE " + srcSchema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = srcDB.Exec("DROP DATABASE IF EXISTS " + srcSchema) })
+	// A pre-existing table so the STARTUP snapshot has something to capture —
+	// the bug under test is about a table created LATER, mid-stream.
+	if _, err := srcDB.Exec("CREATE TABLE " + srcSchema + ".seed (id INT PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+
+	sup := newMonitorSupervisor(ctx, bootDSN)
+	entry := console.ServerEntry{
+		ID:        fmt.Sprintf("ddlrace%d", time.Now().UnixNano()%1e9),
+		Name:      "ddl-race",
+		SourceDSN: testutil.BaseDSN() + "/",
+		Schemas:   srcSchema,
+	}
+	derived, err := sup.DeriveIndexDSN(entry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.DSN = derived
+	t.Cleanup(func() { _, _ = srcDB.Exec("DROP DATABASE IF EXISTS bintrail_idx_" + entry.ID) })
+
+	if err := sup.Start(ctx, entry); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop(context.Background(), entry.ID) })
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && sup.Status(entry.ID).State != "running" {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if st := sup.Status(entry.ID); st.State != "running" {
+		t.Fatalf("stream not running: %+v", st)
+	}
+
+	// THE repro: the table is created WHILE the stream is live, with the row
+	// events immediately behind the DDL in the binlog — one multi-statement
+	// burst, no pause for any snapshot to win a race.
+	if _, err := srcDB.Exec("CREATE TABLE " + srcSchema + ".burst (id INT PRIMARY KEY, v VARCHAR(20))"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srcDB.Exec("INSERT INTO " + srcSchema + ".burst VALUES (1,'a'),(2,'b')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srcDB.Exec("UPDATE " + srcSchema + ".burst SET v='z' WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srcDB.Exec("DELETE FROM " + srcSchema + ".burst WHERE id=2"); err != nil {
+		t.Fatal(err)
+	}
+
+	idxDB, err := sql.Open("mysql", derived)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idxDB.Close()
+
+	// 3 row events (INSERT batch counts once per row? InsertEvent granularity:
+	// the indexer writes one row per affected row — INSERT(2 rows) + UPDATE(1)
+	// + DELETE(1) = 4) must ALL land; before the fix this was 0.
+	var count int
+	deadline = time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = idxDB.QueryRow(
+			"SELECT COUNT(*) FROM binlog_events WHERE schema_name = ? AND table_name = 'burst'",
+			srcSchema).Scan(&count)
+		if count >= 4 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if count < 4 {
+		t.Fatalf("rows immediately after the DDL were lost: indexed %d of 4 (#396)", count)
+	}
+
+	// And the DDL itself was recorded with a fresh snapshot.
+	var changes int
+	if err := idxDB.QueryRow(
+		"SELECT COUNT(*) FROM schema_changes WHERE table_name = 'burst'").Scan(&changes); err != nil {
+		t.Fatal(err)
+	}
+	if changes < 1 {
+		t.Errorf("schema_changes must record the CREATE TABLE, got %d rows", changes)
+	}
+}

@@ -22,6 +22,10 @@ type StreamParser struct {
 	filters       Filters
 	logger        *slog.Logger
 	schemaVersion atomic.Uint32 // actual snapshot_id from schema_snapshots; updated by SwapResolver
+	// onDDL, when set, runs SYNCHRONOUSLY inside Run after a DDL event is
+	// emitted and before ANY subsequent binlog event is decoded. See
+	// SetSyncDDLHook for why this must not move off the parse path.
+	onDDL atomic.Pointer[func(Event)]
 }
 
 // NewStreamParser creates a StreamParser that resolves column names via
@@ -45,6 +49,30 @@ func NewStreamParser(resolver *metadata.Resolver, filters Filters, logger *slog.
 func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
 	sp.schemaVersion.Store(uint32(r.SnapshotID()))
 	sp.resolver.Store(r)
+}
+
+// SetSyncDDLHook registers fn to run synchronously inside Run, after each DDL
+// event is emitted and BEFORE any subsequent binlog event is decoded.
+//
+// This is the ONLY correct place for the auto-snapshot-on-DDL work (#396):
+// the binlog is sequential — `CREATE TABLE t; INSERT INTO t;` puts the row
+// events immediately after the DDL — but the parser goroutine runs ahead of
+// the consumer through the events channel. A consumer-side handler swaps the
+// resolver only after the parser has already decoded (and, for an unknown
+// table, silently skipped) the rows that followed the DDL. Blocking the parse
+// loop until fn returns closes that window: fn typically takes a fresh schema
+// snapshot and calls SwapResolver, so the very next row event decodes with
+// the post-DDL schema.
+//
+// While fn runs, no new events are produced (the replication connection
+// buffers server-side); consumers keep draining already-emitted events.
+// Safe to call concurrently with Run.
+func (sp *StreamParser) SetSyncDDLHook(fn func(Event)) {
+	if fn == nil {
+		sp.onDDL.Store(nil)
+		return
+	}
+	sp.onDDL.Store(&fn)
 }
 
 // Run reads events from the streamer and sends matching row events to out.
@@ -97,6 +125,12 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 				case out <- ddlEv:
 				case <-ctx.Done():
 					return nil
+				}
+				// Synchronous DDL hook: the resolver refresh must complete
+				// before the next event is decoded, or the rows that follow a
+				// CREATE/ALTER in the binlog are skipped as unknown (#396).
+				if hook := sp.onDDL.Load(); hook != nil {
+					(*hook)(ddlEv)
 				}
 			}
 

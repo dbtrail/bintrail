@@ -229,7 +229,7 @@ func TestStreamLoop_flushAndCheckpoint(t *testing.T) {
 		serverID: 1,
 	}
 
-	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, nil); err != nil {
+	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state); err != nil {
 		t.Fatalf("streamLoop: %v", err)
 	}
 
@@ -343,7 +343,7 @@ func TestStreamLoop_liveReplication(t *testing.T) {
 	}()
 
 	state := &streamState{mode: "position", serverID: 99998}
-	if err := streamLoop(ctx, events, idx, indexDB, time.Minute, state, nil); err != nil {
+	if err := streamLoop(ctx, events, idx, indexDB, time.Minute, state); err != nil {
 		t.Fatalf("streamLoop: %v", err)
 	}
 
@@ -406,7 +406,7 @@ func TestStreamLoop_contextCancel(t *testing.T) {
 		cancel()
 	}()
 
-	if err := streamLoop(ctx, events, idx, db, time.Hour, state, nil); err != nil {
+	if err := streamLoop(ctx, events, idx, db, time.Hour, state); err != nil {
 		t.Fatalf("streamLoop: %v", err)
 	}
 
@@ -457,7 +457,7 @@ func TestStreamLoop_tickerCheckpoint(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		// 5 ms interval guarantees the ticker fires well before the 50 ms sleep.
-		done <- streamLoop(ctx, events, idx, db, 5*time.Millisecond, state, nil)
+		done <- streamLoop(ctx, events, idx, db, 5*time.Millisecond, state)
 	}()
 
 	// Wait for: (1) event consumed, (2) ticker to fire and save checkpoint.
@@ -516,7 +516,7 @@ func TestStreamLoop_positionTracking(t *testing.T) {
 
 	state := &streamState{mode: "position", serverID: 1}
 
-	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, nil); err != nil {
+	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state); err != nil {
 		t.Fatalf("streamLoop: %v", err)
 	}
 
@@ -563,7 +563,7 @@ func TestStreamLoop_batchOverflow(t *testing.T) {
 
 	state := &streamState{mode: "position", serverID: 1}
 
-	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, nil); err != nil {
+	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state); err != nil {
 		t.Fatalf("streamLoop: %v", err)
 	}
 
@@ -624,7 +624,7 @@ func TestStreamLoop_gtidAccumulation(t *testing.T) {
 	}
 	close(events)
 
-	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, nil); err != nil {
+	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state); err != nil {
 		t.Fatalf("streamLoop: %v", err)
 	}
 
