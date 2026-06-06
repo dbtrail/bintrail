@@ -636,7 +636,7 @@ Verify the docs are complete and accurate:
 
 - [ ] `docs/mcp-server.md` documents both the connector method (recommended) and the proxy method (legacy fallback)
 - [ ] `docs/mcp-gateway.md` has complete deployment instructions
-- [ ] `README.md` mentions the Claude Connector in the MCP Server section
+- [ ] `docs/mcp-server.md` documents the Claude Connector (the README links it from its Documentation table)
 - [ ] `proxy.py` docstring/comments mention it's an optional legacy fallback
 
 ---

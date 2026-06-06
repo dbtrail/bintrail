@@ -120,7 +120,7 @@ No clone needed — the compose file is self-contained:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/dbtrail/bintrail/main/docker-compose.yml
-echo 'SOURCE_DSN=user:password@tcp(host.docker.internal:3306)/' > .env
+echo 'SOURCE_DSN=USER:PASSWORD@tcp(YOUR_MYSQL_HOST:3306)/' > .env
 docker compose up -d
 docker compose logs -f bintrail
 ```
