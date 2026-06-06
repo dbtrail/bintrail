@@ -63,6 +63,11 @@ streaming. No terminal needed after these four lines. The console binds to
 your machine only (`127.0.0.1`) and every request requires the token from
 the URL.
 
+> The bundled index MySQL is **evaluation-grade** (volume loss = re-index).
+> For production, point `INDEX_DSN` in `.env` at a MySQL you operate —
+> bintrail installs only its schema, never a database server. Boundary:
+> [SUPPORT.md](SUPPORT.md).
+>
 > **Other ways to install** — plain Docker, `.deb`/`.rpm`, `go install`,
 > source builds, and the binary quickstart: see **[docs/install.md](docs/install.md)**.
 >

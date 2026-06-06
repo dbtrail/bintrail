@@ -155,11 +155,14 @@ Notes:
   building from a source checkout instead is a comment-toggle in the
   compose file (`build: .`).
 
-### Connecting to an external index MySQL
+### Connecting to an external index MySQL (the production track)
 
-If you already have a MySQL instance for the index, set `INDEX_DSN` in
-`.env` to point at it and remove the `index-mysql` service from the compose
-file.
+The bundled `index-mysql` container is evaluation-grade (single volume, no
+backups — volume loss = re-index). For production, set `INDEX_DSN` in
+`.env` to a MySQL 8.0+ you operate and remove the `index-mysql` service
+from the compose file. Bintrail installs only its schema there; the
+server's sizing, backups, and upgrades are yours — see
+[deployment.md](./deployment.md) and [SUPPORT.md](../SUPPORT.md).
 
 ## Environment variables
 

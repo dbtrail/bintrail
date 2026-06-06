@@ -276,3 +276,9 @@ Release: update CHANGELOG.md, commit, create annotated tag `vX.Y.Z`, push. GitHu
 - **`p_future` must always exist**: never drop it.
 - **`schema_snapshots` snapshot_id ≠ row id**: snapshot_id groups rows; id is auto-increment PK.
 - **go-mysql lowercases GTID UUIDs**: tests must use lowercase — never uppercase UUID literals.
+
+## Architectural red lines (board decision 2026-06-06, SUPPORT.md is the public artifact)
+
+- **Schema, never server**: bintrail installs databases/tables/migrations on an operator-supplied MySQL (`init`/`up`/control plane). It must NEVER install, embed, supervise, or operate a MySQL server process (no apt/yum mysql-server, no managed mysqld). The bundled compose `index-mysql` is evaluation-grade only and must never be positioned as production.
+- **Control plane holds at database-and-schema**: provisioning a database-per-source on the daemon's index server is in scope; provisioning/tuning/operating the SERVER is not. Any future step in that direction needs explicit sign-off (forecloses index-tier optionality; platform-trap risk — see drafts/board-index-mysql-2026-06-06.md).
+- **Support boundary**: the operator's index MySQL operation (sizing, backups, disk-full, upgrades, corruption, managed-flavor quirks) is out of scope for the free core — that is dbtrail's value proposition. Triage cites SUPPORT.md.

@@ -15,7 +15,7 @@ it's the first section — the same four lines as the README.
   bundles one).
 - Go 1.24+ — only when building from source.
 
-## Docker Compose (recommended)
+## Docker Compose (recommended for evaluation and first contact)
 
 One file, one line of config — an index MySQL (persisted in a volume),
 `bintrail up --console` (preflight → index tables → schema snapshot → live
@@ -43,8 +43,20 @@ From there you can **add more MySQL servers to monitor straight from the
 UI** — Servers → + Add server: paste a DSN, bintrail runs the preflight,
 provisions an index for it, and starts streaming.
 
-All the optional knobs (pinned console token, schema filter, bring-your-own
-index MySQL, image tag) live in
+**The bundled index MySQL is evaluation-grade**: a single unreplicated
+volume, default credentials, no backup story — volume loss means
+re-indexing. It exists so the four lines above need zero prerequisites.
+
+**Production track — bring your own index MySQL** (co-equal path, not an
+afterthought): set `INDEX_DSN` in `.env` to a MySQL 8.0+ you operate, and
+remove the bundled `index-mysql` service. The index becomes your system of
+record: sizing, InnoDB tuning, and backups are yours to run — see
+[deployment.md §3](./deployment.md) and the support boundary in
+[SUPPORT.md](../SUPPORT.md). Bintrail installs and migrates only its schema
+on whatever server you point it at.
+
+All the optional knobs (pinned console token, schema filter, image tag)
+live in
 [`.env.example`](https://github.com/dbtrail/bintrail/blob/main/.env.example);
 the full walkthrough is in [docker.md](./docker.md).
 

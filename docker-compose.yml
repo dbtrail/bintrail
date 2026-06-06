@@ -9,6 +9,12 @@
 # schema snapshot → live binlog stream), and the web console published on
 # http://127.0.0.1:8090 with the access token printed in the logs.
 #
+# The bundled index-mysql is EVALUATION/QUICKSTART-GRADE: a single
+# unreplicated volume with default credentials and no backup story —
+# volume loss means re-indexing. For production, bring your own index
+# MySQL (set INDEX_DSN in .env) and operate it as the system of record
+# it becomes. Support boundary: SUPPORT.md.
+#
 # For the full interactive demo (traffic generator, Grafana, Prometheus),
 # see demo/compose.yml instead.
 
@@ -18,10 +24,11 @@ volumes:
 
 services:
 
-  # ── Index MySQL ──────────────────────────────────────────
-  # Stores binlog_events, schema_snapshots, and stream_state.
-  # Already have a MySQL you want to use as the index? Remove this service
-  # and point INDEX_DSN in .env at it instead.
+  # ── Index MySQL (evaluation/quickstart-grade) ────────────
+  # Stores binlog_events, schema_snapshots, and stream_state — the
+  # forensic record itself. This bundled container is for evaluation:
+  # volume loss = re-index. For production, bring your own index MySQL:
+  # remove this service and point INDEX_DSN in .env at yours.
   index-mysql:
     image: mysql:8.0
     environment:
