@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The `bintrail-demo` image build was broken by its own rename**: `.dockerignore` excludes `demo/` (the dev stack never belonged in the main image's build context), and the rename moved the demo image's build files exactly there — the v0.8.3 `demo-image` workflow failed with `"/demo/image/my.cnf": not found`. Re-included via a `!demo/image` negation (verified against BuildKit: a negated child of an excluded directory is honored).
+
 ## [0.8.3] - 2026-06-06
 
 ### Changed

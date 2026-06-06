@@ -3,6 +3,9 @@
 .claude
 .DS_Store
 demo
+# …but the published demo image's build files live under demo/image (the
+# rename from appliance/, #410) — re-include them in the build context.
+!demo/image
 dist
 docs
 *.md
