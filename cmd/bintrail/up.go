@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
@@ -84,7 +86,9 @@ func init() {
 	upCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface when --console is set")
 	upCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct when --console is set")
 	upCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML when --console is set (default ~/.config/bintrail/console-servers.yaml)")
-	_ = upCmd.MarkFlagRequired("source-dsn")
+	// --source-dsn is validated in runUp instead of MarkFlagRequired: with
+	// --console the daemon may start source-less (zero-config install) and
+	// sources are added from the UI.
 	_ = upCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(upCmd)
 	rootCmd.AddCommand(upCmd)
@@ -94,9 +98,33 @@ func runUp(cmd *cobra.Command, args []string) error {
 	if !cliutil.IsValidOutputFormat(upFormat) {
 		return fmt.Errorf("invalid --format %q; must be text or json", upFormat)
 	}
+	// --source-dsn is required for the classic single-stream `up`, but with
+	// --console the daemon can start with NO source at all: it serves the
+	// console + control plane, and sources are added from the UI ("+ Add
+	// server" runs the preflight, provisions a per-source index, and starts
+	// streaming). That is the zero-config install path.
+	if upSourceDSN == "" && !upConsole {
+		return fmt.Errorf("--source-dsn is required (or pass --console to start source-less and add servers from the UI)")
+	}
+
+	// Containerized installs start bintrail and the index MySQL together, and
+	// the official mysql image briefly accepts-then-drops connections during
+	// its first initialization — a single connect attempt turns first boot
+	// into a restart loop (regenerating the console token each time). Under
+	// --console (the compose path), wait for the index instead of dying;
+	// plain CLI runs keep today's fail-fast behavior.
+	if upConsole {
+		if err := waitForIndexMySQL(cmd.Context(), upIndexDSN, 90*time.Second); err != nil {
+			return fmt.Errorf("index MySQL did not become reachable: %w", err)
+		}
+	}
 
 	// ── Phase 1: Preflight ──────────────────────────────────────────────────
-	if !upSkipDoctor {
+	if upSourceDSN == "" {
+		fmt.Fprintln(os.Stderr, "=== Phase 1/3: Preflight checks ===")
+		fmt.Fprintln(os.Stderr, "No source configured yet — the preflight runs when you add a server from the console.")
+		fmt.Fprintln(os.Stderr)
+	} else if !upSkipDoctor {
 		fmt.Fprintln(os.Stderr, "=== Phase 1/3: Preflight checks ===")
 		if err := runDoctorTo(cmd.Context(), os.Stderr, "text", upSourceDSN, upIndexDSN, upSchemas); err != nil {
 			return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", err)
@@ -111,9 +139,102 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Fprintln(os.Stderr)
 
-	// ── Phase 3: Stream ─────────────────────────────────────────────────────
+	// ── Phase 3: Stream (or console-only daemon when no source yet) ─────────
+	if upSourceDSN == "" {
+		fmt.Fprintln(os.Stderr, "=== Phase 3/3: Console + control plane ===")
+		return runUpConsoleOnly(cmd)
+	}
 	fmt.Fprintln(os.Stderr, "=== Phase 3/3: Streaming ===")
 	return runUpStream(cmd, args)
+}
+
+// waitForIndexMySQL retries a server-level connection (database name
+// stripped — init may not have created it yet) until the index MySQL accepts
+// connections or the timeout elapses. Progress is logged so a compose
+// first-boot reads as "waiting for MySQL", not as a crash loop.
+func waitForIndexMySQL(ctx context.Context, dsn string, timeout time.Duration) error {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("invalid --index-dsn: %w", err)
+	}
+	cfg.DBName = ""
+	serverDSN := cfg.FormatDSN()
+
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		db, err := config.Connect(serverDSN)
+		if err == nil {
+			db.Close()
+			return nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return lastErr
+		}
+		if attempt%5 == 0 {
+			fmt.Fprintf(os.Stderr, "Waiting for index MySQL at %s…\n", cfg.Addr)
+		}
+		select {
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// runUpConsoleOnly is the zero-config daemon: no initial source, just the
+// index, the console, and the control-plane supervisor. Every source is added
+// (and resumed at boot, via Reconcile) from the UI. Mirrors
+// runUpStreamWithConsole minus the main stream.
+func runUpConsoleOnly(cmd *cobra.Command) error {
+	resolveUpConsoleEnv(cmd)
+
+	db, err := config.Connect(upIndexDSN)
+	if err != nil {
+		return fmt.Errorf("console: connect index database: %w", err)
+	}
+	defer db.Close()
+	if err := indexer.EnsureSchema(db); err != nil {
+		return fmt.Errorf("console: schema migration: %w", err)
+	}
+
+	serversPath := upConsoleServersFile
+	if serversPath == "" {
+		serversPath = console.DefaultRegistryPath()
+	}
+	registry, err := console.LoadRegistry(serversPath)
+	if err != nil {
+		return fmt.Errorf("console: %w", err)
+	}
+
+	cfg, err := upConsoleConfig(db, upIndexDSN, upConsoleListen, upConsoleToken, upConsoleBaselineDir, upConsoleBaselineS3)
+	if err != nil {
+		return err
+	}
+	cfg.Registry = registry
+
+	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	supervisor := newMonitorSupervisor(ctx, upIndexDSN)
+	cfg.MonitorCtrl = supervisor
+
+	srv, err := console.New(cfg)
+	if err != nil {
+		return err
+	}
+	ln, err := srv.Listen()
+	if err != nil {
+		return fmt.Errorf("console: cannot bind %s: %w", upConsoleListen, err)
+	}
+
+	fmt.Fprintf(os.Stderr, "\nConsole is running — open it and add the MySQL servers to watch:\n\n    %s\n\n", srv.URL())
+	go supervisor.Reconcile(registry)
+
+	serveErr := srv.Serve(ctx, ln)
+	supervisor.Shutdown() // final checkpoints for every monitored stream
+	return serveErr
 }
 
 // runUpInit calls runInit with up's flag values. We share the parent context

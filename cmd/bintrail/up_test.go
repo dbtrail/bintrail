@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -236,4 +237,33 @@ func TestResolveUpConsoleEnv(t *testing.T) {
 	assertStr(t, "upConsoleToken (empty env)", upConsoleToken, "tok")
 	assertStr(t, "upConsoleBaselineDir (empty env)", upConsoleBaselineDir, "/dir")
 	assertStr(t, "upConsoleBaselineS3 (empty env)", upConsoleBaselineS3, "s3://b/p/")
+}
+
+// TestRunUpSourceDSNValidation: --source-dsn is required for the classic
+// single-stream up, but --console may start source-less (the zero-config
+// install — sources are then added from the UI).
+func TestRunUpSourceDSNValidation(t *testing.T) {
+	origSrc, origIdx, origConsole, origFmt := upSourceDSN, upIndexDSN, upConsole, upFormat
+	t.Cleanup(func() {
+		upSourceDSN, upIndexDSN, upConsole, upFormat = origSrc, origIdx, origConsole, origFmt
+	})
+	upFormat = "text"
+
+	// Without --console: refused up front with the actionable hint.
+	upSourceDSN, upConsole = "", false
+	upIndexDSN = "u:p@tcp(127.0.0.1:3306)/idx"
+	err := runUp(upCmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "--source-dsn is required") {
+		t.Fatalf("source-less up without --console: err = %v, want the --source-dsn requirement", err)
+	}
+
+	// With --console: validation passes; the run proceeds into init and fails
+	// THERE on the deliberately unparseable index DSN — proving the
+	// source-dsn gate did not fire.
+	upSourceDSN, upConsole = "", true
+	upIndexDSN = "not-a-dsn"
+	err = runUp(upCmd, nil)
+	if err == nil || strings.Contains(err.Error(), "--source-dsn is required") {
+		t.Fatalf("source-less up WITH --console must pass the source gate, got: %v", err)
+	}
 }

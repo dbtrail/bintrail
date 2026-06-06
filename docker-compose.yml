@@ -1,8 +1,12 @@
 # Bintrail Docker Compose — the zero-friction quickstart.
 #
-#   1. cp .env.example .env       # set SOURCE_DSN to your MySQL
-#   2. docker compose up -d
-#   3. docker compose logs bintrail   # open the printed console URL
+#   1. docker compose up -d
+#   2. docker compose logs -f bintrail   # open the printed console URL
+#   3. In the console: "+ Add server" — paste the MySQL to watch; bintrail
+#      runs the preflight, provisions an index for it, and starts streaming.
+#
+# No .env needed. Optionally set SOURCE_DSN (start streaming one source
+# immediately) or CONSOLE_TOKEN (stable token across restarts) in a .env.
 #
 # What you get: an index MySQL (persisted in a volume), bintrail running
 # `up --console` against your source (preflight checks → index tables →
@@ -57,8 +61,9 @@ services:
       # change to "8090:8090" AND set a stable CONSOLE_TOKEN in .env.
       - "127.0.0.1:8090:8090"
     environment:
-      # Your application MySQL — the server to watch (set in .env).
-      SOURCE_DSN: ${SOURCE_DSN:?Set SOURCE_DSN in .env (e.g. user:pass@tcp(host.docker.internal:3306)/)}
+      # Optional: a source MySQL to start watching immediately. Leave unset
+      # and add servers from the console UI instead (the zero-config path).
+      SOURCE_DSN: ${SOURCE_DSN:-}
       # The index MySQL above; swap for your own instance if you removed it.
       INDEX_DSN: ${INDEX_DSN:-root:${INDEX_MYSQL_ROOT_PASSWORD:-changeme}@tcp(index-mysql:3306)/bintrail_index}
       # Optional comma-separated schema filter (empty = all user schemas).
@@ -82,10 +87,12 @@ services:
           export BINTRAIL_CONSOLE_TOKEN="$$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
           echo "Generated console token (set CONSOLE_TOKEN in .env to keep it stable across restarts)"
         fi
-        if [ -n "$$SCHEMAS" ]; then
+        if [ -n "$$SOURCE_DSN" ] && [ -n "$$SCHEMAS" ]; then
           exec bintrail up --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN" --schemas "$$SCHEMAS" --console
+        elif [ -n "$$SOURCE_DSN" ]; then
+          exec bintrail up --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN" --console
         fi
-        exec bintrail up --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN" --console
+        exec bintrail up --index-dsn "$$INDEX_DSN" --console
     depends_on:
       index-mysql:
         condition: service_healthy

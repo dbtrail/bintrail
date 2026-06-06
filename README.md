@@ -41,27 +41,24 @@ both and prints the exact fix for anything missing.
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/dbtrail/bintrail/main/docker-compose.yml
-echo 'SOURCE_DSN=USER:PASSWORD@tcp(YOUR_MYSQL_HOST:3306)/' > .env
 docker compose up -d
 docker compose logs -f bintrail
 ```
 
-Change one thing: `USER`, `PASSWORD`, and `YOUR_MYSQL_HOST` — the MySQL you
-want to watch (`host.docker.internal` reaches a MySQL on this same machine).
-The logs end with your console URL:
+Nothing to configure. The logs end with your console URL:
 
 ```
-Console (read-only) is running. Open:
+Console is running — open it and add the MySQL servers to watch:
 
     http://127.0.0.1:8090/?token=ab12cd34…
 ```
 
-Open it. Browse every row change, generate undo SQL, watch stream health —
-and add more MySQL servers to monitor straight from the UI: paste a DSN,
-bintrail runs the preflight checks, provisions an index, and starts
-streaming. No terminal needed after these four lines. The console binds to
-your machine only (`127.0.0.1`) and every request requires the token from
-the URL.
+Open it and click **+ Add server**: paste the MySQL you want to watch —
+host, user, password — and bintrail runs the preflight checks (failures come
+back as fix-this cards), provisions an index for it, and starts streaming.
+Watching events within the minute, and the terminal is already behind you.
+The console binds to your machine only (`127.0.0.1`) and every request
+requires the token from the URL.
 
 > The bundled index MySQL is **evaluation-grade** (volume loss = re-index).
 > For production, point `INDEX_DSN` in `.env` at a MySQL you operate —

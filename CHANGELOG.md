@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Zero-config install — `SOURCE_DSN` is no longer required to get started.** `bintrail up --console` now starts **source-less**: index init + web console + control plane, with sources added afterwards from the UI ("+ Add server" runs the preflight, provisions a per-source index, and starts streaming — and resumes them on restart). The Docker Compose quickstart drops to three commands with nothing to edit (`curl` the compose, `up -d`, open the URL from the logs); `SOURCE_DSN` and `CONSOLE_TOKEN` become optional `.env` knobs instead of prerequisites. On a fresh supervisor with nothing watched, the console opens the Servers screen automatically so "+ Add server" is the first thing the operator sees. Boot robustness: under `--console`, `up` now waits (up to 90s, with progress) for the index MySQL to accept connections instead of dying into a restart loop — the official mysql image briefly accepts-then-drops connections during first initialization, which previously caused ~5 container restarts and a new console token per restart on a cold compose boot.
+
 ## [0.8.1] - 2026-06-05
 
 ### Added

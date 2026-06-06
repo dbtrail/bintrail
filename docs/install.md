@@ -17,21 +17,17 @@ it's the first section — the same four lines as the README.
 
 ## Docker Compose (recommended for evaluation and first contact)
 
-One file, one line of config — an index MySQL (persisted in a volume),
-`bintrail up --console` (preflight → index tables → schema snapshot → live
-binlog stream), and the web console:
+One file, zero config — an index MySQL (persisted in a volume) and
+`bintrail up --console` in source-less daemon mode: the console plus the
+control plane, waiting for you to add servers from the UI:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/dbtrail/bintrail/main/docker-compose.yml
-echo 'SOURCE_DSN=USER:PASSWORD@tcp(YOUR_MYSQL_HOST:3306)/' > .env
 docker compose up -d
 docker compose logs -f bintrail
 ```
 
-Replace `USER`, `PASSWORD`, and `YOUR_MYSQL_HOST` with the MySQL you want to
-watch (`host.docker.internal` reaches a MySQL on the same machine from inside
-Docker — the placeholders are deliberately not a working value, so a missed
-edit fails the preflight loudly instead of half-connecting). The logs print the console URL with its access token:
+The logs print the console URL with its access token:
 
 ```
 Console (read-only) is running. Open:
@@ -39,9 +35,16 @@ Console (read-only) is running. Open:
     http://127.0.0.1:8090/?token=ab12cd34…
 ```
 
-From there you can **add more MySQL servers to monitor straight from the
-UI** — Servers → + Add server: paste a DSN, bintrail runs the preflight,
-provisions an index for it, and starts streaming.
+Open it and use **+ Add server** (the Servers screen opens itself on a
+fresh install): paste the MySQL to watch — host, user, password, optional
+schema filter (`host.docker.internal` reaches a MySQL on this same machine
+from inside Docker). Bintrail runs the preflight (failures come back as
+remediation cards), provisions a dedicated index for that source, and starts
+streaming. Repeat per server; everything you add resumes automatically when
+the container restarts.
+
+Prefer to start streaming one source immediately at boot? Set `SOURCE_DSN`
+in a `.env` next to the compose file — that's optional now, not required.
 
 **The bundled index MySQL is evaluation-grade**: a single unreplicated
 volume, default credentials, no backup story — volume loss means

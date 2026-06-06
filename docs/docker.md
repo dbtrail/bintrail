@@ -116,17 +116,19 @@ stream, **and the web console**, in one `up -d`. It pulls the published
 
 ### Quick start
 
-No clone needed — the compose file is self-contained:
+No clone, no config — the compose file is self-contained and the servers
+to watch are added from the console UI afterwards:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/dbtrail/bintrail/main/docker-compose.yml
-echo 'SOURCE_DSN=USER:PASSWORD@tcp(YOUR_MYSQL_HOST:3306)/' > .env
 docker compose up -d
 docker compose logs -f bintrail
 ```
 
-(From a source checkout, `cp .env.example .env` gives you the annotated
-template with every optional knob instead.)
+Optional knobs go in a `.env` next to the file: `SOURCE_DSN` to start
+streaming one source immediately at boot, `CONSOLE_TOKEN` to pin the access
+token across restarts, `INDEX_DSN` to bring your own index MySQL. (From a
+source checkout, `cp .env.example .env` gives you the annotated template.)
 
 The logs print the console URL, access token included:
 

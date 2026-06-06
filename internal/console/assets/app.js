@@ -879,9 +879,18 @@ function init() {
   // Load the server list first so a stale per-tab selection is reconciled
   // before the capability gate and schema dropdowns fire against it.
   (async () => {
-    try { await loadServers(); } catch (e) { /* default server still works */ }
-    gateCapabilities();
+    let servers = [];
+    try { servers = await loadServers(); } catch (e) { /* default server still works */ }
+    await gateCapabilities();
     populateSchemas();
+    // First-run onboarding: on a supervisor with nothing watched yet, the
+    // Servers screen IS the next step — open it so "+ Add server" is the
+    // first thing the operator sees (once per tab).
+    const ONBOARD_KEY = "bintrail_console_onboarded";
+    if (capsCache.monitor && servers.every((s) => !s.has_source) && !sessionStorage.getItem(ONBOARD_KEY)) {
+      try { sessionStorage.setItem(ONBOARD_KEY, "1"); } catch (e) { /* storage unavailable */ }
+      openServersModal();
+    }
   })();
 }
 
