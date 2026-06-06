@@ -688,8 +688,11 @@ function testResultText(res) {
   if (!res.ok) return "✗ " + (res.error || "unreachable");
   let txt = `✓ ok · ${res.latency_ms} ms`;
   if (res.server_version) txt += " · MySQL " + res.server_version;
-  if (!res.has_index) txt += " · no binlog_events table (not a bintrail index?)";
-  else if (!res.schema_current) txt += " · index schema outdated (run bintrail index/stream once)";
+  // has_index/schema_current are tri-state: absent means the metadata lookup
+  // itself failed (unknown) — never render that as the confident negative.
+  if (res.has_index === false) txt += " · no binlog_events table (not a bintrail index?)";
+  else if (res.has_index === undefined || res.schema_current === undefined) txt += " · index metadata unavailable";
+  else if (res.schema_current === false) txt += " · index schema outdated (run bintrail index/stream once)";
   return txt;
 }
 

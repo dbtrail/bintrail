@@ -360,6 +360,45 @@ func TestBuildDSNMerge(t *testing.T) {
 	}
 }
 
+// TestResolveNoServers: an empty console (no boot entry, empty registry) must
+// return the user-facing errNoServers, which the HTTP layer maps to 404.
+func TestResolveNoServers(t *testing.T) {
+	cm := newConnManager(nil, false)
+	if _, err := cm.Resolve(t.Context(), ""); !errors.Is(err, errNoServers) {
+		t.Fatalf("Resolve on empty console: err = %v, want errNoServers", err)
+	}
+}
+
+// TestRegistryErrStatus locks the registry-error → HTTP status contract,
+// including the string-matched 400 branches a refactor could silently break.
+func TestRegistryErrStatus(t *testing.T) {
+	cases := []struct {
+		err  error
+		want int
+	}{
+		{ErrDuplicateName, 409},
+		{ErrRegistryReadOnly, 409},
+		{ErrUnknownServer, 404},
+		{errors.New("server name is required"), 400},
+		{errors.New(`"default" is reserved for the command-line server`), 400},
+		{errors.New("disk exploded"), 500},
+	}
+	for _, tc := range cases {
+		if got := registryErrStatus(tc.err); got != tc.want {
+			t.Errorf("registryErrStatus(%v) = %d, want %d", tc.err, got, tc.want)
+		}
+	}
+}
+
+// TestBuildDSNRejectsRawDSNPlusPassword: a raw dsn carries its own password;
+// accepting a structured password alongside would silently drop one of them.
+func TestBuildDSNRejectsRawDSNPlusPassword(t *testing.T) {
+	pw := "x"
+	if _, err := buildDSN(serverRequest{DSN: "u:p@tcp(h:3306)/db", Password: &pw}, ""); err == nil {
+		t.Fatal("dsn + structured password must be rejected, not silently merged")
+	}
+}
+
 // TestCapabilityMatrix: the pure-config reconstruct gate over
 // baseline × no_archive × profile.
 func TestCapabilityMatrix(t *testing.T) {

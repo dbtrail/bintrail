@@ -48,7 +48,7 @@ type bundle struct {
 // tolerates it on the DSN the operator typed on the command line (the boot
 // entry, migrated by cmd/bintrail before the server starts). A registry index
 // missing a newer column surfaces as an actionable error instead — see
-// legacyIndexHint.
+// writeFetchError in api.go.
 type connManager struct {
 	reg *Registry
 	// profileActive mirrors "any RBAC rule is loaded" — it forces noArchive
@@ -127,20 +127,46 @@ func (cm *connManager) Resolve(ctx context.Context, id string) (*bundle, error) 
 	}
 	cm.mu.Unlock()
 
-	entry, ok := cm.reg.Get(id)
-	if !ok {
-		return nil, ErrUnknownServer
+	// Build outside cm.mu (network I/O), then publish under ONE critical
+	// section that re-validates the entry. An edit racing this open
+	// (handleServersUpdate runs reg.Update→evict WITHOUT the per-id lock)
+	// would otherwise leave a bundle for the OLD DSN cached forever: evict
+	// only closes what is already in the map, and this open isn't yet.
+	// Re-reading under cm.mu pairs with evict's cm.mu — the edit either
+	// happened before our re-read (we rebuild from the current entry) or its
+	// evict runs after our publish and closes what we cached.
+	for attempt := 0; ; attempt++ {
+		entry, ok := cm.reg.Get(id)
+		if !ok {
+			return nil, ErrUnknownServer
+		}
+		b, err := cm.buildBundle(entry)
+		if err != nil {
+			// Not cached: a failed open is retried on the next selection rather
+			// than poisoning the entry until restart.
+			return nil, err
+		}
+		cm.mu.Lock()
+		cur, stillThere := cm.reg.Get(id)
+		if stillThere && cur.DSN == entry.DSN {
+			// Derive the published gates from the CURRENT entry: a
+			// baseline/no-archive-only edit during the open keeps this db but
+			// must not publish the stale entry's reconstruct gate.
+			nb := newBundleDerived(b.db, b.dbName, cur, cm.profileActive)
+			nb.resolver = b.resolver
+			cm.bundles[id] = nb
+			cm.mu.Unlock()
+			return nb, nil
+		}
+		cm.mu.Unlock()
+		_ = b.db.Close() // built against a deleted or DSN-edited entry
+		if !stillThere {
+			return nil, ErrUnknownServer
+		}
+		if attempt >= 2 {
+			return nil, fmt.Errorf("server %q is being edited concurrently; retry", cur.Name)
+		}
 	}
-	b, err := cm.buildBundle(entry)
-	if err != nil {
-		// Not cached: a failed open is retried on the next selection rather
-		// than poisoning the entry until restart.
-		return nil, err
-	}
-	cm.mu.Lock()
-	cm.bundles[id] = b
-	cm.mu.Unlock()
-	return b, nil
 }
 
 // buildBundle opens a registry server's connection and derives its per-server
@@ -150,7 +176,9 @@ func (cm *connManager) Resolve(ctx context.Context, id string) (*bundle, error) 
 func (cm *connManager) buildBundle(entry ServerEntry) (*bundle, error) {
 	cfg, err := mysql.ParseDSN(entry.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("server %q: invalid DSN: %w", entry.Name, err)
+		// The driver's ParseDSN messages are static today, but scrub anyway so
+		// DSN secrecy holds on every error path, not by driver-version luck.
+		return nil, fmt.Errorf("server %q: invalid DSN: %s", entry.Name, scrubDSNError(err, entry.DSN))
 	}
 	if cfg.DBName == "" {
 		return nil, fmt.Errorf("server %q: DSN must include a database name", entry.Name)
@@ -215,6 +243,14 @@ func (cm *connManager) seedBoot(b *bundle, dsn string) {
 	defer cm.mu.Unlock()
 	cm.boot = b
 	cm.bootDSN = dsn
+}
+
+// bootInfo returns the boot bundle and its display DSN under the lock —
+// seedBoot runs once before serving, but readers stay uniformly synchronized.
+func (cm *connManager) bootInfo() (*bundle, string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.boot, cm.bootDSN
 }
 
 // evict drops and closes a cached bundle (DSN edit or delete). The boot entry

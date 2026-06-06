@@ -340,6 +340,13 @@ func TestIntegrationServerSwitching(t *testing.T) {
 	if !caps.Reconstruct {
 		t.Error("registry entry with baseline_dir must report reconstruct=true")
 	}
+
+	// CloseAll closes registry connections but must NOT touch the boot db —
+	// the cmd layer opened it and owns its deferred Close.
+	srv.cm.CloseAll()
+	if err := srv.cm.boot.db.Ping(); err != nil {
+		t.Errorf("CloseAll must not close the boot db (cmd layer owns it): %v", err)
+	}
 }
 
 // TestIntegrationRegistryServerNeverMigrated locks the read-only boundary: a
@@ -374,8 +381,13 @@ func TestIntegrationRegistryServerNeverMigrated(t *testing.T) {
 	if err := json.Unmarshal(body, &probe); err != nil {
 		t.Fatal(err)
 	}
-	if !probe.OK || !probe.HasIndex || probe.SchemaCurrent {
-		t.Errorf("probe = %+v, want ok+has_index+schema_current=false", probe)
+	if !probe.OK || probe.HasIndex == nil || !*probe.HasIndex {
+		t.Errorf("probe = %+v, want ok with has_index=true", probe)
+	}
+	// Tri-state matters here: a legacy index must report an EXPLICIT
+	// schema_current=false (the actionable claim), not a nil/unknown.
+	if probe.SchemaCurrent == nil || *probe.SchemaCurrent {
+		t.Errorf("probe.SchemaCurrent = %v, want explicit false on a legacy index", probe.SchemaCurrent)
 	}
 
 	// Querying it fails with the actionable 422, not a silent migration.

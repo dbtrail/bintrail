@@ -190,6 +190,19 @@ func TestRegistryFilePerms(t *testing.T) {
 	}
 }
 
+// TestRegistryCorruptFileFailsLoud: the cmd layer's fail-loud stance rests on
+// LoadRegistry erroring for garbage — silently starting with zero servers
+// would look like data loss.
+func TestRegistryCorruptFileFailsLoud(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "console-servers.yaml")
+	if err := os.WriteFile(path, []byte("{{{ not yaml"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadRegistry(path); err == nil {
+		t.Fatal("corrupt registry file must fail loud, not load empty")
+	}
+}
+
 func TestRegistryMissingFileIsEmpty(t *testing.T) {
 	r, err := LoadRegistry(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 	if err != nil {

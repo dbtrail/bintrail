@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -70,6 +71,11 @@ type serverRequest struct {
 	NoArchive   bool    `json:"no_archive"`
 }
 
+// testResponse is the probe result. HasIndex/SchemaCurrent are tri-state
+// (*bool): nil means the metadata lookup itself failed — UNKNOWN, omitted from
+// the JSON — which must never be rendered as the affirmative "outdated/not an
+// index" claim a literal false carries (a swallowed error would otherwise tell
+// the operator to run a migration they don't need).
 type testResponse struct {
 	OK            bool   `json:"ok"`
 	Error         string `json:"error,omitempty"`
@@ -78,12 +84,12 @@ type testResponse struct {
 	LatencyMS     int64  `json:"latency_ms"`
 	// HasIndex: the database contains a binlog_events table (it looks like a
 	// bintrail index at all).
-	HasIndex bool `json:"has_index"`
+	HasIndex *bool `json:"has_index,omitempty"`
 	// SchemaCurrent: binlog_events carries the connection_id column. The
 	// console never migrates registry servers (that ALTER is confined to the
 	// command-line DSN), so a stale index must be migrated by a writer command
 	// (index/stream/agent) before this console can query it.
-	SchemaCurrent bool `json:"schema_current"`
+	SchemaCurrent *bool `json:"schema_current,omitempty"`
 }
 
 // handleServersList serves GET /api/servers.
@@ -228,7 +234,7 @@ func (s *Server) handleServersTest(w http.ResponseWriter, r *http.Request) {
 		stored = e.DSN
 	}
 	if id == bootServerID {
-		stored = s.cm.bootDSN
+		_, stored = s.cm.bootInfo()
 	}
 
 	// An empty body means "test the stored DSN as-is"; anything else must parse.
@@ -271,18 +277,27 @@ func probeServer(r *http.Request, dsn string) testResponse {
 	resp := testResponse{OK: true, DBName: dbName, LatencyMS: latency}
 	ctx := r.Context()
 	// Best-effort enrichments: a probe that Pings but can't read metadata is
-	// still "reachable", so these never flip OK back to false.
+	// still "reachable", so these never flip OK back to false. A FAILED lookup
+	// leaves the tri-state nil (unknown) and is logged — collapsing it to
+	// false would render a confident wrong claim ("schema outdated") out of a
+	// transient error.
 	_ = db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&resp.ServerVersion)
 	var n int
 	if err := db.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events'",
 		dbName).Scan(&n); err == nil {
-		resp.HasIndex = n > 0
+		v := n > 0
+		resp.HasIndex = &v
+	} else {
+		slog.Warn("console: test probe could not check for binlog_events", "db", dbName, "error", err)
 	}
 	if err := db.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events' AND COLUMN_NAME = 'connection_id'",
 		dbName).Scan(&n); err == nil {
-		resp.SchemaCurrent = n > 0
+		v := n > 0
+		resp.SchemaCurrent = &v
+	} else {
+		slog.Warn("console: test probe could not check the index schema", "db", dbName, "error", err)
 	}
 	return resp
 }
@@ -307,6 +322,11 @@ func shortTimeoutDSN(dsn string) (string, string, error) {
 // console query is scoped to the index DB.
 func buildDSN(req serverRequest, stored string) (string, error) {
 	if req.DSN != "" {
+		// The raw DSN carries its own password; accepting a structured
+		// password alongside it would have to silently drop one of the two.
+		if req.Password != nil {
+			return "", errors.New("specify either dsn or the structured password field, not both (a dsn carries its own password)")
+		}
 		cfg, err := mysql.ParseDSN(req.DSN)
 		if err != nil {
 			return "", fmt.Errorf("invalid dsn: %w", err)
@@ -322,8 +342,9 @@ func buildDSN(req serverRequest, stored string) (string, error) {
 		parsed, err := mysql.ParseDSN(stored)
 		if err != nil {
 			// A stored DSN that no longer parses can't be merged; require a
-			// full replacement via the dsn field.
-			return "", fmt.Errorf("stored DSN is invalid; resubmit with a full dsn: %w", err)
+			// full replacement via the dsn field. Scrubbed: secrecy must not
+			// depend on the driver keeping its parse messages static.
+			return "", fmt.Errorf("stored DSN is invalid; resubmit with a full dsn: %s", scrubDSNError(err, stored))
 		}
 		cfg = parsed
 	} else {
@@ -397,9 +418,7 @@ func (s *Server) entryDTO(e ServerEntry) serverDTO {
 
 // bootDTO renders the ephemeral command-line entry, when one exists.
 func (s *Server) bootDTO() (serverDTO, bool) {
-	s.cm.mu.Lock()
-	boot, dsn := s.cm.boot, s.cm.bootDSN
-	s.cm.mu.Unlock()
+	boot, dsn := s.cm.bootInfo()
 	if boot == nil {
 		return serverDTO{}, false
 	}

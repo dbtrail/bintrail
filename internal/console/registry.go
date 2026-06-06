@@ -121,7 +121,9 @@ func LoadRegistry(path string) (*Registry, error) {
 	return r, nil
 }
 
-// List returns a copy of the entries, in file order.
+// List returns a copy of the entries, in file order. The copy is shallow:
+// each entry's Extra map is shared with the registry — treat returned entries
+// as read-only (nothing in the console mutates Extra off a copy today).
 func (r *Registry) List() []ServerEntry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -130,7 +132,8 @@ func (r *Registry) List() []ServerEntry {
 	return out
 }
 
-// Get returns the entry with the given id.
+// Get returns the entry with the given id. Like List, the entry's Extra map
+// is shared with the registry — treat it as read-only.
 func (r *Registry) Get(id string) (ServerEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
