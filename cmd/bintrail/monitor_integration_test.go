@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/console"
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
@@ -410,5 +411,102 @@ func TestIntegrationLostPositionDurable(t *testing.T) {
 	waitState("running", 30*time.Second)
 	if st := sup.Status(entry.ID); st.State != "running" || st.LastError != "" {
 		t.Errorf("post-ack status = %+v, want clean running", st)
+	}
+}
+
+// TestIntegrationReplicaOverlapSQL exercises the replica-detection SQL
+// against real MySQL — the unit tests cover only the pure GTID helpers. The
+// shared test container runs gtid_mode=OFF, so the full warn path is not
+// reproducible here; what this test proves is (a) the supervisor-side flow
+// up to and including the gtid_mode gate (registry peers → source connect →
+// skip card), and (b) loadPeerIdentity's queries against a provisioned
+// per-source index DB (bintrail_servers + stream_state scan shapes).
+func TestIntegrationReplicaOverlapSQL(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, bootName := testutil.CreateTestDB(t)
+	bootDSN := testutil.IntegrationDSN(bootName)
+
+	// A registry with TWO source-bearing entries so Doctor(A) has peer B.
+	regPath := t.TempDir() + "/servers.yaml"
+	reg, err := console.LoadRegistry(regPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryA, err := reg.Add(console.ServerEntry{Name: "cand", SourceDSN: testutil.BaseDSN() + "/", DSN: bootDSN})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sup := newMonitorSupervisor(ctx, bootDSN, reg)
+
+	// Peer B's per-source index DB, provisioned with the real tables and
+	// seeded with an identity + an accumulated GTID set.
+	peerDB, peerName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, peerDB)
+	const peerUUID = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+	if _, err := peerDB.Exec(`INSERT INTO bintrail_servers
+		(bintrail_id, server_uuid, host, port, username)
+		VALUES (UUID(), ?, 'peer-host', 3306, 'rep')`, peerUUID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peerDB.Exec(`INSERT INTO stream_state
+		(id, mode, gtid_set, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, UTC_TIMESTAMP(), 12345)`, peerUUID+":1-100"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Add(console.ServerEntry{
+		Name: "peer", SourceDSN: testutil.BaseDSN() + "/", DSN: testutil.IntegrationDSN(peerName),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// (a) Doctor on the candidate: container runs gtid_mode=OFF, so the
+	// check must surface as an explicit skip card — not vanish, not warn.
+	report, err := sup.Doctor(ctx, entryA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var card *console.DoctorCheck
+	for i := range report.Checks {
+		if report.Checks[i].Name == "Replica / duplicate detection" {
+			card = &report.Checks[i]
+		}
+	}
+	if card == nil {
+		t.Fatalf("replica check card missing from doctor report: %+v", report.Checks)
+	}
+	if card.Status != "skip" || !strings.Contains(card.Detail, "gtid_mode") {
+		t.Fatalf("card = %+v, want skip mentioning gtid_mode (container runs GTID off)", *card)
+	}
+
+	// (b) loadPeerIdentity's SQL against the seeded per-source DB.
+	gotUUID, gotSet, err := loadPeerIdentity(ctx, testutil.IntegrationDSN(peerName))
+	if err != nil {
+		t.Fatalf("loadPeerIdentity: %v", err)
+	}
+	if gotUUID != peerUUID {
+		t.Errorf("peer uuid = %q, want %q", gotUUID, peerUUID)
+	}
+	if gotSet != peerUUID+":1-100" {
+		t.Errorf("peer gtid set = %q, want %q", gotSet, peerUUID+":1-100")
+	}
+
+	// (c) The candidate-side identity query shape (unreachable above because
+	// of the gtid_mode gate): must scan into two strings even with GTID off.
+	srcDB, err := config.Connect(testutil.BaseDSN() + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srcDB.Close()
+	var candUUID, candExecuted string
+	if err := srcDB.QueryRowContext(ctx,
+		"SELECT @@server_uuid, @@global.gtid_executed").Scan(&candUUID, &candExecuted); err != nil {
+		t.Fatalf("candidate identity query: %v", err)
+	}
+	if candUUID == "" {
+		t.Error("candidate server_uuid came back empty")
 	}
 }
