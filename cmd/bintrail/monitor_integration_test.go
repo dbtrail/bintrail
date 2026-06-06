@@ -290,3 +290,125 @@ func TestIntegrationDDLThenImmediateInserts(t *testing.T) {
 		t.Errorf("schema_changes must record the CREATE TABLE, got %d rows", changes)
 	}
 }
+
+// TestIntegrationLostPositionDurable verifies the #402 lost-position cycle
+// end to end: a recorded gap loss survives a supervisor restart (re-hydrated
+// from stream_state at Start), is presented as the derived "lost_position"
+// state, and is cleared only by an explicit Stop — the operator's
+// acknowledgment. The gap record itself is simulated (real binlog purging is
+// not reproducible on the shared test container); the streamOne write path
+// for it is the same UPDATE this test issues.
+func TestIntegrationLostPositionDurable(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, bootName := testutil.CreateTestDB(t)
+	bootDSN := testutil.IntegrationDSN(bootName)
+
+	srcDB, err := sql.Open("mysql", testutil.BaseDSN()+"/?parseTime=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srcDB.Close()
+	srcSchema := fmt.Sprintf("cp_lp_%d", time.Now().UnixNano()%1e9)
+	if _, err := srcDB.Exec("CREATE DATABASE " + srcSchema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = srcDB.Exec("DROP DATABASE IF EXISTS " + srcSchema) })
+	if _, err := srcDB.Exec("CREATE TABLE " + srcSchema + ".items (id INT PRIMARY KEY, qty INT)"); err != nil {
+		t.Fatal(err)
+	}
+
+	sup := newMonitorSupervisor(ctx, bootDSN, nil)
+	entry := console.ServerEntry{
+		ID:        fmt.Sprintf("lptest%d", time.Now().UnixNano()%1e9),
+		Name:      "lost-position",
+		SourceDSN: testutil.BaseDSN() + "/",
+		Schemas:   srcSchema,
+	}
+	derived, err := sup.DeriveIndexDSN(entry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.DSN = derived
+	t.Cleanup(func() { _, _ = srcDB.Exec("DROP DATABASE IF EXISTS bintrail_idx_" + entry.ID) })
+
+	waitState := func(want string, timeout time.Duration) {
+		t.Helper()
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if sup.Status(entry.ID).State == want {
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		t.Fatalf("state = %+v, want %s", sup.Status(entry.ID), want)
+	}
+
+	// Run 1: healthy start, then stop (creates the per-source DB and its
+	// stream_state checkpoint row).
+	if err := sup.Start(ctx, entry); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop(context.Background(), entry.ID) })
+	waitState("running", 30*time.Second)
+
+	idxDB, err := sql.Open("mysql", derived)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idxDB.Close()
+	// The flip to running can come from an indexed batch before the first
+	// checkpoint write — wait for the stream_state row itself.
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := idxDB.QueryRow("SELECT COUNT(*) FROM stream_state WHERE id = 1").Scan(&n); err == nil && n == 1 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err := sup.Stop(ctx, entry.ID); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// Simulate what streamOne persists on an unfillable-gap auto-advance.
+	const gapDetail = "simulated: binlogs purged past saved position; events lost"
+	if _, err := idxDB.Exec(`UPDATE stream_state
+		SET gap_lost_at = UTC_TIMESTAMP(), gap_lost_detail = ? WHERE id = 1`, gapDetail); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 2 (the "daemon restart"): Start must re-hydrate the record and the
+	// derived state must surface it instead of a clean RUNNING badge.
+	if err := sup.Start(ctx, entry); err != nil {
+		t.Fatalf("Start (run 2): %v", err)
+	}
+	waitState("lost_position", 30*time.Second)
+	if st := sup.Status(entry.ID); st.LastError != gapDetail {
+		t.Errorf("LastError = %q, want the hydrated gap detail", st.LastError)
+	}
+
+	// Explicit Stop acknowledges: the durable record must be cleared.
+	if err := sup.Stop(ctx, entry.ID); err != nil {
+		t.Fatalf("Stop (ack): %v", err)
+	}
+	var at, detail sql.NullString
+	if err := idxDB.QueryRow("SELECT gap_lost_at, gap_lost_detail FROM stream_state WHERE id = 1").Scan(&at, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if at.Valid || detail.Valid {
+		t.Errorf("gap record not cleared on explicit Stop: at=%v detail=%v", at, detail)
+	}
+
+	// Run 3: a fresh start after acknowledgment is plain running again.
+	if err := sup.Start(ctx, entry); err != nil {
+		t.Fatalf("Start (run 3): %v", err)
+	}
+	waitState("running", 30*time.Second)
+	if st := sup.Status(entry.ID); st.State != "running" || st.LastError != "" {
+		t.Errorf("post-ack status = %+v, want clean running", st)
+	}
+}

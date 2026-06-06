@@ -232,9 +232,14 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	// One daemon-level /metrics endpoint for ALL supervised streams — the
 	// Prometheus registry is process-global and every stream metric carries
 	// a "source" label (the entry ID), so per-stream servers are unnecessary
-	// (and would fight over the bind).
+	// (and would fight over the bind). Synchronous bind: fails fast, like
+	// the console bind.
 	if upMetricsAddr != "" {
-		defer startMetricsServer(upMetricsAddr)()
+		stopMetrics, err := startMetricsServer(upMetricsAddr)
+		if err != nil {
+			return err
+		}
+		defer stopMetrics()
 	}
 
 	fmt.Fprintf(os.Stderr, "\nConsole is running — open it and add the MySQL servers to watch:\n\n    %s\n\n", srv.URL())
@@ -338,9 +343,14 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// With the console comes the multi-stream control plane, so /metrics is
 	// served once at the daemon level (per-source "source" labels keep the
 	// series apart). Clear the flag fan-out so the main stream does not
-	// double-bind the same address inside streamOne.
+	// double-bind the same address inside streamOne. Synchronous bind:
+	// fails fast, like the console bind below.
 	if upMetricsAddr != "" {
-		defer startMetricsServer(upMetricsAddr)()
+		stopMetrics, err := startMetricsServer(upMetricsAddr)
+		if err != nil {
+			return err
+		}
+		defer stopMetrics()
 		strmMetricsAddr = ""
 	}
 

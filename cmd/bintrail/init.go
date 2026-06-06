@@ -542,6 +542,8 @@ const ddlStreamState = `CREATE TABLE IF NOT EXISTS stream_state (
     last_checkpoint  DATETIME        NOT NULL,
     server_id        INT UNSIGNED    NOT NULL,
     bintrail_id      CHAR(36)        NULL DEFAULT NULL,
+    gap_lost_at      DATETIME        DEFAULT NULL COMMENT 'when an unfillable binlog gap forced an auto-advance (events permanently lost); cleared by an explicit monitor Stop or --reset',
+    gap_lost_detail  TEXT            DEFAULT NULL COMMENT 'human-readable description of the lost gap',
     CONSTRAINT single_row CHECK (id = 1)
 ) ENGINE=InnoDB`
 

@@ -321,7 +321,7 @@ When `--metrics-addr :9090` is set, a Prometheus HTTP endpoint starts at `/metri
 | `bintrail_stream_checkpoint_saves_total` | Counter | Successful checkpoint writes |
 | `bintrail_stream_last_event_timestamp_seconds` | Gauge | Unix timestamp of the last received event |
 | `bintrail_stream_replication_lag_seconds` | Gauge | `now() - last_event_timestamp` in seconds |
-| `bintrail_stream_errors_total{type}` | Counter | Errors by type: `batch_flush`, `checkpoint`, `gtid_update` |
+| `bintrail_stream_errors_total{source,type}` | Counter | Errors by type: `batch_flush`, `checkpoint`, `gtid_update` |
 | `bintrail_stream_batch_size` | Histogram | Distribution of events per batch flush |
 
 Every metric carries a `source` label so concurrent streams in one process stay

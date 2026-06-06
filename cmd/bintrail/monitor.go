@@ -84,8 +84,10 @@ type monitorJob struct {
 	// or batch flushed) — feeds the derived "stalled" state.
 	lastProgress time.Time
 	// lostPosition, when non-empty, records that an unfillable binlog gap
-	// forced an auto-advance: events were permanently lost. Sticky for the
-	// job's lifetime (cleared by Stop + Start) — feeds the derived
+	// forced an auto-advance: events were permanently lost. The fact is
+	// also persisted in stream_state (gap_lost_at/_detail) and re-hydrated
+	// by Start, so it survives daemon restarts; only an explicit Stop (the
+	// operator's acknowledgment) clears it — feeds the derived
 	// "lost_position" state.
 	lostPosition string
 }
@@ -289,6 +291,17 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 		idxDB.Close()
 		return fail(fmt.Errorf("schema migration: %w", err))
 	}
+	// Re-hydrate a durable gap-loss record (#402): once the stream persisted
+	// its advanced checkpoint, a restarted daemon sees no gap and the hook
+	// never re-fires — the lost_position state must be restored from
+	// stream_state or the data loss silently un-surfaces. Cleared only by an
+	// explicit Stop (the operator's acknowledgment).
+	var gapDetail sql.NullString
+	if err := idxDB.QueryRowContext(ctx,
+		`SELECT gap_lost_detail FROM stream_state WHERE id = 1`).Scan(&gapDetail); err == nil &&
+		gapDetail.Valid && gapDetail.String != "" {
+		job.markLostPosition(gapDetail.String)
+	}
 	idxDB.Close()
 
 	// ── Advisory lock: refuse to double-stream one entry ─────────────────
@@ -410,7 +423,11 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 }
 
 // Stop implements console.MonitorController. Idempotent; waits briefly for
-// the stream to flush its final checkpoint.
+// the stream to flush its final checkpoint. An explicit Stop is also the
+// operator's acknowledgment of a recorded data loss: it clears the durable
+// gap-loss record so the next Start begins clean. Daemon shutdown does NOT
+// come through here (Shutdown cancels jobs directly), so a restart preserves
+// the record.
 func (m *monitorSupervisor) Stop(ctx context.Context, entryID string) error {
 	m.mu.Lock()
 	job, ok := m.jobs[entryID]
@@ -420,6 +437,12 @@ func (m *monitorSupervisor) Stop(ctx context.Context, entryID string) error {
 	m.mu.Unlock()
 	if !ok {
 		return nil
+	}
+	if job.lockDB != nil {
+		if _, err := job.lockDB.ExecContext(ctx, `UPDATE stream_state
+			SET gap_lost_at = NULL, gap_lost_detail = NULL WHERE id = 1`); err != nil {
+			slog.Warn("could not clear gap-loss record on stop", "entry", entryID, "error", err)
+		}
 	}
 	job.cancel()
 	select {

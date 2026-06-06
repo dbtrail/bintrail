@@ -145,9 +145,10 @@ immediately; warnings (e.g. short binlog retention) show but don't block.
   badge only says `RUNNING` once the stream has proven it is attached and
   writing. Two unhealthy-but-alive variants surface what used to be silent:
   `STALLED` (connected but no checkpoint/batch progress for 5+ minutes) and
-  `LOST POSITION` (binlogs were purged past the saved position while
-  monitoring was down — the stream auto-advanced and events in the gap are
-  permanently lost; sticky until you Stop + Start the entry).
+  `LOST POSITION` (binlogs were purged past the saved position while the
+  stream was behind or stopped — it auto-advanced and events in the gap are
+  permanently lost; the record is durable, survives daemon restarts, and is
+  cleared only by an explicit Stop on the entry).
 - A failing stream is retried with exponential backoff (15s → 5m) and shows
   as `FAILED` with the scrubbed error; `Stop` requires an explicit click, and
   deleting or re-pointing a *running* entry is refused (409) until stopped.

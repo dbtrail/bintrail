@@ -46,7 +46,10 @@ type MonitorStatus struct {
 	//     (the message says so; Start re-arms it).
 	State     string `json:"state"`
 	LastError string `json:"last_error,omitempty"`
-	// Since is when the state was entered (RFC3339), empty for stopped.
+	// Since is when the underlying STORED state was entered (RFC3339), empty
+	// for stopped. For the derived stalled/lost_position presentations it
+	// still reflects the running transition, not when the stream stalled or
+	// lost its position.
 	Since string `json:"since,omitempty"`
 }
 

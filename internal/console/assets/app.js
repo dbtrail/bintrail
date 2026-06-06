@@ -654,13 +654,26 @@ async function startMonitorRow(id) {
   await refreshServersList();
   if (!res) return;
   if (res.started) {
-    toast("Monitoring started");
+    if (doctorWarnings(res.doctor)) {
+      // Warnings never block (started already), but they must be SEEN —
+      // e.g. "this looks like a replica of an already-monitored server".
+      await editServer(id);
+      renderDoctor(res.doctor);
+      formMsg("monitoring started — review the warnings below", false);
+    } else {
+      toast("Monitoring started");
+    }
   } else {
     // Preflight failed — open the editor so the remediation cards are visible.
     await editServer(id);
     renderDoctor(res.doctor);
     formMsg("preflight failed — fix the items below, Save, and Start again", true);
   }
+}
+
+// doctorWarnings: does the preflight report carry warn cards worth showing?
+function doctorWarnings(report) {
+  return !!(report && report.warnings > 0);
 }
 
 async function stopMonitorRow(id) {
@@ -769,9 +782,14 @@ async function saveServer(e) {
     formMsg("running preflight checks…", false);
     const res = await startMonitor(saved.id);
     await refreshServersList();
-    if (res && res.started) {
+    if (res && res.started && !doctorWarnings(res.doctor)) {
       hideServerForm();
       toast("Monitoring started — events will appear within a minute");
+    } else if (res && res.started) {
+      // Started, but with warn cards (e.g. replica-of-monitored) — keep the
+      // form open so the operator actually sees them.
+      renderDoctor(res.doctor);
+      formMsg("monitoring started — review the warnings below", false);
     } else if (res) {
       renderDoctor(res.doctor);
       formMsg("preflight failed — fix the items below and Save again", true);

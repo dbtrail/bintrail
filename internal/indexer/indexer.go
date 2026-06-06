@@ -201,8 +201,8 @@ func nullOrUint32(v uint32) any {
 }
 
 // EnsureSchema adds any columns introduced after the initial schema to
-// binlog_events and schema_snapshots. It is idempotent — safe to call on
-// every startup.
+// binlog_events, schema_snapshots, and stream_state. It is idempotent — safe
+// to call on every startup.
 func EnsureSchema(db *sql.DB) error {
 	if err := ensureColumn(db, "binlog_events", "connection_id",
 		`ALTER TABLE binlog_events ADD COLUMN connection_id INT UNSIGNED DEFAULT NULL COMMENT 'MySQL connection ID (pseudo_thread_id) that produced this event' AFTER gtid`,
@@ -219,7 +219,18 @@ func EnsureSchema(db *sql.DB) error {
 	); err != nil {
 		return err
 	}
-	return nil
+	// gap_lost_at/_detail record an unfillable-gap auto-advance durably
+	// (#402): the advanced checkpoint is persisted, so without these columns
+	// the only trace of the permanently lost events would be an in-memory
+	// flag that a daemon restart silently discards.
+	if err := ensureColumn(db, "stream_state", "gap_lost_at",
+		`ALTER TABLE stream_state ADD COLUMN gap_lost_at DATETIME DEFAULT NULL COMMENT 'when an unfillable binlog gap forced an auto-advance (events permanently lost); cleared by an explicit monitor Stop or --reset' AFTER bintrail_id`,
+	); err != nil {
+		return err
+	}
+	return ensureColumn(db, "stream_state", "gap_lost_detail",
+		`ALTER TABLE stream_state ADD COLUMN gap_lost_detail TEXT DEFAULT NULL COMMENT 'human-readable description of the lost gap' AFTER gap_lost_at`,
+	)
 }
 
 // ensureColumn runs an idempotent ALTER TABLE ADD COLUMN: checks

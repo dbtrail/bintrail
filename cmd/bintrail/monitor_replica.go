@@ -70,6 +70,12 @@ func (m *monitorSupervisor) replicaOverlapCheck(ctx context.Context, e console.S
 		return &console.DoctorCheck{Name: checkName, Status: "skip",
 			Detail: "could not read server_uuid / gtid_executed: " + err.Error()}
 	}
+	// A malformed candidate set would silently disable the main (replica-of)
+	// direction inside gtidSetContainsUUID — surface it as skip instead.
+	if candExecuted != "" && !gtidSetParseable(candExecuted) {
+		return &console.DoctorCheck{Name: checkName, Status: "skip",
+			Detail: "could not parse the source's gtid_executed set — replica detection unavailable"}
+	}
 
 	var findings []string
 	unverified := 0
@@ -83,6 +89,13 @@ func (m *monitorSupervisor) replicaOverlapCheck(ctx context.Context, e console.S
 		}
 		if rel := classifyReplicaOverlap(candUUID, candExecuted, peerUUID, peerExecuted); rel != "" {
 			findings = append(findings, fmt.Sprintf("%s %q", rel, p.Name))
+			continue
+		}
+		// A peer set that does not parse silently disables the primary-of-
+		// monitored-replica direction — count it as unverified so the pass
+		// card stays honest.
+		if peerExecuted != "" && !gtidSetParseable(peerExecuted) {
+			unverified++
 		}
 	}
 
@@ -93,8 +106,9 @@ func (m *monitorSupervisor) replicaOverlapCheck(ctx context.Context, e console.S
 			Detail: "this server " + strings.Join(findings, "; "),
 			Remediation: "Monitoring a primary and its replica (or the same server twice) indexes every\n" +
 				"row change once per entry — duplicate history, duplicate storage.\n\n" +
-				"If that is not intentional, monitor only one of them (usually the primary).\n" +
-				"This is a WARN, not a hard fail — press Start again to proceed anyway.",
+				"This is a WARN, not a hard fail: monitoring has already started. If the\n" +
+				"overlap is unintentional, press Stop on one of the entries (usually keep\n" +
+				"the primary).",
 		}
 	}
 	detail := fmt.Sprintf("no replica relationship detected among %d monitored source(s)", len(peers))
@@ -149,6 +163,13 @@ func classifyReplicaOverlap(candUUID, candExecuted, peerUUID, peerExecuted strin
 		return "appears to be the primary of already-monitored replica"
 	}
 	return ""
+}
+
+// gtidSetParseable reports whether a stored GTID set parses — callers use it
+// to tell "no overlap" apart from "could not even look".
+func gtidSetParseable(gtidSet string) bool {
+	_, err := gomysql.ParseMysqlGTIDSet(normalizeGTIDSet(gtidSet))
+	return err == nil
 }
 
 // gtidSetContainsUUID reports whether the GTID set contains any transactions

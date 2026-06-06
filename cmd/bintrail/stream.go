@@ -1129,6 +1129,16 @@ func streamOne(ctx context.Context, cfg streamConfig) error {
 				}
 				slog.Info("saved advanced checkpoint after gap auto-advance",
 					"file", startFile, "pos", startPos, "gtid_set", startGTIDStr)
+				// Record the data loss DURABLY: the advanced checkpoint means
+				// the next start sees no gap, so without this row the only
+				// trace of the permanently lost events would be an in-memory
+				// flag (or a log line) that a restart silently discards.
+				// Cleared by an explicit monitor Stop or --reset.
+				if _, err := indexDB.Exec(`UPDATE stream_state
+					SET gap_lost_at = UTC_TIMESTAMP(), gap_lost_detail = ?
+					WHERE id = 1`, gap.Message); err != nil {
+					slog.Warn("failed to persist gap-loss record; the lost_position state will not survive a restart", "error", err)
+				}
 				// Tell the supervisor events were lost — without this the
 				// auto-advance is only a log line and the console shows a
 				// healthy RUNNING badge over a stream that silently skipped
@@ -1251,7 +1261,11 @@ func streamOne(ctx context.Context, cfg streamConfig) error {
 	// instead (cfg.MetricsAddr is empty there) — the registry is process-
 	// global, so one handler exposes every per-source series.
 	if cfg.MetricsAddr != "" {
-		defer startMetricsServer(cfg.MetricsAddr)()
+		stopMetrics, err := startMetricsServer(cfg.MetricsAddr)
+		if err != nil {
+			return err
+		}
+		defer stopMetrics()
 	}
 
 	// All stream metrics carry a "source" label: the supervisor's entry ID
@@ -1355,24 +1369,30 @@ func streamOne(ctx context.Context, cfg streamConfig) error {
 	return nil
 }
 
-// startMetricsServer binds the Prometheus /metrics endpoint asynchronously
-// and returns a shutdown func. Serve errors are logged, never fatal — metrics
-// are observability, not the data path. Shared by `bintrail stream` (one
-// endpoint per stream process) and the `up --console` daemon (one endpoint
-// for all supervised streams; the default registry is process-global).
-func startMetricsServer(addr string) (shutdown func()) {
+// startMetricsServer binds the Prometheus /metrics endpoint and returns a
+// shutdown func. The bind is SYNCHRONOUS so a bad --metrics-addr fails the
+// command fast — the operator explicitly asked for metrics; silently running
+// without them (scrapes getting connection-refused) is worse than refusing
+// to start. Shared by `bintrail stream` (one endpoint per stream process)
+// and the `up --console` daemon (one endpoint for all supervised streams;
+// the default registry is process-global).
+func startMetricsServer(addr string) (shutdown func(), err error) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{Handler: mux}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("metrics server: cannot bind %s: %w", addr, err)
+	}
 	go func() {
 		slog.Info("metrics server starting", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("metrics server error", "error", err)
+		if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			slog.Error("metrics server error", "error", serveErr)
 		}
 	}()
 	return func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
-	}
+	}, nil
 }

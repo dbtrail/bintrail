@@ -196,6 +196,8 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		last_checkpoint  DATETIME        NOT NULL,
 		server_id        INT UNSIGNED    NOT NULL,
 		bintrail_id      CHAR(36)        NULL DEFAULT NULL,
+		gap_lost_at      DATETIME        DEFAULT NULL,
+		gap_lost_detail  TEXT            DEFAULT NULL,
 		CONSTRAINT single_row CHECK (id = 1)
 	) ENGINE=InnoDB`)
 
