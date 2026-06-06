@@ -1,11 +1,11 @@
-# bintrail appliance — single-container evaluation demo (#350).
+# bintrail demo image — single-container evaluation demo (#350).
 #
 # Bundles: bintrail (built from this repo) + MySQL 8.0 (source AND index
 # in one instance) + ProxySQL preloaded for Time Travel SQL + a traffic
 # generator. EVALUATION ONLY — stateless, restart = fresh demo.
 #
-#   docker build -f appliance/Dockerfile -t bintrail-appliance .
-#   docker run --rm -p 6033:6033 bintrail-appliance
+#   docker build -f demo/image/Dockerfile -t bintrail-demo .
+#   docker run --rm -p 6033:6033 bintrail-demo
 #
 # Base-image note: the runtime MUST be glibc-compatible with the builder.
 # mysql:8.0 (Oracle Linux 9, glibc 2.34) cannot run a bookworm-built
@@ -17,7 +17,7 @@
 # amd64-only: MySQL's apt repo ships no arm64 packages for Debian
 # (Architectures: i386 amd64). Apple Silicon runs the image via
 # Rosetta/QEMU emulation — fine for an evaluation. On an ARM host build
-# with: docker build --platform linux/amd64 -f appliance/Dockerfile .
+# with: docker build --platform linux/amd64 -f demo/image/Dockerfile .
 
 FROM golang:1.25-bookworm AS build
 
@@ -56,9 +56,9 @@ RUN set -eux; \
     apt-get purge -y gnupg wget; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/* /tmp/*.key; \
-    # The appliance is stateless: drop whatever datadir the package
+    # The demo is stateless: drop whatever datadir the package
     # postinst initialized (wrong config) — entrypoint.sh re-initializes
-    # with appliance/my.cnf at first boot.
+    # with demo/image/my.cnf at first boot.
     rm -rf /var/lib/mysql && mkdir -p /var/lib/mysql && chown mysql:mysql /var/lib/mysql; \
     mkdir -p /var/lib/proxysql
 
@@ -67,10 +67,10 @@ COPY --from=build /out/bintrail /usr/local/bin/bintrail
 # here, not in the user's first `docker run`.
 RUN bintrail --version
 
-COPY appliance/my.cnf /etc/mysql/conf.d/appliance.cnf
-COPY appliance/proxysql.cnf /etc/proxysql.cnf
-COPY appliance/shim.yaml appliance/seed.sql /opt/bintrail/
-COPY appliance/entrypoint.sh appliance/traffic.sh /usr/local/bin/
+COPY demo/image/my.cnf /etc/mysql/conf.d/demo.cnf
+COPY demo/image/proxysql.cnf /etc/proxysql.cnf
+COPY demo/image/shim.yaml demo/image/seed.sql /opt/bintrail/
+COPY demo/image/entrypoint.sh demo/image/traffic.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/traffic.sh
 
 # 6033 = ProxySQL (Time Travel SQL entry point), 3306 = raw MySQL.

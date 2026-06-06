@@ -1,4 +1,4 @@
-# Shim tenant config for the bintrail appliance (evaluation-only).
+# Shim tenant config for the bintrail demo (evaluation-only).
 #
 # The single tenant binds the wire-protocol login (demo / demo) to the
 # demo schema — the shim derives the default schema from source_dsn's

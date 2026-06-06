@@ -1,11 +1,11 @@
-# bintrail appliance — 30-second evaluation
+# bintrail demo — 30-second evaluation
 
-`ghcr.io/dbtrail/bintrail-appliance` is a **single-container, evaluation-only**
+`ghcr.io/dbtrail/bintrail-demo` is a **single-container, evaluation-only**
 demo: MySQL 8.0, bintrail, ProxySQL, and a traffic generator, preconfigured so
 your first Time Travel SQL query is one `docker run` away.
 
 ```sh
-docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-appliance
+docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-demo
 ```
 
 Wait for the banner (~30 s boot), give the traffic generator a minute to build
@@ -82,11 +82,11 @@ Make your own history: the `demo` user can write, so UPDATE a row through port
 ## Building locally
 
 ```sh
-docker build -f appliance/Dockerfile -t bintrail-appliance .
-docker run --rm -p 6033:6033 bintrail-appliance
+docker build -f demo/image/Dockerfile -t bintrail-demo .
+docker run --rm -p 6033:6033 bintrail-demo
 ```
 
-`appliance/smoke-test.sh` builds, boots, and asserts the acceptance flow
+`demo/image/smoke-test.sh` builds, boots, and asserts the acceptance flow
 (time-travel returns a previous `orders id=1` state distinct from the live
 row). It needs Docker and ~3 minutes; it is not part of `go test ./...`.
 
@@ -94,17 +94,17 @@ row). It needs Docker and ~3 minutes; it is not part of `go test ./...`.
 
 | Symptom | Cause |
 |---|---|
-| `Empty set` from an `AS OF` query | The timestamp predates the stream start (history only accumulates while the appliance runs) or the row wasn't touched yet — wait a minute and retry. |
+| `Empty set` from an `AS OF` query | The timestamp predates the stream start (history only accumulates while the demo runs) or the row wasn't touched yet — wait a minute and retry. |
 | `ERROR 1064` | The query shape isn't in the shim grammar — see the supported forms above (the hint and bare-AS-OF forms only support `SELECT *`, and bare `AS OF` must end the statement). The same query without time-travel syntax goes straight to MySQL. |
 | Historical ENUM shows a number (`2` instead of `processing`) | The binlog row image stores ENUMs as their ordinal; live rows render the label, historical images render the ordinal. |
 | `ERROR 1045` | Wrong credentials — port 6033 takes `demo` / `demo`. |
-| Container exits during boot | A component failed; `docker logs` shows which. The appliance dies loudly rather than half-working. |
+| Container exits during boot | A component failed; `docker logs` shows which. The demo dies loudly rather than half-working. |
 
 ## Publishing notes (maintainers)
 
-`.github/workflows/appliance.yml` builds and pushes
-`ghcr.io/dbtrail/bintrail-appliance` (amd64, cosign-signed) on every `v*` tag
-push, separately from GoReleaser so an appliance build failure never blocks a
+`.github/workflows/demo.yml` builds and pushes
+`ghcr.io/dbtrail/bintrail-demo` (amd64, cosign-signed) on every `v*` tag
+push, separately from GoReleaser so an demo build failure never blocks a
 release. (Not `release: published`: GoReleaser creates the release with the
 default `GITHUB_TOKEN`, whose events never trigger other workflows.) Manual
 runs take an explicit existing tag as a `workflow_dispatch` input. Like the main image, the GHCR package is created

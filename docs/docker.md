@@ -50,9 +50,9 @@ cosign verify ghcr.io/dbtrail/bintrail:latest \
 
 An SBOM is attached to each release archive on the GitHub Releases page.
 
-> **Just evaluating?** `ghcr.io/dbtrail/bintrail-appliance` is a zero-setup,
+> **Just evaluating?** `ghcr.io/dbtrail/bintrail-demo` is a zero-setup,
 > single-container demo (MySQL + bintrail + ProxySQL + traffic generator,
-> evaluation-only) — see [appliance.md](appliance.md). It is a separate GHCR
+> evaluation-only) — see [demo.md](demo.md). It is a separate GHCR
 > package and needs the same one-time public-visibility flip described below.
 
 > **Maintainer note (one-time):** the first release creates the GHCR package as **private**. Anonymous `docker pull` only works once the package is made public: in the org's *Packages → bintrail → Package settings*, set visibility to **Public** and link it to this repository. Until then the `pull` commands above require `docker login ghcr.io`.

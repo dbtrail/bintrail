@@ -65,12 +65,12 @@ the full walkthrough is in [docker.md](./docker.md).
 
 ## Try it without installing anything (30 seconds)
 
-Want to *feel* time-travel SQL before wiring anything up? The appliance image
+Want to *feel* time-travel SQL before wiring anything up? The demo image
 bundles MySQL, bintrail, ProxySQL, and a traffic generator in one
 evaluation-only container:
 
 ```sh
-docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-appliance
+docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-demo
 ```
 
 Wait for the banner, give the traffic a minute to build history, then:
@@ -82,7 +82,7 @@ mysql -h 127.0.0.1 -P 6033 -u demo -pdemo demo \
 
 …returns the row as it was a minute ago. Stateless and for evaluation only;
 amd64-only (it runs under emulation on Apple Silicon — the main bintrail
-image is multi-arch); see [appliance.md](./appliance.md) for what's inside
+image is multi-arch); see [demo.md](./demo.md) for what's inside
 and more queries to try.
 
 ## Docker image (without Compose)

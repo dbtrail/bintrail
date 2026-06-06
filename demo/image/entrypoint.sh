@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Entrypoint for the bintrail appliance (evaluation-only).
+# Entrypoint for the bintrail demo (evaluation-only).
 #
 # Boot order:
 #   1. mysqld          (initialize datadir on first boot, then serve)
@@ -13,11 +13,11 @@
 #
 # Supervision: no init system. SIGTERM/SIGINT fan out to every child;
 # if ANY component dies the container exits non-zero — an evaluation
-# appliance that half-works silently is worse than one that restarts.
+# demo image that half-works silently is worse than one that restarts.
 
 set -euo pipefail
 
-log() { echo "[appliance] $(date '+%H:%M:%S') $*"; }
+log() { echo "[demo image] $(date '+%H:%M:%S') $*"; }
 
 BINTRAIL_DSN='bintrail:bintrail@tcp(127.0.0.1:3306)'
 PIDS=()
@@ -26,7 +26,7 @@ shutdown() {
     log "Shutting down..."
     trap - TERM INT
     # Kill children in reverse boot order; mysqladmin gives mysqld a
-    # clean shutdown (irrelevant for data — the appliance is stateless —
+    # clean shutdown (irrelevant for data — the demo image is stateless —
     # but avoids InnoDB recovery noise on quick restart cycles).
     for ((i=${#PIDS[@]}-1; i>=0; i--)); do
         kill "${PIDS[$i]}" 2>/dev/null || true
@@ -101,7 +101,7 @@ for _ in $(seq 1 30); do
 done
 # Definitive post-loop probe (mirrors the MySQL/stream waits): without
 # it, a shim that never binds (bad shim.yaml, port contention) would
-# boot a half-working appliance whose time-travel queries fail with an
+# boot a half-working demo image whose time-travel queries fail with an
 # opaque ProxySQL routing error at query time.
 (exec 3<>/dev/tcp/127.0.0.1/3308) 2>/dev/null && exec 3>&- \
     || { log "shim never started listening on 127.0.0.1:3308"; exit 1; }
@@ -137,7 +137,7 @@ PIDS+=($!)
 cat <<'BANNER'
 
   ┌─────────────────────────────────────────────────────────────────────┐
-  │  bintrail appliance is up.                                          │
+  │  bintrail demo is up.                                          │
   │                                                                     │
   │  Give the traffic generator ~1 minute to build history, then:      │
   │                                                                     │
@@ -163,5 +163,5 @@ BANNER
 # exists to prevent.
 rc=0
 wait -n || rc=$?
-log "A component exited unexpectedly (status ${rc}); shutting the appliance down."
+log "A component exited unexpectedly (status ${rc}); shutting the demo image down."
 exit 1

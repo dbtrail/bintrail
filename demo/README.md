@@ -1,6 +1,6 @@
 # Bintrail Demo
 
-> **Want the 30-second version?** The [appliance image](../docs/appliance.md)
+> **Want the 30-second version?** The [demo image](../docs/demo.md)
 > packs this whole rig (minus Grafana) into one `docker run` — MySQL, bintrail,
 > ProxySQL and traffic, preconfigured for Time Travel SQL.
 

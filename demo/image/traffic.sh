@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Traffic generator for the bintrail appliance (evaluation-only).
+# Traffic generator for the bintrail demo (evaluation-only).
 #
 # A trimmed demo/traffic/traffic.sh: no sysbench, no compose-restart
 # watchdogs (entrypoint.sh supervises). Every ~5s cycle makes a mixed
@@ -31,7 +31,7 @@ mysql_cmd() {
 # connection blip, the outer `timeout 60` firing) must NOT abort the
 # loop — under set -e an unguarded failure would exit this script, and
 # the entrypoint's fail-loud supervisor would then tear down the whole
-# appliance over a hiccup in non-essential traffic. Log and keep going;
+# demo image over a hiccup in non-essential traffic. Log and keep going;
 # the next cycle retries the same statement shapes anyway.
 sql() {
     mysql_cmd "$MYSQL_DB" -e "$1" \

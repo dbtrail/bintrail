@@ -69,8 +69,8 @@ requires the token from the URL.
 > source builds, and the binary quickstart: see **[docs/install.md](docs/install.md)**.
 >
 > **Just curious?** One container, zero setup, time-travel SQL in 30 seconds:
-> `docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-appliance` — see
-> [the appliance](docs/appliance.md). (amd64 image; on Apple Silicon it runs
+> `docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-demo` — see
+> [the demo image](docs/demo.md). (amd64 image; on Apple Silicon it runs
 > under emulation — the main bintrail image above is multi-arch.)
 
 ## How it works
@@ -91,7 +91,7 @@ ProxySQL — your clients keep speaking plain MySQL.
 | [Install](docs/install.md) | [Query & Recovery](docs/query-and-recovery.md) | [Deployment](docs/deployment.md) |
 | [Quickstart](docs/quickstart.md) | [Web console](docs/console.md) | [Rotation & Status](docs/rotation-and-status.md) |
 | [DBA guide](docs/guide.md) | [Time-Travel SQL](docs/time-travel-sql.md) | [Docker](docs/docker.md) |
-| [Appliance demo](docs/appliance.md) | [Streaming](docs/streaming.md) · [101](docs/streaming-101.md) · [Indexing](docs/indexing.md) | [Upload to S3](docs/upload.md) |
+| [30-second demo](docs/demo.md) | [Streaming](docs/streaming.md) · [101](docs/streaming-101.md) · [Indexing](docs/indexing.md) | [Upload to S3](docs/upload.md) |
 | | [MCP server](docs/mcp-server.md) · [MCP gateway](docs/mcp-gateway.md) | [Server identity](docs/server-identity.md) |
 | | [Dump & Baseline](docs/dump-and-baseline.md) · [DDL tracking](docs/ddl-tracking.md) | [Parquet debugging](docs/parquet-debugging.md) |
 

@@ -1,8 +1,8 @@
 -- ============================================================
--- Bintrail appliance seed (evaluation-only)
+-- Bintrail demo image seed (evaluation-only)
 --
 -- demo/sql/00-schema.sql minus the sysbench database, plus the
--- two users the appliance needs:
+-- two users the demo image needs:
 --
 --   bintrail@127.0.0.1  — what `bintrail up` and `bintrail shim`
 --                         connect as. ALL on *.* covers the doctor

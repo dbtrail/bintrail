@@ -1,4 +1,4 @@
-# Minimal ProxySQL config for the bintrail appliance (evaluation-only).
+# Minimal ProxySQL config for the bintrail demo (evaluation-only).
 #
 # Carries only admin reachability and protocol bind addresses; the
 # routing config (mysql_servers / mysql_users / mysql_query_rules) is

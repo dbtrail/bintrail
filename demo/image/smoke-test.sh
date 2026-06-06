@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for the bintrail appliance image (#350).
+# Smoke test for the bintrail demo image (#350).
 #
 # Builds the image, boots it, waits for the stack, lets the traffic
 # generator build ~70s of history, then asserts the acceptance flow:
@@ -7,20 +7,20 @@
 # state that differs from the live row.
 #
 # Not part of `go test ./...` — needs Docker and ~3 minutes. Run:
-#   appliance/smoke-test.sh            # build + test
-#   SKIP_BUILD=1 appliance/smoke-test.sh   # reuse the last image
+#   demo/image/smoke-test.sh            # build + test
+#   SKIP_BUILD=1 demo/image/smoke-test.sh   # reuse the last image
 
 set -euo pipefail
 
-IMAGE="${IMAGE:-bintrail-appliance:smoke}"
+IMAGE="${IMAGE:-bintrail-demo:smoke}"
 PORT="${PORT:-16033}"
-NAME="bintrail-appliance-smoke"
+NAME="bintrail-demo-smoke"
 
 log() { echo "[smoke] $(date '+%H:%M:%S') $*"; }
 
 if [ -z "${SKIP_BUILD:-}" ]; then
     log "Building image (amd64 — MySQL's Debian apt repo has no arm64)..."
-    docker build --platform linux/amd64 -f appliance/Dockerfile -t "$IMAGE" .
+    docker build --platform linux/amd64 -f demo/image/Dockerfile -t "$IMAGE" .
 fi
 
 cleanup() {
@@ -29,7 +29,7 @@ cleanup() {
 trap cleanup EXIT
 cleanup
 
-log "Starting appliance (ProxySQL on :$PORT)..."
+log "Starting demo image (ProxySQL on :$PORT)..."
 docker run -d --name "$NAME" -p "$PORT:6033" "$IMAGE" >/dev/null
 
 mysql_demo() {
