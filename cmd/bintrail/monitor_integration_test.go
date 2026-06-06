@@ -14,6 +14,37 @@ import (
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
+// waitStreamLive proves the supervised stream is attached and past its
+// auto-discovered start position before the test writes the rows it intends
+// to assert on. The supervisor reports "running" while streamOne is still
+// connecting → snapshotting → discovering its start position; rows written in
+// that window land BEFORE the stream's start and are legitimately never
+// indexed. On a fast laptop the window is <1s; on a cold CI runner it spans
+// seconds (the #407 CI flake: "indexed 0 of 4"). Sentinel writes are retried
+// until one is observed in the index — once any sentinel lands, every later
+// write must land too (the binlog is sequential).
+func waitStreamLive(t *testing.T, srcDB, idxDB *sql.DB, schema, table, pkCol string) {
+	t.Helper()
+	for attempt := range 8 {
+		id := 900000 + attempt
+		if _, err := srcDB.Exec(fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES (%d)", schema, table, pkCol, id)); err != nil {
+			t.Fatalf("sentinel insert: %v", err)
+		}
+		deadline := time.Now().Add(8 * time.Second)
+		for time.Now().Before(deadline) {
+			var n int
+			_ = idxDB.QueryRow(
+				"SELECT COUNT(*) FROM binlog_events WHERE schema_name = ? AND table_name = ? AND pk_values = ?",
+				schema, table, fmt.Sprint(id)).Scan(&n)
+			if n > 0 {
+				return
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+	t.Fatal("stream never went live: no sentinel write was indexed")
+}
+
 // TestIntegrationMonitorSupervisor exercises the control plane end to end
 // against real MySQL: provision a per-source index DB, take the advisory
 // lock, stream real binlog events into it, refuse a second daemon, and stop
@@ -98,6 +129,15 @@ func TestIntegrationMonitorSupervisor(t *testing.T) {
 	}
 	waitState("running", 30*time.Second)
 
+	idxDB, err := sql.Open("mysql", derived)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idxDB.Close()
+	// "running" means the supervisor launched the stream, not that it finished
+	// attaching — gate on real liveness before writing the rows under test.
+	waitStreamLive(t, srcDB, idxDB, srcSchema, "items", "id")
+
 	// The advisory lock: a second supervisor (second daemon) must refuse.
 	sup2 := newMonitorSupervisor(ctx, bootDSN)
 	if err := sup2.Start(ctx, entry); err == nil || !strings.Contains(err.Error(), "already monitoring") {
@@ -108,11 +148,6 @@ func TestIntegrationMonitorSupervisor(t *testing.T) {
 	mustExec("INSERT INTO " + srcSchema + ".items VALUES (1, 10), (2, 5)")
 	mustExec("UPDATE " + srcSchema + ".items SET qty = 99 WHERE id = 1")
 
-	idxDB, err := sql.Open("mysql", derived)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer idxDB.Close()
 	var count int
 	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
@@ -201,6 +236,16 @@ func TestIntegrationDDLThenImmediateInserts(t *testing.T) {
 		t.Fatalf("stream not running: %+v", st)
 	}
 
+	idxDB, err := sql.Open("mysql", derived)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idxDB.Close()
+	// "running" precedes actual attachment; prove liveness via the seed table
+	// before the burst, or a slow runner discovers its start position AFTER
+	// the burst and legitimately never sees it (the #407 CI flake).
+	waitStreamLive(t, srcDB, idxDB, srcSchema, "seed", "id")
+
 	// THE repro: the table is created WHILE the stream is live, with the row
 	// events immediately behind the DDL in the binlog — one multi-statement
 	// burst, no pause for any snapshot to win a race.
@@ -216,12 +261,6 @@ func TestIntegrationDDLThenImmediateInserts(t *testing.T) {
 	if _, err := srcDB.Exec("DELETE FROM " + srcSchema + ".burst WHERE id=2"); err != nil {
 		t.Fatal(err)
 	}
-
-	idxDB, err := sql.Open("mysql", derived)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer idxDB.Close()
 
 	// 3 row events (INSERT batch counts once per row? InsertEvent granularity:
 	// the indexer writes one row per affected row — INSERT(2 rows) + UPDATE(1)
