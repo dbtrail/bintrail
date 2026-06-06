@@ -1359,3 +1359,95 @@ func TestResolveStartWithAutoDiscover_mutuallyExclusiveFlagsErrorPropagates(t *t
 		t.Errorf("expected mutually-exclusive error, got: %v", err)
 	}
 }
+
+// TestStreamConfigFromFlags asserts the strm* → streamConfig snapshot — the
+// single seam where the flag globals become a by-value config that streamOne
+// (and, later, the control-plane supervisor) consumes. A flag added to stream
+// but not wired through here would silently read its zero value inside
+// streamOne, so every field is checked with a distinctive value. Mirrors
+// TestPopulateStreamFlags' save-and-restore discipline: no t.Parallel().
+func TestStreamConfigFromFlags(t *testing.T) {
+	orig := struct {
+		src, idx, file, gtid, sch, tbl, met, fmtv, ssl, ca, cert, key string
+		sid, pos                                                      uint32
+		batch, chk, gap                                               int
+		reset, noGap                                                  bool
+	}{
+		src: strmSourceDSN, idx: strmIndexDSN, file: strmStartFile,
+		gtid: strmStartGTID, sch: strmSchemas, tbl: strmTables,
+		met: strmMetricsAddr, fmtv: strmFormat, ssl: strmSSLMode,
+		ca: strmSSLCA, cert: strmSSLCert, key: strmSSLKey,
+		sid: strmServerID, pos: strmStartPos,
+		batch: strmBatchSize, chk: strmCheckpoint, gap: strmGapTimeout,
+		reset: strmReset, noGap: strmNoGapFill,
+	}
+	t.Cleanup(func() {
+		strmSourceDSN, strmIndexDSN, strmStartFile = orig.src, orig.idx, orig.file
+		strmStartGTID, strmSchemas, strmTables = orig.gtid, orig.sch, orig.tbl
+		strmMetricsAddr, strmFormat, strmSSLMode = orig.met, orig.fmtv, orig.ssl
+		strmSSLCA, strmSSLCert, strmSSLKey = orig.ca, orig.cert, orig.key
+		strmServerID, strmStartPos = orig.sid, orig.pos
+		strmBatchSize, strmCheckpoint, strmGapTimeout = orig.batch, orig.chk, orig.gap
+		strmReset, strmNoGapFill = orig.reset, orig.noGap
+	})
+
+	strmIndexDSN = "ix:pw@tcp(127.0.0.1:3306)/binlog_index"
+	strmSourceDSN = "user:pass@tcp(source.example.com:3306)/src"
+	strmServerID = 424242
+	strmStartFile = "mysql-bin.000777"
+	strmStartPos = 1234
+	strmStartGTID = "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5"
+	strmBatchSize = 333
+	strmSchemas = "mydb,otherdb"
+	strmTables = "mydb.orders"
+	strmCheckpoint = 17
+	strmMetricsAddr = ":9191"
+	strmSSLMode = "verify-ca"
+	strmSSLCA = "/tmp/ca.pem"
+	strmSSLCert = "/tmp/cert.pem"
+	strmSSLKey = "/tmp/key.pem"
+	strmFormat = "json"
+	strmReset = true
+	strmNoGapFill = true
+	strmGapTimeout = 99
+
+	got := streamConfigFromFlags()
+	want := streamConfig{
+		IndexDSN:    "ix:pw@tcp(127.0.0.1:3306)/binlog_index",
+		SourceDSN:   "user:pass@tcp(source.example.com:3306)/src",
+		ServerID:    424242,
+		StartFile:   "mysql-bin.000777",
+		StartPos:    1234,
+		StartGTID:   "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
+		BatchSize:   333,
+		Schemas:     "mydb,otherdb",
+		Tables:      "mydb.orders",
+		Checkpoint:  17,
+		MetricsAddr: ":9191",
+		SSLMode:     "verify-ca",
+		SSLCA:       "/tmp/ca.pem",
+		SSLCert:     "/tmp/cert.pem",
+		SSLKey:      "/tmp/key.pem",
+		Format:      "json",
+		Reset:       true,
+		NoGapFill:   true,
+		GapTimeout:  99,
+	}
+	if got != want {
+		t.Errorf("streamConfigFromFlags mismatch:\n got: %+v\nwant: %+v", got, want)
+	}
+}
+
+// TestStreamOneRejectsBadConfig: streamOne owns its own validation (it must
+// not depend on cobra/flag-layer checks once a supervisor builds configs
+// programmatically).
+func TestStreamOneRejectsBadConfig(t *testing.T) {
+	if err := streamOne(t.Context(), streamConfig{Format: "bogus", GapTimeout: 30}); err == nil ||
+		!strings.Contains(err.Error(), "invalid --format") {
+		t.Errorf("bad format: err = %v, want invalid --format", err)
+	}
+	if err := streamOne(t.Context(), streamConfig{Format: "text", GapTimeout: 0}); err == nil ||
+		!strings.Contains(err.Error(), "gap-timeout") {
+		t.Errorf("bad gap-timeout: err = %v, want gap-timeout error", err)
+	}
+}

@@ -821,25 +821,115 @@ func streamLoop(
 	}
 }
 
-// ─── runStream ───────────────────────────────────────────────────────────────────
+// ─── streamConfig / streamOne ───────────────────────────────────────────────
 
+// streamConfig carries everything ONE replication stream needs — the by-value
+// equivalent of the strm* package globals. It exists so the future control
+// plane can run N streams concurrently in one process (each with its own
+// config), while `bintrail stream` keeps wiring its flags through a single
+// instance unchanged. Plain data, no behavior: the zero value is invalid;
+// build it from flags via streamConfigFromFlags or populate it explicitly.
+type streamConfig struct {
+	IndexDSN    string
+	SourceDSN   string
+	ServerID    uint32
+	StartFile   string
+	StartPos    uint32
+	StartGTID   string
+	BatchSize   int
+	Schemas     string
+	Tables      string
+	Checkpoint  int // seconds
+	MetricsAddr string
+	SSLMode     string
+	SSLCA       string
+	SSLCert     string
+	SSLKey      string
+	Format      string
+	Reset       bool
+	NoGapFill   bool
+	GapTimeout  int // seconds
+}
+
+// streamConfigFromFlags snapshots the strm* package globals into a config.
+// The globals remain the cobra flag targets (and up.go's populateStreamFlags
+// fan-out target); this is the single seam where they become values.
+func streamConfigFromFlags() streamConfig {
+	return streamConfig{
+		IndexDSN:    strmIndexDSN,
+		SourceDSN:   strmSourceDSN,
+		ServerID:    strmServerID,
+		StartFile:   strmStartFile,
+		StartPos:    strmStartPos,
+		StartGTID:   strmStartGTID,
+		BatchSize:   strmBatchSize,
+		Schemas:     strmSchemas,
+		Tables:      strmTables,
+		Checkpoint:  strmCheckpoint,
+		MetricsAddr: strmMetricsAddr,
+		SSLMode:     strmSSLMode,
+		SSLCA:       strmSSLCA,
+		SSLCert:     strmSSLCert,
+		SSLKey:      strmSSLKey,
+		Format:      strmFormat,
+		Reset:       strmReset,
+		NoGapFill:   strmNoGapFill,
+		GapTimeout:  strmGapTimeout,
+	}
+}
+
+// runStream is the `bintrail stream` entrypoint: it owns the PROCESS concerns
+// (signal handling) and delegates the actual streaming to streamOne with a
+// config snapshotted from the flags. The split exists so a supervisor can run
+// several streamOne instances under its own lifecycle without inheriting
+// per-process signal wiring.
 func runStream(cmd *cobra.Command, args []string) error {
-	if !cliutil.IsValidOutputFormat(strmFormat) {
-		return fmt.Errorf("invalid --format %q; must be text or json", strmFormat)
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+
+	// Graceful shutdown on SIGINT/SIGTERM: cancel the context so streamOne
+	// flushes its batch and writes a final checkpoint. (Installed before
+	// startup rather than after StartSync as it historically was — a signal
+	// during the connect/snapshot phase now also exits cleanly.)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			slog.Info("received signal — shutting down gracefully", "signal", sig.String())
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	return streamOne(ctx, streamConfigFromFlags())
+}
+
+// streamOne runs one complete replication stream — connect, validate,
+// resolve identity, snapshot, gap-check, sync, index, checkpoint — until ctx
+// is cancelled or a fatal error occurs. It is self-contained by design: no
+// package globals, no signal handling, safe to run N instances concurrently
+// (each against its own index database).
+func streamOne(ctx context.Context, cfg streamConfig) error {
+	if !cliutil.IsValidOutputFormat(cfg.Format) {
+		return fmt.Errorf("invalid --format %q; must be text or json", cfg.Format)
 	}
 	// Reject non-positive --gap-timeout values: a zero or negative timeout
 	// would produce an immediately-cancelled context inside detectPositionGap
 	// / detectGTIDGap, surfacing as a misleading "context deadline exceeded"
 	// error whose recovery hint (`--reset`) discards the saved checkpoint.
-	if strmGapTimeout <= 0 {
-		return fmt.Errorf("invalid --gap-timeout %d: must be a positive number of seconds", strmGapTimeout)
+	if cfg.GapTimeout <= 0 {
+		return fmt.Errorf("invalid --gap-timeout %d: must be a positive number of seconds", cfg.GapTimeout)
 	}
 
-	ctx, cancel := context.WithCancel(cmd.Context())
+	// Derived cancel: internal failures (e.g. the stream loop erroring) must
+	// stop the parser goroutine even when the caller's ctx stays live.
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// ── 1. Connect to index database ─────────────────────────────────────────
-	indexDB, err := config.Connect(strmIndexDSN)
+	indexDB, err := config.Connect(cfg.IndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
@@ -850,7 +940,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── 2. Connect to source database: validate binlog_row_image ─────────────
-	sourceDB, err := config.Connect(strmSourceDSN)
+	sourceDB, err := config.Connect(cfg.SourceDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to source MySQL: %w", err)
 	}
@@ -866,13 +956,13 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("Source: binlog_row_image=FULL \u2713")
 
-	if err := validateNoFKCascades(sourceDB, parseSchemaList(strmSchemas)); err != nil {
+	if err := validateNoFKCascades(sourceDB, parseSchemaList(cfg.Schemas)); err != nil {
 		return err
 	}
 	fmt.Println("Source: no FK cascades \u2713")
 
 	// ── 3. Resolve server identity ────────────────────────────────────────────
-	bintrailID, err := resolveServerIdentity(ctx, sourceDB, indexDB, strmSourceDSN)
+	bintrailID, err := resolveServerIdentity(ctx, sourceDB, indexDB, cfg.SourceDSN)
 	if err != nil {
 		if errors.Is(err, serverid.ErrConflict) {
 			return fmt.Errorf("cannot stream: %w", err)
@@ -883,14 +973,14 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── 4. Schema snapshot + resolver ─────────────────────────────────────────
-	resolver, err := ensureResolver(indexDB, sourceDB, parseSchemaList(strmSchemas))
+	resolver, err := ensureResolver(indexDB, sourceDB, parseSchemaList(cfg.Schemas))
 	if err != nil {
 		return err
 	}
 	fmt.Printf("Snapshot: id=%d, tables=%d\n", resolver.SnapshotID(), resolver.TableCount())
 
 	// ── 5. Filters ────────────────────────────────────────────────────────────
-	filters := buildIndexFilters(strmSchemas, strmTables)
+	filters := buildIndexFilters(cfg.Schemas, cfg.Tables)
 
 	// ── 6. Determine start position ───────────────────────────────────────────
 	saved, err := loadStreamState(indexDB)
@@ -898,7 +988,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load stream state: %w", err)
 	}
 
-	if strmReset {
+	if cfg.Reset {
 		if saved != nil {
 			if _, err := indexDB.Exec(`DELETE FROM stream_state WHERE id = 1`); err != nil {
 				return fmt.Errorf("failed to reset stream state: %w", err)
@@ -912,14 +1002,14 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}
 
 	mode, startFile, startGTIDStr, startPos, accGTID, err := resolveStartWithAutoDiscover(
-		strmStartFile, strmStartGTID, strmStartPos, saved,
+		cfg.StartFile, cfg.StartGTID, cfg.StartPos, saved,
 		func() (string, uint32, error) { return config.CurrentBinlogPosition(sourceDB) })
 	if err != nil {
 		return err
 	}
 	// Surface the auto-discovered position when this was a first-run, no-flags
 	// invocation. Mirrors the agent BYOS startup checkmark style.
-	if saved == nil && strmStartFile == "" && strmStartGTID == "" && mode == "position" {
+	if saved == nil && cfg.StartFile == "" && cfg.StartGTID == "" && mode == "position" {
 		slog.Info("auto-discovered current binlog position", "file", startFile, "pos", startPos)
 		fmt.Printf("Start position: auto-discovered %s:%d ✓\n", startFile, startPos)
 	}
@@ -930,7 +1020,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 		var gap *gapResult
 		var gapErr error
 
-		gapTimeout := time.Duration(strmGapTimeout) * time.Second
+		gapTimeout := time.Duration(cfg.GapTimeout) * time.Second
 
 		switch mode {
 		case "position":
@@ -954,7 +1044,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 				// Unfillable gap — binlogs/GTIDs have been purged.
 				slog.Warn(gap.Message)
 
-				if strmNoGapFill {
+				if cfg.NoGapFill {
 					return fmt.Errorf("binlog gap detected and --no-gap-fill is set: %s", gap.Message)
 				}
 
@@ -997,7 +1087,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 					binlogFile:    startFile,
 					binlogPos:     uint64(startPos),
 					gtidSet:       startGTIDStr,
-					serverID:      strmServerID,
+					serverID:      cfg.ServerID,
 					bintrailID:    bintrailID,
 					eventsIndexed: saved.eventsIndexed,
 					lastEventTime: saved.lastEventTime,
@@ -1013,7 +1103,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 
 	state := &streamState{
 		mode:       mode,
-		serverID:   strmServerID,
+		serverID:   cfg.ServerID,
 		accGTID:    accGTID,
 		bintrailID: bintrailID,
 	}
@@ -1025,20 +1115,20 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── 7. Parse source DSN for BinlogSyncer ─────────────────────────────
-	host, port, user, password, err := parseSourceDSN(strmSourceDSN)
+	host, port, user, password, err := parseSourceDSN(cfg.SourceDSN)
 	if err != nil {
 		return err
 	}
 
 	// ── 6b. Build TLS config ──────────────────────────────────────────────────
-	tlsCfg, err := buildTLSConfig(strmSSLMode, strmSSLCA, strmSSLCert, strmSSLKey, host)
+	tlsCfg, err := buildTLSConfig(cfg.SSLMode, cfg.SSLCA, cfg.SSLCert, cfg.SSLKey, host)
 	if err != nil {
 		return err
 	}
 
 	// ── 7. Create BinlogSyncer ────────────────────────────────────────────────────
 	syncerCfg := replication.BinlogSyncerConfig{
-		ServerID:             strmServerID,
+		ServerID:             cfg.ServerID,
 		Flavor:               "mysql",
 		Host:                 host,
 		Port:                 port,
@@ -1087,7 +1177,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 
 	// ── 8. Start sync ───────────────────────────────────────────────────────────────
 	streamer, startErr := startStreamer()
-	if startErr != nil && strmSSLMode == "preferred" {
+	if startErr != nil && cfg.SSLMode == "preferred" {
 		// preferred: TLS attempt failed — retry without TLS.
 		slog.Warn("initial connection failed; retrying without TLS (--ssl-mode preferred)", "error", startErr)
 		syncer.Close()
@@ -1108,25 +1198,17 @@ func runStream(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Streaming from GTID set: %s\n", startGTIDStr)
 	}
 
-	// ── 9. Signal handler ────────────────────────────────────────────────────────────
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		select {
-		case sig := <-sigCh:
-			slog.Info("received signal — shutting down gracefully", "signal", sig.String())
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
+	// (Signal handling lives in runStream — the process owner. streamOne only
+	// honors ctx, so a supervisor can run several instances under one
+	// lifecycle without competing signal handlers.)
 
-	// ── 9b. Optional Prometheus metrics HTTP server ─────────────────────────
-	if strmMetricsAddr != "" {
+	// ── 9. Optional Prometheus metrics HTTP server ─────────────────────────
+	if cfg.MetricsAddr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
-		metricsServer := &http.Server{Addr: strmMetricsAddr, Handler: mux}
+		metricsServer := &http.Server{Addr: cfg.MetricsAddr, Handler: mux}
 		go func() {
-			slog.Info("metrics server starting", "addr", strmMetricsAddr)
+			slog.Info("metrics server starting", "addr", cfg.MetricsAddr)
 			if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				slog.Error("metrics server error", "error", err)
 			}
@@ -1140,7 +1222,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 
 	// ── 10. Launch StreamParser in a goroutine ──────────────────────────────────
 	sp := parser.NewStreamParser(resolver, filters, nil)
-	idx := indexer.New(indexDB, strmBatchSize)
+	idx := indexer.New(indexDB, cfg.BatchSize)
 
 	events := make(chan parser.Event, 1000)
 	parseErrCh := make(chan error, 1)
@@ -1151,7 +1233,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}()
 
 	// ── 11. DDL auto-snapshot handler ────────────────────────────────────────────
-	schemas := parseSchemaList(strmSchemas)
+	schemas := parseSchemaList(cfg.Schemas)
 	// ddlHandler performs best-effort snapshot + recording. It always returns nil
 	// so that streaming continues even if the snapshot or recording fails.
 	// TRUNCATE does not change schema structure, so skip snapshot for it.
@@ -1196,9 +1278,9 @@ func runStream(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── 12. Run stream loop with checkpointing ──────────────────────────────────
-	fmt.Printf("Streaming started (server-id=%d, checkpoint=%ds)\n", strmServerID, strmCheckpoint)
+	fmt.Printf("Streaming started (server-id=%d, checkpoint=%ds)\n", cfg.ServerID, cfg.Checkpoint)
 	loopErr := streamLoop(ctx, events, idx, indexDB,
-		time.Duration(strmCheckpoint)*time.Second, state, ddlHandler)
+		time.Duration(cfg.Checkpoint)*time.Second, state, ddlHandler)
 
 	parseErr := <-parseErrCh
 
@@ -1210,7 +1292,7 @@ func runStream(cmd *cobra.Command, args []string) error {
 		return parseErr
 	}
 
-	if strmFormat == "json" {
+	if cfg.Format == "json" {
 		return outputJSON(struct {
 			EventsIndexed int64  `json:"events_indexed"`
 			LastFile      string `json:"last_file"`
