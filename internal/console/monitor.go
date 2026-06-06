@@ -38,8 +38,9 @@ type MonitorStatus struct {
 	//   - "stalled" and "lost_position" are running variants derived at read
 	//     time: the stream goroutine is alive, but it has made no progress
 	//     for several minutes (stalled) or an unfillable binlog gap forced
-	//     it to skip permanently lost events (lost_position, sticky until
-	//     the entry is stopped and started again).
+	//     it to skip permanently lost events (lost_position — durable,
+	//     persisted in stream_state, re-hydrated on Start, cleared only by
+	//     an explicit Stop).
 	//   - "failed" carries LastError; the supervisor keeps retrying with
 	//     backoff — "unhealthy, recovering", not terminal — unless the
 	//     circuit breaker gave up after hours of continuous crash-looping

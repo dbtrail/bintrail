@@ -415,12 +415,14 @@ func TestIntegrationLostPositionDurable(t *testing.T) {
 }
 
 // TestIntegrationReplicaOverlapSQL exercises the replica-detection SQL
-// against real MySQL — the unit tests cover only the pure GTID helpers. The
-// shared test container runs gtid_mode=OFF, so the full warn path is not
-// reproducible here; what this test proves is (a) the supervisor-side flow
-// up to and including the gtid_mode gate (registry peers → source connect →
-// skip card), and (b) loadPeerIdentity's queries against a provisioned
-// per-source index DB (bintrail_servers + stream_state scan shapes).
+// against real MySQL — the unit tests cover the pure GTID helpers and the
+// card assembly (evaluateReplicaOverlap). The shared test container runs
+// gtid_mode=OFF, so the full warn path is not reproducible here; what this
+// test proves is (a) the supervisor-side flow up to and including the
+// gtid_mode gate (registry peers → source connect → skip card), (b)
+// loadPeerIdentity's queries against a provisioned per-source index DB
+// (bintrail_servers + stream_state scan shapes), and (c)
+// loadCandidateIdentity's query shapes, unreachable in (a) past the gate.
 func TestIntegrationReplicaOverlapSQL(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 
@@ -494,17 +496,19 @@ func TestIntegrationReplicaOverlapSQL(t *testing.T) {
 		t.Errorf("peer gtid set = %q, want %q", gotSet, peerUUID+":1-100")
 	}
 
-	// (c) The candidate-side identity query shape (unreachable above because
-	// of the gtid_mode gate): must scan into two strings even with GTID off.
-	srcDB, err := config.Connect(testutil.BaseDSN() + "/")
+	// (c) The candidate-side identity queries (unreachable above because of
+	// the gtid_mode gate) — exercise the production helper directly.
+	srcConn, err := config.Connect(testutil.BaseDSN() + "/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srcDB.Close()
-	var candUUID, candExecuted string
-	if err := srcDB.QueryRowContext(ctx,
-		"SELECT @@server_uuid, @@global.gtid_executed").Scan(&candUUID, &candExecuted); err != nil {
-		t.Fatalf("candidate identity query: %v", err)
+	defer srcConn.Close()
+	gtidMode, candUUID, _, err := loadCandidateIdentity(ctx, srcConn)
+	if err != nil {
+		t.Fatalf("loadCandidateIdentity: %v", err)
+	}
+	if !strings.EqualFold(gtidMode, "OFF") {
+		t.Errorf("gtid_mode = %q, want OFF on the shared test container", gtidMode)
 	}
 	if candUUID == "" {
 		t.Error("candidate server_uuid came back empty")

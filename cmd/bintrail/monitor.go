@@ -66,14 +66,28 @@ var (
 	// a permanent "failed" — the circuit breaker against a misconfigured
 	// source retrying forever. Press Start (or restart the daemon) to re-arm.
 	monitorGiveUpAfter = 6 * time.Hour
+	// Crash-loop backoff: retry delay doubles from base to cap; a run that
+	// survives monitorHealthyReset resets both the attempt counter and the
+	// circuit-breaker clock.
+	monitorBackoffBase  = 15 * time.Second
+	monitorBackoffCap   = 5 * time.Minute
+	monitorHealthyReset = 10 * time.Minute
 )
 
 // monitorJob is one supervised stream.
 type monitorJob struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	// indexDSN is the entry's per-source index database — set once at job
+	// creation (before the job is published), immutable after. Stop uses it
+	// to clear the durable gap-loss record with its own short-lived
+	// connection (lockDB belongs to the run goroutine; sharing it from Stop
+	// would race Start's provisioning window).
+	indexDSN string
 	// lockDB's single dedicated connection holds the advisory lock for this
-	// entry; closing it releases the lock.
+	// entry; closing it releases the lock. Written by Start before the run
+	// goroutine launches and read only by run's teardown — never from other
+	// goroutines.
 	lockDB *sql.DB
 
 	mu      sync.Mutex
@@ -96,6 +110,15 @@ func (j *monitorJob) set(state, lastErr string) {
 	j.mu.Lock()
 	j.state, j.lastErr, j.since = state, lastErr, time.Now().UTC()
 	j.mu.Unlock()
+}
+
+// storedState returns the raw state-machine value (pending|running|failed|
+// stopped) without the derived stalled/lost_position presentation — for
+// callers that need goroutine liveness, not operator-facing health.
+func (j *monitorJob) storedState() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.state
 }
 
 // progress records stream liveness and performs the pending→running flip:
@@ -242,11 +265,14 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 
 	m.mu.Lock()
 	if j, ok := m.jobs[e.ID]; ok {
-		switch j.snapshot().State {
-		// Live stream (stalled/lost_position are running variants — the
-		// goroutine still holds the advisory lock; superseding it would
-		// deadlock on our own lock). Restart a stalled stream via Stop+Start.
-		case "running", "pending", "stalled", "lost_position":
+		// Gate on the STORED state, not the derived presentation: stalled
+		// and lost_position are running variants (the goroutine still holds
+		// the advisory lock; superseding it would deadlock on our own lock —
+		// restart a stalled stream via Stop+Start), and checking the stored
+		// machine means new derived states can never fall through to the
+		// cancel below by omission.
+		switch j.storedState() {
+		case "running", "pending":
 			m.mu.Unlock()
 			return nil // idempotent
 		}
@@ -255,7 +281,7 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 	}
 	// Reserve the slot as pending while provisioning runs outside the lock.
 	jobCtx, cancel := context.WithCancel(m.baseCtx)
-	job := &monitorJob{cancel: cancel, done: make(chan struct{})}
+	job := &monitorJob{cancel: cancel, done: make(chan struct{}), indexDSN: e.DSN}
 	job.set("pending", "")
 	m.jobs[e.ID] = job
 	m.mu.Unlock()
@@ -295,12 +321,18 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 	// its advanced checkpoint, a restarted daemon sees no gap and the hook
 	// never re-fires — the lost_position state must be restored from
 	// stream_state or the data loss silently un-surfaces. Cleared only by an
-	// explicit Stop (the operator's acknowledgment).
+	// explicit Stop (the operator's acknowledgment). ErrNoRows is the normal
+	// fresh-start case; any other error means a recorded loss may go
+	// un-surfaced this run, which deserves a breadcrumb.
 	var gapDetail sql.NullString
-	if err := idxDB.QueryRowContext(ctx,
-		`SELECT gap_lost_detail FROM stream_state WHERE id = 1`).Scan(&gapDetail); err == nil &&
-		gapDetail.Valid && gapDetail.String != "" {
+	err = idxDB.QueryRowContext(ctx,
+		`SELECT gap_lost_detail FROM stream_state WHERE id = 1`).Scan(&gapDetail)
+	switch {
+	case err == nil && gapDetail.Valid && gapDetail.String != "":
 		job.markLostPosition(gapDetail.String)
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		slog.Warn("could not re-hydrate gap-loss record; a recorded data loss may not be re-surfaced this run",
+			"entry", e.ID, "error", scrubMonitorErr(err, e.SourceDSN, e.DSN))
 	}
 	idxDB.Close()
 
@@ -378,11 +410,6 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 		}
 	}()
 
-	const (
-		backoffBase  = 15 * time.Second
-		backoffCap   = 5 * time.Minute
-		healthyReset = 10 * time.Minute
-	)
 	attempt := 0
 	var crashLoopSince time.Time // first failure of the current loop; zero = healthy
 	for {
@@ -393,7 +420,7 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 			job.set("stopped", "")
 			return
 		}
-		if time.Since(started) > healthyReset {
+		if time.Since(started) > monitorHealthyReset {
 			attempt = 0
 			crashLoopSince = time.Time{}
 		}
@@ -408,7 +435,7 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 				scrubbed, looping.Round(time.Minute)))
 			return
 		}
-		delay := min(backoffBase<<attempt, backoffCap)
+		delay := min(monitorBackoffBase<<attempt, monitorBackoffCap)
 		attempt++
 		slog.Warn("monitored stream failed; retrying with backoff",
 			"server", e.Name, "entry", e.ID, "delay", delay, "error", scrubbed)
@@ -438,10 +465,20 @@ func (m *monitorSupervisor) Stop(ctx context.Context, entryID string) error {
 	if !ok {
 		return nil
 	}
-	if job.lockDB != nil {
-		if _, err := job.lockDB.ExecContext(ctx, `UPDATE stream_state
-			SET gap_lost_at = NULL, gap_lost_detail = NULL WHERE id = 1`); err != nil {
-			slog.Warn("could not clear gap-loss record on stop", "entry", entryID, "error", err)
+	// Clear with a short-lived connection of our own: lockDB belongs to the
+	// run goroutine (reading it here would race Start's provisioning window,
+	// and it is already closed when the stream gave up or exited). On
+	// failure the record survives — the next Start re-raises lost_position,
+	// which fails safe: a real past loss is re-surfaced, never dropped.
+	if job.indexDSN != "" {
+		if db, err := config.Connect(job.indexDSN); err != nil {
+			slog.Warn("could not clear gap-loss record on stop", "entry", entryID, "error", scrubMonitorErrText(err.Error(), job.indexDSN))
+		} else {
+			if _, err := db.ExecContext(ctx, `UPDATE stream_state
+				SET gap_lost_at = NULL, gap_lost_detail = NULL WHERE id = 1`); err != nil {
+				slog.Warn("could not clear gap-loss record on stop", "entry", entryID, "error", scrubMonitorErrText(err.Error(), job.indexDSN))
+			}
+			db.Close()
 		}
 	}
 	job.cancel()

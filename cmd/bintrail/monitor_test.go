@@ -246,3 +246,104 @@ func TestClassifyReplicaOverlap(t *testing.T) {
 		t.Errorf("no peer set, unrelated: got %q, want empty", rel)
 	}
 }
+
+func TestEvaluateReplicaOverlap_cardAssembly(t *testing.T) {
+	const (
+		primary = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+		cand    = "9f3829a2-3c4d-11ee-be56-0242ac120002"
+		other   = "11111111-2222-3333-4444-555555555555"
+	)
+
+	// Two findings + one clean peer → warn card naming both, no unverified.
+	card := evaluateReplicaOverlap(cand, primary+":1-100,"+cand+":1-5", []peerIdentity{
+		{name: "prod", uuid: primary, executed: primary + ":1-100"},
+		{name: "same", uuid: cand, executed: cand + ":1-5"},
+		{name: "unrelated", uuid: other, executed: other + ":1-3"},
+	})
+	if card.Status != "warn" {
+		t.Fatalf("status = %q, want warn", card.Status)
+	}
+	if !strings.Contains(card.Detail, `replica of already-monitored "prod"`) ||
+		!strings.Contains(card.Detail, `same server as already-monitored "same"`) {
+		t.Errorf("Detail = %q, want both findings named", card.Detail)
+	}
+	if !strings.Contains(card.Remediation, "monitoring has already started") {
+		t.Errorf("Remediation = %q, must reflect that warns never block", card.Remediation)
+	}
+
+	// No findings, one unreadable peer + one unparseable peer set → pass
+	// card with an honest unverified count.
+	card = evaluateReplicaOverlap(cand, cand+":1-5", []peerIdentity{
+		{name: "down", unreadable: true},
+		{name: "corrupt", uuid: other, executed: "not-a-gtid-set"},
+		{name: "clean", uuid: primary, executed: primary + ":1-100"},
+	})
+	if card.Status != "pass" {
+		t.Fatalf("status = %q, want pass", card.Status)
+	}
+	if !strings.Contains(card.Detail, "3 monitored source(s)") ||
+		!strings.Contains(card.Detail, "(2 could not be verified)") {
+		t.Errorf("Detail = %q, want 3 peers with 2 unverified", card.Detail)
+	}
+
+	// A peer found via the replica direction does NOT count as unverified
+	// even if its own set is unparseable — the relationship WAS detected.
+	card = evaluateReplicaOverlap(cand, primary+":1-100", []peerIdentity{
+		{name: "prod", uuid: primary, executed: "garbage"},
+	})
+	if card.Status != "warn" || strings.Contains(card.Detail, "could not be verified") {
+		t.Errorf("card = %+v, want warn without unverified", *card)
+	}
+
+	// Unparseable candidate set → explicit skip, never a silent pass.
+	card = evaluateReplicaOverlap(cand, "garbage", []peerIdentity{{name: "p", uuid: primary}})
+	if card.Status != "skip" || !strings.Contains(card.Detail, "could not parse") {
+		t.Errorf("card = %+v, want skip on unparseable candidate set", *card)
+	}
+}
+
+func TestMonitorRun_healthyRunResetsBreaker(t *testing.T) {
+	oldGiveUp, oldBase, oldCap, oldHealthy := monitorGiveUpAfter, monitorBackoffBase, monitorBackoffCap, monitorHealthyReset
+	monitorGiveUpAfter = 60 * time.Millisecond
+	monitorBackoffBase = time.Millisecond
+	monitorBackoffCap = 2 * time.Millisecond
+	monitorHealthyReset = 5 * time.Millisecond
+	defer func() {
+		monitorGiveUpAfter, monitorBackoffBase, monitorBackoffCap, monitorHealthyReset = oldGiveUp, oldBase, oldCap, oldHealthy
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Every run is "healthy" (outlives monitorHealthyReset) before failing —
+	// the breaker clock must keep resetting and never trip, no matter how
+	// long the flapping goes on in total.
+	m := &monitorSupervisor{
+		baseCtx: ctx,
+		jobs:    map[string]*monitorJob{},
+		streamFn: func(c context.Context, _ streamConfig) error {
+			select {
+			case <-time.After(10 * time.Millisecond): // > monitorHealthyReset
+				return errors.New("flap")
+			case <-c.Done():
+				return c.Err()
+			}
+		},
+	}
+	job := &monitorJob{cancel: cancel, done: make(chan struct{})}
+	job.set("pending", "")
+
+	m.wg.Add(1)
+	go m.run(ctx, job, console.ServerEntry{ID: "e3", Name: "flappy"}, streamConfig{})
+
+	// Let it flap well past monitorGiveUpAfter in wall-clock time.
+	time.Sleep(150 * time.Millisecond)
+	if st := job.snapshot(); strings.Contains(st.LastError, "gave up") {
+		t.Fatalf("breaker tripped despite healthy runs in between: %+v", st)
+	}
+	cancel()
+	<-job.done
+	if st := job.snapshot(); st.State != "stopped" {
+		t.Fatalf("state = %q, want stopped after cancel", st.State)
+	}
+}

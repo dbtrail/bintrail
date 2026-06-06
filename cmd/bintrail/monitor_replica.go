@@ -21,26 +21,43 @@ import (
 // already stores that entry's server_uuid (bintrail_servers) and accumulated
 // executed set (stream_state.gtid_set). Warn-only per the approved decision —
 // an amber card in the add-server doctor flow, never a hard block.
+//
+// Split for testability: replicaOverlapCheck does the IO (registry walk,
+// candidate + peer reads); evaluateReplicaOverlap is the pure card builder.
 
 // replicaOverlapTimeout bounds the whole check — it runs inside the
 // interactive doctor flow and must not hang on a dead peer index DB.
 const replicaOverlapTimeout = 15 * time.Second
 
+const replicaCheckName = "Replica / duplicate detection"
+
+// peerIdentity is one monitored entry's recorded identity, as the pure
+// evaluator consumes it.
+type peerIdentity struct {
+	name string
+	uuid string
+	// executed is the peer's accumulated GTID set from stream_state; empty
+	// when never streamed in GTID mode.
+	executed string
+	// unreadable marks a peer whose index DB could not be read — counted as
+	// unverified, never silently dropped.
+	unreadable bool
+}
+
 // replicaOverlapCheck compares the candidate entry's source against every
 // other monitored registry entry. Returns nil when there is nothing to
 // compare (no registry, no peers) — no card is shown then.
 func (m *monitorSupervisor) replicaOverlapCheck(ctx context.Context, e console.ServerEntry) *console.DoctorCheck {
-	const checkName = "Replica / duplicate detection"
 	if m.registry == nil {
 		return nil
 	}
-	var peers []console.ServerEntry
+	var entries []console.ServerEntry
 	for _, p := range m.registry.List() {
 		if p.ID != e.ID && p.SourceDSN != "" && p.DSN != "" {
-			peers = append(peers, p)
+			entries = append(entries, p)
 		}
 	}
-	if len(peers) == 0 {
+	if len(entries) == 0 {
 		return nil
 	}
 
@@ -49,73 +66,46 @@ func (m *monitorSupervisor) replicaOverlapCheck(ctx context.Context, e console.S
 
 	srcDB, err := config.Connect(e.SourceDSN)
 	if err != nil {
-		return &console.DoctorCheck{Name: checkName, Status: "skip",
+		return &console.DoctorCheck{Name: replicaCheckName, Status: "skip",
 			Detail: "could not connect to the source to compare GTID lineage: " + err.Error()}
 	}
 	defer srcDB.Close()
 
-	var gtidMode string
-	if err := srcDB.QueryRowContext(ctx, "SELECT @@gtid_mode").Scan(&gtidMode); err != nil {
-		return &console.DoctorCheck{Name: checkName, Status: "skip",
-			Detail: "could not read @@gtid_mode: " + err.Error()}
+	gtidMode, candUUID, candExecuted, err := loadCandidateIdentity(ctx, srcDB)
+	if err != nil {
+		return &console.DoctorCheck{Name: replicaCheckName, Status: "skip",
+			Detail: "could not read gtid_mode / server_uuid / gtid_executed: " + err.Error()}
 	}
 	if !strings.EqualFold(gtidMode, "ON") {
-		return &console.DoctorCheck{Name: checkName, Status: "skip",
+		return &console.DoctorCheck{Name: replicaCheckName, Status: "skip",
 			Detail: fmt.Sprintf("gtid_mode is %s on this source — replica detection needs GTID; a position-mode duplicate cannot be detected", gtidMode)}
 	}
 
-	var candUUID, candExecuted string
-	if err := srcDB.QueryRowContext(ctx,
-		"SELECT @@server_uuid, @@global.gtid_executed").Scan(&candUUID, &candExecuted); err != nil {
-		return &console.DoctorCheck{Name: checkName, Status: "skip",
-			Detail: "could not read server_uuid / gtid_executed: " + err.Error()}
-	}
-	// A malformed candidate set would silently disable the main (replica-of)
-	// direction inside gtidSetContainsUUID — surface it as skip instead.
-	if candExecuted != "" && !gtidSetParseable(candExecuted) {
-		return &console.DoctorCheck{Name: checkName, Status: "skip",
-			Detail: "could not parse the source's gtid_executed set — replica detection unavailable"}
+	peers := make([]peerIdentity, 0, len(entries))
+	for _, p := range entries {
+		uuid, executed, err := loadPeerIdentity(ctx, p.DSN)
+		// Best-effort: a peer whose index DB is unreadable (never started,
+		// dropped, server down) is unverified, not a failure.
+		peers = append(peers, peerIdentity{
+			name: p.Name, uuid: uuid, executed: executed, unreadable: err != nil,
+		})
 	}
 
-	var findings []string
-	unverified := 0
-	for _, p := range peers {
-		peerUUID, peerExecuted, err := loadPeerIdentity(ctx, p.DSN)
-		if err != nil {
-			// Best-effort: a peer whose index DB is unreadable (never
-			// started, dropped, server down) is unverified, not a failure.
-			unverified++
-			continue
-		}
-		if rel := classifyReplicaOverlap(candUUID, candExecuted, peerUUID, peerExecuted); rel != "" {
-			findings = append(findings, fmt.Sprintf("%s %q", rel, p.Name))
-			continue
-		}
-		// A peer set that does not parse silently disables the primary-of-
-		// monitored-replica direction — count it as unverified so the pass
-		// card stays honest.
-		if peerExecuted != "" && !gtidSetParseable(peerExecuted) {
-			unverified++
-		}
-	}
+	return evaluateReplicaOverlap(candUUID, candExecuted, peers)
+}
 
-	if len(findings) > 0 {
-		return &console.DoctorCheck{
-			Name:   checkName,
-			Status: "warn",
-			Detail: "this server " + strings.Join(findings, "; "),
-			Remediation: "Monitoring a primary and its replica (or the same server twice) indexes every\n" +
-				"row change once per entry — duplicate history, duplicate storage.\n\n" +
-				"This is a WARN, not a hard fail: monitoring has already started. If the\n" +
-				"overlap is unintentional, press Stop on one of the entries (usually keep\n" +
-				"the primary).",
-		}
+// loadCandidateIdentity reads the GTID-lineage identity of the source being
+// added. Separate from replicaOverlapCheck so integration tests can exercise
+// the exact production queries.
+func loadCandidateIdentity(ctx context.Context, db *sql.DB) (gtidMode, serverUUID, gtidExecuted string, err error) {
+	if err := db.QueryRowContext(ctx, "SELECT @@gtid_mode").Scan(&gtidMode); err != nil {
+		return "", "", "", err
 	}
-	detail := fmt.Sprintf("no replica relationship detected among %d monitored source(s)", len(peers))
-	if unverified > 0 {
-		detail += fmt.Sprintf(" (%d could not be verified)", unverified)
+	if err := db.QueryRowContext(ctx,
+		"SELECT @@server_uuid, @@global.gtid_executed").Scan(&serverUUID, &gtidExecuted); err != nil {
+		return "", "", "", err
 	}
-	return &console.DoctorCheck{Name: checkName, Status: "pass", Detail: detail}
+	return gtidMode, serverUUID, gtidExecuted, nil
 }
 
 // loadPeerIdentity reads a monitored entry's recorded server_uuid and
@@ -142,6 +132,54 @@ func loadPeerIdentity(ctx context.Context, indexDSN string) (peerUUID, peerExecu
 		peerExecuted = gtidSet.String
 	}
 	return peerUUID, peerExecuted, nil
+}
+
+// evaluateReplicaOverlap builds the doctor card from pre-resolved identities.
+// Pure — unit-testable without MySQL.
+func evaluateReplicaOverlap(candUUID, candExecuted string, peers []peerIdentity) *console.DoctorCheck {
+	// A malformed candidate set would silently disable the main (replica-of)
+	// direction inside gtidSetContainsUUID — surface it as skip instead.
+	if candExecuted != "" && !gtidSetParseable(candExecuted) {
+		return &console.DoctorCheck{Name: replicaCheckName, Status: "skip",
+			Detail: "could not parse the source's gtid_executed set — replica detection unavailable"}
+	}
+
+	var findings []string
+	unverified := 0
+	for _, p := range peers {
+		if p.unreadable {
+			unverified++
+			continue
+		}
+		if rel := classifyReplicaOverlap(candUUID, candExecuted, p.uuid, p.executed); rel != "" {
+			findings = append(findings, fmt.Sprintf("%s %q", rel, p.name))
+			continue
+		}
+		// A peer set that does not parse silently disables the primary-of-
+		// monitored-replica direction — count it as unverified so the pass
+		// card stays honest.
+		if p.executed != "" && !gtidSetParseable(p.executed) {
+			unverified++
+		}
+	}
+
+	if len(findings) > 0 {
+		return &console.DoctorCheck{
+			Name:   replicaCheckName,
+			Status: "warn",
+			Detail: "this server " + strings.Join(findings, "; "),
+			Remediation: "Monitoring a primary and its replica (or the same server twice) indexes every\n" +
+				"row change once per entry — duplicate history, duplicate storage.\n\n" +
+				"This is a WARN, not a hard fail: monitoring has already started. If the\n" +
+				"overlap is unintentional, press Stop on one of the entries (usually keep\n" +
+				"the primary).",
+		}
+	}
+	detail := fmt.Sprintf("no replica relationship detected among %d monitored source(s)", len(peers))
+	if unverified > 0 {
+		detail += fmt.Sprintf(" (%d could not be verified)", unverified)
+	}
+	return &console.DoctorCheck{Name: replicaCheckName, Status: "pass", Detail: detail}
 }
 
 // classifyReplicaOverlap describes the GTID-lineage relationship between a

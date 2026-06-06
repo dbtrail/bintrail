@@ -657,17 +657,23 @@ async function startMonitorRow(id) {
     if (doctorWarnings(res.doctor)) {
       // Warnings never block (started already), but they must be SEEN —
       // e.g. "this looks like a replica of an already-monitored server".
-      await editServer(id);
-      renderDoctor(res.doctor);
-      formMsg("monitoring started — review the warnings below", false);
+      // If the editor cannot open (server deleted concurrently), don't
+      // render into a hidden form — degrade to a toast.
+      if (await editServer(id)) {
+        renderDoctor(res.doctor);
+        formMsg("monitoring started — review the warnings below", false);
+      } else {
+        toast("Monitoring started with warnings — edit the server to review them");
+      }
     } else {
       toast("Monitoring started");
     }
   } else {
     // Preflight failed — open the editor so the remediation cards are visible.
-    await editServer(id);
-    renderDoctor(res.doctor);
-    formMsg("preflight failed — fix the items below, Save, and Start again", true);
+    if (await editServer(id)) {
+      renderDoctor(res.doctor);
+      formMsg("preflight failed — fix the items below, Save, and Start again", true);
+    }
   }
 }
 
@@ -727,12 +733,17 @@ function hideServerForm() {
   document.getElementById("server-add-wrap").hidden = false;
 }
 
+// editServer opens the editor form for a server; returns true when the form
+// is actually showing (callers that render into it must not assume success —
+// the server may have been deleted concurrently).
 async function editServer(id) {
   try {
     const s = await api("/api/servers/" + encodeURIComponent(id));
     showServerForm(s);
+    return true;
   } catch (err) {
     toast("failed to load server: " + (err.message || err));
+    return false;
   }
 }
 

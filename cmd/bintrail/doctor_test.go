@@ -607,3 +607,84 @@ func TestDoctorReportWriteText(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckSchemaVisibility_emptyVsInvisible pins the #402 discrimination:
+// zero tables because the schema is EMPTY routes the operator to "create a
+// table", zero tables because the schema is INVISIBLE routes to grants — the
+// wrong remediation sends a 3am operator down the wrong path.
+func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
+	ctx := t.Context()
+	countRows := func(tables, schemas int) *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"COUNT(*)", "COUNT(DISTINCT TABLE_SCHEMA)"}).AddRow(tables, schemas)
+	}
+	schemataRows := func(n int) *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(n)
+	}
+
+	cases := []struct {
+		name            string
+		setup           func(sqlmock.Sqlmock)
+		wantStatus      checkStatus
+		wantDetail      string
+		wantRemediation string
+	}{
+		{
+			name: "schema exists but is empty → create-a-table",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(0, 0))
+				m.ExpectQuery("SELECT COUNT").WillReturnRows(schemataRows(1))
+			},
+			wantStatus:      statusFail,
+			wantDetail:      "no tables yet",
+			wantRemediation: "Create at least one table",
+		},
+		{
+			name: "schema invisible → grants",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(0, 0))
+				m.ExpectQuery("SELECT COUNT").WillReturnRows(schemataRows(0))
+			},
+			wantStatus:      statusFail,
+			wantDetail:      "no tables visible",
+			wantRemediation: "GRANT SELECT",
+		},
+		{
+			name: "SCHEMATA probe fails → degrade to grants, never crash",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(0, 0))
+				m.ExpectQuery("SELECT COUNT").WillReturnError(errors.New("denied"))
+			},
+			wantStatus:      statusFail,
+			wantDetail:      "no tables visible",
+			wantRemediation: "GRANT SELECT",
+		},
+		{
+			name: "tables visible → pass",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(5, 2))
+			},
+			wantStatus: statusPass,
+			wantDetail: "5 tables across 2 schemas",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+			c.setup(mock)
+			got := checkSchemaVisibility(ctx, db, []string{"shop"})
+			if got.Status != c.wantStatus {
+				t.Errorf("status = %q, want %q (detail=%q)", got.Status, c.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, c.wantDetail) {
+				t.Errorf("Detail = %q, want it to contain %q", got.Detail, c.wantDetail)
+			}
+			if c.wantRemediation != "" && !strings.Contains(got.Remediation, c.wantRemediation) {
+				t.Errorf("Remediation = %q, want it to contain %q", got.Remediation, c.wantRemediation)
+			}
+		})
+	}
+}
