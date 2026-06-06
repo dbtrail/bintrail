@@ -116,11 +116,17 @@ stream, **and the web console**, in one `up -d`. It pulls the published
 
 ### Quick start
 
+No clone needed — the compose file is self-contained:
+
 ```bash
-cp .env.example .env     # set SOURCE_DSN — the only required value
+curl -fsSLO https://raw.githubusercontent.com/dbtrail/bintrail/main/docker-compose.yml
+echo 'SOURCE_DSN=user:password@tcp(host.docker.internal:3306)/' > .env
 docker compose up -d
-docker compose logs bintrail
+docker compose logs -f bintrail
 ```
+
+(From a source checkout, `cp .env.example .env` gives you the annotated
+template with every optional knob instead.)
 
 The logs print the console URL, access token included:
 

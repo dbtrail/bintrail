@@ -61,19 +61,25 @@ and more queries to try.
 
 ## Run everything with Docker Compose
 
-The fastest real setup — no Go, no index database to provision, no flags to
-learn. The bundled [`docker-compose.yml`](docker-compose.yml) starts an index
-MySQL (persisted in a volume) and `bintrail up --console`: preflight checks,
-index tables, schema snapshot, live binlog streaming, and the web console.
+The fastest real setup — no Go, no cloning, no index database to provision,
+no flags to learn. One file, one line of config:
 
 ```sh
-git clone https://github.com/dbtrail/bintrail && cd bintrail   # or just grab docker-compose.yml + .env.example
-cp .env.example .env       # set SOURCE_DSN to your MySQL — the only required value
+curl -fsSLO https://raw.githubusercontent.com/dbtrail/bintrail/main/docker-compose.yml
+echo 'SOURCE_DSN=user:password@tcp(host.docker.internal:3306)/' > .env
 docker compose up -d
-docker compose logs bintrail
+docker compose logs -f bintrail
 ```
 
-The logs end with the console URL, token included:
+The only thing to change is the `SOURCE_DSN` line — your MySQL's user,
+password, host, and port. (`host.docker.internal` already points at a MySQL
+running on this same machine; the user needs `REPLICATION SLAVE`,
+`REPLICATION CLIENT`, and `SELECT`.)
+
+That starts an index MySQL (persisted in a volume) and `bintrail up
+--console` — preflight checks, index tables, schema snapshot, live binlog
+streaming, and the web console. Watch the logs until the URL appears
+(Ctrl-C just stops following; the stack keeps running):
 
 ```
 Console (read-only) is running. Open:
@@ -82,12 +88,12 @@ Console (read-only) is running. Open:
 ```
 
 Open it: browse every row change with before/after diffs, generate undo SQL,
-watch stream health — and manage additional index connections from the
-Servers menu. The console is published on the host loopback only; the access
-token is generated per boot unless you pin `CONSOLE_TOKEN` in `.env`.
-
-> A MySQL running on this same machine is reachable from the containers as
-> `host.docker.internal` — the `.env.example` default already uses it.
+watch stream health — and **add more MySQL servers to monitor straight from
+the UI** (Servers → + Add server: paste a DSN, bintrail runs the preflight,
+provisions an index for it, and starts streaming). The console is published
+on the host loopback only; the access token is generated per boot unless you
+pin `CONSOLE_TOKEN` in `.env`. All the optional knobs live in
+[`.env.example`](.env.example).
 
 ## Quick start (2 commands)
 
@@ -175,7 +181,9 @@ Four screens (Time-travel appears only when a baseline is configured):
 - **Status** — index health: partitions, coverage, stream lag, archives.
 - **Time-travel** — single-row point-in-time reconstruct, gated on a baseline source (`--baseline-dir`/`--baseline-s3`).
 
-It **never executes SQL** — recover produces a script you review and apply yourself, exactly like `bintrail recover --dry-run`. It binds to loopback with an auto-generated access token by default; binding to a non-loopback address requires an explicit `--token`. See [Web console](docs/console.md) for the security model and HTTP API.
+Plus a **Servers** menu: save and switch between multiple index connections from the header. Under `bintrail up --console` it is also a control plane — **+ Add server** with a source DSN runs the doctor preflight (failures come back as remediation cards), provisions a dedicated index for that source, and starts a supervised stream that resumes automatically when the process restarts. The standalone `bintrail console` stays a pure viewer and never gains the monitoring verbs.
+
+It **never executes SQL against your data** — recover produces a script you review and apply yourself, exactly like `bintrail recover --dry-run`. It binds to loopback with an auto-generated access token by default; binding to a non-loopback address requires an explicit `--token`. See [Web console](docs/console.md) for the security model and HTTP API.
 
 | Command | Description |
 |---|---|
