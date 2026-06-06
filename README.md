@@ -59,6 +59,36 @@ mysql -h 127.0.0.1 -P 6033 -u demo -pdemo demo \
 evaluation only; see [docs/appliance.md](docs/appliance.md) for what's inside
 and more queries to try.
 
+## Run everything with Docker Compose
+
+The fastest real setup — no Go, no index database to provision, no flags to
+learn. The bundled [`docker-compose.yml`](docker-compose.yml) starts an index
+MySQL (persisted in a volume) and `bintrail up --console`: preflight checks,
+index tables, schema snapshot, live binlog streaming, and the web console.
+
+```sh
+git clone https://github.com/dbtrail/bintrail && cd bintrail   # or just grab docker-compose.yml + .env.example
+cp .env.example .env       # set SOURCE_DSN to your MySQL — the only required value
+docker compose up -d
+docker compose logs bintrail
+```
+
+The logs end with the console URL, token included:
+
+```
+Console (read-only) is running. Open:
+
+    http://127.0.0.1:8090/?token=ab12cd34…
+```
+
+Open it: browse every row change with before/after diffs, generate undo SQL,
+watch stream health — and manage additional index connections from the
+Servers menu. The console is published on the host loopback only; the access
+token is generated per boot unless you pin `CONSOLE_TOKEN` in `.env`.
+
+> A MySQL running on this same machine is reachable from the containers as
+> `host.docker.internal` — the `.env.example` default already uses it.
+
 ## Quick start (2 commands)
 
 ```sh

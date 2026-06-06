@@ -29,7 +29,11 @@ FROM debian:bookworm-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/* && \
-    useradd --system --no-create-home bintrail
+    useradd --system --no-create-home bintrail && \
+    # Writable state dir (console server registry, etc.). Pre-created and
+    # chowned in the image so a named volume mounted here inherits the
+    # ownership — the container runs as the non-root bintrail user.
+    mkdir -p /var/lib/bintrail && chown bintrail /var/lib/bintrail
 
 COPY --from=builder /bintrail /usr/local/bin/bintrail
 COPY --from=builder /bintrail-mcp /usr/local/bin/bintrail-mcp

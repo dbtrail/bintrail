@@ -108,55 +108,67 @@ docker run -d \
 
 ## Docker Compose
 
-A production-oriented `docker-compose.yml` is provided at the repository root. It starts an index MySQL instance and runs `bintrail stream`.
+The `docker-compose.yml` at the repository root is the zero-friction setup:
+an index MySQL (persisted in a named volume) plus `bintrail up --console` —
+preflight checks, index tables, automatic schema snapshot, the live binlog
+stream, **and the web console**, in one `up -d`. It pulls the published
+`ghcr.io/dbtrail/bintrail` image; no Go toolchain or local build needed.
 
 ### Quick start
 
-1. Create a `.env` file:
-
 ```bash
-INDEX_MYSQL_ROOT_PASSWORD=your-secure-password
-SOURCE_DSN=bintrail:password@tcp(your-source-mysql:3306)/
-SCHEMAS=myapp
-SERVER_ID=1234
-```
-
-2. Start the stack:
-
-```bash
+cp .env.example .env     # set SOURCE_DSN — the only required value
 docker compose up -d
+docker compose logs bintrail
 ```
 
-3. Check status:
+The logs print the console URL, access token included:
 
-```bash
-docker compose logs -f bintrail
+```
+Console (read-only) is running. Open:
+
+    http://127.0.0.1:8090/?token=ab12cd34…
 ```
 
-### Using a pre-built image
+Notes:
 
-To use a pre-built image instead of building locally, replace the `build: .` line in `docker-compose.yml`:
-
-```yaml
-services:
-  bintrail:
-    image: ghcr.io/dbtrail/bintrail:latest
-    # build: .  # comment out or remove
-```
+- `SOURCE_DSN` is the MySQL you want to watch. The user needs
+  `REPLICATION SLAVE`, `REPLICATION CLIENT`, and `SELECT`. A MySQL on the
+  same machine is reachable from inside Docker as `host.docker.internal`.
+- The console is published on the **host loopback only**
+  (`127.0.0.1:8090`). To reach it from another machine, change the port
+  mapping to `"8090:8090"` and pin a stable `CONSOLE_TOKEN` in `.env`
+  (without a pinned token a fresh one is generated per boot and printed in
+  the logs).
+- `bintrail up` is idempotent: restarts resume the stream from its saved
+  checkpoint. The preflight (`doctor`) failing prints copy-pasteable
+  remediation in the logs and the container retries.
+- Saved console connections (the Servers menu) persist in the
+  `bintrail-state` volume.
+- `BINTRAIL_TAG` in `.env` pins the image version (default `latest`);
+  building from a source checkout instead is a comment-toggle in the
+  compose file (`build: .`).
 
 ### Connecting to an external index MySQL
 
-If you already have a MySQL instance for the index, remove the `index-mysql` service from compose and update `INDEX_DSN` in your `.env` to point to your existing instance.
+If you already have a MySQL instance for the index, set `INDEX_DSN` in
+`.env` to point at it and remove the `index-mysql` service from the compose
+file.
 
 ## Environment variables
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `INDEX_DSN` | all commands | DSN for the index MySQL database |
-| `SOURCE_DSN` | snapshot, stream | DSN for the source MySQL database |
-| `SCHEMAS` | snapshot, stream | Comma-separated schemas to track |
-| `SERVER_ID` | stream | Unique replication server ID |
+| `SOURCE_DSN` | compose (required) | DSN for the source MySQL database to watch |
+| `INDEX_DSN` | compose (optional) | Bring-your-own index MySQL (default: the bundled container) |
+| `SCHEMAS` | compose (optional) | Comma-separated schemas to track (empty = all user schemas) |
+| `CONSOLE_TOKEN` | compose (optional) | Pin the console access token (default: generated per boot) |
+| `INDEX_MYSQL_ROOT_PASSWORD` | compose (optional) | Root password for the bundled index MySQL |
+| `BINTRAIL_TAG` | compose (optional) | Image tag to run (default `latest`) |
 | `BINTRAIL_INDEX_DSN` | bintrail-mcp | Index DSN for the MCP server |
+
+(`SERVER_ID` is no longer needed — `bintrail up` derives a stable one from the
+source DSN.)
 
 ## Image details
 
