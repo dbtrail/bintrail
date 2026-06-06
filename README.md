@@ -73,12 +73,9 @@ the URL.
 
 ## How it works
 
-```
-your MySQL ──replication──► bintrail ──► index MySQL          ──┐
-            (or binlog files)            every row change,      │ query · recover
-                                         full before/after      │ console · time-travel
-                                         images, partitioned  ──┘
-```
+<div align="center">
+<img src="docs/img/how-it-works.svg" alt="your MySQL streams via replication into bintrail, which writes every row change with full before/after images into an index MySQL — served as query, recover, console, and time-travel" width="820">
+</div>
 
 The index is self-contained: recovery never needs the original binlog files,
 and old partitions rotate out to Parquet (queried transparently, locally or

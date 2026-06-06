@@ -1,0 +1,74 @@
+<svg width="880" height="250" viewBox="0 0 880 250" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="How bintrail works: your MySQL streams via replication into bintrail, which writes every row change with full before/after images into an index MySQL, served as query, recover, console, and time-travel.">
+  <style>
+    .name  { font: 600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #d7dbe6; }
+    .brand { font: 700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #ffffff; }
+    .mono  { font: 11.5px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; fill: #8b93a7; }
+    .monoA { font: 11.5px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; fill: #5b9dff; }
+    .chip  { font: 600 12px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; fill: #d7dbe6; }
+  </style>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#5b9dff"/>
+    </marker>
+    <marker id="arrMuted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#2a2f3d"/>
+    </marker>
+  </defs>
+
+  <!-- card -->
+  <rect x="1" y="1" width="878" height="248" rx="14" fill="#0f1117" stroke="#2a2f3d"/>
+
+  <!-- ── your MySQL (cylinder) ─────────────────────────────── -->
+  <g>
+    <path d="M 56 84 V 156 A 56 13 0 0 0 168 156 V 84" fill="#171a23" stroke="#2a2f3d" stroke-width="1.5"/>
+    <ellipse cx="112" cy="84" rx="56" ry="13" fill="#1e222e" stroke="#2a2f3d" stroke-width="1.5"/>
+    <text x="112" y="128" text-anchor="middle" class="name">your MySQL</text>
+    <text x="112" y="196" text-anchor="middle" class="mono">RDS · Aurora · Cloud SQL</text>
+    <text x="112" y="212" text-anchor="middle" class="mono">or self-managed</text>
+  </g>
+
+  <!-- arrow: replication -->
+  <line x1="178" y1="120" x2="288" y2="120" stroke="#5b9dff" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="232" y="93" text-anchor="middle" class="monoA">replication</text>
+  <text x="232" y="110" text-anchor="middle" class="mono" style="font-size:10.5px">(or binlog files)</text>
+
+  <!-- ── bintrail ──────────────────────────────────────────── -->
+  <g>
+    <rect x="300" y="86" width="160" height="68" rx="10" fill="#171a23" stroke="#5b9dff" stroke-width="1.5"/>
+    <text x="380" y="116" text-anchor="middle" class="brand">bintrail</text>
+    <text x="380" y="137" text-anchor="middle" class="mono" style="font-size:9.5px">doctor · snapshot · stream</text>
+  </g>
+
+  <!-- arrow: write -->
+  <line x1="466" y1="120" x2="514" y2="120" stroke="#5b9dff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ── index MySQL (cylinder) ────────────────────────────── -->
+  <g>
+    <path d="M 526 84 V 156 A 56 13 0 0 0 638 156 V 84" fill="#171a23" stroke="#2a2f3d" stroke-width="1.5"/>
+    <ellipse cx="582" cy="84" rx="56" ry="13" fill="#1e222e" stroke="#2a2f3d" stroke-width="1.5"/>
+    <text x="582" y="128" text-anchor="middle" class="name">index MySQL</text>
+    <text x="582" y="196" text-anchor="middle" class="mono">every row change · full</text>
+    <text x="582" y="212" text-anchor="middle" class="mono">before/after images · partitioned</text>
+  </g>
+
+  <!-- fan-out to capabilities -->
+  <path d="M 648 112 C 690 112, 690 49,  724 49"  stroke="#2a2f3d" stroke-width="1.5" fill="none" marker-end="url(#arrMuted)"/>
+  <path d="M 648 117 C 690 117, 690 97,  724 97"  stroke="#2a2f3d" stroke-width="1.5" fill="none" marker-end="url(#arrMuted)"/>
+  <path d="M 648 124 C 690 124, 690 145, 724 145" stroke="#2a2f3d" stroke-width="1.5" fill="none" marker-end="url(#arrMuted)"/>
+  <path d="M 648 129 C 690 129, 690 193, 724 193" stroke="#2a2f3d" stroke-width="1.5" fill="none" marker-end="url(#arrMuted)"/>
+
+  <!-- ── capability chips ──────────────────────────────────── -->
+  <g>
+    <rect x="730" y="33"  width="118" height="32" rx="8" fill="#171a23" stroke="#2a2f3d" stroke-width="1.5"/>
+    <text x="789" y="53"  text-anchor="middle" class="chip">query</text>
+
+    <rect x="730" y="81"  width="118" height="32" rx="8" fill="#171a23" stroke="#2a2f3d" stroke-width="1.5"/>
+    <text x="789" y="101" text-anchor="middle" class="chip">recover</text>
+
+    <rect x="730" y="129" width="118" height="32" rx="8" fill="#171a23" stroke="#2a2f3d" stroke-width="1.5"/>
+    <text x="789" y="149" text-anchor="middle" class="chip">console</text>
+
+    <rect x="730" y="177" width="118" height="32" rx="8" fill="#171a23" stroke="#5b9dff" stroke-width="1.5"/>
+    <text x="789" y="197" text-anchor="middle" class="chip" fill="#5b9dff">time-travel</text>
+  </g>
+</svg>
