@@ -95,7 +95,42 @@ func startUpRotation(ctx context.Context, s upRotationSettings, dsns func() []st
 	rotProtectUnarchived = true
 
 	go func() {
-		runUpRotationCycle(ctx, s, dsns)
+		// Consecutive-cycle streaks for escalation: an hourly Warn blends
+		// into noise, but a rotation that fails — or defers everything to a
+		// stalled archiving flow — for hours means the index is growing
+		// unbounded, the exact outcome this loop exists to prevent. After
+		// upRotationEscalateAfter consecutive bad cycles, say so at Error.
+		var failStreak, deferStreak int
+		cycle := func() {
+			// Rotation is the secondary job: a panic here must never take
+			// down the stream (the primary forensic capture) — same
+			// principle as the console goroutine in runUpStreamWithConsole.
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("built-in rotation cycle panicked; rotation continues next tick", "panic", r)
+				}
+			}()
+			deferred, failed := runUpRotationCycle(ctx, s, dsns)
+			if failed {
+				failStreak++
+			} else {
+				failStreak = 0
+			}
+			if deferred > 0 {
+				deferStreak++
+			} else {
+				deferStreak = 0
+			}
+			if failStreak >= upRotationEscalateAfter {
+				slog.Error("built-in rotation has failed for consecutive cycles — the index is NOT being rotated and will grow until the disk fills",
+					"consecutive_failures", failStreak)
+			}
+			if deferStreak >= upRotationEscalateAfter {
+				slog.Error("built-in rotation keeps deferring unarchived partitions — if your archiving flow has stopped, the index will grow until the disk fills (archive the partitions, or set --rotate-retain off and rotate manually)",
+					"consecutive_cycles", deferStreak, "deferred_last_cycle", deferred)
+			}
+		}
+		cycle()
 		ticker := time.NewTicker(s.interval)
 		defer ticker.Stop()
 		for {
@@ -103,19 +138,30 @@ func startUpRotation(ctx context.Context, s upRotationSettings, dsns func() []st
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				runUpRotationCycle(ctx, s, dsns)
+				cycle()
 			}
 		}
 	}()
 }
 
+// upRotationEscalateAfter is how many consecutive failing (or all-deferred)
+// cycles the loop tolerates before escalating from Warn to Error. A var, not
+// a const, so tests can shrink it.
+var upRotationEscalateAfter = 3
+
 // runUpRotationCycle rotates each index database once. Errors are logged and
 // the cycle moves to the next DSN — a transient failure self-heals on the
-// next tick.
-func runUpRotationCycle(ctx context.Context, s upRotationSettings, dsns func() []string) {
+// next tick. Returns the total number of partitions the protect-unarchived
+// guard deferred this cycle, and whether any database's rotation failed.
+func runUpRotationCycle(ctx context.Context, s upRotationSettings, dsns func() []string) (deferred int, failed bool) {
 	for _, dsn := range dedupeDSNs(dsns()) {
-		rotateOneIndex(ctx, dsn, s.retain)
+		d, err := rotateOneIndex(ctx, dsn, s.retain)
+		deferred += d
+		if err != nil {
+			failed = true
+		}
 	}
+	return deferred, failed
 }
 
 // dedupeDSNs drops empty strings and duplicates, preserving order.
@@ -132,23 +178,27 @@ func dedupeDSNs(in []string) []string {
 	return out
 }
 
-// rotateOneIndex runs one performRotation cycle against a single index DSN.
-// Log messages are scrubbed: DSNs (and their passwords) never reach the log.
-func rotateOneIndex(ctx context.Context, dsn string, retain time.Duration) {
+// rotateOneIndex runs one performRotation cycle against a single index DSN,
+// returning the guard-deferred partition count and any failure. Log messages
+// are scrubbed: DSNs (and their passwords) never reach the log.
+func rotateOneIndex(ctx context.Context, dsn string, retain time.Duration) (int, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil || cfg.DBName == "" {
 		slog.Warn("built-in rotation: skipping index DSN without a database name")
-		return
+		return 0, fmt.Errorf("index DSN without a database name")
 	}
 	db, err := config.Connect(dsn)
 	if err != nil {
 		slog.Warn("built-in rotation: cannot connect to index database",
 			"db", cfg.DBName, "error", scrubMonitorErrText(err.Error(), dsn))
-		return
+		return 0, err
 	}
 	defer db.Close()
-	if _, _, err := performRotation(ctx, db, cfg.DBName, retain); err != nil && ctx.Err() == nil {
+	_, _, deferred, err := performRotation(ctx, db, cfg.DBName, retain)
+	if err != nil && ctx.Err() == nil {
 		slog.Warn("built-in rotation cycle failed",
 			"db", cfg.DBName, "error", scrubMonitorErrText(err.Error(), dsn))
+		return deferred, err
 	}
+	return deferred, nil
 }

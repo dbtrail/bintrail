@@ -304,10 +304,14 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 	populateStreamFlags(serverID)
 
 	if !upConsole {
-		// Classic single-stream up: rotate the boot index only. The loop
-		// lives on cmd's context; when runStream returns, the process exits
-		// and takes the goroutine with it.
-		startUpRotation(cmd.Context(), upRotationCfg, func() []string {
+		// Classic single-stream up: rotate the boot index only. The loop gets
+		// its own signal-bound context (cmd's root context is never cancelled
+		// by SIGINT — runStream installs its handler on a derived child), so
+		// rotation stops when the stream starts draining, same as the console
+		// paths.
+		rotCtx, rotStop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+		defer rotStop()
+		startUpRotation(rotCtx, upRotationCfg, func() []string {
 			return []string{upIndexDSN}
 		})
 		return runStream(cmd, args)

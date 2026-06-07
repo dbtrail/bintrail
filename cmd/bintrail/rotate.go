@@ -156,7 +156,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 		if err := indexer.EnsureSchema(db); err != nil {
 			return fmt.Errorf("schema migration: %w", err)
 		}
-		dropped, added, err := performRotation(ctx, db, dbName, retainDur)
+		dropped, added, _, err := performRotation(ctx, db, dbName, retainDur)
 		if err != nil {
 			return err
 		}
@@ -206,18 +206,20 @@ func runRotate(cmd *cobra.Command, args []string) error {
 // performRotation executes one full rotation cycle against an open DB connection.
 // It uses the package-level flag vars (rotRetain, rotAddFuture, rotNoReplace, etc.)
 // so that daemon and one-shot modes share identical rotation logic.
-// Returns (partitions_dropped, partitions_added, error).
-func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur time.Duration) (int, int, error) {
+// Returns (partitions_dropped, partitions_added, partitions_deferred, error),
+// where deferred counts partitions past retention that the rotProtectUnarchived
+// guard refused to drop (always 0 for the explicit rotate command).
+func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur time.Duration) (int, int, int, error) {
 	start := time.Now()
 
 	// ── Load current partition list ─────────────────────────────────────────────
 	partitions, err := listPartitions(ctx, db, dbName)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to list partitions: %w", err)
+		return 0, 0, 0, fmt.Errorf("failed to list partitions: %w", err)
 	}
 
 	// ── Drop old partitions ───────────────────────────────────────────────────
-	var droppedCount int
+	var droppedCount, deferredCount int
 	if retainDur > 0 {
 		cutoff := time.Now().UTC().Add(-retainDur)
 		var toDrop []string
@@ -246,21 +248,21 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 				if rotArchiveS3 != "" {
 					s3Bucket, s3Prefix, err = parseS3URL(rotArchiveS3)
 					if err != nil {
-						return 0, 0, fmt.Errorf("invalid --archive-s3: %w", err)
+						return 0, 0, 0, fmt.Errorf("invalid --archive-s3: %w", err)
 					}
 					s3Client, err = newS3Client(ctx, rotArchiveS3Region)
 					if err != nil {
-						return 0, 0, fmt.Errorf("init S3 client: %w", err)
+						return 0, 0, 0, fmt.Errorf("init S3 client: %w", err)
 					}
 				}
 
 				for _, name := range toDrop {
 					outPath, err := hiveArchivePath(rotArchiveDir, rotBintrailID, name)
 					if err != nil {
-						return 0, 0, fmt.Errorf("build archive path for %s: %w", name, err)
+						return 0, 0, 0, fmt.Errorf("build archive path for %s: %w", name, err)
 					}
 					if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-						return 0, 0, fmt.Errorf("create archive directory for %s: %w", name, err)
+						return 0, 0, 0, fmt.Errorf("create archive directory for %s: %w", name, err)
 					}
 					var n int64
 					skipped := rotRetry && fileExists(outPath)
@@ -272,7 +274,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					} else {
 						n, err = archive.ArchivePartition(ctx, db, dbName, name, outPath, rotArchiveCompression)
 						if err != nil {
-							return 0, 0, fmt.Errorf("archive partition %s: %w", name, err)
+							return 0, 0, 0, fmt.Errorf("archive partition %s: %w", name, err)
 						}
 						if rotFormat != "json" {
 							fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) → %s\n", name, n, outPath)
@@ -285,7 +287,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					if s3Client != nil {
 						s3Key, err = buildS3Key(rotArchiveDir, outPath, s3Prefix)
 						if err != nil {
-							return 0, 0, fmt.Errorf("build S3 key for %s: %w", name, err)
+							return 0, 0, 0, fmt.Errorf("build S3 key for %s: %w", name, err)
 						}
 					}
 
@@ -317,7 +319,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 								s3_key = COALESCE(VALUES(s3_key), s3_key)`,
 							name, rotBintrailID, outPath, fileSize, n, insertBucket, insertKey,
 						); err != nil {
-							return 0, 0, fmt.Errorf("record archive state for %s: %w", name, err)
+							return 0, 0, 0, fmt.Errorf("record archive state for %s: %w", name, err)
 						}
 					}
 
@@ -338,7 +340,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 								}
 								skipUpload = true
 							case err != nil && !errors.Is(err, sql.ErrNoRows):
-								return 0, 0, fmt.Errorf("check S3 upload state for %s: %w", name, err)
+								return 0, 0, 0, fmt.Errorf("check S3 upload state for %s: %w", name, err)
 							}
 						}
 
@@ -347,7 +349,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 								// Propagate context cancellation (e.g. SIGINT in daemon mode)
 								// instead of logging a misleading S3 warning for every remaining partition.
 								if ctx.Err() != nil {
-									return 0, 0, fmt.Errorf("upload %s to S3: %w", name, err)
+									return 0, 0, 0, fmt.Errorf("upload %s to S3: %w", name, err)
 								}
 								slog.Warn("S3 upload failed; partition will not be dropped",
 									"partition", name, "error", err)
@@ -363,7 +365,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 								WHERE partition_name = ? AND bintrail_id = ?`,
 								s3Bucket, s3Key, name, rotBintrailID,
 							); err != nil {
-								return 0, 0, fmt.Errorf("update archive state S3 info for %s: %w", name, err)
+								return 0, 0, 0, fmt.Errorf("update archive state S3 info for %s: %w", name, err)
 							}
 							slog.Info("uploaded archive to S3", "partition", name, "bucket", s3Bucket, "key", s3Key)
 							if rotFormat != "json" {
@@ -376,7 +378,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					// even if the current run does not have --archive-s3 configured.
 					pending, err := hasPendingS3Upload(ctx, db, name, rotBintrailID)
 					if err != nil {
-						return 0, 0, fmt.Errorf("check pending S3 upload for %s: %w", name, err)
+						return 0, 0, 0, fmt.Errorf("check pending S3 upload for %s: %w", name, err)
 					}
 					if pending {
 						slog.Warn("partition archived locally but not yet uploaded to S3; skipping drop",
@@ -390,7 +392,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 
 					// Drop this partition immediately after archiving.
 					if err := dropPartitions(ctx, db, dbName, []string{name}); err != nil {
-						return 0, 0, fmt.Errorf("failed to drop partition %s: %w", name, err)
+						return 0, 0, 0, fmt.Errorf("failed to drop partition %s: %w", name, err)
 					}
 					droppedCount++
 					slog.Info("dropped partition", "partition", name)
@@ -412,7 +414,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 				if rotProtectUnarchived {
 					anyArchives, err := indexHasArchives(ctx, db)
 					if err != nil {
-						return 0, 0, fmt.Errorf("check archive history: %w", err)
+						return 0, 0, 0, fmt.Errorf("check archive history: %w", err)
 					}
 					protectActive = anyArchives
 				}
@@ -421,9 +423,10 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					if protectActive {
 						archived, err := partitionArchived(ctx, db, name)
 						if err != nil {
-							return 0, 0, fmt.Errorf("check archive state for %s: %w", name, err)
+							return 0, 0, 0, fmt.Errorf("check archive state for %s: %w", name, err)
 						}
 						if !archived {
+							deferredCount++
 							slog.Warn("partition past retention but not yet archived; deferring drop to the archiving flow",
 								"partition", name)
 							if rotFormat != "json" {
@@ -434,7 +437,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					}
 					pending, err := hasPendingS3Upload(ctx, db, name, rotBintrailID)
 					if err != nil {
-						return 0, 0, fmt.Errorf("check pending S3 upload for %s: %w", name, err)
+						return 0, 0, 0, fmt.Errorf("check pending S3 upload for %s: %w", name, err)
 					}
 					if pending {
 						slog.Warn("partition has pending S3 upload from a previous run; skipping drop",
@@ -448,10 +451,14 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 				}
 				if len(safeToDrop) > 0 {
 					if err := dropPartitions(ctx, db, dbName, safeToDrop); err != nil {
-						return 0, 0, fmt.Errorf("failed to drop partitions: %w", err)
+						return 0, 0, 0, fmt.Errorf("failed to drop partitions: %w", err)
 					}
 				}
 				for _, name := range safeToDrop {
+					// slog (not just stdout): rotation destroys data by design,
+					// so the durable log must answer "what did rotation drop" —
+					// mirrors the archive path's per-partition Info.
+					slog.Info("dropped partition", "partition", name)
 					if rotFormat != "json" {
 						fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
 					}
@@ -461,7 +468,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 			// Refresh list so nextPartitionStart sees current state.
 			partitions, err = listPartitions(ctx, db, dbName)
 			if err != nil {
-				return 0, 0, fmt.Errorf("failed to refresh partition list: %w", err)
+				return 0, 0, 0, fmt.Errorf("failed to refresh partition list: %w", err)
 			}
 		}
 	}
@@ -485,7 +492,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 	if toAdd > 0 {
 		startDate := nextPartitionStart(partitions)
 		if err := addFuturePartitions(ctx, db, dbName, startDate, toAdd); err != nil {
-			return 0, 0, fmt.Errorf("failed to add future partitions: %w", err)
+			return 0, 0, 0, fmt.Errorf("failed to add future partitions: %w", err)
 		}
 		for i := range toAdd {
 			if rotFormat != "json" {
@@ -497,9 +504,10 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 	slog.Info("rotation complete",
 		"partitions_dropped", droppedCount,
 		"partitions_added", toAdd,
+		"partitions_deferred", deferredCount,
 		"duration_ms", time.Since(start).Milliseconds())
 
-	return droppedCount, toAdd, nil
+	return droppedCount, toAdd, deferredCount, nil
 }
 
 // uploadFileFunc is the function used to upload a file to S3. It defaults to
