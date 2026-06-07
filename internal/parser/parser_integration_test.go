@@ -95,6 +95,23 @@ func drainEvents(ch <-chan parser.Event) []parser.Event {
 	return events
 }
 
+// dmlEvents returns only the INSERT/UPDATE/DELETE events. Count assertions in
+// these tests must ignore DDL: under parallel `go test -tags integration ./...`
+// runs, concurrent test packages' setup DDL (CREATE TABLE index_state, ...)
+// lands in the shared container's binlog window, and DDL events bypass the
+// schema filter by design (#415). Row events ARE schema-filtered and each
+// test owns its schema, so DML counts stay exact.
+func dmlEvents(events []parser.Event) []parser.Event {
+	var dml []parser.Event
+	for _, ev := range events {
+		switch ev.EventType {
+		case parser.EventInsert, parser.EventUpdate, parser.EventDelete:
+			dml = append(dml, ev)
+		}
+	}
+	return dml
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 func TestParseFile_realBinlog(t *testing.T) {
@@ -114,15 +131,15 @@ func TestParseFile_realBinlog(t *testing.T) {
 		errCh <- p.ParseFile(context.Background(), binlogFile, events)
 	}()
 
-	got := drainEvents(events)
+	got := dmlEvents(drainEvents(events))
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("ParseFile returned error: %v", err)
 	}
 
-	// Expect 4 events: 2 INSERT + 1 UPDATE + 1 DELETE.
+	// Expect 4 DML events: 2 INSERT + 1 UPDATE + 1 DELETE.
 	if len(got) != 4 {
-		t.Fatalf("expected 4 events, got %d", len(got))
+		t.Fatalf("expected 4 DML events, got %d", len(got))
 	}
 
 	// Count by type.
@@ -199,14 +216,14 @@ func TestParseFile_withFilters(t *testing.T) {
 		errCh <- p.ParseFile(context.Background(), binlogFile, events)
 	}()
 
-	got := drainEvents(events)
+	got := dmlEvents(drainEvents(events))
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("ParseFile returned error: %v", err)
 	}
 
 	if len(got) != 0 {
-		t.Errorf("expected 0 events with nonexistent schema filter, got %d", len(got))
+		t.Errorf("expected 0 DML events with nonexistent schema filter, got %d", len(got))
 	}
 }
 
@@ -272,15 +289,15 @@ func TestParseFiles_multiple(t *testing.T) {
 		errCh <- p.ParseFiles(context.Background(), binlogFiles, events)
 	}()
 
-	got := drainEvents(events)
+	got := dmlEvents(drainEvents(events))
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("ParseFiles returned error: %v", err)
 	}
 
-	// Each batch has 1 INSERT, so 2 events total.
+	// Each batch has 1 INSERT, so 2 DML events total.
 	if len(got) != 2 {
-		t.Errorf("expected 2 events from 2 binlog files, got %d", len(got))
+		t.Errorf("expected 2 DML events from 2 binlog files, got %d", len(got))
 		for i, ev := range got {
 			t.Logf("  event[%d]: type=%d file=%s table=%s pk=%s",
 				i, ev.EventType, ev.BinlogFile, ev.Table, ev.PKValues)
@@ -423,20 +440,12 @@ func TestParseFile_compressedTransactions(t *testing.T) {
 		t.Fatalf("ParseFile returned error: %v", err)
 	}
 
-	// Count DML events only: under parallel `./...` runs, concurrent test
-	// packages' DDL (CREATE TABLE index_state, ...) leaks into the shared
-	// container's binlog window, and DDL events bypass the schema filter by
-	// design. Row events ARE schema-filtered, so the DML counts are exact.
 	// 20 INSERT + 1 UPDATE + 1 DELETE — the positive count IS the regression
-	// guard (the bug produced exactly zero).
-	var dml []parser.Event
+	// guard (the bug produced exactly zero). DML-only via dmlEvents (#415).
+	dml := dmlEvents(got)
 	typeCounts := map[parser.EventType]int{}
-	for _, ev := range got {
-		switch ev.EventType {
-		case parser.EventInsert, parser.EventUpdate, parser.EventDelete:
-			dml = append(dml, ev)
-			typeCounts[ev.EventType]++
-		}
+	for _, ev := range dml {
+		typeCounts[ev.EventType]++
 	}
 	if typeCounts[parser.EventInsert] != 20 || typeCounts[parser.EventUpdate] != 1 || typeCounts[parser.EventDelete] != 1 {
 		t.Fatalf("event mix = %d INSERT / %d UPDATE / %d DELETE, want 20/1/1",
