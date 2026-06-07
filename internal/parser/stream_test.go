@@ -439,8 +439,9 @@ func makeOrdersResolver() *metadata.Resolver {
 
 // makePayloadEvent wraps inner events in a TransactionPayloadEvent, mimicking
 // what go-mysql produces after decompressing a binlog_transaction_compression
-// transaction: inner events pre-decoded in .Events, with headers whose
-// positions describe the uncompressed transaction buffer — NOT the file.
+// transaction: inner events pre-decoded in .Events, with headers that carry a
+// genuine EventSize but no usable file position (real MySQL zeroes the inner
+// end_log_pos; see rewriteInnerHeader).
 func makePayloadEvent(logPos, eventSize uint32, inner ...*replication.BinlogEvent) *replication.BinlogEvent {
 	return &replication.BinlogEvent{
 		Header: &replication.EventHeader{
@@ -462,18 +463,18 @@ func TestStreamParser_transactionPayloadDispatchesInnerRows(t *testing.T) {
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
-	// Inner BEGIN carries the connection id; inner rows event carries
-	// buffer-relative positions where LogPos < EventSize — deriving start_pos
-	// from them would underflow uint64.
+	// Inner BEGIN carries the connection id; inner row events carry headers
+	// with no usable file position (any LogPos < EventSize would make the
+	// start_pos derivation underflow uint64; real MySQL zeroes LogPos).
 	innerBegin := &replication.BinlogEvent{
-		Header: &replication.EventHeader{EventType: replication.QUERY_EVENT, LogPos: 61},
+		Header: &replication.EventHeader{EventType: replication.QUERY_EVENT, LogPos: 0},
 		Event:  &replication.QueryEvent{Query: []byte("BEGIN"), SlaveProxyID: 42},
 	}
-	innerRows := &replication.BinlogEvent{
+	innerInserts := &replication.BinlogEvent{
 		Header: &replication.EventHeader{
 			EventType: replication.WRITE_ROWS_EVENTv2,
 			Timestamp: 1770000000, // real commit-time timestamp survives dispatch
-			LogPos:    120,
+			LogPos:    0,
 			EventSize: 500,
 		},
 		Event: &replication.RowsEvent{
@@ -485,36 +486,57 @@ func TestStreamParser_transactionPayloadDispatchesInnerRows(t *testing.T) {
 			Rows: [][]any{{int64(1), int64(10)}, {int64(2), int64(20)}},
 		},
 	}
+	innerDelete := &replication.BinlogEvent{
+		Header: &replication.EventHeader{
+			EventType: replication.DELETE_ROWS_EVENTv2,
+			Timestamp: 1770000000,
+			LogPos:    0,
+			EventSize: 300,
+		},
+		Event: &replication.RowsEvent{
+			Table: &replication.TableMapEvent{
+				Schema:      []byte("shop"),
+				Table:       []byte("orders"),
+				ColumnCount: 2,
+			},
+			Rows: [][]any{{int64(2), int64(20)}},
+		},
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	feedThenCancel(t, streamer, cancel,
 		makeGTIDEvent(7), // GTID stays OUTSIDE the payload on the wire
-		makePayloadEvent(5000, 900, innerBegin, innerRows),
+		makePayloadEvent(5000, 900, innerBegin, innerInserts, innerDelete),
 	)
 
 	if err := sp.Run(ctx, streamer, out); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	close(out)
-	var inserts []Event
+	var dml []Event
 	for ev := range out {
 		if ev.EventType == EventGTID {
 			continue // outer GTID tracking event — not under test
 		}
-		inserts = append(inserts, ev)
+		dml = append(dml, ev)
 	}
 
 	// Positive count is the actual regression guard: zero emitted events is
 	// exactly the bug this test exists to prevent.
-	if len(inserts) != 2 {
-		t.Fatalf("expected 2 INSERT events from payload inner rows, got %d", len(inserts))
+	if len(dml) != 3 {
+		t.Fatalf("expected 2 INSERT + 1 DELETE events from payload inner rows, got %d", len(dml))
 	}
-	for i, ev := range inserts {
-		if ev.EventType != EventInsert {
-			t.Errorf("event[%d]: expected EventInsert, got %d", i, ev.EventType)
+	wantTypes := []EventType{EventInsert, EventInsert, EventDelete}
+	wantPKs := []string{"1", "2", "2"}
+	for i, ev := range dml {
+		if ev.EventType != wantTypes[i] {
+			t.Errorf("event[%d]: EventType = %d, want %d", i, ev.EventType, wantTypes[i])
 		}
-		// Positions must come from the OUTER payload event (5000-900..5000),
-		// not the inner buffer-relative header (which would underflow).
+		if ev.PKValues != wantPKs[i] {
+			t.Errorf("event[%d]: PKValues = %q, want %q", i, ev.PKValues, wantPKs[i])
+		}
+		// Positions must come from the OUTER payload event (5000-900..5000) —
+		// the inner headers have no usable file position.
 		if ev.StartPos != 4100 || ev.EndPos != 5000 {
 			t.Errorf("event[%d]: positions = [%d, %d], want outer [4100, 5000]", i, ev.StartPos, ev.EndPos)
 		}
@@ -530,23 +552,31 @@ func TestStreamParser_transactionPayloadDispatchesInnerRows(t *testing.T) {
 			t.Errorf("event[%d]: Timestamp = %v, want inner commit time 1770000000", i, ev.Timestamp.Unix())
 		}
 	}
-	if inserts[0].PKValues != "1" || inserts[1].PKValues != "2" {
-		t.Errorf("PKValues = %q, %q, want \"1\", \"2\"", inserts[0].PKValues, inserts[1].PKValues)
+	if dml[2].RowBefore == nil {
+		t.Error("DELETE event: expected non-nil RowBefore from inner before-image")
 	}
 }
 
-// TestStreamParser_emptyPayloadNoEffect: a payload with no inner events (or
-// one bintrail ignores, like XID) emits nothing and does not error.
+// TestStreamParser_emptyPayloadNoEffect: a payload with no inner events, and
+// one whose only inner event bintrail ignores (XID), both emit nothing and do
+// not error.
 func TestStreamParser_emptyPayloadNoEffect(t *testing.T) {
 	sp := NewStreamParser(nil, Filters{}, nil)
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
+	innerXID := &replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.XID_EVENT, LogPos: 0},
+		Event:  &replication.XIDEvent{XID: 1},
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	feedThenCancel(t, streamer, cancel, makePayloadEvent(3000, 200))
+	feedThenCancel(t, streamer, cancel,
+		makePayloadEvent(3000, 200),           // no inner events at all
+		makePayloadEvent(4000, 200, innerXID), // only an ignored inner event
+	)
 	if err := sp.Run(ctx, streamer, out); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if len(out) != 0 {
-		t.Errorf("expected 0 events from empty payload, got %d", len(out))
+		t.Errorf("expected 0 events from empty/ignored payloads, got %d", len(out))
 	}
 }

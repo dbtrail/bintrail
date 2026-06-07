@@ -4,6 +4,7 @@ package parser_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
+	drivermysql "github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/metadata"
@@ -328,7 +330,14 @@ func TestParseFile_compressedTransactions(t *testing.T) {
 	}
 	defer conn.Close()
 	if _, err := conn.ExecContext(ctx, "SET SESSION binlog_transaction_compression = ON"); err != nil {
-		t.Skipf("binlog_transaction_compression not supported on this server (needs MySQL 8.0.20+): %v", err)
+		// Skip ONLY on ER_UNKNOWN_SYSTEM_VARIABLE (pre-8.0.20 server). Any
+		// other failure (connection drop, permissions) must FAIL, not skip —
+		// a broad skip would silently turn this regression guard green.
+		var myErr *drivermysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1193 {
+			t.Skipf("binlog_transaction_compression not supported on this server (needs MySQL 8.0.20+): %v", err)
+		}
+		t.Fatalf("SET SESSION binlog_transaction_compression failed for a non-version reason: %v", err)
 	}
 
 	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
@@ -435,9 +444,9 @@ func TestParseFile_compressedTransactions(t *testing.T) {
 	}
 
 	for i, ev := range dml {
-		// Positions must be the payload event's FILE coordinates: an
-		// underflowed start_pos (inner buffer-relative header) would be ~2^64
-		// and an inner-relative end_pos would point past nothing meaningful.
+		// Positions must be the payload event's FILE coordinates: real MySQL
+		// zeroes the inner events' end_log_pos, so an unrewritten start_pos
+		// (0 - EventSize) would underflow to ~2^64.
 		if ev.StartPos >= ev.EndPos {
 			t.Errorf("event[%d]: StartPos %d >= EndPos %d (underflow or bad rewrite)", i, ev.StartPos, ev.EndPos)
 		}

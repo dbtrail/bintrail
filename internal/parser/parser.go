@@ -191,10 +191,11 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 
 // rewriteInnerHeader stamps a Transaction_payload inner event's header with
 // the outer payload event's file coordinates. Inner events were never written
-// to the binlog individually — their LogPos/EventSize describe offsets in the
-// uncompressed transaction buffer, not file positions, and deriving start_pos
-// from them would underflow uint64 (LogPos < EventSize). The physical location
-// of every inner event IS the payload event that carries it.
+// to the binlog individually: MySQL zeroes their end_log_pos (LogPos=0 —
+// verified on 8.0.46 and in go-mysql's 8.0.27 test fixture) while EventSize
+// is the genuine event length, so deriving start_pos as LogPos-EventSize
+// would underflow uint64. The physical location of every inner event IS the
+// payload event that carries it.
 func rewriteInnerHeader(inner, outer *replication.EventHeader) {
 	inner.LogPos = outer.LogPos
 	inner.EventSize = outer.EventSize

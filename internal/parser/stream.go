@@ -127,7 +127,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 					return ctx.Err()
 				}
 				// Synchronous DDL hook: the resolver refresh must complete
-				// before the next event is decoded, or the rows that follow a
+				// before the next event is processed, or the rows that follow a
 				// CREATE/ALTER in the binlog are skipped as unknown (#396).
 				if hook := sp.onDDL.Load(); hook != nil {
 					(*hook)(ddlEv)
