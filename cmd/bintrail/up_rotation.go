@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,6 +22,13 @@ type upRotationSettings struct {
 	retainRaw string
 	interval  time.Duration
 	addFuture int
+	// explicit records whether the operator configured --rotate-retain
+	// themselves (flag or env — bindCommandEnv marks env-set flags Changed).
+	// When false (running on the built-in default), the upgrade guard
+	// refuses to drop pre-existing deep history: an operator who never chose
+	// a retention must not lose months of forensic record to a binary
+	// upgrade.
+	explicit bool
 }
 
 // upRotationCfg carries the parsed settings from runUp's validation to the
@@ -64,12 +72,15 @@ func parseUpRotation(retain, interval string, addFuture int) (upRotationSettings
 // index database plus every DSN the provider returns (the control plane's
 // per-source databases). Rotation is the secondary job — failures are logged,
 // never fatal to the stream. Returns immediately; the loop stops when ctx is
-// cancelled.
-func startUpRotation(ctx context.Context, s upRotationSettings, dsns func() []string) {
+// cancelled, and the returned channel closes when it has fully exited (used
+// by tests for deterministic shutdown; production callers may ignore it).
+func startUpRotation(ctx context.Context, s upRotationSettings, dsns func() []string) <-chan struct{} {
+	done := make(chan struct{})
 	if !s.enabled {
 		fmt.Fprintln(os.Stderr, "Built-in rotation: off — the index grows until you rotate it yourself (see `bintrail rotate`)")
 		slog.Info("built-in rotation disabled")
-		return
+		close(done)
+		return done
 	}
 	fmt.Fprintf(os.Stderr,
 		"Built-in rotation: dropping index partitions older than %s every %s, keeping %d future partitions ready.\n"+
@@ -95,6 +106,7 @@ func startUpRotation(ctx context.Context, s upRotationSettings, dsns func() []st
 	rotProtectUnarchived = true
 
 	go func() {
+		defer close(done)
 		// Consecutive-cycle streaks for escalation: an hourly Warn blends
 		// into noise, but a rotation that fails — or defers everything to a
 		// stalled archiving flow — for hours means the index is growing
@@ -142,6 +154,7 @@ func startUpRotation(ctx context.Context, s upRotationSettings, dsns func() []st
 			}
 		}
 	}()
+	return done
 }
 
 // upRotationEscalateAfter is how many consecutive failing (or all-deferred)
@@ -155,7 +168,7 @@ var upRotationEscalateAfter = 3
 // guard deferred this cycle, and whether any database's rotation failed.
 func runUpRotationCycle(ctx context.Context, s upRotationSettings, dsns func() []string) (deferred int, failed bool) {
 	for _, dsn := range dedupeDSNs(dsns()) {
-		d, err := rotateOneIndex(ctx, dsn, s.retain)
+		d, err := rotateOneIndex(ctx, dsn, s)
 		deferred += d
 		if err != nil {
 			failed = true
@@ -181,7 +194,7 @@ func dedupeDSNs(in []string) []string {
 // rotateOneIndex runs one performRotation cycle against a single index DSN,
 // returning the guard-deferred partition count and any failure. Log messages
 // are scrubbed: DSNs (and their passwords) never reach the log.
-func rotateOneIndex(ctx context.Context, dsn string, retain time.Duration) (int, error) {
+func rotateOneIndex(ctx context.Context, dsn string, s upRotationSettings) (int, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil || cfg.DBName == "" {
 		slog.Warn("built-in rotation: skipping index DSN without a database name")
@@ -194,6 +207,32 @@ func rotateOneIndex(ctx context.Context, dsn string, retain time.Duration) (int,
 		return 0, err
 	}
 	defer db.Close()
+
+	retain := s.retain
+	if !s.explicit {
+		// Upgrade guard: an operator running on the IMPLICIT default never
+		// chose a retention. If the index already holds history extending
+		// far beyond the default window — the signature of a pre-existing
+		// deployment that predates built-in rotation — refuse to drop it and
+		// demand an explicit choice. Fresh installs never trip this (they
+		// can't accumulate beyond the window while the loop runs), and a
+		// restart after ordinary downtime stays under the 2× threshold.
+		guarded, oldest, err := upgradeGuardTrips(ctx, db, cfg.DBName, s.retain)
+		if err != nil {
+			slog.Warn("built-in rotation: could not evaluate the upgrade guard; skipping drops this cycle",
+				"db", cfg.DBName, "error", scrubMonitorErrText(err.Error(), dsn))
+			return 0, err
+		}
+		if guarded {
+			slog.Error("built-in rotation: existing history extends far beyond the default retention — refusing to drop it without an explicit choice",
+				"db", cfg.DBName,
+				"oldest_partition", oldest.UTC().Format("2006-01-02 15:04"),
+				"default_retain", s.retainRaw,
+				"action", "set --rotate-retain explicitly (e.g. 30d to confirm, 90d to keep more, off to disable) or BINTRAIL_ROTATE_RETAIN")
+			retain = 0 // still top up future partitions; no drops
+		}
+	}
+
 	_, _, deferred, err := performRotation(ctx, db, cfg.DBName, retain)
 	if err != nil && ctx.Err() == nil {
 		slog.Warn("built-in rotation cycle failed",
@@ -201,4 +240,28 @@ func rotateOneIndex(ctx context.Context, dsn string, retain time.Duration) (int,
 		return deferred, err
 	}
 	return deferred, nil
+}
+
+// upgradeGuardTrips reports whether the implicit-default upgrade guard should
+// block drops: true when the oldest named hourly partition is more than twice
+// the retain window old. Returns the oldest partition hour for the log line.
+func upgradeGuardTrips(ctx context.Context, db *sql.DB, dbName string, retain time.Duration) (bool, time.Time, error) {
+	partitions, err := listPartitions(ctx, db, dbName)
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	var oldest time.Time
+	for _, p := range partitions {
+		d, ok := partitionDate(p.Name)
+		if !ok {
+			continue
+		}
+		if oldest.IsZero() || d.Before(oldest) {
+			oldest = d
+		}
+	}
+	if oldest.IsZero() {
+		return false, time.Time{}, nil
+	}
+	return time.Since(oldest) > 2*retain, oldest, nil
 }

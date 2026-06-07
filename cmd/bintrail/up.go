@@ -112,6 +112,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Explicitly-configured retention (flag or env — bindCommandEnv marks
+	// env-set flags Changed) disables the upgrade guard: the operator chose.
+	upRotationCfg.explicit = cmd.Flags().Changed("rotate-retain")
 	// --source-dsn is required for the classic single-stream `up`, but with
 	// --console the daemon can start with NO source at all: it serves the
 	// console + control plane, and sources are added from the UI ("+ Add

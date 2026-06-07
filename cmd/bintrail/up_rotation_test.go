@@ -2,18 +2,56 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-// TestStartUpRotation_armsRotateGlobals is the guard-arming regression test:
-// the entire data-loss safety of the built-in rotation reduces to the rot*
-// fan-out in startUpRotation. If rotProtectUnarchived stopped being set, `up`
-// would silently drop unarchived partitions by default and the integration
-// tests (which arm the guard themselves) would stay green. Mirrors
-// TestPopulateStreamFlags for the stream fan-out.
-func TestStartUpRotation_armsRotateGlobals(t *testing.T) {
+// logCapture is a slog.Handler that records every emitted record, so tests
+// can assert on escalation levels and messages.
+type logCapture struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, r)
+	return nil
+}
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCapture) WithGroup(string) slog.Handler      { return c }
+
+func (c *logCapture) has(level slog.Level, substr string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, r := range c.records {
+		if r.Level == level && strings.Contains(r.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// captureSlog swaps the default logger for a capturing one until cleanup.
+func captureSlog(t *testing.T) *logCapture {
+	t.Helper()
+	c := &logCapture{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(c))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return c
+}
+
+// saveRotGlobals snapshots and restores the rot* package globals the built-in
+// rotation fans out (the integration-tagged saveRotateVars helper is not
+// available to unit tests).
+func saveRotGlobals(t *testing.T) {
+	t.Helper()
 	saved := struct {
 		retain, archiveDir, archiveS3, bintrailID, format string
 		addFuture                                         int
@@ -26,6 +64,16 @@ func TestStartUpRotation_armsRotateGlobals(t *testing.T) {
 		rotAddFuture, rotNoReplace, rotRetry, rotProtectUnarchived =
 			saved.addFuture, saved.noReplace, saved.retry, saved.protect
 	})
+}
+
+// TestStartUpRotation_armsRotateGlobals is the guard-arming regression test:
+// the entire data-loss safety of the built-in rotation reduces to the rot*
+// fan-out in startUpRotation. If rotProtectUnarchived stopped being set, `up`
+// would silently drop unarchived partitions by default and the integration
+// tests (which arm the guard themselves) would stay green. Mirrors
+// TestPopulateStreamFlags for the stream fan-out.
+func TestStartUpRotation_armsRotateGlobals(t *testing.T) {
+	saveRotGlobals(t)
 
 	// Poison every global so the assertions prove startUpRotation overwrote
 	// them rather than inheriting a lucky zero value.
@@ -44,10 +92,12 @@ func TestStartUpRotation_armsRotateGlobals(t *testing.T) {
 		t.Fatalf("parseUpRotation: %v", err)
 	}
 	// Cancelled ctx + empty DSN provider: the immediate first cycle dedupes
-	// to nothing (no DB touched), then the loop exits on ctx.Done.
+	// to nothing (no DB touched), then the loop exits on ctx.Done. Wait for
+	// the loop to fully exit so it can't race the next test's globals.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	startUpRotation(ctx, s, func() []string { return nil })
+	done := startUpRotation(ctx, s, func() []string { return nil })
+	<-done
 
 	if !rotProtectUnarchived {
 		t.Error("rotProtectUnarchived must be armed — without it the built-in rotation drops unarchived data")
@@ -77,12 +127,79 @@ func TestStartUpRotation_armsRotateGlobals(t *testing.T) {
 // loop and never consults the DSN provider.
 func TestStartUpRotation_disabledIsInert(t *testing.T) {
 	called := false
-	startUpRotation(context.Background(), upRotationSettings{}, func() []string {
+	done := startUpRotation(context.Background(), upRotationSettings{}, func() []string {
 		called = true
 		return nil
 	})
+	select {
+	case <-done: // disabled path returns an already-closed channel
+	default:
+		t.Error("disabled rotation must return a closed done channel (no loop running)")
+	}
 	if called {
 		t.Error("disabled rotation must not invoke the DSN provider")
+	}
+}
+
+// TestStartUpRotation_escalatesAfterConsecutiveFailures exercises the
+// detection half of the data-loss story: a rotation that fails every cycle
+// must escalate from per-cycle Warns to an explicit Error after
+// upRotationEscalateAfter consecutive cycles — otherwise the index grows
+// unbounded while the logs read as routine noise.
+func TestStartUpRotation_escalatesAfterConsecutiveFailures(t *testing.T) {
+	saveRotGlobals(t)
+	logs := captureSlog(t)
+
+	prevN := upRotationEscalateAfter
+	upRotationEscalateAfter = 2
+	t.Cleanup(func() { upRotationEscalateAfter = prevN })
+
+	s := upRotationSettings{
+		enabled:   true,
+		retain:    24 * time.Hour,
+		retainRaw: "24h",
+		interval:  5 * time.Millisecond,
+		addFuture: 0,
+		explicit:  true, // skip the upgrade guard; we are testing escalation
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Port 1 on loopback: connection refused immediately, every cycle fails.
+	done := startUpRotation(ctx, s, func() []string {
+		return []string{"root:x@tcp(127.0.0.1:1)/nope"}
+	})
+
+	deadline := time.After(15 * time.Second)
+	for !logs.has(slog.LevelError, "failed for consecutive cycles") {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("rotation never escalated to Error after consecutive failing cycles")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+}
+
+// TestRunUpRotationCycle_reportsFailure verifies the cycle aggregation: any
+// DSN failing marks the whole cycle failed (feeding the escalation streak).
+func TestRunUpRotationCycle_reportsFailure(t *testing.T) {
+	saveRotGlobals(t)
+	captureSlog(t) // silence the expected warnings
+
+	s := upRotationSettings{
+		enabled: true, retain: 24 * time.Hour, retainRaw: "24h",
+		interval: time.Hour, explicit: true,
+	}
+	deferred, failed := runUpRotationCycle(context.Background(), s, func() []string {
+		return []string{"root:x@tcp(127.0.0.1:1)/nope", "not-a-dsn"}
+	})
+	if !failed {
+		t.Error("cycle with unreachable DSNs must report failed=true")
+	}
+	if deferred != 0 {
+		t.Errorf("deferred = %d, want 0 (nothing rotated)", deferred)
 	}
 }
 
