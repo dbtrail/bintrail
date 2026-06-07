@@ -414,21 +414,27 @@ func TestParseFile_compressedTransactions(t *testing.T) {
 		t.Fatalf("ParseFile returned error: %v", err)
 	}
 
+	// Count DML events only: under parallel `./...` runs, concurrent test
+	// packages' DDL (CREATE TABLE index_state, ...) leaks into the shared
+	// container's binlog window, and DDL events bypass the schema filter by
+	// design. Row events ARE schema-filtered, so the DML counts are exact.
 	// 20 INSERT + 1 UPDATE + 1 DELETE — the positive count IS the regression
 	// guard (the bug produced exactly zero).
-	if len(got) != 22 {
-		t.Fatalf("expected 22 events from compressed transactions, got %d", len(got))
-	}
+	var dml []parser.Event
 	typeCounts := map[parser.EventType]int{}
 	for _, ev := range got {
-		typeCounts[ev.EventType]++
+		switch ev.EventType {
+		case parser.EventInsert, parser.EventUpdate, parser.EventDelete:
+			dml = append(dml, ev)
+			typeCounts[ev.EventType]++
+		}
 	}
 	if typeCounts[parser.EventInsert] != 20 || typeCounts[parser.EventUpdate] != 1 || typeCounts[parser.EventDelete] != 1 {
-		t.Errorf("event mix = %d INSERT / %d UPDATE / %d DELETE, want 20/1/1",
+		t.Fatalf("event mix = %d INSERT / %d UPDATE / %d DELETE, want 20/1/1",
 			typeCounts[parser.EventInsert], typeCounts[parser.EventUpdate], typeCounts[parser.EventDelete])
 	}
 
-	for i, ev := range got {
+	for i, ev := range dml {
 		// Positions must be the payload event's FILE coordinates: an
 		// underflowed start_pos (inner buffer-relative header) would be ~2^64
 		// and an inner-relative end_pos would point past nothing meaningful.
