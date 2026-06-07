@@ -19,29 +19,34 @@ func TestRotateOneIndex_UpgradeGuard(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 
-	// 100 days of pre-existing history — far beyond 2× the 30d default.
+	// 100 days of pre-existing history — far beyond 2× the 30d default —
+	// plus the current-hour partition (a live deployment always has recent
+	// partitions; add-future top-up appends after the LATEST named one, so a
+	// lone ancient partition would make top-up land uselessly in the past).
 	old := time.Now().UTC().Add(-100 * 24 * time.Hour).Truncate(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{old})
+	current := time.Now().UTC().Truncate(time.Hour)
+	setupPartitionedTable(t, db, dbName, []time.Time{old, current})
 
 	savedVars := saveRotateVars()
 	t.Cleanup(func() { restoreRotateVars(savedVars) })
 	logs := captureSlog(t)
 
-	// Built-in rotation profile (what startUpRotation fans out).
+	// Built-in rotation profile (what startUpRotation fans out) — with
+	// add-future headroom so the guarded cycle's top-up promise is asserted.
 	rotArchiveDir = ""
 	rotArchiveS3 = ""
 	rotBintrailID = ""
 	rotFormat = "json"
 	rotRetry = false
 	rotNoReplace = false
-	rotAddFuture = 0
+	rotAddFuture = 2
 	rotProtectUnarchived = true
 	rotRetain = "30d"
 
 	dsn := testutil.IntegrationDSN(dbName)
 	s := upRotationSettings{
 		enabled: true, retain: 30 * 24 * time.Hour, retainRaw: "30d",
-		interval: time.Hour, explicit: false,
+		interval: time.Hour, addFuture: 2, explicit: false,
 	}
 
 	// Implicit default: the guard must refuse the drop and say so loudly.
@@ -52,10 +57,14 @@ func TestRotateOneIndex_UpgradeGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listPartitions: %v", err)
 	}
-	found := false
+	found, future := false, 0
+	nowHour := time.Now().UTC().Truncate(time.Hour)
 	for _, p := range partitions {
 		if p.Name == partitionName(old) {
 			found = true
+		}
+		if d, ok := partitionDate(p.Name); ok && d.After(nowHour) {
+			future++
 		}
 	}
 	if !found {
@@ -63,6 +72,12 @@ func TestRotateOneIndex_UpgradeGuard(t *testing.T) {
 	}
 	if !logs.has(slog.LevelError, "refusing to drop it without an explicit choice") {
 		t.Error("upgrade guard did not log its Error explaining the refusal")
+	}
+	// The guarded cycle must still top up future partitions (retain=0 skips
+	// only the drop branch) — otherwise refusing drops would also starve
+	// p_future headroom while the operator decides.
+	if future < 2 {
+		t.Errorf("guarded cycle added %d future partitions, want >= 2 (top-up must survive the guard)", future)
 	}
 
 	// Explicit choice: the same retention now drops the old history.
@@ -120,7 +135,7 @@ func TestStartUpRotation_escalatesOnPersistentDeferral(t *testing.T) {
 	})
 
 	deadline := time.After(30 * time.Second)
-	for !logs.has(slog.LevelError, "deferring unarchived partitions") {
+	for !logs.has(slog.LevelError, "made no progress for consecutive cycles") {
 		select {
 		case <-deadline:
 			cancel()

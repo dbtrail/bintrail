@@ -87,7 +87,7 @@ func TestStartUpRotation_armsRotateGlobals(t *testing.T) {
 	rotAddFuture = 99
 	rotRetain = "poison"
 
-	s, err := parseUpRotation("30d", "1h", 3)
+	s, err := parseUpRotation("30d", "1h", 3, false)
 	if err != nil {
 		t.Fatalf("parseUpRotation: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestStartUpRotation_escalatesAfterConsecutiveFailures(t *testing.T) {
 	})
 
 	deadline := time.After(15 * time.Second)
-	for !logs.has(slog.LevelError, "failed for consecutive cycles") {
+	for !logs.has(slog.LevelError, "made no progress for consecutive cycles") {
 		select {
 		case <-deadline:
 			cancel()
@@ -180,6 +180,100 @@ func TestStartUpRotation_escalatesAfterConsecutiveFailures(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// TestGuardTrips covers the pure decision behind the upgrade guard at its
+// edges: a regression flipping any of these silently disables rotation on
+// fresh installs (unbounded growth) or shreds history it promised to protect.
+func TestGuardTrips(t *testing.T) {
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+	retain := 30 * 24 * time.Hour
+	name := func(age time.Duration) string { return partitionName(now.Add(-age)) }
+
+	cases := []struct {
+		desc       string
+		partitions []partitionInfo
+		want       bool
+	}{
+		{"empty list (fresh install)", nil, false},
+		{"p_future only (fresh install)", []partitionInfo{{Name: "p_future"}}, false},
+		{"malformed names only", []partitionInfo{{Name: "p_bogus"}, {Name: "weird"}}, false},
+		{"oldest inside the window", []partitionInfo{{Name: name(10 * 24 * time.Hour)}}, false},
+		{"oldest exactly AT the 2x boundary (strict >, must NOT trip)",
+			[]partitionInfo{{Name: name(2 * retain)}}, false},
+		{"oldest just past the 2x boundary",
+			[]partitionInfo{{Name: name(2*retain + time.Hour)}}, true},
+		{"deep history mixed with recent partitions and p_future",
+			[]partitionInfo{{Name: name(time.Hour)}, {Name: name(100 * 24 * time.Hour)}, {Name: "p_future"}}, true},
+	}
+	for _, tc := range cases {
+		got, _ := guardTrips(tc.partitions, retain, now)
+		if got != tc.want {
+			t.Errorf("%s: guardTrips = %v, want %v", tc.desc, got, tc.want)
+		}
+	}
+}
+
+// TestParseUpRotation_explicitPropagates pins that the constructor is the
+// sole author of the explicit field — the switch between "operator chose a
+// retention" and "implicit default protected by the upgrade guard".
+func TestParseUpRotation_explicitPropagates(t *testing.T) {
+	for _, explicit := range []bool{true, false} {
+		s, err := parseUpRotation("30d", "1h", 3, explicit)
+		if err != nil {
+			t.Fatalf("parseUpRotation: %v", err)
+		}
+		if s.explicit != explicit {
+			t.Errorf("explicit = %v, want %v", s.explicit, explicit)
+		}
+	}
+}
+
+// TestRunUp_explicitRetentionWiring pins the runUp call site — the literal
+// Changed("rotate-retain") string. A typo there would make the upgrade guard
+// engage even when the operator explicitly set a retention, silently ignoring
+// their choice (and never dropping deep history they asked to drop).
+func TestRunUp_explicitRetentionWiring(t *testing.T) {
+	flag := upCmd.Flags().Lookup("rotate-retain")
+	if flag == nil {
+		t.Fatal("--rotate-retain not registered on upCmd")
+	}
+	savedChanged, savedValue := flag.Changed, flag.Value.String()
+	savedCfg := upRotationCfg
+	savedRetain, savedInterval, savedAdd := upRotateRetain, upRotateInterval, upRotateAddFuture
+	savedSource, savedConsole, savedFormat := upSourceDSN, upConsole, upFormat
+	t.Cleanup(func() {
+		flag.Changed = savedChanged
+		_ = flag.Value.Set(savedValue)
+		upRotationCfg = savedCfg
+		upRotateRetain, upRotateInterval, upRotateAddFuture = savedRetain, savedInterval, savedAdd
+		upSourceDSN, upConsole, upFormat = savedSource, savedConsole, savedFormat
+	})
+
+	// Make runUp exit early at the source-dsn check — AFTER the rotation
+	// block has populated upRotationCfg, BEFORE any phase touches a DB.
+	upSourceDSN, upConsole, upFormat = "", false, "text"
+	upRotateInterval, upRotateAddFuture = "1h", 3
+
+	// Implicit: flag never set.
+	flag.Changed = false
+	upRotateRetain = "30d"
+	_ = runUp(upCmd, nil) // returns the source-dsn error; irrelevant here
+	if upRotationCfg.explicit {
+		t.Error("explicit must be false when --rotate-retain was never set")
+	}
+
+	// Explicit: set through the flag set, exactly like CLI/env would.
+	if err := upCmd.Flags().Set("rotate-retain", "7d"); err != nil {
+		t.Fatalf("Set(rotate-retain): %v", err)
+	}
+	_ = runUp(upCmd, nil)
+	if !upRotationCfg.explicit {
+		t.Error("explicit must be true when --rotate-retain was set — the Changed(\"rotate-retain\") call site is broken")
+	}
+	if upRotationCfg.retainRaw != "7d" {
+		t.Errorf("retainRaw = %q, want 7d", upRotationCfg.retainRaw)
+	}
 }
 
 // TestRunUpRotationCycle_reportsFailure verifies the cycle aggregation: any
@@ -216,7 +310,7 @@ func TestUpRotateFlagsRegistered(t *testing.T) {
 }
 
 func TestParseUpRotation_enabled(t *testing.T) {
-	s, err := parseUpRotation("30d", "1h", 3)
+	s, err := parseUpRotation("30d", "1h", 3, false)
 	if err != nil {
 		t.Fatalf("parseUpRotation: %v", err)
 	}
@@ -239,7 +333,7 @@ func TestParseUpRotation_enabled(t *testing.T) {
 
 func TestParseUpRotation_disabledForms(t *testing.T) {
 	for _, retain := range []string{"off", "0", ""} {
-		s, err := parseUpRotation(retain, "1h", 3)
+		s, err := parseUpRotation(retain, "1h", 3, false)
 		if err != nil {
 			t.Errorf("parseUpRotation(%q): unexpected error %v", retain, err)
 			continue
@@ -251,7 +345,7 @@ func TestParseUpRotation_disabledForms(t *testing.T) {
 }
 
 func TestParseUpRotation_invalidRetain(t *testing.T) {
-	_, err := parseUpRotation("1x", "1h", 3)
+	_, err := parseUpRotation("1x", "1h", 3, false)
 	if err == nil {
 		t.Fatal("expected error for invalid retain unit")
 	}
@@ -261,16 +355,16 @@ func TestParseUpRotation_invalidRetain(t *testing.T) {
 }
 
 func TestParseUpRotation_invalidInterval(t *testing.T) {
-	if _, err := parseUpRotation("7d", "soon", 3); err == nil {
+	if _, err := parseUpRotation("7d", "soon", 3, false); err == nil {
 		t.Fatal("expected error for unparseable interval")
 	}
-	if _, err := parseUpRotation("7d", "-1h", 3); err == nil {
+	if _, err := parseUpRotation("7d", "-1h", 3, false); err == nil {
 		t.Fatal("expected error for non-positive interval")
 	}
 }
 
 func TestParseUpRotation_negativeAddFuture(t *testing.T) {
-	if _, err := parseUpRotation("7d", "1h", -1); err == nil {
+	if _, err := parseUpRotation("7d", "1h", -1, false); err == nil {
 		t.Fatal("expected error for negative add-future")
 	}
 }

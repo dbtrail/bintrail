@@ -106,15 +106,15 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --format %q; must be text or json", upFormat)
 	}
 	// Validate the built-in rotation settings up front so a typo fails fast,
-	// before any phase runs. The loop itself starts with phase 3.
+	// before any phase runs. The loop itself starts with phase 3. The Changed
+	// check covers flag and env alike (bindCommandEnv marks env-set flags
+	// Changed); an explicitly-chosen retention disables the upgrade guard.
 	var err error
-	upRotationCfg, err = parseUpRotation(upRotateRetain, upRotateInterval, upRotateAddFuture)
+	upRotationCfg, err = parseUpRotation(upRotateRetain, upRotateInterval, upRotateAddFuture,
+		cmd.Flags().Changed("rotate-retain"))
 	if err != nil {
 		return err
 	}
-	// Explicitly-configured retention (flag or env — bindCommandEnv marks
-	// env-set flags Changed) disables the upgrade guard: the operator chose.
-	upRotationCfg.explicit = cmd.Flags().Changed("rotate-retain")
 	// --source-dsn is required for the classic single-stream `up`, but with
 	// --console the daemon can start with NO source at all: it serves the
 	// console + control plane, and sources are added from the UI ("+ Add

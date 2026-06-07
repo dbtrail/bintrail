@@ -189,15 +189,15 @@ func TestPerformRotation_PendingS3BlocksDrop(t *testing.T) {
 	rotArchiveS3 = ""
 	rotRetry = true
 
-	dropped, _, _, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
 	if err != nil {
 		t.Fatalf("performRotation failed: %v", err)
 	}
 
 	// First partition should NOT be dropped (pending S3 upload).
 	// Second partition should be dropped (S3 upload complete).
-	if dropped != 1 {
-		t.Errorf("expected 1 partition dropped, got %d", dropped)
+	if res.dropped != 1 {
+		t.Errorf("expected 1 partition dropped, got %d", res.dropped)
 	}
 
 	// Verify partition h1 still exists.
@@ -250,12 +250,12 @@ func TestPerformRotation_NoPendingS3DropsAll(t *testing.T) {
 	rotAddFuture = 0
 
 	// No archive_state rows at all — partitions should be dropped freely.
-	dropped, _, _, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
 	if err != nil {
 		t.Fatalf("performRotation failed: %v", err)
 	}
-	if dropped != 2 {
-		t.Errorf("expected 2 partitions dropped, got %d", dropped)
+	if res.dropped != 2 {
+		t.Errorf("expected 2 partitions dropped, got %d", res.dropped)
 	}
 }
 
@@ -291,14 +291,14 @@ func TestPerformRotation_BulkDropSkipsPendingS3(t *testing.T) {
 	rotNoReplace = true
 	rotAddFuture = 0
 
-	dropped, _, _, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
 	if err != nil {
 		t.Fatalf("performRotation failed: %v", err)
 	}
 
 	// h1 should be skipped (pending S3), h2 dropped.
-	if dropped != 1 {
-		t.Errorf("expected 1 partition dropped (h2 only), got %d", dropped)
+	if res.dropped != 1 {
+		t.Errorf("expected 1 partition dropped (h2 only), got %d", res.dropped)
 	}
 
 	partitions, err := listPartitions(context.Background(), db, dbName)
@@ -365,15 +365,15 @@ func TestPerformRotation_ProtectUnarchivedDefers(t *testing.T) {
 		VALUES (?, 'cron-uuid', '/archives/p3.parquet', 1, 'my-bucket', 'archives/p3.parquet', UTC_TIMESTAMP())`,
 		partitionName(h3))
 
-	dropped, _, deferred, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
 	if err != nil {
 		t.Fatalf("performRotation failed: %v", err)
 	}
-	if dropped != 1 {
-		t.Errorf("expected 1 partition dropped (archived+uploaded h3 only), got %d", dropped)
+	if res.dropped != 1 {
+		t.Errorf("expected 1 partition dropped (archived+uploaded h3 only), got %d", res.dropped)
 	}
-	if deferred != 1 {
-		t.Errorf("expected 1 partition deferred (unarchived h1; pending-S3 h2 is a skip, not a guard deferral), got %d", deferred)
+	if res.deferred != 1 {
+		t.Errorf("expected 1 partition deferred (unarchived h1; pending-S3 h2 is a skip, not a guard deferral), got %d", res.deferred)
 	}
 
 	partitions, err := listPartitions(context.Background(), db, dbName)
@@ -424,12 +424,12 @@ func TestPerformRotation_ProtectUnarchivedNoHistoryDropsAll(t *testing.T) {
 	rotAddFuture = 0
 	rotProtectUnarchived = true
 
-	dropped, _, _, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
 	if err != nil {
 		t.Fatalf("performRotation failed: %v", err)
 	}
-	if dropped != 2 {
-		t.Errorf("expected 2 partitions dropped (no archiving history), got %d", dropped)
+	if res.dropped != 2 {
+		t.Errorf("expected 2 partitions dropped (no archiving history), got %d", res.dropped)
 	}
 }
 

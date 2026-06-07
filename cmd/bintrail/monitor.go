@@ -496,8 +496,11 @@ func (m *monitorSupervisor) Stop(ctx context.Context, entryID string) error {
 // The built-in `up` rotation uses it to cover the databases the control plane
 // provisions (bintrail_idx_<entry>) in addition to the boot index DB. Jobs in
 // every state are included: a crash-looping stream's database still ages past
-// retention, and a DSN whose database is mid-provisioning merely logs one
-// transient rotation warning and self-heals next tick.
+// retention, and a DSN whose database is mid-provisioning logs one transient
+// rotation warning and self-heals next tick. A job whose provisioning failed
+// TERMINALLY (bad perms, DDL error) keeps producing a per-cycle rotation
+// warning until superseded or stopped — deliberate: the broken entry should
+// stay loud, and Stop() removes it from the map.
 func (m *monitorSupervisor) ActiveIndexDSNs() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()

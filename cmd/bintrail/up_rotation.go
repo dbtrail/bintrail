@@ -36,10 +36,12 @@ type upRotationSettings struct {
 // neighbors (populateStreamFlags et al.).
 var upRotationCfg upRotationSettings
 
-// parseUpRotation validates the --rotate-* flag values. retain accepts the
-// rotate command's Nd/Nh forms, plus "off", "0", or "" to disable the
-// built-in rotation entirely.
-func parseUpRotation(retain, interval string, addFuture int) (upRotationSettings, error) {
+// parseUpRotation validates the --rotate-* flag values and is the sole
+// author of every upRotationSettings field. retain accepts the rotate
+// command's Nd/Nh forms, plus "off", "0", or "" to disable the built-in
+// rotation entirely. explicit is whether the operator set --rotate-retain
+// themselves (cmd.Flags().Changed — true for flag and env alike).
+func parseUpRotation(retain, interval string, addFuture int, explicit bool) (upRotationSettings, error) {
 	switch retain {
 	case "off", "0", "":
 		return upRotationSettings{}, nil
@@ -64,6 +66,7 @@ func parseUpRotation(retain, interval string, addFuture int) (upRotationSettings
 		retainRaw: retain,
 		interval:  iv,
 		addFuture: addFuture,
+		explicit:  explicit,
 	}, nil
 }
 
@@ -107,12 +110,15 @@ func startUpRotation(ctx context.Context, s upRotationSettings, dsns func() []st
 
 	go func() {
 		defer close(done)
-		// Consecutive-cycle streaks for escalation: an hourly Warn blends
-		// into noise, but a rotation that fails — or defers everything to a
-		// stalled archiving flow — for hours means the index is growing
-		// unbounded, the exact outcome this loop exists to prevent. After
-		// upRotationEscalateAfter consecutive bad cycles, say so at Error.
-		var failStreak, deferStreak int
+		// Consecutive-unhealthy-cycle streak for escalation: an hourly Warn
+		// blends into noise, but a rotation that makes no progress it should
+		// have — failing, deferring to a stalled archiving flow, or any
+		// alternation of the two — for hours means the index is growing
+		// unbounded, the exact condition this loop exists to detect. ONE
+		// streak over (failed || deferred>0), not per-reason counters: split
+		// counters each reset while the other condition fires, so an index
+		// alternating defer/fail would never escalate.
+		var unhealthyStreak int
 		cycle := func() {
 			// Rotation is the secondary job: a panic here must never take
 			// down the stream (the primary forensic capture) — same
@@ -123,23 +129,16 @@ func startUpRotation(ctx context.Context, s upRotationSettings, dsns func() []st
 				}
 			}()
 			deferred, failed := runUpRotationCycle(ctx, s, dsns)
-			if failed {
-				failStreak++
+			if failed || deferred > 0 {
+				unhealthyStreak++
 			} else {
-				failStreak = 0
+				unhealthyStreak = 0
 			}
-			if deferred > 0 {
-				deferStreak++
-			} else {
-				deferStreak = 0
-			}
-			if failStreak >= upRotationEscalateAfter {
-				slog.Error("built-in rotation has failed for consecutive cycles — the index is NOT being rotated and will grow until the disk fills",
-					"consecutive_failures", failStreak)
-			}
-			if deferStreak >= upRotationEscalateAfter {
-				slog.Error("built-in rotation keeps deferring unarchived partitions — if your archiving flow has stopped, the index will grow until the disk fills (archive the partitions, or set --rotate-retain off and rotate manually)",
-					"consecutive_cycles", deferStreak, "deferred_last_cycle", deferred)
+			if unhealthyStreak >= upRotationEscalateAfter {
+				slog.Error("built-in rotation made no progress for consecutive cycles — the index is growing unbounded (rotation is failing and/or deferring unarchived partitions to a stalled archiving flow; archive the partitions, fix the failure, or set --rotate-retain off and rotate manually)",
+					"consecutive_cycles", unhealthyStreak,
+					"deferred_last_cycle", deferred,
+					"failed_last_cycle", failed)
 			}
 		}
 		cycle()
@@ -157,9 +156,9 @@ func startUpRotation(ctx context.Context, s upRotationSettings, dsns func() []st
 	return done
 }
 
-// upRotationEscalateAfter is how many consecutive failing (or all-deferred)
-// cycles the loop tolerates before escalating from Warn to Error. A var, not
-// a const, so tests can shrink it.
+// upRotationEscalateAfter is how many consecutive unhealthy cycles (failed
+// or deferring) the loop tolerates before escalating from Warn to Error. A
+// var, not a const, so tests can shrink it.
 var upRotationEscalateAfter = 3
 
 // runUpRotationCycle rotates each index database once. Errors are logged and
@@ -196,7 +195,12 @@ func dedupeDSNs(in []string) []string {
 // are scrubbed: DSNs (and their passwords) never reach the log.
 func rotateOneIndex(ctx context.Context, dsn string, s upRotationSettings) (int, error) {
 	cfg, err := mysql.ParseDSN(dsn)
-	if err != nil || cfg.DBName == "" {
+	if err != nil {
+		slog.Warn("built-in rotation: skipping unparseable index DSN",
+			"error", scrubMonitorErrText(err.Error(), dsn))
+		return 0, fmt.Errorf("parse index DSN: %w", err)
+	}
+	if cfg.DBName == "" {
 		slog.Warn("built-in rotation: skipping index DSN without a database name")
 		return 0, fmt.Errorf("index DSN without a database name")
 	}
@@ -211,12 +215,12 @@ func rotateOneIndex(ctx context.Context, dsn string, s upRotationSettings) (int,
 	retain := s.retain
 	if !s.explicit {
 		// Upgrade guard: an operator running on the IMPLICIT default never
-		// chose a retention. If the index already holds history extending
-		// far beyond the default window — the signature of a pre-existing
-		// deployment that predates built-in rotation — refuse to drop it and
-		// demand an explicit choice. Fresh installs never trip this (they
-		// can't accumulate beyond the window while the loop runs), and a
-		// restart after ordinary downtime stays under the 2× threshold.
+		// chose a retention. If the oldest partition extends far beyond the
+		// default window — the signature of a pre-existing deployment that
+		// predates built-in rotation — refuse to drop it and demand an
+		// explicit choice. Fresh installs never trip this (they can't
+		// accumulate beyond the window while the loop runs), and a restart
+		// after ordinary downtime stays under the 2× threshold.
 		guarded, oldest, err := upgradeGuardTrips(ctx, db, cfg.DBName, s.retain)
 		if err != nil {
 			slog.Warn("built-in rotation: could not evaluate the upgrade guard; skipping drops this cycle",
@@ -233,13 +237,13 @@ func rotateOneIndex(ctx context.Context, dsn string, s upRotationSettings) (int,
 		}
 	}
 
-	_, _, deferred, err := performRotation(ctx, db, cfg.DBName, retain)
+	res, err := performRotation(ctx, db, cfg.DBName, retain)
 	if err != nil && ctx.Err() == nil {
 		slog.Warn("built-in rotation cycle failed",
 			"db", cfg.DBName, "error", scrubMonitorErrText(err.Error(), dsn))
-		return deferred, err
+		return res.deferred, err
 	}
-	return deferred, nil
+	return res.deferred, nil
 }
 
 // upgradeGuardTrips reports whether the implicit-default upgrade guard should
@@ -250,6 +254,15 @@ func upgradeGuardTrips(ctx context.Context, db *sql.DB, dbName string, retain ti
 	if err != nil {
 		return false, time.Time{}, err
 	}
+	trips, oldest := guardTrips(partitions, retain, time.Now())
+	return trips, oldest, nil
+}
+
+// guardTrips is the pure decision behind the upgrade guard: strict-> on twice
+// the retain window, measured against the oldest named hourly partition.
+// p_future and malformed names are ignored; no named partitions (a fresh
+// install) never trips.
+func guardTrips(partitions []partitionInfo, retain time.Duration, now time.Time) (bool, time.Time) {
 	var oldest time.Time
 	for _, p := range partitions {
 		d, ok := partitionDate(p.Name)
@@ -261,7 +274,7 @@ func upgradeGuardTrips(ctx context.Context, db *sql.DB, dbName string, retain ti
 		}
 	}
 	if oldest.IsZero() {
-		return false, time.Time{}, nil
+		return false, time.Time{}
 	}
-	return time.Since(oldest) > 2*retain, oldest, nil
+	return now.Sub(oldest) > 2*retain, oldest
 }
