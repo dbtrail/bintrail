@@ -99,8 +99,10 @@ func drainEvents(ch <-chan parser.Event) []parser.Event {
 // these tests must ignore DDL: under parallel `go test -tags integration ./...`
 // runs, concurrent test packages' setup DDL (CREATE TABLE index_state, ...)
 // lands in the shared container's binlog window, and DDL events bypass the
-// schema filter by design (#415). Row events ARE schema-filtered and each
-// test owns its schema, so DML counts stay exact.
+// schema filter by design — DDL is emitted unconditionally for audit and
+// auto-snapshot purposes (#415; contract pinned by
+// TestStreamParser_ddlBypassesSchemaFilter). Row events ARE schema-filtered
+// and each test owns its schema, so DML counts stay exact.
 func dmlEvents(events []parser.Event) []parser.Event {
 	var dml []parser.Event
 	for _, ev := range events {
@@ -289,7 +291,8 @@ func TestParseFiles_multiple(t *testing.T) {
 		errCh <- p.ParseFiles(context.Background(), binlogFiles, events)
 	}()
 
-	got := dmlEvents(drainEvents(events))
+	raw := drainEvents(events)
+	got := dmlEvents(raw)
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("ParseFiles returned error: %v", err)
@@ -298,9 +301,10 @@ func TestParseFiles_multiple(t *testing.T) {
 	// Each batch has 1 INSERT, so 2 DML events total.
 	if len(got) != 2 {
 		t.Errorf("expected 2 DML events from 2 binlog files, got %d", len(got))
-		for i, ev := range got {
-			t.Logf("  event[%d]: type=%d file=%s table=%s pk=%s",
-				i, ev.EventType, ev.BinlogFile, ev.Table, ev.PKValues)
+		// Dump the RAW set so the failure shows what dmlEvents filtered out.
+		for i, ev := range raw {
+			t.Logf("  event[%d]: type=%d file=%s schema=%s table=%s pk=%s",
+				i, ev.EventType, ev.BinlogFile, ev.Schema, ev.Table, ev.PKValues)
 		}
 	}
 

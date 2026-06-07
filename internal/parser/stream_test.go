@@ -233,6 +233,36 @@ func TestStreamParser_queryEventDDL(t *testing.T) {
 	}
 }
 
+// TestStreamParser_ddlBypassesSchemaFilter pins the contract that DDL events
+// are emitted UNCONDITIONALLY — even for schemas excluded by the filter — for
+// audit and auto-snapshot purposes. The integration tests' dmlEvents helper
+// (#415) depends on this: it strips cross-package DDL leakage from count
+// assertions precisely because DDL ignores the filter. If a future change
+// made DDL respect filters, that flake fix would become a silent no-op and
+// the audit trail would lose foreign-schema DDL — this test fails first.
+func TestStreamParser_ddlBypassesSchemaFilter(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{Schemas: map[string]bool{"prod": true}}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel, makeQueryEvent("CREATE TABLE staging.t (id INT)"))
+
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected 1 EventDDL for a filtered-out schema, got %d", len(out))
+	}
+	ev := <-out
+	if ev.EventType != EventDDL {
+		t.Errorf("expected EventDDL (%d), got %d", EventDDL, ev.EventType)
+	}
+	if ev.Schema != "staging" {
+		t.Errorf("expected schema 'staging' (excluded by filter, still emitted), got %q", ev.Schema)
+	}
+}
+
 // ─── RowsEvent filtering ──────────────────────────────────────────────────────
 
 // TestStreamParser_filteredRowsEvent verifies that a RowsEvent for a schema
