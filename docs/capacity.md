@@ -126,6 +126,7 @@ Prevention is rotation: without a scheduled `rotate`, `binlog_events` grows **un
 
 The index is a regular MySQL table — every tool you already have works. The primitives bintrail exposes:
 
+- **`bintrail doctor --retain <window>`** — runs this page's math for you: it measures events/day and bytes/event from the last 24 hours of partition statistics and projects the steady-state size over the retention window. When the index MySQL is on the same host (loopback/socket DSN), it also probes the datadir's free space — FAIL when the projection exceeds it, WARN above 70%. The same check runs in `bintrail up`'s preflight with your actual `--rotate-retain`.
 - **`bintrail status --index-dsn …`** — per-partition row counts (InnoDB *estimates*, fine for capacity planning), per-file indexing progress, and archive totals (`Total size: X GB`) from `archive_state`.
 - **Per-partition size over time**, straight from SQL — this is your growth trend:
 

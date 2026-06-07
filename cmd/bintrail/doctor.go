@@ -46,6 +46,7 @@ var (
 	docIndexDSN  string
 	docSchemas   string
 	docFormat    string
+	docRetain    string
 )
 
 func init() {
@@ -53,6 +54,7 @@ func init() {
 	doctorCmd.Flags().StringVar(&docIndexDSN, "index-dsn", "", "DSN for the index MySQL database (optional; verifies write access when provided)")
 	doctorCmd.Flags().StringVar(&docSchemas, "schemas", "", "Comma-separated schemas to check (default: all user schemas)")
 	doctorCmd.Flags().StringVar(&docFormat, "format", "text", "Output format: text or json")
+	doctorCmd.Flags().StringVar(&docRetain, "retain", "30d", "Retention window assumed by the index capacity projection (Nd/Nh; \"off\" if you don't rotate)")
 	_ = doctorCmd.MarkFlagRequired("source-dsn")
 	bindCommandEnv(doctorCmd)
 	rootCmd.AddCommand(doctorCmd)
@@ -90,7 +92,18 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	if !cliutil.IsValidOutputFormat(docFormat) {
 		return fmt.Errorf("invalid --format %q; must be text or json", docFormat)
 	}
-	return runDoctorTo(cmd.Context(), os.Stdout, docFormat, docSourceDSN, docIndexDSN, docSchemas)
+	var retain time.Duration
+	switch docRetain {
+	case "off", "0", "":
+		// 0 = no rotation: the capacity check reports unbounded growth.
+	default:
+		var err error
+		retain, err = parseRetain(docRetain)
+		if err != nil {
+			return fmt.Errorf("--retain: %w (or \"off\" if you don't rotate)", err)
+		}
+	}
+	return runDoctorTo(cmd.Context(), os.Stdout, docFormat, docSourceDSN, docIndexDSN, docSchemas, retain)
 }
 
 // binlogRetentionMinSeconds is the minimum binlog retention bintrail asks for
@@ -136,11 +149,12 @@ func connectWithoutDB(dsn string) (*sql.DB, error) {
 // runDoctorTo is the testable core of the doctor command. It runs every check
 // against sourceDSN (and optionally indexDSN), renders the report to w using
 // format ("text" or "json"), and returns a non-nil error iff any required
-// check failed. Callers wanting to route output (e.g. `bintrail up` sending
-// preflight output to stderr to keep stdout clean for streaming) pass their
-// own writer here instead of going through the cobra entry point.
-func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDSN, schemasCSV string) error {
-	report := buildDoctorReport(parent, sourceDSN, indexDSN, schemasCSV)
+// check failed. indexRetain is the rotation window the capacity projection
+// assumes (0 = no rotation). Callers wanting to route output (e.g. `bintrail
+// up` sending preflight output to stderr to keep stdout clean for streaming)
+// pass their own writer here instead of going through the cobra entry point.
+func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDSN, schemasCSV string, indexRetain time.Duration) error {
+	report := buildDoctorReport(parent, sourceDSN, indexDSN, schemasCSV, indexRetain)
 	if err := report.Write(w, format); err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}
@@ -151,7 +165,7 @@ func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDS
 // report without rendering it — the seam the control-plane supervisor uses to
 // surface doctor results as cards in the console UI (runDoctorTo keeps the
 // CLI's write-and-exit behavior on top of it).
-func buildDoctorReport(parent context.Context, sourceDSN, indexDSN, schemasCSV string) *doctorReport {
+func buildDoctorReport(parent context.Context, sourceDSN, indexDSN, schemasCSV string, indexRetain time.Duration) *doctorReport {
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 
@@ -201,6 +215,7 @@ func buildDoctorReport(parent context.Context, sourceDSN, indexDSN, schemasCSV s
 		} else {
 			report.add(checkIndexConnection(ctx, indexDSN, indexCfg.DBName))
 			report.add(checkIndexWriteAccess(ctx, indexDSN, indexCfg.DBName))
+			report.add(checkIndexCapacity(ctx, indexDSN, indexCfg.DBName, indexRetain))
 		}
 	} else {
 		report.add(checkResult{

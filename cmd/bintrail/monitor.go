@@ -215,7 +215,9 @@ func (m *monitorSupervisor) Doctor(ctx context.Context, e console.ServerEntry) (
 	if e.SourceDSN == "" {
 		return nil, errors.New("entry has no source configured")
 	}
-	r := buildDoctorReport(ctx, e.SourceDSN, e.DSN, e.Schemas)
+	// The per-source databases are rotated by the daemon's built-in loop, so
+	// the capacity projection uses its window (0 when rotation is disabled).
+	r := buildDoctorReport(ctx, e.SourceDSN, e.DSN, e.Schemas, upRotationCfg.retain)
 	out := &console.DoctorReport{
 		Passed:   r.Passed,
 		Failed:   r.Failed,

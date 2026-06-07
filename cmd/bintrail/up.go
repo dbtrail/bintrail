@@ -143,7 +143,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr)
 	} else if !upSkipDoctor {
 		fmt.Fprintln(os.Stderr, "=== Phase 1/3: Preflight checks ===")
-		if err := runDoctorTo(cmd.Context(), os.Stderr, "text", upSourceDSN, upIndexDSN, upSchemas); err != nil {
+		// The capacity projection uses up's actual rotation window (0 when
+		// built-in rotation is disabled → it reports unbounded growth).
+		if err := runDoctorTo(cmd.Context(), os.Stderr, "text", upSourceDSN, upIndexDSN, upSchemas, upRotationCfg.retain); err != nil {
 			return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", err)
 		}
 		fmt.Fprintln(os.Stderr)
