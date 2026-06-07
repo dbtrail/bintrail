@@ -86,15 +86,15 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	var currentGTID string
 	var currentConnectionID uint32 // pseudo_thread_id from most recent QueryEvent
 
-	for {
-		binlogEv, err := streamer.GetEvent(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil // context cancelled — graceful shutdown
-			}
-			return err
-		}
-
+	// handleEvent processes one binlog event. It is recursive: with
+	// binlog_transaction_compression=ON the source wraps each transaction's
+	// events (BEGIN + TABLE_MAP + rows + XID) in a single zstd-compressed
+	// Transaction_payload event — delivered as-is over the replication
+	// protocol — which go-mysql hands over pre-decoded in ev.Events.
+	// Returns ctx.Err() on cancellation; the Run loop translates that into
+	// a graceful nil.
+	var handleEvent func(binlogEv *replication.BinlogEvent) error
+	handleEvent = func(binlogEv *replication.BinlogEvent) error {
 		switch ev := binlogEv.Event.(type) {
 		case *replication.RotateEvent:
 			currentFile = string(ev.NextLogName)
@@ -113,7 +113,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 				select {
 				case out <- gtidEv:
 				case <-ctx.Done():
-					return nil
+					return ctx.Err()
 				}
 			}
 
@@ -124,7 +124,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 				select {
 				case out <- ddlEv:
 				case <-ctx.Done():
-					return nil
+					return ctx.Err()
 				}
 				// Synchronous DDL hook: the resolver refresh must complete
 				// before the next event is decoded, or the rows that follow a
@@ -135,12 +135,33 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			}
 
 		case *replication.RowsEvent:
-			if err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, sp.schemaVersion.Load(), out); err != nil {
-				if ctx.Err() != nil {
-					return nil // context cancelled during row processing
+			return handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, sp.schemaVersion.Load(), out)
+
+		case *replication.TransactionPayloadEvent:
+			for _, inner := range ev.Events {
+				rewriteInnerHeader(inner.Header, binlogEv.Header)
+				if err := handleEvent(inner); err != nil {
+					return err
 				}
-				return err
 			}
+		}
+		return nil
+	}
+
+	for {
+		binlogEv, err := streamer.GetEvent(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil // context cancelled — graceful shutdown
+			}
+			return err
+		}
+
+		if err := handleEvent(binlogEv); err != nil {
+			if ctx.Err() != nil {
+				return nil // context cancelled during event processing
+			}
+			return err
 		}
 	}
 }

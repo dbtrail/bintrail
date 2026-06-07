@@ -146,7 +146,13 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 
 	bp := replication.NewBinlogParser()
 
-	err := bp.ParseFile(fullPath, 0, func(binlogEv *replication.BinlogEvent) error {
+	// handleEvent processes one binlog event. It is recursive: with
+	// binlog_transaction_compression=ON the source wraps each transaction's
+	// events (BEGIN + TABLE_MAP + rows + XID) in a single zstd-compressed
+	// Transaction_payload event, which go-mysql delivers pre-decoded in
+	// ev.Events — recursing dispatches them through the same cases.
+	var handleEvent func(binlogEv *replication.BinlogEvent) error
+	handleEvent = func(binlogEv *replication.BinlogEvent) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -168,11 +174,30 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 
 		case *replication.RowsEvent:
 			return handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, p.schemaVersion.Load(), events)
+
+		case *replication.TransactionPayloadEvent:
+			for _, inner := range ev.Events {
+				rewriteInnerHeader(inner.Header, binlogEv.Header)
+				if err := handleEvent(inner); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
-	})
+	}
 
-	return err
+	return bp.ParseFile(fullPath, 0, handleEvent)
+}
+
+// rewriteInnerHeader stamps a Transaction_payload inner event's header with
+// the outer payload event's file coordinates. Inner events were never written
+// to the binlog individually — their LogPos/EventSize describe offsets in the
+// uncompressed transaction buffer, not file positions, and deriving start_pos
+// from them would underflow uint64 (LogPos < EventSize). The physical location
+// of every inner event IS the payload event that carries it.
+func rewriteInnerHeader(inner, outer *replication.EventHeader) {
+	inner.LogPos = outer.LogPos
+	inner.EventSize = outer.EventSize
 }
 
 // ─── Row event handler ────────────────────────────────────────────────────────

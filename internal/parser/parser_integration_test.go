@@ -8,7 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/go-mysql-org/go-mysql/replication"
 
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/metadata"
@@ -284,6 +288,164 @@ func TestParseFiles_multiple(t *testing.T) {
 	// Verify events come from different binlog files.
 	if len(got) == 2 && got[0].BinlogFile == got[1].BinlogFile {
 		t.Error("expected events from different binlog files")
+	}
+}
+
+// TestParseFile_compressedTransactions is the end-to-end regression guard for
+// binlog_transaction_compression=ON: transactions arrive wrapped in
+// zstd-compressed Transaction_payload events, and the parser must dispatch the
+// inner row events through the normal pipeline. Before the fix, compressed
+// transactions were silently dropped (zero events, no error).
+func TestParseFile_compressedTransactions(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id       INT PRIMARY KEY AUTO_INCREMENT,
+		customer VARCHAR(100) NOT NULL,
+		notes    TEXT
+	)`)
+
+	stats, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshot failed: %v", err)
+	}
+	resolver, err := metadata.NewResolver(indexDB, stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("NewResolver failed: %v", err)
+	}
+
+	// Session-scoped compression on a dedicated connection: every transaction
+	// on THIS conn gets the Transaction_payload wrapper without affecting the
+	// rest of the suite's binlog traffic.
+	ctx := context.Background()
+	conn, err := sourceDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("Conn failed: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "SET SESSION binlog_transaction_compression = ON"); err != nil {
+		t.Skipf("binlog_transaction_compression not supported on this server (needs MySQL 8.0.20+): %v", err)
+	}
+
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+	currentBinlog, _, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition failed: %v", err)
+	}
+
+	// Highly repetitive ~1KB filler makes every transaction reliably
+	// compressible, so MySQL picks ZSTD. (Incompressible transactions get a
+	// NONE-type payload wrapper that go-mysql v1.13.0 refuses to decode —
+	// a loud error, tracked separately, but it would fail this test for the
+	// wrong reason.)
+	filler := strings.Repeat("bintrail compresses fine ", 40)
+
+	// One multi-row INSERT transaction + one UPDATE + one DELETE, all on the
+	// compressing connection. The UPDATE/DELETE rows carry the filler in
+	// their before-images (binlog_row_image=FULL), keeping them compressible.
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx failed: %v", err)
+	}
+	for i := range 20 {
+		if _, err := tx.ExecContext(ctx,
+			"INSERT INTO orders (customer, notes) VALUES (?, ?)",
+			fmt.Sprintf("customer_%d", i), filler); err != nil {
+			t.Fatalf("INSERT %d failed: %v", i, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "UPDATE orders SET customer = 'updated_1' WHERE id = 1"); err != nil {
+		t.Fatalf("UPDATE failed: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "DELETE FROM orders WHERE id = 2"); err != nil {
+		t.Fatalf("DELETE failed: %v", err)
+	}
+
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+
+	tmpDir := t.TempDir()
+	cpCmd := exec.Command("docker", "cp",
+		fmt.Sprintf("bintrail-test-mysql:/var/lib/mysql/%s", currentBinlog),
+		filepath.Join(tmpDir, currentBinlog),
+	)
+	if out, err := cpCmd.CombinedOutput(); err != nil {
+		t.Fatalf("docker cp %s failed: %v\n%s", currentBinlog, err, out)
+	}
+
+	// Vacuity guard: the file must actually contain Transaction_payload
+	// events, or this test would pass without exercising the new code path.
+	sawPayload := false
+	rawParser := replication.NewBinlogParser()
+	if err := rawParser.ParseFile(filepath.Join(tmpDir, currentBinlog), 0, func(e *replication.BinlogEvent) error {
+		if e.Header.EventType == replication.TRANSACTION_PAYLOAD_EVENT {
+			sawPayload = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("raw payload scan failed: %v", err)
+	}
+	if !sawPayload {
+		t.Fatal("binlog contains no Transaction_payload events — compression did not engage, test is vacuous")
+	}
+	fileInfo, err := os.Stat(filepath.Join(tmpDir, currentBinlog))
+	if err != nil {
+		t.Fatalf("stat binlog: %v", err)
+	}
+
+	p := parser.New(tmpDir, resolver, parser.Filters{
+		Schemas: map[string]bool{sourceName: true},
+	}, nil)
+
+	events := make(chan parser.Event, 100)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(events)
+		errCh <- p.ParseFile(context.Background(), currentBinlog, events)
+	}()
+	got := drainEvents(events)
+	if err := <-errCh; err != nil {
+		t.Fatalf("ParseFile returned error: %v", err)
+	}
+
+	// 20 INSERT + 1 UPDATE + 1 DELETE — the positive count IS the regression
+	// guard (the bug produced exactly zero).
+	if len(got) != 22 {
+		t.Fatalf("expected 22 events from compressed transactions, got %d", len(got))
+	}
+	typeCounts := map[parser.EventType]int{}
+	for _, ev := range got {
+		typeCounts[ev.EventType]++
+	}
+	if typeCounts[parser.EventInsert] != 20 || typeCounts[parser.EventUpdate] != 1 || typeCounts[parser.EventDelete] != 1 {
+		t.Errorf("event mix = %d INSERT / %d UPDATE / %d DELETE, want 20/1/1",
+			typeCounts[parser.EventInsert], typeCounts[parser.EventUpdate], typeCounts[parser.EventDelete])
+	}
+
+	for i, ev := range got {
+		// Positions must be the payload event's FILE coordinates: an
+		// underflowed start_pos (inner buffer-relative header) would be ~2^64
+		// and an inner-relative end_pos would point past nothing meaningful.
+		if ev.StartPos >= ev.EndPos {
+			t.Errorf("event[%d]: StartPos %d >= EndPos %d (underflow or bad rewrite)", i, ev.StartPos, ev.EndPos)
+		}
+		if ev.EndPos > uint64(fileInfo.Size()) {
+			t.Errorf("event[%d]: EndPos %d exceeds binlog file size %d", i, ev.EndPos, fileInfo.Size())
+		}
+		// Inner-event timestamps are real commit times, not zero.
+		if ev.Timestamp.Before(time.Now().Add(-time.Hour)) {
+			t.Errorf("event[%d]: Timestamp %v looks wrong (zero inner header?)", i, ev.Timestamp)
+		}
+		// The BEGIN inside the payload carries the connection id.
+		if ev.ConnectionID == 0 {
+			t.Errorf("event[%d]: ConnectionID = 0, want pseudo_thread_id from inner BEGIN", i)
+		}
 	}
 }
 

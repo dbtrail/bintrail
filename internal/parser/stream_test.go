@@ -419,3 +419,134 @@ func TestStreamParser_nilHookUnaffected(t *testing.T) {
 		t.Errorf("expected the DDL event, got %d events", len(out))
 	}
 }
+
+// ─── Transaction_payload events (binlog_transaction_compression=ON) ──────────
+
+// makeOrdersResolver builds a resolver for shop.orders(id PK, amount) so a
+// fabricated RowsEvent can clear every handleRows guard and actually emit.
+func makeOrdersResolver() *metadata.Resolver {
+	tm := &metadata.TableMeta{
+		Schema: "shop",
+		Table:  "orders",
+		Columns: []metadata.ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+			{Name: "amount", OrdinalPosition: 2, DataType: "int"},
+		},
+		PKColumns: []string{"id"},
+	}
+	return metadata.NewResolverFromTables(7, map[string]*metadata.TableMeta{"shop.orders": tm})
+}
+
+// makePayloadEvent wraps inner events in a TransactionPayloadEvent, mimicking
+// what go-mysql produces after decompressing a binlog_transaction_compression
+// transaction: inner events pre-decoded in .Events, with headers whose
+// positions describe the uncompressed transaction buffer — NOT the file.
+func makePayloadEvent(logPos, eventSize uint32, inner ...*replication.BinlogEvent) *replication.BinlogEvent {
+	return &replication.BinlogEvent{
+		Header: &replication.EventHeader{
+			EventType: replication.TRANSACTION_PAYLOAD_EVENT,
+			LogPos:    logPos,
+			EventSize: eventSize,
+		},
+		Event: &replication.TransactionPayloadEvent{Events: inner},
+	}
+}
+
+// TestStreamParser_transactionPayloadDispatchesInnerRows is the regression
+// guard for the compressed-transaction bug: a Transaction_payload event must
+// have its inner row events dispatched through the normal pipeline. Before the
+// fix, the payload matched no switch case and every compressed transaction was
+// silently dropped while the GTID checkpoint kept advancing.
+func TestStreamParser_transactionPayloadDispatchesInnerRows(t *testing.T) {
+	sp := NewStreamParser(makeOrdersResolver(), Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	// Inner BEGIN carries the connection id; inner rows event carries
+	// buffer-relative positions where LogPos < EventSize — deriving start_pos
+	// from them would underflow uint64.
+	innerBegin := &replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.QUERY_EVENT, LogPos: 61},
+		Event:  &replication.QueryEvent{Query: []byte("BEGIN"), SlaveProxyID: 42},
+	}
+	innerRows := &replication.BinlogEvent{
+		Header: &replication.EventHeader{
+			EventType: replication.WRITE_ROWS_EVENTv2,
+			Timestamp: 1770000000, // real commit-time timestamp survives dispatch
+			LogPos:    120,
+			EventSize: 500,
+		},
+		Event: &replication.RowsEvent{
+			Table: &replication.TableMapEvent{
+				Schema:      []byte("shop"),
+				Table:       []byte("orders"),
+				ColumnCount: 2,
+			},
+			Rows: [][]any{{int64(1), int64(10)}, {int64(2), int64(20)}},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel,
+		makeGTIDEvent(7), // GTID stays OUTSIDE the payload on the wire
+		makePayloadEvent(5000, 900, innerBegin, innerRows),
+	)
+
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	close(out)
+	var inserts []Event
+	for ev := range out {
+		if ev.EventType == EventGTID {
+			continue // outer GTID tracking event — not under test
+		}
+		inserts = append(inserts, ev)
+	}
+
+	// Positive count is the actual regression guard: zero emitted events is
+	// exactly the bug this test exists to prevent.
+	if len(inserts) != 2 {
+		t.Fatalf("expected 2 INSERT events from payload inner rows, got %d", len(inserts))
+	}
+	for i, ev := range inserts {
+		if ev.EventType != EventInsert {
+			t.Errorf("event[%d]: expected EventInsert, got %d", i, ev.EventType)
+		}
+		// Positions must come from the OUTER payload event (5000-900..5000),
+		// not the inner buffer-relative header (which would underflow).
+		if ev.StartPos != 4100 || ev.EndPos != 5000 {
+			t.Errorf("event[%d]: positions = [%d, %d], want outer [4100, 5000]", i, ev.StartPos, ev.EndPos)
+		}
+		// Connection id must be extracted from the BEGIN *inside* the payload.
+		if ev.ConnectionID != 42 {
+			t.Errorf("event[%d]: ConnectionID = %d, want 42 (from inner BEGIN)", i, ev.ConnectionID)
+		}
+		// GTID set by the uncompressed outer event must carry into inner rows.
+		if ev.GTID == "" {
+			t.Errorf("event[%d]: expected non-empty GTID from outer GTID event", i)
+		}
+		if ev.Timestamp.Unix() != 1770000000 {
+			t.Errorf("event[%d]: Timestamp = %v, want inner commit time 1770000000", i, ev.Timestamp.Unix())
+		}
+	}
+	if inserts[0].PKValues != "1" || inserts[1].PKValues != "2" {
+		t.Errorf("PKValues = %q, %q, want \"1\", \"2\"", inserts[0].PKValues, inserts[1].PKValues)
+	}
+}
+
+// TestStreamParser_emptyPayloadNoEffect: a payload with no inner events (or
+// one bintrail ignores, like XID) emits nothing and does not error.
+func TestStreamParser_emptyPayloadNoEffect(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel, makePayloadEvent(3000, 200))
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("expected 0 events from empty payload, got %d", len(out))
+	}
+}
