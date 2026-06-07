@@ -179,6 +179,14 @@ var envSections = []envSection{
 		},
 	},
 	{
+		Header: "Built-in rotation (used by bintrail up)",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_ROTATE_RETAIN", "30d"},
+			{"BINTRAIL_ROTATE_INTERVAL", "1h"},
+			{"BINTRAIL_ROTATE_ADD_FUTURE", "3"},
+		},
+	},
+	{
 		// These are read directly by `bintrail console` (see runConsole) and
 		// `bintrail up --console` (see resolveUpConsoleEnv), not via the shared
 		// envBindings slice — --listen is also used by shim, and --baseline-dir/

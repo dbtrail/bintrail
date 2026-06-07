@@ -72,6 +72,16 @@ var (
 	rotInterval           string
 	rotFormat             string
 	rotRetry              bool
+
+	// rotProtectUnarchived is not a flag: it is set by `up`'s built-in
+	// rotation (up_rotation.go). When true and the index has ANY archiving
+	// history (archive_state rows), the no-archive drop path only drops
+	// partitions that were already archived — the built-in rotation must
+	// never be the first to destroy data an external archiving flow (the
+	// operator's `rotate --archive-dir` cron) would have preserved. The
+	// explicit `rotate` command keeps its unguarded semantics: the operator
+	// asked for the drop.
+	rotProtectUnarchived bool
 )
 
 func init() {
@@ -392,8 +402,36 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 				// No archiving — drop all expired partitions at once.
 				// Filter out any partition that has a pending S3 upload from
 				// a previous archived rotation run.
+				//
+				// Under rotProtectUnarchived, one more filter applies when the
+				// index has archiving history: only already-archived partitions
+				// may be dropped; the rest are deferred to the archiving flow.
+				// An index with no archive_state rows at all rotates freely —
+				// that is the bounded-volume quickstart behavior.
+				var protectActive bool
+				if rotProtectUnarchived {
+					anyArchives, err := indexHasArchives(ctx, db)
+					if err != nil {
+						return 0, 0, fmt.Errorf("check archive history: %w", err)
+					}
+					protectActive = anyArchives
+				}
 				var safeToDrop []string
 				for _, name := range toDrop {
+					if protectActive {
+						archived, err := partitionArchived(ctx, db, name)
+						if err != nil {
+							return 0, 0, fmt.Errorf("check archive state for %s: %w", name, err)
+						}
+						if !archived {
+							slog.Warn("partition past retention but not yet archived; deferring drop to the archiving flow",
+								"partition", name)
+							if rotFormat != "json" {
+								fmt.Fprintf(os.Stdout, "skipped drop for %s (not yet archived)\n", name)
+							}
+							continue
+						}
+					}
 					pending, err := hasPendingS3Upload(ctx, db, name, rotBintrailID)
 					if err != nil {
 						return 0, 0, fmt.Errorf("check pending S3 upload for %s: %w", name, err)
@@ -499,6 +537,25 @@ func hasPendingS3Upload(ctx context.Context, db *sql.DB, partition, bintrailID s
 		return false, err
 	}
 	return pending, nil
+}
+
+// indexHasArchives reports whether archive_state contains any rows at all —
+// i.e. whether anything has ever archived partitions of this index.
+func indexHasArchives(ctx context.Context, db *sql.DB) (bool, error) {
+	var has bool
+	err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM archive_state)`).Scan(&has)
+	return has, err
+}
+
+// partitionArchived reports whether archive_state records a local archive for
+// the partition under any bintrail_id. Completed-S3 status is checked
+// separately by hasPendingS3Upload.
+func partitionArchived(ctx context.Context, db *sql.DB, partition string) (bool, error) {
+	var has bool
+	err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM archive_state WHERE partition_name = ?)`,
+		partition).Scan(&has)
+	return has, err
 }
 
 // fileExists reports whether a file exists and has a size greater than zero.

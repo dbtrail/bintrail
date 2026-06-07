@@ -410,6 +410,18 @@ bintrail recover
 
 ---
 
+## Built-in Rotation in `bintrail up`
+
+`bintrail up` runs a built-in rotation loop **by default**: every hour it drops index partitions older than 30 days and keeps 3 future hourly partitions ready. It covers the boot index database *and* every per-source database the console control plane provisions (`bintrail_idx_<entry>`), so an unattended quickstart can never grow until the disk fills. The settings are announced loudly at boot.
+
+```sh
+bintrail up ... --rotate-retain 90d        # keep more history
+bintrail up ... --rotate-retain off        # disable entirely
+BINTRAIL_ROTATE_RETAIN=7d bintrail up ...  # env form (also _INTERVAL, _ADD_FUTURE)
+```
+
+**Safety guard**: the built-in rotation never archives, so it defers to any archiving flow it detects. If `archive_state` shows the index has *ever* been archived (e.g. your own `rotate --archive-dir` cron), the built-in loop only drops partitions that are already archived — partitions past retention but not yet archived are left for your cron, with a warning logged. An index with no archiving history rotates unconditionally (the bounded-volume quickstart behavior). The explicit `bintrail rotate` command is unaffected: it keeps its unguarded, operator-asked-for-it semantics.
+
 ## Automating Rotation
 
 In production, run `bintrail rotate` from an hourly cron job or systemd timer. A typical setup:

@@ -317,14 +317,121 @@ func TestPerformRotation_BulkDropSkipsPendingS3(t *testing.T) {
 	}
 }
 
+// ─── protect-unarchived guard (built-in `up` rotation, #420) ─────────────────
+
+// TestPerformRotation_ProtectUnarchivedDefers verifies that when
+// rotProtectUnarchived is set (the built-in `up` rotation) and the index has
+// archiving history, only already-archived partitions are dropped — a
+// partition past retention but missing from archive_state is deferred to the
+// external archiving flow rather than destroyed.
+func TestPerformRotation_ProtectUnarchivedDefers(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	h2 := h1.Add(time.Hour)
+	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ts2, nil, "testdb", "users", 1, "2", nil, nil, []byte(`{"id":2}`))
+
+	savedVars := saveRotateVars()
+	t.Cleanup(func() { restoreRotateVars(savedVars) })
+
+	// Built-in rotation profile: no archive flags, protection on.
+	rotArchiveDir = ""
+	rotArchiveS3 = ""
+	rotBintrailID = ""
+	rotFormat = "text"
+	rotRetry = false
+	rotNoReplace = true
+	rotAddFuture = 0
+	rotProtectUnarchived = true
+
+	// Archiving history exists: h2 was archived (local-only, no S3) by an
+	// external flow; h1 was not archived yet.
+	testutil.MustExec(t, db, `INSERT INTO archive_state
+		(partition_name, bintrail_id, local_path, row_count)
+		VALUES (?, 'cron-uuid', '/archives/p2.parquet', 1)`,
+		partitionName(h2))
+
+	dropped, _, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("performRotation failed: %v", err)
+	}
+	if dropped != 1 {
+		t.Errorf("expected 1 partition dropped (archived h2 only), got %d", dropped)
+	}
+
+	partitions, err := listPartitions(context.Background(), db, dbName)
+	if err != nil {
+		t.Fatalf("listPartitions: %v", err)
+	}
+	var foundP1, foundP2 bool
+	for _, p := range partitions {
+		if p.Name == partitionName(h1) {
+			foundP1 = true
+		}
+		if p.Name == partitionName(h2) {
+			foundP2 = true
+		}
+	}
+	if !foundP1 {
+		t.Errorf("partition %s should NOT have been dropped (past retention but unarchived)", partitionName(h1))
+	}
+	if foundP2 {
+		t.Errorf("partition %s should have been dropped (already archived)", partitionName(h2))
+	}
+}
+
+// TestPerformRotation_ProtectUnarchivedNoHistoryDropsAll verifies the guard's
+// other half: an index with NO archiving history at all (empty archive_state —
+// the quickstart world) rotates freely even under rotProtectUnarchived, which
+// is what keeps an unattended bundled volume bounded.
+func TestPerformRotation_ProtectUnarchivedNoHistoryDropsAll(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	h2 := h1.Add(time.Hour)
+	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ts2, nil, "testdb", "users", 1, "2", nil, nil, []byte(`{"id":2}`))
+
+	savedVars := saveRotateVars()
+	t.Cleanup(func() { restoreRotateVars(savedVars) })
+
+	rotArchiveDir = ""
+	rotArchiveS3 = ""
+	rotBintrailID = ""
+	rotFormat = "text"
+	rotRetry = false
+	rotNoReplace = true
+	rotAddFuture = 0
+	rotProtectUnarchived = true
+
+	dropped, _, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("performRotation failed: %v", err)
+	}
+	if dropped != 2 {
+		t.Errorf("expected 2 partitions dropped (no archiving history), got %d", dropped)
+	}
+}
+
 // ─── test helpers ────────────────────────────────────────────────────────────
 
 type rotateVarSnapshot struct {
 	indexDSN, retain, archiveDir, archiveCompression string
-	bintrailID, archiveS3, archiveS3Region          string
+	bintrailID, archiveS3, archiveS3Region           string
 	format, interval                                 string
 	addFuture                                        int
-	noReplace, daemon, retry                         bool
+	noReplace, daemon, retry, protectUnarchived      bool
 }
 
 func saveRotateVars() rotateVarSnapshot {
@@ -342,6 +449,7 @@ func saveRotateVars() rotateVarSnapshot {
 		noReplace:          rotNoReplace,
 		daemon:             rotDaemon,
 		retry:              rotRetry,
+		protectUnarchived:  rotProtectUnarchived,
 	}
 }
 
@@ -359,4 +467,5 @@ func restoreRotateVars(s rotateVarSnapshot) {
 	rotNoReplace = s.noReplace
 	rotDaemon = s.daemon
 	rotRetry = s.retry
+	rotProtectUnarchived = s.protectUnarchived
 }

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`bintrail up` now rotates the index by default** (#420): a built-in loop drops partitions older than `--rotate-retain` (default `30d`) every `--rotate-interval` (default `1h`) and keeps `--rotate-add-future` (default 3) future hourly partitions ready — on the boot index database and on every per-source database the control plane provisions. Previously an unattended `up` (the compose quickstart) grew the index unbounded until the volume filled, taking the forensic record with it. The settings are announced loudly at boot; disable with `--rotate-retain off` (or `BINTRAIL_ROTATE_RETAIN=off`). **Safety guard**: if the index has any archiving history (`archive_state` rows — e.g. your own `rotate --archive-dir` cron), the built-in rotation only drops partitions that are already archived and defers the rest to your archiving flow — it is never the first to destroy unarchived data. The explicit `bintrail rotate` command is unchanged.
+
 ## [0.8.6] - 2026-06-07
 
 ### Fixed

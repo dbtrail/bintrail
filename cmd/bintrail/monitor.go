@@ -492,6 +492,24 @@ func (m *monitorSupervisor) Stop(ctx context.Context, entryID string) error {
 	return nil
 }
 
+// ActiveIndexDSNs returns the per-source index DSNs of every supervised job.
+// The built-in `up` rotation uses it to cover the databases the control plane
+// provisions (bintrail_idx_<entry>) in addition to the boot index DB. Jobs in
+// every state are included: a crash-looping stream's database still ages past
+// retention, and a DSN whose database is mid-provisioning merely logs one
+// transient rotation warning and self-heals next tick.
+func (m *monitorSupervisor) ActiveIndexDSNs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.jobs))
+	for _, j := range m.jobs {
+		if j.indexDSN != "" {
+			out = append(out, j.indexDSN)
+		}
+	}
+	return out
+}
+
 // Status implements console.MonitorController.
 func (m *monitorSupervisor) Status(entryID string) console.MonitorStatus {
 	m.mu.Lock()

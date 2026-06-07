@@ -10,6 +10,29 @@ import (
 	"github.com/dbtrail/bintrail/internal/console"
 )
 
+// ─── built-in rotation DSN provider (#420) ───────────────────────────────────
+
+func TestActiveIndexDSNs(t *testing.T) {
+	m := &monitorSupervisor{
+		jobs: map[string]*monitorJob{
+			"a": {indexDSN: "root@tcp(idx:3306)/bintrail_idx_a"},
+			"b": {indexDSN: "root@tcp(idx:3306)/bintrail_idx_b"},
+			"c": {indexDSN: ""}, // never published a DSN — skipped
+		},
+	}
+	got := m.ActiveIndexDSNs()
+	if len(got) != 2 {
+		t.Fatalf("ActiveIndexDSNs returned %d DSNs, want 2: %v", len(got), got)
+	}
+	seen := map[string]bool{}
+	for _, dsn := range got {
+		seen[dsn] = true
+	}
+	if !seen["root@tcp(idx:3306)/bintrail_idx_a"] || !seen["root@tcp(idx:3306)/bintrail_idx_b"] {
+		t.Errorf("ActiveIndexDSNs missing expected DSNs: %v", got)
+	}
+}
+
 // ─── derived monitor states (#402) ───────────────────────────────────────────
 
 func TestMonitorJobSnapshot_stalledDerivation(t *testing.T) {

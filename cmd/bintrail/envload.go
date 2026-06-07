@@ -54,6 +54,9 @@ var envBindings = []envBinding{
 	{"max-reconnect-attempts", "BINTRAIL_AGENT_MAX_RECONNECT_ATTEMPTS"},
 	{"column-eq", "BINTRAIL_COLUMN_EQ"},
 	{"auth-method", "BINTRAIL_AUTH_METHOD"},
+	{"rotate-retain", "BINTRAIL_ROTATE_RETAIN"},
+	{"rotate-interval", "BINTRAIL_ROTATE_INTERVAL"},
+	{"rotate-add-future", "BINTRAIL_ROTATE_ADD_FUTURE"},
 }
 
 var envOnce sync.Once
