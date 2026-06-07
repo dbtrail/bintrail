@@ -119,6 +119,25 @@ func TestBuildDoctorReport_includesCapacityCheck(t *testing.T) {
 	}
 }
 
+// TestCheckIndexCapacity_queryErrorFails: a real query error must FAIL with
+// remediation like every sibling check — a SKIP would let the operator
+// believe capacity was covered when it wasn't. A cancelled context turns the
+// partition-statistics query into an error (the connect itself is lazy).
+func TestCheckIndexCapacity_queryErrorFails(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := checkIndexCapacity(ctx, testutil.IntegrationDSN(dbName), dbName, 30*24*time.Hour)
+	if r.Status != statusFail {
+		t.Fatalf("status = %s, want fail on a query error (detail: %s)", r.Status, r.Detail)
+	}
+	if r.Remediation == "" {
+		t.Error("query-error FAIL must carry remediation")
+	}
+}
+
 // TestCheckIndexCapacity_uninitializedIndexExplainsItself: zero visible
 // partitions must disambiguate "not initialized / not visible" from "fresh
 // but initialized" — never tell the operator to wait for a table that will

@@ -34,6 +34,13 @@ var (
 // the free space outright.
 const capWarnFraction = 0.7
 
+// capFreeFloorDays: independent of remaining growth, WARN when the free
+// space is under this many days of the measured GROSS write rate. At steady
+// state remaining≈0 so the remaining-growth thresholds go quiet — but a
+// nearly-full volume there still has zero margin for a rotation stall or a
+// write spike, and the operator should hear it.
+const capFreeFloorDays = 3.0
+
 // capacityCheckName is the check's display name — shared with `up`'s
 // preflight, which treats this check as advisory (see runUp).
 const capacityCheckName = "Index disk capacity"
@@ -131,7 +138,7 @@ func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, fr
 	}
 
 	switch {
-	case remaining >= float64(free):
+	case remaining > 0 && remaining >= float64(free):
 		return checkResult{
 			Name:   capacityCheckName,
 			Status: statusFail,
@@ -141,6 +148,17 @@ func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, fr
 				"  bintrail rotate --index-dsn \"...\" --retain 7d --no-replace   # DROP PARTITION reclaims space instantly\n" +
 				"(archive first with --archive-dir to keep the history). Then grow the volume or lower --rotate-retain.\n" +
 				"Emergency recipe: docs/deployment.md §12; sizing math: docs/capacity.md",
+		}
+	case float64(free) < capFreeFloorDays*growthPerDay:
+		// Steady state quiets the remaining-growth thresholds, but a
+		// nearly-full volume has no margin for a rotation stall or a spike.
+		return checkResult{
+			Name:   capacityCheckName,
+			Status: statusWarn,
+			Detail: fmt.Sprintf("%s; only %s free — under ~%.0f days of the measured write rate (~%s/day): a rotation stall or a write spike fills the disk",
+				projected, humanBytes(float64(free)), capFreeFloorDays, humanBytes(growthPerDay)),
+			Remediation: "Grow the index volume or shorten the retention window (--rotate-retain / `bintrail rotate --retain`).\n" +
+				"Sizing math: docs/capacity.md",
 		}
 	case remaining >= capWarnFraction*float64(free):
 		return checkResult{
@@ -189,7 +207,16 @@ func checkIndexCapacity(ctx context.Context, dsn, dbName string, retain time.Dur
 		// binlog_events not visible (pre-init, or a privilege gap) vs a
 		// freshly-initialized empty index. Disambiguate so the SKIP advice
 		// is never "re-run later" for a table that will never appear.
-		if !tableVisible(ctx, db, dbName, "binlog_events") {
+		visible, err := tableVisible(ctx, db, dbName, "binlog_events")
+		if err != nil {
+			return checkResult{
+				Name:        capacityCheckName,
+				Status:      statusFail,
+				Detail:      "cannot check binlog_events visibility: " + err.Error(),
+				Remediation: queryErrorRemediation("information_schema.TABLES"),
+			}
+		}
+		if !visible {
 			return checkResult{
 				Name:   capacityCheckName,
 				Status: statusSkip,
@@ -212,13 +239,18 @@ func checkIndexCapacity(ctx context.Context, dsn, dbName string, retain time.Dur
 
 // tableVisible reports whether the table exists AND is visible to this user
 // (information_schema filters by privilege rather than erroring, so absent
-// and invisible look identical — the caller's message covers both).
-func tableVisible(ctx context.Context, db *sql.DB, dbName, table string) bool {
+// and invisible look identical — the caller's message covers both). A query
+// error is returned, not folded into false: "not initialized" would be
+// mis-advice for a transient failure.
+func tableVisible(ctx context.Context, db *sql.DB, dbName, table string) (bool, error) {
 	var found bool
 	err := db.QueryRowContext(ctx,
 		`SELECT EXISTS (SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?)`,
 		dbName, table).Scan(&found)
-	return err == nil && found
+	if err != nil {
+		return false, err
+	}
+	return found, nil
 }
 
 // loadPartitionSamples reads per-partition row/size estimates for

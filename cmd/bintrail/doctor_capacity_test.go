@@ -155,9 +155,16 @@ func TestCapacityVerdict_thresholds(t *testing.T) {
 		// its projection — comparing the TOTAL against free would
 		// double-count and spuriously FAIL a healthy deployment on restart.
 		{"steady state: tiny remaining growth, modest free", 700_000_000, 680_000_000, statusPass}, // remaining 20 MB
-		{"steady state: table larger than projection (rate dropped)", 800_000_000, 50_000_000, statusPass},
-		{"mature: remaining growth exceeds free", 300_000_000, 400_000_000, statusFail},     // remaining 420 MB
-		{"mature: remaining growth over 70% of free", 300_000_000, 500_000_000, statusWarn}, // 420/500 = 84%
+		{"mature: remaining growth exceeds free", 300_000_000, 400_000_000, statusFail},            // remaining 420 MB
+		{"mature: remaining growth over 70% of free", 300_000_000, 500_000_000, statusWarn},        // 420/500 = 84%
+
+		// Free-space floor (growthPerDay = 24 MB/day → floor = 72 MB): the
+		// remaining-growth thresholds go quiet at steady state, but a
+		// nearly-full volume still deserves a WARN — and the floor replaces
+		// the nonsensical "~0 B EXCEEDS 0 B free" FAIL on a full disk.
+		{"steady state: volume nearly full", 720_000_000, 10_000_000, statusWarn},
+		{"steady state: rate dropped, under 3 days of free", 800_000_000, 50_000_000, statusWarn},
+		{"steady state: disk completely full", 720_000_000, 0, statusWarn},
 	}
 	for _, tc := range cases {
 		// Projection: 24000 events/day × 1000 B × 30d = 720 MB total.
@@ -203,6 +210,36 @@ func TestSameHostname(t *testing.T) {
 		if got := sameHostname(tc.a, tc.b); got != tc.want {
 			t.Errorf("sameHostname(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
 		}
+	}
+}
+
+// TestUpPreflightOutcome pins up's advisory semantics: a capacity-only FAIL
+// must not block boot but MUST surface the warning — losing either half
+// would silently change what blocks `up` or swallow the operator's only
+// disk-full signal.
+func TestUpPreflightOutcome(t *testing.T) {
+	clean := &doctorReport{}
+	clean.add(checkResult{Name: "log_bin enabled", Status: statusPass})
+	if fatal, warn := upPreflightOutcome(clean); fatal != nil || warn {
+		t.Errorf("clean report: (fatal=%v, warn=%v), want (nil, false)", fatal, warn)
+	}
+
+	capOnly := &doctorReport{}
+	capOnly.add(checkResult{Name: capacityCheckName, Status: statusFail})
+	capOnly.add(checkResult{Name: "log_bin enabled", Status: statusPass})
+	fatal, warn := upPreflightOutcome(capOnly)
+	if fatal != nil {
+		t.Errorf("capacity-only FAIL must not block boot, got fatal=%v", fatal)
+	}
+	if !warn {
+		t.Error("capacity-only FAIL must surface the warning — the operator's only disk-full signal")
+	}
+
+	mixed := &doctorReport{}
+	mixed.add(checkResult{Name: capacityCheckName, Status: statusFail})
+	mixed.add(checkResult{Name: "binlog_format=ROW", Status: statusFail})
+	if fatal, _ := upPreflightOutcome(mixed); fatal == nil {
+		t.Error("a non-advisory FAIL must block boot regardless of the capacity check")
 	}
 }
 

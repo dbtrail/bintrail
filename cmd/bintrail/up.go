@@ -154,10 +154,11 @@ func runUp(cmd *cobra.Command, args []string) error {
 		if err := preflight.Write(os.Stderr, "text"); err != nil {
 			return fmt.Errorf("write preflight report: %w", err)
 		}
-		if err := preflight.ErrExcluding(capacityCheckName); err != nil {
-			return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", err)
+		fatal, warnCapacity := upPreflightOutcome(preflight)
+		if fatal != nil {
+			return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", fatal)
 		}
-		if preflight.Err() != nil {
+		if warnCapacity {
 			fmt.Fprintln(os.Stderr, "WARNING: the index disk capacity check FAILED — starting anyway (capturing beats not capturing), but act on its remediation before the volume fills.")
 		}
 		fmt.Fprintln(os.Stderr)
@@ -177,6 +178,19 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Fprintln(os.Stderr, "=== Phase 3/3: Streaming ===")
 	return runUpStream(cmd, args)
+}
+
+// upPreflightOutcome maps the preflight report to up's boot decision: fatal
+// is non-nil for any non-advisory failure (boot refused); warnCapacity is
+// true when the capacity projection was the ONLY failure — boot proceeds,
+// but the operator must hear about it (the caller prints the WARNING).
+// Extracted so the advisory semantics are unit-testable: losing either half
+// would silently change what blocks `up` or swallow the disk-full signal.
+func upPreflightOutcome(r *doctorReport) (fatal error, warnCapacity bool) {
+	if err := r.ErrExcluding(capacityCheckName); err != nil {
+		return err, false
+	}
+	return nil, r.Err() != nil
 }
 
 // waitForIndexMySQL retries a server-level connection (database name
