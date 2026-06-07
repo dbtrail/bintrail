@@ -137,21 +137,31 @@ func TestCapacityVerdict_noRetention(t *testing.T) {
 }
 
 func TestCapacityVerdict_thresholds(t *testing.T) {
-	// Projection: 24000 events/day × 1000 B × 30d = 720 MB.
-	p := capacityProjection{eventsPerDay: 24000, bytesPerEvent: 1000, projectedBytes: 720_000_000}
 	retain := 30 * 24 * time.Hour
 
 	cases := []struct {
-		desc string
-		free uint64
-		want checkStatus
+		desc    string
+		current uint64
+		free    uint64
+		want    checkStatus
 	}{
-		{"projection exceeds free space", 700_000_000, statusFail},
-		{"projection at exactly free space", 720_000_000, statusFail},
-		{"projection over 70% of free", 1_000_000_000, statusWarn}, // 72%
-		{"comfortable headroom", 2_000_000_000, statusPass},        // 36%
+		// Fresh index (currentBytes 0): remaining growth == full projection.
+		{"fresh: projection exceeds free space", 0, 700_000_000, statusFail},
+		{"fresh: projection at exactly free space", 0, 720_000_000, statusFail},
+		{"fresh: projection over 70% of free", 0, 1_000_000_000, statusWarn}, // 72%
+		{"fresh: comfortable headroom", 0, 2_000_000_000, statusPass},        // 36%
+
+		// Mature index at steady state: the table already occupies most of
+		// its projection — comparing the TOTAL against free would
+		// double-count and spuriously FAIL a healthy deployment on restart.
+		{"steady state: tiny remaining growth, modest free", 700_000_000, 680_000_000, statusPass}, // remaining 20 MB
+		{"steady state: table larger than projection (rate dropped)", 800_000_000, 50_000_000, statusPass},
+		{"mature: remaining growth exceeds free", 300_000_000, 400_000_000, statusFail},     // remaining 420 MB
+		{"mature: remaining growth over 70% of free", 300_000_000, 500_000_000, statusWarn}, // 420/500 = 84%
 	}
 	for _, tc := range cases {
+		// Projection: 24000 events/day × 1000 B × 30d = 720 MB total.
+		p := capacityProjection{eventsPerDay: 24000, bytesPerEvent: 1000, projectedBytes: 720_000_000, currentBytes: tc.current}
 		r := capacityVerdict(p, retain, tc.free, true)
 		if r.Status != tc.want {
 			t.Errorf("%s: status = %s, want %s (detail: %s)", tc.desc, r.Status, tc.want, r.Detail)
@@ -159,6 +169,59 @@ func TestCapacityVerdict_thresholds(t *testing.T) {
 		if (tc.want == statusFail || tc.want == statusWarn) && r.Remediation == "" {
 			t.Errorf("%s: %s must carry remediation", tc.desc, tc.want)
 		}
+	}
+}
+
+func TestParseDocRetain(t *testing.T) {
+	for _, s := range []string{"off", "0", ""} {
+		d, err := parseDocRetain(s)
+		if err != nil || d != 0 {
+			t.Errorf("parseDocRetain(%q) = (%v, %v), want (0, nil)", s, d, err)
+		}
+	}
+	if d, err := parseDocRetain("7d"); err != nil || d != 7*24*time.Hour {
+		t.Errorf("parseDocRetain(7d) = (%v, %v), want 168h", d, err)
+	}
+	if _, err := parseDocRetain("banana"); err == nil {
+		t.Error("parseDocRetain(banana) must error")
+	}
+}
+
+func TestSameHostname(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"db01", "db01", true},
+		{"DB01", "db01", true},
+		{"db01.local", "db01", true},
+		{"db01", "db01.internal.corp", true},
+		{"db01", "db02", false},
+		{"index-mysql", "MacBook", false},
+	}
+	for _, tc := range cases {
+		if got := sameHostname(tc.a, tc.b); got != tc.want {
+			t.Errorf("sameHostname(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestDoctorReportErrExcluding(t *testing.T) {
+	r := &doctorReport{}
+	r.add(checkResult{Name: "Index disk capacity", Status: statusFail})
+	r.add(checkResult{Name: "log_bin enabled", Status: statusPass})
+
+	if r.Err() == nil {
+		t.Error("Err must report the capacity failure")
+	}
+	if err := r.ErrExcluding(capacityCheckName); err != nil {
+		t.Errorf("ErrExcluding(capacity) = %v, want nil — capacity is advisory in up's preflight", err)
+	}
+
+	// A non-advisory failure still blocks.
+	r.add(checkResult{Name: "binlog_format=ROW", Status: statusFail})
+	if r.ErrExcluding(capacityCheckName) == nil {
+		t.Error("ErrExcluding must still report non-advisory failures")
 	}
 }
 

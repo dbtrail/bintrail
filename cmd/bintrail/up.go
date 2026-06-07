@@ -144,9 +144,21 @@ func runUp(cmd *cobra.Command, args []string) error {
 	} else if !upSkipDoctor {
 		fmt.Fprintln(os.Stderr, "=== Phase 1/3: Preflight checks ===")
 		// The capacity projection uses up's actual rotation window (0 when
-		// built-in rotation is disabled → it reports unbounded growth).
-		if err := runDoctorTo(cmd.Context(), os.Stderr, "text", upSourceDSN, upIndexDSN, upSchemas, upRotationCfg.retain); err != nil {
+		// built-in rotation is disabled → it reports unbounded growth). Its
+		// FAIL is ADVISORY here: blocking the stream over a disk forecast
+		// would manufacture the very forensic gap it warns about (an
+		// unattended reboot would crash-loop instead of capturing while
+		// there is still room). Standalone `doctor` keeps full FAIL
+		// semantics for CI.
+		preflight := buildDoctorReport(cmd.Context(), upSourceDSN, upIndexDSN, upSchemas, upRotationCfg.retain)
+		if err := preflight.Write(os.Stderr, "text"); err != nil {
+			return fmt.Errorf("write preflight report: %w", err)
+		}
+		if err := preflight.ErrExcluding(capacityCheckName); err != nil {
 			return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", err)
+		}
+		if preflight.Err() != nil {
+			fmt.Fprintln(os.Stderr, "WARNING: the index disk capacity check FAILED — starting anyway (capturing beats not capturing), but act on its remediation before the volume fills.")
 		}
 		fmt.Fprintln(os.Stderr)
 	}

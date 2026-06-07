@@ -92,18 +92,26 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	if !cliutil.IsValidOutputFormat(docFormat) {
 		return fmt.Errorf("invalid --format %q; must be text or json", docFormat)
 	}
-	var retain time.Duration
-	switch docRetain {
-	case "off", "0", "":
-		// 0 = no rotation: the capacity check reports unbounded growth.
-	default:
-		var err error
-		retain, err = parseRetain(docRetain)
-		if err != nil {
-			return fmt.Errorf("--retain: %w (or \"off\" if you don't rotate)", err)
-		}
+	retain, err := parseDocRetain(docRetain)
+	if err != nil {
+		return err
 	}
 	return runDoctorTo(cmd.Context(), os.Stdout, docFormat, docSourceDSN, docIndexDSN, docSchemas, retain)
+}
+
+// parseDocRetain maps doctor's --retain value to the capacity projection's
+// window: "off", "0", and "" mean no rotation (0 — the check reports
+// unbounded growth); anything else must parse as Nd/Nh.
+func parseDocRetain(s string) (time.Duration, error) {
+	switch s {
+	case "off", "0", "":
+		return 0, nil
+	}
+	retain, err := parseRetain(s)
+	if err != nil {
+		return 0, fmt.Errorf("--retain: %w (or \"off\" if you don't rotate)", err)
+	}
+	return retain, nil
 }
 
 // binlogRetentionMinSeconds is the minimum binlog retention bintrail asks for
@@ -837,6 +845,35 @@ func (r *doctorReport) Write(w io.Writer, format string) error {
 func (r *doctorReport) Err() error {
 	if r.Failed > 0 {
 		return fmt.Errorf("%d preflight check(s) failed", r.Failed)
+	}
+	return nil
+}
+
+// ErrExcluding is Err but ignoring failures of the named advisory checks.
+// `up`'s preflight uses it for the capacity projection: refusing to boot the
+// stream over a disk forecast would manufacture the very forensic gap the
+// check warns about — an unattended host reboot would crash-loop instead of
+// capturing while there is still room. The standalone `doctor` command keeps
+// full FAIL semantics (CI smoke tests SHOULD go red on a capacity overrun).
+func (r *doctorReport) ErrExcluding(advisory ...string) error {
+	failed := 0
+	for _, c := range r.Checks {
+		if c.Status != statusFail {
+			continue
+		}
+		isAdvisory := false
+		for _, name := range advisory {
+			if c.Name == name {
+				isAdvisory = true
+				break
+			}
+		}
+		if !isAdvisory {
+			failed++
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d preflight check(s) failed", failed)
 	}
 	return nil
 }
