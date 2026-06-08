@@ -68,7 +68,7 @@ requires the token from the URL.
 > back up its volumes** (lose them and you re-index from scratch). bintrail
 > **ships** that MySQL but does not **operate** it: disk, backups, and
 > upgrades are yours. Prefer your own? Set `INDEX_DSN` in `.env` to a MySQL
-> 8.0+ **you** run and remove the bundled service — bintrail installs only its
+> 8.0+ **you** run and remove the bundled index services — bintrail installs only its
 > tables there, never operating the server. Either way, what's supported on
 > each side is spelled out in [SUPPORT.md](SUPPORT.md); for an index that's
 > operated for you, that's [dbtrail](https://dbtrail.com).

@@ -79,7 +79,8 @@ The boundary triage cites:
   `bintrail-index-data` + `bintrail-index-secret` volumes together). dbtrail
   operates it for you in the paid tier.
 - **BYO stays co-equal.** Set `INDEX_DSN` in `.env` to a MySQL 8.0+ you run
-  and remove the bundled service — same ship-vs-operate split, your server.
+  and remove the bundled `index-init` + `index-mysql` services (see
+  [docker.md](docs/docker.md)) — same ship-vs-operate split, your server.
 
 ## Reporting issues
 
