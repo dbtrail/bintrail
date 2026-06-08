@@ -51,9 +51,10 @@ services:
     image: ghcr.io/dbtrail/bintrail:${BINTRAIL_TAG:-latest}
     # Runs as root: a freshly-created named volume is root-owned, and the
     # bintrail image otherwise runs as a non-root user that couldn't write it.
-    # The secret is left world-readable (0644) so the non-root bintrail process
-    # and the mysql entrypoint can both read it — it never leaves these
-    # containers on a private Docker network.
+    # The secret is then chowned to uid 999 mode 0600 — both the bintrail
+    # process and mysqld run as uid 999 (same number, different name), so the
+    # owner-only file is readable by both, and the index-mysql healthcheck /
+    # entrypoint read it as root (which bypasses the mode). Not world-readable.
     user: "0:0"
     environment:
       INDEX_MYSQL_ROOT_PASSWORD: ${INDEX_MYSQL_ROOT_PASSWORD:-}
@@ -74,7 +75,8 @@ services:
         # failed od/urandom would leave an EMPTY file. Refuse a blank password
         # rather than let MySQL refuse to initialize with a confusing error.
         if [ ! -s "$$f" ]; then echo "FATAL: failed to write the index password" >&2; rm -f "$$f"; exit 1; fi
-        chmod 0644 "$$f"
+        chown 999:999 "$$f"
+        chmod 0600 "$$f"
     volumes:
       - bintrail-index-secret:/secret
 
