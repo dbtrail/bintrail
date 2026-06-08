@@ -183,16 +183,22 @@ reset out of sync with `bintrail-index-data` — reset both together.
 
 **Upgrading from a pre-8.4 bundled index** — the old eval index used a
 `mysql:8.0` container on the `index-mysql-data` volume. The new compose uses a
-**new** `bintrail-index-data` volume on 8.4 (an 8.4 server auto-upgrades an
-8.0 datadir irreversibly, so reusing the old volume is deliberately avoided).
-Your old volume is left untouched; bintrail re-indexes into the new one from
-the source's binlogs — the bundled index was always "volume loss = re-index".
-To carry the old data instead, `mysqldump` from the old volume and reload, or
-switch to a BYO index.
+**new** `bintrail-index-data` volume on 8.4 and leaves the old one untouched,
+so by default bintrail simply re-indexes into the fresh 8.4 volume from the
+source's binlogs (the bundled index was always "volume loss = re-index").
 
-### Connecting to an external index MySQL (the production track)
+> ⚠️ **The 8.4 datadir is non-downgradable.** A MySQL 8.4 server started on an
+> 8.0 datadir runs an in-place upgrade automatically and **irreversibly** —
+> you cannot go back to 8.0 afterward. That is exactly why the new volume name
+> is used instead of reusing `index-mysql-data`: your old 8.0 data stays
+> recoverable. To carry the old data forward deliberately, `mysqldump` from the
+> old `index-mysql-data` volume and reload into the new one (a logical
+> dump/restore, not an in-place datadir upgrade), or point `INDEX_DSN` at a BYO
+> index instead.
 
-For production, set `INDEX_DSN` in `.env` to a MySQL 8.0+ you operate and
+### Connecting to an external index MySQL (bring your own)
+
+To run your own index instead of the bundled 8.4, set `INDEX_DSN` in `.env` to a MySQL 8.0+ you operate and
 remove the bundled index from the compose file: delete the `index-init` and
 `index-mysql` services, the `bintrail-index-data` / `bintrail-index-secret`
 volumes, the `bintrail-index-secret` mount and the `depends_on: index-mysql`

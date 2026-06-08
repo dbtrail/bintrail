@@ -63,14 +63,15 @@ Watching events within the minute, and the terminal is already behind you.
 The console binds to your machine only (`127.0.0.1`) and every request
 requires the token from the URL.
 
-> The compose stack ships with its own small MySQL container, which
-> bintrail uses to store the index. That's fine for **trying bintrail out**,
-> but don't rely on it in production: if its Docker volume is lost, the
-> index is gone and you have to re-index from scratch. For production, set
-> `INDEX_DSN` in `.env` to a MySQL server **you** run and back up. bintrail
-> creates its tables there and nothing more — it never installs or operates
-> the database server itself. What's supported on each side is spelled out
-> in [SUPPORT.md](SUPPORT.md).
+> The compose stack ships a pinned **MySQL 8.4** container as the index store.
+> That index holds the forensic record — **it is your system of record, so
+> back up its volumes** (lose them and you re-index from scratch). bintrail
+> **ships** that MySQL but does not **operate** it: disk, backups, and
+> upgrades are yours. Prefer your own? Set `INDEX_DSN` in `.env` to a MySQL
+> 8.0+ **you** run and remove the bundled service — bintrail installs only its
+> tables there, never operating the server. Either way, what's supported on
+> each side is spelled out in [SUPPORT.md](SUPPORT.md); for an index that's
+> operated for you, that's [dbtrail](https://dbtrail.com).
 >
 > **Other ways to install** — plain Docker, `.deb`/`.rpm`, `go install`,
 > source builds, and the binary quickstart: see **[docs/install.md](docs/install.md)**.

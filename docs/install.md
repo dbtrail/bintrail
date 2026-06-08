@@ -15,7 +15,7 @@ it's the first section — the same four lines as the README.
   bundles one).
 - Go 1.24+ — only when building from source.
 
-## Docker Compose (recommended for evaluation and first contact)
+## Docker Compose (the bundled default)
 
 One file, zero config — an index MySQL (persisted in a volume) and
 `bintrail up --console` in source-less daemon mode: the console plus the
@@ -46,17 +46,21 @@ the container restarts.
 Prefer to start streaming one source immediately at boot? Set `SOURCE_DSN`
 in a `.env` next to the compose file — that's optional now, not required.
 
-**The bundled index MySQL is evaluation-grade**: a single unreplicated
-volume, default credentials, no backup story — volume loss means
-re-indexing. It exists so the four lines above need zero prerequisites.
+**The bundled index is a pinned MySQL 8.4** with a generated password — it
+holds the forensic record, so **it is your system of record, not a throwaway:
+back up its volumes** (`bintrail-index-data` + `bintrail-index-secret`
+together; volume loss means re-indexing). bintrail **ships** that MySQL but
+does not **operate** it — disk, backups, and upgrades are yours, as is sizing
+(see [Capacity Planning](./capacity.md)). The ship-vs-operate boundary triage
+cites is [SUPPORT.md](../SUPPORT.md). See [docker.md](./docker.md) for the
+credential mechanism and the `8.0→8.4` upgrade note.
 
-**Production track — bring your own index MySQL** (co-equal path, not an
-afterthought): set `INDEX_DSN` in `.env` to a MySQL 8.0+ you operate, and
-remove the bundled `index-mysql` service. The index becomes your system of
-record: sizing, InnoDB tuning, and backups are yours to run — see
-[Capacity Planning](./capacity.md), [deployment.md §3](./deployment.md),
-and the support boundary in [SUPPORT.md](../SUPPORT.md). Bintrail installs and migrates only its schema
-on whatever server you point it at.
+**Bring your own index MySQL** (co-equal path, not an afterthought): set
+`INDEX_DSN` in `.env` to a MySQL 8.0+ you operate, and remove the bundled
+`index-init` + `index-mysql` services. Same split — bintrail installs and
+migrates only its schema on whatever server you point it at; the contract
+floor stays MySQL 8.0+ (only the *bundled* index is 8.4). Want it operated for
+you? That is [dbtrail](https://dbtrail.com).
 
 All the optional knobs (pinned console token, schema filter, image tag)
 live in
