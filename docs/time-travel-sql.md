@@ -179,7 +179,9 @@ The unit reads `BINTRAIL_INDEX_DSN` from `/etc/bintrail/.bintrail.env` (the same
 ExecStart=/usr/local/bin/bintrail shim --shim-config /etc/bintrail/shim.yaml --auth-method=caching_sha2_password
 ```
 
-Requires ProxySQL **2.7+** between the application and the shim — the LTS 2.6 line isn't verified to negotiate SHA2 against backends, so operators on 2.6 keep the default (`mysql_native_password`). The application user used by ProxySQL must match the chosen scheme: `IDENTIFIED WITH mysql_native_password BY '<password>'` for the default path, `IDENTIFIED WITH caching_sha2_password BY '<password>'` for the opt-in. `sha256_password` is also accepted by `--auth-method` if your environment requires it.
+Requires ProxySQL **2.7+** between the application and the shim — the LTS 2.6 line isn't verified to negotiate SHA2 against backends, so operators on 2.6 keep the default (`mysql_native_password`). The application user used by ProxySQL must match the chosen scheme: `IDENTIFIED WITH mysql_native_password BY '<password>'` for the default path, `IDENTIFIED WITH caching_sha2_password BY '<password>'` for the opt-in. `sha256_password` is also accepted by `--auth-method` if your environment requires it. The same 2.7+ requirement applies when ProxySQL fronts an **8.4 source** directly (its `caching_sha2_password` backend), set via `proxysql-config --backend-auth-plugin caching_sha2_password`.
+
+> **bintrail's own connections to MySQL 8.4 need no auth flag.** The ProxySQL requirement above is only about ProxySQL negotiating `caching_sha2_password` to a backend. bintrail's *index* connection (`--index-dsn`, go-sql-driver) and its *source replication* handshake (`bintrail stream`/`up`, go-mysql) both complete `caching_sha2_password` over a plaintext network on their own — the driver retrieves the server's public key for cold-cache full auth, with no flag, no TLS, and no ProxySQL in the path. This is what the bundled MySQL 8.4 index uses by default; CI exercises it against both 8.0 and 8.4.
 
 Enable and start:
 
