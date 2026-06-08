@@ -1,12 +1,13 @@
 //go:build integration
 
-package main
+package streamrun
 
 import (
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	drivermysql "github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/indexer"
@@ -289,16 +291,29 @@ func TestStreamLoop_liveReplication(t *testing.T) {
 		t.Skipf("skipping: cannot read binlog position: %v", err)
 	}
 
-	// Take schema snapshot into the index DB.
-	if _, err := ensureResolver(indexDB, sourceDB, []string{sourceName}); err != nil {
-		t.Fatalf("ensureResolver: %v", err)
+	// Take schema snapshot into the index DB. (The cmd-layer ensureResolver
+	// helper auto-snapshots-then-loads; here we only need the snapshot taken,
+	// since NewResolver(indexDB, 0) below loads it. Inlined so this engine test
+	// stays in package streamrun without importing the cmd layer.)
+	if _, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName}); err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
 	}
 
-	// Parse source DSN to get connection details for the syncer.
-	host, port, user, password, err := parseSourceDSN(testutil.IntegrationDSN(sourceName))
+	// Parse source DSN to get connection details for the syncer (inlined from
+	// the cmd-layer parseSourceDSN).
+	mc, err := drivermysql.ParseDSN(testutil.IntegrationDSN(sourceName))
 	if err != nil {
-		t.Fatalf("parseSourceDSN: %v", err)
+		t.Fatalf("ParseDSN: %v", err)
 	}
+	hostStr, portStr, err := net.SplitHostPort(mc.Addr)
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	portN, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		t.Fatalf("ParseUint(port): %v", err)
+	}
+	host, port, user, password := hostStr, uint16(portN), mc.User, mc.Passwd
 
 	// Insert rows so the streamer has something to receive.
 	for i := range 5 {
@@ -327,7 +342,7 @@ func TestStreamLoop_liveReplication(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
-	filters := buildIndexFilters(sourceName, "")
+	filters := parser.Filters{Schemas: map[string]bool{sourceName: true}}
 
 	sp := parser.NewStreamParser(resolver, filters, nil)
 	idx := indexer.New(indexDB, 100)

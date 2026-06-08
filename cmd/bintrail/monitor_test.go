@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/dbtrail/bintrail/internal/console"
+	"github.com/dbtrail/bintrail/internal/streamrun"
 )
 
 // ─── built-in rotation DSN provider (#420) ───────────────────────────────────
@@ -153,7 +154,7 @@ func TestMonitorRun_circuitBreakerGivesUp(t *testing.T) {
 	m := &monitorSupervisor{
 		baseCtx: ctx,
 		jobs:    map[string]*monitorJob{},
-		streamFn: func(context.Context, streamConfig) error {
+		streamFn: func(context.Context, streamrun.Config) error {
 			return errors.New("boom: cannot connect")
 		},
 	}
@@ -162,7 +163,7 @@ func TestMonitorRun_circuitBreakerGivesUp(t *testing.T) {
 	m.jobs["e1"] = job
 
 	m.wg.Add(1)
-	m.run(ctx, job, console.ServerEntry{ID: "e1", Name: "prod"}, streamConfig{})
+	m.run(ctx, job, console.ServerEntry{ID: "e1", Name: "prod"}, streamrun.Config{})
 
 	select {
 	case <-job.done:
@@ -188,13 +189,13 @@ func TestMonitorRun_cleanStopBypassesBreaker(t *testing.T) {
 	m := &monitorSupervisor{
 		baseCtx:  ctx,
 		jobs:     map[string]*monitorJob{},
-		streamFn: func(c context.Context, _ streamConfig) error { return c.Err() },
+		streamFn: func(c context.Context, _ streamrun.Config) error { return c.Err() },
 	}
 	job := &monitorJob{cancel: func() {}, done: make(chan struct{})}
 	job.set("pending", "")
 
 	m.wg.Add(1)
-	m.run(ctx, job, console.ServerEntry{ID: "e2", Name: "x"}, streamConfig{})
+	m.run(ctx, job, console.ServerEntry{ID: "e2", Name: "x"}, streamrun.Config{})
 
 	if st := job.snapshot(); st.State != "stopped" {
 		t.Fatalf("state = %q, want stopped on cancellation", st.State)
@@ -344,7 +345,7 @@ func TestMonitorRun_healthyRunResetsBreaker(t *testing.T) {
 	m := &monitorSupervisor{
 		baseCtx: ctx,
 		jobs:    map[string]*monitorJob{},
-		streamFn: func(c context.Context, _ streamConfig) error {
+		streamFn: func(c context.Context, _ streamrun.Config) error {
 			select {
 			case <-time.After(10 * time.Millisecond): // > monitorHealthyReset
 				return errors.New("flap")
@@ -357,7 +358,7 @@ func TestMonitorRun_healthyRunResetsBreaker(t *testing.T) {
 	job.set("pending", "")
 
 	m.wg.Add(1)
-	go m.run(ctx, job, console.ServerEntry{ID: "e3", Name: "flappy"}, streamConfig{})
+	go m.run(ctx, job, console.ServerEntry{ID: "e3", Name: "flappy"}, streamrun.Config{})
 
 	// Let it flap well past monitorGiveUpAfter in wall-clock time.
 	time.Sleep(150 * time.Millisecond)

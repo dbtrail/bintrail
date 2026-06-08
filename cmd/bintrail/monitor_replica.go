@@ -11,6 +11,7 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/console"
+	"github.com/dbtrail/bintrail/internal/streamrun"
 )
 
 // Replica / duplicate detection (#402): adding a replica of an already-
@@ -206,7 +207,7 @@ func classifyReplicaOverlap(candUUID, candExecuted, peerUUID, peerExecuted strin
 // gtidSetParseable reports whether a stored GTID set parses — callers use it
 // to tell "no overlap" apart from "could not even look".
 func gtidSetParseable(gtidSet string) bool {
-	_, err := gomysql.ParseMysqlGTIDSet(normalizeGTIDSet(gtidSet))
+	_, err := gomysql.ParseMysqlGTIDSet(streamrun.NormalizeGTIDSet(gtidSet))
 	return err == nil
 }
 
@@ -218,7 +219,7 @@ func gtidSetContainsUUID(gtidSet, serverUUID string) bool {
 	if gtidSet == "" || serverUUID == "" {
 		return false
 	}
-	parsed, err := gomysql.ParseMysqlGTIDSet(normalizeGTIDSet(gtidSet))
+	parsed, err := gomysql.ParseMysqlGTIDSet(streamrun.NormalizeGTIDSet(gtidSet))
 	if err != nil {
 		return false
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/console"
 	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/streamrun"
 )
 
 // monitorSupervisor is the control plane behind `bintrail up --console`: it
@@ -45,9 +46,9 @@ type monitorSupervisor struct {
 	// candidate source against them for replica/duplicate detection. May be
 	// nil (tests); the check is skipped then.
 	registry *console.Registry
-	// streamFn runs one supervised stream; a seam for unit tests, streamOne
+	// streamFn runs one supervised stream; a seam for unit tests, streamrun.One
 	// in production.
-	streamFn func(ctx context.Context, cfg streamConfig) error
+	streamFn func(ctx context.Context, cfg streamrun.Config) error
 
 	mu   sync.Mutex
 	jobs map[string]*monitorJob
@@ -141,8 +142,8 @@ func (j *monitorJob) markLostPosition(detail string) {
 }
 
 // streamHooks wires this job as its stream's liveness observer.
-func (j *monitorJob) streamHooks() *streamHooks {
-	return &streamHooks{
+func (j *monitorJob) streamHooks() *streamrun.Hooks {
+	return &streamrun.Hooks{
 		OnCheckpoint:     j.progress,
 		OnIndexed:        func(int64) { j.progress() },
 		OnGapAutoAdvance: j.markLostPosition,
@@ -183,7 +184,7 @@ func newMonitorSupervisor(baseCtx context.Context, bootIndexDSN string, reg *con
 		baseCtx:      baseCtx,
 		bootIndexDSN: bootIndexDSN,
 		registry:     reg,
-		streamFn:     streamOne,
+		streamFn:     streamrun.One,
 		jobs:         map[string]*monitorJob{},
 	}
 }
@@ -372,7 +373,7 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 			return fail(fmt.Errorf("derive server id: %w", err))
 		}
 	}
-	cfg := streamConfig{
+	cfg := streamrun.Config{
 		IndexDSN:  e.DSN,
 		SourceDSN: e.SourceDSN,
 		ServerID:  serverID,
@@ -387,6 +388,7 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 		Format:        "text",
 		GapTimeout:    30,
 		Hooks:         job.streamHooks(),
+		Deps:          streamDeps(),
 	}
 
 	m.wg.Add(1)
@@ -403,7 +405,7 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 // breaker: permanent "failed", no more retries, advisory lock released —
 // Start (or a daemon restart) re-arms it. Cancellation (stop verb / daemon
 // shutdown) exits cleanly.
-func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.ServerEntry, cfg streamConfig) {
+func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.ServerEntry, cfg streamrun.Config) {
 	defer m.wg.Done()
 	defer close(job.done)
 	defer func() {
