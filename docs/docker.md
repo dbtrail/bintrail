@@ -157,15 +157,43 @@ Notes:
   building from a source checkout instead is a comment-toggle in the
   compose file (`build: .`).
 
+### The bundled index MySQL 8.4
+
+The bundled index is **MySQL 8.4 LTS**, pinned to an exact minor tag. The
+container holds the binary; the data lives in a separate `bintrail-index-data`
+volume — bumping a minor version is "swap the container, keep the volume"
+(the PMM pattern). bintrail **ships** this MySQL but does not **operate** it:
+disk, backups, and upgrades are yours (for a managed, operated index, that is
+what [dbtrail](https://dbtrail.com) is). Support boundary: [SUPPORT.md](../SUPPORT.md).
+
+**Credentials** — no static default password. On the first `up`, the
+one-shot `index-init` service generates a random password into the
+`bintrail-index-secret` volume (or takes one from `INDEX_MYSQL_ROOT_PASSWORD`
+in `.env` if you set it *before* the first boot). Both the index MySQL and
+bintrail read it from there. The password is baked into the datadir at init,
+so `bintrail-index-data` and `bintrail-index-secret` are a pair: back them up
+together, and changing the password later means resetting both volumes.
+
+**Upgrading from a pre-8.4 bundled index** — the old eval index used a
+`mysql:8.0` container on the `index-mysql-data` volume. The new compose uses a
+**new** `bintrail-index-data` volume on 8.4 (an 8.4 server auto-upgrades an
+8.0 datadir irreversibly, so reusing the old volume is deliberately avoided).
+Your old volume is left untouched; bintrail re-indexes into the new one from
+the source's binlogs — the bundled index was always "volume loss = re-index".
+To carry the old data instead, `mysqldump` from the old volume and reload, or
+switch to a BYO index.
+
 ### Connecting to an external index MySQL (the production track)
 
-The bundled `index-mysql` container is evaluation-grade (single volume, no
-backups — volume loss = re-index). For production, set `INDEX_DSN` in
-`.env` to a MySQL 8.0+ you operate and remove the `index-mysql` service
-from the compose file. Bintrail installs only its schema there; the
-server's sizing, backups, and upgrades are yours — see
+For production, set `INDEX_DSN` in `.env` to a MySQL 8.0+ you operate and
+remove the bundled index from the compose file: delete the `index-init` and
+`index-mysql` services, the `bintrail-index-data` / `bintrail-index-secret`
+volumes, the `bintrail-index-secret` mount and the `depends_on: index-mysql`
+on the `bintrail` service. Bintrail installs only its schema on your server;
+its sizing, backups, and upgrades are yours — see
 [Capacity Planning](./capacity.md), [deployment.md](./deployment.md), and
-[SUPPORT.md](../SUPPORT.md).
+[SUPPORT.md](../SUPPORT.md). (The BYO contract floor stays MySQL **8.0+** —
+only the *bundled* index is 8.4.)
 
 ## Environment variables
 
@@ -175,7 +203,7 @@ server's sizing, backups, and upgrades are yours — see
 | `INDEX_DSN` | compose (optional) | Bring-your-own index MySQL (default: the bundled container) |
 | `SCHEMAS` | compose (optional) | Comma-separated schemas to track (empty = all user schemas) |
 | `CONSOLE_TOKEN` | compose (optional) | Pin the console access token (default: generated per boot) |
-| `INDEX_MYSQL_ROOT_PASSWORD` | compose (optional) | Root password for the bundled index MySQL |
+| `INDEX_MYSQL_ROOT_PASSWORD` | compose (optional) | Pin the bundled index root password (set *before* first boot; default: randomly generated into the `bintrail-index-secret` volume) |
 | `BINTRAIL_TAG` | compose (optional) | Image tag to run (default `latest`) |
 | `BINTRAIL_INDEX_DSN` | bintrail-mcp | Index DSN for the MCP server |
 

@@ -8,49 +8,99 @@
 # No .env needed. Optionally set SOURCE_DSN (start streaming one source
 # immediately) or CONSOLE_TOKEN (stable token across restarts) in a .env.
 #
-# What you get: an index MySQL (persisted in a volume), bintrail running
-# `up --console` against your source (preflight checks → index tables →
-# schema snapshot → live binlog stream), and the web console published on
-# http://127.0.0.1:8090 with the access token printed in the logs.
+# What you get: a bundled MySQL 8.4 index (persisted in a volume), bintrail
+# running `up --console` against your source (preflight → index tables →
+# schema snapshot → live binlog stream → built-in rotation), and the web
+# console on http://127.0.0.1:8090 with the access token printed in the logs.
 #
-# The bundled index-mysql is EVALUATION/QUICKSTART-GRADE: a single
-# unreplicated volume with default credentials and no backup story —
-# volume loss means re-indexing. For production, bring your own index
-# MySQL (set INDEX_DSN in .env) and operate it as the system of record
-# it becomes. Support boundary: SUPPORT.md.
+# ┌─ THE INDEX VOLUME IS YOUR SYSTEM OF RECORD ────────────────────────────┐
+# │ The bundled index holds the forensic record (binlog_events with full   │
+# │ before/after images). Its data lives in the `bintrail-index-data` +    │
+# │ `bintrail-index-secret` volumes — TREAT THEM AS ONE: back them up      │
+# │ together, and never reset one without the other (the generated         │
+# │ password is baked into the datadir at first boot and stored in the     │
+# │ secret volume; losing either breaks auth). Lose the data volume and    │
+# │ you re-index from the source's binlogs. bintrail SHIPS this MySQL but  │
+# │ does NOT operate it: disk, backups, and upgrades are yours — for a     │
+# │ managed, operated index, that is what dbtrail is. Support: SUPPORT.md. │
+# │ Bring your own instead: set INDEX_DSN in .env (see docs/docker.md).    │
+# └────────────────────────────────────────────────────────────────────────┘
 #
 # For the full interactive demo (traffic generator, Grafana, Prometheus),
 # see demo/compose.yml instead.
 
 volumes:
-  index-mysql-data:
-  bintrail-state:
+  bintrail-index-data:    # MySQL 8.4 datadir — the forensic record (NEW volume:
+                          # never reuse the old 8.0 `index-mysql-data`, an 8.4
+                          # server auto-upgrades an 8.0 datadir irreversibly).
+  bintrail-index-secret:  # the generated index password (shares fate with the
+                          # datadir — back up / reset the two together).
+  bintrail-state:         # bintrail runtime state (saved console servers, …).
 
 services:
 
-  # ── Index MySQL (evaluation/quickstart-grade) ────────────
-  # Stores binlog_events, schema_snapshots, and stream_state — the
-  # forensic record itself. This bundled container is for evaluation:
-  # volume loss = re-index. For production, bring your own index MySQL:
-  # remove this service and point INDEX_DSN in .env at yours.
-  index-mysql:
-    image: mysql:8.0
+  # ── Index password (one-shot) ────────────────────────────
+  # Generates a random index MySQL password on first boot (or takes one
+  # from INDEX_MYSQL_ROOT_PASSWORD in .env if you set it BEFORE the first
+  # `up` — changing it later means resetting the index volumes). Both the
+  # index MySQL and bintrail read it from the secret volume, so there is no
+  # static default password on a volume holding the forensic record.
+  index-init:
+    image: ghcr.io/dbtrail/bintrail:${BINTRAIL_TAG:-latest}
     environment:
-      MYSQL_ROOT_PASSWORD: ${INDEX_MYSQL_ROOT_PASSWORD:-changeme}
+      INDEX_MYSQL_ROOT_PASSWORD: ${INDEX_MYSQL_ROOT_PASSWORD:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        f=/secret/index_password
+        if [ -s "$$f" ]; then exit 0; fi   # already seeded; password is fixed at datadir init
+        if [ -n "$$INDEX_MYSQL_ROOT_PASSWORD" ]; then
+          printf '%s' "$$INDEX_MYSQL_ROOT_PASSWORD" > "$$f"
+          echo "Index MySQL password taken from INDEX_MYSQL_ROOT_PASSWORD."
+        else
+          od -An -N24 -tx1 /dev/urandom | tr -d ' \n' > "$$f"
+          echo "Generated a random index MySQL password (stored in the bintrail-index-secret volume)."
+        fi
+        chmod 600 "$$f"
+    volumes:
+      - bintrail-index-secret:/secret
+
+  # ── Index MySQL 8.4 (the forensic record) ────────────────
+  # Stores binlog_events, schema_snapshots, and stream_state. Pinned to an
+  # exact 8.4 LTS minor — bump it deliberately (swap the container; the
+  # datadir volume persists, PMM-style). Bring your own instead: set
+  # INDEX_DSN in .env and remove this service, index-init, and the
+  # bintrail-index-secret mount on `bintrail` (see docs/docker.md).
+  index-mysql:
+    image: mysql:8.4.9
+    # --innodb-flush-log-at-trx-commit=2 is the one safe index-side tuning
+    # (bintrail replays from the stream_state checkpoint, so a ≤1s recovery
+    # window is acceptable). buffer-pool size is left at the default — it
+    # depends on host RAM and is the operator's to tune (docs/deployment.md §3).
+    command: ["--innodb-flush-log-at-trx-commit=2"]
+    environment:
+      # 8.4 defaults to caching_sha2_password (native_password disabled);
+      # bintrail's driver negotiates it over the plaintext Docker network.
+      MYSQL_ROOT_PASSWORD_FILE: /run/secret/index_password
       MYSQL_DATABASE: bintrail_index
     volumes:
-      - index-mysql-data:/var/lib/mysql
+      - bintrail-index-data:/var/lib/mysql
+      - bintrail-index-secret:/run/secret:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${INDEX_MYSQL_ROOT_PASSWORD:-changeme}"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p\"$$(cat /run/secret/index_password)\" --silent"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 30s
+    depends_on:
+      index-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   # ── Bintrail: stream + web console ───────────────────────
   # `bintrail up --console` = doctor preflight + init + auto-snapshot +
-  # binlog stream + the read-only web console, in one process.
+  # binlog stream + built-in rotation + the read-only web console.
   bintrail:
     image: ghcr.io/dbtrail/bintrail:${BINTRAIL_TAG:-latest}
     # Building from a source checkout instead? Comment the line above and
@@ -64,8 +114,10 @@ services:
       # Optional: a source MySQL to start watching immediately. Leave unset
       # and add servers from the console UI instead (the zero-config path).
       SOURCE_DSN: ${SOURCE_DSN:-}
-      # The index MySQL above; swap for your own instance if you removed it.
-      INDEX_DSN: ${INDEX_DSN:-root:${INDEX_MYSQL_ROOT_PASSWORD:-changeme}@tcp(index-mysql:3306)/bintrail_index}
+      # Bring your own index: set INDEX_DSN in .env to override the bundled
+      # MySQL entirely. Empty = use the bundled index (DSN built from the
+      # generated password below).
+      INDEX_DSN: ${INDEX_DSN:-}
       # Optional comma-separated schema filter (empty = all user schemas).
       SCHEMAS: ${SCHEMAS:-}
       # The console binds all interfaces INSIDE the container; the `ports`
@@ -76,10 +128,16 @@ services:
       BINTRAIL_CONSOLE_SERVERS: /var/lib/bintrail/console-servers.yaml
     volumes:
       - bintrail-state:/var/lib/bintrail
+      - bintrail-index-secret:/run/secret:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
+        # Use the bundled index unless the operator brought their own. The
+        # generated password lives in the secret volume; build the DSN from it.
+        if [ -z "$$INDEX_DSN" ]; then
+          INDEX_DSN="root:$$(cat /run/secret/index_password)@tcp(index-mysql:3306)/bintrail_index"
+        fi
         # A non-loopback console bind requires an explicit token. Generate one
         # per boot when CONSOLE_TOKEN isn't pinned in .env — the startup
         # banner below prints the full URL including it either way.
