@@ -22,16 +22,23 @@ import (
 // connection bintrail makes — the index connection (go-sql-driver, via
 // config.Connect) AND the source replication handshake (go-mysql, via
 // BinlogSyncer) — authenticates with caching_sha2_password over a plaintext
-// network, which requires the server's public key on a cold cache (full
-// auth). The rest of the integration suite primes root's cache on its first
-// connection and thereafter exercises only fast auth, so it would NOT catch a
-// regression in the cold full-auth / public-key path. This test creates a
-// FRESH caching_sha2 user per path (DROP+CREATE guarantees a cold server-side
-// cache) and proves cold full-auth completes for both libraries.
+// network, which on a cold cache requires the server's public key (full auth).
 //
-// It is meaningful on both MySQL 8.0 (caching_sha2 is already the default
-// plugin) and 8.4 (where it is also the only enabled one), so it guards both
-// CI matrix cells.
+// Why a FRESH user per path: caching_sha2's cache is per-account, and a
+// never-authenticated account has NO fast-auth fallback — its first connect
+// must complete full auth via public-key retrieval or fail. So a successful
+// plaintext connect by a fresh user (DROP+CREATE = empty server-side cache)
+// necessarily exercised the cold full-auth / public-key path; there is no
+// other way for it to succeed. The rest of the integration suite mostly runs
+// over already-primed (fast-auth) connections, so it does not deterministically
+// guard the cold path the way this test does. Each path uses its own fresh user
+// so neither primes the other.
+//
+// It is meaningful on both MySQL 8.0 (caching_sha2 is the default plugin since
+// 8.0.4) and 8.4 (where it is also the only enabled one). It is deliberately
+// version-independent — it explicitly creates a caching_sha2 user, so it guards
+// the cold-auth code path on both cells; the matrix's whole-suite run on 8.4 is
+// what additionally proves the 8.4 native_password-OFF default doesn't break us.
 func TestCachingSha2ColdAuthSeam(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 
@@ -101,8 +108,11 @@ func TestCachingSha2ColdAuthSeam(t *testing.T) {
 			t.Fatalf("parseSourceDSN: %v", err)
 		}
 
-		// Mirrors stream.go's BinlogSyncerConfig: no TLSConfig → plaintext, so
-		// go-mysql must complete caching_sha2 full auth via public-key retrieval.
+		// Omit TLSConfig (nil → plaintext) to force the caching_sha2 full-auth
+		// path. NOTE stream.go defaults to --ssl-mode=preferred (a NON-nil
+		// TLSConfig) and reaches plaintext only via its TLS fallback
+		// (stream.go ~1234) or --ssl-mode=disabled; this mirrors that plaintext
+		// path, where go-mysql must complete full auth via public-key retrieval.
 		syncer := replication.NewBinlogSyncer(replication.BinlogSyncerConfig{
 			ServerID: 99123,
 			Flavor:   "mysql",

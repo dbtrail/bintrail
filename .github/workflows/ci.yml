@@ -35,8 +35,11 @@ jobs:
     # Two supported cells: the BYO contract floor (8.0) and the bundled index
     # engine (8.4, where mysql_native_password is disabled by default so every
     # connection authenticates with caching_sha2_password over the plaintext
-    # network). fail-fast: false so a regression on one version still reports
-    # the other. See TestCachingSha2ColdAuthSeam for the focused auth guard.
+    # network). Running the whole suite on 8.4 is what proves the native_password-
+    # OFF default doesn't break the up→stream→query→shim pipeline; the focused
+    # TestCachingSha2ColdAuthSeam additionally guards the cold full-auth path on
+    # both cells. fail-fast: false so a regression on one version still reports
+    # the other.
     strategy:
       fail-fast: false
       matrix:
