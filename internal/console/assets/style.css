@@ -1068,8 +1068,8 @@ button { font-family: inherit; }
 
 /* The hidden attribute must always win. The new design hides overlays
    via state classes (.show/.open), but the console also toggles the
-   [hidden] attribute (advanced filters, sql panel); an element whose
-   class sets display:flex/grid would otherwise beat [hidden]. */
+   [hidden] attribute (advanced filters, toast, the add-server wrap); an
+   element whose class sets display:flex/grid would otherwise beat [hidden]. */
 [hidden] { display: none !important; }
 
 /* Capability gating: a [data-capability] surface (Time-travel nav,
@@ -1107,9 +1107,6 @@ button { font-family: inherit; }
   background: var(--orange-bg); border: 1px solid var(--ochre);
   border-radius: var(--radius-sm); padding: 9px 12px; margin: 6px 0;
 }
-
-/* export buttons in the events result bar */
-.export-bar { display: inline-flex; gap: 7px; margin-left: auto; }
 
 /* point-in-time state table (Time-travel "Value as of T") */
 .statetable { width: 100%; border-collapse: collapse; font-family: var(--f-mono); font-size: 12.5px; }

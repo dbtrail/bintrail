@@ -13,7 +13,9 @@
 //  3. Every async render captures `serverGen` before its await and bails if a
 //     server switch happened mid-flight (no cross-server repaint).
 //  4. Capability gating toggles the `.cap-on` class on [data-capability] nodes.
-//  5. Exports stay connection_id-free (EVENT_CSV_COLUMNS) — the open-core line.
+//  5. Exports stay connection_id-free: CSV via the EVENT_CSV_COLUMNS allowlist;
+//     JSON only because the server's eventDTO omits connection_id (it serializes
+//     rows as-is). The open-core line is enforced server-side — don't add it.
 //  6. The DOM is built with el()/textContent only — no innerHTML anywhere. The
 //     one string→DOM path is svgEl(), which DOMParses STATIC icon constants
 //     (never data) into SVG nodes. No value from the API touches markup.
@@ -147,7 +149,18 @@ async function api(path, opts = {}) {
   });
   const text = await res.text();
   let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch (_) { data = { error: text }; }
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      // A non-JSON body is the server's error text on a non-OK response, or a
+      // server malfunction on an OK one — surface it; never let a stray HTML
+      // error page render as an empty success. (An EMPTY body stays null: the
+      // 204 from DELETE /api/servers/{id} is a legitimate no-content success.)
+      if (!res.ok) throw new Error(text || "HTTP " + res.status);
+      throw new Error("malformed response from " + path);
+    }
+  }
   if (!res.ok) throw new Error((data && data.error) || "HTTP " + res.status);
   return data;
 }
@@ -236,23 +249,28 @@ function setActiveNav(route) {
 async function renderOverview() {
   const gen = serverGen;
   viewLoading();
-  let status = null, eventsData = null;
   try {
-    [status, eventsData] = await Promise.all([
+    const [status, eventsData] = await Promise.all([
       api("/api/status").catch(() => null),
       api("/api/events?limit=200&order=DESC"),
     ]);
+    if (gen !== serverGen) return;
+    buildOverview(status, eventsData); // render INSIDE the try: a throw here shows an error, never a stuck "Loading…"
   } catch (err) {
     if (gen !== serverGen) return;
     const v = VIEW(); clear(v); v.append(pageHead("Overview", null)); renderError(v, err);
-    return;
   }
-  if (gen !== serverGen) return;
+}
+
+// buildOverview renders the dashboard from the two fetched payloads. status may
+// be null (its fetch is best-effort); when it is, we do NOT claim a global
+// total — `events` is only the fetched window (limit 200), never the index size.
+function buildOverview(status, eventsData) {
   if (status) updateSideMeta(status);
 
-  const events = eventsData.events || [];
+  const events = (eventsData && eventsData.events) || [];
   const cov = (status && status.coverage) || {};
-  const total = (status && status.total_events_estimate) || cov.total_events || events.length;
+  const total = status ? (status.total_events_estimate || cov.total_events || "—") : "—";
   const deletes = events.filter((e) => e.event_type === "DELETE").length;
 
   // Aggregate the fetched window by table.
@@ -694,6 +712,7 @@ function renderRecover(params) {
 // loads its tables and runs cb. Lets the undo-bridge prefill survive the async
 // schema fetch without racing it.
 function setSelectWhenReady(form, name, value, cb) {
+  const gen = serverGen;
   const sel = form.elements[name];
   const tryset = () => {
     if (Array.from(sel.options).some((o) => o.value === value)) {
@@ -705,7 +724,12 @@ function setSelectWhenReady(form, name, value, cb) {
   };
   if (tryset()) return;
   let n = 0;
-  const iv = setInterval(() => { if (tryset() || ++n > 40) clearInterval(iv); }, 50);
+  const iv = setInterval(() => {
+    // Bail if the operator switched servers or navigated away — otherwise a
+    // late tick would auto-generate undo SQL against a detached/other form.
+    if (gen !== serverGen || !document.contains(form)) { clearInterval(iv); return; }
+    if (tryset() || ++n > 40) clearInterval(iv);
+  }, 50);
 }
 
 async function previewRecover(form) {
@@ -990,9 +1014,14 @@ function updateSideMeta(status) {
 
 async function loadSchemas() {
   if (schemaCache) return schemaCache;
+  const gen = serverGen;
   const data = await api("/api/schemas");
-  schemaCache = data.schemas || [];
-  return schemaCache;
+  const schemas = data.schemas || [];
+  // Guard the cache WRITE, not just the render: a response in flight when the
+  // operator switches servers must not poison the freshly-cleared cache with
+  // the previous server's schemas.
+  if (gen === serverGen) schemaCache = schemas;
+  return schemas;
 }
 
 async function populateSchemas(root) {
@@ -1027,7 +1056,11 @@ async function loadTables(form) {
   if (!schema) return;
   let tables = tablesCache.get(schema);
   try {
-    if (!tables) { const data = await api("/api/schemas?schema=" + encodeURIComponent(schema)); tables = data.tables || []; tablesCache.set(schema, tables); }
+    if (!tables) {
+      const data = await api("/api/schemas?schema=" + encodeURIComponent(schema));
+      tables = data.tables || [];
+      if (gen === serverGen) tablesCache.set(schema, tables); // don't cache under a server we've since switched away from
+    }
   } catch (err) {
     if (gen !== serverGen) return;
     tsel.append(opt("", "(error loading tables)"));
@@ -1296,6 +1329,7 @@ async function saveServer(form) {
     if (res && res.started && !doctorWarnings(res.doctor)) { hideServerForm(); toast("Monitoring started — events will appear within a minute"); }
     else if (res && res.started) { renderDoctor(res.doctor); formMsg("monitoring started — review the warnings below", false); }
     else if (res) { renderDoctor(res.doctor); formMsg("preflight failed — fix the items below and Save again", true); }
+    else { formMsg("could not start monitoring — see the error toast and try again", true); } // startMonitor returned null (transport error)
     return;
   }
   hideServerForm();
@@ -1497,7 +1531,10 @@ async function init() {
 
   // Startup order is load-bearing: servers (reconcile selection) → caps → route.
   let servers = [];
-  try { servers = await loadServers(); } catch (err) { renderError(VIEW(), err); }
+  // renderRoute() below clears #view, so an in-view error here would be wiped;
+  // toast it instead. If the backend is down, the chosen view surfaces its own
+  // error when its fetch fails.
+  try { servers = await loadServers(); } catch (err) { toast("couldn't load servers: " + ((err && err.message) || err)); }
   await gateCapabilities();
   renderRoute();
 
