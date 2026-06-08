@@ -50,27 +50,37 @@ With an S3 baseline (`--baseline-s3`), the `up` process reads S3 at request
 time using the ambient AWS credential chain — same as the standalone console,
 but note `up` didn't need AWS credentials before.
 
-Open that URL in a browser. Four tabs (Time-travel appears only when a baseline
-is configured), plus a **server switcher** in the header (see
-[Managing servers](#managing-servers)):
+Open that URL in a browser. A left **sidebar** groups the views (Time-travel
+appears only when a baseline is configured), with a **server switcher** at the
+top (see [Managing servers](#managing-servers)) and a **⌘K command palette**
+(also reachable from the "Search & commands" button) for jumping between views
+and searching events:
 
-1. **Recover** (landing) — filter schema / table / PK / time, preview the
-   affected rows with before→after diffs, then **Generate undo SQL** and
-   copy/download the script.
-2. **Events** — broader filters (event type, changed column, GTID, limit).
-   Results carry **Download JSON / Download CSV** buttons (also on the Recover
-   preview). Export is client-side over the rows already on screen, so it stays
-   within the result caps and — like the on-screen rows — never includes
-   `connection_id`.
-3. **Status** — index health: partitions, coverage, stream lag, archives.
-4. **Time-travel** — single-row point-in-time reconstruct. Appears **only when a
-   baseline is configured** (`--baseline-dir`/`--baseline-s3`); otherwise the tab
-   is hidden, never shown empty. See [Time-travel](#time-travel-reconstruct).
+1. **Overview** (landing) — what changed recently and where: headline counts
+   (changes indexed, deletes, tables touched, most recent change), a **Recent
+   changes** list (each row opens Events, with an inline **Undo**), and an
+   **Activity by table** breakdown. The starting point for "what happened?".
+2. **Events** — a smart search box (free text plus `type:`, `pk:`, `col:`, and
+   `schema.table` tokens) with an expandable **Filters** panel. Each row expands
+   in place to a before→after diff; `j`/`k` move the cursor, `↵` expands, `u`
+   jumps to Recover. Results carry **JSON / CSV** export — client-side over the
+   rows already on screen, so it stays within the result caps and — like the
+   on-screen rows — never includes `connection_id`.
+3. **Time-travel** — single-row point-in-time reconstruct, drawn as a timeline
+   (baseline snapshot → each change, with a **Restore to this state** jump to
+   Recover). Appears **only when a baseline is configured**
+   (`--baseline-dir`/`--baseline-s3`); otherwise it is hidden, never shown
+   empty. See [Time-travel](#time-travel-reconstruct).
+4. **Recover** — filter schema / table / PK / time, preview the affected rows
+   with before→after diffs, then **Generate undo SQL** and copy/download the
+   script. Arriving via an **Undo** action scopes it to that row and shows a
+   context banner. **Nothing is ever executed.**
+5. **Status** — index health: partitions, coverage, stream lag, archives.
 
 ## Managing servers
 
 The header has a server switcher and a **Servers** button: add, edit, and
-remove named connections to bintrail index databases, and switch every tab
+remove named connections to bintrail index databases, and switch every view
 between them. The registry is a **local YAML file on the console host**
 (`~/.config/bintrail/console-servers.yaml` by default, override with
 `--servers-file` / `BINTRAIL_CONSOLE_SERVERS`) — adding a server registers a
@@ -92,7 +102,7 @@ How it behaves:
   `X-Bintrail-Server` header on each request — there is no server-side "active
   server" — so two browser tabs can watch two different servers.
 - **Per-server Time-travel.** The reconstruct gate (baseline configured, no
-  RBAC profile, archives enabled) is evaluated per server; the Time-travel tab
+  RBAC profile, archives enabled) is evaluated per server; the Time-travel view
   appears and disappears as you switch.
 - **Test connection.** Each server (saved or being typed) has a write-free
   probe: ping, MySQL version, latency, whether the database looks like a

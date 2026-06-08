@@ -1,53 +1,101 @@
+// bintrail console — vanilla-JS SPA over the read-only JSON API.
+//
+// No frameworks, no bundler, no third-party code (see assets/VENDOR.md). The
+// design system lives in style.css; this file renders the sidebar-shell UI into
+// #view, talks to /api/* with a bearer token, and selects a server per-request
+// via the X-Bintrail-Server header.
+//
+// Security invariants kept from the prior frontend (do not regress):
+//  1. The token comes from ?token= on first load, is stashed in sessionStorage,
+//     and is stripped from the URL — it never lingers in the address bar.
+//  2. The X-Bintrail-Server header is captured INSIDE api() at dispatch time, so
+//     an in-flight request keeps the server it was fired for.
+//  3. Every async render captures `serverGen` before its await and bails if a
+//     server switch happened mid-flight (no cross-server repaint).
+//  4. Capability gating toggles the `.cap-on` class on [data-capability] nodes.
+//  5. Exports stay connection_id-free (EVENT_CSV_COLUMNS) — the open-core line.
+//  6. The DOM is built with el()/textContent only — no innerHTML anywhere. The
+//     one string→DOM path is svgEl(), which DOMParses STATIC icon constants
+//     (never data) into SVG nodes. No value from the API touches markup.
 "use strict";
 
-// ── token bootstrap ────────────────────────────────────────────────────────
-// The page itself loads without a token; the API requires one. We read it from
-// the ?token= query param the CLI prints, persist it in sessionStorage, and
-// strip it from the visible URL so it isn't left sitting in the address bar /
-// history. On a reload the param is gone, so we recover the token from
-// sessionStorage — otherwise a refresh would drop it and every request would
-// 401. sessionStorage is per-tab and cleared when the tab closes.
+// ── constants ──────────────────────────────────────────────────────────────
+
 const TOKEN_KEY = "bintrail_console_token";
-let TOKEN = new URLSearchParams(location.search).get("token") || "";
-if (TOKEN) {
-  try { sessionStorage.setItem(TOKEN_KEY, TOKEN); } catch (e) { /* storage unavailable */ }
-  history.replaceState(null, "", location.pathname);
-} else {
-  try { TOKEN = sessionStorage.getItem(TOKEN_KEY) || ""; } catch (e) { TOKEN = ""; }
-}
-
-let lastSQL = "";
-
-// ── server selection ─────────────────────────────────────────────────────────
-// currentServer is the id of the server every API call targets, sent as the
-// X-Bintrail-Server header (captured at dispatch time inside api(), so an
-// in-flight request keeps the server it was fired for even if the operator
-// switches mid-flight). Empty = the backend's default (the --index-dsn entry,
-// else the first saved server). Persisted per-tab like the token, so two tabs
-// can watch two different servers.
 const SERVER_KEY = "bintrail_console_server";
-let currentServer = "";
-try { currentServer = sessionStorage.getItem(SERVER_KEY) || ""; } catch (e) { /* storage unavailable */ }
+const ONBOARD_KEY = "bintrail_console_onboarded";
+
+// Export columns. connection_id is DELIBERATELY ABSENT — it is paid-forensics
+// data and the console (query_explorer surface) never exposes it.
+const EVENT_CSV_COLUMNS = [
+  "event_id", "event_timestamp", "schema_name", "table_name", "event_type",
+  "pk_values", "changed_columns", "gtid", "binlog_file", "start_pos", "end_pos",
+  "row_before", "row_after",
+];
+
+// event_type → badge modifier class.
+const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
+function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
+
+const ROUTES = ["overview", "events", "timetravel", "recover", "status"];
+
+const MON_STATE_TITLES = {
+  failed: "stream failing — retrying with backoff; press Start for details",
+  stalled: "stream is connected but has made no progress for several minutes",
+  lost_position: "binlogs were purged past the saved position — events in the gap are permanently lost; current changes are still streaming",
+};
+
+// Static decorative SVGs (module constants — parsed by svgEl via DOMParser).
+const ICONS = {
+  search: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>`,
+  caret: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"></path></svg>`,
+  file: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path><path d="M14 3v5h5"></path></svg>`,
+  warn: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`,
+};
+
+// ── module state ─────────────────────────────────────────────────────────────
+
+let TOKEN = "";
+let currentServer = "";       // X-Bintrail-Server target ("" = backend default)
 let defaultServerId = "";
+let serverGen = 0;            // bumped on every server switch (staleness guard)
+let capsCache = {};           // last /api/capabilities for the selected server
+let lastSQL = "";             // last generated undo SQL (for copy/download)
+let lastEvents = [];          // last rendered (filtered, capped) event page
+let pendingRecover = null;    // event context carried into Recover via "Undo"
+let schemaCache = null;       // cached schema list for the selected server
+const tablesCache = new Map();// schema → tables[]
+let cursorIdx = -1;           // keyboard cursor row on Events
+
+// ── token bootstrap ────────────────────────────────────────────────────────
+
+(function bootstrapToken() {
+  try {
+    const urlToken = new URLSearchParams(location.search).get("token");
+    if (urlToken) {
+      sessionStorage.setItem(TOKEN_KEY, urlToken);
+      // Strip the token from the URL so it never sits in the address bar/history.
+      history.replaceState(null, "", location.pathname);
+      TOKEN = urlToken;
+    } else {
+      TOKEN = sessionStorage.getItem(TOKEN_KEY) || "";
+    }
+    currentServer = sessionStorage.getItem(SERVER_KEY) || "";
+  } catch (_) { /* storage may be unavailable; degrade to in-memory */ }
+})();
 
 function setCurrentServer(id) {
   currentServer = id || "";
-  try { sessionStorage.setItem(SERVER_KEY, currentServer); } catch (e) { /* storage unavailable */ }
+  try { sessionStorage.setItem(SERVER_KEY, currentServer); } catch (_) {}
 }
 
-// serverGen invalidates in-flight renders across server switches. api()
-// captures the header at dispatch, so a slow request keeps QUERYING the right
-// server — but its response must not repaint a panel that now shows another
-// server. Handlers snapshot the generation before awaiting and drop the render
-// when a switch happened underneath them.
-let serverGen = 0;
+// ── tiny DOM helpers (no data ever assigned as HTML) ─────────────────────────
 
-// ── tiny DOM helper (builds nodes; never injects data as HTML) ───────────────
 function el(tag, attrs, ...kids) {
   const n = document.createElement(tag);
   if (attrs) {
     for (const [k, v] of Object.entries(attrs)) {
-      if (v === null || v === undefined) continue;
+      if (v == null || v === false) continue;
       if (k === "class") n.className = v;
       else if (k === "text") n.textContent = v;
       else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
@@ -55,22 +103,27 @@ function el(tag, attrs, ...kids) {
     }
   }
   for (const kid of kids) {
-    if (kid === null || kid === undefined) continue;
-    n.appendChild(typeof kid === "string" ? document.createTextNode(kid) : kid);
+    if (kid == null) continue;
+    n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   }
   return n;
 }
-
-function opt(value, label) {
-  const o = el("option", { value });
-  o.textContent = label;
-  return o;
+function opt(value, label) { const o = el("option", { value }); o.textContent = label; return o; }
+function clear(n) { if (n) n.replaceChildren(); }
+function $(sel, root = document) { return root.querySelector(sel); }
+function $all(sel, root = document) { return Array.from(root.querySelectorAll(sel)); }
+// svgEl parses a STATIC, trusted SVG constant into a detached SVG node. It is
+// NOT an innerHTML sink: image/svg+xml parsing never executes script, and the
+// argument is always a module constant — never server or user data.
+function svgEl(s) {
+  const doc = new DOMParser().parseFromString(s, "image/svg+xml");
+  return document.importNode(doc.documentElement, true);
 }
-
-// clear removes all children of a node. Used instead of innerHTML="" so no
-// markup is ever assigned from a string.
-function clear(n) {
-  n.replaceChildren();
+// icon(name) → a <span> wrapping the named static SVG.
+function icon(name, cls) {
+  const span = el("span", { class: cls || "" });
+  if (ICONS[name]) span.append(svgEl(ICONS[name]));
+  return span;
 }
 
 function valueToString(v) {
@@ -79,18 +132,13 @@ function valueToString(v) {
   return String(v);
 }
 
-function toast(msg) {
-  const t = document.getElementById("toast");
-  t.textContent = msg;
-  t.hidden = false;
-  clearTimeout(toast._t);
-  toast._t = setTimeout(() => { t.hidden = true; }, 2000);
-}
+const VIEW = () => document.getElementById("view");
 
-// ── API wrapper ──────────────────────────────────────────────────────────────
+// ── api ──────────────────────────────────────────────────────────────────────
+
 async function api(path, opts = {}) {
   const headers = { Authorization: "Bearer " + TOKEN };
-  if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+  if (currentServer) headers["X-Bintrail-Server"] = currentServer; // captured at dispatch
   if (opts.body) headers["Content-Type"] = "application/json";
   const res = await fetch(path, {
     method: opts.method || "GET",
@@ -99,841 +147,1369 @@ async function api(path, opts = {}) {
   });
   const text = await res.text();
   let data = null;
-  if (text) {
-    try { data = JSON.parse(text); } catch { data = { error: text }; }
-  }
-  if (!res.ok) {
-    throw new Error((data && data.error) || "HTTP " + res.status);
-  }
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = { error: text }; }
+  if (!res.ok) throw new Error((data && data.error) || "HTTP " + res.status);
   return data;
 }
 
-// ── shared rendering ─────────────────────────────────────────────────────────
+// ── toast / errors / warnings ─────────────────────────────────────────────────
+
+function toast(msg) {
+  const t = document.getElementById("toast");
+  if (!t) return;
+  t.textContent = msg;
+  t.hidden = false;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { t.hidden = true; }, 2200);
+}
+
 function renderError(container, err) {
+  if (!container) return;
   clear(container);
-  container.appendChild(el("div", { class: "error-box" }, String(err.message || err)));
+  container.append(el("div", { class: "error-box", text: String((err && err.message) || err) }));
 }
 
 function renderWarnings(node, warnings) {
+  if (!node) return;
   clear(node);
-  (warnings || []).forEach((w) => node.appendChild(el("div", { class: "warn-item" }, w)));
+  (warnings || []).forEach((w) => node.append(
+    el("div", { class: "warn-item" }, icon("warn"), el("span", { text: w }))
+  ));
 }
 
-function formParams(form) {
-  const out = {};
-  for (const [k, v] of new FormData(form).entries()) {
-    if (String(v).trim() !== "") out[k] = v;
+// ── badge / page-head builders ────────────────────────────────────────────────
+
+function badge(type) { return el("span", { class: "badge " + badgeClass(type), text: type }); }
+
+function pageHead(title, subNode) {
+  const head = el("div", { class: "page-head" }, el("h1", { class: "page-title", text: title }));
+  if (subNode) head.append(subNode);
+  return head;
+}
+
+function viewLoading() {
+  const v = VIEW();
+  clear(v);
+  v.append(el("div", { class: "view-loading", text: "Loading…" }));
+  v.classList.remove("view-enter");
+}
+function viewEnter() { const v = VIEW(); v.classList.remove("view-enter"); void v.offsetWidth; v.classList.add("view-enter"); }
+
+// ── router ─────────────────────────────────────────────────────────────────
+
+function routeFromLocation() {
+  const path = location.pathname.replace(/^\//, "").split("/")[0] || "overview";
+  return ROUTES.includes(path) ? path : "overview";
+}
+
+function navigate(route, params, push = true) {
+  if (!ROUTES.includes(route)) route = "overview";
+  // Reconstruct surface is gated; never navigate to a disabled Time-travel.
+  if (route === "timetravel" && !capsCache.reconstruct) route = "overview";
+  const qs = params && Object.keys(params).length
+    ? "?" + new URLSearchParams(params).toString() : "";
+  if (push) history.pushState({ route }, "", "/" + route + qs);
+  renderRoute();
+}
+
+function renderRoute() {
+  const route = routeFromLocation();
+  setActiveNav(route);
+  cursorIdx = -1;
+  const params = Object.fromEntries(new URLSearchParams(location.search));
+  switch (route) {
+    case "overview": return renderOverview();
+    case "events": return renderEvents(params);
+    case "timetravel": return renderTimetravel(params);
+    case "recover": return renderRecover(params);
+    case "status": return renderStatus();
+    default: return renderOverview();
   }
+}
+
+function setActiveNav(route) {
+  $all(".nav-item").forEach((a) => a.classList.toggle("active", a.dataset.route === route));
+}
+
+// ── Overview ─────────────────────────────────────────────────────────────────
+
+async function renderOverview() {
+  const gen = serverGen;
+  viewLoading();
+  let status = null, eventsData = null;
+  try {
+    [status, eventsData] = await Promise.all([
+      api("/api/status").catch(() => null),
+      api("/api/events?limit=200&order=DESC"),
+    ]);
+  } catch (err) {
+    if (gen !== serverGen) return;
+    const v = VIEW(); clear(v); v.append(pageHead("Overview", null)); renderError(v, err);
+    return;
+  }
+  if (gen !== serverGen) return;
+  if (status) updateSideMeta(status);
+
+  const events = eventsData.events || [];
+  const cov = (status && status.coverage) || {};
+  const total = (status && status.total_events_estimate) || cov.total_events || events.length;
+  const deletes = events.filter((e) => e.event_type === "DELETE").length;
+
+  // Aggregate the fetched window by table.
+  const byTable = new Map();
+  for (const e of events) {
+    const k = e.schema_name + "." + e.table_name;
+    let s = byTable.get(k);
+    if (!s) { s = { key: k, insert: 0, update: 0, delete: 0, total: 0 }; byTable.set(k, s); }
+    s.total++;
+    if (e.event_type === "INSERT") s.insert++;
+    else if (e.event_type === "UPDATE") s.update++;
+    else if (e.event_type === "DELETE") s.delete++;
+  }
+  const tables = Array.from(byTable.values()).sort((a, b) => b.total - a.total);
+  const latest = cov.latest_event || (events[0] && events[0].event_timestamp) || "—";
+  const earliest = cov.earliest_event || (events.length ? events[events.length - 1].event_timestamp : "—");
+
+  const v = VIEW(); clear(v);
+
+  const sub = el("p", { class: "page-sub" },
+    "What changed recently, and where — your starting point. ",
+    el("b", { text: deletes + " delete(s)" }),
+    " in the latest window: the ones worth a look first.");
+  v.append(pageHead("Overview", sub));
+
+  // stats
+  const stats = el("div", { class: "ov-stats" });
+  stats.append(ovStat(String(total), "changes indexed"));
+  stats.append(ovStat(String(deletes), "deletes", deletes > 0 ? "danger" : ""));
+  stats.append(ovStat(String(tables.length), "tables touched"));
+  const wide = el("div", { class: "ov-stat" },
+    el("div", { class: "ov-stat-v small", text: latest }),
+    el("div", { class: "ov-stat-k", text: "most recent change" }));
+  stats.append(wide);
+  v.append(stats);
+
+  // grid
+  const grid = el("div", { class: "ov-grid" });
+
+  // recent changes
+  const recentPanel = el("section", { class: "ov-panel" });
+  const rHead = el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Recent changes" }),
+    el("a", { class: "btn btn-sm btn-ghost", href: "/events",
+      onclick: (e) => { e.preventDefault(); navigate("events"); }, text: "Browse all events ›" }));
+  recentPanel.append(rHead);
+  const evlist = el("div", { class: "ov-evlist" });
+  if (!events.length) {
+    evlist.append(el("div", { class: "ev-empty", text: "No changes indexed yet." }));
+  } else {
+    events.slice(0, 8).forEach((e) => evlist.append(ovEventRow(e)));
+  }
+  recentPanel.append(evlist);
+  grid.append(recentPanel);
+
+  // activity by table
+  const tablesPanel = el("section", { class: "ov-panel" });
+  tablesPanel.append(el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Activity by table" })));
+  const tbox = el("div", { class: "ov-tables" });
+  tables.slice(0, 12).forEach((s) => tbox.append(ovTableRow(s)));
+  tablesPanel.append(tbox);
+  tablesPanel.append(el("div", { class: "ov-coverage" },
+    el("span", { text: "coverage" }), " ",
+    el("b", { text: earliest }), " → ", el("b", { text: latest })));
+  grid.append(tablesPanel);
+
+  v.append(grid);
+  viewEnter();
+}
+
+function ovStat(value, key, mod) {
+  return el("div", { class: "ov-stat" },
+    el("div", { class: "ov-stat-v" + (mod ? " " + mod : ""), text: value }),
+    el("div", { class: "ov-stat-k", text: key }));
+}
+
+function colsSummary(cols, highlight) {
+  cols = cols || [];
+  if (cols.length > 2) return [el("span", { text: cols.length + " cols" })];
+  const out = [];
+  cols.forEach((c, i) => {
+    if (i) out.push(document.createTextNode(", "));
+    out.push(highlight ? el("span", { class: "hl", text: c }) : el("span", { text: c }));
+  });
   return out;
+}
+
+function ovEventRow(e) {
+  const row = el("div", { class: "ov-ev",
+    onclick: () => navigate("events", { q: "pk:" + e.pk_values }) });
+  row.append(el("span", { class: "ov-ev-time", text: e.event_timestamp }));
+  row.append(badge(e.event_type));
+  const tbl = el("span", { class: "ov-ev-tbl", text: e.schema_name + "." + e.table_name + " " });
+  tbl.append(el("span", { class: "ov-ev-pk", text: "#" + e.pk_values }));
+  row.append(tbl);
+  row.append(el("span", { class: "ov-ev-cols" }, ...colsSummary(e.changed_columns, false)));
+  const undo = el("a", { class: "btn btn-sm ov-ev-undo", text: "Undo",
+    onclick: (ev) => { ev.stopPropagation(); undoEvent(e); } });
+  row.append(undo);
+  return row;
+}
+
+function ovTableRow(s) {
+  const row = el("a", { class: "ov-tablerow",
+    onclick: () => navigate("events", { q: s.key }) });
+  row.append(el("span", { class: "ov-tname", text: s.key }));
+  const bar = el("span", { class: "ov-bar" });
+  if (s.insert) bar.append(el("span", { class: "ov-seg i", style: "flex:" + s.insert }));
+  if (s.update) bar.append(el("span", { class: "ov-seg u", style: "flex:" + s.update }));
+  if (s.delete) bar.append(el("span", { class: "ov-seg d", style: "flex:" + s.delete }));
+  row.append(bar);
+  row.append(el("span", { class: "ov-total", text: String(s.total) }));
+  return row;
+}
+
+// ── Events ─────────────────────────────────────────────────────────────────
+
+function renderEvents(params) {
+  const v = VIEW(); clear(v);
+  v.append(pageHead("Events", el("p", { class: "page-sub", text: "Browse indexed row events with full before / after images." })));
+
+  const form = el("form", { id: "ev-form" });
+  // search bar
+  const searchwrap = el("div", { class: "ev-searchwrap" });
+  searchwrap.append(icon("search", "ev-search-ic"));
+  const search = el("input", { class: "ev-search", id: "ev-search", name: "q",
+    autocomplete: "off", spellcheck: "false",
+    placeholder: 'Search changes — try "orders", "type:delete", "pk:1006", "col:email"' });
+  if (params && params.q) search.value = params.q;
+  searchwrap.append(search);
+  const advBtn = el("button", { class: "ev-advbtn", type: "button", text: "Filters",
+    onclick: () => { const a = $("#ev-advanced", VIEW()); a.toggleAttribute("hidden"); advBtn.classList.toggle("on"); } });
+  searchwrap.append(advBtn);
+  form.append(searchwrap);
+
+  // advanced panel
+  const adv = el("div", { class: "ev-advanced", id: "ev-advanced", hidden: "" });
+  adv.append(fieldSelect("Schema", "schema", "md", true));
+  adv.append(fieldSelect("Table", "table", "md", false, true));
+  adv.append(fieldInput("PK", "pk", "sm", "1006"));
+  adv.append(fieldSelect("Type", "event_type", "sm", false, false, ["", "INSERT", "UPDATE", "DELETE"], "any"));
+  adv.append(fieldInput("Changed column", "changed_column", "md", "email"));
+  adv.append(fieldInput("Since", "since", "md", "YYYY-MM-DD HH:MM"));
+  adv.append(fieldInput("Until", "until", "md", "YYYY-MM-DD HH:MM"));
+  adv.append(fieldInput("Limit", "limit", "sm", "100"));
+  form.append(adv);
+  v.append(form);
+
+  // result bar
+  const bar = el("div", { class: "result-bar" });
+  bar.append(el("span", { class: "result-count" }, el("b", { id: "ev-count", text: "…" }), " event(s)"));
+  bar.append(el("span", { class: "spacer" }));
+  bar.append(el("span", { class: "kbd-hint" },
+    el("b", { text: "j" }), "/", el("b", { text: "k" }), " move · ",
+    el("b", { text: "↵" }), " expand · ", el("b", { text: "u" }), " undo"));
+  bar.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "JSON",
+    onclick: () => downloadEventsJSON(lastEvents) }));
+  bar.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "CSV",
+    onclick: () => downloadEventsCSV(lastEvents) }));
+  v.append(bar);
+
+  // events list
+  const list = el("div", { class: "events", id: "events-list" });
+  const head = el("div", { class: "ev-head" });
+  ["time", "table", "type", "pk", "changed columns"].forEach((h) => head.append(el("span", { text: h })));
+  list.append(head);
+  list.append(el("div", { id: "ev-rows" }));
+  v.append(list);
+
+  // wire search (debounced)
+  let t = null;
+  const run = () => runEventsQuery(form);
+  form.addEventListener("input", () => { clearTimeout(t); t = setTimeout(run, 200); });
+  form.addEventListener("change", run);
+  form.addEventListener("submit", (e) => { e.preventDefault(); run(); });
+  wireSchemaCascade(form);
+
+  populateSchemas(form);
+  run();
+  viewEnter();
+}
+
+function fieldInput(label, name, size, placeholder) {
+  return el("div", { class: "field field--" + size },
+    el("label", { class: "field-label", text: label }),
+    el("input", { class: "input", name, placeholder: placeholder || "" }));
+}
+function fieldSelect(label, name, size, isSchema, isTable, options, anyLabel) {
+  const sel = el("select", { class: "select" + (isSchema ? " schema-select" : "") + (isTable ? " table-select" : ""), name });
+  if (options) options.forEach((o) => sel.append(opt(o, o === "" ? (anyLabel || "any") : o)));
+  else sel.append(opt("", "any"));
+  return el("div", { class: "field field--" + size },
+    el("label", { class: "field-label", text: label }), sel);
+}
+
+// parseSmartQuery turns "type:delete pk:1006 orders" into structured filters +
+// leftover free terms. Mirrors the prototype's parseQuery intent.
+function parseSmartQuery(q) {
+  const c = { terms: [] };
+  const known = { table: 1, pk: 1, type: 1, col: 1, column: 1, schema: 1, since: 1, until: 1, gtid: 1, limit: 1 };
+  for (const tok of (q || "").trim().split(/\s+/).filter(Boolean)) {
+    const i = tok.indexOf(":");
+    const k = i > 0 ? tok.slice(0, i).toLowerCase() : "";
+    if (k && known[k]) {
+      const val = tok.slice(i + 1);
+      if (k === "col" || k === "column") c.changed_column = val;
+      else if (k === "type") c.event_type = val.toUpperCase();
+      else c[k] = val;
+    } else if (tok.includes(".") && !c.schema && !c.table) {
+      const [s, tb] = tok.split(".");
+      if (s) c.schema = s;
+      if (tb) c.table = tb;
+    } else {
+      // A bare word is a free-text term, refined client-side over the fetched
+      // page (like the prototype). We do NOT map it to an exact table filter —
+      // that would silently return 0 rows for a value/column search.
+      c.terms.push(tok.toLowerCase());
+    }
+  }
+  return c;
+}
+
+async function runEventsQuery(form) {
+  const gen = serverGen;
+  const rowsEl = $("#ev-rows", VIEW());
+  const countEl = $("#ev-count", VIEW());
+  if (!rowsEl) return;
+
+  // Merge smart-search tokens with the advanced panel (structured fields win).
+  const parsed = parseSmartQuery(form.elements.q ? form.elements.q.value : "");
+  const f = Object.fromEntries(new FormData(form).entries());
+  const merged = Object.assign({}, parsed);
+  ["schema", "table", "pk", "event_type", "changed_column", "since", "until", "gtid", "limit"].forEach((k) => {
+    if (f[k] && f[k].trim() && f[k] !== "any") merged[k] = f[k].trim();
+  });
+
+  // Build API params. pk / changed_column require schema+table server-side, so
+  // when they are not both present we apply them client-side instead of 400ing.
+  const apiParams = {};
+  const hasScope = merged.schema && merged.table;
+  ["schema", "table", "event_type", "since", "until", "gtid", "limit"].forEach((k) => {
+    if (merged[k]) apiParams[k] = merged[k];
+  });
+  if (hasScope) {
+    if (merged.pk) apiParams.pk = merged.pk;
+    if (merged.changed_column) apiParams.changed_column = merged.changed_column;
+  }
+
+  let data;
+  try {
+    data = await api("/api/events?" + new URLSearchParams(apiParams).toString());
+  } catch (err) {
+    if (gen !== serverGen) return;
+    clear(rowsEl); renderError(rowsEl, err);
+    if (countEl) countEl.textContent = "0";
+    return;
+  }
+  if (gen !== serverGen) return;
+
+  // Client-side refine: unscoped pk/col + free terms.
+  let events = data.events || [];
+  const refine = [];
+  if (!hasScope && merged.pk) refine.push(merged.pk.toLowerCase());
+  if (!hasScope && merged.changed_column) refine.push(merged.changed_column.toLowerCase());
+  refine.push(...parsed.terms);
+  if (refine.length) {
+    events = events.filter((e) => {
+      const hay = (e.schema_name + "." + e.table_name + " " + e.event_type + " " + e.pk_values + " " +
+        (e.changed_columns || []).join(" ") + " " +
+        valueToString(e.row_before) + " " + valueToString(e.row_after)).toLowerCase();
+      return refine.every((t) => hay.includes(t));
+    });
+  }
+
+  lastEvents = events;
+  if (countEl) countEl.textContent = String(events.length);
+  buildEventRows(rowsEl, events);
+}
+
+function buildEventRows(container, events) {
+  clear(container);
+  if (!events.length) {
+    const empty = el("div", { class: "ev-empty" }, "No changes match your search. ",
+      el("b", { text: "Clear it", style: "cursor:pointer",
+        onclick: () => { const s = $("#ev-search", VIEW()); if (s) { s.value = ""; runEventsQuery($("#ev-form", VIEW())); } } }),
+      " to see everything.");
+    container.append(empty);
+    return;
+  }
+  events.forEach((e, i) => {
+    const row = el("div", { class: "ev-row", "data-ev": i, tabindex: "0" });
+    row.append(icon("caret", "ev-caret"));
+    row.append(el("span", { class: "ev-time", text: e.event_timestamp }));
+    row.append(el("span", { class: "ev-table", text: e.schema_name + "." + e.table_name }));
+    row.append(el("span", {}, badge(e.event_type)));
+    row.append(el("span", { class: "ev-pk", text: e.pk_values }));
+    row.append(el("span", { class: "ev-cols" }, ...colsSummary(e.changed_columns, true)));
+    const wrap = el("div", { class: "diff-wrap", id: "diff-" + i });
+    let loaded = false;
+    row.addEventListener("click", () => {
+      const open = row.classList.toggle("open");
+      if (open && !loaded) { clear(wrap); wrap.append(renderDiff(e)); loaded = true; }
+    });
+    container.append(row);
+    container.append(wrap);
+  });
 }
 
 function renderDiff(ev) {
   const before = ev.row_before || {};
   const after = ev.row_after || {};
-  const cols = Array.from(new Set([...Object.keys(before), ...Object.keys(after)]));
+  const cols = Array.from(new Set([...Object.keys(before), ...Object.keys(after)])).sort();
   const changed = new Set(ev.changed_columns || []);
   const wholeRow = ev.event_type === "INSERT" || ev.event_type === "DELETE";
-  const grid = el("div", { class: "diff" },
-    el("div", { class: "dh" }, "column"),
-    el("div", { class: "dh" }, "before"),
-    el("div", { class: "dh" }, "after"),
-  );
-  if (cols.length === 0) {
-    grid.appendChild(el("div", { class: "col" }, "(no row image)"));
-    grid.appendChild(el("div", { class: "before" }, ""));
-    grid.appendChild(el("div", { class: "after" }, ""));
+
+  const grid = el("div", { class: "diff-grid" });
+  grid.append(el("div", { class: "diff-h", text: "column" }));
+  grid.append(el("div", { class: "diff-h", text: "before" }));
+  grid.append(el("div", { class: "diff-h", text: "after" }));
+  if (!cols.length) {
+    grid.append(el("div", { class: "diff-col", text: "(no row image)" }));
+    grid.append(el("div", { class: "diff-before" }));
+    grid.append(el("div", { class: "diff-after" }));
+  } else {
+    cols.forEach((c) => {
+      const isCh = wholeRow || changed.has(c);
+      const m = isCh ? " diff-row-changed" : "";
+      grid.append(el("div", { class: "diff-col" + m, text: c }));
+      grid.append(el("div", { class: "diff-before" + m, text: c in before ? valueToString(before[c]) : "∅" }));
+      grid.append(el("div", { class: "diff-after" + m, text: c in after ? valueToString(after[c]) : "∅" }));
+    });
   }
-  cols.forEach((c) => {
-    const isCh = wholeRow || changed.has(c);
-    const mark = isCh ? " changed" : "";
-    grid.appendChild(el("div", { class: "col" + mark }, c));
-    grid.appendChild(el("div", { class: "before" + mark }, c in before ? valueToString(before[c]) : ""));
-    grid.appendChild(el("div", { class: "after" + mark }, c in after ? valueToString(after[c]) : ""));
-  });
-  return grid;
+
+  const foot = el("div", { class: "diff-foot" });
+  foot.append(el("span", { class: "diff-foot-note", text: "Generates reversal SQL — nothing runs automatically." }));
+  const label = ev.event_type === "DELETE" ? "Restore this row" : ev.event_type === "INSERT" ? "Undo this insert" : "Undo this change";
+  foot.append(el("a", { class: "btn btn-sm btn-primary", text: label, onclick: () => undoEvent(ev) }));
+
+  return el("div", { class: "diff" }, grid, foot);
 }
 
-function renderEvents(container, data) {
-  clear(container);
-  const meta = el("div", { class: "meta-line" }, `${data.count} event(s) · limit ${data.limit}`);
-  if (!data.events || data.events.length === 0) {
-    container.appendChild(meta);
-    container.appendChild(el("div", { class: "empty" }, "No events matched these filters."));
-    return;
-  }
-  // Export toolbar — client-side, over the already-fetched (redacted) DTOs, so
-  // it carries no connection_id and only the capped result set.
-  meta.appendChild(el("span", { class: "export-bar" },
-    el("button", { type: "button", class: "export-btn", onclick: () => downloadEventsJSON(data.events) }, "Download JSON"),
-    el("button", { type: "button", class: "export-btn", onclick: () => downloadEventsCSV(data.events) }, "Download CSV")));
-  container.appendChild(meta);
-  const tbody = el("tbody");
-  data.events.forEach((ev) => {
-    const row = el("tr", { class: "event-row" },
-      el("td", null, ev.event_timestamp),
-      el("td", null, `${ev.schema_name}.${ev.table_name}`),
-      el("td", null, el("span", { class: "badge " + ev.event_type }, ev.event_type)),
-      el("td", null, ev.pk_values),
-      el("td", null, (ev.changed_columns || []).join(", ")),
-    );
-    const detail = el("tr", { class: "detail" }, el("td", { colspan: "5" }, renderDiff(ev)));
-    detail.hidden = true;
-    row.addEventListener("click", () => { detail.hidden = !detail.hidden; });
-    tbody.appendChild(row);
-    tbody.appendChild(detail);
-  });
-  const table = el("table", { class: "events" },
-    el("thead", null, el("tr", null,
-      el("th", null, "time"), el("th", null, "table"), el("th", null, "type"),
-      el("th", null, "pk"), el("th", null, "changed columns"))),
-    tbody,
-  );
-  container.appendChild(table);
+// ── keyboard cursor on Events (j/k/↵/u) ──────────────────────────────────────
+
+function moveCursor(delta) {
+  const rows = $all(".ev-row", VIEW());
+  if (!rows.length) return;
+  if (cursorIdx >= 0 && rows[cursorIdx]) rows[cursorIdx].classList.remove("cursor");
+  cursorIdx = Math.max(0, Math.min(rows.length - 1, cursorIdx + delta));
+  const row = rows[cursorIdx];
+  row.classList.add("cursor");
+  row.scrollIntoView({ block: "nearest" });
 }
 
-// ── events tab ───────────────────────────────────────────────────────────────
-async function runEvents(e) {
-  e.preventDefault();
-  const gen = serverGen;
-  const container = document.getElementById("events-result");
-  const warns = document.getElementById("events-warnings");
-  try {
-    const params = new URLSearchParams(formParams(e.target));
-    const data = await api("/api/events?" + params.toString());
-    if (gen !== serverGen) return; // switched servers mid-flight
-    renderWarnings(warns, data.warnings);
-    renderEvents(container, data);
-  } catch (err) {
-    if (gen !== serverGen) return;
-    clear(warns);
-    renderError(container, err);
-  }
-}
+// ── exports (connection_id-free) ──────────────────────────────────────────────
 
-// ── recover tab ──────────────────────────────────────────────────────────────
-async function previewRecover() {
-  const gen = serverGen;
-  const container = document.getElementById("recover-preview");
-  try {
-    const params = new URLSearchParams(formParams(document.getElementById("recover-form")));
-    const data = await api("/api/events?" + params.toString());
-    if (gen !== serverGen) return; // switched servers mid-flight
-    renderEvents(container, data);
-  } catch (err) {
-    if (gen !== serverGen) return;
-    renderError(container, err);
-  }
-}
-
-async function generateUndo(e) {
-  e.preventDefault();
-  const gen = serverGen;
-  const warns = document.getElementById("recover-warnings");
-  const wrap = document.getElementById("recover-sql-wrap");
-  try {
-    const body = formParams(e.target);
-    if (body.limit) body.limit = Number(body.limit);
-    const data = await api("/api/recover", { method: "POST", body });
-    if (gen !== serverGen) return; // an undo script must never show under another server
-    renderWarnings(warns, data.warnings);
-    lastSQL = data.sql || "";
-    document.getElementById("recover-sql").textContent = lastSQL;
-    document.getElementById("recover-meta").textContent =
-      `${data.statement_count} statement(s) from ${data.row_count} event(s)`;
-    wrap.hidden = false;
-  } catch (err) {
-    if (gen !== serverGen) return;
-    clear(warns);
-    wrap.hidden = true;
-    renderError(document.getElementById("recover-preview"), err);
-  }
-}
-
-function copySQL() {
-  navigator.clipboard.writeText(lastSQL)
-    .then(() => toast("SQL copied to clipboard"))
-    .catch(() => toast("copy failed"));
-}
-
-// downloadBlob triggers a client-side file download, surfacing failures as a
-// toast (parity with copySQL) rather than only an uncaught console exception.
 function downloadBlob(filename, content, mime) {
   try {
-    const a = el("a", {
-      href: URL.createObjectURL(new Blob([content], { type: mime })),
-      download: filename,
-    });
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(a.href);
-  } catch (err) {
-    toast("download failed: " + (err.message || err));
-  }
+    const url = URL.createObjectURL(new Blob([content], { type: mime }));
+    const a = el("a", { href: url, download: filename });
+    document.body.append(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) { toast("download failed: " + ((err && err.message) || err)); }
 }
-
-function downloadSQL() {
-  downloadBlob("bintrail-undo.sql", lastSQL, "application/sql");
-}
-
-// ── events export (client-side, over the redacted eventDTOs) ──────────────────
-// Flat CSV columns; row_before/row_after and changed_columns are emitted as JSON
-// strings. connection_id is intentionally absent — these DTOs never carried it.
-const EVENT_CSV_COLUMNS = [
-  "event_id", "event_timestamp", "schema_name", "table_name", "event_type",
-  "pk_values", "changed_columns", "gtid", "binlog_file", "start_pos", "end_pos",
-  "row_before", "row_after",
-];
-
 function csvCell(v) {
-  let s;
-  if (v === null || v === undefined) s = "";
-  else if (typeof v === "object") s = JSON.stringify(v); // arrays + maps
-  else s = String(v);
-  if (/[",\r\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
-  return s;
+  if (v === null || v === undefined) return "";
+  const s = typeof v === "object" ? JSON.stringify(v) : String(v);
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
-
 function downloadEventsJSON(events) {
-  downloadBlob("bintrail-events.json", JSON.stringify(events, null, 2), "application/json");
+  downloadBlob("bintrail-events.json", JSON.stringify(events || [], null, 2), "application/json");
 }
-
 function downloadEventsCSV(events) {
   const lines = [EVENT_CSV_COLUMNS.join(",")];
-  events.forEach((ev) => lines.push(EVENT_CSV_COLUMNS.map((c) => csvCell(ev[c])).join(",")));
+  (events || []).forEach((ev) => lines.push(EVENT_CSV_COLUMNS.map((c) => csvCell(ev[c])).join(",")));
   downloadBlob("bintrail-events.csv", lines.join("\r\n"), "text/csv");
 }
 
-// ── status tab ───────────────────────────────────────────────────────────────
-function kv(k, v) {
-  return el("div", { class: "kv" },
-    el("span", { class: "k" }, k),
-    el("span", { class: "v" }, v === null || v === undefined ? "—" : String(v)));
-}
+// ── Recover ────────────────────────────────────────────────────────────────
 
-async function refreshStatus() {
-  const gen = serverGen;
-  const c = document.getElementById("status-result");
-  try {
-    const s = await api("/api/status");
-    if (gen !== serverGen) return; // switched servers mid-flight
-    clear(c);
-    const grid = el("div", { class: "status-grid" });
-    grid.appendChild(el("div", { class: "card" },
-      el("h3", null, "Summary"),
-      kv("total events (est.)", s.total_events_estimate),
-      kv("indexed files", (s.files || []).length),
-      kv("partitions", (s.partitions || []).length)));
-    if (s.coverage) {
-      grid.appendChild(el("div", { class: "card" },
-        el("h3", null, "Coverage"),
-        kv("earliest event", s.coverage.earliest_event),
-        kv("latest event", s.coverage.latest_event),
-        kv("total events", s.coverage.total_events),
-        kv("schema changes", s.coverage.schema_changes)));
-    }
-    if (s.stream) {
-      grid.appendChild(el("div", { class: "card" },
-        el("h3", null, "Stream"),
-        kv("mode", s.stream.mode),
-        kv("binlog file", s.stream.binlog_file),
-        kv("position", s.stream.binlog_position),
-        kv("events indexed", s.stream.events_indexed)));
-    }
-    if (s.archives) {
-      grid.appendChild(el("div", { class: "card" },
-        el("h3", null, "Archives"),
-        kv("files", s.archives.total_files),
-        kv("rows", s.archives.total_rows),
-        kv("size", s.archives.total_size_human)));
-    }
-    c.appendChild(grid);
-  } catch (err) {
-    if (gen !== serverGen) return;
-    renderError(c, err);
+function renderRecover(params) {
+  const v = VIEW(); clear(v);
+  const sub = el("p", { class: "page-sub" },
+    "Filter the changes you want to undo, preview the affected rows, then generate reversal SQL. ",
+    el("b", { text: "Nothing is ever executed" }),
+    " — copy or download the script and apply it yourself after review.");
+  v.append(pageHead("Recover", sub));
+
+  // Context banner when arriving via an event "Undo" (pendingRecover).
+  const ctx = pendingRecover;
+  if (ctx) {
+    const banner = el("div", { class: "ctx-banner" });
+    banner.append(el("span", { class: "badge " + badgeClass(ctx.type), text: ctx.type }));
+    banner.append(el("div", { class: "ctx-main" },
+      el("span", { class: "ctx-eyebrow", text: "Reverting this row to before this point" }),
+      el("span", { class: "ctx-title", text: ctx.schema + "." + ctx.table + " · pk " + ctx.pk }),
+      el("span", { class: "ctx-detail", text: "undoing changes up to " + ctx.type + " at " + ctx.time })));
+    banner.append(el("span", { class: "spacer" }));
+    banner.append(el("a", { class: "btn btn-sm btn-ghost", text: "Clear",
+      onclick: () => { pendingRecover = null; navigate("recover"); } }));
+    v.append(banner);
   }
-}
 
-// ── schema / table dropdowns ─────────────────────────────────────────────────
-async function populateSchemas() {
-  const gen = serverGen;
-  let schemas = [];
-  try {
-    const data = await api("/api/schemas");
-    schemas = data.schemas || [];
-  } catch (err) {
-    if (gen !== serverGen) return;
-    document.querySelectorAll(".schema-select").forEach((sel) => {
-      clear(sel);
-      sel.appendChild(opt("", "(error: " + (err.message || err) + ")"));
+  // Manual filter form
+  const form = el("form", { class: "filters", id: "recover-form" });
+  form.append(fieldSelect("Schema", "schema", "md", true, false, null, "— select —"));
+  form.append(fieldInput("Table", "table", "md", "orders"));
+  form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
+  form.append(fieldInput("Since", "since", "md", "YYYY-MM-DD HH:MM"));
+  form.append(fieldInput("Until", "until", "md", "YYYY-MM-DD HH:MM"));
+  const actions = el("div", { class: "filter-actions" });
+  actions.append(el("button", { class: "btn btn-ghost", type: "button", text: "Preview rows",
+    onclick: () => previewRecover(form) }));
+  actions.append(el("button", { class: "btn btn-primary", type: "submit", text: "Generate undo SQL" }));
+  form.append(actions);
+  v.append(form);
+
+  v.append(el("div", { id: "recover-warnings", class: "warnings" }));
+  v.append(el("div", { id: "recover-preview" }));
+  v.append(el("div", { id: "recover-out" }));
+
+  form.addEventListener("submit", (e) => { e.preventDefault(); generateUndo(form); });
+  wireSchemaCascade(form);
+  populateSchemas(form);
+
+  // Prefill from context and auto-generate.
+  if (ctx) {
+    setSelectWhenReady(form, "schema", ctx.schema, () => {
+      form.elements.table.value = ctx.table;
+      form.elements.pk.value = ctx.pk;
+      if (ctx.time) form.elements.until.value = ctx.time;
+      generateUndo(form);
     });
-    return;
   }
-  if (gen !== serverGen) return; // a newer switch's populateSchemas owns the dropdowns
-  document.querySelectorAll(".schema-select").forEach((sel) => {
-    clear(sel);
-    sel.appendChild(opt("", "— select —"));
-    schemas.forEach((s) => sel.appendChild(opt(s, s)));
-  });
+  viewEnter();
 }
 
-async function loadTables(form) {
-  const gen = serverGen;
-  const schema = form.querySelector(".schema-select").value;
-  const tsel = form.querySelector(".table-select");
-  clear(tsel);
-  tsel.appendChild(opt("", "— any —"));
-  if (!schema) return;
-  try {
-    const data = await api("/api/schemas?schema=" + encodeURIComponent(schema));
-    if (gen !== serverGen) return; // switched servers mid-flight
-    (data.tables || []).forEach((t) => tsel.appendChild(opt(t, t)));
-  } catch (err) {
-    if (gen !== serverGen) return;
-    // Surface the failure (like populateSchemas) so an empty dropdown isn't
-    // mistaken for "this schema has no tables". Table is still optional.
-    tsel.appendChild(opt("", "(error loading tables)"));
-    toast("failed to load tables: " + (err.message || err));
-  }
+// setSelectWhenReady fills a schema select once its options have loaded, then
+// loads its tables and runs cb. Lets the undo-bridge prefill survive the async
+// schema fetch without racing it.
+function setSelectWhenReady(form, name, value, cb) {
+  const sel = form.elements[name];
+  const tryset = () => {
+    if (Array.from(sel.options).some((o) => o.value === value)) {
+      sel.value = value;
+      loadTables(form).then(() => cb && cb());
+      return true;
+    }
+    return false;
+  };
+  if (tryset()) return;
+  let n = 0;
+  const iv = setInterval(() => { if (tryset() || ++n > 40) clearInterval(iv); }, 50);
 }
 
-// ── reconstruct (time-travel) tab ────────────────────────────────────────────
-async function runReconstruct(history) {
-  const form = document.getElementById("reconstruct-form");
-  const warns = document.getElementById("reconstruct-warnings");
-  const container = document.getElementById("reconstruct-result");
-  const p = formParams(form);
-  if (!p.schema || !p.table || !p.pk) {
-    clear(warns);
-    renderError(container, new Error("schema, table, and pk are required"));
-    return;
-  }
-  const params = new URLSearchParams({ schema: p.schema, table: p.table, pk: p.pk });
-  if (p.at) params.set("at", p.at);
-  if (p.allow_gaps) params.set("allow_gaps", "true");
-  if (history) params.set("history", "true");
+async function previewRecover(form) {
   const gen = serverGen;
+  const container = $("#recover-preview", VIEW());
+  const f = Object.fromEntries(new FormData(form).entries());
+  const params = {};
+  ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) params[k] = f[k].trim(); });
   try {
-    const data = await api("/api/reconstruct?" + params.toString());
-    if (gen !== serverGen) return; // switched servers mid-flight
-    renderWarnings(warns, data.warnings);
-    if (history) renderReconstructHistory(container, data);
-    else renderReconstructState(container, data);
+    const data = await api("/api/events?" + new URLSearchParams(params).toString());
+    if (gen !== serverGen) return;
+    clear(container);
+    container.append(el("div", { class: "meta-line" }, el("b", { text: String(data.count) }), " affected event(s) · limit " + data.limit));
+    const list = el("div", { class: "events" });
+    const head = el("div", { class: "ev-head" });
+    ["time", "table", "type", "pk", "changed columns"].forEach((h) => head.append(el("span", { text: h })));
+    list.append(head);
+    const rows = el("div");
+    buildEventRows(rows, data.events || []);
+    list.append(rows);
+    container.append(list);
   } catch (err) {
     if (gen !== serverGen) return;
-    clear(warns);
     renderError(container, err);
+  }
+}
+
+async function generateUndo(form) {
+  const gen = serverGen;
+  const warns = $("#recover-warnings", VIEW());
+  const out = $("#recover-out", VIEW());
+  const f = Object.fromEntries(new FormData(form).entries());
+  const body = {};
+  ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) body[k] = f[k].trim(); });
+  if (!body.schema) { renderError(out, "recover requires at least a schema filter"); return; }
+  try {
+    const data = await api("/api/recover", { method: "POST", body });
+    if (gen !== serverGen) return;
+    renderWarnings(warns, data.warnings);
+    lastSQL = data.sql || "";
+    clear(out);
+    out.append(codePanel(lastSQL, data.statement_count + " statement(s) from " + data.row_count + " event(s)"));
+  } catch (err) {
+    if (gen !== serverGen) return;
+    clear(warns); renderError(out, err);
+  }
+}
+
+function codePanel(sql, metaLabel) {
+  const panel = el("div", { class: "codepanel", id: "sql-panel" });
+  const head = el("div", { class: "code-head" });
+  head.append(icon("file"));
+  const lbl = el("span", { class: "lbl" }, el("b", { text: "reversal.sql" }), " · " + (metaLabel || "read-only preview"));
+  head.append(lbl);
+  head.append(el("span", { class: "spacer" }));
+  head.append(el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: copySQL }));
+  head.append(el("button", { class: "btn btn-sm", type: "button", text: "Download", onclick: downloadSQL }));
+  panel.append(head);
+  panel.append(el("pre", { class: "code", text: sql }));
+  return panel;
+}
+function copySQL() {
+  navigator.clipboard.writeText(lastSQL).then(() => toast("SQL copied to clipboard"), () => toast("copy failed"));
+}
+function downloadSQL() { downloadBlob("bintrail-undo.sql", lastSQL, "application/sql"); }
+
+// Bridge: an event → Recover, scoped to that row up to the event's timestamp.
+function undoEvent(e) {
+  pendingRecover = {
+    schema: e.schema_name, table: e.table_name, pk: e.pk_values,
+    type: e.event_type, time: e.event_timestamp,
+  };
+  navigate("recover");
+}
+
+// ── Time-travel (reconstruct) ─────────────────────────────────────────────────
+
+function renderTimetravel(params) {
+  // Landed on /timetravel but reconstruct is gated off (direct URL or Back).
+  // Redirect by REWRITING the URL (replaceState) then re-dispatching — calling
+  // navigate(push=false) here would leave the URL on /timetravel and re-resolve
+  // straight back into this guard (infinite recursion).
+  if (!capsCache.reconstruct) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
+  const v = VIEW(); clear(v);
+  const sub = el("p", { class: "page-sub" },
+    "Reconstruct a single row's full state as of a point in time — baseline snapshot + binlog deltas. Pick a row and a moment; see its value then, or its complete change history.");
+  v.append(pageHead("Time-travel", sub));
+
+  const form = el("form", { class: "filters", id: "tt-form" });
+  form.append(fieldSelect("Schema", "schema", "md", true, false, null, "— select —"));
+  form.append(fieldSelect("Table", "table", "md", false, true));
+  form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
+  form.append(fieldInput("As of", "at", "md", "YYYY-MM-DD HH:MM (default: now)"));
+  const gapsField = el("div", { class: "field", style: "justify-content:flex-end" },
+    el("label", { class: "check" }, el("input", { type: "checkbox", name: "allow_gaps" }), el("span", { text: "Allow coverage gaps" })));
+  form.append(gapsField);
+  const actions = el("div", { class: "filter-actions" });
+  actions.append(el("button", { class: "btn btn-ghost", type: "button", text: "Full history", onclick: () => runReconstruct(form, true) }));
+  actions.append(el("button", { class: "btn btn-primary", type: "submit", text: "Value as of T" }));
+  form.append(actions);
+  v.append(form);
+
+  v.append(el("div", { id: "tt-warnings", class: "warnings" }));
+  const out = el("div", { id: "tt-out" });
+  out.append(el("div", { class: "tt-meta", text: "Run a query to reconstruct this row's state." }));
+  v.append(out);
+
+  form.addEventListener("submit", (e) => { e.preventDefault(); runReconstruct(form, false); });
+  wireSchemaCascade(form);
+  populateSchemas(form);
+  viewEnter();
+}
+
+async function runReconstruct(form, history) {
+  const gen = serverGen;
+  const warns = $("#tt-warnings", VIEW());
+  const out = $("#tt-out", VIEW());
+  const f = Object.fromEntries(new FormData(form).entries());
+  if (!f.schema || !f.table || !f.pk) { clear(warns); renderError(out, "schema, table, and pk are required"); return; }
+  const params = { schema: f.schema, table: f.table, pk: f.pk };
+  if (f.at && f.at.trim()) params.at = f.at.trim();
+  if (form.elements.allow_gaps && form.elements.allow_gaps.checked) params.allow_gaps = "true";
+  if (history) params.history = "true";
+  try {
+    const data = await api("/api/reconstruct?" + new URLSearchParams(params).toString());
+    if (gen !== serverGen) return;
+    renderWarnings(warns, data.warnings);
+    clear(out);
+    if (history) renderTimeline(out, data);
+    else renderStateAt(out, data);
+  } catch (err) {
+    if (gen !== serverGen) return;
+    clear(warns); renderError(out, err);
   }
 }
 
 function reconstructMeta(data, label) {
   return el("div", { class: "meta-line" },
-    `${data.schema}.${data.table} pk=${data.pk} · ${label} · baseline ${data.baseline_time} · ${data.event_count} event(s)`);
+    el("b", { text: data.schema + "." + data.table + " pk=" + data.pk }),
+    " · " + label + " · baseline " + data.baseline_time + " · " + data.event_count + " event(s)");
+}
+
+function renderStateAt(container, data) {
+  container.append(reconstructMeta(data, "as of " + data.at));
+  if (!data.found) { container.append(el("div", { class: "deleted-note", text: "No row with this primary key existed at or before the selected time." })); return; }
+  if (data.deleted) { container.append(el("div", { class: "deleted-note", text: "Row was deleted as of " + data.at + "." })); return; }
+  container.append(stateTable(data.state || {}));
 }
 
 function stateTable(state) {
-  const tbody = el("tbody");
-  Object.keys(state || {}).forEach((k) => {
-    tbody.appendChild(el("tr", null, el("th", null, k), el("td", null, valueToString(state[k]))));
+  const table = el("table", { class: "statetable" });
+  Object.keys(state).forEach((k) => {
+    table.append(el("tr", {}, el("th", { text: k }), el("td", { text: valueToString(state[k]) })));
   });
-  return el("table", { class: "statetable" }, tbody);
+  return table;
 }
 
-function renderReconstructState(container, data) {
-  clear(container);
-  container.appendChild(reconstructMeta(data, "as of " + data.at));
-  if (!data.found) {
-    container.appendChild(el("div", { class: "deleted-note" },
-      "No row with this primary key existed at or before the selected time."));
-    return;
-  }
-  if (data.deleted) {
-    container.appendChild(el("div", { class: "deleted-note" }, "Row was deleted as of " + data.at + "."));
-    return;
-  }
-  container.appendChild(stateTable(data.state));
-}
-
-function compactState(state) {
-  return Object.keys(state || {}).map((k) => `${k}=${valueToString(state[k])}`).join("   ");
-}
-
-function renderReconstructHistory(container, data) {
-  clear(container);
+function renderTimeline(container, data) {
   const entries = data.history || [];
-  container.appendChild(reconstructMeta(data, `history through ${data.at} · ${entries.length} state(s)`));
-  if (!data.found) {
-    container.appendChild(el("div", { class: "deleted-note" },
-      "No row with this primary key existed at or before the selected time."));
-    return;
-  }
-  const tl = el("div", { class: "timeline" });
+  container.append(reconstructMeta(data, "history through " + data.at + " · " + entries.length + " state(s)"));
+  if (!entries.length) { container.append(el("div", { class: "deleted-note", text: "No history for this primary key in the covered window." })); return; }
+
+  const tl = el("div", { class: "timeline", id: "timeline" });
+  let prev = null;
   entries.forEach((e) => {
-    const badgeClass = "badge " + (e.source === "baseline" ? "baseline" : e.source);
-    const head = el("div", { class: "tl-head" },
-      el("span", { class: badgeClass }, e.source),
-      el("span", { class: "tl-time" }, e.time));
-    const body = e.deleted
-      ? el("div", { class: "tl-state" }, "(row deleted)")
-      : el("div", { class: "tl-state" }, compactState(e.state));
-    tl.appendChild(el("div", { class: "tl-entry" }, head, body));
+    const node = el("div", { class: "tl-node" });
+    const kind = e.source === "baseline" ? "baseline" : e.source.toLowerCase();
+    node.append(el("span", { class: "tl-dot " + kind }));
+    const head = el("div", { class: "tl-head" });
+    head.append(el("span", { class: "badge " + (e.source === "baseline" ? "b-baseline" : badgeClass(e.source)), text: e.source }));
+    head.append(el("span", { class: "tl-time", text: e.time }));
+    node.append(head);
+
+    const body = el("div", { class: "tl-body" });
+    if (e.deleted || !e.state) {
+      body.append(el("span", { class: "pair" }, el("span", { class: "pk", text: "(row deleted)" })));
+    } else {
+      const changed = new Set();
+      if (prev) for (const k of Object.keys(e.state)) if (valueToString(e.state[k]) !== valueToString(prev[k])) changed.add(k);
+      Object.keys(e.state).forEach((k) => {
+        body.append(el("span", { class: "pair" },
+          el("span", { class: "pk", text: k + "=" }),
+          el("span", { class: "pv" + (e.source !== "baseline" && changed.has(k) ? " changed" : ""), text: valueToString(e.state[k]) })));
+      });
+      prev = e.state;
+    }
+    node.append(body);
+
+    if (e.source !== "baseline") {
+      const acts = el("div", { class: "tl-actions" });
+      acts.append(el("a", { class: "btn btn-sm tl-restore", text: "Restore to this state",
+        onclick: () => undoEvent({ schema_name: data.schema, table_name: data.table, pk_values: data.pk, event_type: e.source, event_timestamp: e.time }) }));
+      node.append(acts);
+    }
+    tl.append(node);
   });
-  container.appendChild(tl);
+  container.append(tl);
+
+  // "draws itself" — progressive-enhancement reveal (decorative).
+  requestAnimationFrame(() => {
+    tl.classList.add("drawn");
+    $all(".tl-node", tl).forEach((n, i) => setTimeout(() => n.classList.add("in"), 60 + i * 55));
+  });
 }
 
-// gateCapabilities toggles capability-gated tabs/panels per the SELECTED
-// server's report. Gated elements keep their data-capability attribute and are
-// shown/hidden via the cap-on class, so the gate re-evaluates on every server
-// switch (a server with Time-travel can be followed by one without). Anything
-// not enabled stays hidden (display:none via CSS), so an un-configured surface
-// never flashes on screen.
-// capsCache holds the last capability report (per selected server) so the
-// servers modal can gate monitor controls without refetching.
-let capsCache = {};
+// ── Status ─────────────────────────────────────────────────────────────────
+
+async function renderStatus() {
+  const gen = serverGen;
+  viewLoading();
+  let data;
+  try { data = await api("/api/status"); }
+  catch (err) { if (gen !== serverGen) return; const v = VIEW(); clear(v); v.append(pageHead("Status", null)); renderError(v, err); return; }
+  if (gen !== serverGen) return;
+  updateSideMeta(data);
+
+  const v = VIEW(); clear(v);
+  const sub = el("p", { class: "page-sub", text: "Index health at a glance — coverage window, stream position, and what's been captured." });
+  v.append(pageHead("Status", sub));
+
+  const cards = el("div", { class: "cards" });
+  const cov = data.coverage || {};
+  const stream = data.stream || null;
+  const arch = data.archives || null;
+
+  cards.append(statusCard("Summary", [
+    ["total events (est.)", data.total_events_estimate, true],
+    ["indexed files", (data.files || []).length],
+    ["partitions", (data.partitions || []).length],
+  ]));
+  cards.append(statusCard("Coverage", [
+    ["earliest event", cov.earliest_event],
+    ["latest event", cov.latest_event],
+    ["total events", cov.total_events],
+    ["schema changes", cov.schema_changes],
+  ]));
+  if (stream) cards.append(statusCard("Stream", [
+    ["mode", stream.mode],
+    ["binlog file", stream.binlog_file],
+    ["position", stream.binlog_position],
+    ["events indexed", stream.events_indexed],
+  ]));
+  if (arch) cards.append(statusCard("Archives", [
+    ["files", arch.total_files],
+    ["rows", arch.total_rows],
+    ["size", arch.total_size_human],
+  ]));
+  v.append(cards);
+  viewEnter();
+}
+
+function statusCard(title, rows) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: title }));
+  rows.forEach(([k, val, big]) => {
+    card.append(el("div", { class: "kv" },
+      el("span", { class: "kv-k", text: k }),
+      el("span", { class: "kv-v" + (big ? " big" : ""), text: val === null || val === undefined ? "—" : String(val) })));
+  });
+  return card;
+}
+
+function updateSideMeta(status) {
+  const servers = status.servers || [];
+  const s0 = servers[0];
+  const conn = s0 ? (s0.username + "@" + s0.host + ":" + s0.port) : "—";
+  const connEl = document.getElementById("meta-conn");
+  if (connEl) connEl.textContent = conn;
+  const streamEl = document.getElementById("meta-stream");
+  if (streamEl) {
+    clear(streamEl);
+    streamEl.append("stream ");
+    if (status.stream) {
+      streamEl.append(el("b", { text: status.stream.mode }));
+      if (status.stream.binlog_file) streamEl.append(" · " + status.stream.binlog_file);
+    } else {
+      streamEl.append(el("b", { text: "—" }));
+    }
+  }
+}
+
+// ── schemas / tables cascade ──────────────────────────────────────────────────
+
+async function loadSchemas() {
+  if (schemaCache) return schemaCache;
+  const data = await api("/api/schemas");
+  schemaCache = data.schemas || [];
+  return schemaCache;
+}
+
+async function populateSchemas(root) {
+  const gen = serverGen;
+  const selects = $all(".schema-select", root || document);
+  if (!selects.length) return;
+  let schemas;
+  try { schemas = await loadSchemas(); }
+  catch (err) {
+    if (gen !== serverGen) return;
+    selects.forEach((sel) => { const keep = sel.value; clear(sel); sel.append(opt("", "(error: " + ((err && err.message) || err) + ")")); sel.value = keep; });
+    return;
+  }
+  if (gen !== serverGen) return;
+  selects.forEach((sel) => {
+    const keep = sel.value;
+    clear(sel);
+    sel.append(opt("", "— select —"));
+    schemas.forEach((s) => sel.append(opt(s, s)));
+    if (keep) sel.value = keep;
+  });
+}
+
+async function loadTables(form) {
+  const gen = serverGen;
+  const sel = form.querySelector(".schema-select");
+  const tsel = form.querySelector(".table-select");
+  if (!tsel) return;
+  const schema = sel ? sel.value : "";
+  clear(tsel);
+  tsel.append(opt("", "— any —"));
+  if (!schema) return;
+  let tables = tablesCache.get(schema);
+  try {
+    if (!tables) { const data = await api("/api/schemas?schema=" + encodeURIComponent(schema)); tables = data.tables || []; tablesCache.set(schema, tables); }
+  } catch (err) {
+    if (gen !== serverGen) return;
+    tsel.append(opt("", "(error loading tables)"));
+    toast("failed to load tables: " + ((err && err.message) || err));
+    return;
+  }
+  if (gen !== serverGen) return;
+  tables.forEach((t) => tsel.append(opt(t, t)));
+}
+
+function wireSchemaCascade(root) {
+  $all(".schema-select", root).forEach((sel) => sel.addEventListener("change", () => loadTables(sel.closest("form"))));
+}
+
+// ── capabilities gating ────────────────────────────────────────────────────
 
 async function gateCapabilities() {
   const gen = serverGen;
   let caps = {};
-  try {
-    caps = await api("/api/capabilities");
-  } catch {
-    caps = {}; // unreachable/unknown server → no optional surfaces
-  }
-  if (gen !== serverGen) return; // a newer switch's gate owns the tabs
-  capsCache = caps;
-  document.querySelectorAll("[data-capability]").forEach((node) => {
-    node.classList.toggle("cap-on", !!caps[node.dataset.capability]);
-  });
-  // If the active tab just lost its capability on a switch, fall back to the
-  // landing tab rather than leaving a blank main area.
-  const active = document.querySelector(".tab.active");
-  if (active && active.dataset.capability && !caps[active.dataset.capability]) {
-    const home = document.querySelector('.tab[data-panel="recover"]');
-    if (home) home.click();
-  }
+  try { caps = await api("/api/capabilities"); } catch (_) { caps = {}; }
+  if (gen !== serverGen) return;
+  capsCache = caps || {};
+  $all("[data-capability]").forEach((node) => node.classList.toggle("cap-on", !!capsCache[node.dataset.capability]));
 }
 
-// ── server switcher + management modal ───────────────────────────────────────
-function serverLabel(s) {
-  return s.kind === "ephemeral" ? s.name + " (cli)" : s.name;
-}
+// ── server registry: switcher + modal CRUD ──────────────────────────────────
 
-// loadServers refreshes the header dropdown from /api/servers and reconciles a
-// stale per-tab selection (e.g. the server was deleted from another tab).
+function serverLabel(s) { return s.kind === "ephemeral" ? s.name + " (cli)" : s.name; }
+
 async function loadServers() {
   const data = await api("/api/servers");
   defaultServerId = data.default_id || "";
   const servers = data.servers || [];
-  if (currentServer && !servers.some((s) => s.id === currentServer)) {
-    setCurrentServer(""); // deleted under us → fall back to the default
-  }
+  // Reconcile a stale selection (server deleted elsewhere).
+  if (currentServer && !servers.some((s) => s.id === currentServer)) setCurrentServer("");
   const sel = document.getElementById("server-select");
-  clear(sel);
-  servers.forEach((s) => sel.appendChild(opt(s.id, serverLabel(s))));
-  sel.value = currentServer || defaultServerId;
+  if (sel) {
+    clear(sel);
+    servers.forEach((s) => sel.append(opt(s.id, serverLabel(s))));
+    sel.value = currentServer || defaultServerId;
+  }
   return servers;
-}
-
-// clearResults wipes every per-server result so nothing from the previous
-// server lingers after a switch (stale rows would read as the new server's).
-function clearResults() {
-  ["events-result", "events-warnings", "recover-preview", "recover-warnings",
-    "reconstruct-result", "reconstruct-warnings", "status-result"].forEach((id) => {
-    const n = document.getElementById(id);
-    if (n) clear(n);
-  });
-  document.getElementById("recover-sql-wrap").hidden = true;
-  lastSQL = "";
 }
 
 async function switchServer(id) {
   setCurrentServer(id);
-  serverGen++; // anything still in flight for the previous server must not render
-  clearResults();
+  serverGen++;
+  schemaCache = null;
+  tablesCache.clear();
+  // A switch is a fresh context: drop any carried undo-context and SQL so they
+  // can never be auto-applied against a different server's index.
+  pendingRecover = null;
+  lastSQL = "";
   await gateCapabilities();
-  populateSchemas();
+  renderRoute(); // re-render the current screen for the new server
+}
+
+// modal -----------------------------------------------------------------------
+
+function buildServersModal() {
+  const scrim = el("div", { class: "modal-scrim show" });
+  const modal = el("div", { class: "modal", role: "dialog", "aria-label": "Servers" });
+
+  const head = el("div", { class: "modal-head" });
+  head.append(el("h2", { class: "modal-title", text: "Servers" }));
+  const desc = el("p", { class: "modal-desc" },
+    "Named connections to bintrail index databases, stored in a local file on the console host. ");
+  desc.append(el("span", { "data-capability": "monitor" },
+    "This process can also ", el("b", { text: "monitor" }),
+    " a source MySQL: add one below and bintrail runs the preflight checks, provisions an index for it, and starts streaming — no terminal needed."));
+  head.append(desc);
+  head.append(el("button", { class: "modal-x", type: "button", text: "✕", onclick: closeServersModal }));
+  modal.append(head);
+
+  const body = el("div", { class: "modal-body" });
+  body.append(el("div", { class: "srv-list", id: "servers-list" }));
+  body.append(el("div", { id: "server-add-wrap", style: "margin-top:18px" },
+    el("button", { class: "btn btn-primary", type: "button", id: "server-add", text: "+ Add server", onclick: () => showServerForm(null) })));
+  body.append(el("div", { id: "server-form-mount" }));
+  modal.append(body);
+
+  scrim.append(modal);
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) closeServersModal(); });
+  return scrim;
 }
 
 function openServersModal() {
-  document.getElementById("servers-modal").hidden = false;
-  hideServerForm();
+  const mount = document.getElementById("modal");
+  clear(mount);
+  mount.append(buildServersModal());
+  // re-apply capability gating to the freshly-mounted [data-capability] nodes
+  $all("[data-capability]", mount).forEach((n) => n.classList.toggle("cap-on", !!capsCache[n.dataset.capability]));
   refreshServersList();
 }
-
-function closeServersModal() {
-  document.getElementById("servers-modal").hidden = true;
-}
-
-// isLiveMonitorState: states where the stream goroutine is alive (Stop is the
-// applicable verb). "stalled" and "lost_position" are unhealthy running
-// variants — the supervisor still owns the stream and its advisory lock.
-function isLiveMonitorState(st) {
-  return st === "running" || st === "pending" || st === "stalled" || st === "lost_position";
-}
-
-const MON_STATE_TITLES = {
-  failed: "stream failing — retrying with backoff; press Start for details",
-  stalled: "stream is connected but has made no progress for several minutes",
-  lost_position: "binlogs were purged past the saved position — events in the gap are permanently lost; current changes are still streaming",
-};
+function closeServersModal() { document.getElementById("modal").replaceChildren(); }
 
 async function refreshServersList() {
   const list = document.getElementById("servers-list");
-  let servers = [];
-  try {
-    servers = await loadServers();
-  } catch (err) {
-    renderError(list, err);
-    return;
-  }
+  if (!list) return;
+  let servers;
+  try { servers = await loadServers(); }
+  catch (err) { renderError(list, err); return; }
   clear(list);
-  if (servers.length === 0) {
-    list.appendChild(el("div", { class: "empty" }, "No servers yet — add your first connection."));
-    return;
-  }
-  servers.forEach((s) => {
-    const desc = s.has_source && s.source_host
-      ? `watching ${s.source_user}@${s.source_host}:${s.source_port || "3306"}${s.schemas ? " [" + s.schemas + "]" : ""}`
-      : (s.host ? `${s.user}@${s.host}:${s.port || "3306"}/${s.dbname}` : s.dbname || "");
-    const monitorable = capsCache.monitor && s.has_source && s.kind !== "ephemeral";
+  if (!servers.length) { list.append(el("div", { class: "ev-empty", text: "No servers yet — add your first connection." })); return; }
+  servers.forEach((s) => list.append(serverRow(s)));
+}
+
+function isLiveMonitorState(st) { return st === "running" || st === "pending" || st === "stalled" || st === "lost_position"; }
+
+function serverRow(s) {
+  const item = el("div", { class: "srv-item" });
+  const nm = el("span", { class: "nm" },
+    el("span", { class: "health-dot" + (s.connected ? " ok" : ""), title: s.connected ? "connected" : "not connected yet" }),
+    serverLabel(s));
+  item.append(nm);
+  if (s.kind === "ephemeral") item.append(el("span", { class: "chip chip-cli", text: "CLI", title: "From --index-dsn; managed by the command line" }));
+  if (s.reconstruct) item.append(el("span", { class: "chip chip-tt", text: "TT", title: "Baseline configured: Time-travel available" }));
+  if (s.monitor_state) item.append(el("span", { class: "chip chip-mon", text: s.monitor_state.replace("_", " ").toUpperCase(), title: MON_STATE_TITLES[s.monitor_state] || ("monitoring " + s.monitor_state) }));
+
+  let desc;
+  if (s.has_source && s.source_host) desc = "watching " + s.source_user + "@" + s.source_host + ":" + (s.source_port || "3306") + (s.schemas ? " [" + s.schemas + "]" : "");
+  else if (s.host) desc = s.user + "@" + s.host + ":" + (s.port || "3306") + "/" + s.dbname;
+  else desc = s.dbname || "";
+  item.append(el("span", { class: "srv-desc conn", text: desc }));
+
+  item.append(el("span", { class: "srv-status", id: "srv-status-" + s.id }));
+
+  const acts = el("span", { class: "acts row-acts" });
+  const monitorable = capsCache.monitor && s.has_source && s.kind !== "ephemeral";
+  if (monitorable) {
     const running = isLiveMonitorState(s.monitor_state);
-    const row = el("div", { class: "server-row" },
-      el("span", { class: "health-dot" + (s.connected ? " ok" : ""), title: s.connected ? "connected" : "not connected yet" }),
-      el("span", { class: "srv-name" }, serverLabel(s)),
-      s.kind === "ephemeral" ? el("span", { class: "badge cli", title: "From --index-dsn; managed by the command line" }, "CLI") : null,
-      s.reconstruct ? el("span", { class: "badge tt", title: "Baseline configured: Time-travel available" }, "TT") : null,
-      s.monitor_state ? el("span", {
-        class: "badge mon-" + s.monitor_state,
-        title: MON_STATE_TITLES[s.monitor_state] || ("monitoring " + s.monitor_state),
-      }, s.monitor_state.replace("_", " ").toUpperCase()) : null,
-      el("span", { class: "srv-desc" }, desc),
-      el("span", { class: "srv-status", id: "srv-status-" + s.id }),
-      monitorable ? el("button", {
-        type: "button", class: "row-btn" + (running ? "" : " primaryish"),
-        onclick: () => (running ? stopMonitorRow(s.id) : startMonitorRow(s.id)),
-      }, running ? "Stop" : "Start") : null,
-      el("button", { type: "button", class: "row-btn", onclick: () => testServerRow(s.id) }, "Test"),
-      el("button", { type: "button", class: "row-btn", disabled: s.editable ? null : "", onclick: () => editServer(s.id) }, "Edit"),
-      el("button", { type: "button", class: "row-btn danger", disabled: s.deletable ? null : "", onclick: () => deleteServer(s) }, "Delete"),
-    );
-    list.appendChild(row);
-  });
-}
-
-// renderDoctor paints the preflight report as remediation cards inside the
-// form — the 3am operator gets the exact fix, not a log pointer.
-function renderDoctor(report) {
-  const c = document.getElementById("doctor-cards");
-  clear(c);
-  if (!report || !report.checks) return;
-  report.checks.forEach((chk) => {
-    const mark = chk.status === "pass" ? "✓" : chk.status === "fail" ? "✗" : chk.status === "warn" ? "!" : "–";
-    c.appendChild(el("div", { class: "doctor-card " + chk.status },
-      el("span", { class: "dc-mark" }, mark),
-      el("div", { class: "dc-body" },
-        el("div", { class: "dc-name" }, chk.name + (chk.detail ? " — " + chk.detail : "")),
-        chk.remediation ? el("pre", { class: "dc-rem" }, chk.remediation) : null)));
-  });
-}
-
-// startMonitor runs the doctor-then-stream flow for one entry and reports the
-// outcome. Returns the start response (or null on transport error).
-async function startMonitor(id) {
-  try {
-    return await api("/api/servers/" + encodeURIComponent(id) + "/monitor/start", { method: "POST", body: {} });
-  } catch (err) {
-    toast("start failed: " + (err.message || err));
-    return null;
+    acts.append(el("button", { class: "btn btn-sm" + (running ? "" : " btn-primary"), type: "button", text: running ? "Stop" : "Start",
+      onclick: () => running ? stopMonitorRow(s.id) : startMonitorRow(s.id) }));
   }
+  acts.append(el("button", { class: "btn btn-sm", type: "button", text: "Test", onclick: () => testServerRow(s.id) }));
+  acts.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Edit", disabled: !s.editable, onclick: () => editServer(s.id) }));
+  acts.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Delete", disabled: !s.deletable, onclick: () => deleteServer(s) }));
+  item.append(acts);
+  return item;
 }
 
-async function startMonitorRow(id) {
-  const slot = document.getElementById("srv-status-" + id);
-  if (slot) slot.textContent = "running checks…";
-  const res = await startMonitor(id);
-  await refreshServersList();
-  if (!res) return;
-  if (res.started) {
-    if (doctorWarnings(res.doctor)) {
-      // Warnings never block (started already), but they must be SEEN —
-      // e.g. "this looks like a replica of an already-monitored server".
-      // If the editor cannot open (server deleted concurrently), don't
-      // render into a hidden form — degrade to a toast.
-      if (await editServer(id)) {
-        renderDoctor(res.doctor);
-        formMsg("monitoring started — review the warnings below", false);
-      } else {
-        toast("Monitoring started with warnings — edit the server to review them");
-      }
-    } else {
-      toast("Monitoring started");
-    }
-  } else {
-    // Preflight failed — open the editor so the remediation cards are visible.
-    if (await editServer(id)) {
-      renderDoctor(res.doctor);
-      formMsg("preflight failed — fix the items below, Save, and Start again", true);
-    }
-  }
+// server form (add/edit) ------------------------------------------------------
+
+// srvField builds a labeled input row: <label class="field"><span/><input/></label>.
+function srvField(label, name, opts) {
+  opts = opts || {};
+  return el("label", { class: "field" },
+    el("span", { class: "field-label", text: label }),
+    el("input", { class: "input", name, type: opts.type || "text", placeholder: opts.placeholder || "", autocomplete: opts.autocomplete }));
 }
 
-// doctorWarnings: does the preflight report carry warn cards worth showing?
-function doctorWarnings(report) {
-  return !!(report && report.warnings > 0);
-}
+function buildServerForm() {
+  const form = el("form", { class: "filters", id: "server-form", style: "display:block;margin-top:18px" });
+  form.append(el("input", { type: "hidden", name: "id" }));
 
-async function stopMonitorRow(id) {
-  try {
-    await api("/api/servers/" + encodeURIComponent(id) + "/monitor/stop", { method: "POST", body: {} });
-    toast("Monitoring stopped");
-  } catch (err) {
-    toast("stop failed: " + (err.message || err));
-  }
-  await refreshServersList();
-}
+  const mon = el("fieldset", { class: "form-section", "data-capability": "monitor" });
+  mon.append(el("legend", { class: "form-legend", text: "Monitor a source MySQL" }));
+  mon.append(el("p", { class: "form-hint", text: "Paste the server to watch — bintrail runs the preflight checks, provisions an index for it, and starts streaming. Leave the index section empty; it is created automatically." }));
+  const monGrid = el("div", { class: "form-grid" });
+  monGrid.append(srvField("Source host", "source_host", { placeholder: "db.example.com" }));
+  monGrid.append(srvField("Source port", "source_port", { placeholder: "3306" }));
+  monGrid.append(srvField("Source user", "source_user", { placeholder: "repl" }));
+  monGrid.append(srvField("Source password", "source_password", { type: "password", autocomplete: "new-password" }));
+  monGrid.append(srvField("Schemas", "schemas", { placeholder: "(optional) shop,billing" }));
+  mon.append(monGrid);
+  form.append(mon);
 
-function formMsg(text, isError) {
-  const n = document.getElementById("server-form-msg");
-  n.className = "form-msg " + (isError ? "err" : "ok");
-  n.textContent = text;
+  const idx = el("fieldset", { class: "form-section" });
+  idx.append(el("legend", { class: "form-legend", text: "Index connection" }));
+  const idxGrid = el("div", { class: "form-grid" });
+  idxGrid.append(srvField("Name", "name", { placeholder: "prod-db-01" }));
+  idxGrid.append(srvField("Host", "host", { placeholder: "127.0.0.1" }));
+  idxGrid.append(srvField("Port", "port", { placeholder: "3306" }));
+  idxGrid.append(srvField("User", "user", { placeholder: "bintrail" }));
+  idxGrid.append(srvField("Password", "password", { type: "password", autocomplete: "new-password" }));
+  idxGrid.append(srvField("Index database", "dbname", { placeholder: "binlog_index" }));
+  idxGrid.append(srvField("Baseline dir", "baseline_dir", { placeholder: "(optional) enables Time-travel" }));
+  idxGrid.append(srvField("Baseline S3", "baseline_s3", { placeholder: "s3://bucket/prefix/" }));
+  idx.append(idxGrid);
+  idx.append(el("label", { class: "check", style: "margin-top:10px" },
+    el("input", { type: "checkbox", name: "no_archive" }), el("span", { text: "Disable archive auto-discovery" })));
+  form.append(idx);
+
+  const foot = el("div", { class: "modal-foot filter-actions" });
+  foot.append(el("button", { class: "btn btn-primary", type: "submit", text: "Save" }));
+  foot.append(el("button", { class: "btn", type: "button", id: "server-test", text: "Test connection" }));
+  foot.append(el("button", { class: "btn btn-ghost", type: "button", id: "server-cancel", text: "Cancel" }));
+  form.append(foot);
+  form.append(el("div", { id: "server-form-msg", class: "form-msg" }));
+  form.append(el("div", { id: "doctor-cards", class: "doctor-cards" }));
+  return form;
 }
 
 function showServerForm(prefill) {
-  const f = document.getElementById("server-form");
-  f.reset();
-  formMsg("", false);
-  clear(document.getElementById("doctor-cards"));
-  f.elements.id.value = prefill ? prefill.id : "";
-  if (prefill) {
-    f.elements.name.value = prefill.name || "";
-    f.elements.host.value = prefill.host || "";
-    f.elements.port.value = prefill.port || "";
-    f.elements.user.value = prefill.user || "";
-    f.elements.dbname.value = prefill.dbname || "";
-    f.elements.baseline_dir.value = prefill.baseline_dir || "";
-    f.elements.baseline_s3.value = prefill.baseline_s3 || "";
-    f.elements.no_archive.checked = !!prefill.no_archive;
-    f.elements.password.placeholder = prefill.has_password ? "(unchanged — leave blank to keep)" : "(none)";
-    f.elements.source_host.value = prefill.source_host || "";
-    f.elements.source_port.value = prefill.source_port || "";
-    f.elements.source_user.value = prefill.source_user || "";
-    f.elements.schemas.value = prefill.schemas || "";
-    f.elements.source_password.placeholder = prefill.has_source_password ? "(unchanged — leave blank to keep)" : "";
-  } else {
-    f.elements.password.placeholder = "";
-    f.elements.source_password.placeholder = "";
-  }
   document.getElementById("server-add-wrap").hidden = true;
-  f.hidden = false;
-  f.elements.name.focus();
-}
+  const mountEl = document.getElementById("server-form-mount");
+  const form = buildServerForm();
+  mountEl.replaceChildren(form);
+  $all("[data-capability]", form).forEach((n) => n.classList.toggle("cap-on", !!capsCache[n.dataset.capability]));
+  $("#server-cancel", form).addEventListener("click", hideServerForm);
+  $("#server-test", form).addEventListener("click", () => testServerForm(form));
+  form.addEventListener("submit", (e) => { e.preventDefault(); saveServer(form); });
 
+  if (prefill) {
+    form.elements.id.value = prefill.id || "";
+    ["name", "host", "port", "user", "dbname", "baseline_dir", "baseline_s3", "source_host", "source_port", "source_user", "schemas"].forEach((k) => {
+      if (form.elements[k] && prefill[k] != null) form.elements[k].value = prefill[k];
+    });
+    if (form.elements.no_archive) form.elements.no_archive.checked = !!prefill.no_archive;
+    form.elements.password.placeholder = prefill.has_password ? "(unchanged — leave blank to keep)" : "(none)";
+    form.elements.source_password.placeholder = prefill.has_source_password ? "(unchanged — leave blank to keep)" : "";
+  }
+  form.elements.name.focus();
+}
 function hideServerForm() {
-  document.getElementById("server-form").hidden = true;
-  document.getElementById("server-add-wrap").hidden = false;
+  document.getElementById("server-form-mount").replaceChildren();
+  const addWrap = document.getElementById("server-add-wrap");
+  if (addWrap) addWrap.hidden = false;
 }
 
-// editServer opens the editor form for a server; returns true when the form
-// is actually showing (callers that render into it must not assume success —
-// the server may have been deleted concurrently).
+function formMsg(text, isError) {
+  const m = document.getElementById("server-form-msg");
+  if (!m) return;
+  m.className = "form-msg " + (isError ? "err" : "ok");
+  m.textContent = text;
+}
+
+// keep-password semantics: omit password fields when blank (= keep stored).
+function serverFormBody(form) {
+  const f = form.elements;
+  const body = {
+    name: f.name.value.trim(),
+    host: f.host.value.trim(), port: f.port.value.trim(), user: f.user.value.trim(), dbname: f.dbname.value.trim(),
+    baseline_dir: f.baseline_dir.value.trim(), baseline_s3: f.baseline_s3.value.trim(),
+    no_archive: !!f.no_archive.checked,
+    source_host: f.source_host.value.trim(), source_port: f.source_port.value.trim(),
+    source_user: f.source_user.value.trim(), schemas: f.schemas.value.trim(),
+  };
+  if (f.password.value !== "") body.password = f.password.value;
+  if (f.source_password.value !== "") body.source_password = f.source_password.value;
+  return body;
+}
+
 async function editServer(id) {
   try {
     const s = await api("/api/servers/" + encodeURIComponent(id));
     showServerForm(s);
     return true;
-  } catch (err) {
-    toast("failed to load server: " + (err.message || err));
-    return false;
-  }
+  } catch (err) { toast("failed to load server: " + ((err && err.message) || err)); return false; }
 }
 
-// serverFormBody collects the form into a request body. The password is only
-// included when the operator typed one — an omitted password means "keep the
-// stored secret" on edit (the server merges it; the browser never sees it).
-function serverFormBody(f) {
-  const body = {
-    name: f.elements.name.value.trim(),
-    host: f.elements.host.value.trim(),
-    port: f.elements.port.value.trim(),
-    user: f.elements.user.value.trim(),
-    dbname: f.elements.dbname.value.trim(),
-    baseline_dir: f.elements.baseline_dir.value.trim(),
-    baseline_s3: f.elements.baseline_s3.value.trim(),
-    no_archive: f.elements.no_archive.checked,
-    source_host: f.elements.source_host.value.trim(),
-    source_port: f.elements.source_port.value.trim(),
-    source_user: f.elements.source_user.value.trim(),
-    schemas: f.elements.schemas.value.trim(),
-  };
-  if (f.elements.password.value !== "") body.password = f.elements.password.value;
-  if (f.elements.source_password.value !== "") body.source_password = f.elements.source_password.value;
-  return body;
-}
-
-async function saveServer(e) {
-  e.preventDefault();
-  const f = e.target;
-  const id = f.elements.id.value;
+async function saveServer(form) {
+  const id = form.elements.id.value;
+  const body = serverFormBody(form);
   let saved;
   try {
-    if (id) {
-      saved = await api("/api/servers/" + encodeURIComponent(id), { method: "PUT", body: serverFormBody(f) });
-    } else {
-      saved = await api("/api/servers", { method: "POST", body: serverFormBody(f) });
-    }
-  } catch (err) {
-    formMsg(err.message || String(err), true);
-    return;
-  }
+    saved = await api(id ? "/api/servers/" + encodeURIComponent(id) : "/api/servers", { method: id ? "PUT" : "POST", body });
+  } catch (err) { formMsg((err && err.message) || String(err), true); return; }
 
-  // The zero-terminal flow: a saved server with a source goes straight into
-  // doctor → stream (auto-start on green). The form stays open on a failed
-  // preflight so the remediation cards are right there.
+  // Zero-terminal auto-start: a monitor-capable process with a source DSN starts
+  // streaming on save (after preflight). Doctor warnings keep the form open.
   if (capsCache.monitor && saved.has_source && !isLiveMonitorState(saved.monitor_state)) {
     formMsg("running preflight checks…", false);
     const res = await startMonitor(saved.id);
     await refreshServersList();
-    if (res && res.started && !doctorWarnings(res.doctor)) {
-      hideServerForm();
-      toast("Monitoring started — events will appear within a minute");
-    } else if (res && res.started) {
-      // Started, but with warn cards (e.g. replica-of-monitored) — keep the
-      // form open so the operator actually sees them.
-      renderDoctor(res.doctor);
-      formMsg("monitoring started — review the warnings below", false);
-    } else if (res) {
-      renderDoctor(res.doctor);
-      formMsg("preflight failed — fix the items below and Save again", true);
-    }
+    if (res && res.started && !doctorWarnings(res.doctor)) { hideServerForm(); toast("Monitoring started — events will appear within a minute"); }
+    else if (res && res.started) { renderDoctor(res.doctor); formMsg("monitoring started — review the warnings below", false); }
+    else if (res) { renderDoctor(res.doctor); formMsg("preflight failed — fix the items below and Save again", true); }
     return;
   }
-
   hideServerForm();
   await refreshServersList();
   toast(id ? "Server updated" : "Server added");
 }
 
 async function deleteServer(s) {
-  if (!window.confirm(`Remove server "${s.name}"? This only removes the saved connection — nothing happens to the server itself.`)) return;
-  try {
-    await api("/api/servers/" + encodeURIComponent(s.id), { method: "DELETE" });
-    if (currentServer === s.id) {
-      await switchServer(""); // deleted the selected server → back to default
-      document.getElementById("server-select").value = defaultServerId;
-    }
-    await refreshServersList();
-    toast("Server removed");
-  } catch (err) {
-    toast("delete failed: " + (err.message || err));
-  }
+  if (!window.confirm('Remove server "' + s.name + '"? This only removes the saved connection — nothing happens to the server itself.')) return;
+  try { await api("/api/servers/" + encodeURIComponent(s.id), { method: "DELETE" }); }
+  catch (err) { toast("delete failed: " + ((err && err.message) || err)); return; }
+  if (currentServer === s.id) { await switchServer(""); const sel = document.getElementById("server-select"); if (sel) sel.value = defaultServerId; }
+  await refreshServersList();
+  toast("Server removed");
 }
+
+// test / doctor / monitor -----------------------------------------------------
 
 function testResultText(res) {
   if (!res.ok) return "✗ " + (res.error || "unreachable");
-  let txt = `✓ ok · ${res.latency_ms} ms`;
-  if (res.server_version) txt += " · MySQL " + res.server_version;
-  // has_index/schema_current are tri-state: absent means the metadata lookup
-  // itself failed (unknown) — never render that as the confident negative.
-  if (res.has_index === false) txt += " · no binlog_events table (not a bintrail index?)";
-  else if (res.has_index === undefined || res.schema_current === undefined) txt += " · index metadata unavailable";
-  else if (res.schema_current === false) txt += " · index schema outdated (run bintrail index/stream once)";
-  return txt;
+  let s = "✓ ok · " + res.latency_ms + " ms";
+  if (res.server_version) s += " · MySQL " + res.server_version;
+  // has_index/schema_current are tri-state: absent = the metadata lookup itself
+  // failed (unknown) — never render that as the confident negative.
+  if (res.has_index === false) s += " · no binlog_events table (not a bintrail index?)";
+  else if (res.has_index === undefined || res.schema_current === undefined) s += " · index metadata unavailable";
+  else if (res.schema_current === false) s += " · index schema outdated (run bintrail index/stream once)";
+  return s;
 }
 
-// testServerForm probes the (possibly unsaved) form values; with an id the
-// backend merges the stored password when the field was left blank.
-async function testServerForm() {
-  const f = document.getElementById("server-form");
-  const id = f.elements.id.value;
-  const path = id ? "/api/servers/" + encodeURIComponent(id) + "/test" : "/api/servers/test";
+async function testServerForm(form) {
+  const id = form.elements.id.value;
+  const body = serverFormBody(form);
   formMsg("testing…", false);
   try {
-    const res = await api(path, { method: "POST", body: serverFormBody(f) });
+    const res = await api(id ? "/api/servers/" + encodeURIComponent(id) + "/test" : "/api/servers/test", { method: "POST", body });
     formMsg(testResultText(res), !res.ok);
-  } catch (err) {
-    formMsg(err.message || String(err), true);
-  }
+  } catch (err) { formMsg((err && err.message) || String(err), true); }
 }
 
-// testServerRow probes a saved entry as-is (no body → stored DSN).
 async function testServerRow(id) {
   const slot = document.getElementById("srv-status-" + id);
-  if (slot) slot.textContent = "testing…";
+  if (slot) { slot.className = "srv-status"; slot.textContent = "testing…"; }
   try {
     const res = await api("/api/servers/" + encodeURIComponent(id) + "/test", { method: "POST", body: {} });
-    if (slot) {
-      slot.textContent = testResultText(res);
-      slot.className = "srv-status " + (res.ok ? "ok" : "err");
-    }
-  } catch (err) {
-    if (slot) {
-      slot.textContent = "✗ " + (err.message || err);
-      slot.className = "srv-status err";
-    }
-  }
+    if (slot) { slot.className = "srv-status " + (res.ok ? "ok" : "err"); slot.textContent = testResultText(res); }
+  } catch (err) { if (slot) { slot.className = "srv-status err"; slot.textContent = "✗ " + ((err && err.message) || err); } }
 }
 
-// ── wiring ───────────────────────────────────────────────────────────────────
-function init() {
-  document.querySelectorAll(".tab").forEach((t) => {
-    t.addEventListener("click", () => {
-      document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
-      document.querySelectorAll(".panel").forEach((x) => x.classList.remove("active"));
-      t.classList.add("active");
-      document.getElementById(t.dataset.panel).classList.add("active");
-    });
-  });
+function doctorWarnings(report) { return !!(report && report.warnings > 0); }
 
-  document.getElementById("events-form").addEventListener("submit", runEvents);
-  document.getElementById("recover-form").addEventListener("submit", generateUndo);
-  document.querySelector("#recover-form .preview-btn").addEventListener("click", previewRecover);
-  document.getElementById("copy-sql").addEventListener("click", copySQL);
-  document.getElementById("download-sql").addEventListener("click", downloadSQL);
-  document.getElementById("status-refresh").addEventListener("click", refreshStatus);
-
-  document.getElementById("reconstruct-form").addEventListener("submit", (e) => {
-    e.preventDefault();
-    runReconstruct(false);
+function renderDoctor(report) {
+  const box = document.getElementById("doctor-cards");
+  if (!box) return;
+  clear(box);
+  if (!report || !report.checks) return;
+  report.checks.forEach((chk) => {
+    const status = ["pass", "fail", "warn"].includes(chk.status) ? chk.status : "skip";
+    const mark = { pass: "✓", fail: "✗", warn: "!", skip: "–" }[status];
+    const card = el("div", { class: "doctor-card " + status });
+    card.append(el("span", { class: "dc-mark", text: mark }));
+    const bodyEl = el("div", { class: "dc-body" }, el("div", { class: "dc-name", text: chk.name + (chk.detail ? " — " + chk.detail : "") }));
+    if (chk.remediation) bodyEl.append(el("pre", { class: "dc-rem", text: chk.remediation }));
+    card.append(bodyEl);
+    box.append(card);
   });
-  document.querySelector("#reconstruct-form .preview-btn").addEventListener("click", () => runReconstruct(true));
+}
 
-  document.querySelectorAll(".schema-select").forEach((sel) => {
-    sel.addEventListener("change", () => loadTables(sel.closest("form")));
-  });
+async function startMonitor(id) {
+  try { return await api("/api/servers/" + encodeURIComponent(id) + "/monitor/start", { method: "POST", body: {} }); }
+  catch (err) { toast("start failed: " + ((err && err.message) || err)); return null; }
+}
 
-  // Server switcher + management modal.
-  document.getElementById("server-select").addEventListener("change", (e) => {
-    switchServer(e.target.value);
+async function startMonitorRow(id) {
+  const slot = document.getElementById("srv-status-" + id);
+  if (slot) { slot.className = "srv-status"; slot.textContent = "running checks…"; }
+  const res = await startMonitor(id);
+  await refreshServersList();
+  if (!res) return;
+  if (res.started && !doctorWarnings(res.doctor)) { toast("Monitoring started"); return; }
+  const opened = await editServer(id);
+  if (opened) {
+    renderDoctor(res.doctor);
+    formMsg(res.started ? "monitoring started — review the warnings below" : "preflight failed — fix the items below, Save, and Start again", !res.started);
+  } else { toast(res.started ? "Monitoring started — with warnings" : "Preflight failed"); }
+}
+
+async function stopMonitorRow(id) {
+  try { await api("/api/servers/" + encodeURIComponent(id) + "/monitor/stop", { method: "POST", body: {} }); toast("Monitoring stopped"); }
+  catch (err) { toast("stop failed: " + ((err && err.message) || err)); }
+  await refreshServersList();
+}
+
+// ── command palette (⌘K) ──────────────────────────────────────────────────
+
+let cmdkSel = 0, cmdkItems = [];
+
+function cmdkCommands() {
+  const cmds = [
+    { group: "Navigate", label: "Overview", run: () => navigate("overview") },
+    { group: "Navigate", label: "Events", run: () => navigate("events") },
+    { group: "Navigate", label: "Recover", run: () => navigate("recover") },
+    { group: "Navigate", label: "Status", run: () => navigate("status") },
+  ];
+  if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
+  cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });
+  cmds.push({ group: "Actions", label: "Search events for…", hint: "type then ↵", search: true });
+  return cmds;
+}
+
+function openCmdk() {
+  const mount = document.getElementById("cmdk-mount");
+  clear(mount);
+  const scrim = el("div", { class: "cmdk-scrim open" });
+  const panel = el("div", { class: "cmdk", role: "dialog", "aria-label": "Commands" });
+  const top = el("div", { class: "cmdk-top" });
+  top.append(icon("search"));
+  const q = el("input", { class: "cmdk-q", id: "cmdk-q", placeholder: "Search commands, or type to find events…", autocomplete: "off", spellcheck: "false" });
+  top.append(q);
+  top.append(el("span", { class: "cmdk-escpill", text: "esc" }));
+  panel.append(top);
+  panel.append(el("div", { class: "cmdk-list", id: "cmdk-list" }));
+  scrim.append(panel);
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) closeCmdk(); });
+  mount.append(scrim);
+  q.addEventListener("input", () => renderCmdk(q.value));
+  q.addEventListener("keydown", cmdkKeydown);
+  renderCmdk("");
+  q.focus();
+}
+function closeCmdk() { document.getElementById("cmdk-mount").replaceChildren(); }
+
+function renderCmdk(query) {
+  const list = document.getElementById("cmdk-list");
+  if (!list) return;
+  const q = (query || "").toLowerCase().trim();
+  let cmds = cmdkCommands();
+  if (q) cmds = cmds.filter((c) => c.search || c.label.toLowerCase().includes(q));
+  cmdkItems = cmds; cmdkSel = 0;
+  clear(list);
+  if (!cmds.length) { list.append(el("div", { class: "cmdk-empty", text: "No commands match." })); return; }
+  let group = null;
+  cmds.forEach((c, i) => {
+    if (c.group !== group) { group = c.group; list.append(el("div", { class: "cmdk-group", text: group })); }
+    const item = el("button", { class: "cmdk-item" + (i === cmdkSel ? " sel" : ""), type: "button",
+      "data-idx": i, onclick: () => runCmdk(c, query) });
+    item.append(icon("search", "cmdk-ic"));
+    item.append(el("span", { class: "cmdk-label", text: c.search && q ? 'Search events: "' + query.trim() + '"' : c.label }));
+    if (c.hint) item.append(el("span", { class: "cmdk-hint", text: c.hint }));
+    list.append(item);
   });
+}
+function runCmdk(c, query) {
+  if (c.search) { closeCmdk(); navigate("events", query && query.trim() ? { q: query.trim() } : null); return; }
+  closeCmdk(); c.run();
+}
+function cmdkKeydown(e) {
+  const list = document.getElementById("cmdk-list");
+  if (e.key === "Escape") { closeCmdk(); return; }
+  if (e.key === "ArrowDown") { e.preventDefault(); cmdkSel = Math.min(cmdkItems.length - 1, cmdkSel + 1); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); cmdkSel = Math.max(0, cmdkSel - 1); }
+  else if (e.key === "Enter") { e.preventDefault(); const c = cmdkItems[cmdkSel]; if (c) runCmdk(c, e.target.value); return; }
+  else return;
+  $all(".cmdk-item", list).forEach((n) => n.classList.toggle("sel", Number(n.dataset.idx) === cmdkSel));
+  const sel = $(".cmdk-item.sel", list); if (sel) sel.scrollIntoView({ block: "nearest" });
+}
+
+// ── global keyboard ──────────────────────────────────────────────────────────
+
+function globalKeydown(e) {
+  // ⌘K / Ctrl+K opens the palette anywhere.
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openCmdk(); return; }
+  // j/k/↵/u row nav — only on Events, only when not typing in a field.
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement && document.activeElement.tagName);
+  if (typing || routeFromLocation() !== "events") return;
+  const rows = $all(".ev-row", VIEW());
+  if (e.key === "j") { e.preventDefault(); moveCursor(1); }
+  else if (e.key === "k") { e.preventDefault(); moveCursor(-1); }
+  else if (e.key === "Enter") { if (cursorIdx >= 0 && rows[cursorIdx]) { e.preventDefault(); rows[cursorIdx].click(); } }
+  else if (e.key === "u") { if (cursorIdx >= 0 && lastEvents[cursorIdx]) { e.preventDefault(); undoEvent(lastEvents[cursorIdx]); } }
+}
+
+// ── init ─────────────────────────────────────────────────────────────────────
+
+async function init() {
+  document.getElementById("server-select").addEventListener("change", (e) => switchServer(e.target.value));
   document.getElementById("manage-servers").addEventListener("click", openServersModal);
-  document.getElementById("servers-close").addEventListener("click", closeServersModal);
-  document.getElementById("servers-modal").addEventListener("click", (e) => {
-    if (e.target === e.currentTarget) closeServersModal(); // click on the backdrop
-  });
-  document.getElementById("server-add").addEventListener("click", () => showServerForm(null));
-  document.getElementById("server-form").addEventListener("submit", saveServer);
-  document.getElementById("server-cancel").addEventListener("click", hideServerForm);
-  document.getElementById("server-test").addEventListener("click", testServerForm);
+  document.getElementById("open-cmdk").addEventListener("click", openCmdk);
+  document.addEventListener("keydown", globalKeydown);
 
-  if (!TOKEN) {
-    toast("No token in URL — open the link printed by `bintrail console`.");
-  }
-  // Load the server list first so a stale per-tab selection is reconciled
-  // before the capability gate and schema dropdowns fire against it.
-  (async () => {
-    let servers = [];
-    try { servers = await loadServers(); } catch (e) { /* default server still works */ }
-    await gateCapabilities();
-    populateSchemas();
-    // First-run onboarding: on a supervisor with nothing watched yet, the
-    // Servers screen IS the next step — open it so "+ Add server" is the
-    // first thing the operator sees (once per tab).
-    const ONBOARD_KEY = "bintrail_console_onboarded";
+  // Sidebar nav (real hrefs upgraded to in-place swaps). A manual nav starts
+  // fresh — clear any carried "Undo" context so the sidebar's Recover link
+  // never shows a stale banner (the undoEvent bridge sets it and navigates
+  // directly, bypassing this handler, so its context survives).
+  $all(".nav-item").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); pendingRecover = null; navigate(a.dataset.route); }));
+  window.addEventListener("popstate", renderRoute);
+
+  if (!TOKEN) toast("No token in URL — open the link printed by `bintrail console`.");
+
+  // Startup order is load-bearing: servers (reconcile selection) → caps → route.
+  let servers = [];
+  try { servers = await loadServers(); } catch (err) { renderError(VIEW(), err); }
+  await gateCapabilities();
+  renderRoute();
+
+  // First-run onboarding: a monitor-capable process with no source yet opens the
+  // servers modal once per tab so the operator can add one without a terminal.
+  try {
     if (capsCache.monitor && servers.every((s) => !s.has_source) && !sessionStorage.getItem(ONBOARD_KEY)) {
-      try { sessionStorage.setItem(ONBOARD_KEY, "1"); } catch (e) { /* storage unavailable */ }
+      sessionStorage.setItem(ONBOARD_KEY, "1");
       openServersModal();
     }
-  })();
+  } catch (_) {}
 }
 
-document.addEventListener("DOMContentLoaded", init);
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+else init();

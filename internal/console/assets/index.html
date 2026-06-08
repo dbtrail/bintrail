@@ -1,183 +1,111 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-dir="studio" data-accent="blue">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>bintrail console</title>
   <link rel="icon" type="image/png" href="favicon.png">
   <link rel="stylesheet" href="style.css">
+  <style>
+    /* Row click toggles .open on the .ev-row to reveal its adjacent diff.
+       Kept as CSS (not JS style toggling) so the caret rotation and the
+       reveal stay declarative. */
+    .diff-wrap { display: none; }
+    .ev-row.open + .diff-wrap { display: block; }
+  </style>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <img class="logo" src="logo.png" alt="bintrail">
-      <span class="sub">console</span>
-      <span class="readonly" title="This console never executes SQL against your data.">read-only</span>
-      <div class="server-ctl">
-        <select id="server-select" title="Active server"></select>
-        <button type="button" id="manage-servers" title="Add, edit, or remove servers">Servers</button>
-      </div>
-    </div>
-    <nav id="tabs">
-      <button class="tab active" data-panel="recover">Recover</button>
-      <button class="tab" data-panel="events">Events</button>
-      <button class="tab" data-panel="status">Status</button>
-      <button class="tab" data-panel="reconstruct" data-capability="reconstruct">Time-travel</button>
-    </nav>
-  </header>
-
-  <main>
-    <!-- ── Recover ─────────────────────────────────────────────── -->
-    <section id="recover" class="panel active">
-      <p class="hint">Filter the changes you want to undo, preview the affected
-        rows, then generate reversal SQL. Nothing is ever executed — copy or
-        download the script and apply it yourself after review.</p>
-      <form id="recover-form" class="filters">
-        <label>Schema
-          <select name="schema" class="schema-select" required></select>
-        </label>
-        <label>Table
-          <select name="table" class="table-select"></select>
-        </label>
-        <label>PK <input name="pk" placeholder="e.g. 42 or 42|7"></label>
-        <label>Since <input name="since" placeholder="YYYY-MM-DD HH:MM:SS"></label>
-        <label>Until <input name="until" placeholder="YYYY-MM-DD HH:MM:SS"></label>
-        <div class="actions">
-          <button type="submit" class="primary">Generate undo SQL</button>
-          <button type="button" class="preview-btn">Preview affected rows</button>
+  <div id="app">
+    <aside class="side">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+            <rect x="3" y="14" width="5" height="5" rx="1"></rect>
+            <rect x="9.5" y="9.5" width="5" height="5" rx="1"></rect>
+            <rect x="16" y="5" width="5" height="5" rx="1"></rect>
+          </svg>
         </div>
-      </form>
-      <div id="recover-warnings" class="warnings"></div>
-      <div id="recover-preview"></div>
-      <div id="recover-sql-wrap" hidden>
-        <div class="sql-toolbar">
-          <span id="recover-meta"></span>
-          <span class="spacer"></span>
-          <button type="button" id="copy-sql">Copy</button>
-          <button type="button" id="download-sql">Download</button>
+        <div>
+          <div class="brand-name">bintrail</div>
+          <div class="brand-sub">console</div>
         </div>
-        <pre id="recover-sql"></pre>
+        <span class="ro-pill" title="This console never executes SQL against your data.">read-only</span>
       </div>
-    </section>
 
-    <!-- ── Events ──────────────────────────────────────────────── -->
-    <section id="events" class="panel">
-      <p class="hint">Browse indexed row events with full before/after images.</p>
-      <form id="events-form" class="filters">
-        <label>Schema
-          <select name="schema" class="schema-select"></select>
-        </label>
-        <label>Table
-          <select name="table" class="table-select"></select>
-        </label>
-        <label>PK <input name="pk" placeholder="e.g. 42"></label>
-        <label>Type
-          <select name="event_type">
-            <option value="">any</option>
-            <option>INSERT</option>
-            <option>UPDATE</option>
-            <option>DELETE</option>
-          </select>
-        </label>
-        <label>Changed column <input name="changed_column" placeholder="e.g. email"></label>
-        <label>GTID <input name="gtid" placeholder="uuid:1-100"></label>
-        <label>Since <input name="since" placeholder="YYYY-MM-DD HH:MM:SS"></label>
-        <label>Until <input name="until" placeholder="YYYY-MM-DD HH:MM:SS"></label>
-        <label>Limit <input name="limit" type="number" min="1" placeholder="100"></label>
-        <div class="actions">
-          <button type="submit" class="primary">Run</button>
+      <button class="cmdk-trigger" id="open-cmdk" type="button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+        <span>Search &amp; commands</span>
+        <span class="cmdk-kbd">⌘K</span>
+      </button>
+
+      <div class="srv-block">
+        <div class="nav-label" style="padding-bottom:0">Server</div>
+        <div class="srv-wrap">
+          <span class="srv-dot"></span>
+          <select class="srv-select" id="server-select" title="Active server"></select>
         </div>
-      </form>
-      <div id="events-warnings" class="warnings"></div>
-      <div id="events-result"></div>
-    </section>
-
-    <!-- ── Status ──────────────────────────────────────────────── -->
-    <section id="status" class="panel">
-      <div class="actions">
-        <button type="button" id="status-refresh" class="primary">Refresh status</button>
+        <button class="srv-manage" id="manage-servers" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"></path><circle cx="12" cy="12" r="3"></circle></svg>
+          <span>Manage servers</span>
+        </button>
       </div>
-      <div id="status-result"></div>
-    </section>
 
-    <!-- ── Time-travel (reconstruct) — only shown when a baseline is configured ── -->
-    <section id="reconstruct" class="panel" data-capability="reconstruct">
-      <p class="hint">Reconstruct a single row's full state as of a point in time
-        — baseline snapshot + binlog deltas. Pick a row and a moment; see its
-        value then, or its complete change history.</p>
-      <form id="reconstruct-form" class="filters">
-        <label>Schema
-          <select name="schema" class="schema-select" required></select>
-        </label>
-        <label>Table
-          <select name="table" class="table-select" required></select>
-        </label>
-        <label>PK <input name="pk" placeholder="e.g. 42 or 42|7" required></label>
-        <label>As of <input name="at" placeholder="YYYY-MM-DD HH:MM:SS (default: now)"></label>
-        <label class="checkbox"><input type="checkbox" name="allow_gaps"> Allow coverage gaps</label>
-        <div class="actions">
-          <button type="submit" class="primary" data-mode="at">Value as of T</button>
-          <button type="button" class="preview-btn" data-mode="history">Full history</button>
+      <nav class="nav" id="nav">
+        <div class="nav-group">
+          <a class="nav-item" data-route="overview" href="/overview">
+            <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>
+            <span>Overview</span>
+          </a>
         </div>
-      </form>
-      <div id="reconstruct-warnings" class="warnings"></div>
-      <div id="reconstruct-result"></div>
-    </section>
-  </main>
-
-  <!-- ── Servers modal — manage the local connection registry ── -->
-  <div id="servers-modal" class="modal" hidden>
-    <div class="modal-dialog">
-      <div class="modal-head">
-        <h2>Servers</h2>
-        <span class="spacer"></span>
-        <button type="button" id="servers-close" class="modal-close" title="Close">&times;</button>
-      </div>
-      <p class="hint">Named connections to bintrail index databases, stored in a
-        local file on the console host.
-        <span data-capability="monitor">This process can also <strong>monitor</strong>
-        a source MySQL: add one below and bintrail runs the preflight checks,
-        provisions an index for it, and starts streaming — no terminal
-        needed.</span></p>
-      <div id="servers-list"></div>
-      <div class="actions" id="server-add-wrap">
-        <button type="button" id="server-add" class="primary">+ Add server</button>
-      </div>
-      <form id="server-form" class="filters server-form" hidden>
-        <input type="hidden" name="id">
-        <label>Name <input name="name" required placeholder="prod-db-01"></label>
-        <fieldset class="form-fieldset" data-capability="monitor">
-          <legend>Monitor a source MySQL</legend>
-          <p class="fieldset-hint">Paste the server to watch — bintrail runs the
-            preflight checks, provisions an index for it, and starts streaming.
-            Leave the index section empty; it is created automatically.</p>
-          <label>Source host <input name="source_host" placeholder="db.example.com"></label>
-          <label>Source port <input name="source_port" type="number" min="1" max="65535" placeholder="3306"></label>
-          <label>Source user <input name="source_user" placeholder="repl"></label>
-          <label>Source password <input name="source_password" type="password" autocomplete="new-password"></label>
-          <label>Schemas <input name="schemas" placeholder="(optional) shop,billing"></label>
-        </fieldset>
-        <fieldset class="form-fieldset">
-          <legend>Index connection</legend>
-          <label>Host <input name="host" placeholder="127.0.0.1"></label>
-          <label>Port <input name="port" type="number" min="1" max="65535" placeholder="3306"></label>
-          <label>User <input name="user" placeholder="bintrail"></label>
-          <label>Password <input name="password" type="password" autocomplete="new-password"></label>
-          <label>Index database <input name="dbname" placeholder="binlog_index"></label>
-          <label>Baseline dir <input name="baseline_dir" placeholder="(optional) enables Time-travel"></label>
-          <label>Baseline S3 <input name="baseline_s3" placeholder="s3://bucket/prefix/"></label>
-          <label class="checkbox"><input type="checkbox" name="no_archive"> Disable archive auto-discovery</label>
-        </fieldset>
-        <div class="actions">
-          <button type="submit" class="primary">Save</button>
-          <button type="button" id="server-test">Test connection</button>
-          <button type="button" id="server-cancel">Cancel</button>
+        <div class="nav-group">
+          <div class="nav-label">Investigate</div>
+          <a class="nav-item" data-route="events" href="/events">
+            <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1.2"/><circle cx="3.5" cy="12" r="1.2"/><circle cx="3.5" cy="18" r="1.2"/></svg></span>
+            <span>Events</span>
+          </a>
+          <a class="nav-item" data-route="timetravel" href="/timetravel" data-capability="reconstruct">
+            <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5v5h5"/><path d="M3.5 10a9 9 0 1 1-.7 4"/><path d="M12 8v4l3 2"/></svg></span>
+            <span>Time-travel</span>
+          </a>
         </div>
-        <div id="server-form-msg" class="form-msg"></div>
-        <div id="doctor-cards"></div>
-      </form>
-    </div>
+        <div class="nav-group">
+          <div class="nav-label">Resolve</div>
+          <a class="nav-item" data-route="recover" href="/recover">
+            <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M3 13a9 9 0 1 0 3-7.7L3 8"/></svg></span>
+            <span>Recover</span>
+          </a>
+        </div>
+        <div class="nav-group">
+          <div class="nav-label">Monitor</div>
+          <a class="nav-item" data-route="status" href="/status">
+            <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5 7 5-14L17 12h4"/></svg></span>
+            <span>Status</span>
+          </a>
+        </div>
+      </nav>
+
+      <div class="side-foot">
+        <a class="side-docs" href="https://www.dbtrail.com/docs/guides/recovery/" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"></path><path d="M19 17H6a2 2 0 0 0-2 2"></path></svg>
+          <span>Docs · Recovery guide</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"></path><path d="M20 4l-9 9"></path><path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4"></path></svg>
+        </a>
+        <div class="side-meta" id="side-meta">
+          <div><b id="meta-conn">—</b></div>
+          <div id="meta-stream">stream <b>—</b></div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="view" id="view"></div>
+    </main>
   </div>
+
+  <!-- Servers modal mount (built by app.js into a .modal-scrim) -->
+  <div id="modal"></div>
+  <!-- Command palette mount (⌘K) -->
+  <div id="cmdk-mount"></div>
 
   <div id="toast" class="toast" hidden></div>
   <script src="app.js"></script>
