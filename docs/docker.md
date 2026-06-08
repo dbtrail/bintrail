@@ -172,7 +172,17 @@ one-shot `index-init` service generates a random password into the
 in `.env` if you set it *before* the first boot). Both the index MySQL and
 bintrail read it from there. The password is baked into the datadir at init,
 so `bintrail-index-data` and `bintrail-index-secret` are a pair: back them up
-together, and changing the password later means resetting both volumes.
+together, and changing the password later means resetting both volumes. If you
+pin `INDEX_MYSQL_ROOT_PASSWORD`, avoid `@`, `:`, `/`, and `?` in it — the
+bundled DSN is assembled as `root:<pw>@tcp(...)/bintrail_index` and those
+characters corrupt it (the generated default is hex and always safe).
+
+**Troubleshooting** — if `docker compose up` never prints the console URL,
+the index MySQL likely isn't healthy yet (the `bintrail` service waits for it
+via `depends_on`, so its own log stays empty until then). Check the index
+directly: `docker compose logs index-init index-mysql`. A "password" or
+"healthcheck" error there usually means the `bintrail-index-secret` volume was
+reset out of sync with `bintrail-index-data` — reset both together.
 
 **Upgrading from a pre-8.4 bundled index** — the old eval index used a
 `mysql:8.0` container on the `index-mysql-data` volume. The new compose uses a

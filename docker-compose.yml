@@ -13,18 +13,20 @@
 # schema snapshot → live binlog stream → built-in rotation), and the web
 # console on http://127.0.0.1:8090 with the access token printed in the logs.
 #
-# ┌─ THE INDEX VOLUME IS YOUR SYSTEM OF RECORD ────────────────────────────┐
-# │ The bundled index holds the forensic record (binlog_events with full   │
-# │ before/after images). Its data lives in the `bintrail-index-data` +    │
-# │ `bintrail-index-secret` volumes — TREAT THEM AS ONE: back them up      │
-# │ together, and never reset one without the other (the generated         │
-# │ password is baked into the datadir at first boot and stored in the     │
-# │ secret volume; losing either breaks auth). Lose the data volume and    │
-# │ you re-index from the source's binlogs. bintrail SHIPS this MySQL but  │
-# │ does NOT operate it: disk, backups, and upgrades are yours — for a     │
-# │ managed, operated index, that is what dbtrail is. Support: SUPPORT.md. │
-# │ Bring your own instead: set INDEX_DSN in .env (see docs/docker.md).    │
-# └────────────────────────────────────────────────────────────────────────┘
+# === THE INDEX VOLUME IS YOUR SYSTEM OF RECORD ===
+# The bundled index holds the forensic record (binlog_events with full
+# before/after images). Its data lives in TWO volumes that must be backed up
+# and RESTORED together: `bintrail-index-data` (the MySQL datadir) and
+# `bintrail-index-secret` (the password, baked into the datadir at first boot).
+# Restoring a datadir paired with a mismatched secret breaks auth; changing the
+# password later means resetting both. Losing only the data volume is safe — the
+# surviving secret re-initializes a fresh datadir with the same password and
+# bintrail re-indexes from the source's binlogs.
+#
+# bintrail SHIPS this MySQL but does NOT operate it: disk, backups, and upgrades
+# are yours — for a managed, operated index, that is what dbtrail is. Support
+# boundary: SUPPORT.md. Bring your own instead: set INDEX_DSN in .env (see
+# docs/docker.md).
 #
 # For the full interactive demo (traffic generator, Grafana, Prometheus),
 # see demo/compose.yml instead.
@@ -47,6 +49,12 @@ services:
   # static default password on a volume holding the forensic record.
   index-init:
     image: ghcr.io/dbtrail/bintrail:${BINTRAIL_TAG:-latest}
+    # Runs as root: a freshly-created named volume is root-owned, and the
+    # bintrail image otherwise runs as a non-root user that couldn't write it.
+    # The secret is left world-readable (0644) so the non-root bintrail process
+    # and the mysql entrypoint can both read it — it never leaves these
+    # containers on a private Docker network.
+    user: "0:0"
     environment:
       INDEX_MYSQL_ROOT_PASSWORD: ${INDEX_MYSQL_ROOT_PASSWORD:-}
     entrypoint: ["/bin/sh", "-c"]
@@ -62,7 +70,11 @@ services:
           od -An -N24 -tx1 /dev/urandom | tr -d ' \n' > "$$f"
           echo "Generated a random index MySQL password (stored in the bintrail-index-secret volume)."
         fi
-        chmod 600 "$$f"
+        # dash has no pipefail and `set -e` only checks the last pipe stage, so a
+        # failed od/urandom would leave an EMPTY file. Refuse a blank password
+        # rather than let MySQL refuse to initialize with a confusing error.
+        if [ ! -s "$$f" ]; then echo "FATAL: failed to write the index password" >&2; rm -f "$$f"; exit 1; fi
+        chmod 0644 "$$f"
     volumes:
       - bintrail-index-secret:/secret
 
