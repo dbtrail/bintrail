@@ -172,10 +172,7 @@ one-shot `index-init` service generates a random password into the
 in `.env` if you set it *before* the first boot). Both the index MySQL and
 bintrail read it from there. The password is baked into the datadir at init,
 so `bintrail-index-data` and `bintrail-index-secret` are a pair: back them up
-together, and changing the password later means resetting both volumes. If you
-pin `INDEX_MYSQL_ROOT_PASSWORD`, avoid `@`, `:`, `/`, and `?` in it — the
-bundled DSN is assembled as `root:<pw>@tcp(...)/bintrail_index` and those
-characters corrupt it (the generated default is hex and always safe).
+together, and changing the password later means resetting both volumes.
 
 **Troubleshooting** — if `docker compose up` never prints the console URL,
 the index MySQL likely isn't healthy yet (the `bintrail` service waits for it

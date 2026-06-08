@@ -51,10 +51,11 @@ services:
     image: ghcr.io/dbtrail/bintrail:${BINTRAIL_TAG:-latest}
     # Runs as root: a freshly-created named volume is root-owned, and the
     # bintrail image otherwise runs as a non-root user that couldn't write it.
-    # The secret is then chowned to uid 999 mode 0600 — both the bintrail
-    # process and mysqld run as uid 999 (same number, different name), so the
-    # owner-only file is readable by both, and the index-mysql healthcheck /
-    # entrypoint read it as root (which bypasses the mode). Not world-readable.
+    # The secret is then chowned to uid 999 mode 0600 FOR the bintrail process
+    # (uid 999), the only non-root reader. The index-mysql side reads it as
+    # root — the entrypoint reads MYSQL_ROOT_PASSWORD_FILE before dropping to
+    # the mysql user, and the healthcheck runs as root — both bypass the mode.
+    # Not world-readable.
     user: "0:0"
     environment:
       INDEX_MYSQL_ROOT_PASSWORD: ${INDEX_MYSQL_ROOT_PASSWORD:-}
@@ -149,6 +150,9 @@ services:
         set -e
         # Use the bundled index unless the operator brought their own. The
         # generated password lives in the secret volume; build the DSN from it.
+        # NOTE: plain assignment on purpose — under `set -e` it propagates a
+        # failed `cat` (unreadable secret) and aborts loud; `export`/`local`
+        # would mask the substitution's exit status and build an empty password.
         if [ -z "$$INDEX_DSN" ]; then
           INDEX_DSN="root:$$(cat /run/secret/index_password)@tcp(index-mysql:3306)/bintrail_index"
         fi

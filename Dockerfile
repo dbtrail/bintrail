@@ -29,7 +29,9 @@ FROM debian:bookworm-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/* && \
-    useradd --system --no-create-home bintrail && \
+    # Pin uid 999: the bundled compose chowns the index password secret to
+    # uid 999 (mode 0600) for this process to read — see docker-compose.yml.
+    useradd --system --no-create-home --uid 999 bintrail && \
     # Writable state dir (console server registry, etc.). Pre-created and
     # chowned in the image so a named volume mounted here inherits the
     # ownership — the container runs as the non-root bintrail user.
