@@ -306,14 +306,14 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 	if idxCfg.DBName == "" || !dbNameRE.MatchString(idxCfg.DBName) {
 		return fail(fmt.Errorf("index database name %q is not provisionable", idxCfg.DBName))
 	}
-	if err := ensureDatabase(idxCfg, idxCfg.DBName); err != nil {
+	if err := indexer.EnsureDatabase(idxCfg, idxCfg.DBName, nil); err != nil {
 		return fail(err)
 	}
 	idxDB, err := config.Connect(e.DSN)
 	if err != nil {
 		return fail(fmt.Errorf("connect provisioned index: %w", err))
 	}
-	if err := createIndexTables(ctx, idxDB, 48, false, nil); err != nil {
+	if err := indexer.CreateIndexTables(ctx, idxDB, 48, false, nil); err != nil {
 		idxDB.Close()
 		return fail(err)
 	}

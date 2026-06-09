@@ -210,7 +210,7 @@ func TestLoadPartitionStats(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
 	// Create table with 3 daily partitions + p_future.
-	if err := createBinlogEventsTable(db, 3, false); err != nil {
+	if err := indexer.CreateBinlogEventsTable(db, 3, false); err != nil {
 		t.Fatalf("createBinlogEventsTable failed: %v", err)
 	}
 
@@ -254,7 +254,7 @@ func TestEnsureDatabase(t *testing.T) {
 		rootDB.Exec("DROP DATABASE IF EXISTS `" + dbName + "`")
 	})
 
-	if err := ensureDatabase(cfg, dbName); err != nil {
+	if err := indexer.EnsureDatabase(cfg, dbName, nil); err != nil {
 		t.Fatalf("ensureDatabase failed: %v", err)
 	}
 
@@ -265,7 +265,7 @@ func TestEnsureDatabase(t *testing.T) {
 	}
 
 	// Calling again should succeed (idempotent).
-	if err := ensureDatabase(cfg, dbName); err != nil {
+	if err := indexer.EnsureDatabase(cfg, dbName, nil); err != nil {
 		t.Fatalf("second ensureDatabase call failed: %v", err)
 	}
 }
@@ -275,7 +275,7 @@ func TestEnsureDatabase(t *testing.T) {
 func TestCreateBinlogEventsTable(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
-	if err := createBinlogEventsTable(db, 3, false); err != nil {
+	if err := indexer.CreateBinlogEventsTable(db, 3, false); err != nil {
 		t.Fatalf("createBinlogEventsTable failed: %v", err)
 	}
 
@@ -297,7 +297,7 @@ func TestCreateBinlogEventsTable(t *testing.T) {
 func TestListPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
-	if err := createBinlogEventsTable(db, 3, false); err != nil {
+	if err := indexer.CreateBinlogEventsTable(db, 3, false); err != nil {
 		t.Fatalf("createBinlogEventsTable failed: %v", err)
 	}
 
@@ -328,7 +328,7 @@ func TestListPartitions(t *testing.T) {
 func TestDropPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
-	if err := createBinlogEventsTable(db, 5, false); err != nil {
+	if err := indexer.CreateBinlogEventsTable(db, 5, false); err != nil {
 		t.Fatalf("createBinlogEventsTable failed: %v", err)
 	}
 
@@ -514,8 +514,8 @@ func TestArchivePartition_empty(t *testing.T) {
 // initServerTables creates bintrail_servers and bintrail_server_changes in db.
 func initServerTables(t *testing.T, db *sql.DB) {
 	t.Helper()
-	testutil.MustExec(t, db, ddlBintrailServers)
-	testutil.MustExec(t, db, ddlBintrailServerChanges)
+	testutil.MustExec(t, db, serverid.DDLBintrailServers)
+	testutil.MustExec(t, db, serverid.DDLBintrailServerChanges)
 }
 
 // countChanges returns the number of rows in bintrail_server_changes for the given bintrail_id.
