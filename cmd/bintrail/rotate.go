@@ -229,7 +229,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 		cutoff := time.Now().UTC().Add(-retainDur)
 		var toDrop []string
 		for _, p := range partitions {
-			d, ok := partitionDate(p.Name)
+			d, ok := indexer.PartitionDate(p.Name)
 			if !ok {
 				continue // skip p_future and any unrecognised names
 			}
@@ -501,7 +501,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 		}
 		for i := range toAdd {
 			if rotFormat != "json" {
-				fmt.Fprintf(os.Stdout, "added partition %s\n", partitionName(startDate.Add(time.Duration(i)*time.Hour)))
+				fmt.Fprintf(os.Stdout, "added partition %s\n", indexer.PartitionName(startDate.Add(time.Duration(i)*time.Hour)))
 			}
 		}
 	}
@@ -585,7 +585,7 @@ func fileExists(path string) bool {
 // Each hourly partition maps to exactly one file. The event_hour= directory level
 // enables DuckDB Hive partition pruning on hour-scoped queries.
 func hiveArchivePath(archiveDir, bintrailID, partitionName string) (string, error) {
-	d, ok := partitionDate(partitionName)
+	d, ok := indexer.PartitionDate(partitionName)
 	if !ok {
 		return "", fmt.Errorf("cannot parse partition date from %q", partitionName)
 	}
@@ -651,24 +651,6 @@ func listPartitions(ctx context.Context, db *sql.DB, dbName string) ([]partition
 	return partitions, rows.Err()
 }
 
-// partitionDate parses the hour from a partition name like "p_2026021914".
-// Returns the time and true on success; zero and false for p_future or other names.
-func partitionDate(name string) (time.Time, bool) {
-	if len(name) != 12 || !strings.HasPrefix(name, "p_") {
-		return time.Time{}, false
-	}
-	t, err := time.ParseInLocation("p_2006010215", name, time.UTC)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
-}
-
-// partitionName returns the partition name for a given hour ("p_YYYYMMDDHH").
-func partitionName(d time.Time) string {
-	return d.UTC().Format("p_2006010215")
-}
-
 // dropPartitions drops one or more named partitions in a single ALTER TABLE statement.
 func dropPartitions(ctx context.Context, db *sql.DB, dbName string, names []string) error {
 	q := fmt.Sprintf("ALTER TABLE `%s`.`binlog_events` DROP PARTITION %s",
@@ -714,7 +696,7 @@ func computeToAdd(target, futureCount, dropped int, noReplace bool) int {
 func countFuturePartitions(partitions []partitionInfo, ref time.Time) int {
 	n := 0
 	for _, p := range partitions {
-		d, ok := partitionDate(p.Name)
+		d, ok := indexer.PartitionDate(p.Name)
 		if !ok {
 			continue
 		}
@@ -731,7 +713,7 @@ func countFuturePartitions(partitions []partitionInfo, ref time.Time) int {
 func nextPartitionStart(partitions []partitionInfo) time.Time {
 	var maxDate time.Time
 	for _, p := range partitions {
-		d, ok := partitionDate(p.Name)
+		d, ok := indexer.PartitionDate(p.Name)
 		if !ok {
 			continue
 		}
@@ -754,7 +736,7 @@ func addFuturePartitions(ctx context.Context, db *sql.DB, dbName string, startDa
 		nextHour := d.Add(time.Hour)
 		parts = append(parts, fmt.Sprintf(
 			"PARTITION %s VALUES LESS THAN (TO_SECONDS('%s'))",
-			partitionName(d),
+			indexer.PartitionName(d),
 			nextHour.UTC().Format("2006-01-02 15:04:05"),
 		))
 	}

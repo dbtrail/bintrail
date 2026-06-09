@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dbtrail/bintrail/internal/indexer"
 )
 
 // ─── parseRetain ───────────────────────────────────────────────────────────────
@@ -53,68 +55,6 @@ func TestParseRetain_invalid(t *testing.T) {
 		if _, err := parseRetain(c); err == nil {
 			t.Errorf("expected error for %q, got nil", c)
 		}
-	}
-}
-
-// ─── partitionDate ──────────────────────────────────────────────────────────────
-
-func TestPartitionDate_valid(t *testing.T) {
-	d, ok := partitionDate("p_2026021900")
-	if !ok {
-		t.Fatal("expected ok=true for p_2026021900")
-	}
-	if d.Year() != 2026 || d.Month() != 2 || d.Day() != 19 || d.Hour() != 0 {
-		t.Errorf("unexpected time: %v", d)
-	}
-}
-
-func TestPartitionDate_firstOfMonth(t *testing.T) {
-	d, ok := partitionDate("p_2026020114")
-	if !ok {
-		t.Fatal("expected ok=true for p_2026020114")
-	}
-	if d.Year() != 2026 || d.Month() != 2 || d.Day() != 1 || d.Hour() != 14 {
-		t.Errorf("unexpected time: %v", d)
-	}
-}
-
-func TestPartitionDate_invalid(t *testing.T) {
-	cases := []string{
-		"p_future",      // MAXVALUE catch-all
-		"p_",            // too short
-		"p_202602",      // incomplete
-		"p_20260219",    // missing hour (10 chars, old daily format)
-		"p_20260219000", // one digit too many (13 chars)
-		"binlog_events",
-		"",
-	}
-	for _, c := range cases {
-		if _, ok := partitionDate(c); ok {
-			t.Errorf("expected ok=false for %q", c)
-		}
-	}
-}
-
-// ─── partitionName ──────────────────────────────────────────────────────────────
-
-func TestPartitionName(t *testing.T) {
-	d := time.Date(2026, 2, 19, 0, 0, 0, 0, time.UTC)
-	if got := partitionName(d); got != "p_2026021900" {
-		t.Errorf("expected p_2026021900, got %s", got)
-	}
-}
-
-func TestPartitionName_roundTrip(t *testing.T) {
-	// partitionName and partitionDate must round-trip correctly.
-	original := time.Date(2026, 12, 31, 14, 30, 0, 0, time.UTC)
-	name := partitionName(original)
-	got, ok := partitionDate(name)
-	if !ok {
-		t.Fatalf("partitionDate(%q) returned ok=false", name)
-	}
-	// partitionDate parses to the top of the hour; year/month/day/hour must match.
-	if got.Year() != original.Year() || got.Month() != original.Month() || got.Day() != original.Day() || got.Hour() != original.Hour() {
-		t.Errorf("round-trip mismatch: original=%v, got=%v", original, got)
 	}
 }
 
@@ -178,9 +118,9 @@ func TestCutoffDropsHourlyPartition(t *testing.T) {
 	}
 
 	for _, p := range partitions {
-		d, ok := partitionDate(p.name)
+		d, ok := indexer.PartitionDate(p.name)
 		if !ok {
-			t.Fatalf("partitionDate(%q) returned false", p.name)
+			t.Fatalf("indexer.PartitionDate(%q) returned false", p.name)
 		}
 		dropped := d.Before(cutoff)
 		if dropped != p.wantDrop {
@@ -201,7 +141,7 @@ func TestPartitionSpec_shape(t *testing.T) {
 	for i := range 3 {
 		d := start.Add(time.Duration(i) * time.Hour)
 		nextHour := d.Add(time.Hour)
-		parts = append(parts, "PARTITION "+partitionName(d)+
+		parts = append(parts, "PARTITION "+indexer.PartitionName(d)+
 			" VALUES LESS THAN (TO_SECONDS('"+
 			nextHour.UTC().Format("2006-01-02 15:04:05")+"'))")
 	}
@@ -286,7 +226,7 @@ func TestAutoAddDeclarative_48CycleSimulation(t *testing.T) {
 	now := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
 	parts := []partitionInfo{}
 	for i := -11; i <= 1; i++ { // 12 past/current hours + 1 future
-		parts = append(parts, partitionInfo{Name: partitionName(now.Add(time.Duration(i) * time.Hour))})
+		parts = append(parts, partitionInfo{Name: indexer.PartitionName(now.Add(time.Duration(i) * time.Hour))})
 	}
 	parts = append(parts, partitionInfo{Name: "p_future", Description: "MAXVALUE"})
 
@@ -301,7 +241,7 @@ func TestAutoAddDeclarative_48CycleSimulation(t *testing.T) {
 		dropped := 0
 		kept := parts[:0]
 		for _, p := range parts {
-			d, ok := partitionDate(p.Name)
+			d, ok := indexer.PartitionDate(p.Name)
 			if ok && d.Before(cutoff) {
 				dropped++
 				continue
@@ -326,7 +266,7 @@ func TestAutoAddDeclarative_48CycleSimulation(t *testing.T) {
 		}
 		parts = withoutFuture
 		for i := 0; i < toAdd; i++ {
-			parts = append(parts, partitionInfo{Name: partitionName(startDate.Add(time.Duration(i) * time.Hour))})
+			parts = append(parts, partitionInfo{Name: indexer.PartitionName(startDate.Add(time.Duration(i) * time.Hour))})
 		}
 		parts = append(parts, partitionInfo{Name: "p_future", Description: "MAXVALUE"})
 	}
@@ -351,7 +291,7 @@ func TestAutoAddDeclarative_48CycleSimulation(t *testing.T) {
 		dropped := 0
 		kept := parts[:0]
 		for _, p := range parts {
-			d, ok := partitionDate(p.Name)
+			d, ok := indexer.PartitionDate(p.Name)
 			if ok && d.Before(cutoff) {
 				dropped++
 				continue
@@ -371,7 +311,7 @@ func TestAutoAddDeclarative_48CycleSimulation(t *testing.T) {
 		}
 		parts = withoutFuture
 		for i := 0; i < toAdd; i++ {
-			parts = append(parts, partitionInfo{Name: partitionName(startDate.Add(time.Duration(i) * time.Hour))})
+			parts = append(parts, partitionInfo{Name: indexer.PartitionName(startDate.Add(time.Duration(i) * time.Hour))})
 		}
 		parts = append(parts, partitionInfo{Name: "p_future", Description: "MAXVALUE"})
 	}

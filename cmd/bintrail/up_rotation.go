@@ -11,6 +11,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/indexer"
 )
 
 // upRotationSettings is the parsed configuration of `up`'s built-in rotation —
@@ -265,7 +266,7 @@ func upgradeGuardTrips(ctx context.Context, db *sql.DB, dbName string, retain ti
 func guardTrips(partitions []partitionInfo, retain time.Duration, now time.Time) (bool, time.Time) {
 	var oldest time.Time
 	for _, p := range partitions {
-		d, ok := partitionDate(p.Name)
+		d, ok := indexer.PartitionDate(p.Name)
 		if !ok {
 			continue
 		}

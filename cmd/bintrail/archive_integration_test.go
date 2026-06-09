@@ -38,14 +38,14 @@ func TestArchiveReconcileRebuild(t *testing.T) {
 
 	archiveDir := t.TempDir()
 	const bintrailID = "deadbeef-dead-beef-dead-beefdeadbeef" // 36 chars, matches archivePathRe
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, partitionName(h1))
+	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	n, err := archive.ArchivePartition(ctx, db, dbName, partitionName(h1), outPath, "zstd")
+	n, err := archive.ArchivePartition(ctx, db, dbName, indexer.PartitionName(h1), outPath, "zstd")
 	if err != nil {
 		t.Fatalf("ArchivePartition: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestArchiveReconcileRebuild(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("expected 1 scanned file, got %d: %+v", len(files), files)
 	}
-	if files[0].BintrailID != bintrailID || files[0].PartitionName != partitionName(h1) {
+	if files[0].BintrailID != bintrailID || files[0].PartitionName != indexer.PartitionName(h1) {
 		t.Fatalf("scan derivation wrong: %+v", files[0])
 	}
 	if !files[0].RowCount.Valid || files[0].RowCount.Int64 != 1 {
@@ -99,7 +99,7 @@ func TestArchiveReconcileRebuild(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `
 		SELECT local_path, file_size_bytes, row_count, s3_bucket, s3_uploaded_at
 		FROM archive_state WHERE partition_name = ? AND bintrail_id = ?`,
-		partitionName(h1), bintrailID).
+		indexer.PartitionName(h1), bintrailID).
 		Scan(&localPath, &fileSize, &rowCount, &s3Bucket, &s3UploadedAt); err != nil {
 		t.Fatalf("rebuilt row missing: %v", err)
 	}
@@ -219,13 +219,13 @@ func TestParseArchivePathRoundTrip(t *testing.T) {
 		time.Date(2026, 12, 31, 23, 0, 0, 0, time.UTC),
 	}
 	for _, h := range hours {
-		p, err := hiveArchivePath("/var/archives", id, partitionName(h))
+		p, err := hiveArchivePath("/var/archives", id, indexer.PartitionName(h))
 		if err != nil {
 			t.Fatalf("hiveArchivePath(%v): %v", h, err)
 		}
 		gotID, gotPart := parseArchivePath(p)
-		if gotID != id || gotPart != partitionName(h) {
-			t.Errorf("round-trip(%s): got (%s, %s), want (%s, %s)", p, gotID, gotPart, id, partitionName(h))
+		if gotID != id || gotPart != indexer.PartitionName(h) {
+			t.Errorf("round-trip(%s): got (%s, %s), want (%s, %s)", p, gotID, gotPart, id, indexer.PartitionName(h))
 		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/indexer"
 )
 
 var uploadCmd = &cobra.Command{
@@ -107,7 +108,7 @@ func parseArchivePath(path string) (bintrailID, partName string) {
 	h := 0
 	fmt.Sscanf(hour, "%d", &h)
 	t = t.Add(time.Duration(h) * time.Hour)
-	return id, partitionName(t)
+	return id, indexer.PartitionName(t)
 }
 
 func runUpload(cmd *cobra.Command, args []string) error {

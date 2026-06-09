@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
@@ -117,7 +118,7 @@ func setupPartitionedTable(t *testing.T, db *sql.DB, dbName string, hours []time
 		}
 		parts += fmt.Sprintf(
 			"PARTITION %s VALUES LESS THAN (TO_SECONDS('%s'))",
-			partitionName(h),
+			indexer.PartitionName(h),
 			nextHour.UTC().Format("2006-01-02 15:04:05"),
 		)
 	}
@@ -168,8 +169,8 @@ func TestPerformRotation_PendingS3BlocksDrop(t *testing.T) {
 	rotNoReplace = true
 	rotAddFuture = 0
 
-	outPath1, _ := hiveArchivePath(archiveDir, rotBintrailID, partitionName(h1))
-	outPath2, _ := hiveArchivePath(archiveDir, rotBintrailID, partitionName(h2))
+	outPath1, _ := hiveArchivePath(archiveDir, rotBintrailID, indexer.PartitionName(h1))
+	outPath2, _ := hiveArchivePath(archiveDir, rotBintrailID, indexer.PartitionName(h2))
 	os.MkdirAll(filepath.Dir(outPath1), 0o755)
 	os.MkdirAll(filepath.Dir(outPath2), 0o755)
 	os.WriteFile(outPath1, []byte("parquet-data"), 0o644)
@@ -179,11 +180,11 @@ func TestPerformRotation_PendingS3BlocksDrop(t *testing.T) {
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key)
 		VALUES (?, ?, ?, 1, 'my-bucket', 'archives/p1.parquet')`,
-		partitionName(h1), rotBintrailID, outPath1)
+		indexer.PartitionName(h1), rotBintrailID, outPath1)
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key, s3_uploaded_at)
 		VALUES (?, ?, ?, 1, 'my-bucket', 'archives/p2.parquet', UTC_TIMESTAMP())`,
-		partitionName(h2), rotBintrailID, outPath2)
+		indexer.PartitionName(h2), rotBintrailID, outPath2)
 
 	// Run rotation WITHOUT --archive-s3, WITH --retry (so it skips re-archiving).
 	rotArchiveS3 = ""
@@ -205,8 +206,8 @@ func TestPerformRotation_PendingS3BlocksDrop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listPartitions: %v", err)
 	}
-	p1Name := partitionName(h1)
-	p2Name := partitionName(h2)
+	p1Name := indexer.PartitionName(h1)
+	p2Name := indexer.PartitionName(h2)
 	var foundP1, foundP2 bool
 	for _, p := range partitions {
 		if p.Name == p1Name {
@@ -277,7 +278,7 @@ func TestPerformRotation_BulkDropSkipsPendingS3(t *testing.T) {
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key)
 		VALUES (?, 'prev-uuid', '/data/test.parquet', 1, 'my-bucket', 'archives/p1.parquet')`,
-		partitionName(h1))
+		indexer.PartitionName(h1))
 
 	savedVars := saveRotateVars()
 	t.Cleanup(func() { restoreRotateVars(savedVars) })
@@ -305,7 +306,7 @@ func TestPerformRotation_BulkDropSkipsPendingS3(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listPartitions: %v", err)
 	}
-	p1Name := partitionName(h1)
+	p1Name := indexer.PartitionName(h1)
 	var foundP1 bool
 	for _, p := range partitions {
 		if p.Name == p1Name {
@@ -359,11 +360,11 @@ func TestPerformRotation_ProtectUnarchivedDefers(t *testing.T) {
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key)
 		VALUES (?, 'cron-uuid', '/archives/p2.parquet', 1, 'my-bucket', 'archives/p2.parquet')`,
-		partitionName(h2))
+		indexer.PartitionName(h2))
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key, s3_uploaded_at)
 		VALUES (?, 'cron-uuid', '/archives/p3.parquet', 1, 'my-bucket', 'archives/p3.parquet', UTC_TIMESTAMP())`,
-		partitionName(h3))
+		indexer.PartitionName(h3))
 
 	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
 	if err != nil {
@@ -384,14 +385,14 @@ func TestPerformRotation_ProtectUnarchivedDefers(t *testing.T) {
 	for _, p := range partitions {
 		remaining[p.Name] = true
 	}
-	if !remaining[partitionName(h1)] {
-		t.Errorf("partition %s should NOT have been dropped (past retention but unarchived)", partitionName(h1))
+	if !remaining[indexer.PartitionName(h1)] {
+		t.Errorf("partition %s should NOT have been dropped (past retention but unarchived)", indexer.PartitionName(h1))
 	}
-	if !remaining[partitionName(h2)] {
-		t.Errorf("partition %s should NOT have been dropped (archived but S3 upload pending)", partitionName(h2))
+	if !remaining[indexer.PartitionName(h2)] {
+		t.Errorf("partition %s should NOT have been dropped (archived but S3 upload pending)", indexer.PartitionName(h2))
 	}
-	if remaining[partitionName(h3)] {
-		t.Errorf("partition %s should have been dropped (archived and uploaded)", partitionName(h3))
+	if remaining[indexer.PartitionName(h3)] {
+		t.Errorf("partition %s should have been dropped (archived and uploaded)", indexer.PartitionName(h3))
 	}
 }
 

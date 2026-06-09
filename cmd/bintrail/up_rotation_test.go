@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/dbtrail/bintrail/internal/indexer"
 )
 
 // logCapture is a slog.Handler that records every emitted record, so tests
@@ -188,7 +190,7 @@ func TestStartUpRotation_escalatesAfterConsecutiveFailures(t *testing.T) {
 func TestGuardTrips(t *testing.T) {
 	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
 	retain := 30 * 24 * time.Hour
-	name := func(age time.Duration) string { return partitionName(now.Add(-age)) }
+	name := func(age time.Duration) string { return indexer.PartitionName(now.Add(-age)) }
 
 	cases := []struct {
 		desc       string

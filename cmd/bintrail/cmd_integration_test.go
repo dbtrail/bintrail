@@ -15,6 +15,7 @@ import (
 	"github.com/parquet-go/parquet-go"
 
 	"github.com/dbtrail/bintrail/internal/archive"
+	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/serverid"
 	"github.com/dbtrail/bintrail/internal/status"
 	"github.com/dbtrail/bintrail/internal/testutil"
@@ -418,7 +419,7 @@ func TestAddFuturePartitions(t *testing.T) {
 
 	// First 3 should be hourly partitions.
 	for i := range 3 {
-		expected := partitionName(startDate.Add(time.Duration(i) * time.Hour))
+		expected := indexer.PartitionName(startDate.Add(time.Duration(i) * time.Hour))
 		if parts[i].Name != expected {
 			t.Errorf("partition %d: expected %s, got %s", i, expected, parts[i].Name)
 		}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
@@ -60,15 +61,15 @@ func TestRotateOneIndex_UpgradeGuard(t *testing.T) {
 	found, future := false, 0
 	nowHour := time.Now().UTC().Truncate(time.Hour)
 	for _, p := range partitions {
-		if p.Name == partitionName(old) {
+		if p.Name == indexer.PartitionName(old) {
 			found = true
 		}
-		if d, ok := partitionDate(p.Name); ok && d.After(nowHour) {
+		if d, ok := indexer.PartitionDate(p.Name); ok && d.After(nowHour) {
 			future++
 		}
 	}
 	if !found {
-		t.Fatalf("partition %s was dropped under the IMPLICIT default — the upgrade guard failed", partitionName(old))
+		t.Fatalf("partition %s was dropped under the IMPLICIT default — the upgrade guard failed", indexer.PartitionName(old))
 	}
 	if !logs.has(slog.LevelError, "refusing to drop it without an explicit choice") {
 		t.Error("upgrade guard did not log its Error explaining the refusal")
@@ -90,8 +91,8 @@ func TestRotateOneIndex_UpgradeGuard(t *testing.T) {
 		t.Fatalf("listPartitions: %v", err)
 	}
 	for _, p := range partitions {
-		if p.Name == partitionName(old) {
-			t.Errorf("partition %s should have been dropped once retention was explicit", partitionName(old))
+		if p.Name == indexer.PartitionName(old) {
+			t.Errorf("partition %s should have been dropped once retention was explicit", indexer.PartitionName(old))
 		}
 	}
 }
@@ -154,7 +155,7 @@ func TestStartUpRotation_escalatesOnPersistentDeferral(t *testing.T) {
 	}
 	found := false
 	for _, p := range partitions {
-		if p.Name == partitionName(h1) {
+		if p.Name == indexer.PartitionName(h1) {
 			found = true
 		}
 	}

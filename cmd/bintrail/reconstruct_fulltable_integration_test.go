@@ -115,23 +115,23 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 	// ── 4. Archive h1 and drop it from live MySQL ────────────────────────
 	archiveDir := t.TempDir()
 	bintrailID := "test-187-roundtrip"
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, partitionName(h1))
+	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		t.Fatalf("mkdir archive: %v", err)
 	}
-	if _, err := archive.ArchivePartition(context.Background(), db, dbName, partitionName(h1), outPath, "zstd"); err != nil {
+	if _, err := archive.ArchivePartition(context.Background(), db, dbName, indexer.PartitionName(h1), outPath, "zstd"); err != nil {
 		t.Fatalf("ArchivePartition: %v", err)
 	}
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key, s3_uploaded_at)
 		VALUES (?, ?, ?, 2, NULL, NULL, NULL)`,
-		partitionName(h1), bintrailID, outPath)
+		indexer.PartitionName(h1), bintrailID, outPath)
 	testutil.MustExec(t, db, fmt.Sprintf(
 		"ALTER TABLE `%s`.`binlog_events` DROP PARTITION `%s`",
-		dbName, partitionName(h1),
+		dbName, indexer.PartitionName(h1),
 	))
 
 	// ── 5. Drive runReconstructFullTable via flag vars ───────────────────

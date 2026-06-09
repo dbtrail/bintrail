@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -274,7 +275,7 @@ func loadPartitionSamples(ctx context.Context, db *sql.DB, dbName string) ([]cap
 		if err := rows.Scan(&name, &s.rows, &s.bytes); err != nil {
 			return nil, err
 		}
-		d, ok := partitionDate(name)
+		d, ok := indexer.PartitionDate(name)
 		if !ok {
 			continue // p_future and unrecognised names carry no hour
 		}

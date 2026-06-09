@@ -67,14 +67,14 @@ func TestFetchMerged_archiveAware(t *testing.T) {
 	// directory layout is required for query.ResolveArchiveSources to find it.
 	archiveDir := t.TempDir()
 	bintrailID := "test-209-reconstruct"
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, partitionName(h1))
+	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	archivedRows, err := archive.ArchivePartition(context.Background(), db, dbName, partitionName(h1), outPath, "zstd")
+	archivedRows, err := archive.ArchivePartition(context.Background(), db, dbName, indexer.PartitionName(h1), outPath, "zstd")
 	if err != nil {
 		t.Fatalf("ArchivePartition: %v", err)
 	}
@@ -86,13 +86,13 @@ func TestFetchMerged_archiveAware(t *testing.T) {
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key, s3_uploaded_at)
 		VALUES (?, ?, ?, 1, NULL, NULL, NULL)`,
-		partitionName(h1), bintrailID, outPath)
+		indexer.PartitionName(h1), bintrailID, outPath)
 
 	// Drop h1 so its event is gone from live MySQL. FetchMerged now has to
 	// read it from the Parquet archive or miss it entirely.
 	testutil.MustExec(t, db, fmt.Sprintf(
 		"ALTER TABLE `%s`.`binlog_events` DROP PARTITION `%s`",
-		dbName, partitionName(h1),
+		dbName, indexer.PartitionName(h1),
 	))
 
 	engine := query.New(db)
@@ -188,7 +188,7 @@ func TestFetchMerged_gapAbort(t *testing.T) {
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count)
 		VALUES (?, 'dummy', '/tmp/dummy/bintrail_id=dummy/events.parquet', 0)`,
-		partitionName(far))
+		indexer.PartitionName(far))
 
 	_, _, err := query.FetchMerged(context.Background(), db, engine, query.FetchMergedOptions{
 		Opts:           opts,
@@ -309,7 +309,7 @@ func TestFetchMerged_allArchiveSourcesFailStrict(t *testing.T) {
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count)
 		VALUES (?, 'stub-failer', ?, 1)`,
-		partitionName(h1), fakeParquet)
+		indexer.PartitionName(h1), fakeParquet)
 
 	stubErr := errors.New("stub archive failure (intentional)")
 	stubFetcher := func(_ context.Context, _ query.Options, _ string) ([]query.ResultRow, error) {
@@ -398,11 +398,11 @@ func TestFetchMerged_partialArchiveFailureAbortsStrict(t *testing.T) {
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count)
 		VALUES (?, 'healthy', ?, 0)`,
-		partitionName(h1), filepath.Join(healthyBase, "events.parquet"))
+		indexer.PartitionName(h1), filepath.Join(healthyBase, "events.parquet"))
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count)
 		VALUES (?, 'broken', ?, 0)`,
-		partitionName(h1), filepath.Join(brokenBase, "events.parquet"))
+		indexer.PartitionName(h1), filepath.Join(brokenBase, "events.parquet"))
 
 	brokenErr := errors.New("stub: broken archive (intentional)")
 	stubFetcher := func(_ context.Context, _ query.Options, src string) ([]query.ResultRow, error) {
@@ -588,23 +588,23 @@ func TestRunReconstruct_archiveAwareE2E(t *testing.T) {
 	// ── 3. Archive h1 and drop it from live MySQL ──────────────────────────
 	archiveDir := t.TempDir()
 	bintrailID := "test-209-e2e"
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, partitionName(h1))
+	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		t.Fatalf("mkdir archive: %v", err)
 	}
-	if _, err := archive.ArchivePartition(context.Background(), db, dbName, partitionName(h1), outPath, "zstd"); err != nil {
+	if _, err := archive.ArchivePartition(context.Background(), db, dbName, indexer.PartitionName(h1), outPath, "zstd"); err != nil {
 		t.Fatalf("ArchivePartition: %v", err)
 	}
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key, s3_uploaded_at)
 		VALUES (?, ?, ?, 1, NULL, NULL, NULL)`,
-		partitionName(h1), bintrailID, outPath)
+		indexer.PartitionName(h1), bintrailID, outPath)
 	testutil.MustExec(t, db, fmt.Sprintf(
 		"ALTER TABLE `%s`.`binlog_events` DROP PARTITION `%s`",
-		dbName, partitionName(h1),
+		dbName, indexer.PartitionName(h1),
 	))
 
 	// ── 4. Drive runReconstruct via package-level flag vars ────────────────
