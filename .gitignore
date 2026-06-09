@@ -8,6 +8,7 @@ deploy/.env
 /bintrail
 /bintrail-mcp
 /mcp-gateway
+/bintrail-console
 /dist/
 
 # Test coverage
