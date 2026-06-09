@@ -328,7 +328,7 @@ type monitorStartResponse struct {
 func (s *Server) requireMonitorEntry(w http.ResponseWriter, id string) (ServerEntry, bool) {
 	if s.monitorCtrl == nil {
 		writeJSONError(w, http.StatusForbidden,
-			"this console is read-only; monitoring is controlled from the `bintrail up --console` process")
+			"this console is read-only; monitoring is controlled from the `bintrail-console watch` process")
 		return ServerEntry{}, false
 	}
 	if id == bootServerID {

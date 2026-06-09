@@ -45,6 +45,33 @@ builds:
       - -s -w
       - -X main.mcpVersion={{.Version}}
 
+  # bintrail-console links DuckDB (console → query → parquetquery), so it is
+  # CGO like the core binary — and uses the SAME main.* ldflags var names, so
+  # the version block mirrors bintrail's verbatim. Archives only for now; the
+  # Docker image and deb/rpm packaging land in a follow-up (decouple PR-E).
+  - id: bintrail-console
+    binary: bintrail-console
+    main: ./cmd/bintrail-console
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    overrides:
+      - goos: linux
+        goarch: arm64
+        env:
+          - CGO_ENABLED=1
+          - CC=aarch64-linux-gnu-gcc
+          - CXX=aarch64-linux-gnu-g++
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.CommitSHA={{.Commit}}
+      - -X main.BuildDate={{.Date}}
+
 archives:
   - formats:
       - tar.gz
@@ -52,6 +79,7 @@ archives:
     ids:
       - bintrail
       - bintrail-mcp
+      - bintrail-console
 
 checksum:
   name_template: "checksums.txt"

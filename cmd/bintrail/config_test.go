@@ -99,29 +99,15 @@ func TestEnvBindingsAndSectionsConsistency(t *testing.T) {
 			t.Errorf("envBindings has %s but envSections does not", b.EnvVar)
 		}
 	}
-	// Console env vars are intentionally template-only: `bintrail console` reads
-	// them directly in runConsole rather than via the shared bindCommandEnv. The
-	// --listen flag name is also used by shim/init-shim, so a global envBinding
-	// keyed on the flag name would cross-wire the console's settings into those
-	// commands. They still belong in the generated template, hence this
-	// documented exception.
-	templateOnly := map[string]bool{
-		"BINTRAIL_CONSOLE_LISTEN":       true,
-		"BINTRAIL_CONSOLE_TOKEN":        true,
-		"BINTRAIL_CONSOLE_BASELINE_DIR": true,
-		"BINTRAIL_CONSOLE_BASELINE_S3":  true,
-		"BINTRAIL_CONSOLE_SERVERS":      true,
-	}
-	// Every other envSection entry must appear in envBindings.
+	// Every envSection entry must appear in envBindings. (The template-only
+	// BINTRAIL_CONSOLE_* exception is gone: those vars moved with the web
+	// console to the standalone bintrail-console binary.)
 	bindingVars := make(map[string]bool)
 	for _, b := range envBindings {
 		bindingVars[b.EnvVar] = true
 	}
 	for _, sec := range envSections {
 		for _, entry := range sec.Bindings {
-			if templateOnly[entry.EnvVar] {
-				continue
-			}
 			if !bindingVars[entry.EnvVar] {
 				t.Errorf("envSections has %s (in %q) but envBindings does not", entry.EnvVar, sec.Header)
 			}

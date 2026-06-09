@@ -20,12 +20,11 @@ var envOnce sync.Once
 //  2. ~/.config/bintrail/config.env
 //
 // loadEnvFile/parseAndSetEnv mirror the core bintrail loader in
-// cmd/bintrail/envload.go. The console decouple keeps the core binary
-// unchanged, so the file→env reader is replicated here rather than shared via
-// internal/ (deduping waits until the console is fully split out). The console
-// reads only BINTRAIL_INDEX_DSN / BINTRAIL_CONSOLE_* (see serve.go), so it needs
-// just the file loader — not the core's full bindCommandEnv/envBindings
-// machinery, out of which the console-specific vars are read in runServe.
+// cmd/bintrail/envload.go — replicated rather than shared via internal/ to
+// keep the core binary untouched by the decouple. `serve` reads only
+// BINTRAIL_INDEX_DSN / BINTRAIL_CONSOLE_* directly in runServe; `watch`
+// additionally binds the stream/rotation BINTRAIL_* vars to its flags via
+// bindWatchEnv (watch.go), the same role the core's bindCommandEnv plays.
 func loadEnvFile() {
 	paths := []string{".bintrail.env"}
 	if home, err := os.UserHomeDir(); err == nil {

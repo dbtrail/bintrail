@@ -525,7 +525,7 @@ func newSupervisorServer(t *testing.T) (*Server, *stubMonitorCtrl) {
 }
 
 // TestCapabilityMonitorGate: only a supervisor process (Config.MonitorCtrl,
-// wired by `up --console`) advertises the monitor capability; the standalone
+// wired by `bintrail-console watch`) advertises the monitor capability; the standalone
 // read-only console never does.
 func TestCapabilityMonitorGate(t *testing.T) {
 	for _, monitor := range []bool{true, false} {

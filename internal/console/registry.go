@@ -54,7 +54,7 @@ type ServerEntry struct {
 
 	// ── Control-plane fields (phase 2 of the approved blueprint) ──
 	// These configure MONITORING of a source MySQL; the supervisor in
-	// `bintrail up --console` consumes them (phase 3). On binaries that
+	// `bintrail-console watch` consumes them (phase 3). On binaries that
 	// predate them they round-trip untouched through Extra.
 
 	// SourceDSN is the source MySQL to monitor — replication credentials,

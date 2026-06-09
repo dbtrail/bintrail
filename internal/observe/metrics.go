@@ -8,7 +8,7 @@ import (
 // Stream metrics — all in the bintrail_stream namespace.
 //
 // Every metric carries a "source" label so N concurrent streams in one
-// process (the `up --console` control plane) stay distinguishable: without
+// process (the `bintrail-console watch` control plane) stay distinguishable: without
 // it the counters of different sources conflate and the gauges clobber each
 // other last-writer-wins. The label value is the supervisor's entry ID for
 // monitored streams and the resolved bintrail_id (or "default") for a

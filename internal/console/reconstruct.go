@@ -24,7 +24,7 @@ var reconstructMaxEvents = 10000
 type capabilitiesResponse struct {
 	Reconstruct bool `json:"reconstruct"`
 	// Monitor: this process can start/stop monitoring (a control-plane
-	// supervisor — `bintrail up --console`). Process-global, not per-server:
+	// supervisor — `bintrail-console watch`). Process-global, not per-server:
 	// it is about what the PROCESS is, not about the selected connection.
 	Monitor bool `json:"monitor"`
 }

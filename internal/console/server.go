@@ -60,7 +60,7 @@ type Config struct {
 	// front the console with a DNS name.
 	AllowedHosts []string
 	// MonitorCtrl is the control-plane supervisor, wired in ONLY by
-	// `bintrail up --console` (the write-capable daemon). nil on the
+	// `bintrail-console watch` (the write-capable daemon). nil on the
 	// standalone read-only console: /api/capabilities reports monitor:false
 	// there and every monitor verb refuses at the endpoint with 403,
 	// mirroring how reconstruct gates on baselineConfigured.
@@ -200,7 +200,7 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("DELETE /api/servers/{id}", s.handleServersDelete)
 	api.HandleFunc("POST /api/servers/{id}/test", s.handleServersTest)
 	// Monitor verbs: 403 unless this process is a control-plane supervisor
-	// (`bintrail up --console`). The standalone console stays read-only.
+	// (`bintrail-console watch`). The standalone console stays read-only.
 	api.HandleFunc("POST /api/servers/{id}/monitor/start", s.handleMonitorStart)
 	api.HandleFunc("POST /api/servers/{id}/monitor/stop", s.handleMonitorStop)
 	api.HandleFunc("GET /api/servers/{id}/monitor", s.handleMonitorStatus)
@@ -227,7 +227,7 @@ func (s *Server) URL() string {
 
 // Listen binds the configured address and returns the listener synchronously,
 // so a caller can fail fast on a port conflict before reporting the server as
-// ready (the standalone command blocks on Run, but `bintrail up --console`
+// ready (the standalone command blocks on Run, but `bintrail-console watch`
 // starts the server in a goroutine and must surface a bind error up front).
 func (s *Server) Listen() (net.Listener, error) {
 	return net.Listen("tcp", s.listen)

@@ -16,18 +16,18 @@ func TestRunUp_explicitRetentionWiring(t *testing.T) {
 	savedChanged, savedValue := flag.Changed, flag.Value.String()
 	savedCfg := upRotationCfg
 	savedRetain, savedInterval, savedAdd := upRotateRetain, upRotateInterval, upRotateAddFuture
-	savedSource, savedConsole, savedFormat := upSourceDSN, upConsole, upFormat
+	savedSource, savedFormat := upSourceDSN, upFormat
 	t.Cleanup(func() {
 		flag.Changed = savedChanged
 		_ = flag.Value.Set(savedValue)
 		upRotationCfg = savedCfg
 		upRotateRetain, upRotateInterval, upRotateAddFuture = savedRetain, savedInterval, savedAdd
-		upSourceDSN, upConsole, upFormat = savedSource, savedConsole, savedFormat
+		upSourceDSN, upFormat = savedSource, savedFormat
 	})
 
 	// Make runUp exit early at the source-dsn check — AFTER the rotation
 	// block has populated upRotationCfg, BEFORE any phase touches a DB.
-	upSourceDSN, upConsole, upFormat = "", false, "text"
+	upSourceDSN, upFormat = "", "text"
 	upRotateInterval, upRotateAddFuture = "1h", 3
 
 	// Implicit: flag never set.

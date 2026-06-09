@@ -1148,7 +1148,7 @@ func One(ctx context.Context, cfg Config) error {
 	// lifecycle without competing signal handlers.)
 
 	// ── 9. Optional Prometheus metrics HTTP server ─────────────────────────
-	// Under `up --console` the daemon serves one endpoint for all streams
+	// Under `bintrail-console watch` the daemon serves one endpoint for all streams
 	// instead (cfg.MetricsAddr is empty there) — the registry is process-
 	// global, so one handler exposes every per-source series.
 	if cfg.MetricsAddr != "" {
@@ -1265,7 +1265,7 @@ func One(ctx context.Context, cfg Config) error {
 // command fast — the operator explicitly asked for metrics; silently running
 // without them (scrapes getting connection-refused) is worse than refusing
 // to start. Shared by `bintrail stream` (one endpoint per stream process)
-// and the `up --console` daemon (one endpoint for all supervised streams;
+// and the `bintrail-console watch` daemon (one endpoint for all supervised streams;
 // the default registry is process-global).
 func StartMetricsServer(addr string) (shutdown func(), err error) {
 	mux := http.NewServeMux()

@@ -186,21 +186,9 @@ var envSections = []envSection{
 			{"BINTRAIL_ROTATE_ADD_FUTURE", "3"},
 		},
 	},
-	{
-		// These are read directly by `bintrail console` (see runConsole) and
-		// `bintrail up --console` (see resolveUpConsoleEnv), not via the shared
-		// envBindings slice — --listen is also used by shim, and --baseline-dir/
-		// --baseline-s3 by reconstruct, so a global binding would cross-wire
-		// the commands.
-		Header: "Console (used by bintrail console and bintrail up --console)",
-		Bindings: []envTemplateEntry{
-			{"BINTRAIL_CONSOLE_LISTEN", "127.0.0.1:8090"},
-			{"BINTRAIL_CONSOLE_TOKEN", ""},
-			{"BINTRAIL_CONSOLE_BASELINE_DIR", ""},
-			{"BINTRAIL_CONSOLE_BASELINE_S3", "s3://my-bucket/baselines/"},
-			{"BINTRAIL_CONSOLE_SERVERS", "~/.config/bintrail/console-servers.yaml"},
-		},
-	},
+	// The BINTRAIL_CONSOLE_* vars moved with the web console to the standalone
+	// bintrail-console binary (serve/watch), which reads the same env file —
+	// they are no longer advertised in the core CLI's template.
 }
 
 // generateEnvTemplate builds the .bintrail.env file content. Variables

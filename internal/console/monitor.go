@@ -5,7 +5,7 @@ import "context"
 // This file defines the seam between the console (which renders and gates the
 // monitoring surface) and the control-plane supervisor (which actually runs
 // streams). The supervisor lives in cmd/bintrail and is wired in ONLY by
-// `bintrail up --console` — the write-capable daemon. The standalone
+// `bintrail-console watch` — the write-capable daemon. The standalone
 // read-only console never constructs one, so every monitor verb refuses
 // there at the endpoint, mirroring how reconstruct gates on
 // baselineConfigured.
