@@ -291,7 +291,7 @@ func TestStreamLoop_liveReplication(t *testing.T) {
 		t.Skipf("skipping: cannot read binlog position: %v", err)
 	}
 
-	// Take schema snapshot into the index DB. (The cmd-layer ensureResolver
+	// Take schema snapshot into the index DB. (The metadata.EnsureResolver
 	// helper auto-snapshots-then-loads; here we only need the snapshot taken,
 	// since NewResolver(indexDB, 0) below loads it. Inlined so this engine test
 	// stays in package streamrun without importing the cmd layer.)

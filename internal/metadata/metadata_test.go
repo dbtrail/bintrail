@@ -168,7 +168,7 @@ func TestResolverTables(t *testing.T) {
 // schemas via a parameterized IN list — and the bintrail-internal exclusion is
 // NOT added (an explicitly named internal schema is still policed).
 func TestBuildFKCascadeQuery_withSchemas(t *testing.T) {
-	query, args := BuildFKCascadeQuery([]string{"iotcore", "billing"})
+	query, args := buildFKCascadeQuery([]string{"iotcore", "billing"})
 
 	if !strings.Contains(query, "CONSTRAINT_SCHEMA IN (?,?)") {
 		t.Errorf("expected parameterized IN list, got query:\n%s", query)
@@ -187,7 +187,7 @@ func TestBuildFKCascadeQuery_withSchemas(t *testing.T) {
 // stream_state — not by name, so an agent does not fatal-fail on bintrail's own
 // index FK cascades regardless of how the index DB is named (#347/#365).
 func TestBuildFKCascadeQuery_noSchemasExcludesInternal(t *testing.T) {
-	query, args := BuildFKCascadeQuery(nil)
+	query, args := buildFKCascadeQuery(nil)
 
 	if len(args) != 0 {
 		t.Errorf("expected no args for unscoped query, got %v", args)

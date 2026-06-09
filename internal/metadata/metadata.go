@@ -606,7 +606,7 @@ func ValidateBinlogRowImage(db *sql.DB) error {
 	return nil
 }
 
-// BuildFKCascadeQuery returns the REFERENTIAL_CONSTRAINTS query (and its args)
+// buildFKCascadeQuery returns the REFERENTIAL_CONSTRAINTS query (and its args)
 // used to find CASCADE foreign keys. When schemas is non-empty the scan is
 // scoped to exactly those schemas — the operator explicitly asked us to index
 // them, so we police them as named. When schemas is empty we scan every schema
@@ -620,7 +620,7 @@ func ValidateBinlogRowImage(db *sql.DB) error {
 // MySQL (#347), while still flagging a genuine user schema whatever it is named
 // (#365). The signature tables are created before access_rules, so any schema
 // carrying that cascade necessarily carries the signature too.
-func BuildFKCascadeQuery(schemas []string) (string, []any) {
+func buildFKCascadeQuery(schemas []string) (string, []any) {
 	query := `SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, DELETE_RULE, UPDATE_RULE
 		FROM information_schema.REFERENTIAL_CONSTRAINTS
 		WHERE (DELETE_RULE = 'CASCADE' OR UPDATE_RULE = 'CASCADE')`
@@ -650,14 +650,14 @@ func BuildFKCascadeQuery(schemas []string) (string, []any) {
 
 // ValidateNoFKCascades checks that none of the targeted schemas contain foreign
 // key constraints with CASCADE rules. When schemas is empty, all non-system,
-// non-bintrail-internal schemas are checked (see BuildFKCascadeQuery). FK
+// non-bintrail-internal schemas are checked (see buildFKCascadeQuery). FK
 // cascades produce invisible side-effect row changes that make reversal SQL
 // unreliable.
 func ValidateNoFKCascades(db *sql.DB, schemas []string) error {
-	query, args := BuildFKCascadeQuery(schemas)
+	query, args := buildFKCascadeQuery(schemas)
 
 	// The unscoped scan skips schemas that look like a bintrail index — those
-	// holding all of bintrail's signature tables (see BuildFKCascadeQuery) — so a
+	// holding all of bintrail's signature tables (see buildFKCascadeQuery) — so a
 	// clean result does not cover them. Disclose the rule, naming the signature
 	// tables rather than asserting the skipped schemas are definitely bintrail's:
 	// a user schema that replicated those table names would be skipped too, and
