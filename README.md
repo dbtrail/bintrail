@@ -4,7 +4,7 @@
 
 **Point-in-time recovery for MySQL — no locks, no schema changes, no waiting for a restore.**
 
-[![Release](https://img.shields.io/github/v/release/dbtrail/bintrail)](https://github.com/dbtrail/dbtrail/releases/latest)
+[![Release](https://img.shields.io/github/v/release/dbtrail/dbtrail)](https://github.com/dbtrail/dbtrail/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![CI](https://github.com/dbtrail/dbtrail/actions/workflows/ci.yml/badge.svg)](https://github.com/dbtrail/dbtrail/actions)
 

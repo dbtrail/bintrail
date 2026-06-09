@@ -12,7 +12,7 @@ Thank you for your interest in contributing. This document covers how to get set
 
 ```sh
 git clone https://github.com/dbtrail/dbtrail
-cd bintrail
+cd dbtrail
 go mod download
 go build ./...
 go test ./...

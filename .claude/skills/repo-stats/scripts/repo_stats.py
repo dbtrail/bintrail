@@ -20,7 +20,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO = "dbtrail/bintrail"
+REPO = "dbtrail/dbtrail"
 API = f"https://api.github.com/repos/{REPO}"
 STATE_DIR = Path.home() / ".local" / "state" / "bintrail-repo-stats" / "snapshots"
 

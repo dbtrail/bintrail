@@ -135,7 +135,7 @@ Requires CGO (bintrail embeds DuckDB for Parquet archive queries).
 
 ```sh
 git clone https://github.com/dbtrail/dbtrail
-cd bintrail
+cd dbtrail
 go build ./cmd/bintrail
 ```
 

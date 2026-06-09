@@ -30,7 +30,7 @@ Source MySQL ──replication──► bintrail stream ──► Index MySQL (b
 
 ```bash
 git clone https://github.com/dbtrail/dbtrail
-cd bintrail
+cd dbtrail
 make all
 sudo cp bintrail /usr/local/bin/
 sudo cp bintrail-mcp /usr/local/bin/
