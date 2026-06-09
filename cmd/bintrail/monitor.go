@@ -47,6 +47,10 @@ type monitorSupervisor struct {
 	// candidate source against them for replica/duplicate detection. May be
 	// nil (tests); the check is skipped then.
 	registry *console.Registry
+	// rotateRetain is the rotation window the daemon's built-in loop uses; the
+	// Doctor capacity projection assumes it (0 = rotation disabled). Set at
+	// construction so the supervisor never reads the cmd-layer upRotationCfg global.
+	rotateRetain time.Duration
 	// streamFn runs one supervised stream; a seam for unit tests, streamrun.One
 	// in production.
 	streamFn func(ctx context.Context, cfg streamrun.Config) error
@@ -180,11 +184,12 @@ func (j *monitorJob) snapshot() console.MonitorStatus {
 
 // newMonitorSupervisor builds the control plane. reg may be nil (tests) —
 // Doctor's replica/duplicate detection is skipped then.
-func newMonitorSupervisor(baseCtx context.Context, bootIndexDSN string, reg *console.Registry) *monitorSupervisor {
+func newMonitorSupervisor(baseCtx context.Context, bootIndexDSN string, reg *console.Registry, retain time.Duration) *monitorSupervisor {
 	return &monitorSupervisor{
 		baseCtx:      baseCtx,
 		bootIndexDSN: bootIndexDSN,
 		registry:     reg,
+		rotateRetain: retain,
 		streamFn:     streamrun.One,
 		jobs:         map[string]*monitorJob{},
 	}
@@ -219,7 +224,7 @@ func (m *monitorSupervisor) Doctor(ctx context.Context, e console.ServerEntry) (
 	}
 	// The per-source databases are rotated by the daemon's built-in loop, so
 	// the capacity projection uses its window (0 when rotation is disabled).
-	r := buildDoctorReport(ctx, e.SourceDSN, e.DSN, e.Schemas, upRotationCfg.retain)
+	r := buildDoctorReport(ctx, e.SourceDSN, e.DSN, e.Schemas, m.rotateRetain)
 	out := &console.DoctorReport{
 		Passed:   r.Passed,
 		Failed:   r.Failed,

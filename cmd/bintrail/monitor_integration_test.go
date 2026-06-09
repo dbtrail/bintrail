@@ -80,7 +80,7 @@ func TestIntegrationMonitorSupervisor(t *testing.T) {
 	t.Cleanup(func() { _, _ = srcDB.Exec("DROP DATABASE IF EXISTS " + srcSchema) })
 	mustExec("CREATE TABLE " + srcSchema + ".items (id INT PRIMARY KEY, qty INT)")
 
-	sup := newMonitorSupervisor(ctx, bootDSN, nil)
+	sup := newMonitorSupervisor(ctx, bootDSN, nil, 0)
 	entry := console.ServerEntry{
 		ID:        fmt.Sprintf("itest%d", time.Now().UnixNano()%1e9),
 		Name:      "integration",
@@ -140,7 +140,7 @@ func TestIntegrationMonitorSupervisor(t *testing.T) {
 	waitStreamLive(t, srcDB, idxDB, srcSchema, "items", "id")
 
 	// The advisory lock: a second supervisor (second daemon) must refuse.
-	sup2 := newMonitorSupervisor(ctx, bootDSN, nil)
+	sup2 := newMonitorSupervisor(ctx, bootDSN, nil, 0)
 	if err := sup2.Start(ctx, entry); err == nil || !strings.Contains(err.Error(), "already monitoring") {
 		t.Fatalf("second daemon Start: err=%v, want advisory-lock refusal", err)
 	}
@@ -210,7 +210,7 @@ func TestIntegrationDDLThenImmediateInserts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sup := newMonitorSupervisor(ctx, bootDSN, nil)
+	sup := newMonitorSupervisor(ctx, bootDSN, nil, 0)
 	entry := console.ServerEntry{
 		ID:        fmt.Sprintf("ddlrace%d", time.Now().UnixNano()%1e9),
 		Name:      "ddl-race",
@@ -322,7 +322,7 @@ func TestIntegrationLostPositionDurable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sup := newMonitorSupervisor(ctx, bootDSN, nil)
+	sup := newMonitorSupervisor(ctx, bootDSN, nil, 0)
 	entry := console.ServerEntry{
 		ID:        fmt.Sprintf("lptest%d", time.Now().UnixNano()%1e9),
 		Name:      "lost-position",
@@ -442,7 +442,7 @@ func TestIntegrationReplicaOverlapSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sup := newMonitorSupervisor(ctx, bootDSN, reg)
+	sup := newMonitorSupervisor(ctx, bootDSN, reg, 0)
 
 	// Peer B's per-source index DB, provisioned with the real tables and
 	// seeded with an identity + an accumulated GTID set.

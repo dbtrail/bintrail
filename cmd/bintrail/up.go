@@ -262,7 +262,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry)
+	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.retain)
 	cfg.MonitorCtrl = supervisor
 
 	// Built-in rotation covers the boot index plus every per-source database
@@ -399,7 +399,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// The control-plane supervisor: "+ Add server" in the console starts real
 	// monitoring through it. Streams live on the daemon context (ctx), not on
 	// the HTTP requests that start them.
-	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry)
+	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.retain)
 	cfg.MonitorCtrl = supervisor
 
 	// Built-in rotation: boot index + every per-source database the control
