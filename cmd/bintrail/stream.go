@@ -126,9 +126,6 @@ func parseSourceDSN(dsn string) (host string, port uint16, user, password string
 	return h, uint16(portN), cfg.User, cfg.Passwd, nil
 }
 
-// streamConfigFromFlags snapshots the strm* package globals into a config.
-// The globals remain the cobra flag targets (and up.go's populateStreamFlags
-// fan-out target); this is the single seam where they become values.
 // streamDeps wires the package-main helper functions into a streamrun.Deps —
 // the host side of streamrun's dependency seam. Shared by streamConfigFromFlags
 // and the control-plane supervisor so both build identical engine deps.
@@ -147,6 +144,10 @@ func streamDeps() streamrun.Deps {
 	}
 }
 
+// streamConfigFromFlags snapshots the strm* package globals into a
+// streamrun.Config. The globals remain the cobra flag targets (and up.go's
+// populateStreamFlags fan-out target); this is the single seam where they
+// become values, with the host-supplied Deps attached.
 func streamConfigFromFlags() streamrun.Config {
 	return streamrun.Config{
 		IndexDSN:    strmIndexDSN,
@@ -173,15 +174,15 @@ func streamConfigFromFlags() streamrun.Config {
 }
 
 // runStream is the `bintrail stream` entrypoint: it owns the PROCESS concerns
-// (signal handling) and delegates the actual streaming to streamOne with a
+// (signal handling) and delegates the actual streaming to streamrun.One with a
 // config snapshotted from the flags. The split exists so a supervisor can run
-// several streamOne instances under its own lifecycle without inheriting
+// several streamrun.One instances under its own lifecycle without inheriting
 // per-process signal wiring.
 func runStream(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
-	// Graceful shutdown on SIGINT/SIGTERM: cancel the context so streamOne
+	// Graceful shutdown on SIGINT/SIGTERM: cancel the context so streamrun.One
 	// flushes its batch and writes a final checkpoint. (Installed before
 	// startup rather than after StartSync as it historically was — a signal
 	// during the connect/snapshot phase now also exits cleanly.)

@@ -412,7 +412,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// With the console comes the multi-stream control plane, so /metrics is
 	// served once at the daemon level (per-source "source" labels keep the
 	// series apart). Clear the flag fan-out so the main stream does not
-	// double-bind the same address inside streamOne. Synchronous bind:
+	// double-bind the same address inside streamrun.One. Synchronous bind:
 	// fails fast, like the console bind below.
 	if upMetricsAddr != "" {
 		stopMetrics, err := streamrun.StartMetricsServer(upMetricsAddr)

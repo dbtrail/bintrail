@@ -793,6 +793,37 @@ type Deps struct {
 	OutputJSON             func(v any) error
 }
 
+// validate fails fast when a required dependency is unset. One calls every Deps
+// field with no nil guard, so without this a missing one would nil-panic deep in
+// the stream (after two DB connections) with a message that names no field — and
+// the compiler can't catch a newly-added field that wasn't wired into the host's
+// streamDeps(). Named errors here turn that into an immediate, actionable failure.
+func (d Deps) validate() error {
+	switch {
+	case d.ValidateBinlogFormat == nil:
+		return errors.New("streamrun.Deps.ValidateBinlogFormat is nil")
+	case d.ValidateBinlogRowImage == nil:
+		return errors.New("streamrun.Deps.ValidateBinlogRowImage is nil")
+	case d.ValidateNoFKCascades == nil:
+		return errors.New("streamrun.Deps.ValidateNoFKCascades is nil")
+	case d.ParseSchemaList == nil:
+		return errors.New("streamrun.Deps.ParseSchemaList is nil")
+	case d.ResolveServerIdentity == nil:
+		return errors.New("streamrun.Deps.ResolveServerIdentity is nil")
+	case d.EnsureResolver == nil:
+		return errors.New("streamrun.Deps.EnsureResolver is nil")
+	case d.BuildIndexFilters == nil:
+		return errors.New("streamrun.Deps.BuildIndexFilters is nil")
+	case d.InsertSchemaChange == nil:
+		return errors.New("streamrun.Deps.InsertSchemaChange is nil")
+	case d.ParseSourceDSN == nil:
+		return errors.New("streamrun.Deps.ParseSourceDSN is nil")
+	case d.OutputJSON == nil:
+		return errors.New("streamrun.Deps.OutputJSON is nil")
+	}
+	return nil
+}
+
 // One runs one complete replication stream — connect, validate,
 // resolve identity, snapshot, gap-check, sync, index, checkpoint — until ctx
 // is cancelled or a fatal error occurs. It is self-contained by design: no
@@ -808,6 +839,11 @@ func One(ctx context.Context, cfg Config) error {
 	// error whose recovery hint (`--reset`) discards the saved checkpoint.
 	if cfg.GapTimeout <= 0 {
 		return fmt.Errorf("invalid --gap-timeout %d: must be a positive number of seconds", cfg.GapTimeout)
+	}
+	// Fail fast on an unwired dependency (named field) before opening any
+	// connection, rather than nil-panicking on first use further down.
+	if err := cfg.Deps.validate(); err != nil {
+		return err
 	}
 
 	// Derived cancel: internal failures (e.g. the stream loop erroring) must

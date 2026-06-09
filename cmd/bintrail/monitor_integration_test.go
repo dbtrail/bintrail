@@ -17,7 +17,7 @@ import (
 
 // waitStreamLive proves the supervised stream is attached and past its
 // auto-discovered start position before the test writes the rows it intends
-// to assert on. The supervisor reports "running" while streamOne is still
+// to assert on. The supervisor reports "running" while streamrun.One is still
 // connecting → snapshotting → discovering its start position; rows written in
 // that window land BEFORE the stream's start and are legitimately never
 // indexed. On a fast laptop the window is <1s; on a cold CI runner it spans
@@ -297,7 +297,7 @@ func TestIntegrationDDLThenImmediateInserts(t *testing.T) {
 // from stream_state at Start), is presented as the derived "lost_position"
 // state, and is cleared only by an explicit Stop — the operator's
 // acknowledgment. The gap record itself is simulated (real binlog purging is
-// not reproducible on the shared test container); the streamOne write path
+// not reproducible on the shared test container); the streamrun.One write path
 // for it is the same UPDATE this test issues.
 func TestIntegrationLostPositionDurable(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
@@ -375,7 +375,7 @@ func TestIntegrationLostPositionDurable(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	// Simulate what streamOne persists on an unfillable-gap auto-advance.
+	// Simulate what streamrun.One persists on an unfillable-gap auto-advance.
 	const gapDetail = "simulated: binlogs purged past saved position; events lost"
 	if _, err := idxDB.Exec(`UPDATE stream_state
 		SET gap_lost_at = UTC_TIMESTAMP(), gap_lost_detail = ? WHERE id = 1`, gapDetail); err != nil {

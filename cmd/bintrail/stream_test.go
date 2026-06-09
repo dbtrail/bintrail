@@ -226,11 +226,11 @@ func TestStreamCmd_noGapFillFlagRegistered(t *testing.T) {
 	}
 }
 
-// TestStreamConfigFromFlags asserts the strm* → streamConfig snapshot — the
-// single seam where the flag globals become a by-value config that streamOne
+// TestStreamConfigFromFlags asserts the strm* → streamrun.Config snapshot — the
+// single seam where the flag globals become a by-value config that streamrun.One
 // (and, later, the control-plane supervisor) consumes. A flag added to stream
 // but not wired through here would silently read its zero value inside
-// streamOne, so every field is checked with a distinctive value. Mirrors
+// streamrun.One, so every field is checked with a distinctive value. Mirrors
 // TestPopulateStreamFlags' save-and-restore discipline: no t.Parallel().
 func TestStreamConfigFromFlags(t *testing.T) {
 	orig := struct {
@@ -278,6 +278,12 @@ func TestStreamConfigFromFlags(t *testing.T) {
 	strmGapTimeout = 99
 
 	got := streamConfigFromFlags()
+	// The Deps seam must be wired (else streamrun.One nil-panics at runtime, and
+	// only the Docker-gated monitor integration test would catch a dropped
+	// streamDeps() call). Spot-check two fields here so a unit run flags it.
+	if got.Deps.BuildIndexFilters == nil || got.Deps.OutputJSON == nil {
+		t.Error("streamConfigFromFlags did not wire Deps (streamDeps())")
+	}
 	// Deps holds func values (not comparable / not == ); this test checks the
 	// strm* → field snapshot, so zero it before the struct comparison.
 	got.Deps = streamrun.Deps{}
@@ -307,7 +313,7 @@ func TestStreamConfigFromFlags(t *testing.T) {
 	}
 }
 
-// TestStreamOneRejectsBadConfig: streamOne owns its own validation (it must
+// TestStreamOneRejectsBadConfig: streamrun.One owns its own validation (it must
 // not depend on cobra/flag-layer checks once a supervisor builds configs
 // programmatically).
 func TestStreamOneRejectsBadConfig(t *testing.T) {

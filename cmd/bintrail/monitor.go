@@ -20,7 +20,7 @@ import (
 )
 
 // monitorSupervisor is the control plane behind `bintrail up --console`: it
-// implements console.MonitorController and runs one supervised streamOne per
+// implements console.MonitorController and runs one supervised streamrun.One per
 // monitored registry entry. The approved architecture is index-DATABASE per
 // source — each monitored entry streams into its own database
 // (bintrail_idx_<entry-id>) on the daemon's index MySQL server, so per-source

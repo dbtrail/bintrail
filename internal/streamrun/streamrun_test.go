@@ -43,14 +43,6 @@ func selfSignedCAPEM(t *testing.T) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
-// ─── parseSourceDSN ──────────────────────────────────────────────────────────
-
-// TestParseSourceDSN_ipv6 verifies IPv6 addresses are parsed correctly.
-
-// TestParseSourceDSN_portOutOfRange verifies that a port above the uint16 max
-// (65535) is rejected. go-mysql-driver accepts it syntactically, but
-// parseSourceDSN uses strconv.ParseUint with bitSize=16 to catch it.
-
 // ─── resolveStart ────────────────────────────────────────────────────────────
 
 func TestResolveStart_noStateNoFlags(t *testing.T) {
@@ -360,25 +352,6 @@ func TestBuildTLSConfig_validCAFile(t *testing.T) {
 		t.Error("expected RootCAs to be set when --ssl-ca is provided")
 	}
 }
-
-// ─── cobra command wiring ─────────────────────────────────────────────────────
-
-// TestStreamCmd_registered verifies that streamCmd is wired into the root command.
-
-// TestStreamCmd_requiredFlags verifies that the three required flags are marked
-// as required so cobra enforces them before RunE is called.
-
-// TestStreamCmd_allFlagsRegistered verifies that all expected flags are wired up.
-
-// TestStreamCmd_resetDefaultFalse verifies the --reset flag defaults to false.
-
-// TestStreamCmd_sslModeDefault verifies the default ssl-mode is "preferred".
-
-// TestStreamCmd_sslFlagsEmptyDefaults verifies ssl-ca/cert/key default to "".
-
-// TestStreamCmd_defaults verifies that optional flags have the expected defaults.
-
-// TestStreamCmd_emptyStringDefaults verifies that optional string flags default to "".
 
 // ─── resolveStart additional paths ───────────────────────────────────────────
 
@@ -1016,8 +989,6 @@ func TestGtidSetsEqual(t *testing.T) {
 	}
 }
 
-// TestStreamCmd_noGapFillFlagRegistered verifies the --no-gap-fill flag exists.
-
 // ─── resolveStartWithAutoDiscover ────────────────────────────────────────────
 
 // TestResolveStartWithAutoDiscover_firesOnFirstRun verifies that the
@@ -1170,14 +1141,3 @@ func TestResolveStartWithAutoDiscover_mutuallyExclusiveFlagsErrorPropagates(t *t
 		t.Errorf("expected mutually-exclusive error, got: %v", err)
 	}
 }
-
-// TestStreamConfigFromFlags asserts the strm* → streamConfig snapshot — the
-// single seam where the flag globals become a by-value config that streamOne
-// (and, later, the control-plane supervisor) consumes. A flag added to stream
-// but not wired through here would silently read its zero value inside
-// streamOne, so every field is checked with a distinctive value. Mirrors
-// TestPopulateStreamFlags' save-and-restore discipline: no t.Parallel().
-
-// TestStreamOneRejectsBadConfig: streamOne owns its own validation (it must
-// not depend on cobra/flag-layer checks once a supervisor builds configs
-// programmatically).
