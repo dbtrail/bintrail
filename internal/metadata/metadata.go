@@ -729,8 +729,8 @@ func EnsureResolver(indexDB, sourceDB *sql.DB, schemas []string) (*Resolver, err
 // HasReplPrivileges checks a list of SHOW GRANTS output lines for REPLICATION
 // SLAVE and REPLICATION CLIENT privileges. A pure source pre-flight parser
 // shared by `bintrail agent --validate` and the doctor's replication-grants
-// check (internal/doctor), so it lives next to the other source validators
-// rather than in either caller's package.
+// check, so it lives in metadata next to the other source validators rather
+// than in either consumer.
 func HasReplPrivileges(grants []string) (slave, client bool) {
 	for _, grant := range grants {
 		upper := strings.ToUpper(grant)
