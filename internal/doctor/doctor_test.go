@@ -1,4 +1,4 @@
-package main
+package doctor
 
 import (
 	"bytes"
@@ -71,12 +71,12 @@ func TestExtractGrantUser(t *testing.T) {
 }
 
 func TestDoctorReportAdd(t *testing.T) {
-	r := &doctorReport{}
-	r.add(checkResult{Name: "a", Status: statusPass})
-	r.add(checkResult{Name: "b", Status: statusFail})
-	r.add(checkResult{Name: "c", Status: statusWarn})
-	r.add(checkResult{Name: "d", Status: statusSkip})
-	r.add(checkResult{Name: "e", Status: statusPass})
+	r := &Report{}
+	r.add(CheckResult{Name: "a", Status: StatusPass})
+	r.add(CheckResult{Name: "b", Status: StatusFail})
+	r.add(CheckResult{Name: "c", Status: StatusWarn})
+	r.add(CheckResult{Name: "d", Status: StatusSkip})
+	r.add(CheckResult{Name: "e", Status: StatusPass})
 
 	if r.Passed != 2 || r.Failed != 1 || r.Warnings != 1 || r.Skipped != 1 {
 		t.Errorf("counts wrong: %+v", r)
@@ -87,8 +87,8 @@ func TestDoctorReportAdd(t *testing.T) {
 }
 
 func TestDoctorReportAddUnknownStatusDoesNotCountButAppends(t *testing.T) {
-	r := &doctorReport{}
-	r.add(checkResult{Name: "weird", Status: checkStatus("UNKNOWN")})
+	r := &Report{}
+	r.add(CheckResult{Name: "weird", Status: CheckStatus("UNKNOWN")})
 	if len(r.Checks) != 1 {
 		t.Errorf("expected unknown check appended for JSON visibility, got %d entries", len(r.Checks))
 	}
@@ -99,13 +99,13 @@ func TestDoctorReportAddUnknownStatusDoesNotCountButAppends(t *testing.T) {
 
 func TestDoctorReportErr(t *testing.T) {
 	// No failures → nil error (warnings are tolerated).
-	r := &doctorReport{Passed: 3, Warnings: 2}
+	r := &Report{Passed: 3, Warnings: 2}
 	if err := r.Err(); err != nil {
 		t.Errorf("expected nil error with no failures, got %v", err)
 	}
 
 	// One failure → error.
-	r2 := &doctorReport{Passed: 3, Failed: 1}
+	r2 := &Report{Passed: 3, Failed: 1}
 	err := r2.Err()
 	if err == nil {
 		t.Error("expected error when Failed > 0")
@@ -118,10 +118,10 @@ func TestDoctorReportErr(t *testing.T) {
 func TestDoctorReportWriteJSON(t *testing.T) {
 	// Build a report, marshal via Write, unmarshal, assert deep equality.
 	// Catches: missing JSON tags, dropped fields, type mismatches.
-	in := &doctorReport{
-		Checks: []checkResult{
-			{Name: "ok", Status: statusPass, Detail: "MySQL 8.0.36"},
-			{Name: "bad", Status: statusFail, Detail: "denied", Remediation: "GRANT X ON *.* ..."},
+	in := &Report{
+		Checks: []CheckResult{
+			{Name: "ok", Status: StatusPass, Detail: "MySQL 8.0.36"},
+			{Name: "bad", Status: StatusFail, Detail: "denied", Remediation: "GRANT X ON *.* ..."},
 		},
 		Passed: 1,
 		Failed: 1,
@@ -130,7 +130,7 @@ func TestDoctorReportWriteJSON(t *testing.T) {
 	if err := in.Write(&buf, "json"); err != nil {
 		t.Fatalf("Write(json) error: %v", err)
 	}
-	var out doctorReport
+	var out Report
 	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
 		t.Fatalf("unmarshal: %v\nraw: %s", err, buf.String())
 	}
@@ -140,7 +140,7 @@ func TestDoctorReportWriteJSON(t *testing.T) {
 	if len(out.Checks) != 2 {
 		t.Fatalf("expected 2 checks, got %d", len(out.Checks))
 	}
-	if out.Checks[0].Status != statusPass {
+	if out.Checks[0].Status != StatusPass {
 		t.Errorf("status round-trip failed: %q", out.Checks[0].Status)
 	}
 	if out.Checks[1].Remediation != "GRANT X ON *.* ..." {
@@ -163,31 +163,31 @@ func TestEveryFailCheckCarriesRemediation(t *testing.T) {
 	cases := []struct {
 		name  string
 		setup func(sqlmock.Sqlmock)
-		run   func(db sqlDB) checkResult
+		run   func(db sqlDB) CheckResult
 	}{
 		{
 			name:  "checkLogBin/query error",
 			setup: func(m sqlmock.Sqlmock) { m.ExpectQuery("SELECT @@log_bin").WillReturnError(forcedErr) },
-			run:   func(db sqlDB) checkResult { return checkLogBin(db) },
+			run:   func(db sqlDB) CheckResult { return checkLogBin(db) },
 		},
 		{
 			name:  "checkReplicationGrants/SHOW GRANTS error",
 			setup: func(m sqlmock.Sqlmock) { m.ExpectQuery("SHOW GRANTS").WillReturnError(forcedErr) },
-			run:   func(db sqlDB) checkResult { return checkReplicationGrants(ctx, db) },
+			run:   func(db sqlDB) CheckResult { return checkReplicationGrants(ctx, db) },
 		},
 		{
 			name: "checkSchemaVisibility/query error",
 			setup: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery("SELECT COUNT").WillReturnError(forcedErr)
 			},
-			run: func(db sqlDB) checkResult { return checkSchemaVisibility(ctx, db, nil) },
+			run: func(db sqlDB) CheckResult { return checkSchemaVisibility(ctx, db, nil) },
 		},
 		{
 			name: "checkIndexWriteAccessOn/SCHEMATA error",
 			setup: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery("information_schema.SCHEMATA").WillReturnError(forcedErr)
 			},
-			run: func(db sqlDB) checkResult { return checkIndexWriteAccessOn(ctx, db, "binlog_index") },
+			run: func(db sqlDB) CheckResult { return checkIndexWriteAccessOn(ctx, db, "binlog_index") },
 		},
 		{
 			name: "checkIndexWriteAccessOn/CREATE TABLE denied",
@@ -196,7 +196,7 @@ func TestEveryFailCheckCarriesRemediation(t *testing.T) {
 					sqlmock.NewRows([]string{"SCHEMA_NAME"}).AddRow("binlog_index"))
 				m.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnError(forcedErr)
 			},
-			run: func(db sqlDB) checkResult { return checkIndexWriteAccessOn(ctx, db, "binlog_index") },
+			run: func(db sqlDB) CheckResult { return checkIndexWriteAccessOn(ctx, db, "binlog_index") },
 		},
 		{
 			name: "checkIndexWriteAccessOn/DROP denied (upgraded WARN→FAIL)",
@@ -206,7 +206,7 @@ func TestEveryFailCheckCarriesRemediation(t *testing.T) {
 				m.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 				m.ExpectExec("DROP TABLE").WillReturnError(forcedErr)
 			},
-			run: func(db sqlDB) checkResult { return checkIndexWriteAccessOn(ctx, db, "binlog_index") },
+			run: func(db sqlDB) CheckResult { return checkIndexWriteAccessOn(ctx, db, "binlog_index") },
 		},
 	}
 	for _, c := range cases {
@@ -218,8 +218,8 @@ func TestEveryFailCheckCarriesRemediation(t *testing.T) {
 			defer db.Close()
 			c.setup(mock)
 			got := c.run(db)
-			if got.Status != statusFail {
-				t.Errorf("expected statusFail, got %q (detail=%q)", got.Status, got.Detail)
+			if got.Status != StatusFail {
+				t.Errorf("expected StatusFail, got %q (detail=%q)", got.Status, got.Detail)
 			}
 			if got.Remediation == "" {
 				t.Errorf("FAIL with no Remediation — operator has no next step.\n  Detail: %q", got.Detail)
@@ -240,16 +240,16 @@ func TestCheckLogBin(t *testing.T) {
 		name       string
 		returnVal  string
 		queryErr   error
-		wantStatus checkStatus
+		wantStatus CheckStatus
 		wantDetail string
 	}{
-		{name: "ON via 1", returnVal: "1", wantStatus: statusPass, wantDetail: "ON"},
-		{name: "ON via literal", returnVal: "ON", wantStatus: statusPass, wantDetail: "ON"},
-		{name: "ON case-insensitive", returnVal: "on", wantStatus: statusPass, wantDetail: "ON"},
-		{name: "OFF literal", returnVal: "OFF", wantStatus: statusFail, wantDetail: `log_bin="OFF"`},
-		{name: "OFF via 0", returnVal: "0", wantStatus: statusFail, wantDetail: `log_bin="0"`},
-		{name: "empty string", returnVal: "", wantStatus: statusFail, wantDetail: `log_bin=""`},
-		{name: "query error", queryErr: errors.New("denied"), wantStatus: statusFail, wantDetail: "denied"},
+		{name: "ON via 1", returnVal: "1", wantStatus: StatusPass, wantDetail: "ON"},
+		{name: "ON via literal", returnVal: "ON", wantStatus: StatusPass, wantDetail: "ON"},
+		{name: "ON case-insensitive", returnVal: "on", wantStatus: StatusPass, wantDetail: "ON"},
+		{name: "OFF literal", returnVal: "OFF", wantStatus: StatusFail, wantDetail: `log_bin="OFF"`},
+		{name: "OFF via 0", returnVal: "0", wantStatus: StatusFail, wantDetail: `log_bin="0"`},
+		{name: "empty string", returnVal: "", wantStatus: StatusFail, wantDetail: `log_bin=""`},
+		{name: "query error", queryErr: errors.New("denied"), wantStatus: StatusFail, wantDetail: "denied"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -273,7 +273,7 @@ func TestCheckLogBin(t *testing.T) {
 			if !strings.Contains(got.Detail, tt.wantDetail) {
 				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetail)
 			}
-			if tt.wantStatus == statusFail && got.Remediation == "" {
+			if tt.wantStatus == StatusFail && got.Remediation == "" {
 				t.Error("FAIL outcome with no remediation breaks doctor's promise")
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
@@ -292,22 +292,22 @@ func TestCheckBinlogRetention(t *testing.T) {
 		name            string
 		modern          mockSQLScalar // first query — @@binlog_expire_logs_seconds
 		legacy          mockSQLScalar // second query — @@expire_logs_days (only invoked when modern errors)
-		wantStatus      checkStatus
+		wantStatus      CheckStatus
 		wantDetailFrag  string // substring assertion on detail
 		wantRemediation bool   // must remediation be present?
 	}{
 		// 1. MySQL 8.0+ branches.
-		{name: "modern: at threshold", modern: row("172800"), wantStatus: statusPass, wantDetailFrag: "48h"},
-		{name: "modern: above threshold", modern: row("259200"), wantStatus: statusPass, wantDetailFrag: "72h"},
-		{name: "modern: below threshold", modern: row("3600"), wantStatus: statusWarn, wantDetailFrag: "1h", wantRemediation: true},
-		{name: "modern: zero (never expire)", modern: row("0"), wantStatus: statusWarn, wantDetailFrag: "no automatic expiration"},
-		{name: "modern: unparseable", modern: row("not-an-int"), wantStatus: statusWarn, wantDetailFrag: "could not parse"},
+		{name: "modern: at threshold", modern: row("172800"), wantStatus: StatusPass, wantDetailFrag: "48h"},
+		{name: "modern: above threshold", modern: row("259200"), wantStatus: StatusPass, wantDetailFrag: "72h"},
+		{name: "modern: below threshold", modern: row("3600"), wantStatus: StatusWarn, wantDetailFrag: "1h", wantRemediation: true},
+		{name: "modern: zero (never expire)", modern: row("0"), wantStatus: StatusWarn, wantDetailFrag: "no automatic expiration"},
+		{name: "modern: unparseable", modern: row("not-an-int"), wantStatus: StatusWarn, wantDetailFrag: "could not parse"},
 		// 2. Legacy fallback when modern errors.
-		{name: "legacy: 7 days", modern: errResp("unknown variable"), legacy: row("7"), wantStatus: statusPass, wantDetailFrag: "7 days"},
-		{name: "legacy: 1 day", modern: errResp("unknown variable"), legacy: row("1"), wantStatus: statusWarn, wantDetailFrag: "expire_logs_days=1", wantRemediation: true},
-		{name: "legacy: unparseable", modern: errResp("unknown variable"), legacy: row("garbage"), wantStatus: statusWarn, wantDetailFrag: "could not parse"},
+		{name: "legacy: 7 days", modern: errResp("unknown variable"), legacy: row("7"), wantStatus: StatusPass, wantDetailFrag: "7 days"},
+		{name: "legacy: 1 day", modern: errResp("unknown variable"), legacy: row("1"), wantStatus: StatusWarn, wantDetailFrag: "expire_logs_days=1", wantRemediation: true},
+		{name: "legacy: unparseable", modern: errResp("unknown variable"), legacy: row("garbage"), wantStatus: StatusWarn, wantDetailFrag: "could not parse"},
 		// 3. Both error → warn-only (no remediation; doctor proceeds with degraded info).
-		{name: "both error", modern: errResp("conn lost"), legacy: errResp("conn lost"), wantStatus: statusWarn, wantDetailFrag: "could not read"},
+		{name: "both error", modern: errResp("conn lost"), legacy: errResp("conn lost"), wantStatus: StatusWarn, wantDetailFrag: "could not read"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -381,7 +381,7 @@ func TestCheckIndexWriteAccessOnNeverDropsPreexistingDB(t *testing.T) {
 	mock.ExpectExec("DROP DATABASE").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	got := checkIndexWriteAccessOn(t.Context(), db, dbName)
-	if got.Status != statusPass {
+	if got.Status != StatusPass {
 		t.Fatalf("Status = %q, want pass (detail=%q)", got.Status, got.Detail)
 	}
 	err = mock.ExpectationsWereMet()
@@ -426,7 +426,7 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 	tests := []struct {
 		name           string
 		setup          func(mock sqlmock.Sqlmock)
-		wantStatus     checkStatus
+		wantStatus     CheckStatus
 		wantDetailFrag string
 	}{
 		{
@@ -437,7 +437,7 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 				m.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 				m.ExpectExec("DROP TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
 			},
-			wantStatus:     statusPass,
+			wantStatus:     StatusPass,
 			wantDetailFrag: "CREATE/DROP TABLE OK",
 		},
 		{
@@ -452,7 +452,7 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 				// the probe-created database is dropped via defer.
 				m.ExpectExec("DROP DATABASE IF EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 			},
-			wantStatus:     statusPass,
+			wantStatus:     StatusPass,
 			wantDetailFrag: "CREATE/DROP TABLE OK",
 		},
 		{
@@ -466,7 +466,7 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 				// Cleanup runs on the FAIL path too (#384).
 				m.ExpectExec("DROP DATABASE IF EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 			},
-			wantStatus:     statusFail,
+			wantStatus:     StatusFail,
 			wantDetailFrag: "cannot CREATE TABLE",
 		},
 		{
@@ -477,7 +477,7 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 				m.ExpectExec("CREATE DATABASE IF NOT EXISTS").
 					WillReturnError(errors.New("Access denied for user"))
 			},
-			wantStatus:     statusFail,
+			wantStatus:     StatusFail,
 			wantDetailFrag: "cannot CREATE DATABASE",
 		},
 		{
@@ -488,7 +488,7 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 				m.ExpectExec("CREATE TABLE IF NOT EXISTS").
 					WillReturnError(errors.New("CREATE command denied"))
 			},
-			wantStatus:     statusFail,
+			wantStatus:     StatusFail,
 			wantDetailFrag: "cannot CREATE TABLE",
 		},
 		{
@@ -499,7 +499,7 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 				m.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 				m.ExpectExec("DROP TABLE").WillReturnError(errors.New("DROP command denied"))
 			},
-			wantStatus:     statusFail,
+			wantStatus:     StatusFail,
 			wantDetailFrag: "user has CREATE but not DROP",
 		},
 		{
@@ -508,7 +508,7 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
 					WillReturnError(errors.New("conn lost"))
 			},
-			wantStatus:     statusFail,
+			wantStatus:     StatusFail,
 			wantDetailFrag: "conn lost",
 		},
 	}
@@ -529,7 +529,7 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
 				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
 			}
-			if tt.wantStatus == statusFail && got.Remediation == "" {
+			if tt.wantStatus == StatusFail && got.Remediation == "" {
 				t.Error("FAIL outcome with no remediation breaks doctor's promise")
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
@@ -542,11 +542,11 @@ func TestCheckIndexWriteAccessOn(t *testing.T) {
 func TestDoctorReportWriteText(t *testing.T) {
 	// Text formatter emits a specific status glyph per status. Any UI scraper
 	// or grep workflow depends on this contract — assert per-glyph.
-	r := &doctorReport{}
-	r.add(checkResult{Name: "p", Status: statusPass, Detail: "ok"})
-	r.add(checkResult{Name: "f", Status: statusFail, Detail: "bad", Remediation: "fix it"})
-	r.add(checkResult{Name: "w", Status: statusWarn, Detail: "meh"})
-	r.add(checkResult{Name: "s", Status: statusSkip, Detail: "n/a"})
+	r := &Report{}
+	r.add(CheckResult{Name: "p", Status: StatusPass, Detail: "ok"})
+	r.add(CheckResult{Name: "f", Status: StatusFail, Detail: "bad", Remediation: "fix it"})
+	r.add(CheckResult{Name: "w", Status: StatusWarn, Detail: "meh"})
+	r.add(CheckResult{Name: "s", Status: StatusSkip, Detail: "n/a"})
 
 	var buf bytes.Buffer
 	if err := r.Write(&buf, "text"); err != nil {
@@ -576,7 +576,7 @@ func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
 	cases := []struct {
 		name            string
 		setup           func(sqlmock.Sqlmock)
-		wantStatus      checkStatus
+		wantStatus      CheckStatus
 		wantDetail      string
 		wantRemediation string
 	}{
@@ -586,7 +586,7 @@ func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(0, 0))
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(schemataRows(1))
 			},
-			wantStatus:      statusFail,
+			wantStatus:      StatusFail,
 			wantDetail:      "no tables yet",
 			wantRemediation: "Create at least one table",
 		},
@@ -596,7 +596,7 @@ func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(0, 0))
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(schemataRows(0))
 			},
-			wantStatus:      statusFail,
+			wantStatus:      StatusFail,
 			wantDetail:      "no tables visible",
 			wantRemediation: "GRANT SELECT",
 		},
@@ -606,7 +606,7 @@ func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(0, 0))
 				m.ExpectQuery("SELECT COUNT").WillReturnError(errors.New("denied"))
 			},
-			wantStatus:      statusFail,
+			wantStatus:      StatusFail,
 			wantDetail:      "no tables visible",
 			wantRemediation: "GRANT SELECT",
 		},
@@ -615,7 +615,7 @@ func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
 			setup: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(5, 2))
 			},
-			wantStatus: statusPass,
+			wantStatus: StatusPass,
 			wantDetail: "5 tables across 2 schemas",
 		},
 	}

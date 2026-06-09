@@ -1,6 +1,6 @@
 //go:build integration
 
-package main
+package doctor
 
 import (
 	"database/sql"
@@ -36,12 +36,12 @@ func TestIndexChecksWithAbsentDatabase(t *testing.T) {
 	})
 
 	conn := checkIndexConnection(ctx, dsn, dbName)
-	if conn.Status != statusPass {
+	if conn.Status != StatusPass {
 		t.Errorf("checkIndexConnection with absent DB: Status = %q (detail=%q), want PASS", conn.Status, conn.Detail)
 	}
 
 	write := checkIndexWriteAccess(ctx, dsn, dbName)
-	if write.Status != statusPass {
+	if write.Status != StatusPass {
 		t.Errorf("checkIndexWriteAccess with absent DB: Status = %q (detail=%q), want PASS", write.Status, write.Detail)
 	}
 
@@ -61,7 +61,7 @@ func TestIndexChecksWithAbsentDatabase(t *testing.T) {
 	// Sanity: a genuinely unreachable server must still FAIL, not be
 	// mistaken for the absent-DB case.
 	bad := checkIndexConnection(ctx, "root:wrong@tcp(127.0.0.1:1)/nope?timeout=1s", "nope")
-	if bad.Status != statusFail {
+	if bad.Status != StatusFail {
 		t.Errorf("unreachable server: Status = %q, want FAIL", bad.Status)
 	}
 }

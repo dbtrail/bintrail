@@ -1,4 +1,4 @@
-package main
+package doctor
 
 import (
 	"context"
@@ -9,8 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/go-sql-driver/mysql"
+
+	"github.com/dbtrail/bintrail/internal/indexer"
 )
 
 // The capacity check measures the index's recent write rate from
@@ -42,9 +43,9 @@ const capWarnFraction = 0.7
 // write spike, and the operator should hear it.
 const capFreeFloorDays = 3.0
 
-// capacityCheckName is the check's display name — shared with `up`'s
+// CapacityCheckName is the check's display name — shared with `up`'s
 // preflight, which treats this check as advisory (see runUp).
-const capacityCheckName = "Index disk capacity"
+const CapacityCheckName = "Index disk capacity"
 
 // capPartitionSample is one named hourly partition's measured footprint.
 // Rows and bytes come from information_schema — InnoDB ESTIMATES, good for
@@ -104,7 +105,7 @@ func projectCapacity(parts []capPartitionSample, retain time.Duration, now time.
 //   - remaining growth >= capWarnFraction of free space: WARN.
 //   - otherwise PASS; when free space is not measurable from this host the
 //     PASS detail carries the projection and the headroom guidance instead.
-func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, freeKnown bool) checkResult {
+func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, freeKnown bool) CheckResult {
 	growthPerDay := p.eventsPerDay * p.bytesPerEvent
 
 	if retain == 0 {
@@ -113,9 +114,9 @@ func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, fr
 		if freeKnown && growthPerDay > 0 {
 			detail += fmt.Sprintf("; ~%.0f days until the volume fills (%s free)", float64(free)/growthPerDay, humanBytes(float64(free)))
 		}
-		return checkResult{
-			Name:   capacityCheckName,
-			Status: statusWarn,
+		return CheckResult{
+			Name:   CapacityCheckName,
+			Status: StatusWarn,
 			Detail: detail,
 			Remediation: "Configure rotation so the live index stays bounded: `bintrail up` rotates by default (--rotate-retain 30d),\n" +
 				"or schedule `bintrail rotate --retain <window>` (archive to Parquet first with --archive-dir to keep history cheaply).\n" +
@@ -131,18 +132,18 @@ func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, fr
 		humanBytes(p.projectedBytes), retain, p.eventsPerDay, humanBytes(p.bytesPerEvent), humanBytes(float64(p.currentBytes)))
 
 	if !freeKnown {
-		return checkResult{
-			Name:   capacityCheckName,
-			Status: statusPass,
+		return CheckResult{
+			Name:   CapacityCheckName,
+			Status: StatusPass,
 			Detail: projected + " — free space not measurable from this host; ensure the index volume keeps >=30% headroom above the projection (docs/capacity.md)",
 		}
 	}
 
 	switch {
 	case remaining > 0 && remaining >= float64(free):
-		return checkResult{
-			Name:   capacityCheckName,
-			Status: statusFail,
+		return CheckResult{
+			Name:   CapacityCheckName,
+			Status: StatusFail,
 			Detail: fmt.Sprintf("%s; the ~%s of growth still ahead EXCEEDS the %s free on the index volume — the disk will fill before rotation bounds the index, stalling the stream (a permanent forensic gap once the source purges its binlogs)",
 				projected, humanBytes(remaining), humanBytes(float64(free))),
 			Remediation: "Free space now: shorten retention and rotate immediately —\n" +
@@ -153,27 +154,27 @@ func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, fr
 	case float64(free) < capFreeFloorDays*growthPerDay:
 		// Steady state quiets the remaining-growth thresholds, but a
 		// nearly-full volume has no margin for a rotation stall or a spike.
-		return checkResult{
-			Name:   capacityCheckName,
-			Status: statusWarn,
+		return CheckResult{
+			Name:   CapacityCheckName,
+			Status: StatusWarn,
 			Detail: fmt.Sprintf("%s; only %s free — under ~%.0f days of the measured write rate (~%s/day): a rotation stall or a write spike fills the disk",
 				projected, humanBytes(float64(free)), capFreeFloorDays, humanBytes(growthPerDay)),
 			Remediation: "Grow the index volume or shorten the retention window (--rotate-retain / `bintrail rotate --retain`).\n" +
 				"Sizing math: docs/capacity.md",
 		}
 	case remaining >= capWarnFraction*float64(free):
-		return checkResult{
-			Name:   capacityCheckName,
-			Status: statusWarn,
+		return CheckResult{
+			Name:   CapacityCheckName,
+			Status: StatusWarn,
 			Detail: fmt.Sprintf("%s; the ~%s of growth still ahead consumes over %.0f%% of the %s free on the index volume — little headroom for growth spikes",
 				projected, humanBytes(remaining), capWarnFraction*100, humanBytes(float64(free))),
 			Remediation: "Grow the index volume or shorten the retention window (--rotate-retain / `bintrail rotate --retain`).\n" +
 				"Sizing math: docs/capacity.md",
 		}
 	default:
-		return checkResult{
-			Name:   capacityCheckName,
-			Status: statusPass,
+		return CheckResult{
+			Name:   CapacityCheckName,
+			Status: StatusPass,
 			Detail: fmt.Sprintf("%s; %s free", projected, humanBytes(float64(free))),
 		}
 	}
@@ -182,13 +183,13 @@ func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, fr
 // checkIndexCapacity runs the capacity projection against the index server.
 // retain is the configured rotation window (0 = no rotation / unknown). It
 // connects server-level (the index database may not exist yet on first run).
-func checkIndexCapacity(ctx context.Context, dsn, dbName string, retain time.Duration) checkResult {
+func checkIndexCapacity(ctx context.Context, dsn, dbName string, retain time.Duration) CheckResult {
 	db, err := connectWithoutDB(dsn)
 	if err != nil {
 		// checkIndexConnection (which runs first) already FAILs a dead
 		// server with remediation; duplicating the failure here would
 		// double-count one root cause.
-		return checkResult{Name: capacityCheckName, Status: statusSkip, Detail: "cannot connect to the index server: " + err.Error()}
+		return CheckResult{Name: CapacityCheckName, Status: StatusSkip, Detail: "cannot connect to the index server: " + err.Error()}
 	}
 	defer db.Close()
 
@@ -196,9 +197,9 @@ func checkIndexCapacity(ctx context.Context, dsn, dbName string, retain time.Dur
 	if err != nil {
 		// A real query error FAILs like every sibling check — a SKIP would
 		// let the operator believe capacity was covered when it wasn't.
-		return checkResult{
-			Name:        capacityCheckName,
-			Status:      statusFail,
+		return CheckResult{
+			Name:        CapacityCheckName,
+			Status:      StatusFail,
 			Detail:      "cannot read partition statistics: " + err.Error(),
 			Remediation: queryErrorRemediation("information_schema.PARTITIONS"),
 		}
@@ -210,26 +211,26 @@ func checkIndexCapacity(ctx context.Context, dsn, dbName string, retain time.Dur
 		// is never "re-run later" for a table that will never appear.
 		visible, err := tableVisible(ctx, db, dbName, "binlog_events")
 		if err != nil {
-			return checkResult{
-				Name:        capacityCheckName,
-				Status:      statusFail,
+			return CheckResult{
+				Name:        CapacityCheckName,
+				Status:      StatusFail,
 				Detail:      "cannot check binlog_events visibility: " + err.Error(),
 				Remediation: queryErrorRemediation("information_schema.TABLES"),
 			}
 		}
 		if !visible {
-			return checkResult{
-				Name:   capacityCheckName,
-				Status: statusSkip,
+			return CheckResult{
+				Name:   CapacityCheckName,
+				Status: StatusSkip,
 				Detail: fmt.Sprintf("binlog_events is not visible in %q — the index is not initialized yet (run `bintrail init`/`up`), or this user lacks SELECT on it", dbName),
 			}
 		}
 	}
 	proj, ok := projectCapacity(samples, retain, time.Now())
 	if !ok {
-		return checkResult{
-			Name:   capacityCheckName,
-			Status: statusSkip,
+		return CheckResult{
+			Name:   CapacityCheckName,
+			Status: StatusSkip,
 			Detail: fmt.Sprintf("not enough recent history to measure a write rate (%d sampled hours, need >=%d with >=%d rows) — re-run after a few hours of streaming",
 				proj.sampleHours, capMinSampleHours, capMinSampleRows),
 		}

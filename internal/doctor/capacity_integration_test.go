@@ -1,6 +1,6 @@
 //go:build integration
 
-package main
+package doctor
 
 import (
 	"context"
@@ -20,7 +20,7 @@ func TestCheckIndexCapacity_skipsWithoutHistory(t *testing.T) {
 	testutil.InitIndexTables(t, db)
 
 	r := checkIndexCapacity(context.Background(), testutil.IntegrationDSN(dbName), dbName, 30*24*time.Hour)
-	if r.Status != statusSkip {
+	if r.Status != StatusSkip {
 		t.Fatalf("status = %s, want skip on an empty index (detail: %s)", r.Status, r.Detail)
 	}
 	if !strings.Contains(r.Detail, "not enough recent history") {
@@ -59,7 +59,7 @@ func TestCheckIndexCapacity_measuresAndProjects(t *testing.T) {
 	testutil.MustExec(t, db, fmt.Sprintf("ANALYZE TABLE `%s`.`binlog_events`", dbName))
 
 	r := checkIndexCapacity(context.Background(), testutil.IntegrationDSN(dbName), dbName, 30*24*time.Hour)
-	if r.Status == statusSkip || r.Status == statusFail {
+	if r.Status == StatusSkip || r.Status == StatusFail {
 		t.Fatalf("status = %s, want a real measurement (detail: %s)", r.Status, r.Detail)
 	}
 	if !strings.Contains(r.Detail, "projected steady-state") {
@@ -68,7 +68,7 @@ func TestCheckIndexCapacity_measuresAndProjects(t *testing.T) {
 }
 
 // TestBuildDoctorReport_includesCapacityCheck pins the battery wiring: the
-// capacity check must appear in buildDoctorReport's output with the retain
+// capacity check must appear in Build's output with the retain
 // parameter flowing through. Without this, a refactor dropping the
 // report.add(checkIndexCapacity(...)) line would leave every direct
 // checkIndexCapacity test green while doctor silently stopped covering
@@ -99,16 +99,16 @@ func TestBuildDoctorReport_includesCapacityCheck(t *testing.T) {
 	testutil.MustExec(t, db, fmt.Sprintf("ANALYZE TABLE `%s`.`binlog_events`", dbName))
 
 	dsn := testutil.IntegrationDSN(dbName)
-	capacityIn := func(retain time.Duration) checkResult {
+	capacityIn := func(retain time.Duration) CheckResult {
 		t.Helper()
-		report := buildDoctorReport(context.Background(), dsn, dsn, "", retain)
+		report := Build(context.Background(), dsn, dsn, "", retain)
 		for _, c := range report.Checks {
-			if c.Name == capacityCheckName {
+			if c.Name == CapacityCheckName {
 				return c
 			}
 		}
-		t.Fatalf("%q missing from the doctor battery (retain=%v)", capacityCheckName, retain)
-		return checkResult{}
+		t.Fatalf("%q missing from the doctor battery (retain=%v)", CapacityCheckName, retain)
+		return CheckResult{}
 	}
 
 	if c := capacityIn(30 * 24 * time.Hour); !strings.Contains(c.Detail, "projected steady-state") {
@@ -130,7 +130,7 @@ func TestCheckIndexCapacity_queryErrorFails(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r := checkIndexCapacity(ctx, testutil.IntegrationDSN(dbName), dbName, 30*24*time.Hour)
-	if r.Status != statusFail {
+	if r.Status != StatusFail {
 		t.Fatalf("status = %s, want fail on a query error (detail: %s)", r.Status, r.Detail)
 	}
 	if r.Remediation == "" {
@@ -147,7 +147,7 @@ func TestCheckIndexCapacity_uninitializedIndexExplainsItself(t *testing.T) {
 	_ = db // database exists, but binlog_events was never created
 
 	r := checkIndexCapacity(context.Background(), testutil.IntegrationDSN(dbName), dbName, 30*24*time.Hour)
-	if r.Status != statusSkip {
+	if r.Status != StatusSkip {
 		t.Fatalf("status = %s, want skip (detail: %s)", r.Status, r.Detail)
 	}
 	if !strings.Contains(r.Detail, "not initialized") {
@@ -184,7 +184,7 @@ func TestCheckIndexCapacity_noRetentionWarnsUnbounded(t *testing.T) {
 	testutil.MustExec(t, db, fmt.Sprintf("ANALYZE TABLE `%s`.`binlog_events`", dbName))
 
 	r := checkIndexCapacity(context.Background(), testutil.IntegrationDSN(dbName), dbName, 0)
-	if r.Status != statusWarn {
+	if r.Status != StatusWarn {
 		t.Fatalf("status = %s, want warn for retain=0 (detail: %s)", r.Status, r.Detail)
 	}
 	if !strings.Contains(r.Detail, "unbounded") {

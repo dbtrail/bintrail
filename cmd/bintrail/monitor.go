@@ -15,6 +15,7 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/console"
+	"github.com/dbtrail/bintrail/internal/doctor"
 	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/serverid"
 	"github.com/dbtrail/bintrail/internal/streamrun"
@@ -224,7 +225,7 @@ func (m *monitorSupervisor) Doctor(ctx context.Context, e console.ServerEntry) (
 	}
 	// The per-source databases are rotated by the daemon's built-in loop, so
 	// the capacity projection uses its window (0 when rotation is disabled).
-	r := buildDoctorReport(ctx, e.SourceDSN, e.DSN, e.Schemas, m.rotateRetain)
+	r := doctor.Build(ctx, e.SourceDSN, e.DSN, e.Schemas, m.rotateRetain)
 	out := &console.DoctorReport{
 		Passed:   r.Passed,
 		Failed:   r.Failed,

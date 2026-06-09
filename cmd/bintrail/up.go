@@ -16,6 +16,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/console"
+	"github.com/dbtrail/bintrail/internal/doctor"
 	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/serverid"
 	"github.com/dbtrail/bintrail/internal/streamrun"
@@ -150,7 +151,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		// unattended reboot would crash-loop instead of capturing while
 		// there is still room). Standalone `doctor` keeps full FAIL
 		// semantics for CI.
-		preflight := buildDoctorReport(cmd.Context(), upSourceDSN, upIndexDSN, upSchemas, upRotationCfg.retain)
+		preflight := doctor.Build(cmd.Context(), upSourceDSN, upIndexDSN, upSchemas, upRotationCfg.retain)
 		if err := preflight.Write(os.Stderr, "text"); err != nil {
 			return fmt.Errorf("write preflight report: %w", err)
 		}
@@ -186,8 +187,8 @@ func runUp(cmd *cobra.Command, args []string) error {
 // but the operator must hear about it (the caller prints the WARNING).
 // Extracted so the advisory semantics are unit-testable: losing either half
 // would silently change what blocks `up` or swallow the disk-full signal.
-func upPreflightOutcome(r *doctorReport) (fatal error, warnCapacity bool) {
-	if err := r.ErrExcluding(capacityCheckName); err != nil {
+func upPreflightOutcome(r *doctor.Report) (fatal error, warnCapacity bool) {
+	if err := r.ErrExcluding(doctor.CapacityCheckName); err != nil {
 		return err, false
 	}
 	return nil, r.Err() != nil
