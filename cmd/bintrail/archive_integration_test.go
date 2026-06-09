@@ -12,6 +12,7 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/archive"
 	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/rotation"
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
@@ -31,14 +32,14 @@ func TestArchiveReconcileRebuild(t *testing.T) {
 	// One partition with one real event, archived to a real Parquet file
 	// in the production Hive layout.
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil,
 		"testdb", "orders", 1, "42", nil, nil, []byte(`{"id":42}`))
 
 	archiveDir := t.TempDir()
 	const bintrailID = "deadbeef-dead-beef-dead-beefdeadbeef" // 36 chars, matches archivePathRe
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	outPath, err := rotation.HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}
@@ -219,9 +220,9 @@ func TestParseArchivePathRoundTrip(t *testing.T) {
 		time.Date(2026, 12, 31, 23, 0, 0, 0, time.UTC),
 	}
 	for _, h := range hours {
-		p, err := hiveArchivePath("/var/archives", id, indexer.PartitionName(h))
+		p, err := rotation.HiveArchivePath("/var/archives", id, indexer.PartitionName(h))
 		if err != nil {
-			t.Fatalf("hiveArchivePath(%v): %v", h, err)
+			t.Fatalf("rotation.HiveArchivePath(%v): %v", h, err)
 		}
 		gotID, gotPart := parseArchivePath(p)
 		if gotID != id || gotPart != indexer.PartitionName(h) {

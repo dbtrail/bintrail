@@ -14,6 +14,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/archive"
 	"github.com/dbtrail/bintrail/internal/baseline"
 	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/rotation"
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
@@ -91,7 +92,7 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 	//   id=3 DELETE (h1)         start-3  (will be in archive)
 	//   id=4 INSERT (h2) new-4            (live; not in baseline)
 	//   id=2 UPDATE (h2) paid    → shipped (live; latest event wins for id=2)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 
@@ -115,7 +116,7 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 	// ── 4. Archive h1 and drop it from live MySQL ────────────────────────
 	archiveDir := t.TempDir()
 	bintrailID := "test-187-roundtrip"
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	outPath, err := rotation.HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}

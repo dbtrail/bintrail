@@ -1,0 +1,581 @@
+package rotation
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
+	"github.com/dbtrail/bintrail/internal/archive"
+	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/storage"
+)
+
+// Result is one rotation cycle's outcome. deferred counts partitions
+// past retention that the opts.ProtectUnarchived guard refused to drop (always
+// 0 for the explicit rotate command). A named struct, not a positional tuple:
+// three same-typed ints invite silent misordering at call sites.
+type Result struct {
+	Dropped, Added, Deferred int
+}
+
+// Options configures one rotation cycle. The fields replace the package-level
+// rot* flag globals the engine used to read directly, so the explicit `rotate`
+// command and `up`'s built-in rotation loop can both drive Perform with their
+// own settings.
+type Options struct {
+	// RetainDur drops partitions older than this. Zero disables drops (the
+	// cycle only tops up future partitions).
+	RetainDur time.Duration
+	// RetainRaw is the operator-facing retain string (e.g. "7d"), used only in
+	// the "no partitions older than %s" message.
+	RetainRaw string
+	// AddFuture is the declarative future-headroom target.
+	AddFuture int
+	// NoReplace suppresses one-for-one replacement of dropped partitions.
+	NoReplace bool
+	// ArchiveDir, when set, archives each partition to Parquet before dropping.
+	ArchiveDir         string
+	ArchiveCompression string
+	BintrailID         string
+	// ArchiveS3, when set (requires ArchiveDir), uploads archives to S3.
+	ArchiveS3       string
+	ArchiveS3Region string
+	// Retry skips partitions whose Parquet already exists and S3 uploads that
+	// already succeeded.
+	Retry bool
+	// Format "json" suppresses the per-partition stdout chatter (callers that
+	// emit their own JSON, or the built-in loop, pass "json").
+	Format string
+	// ProtectUnarchived: when the index has any archiving history, the
+	// no-archive drop path only drops already-archived partitions — the
+	// built-in rotation must not be the first to destroy data an archiving flow
+	// would preserve. The explicit rotate command leaves this false.
+	ProtectUnarchived bool
+}
+
+// Perform executes one full rotation cycle against an open DB connection,
+// reading every setting from opts so daemon and one-shot modes share identical
+// rotation logic.
+func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Result, error) {
+	retainDur := opts.RetainDur
+	start := time.Now()
+
+	// ── Load current partition list ─────────────────────────────────────────────
+	partitions, err := listPartitions(ctx, db, dbName)
+	if err != nil {
+		return Result{}, fmt.Errorf("failed to list partitions: %w", err)
+	}
+
+	// ── Drop old partitions ───────────────────────────────────────────────────
+	var droppedCount, deferredCount int
+	if retainDur > 0 {
+		cutoff := time.Now().UTC().Add(-retainDur)
+		var toDrop []string
+		for _, p := range partitions {
+			d, ok := indexer.PartitionDate(p.Name)
+			if !ok {
+				continue // skip p_future and any unrecognised names
+			}
+			if d.Before(cutoff) {
+				toDrop = append(toDrop, p.Name)
+			}
+		}
+
+		if len(toDrop) == 0 {
+			if opts.Format != "json" {
+				fmt.Fprintf(os.Stdout, "no partitions older than %s to drop\n", opts.RetainRaw)
+			}
+		} else {
+			// Archive partitions to Parquet before dropping, if requested.
+			// Each partition is dropped immediately after archiving to free
+			// disk space incrementally and reduce the crash window.
+			if opts.ArchiveDir != "" {
+				// Set up S3 client once for all uploads (nil when --archive-s3 is not set).
+				var s3Client *s3.Client
+				var s3Bucket, s3Prefix string
+				if opts.ArchiveS3 != "" {
+					s3Bucket, s3Prefix, err = storage.ParseS3URL(opts.ArchiveS3)
+					if err != nil {
+						return Result{}, fmt.Errorf("invalid --archive-s3: %w", err)
+					}
+					s3Client, err = storage.NewS3Client(ctx, opts.ArchiveS3Region)
+					if err != nil {
+						return Result{}, fmt.Errorf("init S3 client: %w", err)
+					}
+				}
+
+				for _, name := range toDrop {
+					outPath, err := HiveArchivePath(opts.ArchiveDir, opts.BintrailID, name)
+					if err != nil {
+						return Result{}, fmt.Errorf("build archive path for %s: %w", name, err)
+					}
+					if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+						return Result{}, fmt.Errorf("create archive directory for %s: %w", name, err)
+					}
+					var n int64
+					skipped := opts.Retry && fileExists(outPath)
+					if skipped {
+						slog.Info("skipping existing archive (--retry)", "partition", name, "file", outPath)
+						if opts.Format != "json" {
+							fmt.Fprintf(os.Stdout, "skipped partition %s (already archived) → %s\n", name, outPath)
+						}
+					} else {
+						n, err = archive.ArchivePartition(ctx, db, dbName, name, outPath, opts.ArchiveCompression)
+						if err != nil {
+							return Result{}, fmt.Errorf("archive partition %s: %w", name, err)
+						}
+						if opts.Format != "json" {
+							fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) → %s\n", name, n, outPath)
+						}
+					}
+
+					// Compute S3 key early so we can record the upload intent
+					// in archive_state before the actual upload.
+					var s3Key string
+					if s3Client != nil {
+						s3Key, err = storage.BuildS3Key(opts.ArchiveDir, outPath, s3Prefix)
+						if err != nil {
+							return Result{}, fmt.Errorf("build S3 key for %s: %w", name, err)
+						}
+					}
+
+					// Record archive in archive_state (skip when retrying —
+					// the row already exists with the correct row_count).
+					// When S3 is configured, s3_bucket and s3_key are recorded
+					// immediately so that future runs (even without --archive-s3)
+					// know that an S3 upload is expected before the partition can
+					// be dropped.
+					if !skipped {
+						var fileSize int64
+						if fi, statErr := os.Stat(outPath); statErr == nil {
+							fileSize = fi.Size()
+						}
+						var insertBucket, insertKey any
+						if s3Client != nil {
+							insertBucket = s3Bucket
+							insertKey = s3Key
+						}
+						if _, err := db.ExecContext(ctx,
+							`INSERT INTO archive_state
+								(partition_name, bintrail_id, local_path, file_size_bytes, row_count, s3_bucket, s3_key)
+							VALUES (?, ?, ?, ?, ?, ?, ?)
+							ON DUPLICATE KEY UPDATE
+								local_path = VALUES(local_path),
+								file_size_bytes = VALUES(file_size_bytes),
+								row_count = VALUES(row_count),
+								s3_bucket = COALESCE(VALUES(s3_bucket), s3_bucket),
+								s3_key = COALESCE(VALUES(s3_key), s3_key)`,
+							name, opts.BintrailID, outPath, fileSize, n, insertBucket, insertKey,
+						); err != nil {
+							return Result{}, fmt.Errorf("record archive state for %s: %w", name, err)
+						}
+					}
+
+					if s3Client != nil {
+						skipUpload := false
+						if opts.Retry {
+							var uploadedAt sql.NullTime
+							err := db.QueryRowContext(ctx,
+								`SELECT s3_uploaded_at FROM archive_state
+								WHERE partition_name = ? AND bintrail_id = ?`,
+								name, opts.BintrailID,
+							).Scan(&uploadedAt)
+							switch {
+							case err == nil && uploadedAt.Valid:
+								slog.Info("skipping existing S3 upload (--retry)", "partition", name)
+								if opts.Format != "json" {
+									fmt.Fprintf(os.Stdout, "skipped S3 upload for %s (already uploaded)\n", name)
+								}
+								skipUpload = true
+							case err != nil && !errors.Is(err, sql.ErrNoRows):
+								return Result{}, fmt.Errorf("check S3 upload state for %s: %w", name, err)
+							}
+						}
+
+						if !skipUpload {
+							if err := uploadFileFunc(ctx, s3Client, outPath, s3Bucket, s3Key); err != nil {
+								// Propagate context cancellation (e.g. SIGINT in daemon mode)
+								// instead of logging a misleading S3 warning for every remaining partition.
+								if ctx.Err() != nil {
+									return Result{}, fmt.Errorf("upload %s to S3: %w", name, err)
+								}
+								slog.Warn("S3 upload failed; partition will not be dropped",
+									"partition", name, "error", err)
+								if opts.Format != "json" {
+									fmt.Fprintf(os.Stdout, "warning: S3 upload failed for %s: %v\n", name, err)
+									fmt.Fprintf(os.Stdout, "  run 'bintrail rotate --retry --archive-s3 ...' to retry\n")
+								}
+								continue
+							}
+							if _, err := db.ExecContext(ctx,
+								`UPDATE archive_state
+									SET s3_bucket = ?, s3_key = ?, s3_uploaded_at = UTC_TIMESTAMP()
+								WHERE partition_name = ? AND bintrail_id = ?`,
+								s3Bucket, s3Key, name, opts.BintrailID,
+							); err != nil {
+								return Result{}, fmt.Errorf("update archive state S3 info for %s: %w", name, err)
+							}
+							slog.Info("uploaded archive to S3", "partition", name, "bucket", s3Bucket, "key", s3Key)
+							if opts.Format != "json" {
+								fmt.Fprintf(os.Stdout, "uploaded %s → s3://%s/%s\n", name, s3Bucket, s3Key)
+							}
+						}
+					}
+
+					// Safety check: never drop a partition that has a pending S3 upload,
+					// even if the current run does not have --archive-s3 configured.
+					pending, err := hasPendingS3Upload(ctx, db, name, opts.BintrailID)
+					if err != nil {
+						return Result{}, fmt.Errorf("check pending S3 upload for %s: %w", name, err)
+					}
+					if pending {
+						slog.Warn("partition archived locally but not yet uploaded to S3; skipping drop",
+							"partition", name)
+						if opts.Format != "json" {
+							fmt.Fprintf(os.Stdout, "skipped drop for %s (pending S3 upload)\n", name)
+							fmt.Fprintf(os.Stdout, "  run 'bintrail rotate --retry --archive-s3 ...' to retry\n")
+						}
+						continue
+					}
+
+					// Drop this partition immediately after archiving.
+					if err := dropPartitions(ctx, db, dbName, []string{name}); err != nil {
+						return Result{}, fmt.Errorf("failed to drop partition %s: %w", name, err)
+					}
+					droppedCount++
+					slog.Info("dropped partition", "partition", name)
+					if opts.Format != "json" {
+						fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+					}
+				}
+			} else {
+				// No archiving — drop all expired partitions at once.
+				// Filter out any partition that has a pending S3 upload from
+				// a previous archived rotation run.
+				//
+				// Under opts.ProtectUnarchived, one more filter applies when the
+				// index has archiving history: only already-archived partitions
+				// may be dropped; the rest are deferred to the archiving flow.
+				// An index with no archive_state rows at all rotates freely —
+				// that is the bounded-volume quickstart behavior.
+				var protectActive bool
+				if opts.ProtectUnarchived {
+					anyArchives, err := indexHasArchives(ctx, db)
+					if err != nil {
+						return Result{}, fmt.Errorf("check archive history: %w", err)
+					}
+					protectActive = anyArchives
+				}
+				var safeToDrop []string
+				for _, name := range toDrop {
+					if protectActive {
+						archived, err := partitionArchived(ctx, db, name)
+						if err != nil {
+							return Result{}, fmt.Errorf("check archive state for %s: %w", name, err)
+						}
+						if !archived {
+							deferredCount++
+							slog.Warn("partition past retention but not yet archived; deferring drop to the archiving flow",
+								"partition", name)
+							if opts.Format != "json" {
+								fmt.Fprintf(os.Stdout, "skipped drop for %s (not yet archived)\n", name)
+							}
+							continue
+						}
+					}
+					pending, err := hasPendingS3Upload(ctx, db, name, opts.BintrailID)
+					if err != nil {
+						return Result{}, fmt.Errorf("check pending S3 upload for %s: %w", name, err)
+					}
+					if pending {
+						slog.Warn("partition has pending S3 upload from a previous run; skipping drop",
+							"partition", name)
+						if opts.Format != "json" {
+							fmt.Fprintf(os.Stdout, "skipped drop for %s (pending S3 upload)\n", name)
+						}
+						continue
+					}
+					safeToDrop = append(safeToDrop, name)
+				}
+				if len(safeToDrop) > 0 {
+					if err := dropPartitions(ctx, db, dbName, safeToDrop); err != nil {
+						return Result{}, fmt.Errorf("failed to drop partitions: %w", err)
+					}
+				}
+				for _, name := range safeToDrop {
+					// slog (not just stdout): rotation destroys data by design,
+					// so the durable log must answer "what did rotation drop" —
+					// mirrors the archive path's per-partition Info.
+					slog.Info("dropped partition", "partition", name)
+					if opts.Format != "json" {
+						fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+					}
+				}
+				droppedCount = len(safeToDrop)
+			}
+			// Refresh list so nextPartitionStart sees current state.
+			partitions, err = listPartitions(ctx, db, dbName)
+			if err != nil {
+				return Result{}, fmt.Errorf("failed to refresh partition list: %w", err)
+			}
+		}
+	}
+
+	// ── Warn if p_future already holds data ───────────────────────────────────
+	hasFutureData, err := partitionHasData(ctx, db, dbName)
+	if err != nil {
+		slog.Warn("could not check p_future data", "error", err)
+	} else if hasFutureData {
+		slog.Warn("p_future partition contains data — events are arriving outside all named partition ranges; consider adding more future partitions with --add-future")
+	}
+
+	// ── Add new future partitions ─────────────────────────────────────────────
+	// --add-future N is declarative: maintain at least N future hourly
+	// partitions beyond the current hour. Top up only if headroom is below
+	// target; never shrink. Unless --no-replace, also add one replacement
+	// for each partition dropped this cycle.
+	nowHour := time.Now().UTC().Truncate(time.Hour)
+	futureCount := countFuturePartitions(partitions, nowHour)
+	toAdd := computeToAdd(opts.AddFuture, futureCount, droppedCount, opts.NoReplace)
+	if toAdd > 0 {
+		startDate := nextPartitionStart(partitions)
+		if err := addFuturePartitions(ctx, db, dbName, startDate, toAdd); err != nil {
+			return Result{}, fmt.Errorf("failed to add future partitions: %w", err)
+		}
+		for i := range toAdd {
+			if opts.Format != "json" {
+				fmt.Fprintf(os.Stdout, "added partition %s\n", indexer.PartitionName(startDate.Add(time.Duration(i)*time.Hour)))
+			}
+		}
+	}
+
+	slog.Info("rotation complete",
+		"partitions_dropped", droppedCount,
+		"partitions_added", toAdd,
+		"partitions_deferred", deferredCount,
+		"duration_ms", time.Since(start).Milliseconds())
+
+	return Result{Dropped: droppedCount, Added: toAdd, Deferred: deferredCount}, nil
+}
+
+// uploadFileFunc is the function used to upload a file to S3. It defaults to
+// uploadFile and can be overridden in tests to simulate S3 failures.
+var uploadFileFunc = storage.UploadFile
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// hasPendingS3Upload reports whether archive_state records a non-empty S3
+// destination (s3_bucket) for the given partition that has not yet been uploaded
+// (s3_uploaded_at IS NULL). When bintrailID is empty, it checks across all
+// bintrail_ids for that partition. Returns false if no archive_state row exists
+// or if the row has no S3 bucket (NULL or empty).
+func hasPendingS3Upload(ctx context.Context, db *sql.DB, partition, bintrailID string) (bool, error) {
+	var pending bool
+	var err error
+	if bintrailID != "" {
+		err = db.QueryRowContext(ctx,
+			`SELECT COUNT(*) > 0 FROM archive_state
+			WHERE partition_name = ? AND bintrail_id = ?
+			  AND s3_bucket IS NOT NULL AND s3_bucket != ''
+			  AND s3_uploaded_at IS NULL`,
+			partition, bintrailID,
+		).Scan(&pending)
+	} else {
+		err = db.QueryRowContext(ctx,
+			`SELECT COUNT(*) > 0 FROM archive_state
+			WHERE partition_name = ?
+			  AND s3_bucket IS NOT NULL AND s3_bucket != ''
+			  AND s3_uploaded_at IS NULL`,
+			partition,
+		).Scan(&pending)
+	}
+	if err != nil {
+		return false, err
+	}
+	return pending, nil
+}
+
+// indexHasArchives reports whether archive_state contains any rows at all —
+// i.e. whether anything has ever archived partitions of this index.
+func indexHasArchives(ctx context.Context, db *sql.DB) (bool, error) {
+	var has bool
+	err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM archive_state)`).Scan(&has)
+	return has, err
+}
+
+// partitionArchived reports whether archive_state records a local archive for
+// the partition under any bintrail_id. Completed-S3 status is checked
+// separately by hasPendingS3Upload.
+func partitionArchived(ctx context.Context, db *sql.DB, partition string) (bool, error) {
+	var has bool
+	err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM archive_state WHERE partition_name = ?)`,
+		partition).Scan(&has)
+	return has, err
+}
+
+// fileExists reports whether a file exists and has a size greater than zero.
+func fileExists(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.Size() > 0
+}
+
+// HiveArchivePath returns the Hive-partitioned path for a binlog_events partition
+// archive. The layout is:
+//
+//	<archiveDir>/bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/event_hour=<HH>/events.parquet
+//
+// Each hourly partition maps to exactly one file. The event_hour= directory level
+// enables DuckDB Hive partition pruning on hour-scoped queries.
+func HiveArchivePath(archiveDir, bintrailID, partitionName string) (string, error) {
+	d, ok := indexer.PartitionDate(partitionName)
+	if !ok {
+		return "", fmt.Errorf("cannot parse partition date from %q", partitionName)
+	}
+	return filepath.Join(
+		archiveDir,
+		"bintrail_id="+bintrailID,
+		"event_date="+d.UTC().Format("2006-01-02"),
+		fmt.Sprintf("event_hour=%02d", d.UTC().Hour()),
+		"events.parquet",
+	), nil
+}
+
+// partitionInfo holds metadata for a single table partition.
+type partitionInfo struct {
+	Name        string
+	Description string // LESS THAN value or "MAXVALUE"
+	Ordinal     int
+}
+
+// listPartitions returns all partitions for binlog_events ordered by ordinal position.
+func listPartitions(ctx context.Context, db *sql.DB, dbName string) ([]partitionInfo, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT PARTITION_NAME, IFNULL(PARTITION_DESCRIPTION, ''), PARTITION_ORDINAL_POSITION
+		FROM information_schema.PARTITIONS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events'
+		ORDER BY PARTITION_ORDINAL_POSITION`,
+		dbName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var partitions []partitionInfo
+	for rows.Next() {
+		var p partitionInfo
+		if err := rows.Scan(&p.Name, &p.Description, &p.Ordinal); err != nil {
+			return nil, err
+		}
+		partitions = append(partitions, p)
+	}
+	return partitions, rows.Err()
+}
+
+// dropPartitions drops one or more named partitions in a single ALTER TABLE statement.
+func dropPartitions(ctx context.Context, db *sql.DB, dbName string, names []string) error {
+	q := fmt.Sprintf("ALTER TABLE `%s`.`binlog_events` DROP PARTITION %s",
+		dbName, strings.Join(names, ", "))
+	_, err := db.ExecContext(ctx, q)
+	return err
+}
+
+// partitionHasData reports whether the p_future catch-all partition holds any rows.
+// Uses SELECT 1 ... LIMIT 1 rather than COUNT(*) for efficiency on large tables.
+func partitionHasData(ctx context.Context, db *sql.DB, dbName string) (bool, error) {
+	q := fmt.Sprintf("SELECT 1 FROM `%s`.`binlog_events` PARTITION (p_future) LIMIT 1", dbName)
+	var dummy int
+	err := db.QueryRowContext(ctx, q).Scan(&dummy)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// computeToAdd returns how many new future partitions to add in a rotation
+// cycle given the declarative --add-future target, the current future-headroom
+// count, the number of partitions dropped this cycle, and --no-replace.
+//
+// Semantics:
+//   - Top up toward `target` if `futureCount < target`; never shrink.
+//   - Unless `noReplace`, add one replacement per dropped partition on top of
+//     the top-up so a drop-and-add rotation keeps total count flat.
+func computeToAdd(target, futureCount, dropped int, noReplace bool) int {
+	toAdd := 0
+	if target > futureCount {
+		toAdd = target - futureCount
+	}
+	if !noReplace {
+		toAdd += dropped
+	}
+	return toAdd
+}
+
+// countFuturePartitions returns how many named hourly partitions start
+// strictly after the given reference hour. p_future and unrecognised names
+// are ignored.
+func countFuturePartitions(partitions []partitionInfo, ref time.Time) int {
+	n := 0
+	for _, p := range partitions {
+		d, ok := indexer.PartitionDate(p.Name)
+		if !ok {
+			continue
+		}
+		if d.After(ref) {
+			n++
+		}
+	}
+	return n
+}
+
+// nextPartitionStart returns the hour for the first new partition to add.
+// It finds the latest p_YYYYMMDDHH partition and returns the following hour.
+// Falls back to the current hour (UTC) if no named hourly partitions exist.
+func nextPartitionStart(partitions []partitionInfo) time.Time {
+	var maxDate time.Time
+	for _, p := range partitions {
+		d, ok := indexer.PartitionDate(p.Name)
+		if !ok {
+			continue
+		}
+		if d.After(maxDate) {
+			maxDate = d
+		}
+	}
+	if maxDate.IsZero() {
+		return time.Now().UTC().Truncate(time.Hour)
+	}
+	return maxDate.Add(time.Hour)
+}
+
+// addFuturePartitions reorganizes p_future to insert n new hourly partitions
+// beginning at startDate, then appends a new p_future MAXVALUE catch-all.
+func addFuturePartitions(ctx context.Context, db *sql.DB, dbName string, startDate time.Time, n int) error {
+	parts := make([]string, 0, n+1)
+	for i := range n {
+		d := startDate.Add(time.Duration(i) * time.Hour)
+		nextHour := d.Add(time.Hour)
+		parts = append(parts, fmt.Sprintf(
+			"PARTITION %s VALUES LESS THAN (TO_SECONDS('%s'))",
+			indexer.PartitionName(d),
+			nextHour.UTC().Format("2006-01-02 15:04:05"),
+		))
+	}
+	parts = append(parts, "PARTITION p_future VALUES LESS THAN MAXVALUE")
+
+	q := fmt.Sprintf(
+		"ALTER TABLE `%s`.`binlog_events` REORGANIZE PARTITION p_future INTO (\n\t%s\n)",
+		dbName,
+		strings.Join(parts, ",\n\t"),
+	)
+	_, err := db.ExecContext(ctx, q)
+	return err
+}

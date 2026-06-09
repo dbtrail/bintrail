@@ -1,10 +1,9 @@
 //go:build integration
 
-package main
+package rotation
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -102,33 +101,7 @@ func TestHasPendingS3Upload_emptyBintrailID(t *testing.T) {
 	}
 }
 
-// ─── performRotation S3 safety ───────────────────────────────────────────────
-
-// setupPartitionedTable creates partitions that cover the given hours so we can
-// insert test data and then rotate them away.
-func setupPartitionedTable(t *testing.T, db *sql.DB, dbName string, hours []time.Time) {
-	t.Helper()
-	// Drop existing partitioning and recreate with specific partitions.
-	// First, drop all non-future partitions by reorganizing.
-	parts := ""
-	for i, h := range hours {
-		nextHour := h.Add(time.Hour)
-		if i > 0 {
-			parts += ",\n"
-		}
-		parts += fmt.Sprintf(
-			"PARTITION %s VALUES LESS THAN (TO_SECONDS('%s'))",
-			indexer.PartitionName(h),
-			nextHour.UTC().Format("2006-01-02 15:04:05"),
-		)
-	}
-	parts += ",\nPARTITION p_future VALUES LESS THAN MAXVALUE"
-
-	testutil.MustExec(t, db, fmt.Sprintf(
-		"ALTER TABLE `%s`.`binlog_events` REORGANIZE PARTITION p_future INTO (\n%s\n)",
-		dbName, parts,
-	))
-}
+// ─── Perform S3 safety ───────────────────────────────────────────────────────
 
 // TestPerformRotation_PendingS3BlocksDrop verifies that when a previous
 // rotation run recorded S3 upload intent (s3_bucket set) but the upload
@@ -136,10 +109,10 @@ func setupPartitionedTable(t *testing.T, db *sql.DB, dbName string, hours []time
 // without --archive-s3 — refuses to drop that partition.
 //
 // Note: the S3-upload-failure continue path (uploadFileFunc returning an error)
-// is not directly integration-tested here because performRotation creates its
-// own S3 client internally from --archive-s3 flags. The safety check tested
-// here is the defense-in-depth layer that catches any scenario where the
-// partition reaches the drop step with a pending upload.
+// is not directly integration-tested here because Perform creates its own S3
+// client internally from the archive Options. The safety check tested here is
+// the defense-in-depth layer that catches any scenario where the partition
+// reaches the drop step with a pending upload.
 func TestPerformRotation_PendingS3BlocksDrop(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
@@ -147,7 +120,7 @@ func TestPerformRotation_PendingS3BlocksDrop(t *testing.T) {
 	// Create two old partitions.
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
 	h2 := h1.Add(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 
 	// Insert a row into each partition so archiving has data.
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
@@ -159,18 +132,10 @@ func TestPerformRotation_PendingS3BlocksDrop(t *testing.T) {
 	// simulating a previous run where S3 upload failed for h1 but
 	// succeeded for h2.
 	archiveDir := t.TempDir()
-	savedVars := saveRotateVars()
-	t.Cleanup(func() { restoreRotateVars(savedVars) })
+	bintrailID := "test-uuid-167"
 
-	rotArchiveDir = archiveDir
-	rotBintrailID = "test-uuid-167"
-	rotArchiveCompression = "none"
-	rotFormat = "text"
-	rotNoReplace = true
-	rotAddFuture = 0
-
-	outPath1, _ := hiveArchivePath(archiveDir, rotBintrailID, indexer.PartitionName(h1))
-	outPath2, _ := hiveArchivePath(archiveDir, rotBintrailID, indexer.PartitionName(h2))
+	outPath1, _ := HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	outPath2, _ := HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h2))
 	os.MkdirAll(filepath.Dir(outPath1), 0o755)
 	os.MkdirAll(filepath.Dir(outPath2), 0o755)
 	os.WriteFile(outPath1, []byte("parquet-data"), 0o644)
@@ -180,25 +145,30 @@ func TestPerformRotation_PendingS3BlocksDrop(t *testing.T) {
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key)
 		VALUES (?, ?, ?, 1, 'my-bucket', 'archives/p1.parquet')`,
-		indexer.PartitionName(h1), rotBintrailID, outPath1)
+		indexer.PartitionName(h1), bintrailID, outPath1)
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key, s3_uploaded_at)
 		VALUES (?, ?, ?, 1, 'my-bucket', 'archives/p2.parquet', UTC_TIMESTAMP())`,
-		indexer.PartitionName(h2), rotBintrailID, outPath2)
+		indexer.PartitionName(h2), bintrailID, outPath2)
 
 	// Run rotation WITHOUT --archive-s3, WITH --retry (so it skips re-archiving).
-	rotArchiveS3 = ""
-	rotRetry = true
-
-	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur:          24 * time.Hour,
+		ArchiveDir:         archiveDir,
+		BintrailID:         bintrailID,
+		ArchiveCompression: "none",
+		Format:             "text",
+		NoReplace:          true,
+		Retry:              true,
+	})
 	if err != nil {
-		t.Fatalf("performRotation failed: %v", err)
+		t.Fatalf("Perform failed: %v", err)
 	}
 
 	// First partition should NOT be dropped (pending S3 upload).
 	// Second partition should be dropped (S3 upload complete).
-	if res.dropped != 1 {
-		t.Errorf("expected 1 partition dropped, got %d", res.dropped)
+	if res.Dropped != 1 {
+		t.Errorf("expected 1 partition dropped, got %d", res.Dropped)
 	}
 
 	// Verify partition h1 still exists.
@@ -232,31 +202,24 @@ func TestPerformRotation_NoPendingS3DropsAll(t *testing.T) {
 	// Create two old partitions.
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
 	h2 := h1.Add(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
 	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ts2, nil, "testdb", "users", 1, "2", nil, nil, []byte(`{"id":2}`))
 
-	savedVars := saveRotateVars()
-	t.Cleanup(func() { restoreRotateVars(savedVars) })
-
-	rotArchiveDir = ""
-	rotBintrailID = ""
-	rotArchiveS3 = ""
-	rotFormat = "text"
-	rotRetry = false
-	rotNoReplace = true
-	rotAddFuture = 0
-
 	// No archive_state rows at all — partitions should be dropped freely.
-	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur: 24 * time.Hour,
+		Format:    "text",
+		NoReplace: true,
+	})
 	if err != nil {
-		t.Fatalf("performRotation failed: %v", err)
+		t.Fatalf("Perform failed: %v", err)
 	}
-	if res.dropped != 2 {
-		t.Errorf("expected 2 partitions dropped, got %d", res.dropped)
+	if res.Dropped != 2 {
+		t.Errorf("expected 2 partitions dropped, got %d", res.Dropped)
 	}
 }
 
@@ -267,7 +230,7 @@ func TestPerformRotation_BulkDropSkipsPendingS3(t *testing.T) {
 	// Create two old partitions.
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
 	h2 := h1.Add(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
@@ -280,26 +243,19 @@ func TestPerformRotation_BulkDropSkipsPendingS3(t *testing.T) {
 		VALUES (?, 'prev-uuid', '/data/test.parquet', 1, 'my-bucket', 'archives/p1.parquet')`,
 		indexer.PartitionName(h1))
 
-	savedVars := saveRotateVars()
-	t.Cleanup(func() { restoreRotateVars(savedVars) })
-
 	// No --archive-dir on this run (bulk-drop path).
-	rotArchiveDir = ""
-	rotBintrailID = ""
-	rotArchiveS3 = ""
-	rotFormat = "text"
-	rotRetry = false
-	rotNoReplace = true
-	rotAddFuture = 0
-
-	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur: 24 * time.Hour,
+		Format:    "text",
+		NoReplace: true,
+	})
 	if err != nil {
-		t.Fatalf("performRotation failed: %v", err)
+		t.Fatalf("Perform failed: %v", err)
 	}
 
 	// h1 should be skipped (pending S3), h2 dropped.
-	if res.dropped != 1 {
-		t.Errorf("expected 1 partition dropped (h2 only), got %d", res.dropped)
+	if res.Dropped != 1 {
+		t.Errorf("expected 1 partition dropped (h2 only), got %d", res.Dropped)
 	}
 
 	partitions, err := listPartitions(context.Background(), db, dbName)
@@ -321,7 +277,7 @@ func TestPerformRotation_BulkDropSkipsPendingS3(t *testing.T) {
 // ─── protect-unarchived guard (built-in `up` rotation, #420) ─────────────────
 
 // TestPerformRotation_ProtectUnarchivedDefers verifies the full guard matrix
-// in one rotation cycle when rotProtectUnarchived is set (the built-in `up`
+// in one rotation cycle when ProtectUnarchived is set (the built-in `up`
 // rotation) and the index has archiving history:
 //   - h1: past retention, NOT archived          → deferred (guard)
 //   - h2: archived but S3 upload still pending  → skipped (pending-S3 filter)
@@ -333,26 +289,13 @@ func TestPerformRotation_ProtectUnarchivedDefers(t *testing.T) {
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
 	h2 := h1.Add(time.Hour)
 	h3 := h2.Add(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2, h3})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2, h3})
 
 	for i, h := range []time.Time{h1, h2, h3} {
 		ts := h.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 		testutil.InsertEvent(t, db, "binlog.000001", uint64(100*(i+1)), uint64(100*(i+2)), ts, nil,
 			"testdb", "users", 1, fmt.Sprintf("%d", i+1), nil, nil, []byte(`{"id":1}`))
 	}
-
-	savedVars := saveRotateVars()
-	t.Cleanup(func() { restoreRotateVars(savedVars) })
-
-	// Built-in rotation profile: no archive flags, protection on.
-	rotArchiveDir = ""
-	rotArchiveS3 = ""
-	rotBintrailID = ""
-	rotFormat = "text"
-	rotRetry = false
-	rotNoReplace = true
-	rotAddFuture = 0
-	rotProtectUnarchived = true
 
 	// Archiving history exists: h2 archived with a pending S3 upload
 	// (s3_bucket set, s3_uploaded_at NULL); h3 archived and uploaded;
@@ -366,15 +309,21 @@ func TestPerformRotation_ProtectUnarchivedDefers(t *testing.T) {
 		VALUES (?, 'cron-uuid', '/archives/p3.parquet', 1, 'my-bucket', 'archives/p3.parquet', UTC_TIMESTAMP())`,
 		indexer.PartitionName(h3))
 
-	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	// Built-in rotation profile: no archive flags, protection on.
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur:         24 * time.Hour,
+		Format:            "text",
+		NoReplace:         true,
+		ProtectUnarchived: true,
+	})
 	if err != nil {
-		t.Fatalf("performRotation failed: %v", err)
+		t.Fatalf("Perform failed: %v", err)
 	}
-	if res.dropped != 1 {
-		t.Errorf("expected 1 partition dropped (archived+uploaded h3 only), got %d", res.dropped)
+	if res.Dropped != 1 {
+		t.Errorf("expected 1 partition dropped (archived+uploaded h3 only), got %d", res.Dropped)
 	}
-	if res.deferred != 1 {
-		t.Errorf("expected 1 partition deferred (unarchived h1; pending-S3 h2 is a skip, not a guard deferral), got %d", res.deferred)
+	if res.Deferred != 1 {
+		t.Errorf("expected 1 partition deferred (unarchived h1; pending-S3 h2 is a skip, not a guard deferral), got %d", res.Deferred)
 	}
 
 	partitions, err := listPartitions(context.Background(), db, dbName)
@@ -398,84 +347,165 @@ func TestPerformRotation_ProtectUnarchivedDefers(t *testing.T) {
 
 // TestPerformRotation_ProtectUnarchivedNoHistoryDropsAll verifies the guard's
 // other half: an index with NO archiving history at all (empty archive_state —
-// the quickstart world) rotates freely even under rotProtectUnarchived, which
-// is what keeps an unattended bundled volume bounded.
+// the quickstart world) rotates freely even under ProtectUnarchived, which is
+// what keeps an unattended bundled volume bounded.
 func TestPerformRotation_ProtectUnarchivedNoHistoryDropsAll(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
 	h2 := h1.Add(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
 	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ts2, nil, "testdb", "users", 1, "2", nil, nil, []byte(`{"id":2}`))
 
-	savedVars := saveRotateVars()
-	t.Cleanup(func() { restoreRotateVars(savedVars) })
-
-	rotArchiveDir = ""
-	rotArchiveS3 = ""
-	rotBintrailID = ""
-	rotFormat = "text"
-	rotRetry = false
-	rotNoReplace = true
-	rotAddFuture = 0
-	rotProtectUnarchived = true
-
-	res, err := performRotation(context.Background(), db, dbName, 24*time.Hour)
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur:         24 * time.Hour,
+		Format:            "text",
+		NoReplace:         true,
+		ProtectUnarchived: true,
+	})
 	if err != nil {
-		t.Fatalf("performRotation failed: %v", err)
+		t.Fatalf("Perform failed: %v", err)
 	}
-	if res.dropped != 2 {
-		t.Errorf("expected 2 partitions dropped (no archiving history), got %d", res.dropped)
-	}
-}
-
-// ─── test helpers ────────────────────────────────────────────────────────────
-
-type rotateVarSnapshot struct {
-	indexDSN, retain, archiveDir, archiveCompression string
-	bintrailID, archiveS3, archiveS3Region           string
-	format, interval                                 string
-	addFuture                                        int
-	noReplace, daemon, retry, protectUnarchived      bool
-}
-
-func saveRotateVars() rotateVarSnapshot {
-	return rotateVarSnapshot{
-		indexDSN:           rotIndexDSN,
-		retain:             rotRetain,
-		archiveDir:         rotArchiveDir,
-		archiveCompression: rotArchiveCompression,
-		bintrailID:         rotBintrailID,
-		archiveS3:          rotArchiveS3,
-		archiveS3Region:    rotArchiveS3Region,
-		format:             rotFormat,
-		interval:           rotInterval,
-		addFuture:          rotAddFuture,
-		noReplace:          rotNoReplace,
-		daemon:             rotDaemon,
-		retry:              rotRetry,
-		protectUnarchived:  rotProtectUnarchived,
+	if res.Dropped != 2 {
+		t.Errorf("expected 2 partitions dropped (no archiving history), got %d", res.Dropped)
 	}
 }
 
-func restoreRotateVars(s rotateVarSnapshot) {
-	rotIndexDSN = s.indexDSN
-	rotRetain = s.retain
-	rotArchiveDir = s.archiveDir
-	rotArchiveCompression = s.archiveCompression
-	rotBintrailID = s.bintrailID
-	rotArchiveS3 = s.archiveS3
-	rotArchiveS3Region = s.archiveS3Region
-	rotFormat = s.format
-	rotInterval = s.interval
-	rotAddFuture = s.addFuture
-	rotNoReplace = s.noReplace
-	rotDaemon = s.daemon
-	rotRetry = s.retry
-	rotProtectUnarchived = s.protectUnarchived
+// ─── listPartitions ──────────────────────────────────────────────────────────────────
+
+func TestListPartitions(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+
+	if err := indexer.CreateIndexTables(context.Background(), db, 3, false, nil); err != nil {
+		t.Fatalf("indexer.CreateIndexTables failed: %v", err)
+	}
+
+	parts, err := listPartitions(context.Background(), db, dbName)
+	if err != nil {
+		t.Fatalf("listPartitions failed: %v", err)
+	}
+
+	if len(parts) != 4 {
+		t.Fatalf("expected 4 partitions, got %d", len(parts))
+	}
+
+	// Verify ordinals are sequential.
+	for i, p := range parts {
+		if p.Ordinal != i+1 {
+			t.Errorf("partition %d: expected ordinal %d, got %d", i, i+1, p.Ordinal)
+		}
+	}
+
+	// Verify the last is p_future.
+	if parts[3].Name != "p_future" {
+		t.Errorf("expected last partition p_future, got %s", parts[3].Name)
+	}
+}
+
+// ─── dropPartitions ──────────────────────────────────────────────────────────────────
+
+func TestDropPartitions(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+
+	if err := indexer.CreateIndexTables(context.Background(), db, 5, false, nil); err != nil {
+		t.Fatalf("indexer.CreateIndexTables failed: %v", err)
+	}
+
+	// List the first partition to drop.
+	parts, _ := listPartitions(context.Background(), db, dbName)
+	if len(parts) < 2 {
+		t.Fatal("need at least 2 partitions to test drop")
+	}
+
+	toDrop := parts[0].Name // drop the first daily partition
+	if err := dropPartitions(context.Background(), db, dbName, []string{toDrop}); err != nil {
+		t.Fatalf("dropPartitions failed: %v", err)
+	}
+
+	// Verify count decreased.
+	partsAfter, _ := listPartitions(context.Background(), db, dbName)
+	if len(partsAfter) != len(parts)-1 {
+		t.Errorf("expected %d partitions after drop, got %d", len(parts)-1, len(partsAfter))
+	}
+
+	// Verify the dropped partition is gone.
+	for _, p := range partsAfter {
+		if p.Name == toDrop {
+			t.Errorf("partition %s should have been dropped", toDrop)
+		}
+	}
+}
+
+// ─── partitionHasData ────────────────────────────────────────────────────────────────
+
+func TestPartitionHasData_empty(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db) // creates binlog_events with only p_future
+
+	has, err := partitionHasData(context.Background(), db, dbName)
+	if err != nil {
+		t.Fatalf("partitionHasData failed: %v", err)
+	}
+	if has {
+		t.Error("expected false for empty p_future partition")
+	}
+}
+
+func TestPartitionHasData_withData(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Insert a row into binlog_events. It will land in p_future since
+	// InitIndexTables creates only p_future.
+	testutil.InsertEvent(t, db,
+		"binlog.000001", 100, 200,
+		time.Now().UTC().Format("2006-01-02 15:04:05"),
+		nil, "testdb", "orders", 1, "1",
+		nil, nil, []byte(`{"id": 1}`),
+	)
+
+	has, err := partitionHasData(context.Background(), db, dbName)
+	if err != nil {
+		t.Fatalf("partitionHasData failed: %v", err)
+	}
+	if !has {
+		t.Error("expected true when p_future has data")
+	}
+}
+
+// ─── addFuturePartitions ─────────────────────────────────────────────────────────────
+
+func TestAddFuturePartitions(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db) // only p_future
+
+	startDate := time.Now().UTC().Truncate(time.Hour)
+
+	if err := addFuturePartitions(context.Background(), db, dbName, startDate, 3); err != nil {
+		t.Fatalf("addFuturePartitions failed: %v", err)
+	}
+
+	parts, _ := listPartitions(context.Background(), db, dbName)
+	// Should be 3 hourly + p_future = 4.
+	if len(parts) != 4 {
+		t.Fatalf("expected 4 partitions, got %d", len(parts))
+	}
+
+	// The last one must still be p_future.
+	if parts[len(parts)-1].Name != "p_future" {
+		t.Errorf("expected last partition p_future, got %s", parts[len(parts)-1].Name)
+	}
+
+	// First 3 should be hourly partitions.
+	for i := range 3 {
+		expected := indexer.PartitionName(startDate.Add(time.Duration(i) * time.Hour))
+		if parts[i].Name != expected {
+			t.Errorf("partition %d: expected %s, got %s", i, expected, parts[i].Name)
+		}
+	}
 }

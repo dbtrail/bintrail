@@ -1,6 +1,6 @@
 //go:build integration
 
-package main
+package rotation
 
 import (
 	"context"
@@ -26,28 +26,17 @@ func TestRotateOneIndex_UpgradeGuard(t *testing.T) {
 	// lone ancient partition would make top-up land uselessly in the past).
 	old := time.Now().UTC().Add(-100 * 24 * time.Hour).Truncate(time.Hour)
 	current := time.Now().UTC().Truncate(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{old, current})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{old, current})
 
-	savedVars := saveRotateVars()
-	t.Cleanup(func() { restoreRotateVars(savedVars) })
 	logs := captureSlog(t)
 
-	// Built-in rotation profile (what startUpRotation fans out) — with
-	// add-future headroom so the guarded cycle's top-up promise is asserted.
-	rotArchiveDir = ""
-	rotArchiveS3 = ""
-	rotBintrailID = ""
-	rotFormat = "json"
-	rotRetry = false
-	rotNoReplace = false
-	rotAddFuture = 2
-	rotProtectUnarchived = true
-	rotRetain = "30d"
-
+	// Built-in rotation profile, with add-future headroom so the guarded
+	// cycle's top-up promise is asserted. rotateOneIndex derives its Options
+	// from this Settings via loopOptions (ProtectUnarchived on, no archiving).
 	dsn := testutil.IntegrationDSN(dbName)
-	s := upRotationSettings{
-		enabled: true, retain: 30 * 24 * time.Hour, retainRaw: "30d",
-		interval: time.Hour, addFuture: 2, explicit: false,
+	s := Settings{
+		Enabled: true, Retain: 30 * 24 * time.Hour, RetainRaw: "30d",
+		Interval: time.Hour, AddFuture: 2, Explicit: false,
 	}
 
 	// Implicit default: the guard must refuse the drop and say so loudly.
@@ -82,7 +71,7 @@ func TestRotateOneIndex_UpgradeGuard(t *testing.T) {
 	}
 
 	// Explicit choice: the same retention now drops the old history.
-	s.explicit = true
+	s.Explicit = true
 	if _, err := rotateOneIndex(context.Background(), dsn, s); err != nil {
 		t.Fatalf("rotateOneIndex (explicit): %v", err)
 	}
@@ -97,18 +86,18 @@ func TestRotateOneIndex_UpgradeGuard(t *testing.T) {
 	}
 }
 
-// TestStartUpRotation_escalatesOnPersistentDeferral runs the real loop
-// against a real index where the protect-unarchived guard defers the same
-// partition every cycle (archiving history exists, partition unarchived) and
-// asserts the loop escalates to Error after upRotationEscalateAfter cycles —
-// the "archiving flow stalled, index growing unbounded" detection.
-func TestStartUpRotation_escalatesOnPersistentDeferral(t *testing.T) {
+// TestStartLoop_escalatesOnPersistentDeferral runs the real loop against a real
+// index where the protect-unarchived guard defers the same partition every
+// cycle (archiving history exists, partition unarchived) and asserts the loop
+// escalates to Error after escalateAfter cycles — the "archiving flow stalled,
+// index growing unbounded" detection.
+func TestStartLoop_escalatesOnPersistentDeferral(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 
 	// One partition past retention (30h > 24h) but NOT archived...
 	h1 := time.Now().UTC().Add(-30 * time.Hour).Truncate(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
 	ts := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
 	// ...while archive_state shows archiving history for a different
@@ -117,21 +106,19 @@ func TestStartUpRotation_escalatesOnPersistentDeferral(t *testing.T) {
 		(partition_name, bintrail_id, local_path, row_count)
 		VALUES ('p_2020010100', 'cron-uuid', '/archives/old.parquet', 1)`)
 
-	savedVars := saveRotateVars()
-	t.Cleanup(func() { restoreRotateVars(savedVars) })
 	logs := captureSlog(t)
 
-	prevN := upRotationEscalateAfter
-	upRotationEscalateAfter = 2
-	t.Cleanup(func() { upRotationEscalateAfter = prevN })
+	prevN := escalateAfter
+	escalateAfter = 2
+	t.Cleanup(func() { escalateAfter = prevN })
 
-	s := upRotationSettings{
-		enabled: true, retain: 24 * time.Hour, retainRaw: "24h",
-		interval: 25 * time.Millisecond, addFuture: 0,
-		explicit: true, // h1 is only 30h old; guard wouldn't trip, but be unambiguous
+	s := Settings{
+		Enabled: true, Retain: 24 * time.Hour, RetainRaw: "24h",
+		Interval: 25 * time.Millisecond, AddFuture: 0,
+		Explicit: true, // h1 is only 30h old; guard wouldn't trip, but be unambiguous
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := startUpRotation(ctx, s, func() []string {
+	done := StartLoop(ctx, s, func() []string {
 		return []string{testutil.IntegrationDSN(dbName)}
 	})
 

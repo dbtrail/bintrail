@@ -14,6 +14,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/archive"
 	"github.com/dbtrail/bintrail/internal/baseline"
 	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/rotation"
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
@@ -96,7 +97,7 @@ func TestRunReconstruct_fullTableRoundTrip_datetimePK(t *testing.T) {
 	}
 
 	// ── 3. Set up partitions and insert events ──────────────────────────
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 
@@ -119,7 +120,7 @@ func TestRunReconstruct_fullTableRoundTrip_datetimePK(t *testing.T) {
 	// ── 4. Archive h1 and drop it from live MySQL ───────────────────────
 	archiveDir := t.TempDir()
 	bintrailID := "test-212-datetime-pk"
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	outPath, err := rotation.HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}
@@ -293,7 +294,7 @@ func TestRunReconstruct_fullTableRoundTrip_varcharPK(t *testing.T) {
 		t.Fatalf("writer close: %v", err)
 	}
 
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 
@@ -309,7 +310,7 @@ func TestRunReconstruct_fullTableRoundTrip_varcharPK(t *testing.T) {
 
 	archiveDir := t.TempDir()
 	bintrailID := "test-212-varchar-pk"
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	outPath, err := rotation.HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}
@@ -502,7 +503,7 @@ func TestRunReconstruct_fullTableRoundTrip_decimalPK(t *testing.T) {
 	}
 
 	// ── 3. Set up partitions and insert events ──────────────────────────
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 
@@ -525,7 +526,7 @@ func TestRunReconstruct_fullTableRoundTrip_decimalPK(t *testing.T) {
 	// ── 4. Archive h1 and drop it from live MySQL ───────────────────────
 	archiveDir := t.TempDir()
 	bintrailID := "test-214-decimal-pk"
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	outPath, err := rotation.HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}
@@ -852,7 +853,7 @@ func TestRunReconstruct_fullTableRoundTrip_datetime6PK(t *testing.T) {
 		t.Fatalf("writer close: %v", err)
 	}
 
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 
@@ -872,7 +873,7 @@ func TestRunReconstruct_fullTableRoundTrip_datetime6PK(t *testing.T) {
 
 	archiveDir := t.TempDir()
 	bintrailID := "test-212-datetime6-pk"
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	outPath, err := rotation.HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}

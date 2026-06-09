@@ -18,6 +18,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/console"
 	"github.com/dbtrail/bintrail/internal/doctor"
 	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/rotation"
 	"github.com/dbtrail/bintrail/internal/serverid"
 	"github.com/dbtrail/bintrail/internal/streamrun"
 )
@@ -71,6 +72,11 @@ var (
 	upRotateRetain    string
 	upRotateInterval  string
 	upRotateAddFuture int
+
+	// upRotationCfg holds the parsed built-in-rotation settings from runUp's
+	// validation, read at the phase-3 start sites (the cobra-accumulator
+	// pattern; the parsing and the loop itself live in internal/rotation).
+	upRotationCfg rotation.Settings
 )
 
 func init() {
@@ -111,7 +117,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// check covers flag and env alike (bindCommandEnv marks env-set flags
 	// Changed); an explicitly-chosen retention disables the upgrade guard.
 	var err error
-	upRotationCfg, err = parseUpRotation(upRotateRetain, upRotateInterval, upRotateAddFuture,
+	upRotationCfg, err = rotation.ParseSettings(upRotateRetain, upRotateInterval, upRotateAddFuture,
 		cmd.Flags().Changed("rotate-retain"))
 	if err != nil {
 		return err
@@ -151,7 +157,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		// unattended reboot would crash-loop instead of capturing while
 		// there is still room). Standalone `doctor` keeps full FAIL
 		// semantics for CI.
-		preflight := doctor.Build(cmd.Context(), upSourceDSN, upIndexDSN, upSchemas, upRotationCfg.retain)
+		preflight := doctor.Build(cmd.Context(), upSourceDSN, upIndexDSN, upSchemas, upRotationCfg.Retain)
 		if err := preflight.Write(os.Stderr, "text"); err != nil {
 			return fmt.Errorf("write preflight report: %w", err)
 		}
@@ -263,13 +269,13 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.retain)
+	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
 
 	// Built-in rotation covers the boot index plus every per-source database
 	// the control plane provisions — the unattended quickstart's real data
 	// lives in the latter.
-	startUpRotation(ctx, upRotationCfg, func() []string {
+	rotation.StartLoop(ctx, upRotationCfg, func() []string {
 		return append([]string{upIndexDSN}, supervisor.ActiveIndexDSNs()...)
 	})
 
@@ -343,7 +349,7 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 		// paths.
 		rotCtx, rotStop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 		defer rotStop()
-		startUpRotation(rotCtx, upRotationCfg, func() []string {
+		rotation.StartLoop(rotCtx, upRotationCfg, func() []string {
 			return []string{upIndexDSN}
 		})
 		return runStream(cmd, args)
@@ -400,12 +406,12 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// The control-plane supervisor: "+ Add server" in the console starts real
 	// monitoring through it. Streams live on the daemon context (ctx), not on
 	// the HTTP requests that start them.
-	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.retain)
+	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
 
 	// Built-in rotation: boot index + every per-source database the control
 	// plane provisions, on the daemon lifecycle.
-	startUpRotation(ctx, upRotationCfg, func() []string {
+	rotation.StartLoop(ctx, upRotationCfg, func() []string {
 		return append([]string{upIndexDSN}, supervisor.ActiveIndexDSNs()...)
 	})
 

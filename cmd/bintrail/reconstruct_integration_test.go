@@ -18,6 +18,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/parquetquery"
 	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/bintrail/internal/rotation"
 	"github.com/dbtrail/bintrail/internal/testutil"
 )
 
@@ -49,7 +50,7 @@ func TestFetchMerged_archiveAware(t *testing.T) {
 	// avoid collisions with the default p_future catch-all.
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
 	h2 := h1.Add(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
@@ -67,7 +68,7 @@ func TestFetchMerged_archiveAware(t *testing.T) {
 	// directory layout is required for query.ResolveArchiveSources to find it.
 	archiveDir := t.TempDir()
 	bintrailID := "test-209-reconstruct"
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	outPath, err := rotation.HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}
@@ -165,7 +166,7 @@ func TestFetchMerged_gapAbort(t *testing.T) {
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
 	h2 := h1.Add(time.Hour)
 	h3 := h2.Add(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
 
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil,
@@ -246,7 +247,7 @@ func TestFetchMerged_noArchiveKeepsPlannerGapDetection(t *testing.T) {
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
 	h2 := h1.Add(time.Hour)
 	h3 := h2.Add(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
 
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil,
@@ -292,7 +293,7 @@ func TestFetchMerged_allArchiveSourcesFailStrict(t *testing.T) {
 	}
 
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
 
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil,
@@ -377,7 +378,7 @@ func TestFetchMerged_partialArchiveFailureAbortsStrict(t *testing.T) {
 	}
 
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
 
 	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil,
@@ -473,7 +474,7 @@ func TestFetchMerged_noArchiveDoesNotCallFetcher(t *testing.T) {
 	}
 
 	h1 := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
 	ts1 := h1.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil,
 		"testdb", "orders", 1, "7", nil, nil, []byte(`{"id":7}`))
@@ -546,7 +547,7 @@ func TestRunReconstruct_archiveAwareE2E(t *testing.T) {
 	// ── 2. Set up two live partitions and insert UPDATE events ─────────────
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
 	h2 := h1.Add(time.Hour)
-	setupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 
 	// Now anchor the baseline snapshot at h1 so reconstruct's query range
 	// becomes [h1, h2 + 30min], which the planner classifies as hours
@@ -588,7 +589,7 @@ func TestRunReconstruct_archiveAwareE2E(t *testing.T) {
 	// ── 3. Archive h1 and drop it from live MySQL ──────────────────────────
 	archiveDir := t.TempDir()
 	bintrailID := "test-209-e2e"
-	outPath, err := hiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	outPath, err := rotation.HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
 	if err != nil {
 		t.Fatalf("hiveArchivePath: %v", err)
 	}
