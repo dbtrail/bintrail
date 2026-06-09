@@ -413,7 +413,7 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) checkResult {
 		grants = append(grants, g)
 	}
 
-	slave, client := hasReplPrivileges(grants)
+	slave, client := metadata.HasReplPrivileges(grants)
 	if slave && client {
 		return checkResult{
 			Name:   "REPLICATION SLAVE + CLIENT grants",

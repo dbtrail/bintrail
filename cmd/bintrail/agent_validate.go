@@ -161,7 +161,7 @@ func checkReplPrivileges(ctx context.Context, db *sql.DB) (string, error) {
 		return "", fmt.Errorf("iterate grants: %w", err)
 	}
 
-	hasSlave, hasClient := hasReplPrivileges(grants)
+	hasSlave, hasClient := metadata.HasReplPrivileges(grants)
 
 	var missing []string
 	if !hasSlave {
@@ -175,24 +175,6 @@ func checkReplPrivileges(ctx context.Context, db *sql.DB) (string, error) {
 	}
 
 	return "REPLICATION SLAVE, REPLICATION CLIENT", nil
-}
-
-// hasReplPrivileges checks a list of SHOW GRANTS output lines for
-// REPLICATION SLAVE and REPLICATION CLIENT privileges.
-func hasReplPrivileges(grants []string) (slave, client bool) {
-	for _, grant := range grants {
-		upper := strings.ToUpper(grant)
-		if strings.Contains(upper, "ALL PRIVILEGES") {
-			return true, true
-		}
-		if strings.Contains(upper, "REPLICATION SLAVE") {
-			slave = true
-		}
-		if strings.Contains(upper, "REPLICATION CLIENT") {
-			client = true
-		}
-	}
-	return
 }
 
 // checkSchemaSnapshot builds a resolver from the source MySQL's
