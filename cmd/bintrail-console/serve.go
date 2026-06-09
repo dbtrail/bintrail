@@ -185,9 +185,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		BaselineDir:   conBaselineDir,
 		BaselineS3:    conBaselineS3,
 		// MonitorCtrl is intentionally left nil: bintrail-console serve is the
-		// read-only standalone console. The write-capable control-plane daemon
-		// (today `bintrail up --console`) wires a supervisor; that path moves
-		// into this binary as a separate command in PR-D.
+		// read-only standalone console. A write-capable control-plane daemon
+		// wires a supervisor here instead; with nil, /api/capabilities reports
+		// monitor:false and every monitor verb refuses at the endpoint with 403.
 	})
 	if err != nil {
 		return err

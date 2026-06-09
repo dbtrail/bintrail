@@ -85,3 +85,26 @@ func TestRunServeCorruptRegistryFailsLoud(t *testing.T) {
 		t.Fatalf("err = %v, want a loud registry-parse failure", err)
 	}
 }
+
+// TestRunServeIndexDSNFromEnv asserts the POSITIVE env-fallback path — the one
+// behavior unique to runServe with no parity baseline in runConsole (the core
+// binds BINTRAIL_INDEX_DSN once at init() via bindCommandEnv; runServe reads it
+// per-call). A decouple regression here — wrong var name, inverted Changed
+// check, a dropped block — would pass every mirrored guard test silently, so it
+// needs its own assertion. We give a DSN with NO database name: when the env is
+// consumed, conIndexDSN becomes non-empty, the empty-registry guard is bypassed,
+// and the db-name check fires ("must include a database name"); if the env were
+// ignored, conIndexDSN stays "" and the "either --index-dsn" guard fires
+// instead — so the error substring discriminates the two outcomes without a DB.
+func TestRunServeIndexDSNFromEnv(t *testing.T) {
+	conIndexDSN, conProfile, conBaselineDir, conBaselineS3 = "", "", "", ""
+	conServersFile = filepath.Join(t.TempDir(), "servers.yaml") // empty registry
+	t.Cleanup(func() { conIndexDSN, conServersFile = "", "" })
+	t.Setenv("BINTRAIL_CONSOLE_SERVERS", "")
+	t.Setenv("BINTRAIL_INDEX_DSN", "u:p@tcp(h:3306)/") // present, no db name
+
+	err := runServe(serveCmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "must include a database name") {
+		t.Fatalf("err = %v, want the env DSN consumed (db-name guard)", err)
+	}
+}
