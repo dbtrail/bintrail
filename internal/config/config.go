@@ -77,8 +77,9 @@ func Connect(dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
-// ParseSourceDSN extracts the host, port, user, and password from a
-// go-sql-driver DSN for use in BinlogSyncerConfig.
+// ParseSourceDSN decomposes a go-sql-driver DSN into host, port, user, and
+// password. It requires a TCP address and rejects unix-socket DSNs — binlog
+// replication (BinlogSyncerConfig) and remote dumps both need a host:port.
 func ParseSourceDSN(dsn string) (host string, port uint16, user, password string, err error) {
 	cfg, parseErr := mysql.ParseDSN(dsn)
 	if parseErr != nil {

@@ -19,8 +19,8 @@ cmd/bintrail/          # One file per command (init, snapshot, index, query, rec
                        # Test files: *_test.go (unit), *_integration_test.go (//go:build integration)
 cmd/bintrail-mcp/      # MCP server: main.go, proxy.py, tests
 internal/
-  cliutil/             # Shared filter parsers: ParseEventType, ParseTime, IsValidFormat, IsValidOutputFormat
-  config/              # config.Connect(dsn) — opens *sql.DB with parseTime=true + 10s timeout
+  cliutil/             # Shared filter-parsing + output helpers: ParseEventType, ParseTime, IsValidFormat, IsValidOutputFormat, ParseSchemaList, BuildIndexFilters, OutputJSON
+  config/              # config.Connect(dsn) + config.ParseSourceDSN(dsn) — opens *sql.DB (parseTime=true + 10s timeout) / decomposes a DSN to host/port/user/pass
   metadata/            # Schema snapshot loader and resolver
   observe/             # slog setup + Prometheus metrics for stream
   parser/              # Binlog file parser + StreamParser (go-mysql-org/go-mysql)

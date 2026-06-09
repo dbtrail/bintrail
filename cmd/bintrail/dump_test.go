@@ -501,7 +501,7 @@ func TestRunDump_invalidSourceDSN(t *testing.T) {
 	})
 
 	dumpCmd.Flags().Set("mydumper-path", fakeBin)
-	dmpSourceDSN = "root@unix(/var/run/mysqld.sock)/" // unix socket → rejected by parseSourceDSN
+	dmpSourceDSN = "root@unix(/var/run/mysqld.sock)/" // unix socket → rejected by config.ParseSourceDSN
 
 	err := runDump(dumpCmd, nil)
 	if err == nil {

@@ -298,7 +298,7 @@ func TestParseSourceDSN_ipv6(t *testing.T) {
 
 // TestParseSourceDSN_portOutOfRange verifies that a port above the uint16 max
 // (65535) is rejected. go-mysql-driver accepts it syntactically, but
-// parseSourceDSN uses strconv.ParseUint with bitSize=16 to catch it.
+// ParseSourceDSN uses strconv.ParseUint with bitSize=16 to catch it.
 func TestParseSourceDSN_portOutOfRange(t *testing.T) {
 	dsn := "root@tcp(localhost:65536)/"
 	_, _, _, _, err := ParseSourceDSN(dsn)

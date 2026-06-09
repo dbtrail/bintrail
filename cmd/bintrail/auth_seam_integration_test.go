@@ -105,7 +105,7 @@ func TestCachingSha2ColdAuthSeam(t *testing.T) {
 		dsn := makeColdUser(t, "bt_authseam_repl")
 		host, port, user, password, err := config.ParseSourceDSN(dsn)
 		if err != nil {
-			t.Fatalf("parseSourceDSN: %v", err)
+			t.Fatalf("config.ParseSourceDSN: %v", err)
 		}
 
 		// Omit TLSConfig (nil → plaintext) to force the caching_sha2 full-auth

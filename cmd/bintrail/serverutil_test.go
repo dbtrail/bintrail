@@ -64,7 +64,7 @@ func TestLoadSourceIdentityBadDSN(t *testing.T) {
 	mock.ExpectQuery("SELECT @@server_uuid").WillReturnRows(
 		sqlmock.NewRows([]string{"@@server_uuid"}).AddRow("uuid-x"))
 
-	// parseSourceDSN rejects unix sockets — use that as the easy bad-DSN trigger.
+	// config.ParseSourceDSN rejects unix sockets — use that as the easy bad-DSN trigger.
 	_, err = loadSourceIdentity(context.Background(), db, "u:p@unix(/tmp/sock)/")
 	if err == nil {
 		t.Fatal("expected error for unix-socket DSN")

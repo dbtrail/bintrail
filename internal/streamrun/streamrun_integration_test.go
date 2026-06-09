@@ -300,7 +300,7 @@ func TestStreamLoop_liveReplication(t *testing.T) {
 	}
 
 	// Parse source DSN to get connection details for the syncer (inlined from
-	// the cmd-layer parseSourceDSN).
+	// the helper now in config.ParseSourceDSN).
 	mc, err := drivermysql.ParseDSN(testutil.IntegrationDSN(sourceName))
 	if err != nil {
 		t.Fatalf("ParseDSN: %v", err)

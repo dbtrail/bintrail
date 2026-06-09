@@ -134,6 +134,8 @@ func TestBinlogFileRe(t *testing.T) {
 	}
 }
 
+// ─── resolveFiles ────────────────────────────────────────────────────────────
+
 func TestResolveFiles_explicit(t *testing.T) {
 	files, err := resolveFiles("/tmp", "binlog.000001,binlog.000002", false)
 	if err != nil {

@@ -334,5 +334,3 @@ func TestBuildIndexFilters_trimming(t *testing.T) {
 		t.Errorf("expected trimmed tables, got %v", f.Tables)
 	}
 }
-
-// ─── resolveFiles ────────────────────────────────────────────────────────────
