@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/bintrail/internal/streamdeps"
-	"github.com/dbtrail/bintrail/internal/streamrun"
+	"github.com/dbtrail/dbtrail/internal/streamdeps"
+	"github.com/dbtrail/dbtrail/internal/streamrun"
 )
 
 var streamCmd = &cobra.Command{

@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/archive"
-	"github.com/dbtrail/bintrail/internal/baseline"
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/archive"
+	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 const tsFormat = "2006-01-02 15:04:05"

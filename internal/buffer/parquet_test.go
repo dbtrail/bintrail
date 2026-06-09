@@ -8,8 +8,8 @@ import (
 
 	"github.com/parquet-go/parquet-go"
 
-	"github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 func TestWriteParquet_empty(t *testing.T) {

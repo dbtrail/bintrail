@@ -8,7 +8,7 @@
 
 Bintrail is a Go CLI that parses MySQL ROW-format binary logs, indexes every row event into MySQL with full before/after images, and generates reversal SQL for recovery. The index is self-contained — recovery never requires the original binlog files.
 
-Module: `github.com/dbtrail/bintrail`
+Module: `github.com/dbtrail/dbtrail`
 Go version: 1.24.7 (go.mod; the source Dockerfiles pin golang:1.24.7-bookworm to match) — uses `range N`, `min()`, `slices.Reverse`, `strings.SplitSeq`, `any` (not `interface{}`).
 
 ## Project structure

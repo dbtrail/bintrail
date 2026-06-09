@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 func TestNewBaselineGating(t *testing.T) {

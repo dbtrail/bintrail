@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/streamrun"
+	"github.com/dbtrail/dbtrail/internal/streamrun"
 )
 
 // ─── cobra command wiring ─────────────────────────────────────────────────────

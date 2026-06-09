@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // Config configures a console Server. The caller (cmd/bintrail/console.go) is

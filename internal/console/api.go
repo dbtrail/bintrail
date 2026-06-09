@@ -15,11 +15,11 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/dbtrail/bintrail/internal/cliutil"
-	"github.com/dbtrail/bintrail/internal/parquetquery"
-	"github.com/dbtrail/bintrail/internal/query"
-	"github.com/dbtrail/bintrail/internal/recovery"
-	"github.com/dbtrail/bintrail/internal/status"
+	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/parquetquery"
+	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/recovery"
+	"github.com/dbtrail/dbtrail/internal/status"
 )
 
 // Result caps. Every endpoint applies a default and a hard maximum; the limit

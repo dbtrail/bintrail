@@ -4,9 +4,9 @@
 
 **Point-in-time recovery for MySQL — no locks, no schema changes, no waiting for a restore.**
 
-[![Release](https://img.shields.io/github/v/release/dbtrail/bintrail)](https://github.com/dbtrail/bintrail/releases/latest)
+[![Release](https://img.shields.io/github/v/release/dbtrail/bintrail)](https://github.com/dbtrail/dbtrail/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![CI](https://github.com/dbtrail/bintrail/actions/workflows/ci.yml/badge.svg)](https://github.com/dbtrail/bintrail/actions)
+[![CI](https://github.com/dbtrail/dbtrail/actions/workflows/ci.yml/badge.svg)](https://github.com/dbtrail/dbtrail/actions)
 
 ```sql
 SELECT * FROM orders WHERE id = 123 AS OF '2026-05-20 14:00:00'
@@ -43,7 +43,7 @@ exact fix for anything missing.
 ## Get started
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/dbtrail/bintrail/main/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
 docker compose up -d
 docker compose logs -f bintrail
 ```

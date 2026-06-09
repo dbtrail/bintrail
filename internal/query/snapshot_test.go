@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 // TestShouldSkipSnapshot is the unit-level truth table for the four always-

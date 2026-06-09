@@ -14,9 +14,9 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/dbtrail/bintrail/internal/cliutil"
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // CheckStatus is the outcome of a single preflight check. Constrained to the

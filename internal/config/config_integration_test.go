@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 func TestConnect_validDSN(t *testing.T) {

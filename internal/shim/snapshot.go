@@ -9,9 +9,9 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
-	"github.com/dbtrail/bintrail/internal/metadata"
-	"github.com/dbtrail/bintrail/internal/query"
-	"github.com/dbtrail/bintrail/internal/reconstruct"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 // runSnapshot resolves a _snapshot query. _snapshot is the

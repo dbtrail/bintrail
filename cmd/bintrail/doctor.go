@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/bintrail/internal/cliutil"
-	"github.com/dbtrail/bintrail/internal/doctor"
+	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/doctor"
 )
 
 var doctorCmd = &cobra.Command{

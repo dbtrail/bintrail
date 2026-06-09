@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 // TestCheckIndexCapacity_skipsWithoutHistory: a freshly-initialized index

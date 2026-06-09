@@ -9,9 +9,9 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/dbtrail/bintrail/internal/serverid"
-	"github.com/dbtrail/bintrail/internal/status"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/serverid"
+	"github.com/dbtrail/dbtrail/internal/status"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 func TestLoadServers_integration(t *testing.T) {

@@ -10,7 +10,7 @@ import (
 
 	"github.com/parquet-go/parquet-go"
 
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 // TestArchivePartition_nullBinlogFile is the rotate-path counterpart to

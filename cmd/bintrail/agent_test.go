@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/buffer"
-	"github.com/dbtrail/bintrail/internal/byos"
-	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/buffer"
+	"github.com/dbtrail/dbtrail/internal/byos"
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 // stubMetadataClient records Send calls and can be configured to fail.

@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/dbtrail/bintrail/internal/buffer"
-	"github.com/dbtrail/bintrail/internal/cliutil"
-	"github.com/dbtrail/bintrail/internal/metadata"
-	"github.com/dbtrail/bintrail/internal/parquetquery"
-	"github.com/dbtrail/bintrail/internal/query"
-	"github.com/dbtrail/bintrail/internal/recovery"
+	"github.com/dbtrail/dbtrail/internal/buffer"
+	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/parquetquery"
+	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/recovery"
 )
 
 // allowedForensicsQueries maps predefined query identifiers to safe SQL

@@ -15,7 +15,7 @@ import (
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 
-	"github.com/dbtrail/bintrail/internal/shim"
+	"github.com/dbtrail/dbtrail/internal/shim"
 )
 
 // TestAllowGapsDefaultIsStrict pins the load-bearing claim of issue #257:

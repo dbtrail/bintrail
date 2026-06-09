@@ -18,13 +18,13 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/dbtrail/bintrail/internal/cliutil"
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/indexer"
-	"github.com/dbtrail/bintrail/internal/metadata"
-	"github.com/dbtrail/bintrail/internal/observe"
-	"github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/serverid"
+	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/serverid"
 )
 
 // ─── streamState ───────────────────────────────────────────────────────────────────

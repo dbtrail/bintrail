@@ -18,7 +18,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 
-	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 // selfSignedCAPEM generates a minimal self-signed CA certificate as PEM bytes.

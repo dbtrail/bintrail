@@ -15,7 +15,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 // mysqlToSecondsConst is the value of MySQL's TO_SECONDS('1970-01-01 00:00:00').

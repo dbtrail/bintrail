@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/archive"
-	"github.com/dbtrail/bintrail/internal/indexer"
-	"github.com/dbtrail/bintrail/internal/rotation"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/archive"
+	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/rotation"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 // TestArchiveReconcileRebuild covers #392's headline scenario end-to-end

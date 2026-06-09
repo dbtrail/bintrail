@@ -13,8 +13,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // ─── buildGlob (local paths only — S3 uses listS3Parquet) ───────────────────

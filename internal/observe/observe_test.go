@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/observe"
 )
 
 func TestParseLevel(t *testing.T) {

@@ -12,7 +12,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/dbtrail/bintrail/internal/shim"
+	"github.com/dbtrail/dbtrail/internal/shim"
 )
 
 // startTestShim launches serveLoop on a localhost listener with the

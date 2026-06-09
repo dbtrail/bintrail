@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/metadata"
-	"github.com/dbtrail/bintrail/internal/query"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 func TestGenerateSQL_deleteToInsert(t *testing.T) {

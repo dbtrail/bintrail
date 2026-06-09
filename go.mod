@@ -1,5 +1,4 @@
-// Deprecated: this module has moved to github.com/dbtrail/dbtrail.
-module github.com/dbtrail/bintrail
+module github.com/dbtrail/dbtrail
 
 go 1.24.7
 

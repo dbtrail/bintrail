@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/query"
-	"github.com/dbtrail/bintrail/internal/recovery"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/recovery"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 const intToken = "integration-token"

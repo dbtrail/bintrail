@@ -6,7 +6,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/dbtrail/bintrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/observe"
 )
 
 func TestForSource_registration(t *testing.T) {

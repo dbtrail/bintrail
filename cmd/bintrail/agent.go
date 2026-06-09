@@ -20,16 +20,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/bintrail/internal/agent"
-	"github.com/dbtrail/bintrail/internal/buffer"
-	"github.com/dbtrail/bintrail/internal/byos"
-	"github.com/dbtrail/bintrail/internal/cliutil"
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/indexer"
-	"github.com/dbtrail/bintrail/internal/metadata"
-	"github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/serverid"
-	"github.com/dbtrail/bintrail/internal/storage"
+	"github.com/dbtrail/dbtrail/internal/agent"
+	"github.com/dbtrail/dbtrail/internal/buffer"
+	"github.com/dbtrail/dbtrail/internal/byos"
+	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/serverid"
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 var agentCmd = &cobra.Command{

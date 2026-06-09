@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // TestParseFile_compressedFixture is the FILE-mode unit guard for compressed

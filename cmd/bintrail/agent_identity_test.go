@@ -10,9 +10,9 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
-	"github.com/dbtrail/bintrail/internal/buffer"
-	"github.com/dbtrail/bintrail/internal/byos"
-	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/buffer"
+	"github.com/dbtrail/dbtrail/internal/byos"
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 const (

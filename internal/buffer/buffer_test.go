@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 func makeEvents(n int, schema, table string, base time.Time) []parser.Event {

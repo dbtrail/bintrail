@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	binparser "github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/query"
+	binparser "github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // ─── cobra command wiring ─────────────────────────────────────────────────────

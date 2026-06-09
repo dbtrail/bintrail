@@ -17,13 +17,13 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver for parquet_scan baseline streaming
 	mysqldriver "github.com/go-sql-driver/mysql"
 
-	"github.com/dbtrail/bintrail/internal/baseline"
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/indexer"
-	"github.com/dbtrail/bintrail/internal/metadata"
-	"github.com/dbtrail/bintrail/internal/parquetquery"
-	"github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/parquetquery"
+	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // FullTableConfig drives ReconstructTables — the full-table merge-on-read

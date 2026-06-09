@@ -8,7 +8,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/storage"
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 // partitionKeyMarker is the key (relative to the storage backend's prefix)

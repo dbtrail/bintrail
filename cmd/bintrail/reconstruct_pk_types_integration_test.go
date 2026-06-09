@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/archive"
-	"github.com/dbtrail/bintrail/internal/baseline"
-	"github.com/dbtrail/bintrail/internal/indexer"
-	"github.com/dbtrail/bintrail/internal/rotation"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/archive"
+	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/rotation"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 // TestRunReconstruct_fullTableRoundTrip_datetimePK is the #212 regression

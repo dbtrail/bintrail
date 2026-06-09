@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/indexer"
 )
 
 // ─── nextPartitionStart ─────────────────────────────────────────────────────────────

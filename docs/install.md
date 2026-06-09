@@ -22,7 +22,7 @@ One file, zero config — an index MySQL (persisted in a volume) and
 control plane, waiting for you to add servers from the UI:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/dbtrail/bintrail/main/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
 docker compose up -d
 docker compose logs -f bintrail
 ```
@@ -64,7 +64,7 @@ you? That is [dbtrail](https://dbtrail.com).
 
 All the optional knobs (pinned console token, schema filter, image tag)
 live in
-[`.env.example`](https://github.com/dbtrail/bintrail/blob/main/.env.example);
+[`.env.example`](https://github.com/dbtrail/dbtrail/blob/main/.env.example);
 the full walkthrough is in [docker.md](./docker.md).
 
 ## Try it without installing anything (30 seconds)
@@ -106,11 +106,11 @@ Compose stack runs). See [docker.md](./docker.md) for signature verification,
 ## Linux packages
 
 `.deb` and `.rpm` for amd64 and arm64 are attached to every
-[release](https://github.com/dbtrail/bintrail/releases):
+[release](https://github.com/dbtrail/dbtrail/releases):
 
 ```sh
 # Debian/Ubuntu
-curl -fsSLO https://github.com/dbtrail/bintrail/releases/latest/download/bintrail_VERSION_linux_amd64.deb
+curl -fsSLO https://github.com/dbtrail/dbtrail/releases/latest/download/bintrail_VERSION_linux_amd64.deb
 sudo dpkg -i bintrail_*_linux_amd64.deb
 
 # RHEL/Fedora
@@ -126,7 +126,7 @@ wants the UI.
 ## Go install
 
 ```sh
-go install github.com/dbtrail/bintrail/cmd/bintrail@latest
+go install github.com/dbtrail/dbtrail/cmd/bintrail@latest
 ```
 
 Requires CGO (bintrail embeds DuckDB for Parquet archive queries).
@@ -134,7 +134,7 @@ Requires CGO (bintrail embeds DuckDB for Parquet archive queries).
 ## Build from source
 
 ```sh
-git clone https://github.com/dbtrail/bintrail
+git clone https://github.com/dbtrail/dbtrail
 cd bintrail
 go build ./cmd/bintrail
 ```
@@ -143,7 +143,7 @@ go build ./cmd/bintrail
 `make build-console` builds the `bintrail-console` web-console binary.
 
 > macOS binaries and a Homebrew tap are tracked in
-> [#349](https://github.com/dbtrail/bintrail/issues/349) — today the
+> [#349](https://github.com/dbtrail/dbtrail/issues/349) — today the
 > supported paths on macOS are Docker (works great on Apple Silicon) and
 > `go install`/source builds.
 

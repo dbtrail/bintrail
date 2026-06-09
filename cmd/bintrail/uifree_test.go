@@ -19,11 +19,11 @@ import (
 // cwd, and the module path resolves identically from anywhere.
 func TestCoreBinaryIsUIFree(t *testing.T) {
 	out, err := exec.Command("go", "list", "-deps",
-		"github.com/dbtrail/bintrail/cmd/bintrail").CombinedOutput()
+		"github.com/dbtrail/dbtrail/cmd/bintrail").CombinedOutput()
 	if err != nil {
 		t.Fatalf("go list -deps: %v\n%s", err, out)
 	}
-	const banned = "github.com/dbtrail/bintrail/internal/console"
+	const banned = "github.com/dbtrail/dbtrail/internal/console"
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		// Exact match or a subpackage — never a substring (avoids false
 		// positives while still catching a future internal/console/dto).

@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/baseline"
-	"github.com/dbtrail/bintrail/internal/storage"
+	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 // payloadColumns defines the Parquet schema for BYOS payload files.

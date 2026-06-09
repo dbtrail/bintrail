@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/baseline"
 )
 
 // TestMydumperWriter_singleChunk covers the happy path: a few rows that all

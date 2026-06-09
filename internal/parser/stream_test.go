@@ -8,7 +8,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
-	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

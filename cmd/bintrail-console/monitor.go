@@ -12,13 +12,13 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/console"
-	"github.com/dbtrail/bintrail/internal/doctor"
-	"github.com/dbtrail/bintrail/internal/indexer"
-	"github.com/dbtrail/bintrail/internal/serverid"
-	"github.com/dbtrail/bintrail/internal/streamdeps"
-	"github.com/dbtrail/bintrail/internal/streamrun"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/doctor"
+	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/serverid"
+	"github.com/dbtrail/dbtrail/internal/streamdeps"
+	"github.com/dbtrail/dbtrail/internal/streamrun"
 )
 
 // monitorSupervisor is the control plane behind `bintrail up --console`: it

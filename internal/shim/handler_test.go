@@ -19,9 +19,9 @@ import (
 	"github.com/go-mysql-org/go-mysql/server"
 	_ "github.com/go-sql-driver/mysql" // database/sql driver registration
 
-	"github.com/dbtrail/bintrail/internal/metadata"
-	"github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // TestHandlerHandshakeNoise verifies the small allow-list for queries

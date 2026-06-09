@@ -13,7 +13,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/config"
 )
 
 // testConnectTimeout is the dial timeout injected into test-connection probes

@@ -108,7 +108,7 @@ nfpms:
       - bintrail
       - bintrail-mcp
     vendor: dbtrail
-    homepage: https://github.com/dbtrail/bintrail
+    homepage: https://github.com/dbtrail/dbtrail
     maintainer: Daniel <daniel@dbtrail.com>
     description: >-
       Parse MySQL ROW-format binary logs, index every row event with full
@@ -128,7 +128,7 @@ nfpms:
     ids:
       - bintrail-console
     vendor: dbtrail
-    homepage: https://github.com/dbtrail/bintrail
+    homepage: https://github.com/dbtrail/dbtrail
     maintainer: Daniel <daniel@dbtrail.com>
     description: >-
       Web console for the bintrail binlog index — read-only event browser,
@@ -167,7 +167,7 @@ dockers:
       - "--label=org.opencontainers.image.version={{ .Version }}"
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
-      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
+      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/dbtrail"
       - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
   - id: bintrail-arm64
@@ -186,7 +186,7 @@ dockers:
       - "--label=org.opencontainers.image.version={{ .Version }}"
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
-      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
+      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/dbtrail"
       - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
   # bintrail-console: its own single-binary image (PMM-style split — the
@@ -206,7 +206,7 @@ dockers:
       - "--label=org.opencontainers.image.version={{ .Version }}"
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
-      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
+      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/dbtrail"
       - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
   - id: bintrail-console-arm64
@@ -224,7 +224,7 @@ dockers:
       - "--label=org.opencontainers.image.version={{ .Version }}"
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
-      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
+      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/dbtrail"
       - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
 docker_manifests:
@@ -267,7 +267,7 @@ docker_manifests:
 #       owner: dbtrail
 #       name: homebrew-tap
 #       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-#     homepage: https://github.com/dbtrail/bintrail
+#     homepage: https://github.com/dbtrail/dbtrail
 #     description: MySQL binlog time-travel — index row events and generate reversal SQL.
 #     license: Apache-2.0
 #     install: |

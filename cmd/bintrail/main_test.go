@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/agent"
+	"github.com/dbtrail/dbtrail/internal/agent"
 )
 
 func TestExitCodeFor(t *testing.T) {

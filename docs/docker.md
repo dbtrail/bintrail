@@ -51,7 +51,7 @@ The images and the release checksums are signed with [cosign](https://github.com
 
 ```bash
 cosign verify ghcr.io/dbtrail/bintrail:latest \
-  --certificate-identity-regexp "https://github.com/dbtrail/bintrail/.*" \
+  --certificate-identity-regexp "https://github.com/dbtrail/dbtrail/.*" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```
 
@@ -128,7 +128,7 @@ No clone, no config — the compose file is self-contained and the servers
 to watch are added from the console UI afterwards:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/dbtrail/bintrail/main/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
 docker compose up -d
 docker compose logs -f bintrail
 ```

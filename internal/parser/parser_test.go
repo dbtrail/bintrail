@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // ─── EventType wire-contract pin ──────────────────────────────────────────────

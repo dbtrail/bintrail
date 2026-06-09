@@ -5,7 +5,7 @@ package indexer
 import (
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 func TestCreateBinlogEventsTable(t *testing.T) {

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/config"
 	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	yaml "go.yaml.in/yaml/v2"

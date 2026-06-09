@@ -9,7 +9,7 @@ Scope check (see SUPPORT.md): bintrail owns its schema, tooling, console,
 and images. The OPERATION of your index MySQL server — sizing, backups,
 disk-full, upgrades, corruption, managed-flavor quirks — is the operator's
 responsibility and out of scope here:
-https://github.com/dbtrail/bintrail/blob/main/SUPPORT.md
+https://github.com/dbtrail/dbtrail/blob/main/SUPPORT.md
 -->
 
 **What happened**

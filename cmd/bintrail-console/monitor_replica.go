@@ -9,9 +9,9 @@ import (
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/console"
-	"github.com/dbtrail/bintrail/internal/streamrun"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/streamrun"
 )
 
 // Replica / duplicate detection (#402): adding a replica of an already-

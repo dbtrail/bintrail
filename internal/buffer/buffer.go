@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // idOffset is added to buffer-local auto-increment IDs to avoid collisions

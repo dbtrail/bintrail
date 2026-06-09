@@ -112,4 +112,4 @@ Roughly in order of impact-to-effort ratio:
 4. **Helm chart for sidecar deployment** under Percona Operator and the official MySQL Operator. Makes "Bintrail = a feature of my operator-managed MySQL" a true statement.
 5. **PMM dashboard** that consumes bintrail's Prometheus metrics and surfaces coverage, gaps, retention horizon, and recovery readiness as panels DBAs already look at.
 
-If you want to follow along, the work is happening in [github.com/dbtrail/bintrail](https://github.com/dbtrail/bintrail). The shorter the quickstart, the better the project — and I think there's still room to halve it again.
+If you want to follow along, the work is happening in [github.com/dbtrail/dbtrail](https://github.com/dbtrail/dbtrail). The shorter the quickstart, the better the project — and I think there's still room to halve it again.

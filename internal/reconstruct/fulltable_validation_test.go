@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/baseline"
-	"github.com/dbtrail/bintrail/internal/metadata"
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // TestReconstructTables_validationErrors covers the pre-DB-connect guards in

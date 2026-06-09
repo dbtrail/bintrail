@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/recovery"
+	"github.com/dbtrail/dbtrail/internal/recovery"
 )
 
 // ErrWriterClosed is returned from MydumperWriter methods called after Close.

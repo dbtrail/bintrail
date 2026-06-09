@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/console"
-	"github.com/dbtrail/bintrail/internal/streamrun"
+	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/streamrun"
 )
 
 // ─── built-in rotation DSN provider (#420) ───────────────────────────────────

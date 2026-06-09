@@ -1,7 +1,7 @@
 blank_issues_enabled: true
 contact_links:
   - name: Support scope — what bintrail does and does not own
-    url: https://github.com/dbtrail/bintrail/blob/main/SUPPORT.md
+    url: https://github.com/dbtrail/dbtrail/blob/main/SUPPORT.md
     about: >-
       Bintrail installs only its schema — the index MySQL server's operation
       (sizing, backups, disk-full, upgrades, corruption) is the operator's.

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 // ParseEventType converts an event-type string to a *parser.EventType.

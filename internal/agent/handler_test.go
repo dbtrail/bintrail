@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/buffer"
-	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/buffer"
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 // makeRecoverEvent builds a single INSERT-style parser.Event for the buffer.

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 func TestRun_singleBatch(t *testing.T) {

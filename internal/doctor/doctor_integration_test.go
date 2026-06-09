@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 // TestIndexChecksWithAbsentDatabase covers #384 end-to-end against a real

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/indexer"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 // ─── hasPendingS3Upload ──────────────────────────────────────────────────────

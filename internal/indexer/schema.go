@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/serverid"
+	"github.com/dbtrail/dbtrail/internal/serverid"
 )
 
 // CreateIndexTables creates every index table (idempotent — all DDL is

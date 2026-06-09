@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/doctor"
+	"github.com/dbtrail/dbtrail/internal/doctor"
 )
 
 func TestParseDocRetain(t *testing.T) {

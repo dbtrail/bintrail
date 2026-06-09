@@ -20,7 +20,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 // SourceIdentity describes the source MySQL server that produced an event.

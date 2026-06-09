@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/console"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 // waitStreamLive proves the supervised stream is attached and past its

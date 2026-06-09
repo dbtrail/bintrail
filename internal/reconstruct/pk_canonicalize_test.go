@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // colMeta is a small helper to build a metadata.ColumnMeta for test tables.

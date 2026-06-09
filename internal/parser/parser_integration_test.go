@@ -16,10 +16,10 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 	drivermysql "github.com/go-sql-driver/mysql"
 
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/metadata"
-	"github.com/dbtrail/bintrail/internal/parser"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

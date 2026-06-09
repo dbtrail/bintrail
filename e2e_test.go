@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 // TestEndToEnd_fullPipeline exercises the bintrail binary through all commands:

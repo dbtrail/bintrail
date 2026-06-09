@@ -7,7 +7,7 @@ import (
 
 	"github.com/parquet-go/parquet-go"
 
-	"github.com/dbtrail/bintrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/baseline"
 )
 
 func TestBinlogEventColumns_count(t *testing.T) {

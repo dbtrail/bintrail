@@ -11,7 +11,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/indexer"
 )
 
 // The capacity check measures the index's recent write rate from

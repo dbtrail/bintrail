@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/bintrail/internal/agent"
-	"github.com/dbtrail/bintrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/agent"
+	"github.com/dbtrail/dbtrail/internal/observe"
 )
 
 var (

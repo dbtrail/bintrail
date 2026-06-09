@@ -16,10 +16,10 @@ import (
 	"github.com/parquet-go/parquet-go"
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/bintrail/internal/archive"
-	"github.com/dbtrail/bintrail/internal/cliutil"
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/storage"
+	"github.com/dbtrail/dbtrail/internal/archive"
+	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 // archiveCmd is the parent for archive-maintenance subcommands (the

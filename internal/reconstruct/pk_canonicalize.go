@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // canonicalizePKValue normalizes a raw Go value scanned from a baseline

@@ -1,6 +1,6 @@
 [Unit]
 Description=Bintrail Agent - MySQL binlog streaming to dbtrail
-Documentation=https://github.com/dbtrail/bintrail
+Documentation=https://github.com/dbtrail/dbtrail
 After=network-online.target
 Wants=network-online.target
 

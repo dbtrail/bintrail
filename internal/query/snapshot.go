@@ -18,7 +18,7 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 
-	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 // snapshotEventIDBase is OR'd with the row index to synthesise a ResultRow

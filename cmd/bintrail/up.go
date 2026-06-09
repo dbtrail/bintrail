@@ -8,10 +8,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/bintrail/internal/cliutil"
-	"github.com/dbtrail/bintrail/internal/doctor"
-	"github.com/dbtrail/bintrail/internal/rotation"
-	"github.com/dbtrail/bintrail/internal/serverid"
+	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/doctor"
+	"github.com/dbtrail/dbtrail/internal/rotation"
+	"github.com/dbtrail/dbtrail/internal/serverid"
 )
 
 var upCmd = &cobra.Command{

@@ -12,8 +12,8 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
-	"github.com/dbtrail/bintrail/internal/indexer"
-	"github.com/dbtrail/bintrail/internal/testutil"
+	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
 // TestRunPointInTime_PlannerCoversCurrentHour pins issue #259: planner

@@ -12,7 +12,7 @@ import (
 
 	mysql "github.com/go-sql-driver/mysql"
 
-	"github.com/dbtrail/bintrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 // Indexer consumes parser.Events from a channel and batch-inserts them into

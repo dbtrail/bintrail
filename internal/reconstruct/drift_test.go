@@ -3,7 +3,7 @@ package reconstruct
 import (
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // TestApplyEvent_driftRowPreservesState pins the dbtrail/bintrail#318 guard:

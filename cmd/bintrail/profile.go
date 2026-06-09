@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/config"
 )
 
 // ─── Parent command ───────────────────────────────────────────────────────────

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dbtrail/bintrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/baseline"
 )
 
 // TestReadBaselineRow_TemporalPKUnderNonUTCHost is the discriminating test for
