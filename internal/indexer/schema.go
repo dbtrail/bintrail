@@ -21,7 +21,7 @@ func CreateIndexTables(ctx context.Context, db *sql.DB, partitions int, encrypt 
 	}
 
 	// Create binlog_events with dynamic hourly partitions.
-	if err := CreateBinlogEventsTable(db, partitions, encrypt); err != nil {
+	if err := createBinlogEventsTable(db, partitions, encrypt); err != nil {
 		return fmt.Errorf("failed to create binlog_events: %w", err)
 	}
 	logTable("binlog_events")
@@ -130,7 +130,7 @@ func buildBinlogEventsDDL(parts []string, encrypt bool) string {
 )`
 }
 
-// CreateBinlogEventsTable generates the CREATE TABLE with N hourly partitions
+// createBinlogEventsTable generates the CREATE TABLE with N hourly partitions
 // spanning from the current hour (UTC) forward through the next N-1 hours, plus
 // a p_future catch-all partition for any events arriving beyond that range.
 //
@@ -138,7 +138,7 @@ func buildBinlogEventsDDL(parts []string, encrypt bool) string {
 // is less than TO_SECONDS of the following hour (timezone-independent).
 // When encrypt is true, ENCRYPTION='Y' is added to enable InnoDB tablespace
 // encryption (requires a keyring plugin on the MySQL server).
-func CreateBinlogEventsTable(db *sql.DB, numPartitions int, encrypt bool) error {
+func createBinlogEventsTable(db *sql.DB, numPartitions int, encrypt bool) error {
 	parts := buildPartitionDefs(time.Now(), numPartitions)
 	ddl := buildBinlogEventsDDL(parts, encrypt)
 	_, err := db.Exec(ddl)

@@ -210,8 +210,8 @@ func TestLoadPartitionStats(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
 	// Create table with 3 daily partitions + p_future.
-	if err := indexer.CreateBinlogEventsTable(db, 3, false); err != nil {
-		t.Fatalf("indexer.CreateBinlogEventsTable failed: %v", err)
+	if err := indexer.CreateIndexTables(context.Background(), db, 3, false, nil); err != nil {
+		t.Fatalf("indexer.CreateIndexTables failed: %v", err)
 	}
 
 	stats, err := status.LoadPartitionStats(context.Background(), db, dbName)
@@ -270,35 +270,13 @@ func TestEnsureDatabase(t *testing.T) {
 	}
 }
 
-// ─── indexer.CreateBinlogEventsTable ─────────────────────────────────────────────────────────────
-
-func TestCreateBinlogEventsTable(t *testing.T) {
-	db, dbName := testutil.CreateTestDB(t)
-
-	if err := indexer.CreateBinlogEventsTable(db, 3, false); err != nil {
-		t.Fatalf("indexer.CreateBinlogEventsTable failed: %v", err)
-	}
-
-	// Verify the table has 4 partitions (3 hourly + p_future).
-	var count int
-	if err := db.QueryRow(`
-		SELECT COUNT(*) FROM information_schema.PARTITIONS
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events'`,
-		dbName).Scan(&count); err != nil {
-		t.Fatalf("query partitions failed: %v", err)
-	}
-	if count != 4 {
-		t.Errorf("expected 4 partitions, got %d", count)
-	}
-}
-
 // ─── listPartitions ──────────────────────────────────────────────────────────────────
 
 func TestListPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
-	if err := indexer.CreateBinlogEventsTable(db, 3, false); err != nil {
-		t.Fatalf("indexer.CreateBinlogEventsTable failed: %v", err)
+	if err := indexer.CreateIndexTables(context.Background(), db, 3, false, nil); err != nil {
+		t.Fatalf("indexer.CreateIndexTables failed: %v", err)
 	}
 
 	parts, err := listPartitions(context.Background(), db, dbName)
@@ -328,8 +306,8 @@ func TestListPartitions(t *testing.T) {
 func TestDropPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
-	if err := indexer.CreateBinlogEventsTable(db, 5, false); err != nil {
-		t.Fatalf("indexer.CreateBinlogEventsTable failed: %v", err)
+	if err := indexer.CreateIndexTables(context.Background(), db, 5, false, nil); err != nil {
+		t.Fatalf("indexer.CreateIndexTables failed: %v", err)
 	}
 
 	// List the first partition to drop.
