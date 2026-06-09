@@ -211,7 +211,7 @@ func TestLoadPartitionStats(t *testing.T) {
 
 	// Create table with 3 daily partitions + p_future.
 	if err := indexer.CreateBinlogEventsTable(db, 3, false); err != nil {
-		t.Fatalf("createBinlogEventsTable failed: %v", err)
+		t.Fatalf("indexer.CreateBinlogEventsTable failed: %v", err)
 	}
 
 	stats, err := status.LoadPartitionStats(context.Background(), db, dbName)
@@ -234,7 +234,7 @@ func TestLoadPartitionStats(t *testing.T) {
 	}
 }
 
-// ─── ensureDatabase ────────────────────────────────────────────────────────────────
+// ─── indexer.EnsureDatabase ────────────────────────────────────────────────────────────────
 
 func TestEnsureDatabase(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
@@ -255,7 +255,7 @@ func TestEnsureDatabase(t *testing.T) {
 	})
 
 	if err := indexer.EnsureDatabase(cfg, dbName, nil); err != nil {
-		t.Fatalf("ensureDatabase failed: %v", err)
+		t.Fatalf("indexer.EnsureDatabase failed: %v", err)
 	}
 
 	// Verify database exists.
@@ -270,13 +270,13 @@ func TestEnsureDatabase(t *testing.T) {
 	}
 }
 
-// ─── createBinlogEventsTable ─────────────────────────────────────────────────────────────
+// ─── indexer.CreateBinlogEventsTable ─────────────────────────────────────────────────────────────
 
 func TestCreateBinlogEventsTable(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
 	if err := indexer.CreateBinlogEventsTable(db, 3, false); err != nil {
-		t.Fatalf("createBinlogEventsTable failed: %v", err)
+		t.Fatalf("indexer.CreateBinlogEventsTable failed: %v", err)
 	}
 
 	// Verify the table has 4 partitions (3 hourly + p_future).
@@ -298,7 +298,7 @@ func TestListPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
 	if err := indexer.CreateBinlogEventsTable(db, 3, false); err != nil {
-		t.Fatalf("createBinlogEventsTable failed: %v", err)
+		t.Fatalf("indexer.CreateBinlogEventsTable failed: %v", err)
 	}
 
 	parts, err := listPartitions(context.Background(), db, dbName)
@@ -329,7 +329,7 @@ func TestDropPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
 	if err := indexer.CreateBinlogEventsTable(db, 5, false); err != nil {
-		t.Fatalf("createBinlogEventsTable failed: %v", err)
+		t.Fatalf("indexer.CreateBinlogEventsTable failed: %v", err)
 	}
 
 	// List the first partition to drop.

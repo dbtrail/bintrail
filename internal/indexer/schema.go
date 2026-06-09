@@ -67,7 +67,7 @@ func CreateIndexTables(ctx context.Context, db *sql.DB, partitions int, encrypt 
 	return nil
 }
 
-// buildPartitionDefs returns numPartitions hourly partition clauses ending at
+// buildPartitionDefs returns numPartitions hourly partition clauses starting at
 // the current hour (truncated from now), followed by a p_future catch-all.
 //
 // Partitions span forward from the current hour so that incoming events
@@ -131,8 +131,8 @@ func buildBinlogEventsDDL(parts []string, encrypt bool) string {
 }
 
 // CreateBinlogEventsTable generates the CREATE TABLE with N hourly partitions
-// spanning from (N-1) hours ago to the current hour (UTC), plus a p_future
-// catch-all partition for any events arriving in subsequent hours.
+// spanning from the current hour (UTC) forward through the next N-1 hours, plus
+// a p_future catch-all partition for any events arriving beyond that range.
 //
 // Each partition p_YYYYMMDDHH covers events where TO_SECONDS(event_timestamp)
 // is less than TO_SECONDS of the following hour (timezone-independent).
