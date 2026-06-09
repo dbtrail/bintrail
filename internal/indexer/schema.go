@@ -11,6 +11,10 @@ import (
 	"github.com/dbtrail/bintrail/internal/serverid"
 )
 
+// CreateIndexTables creates every index table (idempotent — all DDL is
+// CREATE TABLE IF NOT EXISTS). Shared by `bintrail init` and the control-plane
+// supervisor, which provisions a per-source index database with the same set.
+// logTable is invoked per table for progress output; nil is allowed (no output).
 func CreateIndexTables(ctx context.Context, db *sql.DB, partitions int, encrypt bool, logTable func(string)) error {
 	if logTable == nil {
 		logTable = func(string) {}
@@ -126,7 +130,7 @@ func buildBinlogEventsDDL(parts []string, encrypt bool) string {
 )`
 }
 
-// createBinlogEventsTable generates the CREATE TABLE with N hourly partitions
+// CreateBinlogEventsTable generates the CREATE TABLE with N hourly partitions
 // spanning from (N-1) hours ago to the current hour (UTC), plus a p_future
 // catch-all partition for any events arriving in subsequent hours.
 //

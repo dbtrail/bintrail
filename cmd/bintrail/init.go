@@ -344,11 +344,3 @@ func s3Instructions(bucket, region string) string {
 
 	return sb.String()
 }
-
-// ensureDatabase creates the target database if it does not already exist.
-// It connects without a database name so the CREATE DATABASE always succeeds.
-// createIndexTables creates every index table (idempotent — all DDL is
-// CREATE TABLE IF NOT EXISTS). Shared by `bintrail init` and the
-// control-plane supervisor, which provisions a per-source index database with
-// the same set. logTable is invoked per table for progress output; nil is
-// allowed (no output).

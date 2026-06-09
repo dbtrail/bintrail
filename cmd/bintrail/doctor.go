@@ -142,8 +142,8 @@ func isUnknownDatabaseErr(err error) bool {
 }
 
 // connectWithoutDB reconnects to the DSN's server with the database name
-// stripped (the same DBName="" + FormatDSN pattern as init.go's
-// ensureDatabase, but routed through config.Connect to keep parseTime and
+// stripped (the same DBName="" + FormatDSN pattern as
+// indexer.EnsureDatabase, but routed through config.Connect to keep parseTime and
 // the connect timeout), for checks that must run before the index database
 // exists.
 func connectWithoutDB(dsn string) (*sql.DB, error) {
