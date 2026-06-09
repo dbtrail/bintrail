@@ -181,10 +181,11 @@ The script is wrapped in `BEGIN`/`COMMIT` and reverses events in reverse chronol
 
 ## Step 5½ — Or do steps 4–5 from a browser
 
-Steps 4 and 5 (query + recover) are also available as a read-only web UI — same binary, no extra setup:
+Steps 4 and 5 (query + recover) are also available as a read-only web UI,
+served by the companion `bintrail-console` binary (same release archive):
 
 ```sh
-bintrail console --index-dsn "$IDX"
+bintrail-console serve --index-dsn "$IDX"
 ```
 
 It prints a tokenized loopback URL; open it in a browser:
@@ -271,7 +272,7 @@ bintrail rotate        ← run hourly to drop old partitions and stay clean
 bintrail status        ← check at any time
 ```
 
-> Prefer clicking to typing? `bintrail console` exposes the query + recover steps as a read-only web UI.
+> Prefer clicking to typing? `bintrail-console serve` exposes the query + recover steps as a read-only web UI.
 
 ---
 

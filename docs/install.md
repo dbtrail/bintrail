@@ -18,7 +18,7 @@ it's the first section — the same four lines as the README.
 ## Docker Compose (the bundled default)
 
 One file, zero config — an index MySQL (persisted in a volume) and
-`bintrail up --console` in source-less daemon mode: the console plus the
+`bintrail-console watch` in source-less daemon mode: the console plus the
 control plane, waiting for you to add servers from the UI:
 
 ```sh
@@ -30,7 +30,7 @@ docker compose logs -f bintrail
 The logs print the console URL with its access token:
 
 ```
-Console (read-only) is running. Open:
+Console is running — open it and add the MySQL servers to watch:
 
     http://127.0.0.1:8090/?token=ab12cd34…
 ```
@@ -97,9 +97,11 @@ docker run --rm ghcr.io/dbtrail/bintrail:latest --version
 ```
 
 Multi-arch (`linux/amd64` + `linux/arm64`), signed with cosign, SBOM attached
-to every release. The image bundles both `bintrail` and `bintrail-mcp`. See
-[docker.md](./docker.md) for signature verification, `docker run` recipes,
-and the long-running stream container.
+to every release. The image bundles both `bintrail` and `bintrail-mcp`; the
+web console ships as its own image, `ghcr.io/dbtrail/bintrail-console`
+(`serve` = read-only console, `watch` = stream + console daemon — what the
+Compose stack runs). See [docker.md](./docker.md) for signature verification,
+`docker run` recipes, and the long-running stream container.
 
 ## Linux packages
 
@@ -117,6 +119,10 @@ sudo rpm -i bintrail_VERSION_linux_amd64.rpm
 
 (Replace `VERSION` with the release version; `checksums.txt` is cosign-signed.)
 
+The `bintrail` package carries the core CLI + `bintrail-mcp`; the web console
+is a separate `bintrail-console` package — install it only where an operator
+wants the UI.
+
 ## Go install
 
 ```sh
@@ -133,7 +139,8 @@ cd bintrail
 go build ./cmd/bintrail
 ```
 
-`make build` builds both `bintrail` and `bintrail-mcp` with version metadata.
+`make build` builds both `bintrail` and `bintrail-mcp` with version metadata;
+`make build-console` builds the `bintrail-console` web-console binary.
 
 > macOS binaries and a Homebrew tap are tracked in
 > [#349](https://github.com/dbtrail/bintrail/issues/349) — today the
@@ -158,8 +165,9 @@ bintrail up \
 
 `bintrail up` runs preflight + creates index tables + auto-snapshots + starts
 streaming, all in one. It resumes from the last checkpoint on restart and
-auto-derives a unique `server-id` from your source DSN. Add `--console` to
-serve the web UI from the same process.
+auto-derives a unique `server-id` from your source DSN. Want the web UI in
+the same process? Run `bintrail-console watch` (same flags) instead — it is
+`up` plus the console and the multi-server control plane.
 
 Once it's running, query and recover:
 
@@ -217,7 +225,6 @@ For cron, systemd units, and Ansible recipes, see [deployment.md](./deployment.m
 | `stream` | Connect as a replica and index row events in real-time |
 | `query` | Search the index with flexible filters (schema, table, PK, time range, GTID) |
 | `recover` | Generate reversal SQL for matching events |
-| `console` | Serve a read-only web UI to browse changes and generate undo SQL from a browser |
 | `reconstruct` | Rebuild row state at a point in time from baselines + binlog events |
 | `rotate` | Drop old partitions, add new ones, optionally archive to Parquet |
 | `status` | Show indexed files, partition sizes, and event counts |
@@ -235,6 +242,10 @@ For cron, systemd units, and Ansible recipes, see [deployment.md](./deployment.m
 
 All commands accept `--log-level` (default `info`) and `--log-format`
 (default `text`). See each command's `--help` for flags and usage.
+
+The web console lives in the separate `bintrail-console` binary —
+`serve` (read-only UI over an index) and `watch` (stream + console +
+control plane in one daemon). See [console.md](./console.md).
 
 ## Appendix: agent exit codes
 

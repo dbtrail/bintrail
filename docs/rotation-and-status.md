@@ -412,7 +412,7 @@ bintrail recover
 
 ## Built-in Rotation in `bintrail up`
 
-`bintrail up` runs a built-in rotation loop **by default**: every hour it drops index partitions older than 30 days and keeps 3 future hourly partitions ready. It covers the boot index database *and* every per-source database the console control plane provisions (`bintrail_idx_<entry>`), so an unattended quickstart can never grow until the disk fills. The settings are announced loudly at boot.
+`bintrail up` runs a built-in rotation loop **by default**: every hour it drops index partitions older than 30 days and keeps 3 future hourly partitions ready, so an unattended quickstart can never grow until the disk fills. The settings are announced loudly at boot. Under `bintrail-console watch` (the stream + console daemon — same `--rotate-*` flags and env vars) the loop additionally covers every per-source database the console control plane provisions (`bintrail_idx_<entry>`).
 
 ```sh
 bintrail up ... --rotate-retain 90d        # keep more history

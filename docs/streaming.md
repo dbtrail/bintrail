@@ -326,7 +326,7 @@ When `--metrics-addr :9090` is set, a Prometheus HTTP endpoint starts at `/metri
 
 Every metric carries a `source` label so concurrent streams in one process stay
 distinguishable. For a standalone `bintrail stream` it is the server's resolved
-`bintrail_id` (`default` if unresolved); under `bintrail up --console` it is the
+`bintrail_id` (`default` if unresolved); under `bintrail-console watch` it is the
 monitored entry's ID, and the **daemon** serves one `/metrics` endpoint covering
 all supervised streams (per-stream endpoints would fight over the bind).
 

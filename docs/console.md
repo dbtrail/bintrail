@@ -1,10 +1,14 @@
-# bintrail console
+# bintrail-console
 
-`bintrail console` serves an embedded, **read-only, single-operator** web UI over
-an existing index. It is the MCP server with a web face: the same query,
+`bintrail-console serve` serves an embedded, **read-only, single-operator** web
+UI over an existing index. It is the MCP server with a web face: the same query,
 recovery, and status engines, reached from a browser. Browse indexed row events
 with full before/after diffs, and generate recovery (undo) SQL — all without
 leaving the terminal that started it.
+
+The console ships as its own binary (and Docker image,
+`ghcr.io/dbtrail/bintrail-console`), separate from the core `bintrail` CLI —
+install it only where an operator wants the UI.
 
 The console **never executes SQL**. Recover produces a transaction-wrapped
 script you copy or download and apply yourself after review, exactly like
@@ -18,7 +22,7 @@ script you copy or download and apply yourself after review, exactly like
 ## Usage
 
 ```sh
-bintrail console --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
+bintrail-console serve --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 ```
 
 On start it prints a jupyter-style URL with an access token:
@@ -29,10 +33,13 @@ Bintrail console (read-only) is running. Open:
     http://127.0.0.1:8090/?token=ab12cd34ef56ab12cd34ef56ab12cd34
 ```
 
-Or serve it **alongside a live stream** in one process with `bintrail up --console`:
+Or serve it **alongside a live stream** in one process with
+`bintrail-console watch` (the daemon formerly known as `bintrail up
+--console` — `up`'s preflight + init + stream plus the console and the
+multi-server control plane):
 
 ```sh
-bintrail up --source-dsn "$SRC" --index-dsn "$IDX" --console
+bintrail-console watch --source-dsn "$SRC" --index-dsn "$IDX"
 ```
 
 `--console-listen` / `--console-token` (or `BINTRAIL_CONSOLE_LISTEN` /
@@ -43,12 +50,12 @@ the baseline-gated Time-travel surface here too, so one process serves the live
 stream **and** point-in-time reconstruct:
 
 ```sh
-bintrail up --source-dsn "$SRC" --index-dsn "$IDX" --console --baseline-dir /var/bintrail/baselines
+bintrail-console watch --source-dsn "$SRC" --index-dsn "$IDX" --baseline-dir /var/bintrail/baselines
 ```
 
-With an S3 baseline (`--baseline-s3`), the `up` process reads S3 at request
+With an S3 baseline (`--baseline-s3`), the `watch` process reads S3 at request
 time using the ambient AWS credential chain — same as the standalone console,
-but note `up` didn't need AWS credentials before.
+but note the plain stream daemon didn't need AWS credentials before.
 
 Open that URL in a browser. A left **sidebar** groups the views (Time-travel
 appears only when a baseline is configured), with a **server switcher** at the
@@ -85,11 +92,12 @@ between them. The registry is a **local YAML file on the console host**
 (`~/.config/bintrail/console-servers.yaml` by default, override with
 `--servers-file` / `BINTRAIL_CONSOLE_SERVERS`) — adding a server registers a
 connection for browsing; it does **not** start monitoring. Monitoring still
-starts with `bintrail up` / `stream` against that server, as always.
+starts with `bintrail up` / `stream` against that server (or from the UI
+under `watch` — see the control plane below).
 
 How it behaves:
 
-- **The command-line entry.** `--index-dsn` (or `up --console`'s stream index)
+- **The command-line entry.** `--index-dsn` (or `watch`'s stream index)
   appears as an ephemeral `default (cli)` entry: it is the initial selection,
   is never written to the registry file, and cannot be edited or deleted from
   the UI. With at least one saved server, `--index-dsn` becomes optional — the
@@ -132,7 +140,7 @@ rewritten lossily.
 
 ### Monitoring a source from the UI (the control plane)
 
-Under **`bintrail up --console`** — and only there — the console is also a
+Under **`bintrail-console watch`** — and only there — the console is also a
 control plane: "+ Add server" with a **source MySQL** (host/user/password,
 optional schema filter) runs the `bintrail doctor` preflight inline
 (failures come back as remediation cards), provisions a dedicated index
@@ -176,8 +184,8 @@ immediately; warnings (e.g. short binlog retention) show but don't block.
   same masking/keep-password discipline as the index DSN; `source_dsn: ""`
   clears it), `source_server_id` (0 = derived), `schemas`, `monitor_desired`.
 
-The standalone read-only `bintrail console` never offers any of this: the
-`monitor` capability is false and the verbs return 403 there.
+The standalone read-only `bintrail-console serve` never offers any of this:
+the `monitor` capability is false and the verbs return 403 there.
 
 ## Flags
 
@@ -203,7 +211,7 @@ The standalone read-only `bintrail console` never offers any of this: the
 - `BINTRAIL_CONSOLE_SERVERS` — same as `--servers-file`.
 
 Precedence is the usual CLI flag > environment variable > default. The five
-`BINTRAIL_CONSOLE_*` variables apply equally to `bintrail up --console` (where
+`BINTRAIL_CONSOLE_*` variables apply equally to `bintrail-console watch` (where
 the matching flags are `--console-listen`, `--console-token`, `--baseline-dir`,
 `--baseline-s3`, `--console-servers-file`).
 

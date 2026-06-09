@@ -9,7 +9,7 @@
 Bintrail is a Go CLI that parses MySQL ROW-format binary logs, indexes every row event into MySQL with full before/after images, and generates reversal SQL for recovery. The index is self-contained — recovery never requires the original binlog files.
 
 Module: `github.com/dbtrail/bintrail`
-Go version: 1.25.7 — uses `range N`, `min()`, `slices.Reverse`, `strings.SplitSeq`, `any` (not `interface{}`).
+Go version: 1.24.7 (go.mod; the source Dockerfiles pin golang:1.24.7-bookworm to match) — uses `range N`, `min()`, `slices.Reverse`, `strings.SplitSeq`, `any` (not `interface{}`).
 
 ## Project structure
 
@@ -21,6 +21,8 @@ cmd/bintrail/          # One file per command (init, snapshot, index, query, rec
 cmd/bintrail-console/  # Standalone web-console binary (decouple PR-C/PR-D3): `serve` (read-only console, ex `bintrail console`) +
                        # `watch` (stream + console + control-plane supervisor in one daemon, ex `bintrail up --console`; monitor.go/
                        # monitor_replica.go = the supervisor, moved verbatim from cmd/bintrail). CGO (DuckDB via console→query→parquetquery).
+                       # Own image ghcr.io/dbtrail/bintrail-console (PR-E; Dockerfile.bintrail-console = source build, *.goreleaser = staged)
+                       # + separate bintrail-console deb/rpm; the root docker-compose.yml runs `bintrail-console watch` from it.
 cmd/bintrail-mcp/      # MCP server: main.go, proxy.py, tests
 internal/
   cliutil/             # Shared filter-parsing + output helpers: ParseEventType, ParseTime, IsValidFormat, IsValidOutputFormat, ParseSchemaList, BuildIndexFilters, OutputJSON

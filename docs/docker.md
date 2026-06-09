@@ -36,9 +36,16 @@ docker buildx build \
 Each tagged release publishes a multi-arch image (`linux/amd64` + `linux/arm64`) to GitHub Container Registry, so you don't need a Go toolchain or a local build:
 
 ```bash
-docker pull ghcr.io/dbtrail/bintrail:latest        # latest release
-docker pull ghcr.io/dbtrail/bintrail:v0.7.12       # a specific version
+docker pull ghcr.io/dbtrail/bintrail:latest          # core CLI + MCP server
+docker pull ghcr.io/dbtrail/bintrail-console:latest  # web console (serve/watch)
+docker pull ghcr.io/dbtrail/bintrail:v0.7.12         # a specific version
 ```
+
+`bintrail-console` is its own image (and GHCR package — it needs the same
+one-time public-visibility flip described below): a single binary with
+entrypoint `bintrail-console`, used by the Compose quickstart to run `watch`.
+The cosign verification below applies to it equally
+(`cosign verify ghcr.io/dbtrail/bintrail-console:latest …`).
 
 The images and the release checksums are signed with [cosign](https://github.com/sigstore/cosign) (keyless, via GitHub OIDC). Verify an image before running it:
 
@@ -109,10 +116,11 @@ docker run -d \
 ## Docker Compose
 
 The `docker-compose.yml` at the repository root is the zero-friction setup:
-an index MySQL (persisted in a named volume) plus `bintrail up --console` —
+an index MySQL (persisted in a named volume) plus `bintrail-console watch` —
 preflight checks, index tables, automatic schema snapshot, the live binlog
 stream, **and the web console**, in one `up -d`. It pulls the published
-`ghcr.io/dbtrail/bintrail` image; no Go toolchain or local build needed.
+`ghcr.io/dbtrail/bintrail-console` image; no Go toolchain or local build
+needed.
 
 ### Quick start
 
@@ -133,7 +141,7 @@ source checkout, `cp .env.example .env` gives you the annotated template.)
 The logs print the console URL, access token included:
 
 ```
-Console (read-only) is running. Open:
+Console is running — open it and add the MySQL servers to watch:
 
     http://127.0.0.1:8090/?token=ab12cd34…
 ```
@@ -148,14 +156,14 @@ Notes:
   mapping to `"8090:8090"` and pin a stable `CONSOLE_TOKEN` in `.env`
   (without a pinned token a fresh one is generated per boot and printed in
   the logs).
-- `bintrail up` is idempotent: restarts resume the stream from its saved
-  checkpoint. The preflight (`doctor`) failing prints copy-pasteable
-  remediation in the logs and the container retries.
+- `bintrail-console watch` is idempotent: restarts resume the stream from
+  its saved checkpoint. The preflight (`doctor`) failing prints
+  copy-pasteable remediation in the logs and the container retries.
 - Saved console connections (the Servers menu) persist in the
   `bintrail-state` volume.
 - `BINTRAIL_TAG` in `.env` pins the image version (default `latest`);
   building from a source checkout instead is a comment-toggle in the
-  compose file (`build: .`).
+  compose file (`build:` with `dockerfile: Dockerfile.bintrail-console`).
 
 ### The bundled index MySQL 8.4
 
@@ -196,6 +204,16 @@ source's binlogs (the bundled index was always "volume loss = re-index").
 > dump/restore, not an in-place datadir upgrade), or point `INDEX_DSN` at a BYO
 > index instead.
 
+**Upgrading a compose stack from before the console split** — older
+`docker-compose.yml` files ran `bintrail up --console` from the
+`ghcr.io/dbtrail/bintrail` image. That flag no longer exists (the combined
+daemon is now `bintrail-console watch`, in its own image), so a
+`docker compose pull && up -d` on the OLD file crash-loops with
+`unknown flag: --console`. The fix is to re-download `docker-compose.yml`
+(the curl in the Quick start) — image and command changed, but your `.env`
+and all data volumes (`bintrail-index-data`, `bintrail-index-secret`,
+`bintrail-state`, including saved console servers) carry over unchanged.
+
 ### Connecting to an external index MySQL (bring your own)
 
 To run your own index instead of the bundled 8.4, set `INDEX_DSN` in `.env` to a MySQL 8.0+ you operate and
@@ -212,7 +230,7 @@ only the *bundled* index is 8.4.)
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `SOURCE_DSN` | compose (required) | DSN for the source MySQL database to watch |
+| `SOURCE_DSN` | compose (optional) | DSN for a source MySQL to start watching at boot (empty = add servers from the console UI) |
 | `INDEX_DSN` | compose (optional) | Bring-your-own index MySQL (default: the bundled container) |
 | `SCHEMAS` | compose (optional) | Comma-separated schemas to track (empty = all user schemas) |
 | `CONSOLE_TOKEN` | compose (optional) | Pin the console access token (default: generated per boot) |
@@ -220,8 +238,8 @@ only the *bundled* index is 8.4.)
 | `BINTRAIL_TAG` | compose (optional) | Image tag to run (default `latest`) |
 | `BINTRAIL_INDEX_DSN` | bintrail-mcp | Index DSN for the MCP server |
 
-(`SERVER_ID` is no longer needed — `bintrail up` derives a stable one from the
-source DSN.)
+(`SERVER_ID` is no longer needed — `bintrail-console watch` derives a stable
+one from the source DSN.)
 
 ## Image details
 
@@ -229,6 +247,12 @@ source DSN.)
 - **Binaries**: `/usr/local/bin/bintrail`, `/usr/local/bin/bintrail-mcp`
 - **Entrypoint**: `bintrail` (pass subcommands as arguments)
 - **No shell scripts or init systems** — the container runs a single binary
+
+The `ghcr.io/dbtrail/bintrail-console` image follows the same contract with
+one binary: entrypoint `bintrail-console`, uid 999 pinned (the compose secret
+volume is chowned to it), `/var/lib/bintrail` pre-created for the server
+registry. Build it from source with
+`docker build -f Dockerfile.bintrail-console -t bintrail-console .`
 
 ### Why not Alpine?
 

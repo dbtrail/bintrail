@@ -8,10 +8,11 @@
 # No .env needed. Optionally set SOURCE_DSN (start streaming one source
 # immediately) or CONSOLE_TOKEN (stable token across restarts) in a .env.
 #
-# What you get: a bundled MySQL 8.4 index (persisted in a volume), bintrail
-# running `up --console` against your source (preflight → index tables →
-# schema snapshot → live binlog stream → built-in rotation), and the web
-# console on http://127.0.0.1:8090 with the access token printed in the logs.
+# What you get: a bundled MySQL 8.4 index (persisted in a volume), the
+# `bintrail-console watch` daemon against your source (preflight → index
+# tables → schema snapshot → live binlog stream → built-in rotation), and the
+# web console on http://127.0.0.1:8090 with the access token printed in the
+# logs.
 #
 # === THE INDEX VOLUME IS YOUR SYSTEM OF RECORD ===
 # The bundled index holds the forensic record (binlog_events with full
@@ -48,7 +49,15 @@ services:
   # index MySQL and bintrail read it from the secret volume, so there is no
   # static default password on a volume holding the forensic record.
   index-init:
-    image: ghcr.io/dbtrail/bintrail:${BINTRAIL_TAG:-latest}
+    # Reuses the console image (already pulled for the main service below) —
+    # this step only needs a shell + od to seed the password file.
+    image: ghcr.io/dbtrail/bintrail-console:${BINTRAIL_TAG:-latest}
+    # Building from a source checkout instead? Uncomment here AND on the
+    # bintrail service below (keep the image: lines — `docker compose build`
+    # tags the local build with that name, so nothing is pulled):
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.bintrail-console
     # Runs as root: a freshly-created named volume is root-owned, and the
     # bintrail image otherwise runs as a non-root user that couldn't write it.
     # The secret is then chowned to uid 999 mode 0600 FOR the bintrail process
@@ -114,13 +123,17 @@ services:
     restart: unless-stopped
 
   # ── Bintrail: stream + web console ───────────────────────
-  # `bintrail up --console` = doctor preflight + init + auto-snapshot +
-  # binlog stream + built-in rotation + the read-only web console.
+  # `bintrail-console watch` = doctor preflight + init + auto-snapshot +
+  # binlog stream + built-in rotation + the read-only web console (the
+  # daemon formerly known as `bintrail up --console`).
   bintrail:
-    image: ghcr.io/dbtrail/bintrail:${BINTRAIL_TAG:-latest}
-    # Building from a source checkout instead? Comment the line above and
-    # uncomment:
-    # build: .
+    image: ghcr.io/dbtrail/bintrail-console:${BINTRAIL_TAG:-latest}
+    # Building from a source checkout instead? Uncomment here AND on
+    # index-init above (keep the image: lines — `docker compose build` tags
+    # the local build with that name, so nothing is pulled):
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.bintrail-console
     ports:
       # Console on the host loopback only. To reach it from another machine,
       # change to "8090:8090" AND set a stable CONSOLE_TOKEN in .env.
@@ -164,11 +177,11 @@ services:
           echo "Generated console token (set CONSOLE_TOKEN in .env to keep it stable across restarts)"
         fi
         if [ -n "$$SOURCE_DSN" ] && [ -n "$$SCHEMAS" ]; then
-          exec bintrail up --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN" --schemas "$$SCHEMAS" --console
+          exec bintrail-console watch --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN" --schemas "$$SCHEMAS"
         elif [ -n "$$SOURCE_DSN" ]; then
-          exec bintrail up --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN" --console
+          exec bintrail-console watch --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN"
         fi
-        exec bintrail up --index-dsn "$$INDEX_DSN" --console
+        exec bintrail-console watch --index-dsn "$$INDEX_DSN"
     depends_on:
       index-mysql:
         condition: service_healthy

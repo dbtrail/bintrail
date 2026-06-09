@@ -47,8 +47,9 @@ builds:
 
   # bintrail-console links DuckDB (console → query → parquetquery), so it is
   # CGO like the core binary — and uses the SAME main.* ldflags var names, so
-  # the version block mirrors bintrail's verbatim. Archives only for now; the
-  # Docker image and deb/rpm packaging land in a follow-up (decouple PR-E).
+  # the version block mirrors bintrail's verbatim. Ships in the release
+  # archives, as its own deb/rpm (nfpms below), and as its own image
+  # (ghcr.io/dbtrail/bintrail-console — dockers/docker_manifests below).
   - id: bintrail-console
     binary: bintrail-console
     main: ./cmd/bintrail-console
@@ -113,6 +114,26 @@ nfpms:
     dependencies:
       - ca-certificates
 
+  # Separate package, mirroring the binary split: the core CLI stays UI-free
+  # and the web console installs only where an operator wants it.
+  - id: bintrail-console
+    package_name: bintrail-console
+    ids:
+      - bintrail-console
+    vendor: dbtrail
+    homepage: https://github.com/dbtrail/bintrail
+    maintainer: Daniel <daniel@dbtrail.com>
+    description: >-
+      Web console for the bintrail binlog index — read-only event browser,
+      recovery SQL generation, and the combined stream+console watch daemon.
+    license: Apache-2.0
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    dependencies:
+      - ca-certificates
+
 # ── Docker images (multi-arch, published to GHCR) ──────────
 # One image per arch, then a manifest stitching them into a single
 # multi-arch tag. The arm64 image's RUN step executes under QEMU on the
@@ -161,6 +182,44 @@ dockers:
       - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
       - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
+  # bintrail-console: its own single-binary image (PMM-style split — the
+  # compose quickstart runs `bintrail-console watch` from this image).
+  - id: bintrail-console-amd64
+    goos: linux
+    goarch: amd64
+    ids:
+      - bintrail-console
+    dockerfile: Dockerfile.bintrail-console.goreleaser
+    use: buildx
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail-console:{{ .Version }}-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=bintrail-console"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+
+  - id: bintrail-console-arm64
+    goos: linux
+    goarch: arm64
+    ids:
+      - bintrail-console
+    dockerfile: Dockerfile.bintrail-console.goreleaser
+    use: buildx
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail-console:{{ .Version }}-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=bintrail-console"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/bintrail"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+
 docker_manifests:
   - name_template: "ghcr.io/dbtrail/bintrail:{{ .Version }}"
     image_templates:
@@ -175,6 +234,17 @@ docker_manifests:
     image_templates:
       - "ghcr.io/dbtrail/bintrail:{{ .Version }}-amd64"
       - "ghcr.io/dbtrail/bintrail:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/dbtrail/bintrail-console:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail-console:{{ .Version }}-amd64"
+      - "ghcr.io/dbtrail/bintrail-console:{{ .Version }}-arm64"
+  # skip_push: auto — same prerelease gating as the core image's :latest.
+  - name_template: "ghcr.io/dbtrail/bintrail-console:latest"
+    skip_push: "auto"
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail-console:{{ .Version }}-amd64"
+      - "ghcr.io/dbtrail/bintrail-console:{{ .Version }}-arm64"
 
 # ── Homebrew tap (DEFERRED — do not uncomment until prerequisites exist) ──
 # Requires BOTH:

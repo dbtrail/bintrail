@@ -1,0 +1,26 @@
+# GoReleaser-only Dockerfile for the bintrail-console image.
+#
+# Unlike Dockerfile.bintrail-console (which builds from source for
+# `docker build`), this image just copies the binary GoReleaser already
+# cross-compiled. The build context root contains `bintrail-console` for the
+# target arch — GoReleaser stages it there before invoking `docker build`.
+#
+# Runtime base matches Dockerfile.bintrail-console (debian:bookworm-slim):
+# glibc for DuckDB's static libs and a shell for debugging. One binary per
+# image (PMM-style) — the core CLI ships as ghcr.io/dbtrail/bintrail.
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    # Pin uid 999: the bundled compose chowns the index password secret to
+    # uid 999 (mode 0600) for this process to read — see docker-compose.yml.
+    useradd --system --no-create-home --uid 999 bintrail && \
+    # Writable state dir (console server registry, etc.) — a named volume
+    # mounted here inherits the ownership; the container runs as uid 999.
+    mkdir -p /var/lib/bintrail && chown bintrail /var/lib/bintrail
+
+COPY bintrail-console /usr/local/bin/bintrail-console
+
+USER bintrail
+ENTRYPOINT ["bintrail-console"]

@@ -1527,7 +1527,7 @@ async function init() {
   $all(".nav-item").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); pendingRecover = null; navigate(a.dataset.route); }));
   window.addEventListener("popstate", renderRoute);
 
-  if (!TOKEN) toast("No token in URL — open the link printed by `bintrail console`.");
+  if (!TOKEN) toast("No token in URL — open the link printed by `bintrail-console`.");
 
   // Startup order is load-bearing: servers (reconcile selection) → caps → route.
   let servers = [];

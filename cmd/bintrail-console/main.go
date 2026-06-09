@@ -8,7 +8,7 @@
 //
 //	bintrail-console serve --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 //
-// Configuration mirrors `bintrail console`: a .bintrail.env (or
+// Configuration mirrors the core CLI: a .bintrail.env (or
 // ~/.config/bintrail/config.env) file is loaded on startup and the
 // BINTRAIL_INDEX_DSN / BINTRAIL_CONSOLE_* env vars are honored with
 // flag > env > default precedence.
@@ -44,9 +44,10 @@ var rootCmd = &cobra.Command{
 browse indexed row events with full before/after diffs, generate recovery
 (undo) SQL, and run point-in-time reconstruct when baselines are configured.
 
-It is the standalone form of "bintrail console", shipped as its own binary so
-the core bintrail CLI carries no web UI. The console NEVER executes SQL;
-recover produces a script you review and apply yourself.`,
+It is the web console's own binary (formerly the core CLI's "console"
+command), shipped separately so the core bintrail CLI carries no web UI. The
+console NEVER executes SQL; recover produces a script you review and apply
+yourself.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		observe.Setup(os.Stderr, logFormat, logLevel)
 		return nil
