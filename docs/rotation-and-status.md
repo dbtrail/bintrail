@@ -66,7 +66,7 @@ The `--retain` flag accepts a duration: `7d` (days) or `24h` (hours). The comman
 
 1. Computes `cutoff = now - retain_duration` (truncated to the current hour UTC).
 2. Lists all partitions from `information_schema.PARTITIONS`.
-3. Parses the hour from each `p_YYYYMMDDHH` name (`p_future` is skipped automatically because `partitionDate` returns `false` for it).
+3. Parses the hour from each `p_YYYYMMDDHH` name (`p_future` is skipped automatically because `indexer.PartitionDate` returns `false` for it).
 4. Collects all partitions whose date is before the cutoff.
 5. Issues a single `ALTER TABLE binlog_events DROP PARTITION p1, p2, p3` statement.
 
@@ -111,12 +111,12 @@ REORGANIZE PARTITION p_future INTO (
 Two functions handle the hour ↔ name mapping:
 
 ```go
-// cmd/bintrail/rotate.go
-func partitionName(d time.Time) string {
+// internal/indexer/partitions.go (package indexer)
+func PartitionName(d time.Time) string {
     return d.UTC().Format("p_2006010215")  // Go reference time for YYYYMMDDHH
 }
 
-func partitionDate(name string) (time.Time, bool) {
+func PartitionDate(name string) (time.Time, bool) {
     if len(name) != 12 || !strings.HasPrefix(name, "p_") {
         return time.Time{}, false  // rejects p_future and anything malformed
     }
@@ -125,7 +125,7 @@ func partitionDate(name string) (time.Time, bool) {
 }
 ```
 
-These two functions round-trip correctly: `partitionName(partitionDate("p_2026021914"))` → `"p_2026021914"`. Tests in `rotate_test.go` verify this.
+These two functions round-trip correctly: `indexer.PartitionName(indexer.PartitionDate("p_2026021914"))` → `"p_2026021914"`. Tests in `internal/indexer/partitions_test.go` verify this.
 
 ---
 

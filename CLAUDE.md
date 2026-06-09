@@ -162,7 +162,7 @@ After `json.Unmarshal` into `map[string]any`, **all numbers are `float64`**. `fo
 Pipe-delimited with `|` → `\|` and `\` → `\\` escaping. See `BuildPKValues` in `parser/parser.go`.
 
 ### Partition management
-- `partitionName(d)` → `"p_YYYYMMDDHH"` (Go format `"p_2006010215"`); `partitionDate(name)` parses back.
+- `indexer.PartitionName(d)` → `"p_YYYYMMDDHH"` (Go format `"p_2006010215"`); `indexer.PartitionDate(name)` parses back.
 - Add: `REORGANIZE PARTITION p_future INTO (... new ..., PARTITION p_future VALUES LESS THAN MAXVALUE)`. **Never leave out p_future.**
 - Drop: `ALTER TABLE … DROP PARTITION p1, p2` — single statement.
 - `DescriptionToHuman`: `time.Unix(secs-62167219200, 0)` (since `TO_SECONDS('1970-01-01') = 62167219200`).
