@@ -117,10 +117,10 @@ func TestBuildMydumperArgs_lockAndTrx_unsupported(t *testing.T) {
 
 func TestParseMydumperVersion(t *testing.T) {
 	cases := []struct {
-		name                                string
-		output                              string
+		name                            string
+		output                          string
 		wantMajor, wantMinor, wantPatch int
-		wantErr                             bool
+		wantErr                         bool
 	}{
 		{
 			name:      "standard_0.10.0",

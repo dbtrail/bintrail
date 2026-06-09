@@ -51,24 +51,24 @@ Examples:
 }
 
 var (
-	rIndexDSN    string
-	rSchema      string
-	rTable       string
-	rPK          string
-	rPKs         []string
-	rLimitPerPK  int
-	rEventType   string
-	rGTID        string
-	rSince       string
-	rUntil       string
-	rFlag        string
-	rOutput      string
-	rDryRun      bool
-	rLimit       int
-	rProfile     string
-	rFormat      string
-	rNoArchive   bool
-	rColumnEq    []string
+	rIndexDSN   string
+	rSchema     string
+	rTable      string
+	rPK         string
+	rPKs        []string
+	rLimitPerPK int
+	rEventType  string
+	rGTID       string
+	rSince      string
+	rUntil      string
+	rFlag       string
+	rOutput     string
+	rDryRun     bool
+	rLimit      int
+	rProfile    string
+	rFormat     string
+	rNoArchive  bool
+	rColumnEq   []string
 )
 
 func init() {
@@ -234,7 +234,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 			slog.Info("recovery SQL generated",
 				"statements", n, "dry_run", true,
 				"duration_ms", time.Since(start).Milliseconds())
-			return outputJSON(struct {
+			return cliutil.OutputJSON(struct {
 				Statements int    `json:"statements"`
 				DryRun     bool   `json:"dry_run"`
 				SQL        string `json:"sql"`
@@ -278,7 +278,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		"duration_ms", time.Since(start).Milliseconds())
 
 	if rFormat == "json" {
-		return outputJSON(struct {
+		return cliutil.OutputJSON(struct {
 			Statements int    `json:"statements"`
 			DryRun     bool   `json:"dry_run"`
 			Output     string `json:"output"`

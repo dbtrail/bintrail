@@ -50,27 +50,27 @@ Examples:
 }
 
 var (
-	qIndexDSN    string
-	qSchema      string
-	qTable       string
-	qPK          string
-	qPKs         []string
-	qLimitPerPK  int
-	qEventType   string
-	qGTID        string
-	qSince       string
-	qUntil       string
-	qChangedCol  string
-	qColumnEq    []string
-	qFlag        string
-	qFormat      string
-	qLimit       int
-	qOrder       string
-	qArchiveDir  string
-	qArchiveS3   string
-	qBintrailID  string
-	qProfile     string
-	qNoArchive   bool
+	qIndexDSN        string
+	qSchema          string
+	qTable           string
+	qPK              string
+	qPKs             []string
+	qLimitPerPK      int
+	qEventType       string
+	qGTID            string
+	qSince           string
+	qUntil           string
+	qChangedCol      string
+	qColumnEq        []string
+	qFlag            string
+	qFormat          string
+	qLimit           int
+	qOrder           string
+	qArchiveDir      string
+	qArchiveS3       string
+	qBintrailID      string
+	qProfile         string
+	qNoArchive       bool
 	qIncludeSnapshot bool
 	qBaseline        string
 )
@@ -648,4 +648,3 @@ func archiveSources() []string {
 	}
 	return sources
 }
-

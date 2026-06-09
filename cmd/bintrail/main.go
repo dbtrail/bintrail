@@ -97,13 +97,6 @@ func exitCodeFor(reason agent.FatalReason) (int, string) {
 	}
 }
 
-// outputJSON encodes v as indented JSON to stdout.
-func outputJSON(v any) error {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
-}
-
 // wantsJSON reports whether the active command has a --format flag set to "json".
 func wantsJSON(root *cobra.Command) bool {
 	// CalledAs returns the command that was actually invoked.

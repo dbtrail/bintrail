@@ -405,9 +405,9 @@ func TestRunReconstruct_fullTableRoundTrip_varcharPK(t *testing.T) {
 	}
 
 	want := []tenant{
-		{"acme", "Acme Inc"},          // passthrough
-		{"foobar", "FooBar Renamed"},  // updated
-		{"newco", "NewCo"},            // new insert
+		{"acme", "Acme Inc"},         // passthrough
+		{"foobar", "FooBar Renamed"}, // updated
+		{"newco", "NewCo"},           // new insert
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d rows, want %d; got=%+v", len(got), len(want), got)

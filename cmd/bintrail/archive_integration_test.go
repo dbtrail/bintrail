@@ -91,10 +91,10 @@ func TestArchiveReconcileRebuild(t *testing.T) {
 	// The rebuilt row must look exactly like rotate's: same key, local
 	// path, real size, footer row_count, and NO phantom S3-pending state.
 	var (
-		localPath           sql.NullString
-		fileSize, rowCount  sql.NullInt64
-		s3Bucket            sql.NullString
-		s3UploadedAt        sql.NullTime
+		localPath          sql.NullString
+		fileSize, rowCount sql.NullInt64
+		s3Bucket           sql.NullString
+		s3UploadedAt       sql.NullTime
 	)
 	if err := db.QueryRowContext(ctx, `
 		SELECT local_path, file_size_bytes, row_count, s3_bucket, s3_uploaded_at

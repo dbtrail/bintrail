@@ -219,7 +219,7 @@ func TestGenerateShimYAMLContainsNoLegacyFields(t *testing.T) {
 // TestGenerateShimYAMLQuoting locks in the YAML single-quoted scalar
 // behavior: values are wrapped in single quotes, and any embedded single
 // quotes are doubled. Protects against DSNs containing ':', '#', '{',
-// '[', leading whitespace, or '\''.
+// '[', leading whitespace, or '\”.
 func TestGenerateShimYAMLQuoting(t *testing.T) {
 	tricky := "user:pass@tcp(h#ost:3306)/db's_name"
 	out := generateShimYAML(tricky, "1", ":3308")

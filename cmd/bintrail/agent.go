@@ -23,6 +23,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/agent"
 	"github.com/dbtrail/bintrail/internal/buffer"
 	"github.com/dbtrail/bintrail/internal/byos"
+	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/metadata"
@@ -570,19 +571,19 @@ func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer, fc
 	// Build schema resolver from the source DB's information_schema.
 	// The resolver maps column indices to names so the parser can produce
 	// named column maps (RowBefore, RowAfter) and identify PK columns.
-	resolver, err := buildResolverFromSource(sourceDB, parseSchemaList(agtSchemas))
+	resolver, err := buildResolverFromSource(sourceDB, cliutil.ParseSchemaList(agtSchemas))
 	if err != nil {
 		return fmt.Errorf("build schema resolver: %w", err)
 	}
 	slog.Info("BYOS schema resolver built", "tables", resolver.TableCount())
 
 	// Build filters.
-	filters := buildIndexFilters(agtSchemas, agtTables)
+	filters := cliutil.BuildIndexFilters(agtSchemas, agtTables)
 
 	sp := parser.NewStreamParser(resolver, filters, nil)
 
 	// Parse source DSN for BinlogSyncer.
-	host, port, user, password, err := parseSourceDSN(agtSourceDSN)
+	host, port, user, password, err := config.ParseSourceDSN(agtSourceDSN)
 	if err != nil {
 		return err
 	}

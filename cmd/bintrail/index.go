@@ -92,7 +92,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Println("Source: binlog_row_image=FULL \u2713")
 
-		if err := validateNoFKCascades(sourceDB, parseSchemaList(idxSchemas)); err != nil {
+		if err := validateNoFKCascades(sourceDB, cliutil.ParseSchemaList(idxSchemas)); err != nil {
 			return err
 		}
 		fmt.Println("Source: no FK cascades \u2713")
@@ -126,14 +126,14 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		}
 	}
 	// ── 4. Schema snapshot ───────────────────────────────────────────────
-	resolver, err := ensureResolver(indexDB, sourceDB, parseSchemaList(idxSchemas))
+	resolver, err := ensureResolver(indexDB, sourceDB, cliutil.ParseSchemaList(idxSchemas))
 	if err != nil {
 		return err
 	}
 	fmt.Printf("Snapshot: id=%d, tables=%d\n", resolver.SnapshotID(), resolver.TableCount())
 
 	// ── 5. Filters ──────────────────────────────────────────────────────
-	filters := buildIndexFilters(idxSchemas, idxTables)
+	filters := cliutil.BuildIndexFilters(idxSchemas, idxTables)
 
 	// ── 5. File list ──────────────────────────────────────────────────────────
 	files, err := resolveFiles(idxBinlogDir, idxFiles, idxAll)
@@ -148,7 +148,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 
 	// DDL handler: auto-snapshot when --source-dsn is available; warn-only otherwise.
 	// TRUNCATE does not change schema structure, so skip snapshot for it.
-	schemas := parseSchemaList(idxSchemas)
+	schemas := cliutil.ParseSchemaList(idxSchemas)
 	idx.SetOnDDL(func(ev parser.Event) error {
 		if ev.DDLType == parser.DDLTruncateTable {
 			slog.Info("DDL detected (no snapshot needed)",
@@ -210,7 +210,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	slog.Info("indexing complete", "files_processed", len(files), "events_indexed", totalEvents)
 
 	if idxFormat == "json" {
-		return outputJSON(struct {
+		return cliutil.OutputJSON(struct {
 			FilesProcessed int   `json:"files_processed"`
 			EventsIndexed  int64 `json:"events_indexed"`
 		}{
@@ -559,29 +559,6 @@ func nullOrStringVal(s string) any {
 		return nil
 	}
 	return s
-}
-
-// ─── Filter builder ────────────────────────────────────────────────────────────────────────
-
-func buildIndexFilters(schemas, tables string) parser.Filters {
-	var f parser.Filters
-	if schemas != "" {
-		f.Schemas = make(map[string]bool)
-		for s := range strings.SplitSeq(schemas, ",") {
-			if s = strings.TrimSpace(s); s != "" {
-				f.Schemas[s] = true
-			}
-		}
-	}
-	if tables != "" {
-		f.Tables = make(map[string]bool)
-		for t := range strings.SplitSeq(tables, ",") {
-			if t = strings.TrimSpace(t); t != "" {
-				f.Tables[t] = true
-			}
-		}
-	}
-	return f
 }
 
 // ─── File discovery ───────────────────────────────────────────────────────────────────────

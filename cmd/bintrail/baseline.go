@@ -159,7 +159,7 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 			result.Uploaded = uploaded
 			result.UploadDest = bslUpload
 		}
-		return outputJSON(result)
+		return cliutil.OutputJSON(result)
 	}
 
 	fmt.Printf("Baseline complete.\n")

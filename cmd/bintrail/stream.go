@@ -2,18 +2,15 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 
-	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/streamrun"
 )
 
@@ -103,29 +100,6 @@ func init() {
 	rootCmd.AddCommand(streamCmd)
 }
 
-// ─── Start position resolution ───────────────────────────────────────────────
-
-// parseSourceDSN extracts the host, port, user, and password from a
-// go-sql-driver DSN for use in BinlogSyncerConfig.
-func parseSourceDSN(dsn string) (host string, port uint16, user, password string, err error) {
-	cfg, parseErr := drivermysql.ParseDSN(dsn)
-	if parseErr != nil {
-		return "", 0, "", "", fmt.Errorf("invalid --source-dsn: %w", parseErr)
-	}
-	if strings.EqualFold(cfg.Net, "unix") {
-		return "", 0, "", "", fmt.Errorf("--source-dsn uses a unix socket; binlog replication requires a TCP address")
-	}
-	h, p, splitErr := net.SplitHostPort(cfg.Addr)
-	if splitErr != nil {
-		return "", 0, "", "", fmt.Errorf("invalid address in --source-dsn %q: %w", cfg.Addr, splitErr)
-	}
-	portN, convErr := strconv.ParseUint(p, 10, 16)
-	if convErr != nil {
-		return "", 0, "", "", fmt.Errorf("invalid port in --source-dsn: %w", convErr)
-	}
-	return h, uint16(portN), cfg.User, cfg.Passwd, nil
-}
-
 // streamDeps wires the package-main helper functions into a streamrun.Deps —
 // the host side of streamrun's dependency seam. Shared by streamConfigFromFlags
 // and the control-plane supervisor so both build identical engine deps.
@@ -134,13 +108,13 @@ func streamDeps() streamrun.Deps {
 		ValidateBinlogFormat:   validateBinlogFormat,
 		ValidateBinlogRowImage: validateBinlogRowImage,
 		ValidateNoFKCascades:   validateNoFKCascades,
-		ParseSchemaList:        parseSchemaList,
+		ParseSchemaList:        cliutil.ParseSchemaList,
 		ResolveServerIdentity:  resolveServerIdentity,
 		EnsureResolver:         ensureResolver,
-		BuildIndexFilters:      buildIndexFilters,
+		BuildIndexFilters:      cliutil.BuildIndexFilters,
 		InsertSchemaChange:     insertSchemaChange,
-		ParseSourceDSN:         parseSourceDSN,
-		OutputJSON:             outputJSON,
+		ParseSourceDSN:         config.ParseSourceDSN,
+		OutputJSON:             cliutil.OutputJSON,
 	}
 }
 

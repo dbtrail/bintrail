@@ -337,12 +337,12 @@ func TestCheckBinlogRetention(t *testing.T) {
 	// paths. Retention failures are WARN, not FAIL — the property test does not
 	// apply here; each row asserts wantRemediation explicitly.
 	tests := []struct {
-		name              string
-		modern            mockSQLScalar // first query — @@binlog_expire_logs_seconds
-		legacy            mockSQLScalar // second query — @@expire_logs_days (only invoked when modern errors)
-		wantStatus        checkStatus
-		wantDetailFrag    string // substring assertion on detail
-		wantRemediation   bool   // must remediation be present?
+		name            string
+		modern          mockSQLScalar // first query — @@binlog_expire_logs_seconds
+		legacy          mockSQLScalar // second query — @@expire_logs_days (only invoked when modern errors)
+		wantStatus      checkStatus
+		wantDetailFrag  string // substring assertion on detail
+		wantRemediation bool   // must remediation be present?
 	}{
 		// 1. MySQL 8.0+ branches.
 		{name: "modern: at threshold", modern: row("172800"), wantStatus: statusPass, wantDetailFrag: "48h"},

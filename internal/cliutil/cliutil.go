@@ -1,9 +1,11 @@
-// Package cliutil provides shared filter-parsing helpers used by both
-// cmd/bintrail/ commands and cmd/bintrail-mcp/.
+// Package cliutil provides shared filter-parsing and output helpers used by
+// both cmd/bintrail/ commands and cmd/bintrail-mcp/.
 package cliutil
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -79,4 +81,50 @@ func IsValidOutputFormat(s string) bool {
 		return true
 	}
 	return false
+}
+
+// ParseSchemaList splits a comma-separated schema string into a trimmed slice,
+// dropping empty entries. Returns nil if the input is empty.
+func ParseSchemaList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var result []string
+	for part := range strings.SplitSeq(s, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
+}
+
+// BuildIndexFilters builds a parser.Filters from comma-separated schema and
+// table flag values.
+func BuildIndexFilters(schemas, tables string) parser.Filters {
+	var f parser.Filters
+	if schemas != "" {
+		f.Schemas = make(map[string]bool)
+		for s := range strings.SplitSeq(schemas, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				f.Schemas[s] = true
+			}
+		}
+	}
+	if tables != "" {
+		f.Tables = make(map[string]bool)
+		for t := range strings.SplitSeq(tables, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				f.Tables[t] = true
+			}
+		}
+	}
+	return f
+}
+
+// OutputJSON encodes v as indented JSON to stdout.
+func OutputJSON(v any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
 }

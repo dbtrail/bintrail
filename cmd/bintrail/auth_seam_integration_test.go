@@ -103,7 +103,7 @@ func TestCachingSha2ColdAuthSeam(t *testing.T) {
 		}
 
 		dsn := makeColdUser(t, "bt_authseam_repl")
-		host, port, user, password, err := parseSourceDSN(dsn)
+		host, port, user, password, err := config.ParseSourceDSN(dsn)
 		if err != nil {
 			t.Fatalf("parseSourceDSN: %v", err)
 		}

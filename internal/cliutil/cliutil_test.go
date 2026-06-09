@@ -229,3 +229,110 @@ func TestIsValidOutputFormat_invalid(t *testing.T) {
 		}
 	}
 }
+
+// ─── ParseSchemaList ──────────────────────────────────────────────────────────
+
+func TestParseSchemaList_empty(t *testing.T) {
+	got := ParseSchemaList("")
+	if got != nil {
+		t.Errorf("expected nil for empty string, got %v", got)
+	}
+}
+
+func TestParseSchemaList_single(t *testing.T) {
+	got := ParseSchemaList("mydb")
+	if len(got) != 1 || got[0] != "mydb" {
+		t.Errorf("expected [mydb], got %v", got)
+	}
+}
+
+func TestParseSchemaList_multiple(t *testing.T) {
+	got := ParseSchemaList("db1,db2,db3")
+	if len(got) != 3 || got[0] != "db1" || got[1] != "db2" || got[2] != "db3" {
+		t.Errorf("expected [db1 db2 db3], got %v", got)
+	}
+}
+
+func TestParseSchemaList_trims(t *testing.T) {
+	got := ParseSchemaList(" db1 , db2 , db3 ")
+	if len(got) != 3 || got[0] != "db1" || got[1] != "db2" || got[2] != "db3" {
+		t.Errorf("expected trimmed [db1 db2 db3], got %v", got)
+	}
+}
+
+func TestParseSchemaList_dropsEmpty(t *testing.T) {
+	got := ParseSchemaList("db1,,db2,")
+	if len(got) != 2 || got[0] != "db1" || got[1] != "db2" {
+		t.Errorf("expected [db1 db2] with empty entries dropped, got %v", got)
+	}
+}
+
+func TestParseSchemaList_allEmpty(t *testing.T) {
+	got := ParseSchemaList(",,,")
+	if len(got) != 0 {
+		t.Errorf("expected empty result for all-empty entries, got %v", got)
+	}
+}
+
+// TestParseSchemaList_whitespaceOnly verifies that a non-empty string containing
+// only whitespace returns nil — the early "" guard doesn't fire, the loop runs,
+// trims the single part to "", skips it, and returns nil.
+func TestParseSchemaList_whitespaceOnly(t *testing.T) {
+	if got := ParseSchemaList("   "); got != nil {
+		t.Errorf("expected nil for whitespace-only input, got %v", got)
+	}
+}
+
+// ─── BuildIndexFilters ────────────────────────────────────────────────────────
+
+func TestBuildIndexFilters_empty(t *testing.T) {
+	f := BuildIndexFilters("", "")
+	if f.Schemas != nil {
+		t.Errorf("expected nil Schemas map, got %v", f.Schemas)
+	}
+	if f.Tables != nil {
+		t.Errorf("expected nil Tables map, got %v", f.Tables)
+	}
+}
+
+func TestBuildIndexFilters_schemasOnly(t *testing.T) {
+	f := BuildIndexFilters("mydb,other", "")
+	if f.Schemas == nil || !f.Schemas["mydb"] || !f.Schemas["other"] {
+		t.Errorf("expected Schemas {mydb:true, other:true}, got %v", f.Schemas)
+	}
+	if f.Tables != nil {
+		t.Errorf("expected nil Tables, got %v", f.Tables)
+	}
+}
+
+func TestBuildIndexFilters_tablesOnly(t *testing.T) {
+	f := BuildIndexFilters("", "mydb.orders,mydb.items")
+	if f.Schemas != nil {
+		t.Errorf("expected nil Schemas, got %v", f.Schemas)
+	}
+	if f.Tables == nil || !f.Tables["mydb.orders"] || !f.Tables["mydb.items"] {
+		t.Errorf("expected Tables {mydb.orders:true, mydb.items:true}, got %v", f.Tables)
+	}
+}
+
+func TestBuildIndexFilters_both(t *testing.T) {
+	f := BuildIndexFilters("mydb", "mydb.orders")
+	if f.Schemas == nil || !f.Schemas["mydb"] {
+		t.Error("expected Schemas with mydb")
+	}
+	if f.Tables == nil || !f.Tables["mydb.orders"] {
+		t.Error("expected Tables with mydb.orders")
+	}
+}
+
+func TestBuildIndexFilters_trimming(t *testing.T) {
+	f := BuildIndexFilters(" mydb , other ", " mydb.orders , mydb.items ")
+	if !f.Schemas["mydb"] || !f.Schemas["other"] {
+		t.Errorf("expected trimmed schemas, got %v", f.Schemas)
+	}
+	if !f.Tables["mydb.orders"] || !f.Tables["mydb.items"] {
+		t.Errorf("expected trimmed tables, got %v", f.Tables)
+	}
+}
+
+// ─── resolveFiles ────────────────────────────────────────────────────────────

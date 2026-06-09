@@ -13,7 +13,7 @@ import (
 var initShimCmd = &cobra.Command{
 	Use:   "init-shim",
 	Short: "Generate a shim.yaml for `bintrail shim`",
-	Long: `Generates a starter shim.yaml that the in-process `+"`bintrail shim`"+` reads
+	Long: `Generates a starter shim.yaml that the in-process ` + "`bintrail shim`" + ` reads
 to serve time-travel SQL: ` + "`SELECT * FROM _flashback.<table> AS OF '<ts>'" + `
 ` + "`WHERE <col> = <value>`" + ` and the matching _diff / _snapshot virtual schemas.
 

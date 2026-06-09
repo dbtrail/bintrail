@@ -134,60 +134,6 @@ func TestBinlogFileRe(t *testing.T) {
 	}
 }
 
-// ─── buildIndexFilters ───────────────────────────────────────────────────────
-
-func TestBuildIndexFilters_empty(t *testing.T) {
-	f := buildIndexFilters("", "")
-	if f.Schemas != nil {
-		t.Errorf("expected nil Schemas map, got %v", f.Schemas)
-	}
-	if f.Tables != nil {
-		t.Errorf("expected nil Tables map, got %v", f.Tables)
-	}
-}
-
-func TestBuildIndexFilters_schemasOnly(t *testing.T) {
-	f := buildIndexFilters("mydb,other", "")
-	if f.Schemas == nil || !f.Schemas["mydb"] || !f.Schemas["other"] {
-		t.Errorf("expected Schemas {mydb:true, other:true}, got %v", f.Schemas)
-	}
-	if f.Tables != nil {
-		t.Errorf("expected nil Tables, got %v", f.Tables)
-	}
-}
-
-func TestBuildIndexFilters_tablesOnly(t *testing.T) {
-	f := buildIndexFilters("", "mydb.orders,mydb.items")
-	if f.Schemas != nil {
-		t.Errorf("expected nil Schemas, got %v", f.Schemas)
-	}
-	if f.Tables == nil || !f.Tables["mydb.orders"] || !f.Tables["mydb.items"] {
-		t.Errorf("expected Tables {mydb.orders:true, mydb.items:true}, got %v", f.Tables)
-	}
-}
-
-func TestBuildIndexFilters_both(t *testing.T) {
-	f := buildIndexFilters("mydb", "mydb.orders")
-	if f.Schemas == nil || !f.Schemas["mydb"] {
-		t.Error("expected Schemas with mydb")
-	}
-	if f.Tables == nil || !f.Tables["mydb.orders"] {
-		t.Error("expected Tables with mydb.orders")
-	}
-}
-
-func TestBuildIndexFilters_trimming(t *testing.T) {
-	f := buildIndexFilters(" mydb , other ", " mydb.orders , mydb.items ")
-	if !f.Schemas["mydb"] || !f.Schemas["other"] {
-		t.Errorf("expected trimmed schemas, got %v", f.Schemas)
-	}
-	if !f.Tables["mydb.orders"] || !f.Tables["mydb.items"] {
-		t.Errorf("expected trimmed tables, got %v", f.Tables)
-	}
-}
-
-// ─── resolveFiles ────────────────────────────────────────────────────────────
-
 func TestResolveFiles_explicit(t *testing.T) {
 	files, err := resolveFiles("/tmp", "binlog.000001,binlog.000002", false)
 	if err != nil {
@@ -309,10 +255,10 @@ func TestBinlogFileRe_trailingSuffix(t *testing.T) {
 		name  string
 		match bool
 	}{
-		{"binlog.000001.bak", false},    // digits not at end
-		{"binlog.000001-relay", false},  // digits not at end
-		{"binlog.000001", true},         // digits at end — baseline check
-		{"mysql-bin.000001.gz", false},  // compressed backup
+		{"binlog.000001.bak", false},   // digits not at end
+		{"binlog.000001-relay", false}, // digits not at end
+		{"binlog.000001", true},        // digits at end — baseline check
+		{"mysql-bin.000001.gz", false}, // compressed backup
 	}
 	for _, tc := range cases {
 		got := binlogFileRe.MatchString(tc.name)

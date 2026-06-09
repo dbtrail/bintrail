@@ -260,12 +260,12 @@ func TestAutoAddDeclarative(t *testing.T) {
 	}{
 		{"steady state", 1, 1, 0, false, 0},
 		{"cold start", 3, 0, 0, false, 3},
-		{"drops with replace", 1, 1, 1, false, 1},          // 0 top-up + 1 replacement
-		{"drops no replace", 1, 1, 1, true, 0},             // 0 top-up, no replacement
-		{"over target never shrinks", 1, 5, 0, false, 0},   // futureCount > target
+		{"drops with replace", 1, 1, 1, false, 1},        // 0 top-up + 1 replacement
+		{"drops no replace", 1, 1, 1, true, 0},           // 0 top-up, no replacement
+		{"over target never shrinks", 1, 5, 0, false, 0}, // futureCount > target
 		{"under target top-up", 3, 1, 0, false, 2},
-		{"under target plus drops", 3, 1, 2, false, 4},     // 2 top-up + 2 replacements
-		{"no-replace ignores drops", 3, 1, 2, true, 2},     // 2 top-up only
+		{"under target plus drops", 3, 1, 2, false, 4}, // 2 top-up + 2 replacements
+		{"no-replace ignores drops", 3, 1, 2, true, 2}, // 2 top-up only
 		{"no flags", 0, 0, 0, false, 0},
 		{"no-replace over target ignores drops", 1, 5, 3, true, 0},
 	}

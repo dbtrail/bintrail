@@ -4,6 +4,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -72,4 +75,25 @@ func Connect(dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to ping MySQL: %w", err)
 	}
 	return db, nil
+}
+
+// ParseSourceDSN extracts the host, port, user, and password from a
+// go-sql-driver DSN for use in BinlogSyncerConfig.
+func ParseSourceDSN(dsn string) (host string, port uint16, user, password string, err error) {
+	cfg, parseErr := mysql.ParseDSN(dsn)
+	if parseErr != nil {
+		return "", 0, "", "", fmt.Errorf("invalid --source-dsn: %w", parseErr)
+	}
+	if strings.EqualFold(cfg.Net, "unix") {
+		return "", 0, "", "", fmt.Errorf("--source-dsn uses a unix socket; binlog replication requires a TCP address")
+	}
+	h, p, splitErr := net.SplitHostPort(cfg.Addr)
+	if splitErr != nil {
+		return "", 0, "", "", fmt.Errorf("invalid address in --source-dsn %q: %w", cfg.Addr, splitErr)
+	}
+	portN, convErr := strconv.ParseUint(p, 10, 16)
+	if convErr != nil {
+		return "", 0, "", "", fmt.Errorf("invalid port in --source-dsn: %w", convErr)
+	}
+	return h, uint16(portN), cfg.User, cfg.Passwd, nil
 }

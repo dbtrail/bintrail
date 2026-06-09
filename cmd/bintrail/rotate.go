@@ -161,7 +161,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		if rotFormat == "json" {
-			return outputJSON(struct {
+			return cliutil.OutputJSON(struct {
 				PartitionsDropped int `json:"partitions_dropped"`
 				PartitionsAdded   int `json:"partitions_added"`
 			}{PartitionsDropped: res.dropped, PartitionsAdded: res.added})

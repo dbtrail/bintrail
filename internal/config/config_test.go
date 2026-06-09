@@ -121,9 +121,9 @@ func TestCurrentBinlogPosition_LogBinOff(t *testing.T) {
 		fbRows    *sqlmock.Rows
 	}{
 		{
-			name:      "pre_8.4 with log_bin=OFF: new statement is 1064, old returns empty",
-			firstErr:  &mysql.MySQLError{Number: 1064, Message: "syntax error near 'BINARY LOG STATUS'"},
-			fbRows:    sqlmock.NewRows(binlogStatusColumns),
+			name:     "pre_8.4 with log_bin=OFF: new statement is 1064, old returns empty",
+			firstErr: &mysql.MySQLError{Number: 1064, Message: "syntax error near 'BINARY LOG STATUS'"},
+			fbRows:   sqlmock.NewRows(binlogStatusColumns),
 		},
 		{
 			name:      "8.4+ with log_bin=OFF: new returns empty, old is 1064",
@@ -221,5 +221,91 @@ func TestCurrentBinlogPosition_BothNonErrNoRowsFail(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// ─── ParseSourceDSN ───────────────────────────────────────────────────────────
+
+func TestParseSourceDSN_tcp(t *testing.T) {
+	dsn := "root:secret@tcp(db.example.com:3306)/mydb"
+	host, port, user, pass, err := ParseSourceDSN(dsn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if host != "db.example.com" {
+		t.Errorf("host: expected db.example.com, got %q", host)
+	}
+	if port != 3306 {
+		t.Errorf("port: expected 3306, got %d", port)
+	}
+	if user != "root" {
+		t.Errorf("user: expected root, got %q", user)
+	}
+	if pass != "secret" {
+		t.Errorf("password: expected secret, got %q", pass)
+	}
+}
+
+func TestParseSourceDSN_noPassword(t *testing.T) {
+	dsn := "repl@tcp(127.0.0.1:13306)/"
+	host, port, user, pass, err := ParseSourceDSN(dsn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if host != "127.0.0.1" {
+		t.Errorf("host: expected 127.0.0.1, got %q", host)
+	}
+	if port != 13306 {
+		t.Errorf("port: expected 13306, got %d", port)
+	}
+	if user != "repl" {
+		t.Errorf("user: expected repl, got %q", user)
+	}
+	if pass != "" {
+		t.Errorf("password: expected empty, got %q", pass)
+	}
+}
+
+func TestParseSourceDSN_unixSocket(t *testing.T) {
+	dsn := "root@unix(/var/run/mysqld/mysqld.sock)/test"
+	_, _, _, _, err := ParseSourceDSN(dsn)
+	if err == nil {
+		t.Error("expected error for unix socket DSN, got nil")
+	}
+}
+
+func TestParseSourceDSN_invalid(t *testing.T) {
+	_, _, _, _, err := ParseSourceDSN("not-a-valid-dsn::::")
+	if err == nil {
+		t.Error("expected error for invalid DSN, got nil")
+	}
+}
+
+// TestParseSourceDSN_ipv6 verifies IPv6 addresses are parsed correctly.
+func TestParseSourceDSN_ipv6(t *testing.T) {
+	dsn := "root:pw@tcp([::1]:3306)/db"
+	host, port, _, _, err := ParseSourceDSN(dsn)
+	if err != nil {
+		t.Fatalf("unexpected error for IPv6 DSN: %v", err)
+	}
+	if host != "::1" {
+		t.Errorf("host: expected ::1, got %q", host)
+	}
+	if port != 3306 {
+		t.Errorf("port: expected 3306, got %d", port)
+	}
+}
+
+// TestParseSourceDSN_portOutOfRange verifies that a port above the uint16 max
+// (65535) is rejected. go-mysql-driver accepts it syntactically, but
+// parseSourceDSN uses strconv.ParseUint with bitSize=16 to catch it.
+func TestParseSourceDSN_portOutOfRange(t *testing.T) {
+	dsn := "root@tcp(localhost:65536)/"
+	_, _, _, _, err := ParseSourceDSN(dsn)
+	if err == nil {
+		t.Error("expected error for port 65536 (exceeds uint16 max), got nil")
+	}
+	if !strings.Contains(err.Error(), "port") {
+		t.Errorf("expected 'port' in error message, got: %v", err)
 	}
 }

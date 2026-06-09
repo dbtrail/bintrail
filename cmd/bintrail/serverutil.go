@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/dbtrail/bintrail/internal/byos"
+	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/serverid"
 )
 
@@ -31,7 +32,7 @@ func loadSourceIdentity(ctx context.Context, sourceDB *sql.DB, sourceDSN string)
 	if err := sourceDB.QueryRowContext(ctx, "SELECT @@server_uuid").Scan(&serverUUID); err != nil {
 		return byos.SourceIdentity{}, fmt.Errorf("query server_uuid: %w", err)
 	}
-	host, port, user, _, err := parseSourceDSN(sourceDSN)
+	host, port, user, _, err := config.ParseSourceDSN(sourceDSN)
 	if err != nil {
 		return byos.SourceIdentity{}, err
 	}

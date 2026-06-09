@@ -161,7 +161,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 			TablesCreated: tablesCreated,
 			S3Bucket:      s3Result,
 		}
-		return outputJSON(result)
+		return cliutil.OutputJSON(result)
 	}
 
 	fmt.Printf("\nInitialization complete. Index database: %s\n", dbName)
@@ -587,7 +587,7 @@ const ddlArchiveState = `CREATE TABLE IF NOT EXISTS archive_state (
 // ─── RBAC tables ─────────────────────────────────────────────────────────────
 
 // ddlTableFlags stores named flags on tables or individual columns.
-// column_name = '' means the flag applies to the whole table; a non-empty
+// column_name = ” means the flag applies to the whole table; a non-empty
 // value names the specific column that carries the flag.
 // This two-level design lets access_rules express both "deny the billing
 // table" (table-level flag) and "redact the amount column" (column-level flag)

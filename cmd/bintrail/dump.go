@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/bintrail/internal/cliutil"
+	"github.com/dbtrail/bintrail/internal/config"
 )
 
 var dumpCmd = &cobra.Command{
@@ -185,14 +186,14 @@ func runDump(cmd *cobra.Command, args []string) error {
 	}
 
 	// 2. Parse source DSN.
-	host, port, user, password, err := parseSourceDSN(dmpSourceDSN)
+	host, port, user, password, err := config.ParseSourceDSN(dmpSourceDSN)
 	if err != nil {
 		return err
 	}
 
 	// 3. Parse schema and table filters.
-	schemas := parseSchemaList(dmpSchemas)
-	tables := parseSchemaList(dmpTables)
+	schemas := cliutil.ParseSchemaList(dmpSchemas)
+	tables := cliutil.ParseSchemaList(dmpTables)
 
 	// 4. Acquire dump lock — only one dump at a time.
 	lockFile, err := acquireDumpLock()
@@ -261,7 +262,7 @@ func runDump(cmd *cobra.Command, args []string) error {
 	slog.Info("dump complete", "output_dir", dmpOutputDir)
 
 	if dmpFormat == "json" {
-		return outputJSON(struct {
+		return cliutil.OutputJSON(struct {
 			OutputDir string `json:"output_dir"`
 		}{OutputDir: dmpOutputDir})
 	}

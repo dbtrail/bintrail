@@ -138,10 +138,10 @@ func TestRunUpload_sourceNotDir(t *testing.T) {
 
 func TestParseArchivePath(t *testing.T) {
 	cases := []struct {
-		name       string
-		path       string
-		wantID     string
-		wantPart   string
+		name     string
+		path     string
+		wantID   string
+		wantPart string
 	}{
 		{
 			name:     "valid hive path",

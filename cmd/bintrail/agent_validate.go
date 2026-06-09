@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/storage"
 )
@@ -196,7 +197,7 @@ func hasReplPrivileges(grants []string) (slave, client bool) {
 // checkSchemaSnapshot builds a resolver from the source MySQL's
 // information_schema and reports the table and schema counts.
 func checkSchemaSnapshot(ctx context.Context, db *sql.DB) (string, error) {
-	schemas := parseSchemaList(agtSchemas)
+	schemas := cliutil.ParseSchemaList(agtSchemas)
 	resolver, err := buildResolverFromSource(db, schemas)
 	if err != nil {
 		return "", err

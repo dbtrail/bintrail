@@ -72,8 +72,8 @@ const (
 )
 
 type checkResult struct {
-	Name string      `json:"name"`
-	Status      checkStatus `json:"status"`
+	Name   string      `json:"name"`
+	Status checkStatus `json:"status"`
 	// Detail and Remediation are typically empty for statusPass/statusSkip and
 	// populated for statusFail/statusWarn.
 	Detail      string `json:"detail,omitempty"`
@@ -178,7 +178,7 @@ func buildDoctorReport(parent context.Context, sourceDSN, indexDSN, schemasCSV s
 	defer cancel()
 
 	report := &doctorReport{}
-	schemas := parseSchemaList(schemasCSV)
+	schemas := cliutil.ParseSchemaList(schemasCSV)
 
 	// ── Source MySQL checks ──────────────────────────────────────────────────
 	sourceDB, err := config.Connect(sourceDSN)
@@ -726,9 +726,9 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) che
 		}()
 	} else if dbErr != nil {
 		return checkResult{
-			Name:   "Index write access",
-			Status: statusFail,
-			Detail: dbErr.Error(),
+			Name:        "Index write access",
+			Status:      statusFail,
+			Detail:      dbErr.Error(),
 			Remediation: queryErrorRemediation("information_schema.SCHEMATA"),
 		}
 	}

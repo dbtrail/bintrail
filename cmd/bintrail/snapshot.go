@@ -49,7 +49,7 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 	if !cliutil.IsValidOutputFormat(snapshotFormat) {
 		return fmt.Errorf("invalid --format %q; must be text or json", snapshotFormat)
 	}
-	schemas := parseSchemaList(snapshotSchemas)
+	schemas := cliutil.ParseSchemaList(snapshotSchemas)
 
 	sourceDB, err := config.Connect(snapshotSourceDSN)
 	if err != nil {
@@ -88,7 +88,7 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 	}
 
 	if snapshotFormat == "json" {
-		return outputJSON(struct {
+		return cliutil.OutputJSON(struct {
 			SnapshotID    int `json:"snapshot_id"`
 			Tables        int `json:"tables"`
 			Columns       int `json:"columns"`
@@ -107,20 +107,4 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  columns          : %d\n", stats.ColumnCount)
 	fmt.Printf("  fk constraints   : %d\n", stats.FKCount)
 	return nil
-}
-
-// parseSchemaList splits a comma-separated schema string into a trimmed slice,
-// dropping empty entries. Returns nil if the input is empty.
-func parseSchemaList(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var result []string
-	for part := range strings.SplitSeq(s, ",") {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			result = append(result, part)
-		}
-	}
-	return result
 }

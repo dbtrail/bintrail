@@ -83,14 +83,14 @@ Use --out - to write to stdout instead of a file.`,
 }
 
 var (
-	pcOut                string
-	pcShimConfig         string
-	pcMySQLPort          uint
-	pcShimPort           uint
-	pcProxySQLMySQLPort  uint
-	pcForce              bool
-	pcBackendAuthPlugin  string
-	pcValidate           bool
+	pcOut               string
+	pcShimConfig        string
+	pcMySQLPort         uint
+	pcShimPort          uint
+	pcProxySQLMySQLPort uint
+	pcForce             bool
+	pcBackendAuthPlugin string
+	pcValidate          bool
 )
 
 // pcConnect is the indirection seam for opening the source DB during

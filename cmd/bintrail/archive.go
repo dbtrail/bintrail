@@ -413,10 +413,10 @@ type reconcileReportJSON struct {
 }
 
 type reconcileActionJSON struct {
-	Kind      string `json:"kind"`
-	Partition string `json:"partition"`
+	Kind       string `json:"kind"`
+	Partition  string `json:"partition"`
 	BintrailID string `json:"bintrail_id"`
-	Reason    string `json:"reason,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 func writeReconcileReport(w io.Writer, format string, rep *archive.Report, executed int, execErrs []error, repair, prune bool) error {
@@ -433,7 +433,7 @@ func writeReconcileReport(w io.Writer, format string, rep *archive.Report, execu
 		for _, e := range execErrs {
 			j.Errors = append(j.Errors, e.Error())
 		}
-		return outputJSON(j)
+		return cliutil.OutputJSON(j)
 	}
 
 	mode := "dry-run"

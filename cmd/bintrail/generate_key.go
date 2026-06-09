@@ -81,7 +81,7 @@ func runGenerateKey(cmd *cobra.Command, args []string) error {
 	slog.Info("encryption key generated", "path", keyPath)
 
 	if gkFormat == "json" {
-		return outputJSON(struct {
+		return cliutil.OutputJSON(struct {
 			KeyFile string `json:"key_file"`
 		}{KeyFile: keyPath})
 	}

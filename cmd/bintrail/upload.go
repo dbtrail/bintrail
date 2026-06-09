@@ -238,11 +238,11 @@ func runUpload(cmd *cobra.Command, args []string) error {
 
 	if uplFormat == "json" {
 		result := struct {
-			Uploaded     int    `json:"uploaded"`
-			Skipped      int    `json:"skipped"`
-			Destination  string `json:"destination"`
-			DBUpdated    int    `json:"archive_state_updated,omitempty"`
-			DurationMs   int64  `json:"duration_ms"`
+			Uploaded    int    `json:"uploaded"`
+			Skipped     int    `json:"skipped"`
+			Destination string `json:"destination"`
+			DBUpdated   int    `json:"archive_state_updated,omitempty"`
+			DurationMs  int64  `json:"duration_ms"`
 		}{
 			Uploaded:    uploaded,
 			Skipped:     skipped,
@@ -250,7 +250,7 @@ func runUpload(cmd *cobra.Command, args []string) error {
 			DBUpdated:   dbUpdated,
 			DurationMs:  duration.Milliseconds(),
 		}
-		return outputJSON(result)
+		return cliutil.OutputJSON(result)
 	}
 
 	fmt.Printf("Upload complete.\n")
