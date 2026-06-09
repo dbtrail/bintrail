@@ -16,6 +16,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/console"
 	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/serverid"
 	"github.com/dbtrail/bintrail/internal/streamrun"
 )
 
@@ -367,7 +368,7 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 	// ── Launch the supervised stream ─────────────────────────────────────
 	serverID := e.SourceServerID
 	if serverID == 0 {
-		serverID, err = deriveServerID(e.SourceDSN)
+		serverID, err = serverid.DeriveServerID(e.SourceDSN)
 		if err != nil {
 			lockDB.Close()
 			return fail(fmt.Errorf("derive server id: %w", err))

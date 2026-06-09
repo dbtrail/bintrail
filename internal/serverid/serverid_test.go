@@ -1,6 +1,7 @@
 package serverid
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -123,5 +124,52 @@ func TestResolveIdentity_UsernameScope(t *testing.T) {
 	}
 	if matched == nil || matched.BintrailID != "bt-1" {
 		t.Errorf("expected bt-1, got %v", matched)
+	}
+}
+func TestDeriveServerID(t *testing.T) {
+	const dsn = "user:pass@tcp(source.example.com:3306)/mydb"
+	id1, err := DeriveServerID(dsn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	id2, err := DeriveServerID(dsn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id1 != id2 {
+		t.Errorf("DeriveServerID is not deterministic: %d vs %d", id1, id2)
+	}
+
+	// Range invariant: must be >= 100M to keep distance from the 1-1000 zone
+	// most production replicas use. The PR-review caught a typo that broke
+	// this — keep the assertion strict.
+	if id1 < 100000000 {
+		t.Errorf("DeriveServerID produced %d, expected >= 100000000", id1)
+	}
+
+	// Distinct DSNs produce distinct IDs. With 100 generated inputs the
+	// probability of any collision in a 4.2B range is < 10^-15 — this catches
+	// regressions like a stub returning a constant, or a hash truncation bug
+	// that compresses into a 16-bit space.
+	seen := make(map[uint32]string, 100)
+	for i := range 100 {
+		gen := fmt.Sprintf("u:p@tcp(host%d.example.com:3306)/db", i)
+		id, err := DeriveServerID(gen)
+		if err != nil {
+			t.Fatalf("DeriveServerID(%q) error: %v", gen, err)
+		}
+		if id < 100000000 {
+			t.Errorf("DeriveServerID(%q) = %d, below floor 100000000", gen, id)
+		}
+		if prev, dup := seen[id]; dup {
+			t.Errorf("collision: %q and %q both produced %d", prev, gen, id)
+		}
+		seen[id] = gen
+	}
+
+	// Bad DSN returns an error rather than silently substituting a
+	// non-deterministic value (the silent-failure fix).
+	if _, err := DeriveServerID("not-a-dsn"); err == nil {
+		t.Error("expected error for unparseable DSN; got nil")
 	}
 }
