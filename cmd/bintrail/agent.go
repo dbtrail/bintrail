@@ -219,7 +219,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	// signal until queries return wrong results.
 	var sourceIdent byos.SourceIdentity
 	if sourceDB != nil {
-		ident, err := loadSourceIdentity(cmd.Context(), sourceDB, agtSourceDSN)
+		ident, err := byos.LoadSourceIdentity(cmd.Context(), sourceDB, agtSourceDSN)
 		if err != nil {
 			return fmt.Errorf("capture source identity for BYOS metadata: %w", err)
 		}
@@ -230,7 +230,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	// records and WebSocket heartbeats. Requires both source and index DBs.
 	var bintrailID string
 	if sourceDB != nil && indexDB != nil {
-		id, err := resolveServerIdentity(cmd.Context(), sourceDB, indexDB, agtSourceDSN)
+		id, err := byos.ResolveServerIdentity(cmd.Context(), sourceDB, indexDB, agtSourceDSN)
 		if err != nil {
 			if errors.Is(err, serverid.ErrConflict) {
 				return fmt.Errorf("cannot start agent: %w", err)
@@ -249,7 +249,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	} else if byosMode {
 		// BYOS without --index-dsn: the SaaS now resolves a stable
 		// bintrail_id server-side from the @@server_uuid + host/port/user
-		// fields that `loadSourceIdentity` captured above and that
+		// fields that `byos.LoadSourceIdentity` captured above and that
 		// `SplitEvent` stamps on every metadata record (architecture §22.11,
 		// implemented in nethalo/dbtrail#1179). The customer agent no
 		// longer needs a local index DB — the SaaS bt_<prefix>.bintrail_servers
