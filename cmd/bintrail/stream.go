@@ -11,6 +11,8 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/streamrun"
 )
 
@@ -105,14 +107,14 @@ func init() {
 // and the control-plane supervisor so both build identical engine deps.
 func streamDeps() streamrun.Deps {
 	return streamrun.Deps{
-		ValidateBinlogFormat:   validateBinlogFormat,
-		ValidateBinlogRowImage: validateBinlogRowImage,
-		ValidateNoFKCascades:   validateNoFKCascades,
+		ValidateBinlogFormat:   metadata.ValidateBinlogFormat,
+		ValidateBinlogRowImage: metadata.ValidateBinlogRowImage,
+		ValidateNoFKCascades:   metadata.ValidateNoFKCascades,
 		ParseSchemaList:        cliutil.ParseSchemaList,
 		ResolveServerIdentity:  resolveServerIdentity,
-		EnsureResolver:         ensureResolver,
+		EnsureResolver:         metadata.EnsureResolver,
 		BuildIndexFilters:      cliutil.BuildIndexFilters,
-		InsertSchemaChange:     insertSchemaChange,
+		InsertSchemaChange:     indexer.InsertSchemaChange,
 		ParseSourceDSN:         config.ParseSourceDSN,
 		OutputJSON:             cliutil.OutputJSON,
 	}

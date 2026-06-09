@@ -258,3 +258,19 @@ func ensureColumn(db *sql.DB, table, column, alterSQL string) error {
 	}
 	return nil
 }
+
+// InsertSchemaChange records a DDL detection in the schema_changes table.
+// snapshotID may be nil when no auto-snapshot was taken (file mode).
+func InsertSchemaChange(db *sql.DB, ev parser.Event, snapshotID *int) error {
+	var snapArg any
+	if snapshotID != nil {
+		snapArg = *snapshotID
+	}
+	_, err := db.Exec(`
+		INSERT INTO schema_changes
+			(detected_at, binlog_file, binlog_pos, gtid, schema_name, table_name, ddl_type, ddl_query, snapshot_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ev.Timestamp, ev.BinlogFile, ev.EndPos,
+		nullOrString(ev.GTID), ev.Schema, ev.Table, ev.DDLType, ev.DDLQuery, snapArg)
+	return err
+}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/storage"
 )
 
@@ -129,10 +130,10 @@ func checkMySQL(ctx context.Context, db *sql.DB) (string, error) {
 		return "", fmt.Errorf("query version: %w", err)
 	}
 
-	if err := validateBinlogFormat(db); err != nil {
+	if err := metadata.ValidateBinlogFormat(db); err != nil {
 		return "", err
 	}
-	if err := validateBinlogRowImage(db); err != nil {
+	if err := metadata.ValidateBinlogRowImage(db); err != nil {
 		return "", err
 	}
 

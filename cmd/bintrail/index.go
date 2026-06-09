@@ -82,17 +82,17 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		}
 		defer sourceDB.Close()
 
-		if err := validateBinlogFormat(sourceDB); err != nil {
+		if err := metadata.ValidateBinlogFormat(sourceDB); err != nil {
 			return err
 		}
 		fmt.Println("Source: binlog_format=ROW \u2713")
 
-		if err := validateBinlogRowImage(sourceDB); err != nil {
+		if err := metadata.ValidateBinlogRowImage(sourceDB); err != nil {
 			return err
 		}
 		fmt.Println("Source: binlog_row_image=FULL \u2713")
 
-		if err := validateNoFKCascades(sourceDB, cliutil.ParseSchemaList(idxSchemas)); err != nil {
+		if err := metadata.ValidateNoFKCascades(sourceDB, cliutil.ParseSchemaList(idxSchemas)); err != nil {
 			return err
 		}
 		fmt.Println("Source: no FK cascades \u2713")
@@ -126,7 +126,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		}
 	}
 	// ── 4. Schema snapshot ───────────────────────────────────────────────
-	resolver, err := ensureResolver(indexDB, sourceDB, cliutil.ParseSchemaList(idxSchemas))
+	resolver, err := metadata.EnsureResolver(indexDB, sourceDB, cliutil.ParseSchemaList(idxSchemas))
 	if err != nil {
 		return err
 	}
@@ -153,7 +153,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		if ev.DDLType == parser.DDLTruncateTable {
 			slog.Info("DDL detected (no snapshot needed)",
 				"file", ev.BinlogFile, "pos", ev.EndPos, "ddl_type", ev.DDLType, "query", ev.DDLQuery)
-			if err := insertSchemaChange(indexDB, ev, nil); err != nil {
+			if err := indexer.InsertSchemaChange(indexDB, ev, nil); err != nil {
 				slog.Warn("failed to record schema change", "error", err)
 			}
 			return nil
@@ -162,7 +162,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		if sourceDB == nil {
 			slog.Warn("DDL detected but --source-dsn not provided; run `bintrail snapshot` if schema changed",
 				"file", ev.BinlogFile, "pos", ev.EndPos, "ddl_type", ev.DDLType, "query", ev.DDLQuery)
-			if err := insertSchemaChange(indexDB, ev, nil); err != nil {
+			if err := indexer.InsertSchemaChange(indexDB, ev, nil); err != nil {
 				slog.Warn("failed to record schema change", "error", err)
 			}
 			return nil
@@ -191,7 +191,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		if err := insertSchemaChange(indexDB, ev, snapID); err != nil {
+		if err := indexer.InsertSchemaChange(indexDB, ev, snapID); err != nil {
 			slog.Warn("failed to record schema change", "error", err)
 		}
 		return nil
@@ -376,189 +376,6 @@ func upsertFileState(db *sql.DB, filename, status string, fileSize, lastPos, eve
 		return err
 	}
 	return fmt.Errorf("upsertFileState: unknown status %q", status)
-}
-
-// ─── Validation ──────────────────────────────────────────────────────────────────────────────────
-
-// validateBinlogFormat checks that the source server has binlog_format=ROW.
-func validateBinlogFormat(db *sql.DB) error {
-	var varName, val string
-	err := db.QueryRow("SHOW VARIABLES LIKE 'binlog_format'").Scan(&varName, &val)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("binlog_format not found on source server")
-	}
-	if err != nil {
-		return fmt.Errorf("failed to query binlog_format: %w", err)
-	}
-	if !strings.EqualFold(val, "ROW") {
-		return fmt.Errorf("source server has binlog_format=%q; bintrail requires ROW", val)
-	}
-	return nil
-}
-
-// validateBinlogRowImage checks that the source server has binlog_row_image=FULL.
-func validateBinlogRowImage(db *sql.DB) error {
-	var varName, val string
-	err := db.QueryRow("SHOW VARIABLES LIKE 'binlog_row_image'").Scan(&varName, &val)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("binlog_row_image not found on source server; MySQL 5.6+ with binlog_row_image=FULL is required")
-	}
-	if err != nil {
-		return fmt.Errorf("failed to query binlog_row_image: %w", err)
-	}
-	if !strings.EqualFold(val, "FULL") {
-		return fmt.Errorf("source server has binlog_row_image=%q; bintrail requires FULL", val)
-	}
-	return nil
-}
-
-// buildFKCascadeQuery returns the REFERENTIAL_CONSTRAINTS query (and its args)
-// used to find CASCADE foreign keys. When schemas is non-empty the scan is
-// scoped to exactly those schemas — the operator explicitly asked us to index
-// them, so we police them as named. When schemas is empty we scan every schema
-// except (a) MySQL's own system schemas and (b) bintrail's own index schemas.
-//
-// A bintrail index schema is recognised structurally — by the signature tables
-// `bintrail init` creates (binlog_events, schema_snapshots and stream_state must
-// all be present) — not by name. This is what lets the pre-flight skip
-// bintrail's own `access_rules`→`profiles` ON DELETE CASCADE so an agent does
-// not fatal-fail on its own (or another agent's) index DB sharing the source
-// MySQL (#347), while still flagging a genuine user schema whatever it is named
-// (#365). The signature tables are created before access_rules, so any schema
-// carrying that cascade necessarily carries the signature too.
-func buildFKCascadeQuery(schemas []string) (string, []any) {
-	query := `SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, DELETE_RULE, UPDATE_RULE
-		FROM information_schema.REFERENTIAL_CONSTRAINTS
-		WHERE (DELETE_RULE = 'CASCADE' OR UPDATE_RULE = 'CASCADE')`
-
-	var args []any
-	if len(schemas) > 0 {
-		placeholders := strings.Repeat("?,", len(schemas))
-		query += " AND CONSTRAINT_SCHEMA IN (" + placeholders[:len(placeholders)-1] + ")"
-		for _, s := range schemas {
-			args = append(args, s)
-		}
-	} else {
-		// Skip bintrail's own index schemas, identified by their signature tables
-		// rather than by name: a schema counts as bintrail-internal only if it
-		// holds ALL of binlog_events, schema_snapshots and stream_state (HAVING
-		// = 3), so a user schema that merely shares one of those names is still
-		// scanned.
-		query += " AND CONSTRAINT_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys')" +
-			" AND CONSTRAINT_SCHEMA NOT IN (" +
-			"SELECT TABLE_SCHEMA FROM information_schema.TABLES" +
-			" WHERE TABLE_TYPE = 'BASE TABLE'" +
-			" AND TABLE_NAME IN ('binlog_events','schema_snapshots','stream_state')" +
-			" GROUP BY TABLE_SCHEMA HAVING COUNT(DISTINCT TABLE_NAME) = 3)"
-	}
-	return query, args
-}
-
-// validateNoFKCascades checks that none of the targeted schemas contain foreign
-// key constraints with CASCADE rules. When schemas is empty, all non-system,
-// non-bintrail-internal schemas are checked (see buildFKCascadeQuery). FK
-// cascades produce invisible side-effect row changes that make reversal SQL
-// unreliable.
-func validateNoFKCascades(db *sql.DB, schemas []string) error {
-	query, args := buildFKCascadeQuery(schemas)
-
-	// The unscoped scan skips schemas that look like a bintrail index — those
-	// holding all of bintrail's signature tables (see buildFKCascadeQuery) — so a
-	// clean result does not cover them. Disclose the rule, naming the signature
-	// tables rather than asserting the skipped schemas are definitely bintrail's:
-	// a user schema that replicated those table names would be skipped too, and
-	// the operator should be able to recognise that case.
-	if len(schemas) == 0 {
-		slog.Info("FK cascade pre-flight skips schemas that look like a bintrail index DB " +
-			"(those containing binlog_events, schema_snapshots and stream_state); a clean result does not cover them")
-	}
-
-	rows, err := db.Query(query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to query FK cascades: %w", err)
-	}
-	defer rows.Close()
-
-	type cascade struct{ schema, name, deleteRule, updateRule string }
-	var found []cascade
-	for rows.Next() {
-		var c cascade
-		if err := rows.Scan(&c.schema, &c.name, &c.deleteRule, &c.updateRule); err != nil {
-			return fmt.Errorf("failed to scan FK cascade row: %w", err)
-		}
-		found = append(found, c)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("failed to iterate FK cascade rows: %w", err)
-	}
-
-	if len(found) > 0 {
-		for _, c := range found {
-			slog.Warn("FK cascade constraint found on source",
-				"source_schema", c.schema, "constraint", c.name,
-				"delete_rule", c.deleteRule, "update_rule", c.updateRule)
-		}
-		return fmt.Errorf("%d FK cascade constraint(s) found on source; reversal SQL from `recover` may not correctly handle cascade side-effects", len(found))
-	}
-	return nil
-}
-
-// ─── Snapshot bootstrap ────────────────────────────────────────────────────────────────────
-
-// ensureResolver returns a Resolver loaded from the latest snapshot, taking a
-// new snapshot automatically if none exists (requires sourceDB != nil).
-func ensureResolver(indexDB, sourceDB *sql.DB, schemas []string) (*metadata.Resolver, error) {
-	var snapshotID int
-	if err := indexDB.QueryRow(
-		"SELECT COALESCE(MAX(snapshot_id), 0) FROM schema_snapshots",
-	).Scan(&snapshotID); err != nil {
-		return nil, fmt.Errorf("failed to query schema snapshots: %w", err)
-	}
-
-	if snapshotID == 0 {
-		if sourceDB == nil {
-			return nil, fmt.Errorf(
-				"no schema snapshot exists and --source-dsn was not provided; " +
-					"run `bintrail snapshot` first or add --source-dsn for auto-snapshot")
-		}
-		fmt.Println("No snapshot found; taking schema snapshot automatically...")
-		stats, err := metadata.TakeSnapshot(sourceDB, indexDB, schemas)
-		if err != nil {
-			return nil, fmt.Errorf("auto-snapshot failed: %w", err)
-		}
-		fmt.Printf("  snapshot_id=%d, tables=%d, columns=%d\n",
-			stats.SnapshotID, stats.TableCount, stats.ColumnCount)
-		snapshotID = stats.SnapshotID
-	}
-
-	return metadata.NewResolver(indexDB, snapshotID)
-}
-
-// ─── DDL tracking ────────────────────────────────────────────────────────────────────────
-
-// insertSchemaChange records a DDL detection in the schema_changes table.
-// snapshotID may be nil when no auto-snapshot was taken (file mode).
-func insertSchemaChange(db *sql.DB, ev parser.Event, snapshotID *int) error {
-	var snapArg any
-	if snapshotID != nil {
-		snapArg = *snapshotID
-	}
-	_, err := db.Exec(`
-		INSERT INTO schema_changes
-			(detected_at, binlog_file, binlog_pos, gtid, schema_name, table_name, ddl_type, ddl_query, snapshot_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.Timestamp, ev.BinlogFile, ev.EndPos,
-		nullOrStringVal(ev.GTID), ev.Schema, ev.Table, ev.DDLType, ev.DDLQuery, snapArg)
-	return err
-}
-
-// nullOrStringVal returns nil when s is empty (stored as SQL NULL), else s.
-// Mirrors nullOrString in internal/indexer/indexer.go.
-func nullOrStringVal(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
 }
 
 // ─── File discovery ───────────────────────────────────────────────────────────────────────

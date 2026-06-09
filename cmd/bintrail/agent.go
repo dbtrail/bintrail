@@ -559,10 +559,10 @@ func (s *flushPipelineState) toFlushStatus() *agent.FlushStatus {
 // the in-memory buffer, and optionally flushes metadata/payload to sinks.
 func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer, fc *byosFlushConfig) error {
 	// Validate binlog settings.
-	if err := validateBinlogFormat(sourceDB); err != nil {
+	if err := metadata.ValidateBinlogFormat(sourceDB); err != nil {
 		return err
 	}
-	if err := validateBinlogRowImage(sourceDB); err != nil {
+	if err := metadata.ValidateBinlogRowImage(sourceDB); err != nil {
 		return err
 	}
 

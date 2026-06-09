@@ -18,6 +18,7 @@ import (
 
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/metadata"
 )
 
 var doctorCmd = &cobra.Command{
@@ -283,7 +284,7 @@ func checkLogBin(db *sql.DB) checkResult {
 }
 
 func checkBinlogFormat(db *sql.DB) checkResult {
-	err := validateBinlogFormat(db)
+	err := metadata.ValidateBinlogFormat(db)
 	if err != nil {
 		return checkResult{
 			Name:   "binlog_format=ROW",
@@ -300,7 +301,7 @@ func checkBinlogFormat(db *sql.DB) checkResult {
 }
 
 func checkBinlogRowImage(db *sql.DB) checkResult {
-	err := validateBinlogRowImage(db)
+	err := metadata.ValidateBinlogRowImage(db)
 	if err != nil {
 		return checkResult{
 			Name:   "binlog_row_image=FULL",
@@ -490,7 +491,7 @@ func extractGrantUser(grant string) string {
 }
 
 func checkFKCascades(db *sql.DB, schemas []string) checkResult {
-	err := validateNoFKCascades(db, schemas)
+	err := metadata.ValidateNoFKCascades(db, schemas)
 	if err == nil {
 		return checkResult{Name: "No FK CASCADE constraints", Status: statusPass}
 	}

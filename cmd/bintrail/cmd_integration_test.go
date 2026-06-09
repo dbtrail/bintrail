@@ -15,6 +15,7 @@ import (
 	"github.com/parquet-go/parquet-go"
 
 	"github.com/dbtrail/bintrail/internal/archive"
+	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/serverid"
 	"github.com/dbtrail/bintrail/internal/status"
 	"github.com/dbtrail/bintrail/internal/testutil"
@@ -180,7 +181,7 @@ func TestValidateBinlogFormat_row(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := validateBinlogFormat(db); err != nil {
+	if err := metadata.ValidateBinlogFormat(db); err != nil {
 		t.Fatalf("expected nil error for ROW binlog_format, got: %v", err)
 	}
 }
@@ -198,7 +199,7 @@ func TestValidateBinlogRowImage_full(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := validateBinlogRowImage(db); err != nil {
+	if err := metadata.ValidateBinlogRowImage(db); err != nil {
 		t.Fatalf("expected nil error for FULL binlog_row_image, got: %v", err)
 	}
 }
@@ -213,7 +214,7 @@ func TestValidateNoFKCascades_none(t *testing.T) {
 		total DECIMAL(10,2) NOT NULL
 	)`)
 
-	if err := validateNoFKCascades(db, []string{dbName}); err != nil {
+	if err := metadata.ValidateNoFKCascades(db, []string{dbName}); err != nil {
 		t.Fatalf("expected nil error for schema with no cascades, got: %v", err)
 	}
 }
@@ -231,7 +232,7 @@ func TestValidateNoFKCascades_cascade(t *testing.T) {
 		CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
 	)`)
 
-	if err := validateNoFKCascades(db, []string{dbName}); err == nil {
+	if err := metadata.ValidateNoFKCascades(db, []string{dbName}); err == nil {
 		t.Fatal("expected error for schema with FK cascade, got nil")
 	}
 }
@@ -249,7 +250,7 @@ func TestValidateNoFKCascades_updateCascade(t *testing.T) {
 		CONSTRAINT fk_cat FOREIGN KEY (category_id) REFERENCES categories(id) ON UPDATE CASCADE
 	)`)
 
-	if err := validateNoFKCascades(db, []string{dbName}); err == nil {
+	if err := metadata.ValidateNoFKCascades(db, []string{dbName}); err == nil {
 		t.Fatal("expected error for schema with UPDATE CASCADE, got nil")
 	}
 }
@@ -268,7 +269,7 @@ func TestValidateNoFKCascades_otherSchemaIgnored(t *testing.T) {
 
 	// dbName has no cascades — checking only dbName should pass.
 	_ = dbName
-	if err := validateNoFKCascades(db, []string{dbName}); err != nil {
+	if err := metadata.ValidateNoFKCascades(db, []string{dbName}); err != nil {
 		t.Fatalf("expected nil when cascade is only in %q (not targeted), got: %v", otherName, err)
 	}
 }
@@ -311,7 +312,7 @@ func TestValidateNoFKCascades_customNamedIndexSkippedWhenUnscoped(t *testing.T) 
 	}
 
 	// Explicitly named: still policed.
-	if err := validateNoFKCascades(db, []string{idxSchema}); err == nil {
+	if err := metadata.ValidateNoFKCascades(db, []string{idxSchema}); err == nil {
 		t.Fatalf("expected error when %q is explicitly targeted", idxSchema)
 	}
 }
@@ -321,7 +322,7 @@ func TestValidateNoFKCascades_customNamedIndexSkippedWhenUnscoped(t *testing.T) 
 // not) excluded without depending on the rest of the server being cascade-free.
 func unscopedFKCascadeSchemas(t *testing.T, db *sql.DB) map[string]bool {
 	t.Helper()
-	q, args := buildFKCascadeQuery(nil)
+	q, args := metadata.BuildFKCascadeQuery(nil)
 	rows, err := db.Query(q, args...)
 	if err != nil {
 		t.Fatalf("unscoped FK-cascade query: %v", err)
@@ -359,7 +360,7 @@ func TestValidateNoFKCascades_userSchemaCaughtWhenUnscoped(t *testing.T) {
 		"id INT PRIMARY KEY, parent_id INT NOT NULL, "+
 		"CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES `"+userSchema+"`.parents(id) ON DELETE CASCADE)")
 
-	if err := validateNoFKCascades(db, nil); err == nil {
+	if err := metadata.ValidateNoFKCascades(db, nil); err == nil {
 		t.Fatalf("expected unscoped scan to catch the CASCADE FK in non-internal schema %q, got nil", userSchema)
 	}
 }
@@ -405,7 +406,7 @@ func TestEnsureResolver_autoSnapshot(t *testing.T) {
 		name VARCHAR(100) NOT NULL
 	)`)
 
-	resolver, err := ensureResolver(indexDB, sourceDB, []string{sourceName})
+	resolver, err := metadata.EnsureResolver(indexDB, sourceDB, []string{sourceName})
 	if err != nil {
 		t.Fatalf("ensureResolver failed: %v", err)
 	}
@@ -422,7 +423,7 @@ func TestEnsureResolver_noSnapshotNoSource(t *testing.T) {
 	indexDB, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, indexDB)
 
-	_, err := ensureResolver(indexDB, nil, nil)
+	_, err := metadata.EnsureResolver(indexDB, nil, nil)
 	if err == nil {
 		t.Fatal("expected error when no snapshot and no sourceDB")
 	}
@@ -445,7 +446,7 @@ func TestEnsureResolver_existingSnapshot(t *testing.T) {
 		sourceName, "orders", "name", 2, "", "varchar", "YES")
 
 	// Should load existing snapshot without needing sourceDB.
-	resolver, err := ensureResolver(indexDB, nil, nil)
+	resolver, err := metadata.EnsureResolver(indexDB, nil, nil)
 	if err != nil {
 		t.Fatalf("ensureResolver failed: %v", err)
 	}
