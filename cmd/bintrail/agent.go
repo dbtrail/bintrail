@@ -288,7 +288,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	var flushState *flushPipelineState
 
 	if byosMode {
-		retain, err := parseRetain(agtBufferRetain)
+		retain, err := cliutil.ParseRetain(agtBufferRetain)
 		if err != nil {
 			return fmt.Errorf("invalid --buffer-retain: %w", err)
 		}

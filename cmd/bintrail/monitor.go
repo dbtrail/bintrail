@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/doctor"
 	"github.com/dbtrail/bintrail/internal/indexer"
 	"github.com/dbtrail/bintrail/internal/serverid"
+	"github.com/dbtrail/bintrail/internal/streamdeps"
 	"github.com/dbtrail/bintrail/internal/streamrun"
 )
 
@@ -209,7 +209,7 @@ func (m *monitorSupervisor) DeriveIndexDSN(entryID string) (string, error) {
 	}
 	cfg, err := mysql.ParseDSN(m.bootIndexDSN)
 	if err != nil {
-		return "", fmt.Errorf("daemon index DSN: %s", scrubMonitorErr(err, m.bootIndexDSN))
+		return "", fmt.Errorf("daemon index DSN: %s", config.ScrubDSNError(err, m.bootIndexDSN))
 	}
 	cfg.DBName = "bintrail_idx_" + entryID
 	return cfg.FormatDSN(), nil
@@ -237,7 +237,7 @@ func (m *monitorSupervisor) Doctor(ctx context.Context, e console.ServerEntry) (
 		out.Checks[i] = console.DoctorCheck{
 			Name:        c.Name,
 			Status:      string(c.Status),
-			Detail:      scrubMonitorErrText(c.Detail, e.SourceDSN, e.DSN),
+			Detail:      config.ScrubDSNText(c.Detail, e.SourceDSN, e.DSN),
 			Remediation: c.Remediation,
 		}
 	}
@@ -247,7 +247,7 @@ func (m *monitorSupervisor) Doctor(ctx context.Context, e console.ServerEntry) (
 	// block. Supervisor-only: the standalone `bintrail doctor` has no
 	// registry to compare against.
 	if c := m.replicaOverlapCheck(ctx, e); c != nil {
-		c.Detail = scrubMonitorErrText(c.Detail, e.SourceDSN, e.DSN)
+		c.Detail = config.ScrubDSNText(c.Detail, e.SourceDSN, e.DSN)
 		out.Checks = append(out.Checks, *c)
 		switch c.Status {
 		case "warn":
@@ -297,7 +297,7 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 	m.mu.Unlock()
 
 	fail := func(err error) error {
-		scrubbed := scrubMonitorErr(err, e.SourceDSN, e.DSN)
+		scrubbed := config.ScrubDSNError(err, e.SourceDSN, e.DSN)
 		job.set("failed", scrubbed)
 		cancel()
 		close(job.done)
@@ -342,7 +342,7 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 		job.markLostPosition(gapDetail.String)
 	case err != nil && !errors.Is(err, sql.ErrNoRows):
 		slog.Warn("could not re-hydrate gap-loss record; a recorded data loss may not be re-surfaced this run",
-			"entry", e.ID, "error", scrubMonitorErr(err, e.SourceDSN, e.DSN))
+			"entry", e.ID, "error", config.ScrubDSNError(err, e.SourceDSN, e.DSN))
 	}
 	idxDB.Close()
 
@@ -395,7 +395,7 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 		Format:        "text",
 		GapTimeout:    30,
 		Hooks:         job.streamHooks(),
-		Deps:          streamDeps(),
+		Deps:          streamdeps.Default(),
 	}
 
 	m.wg.Add(1)
@@ -438,7 +438,7 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 		if crashLoopSince.IsZero() {
 			crashLoopSince = started
 		}
-		scrubbed := scrubMonitorErr(err, e.SourceDSN, e.DSN)
+		scrubbed := config.ScrubDSNError(err, e.SourceDSN, e.DSN)
 		if looping := time.Since(crashLoopSince); looping > monitorGiveUpAfter {
 			slog.Error("monitored stream crash-looped past the give-up threshold; not retrying",
 				"server", e.Name, "entry", e.ID, "looping_for", looping.Round(time.Minute), "error", scrubbed)
@@ -483,11 +483,11 @@ func (m *monitorSupervisor) Stop(ctx context.Context, entryID string) error {
 	// which fails safe: a real past loss is re-surfaced, never dropped.
 	if job.indexDSN != "" {
 		if db, err := config.Connect(job.indexDSN); err != nil {
-			slog.Warn("could not clear gap-loss record on stop", "entry", entryID, "error", scrubMonitorErrText(err.Error(), job.indexDSN))
+			slog.Warn("could not clear gap-loss record on stop", "entry", entryID, "error", config.ScrubDSNText(err.Error(), job.indexDSN))
 		} else {
 			if _, err := db.ExecContext(ctx, `UPDATE stream_state
 				SET gap_lost_at = NULL, gap_lost_detail = NULL WHERE id = 1`); err != nil {
-				slog.Warn("could not clear gap-loss record on stop", "entry", entryID, "error", scrubMonitorErrText(err.Error(), job.indexDSN))
+				slog.Warn("could not clear gap-loss record on stop", "entry", entryID, "error", config.ScrubDSNText(err.Error(), job.indexDSN))
 			}
 			db.Close()
 		}
@@ -559,24 +559,4 @@ func (m *monitorSupervisor) Shutdown() {
 	}
 	m.mu.Unlock()
 	m.wg.Wait()
-}
-
-// scrubMonitorErr strips every DSN (and its password) from an error before it
-// is stored on a job or returned to the console — monitor errors travel to
-// the browser.
-func scrubMonitorErr(err error, dsns ...string) string {
-	return scrubMonitorErrText(err.Error(), dsns...)
-}
-
-func scrubMonitorErrText(msg string, dsns ...string) string {
-	for _, dsn := range dsns {
-		if dsn == "" {
-			continue
-		}
-		msg = strings.ReplaceAll(msg, dsn, "<dsn>")
-		if cfg, err := mysql.ParseDSN(dsn); err == nil && cfg.Passwd != "" {
-			msg = strings.ReplaceAll(msg, cfg.Passwd, "***")
-		}
-	}
-	return msg
 }

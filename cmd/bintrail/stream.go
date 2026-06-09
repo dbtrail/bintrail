@@ -9,11 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/bintrail/internal/byos"
-	"github.com/dbtrail/bintrail/internal/cliutil"
-	"github.com/dbtrail/bintrail/internal/config"
-	"github.com/dbtrail/bintrail/internal/indexer"
-	"github.com/dbtrail/bintrail/internal/metadata"
+	"github.com/dbtrail/bintrail/internal/streamdeps"
 	"github.com/dbtrail/bintrail/internal/streamrun"
 )
 
@@ -103,24 +99,6 @@ func init() {
 	rootCmd.AddCommand(streamCmd)
 }
 
-// streamDeps wires the package-main helper functions into a streamrun.Deps —
-// the host side of streamrun's dependency seam. Shared by streamConfigFromFlags
-// and the control-plane supervisor so both build identical engine deps.
-func streamDeps() streamrun.Deps {
-	return streamrun.Deps{
-		ValidateBinlogFormat:   metadata.ValidateBinlogFormat,
-		ValidateBinlogRowImage: metadata.ValidateBinlogRowImage,
-		ValidateNoFKCascades:   metadata.ValidateNoFKCascades,
-		ParseSchemaList:        cliutil.ParseSchemaList,
-		ResolveServerIdentity:  byos.ResolveServerIdentity,
-		EnsureResolver:         metadata.EnsureResolver,
-		BuildIndexFilters:      cliutil.BuildIndexFilters,
-		InsertSchemaChange:     indexer.InsertSchemaChange,
-		ParseSourceDSN:         config.ParseSourceDSN,
-		OutputJSON:             cliutil.OutputJSON,
-	}
-}
-
 // streamConfigFromFlags snapshots the strm* package globals into a
 // streamrun.Config. The globals remain the cobra flag targets (and up.go's
 // populateStreamFlags fan-out target); this is the single seam where they
@@ -146,7 +124,7 @@ func streamConfigFromFlags() streamrun.Config {
 		Reset:       strmReset,
 		NoGapFill:   strmNoGapFill,
 		GapTimeout:  strmGapTimeout,
-		Deps:        streamDeps(),
+		Deps:        streamdeps.Default(),
 	}
 }
 

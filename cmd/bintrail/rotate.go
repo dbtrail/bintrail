@@ -22,6 +22,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/storage"
 )
 
 var rotateCmd = &cobra.Command{
@@ -126,7 +127,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 	var retainDur time.Duration
 	if rotRetain != "" {
 		var err error
-		retainDur, err = parseRetain(rotRetain)
+		retainDur, err = cliutil.ParseRetain(rotRetain)
 		if err != nil {
 			return fmt.Errorf("--retain: %w", err)
 		}
@@ -251,11 +252,11 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 				var s3Client *s3.Client
 				var s3Bucket, s3Prefix string
 				if rotArchiveS3 != "" {
-					s3Bucket, s3Prefix, err = parseS3URL(rotArchiveS3)
+					s3Bucket, s3Prefix, err = storage.ParseS3URL(rotArchiveS3)
 					if err != nil {
 						return rotationResult{}, fmt.Errorf("invalid --archive-s3: %w", err)
 					}
-					s3Client, err = newS3Client(ctx, rotArchiveS3Region)
+					s3Client, err = storage.NewS3Client(ctx, rotArchiveS3Region)
 					if err != nil {
 						return rotationResult{}, fmt.Errorf("init S3 client: %w", err)
 					}
@@ -290,7 +291,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 					// in archive_state before the actual upload.
 					var s3Key string
 					if s3Client != nil {
-						s3Key, err = buildS3Key(rotArchiveDir, outPath, s3Prefix)
+						s3Key, err = storage.BuildS3Key(rotArchiveDir, outPath, s3Prefix)
 						if err != nil {
 							return rotationResult{}, fmt.Errorf("build S3 key for %s: %w", name, err)
 						}
@@ -517,7 +518,7 @@ func performRotation(ctx context.Context, db *sql.DB, dbName string, retainDur t
 
 // uploadFileFunc is the function used to upload a file to S3. It defaults to
 // uploadFile and can be overridden in tests to simulate S3 failures.
-var uploadFileFunc = uploadFile
+var uploadFileFunc = storage.UploadFile
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -596,28 +597,6 @@ func hiveArchivePath(archiveDir, bintrailID, partitionName string) (string, erro
 		fmt.Sprintf("event_hour=%02d", d.UTC().Hour()),
 		"events.parquet",
 	), nil
-}
-
-// parseRetain parses a retain string like "7d" or "24h" into a time.Duration.
-// Supported units: 'd' (days), 'h' (hours). The number must be a positive integer.
-func parseRetain(s string) (time.Duration, error) {
-	if len(s) < 2 {
-		return 0, fmt.Errorf("invalid format %q; expected Nd (days) or Nh (hours), e.g. 7d", s)
-	}
-	unit := s[len(s)-1]
-	numStr := s[:len(s)-1]
-	var n int
-	if _, err := fmt.Sscanf(numStr, "%d", &n); err != nil || n <= 0 {
-		return 0, fmt.Errorf("invalid format %q; expected Nd (days) or Nh (hours), e.g. 7d", s)
-	}
-	switch unit {
-	case 'd':
-		return time.Duration(n) * 24 * time.Hour, nil
-	case 'h':
-		return time.Duration(n) * time.Hour, nil
-	default:
-		return 0, fmt.Errorf("invalid unit %q in %q; use 'd' for days or 'h' for hours", unit, s)
-	}
 }
 
 // partitionInfo holds metadata for a single table partition.

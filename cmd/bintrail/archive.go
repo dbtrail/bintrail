@@ -19,6 +19,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/archive"
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
+	"github.com/dbtrail/bintrail/internal/storage"
 )
 
 // archiveCmd is the parent for archive-maintenance subcommands (the
@@ -234,11 +235,11 @@ func localParquetRowCount(path string, size int64) (int64, error) {
 // LastModified come free with the listing; row counts cost one metadata
 // read per object and are only fetched under --deep.
 func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]archive.ScannedFile, error) {
-	bucket, prefix, err := parseS3URL(s3URL)
+	bucket, prefix, err := storage.ParseS3URL(s3URL)
 	if err != nil {
 		return nil, err
 	}
-	client, err := newS3Client(ctx, region)
+	client, err := storage.NewS3Client(ctx, region)
 	if err != nil {
 		return nil, err
 	}

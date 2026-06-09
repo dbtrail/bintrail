@@ -72,7 +72,7 @@ func parseDocRetain(s string) (time.Duration, error) {
 	case "off", "0", "":
 		return 0, nil
 	}
-	retain, err := parseRetain(s)
+	retain, err := cliutil.ParseRetain(s)
 	if err != nil {
 		return 0, fmt.Errorf("--retain: %w (or \"off\" if you don't rotate)", err)
 	}

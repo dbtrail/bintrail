@@ -194,9 +194,9 @@ func TestStreamConfigFromFlags(t *testing.T) {
 	got := streamConfigFromFlags()
 	// The Deps seam must be wired (else streamrun.One nil-panics at runtime, and
 	// only the Docker-gated monitor integration test would catch a dropped
-	// streamDeps() call). Spot-check two fields here so a unit run flags it.
+	// streamdeps.Default() call). Spot-check two fields here so a unit run flags it.
 	if got.Deps.BuildIndexFilters == nil || got.Deps.OutputJSON == nil {
-		t.Error("streamConfigFromFlags did not wire Deps (streamDeps())")
+		t.Error("streamConfigFromFlags did not wire Deps (streamdeps.Default())")
 	}
 	// Deps holds func values (not comparable / not == ); this test checks the
 	// strm* → field snapshot, so zero it before the struct comparison.

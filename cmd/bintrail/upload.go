@@ -15,6 +15,7 @@ import (
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/indexer"
+	"github.com/dbtrail/bintrail/internal/storage"
 )
 
 var uploadCmd = &cobra.Command{
@@ -116,7 +117,7 @@ func runUpload(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --format %q; must be text or json", uplFormat)
 	}
 
-	bucket, prefix, err := parseS3URL(uplDestination)
+	bucket, prefix, err := storage.ParseS3URL(uplDestination)
 	if err != nil {
 		return fmt.Errorf("invalid --destination: %w", err)
 	}
@@ -132,7 +133,7 @@ func runUpload(cmd *cobra.Command, args []string) error {
 
 	ctx := cmd.Context()
 
-	client, err := newS3Client(ctx, uplRegion)
+	client, err := storage.NewS3Client(ctx, uplRegion)
 	if err != nil {
 		return err
 	}
@@ -156,13 +157,13 @@ func runUpload(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
-		key, err := buildS3Key(uplSource, path, prefix)
+		key, err := storage.BuildS3Key(uplSource, path, prefix)
 		if err != nil {
 			return err
 		}
 
 		if uplRetry {
-			exists, err := s3ObjectExists(ctx, client, bucket, key)
+			exists, err := storage.S3ObjectExists(ctx, client, bucket, key)
 			if err != nil {
 				return err
 			}
@@ -173,7 +174,7 @@ func runUpload(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		if err := uploadFile(ctx, client, path, bucket, key); err != nil {
+		if err := storage.UploadFile(ctx, client, path, bucket, key); err != nil {
 			return err
 		}
 		slog.Debug("uploaded", "file", path, "bucket", bucket, "key", key)

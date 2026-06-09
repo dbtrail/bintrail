@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/indexer"
 )
@@ -47,7 +48,7 @@ func parseUpRotation(retain, interval string, addFuture int, explicit bool) (upR
 	case "off", "0", "":
 		return upRotationSettings{}, nil
 	}
-	dur, err := parseRetain(retain)
+	dur, err := cliutil.ParseRetain(retain)
 	if err != nil {
 		return upRotationSettings{}, fmt.Errorf("--rotate-retain: %w (or \"off\" to disable)", err)
 	}
@@ -198,7 +199,7 @@ func rotateOneIndex(ctx context.Context, dsn string, s upRotationSettings) (int,
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		slog.Warn("built-in rotation: skipping unparseable index DSN",
-			"error", scrubMonitorErrText(err.Error(), dsn))
+			"error", config.ScrubDSNText(err.Error(), dsn))
 		return 0, fmt.Errorf("parse index DSN: %w", err)
 	}
 	if cfg.DBName == "" {
@@ -208,7 +209,7 @@ func rotateOneIndex(ctx context.Context, dsn string, s upRotationSettings) (int,
 	db, err := config.Connect(dsn)
 	if err != nil {
 		slog.Warn("built-in rotation: cannot connect to index database",
-			"db", cfg.DBName, "error", scrubMonitorErrText(err.Error(), dsn))
+			"db", cfg.DBName, "error", config.ScrubDSNText(err.Error(), dsn))
 		return 0, err
 	}
 	defer db.Close()
@@ -225,7 +226,7 @@ func rotateOneIndex(ctx context.Context, dsn string, s upRotationSettings) (int,
 		guarded, oldest, err := upgradeGuardTrips(ctx, db, cfg.DBName, s.retain)
 		if err != nil {
 			slog.Warn("built-in rotation: could not evaluate the upgrade guard; skipping drops this cycle",
-				"db", cfg.DBName, "error", scrubMonitorErrText(err.Error(), dsn))
+				"db", cfg.DBName, "error", config.ScrubDSNText(err.Error(), dsn))
 			return 0, err
 		}
 		if guarded {
@@ -241,7 +242,7 @@ func rotateOneIndex(ctx context.Context, dsn string, s upRotationSettings) (int,
 	res, err := performRotation(ctx, db, cfg.DBName, retain)
 	if err != nil && ctx.Err() == nil {
 		slog.Warn("built-in rotation cycle failed",
-			"db", cfg.DBName, "error", scrubMonitorErrText(err.Error(), dsn))
+			"db", cfg.DBName, "error", config.ScrubDSNText(err.Error(), dsn))
 		return res.deferred, err
 	}
 	return res.deferred, nil
