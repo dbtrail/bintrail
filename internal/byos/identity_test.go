@@ -1,4 +1,4 @@
-package main
+package byos
 
 import (
 	"context"
@@ -20,7 +20,7 @@ func TestLoadSourceIdentityHappyPath(t *testing.T) {
 		sqlmock.NewRows([]string{"@@server_uuid"}).
 			AddRow("11111111-2222-3333-4444-555555555555"))
 
-	ident, err := loadSourceIdentity(context.Background(), db, "repluser:secret@tcp(10.0.0.5:3306)/")
+	ident, err := LoadSourceIdentity(context.Background(), db, "repluser:secret@tcp(10.0.0.5:3306)/")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestLoadSourceIdentityServerUUIDQueryFails(t *testing.T) {
 
 	mock.ExpectQuery("SELECT @@server_uuid").WillReturnError(errors.New("connection refused"))
 
-	_, err = loadSourceIdentity(context.Background(), db, "u:p@tcp(h:3306)/")
+	_, err = LoadSourceIdentity(context.Background(), db, "u:p@tcp(h:3306)/")
 	if err == nil {
 		t.Fatal("expected error when @@server_uuid query fails")
 	}
@@ -65,7 +65,7 @@ func TestLoadSourceIdentityBadDSN(t *testing.T) {
 		sqlmock.NewRows([]string{"@@server_uuid"}).AddRow("uuid-x"))
 
 	// config.ParseSourceDSN rejects unix sockets — use that as the easy bad-DSN trigger.
-	_, err = loadSourceIdentity(context.Background(), db, "u:p@unix(/tmp/sock)/")
+	_, err = LoadSourceIdentity(context.Background(), db, "u:p@unix(/tmp/sock)/")
 	if err == nil {
 		t.Fatal("expected error for unix-socket DSN")
 	}

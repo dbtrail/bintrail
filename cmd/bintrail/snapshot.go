@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/bintrail/internal/byos"
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/metadata"
@@ -64,7 +65,7 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 	defer indexDB.Close()
 
 	// Resolve server identity before doing any index work.
-	bintrailID, err := resolveServerIdentity(cmd.Context(), sourceDB, indexDB, snapshotSourceDSN)
+	bintrailID, err := byos.ResolveServerIdentity(cmd.Context(), sourceDB, indexDB, snapshotSourceDSN)
 	if err != nil {
 		if errors.Is(err, serverid.ErrConflict) {
 			return fmt.Errorf("cannot snapshot: %w", err)

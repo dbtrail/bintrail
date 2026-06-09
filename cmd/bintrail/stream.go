@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/bintrail/internal/byos"
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/indexer"
@@ -111,7 +112,7 @@ func streamDeps() streamrun.Deps {
 		ValidateBinlogRowImage: metadata.ValidateBinlogRowImage,
 		ValidateNoFKCascades:   metadata.ValidateNoFKCascades,
 		ParseSchemaList:        cliutil.ParseSchemaList,
-		ResolveServerIdentity:  resolveServerIdentity,
+		ResolveServerIdentity:  byos.ResolveServerIdentity,
 		EnsureResolver:         metadata.EnsureResolver,
 		BuildIndexFilters:      cliutil.BuildIndexFilters,
 		InsertSchemaChange:     indexer.InsertSchemaChange,

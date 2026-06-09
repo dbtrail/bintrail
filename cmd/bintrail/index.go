@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/bintrail/internal/byos"
 	"github.com/dbtrail/bintrail/internal/cliutil"
 	"github.com/dbtrail/bintrail/internal/config"
 	"github.com/dbtrail/bintrail/internal/indexer"
@@ -115,7 +116,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	var bintrailID string
 	if sourceDB != nil {
 		var idErr error
-		bintrailID, idErr = resolveServerIdentity(ctx, sourceDB, indexDB, idxSourceDSN)
+		bintrailID, idErr = byos.ResolveServerIdentity(ctx, sourceDB, indexDB, idxSourceDSN)
 		if idErr != nil {
 			if errors.Is(idErr, serverid.ErrConflict) {
 				return fmt.Errorf("cannot index: %w", idErr)
