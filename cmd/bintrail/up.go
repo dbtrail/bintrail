@@ -193,8 +193,10 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 	// when the stream starts draining.
 	rotCtx, rotStop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer rotStop()
-	rotation.StartLoop(rotCtx, upRotationCfg, func() []string {
-		return []string{upIndexDSN}
+	// Core `up` is single-source and has no control plane / registry, so its
+	// rotation is drop-only (no per-source S3 archive config).
+	rotation.StartLoop(rotCtx, upRotationCfg, func() []rotation.RotateTarget {
+		return []rotation.RotateTarget{{DSN: upIndexDSN}}
 	})
 	return runStream(cmd, args)
 }

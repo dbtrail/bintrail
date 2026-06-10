@@ -57,7 +57,8 @@ func captureSlog(t *testing.T) *logCapture {
 // which guarded the rot*-global fan-out that loopOptions superseded.
 func TestLoopOptions(t *testing.T) {
 	s := Settings{Enabled: true, Retain: 30 * 24 * time.Hour, RetainRaw: "30d", AddFuture: 3}
-	o := loopOptions(7*24*time.Hour, s)
+	// A drop-only target (no ArchiveS3) is the default, data-loss-safe shape.
+	o := loopOptions(7*24*time.Hour, s, RotateTarget{DSN: "x"})
 
 	if !o.ProtectUnarchived {
 		t.Error("ProtectUnarchived must be armed — without it the built-in rotation drops unarchived data")
@@ -66,11 +67,11 @@ func TestLoopOptions(t *testing.T) {
 		t.Error("NoReplace must be false (dropped partitions are replaced)")
 	}
 	if o.ArchiveDir != "" || o.ArchiveS3 != "" || o.BintrailID != "" {
-		t.Errorf("archive fields must be empty (built-in rotation never archives): dir=%q s3=%q id=%q",
+		t.Errorf("a drop-only target must leave archive fields empty: dir=%q s3=%q id=%q",
 			o.ArchiveDir, o.ArchiveS3, o.BintrailID)
 	}
 	if o.Retry {
-		t.Error("Retry must be false")
+		t.Error("Retry must be false for a drop-only target")
 	}
 	if o.Format != "json" {
 		t.Errorf("Format = %q, want json (suppresses per-partition stdout chatter)", o.Format)
@@ -86,11 +87,41 @@ func TestLoopOptions(t *testing.T) {
 	}
 }
 
+// TestLoopOptionsArchive: a target carrying an ArchiveS3 bucket flips the cycle
+// into archive-then-drop with the staging dir, bintrail_id, retry, and local
+// prune all wired through from the target.
+func TestLoopOptionsArchive(t *testing.T) {
+	s := Settings{Enabled: true, Retain: 30 * 24 * time.Hour, RetainRaw: "30d", AddFuture: 3}
+	o := loopOptions(s.Retain, s, RotateTarget{
+		DSN:                "x",
+		ArchiveDir:         "/staging/abc",
+		ArchiveS3:          "s3://bucket/prefix/",
+		ArchiveS3Region:    "us-east-1",
+		BintrailID:         "uuid-123",
+		ArchiveCompression: "zstd",
+	})
+	if o.ArchiveDir != "/staging/abc" || o.ArchiveS3 != "s3://bucket/prefix/" || o.BintrailID != "uuid-123" {
+		t.Errorf("archive config not threaded through: %+v", o)
+	}
+	if o.ArchiveS3Region != "us-east-1" || o.ArchiveCompression != "zstd" {
+		t.Errorf("region/compression not threaded: region=%q codec=%q", o.ArchiveS3Region, o.ArchiveCompression)
+	}
+	if !o.Retry {
+		t.Error("Retry must be true when archiving (skip what a prior cycle already did)")
+	}
+	if !o.PruneLocalAfterUpload {
+		t.Error("PruneLocalAfterUpload must be true for the unattended loop")
+	}
+	if !o.ProtectUnarchived {
+		t.Error("ProtectUnarchived stays armed")
+	}
+}
+
 // TestStartLoop_disabledIsInert verifies the disabled path starts no loop and
 // never consults the DSN provider.
 func TestStartLoop_disabledIsInert(t *testing.T) {
 	called := false
-	done := StartLoop(context.Background(), Settings{}, func() []string {
+	done := StartLoop(context.Background(), Settings{}, func() []RotateTarget {
 		called = true
 		return nil
 	})
@@ -125,8 +156,8 @@ func TestStartLoop_escalatesAfterConsecutiveFailures(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	// Port 1 on loopback: connection refused immediately, every cycle fails.
-	done := StartLoop(ctx, s, func() []string {
-		return []string{"root:x@tcp(127.0.0.1:1)/nope"}
+	done := StartLoop(ctx, s, func() []RotateTarget {
+		return []RotateTarget{{DSN: "root:x@tcp(127.0.0.1:1)/nope"}}
 	})
 
 	deadline := time.After(15 * time.Second)
@@ -199,8 +230,8 @@ func TestRunCycle_reportsFailure(t *testing.T) {
 		Enabled: true, Retain: 24 * time.Hour, RetainRaw: "24h",
 		Interval: time.Hour, Explicit: true,
 	}
-	deferred, failed := runCycle(context.Background(), s, func() []string {
-		return []string{"root:x@tcp(127.0.0.1:1)/nope", "not-a-dsn"}
+	deferred, failed := runCycle(context.Background(), s, func() []RotateTarget {
+		return []RotateTarget{{DSN: "root:x@tcp(127.0.0.1:1)/nope"}, {DSN: "not-a-dsn"}}
 	})
 	if !failed {
 		t.Error("cycle with unreachable DSNs must report failed=true")
@@ -270,16 +301,16 @@ func TestParseSettings_negativeAddFuture(t *testing.T) {
 	}
 }
 
-func TestDedupeDSNs(t *testing.T) {
-	in := []string{"a", "", "b", "a", "c", "b"}
-	got := dedupeDSNs(in)
+func TestDedupeTargets(t *testing.T) {
+	in := []RotateTarget{{DSN: "a"}, {DSN: ""}, {DSN: "b"}, {DSN: "a"}, {DSN: "c"}, {DSN: "b"}}
+	got := dedupeTargets(in)
 	want := []string{"a", "b", "c"}
 	if len(got) != len(want) {
-		t.Fatalf("dedupeDSNs = %v, want %v", got, want)
+		t.Fatalf("dedupeTargets = %v, want DSNs %v", got, want)
 	}
 	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("dedupeDSNs = %v, want %v", got, want)
+		if got[i].DSN != want[i] {
+			t.Fatalf("dedupeTargets[%d].DSN = %q, want %q", i, got[i].DSN, want[i])
 		}
 	}
 }

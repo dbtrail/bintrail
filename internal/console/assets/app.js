@@ -1562,7 +1562,9 @@ function buildServerForm() {
   monGrid.append(srvField("Source user", "source_user", { placeholder: "repl" }));
   monGrid.append(srvField("Source password", "source_password", { type: "password", autocomplete: "new-password" }));
   monGrid.append(srvField("Schemas", "schemas", { placeholder: "(optional) shop,billing" }));
+  monGrid.append(srvField("Archive to S3", "archive_s3", { placeholder: "(optional) s3://bucket/prefix/" }));
   mon.append(monGrid);
+  mon.append(el("p", { class: "form-hint", style: "margin-top:10px", text: "Archive to S3: rotated partitions upload here as Parquet before they're dropped, so the history survives retention and stays queryable. Needs AWS credentials on the daemon (env / role)." }));
   form.append(mon);
 
   // BYO index is the advanced path — collapsed behind a <details> so the
@@ -1620,7 +1622,7 @@ function showServerForm(prefill) {
 
   if (prefill) {
     form.elements.id.value = prefill.id || "";
-    ["name", "host", "port", "user", "dbname", "baseline_dir", "baseline_s3", "source_host", "source_port", "source_user", "schemas"].forEach((k) => {
+    ["name", "host", "port", "user", "dbname", "baseline_dir", "baseline_s3", "archive_s3", "source_host", "source_port", "source_user", "schemas"].forEach((k) => {
       if (form.elements[k] && prefill[k] != null) form.elements[k].value = prefill[k];
     });
     if (form.elements.no_archive) form.elements.no_archive.checked = !!prefill.no_archive;
@@ -1650,6 +1652,7 @@ function serverFormBody(form) {
     host: f.host.value.trim(), port: f.port.value.trim(), user: f.user.value.trim(), dbname: f.dbname.value.trim(),
     baseline_dir: f.baseline_dir.value.trim(), baseline_s3: f.baseline_s3.value.trim(),
     no_archive: !!f.no_archive.checked,
+    archive_s3: f.archive_s3.value.trim(),
     source_host: f.source_host.value.trim(), source_port: f.source_port.value.trim(),
     source_user: f.source_user.value.trim(), schemas: f.schemas.value.trim(),
   };

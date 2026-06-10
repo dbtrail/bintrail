@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Configure S3 archiving for a monitored source from the console UI.** A new "Archive to S3" field on a monitored server (under `bintrail-console watch`) takes an `s3://bucket/prefix/` destination; the daemon's built-in rotation then uploads that source's rotated partitions as Parquet **before** dropping them, so the forensic record survives the retention window and the console auto-discovers it on the next query — no extra setup. Partitions are staged locally (`--archive-staging-dir` / `BINTRAIL_CONSOLE_ARCHIVE_STAGING`), uploaded with the ambient AWS credential chain (`AWS_*` / `~/.aws` / instance role), then pruned. Archiving begins once a source's identity is resolved; until then it rotates drop-only and the protect-unarchived guard never drops un-uploaded data. The Docker Compose stack now passes `AWS_*` through from `.env` and stages under the state volume. (Archive S3 is the write side; the existing `Baseline S3` field is the read-side Time-travel input — they are distinct.)
+
 ## [0.12.0] - 2026-06-10
 
 ### Changed

@@ -162,6 +162,19 @@ services:
       BINTRAIL_CONSOLE_TOKEN: ${CONSOLE_TOKEN:-}
       # Saved console connections persist across container recreations.
       BINTRAIL_CONSOLE_SERVERS: /var/lib/bintrail/console-servers.yaml
+      # Local staging for the "Archive to S3" feature (a source's rotated
+      # Parquet is written here, uploaded to its configured bucket, then
+      # pruned). Lives in the state volume so an interrupted upload survives a
+      # restart.
+      BINTRAIL_CONSOLE_ARCHIVE_STAGING: /var/lib/bintrail/archives
+      # AWS credentials for "Archive to S3" (the bucket is set per-source from
+      # the console UI). Passed through from .env; leave empty to rely on an
+      # IAM role (EC2/EKS) or a mounted ~/.aws. Needed for BOTH the upload and
+      # the console querying the archived Parquet back from S3.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-}
       # Password login (persists next to the registry). On first run the
       # console serves a "create your password" screen; later visits sign in.
       # There is deliberately NO password env var: docker inspect must never

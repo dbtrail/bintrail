@@ -67,14 +67,30 @@ func ParseSettings(retain, interval string, addFuture int, explicit bool) (Setti
 	}, nil
 }
 
+// RotateTarget is one index database the loop rotates this cycle, plus its
+// optional per-source archive config. ArchiveS3 == "" means drop-only (the
+// historical behavior). When ArchiveS3 is set, the cycle archives each expired
+// partition to ArchiveDir (a local staging dir) under bintrail_id=BintrailID,
+// uploads it to ArchiveS3, then drops it — and prunes the local copy. The
+// provider (cmd/bintrail-console) is responsible for only setting the archive
+// fields once BintrailID is known (resolved from the source's stream_state).
+type RotateTarget struct {
+	DSN                string
+	ArchiveDir         string
+	ArchiveS3          string
+	ArchiveS3Region    string
+	BintrailID         string
+	ArchiveCompression string
+}
+
 // StartLoop announces and launches the built-in rotation loop: one
-// cycle immediately, then one every interval, each cycle rotating the boot
-// index database plus every DSN the provider returns (the control plane's
-// per-source databases). Rotation is the secondary job — failures are logged,
-// never fatal to the stream. Returns immediately; the loop stops when ctx is
-// cancelled, and the returned channel closes when it has fully exited (used
-// by tests for deterministic shutdown; production callers may ignore it).
-func StartLoop(ctx context.Context, s Settings, dsns func() []string) <-chan struct{} {
+// cycle immediately, then one every interval, each cycle rotating every target
+// the provider returns (the boot index plus the control plane's per-source
+// databases). Rotation is the secondary job — failures are logged, never fatal
+// to the stream. Returns immediately; the loop stops when ctx is cancelled, and
+// the returned channel closes when it has fully exited (used by tests for
+// deterministic shutdown; production callers may ignore it).
+func StartLoop(ctx context.Context, s Settings, targets func() []RotateTarget) <-chan struct{} {
 	done := make(chan struct{})
 	if !s.Enabled {
 		fmt.Fprintln(os.Stderr, "Built-in rotation: off — the index grows until you rotate it yourself (see `bintrail rotate`)")
@@ -109,7 +125,7 @@ func StartLoop(ctx context.Context, s Settings, dsns func() []string) <-chan str
 					slog.Error("built-in rotation cycle panicked; rotation continues next tick", "panic", r)
 				}
 			}()
-			deferred, failed := runCycle(ctx, s, dsns)
+			deferred, failed := runCycle(ctx, s, targets)
 			if failed || deferred > 0 {
 				unhealthyStreak++
 			} else {
@@ -143,12 +159,12 @@ func StartLoop(ctx context.Context, s Settings, dsns func() []string) <-chan str
 var escalateAfter = 3
 
 // runCycle rotates each index database once. Errors are logged and
-// the cycle moves to the next DSN — a transient failure self-heals on the
+// the cycle moves to the next target — a transient failure self-heals on the
 // next tick. Returns the total number of partitions the protect-unarchived
 // guard deferred this cycle, and whether any database's rotation failed.
-func runCycle(ctx context.Context, s Settings, dsns func() []string) (deferred int, failed bool) {
-	for _, dsn := range dedupeDSNs(dsns()) {
-		d, err := rotateOneIndex(ctx, dsn, s)
+func runCycle(ctx context.Context, s Settings, targets func() []RotateTarget) (deferred int, failed bool) {
+	for _, t := range dedupeTargets(targets()) {
+		d, err := rotateOneIndex(ctx, t, s)
 		deferred += d
 		if err != nil {
 			failed = true
@@ -157,29 +173,29 @@ func runCycle(ctx context.Context, s Settings, dsns func() []string) (deferred i
 	return deferred, failed
 }
 
-// dedupeDSNs drops empty strings and duplicates, preserving order.
-func dedupeDSNs(in []string) []string {
+// dedupeTargets drops empty-DSN and duplicate-DSN targets, preserving order.
+func dedupeTargets(in []RotateTarget) []RotateTarget {
 	seen := make(map[string]bool, len(in))
-	out := make([]string, 0, len(in))
-	for _, dsn := range in {
-		if dsn == "" || seen[dsn] {
+	out := make([]RotateTarget, 0, len(in))
+	for _, t := range in {
+		if t.DSN == "" || seen[t.DSN] {
 			continue
 		}
-		seen[dsn] = true
-		out = append(out, dsn)
+		seen[t.DSN] = true
+		out = append(out, t)
 	}
 	return out
 }
 
-// loopOptions builds the Perform Options for one built-in-rotation cycle.
-// Built-in rotation never archives (ArchiveDir empty) — it drops and tops up
-// only — and ALWAYS arms ProtectUnarchived so it can never be the first to
-// destroy data an external archiving flow would preserve; Format "json"
-// suppresses per-partition stdout (slog carries the per-cycle signal). The
-// data-loss safety of `up`'s rotation reduces to this one constructor, so it is
-// kept pure and unit-tested (it replaces the old rot*-global fan-out).
-func loopOptions(retain time.Duration, s Settings) Options {
-	return Options{
+// loopOptions builds the Perform Options for one built-in-rotation cycle. It
+// ALWAYS arms ProtectUnarchived so the loop can never be the first to destroy
+// data an external archiving flow would preserve; Format "json" suppresses
+// per-partition stdout (slog carries the per-cycle signal). When the target
+// carries an ArchiveS3 bucket, the cycle archives-then-drops (and prunes the
+// local staging copy after upload); otherwise ArchiveDir is empty and it
+// drops-and-tops-up only — the historical behavior.
+func loopOptions(retain time.Duration, s Settings, t RotateTarget) Options {
+	o := Options{
 		RetainDur:         retain,
 		RetainRaw:         s.RetainRaw,
 		AddFuture:         s.AddFuture,
@@ -187,12 +203,23 @@ func loopOptions(retain time.Duration, s Settings) Options {
 		Format:            "json",
 		ProtectUnarchived: true,
 	}
+	if t.ArchiveS3 != "" {
+		o.ArchiveDir = t.ArchiveDir
+		o.ArchiveS3 = t.ArchiveS3
+		o.ArchiveS3Region = t.ArchiveS3Region
+		o.BintrailID = t.BintrailID
+		o.ArchiveCompression = t.ArchiveCompression
+		o.Retry = true                 // skip re-archiving/re-uploading what a prior cycle already did
+		o.PruneLocalAfterUpload = true // unattended daemon: don't grow the staging dir
+	}
+	return o
 }
 
-// rotateOneIndex runs one Perform cycle against a single index DSN,
+// rotateOneIndex runs one Perform cycle against a single target's index DSN,
 // returning the guard-deferred partition count and any failure. Log messages
 // are scrubbed: DSNs (and their passwords) never reach the log.
-func rotateOneIndex(ctx context.Context, dsn string, s Settings) (int, error) {
+func rotateOneIndex(ctx context.Context, t RotateTarget, s Settings) (int, error) {
+	dsn := t.DSN
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		slog.Warn("built-in rotation: skipping unparseable index DSN",
@@ -236,7 +263,7 @@ func rotateOneIndex(ctx context.Context, dsn string, s Settings) (int, error) {
 		}
 	}
 
-	res, err := Perform(ctx, db, cfg.DBName, loopOptions(retain, s))
+	res, err := Perform(ctx, db, cfg.DBName, loopOptions(retain, s, t))
 	if err != nil && ctx.Err() == nil {
 		slog.Warn("built-in rotation cycle failed",
 			"db", cfg.DBName, "error", config.ScrubDSNText(err.Error(), dsn))

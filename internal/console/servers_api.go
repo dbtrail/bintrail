@@ -38,6 +38,7 @@ type serverDTO struct {
 	BaselineDir string            `json:"baseline_dir,omitempty"`
 	BaselineS3  string            `json:"baseline_s3,omitempty"`
 	NoArchive   bool              `json:"no_archive"`
+	ArchiveS3   string            `json:"archive_s3,omitempty"`
 	// Source-monitoring config (control plane). HasSource reports whether a
 	// source DSN is configured at all; the parts are its masked view — the
 	// source DSN itself (replication credentials) never leaves the process.
@@ -89,6 +90,7 @@ type serverRequest struct {
 	BaselineDir string  `json:"baseline_dir"`
 	BaselineS3  string  `json:"baseline_s3"`
 	NoArchive   bool    `json:"no_archive"`
+	ArchiveS3   string  `json:"archive_s3"`
 
 	SourceDSN      *string `json:"source_dsn"`
 	SourceHost     string  `json:"source_host"`
@@ -189,6 +191,7 @@ func (s *Server) handleServersCreate(w http.ResponseWriter, r *http.Request) {
 		BaselineDir:    req.BaselineDir,
 		BaselineS3:     req.BaselineS3,
 		NoArchive:      req.NoArchive,
+		ArchiveS3:      strings.TrimSpace(req.ArchiveS3),
 		SourceDSN:      sourceDSN,
 		SourceServerID: req.SourceServerID,
 		Schemas:        req.Schemas,
@@ -260,6 +263,7 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 		BaselineDir: req.BaselineDir,
 		BaselineS3:  req.BaselineS3,
 		NoArchive:   req.NoArchive,
+		ArchiveS3:   strings.TrimSpace(req.ArchiveS3),
 		SourceDSN:   sourceDSN,
 		// The verbs that flip monitoring intent arrive with the supervisor
 		// (phase 3); a plain edit must not silently start or stop anything.
@@ -696,6 +700,7 @@ func (s *Server) entryDTO(e ServerEntry) serverDTO {
 		BaselineDir:    e.BaselineDir,
 		BaselineS3:     e.BaselineS3,
 		NoArchive:      e.NoArchive,
+		ArchiveS3:      e.ArchiveS3,
 		Reconstruct:    s.cm.capability(e),
 		Editable:       !s.cm.reg.ReadOnly(),
 		Deletable:      !s.cm.reg.ReadOnly(),
@@ -748,6 +753,7 @@ func (s *Server) bootDTO() (serverDTO, bool) {
 		Reconstruct: boot.baselineConfigured,
 		BaselineDir: "",
 		BaselineS3:  "",
+		ArchiveS3:   "",
 		Editable:    false,
 		Deletable:   false,
 		Connected:   true,

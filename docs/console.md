@@ -184,9 +184,28 @@ immediately; warnings (e.g. short binlog retention) show but don't block.
 - With `--metrics-addr`, the daemon serves one Prometheus `/metrics` endpoint
   for all supervised streams; every series carries a `source` label set to
   the entry ID (see [streaming.md](streaming.md)).
+- **Archive to S3** (the `Archive to S3` field on a monitored source): set an
+  `s3://bucket/prefix/` destination and the daemon's built-in rotation
+  **uploads that source's rotated partitions as Parquet before dropping them**,
+  so the forensic record survives the retention window and stays queryable —
+  the console auto-discovers the archive on the next query, no extra config.
+  Partitions are staged locally (`--archive-staging-dir` /
+  `BINTRAIL_CONSOLE_ARCHIVE_STAGING`, default a temp dir), uploaded, then
+  pruned. The S3 upload uses the **ambient AWS credential chain** (`AWS_*`
+  env, `~/.aws`, or an instance/role) — the same credentials the console needs
+  to read the archive back; there is no per-source credential. Archiving for a
+  source begins once its identity (`bintrail_id`) is resolved (right after its
+  first stream connect); until then it rotates drop-only, and the
+  protect-unarchived guard never drops un-uploaded data. A persistently failing
+  upload (bad bucket/credentials) keeps partitions undropped and escalates to a
+  loud Error after a few cycles — the index does not silently lose data, but it
+  does stop shrinking, so fix the bucket/credentials. The archived Parquet is
+  unencrypted; rely on bucket-level SSE/policy. Archive to S3 ≠ Baseline S3
+  (the latter is read-side Time-travel input).
 - Registry fields: `source_dsn` (replication credentials — a secret with the
   same masking/keep-password discipline as the index DSN; `source_dsn: ""`
-  clears it), `source_server_id` (0 = derived), `schemas`, `monitor_desired`.
+  clears it), `source_server_id` (0 = derived), `schemas`, `monitor_desired`,
+  `archive_s3` (the bucket above — non-secret, round-trips in the masked DTO).
 
 The standalone read-only `bintrail-console serve` never offers any of this:
 the `monitor` capability is false and the verbs return 403 there.
@@ -220,6 +239,9 @@ the `monitor` capability is false and the verbs return 403 there.
 - `BINTRAIL_CONSOLE_TLS_CERT` / `BINTRAIL_CONSOLE_TLS_KEY` — same as `--tls-cert` / `--tls-key`.
 - `BINTRAIL_CONSOLE_ALLOWED_HOSTS` — comma-separated, same as `--allowed-hosts`.
 - `BINTRAIL_CONSOLE_ALLOW_SETUP` — `1`/`true`, same as `--allow-setup`.
+- `BINTRAIL_CONSOLE_ARCHIVE_STAGING` (`watch` only) — local staging dir for the
+  Archive-to-S3 feature, same as `--archive-staging-dir`. AWS credentials for
+  the upload come from the ambient chain (`AWS_*` / `~/.aws` / role).
 
 There is deliberately **no** environment variable for the password itself —
 env vars leak through `docker inspect`, `ps e`, and `/proc`; the password is

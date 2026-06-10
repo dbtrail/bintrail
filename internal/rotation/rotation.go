@@ -59,6 +59,13 @@ type Options struct {
 	// built-in rotation must not be the first to destroy data an archiving flow
 	// would preserve. The explicit rotate command leaves this false.
 	ProtectUnarchived bool
+	// PruneLocalAfterUpload removes the local staging Parquet once it has been
+	// uploaded to S3 and the partition dropped. The unattended built-in loop
+	// sets this so a container's staging dir doesn't grow without bound; the
+	// read side falls back to S3 when the local copy is gone. Requires
+	// ArchiveS3 (a local-only archive IS the durable copy — never pruned). The
+	// explicit rotate command leaves this false (operator keeps both copies).
+	PruneLocalAfterUpload bool
 }
 
 // Perform executes one full rotation cycle against an open DB connection,
@@ -254,6 +261,15 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 					slog.Info("dropped partition", "partition", name)
 					if opts.Format != "json" {
 						fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+					}
+
+					// We only reach the drop once the S3 copy is confirmed (the
+					// pending-upload guard above), so removing the local staging
+					// Parquet is safe — reads fall back to S3. Best-effort.
+					if opts.PruneLocalAfterUpload && opts.ArchiveS3 != "" {
+						if err := os.Remove(outPath); err != nil && !os.IsNotExist(err) {
+							slog.Warn("could not prune local archive after S3 upload", "partition", name, "error", err)
+						}
 					}
 				}
 			} else {

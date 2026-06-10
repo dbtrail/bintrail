@@ -513,12 +513,32 @@ func (m *monitorSupervisor) Stop(ctx context.Context, entryID string) error {
 // warning until superseded or stopped — deliberate: the broken entry should
 // stay loud, and Stop() removes it from the map.
 func (m *monitorSupervisor) ActiveIndexDSNs() []string {
+	jobs := m.ActiveJobs()
+	out := make([]string, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, j.IndexDSN)
+	}
+	return out
+}
+
+// ActiveJob pairs a supervised entry's id with its per-source index DSN, so the
+// rotation provider can look the entry up in the registry (for its ArchiveS3)
+// and read its resolved bintrail_id.
+type ActiveJob struct {
+	EntryID  string
+	IndexDSN string
+}
+
+// ActiveJobs returns one ActiveJob per supervised job with a known index DSN —
+// the per-source databases the built-in rotation covers alongside the boot
+// index. Same inclusion rules as ActiveIndexDSNs (every job state).
+func (m *monitorSupervisor) ActiveJobs() []ActiveJob {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]string, 0, len(m.jobs))
-	for _, j := range m.jobs {
+	out := make([]ActiveJob, 0, len(m.jobs))
+	for id, j := range m.jobs {
 		if j.indexDSN != "" {
-			out = append(out, j.indexDSN)
+			out = append(out, ActiveJob{EntryID: id, IndexDSN: j.indexDSN})
 		}
 	}
 	return out

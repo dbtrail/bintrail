@@ -4,6 +4,9 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/rotation"
 )
 
 // This file mutates up* package globals via save-and-restore. DO NOT add
@@ -262,4 +265,87 @@ func TestResolveUpConsoleEnvAuthTLS(t *testing.T) {
 	assertStr(t, "upConsoleAuthFile (flag)", upConsoleAuthFile, "/flag/auth.yaml")
 	assertStr(t, "upConsoleTLSCert (flag)", upConsoleTLSCert, "/flag/cert.pem")
 	assertStr(t, "upConsoleTLSKey (flag)", upConsoleTLSKey, "/flag/key.pem")
+}
+
+// TestRotateTargets covers the per-source archive wiring: the boot index is
+// drop-only; a source whose registry entry has an Archive S3 bucket archives
+// to it (with a per-entry staging dir + resolved bintrail_id); a source with
+// no bucket, or whose bintrail_id is unresolved, rotates drop-only.
+func TestRotateTargets(t *testing.T) {
+	reg, err := console.LoadRegistry("") // in-memory
+	if err != nil {
+		t.Fatal(err)
+	}
+	arch, err := reg.Add(console.ServerEntry{Name: "src-archived", ArchiveS3: "s3://bucket/prefix/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := reg.Add(console.ServerEntry{Name: "src-plain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingID, err := reg.Add(console.ServerEntry{Name: "src-archived-pending", ArchiveS3: "s3://bucket/pending/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sup := &monitorSupervisor{
+		registry: reg,
+		jobs: map[string]*monitorJob{
+			arch.ID:      {indexDSN: "dsn-arch"},
+			plain.ID:     {indexDSN: "dsn-plain"},
+			pendingID.ID: {indexDSN: "dsn-pending"},
+		},
+	}
+
+	prev := resolveBintrailIDFunc
+	resolveBintrailIDFunc = func(dsn string) string {
+		if dsn == "dsn-pending" {
+			return "" // identity not yet resolved → archive waits
+		}
+		return "uuid-" + dsn
+	}
+	t.Cleanup(func() { resolveBintrailIDFunc = prev })
+
+	targets := rotateTargets("boot-dsn", sup, reg, "/stage")
+	byDSN := map[string]rotation.RotateTarget{}
+	for _, tg := range targets {
+		byDSN[tg.DSN] = tg
+	}
+
+	if boot := byDSN["boot-dsn"]; boot.ArchiveS3 != "" {
+		t.Errorf("boot index must be drop-only, got ArchiveS3=%q", boot.ArchiveS3)
+	}
+	a := byDSN["dsn-arch"]
+	if a.ArchiveS3 != "s3://bucket/prefix/" || a.BintrailID != "uuid-dsn-arch" {
+		t.Errorf("archived source target wrong: %+v", a)
+	}
+	if a.ArchiveDir != "/stage/"+arch.ID {
+		t.Errorf("staging dir = %q, want /stage/%s", a.ArchiveDir, arch.ID)
+	}
+	if a.ArchiveCompression != "zstd" {
+		t.Errorf("compression = %q, want zstd", a.ArchiveCompression)
+	}
+	if p := byDSN["dsn-plain"]; p.ArchiveS3 != "" {
+		t.Errorf("no-bucket source must be drop-only, got %+v", p)
+	}
+	if pend := byDSN["dsn-pending"]; pend.ArchiveS3 != "" {
+		t.Errorf("unresolved-bintrail_id source must rotate drop-only until resolved, got %+v", pend)
+	}
+}
+
+func TestArchiveStagingEnvFallback(t *testing.T) {
+	saved := upArchiveStageDir
+	t.Cleanup(func() { upArchiveStageDir = saved })
+	if watchCmd.Flags().Lookup("archive-staging-dir") == nil {
+		t.Fatal("flag --archive-staging-dir not registered on watchCmd")
+	}
+	cmd := &cobra.Command{}
+	cmd.Flags().StringVar(&upArchiveStageDir, "archive-staging-dir", "", "")
+	t.Setenv("BINTRAIL_CONSOLE_ARCHIVE_STAGING", "/env/staging")
+	upArchiveStageDir = ""
+	resolveUpConsoleEnv(cmd)
+	if upArchiveStageDir != "/env/staging" {
+		t.Errorf("archive-staging-dir from env = %q, want /env/staging", upArchiveStageDir)
+	}
 }

@@ -66,6 +66,14 @@ type ServerEntry struct {
 	SourceServerID uint32 `yaml:"source_server_id,omitempty"`
 	// Schemas is the optional comma-separated schema filter for monitoring.
 	Schemas string `yaml:"schemas,omitempty"`
+	// ArchiveS3 is the S3 destination (s3://bucket/prefix/) the daemon's
+	// built-in rotation uploads this source's rotated Parquet partitions to
+	// BEFORE dropping them — so the forensic record survives retention and
+	// stays queryable (the console auto-discovers it). Empty = drop-only.
+	// Region/credentials come from the ambient AWS chain (env / ~/.aws / IAM
+	// role); a local staging dir is used transiently. Non-secret (a bucket
+	// URL): unlike DSNs it is serialized to the masked HTTP responses.
+	ArchiveS3 string `yaml:"archive_s3,omitempty"`
 	// MonitorDesired records the operator's intent to monitor this source.
 	// The supervisor reconciles running streams against it at boot and on
 	// every edit; nothing reads it until phase 3.

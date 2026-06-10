@@ -40,7 +40,7 @@ func TestRotateOneIndex_UpgradeGuard(t *testing.T) {
 	}
 
 	// Implicit default: the guard must refuse the drop and say so loudly.
-	if _, err := rotateOneIndex(context.Background(), dsn, s); err != nil {
+	if _, err := rotateOneIndex(context.Background(), RotateTarget{DSN: dsn}, s); err != nil {
 		t.Fatalf("rotateOneIndex (implicit): %v", err)
 	}
 	partitions, err := listPartitions(context.Background(), db, dbName)
@@ -72,7 +72,7 @@ func TestRotateOneIndex_UpgradeGuard(t *testing.T) {
 
 	// Explicit choice: the same retention now drops the old history.
 	s.Explicit = true
-	if _, err := rotateOneIndex(context.Background(), dsn, s); err != nil {
+	if _, err := rotateOneIndex(context.Background(), RotateTarget{DSN: dsn}, s); err != nil {
 		t.Fatalf("rotateOneIndex (explicit): %v", err)
 	}
 	partitions, err = listPartitions(context.Background(), db, dbName)
@@ -118,8 +118,8 @@ func TestStartLoop_escalatesOnPersistentDeferral(t *testing.T) {
 		Explicit: true, // h1 is only 30h old; guard wouldn't trip, but be unambiguous
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := StartLoop(ctx, s, func() []string {
-		return []string{testutil.IntegrationDSN(dbName)}
+	done := StartLoop(ctx, s, func() []RotateTarget {
+		return []RotateTarget{{DSN: testutil.IntegrationDSN(dbName)}}
 	})
 
 	deadline := time.After(30 * time.Second)
