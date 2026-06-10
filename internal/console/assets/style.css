@@ -1,5 +1,5 @@
 /* ============================================================
-   bintrail console — light, warm redesign
+   dbtrail console — light, warm redesign
    Type:  Bricolage Grotesque (display) · Hanken Grotesk (UI) · IBM Plex Mono (data)
    Accent system: blue (primary) + orange + ochre, on white, warm neutrals.
    Three directions via [data-dir="paper" | "studio" | "trail"].
@@ -1060,7 +1060,7 @@ button { font-family: inherit; }
 }
 
 /* ============================================================
-   bintrail console — functional additions
+   dbtrail console — functional additions
    The prototype above is a design scaffold. These rules style the
    real-app pieces it omitted (server management depth, doctor cards,
    capability gating, toast, errors/warnings, exports), using ONLY the

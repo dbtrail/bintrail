@@ -134,7 +134,7 @@ Security notes specific to the registry:
   everything else.
 
 The registry file is versioned and forward-compatible: fields written by a
-newer bintrail survive load→edit→save round-trips on an older binary, and a
+newer dbtrail survive load→edit→save round-trips on an older binary, and a
 file written by a newer *schema* version loads read-only rather than being
 rewritten lossily.
 

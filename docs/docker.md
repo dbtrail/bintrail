@@ -171,8 +171,8 @@ The bundled index is **MySQL 8.4 LTS**, pinned to an exact minor tag. The
 container holds the binary; the data lives in a separate `bintrail-index-data`
 volume — bumping a minor version is "swap the container, keep the volume"
 (the PMM pattern). dbtrail **ships** this MySQL but does not **operate** it:
-disk, backups, and upgrades are yours (for a managed, operated index, that is
-what [dbtrail](https://dbtrail.com) is). Support boundary: [SUPPORT.md](../SUPPORT.md).
+disk, backups, and upgrades are yours (for a managed, operated index, see
+[dbtrail.com](https://dbtrail.com)). Support boundary: [SUPPORT.md](../SUPPORT.md).
 
 **Credentials** — no static default password. On the first `up`, the
 one-shot `index-init` service generates a random password into the

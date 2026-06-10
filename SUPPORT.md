@@ -59,7 +59,8 @@ builds and the schema/migrations on them; the *operation* of whatever server
 you actually run — BYO or bundled — is not part of our defect matrix.
 
 > Want the index **operated** for you — sized, backed up, upgraded, kept
-> alive on-call? That is exactly what [dbtrail](https://dbtrail.com) is.
+> alive on-call? That is exactly what the managed service at
+> [dbtrail.com](https://dbtrail.com) is for.
 
 ## The bundled MySQL 8.4 index: we ship it, you operate it
 
@@ -76,8 +77,8 @@ The boundary triage cites:
 - **You operate it.** The running instance is yours: disk and disk-full,
   backups and restore, corruption and crash recovery, and *executing* the
   upgrades we document. **Volume loss = re-index** (back up the
-  `bintrail-index-data` + `bintrail-index-secret` volumes together). dbtrail
-  operates it for you in the paid tier.
+  `bintrail-index-data` + `bintrail-index-secret` volumes together). The
+  managed tier at [dbtrail.com](https://dbtrail.com) operates it for you.
 - **BYO stays co-equal.** Set `INDEX_DSN` in `.env` to a MySQL 8.0+ you run
   and remove the bundled `index-init` + `index-mysql` services (see
   [docker.md](docs/docker.md)) — same ship-vs-operate split, your server.

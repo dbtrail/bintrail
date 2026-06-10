@@ -71,7 +71,7 @@ requires the token from the URL.
 > 8.0+ **you** run and remove the bundled index services — dbtrail installs only its
 > tables there, never operating the server. Either way, what's supported on
 > each side is spelled out in [SUPPORT.md](SUPPORT.md); for an index that's
-> operated for you, that's [dbtrail](https://dbtrail.com).
+> operated for you, there's the managed service at [dbtrail.com](https://dbtrail.com).
 >
 > **Other ways to install** — plain Docker, `.deb`/`.rpm`, `go install`,
 > source builds, and the binary quickstart: see **[docs/install.md](docs/install.md)**.

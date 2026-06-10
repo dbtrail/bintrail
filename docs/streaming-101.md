@@ -22,11 +22,11 @@ Source MySQL ──replication──► bintrail stream ──► Index MySQL (b
 
 - **Source MySQL 8.0+** with `binlog_format = ROW`, `binlog_row_image = FULL`, and GTIDs enabled (`gtid_mode = ON`, `enforce_gtid_consistency = ON`)
 - **Index MySQL 8.0+** — a separate database (can be the same server or a different one)
-- **Go 1.24+** installed (to build bintrail from source)
+- **Go 1.24+** installed (to build dbtrail from source)
 - **AWS account** (for S3 archiving)
 - **Docker** (for mydumper)
 
-### Install bintrail
+### Install dbtrail
 
 ```bash
 git clone https://github.com/dbtrail/dbtrail
@@ -672,7 +672,7 @@ claude mcp add bintrail -- env BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)
 
 This setup lets any machine on the network use the bintrail tools in Claude Desktop, without installing Go.
 
-**On the machine with bintrail installed:**
+**On the machine with dbtrail installed:**
 
 ```bash
 # Start the HTTP MCP server

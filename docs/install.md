@@ -65,7 +65,7 @@ credential mechanism and the `8.0→8.4` upgrade note.
 `index-init` + `index-mysql` services. Same split — dbtrail installs and
 migrates only its schema on whatever server you point it at; the contract
 floor stays MySQL 8.0+ (only the *bundled* index is 8.4). Want it operated for
-you? That is [dbtrail](https://dbtrail.com).
+you? That's the managed service at [dbtrail.com](https://dbtrail.com).
 
 All the optional knobs (pinned console token, schema filter, image tag)
 live in
