@@ -289,3 +289,50 @@ func TestRegistryVersionNormalized(t *testing.T) {
 		t.Errorf("version = %d after write, want %d", f.Version, registryVersion)
 	}
 }
+
+// TestRegistryRotationRoundTrip: the global rotation override persists across a
+// reload and coexists with server entries — no version bump needed (it lives in
+// the same additive envelope).
+func TestRegistryRotationRoundTrip(t *testing.T) {
+	r, path := tmpRegistry(t)
+	if _, ok := r.Rotation(); ok {
+		t.Fatal("a fresh registry must have no rotation policy")
+	}
+	if err := r.SetRotation(RotationConfig{Retain: "7d", Interval: "30m", AddFuture: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(ServerEntry{Name: "prod", DSN: "u:p@tcp(h:3306)/idx"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r2, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, ok := r2.Rotation()
+	if !ok || rc.Retain != "7d" || rc.Interval != "30m" || rc.AddFuture != 5 {
+		t.Fatalf("rotation policy did not round-trip: %+v ok=%v", rc, ok)
+	}
+	if r2.Len() != 1 {
+		t.Errorf("server entry lost alongside the rotation block: len=%d", r2.Len())
+	}
+}
+
+// TestRegistrySetRotationRefusedReadOnly: a newer-version file loads read-only,
+// so SetRotation is refused like every other mutation.
+func TestRegistrySetRotationRefusedReadOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "console-servers.yaml")
+	if err := os.WriteFile(path, []byte("version: 999\nservers: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.ReadOnly() {
+		t.Fatal("a version-999 file must load read-only")
+	}
+	if err := r.SetRotation(RotationConfig{Retain: "7d", Interval: "1h", AddFuture: 3}); !errors.Is(err, ErrRegistryReadOnly) {
+		t.Fatalf("SetRotation on a read-only registry = %v, want ErrRegistryReadOnly", err)
+	}
+}

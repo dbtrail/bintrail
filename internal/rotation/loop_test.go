@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -121,7 +122,7 @@ func TestLoopOptionsArchive(t *testing.T) {
 // never consults the DSN provider.
 func TestStartLoop_disabledIsInert(t *testing.T) {
 	called := false
-	done := StartLoop(context.Background(), Settings{}, func() []RotateTarget {
+	done := StartLoop(context.Background(), func() Settings { return Settings{} }, func() []RotateTarget {
 		called = true
 		return nil
 	})
@@ -133,6 +134,38 @@ func TestStartLoop_disabledIsInert(t *testing.T) {
 	if called {
 		t.Error("disabled rotation must not invoke the DSN provider")
 	}
+}
+
+// TestStartLoop_rereadsSettingsEachCycle proves the settings provider is read
+// FRESH every cycle (not captured once at start) — the property the console
+// rotation panel relies on to apply an edit without a daemon restart. With no
+// targets the cycle is a no-op (no DB needed); we only assert the provider keeps
+// being called.
+func TestStartLoop_rereadsSettingsEachCycle(t *testing.T) {
+	captureSlog(t)
+	var calls atomic.Int32
+	s := Settings{
+		Enabled: true, Retain: 24 * time.Hour, RetainRaw: "24h",
+		Interval: 5 * time.Millisecond, AddFuture: 0, Explicit: true,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := StartLoop(ctx, func() Settings { calls.Add(1); return s }, func() []RotateTarget {
+		return nil // empty target set → cycle is a no-op, but settings() was still read
+	})
+
+	// Expect the initial gate read + first immediate cycle + several ticks.
+	deadline := time.After(5 * time.Second)
+	for calls.Load() < 4 {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("settings provider called only %d times; it must be read fresh each cycle", calls.Load())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
 }
 
 // TestStartLoop_escalatesAfterConsecutiveFailures exercises the detection half
@@ -156,7 +189,7 @@ func TestStartLoop_escalatesAfterConsecutiveFailures(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	// Port 1 on loopback: connection refused immediately, every cycle fails.
-	done := StartLoop(ctx, s, func() []RotateTarget {
+	done := StartLoop(ctx, func() Settings { return s }, func() []RotateTarget {
 		return []RotateTarget{{DSN: "root:x@tcp(127.0.0.1:1)/nope"}}
 	})
 

@@ -210,6 +210,30 @@ immediately; warnings (e.g. short binlog retention) show but don't block.
 The standalone read-only `bintrail-console serve` never offers any of this:
 the `monitor` capability is false and the verbs return 403 there.
 
+### Configuring rotation from the UI
+
+`bintrail-console watch` runs the built-in rotation loop that keeps the index
+from growing without bound: it drops binlog partitions older than a **retention
+window** every **interval**, keeping a few **future partitions** ready. Under
+`watch` you can tune that policy from the console — **⌘K → "Configure
+rotation…"** — without editing flags or restarting:
+
+- **Live:** changes apply on the loop's next cycle. Retention and future-partition
+  count take effect immediately; a changed interval re-tunes the schedule.
+- **Global, one schedule:** the loop is a single shared ticker, so the policy
+  applies to **every** index the daemon rotates (the boot index and every
+  monitored source). Per-source retention is not offered — the schedule is one.
+- **Override vs default:** the saved policy lives in the local console registry
+  (`console-servers.yaml` — the only file the console writes, no version bump,
+  round-trips on older binaries). When nothing is saved the panel shows the
+  daemon's `--rotate-retain` / `--rotate-interval` / `--rotate-add-future`
+  (`BINTRAIL_ROTATE_*`) values as the **effective default**.
+- **Disabling** rotation entirely stays a daemon-level decision
+  (`--rotate-retain off`); the panel tunes a running loop rather than turning it
+  off. A retain like `off` is rejected at save.
+- The standalone `bintrail-console serve` hides the panel and refuses the write
+  (HTTP 403) — only the daemon running the loop consumes the policy.
+
 ## Flags
 
 | Flag | Default | Description |
@@ -383,6 +407,8 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `POST /api/servers/{id}/monitor/start` | Supervisor only (403 on the standalone console): doctor preflight → on green, record intent + provision + stream. Returns `{doctor, started, monitor}`. |
 | `POST /api/servers/{id}/monitor/stop` | Supervisor only: clear intent, drain the stream (final checkpoint), release the advisory lock. |
 | `GET /api/servers/{id}/monitor` | Supervisor only: `{monitor: {state, last_error, since}}` — `stopped\|pending\|running\|stalled\|lost_position\|failed`. |
+| `GET /api/rotation` | Effective global rotation policy: `{retain, interval, add_future, source, enabled}` — `source` is `"override"` (console-saved) or `"default"` (daemon `--rotate-*`). |
+| `PUT /api/rotation` | Supervisor only (403 on the standalone console): save a global rotation override `{retain, interval, add_future}` (validated; `off` rejected). Applies live on the next cycle. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`, `capabilities`,
 `reconstruct`) targets the server named by the `X-Bintrail-Server` request

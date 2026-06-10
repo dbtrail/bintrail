@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -339,6 +340,53 @@ func TestRotateTargets(t *testing.T) {
 		t.Error("a job whose registry entry was deleted must still produce a (drop-only) target, not vanish")
 	} else if ghost.ArchiveS3 != "" {
 		t.Errorf("deleted-entry job must rotate drop-only, got %+v", ghost)
+	}
+}
+
+// TestRotationSettingsProvider pins the live-settings precedence the console
+// rotation panel relies on: a valid saved policy wins (and is marked Explicit so
+// the upgrade guard is skipped for an operator-typed window), no policy falls
+// back to the daemon defaults, and an invalid saved policy ALSO falls back
+// (never silently disables rotation).
+func TestRotationSettingsProvider(t *testing.T) {
+	saved := upRotationCfg
+	t.Cleanup(func() { upRotationCfg = saved })
+	upRotationCfg = rotation.Settings{
+		Enabled: true, Retain: 30 * 24 * time.Hour, RetainRaw: "30d",
+		Interval: time.Hour, AddFuture: 3, Explicit: false,
+	}
+
+	reg, err := console.LoadRegistry("") // in-memory
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov := rotationSettingsProvider(reg)
+
+	// No saved policy → daemon defaults verbatim.
+	if s := prov(); s.RetainRaw != "30d" || s.Interval != time.Hour || s.AddFuture != 3 {
+		t.Errorf("no override should yield the daemon defaults, got %+v", s)
+	}
+
+	// A valid saved policy wins and is Explicit (so a long-lived index doesn't
+	// trip the upgrade guard on an operator's deliberate window).
+	if err := reg.SetRotation(console.RotationConfig{Retain: "7d", Interval: "15m", AddFuture: 5}); err != nil {
+		t.Fatal(err)
+	}
+	s := prov()
+	if s.RetainRaw != "7d" || s.Interval != 15*time.Minute || s.AddFuture != 5 {
+		t.Errorf("valid override should win, got %+v", s)
+	}
+	if !s.Explicit {
+		t.Error("a console-set policy must be Explicit so the upgrade guard is skipped")
+	}
+
+	// An invalid saved policy (bad retain) must fall back to the defaults, not
+	// disable rotation.
+	if err := reg.SetRotation(console.RotationConfig{Retain: "garbage", Interval: "15m", AddFuture: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if s := prov(); s.RetainRaw != "30d" {
+		t.Errorf("an invalid override must fall back to the daemon defaults, got %+v", s)
 	}
 }
 

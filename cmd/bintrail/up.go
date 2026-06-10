@@ -194,8 +194,9 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 	rotCtx, rotStop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer rotStop()
 	// Core `up` is single-source and has no control plane / registry, so its
-	// rotation is drop-only (no per-source S3 archive config).
-	rotation.StartLoop(rotCtx, upRotationCfg, func() []rotation.RotateTarget {
+	// rotation is drop-only (no per-source S3 archive config) and its settings
+	// are static — a constant provider (no live console reconfiguration here).
+	rotation.StartLoop(rotCtx, func() rotation.Settings { return upRotationCfg }, func() []rotation.RotateTarget {
 		return []rotation.RotateTarget{{DSN: upIndexDSN}}
 	})
 	return runStream(cmd, args)

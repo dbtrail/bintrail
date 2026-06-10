@@ -90,9 +90,17 @@ type RotateTarget struct {
 // to the stream. Returns immediately; the loop stops when ctx is cancelled, and
 // the returned channel closes when it has fully exited (used by tests for
 // deterministic shutdown; production callers may ignore it).
-func StartLoop(ctx context.Context, s Settings, targets func() []RotateTarget) <-chan struct{} {
+//
+// settings is a PROVIDER, read fresh each cycle (mirroring the targets
+// provider): the console can edit the global rotation policy at runtime, and an
+// edit applies on the next tick — retain/add-future immediately, and a changed
+// interval re-tunes the ticker. The enabled/disabled decision and the startup
+// banner are taken once from the initial read: a daemon started with rotation
+// off runs no loop (re-enabling needs a restart).
+func StartLoop(ctx context.Context, settings func() Settings, targets func() []RotateTarget) <-chan struct{} {
 	done := make(chan struct{})
-	if !s.Enabled {
+	s0 := settings()
+	if !s0.Enabled {
 		fmt.Fprintln(os.Stderr, "Built-in rotation: off — the index grows until you rotate it yourself (see `bintrail rotate`)")
 		slog.Info("built-in rotation disabled")
 		close(done)
@@ -100,10 +108,10 @@ func StartLoop(ctx context.Context, s Settings, targets func() []RotateTarget) <
 	}
 	fmt.Fprintf(os.Stderr,
 		"Built-in rotation: dropping index partitions older than %s every %s, keeping %d future partitions ready.\n"+
-			"  Tune with --rotate-retain / --rotate-interval (or BINTRAIL_ROTATE_RETAIN); disable with --rotate-retain off.\n",
-		s.RetainRaw, s.Interval, s.AddFuture)
+			"  Tune with --rotate-retain / --rotate-interval (or BINTRAIL_ROTATE_RETAIN), or live from the console; disable with --rotate-retain off.\n",
+		s0.RetainRaw, s0.Interval, s0.AddFuture)
 	slog.Info("built-in rotation enabled",
-		"retain", s.RetainRaw, "interval", s.Interval.String(), "add_future", s.AddFuture)
+		"retain", s0.RetainRaw, "interval", s0.Interval.String(), "add_future", s0.AddFuture)
 
 	go func() {
 		defer close(done)
@@ -116,37 +124,49 @@ func StartLoop(ctx context.Context, s Settings, targets func() []RotateTarget) <
 		// counters each reset while the other condition fires, so an index
 		// alternating defer/fail would never escalate.
 		var unhealthyStreak int
-		cycle := func() {
-			// Rotation is the secondary job: a panic here must never take
-			// down the stream (the primary forensic capture) — same
-			// principle as the console goroutine in runUpStreamWithConsole.
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("built-in rotation cycle panicked; rotation continues next tick", "panic", r)
+		// runOne reads the current settings (the console may have edited them
+		// since the last tick), rotates every target, and returns the interval
+		// it saw so the caller can re-tune the ticker. The settings read is
+		// outside the recover so a panicking cycle still reports the intended
+		// interval; the rotation work itself is recover-guarded because a panic
+		// here must never take down the stream (the primary forensic capture).
+		runOne := func() time.Duration {
+			s := settings()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("built-in rotation cycle panicked; rotation continues next tick", "panic", r)
+					}
+				}()
+				deferred, failed := runCycle(ctx, s, targets)
+				if failed || deferred > 0 {
+					unhealthyStreak++
+				} else {
+					unhealthyStreak = 0
+				}
+				if unhealthyStreak >= escalateAfter {
+					slog.Error("built-in rotation made no progress for consecutive cycles — the index is growing unbounded (rotation is failing and/or deferring unarchived partitions to a stalled archiving flow; archive the partitions, fix the failure, or set --rotate-retain off and rotate manually)",
+						"consecutive_cycles", unhealthyStreak,
+						"deferred_last_cycle", deferred,
+						"failed_last_cycle", failed)
 				}
 			}()
-			deferred, failed := runCycle(ctx, s, targets)
-			if failed || deferred > 0 {
-				unhealthyStreak++
-			} else {
-				unhealthyStreak = 0
-			}
-			if unhealthyStreak >= escalateAfter {
-				slog.Error("built-in rotation made no progress for consecutive cycles — the index is growing unbounded (rotation is failing and/or deferring unarchived partitions to a stalled archiving flow; archive the partitions, fix the failure, or set --rotate-retain off and rotate manually)",
-					"consecutive_cycles", unhealthyStreak,
-					"deferred_last_cycle", deferred,
-					"failed_last_cycle", failed)
-			}
+			return s.Interval
 		}
-		cycle()
-		ticker := time.NewTicker(s.Interval)
+		runOne()
+		iv := s0.Interval
+		ticker := time.NewTicker(iv)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				cycle()
+				if newIV := runOne(); newIV > 0 && newIV != iv {
+					ticker.Reset(newIV)
+					iv = newIV
+					slog.Info("built-in rotation interval changed", "interval", iv.String())
+				}
 			}
 		}
 	}()

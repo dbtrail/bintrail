@@ -348,8 +348,9 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 
 	// Built-in rotation covers the boot index plus every per-source database
 	// the control plane provisions — the unattended quickstart's real data
-	// lives in the latter.
-	rotation.StartLoop(ctx, upRotationCfg, func() []rotation.RotateTarget {
+	// lives in the latter. Settings are a live provider so the console can
+	// retune retain/interval/add-future without a restart.
+	rotation.StartLoop(ctx, rotationSettingsProvider(registry), func() []rotation.RotateTarget {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
 	})
 
@@ -444,8 +445,9 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	cfg.MonitorCtrl = supervisor
 
 	// Built-in rotation: boot index + every per-source database the control
-	// plane provisions, on the daemon lifecycle.
-	rotation.StartLoop(ctx, upRotationCfg, func() []rotation.RotateTarget {
+	// plane provisions, on the daemon lifecycle. Live settings provider so the
+	// console can retune retain/interval/add-future without a restart.
+	rotation.StartLoop(ctx, rotationSettingsProvider(registry), func() []rotation.RotateTarget {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
 	})
 
@@ -645,7 +647,16 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 		TLSCert:      opts.TLSCert,
 		TLSKey:       opts.TLSKey,
 		AllowedHosts: opts.AllowedHosts,
-		AllowSetup:   opts.AllowSetup,
+		// The daemon's --rotate-* defaults, so GET /api/rotation can report the
+		// effective policy (and the console panel prefill it) before the
+		// operator saves an override.
+		RotationDefaults: console.RotationDefaults{
+			Retain:    upRotateRetain,
+			Interval:  upRotateInterval,
+			AddFuture: upRotateAddFuture,
+			Enabled:   upRotationCfg.Enabled,
+		},
+		AllowSetup: opts.AllowSetup,
 		// MonitorCtrl (the control-plane supervisor) is wired by the caller —
 		// runUpStreamWithConsole / runUpConsoleOnly — because it needs the
 		// registry and the daemon lifecycle context, which this config builder
@@ -697,6 +708,27 @@ func rotateTargets(bootDSN string, sup *monitorSupervisor, reg *console.Registry
 		targets = append(targets, t)
 	}
 	return targets
+}
+
+// rotationSettingsProvider returns the live built-in-rotation settings: the
+// console-saved global policy (registry envelope) when present and valid, else
+// the daemon's --rotate-* flag/env defaults (upRotationCfg). StartLoop reads it
+// fresh each cycle, so an edit from the console applies on the next tick without
+// a restart. A saved policy that fails to parse — a bad hand-edit of the file —
+// falls back to the defaults with a warning rather than silently disabling
+// rotation. The boot-index/per-source targets are unaffected: this governs the
+// daemon-global retain/interval/add-future only (the loop is one shared ticker).
+func rotationSettingsProvider(reg *console.Registry) func() rotation.Settings {
+	return func() rotation.Settings {
+		if rc, ok := reg.Rotation(); ok {
+			s, err := rotation.ParseSettings(rc.Retain, rc.Interval, rc.AddFuture, true)
+			if err == nil && s.Enabled {
+				return s
+			}
+			slog.Warn("built-in rotation: ignoring invalid saved console policy; using daemon defaults", "error", err)
+		}
+		return upRotationCfg
+	}
 }
 
 // resolveBintrailIDFunc is the seam tests stub to avoid a real DB.

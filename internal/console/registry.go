@@ -88,10 +88,27 @@ type ServerEntry struct {
 	Extra map[string]any `yaml:",inline"`
 }
 
+// RotationConfig is the daemon-global built-in-rotation policy, editable from
+// the console UI. It is stored once in the registry envelope, NOT per-server:
+// the rotation loop is a single shared ticker, so retain/interval/add-future
+// necessarily apply to every index the daemon rotates. Absent (nil) = the
+// daemon's --rotate-* flags / BINTRAIL_ROTATE_* env stay in force. The fields
+// hold the operator-typed strings (e.g. "30d", "1h") so they round-trip
+// exactly and the engine parses them with the same grammar as the flags.
+type RotationConfig struct {
+	Retain    string `yaml:"retain"`
+	Interval  string `yaml:"interval"`
+	AddFuture int    `yaml:"add_future"`
+}
+
 // registryFile is the versioned on-disk envelope.
 type registryFile struct {
-	Version int           `yaml:"version"`
-	Servers []ServerEntry `yaml:"servers"`
+	Version int `yaml:"version"`
+	// Rotation is the optional global rotation override (omitted when the
+	// daemon flags/env are in force). Additive — round-trips on older binaries
+	// without a version bump, same as ServerEntry's additive fields.
+	Rotation *RotationConfig `yaml:"rotation,omitempty"`
+	Servers  []ServerEntry   `yaml:"servers"`
 }
 
 // Registry is the console's named-server store: a local YAML file, the ONLY
@@ -181,6 +198,36 @@ func (r *Registry) Len() int {
 
 // ReadOnly reports whether mutating operations are refused (newer-version file).
 func (r *Registry) ReadOnly() bool { return r.readOnly }
+
+// Rotation returns the saved global rotation policy, or false when none is set
+// (the daemon's --rotate-* flags/env are in force). The rotation loop's
+// settings provider reads this every cycle, so an override applies live.
+func (r *Registry) Rotation() (RotationConfig, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.file.Rotation == nil {
+		return RotationConfig{}, false
+	}
+	return *r.file.Rotation, true
+}
+
+// SetRotation persists the global rotation policy. Like every registry
+// mutation it rewrites the file atomically and is refused on a newer-version
+// (read-only) file. The caller validates the field grammar.
+func (r *Registry) SetRotation(rc RotationConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.readOnly {
+		return ErrRegistryReadOnly
+	}
+	prev := r.file.Rotation
+	r.file.Rotation = &rc
+	if err := r.save(); err != nil {
+		r.file.Rotation = prev // roll back
+		return err
+	}
+	return nil
+}
 
 // Add validates, mints an id, appends, and persists the entry. The returned
 // entry carries the generated ID.

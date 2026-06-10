@@ -91,6 +91,24 @@ type Config struct {
 	// allow setup regardless. Off by default: an unguarded setup endpoint on a
 	// truly public bind would let the first stranger claim the password.
 	AllowSetup bool
+	// RotationDefaults carries the daemon's --rotate-* flag/env values so
+	// GET /api/rotation can report the effective policy (and the console panel
+	// prefill it) before any console override is saved. Set by the watch
+	// daemon; zero on the standalone serve (which runs no rotation loop and
+	// hides the panel).
+	RotationDefaults RotationDefaults
+}
+
+// RotationDefaults is the daemon-side built-in-rotation policy, surfaced to the
+// console read-only as the fallback shown when no override is saved.
+type RotationDefaults struct {
+	Retain    string
+	Interval  string
+	AddFuture int
+	// Enabled is false when the daemon was started with rotation off
+	// (--rotate-retain off). The loop is not running then, so a console-saved
+	// override would need a restart — the panel warns in that state.
+	Enabled bool
 }
 
 // Server is a configured, ready-to-run console HTTP server. It holds only
@@ -106,8 +124,11 @@ type Server struct {
 	// monitorCtrl: non-nil only when this process is a control-plane
 	// supervisor (see Config.MonitorCtrl).
 	monitorCtrl MonitorController
-	cm          *connManager
-	mux         http.Handler
+	// rotationDefaults are the daemon's --rotate-* values, the fallback GET
+	// /api/rotation reports when no console override is saved.
+	rotationDefaults RotationDefaults
+	cm               *connManager
+	mux              http.Handler
 	// Password login: authPath is the credential file (re-read per login so a
 	// live `user set-password` applies without restart); passwordCfg is its
 	// boot-time existence, which drives the bind gate and the printed banner.
@@ -209,19 +230,20 @@ func New(cfg Config) (*Server, error) {
 	profileActive := len(cfg.DenyTables) > 0 || len(cfg.RedactColumns) > 0
 
 	s := &Server{
-		listen:       listen,
-		token:        token,
-		denyTables:   cfg.DenyTables,
-		redactCols:   cfg.RedactColumns,
-		allowedHosts: cfg.AllowedHosts,
-		monitorCtrl:  cfg.MonitorCtrl,
-		cm:           newConnManager(cfg.Registry, profileActive),
-		authPath:     authPath,
-		passwordCfg:  passwordCfg,
-		allowSetup:   cfg.AllowSetup,
-		sessions:     newSessionStore(),
-		loginLimiter: newLoginLimiter(),
-		tlsConf:      tlsConf,
+		listen:           listen,
+		token:            token,
+		denyTables:       cfg.DenyTables,
+		redactCols:       cfg.RedactColumns,
+		allowedHosts:     cfg.AllowedHosts,
+		monitorCtrl:      cfg.MonitorCtrl,
+		rotationDefaults: cfg.RotationDefaults,
+		cm:               newConnManager(cfg.Registry, profileActive),
+		authPath:         authPath,
+		passwordCfg:      passwordCfg,
+		allowSetup:       cfg.AllowSetup,
+		sessions:         newSessionStore(),
+		loginLimiter:     newLoginLimiter(),
+		tlsConf:          tlsConf,
 	}
 
 	// Seed the ephemeral boot bundle when the caller supplied a command-line
@@ -296,6 +318,11 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("POST /api/servers/{id}/monitor/start", s.handleMonitorStart)
 	api.HandleFunc("POST /api/servers/{id}/monitor/stop", s.handleMonitorStop)
 	api.HandleFunc("GET /api/servers/{id}/monitor", s.handleMonitorStatus)
+	// Global built-in-rotation policy: read the effective settings; PUT an
+	// override (refused on the read-only console — only the watch daemon runs
+	// the loop that consumes it).
+	api.HandleFunc("GET /api/rotation", s.handleRotationGet)
+	api.HandleFunc("PUT /api/rotation", s.handleRotationUpdate)
 	// Authenticated auth verbs. Registered on the inner mux so a forgotten
 	// root registration breaks login, never security (ServeMux specificity
 	// keeps them under the tokenMiddleware-wrapped /api/ catch-all).

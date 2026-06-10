@@ -1488,6 +1488,79 @@ function openServersModal() {
 }
 function closeServersModal() { document.getElementById("modal").replaceChildren(); }
 
+// ── rotation settings ────────────────────────────────────────────────────────
+
+// showRotationDialog edits the daemon-global built-in rotation policy (retain /
+// interval / future partitions). Changes apply live — the watch loop re-reads
+// them on its next cycle. Only reachable when this process is a supervisor
+// (capsCache.monitor gates the ⌘K entry); the read-only console has no loop to
+// tune and the PUT 403s there anyway.
+async function showRotationDialog() {
+  if (loginGateRaised) return;
+  let cur;
+  try { cur = await api("/api/rotation"); }
+  catch (err) { toast("failed to load rotation settings: " + ((err && err.message) || err)); return; }
+
+  const mount = document.getElementById("modal");
+  const scrim = el("div", { class: "modal-scrim show" });
+  const modal = el("div", { class: "modal", role: "dialog", "aria-label": "Rotation" });
+
+  const head = el("div", { class: "modal-head" });
+  head.append(el("h2", { class: "modal-title", text: "Rotation" }));
+  head.append(el("p", { class: "modal-desc", text:
+    "The daemon drops index partitions older than the retention window every interval, keeping a few future partitions ready. One shared schedule covers every monitored source; changes take effect on the next cycle." }));
+  head.append(el("button", { class: "modal-x", type: "button", text: "✕", onclick: closeRotationDialog }));
+  modal.append(head);
+
+  const form = el("form", { class: "filters", style: "display:block" });
+  const grid = el("div", { class: "form-grid" });
+  grid.append(srvField("Retention", "retain", { placeholder: "e.g. 30d, 24h" }));
+  grid.append(srvField("Interval", "interval", { placeholder: "e.g. 1h, 30m" }));
+  grid.append(srvField("Future partitions", "add_future", { placeholder: "e.g. 3" }));
+  form.append(grid);
+  form.elements.retain.value = cur.retain || "";
+  form.elements.interval.value = cur.interval || "";
+  form.elements.add_future.value = (cur.add_future != null ? cur.add_future : "");
+
+  const note = el("p", { class: "form-hint", style: "margin-top:10px" });
+  if (!cur.enabled) note.textContent = "Rotation is OFF at the daemon (--rotate-retain off). Saved changes need a daemon restart to take effect.";
+  else if (cur.source === "default") note.textContent = "Currently using the daemon defaults (--rotate-* / BINTRAIL_ROTATE_*). Saving creates a console override that applies live.";
+  else note.textContent = "A console override is active, applied live each cycle.";
+  form.append(note);
+
+  const msg = el("div", { class: "form-msg" });
+  const foot = el("div", { class: "modal-foot" });
+  foot.append(el("button", { class: "btn btn-primary", type: "submit", text: "Save" }));
+  foot.append(el("button", { class: "btn btn-ghost", type: "button", text: "Cancel", onclick: closeRotationDialog }));
+  form.append(foot);
+  form.append(msg);
+  form.addEventListener("submit", (e) => { e.preventDefault(); submitRotation(form, msg); });
+  modal.append(form);
+
+  scrim.append(modal);
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) closeRotationDialog(); });
+  mount.replaceChildren(scrim);
+}
+
+function closeRotationDialog() { document.getElementById("modal").replaceChildren(); }
+
+async function submitRotation(form, msg) {
+  const body = {
+    retain: form.elements.retain.value.trim(),
+    interval: form.elements.interval.value.trim(),
+    add_future: parseInt(form.elements.add_future.value, 10) || 0,
+  };
+  try {
+    await api("/api/rotation", { method: "PUT", body });
+  } catch (err) {
+    msg.textContent = (err && err.message) || String(err);
+    msg.className = "form-msg err";
+    return;
+  }
+  closeRotationDialog();
+  toast("Rotation settings saved");
+}
+
 async function refreshServersList() {
   const list = document.getElementById("servers-list");
   if (!list) return;
@@ -1795,6 +1868,7 @@ function cmdkCommands() {
   ];
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
   cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });
+  if (capsCache.monitor) cmds.push({ group: "Actions", label: "Configure rotation…", run: () => { closeCmdk(); showRotationDialog(); } });
   if (capsCache.auth) {
     cmds.push({
       group: "Actions",

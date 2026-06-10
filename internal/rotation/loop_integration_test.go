@@ -118,7 +118,7 @@ func TestStartLoop_escalatesOnPersistentDeferral(t *testing.T) {
 		Explicit: true, // h1 is only 30h old; guard wouldn't trip, but be unambiguous
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := StartLoop(ctx, s, func() []RotateTarget {
+	done := StartLoop(ctx, func() Settings { return s }, func() []RotateTarget {
 		return []RotateTarget{{DSN: testutil.IntegrationDSN(dbName)}}
 	})
 
