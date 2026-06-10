@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
@@ -507,5 +509,61 @@ func TestAddFuturePartitions(t *testing.T) {
 		if parts[i].Name != expected {
 			t.Errorf("partition %d: expected %s, got %s", i, expected, parts[i].Name)
 		}
+	}
+}
+
+// TestPerformRotation_S3UploadFailureDefers covers the path the review flagged:
+// when archiving to S3 and the upload persistently fails, the partition is NOT
+// dropped (data safe) AND the failure is counted into Result.Deferred so the
+// built-in loop's unhealthy-streak escalation fires — instead of reporting a
+// healthy cycle while the index grows unbounded.
+func TestPerformRotation_S3UploadFailureDefers(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
+
+	// Stub the uploader to always fail, simulating a bad bucket / missing creds.
+	prev := uploadFileFunc
+	uploadFileFunc = func(ctx context.Context, client *s3.Client, path, bucket, key string) error {
+		return fmt.Errorf("simulated S3 upload failure")
+	}
+	t.Cleanup(func() { uploadFileFunc = prev })
+
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur:          24 * time.Hour,
+		ArchiveDir:         t.TempDir(),
+		ArchiveS3:          "s3://fake-bucket/prefix/",
+		ArchiveS3Region:    "us-east-1",
+		BintrailID:         "test-uuid-upload-fail",
+		ArchiveCompression: "zstd",
+		Format:             "json",
+		NoReplace:          true,
+	})
+	if err != nil {
+		t.Fatalf("Perform must not error on an upload failure (it defers): %v", err)
+	}
+	if res.Dropped != 0 {
+		t.Errorf("Dropped = %d, want 0 (an un-uploaded partition must never be dropped)", res.Dropped)
+	}
+	if res.Deferred < 1 {
+		t.Errorf("Deferred = %d, want >=1 — a failed upload must count as deferred so the loop escalates", res.Deferred)
+	}
+	// The partition must still be present.
+	partitions, err := listPartitions(context.Background(), db, dbName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range partitions {
+		if p.Name == indexer.PartitionName(h1) {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("partition was dropped despite a failed S3 upload — data loss")
 	}
 }

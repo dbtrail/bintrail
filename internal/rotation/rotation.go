@@ -220,6 +220,11 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 									fmt.Fprintf(os.Stdout, "warning: S3 upload failed for %s: %v\n", name, err)
 									fmt.Fprintf(os.Stdout, "  run 'bintrail rotate --retry --archive-s3 ...' to retry\n")
 								}
+								// Count it deferred so the built-in loop's unhealthy-streak
+								// escalation fires: a persistently failing upload keeps the
+								// index (and staging dir) growing, the exact condition the
+								// streak detector exists to surface above per-cycle warnings.
+								deferredCount++
 								continue
 							}
 							if _, err := db.ExecContext(ctx,
@@ -250,6 +255,9 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 							fmt.Fprintf(os.Stdout, "skipped drop for %s (pending S3 upload)\n", name)
 							fmt.Fprintf(os.Stdout, "  run 'bintrail rotate --retry --archive-s3 ...' to retry\n")
 						}
+						// A still-pending upload is an undropped partition too — count it
+						// so the loop escalates rather than reporting a healthy cycle.
+						deferredCount++
 						continue
 					}
 
