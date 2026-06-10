@@ -47,6 +47,9 @@ var (
 	conBaselineDir  string
 	conBaselineS3   string
 	conServersFile  string
+	conAuthFile     string
+	conTLSCert      string
+	conTLSKey       string
 )
 
 func init() {
@@ -59,6 +62,9 @@ func init() {
 	serveCmd.Flags().StringVar(&conBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the point-in-time Reconstruct surface")
 	serveCmd.Flags().StringVar(&conBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
 	serveCmd.Flags().StringVar(&conServersFile, "servers-file", "", "Path to the server registry YAML managed by the UI (default ~/.config/bintrail/console-servers.yaml)")
+	serveCmd.Flags().StringVar(&conAuthFile, "auth-file", "", "Path to the console auth file enabling password login (default ~/.config/bintrail/console-auth.yaml; created with `bintrail-console user set-password`)")
+	serveCmd.Flags().StringVar(&conTLSCert, "tls-cert", "", "TLS certificate file (PEM); serve the console over HTTPS (requires --tls-key)")
+	serveCmd.Flags().StringVar(&conTLSKey, "tls-key", "", "TLS private key file (PEM; requires --tls-cert)")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -100,6 +106,21 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if !cmd.Flags().Changed("servers-file") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_SERVERS"); v != "" {
 			conServersFile = v
+		}
+	}
+	if !cmd.Flags().Changed("auth-file") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_AUTH"); v != "" {
+			conAuthFile = v
+		}
+	}
+	if !cmd.Flags().Changed("tls-cert") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_TLS_CERT"); v != "" {
+			conTLSCert = v
+		}
+	}
+	if !cmd.Flags().Changed("tls-key") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_TLS_KEY"); v != "" {
+			conTLSKey = v
 		}
 	}
 
@@ -184,6 +205,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		AllowedHosts:  conAllowedHosts,
 		BaselineDir:   conBaselineDir,
 		BaselineS3:    conBaselineS3,
+		AuthPath:      conAuthFile,
+		TLSCert:       conTLSCert,
+		TLSKey:        conTLSKey,
 		// MonitorCtrl is intentionally left nil: bintrail-console serve is the
 		// read-only standalone console. A write-capable control-plane daemon
 		// wires a supervisor here instead; with nil, /api/capabilities reports
@@ -196,11 +220,27 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Fprintf(os.Stderr, "\nBintrail console (read-only) is running. Open:\n\n    %s\n\n", srv.URL())
+	printConsoleBanner(srv, "Bintrail console (read-only) is running. Open:")
 	slog.Info("console listening", "addr", conListen, "no_archive", conNoArchive || conProfile != "")
 
 	if err := srv.Run(ctx); err != nil {
 		return fmt.Errorf("console server: %w", err)
 	}
 	return nil
+}
+
+// printConsoleBanner prints the startup URL. In password mode the URL carries
+// no ?token= (URL() already omits it — a live credential does not belong in
+// logs or shell history) and the sign-in hint is printed instead; an
+// explicitly configured token stays valid for automation but its value is
+// never echoed.
+func printConsoleBanner(srv *console.Server, headline string) {
+	fmt.Fprintf(os.Stderr, "\n%s\n\n    %s\n\n", headline, srv.URL())
+	if srv.PasswordLogin() {
+		fmt.Fprintf(os.Stderr, "Sign in with your console username and password.\n")
+		if srv.Token() != "" {
+			fmt.Fprintf(os.Stderr, "(The configured access token also remains valid, for API automation.)\n")
+		}
+		fmt.Fprintln(os.Stderr)
+	}
 }

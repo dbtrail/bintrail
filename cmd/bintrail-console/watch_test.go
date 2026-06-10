@@ -18,7 +18,7 @@ func assertStr(t *testing.T, name, got, want string) {
 }
 
 func TestUpConsoleConfig(t *testing.T) {
-	cfg, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", "127.0.0.1:8090", "tok", "/baselines", "s3://bucket/prefix/")
+	cfg, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok", BaselineDir: "/baselines", BaselineS3: "s3://bucket/prefix/", AuthFile: "/auth.yaml", TLSCert: "/c.pem", TLSKey: "/k.pem"})
 	if err != nil {
 		t.Fatalf("upConsoleConfig: %v", err)
 	}
@@ -33,6 +33,11 @@ func TestUpConsoleConfig(t *testing.T) {
 	if cfg.BaselineDir != "/baselines" || cfg.BaselineS3 != "s3://bucket/prefix/" {
 		t.Errorf("BaselineDir=%q BaselineS3=%q, want /baselines / s3://bucket/prefix/", cfg.BaselineDir, cfg.BaselineS3)
 	}
+	// Auth and TLS settings thread through verbatim too — console.New owns
+	// their validation (both-or-neither TLS, auth-file probe).
+	if cfg.AuthPath != "/auth.yaml" || cfg.TLSCert != "/c.pem" || cfg.TLSKey != "/k.pem" {
+		t.Errorf("AuthPath=%q TLSCert=%q TLSKey=%q, want verbatim pass-through", cfg.AuthPath, cfg.TLSCert, cfg.TLSKey)
+	}
 	// watch has no --profile/--no-archive, so NoArchive must stay false —
 	// setting it would silently disable the reconstruct gate this wiring
 	// enables.
@@ -42,7 +47,7 @@ func TestUpConsoleConfig(t *testing.T) {
 
 	// Without baseline flags the Phase 1 default is preserved: empty baselines
 	// keep the reconstruct surface gated off.
-	cfg, err = upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", "127.0.0.1:8090", "tok", "", "")
+	cfg, err = upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok"})
 	if err != nil {
 		t.Fatalf("upConsoleConfig (no baseline): %v", err)
 	}
@@ -51,12 +56,12 @@ func TestUpConsoleConfig(t *testing.T) {
 	}
 
 	// Invalid DSN (no '/') must error, not silently produce an empty dbName.
-	if _, err := upConsoleConfig(nil, "invalid", "127.0.0.1:8090", "", "", ""); err == nil {
+	if _, err := upConsoleConfig(nil, "invalid", consoleOpts{Listen: "127.0.0.1:8090"}); err == nil {
 		t.Error("invalid --index-dsn should error")
 	}
 	// A DSN with no database name must error (parity with runServe) rather
 	// than starting a console that feeds an empty schema to the planner.
-	if _, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/", "127.0.0.1:8090", "", "", ""); err == nil {
+	if _, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/", consoleOpts{Listen: "127.0.0.1:8090"}); err == nil {
 		t.Error("--index-dsn without a database name should error")
 	}
 }
@@ -203,4 +208,55 @@ func TestWatchStreamConfig(t *testing.T) {
 	if cfg.Deps.ValidateBinlogFormat == nil {
 		t.Error("Deps must be wired (streamdeps.Default()), got zero-value Deps")
 	}
+}
+
+// TestResolveUpConsoleEnvAuthTLS mirrors TestResolveUpConsoleEnv for the
+// auth/TLS console vars — the duplicated direct-read blocks (serve vs watch)
+// are the established silent-breakage trap for env-only installs; this is the
+// watch-side tripwire.
+func TestResolveUpConsoleEnvAuthTLS(t *testing.T) {
+	saved := [3]string{upConsoleAuthFile, upConsoleTLSCert, upConsoleTLSKey}
+	t.Cleanup(func() {
+		upConsoleAuthFile, upConsoleTLSCert, upConsoleTLSKey = saved[0], saved[1], saved[2]
+	})
+
+	for _, name := range []string{"console-auth-file", "console-tls-cert", "console-tls-key"} {
+		if watchCmd.Flags().Lookup(name) == nil {
+			t.Fatalf("flag --%s not registered on watchCmd", name)
+		}
+	}
+	newCmd := func() *cobra.Command {
+		cmd := &cobra.Command{}
+		cmd.Flags().StringVar(&upConsoleAuthFile, "console-auth-file", "", "")
+		cmd.Flags().StringVar(&upConsoleTLSCert, "console-tls-cert", "", "")
+		cmd.Flags().StringVar(&upConsoleTLSKey, "console-tls-key", "", "")
+		return cmd
+	}
+
+	t.Setenv("BINTRAIL_CONSOLE_AUTH", "/env/auth.yaml")
+	t.Setenv("BINTRAIL_CONSOLE_TLS_CERT", "/env/cert.pem")
+	t.Setenv("BINTRAIL_CONSOLE_TLS_KEY", "/env/key.pem")
+
+	// No flags set → env wins.
+	upConsoleAuthFile, upConsoleTLSCert, upConsoleTLSKey = "", "", ""
+	resolveUpConsoleEnv(newCmd())
+	assertStr(t, "upConsoleAuthFile (env)", upConsoleAuthFile, "/env/auth.yaml")
+	assertStr(t, "upConsoleTLSCert (env)", upConsoleTLSCert, "/env/cert.pem")
+	assertStr(t, "upConsoleTLSKey (env)", upConsoleTLSKey, "/env/key.pem")
+
+	// Explicit flags beat env.
+	cmd := newCmd()
+	for flag, val := range map[string]string{
+		"console-auth-file": "/flag/auth.yaml",
+		"console-tls-cert":  "/flag/cert.pem",
+		"console-tls-key":   "/flag/key.pem",
+	} {
+		if err := cmd.Flags().Set(flag, val); err != nil {
+			t.Fatalf("set --%s: %v", flag, err)
+		}
+	}
+	resolveUpConsoleEnv(cmd)
+	assertStr(t, "upConsoleAuthFile (flag)", upConsoleAuthFile, "/flag/auth.yaml")
+	assertStr(t, "upConsoleTLSCert (flag)", upConsoleTLSCert, "/flag/cert.pem")
+	assertStr(t, "upConsoleTLSKey (flag)", upConsoleTLSKey, "/flag/key.pem")
 }

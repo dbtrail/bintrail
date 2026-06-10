@@ -72,18 +72,18 @@ let cursorIdx = -1;           // keyboard cursor row on Events
 // ── token bootstrap ────────────────────────────────────────────────────────
 
 (function bootstrapToken() {
-  try {
-    const urlToken = new URLSearchParams(location.search).get("token");
-    if (urlToken) {
-      sessionStorage.setItem(TOKEN_KEY, urlToken);
-      // Strip the token from the URL so it never sits in the address bar/history.
-      history.replaceState(null, "", location.pathname);
-      TOKEN = urlToken;
-    } else {
-      TOKEN = sessionStorage.getItem(TOKEN_KEY) || "";
-    }
-    currentServer = sessionStorage.getItem(SERVER_KEY) || "";
-  } catch (_) { /* storage may be unavailable; degrade to in-memory */ }
+  const urlToken = new URLSearchParams(location.search).get("token");
+  if (urlToken) {
+    // Assign and strip the URL BEFORE touching storage: with storage
+    // disabled the old ordering threw first, leaving the token both unused
+    // and sitting in the address bar.
+    TOKEN = urlToken;
+    history.replaceState(null, "", location.pathname);
+    try { sessionStorage.setItem(TOKEN_KEY, urlToken); } catch (_) { /* in-memory only */ }
+  } else {
+    try { TOKEN = sessionStorage.getItem(TOKEN_KEY) || ""; } catch (_) {}
+  }
+  try { currentServer = sessionStorage.getItem(SERVER_KEY) || ""; } catch (_) {}
 })();
 
 function setCurrentServer(id) {
@@ -157,12 +157,240 @@ async function api(path, opts = {}) {
       // server malfunction on an OK one — surface it; never let a stray HTML
       // error page render as an empty success. (An EMPTY body stays null: the
       // 204 from DELETE /api/servers/{id} is a legitimate no-content success.)
-      if (!res.ok) throw new Error(text || "HTTP " + res.status);
+      if (!res.ok) throw apiError(res.status, text || "HTTP " + res.status);
       throw new Error("malformed response from " + path);
     }
   }
-  if (!res.ok) throw new Error((data && data.error) || "HTTP " + res.status);
+  if (!res.ok) {
+    // 401 = the bearer credential is dead (expired session, rotated token).
+    // One central chokepoint clears state and raises the sign-in gate; every
+    // in-flight render bails on the serverGen bump.
+    if (res.status === 401) handleUnauthorized();
+    throw apiError(res.status, (data && data.error) || "HTTP " + res.status);
+  }
   return data;
+}
+
+function apiError(status, message) {
+  const err = new Error(message);
+  err.status = status;
+  return err;
+}
+
+// ── auth: login overlay, logout, password dialog ─────────────────────────────
+//
+// Password login is OPTIONAL (configured with `bintrail-console user
+// set-password`); the ?token= bootstrap stays the default. A successful login
+// returns a session token that drops into the SAME `TOKEN` slot the static
+// token uses — api() and the X-Bintrail-Server flow never know the difference.
+// The server reports how this tab authenticated (capabilities.auth.auth_kind),
+// which gates the logout affordance via [data-auth]/.auth-on.
+
+let unauthorizedHandled = false; // first 401 wins; later ones no-op
+
+// fetchAuthInfo asks the unauthenticated probe whether password login exists.
+// Raw fetch: no bearer yet, and its failure must not recurse into the 401
+// chokepoint.
+async function fetchAuthInfo() {
+  const res = await fetch("/api/auth");
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+// handleUnauthorized is api()'s 401 chokepoint: the bearer is dead, so clear
+// every credential-scoped cache (same hygiene as switchServer), invalidate
+// in-flight renders, and raise the sign-in gate.
+async function handleUnauthorized() {
+  if (unauthorizedHandled) return;
+  unauthorizedHandled = true;
+  TOKEN = "";
+  try { sessionStorage.removeItem(TOKEN_KEY); } catch (_) {}
+  serverGen++;
+  schemaCache = null;
+  tablesCache.clear();
+  pendingRecover = null;
+  lastSQL = "";
+  lastEvents = [];
+  let pw = false;
+  try { pw = !!(await fetchAuthInfo()).password_login; } catch (_) {}
+  showLoginOverlay({ passwordLogin: pw, message: "Session expired — sign in again." });
+}
+
+// showLoginOverlay raises the sign-in gate in #login-mount. With password
+// login enabled it renders the form; without, a persistent (non-toast)
+// pointer at the printed ?token= URL. The scrim deliberately does NOT close
+// on outside-click — it is a gate, not a dialog.
+function showLoginOverlay(opts) {
+  opts = opts || { passwordLogin: true };
+  const mount = document.getElementById("login-mount");
+  const scrim = el("div", { class: "modal-scrim show" });
+  const panel = el("div", { class: "modal login-panel", role: "dialog", "aria-label": "Sign in" });
+  panel.append(el("h2", { class: "modal-title", text: "dbtrail console" }));
+
+  if (!opts.passwordLogin) {
+    panel.append(el("p", { class: "modal-desc", text: opts.message || "" }));
+    panel.append(el("p", { class: "modal-desc", text: "Open the access link printed by bintrail-console — it carries the token this page needs." }));
+    scrim.append(panel);
+    mount.replaceChildren(scrim);
+    return;
+  }
+
+  panel.append(el("p", { class: "modal-desc", text: "Sign in to the read-only console." }));
+  const form = el("form", { class: "login-form", id: "login-form" });
+  form.append(el("label", { class: "field" },
+    el("span", { class: "field-label", text: "Username" }),
+    el("input", { class: "input", name: "username", value: "admin", autocomplete: "username", spellcheck: "false" })));
+  form.append(el("label", { class: "field" },
+    el("span", { class: "field-label", text: "Password" }),
+    el("input", { class: "input", name: "password", type: "password", autocomplete: "current-password" })));
+  // Its own message node: formMsg() is hard-wired to #server-form-msg.
+  const msg = el("div", { class: "form-msg", id: "login-msg" });
+  if (opts.message) { msg.classList.add("err"); msg.textContent = opts.message; }
+  const foot = el("div", { class: "modal-foot" });
+  foot.append(el("button", { class: "btn btn-primary", type: "submit", text: "Sign in" }));
+  form.append(foot);
+  form.append(msg);
+  form.addEventListener("submit", (e) => { e.preventDefault(); submitLogin(form, msg); });
+  panel.append(form);
+  scrim.append(panel);
+  mount.replaceChildren(scrim);
+  form.elements.password.focus();
+}
+
+function closeLoginOverlay() { document.getElementById("login-mount").replaceChildren(); }
+
+function loginMsg(node, text) { node.classList.add("err"); node.textContent = text; }
+
+// submitLogin posts the credentials with a RAW fetch: there is no bearer yet,
+// and a 401 here means "wrong password", which must not recurse into
+// handleUnauthorized.
+async function submitLogin(form, msg) {
+  const body = {
+    username: form.elements.username.value.trim(),
+    password: form.elements.password.value,
+  };
+  let res;
+  try {
+    res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (_) { loginMsg(msg, "Network error — is the console still running?"); return; }
+  if (res.status === 429) {
+    const retry = res.headers.get("Retry-After");
+    loginMsg(msg, "Too many attempts — wait " + (retry ? retry + "s" : "a minute") + " and retry.");
+    return;
+  }
+  if (!res.ok) {
+    let m = "Invalid username or password.";
+    if (res.status !== 401) { try { m = (await res.json()).error || m; } catch (_) {} }
+    loginMsg(msg, m);
+    return;
+  }
+  let data;
+  try { data = await res.json(); } catch (_) { loginMsg(msg, "Malformed login response."); return; }
+  TOKEN = data.token || "";
+  try { sessionStorage.setItem(TOKEN_KEY, TOKEN); } catch (_) {}
+  unauthorizedHandled = false;
+  closeLoginOverlay();
+  await bootSequence();
+}
+
+async function doLogout() {
+  try { await api("/api/auth/logout", { method: "POST" }); } catch (_) { /* dead session = already out */ }
+  TOKEN = "";
+  try { sessionStorage.removeItem(TOKEN_KEY); } catch (_) {}
+  serverGen++;
+  schemaCache = null;
+  tablesCache.clear();
+  pendingRecover = null;
+  lastSQL = "";
+  lastEvents = [];
+  unauthorizedHandled = false;
+  // Logout is only reachable for session auth, which implies password login.
+  showLoginOverlay({ passwordLogin: true, message: "Signed out." });
+}
+
+// applyAuthGate mirrors the [data-capability]/.cap-on pattern for auth-kind
+// gated surfaces (the logout button). Server-derived: capabilities.auth tells
+// this tab how it authenticated, so the affordance survives reloads.
+function applyAuthGate() {
+  const kind = (capsCache.auth && capsCache.auth.auth_kind) || "";
+  $all("[data-auth]").forEach((n) => n.classList.toggle("auth-on", n.dataset.auth === kind));
+}
+
+// showPasswordDialog sets (token bootstrap) or rotates the console password.
+// Mounted in #login-mount — never coexists with the login gate (it requires
+// an authenticated tab).
+function showPasswordDialog() {
+  const firstSet = !(capsCache.auth && capsCache.auth.password_set);
+  const mount = document.getElementById("login-mount");
+  const scrim = el("div", { class: "modal-scrim show" });
+  const panel = el("div", { class: "modal login-panel", role: "dialog", "aria-label": "Console password" });
+  panel.append(el("h2", { class: "modal-title", text: firstSet ? "Set console password" : "Change console password" }));
+  panel.append(el("p", { class: "modal-desc", text: firstSet
+    ? "Enables username+password sign-in next to the access token."
+    : "Rotating the password signs out every other session." }));
+
+  const form = el("form", { class: "login-form" });
+  if (!firstSet) {
+    form.append(el("label", { class: "field" },
+      el("span", { class: "field-label", text: "Current password" }),
+      el("input", { class: "input", name: "current", type: "password", autocomplete: "current-password" })));
+  }
+  form.append(el("label", { class: "field" },
+    el("span", { class: "field-label", text: "New password" }),
+    el("input", { class: "input", name: "next", type: "password", autocomplete: "new-password" })));
+  form.append(el("label", { class: "field" },
+    el("span", { class: "field-label", text: "Retype new password" }),
+    el("input", { class: "input", name: "confirm", type: "password", autocomplete: "new-password" })));
+  const msg = el("div", { class: "form-msg" });
+  const foot = el("div", { class: "modal-foot" });
+  foot.append(el("button", { class: "btn btn-primary", type: "submit", text: firstSet ? "Set password" : "Change password" }));
+  foot.append(el("button", { class: "btn btn-ghost", type: "button", text: "Cancel", onclick: closeLoginOverlay }));
+  form.append(foot);
+  form.append(msg);
+  form.addEventListener("submit", (e) => { e.preventDefault(); submitPasswordChange(form, msg, firstSet); });
+  panel.append(form);
+  scrim.append(panel);
+  mount.replaceChildren(scrim);
+}
+
+// submitPasswordChange uses a RAW fetch with the live bearer: the endpoint
+// answers 401 for "wrong current password", which must not trip api()'s
+// dead-credential chokepoint.
+async function submitPasswordChange(form, msg, firstSet) {
+  const next = form.elements.next.value;
+  if (next !== form.elements.confirm.value) { loginMsg(msg, "Passwords do not match."); return; }
+  const body = {
+    current_password: firstSet ? "" : form.elements.current.value,
+    new_password: next,
+  };
+  let res;
+  try {
+    res = await fetch("/api/auth/password", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (_) { loginMsg(msg, "Network error — is the console still running?"); return; }
+  if (!res.ok) {
+    let m = "HTTP " + res.status;
+    try { m = (await res.json()).error || m; } catch (_) {}
+    if (res.status === 429) m = "Too many attempts — wait " + (res.headers.get("Retry-After") || "60") + "s.";
+    loginMsg(msg, m);
+    return;
+  }
+  let data;
+  try { data = await res.json(); } catch (_) { loginMsg(msg, "Malformed response."); return; }
+  // Every other session just died; this tab continues on the fresh one.
+  TOKEN = data.token || TOKEN;
+  try { sessionStorage.setItem(TOKEN_KEY, TOKEN); } catch (_) {}
+  closeLoginOverlay();
+  toast("Password " + (firstSet ? "set" : "updated"));
+  // password_set (and possibly auth_kind) changed server-side.
+  try { await gateCapabilities(); } catch (_) {}
 }
 
 // ── toast / errors / warnings ─────────────────────────────────────────────────
@@ -1082,10 +1310,17 @@ async function gateCapabilities() {
   let caps = {};
   // Degrading to {} hides capability-gated UI (Time-travel tab, the source
   // section of the server form) — warn so a wrongly-shaped UI is diagnosable.
-  try { caps = await api("/api/capabilities"); } catch (err) { console.warn("capabilities check failed; UI degrades to no-capability gating", err); caps = {}; }
+  // A 401 is NOT capability loss: rethrow so session expiry surfaces as the
+  // sign-in gate (api() already raised it), never as silently vanished tabs.
+  try { caps = await api("/api/capabilities"); } catch (err) {
+    if (err && err.status === 401) throw err;
+    console.warn("capabilities check failed; UI degrades to no-capability gating", err);
+    caps = {};
+  }
   if (gen !== serverGen) return;
   capsCache = caps || {};
   $all("[data-capability]").forEach((node) => node.classList.toggle("cap-on", !!capsCache[node.dataset.capability]));
+  applyAuthGate();
 }
 
 // ── server registry: switcher + modal CRUD ──────────────────────────────────
@@ -1116,7 +1351,10 @@ async function switchServer(id) {
   // can never be auto-applied against a different server's index.
   pendingRecover = null;
   lastSQL = "";
-  await gateCapabilities();
+  try { await gateCapabilities(); } catch (err) {
+    if (err && err.status === 401) return; // chokepoint already raised the sign-in gate
+    throw err;
+  }
   renderRoute(); // re-render the current screen for the new server
 }
 
@@ -1463,6 +1701,16 @@ function cmdkCommands() {
   ];
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
   cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });
+  if (capsCache.auth) {
+    cmds.push({
+      group: "Actions",
+      label: capsCache.auth.password_set ? "Change console password…" : "Set console password…",
+      run: () => { closeCmdk(); showPasswordDialog(); },
+    });
+    if (capsCache.auth.auth_kind === "session") {
+      cmds.push({ group: "Actions", label: "Log out", run: () => { closeCmdk(); doLogout(); } });
+    }
+  }
   cmds.push({ group: "Actions", label: "Search events for…", hint: "type then ↵", search: true });
   return cmds;
 }
@@ -1541,10 +1789,33 @@ function globalKeydown(e) {
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
+// bootSequence is the load-bearing startup order: servers (reconcile
+// selection) → caps → route. ONE definition, called from both the normal boot
+// and the post-login path — two inline copies of an order-sensitive sequence
+// is how wrong-shape-UI bugs come back. Returns the server list (null when
+// the boot aborted on a dead credential — the sign-in gate is already up).
+async function bootSequence() {
+  let servers = [];
+  // renderRoute() below clears #view, so an in-view error here would be wiped;
+  // toast it instead. If the backend is down, the chosen view surfaces its own
+  // error when its fetch fails.
+  try { servers = await loadServers(); } catch (err) {
+    if (err && err.status === 401) return null;
+    toast("couldn't load servers: " + ((err && err.message) || err));
+  }
+  try { await gateCapabilities(); } catch (err) {
+    if (err && err.status === 401) return null;
+    throw err;
+  }
+  renderRoute();
+  return servers;
+}
+
 async function init() {
   document.getElementById("server-select").addEventListener("change", (e) => switchServer(e.target.value));
   document.getElementById("manage-servers").addEventListener("click", openServersModal);
   document.getElementById("open-cmdk").addEventListener("click", openCmdk);
+  document.getElementById("logout-btn").addEventListener("click", doLogout);
   document.addEventListener("keydown", globalKeydown);
 
   // Sidebar nav (real hrefs upgraded to in-place swaps). A manual nav starts
@@ -1554,16 +1825,17 @@ async function init() {
   $all(".nav-item").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); pendingRecover = null; navigate(a.dataset.route); }));
   window.addEventListener("popstate", renderRoute);
 
-  if (!TOKEN) toast("No token in URL — open the link printed by `bintrail-console`.");
+  // Pre-auth gate: ask the (unauthenticated) probe how this console
+  // authenticates BEFORE firing data fetches that are guaranteed 401s.
+  if (!TOKEN) {
+    let pw = false;
+    try { pw = !!(await fetchAuthInfo()).password_login; } catch (_) { /* server down — fall through, the view will surface it */ }
+    if (pw) { showLoginOverlay({ passwordLogin: true }); return; }
+    toast("No token in URL — open the link printed by `bintrail-console`.");
+  }
 
-  // Startup order is load-bearing: servers (reconcile selection) → caps → route.
-  let servers = [];
-  // renderRoute() below clears #view, so an in-view error here would be wiped;
-  // toast it instead. If the backend is down, the chosen view surfaces its own
-  // error when its fetch fails.
-  try { servers = await loadServers(); } catch (err) { toast("couldn't load servers: " + ((err && err.message) || err)); }
-  await gateCapabilities();
-  renderRoute();
+  const servers = await bootSequence();
+  if (servers === null) return; // dead credential: the sign-in gate is up
 
   // First-run onboarding: a monitor-capable process with no source yet opens the
   // servers modal once per tab so the operator can add one without a terminal.

@@ -11,9 +11,11 @@ package console
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -71,6 +73,15 @@ type Config struct {
 	// BaselineS3 is an s3:// prefix. Registry entries carry their own.
 	BaselineDir string
 	BaselineS3  string
+	// AuthPath locates the console credential file (username + bcrypt hash,
+	// written by `bintrail-console user set-password`). Empty means
+	// DefaultAuthPath(). A missing file means password login is not
+	// configured; a corrupt one fails New loudly.
+	AuthPath string
+	// TLSCert / TLSKey serve the console over HTTPS (both-or-neither). Static
+	// files only — rotation is a restart; ACME is out of scope.
+	TLSCert string
+	TLSKey  string
 }
 
 // Server is a configured, ready-to-run console HTTP server. It holds only
@@ -88,6 +99,14 @@ type Server struct {
 	monitorCtrl MonitorController
 	cm          *connManager
 	mux         http.Handler
+	// Password login: authPath is the credential file (re-read per login so a
+	// live `user set-password` applies without restart); passwordCfg is its
+	// boot-time existence, which drives the bind gate and the printed banner.
+	authPath     string
+	passwordCfg  bool
+	sessions     *sessionStore
+	loginLimiter *loginLimiter
+	tlsConf      *tls.Config
 }
 
 // serverHeader selects the target server per request. Selection is stateless —
@@ -104,16 +123,59 @@ func New(cfg Config) (*Server, error) {
 		listen = "127.0.0.1:8090"
 	}
 
+	// Probe the credential file. Missing = password login not configured
+	// (warned about when the path was explicit — a typo'd --auth-file must
+	// not silently downgrade auth); corrupt = fail loud.
+	authPath := cfg.AuthPath
+	explicitAuthPath := authPath != ""
+	if authPath == "" {
+		authPath = DefaultAuthPath()
+	}
+	authFile, err := LoadAuthFile(authPath)
+	if err != nil {
+		return nil, err
+	}
+	passwordCfg := authFile != nil
+	if explicitAuthPath && !passwordCfg {
+		slog.Warn("console auth file not found — password login disabled until it is created with `bintrail-console user set-password`", "path", authPath)
+	}
+
+	// Bind/credential policy: an explicit token always stands. With a
+	// password configured and no token, NO token is auto-generated (the
+	// printed ?token= URL would leak a live credential into logs and shell
+	// history for nothing) and non-loopback binds are legal — the password is
+	// the auth. With neither credential, the pre-auth behavior is unchanged:
+	// loopback auto-generates, non-loopback refuses.
 	token := cfg.Token
-	if token == "" {
+	if token == "" && !passwordCfg {
 		if !isLoopbackAddr(listen) {
-			return nil, fmt.Errorf("a token is required when binding to a non-loopback address %q: set --token or BINTRAIL_CONSOLE_TOKEN", listen)
+			return nil, fmt.Errorf("authentication is required when binding to a non-loopback address %q: set --token / BINTRAIL_CONSOLE_TOKEN, or set a console password with `bintrail-console user set-password`", listen)
 		}
 		t, err := generateToken()
 		if err != nil {
 			return nil, fmt.Errorf("generate token: %w", err)
 		}
 		token = t
+	}
+
+	var tlsConf *tls.Config
+	if cfg.TLSCert != "" || cfg.TLSKey != "" {
+		if cfg.TLSCert == "" || cfg.TLSKey == "" {
+			return nil, errors.New("both --tls-cert and --tls-key are required to serve HTTPS")
+		}
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			return nil, fmt.Errorf("load TLS key pair: %w", err)
+		}
+		tlsConf = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
+	}
+
+	// The LAN-plaintext warning: a password typed into a login form on plain
+	// HTTP off-loopback transits cleartext. Warn, don't refuse — TLS
+	// termination at a reverse proxy (with --allowed-hosts) is a legitimate,
+	// documented topology.
+	if passwordCfg && tlsConf == nil && !isLoopbackAddr(listen) {
+		slog.Warn("the console password will transit plain HTTP on a non-loopback address — set --tls-cert/--tls-key or terminate TLS at a reverse proxy", "listen", listen)
 	}
 
 	// Safety coupling enforced here so it holds for every caller, not just the
@@ -132,6 +194,11 @@ func New(cfg Config) (*Server, error) {
 		allowedHosts: cfg.AllowedHosts,
 		monitorCtrl:  cfg.MonitorCtrl,
 		cm:           newConnManager(cfg.Registry, profileActive),
+		authPath:     authPath,
+		passwordCfg:  passwordCfg,
+		sessions:     newSessionStore(),
+		loginLimiter: newLoginLimiter(),
+		tlsConf:      tlsConf,
 	}
 
 	// Seed the ephemeral boot bundle when the caller supplied a command-line
@@ -178,9 +245,11 @@ func (s *Server) resolveOr(w http.ResponseWriter, r *http.Request) *bundle {
 
 // buildHandler wires the route tree and middleware chain:
 //   - host guard on EVERY request (DNS-rebinding defense)
+//   - three static security headers on every response
 //   - the static shell and assets are served without a token, so a browser
 //     can load the page and read its bootstrap token from the URL
-//   - every /api/* route except healthz requires a bearer token
+//   - every /api/* route except healthz, the auth probe, and login requires a
+//     bearer credential (static token or login session)
 func (s *Server) buildHandler() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/status", s.handleStatus)
@@ -204,25 +273,48 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("POST /api/servers/{id}/monitor/start", s.handleMonitorStart)
 	api.HandleFunc("POST /api/servers/{id}/monitor/stop", s.handleMonitorStop)
 	api.HandleFunc("GET /api/servers/{id}/monitor", s.handleMonitorStatus)
+	// Authenticated auth verbs. Registered on the inner mux so a forgotten
+	// root registration breaks login, never security (ServeMux specificity
+	// keeps them under the tokenMiddleware-wrapped /api/ catch-all).
+	api.HandleFunc("POST /api/auth/logout", s.handleLogout)
+	api.HandleFunc("POST /api/auth/password", s.handlePasswordChange)
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /api/healthz", s.handleHealthz) // unauthenticated liveness
-	root.Handle("/api/", s.tokenMiddleware(api))         // token on all other /api/*
-	root.Handle("/", assetHandler())                     // static shell + assets
+	// Pre-auth surface (still behind hostGuard): the auth-mode probe the SPA
+	// boots from, and login itself.
+	root.HandleFunc("GET /api/auth", s.handleAuthInfo)
+	root.HandleFunc("POST /api/auth/login", s.handleLogin)
+	root.Handle("/api/", s.tokenMiddleware(api)) // credential on all other /api/*
+	root.Handle("/", assetHandler())             // static shell + assets
 
-	return s.hostGuard(root)
+	return s.hostGuard(securityHeaders(root))
 }
 
 // Handler returns the fully assembled HTTP handler. Exposed for tests.
 func (s *Server) Handler() http.Handler { return s.mux }
 
-// Token returns the active access token (supplied or generated).
+// Token returns the active access token (supplied or generated). Empty in
+// password-only mode.
 func (s *Server) Token() string { return s.token }
 
-// URL returns the jupyter-style bootstrap URL, including the token, that the
-// operator opens in a browser.
+// PasswordLogin reports whether a console password was configured at boot —
+// the cmd layer keys its banner wording on it.
+func (s *Server) PasswordLogin() bool { return s.passwordCfg }
+
+// URL returns the bootstrap URL the operator opens in a browser. Token mode
+// includes the jupyter-style ?token=; password mode omits it (printing a live
+// credential into logs and shell history serves no one when the login form is
+// the entry point). The scheme follows TLS.
 func (s *Server) URL() string {
-	return fmt.Sprintf("http://%s/?token=%s", displayHost(s.listen), s.token)
+	scheme := "http"
+	if s.tlsConf != nil {
+		scheme = "https"
+	}
+	if s.passwordCfg || s.token == "" {
+		return fmt.Sprintf("%s://%s/", scheme, displayHost(s.listen))
+	}
+	return fmt.Sprintf("%s://%s/?token=%s", scheme, displayHost(s.listen), s.token)
 }
 
 // Listen binds the configured address and returns the listener synchronously,
@@ -242,11 +334,20 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           s.mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		TLSConfig:         s.tlsConf,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		var err error
+		if s.tlsConf != nil {
+			// Cert/key already live in TLSConfig; ServeTLS's file args are
+			// unused. http/2 comes along automatically.
+			err = srv.ServeTLS(ln, "", "")
+		} else {
+			err = srv.Serve(ln)
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}

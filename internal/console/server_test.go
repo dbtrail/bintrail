@@ -62,7 +62,9 @@ func TestMuxHealthzUnauthenticated(t *testing.T) {
 
 func TestMuxAPIRequiresToken(t *testing.T) {
 	srv := newTestServer(t)
-	for _, path := range []string{"/api/status", "/api/events", "/api/schemas", "/api/capabilities", "/api/reconstruct"} {
+	// The two authenticated auth verbs ride the same middleware: the 401
+	// fires before method matching, so GET probes them fine.
+	for _, path := range []string{"/api/status", "/api/events", "/api/schemas", "/api/capabilities", "/api/reconstruct", "/api/auth/logout", "/api/auth/password"} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+path, nil)
 		srv.Handler().ServeHTTP(rec, req)

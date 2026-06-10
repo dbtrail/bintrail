@@ -1,6 +1,7 @@
 package console
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -50,21 +51,69 @@ func bearerToken(r *http.Request) string {
 	return h[len(prefix):]
 }
 
-// tokenMiddleware requires a valid bearer token on every wrapped request.
-// The comparison is constant-time for equal-length inputs (subtle returns 0
-// immediately on a length mismatch, so token *length* is not hidden — that's
-// fine here, the token is a fixed 32 hex chars).
+// authKind records, in the request context, which credential authenticated
+// the request. The change-password first-set branch keys on it: only the
+// static token (the bootstrap trust root) may claim the first password.
+type authKind int
+
+const (
+	authKindNone authKind = iota
+	authKindToken
+	authKindSession
+)
+
+type authKindCtxKey struct{}
+
+func authKindFrom(ctx context.Context) authKind {
+	k, _ := ctx.Value(authKindCtxKey{}).(authKind)
+	return k
+}
+
+// tokenMiddleware requires a valid bearer credential on every wrapped
+// request: either the static access token or a login session. Both checks
+// run on the same path with no prefix branching, so response shape never
+// reveals which credential kind a guess was tested against. The static
+// compare is constant-time for equal-length inputs (subtle returns 0
+// immediately on a length mismatch, so credential *length* is not hidden —
+// fine: the token is 32 hex chars and sessions are "bcs_"+64 hex by
+// construction, not secrets in their shape).
 //
-// The token is required in the Authorization header specifically (not a
+// The empty-got guard is load-bearing: password-only mode legitimately runs
+// with s.token == "", and ConstantTimeCompare("", "") == 1 would otherwise
+// wave every credential-less request through.
+//
+// The credential is required in the Authorization header specifically (not a
 // cookie): a browser fetch() must opt in to sending it, which keeps a
 // cross-site form-POST from carrying ambient credentials to /api/recover.
 func (s *Server) tokenMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := bearerToken(r)
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
+		if got == "" {
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
 			return
 		}
+		if s.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1 {
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authKindCtxKey{}, authKindToken)))
+			return
+		}
+		if s.sessions.Validate(got) {
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authKindCtxKey{}, authKindSession)))
+			return
+		}
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
+	})
+}
+
+// securityHeaders sets three static response headers on everything:
+// Referrer-Policy keeps the ?token= bootstrap URL out of Referer headers,
+// nosniff hardens the embedded assets, and DENY blocks framing the login
+// overlay (clickjacking).
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
 		next.ServeHTTP(w, r)
 	})
 }

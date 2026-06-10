@@ -134,9 +134,9 @@ docker compose logs -f bintrail
 ```
 
 Optional knobs go in a `.env` next to the file: `SOURCE_DSN` to start
-streaming one source immediately at boot, `CONSOLE_TOKEN` to pin the access
-token across restarts, `INDEX_DSN` to bring your own index MySQL. (From a
-source checkout, `cp .env.example .env` gives you the annotated template.)
+streaming one source immediately at boot, `CONSOLE_TOKEN` to pin your own
+access token, `INDEX_DSN` to bring your own index MySQL. (From a source
+checkout, `cp .env.example .env` gives you the annotated template.)
 
 The logs print the console URL, access token included:
 
@@ -146,6 +146,15 @@ Console is running — open it and add the MySQL servers to watch:
     http://127.0.0.1:8090/?token=ab12cd34…
 ```
 
+The generated token persists in the `bintrail-state` volume, so it stays
+stable across restarts and recreations. Prefer signing in with a username and
+password instead of a token URL? Set one — the login form appears on the next
+visit, no restart needed:
+
+```bash
+docker compose exec -it bintrail bintrail-console user set-password
+```
+
 Notes:
 
 - `SOURCE_DSN` is the MySQL you want to watch. The user needs
@@ -153,9 +162,14 @@ Notes:
   same machine is reachable from inside Docker as `host.docker.internal`.
 - The console is published on the **host loopback only**
   (`127.0.0.1:8090`). To reach it from another machine, change the port
-  mapping to `"8090:8090"` and pin a stable `CONSOLE_TOKEN` in `.env`
-  (without a pinned token a fresh one is generated per boot and printed in
-  the logs).
+  mapping to `"8090:8090"` and set a credential: a console password (above —
+  ideally behind TLS: `BINTRAIL_CONSOLE_TLS_CERT`/`_TLS_KEY`, or a
+  TLS-terminating proxy) or a pinned `CONSOLE_TOKEN`.
+- The credential file lives at `/var/lib/bintrail/console-auth.yaml` in the
+  `bintrail-state` volume. Remove password login with
+  `docker compose exec bintrail bintrail-console user remove --yes`. There is
+  deliberately no password environment variable — `docker inspect` must never
+  print a credential.
 - `bintrail-console watch` is idempotent: restarts resume the stream from
   its saved checkpoint. The preflight (`doctor`) failing prints
   copy-pasteable remediation in the logs and the container retries.
@@ -233,7 +247,7 @@ only the *bundled* index is 8.4.)
 | `SOURCE_DSN` | compose (optional) | DSN for a source MySQL to start watching at boot (empty = add servers from the console UI) |
 | `INDEX_DSN` | compose (optional) | Bring-your-own index MySQL (default: the bundled container) |
 | `SCHEMAS` | compose (optional) | Comma-separated schemas to track (empty = all user schemas) |
-| `CONSOLE_TOKEN` | compose (optional) | Pin the console access token (default: generated per boot) |
+| `CONSOLE_TOKEN` | compose (optional) | Pin your own console access token (default: generated once and persisted in the `bintrail-state` volume) |
 | `INDEX_MYSQL_ROOT_PASSWORD` | compose (optional) | Pin the bundled index root password (set *before* first boot; default: randomly generated into the `bintrail-index-secret` volume) |
 | `BINTRAIL_TAG` | compose (optional) | Image tag to run (default `latest`) |
 | `BINTRAIL_INDEX_DSN` | bintrail-mcp | Index DSN for the MCP server |

@@ -6,7 +6,10 @@
 #      runs the preflight, provisions an index for it, and starts streaming.
 #
 # No .env needed. Optionally set SOURCE_DSN (start streaming one source
-# immediately) or CONSOLE_TOKEN (stable token across restarts) in a .env.
+# immediately) or CONSOLE_TOKEN (pin your own token) in a .env. The generated
+# token persists in the bintrail-state volume, so it is stable across
+# restarts either way. Prefer a username+password login instead? Run:
+#   docker compose exec -it bintrail bintrail-console user set-password
 #
 # What you get: a bundled MySQL 8.4 index (persisted in a volume), the
 # `bintrail-console watch` daemon against your source (preflight → index
@@ -136,7 +139,10 @@ services:
     #   dockerfile: Dockerfile.bintrail-console
     ports:
       # Console on the host loopback only. To reach it from another machine,
-      # change to "8090:8090" AND set a stable CONSOLE_TOKEN in .env.
+      # change to "8090:8090" AND set a credential: a console password
+      # (docker compose exec -it bintrail bintrail-console user set-password —
+      # ideally behind TLS or a TLS-terminating proxy) or a stable
+      # CONSOLE_TOKEN in .env.
       - "127.0.0.1:8090:8090"
     environment:
       # Optional: a source MySQL to start watching immediately. Leave unset
@@ -154,6 +160,12 @@ services:
       BINTRAIL_CONSOLE_TOKEN: ${CONSOLE_TOKEN:-}
       # Saved console connections persist across container recreations.
       BINTRAIL_CONSOLE_SERVERS: /var/lib/bintrail/console-servers.yaml
+      # Optional password login (persists next to the registry). Enable it
+      # with: docker compose exec -it bintrail bintrail-console user set-password
+      # The running daemon honors it on the next login — no restart needed.
+      # There is deliberately NO password env var: docker inspect must never
+      # be able to print a credential.
+      BINTRAIL_CONSOLE_AUTH: /var/lib/bintrail/console-auth.yaml
     volumes:
       - bintrail-state:/var/lib/bintrail
       - bintrail-index-secret:/run/secret:ro
@@ -169,12 +181,21 @@ services:
         if [ -z "$$INDEX_DSN" ]; then
           INDEX_DSN="root:$$(cat /run/secret/index_password)@tcp(index-mysql:3306)/bintrail_index"
         fi
-        # A non-loopback console bind requires an explicit token. Generate one
-        # per boot when CONSOLE_TOKEN isn't pinned in .env — the startup
-        # banner below prints the full URL including it either way.
+        # A non-loopback console bind requires a credential. When CONSOLE_TOKEN
+        # isn't pinned in .env, generate a token ONCE and persist it in the
+        # bintrail-state volume — restarts and recreations keep the same token,
+        # so bookmarked ?token= URLs and automation survive redeploys. (umask
+        # before the write: the file must never be world-readable, even
+        # pre-chmod. The -s guard copies index-init's dash-has-no-pipefail
+        # defense: an empty token file must abort, not 401 everything.)
         if [ -z "$$BINTRAIL_CONSOLE_TOKEN" ]; then
-          export BINTRAIL_CONSOLE_TOKEN="$$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-          echo "Generated console token (set CONSOLE_TOKEN in .env to keep it stable across restarts)"
+          tf=/var/lib/bintrail/console_token
+          if [ ! -s "$$tf" ]; then
+            (umask 077; od -An -N16 -tx1 /dev/urandom | tr -d ' \n' > "$$tf")
+            if [ ! -s "$$tf" ]; then echo "FATAL: failed to generate the console token" >&2; rm -f "$$tf"; exit 1; fi
+            echo "Generated console token (persisted in the bintrail-state volume; set CONSOLE_TOKEN in .env to override)"
+          fi
+          export BINTRAIL_CONSOLE_TOKEN="$$(cat "$$tf")"
         fi
         if [ -n "$$SOURCE_DSN" ] && [ -n "$$SCHEMAS" ]; then
           exec bintrail-console watch --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN" --schemas "$$SCHEMAS"

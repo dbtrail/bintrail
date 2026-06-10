@@ -200,6 +200,8 @@ the `monitor` capability is false and the verbs return 403 there.
 | `--baseline-dir` | — | Local directory of baseline Parquet snapshots. Enables the Time-travel (reconstruct) surface. |
 | `--baseline-s3` | — | S3 prefix of baseline snapshots (`s3://bucket/prefix/`). Enables Time-travel. |
 | `--servers-file` | `~/.config/bintrail/console-servers.yaml` | Path to the server registry YAML managed from the UI. |
+| `--auth-file` | `~/.config/bintrail/console-auth.yaml` | Console credential file enabling password login (see below). Created with `bintrail-console user set-password`, never by the server on its own. |
+| `--tls-cert` / `--tls-key` | — | Serve the console over HTTPS (PEM files, both-or-neither). Rotation = restart; no ACME. |
 
 ### Environment variables
 
@@ -209,34 +211,96 @@ the `monitor` capability is false and the verbs return 403 there.
 - `BINTRAIL_CONSOLE_BASELINE_DIR` — same as `--baseline-dir`.
 - `BINTRAIL_CONSOLE_BASELINE_S3` — same as `--baseline-s3`.
 - `BINTRAIL_CONSOLE_SERVERS` — same as `--servers-file`.
+- `BINTRAIL_CONSOLE_AUTH` — same as `--auth-file`.
+- `BINTRAIL_CONSOLE_TLS_CERT` / `BINTRAIL_CONSOLE_TLS_KEY` — same as `--tls-cert` / `--tls-key`.
 
-Precedence is the usual CLI flag > environment variable > default. The five
+There is deliberately **no** environment variable for the password itself —
+env vars leak through `docker inspect`, `ps e`, and `/proc`; the password is
+set interactively or via `--password-stdin`, never inlined.
+
+Precedence is the usual CLI flag > environment variable > default. The
 `BINTRAIL_CONSOLE_*` variables apply equally to `bintrail-console watch` (where
 the matching flags are `--console-listen`, `--console-token`, `--baseline-dir`,
-`--baseline-s3`, `--console-servers-file`).
+`--baseline-s3`, `--console-servers-file`, `--console-auth-file`,
+`--console-tls-cert`, `--console-tls-key`).
+
+## Password login
+
+The token is the zero-config default, but it can be paired with (or, for
+humans, replaced by) a username+password login:
+
+```console
+$ bintrail-console user set-password
+New console password: ********
+Retype to confirm: ********
+Console password set for user "admin" (~/.config/bintrail/console-auth.yaml).
+A running server accepts it on the next login — no restart needed.
+```
+
+- The credential lives in a 0600 YAML file (`version`, `username`, a
+  bcrypt-cost-12 `password_bcrypt`, `updated_at`) — same envelope and atomic
+  write as the server registry. One user; multi-user/RBAC/SSO is dbtrail.
+- A successful `POST /api/auth/login` mints an **in-memory session token**
+  (24 h absolute, 8 h idle, max 16 concurrent) the SPA uses as its Bearer
+  credential. Sessions die on logout, on password change (which revokes all
+  of them), and on process restart — nothing session-shaped touches disk.
+- **The static `--token` keeps working unchanged** as the automation
+  credential (scripts, curl, CI). With a password configured and no explicit
+  token, no token is auto-generated and the startup banner prints a clean URL
+  — sign in at the login form instead. Non-loopback binds become legal with
+  either credential.
+- Login and password-change are throttled (per-IP 5 failures/min and
+  20/15 min, 30/min globally, `Retry-After` on 429) and bcrypt-verified in
+  constant time with no username enumeration. There is no lockout — locking
+  the single user out would hand an attacker a denial-of-service against the
+  operator.
+- Rotate from the UI (⌘K → "Change console password", revokes every other
+  session immediately) or re-run `user set-password` (applies on the next
+  login; live sessions ride out their TTL). `user remove` deletes the file
+  and reverts to token-only auth; `user status` shows what is configured
+  without printing secrets. Forgot the password? Shell access is the
+  recovery path: re-run `user set-password`.
+- Off-loopback password logins over plain HTTP are warned about at startup:
+  use `--tls-cert`/`--tls-key` or terminate TLS at a reverse proxy (with
+  `--allowed-hosts`).
 
 ## Security model
 
 The binary has no Supabase/RBAC backend to lean on, so the console defends
 itself:
 
-- **Loopback by default + token required.** A random 128-bit token is generated
-  for loopback binds and printed in the URL. Binding to a non-loopback address
-  (`0.0.0.0`, a LAN IP, …) **requires** an explicit `--token` or the command
-  refuses to start.
-- **Constant-time token compare** (`crypto/subtle`).
-- **Bearer header on the API.** `/api/*` requires the token in the
-  `Authorization: Bearer …` header — never a cookie alone — so a cross-site
-  form POST cannot carry ambient credentials to `/api/recover`. The page shell
-  loads without a token (it reads the token from the URL to bootstrap its
-  requests).
+- **Loopback by default + a credential required.** A random 128-bit token is
+  generated for loopback binds and printed in the URL. Binding to a
+  non-loopback address (`0.0.0.0`, a LAN IP, …) **requires** an explicit
+  `--token` or a configured console password, or the command refuses to start.
+- **Constant-time credential checks** (`crypto/subtle` for the token;
+  sessions are looked up by SHA-256 of the presented value, so raw session
+  tokens never live server-side; unknown-username logins still burn a full
+  bcrypt compare so timing cannot enumerate the username).
+- **Bearer header on the API — never a cookie.** `/api/*` requires the
+  credential (static token or login session) in the `Authorization: Bearer …`
+  header, so a cross-site form POST cannot carry ambient credentials to
+  `/api/recover`. Login itself requires `Content-Type: application/json`,
+  which an HTML form cannot send — login-CSRF dies the same way. The page
+  shell loads without a token (it reads the token from the URL to bootstrap
+  its requests).
 - **No CORS headers.** Requests are same-origin only.
 - **Host-header allowlist.** Requests whose `Host` is a domain name are
   rejected (only IP literals and `localhost` pass), which defeats DNS-rebinding
   attacks against the local bind.
+- **Static security headers** on every response: `Referrer-Policy:
+  no-referrer` (keeps the `?token=` bootstrap URL out of Referer headers),
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`.
+- **Brute-force throttling** on the two bcrypt-verifying endpoints (login and
+  change-password), counting failures per client IP plus a global window.
+  `X-Forwarded-For` is never trusted; behind a reverse proxy all clients share
+  one bucket — rate-limit at the proxy if that matters to you.
 - **Result caps.** Every query is bounded — events default 100 (max 1000),
   recover default 1000 (max 10000). Never unlimited.
-- **`/api/healthz`** is the only unauthenticated endpoint (a liveness probe).
+- **Unauthenticated endpoints**: `/api/healthz` (liveness), `GET /api/auth`
+  (does password login exist — what the login form's presence would reveal
+  anyway), and `POST /api/auth/login` itself. Everything else needs a Bearer
+  credential.
 
 ## Open-core boundary
 
@@ -255,11 +319,15 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | Method & path | Purpose |
 |---|---|
 | `GET /api/healthz` | Liveness probe (no token). |
+| `GET /api/auth` | Whether password login is enabled (no token): `{"password_login": bool}`. |
+| `POST /api/auth/login` | Exchange `{username, password}` for a session: `{token, expires_at}`. Rate-limited; requires `Content-Type: application/json`. |
+| `POST /api/auth/logout` | Revoke the presented session (static token → 204 no-op). |
+| `POST /api/auth/password` | Set (first time; requires static-token auth) or rotate (`current_password` verified) the console password. Revokes all sessions and returns a fresh one. |
 | `GET /api/status` | Index status (same payload as `bintrail status --format json`). |
 | `GET /api/schemas` | Distinct schemas. `?schema=<name>` → that schema's tables. |
 | `GET /api/events` | Event browser. Query params: `schema, table, pk, event_type, gtid, since, until, changed_column, order, limit`. |
 | `POST /api/recover` | Undo-SQL generation. JSON body with the same filter fields (requires at least `schema`; an `order` field is accepted but ignored — recover always processes oldest-first). Returns `{sql, statement_count, row_count, warnings}`. |
-| `GET /api/capabilities` | Reports enabled optional surfaces for the **selected server**, e.g. `{"reconstruct": true}`. The frontend uses it to show/hide baseline-gated tabs on every switch. |
+| `GET /api/capabilities` | Reports enabled optional surfaces for the **selected server**, e.g. `{"reconstruct": true, "auth": {"password_set": true, "auth_kind": "session"}}`. The frontend uses it to show/hide baseline-gated tabs on every switch and to gate the logout affordance (`auth_kind` says how this request authenticated). |
 | `GET /api/reconstruct` | Single-row point-in-time reconstruct (baseline-gated **per server**; 404 when not configured). Query params: `schema, table, pk, at, history, allow_gaps`. Returns `{found, deleted, state, history, baseline_time, event_count, warnings}`. |
 | `GET /api/servers` | List servers (masked: parsed host/port/user/dbname + `has_password`, never a DSN or password) plus `default_id`. |
 | `POST /api/servers` | Add a server to the registry (validates, does not connect; never runs DDL). |

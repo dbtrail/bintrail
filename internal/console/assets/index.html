@@ -86,6 +86,13 @@
           <span>Docs · Recovery guide</span>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"></path><path d="M20 4l-9 9"></path><path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4"></path></svg>
         </a>
+        <!-- Shown only for session-authenticated operators (server-reported
+             auth_kind gates it via the .auth-on class — token auth has nothing
+             to log out of). -->
+        <button class="side-logout" id="logout-btn" type="button" data-auth="session">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><path d="M16 17l5-5-5-5"></path><path d="M21 12H9"></path></svg>
+          <span>Log out</span>
+        </button>
         <div class="side-meta" id="side-meta">
           <div><b id="meta-conn">—</b></div>
           <div id="meta-stream">stream <b>—</b></div>
@@ -100,6 +107,10 @@
 
   <!-- Servers modal mount (built by app.js into a .modal-scrim) -->
   <div id="modal"></div>
+  <!-- Login overlay + password dialog mount — its own div, NOT #modal: the
+       onboarding flow also mounts there and the login gate must never race a
+       dialog lifecycle. -->
+  <div id="login-mount"></div>
   <!-- Command palette mount (⌘K) -->
   <div id="cmdk-mount"></div>
 

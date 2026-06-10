@@ -1,0 +1,175 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/dbtrail/dbtrail/internal/console"
+)
+
+// This file mutates usr* package globals via save-and-restore — no
+// t.Parallel(), same rule as watch_test.go.
+
+func resetUserGlobals(t *testing.T) {
+	t.Helper()
+	saved := []any{usrAuthFile, usrUsername, usrPasswordStdin, usrSkipIfUnchanged, usrYes, usrFormat}
+	t.Cleanup(func() {
+		usrAuthFile = saved[0].(string)
+		usrUsername = saved[1].(string)
+		usrPasswordStdin = saved[2].(bool)
+		usrSkipIfUnchanged = saved[3].(bool)
+		usrYes = saved[4].(bool)
+		usrFormat = saved[5].(string)
+	})
+	usrAuthFile, usrUsername, usrPasswordStdin, usrSkipIfUnchanged, usrYes, usrFormat = "", "", false, false, false, "text"
+}
+
+// stdinFrom replaces os.Stdin with a pipe carrying s.
+func stdinFrom(t *testing.T, s string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.WriteString(s)
+	w.Close()
+	old := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = old; r.Close() })
+}
+
+func TestUserSetPasswordStdin(t *testing.T) {
+	resetUserGlobals(t)
+	path := filepath.Join(t.TempDir(), "auth.yaml")
+	usrAuthFile, usrUsername, usrPasswordStdin = path, "ops", true
+	stdinFrom(t, "stdin-password-1\n")
+
+	if err := runUserSetPassword(userSetPasswordCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	a, err := console.LoadAuthFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Username != "ops" || !a.VerifyPassword("ops", "stdin-password-1") {
+		t.Error("written credential does not verify")
+	}
+}
+
+func TestUserSetPasswordPolicyAtCLI(t *testing.T) {
+	resetUserGlobals(t)
+	usrAuthFile, usrPasswordStdin = filepath.Join(t.TempDir(), "auth.yaml"), true
+	stdinFrom(t, "short77\n")
+	if err := runUserSetPassword(userSetPasswordCmd, nil); err == nil {
+		t.Error("7-char password accepted by the CLI")
+	}
+	if _, err := os.Stat(usrAuthFile); !os.IsNotExist(err) {
+		t.Error("rejected password still wrote a file")
+	}
+}
+
+func TestUserSetPasswordSkipIfUnchanged(t *testing.T) {
+	resetUserGlobals(t)
+	path := filepath.Join(t.TempDir(), "auth.yaml")
+	usrAuthFile, usrPasswordStdin = path, true
+	stdinFrom(t, "idempotent-pass-1\n")
+	if err := runUserSetPassword(userSetPasswordCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path)
+
+	usrSkipIfUnchanged = true
+	stdinFrom(t, "idempotent-pass-1\n")
+	if err := runUserSetPassword(userSetPasswordCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Error("--skip-if-unchanged rewrote an unchanged credential (hash churn + misleading updated_at)")
+	}
+
+	// A DIFFERENT password must still write.
+	stdinFrom(t, "rotated-pass-22\n")
+	if err := runUserSetPassword(userSetPasswordCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := console.LoadAuthFile(path)
+	if !a.VerifyPassword("admin", "rotated-pass-22") {
+		t.Error("--skip-if-unchanged blocked a real rotation")
+	}
+}
+
+func TestUserRemove(t *testing.T) {
+	resetUserGlobals(t)
+	path := filepath.Join(t.TempDir(), "auth.yaml")
+	if err := console.SetAuthPassword(path, "", "remove-me-pass"); err != nil {
+		t.Fatal(err)
+	}
+	usrAuthFile, usrYes = path, true
+	if err := runUserRemove(userRemoveCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("auth file survives user remove")
+	}
+	// Removing again is a friendly no-op, not an error.
+	if err := runUserRemove(userRemoveCmd, nil); err != nil {
+		t.Errorf("second remove errored: %v", err)
+	}
+}
+
+func TestUserStatusPrintsNoSecrets(t *testing.T) {
+	resetUserGlobals(t)
+	path := filepath.Join(t.TempDir(), "auth.yaml")
+	if err := console.SetAuthPassword(path, "ops", "status-pass-123"); err != nil {
+		t.Fatal(err)
+	}
+	usrAuthFile = path
+
+	for _, format := range []string{"text", "json"} {
+		usrFormat = format
+		r, w, _ := os.Pipe()
+		old := os.Stdout
+		os.Stdout = w
+		err := runUserStatus(userStatusCmd, nil)
+		w.Close()
+		os.Stdout = old
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 4096)
+		n, _ := r.Read(buf)
+		out := string(buf[:n])
+		if strings.Contains(out, "$2a$") || strings.Contains(out, "status-pass-123") {
+			t.Errorf("%s status output leaks hash material:\n%s", format, out)
+		}
+		if !strings.Contains(out, "ops") || !strings.Contains(out, "cost=12") {
+			t.Errorf("%s status output missing expected fields:\n%s", format, out)
+		}
+	}
+}
+
+// TestServeAuthTLSEnvFallback asserts the three new env fallbacks in runServe
+// the same way TestRunServeIndexDSNFromEnv does: let runServe error on its
+// earliest guard, then inspect that the env values landed in the globals (the
+// fallback block runs first).
+func TestServeAuthTLSEnvFallback(t *testing.T) {
+	conIndexDSN, conProfile, conBaselineDir, conBaselineS3 = "", "", "", ""
+	conAuthFile, conTLSCert, conTLSKey = "", "", ""
+	conServersFile = filepath.Join(t.TempDir(), "servers.yaml") // empty registry
+	t.Cleanup(func() { conIndexDSN, conServersFile, conAuthFile, conTLSCert, conTLSKey = "", "", "", "", "" })
+	t.Setenv("BINTRAIL_INDEX_DSN", "")
+	t.Setenv("BINTRAIL_CONSOLE_SERVERS", "")
+	t.Setenv("BINTRAIL_CONSOLE_AUTH", "/env/auth.yaml")
+	t.Setenv("BINTRAIL_CONSOLE_TLS_CERT", "/env/cert.pem")
+	t.Setenv("BINTRAIL_CONSOLE_TLS_KEY", "/env/key.pem")
+
+	if err := runServe(serveCmd, nil); err == nil {
+		t.Fatal("expected the empty-DSN guard to fire")
+	}
+	if conAuthFile != "/env/auth.yaml" || conTLSCert != "/env/cert.pem" || conTLSKey != "/env/key.pem" {
+		t.Errorf("env fallbacks not consumed: auth=%q cert=%q key=%q", conAuthFile, conTLSCert, conTLSKey)
+	}
+}

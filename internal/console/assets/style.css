@@ -289,6 +289,16 @@ button { font-family: inherit; }
 .side-docs:hover svg { color: var(--accent); }
 [data-accent="warm"] .side-docs:hover { color: var(--orange-2); }
 [data-accent="warm"] .side-docs:hover svg { color: var(--orange-2); }
+.side-logout {
+  display: flex; align-items: center; gap: 9px; width: calc(100% + 12px);
+  font-family: var(--f-ui); font-size: 13px; color: var(--ink-2);
+  background: none; border: none; cursor: pointer; text-align: left;
+  padding: 8px 8px; margin: -4px -6px 8px; border-radius: var(--radius-sm);
+  transition: background .15s, color .15s;
+}
+.side-logout svg { width: 15px; height: 15px; color: var(--ink-4); }
+.side-logout:hover { background: var(--delete-bg); color: var(--delete); }
+.side-logout:hover svg { color: var(--delete); }
 .side-meta { display: flex; flex-direction: column; gap: 3px; }
 
 /* ============================================================
@@ -1086,6 +1096,16 @@ button { font-family: inherit; }
    .cap-on. The :not() + !important hides by default and restores the
    element's own display once gated on — no flash, no per-element value. */
 [data-capability]:not(.cap-on) { display: none !important; }
+
+/* Auth-kind gating, same pattern: [data-auth="session"] surfaces (the logout
+   button) show only when applyAuthGate() confirms this tab holds a login
+   session — a static token has nothing to log out of. */
+[data-auth]:not(.auth-on) { display: none !important; }
+
+/* login overlay + password dialog (mounted in #login-mount) */
+.login-panel { max-width: 380px; }
+.login-form { display: flex; flex-direction: column; gap: 14px; margin-top: 16px; }
+.login-form .field { width: auto; }
 
 /* result/meta lines reused across Events, Recover, Reconstruct */
 .meta-line {

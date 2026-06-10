@@ -67,6 +67,9 @@ var (
 	upConsoleBaselineDir string
 	upConsoleBaselineS3  string
 	upConsoleServersFile string
+	upConsoleAuthFile    string
+	upConsoleTLSCert     string
+	upConsoleTLSKey      string
 
 	upRotateRetain    string
 	upRotateInterval  string
@@ -139,6 +142,9 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface")
 	watchCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
 	watchCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML (default ~/.config/bintrail/console-servers.yaml)")
+	watchCmd.Flags().StringVar(&upConsoleAuthFile, "console-auth-file", "", "Path to the console auth file enabling password login (default ~/.config/bintrail/console-auth.yaml; created with `bintrail-console user set-password`)")
+	watchCmd.Flags().StringVar(&upConsoleTLSCert, "console-tls-cert", "", "TLS certificate file (PEM); serve the console over HTTPS (requires --console-tls-key)")
+	watchCmd.Flags().StringVar(&upConsoleTLSKey, "console-tls-key", "", "TLS private key file (PEM; requires --console-tls-cert)")
 	watchCmd.Flags().StringVar(&upRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
 	watchCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
 	watchCmd.Flags().IntVar(&upRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
@@ -319,7 +325,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 		return fmt.Errorf("console: %w", err)
 	}
 
-	cfg, err := upConsoleConfig(db, upIndexDSN, upConsoleListen, upConsoleToken, upConsoleBaselineDir, upConsoleBaselineS3)
+	cfg, err := upConsoleConfig(db, upIndexDSN, upConsoleOpts())
 	if err != nil {
 		return err
 	}
@@ -360,7 +366,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 		defer stopMetrics()
 	}
 
-	fmt.Fprintf(os.Stderr, "\nConsole is running — open it and add the MySQL servers to watch:\n\n    %s\n\n", srv.URL())
+	printConsoleBanner(srv, "Console is running — open it and add the MySQL servers to watch:")
 	go supervisor.Reconcile(registry)
 
 	serveErr := srv.Serve(ctx, ln)
@@ -413,7 +419,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("console: %w", err)
 	}
 
-	cfg, err := upConsoleConfig(db, upIndexDSN, upConsoleListen, upConsoleToken, upConsoleBaselineDir, upConsoleBaselineS3)
+	cfg, err := upConsoleConfig(db, upIndexDSN, upConsoleOpts())
 	if err != nil {
 		return err
 	}
@@ -469,7 +475,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		}
 		consoleDone <- struct{}{}
 	}()
-	fmt.Fprintf(os.Stderr, "\nConsole (read-only) is running. Open:\n\n    %s\n\n", srv.URL())
+	printConsoleBanner(srv, "Console (read-only) is running. Open:")
 
 	// Resume whatever the operator had monitoring before the restart —
 	// desired state lives in the registry, positions in each per-source
@@ -541,6 +547,47 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 			upConsoleServersFile = v
 		}
 	}
+	if !cmd.Flags().Changed("console-auth-file") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_AUTH"); v != "" {
+			upConsoleAuthFile = v
+		}
+	}
+	if !cmd.Flags().Changed("console-tls-cert") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_TLS_CERT"); v != "" {
+			upConsoleTLSCert = v
+		}
+	}
+	if !cmd.Flags().Changed("console-tls-key") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_TLS_KEY"); v != "" {
+			upConsoleTLSKey = v
+		}
+	}
+}
+
+// consoleOpts carries watch's console-surface settings into upConsoleConfig —
+// a struct rather than a growing list of positional string params (it crossed
+// six with auth+TLS; nine positionals is how arguments get transposed).
+type consoleOpts struct {
+	Listen      string
+	Token       string
+	BaselineDir string
+	BaselineS3  string
+	AuthFile    string
+	TLSCert     string
+	TLSKey      string
+}
+
+// upConsoleOpts snapshots the resolved upConsole* globals.
+func upConsoleOpts() consoleOpts {
+	return consoleOpts{
+		Listen:      upConsoleListen,
+		Token:       upConsoleToken,
+		BaselineDir: upConsoleBaselineDir,
+		BaselineS3:  upConsoleBaselineS3,
+		AuthFile:    upConsoleAuthFile,
+		TLSCert:     upConsoleTLSCert,
+		TLSKey:      upConsoleTLSKey,
+	}
 }
 
 // upConsoleConfig builds the console configuration for `watch`. It serves
@@ -550,7 +597,7 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 // (baselineConfigured in internal/console/server.go, which owns dir-over-s3
 // precedence) reduces to baseline presence. Extracted for testability (dbName
 // extraction + DSN validation).
-func upConsoleConfig(db *sql.DB, indexDSN, listen, token, baselineDir, baselineS3 string) (console.Config, error) {
+func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Config, error) {
 	cfg, err := mysql.ParseDSN(indexDSN)
 	if err != nil {
 		return console.Config{}, fmt.Errorf("invalid --index-dsn: %w", err)
@@ -562,10 +609,13 @@ func upConsoleConfig(db *sql.DB, indexDSN, listen, token, baselineDir, baselineS
 		DB:          db,
 		DBName:      cfg.DBName,
 		BootDSN:     indexDSN,
-		Listen:      listen,
-		Token:       token,
-		BaselineDir: baselineDir,
-		BaselineS3:  baselineS3,
+		Listen:      opts.Listen,
+		Token:       opts.Token,
+		BaselineDir: opts.BaselineDir,
+		BaselineS3:  opts.BaselineS3,
+		AuthPath:    opts.AuthFile,
+		TLSCert:     opts.TLSCert,
+		TLSKey:      opts.TLSKey,
 		// MonitorCtrl (the control-plane supervisor) is wired by the caller —
 		// runUpStreamWithConsole / runUpConsoleOnly — because it needs the
 		// registry and the daemon lifecycle context, which this config builder

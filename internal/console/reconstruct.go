@@ -26,7 +26,18 @@ type capabilitiesResponse struct {
 	// Monitor: this process can start/stop monitoring (a control-plane
 	// supervisor — `bintrail-console watch`). Process-global, not per-server:
 	// it is about what the PROCESS is, not about the selected connection.
-	Monitor bool `json:"monitor"`
+	Monitor bool         `json:"monitor"`
+	Auth    authCapsInfo `json:"auth"`
+}
+
+// authCapsInfo tells the authenticated SPA how it got in and whether a
+// password exists: AuthKind gates the logout affordance (only sessions are
+// revocable) and PasswordSet picks "Set" vs "Change console password" in the
+// command palette. Server-derived on purpose — client-side bookkeeping of
+// "how did I log in" goes stale across reloads.
+type authCapsInfo struct {
+	PasswordSet bool   `json:"password_set"`
+	AuthKind    string `json:"auth_kind"` // "token" | "session"
 }
 
 // handleCapabilities reports which optional console surfaces are enabled for
@@ -39,7 +50,15 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	if b == nil {
 		return
 	}
-	writeJSON(w, http.StatusOK, capabilitiesResponse{Reconstruct: b.baselineConfigured, Monitor: s.monitorCtrl != nil})
+	kind := "token"
+	if authKindFrom(r.Context()) == authKindSession {
+		kind = "session"
+	}
+	writeJSON(w, http.StatusOK, capabilitiesResponse{
+		Reconstruct: b.baselineConfigured,
+		Monitor:     s.monitorCtrl != nil,
+		Auth:        authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
+	})
 }
 
 // stateEntryDTO is the wire view of a reconstruct.StateEntry (that struct has no
