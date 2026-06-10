@@ -69,9 +69,14 @@ func newLoginLimiter() *loginLimiter {
 // Allow reports whether ip may attempt a login now. When denied it returns
 // the duration after which the binding window resets (for Retry-After).
 // Checks run BEFORE any file read or bcrypt work.
+//
+// A nil limiter DENIES (fail closed), unlike Fail/Success which no-op: New is
+// the sole constructor and always populates loginLimiter, so a nil here means
+// a future construction path forgot it — failing closed surfaces that as
+// "logins are throttled" rather than silently disabling brute-force defense.
 func (l *loginLimiter) Allow(ip string) (bool, time.Duration) {
 	if l == nil {
-		return true, 0
+		return false, ipShortWindow
 	}
 	now := l.now()
 	l.mu.Lock()

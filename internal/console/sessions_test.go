@@ -69,6 +69,56 @@ func TestSessionIdleExpiry(t *testing.T) {
 	}
 }
 
+func TestSessionLastSeenThrottle(t *testing.T) {
+	s, now := fakeClock(t)
+	tok, _, _ := s.Issue()
+	created := s.m[sessionKey(tok)].lastSeen
+
+	// A Validate within lastSeenGranularity must NOT rewrite lastSeen (the
+	// throttle that keeps the hot path off the write churn).
+	*now = now.Add(30 * time.Second)
+	s.Validate(tok)
+	if !s.m[sessionKey(tok)].lastSeen.Equal(created) {
+		t.Error("lastSeen advanced within the granularity window — throttle broken")
+	}
+	// Past the granularity it does advance.
+	*now = now.Add(2 * time.Minute)
+	s.Validate(tok)
+	if !s.m[sessionKey(tok)].lastSeen.Equal(*now) {
+		t.Error("lastSeen did not advance past the granularity window")
+	}
+}
+
+func TestSessionEvictionUsesIdleDeadline(t *testing.T) {
+	// The eviction comparator is min(absolute, idle); since idleTTL (8h) <
+	// absoluteTTL (24h), the idle deadline governs. So refreshing the
+	// oldest-created session must PROTECT it: a later-created but un-refreshed
+	// session becomes the earliest-expiring and is evicted instead.
+	s, now := fakeClock(t)
+	a, _, _ := s.Issue() // created first
+	var later []string
+	for i := 1; i < maxSessions; i++ {
+		*now = now.Add(time.Minute)
+		tok, _, _ := s.Issue()
+		later = append(later, tok)
+	}
+	// Refresh A: its idle deadline becomes the latest of all.
+	*now = now.Add(20 * time.Minute)
+	s.Validate(a)
+	// Overflow eviction now targets later[0] (earliest idle deadline), not A.
+	*now = now.Add(time.Minute)
+	overflow, _, _ := s.Issue()
+	if !s.Validate(a) {
+		t.Error("a refreshed session was evicted despite the latest idle deadline")
+	}
+	if s.Validate(later[0]) {
+		t.Error("the earliest-idle session was not the eviction victim")
+	}
+	if !s.Validate(overflow) {
+		t.Error("the new session was not admitted")
+	}
+}
+
 func TestSessionRevocation(t *testing.T) {
 	s, _ := fakeClock(t)
 	t1, _, _ := s.Issue()

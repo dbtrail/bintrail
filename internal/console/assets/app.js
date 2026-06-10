@@ -277,7 +277,9 @@ function showLoginOverlay(opts) {
 // the password dialog (authenticated; the gate was never up) and, after a
 // successful login, by submitLogin. It does NOT lower loginGateRaised on its
 // own — only authenticating does, so the password dialog can never be the
-// thing that drops the gate (see showPasswordDialog's authenticated guard).
+// thing that drops the gate: showPasswordDialog bails on `if (loginGateRaised)
+// return`, and it is only reachable from ⌘K, which itself no-ops while the gate
+// is up and is only offered once authenticated (capsCache.auth populated).
 function closeLoginOverlay() { document.getElementById("login-mount").replaceChildren(); }
 
 function loginMsg(node, text) { node.classList.add("err"); node.textContent = text; }

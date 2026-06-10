@@ -140,11 +140,45 @@ func TestAuthFileNewerVersionLoadsReadOnly(t *testing.T) {
 }
 
 func TestVerifyNilAuthFileRunsDummyCompare(t *testing.T) {
-	// nil receiver must deny — and still burn a bcrypt compare so a missing
-	// file is not timing-distinguishable at the verify layer.
+	// nil receiver must deny — and still burn a bcrypt compare against the
+	// dummy hash so a missing file is not timing-distinguishable at verify.
+	var gotHash []byte
+	orig := bcryptCompare
+	bcryptCompare = func(hash, pw []byte) error { gotHash = hash; return orig(hash, pw) }
+	t.Cleanup(func() { bcryptCompare = orig })
+
 	var a *AuthFile
 	if a.VerifyPassword("admin", "whatever-pass") {
 		t.Error("nil AuthFile verified a password")
+	}
+	if string(gotHash) != dummyBcryptHash {
+		t.Errorf("nil-receiver compare ran against %q, want the dummy hash", gotHash)
+	}
+}
+
+// TestDummyHashCostMatchesReal pins the load-bearing timing-equalization
+// invariant: the dummy hash run on an unknown username must cost the SAME as a
+// real verify, or response time leaks whether the username exists. A future
+// edit dropping consoleBcryptCost or the dummy to a cheaper cost would reopen
+// the enumeration oracle while every other test stays green.
+func TestDummyHashCostMatchesReal(t *testing.T) {
+	cost, err := bcrypt.Cost([]byte(dummyBcryptHash))
+	if err != nil {
+		t.Fatalf("dummy hash is not a valid bcrypt hash: %v", err)
+	}
+	if cost != consoleBcryptCost {
+		t.Errorf("dummy hash cost = %d, want %d (timing oracle)", cost, consoleBcryptCost)
+	}
+}
+
+func TestAuthFileMalformedHashFailsLoud(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "auth.yaml")
+	// Present but structurally broken hash: must fail loud at load, so login,
+	// `user status`, and change-password all agree the file is corrupt rather
+	// than login silently treating it as a permanent wrong password.
+	os.WriteFile(p, []byte("version: 1\nusername: admin\npassword_bcrypt: $2a$12$truncated\n"), 0o600)
+	if _, err := LoadAuthFile(p); err == nil {
+		t.Fatal("malformed password_bcrypt loaded as a valid credential")
 	}
 }
 

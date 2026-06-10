@@ -156,8 +156,10 @@ func TestLoginRateLimited(t *testing.T) {
 	if rec.Code != 429 {
 		t.Fatalf("throttled attempt = %d, want 429", rec.Code)
 	}
-	if rec.Header().Get("Retry-After") == "" {
-		t.Error("429 without a Retry-After header")
+	// Retry-After must be >= 1: the handler's int(seconds)+1 ceiling avoids a
+	// "Retry-After: 0" that tells the client to retry immediately and re-trip.
+	if ra := rec.Header().Get("Retry-After"); ra == "" || ra == "0" {
+		t.Errorf("Retry-After = %q, want a positive integer", ra)
 	}
 	// The throttle also denies a CORRECT password (pre-bcrypt check), and the
 	// static token keeps working — automation is never throttled.

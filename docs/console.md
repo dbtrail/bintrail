@@ -213,6 +213,7 @@ the `monitor` capability is false and the verbs return 403 there.
 - `BINTRAIL_CONSOLE_SERVERS` — same as `--servers-file`.
 - `BINTRAIL_CONSOLE_AUTH` — same as `--auth-file`.
 - `BINTRAIL_CONSOLE_TLS_CERT` / `BINTRAIL_CONSOLE_TLS_KEY` — same as `--tls-cert` / `--tls-key`.
+- `BINTRAIL_CONSOLE_ALLOWED_HOSTS` — comma-separated, same as `--allowed-hosts`.
 
 There is deliberately **no** environment variable for the password itself —
 env vars leak through `docker inspect`, `ps e`, and `/proc`; the password is
@@ -222,7 +223,7 @@ Precedence is the usual CLI flag > environment variable > default. The
 `BINTRAIL_CONSOLE_*` variables apply equally to `bintrail-console watch` (where
 the matching flags are `--console-listen`, `--console-token`, `--baseline-dir`,
 `--baseline-s3`, `--console-servers-file`, `--console-auth-file`,
-`--console-tls-cert`, `--console-tls-key`).
+`--console-tls-cert`, `--console-tls-key`, `--console-allowed-hosts`).
 
 ## Password login
 

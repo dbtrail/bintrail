@@ -78,9 +78,12 @@ func authKindFrom(ctx context.Context) authKind {
 // fine: the token is 32 hex chars and sessions are "bcs_"+64 hex by
 // construction, not secrets in their shape).
 //
-// The empty-got guard is load-bearing: password-only mode legitimately runs
-// with s.token == "", and ConstantTimeCompare("", "") == 1 would otherwise
-// wave every credential-less request through.
+// Two guards are independent and BOTH load-bearing in password-only mode,
+// where s.token == "" and ConstantTimeCompare("", "") returns 1: the empty-got
+// early return rejects credential-less requests up front, and the s.token != ""
+// short-circuit additionally stops the static compare from ever running against
+// an empty configured token. Removing either leaves the other as the last line
+// of defense — keep both.
 //
 // The credential is required in the Authorization header specifically (not a
 // cookie): a browser fetch() must opt in to sending it, which keeps a

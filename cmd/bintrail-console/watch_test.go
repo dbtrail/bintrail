@@ -18,7 +18,7 @@ func assertStr(t *testing.T, name, got, want string) {
 }
 
 func TestUpConsoleConfig(t *testing.T) {
-	cfg, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok", BaselineDir: "/baselines", BaselineS3: "s3://bucket/prefix/", AuthFile: "/auth.yaml", TLSCert: "/c.pem", TLSKey: "/k.pem"})
+	cfg, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok", BaselineDir: "/baselines", BaselineS3: "s3://bucket/prefix/", AuthFile: "/auth.yaml", TLSCert: "/c.pem", TLSKey: "/k.pem", AllowedHosts: []string{"console.internal"}})
 	if err != nil {
 		t.Fatalf("upConsoleConfig: %v", err)
 	}
@@ -37,6 +37,9 @@ func TestUpConsoleConfig(t *testing.T) {
 	// their validation (both-or-neither TLS, auth-file probe).
 	if cfg.AuthPath != "/auth.yaml" || cfg.TLSCert != "/c.pem" || cfg.TLSKey != "/k.pem" {
 		t.Errorf("AuthPath=%q TLSCert=%q TLSKey=%q, want verbatim pass-through", cfg.AuthPath, cfg.TLSCert, cfg.TLSKey)
+	}
+	if len(cfg.AllowedHosts) != 1 || cfg.AllowedHosts[0] != "console.internal" {
+		t.Errorf("AllowedHosts=%v, want [console.internal]", cfg.AllowedHosts)
 	}
 	// watch has no --profile/--no-archive, so NoArchive must stay false —
 	// setting it would silently disable the reconstruct gate this wiring

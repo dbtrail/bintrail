@@ -52,6 +52,10 @@ func newSessionStore() *sessionStore {
 	return &sessionStore{m: make(map[[32]byte]*session), now: time.Now}
 }
 
+// sessionKey is the map key for a presented token: its SHA-256. Keeping the
+// raw token out of the map means a heap dump yields hashes, not credentials.
+func sessionKey(token string) [32]byte { return sha256.Sum256([]byte(token)) }
+
 // Issue mints a new session token: sessionPrefix + 64 hex chars (256 bits of
 // crypto/rand entropy). It sweeps expired entries and, if the store is still
 // at capacity, evicts the earliest-expiring session.
@@ -69,7 +73,7 @@ func (s *sessionStore) Issue() (token string, expiresAt time.Time, err error) {
 	if len(s.m) >= maxSessions {
 		s.evictEarliestLocked()
 	}
-	s.m[sha256.Sum256([]byte(token))] = &session{createdAt: now, lastSeen: now}
+	s.m[sessionKey(token)] = &session{createdAt: now, lastSeen: now}
 	return token, now.Add(sessionAbsoluteTTL), nil
 }
 
@@ -79,7 +83,7 @@ func (s *sessionStore) Validate(token string) bool {
 	if s == nil || token == "" {
 		return false
 	}
-	key := sha256.Sum256([]byte(token))
+	key := sessionKey(token)
 	now := s.now()
 
 	s.mu.Lock()
@@ -103,7 +107,7 @@ func (s *sessionStore) Revoke(token string) {
 	if s == nil {
 		return
 	}
-	key := sha256.Sum256([]byte(token))
+	key := sessionKey(token)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.m, key)

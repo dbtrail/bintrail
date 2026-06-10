@@ -114,6 +114,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	s.loginLimiter.Success(ip)
 	token, expires, err := s.sessions.Issue()
 	if err != nil {
+		slog.Error("console session issue failed", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, "failed to issue session")
 		return
 	}
@@ -212,6 +213,7 @@ func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 	s.sessions.RevokeAll()
 	token, expires, err := s.sessions.Issue()
 	if err != nil {
+		slog.Error("console session issue failed after password change", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, "password changed, but failed to issue a session — sign in again")
 		return
 	}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -70,6 +71,7 @@ var (
 	upConsoleAuthFile    string
 	upConsoleTLSCert     string
 	upConsoleTLSKey      string
+	upConsoleAllowedHost []string
 
 	upRotateRetain    string
 	upRotateInterval  string
@@ -145,6 +147,7 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleAuthFile, "console-auth-file", "", "Path to the console auth file enabling password login (default ~/.config/bintrail/console-auth.yaml; created with `bintrail-console user set-password`)")
 	watchCmd.Flags().StringVar(&upConsoleTLSCert, "console-tls-cert", "", "TLS certificate file (PEM); serve the console over HTTPS (requires --console-tls-key)")
 	watchCmd.Flags().StringVar(&upConsoleTLSKey, "console-tls-key", "", "TLS private key file (PEM; requires --console-tls-cert)")
+	watchCmd.Flags().StringSliceVar(&upConsoleAllowedHost, "console-allowed-hosts", nil, "Extra hostnames allowed in the Host header (for a TLS-terminating reverse proxy); IP literals and localhost are always allowed")
 	watchCmd.Flags().StringVar(&upRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
 	watchCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
 	watchCmd.Flags().IntVar(&upRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
@@ -562,31 +565,38 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 			upConsoleTLSKey = v
 		}
 	}
+	if !cmd.Flags().Changed("console-allowed-hosts") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_ALLOWED_HOSTS"); v != "" {
+			upConsoleAllowedHost = strings.Split(v, ",")
+		}
+	}
 }
 
 // consoleOpts carries watch's console-surface settings into upConsoleConfig —
 // a struct rather than a growing list of positional string params (it crossed
 // six with auth+TLS; nine positionals is how arguments get transposed).
 type consoleOpts struct {
-	Listen      string
-	Token       string
-	BaselineDir string
-	BaselineS3  string
-	AuthFile    string
-	TLSCert     string
-	TLSKey      string
+	Listen       string
+	Token        string
+	BaselineDir  string
+	BaselineS3   string
+	AuthFile     string
+	TLSCert      string
+	TLSKey       string
+	AllowedHosts []string
 }
 
 // upConsoleOpts snapshots the resolved upConsole* globals.
 func upConsoleOpts() consoleOpts {
 	return consoleOpts{
-		Listen:      upConsoleListen,
-		Token:       upConsoleToken,
-		BaselineDir: upConsoleBaselineDir,
-		BaselineS3:  upConsoleBaselineS3,
-		AuthFile:    upConsoleAuthFile,
-		TLSCert:     upConsoleTLSCert,
-		TLSKey:      upConsoleTLSKey,
+		Listen:       upConsoleListen,
+		Token:        upConsoleToken,
+		BaselineDir:  upConsoleBaselineDir,
+		BaselineS3:   upConsoleBaselineS3,
+		AuthFile:     upConsoleAuthFile,
+		TLSCert:      upConsoleTLSCert,
+		TLSKey:       upConsoleTLSKey,
+		AllowedHosts: upConsoleAllowedHost,
 	}
 }
 
@@ -606,16 +616,17 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 		return console.Config{}, fmt.Errorf("--index-dsn must include a database name (e.g. user:pass@tcp(host:3306)/binlog_index)")
 	}
 	return console.Config{
-		DB:          db,
-		DBName:      cfg.DBName,
-		BootDSN:     indexDSN,
-		Listen:      opts.Listen,
-		Token:       opts.Token,
-		BaselineDir: opts.BaselineDir,
-		BaselineS3:  opts.BaselineS3,
-		AuthPath:    opts.AuthFile,
-		TLSCert:     opts.TLSCert,
-		TLSKey:      opts.TLSKey,
+		DB:           db,
+		DBName:       cfg.DBName,
+		BootDSN:      indexDSN,
+		Listen:       opts.Listen,
+		Token:        opts.Token,
+		BaselineDir:  opts.BaselineDir,
+		BaselineS3:   opts.BaselineS3,
+		AuthPath:     opts.AuthFile,
+		TLSCert:      opts.TLSCert,
+		TLSKey:       opts.TLSKey,
+		AllowedHosts: opts.AllowedHosts,
 		// MonitorCtrl (the control-plane supervisor) is wired by the caller —
 		// runUpStreamWithConsole / runUpConsoleOnly — because it needs the
 		// registry and the daemon lifecycle context, which this config builder

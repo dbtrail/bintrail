@@ -111,11 +111,30 @@ func TestLimiterMapCapPrunesExpired(t *testing.T) {
 	}
 }
 
-func TestLimiterNilFailsOpen(t *testing.T) {
+func TestLimiterNilFailsClosed(t *testing.T) {
 	var l *loginLimiter
-	if ok, _ := l.Allow("10.0.0.1"); !ok {
-		t.Error("nil limiter denied")
+	// A nil limiter DENIES — New always populates loginLimiter, so a nil here
+	// is a construction bug that must surface as "throttled", not as silently
+	// disabled brute-force defense.
+	if ok, _ := l.Allow("10.0.0.1"); ok {
+		t.Error("nil limiter allowed — must fail closed")
 	}
 	l.Fail("10.0.0.1")    // must not panic
 	l.Success("10.0.0.1") // must not panic
+}
+
+func TestLimiterGlobalWindowResets(t *testing.T) {
+	l, now := fakeLimiter(t)
+	for i := 0; i < globalMax; i++ {
+		l.Fail(fmt.Sprintf("10.0.%d.%d", i/250, i%250))
+	}
+	if ok, _ := l.Allow("192.168.1.1"); ok {
+		t.Fatal("global window should be tripped")
+	}
+	// After the window elapses it must reset — otherwise 30 global failures
+	// brick logins for everyone forever (the self-DoS the throttle forbids).
+	*now = now.Add(globalWindow + time.Second)
+	if ok, _ := l.Allow("192.168.1.1"); !ok {
+		t.Error("global window did not reset after its width elapsed")
+	}
 }

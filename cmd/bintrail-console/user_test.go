@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/dbtrail/dbtrail/internal/console"
 )
 
@@ -171,5 +173,24 @@ func TestServeAuthTLSEnvFallback(t *testing.T) {
 	}
 	if conAuthFile != "/env/auth.yaml" || conTLSCert != "/env/cert.pem" || conTLSKey != "/env/key.pem" {
 		t.Errorf("env fallbacks not consumed: auth=%q cert=%q key=%q", conAuthFile, conTLSCert, conTLSKey)
+	}
+}
+
+// TestWatchAllowedHostsEnvFallback covers the new --console-allowed-hosts env
+// fallback on watch (the flag the reverse-proxy+TLS topology needs). Mirrors
+// the watch_test.go env-fallback pattern.
+func TestWatchAllowedHostsEnvFallback(t *testing.T) {
+	saved := upConsoleAllowedHost
+	t.Cleanup(func() { upConsoleAllowedHost = saved })
+	if watchCmd.Flags().Lookup("console-allowed-hosts") == nil {
+		t.Fatal("flag --console-allowed-hosts not registered on watchCmd")
+	}
+	cmd := &cobra.Command{}
+	cmd.Flags().StringSliceVar(&upConsoleAllowedHost, "console-allowed-hosts", nil, "")
+	t.Setenv("BINTRAIL_CONSOLE_ALLOWED_HOSTS", "console.internal,proxy.example")
+	upConsoleAllowedHost = nil
+	resolveUpConsoleEnv(cmd)
+	if len(upConsoleAllowedHost) != 2 || upConsoleAllowedHost[0] != "console.internal" || upConsoleAllowedHost[1] != "proxy.example" {
+		t.Errorf("allowed-hosts from env = %v, want [console.internal proxy.example]", upConsoleAllowedHost)
 	}
 }

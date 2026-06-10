@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/go-sql-driver/mysql"
@@ -121,6 +122,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if !cmd.Flags().Changed("tls-key") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_TLS_KEY"); v != "" {
 			conTLSKey = v
+		}
+	}
+	if !cmd.Flags().Changed("allowed-hosts") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_ALLOWED_HOSTS"); v != "" {
+			conAllowedHosts = strings.Split(v, ",")
 		}
 	}
 

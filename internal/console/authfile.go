@@ -100,6 +100,15 @@ func LoadAuthFile(path string) (*AuthFile, error) {
 	if a.Username == "" || a.PasswordBcrypt == "" {
 		return nil, fmt.Errorf("console auth file %s is missing username or password_bcrypt; re-create it with `bintrail-console user set-password`", path)
 	}
+	// Reject a structurally-broken hash at load time, so login, `user status`,
+	// and change-password all fail loud together. Without this a truncated /
+	// hand-edited password_bcrypt would parse here (non-empty), then silently
+	// fail every bcrypt compare (login looks like "wrong password" forever)
+	// while `user status` reports the file as healthy. bcrypt.Cost validates
+	// the hash structure; any cost is accepted (rehash-on-login upgrades it).
+	if _, err := bcrypt.Cost([]byte(a.PasswordBcrypt)); err != nil {
+		return nil, fmt.Errorf("console auth file %s has a malformed password hash (%v); re-create it with `bintrail-console user set-password`", path, err)
+	}
 	return &a, nil
 }
 
@@ -170,7 +179,7 @@ func SetAuthPassword(path, username, password string) error {
 	if err != nil {
 		// ErrPasswordTooLong is pre-empted by ValidateNewPassword; anything
 		// else here is an internal bcrypt failure.
-		return fmt.Errorf("hash console password: %w", err)
+		return fmt.Errorf("hash console password for %s: %w", path, err)
 	}
 	a.PasswordBcrypt = string(hash)
 	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
@@ -195,9 +204,12 @@ func verifyAndMaybeRehash(path string, a *AuthFile, username, password string) b
 // fsync → rename. File 0600, directory 0700 — it holds a credential hash
 // (same class as the server registry). Callers hold authFileMu.
 func saveAuthFile(path string, a *AuthFile) error {
+	// Every error wraps the resolved path: in a homeless container the default
+	// resolves to an unwritable relative ./.config/... and the path is the
+	// only clue (e.g. a full-disk write needs to say WHERE).
 	data, err := yaml.Marshal(a)
 	if err != nil {
-		return fmt.Errorf("marshal console auth file: %w", err)
+		return fmt.Errorf("marshal console auth file %s: %w", path, err)
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -210,18 +222,18 @@ func saveAuthFile(path string, a *AuthFile) error {
 	defer os.Remove(tmp.Name()) // no-op after a successful rename
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
-		return fmt.Errorf("chmod temp auth file: %w", err)
+		return fmt.Errorf("chmod temp auth file for %s: %w", path, err)
 	}
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		return fmt.Errorf("write console auth file: %w", err)
+		return fmt.Errorf("write console auth file %s: %w", path, err)
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return fmt.Errorf("sync console auth file: %w", err)
+		return fmt.Errorf("sync console auth file %s: %w", path, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp auth file: %w", err)
+		return fmt.Errorf("close temp auth file for %s: %w", path, err)
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return fmt.Errorf("replace console auth file %s: %w", path, err)
