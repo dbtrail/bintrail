@@ -18,10 +18,14 @@ import (
 	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
-// Result is one rotation cycle's outcome. deferred counts partitions
-// past retention that the opts.ProtectUnarchived guard refused to drop (always
-// 0 for the explicit rotate command). A named struct, not a positional tuple:
-// three same-typed ints invite silent misordering at call sites.
+// Result is one rotation cycle's outcome. Deferred counts partitions past
+// retention that this cycle did NOT drop to avoid data loss: the
+// ProtectUnarchived guard refusing an unarchived partition, OR (in the archive
+// path) an S3 upload that failed or is still pending. The built-in loop sums it
+// across targets to drive escalation. The explicit `rotate` command surfaces
+// only Dropped/Added, but can still produce Deferred>0 when its --archive-s3
+// uploads fail. A named struct, not a positional tuple: three same-typed ints
+// invite silent misordering at call sites.
 type Result struct {
 	Dropped, Added, Deferred int
 }
@@ -74,6 +78,15 @@ type Options struct {
 func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Result, error) {
 	retainDur := opts.RetainDur
 	start := time.Now()
+
+	// An S3 target without a local staging dir is a misconfiguration: archiving
+	// keys off ArchiveDir, so this would silently fall through to the no-archive
+	// bulk-drop branch and drop partitions that were never uploaded. Fail loud
+	// instead — the field invariant (ArchiveS3 requires ArchiveDir) is enforced
+	// here, not just documented on Options.
+	if opts.ArchiveS3 != "" && opts.ArchiveDir == "" {
+		return Result{}, fmt.Errorf("ArchiveS3 set without ArchiveDir: cannot upload to S3 without a local staging path")
+	}
 
 	// ── Load current partition list ─────────────────────────────────────────────
 	partitions, err := listPartitions(ctx, db, dbName)

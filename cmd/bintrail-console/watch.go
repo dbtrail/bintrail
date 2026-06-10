@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -674,13 +675,23 @@ func rotateTargets(bootDSN string, sup *monitorSupervisor, reg *console.Registry
 	for _, j := range sup.ActiveJobs() {
 		t := rotation.RotateTarget{DSN: j.IndexDSN}
 		if entry, ok := reg.Get(j.EntryID); ok && entry.ArchiveS3 != "" {
-			if id := resolveBintrailIDFunc(j.IndexDSN); id != "" {
+			id, err := resolveBintrailIDFunc(j.IndexDSN)
+			switch {
+			case err != nil:
+				// A real DB error reading stream_state must not masquerade as
+				// "identity not yet resolved": that would let a permanently
+				// stalled archive (bad perms, unreachable index) rotate drop-only
+				// forever with only a Debug line. Surface it at Warn so an
+				// operator can tell archiving stalled from archiving being off.
+				slog.Warn("archive-to-S3 configured but reading the source's bintrail_id failed; rotating drop-only this cycle",
+					"entry", j.EntryID, "error", err)
+			case id == "":
+				slog.Debug("archive-to-S3 configured but the source's bintrail_id is not yet resolved; rotating drop-only this cycle", "entry", j.EntryID)
+			default:
 				t.ArchiveS3 = entry.ArchiveS3
 				t.ArchiveDir = filepath.Join(stagingBase, j.EntryID)
 				t.BintrailID = id
 				t.ArchiveCompression = "zstd"
-			} else {
-				slog.Debug("archive-to-S3 configured but the source's bintrail_id is not yet resolved; rotating drop-only this cycle", "entry", j.EntryID)
 			}
 		}
 		targets = append(targets, t)
@@ -693,19 +704,25 @@ var resolveBintrailIDFunc = resolveBintrailID
 
 // resolveBintrailID reads a source's resolved server identity from its index
 // stream_state — the UUID archives are partitioned under (bintrail_id=<uuid>).
-// Returns "" when unreadable or not yet resolved (the stream sets it after its
-// first connect), in which case archiving for that source waits a cycle.
-func resolveBintrailID(indexDSN string) string {
+// Returns ("", nil) when the stream has not resolved its identity yet (no
+// stream_state row, or a NULL/empty bintrail_id) — archiving waits a cycle.
+// Returns ("", err) on a genuine failure (connect or query error) so the caller
+// can distinguish a transient/persistent fault from "not yet resolved" and log
+// it loudly rather than letting a stalled archive look like a normal wait.
+func resolveBintrailID(indexDSN string) (string, error) {
 	db, err := config.Connect(indexDSN)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("connect: %w", err)
 	}
 	defer db.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var id sql.NullString
 	if err := db.QueryRowContext(ctx, "SELECT bintrail_id FROM stream_state WHERE id = 1").Scan(&id); err != nil {
-		return ""
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil // no checkpoint row yet — identity not resolved, not a fault
+		}
+		return "", fmt.Errorf("read stream_state: %w", err)
 	}
-	return id.String
+	return id.String, nil
 }

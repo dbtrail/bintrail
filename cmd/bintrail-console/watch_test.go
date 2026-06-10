@@ -295,15 +295,18 @@ func TestRotateTargets(t *testing.T) {
 			arch.ID:      {indexDSN: "dsn-arch"},
 			plain.ID:     {indexDSN: "dsn-plain"},
 			pendingID.ID: {indexDSN: "dsn-pending"},
+			// A job whose registry entry was deleted between cycles (reg.Get
+			// returns !ok). It must still rotate — drop-only — never vanish.
+			"ghost": {indexDSN: "dsn-ghost"},
 		},
 	}
 
 	prev := resolveBintrailIDFunc
-	resolveBintrailIDFunc = func(dsn string) string {
+	resolveBintrailIDFunc = func(dsn string) (string, error) {
 		if dsn == "dsn-pending" {
-			return "" // identity not yet resolved → archive waits
+			return "", nil // identity not yet resolved → archive waits
 		}
-		return "uuid-" + dsn
+		return "uuid-" + dsn, nil
 	}
 	t.Cleanup(func() { resolveBintrailIDFunc = prev })
 
@@ -331,6 +334,11 @@ func TestRotateTargets(t *testing.T) {
 	}
 	if pend := byDSN["dsn-pending"]; pend.ArchiveS3 != "" {
 		t.Errorf("unresolved-bintrail_id source must rotate drop-only until resolved, got %+v", pend)
+	}
+	if ghost, ok := byDSN["dsn-ghost"]; !ok {
+		t.Error("a job whose registry entry was deleted must still produce a (drop-only) target, not vanish")
+	} else if ghost.ArchiveS3 != "" {
+		t.Errorf("deleted-entry job must rotate drop-only, got %+v", ghost)
 	}
 }
 

@@ -11,9 +11,9 @@ import (
 	"github.com/dbtrail/dbtrail/internal/streamrun"
 )
 
-// ─── built-in rotation DSN provider (#420) ───────────────────────────────────
+// ─── built-in rotation job provider (#420) ───────────────────────────────────
 
-func TestActiveIndexDSNs(t *testing.T) {
+func TestActiveJobs(t *testing.T) {
 	m := &monitorSupervisor{
 		jobs: map[string]*monitorJob{
 			"a": {indexDSN: "root@tcp(idx:3306)/bintrail_idx_a"},
@@ -21,16 +21,19 @@ func TestActiveIndexDSNs(t *testing.T) {
 			"c": {indexDSN: ""}, // never published a DSN — skipped
 		},
 	}
-	got := m.ActiveIndexDSNs()
+	got := m.ActiveJobs()
 	if len(got) != 2 {
-		t.Fatalf("ActiveIndexDSNs returned %d DSNs, want 2: %v", len(got), got)
+		t.Fatalf("ActiveJobs returned %d jobs, want 2: %v", len(got), got)
 	}
-	seen := map[string]bool{}
-	for _, dsn := range got {
-		seen[dsn] = true
+	seen := map[string]string{}
+	for _, j := range got {
+		seen[j.EntryID] = j.IndexDSN
 	}
-	if !seen["root@tcp(idx:3306)/bintrail_idx_a"] || !seen["root@tcp(idx:3306)/bintrail_idx_b"] {
-		t.Errorf("ActiveIndexDSNs missing expected DSNs: %v", got)
+	if seen["a"] != "root@tcp(idx:3306)/bintrail_idx_a" || seen["b"] != "root@tcp(idx:3306)/bintrail_idx_b" {
+		t.Errorf("ActiveJobs missing expected entry→DSN pairs: %v", got)
+	}
+	if _, ok := seen["c"]; ok {
+		t.Error("ActiveJobs must skip a job with an empty index DSN")
 	}
 }
 

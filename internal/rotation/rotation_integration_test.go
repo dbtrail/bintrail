@@ -4,6 +4,7 @@ package rotation
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -171,6 +172,13 @@ func TestPerformRotation_PendingS3BlocksDrop(t *testing.T) {
 	// Second partition should be dropped (S3 upload complete).
 	if res.Dropped != 1 {
 		t.Errorf("expected 1 partition dropped, got %d", res.Dropped)
+	}
+	// h1's still-pending upload must register as Deferred (the archive-branch
+	// pending-skip increment). Asserting only Dropped would let that count
+	// regress silently — a stalled archive would then read as a healthy cycle
+	// and the built-in loop's escalation streak would never fire.
+	if res.Deferred != 1 {
+		t.Errorf("expected 1 partition deferred (h1 pending S3 upload), got %d", res.Deferred)
 	}
 
 	// Verify partition h1 still exists.
@@ -565,5 +573,118 @@ func TestPerformRotation_S3UploadFailureDefers(t *testing.T) {
 	}
 	if !found {
 		t.Error("partition was dropped despite a failed S3 upload — data loss")
+	}
+}
+
+// TestPerformRotation_S3UploadSuccessPrunesAndDrops covers the success path that
+// no other test exercises: a confirmed S3 upload must stamp s3_uploaded_at, drop
+// the partition, and (with PruneLocalAfterUpload) remove the local staging copy.
+// A regression that stamped before the upload returned, or pruned the durable
+// copy on the wrong branch, would be data loss this test catches.
+func TestPerformRotation_S3UploadSuccessPrunesAndDrops(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
+
+	// Stub the uploader to succeed (no real S3); Perform then stamps
+	// s3_uploaded_at, drops the partition, and prunes the local staging copy.
+	prev := uploadFileFunc
+	uploadFileFunc = func(ctx context.Context, client *s3.Client, path, bucket, key string) error {
+		return nil
+	}
+	t.Cleanup(func() { uploadFileFunc = prev })
+
+	archiveDir := t.TempDir()
+	bintrailID := "test-uuid-upload-ok"
+	outPath, _ := HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur:             24 * time.Hour,
+		ArchiveDir:            archiveDir,
+		ArchiveS3:             "s3://fake-bucket/prefix/",
+		ArchiveS3Region:       "us-east-1",
+		BintrailID:            bintrailID,
+		ArchiveCompression:    "zstd",
+		Format:                "json",
+		NoReplace:             true,
+		PruneLocalAfterUpload: true,
+	})
+	if err != nil {
+		t.Fatalf("Perform: %v", err)
+	}
+	if res.Dropped != 1 {
+		t.Errorf("Dropped = %d, want 1 (a successfully uploaded partition is dropped)", res.Dropped)
+	}
+	if res.Deferred != 0 {
+		t.Errorf("Deferred = %d, want 0", res.Deferred)
+	}
+
+	// s3_uploaded_at must be stamped so a later drop-only cycle sees the S3 copy
+	// as durable (hasPendingS3Upload → false).
+	var uploadedAt sql.NullTime
+	if err := db.QueryRow(
+		`SELECT s3_uploaded_at FROM archive_state WHERE partition_name = ? AND bintrail_id = ?`,
+		indexer.PartitionName(h1), bintrailID,
+	).Scan(&uploadedAt); err != nil {
+		t.Fatalf("read s3_uploaded_at: %v", err)
+	}
+	if !uploadedAt.Valid {
+		t.Error("s3_uploaded_at must be set after a successful upload")
+	}
+
+	// PruneLocalAfterUpload removed the local staging Parquet (reads fall back to S3).
+	if _, err := os.Stat(outPath); !os.IsNotExist(err) {
+		t.Errorf("local archive %s must be pruned after a confirmed upload; stat err = %v", outPath, err)
+	}
+
+	// The partition itself is gone.
+	partitions, err := listPartitions(context.Background(), db, dbName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range partitions {
+		if p.Name == indexer.PartitionName(h1) {
+			t.Error("partition should have been dropped after a successful upload")
+		}
+	}
+}
+
+// TestPerformRotation_LocalOnlyArchiveNotPruned pins the inverse invariant: with
+// no ArchiveS3 the local Parquet IS the durable copy, so PruneLocalAfterUpload
+// must be a no-op even when set. Deleting it would be silent data loss.
+func TestPerformRotation_LocalOnlyArchiveNotPruned(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
+
+	archiveDir := t.TempDir()
+	bintrailID := "test-uuid-local-only"
+	outPath, _ := HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur:             24 * time.Hour,
+		ArchiveDir:            archiveDir, // local archive, no S3
+		BintrailID:            bintrailID,
+		ArchiveCompression:    "zstd",
+		Format:                "json",
+		NoReplace:             true,
+		PruneLocalAfterUpload: true, // must be ignored without ArchiveS3
+	})
+	if err != nil {
+		t.Fatalf("Perform: %v", err)
+	}
+	if res.Dropped != 1 {
+		t.Errorf("Dropped = %d, want 1", res.Dropped)
+	}
+	if _, err := os.Stat(outPath); err != nil {
+		t.Errorf("local-only archive %s must survive (it is the durable copy); stat err = %v", outPath, err)
 	}
 }
