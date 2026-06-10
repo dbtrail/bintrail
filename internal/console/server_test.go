@@ -96,6 +96,39 @@ func TestMuxServesAssets(t *testing.T) {
 	}
 }
 
+func TestMuxSPAFallback(t *testing.T) {
+	srv := newTestServer(t)
+	// pushState routes must reload/deep-link to the shell, not 404.
+	for _, p := range []string{"/overview", "/events", "/timetravel", "/recover", "/status", "/events?q=pk:1"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+p, nil)
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Errorf("%s code = %d, want 200", p, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "dbtrail console") {
+			t.Errorf("%s did not serve the index.html shell", p)
+		}
+	}
+	// Real assets still resolve as themselves, not as the shell.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8090/app.js", nil)
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 || strings.Contains(rec.Body.String(), "<!DOCTYPE html") {
+		t.Errorf("/app.js code = %d, shell = %v; want the JS file itself", rec.Code, strings.Contains(rec.Body.String(), "<!DOCTYPE html"))
+	}
+	// Missing files with an extension stay 404 — the fallback must not mask
+	// broken asset references by serving them HTML.
+	for _, p := range []string{"/favicon.ico", "/app.js.map", "/missing/deep.css"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+p, nil)
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != 404 {
+			t.Errorf("%s code = %d, want 404", p, rec.Code)
+		}
+	}
+}
+
 func TestMuxRejectsForeignHost(t *testing.T) {
 	srv := newTestServer(t)
 	rec := httptest.NewRecorder()
