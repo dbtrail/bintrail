@@ -23,9 +23,11 @@ var assetsFS embed.FS
 // The SPA routes with history.pushState ("/events", "/recover", …), so a
 // reload or deep link arrives here as a path that is not an embedded file.
 // Those get the index.html shell and the frontend router restores the view
-// (routeFromLocation in app.js). The fallback is limited to extensionless
-// paths: a missing real asset ("/favicon.ico", a stale "/app.js.map") must
-// stay a 404, not silently become HTML.
+// (routeFromLocation in app.js). The fallback is limited to paths whose last
+// segment has no extension: a missing real asset ("/favicon.ico", a stale
+// "/app.js.map") must stay a 404, not silently become HTML. Treating any
+// Stat error as "not a file" is safe only on embed.FS, which has no
+// ErrPermission/transient-IO class — revisit if sub ever comes from disk.
 func assetHandler() http.Handler {
 	sub, err := fs.Sub(assetsFS, "assets")
 	if err != nil {

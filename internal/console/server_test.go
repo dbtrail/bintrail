@@ -98,8 +98,9 @@ func TestMuxServesAssets(t *testing.T) {
 
 func TestMuxSPAFallback(t *testing.T) {
 	srv := newTestServer(t)
-	// pushState routes must reload/deep-link to the shell, not 404.
-	for _, p := range []string{"/overview", "/events", "/timetravel", "/recover", "/status", "/events?q=pk:1"} {
+	// pushState routes must reload/deep-link to the shell, not 404. The
+	// trailing-slash form rides on path.Clean — a URL shape users produce.
+	for _, p := range []string{"/overview", "/events", "/timetravel", "/recover", "/status", "/events/", "/events?q=pk:1"} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+p, nil)
 		srv.Handler().ServeHTTP(rec, req)
@@ -126,6 +127,17 @@ func TestMuxSPAFallback(t *testing.T) {
 		if rec.Code != 404 {
 			t.Errorf("%s code = %d, want 404", p, rec.Code)
 		}
+	}
+	// An unknown /api/* path must NEVER receive the shell: today the API
+	// lives on its own inner mux registered ahead of "/", but a refactor
+	// that flattens the muxes (or makes the fallback a NotFound handler)
+	// would turn every API 404 into 200 text/html and break API consumers.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "http://127.0.0.1:8090/api/nonexistent", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != 404 || strings.Contains(rec.Body.String(), "<!DOCTYPE html") {
+		t.Errorf("/api/nonexistent code = %d, shell = %v; want 404 without HTML", rec.Code, strings.Contains(rec.Body.String(), "<!DOCTYPE html"))
 	}
 }
 
