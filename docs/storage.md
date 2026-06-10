@@ -1,6 +1,6 @@
 # BYOS — Bring Your Own Storage
 
-In BYOS mode, bintrail splits every parsed binlog event into two streams so that row-level data never leaves the customer's infrastructure:
+In BYOS mode, dbtrail splits every parsed binlog event into two streams so that row-level data never leaves the customer's infrastructure:
 
 | Stream | Contains | Destination |
 |--------|----------|-------------|

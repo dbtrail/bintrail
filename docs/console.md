@@ -87,7 +87,7 @@ and searching events:
 ## Managing servers
 
 The header has a server switcher and a **Servers** button: add, edit, and
-remove named connections to bintrail index databases, and switch every view
+remove named connections to dbtrail index databases, and switch every view
 between them. The registry is a **local YAML file on the console host**
 (`~/.config/bintrail/console-servers.yaml` by default, override with
 `--servers-file` / `BINTRAIL_CONSOLE_SERVERS`) — adding a server registers a
@@ -114,7 +114,7 @@ How it behaves:
   appears and disappears as you switch.
 - **Test connection.** Each server (saved or being typed) has a write-free
   probe: ping, MySQL version, latency, whether the database looks like a
-  bintrail index, and whether its schema is current.
+  dbtrail index, and whether its schema is current.
 
 Security notes specific to the registry:
 

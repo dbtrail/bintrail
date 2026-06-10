@@ -1,4 +1,4 @@
-// bintrail console — vanilla-JS SPA over the read-only JSON API.
+// dbtrail console — vanilla-JS SPA over the read-only JSON API.
 //
 // No frameworks, no bundler, no third-party code (see assets/VENDOR.md). The
 // design system lives in style.css; this file renders the sidebar-shell UI into
@@ -641,12 +641,12 @@ function csvCell(v) {
   return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 function downloadEventsJSON(events) {
-  downloadBlob("bintrail-events.json", JSON.stringify(events || [], null, 2), "application/json");
+  downloadBlob("dbtrail-events.json", JSON.stringify(events || [], null, 2), "application/json");
 }
 function downloadEventsCSV(events) {
   const lines = [EVENT_CSV_COLUMNS.join(",")];
   (events || []).forEach((ev) => lines.push(EVENT_CSV_COLUMNS.map((c) => csvCell(ev[c])).join(",")));
-  downloadBlob("bintrail-events.csv", lines.join("\r\n"), "text/csv");
+  downloadBlob("dbtrail-events.csv", lines.join("\r\n"), "text/csv");
 }
 
 // ── Recover ────────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
-# Bintrail Streaming 101
+# dbtrail Streaming 101
 
-A step-by-step guide to set up bintrail with replication streaming, S3 archiving, Parquet querying, and the MCP client. This is the happy path — every command is shown in order with expected output.
+A step-by-step guide to set up dbtrail with replication streaming, S3 archiving, Parquet querying, and the MCP client. This is the happy path — every command is shown in order with expected output.
 
 **What you'll end up with:**
 
@@ -78,7 +78,7 @@ This creates the index database and all required tables. The `--partitions 48` f
 
 ## Step 2: Set up AWS access for S3
 
-Bintrail uses the standard AWS SDK credential chain. You need an IAM user (or role) with permissions to create and write to an S3 bucket.
+dbtrail uses the standard AWS SDK credential chain. You need an IAM user (or role) with permissions to create and write to an S3 bucket.
 
 ### 2a. Create an IAM policy
 
@@ -177,7 +177,7 @@ bintrail init \
 
 ## Step 4: Install mydumper via Docker
 
-Mydumper creates logical dumps of MySQL databases. Bintrail uses its output to generate Parquet baseline snapshots.
+Mydumper creates logical dumps of MySQL databases. dbtrail uses its output to generate Parquet baseline snapshots.
 
 Pull the mydumper Docker image:
 
@@ -191,7 +191,7 @@ Verify it works:
 docker run --rm mydumper/mydumper:latest mydumper --version
 ```
 
-To use mydumper through bintrail's `dump` command, create a wrapper script that Docker runs transparently:
+To use mydumper through dbtrail's `dump` command, create a wrapper script that Docker runs transparently:
 
 ```bash
 cat > /usr/local/bin/mydumper << 'SCRIPT'
@@ -238,7 +238,7 @@ This creates a Parquet baseline of all your table data — a point-in-time refer
 
 ### 6a. Dump the source database with mydumper
 
-Using bintrail's `dump` command (requires the mydumper wrapper from step 4):
+Using dbtrail's `dump` command (requires the mydumper wrapper from step 4):
 
 ```bash
 bintrail dump \
@@ -627,7 +627,7 @@ The MCP server lets Claude Code or Claude Desktop query your binlog index conver
 
 ### Option A: Claude Code (same machine — automatic)
 
-If you're using Claude Code in the bintrail project directory, the `.mcp.json` file registers the MCP server automatically.
+If you're using Claude Code in the dbtrail project directory, the `.mcp.json` file registers the MCP server automatically.
 
 1. Edit `.mcp.json` in the project root to set your DSN:
 
@@ -657,7 +657,7 @@ If you're using Claude Code in the bintrail project directory, the `.mcp.json` f
 
 ### Option B: Claude Code (any directory — pre-built binary)
 
-If you want to use the MCP tools from any directory (not just the bintrail project), register the server globally:
+If you want to use the MCP tools from any directory (not just the dbtrail project), register the server globally:
 
 ```bash
 # Build the binary
@@ -684,7 +684,7 @@ Keep it running with systemd, launchd, or tmux.
 
 **On the machine where Claude Desktop runs:**
 
-1. Copy the proxy script from the bintrail repo (no dependencies — pure Python stdlib):
+1. Copy the proxy script from the dbtrail repo (no dependencies — pure Python stdlib):
 
    ```bash
    scp user@bintrail-host:~/bintrail/cmd/bintrail-mcp/proxy.py ~/proxy.py

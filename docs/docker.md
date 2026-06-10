@@ -1,6 +1,6 @@
 # Docker Deployment
 
-Bintrail ships a multi-stage Dockerfile that produces a minimal image containing both `bintrail` and `bintrail-mcp` binaries.
+dbtrail ships a multi-stage Dockerfile that produces a minimal image containing both `bintrail` and `bintrail-mcp` binaries.
 
 ## Building the image
 
@@ -58,7 +58,7 @@ cosign verify ghcr.io/dbtrail/bintrail:latest \
 An SBOM is attached to each release archive on the GitHub Releases page.
 
 > **Just evaluating?** `ghcr.io/dbtrail/bintrail-demo` is a zero-setup,
-> single-container demo (MySQL + bintrail + ProxySQL + traffic generator,
+> single-container demo (MySQL + dbtrail + ProxySQL + traffic generator,
 > evaluation-only) — see [demo.md](demo.md). It is a separate GHCR
 > package and needs the same one-time public-visibility flip described below.
 
@@ -170,7 +170,7 @@ Notes:
 The bundled index is **MySQL 8.4 LTS**, pinned to an exact minor tag. The
 container holds the binary; the data lives in a separate `bintrail-index-data`
 volume — bumping a minor version is "swap the container, keep the volume"
-(the PMM pattern). bintrail **ships** this MySQL but does not **operate** it:
+(the PMM pattern). dbtrail **ships** this MySQL but does not **operate** it:
 disk, backups, and upgrades are yours (for a managed, operated index, that is
 what [dbtrail](https://dbtrail.com) is). Support boundary: [SUPPORT.md](../SUPPORT.md).
 
@@ -178,7 +178,7 @@ what [dbtrail](https://dbtrail.com) is). Support boundary: [SUPPORT.md](../SUPPO
 one-shot `index-init` service generates a random password into the
 `bintrail-index-secret` volume (or takes one from `INDEX_MYSQL_ROOT_PASSWORD`
 in `.env` if you set it *before* the first boot). Both the index MySQL and
-bintrail read it from there. The password is baked into the datadir at init,
+dbtrail read it from there. The password is baked into the datadir at init,
 so `bintrail-index-data` and `bintrail-index-secret` are a pair: back them up
 together, and changing the password later means resetting both volumes.
 
@@ -192,7 +192,7 @@ reset out of sync with `bintrail-index-data` — reset both together.
 **Upgrading from a pre-8.4 bundled index** — the old eval index used a
 `mysql:8.0` container on the `index-mysql-data` volume. The new compose uses a
 **new** `bintrail-index-data` volume on 8.4 and leaves the old one untouched,
-so by default bintrail simply re-indexes into the fresh 8.4 volume from the
+so by default dbtrail simply re-indexes into the fresh 8.4 volume from the
 source's binlogs (the bundled index was always "volume loss = re-index").
 
 > ⚠️ **The 8.4 datadir is non-downgradable.** A MySQL 8.4 server started on an
@@ -220,7 +220,7 @@ To run your own index instead of the bundled 8.4, set `INDEX_DSN` in `.env` to a
 remove the bundled index from the compose file: delete the `index-init` and
 `index-mysql` services, the `bintrail-index-data` / `bintrail-index-secret`
 volumes, the `bintrail-index-secret` mount and the `depends_on: index-mysql`
-on the `bintrail` service. Bintrail installs only its schema on your server;
+on the `bintrail` service. dbtrail installs only its schema on your server;
 its sizing, backups, and upgrades are yours — see
 [Capacity Planning](./capacity.md), [deployment.md](./deployment.md), and
 [SUPPORT.md](../SUPPORT.md). (The BYO contract floor stays MySQL **8.0+** —
@@ -256,7 +256,7 @@ registry. Build it from source with
 
 ### Why not Alpine?
 
-Bintrail depends on DuckDB (`duckdb-go`) for querying Parquet archives. DuckDB's Go bindings include pre-compiled C libraries linked against glibc. Alpine uses musl libc, which is binary-incompatible and would cause runtime failures.
+dbtrail depends on DuckDB (`duckdb-go`) for querying Parquet archives. DuckDB's Go bindings include pre-compiled C libraries linked against glibc. Alpine uses musl libc, which is binary-incompatible and would cause runtime failures.
 
 ## Full demo
 

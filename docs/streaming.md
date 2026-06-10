@@ -16,7 +16,7 @@ The solution is to connect to MySQL as if you were a replica. MySQL's replicatio
 
 When MySQL runs as primary in a replication setup, replicas connect using the `COM_BINLOG_DUMP` command and receive an event stream. The primary sends every event as it commits: `GTIDEvent`, `QueryEvent`, `RowsEvent`, `RotateEvent`, etc.
 
-Bintrail impersonates a replica by:
+dbtrail impersonates a replica by:
 
 1. Presenting a server ID (set via `--server-id`) that doesn't conflict with any real server.
 2. Telling MySQL where to start (a binlog file+position, or a GTID set).
@@ -184,19 +184,19 @@ bintrail stream \
 
 ## Binlog Gap Detection
 
-When a stream is restarted after downtime, MySQL may have continued generating binlog events that bintrail did not capture. On every restart from a saved checkpoint, bintrail automatically detects whether a gap exists and handles it:
+When a stream is restarted after downtime, MySQL may have continued generating binlog events that dbtrail did not capture. On every restart from a saved checkpoint, dbtrail automatically detects whether a gap exists and handles it:
 
 ### How it works
 
 **Position mode** (`--start-file`/`--start-pos`):
 1. Queries `SHOW BINARY LOGS` on the source MySQL.
-2. If the checkpoint file still exists in the list, the gap is **fillable** — bintrail resumes from the checkpoint and replays all missed events before switching to live tailing.
-3. If the checkpoint file has been purged, the gap is **unfillable** — bintrail logs a warning and auto-advances to the earliest available binlog file.
+2. If the checkpoint file still exists in the list, the gap is **fillable** — dbtrail resumes from the checkpoint and replays all missed events before switching to live tailing.
+3. If the checkpoint file has been purged, the gap is **unfillable** — dbtrail logs a warning and auto-advances to the earliest available binlog file.
 
 **GTID mode** (`--start-gtid`):
 1. Queries `@@gtid_purged` and `@@gtid_executed` from the source MySQL.
 2. If the checkpoint GTID set does not intersect with the purged set, the gap is **fillable** — MySQL still has all required binlog events.
-3. If the checkpoint includes purged GTIDs, the gap is **unfillable** — bintrail logs a warning and advances past the purged GTID set.
+3. If the checkpoint includes purged GTIDs, the gap is **unfillable** — dbtrail logs a warning and advances past the purged GTID set.
 
 ### What happens during an unfillable gap
 
@@ -212,7 +212,7 @@ When binlogs have been purged and the gap cannot be filled:
 
 ### The `--no-gap-fill` flag
 
-By default, bintrail auto-advances past unfillable gaps. If you want the stream to **refuse to start** when a gap is detected (so you can investigate and decide how to proceed), use:
+By default, dbtrail auto-advances past unfillable gaps. If you want the stream to **refuse to start** when a gap is detected (so you can investigate and decide how to proceed), use:
 
 ```sh
 bintrail stream --no-gap-fill --index-dsn "..." --source-dsn "..." --server-id 99999
@@ -245,7 +245,7 @@ Reducing binlog retention is also a valid mitigation, but loses the ability to f
 ERROR 1290 (HY000): The MySQL server is running with the --read-only option so it cannot execute this statement
 ```
 
-Always point `--source-dsn` at the **primary** RDS instance, not a read-replica. If your application reads through a read-replica to spare the primary, bintrail still needs to stream from the primary — the binlog activity it adds is comparable to a single managed read-replica connection.
+Always point `--source-dsn` at the **primary** RDS instance, not a read-replica. If your application reads through a read-replica to spare the primary, dbtrail still needs to stream from the primary — the binlog activity it adds is comparable to a single managed read-replica connection.
 
 ### RDS: backup retention enables binlog
 
@@ -264,7 +264,7 @@ aws rds modify-db-instance \
   --apply-immediately
 ```
 
-The modification reaches the instance in ~2 minutes. After that, `SELECT @@log_bin` reports `1` but `SHOW BINARY LOGS` may still return an empty set until RDS completes its first automated snapshot (another ~30s–1min). Wait for `SHOW BINARY LOGS` to return at least one row before launching `bintrail stream` — until then auto-discovery returns no row and the streamer exits with `auto-discover binlog position: ...`. Set `binlog retention hours` (see below) so RDS keeps binlogs long enough for bintrail to index them before purge:
+The modification reaches the instance in ~2 minutes. After that, `SELECT @@log_bin` reports `1` but `SHOW BINARY LOGS` may still return an empty set until RDS completes its first automated snapshot (another ~30s–1min). Wait for `SHOW BINARY LOGS` to return at least one row before launching `bintrail stream` — until then auto-discovery returns no row and the streamer exits with `auto-discover binlog position: ...`. Set `binlog retention hours` (see below) so RDS keeps binlogs long enough for dbtrail to index them before purge:
 
 ```sql
 CALL mysql.rds_set_configuration('binlog retention hours', 48);
@@ -272,7 +272,7 @@ CALL mysql.rds_set_configuration('binlog retention hours', 48);
 
 ### Binlog retention requirement
 
-**Important:** Configure your MySQL server's binlog retention to be **at least 2 days**. This gives bintrail enough time to fill gaps after planned maintenance, restarts, or brief outages. With very short retention (seconds or minutes), binlogs may be purged before bintrail has a chance to replay them, resulting in permanent data loss.
+**Important:** Configure your MySQL server's binlog retention to be **at least 2 days**. This gives dbtrail enough time to fill gaps after planned maintenance, restarts, or brief outages. With very short retention (seconds or minutes), binlogs may be purged before dbtrail has a chance to replay them, resulting in permanent data loss.
 
 For MySQL 8.0+:
 ```sql
@@ -291,7 +291,7 @@ For managed MySQL services (RDS, Aurora, Cloud SQL), check your provider's docum
 CALL mysql.rds_set_configuration('binlog retention hours', 48);
 ```
 
-RDS caps `binlog retention hours` at **720 (30 days)**. Values above the ceiling are rejected with `ERROR 1644 (45000)`. Longer historical reach is the bintrail index's job (and `bintrail baseline` for replay anchors before the index window) — not RDS's binlog buffer.
+RDS caps `binlog retention hours` at **720 (30 days)**. Values above the ceiling are rejected with `ERROR 1644 (45000)`. Longer historical reach is the dbtrail index's job (and `bintrail baseline` for replay anchors before the index window) — not RDS's binlog buffer.
 
 ---
 

@@ -91,8 +91,8 @@ func TestMuxServesAssets(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("/ code = %d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "bintrail console") {
-		t.Error("index.html (with 'bintrail console') was not served at /")
+	if !strings.Contains(rec.Body.String(), "dbtrail console") {
+		t.Error("index.html (with 'dbtrail console') was not served at /")
 	}
 }
 

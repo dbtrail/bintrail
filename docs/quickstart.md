@@ -1,6 +1,6 @@
-# Bintrail Quickstart
+# dbtrail Quickstart
 
-Bintrail records every INSERT, UPDATE, and DELETE from MySQL into a searchable index. When something goes wrong, you can find exactly what changed and generate SQL to undo it.
+dbtrail records every INSERT, UPDATE, and DELETE from MySQL into a searchable index. When something goes wrong, you can find exactly what changed and generate SQL to undo it.
 
 This guide walks through the complete lifecycle from zero to recovery in about 10 minutes.
 
@@ -42,13 +42,13 @@ Tables created: binlog_events, schema_snapshots, index_state
 Partitions created: 48 hourly partitions + p_future catch-all
 ```
 
-This creates the `binlog_index` database (if it doesn't exist) and all the tables bintrail needs. **Run once.**
+This creates the `binlog_index` database (if it doesn't exist) and all the tables dbtrail needs. **Run once.**
 
 ---
 
 ## Step 2 — Capture your schema
 
-Bintrail needs to know your table structure (column names, primary keys) to build useful output.
+dbtrail needs to know your table structure (column names, primary keys) to build useful output.
 
 ```sh
 bintrail snapshot \
@@ -62,7 +62,7 @@ Snapshotting schemas: mydb, information_schema, ...
 Snapshot complete: 42 tables captured (snapshot_id=1)
 ```
 
-Re-run this any time you `ALTER TABLE` on the source. The old snapshot is kept — bintrail uses the most recent one.
+Re-run this any time you `ALTER TABLE` on the source. The old snapshot is kept — dbtrail uses the most recent one.
 
 ---
 

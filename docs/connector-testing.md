@@ -1,6 +1,6 @@
 # Claude Connector — Integration Testing & Hardening Checklist
 
-This is a step-by-step guide for manually testing the Bintrail Claude Connector before GA. Follow each section in order. Every step has exact commands or click paths — no assumed knowledge.
+This is a step-by-step guide for manually testing the dbtrail Claude Connector before GA. Follow each section in order. Every step has exact commands or click paths — no assumed knowledge.
 
 ---
 
@@ -29,7 +29,7 @@ Before you start, you need:
 5. In the URL field, enter: `https://mcp.dbtrail.com/mcp`
 6. Click **Add** (or **Save**)
 
-**What should happen:** Claude discovers the OAuth endpoints automatically (via `/.well-known/oauth-authorization-server`), opens a browser tab to the Bintrail authorization page.
+**What should happen:** Claude discovers the OAuth endpoints automatically (via `/.well-known/oauth-authorization-server`), opens a browser tab to the dbtrail authorization page.
 
 **If it fails:**
 - Check that `https://mcp.dbtrail.com/.well-known/oauth-authorization-server` returns JSON in your browser
@@ -37,7 +37,7 @@ Before you start, you need:
 
 ### 1.2 Complete the OAuth Flow
 
-1. On the Bintrail authorization page, enter your **tenant ID** (e.g. `tenant-a`)
+1. On the dbtrail authorization page, enter your **tenant ID** (e.g. `tenant-a`)
 2. Click **Authorize**
 
 **What should happen:** The page redirects back to Claude. The connector shows as "Connected" in Settings.
@@ -159,7 +159,7 @@ This verifies that tenant A cannot see tenant B's data.
 Connectors added on claude.ai should sync to mobile automatically.
 
 1. Open the Claude app on your phone
-2. Go to **Settings** → check that the Bintrail connector appears
+2. Go to **Settings** → check that the dbtrail connector appears
 
 **If it doesn't appear:**
 - Force-close and reopen the app

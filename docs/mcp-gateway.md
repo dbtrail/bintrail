@@ -1,6 +1,6 @@
-# MCP Gateway — Connect Claude to Bintrail
+# MCP Gateway — Connect Claude to dbtrail
 
-The MCP Gateway lets you connect Claude (the AI) directly to your bintrail index. After a one-time setup, you can ask Claude questions like:
+The MCP Gateway lets you connect Claude (the AI) directly to your dbtrail index. After a one-time setup, you can ask Claude questions like:
 
 > "What got deleted from the orders table in the last hour?"
 
@@ -670,7 +670,7 @@ If all four work, you're good.
 
 ---
 
-## Adding Bintrail to Claude
+## Adding dbtrail to Claude
 
 This is the easy part. Once the gateway is running:
 

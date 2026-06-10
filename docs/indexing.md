@@ -1,6 +1,6 @@
 # How Indexing Works
 
-This page explains what happens when you run `bintrail index`. It covers the problem bintrail solves, how it reads and understands binlog data, and how the concurrent parser/indexer pipeline avoids buffering entire files in memory.
+This page explains what happens when you run `bintrail index`. It covers the problem dbtrail solves, how it reads and understands binlog data, and how the concurrent parser/indexer pipeline avoids buffering entire files in memory.
 
 ---
 
@@ -8,13 +8,13 @@ This page explains what happens when you run `bintrail index`. It covers the pro
 
 MySQL binary logs record every INSERT, UPDATE, and DELETE as binary events in a sequential file. They are not queryable. You can't say "show me all changes to the `orders` table in the last hour" — you have to replay the entire file from the beginning, decode each event, and filter manually. And once a binlog file is purged (MySQL rotates them), that history is gone.
 
-Bintrail solves this by reading binlog files once and writing every row event into a queryable MySQL table with full before and after images, where it lives until you explicitly rotate it out.
+dbtrail solves this by reading binlog files once and writing every row event into a queryable MySQL table with full before and after images, where it lives until you explicitly rotate it out.
 
 ---
 
 ## Step 1: Schema Snapshot and the Resolver
 
-Before parsing a single binlog event, bintrail needs to know what the table columns are called.
+Before parsing a single binlog event, dbtrail needs to know what the table columns are called.
 
 Here's the problem: MySQL's ROW format binary log records rows as positional arrays — `[1, "Alice", 42]` — with no column names attached. The column names live in `information_schema.COLUMNS` on the source server, not in the binlog.
 
@@ -41,7 +41,7 @@ The Resolver lives in memory for the duration of the index run — one lookup pe
 
 ### Foreign Key Constraints
 
-In the same snapshot transaction, bintrail also captures foreign key relationships into the `fk_constraints` table. It queries `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` joined with `REFERENTIAL_CONSTRAINTS` on the source server and stores one row per FK column mapping:
+In the same snapshot transaction, dbtrail also captures foreign key relationships into the `fk_constraints` table. It queries `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` joined with `REFERENTIAL_CONSTRAINTS` on the source server and stores one row per FK column mapping:
 
 | Column | Description |
 |--------|-------------|
@@ -57,7 +57,7 @@ In the same snapshot transaction, bintrail also captures foreign key relationshi
 
 Composite foreign keys produce multiple rows with increasing `ordinal_position`. Tables with no foreign keys simply contribute zero rows — this is not an error.
 
-**No additional MySQL grants are required.** The same privileges that allow bintrail to read `INFORMATION_SCHEMA.COLUMNS` (which is required for column metadata) also grant visibility into `KEY_COLUMN_USAGE` and `REFERENTIAL_CONSTRAINTS`. MySQL's metadata visibility is row-level, not table-level — if you can see a table's columns, you can see its FK constraints.
+**No additional MySQL grants are required.** The same privileges that allow dbtrail to read `INFORMATION_SCHEMA.COLUMNS` (which is required for column metadata) also grant visibility into `KEY_COLUMN_USAGE` and `REFERENTIAL_CONSTRAINTS`. MySQL's metadata visibility is row-level, not table-level — if you can see a table's columns, you can see its FK constraints.
 
 The snapshot output includes the FK count:
 
@@ -140,7 +140,7 @@ for k, v := range row {
 
 ## Step 4: Concurrent Architecture
 
-The most important design decision in the indexer is that the parser and indexer run concurrently. Without this, bintrail would have to parse the entire file into memory before writing anything, which would be a problem for large binlog files.
+The most important design decision in the indexer is that the parser and indexer run concurrently. Without this, dbtrail would have to parse the entire file into memory before writing anything, which would be a problem for large binlog files.
 
 ```
 ParseFile goroutine ──► events chan (buffered 1000) ──► idx.Run (main goroutine)

@@ -30,7 +30,7 @@ MySQL 8.0 rejects `UNIX_TIMESTAMP()` in partition expressions when `time_zone=SY
 Error 1486: Constant, random or timezone-dependent expressions in (sub)partitioning function are not allowed
 ```
 
-`TO_SECONDS()` is timezone-independent — it returns the number of seconds since year 0, which is a pure calendar computation with no timezone involvement. This is why every partition boundary in bintrail is expressed as a `TO_SECONDS` value.
+`TO_SECONDS()` is timezone-independent — it returns the number of seconds since year 0, which is a pure calendar computation with no timezone involvement. This is why every partition boundary in dbtrail is expressed as a `TO_SECONDS` value.
 
 The DDL looks like:
 
@@ -131,7 +131,7 @@ These two functions round-trip correctly: `indexer.PartitionName(indexer.Partiti
 
 ## Archiving Partitions to Parquet
 
-Before dropping old partitions, bintrail can serialize each partition's events to a Parquet file. This gives you a long-term queryable record outside the index database — without requiring the original binlog files.
+Before dropping old partitions, dbtrail can serialize each partition's events to a Parquet file. This gives you a long-term queryable record outside the index database — without requiring the original binlog files.
 
 ### Archiving to a local directory
 
@@ -221,7 +221,7 @@ s3://my-bintrail-archives/events/
 
 The `bintrail_id` partition key is the stable UUID of the bintrail server instance that indexed the data (see [Server Identity](server-identity.md)). Multiple bintrail instances indexing different MySQL sources can share the same S3 prefix without collision.
 
-**AWS credentials**: bintrail uses the standard credential chain — environment variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, or EC2/ECS instance metadata. `--archive-s3-region` is optional if `AWS_REGION` is already set.
+**AWS credentials**: dbtrail uses the standard credential chain — environment variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, or EC2/ECS instance metadata. `--archive-s3-region` is optional if `AWS_REGION` is already set.
 
 ### Querying archived events
 

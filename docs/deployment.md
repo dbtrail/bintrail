@@ -1,6 +1,6 @@
-# Bintrail Production Deployment Guide
+# dbtrail Production Deployment Guide
 
-This guide covers everything needed to run bintrail in production: infrastructure sizing, network topology, deployment options, observability, and operational procedures.
+This guide covers everything needed to run dbtrail in production: infrastructure sizing, network topology, deployment options, observability, and operational procedures.
 
 ## 1. Architecture Overview
 
@@ -107,8 +107,8 @@ See `docs/storage.md` for details on the buffer, query priority, and configurati
 ### Version and configuration
 
 - MySQL 8.0 or later
-- `binlog_format = ROW` (required — bintrail refuses to index non-ROW binlogs)
-- `binlog_row_image = FULL` (required — bintrail validates this on startup)
+- `binlog_format = ROW` (required — dbtrail refuses to index non-ROW binlogs)
+- `binlog_row_image = FULL` (required — dbtrail validates this on startup)
 - GTID mode strongly recommended for reliable resume after restarts:
   ```
   gtid_mode = ON
@@ -145,7 +145,7 @@ MySQL 8.0 or later. The `binlog_events` table uses `RANGE (TO_SECONDS(...))` par
 
 Run the index database on a separate MySQL instance from the source. This provides:
 - **Failure isolation**: index failures don't affect the source
-- **Write amplification**: bintrail generates significant write traffic — separate I/O from application queries
+- **Write amplification**: dbtrail generates significant write traffic — separate I/O from application queries
 - **Security**: index credentials don't grant access to application data
 
 ### Sizing
@@ -168,7 +168,7 @@ innodb_log_file_size = 1G
 innodb_flush_method = O_DIRECT
 ```
 
-`innodb_flush_log_at_trx_commit = 2` trades a tiny recovery window (up to 1s of events) for significantly better write throughput. Since bintrail can replay from the binlog position in `stream_state`, this tradeoff is acceptable.
+`innodb_flush_log_at_trx_commit = 2` trades a tiny recovery window (up to 1s of events) for significantly better write throughput. Since dbtrail can replay from the binlog position in `stream_state`, this tradeoff is acceptable.
 
 ## 4. Network Topology
 
@@ -202,7 +202,7 @@ TCP 9090 → Prometheus host
 TCP 3306 → index MySQL host
 ```
 
-The bintrail metrics port (9090) does not need to be exposed to the public internet.
+The dbtrail metrics port (9090) does not need to be exposed to the public internet.
 
 ## 5. Deployment Options
 
@@ -261,7 +261,7 @@ journalctl -u bintrail-stream -f
 The demo `compose.yml` is a working example. For production, adjust:
 - Use Docker secrets or environment files instead of inline credentials
 - Pin image versions (`FROM golang:1.25.7-alpine` in your Dockerfile)
-- Mount a named volume for any persistent state (the index MySQL is the real persistent state — bintrail itself is stateless)
+- Mount a named volume for any persistent state (the index MySQL is the real persistent state — dbtrail itself is stateless)
 - Set resource limits (`mem_limit`, `cpus`) on the bintrail container
 
 ```yaml
@@ -528,7 +528,7 @@ When you run `ALTER TABLE` on the source:
    ```
 3. No stream restart is needed. The new snapshot is used for all subsequent queries and recovery.
 
-> **Note:** Bintrail logs a `column count mismatch` warning for events on a changed table until the snapshot is updated. Those events are skipped — they are not indexed. Take the snapshot promptly after DDL changes.
+> **Note:** dbtrail logs a `column count mismatch` warning for events on a changed table until the snapshot is updated. Those events are skipped — they are not indexed. Take the snapshot promptly after DDL changes.
 
 ## 11. Backup and Recovery
 
@@ -612,7 +612,7 @@ bintrail rotate --index-dsn "$INDEX_DSN" --retain 7d
 
 ### Stream process crash recovery
 
-With systemd `Restart=always`, the process restarts automatically. Bintrail resumes from the GTID in `stream_state`. Check:
+With systemd `Restart=always`, the process restarts automatically. dbtrail resumes from the GTID in `stream_state`. Check:
 
 ```bash
 journalctl -u bintrail-stream --since "5 minutes ago"

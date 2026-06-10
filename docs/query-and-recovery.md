@@ -231,7 +231,7 @@ The `recover` command also supports archive auto-discovery and the `--no-archive
 
 ### The Concept
 
-Recovery works because bintrail stores **full before and after images** for every row event. To undo an operation, you simply reverse it:
+Recovery works because dbtrail stores **full before and after images** for every row event. To undo an operation, you simply reverse it:
 
 | Original operation | Reversal |
 |--------------------|----------|
@@ -343,7 +343,7 @@ Key properties:
 - Wrapped in `BEGIN` / `COMMIT` — all changes apply atomically or not at all.
 - Comments before each statement showing the original event ID, type, table, PK, timestamp, and GTID.
 - Generation errors emit a `-- ERROR ...` comment rather than halting — the script remains runnable (the transaction will roll back on the first error anyway).
-- **Never auto-executed**: bintrail only generates the file. Applying it is always a manual step.
+- **Never auto-executed**: dbtrail only generates the file. Applying it is always a manual step.
 
 ---
 

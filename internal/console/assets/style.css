@@ -152,6 +152,7 @@ button { font-family: inherit; }
 [data-accent="warm"] .brand-mark {
   background: linear-gradient(150deg, var(--accent-a) 0%, var(--accent-b) 130%);
 }
+.brand-mark img { width: 30px; height: 30px; border-radius: 8px; display: block; }
 .brand-name {
   font-family: var(--f-display);
   font-weight: 700;

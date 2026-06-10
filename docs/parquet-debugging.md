@@ -173,7 +173,7 @@ DuckDB pushes certain filters into the Parquet reader so it can skip entire row 
 
 | Filter | Pushdown? | Notes |
 |--------|-----------|-------|
-| `event_timestamp >= ?` / `<= ?` | Yes | Effective when data is sorted by timestamp (bintrail writes in timestamp order) |
+| `event_timestamp >= ?` / `<= ?` | Yes | Effective when data is sorted by timestamp (dbtrail writes in timestamp order) |
 | `schema_name = ?` | Yes | Pushed as a predicate on the string column |
 | `table_name = ?` | Yes | Same as above |
 | `pk_values = ?` | Partial | Pushed down, but row groups contain many distinct PKs so few groups are skipped |
@@ -187,7 +187,7 @@ To see whether pushdown is happening, check the `EXPLAIN ANALYZE` output for `PA
 
 1. **Add time range filters**: Always include `event_timestamp` (or Hive partition key) bounds. Without them, DuckDB reads every Parquet file.
 
-2. **Check row group size**: Archives written with very small row groups (< 10,000 rows) produce excessive per-group overhead. The default `--row-group-size` in bintrail is large enough to avoid this. Check with `parquet_metadata()`.
+2. **Check row group size**: Archives written with very small row groups (< 10,000 rows) produce excessive per-group overhead. The default `--row-group-size` in dbtrail is large enough to avoid this. Check with `parquet_metadata()`.
 
 3. **Reduce file count**: Scanning thousands of small files is slower than fewer large ones. If you have many hourly partitions archived, consider the Hive partition filters (`event_date`, `event_hour`) to narrow the scan.
 
@@ -276,7 +276,7 @@ The subsections below catalogue the common failure modes and how to diagnose eac
 Warning: archive query failed for s3://.../bintrail_id=<uuid>: Binder Error: Referenced column "connection_id" not found in FROM clause
 ```
 
-**Cause**: archive Parquet files written by `bintrail` versions before v0.4.4 lack the `connection_id` column, which was added in v0.4.4 when the indexer started recording `pseudo_thread_id` from `QueryEvent.SlaveProxyID`. v0.4.8 fixed the per-file query to probe the Parquet schema and substitute `NULL::INT32 AS connection_id` when the column is absent, but old Parquet files written by even older bintrail versions might still trigger this on environments that haven't upgraded.
+**Cause**: archive Parquet files written by `bintrail` versions before v0.4.4 lack the `connection_id` column, which was added in v0.4.4 when the indexer started recording `pseudo_thread_id` from `QueryEvent.SlaveProxyID`. v0.4.8 fixed the per-file query to probe the Parquet schema and substitute `NULL::INT32 AS connection_id` when the column is absent, but old Parquet files written by even older dbtrail versions might still trigger this on environments that haven't upgraded.
 
 **Diagnose**:
 
@@ -285,7 +285,7 @@ Warning: archive query failed for s3://.../bintrail_id=<uuid>: Binder Error: Ref
 SELECT * FROM parquet_schema('s3://my-bucket/events/bintrail_id=<uuid>/event_date=2026-01-15/event_hour=14/events.parquet');
 ```
 
-If `connection_id` is missing, the file was written by a pre-v0.4.4 indexer. Either re-archive from the live index with a current bintrail version, or accept that the column will be NULL for those events in merged results (which is what current bintrail already does).
+If `connection_id` is missing, the file was written by a pre-v0.4.4 indexer. Either re-archive from the live index with a current dbtrail version, or accept that the column will be NULL for those events in merged results (which is what current dbtrail already does).
 
 ### S3 AccessDenied / credential errors
 
@@ -293,7 +293,7 @@ If `connection_id` is missing, the file was written by a pre-v0.4.4 indexer. Eit
 Warning: archive query failed for s3://.../bintrail_id=<uuid>: IO Error: S3 AccessDenied: ...
 ```
 
-**Cause**: expired AWS credentials, a mis-scoped IAM role, or a bucket policy change. bintrail uses DuckDB's standard AWS credential chain (env vars → `~/.aws/credentials` → IAM role).
+**Cause**: expired AWS credentials, a mis-scoped IAM role, or a bucket policy change. dbtrail uses DuckDB's standard AWS credential chain (env vars → `~/.aws/credentials` → IAM role).
 
 **Diagnose**: reproduce the failure in the DuckDB CLI with the same credentials:
 
@@ -305,7 +305,7 @@ aws s3 ls s3://my-bucket/events/bintrail_id=<uuid>/
 duckdb -c "INSTALL httpfs; LOAD httpfs; SELECT COUNT(*) FROM parquet_scan('s3://my-bucket/events/bintrail_id=<uuid>/**/*.parquet');"
 ```
 
-If DuckDB reports the same error, the issue is the credential chain, not bintrail. If `aws s3 ls` succeeds but DuckDB fails, DuckDB may be using a different credential profile than the AWS CLI — explicitly set `AWS_PROFILE` or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` in the shell running `bintrail query`.
+If DuckDB reports the same error, the issue is the credential chain, not dbtrail. If `aws s3 ls` succeeds but DuckDB fails, DuckDB may be using a different credential profile than the AWS CLI — explicitly set `AWS_PROFILE` or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` in the shell running `bintrail query`.
 
 ### DuckDB memory_limit exceeded
 
@@ -328,7 +328,7 @@ bintrail query \
   --bintrail-id <uuid>
 ```
 
-You can also raise DuckDB's `memory_limit` in a direct DuckDB CLI session for debugging — bintrail's internal DuckDB instance uses the default (80% of system RAM), so the usual fix is to narrow the query.
+You can also raise DuckDB's `memory_limit` in a direct DuckDB CLI session for debugging — dbtrail's internal DuckDB instance uses the default (80% of system RAM), so the usual fix is to narrow the query.
 
 ### Corrupted Parquet file
 
@@ -362,11 +362,11 @@ If the cancellation is fired by a context deadline (not Ctrl-C), the wrapped err
 
 ### "Works in DuckDB CLI, fails in bintrail query"
 
-If you can run the same glob directly in the DuckDB CLI but `bintrail query` fails with an archive warning, compare the exact query bintrail issued. Run with `--log-level debug` to see the generated DuckDB SQL:
+If you can run the same glob directly in the DuckDB CLI but `bintrail query` fails with an archive warning, compare the exact query dbtrail issued. Run with `--log-level debug` to see the generated DuckDB SQL:
 
 ```sh
 bintrail query --index-dsn "..." --archive-s3 s3://... --bintrail-id <uuid> \
   --since "2026-02-01 00:00:00" --log-level debug 2>&1 | grep -i parquet
 ```
 
-Copy the generated `SELECT ... FROM parquet_scan(...)` into the DuckDB CLI with the same filters and compare. The two should produce identical results; if they don't, the discrepancy is either (a) a filter-translation bug in bintrail (worth filing), or (b) a DuckDB version mismatch between bintrail's embedded DuckDB and your CLI install.
+Copy the generated `SELECT ... FROM parquet_scan(...)` into the DuckDB CLI with the same filters and compare. The two should produce identical results; if they don't, the discrepancy is either (a) a filter-translation bug in dbtrail (worth filing), or (b) a DuckDB version mismatch between dbtrail's embedded DuckDB and your CLI install.

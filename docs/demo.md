@@ -1,7 +1,7 @@
-# bintrail demo — 30-second evaluation
+# dbtrail demo — 30-second evaluation
 
 `ghcr.io/dbtrail/bintrail-demo` is a **single-container, evaluation-only**
-demo: MySQL 8.0, bintrail, ProxySQL, and a traffic generator, preconfigured so
+demo: MySQL 8.0, dbtrail, ProxySQL, and a traffic generator, preconfigured so
 your first Time Travel SQL query is one `docker run` away.
 
 ```sh

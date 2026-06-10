@@ -1,8 +1,13 @@
-# Installing bintrail
+# Installing dbtrail
 
-Every way to install and first-run bintrail, from the zero-friction Docker
+Every way to install and first-run dbtrail, from the zero-friction Docker
 Compose stack to building from source. If you just want the fastest path,
 it's the first section — the same four lines as the README.
+
+> **Naming note:** the project is **dbtrail**; the binaries, packages, and
+> images keep the original engine name **`bintrail`** (`bintrail`,
+> `bintrail-console`, `ghcr.io/dbtrail/bintrail`, `BINTRAIL_*` env vars).
+> Existing installs, scripts, and services stay valid as-is.
 
 ## Requirements
 
@@ -11,7 +16,7 @@ it's the first section — the same four lines as the README.
   and prints copy-pasteable remediation for whatever is missing.
 - A MySQL user on the source with `REPLICATION SLAVE`, `REPLICATION CLIENT`,
   and `SELECT`.
-- An **index MySQL 8.0+** database for bintrail's data (the Compose stack
+- An **index MySQL 8.0+** database for dbtrail's data (the Compose stack
   bundles one).
 - Go 1.24+ — only when building from source.
 
@@ -38,7 +43,7 @@ Console is running — open it and add the MySQL servers to watch:
 Open it and use **+ Add server** (the Servers screen opens itself on a
 fresh install): paste the MySQL to watch — host, user, password, optional
 schema filter (`host.docker.internal` reaches a MySQL on this same machine
-from inside Docker). Bintrail runs the preflight (failures come back as
+from inside Docker). dbtrail runs the preflight (failures come back as
 remediation cards), provisions a dedicated index for that source, and starts
 streaming. Repeat per server; everything you add resumes automatically when
 the container restarts.
@@ -49,7 +54,7 @@ in a `.env` next to the compose file — that's optional now, not required.
 **The bundled index is a pinned MySQL 8.4** with a generated password — it
 holds the forensic record, so **it is your system of record, not a throwaway:
 back up its volumes** (`bintrail-index-data` + `bintrail-index-secret`
-together; volume loss means re-indexing). bintrail **ships** that MySQL but
+together; volume loss means re-indexing). dbtrail **ships** that MySQL but
 does not **operate** it — disk, backups, and upgrades are yours, as is sizing
 (see [Capacity Planning](./capacity.md)). The ship-vs-operate boundary triage
 cites is [SUPPORT.md](../SUPPORT.md). See [docker.md](./docker.md) for the
@@ -57,7 +62,7 @@ credential mechanism and the `8.0→8.4` upgrade note.
 
 **Bring your own index MySQL** (co-equal path, not an afterthought): set
 `INDEX_DSN` in `.env` to a MySQL 8.0+ you operate, and remove the bundled
-`index-init` + `index-mysql` services. Same split — bintrail installs and
+`index-init` + `index-mysql` services. Same split — dbtrail installs and
 migrates only its schema on whatever server you point it at; the contract
 floor stays MySQL 8.0+ (only the *bundled* index is 8.4). Want it operated for
 you? That is [dbtrail](https://dbtrail.com).
@@ -129,7 +134,7 @@ wants the UI.
 go install github.com/dbtrail/dbtrail/cmd/bintrail@latest
 ```
 
-Requires CGO (bintrail embeds DuckDB for Parquet archive queries).
+Requires CGO (dbtrail embeds DuckDB for Parquet archive queries).
 
 ## Build from source
 

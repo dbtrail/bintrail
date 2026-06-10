@@ -9,7 +9,7 @@ This page covers the math; the *operation* of the index MySQL — provisioning t
 Every row change becomes one row in `binlog_events`. Its size has two parts:
 
 1. **A fixed floor** (~0.8 KB measured) — the event metadata (binlog coordinates, GTID, schema/table names, `pk_values`) plus the secondary indexes (~0.5 KB of the floor is index entries alone). The largest single contributor is `pk_hash`, a 64-character SHA-256 hex string stored twice: once in the row, once in the PK-lookup index. This floor is the same whether the source row is 3 columns or 40.
-2. **The row image(s)** — JSON copies of the row, stored in `row_before` / `row_after`. Because bintrail requires `binlog_row_image=FULL`, every image contains **all** columns, with **column names as JSON keys**. Numeric values are nearly free (they inline into the JSON binary format); strings cost their byte length; long column names tax every single event.
+2. **The row image(s)** — JSON copies of the row, stored in `row_before` / `row_after`. Because dbtrail requires `binlog_row_image=FULL`, every image contains **all** columns, with **column names as JSON keys**. Numeric values are nearly free (they inline into the JSON binary format); strings cost their byte length; long column names tax every single event.
 
 The event type decides how many images are stored:
 
@@ -65,7 +65,7 @@ Adding a server from the console is a disk decision, not just a connection — b
 
 ### Estimating `events_per_day` before you have history
 
-If bintrail isn't streaming yet, ask the source itself. On the production MySQL:
+If dbtrail isn't streaming yet, ask the source itself. On the production MySQL:
 
 ```sql
 SHOW GLOBAL STATUS LIKE 'Innodb_rows_%';
@@ -124,7 +124,7 @@ Prevention is rotation: without a scheduled `rotate`, `binlog_events` grows **un
 
 ## Monitoring
 
-The index is a regular MySQL table — every tool you already have works. The primitives bintrail exposes:
+The index is a regular MySQL table — every tool you already have works. The primitives dbtrail exposes:
 
 - **`bintrail doctor --retain <window>`** — runs this page's math for you: it measures events/day and bytes/event from the last 24 hours of partition statistics and projects the steady-state size over the retention window. When the index MySQL is on the same host (loopback/socket DSN), it also probes the datadir's free space — FAIL when the projection exceeds it, WARN above 70%. The same check runs in `bintrail up`'s preflight with your actual `--rotate-retain`.
 - **`bintrail status --index-dsn …`** — per-partition row counts (InnoDB *estimates*, fine for capacity planning), per-file indexing progress, and archive totals (`Total size: X GB`) from `archive_state`.

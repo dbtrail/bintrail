@@ -1,16 +1,16 @@
 # Support scope
 
-This document is the canonical statement of what the bintrail project does
+This document is the canonical statement of what the dbtrail project does
 and does not support. Issue triage links here; reports outside this scope
 are closed with a pointer to this file.
 
 ## The contract
 
-Bintrail's contract with your infrastructure is one line:
+dbtrail's contract with your infrastructure is one line:
 
 > **A reachable MySQL 8.0+ via `--index-dsn`.**
 
-Bintrail installs and versions **its own schema** on that server — databases
+dbtrail installs and versions **its own schema** on that server — databases
 (`CREATE DATABASE IF NOT EXISTS`), tables, and idempotent migrations, via
 `init`, `up`, and the console control plane. The **bintrail binary** never
 installs, supervises, or operates a mysqld **on the host** (no apt/yum
@@ -27,7 +27,7 @@ ship-vs-operate boundary below.
 - The bintrail binaries and their commands, flags, and documented behavior.
 - The index **schema**: its tables, migrations, and data correctness
   (every row event, full before/after images).
-- Bintrail's own tooling for operating the index *data*: `rotate`, `status`,
+- dbtrail's own tooling for operating the index *data*: `rotate`, `status`,
   `doctor`, `archive reconcile`, Parquet archives and their queries.
 - The web console, the MCP server, the time-travel shim.
 - The Docker images we publish, **including the pinned MySQL 8.4 index image
@@ -84,7 +84,7 @@ The boundary triage cites:
 
 ## Reporting issues
 
-Bugs in bintrail's binaries, schema, tooling, console, or docs: please open
+Bugs in dbtrail's binaries, schema, tooling, console, or docs: please open
 an issue with reproduction steps — those are always in scope. If your report
 is about the index MySQL server's own operation (disk, backups, upgrades,
 corruption), see the list above first.

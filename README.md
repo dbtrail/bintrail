@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/img/header.png" alt="bintrail — the open-source time-travel flashback for MySQL. Every change leaves a trail: follow it back." width="100%">
+<img src="docs/img/header.png" alt="dbtrail — the open-source time-travel flashback for MySQL. Every change leaves a trail: follow it back." width="100%">
 
 **Point-in-time recovery for MySQL — no locks, no schema changes, no waiting for a restore.**
 
@@ -12,15 +12,15 @@
 SELECT * FROM orders WHERE id = 123 AS OF '2026-05-20 14:00:00'
 ```
 
-*— against production MySQL. That's the experience bintrail makes possible.*
+*— against production MySQL. That's the experience dbtrail makes possible.*
 
-<img src="docs/img/console-events.png" alt="bintrail console: every row change with before/after diffs" width="850">
+<img src="docs/img/console-events.png" alt="dbtrail console: every row change with before/after diffs" width="850">
 
 </div>
 
 ---
 
-Bintrail tails the binary log, keeps every row change with full
+dbtrail tails the binary log, keeps every row change with full
 before/after images in a searchable index, and turns "someone ran the wrong
 UPDATE" from a restore-from-backup incident into a two-minute fix:
 
@@ -34,7 +34,7 @@ client) can search your change history and draft recoveries.
 
 Works with **MySQL**, **Percona Server for MySQL**, **Amazon RDS for
 MySQL**, **Amazon Aurora MySQL**, and **Google Cloud SQL for MySQL** —
-bintrail connects over the replication protocol, so it never needs access
+dbtrail connects over the replication protocol, so it never needs access
 to the binlog files on disk (that's what makes managed cloud databases
 work). Requires MySQL 8.0+ with `binlog_format=ROW` and
 `binlog_row_image=FULL` — `bintrail doctor` checks both and prints the
@@ -57,7 +57,7 @@ Console is running — open it and add the MySQL servers to watch:
 ```
 
 Open it and click **+ Add server**: paste the MySQL you want to watch —
-host, user, password — and bintrail runs the preflight checks (failures come
+host, user, password — and dbtrail runs the preflight checks (failures come
 back as fix-this cards), provisions an index for it, and starts streaming.
 Watching events within the minute, and the terminal is already behind you.
 The console binds to your machine only (`127.0.0.1`) and every request
@@ -65,10 +65,10 @@ requires the token from the URL.
 
 > The compose stack ships a pinned **MySQL 8.4** container as the index store.
 > That index holds the forensic record — **it is your system of record, so
-> back up its volumes** (lose them and you re-index from scratch). bintrail
+> back up its volumes** (lose them and you re-index from scratch). dbtrail
 > **ships** that MySQL but does not **operate** it: disk, backups, and
 > upgrades are yours. Prefer your own? Set `INDEX_DSN` in `.env` to a MySQL
-> 8.0+ **you** run and remove the bundled index services — bintrail installs only its
+> 8.0+ **you** run and remove the bundled index services — dbtrail installs only its
 > tables there, never operating the server. Either way, what's supported on
 > each side is spelled out in [SUPPORT.md](SUPPORT.md); for an index that's
 > operated for you, that's [dbtrail](https://dbtrail.com).
@@ -83,7 +83,7 @@ requires the token from the URL.
 ## How it works
 
 <div align="center">
-<img src="docs/img/how-it-works.svg" alt="your MySQL streams via replication into bintrail, which writes every row change with full before/after images into an index MySQL — served as query, recover, console, and time-travel" width="820">
+<img src="docs/img/how-it-works.svg" alt="your MySQL streams via replication into dbtrail, which writes every row change with full before/after images into an index MySQL — served as query, recover, console, and time-travel" width="820">
 </div>
 
 The index is self-contained: recovery never needs the original binlog files,

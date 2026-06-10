@@ -1,6 +1,6 @@
-# Dump and Baseline — Using mydumper with Bintrail
+# Dump and Baseline — Using mydumper with dbtrail
 
-Bintrail uses [mydumper](https://github.com/mydumper/mydumper) to create logical dumps of MySQL databases. The dump output is then converted to Parquet files by `bintrail baseline`, producing a point-in-time snapshot of every table that can be stored alongside archived binlog event partitions for long-term audit reconstruction.
+dbtrail uses [mydumper](https://github.com/mydumper/mydumper) to create logical dumps of MySQL databases. The dump output is then converted to Parquet files by `bintrail baseline`, producing a point-in-time snapshot of every table that can be stored alongside archived binlog event partitions for long-term audit reconstruction.
 
 This document covers running dumps, converting to Parquet baselines, and scheduling.
 
@@ -8,7 +8,7 @@ This document covers running dumps, converting to Parquet baselines, and schedul
 
 ## Why mydumper?
 
-Bintrail's binlog index captures every change (INSERT, UPDATE, DELETE) but not the initial state of rows that existed before indexing began. A baseline snapshot fills that gap — it records every row as it existed at a known point in time.
+dbtrail's binlog index captures every change (INSERT, UPDATE, DELETE) but not the initial state of rows that existed before indexing began. A baseline snapshot fills that gap — it records every row as it existed at a known point in time.
 
 mydumper is used instead of `mysqldump` because it:
 
@@ -30,7 +30,7 @@ The resolution order is:
 3. If Docker is available — invoke mydumper via `docker run`
 4. If none of the above — fail with a clear error message
 
-> **Note:** Do not place a shell script wrapper named `mydumper` on your PATH. Bintrail detects scripts (files starting with `#!`) and skips them to avoid argument-handling issues with volume mounts. If you need to force a specific binary, use `--mydumper-path`.
+> **Note:** Do not place a shell script wrapper named `mydumper` on your PATH. dbtrail detects scripts (files starting with `#!`) and skips them to avoid argument-handling issues with volume mounts. If you need to force a specific binary, use `--mydumper-path`.
 
 To pin a specific mydumper Docker image version:
 
@@ -147,11 +147,11 @@ bintrail dump \
   --tables mydb.orders,mydb.customers
 ```
 
-When a single schema is given, bintrail passes `--database <schema>` to mydumper. When multiple schemas are given, it constructs a regex filter (`--regex ^(s1|s2)\.`). Table filtering uses mydumper's `--tables-list` flag.
+When a single schema is given, dbtrail passes `--database <schema>` to mydumper. When multiple schemas are given, it constructs a regex filter (`--regex ^(s1|s2)\.`). Table filtering uses mydumper's `--tables-list` flag.
 
-### What mydumper flags does bintrail pass?
+### What mydumper flags does dbtrail pass?
 
-bintrail always passes these flags to mydumper:
+dbtrail always passes these flags to mydumper:
 
 | mydumper flag | Purpose |
 |---|---|
@@ -163,7 +163,7 @@ bintrail always passes these flags to mydumper:
 
 ### Concurrency protection
 
-Only one `bintrail dump` can run at a time. A lockfile at `$TMPDIR/bintrail-dump.lock` prevents concurrent runs. If a previous dump crashed without cleaning up, bintrail detects the stale lock (by checking if the PID is still alive) and removes it automatically.
+Only one `bintrail dump` can run at a time. A lockfile at `$TMPDIR/bintrail-dump.lock` prevents concurrent runs. If a previous dump crashed without cleaning up, dbtrail detects the stale lock (by checking if the PID is still alive) and removes it automatically.
 
 ### Output directory behavior
 
@@ -260,7 +260,7 @@ This makes the command safe to re-run without duplicating work.
 
 ### Initial setup
 
-Run a dump once when you first set up bintrail, before starting to index binlog events. This captures the starting state of your data:
+Run a dump once when you first set up dbtrail, before starting to index binlog events. This captures the starting state of your data:
 
 ```sh
 # 1. Dump
@@ -326,7 +326,7 @@ bintrail baseline \
 | Small, rarely-changing databases | Monthly or quarterly |
 | Large, high-write databases | Weekly (with `--schemas` to limit scope) |
 
-The dump frequency depends on your recovery and audit requirements. Bintrail's binlog index captures every change between baselines, so even infrequent baselines provide full coverage when combined with the change log.
+The dump frequency depends on your recovery and audit requirements. dbtrail's binlog index captures every change between baselines, so even infrequent baselines provide full coverage when combined with the change log.
 
 ---
 
@@ -336,13 +336,13 @@ The dump frequency depends on your recovery and audit requirements. Bintrail's b
 |---------|-------|-----|
 | `mydumper not found on $PATH and Docker is not available` | Neither mydumper nor Docker is installed | Install Docker (recommended) or install mydumper manually (see above) |
 | `mydumper not found at "/custom/path"` | Explicit `--mydumper-path` points to a missing binary | Verify the path is correct and the binary is executable |
-| `found mydumper on $PATH but it appears to be a shell script wrapper` | A shell script named `mydumper` is on your PATH (e.g. a Docker wrapper) | Remove the wrapper script — bintrail handles Docker invocation automatically. Or use `--mydumper-path` to point to the real binary. |
+| `found mydumper on $PATH but it appears to be a shell script wrapper` | A shell script named `mydumper` is on your PATH (e.g. a Docker wrapper) | Remove the wrapper script — dbtrail handles Docker invocation automatically. Or use `--mydumper-path` to point to the real binary. |
 | `another dump is already running` | A previous dump is still running or crashed | Wait for it to finish, or check if the PID in `$TMPDIR/bintrail-dump.lock` is still alive. Stale locks from crashed processes are cleaned up automatically on the next run. |
 | `mydumper failed: exit status 2` | mydumper itself encountered an error (wrong credentials, unreachable host, etc.) | Check mydumper's stderr output for details. Verify the `--source-dsn` is correct. |
 | Docker: `permission denied` on `/var/run/docker.sock` | Current user is not in the `docker` group | Run `sudo usermod -aG docker $USER` and log out/in, or use `sudo bintrail dump ...` |
 | Docker: `Cannot connect to the Docker daemon` | Docker daemon is not running | Start Docker: `sudo systemctl start docker` (Linux) or open Docker Desktop (macOS) |
 | Docker: mydumper cannot reach MySQL on localhost | On macOS/Windows, `--network host` does not work as on Linux | Use `host.docker.internal` instead of `localhost` in `--source-dsn` (e.g. `user:pass@tcp(host.docker.internal:3306)/`) |
 | Docker: volume mount permission errors | Docker cannot write to the `--output-dir` path | Ensure the output directory's parent exists and is writable. On SELinux systems, add `:z` to the volume mount or use `--security-opt label=disable`. |
-| Docker: dump files owned by root | Older bintrail versions ran the container as root | Upgrade — bintrail now passes `--user <uid>:<gid>` to `docker run` so dump files are owned by the invoking user. |
+| Docker: dump files owned by root | Older dbtrail versions ran the container as root | Upgrade — dbtrail now passes `--user <uid>:<gid>` to `docker run` so dump files are owned by the invoking user. |
 | Baseline produces no files | mydumper output directory is empty or has no table data files | Verify the dump ran successfully and the `--schemas`/`--tables` filters match existing tables. |
 | `--timestamp: expected ISO 8601 format` | Invalid timestamp override format | Use `2026-03-02T14:30:00Z` or `2026-03-02 14:30:00` format. |

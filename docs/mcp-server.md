@@ -1,6 +1,6 @@
 # How the MCP Server Works
 
-This page explains `bintrail-mcp` — the Model Context Protocol server that exposes bintrail's `query`, `recover`, and `status` operations as tools for AI assistants like Claude.
+This page explains `bintrail-mcp` — the Model Context Protocol server that exposes dbtrail's `query`, `recover`, and `status` operations as tools for AI assistants like Claude.
 
 ---
 
@@ -8,7 +8,7 @@ This page explains `bintrail-mcp` — the Model Context Protocol server that exp
 
 MCP (Model Context Protocol) is an open standard for connecting AI assistants to external data sources and tools. When an MCP server is registered with an AI assistant, the assistant can call the server's tools during a conversation — and the server's responses become part of the conversation context.
 
-For bintrail, this means you can ask Claude things like:
+For dbtrail, this means you can ask Claude things like:
 
 > "What got deleted from the orders table in the last 10 minutes?"
 
@@ -151,7 +151,7 @@ go newServer().Connect(ctx, t1, nil)
 
 ### Claude Connector (recommended — for claude.ai, Desktop, and mobile)
 
-The easiest way to connect Claude to bintrail. Requires the [MCP Gateway](./mcp-gateway.md) running at a public URL.
+The easiest way to connect Claude to dbtrail. Requires the [MCP Gateway](./mcp-gateway.md) running at a public URL.
 
 1. Open **claude.ai** → **Settings** → **Integrations**
 2. Click **Add custom integration**
@@ -181,7 +181,7 @@ Claude Code on the same machine auto-starts the server via `.mcp.json` at the pr
 }
 ```
 
-When you open the bintrail directory in Claude Code, the server starts automatically. Set `BINTRAIL_INDEX_DSN` in your shell or in the env section of `.mcp.json` and the tools are immediately available.
+When you open the dbtrail directory in Claude Code, the server starts automatically. Set `BINTRAIL_INDEX_DSN` in your shell or in the env section of `.mcp.json` and the tools are immediately available.
 
 ```sh
 export BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index'

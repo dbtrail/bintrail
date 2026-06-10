@@ -1,10 +1,10 @@
-# Bintrail — Practical Guide for DBAs
+# dbtrail — Practical Guide for DBAs
 
-Bintrail indexes every INSERT, UPDATE, and DELETE from MySQL ROW-format binary logs into a queryable MySQL database, and generates reversal SQL for recovery — without needing the original binlog files. This guide is for DBAs who need scenario-driven walkthroughs and troubleshooting help.
+dbtrail indexes every INSERT, UPDATE, and DELETE from MySQL ROW-format binary logs into a queryable MySQL database, and generates reversal SQL for recovery — without needing the original binlog files. This guide is for DBAs who need scenario-driven walkthroughs and troubleshooting help.
 
 ---
 
-## 0. Where to Run Bintrail
+## 0. Where to Run dbtrail
 
 Where you install and run the `bintrail` binary depends on which indexing mode you use.
 
@@ -12,7 +12,7 @@ Where you install and run the `bintrail` binary depends on which indexing mode y
 
 ### Mode A: File-based indexing (`bintrail index`)
 
-`bintrail index` reads binlog files directly from the local filesystem using `--binlog-dir`. There is **no remote file access** — the path must be readable by the process running bintrail.
+`bintrail index` reads binlog files directly from the local filesystem using `--binlog-dir`. There is **no remote file access** — the path must be readable by the process running dbtrail.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -32,21 +32,21 @@ Where you install and run the `bintrail` binary depends on which indexing mode y
 
 **Typical deployment locations:**
 
-| Where to run bintrail | When to use it |
+| Where to run dbtrail | When to use it |
 |---|---|
 | On the MySQL server itself | Simplest option for self-managed MySQL. `--binlog-dir /var/lib/mysql`. |
 | On a replica host | Point `--binlog-dir` at the replica's own binlog directory (requires `log_bin` enabled on the replica). Useful to avoid load on the primary. |
 | On any host with an NFS/CIFS mount | Mount the MySQL data directory read-only and point `--binlog-dir` at the mount point. |
 | Inside a Docker container | Mount the binlog directory read-only: `-v /var/lib/mysql:/var/lib/mysql:ro`. |
-| After copying files with rsync/SCP | Copy binlog files to a staging directory, run bintrail there, delete afterwards. |
+| After copying files with rsync/SCP | Copy binlog files to a staging directory, run dbtrail there, delete afterwards. |
 
 **What does NOT work:**
 
 - Pointing `--binlog-dir` at an SSH or SFTP path (`/ssh/host/var/lib/mysql`) — the flag is a plain filesystem path
 - Pointing `--binlog-dir` at a remote HTTP or object-storage URL
-- Running bintrail on a machine with no access to the binlog files and hoping `--source-dsn` provides them — `--source-dsn` is only used for schema metadata and format validation, not for reading binlog file content
+- Running dbtrail on a machine with no access to the binlog files and hoping `--source-dsn` provides them — `--source-dsn` is only used for schema metadata and format validation, not for reading binlog file content
 
-**Bintrail never modifies binlog files.** It opens them read-only. It is safe to point `--binlog-dir` at the live MySQL data directory.
+**dbtrail never modifies binlog files.** It opens them read-only. It is safe to point `--binlog-dir` at the live MySQL data directory.
 
 ---
 
@@ -67,7 +67,7 @@ bintrail stream ─────────────────────�
 └─────────────────┘
 ```
 
-**Bintrail can run anywhere** that has a TCP path to the source MySQL server — your laptop, a CI runner, a separate host, or a container.
+**dbtrail can run anywhere** that has a TCP path to the source MySQL server — your laptop, a CI runner, a separate host, or a container.
 
 This is the required mode for managed MySQL services (Amazon RDS, Aurora, Google Cloud SQL, Azure Database for MySQL) where binlog files are not accessible on disk.
 
@@ -93,7 +93,7 @@ You can use **both modes together**: use `bintrail index` to backfill historical
 Before you start:
 
 - [ ] Source MySQL server has `binlog_format = ROW` and `binlog_row_image = FULL`
-- [ ] A separate database (or schema) is available for the bintrail index — it can be on the same server or a different one
+- [ ] A separate database (or schema) is available for the dbtrail index — it can be on the same server or a different one
 - [ ] `bintrail` binary is installed and on your `$PATH`
 - [ ] Your index DSN includes the database name: `user:pass@tcp(host:3306)/binlog_index`
 
@@ -167,7 +167,7 @@ Indexing binlog.000043 ... 8901 events indexed
 Done: 2 files, 21246 events total
 ```
 
-After this, the index is live. See [Section 4](#4-keeping-bintrail-running-day-to-day) for ongoing automation.
+After this, the index is live. See [Section 4](#4-keeping-dbtrail-running-day-to-day) for ongoing automation.
 
 ---
 
@@ -399,7 +399,7 @@ The JSON output includes `row_before` and `row_after` for every event, giving a 
 
 ### Scenario F: Disk is filling up — clean old index data
 
-**Situation:** The bintrail index database is growing large and you need to reclaim space by dropping old partitions.
+**Situation:** The dbtrail index database is growing large and you need to reclaim space by dropping old partitions.
 
 **Check the current state:**
 
@@ -444,7 +444,7 @@ bintrail rotate \
 
 **Situation:** You want to archive old `binlog_events` partitions to S3 as Parquet files before dropping them, so you retain a long-term queryable history outside the index database.
 
-**Option 1 — Let bintrail create the bucket:**
+**Option 1 — Let dbtrail create the bucket:**
 
 ```sh
 bintrail init \
@@ -453,7 +453,7 @@ bintrail init \
   --s3-region  us-east-1
 ```
 
-bintrail creates the bucket, blocks all public access, and sets a 1-year lifecycle expiry.
+dbtrail creates the bucket, blocks all public access, and sets a 1-year lifecycle expiry.
 
 **Option 2 — Use a bucket that already exists (pass its ARN):**
 
@@ -463,11 +463,11 @@ bintrail init \
   --s3-arn     arn:aws:s3:::my-existing-bucket
 ```
 
-bintrail verifies the bucket is reachable with the current AWS credentials. `--s3-bucket` and `--s3-arn` are mutually exclusive.
+dbtrail verifies the bucket is reachable with the current AWS credentials. `--s3-bucket` and `--s3-arn` are mutually exclusive.
 
 **Required IAM permissions:**
 
-Whichever approach you use, the IAM role or user running bintrail needs these permissions on the bucket:
+Whichever approach you use, the IAM role or user running dbtrail needs these permissions on the bucket:
 
 ```json
 {
@@ -491,11 +491,11 @@ Whichever approach you use, the IAM role or user running bintrail needs these pe
 }
 ```
 
-The example above uses the standard `aws` partition. If your bucket is in AWS China (`aws-cn`) or GovCloud (`aws-us-gov`), replace `arn:aws:s3:::` with `arn:aws-cn:s3:::` or `arn:aws-us-gov:s3:::` in both resource lines. When you use `--s3-arn`, bintrail extracts the correct partition from the ARN and prints an already-correct policy in the warning output.
+The example above uses the standard `aws` partition. If your bucket is in AWS China (`aws-cn`) or GovCloud (`aws-us-gov`), replace `arn:aws:s3:::` with `arn:aws-cn:s3:::` or `arn:aws-us-gov:s3:::` in both resource lines. When you use `--s3-arn`, dbtrail extracts the correct partition from the ARN and prints an already-correct policy in the warning output.
 
-If you used `--s3-bucket` to let bintrail create the bucket, it also needs `s3:CreateBucket`, `s3:PutBucketPublicAccessBlock`, and `s3:PutLifecycleConfiguration` at creation time — these can be removed from the policy afterwards.
+If you used `--s3-bucket` to let dbtrail create the bucket, it also needs `s3:CreateBucket`, `s3:PutBucketPublicAccessBlock`, and `s3:PutLifecycleConfiguration` at creation time — these can be removed from the policy afterwards.
 
-**AWS credentials:** bintrail uses the standard AWS credential chain — environment variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, or the EC2/ECS instance metadata service. No extra configuration is needed when running on an EC2 instance with an IAM instance profile that has the policy above attached.
+**AWS credentials:** dbtrail uses the standard AWS credential chain — environment variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, or the EC2/ECS instance metadata service. No extra configuration is needed when running on an EC2 instance with an IAM instance profile that has the policy above attached.
 
 **Archive to a local directory:**
 
@@ -563,9 +563,9 @@ To disable archive routing entirely and query only live MySQL data, use `--no-ar
 
 ### Scenario H: Creating a baseline snapshot with mydumper
 
-**Situation:** You're setting up bintrail for the first time and want to capture the current state of your tables before you start indexing binlog events. Or you need a periodic full snapshot for audit purposes.
+**Situation:** You're setting up dbtrail for the first time and want to capture the current state of your tables before you start indexing binlog events. Or you need a periodic full snapshot for audit purposes.
 
-**Prerequisites:** Either mydumper or Docker must be available. If Docker is installed, no separate mydumper installation is needed — bintrail invokes it automatically via `docker run`. See the [Dump and Baseline guide](dump-and-baseline.md#getting-mydumper) for details.
+**Prerequisites:** Either mydumper or Docker must be available. If Docker is installed, no separate mydumper installation is needed — dbtrail invokes it automatically via `docker run`. See the [Dump and Baseline guide](dump-and-baseline.md#getting-mydumper) for details.
 
 **Step 1 — Dump the source database:**
 
@@ -680,7 +680,7 @@ aws s3api put-bucket-lifecycle-configuration \
 
 **IAM permissions required:**
 
-The IAM role or user running bintrail needs `s3:PutObject` (and `s3:GetObject` / `s3:ListBucket` for future reads):
+The IAM role or user running dbtrail needs `s3:PutObject` (and `s3:GetObject` / `s3:ListBucket` for future reads):
 
 ```json
 {
@@ -779,11 +779,11 @@ curl -s localhost:9090/metrics | grep bintrail_stream_replication_lag_seconds
 
 ---
 
-### Scenario K: Using bintrail from Claude Desktop (AI-assisted investigation)
+### Scenario K: Using dbtrail from Claude Desktop (AI-assisted investigation)
 
 **Situation:** You want to use Claude Desktop (or Claude Code on another machine) to investigate database changes in natural language — without typing CLI commands.
 
-Bintrail ships an MCP server that exposes `query`, `recover`, and `status` as AI tools. Once configured, you can ask Claude things like:
+dbtrail ships an MCP server that exposes `query`, `recover`, and `status` as AI tools. Once configured, you can ask Claude things like:
 
 - "What got deleted in the last 10 minutes in the orders table?"
 - "Bring back customer 289"
@@ -795,7 +795,7 @@ Claude calls the tools automatically and presents the results.
 
 #### Option A: Claude Code on the same machine (automatic)
 
-If you're using Claude Code in the bintrail repo directory, the `.mcp.json` file registers the MCP server automatically. Just set the DSN:
+If you're using Claude Code in the dbtrail repo directory, the `.mcp.json` file registers the MCP server automatically. Just set the DSN:
 
 ```bash
 export BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index'
@@ -815,7 +815,7 @@ This setup lets any machine on the same network use the bintrail tools in Claude
 Claude Desktop  →  proxy.py (stdio, local)  →  bintrail-mcp --http :8080  →  Index MySQL
 ```
 
-**On the machine that has bintrail installed:**
+**On the machine that has dbtrail installed:**
 
 ```bash
 # Build the binary if you haven't already
@@ -919,7 +919,7 @@ bintrail --log-level debug query --index-dsn "..." --schema mydb --table orders 
 
 ---
 
-## 4. Keeping Bintrail Running (Day-to-Day)
+## 4. Keeping dbtrail Running (Day-to-Day)
 
 **Re-indexing new binlog files:** Just run `index --all` again. Files already marked `completed` are skipped automatically — re-running is always safe.
 
@@ -953,7 +953,7 @@ bintrail status --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 | `--index-dsn must include a database name` | DSN is missing the `/database` component | Use format `user:pass@tcp(host:3306)/binlog_index`. The database name is required. |
 | `warning: p_future partition contains data` (printed by rotate) | Events arrived beyond the last named partition | Run `bintrail rotate --add-future N` to extend the partition range. |
 | `no binlog files found in "/path/to/dir"` | Wrong `--binlog-dir` or binlog files not yet copied | Verify the path with `ls /path/to/dir`. Binlog files are typically named `binlog.000001` etc. Use `docker cp` if the files are inside a container. |
-| Recovery SQL uses `WHERE col1 = ? AND col2 = ?` for all columns (verbose) | No schema snapshot available, so bintrail falls back to matching all columns | Run `bintrail snapshot` — once a snapshot is available, recovery uses the primary key only. |
+| Recovery SQL uses `WHERE col1 = ? AND col2 = ?` for all columns (verbose) | No schema snapshot available, so dbtrail falls back to matching all columns | Run `bintrail snapshot` — once a snapshot is available, recovery uses the primary key only. |
 | `failed to connect to index database: ...` | Wrong DSN, MySQL not running, or network issue | Verify the DSN is correct and test connectivity: `mysql -u user -p -h host -P 3306 binlog_index`. |
 | Index files stuck as `in_progress` | Previous `index` run crashed or was killed | Re-run `bintrail index` — `in_progress` files are retried automatically. |
 | `auto-discover binlog position: ...` on `bintrail stream` first run | The default auto-discovery (`SHOW BINARY LOG STATUS` / `SHOW MASTER STATUS`) failed — usually because `log_bin=OFF` on the source, or the user lacks `REPLICATION CLIENT` | Enable binary logging on the source (or override with an explicit `--start-file`/`--start-pos` or `--start-gtid`). On RDS, set `binlog_format=ROW` in the parameter group and ensure `backup-retention-period > 0`. |
@@ -979,7 +979,7 @@ appuser:p@ssw0rd@tcp(db.internal:3306)/binlog_index
 
 **Special characters in passwords** must be URL-encoded. For example, `p@ss#word` becomes `p%40ss%23word`. When in doubt, wrap passwords in single quotes in shell scripts and use a password without special characters for the index DSN.
 
-**Source DSN** (used with `--source-dsn`) does not require a database name since bintrail reads from `information_schema`:
+**Source DSN** (used with `--source-dsn`) does not require a database name since dbtrail reads from `information_schema`:
 
 ```
 root:secret@tcp(source-db:3306)/

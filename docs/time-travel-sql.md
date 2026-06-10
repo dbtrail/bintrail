@@ -6,7 +6,7 @@ This walkthrough takes you from zero to running a working time-travel query agai
 SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
 ```
 
-The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a subcommand of the `bintrail` binary) that intercepts the virtual `_flashback`, `_diff`, and `_snapshot` schemas and resolves them against your bintrail index plus any rotated archives (local directory or `s3://` prefix). ProxySQL sits in front of both your real MySQL and the shim, routing each query to the right backend. The setup is the same whether you populate the index with `bintrail stream` (hosted) or `bintrail agent` (BYOS) — the shim only cares that the index exists and `archive_state` is current.
+The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a subcommand of the `bintrail` binary) that intercepts the virtual `_flashback`, `_diff`, and `_snapshot` schemas and resolves them against your dbtrail index plus any rotated archives (local directory or `s3://` prefix). ProxySQL sits in front of both your real MySQL and the shim, routing each query to the right backend. The setup is the same whether you populate the index with `bintrail stream` (hosted) or `bintrail agent` (BYOS) — the shim only cares that the index exists and `archive_state` is current.
 
 ```
 ┌─────────────┐     :6033       ┌──────────┐    real query     ┌────────────┐
@@ -19,7 +19,7 @@ The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a
                                 └──────────┘                   └────────────┘
 ```
 
-The whole walkthrough takes about 10 minutes on a fresh Ubuntu 22.04 or Amazon Linux 2023 host that already has a populated bintrail index.
+The whole walkthrough takes about 10 minutes on a fresh Ubuntu 22.04 or Amazon Linux 2023 host that already has a populated dbtrail index.
 
 ---
 
@@ -27,7 +27,7 @@ The whole walkthrough takes about 10 minutes on a fresh Ubuntu 22.04 or Amazon L
 
 Before starting, you need:
 
-- **A populated bintrail index.** Some process is keeping `binlog_events` current — typically `bintrail stream` (hosted) or `bintrail agent` (BYOS). If rotated hours have been archived, `archive_state` points at the local directory or `s3://` prefix where the Parquet files live. If you haven't set any of this up yet, see [`docs/streaming.md`](streaming.md) and [`docs/rotation-and-status.md`](rotation-and-status.md).
+- **A populated dbtrail index.** Some process is keeping `binlog_events` current — typically `bintrail stream` (hosted) or `bintrail agent` (BYOS). If rotated hours have been archived, `archive_state` points at the local directory or `s3://` prefix where the Parquet files live. If you haven't set any of this up yet, see [`docs/streaming.md`](streaming.md) and [`docs/rotation-and-status.md`](rotation-and-status.md).
 - **A `.bintrail.env` file** with `BINTRAIL_SOURCE_DSN`, `BINTRAIL_INDEX_DSN`, and `BINTRAIL_SERVER_ID` set. `bintrail config init` scaffolds one.
 - **The `bintrail` binary** on the host. The shim is a subcommand — there is no second binary to download.
 - **Root or `sudo` access** on the host.
@@ -132,7 +132,7 @@ If ProxySQL is on the same host (typical):
 mysql -u admin -p -h 127.0.0.1 -P 6032 < proxysql-setup.sql
 ```
 
-The script wraps its DML in `BEGIN`/`COMMIT` and finishes with `LOAD ... TO RUNTIME` and `SAVE ... TO DISK`, so the new routing is live immediately and survives a ProxySQL restart. **Re-running the script is safe** — it scopes its DELETEs to bintrail-owned hostgroups (990, 991) and rule IDs (990001-990006), so it never touches operator-managed config.
+The script wraps its DML in `BEGIN`/`COMMIT` and finishes with `LOAD ... TO RUNTIME` and `SAVE ... TO DISK`, so the new routing is live immediately and survives a ProxySQL restart. **Re-running the script is safe** — it scopes its DELETEs to dbtrail-owned hostgroups (990, 991) and rule IDs (990001-990006), so it never touches operator-managed config.
 
 Verify ProxySQL accepted the config — you should see exactly two rows, one for hostgroup 990 (your real MySQL — `hostname` reflects whatever you have in `BINTRAIL_SOURCE_DSN`) and one for hostgroup 991 (the shim, always `127.0.0.1:3308`):
 
@@ -169,7 +169,7 @@ StandardError=journal
 WantedBy=multi-user.target
 ```
 
-> A copy of this unit ships at `deploy/bintrail-shim.service` in the bintrail repo.
+> A copy of this unit ships at `deploy/bintrail-shim.service` in the dbtrail repo.
 
 The unit reads `BINTRAIL_INDEX_DSN` from `/etc/bintrail/.bintrail.env` (the same file your agent uses) so the shim can answer queries against your index. The DSN must include the index database name (e.g. `…/bintrail_index`) — the shim refuses to start otherwise. Append `--allow-gaps` to `ExecStart` to warn-and-continue on archive failures or coverage gaps instead of returning a MySQL error to the client; the default is strict because the wire protocol has no warning channel.
 
@@ -181,7 +181,7 @@ ExecStart=/usr/local/bin/bintrail shim --shim-config /etc/bintrail/shim.yaml --a
 
 Requires ProxySQL **2.7+** between the application and the shim — the LTS 2.6 line isn't verified to negotiate SHA2 against backends, so operators on 2.6 keep the default (`mysql_native_password`). The application user used by ProxySQL must match the chosen scheme: `IDENTIFIED WITH mysql_native_password BY '<password>'` for the default path, `IDENTIFIED WITH caching_sha2_password BY '<password>'` for the opt-in. `sha256_password` is also accepted by `--auth-method` if your environment requires it. The same 2.7+ requirement applies when ProxySQL fronts an **8.4 source** directly (its `caching_sha2_password` backend), set via `proxysql-config --backend-auth-plugin caching_sha2_password`.
 
-> **bintrail's own connections to MySQL 8.4 need no auth flag.** The ProxySQL requirement above is only about ProxySQL negotiating `caching_sha2_password` to a backend. bintrail's *index* connection (`--index-dsn`, go-sql-driver) and its *source replication* handshake (`bintrail stream`/`up`, go-mysql) both complete `caching_sha2_password` over a plaintext network on their own — the driver retrieves the server's public key for cold-cache full auth, with no flag, no TLS, and no ProxySQL in the path. This is what the bundled MySQL 8.4 index uses by default; CI exercises it against both 8.0 and 8.4.
+> **dbtrail's own connections to MySQL 8.4 need no auth flag.** The ProxySQL requirement above is only about ProxySQL negotiating `caching_sha2_password` to a backend. dbtrail's *index* connection (`--index-dsn`, go-sql-driver) and its *source replication* handshake (`bintrail stream`/`up`, go-mysql) both complete `caching_sha2_password` over a plaintext network on their own — the driver retrieves the server's public key for cold-cache full auth, with no flag, no TLS, and no ProxySQL in the path. This is what the bundled MySQL 8.4 index uses by default; CI exercises it against both 8.0 and 8.4.
 
 Enable and start:
 
@@ -269,7 +269,7 @@ SHOW TABLES FROM _flashback;
 
 Full-table `_flashback` / `_snapshot` queries are buffered and capped at 100,000 rows; exceeding the cap surfaces as `ER_TOO_BIG_SELECT` (code 1104) with a hint to narrow the AS OF range or add a PK filter. DELETE events are correctly suppressed — rows that did not exist at the AS OF instant don't appear in the resultset (same semantic as Oracle's `AS OF`). For ad-hoc filtering, joins, or aggregations, pipe the resultset to `duckdb`, `pandas`, or any tool that consumes a `SELECT *` stream — the shim deliberately stays a forensic point-lookup + full-table tool, not a SQL planner.
 
-The shim resolves the row by replaying the relevant binlog events from your bintrail MySQL index. If the timestamp falls outside the index's retention (because hourly partitions have been rotated to S3), the shim auto-discovers the Parquet archives via `archive_state` and merges results from both sources — same machinery `bintrail query` and `bintrail recover` already use.
+The shim resolves the row by replaying the relevant binlog events from your dbtrail MySQL index. If the timestamp falls outside the index's retention (because hourly partitions have been rotated to S3), the shim auto-discovers the Parquet archives via `archive_state` and merges results from both sources — same machinery `bintrail query` and `bintrail recover` already use.
 
 ---
 
@@ -334,11 +334,11 @@ To distinguish cases 1 and 2, query `_diff` for the per-PK history: it returns e
 journalctl -u bintrail-agent -n 200
 ```
 
-The bintrail index retains the most recent hours via partition rotation; older data is in S3 (auto-discovered via `archive_state`). See [`docs/storage.md`](storage.md) for the buffer query priority and S3 flush cadence.
+The dbtrail index retains the most recent hours via partition rotation; older data is in S3 (auto-discovered via `archive_state`). See [`docs/storage.md`](storage.md) for the buffer query priority and S3 flush cadence.
 
 ### Operator already has users in hostgroup 990
 
-`bintrail proxysql-config` scopes its DELETE to `mysql_users WHERE default_hostgroup = 990` — any pre-existing user in that hostgroup will be removed when the script is applied. If you have application users you want to keep separate from bintrail-managed routing, place them in a different hostgroup before running the script. Hostgroup 990 is reserved for bintrail; see the comment header at the top of the generated `proxysql-setup.sql` for the full list of resources the script manages.
+`bintrail proxysql-config` scopes its DELETE to `mysql_users WHERE default_hostgroup = 990` — any pre-existing user in that hostgroup will be removed when the script is applied. If you have application users you want to keep separate from dbtrail-managed routing, place them in a different hostgroup before running the script. Hostgroup 990 is reserved for dbtrail; see the comment header at the top of the generated `proxysql-setup.sql` for the full list of resources the script manages.
 
 ---
 
@@ -349,6 +349,6 @@ The bintrail index retains the most recent hours via partition rotation; older d
 - **`_snapshot` is baseline-aware; `_flashback` is binlog-only.** Start `bintrail shim` with `--baseline-dir <dir>` or `--baseline-s3 s3://bucket/prefix/` (the snapshots produced by `bintrail baseline`) to enable it. Both the **single-row** (`WHERE <pk> = <value>`) and **full-table** (no WHERE) `_snapshot` shapes then seed row state from the baseline at-or-before the AS OF instant and apply post-snapshot binlog events on top — so a row that existed at AS OF but was never touched within the retained binlog window still resolves, and full-table `_snapshot` returns the table's complete row state at AS OF (never-touched baseline rows, rows updated/inserted after the baseline, with rows deleted after it dropped). `_flashback` deliberately stays binlog-only — its full-table form returns only rows with binlog activity in the retained window — so the two schemas have distinct, observable semantics. With no baseline source configured, `_snapshot` degrades to the binlog-only `_flashback` behaviour (a `Debug` log notes the fallback). The baseline match is supported for **integer, `YEAR`, `DECIMAL`/`NUMERIC`, string (`CHAR`/`VARCHAR`/`TEXT`/`ENUM`/`SET`), and `DATETIME`/`TIMESTAMP`/`DATE` PKs** (the shim pins the DuckDB session to UTC so temporal-PK matches resolve deterministically on any host timezone). **`FLOAT`/`DOUBLE`, `BINARY`/`VARBINARY`/`BLOB`, `BIT`, `JSON`, and spatial PK types fall back to binlog-only with a `Warn`** (their Parquet representation doesn't match reliably against a string literal); a table with no primary key in the indexed snapshot also falls back. For tables keyed by an unsupported PK type, or to write the reconstructed table to mydumper-format files, use the offline `bintrail reconstruct` command. Full-table `_snapshot` buffers the reconstructed table in memory and is bounded by the same row cap as `_flashback` (see the next limitation).
 - **Full-table reconstruction is buffered, not streamed.** The MVP buffers up to 100,000 rows per query and surfaces overflow as `ER_TOO_BIG_SELECT` (1104). A streaming wire-protocol path (no row cap) is deferred until an operator reports the cap as a real bottleneck. PK-filtered point-lookups are unaffected.
 - **No JOINs, aggregations, or non-PK WHERE filters inside the shim.** Run them outside on the resultset (`duckdb`, `pandas`, `awk`). The shim's job is to deliver correct historical row state; SQL execution against that state is the operator's tool of choice.
-- **ProxySQL itself is not provisioned by bintrail.** `bintrail proxysql-config` only writes routing rules; you install and harden ProxySQL itself (admin password, frontend TLS, monitoring) using the standard ProxySQL docs.
+- **ProxySQL itself is not provisioned by dbtrail.** `bintrail proxysql-config` only writes routing rules; you install and harden ProxySQL itself (admin password, frontend TLS, monitoring) using the standard ProxySQL docs.
 - **The bare `AS OF` rule (990006) has a small residual false-positive surface.** The rule is end-anchored — only statements that *finish* with `AS OF '<text>'` route to the shim, so `AS OF` inside a string literal mid-query stays on passthrough (covered by an e2e guard test against real ProxySQL). The irreducible residue: a benign statement whose **final token** is a string literal of the exact form `AS OF '<text>'` would route to the shim and fail (the shim has no passthrough). If you hit that in practice, parenthesise or reorder the predicate — or delete rule 990006 from `mysql_query_rules` and use the `_flashback.`/hint forms instead. Note ProxySQL's `$` anchor assumes the default `re_modifiers` (CASELESS, no multiline); adding `GLOBAL`/multiline modifiers to the rule weakens the anchor to end-of-line.
 - **The bare `AS OF` form is `*`-only and trailing-only.** Column lists stay on the `_flashback`/`_snapshot` virtual schemas, and the AS OF clause must end the statement (an AS-OF-before-WHERE variant would forfeit the end anchor — the false-positive defense above). The bare form rewrites to `_flashback` (binlog-only); for baseline-aware lookups use `_snapshot`.
