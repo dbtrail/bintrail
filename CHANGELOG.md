@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING (console auth) — username+password is now the only login path; the access token is opt-in automation only.** This supersedes the additive token-or-password model from 0.11.0. On a fresh console the **first browser visit creates the password** (a loopback-only, self-disabling `POST /api/auth/setup` endpoint); every later visit signs in. **No access token is generated anymore** — set `--token` / `CONSOLE_TOKEN` explicitly only if a script needs the console API. A non-loopback bind with no credential is refused unless you set a password, a token, or `--allow-setup` (asserting the bind is access-controlled — what the Docker stack does, since it binds `0.0.0.0` in the container but publishes on the host's loopback). The Docker Compose entrypoint no longer generates or persists a token; on first `up` you create the password in the browser.
+  - **Upgrading from 0.11.0?** If you used a password, nothing changes (you get the login form). If you relied on the auto-generated compose token (a bookmarked `?token=` URL, or token-based API automation with no explicit `CONSOLE_TOKEN`), that token is gone after this upgrade: the browser lands on the create-password screen instead, and automation must now pin `CONSOLE_TOKEN` in `.env`. Reset a forgotten password from the host shell: `docker compose exec -it bintrail bintrail-console user set-password`.
+- New flag/env `--allow-setup` / `BINTRAIL_CONSOLE_ALLOW_SETUP` (on `serve` and `watch`) permits browser first-run setup on a non-loopback bind that is access-controlled by other means; a loud startup warning fires while setup is open off-loopback.
+
 ### Fixed
-- **The console sign-in overlay no longer renders with its text clipped** (#452). The login gate and password dialog (new in 0.11.0) appended their content directly to a panel whose padding lived on sub-elements they didn't use, so the text jammed against the edges and `overflow: hidden` clipped it. The panel now carries its own padding, and a 401 in token mode reads "This access token is no longer valid." instead of the session-flavored "Session expired — sign in again" (token mode has no session).
+- **The console sign-in overlay no longer renders with its text clipped, and the login form is tightened** (#452, #453). The login gate and password dialog (new in 0.11.0) appended their content directly to a panel whose padding lived on sub-elements they didn't use, so the text jammed against the edges and `overflow: hidden` clipped it; the panel now carries its own padding. The submit button is full-width and the status message uses the UI font (not the servers-form monospace), and a 401 in token mode reads "This access token is no longer valid." instead of the session-flavored "Session expired" (token mode has no session).
 
 ## [0.11.0] - 2026-06-10
 

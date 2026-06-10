@@ -66,10 +66,10 @@ docker compose exec -it bintrail bintrail-console user set-password
 ```
 
 To reach the console from another machine, **set the password from the shell
-first** (off-loopback browser setup is refused), then publish the port —
-ideally behind TLS. The [console guide](docs/console.md#password-login) has the
-full auth, TLS, and reverse-proxy options (plus an opt-in API token for
-automation).
+first** — until one exists, exposing the port would expose the create-password
+screen — then publish the port, ideally behind TLS. The
+[console guide](docs/console.md#password-login) has the full auth, TLS, and
+reverse-proxy options (plus an opt-in API token for automation).
 
 > The compose stack ships a pinned **MySQL 8.4** container as the index store.
 > That index holds the forensic record — **it is your system of record, so

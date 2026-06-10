@@ -29,9 +29,12 @@ console NEVER executes SQL; recover produces a script you review and apply
 yourself.
 
 Security:
-  - Binds to loopback (127.0.0.1) by default and requires an access token.
-  - A token is auto-generated for loopback binds and printed in the URL.
-  - Binding to a non-loopback address REQUIRES an explicit --token.
+  - Binds to loopback (127.0.0.1) by default. Username+password login is the
+    primary credential: on a fresh loopback console the first visit creates
+    the password in the browser (or set it up front with 'user set-password').
+  - A non-loopback bind needs a credential: a configured password, an explicit
+    --token (opt-in automation), or --allow-setup (assert the bind is
+    access-controlled) — otherwise it is refused.
 
 Example:
   bintrail-console serve --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"`,
@@ -57,7 +60,7 @@ var (
 func init() {
 	serveCmd.Flags().StringVar(&conIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required unless the server registry has entries)")
 	serveCmd.Flags().StringVar(&conListen, "listen", "127.0.0.1:8090", "Address to listen on (host:port)")
-	serveCmd.Flags().StringVar(&conToken, "token", "", "Access token (auto-generated for loopback binds when empty)")
+	serveCmd.Flags().StringVar(&conToken, "token", "", "Opt-in static token for API automation (never generated; humans use the console password)")
 	serveCmd.Flags().BoolVar(&conNoArchive, "no-archive", false, "Disable Parquet archive auto-discovery (MySQL-only)")
 	serveCmd.Flags().StringVar(&conProfile, "profile", "", "RBAC profile: deny tables / redact columns; forces --no-archive")
 	serveCmd.Flags().StringSliceVar(&conAllowedHosts, "allowed-hosts", nil, "Extra hostnames allowed in the Host header (for reverse-proxy setups; IP literals and localhost are always allowed)")

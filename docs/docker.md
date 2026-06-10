@@ -149,11 +149,13 @@ Notes:
   same machine is reachable from inside Docker as `host.docker.internal`.
 - The console is published on the **host loopback only** (`127.0.0.1:8090`),
   which is why first-run browser setup is allowed (the compose sets
-  `BINTRAIL_CONSOLE_ALLOW_SETUP` because the container itself binds
-  `0.0.0.0`). To reach it from another machine, **set the password from the
-  shell first** (`docker compose exec -it bintrail bintrail-console
-  user set-password` — off-loopback browser setup is refused), then change the
-  port mapping to `"8090:8090"`, ideally behind TLS
+  `BINTRAIL_CONSOLE_ALLOW_SETUP` because the container itself binds `0.0.0.0`).
+  The setup screen self-disables the moment a password exists. To reach the
+  console from another machine, **set the password from the host shell first**
+  (`docker compose exec -it bintrail bintrail-console user set-password`) —
+  until you do, the compose stack would serve the create-password screen on
+  whatever you publish (a loud startup warning fires while it is open). Then
+  change the port mapping to `"8090:8090"`, ideally behind TLS
   (`BINTRAIL_CONSOLE_TLS_CERT`/`_TLS_KEY` or a TLS-terminating proxy).
 - The credential file lives at `/var/lib/bintrail/console-auth.yaml` in the
   `bintrail-state` volume. **Forgot the password?** Reset it with

@@ -197,7 +197,7 @@ the `monitor` capability is false and the verbs return 403 there.
 |---|---|---|
 | `--index-dsn` | — | DSN for the index MySQL database. Becomes the ephemeral `default` entry. Required only when the server registry is empty. |
 | `--listen` | `127.0.0.1:8090` | Bind address. `:8090` avoids the MCP server's `:8080`. |
-| `--token` | auto-generated | Access token. Auto-generated for loopback binds; **required** for non-loopback. |
+| `--token` | — (none) | Opt-in static token for API automation. **Never generated** — humans sign in with the console password. One of the credentials that makes a non-loopback bind legal. |
 | `--no-archive` | `false` | Disable Parquet archive auto-discovery (MySQL-only results). Also **disables Time-travel** — reconstruct needs archive access to verify coverage. |
 | `--profile` | — | RBAC profile: deny tables / redact columns. Forces `--no-archive` and **disables Time-travel** (baseline reads bypass redaction). |
 | `--allowed-hosts` | — | Extra hostnames accepted in the `Host` header (for reverse-proxy setups). IP literals and `localhost` are always allowed. |
