@@ -224,8 +224,7 @@ rotation…"** — without editing flags or restarting:
   applies to **every** index the daemon rotates (the boot index and every
   monitored source). Per-source retention is not offered — the schedule is one.
 - **Override vs default:** the saved policy lives in the local console registry
-  (`console-servers.yaml` — the only file the console writes, no version bump,
-  round-trips on older binaries). When nothing is saved the panel shows the
+  (`console-servers.yaml` — the only file the console writes). When nothing is saved the panel shows the
   daemon's `--rotate-retain` / `--rotate-interval` / `--rotate-add-future`
   (`BINTRAIL_ROTATE_*`) values as the **effective default**.
 - **Disabling** rotation entirely stays a daemon-level decision

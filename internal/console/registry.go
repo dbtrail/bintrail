@@ -105,10 +105,19 @@ type RotationConfig struct {
 type registryFile struct {
 	Version int `yaml:"version"`
 	// Rotation is the optional global rotation override (omitted when the
-	// daemon flags/env are in force). Additive — round-trips on older binaries
-	// without a version bump, same as ServerEntry's additive fields.
+	// daemon flags/env are in force). Additive at registryVersion 1 (no bump):
+	// binaries from this release on preserve it (this field, plus the Extra
+	// catch-all below for any future envelope key). A downgrade to a
+	// PRE-rotation binary that re-saves the file would drop it — the version
+	// gate, not round-tripping, is the cross-version safety net, since that
+	// older binary has neither this field nor the inline catch-all.
 	Rotation *RotationConfig `yaml:"rotation,omitempty"`
 	Servers  []ServerEntry   `yaml:"servers"`
+	// Extra preserves any FUTURE envelope-level key a (future) older binary
+	// doesn't model, exactly as ServerEntry.Extra does at the entry level — so
+	// the next additive envelope field is downgrade-safe from here on. (It does
+	// not retroactively help binaries released before it.)
+	Extra map[string]any `yaml:",inline"`
 }
 
 // Registry is the console's named-server store: a local YAML file, the ONLY

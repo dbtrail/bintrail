@@ -1534,7 +1534,7 @@ async function showRotationDialog() {
   foot.append(el("button", { class: "btn btn-ghost", type: "button", text: "Cancel", onclick: closeRotationDialog }));
   form.append(foot);
   form.append(msg);
-  form.addEventListener("submit", (e) => { e.preventDefault(); submitRotation(form, msg); });
+  form.addEventListener("submit", (e) => { e.preventDefault(); submitRotation(form, msg, cur.enabled); });
   modal.append(form);
 
   scrim.append(modal);
@@ -1544,7 +1544,7 @@ async function showRotationDialog() {
 
 function closeRotationDialog() { document.getElementById("modal").replaceChildren(); }
 
-async function submitRotation(form, msg) {
+async function submitRotation(form, msg, wasEnabled) {
   const body = {
     retain: form.elements.retain.value.trim(),
     interval: form.elements.interval.value.trim(),
@@ -1558,7 +1558,9 @@ async function submitRotation(form, msg) {
     return;
   }
   closeRotationDialog();
-  toast("Rotation settings saved");
+  // When the daemon booted with rotation off the loop isn't running, so the
+  // save is inert until a restart — say so rather than implying it took effect.
+  toast(wasEnabled ? "Rotation settings saved" : "Saved — rotation is off at the daemon; restart to apply");
 }
 
 async function refreshServersList() {

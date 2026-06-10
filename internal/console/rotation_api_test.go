@@ -45,6 +45,45 @@ func TestRotationGet_defaultThenOverride(t *testing.T) {
 	}
 }
 
+// TestRotationGet_overrideWhenDaemonOff: when the daemon booted with rotation
+// off, StartLoop runs no loop, so a saved override is dormant until a restart.
+// The override persists, but the API must NOT claim it is live (enabled:false) —
+// otherwise the panel would tell the operator rotation is bounded when the index
+// is in fact growing unbounded. Regression guard for the review finding.
+func TestRotationGet_overrideWhenDaemonOff(t *testing.T) {
+	srv, _ := newSupervisorServer(t)
+	srv.rotationDefaults = RotationDefaults{Retain: "off", Interval: "", AddFuture: 0, Enabled: false}
+
+	// Before any override, GET reports the off state.
+	_, body := doServersReq(t, srv, "GET", "/api/rotation", "")
+	var got rotationDTO
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled {
+		t.Fatalf("daemon booted off must report enabled:false, got %+v", got)
+	}
+
+	// The PUT is accepted (a supervisor is present) and persists...
+	rec, body := doServersReq(t, srv, "PUT", "/api/rotation", `{"retain":"7d","interval":"30m","add_future":5}`)
+	if rec.Code != 200 {
+		t.Fatalf("PUT code=%d body=%s", rec.Code, body)
+	}
+
+	// ...but GET must still report enabled:false — the loop never started, so the
+	// saved override does not apply until a restart.
+	_, body = doServersReq(t, srv, "GET", "/api/rotation", "")
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Source != "override" || got.Retain != "7d" {
+		t.Fatalf("override should be persisted: %+v", got)
+	}
+	if got.Enabled {
+		t.Error("a saved override on a daemon booted with rotation off must report enabled:false (loop not running until restart)")
+	}
+}
+
 // TestRotationUpdate_validation: a bad retain/interval/add_future is rejected at
 // the API boundary (400) rather than silently breaking a rotation cycle. "off"
 // is forbidden here — disabling rotation stays a daemon-level decision.

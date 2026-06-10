@@ -168,6 +168,43 @@ func TestStartLoop_rereadsSettingsEachCycle(t *testing.T) {
 	<-done
 }
 
+// TestStartLoop_liveIntervalRetune pins the headline feature: when the settings
+// provider returns a CHANGED interval mid-run, the loop re-tunes its ticker
+// (the ticker.Reset branch) rather than staying on the boot-time cadence —
+// otherwise a console interval edit would silently no-op until restart.
+// TestStartLoop_rereadsSettingsEachCycle returns a constant, so it can't cover
+// this branch.
+func TestStartLoop_liveIntervalRetune(t *testing.T) {
+	logs := captureSlog(t)
+	var calls atomic.Int32
+	settings := func() Settings {
+		n := calls.Add(1)
+		iv := 30 * time.Millisecond
+		if n >= 3 {
+			iv = 8 * time.Millisecond // shrink the interval after a couple reads
+		}
+		return Settings{
+			Enabled: true, Retain: 24 * time.Hour, RetainRaw: "24h",
+			Interval: iv, AddFuture: 0, Explicit: true,
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := StartLoop(ctx, settings, func() []RotateTarget { return nil })
+
+	deadline := time.After(5 * time.Second)
+	for !logs.has(slog.LevelInfo, "interval changed") {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("the ticker was never re-tuned after the provider changed the interval")
+		case <-time.After(3 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+}
+
 // TestStartLoop_escalatesAfterConsecutiveFailures exercises the detection half
 // of the data-loss story: a rotation that fails every cycle must escalate from
 // per-cycle Warns to an explicit Error after escalateAfter consecutive cycles —

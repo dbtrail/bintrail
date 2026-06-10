@@ -17,9 +17,12 @@ type rotationDTO struct {
 	// Source is "override" when the values come from a console-saved policy,
 	// "default" when they are the daemon's --rotate-* flags/env.
 	Source string `json:"source"`
-	// Enabled is false only when the daemon was started with rotation off and
-	// no override is saved — the loop is not running, so a saved change would
-	// need a restart. The UI warns in that state.
+	// Enabled reports whether the rotation loop is actually RUNNING — false when
+	// the daemon was started with rotation off (--rotate-retain off). The loop's
+	// run/skip decision is taken once at boot, so a saved override does NOT
+	// re-enable it (it stays dormant until a restart); Enabled is a property of
+	// that boot-time liveness, independent of whether an override exists. The UI
+	// warns that a restart is needed when this is false.
 	Enabled bool `json:"enabled"`
 }
 
@@ -38,18 +41,22 @@ func (s *Server) handleRotationGet(w http.ResponseWriter, r *http.Request) {
 }
 
 // effectiveRotation resolves the policy the daemon is actually running: a
-// console-saved override wins, else the injected daemon defaults.
+// console-saved override wins, else the injected daemon defaults. Enabled is
+// taken from the daemon's boot-time liveness (rotationDefaults.Enabled) in BOTH
+// branches — never forced true on override presence: a daemon booted with
+// rotation off runs no loop, so a saved override is dormant until a restart and
+// the panel must keep warning, not claim it is live.
 func (s *Server) effectiveRotation() rotationDTO {
+	d := s.rotationDefaults
 	if rc, ok := s.cm.reg.Rotation(); ok {
 		return rotationDTO{
 			Retain:    rc.Retain,
 			Interval:  rc.Interval,
 			AddFuture: rc.AddFuture,
 			Source:    "override",
-			Enabled:   true,
+			Enabled:   d.Enabled,
 		}
 	}
-	d := s.rotationDefaults
 	return rotationDTO{
 		Retain:    d.Retain,
 		Interval:  d.Interval,
