@@ -6,20 +6,6 @@ import (
 	"testing"
 )
 
-func TestGenerateToken(t *testing.T) {
-	a, err := generateToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(a) != 32 {
-		t.Errorf("token length = %d, want 32 hex chars", len(a))
-	}
-	b, _ := generateToken()
-	if a == b {
-		t.Error("two generated tokens should differ")
-	}
-}
-
 func TestIsLoopbackAddr(t *testing.T) {
 	cases := map[string]bool{
 		"127.0.0.1:8090":   true,

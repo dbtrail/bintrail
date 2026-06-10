@@ -318,6 +318,16 @@ async function submitSetup(form, msg) {
       body: JSON.stringify(body),
     });
   } catch (_) { loginMsg(msg, "Network error — is the console still running?"); return; }
+  if (res.status === 403) {
+    // Setup closed under us (a concurrent `user set-password`, another tab, or
+    // a CLI set it first). Unlike login, the setup endpoint self-disables —
+    // re-probe and switch the gate to the sign-in form instead of leaving the
+    // operator stuck re-posting to a now-closed endpoint.
+    let pw = false;
+    try { pw = !!(await fetchAuthInfo()).password_login; } catch (_) {}
+    showLoginOverlay({ passwordLogin: pw, message: "A password was already created — sign in." });
+    return;
+  }
   if (!res.ok) {
     let m = "Could not set the password.";
     try { m = (await res.json()).error || m; } catch (_) {}

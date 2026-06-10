@@ -76,14 +76,17 @@ func (s *Server) setupAllowed() bool {
 	return s.token == "" && !s.passwordLoginEnabled() && (isLoopbackAddr(s.listen) || s.allowSetup)
 }
 
-// handleSetup serves POST /api/auth/setup — the first-run, unauthenticated,
-// loopback-only password creation. It self-disables once a password exists.
+// handleSetup serves POST /api/auth/setup — the first-run, unauthenticated
+// password creation. It is gated by setupAllowed() (a loopback bind, OR a
+// non-loopback bind the operator asserted is access-controlled via
+// AllowSetup — the compose case) and self-disables the instant a password
+// exists.
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	if !s.setupAllowed() {
-		// Either a credential already exists or this is a non-loopback bind:
-		// creating the password is then a CLI (`user set-password`) or
-		// authenticated (change-password) action, never an open endpoint.
-		writeJSONError(w, http.StatusForbidden, "console setup is not available (a credential is already configured, or this bind is not loopback)")
+		// Either a credential already exists, or this bind is neither loopback
+		// nor marked --allow-setup. Creating the password is then a CLI
+		// (`user set-password`) or authenticated (change-password) action.
+		writeJSONError(w, http.StatusForbidden, "console setup is not available (a credential is already configured, or this bind is neither loopback nor marked --allow-setup)")
 		return
 	}
 	if !requireJSONBody(w, r) {
@@ -102,6 +105,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.loginLimiter.Fail(ip)
 		status := http.StatusBadRequest
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
@@ -111,6 +115,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := ValidateNewPassword(req.Password); err != nil {
+		s.loginLimiter.Fail(ip)
 		writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
@@ -119,6 +124,10 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "failed to write the auth file; see server log")
 		return
 	}
+	// A successful setup closes the endpoint anyway, but clear the IP's
+	// counters for parity with login/change-password (Allow() above only
+	// throttles when Fail() has populated the per-IP windows).
+	s.loginLimiter.Success(ip)
 	token, expires, err := s.sessions.Issue()
 	if err != nil {
 		slog.Error("console session issue failed after setup", "error", err)

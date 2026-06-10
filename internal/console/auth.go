@@ -2,24 +2,11 @@ package console
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/hex"
 	"net"
 	"net/http"
 	"strings"
 )
-
-// generateToken returns a cryptographically random 128-bit token rendered as
-// 32 lowercase hex characters. It is used to gate the API when the operator
-// does not supply an explicit token.
-func generateToken() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
-}
 
 // isLoopbackAddr reports whether a listen address binds only to the loopback
 // interface. An empty host or a wildcard (0.0.0.0 / ::) binds to every

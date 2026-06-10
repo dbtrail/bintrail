@@ -151,9 +151,9 @@ func New(cfg Config) (*Server, error) {
 	// token is an opt-in automation credential (set explicitly, never
 	// generated). With neither a token nor a password:
 	//   - loopback → first-run SETUP: no token is generated, and the
-	//     unauthenticated, loopback-only /api/auth/setup endpoint lets the
-	//     operator create the password in the browser. The rest of the API
-	//     stays locked (token "" + no session ⇒ 401) until they do.
+	//     unauthenticated /api/auth/setup endpoint lets the operator create the
+	//     password in the browser. The rest of the API stays locked (token "" +
+	//     no session ⇒ 401) until they do.
 	//   - non-loopback → refused: an unauthenticated setup endpoint off-host
 	//     would let the first stranger to reach it claim the password.
 	// An explicit token always stands; a configured password makes
@@ -327,10 +327,10 @@ func (s *Server) Token() string { return s.token }
 func (s *Server) PasswordLogin() bool { return s.passwordCfg }
 
 // NeedsSetup reports whether the console is in first-run setup: no credential
-// at all on a loopback bind, so the operator must create a password in the
-// browser (via the unauthenticated, loopback-only /api/auth/setup endpoint).
-// The cmd layer uses it to print "create your password" instead of a URL with
-// a token.
+// at all, on a loopback bind (or a non-loopback bind the operator marked
+// access-controlled via --allow-setup), so the operator must create a password
+// in the browser (via the unauthenticated /api/auth/setup endpoint). The cmd
+// layer uses it to print "create your password" instead of a URL with a token.
 func (s *Server) NeedsSetup() bool { return s.setupAllowed() }
 
 // URL returns the bootstrap URL the operator opens in a browser. Token mode
