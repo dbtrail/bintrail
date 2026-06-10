@@ -1080,7 +1080,9 @@ function wireSchemaCascade(root) {
 async function gateCapabilities() {
   const gen = serverGen;
   let caps = {};
-  try { caps = await api("/api/capabilities"); } catch (_) { caps = {}; }
+  // Degrading to {} hides capability-gated UI (Time-travel tab, the source
+  // section of the server form) — warn so a wrongly-shaped UI is diagnosable.
+  try { caps = await api("/api/capabilities"); } catch (err) { console.warn("capabilities check failed; UI degrades to no-capability gating", err); caps = {}; }
   if (gen !== serverGen) return;
   capsCache = caps || {};
   $all("[data-capability]").forEach((node) => node.classList.toggle("cap-on", !!capsCache[node.dataset.capability]));
@@ -1224,7 +1226,7 @@ function buildServerForm() {
 
   const mon = el("fieldset", { class: "form-section", "data-capability": "monitor" });
   mon.append(el("legend", { class: "form-legend", text: "Monitor a source MySQL" }));
-  mon.append(el("p", { class: "form-hint", text: "Paste the server to watch — dbtrail runs the preflight checks, provisions an index database for it automatically, and starts streaming. Nothing else to fill in." }));
+  mon.append(el("p", { class: "form-hint", text: "Paste the server to watch — dbtrail runs the preflight checks, provisions an index database for it automatically, and starts streaming. Nothing else to fill in beyond a name." }));
   const monGrid = el("div", { class: "form-grid" });
   monGrid.append(srvField("Source host", "source_host", { placeholder: "db.example.com" }));
   monGrid.append(srvField("Source port", "source_port", { placeholder: "3306" }));
@@ -1234,9 +1236,9 @@ function buildServerForm() {
   mon.append(monGrid);
   form.append(mon);
 
-  // BYO index is the advanced path: collapsed by default where monitoring is
-  // available; showServerForm opens it in serve-only mode (where it is the
-  // whole form) and when editing an entry that already carries index fields.
+  // BYO index is the advanced path — collapsed behind a <details> so the
+  // monitor-first form stays one field + source. Open/close rules live in
+  // showServerForm.
   const adv = el("details", { class: "form-advanced", id: "server-advanced" });
   adv.append(el("summary", { class: "form-adv-summary", text: "Advanced — bring your own index (optional)" }));
   const idx = el("fieldset", { class: "form-section" });
@@ -1276,9 +1278,12 @@ function showServerForm(prefill) {
   form.addEventListener("submit", (e) => { e.preventDefault(); saveServer(form); });
 
   // Where the index connection is the whole form (serve-only process: no
-  // monitor capability), or the entry being edited already carries index
-  // fields, the "advanced" block must start expanded — and in serve-only
-  // mode there is nothing to collapse it back to, so the toggle hides.
+  // monitor capability), or the entry being edited carries index fields,
+  // the "advanced" block must start expanded — and in serve-only mode
+  // there is nothing to collapse it back to, so the toggle hides. Note a
+  // monitor-first save also ends with index fields (the derived index DSN
+  // round-trips as host/dbname in the DTO), so "collapsed by default"
+  // means a fresh add; editing any saved entry shows its index.
   const adv = $("#server-advanced", form);
   const hasIndexFields = !!(prefill && (prefill.host || prefill.dbname || prefill.baseline_dir || prefill.baseline_s3 || prefill.no_archive));
   adv.open = !capsCache.monitor || hasIndexFields;
@@ -1325,11 +1330,13 @@ function serverFormBody(form) {
 }
 
 async function editServer(id) {
-  try {
-    const s = await api("/api/servers/" + encodeURIComponent(id));
-    showServerForm(s);
-    return true;
-  } catch (err) { toast("failed to load server: " + ((err && err.message) || err)); return false; }
+  // Catch only the fetch: a render throw from showServerForm must surface
+  // as an uncaught error, not masquerade as "failed to load server".
+  let s;
+  try { s = await api("/api/servers/" + encodeURIComponent(id)); }
+  catch (err) { toast("failed to load server: " + ((err && err.message) || err)); return false; }
+  showServerForm(s);
+  return true;
 }
 
 async function saveServer(form) {
