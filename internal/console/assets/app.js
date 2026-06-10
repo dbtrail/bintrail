@@ -1216,9 +1216,15 @@ function buildServerForm() {
   const form = el("form", { class: "filters", id: "server-form", style: "display:block;margin-top:18px" });
   form.append(el("input", { type: "hidden", name: "id" }));
 
+  // Name is the one field every entry needs, whatever the path — keep it out
+  // of both sections so the index section reads as fully optional.
+  const top = el("div", { class: "form-grid" });
+  top.append(srvField("Name", "name", { placeholder: "prod-db-01" }));
+  form.append(top);
+
   const mon = el("fieldset", { class: "form-section", "data-capability": "monitor" });
   mon.append(el("legend", { class: "form-legend", text: "Monitor a source MySQL" }));
-  mon.append(el("p", { class: "form-hint", text: "Paste the server to watch — dbtrail runs the preflight checks, provisions an index for it, and starts streaming. Leave the index section empty; it is created automatically." }));
+  mon.append(el("p", { class: "form-hint", text: "Paste the server to watch — dbtrail runs the preflight checks, provisions an index database for it automatically, and starts streaming. Nothing else to fill in." }));
   const monGrid = el("div", { class: "form-grid" });
   monGrid.append(srvField("Source host", "source_host", { placeholder: "db.example.com" }));
   monGrid.append(srvField("Source port", "source_port", { placeholder: "3306" }));
@@ -1228,10 +1234,14 @@ function buildServerForm() {
   mon.append(monGrid);
   form.append(mon);
 
+  // BYO index is the advanced path: collapsed by default where monitoring is
+  // available; showServerForm opens it in serve-only mode (where it is the
+  // whole form) and when editing an entry that already carries index fields.
+  const adv = el("details", { class: "form-advanced", id: "server-advanced" });
+  adv.append(el("summary", { class: "form-adv-summary", text: "Advanced — bring your own index (optional)" }));
   const idx = el("fieldset", { class: "form-section" });
   idx.append(el("legend", { class: "form-legend", text: "Index connection" }));
   const idxGrid = el("div", { class: "form-grid" });
-  idxGrid.append(srvField("Name", "name", { placeholder: "prod-db-01" }));
   idxGrid.append(srvField("Host", "host", { placeholder: "127.0.0.1" }));
   idxGrid.append(srvField("Port", "port", { placeholder: "3306" }));
   idxGrid.append(srvField("User", "user", { placeholder: "bintrail" }));
@@ -1242,7 +1252,8 @@ function buildServerForm() {
   idx.append(idxGrid);
   idx.append(el("label", { class: "check", style: "margin-top:10px" },
     el("input", { type: "checkbox", name: "no_archive" }), el("span", { text: "Disable archive auto-discovery" })));
-  form.append(idx);
+  adv.append(idx);
+  form.append(adv);
 
   const foot = el("div", { class: "modal-foot filter-actions" });
   foot.append(el("button", { class: "btn btn-primary", type: "submit", text: "Save" }));
@@ -1263,6 +1274,15 @@ function showServerForm(prefill) {
   $("#server-cancel", form).addEventListener("click", hideServerForm);
   $("#server-test", form).addEventListener("click", () => testServerForm(form));
   form.addEventListener("submit", (e) => { e.preventDefault(); saveServer(form); });
+
+  // Where the index connection is the whole form (serve-only process: no
+  // monitor capability), or the entry being edited already carries index
+  // fields, the "advanced" block must start expanded — and in serve-only
+  // mode there is nothing to collapse it back to, so the toggle hides.
+  const adv = $("#server-advanced", form);
+  const hasIndexFields = !!(prefill && (prefill.host || prefill.dbname || prefill.baseline_dir || prefill.baseline_s3 || prefill.no_archive));
+  adv.open = !capsCache.monitor || hasIndexFields;
+  $(".form-adv-summary", adv).hidden = !capsCache.monitor;
 
   if (prefill) {
     form.elements.id.value = prefill.id || "";

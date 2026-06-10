@@ -825,6 +825,14 @@ button { font-family: inherit; }
   color: var(--blue); padding: 0 6px; margin-left: 6px;
 }
 .form-hint { color: var(--ink-2); font-size: 12.5px; margin: 4px 0 16px; }
+.form-advanced { margin-top: 18px; }
+.form-adv-summary {
+  cursor: pointer; user-select: none;
+  font-family: var(--f-mono); font-size: 11px; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2);
+}
+.form-adv-summary:hover, .form-advanced[open] > .form-adv-summary { color: var(--blue); }
+.form-adv-summary[hidden] { display: none; }
 .form-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
 .form-grid .field { width: auto; }
 .form-grid.two { grid-template-columns: repeat(2, 1fr); }
