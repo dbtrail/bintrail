@@ -1102,9 +1102,15 @@ button { font-family: inherit; }
    session — a static token has nothing to log out of. */
 [data-auth]:not(.auth-on) { display: none !important; }
 
-/* login overlay + password dialog (mounted in #login-mount) */
-.login-panel { max-width: 380px; }
-.login-form { display: flex; flex-direction: column; gap: 14px; margin-top: 16px; }
+/* login overlay + password dialog (mounted in #login-mount). Unlike the
+   servers modal these panels hold their content DIRECTLY (no .modal-head/
+   .modal-body), so the panel itself carries the padding — without it .modal's
+   overflow:hidden clips the text against the edges. */
+.login-panel { max-width: 400px; padding: 30px 32px; }
+.login-panel .modal-title { margin-bottom: 12px; }
+.login-panel .modal-desc { max-width: none; }
+.login-panel .modal-desc + .modal-desc { margin-top: 10px; }
+.login-form { display: flex; flex-direction: column; gap: 14px; margin-top: 18px; }
 .login-form .field { width: auto; }
 
 /* result/meta lines reused across Events, Recover, Reconstruct */

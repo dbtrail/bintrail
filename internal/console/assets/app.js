@@ -207,7 +207,10 @@ async function handleUnauthorized() {
   clearAuthState();
   let pw = false;
   try { pw = !!(await fetchAuthInfo()).password_login; } catch (_) {}
-  showLoginOverlay({ passwordLogin: pw, message: "Session expired — sign in again." });
+  // Token mode has no session to expire and no form to "sign in" to — say what
+  // actually happened (the stored token is no longer accepted).
+  const msg = pw ? "Session expired — sign in again." : "This access token is no longer valid.";
+  showLoginOverlay({ passwordLogin: pw, message: msg });
 }
 
 // clearAuthState drops every credential-scoped cache on sign-out. capsCache
