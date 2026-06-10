@@ -1112,6 +1112,13 @@ button { font-family: inherit; }
 .login-panel .modal-desc + .modal-desc { margin-top: 10px; }
 .login-form { display: flex; flex-direction: column; gap: 14px; margin-top: 18px; }
 .login-form .field { width: auto; }
+/* The login/password dialogs are compact: drop the wide servers-modal foot
+   spacing, make the submit full-width (it reads as intentional, not stranded),
+   and give the message the UI font — the mono .form-msg is for the servers
+   form's technical/DSN errors, not a friendly "Signed out." here. */
+.login-form .modal-foot { margin-top: 4px; }
+.login-form .modal-foot .btn { flex: 1; }
+.login-panel .form-msg { font-family: var(--f-ui); font-size: 13px; margin-top: 6px; }
 
 /* result/meta lines reused across Events, Recover, Reconstruct */
 .meta-line {
