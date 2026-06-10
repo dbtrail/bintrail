@@ -51,6 +51,7 @@ var (
 	conAuthFile     string
 	conTLSCert      string
 	conTLSKey       string
+	conAllowSetup   bool
 )
 
 func init() {
@@ -66,6 +67,7 @@ func init() {
 	serveCmd.Flags().StringVar(&conAuthFile, "auth-file", "", "Path to the console auth file enabling password login (default ~/.config/bintrail/console-auth.yaml; created with `bintrail-console user set-password`)")
 	serveCmd.Flags().StringVar(&conTLSCert, "tls-cert", "", "TLS certificate file (PEM); serve the console over HTTPS (requires --tls-key)")
 	serveCmd.Flags().StringVar(&conTLSKey, "tls-key", "", "TLS private key file (PEM; requires --tls-cert)")
+	serveCmd.Flags().BoolVar(&conAllowSetup, "allow-setup", false, "Allow browser first-run password setup on a non-loopback bind (assert the bind is access-controlled, e.g. published only on the host loopback)")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -127,6 +129,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if !cmd.Flags().Changed("allowed-hosts") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_ALLOWED_HOSTS"); v != "" {
 			conAllowedHosts = strings.Split(v, ",")
+		}
+	}
+	if !cmd.Flags().Changed("allow-setup") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_ALLOW_SETUP"); v == "1" || v == "true" {
+			conAllowSetup = true
 		}
 	}
 
@@ -214,6 +221,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		AuthPath:      conAuthFile,
 		TLSCert:       conTLSCert,
 		TLSKey:        conTLSKey,
+		AllowSetup:    conAllowSetup,
 		// MonitorCtrl is intentionally left nil: bintrail-console serve is the
 		// read-only standalone console. A write-capable control-plane daemon
 		// wires a supervisor here instead; with nil, /api/capabilities reports
@@ -235,14 +243,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// printConsoleBanner prints the startup URL. In password mode the URL carries
-// no ?token= (URL() already omits it — a live credential does not belong in
-// logs or shell history) and the sign-in hint is printed instead; an
-// explicitly configured token stays valid for automation but its value is
-// never echoed.
+// printConsoleBanner prints the startup URL plus a credential hint keyed to
+// the console's mode. The URL never carries a ?token= unless an explicit token
+// is the only credential (URL() handles that); a live credential does not
+// belong in logs or shell history.
 func printConsoleBanner(srv *console.Server, headline string) {
 	fmt.Fprintf(os.Stderr, "\n%s\n\n    %s\n\n", headline, srv.URL())
-	if srv.PasswordLogin() {
+	switch {
+	case srv.NeedsSetup():
+		// First run, loopback, no credential: the browser creates the password.
+		fmt.Fprintf(os.Stderr, "First run — open the URL and create your console username and password.\n\n")
+	case srv.PasswordLogin():
 		fmt.Fprintf(os.Stderr, "Sign in with your console username and password.\n")
 		if srv.Token() != "" {
 			fmt.Fprintf(os.Stderr, "(The configured access token also remains valid, for API automation.)\n")

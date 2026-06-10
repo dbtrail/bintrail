@@ -45,36 +45,31 @@ exact fix for anything missing.
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
 docker compose up -d
-docker compose logs -f bintrail
 ```
 
-Nothing to configure. The logs end with your console URL:
+Open **http://127.0.0.1:8090** — on first run the console asks you to **create
+a username and password**. That's your login from now on.
 
-```
-Console is running — open it and add the MySQL servers to watch:
+Then click **+ Add server**: paste the MySQL you want to watch — host, user,
+password — and dbtrail runs the preflight checks (failures come back as
+fix-this cards), provisions an index for it, and starts streaming. Watching
+events within the minute, and the terminal is already behind you.
 
-    http://127.0.0.1:8090/?token=ab12cd34…
-```
+The console binds to your machine only (`127.0.0.1`); your password persists in
+the stack's volume, so every later visit is a normal sign-in.
 
-Open it and click **+ Add server**: paste the MySQL you want to watch —
-host, user, password — and dbtrail runs the preflight checks (failures come
-back as fix-this cards), provisions an index for it, and starts streaming.
-Watching events within the minute, and the terminal is already behind you.
-
-The console binds to your machine only (`127.0.0.1`) and every request needs
-the access token — generated once and kept in the stack's volume, so the URL
-stays valid across restarts. Prefer signing in with a username and password?
-Set one and a login form replaces the token URL on your next visit (no
-restart needed):
+**Forgot the password?** Reset it from the host shell — re-running this
+overwrites it, no data lost:
 
 ```sh
 docker compose exec -it bintrail bintrail-console user set-password
 ```
 
-To reach the console from another machine, set a credential (the password
-above — ideally behind TLS) and publish the port; the
-[console guide](docs/console.md#password-login) has the full auth, TLS, and
-reverse-proxy options.
+To reach the console from another machine, **set the password from the shell
+first** (off-loopback browser setup is refused), then publish the port —
+ideally behind TLS. The [console guide](docs/console.md#password-login) has the
+full auth, TLS, and reverse-proxy options (plus an opt-in API token for
+automation).
 
 > The compose stack ships a pinned **MySQL 8.4** container as the index store.
 > That index holds the forensic record — **it is your system of record, so

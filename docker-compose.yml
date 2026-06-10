@@ -1,21 +1,22 @@
 # Bintrail Docker Compose — the zero-friction quickstart.
 #
 #   1. docker compose up -d
-#   2. docker compose logs -f bintrail   # open the printed console URL
+#   2. Open http://127.0.0.1:8090 and create your console username + password
 #   3. In the console: "+ Add server" — paste the MySQL to watch; bintrail
 #      runs the preflight, provisions an index for it, and starts streaming.
 #
-# No .env needed. Optionally set SOURCE_DSN (start streaming one source
-# immediately) or CONSOLE_TOKEN (pin your own token) in a .env. The generated
-# token persists in the bintrail-state volume, so it is stable across
-# restarts either way. Prefer a username+password login instead? Run:
+# No .env needed. On first run the console asks you to create a username and
+# password (it persists in the bintrail-state volume); every later visit is a
+# normal sign-in. Forgot it? Reset from the host shell:
 #   docker compose exec -it bintrail bintrail-console user set-password
+# Optionally set SOURCE_DSN (start streaming one source immediately) in a .env.
+# CONSOLE_TOKEN is an opt-in API-automation credential — set it only if a
+# script needs the console API; humans sign in with the password.
 #
 # What you get: a bundled MySQL 8.4 index (persisted in a volume), the
 # `bintrail-console watch` daemon against your source (preflight → index
 # tables → schema snapshot → live binlog stream → built-in rotation), and the
-# web console on http://127.0.0.1:8090 with the access token printed in the
-# logs.
+# web console on http://127.0.0.1:8090.
 #
 # === THE INDEX VOLUME IS YOUR SYSTEM OF RECORD ===
 # The bundled index holds the forensic record (binlog_events with full
@@ -138,11 +139,12 @@ services:
     #   context: .
     #   dockerfile: Dockerfile.bintrail-console
     ports:
-      # Console on the host loopback only. To reach it from another machine,
-      # change to "8090:8090" AND set a credential: a console password
+      # Console on the host loopback only — first-run password setup is allowed
+      # because reaching loopback already implies local access. To reach it from
+      # another machine, first create the password from the host shell
       # (docker compose exec -it bintrail bintrail-console user set-password —
-      # ideally behind TLS or a TLS-terminating proxy) or a stable
-      # CONSOLE_TOKEN in .env.
+      # off-loopback setup is refused), THEN change to "8090:8090", ideally
+      # behind TLS or a TLS-terminating proxy.
       - "127.0.0.1:8090:8090"
     environment:
       # Optional: a source MySQL to start watching immediately. Leave unset
@@ -160,12 +162,18 @@ services:
       BINTRAIL_CONSOLE_TOKEN: ${CONSOLE_TOKEN:-}
       # Saved console connections persist across container recreations.
       BINTRAIL_CONSOLE_SERVERS: /var/lib/bintrail/console-servers.yaml
-      # Optional password login (persists next to the registry). Enable it
-      # with: docker compose exec -it bintrail bintrail-console user set-password
-      # The running daemon honors it on the next login — no restart needed.
+      # Password login (persists next to the registry). On first run the
+      # console serves a "create your password" screen; later visits sign in.
       # There is deliberately NO password env var: docker inspect must never
       # be able to print a credential.
       BINTRAIL_CONSOLE_AUTH: /var/lib/bintrail/console-auth.yaml
+      # The console binds 0.0.0.0 INSIDE the container, but the `ports` mapping
+      # above publishes it on the host's loopback only — so first-run setup is
+      # access-controlled in the default stack. The container can't see the
+      # host mapping, so we assert it here. If you change `ports` to expose the
+      # console (e.g. "8090:8090"), set the password from the host shell FIRST
+      # (docker compose exec … user set-password) before exposing it.
+      BINTRAIL_CONSOLE_ALLOW_SETUP: "1"
     volumes:
       - bintrail-state:/var/lib/bintrail
       - bintrail-index-secret:/run/secret:ro
@@ -181,29 +189,12 @@ services:
         if [ -z "$$INDEX_DSN" ]; then
           INDEX_DSN="root:$$(cat /run/secret/index_password)@tcp(index-mysql:3306)/bintrail_index"
         fi
-        # A non-loopback console bind requires a credential. When CONSOLE_TOKEN
-        # isn't pinned in .env, generate a token ONCE and persist it in the
-        # bintrail-state volume — restarts and recreations keep the same token,
-        # so bookmarked ?token= URLs and automation survive redeploys. (umask
-        # before the write: the file must never be world-readable, even
-        # pre-chmod. The -s guard copies index-init's dash-has-no-pipefail
-        # defense: an empty token file must abort, not 401 everything.)
-        if [ -z "$$BINTRAIL_CONSOLE_TOKEN" ]; then
-          tf=/var/lib/bintrail/console_token
-          if [ ! -s "$$tf" ]; then
-            (umask 077; od -An -N16 -tx1 /dev/urandom | tr -d ' \n' > "$$tf")
-            if [ ! -s "$$tf" ]; then echo "FATAL: failed to generate the console token" >&2; rm -f "$$tf"; exit 1; fi
-            echo "Generated console token (persisted in the bintrail-state volume; set CONSOLE_TOKEN in .env to override)"
-          fi
-          # Plain assignment, like the INDEX_DSN block above: under `set -e` it
-          # propagates a failed `cat` (e.g. an unreadable root-owned token file
-          # after a user: override) and aborts loud. `export VAR="$(cat …)"`
-          # would discard the substitution's exit status and export an EMPTY
-          # token — which boots password-only or crash-loops, never naming the
-          # culprit.
-          BINTRAIL_CONSOLE_TOKEN="$$(cat "$$tf")"
-          export BINTRAIL_CONSOLE_TOKEN
-        fi
+        # No token is generated: the console binds to loopback, so first run is
+        # password SETUP — open the printed URL and create your console
+        # username and password (it persists in the bintrail-state volume next
+        # to the server registry). CONSOLE_TOKEN in .env is an opt-in API
+        # automation credential, passed through via the environment above; it
+        # is not generated for you.
         if [ -n "$$SOURCE_DSN" ] && [ -n "$$SCHEMAS" ]; then
           exec bintrail-console watch --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN" --schemas "$$SCHEMAS"
         elif [ -n "$$SOURCE_DSN" ]; then

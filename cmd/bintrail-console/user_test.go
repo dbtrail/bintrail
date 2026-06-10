@@ -194,3 +194,37 @@ func TestWatchAllowedHostsEnvFallback(t *testing.T) {
 		t.Errorf("allowed-hosts from env = %v, want [console.internal proxy.example]", upConsoleAllowedHost)
 	}
 }
+
+// TestAllowSetupEnvFallback covers BINTRAIL_CONSOLE_ALLOW_SETUP on both serve
+// and watch (the compose sets it so first-run setup works behind the
+// container's 0.0.0.0 bind / host-loopback publish).
+func TestAllowSetupEnvFallback(t *testing.T) {
+	t.Run("serve", func(t *testing.T) {
+		conIndexDSN, conProfile, conBaselineDir, conBaselineS3 = "", "", "", ""
+		conAllowSetup = false
+		conServersFile = filepath.Join(t.TempDir(), "servers.yaml")
+		t.Cleanup(func() { conIndexDSN, conServersFile, conAllowSetup = "", "", false })
+		t.Setenv("BINTRAIL_INDEX_DSN", "")
+		t.Setenv("BINTRAIL_CONSOLE_SERVERS", "")
+		t.Setenv("BINTRAIL_CONSOLE_ALLOW_SETUP", "1")
+		_ = runServe(serveCmd, nil) // errors on the empty-DSN guard; env runs first
+		if !conAllowSetup {
+			t.Error("BINTRAIL_CONSOLE_ALLOW_SETUP=1 not consumed by runServe")
+		}
+	})
+	t.Run("watch", func(t *testing.T) {
+		saved := upConsoleAllowSetup
+		t.Cleanup(func() { upConsoleAllowSetup = saved })
+		if watchCmd.Flags().Lookup("console-allow-setup") == nil {
+			t.Fatal("flag --console-allow-setup not registered on watchCmd")
+		}
+		cmd := &cobra.Command{}
+		cmd.Flags().BoolVar(&upConsoleAllowSetup, "console-allow-setup", false, "")
+		t.Setenv("BINTRAIL_CONSOLE_ALLOW_SETUP", "true")
+		upConsoleAllowSetup = false
+		resolveUpConsoleEnv(cmd)
+		if !upConsoleAllowSetup {
+			t.Error("BINTRAIL_CONSOLE_ALLOW_SETUP=true not consumed by resolveUpConsoleEnv")
+		}
+	})
+}

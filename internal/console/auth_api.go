@@ -41,12 +41,16 @@ func requireJSONBody(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // handleAuthInfo serves GET /api/auth — unauthenticated (root mux, like
-// healthz; hostGuard still applies). It reveals only whether password login
-// exists, which the login form's existence would reveal anyway. The file is
-// statted per request so `user set-password` against a live server lights the
-// login form up without a restart.
+// healthz; hostGuard still applies). It reveals whether password login exists
+// (which the login form's existence would reveal anyway) and whether the
+// console is in first-run setup, so the SPA shows the create-password screen.
+// The file is statted per request so `user set-password` against a live server
+// lights the login form up without a restart.
 func (s *Server) handleAuthInfo(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{"password_login": s.passwordLoginEnabled()})
+	writeJSON(w, http.StatusOK, map[string]bool{
+		"password_login": s.passwordLoginEnabled(),
+		"setup":          s.setupAllowed(),
+	})
 }
 
 // passwordLoginEnabled re-checks the auth file at call time. A corrupt file
@@ -58,6 +62,74 @@ func (s *Server) passwordLoginEnabled() bool {
 	}
 	a, err := LoadAuthFile(s.authPath)
 	return err != nil || a != nil
+}
+
+// setupAllowed reports whether first-run setup is open: no static token, no
+// password yet, and either a loopback bind or an explicit AllowSetup assertion
+// (the compose case — 0.0.0.0 inside the container, host-loopback published).
+// Re-evaluated live (passwordLoginEnabled stats the file), so the moment a
+// password exists — set in the browser or via the CLI — the unauthenticated
+// /api/auth/setup endpoint self-disables. The loopback-or-AllowSetup gate is
+// the load-bearing guard: an unauthenticated set-password endpoint is only
+// safe where reaching it already implies trusted (local) access.
+func (s *Server) setupAllowed() bool {
+	return s.token == "" && !s.passwordLoginEnabled() && (isLoopbackAddr(s.listen) || s.allowSetup)
+}
+
+// handleSetup serves POST /api/auth/setup — the first-run, unauthenticated,
+// loopback-only password creation. It self-disables once a password exists.
+func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
+	if !s.setupAllowed() {
+		// Either a credential already exists or this is a non-loopback bind:
+		// creating the password is then a CLI (`user set-password`) or
+		// authenticated (change-password) action, never an open endpoint.
+		writeJSONError(w, http.StatusForbidden, "console setup is not available (a credential is already configured, or this bind is not loopback)")
+		return
+	}
+	if !requireJSONBody(w, r) {
+		return
+	}
+	ip := clientIP(r)
+	if ok, retry := s.loginLimiter.Allow(ip); !ok {
+		secs := int(retry.Seconds()) + 1
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		writeJSONError(w, http.StatusTooManyRequests, fmt.Sprintf("too many attempts; retry in %ds", secs))
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		status := http.StatusBadRequest
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeJSONError(w, status, "invalid JSON body")
+		return
+	}
+	if err := ValidateNewPassword(req.Password); err != nil {
+		writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if err := SetAuthPassword(s.authPath, req.Username, req.Password); err != nil {
+		slog.Error("console setup write failed", "path", s.authPath, "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "failed to write the auth file; see server log")
+		return
+	}
+	token, expires, err := s.sessions.Issue()
+	if err != nil {
+		slog.Error("console session issue failed after setup", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "password set, but failed to issue a session — sign in")
+		return
+	}
+	slog.Info("console password created via first-run setup", "remote", ip)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"token":      token,
+		"expires_at": expires.UTC().Format(time.RFC3339),
+	})
 }
 
 // handleLogin serves POST /api/auth/login — unauthenticated, rate-limited,

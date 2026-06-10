@@ -45,9 +45,10 @@ type Config struct {
 	Registry *Registry
 	// Listen is the bind address (host:port). Default 127.0.0.1:8090.
 	Listen string
-	// Token gates the API. When empty and Listen is loopback, a random token
-	// is generated. When empty and Listen is non-loopback, New returns an
-	// error — exposing an unauthenticated console off-host is refused.
+	// Token is an OPT-IN static automation credential — set it explicitly for
+	// scripts/curl. It is never generated. Password login is the primary path:
+	// with no token and no password, a loopback bind (or AllowSetup) enters
+	// first-run setup, and a non-loopback bind is refused.
 	Token string
 	// NoArchive disables Parquet archive auto-discovery on the boot entry.
 	// The caller forces this true when a profile is active (archives do not
@@ -82,6 +83,14 @@ type Config struct {
 	// files only — rotation is a restart; ACME is out of scope.
 	TLSCert string
 	TLSKey  string
+	// AllowSetup permits browser first-run password setup on a NON-loopback
+	// bind — an assertion that the bind is access-controlled by other means.
+	// The compose stack sets it because it binds 0.0.0.0 inside the container
+	// but publishes the port on the host's loopback only; the container can't
+	// see that host mapping, so the operator asserts it. Loopback binds always
+	// allow setup regardless. Off by default: an unguarded setup endpoint on a
+	// truly public bind would let the first stranger claim the password.
+	AllowSetup bool
 }
 
 // Server is a configured, ready-to-run console HTTP server. It holds only
@@ -104,6 +113,7 @@ type Server struct {
 	// boot-time existence, which drives the bind gate and the printed banner.
 	authPath     string
 	passwordCfg  bool
+	allowSetup   bool // assert a non-loopback bind is access-controlled (compose)
 	sessions     *sessionStore
 	loginLimiter *loginLimiter
 	tlsConf      *tls.Config
@@ -136,26 +146,32 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	passwordCfg := authFile != nil
-	if explicitAuthPath && !passwordCfg {
-		slog.Warn("console auth file not found — password login disabled until it is created with `bintrail-console user set-password`", "path", authPath)
-	}
 
-	// Bind/credential policy: an explicit token always stands. With a
-	// password configured and no token, NO token is auto-generated (the
-	// printed ?token= URL would leak a live credential into logs and shell
-	// history for nothing) and non-loopback binds are legal — the password is
-	// the auth. With neither credential, the pre-auth behavior is unchanged:
-	// loopback auto-generates, non-loopback refuses.
+	// Bind/credential policy. Password login is the primary path; the static
+	// token is an opt-in automation credential (set explicitly, never
+	// generated). With neither a token nor a password:
+	//   - loopback → first-run SETUP: no token is generated, and the
+	//     unauthenticated, loopback-only /api/auth/setup endpoint lets the
+	//     operator create the password in the browser. The rest of the API
+	//     stays locked (token "" + no session ⇒ 401) until they do.
+	//   - non-loopback → refused: an unauthenticated setup endpoint off-host
+	//     would let the first stranger to reach it claim the password.
+	// An explicit token always stands; a configured password makes
+	// non-loopback binds legal. A non-loopback bind with no credential is
+	// refused UNLESS the operator asserts the bind is access-controlled
+	// (AllowSetup) — then it enters setup like a loopback bind would.
 	token := cfg.Token
-	if token == "" && !passwordCfg {
-		if !isLoopbackAddr(listen) {
-			return nil, fmt.Errorf("authentication is required when binding to a non-loopback address %q: set --token / BINTRAIL_CONSOLE_TOKEN, or set a console password with `bintrail-console user set-password`", listen)
-		}
-		t, err := generateToken()
-		if err != nil {
-			return nil, fmt.Errorf("generate token: %w", err)
-		}
-		token = t
+	noCredential := token == "" && !passwordCfg
+	willSetup := noCredential && (isLoopbackAddr(listen) || cfg.AllowSetup)
+	if noCredential && !willSetup {
+		return nil, fmt.Errorf("authentication is required when binding to a non-loopback address %q: set a console password with `bintrail-console user set-password`, set --token / BINTRAIL_CONSOLE_TOKEN for automation, or pass --allow-setup if this bind is access-controlled (e.g. published only on the host's loopback)", listen)
+	}
+	// A missing auth file is the EXPECTED first-run state (browser setup creates
+	// it). Only warn about a missing explicit --auth-file when setup is NOT the
+	// path — i.e. a token is configured (password login genuinely disabled until
+	// the file exists), which usually means a typo'd path.
+	if explicitAuthPath && !passwordCfg && !willSetup {
+		slog.Warn("console auth file not found — password login disabled until it is created with `bintrail-console user set-password`", "path", authPath)
 	}
 
 	var tlsConf *tls.Config
@@ -177,6 +193,12 @@ func New(cfg Config) (*Server, error) {
 	if passwordCfg && tlsConf == nil && !isLoopbackAddr(listen) {
 		slog.Warn("the console password will transit plain HTTP on a non-loopback address — set --tls-cert/--tls-key or terminate TLS at a reverse proxy", "listen", listen)
 	}
+	// First-run setup is open until a password exists. On a non-loopback bind
+	// that means anyone who can reach this port could claim the password — a
+	// one-time, first-run-only message (it stops once the password is set).
+	if noCredential && !isLoopbackAddr(listen) && cfg.AllowSetup {
+		slog.Warn("first-run password setup is OPEN — create the console password before this port is reachable from untrusted networks", "listen", listen)
+	}
 
 	// Safety coupling enforced here so it holds for every caller, not just the
 	// CLI: Parquet archives do not apply RBAC rules, so the presence of any
@@ -196,6 +218,7 @@ func New(cfg Config) (*Server, error) {
 		cm:           newConnManager(cfg.Registry, profileActive),
 		authPath:     authPath,
 		passwordCfg:  passwordCfg,
+		allowSetup:   cfg.AllowSetup,
 		sessions:     newSessionStore(),
 		loginLimiter: newLoginLimiter(),
 		tlsConf:      tlsConf,
@@ -285,8 +308,9 @@ func (s *Server) buildHandler() http.Handler {
 	// boots from, and login itself.
 	root.HandleFunc("GET /api/auth", s.handleAuthInfo)
 	root.HandleFunc("POST /api/auth/login", s.handleLogin)
-	root.Handle("/api/", s.tokenMiddleware(api)) // credential on all other /api/*
-	root.Handle("/", assetHandler())             // static shell + assets
+	root.HandleFunc("POST /api/auth/setup", s.handleSetup) // first-run, loopback-only, self-disables
+	root.Handle("/api/", s.tokenMiddleware(api))           // credential on all other /api/*
+	root.Handle("/", assetHandler())                       // static shell + assets
 
 	return s.hostGuard(securityHeaders(root))
 }
@@ -301,6 +325,13 @@ func (s *Server) Token() string { return s.token }
 // PasswordLogin reports whether a console password was configured at boot —
 // the cmd layer keys its banner wording on it.
 func (s *Server) PasswordLogin() bool { return s.passwordCfg }
+
+// NeedsSetup reports whether the console is in first-run setup: no credential
+// at all on a loopback bind, so the operator must create a password in the
+// browser (via the unauthenticated, loopback-only /api/auth/setup endpoint).
+// The cmd layer uses it to print "create your password" instead of a URL with
+// a token.
+func (s *Server) NeedsSetup() bool { return s.setupAllowed() }
 
 // URL returns the bootstrap URL the operator opens in a browser. Token mode
 // includes the jupyter-style ?token=; password mode omits it (printing a live

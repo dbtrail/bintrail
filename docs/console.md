@@ -25,12 +25,16 @@ script you copy or download and apply yourself after review, exactly like
 bintrail-console serve --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 ```
 
-On start it prints a jupyter-style URL with an access token:
+On start it prints the URL to open. On a fresh console the first visit is a
+**"create your password"** screen (see [Password login](#password-login));
+after that, you sign in:
 
 ```
 Bintrail console (read-only) is running. Open:
 
-    http://127.0.0.1:8090/?token=ab12cd34ef56ab12cd34ef56ab12cd34
+    http://127.0.0.1:8090/
+
+First run — open the URL and create your console username and password.
 ```
 
 Or serve it **alongside a live stream** in one process with
@@ -202,6 +206,7 @@ the `monitor` capability is false and the verbs return 403 there.
 | `--servers-file` | `~/.config/bintrail/console-servers.yaml` | Path to the server registry YAML managed from the UI. |
 | `--auth-file` | `~/.config/bintrail/console-auth.yaml` | Console credential file enabling password login (see below). Created with `bintrail-console user set-password`, never by the server on its own. |
 | `--tls-cert` / `--tls-key` | — | Serve the console over HTTPS (PEM files, both-or-neither). Rotation = restart; no ACME. |
+| `--allow-setup` | `false` | Allow browser first-run password setup on a non-loopback bind (assert the bind is access-controlled, e.g. host-loopback published). Loopback always allows setup. |
 
 ### Environment variables
 
@@ -214,6 +219,7 @@ the `monitor` capability is false and the verbs return 403 there.
 - `BINTRAIL_CONSOLE_AUTH` — same as `--auth-file`.
 - `BINTRAIL_CONSOLE_TLS_CERT` / `BINTRAIL_CONSOLE_TLS_KEY` — same as `--tls-cert` / `--tls-key`.
 - `BINTRAIL_CONSOLE_ALLOWED_HOSTS` — comma-separated, same as `--allowed-hosts`.
+- `BINTRAIL_CONSOLE_ALLOW_SETUP` — `1`/`true`, same as `--allow-setup`.
 
 There is deliberately **no** environment variable for the password itself —
 env vars leak through `docker inspect`, `ps e`, and `/proc`; the password is
@@ -223,12 +229,16 @@ Precedence is the usual CLI flag > environment variable > default. The
 `BINTRAIL_CONSOLE_*` variables apply equally to `bintrail-console watch` (where
 the matching flags are `--console-listen`, `--console-token`, `--baseline-dir`,
 `--baseline-s3`, `--console-servers-file`, `--console-auth-file`,
-`--console-tls-cert`, `--console-tls-key`, `--console-allowed-hosts`).
+`--console-tls-cert`, `--console-tls-key`, `--console-allowed-hosts`,
+`--console-allow-setup`).
 
 ## Password login
 
-The token is the zero-config default, but it can be paired with (or, for
-humans, replaced by) a username+password login:
+**Username + password is the primary way in.** On a fresh loopback console
+with no credential, the first browser visit shows a **"create your password"**
+screen; you set it once and you're signed in. Every later visit is a normal
+sign-in. (Prefer the terminal, or setting it up before first launch? Run
+`bintrail-console user set-password`.)
 
 ```console
 $ bintrail-console user set-password
@@ -238,29 +248,39 @@ Console password set for user "admin" (~/.config/bintrail/console-auth.yaml).
 A running server accepts it on the next login — no restart needed.
 ```
 
+- **First-run setup is loopback-only.** The unauthenticated `POST
+  /api/auth/setup` endpoint (which the "create your password" screen calls)
+  is enabled only on a loopback bind — where reaching it already implies local
+  access — and **self-disables the instant a password exists**. It is also
+  enabled by `--allow-setup` (`BINTRAIL_CONSOLE_ALLOW_SETUP`), the assertion
+  the Docker stack makes because it binds `0.0.0.0` inside the container but
+  publishes the port on the host's loopback only. A non-loopback bind with no
+  credential and no `--allow-setup` is refused — set the password from the
+  shell first.
 - The credential lives in a 0600 YAML file (`version`, `username`, a
   bcrypt-cost-12 `password_bcrypt`, `updated_at`) — same envelope and atomic
   write as the server registry. One user; multi-user/RBAC/SSO is dbtrail.
-- A successful `POST /api/auth/login` mints an **in-memory session token**
+- A successful login (or first-run setup) mints an **in-memory session token**
   (24 h absolute, 8 h idle, max 16 concurrent) the SPA uses as its Bearer
   credential. Sessions die on logout, on password change (which revokes all
   of them), and on process restart — nothing session-shaped touches disk.
-- **The static `--token` keeps working unchanged** as the automation
-  credential (scripts, curl, CI). With a password configured and no explicit
-  token, no token is auto-generated and the startup banner prints a clean URL
-  — sign in at the login form instead. Non-loopback binds become legal with
-  either credential.
-- Login and password-change are throttled (per-IP 5 failures/min and
+- **An opt-in static token** for automation: set `--token` /
+  `BINTRAIL_CONSOLE_TOKEN` explicitly and scripts/curl/CI can call the API with
+  it. It is never generated for you, and it is not the human path — when a
+  token *is* set, the browser never sees the setup screen (the token is the
+  credential).
+- Login, setup, and password-change are throttled (per-IP 5 failures/min and
   20/15 min, 30/min globally, `Retry-After` on 429) and bcrypt-verified in
   constant time with no username enumeration. There is no lockout — locking
   the single user out would hand an attacker a denial-of-service against the
   operator.
-- Rotate from the UI (⌘K → "Change console password", revokes every other
-  session immediately) or re-run `user set-password` (applies on the next
-  login; live sessions ride out their TTL). `user remove` deletes the file
-  and reverts to token-only auth; `user status` shows what is configured
-  without printing secrets. Forgot the password? Shell access is the
-  recovery path: re-run `user set-password`.
+- **Rotate or reset:** from the UI (⌘K → "Change console password", revokes
+  every other session immediately) or re-run `user set-password` (overwrites;
+  applies on the next login, live sessions ride out their TTL). **Forgot the
+  password?** Shell access is the recovery path — re-run `user set-password`.
+  `user remove` deletes the file (a loopback console then returns to first-run
+  setup; a non-loopback one refuses its next restart until a credential is set
+  again). `user status` shows what is configured without printing secrets.
 - Off-loopback password logins over plain HTTP are warned about at startup:
   use `--tls-cert`/`--tls-key` or terminate TLS at a reverse proxy (with
   `--allowed-hosts`).
@@ -300,7 +320,8 @@ itself:
   recover default 1000 (max 10000). Never unlimited.
 - **Unauthenticated endpoints**: `/api/healthz` (liveness), `GET /api/auth`
   (does password login exist — what the login form's presence would reveal
-  anyway), and `POST /api/auth/login` itself. Everything else needs a Bearer
+  anyway), `POST /api/auth/login`, and — only during first-run setup —
+  `POST /api/auth/setup`. Everything else needs a Bearer
   credential.
 
 ## Open-core boundary
@@ -320,8 +341,9 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | Method & path | Purpose |
 |---|---|
 | `GET /api/healthz` | Liveness probe (no token). |
-| `GET /api/auth` | Whether password login is enabled (no token): `{"password_login": bool}`. |
+| `GET /api/auth` | Auth mode (no token): `{"password_login": bool, "setup": bool}` — `setup` true means first-run create-password is open. |
 | `POST /api/auth/login` | Exchange `{username, password}` for a session: `{token, expires_at}`. Rate-limited; requires `Content-Type: application/json`. |
+| `POST /api/auth/setup` | First-run only (loopback / `--allow-setup`, self-disables once a password exists): create the password, returns a session. |
 | `POST /api/auth/logout` | Revoke the presented session (static token → 204 no-op). |
 | `POST /api/auth/password` | Set (first time; requires static-token auth) or rotate (`current_password` verified) the console password. Revokes all sessions and returns a fresh one. |
 | `GET /api/status` | Index status (same payload as `bintrail status --format json`). |

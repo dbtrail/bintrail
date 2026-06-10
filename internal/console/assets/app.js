@@ -205,12 +205,14 @@ async function handleUnauthorized() {
   if (unauthorizedHandled) return;
   unauthorizedHandled = true;
   clearAuthState();
-  let pw = false;
-  try { pw = !!(await fetchAuthInfo()).password_login; } catch (_) {}
+  let auth = {};
+  try { auth = await fetchAuthInfo(); } catch (_) {}
+  // After a `user remove` the console can be back in first-run setup.
+  if (auth.setup) { showLoginOverlay({ setup: true }); return; }
   // Token mode has no session to expire and no form to "sign in" to — say what
   // actually happened (the stored token is no longer accepted).
-  const msg = pw ? "Session expired — sign in again." : "This access token is no longer valid.";
-  showLoginOverlay({ passwordLogin: pw, message: msg });
+  const msg = auth.password_login ? "Session expired — sign in again." : "This access token is no longer valid.";
+  showLoginOverlay({ passwordLogin: !!auth.password_login, message: msg });
 }
 
 // clearAuthState drops every credential-scoped cache on sign-out. capsCache
@@ -230,10 +232,11 @@ function clearAuthState() {
   applyAuthGate();
 }
 
-// showLoginOverlay raises the sign-in gate in #login-mount. With password
-// login enabled it renders the form; without, a persistent (non-toast)
-// pointer at the printed ?token= URL. The scrim deliberately does NOT close
-// on outside-click — it is a gate, not a dialog.
+// showLoginOverlay raises the sign-in gate in #login-mount. Three modes:
+//   - setup: true        → first-run "create your password" form (no auth yet)
+//   - passwordLogin: true → the username/password sign-in form
+//   - passwordLogin: false → a pointer at the printed ?token= URL (token mode)
+// The scrim deliberately does NOT close on outside-click — it is a gate.
 function showLoginOverlay(opts) {
   opts = opts || { passwordLogin: true };
   loginGateRaised = true;
@@ -243,8 +246,33 @@ function showLoginOverlay(opts) {
   clear(VIEW());
   const mount = document.getElementById("login-mount");
   const scrim = el("div", { class: "modal-scrim show" });
-  const panel = el("div", { class: "modal login-panel", role: "dialog", "aria-label": "Sign in" });
+  const panel = el("div", { class: "modal login-panel", role: "dialog", "aria-label": opts.setup ? "Set up console" : "Sign in" });
   panel.append(el("h2", { class: "modal-title", text: "dbtrail console" }));
+
+  if (opts.setup) {
+    panel.append(el("p", { class: "modal-desc", text: "First run — create a username and password to access this console." }));
+    const form = el("form", { class: "login-form", id: "login-form" });
+    form.append(el("label", { class: "field" },
+      el("span", { class: "field-label", text: "Username" }),
+      el("input", { class: "input", name: "username", value: "admin", autocomplete: "username", spellcheck: "false" })));
+    form.append(el("label", { class: "field" },
+      el("span", { class: "field-label", text: "Password" }),
+      el("input", { class: "input", name: "password", type: "password", autocomplete: "new-password" })));
+    form.append(el("label", { class: "field" },
+      el("span", { class: "field-label", text: "Confirm password" }),
+      el("input", { class: "input", name: "confirm", type: "password", autocomplete: "new-password" })));
+    const msg = el("div", { class: "form-msg", id: "login-msg" });
+    const foot = el("div", { class: "modal-foot" });
+    foot.append(el("button", { class: "btn btn-primary", type: "submit", text: "Create & sign in" }));
+    form.append(foot);
+    form.append(msg);
+    form.addEventListener("submit", (e) => { e.preventDefault(); submitSetup(form, msg); });
+    panel.append(form);
+    scrim.append(panel);
+    mount.replaceChildren(scrim);
+    form.elements.password.focus();
+    return;
+  }
 
   if (!opts.passwordLogin) {
     panel.append(el("p", { class: "modal-desc", text: opts.message || "" }));
@@ -274,6 +302,37 @@ function showLoginOverlay(opts) {
   scrim.append(panel);
   mount.replaceChildren(scrim);
   form.elements.password.focus();
+}
+
+// submitSetup posts the first-run credential to /api/auth/setup (raw fetch:
+// no bearer yet) and, on success, drops the gate on the returned session.
+async function submitSetup(form, msg) {
+  const password = form.elements.password.value;
+  if (password !== form.elements.confirm.value) { loginMsg(msg, "Passwords do not match."); return; }
+  const body = { username: form.elements.username.value.trim(), password };
+  let res;
+  try {
+    res = await fetch("/api/auth/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (_) { loginMsg(msg, "Network error — is the console still running?"); return; }
+  if (!res.ok) {
+    let m = "Could not set the password.";
+    try { m = (await res.json()).error || m; } catch (_) {}
+    if (res.status === 429) m = "Too many attempts — wait " + (res.headers.get("Retry-After") || "60") + "s.";
+    loginMsg(msg, m);
+    return;
+  }
+  let data;
+  try { data = await res.json(); } catch (_) { loginMsg(msg, "Malformed response."); return; }
+  TOKEN = data.token || "";
+  try { sessionStorage.setItem(TOKEN_KEY, TOKEN); } catch (_) {}
+  unauthorizedHandled = false;
+  loginGateRaised = false;
+  closeLoginOverlay();
+  await bootSequence();
 }
 
 // closeLoginOverlay empties the #login-mount slot. It is used both to dismiss
@@ -1851,11 +1910,14 @@ async function init() {
   window.addEventListener("popstate", renderRoute);
 
   // Pre-auth gate: ask the (unauthenticated) probe how this console
-  // authenticates BEFORE firing data fetches that are guaranteed 401s.
+  // authenticates BEFORE firing data fetches that are guaranteed 401s. First
+  // run with no credential → create-password screen; password configured →
+  // sign-in form; token mode → the printed-link hint.
   if (!TOKEN) {
-    let pw = false;
-    try { pw = !!(await fetchAuthInfo()).password_login; } catch (_) { /* server down — fall through, the view will surface it */ }
-    if (pw) { showLoginOverlay({ passwordLogin: true }); return; }
+    let auth = {};
+    try { auth = await fetchAuthInfo(); } catch (_) { /* server down — fall through, the view will surface it */ }
+    if (auth.setup) { showLoginOverlay({ setup: true }); return; }
+    if (auth.password_login) { showLoginOverlay({ passwordLogin: true }); return; }
     toast("No token in URL — open the link printed by `bintrail-console`.");
   }
 

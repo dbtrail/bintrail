@@ -130,46 +130,36 @@ to watch are added from the console UI afterwards:
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
 docker compose up -d
-docker compose logs -f bintrail
 ```
+
+Open **http://127.0.0.1:8090** — on first run the console serves a **"create
+your console password"** screen. Set it once; every later visit is a normal
+sign-in.
 
 Optional knobs go in a `.env` next to the file: `SOURCE_DSN` to start
-streaming one source immediately at boot, `CONSOLE_TOKEN` to pin your own
-access token, `INDEX_DSN` to bring your own index MySQL. (From a source
-checkout, `cp .env.example .env` gives you the annotated template.)
-
-The logs print the console URL, access token included:
-
-```
-Console is running — open it and add the MySQL servers to watch:
-
-    http://127.0.0.1:8090/?token=ab12cd34…
-```
-
-The generated token persists in the `bintrail-state` volume, so it stays
-stable across restarts and recreations. Prefer signing in with a username and
-password instead of a token URL? Set one — the login form appears on the next
-visit, no restart needed:
-
-```bash
-docker compose exec -it bintrail bintrail-console user set-password
-```
+streaming one source immediately at boot, `INDEX_DSN` to bring your own index
+MySQL, `CONSOLE_TOKEN` for an opt-in API-automation token (humans use the
+password). (From a source checkout, `cp .env.example .env` gives you the
+annotated template.)
 
 Notes:
 
 - `SOURCE_DSN` is the MySQL you want to watch. The user needs
   `REPLICATION SLAVE`, `REPLICATION CLIENT`, and `SELECT`. A MySQL on the
   same machine is reachable from inside Docker as `host.docker.internal`.
-- The console is published on the **host loopback only**
-  (`127.0.0.1:8090`). To reach it from another machine, change the port
-  mapping to `"8090:8090"` and set a credential: a console password (above —
-  ideally behind TLS: `BINTRAIL_CONSOLE_TLS_CERT`/`_TLS_KEY`, or a
-  TLS-terminating proxy) or a pinned `CONSOLE_TOKEN`.
+- The console is published on the **host loopback only** (`127.0.0.1:8090`),
+  which is why first-run browser setup is allowed (the compose sets
+  `BINTRAIL_CONSOLE_ALLOW_SETUP` because the container itself binds
+  `0.0.0.0`). To reach it from another machine, **set the password from the
+  shell first** (`docker compose exec -it bintrail bintrail-console
+  user set-password` — off-loopback browser setup is refused), then change the
+  port mapping to `"8090:8090"`, ideally behind TLS
+  (`BINTRAIL_CONSOLE_TLS_CERT`/`_TLS_KEY` or a TLS-terminating proxy).
 - The credential file lives at `/var/lib/bintrail/console-auth.yaml` in the
-  `bintrail-state` volume. Remove password login with
-  `docker compose exec bintrail bintrail-console user remove --yes`. There is
-  deliberately no password environment variable — `docker inspect` must never
-  print a credential.
+  `bintrail-state` volume. **Forgot the password?** Reset it with
+  `docker compose exec -it bintrail bintrail-console user set-password`
+  (overwrites, no data lost). There is deliberately no password environment
+  variable — `docker inspect` must never print a credential.
 - `bintrail-console watch` is idempotent: restarts resume the stream from
   its saved checkpoint. The preflight (`doctor`) failing prints
   copy-pasteable remediation in the logs and the container retries.
@@ -196,7 +186,7 @@ dbtrail read it from there. The password is baked into the datadir at init,
 so `bintrail-index-data` and `bintrail-index-secret` are a pair: back them up
 together, and changing the password later means resetting both volumes.
 
-**Troubleshooting** — if `docker compose up` never prints the console URL,
+**Troubleshooting** — if `docker compose up` never gets the console listening,
 the index MySQL likely isn't healthy yet (the `bintrail` service waits for it
 via `depends_on`, so its own log stays empty until then). Check the index
 directly: `docker compose logs index-init index-mysql`. A "password" or
@@ -247,7 +237,7 @@ only the *bundled* index is 8.4.)
 | `SOURCE_DSN` | compose (optional) | DSN for a source MySQL to start watching at boot (empty = add servers from the console UI) |
 | `INDEX_DSN` | compose (optional) | Bring-your-own index MySQL (default: the bundled container) |
 | `SCHEMAS` | compose (optional) | Comma-separated schemas to track (empty = all user schemas) |
-| `CONSOLE_TOKEN` | compose (optional) | Pin your own console access token (default: generated once and persisted in the `bintrail-state` volume) |
+| `CONSOLE_TOKEN` | compose (optional) | Opt-in static API-automation token (default: none — humans sign in with the console password) |
 | `INDEX_MYSQL_ROOT_PASSWORD` | compose (optional) | Pin the bundled index root password (set *before* first boot; default: randomly generated into the `bintrail-index-secret` volume) |
 | `BINTRAIL_TAG` | compose (optional) | Image tag to run (default `latest`) |
 | `BINTRAIL_INDEX_DSN` | bintrail-mcp | Index DSN for the MCP server |

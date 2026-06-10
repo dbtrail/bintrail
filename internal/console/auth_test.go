@@ -39,19 +39,24 @@ func TestIsLoopbackAddr(t *testing.T) {
 	}
 }
 
-// TestNewTokenPolicy verifies the bind/token security policy: non-loopback
-// binds demand an explicit token; loopback binds auto-generate one.
+// TestNewTokenPolicy verifies the bind/credential policy: a non-loopback bind
+// with no credential is refused; a loopback bind with no credential enters
+// first-run setup (NO token is generated — password is the primary path); an
+// explicit token always stands.
 func TestNewTokenPolicy(t *testing.T) {
 	if _, err := New(Config{Listen: "0.0.0.0:8090"}); err == nil {
-		t.Error("non-loopback bind without a token should be refused")
+		t.Error("non-loopback bind without a credential should be refused")
 	}
 
 	srv, err := New(Config{Listen: "127.0.0.1:8090"})
 	if err != nil {
 		t.Fatalf("loopback bind: %v", err)
 	}
-	if srv.Token() == "" {
-		t.Error("loopback bind should auto-generate a token")
+	if srv.Token() != "" {
+		t.Errorf("loopback bind with no credential auto-generated a token %q — should enter setup instead", srv.Token())
+	}
+	if !srv.NeedsSetup() {
+		t.Error("loopback bind with no credential should report NeedsSetup")
 	}
 
 	srv2, err := New(Config{Listen: "0.0.0.0:9000", Token: "explicit-token"})
@@ -60,6 +65,18 @@ func TestNewTokenPolicy(t *testing.T) {
 	}
 	if srv2.Token() != "explicit-token" {
 		t.Errorf("Token() = %q, want explicit-token", srv2.Token())
+	}
+	if srv2.NeedsSetup() {
+		t.Error("a token-configured server is not in setup")
+	}
+
+	// AllowSetup makes a non-loopback bind legal and puts it in setup mode.
+	srv3, err := New(Config{Listen: "0.0.0.0:9001", AllowSetup: true})
+	if err != nil {
+		t.Fatalf("non-loopback bind with AllowSetup: %v", err)
+	}
+	if !srv3.NeedsSetup() {
+		t.Error("AllowSetup non-loopback bind should report NeedsSetup")
 	}
 }
 
