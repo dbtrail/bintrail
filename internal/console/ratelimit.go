@@ -12,13 +12,13 @@ import (
 // login clears its IP. Throttle-only, never a lockout: locking the single
 // user out would hand an attacker a trivial DoS against the operator.
 const (
-	ipShortWindow   = time.Minute
-	ipShortMax      = 5
-	ipLongWindow    = 15 * time.Minute
-	ipLongMax       = 20
-	globalWindow    = time.Minute
-	globalMax       = 30 // caps attacker-driven bcrypt CPU at ~30×250ms/min
-	maxTrackedIPs   = 4096
+	ipShortWindow = time.Minute
+	ipShortMax    = 5
+	ipLongWindow  = 15 * time.Minute
+	ipLongMax     = 20
+	globalWindow  = time.Minute
+	globalMax     = 30 // caps attacker-driven bcrypt CPU at ~30×250ms/min
+	maxTrackedIPs = 4096
 )
 
 type failWindow struct {

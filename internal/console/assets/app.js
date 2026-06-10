@@ -187,6 +187,7 @@ function apiError(status, message) {
 // which gates the logout affordance via [data-auth]/.auth-on.
 
 let unauthorizedHandled = false; // first 401 wins; later ones no-op
+let loginGateRaised = false;     // the sign-in gate owns the screen — ⌘K and onboarding stay inert
 
 // fetchAuthInfo asks the unauthenticated probe whether password login exists.
 // Raw fetch: no bearer yet, and its failure must not recurse into the 401
@@ -203,6 +204,17 @@ async function fetchAuthInfo() {
 async function handleUnauthorized() {
   if (unauthorizedHandled) return;
   unauthorizedHandled = true;
+  clearAuthState();
+  let pw = false;
+  try { pw = !!(await fetchAuthInfo()).password_login; } catch (_) {}
+  showLoginOverlay({ passwordLogin: pw, message: "Session expired — sign in again." });
+}
+
+// clearAuthState drops every credential-scoped cache on sign-out. capsCache
+// MUST be cleared too: a stale capsCache.auth would keep the command palette
+// offering "Change console password…"/"Log out" in a signed-out tab, and
+// running either evicts the gate from #login-mount.
+function clearAuthState() {
   TOKEN = "";
   try { sessionStorage.removeItem(TOKEN_KEY); } catch (_) {}
   serverGen++;
@@ -211,9 +223,8 @@ async function handleUnauthorized() {
   pendingRecover = null;
   lastSQL = "";
   lastEvents = [];
-  let pw = false;
-  try { pw = !!(await fetchAuthInfo()).password_login; } catch (_) {}
-  showLoginOverlay({ passwordLogin: pw, message: "Session expired — sign in again." });
+  capsCache = {};
+  applyAuthGate();
 }
 
 // showLoginOverlay raises the sign-in gate in #login-mount. With password
@@ -222,6 +233,11 @@ async function handleUnauthorized() {
 // on outside-click — it is a gate, not a dialog.
 function showLoginOverlay(opts) {
   opts = opts || { passwordLogin: true };
+  loginGateRaised = true;
+  // Clear the workspace: the prior session's events/recover SQL must not stay
+  // readable behind the blurred scrim (or after the gate is dismissed by a
+  // dialog mounted in the same slot).
+  clear(VIEW());
   const mount = document.getElementById("login-mount");
   const scrim = el("div", { class: "modal-scrim show" });
   const panel = el("div", { class: "modal login-panel", role: "dialog", "aria-label": "Sign in" });
@@ -257,6 +273,11 @@ function showLoginOverlay(opts) {
   form.elements.password.focus();
 }
 
+// closeLoginOverlay empties the #login-mount slot. It is used both to dismiss
+// the password dialog (authenticated; the gate was never up) and, after a
+// successful login, by submitLogin. It does NOT lower loginGateRaised on its
+// own — only authenticating does, so the password dialog can never be the
+// thing that drops the gate (see showPasswordDialog's authenticated guard).
 function closeLoginOverlay() { document.getElementById("login-mount").replaceChildren(); }
 
 function loginMsg(node, text) { node.classList.add("err"); node.textContent = text; }
@@ -293,20 +314,14 @@ async function submitLogin(form, msg) {
   TOKEN = data.token || "";
   try { sessionStorage.setItem(TOKEN_KEY, TOKEN); } catch (_) {}
   unauthorizedHandled = false;
+  loginGateRaised = false; // authenticating is the ONLY thing that drops the gate
   closeLoginOverlay();
   await bootSequence();
 }
 
 async function doLogout() {
   try { await api("/api/auth/logout", { method: "POST" }); } catch (_) { /* dead session = already out */ }
-  TOKEN = "";
-  try { sessionStorage.removeItem(TOKEN_KEY); } catch (_) {}
-  serverGen++;
-  schemaCache = null;
-  tablesCache.clear();
-  pendingRecover = null;
-  lastSQL = "";
-  lastEvents = [];
+  clearAuthState();
   unauthorizedHandled = false;
   // Logout is only reachable for session auth, which implies password login.
   showLoginOverlay({ passwordLogin: true, message: "Signed out." });
@@ -321,9 +336,11 @@ function applyAuthGate() {
 }
 
 // showPasswordDialog sets (token bootstrap) or rotates the console password.
-// Mounted in #login-mount — never coexists with the login gate (it requires
-// an authenticated tab).
+// Mounted in #login-mount — never coexists with the login gate: it requires an
+// authenticated tab, so it refuses while the gate is up (defense in depth —
+// clearAuthState also strips the cmdk entries that could reach it signed-out).
 function showPasswordDialog() {
+  if (loginGateRaised) return;
   const firstSet = !(capsCache.auth && capsCache.auth.password_set);
   const mount = document.getElementById("login-mount");
   const scrim = el("div", { class: "modal-scrim show" });
@@ -1716,6 +1733,7 @@ function cmdkCommands() {
 }
 
 function openCmdk() {
+  if (loginGateRaised) return; // the sign-in gate owns the screen
   const mount = document.getElementById("cmdk-mount");
   clear(mount);
   const scrim = el("div", { class: "cmdk-scrim open" });
@@ -1775,6 +1793,8 @@ function cmdkKeydown(e) {
 // ── global keyboard ──────────────────────────────────────────────────────────
 
 function globalKeydown(e) {
+  // The sign-in gate is modal: no shortcuts reach the workspace behind it.
+  if (loginGateRaised) return;
   // ⌘K / Ctrl+K opens the palette anywhere.
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openCmdk(); return; }
   // j/k/↵/u row nav — only on Events, only when not typing in a field.

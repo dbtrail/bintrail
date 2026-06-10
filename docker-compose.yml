@@ -195,7 +195,14 @@ services:
             if [ ! -s "$$tf" ]; then echo "FATAL: failed to generate the console token" >&2; rm -f "$$tf"; exit 1; fi
             echo "Generated console token (persisted in the bintrail-state volume; set CONSOLE_TOKEN in .env to override)"
           fi
-          export BINTRAIL_CONSOLE_TOKEN="$$(cat "$$tf")"
+          # Plain assignment, like the INDEX_DSN block above: under `set -e` it
+          # propagates a failed `cat` (e.g. an unreadable root-owned token file
+          # after a user: override) and aborts loud. `export VAR="$(cat …)"`
+          # would discard the substitution's exit status and export an EMPTY
+          # token — which boots password-only or crash-loops, never naming the
+          # culprit.
+          BINTRAIL_CONSOLE_TOKEN="$$(cat "$$tf")"
+          export BINTRAIL_CONSOLE_TOKEN
         fi
         if [ -n "$$SOURCE_DSN" ] && [ -n "$$SCHEMAS" ]; then
           exec bintrail-console watch --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN" --schemas "$$SCHEMAS"

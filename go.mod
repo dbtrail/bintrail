@@ -22,6 +22,7 @@ require (
 	go.yaml.in/yaml/v2 v2.4.2
 	golang.org/x/crypto v0.40.0
 	golang.org/x/sync v0.19.0
+	golang.org/x/term v0.39.0
 )
 
 require (
@@ -86,7 +87,6 @@ require (
 	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260116145544-c6413dc483f5 // indirect
-	golang.org/x/term v0.39.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/tools v0.41.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
