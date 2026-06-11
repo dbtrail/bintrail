@@ -265,8 +265,9 @@ Reversed: undo the 14:03 UPDATE first, then the 14:02 UPDATE, then the 14:01 INS
 > topological reordering across tables, and the generated script never emits
 > `SET FOREIGN_KEY_CHECKS`. Tables with `ON DELETE/UPDATE CASCADE` produce
 > side-effect row changes that reversal SQL cannot reliably undo
-> (`bintrail doctor` warns about them, and ingestion refuses to start against
-> a source that has them). The FK-aware recovery described on dbtrail.com
+> (`bintrail doctor` warns about them, and `stream`/`watch` — plus `index`
+> runs given a `--source-dsn` to validate against — refuse to start when the
+> source has them). The FK-aware recovery described on dbtrail.com
 > (parent resolution via `resolve_fk`, dependent ordering) is a dbtrail
 > platform feature, not part of this binary — even though the hosted `recover`
 > tool shares its name with the CLI command and the console tab.

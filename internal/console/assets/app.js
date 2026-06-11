@@ -1343,17 +1343,29 @@ async function renderStorage() {
   // Each fetch degrades independently: a panel renders its own failure note
   // instead of one error wiping the whole page. (A 401 inside api() raises the
   // sign-in gate and bumps serverGen, so the stale-render guard below bails.)
+  const asErr = (err) => ({ error: (err && err.message) || String(err) });
   const [serversRes, rotation, storage, baselines] = await Promise.all([
-    api("/api/servers").catch(() => null),
-    api("/api/rotation").catch(() => null),
-    api("/api/storage").catch(() => null),
-    api("/api/baselines").catch((err) => ({ error: (err && err.message) || String(err) })),
+    api("/api/servers").catch(asErr),
+    api("/api/rotation").catch(asErr),
+    api("/api/storage").catch(asErr),
+    api("/api/baselines").catch(asErr),
   ]);
   if (gen !== serverGen) return;
-  buildStorage((serversRes && serversRes.servers) || [], rotation, storage, baselines);
+  // Same guard as renderOverview: a throw inside the build must show an
+  // error, never leave the "Loading…" skeleton up forever.
+  try {
+    buildStorage(serversRes, rotation, storage, baselines);
+  } catch (err) {
+    const v = VIEW(); clear(v); v.append(pageHead("Storage", null)); renderError(v, err);
+  }
 }
 
-function buildStorage(servers, rotation, storage, baselines) {
+function buildStorage(serversRes, rotation, storage, baselines) {
+  // serversRes is the raw /api/servers payload or {error} — archivingPanel
+  // must be able to tell "failed to load" from "genuinely no sources", or a
+  // transient 500 would render the affirmative "No monitored sources yet" lie.
+  const servers = (serversRes && serversRes.servers) || [];
+  const serversErr = serversRes && serversRes.error;
   const v = VIEW(); clear(v);
   const sub = el("p", { class: "page-sub" },
     "Where captured history lives beyond the index — per-source S3 archiving, the rotation that feeds it, and the baselines Time-travel reads. ",
@@ -1362,13 +1374,14 @@ function buildStorage(servers, rotation, storage, baselines) {
   v.append(pageHead("Storage", sub));
 
   const cards = el("div", { class: "cards" });
+  const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
   cards.append(rotationCard(rotation));
   cards.append(credentialsCard(storage));
-  cards.append(baselineSummaryCard(baselines));
+  cards.append(baselineSummaryCard(baselines, cur));
   v.append(cards);
 
   const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
-  grid.append(archivingPanel(servers));
+  grid.append(archivingPanel(servers, serversErr));
   grid.append(baselinesPanel(baselines, servers));
   v.append(grid);
   viewEnter();
@@ -1382,8 +1395,8 @@ function kvRow(card, k, val) {
 
 function rotationCard(rot) {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Rotation" }));
-  if (!rot) {
-    card.append(el("p", { class: "form-hint", text: "Could not load the rotation policy." }));
+  if (!rot || rot.error) {
+    card.append(el("p", { class: "form-hint", text: "Could not load the rotation policy" + (rot && rot.error ? ": " + rot.error : ".") }));
     return card;
   }
   kvRow(card, "retention", rot.retain);
@@ -1400,7 +1413,7 @@ function credentialsCard(storage) {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "AWS credentials" }));
   const aws = storage && storage.aws;
   if (!aws) {
-    card.append(el("p", { class: "form-hint", text: "Could not read the daemon's credential signals." }));
+    card.append(el("p", { class: "form-hint", text: "Could not read the daemon's credential signals" + (storage && storage.error ? ": " + storage.error : ".") }));
     return card;
   }
   kvRow(card, "access keys (env)", aws.access_key_env ? "set" : "not set");
@@ -1410,11 +1423,11 @@ function credentialsCard(storage) {
   if (aws.container_creds) kvRow(card, "ECS task role", "detected");
   if (aws.web_identity) kvRow(card, "EKS IRSA", "detected");
   card.append(el("p", { class: "form-hint stg-hint", text:
-    "S3 access uses the AWS default credential chain of the daemon process — environment keys, a shared profile (incl. SSO), or an IAM role. EC2/ECS/EKS roles work even when nothing shows as set here. The console never stores keys." }));
+    "S3 uploads and archive reads use the AWS default credential chain of the daemon process — environment keys, a shared profile (incl. SSO), or an IAM role; roles work even when nothing shows as set here. Baseline listings from s3:// currently support environment keys only. The console never stores keys." }));
   return card;
 }
 
-function baselineSummaryCard(b) {
+function baselineSummaryCard(b, cur) {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Baselines" }));
   if (!b || b.error) {
     card.append(el("p", { class: "form-hint", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));
@@ -1422,8 +1435,7 @@ function baselineSummaryCard(b) {
   }
   if (!b.configured) {
     kvRow(card, "source", "not configured");
-    card.append(el("p", { class: "form-hint stg-hint", text:
-      "Set a Baseline dir / S3 on the server (Manage servers → Edit → Advanced) to enable Time-travel." }));
+    card.append(el("p", { class: "form-hint stg-hint", text: baselineConfigHint(cur) }));
     return card;
   }
   const snaps = b.snapshots || [];
@@ -1435,6 +1447,17 @@ function baselineSummaryCard(b) {
   return card;
 }
 
+// baselineConfigHint: the boot (cli) entry is not editable from the UI — its
+// baseline comes only from --baseline-dir/--baseline-s3 (or the BINTRAIL_
+// CONSOLE_BASELINE_DIR/_S3 env; BASELINE_DIR in the compose stack) — so the
+// "edit the server" instruction would point it at a dead end.
+function baselineConfigHint(cur) {
+  if (cur && cur.kind === "ephemeral") {
+    return "This is the command-line (cli) entry — restart the daemon with --baseline-dir / --baseline-s3 (compose: BASELINE_DIR in .env) to enable Time-travel on it.";
+  }
+  return "Set a Baseline dir / S3 on the server (Manage servers → Edit → Advanced) to enable Time-travel.";
+}
+
 function formatAge(hours) {
   if (hours == null) return "—";
   if (hours < 1) return Math.max(1, Math.round(hours * 60)) + " min";
@@ -1442,14 +1465,16 @@ function formatAge(hours) {
   return Math.round(hours / 24) + " day(s)";
 }
 
-function archivingPanel(servers) {
+function archivingPanel(servers, serversErr) {
   const panel = el("section", { class: "ov-panel" });
   panel.append(el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title", text: "S3 archiving per source" }),
     el("a", { class: "btn btn-sm btn-ghost", text: "Manage servers ›", onclick: openServersModal })));
   const list = el("div", { class: "stg-list" });
   const sources = servers.filter((s) => s.has_source);
-  if (!sources.length) {
+  if (serversErr) {
+    list.append(el("div", { class: "ev-empty", text: "Could not load servers: " + serversErr }));
+  } else if (!sources.length) {
     list.append(el("div", { class: "ev-empty", text: "No monitored sources yet — add one under Manage servers." }));
   } else {
     sources.forEach((s) => {
@@ -1478,10 +1503,10 @@ function baselinesPanel(b, servers) {
     list.append(el("div", { class: "ev-empty", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));
   } else if (!b.configured) {
     list.append(el("div", { class: "ev-empty", text:
-      "No baseline source configured for this server. Baselines are full-table Parquet snapshots (bintrail dump → bintrail baseline); with one configured, Time-travel reconstructs complete rows — not just rows with binlog activity." }));
+      "No baseline source configured for this server. Baselines are full-table Parquet snapshots (bintrail dump → bintrail baseline); with one configured, Time-travel reconstructs complete rows — not just rows with binlog activity. " + baselineConfigHint(cur) }));
   } else if (!(b.snapshots || []).length) {
     list.append(el("div", { class: "ev-empty", text:
-      "Source configured (" + b.source + ") but no snapshots found yet — run bintrail dump + bintrail baseline to create the first one." }));
+      "Source configured (" + b.source + ") but no snapshots matched the expected <timestamp>/<schema>/<table>.parquet layout — run bintrail dump + bintrail baseline to create the first one, and check the path points at the snapshots' PARENT directory." }));
   } else {
     b.snapshots.forEach((sn) => {
       const row = el("div", { class: "stg-row" });
@@ -1601,13 +1626,15 @@ async function loadServers() {
   const sel = document.getElementById("server-select");
   if (sel) {
     clear(sel);
-    // Registry servers first; the ephemeral boot entry goes last — it is the
-    // daemon's anchor index, not where a monitored source's events land.
+    // Registry servers first; the ephemeral boot entry goes last (in every
+    // mode — it is the connection the operator least often switches to; under
+    // source-ful watch it does carry the main stream's events and stays one
+    // click away).
     const ordered = servers.filter((s) => s.kind !== "ephemeral")
       .concat(servers.filter((s) => s.kind === "ephemeral"));
     ordered.forEach((s) => {
       const o = opt(s.id, serverLabel(s));
-      if (s.kind === "ephemeral") o.title = "The daemon's own index database (from --index-dsn) — not a monitored source";
+      if (s.kind === "ephemeral") o.title = "The daemon's own index database (from --index-dsn); managed by the command line";
       sel.append(o);
     });
     sel.value = currentServer || defaultServerId;

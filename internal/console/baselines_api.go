@@ -1,6 +1,7 @@
 package console
 
 import (
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -93,6 +94,12 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 					dto.BinlogFile = meta.BinlogFile
 					dto.BinlogPos = meta.BinlogPos
 					dto.GTIDSet = meta.GTIDSet
+				} else {
+					// Tolerated (the listing must not die on one bad footer), but
+					// never silent: a corrupt snapshot rendered as merely
+					// "coordinate-less" would look identical to a healthy
+					// pre-metadata baseline.
+					slog.Warn("console: baseline Parquet metadata unreadable", "path", f.Path, "error", err)
 				}
 			}
 			resp.Snapshots = append(resp.Snapshots, dto)

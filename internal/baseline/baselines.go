@@ -26,6 +26,9 @@ type BaselineInfo struct {
 //
 // where <timestamp> is an RFC3339 string with colons replaced by hyphens
 // (e.g. "2025-02-28T00-00-00Z"). Files that cannot be parsed are skipped.
+// internal/reconstruct.ListBaselines walks the same layout (local + S3,
+// path-only) for the console's listing — keep the two in sync if the layout
+// ever changes.
 func DiscoverBaselines(dir string) ([]BaselineInfo, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -162,7 +163,12 @@ type BaselineFile struct {
 // directory or an s3:// prefix), newest snapshot first (then schema/table for
 // a stable render order). Entries that don't match the
 // <timestamp>/<schema>/<table>.parquet layout are skipped, mirroring
-// FindBaseline's tolerance.
+// FindBaseline's tolerance; unreadable snapshot subdirectories are skipped
+// WITH a warning — the listing is an observability surface, and a silently
+// shrunken one would misreport "latest baseline" with nothing in any log.
+// internal/baseline.DiscoverBaselines walks the same local layout (plus
+// Parquet footers) for `bintrail status`; keep the two in sync if the layout
+// ever changes.
 func ListBaselines(ctx context.Context, source string) ([]BaselineFile, error) {
 	if strings.HasPrefix(source, "s3://") {
 		return listBaselinesS3(ctx, source)
@@ -187,14 +193,17 @@ func listBaselinesLocal(baselineDir string) ([]BaselineFile, error) {
 		snapDir := filepath.Join(baselineDir, entry.Name())
 		dbDirs, err := os.ReadDir(snapDir)
 		if err != nil {
+			slog.Warn("baseline listing: skipping unreadable snapshot directory", "path", snapDir, "error", err)
 			continue
 		}
 		for _, dbDir := range dbDirs {
 			if !dbDir.IsDir() {
 				continue
 			}
-			files, err := os.ReadDir(filepath.Join(snapDir, dbDir.Name()))
+			schemaDir := filepath.Join(snapDir, dbDir.Name())
+			files, err := os.ReadDir(schemaDir)
 			if err != nil {
+				slog.Warn("baseline listing: skipping unreadable schema directory", "path", schemaDir, "error", err)
 				continue
 			}
 			for _, f := range files {
@@ -205,7 +214,7 @@ func listBaselinesLocal(baselineDir string) ([]BaselineFile, error) {
 					SnapshotTime: ts,
 					Schema:       dbDir.Name(),
 					Table:        strings.TrimSuffix(f.Name(), ".parquet"),
-					Path:         filepath.Join(snapDir, dbDir.Name(), f.Name()),
+					Path:         filepath.Join(schemaDir, f.Name()),
 				})
 			}
 		}
@@ -239,7 +248,11 @@ func listBaselinesS3(ctx context.Context, s3URL string) ([]BaselineFile, error) 
 	for rows.Next() {
 		var path string
 		if err := rows.Scan(&path); err != nil {
-			continue
+			// The glob returns exactly one VARCHAR column; a Scan failure is a
+			// driver/DuckDB fault, never an expected layout condition — and
+			// rows.Err() below would NOT catch it. Fail loud rather than let a
+			// listing whose purpose is observability silently drop snapshots.
+			return nil, fmt.Errorf("scan S3 baseline path: %w", err)
 		}
 		rest := strings.TrimPrefix(path, prefix+"/")
 		parts := strings.Split(rest, "/")

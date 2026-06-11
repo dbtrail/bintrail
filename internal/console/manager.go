@@ -334,6 +334,9 @@ func (cm *connManager) defaultID() string {
 		}
 		return entries[0].ID
 	}
+	// boot == nil: registry-only console. demoteBoot is unreachable here
+	// today (only watch sets it, and watch always seeds a boot bundle), so the
+	// sourced-entry preference deliberately does not apply.
 	if len(entries) > 0 {
 		return entries[0].ID
 	}

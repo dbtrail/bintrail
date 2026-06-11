@@ -111,9 +111,10 @@ How it behaves:
   added source gets its own per-source database), so it legitimately shows 0
   events with a full set of provisioned partitions. For that reason a
   source-less `watch` daemon **demotes** it: fresh tabs land on the first
-  monitored registry server instead, and the cli entry sorts last in the
-  switcher (still selectable — its Status shows the boot index and the
-  rotation that maintains it).
+  monitored registry server (or the first saved server when none is
+  monitored). The cli entry always sorts last in the switcher regardless of
+  mode, and stays selectable — its Status shows the boot index and the
+  rotation that maintains it.
 - **Lazy connections.** Saved servers connect on first selection (with an
   eager ping, so a dead server fails the moment you switch to it, not on your
   first query). Editing a server's connection details closes and reopens its
@@ -261,10 +262,12 @@ across the rotation dialog and the per-server edit form):
 - **AWS credentials** — which ambient credential signals the daemon process
   can see: env keys (presence only, never values), `AWS_PROFILE`,
   `AWS_REGION`, a shared `~/.aws` config, ECS task-role / EKS IRSA markers.
-  **The console never stores AWS keys** — uploads and reads use the AWS
-  default credential chain of the daemon (environment, shared profile incl.
-  SSO, or an IAM role; EC2/ECS/EKS roles work even when nothing shows as set,
-  since instance roles are not detectable without a metadata call).
+  **The console never stores AWS keys.** S3 *uploads* and archived-event
+  *reads* use the AWS default credential chain of the daemon (environment,
+  shared profile incl. SSO, or an IAM role; EC2/ECS/EKS roles work even when
+  nothing shows as set, since instance roles are not detectable without a
+  metadata call). Baseline listings/reads from `s3://` ride DuckDB httpfs and
+  currently support environment keys only (dbtrail/dbtrail#459).
 
 ## Flags
 
@@ -445,8 +448,9 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`, `capabilities`,
-`reconstruct`) targets the server named by the `X-Bintrail-Server` request
-header; without the header they target the default entry. Selection is
+`reconstruct`, `baselines`) targets the server named by the
+`X-Bintrail-Server` request header; without the header they target the
+default entry (`storage` is the one process-global exception). Selection is
 stateless — concurrent clients can each target a different server.
 
 ### Time-travel (reconstruct)
