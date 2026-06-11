@@ -19,6 +19,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/archive"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
@@ -301,6 +302,7 @@ func s3ParquetRowCount(ctx context.Context, bucket, key string) (int64, error) {
 	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
 		return 0, fmt.Errorf("load httpfs extension: %w", err)
 	}
+	duckdbutil.EnableS3CredentialChain(ctx, db)
 	safe := strings.ReplaceAll("s3://"+bucket+"/"+key, "'", "''")
 	var n int64
 	if err := db.QueryRowContext(ctx,

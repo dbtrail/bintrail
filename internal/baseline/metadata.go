@@ -14,6 +14,8 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver for s3:// metadata reads
 	"github.com/parquet-go/parquet-go"
+
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 )
 
 // Parquet metadata keys for baseline binlog position and schema DDL.
@@ -158,6 +160,7 @@ func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, err
 	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
 		return DumpMetadata{}, fmt.Errorf("load httpfs extension: %w", err)
 	}
+	duckdbutil.EnableS3CredentialChain(ctx, db)
 
 	safePath := strings.ReplaceAll(path, "'", "''")
 	q := fmt.Sprintf("SELECT key, value FROM parquet_kv_metadata('%s')", safePath)

@@ -13,6 +13,8 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 )
 
 // ErrNoBaseline is returned by FindBaseline when no baseline snapshot exists
@@ -49,6 +51,7 @@ func ReadBaselineRow(ctx context.Context, path string, pkFilter map[string]strin
 		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
 			return nil, fmt.Errorf("load httpfs extension: %w", err)
 		}
+		duckdbutil.EnableS3CredentialChain(ctx, db)
 	}
 
 	// Build sorted conditions for deterministic SQL + arg ordering.
@@ -115,6 +118,7 @@ func ExecSQL(ctx context.Context, source, sqlStr string) ([]map[string]any, []st
 		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
 			return nil, nil, fmt.Errorf("load httpfs extension: %w", err)
 		}
+		duckdbutil.EnableS3CredentialChain(ctx, db)
 	}
 
 	rows, err := db.QueryContext(ctx, sqlStr)
@@ -235,6 +239,7 @@ func listBaselinesS3(ctx context.Context, s3URL string) ([]BaselineFile, error) 
 	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
 		return nil, fmt.Errorf("load httpfs extension: %w", err)
 	}
+	duckdbutil.EnableS3CredentialChain(ctx, db)
 
 	prefix := strings.TrimSuffix(s3URL, "/")
 	safeGlob := strings.ReplaceAll(prefix+"/*/*/*.parquet", "'", "''")
@@ -339,6 +344,7 @@ func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Ti
 	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
 		return "", time.Time{}, fmt.Errorf("load httpfs extension: %w", err)
 	}
+	duckdbutil.EnableS3CredentialChain(ctx, db)
 
 	prefix := strings.TrimSuffix(s3URL, "/")
 	globPat := prefix + "/*/" + schema + "/" + table + ".parquet"

@@ -19,6 +19,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
@@ -727,6 +728,7 @@ func materializeBaselineLocal(ctx context.Context, path string) (string, func(),
 		os.RemoveAll(tmpDir)
 		return "", nil, fmt.Errorf("load httpfs: %w", err)
 	}
+	duckdbutil.EnableS3CredentialChain(ctx, db)
 	safeSrc := strings.ReplaceAll(path, "'", "''")
 	safeDst := strings.ReplaceAll(tmpPath, "'", "''")
 	copyQ := fmt.Sprintf("COPY (SELECT * FROM parquet_scan('%s')) TO '%s' (FORMAT PARQUET)", safeSrc, safeDst)

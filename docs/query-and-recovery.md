@@ -218,10 +218,8 @@ The merge path loads **all matching rows** from all sources into memory before a
 
 ### S3 Prerequisites
 
-`--archive-s3` uses DuckDB's `httpfs` extension:
-
-- **AWS credentials** — DuckDB uses the standard credential chain: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, `~/.aws/credentials`, or an IAM role. Set credentials before running the query.
-- **Outbound internet access** — on first use, DuckDB downloads the `httpfs` extension from its extension registry. In airgapped environments, pre-install it by running `duckdb -c "INSTALL httpfs;"` once on a machine with internet access and copying the extension cache.
+- **Archived events** (`--archive-s3`): objects are listed and downloaded with the **AWS SDK** — the full default credential chain applies (env keys, `~/.aws` profiles incl. SSO, EC2/ECS/EKS IAM roles). DuckDB then scans the downloaded files locally; its `httpfs` extension is not involved on this path.
+- **Baselines** (`--baseline-s3` / reconstruct / `--include-snapshot`): read through DuckDB `httpfs`, with SDK-chain parity provided by the `aws` extension's `credential_chain` secret (set up automatically). Offline hosts where the extensions cannot be downloaded on first use fall back to environment-key resolution — pre-install with `duckdb -c "INSTALL httpfs; INSTALL aws;"` on a connected machine and copy the `~/.duckdb` extension cache for airgapped parity.
 
 ---
 

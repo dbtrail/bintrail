@@ -266,8 +266,10 @@ across the rotation dialog and the per-server edit form):
   *reads* use the AWS default credential chain of the daemon (environment,
   shared profile incl. SSO, or an IAM role; EC2/ECS/EKS roles work even when
   nothing shows as set, since instance roles are not detectable without a
-  metadata call). Baseline listings/reads from `s3://` ride DuckDB httpfs and
-  currently support environment keys only (dbtrail/dbtrail#459).
+  metadata call). Baseline listings/reads from `s3://` ride DuckDB httpfs with
+  SDK-chain parity via the `aws` extension's `credential_chain` secret (set
+  up automatically; offline hosts where the extension cannot install fall
+  back to environment keys).
 
 ## Flags
 

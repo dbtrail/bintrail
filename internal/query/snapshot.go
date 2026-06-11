@@ -18,6 +18,8 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
+
 	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
@@ -57,6 +59,7 @@ func FetchSnapshot(ctx context.Context, path string, opts Options) ([]ResultRow,
 		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
 			return nil, fmt.Errorf("load httpfs: %w", err)
 		}
+		duckdbutil.EnableS3CredentialChain(ctx, db)
 	}
 
 	ts, err := readSnapshotTimestamp(ctx, db, path)

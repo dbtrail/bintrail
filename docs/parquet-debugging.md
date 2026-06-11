@@ -99,15 +99,20 @@ On first use DuckDB downloads the extension from its registry. In airgapped envi
 
 ### Configuring S3 credentials
 
-Set credentials before querying. DuckDB supports the standard AWS credential chain, but you can also set them explicitly:
+Give the session the standard AWS credential chain (env keys, `~/.aws` profiles incl. SSO, IAM roles) via the `aws` extension — modern DuckDB does **not** read your environment automatically without a secret:
+
+```sql
+INSTALL aws; LOAD aws;
+CREATE SECRET (TYPE s3, PROVIDER credential_chain);
+```
+
+(bintrail's own S3 baseline reads set this up automatically.) Static credentials still work too:
 
 ```sql
 SET s3_region = 'us-east-1';
 SET s3_access_key_id = 'AKIA...';
 SET s3_secret_access_key = '...';
 ```
-
-Or rely on environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`) and `~/.aws/credentials` — DuckDB picks these up automatically.
 
 ### Running queries
 
