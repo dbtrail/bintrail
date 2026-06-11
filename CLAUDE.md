@@ -38,6 +38,7 @@ internal/
   baseline/            # mydumper → Parquet converter (full table state; consumed by reconstruct, not standalone)
   archive/             # Partition archiver → Parquet via baseline.Writer
   parquetquery/        # DuckDB-backed Parquet query engine
+  duckdbutil/          # Shared DuckDB session helpers: EnableS3CredentialChain — aws-extension credential_chain secret wired after every httpfs load (baseline reads, query --include-snapshot, S3 footer metadata, reconcile --deep probes); best-effort with an env-key Debug/Warn discriminator; BINTRAIL_DUCKDB_NO_AWS_EXT=1 skips it (#459)
   storage/             # Abstract storage backend interface (Backend) + S3 implementation for BYOS
   buffer/              # In-memory event buffer for BYOS mode — Insert, Fetch, ResolvePK, Evict, WriteParquet
   byos/                # BYOS data separation: SplitEvent → MetadataRecord (dbtrail API) + PayloadRecord (customer S3 Parquet)

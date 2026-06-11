@@ -25,3 +25,51 @@ func TestEnableS3CredentialChainKeepsSessionUsable(t *testing.T) {
 		t.Fatalf("session unusable after EnableS3CredentialChain: %v (got %d)", err, one)
 	}
 }
+
+// TestEnableS3CredentialChainCreatesSecret pins the success path: when the
+// aws extension is available, the chain secret must actually exist — without
+// this, renaming the secret, typoing the SQL, or deleting the CREATE entirely
+// keeps the suite green. Dummy env creds make the chain always resolvable
+// (creds-less CI would otherwise hit the legitimate validation failure).
+func TestEnableS3CredentialChainCreatesSecret(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIATESTDUMMY0000000")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "testdummysecret")
+	t.Setenv("BINTRAIL_DUCKDB_NO_AWS_EXT", "")
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	EnableS3CredentialChain(context.Background(), db)
+
+	var loaded bool
+	if err := db.QueryRow("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'aws'").Scan(&loaded); err != nil || !loaded {
+		t.Skip("aws extension unavailable (offline host) — the best-effort fallback branch applies")
+	}
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("chain secret missing after a successful extension load: n=%d err=%v", n, err)
+	}
+}
+
+// TestEnableS3CredentialChainEscapeHatch: BINTRAIL_DUCKDB_NO_AWS_EXT must
+// skip the setup entirely (no INSTALL attempt that could stall behind a
+// blackholing proxy) — no secret, session untouched.
+func TestEnableS3CredentialChainEscapeHatch(t *testing.T) {
+	t.Setenv("BINTRAIL_DUCKDB_NO_AWS_EXT", "1")
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	EnableS3CredentialChain(context.Background(), db)
+
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("escape hatch did not skip the secret setup: n=%d err=%v", n, err)
+	}
+}

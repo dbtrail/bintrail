@@ -1423,7 +1423,7 @@ function credentialsCard(storage) {
   if (aws.container_creds) kvRow(card, "ECS task role", "detected");
   if (aws.web_identity) kvRow(card, "EKS IRSA", "detected");
   card.append(el("p", { class: "form-hint stg-hint", text:
-    "S3 access — uploads, archive reads, and baseline reads — uses the AWS default credential chain of the daemon process: environment keys, a shared profile (incl. SSO), or an IAM role; roles work even when nothing shows as set here. The console never stores keys." }));
+    "S3 access — uploads, archive reads, and baseline reads — uses the AWS default credential chain of the daemon process: environment keys, a shared profile, or an IAM role; roles work even when nothing shows as set here. Baseline reads additionally need DuckDB's aws extension, fetched automatically on first use (offline hosts fall back to environment keys). The console never stores keys." }));
   return card;
 }
 
