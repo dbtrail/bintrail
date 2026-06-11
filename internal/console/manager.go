@@ -56,6 +56,14 @@ type connManager struct {
 	// nor baseline reads apply RBAC redaction.
 	profileActive bool
 
+	// demoteBoot prefers a registry entry over the boot entry as the default
+	// (no-header) selection when registry entries exist. Set by source-less
+	// `bintrail-console watch`: its boot index is only the control plane's
+	// anchor database — no stream ever writes to it — so landing new tabs
+	// there shows a permanently empty index. The boot entry stays listed and
+	// selectable. Written once before serving (console.New); read under mu.
+	demoteBoot bool
+
 	mu      sync.Mutex
 	bundles map[string]*bundle
 	locks   map[string]*sync.Mutex // per-id single-flight for lazy opens
@@ -86,24 +94,23 @@ func newConnManager(reg *Registry, profileActive bool) *connManager {
 // fan-out a tab switch fires (capabilities + schemas + events) opens ONE
 // connection, not four.
 func (cm *connManager) Resolve(ctx context.Context, id string) (*bundle, error) {
+	if id == "" {
+		// The no-header default must match defaultID() exactly — /api/servers
+		// reports that id as default_id and the switcher renders it selected,
+		// so resolving "" anywhere else would render one server while
+		// querying another.
+		if id = cm.defaultID(); id == "" {
+			return nil, errNoServers
+		}
+	}
 	cm.mu.Lock()
-	if id == "" || id == bootServerID {
-		if cm.boot != nil {
-			b := cm.boot
+	if id == bootServerID {
+		if b := cm.boot; b != nil {
 			cm.mu.Unlock()
 			return b, nil
 		}
-		if id == bootServerID {
-			cm.mu.Unlock()
-			return nil, ErrUnknownServer
-		}
-		// Registry-only console: default to the first entry.
-		entries := cm.reg.List()
-		if len(entries) == 0 {
-			cm.mu.Unlock()
-			return nil, errNoServers
-		}
-		id = entries[0].ID
+		cm.mu.Unlock()
+		return nil, ErrUnknownServer
 	}
 	if b, ok := cm.bundles[id]; ok {
 		cm.mu.Unlock()
@@ -305,15 +312,29 @@ func (cm *connManager) capability(entry ServerEntry) bool {
 }
 
 // defaultID returns the id the browser falls back to with no header: the boot
-// entry when present, else the first registry entry, else "".
+// entry when present, else the first registry entry, else "". Under demoteBoot
+// the preference inverts when registry entries exist: the first entry with a
+// source (a monitored server — where events actually land), else the first
+// entry. The boot entry stays selectable; it just stops being the landing
+// default for fresh tabs.
 func (cm *connManager) defaultID() string {
 	cm.mu.Lock()
 	boot := cm.boot
+	demote := cm.demoteBoot
 	cm.mu.Unlock()
+	entries := cm.reg.List()
 	if boot != nil {
-		return bootServerID
+		if !demote || len(entries) == 0 {
+			return bootServerID
+		}
+		for _, e := range entries {
+			if e.SourceDSN != "" {
+				return e.ID
+			}
+		}
+		return entries[0].ID
 	}
-	if entries := cm.reg.List(); len(entries) > 0 {
+	if len(entries) > 0 {
 		return entries[0].ID
 	}
 	return ""

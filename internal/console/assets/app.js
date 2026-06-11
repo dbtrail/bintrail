@@ -39,7 +39,7 @@ const EVENT_CSV_COLUMNS = [
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
-const ROUTES = ["overview", "events", "timetravel", "recover", "status"];
+const ROUTES = ["overview", "events", "timetravel", "recover", "status", "storage"];
 
 const MON_STATE_TITLES = {
   failed: "stream failing — retrying with backoff; press Start for details",
@@ -538,6 +538,8 @@ function navigate(route, params, push = true) {
   if (!ROUTES.includes(route)) route = "overview";
   // Reconstruct surface is gated; never navigate to a disabled Time-travel.
   if (route === "timetravel" && !capsCache.reconstruct) route = "overview";
+  // Storage is a watch-daemon surface (rotation + archiving live there).
+  if (route === "storage" && !capsCache.monitor) route = "overview";
   const qs = params && Object.keys(params).length
     ? "?" + new URLSearchParams(params).toString() : "";
   if (push) history.pushState({ route }, "", "/" + route + qs);
@@ -555,6 +557,7 @@ function renderRoute() {
     case "timetravel": return renderTimetravel(params);
     case "recover": return renderRecover(params);
     case "status": return renderStatus();
+    case "storage": return renderStorage();
     default: return renderOverview();
   }
 }
@@ -1329,6 +1332,171 @@ function updateSideMeta(status) {
   }
 }
 
+// ── Storage (rotation · S3 archiving · baselines · credentials) ──────────────
+
+async function renderStorage() {
+  // Gated like Time-travel: a direct URL / Back with the capability off must
+  // REWRITE the URL (replaceState) before re-dispatching — see renderTimetravel.
+  if (!capsCache.monitor) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
+  const gen = serverGen;
+  viewLoading();
+  // Each fetch degrades independently: a panel renders its own failure note
+  // instead of one error wiping the whole page. (A 401 inside api() raises the
+  // sign-in gate and bumps serverGen, so the stale-render guard below bails.)
+  const [serversRes, rotation, storage, baselines] = await Promise.all([
+    api("/api/servers").catch(() => null),
+    api("/api/rotation").catch(() => null),
+    api("/api/storage").catch(() => null),
+    api("/api/baselines").catch((err) => ({ error: (err && err.message) || String(err) })),
+  ]);
+  if (gen !== serverGen) return;
+  buildStorage((serversRes && serversRes.servers) || [], rotation, storage, baselines);
+}
+
+function buildStorage(servers, rotation, storage, baselines) {
+  const v = VIEW(); clear(v);
+  const sub = el("p", { class: "page-sub" },
+    "Where captured history lives beyond the index — per-source S3 archiving, the rotation that feeds it, and the baselines Time-travel reads. ",
+    el("b", { text: "No credentials are stored here" }),
+    " — uploads use the daemon's ambient AWS identity.");
+  v.append(pageHead("Storage", sub));
+
+  const cards = el("div", { class: "cards" });
+  cards.append(rotationCard(rotation));
+  cards.append(credentialsCard(storage));
+  cards.append(baselineSummaryCard(baselines));
+  v.append(cards);
+
+  const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
+  grid.append(archivingPanel(servers));
+  grid.append(baselinesPanel(baselines, servers));
+  v.append(grid);
+  viewEnter();
+}
+
+function kvRow(card, k, val) {
+  card.append(el("div", { class: "kv" },
+    el("span", { class: "kv-k", text: k }),
+    el("span", { class: "kv-v", text: val === null || val === undefined || val === "" ? "—" : String(val) })));
+}
+
+function rotationCard(rot) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Rotation" }));
+  if (!rot) {
+    card.append(el("p", { class: "form-hint", text: "Could not load the rotation policy." }));
+    return card;
+  }
+  kvRow(card, "retention", rot.retain);
+  kvRow(card, "interval", rot.interval);
+  kvRow(card, "future partitions", rot.add_future);
+  kvRow(card, "policy", rot.source === "override" ? "console override (live)" : "daemon defaults");
+  if (!rot.enabled) card.append(el("p", { class: "form-hint", text: "Rotation is OFF at the daemon (--rotate-retain off) — saved changes need a restart." }));
+  card.append(el("div", { class: "stg-cardfoot" },
+    el("button", { class: "btn btn-sm", type: "button", text: "Edit rotation…", onclick: showRotationDialog })));
+  return card;
+}
+
+function credentialsCard(storage) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "AWS credentials" }));
+  const aws = storage && storage.aws;
+  if (!aws) {
+    card.append(el("p", { class: "form-hint", text: "Could not read the daemon's credential signals." }));
+    return card;
+  }
+  kvRow(card, "access keys (env)", aws.access_key_env ? "set" : "not set");
+  kvRow(card, "profile (env)", aws.profile || "—");
+  kvRow(card, "region (env)", aws.region_env || "—");
+  kvRow(card, "~/.aws config", aws.shared_config ? "present" : "absent");
+  if (aws.container_creds) kvRow(card, "ECS task role", "detected");
+  if (aws.web_identity) kvRow(card, "EKS IRSA", "detected");
+  card.append(el("p", { class: "form-hint stg-hint", text:
+    "S3 access uses the AWS default credential chain of the daemon process — environment keys, a shared profile (incl. SSO), or an IAM role. EC2/ECS/EKS roles work even when nothing shows as set here. The console never stores keys." }));
+  return card;
+}
+
+function baselineSummaryCard(b) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Baselines" }));
+  if (!b || b.error) {
+    card.append(el("p", { class: "form-hint", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));
+    return card;
+  }
+  if (!b.configured) {
+    kvRow(card, "source", "not configured");
+    card.append(el("p", { class: "form-hint stg-hint", text:
+      "Set a Baseline dir / S3 on the server (Manage servers → Edit → Advanced) to enable Time-travel." }));
+    return card;
+  }
+  const snaps = b.snapshots || [];
+  kvRow(card, "source", b.source);
+  kvRow(card, "snapshots", String(snaps.length) + (b.truncated ? "+" : ""));
+  kvRow(card, "latest", snaps.length ? snaps[0].time : "none yet");
+  if (snaps.length) kvRow(card, "age", formatAge(snaps[0].age_hours));
+  kvRow(card, "time-travel", b.reconstruct ? "enabled" : "off (archives disabled)");
+  return card;
+}
+
+function formatAge(hours) {
+  if (hours == null) return "—";
+  if (hours < 1) return Math.max(1, Math.round(hours * 60)) + " min";
+  if (hours < 48) return Math.round(hours) + " h";
+  return Math.round(hours / 24) + " day(s)";
+}
+
+function archivingPanel(servers) {
+  const panel = el("section", { class: "ov-panel" });
+  panel.append(el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "S3 archiving per source" }),
+    el("a", { class: "btn btn-sm btn-ghost", text: "Manage servers ›", onclick: openServersModal })));
+  const list = el("div", { class: "stg-list" });
+  const sources = servers.filter((s) => s.has_source);
+  if (!sources.length) {
+    list.append(el("div", { class: "ev-empty", text: "No monitored sources yet — add one under Manage servers." }));
+  } else {
+    sources.forEach((s) => {
+      const row = el("div", { class: "stg-row" });
+      row.append(el("span", { class: "stg-name", text: s.name }));
+      row.append(el("span", { class: "stg-dest" + (s.archive_s3 ? "" : " muted"), text: s.archive_s3 || "drop-only (no S3 destination)" }));
+      if (s.monitor_state) row.append(el("span", { class: "chip chip-mon", text: s.monitor_state.replace("_", " ").toUpperCase(), title: MON_STATE_TITLES[s.monitor_state] || ("monitoring " + s.monitor_state) }));
+      row.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Configure",
+        onclick: () => { openServersModal(); editServer(s.id); } }));
+      list.append(row);
+    });
+  }
+  panel.append(list);
+  panel.append(el("p", { class: "form-hint stg-foot", text:
+    "Rotated index partitions upload to the source's bucket as Parquet before they are dropped — history survives retention and stays queryable. The boot (cli) index rotates drop-only." }));
+  return panel;
+}
+
+function baselinesPanel(b, servers) {
+  const panel = el("section", { class: "ov-panel" });
+  const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
+  panel.append(el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Baseline snapshots" + (cur ? " — " + serverLabel(cur) : "") })));
+  const list = el("div", { class: "stg-list" });
+  if (!b || b.error) {
+    list.append(el("div", { class: "ev-empty", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));
+  } else if (!b.configured) {
+    list.append(el("div", { class: "ev-empty", text:
+      "No baseline source configured for this server. Baselines are full-table Parquet snapshots (bintrail dump → bintrail baseline); with one configured, Time-travel reconstructs complete rows — not just rows with binlog activity." }));
+  } else if (!(b.snapshots || []).length) {
+    list.append(el("div", { class: "ev-empty", text:
+      "Source configured (" + b.source + ") but no snapshots found yet — run bintrail dump + bintrail baseline to create the first one." }));
+  } else {
+    b.snapshots.forEach((sn) => {
+      const row = el("div", { class: "stg-row" });
+      row.append(el("span", { class: "stg-name mono", text: sn.time }));
+      row.append(el("span", { class: "stg-dest", text:
+        (sn.tables || []).length + " table(s)" + (sn.binlog_file ? " · " + sn.binlog_file + ":" + sn.binlog_pos : "") }));
+      row.append(el("span", { class: "stg-age", text: formatAge(sn.age_hours) + " ago" }));
+      list.append(row);
+    });
+    if (b.truncated) list.append(el("div", { class: "ev-empty", text: "…older snapshots not shown." }));
+  }
+  panel.append(list);
+  return panel;
+}
+
 // ── schemas / tables cascade ──────────────────────────────────────────────────
 
 async function loadSchemas() {
@@ -1416,7 +1584,13 @@ async function gateCapabilities() {
 
 // ── server registry: switcher + modal CRUD ──────────────────────────────────
 
-function serverLabel(s) { return s.kind === "ephemeral" ? s.name + " (cli)" : s.name; }
+// serverLabel: the ephemeral boot entry's name is the reserved id "default",
+// which reads as meaningless in the switcher — label it by its database name
+// (what the entry actually is: the daemon's own index DB from --index-dsn).
+function serverLabel(s) {
+  if (s.kind === "ephemeral") return (s.dbname || s.name) + " (cli)";
+  return s.name;
+}
 
 async function loadServers() {
   const data = await api("/api/servers");
@@ -1427,7 +1601,15 @@ async function loadServers() {
   const sel = document.getElementById("server-select");
   if (sel) {
     clear(sel);
-    servers.forEach((s) => sel.append(opt(s.id, serverLabel(s))));
+    // Registry servers first; the ephemeral boot entry goes last — it is the
+    // daemon's anchor index, not where a monitored source's events land.
+    const ordered = servers.filter((s) => s.kind !== "ephemeral")
+      .concat(servers.filter((s) => s.kind === "ephemeral"));
+    ordered.forEach((s) => {
+      const o = opt(s.id, serverLabel(s));
+      if (s.kind === "ephemeral") o.title = "The daemon's own index database (from --index-dsn) — not a monitored source";
+      sel.append(o);
+    });
     sel.value = currentServer || defaultServerId;
   }
   return servers;
@@ -1869,6 +2051,7 @@ function cmdkCommands() {
     { group: "Navigate", label: "Status", run: () => navigate("status") },
   ];
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
+  if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Storage", run: () => navigate("storage") });
   cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });
   if (capsCache.monitor) cmds.push({ group: "Actions", label: "Configure rotation…", run: () => { closeCmdk(); showRotationDialog(); } });
   if (capsCache.auth) {
@@ -1995,7 +2178,16 @@ async function init() {
   // fresh — clear any carried "Undo" context so the sidebar's Recover link
   // never shows a stale banner (the undoEvent bridge sets it and navigates
   // directly, bypassing this handler, so its context survives).
-  $all(".nav-item").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); pendingRecover = null; navigate(a.dataset.route); }));
+  $all(".nav-item").forEach((a) => a.addEventListener("click", (e) => {
+    e.preventDefault();
+    // Route-less nav items are modal triggers (e.g. #nav-rotation) with their
+    // own bindings — navigate(undefined) would coerce to /overview and repaint
+    // the view behind the modal.
+    if (!a.dataset.route) return;
+    pendingRecover = null;
+    navigate(a.dataset.route);
+  }));
+  document.getElementById("nav-rotation").addEventListener("click", showRotationDialog);
   window.addEventListener("popstate", renderRoute);
 
   // Pre-auth gate: ask the (unauthenticated) probe how this console

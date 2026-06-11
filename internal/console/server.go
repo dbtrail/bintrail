@@ -40,6 +40,13 @@ type Config struct {
 	// BootDSN is the boot entry's DSN, used ONLY to render the masked
 	// host/user/dbname view in /api/servers. Optional.
 	BootDSN string
+	// DemoteBoot prefers a registry entry over the boot entry as the default
+	// (no-header) selection when registry entries exist. Set by source-less
+	// `bintrail-console watch`: its boot index is only the control plane's
+	// anchor database — no stream ever writes to it — so landing new tabs
+	// there would show a permanently empty index. The boot entry stays
+	// listed and selectable.
+	DemoteBoot bool
 	// Registry is the named-server store (a local YAML file — the only thing
 	// the console ever writes). nil means an empty in-memory registry.
 	Registry *Registry
@@ -245,6 +252,7 @@ func New(cfg Config) (*Server, error) {
 		loginLimiter:     newLoginLimiter(),
 		tlsConf:          tlsConf,
 	}
+	s.cm.demoteBoot = cfg.DemoteBoot
 
 	// Seed the ephemeral boot bundle when the caller supplied a command-line
 	// connection (or baseline config for it). Its derived state — noArchive
@@ -303,6 +311,11 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("POST /api/recover", s.handleRecover)
 	api.HandleFunc("GET /api/capabilities", s.handleCapabilities)
 	api.HandleFunc("GET /api/reconstruct", s.handleReconstruct)
+	// Storage surfaces (read-only): the selected server's baseline snapshot
+	// listing, and the process's ambient AWS credential signals (presence
+	// booleans and non-secret names — never values).
+	api.HandleFunc("GET /api/baselines", s.handleBaselines)
+	api.HandleFunc("GET /api/storage", s.handleStorageInfo)
 	// Server management: CRUD over the local registry file (never a DB write)
 	// plus a write-free test-connection probe. Same token + host guard as the
 	// data endpoints.

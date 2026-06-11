@@ -339,6 +339,11 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 		return err
 	}
 	cfg.Registry = registry
+	// Source-less daemon: nothing ever streams into the boot index (each
+	// "+ Add server" source gets its own per-source database), so prefer a
+	// registry server — where events actually land — as the browser default.
+	// The boot entry stays listed and selectable.
+	cfg.DemoteBoot = true
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

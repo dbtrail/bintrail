@@ -145,6 +145,137 @@ func ExecSQL(ctx context.Context, source, sqlStr string) ([]map[string]any, []st
 	return results, cols, rows.Err()
 }
 
+// ─── listing ──────────────────────────────────────────────────────────────────
+
+// BaselineFile is one table's Parquet file discovered in a baseline source
+// listing. Path-derived only — no file contents are read — so listing stays
+// cheap over both a local directory and an s3:// prefix. Binlog coordinates
+// live in Parquet metadata and are the caller's (optional) enrichment step.
+type BaselineFile struct {
+	SnapshotTime time.Time
+	Schema       string
+	Table        string
+	Path         string
+}
+
+// ListBaselines enumerates every baseline snapshot file under source (a local
+// directory or an s3:// prefix), newest snapshot first (then schema/table for
+// a stable render order). Entries that don't match the
+// <timestamp>/<schema>/<table>.parquet layout are skipped, mirroring
+// FindBaseline's tolerance.
+func ListBaselines(ctx context.Context, source string) ([]BaselineFile, error) {
+	if strings.HasPrefix(source, "s3://") {
+		return listBaselinesS3(ctx, source)
+	}
+	return listBaselinesLocal(source)
+}
+
+func listBaselinesLocal(baselineDir string) ([]BaselineFile, error) {
+	entries, err := os.ReadDir(baselineDir)
+	if err != nil {
+		return nil, fmt.Errorf("read baseline directory %q: %w", baselineDir, err)
+	}
+	var out []BaselineFile
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		ts, ok := parseDirTimestamp(entry.Name())
+		if !ok {
+			continue
+		}
+		snapDir := filepath.Join(baselineDir, entry.Name())
+		dbDirs, err := os.ReadDir(snapDir)
+		if err != nil {
+			continue
+		}
+		for _, dbDir := range dbDirs {
+			if !dbDir.IsDir() {
+				continue
+			}
+			files, err := os.ReadDir(filepath.Join(snapDir, dbDir.Name()))
+			if err != nil {
+				continue
+			}
+			for _, f := range files {
+				if f.IsDir() || !strings.HasSuffix(f.Name(), ".parquet") {
+					continue
+				}
+				out = append(out, BaselineFile{
+					SnapshotTime: ts,
+					Schema:       dbDir.Name(),
+					Table:        strings.TrimSuffix(f.Name(), ".parquet"),
+					Path:         filepath.Join(snapDir, dbDir.Name(), f.Name()),
+				})
+			}
+		}
+	}
+	sortBaselineFiles(out)
+	return out, nil
+}
+
+func listBaselinesS3(ctx context.Context, s3URL string) ([]BaselineFile, error) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		return nil, fmt.Errorf("open duckdb: %w", err)
+	}
+	defer db.Close()
+	if err := pinDuckDBSessionUTC(ctx, db); err != nil {
+		return nil, err
+	}
+	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+		return nil, fmt.Errorf("load httpfs extension: %w", err)
+	}
+
+	prefix := strings.TrimSuffix(s3URL, "/")
+	safeGlob := strings.ReplaceAll(prefix+"/*/*/*.parquet", "'", "''")
+	rows, err := db.QueryContext(ctx, "SELECT * FROM glob('"+safeGlob+"')")
+	if err != nil {
+		return nil, fmt.Errorf("list S3 baseline snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var out []BaselineFile
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			continue
+		}
+		rest := strings.TrimPrefix(path, prefix+"/")
+		parts := strings.Split(rest, "/")
+		if len(parts) != 3 || !strings.HasSuffix(parts[2], ".parquet") {
+			continue
+		}
+		ts, ok := parseDirTimestamp(parts[0])
+		if !ok {
+			continue
+		}
+		out = append(out, BaselineFile{
+			SnapshotTime: ts,
+			Schema:       parts[1],
+			Table:        strings.TrimSuffix(parts[2], ".parquet"),
+			Path:         path,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate S3 baseline list: %w", err)
+	}
+	sortBaselineFiles(out)
+	return out, nil
+}
+
+func sortBaselineFiles(files []BaselineFile) {
+	slices.SortFunc(files, func(a, b BaselineFile) int {
+		if c := b.SnapshotTime.Compare(a.SnapshotTime); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.Schema, b.Schema); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Table, b.Table)
+	})
+}
+
 // ─── local ────────────────────────────────────────────────────────────────────
 
 func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string, time.Time, error) {

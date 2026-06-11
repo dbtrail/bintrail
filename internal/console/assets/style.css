@@ -1212,3 +1212,23 @@ button { font-family: inherit; }
 
 /* loading shimmer for #view while a screen fetches */
 .view-loading { font-family: var(--f-mono); font-size: 12.5px; color: var(--ink-4); padding: 20px 2px; }
+
+/* ── Storage page (Settings) ── */
+.stg-list { display: flex; flex-direction: column; padding: 2px 14px 10px; }
+.stg-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 0; border-bottom: 1px solid var(--line-soft);
+  font-size: 13px;
+}
+.stg-row:last-child { border-bottom: none; }
+.stg-name { font-weight: 600; color: var(--ink); white-space: nowrap; }
+.stg-name.mono { font-family: var(--f-mono); font-weight: 500; font-size: 12.5px; }
+.stg-dest {
+  color: var(--ink-2); flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.stg-dest.muted { color: var(--ink-3); }
+.stg-age { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
+.stg-foot { padding: 0 14px 12px; margin: 6px 0 0; }
+.stg-hint { margin-bottom: 0; }
+.stg-cardfoot { margin-top: 12px; }

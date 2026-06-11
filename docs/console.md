@@ -102,10 +102,18 @@ under `watch` — see the control plane below).
 How it behaves:
 
 - **The command-line entry.** `--index-dsn` (or `watch`'s stream index)
-  appears as an ephemeral `default (cli)` entry: it is the initial selection,
-  is never written to the registry file, and cannot be edited or deleted from
-  the UI. With at least one saved server, `--index-dsn` becomes optional — the
-  console can start registry-only.
+  appears as an ephemeral entry labeled by its database name, e.g.
+  `bintrail_index (cli)`: it is never written to the registry file and cannot
+  be edited or deleted from the UI. With at least one saved server,
+  `--index-dsn` becomes optional — the console can start registry-only.
+  **It is a connection to the daemon's own index database, not a monitored
+  source** — under source-less `watch` nothing ever streams into it (each
+  added source gets its own per-source database), so it legitimately shows 0
+  events with a full set of provisioned partitions. For that reason a
+  source-less `watch` daemon **demotes** it: fresh tabs land on the first
+  monitored registry server instead, and the cli entry sorts last in the
+  switcher (still selectable — its Status shows the boot index and the
+  rotation that maintains it).
 - **Lazy connections.** Saved servers connect on first selection (with an
   eager ping, so a dead server fails the moment you switch to it, not on your
   first query). Editing a server's connection details closes and reopens its
@@ -215,8 +223,9 @@ the `monitor` capability is false and the verbs return 403 there.
 `bintrail-console watch` runs the built-in rotation loop that keeps the index
 from growing without bound: it drops binlog partitions older than a **retention
 window** every **interval**, keeping a few **future partitions** ready. Under
-`watch` you can tune that policy from the console — **⌘K → "Configure
-rotation…"** — without editing flags or restarting:
+`watch` you can tune that policy from the console — the sidebar's
+**Settings → Rotation** entry, or **⌘K → "Configure rotation…"** — without
+editing flags or restarting:
 
 - **Live:** changes apply on the loop's next cycle. Retention and future-partition
   count take effect immediately; a changed interval re-tunes the schedule.
@@ -232,6 +241,30 @@ rotation…"** — without editing flags or restarting:
   off. A retain like `off` is rejected at save.
 - The standalone `bintrail-console serve` hides the panel and refuses the write
   (HTTP 403) — only the daemon running the loop consumes the policy.
+
+### The Storage page
+
+Under `watch` the sidebar grows a **Settings → Storage** page that gathers
+everything S3/baseline-related in one place (it was previously scattered
+across the rotation dialog and the per-server edit form):
+
+- **Rotation** — the effective policy (override vs daemon defaults) with an
+  edit shortcut to the rotation dialog.
+- **S3 archiving per source** — every monitored server with its
+  `Archive to S3` destination (or `drop-only` when none), with a shortcut into
+  that server's edit form. The boot (cli) index always rotates drop-only.
+- **Baseline snapshots** — a read-only listing of the **selected server's**
+  baseline source (`baseline_dir` / `baseline_s3`): each snapshot's timestamp,
+  age, table count, and (local sources) the binlog coordinates its deltas
+  start from. The empty states explain how to produce a first baseline
+  (`bintrail dump` → `bintrail baseline`).
+- **AWS credentials** — which ambient credential signals the daemon process
+  can see: env keys (presence only, never values), `AWS_PROFILE`,
+  `AWS_REGION`, a shared `~/.aws` config, ECS task-role / EKS IRSA markers.
+  **The console never stores AWS keys** — uploads and reads use the AWS
+  default credential chain of the daemon (environment, shared profile incl.
+  SSO, or an IAM role; EC2/ECS/EKS roles work even when nothing shows as set,
+  since instance roles are not detectable without a metadata call).
 
 ## Flags
 
@@ -408,6 +441,8 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `GET /api/servers/{id}/monitor` | Supervisor only: `{monitor: {state, last_error, since}}` — `stopped\|pending\|running\|stalled\|lost_position\|failed`. |
 | `GET /api/rotation` | Effective global rotation policy: `{retain, interval, add_future, source, enabled}` — `source` is `"override"` (console-saved) or `"default"` (daemon `--rotate-*`). |
 | `PUT /api/rotation` | Supervisor only (403 on the standalone console): save a global rotation override `{retain, interval, add_future}` (validated; `off` rejected). Applies live on the next cycle. |
+| `GET /api/baselines` | Read-only listing of the **selected server's** baseline snapshots, grouped per snapshot: `{configured, source, kind, reconstruct, snapshots: [{time, age_hours, tables, binlog_file, binlog_pos, gtid_set}]}` (coordinates local-only, capped at 50 snapshots). `502` when the configured source is unreadable. |
+| `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`, `capabilities`,
 `reconstruct`) targets the server named by the `X-Bintrail-Server` request

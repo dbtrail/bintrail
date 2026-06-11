@@ -260,6 +260,17 @@ UPDATE id=5: status=published→deleted (at 14:03)
 
 Reversed: undo the 14:03 UPDATE first, then the 14:02 UPDATE, then the 14:01 INSERT. This is the correct rollback order for any sequence of operations on the same row.
 
+> **Foreign keys are NOT handled.** Reverse-chronological ordering is the only
+> ordering `bintrail recover` applies — there is no FK-graph analysis, no
+> topological reordering across tables, and the generated script never emits
+> `SET FOREIGN_KEY_CHECKS`. Tables with `ON DELETE/UPDATE CASCADE` produce
+> side-effect row changes that reversal SQL cannot reliably undo
+> (`bintrail doctor` warns about them, and ingestion refuses to start against
+> a source that has them). The FK-aware recovery described on dbtrail.com
+> (parent resolution via `resolve_fk`, dependent ordering) is a dbtrail
+> platform feature, not part of this binary — even though the hosted `recover`
+> tool shares its name with the CLI command and the console tab.
+
 ### WHERE Clause Strategy
 
 For `UPDATE` and `DELETE` reversals, the generator needs a `WHERE` clause to identify the correct row in the current database state.
