@@ -1,5 +1,6 @@
 // bintrail-mcp is an MCP (Model Context Protocol) server that exposes
-// read-only Bintrail operations as tools: query, recover, and status.
+// read-only Bintrail operations as tools: query, recover, status, and
+// list_schema_changes.
 //
 // By default it communicates over stdio (for use as a subprocess by Claude
 // Code, Cursor, etc.). Pass --http <addr> to start an HTTP server instead,

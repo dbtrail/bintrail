@@ -206,7 +206,7 @@ Once connected, in the Inspector UI:
 
 **Test `tools/list`:**
 1. Click **Tools** in the sidebar
-2. You should see three tools: `query`, `recover`, `status`
+2. You should see four tools: `query`, `recover`, `status`, `list_schema_changes`
 
 **Test `tools/call`:**
 1. Click on the `status` tool
@@ -644,7 +644,7 @@ Verify the docs are complete and accurate:
 ## Summary: All Checks
 
 ### Integration Testing
-- [ ] Claude.ai: Add connector → OAuth flow → query/recover/status tools work
+- [ ] Claude.ai: Add connector → OAuth flow → query/recover/status/list_schema_changes tools work
 - [ ] Claude.ai: Token refresh (wait >1 hour, query again)
 - [ ] Claude.ai: Two-tenant data isolation
 - [ ] Claude Desktop: Add connector via UI → tools work → SSE streaming works

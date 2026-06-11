@@ -227,7 +227,7 @@ Connect through ProxySQL:
 mysql -u app_user -p -h 127.0.0.1 -P 6033 myapp
 ```
 
-Five statement shapes are recognised:
+Six statement shapes are recognised:
 
 ```sql
 -- Row state at a point in time (point-lookup, fast):
@@ -236,6 +236,11 @@ SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
 -- The same, on the REAL table name — the AS OF clause must END the
 -- statement (#385). Rewritten internally to _flashback (binlog-only):
 SELECT * FROM orders WHERE id = 12345 AS OF '2026-05-02 10:00:00';
+
+-- Optimizer-hint form on the real table name (ORM-friendly: survives query
+-- builders that would reject AS OF syntax). `*`-only — a column list here
+-- is a parse error:
+SELECT /*+ DBTRAIL_AT='2026-05-02 10:00:00' */ * FROM orders WHERE id = 12345;
 
 -- Full-table reconstruction at AS OF (no WHERE). Against _snapshot (with a
 -- baseline configured) this is every row that existed at that instant;
@@ -247,6 +252,8 @@ SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00';
 -- All events for one row in a time window:
 SELECT * FROM _diff.orders BETWEEN '2026-05-01' AND '2026-05-02' WHERE id = 12345;
 ```
+
+Every quoted time literal — in `AS OF`, `DBTRAIL_AT`, and the `BETWEEN` bounds — accepts four absolute formats (`'2026-05-02 10:00:00'`, RFC 3339 `'2026-05-02T10:00:00Z'`, zone-less `'2026-05-02T10:00:00'`, and date-only `'2026-05-02'`), plus `'now'` and relative forms `'<n> seconds|minutes|hours|days ago'` (e.g. `AS OF '5 minutes ago'`), resolved against the wall clock at parse time. Larger units (weeks, months) are deliberately not parsed — spell them as days.
 
 On the `_flashback` / `_snapshot` shapes a column list may replace `*` and the optional `TIMESTAMP` keyword may follow `AS OF` (Oracle / SQL Server convention):
 

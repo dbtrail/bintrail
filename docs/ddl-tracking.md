@@ -181,11 +181,20 @@ Key fields:
 
 | Field | Description |
 |---|---|
-| `ddl_type` | One of `ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`, `RENAME TABLE` |
+| `ddl_type` | One of `ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`, `RENAME TABLE`, `TRUNCATE TABLE` |
 | `ddl_query` | The full DDL statement from the binlog |
 | `snapshot_id` | The snapshot taken after this DDL, or NULL if no source connection was available |
 
 This table is created by `bintrail init` and must exist in the index database. Older index databases (created before this feature) won't have it — the status command handles this gracefully by treating a missing table as zero schema changes.
+
+### Querying schema changes from AI (MCP)
+
+The MCP server exposes this table as the `list_schema_changes` tool, so an AI
+assistant can answer "what ALTERs hit the orders table this month?" directly.
+Filters: `schema`, `table`, `ddl_type` (prefix-matched — `ALTER` matches
+`ALTER TABLE`), `since`, `until`, `limit`. Each result carries the full DDL
+statement, binlog coordinates, and detection timestamp. See
+[mcp-server.md](./mcp-server.md).
 
 ---
 

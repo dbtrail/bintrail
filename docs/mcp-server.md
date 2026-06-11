@@ -1,6 +1,6 @@
 # How the MCP Server Works
 
-This page explains `bintrail-mcp` — the Model Context Protocol server that exposes dbtrail's `query`, `recover`, and `status` operations as tools for AI assistants like Claude.
+This page explains `bintrail-mcp` — the Model Context Protocol server that exposes dbtrail's `query`, `recover`, `status`, and `list_schema_changes` operations as tools for AI assistants like Claude.
 
 ---
 
@@ -16,17 +16,20 @@ Claude calls the `query` tool with the right parameters, gets the results back a
 
 ---
 
-## Three Read-Only Tools
+## Four Read-Only Tools
 
-The MCP server exposes three tools, all of which are read-only:
+The MCP server exposes four tools, all of which are read-only:
 
 | Tool | CLI equivalent | Description |
 |------|---------------|-------------|
 | `query` | `bintrail query` | Search indexed binlog events with filters |
 | `recover` | `bintrail recover --dry-run` | Generate reversal SQL (never executes it) |
 | `status` | `bintrail status` | Show indexed files, partitions, and summary |
+| `list_schema_changes` | — (reads the `schema_changes` table, see [DDL tracking](./ddl-tracking.md)) | List DDL changes recorded during indexing or streaming, with the full statement and binlog coordinates |
 
-All three tools are annotated with `ReadOnlyHint: true` and `IdempotentHint: true`. These hints tell the MCP client that it's safe to call them multiple times and that they don't modify any state.
+All four tools are annotated with `ReadOnlyHint: true` and `IdempotentHint: true`. These hints tell the MCP client that it's safe to call them multiple times and that they don't modify any state.
+
+`list_schema_changes` accepts `schema`, `table`, `ddl_type`, `since`, `until`, and `limit` (default 100). `ddl_type` takes `CREATE`, `ALTER`, `DROP`, `RENAME`, or `TRUNCATE` and is prefix-matched against the stored values (`ALTER` matches `ALTER TABLE`). Results come back as JSON, newest first (a plain "No schema changes found." when nothing matches).
 
 ---
 
@@ -39,17 +42,20 @@ cmd/bintrail-mcp/main.go
        │
        ├── queryTool  → resolveArchiveSources → Engine.Fetch + parquetquery.Fetch → MergeResults → Format
        ├── recoverTool → resolveArchiveSources → Engine.Fetch + parquetquery.Fetch → MergeResults → GenerateSQLFromRows
-       └── statusTool → internal/status.LoadIndexState + LoadPartitionStats + WriteStatus
+       ├── statusTool → internal/status.CollectStatus → StatusData.Write
+       └── schemaChangesTool → SELECT … FROM schema_changes (JSON output)
 ```
 
 Both `queryTool` and `recoverTool` automatically discover Parquet archive sources from `archive_state` in the index database (or from `BINTRAIL_ARCHIVE_S3` + `BINTRAIL_ID` env vars). When archives are found, results from MySQL and Parquet are merged, deduplicated, and sorted before formatting or SQL generation. The `no_archive` parameter disables this auto-routing.
+
+Beyond the basic filters (schema, table, pk, event_type, gtid, since, until), both tools accept `changed_column`, `column_eq` (repeatable `column=value` equality filters), `flag` (table/column flag filter), and `profile` (RBAC table-deny + column-redaction); `query` additionally takes `format` (`json`, `table`, or `csv`).
 
 `buildQueryOptions` in `cmd/bintrail-mcp/main.go` is the shared filter builder used by both `queryTool` and `recoverTool`. It calls the same `cliutil.ParseEventType` and `cliutil.ParseTime` helpers that the CLI uses:
 
 ```go
 // cmd/bintrail-mcp/main.go
 func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol string,
-    limit, defaultLimit int) (query.Options, error) {
+    columnEq []string, flagVal string, limit, defaultLimit int) (query.Options, error) {
     // validate pk requires schema+table
     // validate changed_column requires schema+table
     et, err := cliutil.ParseEventType(eventType)
@@ -122,13 +128,20 @@ The server setup is in `newServer()` rather than `main()`:
 ```go
 // cmd/bintrail-mcp/main.go
 func newServer() *mcp.Server {
+    return newServerWithDSN("")
+}
+
+func newServerWithDSN(dsnOverride string) *mcp.Server {
     server := mcp.NewServer(&mcp.Implementation{...}, &mcp.ServerOptions{...})
-    mcp.AddTool(server, &mcp.Tool{Name: "query", ...}, queryTool)
-    mcp.AddTool(server, &mcp.Tool{Name: "recover", ...}, recoverTool)
-    mcp.AddTool(server, &mcp.Tool{Name: "status", ...}, statusTool)
+    mcp.AddTool(server, &mcp.Tool{Name: "query", ...}, makeQueryTool(connectFn))
+    mcp.AddTool(server, &mcp.Tool{Name: "recover", ...}, makeRecoverTool(connectFn))
+    mcp.AddTool(server, &mcp.Tool{Name: "status", ...}, makeStatusTool(resolveFn))
+    mcp.AddTool(server, &mcp.Tool{Name: "list_schema_changes", ...}, makeSchemaChangesTool(connectFn))
     return server
 }
 ```
+
+`newServer()` is a thin wrapper over `newServerWithDSN(dsnOverride)`: a non-empty override forces every tool to use that DSN, ignoring both the env var and the `index_dsn` parameter. Multi-tenant mode (`--tenant-dsns`, see [MCP Gateway](./mcp-gateway.md)) uses it to pin each session to the tenant's index.
 
 `main()` just calls `newServer()` and wires it to a transport. This means unit tests can call `newServer()` directly and pass it an in-memory transport, without starting a subprocess or dealing with stdio framing:
 
@@ -158,7 +171,7 @@ The easiest way to connect Claude to dbtrail. Requires the [MCP Gateway](./mcp-g
 3. Enter the gateway URL: `https://mcp.dbtrail.com/mcp`
 4. Claude auto-discovers the OAuth endpoints, opens the login page
 5. Enter your **tenant ID** and click **Authorize**
-6. Done — `query`, `recover`, and `status` tools are now available
+6. Done — the `query`, `recover`, `status`, and `list_schema_changes` tools are now available
 
 This works from the Claude web app, Claude Desktop, and Claude mobile. Token refresh happens automatically — sessions survive indefinitely without re-authenticating.
 

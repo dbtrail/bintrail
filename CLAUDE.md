@@ -87,7 +87,7 @@ All commands load a `.bintrail.env` file (local) or `~/.config/bintrail/config.e
 
 ## MCP server
 
-`cmd/bintrail-mcp/` exposes three read-only tools (`query`, `recover`, `status`) via stdio (default, `.mcp.json`) or HTTP (`--http :8080`). DSN: `index_dsn` parameter overrides `BINTRAIL_INDEX_DSN` env var. All tools annotated `ReadOnlyHint: true`, `IdempotentHint: true`.
+`cmd/bintrail-mcp/` exposes four read-only tools (`query`, `recover`, `status`, `list_schema_changes`) via stdio (default, `.mcp.json`) or HTTP (`--http :8080`). DSN: `index_dsn` parameter overrides `BINTRAIL_INDEX_DSN` env var. All tools annotated `ReadOnlyHint: true`, `IdempotentHint: true`. `list_schema_changes` reads the `schema_changes` table directly; its `ddl_type` filter is prefix-matched (`ALTER` → `ALTER TABLE`).
 
 Key patterns:
 - `newServer() *mcp.Server` — extracted from `main()` for testability

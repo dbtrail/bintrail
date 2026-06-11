@@ -679,12 +679,13 @@ This is the easy part. Once the gateway is running:
 3. Enter the URL: `https://mcp.dbtrail.com/mcp`
 4. Claude auto-discovers the OAuth endpoints, registers itself, and opens a login page
 5. Enter your **tenant ID** (e.g. `acme-corp`) on the authorization page
-6. Done. Claude now has access to `query`, `recover`, and `status` tools.
+6. Done. Claude now has access to the `query`, `recover`, `status`, and `list_schema_changes` tools.
 
 From now on, you can ask Claude things like:
 - "What changed in the users table in the last 24 hours?"
 - "Show me all DELETEs on the orders table since Monday"
 - "Generate SQL to undo the last 5 updates to order 12345"
+- "Which ALTERs hit the orders table this month?"
 
 ---
 

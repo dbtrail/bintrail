@@ -102,9 +102,9 @@ row). It needs Docker and ~3 minutes; it is not part of `go test ./...`.
 
 ## Publishing notes (maintainers)
 
-`.github/workflows/demo.yml` builds and pushes
+`.github/workflows/demo-image.yml` builds and pushes
 `ghcr.io/dbtrail/bintrail-demo` (amd64, cosign-signed) on every `v*` tag
-push, separately from GoReleaser so an demo build failure never blocks a
+push, separately from GoReleaser so a demo build failure never blocks a
 release. (Not `release: published`: GoReleaser creates the release with the
 default `GITHUB_TOKEN`, whose events never trigger other workflows.) Manual
 runs take an explicit existing tag as a `workflow_dispatch` input. Like the main image, the GHCR package is created

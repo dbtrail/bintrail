@@ -285,6 +285,21 @@ Notes:
   baseline and "now" stays short. Old snapshots are plain directories — prune
   them by deleting `<timestamp>` dirs in the volume.
 
+### Time-travel SQL (`AS OF`) and the compose stack
+
+The console's Time-travel tab and time-travel **SQL** are different surfaces.
+`SELECT … AS OF` queries are answered by `bintrail shim` behind ProxySQL — a
+subcommand of the **core** `bintrail` binary that the console image
+deliberately does not ship — and the compose file includes no shim or ProxySQL
+service. To put `AS OF` SQL in front of this stack, run the core image
+(`ghcr.io/dbtrail/bintrail`) joined to the compose network with
+`shim --index-dsn` pointed at the bundled index (`index-mysql:3306`, password
+from the `bintrail-index-secret` volume — the boot `SOURCE_DSN` entry streams
+into `bintrail_index`), plus a ProxySQL loaded with `bintrail proxysql-config`
+output. The full shim + ProxySQL walkthrough is
+[time-travel-sql.md](./time-travel-sql.md); for a zero-setup taste of the SQL
+surface, use the demo image ([demo.md](./demo.md)).
+
 ## Environment variables
 
 | Variable | Used by | Description |

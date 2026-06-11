@@ -645,7 +645,7 @@ If you're using Claude Code in the dbtrail project directory, the `.mcp.json` fi
    }
    ```
 
-2. Open a Claude Code session in the project directory. The bintrail tools (`query`, `recover`, `status`) are available immediately.
+2. Open a Claude Code session in the project directory. The bintrail tools (`query`, `recover`, `status`, `list_schema_changes`) are available immediately.
 
 3. Try asking:
 
@@ -720,7 +720,7 @@ Keep it running with systemd, launchd, or tmux.
    }
    ```
 
-4. Restart Claude Desktop. The `query`, `recover`, and `status` tools appear automatically.
+4. Restart Claude Desktop. The `query`, `recover`, `status`, and `list_schema_changes` tools appear automatically.
 
 ### Troubleshooting MCP
 

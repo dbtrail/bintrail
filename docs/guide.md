@@ -783,11 +783,12 @@ curl -s localhost:9090/metrics | grep bintrail_stream_replication_lag_seconds
 
 **Situation:** You want to use Claude Desktop (or Claude Code on another machine) to investigate database changes in natural language — without typing CLI commands.
 
-dbtrail ships an MCP server that exposes `query`, `recover`, and `status` as AI tools. Once configured, you can ask Claude things like:
+dbtrail ships an MCP server that exposes `query`, `recover`, `status`, and `list_schema_changes` as AI tools. Once configured, you can ask Claude things like:
 
 - "What got deleted in the last 10 minutes in the orders table?"
 - "Bring back customer 289"
 - "Which tables had the most activity today?"
+- "What schema changes happened this week?"
 
 Claude calls the tools automatically and presents the results.
 
