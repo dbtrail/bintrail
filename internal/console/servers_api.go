@@ -65,9 +65,10 @@ type serverDTO struct {
 
 type serversResponse struct {
 	Servers []serverDTO `json:"servers"`
-	// DefaultID is the entry served when the browser sends no selection
-	// header: the command-line (ephemeral) entry when present, else the first
-	// registry entry.
+	// DefaultID is the entry the switcher renders as selected: the boot
+	// entry when present and not hidden; under HideBoot the first sourced
+	// registry entry, else the first entry; "" on a fresh hidden-boot
+	// install (the browser then renders via the hidden boot fallback).
 	DefaultID string `json:"default_id"`
 }
 
@@ -127,7 +128,8 @@ func (s *Server) handleServersList(w http.ResponseWriter, r *http.Request) {
 	out := []serverDTO{}
 	// On a source-less watch the boot entry is internal plumbing (nothing
 	// streams into it) and is hidden: a fresh install lists no servers. It
-	// still backs header-less requests — see connManager.Resolve.
+	// backs header-less requests until the first entry exists — see
+	// connManager.Resolve — and stays addressable by its reserved id.
 	if dto, ok := s.bootDTO(); ok && !s.cm.bootHidden() {
 		out = append(out, dto)
 	}

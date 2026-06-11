@@ -116,11 +116,13 @@ How it behaves:
   source-less `watch` daemon **hides it entirely**: a fresh install lists no
   servers (the switcher shows "no servers yet" and the Servers dialog is
   empty), and the views render against the internal index underneath until
-  the first server is added; the default selection is then the first
-  monitored server (or the first saved one). The cli entry remains visible
-  where it actually carries data — `serve`, and `watch` with `--source-dsn`
-  (the main stream writes into it) — labeled by its database name and sorted
-  last.
+  the first server is added (a note under the switcher says so — the
+  internal index is not guaranteed empty, e.g. after restarting without a
+  previous `SOURCE_DSN`); the default selection is then the first server
+  with a source configured (or the first saved one). The cli entry remains
+  visible where it actually carries data — `serve`, and `watch` with
+  `--source-dsn` (the main stream writes into it) — labeled by its database
+  name and sorted last in the switcher.
 - **Lazy connections.** Saved servers connect on first selection (with an
   eager ping, so a dead server fails the moment you switch to it, not on your
   first query). Editing a server's connection details closes and reopens its

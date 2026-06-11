@@ -68,6 +68,7 @@ let pendingRecover = null;    // event context carried into Recover via "Undo"
 let schemaCache = null;       // cached schema list for the selected server
 const tablesCache = new Map();// schema → tables[]
 let cursorIdx = -1;           // keyboard cursor row on Events
+let serversEmpty = false;     // no listed servers (hidden-boot fresh install)
 
 // ── token bootstrap ────────────────────────────────────────────────────────
 
@@ -1318,7 +1319,7 @@ function updateSideMeta(status) {
   const s0 = servers[0];
   const conn = s0 ? (s0.username + "@" + s0.host + ":" + s0.port) : "—";
   const connEl = document.getElementById("meta-conn");
-  if (connEl) connEl.textContent = conn;
+  if (connEl) connEl.textContent = serversEmpty && capsCache.monitor ? "internal index" : conn;
   const streamEl = document.getElementById("meta-stream");
   if (streamEl) {
     clear(streamEl);
@@ -1496,8 +1497,10 @@ function archivingPanel(servers, serversErr) {
 function baselinesPanel(b, servers) {
   const panel = el("section", { class: "ov-panel" });
   const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
+  let owner = cur ? serverLabel(cur) : "";
+  if (!owner && b && !b.error && b.configured) owner = "daemon (--baseline-dir / --baseline-s3)";
   panel.append(el("div", { class: "ov-panel-head" },
-    el("h2", { class: "ov-panel-title", text: "Baseline snapshots" + (cur ? " — " + serverLabel(cur) : "") })));
+    el("h2", { class: "ov-panel-title", text: "Baseline snapshots" + (owner ? " — " + owner : "") })));
   const list = el("div", { class: "stg-list" });
   if (!b || b.error) {
     list.append(el("div", { class: "ev-empty", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));
@@ -1593,6 +1596,17 @@ function wireSchemaCascade(root) {
   $all(".schema-select", root).forEach((sel) => sel.addEventListener("change", () => loadTables(sel.closest("form"))));
 }
 
+// updateSrvNote labels where header-less data comes from when no servers are
+// listed. The hidden boot index is NOT guaranteed empty — a daemon restarted
+// without its previous SOURCE_DSN, or pointed at a reused index DB, renders
+// real history here — so the origin must be attributed right under the
+// "no servers yet" switcher, not only in the docs. Monitor-gated: on a
+// registry-only serve an empty list 404s instead, where this label would lie.
+function updateSrvNote() {
+  const n = document.getElementById("srv-note");
+  if (n) n.hidden = !(serversEmpty && capsCache.monitor);
+}
+
 // ── capabilities gating ────────────────────────────────────────────────────
 
 async function gateCapabilities() {
@@ -1611,6 +1625,7 @@ async function gateCapabilities() {
   capsCache = caps || {};
   $all("[data-capability]").forEach((node) => node.classList.toggle("cap-on", !!capsCache[node.dataset.capability]));
   applyAuthGate();
+  updateSrvNote(); // capsCache.monitor may have just changed
 }
 
 // ── server registry: switcher + modal CRUD ──────────────────────────────────
@@ -1629,12 +1644,14 @@ async function loadServers() {
   const servers = data.servers || [];
   // Reconcile a stale selection (server deleted elsewhere).
   if (currentServer && !servers.some((s) => s.id === currentServer)) setCurrentServer("");
+  serversEmpty = !servers.length;
+  updateSrvNote();
   const sel = document.getElementById("server-select");
   if (sel) {
     clear(sel);
     if (!servers.length) {
-      // Fresh install under source-less watch: the internal boot index is
-      // hidden, so there are genuinely no servers yet.
+      // No listed servers: a hidden-boot fresh install (source-less watch),
+      // or a registry-only console whose last entry was deleted.
       const o = opt("", "no servers yet");
       o.disabled = true;
       sel.append(o);

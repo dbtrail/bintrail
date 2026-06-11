@@ -1242,3 +1242,8 @@ button { font-family: inherit; }
   background: var(--surface-3); border-radius: 4px; padding: 7px 10px;
   align-self: flex-start; overflow-x: auto; max-width: 100%;
 }
+
+.srv-note {
+  margin-top: 6px; padding: 0 2px;
+  font-size: 11px; line-height: 1.45; color: var(--ink-3);
+}

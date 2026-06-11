@@ -342,7 +342,8 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	// Source-less daemon: nothing ever streams into the boot index (each
 	// "+ Add server" source gets its own per-source database), so hide it
 	// from the UI entirely — a fresh install must list no servers. The
-	// console still serves header-less requests from it underneath.
+	// console serves header-less requests from it underneath until the
+	// first server is added.
 	cfg.HideBoot = true
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)

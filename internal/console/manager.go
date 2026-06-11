@@ -104,7 +104,9 @@ func (cm *connManager) Resolve(ctx context.Context, id string) (*bundle, error) 
 		if id = cm.defaultID(); id == "" {
 			// Source-less watch, empty registry: the boot entry is hidden
 			// from every listing but still backs header-less requests, so a
-			// fresh install renders (empty) views instead of a 404.
+			// fresh install renders (empty) views instead of a 404. The
+			// bundle's db is non-nil by construction: only watch sets
+			// HideBoot, and it connects the boot DB before console.New.
 			cm.mu.Lock()
 			if b := cm.boot; b != nil {
 				cm.mu.Unlock()
@@ -323,11 +325,14 @@ func (cm *connManager) capability(entry ServerEntry) bool {
 }
 
 // defaultID returns the id the browser falls back to with no header: the boot
-// entry when present, else the first registry entry, else "". Under hideBoot
-// the boot entry is never the default: the first entry with a source (a
-// monitored server — where events actually land) wins, else the first entry,
-// else "" — a fresh install reports no default at all, and Resolve("") falls
-// back to the hidden boot bundle so the views still render.
+// entry when present and not hidden; under hideBoot, the first entry with a
+// source CONFIGURED (typically the monitored one), else the first entry,
+// else "" — a fresh hidden-boot install reports no default at all, and
+// Resolve("") falls back to the hidden boot bundle so the views still
+// render. Registry-only `serve` (boot == nil) keeps its longstanding
+// first-entry default: the sourced preference applies ONLY when a hidden
+// boot forces a choice — applying it to serve would silently change which
+// server header-less tabs query on registries shared with watch.
 func (cm *connManager) defaultID() string {
 	cm.mu.Lock()
 	boot := cm.boot
@@ -337,14 +342,13 @@ func (cm *connManager) defaultID() string {
 	if boot != nil && !hide {
 		return bootServerID
 	}
-	for _, e := range entries {
-		if e.SourceDSN != "" {
-			return e.ID
+	if boot != nil { // hidden boot: prefer the entry events actually land in
+		for _, e := range entries {
+			if e.SourceDSN != "" {
+				return e.ID
+			}
 		}
 	}
-	// The sourced-entry preference above is inert for registry-only `serve`
-	// (boot == nil, hide unset): with no boot bundle every entry is equal and
-	// the first one wins, exactly as before hideBoot existed.
 	if len(entries) > 0 {
 		return entries[0].ID
 	}

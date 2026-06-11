@@ -43,6 +43,15 @@ func TestDefaultIDHideBoot(t *testing.T) {
 	if got := cm.defaultID(); got != bootServerID {
 		t.Fatalf("boot visible: defaultID = %q, want %q", got, bootServerID)
 	}
+
+	// Registry-only `serve` (boot == nil, same registry: [view-only, sourced]):
+	// the longstanding first-entry default holds — the sourced preference is a
+	// hidden-boot behavior ONLY, and leaking it here would silently change
+	// which server header-less tabs query on registries shared with watch.
+	cmServe := newConnManager(reg, false)
+	if got := cmServe.defaultID(); got != viewOnly.ID {
+		t.Fatalf("registry-only serve: defaultID = %q, want the FIRST entry %q (not the sourced %q)", got, viewOnly.ID, monitored.ID)
+	}
 }
 
 // TestResolveEmptyFollowsHiddenDefault: Resolve("") must land on the same
@@ -149,5 +158,13 @@ func TestServersAPIHideBootWire(t *testing.T) {
 		if sv.ID == bootServerID {
 			t.Fatal("the boot entry must stay hidden under HideBoot")
 		}
+	}
+
+	// The reserved id stays addressable while hidden (a pre-upgrade tab with
+	// "default" in sessionStorage fetches it directly) — hiding is a listing
+	// concern, not a 404.
+	rec, body = doServersReq(t, srv, "GET", "/api/servers/"+bootServerID, "")
+	if rec.Code != 200 {
+		t.Fatalf("GET /api/servers/default while hidden = %d (%s), want 200", rec.Code, body)
 	}
 }
