@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1109,12 +1110,14 @@ func TestFilterTablesNoMatch(t *testing.T) {
 		RowGroupSize: 100,
 	}
 
-	stats, err := Run(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+	// Pre-#461 this returned success with 0 tables processed — a typo'd
+	// filter silently produced no baseline. It is now an error.
+	_, err := Run(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("Run with a filter matching nothing succeeded; want an error")
 	}
-	if stats.TablesProcessed != 0 {
-		t.Errorf("TablesProcessed = %d, want 0 (filter matched nothing)", stats.TablesProcessed)
+	if !strings.Contains(err.Error(), "matched none") {
+		t.Errorf("error = %v, want the filter-matched-nothing message", err)
 	}
 }
 
@@ -1446,5 +1449,60 @@ func TestDiscoverBaselines_emptyDir(t *testing.T) {
 	}
 	if len(results) != 0 {
 		t.Errorf("got %d baselines, want 0", len(results))
+	}
+}
+
+// ─── zero-table refusals (#461) ──────────────────────────────────────────────
+
+// TestRun_zeroTablesIsError: a metadata-only dump (mydumper exits 0 for a
+// no-match --regex or missing SELECT privileges) must NOT convert into a
+// silent "success" with no baseline.
+func TestRun_zeroTablesIsError(t *testing.T) {
+	inputDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Run(context.Background(), Config{
+		InputDir:     inputDir,
+		OutputDir:    t.TempDir(),
+		Compression:  "none",
+		RowGroupSize: 100,
+	})
+	if err == nil {
+		t.Fatal("Run on a metadata-only dump succeeded; want an error")
+	}
+	if !strings.Contains(err.Error(), "no tables found") {
+		t.Fatalf("error = %v, want the no-tables message", err)
+	}
+}
+
+// TestRun_filterMatchesNothingIsError: a --tables filter that eliminates every
+// discovered table is a caller mistake (typo'd schema.table), not a no-op.
+func TestRun_filterMatchesNothingIsError(t *testing.T) {
+	inputDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"),
+		[]byte("INSERT INTO `orders` VALUES(1,10,'9.99','note','2025-01-01 00:00:00','2025-01-15');\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Run(context.Background(), Config{
+		InputDir:     inputDir,
+		OutputDir:    t.TempDir(),
+		Tables:       []string{"shop.nope"},
+		Compression:  "none",
+		RowGroupSize: 100,
+	})
+	if err == nil {
+		t.Fatal("Run with a filter matching nothing succeeded; want an error")
+	}
+	if !strings.Contains(err.Error(), "matched none") {
+		t.Fatalf("error = %v, want the filter-matched-nothing message", err)
 	}
 }

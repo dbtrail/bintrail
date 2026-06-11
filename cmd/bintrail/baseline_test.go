@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -222,8 +223,14 @@ func TestRunBaseline_invalidUploadURL(t *testing.T) {
 		bslUpload = origUpload
 	})
 
-	bslInput = t.TempDir() // empty dir → 0 tables → baseline.Run succeeds
+	// A minimal 1-table dump: an EMPTY input dir no longer reaches the
+	// upload validation — zero discovered tables is an error since #461.
+	bslInput = t.TempDir()
+	writeMinimalDump(t, bslInput)
 	bslOutput = t.TempDir()
+	// Outside cobra's Execute the command context is nil, and baseline.Run's
+	// workers (now actually reached — the dump has a table) call ctx.Err().
+	baselineCmd.SetContext(context.Background())
 	bslTimestamp = "2025-02-28T00:00:00Z"
 	bslUpload = "http://not-s3.example.com/bucket" // invalid: not s3://
 
@@ -333,5 +340,20 @@ func TestDecryptDumpFiles_roundTrip(t *testing.T) {
 	cleanup()
 	if _, err := os.Stat(plainFile); !os.IsNotExist(err) {
 		t.Error("cleanup should have removed the decrypted file")
+	}
+}
+
+// writeMinimalDump writes the smallest mydumper output that converts: one
+// table with a schema file and a single-row INSERT.
+func writeMinimalDump(t *testing.T, dir string) {
+	t.Helper()
+	schema := "CREATE TABLE `orders` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n);\n"
+	for name, content := range map[string]string{
+		"shop.orders-schema.sql": schema,
+		"shop.orders.00000.sql":  "INSERT INTO `orders` VALUES(1);\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
