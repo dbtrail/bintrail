@@ -87,6 +87,10 @@ and searching events:
    script. Arriving via an **Undo** action scopes it to that row and shows a
    context banner. **Nothing is ever executed.**
 5. **Status** — index health: partitions, coverage, stream lag, archives.
+6. **Settings** (under `watch` only) — **Storage** (rotation policy,
+   per-source S3 archiving, baseline snapshots, AWS credential signals — see
+   [The Storage page](#the-storage-page)) and **Rotation** (opens the
+   rotation dialog).
 
 ## Managing servers
 

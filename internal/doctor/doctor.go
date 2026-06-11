@@ -423,8 +423,10 @@ func checkFKCascades(db *sql.DB, schemas []string) CheckResult {
 			"     ALTER TABLE <child> ADD CONSTRAINT <fk_name> FOREIGN KEY (...) REFERENCES <parent>(...)\n" +
 			"         ON DELETE RESTRICT ON UPDATE RESTRICT;\n\n" +
 			"  2. Accept that reversal across cascades requires manual review.\n\n" +
-			"This is a WARN, not a hard fail — bintrail will index events fine, but `recover` may\n" +
-			"produce incomplete SQL for tables involved in cascades.",
+			"This check is a WARN here, but ingestion enforces it hard: `stream`/`watch` (and\n" +
+			"`index` runs given --source-dsn to validate against) refuse to start while cascade\n" +
+			"constraints exist — apply option 1 before streaming. Where events ARE indexed\n" +
+			"despite cascades, `recover` may produce incomplete SQL for the tables involved.",
 	}
 }
 
