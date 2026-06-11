@@ -112,13 +112,15 @@ How it behaves:
   `--index-dsn` becomes optional — the console can start registry-only.
   **It is a connection to the daemon's own index database, not a monitored
   source** — under source-less `watch` nothing ever streams into it (each
-  added source gets its own per-source database), so it legitimately shows 0
-  events with a full set of provisioned partitions. For that reason a
-  source-less `watch` daemon **demotes** it: fresh tabs land on the first
-  monitored registry server (or the first saved server when none is
-  monitored). The cli entry always sorts last in the switcher regardless of
-  mode, and stays selectable — its Status shows the boot index and the
-  rotation that maintains it.
+  added source gets its own per-source database). For that reason a
+  source-less `watch` daemon **hides it entirely**: a fresh install lists no
+  servers (the switcher shows "no servers yet" and the Servers dialog is
+  empty), and the views render against the internal index underneath until
+  the first server is added; the default selection is then the first
+  monitored server (or the first saved one). The cli entry remains visible
+  where it actually carries data — `serve`, and `watch` with `--source-dsn`
+  (the main stream writes into it) — labeled by its database name and sorted
+  last.
 - **Lazy connections.** Saved servers connect on first selection (with an
   eager ping, so a dead server fails the moment you switch to it, not on your
   first query). Editing a server's connection details closes and reopens its

@@ -56,13 +56,15 @@ type connManager struct {
 	// nor baseline reads apply RBAC redaction.
 	profileActive bool
 
-	// demoteBoot prefers a registry entry over the boot entry as the default
-	// (no-header) selection when registry entries exist. Set by source-less
-	// `bintrail-console watch`: its boot index is only the control plane's
-	// anchor database — no stream ever writes to it — so landing new tabs
-	// there shows a permanently empty index. The boot entry stays listed and
-	// selectable. Written once before serving (console.New); read under mu.
-	demoteBoot bool
+	// hideBoot removes the boot entry from the UI entirely. Set by
+	// source-less `bintrail-console watch`: its boot index is only the
+	// control plane's anchor database — no stream ever writes to it — so a
+	// fresh install must list NO servers (showing the internal index as a
+	// "server" reads as a phantom entry). Header-less requests still resolve
+	// to the boot bundle underneath, so the views render (empty) before the
+	// first server is added. Written once before serving (console.New);
+	// read under mu.
+	hideBoot bool
 
 	mu      sync.Mutex
 	bundles map[string]*bundle
@@ -100,6 +102,15 @@ func (cm *connManager) Resolve(ctx context.Context, id string) (*bundle, error) 
 		// so resolving "" anywhere else would render one server while
 		// querying another.
 		if id = cm.defaultID(); id == "" {
+			// Source-less watch, empty registry: the boot entry is hidden
+			// from every listing but still backs header-less requests, so a
+			// fresh install renders (empty) views instead of a 404.
+			cm.mu.Lock()
+			if b := cm.boot; b != nil {
+				cm.mu.Unlock()
+				return b, nil
+			}
+			cm.mu.Unlock()
 			return nil, errNoServers
 		}
 	}
@@ -312,35 +323,40 @@ func (cm *connManager) capability(entry ServerEntry) bool {
 }
 
 // defaultID returns the id the browser falls back to with no header: the boot
-// entry when present, else the first registry entry, else "". Under demoteBoot
-// the preference inverts when registry entries exist: the first entry with a
-// source (a monitored server — where events actually land), else the first
-// entry. The boot entry stays selectable; it just stops being the landing
-// default for fresh tabs.
+// entry when present, else the first registry entry, else "". Under hideBoot
+// the boot entry is never the default: the first entry with a source (a
+// monitored server — where events actually land) wins, else the first entry,
+// else "" — a fresh install reports no default at all, and Resolve("") falls
+// back to the hidden boot bundle so the views still render.
 func (cm *connManager) defaultID() string {
 	cm.mu.Lock()
 	boot := cm.boot
-	demote := cm.demoteBoot
+	hide := cm.hideBoot
 	cm.mu.Unlock()
 	entries := cm.reg.List()
-	if boot != nil {
-		if !demote || len(entries) == 0 {
-			return bootServerID
-		}
-		for _, e := range entries {
-			if e.SourceDSN != "" {
-				return e.ID
-			}
-		}
-		return entries[0].ID
+	if boot != nil && !hide {
+		return bootServerID
 	}
-	// boot == nil: registry-only console. demoteBoot is unreachable here
-	// today (only watch sets it, and watch always seeds a boot bundle), so the
-	// sourced-entry preference deliberately does not apply.
+	for _, e := range entries {
+		if e.SourceDSN != "" {
+			return e.ID
+		}
+	}
+	// The sourced-entry preference above is inert for registry-only `serve`
+	// (boot == nil, hide unset): with no boot bundle every entry is equal and
+	// the first one wins, exactly as before hideBoot existed.
 	if len(entries) > 0 {
 		return entries[0].ID
 	}
 	return ""
+}
+
+// bootHidden reports whether the boot entry exists but must not appear in any
+// server listing (source-less watch).
+func (cm *connManager) bootHidden() bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.hideBoot && cm.boot != nil
 }
 
 // CloseAll closes every cached registry connection. The boot entry's db is

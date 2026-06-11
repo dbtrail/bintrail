@@ -1232,3 +1232,13 @@ button { font-family: inherit; }
 .stg-foot { padding: 0 14px 12px; margin: 6px 0 0; }
 .stg-hint { margin-bottom: 0; }
 .stg-cardfoot { margin-top: 12px; }
+
+/* Storage empty states: lead + short steps, not paragraphs */
+.stg-empty { padding: 14px 4px; display: flex; flex-direction: column; gap: 7px; }
+.stg-empty-lead { margin: 0; font-size: 13.5px; font-weight: 600; color: var(--ink-2); }
+.stg-empty-sub { margin: 0; font-size: 12.5px; color: var(--ink-3); max-width: 52ch; }
+.stg-code {
+  font-family: var(--f-mono); font-size: 11.5px; color: var(--ink-2);
+  background: var(--surface-3); border-radius: 4px; padding: 7px 10px;
+  align-self: flex-start; overflow-x: auto; max-width: 100%;
+}

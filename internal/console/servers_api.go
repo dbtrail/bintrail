@@ -125,7 +125,10 @@ type testResponse struct {
 // handleServersList serves GET /api/servers.
 func (s *Server) handleServersList(w http.ResponseWriter, r *http.Request) {
 	out := []serverDTO{}
-	if dto, ok := s.bootDTO(); ok {
+	// On a source-less watch the boot entry is internal plumbing (nothing
+	// streams into it) and is hidden: a fresh install lists no servers. It
+	// still backs header-less requests — see connManager.Resolve.
+	if dto, ok := s.bootDTO(); ok && !s.cm.bootHidden() {
 		out = append(out, dto)
 	}
 	for _, e := range s.cm.reg.List() {

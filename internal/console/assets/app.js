@@ -1368,9 +1368,8 @@ function buildStorage(serversRes, rotation, storage, baselines) {
   const serversErr = serversRes && serversRes.error;
   const v = VIEW(); clear(v);
   const sub = el("p", { class: "page-sub" },
-    "Where captured history lives beyond the index — per-source S3 archiving, the rotation that feeds it, and the baselines Time-travel reads. ",
-    el("b", { text: "No credentials are stored here" }),
-    " — uploads use the daemon's ambient AWS identity.");
+    "S3 archiving, rotation, and the baselines Time-travel reads. ",
+    el("b", { text: "No credentials are stored here." }));
   v.append(pageHead("Storage", sub));
 
   const cards = el("div", { class: "cards" });
@@ -1423,7 +1422,7 @@ function credentialsCard(storage) {
   if (aws.container_creds) kvRow(card, "ECS task role", "detected");
   if (aws.web_identity) kvRow(card, "EKS IRSA", "detected");
   card.append(el("p", { class: "form-hint stg-hint", text:
-    "S3 access — uploads, archive reads, and baseline reads — uses the AWS default credential chain of the daemon process: environment keys, a shared profile, or an IAM role; roles work even when nothing shows as set here. Baseline reads additionally need DuckDB's aws extension, fetched automatically on first use (offline hosts fall back to environment keys). The console never stores keys." }));
+    "Resolved from the daemon's AWS credential chain. IAM roles work even when nothing shows as set here." }));
   return card;
 }
 
@@ -1435,7 +1434,7 @@ function baselineSummaryCard(b, cur) {
   }
   if (!b.configured) {
     kvRow(card, "source", "not configured");
-    card.append(el("p", { class: "form-hint stg-hint", text: baselineConfigHint(cur) }));
+    kvRow(card, "time-travel", "off");
     return card;
   }
   const snaps = b.snapshots || [];
@@ -1452,10 +1451,11 @@ function baselineSummaryCard(b, cur) {
 // CONSOLE_BASELINE_DIR/_S3 env; BASELINE_DIR in the compose stack) — so the
 // "edit the server" instruction would point it at a dead end.
 function baselineConfigHint(cur) {
-  if (cur && cur.kind === "ephemeral") {
-    return "This is the command-line (cli) entry — restart the daemon with --baseline-dir / --baseline-s3 (compose: BASELINE_DIR in .env) to enable Time-travel on it.";
+  if (!cur) return "Add a server first (Manage servers).";
+  if (cur.kind === "ephemeral") {
+    return "Restart the daemon with --baseline-dir or --baseline-s3 (compose: BASELINE_DIR in .env).";
   }
-  return "Set a Baseline dir / S3 on the server (Manage servers → Edit → Advanced) to enable Time-travel.";
+  return "Set Baseline dir or S3 under Manage servers → Edit → Advanced.";
 }
 
 function formatAge(hours) {
@@ -1489,7 +1489,7 @@ function archivingPanel(servers, serversErr) {
   }
   panel.append(list);
   panel.append(el("p", { class: "form-hint stg-foot", text:
-    "Rotated index partitions upload to the source's bucket as Parquet before they are dropped — history survives retention and stays queryable. The boot (cli) index rotates drop-only." }));
+    "Rotated partitions upload as Parquet before being dropped, so history survives retention." }));
   return panel;
 }
 
@@ -1502,11 +1502,17 @@ function baselinesPanel(b, servers) {
   if (!b || b.error) {
     list.append(el("div", { class: "ev-empty", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));
   } else if (!b.configured) {
-    list.append(el("div", { class: "ev-empty", text:
-      "No baseline source configured for this server. Baselines are full-table Parquet snapshots (bintrail dump → bintrail baseline); with one configured, Time-travel reconstructs complete rows — not just rows with binlog activity. " + baselineConfigHint(cur) }));
+    list.append(el("div", { class: "stg-empty" },
+      el("p", { class: "stg-empty-lead", text: "No baselines configured." }),
+      el("p", { class: "stg-empty-sub", text: "A baseline is a full-table snapshot — with one, Time-travel reconstructs complete rows, not just rows with recent changes." }),
+      el("p", { class: "stg-empty-sub", text: "1. Create snapshots:" }),
+      el("code", { class: "stg-code", text: "docker compose --profile baseline run --rm baseline" }),
+      el("p", { class: "stg-empty-sub", text: "2. " + baselineConfigHint(cur) })));
   } else if (!(b.snapshots || []).length) {
-    list.append(el("div", { class: "ev-empty", text:
-      "Source configured (" + b.source + ") but no snapshots matched the expected <timestamp>/<schema>/<table>.parquet layout — run bintrail dump + bintrail baseline to create the first one, and check the path points at the snapshots' PARENT directory." }));
+    list.append(el("div", { class: "stg-empty" },
+      el("p", { class: "stg-empty-lead", text: "Source configured, no snapshots found." }),
+      el("code", { class: "stg-code", text: b.source }),
+      el("p", { class: "stg-empty-sub", text: "Run bintrail dump + bintrail baseline to create the first one. The path must point at the snapshots' parent directory (<timestamp>/<schema>/<table>.parquet)." })));
   } else {
     b.snapshots.forEach((sn) => {
       const row = el("div", { class: "stg-row" });
@@ -1626,18 +1632,25 @@ async function loadServers() {
   const sel = document.getElementById("server-select");
   if (sel) {
     clear(sel);
-    // Registry servers first; the ephemeral boot entry goes last (in every
-    // mode — it is the connection the operator least often switches to; under
-    // source-ful watch it does carry the main stream's events and stays one
-    // click away).
-    const ordered = servers.filter((s) => s.kind !== "ephemeral")
-      .concat(servers.filter((s) => s.kind === "ephemeral"));
-    ordered.forEach((s) => {
-      const o = opt(s.id, serverLabel(s));
-      if (s.kind === "ephemeral") o.title = "The daemon's own index database (from --index-dsn); managed by the command line";
+    if (!servers.length) {
+      // Fresh install under source-less watch: the internal boot index is
+      // hidden, so there are genuinely no servers yet.
+      const o = opt("", "no servers yet");
+      o.disabled = true;
       sel.append(o);
-    });
-    sel.value = currentServer || defaultServerId;
+      sel.value = "";
+    } else {
+      // Registry servers first; the ephemeral boot entry goes last (it shows
+      // only where it carries data: serve, or watch with --source-dsn).
+      const ordered = servers.filter((s) => s.kind !== "ephemeral")
+        .concat(servers.filter((s) => s.kind === "ephemeral"));
+      ordered.forEach((s) => {
+        const o = opt(s.id, serverLabel(s));
+        if (s.kind === "ephemeral") o.title = "The daemon's own index database (from --index-dsn); managed by the command line";
+        sel.append(o);
+      });
+      sel.value = currentServer || defaultServerId;
+    }
   }
   return servers;
 }

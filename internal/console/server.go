@@ -40,13 +40,13 @@ type Config struct {
 	// BootDSN is the boot entry's DSN, used ONLY to render the masked
 	// host/user/dbname view in /api/servers. Optional.
 	BootDSN string
-	// DemoteBoot prefers a registry entry over the boot entry as the default
-	// (no-header) selection when registry entries exist. Set by source-less
-	// `bintrail-console watch`: its boot index is only the control plane's
-	// anchor database — no stream ever writes to it — so landing new tabs
-	// there would show a permanently empty index. The boot entry stays
-	// listed and selectable.
-	DemoteBoot bool
+	// HideBoot removes the boot entry from the UI entirely (selector, server
+	// list, default selection). Set by source-less `bintrail-console watch`:
+	// its boot index is only the control plane's anchor database — no stream
+	// ever writes to it — and surfacing it as a "server" made fresh installs
+	// look pre-populated. Header-less requests still resolve to the boot
+	// bundle underneath, so the views render before the first server exists.
+	HideBoot bool
 	// Registry is the named-server store (a local YAML file — the only thing
 	// the console ever writes). nil means an empty in-memory registry.
 	Registry *Registry
@@ -252,7 +252,7 @@ func New(cfg Config) (*Server, error) {
 		loginLimiter:     newLoginLimiter(),
 		tlsConf:          tlsConf,
 	}
-	s.cm.demoteBoot = cfg.DemoteBoot
+	s.cm.hideBoot = cfg.HideBoot
 
 	// Seed the ephemeral boot bundle when the caller supplied a command-line
 	// connection (or baseline config for it). Its derived state — noArchive
