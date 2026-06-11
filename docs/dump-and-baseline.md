@@ -36,7 +36,7 @@ To pin a specific mydumper Docker image version:
 
 ```sh
 bintrail dump \
-  --mydumper-image mydumper/mydumper:v0.16.7-3 \
+  --mydumper-image mydumper/mydumper:v1.0.3-1 \
   --source-dsn "user:pass@tcp(source-db:3306)/" \
   --output-dir /tmp/mydumper-output
 ```
@@ -51,7 +51,7 @@ If you prefer to install mydumper as a local binary instead of using Docker:
 ```sh
 # Download from the releases page — check for the latest version:
 # https://github.com/mydumper/mydumper/releases/latest
-wget https://github.com/mydumper/mydumper/releases/download/v0.16.7-3/mydumper_0.16.7-3.jammy_amd64.deb
+wget https://github.com/mydumper/mydumper/releases/download/v1.0.3-1/mydumper_1.0.3-1.jammy_amd64.deb
 sudo dpkg -i mydumper_*.deb
 
 # Or from the system repository (may be older)
@@ -62,7 +62,7 @@ sudo apt-get install mydumper
 
 ```sh
 # Check for the latest version: https://github.com/mydumper/mydumper/releases/latest
-wget https://github.com/mydumper/mydumper/releases/download/v0.16.7-3/mydumper-0.16.7-3.el8.x86_64.rpm
+wget https://github.com/mydumper/mydumper/releases/download/v1.0.3-1/mydumper-1.0.3-1.el9.x86_64.rpm
 sudo rpm -i mydumper-*.rpm
 ```
 

@@ -209,10 +209,12 @@ func runDump(cmd *cobra.Command, args []string) error {
 
 	// 6. Probe mydumper version and build args.
 	// --sync-thread-lock-mode and --trx-tables require mydumper >= 0.18 (see
-	// mydumperSupportsLockMode). Distro apt packages ship older builds
-	// (Ubuntu 24.04: 0.10.0, Debian bookworm: 0.10.1), so we must not pass
-	// the flags unconditionally or the dump fails (#219, #460). Docker
-	// images are assumed to ship a recent enough version.
+	// mydumperSupportsLockMode). Distro apt packages ship older builds —
+	// Ubuntu 24.04 and Debian bookworm both package upstream 0.10.1, whose
+	// binary self-reports 0.10.0 — so we must not pass the flags
+	// unconditionally or the dump fails (#219, #460). Docker mode is NOT
+	// version-probed: a pinned --mydumper-image older than 0.18 fails with
+	// "unknown option", which is why the docs' pin examples stay >= 0.18.
 	supportsLockMode := true
 	if res.mode == dumpModeLocal {
 		major, minor, patch, verErr := mydumperVersion(res.path)
@@ -301,10 +303,12 @@ func parseMydumperVersion(output string) (major, minor, patch int, err error) {
 
 // mydumperSupportsLockMode reports whether a mydumper version understands
 // --sync-thread-lock-mode and --trx-tables. The flags landed in mydumper
-// 0.18.1 — NOT 0.11, whose light-locking options were --no-locks /
-// --trx-consistency-only, different flags entirely. The gate previously sat
-// at 0.11, handing 0.11–0.17 builds flags they reject with "unknown option"
-// (#460).
+// 0.18.1 — NOT 0.11, whose light-locking options were --less-locking /
+// --trx-consistency-only (which --trx-tables replaced; --no-locks survives
+// in modern versions). The gate previously sat at 0.11, handing 0.11–0.17
+// builds flags they reject with "unknown option" (#460). No 0.18.0 was ever
+// released — the 0.18 series starts at 0.18.1 — so gating on (major, minor)
+// alone is exact.
 func mydumperSupportsLockMode(major, minor int) bool {
 	return major > 0 || minor >= 18
 }
