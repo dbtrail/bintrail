@@ -208,10 +208,11 @@ func runDump(cmd *cobra.Command, args []string) error {
 	}
 
 	// 6. Probe mydumper version and build args.
-	// --sync-thread-lock-mode and --trx-tables require mydumper >= 0.11.0.
-	// Ubuntu 24.04's apt package ships 0.10.0, so we must not pass them
-	// unconditionally or the dump fails (#219). Docker images are assumed
-	// to ship a recent enough version.
+	// --sync-thread-lock-mode and --trx-tables require mydumper >= 0.18 (see
+	// mydumperSupportsLockMode). Distro apt packages ship older builds
+	// (Ubuntu 24.04: 0.10.0, Debian bookworm: 0.10.1), so we must not pass
+	// the flags unconditionally or the dump fails (#219, #460). Docker
+	// images are assumed to ship a recent enough version.
 	supportsLockMode := true
 	if res.mode == dumpModeLocal {
 		major, minor, patch, verErr := mydumperVersion(res.path)
@@ -219,8 +220,8 @@ func runDump(cmd *cobra.Command, args []string) error {
 			slog.Warn("could not determine mydumper version; omitting --sync-thread-lock-mode and --trx-tables for safety",
 				"error", verErr)
 			supportsLockMode = false
-		} else if major == 0 && minor < 11 {
-			slog.Warn("mydumper version is older than 0.11.0; omitting --sync-thread-lock-mode and --trx-tables — the dump may hold heavier locks",
+		} else if !mydumperSupportsLockMode(major, minor) {
+			slog.Warn("mydumper version is older than 0.18; omitting --sync-thread-lock-mode and --trx-tables — the dump may hold heavier locks",
 				"version", fmt.Sprintf("%d.%d.%d", major, minor, patch))
 			supportsLockMode = false
 		}
@@ -298,12 +299,22 @@ func parseMydumperVersion(output string) (major, minor, patch int, err error) {
 	return major, minor, patch, nil
 }
 
+// mydumperSupportsLockMode reports whether a mydumper version understands
+// --sync-thread-lock-mode and --trx-tables. The flags landed in mydumper
+// 0.18.1 — NOT 0.11, whose light-locking options were --no-locks /
+// --trx-consistency-only, different flags entirely. The gate previously sat
+// at 0.11, handing 0.11–0.17 builds flags they reject with "unknown option"
+// (#460).
+func mydumperSupportsLockMode(major, minor int) bool {
+	return major > 0 || minor >= 18
+}
+
 // buildMydumperArgs constructs the argument slice for a mydumper invocation.
 // --compress-protocol and --complete-insert are always included.
-// When supportsLockMode is true (mydumper >= 0.11.0), --sync-thread-lock-mode
-// and --trx-tables are included for lighter locking. When false (mydumper
-// 0.10.x or older), they are omitted so the dump works on Ubuntu 24.04's
-// apt-installed mydumper without error (#219).
+// When supportsLockMode is true (mydumper >= 0.18, see
+// mydumperSupportsLockMode), --sync-thread-lock-mode and --trx-tables are
+// included for lighter locking. When false (older builds, e.g. distro apt
+// packages), they are omitted so the dump works without error (#219, #460).
 // Schema filtering: single schema → --database; multiple → --regex.
 // Table filtering: --tables-list with a comma-joined list.
 // When encryptKeyPath is non-empty, --exec-per-thread and

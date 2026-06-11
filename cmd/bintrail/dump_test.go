@@ -876,3 +876,22 @@ func assertArgsContainPair(t *testing.T, args []string, key, val string) {
 		t.Errorf("expected %q after %q, got %q", val, key, got)
 	}
 }
+
+func TestMydumperSupportsLockMode(t *testing.T) {
+	cases := []struct {
+		major, minor int
+		want         bool
+	}{
+		{0, 10, false}, // Ubuntu 24.04 / Debian bookworm apt builds
+		{0, 11, false}, // had --no-locks/--trx-consistency-only, NOT these flags
+		{0, 17, false}, // last minor before the flags landed
+		{0, 18, true},  // --sync-thread-lock-mode/--trx-tables introduced (0.18.1)
+		{0, 21, true},
+		{1, 0, true},
+	}
+	for _, tc := range cases {
+		if got := mydumperSupportsLockMode(tc.major, tc.minor); got != tc.want {
+			t.Errorf("mydumperSupportsLockMode(%d, %d) = %v, want %v", tc.major, tc.minor, got, tc.want)
+		}
+	}
+}
