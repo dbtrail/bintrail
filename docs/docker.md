@@ -261,16 +261,23 @@ reconstruct knows where deltas begin. Then point the console at it:
 
 - **Servers added from the UI**: Manage servers → Edit → Advanced →
   **Baseline dir** = `/var/lib/bintrail/baselines` (a *container* path — the
-  `watch` daemon reads it, not your host). The server's Time-travel tab and
-  Storage → Baseline snapshots panel light up.
+  `watch` daemon reads it, not your host). The server's Time-travel tab
+  lights up, and its row shows a TT chip under Manage servers.
 - **The boot `SOURCE_DSN` entry**: set `BASELINE_DIR=/var/lib/bintrail/baselines`
   in `.env` and `docker compose up -d` again.
 
 Notes:
 
-- The dump uses mydumper ≥ 0.11 light locking (`--sync-thread-lock-mode
-  NO_LOCK --trx-tables`) — same flags as `bintrail dump`. It still reads every
-  row of the selected schemas; schedule it off-peak for large sources.
+- The dump uses mydumper light locking (`--sync-thread-lock-mode NO_LOCK
+  --trx-tables`, available since mydumper 0.18 — the pinned image is recent)
+  — same flags as `bintrail dump`. It still reads every row of the selected
+  schemas; schedule it off-peak for large sources. On sources with
+  non-transactional tables (MyISAM), the binlog coordinates embedded in the
+  snapshot may not exactly match those tables' data — the same caveat as
+  `bintrail dump`.
+- If the run fails with `service "baseline-dump" didn't complete
+  successfully`, the cause (a mydumper error, a FATAL from the DSN/schema
+  guards) is in `docker compose --profile baseline logs baseline-dump`.
 - `BASELINE_SCHEMAS` defaults to `SCHEMAS`; empty dumps everything mydumper
   covers by default. Snapshot only what you want to time-travel.
 - Take a fresh baseline after `ALTER TABLE` (reconstruct needs the snapshot

@@ -44,9 +44,9 @@ volumes:
                           # datadir — back up / reset the two together).
   bintrail-state:         # bintrail runtime state (saved console servers,
                           # archive staging, baseline snapshots, …).
-  bintrail-dump:          # transient mydumper output for the `baseline` profile
-                          # (wiped at the start of every run — never store
-                          # anything else here).
+  bintrail-dump:          # transient mydumper output for the `baseline`
+                          # profile (its snapshot/ dir is recreated from
+                          # scratch every run — never store anything here).
 
 services:
 
@@ -179,7 +179,8 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       AWS_REGION: ${AWS_REGION:-}
-      # Baselines for the boot (SOURCE_DSN) entry: set
+      # Baselines for the boot entry (the cli-seeded server backed by the
+      # index DSN — the one a SOURCE_DSN stream writes into): set
       # BASELINE_DIR=/var/lib/bintrail/baselines in .env after producing
       # snapshots with the `baseline` profile below — it enables the console's
       # Time-travel surface on that entry. Servers added from the UI configure
@@ -249,8 +250,8 @@ services:
   # BASELINE_DIR for the boot entry. See docs/docker.md.
   baseline-dump:
     profiles: ["baseline"]
-    # Pinned upstream image (mydumper >= 0.11 supports the light-locking
-    # flags below; distro-apt builds are older and would need heavier locks).
+    # Pinned upstream image (the light-locking flags below need mydumper
+    # >= 0.18; distro-apt builds are older and would reject them).
     image: mydumper/mydumper:v1.0.3-1
     environment:
       BASELINE_SOURCE_DSN: ${BASELINE_SOURCE_DSN:-${SOURCE_DSN:-}}
@@ -275,6 +276,10 @@ services:
         # containing "@" survive; the username cannot contain ":" in a Go DSN,
         # so the first ":" splits user from password.
         hostport="$${dsn##*@tcp(}"; hostport="$${hostport%%)*}"
+        case "$$hostport" in
+          *:*) ;;
+          *) echo "FATAL: the DSN must include host:port, e.g. @tcp(db.example.com:3306)" >&2; exit 1 ;;
+        esac
         host="$${hostport%%:*}"; port="$${hostport##*:}"
         creds="$${dsn%@tcp(*}"
         user="$${creds%%:*}"
@@ -287,15 +292,16 @@ services:
         rm -rf /dump/snapshot
         mkdir -p /dump/snapshot
         # Mirror `bintrail dump`'s mydumper invocation (cmd/bintrail/dump.go):
-        # light locking (>= 0.11), compressed protocol, complete INSERTs, and
+        # light locking (flags exist since mydumper 0.18), compressed
+        # protocol, complete INSERTs, and
         # --outputdir last. The metadata file it writes carries the binlog
         # coordinates `bintrail baseline` embeds in the Parquet.
         set -- --host "$$host" --port "$$port" --user "$$user" \
           --threads 4 --compress-protocol --complete-insert \
           --sync-thread-lock-mode NO_LOCK --trx-tables
         [ -n "$$pass" ] && set -- "$$@" --password "$$pass"
-        if [ -n "$$BASELINE_SCHEMAS" ]; then
-          schemas="$$(printf '%s' "$$BASELINE_SCHEMAS" | tr -d ' ')"
+        schemas="$$(printf '%s' "$$BASELINE_SCHEMAS" | tr -d ' ')"
+        if [ -n "$$schemas" ]; then
           case "$$schemas" in
             *,*) set -- "$$@" --regex "^($$(printf '%s' "$$schemas" | tr ',' '|'))\\." ;;
             *)   set -- "$$@" --database "$$schemas" ;;
@@ -303,6 +309,25 @@ services:
         fi
         set -- "$$@" --outputdir /dump/snapshot
         mydumper "$$@"
+        # GUARD: mydumper exits 0 for a --regex that matches nothing and for
+        # schemas the dump user cannot read — both yield a metadata-only or
+        # partial dump that `bintrail baseline` would happily convert into an
+        # incomplete baseline (silently wrong Time-travel reconstructions,
+        # the worst failure class). "exit 0" is NOT "the baseline is
+        # complete": verify table data actually landed, per schema when a
+        # filter was given.
+        if ! ls /dump/snapshot | grep -q -- '-schema\.sql'; then
+          echo "FATAL: the dump produced no tables — check BASELINE_SCHEMAS and the dump user's privileges" >&2
+          exit 1
+        fi
+        if [ -n "$$schemas" ]; then
+          for sc in $$(printf '%s' "$$schemas" | tr ',' ' '); do
+            if ! ls /dump/snapshot | grep -q "^$$sc\."; then
+              echo "FATAL: schema '$$sc' is missing from the dump — check the name and the dump user's SELECT privileges" >&2
+              exit 1
+            fi
+          done
+        fi
         # The convert step runs as the bintrail image's non-root uid 999:
         # hand it the dump, and pre-create the baselines dir in the state
         # volume (whose root may be root-owned when this profile runs before
@@ -310,7 +335,7 @@ services:
         chown -R 999:999 /dump/snapshot
         mkdir -p /state/baselines
         chown 999:999 /state/baselines
-        echo "Dump complete: $$(ls /dump/snapshot | wc -l) file(s)."
+        echo "Dump complete: $$(ls /dump/snapshot | grep -c -- '-schema\.sql') table(s)."
     volumes:
       - bintrail-dump:/dump
       - bintrail-state:/state
