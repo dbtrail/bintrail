@@ -232,6 +232,52 @@ its sizing, backups, and upgrades are yours — see
 [SUPPORT.md](../SUPPORT.md). (The BYO contract floor stays MySQL **8.0+** —
 only the *bundled* index is 8.4.)
 
+### Baselines and Time-travel (the `baseline` profile)
+
+The console's **Time-travel** surface reconstructs complete rows (baseline
+snapshot + binlog deltas), so it needs **baseline Parquet snapshots** — and the
+console image deliberately ships without the `dump`/`baseline` commands. The
+compose file includes an opt-in one-shot profile that produces them with zero
+extra installs: the official `mydumper` image dumps the source over the
+network into a transient volume, then the core `bintrail` CLI image converts
+the dump to Parquet inside the `bintrail-state` volume.
+
+Run it on demand (or from cron on the host):
+
+```sh
+# Single-source stack (SOURCE_DSN set in .env): no extra config needed.
+docker compose --profile baseline run --rm baseline
+
+# Any other source (e.g. one you added from the console UI):
+BASELINE_SOURCE_DSN="repl:secret@tcp(db.example.com:3306)/" \
+BASELINE_SCHEMAS="shop,billing" \
+  docker compose --profile baseline run --rm baseline
+```
+
+Each run creates a new snapshot under
+`/var/lib/bintrail/baselines/<timestamp>/<schema>/<table>.parquet` (in the
+`bintrail-state` volume), with the source's binlog coordinates embedded so
+reconstruct knows where deltas begin. Then point the console at it:
+
+- **Servers added from the UI**: Manage servers → Edit → Advanced →
+  **Baseline dir** = `/var/lib/bintrail/baselines` (a *container* path — the
+  `watch` daemon reads it, not your host). The server's Time-travel tab and
+  Storage → Baseline snapshots panel light up.
+- **The boot `SOURCE_DSN` entry**: set `BASELINE_DIR=/var/lib/bintrail/baselines`
+  in `.env` and `docker compose up -d` again.
+
+Notes:
+
+- The dump uses mydumper ≥ 0.11 light locking (`--sync-thread-lock-mode
+  NO_LOCK --trx-tables`) — same flags as `bintrail dump`. It still reads every
+  row of the selected schemas; schedule it off-peak for large sources.
+- `BASELINE_SCHEMAS` defaults to `SCHEMAS`; empty dumps everything mydumper
+  covers by default. Snapshot only what you want to time-travel.
+- Take a fresh baseline after `ALTER TABLE` (reconstruct needs the snapshot
+  schema to match the deltas), and periodically so the binlog window between
+  baseline and "now" stays short. Old snapshots are plain directories — prune
+  them by deleting `<timestamp>` dirs in the volume.
+
 ## Environment variables
 
 | Variable | Used by | Description |
@@ -242,6 +288,9 @@ only the *bundled* index is 8.4.)
 | `CONSOLE_TOKEN` | compose (optional) | Opt-in static API-automation token (default: none — humans sign in with the console password) |
 | `INDEX_MYSQL_ROOT_PASSWORD` | compose (optional) | Pin the bundled index root password (set *before* first boot; default: randomly generated into the `bintrail-index-secret` volume) |
 | `BINTRAIL_TAG` | compose (optional) | Image tag to run (default `latest`) |
+| `BASELINE_SOURCE_DSN` | compose `baseline` profile | Source MySQL to snapshot (default: `SOURCE_DSN`) |
+| `BASELINE_SCHEMAS` | compose `baseline` profile | Comma-separated schemas to snapshot (default: `SCHEMAS`) |
+| `BASELINE_DIR` | compose (optional) | Baseline dir for the boot `SOURCE_DSN` entry — set `/var/lib/bintrail/baselines` after the first `baseline` profile run to enable Time-travel on it |
 | `BINTRAIL_INDEX_DSN` | bintrail-mcp | Index DSN for the MCP server |
 
 (`SERVER_ID` is no longer needed — `bintrail-console watch` derives a stable

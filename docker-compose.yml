@@ -42,7 +42,11 @@ volumes:
                           # server auto-upgrades an 8.0 datadir irreversibly).
   bintrail-index-secret:  # the generated index password (shares fate with the
                           # datadir — back up / reset the two together).
-  bintrail-state:         # bintrail runtime state (saved console servers, …).
+  bintrail-state:         # bintrail runtime state (saved console servers,
+                          # archive staging, baseline snapshots, …).
+  bintrail-dump:          # transient mydumper output for the `baseline` profile
+                          # (wiped at the start of every run — never store
+                          # anything else here).
 
 services:
 
@@ -175,6 +179,14 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       AWS_REGION: ${AWS_REGION:-}
+      # Baselines for the boot (SOURCE_DSN) entry: set
+      # BASELINE_DIR=/var/lib/bintrail/baselines in .env after producing
+      # snapshots with the `baseline` profile below — it enables the console's
+      # Time-travel surface on that entry. Servers added from the UI configure
+      # it per server instead (Edit → Advanced → "Baseline dir", same path).
+      # Left empty by default: the gate is config-based, so setting it with no
+      # snapshots would show a Time-travel tab with nothing behind it.
+      BINTRAIL_CONSOLE_BASELINE_DIR: ${BASELINE_DIR:-}
       # Password login (persists next to the registry). On first run the
       # console serves a "create your password" screen; later visits sign in.
       # There is deliberately NO password env var: docker inspect must never
@@ -218,3 +230,100 @@ services:
       index-mysql:
         condition: service_healthy
     restart: unless-stopped
+
+  # ── Baselines (one-shot, opt-in `baseline` profile) ──────
+  # Produces the full-table Parquet snapshots Time-travel reconstructs from
+  # (baseline + binlog deltas → complete rows, not just rows with binlog
+  # activity). Two one-shot steps: the official mydumper image dumps the
+  # source over the network into a transient volume, then the core bintrail
+  # CLI image converts the dump to Parquet in the state volume. Run on demand
+  # (or from cron):
+  #
+  #   BASELINE_SOURCE_DSN="user:pass@tcp(db.example.com:3306)/" \
+  #     docker compose --profile baseline run --rm baseline
+  #
+  # BASELINE_SOURCE_DSN defaults to SOURCE_DSN, so the single-source stack
+  # needs no extra configuration. Snapshots land in
+  # /var/lib/bintrail/baselines (the bintrail-state volume); point the
+  # console at them per server (Edit → Advanced → "Baseline dir") or via
+  # BASELINE_DIR for the boot entry. See docs/docker.md.
+  baseline-dump:
+    profiles: ["baseline"]
+    # Pinned upstream image (mydumper >= 0.11 supports the light-locking
+    # flags below; distro-apt builds are older and would need heavier locks).
+    image: mydumper/mydumper:v1.0.3-1
+    environment:
+      BASELINE_SOURCE_DSN: ${BASELINE_SOURCE_DSN:-${SOURCE_DSN:-}}
+      # Comma-separated schemas to snapshot (defaults to SCHEMAS; empty =
+      # everything mydumper dumps by default).
+      BASELINE_SCHEMAS: ${BASELINE_SCHEMAS:-${SCHEMAS:-}}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        dsn="$$BASELINE_SOURCE_DSN"
+        if [ -z "$$dsn" ]; then
+          echo "FATAL: set BASELINE_SOURCE_DSN (or SOURCE_DSN) to the source MySQL to snapshot, e.g." >&2
+          echo '  BASELINE_SOURCE_DSN="user:pass@tcp(db.example.com:3306)/" docker compose --profile baseline run --rm baseline' >&2
+          exit 1
+        fi
+        case "$$dsn" in
+          *"@tcp("*")"*) ;;
+          *) echo "FATAL: BASELINE_SOURCE_DSN must be a Go MySQL DSN like user:pass@tcp(host:3306)/" >&2; exit 1 ;;
+        esac
+        # Decompose the DSN in shell: split on the LAST "@tcp(" so passwords
+        # containing "@" survive; the username cannot contain ":" in a Go DSN,
+        # so the first ":" splits user from password.
+        hostport="$${dsn##*@tcp(}"; hostport="$${hostport%%)*}"
+        host="$${hostport%%:*}"; port="$${hostport##*:}"
+        creds="$${dsn%@tcp(*}"
+        user="$${creds%%:*}"
+        pass="$${creds#*:}"; [ "$$pass" = "$$creds" ] && pass=""
+        if [ -z "$$host" ] || [ -z "$$user" ]; then
+          echo "FATAL: could not parse host/user from BASELINE_SOURCE_DSN" >&2; exit 1
+        fi
+        # Fresh dump every run — mydumper refuses a non-empty output dir, and
+        # stale dumps must never be converted as if they were current.
+        rm -rf /dump/snapshot
+        mkdir -p /dump/snapshot
+        # Mirror `bintrail dump`'s mydumper invocation (cmd/bintrail/dump.go):
+        # light locking (>= 0.11), compressed protocol, complete INSERTs, and
+        # --outputdir last. The metadata file it writes carries the binlog
+        # coordinates `bintrail baseline` embeds in the Parquet.
+        set -- --host "$$host" --port "$$port" --user "$$user" \
+          --threads 4 --compress-protocol --complete-insert \
+          --sync-thread-lock-mode NO_LOCK --trx-tables
+        [ -n "$$pass" ] && set -- "$$@" --password "$$pass"
+        if [ -n "$$BASELINE_SCHEMAS" ]; then
+          schemas="$$(printf '%s' "$$BASELINE_SCHEMAS" | tr -d ' ')"
+          case "$$schemas" in
+            *,*) set -- "$$@" --regex "^($$(printf '%s' "$$schemas" | tr ',' '|'))\\." ;;
+            *)   set -- "$$@" --database "$$schemas" ;;
+          esac
+        fi
+        set -- "$$@" --outputdir /dump/snapshot
+        mydumper "$$@"
+        # The convert step runs as the bintrail image's non-root uid 999:
+        # hand it the dump, and pre-create the baselines dir in the state
+        # volume (whose root may be root-owned when this profile runs before
+        # the main stack ever initialized it).
+        chown -R 999:999 /dump/snapshot
+        mkdir -p /state/baselines
+        chown 999:999 /state/baselines
+        echo "Dump complete: $$(ls /dump/snapshot | wc -l) file(s)."
+    volumes:
+      - bintrail-dump:/dump
+      - bintrail-state:/state
+
+  baseline:
+    profiles: ["baseline"]
+    # The CORE CLI image — the console image deliberately ships without the
+    # dump/baseline commands.
+    image: ghcr.io/dbtrail/bintrail:${BINTRAIL_TAG:-latest}
+    command: ["baseline", "--input", "/dump/snapshot", "--output", "/var/lib/bintrail/baselines"]
+    volumes:
+      - bintrail-dump:/dump
+      - bintrail-state:/var/lib/bintrail
+    depends_on:
+      baseline-dump:
+        condition: service_completed_successfully
