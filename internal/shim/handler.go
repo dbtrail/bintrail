@@ -454,6 +454,9 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	if image == nil {
 		return emptyResult(), nil
 	}
+	// ENUM/SET ordinals → labels (#472), so the historical row renders
+	// the same way the live table does.
+	h.enumMapperFor(q.Schema, q.Table).mapImage(image)
 	// When q.Columns is set (#313 user-supplied projection), bypass
 	// imageToResult's orderColumns step — orderColumns is designed for
 	// SELECT * and DROPS missing-from-image columns + APPENDS image
@@ -621,7 +624,13 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 		))
 	}
 
-	return imagesToResult(extractFullTableImages(rows), h.effectiveColumnOrder(q))
+	images := extractFullTableImages(rows)
+	if mapper := h.enumMapperFor(q.Schema, q.Table); mapper != nil {
+		for _, img := range images {
+			mapper.mapImage(img)
+		}
+	}
+	return imagesToResult(images, h.effectiveColumnOrder(q))
 }
 
 // extractFullTableImages picks the post-image of every non-DELETE
@@ -812,24 +821,8 @@ func (h *Handler) validatePKColumn(q TimeTravelQuery) error {
 // hard failure on what is otherwise a working query — but the
 // fallback should be loud when it's hiding a real outage.
 func (h *Handler) columnOrderFor(schema, table string) []string {
-	if h.resolverFn == nil {
-		return nil
-	}
-	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger)
-	if err != nil {
-		if errors.Is(err, metadata.ErrNoSnapshots) {
-			h.logger.Debug("shim: no snapshots yet; falling back to alphabetical column order",
-				"schema", schema, "table", table)
-		} else {
-			h.logger.Warn("shim: schema_snapshots lookup failed; falling back to alphabetical column order",
-				"err", err, "schema", schema, "table", table)
-		}
-		return nil
-	}
-	tm, err := r.Resolve(schema, table)
-	if err != nil {
-		h.logger.Debug("shim: table not in latest snapshot; falling back to alphabetical column order",
-			"err", err, "schema", schema, "table", table)
+	tm := h.tableMetaFor(schema, table)
+	if tm == nil {
 		return nil
 	}
 	cols := make([]string, 0, len(tm.Columns))
@@ -837,6 +830,45 @@ func (h *Handler) columnOrderFor(schema, table string) []string {
 		cols = append(cols, c.Name)
 	}
 	return cols
+}
+
+// tableMetaFor returns the table's metadata from the latest schema
+// snapshot, or nil when it can't be resolved. nil is the graceful-
+// degradation signal shared by every consumer (columnOrderFor's
+// alphabetical fallback, enumMapperFor's pass-through): a broken or
+// absent snapshot must never turn a working query into an error.
+// Log channel split mirrors the original columnOrderFor semantics —
+// Debug for the benign states (no snapshot yet, table not captured),
+// Warn for a real lookup failure.
+func (h *Handler) tableMetaFor(schema, table string) *metadata.TableMeta {
+	if h.resolverFn == nil {
+		return nil
+	}
+	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger)
+	if err != nil {
+		if errors.Is(err, metadata.ErrNoSnapshots) {
+			h.logger.Debug("shim: no snapshots yet; proceeding without snapshot metadata",
+				"schema", schema, "table", table)
+		} else {
+			h.logger.Warn("shim: schema_snapshots lookup failed; proceeding without snapshot metadata",
+				"err", err, "schema", schema, "table", table)
+		}
+		return nil
+	}
+	tm, err := r.Resolve(schema, table)
+	if err != nil {
+		h.logger.Debug("shim: table not in latest snapshot; proceeding without snapshot metadata",
+			"err", err, "schema", schema, "table", table)
+		return nil
+	}
+	return tm
+}
+
+// enumMapperFor builds the ENUM/SET ordinal→label mapper for a table
+// (#472). Returns nil — a valid no-op receiver — whenever the snapshot
+// is unavailable or the table has no ENUM/SET columns.
+func (h *Handler) enumMapperFor(schema, table string) *enumLabelMapper {
+	return newEnumLabelMapper(h.tableMetaFor(schema, table))
 }
 
 // selectImage picks the row image that represents the row's state at
@@ -930,6 +962,10 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 	// when a customer compares _diff output side by side with the
 	// reconstructed flashback row.
 	ddlOrder := h.columnOrderFor(q.Schema, q.Table)
+	// Map ENUM/SET ordinals to labels (#472) so the audit JSON shows the
+	// same value representation a live SELECT (and the _flashback /
+	// _snapshot reconstructions) would.
+	mapper := h.enumMapperFor(q.Schema, q.Table)
 	cols := []string{"event_id", "event_timestamp", "event_type", "gtid", "row_before", "row_after"}
 	values := make([][]any, 0, len(rows))
 	for _, r := range rows {
@@ -937,6 +973,8 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 		if r.GTID != nil {
 			gtid = *r.GTID
 		}
+		mapper.mapImage(r.RowBefore)
+		mapper.mapImage(r.RowAfter)
 		values = append(values, []any{
 			r.EventID,
 			r.EventTimestamp.UTC().Format("2006-01-02 15:04:05"),

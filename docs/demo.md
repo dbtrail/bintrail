@@ -96,7 +96,6 @@ row). It needs Docker and ~3 minutes; it is not part of `go test ./...`.
 |---|---|
 | `Empty set` from an `AS OF` query | The timestamp predates the stream start (history only accumulates while the demo runs) or the row wasn't touched yet — wait a minute and retry. |
 | `ERROR 1064` | The query shape isn't in the shim grammar — see the supported forms above (the hint and bare-AS-OF forms only support `SELECT *`, and bare `AS OF` must end the statement). The same query without time-travel syntax goes straight to MySQL. |
-| Historical ENUM shows a number (`2` instead of `processing`) | The binlog row image stores ENUMs as their ordinal; live rows render the label, historical images render the ordinal. |
 | `ERROR 1045` | Wrong credentials — port 6033 takes `demo` / `demo`. |
 | Container exits during boot | A component failed; `docker logs` shows which. The demo dies loudly rather than half-working. |
 

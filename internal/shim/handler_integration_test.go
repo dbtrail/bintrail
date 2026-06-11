@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -236,4 +237,99 @@ func fieldNames(fields []*mysql.Field) []string {
 		out[i] = string(f.Name)
 	}
 	return out
+}
+
+// TestRunPointInTime_EnumSetOrdinalsMapToLabels pins #472 end-to-end
+// against a real index DB: binlog ROW images store ENUMs as 1-based
+// ordinals and SETs as bitmasks, and the shim must map them back to
+// labels via the snapshot's column_type so a time-travel row renders
+// the way a live SELECT does. Also covers runDiff (the audit JSON must
+// carry the same representation) and the 0-ordinal / 0-mask sentinels.
+func TestRunPointInTime_EnumSetOrdinalsMapToLabels(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, now)
+
+	// Snapshot rows with column_type populated (testutil.InsertSnapshot
+	// predates the column, so raw SQL keeps the shared helper untouched).
+	snapTS := now.Format("2006-01-02 15:04:05")
+	insertTyped := func(column string, ordinal int, key, dataType, columnType string) {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable)
+			VALUES (1, ?, 'myapp', 'orders', ?, ?, ?, ?, ?, 'NO')`,
+			snapTS, column, ordinal, key, dataType, columnType)
+	}
+	insertTyped("id", 1, "PRI", "int", "int unsigned")
+	insertTyped("status", 2, "", "enum", "enum('pending','processing','shipped')")
+	insertTyped("tags", 3, "", "set", "set('red','blue')")
+
+	// UPDATE event: pending/no-tags → shipped/red,blue — all stored as
+	// ordinals/bitmasks, exactly as the binlog ROW image records them.
+	eventTS := now.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "orders", 2, "1", []byte(`["status","tags"]`),
+		[]byte(`{"id":1,"status":1,"tags":0}`),
+		[]byte(`{"id":1,"status":3,"tags":3}`))
+
+	h := NewHandlerWithConfig(db, Config{
+		NoArchive:   true,
+		IndexDBName: dbName,
+	}, slog.Default())
+
+	result, err := h.runPointInTime(TimeTravelQuery{
+		Type:     TypeFlashback,
+		Schema:   "myapp",
+		Table:    "orders",
+		PKColumn: "id",
+		PKValue:  "1",
+		AsOf:     now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("runPointInTime: %v", err)
+	}
+	gotFields := fieldNames(result.Resultset.Fields)
+	if want := []string{"id", "status", "tags"}; !slices.Equal(gotFields, want) {
+		t.Fatalf("fields = %v, want %v", gotFields, want)
+	}
+	cells := rowCells(t, result.Resultset)
+	if len(cells) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(cells))
+	}
+	if got, want := cells[0][1], "shipped"; got != want {
+		t.Errorf("status = %q, want %q (enum ordinal not mapped to label)", got, want)
+	}
+	if got, want := cells[0][2], "red,blue"; got != want {
+		t.Errorf("tags = %q, want %q (set bitmask not mapped to members)", got, want)
+	}
+
+	// _diff must show the same representation in both image JSONs,
+	// including the 0-ordinal ("") and 0-mask ("") sentinels in row_before.
+	diffResult, err := h.runDiff(TimeTravelQuery{
+		Type:    TypeDiff,
+		Schema:  "myapp",
+		Table:   "orders",
+		PKValue: "1",
+		Since:   now.Add(time.Minute),
+		Until:   now.Add(15 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("runDiff: %v", err)
+	}
+	diffCells := rowCells(t, diffResult.Resultset)
+	if len(diffCells) != 1 {
+		t.Fatalf("_diff: expected 1 row, got %d", len(diffCells))
+	}
+	rowBefore, rowAfter := diffCells[0][4], diffCells[0][5]
+	if !strings.Contains(rowBefore, `"status":"pending"`) || !strings.Contains(rowBefore, `"tags":""`) {
+		t.Errorf("row_before = %s, want status mapped to \"pending\" and tags to \"\"", rowBefore)
+	}
+	if !strings.Contains(rowAfter, `"status":"shipped"`) || !strings.Contains(rowAfter, `"tags":"red,blue"`) {
+		t.Errorf("row_after = %s, want status \"shipped\" and tags \"red,blue\"", rowAfter)
+	}
 }
