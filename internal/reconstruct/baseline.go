@@ -341,6 +341,10 @@ func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string,
 
 // ─── S3 ───────────────────────────────────────────────────────────────────────
 
+// NOTE(#461): unlike findBaselineLocal, this path CANNOT warn when the table
+// is absent from the newest snapshot — the glob below is table-scoped, so
+// snapshots lacking the table are invisible without a broader (and costlier)
+// listing. S3 lookups therefore still fall back to older snapshots silently.
 func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Time) (string, time.Time, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {

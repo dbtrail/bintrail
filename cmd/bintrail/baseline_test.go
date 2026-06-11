@@ -124,8 +124,9 @@ func TestRunBaselineTimestampParsing(t *testing.T) {
 		bslTimestamp = origTS
 	})
 
-	// Use real directories so Run gets past DiscoverTables with 0 tables found,
-	// avoiding any interaction with the filesystem beyond what's needed.
+	// Real (empty) directories: post-#461 a dump with zero tables is an
+	// error, so the valid-timestamp cases below assert exactly that error —
+	// which doubles as the cmd-level propagation check for it.
 	bslInput = t.TempDir()
 	bslOutput = t.TempDir()
 
@@ -135,9 +136,8 @@ func TestRunBaselineTimestampParsing(t *testing.T) {
 		t.Errorf("invalid timestamp: want ISO 8601 error, got: %v", err)
 	}
 
-	// Valid formats: each should parse without the ISO 8601 error.
-	// With an empty input dir, DiscoverTables returns 0 tables → Run returns
-	// Stats{} with no error, so runBaseline succeeds overall.
+	// Valid formats: each must get past timestamp parsing and surface the
+	// zero-tables refusal from baseline.Run instead.
 	validCases := []struct {
 		name string
 		ts   string
@@ -149,8 +149,8 @@ func TestRunBaselineTimestampParsing(t *testing.T) {
 	for _, tc := range validCases {
 		bslTimestamp = tc.ts
 		err := runBaseline(baselineCmd, nil)
-		if err != nil && strings.Contains(err.Error(), "expected ISO 8601") {
-			t.Errorf("%s: timestamp should parse without ISO 8601 error, got: %v", tc.name, err)
+		if err == nil || !strings.Contains(err.Error(), "no tables found") {
+			t.Errorf("%s: want the zero-tables error after a parsed timestamp, got: %v", tc.name, err)
 		}
 	}
 }
@@ -211,8 +211,9 @@ func TestRunBaselineMissingInput(t *testing.T) {
 // TestRunBaseline_invalidUploadURL verifies that an invalid --upload value
 // (not starting with s3://) is caught by parseS3URL inside uploadBaselineToS3
 // and surfaces as an "S3 upload" error — without requiring AWS credentials.
-// baseline.Run with an empty input dir and a valid timestamp succeeds (0 tables),
-// so execution reaches the upload block before the URL validation fires.
+// A minimal real dump carries execution past baseline.Run (post-#461 an
+// empty input dir errors on zero tables) so the upload block's URL
+// validation is what fires.
 func TestRunBaseline_invalidUploadURL(t *testing.T) {
 	origInput, origOutput, origTS, origUpload :=
 		bslInput, bslOutput, bslTimestamp, bslUpload
@@ -231,6 +232,7 @@ func TestRunBaseline_invalidUploadURL(t *testing.T) {
 	// Outside cobra's Execute the command context is nil, and baseline.Run's
 	// workers (now actually reached — the dump has a table) call ctx.Err().
 	baselineCmd.SetContext(context.Background())
+	t.Cleanup(func() { baselineCmd.SetContext(nil) })
 	bslTimestamp = "2025-02-28T00:00:00Z"
 	bslUpload = "http://not-s3.example.com/bucket" // invalid: not s3://
 

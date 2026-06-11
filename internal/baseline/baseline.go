@@ -189,8 +189,17 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	}
 	wg.Wait()
 
+	// A cancelled run skipped tables without recording errors (workers just
+	// return on ctx.Err()) — succeeding here would publish a partial snapshot
+	// indistinguishable from a complete one.
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	if len(errs) > 0 {
-		return stats, errs[0] // return first error; others are logged
+		if len(errs) > 1 {
+			return stats, fmt.Errorf("%d of %d tables failed (others logged); first: %w", len(errs), len(tables), errs[0])
+		}
+		return stats, errs[0]
 	}
 	return stats, nil
 }
