@@ -39,3 +39,32 @@ func TestMakeBuildMCP(t *testing.T) {
 		t.Errorf("expected --help output to mention -http flag, got:\n%s", output)
 	}
 }
+
+// TestStdioCleanDisconnectExitsZero pins #473 end-to-end: a client
+// closing stdin after initialize is the normal end of an MCP stdio
+// session, so the server must exit 0 with no ERROR log line —
+// supervisors and exit-code checks must not record a failure for
+// every normal disconnect.
+func TestStdioCleanDisconnectExitsZero(t *testing.T) {
+	projectRoot := filepath.Join("..", "..")
+	binPath := filepath.Join(t.TempDir(), "bintrail-mcp")
+
+	makeCmd := exec.Command("make", "build-mcp", "MCP_BINARY="+binPath)
+	makeCmd.Dir = projectRoot
+	if out, err := makeCmd.CombinedOutput(); err != nil {
+		t.Fatalf("make build-mcp failed: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(binPath)
+	cmd.Stdin = strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"disconnect-test","version":"1.0"}}}` + "\n" +
+			`{"jsonrpc":"2.0","method":"notifications/initialized"}` + "\n",
+	) // reader drains → stdin closes → clean client disconnect
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("clean disconnect must exit 0, got %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "ERROR") {
+		t.Errorf("clean disconnect must not log ERROR, got:\n%s", out)
+	}
+}

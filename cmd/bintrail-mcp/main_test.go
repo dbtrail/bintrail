@@ -2,11 +2,14 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -387,5 +390,34 @@ func TestSchemaChangesArgs_validDDLTypes(t *testing.T) {
 		if strings.Contains(tc.Text, "invalid ddl_type") {
 			t.Errorf("ddl_type %q should be valid, got: %s", ddlType, tc.Text)
 		}
+	}
+}
+
+// ─── isClientDisconnect ──────────────────────────────────────────────────────
+
+func TestIsClientDisconnect(t *testing.T) {
+	// The shape Run returns on a clean stdin EOF (go-sdk v1.3.1):
+	// jsonrpc2.ErrServerClosing (*jsonrpc.Error, code -32004) wrapped
+	// with the EOF rendered as text.
+	closing := fmt.Errorf("%w: %v", &jsonrpc.Error{Code: -32004, Message: "server is closing"}, io.EOF)
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"clean disconnect (wrapped ErrServerClosing)", closing, true},
+		{"bare ErrServerClosing", &jsonrpc.Error{Code: -32004, Message: "server is closing"}, true},
+		{"nil error", nil, false},
+		{"plain transport fault", errors.New("read /dev/stdin: input/output error"), false},
+		{"raw io.EOF (never -32004-wrapped)", io.EOF, false},
+		{"other wire error code", &jsonrpc.Error{Code: -32603, Message: "internal error"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isClientDisconnect(tt.err); got != tt.want {
+				t.Errorf("isClientDisconnect(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
