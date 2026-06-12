@@ -217,8 +217,11 @@ func main() {
 		if isClientDisconnect(err) {
 			// The client closing stdin is the normal end of an MCP stdio
 			// session, not a failure — exit 0 so supervisors and scripts
-			// checking exit codes don't record an error (#473).
-			slog.Info("MCP client disconnected; shutting down")
+			// checking exit codes don't record an error (#473). The cause
+			// is kept in the log so anything misclassified as a disconnect
+			// (e.g. an SDK bump re-purposing the wire code) stays
+			// diagnosable.
+			slog.Info("MCP client disconnected; shutting down", "cause", err)
 			return
 		}
 		slog.Error("MCP server error", "error", err)
@@ -239,11 +242,18 @@ const errCodeServerClosing = -32004
 // client closed the connection — as opposed to a transport fault.
 //
 // On a clean stdin EOF, Run (go-sdk v1.3.1, verified empirically)
-// returns "server is closing: EOF": jsonrpc2.ErrServerClosing wrapping
-// the EOF as TEXT — errors.Is(err, io.EOF) is false. Hard transport
-// faults are safe from this check: the SDK's Connection.wait returns
-// non-EOF read/write errors raw (never wrapped in -32004), so they
-// still reach the Error + exit-1 path.
+// returns "server is closing: EOF": after the read side hits EOF the
+// SDK rejects the pending response write, storing
+// jsonrpc2.ErrServerClosing (-32004) wrapping the EOF as TEXT — so
+// errors.Is(err, io.EOF) is false. Real faults cannot arrive wearing
+// -32004: Connection.wait returns a non-EOF readErr RAW with priority
+// over that stored wrapper, and a real write fault claims the writeErr
+// slot first (the SDK stores only the first write error) — both still
+// reach the Error + exit-1 path. The one other -32004 construction (a
+// bare "server is closing" from ss.Close) is unreachable because the
+// stdio path uses context.Background() (no signal cancellation) and
+// sets no ServerOptions.KeepAlive — re-verify this classification if
+// either of those changes.
 func isClientDisconnect(err error) bool {
 	var wireErr *jsonrpc.Error
 	return errors.As(err, &wireErr) && wireErr.Code == errCodeServerClosing

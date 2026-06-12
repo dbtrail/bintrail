@@ -64,7 +64,40 @@ func TestStdioCleanDisconnectExitsZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clean disconnect must exit 0, got %v\n%s", err, out)
 	}
+	// NOTE: the SDK's own Run logs Error("server session ended with
+	// error") on this exact path, currently discarded because
+	// ServerOptions.Logger defaults to a discard logger. If someone
+	// wires a real logger into newServerWithDSN, this assertion starts
+	// failing — that's a TRUE positive for #473's spirit (clean
+	// disconnects must not emit error noise), not test brittleness.
 	if strings.Contains(string(out), "ERROR") {
 		t.Errorf("clean disconnect must not log ERROR, got:\n%s", out)
+	}
+}
+
+// TestStdioGarbageInputExitsNonZero pins the other side of the #473
+// boundary: a real transport fault (undecodable stdin) must still log
+// ERROR and exit non-zero. The clean-disconnect swallow is allowed to
+// catch ONLY the -32004 client-went-away shape — if an SDK bump ever
+// rewired decode errors through that code, this test catches the new
+// silent swallow.
+func TestStdioGarbageInputExitsNonZero(t *testing.T) {
+	projectRoot := filepath.Join("..", "..")
+	binPath := filepath.Join(t.TempDir(), "bintrail-mcp")
+
+	makeCmd := exec.Command("make", "build-mcp", "MCP_BINARY="+binPath)
+	makeCmd.Dir = projectRoot
+	if out, err := makeCmd.CombinedOutput(); err != nil {
+		t.Fatalf("make build-mcp failed: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(binPath)
+	cmd.Stdin = strings.NewReader("this is not json\n")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("garbage stdin must exit non-zero, got exit 0\n%s", out)
+	}
+	if !strings.Contains(string(out), "ERROR") {
+		t.Errorf("garbage stdin must log ERROR, got:\n%s", out)
 	}
 }
