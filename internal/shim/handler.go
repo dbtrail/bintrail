@@ -111,6 +111,14 @@ type Handler struct {
 	epochMu        sync.Mutex
 	epochResolvers map[int]*metadata.Resolver
 
+	// The epoch LIST does grow (each `bintrail snapshot` appends), so it
+	// gets the same TTL treatment as resolverCache: a fresh snapshot
+	// becomes visible at the next expiry, and steady-state time-travel
+	// queries pay no extra DB round-trip.
+	epochListMu     sync.Mutex
+	epochList       []metadata.SnapshotEpoch
+	epochListLoaded time.Time
+
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
 }
@@ -906,19 +914,34 @@ func (h *Handler) mapEventImages(schema, table string, rows []query.ResultRow) {
 }
 
 // loadEpochs fetches the snapshot history for epoch-aware ENUM/SET
-// decoding. nil (on any failure, or in resolver-only test handlers
+// decoding, cached for resolverCacheTTL (the same freshness contract as
+// the resolver: a fresh `bintrail snapshot` shows up at the next
+// expiry). nil (on any failure, or in resolver-only test handlers
 // without a DB) degrades MapperAt to the latest-snapshot Fallback —
 // the pre-#475 behavior, logged at Debug since the wire response is
-// still correct for any enum that was never reshaped.
+// still correct for any enum that was never reshaped. Failures are not
+// cached: the next query retries.
 func (h *Handler) loadEpochs() []metadata.SnapshotEpoch {
 	if h.indexDB == nil {
 		return nil
 	}
+	now := time.Now()
+	h.epochListMu.Lock()
+	if !h.epochListLoaded.IsZero() && now.Sub(h.epochListLoaded) < resolverCacheTTL {
+		list := h.epochList
+		h.epochListMu.Unlock()
+		return list
+	}
+	h.epochListMu.Unlock()
+
 	epochs, err := metadata.LoadSnapshotEpochs(h.indexDB)
 	if err != nil {
 		h.logger.Debug("shim: snapshot epoch lookup failed; decoding ENUM/SET with the latest snapshot", "err", err)
 		return nil
 	}
+	h.epochListMu.Lock()
+	h.epochList, h.epochListLoaded = epochs, now
+	h.epochListMu.Unlock()
 	return epochs
 }
 
