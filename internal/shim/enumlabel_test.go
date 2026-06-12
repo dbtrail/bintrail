@@ -50,10 +50,35 @@ func TestParseEnumSetLabels(t *testing.T) {
 			columnType: "enum('only')",
 			wantLabels: []string{"only"},
 		},
+		{
+			// MySQL renders a literal backslash in a member as \\ —
+			// COLUMN_TYPE bytes: enum('a\\b','c')
+			name:       "backslash escape decodes",
+			columnType: `enum('a\\b','c')`,
+			wantLabels: []string{`a\b`, "c"},
+		},
+		{
+			// A newline in a member renders as the two bytes \n.
+			name:       "newline escape decodes",
+			columnType: `enum('line1\nline2')`,
+			wantLabels: []string{"line1\nline2"},
+		},
+		{
+			name:       "carriage-return escape decodes",
+			columnType: `enum('a\rb')`,
+			wantLabels: []string{"a\rb"},
+		},
+		{
+			name:       "NUL escape decodes",
+			columnType: `enum('a\0b')`,
+			wantLabels: []string{"a\x00b"},
+		},
 		{name: "not an enum", columnType: "int unsigned"},
 		{name: "varchar with parens", columnType: "varchar(20)"},
 		{name: "pre-#212 empty column_type", columnType: ""},
 		{name: "unterminated quote", columnType: "enum('a"},
+		{name: "unknown escape bails to honest ordinal", columnType: `enum('a\xb')`},
+		{name: "dangling backslash at end", columnType: `enum('a\`},
 		{name: "empty member list", columnType: "enum()"},
 		{name: "trailing comma", columnType: "enum('a',)"},
 		{name: "garbage between members", columnType: "enum('a' x 'b')"},

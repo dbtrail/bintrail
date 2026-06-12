@@ -23,6 +23,15 @@ import (
 // event), non-integral numbers, values already strings (the _snapshot
 // baseline path seeds labels from mydumper dumps) — passes through
 // unchanged rather than guessing.
+//
+// KNOWN LIMITATION: ordinals are decoded with the LATEST snapshot's
+// definition, not the one in effect at the event's timestamp. Appending
+// members (the common evolution) is safe, and end-shrink is caught by the
+// out-of-range guard — but a REORDER or middle-member removal between the
+// event and the latest snapshot maps an old ordinal to the wrong label
+// with no signal. Documented in docs/time-travel-sql.md's Limitations;
+// the fix (resolve the snapshot in effect at the event time via
+// metadata.NewResolver(db, N)) is tracked as a follow-up issue.
 type enumLabelMapper struct {
 	enums map[string][]string // column → labels in 1-based ordinal order
 	sets  map[string][]string // column → members in bit order (bit i ↔ member i)
@@ -31,9 +40,9 @@ type enumLabelMapper struct {
 // newEnumLabelMapper builds a mapper for the table's ENUM/SET columns.
 // Returns nil — a valid no-op receiver for mapImage — when tm is nil
 // (resolver unavailable; same degradation contract as columnOrderFor) or
-// the table has no ENUM/SET columns, so callers pay nothing on the
-// common path. Pre-#212 snapshots have empty ColumnType and naturally
-// fall out as "no ENUM/SET columns".
+// the table has no ENUM/SET columns, so the per-row mapping cost on the
+// common path is a single nil check. Pre-#212 snapshots have empty
+// ColumnType and naturally fall out as "no ENUM/SET columns".
 func newEnumLabelMapper(tm *metadata.TableMeta) *enumLabelMapper {
 	if tm == nil {
 		return nil
@@ -102,9 +111,13 @@ func (m *enumLabelMapper) mapImage(image map[string]any) {
 // ordinalValue extracts a non-negative integral ordinal from the value
 // types a row image can carry. JSON-decoded images yield float64; the
 // defensive integer cases cover merged values that skipped the JSON
-// round-trip. Strings (already labels), NULLs, negatives, non-integral
-// floats, and floats beyond exact integer precision (2^53) all report
-// !ok — the caller leaves those values untouched.
+// round-trip. Textual values (string or []byte — already labels),
+// NULLs, negatives, non-integral floats, and floats beyond exact
+// integer precision (2^53) all report !ok — the caller leaves those
+// values untouched. The 2^53 bound also means a SET mask using members
+// beyond bit 53 degrades to pass-through: such a mask is already
+// precision-lossy after the JSON round-trip, so refusing it is the
+// honest call.
 func ordinalValue(v any) (uint64, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -158,10 +171,14 @@ func setString(mask uint64, members []string) (string, bool) {
 // information_schema COLUMN_TYPE declaration like
 // `enum('pending','shipped')` or `set('a','b')`. Members are
 // single-quoted with embedded quotes doubled (`'it''s'`), and may
-// legitimately be empty (`enum('','a')`) or contain commas. Reports
-// !ok for any other type declaration ("int unsigned", "varchar(20)",
-// the empty pre-#212 string) and for malformed input — callers treat
-// !ok as "not an ENUM/SET column".
+// legitimately be empty (`enum('','a')`) or contain commas. MySQL
+// additionally renders backslashes and control characters inside
+// members with C-style escapes (verified on 8.0: `\\`, `\n`, `\r`,
+// `\0`); those are decoded so the label's bytes match the live
+// value. Reports !ok for any other type declaration ("int unsigned",
+// "varchar(20)", the empty pre-#212 string), for malformed input,
+// and for an escape sequence we don't recognize — !ok degrades to
+// the honest raw ordinal, never a guessed label.
 func parseEnumSetLabels(columnType string) (labels []string, isSet, ok bool) {
 	ct := strings.TrimSpace(columnType)
 	lower := strings.ToLower(ct)
@@ -182,16 +199,36 @@ func parseEnumSetLabels(columnType string) (labels []string, isSet, ok bool) {
 	for i := 0; i < len(inner); i++ {
 		ch := inner[i]
 		if inString {
-			if ch == '\'' {
+			switch ch {
+			case '\'':
 				if i+1 < len(inner) && inner[i+1] == '\'' {
 					cur.WriteByte('\'') // doubled quote → literal quote
 					i++
 					continue
 				}
 				inString = false
-				continue
+			case '\\':
+				// Quotes are only ever doubled (never \'), so a backslash
+				// always starts one of MySQL's C-style escapes.
+				if i+1 >= len(inner) {
+					return nil, false, false
+				}
+				i++
+				switch inner[i] {
+				case '\\':
+					cur.WriteByte('\\')
+				case 'n':
+					cur.WriteByte('\n')
+				case 'r':
+					cur.WriteByte('\r')
+				case '0':
+					cur.WriteByte(0)
+				default:
+					return nil, false, false
+				}
+			default:
+				cur.WriteByte(ch)
 			}
-			cur.WriteByte(ch)
 			continue
 		}
 		switch ch {

@@ -421,7 +421,9 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 	// ENUM/SET ordinals → labels (#472). Only delta-applied values need
 	// this — the baseline image already carries labels (mydumper dumps
 	// strings) and string values pass through the mapper untouched, so
-	// this also keeps a baseline+delta row internally consistent.
+	// this also keeps a baseline+delta row internally consistent
+	// (assuming the enum definition didn't change between the dump and
+	// the latest snapshot — see the staleness caveat in enumlabel.go).
 	h.enumMapperFor(q.Schema, q.Table).mapImage(state)
 
 	// Same projection handling as runPointInTime: an explicit column list

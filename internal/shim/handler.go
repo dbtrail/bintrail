@@ -802,24 +802,8 @@ func (h *Handler) validatePKColumn(q TimeTravelQuery) error {
 // what a regular MySQL `SELECT *` would emit. Returns nil when no
 // snapshot is available or the table is missing from the latest
 // snapshot — the caller falls back to alphabetical ordering of the
-// JSON image keys.
-//
-// Logging policy is split deliberately so operators can tell
-// "first-install with no snapshot yet" apart from real DB-side
-// failure:
-//
-//   - metadata.ErrNoSnapshots → Debug. Benign first-install state;
-//     the operator just hasn't run `bintrail snapshot` yet.
-//   - any other resolver-load error → Warn. Index DB is unreachable
-//     or schema_snapshots is unreadable — a real config/infra
-//     problem the operator should see at default --log-level info.
-//   - table not in snapshot → Debug. Common for tables created
-//     after the latest snapshot was taken; benign and self-fixing
-//     once a fresh snapshot runs.
-//
-// A janky-but-deterministic fallback is strictly better than a
-// hard failure on what is otherwise a working query — but the
-// fallback should be loud when it's hiding a real outage.
+// JSON image keys. Degradation semantics and logging live in
+// tableMetaFor.
 func (h *Handler) columnOrderFor(schema, table string) []string {
 	tm := h.tableMetaFor(schema, table)
 	if tm == nil {
@@ -837,9 +821,23 @@ func (h *Handler) columnOrderFor(schema, table string) []string {
 // degradation signal shared by every consumer (columnOrderFor's
 // alphabetical fallback, enumMapperFor's pass-through): a broken or
 // absent snapshot must never turn a working query into an error.
-// Log channel split mirrors the original columnOrderFor semantics —
-// Debug for the benign states (no snapshot yet, table not captured),
-// Warn for a real lookup failure.
+//
+// Logging policy is split deliberately so operators can tell
+// "first-install with no snapshot yet" apart from real DB-side
+// failure:
+//
+//   - metadata.ErrNoSnapshots → Debug. Benign first-install state;
+//     the operator just hasn't run `bintrail snapshot` yet.
+//   - any other resolver-load error → Warn. Index DB is unreachable
+//     or schema_snapshots is unreadable — a real config/infra
+//     problem the operator should see at default --log-level info.
+//   - table not in snapshot → Debug. Common for tables created
+//     after the latest snapshot was taken; benign and self-fixing
+//     once a fresh snapshot runs.
+//
+// A degraded-but-deterministic fallback is strictly better than a
+// hard failure on what is otherwise a working query — but the
+// fallback should be loud when it's hiding a real outage.
 func (h *Handler) tableMetaFor(schema, table string) *metadata.TableMeta {
 	if h.resolverFn == nil {
 		return nil
