@@ -288,6 +288,12 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 	slog.Debug("fetched binlog events", "count", len(events))
 
+	// ENUM/SET ordinals → labels (#476), each delta decoded with the
+	// snapshot in effect at its event time (#475). No latest-resolver
+	// fallback here: if the epoch lookup fails, ordinals pass through
+	// raw — the pre-#476 CLI output.
+	reconstruct.MapEventEnumLabels(db, nil, recSchema, recTable, events)
+
 	// Warn if there is a gap between the baseline binlog position and the
 	// first indexed event — events in that gap are missing from the reconstruction.
 	if bmeta.BinlogFile == "" && len(events) > 0 {

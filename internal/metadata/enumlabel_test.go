@@ -1,11 +1,10 @@
-package shim
+package metadata
 
 import (
-	"log/slog"
+	"errors"
 	"reflect"
 	"testing"
-
-	"github.com/dbtrail/dbtrail/internal/metadata"
+	"time"
 )
 
 func TestParseEnumSetLabels(t *testing.T) {
@@ -103,11 +102,11 @@ func TestParseEnumSetLabels(t *testing.T) {
 	}
 }
 
-func orderEnumSetMeta() *metadata.TableMeta {
-	return &metadata.TableMeta{
+func orderEnumSetMeta() *TableMeta {
+	return &TableMeta{
 		Schema: "myapp",
 		Table:  "orders",
-		Columns: []metadata.ColumnMeta{
+		Columns: []ColumnMeta{
 			{Name: "id", DataType: "int", ColumnType: "int unsigned", IsPK: true},
 			{Name: "status", DataType: "enum", ColumnType: "enum('pending','processing','shipped')"},
 			{Name: "tags", DataType: "set", ColumnType: "set('red','blue')"},
@@ -185,11 +184,11 @@ func TestEnumLabelMapperMapImage(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := newEnumLabelMapper(orderEnumSetMeta())
+			m := NewEnumLabelMapper(orderEnumSetMeta())
 			if m == nil {
 				t.Fatal("expected a mapper for a table with enum/set columns")
 			}
-			m.mapImage(tt.in)
+			m.MapImage(tt.in)
 			if !reflect.DeepEqual(tt.in, tt.want) {
 				t.Errorf("image = %v, want %v", tt.in, tt.want)
 			}
@@ -198,60 +197,137 @@ func TestEnumLabelMapperMapImage(t *testing.T) {
 }
 
 func TestEnumLabelMapperNilSafety(t *testing.T) {
-	if m := newEnumLabelMapper(nil); m != nil {
+	if m := NewEnumLabelMapper(nil); m != nil {
 		t.Error("nil TableMeta must yield a nil mapper")
 	}
-	noEnums := &metadata.TableMeta{Columns: []metadata.ColumnMeta{
+	noEnums := &TableMeta{Columns: []ColumnMeta{
 		{Name: "id", ColumnType: "int unsigned"},
 		{Name: "name", ColumnType: "varchar(20)"},
 		{Name: "legacy", ColumnType: ""}, // pre-#212 snapshot
 	}}
-	if m := newEnumLabelMapper(noEnums); m != nil {
+	if m := NewEnumLabelMapper(noEnums); m != nil {
 		t.Error("table without enum/set columns must yield a nil mapper")
 	}
 
 	// The nil receiver and nil image are both valid no-ops — every call
 	// site relies on this instead of guarding.
-	var m *enumLabelMapper
-	m.mapImage(map[string]any{"status": float64(1)})
-	m.mapImage(nil)
-	real := newEnumLabelMapper(orderEnumSetMeta())
-	real.mapImage(nil)
+	var m *EnumLabelMapper
+	m.MapImage(map[string]any{"status": float64(1)})
+	m.MapImage(nil)
+	real := NewEnumLabelMapper(orderEnumSetMeta())
+	real.MapImage(nil)
 }
 
-// TestEnumMapperFor covers the Handler-side composition (tableMetaFor →
-// newEnumLabelMapper) that every render path calls — the only other
-// protection it has is one integration-tagged test.
-func TestEnumMapperFor(t *testing.T) {
-	h := &Handler{
-		logger: slog.Default(),
-		resolverFn: func() (*metadata.Resolver, error) {
-			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
-				"myapp.orders": orderEnumSetMeta(),
-				"myapp.plain": {Schema: "myapp", Table: "plain", Columns: []metadata.ColumnMeta{
-					{Name: "id", ColumnType: "int unsigned"},
-				}},
-			}), nil
+// ─── Epochs (#475) ──────────────────────────────────────────────────────────
+
+func TestEpochAt(t *testing.T) {
+	t0 := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	epochs := []SnapshotEpoch{
+		{ID: 1, At: t0},
+		{ID: 2, At: t0.Add(time.Hour)},
+		{ID: 5, At: t0.Add(2 * time.Hour)},
+	}
+	tests := []struct {
+		name   string
+		at     time.Time
+		wantID int
+		wantOK bool
+	}{
+		{"before first snapshot clamps to first", t0.Add(-time.Hour), 1, true},
+		{"exactly at an epoch", t0.Add(time.Hour), 2, true},
+		{"between epochs", t0.Add(90 * time.Minute), 2, true},
+		{"after last epoch", t0.Add(3 * time.Hour), 5, true},
+		{"empty epochs", t0, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eps := epochs
+			if tt.name == "empty epochs" {
+				eps = nil
+			}
+			id, ok := EpochAt(eps, tt.at)
+			if id != tt.wantID || ok != tt.wantOK {
+				t.Errorf("EpochAt = (%d, %v), want (%d, %v)", id, ok, tt.wantID, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestEnumMapperSource pins the selection + degradation ladder: epoch
+// resolver when available, Fallback when the per-id load fails or no
+// epochs exist, nil (pass-through) when nothing resolves — and per-key
+// memoization so ResolverFor runs once per (epoch, table).
+func TestEnumMapperSource(t *testing.T) {
+	t0 := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	// Epoch 1: enum('pending','processing','shipped'); epoch 2: REORDERED.
+	metaV1 := orderEnumSetMeta()
+	metaV2 := &TableMeta{Schema: "myapp", Table: "orders", Columns: []ColumnMeta{
+		{Name: "id", ColumnType: "int", IsPK: true},
+		{Name: "status", ColumnType: "enum('shipped','processing','pending')"},
+	}}
+	resolvers := map[int]*Resolver{
+		1: NewResolverFromTables(1, map[string]*TableMeta{"myapp.orders": metaV1}),
+		2: NewResolverFromTables(2, map[string]*TableMeta{"myapp.orders": metaV2}),
+	}
+	loads := 0
+	src := &EnumMapperSource{
+		Epochs: []SnapshotEpoch{{ID: 1, At: t0}, {ID: 2, At: t0.Add(time.Hour)}},
+		ResolverFor: func(id int) (*Resolver, error) {
+			loads++
+			r, ok := resolvers[id]
+			if !ok {
+				return nil, errors.New("no such snapshot")
+			}
+			return r, nil
 		},
+		Fallback: resolvers[2],
 	}
 
-	m := h.enumMapperFor("myapp", "orders")
-	if m == nil {
-		t.Fatal("expected a mapper for a snapshot-resolved enum table")
+	// Ordinal 3 decodes differently per epoch: 'shipped' under v1,
+	// 'pending' under v2 — the exact #475 failure the source prevents.
+	img := map[string]any{"status": float64(3)}
+	src.MapperAt("myapp", "orders", t0.Add(time.Minute)).MapImage(img)
+	if img["status"] != "shipped" {
+		t.Errorf("epoch-1 decode = %v, want \"shipped\"", img["status"])
 	}
-	img := map[string]any{"status": float64(2)}
-	m.mapImage(img)
-	if img["status"] != "processing" {
-		t.Errorf("status = %v, want \"processing\"", img["status"])
+	img = map[string]any{"status": float64(3)}
+	src.MapperAt("myapp", "orders", t0.Add(2*time.Hour)).MapImage(img)
+	if img["status"] != "pending" {
+		t.Errorf("epoch-2 decode = %v, want \"pending\"", img["status"])
 	}
 
-	if m := h.enumMapperFor("myapp", "plain"); m != nil {
-		t.Error("table without enum/set columns must yield a nil mapper")
+	// Memoization: repeated lookups in the same epochs add no loads.
+	before := loads
+	src.MapperAt("myapp", "orders", t0.Add(2*time.Minute))
+	src.MapperAt("myapp", "orders", t0.Add(3*time.Hour))
+	if loads != before {
+		t.Errorf("memo miss: ResolverFor ran %d extra times", loads-before)
 	}
-	if m := h.enumMapperFor("myapp", "missing"); m != nil {
-		t.Error("table absent from the snapshot must yield a nil mapper")
+
+	// Per-id load failure → Fallback (latest definition), not no-mapping.
+	failing := &EnumMapperSource{
+		Epochs:      []SnapshotEpoch{{ID: 9, At: t0}},
+		ResolverFor: func(int) (*Resolver, error) { return nil, errors.New("boom") },
+		Fallback:    resolvers[1],
 	}
-	if m := (&Handler{logger: slog.Default()}).enumMapperFor("a", "b"); m != nil {
-		t.Error("handler without resolverFn must yield a nil mapper")
+	img = map[string]any{"status": float64(3)}
+	failing.MapperAt("myapp", "orders", t0).MapImage(img)
+	if img["status"] != "shipped" {
+		t.Errorf("fallback decode = %v, want \"shipped\" (epoch-1 fallback)", img["status"])
+	}
+
+	// No epochs + no fallback → nil mapper → honest pass-through.
+	empty := &EnumMapperSource{}
+	img = map[string]any{"status": float64(3)}
+	empty.MapperAt("myapp", "orders", t0).MapImage(img)
+	if img["status"] != float64(3) {
+		t.Errorf("empty source must pass through, got %v", img["status"])
+	}
+
+	// Table absent from the epoch's snapshot → nil mapper, pass-through.
+	img = map[string]any{"status": float64(3)}
+	src.MapperAt("myapp", "missing", t0).MapImage(img)
+	if img["status"] != float64(3) {
+		t.Errorf("unknown table must pass through, got %v", img["status"])
 	}
 }

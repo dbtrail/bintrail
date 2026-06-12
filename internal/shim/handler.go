@@ -105,6 +105,12 @@ type Handler struct {
 	resolverFn    func() (*metadata.Resolver, error)
 	resolverCache resolverCache
 
+	// epochResolvers permanently caches per-snapshot resolvers for
+	// epoch-aware ENUM/SET decoding (#475): snapshots are immutable, so
+	// entries never go stale; epochResolverCacheCap bounds memory.
+	epochMu        sync.Mutex
+	epochResolvers map[int]*metadata.Resolver
+
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
 }
@@ -450,13 +456,13 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 		return nil, wrapFetchError(q.Type, err)
 	}
 
+	// ENUM/SET ordinals → labels (#472/#475), so the historical row
+	// renders the way the live table did when the event happened.
+	h.mapEventImages(q.Schema, q.Table, rows)
 	image := selectImage(rows)
 	if image == nil {
 		return emptyResult(), nil
 	}
-	// ENUM/SET ordinals → labels (#472), so the historical row renders
-	// the same way the live table does.
-	h.enumMapperFor(q.Schema, q.Table).mapImage(image)
 	// When q.Columns is set (#313 user-supplied projection), bypass
 	// imageToResult's orderColumns step — orderColumns is designed for
 	// SELECT * and DROPS missing-from-image columns + APPENDS image
@@ -624,14 +630,10 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 		))
 	}
 
-	images := extractFullTableImages(rows)
-	// The nil guard is a loop hoist only — mapImage is nil-receiver safe.
-	if mapper := h.enumMapperFor(q.Schema, q.Table); mapper != nil {
-		for _, img := range images {
-			mapper.mapImage(img)
-		}
-	}
-	return imagesToResult(images, h.effectiveColumnOrder(q))
+	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
+	// before the images are extracted.
+	h.mapEventImages(q.Schema, q.Table, rows)
+	return imagesToResult(extractFullTableImages(rows), h.effectiveColumnOrder(q))
 }
 
 // extractFullTableImages picks the post-image of every non-DELETE
@@ -820,8 +822,8 @@ func (h *Handler) columnOrderFor(schema, table string) []string {
 // tableMetaFor returns the table's metadata from the latest schema
 // snapshot, or nil when it can't be resolved. nil is the graceful-
 // degradation signal shared by every consumer (columnOrderFor's
-// alphabetical fallback, enumMapperFor's pass-through): a broken or
-// absent snapshot must never turn a working query into an error.
+// alphabetical fallback): a broken or absent snapshot must never turn
+// a working query into an error.
 //
 // Logging policy is split deliberately so operators can tell
 // "first-install with no snapshot yet" apart from real DB-side
@@ -863,11 +865,92 @@ func (h *Handler) tableMetaFor(schema, table string) *metadata.TableMeta {
 	return tm
 }
 
-// enumMapperFor builds the ENUM/SET ordinal→label mapper for a table
-// (#472). Returns nil — a valid no-op receiver — whenever the snapshot
-// is unavailable or the table has no ENUM/SET columns.
-func (h *Handler) enumMapperFor(schema, table string) *enumLabelMapper {
-	return newEnumLabelMapper(h.tableMetaFor(schema, table))
+// epochResolverCacheCap bounds the per-snapshot resolver cache: each
+// entry holds a full snapshot in memory, and a long-lived shim on an
+// index with years of snapshots must not accumulate them all. Real
+// queries touch one or two epochs; eviction is arbitrary because any
+// evicted entry reloads on demand.
+const epochResolverCacheCap = 8
+
+// mapEventImages rewrites ENUM/SET ordinals in every row's images back
+// to labels (#472), decoding each EVENT with the snapshot in effect at
+// its timestamp (#475): an enum reshaped between two events renders
+// each event under its own definition instead of mislabeling old
+// ordinals with the latest one. Degradation ladder: epoch lookup
+// unavailable → latest snapshot (the pre-#475 behavior); nothing
+// resolvable → pass-through (raw ordinals, never a guessed label).
+//
+// Call this on fetched rows BEFORE any merge or text coercion — the
+// _snapshot paths fold row_after wholesale into the reconstructed
+// state, so pre-mapped events make the merged row carry labels, and
+// fullTableTextCell would otherwise hide ordinals as text cells the
+// mapper (correctly) refuses to touch.
+func (h *Handler) mapEventImages(schema, table string, rows []query.ResultRow) {
+	if len(rows) == 0 || h.resolverFn == nil {
+		return
+	}
+	var fallback *metadata.Resolver
+	if r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger); err == nil {
+		fallback = r
+	}
+	src := metadata.EnumMapperSource{
+		Epochs:      h.loadEpochs(),
+		ResolverFor: h.epochResolver,
+		Fallback:    fallback,
+	}
+	for i := range rows {
+		m := src.MapperAt(schema, table, rows[i].EventTimestamp)
+		m.MapImage(rows[i].RowBefore)
+		m.MapImage(rows[i].RowAfter)
+	}
+}
+
+// loadEpochs fetches the snapshot history for epoch-aware ENUM/SET
+// decoding. nil (on any failure, or in resolver-only test handlers
+// without a DB) degrades MapperAt to the latest-snapshot Fallback —
+// the pre-#475 behavior, logged at Debug since the wire response is
+// still correct for any enum that was never reshaped.
+func (h *Handler) loadEpochs() []metadata.SnapshotEpoch {
+	if h.indexDB == nil {
+		return nil
+	}
+	epochs, err := metadata.LoadSnapshotEpochs(h.indexDB)
+	if err != nil {
+		h.logger.Debug("shim: snapshot epoch lookup failed; decoding ENUM/SET with the latest snapshot", "err", err)
+		return nil
+	}
+	return epochs
+}
+
+// epochResolver loads (and permanently caches) the resolver for one
+// snapshot id. Snapshots are immutable, so entries never go stale;
+// epochResolverCacheCap bounds memory on long-lived shims.
+func (h *Handler) epochResolver(id int) (*metadata.Resolver, error) {
+	h.epochMu.Lock()
+	if r, ok := h.epochResolvers[id]; ok {
+		h.epochMu.Unlock()
+		return r, nil
+	}
+	h.epochMu.Unlock()
+
+	r, err := metadata.NewResolver(h.indexDB, id)
+	if err != nil {
+		return nil, err
+	}
+
+	h.epochMu.Lock()
+	defer h.epochMu.Unlock()
+	if h.epochResolvers == nil {
+		h.epochResolvers = make(map[int]*metadata.Resolver)
+	}
+	if len(h.epochResolvers) >= epochResolverCacheCap {
+		for k := range h.epochResolvers {
+			delete(h.epochResolvers, k)
+			break
+		}
+	}
+	h.epochResolvers[id] = r
+	return r, nil
 }
 
 // selectImage picks the row image that represents the row's state at
@@ -961,10 +1044,10 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 	// when a customer compares _diff output side by side with the
 	// reconstructed flashback row.
 	ddlOrder := h.columnOrderFor(q.Schema, q.Table)
-	// Map ENUM/SET ordinals to labels (#472) so the audit JSON shows the
-	// same value representation a live SELECT (and the _flashback /
-	// _snapshot reconstructions) would.
-	mapper := h.enumMapperFor(q.Schema, q.Table)
+	// Map ENUM/SET ordinals to labels (#472/#475) so the audit JSON
+	// shows each event under the definition in effect when it happened —
+	// a _diff window crossing an enum ALTER renders each side correctly.
+	h.mapEventImages(q.Schema, q.Table, rows)
 	cols := []string{"event_id", "event_timestamp", "event_type", "gtid", "row_before", "row_after"}
 	values := make([][]any, 0, len(rows))
 	for _, r := range rows {
@@ -972,8 +1055,6 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 		if r.GTID != nil {
 			gtid = *r.GTID
 		}
-		mapper.mapImage(r.RowBefore)
-		mapper.mapImage(r.RowAfter)
 		values = append(values, []any{
 			r.EventID,
 			r.EventTimestamp.UTC().Format("2006-01-02 15:04:05"),

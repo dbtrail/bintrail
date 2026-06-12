@@ -143,6 +143,13 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	if err != nil {
 		return nil, wrapFetchError(q.Type, err)
 	}
+	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
+	// BEFORE the merge: the merged rowMap reaching the callback below has
+	// no per-row timestamp, and fullTableTextCell would coerce a delta's
+	// float64 ordinal into the text "3" — which the mapper (correctly)
+	// refuses to touch. Baseline rows already carry labels and pass
+	// through unchanged.
+	h.mapEventImages(q.Schema, q.Table, rows)
 	changes := make(map[string]*query.ResultRow, len(rows))
 	for i := range rows {
 		changes[rows[i].PKValues] = &rows[i]
@@ -163,10 +170,6 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	// for large integers (unlike the event path's float64), and identical on
 	// the wire to per-value formatting. Stop at cap+1 so overflow is
 	// detectable.
-	// ENUM/SET ordinals → labels (#472). Must run BEFORE fullTableTextCell:
-	// the text coercion below turns a delta's float64 ordinal into the
-	// string "3", which the mapper (correctly) refuses to touch.
-	mapper := h.enumMapperFor(q.Schema, q.Table)
 	images := make([]map[string]any, 0)
 	err = reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
 		BaselinePath: baselinePath,
@@ -175,7 +178,6 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		PKCols:       pkCols,
 		Changes:      changes,
 	}, func(rowMap map[string]any) error {
-		mapper.mapImage(rowMap)
 		img := make(map[string]any, len(rowMap))
 		for k, v := range rowMap {
 			img[k] = h.fullTableTextCell(q.Schema, q.Table, k, v)
@@ -412,19 +414,18 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		return nil, wrapFetchError(q.Type, err)
 	}
 
+	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
+	// BEFORE the fold: ApplyAt replaces the image wholesale per event, so
+	// pre-mapped events make the final state carry labels. Only deltas
+	// need this — the baseline image already carries labels (mydumper
+	// dumps strings) and string values pass through the mapper untouched.
+	h.mapEventImages(q.Schema, q.Table, rows)
 	state := reconstruct.ApplyAt(baselineRow, rows, q.AsOf)
 	if state == nil {
 		// Either the row never existed at AsOf (no baseline image and no
 		// INSERT in the window) or its latest event was a DELETE.
 		return emptyResult(), nil
 	}
-	// ENUM/SET ordinals → labels (#472). Only delta-applied values need
-	// this — the baseline image already carries labels (mydumper dumps
-	// strings) and string values pass through the mapper untouched, so
-	// this also keeps a baseline+delta row internally consistent
-	// (assuming the enum definition didn't change between the dump and
-	// the latest snapshot — see the staleness caveat in enumlabel.go).
-	h.enumMapperFor(q.Schema, q.Table).mapImage(state)
 
 	// Same projection handling as runPointInTime: an explicit column list
 	// is emitted verbatim; SELECT * uses the DDL column order.

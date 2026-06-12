@@ -427,3 +427,74 @@ func TestEnumLabels_FullChainFromRealSnapshot(t *testing.T) {
 		t.Errorf("path = %q, want %q (backslash member must roundtrip byte-exact)", got, want)
 	}
 }
+
+// TestEnumLabels_EpochAwareDecoding pins #475: an enum REORDERED between
+// two snapshots must decode each event with the definition in effect at
+// the event's timestamp. Ordinal 3 means 'shipped' under epoch 1 but
+// 'pending' under epoch 2 — a latest-snapshot-only decode (the pre-#475
+// behavior) would confidently mislabel the older event. Also pins the
+// clamp: an event predating the first snapshot decodes with the first
+// epoch.
+func TestEnumLabels_EpochAwareDecoding(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, now)
+
+	insertTyped := func(snapID int, snapTS, column string, ordinal int, key, dataType, columnType string) {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable)
+			VALUES (?, ?, 'myapp', 'orders', ?, ?, ?, ?, ?, 'NO')`,
+			snapID, snapTS, column, ordinal, key, dataType, columnType)
+	}
+	snap1TS := now.Add(1 * time.Minute).Format("2006-01-02 15:04:05")
+	snap2TS := now.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	insertTyped(1, snap1TS, "id", 1, "PRI", "int", "int")
+	insertTyped(1, snap1TS, "status", 2, "", "enum", "enum('pending','processing','shipped')")
+	insertTyped(2, snap2TS, "id", 1, "PRI", "int", "int")
+	insertTyped(2, snap2TS, "status", 2, "", "enum", "enum('shipped','processing','pending')")
+
+	insertEventAt := func(pos uint64, ts time.Time, pk string, rowAfter string) {
+		testutil.InsertEvent(t, db, "mysql-bin.000001", pos, pos+100,
+			ts.Format("2006-01-02 15:04:05"), nil,
+			"myapp", "orders", 1, pk, nil, nil, []byte(rowAfter))
+	}
+	// Event C predates the first snapshot → clamps to epoch 1.
+	insertEventAt(100, now.Add(30*time.Second), "3", `{"id":3,"status":3}`)
+	// Event A inside epoch 1: ordinal 3 = 'shipped' under v1.
+	insertEventAt(200, now.Add(5*time.Minute), "1", `{"id":1,"status":3}`)
+	// Event B inside epoch 2: ordinal 1 = 'shipped' under v2.
+	insertEventAt(300, now.Add(15*time.Minute), "2", `{"id":2,"status":1}`)
+
+	h := NewHandlerWithConfig(db, Config{
+		NoArchive:   true,
+		IndexDBName: dbName,
+	}, slog.Default())
+
+	asOf := now.Add(20 * time.Minute)
+	for _, tc := range []struct{ pk, want, why string }{
+		{"1", "shipped", "epoch-1 event must decode with epoch-1 labels (latest-only would say 'pending')"},
+		{"2", "shipped", "epoch-2 event must decode with epoch-2 labels"},
+		{"3", "shipped", "pre-first-snapshot event must clamp to the first epoch"},
+	} {
+		res, err := h.runPointInTime(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			PKColumn: "id", PKValue: tc.pk, AsOf: asOf,
+		})
+		if err != nil {
+			t.Fatalf("pk=%s: %v", tc.pk, err)
+		}
+		cells := rowCells(t, res.Resultset)
+		if len(cells) != 1 {
+			t.Fatalf("pk=%s: expected 1 row, got %d", tc.pk, len(cells))
+		}
+		if got := cells[0][1]; got != tc.want {
+			t.Errorf("pk=%s: status = %q, want %q — %s", tc.pk, got, tc.want, tc.why)
+		}
+	}
+}

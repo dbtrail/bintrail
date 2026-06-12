@@ -228,3 +228,74 @@ func TestIntegrationReconstructCapability(t *testing.T) {
 		t.Error("capabilities.reconstruct=false, want true (baseline configured)")
 	}
 }
+
+// TestIntegrationReconstructEnumLabels pins #476 on the console surface:
+// the Time-travel response must render ENUM deltas as labels — decoded
+// with the snapshot in effect at the event's time (#475) — matching the
+// representation baseline rows already carry. Pre-#476 the same row
+// answered status=3 here and status='shipped' through the shim.
+func TestIntegrationReconstructEnumLabels(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Typed snapshot rows (testutil.InsertSnapshot predates column_type).
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable)
+		VALUES (1, '2026-06-01 00:00:00', 'app', 'orders', 'id', 1, 'PRI', 'int', 'int', 'NO'),
+		       (1, '2026-06-01 00:00:00', 'app', 'orders', 'status', 2, '', 'enum', 'enum(''pending'',''processing'',''shipped'')', 'NO')`)
+
+	// Post-baseline UPDATE: ordinals, exactly as the binlog stores them.
+	testutil.InsertEvent(t, db, "bin.000001", 4, 40, "2026-06-01 12:00:00", nil, "app", "orders", 2, "1",
+		[]byte(`["status"]`), []byte(`{"id":1,"status":1}`), []byte(`{"id":1,"status":3}`))
+
+	// Baseline row carries the LABEL (the mydumper dump shape).
+	baseDir := t.TempDir()
+	tsDir := strings.ReplaceAll(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339), ":", "-")
+	dir := filepath.Join(baseDir, tsDir, "app")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "status", MySQLType: "enum", ParquetType: baseline.MysqlToParquetNode("enum")},
+	}
+	w, err := baseline.NewWriter(filepath.Join(dir, "orders.parquet"), cols,
+		baseline.WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteRow([]string{"1", "pending"}, []bool{false, false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, BaselineDir: baseDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Before the delta: the baseline label passes through untouched.
+	r := reconstructAt(t, srv, "schema=app&table=orders&pk=1&at=2026-06-01%2000:30:00&allow_gaps=true")
+	if !r.Found || fmt.Sprint(r.State["status"]) != "pending" {
+		t.Errorf("at 00:30: found=%v status=%v, want baseline label 'pending'", r.Found, r.State["status"])
+	}
+
+	// After the delta: the ordinal 3 must arrive as 'shipped', not 3.
+	r = reconstructAt(t, srv, "schema=app&table=orders&pk=1&at=2026-06-01%2012:30:00&allow_gaps=true")
+	if !r.Found || fmt.Sprint(r.State["status"]) != "shipped" {
+		t.Errorf("at 12:30: found=%v status=%v, want mapped label 'shipped'", r.Found, r.State["status"])
+	}
+
+	// History: both entries carry labels (baseline + mapped delta).
+	r = reconstructAt(t, srv, "schema=app&table=orders&pk=1&at=2026-06-01%2012:30:00&history=true&allow_gaps=true")
+	if len(r.History) != 2 {
+		t.Fatalf("history len=%d, want 2: %+v", len(r.History), r.History)
+	}
+	if fmt.Sprint(r.History[0].State["status"]) != "pending" || fmt.Sprint(r.History[1].State["status"]) != "shipped" {
+		t.Errorf("history statuses = [%v, %v], want [pending, shipped]",
+			r.History[0].State["status"], r.History[1].State["status"])
+	}
+}

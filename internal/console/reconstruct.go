@@ -202,6 +202,12 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ENUM/SET ordinals → labels (#476), each delta decoded with the
+	// snapshot in effect at its event time (#475); baseline values are
+	// already labels and pass through. Must run before the fold below so
+	// both State and History carry labels.
+	reconstruct.MapEventEnumLabels(b.db, b.resolver, schema, table, rows)
+
 	resp := reconstructResponse{
 		Schema: schema, Table: table, PK: pk,
 		At:           atTime.Format(consoleTSFormat),

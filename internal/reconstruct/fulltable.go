@@ -359,6 +359,13 @@ func ReconstructTable(
 	}
 	rep.EventsApplied = int64(len(events))
 
+	// ENUM/SET ordinals → labels (#476), each delta decoded with the
+	// snapshot in effect at its event time (#475). Must run before the
+	// merge so the mydumper output writes labels — the same form the
+	// baseline rows and a real mydumper dump carry — instead of numeric
+	// ordinals.
+	MapEventEnumLabels(db, resolver, schema, table, events)
+
 	// ── 5. Build the change map: PK string → last event for that PK ───────
 	// events is already sorted by (event_timestamp, event_id) via
 	// query.MergeResults, so the last write wins naturally.

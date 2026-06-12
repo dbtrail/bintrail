@@ -2253,3 +2253,42 @@ func TestImageToResultVerbatim(t *testing.T) {
 		}
 	})
 }
+
+// TestMapEventImagesFallback covers mapEventImages' degradation path in
+// a handler with no DB (epochs unavailable): rows must still map via
+// the latest-snapshot fallback resolver (#475's pre-existing behavior),
+// and a handler without a resolverFn must leave images untouched.
+func TestMapEventImagesFallback(t *testing.T) {
+	h := &Handler{
+		logger: slog.Default(),
+		resolverFn: func() (*metadata.Resolver, error) {
+			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+				"myapp.orders": {Schema: "myapp", Table: "orders", Columns: []metadata.ColumnMeta{
+					{Name: "id", ColumnType: "int", IsPK: true},
+					{Name: "status", ColumnType: "enum('pending','processing','shipped')"},
+				}},
+			}), nil
+		},
+	}
+	rows := []query.ResultRow{{
+		EventTimestamp: time.Now(),
+		RowBefore:      map[string]any{"id": float64(1), "status": float64(1)},
+		RowAfter:       map[string]any{"id": float64(1), "status": float64(3)},
+	}}
+	h.mapEventImages("myapp", "orders", rows)
+	if rows[0].RowBefore["status"] != "pending" || rows[0].RowAfter["status"] != "shipped" {
+		t.Errorf("fallback mapping failed: before=%v after=%v",
+			rows[0].RowBefore["status"], rows[0].RowAfter["status"])
+	}
+
+	// No resolverFn → untouched ordinals (bare test handlers).
+	bare := &Handler{logger: slog.Default()}
+	rows2 := []query.ResultRow{{
+		EventTimestamp: time.Now(),
+		RowAfter:       map[string]any{"status": float64(3)},
+	}}
+	bare.mapEventImages("myapp", "orders", rows2)
+	if rows2[0].RowAfter["status"] != float64(3) {
+		t.Errorf("bare handler must pass through, got %v", rows2[0].RowAfter["status"])
+	}
+}
