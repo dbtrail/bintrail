@@ -227,9 +227,12 @@ func main() {
 }
 
 // errCodeServerClosing is the JSON-RPC error code of the SDK's
-// jsonrpc2.ErrServerClosing sentinel. The sentinel itself lives in the
-// SDK's internal/jsonrpc2 package, so the wire code is the stable
-// importable handle.
+// jsonrpc2.ErrServerClosing sentinel. The sentinel lives in the SDK's
+// internal/jsonrpc2 package and the code is NOT re-exported by the
+// public jsonrpc package, so this is a verified-against-v1.3.1 value,
+// not an API promise. If an SDK bump ever renumbers it, the failure
+// mode is benign: clean disconnects revert to the old noisy
+// ERROR + exit 1 — a real fault is never swallowed.
 const errCodeServerClosing = -32004
 
 // isClientDisconnect reports whether a stdio session ended because the
