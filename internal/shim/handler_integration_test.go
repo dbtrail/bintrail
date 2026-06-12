@@ -14,6 +14,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
@@ -331,5 +332,98 @@ func TestRunPointInTime_EnumSetOrdinalsMapToLabels(t *testing.T) {
 	}
 	if !strings.Contains(rowAfter, `"status":"shipped"`) || !strings.Contains(rowAfter, `"tags":"red,blue"`) {
 		t.Errorf("row_after = %s, want status \"shipped\" and tags \"red,blue\"", rowAfter)
+	}
+
+	// _flashback full-table (no WHERE → runFullTable): its mapping loop
+	// is wired differently from the single-row path (explicit hoist),
+	// so the point-lookup assertions above don't cover it.
+	ftRes, err := h.runPointInTime(TimeTravelQuery{
+		Type:   TypeFlashback,
+		Schema: "myapp",
+		Table:  "orders",
+		AsOf:   now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("full-table _flashback: %v", err)
+	}
+	ftCells := rowCells(t, ftRes.Resultset)
+	if len(ftCells) != 1 {
+		t.Fatalf("full-table: expected 1 row, got %d", len(ftCells))
+	}
+	if got, want := ftCells[0][1], "shipped"; got != want {
+		t.Errorf("full-table status = %q, want %q", got, want)
+	}
+	if got, want := ftCells[0][2], "red,blue"; got != want {
+		t.Errorf("full-table tags = %q, want %q", got, want)
+	}
+}
+
+// TestEnumLabels_FullChainFromRealSnapshot covers the wiring no other
+// test exercises end-to-end: real CREATE TABLE → metadata.TakeSnapshot
+// (capturing an ENUM declaration well past #212's old VARCHAR(128)
+// limit, with a backslash-escaped member) → resolver load → shim label
+// mapping on the wire. Before column_type was widened to TEXT, this
+// test failed at the TakeSnapshot step with a 1406 that aborted the
+// whole snapshot transaction (#472 review finding).
+func TestEnumLabels_FullChainFromRealSnapshot(t *testing.T) {
+	indexDB, indexName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+	if err := indexer.EnsureSchema(indexDB); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	// The status declaration renders a 189-char COLUMN_TYPE; path's first
+	// member is `a\b`, which information_schema renders as 'a\\b'.
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id INT PRIMARY KEY,
+		status ENUM('pending_payment','payment_confirmed','awaiting_fulfillment','partially_shipped','shipped','out_for_delivery','delivered','return_requested','refund_processed','cancelled_by_customer') NOT NULL,
+		path ENUM('a\\b','plain') NOT NULL
+	) ENGINE=InnoDB`)
+
+	if _, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName}); err != nil {
+		t.Fatalf("TakeSnapshot must survive a long ENUM declaration: %v", err)
+	}
+	var capturedLen int
+	if err := indexDB.QueryRow(
+		`SELECT CHAR_LENGTH(column_type) FROM schema_snapshots WHERE table_name = 'orders' AND column_name = 'status'`,
+	).Scan(&capturedLen); err != nil {
+		t.Fatalf("read captured column_type length: %v", err)
+	}
+	if capturedLen <= 128 {
+		t.Fatalf("fixture regression: status COLUMN_TYPE is %d chars, must exceed the old 128 limit to pin the widening", capturedLen)
+	}
+
+	now := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, indexDB, now)
+	eventTS := now.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+	// status ordinal 5 = 'shipped'; path ordinal 1 = the escaped member a\b.
+	testutil.InsertEvent(t, indexDB, "mysql-bin.000001", 100, 200, eventTS, nil,
+		sourceName, "orders", 1, "1", nil, nil,
+		[]byte(`{"id":1,"status":5,"path":1}`))
+
+	h := NewHandlerWithConfig(indexDB, Config{
+		NoArchive:   true,
+		IndexDBName: indexName,
+	}, slog.Default())
+	res, err := h.runPointInTime(TimeTravelQuery{
+		Type:     TypeFlashback,
+		Schema:   sourceName,
+		Table:    "orders",
+		PKColumn: "id",
+		PKValue:  "1",
+		AsOf:     now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("runPointInTime: %v", err)
+	}
+	cells := rowCells(t, res.Resultset)
+	if len(cells) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(cells))
+	}
+	if got, want := cells[0][1], "shipped"; got != want {
+		t.Errorf("status = %q, want %q (ordinal 5 of the real captured declaration)", got, want)
+	}
+	if got, want := cells[0][2], "a\\b"; got != want {
+		t.Errorf("path = %q, want %q (backslash member must roundtrip byte-exact)", got, want)
 	}
 }

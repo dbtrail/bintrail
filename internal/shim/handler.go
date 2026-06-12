@@ -625,6 +625,7 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 	}
 
 	images := extractFullTableImages(rows)
+	// The nil guard is a loop hoist only — mapImage is nil-receiver safe.
 	if mapper := h.enumMapperFor(q.Schema, q.Table); mapper != nil {
 		for _, img := range images {
 			mapper.mapImage(img)

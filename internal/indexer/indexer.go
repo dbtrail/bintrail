@@ -211,11 +211,22 @@ func EnsureSchema(db *sql.DB) error {
 	}
 	// column_type carries the full type declaration (e.g. "datetime(6)") so
 	// full-table reconstruct (#187, #212) can tell the declared fractional
-	// precision of DATETIME/TIMESTAMP PK columns. Without this the PK
+	// precision of DATETIME/TIMESTAMP PK columns, and so the shim can map
+	// ENUM/SET ordinals back to labels (#472). Without this the PK
 	// canonicalizer cannot distinguish DATETIME(0) from DATETIME(6) with
 	// whole-second values.
 	if err := ensureColumn(db, "schema_snapshots", "column_type",
-		`ALTER TABLE schema_snapshots ADD COLUMN column_type VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'full type from information_schema.COLUMNS.COLUMN_TYPE' AFTER data_type`,
+		`ALTER TABLE schema_snapshots ADD COLUMN column_type TEXT DEFAULT NULL COMMENT 'full type from information_schema.COLUMNS.COLUMN_TYPE' AFTER data_type`,
+	); err != nil {
+		return err
+	}
+	// #212 created column_type as VARCHAR(128), which a realistic ENUM
+	// declaration exceeds — and under strict mode the resulting 1406
+	// ("Data too long") aborts the ENTIRE snapshot transaction, not just
+	// one column. Widen pre-existing installs to TEXT (#472). Existing
+	// values are preserved; the resolver already COALESCEs NULL to ''.
+	if err := ensureColumnWidened(db, "schema_snapshots", "column_type", "text",
+		`ALTER TABLE schema_snapshots MODIFY COLUMN column_type TEXT DEFAULT NULL COMMENT 'full type from information_schema.COLUMNS.COLUMN_TYPE'`,
 	); err != nil {
 		return err
 	}
@@ -231,6 +242,32 @@ func EnsureSchema(db *sql.DB) error {
 	return ensureColumn(db, "stream_state", "gap_lost_detail",
 		`ALTER TABLE stream_state ADD COLUMN gap_lost_detail TEXT DEFAULT NULL COMMENT 'human-readable description of the lost gap' AFTER gap_lost_at`,
 	)
+}
+
+// ensureColumnWidened runs an idempotent ALTER TABLE MODIFY COLUMN: it
+// checks the column's current information_schema DATA_TYPE and bails out
+// when it already matches wantDataType (lowercase, e.g. "text"). A column
+// that does not exist at all is also a no-op — ensureColumn owns creation;
+// this helper only ever widens an existing one.
+func ensureColumnWidened(db *sql.DB, table, column, wantDataType, alterSQL string) error {
+	var dataType string
+	err := db.QueryRow(`SELECT DATA_TYPE FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME   = ?
+		  AND COLUMN_NAME  = ?`, table, column).Scan(&dataType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check %s.%s type: %w", table, column, err)
+	}
+	if strings.EqualFold(dataType, wantDataType) {
+		return nil
+	}
+	if _, err := db.Exec(alterSQL); err != nil {
+		return fmt.Errorf("widen %s.%s to %s: %w", table, column, wantDataType, err)
+	}
+	return nil
 }
 
 // ensureColumn runs an idempotent ALTER TABLE ADD COLUMN: checks

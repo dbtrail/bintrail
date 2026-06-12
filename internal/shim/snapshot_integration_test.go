@@ -942,3 +942,102 @@ func TestSnapshotBaseline_FullTableNoBaselineAtOrBeforeAsOfDegrades(t *testing.T
 		t.Errorf("no-baseline-at-or-before-AsOf full-table _snapshot = %v, want only the binlog row id=2 fresh", got)
 	}
 }
+
+// TestSnapshotBaseline_EnumLabelsAcrossBaselineAndDeltas pins #472 on
+// both _snapshot paths. A baseline row carries the ENUM value as a label
+// string (the mydumper dump shape) and must pass through the mapper
+// untouched; a post-baseline delta carries the binlog ordinal and must
+// map. Single-row exercises the post-ApplyAt mapping; full-table
+// exercises the ordering constraint that mapImage runs BEFORE
+// fullTableTextCell — moving it after would coerce the delta's float64
+// ordinal into the text "3" (which the mapper correctly refuses) and
+// silently revert touched rows to ordinals while baseline rows keep
+// labels: the exact mixed-representation bug class #472 fixes.
+func TestSnapshotBaseline_EnumLabelsAcrossBaselineAndDeltas(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// Typed snapshot rows: testutil.InsertSnapshot predates column_type,
+	// so insert with raw SQL (same pattern as the handler enum test).
+	snapTS := snapTime.UTC().Format("2006-01-02 15:04:05")
+	insertTyped := func(column string, ordinal int, key, dataType, columnType string) {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable)
+			VALUES (1, ?, 'myapp', 'orders', ?, ?, ?, ?, ?, 'NO')`,
+			snapTS, column, ordinal, key, dataType, columnType)
+	}
+	insertTyped("id", 1, "PRI", "int", "int")
+	insertTyped("status", 2, "", "enum", "enum('pending','processing','shipped')")
+
+	// Baseline at snapTime: labels as strings. id=1 never touched after;
+	// id=2 updated post-baseline (delta arrives as ordinal).
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "orders",
+		[]baseline.Column{
+			{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+			{Name: "status", MySQLType: "enum", ParquetType: baseline.MysqlToParquetNode("enum")},
+		},
+		[][]string{
+			{"1", "pending"},
+			{"2", "processing"},
+		})
+
+	// Post-baseline UPDATE: id=2 → status ordinal 3 ('shipped').
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "orders", 2, "2", []byte(`["status"]`),
+		[]byte(`{"id":2,"status":2}`), []byte(`{"id":2,"status":3}`))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:   true,
+		NoArchive:   true,
+		IndexDBName: dbName,
+		BaselineDir: baselineDir,
+	}, slog.Default())
+
+	// ── single-row, untouched: baseline label passes through ──
+	res1, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "orders", PKColumn: "id", PKValue: "1", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("_snapshot id=1: %v", err)
+	}
+	cells := rowCells(t, res1.Resultset)
+	if len(cells) != 1 || !slices.Equal(cells[0], []string{"1", "pending"}) {
+		t.Errorf("_snapshot id=1 = %v, want [[1 pending]] (baseline label must pass through)", cells)
+	}
+
+	// ── single-row, touched: delta ordinal maps to label ──
+	res2, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "orders", PKColumn: "id", PKValue: "2", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("_snapshot id=2: %v", err)
+	}
+	cells = rowCells(t, res2.Resultset)
+	if len(cells) != 1 || !slices.Equal(cells[0], []string{"2", "shipped"}) {
+		t.Errorf("_snapshot id=2 = %v, want [[2 shipped]] (delta ordinal 3 must map post-ApplyAt)", cells)
+	}
+
+	// ── full-table: baseline row AND delta row both carry labels ──
+	resFT, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "orders", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("_snapshot full-table: %v", err)
+	}
+	ftCells := rowCells(t, resFT.Resultset)
+	if len(ftCells) != 2 {
+		t.Fatalf("_snapshot full-table: expected 2 rows, got %d (%v)", len(ftCells), ftCells)
+	}
+	got := map[string]string{}
+	for _, row := range ftCells {
+		got[row[0]] = row[1]
+	}
+	if got["1"] != "pending" || got["2"] != "shipped" {
+		t.Errorf("_snapshot full-table = %v, want id=1 'pending' (baseline) and id=2 'shipped' (mapped delta)", got)
+	}
+}

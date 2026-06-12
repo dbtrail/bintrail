@@ -27,3 +27,62 @@ func TestCreateBinlogEventsTable(t *testing.T) {
 		t.Errorf("expected 4 partitions, got %d", count)
 	}
 }
+
+// TestEnsureSchemaWidensColumnType pins the #472 migration: #212 created
+// schema_snapshots.column_type as VARCHAR(128), which a realistic ENUM
+// declaration exceeds — under strict mode the 1406 aborts the whole
+// snapshot transaction. EnsureSchema must widen pre-existing installs to
+// TEXT while preserving stored values, and stay idempotent.
+func TestEnsureSchemaWidensColumnType(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Downgrade to the #212-era shape an existing install would have.
+	testutil.MustExec(t, db,
+		`ALTER TABLE schema_snapshots MODIFY COLUMN column_type VARCHAR(128) NOT NULL DEFAULT ''`)
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable)
+		VALUES (1, NOW(), 'app', 't', 'created_at', 1, '', 'datetime', 'datetime(6)', 'NO')`)
+
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	var dataType string
+	if err := db.QueryRow(`SELECT DATA_TYPE FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'schema_snapshots'
+		  AND COLUMN_NAME = 'column_type'`).Scan(&dataType); err != nil {
+		t.Fatalf("read column_type DATA_TYPE: %v", err)
+	}
+	if dataType != "text" {
+		t.Fatalf("column_type DATA_TYPE = %q after EnsureSchema, want \"text\"", dataType)
+	}
+
+	// Pre-existing value preserved through the MODIFY.
+	var preserved string
+	if err := db.QueryRow(
+		`SELECT column_type FROM schema_snapshots WHERE column_name = 'created_at'`,
+	).Scan(&preserved); err != nil {
+		t.Fatalf("read preserved value: %v", err)
+	}
+	if preserved != "datetime(6)" {
+		t.Errorf("pre-migration value = %q, want \"datetime(6)\"", preserved)
+	}
+
+	// The widened column accepts a >128-char declaration — the exact
+	// insert that aborted snapshots before.
+	longEnum := "enum('pending_payment','payment_confirmed','awaiting_fulfillment','partially_shipped','shipped','out_for_delivery','delivered','return_requested','refund_processed','cancelled_by_customer')"
+	if len(longEnum) <= 128 {
+		t.Fatalf("fixture regression: longEnum is %d chars", len(longEnum))
+	}
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable)
+		VALUES (1, NOW(), 'app', 't', 'status', 2, '', 'enum', ?, 'NO')`, longEnum)
+
+	// Idempotent: a second run must not error or re-alter.
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema (second run): %v", err)
+	}
+}

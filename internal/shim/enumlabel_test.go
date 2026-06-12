@@ -1,6 +1,7 @@
 package shim
 
 import (
+	"log/slog"
 	"reflect"
 	"testing"
 
@@ -216,4 +217,41 @@ func TestEnumLabelMapperNilSafety(t *testing.T) {
 	m.mapImage(nil)
 	real := newEnumLabelMapper(orderEnumSetMeta())
 	real.mapImage(nil)
+}
+
+// TestEnumMapperFor covers the Handler-side composition (tableMetaFor →
+// newEnumLabelMapper) that every render path calls — the only other
+// protection it has is one integration-tagged test.
+func TestEnumMapperFor(t *testing.T) {
+	h := &Handler{
+		logger: slog.Default(),
+		resolverFn: func() (*metadata.Resolver, error) {
+			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+				"myapp.orders": orderEnumSetMeta(),
+				"myapp.plain": {Schema: "myapp", Table: "plain", Columns: []metadata.ColumnMeta{
+					{Name: "id", ColumnType: "int unsigned"},
+				}},
+			}), nil
+		},
+	}
+
+	m := h.enumMapperFor("myapp", "orders")
+	if m == nil {
+		t.Fatal("expected a mapper for a snapshot-resolved enum table")
+	}
+	img := map[string]any{"status": float64(2)}
+	m.mapImage(img)
+	if img["status"] != "processing" {
+		t.Errorf("status = %v, want \"processing\"", img["status"])
+	}
+
+	if m := h.enumMapperFor("myapp", "plain"); m != nil {
+		t.Error("table without enum/set columns must yield a nil mapper")
+	}
+	if m := h.enumMapperFor("myapp", "missing"); m != nil {
+		t.Error("table absent from the snapshot must yield a nil mapper")
+	}
+	if m := (&Handler{logger: slog.Default()}).enumMapperFor("a", "b"); m != nil {
+		t.Error("handler without resolverFn must yield a nil mapper")
+	}
 }

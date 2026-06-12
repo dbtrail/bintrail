@@ -572,3 +572,52 @@ func TestEnsureResolver_existingSnapshot(t *testing.T) {
 		t.Errorf("expected snapshot ID 1, got %d", resolver.SnapshotID())
 	}
 }
+
+// TestTakeSnapshot_longEnumColumnType pins the #472 capture-side fix: a
+// realistic ENUM declaration renders a COLUMN_TYPE well past the 128
+// chars #212's VARCHAR allowed, and under strict mode the resulting
+// 1406 ("Data too long") aborted the ENTIRE snapshot transaction — not
+// one column. column_type is TEXT now; capture must be byte-exact
+// against information_schema's own rendering, including MySQL's
+// backslash escaping inside members.
+func TestTakeSnapshot_longEnumColumnType(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id INT PRIMARY KEY,
+		status ENUM('pending_payment','payment_confirmed','awaiting_fulfillment','partially_shipped','shipped','out_for_delivery','delivered','return_requested','refund_processed','cancelled_by_customer') NOT NULL,
+		path ENUM('a\\b','plain') NOT NULL
+	) ENGINE=InnoDB`)
+
+	stats, err := TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshot must survive a long ENUM declaration: %v", err)
+	}
+
+	for _, column := range []string{"status", "path"} {
+		var want string
+		if err := sourceDB.QueryRow(
+			`SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+			 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'orders' AND COLUMN_NAME = ?`,
+			sourceName, column,
+		).Scan(&want); err != nil {
+			t.Fatalf("read information_schema COLUMN_TYPE for %s: %v", column, err)
+		}
+		var got string
+		if err := indexDB.QueryRow(
+			`SELECT column_type FROM schema_snapshots
+			 WHERE snapshot_id = ? AND table_name = 'orders' AND column_name = ?`,
+			stats.SnapshotID, column,
+		).Scan(&got); err != nil {
+			t.Fatalf("read captured column_type for %s: %v", column, err)
+		}
+		if got != want {
+			t.Errorf("column %s: captured %q, information_schema renders %q (must be byte-exact)", column, got, want)
+		}
+		if column == "status" && len(want) <= 128 {
+			t.Fatalf("fixture regression: status COLUMN_TYPE is %d chars, must exceed the old VARCHAR(128) to pin the widening", len(want))
+		}
+	}
+}
