@@ -1,281 +1,128 @@
 # dbtrail Quickstart
 
-dbtrail records every INSERT, UPDATE, and DELETE from MySQL into a searchable index. When something goes wrong, you can find exactly what changed and generate SQL to undo it.
+dbtrail records every INSERT, UPDATE, and DELETE from MySQL into a searchable
+index — so when something goes wrong you can find exactly what changed and
+generate SQL to undo it.
 
-This guide walks through the complete lifecycle from zero to recovery in about 10 minutes.
-
----
-
-## Before You Start
-
-You need:
-
-- MySQL with `binlog_format = ROW` and `binlog_row_image = FULL` (check with `SHOW VARIABLES LIKE 'binlog_%';`)
-- A MySQL database to use as the index (can be on the same server — call it `binlog_index`)
-- The `bintrail` binary installed and on your `$PATH`
-- A user on the source MySQL for dbtrail to read from (see below)
-
-### The source MySQL user
-
-dbtrail reads the source over the replication protocol, so it needs a user with replication + read access. Create one on the **source** server:
-
-```sql
-CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';
-GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';
-```
-
-`REPLICATION SLAVE`/`REPLICATION CLIENT` drive the binlog stream; `SELECT` lets dbtrail snapshot the schema (columns, primary keys, foreign keys). dbtrail never writes to or locks the source. For the least-privilege variant (scoping `SELECT` to specific schemas) and a per-privilege breakdown, see [streaming.md](streaming.md#the-source-mysql-user).
-
-Set a shorthand for your index DSN so you don't retype it:
-
-```sh
-export IDX="root:secret@tcp(127.0.0.1:3306)/binlog_index"
-```
-
-Or generate a `.bintrail.env` configuration file and set your DSN there — all commands load it automatically:
-
-```sh
-bintrail config init        # creates .bintrail.env in the current directory
-# Edit .bintrail.env and uncomment BINTRAIL_INDEX_DSN=...
-```
+There are two ways to start: the **web console** (no commands — recommended) or
+the **command line**. Both need a source MySQL user first.
 
 ---
 
-## Step 1 — Create the index tables
+## Prerequisites
 
-```sh
-bintrail init --index-dsn "$IDX"
-```
+- A MySQL **source** with `binlog_format = ROW` and `binlog_row_image = FULL`.
+  (dbtrail's preflight checks this and shows the exact fix if it's missing.)
+- A user on the source for dbtrail to read from — create it on the source:
 
-Expected output:
-```
-Database "binlog_index" created (or already exists).
-Tables created: binlog_events, schema_snapshots, index_state
-Partitions created: 48 hourly partitions + p_future catch-all
-```
+  ```sql
+  CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';
+  GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';
+  ```
 
-This creates the `binlog_index` database (if it doesn't exist) and all the tables dbtrail needs. **Run once.**
+  `REPLICATION SLAVE`/`REPLICATION CLIENT` drive the binlog stream; `SELECT` lets
+  dbtrail snapshot the schema. dbtrail never writes to or locks the source.
+  (Least-privilege variant: [streaming.md](streaming.md#the-source-mysql-user).)
 
----
-
-## Step 2 — Capture your schema
-
-dbtrail needs to know your table structure (column names, primary keys) to build useful output.
-
-```sh
-bintrail snapshot \
-  --source-dsn "root:secret@tcp(127.0.0.1:3306)/" \
-  --index-dsn  "$IDX"
-```
-
-Expected output:
-```
-Snapshotting schemas: mydb, information_schema, ...
-Snapshot complete: 42 tables captured (snapshot_id=1)
-```
-
-Re-run this any time you `ALTER TABLE` on the source. The old snapshot is kept — dbtrail uses the most recent one.
+Works with self-managed MySQL **and** managed services (RDS, Aurora, Cloud SQL) —
+dbtrail streams over the replication protocol and never needs the binlog files on
+disk.
 
 ---
 
-## Step 3 — Index your binlog files
+## Option A — Web console (recommended, no CLI)
+
+**1. Bring up the stack:**
 
 ```sh
-bintrail index \
-  --index-dsn  "$IDX" \
-  --source-dsn "root:secret@tcp(127.0.0.1:3306)/" \
-  --binlog-dir /var/lib/mysql \
-  --all
+curl -fsSL https://raw.githubusercontent.com/dbtrail/dbtrail/main/install.sh | sh
 ```
 
-Expected output:
-```
-Source: binlog_row_image=FULL ✓
-Indexing binlog.000042 ... 12345 events indexed
-Indexing binlog.000043 ... 8901 events indexed
-indexing complete files_processed=2 events_indexed=21246
-```
+This downloads the Docker Compose stack — the console plus a bundled index store —
+and starts it. (Equivalent manual steps are in the [README](../README.md).)
 
-`--all` processes every binlog file in `--binlog-dir`. Files already indexed are skipped automatically, so re-running is safe.
+**2. Open the console:** go to **http://127.0.0.1:8090**. On first run, create a
+username and password — that's your login from now on.
 
-> **Using RDS, Aurora, or Cloud SQL?** You don't have access to binlog files on disk. Use `bintrail stream` instead — see [Streaming](./streaming.md).
+**3. Add the server to watch:** click **+ Add server** and paste the source MySQL
+host, user, and password. dbtrail runs the preflight (any failure comes back as a
+fix-this card), provisions an index for it, and starts streaming — you'll see
+changes within the minute.
+
+**4. Use it** — entirely in the browser:
+
+- **Overview** — what changed recently and where, with a Recent-changes list and
+  an inline **Undo**.
+- **Events** — search by free text or `type:` / `pk:` / `col:` / `schema.table`
+  tokens; each row expands to a before→after diff.
+- **Recover** — filter to the damage, preview the affected rows, **Generate undo
+  SQL**, then copy/download and apply it yourself. The console **never executes
+  SQL**.
+- **Status** — index health: partitions, coverage, stream lag, archives.
+
+That's the whole loop — see a change, undo it — without touching a terminal.
+
+> Reconstruct a full row *as of* a point in time? A **Time-travel** view appears
+> once a baseline is configured — the easiest way is the compose
+> [`baseline` profile](./docker.md#baselines-and-time-travel-the-baseline-profile).
+
+See [Web console](./console.md) for login/TLS, the server switcher, and the API.
 
 ---
 
-## Step 4 — Query what changed
+## Option B — Command line
 
-Now you can search the index. Some examples:
-
-**Everything that happened to the `orders` table in the last hour:**
+Prefer the CLI (or scripting and automation)? Install the `bintrail` binary (see
+[Install](install.md)) and set shorthands for your two DSNs:
 
 ```sh
-bintrail query \
-  --index-dsn "$IDX" \
-  --schema    mydb \
-  --table     orders \
-  --since     "2026-02-19 14:00:00" \
-  --until     "2026-02-19 15:00:00"
+export SRC="dbtrail:strong-password@tcp(127.0.0.1:3306)/"   # source MySQL
+export IDX="root:secret@tcp(127.0.0.1:3306)/binlog_index"   # the index
 ```
 
-**Only DELETEs:**
+**Start capturing changes** — one command runs the preflight, creates the index,
+snapshots the schema, and streams in real time (and rotates old partitions
+hourly):
 
 ```sh
-bintrail query \
-  --index-dsn  "$IDX" \
-  --schema     mydb \
-  --table      orders \
-  --event-type DELETE \
-  --since      "2026-02-19 14:00:00"
+bintrail up --source-dsn "$SRC" --index-dsn "$IDX"
 ```
 
-**Full history of a specific row (by primary key):**
+It keeps running — leave it in its own terminal or run it under systemd — and
+resumes from its checkpoint on restart. Want to check prerequisites on their own
+first? Run `bintrail doctor --source-dsn "$SRC" --index-dsn "$IDX"`.
+
+**Query what changed** (in another terminal):
 
 ```sh
-bintrail query \
-  --index-dsn "$IDX" \
-  --schema    mydb \
-  --table     orders \
-  --pk        12345
+bintrail query --index-dsn "$IDX" --schema mydb --table orders \
+  --since "2026-02-19 14:00:00"
 ```
 
-**All changes to the `status` column:**
+Useful filters: `--event-type DELETE`, `--pk 12345`, `--changed-column status`,
+`--until "..."`. Add `--format json` to see full before/after values.
+
+**Undo it** — generate reversal SQL, review, then apply it yourself:
 
 ```sh
-bintrail query \
-  --index-dsn      "$IDX" \
-  --schema         mydb \
-  --table          orders \
-  --changed-column status
-```
+bintrail recover --index-dsn "$IDX" --schema mydb --table orders \
+  --event-type DELETE --since "2026-02-19 14:00:00" --until "2026-02-19 14:05:00" \
+  --output recovery.sql
 
-Add `--format json` to any query to see the full before and after values for each event.
-
----
-
-## Step 5 — Undo something
-
-When you've found the events you want to reverse, generate the recovery SQL:
-
-**Preview (dry run):**
-
-```sh
-bintrail recover \
-  --index-dsn  "$IDX" \
-  --schema     mydb \
-  --table      orders \
-  --event-type DELETE \
-  --since      "2026-02-19 14:00:00" \
-  --until      "2026-02-19 14:05:00" \
-  --dry-run
-```
-
-This prints the SQL without writing any files. Review it.
-
-**Write to a file:**
-
-```sh
-bintrail recover \
-  --index-dsn  "$IDX" \
-  --schema     mydb \
-  --table      orders \
-  --event-type DELETE \
-  --since      "2026-02-19 14:00:00" \
-  --until      "2026-02-19 14:05:00" \
-  --output     recovery.sql
-
-cat recovery.sql          # always review before applying
+cat recovery.sql                 # always review before applying
 mysql -u root -p mydb < recovery.sql
 ```
 
-The script is wrapped in `BEGIN`/`COMMIT` and reverses events in reverse chronological order (most recent first).
+The script is wrapped in `BEGIN`/`COMMIT` and reverses events most-recent-first.
+dbtrail never applies it for you. Check progress any time with
+`bintrail status --index-dsn "$IDX"`.
 
----
-
-## Step 5½ — Or do steps 4–5 from a browser
-
-Steps 4–5 (query + recover) are also a read-only web UI in the companion
-`bintrail-console` binary (same release archive):
-
-```sh
-bintrail-console serve --index-dsn "$IDX"
-```
-
-It prints a tokenized loopback URL — open it for the **Recover**, **Events**,
-and **Status** screens (filter by schema/table/PK/time, preview before→after
-diffs, generate undo SQL). Like `recover --dry-run`, the console **never
-executes SQL**, and binds to loopback with an auto-generated token by default
-(a non-loopback bind requires an explicit `--token`). See
-[Web console](./console.md) for the security model and HTTP API.
-
----
-
-## Step 6 — Keep the index clean
-
-The `binlog_events` table will keep growing. Drop old data with `rotate`:
-
-```sh
-# Drop everything older than 7 days (auto-adds replacement future partitions)
-bintrail rotate --index-dsn "$IDX" --retain 7d
-```
-
-This is fast — it's a metadata operation, not row-by-row deletion. Run it from a cron job:
-
-```sh
-# /etc/cron.d/bintrail-rotate
-0 * * * * root bintrail rotate --index-dsn "$IDX" --retain 7d
-```
-
----
-
-## Step 7 — Check what's indexed
-
-At any time:
-
-```sh
-bintrail status --index-dsn "$IDX"
-```
-
-Output:
-```
-=== Indexed Files ===
-FILE              STATUS     EVENTS  STARTED_AT           COMPLETED_AT         ERROR  BINTRAIL_ID
-binlog.000042     completed  12345   2026-02-19 10:00:00  2026-02-19 10:00:42  -      abc123...
-binlog.000043     completed  8901    2026-02-19 10:00:43  2026-02-19 10:01:12  -      abc123...
-
-=== Partitions ===
-PARTITION       LESS_THAN               ROWS (est.)
-p_2026021914    2026-02-19 15:00 UTC    12345
-...
-p_future        MAXVALUE                0
-Total events (est.): 21246
-
-=== Summary ===
-Server abc123de-0000-0000-0000-000000000001
-  Files:  2 completed, 0 in_progress, 0 failed
-  Events: 21246 indexed
-```
-
----
-
-## The Full Picture
-
-```
-bintrail init          ← run once
-       ↓
-bintrail snapshot      ← run once, re-run after schema changes
-       ↓
-bintrail index --all   ← run regularly (cron) or use stream for real-time
-       ↓
-bintrail query         ← investigate changes
-       ↓
-bintrail recover       ← generate undo SQL when needed
-       ↓
-bintrail rotate        ← run hourly to drop old partitions and stay clean
-       ↓
-bintrail status        ← check at any time
-```
-
-> Prefer clicking to typing? `bintrail-console serve` exposes the query + recover steps as a read-only web UI.
+> Same query + recover screens, read-only, without the full stack:
+> `bintrail-console serve --index-dsn "$IDX"`.
+>
+> **Backfilling history** from binlog files already on disk (self-managed MySQL
+> only): `bintrail index --index-dsn "$IDX" --source-dsn "$SRC" --binlog-dir
+> /var/lib/mysql --all`. See [Indexing](./indexing.md).
 
 ---
 
