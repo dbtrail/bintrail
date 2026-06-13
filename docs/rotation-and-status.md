@@ -32,7 +32,7 @@ PARTITION p_future VALUES LESS THAN MAXVALUE
 
 `p_future` catches any event whose timestamp is beyond all named partition boundaries. This is MySQL's safety net — without it, inserting an event with a timestamp in the future would fail with an error.
 
-**The invariant**: `p_future` must always exist. You can add or drop any other partition, but never drop `p_future`. The `addFuturePartitions` function in `rotate.go` always appends it at the end of every `REORGANIZE PARTITION` operation.
+**The invariant**: `p_future` must always exist. You can add or drop any other partition, but never drop `p_future` — `bintrail rotate` always re-appends it at the end of every `REORGANIZE PARTITION` operation.
 
 ---
 
@@ -404,5 +404,17 @@ bintrail rotate \
   --retain 720h \
   --no-replace
 ```
+
+**Daemon mode** — instead of cron, `rotate` can run continuously and repeat on a schedule until `SIGINT`/`SIGTERM`:
+
+```sh
+bintrail rotate \
+  --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain 720h \
+  --daemon \
+  --interval 1h   # default 1h
+```
+
+This is the standalone equivalent of the rotation loop that `bintrail up` / `bintrail-console watch` run built-in — use it when you rotate a BYO index on a process separate from streaming.
 
 Schedule the timer to run once per hour. The drop operation is instant, but `REORGANIZE PARTITION` on a partition containing data does a full table scan of `p_future` to redistribute rows — if your `p_future` is empty (because you add future partitions frequently), the reorganize is also instant.

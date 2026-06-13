@@ -6,10 +6,11 @@ How to search indexed events with `bintrail query`, and turn them into SQL that 
 
 ## Querying the index
 
-`bintrail query` searches `binlog_events` with optional filters; with no filters
-it returns the most recent events (bounded by `--limit`). Results come back
-chronologically — by `event_timestamp`, then `event_id` as a tiebreaker. The
-same filter set powers `bintrail recover` and the MCP `query` tool.
+`bintrail query` searches `binlog_events` with optional filters. Results are
+ordered by `event_timestamp` (then `event_id` as a tiebreaker) — **oldest first
+by default**; pass `--order DESC` for newest-first. With no filters it returns
+the first `--limit` events in that order. The same filter set powers
+`bintrail recover` and the MCP `query` tool.
 
 Filters: `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`,
 `--since` / `--until`, `--changed-column` (events that touched a given column),

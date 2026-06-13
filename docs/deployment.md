@@ -62,7 +62,7 @@ On-demand (DBA workstation):
 
 ### Replication user
 
-`bintrail` connects to the source as a replication client. The required grants (`REPLICATION SLAVE`, `REPLICATION CLIENT`, plus `SELECT` only during `bintrail snapshot`) and the minimal-permissions guidance are in [streaming.md → The Source MySQL User](streaming.md#the-source-mysql-user).
+`bintrail` connects to the source as a replication client. The required grants (`REPLICATION SLAVE`, `REPLICATION CLIENT`, plus `SELECT` for schema snapshots and preflight checks) and the minimal-permissions guidance are in [streaming.md → The Source MySQL User](streaming.md#the-source-mysql-user).
 
 ### Managed MySQL (RDS / Aurora / Cloud SQL)
 
