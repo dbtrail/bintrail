@@ -679,8 +679,8 @@ dbtrail ships an MCP server that exposes `query`, `recover`, `status`, and `list
 
 Claude calls the tools automatically and presents the results. Setup depends on where Claude runs:
 
-- **Claude Code, same machine** (stdio) and **Claude Desktop, remote** (the `proxy.py` bridge): see [mcp-server.md → Three Ways to Connect Claude](mcp-server.md#three-ways-to-connect-claude).
-- **claude.ai / Claude mobile** (the network Connector, via a gateway you self-host or dbtrail's hosted one — an advanced path): see [mcp-server.md → Claude Connector](mcp-server.md#claude-connector-for-claudeai-desktop-and-mobile).
+- **Claude Code, same machine** (stdio) and **Claude Desktop, remote** (the `proxy.py` bridge): see [mcp-server.md → Connect Claude](mcp-server.md#connect-claude).
+- **claude.ai / Claude mobile** (the network Connector, via a gateway you self-host or dbtrail's hosted one — an advanced path): see [mcp-server.md → claude.ai and Claude mobile](mcp-server.md#claudeai-and-claude-mobile).
 
 ---
 

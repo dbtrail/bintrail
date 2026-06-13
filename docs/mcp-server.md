@@ -1,41 +1,145 @@
-# The MCP Server
+# Using Claude with dbtrail (MCP)
 
-`bintrail-mcp` is a Model Context Protocol server that exposes dbtrail's `query`, `recover`, `status`, and `list_schema_changes` as tools for AI assistants like Claude — so you can investigate database changes in natural language instead of running CLI commands.
+dbtrail ships an MCP server, `bintrail-mcp`, that lets **Claude** — in Claude
+Code, Claude Desktop, or claude.ai — search your change history and draft
+recoveries in plain English. Once connected, you can ask:
+
+> "What got deleted from the `orders` table in the last 10 minutes?"
+>
+> "Generate the SQL to bring back customer 42."
+>
+> "What schema changes happened this week?"
+
+It exposes four **read-only** tools — `query`, `recover` (generates reversal SQL,
+never runs it), `status`, and `list_schema_changes` — and never writes to your
+database.
 
 ---
 
-## What MCP Is
+## Before you start
 
-MCP (Model Context Protocol) is an open standard for connecting AI assistants to external data sources and tools. When an MCP server is registered with an AI assistant, the assistant can call the server's tools during a conversation — and the server's responses become part of the conversation context.
+You need two things on the machine where Claude runs:
 
-For dbtrail, this means you can ask Claude things like:
-
-> "What got deleted from the orders table in the last 10 minutes?"
-
-Claude calls the `query` tool with the right parameters, gets the results back as text, and tells you what happened — without you having to write a single CLI command.
+1. **The `bintrail-mcp` binary.** It ships in the release archives, the
+   `.deb`/`.rpm` (`bintrail` package), and the Docker image — or install it
+   directly:
+   ```sh
+   go install github.com/dbtrail/dbtrail/cmd/bintrail-mcp@latest
+   ```
+2. **Your index DSN** — the same `BINTRAIL_INDEX_DSN` your dbtrail stack uses,
+   e.g. `user:pass@tcp(127.0.0.1:3306)/binlog_index`.
 
 ---
 
-## Four Read-Only Tools
+## Connect Claude
 
-The MCP server exposes four tools, all of which are read-only:
+Pick the setup that matches where you run Claude. **Claude Code is the simplest —
+start there.**
 
-| Tool | CLI equivalent | Description |
-|------|---------------|-------------|
-| `query` | `bintrail query` | Search indexed binlog events with filters |
+### Claude Code (local)
+
+Add an `.mcp.json` at your project root (or `~/.claude.json` to use it
+everywhere):
+
+```json
+{
+  "mcpServers": {
+    "bintrail": {
+      "command": "bintrail-mcp",
+      "env": { "BINTRAIL_INDEX_DSN": "user:pass@tcp(127.0.0.1:3306)/binlog_index" }
+    }
+  }
+}
+```
+
+Restart Claude Code. The `query`, `recover`, `status`, and `list_schema_changes`
+tools appear — now ask: *"What changed in the orders table in the last hour?"*
+
+> Working inside the dbtrail **source repo**? Use
+> `"command": "go", "args": ["run", "./cmd/bintrail-mcp"]` instead — no separate
+> install needed.
+
+### Claude Desktop (local index)
+
+Same idea, in Claude Desktop's config file
+(`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "bintrail": {
+      "command": "bintrail-mcp",
+      "env": { "BINTRAIL_INDEX_DSN": "user:pass@tcp(127.0.0.1:3306)/binlog_index" }
+    }
+  }
+}
+```
+
+Restart Claude Desktop.
+
+### Index on another machine (Claude Desktop)
+
+If the index runs on a different host, start the server **there** over HTTP:
+
+```sh
+BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index' \
+  bintrail-mcp --http :8080
+```
+
+Then bridge Claude Desktop to it from your laptop with `proxy.py` — see
+[proxy.py (remote bridge)](#proxypy-remote-bridge) below.
+
+### claude.ai and Claude mobile
+
+Reaching your index from the web app or your phone needs an OAuth **gateway** in
+front — an **advanced, optional** path. Most people use Claude Code or Claude
+Desktop above instead. Two ways to get a gateway:
+
+- **Self-host it (open source).** Build `cmd/mcp-gateway` and run it behind HTTPS
+  on your own infrastructure and public domain.
+- **dbtrail's hosted gateway (managed-service customers).** dbtrail operates one
+  at `https://mcp.dbtrail.com/mcp` and provisions your tenant — this requires a
+  dbtrail account; the open-source repo does not give you access to it.
+
+Once a gateway is reachable at a public URL: in **claude.ai → Settings →
+Integrations → Add custom integration**, enter the gateway URL (your domain, or
+`https://mcp.dbtrail.com/mcp` for managed customers), complete the OAuth login
+with your **tenant ID**, and the four tools appear. Works from web, Desktop, and
+mobile; tokens refresh automatically.
+
+---
+
+## The four tools
+
+| Tool | CLI equivalent | What it does |
+|---|---|---|
+| `query` | `bintrail query` | Search indexed row changes with filters |
 | `recover` | `bintrail recover --dry-run` | Generate reversal SQL (never executes it) |
-| `status` | `bintrail status` | Show indexed files, partitions, and summary |
-| `list_schema_changes` | — (reads the `schema_changes` table, see [DDL tracking](./ddl-tracking.md)) | List DDL changes recorded during indexing or streaming, with the full statement and binlog coordinates |
+| `status` | `bintrail status` | Indexed files, partitions, and summary |
+| `list_schema_changes` | reads `schema_changes` (see [DDL tracking](./ddl-tracking.md)) | DDL changes recorded while indexing/streaming, with the full statement and binlog coordinates |
 
-All four tools are annotated with `ReadOnlyHint: true` and `IdempotentHint: true`. These hints tell the MCP client that it's safe to call them multiple times and that they don't modify any state.
+All four are read-only — annotated `ReadOnlyHint: true` and `IdempotentHint: true`,
+so the client knows they're safe to call repeatedly and never modify state.
+`list_schema_changes` accepts `schema`, `table`, `ddl_type`
+(`CREATE`/`ALTER`/`DROP`/`RENAME`/`TRUNCATE`, prefix-matched so `ALTER` matches
+`ALTER TABLE`), `since`, `until`, and `limit` (default 100); results come back
+newest-first.
 
-`list_schema_changes` accepts `schema`, `table`, `ddl_type`, `since`, `until`, and `limit` (default 100). `ddl_type` takes `CREATE`, `ALTER`, `DROP`, `RENAME`, or `TRUNCATE` and is prefix-matched against the stored values (`ALTER` matches `ALTER TABLE`). Results come back as JSON, newest first (a plain "No schema changes found." when nothing matches).
+Prompts that work well:
+
+> "Someone deleted rows from `users` this afternoon — show me what and when."
+>
+> "Generate the SQL to undo the bad UPDATE on order 1234."
+>
+> "What was customer 42's row before the last change?"
 
 ---
 
-## Tool parameters and behavior
+## Tool parameters and behavior (reference)
 
-The `query` and `recover` tools share the CLI's filters and validation. Beyond the basics (`schema`, `table`, `pk`, `event_type`, `gtid`, `since`, `until`), both accept:
+The `query` and `recover` tools share the CLI's filters and validation. Beyond
+the basics (`schema`, `table`, `pk`, `event_type`, `gtid`, `since`, `until`),
+both accept:
 
 - `changed_column` — events that touched a given column
 - `column_eq` — repeatable `column=value` equality filters
@@ -43,102 +147,37 @@ The `query` and `recover` tools share the CLI's filters and validation. Beyond t
 - `profile` — RBAC table-deny + column-redaction
 - `no_archive` — disable Parquet archive auto-routing (see below)
 
-`query` additionally takes `format` (`json`, `table`, or `csv`). Time values (`since` / `until`) accept MySQL datetime (`2006-01-02 15:04:05`), RFC 3339, or date-only (`2006-01-02`) — the same formats as the CLI.
+`query` additionally takes `format` (`json`, `table`, or `csv`). Time values
+(`since` / `until`) accept MySQL datetime (`2006-01-02 15:04:05`), RFC 3339, or
+date-only (`2006-01-02`) — the same formats as the CLI.
 
-**Archive auto-discovery.** `query` and `recover` automatically discover Parquet archive sources from `archive_state` in the index database (or from the `BINTRAIL_ARCHIVE_S3` + `BINTRAIL_ID` env vars). When archives are found, results from MySQL and Parquet are merged, deduplicated, and sorted before output or SQL generation. Pass `no_archive` to disable this.
+**Archive auto-discovery.** `query` and `recover` automatically discover Parquet
+archive sources from `archive_state` in the index database (or from the
+`BINTRAIL_ARCHIVE_S3` + `BINTRAIL_ID` env vars). When archives are found, results
+from MySQL and Parquet are merged, deduplicated, and sorted before output or SQL
+generation. Pass `no_archive` to disable this.
 
-**Index DSN.** The server connects to the index via the `BINTRAIL_INDEX_DSN` environment variable (set once at startup) or the per-call `index_dsn` parameter, which overrides the env var. Set the env var at startup so callers don't repeat it on every call.
-
----
-
-## Three Ways to Connect Claude
-
-| Method | Works from | Auth | Setup |
-|---|---|---|---|
-| **stdio** (recommended for Claude Code) | Claude Code (local) | None (trusts local user) | `.mcp.json` at project root |
-| **Claude Connector** | claude.ai, Claude Desktop, Claude mobile | OAuth 2.1 (automatic) | Self-host a gateway (or use dbtrail's hosted one), add its URL in Claude Settings |
-| **proxy.py** (legacy) | Claude Desktop only | None (trusts local user) | Edit `claude_desktop_config.json` |
-
-For Claude Code on the same machine as your index, **stdio** is the zero-infrastructure path — start there. The **Claude Connector** reaches the index from claude.ai / Claude Desktop / mobile over the network, and needs an MCP Gateway in front (which you self-host, or which dbtrail operates for managed-service customers).
-
-### stdio (recommended — for Claude Code)
-
-When started without flags, `bintrail-mcp` communicates over `stdin`/`stdout` using newline-delimited JSON-RPC. This is the MCP stdio transport.
-
-Claude Code on the same machine auto-starts the server via `.mcp.json` at the project root:
-
-```json
-{
-  "mcpServers": {
-    "bintrail": {
-      "command": "go",
-      "args": ["run", "./cmd/bintrail-mcp"]
-    }
-  }
-}
-```
-
-When you open the dbtrail directory in Claude Code, the server starts automatically. Set `BINTRAIL_INDEX_DSN` in your shell or in the env section of `.mcp.json` and the tools are immediately available.
-
-```sh
-export BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index'
-# Now ask Claude: "What got deleted in the orders table today?"
-```
-
-### Claude Connector (for claude.ai, Desktop, and mobile)
-
-This reaches your index over the network through an **MCP Gateway** — an OAuth front door whose source is in `cmd/mcp-gateway`. It is an **advanced, optional** path; most users want **stdio** (above), which needs no gateway at all. There are two ways to get one:
-
-- **Self-host it (open source).** Build `cmd/mcp-gateway` and run it behind HTTPS on your own infrastructure and public domain — fully doable with this repo alone.
-- **Use dbtrail's hosted gateway (managed-service customers).** dbtrail operates one at `https://mcp.dbtrail.com/mcp` and provisions your tenant. This requires a dbtrail account — the open-source repo does **not** give you access to it; it is the managed offering.
-
-Once a gateway is reachable at a public URL:
-
-1. Open **claude.ai** → **Settings** → **Integrations**
-2. Click **Add custom integration**
-3. Enter the gateway URL — your self-hosted domain (e.g. `https://mcp.example.com/mcp`) or, if you are a managed-service customer, `https://mcp.dbtrail.com/mcp`
-4. Claude auto-discovers the OAuth endpoints, opens the login page
-5. Enter your **tenant ID** and click **Authorize**
-6. Done — the `query`, `recover`, `status`, and `list_schema_changes` tools are now available
-
-This works from the Claude web app, Claude Desktop, and Claude mobile. Token refresh happens automatically — sessions survive indefinitely without re-authenticating.
-
-### HTTP (for remote access — Claude Desktop)
-
-```sh
-BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index' \
-  bintrail-mcp --http :8080
-```
-
-HTTP mode starts a persistent HTTP server using the MCP Streamable HTTP spec (2025-03-26). It serves at `/mcp`; the SDK manages session state via the `Mcp-Session-Id` response header. This is useful when Claude Desktop runs on your laptop but the bintrail server runs on a remote machine.
+**Index DSN.** The server connects to the index via the `BINTRAIL_INDEX_DSN`
+environment variable (set once at startup) or the per-call `index_dsn` parameter,
+which overrides the env var. Set the env var at startup so callers don't repeat
+it on every call.
 
 ---
 
-## `proxy.py`: Legacy Bridge for Claude Desktop
+## proxy.py (remote bridge)
 
-> **Note:** For new setups, use the [Claude Connector](#claude-connector-for-claudeai-desktop-and-mobile) method instead — it's simpler, works from more clients, and supports OAuth. `proxy.py` is still available as a fallback for environments that can't use the gateway.
-
-`proxy.py` bridges Claude Desktop (which speaks stdio) to a remote `bintrail-mcp --http` server:
+When the index runs on a different machine than Claude Desktop, `proxy.py`
+bridges Claude Desktop (which speaks stdio) to a remote `bintrail-mcp --http`
+server:
 
 ```
 Claude Desktop  →  proxy.py (stdio, runs locally)  →  bintrail-mcp --http :8080  →  MySQL
 ```
 
-`proxy.py` is a single Python file with zero dependencies (stdlib only), compatible with Python 3.7+. It:
+It's a single Python file with zero dependencies (stdlib only, Python 3.7+).
 
-1. Reads newline-delimited JSON-RPC messages from `stdin`.
-2. POSTs each message to the `BINTRAIL_SERVER` URL.
-3. Reads the SSE response and writes JSON-RPC responses back to `stdout`.
-4. Tracks the `Mcp-Session-Id` response header across requests (thread-safe, with a lock).
-
-**Python version compatibility**: `proxy.py` uses comment-style type annotations (`# type: str`) instead of `str | None` syntax. The union type syntax requires Python 3.10+, but macOS ships Python 3.9 or older.
-
-**Notifications (no `id` field)**: MCP notifications don't expect a response. `proxy.py` suppresses error responses for notifications because Claude Desktop rejects JSON-RPC error responses that have `id: null`.
-
-**Setup**:
-
-1. Copy `proxy.py` to the remote machine.
-2. Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+1. Copy `proxy.py` (from `cmd/bintrail-mcp/proxy.py`) to your laptop.
+2. Add it to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
    ```json
    {
@@ -152,7 +191,7 @@ Claude Desktop  →  proxy.py (stdio, runs locally)  →  bintrail-mcp --http :8
    }
    ```
 
-3. Test connectivity before configuring Claude Desktop:
+3. Test connectivity before restarting Claude Desktop:
 
    ```sh
    BINTRAIL_SERVER=http://192.168.1.10:8080/mcp python3 ~/proxy.py <<'EOF'
@@ -161,12 +200,10 @@ Claude Desktop  →  proxy.py (stdio, runs locally)  →  bintrail-mcp --http :8
    EOF
    ```
 
-   Two JSON responses = working. No response or connection error = check the server address and firewall.
+   Two JSON responses = working. No response or a connection error = check the
+   server address and firewall.
 
----
-
-## Stale Session Gotcha
-
-When `bintrail-mcp --http` restarts, all existing sessions are invalidated. But `proxy.py` (started as a subprocess by Claude Desktop) holds the old `Mcp-Session-Id` in memory. Subsequent tool calls fail with validation errors.
-
-**Fix**: Restart Claude Desktop. This kills and restarts the proxy process, clearing the stale session ID. No restart of the HTTP server is needed — just Claude Desktop.
+**Stale session after a restart:** when `bintrail-mcp --http` restarts, existing
+sessions are invalidated, but `proxy.py` still holds the old `Mcp-Session-Id` and
+tool calls start failing. Fix: restart Claude Desktop (that restarts the proxy
+and clears the session) — no need to restart the HTTP server.
