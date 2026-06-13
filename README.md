@@ -20,93 +20,56 @@ SELECT * FROM orders WHERE id = 123 AS OF '2026-05-20 14:00:00'
 
 ---
 
-dbtrail tails the binary log, keeps every row change with full
-before/after images in a searchable index, and turns "someone ran the wrong
-UPDATE" from a restore-from-backup incident into a two-minute fix:
+## What you get
+
+dbtrail tails the MySQL binary log and keeps every row change with full
+before/after images in a searchable index:
 
 - **See every change** — what changed and when, for every row, with before → after diffs
 - **Undo precisely** — generate exact reversal SQL for just the damaged rows
 - **Time-travel** — query any row (or table) as it was at any moment
-- **From a web console** — browse, recover, and add servers to monitor, all in the UI
+- **Web console** — browse, recover, and add servers to monitor, all in the UI
+- **[MCP server](docs/mcp-server.md)** — Claude or any MCP client can search history and draft recoveries
 
-It also ships an [MCP server](docs/mcp-server.md), so Claude (or any MCP
-client) can search your change history and draft recoveries.
+Works with **MySQL**, **Percona Server for MySQL**, **Amazon RDS for MySQL**,
+**Amazon Aurora MySQL**, and **Google Cloud SQL for MySQL** — dbtrail connects
+over the replication protocol, so it never needs the binlog files on disk
+(that's what makes managed cloud databases work). Requires MySQL 8.0+ with
+`binlog_format=ROW` and `binlog_row_image=FULL`; `bintrail doctor` checks both
+and prints the exact fix.
 
-Works with **MySQL**, **Percona Server for MySQL**, **Amazon RDS for
-MySQL**, **Amazon Aurora MySQL**, and **Google Cloud SQL for MySQL** —
-dbtrail connects over the replication protocol, so it never needs access
-to the binlog files on disk (that's what makes managed cloud databases
-work). Requires MySQL 8.0+ with `binlog_format=ROW` and
-`binlog_row_image=FULL` — `bintrail doctor` checks both and prints the
-exact fix for anything missing.
-
-## Get started
+## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dbtrail/dbtrail/main/install.sh | sh
 ```
 
-This downloads the Compose stack, brings it up, waits for the console to come
-up, and then prints exactly what to do next (it opens the console for you when
-it can). Prefer to run the two steps yourself? They are:
+This downloads the Compose stack, brings it up, waits for the console, and prints
+what to do next. Prefer to run the steps yourself?
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
 docker compose up -d
 ```
 
-Either way: open **http://127.0.0.1:8090** — on first run the console asks you
-to **create a username and password**. That's your login from now on.
+Then:
 
-Then click **+ Add server**: paste the MySQL you want to watch — host, user,
-password — and dbtrail runs the preflight checks (failures come back as
-fix-this cards), provisions an index for it, and starts streaming. Watching
-events within the minute, and the terminal is already behind you.
+1. Open **http://127.0.0.1:8090** — on first run, create a username and password (that's your login from now on).
+2. Click **+ Add server** and paste the MySQL you want to watch — host, user, password. dbtrail runs preflight checks, provisions an index, and starts streaming within the minute.
 
-The console binds to your machine only (`127.0.0.1`); your password persists in
-the stack's volume, so every later visit is a normal sign-in.
+The console binds to `127.0.0.1` only; your password persists in the stack's volume.
 
-**Forgot the password?** Reset it from the host shell — re-running this
-overwrites it, no data lost:
+- **Password reset, remote access, TLS, API tokens** → [docs/console.md](docs/console.md)
+- **Other install methods** (plain Docker, `.deb`/`.rpm`, `go install`, source, binary quickstart) → [docs/install.md](docs/install.md)
+- **BYO index, capacity, backups, support boundary** → [docs/deployment.md](docs/deployment.md) · [SUPPORT.md](SUPPORT.md). The stack ships a pinned MySQL 8.4 index container (your system of record — back up its volumes); an operated/managed option lives at [dbtrail.com](https://dbtrail.com).
+
+**Just curious?** One container, zero setup, time-travel SQL in 30 seconds:
 
 ```sh
-docker compose exec -it bintrail bintrail-console user set-password
+docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-demo
 ```
 
-To reach the console from another machine, **set the password from the shell
-first** — until one exists, exposing the port would expose the create-password
-screen — then publish the port, ideally behind TLS. The
-[console guide](docs/console.md#password-login) has the full auth, TLS, and
-reverse-proxy options (plus an opt-in API token for automation).
-
-> The compose stack ships a pinned **MySQL 8.4** container as the index store.
-> That index holds the forensic record — **it is your system of record, so
-> back up its volumes** (lose them and you re-index from scratch). dbtrail
-> **ships** that MySQL but does not **operate** it: disk, backups, and
-> upgrades are yours. Prefer your own? Set `INDEX_DSN` in `.env` to a MySQL
-> 8.0+ **you** run and remove the bundled index services — dbtrail installs only its
-> tables there, never operating the server. Either way, what's supported on
-> each side is spelled out in [SUPPORT.md](SUPPORT.md); for an index that's
-> operated for you, there's the managed service at [dbtrail.com](https://dbtrail.com).
->
-> **Other ways to install** — plain Docker, `.deb`/`.rpm`, `go install`,
-> source builds, and the binary quickstart: see **[docs/install.md](docs/install.md)**.
->
-> **Just curious?** One container, zero setup, time-travel SQL in 30 seconds:
-> `docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-demo` — see
-> [the demo image](docs/demo.md).
-
-## How it works
-
-<div align="center">
-<img src="docs/img/how-it-works.svg" alt="your MySQL streams via replication into dbtrail, which writes every row change with full before/after images into an index MySQL — served as query, recover, console, and time-travel" width="820">
-</div>
-
-The index is self-contained: recovery never needs the original binlog files,
-and old partitions rotate out to Parquet files — on local disk or in any
-S3-compatible bucket (S3, MinIO, …); no cloud account needed. Queries read
-them transparently either way. Time-travel SQL (`AS OF`) is served by a
-MySQL-protocol shim behind ProxySQL — your clients keep speaking plain MySQL.
+See [the demo image](docs/demo.md).
 
 ## Documentation
 
