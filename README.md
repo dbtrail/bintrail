@@ -27,7 +27,7 @@ before/after images in a searchable index:
 
 - **See every change** — what changed and when, for every row, with before → after diffs
 - **Undo precisely** — generate exact reversal SQL for just the damaged rows
-- **Time-travel** — query any row (or table) as it was at any moment
+- **Time-travel** — query any row (or table) as it was at any moment (requires ProxySQL — see [Time-Travel SQL](docs/time-travel-sql.md))
 - **Web console** — browse, recover, and add servers to monitor, all in the UI
 - **[MCP server](docs/mcp-server.md)** — Claude or any MCP client can search history and draft recoveries
 
@@ -45,23 +45,10 @@ curl -fsSL https://raw.githubusercontent.com/dbtrail/dbtrail/main/install.sh | s
 ```
 
 This downloads the Compose stack, brings it up, waits for the console, and prints
-what to do next. Prefer to run the steps yourself?
-
-```sh
-curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
-docker compose up -d
-```
-
-Then:
+what to do next. Then:
 
 1. Open **http://127.0.0.1:8090** — on first run, create a username and password (that's your login from now on).
 2. Click **+ Add server** and paste the MySQL you want to watch — host, user, password. dbtrail runs preflight checks, provisions an index, and starts streaming within the minute.
-
-The console binds to `127.0.0.1` only; your password persists in the stack's volume.
-
-- **Password reset, remote access, TLS, API tokens** → [docs/console.md](docs/console.md)
-- **Other install methods** (plain Docker, `.deb`/`.rpm`, `go install`, source, binary quickstart) → [docs/install.md](docs/install.md)
-- **BYO index, capacity, backups, support boundary** → [docs/deployment.md](docs/deployment.md) · [SUPPORT.md](SUPPORT.md). The stack ships a pinned MySQL 8.4 index container (your system of record — back up its volumes); an operated/managed option lives at [dbtrail.com](https://dbtrail.com).
 
 **Just curious?** One container, zero setup, time-travel SQL in 30 seconds:
 
