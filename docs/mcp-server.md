@@ -87,9 +87,9 @@ export BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index'
 
 ### Claude Connector (for claude.ai, Desktop, and mobile)
 
-This reaches your index over the network through an **MCP Gateway** — the OAuth front door whose source lives in `cmd/mcp-gateway`. There are two ways to have one:
+This reaches your index over the network through an **MCP Gateway** — an OAuth front door whose source is in `cmd/mcp-gateway`. It is an **advanced, optional** path; most users want **stdio** (above), which needs no gateway at all. There are two ways to get one:
 
-- **Self-host it (open source).** Build and run `cmd/mcp-gateway` on your own infrastructure and public domain. This is fully doable with this repo alone — see the [MCP Gateway docs](./mcp-gateway.md).
+- **Self-host it (open source).** Build `cmd/mcp-gateway` and run it behind HTTPS on your own infrastructure and public domain — fully doable with this repo alone.
 - **Use dbtrail's hosted gateway (managed-service customers).** dbtrail operates one at `https://mcp.dbtrail.com/mcp` and provisions your tenant. This requires a dbtrail account — the open-source repo does **not** give you access to it; it is the managed offering.
 
 Once a gateway is reachable at a public URL:
@@ -102,8 +102,6 @@ Once a gateway is reachable at a public URL:
 6. Done — the `query`, `recover`, `status`, and `list_schema_changes` tools are now available
 
 This works from the Claude web app, Claude Desktop, and Claude mobile. Token refresh happens automatically — sessions survive indefinitely without re-authenticating.
-
-For setup and deployment of the gateway itself, see [MCP Gateway docs](./mcp-gateway.md). For a comprehensive integration testing checklist, see [Connector Testing](./connector-testing.md).
 
 ### HTTP (for remote access — Claude Desktop)
 
