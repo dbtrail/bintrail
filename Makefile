@@ -12,7 +12,7 @@ GATEWAY_LDFLAGS=-ldflags "-X main.gatewayVersion=$(VERSION)"
 # bintrail-console reuses BINTRAIL_LDFLAGS: it injects the same
 # main.Version/CommitSHA/BuildDate vars as the core binary.
 
-.PHONY: all build build-mcp build-gateway build-console clean test lint install build-all tidy deps
+.PHONY: all build build-mcp build-gateway build-console clean test console-e2e lint install build-all tidy deps
 
 all: build build-mcp build-gateway build-console
 
@@ -42,6 +42,12 @@ clean:
 
 test:
 	go test ./... -count=1
+
+# Headless-Chrome regression guard for the console SPA (assets the Go suite
+# never renders). Needs Docker (bintrail-test-mysql) + Node. PW_CHANNEL=chrome
+# uses system Chrome instead of the playwright-managed chromium.
+console-e2e:
+	bash test/console-e2e/run.sh
 
 lint:
 	golangci-lint run ./...

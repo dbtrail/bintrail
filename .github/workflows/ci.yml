@@ -93,3 +93,59 @@ jobs:
       # the sole writer during its run.
       - name: Integration tests (-tags=integration)
         run: go test -tags=integration -race -p 1 -count=1 ./...
+
+  console-e2e:
+    # Headless-Chrome regression guard for the console SPA: go test never
+    # renders assets/*, so CSS/DOM/presentation bugs (invisible buttons, a
+    # form that auto-expands, a raw error wall, the control plane vanishing on
+    # a broken server selection) are invisible to the Go suite. Each scenario
+    # pins a bug that shipped in 0.13.3.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Same manually-named container as the integration job (8.4 = the bundled
+      # index engine, caching_sha2_password default).
+      - name: Start MySQL (bintrail-test-mysql, 8.4)
+        run: |
+          docker run -d --name bintrail-test-mysql \
+            -e MYSQL_ROOT_PASSWORD=testroot \
+            -p 13306:3306 \
+            mysql:8.4 \
+            --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          for i in $(seq 1 60); do
+            if docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent 2>/dev/null; then
+              echo "MySQL is ready."; exit 0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready in time" >&2
+          docker logs bintrail-test-mysql >&2 || true
+          exit 1
+
+      - name: Install playwright chromium (+ system deps)
+        run: |
+          npm --prefix test/console-e2e install --no-audit --no-fund
+          npx --prefix test/console-e2e playwright install --with-deps chromium
+
+      # PW_CHANNEL unset → use the chromium installed above (not system Chrome).
+      - name: Console E2E (headless Chrome)
+        run: make console-e2e
+
+      - name: Upload failure screenshot
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-e2e-failure
+          path: |
+            ${{ runner.temp }}/console-e2e-failure.png
+            ${{ runner.temp }}/console-e2e-daemon.log
+          if-no-files-found: ignore
