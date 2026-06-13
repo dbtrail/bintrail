@@ -34,10 +34,11 @@ guards), drives the scenarios, and tears everything down.
 |---|---|
 | boot: monitor capability reported | caps fetch for a broken/unprovisioned selected server must not degrade to `{}` |
 | control plane: Start button / monitor copy | `/api/capabilities` 502 cascade hiding the whole control plane |
-| button: primary keeps gradient on hover | `.btn:hover` background winning → white text on light gray |
-| form: advanced section collapsed | the optional "BYO index" section auto-expanding for a source entry |
+| button: primary keeps gradient on hover + text stays white | `.btn:hover` background winning → white text on light gray |
+| form: advanced collapsed for a source entry | the optional "BYO index" section auto-expanding for a source entry |
+| form: advanced expanded for a BYO-index entry | the other `byoIndex` arm — a no-source entry must show its index fields |
 | form: source fields visible | the monitor form rendering for a source entry |
-| error: 1049 empty state (×3) | a missing-index error rendering as a raw wall instead of an actionable empty state |
+| error: real 1049 reaches the frontend + empty state (×4) | the actual backend 1049 (from the unprovisioned default server) must surface as an actionable empty state, not a raw wall — and `scrubDSNError` must preserve the index db name |
 | no uncaught JS errors | any thrown error over the whole drive |
 
 Adding a scenario: append an `ok(...)`/`bad(...)` block in `console_e2e.mjs`.

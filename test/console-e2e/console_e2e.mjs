@@ -74,11 +74,16 @@ try {
   const hov = await page.evaluate(() => {
     const b = document.getElementById("server-add");
     const cs = getComputedStyle(b);
-    return { bgImage: cs.backgroundImage, bgColor: cs.backgroundColor };
+    return { bgImage: cs.backgroundImage, bgColor: cs.backgroundColor, color: cs.color };
   });
+  // Visibility is contrast: the gradient must survive AND the text must stay
+  // white. Checking only the background would miss a light-text regression.
   /gradient/.test(hov.bgImage)
     ? ok("button: primary keeps gradient on hover")
     : bad("button: primary keeps gradient on hover", `bgImage=${hov.bgImage} bgColor=${hov.bgColor}`);
+  hov.color === "rgb(255, 255, 255)"
+    ? ok("button: primary text stays white on hover")
+    : bad("button: primary text stays white on hover", `color=${hov.color}`);
 
   // Scenario 3 — editing a monitored source keeps the optional "bring your own
   // index" section COLLAPSED (its index DSN is auto-derived; expanding it shows
@@ -97,21 +102,54 @@ try {
   !form.advOpen ? ok("form: advanced section collapsed for a source entry") : bad("form: advanced section collapsed for a source entry", "auto-expanded");
   form.srcVisible ? ok("form: source fields visible") : bad("form: source fields visible", "hidden");
 
-  // Scenario 4 — a missing-index (MySQL 1049) view error renders an actionable
-  // empty state, not a raw red error wall, and clarifies the index is never on
-  // the source.
-  const es = await page.evaluate(() => {
+  // Scenario 4 — the REAL missing-index path (not a fabricated string): query
+  // a data endpoint against the default (unprovisioned wp) server, take the
+  // ACTUAL backend error, and feed it to renderError. This proves the backend
+  // 1049 reaches the frontend in the shape the empty-state needs — i.e. that
+  // scrubDSNError preserves the index db name and the 1049 text survives.
+  await page.evaluate(() => closeServersModal());
+  const es = await page.evaluate(async () => {
+    let errMsg = null;
+    try { await api("/api/status"); } catch (e) { errMsg = (e && e.message) || String(e); }
+    if (!errMsg) return { errMsg: null };
     const v = document.getElementById("view") || document.querySelector(".view") || document.body;
-    renderError(v, new Error("server \"wp\": failed to ping MySQL: Error 1049 (42000): Unknown database 'bintrail_idx_deadbeef'"));
+    renderError(v, new Error(errMsg));
     const empty = document.querySelector(".empty");
-    return empty ? empty.textContent : null;
+    return { errMsg, empty: empty ? empty.textContent : null };
   });
-  if (!es) bad("error: 1049 renders friendly empty state", "no .empty element produced");
-  else {
-    /indexing yet/.test(es) ? ok("error: 1049 empty state has friendly title") : bad("error: 1049 empty state has friendly title", es);
-    /never lives on the source/.test(es) ? ok("error: 1049 empty state clarifies source-vs-index") : bad("error: 1049 empty state clarifies source-vs-index", es);
-    /bintrail_idx_deadbeef/.test(es) ? ok("error: 1049 empty state names the index db") : bad("error: 1049 empty state names the index db", es);
+  if (!es.errMsg) {
+    bad("error: real 1049 reaches the frontend", "/api/status did not error for the unprovisioned default server");
+  } else if (!/Unknown database '(bintrail_idx_[^']+)'/.test(es.errMsg)) {
+    bad("error: real 1049 reaches the frontend", `backend error not the expected 1049 shape: ${es.errMsg}`);
+  } else {
+    ok("error: real 1049 reaches the frontend");
+    const t = es.empty || "";
+    !es.empty ? bad("error: 1049 renders friendly empty state", "no .empty element produced") : ok("error: 1049 renders friendly empty state");
+    /indexing yet/.test(t) ? ok("error: 1049 empty state has friendly title") : bad("error: 1049 empty state has friendly title", t);
+    /never lives on the source/.test(t) ? ok("error: 1049 empty state clarifies source-vs-index") : bad("error: 1049 empty state clarifies source-vs-index", t);
+    /bintrail_idx_/.test(t) ? ok("error: 1049 empty state names the index db") : bad("error: 1049 empty state names the index db", t);
   }
+
+  // Scenario 5 — a pure BYO-index entry (no source) must auto-EXPAND the
+  // advanced section: the index IS the whole form. This is the other arm of
+  // byoIndex (scenario 3 covers the collapse-for-source arm). Its dbname points
+  // at the daemon's own (existing) boot index, so it resolves cleanly.
+  const byoId = await page.evaluate(async () => {
+    const res = await api("/api/servers", { method: "POST", body: {
+      name: "byo-idx", host: "127.0.0.1", port: "13306", user: "root", password: "testroot", dbname: "bintrail_e2e_idx",
+    } });
+    return res.id;
+  });
+  await page.evaluate(() => openServersModal());
+  await page.waitForSelector("#servers-list", { timeout: 5000 });
+  await page.waitForTimeout(300);
+  await page.evaluate((id) => editServer(id), byoId);
+  await page.waitForSelector("#server-advanced", { timeout: 5000 });
+  await page.waitForTimeout(200);
+  const byoOpen = await page.evaluate(() => document.getElementById("server-advanced").open);
+  byoOpen
+    ? ok("form: advanced section expanded for a BYO-index entry")
+    : bad("form: advanced section expanded for a BYO-index entry", "collapsed — the byoIndex open-arm regressed");
 
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));
