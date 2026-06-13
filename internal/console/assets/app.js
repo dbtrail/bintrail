@@ -1878,6 +1878,17 @@ function buildServerForm() {
   monGrid.append(srvField("Schemas", "schemas", { placeholder: "(optional) shop,billing" }));
   monGrid.append(srvField("Archive to S3", "archive_s3", { placeholder: "(optional) s3://bucket/prefix/" }));
   mon.append(monGrid);
+  // The source user is the #1 friction point — spell out the grant inline,
+  // never behind a <details>. REPLICATION SLAVE/CLIENT drive the stream;
+  // SELECT covers the information_schema snapshot of columns/PKs/FKs.
+  const grantHint = el("p", { class: "form-hint", style: "margin-top:10px" });
+  grantHint.append("Source user needs ");
+  grantHint.append(el("code", { text: "REPLICATION SLAVE, REPLICATION CLIENT, SELECT" }));
+  grantHint.append(". Create one on the source MySQL — copy and run:");
+  mon.append(grantHint);
+  mon.append(el("pre", { class: "form-code", text:
+    "CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';\n" +
+    "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';" }));
   mon.append(el("p", { class: "form-hint", style: "margin-top:10px", text: "Archive to S3: rotated partitions upload here as Parquet before they're dropped, so the history survives retention and stays queryable. Needs AWS credentials on the daemon (env / role)." }));
   form.append(mon);
 

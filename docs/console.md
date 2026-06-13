@@ -171,6 +171,12 @@ console's request handlers still never migrate anything), and starts a
 supervised binlog stream. Auto-start: a green preflight starts streaming
 immediately; warnings (e.g. short binlog retention) show but don't block.
 
+The **source user** you paste into the form needs `REPLICATION SLAVE,
+REPLICATION CLIENT, SELECT` on the source MySQL — the form spells out the
+exact `CREATE USER` / `GRANT` to copy. dbtrail never writes to or locks the
+source. Full per-privilege breakdown and the least-privilege (schema-scoped
+`SELECT`) variant: [streaming.md](streaming.md#the-source-mysql-user).
+
 - Each monitored source gets **its own index database** — per-source state
   (checkpoints, snapshots) stays structurally isolated, and the server
   switcher lists it like any other connection.

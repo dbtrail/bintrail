@@ -4,6 +4,39 @@ This page explains `bintrail stream` — the real-time indexing mode that connec
 
 ---
 
+## The Source MySQL User
+
+Before streaming (or monitoring a source from the console "+ Add server" form), create a user on the **source** MySQL with the privileges dbtrail needs. Run this on the source:
+
+```sql
+CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';
+```
+
+That is the complete, minimal set. Each privilege maps to exactly one thing dbtrail does:
+
+| Privilege | Why dbtrail needs it |
+|---|---|
+| `REPLICATION SLAVE` | Consume the binlog event stream — dbtrail registers as a replica (`COM_BINLOG_DUMP`). |
+| `REPLICATION CLIENT` | Discover the start position and detect gaps: `SHOW BINARY LOG STATUS` / `SHOW MASTER STATUS`, `SHOW BINARY LOGS`, `@@gtid_purged`, `@@gtid_executed`. |
+| `SELECT` | Snapshot the schema (column types, primary keys, foreign keys) from `information_schema`, and run the preflight checks. |
+
+dbtrail **never** writes to the source and never locks it. It does not need `RELOAD`, `LOCK TABLES`, `PROCESS`, `SHOW VIEW`, or `EXECUTE`.
+
+**Least-privilege variant** — `SELECT` is the only privilege you can scope to specific schemas (the two `REPLICATION` grants are global-only in MySQL):
+
+```sql
+CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'dbtrail'@'%';
+GRANT SELECT ON shop.* TO 'dbtrail'@'%';        -- repeat per monitored schema
+```
+
+If you scope `SELECT`, it must cover **every column of every monitored table**, or the schema snapshot fails with `no columns found for the requested schemas`.
+
+> The source must also have `binlog_format = ROW` and `binlog_row_image = FULL`. The preflight check (and `bintrail doctor`) refuses to start otherwise — verify with `SHOW VARIABLES LIKE 'binlog_%';`.
+
+---
+
 ## The Problem
 
 `bintrail index` reads binlog files from disk. That works well for self-managed MySQL where you have filesystem access, but it doesn't work for managed MySQL services (Amazon RDS, Aurora, Cloud SQL). Those services don't give you file access to the binlog directory.

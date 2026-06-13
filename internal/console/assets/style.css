@@ -835,6 +835,17 @@ button { font-family: inherit; }
   color: var(--blue); padding: 0 6px; margin-left: 6px;
 }
 .form-hint { color: var(--ink-2); font-size: 12.5px; margin: 4px 0 16px; }
+.form-hint code { font-family: var(--f-mono); font-size: 12px; }
+/* Copy-pasteable SQL inside a form (e.g. the source-user GRANT). Always
+   visible — never tuck the grant behind a <details>; it is the first thing
+   a user hunting for "what do I put in Source user" needs. */
+.form-code {
+  margin: 6px 0 14px; padding: 12px 14px;
+  font-family: var(--f-mono); font-size: 12px; line-height: 1.65;
+  color: var(--ink); white-space: pre; overflow-x: auto;
+  background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: var(--radius); user-select: all;
+}
 .form-advanced { margin-top: 18px; }
 .form-adv-summary {
   cursor: pointer; user-select: none;

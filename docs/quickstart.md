@@ -13,6 +13,18 @@ You need:
 - MySQL with `binlog_format = ROW` and `binlog_row_image = FULL` (check with `SHOW VARIABLES LIKE 'binlog_%';`)
 - A MySQL database to use as the index (can be on the same server — call it `binlog_index`)
 - The `bintrail` binary installed and on your `$PATH`
+- A user on the source MySQL for dbtrail to read from (see below)
+
+### The source MySQL user
+
+dbtrail reads the source over the replication protocol, so it needs a user with replication + read access. Create one on the **source** server:
+
+```sql
+CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';
+```
+
+`REPLICATION SLAVE`/`REPLICATION CLIENT` drive the binlog stream; `SELECT` lets dbtrail snapshot the schema (columns, primary keys, foreign keys). dbtrail never writes to or locks the source. For the least-privilege variant (scoping `SELECT` to specific schemas) and a per-privilege breakdown, see [streaming.md](streaming.md#the-source-mysql-user).
 
 Set a shorthand for your index DSN so you don't retype it:
 
