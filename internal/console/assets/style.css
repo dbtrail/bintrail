@@ -470,7 +470,11 @@ button { font-family: inherit; }
   color: #fff; background: linear-gradient(135deg, var(--accent-a), var(--accent-b)); border-color: transparent;
   box-shadow: 0 1px 2px oklch(0.4 0.04 60 / 0.22), 0 1px 0 oklch(1 0 0 / 0.2) inset;
 }
+/* Re-assert the gradient: .btn:hover (same specificity, earlier in source)
+   sets background:var(--surface-2), which would otherwise win and leave the
+   primary button's white text on a light-gray fill — invisible on hover. */
 .btn-primary:hover { filter: brightness(1.05) saturate(1.04); border-color: transparent;
+  background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
   box-shadow: 0 5px 16px -5px oklch(0.5 0.08 60 / 0.45), 0 1px 0 oklch(1 0 0 / 0.2) inset; }
 
 .btn-accent { color: #fff; background: var(--orange-2); border-color: transparent; }

@@ -40,25 +40,29 @@ type authCapsInfo struct {
 	AuthKind    string `json:"auth_kind"` // "token" | "session"
 }
 
-// handleCapabilities reports which optional console surfaces are enabled for
-// the SELECTED server, so the frontend can show/hide them per server. Today
-// that is just reconstruct (baseline-gated). Resolving the bundle here is
-// deliberate: it lazily opens the connection on switch, so a dead entry fails
-// the moment the operator selects it, not on their first query.
+// handleCapabilities reports which optional console surfaces are enabled.
+// Monitor and Auth are PROCESS-level and must always be reported, even when
+// the selected server's index is unreachable — otherwise a broken selection
+// (e.g. a monitored source whose per-source index isn't provisioned yet)
+// would 502 here and make the frontend's gateCapabilities degrade to {},
+// hiding the entire control plane (the Start button, the "+ Add server"
+// monitor copy). Reconstruct is per-server (baseline-gated) so it needs the
+// bundle; a failed resolve just leaves it false rather than failing the whole
+// response. The dead-entry-fails-on-select feedback still comes from the data
+// queries (events/status), which resolveOr properly.
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
-	b := s.resolveOr(w, r)
-	if b == nil {
-		return
-	}
 	kind := "token"
 	if authKindFrom(r.Context()) == authKindSession {
 		kind = "session"
 	}
-	writeJSON(w, http.StatusOK, capabilitiesResponse{
-		Reconstruct: b.baselineConfigured,
-		Monitor:     s.monitorCtrl != nil,
-		Auth:        authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
-	})
+	resp := capabilitiesResponse{
+		Monitor: s.monitorCtrl != nil,
+		Auth:    authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
+	}
+	if b, err := s.resolve(r); err == nil {
+		resp.Reconstruct = b.baselineConfigured
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // stateEntryDTO is the wire view of a reconstruct.StateEntry (that struct has no

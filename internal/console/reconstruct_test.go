@@ -76,6 +76,32 @@ func TestHandleCapabilities(t *testing.T) {
 	}
 }
 
+// TestHandleCapabilitiesMonitorSurvivesUnresolvableServer: Monitor/Auth are
+// process-level and must be reported even when the SELECTED server can't be
+// resolved (e.g. a monitored source whose per-source index isn't provisioned
+// yet). A 502 here would make the frontend's gateCapabilities degrade to {},
+// hiding the whole control plane (Start button, "+ Add server" monitor copy).
+func TestHandleCapabilitiesMonitorSurvivesUnresolvableServer(t *testing.T) {
+	srv, _ := newSupervisorServer(t) // MonitorCtrl set, empty registry
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/capabilities", nil)
+	req.Header.Set(serverHeader, "ffffffffffffffff") // no such server → resolve fails
+	srv.handleCapabilities(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("capabilities must still 200 for an unresolvable selection, got %d (body=%s)", rec.Code, rec.Body)
+	}
+	var resp capabilitiesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Monitor {
+		t.Error("Monitor is process-level — must survive a broken server selection")
+	}
+	if resp.Reconstruct {
+		t.Error("Reconstruct needs a resolvable bundle — must be false here")
+	}
+}
+
 // TestHandleReconstructGatedOff: the endpoint is the boundary, not just the UI —
 // it must refuse when reconstruct is not configured.
 func TestHandleReconstructGatedOff(t *testing.T) {

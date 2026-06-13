@@ -499,7 +499,26 @@ function toast(msg) {
 function renderError(container, err) {
   if (!container) return;
   clear(container);
-  container.append(el("div", { class: "error-box", text: String((err && err.message) || err) }));
+  const msg = String((err && err.message) || err);
+  // A server whose index database doesn't exist yet (MySQL 1049) is the normal
+  // pre-monitoring state, not a fault — and the #1 source of confusion: the
+  // index DB lives on the INDEX server and is created when monitoring starts;
+  // it is NEVER expected on the source. Render an actionable empty state, not
+  // a raw red error wall.
+  const m = msg.match(/Unknown database '([^']+)'/);
+  if (m) {
+    const box = el("div", { class: "empty" });
+    box.append(el("h3", { text: "This server isn't indexing yet" }));
+    box.append(el("p", { text:
+      "Its index database \"" + m[1] + "\" doesn't exist on the index server yet. " +
+      "It's created automatically when monitoring starts for this source — it never lives on the source MySQL itself. " +
+      "Start monitoring from Manage servers, or switch to a server that's already indexing." }));
+    box.append(el("button", { class: "btn btn-sm", type: "button", text: "Manage servers",
+      onclick: () => openServersModal() }));
+    container.append(box);
+    return;
+  }
+  container.append(el("div", { class: "error-box", text: msg }));
 }
 
 function renderWarnings(node, warnings) {
@@ -1931,7 +1950,14 @@ function showServerForm(prefill) {
   // means a fresh add; editing any saved entry shows its index.
   const adv = $("#server-advanced", form);
   const hasIndexFields = !!(prefill && (prefill.host || prefill.dbname || prefill.baseline_dir || prefill.baseline_s3 || prefill.no_archive));
-  adv.open = !capsCache.monitor || hasIndexFields;
+  // Keep "bring your own index (optional)" COLLAPSED for a monitored source:
+  // its index DSN is auto-derived and round-trips as host/dbname, so expanding
+  // it — e.g. when a failed-preflight error card opens the form — would show
+  // the operator a per-source index they never typed. Open it only for a pure
+  // BYO-index entry (no source) or a serve-only process where the index is the
+  // whole form.
+  const byoIndex = hasIndexFields && !(prefill && prefill.has_source);
+  adv.open = !capsCache.monitor || byoIndex;
   $(".form-adv-summary", adv).hidden = !capsCache.monitor;
 
   if (prefill) {

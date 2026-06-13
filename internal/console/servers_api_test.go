@@ -246,12 +246,16 @@ func TestResolveHeader(t *testing.T) {
 		t.Fatalf("unknown id: err=%v, want ErrUnknownServer", err)
 	}
 	// A registry entry pointing at a dead host fails on SELECTION with 502 and
-	// a scrubbed error.
+	// a scrubbed error — on the DATA endpoints (status/events/recover). NOTE:
+	// /api/capabilities deliberately does NOT 502 here; Monitor/Auth are
+	// process-level and must survive a broken selection (see
+	// TestHandleCapabilitiesMonitorSurvivesUnresolvableServer), so the
+	// dead-server feedback comes from the data queries, exercised below.
 	added, err := srv.cm.reg.Add(ServerEntry{Name: "dead", DSN: "u:" + secretPW + "@tcp(127.0.0.1:1)/db?timeout=200ms"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	req2 := httptest.NewRequest("GET", "http://127.0.0.1:8090/api/capabilities", nil)
+	req2 := httptest.NewRequest("GET", "http://127.0.0.1:8090/api/status", nil)
 	req2.Host = "127.0.0.1:8090"
 	req2.Header.Set("Authorization", "Bearer t")
 	req2.Header.Set(serverHeader, added.ID)
