@@ -4,87 +4,21 @@ dbtrail indexes every INSERT, UPDATE, and DELETE from MySQL ROW-format binary lo
 
 ---
 
-## 0. Where to Run dbtrail
+## 0. Where to run dbtrail
 
-Where you install and run the `bintrail` binary depends on which indexing mode you use.
+dbtrail ingests changes two ways:
 
----
-
-### Mode A: File-based indexing (`bintrail index`)
-
-`bintrail index` reads binlog files directly from the local filesystem using `--binlog-dir`. There is **no remote file access** — the path must be readable by the process running dbtrail.
-
-```
-┌─────────────────────────────────────────────────────┐
-│  Host with access to binlog files                   │
-│                                                     │
-│  /var/lib/mysql/binlog.000042   ◄──── bintrail      │
-│  /var/lib/mysql/binlog.000043         index         │
-└─────────────────────────────────────────────────────┘
-                                             │
-                                             │ TCP (MySQL protocol)
-                                             ▼
-                                    ┌─────────────────┐
-                                    │  Index Database  │
-                                    │  (binlog_index)  │
-                                    └─────────────────┘
-```
-
-**Typical deployment locations:**
-
-| Where to run dbtrail | When to use it |
-|---|---|
-| On the MySQL server itself | Simplest option for self-managed MySQL. `--binlog-dir /var/lib/mysql`. |
-| On a replica host | Point `--binlog-dir` at the replica's own binlog directory (requires `log_bin` enabled on the replica). Useful to avoid load on the primary. |
-| On any host with an NFS/CIFS mount | Mount the MySQL data directory read-only and point `--binlog-dir` at the mount point. |
-| Inside a Docker container | Mount the binlog directory read-only: `-v /var/lib/mysql:/var/lib/mysql:ro`. |
-| After copying files with rsync/SCP | Copy binlog files to a staging directory, run dbtrail there, delete afterwards. |
-
-**What does NOT work:**
-
-- Pointing `--binlog-dir` at an SSH or SFTP path (`/ssh/host/var/lib/mysql`) — the flag is a plain filesystem path
-- Pointing `--binlog-dir` at a remote HTTP or object-storage URL
-- Running dbtrail on a machine with no access to the binlog files and hoping `--source-dsn` provides them — `--source-dsn` is only used for schema metadata and format validation, not for reading binlog file content
-
-**dbtrail never modifies binlog files.** It opens them read-only. It is safe to point `--binlog-dir` at the live MySQL data directory.
-
----
-
-### Mode B: Replication streaming (`bintrail stream`)
-
-`bintrail stream` connects to MySQL over the standard network replication protocol, receiving binlog events as they are committed. It requires **no access to binlog files on disk** — only a TCP connection to MySQL with a replication-privileged user.
-
-```
-                    TCP (MySQL replication protocol)
-bintrail stream ────────────────────────────────► Source MySQL
-                                                  (any location)
-       │
-       │ TCP (MySQL protocol)
-       ▼
-┌─────────────────┐
-│  Index Database  │
-│  (binlog_index)  │
-└─────────────────┘
-```
-
-**dbtrail can run anywhere** that has a TCP path to the source MySQL server — your laptop, a CI runner, a separate host, or a container.
-
-This is the required mode for managed MySQL services (Amazon RDS, Aurora, Google Cloud SQL, Azure Database for MySQL) where binlog files are not accessible on disk.
-
----
-
-### Choosing a mode
+- **`bintrail stream`** (and `bintrail up`, which wraps it) connects over the MySQL **replication protocol** — no access to binlog files on disk. This is the default, the only option for managed MySQL (RDS, Aurora, Cloud SQL), and runs anywhere with a TCP path to the source. See [Streaming](streaming.md).
+- **`bintrail index`** reads binlog **files** from a local path (`--binlog-dir`). Use it to **backfill** historical files on self-managed MySQL; it never reads remote, SSH, or object-storage paths, and it opens files read-only. See [Indexing](indexing.md).
 
 | | `bintrail index` | `bintrail stream` |
 |---|---|---|
-| **Requires filesystem access** | Yes — binlog files must be readable locally | No |
-| **Requires MySQL TCP access** | Optional (for validation + auto-snapshot) | Yes (always) |
-| **Works with managed MySQL** | No (no disk access on RDS/Aurora) | Yes |
-| **Backfills historical data** | Yes — indexes any binlog file, including archived ones | No — only events from the starting position forward |
-| **Suitable for one-off catchup** | Yes (run and exit) | No (long-running process) |
-| **Suitable for continuous indexing** | Yes (cron or timer) | Yes (runs indefinitely, self-checkpoints) |
+| Needs filesystem access to binlogs | Yes | No |
+| Works with managed MySQL (RDS/Aurora/Cloud SQL) | No | Yes |
+| Backfills historical data | Yes | No — from the start position forward |
+| Shape | One-off (run and exit) | Long-running (self-checkpoints) |
 
-You can use **both modes together**: use `bintrail index` to backfill historical binlog files, then switch to `bintrail stream` for ongoing real-time indexing from the current position.
+Use both together if you like: `index` to backfill old files, then `stream` for ongoing real-time indexing.
 
 ---
 
@@ -109,7 +43,7 @@ Before you start:
 
 ## 2. First-Time Setup
 
-Three commands get you running: `bintrail init` (create the index tables) → `bintrail snapshot` (capture schema metadata) → `bintrail index --all` (backfill from binlog files on disk). The [Quickstart](quickstart.md) walks through each with expected output; this guide assumes you've done that and focuses on the day-to-day scenarios below. (Streaming from a managed source instead of indexing files on disk? See [Scenario J](#scenario-j-streaming-from-managed-mysql-rds-aurora-cloud-sql).)
+The [Quickstart](quickstart.md) gets you running — the web console (`+ Add server`), or `bintrail up` on the command line (preflight + init + snapshot + stream). This guide assumes you're up and focuses on the day-to-day scenarios below.
 
 **Tip — skip the repeated flags.** Instead of passing `--index-dsn`/`--source-dsn` on every command, generate a config file once:
 
@@ -350,114 +284,24 @@ The JSON output includes `row_before` and `row_after` for every event, giving a 
 
 ### Scenario F: Disk is filling up — clean old index data
 
-**Situation:** The dbtrail index database is growing large and you need to reclaim space by dropping old partitions.
+**Situation:** the index database is growing and you need to reclaim space.
 
-**Check the current state:**
-
-```sh
-bintrail status --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
-```
-
-The output shows each partition, its hour boundary, and estimated row counts. Identify how many hours of history you're holding.
-
-**Drop old partitions and reclaim space:**
+Check what you're holding with `bintrail status`, then drop partitions past a retention window:
 
 ```sh
-# Drop partitions older than 7 days without auto-adding replacements
+# Reclaim space: drop partitions older than 7 days, no replacements
 bintrail rotate \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --retain     7d \
-  --no-replace
+  --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --retain 7d --no-replace
 ```
 
-Partitions older than the retain threshold are dropped in a single `ALTER TABLE … DROP PARTITION` statement — much faster than `DELETE` on InnoDB. Use `--no-replace` when you genuinely want to reclaim space; without it, `--retain` automatically adds back the same number of future partitions to keep the rolling window size constant.
-
-**Maintain a rolling window (same partition count):**
-
-```sh
-# Drop old partitions, auto-add the same number of replacement future ones
-bintrail rotate \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --retain     7d
-```
-
-**Extend the partition range** if the `p_future` catch-all is holding data:
-
-```sh
-bintrail rotate \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --add-future 48
-```
+Dropping is a single `ALTER TABLE … DROP PARTITION` — far faster than a `DELETE`. Without `--no-replace`, `--retain` keeps a constant rolling window (drops old, adds the same number of future partitions); `--add-future N` extends the range if `p_future` is holding data. Full options and scheduling are in [Rotation and Status](rotation-and-status.md#automating-rotation).
 
 ---
 
 ### Scenario G: Archiving partitions to S3
 
-**Situation:** You want to archive old `binlog_events` partitions to S3 as Parquet files before dropping them, so you retain a long-term queryable history outside the index database.
-
-**Option 1 — Let dbtrail create the bucket:**
-
-```sh
-bintrail init \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --s3-bucket  my-bintrail-archives \
-  --s3-region  us-east-1
-```
-
-dbtrail creates the bucket, blocks all public access, and sets a 1-year lifecycle expiry.
-
-**Option 2 — Use a bucket that already exists (pass its ARN):**
-
-```sh
-bintrail init \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --s3-arn     arn:aws:s3:::my-existing-bucket
-```
-
-dbtrail verifies the bucket is reachable with the current AWS credentials. `--s3-bucket` and `--s3-arn` are mutually exclusive.
-
-**Required IAM permissions:**
-
-Whichever approach you use, the IAM role or user running dbtrail needs these permissions on the bucket:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "BintrailS3Access",
-      "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:GetObject",
-        "s3:ListBucket",
-        "s3:DeleteObject"
-      ],
-      "Resource": [
-        "arn:aws:s3:::my-bintrail-archives",
-        "arn:aws:s3:::my-bintrail-archives/*"
-      ]
-    }
-  ]
-}
-```
-
-The example above uses the standard `aws` partition. If your bucket is in AWS China (`aws-cn`) or GovCloud (`aws-us-gov`), replace `arn:aws:s3:::` with `arn:aws-cn:s3:::` or `arn:aws-us-gov:s3:::` in both resource lines. When you use `--s3-arn`, dbtrail extracts the correct partition from the ARN and prints an already-correct policy in the warning output.
-
-If you used `--s3-bucket` to let dbtrail create the bucket, it also needs `s3:CreateBucket`, `s3:PutBucketPublicAccessBlock`, and `s3:PutLifecycleConfiguration` at creation time — these can be removed from the policy afterwards.
-
-**AWS credentials:** dbtrail uses the standard AWS credential chain — environment variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, or the EC2/ECS instance metadata service. No extra configuration is needed when running on an EC2 instance with an IAM instance profile that has the policy above attached.
-
-**Archive to a local directory:**
-
-```sh
-bintrail rotate \
-  --index-dsn   "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --retain      7d \
-  --archive-dir /mnt/archives
-```
-
-**Archive directly to S3:**
+**Situation:** keep a long-term, queryable history outside the index by archiving old partitions to Parquet (local or S3) before dropping them.
 
 ```sh
 bintrail rotate \
@@ -468,198 +312,52 @@ bintrail rotate \
   --archive-s3-region us-east-1
 ```
 
-`--archive-dir` is still required with `--archive-s3` — files are written locally first, then uploaded. Point it at a temporary directory if you don't need local copies after upload. Archives are stored in a Hive-partitioned layout: `bintrail_id=<uuid>/event_date=<YYYY-MM-DD>/event_hour=<HH>/events.parquet`, compatible with Athena, Glue, and DuckDB.
-
-**Retry after a partial failure:** If archiving or S3 upload fails partway through (network error, disk full, etc.), re-run with `--retry` to pick up where it left off:
-
-```sh
-bintrail rotate \
-  --index-dsn         "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --retain            7d \
-  --archive-dir       /tmp/rotate-staging \
-  --archive-s3        s3://my-bintrail-archives/events/ \
-  --archive-s3-region us-east-1 \
-  --retry
-```
-
-`--retry` skips partitions whose local Parquet file already exists and S3 uploads that already succeeded (tracked in the `archive_state` table).
-
-**Query archived events** — once you've archived partitions, `query` and `recover` automatically discover the archive locations from `archive_state`. No extra flags needed:
-
-```sh
-bintrail query \
-  --index-dsn   "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --schema      mydb \
-  --table       orders \
-  --since       "2026-01-01 00:00:00"
-```
-
-Results from the live MySQL index and from Parquet archives are merged, deduplicated, and sorted by timestamp before being returned. If a time range has been rotated out of MySQL but not archived, a coverage warning is emitted.
-
-You can also specify archive sources explicitly (skipping auto-discovery):
-
-```sh
-bintrail query \
-  --index-dsn   "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --schema      mydb \
-  --table       orders \
-  --since       "2026-01-01 00:00:00" \
-  --archive-s3  s3://my-bintrail-archives/events/ \
-  --bintrail-id abc123de-0000-0000-0000-000000000001
-```
-
-To disable archive routing entirely and query only live MySQL data, use `--no-archive`.
+Files are written locally first, then uploaded (Hive-partitioned, Athena/Glue/DuckDB-compatible); re-run with `--retry` after a partial failure. Once archived, `query` and `recover` **discover the archives automatically** (from `archive_state`) and merge them with live results — no extra flags (use `--no-archive` to skip). The full setup — creating and locking down the bucket, the minimum IAM policy, the AWS credential chain — is in [Rotation and Status](rotation-and-status.md#archiving-partitions-to-parquet) and [Upload](upload.md).
 
 ---
 
 ### Scenario H: Creating a baseline snapshot with mydumper
 
-**Situation:** You're setting up dbtrail for the first time and want to capture the current state of your tables before you start indexing binlog events. Or you need a periodic full snapshot for audit purposes.
-
-**Prerequisites:** Either mydumper or Docker must be available. If Docker is installed, no separate mydumper installation is needed — dbtrail invokes it automatically via `docker run`. See the [Dump and Baseline guide](dump-and-baseline.md#getting-mydumper) for details.
-
-**Step 1 — Dump the source database:**
+**Situation:** capture the current full state of your tables — before you start indexing, or as periodic audit snapshots.
 
 ```sh
-bintrail dump \
-  --source-dsn "user:pass@tcp(source-db:3306)/" \
-  --output-dir /tmp/mydumper-output \
-  --schemas mydb
+# 1. Dump the source (mydumper; auto-run via Docker if installed)
+bintrail dump --source-dsn "user:pass@tcp(source-db:3306)/" --output-dir /tmp/mydumper-output --schemas mydb
+
+# 2. Convert to Parquet (no DB connection — reads files only)
+bintrail baseline --input /tmp/mydumper-output --output /data/baselines
 ```
 
-This invokes mydumper to create a logical dump of the `mydb` schema. Omit `--schemas` to dump all user schemas. Use `--tables mydb.orders,mydb.items` to dump specific tables.
-
-**Step 2 — Convert to Parquet:**
-
-```sh
-bintrail baseline \
-  --input  /tmp/mydumper-output \
-  --output /data/baselines
-```
-
-No database connection needed — this reads only files. Output: `/data/baselines/<timestamp>/mydb/orders.parquet`, etc.
-
-**Step 3 — Verify:**
-
-```sh
-ls -lR /data/baselines/
-```
-
-You should see one `.parquet` file per table, organized by timestamp and schema.
-
-> For the full reference on all flags, scheduling, and troubleshooting, see [Dump and Baseline](dump-and-baseline.md).
+Output is one `.parquet` per table under `<timestamp>/<schema>/`. Baselines power full-row time-travel (`bintrail reconstruct` and the console's Time-travel view). Full flags, mydumper install, scheduling, and troubleshooting: [Dump and Baseline](dump-and-baseline.md).
 
 ---
 
 ### Scenario I: Uploading baseline Parquet files to S3
 
-**Situation:** You've generated a mydumper baseline (see [Scenario H](#scenario-h-creating-a-baseline-snapshot-with-mydumper)) and want to store the resulting Parquet files in S3 for long-term retention alongside your archived `binlog_events` partitions.
+**Situation:** store baseline Parquet (Scenario H) in S3 for long-term retention.
 
-**Option 1 — Generate locally and upload in one step (recommended):**
-
-```bash
-bintrail baseline \
-  --input         /path/to/mydumper-output \
-  --output        /tmp/baselines \
-  --upload        s3://bintrail-audit-baselines/baselines/ \
-  --upload-region us-east-1
+```sh
+bintrail baseline --input /path/to/mydumper-output --output /tmp/baselines \
+  --upload s3://bintrail-audit-baselines/baselines/ --upload-region us-east-1
 ```
 
-`--upload` writes Parquet files to `--output` first, then uploads every file to S3 preserving the relative directory structure (`timestamp/database/table.parquet`). Uses the standard AWS credential chain — environment variables, `~/.aws/credentials`, or EC2/ECS instance metadata. `--upload-region` is optional if `AWS_REGION` is already set in your environment or `~/.aws/config`.
-
-If the upload fails partway through, re-run with `--retry` to skip files that already exist locally and in S3:
-
-```bash
-bintrail baseline \
-  --input         /path/to/mydumper-output \
-  --output        /tmp/baselines \
-  --upload        s3://bintrail-audit-baselines/baselines/ \
-  --upload-region us-east-1 \
-  --retry
-```
-
-Prefer to upload separately (e.g. `aws s3 sync` or `bintrail upload`), or need the S3 access setup? The **minimum IAM policy** and the **AWS credential chain** live in **[upload.md](upload.md)**. Create the bucket once with `bintrail init --s3-bucket` (or the AWS CLI: `aws s3api create-bucket` + a public-access block).
-
-**Storage-class notes (operational):**
-
-- **STANDARD_IA** (Infrequent Access) suits baselines written once and read occasionally during audits — cheaper storage than STANDARD, with a small per-retrieval fee. Pass `--storage-class STANDARD_IA` to `aws s3 sync`.
-- A **Glacier** lifecycle rule (transition objects older than ~90 days) cuts cost further for rarely-queried baselines. Note: DuckDB/Athena cannot query Glacier directly — restore to STANDARD first (minutes to hours depending on tier).
-- Use `--no-progress` (AWS CLI) in scripts and cron to avoid noisy output.
+`--upload` writes locally then uploads (re-run with `--retry` to resume). The IAM policy, credential chain, and `aws s3 sync` / storage-class options are in [Upload](upload.md).
 
 ---
 
 ### Scenario J: Streaming from managed MySQL (RDS, Aurora, Cloud SQL)
 
-**Situation:** You're using a managed MySQL service where you have no filesystem access to binlog files. You want continuous real-time indexing using the replication protocol.
+**Situation:** continuous real-time indexing from a managed service with no binlog file access.
 
-**Prerequisites** — grant replication privileges on the source:
-
-```sql
-CREATE USER 'bintrail_repl'@'%' IDENTIFIED BY 'secret';
-GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'bintrail_repl'@'%';
-FLUSH PRIVILEGES;
-```
-
-**First run** — one-time setup. `bintrail stream` auto-discovers the current binlog position from the source on first run, so no `--start-file`/`--start-gtid` is required by default:
+Grant `REPLICATION SLAVE, REPLICATION CLIENT` (plus `SELECT` for schema snapshots) on the source — see [the source user](quickstart.md#prerequisites) — then start streaming. `bintrail up` (or `stream`) auto-discovers the current binlog position on first run and resumes from its checkpoint afterward:
 
 ```sh
-# Step 1: Create index tables
-bintrail init --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
-
-# Step 2: Snapshot schema metadata
-bintrail snapshot \
+bintrail up \
   --source-dsn "bintrail_repl:secret@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
   --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index"
-
-# Step 3: Start streaming — auto-discovers the current binlog head
-bintrail stream \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --source-dsn "bintrail_repl:secret@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
-  --server-id  99999 \
-  --metrics-addr :9090
 ```
 
-To start from an earlier position (e.g. replay a known window), query the source explicitly and pass `--start-gtid` or `--start-file`/`--start-pos`:
-
-```sql
-SHOW BINARY LOG STATUS;   -- MySQL 8.4+
-SHOW MASTER STATUS;       -- pre-8.4
--- Example output:
--- File: binlog.000123  Position: 4  Executed_Gtid_Set: 3e11fa47-...:1-5000
-```
-
-**Subsequent runs** — the checkpoint is resumed automatically:
-
-```sh
-bintrail stream \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --source-dsn "bintrail_repl:secret@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
-  --server-id  99999
-# No --start-gtid needed — resumed from stream_state checkpoint
-```
-
-**Force a new start position** — use `--reset` to clear the saved checkpoint and start from a specific position:
-
-```sh
-bintrail stream \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --source-dsn "bintrail_repl:secret@tcp(mydb.us-east-1.rds.amazonaws.com:3306)/" \
-  --server-id  99999 \
-  --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-8000" \
-  --reset
-```
-
-`--reset` is useful when switching between position mode and GTID mode, or when you need to skip ahead past corrupted events. Without `--reset`, the saved checkpoint always takes precedence over `--start-*` flags.
-
-**Monitor** replication lag and throughput:
-
-```sh
-curl -s localhost:9090/metrics | grep bintrail_stream_replication_lag_seconds
-```
-
-**Graceful shutdown** — send `SIGTERM` (or Ctrl-C). The current batch is flushed and the checkpoint is written before exit.
-
-**Run as a systemd service** for automatic restart — see [deployment.md](./deployment.md). Use `Type=simple` and `Restart=always` since `stream` is long-running (unlike the one-shot `index` command).
+`up` runs the preflight, creates the index, snapshots, streams, and rotates hourly — run it under systemd (`Restart=always`). To replay from an earlier point, use `bintrail stream --start-gtid ... --reset`. RDS gotchas (backup-retention enables binlog, stream from the primary, retention cap), the `--ssl-mode` TLS options, and metrics are in [Streaming](streaming.md); the command-by-command walkthrough is [Quickstart Option B](quickstart.md#option-b--command-line).
 
 ---
 
