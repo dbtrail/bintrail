@@ -123,9 +123,11 @@ fi
 docker info >/dev/null 2>&1 || die \
   "The Docker daemon isn't running. Start Docker and re-run this installer."
 
-# Catch the single most common first-run failure — port already taken — with
+# Catch the single most common FRESH-install failure — port already taken — with
 # an actionable message instead of Docker's raw bind error. Best-effort: if we
-# have no probe tool, stay quiet and let Docker decide.
+# have no probe tool, stay quiet and let Docker decide. Skipped when this dir
+# already has a stack (a re-run, where dbtrail's OWN container legitimately holds
+# the port) — there `up -d` is a harmless no-op and the console is already up.
 port_in_use() {
   if command -v lsof >/dev/null 2>&1; then
     lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
@@ -135,7 +137,7 @@ port_in_use() {
     return 1
   fi
 }
-if port_in_use "$PORT"; then
+if [ ! -f "$DIR/docker-compose.yml" ] && port_in_use "$PORT"; then
   die "Port ${PORT} is already in use on this machine — the console can't bind it.
     Free that port, or run the console on another one:
         DBTRAIL_PORT=9090 curl -fsSL .../install.sh | sh"
@@ -172,19 +174,34 @@ else
   if [ "$PORT" != "8090" ]; then
     sed "s|127.0.0.1:8090:8090|127.0.0.1:${PORT}:8090|" docker-compose.yml > docker-compose.yml.tmp \
       && mv docker-compose.yml.tmp docker-compose.yml
+    # sed exits 0 even when nothing matched — verify the rewrite actually landed
+    # rather than print a false "port set" and bind the wrong port.
+    grep -q "127.0.0.1:${PORT}:8090" docker-compose.yml || die \
+      "Couldn't set the console port to ${PORT} — the compose file's published-port
+    line isn't what this installer expected. Edit the 'ports:' line in
+    ${DIR}/docker-compose.yml by hand, or report it."
     say "${DIM}    console port set to ${PORT}${RST}"
   fi
 fi
+
+# Whether freshly downloaded or reused, make sure it's actually a compose file
+# before handing it to Docker: a captive portal / proxy can return HTTP 200 with
+# an HTML body, and a prior run interrupted mid-download leaves a truncated file.
+# Either way `up -d` would emit an opaque YAML error; fail with a clear cause.
+grep -q '^services:' docker-compose.yml || die \
+  "${DIR}/docker-compose.yml doesn't look like a compose file (truncated download,
+    or a network proxy/captive portal returned something else). Delete it and re-run."
 
 # ── 3. bring it up ──────────────────────────────────────────────────────
 step "Starting containers (first run pulls images — this can take a minute)"
 $COMPOSE up -d || die "\`$COMPOSE up -d\` failed. Check the output above."
 
 # ── 4. wait for the console to actually answer ──────────────────────────
-# `up -d` returns the moment containers are created, but the console only
-# answers after the bundled index MySQL passes its healthcheck (~30-60s on a
-# cold start). Poll the unauthenticated liveness endpoint so we never tell the
-# user "ready" before it is.
+# `up -d` already blocks until the bundled index MySQL is healthy (the bintrail
+# service has `depends_on: condition: service_healthy`, ~30-60s on a cold start),
+# so by the time it returns the index is up. We still poll the unauthenticated
+# liveness endpoint to wait out the short gap before the console process binds
+# its HTTP listener — so we never print "ready" before the URL actually answers.
 step "Waiting for the console to come up"
 ready=""
 i=0
@@ -201,11 +218,15 @@ done
 printf '\r%*s\r' 40 ''   # clear the progress line
 
 if [ -z "$ready" ]; then
+  # `up -d` returns 0 even if a container then crash-loops, so "no answer" can
+  # mean still-pulling OR genuinely broken. Point at both ps and logs, and exit
+  # non-zero so an automated caller (`install.sh && …`) doesn't read this as success.
   warn "The console didn't answer at ${CONSOLE_URL} within ~3 minutes."
-  say  "It may still be pulling images or initializing. Watch the logs:"
+  say  "It may still be pulling images, or a container may have failed. Check both:"
+  say  "    ${B}cd ${DIR} && ${COMPOSE} ps${RST}"
   say  "    ${B}cd ${DIR} && ${COMPOSE} logs -f bintrail${RST}"
-  say  "Once you see the console URL there, open ${CONSOLE_URL}"
-  exit 0
+  say  "Once the console URL shows there, open ${CONSOLE_URL}"
+  exit 1
 fi
 
 # ── 5. next steps — the whole point of this script ──────────────────────
