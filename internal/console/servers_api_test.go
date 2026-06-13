@@ -1,10 +1,12 @@
 package console
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -698,6 +700,54 @@ func TestMonitorStartDoctorFailure(t *testing.T) {
 	}
 	if e, _ := srv.cm.reg.Get(created.ID); e.MonitorDesired {
 		t.Error("a failed doctor must not record monitoring intent")
+	}
+}
+
+// TestFailedCheckSummary: the log line joins only the failed checks, with
+// their (already-scrubbed) details, skipping passes.
+func TestFailedCheckSummary(t *testing.T) {
+	r := &DoctorReport{Checks: []DoctorCheck{
+		{Name: "Source MySQL connection", Status: "pass", Detail: "MySQL 8.4"},
+		{Name: "binlog_row_image", Status: "fail", Detail: "is MINIMAL, need FULL"},
+		{Name: "Replication grants", Status: "fail", Detail: ""},
+	}}
+	got := failedCheckSummary(r)
+	want := "binlog_row_image: is MINIMAL, need FULL; Replication grants"
+	if got != want {
+		t.Errorf("failedCheckSummary = %q, want %q", got, want)
+	}
+}
+
+// TestMonitorStartLogsPreflightFailure locks in the silent-failure fix: a
+// preflight failure must be visible from the host (docker logs), not only in
+// the browser that fired the request. Without the slog.Warn, an operator
+// running --log-level debug sees NOTHING when Start fails.
+func TestMonitorStartLogsPreflightFailure(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(old)
+
+	srv, ctrl := newSupervisorServer(t)
+	ctrl.report = &DoctorReport{
+		Failed: 1,
+		Checks: []DoctorCheck{{Name: "Source MySQL connection", Status: "fail",
+			Detail: "failed to ping MySQL: dial tcp 172.18.0.1:3306: connect: connection refused", Remediation: "x"}},
+	}
+	_, body := doServersReq(t, srv, "POST", "/api/servers",
+		`{"name":"wp","source_host":"db","source_user":"repl"}`)
+	var created serverDTO
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	doServersReq(t, srv, "POST", "/api/servers/"+created.ID+"/monitor/start", "")
+
+	out := buf.String()
+	if !strings.Contains(out, "preflight failed") {
+		t.Errorf("a preflight failure must be logged (silent-failure fix); log was:\n%s", out)
+	}
+	if !strings.Contains(out, "172.18.0.1:3306") {
+		t.Errorf("the failure log must carry the actionable detail; log was:\n%s", out)
 	}
 }
 

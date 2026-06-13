@@ -240,6 +240,12 @@ func (m *monitorSupervisor) Doctor(ctx context.Context, e console.ServerEntry) (
 			Detail:      config.ScrubDSNText(c.Detail, e.SourceDSN, e.DSN),
 			Remediation: c.Remediation,
 		}
+		// Per-check trace so `--log-level debug` shows the full preflight from
+		// the host, not just the pass/fail tally returned to the browser.
+		slog.Debug("monitor: preflight check",
+			"server", e.Name, "id", e.ID,
+			"check", out.Checks[i].Name, "status", out.Checks[i].Status,
+			"detail", out.Checks[i].Detail)
 	}
 
 	// Replica/duplicate detection against the other monitored entries —

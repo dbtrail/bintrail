@@ -373,12 +373,22 @@ func (s *Server) handleMonitorStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A monitor start is an operator action whose outcome must be visible from
+	// the host (docker logs), not only in the browser that fired it — a
+	// preflight failure that travels solely over HTTP is a silent failure.
+	slog.Info("monitor: start requested", "server", e.Name, "id", e.ID)
+
 	report, err := s.monitorCtrl.Doctor(r.Context(), e)
 	if err != nil {
+		slog.Error("monitor: preflight could not run", "server", e.Name, "id", e.ID, "error", err.Error())
 		writeJSONError(w, http.StatusInternalServerError, "doctor: "+err.Error())
 		return
 	}
 	if report.Failed > 0 {
+		slog.Warn("monitor: preflight failed — not starting",
+			"server", e.Name, "id", e.ID,
+			"failed", report.Failed, "passed", report.Passed,
+			"failures", failedCheckSummary(report))
 		writeJSON(w, http.StatusOK, monitorStartResponse{
 			Doctor:  report,
 			Started: false,
@@ -390,20 +400,46 @@ func (s *Server) handleMonitorStart(w http.ResponseWriter, r *http.Request) {
 	// Doctor green → record intent first (the supervisor reconciles desired
 	// state at boot, so a crash right after this line still resumes), then
 	// launch.
+	slog.Info("monitor: preflight passed, starting stream", "server", e.Name, "id", e.ID)
 	e.MonitorDesired = true
 	if err := s.cm.reg.Update(e); err != nil {
 		writeJSONError(w, registryErrStatus(err), err.Error())
 		return
 	}
 	if err := s.monitorCtrl.Start(r.Context(), e); err != nil {
+		slog.Error("monitor: start failed after green preflight", "server", e.Name, "id", e.ID, "error", err.Error())
 		writeJSONError(w, http.StatusInternalServerError, "start monitoring: "+err.Error())
 		return
 	}
+	slog.Info("monitor: stream started", "server", e.Name, "id", e.ID)
 	writeJSON(w, http.StatusOK, monitorStartResponse{
 		Doctor:  report,
 		Started: true,
 		Monitor: s.monitorCtrl.Status(e.ID),
 	})
+}
+
+// failedCheckSummary joins a report's failed checks into one log-friendly
+// line ("Source MySQL connection: dial tcp …; Replication grants: …"). The
+// details are already DSN-scrubbed by the supervisor's Doctor, so this is safe
+// to log — it carries the host:port and error the operator needs without the
+// credentials.
+func failedCheckSummary(report *DoctorReport) string {
+	var b strings.Builder
+	for _, c := range report.Checks {
+		if c.Status != "fail" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(c.Name)
+		if c.Detail != "" {
+			b.WriteString(": ")
+			b.WriteString(c.Detail)
+		}
+	}
+	return b.String()
 }
 
 // handleMonitorStop serves POST /api/servers/{id}/monitor/stop.
