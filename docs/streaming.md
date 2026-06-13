@@ -1,4 +1,4 @@
-# How the Stream Command Works
+# Streaming from MySQL
 
 This page explains `bintrail stream` — the real-time indexing mode that connects to MySQL over the replication protocol instead of reading binlog files directly.
 
@@ -49,115 +49,10 @@ The solution is to connect to MySQL as if you were a replica. MySQL's replicatio
 
 When MySQL runs as primary in a replication setup, replicas connect using the `COM_BINLOG_DUMP` command and receive an event stream. The primary sends every event as it commits: `GTIDEvent`, `QueryEvent`, `RowsEvent`, `RotateEvent`, etc.
 
-dbtrail impersonates a replica by:
-
-1. Presenting a server ID (set via `--server-id`) that doesn't conflict with any real server.
-2. Telling MySQL where to start (a binlog file+position, or a GTID set).
-3. Reading the event stream with `go-mysql`'s `BinlogSyncer`.
-
 **GTID vs position mode**: MySQL supports two ways to identify a position in the binlog stream:
 
 - **Position mode** (`--start-file`, `--start-pos`): The traditional approach — a filename and byte offset. Simple but tied to a specific server instance.
 - **GTID mode** (`--start-gtid`): Each transaction gets a globally unique ID (`server-uuid:sequence-number`). MySQL tracks which GTIDs have been executed and resumes from the right point even after a failover. Use GTID mode on any setup where GTID replication is enabled (which is most managed MySQL services).
-
----
-
-## Architecture
-
-```
-MySQL source server
-       │
-       │  replication protocol (TCP)
-       │
-BinlogSyncer (go-mysql)
-       │
-StreamParser.Run goroutine  ──────► events chan (buffered 1000) ──► streamLoop (main goroutine)
-       │                                                                    │
-       └──► parseErrCh (buffered 1)                                        │
-                                                                  ticker every 10s
-                                                                  → flush batch + save checkpoint
-                                                                            │
-                                                                       indexer.InsertBatch
-                                                                            │
-                                                                       index MySQL database
-```
-
-The architecture mirrors the file-based indexer: a producer goroutine fills a channel, the main goroutine consumes it. The key difference is that the stream never ends — it runs until you send `SIGINT` or `SIGTERM`.
-
----
-
-## StreamParser vs Parser: Code Reuse
-
-`internal/parser/` has two types:
-
-- `Parser` — reads binlog files; called from `bintrail index`
-- `StreamParser` — reads from a `BinlogStreamer`; called from `bintrail stream`
-
-They look different on the outside but share all the internal logic. Both call the same package-level `handleRows` function for every row event:
-
-```go
-// internal/parser/parser.go — shared by both
-func handleRows(ctx context.Context, logger *slog.Logger, resolver *metadata.Resolver,
-    filters *Filters, binlogEv *replication.BinlogEvent, rowsEv *replication.RowsEvent,
-    filename, currentGTID string, out chan<- Event) error { ... }
-```
-
-`StreamParser.Run` reads events from the streamer in a loop, calling `streamer.GetEvent(ctx)` which blocks until an event arrives:
-
-```go
-// internal/parser/stream.go
-for {
-    binlogEv, err := streamer.GetEvent(ctx)
-    if err != nil {
-        if ctx.Err() != nil {
-            return nil  // context cancelled — graceful shutdown
-        }
-        return err
-    }
-    switch ev := binlogEv.Event.(type) {
-    case *replication.RotateEvent:
-        currentFile = string(ev.NextLogName)  // track binlog filename changes
-    case *replication.GTIDEvent:
-        currentGTID = formatGTID(ev.SID, ev.GNO)
-    case *replication.RowsEvent:
-        handleRows(...)
-    }
-}
-```
-
-`StreamParser` also handles `RotateEvent` — when MySQL switches to a new binlog file, the streamer sends a `RotateEvent` with the new filename. The stream parser updates `currentFile` so the filename is accurate in each emitted `Event`.
-
----
-
-## The Stream Loop
-
-`streamLoop` in `cmd/bintrail/stream.go` is the main goroutine. It uses a three-way `select`:
-
-```go
-for {
-    select {
-    case <-ctx.Done():
-        checkpoint()  // flush + save
-        return nil
-
-    case <-ticker.C:
-        checkpoint()  // periodic flush + save
-
-    case ev, ok := <-events:
-        if !ok {
-            checkpoint()
-            return nil
-        }
-        // update state from event
-        batch = append(batch, ev)
-        if len(batch) >= idx.BatchSize() {
-            flush()
-        }
-    }
-}
-```
-
-**Why not use `idx.Run` from the indexer?** The file-based `indexer.Run` method handles its own batching and flushes when the channel closes. But the stream never closes — it runs forever. The stream command needs checkpoint control between batches (flush the DB batch, then save position to `stream_state`). So it uses `idx.InsertBatch` (the exported lower-level method) directly, with its own ticker driving checkpoints.
 
 ---
 
@@ -176,17 +71,7 @@ The `stream_state` table has exactly one row (enforced by a `CHECK (id = 1)` con
 | `last_checkpoint` | When the checkpoint was last written |
 | `server_id` | The `--server-id` used |
 
-**GTID accumulation**: In GTID mode, the stream state doesn't store just the latest GTID — it stores the entire accumulated executed GTID set. This is how MySQL replication works: when resuming, you tell MySQL "I've already seen all of these GTIDs, send me everything after." The Go type is `*gomysql.MysqlGTIDSet` (in-memory), serialized to a string on checkpoint.
-
-```go
-// cmd/bintrail/stream.go
-if ev.GTID != "" && state.accGTID != nil {
-    state.accGTID.Update(ev.GTID)       // add this GTID to the set
-    state.gtidSet = state.accGTID.String()  // serialize for checkpoint
-}
-```
-
-**Checkpoint upsert**: The `saveCheckpoint` function uses `INSERT … ON DUPLICATE KEY UPDATE` to atomically write-or-update the single row. On the first run, it inserts. On every subsequent checkpoint, it updates. The duplicate key is `id = 1`.
+**GTID accumulation**: In GTID mode, the stream state doesn't store just the latest GTID — it stores the entire accumulated executed GTID set. This is how MySQL replication works: when resuming, you tell MySQL "I've already seen all of these GTIDs, send me everything after."
 
 **Checkpoint interval**: Default 10 seconds, configurable via `--checkpoint`. This is the maximum amount of data you'd need to re-index if the process crashes — events between the last checkpoint and the crash are re-indexed on restart (they're deduplicated naturally because the same GTID/position is just re-received from MySQL).
 
@@ -326,19 +211,49 @@ CALL mysql.rds_set_configuration('binlog retention hours', 48);
 
 RDS caps `binlog retention hours` at **720 (30 days)**. Values above the ceiling are rejected with `ERROR 1644 (45000)`. Longer historical reach is the dbtrail index's job (and `bintrail baseline` for replay anchors before the index window) — not RDS's binlog buffer.
 
+### TLS/SSL for managed MySQL (RDS, Aurora, Cloud SQL)
+
+Managed MySQL services often require TLS. Use `--ssl-mode` to control the connection security:
+
+| Mode | Behavior |
+|------|----------|
+| `disabled` | No TLS |
+| `preferred` (default) | Attempt TLS (no certificate verification), fall back to unencrypted if unavailable |
+| `required` | TLS mandatory (no certificate verification), fail if unavailable |
+| `verify-ca` | Validate server certificate against CA (no hostname check) |
+| `verify-identity` | Full verification (certificate + hostname) |
+
+**Amazon RDS example** (download the [RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html) first):
+
+```bash
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "bintrail_repl:a-strong-password@tcp(mydb.abc123.us-east-1.rds.amazonaws.com:3306)/" \
+  --server-id  99999 \
+  --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-50000" \
+  --ssl-mode   verify-ca \
+  --ssl-ca     /path/to/rds-combined-ca-bundle.pem \
+  --metrics-addr :9090
+```
+
+For **mutual TLS** (client certificate authentication), add `--ssl-cert` and `--ssl-key` to any stream command above:
+
+```bash
+bintrail stream \
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --source-dsn "bintrail_repl:a-strong-password@tcp(source-db:3306)/" \
+  --server-id  99999 \
+  --ssl-mode   verify-identity \
+  --ssl-ca     /path/to/ca.pem \
+  --ssl-cert   /path/to/client-cert.pem \
+  --ssl-key    /path/to/client-key.pem
+```
+
 ---
 
 ## Graceful Shutdown
 
-When you send `SIGINT` or `SIGTERM` (or press Ctrl-C):
-
-1. The signal handler goroutine calls `cancel()`, which cancels the context.
-2. `streamLoop`'s `select` receives `ctx.Done()` and calls `checkpoint()` — flushing the current batch and writing position to `stream_state`.
-3. `StreamParser.Run` is blocking on `streamer.GetEvent(ctx)`, which returns an error when the context is cancelled. It returns `nil` (not an error) when `ctx.Err() != nil`.
-4. The parser goroutine closes the `events` channel (via `defer close(events)` in the goroutine wrapper).
-5. `streamLoop` has already returned; it reads the nil parse error from `parseErrCh` and the command exits cleanly.
-
-This means no events in the current in-memory batch are lost — they're flushed before exit.
+When you send `SIGINT` or `SIGTERM` (or press Ctrl-C), the current in-memory batch is flushed before exit — no events are lost.
 
 ---
 

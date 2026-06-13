@@ -193,28 +193,19 @@ The script is wrapped in `BEGIN`/`COMMIT` and reverses events in reverse chronol
 
 ## Step 5½ — Or do steps 4–5 from a browser
 
-Steps 4 and 5 (query + recover) are also available as a read-only web UI,
-served by the companion `bintrail-console` binary (same release archive):
+Steps 4–5 (query + recover) are also a read-only web UI in the companion
+`bintrail-console` binary (same release archive):
 
 ```sh
 bintrail-console serve --index-dsn "$IDX"
 ```
 
-It prints a tokenized loopback URL; open it in a browser:
-
-```
-Bintrail console (read-only) is running. Open:
-
-    http://127.0.0.1:8090/?token=ab12cd34ef56ab12cd34ef56ab12cd34
-```
-
-Three screens:
-
-- **Recover** — filter by schema / table / PK / time, preview the affected rows with before→after diffs, then generate undo SQL to copy or download.
-- **Events** — browse every indexed change with full before/after images.
-- **Status** — index health: partitions, coverage, stream lag, archives.
-
-Like `recover --dry-run`, the console **never executes SQL** — you review and apply the script yourself. It binds to loopback with an auto-generated access token by default; a non-loopback bind requires an explicit `--token`. See [Web console](./console.md) for the security model and HTTP API.
+It prints a tokenized loopback URL — open it for the **Recover**, **Events**,
+and **Status** screens (filter by schema/table/PK/time, preview before→after
+diffs, generate undo SQL). Like `recover --dry-run`, the console **never
+executes SQL**, and binds to loopback with an auto-generated token by default
+(a non-loopback bind requires an explicit `--token`). See
+[Web console](./console.md) for the security model and HTTP API.
 
 ---
 

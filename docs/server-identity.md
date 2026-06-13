@@ -14,7 +14,7 @@ The server identity system assigns a stable UUID (`bintrail_id`) to each source 
 
 ### How It Works
 
-Every command that connects to a source server (`snapshot`, `index`, `stream`) calls `ResolveServer` before doing any work. `ResolveServer` reads the source server's connection details (host, port, user) and looks them up in the `bintrail_servers` table.
+Every command that connects to a source server (`snapshot`, `index`, `stream`) resolves a server identity before doing any work: it reads the source server's connection details (host, port, user), looks them up in the `bintrail_servers` table, and records the resulting `bintrail_id` for the indexed file or stream.
 
 The result is one of five outcomes ("resolution rules"):
 
@@ -184,7 +184,7 @@ bintrail query \
   --flag      billing
 ```
 
-This returns events from any table or column that has the `billing` flag. It's equivalent to an `EXISTS` correlated subquery against `table_flags` — the filter matches if the event's `(schema_name, table_name)` has a row in `table_flags` with `flag = 'billing'` (at the table level, column level, or both). Events are never duplicated even when a table has multiple matching flag rows.
+This returns events from any table or column that has the `billing` flag. The filter matches if the event's `(schema_name, table_name)` has a `billing` flag at the table level, column level, or both. Events are never duplicated even when a table has multiple matching flag rows.
 
 The `--flag` parameter is also available on the MCP `query` and `recover` tools:
 

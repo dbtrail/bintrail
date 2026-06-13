@@ -1,6 +1,6 @@
-# How the MCP Server Works
+# The MCP Server
 
-This page explains `bintrail-mcp` — the Model Context Protocol server that exposes dbtrail's `query`, `recover`, `status`, and `list_schema_changes` operations as tools for AI assistants like Claude.
+`bintrail-mcp` is a Model Context Protocol server that exposes dbtrail's `query`, `recover`, `status`, and `list_schema_changes` as tools for AI assistants like Claude — so you can investigate database changes in natural language instead of running CLI commands.
 
 ---
 
@@ -33,124 +33,21 @@ All four tools are annotated with `ReadOnlyHint: true` and `IdempotentHint: true
 
 ---
 
-## Code Reuse: Same Internals as the CLI
+## Tool parameters and behavior
 
-The MCP server is a thin wrapper around the same internal packages used by the CLI:
+The `query` and `recover` tools share the CLI's filters and validation. Beyond the basics (`schema`, `table`, `pk`, `event_type`, `gtid`, `since`, `until`), both accept:
 
-```
-cmd/bintrail-mcp/main.go
-       │
-       ├── queryTool  → resolveArchiveSources → Engine.Fetch + parquetquery.Fetch → MergeResults → Format
-       ├── recoverTool → resolveArchiveSources → Engine.Fetch + parquetquery.Fetch → MergeResults → GenerateSQLFromRows
-       ├── statusTool → internal/status.CollectStatus → StatusData.Write
-       └── schemaChangesTool → SELECT … FROM schema_changes (JSON output)
-```
+- `changed_column` — events that touched a given column
+- `column_eq` — repeatable `column=value` equality filters
+- `flag` — table/column flag filter
+- `profile` — RBAC table-deny + column-redaction
+- `no_archive` — disable Parquet archive auto-routing (see below)
 
-Both `queryTool` and `recoverTool` automatically discover Parquet archive sources from `archive_state` in the index database (or from `BINTRAIL_ARCHIVE_S3` + `BINTRAIL_ID` env vars). When archives are found, results from MySQL and Parquet are merged, deduplicated, and sorted before formatting or SQL generation. The `no_archive` parameter disables this auto-routing.
+`query` additionally takes `format` (`json`, `table`, or `csv`). Time values (`since` / `until`) accept MySQL datetime (`2006-01-02 15:04:05`), RFC 3339, or date-only (`2006-01-02`) — the same formats as the CLI.
 
-Beyond the basic filters (schema, table, pk, event_type, gtid, since, until), both tools accept `changed_column`, `column_eq` (repeatable `column=value` equality filters), `flag` (table/column flag filter), and `profile` (RBAC table-deny + column-redaction); `query` additionally takes `format` (`json`, `table`, or `csv`).
+**Archive auto-discovery.** `query` and `recover` automatically discover Parquet archive sources from `archive_state` in the index database (or from the `BINTRAIL_ARCHIVE_S3` + `BINTRAIL_ID` env vars). When archives are found, results from MySQL and Parquet are merged, deduplicated, and sorted before output or SQL generation. Pass `no_archive` to disable this.
 
-`buildQueryOptions` in `cmd/bintrail-mcp/main.go` is the shared filter builder used by both `queryTool` and `recoverTool`. It calls the same `cliutil.ParseEventType` and `cliutil.ParseTime` helpers that the CLI uses:
-
-```go
-// cmd/bintrail-mcp/main.go
-func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol string,
-    columnEq []string, flagVal string, limit, defaultLimit int) (query.Options, error) {
-    // validate pk requires schema+table
-    // validate changed_column requires schema+table
-    et, err := cliutil.ParseEventType(eventType)
-    sinceT, err := cliutil.ParseTime(since)
-    untilT, err := cliutil.ParseTime(until)
-    return query.Options{...}, nil
-}
-```
-
-This means the same validation rules, the same time parsing formats (MySQL datetime `"2006-01-02 15:04:05"`, RFC 3339, date-only `"2006-01-02"`), and the same query logic apply whether you call the CLI or the AI tool.
-
----
-
-## DSN Resolution
-
-The server needs a MySQL DSN to connect to the index database. There are two ways to provide it:
-
-1. **`BINTRAIL_INDEX_DSN` environment variable** — set once when starting the server; applies to all tool calls.
-2. **`index_dsn` tool parameter** — passed on each individual tool call; overrides the env var.
-
-`resolveDSN` implements this priority:
-
-```go
-// cmd/bintrail-mcp/main.go
-func resolveDSN(override string) (string, error) {
-    if override != "" {
-        return override, nil
-    }
-    dsn := os.Getenv("BINTRAIL_INDEX_DSN")
-    if dsn == "" {
-        return "", fmt.Errorf("no index DSN: set BINTRAIL_INDEX_DSN env var or pass index_dsn parameter")
-    }
-    return dsn, nil
-}
-```
-
-In practice, set the env var when starting the server so callers don't need to pass `index_dsn` on every call.
-
----
-
-## Error Handling: Application vs Protocol Level
-
-MCP distinguishes two kinds of errors:
-
-- **Protocol errors** (the tool couldn't be called at all — wrong parameters, malformed request) → returned as JSON-RPC error responses.
-- **Application errors** (the tool was called correctly but the operation failed) → returned as a successful tool call result where `IsError: true`.
-
-The MCP server uses application-level errors for all tool failures:
-
-```go
-// cmd/bintrail-mcp/main.go
-func errorResult(err error) *mcp.CallToolResult {
-    return &mcp.CallToolResult{
-        Content: []mcp.Content{
-            &mcp.TextContent{Text: err.Error()},
-        },
-        IsError: true,
-    }
-}
-```
-
-This means Claude sees the error message as text in the tool result, can explain it to you, and can suggest fixes — instead of seeing an opaque JSON-RPC error that it might not understand.
-
----
-
-## `newServer()`: Extracted for Testability
-
-The server setup is in `newServer()` rather than `main()`:
-
-```go
-// cmd/bintrail-mcp/main.go
-func newServer() *mcp.Server {
-    return newServerWithDSN("")
-}
-
-func newServerWithDSN(dsnOverride string) *mcp.Server {
-    server := mcp.NewServer(&mcp.Implementation{...}, &mcp.ServerOptions{...})
-    mcp.AddTool(server, &mcp.Tool{Name: "query", ...}, makeQueryTool(connectFn))
-    mcp.AddTool(server, &mcp.Tool{Name: "recover", ...}, makeRecoverTool(connectFn))
-    mcp.AddTool(server, &mcp.Tool{Name: "status", ...}, makeStatusTool(resolveFn))
-    mcp.AddTool(server, &mcp.Tool{Name: "list_schema_changes", ...}, makeSchemaChangesTool(connectFn))
-    return server
-}
-```
-
-`newServer()` is a thin wrapper over `newServerWithDSN(dsnOverride)`: a non-empty override forces every tool to use that DSN, ignoring both the env var and the `index_dsn` parameter. Multi-tenant mode (`--tenant-dsns`, see [MCP Gateway](./mcp-gateway.md)) uses it to pin each session to the tenant's index.
-
-`main()` just calls `newServer()` and wires it to a transport. This means unit tests can call `newServer()` directly and pass it an in-memory transport, without starting a subprocess or dealing with stdio framing:
-
-```go
-// cmd/bintrail-mcp/integration_test.go
-t1, t2 := mcp.NewInMemoryTransports()
-go newServer().Connect(ctx, t1, nil)
-// connect test client to t2 and call tools...
-```
+**Index DSN.** The server connects to the index via the `BINTRAIL_INDEX_DSN` environment variable (set once at startup) or the per-call `index_dsn` parameter, which overrides the env var. Set the env var at startup so callers don't repeat it on every call.
 
 ---
 
@@ -158,26 +55,13 @@ go newServer().Connect(ctx, t1, nil)
 
 | Method | Works from | Auth | Setup |
 |---|---|---|---|
-| **Claude Connector** (recommended) | claude.ai, Claude Desktop, Claude mobile | OAuth 2.1 (automatic) | Add URL in Claude Settings |
-| **stdio** | Claude Code (local) | None (trusts local user) | `.mcp.json` at project root |
+| **stdio** (recommended for Claude Code) | Claude Code (local) | None (trusts local user) | `.mcp.json` at project root |
+| **Claude Connector** | claude.ai, Claude Desktop, Claude mobile | OAuth 2.1 (automatic) | Self-host a gateway (or use dbtrail's hosted one), add its URL in Claude Settings |
 | **proxy.py** (legacy) | Claude Desktop only | None (trusts local user) | Edit `claude_desktop_config.json` |
 
-### Claude Connector (recommended — for claude.ai, Desktop, and mobile)
+For Claude Code on the same machine as your index, **stdio** is the zero-infrastructure path — start there. The **Claude Connector** reaches the index from claude.ai / Claude Desktop / mobile over the network, and needs an MCP Gateway in front (which you self-host, or which dbtrail operates for managed-service customers).
 
-The easiest way to connect Claude to dbtrail. Requires the [MCP Gateway](./mcp-gateway.md) running at a public URL.
-
-1. Open **claude.ai** → **Settings** → **Integrations**
-2. Click **Add custom integration**
-3. Enter the gateway URL: `https://mcp.dbtrail.com/mcp`
-4. Claude auto-discovers the OAuth endpoints, opens the login page
-5. Enter your **tenant ID** and click **Authorize**
-6. Done — the `query`, `recover`, `status`, and `list_schema_changes` tools are now available
-
-This works from the Claude web app, Claude Desktop, and Claude mobile. Token refresh happens automatically — sessions survive indefinitely without re-authenticating.
-
-For setup and deployment of the gateway itself, see [MCP Gateway docs](./mcp-gateway.md). For a comprehensive integration testing checklist, see [Connector Testing](./connector-testing.md).
-
-### stdio (default — for Claude Code)
+### stdio (recommended — for Claude Code)
 
 When started without flags, `bintrail-mcp` communicates over `stdin`/`stdout` using newline-delimited JSON-RPC. This is the MCP stdio transport.
 
@@ -201,6 +85,26 @@ export BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index'
 # Now ask Claude: "What got deleted in the orders table today?"
 ```
 
+### Claude Connector (for claude.ai, Desktop, and mobile)
+
+This reaches your index over the network through an **MCP Gateway** — the OAuth front door whose source lives in `cmd/mcp-gateway`. There are two ways to have one:
+
+- **Self-host it (open source).** Build and run `cmd/mcp-gateway` on your own infrastructure and public domain. This is fully doable with this repo alone — see the [MCP Gateway docs](./mcp-gateway.md).
+- **Use dbtrail's hosted gateway (managed-service customers).** dbtrail operates one at `https://mcp.dbtrail.com/mcp` and provisions your tenant. This requires a dbtrail account — the open-source repo does **not** give you access to it; it is the managed offering.
+
+Once a gateway is reachable at a public URL:
+
+1. Open **claude.ai** → **Settings** → **Integrations**
+2. Click **Add custom integration**
+3. Enter the gateway URL — your self-hosted domain (e.g. `https://mcp.example.com/mcp`) or, if you are a managed-service customer, `https://mcp.dbtrail.com/mcp`
+4. Claude auto-discovers the OAuth endpoints, opens the login page
+5. Enter your **tenant ID** and click **Authorize**
+6. Done — the `query`, `recover`, `status`, and `list_schema_changes` tools are now available
+
+This works from the Claude web app, Claude Desktop, and Claude mobile. Token refresh happens automatically — sessions survive indefinitely without re-authenticating.
+
+For setup and deployment of the gateway itself, see [MCP Gateway docs](./mcp-gateway.md). For a comprehensive integration testing checklist, see [Connector Testing](./connector-testing.md).
+
 ### HTTP (for remote access — Claude Desktop)
 
 ```sh
@@ -208,24 +112,13 @@ BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index' \
   bintrail-mcp --http :8080
 ```
 
-HTTP mode starts a persistent HTTP server using the MCP Streamable HTTP spec (2025-03-26). It serves at `/mcp`. Each incoming HTTP connection gets a fresh `newServer()` instance; the SDK manages session state via the `Mcp-Session-Id` response header.
-
-```go
-// cmd/bintrail-mcp/main.go
-handler := mcp.NewStreamableHTTPHandler(
-    func(_ *http.Request) *mcp.Server { return newServer() },
-    nil,
-)
-mux.Handle("/mcp", handler)
-```
-
-This is useful when Claude Desktop runs on your laptop but the bintrail server runs on a remote machine.
+HTTP mode starts a persistent HTTP server using the MCP Streamable HTTP spec (2025-03-26). It serves at `/mcp`; the SDK manages session state via the `Mcp-Session-Id` response header. This is useful when Claude Desktop runs on your laptop but the bintrail server runs on a remote machine.
 
 ---
 
 ## `proxy.py`: Legacy Bridge for Claude Desktop
 
-> **Note:** For new setups, use the [Claude Connector](#claude-connector-recommended--for-claudeai-desktop-and-mobile) method instead — it's simpler, works from more clients, and supports OAuth. `proxy.py` is still available as a fallback for environments that can't use the gateway.
+> **Note:** For new setups, use the [Claude Connector](#claude-connector-for-claudeai-desktop-and-mobile) method instead — it's simpler, works from more clients, and supports OAuth. `proxy.py` is still available as a fallback for environments that can't use the gateway.
 
 `proxy.py` bridges Claude Desktop (which speaks stdio) to a remote `bintrail-mcp --http` server:
 
@@ -279,15 +172,3 @@ Claude Desktop  →  proxy.py (stdio, runs locally)  →  bintrail-mcp --http :8
 When `bintrail-mcp --http` restarts, all existing sessions are invalidated. But `proxy.py` (started as a subprocess by Claude Desktop) holds the old `Mcp-Session-Id` in memory. Subsequent tool calls fail with validation errors.
 
 **Fix**: Restart Claude Desktop. This kills and restarts the proxy process, clearing the stale session ID. No restart of the HTTP server is needed — just Claude Desktop.
-
----
-
-## `jsonschema` Tag Format
-
-The tool argument structs use struct tags to describe parameters to the MCP framework. The correct format for `jsonschema-go v0.3+` is a plain description string:
-
-```go
-IndexDSN string `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
-```
-
-The old `key=value` format (`jsonschema:"description=..."`) is rejected at runtime with a panic inside `mcp.AddTool()`. The panic happens at construction time (when the server starts), not when the tool is called — so a wrong tag format would cause the server to fail immediately on startup.

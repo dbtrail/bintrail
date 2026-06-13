@@ -6,7 +6,7 @@ This walkthrough takes you from zero to running a working time-travel query agai
 SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
 ```
 
-The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a subcommand of the `bintrail` binary) that intercepts the virtual `_flashback`, `_diff`, and `_snapshot` schemas and resolves them against your dbtrail index plus any rotated archives (local directory or `s3://` prefix). ProxySQL sits in front of both your real MySQL and the shim, routing each query to the right backend. The setup is the same whether you populate the index with `bintrail stream` (hosted) or `bintrail agent` (BYOS) — the shim only cares that the index exists and `archive_state` is current.
+The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a subcommand of the `bintrail` binary) that intercepts the virtual `_flashback`, `_diff`, and `_snapshot` schemas and resolves them against your dbtrail index plus any rotated archives (local directory or `s3://` prefix). ProxySQL sits in front of both your real MySQL and the shim, routing each query to the right backend. The shim only cares that the index exists and `archive_state` is current — whatever keeps `binlog_events` populated (typically `bintrail stream`).
 
 ```
 ┌─────────────┐     :6033       ┌──────────┐    real query     ┌────────────┐
@@ -27,7 +27,7 @@ The whole walkthrough takes about 10 minutes on a fresh Ubuntu 22.04 or Amazon L
 
 Before starting, you need:
 
-- **A populated dbtrail index.** Some process is keeping `binlog_events` current — typically `bintrail stream` (hosted) or `bintrail agent` (BYOS). If rotated hours have been archived, `archive_state` points at the local directory or `s3://` prefix where the Parquet files live. If you haven't set any of this up yet, see [`docs/streaming.md`](streaming.md) and [`docs/rotation-and-status.md`](rotation-and-status.md).
+- **A populated dbtrail index.** Some process is keeping `binlog_events` current — typically `bintrail stream`. If rotated hours have been archived, `archive_state` points at the local directory or `s3://` prefix where the Parquet files live. If you haven't set any of this up yet, see [`docs/streaming.md`](streaming.md) and [`docs/rotation-and-status.md`](rotation-and-status.md).
 - **A `.bintrail.env` file** with `BINTRAIL_SOURCE_DSN`, `BINTRAIL_INDEX_DSN`, and `BINTRAIL_SERVER_ID` set. `bintrail config init` scaffolds one.
 - **The `bintrail` binary** on the host. The shim is a subcommand — there is no second binary to download.
 - **Root or `sudo` access** on the host.
@@ -181,7 +181,7 @@ ExecStart=/usr/local/bin/bintrail shim --shim-config /etc/bintrail/shim.yaml --a
 
 Requires ProxySQL **2.7+** between the application and the shim — the LTS 2.6 line isn't verified to negotiate SHA2 against backends, so operators on 2.6 keep the default (`mysql_native_password`). The application user used by ProxySQL must match the chosen scheme: `IDENTIFIED WITH mysql_native_password BY '<password>'` for the default path, `IDENTIFIED WITH caching_sha2_password BY '<password>'` for the opt-in. `sha256_password` is also accepted by `--auth-method` if your environment requires it. The same 2.7+ requirement applies when ProxySQL fronts an **8.4 source** directly (its `caching_sha2_password` backend), set via `proxysql-config --backend-auth-plugin caching_sha2_password`.
 
-> **dbtrail's own connections to MySQL 8.4 need no auth flag.** The ProxySQL requirement above is only about ProxySQL negotiating `caching_sha2_password` to a backend. dbtrail's *index* connection (`--index-dsn`, go-sql-driver) and its *source replication* handshake (`bintrail stream`/`up`, go-mysql) both complete `caching_sha2_password` over a plaintext network on their own — the driver retrieves the server's public key for cold-cache full auth, with no flag, no TLS, and no ProxySQL in the path. This is what the bundled MySQL 8.4 index uses by default; CI exercises it against both 8.0 and 8.4.
+> **dbtrail's own connections to MySQL 8.4 need no auth flag.** The ProxySQL requirement above is only about ProxySQL negotiating `caching_sha2_password` to a backend. dbtrail's *index* connection (`--index-dsn`) and its *source replication* handshake (`bintrail stream`/`up`) both complete `caching_sha2_password` over a plaintext network on their own — with no flag, no TLS, and no ProxySQL in the path. This is what the bundled MySQL 8.4 index uses by default.
 
 Enable and start:
 
@@ -292,7 +292,7 @@ bintrail proxysql-config --out proxysql-setup.sql
 mysql -u admin -p -h 127.0.0.1 -P 6032 < proxysql-setup.sql
 ```
 
-If the username comes through but the connection still fails, check `bintrail shim`'s log: it logs which usernames are in the allowlist at startup, and a connection from an unknown username is rejected by `TenantAuth.CheckUsername`.
+If the username comes through but the connection still fails, check `bintrail shim`'s log: it logs which usernames are in the allowlist at startup, and a connection from an unknown username is rejected.
 
 ### `_flashback.t doesn't exist` (or query goes to MySQL instead of the shim)
 
@@ -335,13 +335,13 @@ Three causes produce an empty `_flashback` / `_snapshot` resultset:
 2. The latest event at-or-before the timestamp is a DELETE — the row did not exist at AS OF (Oracle `AS OF` semantic; matches the full-table path).
 3. A coverage gap or archive-fetch failure under `--allow-gaps`. Without that flag the shim returns a typed MySQL error instead — `ER_NO_PARTITION_FOR_GIVEN_VALUE` (1526) for coverage gaps, `ER_UNKNOWN_ERROR` (1105) for archive-fetch failures — so on the default strict configuration the empty resultset never indicates a gap or an archive outage.
 
-To distinguish cases 1 and 2, query `_diff` for the per-PK history: it returns every event (including the DELETE's `row_before`), so a row that was deleted produces at least one row in the diff resultset while a row that never existed produces zero. Or check the agent is keeping up:
+To distinguish cases 1 and 2, query `_diff` for the per-PK history: it returns every event (including the DELETE's `row_before`), so a row that was deleted produces at least one row in the diff resultset while a row that never existed produces zero. Or check the indexer is keeping up:
 
 ```sh
-journalctl -u bintrail-agent -n 200
+journalctl -u bintrail-stream -n 200
 ```
 
-The dbtrail index retains the most recent hours via partition rotation; older data is in S3 (auto-discovered via `archive_state`). See [`docs/storage.md`](storage.md) for the buffer query priority and S3 flush cadence.
+The dbtrail index retains the most recent hours via partition rotation; older data is in S3 (auto-discovered via `archive_state`). See [`docs/rotation-and-status.md`](rotation-and-status.md) for rotation and archive cadence.
 
 ### Operator already has users in hostgroup 990
 

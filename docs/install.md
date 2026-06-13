@@ -97,17 +97,11 @@ evaluation-only container:
 docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-demo
 ```
 
-Wait for the banner, give the traffic a minute to build history, then:
-
-```sh
-mysql -h 127.0.0.1 -P 6033 -u demo -pdemo demo \
-  -e "SELECT * FROM orders WHERE id = 1 AS OF '1 minute ago'"
-```
-
-…returns the row as it was a minute ago. Stateless and for evaluation only;
-amd64-only (it runs under emulation on Apple Silicon — the main bintrail
-image is multi-arch); see [demo.md](./demo.md) for what's inside
-and more queries to try.
+Wait for the banner, give the traffic a minute to build history, then query a
+row "as of" a minute ago over port 6033. The full walkthrough, credentials,
+and more queries are in [demo.md](./demo.md). (Stateless, evaluation-only,
+amd64-only — runs under emulation on Apple Silicon; the main bintrail image is
+multi-arch.)
 
 ## Docker image (without Compose)
 
@@ -189,21 +183,9 @@ auto-derives a unique `server-id` from your source DSN. Want the web UI in
 the same process? Run `bintrail-console watch` (same flags) instead — it is
 `up` plus the console and the multi-server control plane.
 
-Once it's running, query and recover:
-
-```sh
-# Search the index
-bintrail query \
-  --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --schema mydb --table orders --pk 12345
-
-# Generate reversal SQL
-bintrail recover \
-  --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --schema mydb --table orders --event-type DELETE \
-  --since "2026-02-19 14:00:00" --until "2026-02-19 14:05:00" \
-  --output recovery.sql
-```
+Once it's running, the [Quickstart](quickstart.md) covers querying the index
+and generating reversal SQL (`bintrail query` / `bintrail recover`) with worked
+examples.
 
 > **Managed MySQL (RDS, Aurora, Cloud SQL)?** `bintrail up` connects over the
 > replication protocol — no disk access to binlogs required. See
@@ -266,18 +248,3 @@ All commands accept `--log-level` (default `info`) and `--log-format`
 The web console lives in the separate `bintrail-console` binary —
 `serve` (read-only UI over an index) and `watch` (stream + console +
 control plane in one daemon). See [console.md](./console.md).
-
-## Appendix: agent exit codes
-
-`bintrail agent` uses distinct process exit codes so a supervisor (e.g.
-systemd) can distinguish permanent failures from transient ones:
-
-| Code | Meaning | Supervisor action |
-|---|---|---|
-| 0 | Clean shutdown (SIGTERM/SIGINT) | — |
-| 64 | Fatal auth/config error (missing, invalid, or revoked API key; wrong tenant mode) | Fix credentials, restart manually |
-| 65 | Rate-limited by the server | Contact support before restarting |
-| 1 | Transient/unknown error | Safe to respawn (default systemd behavior) |
-
-For systemd, add `RestartPreventExitStatus=64 65` to the service unit so the
-agent is not respawned on permanent failures.

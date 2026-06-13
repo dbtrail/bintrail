@@ -19,7 +19,7 @@ You, in Claude (web/desktop/mobile)
     │
     │  "What happened to user 42 today?"
     ▼
-Claude calls https://mcp.dbtrail.com/mcp
+Claude calls https://mcp.example.com/mcp
     │
     │  OAuth token (proves who you are)
     ▼
@@ -71,7 +71,7 @@ This will fail with a DynamoDB error because there's no AWS credentials. For loc
    ```sh
    docker run -p 8000:8000 amazon/dynamodb-local
    ```
-   Then set `AWS_ENDPOINT_URL=http://localhost:8000` and create the tables (see [DynamoDB Tables](#3-dynamodb-tables) below).
+   Then set `AWS_ENDPOINT_URL=http://localhost:8000` and create the tables (see [DynamoDB Tables](#4-dynamodb-tables) below).
 
 2. **Use a real AWS account** — just make sure `aws configure` works and create the tables in your account.
 
@@ -102,7 +102,7 @@ This is the full setup for running the gateway as a public service.
 #### What You Need
 
 - An AWS account
-- A domain name (the guide uses `mcp.dbtrail.com` — replace with yours)
+- A domain name (the guide uses `mcp.example.com` — replace with yours)
 - One or more `bintrail-mcp` backends already running (each with its own MySQL index)
 
 #### Architecture
@@ -113,7 +113,7 @@ Internet (claude.ai, Claude Desktop, Claude mobile)
          │  HTTPS
          ▼
 ┌─────────────────────┐
-│    Route 53         │  mcp.dbtrail.com → ALB
+│    Route 53         │  mcp.example.com → ALB
 └────────┬────────────┘
          ▼
 ┌─────────────────────┐
@@ -141,7 +141,7 @@ You need an HTTPS certificate for the ALB. AWS gives you one for free:
 
 ```sh
 aws acm request-certificate \
-  --domain-name mcp.dbtrail.com \
+  --domain-name mcp.example.com \
   --validation-method DNS \
   --region us-east-1
 ```
@@ -157,7 +157,7 @@ aws acm describe-certificate \
 
 Add that CNAME record to Route 53 (or your DNS provider). Wait a few minutes. The certificate status will change from `PENDING_VALIDATION` to `ISSUED`.
 
-**Already have a `*.dbtrail.com` wildcard cert?** Skip this step and use that ARN.
+**Already have a wildcard cert for your domain?** Skip this step and use that ARN.
 
 ### 2. Load Balancer (ALB)
 
@@ -298,7 +298,7 @@ aws elbv2 create-listener \
 
 The `--ssl-policy` enables TLS 1.3 and 1.2. This is the recommended policy for new ALBs — it disables older protocols like TLS 1.0 and 1.1.
 
-Optionally, add an HTTP listener that redirects to HTTPS (so `http://mcp.dbtrail.com` → `https://mcp.dbtrail.com`):
+Optionally, add an HTTP listener that redirects to HTTPS (so `http://mcp.example.com` → `https://mcp.example.com`):
 
 ```sh
 aws elbv2 create-listener \
@@ -363,7 +363,7 @@ aws elbv2 describe-load-balancers \
   --output table
 ```
 
-Create an A record (alias type) for `mcp.dbtrail.com`:
+Create an A record (alias type) for `mcp.example.com`:
 
 ```sh
 aws route53 change-resource-record-sets \
@@ -372,7 +372,7 @@ aws route53 change-resource-record-sets \
     "Changes": [{
       "Action": "UPSERT",
       "ResourceRecordSet": {
-        "Name": "mcp.dbtrail.com",
+        "Name": "mcp.example.com",
         "Type": "A",
         "AliasTarget": {
           "HostedZoneId": "<ALB_HOSTED_ZONE_ID>",
@@ -392,10 +392,10 @@ Verify DNS is working:
 
 ```sh
 # Should resolve to the ALB's IP addresses (may take a few minutes to propagate)
-dig mcp.dbtrail.com
+dig mcp.example.com
 
 # Should return the gateway health response
-curl https://mcp.dbtrail.com/health
+curl https://mcp.example.com/health
 ```
 
 ### 4. DynamoDB Tables
@@ -606,7 +606,7 @@ Run it:
 ```sh
 ./mcp-gateway \
   --addr :8443 \
-  --issuer https://mcp.dbtrail.com \
+  --issuer https://mcp.example.com \
   --allowed-origins "https://claude.ai,https://claude.com" \
   --table-prefix bintrail-oauth \
   --backend-url http://10.0.1.100:8080
@@ -615,7 +615,7 @@ Run it:
 | Flag | What it does | Default | Example |
 |---|---|---|---|
 | `--addr` | Port the gateway listens on | `:8443` | `:8443` |
-| `--issuer` | Your public URL (used in OAuth metadata) | `https://mcp.dbtrail.com` | `https://mcp.dbtrail.com` |
+| `--issuer` | Your public URL (used in OAuth metadata) | `https://mcp.example.com` | `https://mcp.example.com` |
 | `--allowed-origins` | Which browser origins can call the gateway | `https://claude.ai,https://claude.com` | `https://claude.ai,https://claude.com` |
 | `--table-prefix` | DynamoDB table name prefix | `bintrail-oauth` | `bintrail-oauth` |
 | `--backend-url` | Default backend for tenants without their own | (none) | `http://10.0.1.100:8080` |
@@ -647,20 +647,20 @@ Run it:
 
 ```sh
 # 1. OAuth metadata discovery (should return JSON with all the endpoints)
-curl https://mcp.dbtrail.com/.well-known/oauth-authorization-server | jq .
+curl https://mcp.example.com/.well-known/oauth-authorization-server | jq .
 
 # 2. Health check (now includes backend health status)
-curl https://mcp.dbtrail.com/health | jq .
+curl https://mcp.example.com/health | jq .
 # → {"status":"ok","version":"v1.2.3","backends":{"http://10.0.1.100:8080":true}}
 
 # 3. Register a test client
-curl -X POST https://mcp.dbtrail.com/oauth/register \
+curl -X POST https://mcp.example.com/oauth/register \
   -H 'Content-Type: application/json' \
   -d '{"client_name":"test","redirect_uris":["http://localhost:3000/callback"]}'
 # → {"client_id":"...","client_secret":"...","client_name":"test",...}
 
 # 4. CORS preflight (should return 204 with CORS headers)
-curl -i -X OPTIONS https://mcp.dbtrail.com/mcp \
+curl -i -X OPTIONS https://mcp.example.com/mcp \
   -H 'Origin: https://claude.ai' \
   -H 'Access-Control-Request-Method: POST'
 # → Access-Control-Allow-Origin: https://claude.ai
@@ -676,7 +676,7 @@ This is the easy part. Once the gateway is running:
 
 1. Go to **claude.ai** > **Settings** > **Connectors**
 2. Click **Add custom connector**
-3. Enter the URL: `https://mcp.dbtrail.com/mcp`
+3. Enter the URL: `https://mcp.example.com/mcp`
 4. Claude auto-discovers the OAuth endpoints, registers itself, and opens a login page
 5. Enter your **tenant ID** (e.g. `acme-corp`) on the authorization page
 6. Done. Claude now has access to the `query`, `recover`, `status`, and `list_schema_changes` tools.
@@ -689,90 +689,9 @@ From now on, you can ask Claude things like:
 
 ---
 
-## How the OAuth Flow Works
-
-You don't need to understand this to use the gateway, but here's what happens under the hood when Claude connects:
-
-```
-1. Claude discovers endpoints
-   GET /.well-known/oauth-authorization-server
-   ← {authorization_endpoint, token_endpoint, registration_endpoint, ...}
-
-2. Claude registers itself (one-time, per device)
-   POST /oauth/register
-   → {client_name: "Claude", redirect_uris: ["https://claude.ai/..."]}
-   ← {client_id: "abc", client_secret: "xyz"}
-
-3. Claude opens the authorization page in your browser
-   GET /oauth/authorize?client_id=abc&redirect_uri=...&code_challenge=...&code_challenge_method=S256
-   ← HTML page: "Enter your Bintrail tenant ID"
-
-4. You submit your tenant ID
-   POST /oauth/authorize
-   → {tenant_id: "acme-corp", ...}
-   ← 302 redirect to Claude with an authorization code
-
-5. Claude exchanges the code for tokens
-   POST /oauth/token
-   → {grant_type: "authorization_code", code: "...", code_verifier: "...", client_secret: "..."}
-   ← {access_token: "...", refresh_token: "...", expires_in: 3600}
-
-6. Claude calls tools using the access token
-   POST /mcp (Authorization: Bearer <access_token>)
-   → gateway validates token → resolves tenant → proxies to backend → returns results
-
-7. When the access token expires (1 hour), Claude refreshes it
-   POST /oauth/token
-   → {grant_type: "refresh_token", refresh_token: "...", client_secret: "..."}
-   ← {access_token: "new-token", refresh_token: "new-refresh-token", ...}
-```
-
-PKCE (S256) prevents authorization code interception. Refresh tokens are single-use (rotated on every refresh). Access tokens are stored as SHA-256 hashes in DynamoDB — even if someone reads the database, they can't forge tokens.
-
----
-
 ## How Tenant Routing Works (The Full Picture)
 
 This section explains exactly what happens when a request arrives, from start to finish. You don't need to understand this to use the gateway, but it helps when debugging.
-
-### The Request Journey
-
-```
-1. Claude sends:  POST /mcp  (Authorization: Bearer <token>)
-                       │
-2. OriginMiddleware:   Is the Origin header from an allowed site?
-                       │  (claude.ai ✓, evil-site.com ✗, no Origin ✓)
-                       │
-3. CORSMiddleware:     Add Access-Control-Allow-Origin headers for browsers.
-                       │
-4. AuthMiddleware:     Validate the Bearer token.
-                       │
-                       ├── SHA-256(token) → look up in DynamoDB tokens table
-                       ├── Token expired? → 401 Unauthorized
-                       ├── Token valid → get tenant_id from the token record
-                       ├── Look up tenant in DynamoDB tenants table
-                       └── Tenant active? → inject into request context
-                                           Tenant suspended? → 403 Forbidden
-                       │
-5. ReverseProxy:       Route to the right backend.
-                       │
-                       ├── Does the tenant have a backend_url? Use it.
-                       │   (e.g. paid tenant → http://10.0.1.5:8080/mcp)
-                       │
-                       ├── No backend_url? Use the --backend-url default.
-                       │   (e.g. free tenant → http://10.0.1.100:8080/mcp)
-                       │
-                       ├── Is the backend healthy? (health checker says yes/no)
-                       │   Unhealthy → 502 "backend is currently unhealthy"
-                       │
-                       ├── Add X-Bintrail-Tenant: <tenant_id> header
-                       │   (so shared backends know which database to query)
-                       │
-                       ├── Strip the Authorization header
-                       │   (backend doesn't need the OAuth token)
-                       │
-                       └── Forward the request → return the response
-```
 
 ### Paid vs Free Tier Routing
 
@@ -910,4 +829,4 @@ The gateway replaces the need for `proxy.py`. But if you prefer running everythi
 | Auth | OAuth 2.1 (automatic) | None (trusts local user) |
 | Requires | AWS infrastructure | Python 3.7+ on your machine |
 
-For proxy.py setup, see [MCP Server docs](./mcp-server.md#proxypy-bridging-claude-desktop-to-remote-http).
+For proxy.py setup, see [MCP Server docs](./mcp-server.md#proxypy-legacy-bridge-for-claude-desktop).

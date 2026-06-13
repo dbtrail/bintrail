@@ -525,10 +525,3 @@ the reconstruct endpoint fails loudly instead, see above):
 
 In both cases you get results without a coverage caveat in the response. Watch
 the server log when running with archives configured.
-
-## Build
-
-The frontend is vanilla HTML/CSS/JS with **zero third-party assets** (see
-`internal/console/assets/VENDOR.md`) and is embedded via `//go:embed`. There is
-no Node build step; `make build` (CGO, required for DuckDB) produces a single
-self-contained binary.

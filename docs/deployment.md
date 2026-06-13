@@ -47,61 +47,6 @@ On-demand (DBA workstation):
 | `bintrail query` / `recover` | DBA tools; read from index | On-demand |
 | `bintrail rotate` | Drops old partitions; adds future ones | Scheduled (hourly or daily cron) |
 
-### BYOS architecture
-
-In BYOS (Bring Your Own Storage) mode, the customer provides an EC2 instance and S3 bucket. Row-level data never leaves the customer's infrastructure.
-
-```
-Customer EC2                                 dbtrail EC2 (dedicated)
-┌────────────────────────────┐              ┌─────────────────────────┐
-│                            │              │                         │
-│  ┌──────────────────────┐  │   WebSocket  │  ┌───────────────────┐  │
-│  │  bintrail agent      │──┼──────────────┼─►│  dbtrail service  │  │
-│  │  (stream + commands) │  │              │  └─────────┬─────────┘  │
-│  └──────────┬───────────┘  │              │            │            │
-│             │ replication  │              │  ┌─────────▼─────────┐  │
-│  ┌──────────▼───────────┐  │              │  │  Index MySQL      │  │
-│  │  Source MySQL        │  │              │  │  (metadata only:  │  │
-│  │  (customer data)     │  │              │  │   pk_hash, schema │  │
-│  └──────────────────────┘  │              │  │   timestamps)     │  │
-│                            │              │  └───────────────────┘  │
-│  ┌──────────────────────┐  │              │                         │
-│  │  In-memory buffer    │  │              └─────────────────────────┘
-│  │  (recent events)     │  │
-│  └──────────┬───────────┘  │
-│             │ Parquet      │
-│  ┌──────────▼───────────┐  │
-│  │  Customer S3 bucket  │  │
-│  │  (full event data)   │  │
-│  └──────────────────────┘  │
-│                            │
-└────────────────────────────┘
-```
-
-| Component | Location | Data |
-|-----------|----------|------|
-| Source MySQL | Customer EC2 | Customer's production data |
-| `bintrail agent` | Customer EC2 | Streams binlogs + handles dbtrail commands |
-| In-memory buffer | Customer EC2 | Last N hours of full event data |
-| Customer S3 | Customer AWS | Parquet files with pk_values, row data |
-| Index MySQL | dbtrail EC2 | Metadata only: pk_hash, timestamps, schema |
-| dbtrail service | dbtrail EC2 | Sends resolve_pk / recover commands |
-
-The agent runs as a single process combining streaming and command handling. Start it with:
-
-```bash
-bintrail agent \
-  --api-key "ak_..." \
-  --endpoint "wss://api.dbtrail.io/v1/agent" \
-  --source-dsn "user:pass@tcp(localhost:3306)/mydb" \
-  --server-id 99999 \
-  --buffer-retain "6h"
-```
-
-> **systemd is required for the agent.** The agent's WebSocket reconnect loop will give up after `--max-reconnect-attempts` consecutive failures (default 10) and exit with a non-zero status. This is intentional: it lets a process supervisor respawn the entire process so the WebSocket state machine restarts cleanly, instead of the in-process loop spinning silently while the dashboard sees the agent as offline. The shipped unit at `deploy/bintrail-agent.service` already sets `Restart=on-failure` and `RestartSec=10s`. If you run the agent under a different supervisor, configure equivalent restart-on-failure behavior.
-
-See `docs/storage.md` for details on the buffer, query priority, and configuration.
-
 ## 2. Source MySQL Requirements
 
 ### Version and configuration
@@ -117,14 +62,7 @@ See `docs/storage.md` for details on the buffer, query priority, and configurati
 
 ### Replication user
 
-```sql
-CREATE USER 'bintrail'@'%' IDENTIFIED BY 'strong-password';
-GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'bintrail'@'%';
-GRANT SELECT ON *.* TO 'bintrail'@'%';  -- needed for bintrail snapshot
-FLUSH PRIVILEGES;
-```
-
-The `SELECT` grant is only needed during `bintrail snapshot`. If you prefer minimal ongoing permissions, grant `SELECT` temporarily for the snapshot, then revoke it.
+`bintrail` connects to the source as a replication client. The required grants (`REPLICATION SLAVE`, `REPLICATION CLIENT`, plus `SELECT` only during `bintrail snapshot`) and the minimal-permissions guidance are in [streaming.md → The Source MySQL User](streaming.md#the-source-mysql-user).
 
 ### Managed MySQL (RDS / Aurora / Cloud SQL)
 
@@ -150,13 +88,7 @@ Run the index database on a separate MySQL instance from the source. This provid
 
 ### Sizing
 
-Expect roughly **1.2–1.6 KB per indexed event** for a typical ~15-column OLTP row (INSERT/DELETE ≈ 1.2 KB, UPDATE ≈ 1.6 KB — an UPDATE stores both the before and after row images), measured with all indexes included. Narrow rows run ~0.9 KB; wide or update-heavy workloads run several times higher.
-
-```
-required_storage_GB = daily_events × retain_days × avg_event_bytes / 1e9
-```
-
-For the full model — measured per-event-type sizes, worked examples, retention and Parquet-tiering math, multi-source sizing, and monitoring — see [Capacity Planning](./capacity.md).
+Budget roughly **1.2–1.6 KB per indexed event** (INSERT/DELETE ≈ 1.2 KB, UPDATE ≈ 1.6 KB — an UPDATE stores both row images); narrow rows ~0.9 KB, wide/update-heavy several times higher. The full model — the `daily_events × retain_days × avg_event_bytes` formula, measured per-event-type sizes, worked examples, retention/Parquet-tiering math, multi-source sizing, and monitoring — is in [Capacity Planning](capacity.md).
 
 ### InnoDB tuning
 
@@ -258,7 +190,7 @@ journalctl -u bintrail-stream -f
 
 ### Docker
 
-The demo `compose.yml` is a working example. For production, adjust:
+[docker.md](docker.md) is the canonical home for the image, `docker run`, and the compose stack. For production, harden that base:
 - Use Docker secrets or environment files instead of inline credentials
 - Pin image versions (`FROM golang:1.25.7-alpine` in your Dockerfile)
 - Mount a named volume for any persistent state (the index MySQL is the real persistent state — dbtrail itself is stateless)
@@ -339,37 +271,15 @@ spec:
 
 ## 6. Initial Setup Procedure
 
-```bash
-# 1. Provision the index database (run once)
-bintrail init \
-    --index-dsn "$INDEX_DSN" \
-    --partitions 30          # 30 hourly partitions + p_future
+Bring-up order (the [Quickstart](quickstart.md) shows `init`/`snapshot` with expected output):
 
-# 2. Snapshot current schema (run once per schema change after this)
-bintrail snapshot \
-    --source-dsn "$SOURCE_DSN" \
-    --index-dsn  "$INDEX_DSN" \
-    --schemas    "myapp"
+1. `bintrail init` — provision the index database (**run once**; `--partitions 30` for 30 hourly partitions + `p_future`).
+2. `bintrail snapshot` — capture schema metadata (**re-run after every schema change**).
+3. Note the starting position (`SELECT @@global.gtid_executed` on the source) — optional, since `stream` auto-discovers the current head when `--start-gtid` is omitted.
+4. Start `bintrail stream` — the systemd unit in [§5](#5-deployment-options) is the production form.
+5. `bintrail status --index-dsn "$INDEX_DSN"` to verify.
 
-# 3. Capture current GTID position (start streaming from here)
-mysql -h source-host -u bintrail -p -e "SELECT @@global.gtid_executed\G"
-# → e.g. "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-12345"
-
-# 4. Start streaming
-bintrail stream \
-    --index-dsn  "$INDEX_DSN" \
-    --source-dsn "$SOURCE_DSN" \
-    --server-id  "1234" \
-    --start-gtid "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-12345" \
-    --schemas    "myapp" \
-    --metrics-addr ":9090" \
-    --log-format json
-
-# 5. Verify with status
-bintrail status --index-dsn "$INDEX_DSN"
-```
-
-After the first successful checkpoint, restart without `--start-gtid` — the position is persisted in `stream_state` and will be used automatically.
+After the first successful checkpoint, restart without `--start-gtid` — the position is persisted in `stream_state` and used automatically.
 
 ## 7. Observability
 
@@ -470,20 +380,7 @@ Key log fields emitted by bintrail commands:
 
 ## 8. Partition Rotation
 
-Add a hourly cron job or systemd timer:
-
-```bash
-# /etc/cron.d/bintrail-rotate
-0 * * * * bintrail /usr/local/bin/bintrail rotate \
-    --index-dsn "$INDEX_DSN" \
-    --retain 30d \
-    --add-future 3 \
-    --log-format json >> /var/log/bintrail-rotate.log 2>&1
-```
-
-`--retain 30d` drops partitions older than 30 days. `--add-future 3` ensures at least 3 future hourly partitions exist beyond the current hour (prevents the catch-all `p_future` from accumulating all new events).
-
-Monitor the `p_future` row count via `bintrail status` — a growing `p_future` means rotation isn't running.
+Run `bintrail rotate` hourly (cron or systemd timer) so old partitions are dropped and future ones stay provisioned — otherwise the catch-all `p_future` accumulates every new event. The cron/timer setup, the `--retain`/`--add-future` semantics, and monitoring `p_future` via `bintrail status` are in [rotation-and-status.md → Automating Rotation](rotation-and-status.md#automating-rotation). (`bintrail up`/`bintrail-console watch` also run this loop built-in.)
 
 ## 9. Security
 
@@ -503,6 +400,8 @@ Append `?tls=true` (or `?tls=skip-verify` for self-signed certs in dev) to both 
 INDEX_DSN="bintrail:password@tcp(index-mysql:3306)/bintrail_index?tls=true"
 SOURCE_DSN="bintrail:password@tcp(source-mysql:3306)/?tls=true"
 ```
+
+For richer **source** TLS on `bintrail stream` — CA verification or mutual TLS — use the dedicated `--ssl-mode`/`--ssl-ca`/`--ssl-cert`/`--ssl-key` flags instead of the DSN parameter; see [streaming.md → TLS/SSL for managed MySQL](streaming.md#tlsssl-for-managed-mysql-rds-aurora-cloud-sql).
 
 ### Metrics endpoint security
 

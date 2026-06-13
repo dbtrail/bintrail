@@ -8,7 +8,7 @@ This is a step-by-step guide for manually testing the dbtrail Claude Connector b
 
 Before you start, you need:
 
-- [ ] The MCP gateway running at `https://mcp.dbtrail.com` (or your domain)
+- [ ] The MCP gateway running at `https://mcp.example.com` (or your domain)
 - [ ] At least one `bintrail-mcp` backend running with indexed data
 - [ ] Two test tenants provisioned (e.g. `tenant-a` and `tenant-b`) — see [gateway docs](./mcp-gateway.md#5-add-your-tenants)
 - [ ] A Claude Pro/Team account (for claude.ai and mobile testing)
@@ -26,18 +26,18 @@ Before you start, you need:
 2. Click your profile icon (bottom-left) → **Settings**
 3. Click **Integrations** in the left sidebar (may also be called **Connectors** depending on your version)
 4. Click **Add custom integration** (or **Add custom connector**)
-5. In the URL field, enter: `https://mcp.dbtrail.com/mcp`
+5. In the URL field, enter: `https://mcp.example.com/mcp`
 6. Click **Add** (or **Save**)
 
-**What should happen:** Claude discovers the OAuth endpoints automatically (via `/.well-known/oauth-authorization-server`), opens a browser tab to the dbtrail authorization page.
+**What should happen:** Claude discovers the OAuth endpoints automatically (via `/.well-known/oauth-authorization-server`), opens a browser tab to the gateway's authorization page.
 
 **If it fails:**
-- Check that `https://mcp.dbtrail.com/.well-known/oauth-authorization-server` returns JSON in your browser
+- Check that `https://mcp.example.com/.well-known/oauth-authorization-server` returns JSON in your browser
 - Check the gateway logs for errors
 
 ### 1.2 Complete the OAuth Flow
 
-1. On the dbtrail authorization page, enter your **tenant ID** (e.g. `tenant-a`)
+1. On the gateway's authorization page, enter your **tenant ID** (e.g. `tenant-a`)
 2. Click **Authorize**
 
 **What should happen:** The page redirects back to Claude. The connector shows as "Connected" in Settings.
@@ -45,7 +45,7 @@ Before you start, you need:
 **If it fails:**
 - "unknown or inactive tenant" → your tenant ID doesn't exist or its status isn't `active`. Check:
   ```sh
-  curl https://mcp.dbtrail.com/admin/tenants/tenant-a \
+  curl https://mcp.example.com/admin/tenants/tenant-a \
     -H 'Authorization: Bearer YOUR_ADMIN_TOKEN'
   ```
 - "redirect_uri not registered" → this is a bug in the gateway's DCR flow. Check gateway logs.
@@ -120,7 +120,7 @@ This verifies that tenant A cannot see tenant B's data.
 2. Click your profile icon → **Settings**
 3. Go to **Integrations** (or **Connectors**)
 4. Click **Add custom integration**
-5. Enter URL: `https://mcp.dbtrail.com/mcp`
+5. Enter URL: `https://mcp.example.com/mcp`
 6. Complete the OAuth flow (same as web — enter your tenant ID)
 
 > **Important:** Add the connector through the UI, NOT by editing `claude_desktop_config.json`. The JSON config method is the old `proxy.py` approach. The connector UI handles OAuth automatically.
@@ -159,7 +159,7 @@ This verifies that tenant A cannot see tenant B's data.
 Connectors added on claude.ai should sync to mobile automatically.
 
 1. Open the Claude app on your phone
-2. Go to **Settings** → check that the dbtrail connector appears
+2. Go to **Settings** → check that the connector appears
 
 **If it doesn't appear:**
 - Force-close and reopen the app
@@ -184,7 +184,7 @@ The MCP Inspector is a developer tool that tests the raw MCP protocol without Cl
 ### 4.1 Run the Inspector
 
 ```sh
-npx @modelcontextprotocol/inspector https://mcp.dbtrail.com/mcp
+npx @modelcontextprotocol/inspector https://mcp.example.com/mcp
 ```
 
 This opens a browser UI.
@@ -232,7 +232,7 @@ Default: 10 requests/minute per IP.
 # Send 11 register requests rapidly. The 11th should get 429.
 for i in $(seq 1 11); do
   STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST https://mcp.dbtrail.com/oauth/register \
+    -X POST https://mcp.example.com/oauth/register \
     -H 'Content-Type: application/json' \
     -d '{"client_name":"test-'$i'","redirect_uris":["http://localhost/cb"]}')
   echo "Request $i: HTTP $STATUS"
@@ -249,7 +249,7 @@ Default: 30 requests/minute per IP.
 # Send 31 token requests. All will fail (bad grant), but only the 31st should be 429.
 for i in $(seq 1 31); do
   STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST https://mcp.dbtrail.com/oauth/token \
+    -X POST https://mcp.example.com/oauth/token \
     -H 'Content-Type: application/x-www-form-urlencoded' \
     -d 'grant_type=authorization_code&code=fake&client_id=fake&client_secret=fake&code_verifier=fake')
   echo "Request $i: HTTP $STATUS"
@@ -265,7 +265,7 @@ Default: 20 requests/minute per IP.
 ```sh
 for i in $(seq 1 21); do
   STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST https://mcp.dbtrail.com/oauth/authorize \
+    -X POST https://mcp.example.com/oauth/authorize \
     -H 'Content-Type: application/x-www-form-urlencoded' \
     -d 'client_id=fake&redirect_uri=http://localhost&code_challenge=test&tenant_id=fake')
   echo "Request $i: HTTP $STATUS"
@@ -280,7 +280,7 @@ After the rate limit window resets (wait 1 minute), verify that a normal OAuth f
 
 ```sh
 # Should succeed (201)
-curl -X POST https://mcp.dbtrail.com/oauth/register \
+curl -X POST https://mcp.example.com/oauth/register \
   -H 'Content-Type: application/json' \
   -d '{"client_name":"normal-test","redirect_uris":["http://localhost/cb"]}'
 ```
@@ -294,7 +294,7 @@ The gateway now logs every request with a unique `X-Request-Id`.
 ### 6.1 Verify Correlation IDs in Responses
 
 ```sh
-curl -v https://mcp.dbtrail.com/health 2>&1 | grep -i x-request-id
+curl -v https://mcp.example.com/health 2>&1 | grep -i x-request-id
 ```
 
 **Expected:** Response includes `X-Request-Id: <uuid>` header.
@@ -303,7 +303,7 @@ curl -v https://mcp.dbtrail.com/health 2>&1 | grep -i x-request-id
 
 ```sh
 curl -v -H 'X-Request-Id: my-custom-trace-123' \
-  https://mcp.dbtrail.com/health 2>&1 | grep -i x-request-id
+  https://mcp.example.com/health 2>&1 | grep -i x-request-id
 ```
 
 **Expected:** Response header is `X-Request-Id: my-custom-trace-123` (preserved, not overwritten).
@@ -350,7 +350,7 @@ aws dynamodb scan --table-name bintrail-oauth-tokens --limit 3 \
 
 1. Register a test client:
    ```sh
-   CLIENT=$(curl -s -X POST https://mcp.dbtrail.com/oauth/register \
+   CLIENT=$(curl -s -X POST https://mcp.example.com/oauth/register \
      -H 'Content-Type: application/json' \
      -d '{"client_name":"security-test","redirect_uris":["http://localhost:9999/cb"]}')
    CLIENT_ID=$(echo $CLIENT | jq -r .client_id)
@@ -368,7 +368,7 @@ aws dynamodb scan --table-name bintrail-oauth-tokens --limit 3 \
    echo "challenge=$CHALLENGE"
 
    # Open this URL in a browser:
-   echo "https://mcp.dbtrail.com/oauth/authorize?client_id=$CLIENT_ID&redirect_uri=http://localhost:9999/cb&code_challenge=$CHALLENGE&code_challenge_method=S256&state=test123"
+   echo "https://mcp.example.com/oauth/authorize?client_id=$CLIENT_ID&redirect_uri=http://localhost:9999/cb&code_challenge=$CHALLENGE&code_challenge_method=S256&state=test123"
    ```
 
 3. Submit the form with a valid tenant ID. The redirect will fail (localhost:9999 isn't running), but grab the `code` from the URL bar:
@@ -379,7 +379,7 @@ aws dynamodb scan --table-name bintrail-oauth-tokens --limit 3 \
 4. Exchange the code for tokens:
    ```sh
    CODE="THE_CODE_HERE"
-   curl -X POST https://mcp.dbtrail.com/oauth/token \
+   curl -X POST https://mcp.example.com/oauth/token \
      -H 'Content-Type: application/x-www-form-urlencoded' \
      -d "grant_type=authorization_code&code=$CODE&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&code_verifier=$VERIFIER&redirect_uri=http://localhost:9999/cb"
    ```
@@ -387,7 +387,7 @@ aws dynamodb scan --table-name bintrail-oauth-tokens --limit 3 \
 
 5. Try to use the same code again:
    ```sh
-   curl -X POST https://mcp.dbtrail.com/oauth/token \
+   curl -X POST https://mcp.example.com/oauth/token \
      -H 'Content-Type: application/x-www-form-urlencoded' \
      -d "grant_type=authorization_code&code=$CODE&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&code_verifier=$VERIFIER&redirect_uri=http://localhost:9999/cb"
    ```
@@ -406,7 +406,7 @@ aws dynamodb scan --table-name bintrail-oauth-tokens --limit 3 \
 Try exchanging a code with a **wrong** verifier:
 
 ```sh
-curl -X POST https://mcp.dbtrail.com/oauth/token \
+curl -X POST https://mcp.example.com/oauth/token \
   -H 'Content-Type: application/x-www-form-urlencoded' \
   -d "grant_type=authorization_code&code=$CODE&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&code_verifier=wrong-verifier&redirect_uri=http://localhost:9999/cb"
 ```
@@ -420,7 +420,7 @@ curl -X POST https://mcp.dbtrail.com/oauth/token \
 3. Use the refresh token to get new tokens:
    ```sh
    REFRESH_TOKEN="the_refresh_token"
-   curl -X POST https://mcp.dbtrail.com/oauth/token \
+   curl -X POST https://mcp.example.com/oauth/token \
      -H 'Content-Type: application/x-www-form-urlencoded' \
      -d "grant_type=refresh_token&refresh_token=$REFRESH_TOKEN&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET"
    ```
@@ -428,7 +428,7 @@ curl -X POST https://mcp.dbtrail.com/oauth/token \
 
 4. Try to use the **old** refresh token again:
    ```sh
-   curl -X POST https://mcp.dbtrail.com/oauth/token \
+   curl -X POST https://mcp.example.com/oauth/token \
      -H 'Content-Type: application/x-www-form-urlencoded' \
      -d "grant_type=refresh_token&refresh_token=$REFRESH_TOKEN&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET"
    ```
@@ -438,11 +438,11 @@ curl -X POST https://mcp.dbtrail.com/oauth/token \
 
 ```sh
 # Allowed origin — should work (200 or 4xx from the endpoint, but not 403 from origin check)
-curl -H 'Origin: https://claude.ai' https://mcp.dbtrail.com/health
+curl -H 'Origin: https://claude.ai' https://mcp.example.com/health
 
 # Disallowed origin — should get 403 Forbidden
 curl -s -o /dev/null -w "%{http_code}" \
-  -H 'Origin: https://evil-site.com' https://mcp.dbtrail.com/health
+  -H 'Origin: https://evil-site.com' https://mcp.example.com/health
 ```
 
 **Expected:** Second request returns `403`.
@@ -450,7 +450,7 @@ curl -s -o /dev/null -w "%{http_code}" \
 ### 7.7 CORS Headers Only Allow Claude Origins
 
 ```sh
-curl -v -X OPTIONS https://mcp.dbtrail.com/mcp \
+curl -v -X OPTIONS https://mcp.example.com/mcp \
   -H 'Origin: https://claude.ai' \
   -H 'Access-Control-Request-Method: POST' 2>&1 | grep -i access-control
 ```
@@ -458,7 +458,7 @@ curl -v -X OPTIONS https://mcp.dbtrail.com/mcp \
 **Expected:** `Access-Control-Allow-Origin: https://claude.ai` (NOT `*`).
 
 ```sh
-curl -v -X OPTIONS https://mcp.dbtrail.com/mcp \
+curl -v -X OPTIONS https://mcp.example.com/mcp \
   -H 'Origin: https://random-site.com' \
   -H 'Access-Control-Request-Method: POST' 2>&1 | grep -i access-control
 ```
@@ -613,7 +613,7 @@ aws sns subscribe \
 1. Trigger a few auth failures:
    ```sh
    for i in $(seq 1 5); do
-     curl -s https://mcp.dbtrail.com/mcp -H 'Authorization: Bearer invalid-token'
+     curl -s https://mcp.example.com/mcp -H 'Authorization: Bearer invalid-token'
    done
    ```
 
@@ -627,17 +627,6 @@ aws sns subscribe \
      --period 300 \
      --statistics Sum
    ```
-
----
-
-## 9. Documentation Checklist
-
-Verify the docs are complete and accurate:
-
-- [ ] `docs/mcp-server.md` documents both the connector method (recommended) and the proxy method (legacy fallback)
-- [ ] `docs/mcp-gateway.md` has complete deployment instructions
-- [ ] `docs/mcp-server.md` documents the Claude Connector (the README links it from its Documentation table)
-- [ ] `proxy.py` docstring/comments mention it's an optional legacy fallback
 
 ---
 

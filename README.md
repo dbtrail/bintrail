@@ -115,7 +115,7 @@ MySQL-protocol shim behind ProxySQL — your clients keep speaking plain MySQL.
 | [Install](docs/install.md) | [Query & Recovery](docs/query-and-recovery.md) | [Deployment](docs/deployment.md) · [Capacity](docs/capacity.md) |
 | [Quickstart](docs/quickstart.md) | [Web console](docs/console.md) | [Rotation & Status](docs/rotation-and-status.md) |
 | [DBA guide](docs/guide.md) | [Time-Travel SQL](docs/time-travel-sql.md) | [Docker](docs/docker.md) |
-| [30-second demo](docs/demo.md) | [Streaming](docs/streaming.md) · [101](docs/streaming-101.md) · [Indexing](docs/indexing.md) | [Upload to S3](docs/upload.md) |
+| [30-second demo](docs/demo.md) | [Streaming](docs/streaming.md) · [Indexing](docs/indexing.md) | [Upload to S3](docs/upload.md) |
 | | [MCP server](docs/mcp-server.md) · [MCP gateway](docs/mcp-gateway.md) | [Server identity](docs/server-identity.md) |
 | | [Dump & Baseline](docs/dump-and-baseline.md) · [DDL tracking](docs/ddl-tracking.md) | [Parquet debugging](docs/parquet-debugging.md) |
 

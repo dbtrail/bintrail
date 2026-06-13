@@ -281,7 +281,7 @@ The subsections below catalogue the common failure modes and how to diagnose eac
 Warning: archive query failed for s3://.../bintrail_id=<uuid>: Binder Error: Referenced column "connection_id" not found in FROM clause
 ```
 
-**Cause**: archive Parquet files written by `bintrail` versions before v0.4.4 lack the `connection_id` column, which was added in v0.4.4 when the indexer started recording `pseudo_thread_id` from `QueryEvent.SlaveProxyID`. v0.4.8 fixed the per-file query to probe the Parquet schema and substitute `NULL::INT32 AS connection_id` when the column is absent, but old Parquet files written by even older dbtrail versions might still trigger this on environments that haven't upgraded.
+**Cause**: archive Parquet files written by `bintrail` versions before v0.4.4 lack the `connection_id` column. v0.4.8 fixed the per-file query to tolerate the missing column, but old Parquet files written by even older dbtrail versions might still trigger this on environments that haven't upgraded.
 
 **Diagnose**:
 

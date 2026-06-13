@@ -22,26 +22,6 @@ MySQL's solution is table partitioning.
 
 ---
 
-## Why `TO_SECONDS`, Not `UNIX_TIMESTAMP`?
-
-MySQL 8.0 rejects `UNIX_TIMESTAMP()` in partition expressions when `time_zone=SYSTEM`:
-
-```
-Error 1486: Constant, random or timezone-dependent expressions in (sub)partitioning function are not allowed
-```
-
-`TO_SECONDS()` is timezone-independent — it returns the number of seconds since year 0, which is a pure calendar computation with no timezone involvement. This is why every partition boundary in dbtrail is expressed as a `TO_SECONDS` value.
-
-The DDL looks like:
-
-```sql
-PARTITION p_2026021914 VALUES LESS THAN (TO_SECONDS('2026-02-19 15:00:00'))
-```
-
-The `VALUES LESS THAN` value is the *next* hour boundary — a row with `event_timestamp = '2026-02-19 14:59:59'` goes into `p_2026021914` because `TO_SECONDS('2026-02-19 14:59:59') < TO_SECONDS('2026-02-19 15:00:00')`.
-
----
-
 ## The `p_future` Catch-All
 
 There is always a special partition:
@@ -106,26 +86,9 @@ REORGANIZE PARTITION p_future INTO (
 
 ---
 
-## Partition Naming and Parsing
+## Partition Naming
 
-Two functions handle the hour ↔ name mapping:
-
-```go
-// internal/indexer/partitions.go (package indexer)
-func PartitionName(d time.Time) string {
-    return d.UTC().Format("p_2006010215")  // Go reference time for YYYYMMDDHH
-}
-
-func PartitionDate(name string) (time.Time, bool) {
-    if len(name) != 12 || !strings.HasPrefix(name, "p_") {
-        return time.Time{}, false  // rejects p_future and anything malformed
-    }
-    t, err := time.ParseInLocation("p_2006010215", name, time.UTC)
-    ...
-}
-```
-
-These two functions round-trip correctly: `indexer.PartitionName(indexer.PartitionDate("p_2026021914"))` → `"p_2026021914"`. Tests in `internal/indexer/partitions_test.go` verify this.
+Each hourly partition is named `p_YYYYMMDDHH` in UTC (e.g. `p_2026021914`); the only exception is the `p_future` catch-all.
 
 ---
 
@@ -345,31 +308,6 @@ S3 uploaded:    168 partitions
 This section is loaded best-effort — if the `archive_state` table does not exist (older index databases created before the archiving feature), the section is silently omitted.
 
 The row counts in the partitions section are **estimates** from `information_schema.PARTITIONS.TABLE_ROWS`. InnoDB doesn't maintain exact row counts, so these are good approximations for capacity planning but not for exact totals. For turning these estimates into a disk forecast, see [Capacity Planning](./capacity.md).
-
----
-
-## `DescriptionToHuman`: Converting Partition Boundaries
-
-MySQL stores partition boundary values as evaluated integers in `information_schema.PARTITIONS.PARTITION_DESCRIPTION`. For `TO_SECONDS`-based partitions, this is the numeric `TO_SECONDS` result (e.g. `63786820800`). For `p_future`, it's the literal string `MAXVALUE`.
-
-`DescriptionToHuman` converts the integer back to a human-readable datetime:
-
-```go
-// internal/status/status.go
-func DescriptionToHuman(desc string) string {
-    if desc == "" || strings.EqualFold(desc, "MAXVALUE") {
-        return "MAXVALUE"
-    }
-    secs, err := strconv.ParseInt(desc, 10, 64)
-    if err != nil {
-        return desc  // not an integer — return raw
-    }
-    // TO_SECONDS('1970-01-01 00:00:00') = 62167219200 in MySQL 8.0
-    return time.Unix(secs-62167219200, 0).UTC().Format("2006-01-02 15:00 UTC")
-}
-```
-
-The constant `62167219200` is MySQL 8.0's value for `TO_SECONDS('1970-01-01 00:00:00')` (= 719528 days × 86400 seconds). Subtracting it converts the MySQL second count to a Unix timestamp; `time.Unix` converts to Go's `time.Time`.
 
 ---
 

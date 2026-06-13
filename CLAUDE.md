@@ -47,7 +47,7 @@ e2e_test.go            # Full CLI pipeline E2E test (//go:build integration), bu
 .mcp.json              # MCP server registration (go run ./cmd/bintrail-mcp)
 migrations/            # Reference DDL (tables created by `bintrail init`, not this file)
 demo/image/            # Single-container demo image, published as ghcr.io/dbtrail/bintrail-demo (#350; RENAMED from bintrail-appliance 2026-06-06 — old GHCR package keeps serving old tags): Dockerfile (debian:bookworm-slim + MySQL 8.0 apt + ProxySQL apt; amd64-only — MySQL's Debian apt repo has no arm64), entrypoint.sh (mysqld → seed → up → shim → proxysql → traffic; wait -n supervision, dies loudly), traffic.sh (deterministic orders id=1 mutation per cycle), shim.yaml/seed.sql/my.cnf/proxysql.cnf, smoke-test.sh (not in go test). Published by .github/workflows/demo-image.yml on v* tag push (NOT release:published — GITHUB_TOKEN-created releases never trigger workflows; separate from GoReleaser on purpose; dispatch takes an explicit tag input).
-docs/                  # guide.md, indexing.md, query-and-recovery.md, streaming.md, rotation-and-status.md, mcp-server.md, upload.md, parquet-debugging.md, deployment.md, quickstart.md, dump-and-baseline.md, docker.md, server-identity.md, mcp-gateway.md, storage.md, console.md
+docs/                  # guide.md, indexing.md, query-and-recovery.md, streaming.md, rotation-and-status.md, mcp-server.md, upload.md, parquet-debugging.md, deployment.md, quickstart.md, dump-and-baseline.md, docker.md, server-identity.md, mcp-gateway.md, console.md
 ```
 
 ## Commands

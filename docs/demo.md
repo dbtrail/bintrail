@@ -98,14 +98,3 @@ row). It needs Docker and ~3 minutes; it is not part of `go test ./...`.
 | `ERROR 1064` | The query shape isn't in the shim grammar — see the supported forms above (the hint and bare-AS-OF forms only support `SELECT *`, and bare `AS OF` must end the statement). The same query without time-travel syntax goes straight to MySQL. |
 | `ERROR 1045` | Wrong credentials — port 6033 takes `demo` / `demo`. |
 | Container exits during boot | A component failed; `docker logs` shows which. The demo dies loudly rather than half-working. |
-
-## Publishing notes (maintainers)
-
-`.github/workflows/demo-image.yml` builds and pushes
-`ghcr.io/dbtrail/bintrail-demo` (amd64, cosign-signed) on every `v*` tag
-push, separately from GoReleaser so a demo build failure never blocks a
-release. (Not `release: published`: GoReleaser creates the release with the
-default `GITHUB_TOKEN`, whose events never trigger other workflows.) Manual
-runs take an explicit existing tag as a `workflow_dispatch` input. Like the main image, the GHCR package is created
-private on first push and needs a one-time flip to public (see
-[docker.md](docker.md)).

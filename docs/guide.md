@@ -109,65 +109,16 @@ Before you start:
 
 ## 2. First-Time Setup
 
-Three commands to get running. Run them once on initial setup.
+Three commands get you running: `bintrail init` (create the index tables) → `bintrail snapshot` (capture schema metadata) → `bintrail index --all` (backfill from binlog files on disk). The [Quickstart](quickstart.md) walks through each with expected output; this guide assumes you've done that and focuses on the day-to-day scenarios below. (Streaming from a managed source instead of indexing files on disk? See [Scenario J](#scenario-j-streaming-from-managed-mysql-rds-aurora-cloud-sql).)
 
-**Optional — Generate a configuration file:**
-
-Instead of passing `--index-dsn` and `--source-dsn` on every command, you can create a `.bintrail.env` file:
+**Tip — skip the repeated flags.** Instead of passing `--index-dsn`/`--source-dsn` on every command, generate a config file once:
 
 ```sh
 bintrail config init
 # Edit .bintrail.env and set BINTRAIL_INDEX_DSN and BINTRAIL_SOURCE_DSN
 ```
 
-All commands load this file automatically. CLI flags take precedence over env vars. Use `--global` to write to `~/.config/bintrail/config.env` instead.
-
-**Step 1 — Create index tables:**
-
-```sh
-bintrail init --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
-```
-
-Expected output:
-```
-Database "binlog_index" created (or already exists).
-Tables created: binlog_events, schema_snapshots, index_state
-Partitions created: 48 hourly partitions + p_future catch-all
-```
-
-**Step 2 — Snapshot schema metadata:**
-
-```sh
-bintrail snapshot \
-  --source-dsn "user:pass@tcp(source-db:3306)/" \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index"
-```
-
-Expected output:
-```
-Snapshotting schemas: mydb, appdb, ...
-Snapshot complete: 42 tables captured (snapshot_id=1)
-```
-
-**Step 3 — Index binlog files:**
-
-```sh
-bintrail index \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
-  --source-dsn "user:pass@tcp(source-db:3306)/" \
-  --binlog-dir /var/lib/mysql \
-  --all
-```
-
-Expected output:
-```
-Source: binlog_row_image=FULL ✓
-Indexing binlog.000042 ... 12345 events indexed
-Indexing binlog.000043 ... 8901 events indexed
-Done: 2 files, 21246 events total
-```
-
-After this, the index is live. See [Section 4](#4-keeping-dbtrail-running-day-to-day) for ongoing automation.
+All commands load it automatically; CLI flags take precedence. Use `--global` to write `~/.config/bintrail/config.env` instead.
 
 ---
 
@@ -627,80 +578,13 @@ bintrail baseline \
   --retry
 ```
 
-**Option 2 — Generate locally, upload separately with the AWS CLI:**
+Prefer to upload separately (e.g. `aws s3 sync` or `bintrail upload`), or need the S3 access setup? The **minimum IAM policy** and the **AWS credential chain** live in **[upload.md](upload.md)**. Create the bucket once with `bintrail init --s3-bucket` (or the AWS CLI: `aws s3api create-bucket` + a public-access block).
 
-```bash
-# Generate Parquet files
-bintrail baseline \
-  --input  /path/to/mydumper-output \
-  --output /path/to/baselines
+**Storage-class notes (operational):**
 
-# Sync to S3
-aws s3 sync \
-  /path/to/baselines/2025-02-28T00-00-00Z/ \
-  s3://bintrail-audit-baselines/baselines/2025-02-28T00-00-00Z/ \
-  --storage-class STANDARD_IA \
-  --no-progress
-```
-
-**S3 bucket setup (one-time):**
-
-If you haven't run `bintrail init --s3-bucket` yet, create the bucket manually:
-
-```bash
-# Create bucket in us-east-1
-aws s3api create-bucket \
-  --bucket bintrail-audit-baselines \
-  --region us-east-1
-
-# For any other region, add --create-bucket-configuration (required by AWS):
-# aws s3api create-bucket \
-#   --bucket bintrail-audit-baselines \
-#   --region eu-west-1 \
-#   --create-bucket-configuration LocationConstraint=eu-west-1
-
-# Block public access
-aws s3api put-public-access-block \
-  --bucket bintrail-audit-baselines \
-  --public-access-block-configuration \
-    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-
-# Optional: move files older than 90 days to Glacier to reduce storage costs
-aws s3api put-bucket-lifecycle-configuration \
-  --bucket bintrail-audit-baselines \
-  --lifecycle-configuration '{
-    "Rules": [{
-      "ID": "ArchiveToGlacier",
-      "Status": "Enabled",
-      "Filter": {"Prefix": "baselines/"},
-      "Transitions": [{"Days": 90, "StorageClass": "GLACIER"}]
-    }]
-  }'
-```
-
-**IAM permissions required:**
-
-The IAM role or user running dbtrail needs `s3:PutObject` (and `s3:GetObject` / `s3:ListBucket` for future reads):
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
-    "Resource": [
-      "arn:aws:s3:::bintrail-audit-baselines",
-      "arn:aws:s3:::bintrail-audit-baselines/*"
-    ]
-  }]
-}
-```
-
-**Storage class notes:**
-
-- **STANDARD_IA** (Infrequent Access) is recommended for baselines written once and read occasionally during audits — significantly cheaper than STANDARD for storage, with a small per-retrieval fee.
-- **Glacier** lifecycle rule is optional — if baselines older than 90 days are rarely queried, Glacier saves substantial storage costs. Note: DuckDB/Athena cannot query Glacier directly; restore to STANDARD first (takes minutes to hours depending on tier).
-- Use `--no-progress` in scripts and cron jobs to avoid noisy output.
+- **STANDARD_IA** (Infrequent Access) suits baselines written once and read occasionally during audits — cheaper storage than STANDARD, with a small per-retrieval fee. Pass `--storage-class STANDARD_IA` to `aws s3 sync`.
+- A **Glacier** lifecycle rule (transition objects older than ~90 days) cuts cost further for rarely-queried baselines. Note: DuckDB/Athena cannot query Glacier directly — restore to STANDARD first (minutes to hours depending on tier).
+- Use `--no-progress` (AWS CLI) in scripts and cron to avoid noisy output.
 
 ---
 
@@ -779,92 +663,11 @@ curl -s localhost:9090/metrics | grep bintrail_stream_replication_lag_seconds
 
 ---
 
-### Scenario K: Using dbtrail from Claude Desktop (AI-assisted investigation)
+### Scenario K: Using dbtrail from Claude (AI-assisted investigation)
 
-**Situation:** You want to use Claude Desktop (or Claude Code on another machine) to investigate database changes in natural language — without typing CLI commands.
+**Situation:** You want to investigate database changes in natural language from Claude — Claude Code, Claude Desktop, or claude.ai — instead of typing CLI commands.
 
-dbtrail ships an MCP server that exposes `query`, `recover`, `status`, and `list_schema_changes` as AI tools. Once configured, you can ask Claude things like:
-
-- "What got deleted in the last 10 minutes in the orders table?"
-- "Bring back customer 289"
-- "Which tables had the most activity today?"
-- "What schema changes happened this week?"
-
-Claude calls the tools automatically and presents the results.
-
----
-
-#### Option A: Claude Code on the same machine (automatic)
-
-If you're using Claude Code in the dbtrail repo directory, the `.mcp.json` file registers the MCP server automatically. Just set the DSN:
-
-```bash
-export BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index'
-```
-
-The tools appear in Claude Code with no further configuration.
-
----
-
-#### Option B: Claude Desktop on a different machine (via HTTP + proxy)
-
-This setup lets any machine on the same network use the bintrail tools in Claude Desktop without installing Go.
-
-**Architecture:**
-
-```
-Claude Desktop  →  proxy.py (stdio, local)  →  bintrail-mcp --http :8080  →  Index MySQL
-```
-
-**On the machine that has dbtrail installed:**
-
-```bash
-# Build the binary if you haven't already
-go build -o bintrail-mcp ./cmd/bintrail-mcp
-
-# Start the HTTP MCP server with the index DSN
-BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index' \
-  ./bintrail-mcp --http :8080
-```
-
-> Use a process manager (systemd, launchd) or a `tmux` session to keep it running.
-
-**On the remote machine (where Claude Desktop runs):**
-
-1. Copy the proxy script (requires no dependencies):
-
-   ```bash
-   scp user@server:~/bintrail/cmd/bintrail-mcp/proxy.py ~/proxy.py
-   ```
-
-2. Test the connection before configuring Claude Desktop:
-
-   ```bash
-   BINTRAIL_SERVER=http://192.168.1.10:8080/mcp python3 ~/proxy.py <<'EOF'
-   {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
-   {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
-   EOF
-   ```
-
-   You should see two JSON responses. If you do, the server is reachable.
-
-3. Edit Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
-
-   ```json
-   {
-     "mcpServers": {
-       "bintrail": {
-         "command": "python3",
-         "args": ["/Users/you/proxy.py"],
-         "env": { "BINTRAIL_SERVER": "http://192.168.1.10:8080/mcp" }
-       }
-     }
-   }
-   ```
-
-4. Restart Claude Desktop.
-
-**Example prompts that work well:**
+dbtrail ships an MCP server that exposes `query`, `recover`, `status`, and `list_schema_changes` as AI tools. Once connected, you can ask:
 
 ```
 "What tables had deletions in the last hour?"
@@ -874,14 +677,10 @@ BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index' \
 "Which customer was modified the most this week?"
 ```
 
-**Troubleshooting:**
+Claude calls the tools automatically and presents the results. Setup depends on where Claude runs:
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| "Both calls failed" | HTTP server not running or wrong IP | Re-run the curl test above; check firewall |
-| Tools fail after server restart | Proxy has stale `Mcp-Session-Id` | Restart Claude Desktop to reset proxy |
-| No bintrail tools in Claude Desktop | Config JSON is malformed | Validate JSON; check for missing braces |
-| Recovery SQL looks wrong | Schema snapshot is stale | Re-run `bintrail snapshot` on the source |
+- **Claude Code, same machine** (stdio) and **Claude Desktop, remote** (the `proxy.py` bridge): see [mcp-server.md → Three Ways to Connect Claude](mcp-server.md#three-ways-to-connect-claude).
+- **claude.ai / Claude mobile** (the network Connector, via a gateway you self-host or dbtrail's hosted one): see [mcp-gateway.md](mcp-gateway.md).
 
 ---
 

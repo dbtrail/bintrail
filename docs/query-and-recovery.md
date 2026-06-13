@@ -1,59 +1,22 @@
-# How Query and Recovery Work
+# Query and Recovery
 
-This page explains how `bintrail query` finds indexed events, and how `bintrail recover` turns them into SQL that undoes the original operations.
+How to search indexed events with `bintrail query`, and turn them into SQL that undoes the original operations with `bintrail recover`.
 
 ---
 
-## Query: How It Works
+## Querying the index
 
-### The Query Engine
+`bintrail query` searches `binlog_events` with optional filters; with no filters
+it returns the most recent events (bounded by `--limit`). Results come back
+chronologically — by `event_timestamp`, then `event_id` as a tiebreaker. The
+same filter set powers `bintrail recover` and the MCP `query` tool.
 
-The query engine lives in `internal/query/query.go`. Its job is to translate `Options` (a Go struct describing what you're looking for) into a SQL `SELECT` against `binlog_events`, then format the results.
-
-The engine is shared: the CLI `query` command, the CLI `recover` command, and the MCP server all call the same `query.New(db).Fetch(ctx, opts)` entry point.
-
-### Dynamic SQL Builder
-
-`buildQuery` constructs the WHERE clause incrementally. Each filter field in `Options` is optional — nil or zero-valued fields are simply omitted:
-
-| Filter | SQL condition |
-|--------|---------------|
-| `Schema` | `schema_name = ?` |
-| `Table` | `table_name = ?` |
-| `PKValues` | `pk_hash = SHA2(?, 256) AND pk_values = ?` |
-| `EventType` | `event_type = ?` |
-| `GTID` | `gtid = ?` |
-| `Since` | `event_timestamp >= ?` (+ pruning hint for non-hour-aligned values) |
-| `Until` | `event_timestamp <= ?` (+ pruning hint for non-hour-aligned values) |
-| `ChangedColumn` | `JSON_CONTAINS(changed_columns, ?)` |
-| `ColumnEq` | `JSON_UNQUOTE(JSON_EXTRACT(row_after, '$.<col>')) = ? OR JSON_UNQUOTE(JSON_EXTRACT(row_before, '$.<col>')) = ?` |
-| `Flag` | `EXISTS (SELECT 1 FROM table_flags WHERE schema_name = binlog_events.schema_name AND table_name = binlog_events.table_name AND flag = ?)` |
-
-The conditions are joined with `AND`. If no filters are provided, there's no `WHERE` clause at all (subject to the `LIMIT`).
-
-Results are always `ORDER BY event_timestamp, event_id` — chronological, with event_id as a tiebreaker for events in the same second.
-
-### PK Lookup Pattern
-
-Primary key lookups use two conditions, not one:
-
-```sql
-pk_hash = SHA2(?, 256) AND pk_values = ?
-```
-
-`pk_hash` is a `STORED` generated column — MySQL computes it automatically as `SHA2(pk_values, 256)` and indexes it. This means a PK lookup becomes an index scan on the hash, which is extremely fast even across millions of rows and multiple partitions.
-
-The second condition (`pk_values = ?`) is a collision guard. SHA-256 collisions are astronomically unlikely, but the guard costs nothing and makes the query provably correct.
-
-### `changed_column` Filter
-
-The `changed_columns` column is stored as a JSON array (e.g. `["status","updated_at"]`). Filtering on a specific column uses MySQL's `JSON_CONTAINS`:
-
-```sql
-JSON_CONTAINS(changed_columns, '"status"')
-```
-
-The needle is the JSON string representation of the column name (with quotes). `json.Marshal("status")` produces `"status"` — exactly the right format for `JSON_CONTAINS`.
+Filters: `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`,
+`--since` / `--until`, `--changed-column` (events that touched a given column),
+`--column-eq` (events where a column has a given value — see below), and
+`--flag` (tables/columns labeled via [RBAC flags](server-identity.md)). A
+`--pk` lookup is fast and collision-safe — it matches a hash of the PK values
+plus the exact values.
 
 ### `--column-eq` Filter
 
@@ -87,23 +50,6 @@ Internally this translates to `JSON_TYPE(JSON_EXTRACT(..., '$.deleted_at')) = 'N
 The literal value `NULL` is reserved as the JSON-null sentinel — there is currently no escape for matching a column whose value is the four-character string `"NULL"`. If you need that, file an issue.
 
 The same filter is applied to DuckDB when archive auto-discovery routes the query through Parquet files (`json_extract_string` / `json_type`), so merged (live + archive) results stay consistent.
-
-### Partition Pruning Guarantee
-
-MySQL can prune `RANGE (TO_SECONDS(event_timestamp))` partitions when it can compare the query bounds directly against the stored `TO_SECONDS` integer literals. For parameterised datetime comparisons (`event_timestamp >= ?`), the optimizer must infer this — and for non-hour-aligned values it may not.
-
-When `--since` or `--until` has non-zero minutes/seconds (e.g. `15:45:00`), `buildQuery` adds an extra condition using inlined `TO_SECONDS()` integer literals alongside the exact parameterised bound:
-
-```sql
-WHERE TO_SECONDS(event_timestamp) >= 63826647000   -- floor to hour: 15:00
-  AND event_timestamp >= ?                          -- exact lower bound
-  AND TO_SECONDS(event_timestamp) < 63826654800    -- ceil to next hour: 17:00
-  AND event_timestamp <= ?                          -- exact upper bound
-```
-
-The integer literals are evaluated at parse time, so MySQL can always prune partitions before executing the query — no optimizer inference needed. For hour-aligned ranges (e.g. `15:00:00`–`16:00:00`), no extra conditions are added.
-
-This is transparent to users. The same `--since`/`--until` flags work as before, but queries against non-hour-aligned windows now reliably skip irrelevant partitions.
 
 ### Output Formats
 
@@ -168,29 +114,9 @@ WARN query covers hours with no data (rotated and not archived): 2026-02-10 00:0
 
 The planner also optimizes routing: if the entire queried time range is covered by archives (no live MySQL partitions needed), the MySQL query is skipped entirely.
 
-### How the Merge Works
+### How merged results are deduplicated
 
-When archive sources are available (via auto-discovery or explicit flags), the query command takes a different path:
-
-1. **Fetch from MySQL index** — same query as usual, but with no `LIMIT` (`Limit=0` omits the LIMIT clause so no events are dropped before the merge).
-2. **Fetch from each archive source** — DuckDB opens the Parquet files via `parquet_scan('glob/**/*.parquet')`, applies the same filters (schema, table, PK, time range, etc.) in DuckDB SQL, and returns `[]ResultRow`.
-3. **Merge** — results from all sources are combined, deduplicated by `event_id` (MySQL wins on duplicates, since it is appended first), sorted by `(event_timestamp, event_id)`, and then the user's `--limit` is applied once.
-
-```
-bintrail query --archive-s3 s3://... --bintrail-id <uuid> --since "2026-02-01 00:00:00"
-                     │
-          ┌──────────┴──────────┐
-          ▼                     ▼
-   MySQL index            DuckDB (S3 Parquet)
-   (live data)            s3://.../bintrail_id=<uuid>/**/*.parquet
-          │                     │
-          └──────────┬──────────┘
-                     ▼
-              dedup + sort + limit
-                     │
-                     ▼
-               formatted output
-```
+When archives are in play, live MySQL and archive (Parquet) results are combined, deduplicated by `event_id` (the live MySQL row wins on a duplicate), sorted chronologically, and **`--limit` is applied once after the merge** — so no events are dropped before deduplication.
 
 ### Archive Fetch Error Handling
 
@@ -223,9 +149,9 @@ The merge path loads **all matching rows** from all sources into memory before a
 
 ---
 
-## Recovery: How It Works
+## Recovery
 
-The `recover` command also supports archive auto-discovery and the `--no-archive` flag, using the same merge logic as `query`. When archives are available, events are fetched from both MySQL and Parquet, merged, and then passed to the SQL generator via `GenerateSQLFromRows`.
+The `recover` command also supports archive auto-discovery and the `--no-archive` flag, using the same merge logic as `query`. When archives are available, events are fetched from both MySQL and Parquet, merged, and then turned into reversal SQL.
 
 ### The Concept
 
@@ -237,18 +163,11 @@ Recovery works because dbtrail stores **full before and after images** for every
 | `UPDATE` | `UPDATE` back to `row_before` values, `WHERE` the current state matches `row_after` |
 | `INSERT` | `DELETE` the row (using `row_after` to identify it) |
 
-The reversal logic is in `internal/recovery/recovery.go`. It never executes SQL — it only generates a script.
+Recovery never executes SQL — it only generates a script you review and apply yourself.
 
 ### Reverse Chronological Ordering
 
-Before generating SQL, the generator reverses the event list:
-
-```go
-// internal/recovery/recovery.go
-slices.Reverse(rows)
-```
-
-The most recent event is undone first. This matters for sequences like:
+Before generating SQL, the generator reverses the event list so the **most recent event is undone first**. This matters for sequences like:
 
 ```
 INSERT id=5 (at 14:01)
@@ -265,10 +184,7 @@ Reversed: undo the 14:03 UPDATE first, then the 14:02 UPDATE, then the 14:01 INS
 > side-effect row changes that reversal SQL cannot reliably undo
 > (`bintrail doctor` warns about them, and `stream`/`watch` — plus `index`
 > runs given a `--source-dsn` to validate against — refuse to start when the
-> source has them). The FK-aware recovery described on dbtrail.com
-> (parent resolution via `resolve_fk`, dependent ordering) is a dbtrail
-> platform feature, not part of this binary — even though the hosted `recover`
-> tool shares its name with the CLI command and the console tab.
+> source has them).
 
 ### WHERE Clause Strategy
 
@@ -294,40 +210,7 @@ The resolver is loaded best-effort in the `recover` command — a failure logs a
 
 ### Generated Column Handling
 
-Generated columns (`STORED` or `VIRTUAL`) are computed by MySQL and cannot be set explicitly. The generator skips them when building `INSERT` SET clauses and UPDATE SET clauses:
-
-```go
-// internal/recovery/recovery.go
-genCols := g.generatedCols(row.SchemaName, row.TableName)
-for _, col := range sortedKeys(row.RowBefore) {
-    if genCols[col] {
-        continue  // skip generated columns
-    }
-    // ...
-}
-```
-
-The `generatedCols` method queries the resolver for columns where `IsGenerated = true`. If the resolver is nil, `generatedCols` returns nil — treated as an empty set, so nothing is skipped. This is safe because the fallback (all-columns WHERE) doesn't need to distinguish generated columns.
-
-### The float64 JSON Round-Trip Gotcha
-
-There's a subtle type coercion issue in recovery. The `row_before` and `row_after` data was stored as JSON, and when the query engine reads it back with `json.Unmarshal` into `map[string]any`, **all numbers become `float64`**.
-
-This is standard Go JSON behavior, but it means an integer ID like `12345` becomes `float64(12345)`, which would naively format as `12345` — correct — but a large integer like `9007199254740993` (beyond float64's exact range) would format incorrectly.
-
-`formatValue` handles this explicitly:
-
-```go
-// internal/recovery/recovery.go
-case float64:
-    if !math.IsInf(val, 0) && !math.IsNaN(val) &&
-        val == math.Trunc(val) && math.Abs(val) < 1e15 {
-        return strconv.FormatInt(int64(val), 10)  // format as integer
-    }
-    return strconv.FormatFloat(val, 'f', -1, 64)
-```
-
-The `math.Abs(val) < 1e15` guard keeps the conversion in the safe integer range for float64 (which has 53 bits of mantissa). For whole-number floats within this range, the output is an integer literal. For fractional values or very large numbers, it uses decimal notation.
+Generated columns (`STORED` or `VIRTUAL`) are computed by MySQL and cannot be set explicitly, so the generated script skips them in `INSERT`/`UPDATE` SET clauses — the script won't fail trying to assign a value MySQL owns.
 
 ### Output Format
 
@@ -354,43 +237,3 @@ Key properties:
 - Comments before each statement showing the original event ID, type, table, PK, timestamp, and GTID.
 - Generation errors emit a `-- ERROR ...` comment rather than halting — the script remains runnable (the transaction will roll back on the first error anyway).
 - **Never auto-executed**: dbtrail only generates the file. Applying it is always a manual step.
-
----
-
-## The Full Query-to-Recovery Flow
-
-```
-bintrail query/recover
-        │
-        ├── parse flags → query.Options
-        │
-        ├── resolve archive sources (auto-discovery from archive_state, or explicit flags)
-        │   └── query.ResolveArchiveSources(ctx, db) when no explicit flags and no --no-archive
-        │
-        ├── query planner: Plan(ctx, db, dbName, since, until)
-        │   └── warns about coverage gaps, may skip MySQL if fully archived
-        │
-        ├── if no archives: fast path
-        │       └── query.Engine.Run(ctx, opts, format, w) → stdout
-        │
-        ├── if archives: merge path
-        │       ├── query.Engine.Fetch(ctx, opts) → []ResultRow (MySQL, unless planner skips)
-        │       ├── queryArchiveSources(ctx, sources, opts, parquetquery.Fetch, os.Stderr)
-        │       │       ├── for each source: parquetquery.Fetch(...)
-        │       │       ├── on plain error: stderr warning + slog.Warn, continue
-        │       │       └── on ctx.Err() or errors.Is(err, context.Canceled|DeadlineExceeded):
-        │       │               return (nil, wrapped-ctx-err) — short-circuit
-        │       └── query.MergeResults(all, limit) → dedup + sort + limit
-        │
-        ├── [query] → query.Format(results, format, w) → stdout
-        │
-        └── [recover]
-                ├── recovery.GenerateSQLFromRows(rows, w)
-                │       ├── slices.Reverse(rows)
-                │       └── for each row:
-                │               generateStatement(row)
-                │                   DELETE → generateInsert (from row_before)
-                │                   UPDATE → generateUpdate (SET row_before WHERE row_after PK)
-                │                   INSERT → generateDelete (WHERE row_after PK)
-                └── write BEGIN ... statements ... COMMIT → file or stdout
-```
