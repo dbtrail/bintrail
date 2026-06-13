@@ -1170,6 +1170,7 @@ button { font-family: inherit; }
 .srv-status { font-family: var(--f-mono); font-size: 11px; }
 .srv-status.ok { color: var(--insert); }
 .srv-status.err { color: var(--delete); }
+.srv-status.pending { color: var(--ink-2); }
 .chip.chip-mon {
   color: var(--orange-2); border-color: var(--ochre); background: var(--ochre-bg);
 }

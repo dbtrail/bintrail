@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -28,6 +29,34 @@ func newRegistryServer(t *testing.T) *Server {
 	}
 	return srv
 }
+
+// TestIsUnknownDatabase: the probe distinguishes "server reachable but the
+// named DB doesn't exist" (MySQL 1049) from any other failure, through wraps —
+// this is what reclassifies a monitored source's pre-Start probe as pending
+// rather than a hard connection error.
+func TestIsUnknownDatabase(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"direct 1049", &mysql.MySQLError{Number: 1049, Message: "Unknown database 'x'"}, true},
+		{"wrapped 1049", errors.New("failed to ping MySQL: "), false}, // placeholder, replaced below
+		{"other mysql error", &mysql.MySQLError{Number: 1045, Message: "Access denied"}, false},
+		{"plain error", errors.New("dial tcp: connection refused"), false},
+		{"nil", nil, false},
+	}
+	// The wrapped case mirrors config.Connect's fmt.Errorf("...: %w", err).
+	cases[1].err = errwrap(&mysql.MySQLError{Number: 1049, Message: "Unknown database 'bintrail_idx_x'"})
+	cases[1].want = true
+	for _, tc := range cases {
+		if got := isUnknownDatabase(tc.err); got != tc.want {
+			t.Errorf("%s: isUnknownDatabase = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func errwrap(err error) error { return fmt.Errorf("failed to ping MySQL: %w", err) }
 
 func doServersReq(t *testing.T, srv *Server, method, path, body string) (*httptest.ResponseRecorder, []byte) {
 	t.Helper()

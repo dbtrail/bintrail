@@ -2022,6 +2022,10 @@ async function deleteServer(s) {
 // test / doctor / monitor -----------------------------------------------------
 
 function testResultText(res) {
+  // provision_pending: a monitored source whose per-source index isn't created
+  // yet (Start creates it). Reachable server, normal pre-Start state — render
+  // it as a neutral hint, not a red failure.
+  if (res.provision_pending) return "○ " + (res.error || "index not provisioned yet — click Start");
   if (!res.ok) return "✗ " + (res.error || "unreachable");
   let s = "✓ ok · " + res.latency_ms + " ms";
   if (res.server_version) s += " · MySQL " + res.server_version;
@@ -2039,7 +2043,7 @@ async function testServerForm(form) {
   formMsg("testing…", false);
   try {
     const res = await api(id ? "/api/servers/" + encodeURIComponent(id) + "/test" : "/api/servers/test", { method: "POST", body });
-    formMsg(testResultText(res), !res.ok);
+    formMsg(testResultText(res), !res.ok && !res.provision_pending);
   } catch (err) { formMsg((err && err.message) || String(err), true); }
 }
 
@@ -2048,7 +2052,7 @@ async function testServerRow(id) {
   if (slot) { slot.className = "srv-status"; slot.textContent = "testing…"; }
   try {
     const res = await api("/api/servers/" + encodeURIComponent(id) + "/test", { method: "POST", body: {} });
-    if (slot) { slot.className = "srv-status " + (res.ok ? "ok" : "err"); slot.textContent = testResultText(res); }
+    if (slot) { slot.className = "srv-status " + (res.provision_pending ? "pending" : (res.ok ? "ok" : "err")); slot.textContent = testResultText(res); }
   } catch (err) { if (slot) { slot.className = "srv-status err"; slot.textContent = "✗ " + ((err && err.message) || err); } }
 }
 

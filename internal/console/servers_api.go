@@ -121,6 +121,11 @@ type testResponse struct {
 	// command-line DSN), so a stale index must be migrated by a writer command
 	// (index/stream/agent) before this console can query it.
 	SchemaCurrent *bool `json:"schema_current,omitempty"`
+	// ProvisionPending: the probe target is a monitored source whose per-source
+	// index database does not exist yet (MySQL 1049) — it is CREATEd inside
+	// Start, so this is the normal pre-Start state, not a connection failure.
+	// The frontend renders it neutrally (a hint, not a red error).
+	ProvisionPending bool `json:"provision_pending,omitempty"`
 }
 
 // handleServersList serves GET /api/servers.
@@ -444,6 +449,10 @@ func (s *Server) handleMonitorStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleServersTest(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	stored := ""
+	// monitored: the entry is a source dbtrail provisions an index for. Its
+	// per-source index DB only exists after a successful Start, so an
+	// Unknown-database probe error is "not started yet", not "unreachable".
+	monitored := false
 	if id != "" && id != bootServerID {
 		e, ok := s.cm.reg.Get(id)
 		if !ok {
@@ -451,6 +460,7 @@ func (s *Server) handleServersTest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		stored = e.DSN
+		monitored = e.SourceDSN != ""
 	}
 	if id == bootServerID {
 		_, stored = s.cm.bootInfo()
@@ -476,11 +486,21 @@ func (s *Server) handleServersTest(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "nothing to test: no stored DSN and no candidate supplied")
 		return
 	}
-	writeJSON(w, http.StatusOK, probeServer(r, dsn))
+	writeJSON(w, http.StatusOK, probeServer(r, dsn, monitored))
 }
 
-// probeServer runs the write-free reachability probe against one DSN.
-func probeServer(r *http.Request, dsn string) testResponse {
+// isUnknownDatabase reports whether err is MySQL 1049 (ER_BAD_DB_ERROR) —
+// the server is reachable but the named database does not exist.
+func isUnknownDatabase(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1049
+}
+
+// probeServer runs the write-free reachability probe against one DSN. When
+// monitored is true, an Unknown-database error means the per-source index has
+// not been provisioned yet (Start creates it) rather than an unreachable
+// server, so it is reported as a pending state instead of a hard failure.
+func probeServer(r *http.Request, dsn string, monitored bool) testResponse {
 	short, dbName, err := shortTimeoutDSN(dsn)
 	if err != nil {
 		return testResponse{Error: scrubDSNError(err, dsn)}
@@ -489,6 +509,13 @@ func probeServer(r *http.Request, dsn string) testResponse {
 	db, err := config.Connect(short)
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
+		if monitored && isUnknownDatabase(err) {
+			return testResponse{
+				ProvisionPending: true,
+				Error:            fmt.Sprintf("index database %q not provisioned yet — click Start to create it and begin streaming", dbName),
+				LatencyMS:        latency,
+			}
+		}
 		return testResponse{Error: scrubDSNError(err, dsn), LatencyMS: latency}
 	}
 	defer db.Close()

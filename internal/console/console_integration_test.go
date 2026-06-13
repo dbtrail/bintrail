@@ -411,6 +411,36 @@ func TestIntegrationRegistryServerNeverMigrated(t *testing.T) {
 	}
 }
 
+// TestIntegrationProbeProvisionPending: a monitored source whose per-source
+// index DB does not exist yet probes as ProvisionPending (reachable server,
+// pre-Start state) rather than a hard failure — but only when monitored=true.
+// An unmonitored entry pointing at a missing DB is a genuine error.
+func TestIntegrationProbeProvisionPending(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	// A reachable server, but a database name that does not exist.
+	missingDSN := testutil.DefaultDSN + "/bintrail_idx_doesnotexist00"
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8090/api/servers/x/test", strings.NewReader(""))
+
+	pending := probeServer(req, missingDSN, true)
+	if !pending.ProvisionPending {
+		t.Errorf("monitored probe of a missing index DB: ProvisionPending=false, want true (resp=%+v)", pending)
+	}
+	if pending.OK {
+		t.Errorf("a not-yet-provisioned index is not OK: %+v", pending)
+	}
+	if !strings.Contains(pending.Error, "not provisioned yet") {
+		t.Errorf("pending error must be actionable, got %q", pending.Error)
+	}
+
+	hard := probeServer(req, missingDSN, false)
+	if hard.ProvisionPending {
+		t.Errorf("unmonitored probe must NOT be ProvisionPending: %+v", hard)
+	}
+	if hard.OK || hard.Error == "" {
+		t.Errorf("unmonitored probe of a missing DB must be a hard error: %+v", hard)
+	}
+}
+
 // TestIntegrationEvictOnDSNEdit: editing an entry's DSN closes the cached
 // connection; a baseline-only edit keeps it open.
 func TestIntegrationEvictOnDSNEdit(t *testing.T) {
