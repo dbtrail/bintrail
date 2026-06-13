@@ -24,7 +24,20 @@ it's the first section — the same four lines as the README.
 
 One file, zero config — an index MySQL (persisted in a volume) and
 `bintrail-console watch` in source-less daemon mode: the console plus the
-control plane, waiting for you to add servers from the UI:
+control plane, waiting for you to add servers from the UI.
+
+The shortest path is the install script — it does the two commands below
+*and* waits for the console to actually answer before telling you where to
+go next (and opens it in your browser when it can):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dbtrail/dbtrail/main/install.sh | sh
+```
+
+It drops the stack in `./dbtrail` (override with `DBTRAIL_DIR`), and if port
+8090 is already taken it tells you so up front — re-run with
+`DBTRAIL_PORT=9090 …` to publish the console somewhere else. Prefer to drive
+Compose yourself?
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
@@ -32,12 +45,14 @@ docker compose up -d
 docker compose logs -f bintrail
 ```
 
-The logs print the console URL with its access token:
+The logs print the console URL:
 
 ```
 Console is running — open it and add the MySQL servers to watch:
 
-    http://127.0.0.1:8090/?token=ab12cd34…
+    http://127.0.0.1:8090/
+
+First run — open the URL and create your console username and password.
 ```
 
 Open it and use **+ Add server** (the Servers screen opens itself on a

@@ -1,0 +1,239 @@
+#!/bin/sh
+# dbtrail one-command installer.
+#
+#   curl -fsSL https://raw.githubusercontent.com/dbtrail/dbtrail/main/install.sh | sh
+#
+# Downloads the Docker Compose stack, brings it up, waits for the console to
+# actually answer, then tells you exactly where to go next. Everything it does
+# you could do by hand (it prints each step); it just removes the "...now what?"
+# gap after `docker compose up -d`.
+#
+# Knobs (all optional, set them before the pipe — e.g.  DBTRAIL_DIR=/opt/dbtrail sh):
+#   DBTRAIL_DIR      where to put the stack        (default: ./dbtrail)
+#   DBTRAIL_REF      git ref for the compose file  (default: main)
+#   DBTRAIL_PORT     host port the console answers  (default: 8090)
+#   DBTRAIL_NO_OPEN  set to 1 to NOT open a browser (default: opens best-effort)
+#
+# No root needed beyond whatever your Docker setup already requires.
+
+set -eu
+
+DIR="${DBTRAIL_DIR:-./dbtrail}"
+REF="${DBTRAIL_REF:-main}"
+PORT="${DBTRAIL_PORT:-8090}"
+COMPOSE_URL="https://raw.githubusercontent.com/dbtrail/dbtrail/${REF}/docker-compose.yml"
+HEALTH_URL="http://127.0.0.1:${PORT}/api/healthz"
+CONSOLE_URL="http://127.0.0.1:${PORT}"
+
+# ── color capability detection ──────────────────────────────────────────
+# Four tiers so the sunset gradient degrades gracefully: 24-bit truecolor →
+# 256-color cube → basic 8/16 ANSI → no color. Under `curl … | sh` only stdin
+# is the pipe — stdout is still the terminal — so colors render; they drop only
+# when stdout is redirected, NO_COLOR is set, or TERM is dumb.
+COLORTIER=none
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+  case "${COLORTERM:-}" in
+    truecolor|24bit) COLORTIER=truecolor ;;
+    *)
+      ncolors=$(tput colors 2>/dev/null || echo 0)
+      if   [ "${ncolors:-0}" -ge 256 ]; then COLORTIER=256
+      elif [ "${ncolors:-0}" -ge 8   ]; then COLORTIER=basic
+      fi ;;
+  esac
+fi
+
+# Plain attributes (work in every color tier; empty when there's no color).
+if [ "$COLORTIER" = none ]; then
+  B=''; DIM=''; RST=''
+else
+  B=$(printf '\033[1m'); DIM=$(printf '\033[2m'); RST=$(printf '\033[0m')
+fi
+
+# fg R G B BASIC — emit a foreground color for the active tier. BASIC is the
+# 8/16-color SGR code (e.g. 35=magenta) used when truecolor/256 aren't there.
+rgb256() { printf '%d' $(( 16 + 36*(($1*5+127)/255) + 6*(($2*5+127)/255) + (($3*5+127)/255) )); }
+fg() {
+  case "$COLORTIER" in
+    truecolor) printf '\033[38;2;%d;%d;%dm' "$1" "$2" "$3" ;;
+    256)       printf '\033[38;5;%dm' "$(rgb256 "$1" "$2" "$3")" ;;
+    basic)     printf '\033[%dm' "$4" ;;
+  esac
+}
+crst() { [ "$COLORTIER" = none ] || printf '\033[0m'; }
+
+# Semantic colors built on fg (so step/warn/die share the tiering).
+cstep() { fg 124 92 255 36; }   # violet  / cyan
+cwarn() { fg 255 138 61 33; }   # orange  / yellow
+cerr()  { fg 255  77 141 31; }  # pink    / red
+say()  { printf '%s\n' "$*"; }
+step() { cstep; printf '==>'; crst; printf ' %s\n' "$*"; }
+warn() { cwarn; printf '!  %s' "$*"; crst; printf '\n'; }
+die()  { { cerr; printf 'ERROR:'; crst; printf ' %s\n' "$*"; } >&2; exit 1; }
+
+# ── brand banner ────────────────────────────────────────────────────────
+# The dbtrail wordmark in the site's tropical-sunset gradient (pink → orange →
+# violet, #FF4D8D → #FF8A3D → #7C5CFF) topped by a gold "sun" node on a
+# gradient bar. Per-char gradient in truecolor/256; a flat bold accent in basic.
+sunset_word() {
+  word=dbtrail; n=${#word}; i=0
+  while [ "$i" -lt "$n" ]; do
+    ch=$(printf '%s' "$word" | cut -c $((i + 1)))
+    t=$(( i * 100 / (n - 1) ))           # position 0..100 along the gradient
+    if [ "$t" -lt 50 ]; then             # pink → orange
+      lt=$(( t * 2 ))
+      r=255; g=$(( 77 + (138 - 77) * lt / 100 )); b=$(( 141 + (61 - 141) * lt / 100 ))
+    else                                 # orange → violet
+      lt=$(( (t - 50) * 2 ))
+      r=$(( 255 + (124 - 255) * lt / 100 )); g=$(( 138 + (92 - 138) * lt / 100 )); b=$(( 61 + (255 - 61) * lt / 100 ))
+    fi
+    fg "$r" "$g" "$b" 35; printf '%s%s' "$B" "$ch"
+    i=$(( i + 1 ))
+  done
+  crst
+}
+banner() {
+  printf '\n  '
+  fg 255 210 61 93; printf '●'; crst                          # gold sun node
+  printf '   '; sunset_word; printf '\n  '
+  fg 255 77 141 35; printf '▌'; crst                          # pink bar
+  printf '   %severy MySQL change — indexed, queryable, reversible%s\n  ' "$DIM" "$RST"
+  fg 255 138 61 33; printf '▌'; crst                          # orange bar
+  printf '   %sinstalling the Docker stack → %s%s\n\n' "$DIM" "$DIR" "$RST"
+}
+banner
+
+# ── 1. preflight: docker + compose v2 + a running daemon ────────────────
+step "Checking prerequisites"
+
+command -v docker >/dev/null 2>&1 || die \
+  "Docker is not installed. Install Docker Desktop or Docker Engine first:
+    https://docs.docker.com/get-docker/"
+
+# Prefer the v2 plugin (\`docker compose\`); fall back to legacy \`docker-compose\`.
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE="docker-compose"
+  warn "Using legacy docker-compose v1; v2 (\`docker compose\`) is recommended."
+else
+  die "Docker Compose is not available. Update Docker Desktop, or install the
+    Compose plugin: https://docs.docker.com/compose/install/"
+fi
+
+docker info >/dev/null 2>&1 || die \
+  "The Docker daemon isn't running. Start Docker and re-run this installer."
+
+# Catch the single most common first-run failure — port already taken — with
+# an actionable message instead of Docker's raw bind error. Best-effort: if we
+# have no probe tool, stay quiet and let Docker decide.
+port_in_use() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  elif command -v nc >/dev/null 2>&1; then
+    nc -z 127.0.0.1 "$1" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+if port_in_use "$PORT"; then
+  die "Port ${PORT} is already in use on this machine — the console can't bind it.
+    Free that port, or run the console on another one:
+        DBTRAIL_PORT=9090 curl -fsSL .../install.sh | sh"
+fi
+
+# Need curl or wget to fetch the compose file.
+if command -v curl >/dev/null 2>&1; then
+  fetch() { curl -fsSL "$1" -o "$2"; }
+elif command -v wget >/dev/null 2>&1; then
+  fetch() { wget -qO "$2" "$1"; }
+else
+  die "Need curl or wget to download the compose file."
+fi
+say "${DIM}    docker ✓   ${COMPOSE} ✓   daemon ✓${RST}"
+
+# ── 2. download the compose file into a self-contained directory ────────
+step "Setting up the stack in ${B}${DIR}${RST}"
+mkdir -p "$DIR"
+cd "$DIR"
+
+if [ -f docker-compose.yml ]; then
+  warn "docker-compose.yml already exists here — keeping it (delete it to re-fetch)."
+  [ "$PORT" != "8090" ] && warn \
+    "DBTRAIL_PORT=${PORT} ignored — reusing the existing docker-compose.yml (edit its ports: line by hand)."
+else
+  fetch "$COMPOSE_URL" docker-compose.yml \
+    || die "Failed to download $COMPOSE_URL"
+  say "${DIM}    downloaded docker-compose.yml${RST}"
+
+  # The compose file publishes the console on 127.0.0.1:8090. If the operator
+  # asked for a different host port, rewrite that one line in OUR freshly
+  # downloaded copy (the container side stays 8090). Portable in-place edit
+  # (BSD/GNU sed differ on -i), so write-and-move.
+  if [ "$PORT" != "8090" ]; then
+    sed "s|127.0.0.1:8090:8090|127.0.0.1:${PORT}:8090|" docker-compose.yml > docker-compose.yml.tmp \
+      && mv docker-compose.yml.tmp docker-compose.yml
+    say "${DIM}    console port set to ${PORT}${RST}"
+  fi
+fi
+
+# ── 3. bring it up ──────────────────────────────────────────────────────
+step "Starting containers (first run pulls images — this can take a minute)"
+$COMPOSE up -d || die "\`$COMPOSE up -d\` failed. Check the output above."
+
+# ── 4. wait for the console to actually answer ──────────────────────────
+# `up -d` returns the moment containers are created, but the console only
+# answers after the bundled index MySQL passes its healthcheck (~30-60s on a
+# cold start). Poll the unauthenticated liveness endpoint so we never tell the
+# user "ready" before it is.
+step "Waiting for the console to come up"
+ready=""
+i=0
+while [ "$i" -lt 90 ]; do
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -o /dev/null "$HEALTH_URL" 2>/dev/null && { ready=1; break; }
+  else
+    wget -qO /dev/null "$HEALTH_URL" 2>/dev/null && { ready=1; break; }
+  fi
+  i=$((i + 1))
+  printf '%s    ...still starting (%ss)%s\r' "$DIM" "$((i * 2))" "$RST"
+  sleep 2
+done
+printf '\r%*s\r' 40 ''   # clear the progress line
+
+if [ -z "$ready" ]; then
+  warn "The console didn't answer at ${CONSOLE_URL} within ~3 minutes."
+  say  "It may still be pulling images or initializing. Watch the logs:"
+  say  "    ${B}cd ${DIR} && ${COMPOSE} logs -f bintrail${RST}"
+  say  "Once you see the console URL there, open ${CONSOLE_URL}"
+  exit 0
+fi
+
+# ── 5. next steps — the whole point of this script ──────────────────────
+say ""
+fg 14 170 110 32; printf '%s✓ dbtrail is up.%s\n' "$B" "$RST"   # green check
+say ""
+say "${B}Next steps${RST}"
+say "  ${B}1.${RST} Open the console:    ${B}${CONSOLE_URL}${RST}"
+say "  ${B}2.${RST} Create your console ${B}username + password${RST} (first-run screen)."
+say "  ${B}3.${RST} Click ${B}+ Add server${RST} and paste the MySQL you want to watch —"
+say "     host, user, password. dbtrail runs the preflight, provisions an"
+say "     index for it, and starts streaming. Watch it from a MySQL on this"
+say "     same machine? Use host ${B}host.docker.internal${RST}."
+say ""
+say "${DIM}The stack lives in ${DIR}. Useful commands from there:${RST}"
+say "  ${COMPOSE} logs -f bintrail     ${DIM}# follow what it's doing${RST}"
+say "  ${COMPOSE} ps                   ${DIM}# container status${RST}"
+say "  ${COMPOSE} down                 ${DIM}# stop (your data stays in the volumes)${RST}"
+say "  ${COMPOSE} exec -it bintrail bintrail-console user set-password  ${DIM}# reset login${RST}"
+say ""
+say "${DIM}The bundled MySQL 8.4 index is your system of record — back up its"
+say "volumes. Bring your own with INDEX_DSN in a .env. Docs: https://github.com/dbtrail/dbtrail${RST}"
+
+# ── 6. best-effort: open the browser ────────────────────────────────────
+if [ "${DBTRAIL_NO_OPEN:-}" != "1" ]; then
+  if command -v open >/dev/null 2>&1; then
+    open "$CONSOLE_URL" >/dev/null 2>&1 || true        # macOS
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$CONSOLE_URL" >/dev/null 2>&1 || true    # Linux desktop
+  fi
+fi

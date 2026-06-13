@@ -43,12 +43,20 @@ exact fix for anything missing.
 ## Get started
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/dbtrail/dbtrail/main/install.sh | sh
+```
+
+This downloads the Compose stack, brings it up, waits for the console to come
+up, and then prints exactly what to do next (it opens the console for you when
+it can). Prefer to run the two steps yourself? They are:
+
+```sh
 curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
 docker compose up -d
 ```
 
-Open **http://127.0.0.1:8090** — on first run the console asks you to **create
-a username and password**. That's your login from now on.
+Either way: open **http://127.0.0.1:8090** — on first run the console asks you
+to **create a username and password**. That's your login from now on.
 
 Then click **+ Add server**: paste the MySQL you want to watch — host, user,
 password — and dbtrail runs the preflight checks (failures come back as
