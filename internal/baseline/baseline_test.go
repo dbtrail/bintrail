@@ -671,6 +671,291 @@ func TestReadSQLRowTruncated(t *testing.T) {
 	}
 }
 
+func TestReadSQLRowMydumperBinaryJSON(t *testing.T) {
+	// Fixture is captured mydumper output (--complete-insert) for a table with
+	// VARBINARY, BLOB, BIT, and JSON columns holding adversarial bytes (',' ')'
+	// quotes, NUL, 0x1A). Generated with:
+	//   docker run mydumper/mydumper:v1.0.3-1 mydumper --complete-insert \
+	//     --database ptest --tables-list ptest.bins   (MySQL 8.0 source)
+	// The pre-fix parser routed _binary "…" and
+	// CONVERT("…" USING …) through the quote-blind reader, silently corrupting
+	// values and column counts. Columns (MySQL order): id, vb, bl, bt, js, txt.
+	path := filepath.Join("testdata", "mydumper_v1_binary_json.sql")
+	var rows [][]string
+	var nullRows [][]bool
+	if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		rows = append(rows, append([]string(nil), values...))
+		nullRows = append(nullRows, append([]bool(nil), nulls...))
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadSQLFile: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+	// Wrong column count was the silent-corruption symptom — every row is 6 cols.
+	for i, r := range rows {
+		if len(r) != 6 {
+			t.Fatalf("row %d has %d cols, want 6: %q", i, len(r), r)
+		}
+	}
+	// Row 0: vb=0x612c6229 ("a,b)"), bl=0x2722 ("'\""), bt=0xAA,
+	//        js={"m": "done) here", "n": 5}, txt=plain
+	want0 := []string{"1", "a,b)", "'\"", "\xaa", `{"m": "done) here", "n": 5}`, "plain"}
+	for c, w := range want0 {
+		if rows[0][c] != w {
+			t.Errorf("row0 col%d = %q, want %q", c, rows[0][c], w)
+		}
+	}
+	// Row 1: vb=NUL,0x1A,CR,LF,backslash; bl=Hello; bt=0x01; js=[1, 2, 3];
+	//        txt contains both ',' and ')'
+	want1 := []string{"2", "\x00\x1a\r\n\\", "Hello", "\x01", "[1, 2, 3]", "two,with)delims"}
+	for c, w := range want1 {
+		if rows[1][c] != w {
+			t.Errorf("row1 col%d = %q, want %q", c, rows[1][c], w)
+		}
+	}
+	// Row 2: id=3 is a real value; columns 1..5 are NULL.
+	if rows[2][0] != "3" || nullRows[2][0] {
+		t.Errorf("row2 col0 = %q null=%v, want \"3\" non-null", rows[2][0], nullRows[2][0])
+	}
+	for c := 1; c < 6; c++ {
+		if !nullRows[2][c] {
+			t.Errorf("row2 col%d should be NULL, got %q", c, rows[2][c])
+		}
+	}
+}
+
+func TestReadSQLRowReplaceInto(t *testing.T) {
+	// REPLACE INTO (mysqldump --replace / mydumper --replace) carries rows
+	// exactly like INSERT; the old INSERT-only dispatch dropped them all.
+	cases := map[string]struct {
+		sql  string
+		rows int
+	}{
+		"single-line": {"REPLACE INTO `t` VALUES (1,'a'),(2,'b');\n", 2},
+		"multi-line":  {"REPLACE INTO `t` (`id`,`c`) VALUES\n(1,'a')\n,(2,'b')\n,(3,'c');\n", 3},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "shop.t.00000.sql")
+			if err := os.WriteFile(path, []byte(tc.sql), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var count int
+			if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+				count++
+				return nil
+			}); err != nil {
+				t.Fatalf("ReadSQLFile: %v", err)
+			}
+			if count != tc.rows {
+				t.Errorf("got %d rows, want %d", count, tc.rows)
+			}
+		})
+	}
+}
+
+func TestReadSQLRowCharsetIntroducer(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want []string // expected decoded values of the single row
+	}{
+		{
+			// mysqldump default (no --hex-blob): _binary 'escaped' (single-quote)
+			// with embedded ',' ')' and a \Z (0x1A).
+			name: "single-quote",
+			sql:  "INSERT INTO `t` VALUES (1,_binary 'a,b)\\Z',2);\n",
+			want: []string{"1", "a,b)\x1a", "2"},
+		},
+		{
+			// mydumper default: _binary "escaped" (double-quote) with \0.
+			name: "double-quote-nul",
+			sql:  "INSERT INTO `t` VALUES (1,_binary \"x\\0y\",2);\n",
+			want: []string{"1", "x\x00y", "2"},
+		},
+		{
+			// other introducer (text columns under some configs)
+			name: "utf8mb4",
+			sql:  "INSERT INTO `t` VALUES (1,_utf8mb4'héllo');\n",
+			want: []string{"1", "héllo"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "shop.t.00000.sql")
+			if err := os.WriteFile(path, []byte(tc.sql), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var rows [][]string
+			if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+				rows = append(rows, append([]string(nil), values...))
+				return nil
+			}); err != nil {
+				t.Fatalf("ReadSQLFile: %v", err)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("got %d rows, want 1", len(rows))
+			}
+			if len(rows[0]) != len(tc.want) {
+				t.Fatalf("got %d cols %q, want %d", len(rows[0]), rows[0], len(tc.want))
+			}
+			for c, w := range tc.want {
+				if rows[0][c] != w {
+					t.Errorf("col%d = %q, want %q", c, rows[0][c], w)
+				}
+			}
+		})
+	}
+}
+
+func TestReadSQLRowConvertJSON(t *testing.T) {
+	// mydumper JSON encoding CONVERT("<json>" USING <charset>) must yield the
+	// JSON document, not the wrapper text — even with ')' inside a JSON string.
+	// Row 3 covers the single-quoted inner-literal branch of parseConvertExpr.
+	sql := "INSERT INTO `j` (`id`,`doc`) VALUES" +
+		"(1,CONVERT(\"{\\\"k\\\": \\\"a)b\\\"}\" USING UTF8MB4))\n" +
+		",(2,CONVERT(\"[1, 2]\" USING UTF8MB4))\n" +
+		",(3,CONVERT('{\"y\": 2}' USING utf8mb4));\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.j.00000.sql")
+	if err := os.WriteFile(path, []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var rows [][]string
+	if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		rows = append(rows, append([]string(nil), values...))
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadSQLFile: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+	if len(rows[0]) != 2 || rows[0][1] != `{"k": "a)b"}` {
+		t.Errorf("row0 = %q, want doc=%q", rows[0], `{"k": "a)b"}`)
+	}
+	if len(rows[1]) != 2 || rows[1][1] != "[1, 2]" {
+		t.Errorf("row1 = %q, want doc=%q", rows[1], "[1, 2]")
+	}
+	if len(rows[2]) != 2 || rows[2][1] != `{"y": 2}` {
+		t.Errorf("row2 (single-quoted CONVERT) = %q, want doc=%q", rows[2], `{"y": 2}`)
+	}
+}
+
+// copyFixture copies a file from testdata/ to dst.
+func copyFixture(t *testing.T, name, dst string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		t.Fatalf("write fixture %s: %v", dst, err)
+	}
+}
+
+// TestRunMydumperBinaryJSONRoundTrip is the committed end-to-end proof: the real
+// mydumper v1.0.3 fixture (schema + data) flows through baseline.Run into Parquet
+// and reads back byte-exact. Unlike the ReadSQLFile-level test it also exercises
+// convertValue + MysqlToParquetNode (the schema-mapping hop), so a regression in
+// either is caught here.
+func TestRunMydumperBinaryJSONRoundTrip(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+	// mydumper-named copies so DiscoverTables groups them as ptest.bins.
+	copyFixture(t, "mydumper_v1_binary_json-schema.sql", filepath.Join(inputDir, "ptest.bins-schema.sql"))
+	copyFixture(t, "mydumper_v1_binary_json.sql", filepath.Join(inputDir, "ptest.bins.00000.sql"))
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := Run(context.Background(), Config{
+		InputDir: inputDir, OutputDir: outputDir, Compression: "none", RowGroupSize: 100,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.RowsWritten != 3 {
+		t.Fatalf("RowsWritten = %d, want 3", stats.RowsWritten)
+	}
+
+	var parquetPath string
+	_ = filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && filepath.Ext(path) == ".parquet" {
+			parquetPath = path
+		}
+		return nil
+	})
+	if parquetPath == "" {
+		t.Fatal("no .parquet output found")
+	}
+
+	rf, err := os.Open(parquetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rf.Close()
+	info, err := rf.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pf, err := parquet.OpenFile(rf, info.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := parquet.NewReader(pf)
+	defer reader.Close()
+	rows := make([]parquet.Row, 3)
+	n, _ := reader.ReadRows(rows)
+	if n != 3 {
+		t.Fatalf("read %d rows, want 3", n)
+	}
+
+	// Parquet columns are alphabetical: bl(0) bt(1) id(2) js(3) txt(4) vb(5).
+	byID := map[int32]parquet.Row{}
+	for _, r := range rows[:n] {
+		byID[r[2].Int32()] = r
+	}
+	ba := func(v parquet.Value) string { return string(v.ByteArray()) }
+
+	r1 := byID[1] // vb=a,b)  bl='"  bt=0xAA  js={"m": "done) here", "n": 5}
+	if got := ba(r1[5]); got != "a,b)" {
+		t.Errorf("id1 vb = %q, want %q", got, "a,b)")
+	}
+	if got := ba(r1[0]); got != "'\"" {
+		t.Errorf("id1 bl = %q, want %q", got, "'\"")
+	}
+	if got := r1[1].ByteArray(); len(got) != 1 || got[0] != 0xAA {
+		t.Errorf("id1 bt = % x, want AA", got)
+	}
+	if got := ba(r1[3]); got != `{"m": "done) here", "n": 5}` {
+		t.Errorf("id1 js = %q", got)
+	}
+
+	r2 := byID[2] // vb=NUL,0x1A,CR,LF,backslash  bl=Hello  bt=0x01  js=[1, 2, 3]
+	if got := ba(r2[5]); got != "\x00\x1a\r\n\\" {
+		t.Errorf("id2 vb = %q, want NUL,0x1A,CR,LF,backslash", got)
+	}
+	if got := ba(r2[0]); got != "Hello" {
+		t.Errorf("id2 bl = %q, want Hello", got)
+	}
+	if got := r2[1].ByteArray(); len(got) != 1 || got[0] != 0x01 {
+		t.Errorf("id2 bt = % x, want 01", got)
+	}
+	if got := ba(r2[3]); got != "[1, 2, 3]" {
+		t.Errorf("id2 js = %q, want [1, 2, 3]", got)
+	}
+
+	r3 := byID[3] // binary/json columns NULL
+	if !r3[5].IsNull() || !r3[0].IsNull() || !r3[3].IsNull() || !r3[1].IsNull() {
+		t.Errorf("id3 vb/bl/bt/js should be NULL, got %v", r3)
+	}
+}
+
 // ─── DiscoverTables ───────────────────────────────────────────────────────────
 
 func TestDiscoverTables(t *testing.T) {

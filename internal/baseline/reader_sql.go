@@ -54,11 +54,15 @@ func ReadSQLFile(path string, fn func(values []string, nulls []bool) error) erro
 			// last ending in ';'.
 			fragment = trimmed
 		} else {
-			if !strings.HasPrefix(strings.ToUpper(trimmed), "INSERT") {
+			upper := strings.ToUpper(trimmed)
+			// mysqldump --replace and mydumper --replace emit REPLACE INTO
+			// instead of INSERT INTO; both carry row data the same way. Skipping
+			// REPLACE lines silently dropped every such row.
+			if !strings.HasPrefix(upper, "INSERT") && !strings.HasPrefix(upper, "REPLACE") {
 				continue
 			}
 			// Find VALUES keyword (after any column list).
-			valIdx := strings.Index(strings.ToUpper(trimmed), " VALUES")
+			valIdx := strings.Index(upper, " VALUES")
 			if valIdx < 0 {
 				continue
 			}
@@ -185,9 +189,29 @@ func parseSQLValue(s string, pos int) (string, bool, int, error) {
 		return val, false, end, err
 
 	case s[pos] == '"':
-		// Double-quoted string (MySQL ANSI mode or JSON values)
+		// Double-quoted string (MySQL ANSI mode, JSON values, BIT columns)
 		val, end, err := parseSQLDoubleString(s, pos+1)
 		return val, false, end, err
+
+	case s[pos] == '_':
+		// MySQL charset introducer: _binary "…" / _utf8mb4 '…' / etc. mydumper
+		// dumps BINARY/VARBINARY/BLOB columns this way (verified v1.0.3); the
+		// bytes carry raw ',' and ')' that the default reader below would
+		// mis-split into the wrong columns (or abort the file). Parse the
+		// introduced quoted string so the stored value is the decoded bytes.
+		if val, end, ok, err := parseIntroducedString(s, pos); ok {
+			return val, false, end, err
+		}
+		return parseDefaultValue(s, pos)
+
+	case hasPrefixFold(s[pos:], "CONVERT("):
+		// mydumper dumps JSON columns as CONVERT("<json>" USING <charset>).
+		// Extract the inner document so the baseline stores the JSON itself,
+		// not the literal wrapper-expression text.
+		if val, end, ok, err := parseConvertExpr(s, pos); ok {
+			return val, false, end, err
+		}
+		return parseDefaultValue(s, pos)
 
 	case s[pos] == '0' && pos+1 < len(s) && (s[pos+1] == 'x' || s[pos+1] == 'X'):
 		// Hex literal: 0x...
@@ -198,25 +222,108 @@ func parseSQLValue(s string, pos int) (string, bool, int, error) {
 		return s[pos:end], false, end, nil
 
 	default:
-		// Number, unquoted keyword, or expression — read until ',' or ')'
-		end := pos
-		depth := 0
-		for end < len(s) {
-			c := s[end]
-			if c == '(' {
-				depth++
-			} else if c == ')' {
-				if depth == 0 {
-					break
-				}
-				depth--
-			} else if c == ',' && depth == 0 {
+		return parseDefaultValue(s, pos)
+	}
+}
+
+// parseDefaultValue reads an unquoted number, keyword, or expression up to a
+// top-level ',' or ')'. Parenthesis depth is tracked so a function expression
+// like POINT(1 2) is read whole.
+func parseDefaultValue(s string, pos int) (string, bool, int, error) {
+	end := pos
+	depth := 0
+	for end < len(s) {
+		c := s[end]
+		if c == '(' {
+			depth++
+		} else if c == ')' {
+			if depth == 0 {
 				break
 			}
-			end++
+			depth--
+		} else if c == ',' && depth == 0 {
+			break
 		}
-		return strings.TrimSpace(s[pos:end]), false, end, nil
+		end++
 	}
+	return strings.TrimSpace(s[pos:end]), false, end, nil
+}
+
+// parseIntroducedString handles a MySQL charset introducer followed by a quoted
+// string literal, e.g. `_binary "a,b)"` or `_utf8mb4 'x'`. It returns the
+// unescaped value and the position after the closing quote. ok=false (nothing
+// consumed) when pos is not an introducer followed by a quote, so the caller can
+// fall back to the default reader.
+func parseIntroducedString(s string, pos int) (val string, end int, ok bool, err error) {
+	i := pos + 1 // past '_'
+	for i < len(s) && isIdentByte(s[i]) {
+		i++
+	}
+	if i == pos+1 {
+		return "", pos, false, nil // a lone '_' is not an introducer
+	}
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	if i >= len(s) {
+		return "", pos, false, nil
+	}
+	switch s[i] {
+	case '\'':
+		v, e, perr := parseSQLString(s, i+1)
+		return v, e, true, perr
+	case '"':
+		v, e, perr := parseSQLDoubleString(s, i+1)
+		return v, e, true, perr
+	default:
+		return "", pos, false, nil
+	}
+}
+
+// parseConvertExpr handles mydumper's JSON encoding CONVERT("<json>" USING
+// <charset>), returning the unescaped inner string and the position after the
+// wrapper's closing ')'. ok=false when the text after "CONVERT(" is not a quoted
+// literal (caller falls back to the default reader).
+func parseConvertExpr(s string, pos int) (val string, end int, ok bool, err error) {
+	i := pos + len("CONVERT(")
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	if i >= len(s) {
+		return "", pos, false, nil
+	}
+	var v string
+	var e int
+	switch s[i] {
+	case '"':
+		v, e, err = parseSQLDoubleString(s, i+1)
+	case '\'':
+		v, e, err = parseSQLString(s, i+1)
+	default:
+		return "", pos, false, nil
+	}
+	if err != nil {
+		return "", e, true, err
+	}
+	// The inner literal is fully consumed (quotes balanced), so the next ')'
+	// closes CONVERT( — the "USING <charset>" tail contains no parentheses.
+	for e < len(s) && s[e] != ')' {
+		e++
+	}
+	if e >= len(s) {
+		return "", e, true, fmt.Errorf("unterminated CONVERT(...) expression")
+	}
+	return v, e + 1, true, nil
+}
+
+// isIdentByte reports whether c can appear in a charset-introducer name.
+func isIdentByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// hasPrefixFold reports whether s begins with prefix, ASCII-case-insensitively.
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
 // parseSQLString parses a single-quoted SQL string starting after the opening '.
@@ -241,6 +348,10 @@ func parseSQLString(s string, pos int) (string, int, error) {
 				b.WriteByte('"')
 			case '0':
 				b.WriteByte(0)
+			case 'Z':
+				// MySQL escapes Ctrl-Z (0x1A) as \Z; without this it round-trips
+				// to a literal 'Z', corrupting binary values (#495 follow-up).
+				b.WriteByte(0x1a)
 			default:
 				b.WriteByte(s[i+1])
 			}
@@ -279,6 +390,13 @@ func parseSQLDoubleString(s string, pos int) (string, int, error) {
 				b.WriteByte('\\')
 			case '"':
 				b.WriteByte('"')
+			case '0':
+				// NUL — emitted inside _binary "…" for binary/BLOB columns.
+				b.WriteByte(0)
+			case 'Z':
+				// Ctrl-Z (0x1A); see parseSQLString. Real mydumper binary output
+				// contains \0 and \Z inside double-quoted _binary values.
+				b.WriteByte(0x1a)
 			default:
 				b.WriteByte(s[i+1])
 			}
