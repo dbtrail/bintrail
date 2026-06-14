@@ -98,6 +98,11 @@ func TestCoerceUnsigned(t *testing.T) {
 		// NULL and non-integer values on an unsigned column are returned unchanged.
 		{"null on unsigned", nil, ColumnMeta{DataType: "bigint", ColumnType: "bigint unsigned"}, nil},
 		{"string on unsigned", "x", ColumnMeta{DataType: "bigint", ColumnType: "bigint unsigned"}, "x"},
+		// ENUM whose value list literally contains "unsigned" matches the substring
+		// gate, but go-mysql decodes ENUM as int64, so it reaches the DataType switch
+		// (DataType "enum" ∉ integer widths) — which must leave it untouched. This
+		// locks that load-bearing default so a future refactor can't coerce it.
+		{"enum value list contains 'unsigned'", int64(2), ColumnMeta{DataType: "enum", ColumnType: "enum('signed','unsigned')"}, int64(2)},
 	}
 
 	for _, tc := range cases {

@@ -101,6 +101,7 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	defer rows.Close()
 
 	r := &Resolver{snapshotID: snapshotID, tables: make(map[string]*TableMeta)}
+	sawColumnType := false
 
 	for rows.Next() {
 		var schemaName, tableName, columnName, columnKey, dataType, columnType string
@@ -126,6 +127,9 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 			ColumnType:      columnType,
 			IsGenerated:     isGenerated,
 		}
+		if columnType != "" {
+			sawColumnType = true
+		}
 		tm.Columns = append(tm.Columns, col)
 		if col.IsPK {
 			tm.PKColumns = append(tm.PKColumns, columnName)
@@ -134,6 +138,18 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate snapshot rows: %w", err)
+	}
+
+	// Pre-#212 snapshots have no column_type, so coerceUnsigned cannot tell which
+	// integer columns are UNSIGNED and silently indexes them as-is. Warn once (not
+	// per row) so an operator who upgraded for the unsigned fix (#490) isn't misled
+	// into thinking a stale snapshot is corrected.
+	if len(r.tables) > 0 && !sawColumnType {
+		slog.Warn("snapshot predates column_type capture (#212); UNSIGNED integer "+
+			"columns cannot be sign-corrected and are indexed with the wrong value when "+
+			"the high bit is set (unsigned PKs also corrupt pk_hash) — re-run "+
+			"`bintrail snapshot` to enable the fix",
+			"snapshot_id", snapshotID)
 	}
 
 	return r, nil
@@ -213,18 +229,22 @@ func (r *Resolver) MapRow(schema, table string, row []any) (map[string]any, erro
 // value lands in the index and, for unsigned PKs, corrupts pk_values/pk_hash.
 //
 // Signedness is taken from the snapshot's ColumnType ("... unsigned"), NOT the
-// TABLE_MAP bitmap, because the bitmap is only present under
-// binlog_row_metadata=FULL (not the default), whereas ColumnType is always
-// loaded by the resolver. Width is taken from DataType so the reinterpretation
-// masks to the column's real size — MEDIUMINT is 3 bytes but go-mysql returns it
-// as int32, so it must be masked to 24 bits (else MEDIUMINT UNSIGNED -1 would
-// become 2^32-1 instead of 2^24-1).
+// TABLE_MAP SIGNEDNESS bitmap: coerceUnsigned runs inside MapRow, which works
+// only off the resolver's snapshot and never sees the live TableMapEvent, so the
+// bitmap is not reachable at this layer (and go-mysql would not apply it anyway —
+// see above). ColumnType is always loaded by the resolver, independent of the
+// source's binlog_row_metadata setting. Width is taken from DataType so the
+// reinterpretation masks to the column's real size — MEDIUMINT is 3 bytes but
+// go-mysql returns it as int32, so it must be masked to 24 bits (else
+// MEDIUMINT UNSIGNED -1 would become 2^32-1 instead of 2^24-1).
 //
 // No-op when the column is not unsigned, when ColumnType is empty (pre-#212
-// snapshots can't express signedness), or when the value is not a signed integer
-// (NULL, string, decimal, time, etc. are returned unchanged). BIT columns are
-// intentionally not handled here — BIT is a distinct type, not declared
-// "unsigned", and has its own representation.
+// snapshots can't express signedness — NewResolver warns once in that case), or
+// when the value is not a signed integer (NULL, string, and DECIMAL/FLOAT/DOUBLE
+// UNSIGNED — which go-mysql returns as string/float — are returned unchanged).
+// BIT is intentionally gated out: it is a distinct type, never declared
+// "unsigned". (BIT(64) with the high bit set has the same underlying corruption,
+// since go-mysql decodes BIT as int64, but is tracked separately.)
 func coerceUnsigned(v any, col ColumnMeta) any {
 	if !strings.Contains(strings.ToLower(col.ColumnType), "unsigned") {
 		return v

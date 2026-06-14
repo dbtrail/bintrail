@@ -52,6 +52,10 @@ func TestParseFile_unsignedIntegers(t *testing.T) {
 	// would return these as negative.
 	testutil.MustExec(t, sourceDB,
 		`INSERT INTO u (id, n, m) VALUES (18446744073709551615, 4294967295, 16777215)`)
+	// Update a non-PK column so the UPDATE before-image carries the unsigned PK —
+	// this is what `recover` keys on, so the before-image PK must be correct too.
+	testutil.MustExec(t, sourceDB,
+		`UPDATE u SET n = 1 WHERE id = 18446744073709551615`)
 
 	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
 
@@ -72,10 +76,16 @@ func TestParseFile_unsignedIntegers(t *testing.T) {
 		errCh <- p.ParseFile(ctx, currentBinlog, events)
 	}()
 
-	var ins []parser.Event
+	var ins, upd []parser.Event
 	for ev := range events {
-		if ev.Table == "u" && ev.EventType == parser.EventInsert {
+		if ev.Table != "u" {
+			continue
+		}
+		switch ev.EventType {
+		case parser.EventInsert:
 			ins = append(ins, ev)
+		case parser.EventUpdate:
+			upd = append(upd, ev)
 		}
 	}
 	if err := <-errCh; err != nil {
@@ -98,5 +108,18 @@ func TestParseFile_unsignedIntegers(t *testing.T) {
 	// The unsigned PK must serialize to the correct value, not a negative one.
 	if ev.PKValues != "18446744073709551615" {
 		t.Errorf("PKValues: want 18446744073709551615, got %q", ev.PKValues)
+	}
+
+	// UPDATE before-image: the unsigned PK that recover keys on must be correct,
+	// both in RowBefore and in the PKValues built from the before-image.
+	if len(upd) != 1 {
+		t.Fatalf("expected 1 UPDATE for table u, got %d", len(upd))
+	}
+	u := upd[0]
+	if got := u.RowBefore["id"]; got != uint64(18446744073709551615) {
+		t.Errorf("UPDATE RowBefore id: want uint64 max, got %#v (%T)", got, got)
+	}
+	if u.PKValues != "18446744073709551615" {
+		t.Errorf("UPDATE PKValues (from before-image): want 18446744073709551615, got %q", u.PKValues)
 	}
 }
