@@ -55,6 +55,27 @@ func makeQueryEvent(query string) *replication.BinlogEvent {
 	}
 }
 
+// makeXIDEvent builds a BinlogEvent wrapping an XIDEvent (InnoDB commit).
+func makeXIDEvent(logPos uint32) *replication.BinlogEvent {
+	return &replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.XID_EVENT, LogPos: logPos},
+		Event:  &replication.XIDEvent{XID: 1},
+	}
+}
+
+// drainTypes collects the EventTypes emitted on the channel.
+func drainTypes(out <-chan Event) []EventType {
+	var types []EventType
+	for {
+		select {
+		case ev := <-out:
+			types = append(types, ev.EventType)
+		default:
+			return types
+		}
+	}
+}
+
 // feed sends events to a streamer then cancels ctx after a short delay,
 // ensuring Run returns even if no further events arrive.
 func feedThenCancel(t *testing.T, streamer *replication.BinlogStreamer, cancel context.CancelFunc, evs ...*replication.BinlogEvent) {
@@ -230,6 +251,102 @@ func TestStreamParser_queryEventDDL(t *testing.T) {
 	}
 	if ev.DDLType != DDLAlterTable {
 		t.Errorf("expected DDLType DDLAlterTable, got %q", ev.DDLType)
+	}
+}
+
+// TestStreamParser_xidEmitsCommit verifies that an XID_EVENT closing a GTID
+// transaction emits an EventCommit carrying that GTID (#491).
+func TestStreamParser_xidEmitsCommit(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel,
+		makeGTIDEvent(7),
+		makeQueryEvent("BEGIN"),
+		makeXIDEvent(300),
+	)
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	types := drainTypes(out)
+	if len(types) != 2 || types[0] != EventGTID || types[1] != EventCommit {
+		t.Fatalf("expected [EventGTID, EventCommit], got %v", types)
+	}
+}
+
+// TestStreamParser_implicitCommitViaNextGTID verifies the catch-all for
+// implicitly-committed statements that carry a GTID but have no XID and aren't
+// table DDL (e.g. GRANT): the prior transaction's GTID is committed when the
+// next transaction's GTID_EVENT arrives, so its checkpoint advances (#491).
+func TestStreamParser_implicitCommitViaNextGTID(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel,
+		makeGTIDEvent(1),
+		makeQueryEvent("GRANT SELECT ON *.* TO 'x'@'%'"), // implicit commit, no XID, not table DDL
+		makeGTIDEvent(2),
+	)
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// GTID(1) → (GRANT: nothing) → GTID(2) triggers the fallback commit of GTID(1).
+	evs := make([]Event, 0, 3)
+	for {
+		got := false
+		select {
+		case ev := <-out:
+			evs = append(evs, ev)
+			got = true
+		default:
+		}
+		if !got {
+			break
+		}
+	}
+	if len(evs) != 3 {
+		t.Fatalf("expected [EventGTID, EventCommit, EventGTID], got %d events: %+v", len(evs), evs)
+	}
+	if evs[0].EventType != EventGTID || evs[1].EventType != EventCommit || evs[2].EventType != EventGTID {
+		t.Fatalf("expected [EventGTID, EventCommit, EventGTID], got types %d,%d,%d", evs[0].EventType, evs[1].EventType, evs[2].EventType)
+	}
+	if evs[1].GTID != evs[0].GTID {
+		t.Errorf("the fallback commit must carry the first transaction's GTID: commit=%q gtid=%q", evs[1].GTID, evs[0].GTID)
+	}
+	if evs[2].GTID == evs[0].GTID {
+		t.Errorf("the second GTID must differ from the first; both are %q", evs[2].GTID)
+	}
+}
+
+// TestStreamParser_compressedTransactionEmitsCommit verifies that a transaction
+// whose XID lives inside a compressed Transaction_payload event still emits an
+// EventCommit (the GTID_EVENT precedes the payload on the wire) (#491).
+func TestStreamParser_compressedTransactionEmitsCommit(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	innerBegin := makeQueryEvent("BEGIN")
+	innerXID := makeXIDEvent(0) // inner LogPos is rewritten to the payload's
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel,
+		makeGTIDEvent(9),                              // GTID is outside the compressed payload
+		makePayloadEvent(5000, 200, innerBegin, innerXID),
+	)
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	types := drainTypes(out)
+	if len(types) != 2 || types[0] != EventGTID || types[1] != EventCommit {
+		t.Fatalf("expected [EventGTID, EventCommit] from a compressed transaction, got %v", types)
 	}
 }
 
@@ -600,8 +717,12 @@ func TestStreamParser_emptyPayloadNoEffect(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	feedThenCancel(t, streamer, cancel,
-		makePayloadEvent(3000, 200),           // no inner events at all
-		makePayloadEvent(4000, 200, innerXID), // only an ignored inner event
+		makePayloadEvent(3000, 200), // no inner events at all
+		// An inner XID with NO preceding GTID: emitCommit is a no-op because
+		// currentGTID is empty, so still nothing is emitted. (A GTID-led
+		// transaction's inner XID DOES emit EventCommit — see
+		// TestStreamParser_compressedTransactionEmitsCommit.)
+		makePayloadEvent(4000, 200, innerXID),
 	)
 	if err := sp.Run(ctx, streamer, out); err != nil {
 		t.Fatalf("Run: %v", err)

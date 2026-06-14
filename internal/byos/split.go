@@ -94,8 +94,8 @@ func PKHash(pkValues string) string {
 // permitted (older callers / tests) and produces a record without source
 // identity fields.
 //
-// Returns an error for unsupported event types (DDL, GTID). Callers should
-// filter these before calling SplitEvent.
+// Returns an error for unsupported event types (DDL, GTID, commit boundaries).
+// Callers should filter these before calling SplitEvent.
 func SplitEvent(ev parser.Event, serverID string, ident SourceIdentity) (MetadataRecord, PayloadRecord, error) {
 	typeName, err := eventTypeName(ev.EventType)
 	if err != nil {

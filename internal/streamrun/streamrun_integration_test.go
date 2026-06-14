@@ -526,6 +526,38 @@ func TestStreamLoop_gtidCheckpointAtCommit(t *testing.T) {
 			t.Errorf("gtid_set must contain the committed GTID, got %q", loaded.gtidSet)
 		}
 	})
+
+	// Scenario C: a DDL auto-commits its own GTID (no XID). EventDDL must flush
+	// pending rows AND advance the GTID — the only path that claims a DDL's GTID.
+	t.Run("DDL advances the GTID and flushes prior rows", func(t *testing.T) {
+		idx, db := setupIdx(t)
+		events := make(chan parser.Event, 10)
+		events <- parser.Event{BinlogFile: "binlog.000001", EndPos: 100, GTID: gtid, EventType: parser.EventGTID}
+		events <- insertEvent
+		events <- parser.Event{BinlogFile: "binlog.000001", EndPos: 300, GTID: gtid, EventType: parser.EventDDL,
+			Schema: "testdb", Table: "orders", DDLType: parser.DDLAlterTable, DDLQuery: "ALTER TABLE orders ADD c INT"}
+		close(events)
+
+		state := newGTIDState(t)
+		if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, observe.ForSource("test"), nil); err != nil {
+			t.Fatalf("streamLoop: %v", err)
+		}
+
+		loaded, err := loadStreamState(db)
+		if err != nil || loaded == nil {
+			t.Fatalf("loadStreamState err=%v nil=%v", err, loaded == nil)
+		}
+		if !strings.Contains(loaded.gtidSet, uuid) {
+			t.Errorf("DDL must advance the GTID, got %q", loaded.gtidSet)
+		}
+		var count int
+		if err := db.QueryRow("SELECT COUNT(*) FROM binlog_events").Scan(&count); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if count != 1 {
+			t.Errorf("the pre-DDL row must be flushed before the GTID advances: want 1, got %d", count)
+		}
+	})
 }
 
 // setGTIDMode transitions @@GLOBAL.gtid_mode through the required permissive
@@ -562,14 +594,24 @@ func TestStreamLoop_gtidAdvancesOnCommit_live(t *testing.T) {
 	indexDB, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, indexDB)
 
-	if err := setGTIDMode(sourceDB, true); err != nil {
-		t.Skipf("skipping: cannot enable gtid_mode on the test server: %v", err)
-	}
+	// Register restore BEFORE attempting the transition, so a partial enable that
+	// leaves gtid_mode in a permissive state is still undone (a leaked gtid_mode
+	// would silently break every other test on the shared server). Skip the
+	// down-sequence when already OFF (enable never progressed) — OFF→ON_PERMISSIVE
+	// is itself an invalid jump.
 	t.Cleanup(func() {
+		var mode string
+		if err := sourceDB.QueryRow("SELECT @@GLOBAL.gtid_mode").Scan(&mode); err == nil && mode == "OFF" {
+			_, _ = sourceDB.Exec("SET @@GLOBAL.enforce_gtid_consistency = OFF")
+			return
+		}
 		if err := setGTIDMode(sourceDB, false); err != nil {
 			t.Logf("warning: failed to restore gtid_mode=OFF: %v", err)
 		}
 	})
+	if err := setGTIDMode(sourceDB, true); err != nil {
+		t.Skipf("skipping: cannot enable gtid_mode on the test server: %v", err)
+	}
 
 	var serverUUID string
 	if err := sourceDB.QueryRow("SELECT @@server_uuid").Scan(&serverUUID); err != nil {
