@@ -13,6 +13,31 @@ import (
 
 // ─── buildQuery ───────────────────────────────────────────────────────────────
 
+func TestUnmarshalRowImage_preservesLargeIntegers(t *testing.T) {
+	// A BIGINT UNSIGNED max stored in row JSON must survive the read exactly —
+	// default json.Unmarshal would coerce it to float64 and round it (#496).
+	m := UnmarshalRowImage([]byte(`{"big":18446744073709551615,"dec":3.14,"s":"x"}`))
+	n, ok := m["big"].(json.Number)
+	if !ok {
+		t.Fatalf("big should decode to json.Number, got %T", m["big"])
+	}
+	if n.String() != "18446744073709551615" {
+		t.Errorf("big = %q, want exact 18446744073709551615", n.String())
+	}
+	if d, ok := m["dec"].(json.Number); !ok || d.String() != "3.14" {
+		t.Errorf("dec = %#v, want json.Number 3.14", m["dec"])
+	}
+	if s, ok := m["s"].(string); !ok || s != "x" {
+		t.Errorf("s = %#v, want string \"x\"", m["s"])
+	}
+	// Best-effort: nil/empty/malformed input returns nil (no scan abort).
+	for _, in := range [][]byte{nil, []byte(""), []byte("{bad")} {
+		if got := UnmarshalRowImage(in); got != nil {
+			t.Errorf("UnmarshalRowImage(%q) = %#v, want nil", in, got)
+		}
+	}
+}
+
 func TestBuildQuery_noFilters(t *testing.T) {
 	opts := Options{Limit: 50}
 	q, args := buildQuery(opts)

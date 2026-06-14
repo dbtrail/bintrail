@@ -2,7 +2,9 @@ package metadata
 
 import (
 	"database/sql"
+	"encoding/json"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -237,6 +239,16 @@ func (s *EnumMapperSource) memoized(key mapperKey, r *Resolver) *EnumLabelMapper
 // honest call.
 func ordinalValue(v any) (uint64, bool) {
 	switch n := v.(type) {
+	case json.Number:
+		// Row images decoded by query.UnmarshalRowImage keep numbers as
+		// json.Number (#496). Parse the exact integer literal — no 2^53 float
+		// limit, so SET masks using high bits resolve correctly. A negative,
+		// fractional, or out-of-range value fails ParseUint → pass-through.
+		u, err := strconv.ParseUint(n.String(), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return u, true
 	case float64:
 		if n < 0 || n != math.Trunc(n) || n > 1<<53 {
 			return 0, false

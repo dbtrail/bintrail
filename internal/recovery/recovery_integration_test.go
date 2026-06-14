@@ -46,6 +46,35 @@ func TestGenerateSQL_deleteToInsert(t *testing.T) {
 	assertContains(t, out, "COMMIT;")
 }
 
+func TestGenerateSQL_largeUnsignedBigintExact(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// DELETE whose before-image holds a BIGINT UNSIGNED max value. Reversing it
+	// emits an INSERT; the value must appear EXACTLY, not rounded through float64
+	// — this completes the #490 unsigned fix end-to-end through recover (#496).
+	testutil.InsertEvent(t, db,
+		"binlog.000001", 100, 200, "2026-02-19 14:00:00", nil,
+		"mydb", "counters", 3, "1",
+		nil,
+		[]byte(`{"id":1,"big":18446744073709551615}`),
+		nil,
+	)
+
+	g := New(db, nil)
+	var buf bytes.Buffer
+	if _, err := g.GenerateSQL(context.Background(), query.Options{
+		Schema: "mydb", Table: "counters", Limit: 100,
+	}, &buf); err != nil {
+		t.Fatalf("GenerateSQL failed: %v", err)
+	}
+	out := buf.String()
+	assertContains(t, out, "18446744073709551615")
+	if strings.Contains(out, "18446744073709551616") {
+		t.Errorf("BIGINT UNSIGNED max was rounded through float64 (got ...616):\n%s", out)
+	}
+}
+
 func TestGenerateSQL_updateReverse(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)

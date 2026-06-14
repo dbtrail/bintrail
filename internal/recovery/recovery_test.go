@@ -38,6 +38,29 @@ func TestFormatValue_boolFalse(t *testing.T) {
 	}
 }
 
+func TestFormatSQLValue_jsonNumber(t *testing.T) {
+	// Row images now come back as json.Number (query.UnmarshalRowImage), so large
+	// integers survive exactly instead of rounding through float64 (#496).
+	cases := []struct{ in, want string }{
+		{"18446744073709551615", "18446744073709551615"}, // BIGINT UNSIGNED max
+		{"9223372036854775807", "9223372036854775807"},   // BIGINT signed max
+		{"-9223372036854775808", "-9223372036854775808"}, // BIGINT signed min
+		{"1000000000000000007", "1000000000000000007"},   // > 2^53: float64 would round
+		{"3.14", "3.14"},                                 // decimal preserved verbatim
+		{"0", "0"},
+	}
+	for _, c := range cases {
+		if got := FormatSQLValue(json.Number(c.in)); got != c.want {
+			t.Errorf("FormatSQLValue(json.Number(%q)) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// Contrast: the float64 path silently rounds the same large value — this is
+	// exactly why the JSON read path must use json.Number.
+	if got := FormatSQLValue(float64(1000000000000000007)); got == "1000000000000000007" {
+		t.Errorf("float64 path unexpectedly exact for >2^53 (%q) — json.Number is required", got)
+	}
+}
+
 func TestFormatValue_integerFloat(t *testing.T) {
 	// JSON round-trip turns int64(12345) into float64(12345).
 	got := FormatSQLValue(float64(12345))

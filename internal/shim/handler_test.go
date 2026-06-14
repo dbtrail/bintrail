@@ -3,6 +3,7 @@ package shim
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,38 @@ import (
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
+
+// TestResultsetValue_jsonNumber locks the json.Number → resultset conversion
+// (#496): BuildSimpleTextResultset rejects json.Number, so row-image numbers must
+// map to the narrowest exact numeric type, including uint64 for BIGINT UNSIGNED
+// above 2^63.
+func TestResultsetValue_jsonNumber(t *testing.T) {
+	cases := []struct {
+		in   json.Number
+		want any
+	}{
+		{"12345", int64(12345)},
+		{"-7", int64(-7)},
+		{"9223372036854775807", int64(9223372036854775807)},     // BIGINT signed max
+		{"18446744073709551615", uint64(18446744073709551615)},  // BIGINT UNSIGNED max
+		{"3.14", float64(3.14)},                                 // fractional → float64
+	}
+	for _, c := range cases {
+		if got := resultsetValue(c.in); got != c.want {
+			t.Errorf("resultsetValue(json.Number(%q)) = %#v (%T), want %#v (%T)", c.in, got, got, c.want, c.want)
+		}
+	}
+	// Non-json.Number values pass through unchanged.
+	if got := resultsetValue("hi"); got != "hi" {
+		t.Errorf("string passthrough = %#v, want \"hi\"", got)
+	}
+	if got := resultsetValue(nil); got != nil {
+		t.Errorf("nil passthrough = %#v, want nil", got)
+	}
+	if got := resultsetValue(int64(42)); got != int64(42) {
+		t.Errorf("int64 passthrough = %#v, want int64(42)", got)
+	}
+}
 
 // TestHandlerHandshakeNoise verifies the small allow-list for queries
 // MySQL clients send during connection setup — these shouldn't be

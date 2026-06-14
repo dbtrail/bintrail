@@ -2,6 +2,7 @@ package shim
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -248,6 +249,10 @@ func (h *Handler) fullTableTextCell(schema, table, column string, v any) any {
 		return x
 	case string:
 		return []byte(x)
+	case json.Number:
+		// Post-baseline event images are JSON-decoded as json.Number (#496);
+		// render the exact literal so large integers stay lossless on the wire.
+		return []byte(x.String())
 	case time.Time:
 		return []byte(x.UTC().Format("2006-01-02 15:04:05"))
 	default:

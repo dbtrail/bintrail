@@ -329,6 +329,14 @@ func FormatSQLValue(v any) string {
 	case uint32:
 		return strconv.FormatUint(uint64(val), 10)
 
+	case json.Number:
+		// Row images read from binlog_events JSON come back as json.Number
+		// (query.UnmarshalRowImage uses UseNumber), preserving the exact literal.
+		// Emit it verbatim as a SQL numeric literal — integers above 2^53 survive
+		// instead of being rounded through float64 (#496). JSON number syntax is a
+		// valid SQL numeric literal (integer, decimal, or exponent).
+		return string(val)
+
 	case float64:
 		// Detect integer-valued floats (JSON round-trip converts int→float64).
 		// math.Abs guard prevents int64 overflow for very large floats.

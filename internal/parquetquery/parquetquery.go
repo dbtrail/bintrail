@@ -904,10 +904,10 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 			_ = json.Unmarshal([]byte(changedCols.String), &r.ChangedColumns)
 		}
 		if rowBefore.Valid && rowBefore.String != "" {
-			_ = json.Unmarshal([]byte(rowBefore.String), &r.RowBefore)
+			r.RowBefore = query.UnmarshalRowImage([]byte(rowBefore.String))
 		}
 		if rowAfter.Valid && rowAfter.String != "" {
-			_ = json.Unmarshal([]byte(rowAfter.String), &r.RowAfter)
+			r.RowAfter = query.UnmarshalRowImage([]byte(rowAfter.String))
 		}
 		results = append(results, r)
 	}

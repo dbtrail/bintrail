@@ -1,11 +1,30 @@
 package metadata
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
 	"time"
 )
+
+func TestOrdinalValue_jsonNumber(t *testing.T) {
+	// Row images decoded by query.UnmarshalRowImage carry numbers as json.Number
+	// (#496); ENUM/SET label resolution must still extract the ordinal.
+	if u, ok := ordinalValue(json.Number("3")); !ok || u != 3 {
+		t.Errorf("ordinalValue(json.Number(\"3\")) = (%d,%v), want (3,true)", u, ok)
+	}
+	// Full 64-bit range (a SET mask using a high bit) — no 2^53 float cap.
+	if u, ok := ordinalValue(json.Number("9223372036854775808")); !ok || u != 9223372036854775808 {
+		t.Errorf("ordinalValue(high-bit) = (%d,%v), want (9223372036854775808,true)", u, ok)
+	}
+	// Negative, fractional, and non-numeric → pass-through (!ok).
+	for _, bad := range []json.Number{"-1", "1.5", "abc"} {
+		if _, ok := ordinalValue(bad); ok {
+			t.Errorf("ordinalValue(json.Number(%q)) reported ok, want !ok", bad)
+		}
+	}
+}
 
 func TestParseEnumSetLabels(t *testing.T) {
 	tests := []struct {

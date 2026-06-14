@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -498,7 +499,7 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 func imageToResultVerbatim(image map[string]any, cols []string) (*mysql.Result, error) {
 	row := make([]any, len(cols))
 	for i, c := range cols {
-		row[i] = image[c] // nil for missing key → NULL on wire
+		row[i] = resultsetValue(image[c]) // nil for missing key → NULL on wire
 	}
 	rs, err := mysql.BuildSimpleTextResultset(cols, [][]any{row})
 	if err != nil {
@@ -706,7 +707,7 @@ func imagesToResult(images []map[string]any, ddlOrder []string) (*mysql.Result, 
 	for i, img := range images {
 		row := make([]any, len(cols))
 		for j, c := range cols {
-			row[j] = img[c]
+			row[j] = resultsetValue(img[c])
 		}
 		values[i] = row
 	}
@@ -1182,6 +1183,29 @@ func marshalImageOrdered(image map[string]any, ddlOrder []string) string {
 // ddlOrder=nil signals "no snapshot available"; in that case we
 // fall back to alphabetical key order, which is deterministic but
 // won't match the table's natural DDL order.
+// resultsetValue converts a row-image cell into a type go-mysql's resultset
+// builder accepts. Row images decoded by query.UnmarshalRowImage carry numbers
+// as json.Number (#496), which BuildSimpleTextResultset rejects. Map it to the
+// narrowest exact numeric type — int64, or uint64 for a BIGINT UNSIGNED above
+// 2^63 — so large integers render exactly; fall back to float64 for fractional
+// values and the literal string for anything out of numeric range.
+func resultsetValue(v any) any {
+	n, ok := v.(json.Number)
+	if !ok {
+		return v
+	}
+	if i, err := n.Int64(); err == nil {
+		return i
+	}
+	if u, err := strconv.ParseUint(n.String(), 10, 64); err == nil {
+		return u
+	}
+	if f, err := n.Float64(); err == nil {
+		return f
+	}
+	return n.String()
+}
+
 func imageToResult(image map[string]any, ddlOrder []string) (*mysql.Result, error) {
 	if len(image) == 0 {
 		return emptyResult(), nil
@@ -1190,7 +1214,7 @@ func imageToResult(image map[string]any, ddlOrder []string) (*mysql.Result, erro
 	cols := orderColumns(image, ddlOrder)
 	row := make([]any, len(cols))
 	for i, c := range cols {
-		row[i] = image[c]
+		row[i] = resultsetValue(image[c])
 	}
 
 	rs, err := mysql.BuildSimpleTextResultset(cols, [][]any{row})

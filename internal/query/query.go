@@ -4,6 +4,7 @@
 package query
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -470,14 +471,36 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 			_ = json.Unmarshal(changedCols, &r.ChangedColumns)
 		}
 		if rowBefore != nil {
-			_ = json.Unmarshal(rowBefore, &r.RowBefore)
+			r.RowBefore = UnmarshalRowImage(rowBefore)
 		}
 		if rowAfter != nil {
-			_ = json.Unmarshal(rowAfter, &r.RowAfter)
+			r.RowAfter = UnmarshalRowImage(rowAfter)
 		}
 		results = append(results, r)
 	}
 	return results, rows.Err()
+}
+
+// UnmarshalRowImage decodes a row_before/row_after JSON blob into a named map,
+// keeping numbers as json.Number rather than coercing them to float64. Default
+// encoding/json turns every JSON number into a float64, which silently rounds
+// integers above 2^53 (BIGINT UNSIGNED > 2^63, large signed BIGINT) — so recover
+// SQL and query/CSV output would emit the wrong value even though storage was
+// exact (#496). json.Number preserves the exact literal; recovery.FormatSQLValue
+// and metadata.ordinalValue handle it. Returns nil on empty input or a decode
+// error (matching the prior best-effort behavior — a malformed blob yields no row
+// image rather than aborting the scan).
+func UnmarshalRowImage(data []byte) map[string]any {
+	if len(data) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil
+	}
+	return m
 }
 
 // ─── Formatters ───────────────────────────────────────────────────────────────
