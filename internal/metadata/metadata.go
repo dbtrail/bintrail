@@ -199,9 +199,63 @@ func (r *Resolver) MapRow(schema, table string, row []any) (map[string]any, erro
 	}
 	named := make(map[string]any, len(row))
 	for i, col := range tm.Columns {
-		named[col.Name] = row[i]
+		named[col.Name] = coerceUnsigned(row[i], col)
 	}
 	return named, nil
+}
+
+// coerceUnsigned reinterprets an integer value decoded by go-mysql into the
+// correct unsigned value. go-mysql always decodes INT-family columns as SIGNED
+// (int8/int16/int32/int64) — it parses the TABLE_MAP SIGNEDNESS bitmap but never
+// applies it (UnsignedMap is used only in its Dump output). So a column declared
+// UNSIGNED whose value has the high bit set comes back negative (e.g.
+// BIGINT UNSIGNED 18446744073709551615 → int64(-1)). Left uncorrected, the wrong
+// value lands in the index and, for unsigned PKs, corrupts pk_values/pk_hash.
+//
+// Signedness is taken from the snapshot's ColumnType ("... unsigned"), NOT the
+// TABLE_MAP bitmap, because the bitmap is only present under
+// binlog_row_metadata=FULL (not the default), whereas ColumnType is always
+// loaded by the resolver. Width is taken from DataType so the reinterpretation
+// masks to the column's real size — MEDIUMINT is 3 bytes but go-mysql returns it
+// as int32, so it must be masked to 24 bits (else MEDIUMINT UNSIGNED -1 would
+// become 2^32-1 instead of 2^24-1).
+//
+// No-op when the column is not unsigned, when ColumnType is empty (pre-#212
+// snapshots can't express signedness), or when the value is not a signed integer
+// (NULL, string, decimal, time, etc. are returned unchanged). BIT columns are
+// intentionally not handled here — BIT is a distinct type, not declared
+// "unsigned", and has its own representation.
+func coerceUnsigned(v any, col ColumnMeta) any {
+	if !strings.Contains(strings.ToLower(col.ColumnType), "unsigned") {
+		return v
+	}
+	var signed int64
+	switch x := v.(type) {
+	case int8:
+		signed = int64(x)
+	case int16:
+		signed = int64(x)
+	case int32:
+		signed = int64(x)
+	case int64:
+		signed = x
+	default:
+		return v // not a signed integer (NULL/string/decimal/...) — leave as-is
+	}
+	switch strings.ToLower(col.DataType) {
+	case "tinyint":
+		return uint8(signed)
+	case "smallint":
+		return uint16(signed)
+	case "mediumint":
+		return uint32(signed) & 0xFFFFFF
+	case "int":
+		return uint32(signed)
+	case "bigint":
+		return uint64(signed)
+	default:
+		return v
+	}
 }
 
 // ─── TakeSnapshot ────────────────────────────────────────────────────────────

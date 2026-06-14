@@ -73,6 +73,70 @@ func TestMapRow_success(t *testing.T) {
 	}
 }
 
+func TestCoerceUnsigned(t *testing.T) {
+	const maxU64 = uint64(18446744073709551615) // 2^64-1; int64(-1) bit pattern
+
+	cases := []struct {
+		name string
+		v    any
+		col  ColumnMeta
+		want any
+	}{
+		// Unsigned columns with the high bit set: reinterpret to the correct width.
+		{"bigint unsigned max", int64(-1), ColumnMeta{DataType: "bigint", ColumnType: "bigint unsigned"}, maxU64},
+		{"int unsigned max", int32(-1), ColumnMeta{DataType: "int", ColumnType: "int unsigned"}, uint32(4294967295)},
+		{"mediumint unsigned max (24-bit mask)", int32(-1), ColumnMeta{DataType: "mediumint", ColumnType: "mediumint unsigned"}, uint32(16777215)},
+		{"smallint unsigned max", int16(-1), ColumnMeta{DataType: "smallint", ColumnType: "smallint unsigned"}, uint16(65535)},
+		{"tinyint unsigned max", int8(-1), ColumnMeta{DataType: "tinyint", ColumnType: "tinyint unsigned"}, uint8(255)},
+		// Unsigned but value below the threshold: numerically unchanged (still converted type).
+		{"int unsigned small positive", int32(1000000), ColumnMeta{DataType: "int", ColumnType: "int unsigned"}, uint32(1000000)},
+		{"tinyint unsigned 200", int8(-56), ColumnMeta{DataType: "tinyint", ColumnType: "tinyint unsigned"}, uint8(200)},
+		// Signed column: never touched.
+		{"signed bigint negative", int64(-1), ColumnMeta{DataType: "bigint", ColumnType: "bigint(20)"}, int64(-1)},
+		// Pre-#212 snapshot: ColumnType empty → cannot know signedness → no-op.
+		{"empty column type", int64(-1), ColumnMeta{DataType: "bigint", ColumnType: ""}, int64(-1)},
+		// NULL and non-integer values on an unsigned column are returned unchanged.
+		{"null on unsigned", nil, ColumnMeta{DataType: "bigint", ColumnType: "bigint unsigned"}, nil},
+		{"string on unsigned", "x", ColumnMeta{DataType: "bigint", ColumnType: "bigint unsigned"}, "x"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := coerceUnsigned(tc.v, tc.col)
+			if got != tc.want {
+				t.Errorf("coerceUnsigned(%#v, %q) = %#v (%T); want %#v (%T)",
+					tc.v, tc.col.ColumnType, got, got, tc.want, tc.want)
+			}
+		})
+	}
+}
+
+func TestMapRow_unsignedCoercion(t *testing.T) {
+	r := buildTestResolver(map[string]*TableMeta{
+		"mydb.counters": {
+			Schema: "mydb", Table: "counters",
+			Columns: []ColumnMeta{
+				{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "bigint", ColumnType: "bigint unsigned"},
+				{Name: "n", OrdinalPosition: 2, DataType: "int", ColumnType: "int unsigned"},
+			},
+			PKColumns: []string{"id"},
+		},
+	})
+
+	// go-mysql would hand us these signed values for an unsigned PK and column.
+	row := []any{int64(-1), int32(-1)}
+	named, err := r.MapRow("mydb", "counters", row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if named["id"] != uint64(18446744073709551615) {
+		t.Errorf("id: want uint64 max, got %#v (%T)", named["id"], named["id"])
+	}
+	if named["n"] != uint32(4294967295) {
+		t.Errorf("n: want uint32 max, got %#v (%T)", named["n"], named["n"])
+	}
+}
+
 func TestMapRow_columnCountMismatch(t *testing.T) {
 	r := buildTestResolver(map[string]*TableMeta{
 		"mydb.orders": {
