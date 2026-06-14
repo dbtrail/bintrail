@@ -8,7 +8,27 @@ import (
 )
 
 // ReadSQLFile reads a mydumper SQL (.sql) data file and calls fn for each row.
-// The file contains INSERT INTO `table` VALUES(...),(...),...; statements.
+//
+// Two INSERT layouts must be handled:
+//
+//	mysqldump-style, all tuples on one line:
+//	    INSERT INTO `t` VALUES (a),(b),(c);
+//
+//	mydumper >= 1.0, one tuple per physical line with a leading comma:
+//	    INSERT INTO `t` (...) VALUES(a)
+//	    ,(b)
+//	    ,(c);
+//
+// A naive line-oriented parser that only read the VALUES line would silently
+// drop every continuation row of the second layout — the catastrophic data
+// loss of issue #495. Instead this carries an "inside a not-yet-terminated
+// INSERT" state across lines: continuation lines are parsed as further tuples
+// until the ';' statement terminator is consumed.
+//
+// Splitting on physical lines is safe because mydumper escapes embedded
+// newlines inside string values as the two-character sequence `\n`, so a line
+// boundary always falls between tuples, never inside a quoted value.
+//
 // Values are returned as raw strings; NULL is returned as "" with nulls[i]=true.
 func ReadSQLFile(path string, fn func(values []string, nulls []bool) error) error {
 	f, err := os.Open(path)
@@ -20,53 +40,91 @@ func ReadSQLFile(path string, fn func(values []string, nulls []bool) error) erro
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 8<<20), 8<<20) // 8 MB per line
 	lineNum := 0
+	inStatement := false // inside an INSERT whose ';' terminator hasn't been seen
 	for scanner.Scan() {
 		lineNum++
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(strings.ToUpper(trimmed), "INSERT") {
+		trimmed := strings.TrimSpace(scanner.Text())
+		if trimmed == "" {
 			continue
 		}
-		// Find VALUES keyword
-		valIdx := strings.Index(strings.ToUpper(trimmed), " VALUES")
-		if valIdx < 0 {
-			continue
+
+		var fragment string
+		if inStatement {
+			// Continuation line of a multi-row INSERT: ",(...)" tuples, the
+			// last ending in ';'.
+			fragment = trimmed
+		} else {
+			if !strings.HasPrefix(strings.ToUpper(trimmed), "INSERT") {
+				continue
+			}
+			// Find VALUES keyword (after any column list).
+			valIdx := strings.Index(strings.ToUpper(trimmed), " VALUES")
+			if valIdx < 0 {
+				continue
+			}
+			fragment = strings.TrimSpace(trimmed[valIdx+7:])
 		}
-		valuesPart := strings.TrimSpace(trimmed[valIdx+7:])
-		// Parse all tuples from this line
-		if err := parseSQLTuples(valuesPart, fn); err != nil {
+
+		terminated, err := parseSQLTuples(fragment, fn)
+		if err != nil {
 			return fmt.Errorf("%s line %d: %w", path, lineNum, err)
 		}
+		inStatement = !terminated
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	// A file that ends mid-statement (no ';') is truncated: fail loudly rather
+	// than report a silently short row count.
+	if inStatement {
+		return fmt.Errorf("%s: unterminated INSERT statement (missing ';') — dump file may be truncated", path)
+	}
+	return nil
 }
 
-// parseSQLTuples parses the values portion of an INSERT: "(v,v,...),(v,v,...);".
-func parseSQLTuples(s string, fn func(values []string, nulls []bool) error) error {
+// parseSQLTuples parses a fragment of an INSERT's values portion:
+// "(v,v,...),(v,v,...)" optionally ending with ";". A fragment is the part of
+// a single physical line that carries tuples — for a multi-line INSERT the same
+// statement is fed in across several calls. It returns terminated=true once it
+// consumes the ';' statement terminator, so ReadSQLFile knows the (possibly
+// multi-line) INSERT is complete.
+func parseSQLTuples(s string, fn func(values []string, nulls []bool) error) (bool, error) {
 	i := 0
 	for i < len(s) {
-		// Skip whitespace and commas between tuples
-		for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == ',' || s[i] == ';') {
+		// Skip separators between tuples. NOT ';' — that is the statement
+		// terminator and must be detected, not skipped.
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == ',') {
 			i++
 		}
 		if i >= len(s) {
 			break
 		}
+		if s[i] == ';' {
+			return true, nil
+		}
 		if s[i] != '(' {
-			break
+			// An unexpected token where a tuple or terminator was expected means
+			// malformed or non-mydumper SQL. Fail loud: a lenient skip here would
+			// discard the rest of the fragment and — because inStatement now
+			// carries across lines — swallow the following statements as bogus
+			// continuations, silently dropping their rows. That is the exact
+			// silent-loss class #495 closes. (On valid mydumper output this is
+			// unreachable: after a tuple only ',', whitespace, or ';' appears,
+			// all consumed above.)
+			return false, fmt.Errorf("unexpected token %q at offset %d (expected '(' or ';')", s[i], i)
 		}
 		i++ // consume '('
 
 		values, nulls, end, err := parseTuple(s, i)
 		if err != nil {
-			return err
+			return false, err
 		}
 		i = end
 		if err := fn(values, nulls); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // parseTuple parses a comma-separated list of SQL values starting at pos (after

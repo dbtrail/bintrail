@@ -544,6 +544,133 @@ func TestReadSQLRowUnterminated(t *testing.T) {
 	}
 }
 
+func TestReadSQLRowMultiLineInsert(t *testing.T) {
+	// mydumper >= 1.0 emits one tuple per physical line with a leading comma.
+	// The old line-oriented parser captured only the first tuple of each
+	// INSERT and silently dropped every continuation row — issue #495. This
+	// asserts every row of a multi-line, multi-statement dump is returned.
+	const sqlData = "INSERT INTO `orders` (`id`,`name`) VALUES(1,'a')\n" +
+		",(2,'b')\n" +
+		",(3,'c')\n" +
+		",(4,'d');\n" +
+		"INSERT INTO `orders` (`id`,`name`) VALUES(5,'e')\n" +
+		",(6,'f');\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.orders.00000.sql")
+	if err := os.WriteFile(path, []byte(sqlData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var rows [][]string
+	if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		rows = append(rows, append([]string(nil), values...))
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadSQLFile: %v", err)
+	}
+	// Two statements carrying 4 + 2 = 6 tuples total.
+	if len(rows) != 6 {
+		t.Fatalf("got %d rows, want 6 (multi-line continuation rows were dropped)", len(rows))
+	}
+	for i, want := range []string{"1", "2", "3", "4", "5", "6"} {
+		if rows[i][0] != want {
+			t.Errorf("row %d id = %q, want %q", i, rows[i][0], want)
+		}
+	}
+	// Spot-check continuation-row values, not just ids.
+	if rows[3][1] != "d" || rows[5][1] != "f" {
+		t.Errorf("continuation values wrong: row3=%v row5=%v", rows[3], rows[5])
+	}
+}
+
+func TestReadSQLRowMultiLineLayouts(t *testing.T) {
+	// Every comma/terminator placement mydumper variants emit must yield the
+	// same three rows.
+	layouts := map[string]string{
+		"leading-comma":      "INSERT INTO t VALUES(1)\n,(2)\n,(3);\n",
+		"trailing-comma":     "INSERT INTO t VALUES(1),\n(2),\n(3);\n",
+		"semicolon-own-line": "INSERT INTO t VALUES(1)\n,(2)\n,(3)\n;\n",
+		"values-then-tuples": "INSERT INTO t VALUES\n(1),\n(2),\n(3);\n",
+		"single-line":        "INSERT INTO t VALUES(1),(2),(3);\n",
+		"two-statements":     "INSERT INTO t VALUES(1);\nINSERT INTO t VALUES(2)\n,(3);\n",
+	}
+	for name, sql := range layouts {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "shop.t.00000.sql")
+			if err := os.WriteFile(path, []byte(sql), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var ids []string
+			if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+				ids = append(ids, values[0])
+				return nil
+			}); err != nil {
+				t.Fatalf("ReadSQLFile: %v", err)
+			}
+			if got := strings.Join(ids, ","); got != "1,2,3" {
+				t.Errorf("ids = %q, want \"1,2,3\"", got)
+			}
+		})
+	}
+}
+
+func TestReadSQLRowUnexpectedToken(t *testing.T) {
+	// A stray token where a tuple or ';' is expected must surface as a loud
+	// error, not silently truncate the fragment. With cross-line state, a
+	// lenient skip would consume the FOLLOWING INSERT as a bogus continuation
+	// and drop its rows, while a later ';' clears inStatement so the EOF guard
+	// never fires — the exact silent-loss class #495 closes. Both review repros:
+	cases := map[string]string{
+		// stray token then a bare ';' line that would have hidden the loss
+		"junk-then-bare-semicolon": "INSERT INTO `t` VALUES(1) JUNK,(2)\n;\n",
+		// stray token desyncs, swallowing the next INSERT statement's rows
+		"junk-swallows-next-stmt": "INSERT INTO `t` VALUES(1) X\nINSERT INTO `t` VALUES(2)\n,(3);\n",
+	}
+	for name, sql := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "shop.t.00000.sql")
+			if err := os.WriteFile(path, []byte(sql), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var count int
+			err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+				count++
+				return nil
+			})
+			if err == nil {
+				t.Fatalf("expected error for unexpected token, got nil (parsed %d rows)", count)
+			}
+			if !strings.Contains(err.Error(), "unexpected token") {
+				t.Errorf("error = %v, want it to mention 'unexpected token'", err)
+			}
+		})
+	}
+}
+
+func TestReadSQLRowTruncated(t *testing.T) {
+	// A dump file that ends mid-statement (no terminating ';') is truncated.
+	// Fail loudly rather than silently return a short row count.
+	const sqlData = "INSERT INTO `orders` VALUES(1,'a')\n,(2,'b')\n,(3,'c')\n" // no ';'
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.orders.00000.sql")
+	if err := os.WriteFile(path, []byte(sqlData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		count++
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("expected error for truncated (unterminated) INSERT, got nil (parsed %d rows)", count)
+	}
+	if !strings.Contains(err.Error(), "unterminated") {
+		t.Errorf("error = %v, want it to mention 'unterminated'", err)
+	}
+}
+
 // ─── DiscoverTables ───────────────────────────────────────────────────────────
 
 func TestDiscoverTables(t *testing.T) {
