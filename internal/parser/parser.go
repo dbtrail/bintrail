@@ -36,6 +36,13 @@ const (
 	// produces this type — it exists so baseline rows can flow through the
 	// same ResultRow pipeline as real binlog events.
 	EventSnapshot EventType = 6
+	// EventCommit marks a transaction commit boundary (XID_EVENT, or a COMMIT
+	// QUERY_EVENT). It carries no row data — only the GTID of the transaction
+	// that just committed. The stream consumer uses it to advance the durable
+	// GTID checkpoint ONLY after a transaction's rows are fully received, so a
+	// checkpoint can never claim a half-streamed transaction (#491). Emitted only
+	// by the StreamParser; the file parser does not produce it.
+	EventCommit EventType = 7
 )
 
 // Event is a fully resolved binlog row event with column names attached.

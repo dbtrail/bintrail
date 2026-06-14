@@ -739,8 +739,8 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 				return nil
 			}
 
-			// Skip non-row events (GTID tracking, DDL).
-			if ev.EventType == parser.EventGTID || ev.EventType == parser.EventDDL {
+			// Skip non-row events (GTID tracking, DDL, commit boundaries).
+			if ev.EventType == parser.EventGTID || ev.EventType == parser.EventDDL || ev.EventType == parser.EventCommit {
 				continue
 			}
 

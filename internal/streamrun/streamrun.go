@@ -650,6 +650,23 @@ func streamLoop(
 		}
 	}
 
+	// advanceGTID adds a committed transaction's GTID to the durable set. It is
+	// called only at commit boundaries (EventCommit / EventDDL), never at the
+	// leading EventGTID, so a checkpoint can never persist a GTID whose rows were
+	// not fully received and indexed (#491). No-op in position mode (accGTID nil)
+	// and for non-GTID sources (empty gtid).
+	advanceGTID := func(gtid string) {
+		if gtid == "" || state.accGTID == nil {
+			return
+		}
+		if err := state.accGTID.Update(gtid); err != nil {
+			slog.Warn("failed to update GTID set", "gtid", gtid, "error", err)
+			m.Errors.WithLabelValues("gtid_update").Inc()
+			return
+		}
+		state.gtidSet = state.accGTID.String()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -669,29 +686,29 @@ func streamLoop(
 				state.binlogFile = ev.BinlogFile
 			}
 			state.binlogPos = ev.EndPos
-			if ev.GTID != "" && state.accGTID != nil {
-				if err := state.accGTID.Update(ev.GTID); err != nil {
-					slog.Warn("failed to update GTID set", "gtid", ev.GTID, "error", err)
-					m.Errors.WithLabelValues("gtid_update").Inc()
-				} else {
-					state.gtidSet = state.accGTID.String()
-				}
-			}
 			if !ev.Timestamp.IsZero() {
 				state.lastEventTime = sql.NullTime{Time: ev.Timestamp, Valid: true}
 			}
 
-			// GTID-only events: position/GTID already tracked above, skip insertion.
-			if ev.EventType == parser.EventGTID {
+			switch ev.EventType {
+			case parser.EventGTID:
+				// Transaction start marker — attribution only. The GTID is NOT
+				// added to the durable set here; that happens at EventCommit, so a
+				// checkpoint mid-transaction can't claim a half-streamed
+				// transaction (#491).
 				continue
-			}
-
-			// DDL events: flush batch, skip insertion (handled by the
-			// parser's synchronous hook — see the function comment).
-			if ev.EventType == parser.EventDDL {
+			case parser.EventCommit:
+				// Transaction committed: all its rows have been received, so it is
+				// now safe to advance the durable GTID checkpoint.
+				advanceGTID(ev.GTID)
+				continue
+			case parser.EventDDL:
+				// DDL flushes pending rows, then auto-commits its own GTID
+				// (insertion itself is handled by the parser's synchronous hook).
 				if err := flush(); err != nil {
 					return err
 				}
+				advanceGTID(ev.GTID)
 				continue
 			}
 

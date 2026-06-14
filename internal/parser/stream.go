@@ -6,6 +6,7 @@ package parser
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -86,6 +87,29 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	var currentGTID string
 	var currentConnectionID uint32 // pseudo_thread_id from most recent QueryEvent
 
+	// emitCommit signals a transaction commit boundary so the stream consumer can
+	// advance the durable GTID checkpoint only after the transaction's rows are
+	// fully received (#491). No-op for non-GTID sources (currentGTID empty), which
+	// keeps position-mode behavior unchanged.
+	emitCommit := func(hdr *replication.EventHeader) error {
+		if currentGTID == "" {
+			return nil
+		}
+		commitEv := Event{
+			BinlogFile: currentFile,
+			EndPos:     uint64(hdr.LogPos),
+			Timestamp:  time.Unix(int64(hdr.Timestamp), 0).UTC(),
+			GTID:       currentGTID,
+			EventType:  EventCommit,
+		}
+		select {
+		case out <- commitEv:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	// handleEvent processes one binlog event. It is recursive: with
 	// binlog_transaction_compression=ON the source wraps each transaction's
 	// events (BEGIN + TABLE_MAP + rows + XID) in a single zstd-compressed
@@ -132,6 +156,19 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 				if hook := sp.onDDL.Load(); hook != nil {
 					(*hook)(ddlEv)
 				}
+			} else if strings.EqualFold(strings.TrimSpace(string(ev.Query)), "COMMIT") {
+				// Non-XID transactional commit (e.g. non-InnoDB engines). InnoDB
+				// commits arrive as XID_EVENT, handled below.
+				if err := emitCommit(binlogEv.Header); err != nil {
+					return err
+				}
+			}
+
+		case *replication.XIDEvent:
+			// InnoDB transaction commit — the boundary at which it's safe to
+			// advance the durable GTID checkpoint (#491).
+			if err := emitCommit(binlogEv.Header); err != nil {
+				return err
 			}
 
 		case *replication.RowsEvent:
