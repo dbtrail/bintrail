@@ -660,7 +660,14 @@ func streamLoop(
 			return
 		}
 		if err := state.accGTID.Update(gtid); err != nil {
-			slog.Warn("failed to update GTID set", "gtid", gtid, "error", err)
+			// This is the sole path to durable GTID progress; on a persistent
+			// failure the checkpoint silently freezes while rows keep indexing and
+			// checkpoints keep "succeeding" with the stale set. Log loudly (Error,
+			// not Warn) — a frozen-but-green checkpoint means a full re-stream on
+			// the next restart. Update only errors on a malformed GTID, which the
+			// parser does not produce, so this should never fire in practice.
+			slog.Error("failed to update GTID set — durable checkpoint is not advancing",
+				"gtid", gtid, "error", err)
 			m.Errors.WithLabelValues("gtid_update").Inc()
 			return
 		}

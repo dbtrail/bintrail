@@ -129,12 +129,21 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 		case *replication.GTIDEvent:
 			// A new transaction is starting, so the previous one has terminated. If
 			// it wasn't already committed by its XID or a table DDL, commit it now.
-			// This is the catch-all for implicitly-committed statements that carry a
-			// GTID but emit no XID and aren't table DDL: GRANT/REVOKE, CREATE/DROP
-			// DATABASE, CREATE/DROP VIEW/TRIGGER/PROCEDURE/FUNCTION, CREATE/DROP
-			// INDEX, ANALYZE/OPTIMIZE TABLE, XA COMMIT, an explicit COMMIT, etc.
+			// This is the catch-all for transactions that carry a GTID but emit no
+			// XID and aren't table DDL — two families:
+			//   * implicitly-committed DDL/DCL: GRANT/REVOKE, CREATE/DROP DATABASE,
+			//     CREATE/DROP VIEW/TRIGGER/PROCEDURE/FUNCTION, CREATE/DROP INDEX,
+			//     ANALYZE/OPTIMIZE TABLE;
+			//   * explicit terminators logged as a QUERY with no XID: XA COMMIT, or
+			//     a COMMIT of a non-transactional/mixed-engine transaction.
+			// (A normal InnoDB COMMIT does NOT reach here — it ends in an XID_EVENT.)
 			// Without this their GTID would never advance the checkpoint, causing
 			// endless re-streaming and eventually a false data-loss gap alarm (#491).
+			//
+			// Limitation: the fallback fires on the NEXT GTID, so the LAST such
+			// statement before an idle period or shutdown stays uncommitted until
+			// traffic resumes — it is re-streamed on restart (harmless: these carry
+			// no rows). DML is unaffected (it commits immediately at its XID).
 			if err := emitCommit(binlogEv.Header); err != nil {
 				return err
 			}
