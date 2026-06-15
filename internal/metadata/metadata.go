@@ -253,6 +253,9 @@ func coerceUnsigned(v any, col ColumnMeta) any {
 		if i, ok := v.(int64); ok {
 			return uint64(i)
 		}
+		// go-mysql always decodes BIT as int64, so this never fires today. If a
+		// future go-mysql/MariaDB path ever delivered BIT as []byte/string, leave
+		// it uninterpreted rather than mis-coerce — the original value, not a bug.
 		return v
 	}
 	if !strings.Contains(strings.ToLower(col.ColumnType), "unsigned") {
