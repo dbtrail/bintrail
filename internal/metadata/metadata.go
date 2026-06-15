@@ -247,15 +247,17 @@ func (r *Resolver) MapRow(schema, table string, row []any) (map[string]any, erro
 func coerceUnsigned(v any, col ColumnMeta) any {
 	// BIT is an unsigned bit string. go-mysql decodes BIT(N) as int64, so BIT(64)
 	// with the high bit set comes back negative; reinterpret as uint64 — identity
-	// for BIT(1..63) (always positive within int64). BIT's ColumnType is "bit(N)"
-	// (no "unsigned"), so handle it before the unsigned gate below.
+	// for BIT(1..63) (the value is non-negative as int64, so uint64() preserves
+	// it). BIT's ColumnType is "bit(N)" (no "unsigned"), so handle it before the
+	// unsigned gate below.
 	if strings.ToLower(col.DataType) == "bit" {
 		if i, ok := v.(int64); ok {
 			return uint64(i)
 		}
-		// go-mysql always decodes BIT as int64, so this never fires today. If a
-		// future go-mysql/MariaDB path ever delivered BIT as []byte/string, leave
-		// it uninterpreted rather than mis-coerce — the original value, not a bug.
+		// A NULL BIT arrives as nil and passes through here. Otherwise go-mysql
+		// always decodes BIT as int64, so a non-nil non-int64 value can't occur
+		// today; if a future go-mysql/MariaDB path delivered BIT as []byte/string,
+		// leave it uninterpreted rather than mis-coerce — the original value.
 		return v
 	}
 	if !strings.Contains(strings.ToLower(col.ColumnType), "unsigned") {
