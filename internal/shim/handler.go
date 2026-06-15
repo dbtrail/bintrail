@@ -1183,27 +1183,45 @@ func marshalImageOrdered(image map[string]any, ddlOrder []string) string {
 // ddlOrder=nil signals "no snapshot available"; in that case we
 // fall back to alphabetical key order, which is deterministic but
 // won't match the table's natural DDL order.
-// resultsetValue converts a row-image cell into a type go-mysql's resultset
-// builder accepts. Row images decoded by query.UnmarshalRowImage carry numbers
-// as json.Number (#496), which BuildSimpleTextResultset rejects. Map it to the
-// narrowest exact numeric type — int64, or uint64 for a BIGINT UNSIGNED above
-// 2^63 — so large integers render exactly; fall back to float64 for fractional
-// values and the literal string for anything out of numeric range.
-func resultsetValue(v any) any {
-	n, ok := v.(json.Number)
-	if !ok {
-		return v
-	}
+// numberToText renders a JSON-decoded numeric row-image value (#496) to the
+// SAME wire bytes go-mysql's FormatTextValue produces for the equivalent native
+// value. Two reasons it must pre-render to []byte rather than return a numeric:
+//   - BuildSimpleTextResultset fixes a column's wire type from its first row and
+//     rejects later rows of a different Go type ("row types aren't consistent").
+//     Returning int64 for an integral DOUBLE and float64 for a fractional one in
+//     the same column would crash the whole _flashback full-table query. A
+//     uniform []byte makes every such column VAR_STRING.
+//   - In the full-table _snapshot merge, baseline-origin cells (DuckDB-native,
+//     rendered via FormatTextValue) and event-origin cells must emit identical
+//     bytes; routing both through FormatTextValue guarantees that (a raw
+//     json.Number literal would diverge, e.g. "1e+21" vs "1000…0").
+// The exact numeric type is recovered first so a BIGINT UNSIGNED > 2^63 stays
+// exact (int64 → uint64 → float64), falling back to the literal text.
+func numberToText(n json.Number) []byte {
+	var v any
 	if i, err := n.Int64(); err == nil {
-		return i
+		v = i
+	} else if u, err := strconv.ParseUint(n.String(), 10, 64); err == nil {
+		v = u
+	} else if f, err := n.Float64(); err == nil {
+		v = f
+	} else {
+		return []byte(n.String())
 	}
-	if u, err := strconv.ParseUint(n.String(), 10, 64); err == nil {
-		return u
+	if b, err := mysql.FormatTextValue(v); err == nil {
+		return b
 	}
-	if f, err := n.Float64(); err == nil {
-		return f
+	return []byte(n.String())
+}
+
+// resultsetValue normalizes a row-image cell for BuildSimpleTextResultset. A
+// json.Number (#496) is pre-rendered to uniform text bytes via numberToText;
+// every other value passes through unchanged.
+func resultsetValue(v any) any {
+	if n, ok := v.(json.Number); ok {
+		return numberToText(n)
 	}
-	return n.String()
+	return v
 }
 
 func imageToResult(image map[string]any, ddlOrder []string) (*mysql.Result, error) {

@@ -1,6 +1,7 @@
 package reconstruct
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,7 +145,7 @@ func TestMydumperWriter_rotateByChunkSize(t *testing.T) {
 // (JSON column).
 func TestMydumperWriter_valueTypeMatrix(t *testing.T) {
 	dir := t.TempDir()
-	cols := []string{"c_int", "c_text", "c_null", "c_double", "c_time", "c_blob", "c_json"}
+	cols := []string{"c_int", "c_text", "c_null", "c_double", "c_time", "c_blob", "c_json", "c_bigu"}
 	w, err := NewMydumperWriter(dir, "mydb", "mixed", cols, 0)
 	if err != nil {
 		t.Fatalf("NewMydumperWriter: %v", err)
@@ -159,6 +160,7 @@ func TestMydumperWriter_valueTypeMatrix(t *testing.T) {
 		ts,
 		[]byte{0xde, 0xad, 0xbe, 0xef},
 		map[string]any{"k": "v"},
+		json.Number("18446744073709551615"), // BIGINT UNSIGNED max from a binlog delta (#496)
 	}
 	if err := w.WriteRow(row); err != nil {
 		t.Fatalf("WriteRow: %v", err)
@@ -181,11 +183,17 @@ func TestMydumperWriter_valueTypeMatrix(t *testing.T) {
 		"'2026-04-11 14:30:45.500000'",   // time.Time
 		"X'deadbeef'",                    // []byte
 		`'{"k":"v"}'`,                    // map[string]any (JSON column)
+		"18446744073709551615",           // json.Number: bare numeric literal, exact
 	}
 	for _, want := range wants {
 		if !strings.Contains(content, want) {
 			t.Errorf("chunk missing %q, content:\n%s", want, content)
 		}
+	}
+	// The json.Number must be a bare numeric literal, not quoted (the quoted form
+	// is what a regression to the default string case would produce).
+	if strings.Contains(content, `'18446744073709551615'`) {
+		t.Errorf("json.Number must not be quoted as a string:\n%s", content)
 	}
 }
 

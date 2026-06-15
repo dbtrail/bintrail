@@ -164,13 +164,14 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	// Buffer the merged rows, coercing every value to a uniform text cell
 	// (see fullTableTextCell). This is required, not cosmetic: a baseline row
 	// carries DuckDB-native types (an int column is int32 → LONGLONG) while a
-	// post-baseline event image is JSON-decoded (the same column is float64 →
-	// DOUBLE), and BuildSimpleTextResultset rejects a column whose non-NULL
-	// rows disagree on type ("row types aren't consistent"). Rendering every
-	// cell to its text bytes makes each column uniformly VAR_STRING, lossless
-	// for large integers (unlike the event path's float64), and identical on
-	// the wire to per-value formatting. Stop at cap+1 so overflow is
-	// detectable.
+	// post-baseline event image is JSON-decoded (the same column arrives as
+	// json.Number), and BuildSimpleTextResultset rejects a column whose non-NULL
+	// rows disagree on type ("row types aren't consistent"). Rendering every cell
+	// to its text bytes makes each column uniformly VAR_STRING and lossless for
+	// large integers — both origins now preserve them exactly (#496): fullTableTextCell
+	// routes json.Number through numberToText, the same FormatTextValue path the
+	// default branch uses for baseline values, so the bytes are identical on the
+	// wire. Stop at cap+1 so overflow is detectable.
 	images := make([]map[string]any, 0)
 	err = reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
 		BaselinePath: baselinePath,
@@ -250,9 +251,11 @@ func (h *Handler) fullTableTextCell(schema, table, column string, v any) any {
 	case string:
 		return []byte(x)
 	case json.Number:
-		// Post-baseline event images are JSON-decoded as json.Number (#496);
-		// render the exact literal so large integers stay lossless on the wire.
-		return []byte(x.String())
+		// Post-baseline event images are JSON-decoded as json.Number (#496).
+		// Render through numberToText (FormatTextValue) so event-origin cells emit
+		// byte-identical wire bytes to baseline-origin cells of the same value —
+		// the default branch below renders DuckDB-native values the same way.
+		return numberToText(x)
 	case time.Time:
 		return []byte(x.UTC().Format("2006-01-02 15:04:05"))
 	default:

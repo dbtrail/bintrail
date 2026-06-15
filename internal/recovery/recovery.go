@@ -298,15 +298,16 @@ func allColsWhere(row map[string]any) []string {
 // mydumper writer in internal/reconstruct, #187) can reuse the exact same
 // formatting and escaping.
 //
-// Binlog-event values arrive here after a JSON round-trip
-// (row_before/row_after are stored as JSON and unmarshalled into
-// map[string]any), so all numeric values are float64. Whole-number float64s
-// are formatted as integers; fractional ones as decimals.
+// Binlog-event values arrive here after a JSON round-trip — row_before/row_after
+// are decoded via query.UnmarshalRowImage, so numeric values are json.Number
+// (the exact literal, no float64 rounding — #496); the json.Number case emits
+// them verbatim.
 //
-// DuckDB's database/sql driver (used by the full-table reconstruct path)
-// returns int64 / time.Time / []byte natively — those cases are also handled
-// here so the same function formats both JSON-round-tripped values from
-// binlog events and direct DuckDB scan values from baseline Parquet rows.
+// DuckDB's database/sql driver (used by the full-table reconstruct path) returns
+// int64 / float64 / time.Time / []byte natively — those cases are also handled
+// here so the same function formats both JSON-round-tripped binlog values and
+// direct DuckDB scan values from baseline Parquet rows. The float64 case is now
+// reached only by DuckDB-origin DOUBLE/FLOAT columns, not binlog integers.
 func FormatSQLValue(v any) string {
 	if v == nil {
 		return "NULL"
@@ -338,8 +339,10 @@ func FormatSQLValue(v any) string {
 		return string(val)
 
 	case float64:
-		// Detect integer-valued floats (JSON round-trip converts int→float64).
-		// math.Abs guard prevents int64 overflow for very large floats.
+		// DuckDB-origin DOUBLE/FLOAT columns (baseline reconstruct path). Whole
+		// numbers are emitted as integers, fractional ones as decimals. Binlog
+		// integers no longer reach here — they arrive as json.Number, handled
+		// above. math.Abs guard prevents int64 overflow for very large floats.
 		if !math.IsInf(val, 0) && !math.IsNaN(val) &&
 			val == math.Trunc(val) && math.Abs(val) < 1e15 {
 			return strconv.FormatInt(int64(val), 10)

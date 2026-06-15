@@ -4,6 +4,7 @@ package parquetquery_test
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
@@ -12,6 +13,41 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
+
+// TestFetch_archivedLargeUnsignedExact verifies the archived-Parquet read path
+// preserves a BIGINT UNSIGNED > 2^63 exactly: the archive writer stores the raw
+// JSON bytes, and parquetquery.scanRows now decodes via query.UnmarshalRowImage
+// (json.Number), so the value survives the round-trip without float64 rounding
+// (#496). This is a SEPARATE scanRows from the live-MySQL path.
+func TestFetch_archivedLargeUnsignedExact(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, "2026-02-19 14:00:00", nil,
+		"mydb", "counters", 1, "1",
+		nil, nil, []byte(`{"id":1,"big":18446744073709551615}`))
+
+	outPath := filepath.Join(t.TempDir(), "p_future.parquet")
+	if _, err := archive.ArchivePartition(context.Background(), db, dbName, "p_future", outPath, "none"); err != nil {
+		t.Fatalf("ArchivePartition failed: %v", err)
+	}
+
+	rows, err := parquetquery.Fetch(context.Background(),
+		query.Options{Schema: "mydb", Table: "counters", Limit: 100}, outPath)
+	if err != nil {
+		t.Fatalf("parquetquery.Fetch failed: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	n, ok := rows[0].RowAfter["big"].(json.Number)
+	if !ok {
+		t.Fatalf("big should decode to json.Number, got %T", rows[0].RowAfter["big"])
+	}
+	if n.String() != "18446744073709551615" {
+		t.Errorf("archived BIGINT UNSIGNED = %q, want exact 18446744073709551615", n.String())
+	}
+}
 
 // TestFetch_archivedNullBinlogFile closes the dbtrail/bintrail#318 loop
 // end-to-end: drift in the MySQL index → bintrail rotate writes Parquet

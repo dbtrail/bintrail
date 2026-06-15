@@ -486,10 +486,11 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 // encoding/json turns every JSON number into a float64, which silently rounds
 // integers above 2^53 (BIGINT UNSIGNED > 2^63, large signed BIGINT) — so recover
 // SQL and query/CSV output would emit the wrong value even though storage was
-// exact (#496). json.Number preserves the exact literal; recovery.FormatSQLValue
-// and metadata.ordinalValue handle it. Returns nil on empty input or a decode
-// error (matching the prior best-effort behavior — a malformed blob yields no row
-// image rather than aborting the scan).
+// exact (#496). json.Number preserves the exact literal; the downstream
+// formatters handle it (recovery.FormatSQLValue, metadata.ordinalValue, the
+// shim's resultsetValue/fullTableTextCell). Returns nil on empty input or a
+// decode error — still best-effort: a malformed blob yields no row image rather
+// than aborting the scan.
 func UnmarshalRowImage(data []byte) map[string]any {
 	if len(data) == 0 {
 		return nil

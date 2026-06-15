@@ -25,25 +25,68 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
+func mustFormatText(t *testing.T, v any) string {
+	t.Helper()
+	b, err := gomysql.FormatTextValue(v)
+	if err != nil {
+		t.Fatalf("FormatTextValue(%#v): %v", v, err)
+	}
+	return string(b)
+}
+
+// parseRowCells parses every RowData in a BuildSimpleTextResultset result into
+// string cells (RowDatas are populated, not Values, so GetString can't be used).
+func parseRowCells(t *testing.T, rs *gomysql.Resultset) [][]string {
+	t.Helper()
+	out := make([][]string, 0, len(rs.RowDatas))
+	for _, rd := range rs.RowDatas {
+		fvs, err := rd.Parse(rs.Fields, false, nil)
+		if err != nil {
+			t.Fatalf("parse row data: %v", err)
+		}
+		cells := make([]string, len(fvs))
+		for i := range fvs {
+			switch v := fvs[i].Value().(type) {
+			case nil:
+				cells[i] = "NULL"
+			case []byte:
+				cells[i] = string(v)
+			default:
+				cells[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		out = append(out, cells)
+	}
+	return out
+}
+
 // TestResultsetValue_jsonNumber locks the json.Number → resultset conversion
-// (#496): BuildSimpleTextResultset rejects json.Number, so row-image numbers must
-// map to the narrowest exact numeric type, including uint64 for BIGINT UNSIGNED
-// above 2^63.
+// (#496). BuildSimpleTextResultset rejects json.Number and fixes a column's wire
+// type from its first row, so numbers are pre-rendered to uniform text bytes via
+// FormatTextValue — exact for BIGINT UNSIGNED above 2^63.
 func TestResultsetValue_jsonNumber(t *testing.T) {
-	cases := []struct {
-		in   json.Number
-		want any
-	}{
-		{"12345", int64(12345)},
-		{"-7", int64(-7)},
-		{"9223372036854775807", int64(9223372036854775807)},     // BIGINT signed max
-		{"18446744073709551615", uint64(18446744073709551615)},  // BIGINT UNSIGNED max
-		{"3.14", float64(3.14)},                                 // fractional → float64
+	cases := []struct{ in, want string }{
+		{"12345", "12345"},
+		{"-7", "-7"},
+		{"9223372036854775807", "9223372036854775807"},   // 2^63-1 → int64 branch
+		{"9223372036854775808", "9223372036854775808"},   // exactly 2^63 → uint64 branch
+		{"18446744073709551615", "18446744073709551615"}, // BIGINT UNSIGNED max → uint64
+		{"3.14", "3.14"},                                 // fractional → float64
 	}
 	for _, c := range cases {
-		if got := resultsetValue(c.in); got != c.want {
-			t.Errorf("resultsetValue(json.Number(%q)) = %#v (%T), want %#v (%T)", c.in, got, got, c.want, c.want)
+		b, ok := resultsetValue(json.Number(c.in)).([]byte)
+		if !ok {
+			t.Errorf("resultsetValue(%q) = %T, want []byte", c.in, resultsetValue(json.Number(c.in)))
+			continue
 		}
+		if string(b) != c.want {
+			t.Errorf("resultsetValue(json.Number(%q)) = %q, want %q", c.in, b, c.want)
+		}
+	}
+	// json.Number renders byte-identically to FormatTextValue of the equivalent
+	// native value — the path baseline-origin cells take, so the two agree.
+	if got := string(resultsetValue(json.Number("18446744073709551615")).([]byte)); got != mustFormatText(t, uint64(18446744073709551615)) {
+		t.Errorf("json.Number vs native uint64 render diverge: %q", got)
 	}
 	// Non-json.Number values pass through unchanged.
 	if got := resultsetValue("hi"); got != "hi" {
@@ -52,8 +95,63 @@ func TestResultsetValue_jsonNumber(t *testing.T) {
 	if got := resultsetValue(nil); got != nil {
 		t.Errorf("nil passthrough = %#v, want nil", got)
 	}
-	if got := resultsetValue(int64(42)); got != int64(42) {
-		t.Errorf("int64 passthrough = %#v, want int64(42)", got)
+}
+
+// TestImagesToResult_jsonNumberMixedAndExact is the regression test for the
+// review-caught crash (#496/#505): a DOUBLE column with an integral value in one
+// row and a fractional in another must NOT trip "row types aren't consistent",
+// and a BIGINT UNSIGNED max must render exactly on the wire.
+func TestImagesToResult_jsonNumberMixedAndExact(t *testing.T) {
+	images := []map[string]any{
+		{"id": json.Number("1"), "score": json.Number("100"), "big": json.Number("18446744073709551615")},
+		{"id": json.Number("2"), "score": json.Number("100.5"), "big": json.Number("0")},
+	}
+	res, err := imagesToResult(images, []string{"id", "score", "big"})
+	if err != nil {
+		t.Fatalf("imagesToResult must not crash on a mixed integral/fractional column: %v", err)
+	}
+	got := parseRowCells(t, res.Resultset)
+	want := [][]string{
+		{"1", "100", "18446744073709551615"},
+		{"2", "100.5", "0"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("rows = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		for j := range want[i] {
+			if got[i][j] != want[i][j] {
+				t.Errorf("cell[%d][%d] = %q, want %q", i, j, got[i][j], want[i][j])
+			}
+		}
+	}
+}
+
+// TestFullTableTextCell_jsonNumberMatchesNative locks the baseline/event
+// consistency the silent-failure review flagged: a json.Number event cell must
+// render byte-identically to the DuckDB-native baseline cell of the same value,
+// including extreme doubles where the raw literal (1e+21) differs from
+// FormatTextValue's decimal form.
+func TestFullTableTextCell_jsonNumberMatchesNative(t *testing.T) {
+	h := NewHandler(nil, nil)
+	cases := []struct {
+		num    json.Number
+		native any
+	}{
+		{"18446744073709551615", uint64(18446744073709551615)}, // BIGINT UNSIGNED
+		{"100", int64(100)},
+		{"1e+21", float64(1e21)},   // extreme double: literal "1e+21" vs decimal
+		{"0.0000001", float64(1e-7)},
+		{"100.5", float64(100.5)},
+	}
+	for _, c := range cases {
+		event := h.fullTableTextCell("s", "t", "c", c.num)
+		baseline := h.fullTableTextCell("s", "t", "c", c.native)
+		eb, _ := event.([]byte)
+		bb, _ := baseline.([]byte)
+		if string(eb) != string(bb) {
+			t.Errorf("json.Number(%q) → %q, native %T → %q (must be identical)", c.num, eb, c.native, bb)
+		}
 	}
 }
 

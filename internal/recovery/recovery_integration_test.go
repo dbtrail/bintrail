@@ -108,6 +108,40 @@ func TestGenerateSQL_updateReverse(t *testing.T) {
 	assertContains(t, out, "'shipped'")
 }
 
+func TestGenerateSQL_updateLargeUnsignedExact(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// UPDATE reversal with a BIGINT UNSIGNED max in both images. With a nil
+	// resolver the value lands in BOTH the SET clause (from row_before) and the
+	// all-columns WHERE clause (from row_after) — both via FormatSQLValue — so one
+	// event locks the large value on both clauses (#496).
+	testutil.InsertEvent(t, db,
+		"binlog.000001", 100, 200, "2026-02-19 14:00:00", nil,
+		"mydb", "counters", 2, "1",
+		[]byte(`["n"]`),
+		[]byte(`{"id":1,"big":18446744073709551615,"n":1}`),
+		[]byte(`{"id":1,"big":18446744073709551615,"n":2}`),
+	)
+
+	g := New(db, nil)
+	var buf bytes.Buffer
+	if _, err := g.GenerateSQL(context.Background(), query.Options{
+		Schema: "mydb", Table: "counters", Limit: 100,
+	}, &buf); err != nil {
+		t.Fatalf("GenerateSQL failed: %v", err)
+	}
+	out := buf.String()
+	assertContains(t, out, "UPDATE")
+	// Must appear exactly (SET and WHERE), never rounded to ...616.
+	if strings.Count(out, "18446744073709551615") < 2 {
+		t.Errorf("expected the exact BIGINT UNSIGNED value in SET and WHERE:\n%s", out)
+	}
+	if strings.Contains(out, "18446744073709551616") {
+		t.Errorf("BIGINT UNSIGNED was rounded through float64:\n%s", out)
+	}
+}
+
 func TestGenerateSQL_insertToDelete(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
