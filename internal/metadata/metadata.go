@@ -242,10 +242,19 @@ func (r *Resolver) MapRow(schema, table string, row []any) (map[string]any, erro
 // snapshots can't express signedness — NewResolver warns once in that case), or
 // when the value is not a signed integer (NULL, string, and DECIMAL/FLOAT/DOUBLE
 // UNSIGNED — which go-mysql returns as string/float — are returned unchanged).
-// BIT is intentionally gated out: it is a distinct type, never declared
-// "unsigned". (BIT(64) with the high bit set has the same underlying corruption,
-// since go-mysql decodes BIT as int64, but is tracked separately.)
+// BIT is also reinterpreted here: go-mysql decodes it as a signed int64, so a
+// BIT(64) with the high bit set comes back negative; it's mapped to uint64 (#497).
 func coerceUnsigned(v any, col ColumnMeta) any {
+	// BIT is an unsigned bit string. go-mysql decodes BIT(N) as int64, so BIT(64)
+	// with the high bit set comes back negative; reinterpret as uint64 — identity
+	// for BIT(1..63) (always positive within int64). BIT's ColumnType is "bit(N)"
+	// (no "unsigned"), so handle it before the unsigned gate below.
+	if strings.ToLower(col.DataType) == "bit" {
+		if i, ok := v.(int64); ok {
+			return uint64(i)
+		}
+		return v
+	}
 	if !strings.Contains(strings.ToLower(col.ColumnType), "unsigned") {
 		return v
 	}

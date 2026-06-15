@@ -103,6 +103,13 @@ func TestCoerceUnsigned(t *testing.T) {
 		// (DataType "enum" ∉ integer widths) — which must leave it untouched. This
 		// locks that load-bearing default so a future refactor can't coerce it.
 		{"enum value list contains 'unsigned'", int64(2), ColumnMeta{DataType: "enum", ColumnType: "enum('signed','unsigned')"}, int64(2)},
+		// BIT: go-mysql decodes it as int64, so BIT(64) with the high bit set is
+		// negative; reinterpret as uint64 (#497). BIT(<64) values are already
+		// positive (identity); NULL passes through.
+		{"bit(64) all bits set", int64(-1), ColumnMeta{DataType: "bit", ColumnType: "bit(64)"}, maxU64},
+		{"bit(64) high bit only", int64(-9223372036854775808), ColumnMeta{DataType: "bit", ColumnType: "bit(64)"}, uint64(9223372036854775808)},
+		{"bit(8) positive unchanged", int64(200), ColumnMeta{DataType: "bit", ColumnType: "bit(8)"}, uint64(200)},
+		{"bit null passthrough", nil, ColumnMeta{DataType: "bit", ColumnType: "bit(64)"}, nil},
 	}
 
 	for _, tc := range cases {
