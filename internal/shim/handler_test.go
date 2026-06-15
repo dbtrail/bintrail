@@ -68,10 +68,12 @@ func TestResultsetValue_jsonNumber(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"12345", "12345"},
 		{"-7", "-7"},
+		{"-9223372036854775808", "-9223372036854775808"}, // BIGINT signed min → int64 branch
 		{"9223372036854775807", "9223372036854775807"},   // 2^63-1 → int64 branch
 		{"9223372036854775808", "9223372036854775808"},   // exactly 2^63 → uint64 branch
 		{"18446744073709551615", "18446744073709551615"}, // BIGINT UNSIGNED max → uint64
 		{"3.14", "3.14"},                                 // fractional → float64
+		{"1e1000", "1e1000"},                             // beyond float64 range → literal passthrough
 	}
 	for _, c := range cases {
 		b, ok := resultsetValue(json.Number(c.in)).([]byte)
@@ -128,30 +130,46 @@ func TestImagesToResult_jsonNumberMixedAndExact(t *testing.T) {
 }
 
 // TestFullTableTextCell_jsonNumberMatchesNative locks the baseline/event
-// consistency the silent-failure review flagged: a json.Number event cell must
-// render byte-identically to the DuckDB-native baseline cell of the same value,
-// including extreme doubles where the raw literal (1e+21) differs from
-// FormatTextValue's decimal form.
+// consistency the silent-failure review flagged: a json.Number event cell renders
+// byte-identically to FormatTextValue of the equivalent native Go value (the path
+// baseline-origin INT/DOUBLE cells take), including extreme doubles where the raw
+// literal (1e+21) differs from FormatTextValue's decimal form. FLOAT (float32) is
+// the documented exception (separate sub-test below).
 func TestFullTableTextCell_jsonNumberMatchesNative(t *testing.T) {
 	h := NewHandler(nil, nil)
 	cases := []struct {
 		num    json.Number
 		native any
 	}{
-		{"18446744073709551615", uint64(18446744073709551615)}, // BIGINT UNSIGNED
+		{"18446744073709551615", uint64(18446744073709551615)},   // BIGINT UNSIGNED max
 		{"100", int64(100)},
-		{"1e+21", float64(1e21)},   // extreme double: literal "1e+21" vs decimal
+		{"-9223372036854775808", int64(-9223372036854775808)},    // BIGINT signed min
+		{"1e+21", float64(1e21)},                                 // extreme double: "1e+21" vs decimal
+		{"-1e+21", float64(-1e21)},                               // negative extreme double
 		{"0.0000001", float64(1e-7)},
 		{"100.5", float64(100.5)},
 	}
 	for _, c := range cases {
-		event := h.fullTableTextCell("s", "t", "c", c.num)
-		baseline := h.fullTableTextCell("s", "t", "c", c.native)
-		eb, _ := event.([]byte)
-		bb, _ := baseline.([]byte)
-		if string(eb) != string(bb) {
-			t.Errorf("json.Number(%q) → %q, native %T → %q (must be identical)", c.num, eb, c.native, bb)
+		event, _ := h.fullTableTextCell("s", "t", "c", c.num).([]byte)
+		baseline, _ := h.fullTableTextCell("s", "t", "c", c.native).([]byte)
+		if string(event) != string(baseline) {
+			t.Errorf("json.Number(%q) → %q, native %T → %q (must be identical)", c.num, event, c.native, baseline)
 		}
+	}
+
+	// Documented KNOWN exception (pre-existing, baseline-side, tracked as a
+	// follow-up): a baseline FLOAT column is scanned by DuckDB as float32, which
+	// FormatTextValue widens — so it does NOT match the event side's shortest
+	// float32 literal. This locks the current behavior so a future baseline
+	// float32 fix has to update it deliberately.
+	eventFloat := string(h.fullTableTextCell("s", "t", "c", json.Number("0.1")).([]byte))
+	baselineFloat := string(h.fullTableTextCell("s", "t", "c", float32(0.1)).([]byte))
+	if eventFloat != "0.1" {
+		t.Errorf("event FLOAT 0.1 = %q, want \"0.1\"", eventFloat)
+	}
+	if eventFloat == baselineFloat {
+		t.Errorf("FLOAT baseline (float32) is expected to DIVERGE from the event side today; "+
+			"event=%q baseline=%q — if a baseline float32 fix made them match, update this test and the comments", eventFloat, baselineFloat)
 	}
 }
 

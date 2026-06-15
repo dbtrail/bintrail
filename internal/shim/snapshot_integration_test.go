@@ -799,6 +799,77 @@ func TestSnapshotBaseline_FullTableHandleQueryWiring(t *testing.T) {
 	}
 }
 
+// TestSnapshotBaseline_FullTableDoubleMerge is the end-to-end proof for #496/#505:
+// a DOUBLE column whose rows mix a baseline-origin (DuckDB float64) integral value
+// and event-origin (json.Number) fractional values must (a) NOT trip
+// BuildSimpleTextResultset's "row types aren't consistent" (the crash the review
+// caught), and (b) render baseline-origin and event-origin cells of the same
+// value byte-identically (both via FormatTextValue).
+func TestSnapshotBaseline_FullTableDoubleMerge(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOfLit := hourTop.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	ts := snapTime.UTC().Format("2006-01-02 15:04:05")
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "metrics", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "metrics", "score", 2, "", "double", "YES")
+
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "score", MySQLType: "double", ParquetType: baseline.MysqlToParquetNode("double")},
+	}
+	// id=1 never touched (baseline-origin, integral double → "100"); id=2 updated
+	// after baseline (event-origin, fractional); id=3 never touched (baseline-origin
+	// fractional → must equal the event-origin 100.5).
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "metrics", cols, [][]string{
+		{"1", "100"},
+		{"2", "999"},
+		{"3", "100.5"},
+	})
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "metrics", 2 /*update*/, "2", nil,
+		[]byte(`{"id":2,"score":999}`),
+		[]byte(`{"id":2,"score":100.5}`))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps: true, NoArchive: true, IndexDBName: dbName, BaselineDir: baselineDir,
+	}, slog.Default())
+	if err := h.UseDB("myapp"); err != nil {
+		t.Fatalf("UseDB: %v", err)
+	}
+
+	// Must NOT crash — the score column mixes integral ("100") and fractional
+	// ("100.5") rendered cells.
+	res, err := h.HandleQuery("SELECT * FROM _snapshot.metrics AS OF '" + asOfLit + "'")
+	if err != nil {
+		t.Fatalf("HandleQuery full-table _snapshot DOUBLE merge: %v", err)
+	}
+	score := map[string]string{}
+	for _, cells := range rowCells(t, res.Resultset) {
+		if len(cells) == 2 {
+			score[cells[0]] = cells[1]
+		}
+	}
+	if score["1"] != "100" {
+		t.Errorf("baseline-origin id=1 score = %q, want \"100\"", score["1"])
+	}
+	if score["2"] != "100.5" {
+		t.Errorf("event-origin id=2 score = %q, want \"100.5\"", score["2"])
+	}
+	// Baseline-origin (id=3) and event-origin (id=2) cells of 100.5 must match.
+	if score["3"] != score["2"] {
+		t.Errorf("baseline-origin id=3 (%q) and event-origin id=2 (%q) must render 100.5 identically", score["3"], score["2"])
+	}
+}
+
 // The three tests below close the coverage gap on the configured-but-degraded
 // full-table fallback branches of runSnapshotFullTable. Each configures a
 // baseline source (so we are past the no-source Debug branch) and asserts the

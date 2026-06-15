@@ -1172,17 +1172,6 @@ func marshalImageOrdered(image map[string]any, ddlOrder []string) string {
 	return sb.String()
 }
 
-// imageToResult turns a single-row JSON object into a mysql.Result
-// shaped for the wire protocol. Columns are emitted in ddlOrder
-// (the source table's column ordinal_position from the latest
-// schema_snapshots row) so a customer running
-// `SELECT * FROM _flashback.orders ...` gets the same column
-// ordering they'd get from a regular `SELECT * FROM orders` — no
-// surprising reshuffling between the two.
-//
-// ddlOrder=nil signals "no snapshot available"; in that case we
-// fall back to alphabetical key order, which is deterministic but
-// won't match the table's natural DDL order.
 // numberToText renders a JSON-decoded numeric row-image value (#496) to the
 // SAME wire bytes go-mysql's FormatTextValue produces for the equivalent native
 // value. Two reasons it must pre-render to []byte rather than return a numeric:
@@ -1191,10 +1180,11 @@ func marshalImageOrdered(image map[string]any, ddlOrder []string) string {
 //     Returning int64 for an integral DOUBLE and float64 for a fractional one in
 //     the same column would crash the whole _flashback full-table query. A
 //     uniform []byte makes every such column VAR_STRING.
-//   - In the full-table _snapshot merge, baseline-origin cells (DuckDB-native,
-//     rendered via FormatTextValue) and event-origin cells must emit identical
-//     bytes; routing both through FormatTextValue guarantees that (a raw
-//     json.Number literal would diverge, e.g. "1e+21" vs "1000…0").
+//   - In the full-table _snapshot merge, baseline-origin INT/DOUBLE cells
+//     (DuckDB-native, rendered via FormatTextValue) and event-origin cells emit
+//     identical bytes because both route through FormatTextValue (a raw
+//     json.Number literal would diverge, e.g. "1e+21" vs "1000…0"). FLOAT(32-bit)
+//     is the known exception — see runSnapshotFullTable.
 // The exact numeric type is recovered first so a BIGINT UNSIGNED > 2^63 stays
 // exact (int64 → uint64 → float64), falling back to the literal text.
 func numberToText(n json.Number) []byte {
@@ -1224,6 +1214,17 @@ func resultsetValue(v any) any {
 	return v
 }
 
+// imageToResult turns a single-row JSON object into a mysql.Result
+// shaped for the wire protocol. Columns are emitted in ddlOrder
+// (the source table's column ordinal_position from the latest
+// schema_snapshots row) so a customer running
+// `SELECT * FROM _flashback.orders ...` gets the same column
+// ordering they'd get from a regular `SELECT * FROM orders` — no
+// surprising reshuffling between the two.
+//
+// ddlOrder=nil signals "no snapshot available"; in that case we
+// fall back to alphabetical key order, which is deterministic but
+// won't match the table's natural DDL order.
 func imageToResult(image map[string]any, ddlOrder []string) (*mysql.Result, error) {
 	if len(image) == 0 {
 		return emptyResult(), nil
