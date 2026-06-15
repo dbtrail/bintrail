@@ -97,8 +97,9 @@ requires the source to be configured **server-wide** (not just per-session):
 - `binlog_row_value_options` must **not** include `PARTIAL_JSON` — partial JSON
   updates log only a diff, leaving no complete after-image to recover from.
 
-dbtrail's startup preflight and `bintrail doctor` validate the **global**
-`binlog_row_image`; preventing per-session overrides is the operator's
+dbtrail's startup preflight and `bintrail doctor` validate the `binlog_row_image`
+they see on bintrail's own connection; bintrail can't observe what other
+application sessions set, so preventing per-session overrides is the operator's
 responsibility. Data captured while the source violated these requirements is out
 of scope — configure the source (see
 [deployment.md → Source MySQL Requirements](docs/deployment.md#2-source-mysql-requirements))
