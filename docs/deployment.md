@@ -53,12 +53,26 @@ On-demand (DBA workstation):
 
 - MySQL 8.0 or later
 - `binlog_format = ROW` (required — dbtrail refuses to index non-ROW binlogs)
-- `binlog_row_image = FULL` (required — dbtrail validates this on startup)
+- `binlog_row_image = FULL` (required — dbtrail validates this on startup).
+  This must be set **server-wide**, not just at the session level. The startup
+  check reads the global variable, but `binlog_row_image` is also settable
+  per-session: an application that runs `SET SESSION binlog_row_image = MINIMAL`
+  (or `NOBLOB`) writes partial row images that dbtrail will index as if complete —
+  unchanged columns and the after-image primary key come back as NULL, so
+  `recover` destroys data and its `WHERE` clause matches nothing. Keep every
+  session on `FULL`.
+- `binlog_row_value_options` must **not** include `PARTIAL_JSON`. With partial
+  JSON updates enabled, an `UPDATE` logs only a JSON *diff*, not the full
+  document, so there is no complete after-image to recover from.
 - GTID mode strongly recommended for reliable resume after restarts:
   ```
   gtid_mode = ON
   enforce_gtid_consistency = ON
   ```
+
+> These are source-configuration requirements you own. Data captured under a
+> non-`FULL` row image or `PARTIAL_JSON` is **out of support** — see
+> [SUPPORT.md](../SUPPORT.md).
 
 ### Replication user
 

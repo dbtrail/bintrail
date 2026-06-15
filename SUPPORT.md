@@ -83,9 +83,31 @@ The boundary triage cites:
   and remove the bundled `index-init` + `index-mysql` services (see
   [docker.md](docs/docker.md)) — same ship-vs-operate split, your server.
 
+## Source server configuration (required for correct capture)
+
+dbtrail reads ROW-format binary logs from your **source** MySQL. Faithful capture
+requires the source to be configured **server-wide** (not just per-session):
+
+- `binlog_format = ROW`.
+- `binlog_row_image = FULL`. Partial images (`MINIMAL`/`NOBLOB`) — **including from
+  a per-session `SET SESSION binlog_row_image = MINIMAL`** while the global is `FULL`
+  — are **out of scope**: dbtrail indexes incomplete before/after images as if
+  complete, so `recover` emits NULLs for unchanged columns and its `WHERE` clause
+  matches nothing.
+- `binlog_row_value_options` must **not** include `PARTIAL_JSON` — partial JSON
+  updates log only a diff, leaving no complete after-image to recover from.
+
+dbtrail's startup preflight and `bintrail doctor` validate the **global**
+`binlog_row_image`; preventing per-session overrides is the operator's
+responsibility. Data captured while the source violated these requirements is out
+of scope — configure the source (see
+[deployment.md → Source MySQL Requirements](docs/deployment.md#2-source-mysql-requirements))
+and re-index.
+
 ## Reporting issues
 
 Bugs in dbtrail's binaries, schema, tooling, console, or docs: please open
 an issue with reproduction steps — those are always in scope. If your report
 is about the index MySQL server's own operation (disk, backups, upgrades,
-corruption), see the list above first.
+corruption), or about data captured under an unsupported source configuration
+(non-`FULL` row image, `PARTIAL_JSON`), see the lists above first.

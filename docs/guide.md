@@ -26,7 +26,7 @@ Use both together if you like: `index` to backfill old files, then `stream` for 
 
 Before you start:
 
-- [ ] Source MySQL server has `binlog_format = ROW` and `binlog_row_image = FULL`
+- [ ] Source MySQL server has `binlog_format = ROW` and `binlog_row_image = FULL` **server-wide** (a per-session `SET SESSION binlog_row_image = MINIMAL`/`NOBLOB` writes partial images that aren't supported), and `binlog_row_value_options` does **not** include `PARTIAL_JSON`
 - [ ] A separate database (or schema) is available for the dbtrail index — it can be on the same server or a different one
 - [ ] `bintrail` binary is installed and on your `$PATH`
 - [ ] Your index DSN includes the database name: `user:pass@tcp(host:3306)/binlog_index`
