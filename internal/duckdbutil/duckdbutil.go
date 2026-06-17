@@ -49,8 +49,8 @@ func EnableS3CredentialChain(ctx context.Context, db *sql.DB) {
 // precedence over the session `SET s3_region` for matching paths, and a
 // credential_chain secret otherwise resolves region from the AWS SDK config
 // (e.g. AWS_REGION) — not the bucket's actual location. Putting the detected
-// bucket region IN the secret makes a cross-region read work regardless of that
-// precedence, avoiding a 301/PermanentRedirect (#511). region "" reproduces
+// bucket region IN the secret pins it so a cross-region read avoids a
+// 301/PermanentRedirect regardless of that precedence (#511). region "" reproduces
 // EnableS3CredentialChain exactly (no REGION clause), so existing same-region
 // callers are unchanged.
 func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region string) {

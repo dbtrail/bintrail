@@ -238,8 +238,9 @@ func queryFileList(ctx context.Context, db *sql.DB, files []string, opts query.O
 }
 
 // duckDBThreadCount reports the session's effective DuckDB thread count for the
-// httpfs peak-RAM warning. Falls back to NumCPU if the setting can't be read
-// (e.g. unset under ultrafast, which DuckDB also resolves to one-per-core).
+// httpfs peak-RAM warning. Falls back to NumCPU only if the setting genuinely
+// can't be read (query/scan error); when threads is merely unset under
+// ultrafast, current_setting returns the resolved one-per-core value directly.
 func duckDBThreadCount(ctx context.Context, db *sql.DB) int {
 	var n int
 	if err := db.QueryRowContext(ctx, "SELECT current_setting('threads')").Scan(&n); err != nil || n <= 0 {

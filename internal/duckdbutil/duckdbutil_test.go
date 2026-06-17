@@ -3,6 +3,7 @@ package duckdbutil
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -102,8 +103,15 @@ func TestEnableS3CredentialChainRegion(t *testing.T) {
 	if err := db.QueryRow("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'aws'").Scan(&loaded); err != nil || !loaded {
 		t.Skip("aws extension unavailable (offline host) — region pin not exercised")
 	}
-	var n int
-	if err := db.QueryRow("SELECT count(*) FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&n); err != nil || n != 1 {
-		t.Fatalf("region-pinned chain secret missing after a successful extension load: n=%d err=%v", n, err)
+	// Assert the region actually TRAVELS WITH the secret — not just that a
+	// secret exists (which TestEnableS3CredentialChainCreatesSecret already
+	// covers). secret_string carries the region in plaintext, so this pins the
+	// commit's actual change: stripping the REGION clause would fail here.
+	var secretStr string
+	if err := db.QueryRow("SELECT secret_string FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&secretStr); err != nil {
+		t.Fatalf("region-pinned chain secret missing after a successful extension load: %v", err)
+	}
+	if !strings.Contains(secretStr, "region=eu-west-1") {
+		t.Fatalf("chain secret does not carry the pinned region; got secret_string=%q", secretStr)
 	}
 }
