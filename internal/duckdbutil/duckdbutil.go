@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"log/slog"
 	"os"
+	"strings"
 )
 
 // EnableS3CredentialChain gives a DuckDB session AWS-SDK credentials for
@@ -40,6 +41,19 @@ import (
 // Call it after `INSTALL httpfs; LOAD httpfs;` on sessions that will touch
 // s3:// paths.
 func EnableS3CredentialChain(ctx context.Context, db *sql.DB) {
+	EnableS3CredentialChainRegion(ctx, db, "")
+}
+
+// EnableS3CredentialChainRegion is EnableS3CredentialChain that also pins the
+// secret's REGION when region is non-empty. DuckDB's secrets manager can take
+// precedence over the session `SET s3_region` for matching paths, and a
+// credential_chain secret otherwise resolves region from the AWS SDK config
+// (e.g. AWS_REGION) — not the bucket's actual location. Putting the detected
+// bucket region IN the secret makes a cross-region read work regardless of that
+// precedence, avoiding a 301/PermanentRedirect (#511). region "" reproduces
+// EnableS3CredentialChain exactly (no REGION clause), so existing same-region
+// callers are unchanged.
+func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region string) {
 	if os.Getenv("BINTRAIL_DUCKDB_NO_AWS_EXT") != "" {
 		return
 	}
@@ -53,8 +67,12 @@ func EnableS3CredentialChain(ctx context.Context, db *sql.DB) {
 		}
 		return
 	}
-	if _, err := db.ExecContext(ctx,
-		"CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain)"); err != nil {
+	secret := "CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain"
+	if region != "" {
+		secret += ", REGION '" + strings.ReplaceAll(region, "'", "''") + "'"
+	}
+	secret += ")"
+	if _, err := db.ExecContext(ctx, secret); err != nil {
 		slog.Warn("duckdb: AWS credential chain resolved no usable credentials for S3 reads",
 			"error", err)
 	}

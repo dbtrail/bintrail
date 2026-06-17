@@ -73,3 +73,37 @@ func TestEnableS3CredentialChainEscapeHatch(t *testing.T) {
 		t.Fatalf("escape hatch did not skip the secret setup: n=%d err=%v", n, err)
 	}
 }
+
+// TestEnableS3CredentialChainRegion: pinning a region must keep the session
+// usable and, when the aws extension is available, still create the chain
+// secret (now carrying REGION). The region travels with the secret so a
+// cross-region httpfs read doesn't 301 regardless of secret-vs-SET precedence
+// (#511). Dummy env creds make the chain resolvable on creds-less CI.
+func TestEnableS3CredentialChainRegion(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIATESTDUMMY0000000")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "testdummysecret")
+	t.Setenv("BINTRAIL_DUCKDB_NO_AWS_EXT", "")
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	EnableS3CredentialChainRegion(context.Background(), db, "eu-west-1")
+
+	// Session must remain usable whether or not the aws extension loaded.
+	var one int
+	if err := db.QueryRow("SELECT 1").Scan(&one); err != nil || one != 1 {
+		t.Fatalf("session unusable after EnableS3CredentialChainRegion: %v (got %d)", err, one)
+	}
+
+	var loaded bool
+	if err := db.QueryRow("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'aws'").Scan(&loaded); err != nil || !loaded {
+		t.Skip("aws extension unavailable (offline host) — region pin not exercised")
+	}
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("region-pinned chain secret missing after a successful extension load: n=%d err=%v", n, err)
+	}
+}

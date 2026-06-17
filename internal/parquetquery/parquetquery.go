@@ -195,14 +195,24 @@ func fetchS3Direct(ctx context.Context, db *sql.DB, files []string, region strin
 			slog.Warn("could not set DuckDB s3_region for S3-direct read", "region", region, "error", err)
 		}
 	}
-	duckdbutil.EnableS3CredentialChain(ctx, db)
+	// Pin the region IN the secret (not just the session SET above): DuckDB's
+	// secrets manager can take precedence over SET s3_region, and a
+	// credential_chain secret otherwise resolves region from the AWS SDK config,
+	// not the bucket. Both together cover every precedence model — and the SET
+	// still applies when the aws extension is unavailable and no secret exists.
+	duckdbutil.EnableS3CredentialChainRegion(ctx, db, region)
 
 	threads := duckDBThreadCount(ctx, db)
-	slog.Warn("ultrafast S3-direct: reading S3 archives via DuckDB httpfs, held in memory OUTSIDE memory_limit — ensure free RAM exceeds the peak estimate; lower --duckdb-threads to bound it",
-		"files", len(files),
-		"largest_file_bytes", maxFileSize,
-		"duckdb_threads", threads,
-		"peak_ram_estimate_bytes", maxFileSize*int64(threads))
+	warnAttrs := []any{"files", len(files), "duckdb_threads", threads}
+	if maxFileSize > 0 {
+		warnAttrs = append(warnAttrs, "largest_file_bytes", maxFileSize, "peak_ram_estimate_bytes", maxFileSize*int64(threads))
+	} else {
+		// S3 omitted object sizes for every file — print "unknown" rather than a
+		// falsely reassuring 0 on the one path whose warning exists precisely to
+		// make the operator weigh RAM before an OOM.
+		warnAttrs = append(warnAttrs, "largest_file_bytes", "unknown (S3 omitted object sizes)")
+	}
+	slog.Warn("ultrafast S3-direct: reading S3 archives via DuckDB httpfs, held in memory OUTSIDE memory_limit — ensure free RAM exceeds the peak estimate; lower --duckdb-threads to bound it", warnAttrs...)
 
 	cols, err := parquetColumnsFromFiles(ctx, db, files)
 	if err != nil {
