@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -9,6 +12,16 @@ import (
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
+
+// duckDBMemoryLimitRE accepts the DuckDB memory_limit forms an operator would
+// pass: a positive size with an optional decimal or binary unit (16GB, 2.5GB,
+// 16GiB, a bare byte count) or a percentage (80%). It deliberately rejects a
+// leading '-': DuckDB SILENTLY accepts a negative memory_limit and treats it as
+// effectively unlimited (no error, so the best-effort WARN never fires), which
+// would invert the whole point of a memory cap. Garbage (typos) is rejected too
+// so an operator gets a clear error instead of a silent fall-back to the
+// conservative default.
+var duckDBMemoryLimitRE = regexp.MustCompile(`(?i)^(\d+(\.\d+)?\s*(b|kb|mb|gb|tb|pb|kib|mib|gib|tib|pib)?|\d+%)$`)
 
 // addDuckDBTuningFlags registers the shared DuckDB resource flags on the
 // offline query/recover/reconstruct commands. They lift the conservative,
@@ -33,7 +46,13 @@ func addDuckDBTuningFlags(cmd *cobra.Command) {
 // Precedence: an explicit --duckdb-* flag wins over --ultrafast, which wins
 // over the conservative default. The granular flags let an operator tune to
 // their box without the all-or-nothing --ultrafast switch.
-func duckDBTuningFromFlags(cmd *cobra.Command) duckdbutil.Tuning {
+//
+// An operator-supplied --duckdb-memory-limit is validated here, at the CLI
+// boundary, and a bad value is a hard error — DuckDB's SET memory_limit is
+// best-effort downstream and would either silently fall back to the default
+// (a typo) or silently uncap on a negative value, neither of which an operator
+// who explicitly asked for a budget should get without being told.
+func duckDBTuningFromFlags(cmd *cobra.Command) (duckdbutil.Tuning, error) {
 	t := duckdbutil.DefaultTuning()
 	if ultrafast, _ := cmd.Flags().GetBool("ultrafast"); ultrafast {
 		t = duckdbutil.Ultrafast()
@@ -42,9 +61,12 @@ func duckDBTuningFromFlags(cmd *cobra.Command) duckdbutil.Tuning {
 		t.Threads = threads
 	}
 	if mem, _ := cmd.Flags().GetString("duckdb-memory-limit"); mem != "" {
+		if !duckDBMemoryLimitRE.MatchString(strings.TrimSpace(mem)) {
+			return duckdbutil.Tuning{}, fmt.Errorf("invalid --duckdb-memory-limit %q: expected a positive size like 16GB / 512MB / 16GiB or a percentage like 80%%", mem)
+		}
 		t.MemoryLimit = mem
 	}
-	return t
+	return t, nil
 }
 
 // tunedArchiveFetcher adapts a DuckDB Tuning into a query.ArchiveFetcher so the

@@ -266,12 +266,16 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		Since:    &snapshotTime,
 		Until:    &at,
 	}
+	duckTuning, err := duckDBTuningFromFlags(cmd)
+	if err != nil {
+		return err
+	}
 	events, _, err := query.FetchMerged(cmd.Context(), db, engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         dbName,
 		NoArchive:      recNoArchive,
 		AllowGaps:      recAllowGaps,
-		ArchiveFetcher: tunedArchiveFetcher(duckDBTuningFromFlags(cmd)),
+		ArchiveFetcher: tunedArchiveFetcher(duckTuning),
 	})
 	if err != nil {
 		// Surface CLI hints only at the CLI layer; the library types
@@ -465,6 +469,11 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 		baselineSrc = recBaselineS3
 	}
 
+	duckTuning, err := duckDBTuningFromFlags(cmd)
+	if err != nil {
+		return err
+	}
+
 	// ── Run ────────────────────────────────────────────────────────────────
 	cfg := reconstruct.FullTableConfig{
 		IndexDSN:       recIndexDSN,
@@ -475,7 +484,7 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 		ChunkSize:      chunkSize,
 		Parallelism:    recParallelism,
 		AllowGaps:      recAllowGaps,
-		ArchiveFetcher: tunedArchiveFetcher(duckDBTuningFromFlags(cmd)),
+		ArchiveFetcher: tunedArchiveFetcher(duckTuning),
 	}
 	reports, err := reconstruct.ReconstructTables(cmd.Context(), cfg)
 	if err != nil {

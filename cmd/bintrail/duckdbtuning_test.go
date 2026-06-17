@@ -14,9 +14,10 @@ import (
 // off, callers get exactly the budget parquetquery.Fetch used before #510.
 func TestDuckDBTuningFromFlags(t *testing.T) {
 	tests := []struct {
-		name  string
-		flags map[string]string
-		want  duckdbutil.Tuning
+		name    string
+		flags   map[string]string
+		want    duckdbutil.Tuning
+		wantErr bool
 	}{
 		{
 			name:  "no flags → conservative default",
@@ -39,6 +40,16 @@ func TestDuckDBTuningFromFlags(t *testing.T) {
 			want:  duckdbutil.Tuning{Threads: 2, MemoryLimit: "16GB"},
 		},
 		{
+			name:  "binary-unit memory-limit accepted",
+			flags: map[string]string{"duckdb-memory-limit": "16GiB"},
+			want:  duckdbutil.Tuning{Threads: 2, MemoryLimit: "16GiB"},
+		},
+		{
+			name:  "percentage memory-limit accepted",
+			flags: map[string]string{"duckdb-memory-limit": "80%"},
+			want:  duckdbutil.Tuning{Threads: 2, MemoryLimit: "80%"},
+		},
+		{
 			name:  "explicit threads=0 means one-per-core, overriding default 2",
 			flags: map[string]string{"duckdb-threads": "0"},
 			want:  duckdbutil.Tuning{Threads: 0, MemoryLimit: "4GB"},
@@ -53,6 +64,18 @@ func TestDuckDBTuningFromFlags(t *testing.T) {
 			flags: map[string]string{"ultrafast": "true", "duckdb-memory-limit": "16GB"},
 			want:  duckdbutil.Tuning{Threads: 0, MemoryLimit: "16GB"},
 		},
+		{
+			// Negative is the dangerous case: DuckDB silently accepts it and
+			// uncaps memory, so the CLI must reject it up front.
+			name:    "negative memory-limit → error",
+			flags:   map[string]string{"duckdb-memory-limit": "-4GB"},
+			wantErr: true,
+		},
+		{
+			name:    "garbage memory-limit → error",
+			flags:   map[string]string{"duckdb-memory-limit": "lots"},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -64,7 +87,17 @@ func TestDuckDBTuningFromFlags(t *testing.T) {
 					t.Fatalf("set --%s=%s: %v", flag, val, err)
 				}
 			}
-			if got := duckDBTuningFromFlags(cmd); got != tt.want {
+			got, err := duckDBTuningFromFlags(cmd)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("duckDBTuningFromFlags() = %+v, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("duckDBTuningFromFlags() unexpected error: %v", err)
+			}
+			if got != tt.want {
 				t.Fatalf("duckDBTuningFromFlags() = %+v, want %+v", got, tt.want)
 			}
 		})

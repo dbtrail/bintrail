@@ -153,6 +153,10 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	if qNoArchive && (qArchiveDir != "" || qArchiveS3 != "") {
 		return fmt.Errorf("--no-archive cannot be combined with --archive-dir or --archive-s3")
 	}
+	duckTuning, err := duckDBTuningFromFlags(cmd)
+	if err != nil {
+		return err
+	}
 	if qIncludeSnapshot {
 		if qBaseline == "" {
 			return fmt.Errorf("--include-snapshot requires --baseline")
@@ -318,7 +322,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 			cmd.Context(),
 			archSources,
 			fetchOpts,
-			tunedArchiveFetcher(duckDBTuningFromFlags(cmd)),
+			tunedArchiveFetcher(duckTuning),
 			os.Stderr,
 		)
 		if err != nil {

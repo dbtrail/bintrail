@@ -46,12 +46,15 @@ func TestTuningApplyDefault(t *testing.T) {
 func TestTuningApplyUltrafastIsNoOp(t *testing.T) {
 	db := openDuckDB(t)
 
-	before := currentSetting(t, db, "threads")
+	threadsBefore := currentSetting(t, db, "threads")
+	memBefore := currentSetting(t, db, "memory_limit")
 	Ultrafast().Apply(context.Background(), db)
-	after := currentSetting(t, db, "threads")
 
-	if before != after {
-		t.Fatalf("Ultrafast().Apply changed threads %q → %q; want it left at DuckDB's default", before, after)
+	if after := currentSetting(t, db, "threads"); after != threadsBefore {
+		t.Fatalf("Ultrafast().Apply changed threads %q → %q; want it left at DuckDB's default", threadsBefore, after)
+	}
+	if after := currentSetting(t, db, "memory_limit"); after != memBefore {
+		t.Fatalf("Ultrafast().Apply changed memory_limit %q → %q; want it left at DuckDB's default", memBefore, after)
 	}
 	assertUsable(t, db)
 }

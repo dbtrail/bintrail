@@ -209,12 +209,16 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		dbName = cfg.DBName
 	}
 
+	duckTuning, err := duckDBTuningFromFlags(cmd)
+	if err != nil {
+		return err
+	}
 	rows, _, err := query.FetchMerged(cmd.Context(), db, engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         dbName,
 		NoArchive:      rNoArchive || rProfile != "",
 		AllowGaps:      true, // preserve recover's warn-and-continue behavior
-		ArchiveFetcher: tunedArchiveFetcher(duckDBTuningFromFlags(cmd)),
+		ArchiveFetcher: tunedArchiveFetcher(duckTuning),
 	})
 	if err != nil {
 		return err
