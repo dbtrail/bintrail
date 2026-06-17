@@ -333,7 +333,7 @@ bintrail query \
   --bintrail-id <uuid>
 ```
 
-You can also raise DuckDB's `memory_limit` in a direct DuckDB CLI session for debugging — dbtrail's internal DuckDB instance uses the default (80% of system RAM), so the usual fix is to narrow the query.
+By default `bintrail query`/`recover`/`reconstruct` run their internal DuckDB under a conservative, container-safe budget — **2 threads and a 4 GB `memory_limit`**, spilling to the OS temp directory when exceeded — so narrowing the query is the usual fix. On a host with plenty of RAM you can instead **lift the cap**: `--ultrafast` lets DuckDB self-tune to the host (all CPU cores, ~80% of system RAM), and `--duckdb-memory-limit 16GB` / `--duckdb-threads N` tune either knob explicitly. See "DuckDB resource tuning" in [query-and-recovery.md](query-and-recovery.md#duckdb-resource-tuning---ultrafast). Note `--ultrafast` also switches S3 reads to in-memory `httpfs` (held outside `memory_limit`) — that section covers the trade-off.
 
 ### Corrupted Parquet file
 
