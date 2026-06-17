@@ -15,7 +15,6 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
-	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
@@ -119,6 +118,7 @@ func init() {
 	reconstructCmd.Flags().StringVar(&recTables, "tables", "", "Comma-separated schema.table list for --output-format=mydumper (e.g. mydb.orders,mydb.users)")
 	reconstructCmd.Flags().StringVar(&recChunkSize, "chunk-size", "256MB", "Max size per SQL chunk file in full-table mode (e.g. 64MB, 1GB)")
 	reconstructCmd.Flags().IntVar(&recParallelism, "parallelism", 0, "Max tables to reconstruct concurrently in full-table mode (default: runtime.NumCPU())")
+	addDuckDBTuningFlags(reconstructCmd)
 	bindCommandEnv(reconstructCmd)
 
 	rootCmd.AddCommand(reconstructCmd)
@@ -271,7 +271,7 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		DBName:         dbName,
 		NoArchive:      recNoArchive,
 		AllowGaps:      recAllowGaps,
-		ArchiveFetcher: parquetquery.Fetch,
+		ArchiveFetcher: tunedArchiveFetcher(duckDBTuningFromFlags(cmd)),
 	})
 	if err != nil {
 		// Surface CLI hints only at the CLI layer; the library types
@@ -467,14 +467,15 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 
 	// ── Run ────────────────────────────────────────────────────────────────
 	cfg := reconstruct.FullTableConfig{
-		IndexDSN:    recIndexDSN,
-		BaselineSrc: baselineSrc,
-		Tables:      tables,
-		At:          at,
-		OutputDir:   recOutputDir,
-		ChunkSize:   chunkSize,
-		Parallelism: recParallelism,
-		AllowGaps:   recAllowGaps,
+		IndexDSN:       recIndexDSN,
+		BaselineSrc:    baselineSrc,
+		Tables:         tables,
+		At:             at,
+		OutputDir:      recOutputDir,
+		ChunkSize:      chunkSize,
+		Parallelism:    recParallelism,
+		AllowGaps:      recAllowGaps,
+		ArchiveFetcher: tunedArchiveFetcher(duckDBTuningFromFlags(cmd)),
 	}
 	reports, err := reconstruct.ReconstructTables(cmd.Context(), cfg)
 	if err != nil {

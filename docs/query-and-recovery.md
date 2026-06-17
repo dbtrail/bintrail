@@ -143,6 +143,15 @@ That strictness deliberately includes stale registrations: an `archive_state` ro
 
 The merge path loads **all matching rows** from all sources into memory before applying the limit. Filters (schema, table, time range, etc.) bound the result set in practice. For extremely broad queries against large archives, memory usage could be significant — apply at least a `--since`/`--until` range to keep the result set manageable.
 
+### DuckDB resource tuning (`--ultrafast`)
+
+When `query`, `recover`, or `reconstruct` scan Parquet archives, DuckDB runs under a conservative, container-safe budget by default: **2 threads and a 4 GB memory limit**, spilling to the OS temp directory when exceeded. These defaults keep bintrail alive in small shared containers; on a dedicated box with plenty of RAM they leave performance on the table.
+
+- `--ultrafast` lets DuckDB self-tune to the host: it uses **all CPU cores** and **~80% of physical RAM**, still spilling to the temp directory before hitting the limit. This trades memory-safety for speed — use it for offline recovery on a big machine, **not** in a small container. It does **not** remove the memory limit (which would invite the OOM-killer instead of a graceful spill); it lets DuckDB pick its own RAM-aware limit.
+- `--duckdb-threads N` and `--duckdb-memory-limit SIZE` (e.g. `16GB`) override either knob independently. An explicit flag wins over `--ultrafast`, which wins over the default — so you can tune to your box without the all-or-nothing switch.
+
+Equivalent env vars: `BINTRAIL_ULTRAFAST=1`, `BINTRAIL_DUCKDB_THREADS`, `BINTRAIL_DUCKDB_MEMORY_LIMIT`. These flags affect only the offline CLI commands; the long-lived `shim` and `bintrail-console` daemons always use the safe default.
+
 ### S3 Prerequisites
 
 - **Archived events** (`--archive-s3`): objects are listed and downloaded with the **AWS SDK** — the full default credential chain applies (env keys, `~/.aws` profiles incl. SSO, EC2/ECS/EKS IAM roles). DuckDB then scans the downloaded files locally; its `httpfs` extension is not involved on this path.

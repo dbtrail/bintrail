@@ -186,6 +186,14 @@ var envSections = []envSection{
 			{"BINTRAIL_ROTATE_ADD_FUTURE", "3"},
 		},
 	},
+	{
+		Header: "DuckDB tuning (query/recover/reconstruct: trade memory-safety for speed)",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_ULTRAFAST", ""},
+			{"BINTRAIL_DUCKDB_THREADS", ""},
+			{"BINTRAIL_DUCKDB_MEMORY_LIMIT", ""},
+		},
+	},
 	// The BINTRAIL_CONSOLE_* vars moved with the web console to the standalone
 	// bintrail-console binary (serve/watch), which reads the same env file —
 	// they are no longer advertised in the core CLI's template.

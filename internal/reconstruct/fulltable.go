@@ -68,6 +68,12 @@ type FullTableConfig struct {
 	ChunkSize   int64     // per-chunk SQL file size (0 → 256 MiB)
 	Parallelism int       // max concurrent tables (0 → runtime.NumCPU())
 	AllowGaps   bool      // false = strict abort on gaps (default for reconstruct)
+
+	// ArchiveFetcher fetches archived binlog events for a table. nil →
+	// parquetquery.Fetch (the container-safe DuckDB budget). The CLI sets it
+	// to a tuned fetcher under --ultrafast so the flag is honored on the
+	// full-table path, not just single-row reconstruct (#510).
+	ArchiveFetcher query.ArchiveFetcher
 }
 
 // TableReport carries the per-table outcome stats that the CLI summary prints.
@@ -342,6 +348,13 @@ func ReconstructTable(
 		Until:  &cfg.At,
 		// No PKValues filter — we want every event for this table.
 	}
+	// nil ArchiveFetcher → the container-safe parquetquery.Fetch. Resolved here
+	// at the point of use so both ReconstructTables and any direct
+	// ReconstructTable caller get the default (#510).
+	fetcher := cfg.ArchiveFetcher
+	if fetcher == nil {
+		fetcher = parquetquery.Fetch
+	}
 	// Pass NoArchive=false unconditionally and let query.FetchMerged decide
 	// whether to query archives — it already handles the empty-archive case
 	// in its fast path. The previous `len(archSources)==0` gate was wrong:
@@ -352,7 +365,7 @@ func ReconstructTable(
 		DBName:         dbName,
 		NoArchive:      false,
 		AllowGaps:      cfg.AllowGaps,
-		ArchiveFetcher: parquetquery.Fetch,
+		ArchiveFetcher: fetcher,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fetch events: %w", err)

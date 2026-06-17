@@ -22,6 +22,7 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -30,7 +31,19 @@ import (
 // source is either a local directory path or an S3 URL prefix (s3://bucket/prefix/).
 // Archives follow the Hive-partitioned layout written by bintrail rotate
 // (event_date=YYYY-MM-DD/event_hour=HH/events.parquet).
+//
+// It applies bintrail's conservative, container-safe DuckDB budget
+// (duckdbutil.DefaultTuning). Long-lived/shared callers (shim, console, agent)
+// use this. The offline CLI commands that can afford more resources call
+// FetchWithTuning to lift the cap (#510).
 func Fetch(ctx context.Context, opts query.Options, source string) ([]query.ResultRow, error) {
+	return FetchWithTuning(ctx, opts, source, duckdbutil.DefaultTuning())
+}
+
+// FetchWithTuning is Fetch with an explicit DuckDB resource budget. See Tuning:
+// the conservative DefaultTuning (threads=2, memory_limit=4GB) is for small
+// containers; duckdbutil.Ultrafast lets DuckDB self-tune to the host.
+func FetchWithTuning(ctx context.Context, opts query.Options, source string, tuning duckdbutil.Tuning) ([]query.ResultRow, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, fmt.Errorf("open duckdb: %w", err)
@@ -39,25 +52,26 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 
 	// Use the OS temp directory for DuckDB scratch files. By default DuckDB
 	// creates a .tmp directory in the CWD, which fails in containers where
-	// the working directory (often /) is read-only.
+	// the working directory (often /) is read-only. Set unconditionally: it is
+	// the spill backstop, not a memory-for-speed knob, so it stays on even
+	// under ultrafast — exceeding the memory budget spills here instead of
+	// inviting the OOM-killer.
 	if _, err := db.ExecContext(ctx, "SET temp_directory = '"+os.TempDir()+"'"); err != nil {
 		slog.Warn("could not set DuckDB temp_directory", "error", err)
 	}
 
-	// Constrain DuckDB resource usage for container environments.
-	// DuckDB requires ~125MB per thread; 2 threads allows parallelism
-	// across row groups while staying within container memory limits.
-	// preserve_insertion_order is safe to disable because our queries
-	// have explicit ORDER BY.
-	for _, stmt := range []string{
-		"SET threads = 2",
-		"SET memory_limit = '4GB'",
-		"SET preserve_insertion_order = false",
-	} {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			slog.Warn("could not configure DuckDB", "statement", stmt, "error", err)
-		}
+	// preserve_insertion_order is safe to disable because our queries have
+	// explicit ORDER BY; disabling it lets DuckDB stream without buffering the
+	// whole result set to reorder. It saves memory AND is faster, so it stays
+	// on unconditionally — it is not part of the tunable trade-off.
+	if _, err := db.ExecContext(ctx, "SET preserve_insertion_order = false"); err != nil {
+		slog.Warn("could not configure DuckDB", "statement", "SET preserve_insertion_order = false", "error", err)
 	}
+
+	// Constrain DuckDB thread count and memory. DuckDB requires ~125MB per
+	// thread; the conservative default (2 threads, 4GB) keeps small containers
+	// alive, while ultrafast leaves both unset so DuckDB self-tunes to the host.
+	tuning.Apply(ctx, db)
 
 	// For S3, download each file locally via the AWS SDK and query with
 	// DuckDB from disk. This avoids DuckDB's httpfs extension which holds
