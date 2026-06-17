@@ -11,13 +11,13 @@ import (
 // TestTuningConstructors pins the two named budgets so renaming or retuning
 // them is a deliberate, test-visible change. DefaultTuning must reproduce the
 // values parquetquery.Fetch hardcoded before this struct existed; Ultrafast
-// must be the zero value (both knobs unset → DuckDB self-tunes).
+// leaves threads/memory unset (DuckDB self-tunes) and sets S3Direct (httpfs).
 func TestTuningConstructors(t *testing.T) {
-	if got := DefaultTuning(); got.Threads != 2 || got.MemoryLimit != "4GB" {
-		t.Fatalf("DefaultTuning() = %+v, want {Threads:2 MemoryLimit:4GB}", got)
+	if got := DefaultTuning(); got.Threads != 2 || got.MemoryLimit != "4GB" || got.S3Direct {
+		t.Fatalf("DefaultTuning() = %+v, want {Threads:2 MemoryLimit:4GB S3Direct:false}", got)
 	}
-	if got := Ultrafast(); got != (Tuning{}) {
-		t.Fatalf("Ultrafast() = %+v, want zero Tuning{}", got)
+	if got := Ultrafast(); got != (Tuning{S3Direct: true}) {
+		t.Fatalf("Ultrafast() = %+v, want {S3Direct:true} (threads/memory unset)", got)
 	}
 }
 

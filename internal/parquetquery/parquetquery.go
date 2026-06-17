@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -78,7 +79,7 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 	// entire S3 files in memory (outside memory_limit tracking), causing
 	// OOM kills in containers. Local reads use OS page cache / mmap.
 	if strings.HasPrefix(source, "s3://") {
-		files, s3Client, err := listS3ParquetScoped(ctx, source, opts.Since, opts.Until)
+		files, maxSize, region, s3Client, err := listS3ParquetScoped(ctx, source, opts.Since, opts.Until)
 		if err != nil {
 			return nil, fmt.Errorf("list S3 archive files: %w", err)
 		}
@@ -90,6 +91,13 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 		slog.Debug("files after time-range pruning", "count", len(files))
 		if len(files) == 0 {
 			return classifyEmptyS3Listing(ctx, s3Client, source, opts.Since, opts.Until)
+		}
+
+		// Ultrafast: read the S3 files directly via DuckDB httpfs in one
+		// parallel multi-file scan, skipping the download-to-disk pipeline.
+		// maxSize is pre-filter (a conservative over-estimate for the RAM warn).
+		if tuning.S3Direct {
+			return fetchS3Direct(ctx, db, files, region, maxSize, opts)
 		}
 
 		dl := newS3Downloader(s3Client)
@@ -163,20 +171,98 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 	return scanRows(rows)
 }
 
+// fetchS3Direct reads the S3 archive files directly through DuckDB's httpfs
+// extension as a single parallel multi-file scan, instead of the default
+// download-to-disk pipeline. This is the ultrafast S3 lever (tuning.S3Direct),
+// mirroring the local-glob path above (probe columns → one query) but over
+// s3:// paths.
+//
+// httpfs holds each scanned file in memory OUTSIDE DuckDB's memory_limit, so
+// peak RAM ≈ largestFile × DuckDB threads. The caller gates this behind the
+// explicit --ultrafast opt-in; we warn with the estimate so the operator can
+// judge it against free RAM (lowering --duckdb-threads bounds the peak). The
+// Go-side early termination and per-file streaming are given up here — DuckDB
+// applies the global ORDER BY + LIMIT (top-N) natively across all files.
+func fetchS3Direct(ctx context.Context, db *sql.DB, files []string, region string, maxFileSize int64, opts query.Options) ([]query.ResultRow, error) {
+	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+		return nil, fmt.Errorf("load DuckDB httpfs for S3-direct read: %w", err)
+	}
+	// Pin the bucket's region so httpfs does not 301/PermanentRedirect on a
+	// cross-region bucket. The AWS-SDK download path gets this from
+	// GetBucketLocation; httpfs only knows what the session is told.
+	if region != "" {
+		if _, err := db.ExecContext(ctx, "SET s3_region='"+strings.ReplaceAll(region, "'", "''")+"'"); err != nil {
+			slog.Warn("could not set DuckDB s3_region for S3-direct read", "region", region, "error", err)
+		}
+	}
+	duckdbutil.EnableS3CredentialChain(ctx, db)
+
+	threads := duckDBThreadCount(ctx, db)
+	slog.Warn("ultrafast S3-direct: reading S3 archives via DuckDB httpfs, held in memory OUTSIDE memory_limit — ensure free RAM exceeds the peak estimate; lower --duckdb-threads to bound it",
+		"files", len(files),
+		"largest_file_bytes", maxFileSize,
+		"duckdb_threads", threads,
+		"peak_ram_estimate_bytes", maxFileSize*int64(threads))
+
+	cols, err := parquetColumnsFromFiles(ctx, db, files)
+	if err != nil {
+		return nil, fmt.Errorf("read S3 parquet schema: %w", err)
+	}
+	q, args := buildQueryFromFiles(files, opts, cols)
+	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("S3-direct parquet query: %w", err)
+	}
+	defer rows.Close()
+	return scanRows(rows)
+}
+
+// duckDBThreadCount reports the session's effective DuckDB thread count for the
+// httpfs peak-RAM warning. Falls back to NumCPU if the setting can't be read
+// (e.g. unset under ultrafast, which DuckDB also resolves to one-per-core).
+func duckDBThreadCount(ctx context.Context, db *sql.DB) int {
+	var n int
+	if err := db.QueryRowContext(ctx, "SELECT current_setting('threads')").Scan(&n); err != nil || n <= 0 {
+		return runtime.NumCPU()
+	}
+	return n
+}
+
+// parquetColumnsFromFiles probes the unioned column set across an explicit list
+// of parquet files (local or s3://), so buildQueryFromFiles can substitute a
+// typed NULL for columns absent from every file (e.g. connection_id in archives
+// written before that column existed).
+func parquetColumnsFromFiles(ctx context.Context, db *sql.DB, files []string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, "SELECT * FROM parquet_scan("+fileArrayLiteral(files)+", hive_partitioning=true, union_by_name=true) LIMIT 0")
+	if err != nil {
+		return nil, err
+	}
+	names, err := rows.Columns()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	cols := make(map[string]bool, len(names))
+	for _, n := range names {
+		cols[n] = true
+	}
+	return cols, nil
+}
+
 // listS3ParquetScoped lists .parquet files under an S3 prefix, optionally scoping
 // to date-specific prefixes when since/until are provided and span ≤31 days.
 // This avoids listing all files in the archive when only a narrow time range is needed.
 // It returns the S3 client configured for the bucket's region so callers can reuse
 // it for downloads without loading the AWS config again.
-func listS3ParquetScoped(ctx context.Context, source string, since, until *time.Time) (files []string, client *s3.Client, err error) {
+func listS3ParquetScoped(ctx context.Context, source string, since, until *time.Time) (files []string, maxSize int64, region string, client *s3.Client, err error) {
 	bucket, prefix, err := parseS3Source(source)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, "", nil, err
 	}
 
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load AWS config: %w", err)
+		return nil, 0, "", nil, fmt.Errorf("load AWS config: %w", err)
 	}
 
 	// Detect the bucket's actual region via GetBucketLocation (must be called
@@ -234,6 +320,11 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 				for _, obj := range page.Contents {
 					if obj.Key != nil && strings.HasSuffix(*obj.Key, ".parquet") {
 						files = append(files, fmt.Sprintf("s3://%s/%s", bucket, *obj.Key))
+						// Track the largest object so the httpfs-direct path can
+						// warn on its peak-RAM estimate (largest_file × threads).
+						if obj.Size != nil && *obj.Size > maxSize {
+							maxSize = *obj.Size
+						}
 					}
 				}
 				mu.Unlock()
@@ -242,11 +333,11 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, nil, err
+		return nil, 0, "", nil, err
 	}
 
 	slog.Debug("listed S3 archive files", "source", source, "count", len(files))
-	return files, client, nil
+	return files, maxSize, bucketRegion, client, nil
 }
 
 // maxScopedDays is the maximum number of days for prefix-scoped S3 listing.
@@ -571,23 +662,35 @@ func parseS3Source(source string) (bucket, prefix string, err error) {
 	return bucket, prefix, nil
 }
 
+// fileArrayLiteral renders a file list as a DuckDB array literal
+// (['s3://...', '/tmp/...']) with single quotes escaped, for parquet_scan over
+// an explicit list instead of a glob. A glob is avoided for S3 because DuckDB's
+// glob expansion breaks on Hive partition keys (= signs) in the path.
+func fileArrayLiteral(files []string) string {
+	escaped := make([]string, len(files))
+	for i, f := range files {
+		escaped[i] = "'" + strings.ReplaceAll(f, "'", "''") + "'"
+	}
+	return "[" + strings.Join(escaped, ", ") + "]"
+}
+
 // buildQueryFromFiles constructs a DuckDB SQL query using an explicit list of
-// S3 file paths instead of a glob pattern. This avoids DuckDB's broken S3 glob
-// expansion for paths containing Hive partition keys (= signs).
-func buildQueryFromFiles(files []string, opts query.Options) (string, []any) {
+// file paths instead of a glob pattern. cols is the unioned column set across
+// those files (from parquetColumnsFromFiles): a typed NULL is substituted for
+// connection_id when it is absent from every file, matching buildQueryForFile
+// so archives written before that column read back correctly.
+func buildQueryFromFiles(files []string, opts query.Options, cols map[string]bool) (string, []any) {
 	where, args := buildFilters(opts)
 
-	// Build the file list as a DuckDB array literal: ['s3://...', 's3://...']
-	var escaped []string
-	for _, f := range files {
-		escaped = append(escaped, "'"+strings.ReplaceAll(f, "'", "''")+"'")
+	connCol := "connection_id"
+	if !cols["connection_id"] {
+		connCol = "NULL::INT32 AS connection_id"
 	}
-	fileList := "[" + strings.Join(escaped, ", ") + "]"
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
-		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
+		" gtid, " + connCol + ", schema_name, table_name, event_type, pk_values," +
 		" changed_columns, row_before, row_after, schema_version" +
-		" FROM parquet_scan(" + fileList + ", hive_partitioning=true, union_by_name=true)"
+		" FROM parquet_scan(" + fileArrayLiteral(files) + ", hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}

@@ -21,9 +21,10 @@ import (
 // these two constructors are not special-cased anywhere — the same struct
 // expresses "default", "ultrafast", and any explicit operator override.
 //
-// Note the polarity: the whole-struct zero value Tuning{} equals Ultrafast()
-// (host-greedy), NOT the container-safe budget. A caller that wants the safe
-// default must call DefaultTuning() explicitly rather than rely on a zero value.
+// Note the polarity: a zero Tuning{} is host-greedy on threads/memory (both
+// unset → DuckDB native defaults), so a caller that wants the container-safe
+// budget must call DefaultTuning() explicitly rather than rely on a zero value.
+// (Ultrafast also sets S3Direct, so it is no longer the bare zero value.)
 //
 // temp_directory and preserve_insertion_order are deliberately NOT in this
 // struct: they are not memory-for-speed trade-offs (the former is the spill
@@ -36,6 +37,13 @@ type Tuning struct {
 	// MemoryLimit is the DuckDB memory budget (SET memory_limit = '...'), e.g.
 	// "4GB". Empty leaves it unset, so DuckDB defaults to ~80% of physical RAM.
 	MemoryLimit string
+	// S3Direct routes S3 archive reads through DuckDB's httpfs extension as one
+	// parallel multi-file scan, instead of downloading each file to disk first.
+	// It is NOT a DuckDB SET — Apply ignores it; parquetquery.FetchWithTuning
+	// reads it to pick the S3 path. httpfs holds each scanned file in memory
+	// OUTSIDE memory_limit, so this is the risky ultrafast lever (only Ultrafast
+	// sets it) with peak RAM ≈ largest_file × Threads (#511).
+	S3Direct bool
 }
 
 // DefaultTuning is bintrail's conservative, container-safe DuckDB budget — the
@@ -44,11 +52,13 @@ type Tuning struct {
 // base the CLI tuning flags build on.
 func DefaultTuning() Tuning { return Tuning{Threads: 2, MemoryLimit: "4GB"} }
 
-// Ultrafast trades the container-safe cap for speed: both knobs unset, so
+// Ultrafast trades the container-safe cap for speed: threads/memory unset so
 // DuckDB self-tunes to the host (all cores, ~80% RAM, spilling to
-// temp_directory). For big boxes running the offline query/recover/reconstruct
-// commands, not the small shared containers the shim runs in. See #509.
-func Ultrafast() Tuning { return Tuning{} }
+// temp_directory), plus S3Direct so S3 archives are read via httpfs in one
+// parallel scan rather than downloaded first. For big boxes running the offline
+// query/recover/reconstruct commands, not the small shared containers the shim
+// runs in. See #509/#511.
+func Ultrafast() Tuning { return Tuning{S3Direct: true} }
 
 // Apply emits the SET statements for the non-zero fields on db. Best-effort,
 // matching the rest of duckdbutil: a failed SET is logged at WARN and the

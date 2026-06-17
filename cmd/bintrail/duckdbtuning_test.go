@@ -25,9 +25,9 @@ func TestDuckDBTuningFromFlags(t *testing.T) {
 			want:  duckdbutil.Tuning{Threads: 2, MemoryLimit: "4GB"},
 		},
 		{
-			name:  "ultrafast → DuckDB self-tunes (both unset)",
+			name:  "ultrafast → DuckDB self-tunes (both unset) + S3Direct",
 			flags: map[string]string{"ultrafast": "true"},
-			want:  duckdbutil.Tuning{},
+			want:  duckdbutil.Tuning{S3Direct: true},
 		},
 		{
 			name:  "explicit threads overrides the default base",
@@ -55,14 +55,14 @@ func TestDuckDBTuningFromFlags(t *testing.T) {
 			want:  duckdbutil.Tuning{Threads: 0, MemoryLimit: "4GB"},
 		},
 		{
-			name:  "ultrafast + explicit threads → threads applied, memory stays unset",
+			name:  "ultrafast + explicit threads → threads applied, memory unset, S3Direct kept",
 			flags: map[string]string{"ultrafast": "true", "duckdb-threads": "8"},
-			want:  duckdbutil.Tuning{Threads: 8, MemoryLimit: ""},
+			want:  duckdbutil.Tuning{Threads: 8, MemoryLimit: "", S3Direct: true},
 		},
 		{
-			name:  "ultrafast + explicit memory-limit → memory applied, threads stays unset",
+			name:  "ultrafast + explicit memory-limit → memory applied, threads unset, S3Direct kept",
 			flags: map[string]string{"ultrafast": "true", "duckdb-memory-limit": "16GB"},
-			want:  duckdbutil.Tuning{Threads: 0, MemoryLimit: "16GB"},
+			want:  duckdbutil.Tuning{Threads: 0, MemoryLimit: "16GB", S3Direct: true},
 		},
 		{
 			// Negative is a dangerous case: DuckDB silently accepts it and

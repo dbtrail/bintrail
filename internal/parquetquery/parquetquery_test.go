@@ -98,7 +98,7 @@ func TestBuildQueryFromFiles(t *testing.T) {
 		"s3://bucket/events/bintrail_id=abc/event_date=2026-03-09/event_hour=11/events.parquet",
 		"s3://bucket/events/bintrail_id=abc/event_date=2026-03-09/event_hour=12/events.parquet",
 	}
-	q, args := buildQueryFromFiles(files, query.Options{Limit: 50})
+	q, args := buildQueryFromFiles(files, query.Options{Limit: 50}, map[string]bool{"connection_id": true})
 	assertContains(t, q, "FROM parquet_scan([")
 	assertContains(t, q, "hive_partitioning=true, union_by_name=true)")
 	assertContains(t, q, "event_hour=11/events.parquet")
@@ -112,7 +112,7 @@ func TestBuildQueryFromFiles(t *testing.T) {
 
 func TestBuildQueryFromFilesEscaping(t *testing.T) {
 	files := []string{"s3://bucket/it's/file.parquet"}
-	q, _ := buildQueryFromFiles(files, query.Options{})
+	q, _ := buildQueryFromFiles(files, query.Options{}, map[string]bool{"connection_id": true})
 	assertContains(t, q, "it''s")
 }
 
@@ -120,7 +120,7 @@ func TestBuildQueryFromFilesWithFilters(t *testing.T) {
 	files := []string{"s3://bucket/f.parquet"}
 	since := time.Date(2026, 3, 9, 11, 0, 0, 0, time.UTC)
 	opts := query.Options{Schema: "mydb", Table: "orders", Since: &since, Limit: 10}
-	q, args := buildQueryFromFiles(files, opts)
+	q, args := buildQueryFromFiles(files, opts, map[string]bool{"connection_id": true})
 	assertContains(t, q, "schema_name = ?")
 	assertContains(t, q, "table_name = ?")
 	assertContains(t, q, "event_timestamp >= ?")
@@ -128,6 +128,25 @@ func TestBuildQueryFromFilesWithFilters(t *testing.T) {
 	if len(args) != 4 {
 		t.Errorf("expected 4 args, got %d: %v", len(args), args)
 	}
+}
+
+// TestBuildQueryFromFilesConnectionIDSubstitution pins the backward-compat path
+// the S3-direct (httpfs) read relies on: when connection_id is absent from
+// every file in the list, the query must substitute a typed NULL instead of
+// selecting a column that doesn't exist (which would error), matching
+// buildQueryForFile.
+func TestBuildQueryFromFilesConnectionIDSubstitution(t *testing.T) {
+	files := []string{"s3://bucket/old.parquet"}
+	// cols WITHOUT connection_id (e.g. a pre-v0.4.4 archive).
+	q, _ := buildQueryFromFiles(files, query.Options{Limit: 10}, map[string]bool{})
+	assertContains(t, q, "NULL::INT32 AS connection_id")
+
+	// cols WITH connection_id selects the real column, no substitution.
+	q2, _ := buildQueryFromFiles(files, query.Options{Limit: 10}, map[string]bool{"connection_id": true})
+	if strings.Contains(q2, "NULL::INT32 AS connection_id") {
+		t.Errorf("should select the real connection_id when present, got: %s", q2)
+	}
+	assertContains(t, q2, " connection_id,")
 }
 
 // ─── buildQuery (local glob path) ───────────────────────────────────────────
@@ -163,7 +182,7 @@ func TestBuildQueryOrderDESC(t *testing.T) {
 // archive lookups).
 func TestBuildQueryFromFilesOrderDESC(t *testing.T) {
 	files := []string{"s3://bucket/f.parquet"}
-	q, _ := buildQueryFromFiles(files, query.Options{Limit: 50, Order: "DESC"})
+	q, _ := buildQueryFromFiles(files, query.Options{Limit: 50, Order: "DESC"}, map[string]bool{"connection_id": true})
 	assertContains(t, q, "ORDER BY event_timestamp DESC, event_id DESC")
 }
 
@@ -299,7 +318,7 @@ func mustBuildQueryForFile(opts query.Options, cols map[string]bool) string {
 }
 
 func mustBuildQueryFromFiles(opts query.Options) string {
-	q, _ := buildQueryFromFiles([]string{"s3://b/x.parquet"}, opts)
+	q, _ := buildQueryFromFiles([]string{"s3://b/x.parquet"}, opts, map[string]bool{"connection_id": true})
 	return q
 }
 
