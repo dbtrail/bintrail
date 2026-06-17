@@ -21,6 +21,10 @@ import (
 // these two constructors are not special-cased anywhere — the same struct
 // expresses "default", "ultrafast", and any explicit operator override.
 //
+// Note the polarity: the whole-struct zero value Tuning{} equals Ultrafast()
+// (host-greedy), NOT the container-safe budget. A caller that wants the safe
+// default must call DefaultTuning() explicitly rather than rely on a zero value.
+//
 // temp_directory and preserve_insertion_order are deliberately NOT in this
 // struct: they are not memory-for-speed trade-offs (the former is the spill
 // backstop, the latter is a win-win that is safe under our explicit ORDER BY),

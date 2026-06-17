@@ -45,9 +45,9 @@ func TestDuckDBTuningFromFlags(t *testing.T) {
 			want:  duckdbutil.Tuning{Threads: 2, MemoryLimit: "16GiB"},
 		},
 		{
-			name:  "percentage memory-limit accepted",
-			flags: map[string]string{"duckdb-memory-limit": "80%"},
-			want:  duckdbutil.Tuning{Threads: 2, MemoryLimit: "80%"},
+			name:  "decimal memory-limit accepted",
+			flags: map[string]string{"duckdb-memory-limit": "2.5GB"},
+			want:  duckdbutil.Tuning{Threads: 2, MemoryLimit: "2.5GB"},
 		},
 		{
 			name:  "explicit threads=0 means one-per-core, overriding default 2",
@@ -65,10 +65,30 @@ func TestDuckDBTuningFromFlags(t *testing.T) {
 			want:  duckdbutil.Tuning{Threads: 0, MemoryLimit: "16GB"},
 		},
 		{
-			// Negative is the dangerous case: DuckDB silently accepts it and
+			// Negative is a dangerous case: DuckDB silently accepts it and
 			// uncaps memory, so the CLI must reject it up front.
 			name:    "negative memory-limit → error",
 			flags:   map[string]string{"duckdb-memory-limit": "-4GB"},
+			wantErr: true,
+		},
+		{
+			// Zero is the other silent-uncap: DuckDB accepts e.g. '0GB' and
+			// treats it as unlimited.
+			name:    "zero memory-limit → error",
+			flags:   map[string]string{"duckdb-memory-limit": "0GB"},
+			wantErr: true,
+		},
+		{
+			// A percentage / a bare unitless number are NOT accepted by the
+			// linked DuckDB — rejecting them at the CLI avoids a silent
+			// fall-back to the default at Apply time.
+			name:    "percentage memory-limit → error",
+			flags:   map[string]string{"duckdb-memory-limit": "80%"},
+			wantErr: true,
+		},
+		{
+			name:    "bare unitless number → error",
+			flags:   map[string]string{"duckdb-memory-limit": "1024"},
 			wantErr: true,
 		},
 		{

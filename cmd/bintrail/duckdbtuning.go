@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -13,15 +14,31 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
-// duckDBMemoryLimitRE accepts the DuckDB memory_limit forms an operator would
-// pass: a positive size with an optional decimal or binary unit (16GB, 2.5GB,
-// 16GiB, a bare byte count) or a percentage (80%). It deliberately rejects a
-// leading '-': DuckDB SILENTLY accepts a negative memory_limit and treats it as
-// effectively unlimited (no error, so the best-effort WARN never fires), which
-// would invert the whole point of a memory cap. Garbage (typos) is rejected too
-// so an operator gets a clear error instead of a silent fall-back to the
-// conservative default.
-var duckDBMemoryLimitRE = regexp.MustCompile(`(?i)^(\d+(\.\d+)?\s*(b|kb|mb|gb|tb|pb|kib|mib|gib|tib|pib)?|\d+%)$`)
+// duckDBMemoryLimitRE matches a number with a REQUIRED unit from the exact set
+// the linked DuckDB accepts as a memory_limit — decimal B/KB/MB/GB/TB or binary
+// KiB/MiB/GiB/TiB (verified empirically; DuckDB rejects PB/PiB, '%', and a
+// bare unitless number). Matching only what DuckDB honors is the whole point:
+// a value the regex accepts but DuckDB rejects (e.g. '80%') would pass this CLI
+// gate and then hit Apply's best-effort SET, which logs a WARN and silently
+// falls back to the default — the exact silent-fallback this validation exists
+// to prevent. A leading '-' has no match (DuckDB SILENTLY accepts a negative
+// limit as effectively unlimited), and a zero magnitude is rejected separately
+// in validateDuckDBMemoryLimit (DuckDB accepts e.g. '0GB' and uncaps).
+var duckDBMemoryLimitRE = regexp.MustCompile(`(?i)^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb|tb|kib|mib|gib|tib)$`)
+
+// validateDuckDBMemoryLimit rejects an operator-supplied --duckdb-memory-limit
+// that DuckDB would mishandle, turning a typo or a footgun into a clear CLI
+// error instead of a silent fall-back to the default (or a silent uncap).
+func validateDuckDBMemoryLimit(s string) error {
+	m := duckDBMemoryLimitRE.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return fmt.Errorf("invalid --duckdb-memory-limit %q: expected a positive size with a unit, e.g. 16GB, 512MB, or 16GiB (units: B/KB/MB/GB/TB or KiB/MiB/GiB/TiB)", s)
+	}
+	if v, err := strconv.ParseFloat(m[1], 64); err != nil || v <= 0 {
+		return fmt.Errorf("invalid --duckdb-memory-limit %q: must be greater than zero (DuckDB treats a zero limit as unlimited)", s)
+	}
+	return nil
+}
 
 // addDuckDBTuningFlags registers the shared DuckDB resource flags on the
 // offline query/recover/reconstruct commands. They lift the conservative,
@@ -61,8 +78,8 @@ func duckDBTuningFromFlags(cmd *cobra.Command) (duckdbutil.Tuning, error) {
 		t.Threads = threads
 	}
 	if mem, _ := cmd.Flags().GetString("duckdb-memory-limit"); mem != "" {
-		if !duckDBMemoryLimitRE.MatchString(strings.TrimSpace(mem)) {
-			return duckdbutil.Tuning{}, fmt.Errorf("invalid --duckdb-memory-limit %q: expected a positive size like 16GB / 512MB / 16GiB or a percentage like 80%%", mem)
+		if err := validateDuckDBMemoryLimit(mem); err != nil {
+			return duckdbutil.Tuning{}, err
 		}
 		t.MemoryLimit = mem
 	}
