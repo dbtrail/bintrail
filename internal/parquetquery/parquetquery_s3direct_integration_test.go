@@ -16,15 +16,16 @@ import (
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
-// TestFetchS3Direct_globalTopNAcrossFiles proves the ultrafast S3-direct path's
-// core correctness claim: a single DuckDB parquet_scan over the whole file list
-// applies a GLOBAL ORDER BY + LIMIT (top-N across all files), not a per-file
-// limit. Two disjoint LOCAL parquet files stand in for S3 objects — the query
-// logic is identical; only the httpfs transport + region pinning differ, and
-// those need a live S3/minio (a documented gap; SQL construction is covered by
-// the unit tests). fetchS3Direct accepts any parquet path, so local files
-// exercise the real production function.
-func TestFetchS3Direct_globalTopNAcrossFiles(t *testing.T) {
+// TestQueryFileList_globalTopNAcrossFiles proves the ultrafast S3-direct path's
+// core correctness claim: queryFileList (the multi-file scan that fetchS3Direct
+// runs after its httpfs/region setup) applies a GLOBAL ORDER BY + LIMIT (top-N
+// across all files), not a per-file limit. Two disjoint LOCAL parquet files
+// stand in for S3 objects — the query logic is identical; only the httpfs
+// transport + region pinning differ, and those need a live S3/minio (a
+// documented gap; SQL construction is covered by the unit tests). The test
+// exercises queryFileList directly so it does not trigger INSTALL httpfs (which
+// can stall on a runner that can't reach the extension registry).
+func TestQueryFileList_globalTopNAcrossFiles(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 	dir := t.TempDir()
@@ -54,15 +55,17 @@ func TestFetchS3Direct_globalTopNAcrossFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ddb.Close()
+	// Apply the ultrafast tuning (threads/memory unset → DuckDB parallelizes the
+	// multi-file scan), the realistic condition for this path.
 	duckdbutil.Ultrafast().Apply(context.Background(), ddb)
 
 	// LIMIT 2 ascending must return the two GLOBALLY earliest events — pk 1
 	// (14:00, file1) and pk 2 (15:00, file2) — NOT file1's own first two
 	// (pk 1, pk 3), which is what a per-file limit would have produced.
-	rows, err := fetchS3Direct(context.Background(), ddb, []string{file1, file2}, "", 0,
+	rows, err := queryFileList(context.Background(), ddb, []string{file1, file2},
 		query.Options{Schema: "mydb", Table: "orders", Limit: 2})
 	if err != nil {
-		t.Fatalf("fetchS3Direct: %v", err)
+		t.Fatalf("queryFileList: %v", err)
 	}
 	if len(rows) != 2 {
 		t.Fatalf("expected 2 rows under LIMIT 2, got %d", len(rows))

@@ -214,14 +214,24 @@ func fetchS3Direct(ctx context.Context, db *sql.DB, files []string, region strin
 	}
 	slog.Warn("ultrafast S3-direct: reading S3 archives via DuckDB httpfs, held in memory OUTSIDE memory_limit — ensure free RAM exceeds the peak estimate; lower --duckdb-threads to bound it", warnAttrs...)
 
+	return queryFileList(ctx, db, files, opts)
+}
+
+// queryFileList runs the single multi-file parquet_scan that backs the
+// S3-direct path: probe the unioned columns, build one query over the whole
+// list (DuckDB parallelizes the scan and applies the global ORDER BY + LIMIT),
+// and scan the rows. Split out of fetchS3Direct so it can be tested over local
+// parquet without the httpfs install/region setup — the file paths can be
+// local or s3://; only the transport differs (#511).
+func queryFileList(ctx context.Context, db *sql.DB, files []string, opts query.Options) ([]query.ResultRow, error) {
 	cols, err := parquetColumnsFromFiles(ctx, db, files)
 	if err != nil {
-		return nil, fmt.Errorf("read S3 parquet schema: %w", err)
+		return nil, fmt.Errorf("read parquet schema: %w", err)
 	}
 	q, args := buildQueryFromFiles(files, opts, cols)
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("S3-direct parquet query: %w", err)
+		return nil, fmt.Errorf("multi-file parquet query: %w", err)
 	}
 	defer rows.Close()
 	return scanRows(rows)
