@@ -183,6 +183,135 @@ func TestResolveStart_invalidStartGTIDFlag(t *testing.T) {
 	}
 }
 
+// ─── MariaDB flavor: GTID parsing + resolveStart (alpha) ──────────────────────
+
+// TestParseGTIDSetForFlavor verifies the flavor dispatch: MariaDB strings parse
+// to *MariadbGTIDSet (domain-server-seq, not zero-padded), MySQL strings to
+// *MysqlGTIDSet, and an unparseable string errors for both flavors.
+func TestParseGTIDSetForFlavor(t *testing.T) {
+	gs, err := parseGTIDSetForFlavor(gomysql.MySQLFlavor, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
+	if err != nil {
+		t.Fatalf("mysql parse: %v", err)
+	}
+	if _, ok := gs.(*gomysql.MysqlGTIDSet); !ok {
+		t.Errorf("mysql flavor: expected *MysqlGTIDSet, got %T", gs)
+	}
+
+	mgs, err := parseGTIDSetForFlavor(gomysql.MariaDBFlavor, "0-1-100")
+	if err != nil {
+		t.Fatalf("mariadb parse: %v", err)
+	}
+	if _, ok := mgs.(*gomysql.MariadbGTIDSet); !ok {
+		t.Errorf("mariadb flavor: expected *MariadbGTIDSet, got %T", mgs)
+	}
+	if mgs.String() != "0-1-100" {
+		t.Errorf("mariadb GTID string = %q, want %q (must not be zero-padded)", mgs.String(), "0-1-100")
+	}
+
+	if _, err := parseGTIDSetForFlavor(gomysql.MySQLFlavor, "garbage"); err == nil {
+		t.Error("expected error for invalid mysql GTID")
+	}
+	if _, err := parseGTIDSetForFlavor(gomysql.MariaDBFlavor, "garbage"); err == nil {
+		t.Error("expected error for invalid mariadb GTID")
+	}
+}
+
+// TestNormalizeGTIDSet_mariadbPassthrough pins that the MySQL UUID zero-padder
+// leaves MariaDB domain-server-seq GTIDs untouched (3 segments is not a 5-part
+// UUID, so it passes through). Defense in depth in case a MariaDB string reaches
+// NormalizeGTIDSet.
+func TestNormalizeGTIDSet_mariadbPassthrough(t *testing.T) {
+	for _, s := range []string{"0-1-100", "0-1-100,1-2-50"} {
+		if got := NormalizeGTIDSet(s); got != s {
+			t.Errorf("NormalizeGTIDSet(%q) = %q, want unchanged", s, got)
+		}
+	}
+}
+
+// TestResolveStartForFlavor_mariadbGTID verifies a fresh MariaDB GTID start: the
+// GTID is parsed with the MariaDB flavor and returned without zero-padding, and
+// accGTID's dynamic type is *MariadbGTIDSet.
+func TestResolveStartForFlavor_mariadbGTID(t *testing.T) {
+	mode, _, gtidStr, _, accGTID, err := resolveStartForFlavor("", "0-1-100", 4, nil, gomysql.MariaDBFlavor)
+	if err != nil {
+		t.Fatalf("resolveStartForFlavor: %v", err)
+	}
+	if mode != "gtid" {
+		t.Errorf("mode = %q, want gtid", mode)
+	}
+	if gtidStr != "0-1-100" {
+		t.Errorf("gtidStr = %q, want 0-1-100", gtidStr)
+	}
+	if accGTID == nil {
+		t.Fatal("expected non-nil accGTID for mariadb GTID mode")
+	}
+	if _, ok := accGTID.(*gomysql.MariadbGTIDSet); !ok {
+		t.Errorf("accGTID dynamic type = %T, want *MariadbGTIDSet", accGTID)
+	}
+}
+
+// TestResolveStartForFlavor_resumeMariaDBGTID verifies the resume path: a saved
+// MariaDB checkpoint (flavor=mariadb) re-parses its gtid_set with the MariaDB
+// parser. The negative control proves a MariaDB set parsed as MySQL fails — the
+// exact break that the persisted flavor column prevents.
+func TestResolveStartForFlavor_resumeMariaDBGTID(t *testing.T) {
+	saved := &streamState{mode: "gtid", gtidSet: "0-1-100", flavor: gomysql.MariaDBFlavor}
+	mode, _, gtidStr, _, accGTID, err := resolveStartForFlavor("", "", 0, saved, gomysql.MariaDBFlavor)
+	if err != nil {
+		t.Fatalf("resume mariadb: %v", err)
+	}
+	if mode != "gtid" || gtidStr != "0-1-100" {
+		t.Errorf("resume: mode=%q gtidStr=%q, want gtid/0-1-100", mode, gtidStr)
+	}
+	if _, ok := accGTID.(*gomysql.MariadbGTIDSet); !ok {
+		t.Errorf("resume accGTID type = %T, want *MariadbGTIDSet", accGTID)
+	}
+
+	// Negative control: a MariaDB set parsed under the MySQL flavor must fail.
+	if _, err := parseGTIDSetForFlavor(gomysql.MySQLFlavor, "0-1-100"); err == nil {
+		t.Error("expected MariaDB GTID parsed as MySQL to error (this is why flavor must be persisted)")
+	}
+}
+
+// TestResolveStartForFlavor_flavorMismatchErrors verifies that resuming a saved
+// checkpoint under a different source flavor is rejected (latent-corruption
+// guard): the saved set would be parsed as one flavor while the syncer handshake
+// and the next checkpoint use another. A legacy checkpoint (empty flavor) adopts
+// the requested flavor instead of erroring.
+func TestResolveStartForFlavor_flavorMismatchErrors(t *testing.T) {
+	// Saved as mariadb, requested mysql → error (covers GTID mode).
+	mdb := &streamState{mode: "gtid", gtidSet: "0-1-100", flavor: gomysql.MariaDBFlavor}
+	if _, _, _, _, _, err := resolveStartForFlavor("", "", 0, mdb, gomysql.MySQLFlavor); err == nil {
+		t.Error("expected error resuming a mariadb checkpoint under mysql flavor")
+	}
+
+	// Saved as mysql, requested mariadb → error (covers position mode).
+	my := &streamState{mode: "position", binlogFile: "binlog.000001", binlogPos: 4, flavor: gomysql.MySQLFlavor}
+	if _, _, _, _, _, err := resolveStartForFlavor("", "", 0, my, gomysql.MariaDBFlavor); err == nil {
+		t.Error("expected error resuming a mysql checkpoint under mariadb flavor")
+	}
+
+	// Legacy checkpoint (empty flavor) adopts the requested flavor — no error.
+	legacy := &streamState{mode: "position", binlogFile: "binlog.000001", binlogPos: 4}
+	if _, _, _, _, _, err := resolveStartForFlavor("", "", 0, legacy, gomysql.MariaDBFlavor); err != nil {
+		t.Errorf("legacy checkpoint (empty flavor) should adopt requested flavor, got error: %v", err)
+	}
+}
+
+// TestResolveStart_positionModeReturnsTrueNil pins that position mode returns a
+// genuine nil interface — not a typed-nil *MysqlGTIDSet wrapped in the interface
+// — so advanceGTID's `state.accGTID == nil` guard keeps working after the
+// interface widening (the typed-nil-interface trap).
+func TestResolveStart_positionModeReturnsTrueNil(t *testing.T) {
+	_, _, _, _, accGTID, err := resolveStart("binlog.000001", "", 4, nil)
+	if err != nil {
+		t.Fatalf("resolveStart: %v", err)
+	}
+	if accGTID != nil {
+		t.Errorf("position mode must return a true-nil accGTID interface, got %T", accGTID)
+	}
+}
+
 // ─── GTID accumulation ────────────────────────────────────────────────────────
 
 // TestStreamState_gtidAccumulation verifies that accGTID.Update correctly

@@ -36,14 +36,18 @@ type streamState struct {
 	binlogFile    string
 	binlogPos     uint64
 	gtidSet       string // serialized GTID set (GTID mode only)
+	flavor        string // source flavor: "mysql" (default) or "mariadb"; selects the GTID parser on resume
 	eventsIndexed int64
 	lastEventTime sql.NullTime
 	serverID      uint32
 	bintrailID    string // resolved server identity (empty = unknown, stored as NULL)
 
 	// accGTID is the in-memory accumulated GTID set (GTID mode only).
-	// It is serialized to gtidSet on checkpoint.
-	accGTID *gomysql.MysqlGTIDSet
+	// It is serialized to gtidSet on checkpoint. Typed as the gomysql.GTIDSet
+	// interface so it can hold either a *MysqlGTIDSet or, for a MariaDB source,
+	// a *MariadbGTIDSet. Position mode leaves it a true nil interface, which the
+	// advanceGTID guard relies on.
+	accGTID gomysql.GTIDSet
 }
 
 // loadStreamState loads the saved stream_state row, returning nil if no row exists.
@@ -51,10 +55,10 @@ func loadStreamState(db *sql.DB) (*streamState, error) {
 	var s streamState
 	var gtidSet, bintrailID sql.NullString
 	err := db.QueryRow(`
-		SELECT mode, binlog_file, binlog_position, gtid_set,
+		SELECT mode, binlog_file, binlog_position, gtid_set, flavor,
 		       events_indexed, last_event_time, server_id, bintrail_id
 		FROM stream_state WHERE id = 1`).Scan(
-		&s.mode, &s.binlogFile, &s.binlogPos, &gtidSet,
+		&s.mode, &s.binlogFile, &s.binlogPos, &gtidSet, &s.flavor,
 		&s.eventsIndexed, &s.lastEventTime, &s.serverID, &bintrailID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -85,21 +89,28 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	if state.bintrailID != "" {
 		bintrailIDArg = state.bintrailID
 	}
+	// Default an unset flavor to mysql so the NOT NULL column never receives an
+	// empty string from a caller that predates the flavor field.
+	flavor := state.flavor
+	if flavor == "" {
+		flavor = gomysql.MySQLFlavor
+	}
 	_, err := db.Exec(`
 		INSERT INTO stream_state
-		    (id, mode, binlog_file, binlog_position, gtid_set,
+		    (id, mode, binlog_file, binlog_position, gtid_set, flavor,
 		     events_indexed, last_event_time, last_checkpoint, server_id, bintrail_id)
-		VALUES (1, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?, ?)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?, ?)
 		ON DUPLICATE KEY UPDATE
 		    binlog_file     = VALUES(binlog_file),
 		    binlog_position = VALUES(binlog_position),
 		    gtid_set        = VALUES(gtid_set),
+		    flavor          = VALUES(flavor),
 		    events_indexed  = VALUES(events_indexed),
 		    last_event_time = VALUES(last_event_time),
 		    last_checkpoint = UTC_TIMESTAMP(),
 		    server_id       = VALUES(server_id),
 		    bintrail_id     = VALUES(bintrail_id)`,
-		state.mode, state.binlogFile, state.binlogPos, gtidSet,
+		state.mode, state.binlogFile, state.binlogPos, gtidSet, flavor,
 		state.eventsIndexed, lastEventTime, state.serverID, bintrailIDArg)
 	return err
 }
@@ -223,13 +234,47 @@ func NormalizeGTIDSet(s string) string {
 	return strings.Join(entries, ",")
 }
 
-// resolveStart determines the start position for replication. It returns the
-// mode ("position" or "gtid"), file, GTID string, pos, and an optional
-// pre-parsed MysqlGTIDSet (non-nil only in GTID mode).
+// parseGTIDSetForFlavor parses a GTID set string with the parser for the given
+// flavor: ParseMariadbGTIDSet for "mariadb", ParseMysqlGTIDSet otherwise. Both
+// library functions return the gomysql.GTIDSet interface (and a true-nil
+// interface on error), so this never produces a typed-nil. The caller is
+// responsible for any flavor-appropriate normalization first (see
+// normalizeGTIDForFlavor).
+func parseGTIDSetForFlavor(flavor, s string) (gomysql.GTIDSet, error) {
+	if flavor == gomysql.MariaDBFlavor {
+		return gomysql.ParseMariadbGTIDSet(s)
+	}
+	return gomysql.ParseMysqlGTIDSet(s)
+}
+
+// normalizeGTIDForFlavor zero-pads UUIDs for MySQL (see NormalizeGTIDSet) and
+// leaves MariaDB domain-server-seq GTIDs untouched (they have no UUID to pad).
+func normalizeGTIDForFlavor(flavor, s string) string {
+	if flavor == gomysql.MariaDBFlavor {
+		return s
+	}
+	return NormalizeGTIDSet(s)
+}
+
+// resolveStart determines the start position for replication for a MySQL source.
+// It is a thin wrapper over resolveStartForFlavor; see that function for the
+// full contract. Kept so existing MySQL callers and tests are unchanged.
 func resolveStart(
 	startFile, startGTID string, startPos uint32,
 	saved *streamState,
-) (mode, file, gtidStr string, pos uint32, accGTID *gomysql.MysqlGTIDSet, err error) {
+) (mode, file, gtidStr string, pos uint32, accGTID gomysql.GTIDSet, err error) {
+	return resolveStartForFlavor(startFile, startGTID, startPos, saved, gomysql.MySQLFlavor)
+}
+
+// resolveStartForFlavor determines the start position for replication. It returns
+// the mode ("position" or "gtid"), file, GTID string, pos, and an optional
+// pre-parsed GTID set (non-nil only in GTID mode). flavor selects the GTID
+// parser; for "mariadb" the set is parsed as domain-server-seq and not UUID
+// zero-padded. Position mode returns a true-nil accGTID interface.
+func resolveStartForFlavor(
+	startFile, startGTID string, startPos uint32,
+	saved *streamState, flavor string,
+) (mode, file, gtidStr string, pos uint32, accGTID gomysql.GTIDSet, err error) {
 	// Saved checkpoint takes priority — makes re-running the same command
 	// idempotent (the user doesn't need to remove --start-file to resume).
 	// Exception: if the user explicitly requests a *different* mode than the
@@ -241,18 +286,30 @@ func resolveStart(
 			return "", "", "", 0, nil, fmt.Errorf("--start-file and --start-gtid are mutually exclusive")
 		}
 
+		// Reject resuming a checkpoint under a different source flavor. The saved
+		// set's format is fixed by the flavor that wrote it; continuing under
+		// another flavor would parse the saved set one way while the BinlogSyncer
+		// handshakes — and the next checkpoint persists — as another, a latent
+		// corruption. Legacy rows (empty flavor, pre-column) adopt the requested
+		// flavor. --reset clears the checkpoint (saved == nil) and bypasses this.
+		if saved.flavor != "" && saved.flavor != flavor {
+			return "", "", "", 0, nil, fmt.Errorf(
+				"saved checkpoint is source flavor %q but %q was requested; pass --source-flavor %s (or --reset to start fresh)",
+				saved.flavor, flavor, saved.flavor)
+		}
+
 		// Detect mode switch: user explicitly requests a different mode.
 		switchToGTID := saved.mode == "position" && startGTID != "" && startFile == ""
 		switchToPosition := saved.mode == "gtid" && startFile != "" && startGTID == ""
 
 		if switchToGTID {
 			slog.Warn("switching from position mode to GTID mode", "old_file", saved.binlogFile, "old_pos", saved.binlogPos)
-			startGTID = NormalizeGTIDSet(startGTID)
-			gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTID)
+			startGTID = normalizeGTIDForFlavor(flavor, startGTID)
+			gs, parseErr := parseGTIDSetForFlavor(flavor, startGTID)
 			if parseErr != nil {
 				return "", "", "", 0, nil, fmt.Errorf("invalid --start-gtid: %w", parseErr)
 			}
-			return "gtid", "", startGTID, 0, gs.(*gomysql.MysqlGTIDSet), nil
+			return "gtid", "", startGTID, 0, gs, nil
 		}
 		if switchToPosition {
 			slog.Warn("switching from GTID mode to position mode", "old_gtid_set", saved.gtidSet)
@@ -264,13 +321,15 @@ func resolveStart(
 			slog.Warn("checkpoint exists; ignoring --start-file/--start-gtid and resuming from saved state")
 		}
 		if saved.mode == "gtid" {
-			normalized := NormalizeGTIDSet(saved.gtidSet)
-			slog.Info("resuming from GTID set", "gtid_set", normalized)
-			gs, parseErr := gomysql.ParseMysqlGTIDSet(normalized)
+			// flavor is authoritative here: the mismatch guard above guarantees
+			// saved.flavor is either empty (legacy) or equal to flavor.
+			normalized := normalizeGTIDForFlavor(flavor, saved.gtidSet)
+			slog.Info("resuming from GTID set", "gtid_set", normalized, "flavor", flavor)
+			gs, parseErr := parseGTIDSetForFlavor(flavor, normalized)
 			if parseErr != nil {
 				return "", "", "", 0, nil, fmt.Errorf("invalid saved gtid_set %q: %w", saved.gtidSet, parseErr)
 			}
-			return "gtid", "", normalized, 0, gs.(*gomysql.MysqlGTIDSet), nil
+			return "gtid", "", normalized, 0, gs, nil
 		}
 		slog.Info("resuming from position", "file", saved.binlogFile, "pos", saved.binlogPos)
 		return "position", saved.binlogFile, "", uint32(saved.binlogPos), nil, nil
@@ -281,12 +340,12 @@ func resolveStart(
 		return "", "", "", 0, nil, fmt.Errorf("--start-file and --start-gtid are mutually exclusive")
 	}
 	if startGTID != "" {
-		startGTID = NormalizeGTIDSet(startGTID)
-		gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTID)
+		startGTID = normalizeGTIDForFlavor(flavor, startGTID)
+		gs, parseErr := parseGTIDSetForFlavor(flavor, startGTID)
 		if parseErr != nil {
 			return "", "", "", 0, nil, fmt.Errorf("invalid --start-gtid: %w", parseErr)
 		}
-		return "gtid", "", startGTID, 0, gs.(*gomysql.MysqlGTIDSet), nil
+		return "gtid", "", startGTID, 0, gs, nil
 	}
 	if startFile != "" {
 		return "position", startFile, "", startPos, nil, nil
@@ -312,8 +371,20 @@ func resolveStartWithAutoDiscover(
 	startFile, startGTID string, startPos uint32,
 	saved *streamState,
 	autoDiscover func() (string, uint32, error),
-) (mode, file, gtidStr string, pos uint32, accGTID *gomysql.MysqlGTIDSet, err error) {
-	mode, file, gtidStr, pos, accGTID, err = resolveStart(startFile, startGTID, startPos, saved)
+) (mode, file, gtidStr string, pos uint32, accGTID gomysql.GTIDSet, err error) {
+	return resolveStartWithAutoDiscoverForFlavor(startFile, startGTID, startPos, saved, gomysql.MySQLFlavor, autoDiscover)
+}
+
+// resolveStartWithAutoDiscoverForFlavor is the flavor-aware variant of
+// resolveStartWithAutoDiscover; see that function for the contract. flavor is
+// threaded into resolveStartForFlavor so saved/flag GTID sets parse with the
+// right flavor.
+func resolveStartWithAutoDiscoverForFlavor(
+	startFile, startGTID string, startPos uint32,
+	saved *streamState, flavor string,
+	autoDiscover func() (string, uint32, error),
+) (mode, file, gtidStr string, pos uint32, accGTID gomysql.GTIDSet, err error) {
+	mode, file, gtidStr, pos, accGTID, err = resolveStartForFlavor(startFile, startGTID, startPos, saved, flavor)
 	if err == nil {
 		return
 	}
@@ -751,8 +822,12 @@ func streamLoop(
 // zero value is invalid; build it from the cobra layer's streamConfigFromFlags
 // or populate it explicitly.
 type Config struct {
-	IndexDSN    string
-	SourceDSN   string
+	IndexDSN  string
+	SourceDSN string
+	// Flavor is the source database flavor: "mysql" (default) or "mariadb".
+	// Empty is normalized to "mysql" in One(). It selects the GTID parser and
+	// the BinlogSyncer flavor, and is persisted to stream_state for resume.
+	Flavor      string
 	ServerID    uint32
 	StartFile   string
 	StartPos    uint32
@@ -870,6 +945,17 @@ func One(ctx context.Context, cfg Config) error {
 		return err
 	}
 
+	// Normalize the source flavor once so every downstream use (GTID parsing,
+	// BinlogSyncerConfig, persistence) sees a concrete value. Empty defaults to
+	// MySQL, keeping every existing caller (which never sets Flavor) unchanged.
+	switch cfg.Flavor {
+	case "":
+		cfg.Flavor = gomysql.MySQLFlavor
+	case gomysql.MySQLFlavor, gomysql.MariaDBFlavor:
+	default:
+		return fmt.Errorf("invalid source flavor %q: must be %q or %q", cfg.Flavor, gomysql.MySQLFlavor, gomysql.MariaDBFlavor)
+	}
+
 	// Derived cancel: internal failures (e.g. the stream loop erroring) must
 	// stop the parser goroutine even when the caller's ctx stays live.
 	ctx, cancel := context.WithCancel(ctx)
@@ -907,6 +993,16 @@ func One(ctx context.Context, cfg Config) error {
 		return err
 	}
 	fmt.Println("Source: no FK cascades \u2713")
+
+	// Advisory only: warn (never block) when the declared flavor disagrees with
+	// the server's actual VERSION(). A mismatch \u2014 e.g. the default --source-flavor
+	// mysql pointed at a MariaDB server \u2014 makes the GTID handshake misbehave.
+	// Detection never flips the configured flavor, so it can't silently
+	// mis-handshake a MySQL source.
+	if detected := metadata.DetectFlavor(sourceDB); detected != "" && detected != cfg.Flavor {
+		slog.Warn("source flavor mismatch: configured flavor differs from the detected server flavor \u2014 GTID handling may misbehave; set --source-flavor to match",
+			"configured", cfg.Flavor, "detected", detected)
+	}
 
 	// ── 3. Resolve server identity ────────────────────────────────────────────
 	bintrailID, err := cfg.Deps.ResolveServerIdentity(ctx, sourceDB, indexDB, cfg.SourceDSN)
@@ -948,8 +1044,8 @@ func One(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	mode, startFile, startGTIDStr, startPos, accGTID, err := resolveStartWithAutoDiscover(
-		cfg.StartFile, cfg.StartGTID, cfg.StartPos, saved,
+	mode, startFile, startGTIDStr, startPos, accGTID, err := resolveStartWithAutoDiscoverForFlavor(
+		cfg.StartFile, cfg.StartGTID, cfg.StartPos, saved, cfg.Flavor,
 		func() (string, uint32, error) { return config.CurrentBinlogPosition(sourceDB) })
 	if err != nil {
 		return err
@@ -973,7 +1069,25 @@ func One(ctx context.Context, cfg Config) error {
 		case "position":
 			gap, gapErr = detectPositionGap(sourceDB, startFile, startPos, gapTimeout)
 		case "gtid":
-			gap, gapErr = detectGTIDGap(sourceDB, startGTIDStr, gapTimeout)
+			if cfg.Flavor == gomysql.MariaDBFlavor {
+				// MariaDB GTID gap detection is not implemented for the alpha:
+				// detectGTIDGap relies on MySQL-only @@gtid_purged/@@gtid_executed
+				// and the MySQL GTID-set map shape, neither of which is portable, so
+				// we cannot verify whether binlogs were purged. If the operator
+				// demanded a hard stop on unverifiable gaps (--no-gap-fill), honor it
+				// — refuse rather than proceed blind. Otherwise warn loudly and
+				// proceed; position mode retains full gap detection and is the
+				// recommended MariaDB resume mode. gap/gapErr stay nil → stream runs.
+				if cfg.NoGapFill {
+					return fmt.Errorf("--no-gap-fill is set but GTID gap detection is unavailable for a MariaDB source; " +
+						"resume in position mode or drop --no-gap-fill (alpha limitation)")
+				}
+				slog.Warn("GTID gap detection is unavailable for a MariaDB source (alpha): a purged-binlog gap on resume " +
+					"will NOT abort or raise the data-loss alarm, and --no-gap-fill cannot be enforced in this mode — " +
+					"prefer position mode for MariaDB resumes")
+			} else {
+				gap, gapErr = detectGTIDGap(sourceDB, startGTIDStr, gapTimeout)
+			}
 		default:
 			slog.Warn("gap detection not implemented for mode", "mode", mode)
 		}
@@ -1014,16 +1128,14 @@ func One(ctx context.Context, cfg Config) error {
 					// Use the purged set as the checkpoint GTID set — this tells
 					// MySQL we have already seen all purged GTIDs, so it will
 					// only send the non-purged GTIDs that remain in @@gtid_executed.
+					// MySQL-only branch: a MariaDB source skips GTID gap detection
+					// above, so gap is nil here and this is never reached for MariaDB.
 					startGTIDStr = NormalizeGTIDSet(gap.PurgedGTIDSet)
 					gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTIDStr)
 					if parseErr != nil {
 						return fmt.Errorf("failed to parse purged GTID set for auto-advance: %w", parseErr)
 					}
-					parsed, ok := gs.(*gomysql.MysqlGTIDSet)
-					if !ok {
-						return fmt.Errorf("unexpected GTID set type %T after parsing purged set", gs)
-					}
-					accGTID = parsed
+					accGTID = gs
 				}
 
 				// Persist the advanced position immediately so that if the stream
@@ -1034,6 +1146,7 @@ func One(ctx context.Context, cfg Config) error {
 					binlogFile:    startFile,
 					binlogPos:     uint64(startPos),
 					gtidSet:       startGTIDStr,
+					flavor:        cfg.Flavor,
 					serverID:      cfg.ServerID,
 					bintrailID:    bintrailID,
 					eventsIndexed: saved.eventsIndexed,
@@ -1072,6 +1185,7 @@ func One(ctx context.Context, cfg Config) error {
 		// valid resume point instead of an empty file / position 0.
 		binlogFile: startFile,
 		binlogPos:  uint64(startPos),
+		flavor:     cfg.Flavor,
 		serverID:   cfg.ServerID,
 		accGTID:    accGTID,
 		bintrailID: bintrailID,
@@ -1098,7 +1212,7 @@ func One(ctx context.Context, cfg Config) error {
 	// ── 7. Create BinlogSyncer ────────────────────────────────────────────────────
 	syncerCfg := replication.BinlogSyncerConfig{
 		ServerID:             cfg.ServerID,
-		Flavor:               "mysql",
+		Flavor:               cfg.Flavor,
 		Host:                 host,
 		Port:                 port,
 		User:                 user,
@@ -1130,7 +1244,7 @@ func One(ctx context.Context, cfg Config) error {
 			}
 			return s, nil
 		case "gtid":
-			gset, parseErr := gomysql.ParseGTIDSet("mysql", startGTIDStr)
+			gset, parseErr := gomysql.ParseGTIDSet(cfg.Flavor, startGTIDStr)
 			if parseErr != nil {
 				return nil, fmt.Errorf("parse start GTID set: %w", parseErr)
 			}

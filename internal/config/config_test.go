@@ -99,6 +99,43 @@ func TestCurrentBinlogPosition_FallbackHappyPath(t *testing.T) {
 	}
 }
 
+// TestCurrentBinlogPosition_MariaDBFourColumns covers a MariaDB source:
+// SHOW BINARY LOG STATUS does not exist there (syntax error 1064), and
+// SHOW MASTER STATUS returns only FOUR columns — File, Position, Binlog_Do_DB,
+// Binlog_Ignore_DB — because MariaDB has no Executed_Gtid_Set column. The scan
+// must tolerate the differing column count and still extract File+Position.
+// Reproduces the alpha smoke-test failure "expected 4 destination arguments in
+// Scan, not 5" against real MariaDB 11.4.
+func TestCurrentBinlogPosition_MariaDBFourColumns(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW BINARY LOG STATUS").WillReturnError(&mysql.MySQLError{
+		Number:  1064,
+		Message: "You have an error in your SQL syntax near 'LOG STATUS'",
+	})
+	mock.ExpectQuery("SHOW MASTER STATUS").WillReturnRows(
+		sqlmock.NewRows([]string{"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB"}).
+			AddRow("mariadb-bin.000002", uint32(1483), "", ""))
+
+	file, pos, err := CurrentBinlogPosition(db)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if file != "mariadb-bin.000002" {
+		t.Errorf("file = %q, want %q", file, "mariadb-bin.000002")
+	}
+	if pos != 1483 {
+		t.Errorf("pos = %d, want 1483", pos)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // TestCurrentBinlogPosition_LogBinOff covers the real-world shape of
 // log_bin=OFF on every supported MySQL/Percona line. The crash-loop
 // in #325 surfaced as an asymmetric error pair — exactly one branch

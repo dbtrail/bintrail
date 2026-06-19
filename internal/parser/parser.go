@@ -173,6 +173,12 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 		case *replication.GTIDEvent:
 			currentGTID = formatGTID(ev.SID, ev.GNO)
 
+		case *replication.MariadbGTIDEvent:
+			// MariaDB source: the GTID arrives as domain-server-seq (e.g.
+			// "0-1-100"). ev.GTID.String() returns "" for the zero GTID,
+			// mirroring formatGTID's not-enabled behavior.
+			currentGTID = ev.GTID.String()
+
 		case *replication.QueryEvent:
 			currentConnectionID = ev.SlaveProxyID
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
@@ -288,6 +294,22 @@ func handleRows(
 		replication.UPDATE_ROWS_EVENTv1,
 		replication.UPDATE_ROWS_EVENTv2:
 		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, startPos, endPos, ts, pkCols, schemaVersion, out)
+
+	default:
+		// A RowsEvent whose type matches none of the above — e.g. MariaDB's
+		// MARIADB_WRITE/UPDATE/DELETE_ROWS_COMPRESSED_EVENT_V1 (log_bin_compress=ON),
+		// or PARTIAL_UPDATE_ROWS_EVENT which a MySQL source emits under
+		// binlog_row_value_options=PARTIAL_JSON (out of support; binlog_row_image=FULL
+		// is required). Decoding these is deferred; warn loudly — including how many
+		// rows were skipped — rather than dropping them silently (a data-loss class).
+		// Standard MySQL ROW DML always matches a specific case above.
+		logger.Warn("unhandled row event type — rows skipped (e.g. MariaDB compressed-row events are not yet decoded)",
+			"file", filename,
+			"pos", binlogEv.Header.LogPos,
+			"schema", schema,
+			"table", table,
+			"event_type", binlogEv.Header.EventType,
+			"rows_skipped", len(rowsEv.Rows))
 	}
 
 	return nil

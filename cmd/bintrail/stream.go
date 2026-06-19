@@ -52,6 +52,7 @@ a checkpoint before exiting.`,
 var (
 	strmIndexDSN    string
 	strmSourceDSN   string
+	strmFlavor      string
 	strmServerID    uint32
 	strmStartFile   string
 	strmStartPos    uint32
@@ -74,6 +75,7 @@ var (
 func init() {
 	streamCmd.Flags().StringVar(&strmIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	streamCmd.Flags().StringVar(&strmSourceDSN, "source-dsn", "", "DSN for the source MySQL server (required)")
+	streamCmd.Flags().StringVar(&strmFlavor, "source-flavor", "mysql", "Source database flavor: mysql or mariadb (MariaDB source support is alpha; prefer position mode for resume)")
 	streamCmd.Flags().Uint32Var(&strmServerID, "server-id", 0, "Unique replica server ID (required, must differ from all other servers)")
 	streamCmd.Flags().StringVar(&strmStartFile, "start-file", "", "Initial binlog file (mutually exclusive with --start-gtid)")
 	streamCmd.Flags().Uint32Var(&strmStartPos, "start-pos", 4, "Initial position within start file")
@@ -107,6 +109,7 @@ func streamConfigFromFlags() streamrun.Config {
 	return streamrun.Config{
 		IndexDSN:    strmIndexDSN,
 		SourceDSN:   strmSourceDSN,
+		Flavor:      strmFlavor,
 		ServerID:    strmServerID,
 		StartFile:   strmStartFile,
 		StartPos:    strmStartPos,

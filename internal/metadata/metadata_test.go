@@ -1,9 +1,51 @@
 package metadata
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
+
+// TestDetectFlavor verifies VERSION()-string flavor detection: any string
+// containing "MariaDB" (case-insensitive) is mariadb, everything else (incl.
+// Percona) is mysql, and a query error returns "" (unknown) rather than a
+// fabricated flavor.
+func TestDetectFlavor(t *testing.T) {
+	cases := []struct {
+		name     string
+		version  string
+		queryErr bool
+		want     string
+	}{
+		{"mysql 8.0", "8.0.36", false, "mysql"},
+		{"percona", "8.0.36-28", false, "mysql"},
+		{"mariadb 11.4", "11.4.10-MariaDB-1:11.4.10+maria~ubu2404", false, "mariadb"},
+		{"mariadb 10.6", "10.6.18-MariaDB", false, "mariadb"},
+		{"query error returns unknown (empty)", "", true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			exp := mock.ExpectQuery("SELECT VERSION()")
+			if tc.queryErr {
+				exp.WillReturnError(errors.New("connection refused"))
+			} else {
+				exp.WillReturnRows(sqlmock.NewRows([]string{"VERSION()"}).AddRow(tc.version))
+			}
+
+			if got := DetectFlavor(db); got != tc.want {
+				t.Errorf("DetectFlavor(%q) = %q, want %q", tc.version, got, tc.want)
+			}
+		})
+	}
+}
 
 // buildTestResolver constructs a Resolver directly without a database,
 // allowing MapRow and Resolve to be tested without a MySQL connection.

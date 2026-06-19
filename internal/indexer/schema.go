@@ -169,6 +169,7 @@ const ddlStreamState = `CREATE TABLE IF NOT EXISTS stream_state (
     binlog_file      VARCHAR(255)    NOT NULL DEFAULT '',
     binlog_position  BIGINT UNSIGNED NOT NULL DEFAULT 0,
     gtid_set         TEXT            DEFAULT NULL,
+    flavor           VARCHAR(16)     NOT NULL DEFAULT 'mysql' COMMENT 'source flavor: mysql or mariadb; selects the GTID parser on resume',
     events_indexed   BIGINT UNSIGNED NOT NULL DEFAULT 0,
     last_event_time  DATETIME        DEFAULT NULL,
     last_checkpoint  DATETIME        NOT NULL,

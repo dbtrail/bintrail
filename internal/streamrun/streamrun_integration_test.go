@@ -85,6 +85,69 @@ func TestStreamState_upsertAndLoad(t *testing.T) {
 	}
 }
 
+// TestStreamState_mariadbRoundTrip verifies the source flavor persists through a
+// checkpoint save/load cycle and then drives resume parsing: a MariaDB gtid_set
+// ("0-1-100") survives and re-parses with the MariaDB parser. Without the
+// persisted flavor, resume would call ParseMysqlGTIDSet and reject the set.
+func TestStreamState_mariadbRoundTrip(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	if err := saveCheckpoint(db, &streamState{
+		mode:     "gtid",
+		gtidSet:  "0-1-100",
+		flavor:   gomysql.MariaDBFlavor,
+		serverID: 42,
+	}); err != nil {
+		t.Fatalf("saveCheckpoint: %v", err)
+	}
+
+	loaded, err := loadStreamState(db)
+	if err != nil {
+		t.Fatalf("loadStreamState: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected non-nil state after save")
+	}
+	if loaded.flavor != gomysql.MariaDBFlavor {
+		t.Errorf("flavor: expected mariadb, got %q", loaded.flavor)
+	}
+	if loaded.gtidSet != "0-1-100" {
+		t.Errorf("gtidSet: expected 0-1-100, got %q", loaded.gtidSet)
+	}
+
+	// The persisted flavor must drive resume parsing.
+	mode, _, gtidStr, _, accGTID, err := resolveStartForFlavor("", "", 0, loaded, loaded.flavor)
+	if err != nil {
+		t.Fatalf("resume resolveStartForFlavor: %v", err)
+	}
+	if mode != "gtid" || gtidStr != "0-1-100" {
+		t.Errorf("resume: mode=%q gtid=%q, want gtid/0-1-100", mode, gtidStr)
+	}
+	if _, ok := accGTID.(*gomysql.MariadbGTIDSet); !ok {
+		t.Errorf("resume accGTID type = %T, want *MariadbGTIDSet", accGTID)
+	}
+}
+
+// TestStreamState_mysqlFlavorDefault verifies a checkpoint written without an
+// explicit flavor loads back as mysql (the NOT NULL DEFAULT) — pre-MariaDB
+// callers and rows are unaffected.
+func TestStreamState_mysqlFlavorDefault(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	if err := saveCheckpoint(db, &streamState{mode: "position", binlogFile: "binlog.000001", binlogPos: 4, serverID: 1}); err != nil {
+		t.Fatalf("saveCheckpoint: %v", err)
+	}
+	loaded, err := loadStreamState(db)
+	if err != nil {
+		t.Fatalf("loadStreamState: %v", err)
+	}
+	if loaded.flavor != gomysql.MySQLFlavor {
+		t.Errorf("flavor default: expected mysql, got %q", loaded.flavor)
+	}
+}
+
 func TestStreamState_upsertUpdate(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)

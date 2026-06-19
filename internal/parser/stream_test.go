@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
@@ -60,6 +61,19 @@ func makeXIDEvent(logPos uint32) *replication.BinlogEvent {
 	return &replication.BinlogEvent{
 		Header: &replication.EventHeader{EventType: replication.XID_EVENT, LogPos: logPos},
 		Event:  &replication.XIDEvent{XID: 1},
+	}
+}
+
+// makeMariadbGTIDEvent builds a BinlogEvent wrapping a MariaDB GTID event
+// (domain-server-seq), the MariaDB analogue of makeGTIDEvent. The stream parser
+// switches on the concrete event struct, so the MARIADB_GTID_EVENT header type
+// is set for realism only.
+func makeMariadbGTIDEvent(domain, server uint32, seq uint64) *replication.BinlogEvent {
+	return &replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.MARIADB_GTID_EVENT},
+		Event: &replication.MariadbGTIDEvent{
+			GTID: mysql.MariadbGTID{DomainID: domain, ServerID: server, SequenceNumber: seq},
+		},
 	}
 }
 
@@ -211,6 +225,65 @@ func TestStreamParser_gtidThenFilteredRows(t *testing.T) {
 	ev := <-out
 	if ev.EventType != EventGTID {
 		t.Errorf("expected EventGTID (%d), got %d", EventGTID, ev.EventType)
+	}
+}
+
+// ─── MariaDB GTIDEvent (alpha) ───────────────────────────────────────────────
+
+// TestStreamParser_mariadbGTIDEventEmitsTrackingEvent verifies that a MariaDB
+// GTID event (MariadbGTIDEvent, domain-server-seq) emits an EventGTID tracking
+// event just like a MySQL GTIDEvent. Without this, currentGTID stays empty for a
+// MariaDB source, no tracking/commit events fire, and the durable GTID
+// checkpoint never advances (endless re-stream + false gap alarm).
+func TestStreamParser_mariadbGTIDEventEmitsTrackingEvent(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel, makeMariadbGTIDEvent(0, 1, 100))
+
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected 1 EventGTID tracking event, got %d", len(out))
+	}
+	ev := <-out
+	if ev.EventType != EventGTID {
+		t.Errorf("expected EventGTID (%d), got %d", EventGTID, ev.EventType)
+	}
+	// MariaDB GTID is domain-server-seq and must NOT be zero-padded like a MySQL UUID.
+	if ev.GTID != "0-1-100" {
+		t.Errorf("expected MariaDB GTID '0-1-100', got %q", ev.GTID)
+	}
+}
+
+// TestStreamParser_mariadbGTIDThenXIDEmitsCommit verifies the #491 commit
+// machinery fires for a MariaDB source: a MariadbGTIDEvent + BEGIN + XID emits
+// [EventGTID, EventCommit] both carrying the MariaDB GTID — that EventCommit is
+// what the consumer feeds to advanceGTID to move the checkpoint forward.
+func TestStreamParser_mariadbGTIDThenXIDEmitsCommit(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel,
+		makeMariadbGTIDEvent(0, 1, 100),
+		makeQueryEvent("BEGIN"),
+		makeXIDEvent(300),
+	)
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	evs := drainAll(out)
+	if len(evs) != 2 || evs[0].EventType != EventGTID || evs[1].EventType != EventCommit {
+		t.Fatalf("expected [EventGTID, EventCommit], got %v", typesOf(evs))
+	}
+	if evs[1].GTID != "0-1-100" || evs[1].GTID != evs[0].GTID {
+		t.Errorf("EventCommit must carry the MariaDB GTID: commit=%q gtid=%q", evs[1].GTID, evs[0].GTID)
 	}
 }
 

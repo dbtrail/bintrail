@@ -33,16 +33,59 @@ import (
 // ACCESS_DENIED_ERROR), not ErrNoRows, so false-positive risk is essentially
 // nil.
 func CurrentBinlogPosition(db *sql.DB) (file string, pos uint32, err error) {
-	scanArgs := []any{&file, &pos, new(string), new(string), new(string)}
-	if err = db.QueryRow("SHOW BINARY LOG STATUS").Scan(scanArgs...); err == nil {
+	file, pos, err = scanBinlogStatus(db, "SHOW BINARY LOG STATUS")
+	if err == nil {
 		return file, pos, nil
 	}
 	firstErr := err
-	if err = db.QueryRow("SHOW MASTER STATUS").Scan(scanArgs...); err != nil {
+	file, pos, err = scanBinlogStatus(db, "SHOW MASTER STATUS")
+	if err != nil {
 		if errors.Is(firstErr, sql.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
 			return "", 0, fmt.Errorf("current binlog position empty — log_bin appears to be OFF on the source server (run \"SHOW VARIABLES LIKE 'log_bin'\" to confirm)")
 		}
 		return "", 0, fmt.Errorf("SHOW BINARY LOG STATUS / SHOW MASTER STATUS: %w (fallback: %w)", firstErr, err)
+	}
+	return file, pos, nil
+}
+
+// scanBinlogStatus runs a SHOW … STATUS statement and extracts the binlog file
+// and position from its first two columns. The remaining columns are discarded,
+// which makes the read tolerant to the column-count difference across flavors:
+// MySQL 5.7/8.0 and 8.4 return five columns (… Executed_Gtid_Set), MariaDB
+// returns four (no Executed_Gtid_Set). Only File and Position are needed.
+//
+// An empty resultset (log_bin=OFF) surfaces as sql.ErrNoRows so the caller's
+// OFF-detection keeps working unchanged; statement-not-found surfaces as the
+// driver's syntax error (1064).
+func scanBinlogStatus(db *sql.DB, stmt string) (file string, pos uint32, err error) {
+	rows, err := db.Query(stmt)
+	if err != nil {
+		return "", 0, err
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return "", 0, err
+	}
+	if len(cols) < 2 {
+		return "", 0, fmt.Errorf("%s returned %d column(s), expected at least File and Position", stmt, len(cols))
+	}
+	if !rows.Next() {
+		if rerr := rows.Err(); rerr != nil {
+			return "", 0, rerr
+		}
+		return "", 0, sql.ErrNoRows
+	}
+
+	dest := make([]any, len(cols))
+	dest[0] = &file
+	dest[1] = &pos
+	for i := 2; i < len(cols); i++ {
+		dest[i] = new(sql.RawBytes)
+	}
+	if err := rows.Scan(dest...); err != nil {
+		return "", 0, err
 	}
 	return file, pos, nil
 }

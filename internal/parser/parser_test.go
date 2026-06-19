@@ -2,10 +2,13 @@ package parser
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-mysql-org/go-mysql/replication"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
@@ -148,6 +151,53 @@ func TestFormatGTID_shortSID(t *testing.T) {
 	got := formatGTID([]byte{0x01, 0x02}, 1)
 	if got != "" {
 		t.Errorf("expected empty string for short SID, got %q", got)
+	}
+}
+
+// ─── handleRows: unhandled (e.g. MariaDB compressed) row event type ───────────
+
+// TestHandleRows_unhandledEventTypeLogsNotSilent verifies that a row event type
+// handleRows does not recognize — e.g. MariaDB's MARIADB_WRITE_ROWS_COMPRESSED_
+// EVENT_V1 — is logged at warn instead of being silently dropped. Before the
+// default arm the switch fell through to `return nil`, dropping every row with
+// no trace (a silent data-loss class). Decoding compressed rows is deferred to
+// beta; the alpha guarantee is only that they are never dropped silently.
+func TestHandleRows_unhandledEventTypeLogsNotSilent(t *testing.T) {
+	tm := &metadata.TableMeta{
+		Schema:    "shop",
+		Table:     "orders",
+		Columns:   []metadata.ColumnMeta{{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"}},
+		PKColumns: []string{"id"},
+	}
+	resolver := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{"shop.orders": tm})
+
+	var buf bytes.Buffer
+	logger := newTestLogger(&buf)
+
+	binlogEv := &replication.BinlogEvent{
+		Header: &replication.EventHeader{
+			EventType: replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1,
+			LogPos:    200,
+			EventSize: 100,
+		},
+		Event: &replication.RowsEvent{
+			Table: &replication.TableMapEvent{
+				Schema:      []byte("shop"),
+				Table:       []byte("orders"),
+				ColumnCount: 1,
+			},
+			Rows: [][]any{{int64(1)}},
+		},
+	}
+	rowsEv := binlogEv.Event.(*replication.RowsEvent)
+
+	out := make(chan Event, 4)
+	if err := handleRows(context.Background(), logger, resolver, &Filters{}, binlogEv, rowsEv, "mariadb-bin.000001", "0-1-1", 0, 1, out); err != nil {
+		t.Fatalf("handleRows: %v", err)
+	}
+
+	if !strings.Contains(strings.ToLower(buf.String()), "unhandled") {
+		t.Errorf("expected a warn mentioning the unhandled row event type, got logs: %q", buf.String())
 	}
 }
 

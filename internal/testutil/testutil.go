@@ -95,6 +95,82 @@ func CreateTestDB(t *testing.T) (*sql.DB, string) {
 	return db, name
 }
 
+// ─── MariaDB source helpers (MariaDB-as-source alpha) ─────────────────────────
+//
+// These mirror the MySQL helpers above for a MariaDB SOURCE container, used only
+// by MariaDB-tagged integration/e2e tests. The MySQL helpers (index DB) are left
+// completely unchanged. Default container: port 13307, root:testroot.
+
+// MariaDBDefaultDSN is the base DSN used when BINTRAIL_TEST_MARIADB_DSN is not
+// set. It assumes a local Docker MariaDB container on port 13307 with
+// root:testroot (distinct from the MySQL index container on 13306).
+const MariaDBDefaultDSN = "root:testroot@tcp(127.0.0.1:13307)"
+
+// MariaDBBaseDSN returns the base MariaDB source DSN (without database name)
+// from the environment or the default. It always includes parseTime=true.
+func MariaDBBaseDSN() string {
+	if env := os.Getenv("BINTRAIL_TEST_MARIADB_DSN"); env != "" {
+		return env
+	}
+	return MariaDBDefaultDSN
+}
+
+// SkipIfNoMariaDB pings the MariaDB source server and calls t.Skip if
+// unreachable, so MariaDB tests degrade gracefully when only the MySQL
+// container is running.
+func SkipIfNoMariaDB(t *testing.T) {
+	t.Helper()
+	db, err := sql.Open("mysql", MariaDBBaseDSN()+"/?parseTime=true")
+	if err != nil {
+		t.Skipf("skipping: cannot open MariaDB connection: %v", err)
+	}
+	defer db.Close()
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping: MariaDB not reachable: %v", err)
+	}
+}
+
+// CreateTestMariaDB creates a unique database on the MariaDB SOURCE server,
+// returning a connected *sql.DB, the database name, and registering cleanup.
+// It mirrors CreateTestDB but targets the MariaDB container (13307).
+func CreateTestMariaDB(t *testing.T) (*sql.DB, string) {
+	t.Helper()
+	SkipIfNoMariaDB(t)
+
+	name := fmt.Sprintf("%s_%d", sanitiseDBName(t.Name()), dbCounter.Add(1))
+
+	rootDB, err := sql.Open("mysql", MariaDBBaseDSN()+"/?parseTime=true")
+	if err != nil {
+		t.Fatalf("failed to connect to MariaDB for DB creation: %v", err)
+	}
+	defer rootDB.Close()
+
+	rootDB.Exec("DROP DATABASE IF EXISTS `" + name + "`")
+	if _, err := rootDB.Exec("CREATE DATABASE `" + name + "`"); err != nil {
+		t.Fatalf("failed to create MariaDB test database %q: %v", name, err)
+	}
+
+	dsn := MariaDBBaseDSN() + "/" + name + "?parseTime=true"
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("failed to connect to MariaDB test database %q: %v", name, err)
+	}
+	if err := db.Ping(); err != nil {
+		t.Fatalf("failed to ping MariaDB test database %q: %v", name, err)
+	}
+
+	t.Cleanup(func() {
+		db.Close()
+		cleanup, _ := sql.Open("mysql", MariaDBBaseDSN()+"/?parseTime=true")
+		if cleanup != nil {
+			cleanup.Exec("DROP DATABASE IF EXISTS `" + name + "`")
+			cleanup.Close()
+		}
+	})
+
+	return db, name
+}
+
 // MustExec executes a query or calls t.Fatal on error.
 func MustExec(t *testing.T, db *sql.DB, query string, args ...any) {
 	t.Helper()
@@ -191,6 +267,7 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		binlog_file      VARCHAR(255)    NOT NULL DEFAULT '',
 		binlog_position  BIGINT UNSIGNED NOT NULL DEFAULT 0,
 		gtid_set         TEXT            DEFAULT NULL,
+		flavor           VARCHAR(16)     NOT NULL DEFAULT 'mysql',
 		events_indexed   BIGINT UNSIGNED NOT NULL DEFAULT 0,
 		last_event_time  DATETIME        DEFAULT NULL,
 		last_checkpoint  DATETIME        NOT NULL,

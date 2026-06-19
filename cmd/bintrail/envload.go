@@ -25,6 +25,7 @@ type envBinding struct {
 var envBindings = []envBinding{
 	{"index-dsn", "BINTRAIL_INDEX_DSN"},
 	{"source-dsn", "BINTRAIL_SOURCE_DSN"},
+	{"source-flavor", "BINTRAIL_SOURCE_FLAVOR"},
 	{"schemas", "BINTRAIL_SCHEMAS"},
 	{"tables", "BINTRAIL_TABLES"},
 	{"bintrail-id", "BINTRAIL_ID"},

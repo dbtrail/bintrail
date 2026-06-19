@@ -45,7 +45,7 @@ func TestStreamCmd_requiredFlags(t *testing.T) {
 // TestStreamCmd_allFlagsRegistered verifies that all expected flags are wired up.
 func TestStreamCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
-		"index-dsn", "source-dsn", "server-id",
+		"index-dsn", "source-dsn", "source-flavor", "server-id",
 		"start-file", "start-pos", "start-gtid",
 		"batch-size", "schemas", "tables", "checkpoint", "metrics-addr",
 		"ssl-mode", "ssl-ca", "ssl-cert", "ssl-key",
@@ -54,6 +54,18 @@ func TestStreamCmd_allFlagsRegistered(t *testing.T) {
 		if streamCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on streamCmd", name)
 		}
+	}
+}
+
+// TestStreamCmd_sourceFlavorDefault verifies --source-flavor defaults to mysql,
+// so every existing MySQL invocation is unchanged.
+func TestStreamCmd_sourceFlavorDefault(t *testing.T) {
+	f := streamCmd.Flag("source-flavor")
+	if f == nil {
+		t.Fatal("flag --source-flavor not registered")
+	}
+	if f.DefValue != "mysql" {
+		t.Errorf("expected default source-flavor=mysql, got %q", f.DefValue)
 	}
 }
 
@@ -148,15 +160,15 @@ func TestStreamCmd_noGapFillFlagRegistered(t *testing.T) {
 // TestPopulateStreamFlags' save-and-restore discipline: no t.Parallel().
 func TestStreamConfigFromFlags(t *testing.T) {
 	orig := struct {
-		src, idx, file, gtid, sch, tbl, met, fmtv, ssl, ca, cert, key string
-		sid, pos                                                      uint32
-		batch, chk, gap                                               int
-		reset, noGap                                                  bool
+		src, idx, file, gtid, sch, tbl, met, fmtv, ssl, ca, cert, key, flavor string
+		sid, pos                                                              uint32
+		batch, chk, gap                                                       int
+		reset, noGap                                                          bool
 	}{
 		src: strmSourceDSN, idx: strmIndexDSN, file: strmStartFile,
 		gtid: strmStartGTID, sch: strmSchemas, tbl: strmTables,
 		met: strmMetricsAddr, fmtv: strmFormat, ssl: strmSSLMode,
-		ca: strmSSLCA, cert: strmSSLCert, key: strmSSLKey,
+		ca: strmSSLCA, cert: strmSSLCert, key: strmSSLKey, flavor: strmFlavor,
 		sid: strmServerID, pos: strmStartPos,
 		batch: strmBatchSize, chk: strmCheckpoint, gap: strmGapTimeout,
 		reset: strmReset, noGap: strmNoGapFill,
@@ -169,10 +181,12 @@ func TestStreamConfigFromFlags(t *testing.T) {
 		strmServerID, strmStartPos = orig.sid, orig.pos
 		strmBatchSize, strmCheckpoint, strmGapTimeout = orig.batch, orig.chk, orig.gap
 		strmReset, strmNoGapFill = orig.reset, orig.noGap
+		strmFlavor = orig.flavor
 	})
 
 	strmIndexDSN = "ix:pw@tcp(127.0.0.1:3306)/binlog_index"
 	strmSourceDSN = "user:pass@tcp(source.example.com:3306)/src"
+	strmFlavor = "mariadb"
 	strmServerID = 424242
 	strmStartFile = "mysql-bin.000777"
 	strmStartPos = 1234
@@ -204,6 +218,7 @@ func TestStreamConfigFromFlags(t *testing.T) {
 	want := streamrun.Config{
 		IndexDSN:    "ix:pw@tcp(127.0.0.1:3306)/binlog_index",
 		SourceDSN:   "user:pass@tcp(source.example.com:3306)/src",
+		Flavor:      "mariadb",
 		ServerID:    424242,
 		StartFile:   "mysql-bin.000777",
 		StartPos:    1234,

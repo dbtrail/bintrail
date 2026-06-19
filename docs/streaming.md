@@ -37,6 +37,29 @@ If you scope `SELECT`, it must cover **every column of every monitored table**, 
 
 ---
 
+## MariaDB as a source (alpha)
+
+bintrail can stream from a **MariaDB** source while the index database stays MySQL. Pass `--source-flavor mariadb` (or set `BINTRAIL_SOURCE_FLAVOR=mariadb`):
+
+```bash
+bintrail stream \
+  --source-dsn 'dbtrail:pw@tcp(mariadb-host:3306)/' \
+  --source-flavor mariadb \
+  --index-dsn 'user:pw@tcp(index-host:3306)/binlog_index' \
+  --server-id 200 --schemas shop
+```
+
+The flag defaults to `mysql`, so every existing MySQL command is unchanged. The same `binlog_format = ROW` / `binlog_row_image = FULL` requirement and the same source-user grants apply. File-based `bintrail index` over MariaDB binlog files works too — bintrail decodes MariaDB row events (and skips MariaDB-only `Annotate_rows` / `Gtid_list` / `Binlog_checkpoint` events) transparently.
+
+**Status — alpha.** Tested against **MariaDB 11.4** (the primary target); 10.6 LTS and newer are expected to work but are not yet covered by CI. Known limitations for this release:
+
+- **Prefer position mode for resume.** Both position and GTID capture work, but MariaDB GTID **gap detection** (the purged-binlog data-loss alarm) is not yet implemented — a GTID-mode resume past purged binlogs proceeds with a loud warning instead of the alarm. Position mode retains full gap detection. `--no-gap-fill` is refused in MariaDB GTID mode rather than silently ignored.
+- **The source flavor is fixed per checkpoint.** Resuming a saved MariaDB checkpoint requires the same `--source-flavor mariadb` (a mismatch is rejected with an actionable error; `--reset` starts fresh).
+- **Not yet wired into the console "+ Add server" / control plane** — use the `bintrail stream` CLI for MariaDB sources in this release.
+- **Index-on-MariaDB is out of scope** — the index database stays MySQL.
+
+---
+
 ## The Problem
 
 `bintrail index` reads binlog files from disk. That works well for self-managed MySQL where you have filesystem access, but it doesn't work for managed MySQL services (Amazon RDS, Aurora, Cloud SQL). Those services don't give you file access to the binlog directory.

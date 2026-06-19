@@ -694,6 +694,24 @@ func ValidateBinlogRowImage(db *sql.DB) error {
 	return nil
 }
 
+// DetectFlavor reports the source server flavor by inspecting VERSION():
+// "mariadb" when the version string contains "MariaDB" (case-insensitive),
+// otherwise "mysql" (which also covers Percona). On a query error it returns ""
+// (unknown) rather than fabricating a flavor — detection is advisory (surfacing a
+// --source-flavor mismatch), and callers must treat "" as "could not determine"
+// instead of asserting a false mismatch. Returns bare strings to keep
+// internal/metadata free of a go-mysql dependency.
+func DetectFlavor(db *sql.DB) string {
+	var version string
+	if err := db.QueryRow("SELECT VERSION()").Scan(&version); err != nil {
+		return ""
+	}
+	if strings.Contains(strings.ToLower(version), "mariadb") {
+		return "mariadb"
+	}
+	return "mysql"
+}
+
 // buildFKCascadeQuery returns the REFERENTIAL_CONSTRAINTS query (and its args)
 // used to find CASCADE foreign keys. When schemas is non-empty the scan is
 // scoped to exactly those schemas — the operator explicitly asked us to index

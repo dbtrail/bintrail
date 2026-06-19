@@ -28,6 +28,40 @@ func TestCreateBinlogEventsTable(t *testing.T) {
 	}
 }
 
+// TestEnsureSchemaAddsFlavorColumn pins the MariaDB-source migration: a
+// pre-flavor install must gain stream_state.flavor as NOT NULL DEFAULT 'mysql'
+// (so existing rows read back as mysql with no data migration), and the
+// migration must be idempotent.
+func TestEnsureSchemaAddsFlavorColumn(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Simulate a pre-flavor install by dropping the column EnsureSchema re-adds.
+	testutil.MustExec(t, db, `ALTER TABLE stream_state DROP COLUMN flavor`)
+
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	var colDefault, isNullable string
+	if err := db.QueryRow(`SELECT COLUMN_DEFAULT, IS_NULLABLE FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stream_state'
+		  AND COLUMN_NAME = 'flavor'`).Scan(&colDefault, &isNullable); err != nil {
+		t.Fatalf("read flavor column: %v", err)
+	}
+	if colDefault != "mysql" {
+		t.Errorf("flavor COLUMN_DEFAULT = %q, want \"mysql\"", colDefault)
+	}
+	if isNullable != "NO" {
+		t.Errorf("flavor IS_NULLABLE = %q, want \"NO\"", isNullable)
+	}
+
+	// Idempotent: a second run must not error or re-add.
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema (second run): %v", err)
+	}
+}
+
 // TestEnsureSchemaWidensColumnType pins the #472 migration: #212 created
 // schema_snapshots.column_type as VARCHAR(128), which a realistic ENUM
 // declaration exceeds — under strict mode the 1406 aborts the whole

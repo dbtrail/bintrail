@@ -113,6 +113,29 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 		}
 	}
 
+	// emitGTIDTracking emits an EventGTID for the in-flight currentGTID so the
+	// stream consumer accumulates it even when no rows follow (#124). No-op when
+	// currentGTID is empty (non-GTID source). Shared by the MySQL GTIDEvent and
+	// MariaDB MariadbGTIDEvent cases so both flavors track identically.
+	emitGTIDTracking := func(hdr *replication.EventHeader) error {
+		if currentGTID == "" {
+			return nil
+		}
+		gtidEv := Event{
+			BinlogFile: currentFile,
+			EndPos:     uint64(hdr.LogPos),
+			Timestamp:  time.Unix(int64(hdr.Timestamp), 0).UTC(),
+			GTID:       currentGTID,
+			EventType:  EventGTID,
+		}
+		select {
+		case out <- gtidEv:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	// handleEvent processes one binlog event. It is recursive: with
 	// binlog_transaction_compression=ON the source wraps each transaction's
 	// events (BEGIN + TABLE_MAP + rows + XID) in a single zstd-compressed
@@ -148,20 +171,23 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 				return err
 			}
 			currentGTID = formatGTID(ev.SID, ev.GNO)
-			if currentGTID != "" {
-				ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
-				gtidEv := Event{
-					BinlogFile: currentFile,
-					EndPos:     uint64(binlogEv.Header.LogPos),
-					Timestamp:  ts,
-					GTID:       currentGTID,
-					EventType:  EventGTID,
-				}
-				select {
-				case out <- gtidEv:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
+			if err := emitGTIDTracking(binlogEv.Header); err != nil {
+				return err
+			}
+
+		case *replication.MariadbGTIDEvent:
+			// MariaDB analogue of GTIDEvent: a MariaDB source emits a
+			// MariadbGTIDEvent (domain-server-seq) instead of a GTIDEvent. The
+			// commit-boundary and tracking-emit logic is identical — see the
+			// GTIDEvent case above for the #491 next-GTID-fallback rationale.
+			// ev.GTID.String() yields "0-1-100" and "" for the zero GTID, so the
+			// emit guard inside emitGTIDTracking is built in.
+			if err := emitCommit(binlogEv.Header); err != nil {
+				return err
+			}
+			currentGTID = ev.GTID.String()
+			if err := emitGTIDTracking(binlogEv.Header); err != nil {
+				return err
 			}
 
 		case *replication.QueryEvent:

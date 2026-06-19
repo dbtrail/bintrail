@@ -239,8 +239,17 @@ func EnsureSchema(db *sql.DB) error {
 	); err != nil {
 		return err
 	}
-	return ensureColumn(db, "stream_state", "gap_lost_detail",
+	if err := ensureColumn(db, "stream_state", "gap_lost_detail",
 		`ALTER TABLE stream_state ADD COLUMN gap_lost_detail TEXT DEFAULT NULL COMMENT 'human-readable description of the lost gap' AFTER gap_lost_at`,
+	); err != nil {
+		return err
+	}
+	// flavor records the source database flavor (mysql/mariadb) so a resume
+	// parses the saved gtid_set with the correct GTID parser. NOT NULL DEFAULT
+	// 'mysql' means existing rows read back as mysql with no data migration,
+	// keeping every pre-MariaDB install unchanged.
+	return ensureColumn(db, "stream_state", "flavor",
+		`ALTER TABLE stream_state ADD COLUMN flavor VARCHAR(16) NOT NULL DEFAULT 'mysql' COMMENT 'source flavor: mysql or mariadb; selects the GTID parser on resume' AFTER gtid_set`,
 	)
 }
 

@@ -94,6 +94,69 @@ jobs:
       - name: Integration tests (-tags=integration)
         run: go test -tags=integration -race -p 1 -count=1 ./...
 
+  integration-mariadb-source:
+    # MariaDB-as-source alpha. A MariaDB-source test pairs a NEW MariaDB SOURCE
+    # container (13307) with the existing MySQL INDEX container (13306) — two
+    # containers a single matrix cell of the `integration` job cannot host, and
+    # bolting MariaDB into that job would also perturb the shared-binlog window
+    # the parser count-assertions depend on (#415). So it gets its own job, and
+    # the 8.0/8.4 matrix above stays byte-identical. Runs only the MariaDB-named
+    # tests (-run); the MySQL-only MariaDB tests (sqlmock/index-side) also run in
+    # the matrix job, where the live-replication test skips for lack of a source.
+    runs-on: ubuntu-22.04
+
+    env:
+      BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
+      BINTRAIL_TEST_MARIADB_DSN: "root:testroot@tcp(127.0.0.1:13307)"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start MySQL index (bintrail-test-mysql, 8.4)
+        run: |
+          docker run -d --name bintrail-test-mysql \
+            -e MYSQL_ROOT_PASSWORD=testroot \
+            -p 13306:3306 \
+            mysql:8.4 \
+            --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          for i in $(seq 1 60); do
+            if docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent 2>/dev/null; then
+              echo "MySQL index is ready."; exit 0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready in time" >&2
+          docker logs bintrail-test-mysql >&2 || true
+          exit 1
+
+      - name: Start MariaDB source (bintrail-test-mariadb, 11.4)
+        run: |
+          docker run -d --name bintrail-test-mariadb \
+            -e MARIADB_ROOT_PASSWORD=testroot \
+            -p 13307:3306 \
+            mariadb:11.4 \
+            --log-bin=mariadb-bin --binlog-format=ROW --binlog-row-image=FULL \
+            --server-id=2 --gtid-strict-mode=ON
+          for i in $(seq 1 60); do
+            if docker exec bintrail-test-mariadb mariadb-admin ping -u root -ptestroot --silent 2>/dev/null; then
+              echo "MariaDB source is ready."; exit 0
+            fi
+            sleep 2
+          done
+          echo "MariaDB did not become ready in time" >&2
+          docker logs bintrail-test-mariadb >&2 || true
+          exit 1
+
+      # -run selects the MariaDB-named tests across all packages; -p 1 serializes
+      # so the shared binlog window stays single-writer (same rationale as the
+      # MySQL integration job).
+      - name: MariaDB-source integration tests
+        run: go test -tags=integration -race -p 1 -count=1 -run 'MariaDB|Mariadb|mariadb|Flavor|FourColumns' ./...
+
   console-e2e:
     # Headless-Chrome regression guard for the console SPA: go test never
     # renders assets/*, so CSS/DOM/presentation bugs (invisible buttons, a
