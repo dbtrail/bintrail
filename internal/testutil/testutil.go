@@ -115,18 +115,39 @@ func MariaDBBaseDSN() string {
 	return MariaDBDefaultDSN
 }
 
-// SkipIfNoMariaDB pings the MariaDB source server and calls t.Skip if
-// unreachable, so MariaDB tests degrade gracefully when only the MySQL
-// container is running.
+// MariaDBRequired reports whether MariaDB integration tests must RUN (and fail
+// rather than skip when MariaDB is unavailable or a setup step no-ops). The
+// dedicated CI job sets BINTRAIL_REQUIRE_MARIADB=1, where a MariaDB source is
+// guaranteed present — so a silent skip there would be a false green that hides
+// a real regression in the headline capture path. Unset on developer machines
+// and the MySQL-only matrix job, where graceful skipping is the right behavior.
+func MariaDBRequired() bool {
+	return os.Getenv("BINTRAIL_REQUIRE_MARIADB") == "1"
+}
+
+// SkipOrFailMariaDB skips the test, or fails it when MariaDBRequired() — so a
+// MariaDB step that can't run never silently passes as green in CI.
+func SkipOrFailMariaDB(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if MariaDBRequired() {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
+// SkipIfNoMariaDB pings the MariaDB source server and skips (or fails, when
+// MariaDBRequired()) if unreachable, so MariaDB tests degrade gracefully when
+// only the MySQL container is running but cannot false-green in the CI job that
+// guarantees a MariaDB source.
 func SkipIfNoMariaDB(t *testing.T) {
 	t.Helper()
 	db, err := sql.Open("mysql", MariaDBBaseDSN()+"/?parseTime=true")
-	if err != nil {
-		t.Skipf("skipping: cannot open MariaDB connection: %v", err)
+	if err == nil {
+		defer db.Close()
+		err = db.Ping()
 	}
-	defer db.Close()
-	if err := db.Ping(); err != nil {
-		t.Skipf("skipping: MariaDB not reachable: %v", err)
+	if err != nil {
+		SkipOrFailMariaDB(t, "MariaDB not reachable: %v", err)
 	}
 }
 

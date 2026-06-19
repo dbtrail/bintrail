@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dbtrail/dbtrail/internal/streamdeps"
 	"github.com/dbtrail/dbtrail/internal/streamrun"
 )
 
@@ -253,5 +254,11 @@ func TestStreamOneRejectsBadConfig(t *testing.T) {
 	if err := streamrun.One(t.Context(), streamrun.Config{Format: "text", GapTimeout: 0}); err == nil ||
 		!strings.Contains(err.Error(), "gap-timeout") {
 		t.Errorf("bad gap-timeout: err = %v, want gap-timeout error", err)
+	}
+	// An unsupported --source-flavor is rejected before any connection is opened.
+	// Deps must be wired because the flavor check runs after Deps.validate().
+	if err := streamrun.One(t.Context(), streamrun.Config{Deps: streamdeps.Default(), Format: "text", GapTimeout: 30, Flavor: "postgres"}); err == nil ||
+		!strings.Contains(err.Error(), "invalid source flavor") {
+		t.Errorf("bad flavor: err = %v, want invalid source flavor", err)
 	}
 }

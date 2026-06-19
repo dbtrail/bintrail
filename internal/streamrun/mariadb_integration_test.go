@@ -98,7 +98,7 @@ func TestStreamLoop_liveReplication_mariadb(t *testing.T) {
 
 	streamer, syncErr := syncer.StartSync(gomysql.Position{Name: binlogFile, Pos: binlogPos})
 	if syncErr != nil {
-		t.Skipf("skipping: StartSync failed (replication may not be granted): %v", syncErr)
+		testutil.SkipOrFailMariaDB(t, "StartSync against MariaDB failed (replication may not be granted): %v", syncErr)
 	}
 
 	resolver, err := metadata.NewResolver(indexDB, 0)
@@ -214,7 +214,7 @@ func TestStreamLoop_gtidAdvancesOnCommit_mariadb(t *testing.T) {
 
 	streamer, syncErr := syncer.StartSync(gomysql.Position{Name: binlogFile, Pos: binlogPos})
 	if syncErr != nil {
-		t.Skipf("skipping: StartSync failed: %v", syncErr)
+		testutil.SkipOrFailMariaDB(t, "StartSync against MariaDB failed: %v", syncErr)
 	}
 
 	resolver, err := metadata.NewResolver(indexDB, 0)

@@ -89,13 +89,13 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	if state.bintrailID != "" {
 		bintrailIDArg = state.bintrailID
 	}
-	// Default an unset flavor to mysql so the NOT NULL column never receives an
-	// empty string from a caller that predates the flavor field.
-	flavor := state.flavor
-	if flavor == "" {
-		flavor = gomysql.MySQLFlavor
+	// Canonicalize the flavor (empty→mysql) so the NOT NULL column never receives
+	// an empty string; an invalid flavor fails loud rather than persisting garbage.
+	flavor, err := normalizeFlavor(state.flavor)
+	if err != nil {
+		return err
 	}
-	_, err := db.Exec(`
+	_, err = db.Exec(`
 		INSERT INTO stream_state
 		    (id, mode, binlog_file, binlog_position, gtid_set, flavor,
 		     events_indexed, last_event_time, last_checkpoint, server_id, bintrail_id)
@@ -256,6 +256,21 @@ func normalizeGTIDForFlavor(flavor, s string) string {
 	return NormalizeGTIDSet(s)
 }
 
+// normalizeFlavor canonicalizes a source flavor: empty defaults to MySQL,
+// "mysql"/"mariadb" pass through, and anything else is rejected. It is the
+// single home for both the empty→mysql default and the supported-flavor check,
+// used at stream startup (One) and on checkpoint persistence (saveCheckpoint).
+func normalizeFlavor(flavor string) (string, error) {
+	switch flavor {
+	case "":
+		return gomysql.MySQLFlavor, nil
+	case gomysql.MySQLFlavor, gomysql.MariaDBFlavor:
+		return flavor, nil
+	default:
+		return "", fmt.Errorf("invalid source flavor %q: must be %q or %q", flavor, gomysql.MySQLFlavor, gomysql.MariaDBFlavor)
+	}
+}
+
 // resolveStart determines the start position for replication for a MySQL source.
 // It is a thin wrapper over resolveStartForFlavor; see that function for the
 // full contract. Kept so existing MySQL callers and tests are unchanged.
@@ -290,8 +305,9 @@ func resolveStartForFlavor(
 		// set's format is fixed by the flavor that wrote it; continuing under
 		// another flavor would parse the saved set one way while the BinlogSyncer
 		// handshakes — and the next checkpoint persists — as another, a latent
-		// corruption. Legacy rows (empty flavor, pre-column) adopt the requested
-		// flavor. --reset clears the checkpoint (saved == nil) and bypasses this.
+		// corruption. Rows predating the column read back as the migration default
+		// 'mysql'; only a genuinely empty flavor (defensive) adopts the requested
+		// one. --reset clears the checkpoint (saved == nil) and bypasses this.
 		if saved.flavor != "" && saved.flavor != flavor {
 			return "", "", "", 0, nil, fmt.Errorf(
 				"saved checkpoint is source flavor %q but %q was requested; pass --source-flavor %s (or --reset to start fresh)",
@@ -947,14 +963,13 @@ func One(ctx context.Context, cfg Config) error {
 
 	// Normalize the source flavor once so every downstream use (GTID parsing,
 	// BinlogSyncerConfig, persistence) sees a concrete value. Empty defaults to
-	// MySQL, keeping every existing caller (which never sets Flavor) unchanged.
-	switch cfg.Flavor {
-	case "":
-		cfg.Flavor = gomysql.MySQLFlavor
-	case gomysql.MySQLFlavor, gomysql.MariaDBFlavor:
-	default:
-		return fmt.Errorf("invalid source flavor %q: must be %q or %q", cfg.Flavor, gomysql.MySQLFlavor, gomysql.MariaDBFlavor)
+	// MySQL, keeping every existing caller (which never sets Flavor) unchanged;
+	// an unsupported flavor is rejected here, before any connection is opened.
+	normalizedFlavor, err := normalizeFlavor(cfg.Flavor)
+	if err != nil {
+		return err
 	}
+	cfg.Flavor = normalizedFlavor
 
 	// Derived cancel: internal failures (e.g. the stream loop erroring) must
 	// stop the parser goroutine even when the caller's ctx stays live.
@@ -1083,8 +1098,7 @@ func One(ctx context.Context, cfg Config) error {
 						"resume in position mode or drop --no-gap-fill (alpha limitation)")
 				}
 				slog.Warn("GTID gap detection is unavailable for a MariaDB source (alpha): a purged-binlog gap on resume " +
-					"will NOT abort or raise the data-loss alarm, and --no-gap-fill cannot be enforced in this mode — " +
-					"prefer position mode for MariaDB resumes")
+					"will NOT raise the data-loss alarm — prefer position mode for MariaDB resumes (or pass --no-gap-fill to refuse starting)")
 			} else {
 				gap, gapErr = detectGTIDGap(sourceDB, startGTIDStr, gapTimeout)
 			}

@@ -108,6 +108,11 @@ jobs:
     env:
       BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
       BINTRAIL_TEST_MARIADB_DSN: "root:testroot@tcp(127.0.0.1:13307)"
+      # A MariaDB source is guaranteed present in this job, so the MariaDB tests
+      # must FAIL (not silently skip) if they can't run — otherwise a handshake
+      # regression would pass as green-via-skip. The 8.0/8.4 matrix leaves this
+      # unset, so the same tests skip politely there.
+      BINTRAIL_REQUIRE_MARIADB: "1"
 
     steps:
       - uses: actions/checkout@v5

@@ -196,8 +196,17 @@ func TestHandleRows_unhandledEventTypeLogsNotSilent(t *testing.T) {
 		t.Fatalf("handleRows: %v", err)
 	}
 
-	if !strings.Contains(strings.ToLower(buf.String()), "unhandled") {
-		t.Errorf("expected a warn mentioning the unhandled row event type, got logs: %q", buf.String())
+	logged := buf.String()
+	if !strings.Contains(strings.ToLower(logged), "unhandled") {
+		t.Errorf("expected a warn mentioning the unhandled row event type, got logs: %q", logged)
+	}
+	// The anti-silent-data-loss contract is two-part: the warn must quantify the
+	// drop (rows_skipped) and nothing may leak onto the output channel.
+	if !strings.Contains(logged, "rows_skipped") {
+		t.Errorf("expected rows_skipped count in the warn, got logs: %q", logged)
+	}
+	if len(out) != 0 {
+		t.Errorf("unhandled event must emit no rows downstream, got %d", len(out))
 	}
 }
 
