@@ -34,7 +34,7 @@ import (
 //   - the BinlogSyncer Flavor="mariadb" handshake + the MariadbGTIDEvent parser
 //     case must populate domain-server-seq GTIDs on indexed rows.
 //
-// It runs in POSITION mode (the recommended MariaDB resume mode for the alpha)
+// It runs in POSITION mode (the mode this end-to-end guard exercises)
 // and asserts via the indexed-event counter, not raw event counts — MariaDB
 // interleaves ANNOTATE_ROWS / GTID_LIST / BINLOG_CHECKPOINT events the indexer
 // never counts.
@@ -256,5 +256,94 @@ func TestStreamLoop_gtidAdvancesOnCommit_mariadb(t *testing.T) {
 	// The persisted set must re-parse with the MariaDB parser (resume contract).
 	if _, err := parseGTIDSetForFlavor(gomysql.MariaDBFlavor, state.gtidSet); err != nil {
 		t.Errorf("accumulated MariaDB set %q does not re-parse: %v", state.gtidSet, err)
+	}
+}
+
+// TestDetectMariaDBGTIDGap_livePurge is the discriminator for real MariaDB GTID
+// gap detection. The sqlmock unit tests pin the decision tree; this proves the
+// three live queries (SHOW BINARY LOGS, BINLOG_GTID_POS, @@gtid_binlog_pos)
+// behave as the gate-#1 design verified against MariaDB 11.4 — including the part
+// no unit test can: that BINLOG_GTID_POS over the oldest surviving binlog yields
+// a real purge floor after PURGE BINARY LOGS.
+//
+// It manufactures a genuine unfillable gap, then closes the auto-advance loop:
+// advancing the checkpoint to the floor must (a) re-parse with the MariaDB parser
+// and (b) clear the unfillable gap on the next detection — i.e. the advanced
+// position re-syncs cleanly, which is the one thing the design flagged as needing
+// a live check.
+func TestDetectMariaDBGTIDGap_livePurge(t *testing.T) {
+	sourceDB, _ := testutil.CreateTestMariaDB(t)
+
+	// PURGE BINARY LOGS mutates server-wide binlog state, so this test must be
+	// the only writer — the dedicated CI job serializes MariaDB tests with -p 1.
+	testutil.MustExec(t, sourceDB, `CREATE TABLE gap_probe (
+		id INT PRIMARY KEY AUTO_INCREMENT, v INT NOT NULL)`)
+
+	for i := range 3 {
+		testutil.MustExec(t, sourceDB, "INSERT INTO gap_probe (v) VALUES (?)", i)
+	}
+
+	// Checkpoint T1: the GTID position after the first few transactions.
+	var checkpoint string
+	if err := sourceDB.QueryRow("SELECT @@gtid_binlog_pos").Scan(&checkpoint); err != nil {
+		t.Fatalf("read checkpoint @@gtid_binlog_pos: %v", err)
+	}
+	if checkpoint == "" {
+		testutil.SkipOrFailMariaDB(t, "MariaDB reported an empty GTID position; GTID binlogging not active")
+	}
+
+	// Roll several binlog files (with a transaction in each) so PURGE has earlier
+	// files to drop and the floor lands strictly past T1.
+	for i := range 5 {
+		testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+		testutil.MustExec(t, sourceDB, "INSERT INTO gap_probe (v) VALUES (?)", 100+i)
+	}
+
+	// Before purging: the checkpoint is behind but every binlog is still present,
+	// so detection must NOT report an unfillable gap.
+	pre, err := detectMariaDBGTIDGap(sourceDB, checkpoint, 30*time.Second)
+	if err != nil {
+		t.Fatalf("pre-purge detect: %v", err)
+	}
+	if pre.HasGap && !pre.Fillable {
+		t.Fatalf("pre-purge: expected fillable/no-gap before any purge, got %+v", pre)
+	}
+
+	// Purge up to the current active binlog so T1's binlogs are gone.
+	latestFile, _, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition: %v", err)
+	}
+	testutil.MustExec(t, sourceDB, "PURGE BINARY LOGS TO '"+latestFile+"'")
+
+	// Now the gap MUST be unfillable, and PurgedGTIDSet must carry the floor.
+	gap, err := detectMariaDBGTIDGap(sourceDB, checkpoint, 30*time.Second)
+	if err != nil {
+		t.Fatalf("post-purge detect: %v", err)
+	}
+	if !gap.HasGap || gap.Fillable {
+		t.Fatalf("post-purge: expected an UNFILLABLE gap for a checkpoint below the purge floor, got %+v", gap)
+	}
+	if gap.PurgedGTIDSet == "" {
+		t.Fatal("post-purge: expected the purge floor in PurgedGTIDSet")
+	}
+	if strings.Contains(gap.PurgedGTIDSet, ":") {
+		t.Errorf("purge floor %q is not MariaDB domain-server-seq form", gap.PurgedGTIDSet)
+	}
+
+	// Auto-advance contract (a): the floor re-parses with the MariaDB parser —
+	// exactly what runStream feeds parseGTIDSetForFlavor + StartSyncGTID.
+	if _, err := parseGTIDSetForFlavor(gomysql.MariaDBFlavor, gap.PurgedGTIDSet); err != nil {
+		t.Fatalf("advanced checkpoint (floor) %q does not re-parse with the MariaDB parser: %v", gap.PurgedGTIDSet, err)
+	}
+
+	// Auto-advance contract (b): resuming from the floor clears the unfillable
+	// gap — the advanced position re-syncs cleanly instead of re-tripping.
+	after, err := detectMariaDBGTIDGap(sourceDB, gap.PurgedGTIDSet, 30*time.Second)
+	if err != nil {
+		t.Fatalf("post-advance detect: %v", err)
+	}
+	if after.HasGap && !after.Fillable {
+		t.Fatalf("post-advance: advancing to the floor must clear the unfillable gap, got %+v", after)
 	}
 }

@@ -72,8 +72,13 @@ Identical to a MySQL source (see [Streaming → The Source MySQL User](streaming
 
 - **Live capture** in both **position mode** and **GTID mode** (MariaDB
   `domain-server-seq` GTIDs, e.g. `0-1-100`).
-- **GTID resume** — restart and bintrail re-reads the saved MariaDB GTID set and
-  continues where it left off.
+- **GTID resume with gap detection** — restart and bintrail re-reads the saved
+  MariaDB GTID set and continues where it left off. On resume it verifies the
+  source still retains the binlogs needed: MariaDB has no `@@gtid_purged`, so the
+  purge floor is derived from `BINLOG_GTID_POS` over the oldest surviving binlog.
+  A purged-binlog gap raises the data-loss alarm (or, with `--no-gap-fill`,
+  refuses to start) in **both position and GTID mode**, and multi-domain GTID
+  sets are compared per domain.
 - **File-based `bintrail index`** over MariaDB binlog files.
 - All row events (INSERT/UPDATE/DELETE) with before/after images, including
   `UNSIGNED`, `DECIMAL`, and DDL detection / auto-snapshot.
@@ -84,14 +89,6 @@ Identical to a MySQL source (see [Streaming → The Source MySQL User](streaming
 
 ## Alpha limitations
 
-- **Prefer position mode for resume.** Both position and GTID capture work, but
-  MariaDB **GTID gap detection** — the alarm that fires when a resume would skip
-  past binlogs the source has already purged — is **not yet implemented**. A
-  GTID-mode resume past purged binlogs proceeds with a loud warning instead of
-  the data-loss alarm. **Position mode keeps full gap detection** and is the
-  recommended resume mode for MariaDB. If you want a hard stop on unverifiable
-  gaps, pass `--no-gap-fill`: in MariaDB GTID mode it **refuses to start** rather
-  than proceeding blind.
 - **The source flavor is fixed per checkpoint.** Resuming a saved MariaDB
   checkpoint requires the same `--source-flavor mariadb`. A mismatch is rejected
   with an actionable error; use `--reset` to start fresh.
@@ -99,8 +96,10 @@ Identical to a MySQL source (see [Streaming → The Source MySQL User](streaming
   compressed row events are not yet decoded — bintrail logs a loud warning
   (`rows_skipped`) rather than indexing them. Leave `log_bin_compress = OFF` on
   the source for now.
-- **Multi-domain GTID is untested.** Capture works, but resume/gap behavior
-  under multiple GTID domains has not been validated — prefer position mode.
+- **Mid-capture primary failover is untested.** Gap detection compares GTID
+  sequences per domain (correct for single-server and multi-domain topologies),
+  but a primary failover that changes the `server_id` *within* a domain mid-stream
+  has not been validated against a live multi-server MariaDB cluster.
 - **Not wired into the console / control plane.** The console "+ Add server"
   form and `bintrail-console watch` do not yet pass the MariaDB flavor — use the
   `bintrail stream` CLI for MariaDB sources in this release.
@@ -117,7 +116,7 @@ Identical to a MySQL source (see [Streaming → The Source MySQL User](streaming
 | `invalid Mysql GTID` when starting against MariaDB | You omitted `--source-flavor mariadb` — the MariaDB GTID set was parsed as a MySQL set. Add the flag. |
 | `WARN source flavor mismatch: configured … detected …` | `--source-flavor` doesn't match the server's actual flavor. Set it to match. |
 | `saved checkpoint is source flavor "mariadb" but "mysql" was requested` | You resumed a MariaDB checkpoint without `--source-flavor mariadb`. Add the flag, or `--reset` to start fresh. |
-| `--no-gap-fill is set but GTID gap detection is unavailable for a MariaDB source` | Expected guard. Resume in **position mode**, or drop `--no-gap-fill`. |
+| `MariaDB GTID gap detected but CANNOT be filled` | The source purged binlogs your checkpoint still needed. bintrail auto-advances past the lost range and records the data loss durably; pass `--no-gap-fill` to refuse to start instead. Raise `binlog_expire_logs_seconds` to give bintrail more time to resume. |
 | `auto-discover binlog position` errors on an old MariaDB | Ensure `log_bin = ON` and the source user has `REPLICATION CLIENT`. |
 
 ---

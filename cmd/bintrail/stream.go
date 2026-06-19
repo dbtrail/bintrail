@@ -75,7 +75,7 @@ var (
 func init() {
 	streamCmd.Flags().StringVar(&strmIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	streamCmd.Flags().StringVar(&strmSourceDSN, "source-dsn", "", "DSN for the source MySQL server (required)")
-	streamCmd.Flags().StringVar(&strmFlavor, "source-flavor", "mysql", "Source database flavor: mysql or mariadb (MariaDB source support is alpha; prefer position mode for resume)")
+	streamCmd.Flags().StringVar(&strmFlavor, "source-flavor", "mysql", "Source database flavor: mysql or mariadb (MariaDB source support is alpha)")
 	streamCmd.Flags().Uint32Var(&strmServerID, "server-id", 0, "Unique replica server ID (required, must differ from all other servers)")
 	streamCmd.Flags().StringVar(&strmStartFile, "start-file", "", "Initial binlog file (mutually exclusive with --start-gtid)")
 	streamCmd.Flags().Uint32Var(&strmStartPos, "start-pos", 4, "Initial position within start file")
@@ -92,7 +92,7 @@ func init() {
 	streamCmd.Flags().StringVar(&strmFormat, "format", "text", "Output format: text or json")
 	streamCmd.Flags().BoolVar(&strmReset, "reset", false, "Clear saved checkpoint before starting (forces use of --start-file/--start-gtid)")
 	streamCmd.Flags().BoolVar(&strmNoGapFill, "no-gap-fill", false, "Refuse to start if an unfillable binlog gap is detected (instead of auto-advancing past purged data)")
-	streamCmd.Flags().IntVar(&strmGapTimeout, "gap-timeout", 30, "Timeout in seconds for the one-shot gap-detection queries run at startup (SHOW BINARY LOGS, @@gtid_purged, @@gtid_executed); raise on managed MySQL with many binlog files")
+	streamCmd.Flags().IntVar(&strmGapTimeout, "gap-timeout", 30, "Timeout in seconds for the one-shot gap-detection queries run at startup (SHOW BINARY LOGS plus @@gtid_purged/@@gtid_executed on MySQL or BINLOG_GTID_POS/@@gtid_binlog_pos on MariaDB); raise on managed servers with many binlog files")
 	_ = streamCmd.MarkFlagRequired("index-dsn")
 	_ = streamCmd.MarkFlagRequired("source-dsn")
 	_ = streamCmd.MarkFlagRequired("server-id")

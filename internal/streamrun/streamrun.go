@@ -115,6 +115,29 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	return err
 }
 
+// persistGapAutoAdvance durably records an unfillable-gap auto-advance. It stamps
+// gap_lost_at FIRST, then writes the advanced checkpoint — never the reverse.
+// Ordering is a data-loss-safety invariant: once the checkpoint is advanced past
+// the purge floor the next restart sees no gap, so a loss record written
+// afterwards (and failing) would let the advanced checkpoint silently outlive the
+// only durable trace of the permanently lost events — the console would show a
+// healthy RUNNING badge over a stream that skipped data (#402). Both writes fail
+// loud; a failed stamp aborts startup with the OLD checkpoint intact, so the gap
+// is re-detected and re-recorded on the next start. saveCheckpoint's upsert does
+// not touch the gap_lost_* columns, so the stamp survives it. Cleared by an
+// explicit monitor Stop or --reset.
+func persistGapAutoAdvance(db *sql.DB, advanced *streamState, gapMessage string) error {
+	if _, err := db.Exec(`UPDATE stream_state
+		SET gap_lost_at = UTC_TIMESTAMP(), gap_lost_detail = ?
+		WHERE id = 1`, gapMessage); err != nil {
+		return fmt.Errorf("failed to persist gap-loss record before auto-advance: %w", err)
+	}
+	if err := saveCheckpoint(db, advanced); err != nil {
+		return fmt.Errorf("failed to save advanced checkpoint: %w", err)
+	}
+	return nil
+}
+
 // ─── TLS configuration ───────────────────────────────────────────────────────────────
 
 // buildTLSConfig returns a *tls.Config for the given ssl-mode, or nil for
@@ -671,6 +694,230 @@ func detectGTIDGap(sourceDB *sql.DB, checkpointGTID string, timeout time.Duratio
 	}, nil
 }
 
+// detectMariaDBGTIDGap is the MariaDB analog of detectGTIDGap. MariaDB has no
+// @@gtid_purged, so the purge floor is derived from BINLOG_GTID_POS(<earliest
+// surviving binlog>, 4) — the GTID state recorded at the start of the oldest
+// binlog the source still has. Every GTID strictly before that floor is gone.
+// The floor is empty when nothing has been purged (the very first binlog, whose
+// starting state is "nothing executed", still exists).
+//
+// The three one-shot queries — SHOW BINARY LOGS, BINLOG_GTID_POS, and
+// @@gtid_binlog_pos (the executed set, MariaDB's @@gtid_executed analog) — are
+// bounded by timeout.
+func detectMariaDBGTIDGap(sourceDB *sql.DB, checkpointGTID string, timeout time.Duration) (*gapResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	checkpointGTID = strings.TrimSpace(checkpointGTID)
+
+	// 1. The oldest surviving binlog (first row of SHOW BINARY LOGS).
+	earliestFile, err := earliestBinlogFile(ctx, sourceDB)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. The purge floor: the GTID state at the start of that file. BINLOG_GTID_POS
+	//    returns SQL NULL (not an empty string) when the oldest binlog is the
+	//    first-ever one — i.e. nothing has been purged — so scan through a
+	//    NullString and treat NULL as "no floor". A plain string Scan would error
+	//    on NULL, which is the common no-purge case.
+	var floorNS sql.NullString
+	if err := sourceDB.QueryRowContext(ctx, "SELECT BINLOG_GTID_POS(?, 4)", earliestFile).Scan(&floorNS); err != nil {
+		return nil, fmt.Errorf("query BINLOG_GTID_POS(%q, 4): %w", earliestFile, err)
+	}
+	floorStr := strings.TrimSpace(floorNS.String)
+
+	// 3. The executed set.
+	var executedStr string
+	if err := sourceDB.QueryRowContext(ctx, "SELECT @@gtid_binlog_pos").Scan(&executedStr); err != nil {
+		return nil, fmt.Errorf("query @@gtid_binlog_pos: %w", err)
+	}
+	executedStr = strings.TrimSpace(executedStr)
+
+	// Nothing purged: every GTID is still available, so the only question is
+	// whether the checkpoint is caught up or merely behind.
+	if floorStr == "" {
+		if mariadbGTIDSetsEqual(checkpointGTID, executedStr) {
+			return &gapResult{HasGap: false}, nil
+		}
+		return &gapResult{
+			HasGap:   true,
+			Fillable: true,
+			Message:  "gap detected: checkpoint MariaDB GTID set is behind source @@gtid_binlog_pos; replaying missed events",
+		}, nil
+	}
+
+	if checkpointGTID == "" {
+		return nil, fmt.Errorf("checkpoint GTID set is empty; cannot perform gap detection")
+	}
+
+	checkpoint, err := parseMariadbSet(checkpointGTID)
+	if err != nil {
+		return nil, fmt.Errorf("parse checkpoint GTID set: %w", err)
+	}
+	floor, err := parseMariadbSet(floorStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse purge floor (BINLOG_GTID_POS): %w", err)
+	}
+
+	// The gap is unfillable iff the checkpoint has NOT seen everything up to the
+	// purge floor: some purged GTID the checkpoint never indexed is permanently
+	// gone. PurgedGTIDSet carries the floor so the caller can auto-advance to it.
+	if !mariadbCheckpointCoversFloor(checkpoint, floor) {
+		return &gapResult{
+			HasGap:        true,
+			Fillable:      false,
+			PurgedGTIDSet: floorStr,
+			Message: fmt.Sprintf(
+				"MariaDB GTID gap detected but CANNOT be filled: required GTIDs have been purged from the source "+
+					"(purge floor %s is beyond checkpoint %s); events in the purged range are permanently lost",
+				floorStr, checkpointGTID),
+		}, nil
+	}
+
+	// Checkpoint covers the floor — any gap is fillable.
+	if mariadbGTIDSetsEqual(checkpointGTID, executedStr) {
+		return &gapResult{HasGap: false}, nil
+	}
+	return &gapResult{
+		HasGap:   true,
+		Fillable: true,
+		Message:  "gap detected: checkpoint MariaDB GTID set is behind source @@gtid_binlog_pos; replaying missed events",
+	}, nil
+}
+
+// earliestBinlogFile returns the name of the oldest binlog the source still
+// retains — the first row of SHOW BINARY LOGS (both MySQL and MariaDB order it
+// oldest-first). The column-tolerant scan mirrors detectPositionGap: only the
+// first column (Log_name) is needed, and extra columns vary across versions.
+func earliestBinlogFile(ctx context.Context, sourceDB *sql.DB) (string, error) {
+	rows, err := sourceDB.QueryContext(ctx, "SHOW BINARY LOGS")
+	if err != nil {
+		return "", fmt.Errorf("SHOW BINARY LOGS: %w", err)
+	}
+	defer rows.Close()
+
+	cols, colErr := rows.Columns()
+	if colErr != nil {
+		return "", fmt.Errorf("SHOW BINARY LOGS columns: %w", colErr)
+	}
+	if len(cols) < 1 {
+		return "", fmt.Errorf("SHOW BINARY LOGS returned no columns")
+	}
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", fmt.Errorf("iterate SHOW BINARY LOGS: %w", err)
+		}
+		return "", fmt.Errorf("SHOW BINARY LOGS returned no results")
+	}
+
+	var name string
+	vals := make([]any, len(cols))
+	vals[0] = &name
+	for i := 1; i < len(cols); i++ {
+		vals[i] = new(sql.RawBytes)
+	}
+	if err := rows.Scan(vals...); err != nil {
+		return "", fmt.Errorf("scan SHOW BINARY LOGS: %w", err)
+	}
+	return name, nil
+}
+
+// parseMariadbSet parses a MariaDB GTID set string into the concrete
+// *MariadbGTIDSet — the gap logic needs the per-domain map, not the interface.
+func parseMariadbSet(s string) (*gomysql.MariadbGTIDSet, error) {
+	set, err := gomysql.ParseMariadbGTIDSet(s)
+	if err != nil {
+		return nil, err
+	}
+	ms, ok := set.(*gomysql.MariadbGTIDSet)
+	if !ok {
+		return nil, fmt.Errorf("unexpected GTID set type %T from MariaDB parse", set)
+	}
+	return ms, nil
+}
+
+// mariadbGTIDSetsEqual parses two MariaDB GTID set strings and compares them
+// structurally, so ordering differences never cause a false mismatch. It returns
+// false (not an error) on a parse failure — the caller treats that as "not equal"
+// and proceeds with gap detection. The MariaDB sibling of gtidSetsEqual.
+//
+// Like the MySQL gtidSetsEqual, this uses go-mysql's set Equal, which keys by
+// (domain, server). Its only failure mode here is reporting "behind, replaying"
+// when the stream is actually caught up — harmless: the syncer resumes from the
+// checkpoint, finds nothing past it, and tails live. The unfillable decision (the
+// path that records permanent data loss) uses mariadbCheckpointCoversFloor, which
+// is server-agnostic.
+func mariadbGTIDSetsEqual(a, b string) bool {
+	if a == "" && b == "" {
+		return true
+	}
+	ga, err := gomysql.ParseMariadbGTIDSet(a)
+	if err != nil {
+		slog.Debug("mariadbGTIDSetsEqual: failed to parse first GTID set", "gtid_set", a, "error", err)
+		return false
+	}
+	gb, err := gomysql.ParseMariadbGTIDSet(b)
+	if err != nil {
+		slog.Debug("mariadbGTIDSetsEqual: failed to parse second GTID set", "gtid_set", b, "error", err)
+		return false
+	}
+	return ga.Equal(gb)
+}
+
+// mariadbCheckpointCoversFloor reports whether the checkpoint has already seen
+// every GTID at or below the purge floor — i.e. resuming from the checkpoint will
+// not require any GTID the source has purged.
+//
+// It compares the MAX sequence number PER DOMAIN and deliberately ignores the
+// server_id, because a MariaDB GTID sequence is domain-GLOBAL: within one
+// replication domain the sequence increments monotonically regardless of which
+// server writes the event. So the next GTID a checkpoint at domainMax needs is
+// domainMax+1, which is still available iff checkpointMax >= floorMax. This is the
+// "per-domain seq >= other.seq" semantics gate #1 was designed around.
+//
+// We deliberately do NOT use go-mysql's MariadbGTIDSet.Contain: its set-level map
+// lookup is keyed by (domain, server), so after a primary failover — where the
+// floor and the checkpoint carry different server_ids inside the same domain — it
+// reports a spurious unfillable gap even though the checkpoint is demonstrably
+// ahead. That error is in the safe direction (a false data-loss alarm, never a
+// silent loss), but the per-domain max comparison avoids it. (go-mysql's per-GTID
+// MariadbGTID.Contain already ignores server_id; only its set wrapper re-keys by
+// server.)
+//
+// Confidence boundary: the max-per-domain logic is exact for the single-server
+// and multi-DOMAIN topologies that are gate #1's scope. Multi-SERVER-within-a-
+// domain only arises after a primary failover mid-capture; the per-domain max
+// handles it and it is unit-tested (TestMariaDBCheckpointCoversFloor_multiServerPerDomain),
+// but it is not validated against a live multi-server failover cluster — the
+// "topology untested" alpha caveat in docs/mariadb.md.
+func mariadbCheckpointCoversFloor(checkpoint, floor *gomysql.MariadbGTIDSet) bool {
+	for domain, floorServers := range floor.Sets {
+		cpServers, ok := checkpoint.Sets[domain]
+		if !ok {
+			// The source purged GTIDs in a domain the checkpoint never indexed —
+			// those events are unreachable.
+			return false
+		}
+		if mariadbDomainMaxSeq(cpServers) < mariadbDomainMaxSeq(floorServers) {
+			return false
+		}
+	}
+	return true
+}
+
+// mariadbDomainMaxSeq returns the highest sequence number across every server
+// recorded for one domain. A MariaDB sequence is domain-global, so this max is the
+// domain's frontier regardless of which server produced the latest event.
+func mariadbDomainMaxSeq(serverSet map[uint32]*gomysql.MariadbGTID) uint64 {
+	var hi uint64
+	for _, gtid := range serverSet {
+		hi = max(hi, gtid.SequenceNumber)
+	}
+	return hi
+}
+
 // ─── Stream loop ────────────────────────────────────────────────────────────────
 
 // streamLoop consumes parser events, flushes batches to MySQL, and writes
@@ -1084,21 +1331,12 @@ func One(ctx context.Context, cfg Config) error {
 		case "position":
 			gap, gapErr = detectPositionGap(sourceDB, startFile, startPos, gapTimeout)
 		case "gtid":
+			// MySQL and MariaDB expose the purge boundary differently
+			// (@@gtid_purged vs BINLOG_GTID_POS over the oldest surviving binlog),
+			// so each flavor has its own detector; both return the same gapResult
+			// and feed the shared auto-advance / gap_lost_at machinery below.
 			if cfg.Flavor == gomysql.MariaDBFlavor {
-				// MariaDB GTID gap detection is not implemented for the alpha:
-				// detectGTIDGap relies on MySQL-only @@gtid_purged/@@gtid_executed
-				// and the MySQL GTID-set map shape, neither of which is portable, so
-				// we cannot verify whether binlogs were purged. If the operator
-				// demanded a hard stop on unverifiable gaps (--no-gap-fill), honor it
-				// — refuse rather than proceed blind. Otherwise warn loudly and
-				// proceed; position mode retains full gap detection and is the
-				// recommended MariaDB resume mode. gap/gapErr stay nil → stream runs.
-				if cfg.NoGapFill {
-					return fmt.Errorf("--no-gap-fill is set but GTID gap detection is unavailable for a MariaDB source; " +
-						"resume in position mode or drop --no-gap-fill (alpha limitation)")
-				}
-				slog.Warn("GTID gap detection is unavailable for a MariaDB source (alpha): a purged-binlog gap on resume " +
-					"will NOT raise the data-loss alarm — prefer position mode for MariaDB resumes (or pass --no-gap-fill to refuse starting)")
+				gap, gapErr = detectMariaDBGTIDGap(sourceDB, startGTIDStr, gapTimeout)
 			} else {
 				gap, gapErr = detectGTIDGap(sourceDB, startGTIDStr, gapTimeout)
 			}
@@ -1139,22 +1377,25 @@ func One(ctx context.Context, cfg Config) error {
 						"old_gtid_set", startGTIDStr,
 						"purged_gtid_set", gap.PurgedGTIDSet)
 					fmt.Printf("Gap: UNFILLABLE — checkpoint GTID set includes purged GTIDs; advancing past purged set (events are permanently lost)\n")
-					// Use the purged set as the checkpoint GTID set — this tells
-					// MySQL we have already seen all purged GTIDs, so it will
-					// only send the non-purged GTIDs that remain in @@gtid_executed.
-					// MySQL-only branch: a MariaDB source skips GTID gap detection
-					// above, so gap is nil here and this is never reached for MariaDB.
-					startGTIDStr = NormalizeGTIDSet(gap.PurgedGTIDSet)
-					gs, parseErr := gomysql.ParseMysqlGTIDSet(startGTIDStr)
+					// Adopt the purged set (MySQL: @@gtid_purged; MariaDB: the
+					// BINLOG_GTID_POS purge floor) as the checkpoint — this tells the
+					// source we have already seen everything up to the purge boundary,
+					// so it sends only the surviving GTIDs that remain in the executed
+					// set. Flavor-aware: for a MySQL source normalizeGTIDForFlavor /
+					// parseGTIDSetForFlavor reduce to NormalizeGTIDSet /
+					// ParseMysqlGTIDSet (byte-identical to the original), and a MariaDB
+					// source parses domain-server-seq instead.
+					startGTIDStr = normalizeGTIDForFlavor(cfg.Flavor, gap.PurgedGTIDSet)
+					gs, parseErr := parseGTIDSetForFlavor(cfg.Flavor, startGTIDStr)
 					if parseErr != nil {
 						return fmt.Errorf("failed to parse purged GTID set for auto-advance: %w", parseErr)
 					}
 					accGTID = gs
 				}
 
-				// Persist the advanced position immediately so that if the stream
-				// crashes during startup, the next restart won't hit the same
-				// purged-binlog error again.
+				// Durably record the loss and advance the checkpoint, in that order
+				// (see persistGapAutoAdvance — the stamp must precede the advance so
+				// the loss record can never desync from an advanced checkpoint, #402).
 				advancedState := &streamState{
 					mode:          mode,
 					binlogFile:    startFile,
@@ -1166,21 +1407,11 @@ func One(ctx context.Context, cfg Config) error {
 					eventsIndexed: saved.eventsIndexed,
 					lastEventTime: saved.lastEventTime,
 				}
-				if err := saveCheckpoint(indexDB, advancedState); err != nil {
-					return fmt.Errorf("failed to save advanced checkpoint: %w", err)
+				if err := persistGapAutoAdvance(indexDB, advancedState, gap.Message); err != nil {
+					return err
 				}
 				slog.Info("saved advanced checkpoint after gap auto-advance",
 					"file", startFile, "pos", startPos, "gtid_set", startGTIDStr)
-				// Record the data loss DURABLY: the advanced checkpoint means
-				// the next start sees no gap, so without this row the only
-				// trace of the permanently lost events would be an in-memory
-				// flag (or a log line) that a restart silently discards.
-				// Cleared by an explicit monitor Stop or --reset.
-				if _, err := indexDB.Exec(`UPDATE stream_state
-					SET gap_lost_at = UTC_TIMESTAMP(), gap_lost_detail = ?
-					WHERE id = 1`, gap.Message); err != nil {
-					slog.Warn("failed to persist gap-loss record; the lost_position state will not survive a restart", "error", err)
-				}
 				// Tell the supervisor events were lost — without this the
 				// auto-advance is only a log line and the console shows a
 				// healthy RUNNING badge over a stream that silently skipped
