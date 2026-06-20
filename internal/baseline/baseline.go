@@ -95,6 +95,24 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		compression = "zstd"
 	}
 
+	// Crash-safety (#467): create the snapshot directory and flag it _INCOMPLETE
+	// BEFORE launching the workers. The graceful failure paths below leave this
+	// marker in place; a successful run replaces it with _SUCCESS (which removes
+	// _INCOMPLETE). Writing the marker only after wg.Wait() (the original code)
+	// left a window where an UNCATCHABLE kill (OOM / SIGKILL / power loss)
+	// mid-conversion produced a markerless partial snapshot that SnapshotComplete
+	// trusts as complete-by-default and discovery serves as the newest baseline —
+	// the exact #467 silent loss this marker exists to close. (It also fixes a
+	// latent bug: a context cancelled before any table converted never created
+	// snapDir, so the old post-wait markIncomplete wrote into a non-existent
+	// directory and silently failed.) The per-table output dirs created lazily by
+	// the writers nest under snapDir.
+	snapDir := filepath.Join(cfg.OutputDir, tsDir)
+	if err := os.MkdirAll(snapDir, 0o755); err != nil {
+		return Stats{}, fmt.Errorf("create snapshot directory %s: %w", snapDir, err)
+	}
+	markIncomplete(snapDir)
+
 	// Process tables in parallel with bounded concurrency.
 	concurrency := runtime.NumCPU()
 	if concurrency < 1 {
@@ -189,22 +207,16 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	}
 	wg.Wait()
 
-	// The snapshot directory that holds every table's Parquet. On any failure
-	// the tables that converted BEFORE the failure stay on disk here, so we mark
-	// the snapshot _INCOMPLETE; on full success we mark it _SUCCESS. Discovery
-	// requires the marker contract (see marker.go) to tell a partial snapshot
-	// from a complete one (#467).
-	snapDir := filepath.Join(cfg.OutputDir, tsDir)
-
-	// A cancelled run skipped tables without recording errors (workers just
-	// return on ctx.Err()) — succeeding here would publish a partial snapshot
-	// indistinguishable from a complete one.
+	// snapDir was created and flagged _INCOMPLETE before the workers launched
+	// (see above), so every early return below leaves the snapshot positively
+	// marked incomplete without re-writing the marker. Only full success
+	// replaces it with _SUCCESS. A cancelled run skipped tables without
+	// recording errors (workers return on ctx.Err()), so it too must stay
+	// _INCOMPLETE rather than publish a partial snapshot as complete.
 	if err := ctx.Err(); err != nil {
-		markIncomplete(snapDir)
 		return stats, err
 	}
 	if len(errs) > 0 {
-		markIncomplete(snapDir)
 		if len(errs) > 1 {
 			return stats, fmt.Errorf("%d of %d tables failed (others logged); first: %w", len(errs), len(tables), errs[0])
 		}

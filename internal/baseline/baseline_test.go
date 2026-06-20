@@ -2030,6 +2030,55 @@ func TestRun_partialFailureMarksIncomplete(t *testing.T) {
 	}
 }
 
+// TestRun_cancelledContextMarksIncomplete: a run cancelled before any table
+// converts still leaves the snapshot dir flagged _INCOMPLETE. This pins the
+// crash-safety fix — the marker is written BEFORE the workers launch, so an
+// uncatchable kill mid-conversion can't leave a markerless partial that
+// complete-by-default would serve as the newest baseline (#467). Pre-fix the
+// snapshot dir was created lazily by the first worker, so a run that converted
+// no table produced no dir and the post-wait marker write silently failed.
+func TestRun_cancelledContextMarksIncomplete(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"),
+		[]byte("INSERT INTO `orders` VALUES(1,10,'9.99','note','2025-01-01 00:00:00','2025-01-15');\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before Run launches workers — no table converts
+
+	if _, err := Run(ctx, Config{
+		InputDir: inputDir, OutputDir: outputDir, Compression: "none", RowGroupSize: 100,
+	}); err == nil {
+		t.Fatal("Run with a cancelled context succeeded; want an error")
+	}
+
+	dir := snapDir(t, outputDir)
+	if _, err := os.Stat(filepath.Join(dir, IncompleteMarker)); err != nil {
+		t.Fatalf("expected %s marker after a cancelled run: %v", IncompleteMarker, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, SuccessMarker)); !os.IsNotExist(err) {
+		t.Fatalf("did not expect %s marker after a cancelled run (err=%v)", SuccessMarker, err)
+	}
+	if SnapshotComplete(dir) {
+		t.Fatal("SnapshotComplete=true for a cancelled run; want false")
+	}
+	got, err := DiscoverBaselines(outputDir)
+	if err != nil {
+		t.Fatalf("DiscoverBaselines: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("DiscoverBaselines returned %d for a cancelled run; want 0", len(got))
+	}
+}
+
 // TestSnapshotComplete_legacyMarkerless: a pre-marker snapshot (neither marker)
 // stays complete-by-default so existing baselines keep working.
 func TestSnapshotComplete_legacyMarkerless(t *testing.T) {
