@@ -98,11 +98,15 @@ func (w *Writer) WriteRow(values []string, nulls []bool) error {
 			}
 			converted, err := convertValue(col, raw)
 			if err != nil {
-				// On conversion error, store as NULL to avoid data loss.
-				v = parquet.NullValue().Level(0, 0, parquetIdx)
-			} else {
-				v = converted.Level(0, 1, parquetIdx)
+				// Fail loud: silently coercing an unconvertible value to NULL
+				// publishes a lossy baseline (issue #503 item-3). This is a
+				// data-recovery tool — abort the run rather than hand back a
+				// snapshot that quietly dropped a value. Context lets the
+				// operator locate the offending row.
+				return fmt.Errorf("baseline: column %q (%s) value %q: %w",
+					col.Name, col.MySQLType, raw, err)
 			}
+			v = converted.Level(0, 1, parquetIdx)
 		}
 		row[parquetIdx] = v
 	}
@@ -147,7 +151,25 @@ func sortColumnsForParquet(cols []Column) ([]Column, []int) {
 // column's MySQL type. Caller sets Level after.
 func convertValue(col Column, raw string) (parquet.Value, error) {
 	switch col.MySQLType {
-	case "tinyint", "smallint", "mediumint", "int", "integer":
+	case "tinyint", "smallint", "mediumint":
+		// These fit int32 whether signed or unsigned (max 16777215 for
+		// MEDIUMINT UNSIGNED), so a plain signed parse is lossless.
+		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
+		if err != nil {
+			return parquet.Value{}, err
+		}
+		return parquet.Int32Value(int32(n)), nil
+
+	case "int", "integer":
+		if col.Unsigned {
+			// INT UNSIGNED reaches 4294967295, which overflows int32.
+			// Parse as uint32 and widen into the INT64 column (issue #506).
+			n, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 32)
+			if err != nil {
+				return parquet.Value{}, err
+			}
+			return parquet.Int64Value(int64(n)), nil
+		}
 		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
 		if err != nil {
 			return parquet.Value{}, err
@@ -155,6 +177,17 @@ func convertValue(col Column, raw string) (parquet.Value, error) {
 		return parquet.Int32Value(int32(n)), nil
 
 	case "bigint":
+		if col.Unsigned {
+			// BIGINT UNSIGNED reaches 18446744073709551615, which overflows
+			// int64. Parse as uint64 and store the bit pattern in the UINT64
+			// column: int64(MaxUint64) round-trips back via uint64(v.Int64())
+			// (issue #506).
+			n, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+			if err != nil {
+				return parquet.Value{}, err
+			}
+			return parquet.Int64Value(int64(n)), nil
+		}
 		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 		if err != nil {
 			return parquet.Value{}, err
