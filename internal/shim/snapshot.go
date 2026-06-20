@@ -103,7 +103,10 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	baselinePath, snapshotTime, err := reconstruct.FindBaseline(ctx, src, q.Schema, q.Table, q.AsOf)
+	// Shim handling of the stale-fallback warning (#466) is intentionally
+	// minimal: FindBaseline already logs it server-side and an in-band MySQL
+	// signal needs design (deferred by #466), so we discard it here.
+	baselinePath, snapshotTime, _, err := reconstruct.FindBaseline(ctx, src, q.Schema, q.Table, q.AsOf)
 	if err != nil {
 		if errors.Is(err, reconstruct.ErrNoBaseline) {
 			// Source configured but no baseline exists for this table at-or-
@@ -370,7 +373,8 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	baselinePath, snapshotTime, err := reconstruct.FindBaseline(ctx, src, q.Schema, q.Table, q.AsOf)
+	// Stale-fallback warning (#466) discarded here — see the full-table path.
+	baselinePath, snapshotTime, _, err := reconstruct.FindBaseline(ctx, src, q.Schema, q.Table, q.AsOf)
 	if err != nil {
 		if errors.Is(err, reconstruct.ErrNoBaseline) {
 			h.logger.Debug("shim: _snapshot found no baseline at-or-before AsOf; using binlog-only path",

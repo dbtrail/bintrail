@@ -14,6 +14,7 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 )
 
@@ -21,13 +22,31 @@ import (
 // for the requested table at or before the target time.
 var ErrNoBaseline = errors.New("no baseline snapshot found")
 
+// StaleWarning describes a baseline that was selected by falling back to an
+// older snapshot because the table is absent from a newer one (#461/#466).
+// Empty Message means "not stale" — the table is present in the newest eligible
+// snapshot. Both the local and S3 lookups populate it identically; callers that
+// surface staleness (the console reconstruct response, #466) read Message,
+// while callers that only log can ignore it.
+type StaleWarning struct {
+	Message        string    // human-readable, empty when not stale
+	UsingSnapshot  time.Time // snapshot the table was actually read from
+	NewestSnapshot time.Time // newest eligible snapshot (lacks the table)
+}
+
+// Stale reports whether the baseline was a stale fallback.
+func (s StaleWarning) Stale() bool { return s.Message != "" }
+
 // FindBaseline finds the most recent baseline Parquet file at or before `at`
-// for the given schema and table, returning its path and snapshot timestamp.
+// for the given schema and table, returning its path, snapshot timestamp, and a
+// staleness warning (#466). The warning's Message is non-empty only when the
+// table is absent from a newer eligible snapshot, meaning the result is an
+// older-snapshot fallback — both the local and S3 paths report it now.
 //
 // source may be:
 //   - A local directory path (parent of RFC3339-named snapshot subdirectories)
 //   - An S3 URL prefix (e.g. "s3://bucket/baselines")
-func FindBaseline(ctx context.Context, source, schema, table string, at time.Time) (path string, snapshotTime time.Time, err error) {
+func FindBaseline(ctx context.Context, source, schema, table string, at time.Time) (path string, snapshotTime time.Time, stale StaleWarning, err error) {
 	if strings.HasPrefix(source, "s3://") {
 		return findBaselineS3(ctx, source, schema, table, at)
 	}
@@ -195,6 +214,12 @@ func listBaselinesLocal(baselineDir string) ([]BaselineFile, error) {
 			continue
 		}
 		snapDir := filepath.Join(baselineDir, entry.Name())
+		// Skip a partially-converted snapshot (#467) so the listing doesn't
+		// advertise an incomplete snapshot as the latest baseline.
+		if !baseline.SnapshotComplete(snapDir) {
+			slog.Warn("baseline listing: skipping incomplete snapshot", "path", snapDir)
+			continue
+		}
 		dbDirs, err := os.ReadDir(snapDir)
 		if err != nil {
 			slog.Warn("baseline listing: skipping unreadable snapshot directory", "path", snapDir, "error", err)
@@ -242,6 +267,14 @@ func listBaselinesS3(ctx context.Context, s3URL string) ([]BaselineFile, error) 
 	duckdbutil.EnableS3CredentialChain(ctx, db)
 
 	prefix := strings.TrimSuffix(s3URL, "/")
+
+	// Exclude partially-converted snapshots (#467) so the listing doesn't
+	// advertise an incomplete snapshot as the latest baseline.
+	incomplete, err := s3IncompleteSnapshots(ctx, db, prefix)
+	if err != nil {
+		return nil, err
+	}
+
 	safeGlob := strings.ReplaceAll(prefix+"/*/*/*.parquet", "'", "''")
 	rows, err := db.QueryContext(ctx, "SELECT * FROM glob('"+safeGlob+"')")
 	if err != nil {
@@ -266,6 +299,9 @@ func listBaselinesS3(ctx context.Context, s3URL string) ([]BaselineFile, error) 
 		}
 		ts, ok := parseDirTimestamp(parts[0])
 		if !ok {
+			continue
+		}
+		if incomplete[ts.UTC().Format(time.RFC3339)] {
 			continue
 		}
 		out = append(out, BaselineFile{
@@ -296,10 +332,10 @@ func sortBaselineFiles(files []BaselineFile) {
 
 // ─── local ────────────────────────────────────────────────────────────────────
 
-func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string, time.Time, error) {
+func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string, time.Time, StaleWarning, error) {
 	entries, err := os.ReadDir(baselineDir)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("read baseline directory %q: %w", baselineDir, err)
+		return "", time.Time{}, StaleWarning{}, fmt.Errorf("read baseline directory %q: %w", baselineDir, err)
 	}
 
 	type candidate struct {
@@ -316,6 +352,11 @@ func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string,
 		if !ok || t.After(at) {
 			continue
 		}
+		// Skip a partially-converted snapshot (#467): treating it as the newest
+		// would reconstruct missing tables from an older one or hit ErrNoBaseline.
+		if !baseline.SnapshotComplete(filepath.Join(baselineDir, entry.Name())) {
+			continue
+		}
 		if t.After(newestSnap) {
 			newestSnap = t
 		}
@@ -326,53 +367,81 @@ func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string,
 		candidates = append(candidates, candidate{t: t, path: p})
 	}
 	if len(candidates) == 0 {
-		return "", time.Time{}, fmt.Errorf("%w: %s.%s at or before %s in %q",
+		return "", time.Time{}, StaleWarning{}, fmt.Errorf("%w: %s.%s at or before %s in %q",
 			ErrNoBaseline, schema, table, at.UTC().Format(time.RFC3339), baselineDir)
 	}
 	slices.SortFunc(candidates, func(a, b candidate) int { return b.t.Compare(a.t) })
 	best := candidates[0]
-	if newestSnap.After(best.t) {
-		// The table dropped out of newer snapshots (dump filter change, lost
-		// SELECT privilege, rename): falling back to an older snapshot is the
-		// designed behavior, but doing it silently means reconstructing from
-		// ever-staler data with no signal anywhere (#461).
-		slog.Warn("baseline: table is absent from the newest snapshot; using an older one — re-dump to refresh it",
-			"schema", schema, "table", table,
-			"using", best.t.UTC().Format(time.RFC3339),
-			"newest_snapshot", newestSnap.UTC().Format(time.RFC3339))
+	stale := staleFallback(schema, table, best.t, newestSnap)
+	return best.path, best.t, stale, nil
+}
+
+// staleFallback builds the staleness warning (and logs it) when the table is
+// absent from a newer eligible snapshot, so the chosen snapshot is an older
+// fallback (#461/#466). When newestSnap is not after using, the result is the
+// zero StaleWarning ("not stale"). The local and S3 lookups share this so the
+// server-side log message and the surfaced warning are identical.
+func staleFallback(schema, table string, using, newestSnap time.Time) StaleWarning {
+	if !newestSnap.After(using) {
+		return StaleWarning{}
 	}
-	return best.path, best.t, nil
+	// The table dropped out of newer snapshots (dump filter change, lost SELECT
+	// privilege, rename): falling back to an older snapshot is the designed
+	// behavior, but doing it silently means reconstructing from ever-staler data
+	// with no signal anywhere (#461). Warn server-side AND return the message so
+	// callers (the console, #466) can surface it in-band.
+	usingStr := using.UTC().Format(time.RFC3339)
+	newestStr := newestSnap.UTC().Format(time.RFC3339)
+	slog.Warn("baseline: table is absent from the newest snapshot; using an older one — re-dump to refresh it",
+		"schema", schema, "table", table, "using", usingStr, "newest_snapshot", newestStr)
+	return StaleWarning{
+		Message: fmt.Sprintf("baseline for %s.%s is stale: the table is absent from the newest snapshot (%s); reconstructing from an older snapshot (%s) — re-dump to refresh it",
+			schema, table, newestStr, usingStr),
+		UsingSnapshot:  using,
+		NewestSnapshot: newestSnap,
+	}
 }
 
 // ─── S3 ───────────────────────────────────────────────────────────────────────
 
-// NOTE(#461): unlike findBaselineLocal, this path CANNOT warn when the table
-// is absent from the newest snapshot — the glob below is table-scoped, so
-// snapshots lacking the table are invisible without a broader (and costlier)
-// listing. S3 lookups therefore still fall back to older snapshots silently.
-func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Time) (string, time.Time, error) {
+// findBaselineS3 mirrors findBaselineLocal over an s3:// prefix. It now also
+// warns when the result is an older-snapshot fallback (#466): the prior
+// table-scoped glob made snapshots lacking the table invisible, so it could
+// never compute a "newest eligible snapshot" to compare against. We resolve
+// that by running ONE broader listing (prefix/*/*/*.parquet, the same glob
+// listBaselinesS3 uses) — bounding the listing cost to a single extra glob —
+// to derive the newest complete snapshot at-or-before `at`, and ONE marker glob
+// (prefix/*/_SUCCESS and _INCOMPLETE) to exclude partial snapshots (#467).
+func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Time) (string, time.Time, StaleWarning, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("open duckdb: %w", err)
+		return "", time.Time{}, StaleWarning{}, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer db.Close()
 	if err := pinDuckDBSessionUTC(ctx, db); err != nil {
-		return "", time.Time{}, err
+		return "", time.Time{}, StaleWarning{}, err
 	}
 
 	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
-		return "", time.Time{}, fmt.Errorf("load httpfs extension: %w", err)
+		return "", time.Time{}, StaleWarning{}, fmt.Errorf("load httpfs extension: %w", err)
 	}
 	duckdbutil.EnableS3CredentialChain(ctx, db)
 
 	prefix := strings.TrimSuffix(s3URL, "/")
+
+	// Snapshot dirs flagged incomplete (#467) — excluded from both the
+	// table-scoped candidate scan and the broad newest-snapshot scan.
+	incomplete, err := s3IncompleteSnapshots(ctx, db, prefix)
+	if err != nil {
+		return "", time.Time{}, StaleWarning{}, err
+	}
+
+	// Table-scoped glob: the snapshots that actually contain this table.
 	globPat := prefix + "/*/" + schema + "/" + table + ".parquet"
 	safeGlob := strings.ReplaceAll(globPat, "'", "''")
-
-	// Use DuckDB's glob() table function to enumerate matching S3 paths without downloading data.
 	rows, err := db.QueryContext(ctx, "SELECT * FROM glob('"+safeGlob+"')")
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("list S3 baseline snapshots: %w", err)
+		return "", time.Time{}, StaleWarning{}, fmt.Errorf("list S3 baseline snapshots: %w", err)
 	}
 	defer rows.Close()
 
@@ -390,17 +459,122 @@ func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Ti
 		if !ok || t.After(at) {
 			continue
 		}
+		if incomplete[t.UTC().Format(time.RFC3339)] {
+			continue // partial snapshot (#467)
+		}
 		candidates = append(candidates, candidate{t: t, path: path})
 	}
 	if err := rows.Err(); err != nil {
-		return "", time.Time{}, fmt.Errorf("iterate S3 baseline list: %w", err)
+		return "", time.Time{}, StaleWarning{}, fmt.Errorf("iterate S3 baseline list: %w", err)
 	}
 	if len(candidates) == 0 {
-		return "", time.Time{}, fmt.Errorf("%w: %s.%s at or before %s in %q",
+		return "", time.Time{}, StaleWarning{}, fmt.Errorf("%w: %s.%s at or before %s in %q",
 			ErrNoBaseline, schema, table, at.UTC().Format(time.RFC3339), s3URL)
 	}
 	slices.SortFunc(candidates, func(a, b candidate) int { return b.t.Compare(a.t) })
-	return candidates[0].path, candidates[0].t, nil
+	best := candidates[0]
+
+	// Broad scan for the newest complete snapshot at-or-before `at`, whether or
+	// not it contains this table — the missing piece that let S3 fall back
+	// silently (#466).
+	newestSnap, err := s3NewestSnapshot(ctx, db, prefix, at, incomplete)
+	if err != nil {
+		return "", time.Time{}, StaleWarning{}, err
+	}
+	stale := staleFallback(schema, table, best.t, newestSnap)
+	return best.path, best.t, stale, nil
+}
+
+// s3NewestSnapshot returns the newest complete snapshot timestamp at-or-before
+// `at` across ALL tables under prefix, using the broad prefix/*/*/*.parquet
+// glob. Snapshots in the incomplete set (#467) are excluded.
+func s3NewestSnapshot(ctx context.Context, db *sql.DB, prefix string, at time.Time, incomplete map[string]bool) (time.Time, error) {
+	safeGlob := strings.ReplaceAll(prefix+"/*/*/*.parquet", "'", "''")
+	rows, err := db.QueryContext(ctx, "SELECT * FROM glob('"+safeGlob+"')")
+	if err != nil {
+		return time.Time{}, fmt.Errorf("list S3 baseline snapshots (broad): %w", err)
+	}
+	defer rows.Close()
+
+	var newest time.Time
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			continue
+		}
+		rest := strings.TrimPrefix(path, prefix+"/")
+		parts := strings.Split(rest, "/")
+		if len(parts) != 3 || !strings.HasSuffix(parts[2], ".parquet") {
+			continue
+		}
+		t, ok := parseDirTimestamp(parts[0])
+		if !ok || t.After(at) {
+			continue
+		}
+		if incomplete[t.UTC().Format(time.RFC3339)] {
+			continue
+		}
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return time.Time{}, fmt.Errorf("iterate S3 baseline list (broad): %w", err)
+	}
+	return newest, nil
+}
+
+// s3IncompleteSnapshots returns the set of snapshot timestamps (keyed by
+// RFC3339 UTC) that carry an _INCOMPLETE marker without a _SUCCESS marker, so a
+// partially-converted snapshot (#467) is excluded from S3 discovery. Pre-marker
+// snapshots have neither and are complete-by-default (absent from this set).
+//
+// The glob is prefix/*/_* — DuckDB's glob() does NOT brace-expand
+// {_SUCCESS,_INCOMPLETE} (verified empirically), and the only underscore-prefixed
+// entries in the snapshot layout are these two markers; we still filter by exact
+// basename so an unrelated _* file can't be mistaken for a marker.
+func s3IncompleteSnapshots(ctx context.Context, db *sql.DB, prefix string) (map[string]bool, error) {
+	markerGlob := strings.ReplaceAll(prefix+"/*/_*", "'", "''")
+	rows, err := db.QueryContext(ctx, "SELECT * FROM glob('"+markerGlob+"')")
+	if err != nil {
+		return nil, fmt.Errorf("list S3 baseline markers: %w", err)
+	}
+	defer rows.Close()
+
+	hasSuccess := map[string]bool{}
+	hasIncomplete := map[string]bool{}
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			continue
+		}
+		rest := strings.TrimPrefix(path, prefix+"/")
+		parts := strings.Split(rest, "/")
+		if len(parts) != 2 {
+			continue
+		}
+		t, ok := parseDirTimestamp(parts[0])
+		if !ok {
+			continue
+		}
+		key := t.UTC().Format(time.RFC3339)
+		switch parts[1] {
+		case baseline.SuccessMarker:
+			hasSuccess[key] = true
+		case baseline.IncompleteMarker:
+			hasIncomplete[key] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate S3 baseline markers: %w", err)
+	}
+	incomplete := map[string]bool{}
+	for key := range hasIncomplete {
+		if !hasSuccess[key] {
+			incomplete[key] = true
+		}
+	}
+	return incomplete, nil
 }
 
 // extractTimestampFromS3Path parses the snapshot timestamp from a full S3 path:

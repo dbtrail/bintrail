@@ -1,0 +1,78 @@
+package baseline
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// Snapshot completeness markers (#467).
+//
+// A baseline run converts one table at a time into
+// <output>/<timestamp>/<db>/<table>.parquet. Per-table cleanup removes a
+// table's own partial Parquet on failure, but the tables that converted BEFORE
+// a mid-run failure stay on disk — a snapshot directory that is byte-for-byte
+// indistinguishable from a complete one. Discovery (FindBaseline /
+// DiscoverBaselines / ListBaselines) would then treat it as the newest
+// snapshot and silently reconstruct missing tables from an older one (#461) or
+// return ErrNoBaseline.
+//
+// The fix is a snapshot-level marker, NOT an atomic rename-on-complete: the
+// --retry resume path reuses already-converted Parquet under <output>/<tsDir>,
+// so renaming the directory away on failure would leave nothing to resume from.
+//
+//   - SuccessMarker   ("_SUCCESS")    written ONLY when every table converted.
+//   - IncompleteMarker ("_INCOMPLETE") written when a run fails or is cancelled
+//     mid-way, so a NEW partial snapshot is positively flagged as incomplete
+//     and excluded from discovery.
+//
+// Backward compatibility: snapshots produced before this change have NEITHER
+// marker. They are treated as complete-by-default — SnapshotComplete returns
+// true when neither marker is present — so existing baselines keep working.
+// Only an explicit IncompleteMarker (a new partial run) is treated as
+// incomplete; the SuccessMarker is the affirmative signal for runs that have it.
+const (
+	// SuccessMarker is written under <output>/<timestamp>/ on full success.
+	SuccessMarker = "_SUCCESS"
+	// IncompleteMarker is written under <output>/<timestamp>/ when a run fails
+	// or is cancelled before every table converted.
+	IncompleteMarker = "_INCOMPLETE"
+)
+
+// WriteSuccessMarker writes the _SUCCESS marker into snapshotDir and removes any
+// stale _INCOMPLETE marker left by an earlier failed attempt (the --retry path
+// can complete a snapshot that a previous run flagged incomplete).
+func WriteSuccessMarker(snapshotDir string) error {
+	if err := os.WriteFile(filepath.Join(snapshotDir, SuccessMarker), nil, 0o644); err != nil {
+		return fmt.Errorf("write %s marker: %w", SuccessMarker, err)
+	}
+	if err := os.Remove(filepath.Join(snapshotDir, IncompleteMarker)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale %s marker: %w", IncompleteMarker, err)
+	}
+	return nil
+}
+
+// WriteIncompleteMarker writes the _INCOMPLETE marker into snapshotDir. It is
+// best-effort: a run already returning a failure error should not be masked by
+// a marker-write error, so callers log rather than propagate.
+func WriteIncompleteMarker(snapshotDir string) error {
+	if err := os.WriteFile(filepath.Join(snapshotDir, IncompleteMarker), nil, 0o644); err != nil {
+		return fmt.Errorf("write %s marker: %w", IncompleteMarker, err)
+	}
+	return nil
+}
+
+// SnapshotComplete reports whether the snapshot directory snapshotDir is a
+// COMPLETE baseline, for local discovery. The rule (see the package comment):
+//   - _INCOMPLETE present, _SUCCESS absent → incomplete (false).
+//   - otherwise (marker-absent legacy snapshot, or _SUCCESS present) → complete.
+func SnapshotComplete(snapshotDir string) bool {
+	if _, err := os.Stat(filepath.Join(snapshotDir, SuccessMarker)); err == nil {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(snapshotDir, IncompleteMarker)); err == nil {
+		return false
+	}
+	// Neither marker: a pre-marker (legacy) snapshot — complete by default.
+	return true
+}

@@ -157,7 +157,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// 1. Locate the baseline at-or-before `at` and read the row's initial state.
-	path, snapshotTime, err := reconstruct.FindBaseline(ctx, b.baselineSrc, schema, table, atTime)
+	path, snapshotTime, stale, err := reconstruct.FindBaseline(ctx, b.baselineSrc, schema, table, atTime)
 	if err != nil {
 		if errors.Is(err, reconstruct.ErrNoBaseline) {
 			writeJSONError(w, http.StatusNotFound,
@@ -224,7 +224,11 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		At:           atTime.Format(consoleTSFormat),
 		BaselineTime: snapshotTime.Format(consoleTSFormat),
 		EventCount:   len(rows),
-		Warnings:     gapWarnings(plan),
+		// Surface a stale-baseline fallback (#466) alongside coverage-gap
+		// warnings: the table is absent from a newer snapshot, so Time-travel is
+		// reconstructing from an older one. The server already logged it; this
+		// puts it in front of the operator.
+		Warnings: appendStaleWarning(gapWarnings(plan), stale),
 	}
 
 	// 3. Fold baseline + deltas. baselineRow may be nil. "existed" = the row was
@@ -296,6 +300,16 @@ func toStateEntryDTOs(entries []reconstruct.StateEntry) []stateEntryDTO {
 		}
 	}
 	return out
+}
+
+// appendStaleWarning adds a "stale_baseline: …" entry to the warnings list when
+// the baseline was an older-snapshot fallback (#466). A no-op for a non-stale
+// result, so callers can wire it unconditionally.
+func appendStaleWarning(warnings []string, stale reconstruct.StaleWarning) []string {
+	if !stale.Stale() {
+		return warnings
+	}
+	return append(warnings, "stale_baseline: "+stale.Message)
 }
 
 // isTrue reports whether a query-param flag is set to a truthy value.

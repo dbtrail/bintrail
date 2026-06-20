@@ -169,6 +169,13 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 // optional — if empty, the AWS SDK resolves it from AWS_REGION env var or
 // ~/.aws/config. When retry is true, files that already exist in S3 are
 // skipped (checked via HeadObject). Returns the number of files uploaded.
+//
+// The _SUCCESS completeness marker (#467) is uploaded LAST, after every other
+// file. WalkDir is lexical and "_SUCCESS" sorts before sibling schema dirs, so
+// a naive walk would publish the marker first; if the upload then died mid-way,
+// S3 would carry _SUCCESS without all the Parquet — the exact "partial looks
+// complete" failure #467 kills, recreated on the upload path. Deferring it keeps
+// the S3 snapshot un-marked-complete until its data is fully present.
 func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string, retry bool) (int, error) {
 	bucket, prefix, err := storage.ParseS3URL(s3URL)
 	if err != nil {
@@ -180,11 +187,7 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string, re
 		return 0, err
 	}
 
-	var count int
-	err = filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() {
-			return walkErr
-		}
+	upload := func(path string) error {
 		key, err := storage.BuildS3Key(outputDir, path, prefix)
 		if err != nil {
 			return err
@@ -203,10 +206,36 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string, re
 			return err
 		}
 		slog.Debug("uploaded", "file", path, "bucket", bucket, "key", key)
+		return nil
+	}
+
+	var count int
+	var successMarkers []string
+	err = filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return walkErr
+		}
+		if d.Name() == baseline.SuccessMarker {
+			successMarkers = append(successMarkers, path) // defer to the end
+			return nil
+		}
+		if err := upload(path); err != nil {
+			return err
+		}
 		count++
 		return nil
 	})
-	return count, err
+	if err != nil {
+		return count, err
+	}
+	// Everything else is uploaded; publish the completeness marker(s) last.
+	for _, path := range successMarkers {
+		if err := upload(path); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
 }
 
 // decryptDumpFiles walks inputDir and decrypts every .enc file using openssl,

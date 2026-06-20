@@ -46,6 +46,13 @@ func DiscoverBaselines(dir string) ([]BaselineInfo, error) {
 		}
 
 		snapshotDir := filepath.Join(dir, entry.Name())
+		// Skip a partially-converted snapshot (#467): an _INCOMPLETE marker
+		// without _SUCCESS means a run failed mid-way. Pre-marker (legacy)
+		// snapshots have neither and stay complete-by-default.
+		if !SnapshotComplete(snapshotDir) {
+			slog.Warn("skipping incomplete baseline snapshot", "path", snapshotDir)
+			continue
+		}
 		dbEntries, err := os.ReadDir(snapshotDir)
 		if err != nil {
 			slog.Warn("could not read baseline snapshot directory", "path", snapshotDir, "error", err)

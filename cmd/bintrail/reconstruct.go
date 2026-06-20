@@ -199,7 +199,9 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Find and read the baseline snapshot ────────────────────────────────────
-	baselinePath, snapshotTime, err := reconstruct.FindBaseline(cmd.Context(), baselineSrc, recSchema, recTable, at)
+	// The stale-fallback warning (#466) is already logged inside FindBaseline;
+	// the CLI relies on that server-side log.
+	baselinePath, snapshotTime, _, err := reconstruct.FindBaseline(cmd.Context(), baselineSrc, recSchema, recTable, at)
 	if err != nil {
 		return err
 	}

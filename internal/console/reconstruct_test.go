@@ -1,12 +1,18 @@
 package console
 
 import (
+	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 func TestNewBaselineGating(t *testing.T) {
@@ -142,5 +148,74 @@ func TestPKColumnsNoResolver(t *testing.T) {
 	b := &bundle{}
 	if _, err := b.pkColumns("app", "users"); err == nil {
 		t.Error("nil resolver must produce a clear error, not a panic")
+	}
+}
+
+// TestAppendStaleWarning pins the console-side surfacing of a stale-baseline
+// fallback (#466): a non-stale result leaves Warnings untouched; a stale one
+// appends a "stale_baseline:" entry carrying the message.
+func TestAppendStaleWarning(t *testing.T) {
+	if got := appendStaleWarning(nil, reconstruct.StaleWarning{}); got != nil {
+		t.Errorf("non-stale must not add a warning, got %v", got)
+	}
+	base := []string{"gap warning"}
+	got := appendStaleWarning(base, reconstruct.StaleWarning{Message: "table absent from newest"})
+	if len(got) != 2 || got[0] != "gap warning" || !strings.HasPrefix(got[1], "stale_baseline: ") {
+		t.Errorf("stale warning not appended correctly: %v", got)
+	}
+	if !strings.Contains(got[1], "table absent from newest") {
+		t.Errorf("stale warning lost its message: %q", got[1])
+	}
+}
+
+// TestStaleBaselineReachesWarningsDTO drives a REAL stale fallback end-to-end on
+// the surfacing path: a local baseline source where the table is absent from the
+// newest snapshot makes reconstruct.FindBaseline return a populated StaleWarning,
+// which the console's appendStaleWarning lands in the reconstructResponse the
+// Time-travel UI renders (#466). Uses a local source — findBaselineLocal and
+// findBaselineS3 produce the identical StaleWarning, and handleReconstruct is
+// source-agnostic, so this exercises the same plumbing the S3 path feeds.
+func TestStaleBaselineReachesWarningsDTO(t *testing.T) {
+	dir := t.TempDir()
+	// Newest snapshot lacks "orders"; an older one has it → stale fallback.
+	mkEmpty := func(parts ...string) {
+		p := filepath.Join(append([]string{dir}, parts...)...)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkEmpty("2026-01-01T00-00-00Z", "shop", "orders.parquet")
+	mkEmpty("2026-02-01T00-00-00Z", "shop", "users.parquet") // newest, no orders
+
+	at := time.Date(2026, 2, 15, 0, 0, 0, 0, time.UTC)
+	_, snapTime, stale, err := reconstruct.FindBaseline(context.Background(), dir, "shop", "orders", at)
+	if err != nil {
+		t.Fatalf("FindBaseline: %v", err)
+	}
+	if !stale.Stale() {
+		t.Fatal("expected a stale fallback (orders absent from the newest snapshot)")
+	}
+
+	// Build the response exactly as handleReconstruct does for the warnings.
+	resp := reconstructResponse{
+		Schema: "shop", Table: "orders", PK: "1",
+		At:           at.Format(consoleTSFormat),
+		BaselineTime: snapTime.Format(consoleTSFormat),
+		Warnings:     appendStaleWarning(nil, stale),
+	}
+	if len(resp.Warnings) != 1 || !strings.HasPrefix(resp.Warnings[0], "stale_baseline: ") {
+		t.Fatalf("Warnings DTO missing the stale_baseline entry: %v", resp.Warnings)
+	}
+
+	// And it survives JSON encoding (what the UI receives).
+	b, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "stale_baseline") {
+		t.Fatalf("encoded response lacks stale_baseline: %s", b)
 	}
 }

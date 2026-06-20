@@ -1918,3 +1918,123 @@ func TestRun_filterMatchesNothingIsError(t *testing.T) {
 		t.Fatalf("error = %v, want the filter-matched-nothing message", err)
 	}
 }
+
+// ─── completeness markers (#467) ─────────────────────────────────────────────
+
+// snapDir returns the single <timestamp> snapshot directory under outputDir.
+func snapDir(t *testing.T, outputDir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			return filepath.Join(outputDir, e.Name())
+		}
+	}
+	t.Fatal("no snapshot directory produced")
+	return ""
+}
+
+// TestRun_writesSuccessMarker: a clean run marks the snapshot _SUCCESS and
+// DiscoverBaselines treats it as complete.
+func TestRun_writesSuccessMarker(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"),
+		[]byte("INSERT INTO `orders` VALUES(1,10,'9.99','note','2025-01-01 00:00:00','2025-01-15');\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(context.Background(), Config{
+		InputDir: inputDir, OutputDir: outputDir, Compression: "none", RowGroupSize: 100,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	dir := snapDir(t, outputDir)
+	if _, err := os.Stat(filepath.Join(dir, SuccessMarker)); err != nil {
+		t.Fatalf("expected %s marker after a clean run: %v", SuccessMarker, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, IncompleteMarker)); !os.IsNotExist(err) {
+		t.Fatalf("did not expect %s marker after a clean run (err=%v)", IncompleteMarker, err)
+	}
+	if !SnapshotComplete(dir) {
+		t.Fatal("SnapshotComplete=false for a clean run")
+	}
+	got, err := DiscoverBaselines(outputDir)
+	if err != nil {
+		t.Fatalf("DiscoverBaselines: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("DiscoverBaselines returned %d, want 1", len(got))
+	}
+}
+
+// TestRun_partialFailureMarksIncomplete: when one table fails mid-run, the
+// snapshot is flagged _INCOMPLETE (no _SUCCESS) and DiscoverBaselines skips it,
+// so a partial snapshot is never treated as the newest baseline (#467).
+func TestRun_partialFailureMarksIncomplete(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Good table.
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"),
+		[]byte("INSERT INTO `orders` VALUES(1,10,'9.99','note','2025-01-01 00:00:00','2025-01-15');\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Broken table: a schema file with no parseable columns → ParseSchema fails
+	// in processTable, failing this table while orders converts.
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.broken-schema.sql"), []byte("-- not a CREATE TABLE\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.broken.00000.sql"), []byte("INSERT INTO `broken` VALUES(1);\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(context.Background(), Config{
+		InputDir: inputDir, OutputDir: outputDir, Compression: "none", RowGroupSize: 100,
+	}); err == nil {
+		t.Fatal("Run with a failing table succeeded; want an error")
+	}
+
+	dir := snapDir(t, outputDir)
+	if _, err := os.Stat(filepath.Join(dir, SuccessMarker)); !os.IsNotExist(err) {
+		t.Fatalf("did not expect %s marker after a partial run (err=%v)", SuccessMarker, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, IncompleteMarker)); err != nil {
+		t.Fatalf("expected %s marker after a partial run: %v", IncompleteMarker, err)
+	}
+	if SnapshotComplete(dir) {
+		t.Fatal("SnapshotComplete=true for a partial run; want false")
+	}
+	// Discovery must NOT surface the incomplete snapshot.
+	got, err := DiscoverBaselines(outputDir)
+	if err != nil {
+		t.Fatalf("DiscoverBaselines: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("DiscoverBaselines returned %d for an incomplete snapshot; want 0", len(got))
+	}
+}
+
+// TestSnapshotComplete_legacyMarkerless: a pre-marker snapshot (neither marker)
+// stays complete-by-default so existing baselines keep working.
+func TestSnapshotComplete_legacyMarkerless(t *testing.T) {
+	dir := t.TempDir()
+	if !SnapshotComplete(dir) {
+		t.Fatal("a marker-absent (legacy) snapshot must be complete-by-default")
+	}
+}

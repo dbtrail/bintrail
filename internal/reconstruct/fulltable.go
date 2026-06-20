@@ -220,7 +220,7 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 		}
 		if metaReport != nil {
 			tableName := metaReport.Schema + "." + metaReport.Table
-			baselinePath, _, perr := FindBaseline(ctx, cfg.BaselineSrc, metaReport.Schema, metaReport.Table, cfg.At)
+			baselinePath, _, _, perr := FindBaseline(ctx, cfg.BaselineSrc, metaReport.Schema, metaReport.Table, cfg.At)
 			if perr == nil {
 				bmeta, merr := baseline.ReadParquetMetadataAny(ctx, baselinePath)
 				if merr == nil {
@@ -268,7 +268,8 @@ func ReconstructTable(
 	rep := &TableReport{Schema: schema, Table: table}
 
 	// ── 1. Find the baseline snapshot ──────────────────────────────────────
-	baselinePath, snapshotTime, err := FindBaseline(ctx, cfg.BaselineSrc, schema, table, cfg.At)
+	// FindBaseline already logs a stale-fallback warning (#466) server-side.
+	baselinePath, snapshotTime, _, err := FindBaseline(ctx, cfg.BaselineSrc, schema, table, cfg.At)
 	if err != nil {
 		if !errors.Is(err, ErrNoBaseline) {
 			return nil, fmt.Errorf("find baseline: %w", err)
