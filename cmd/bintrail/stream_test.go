@@ -163,7 +163,7 @@ func TestStreamConfigFromFlags(t *testing.T) {
 	orig := struct {
 		src, idx, file, gtid, sch, tbl, met, fmtv, ssl, ca, cert, key, flavor string
 		sid, pos                                                              uint32
-		batch, chk, gap                                                       int
+		batch, chk, gap, msi                                                  int
 		reset, noGap                                                          bool
 	}{
 		src: strmSourceDSN, idx: strmIndexDSN, file: strmStartFile,
@@ -172,6 +172,7 @@ func TestStreamConfigFromFlags(t *testing.T) {
 		ca: strmSSLCA, cert: strmSSLCert, key: strmSSLKey, flavor: strmFlavor,
 		sid: strmServerID, pos: strmStartPos,
 		batch: strmBatchSize, chk: strmCheckpoint, gap: strmGapTimeout,
+		msi:   strmMetricsScrapeInterval,
 		reset: strmReset, noGap: strmNoGapFill,
 	}
 	t.Cleanup(func() {
@@ -181,6 +182,7 @@ func TestStreamConfigFromFlags(t *testing.T) {
 		strmSSLCA, strmSSLCert, strmSSLKey = orig.ca, orig.cert, orig.key
 		strmServerID, strmStartPos = orig.sid, orig.pos
 		strmBatchSize, strmCheckpoint, strmGapTimeout = orig.batch, orig.chk, orig.gap
+		strmMetricsScrapeInterval = orig.msi
 		strmReset, strmNoGapFill = orig.reset, orig.noGap
 		strmFlavor = orig.flavor
 	})
@@ -197,6 +199,7 @@ func TestStreamConfigFromFlags(t *testing.T) {
 	strmTables = "mydb.orders"
 	strmCheckpoint = 17
 	strmMetricsAddr = ":9191"
+	strmMetricsScrapeInterval = 45
 	strmSSLMode = "verify-ca"
 	strmSSLCA = "/tmp/ca.pem"
 	strmSSLCert = "/tmp/cert.pem"
@@ -217,26 +220,27 @@ func TestStreamConfigFromFlags(t *testing.T) {
 	// strm* → field snapshot, so zero it before the struct comparison.
 	got.Deps = streamrun.Deps{}
 	want := streamrun.Config{
-		IndexDSN:    "ix:pw@tcp(127.0.0.1:3306)/binlog_index",
-		SourceDSN:   "user:pass@tcp(source.example.com:3306)/src",
-		Flavor:      "mariadb",
-		ServerID:    424242,
-		StartFile:   "mysql-bin.000777",
-		StartPos:    1234,
-		StartGTID:   "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
-		BatchSize:   333,
-		Schemas:     "mydb,otherdb",
-		Tables:      "mydb.orders",
-		Checkpoint:  17,
-		MetricsAddr: ":9191",
-		SSLMode:     "verify-ca",
-		SSLCA:       "/tmp/ca.pem",
-		SSLCert:     "/tmp/cert.pem",
-		SSLKey:      "/tmp/key.pem",
-		Format:      "json",
-		Reset:       true,
-		NoGapFill:   true,
-		GapTimeout:  99,
+		IndexDSN:              "ix:pw@tcp(127.0.0.1:3306)/binlog_index",
+		SourceDSN:             "user:pass@tcp(source.example.com:3306)/src",
+		Flavor:                "mariadb",
+		ServerID:              424242,
+		StartFile:             "mysql-bin.000777",
+		StartPos:              1234,
+		StartGTID:             "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
+		BatchSize:             333,
+		Schemas:               "mydb,otherdb",
+		Tables:                "mydb.orders",
+		Checkpoint:            17,
+		MetricsAddr:           ":9191",
+		MetricsScrapeInterval: 45,
+		SSLMode:               "verify-ca",
+		SSLCA:                 "/tmp/ca.pem",
+		SSLCert:               "/tmp/cert.pem",
+		SSLKey:                "/tmp/key.pem",
+		Format:                "json",
+		Reset:                 true,
+		NoGapFill:             true,
+		GapTimeout:            99,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("streamConfigFromFlags mismatch:\n got: %+v\nwant: %+v", got, want)
