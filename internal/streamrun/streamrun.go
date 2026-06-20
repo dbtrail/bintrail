@@ -1108,14 +1108,19 @@ type Config struct {
 	// MetricsScrapeInterval is how often (seconds) the bintrail_index_* gauges
 	// are refreshed from a status snapshot. 0 = the 60s default.
 	MetricsScrapeInterval int
-	SSLMode               string
-	SSLCA                 string
-	SSLCert               string
-	SSLKey                string
-	Format                string
-	Reset                 bool
-	NoGapFill             bool
-	GapTimeout            int // seconds
+	// IndexMetrics forces the bintrail_index_* scraper on even when this stream
+	// sets neither MetricsAddr nor MetricsSource — the `bintrail-console watch`
+	// daemon's OWN primary stream needs this, since it serves /metrics centrally
+	// (MetricsAddr empty) and isn't supervisor-launched (MetricsSource empty).
+	IndexMetrics bool
+	SSLMode      string
+	SSLCA        string
+	SSLCert      string
+	SSLKey       string
+	Format       string
+	Reset        bool
+	NoGapFill    bool
+	GapTimeout   int // seconds
 	// Hooks, when non-nil, lets a supervisor observe this stream's liveness
 	// without polling. Plain `bintrail stream` leaves it nil.
 	Hooks *Hooks
@@ -1554,11 +1559,11 @@ func One(ctx context.Context, cfg Config) error {
 	metrics := observe.ForSource(metricsSource)
 
 	// Index-state gauges (bintrail_index_*, #351): refresh periodically from a
-	// status snapshot whenever metrics are exposed — standalone --metrics-addr
-	// or under the `bintrail-console watch` supervisor (which sets MetricsSource
-	// and serves the process-global registry on its own endpoint). The scraper
-	// stops with ctx.
-	if cfg.MetricsAddr != "" || cfg.MetricsSource != "" {
+	// status snapshot whenever metrics are exposed — standalone --metrics-addr,
+	// a supervisor-launched stream (MetricsSource set), or the watch daemon's
+	// own primary stream (IndexMetrics set, since it serves /metrics centrally
+	// with MetricsAddr/MetricsSource both empty). The scraper stops with ctx.
+	if cfg.MetricsAddr != "" || cfg.MetricsSource != "" || cfg.IndexMetrics {
 		startIndexMetricsScraper(ctx, indexDB, cfg.IndexDSN, metricsSource, cfg.MetricsScrapeInterval)
 	}
 

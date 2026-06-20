@@ -53,17 +53,18 @@ Examples:
 }
 
 var (
-	upSourceDSN   string
-	upIndexDSN    string
-	upServerID    uint32
-	upSchemas     string
-	upTables      string
-	upBatchSize   int
-	upCheckpoint  int
-	upMetricsAddr string
-	upPartitions  int
-	upSkipDoctor  bool
-	upFormat      string
+	upSourceDSN             string
+	upIndexDSN              string
+	upServerID              uint32
+	upSchemas               string
+	upTables                string
+	upBatchSize             int
+	upCheckpoint            int
+	upMetricsAddr           string
+	upMetricsScrapeInterval int
+	upPartitions            int
+	upSkipDoctor            bool
+	upFormat                string
 
 	upConsoleListen      string
 	upConsoleToken       string
@@ -104,6 +105,7 @@ var watchEnvBindings = []struct {
 	{"server-id", "BINTRAIL_SERVER_ID"},
 	{"batch-size", "BINTRAIL_BATCH_SIZE"},
 	{"metrics-addr", "BINTRAIL_METRICS_ADDR"},
+	{"metrics-scrape-interval", "BINTRAIL_METRICS_SCRAPE_INTERVAL"},
 	{"rotate-retain", "BINTRAIL_ROTATE_RETAIN"},
 	{"rotate-interval", "BINTRAIL_ROTATE_INTERVAL"},
 	{"rotate-add-future", "BINTRAIL_ROTATE_ADD_FUTURE"},
@@ -140,6 +142,7 @@ func init() {
 	watchCmd.Flags().IntVar(&upBatchSize, "batch-size", 1000, "Events per batch INSERT")
 	watchCmd.Flags().IntVar(&upCheckpoint, "checkpoint", 10, "Checkpoint interval in seconds")
 	watchCmd.Flags().StringVar(&upMetricsAddr, "metrics-addr", "", "Address to expose Prometheus metrics (e.g. :9090); empty = disabled")
+	watchCmd.Flags().IntVar(&upMetricsScrapeInterval, "metrics-scrape-interval", 60, "How often (seconds) to refresh the bintrail_index_* gauges from a status snapshot")
 	watchCmd.Flags().IntVar(&upPartitions, "partitions", 48, "Hourly partitions to create on first init")
 	watchCmd.Flags().BoolVar(&upSkipDoctor, "skip-doctor", false, "Skip the preflight checks (useful when you've already verified with `bintrail doctor`)")
 	watchCmd.Flags().StringVar(&upFormat, "format", "text", "Output format: text or json")
@@ -528,7 +531,12 @@ func watchStreamConfig(serverID uint32) streamrun.Config {
 		SSLMode:    "preferred",
 		Format:     upFormat,
 		GapTimeout: 30,
-		Deps:       streamdeps.Default(),
+		// The daemon serves /metrics centrally, so the primary stream sets
+		// neither MetricsAddr nor MetricsSource — IndexMetrics turns the
+		// bintrail_index_* scraper on for it when the daemon exposes metrics.
+		IndexMetrics:          upMetricsAddr != "",
+		MetricsScrapeInterval: upMetricsScrapeInterval,
+		Deps:                  streamdeps.Default(),
 	}
 }
 

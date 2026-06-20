@@ -39,6 +39,7 @@ var envBindings = []envBinding{
 	{"s3-region", "BINTRAIL_S3_REGION"},
 	{"s3-arn", "BINTRAIL_S3_ARN"},
 	{"metrics-addr", "BINTRAIL_METRICS_ADDR"},
+	{"metrics-scrape-interval", "BINTRAIL_METRICS_SCRAPE_INTERVAL"},
 	{"ssl-mode", "BINTRAIL_SSL_MODE"},
 	{"ssl-ca", "BINTRAIL_SSL_CA"},
 	{"ssl-cert", "BINTRAIL_SSL_CERT"},

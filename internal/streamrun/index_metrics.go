@@ -82,13 +82,41 @@ func scrapeIndexMetrics(ctx context.Context, db *sql.DB, dbName string, m *obser
 	if data.Archives != nil {
 		snap.ParquetBytes = data.Archives.TotalSizeBytes
 	}
+
 	// Gap hours: hours rotated out of MySQL with no Parquet archive — holes in
-	// recovery coverage. Plan over the full range (nil since/until).
-	if plan, err := query.Plan(ctx, db, dbName, nil, nil); err != nil {
-		slog.Warn("index metrics scrape: could not plan gap hours", "error", err)
-	} else {
-		snap.GapHours = len(plan.GapHours)
+	// recovery coverage. query.Plan SHORT-CIRCUITS to a nil plan when given a
+	// nil range (planner.go), so we must pass a concrete window — and it has to
+	// reach back to the earliest data that SHOULD exist (live or archived) for
+	// the count to mean anything. An empty index has no span and no gaps.
+	var archiveEarliest sql.NullTime
+	if data.Coverage != nil {
+		archiveEarliest = data.Coverage.ArchiveEarliestHour
+	}
+	if since, until, ok := gapScrapeRange(snap.OldestEvent, archiveEarliest, time.Now()); ok {
+		if plan, err := query.Plan(ctx, db, dbName, &since, &until); err != nil {
+			slog.Warn("index metrics scrape: could not plan gap hours", "error", err)
+		} else if plan != nil { // belt-and-suspenders: Plan can still return nil
+			snap.GapHours = len(plan.GapHours)
+		}
 	}
 
 	m.Set(snap, time.Now())
+}
+
+// gapScrapeRange returns the [since, until] window over which to count coverage
+// gap hours, or ok=false when the index has no data to span. since reaches back
+// to the earliest data that should exist — the earlier of the oldest live event
+// and the earliest archived hour — so a hole anywhere in the covered span is
+// seen. Returning a concrete (non-nil) range is also what keeps the scraper
+// from calling query.Plan with nil bounds, which it short-circuits to a nil
+// plan (the cause of an earlier nil-deref panic).
+func gapScrapeRange(oldest time.Time, archiveEarliest sql.NullTime, now time.Time) (since, until time.Time, ok bool) {
+	since = oldest
+	if archiveEarliest.Valid && (since.IsZero() || archiveEarliest.Time.Before(since)) {
+		since = archiveEarliest.Time
+	}
+	if since.IsZero() {
+		return time.Time{}, time.Time{}, false
+	}
+	return since, now, true
 }
