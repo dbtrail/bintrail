@@ -177,8 +177,10 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 //     _INCOMPLETE marker was already removed once Run succeeded, so there is no
 //     local file to walk).
 //  2. every data file.
-//  3. _SUCCESS LAST. WalkDir is lexical and "_SUCCESS" sorts before sibling
-//     schema dirs, so a naive walk would publish it first; deferring it keeps
+//  3. _SUCCESS LAST. "_SUCCESS" can sort before sibling schema dirs depending
+//     on the database name's first byte ('_' is 0x5F — before lowercase letters
+//     but after digits and uppercase), so a single-pass lexical WalkDir could
+//     publish it before all data is up. We defer it UNCONDITIONALLY, which keeps
 //     the S3 snapshot un-marked-complete until its data is fully present.
 //  4. best-effort _INCOMPLETE delete. s3IncompleteSnapshots only flags a
 //     snapshot incomplete when _INCOMPLETE is present AND _SUCCESS is absent, so
@@ -196,25 +198,50 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string, re
 		return 0, err
 	}
 
+	// Route the four S3 operations through an injectable seam so the ordering
+	// invariant can be unit-tested with a recording mock (#524 review).
+	ops := s3ops{
+		putEmpty:     func(ctx context.Context, key string) error { return storage.PutEmptyObject(ctx, client, bucket, key) },
+		uploadFile:   func(ctx context.Context, path, key string) error { return storage.UploadFile(ctx, client, path, bucket, key) },
+		objectExists: func(ctx context.Context, key string) (bool, error) { return storage.S3ObjectExists(ctx, client, bucket, key) },
+		deleteObject: func(ctx context.Context, key string) error { return storage.DeleteObject(ctx, client, bucket, key) },
+	}
+	return runBaselineUpload(ctx, outputDir, prefix, retry, ops)
+}
+
+// s3ops abstracts the four S3 operations the baseline upload performs, so the
+// crash-safe ordering invariant (_INCOMPLETE first → data files → _SUCCESS last
+// → best-effort _INCOMPLETE delete) can be pinned by a recording mock without a
+// live client (#524 review).
+type s3ops struct {
+	putEmpty     func(ctx context.Context, key string) error
+	uploadFile   func(ctx context.Context, path, key string) error
+	objectExists func(ctx context.Context, key string) (bool, error)
+	deleteObject func(ctx context.Context, key string) error
+}
+
+// runBaselineUpload performs the crash-safe upload ordering against ops. See the
+// uploadBaselineToS3 doc for the four-step contract it guarantees.
+func runBaselineUpload(ctx context.Context, outputDir, prefix string, retry bool, ops s3ops) (int, error) {
 	upload := func(path string) error {
 		key, err := storage.BuildS3Key(outputDir, path, prefix)
 		if err != nil {
 			return err
 		}
 		if retry {
-			exists, err := storage.S3ObjectExists(ctx, client, bucket, key)
+			exists, err := ops.objectExists(ctx, key)
 			if err != nil {
 				return err
 			}
 			if exists {
-				slog.Info("skipping existing S3 object (--retry)", "bucket", bucket, "key", key)
+				slog.Info("skipping existing S3 object (--retry)", "key", key)
 				return nil
 			}
 		}
-		if err := storage.UploadFile(ctx, client, path, bucket, key); err != nil {
+		if err := ops.uploadFile(ctx, path, key); err != nil {
 			return err
 		}
-		slog.Debug("uploaded", "file", path, "bucket", bucket, "key", key)
+		slog.Debug("uploaded", "file", path, "key", key)
 		return nil
 	}
 
@@ -235,7 +262,7 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string, re
 		if err != nil {
 			return 0, err
 		}
-		if err := storage.PutEmptyObject(ctx, client, bucket, key); err != nil {
+		if err := ops.putEmpty(ctx, key); err != nil {
 			return 0, err
 		}
 	}
@@ -274,9 +301,9 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string, re
 			slog.Warn("could not build _INCOMPLETE marker key for cleanup", "snapshot", snapDir, "error", err)
 			continue
 		}
-		if err := storage.DeleteObject(ctx, client, bucket, key); err != nil {
+		if err := ops.deleteObject(ctx, key); err != nil {
 			slog.Warn("could not remove S3 _INCOMPLETE marker after upload (harmless; _SUCCESS decides completeness)",
-				"bucket", bucket, "key", key, "error", err)
+				"key", key, "error", err)
 		}
 	}
 	return count, nil
