@@ -39,12 +39,12 @@ type PartitionStat struct {
 
 // ServerInfo holds one active row from the bintrail_servers table.
 type ServerInfo struct {
-	BintrailID      string
-	ServerUUID      string
-	Host            string
-	Port            uint16
-	Username        string
-	CreatedAt       time.Time
+	BintrailID       string
+	ServerUUID       string
+	Host             string
+	Port             uint16
+	Username         string
+	CreatedAt        time.Time
 	DecommissionedAt sql.NullTime
 }
 
@@ -86,15 +86,20 @@ type StreamStateInfo struct {
 
 // CoverageInfo summarizes the restore coverage of the index.
 type CoverageInfo struct {
-	EarliestEvent     sql.NullTime
-	LatestEvent       sql.NullTime
-	TotalEvents       int64
-	SchemaChanges     int
-	UncoveredDDLs     int // DDLs without a snapshot (file mode, or failed auto-snapshot in stream mode)
+	EarliestEvent sql.NullTime
+	LatestEvent   sql.NullTime
+	TotalEvents   int64
+	SchemaChanges int
+	UncoveredDDLs int // DDLs without a snapshot (file mode, or failed auto-snapshot in stream mode)
 
 	// Archive-derived fields (from archive_state partition names and row counts).
 	ArchiveEarliestHour sql.NullTime // earliest hour derived from MIN(partition_name)
 	ArchiveTotalRows    int64
+
+	// IndexSizeBytes is the on-disk size of the binlog_events table
+	// (DATA_LENGTH + INDEX_LENGTH, an InnoDB estimate). Surfaced so an operator
+	// sees how much disk the live index occupies alongside its time coverage.
+	IndexSizeBytes int64
 }
 
 // TSFmt is the timestamp format used in status output.
@@ -339,6 +344,10 @@ type BaselineInfo struct {
 	BinlogPos    int64
 	GTIDSet      string
 	Path         string // filesystem path; ignored by display/JSON output
+	// Size is the Parquet file size in bytes (0 = unknown). Surfaced so an
+	// operator can see per-table baseline size — the signal that tells whether
+	// a single-table baseline has grown into the large regime.
+	Size int64
 }
 
 // CollectStatus loads all status data from the index database.
@@ -382,7 +391,31 @@ func CollectStatus(ctx context.Context, db *sql.DB, dbName string) (*StatusData,
 		d.Coverage = coverage
 	}
 
+	// Best-effort: the binlog_events on-disk size, attached to coverage so it
+	// surfaces alongside the time-coverage figures (and is reused by the
+	// bintrail_index_storage_bytes gauge).
+	if size, err := LoadIndexSizeBytes(ctx, db, dbName); err != nil {
+		slog.Warn("could not load index size", "error", err)
+	} else if d.Coverage != nil {
+		d.Coverage.IndexSizeBytes = size
+	}
+
 	return d, nil
+}
+
+// LoadIndexSizeBytes returns the on-disk size of the binlog_events table
+// (DATA_LENGTH + INDEX_LENGTH summed across partitions) — an InnoDB estimate
+// from information_schema, the same figure the doctor capacity check uses.
+func LoadIndexSizeBytes(ctx context.Context, db *sql.DB, dbName string) (int64, error) {
+	var b sql.NullInt64
+	err := db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0)
+		FROM information_schema.PARTITIONS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events'`, dbName).Scan(&b)
+	if err != nil {
+		return 0, err
+	}
+	return b.Int64, nil
 }
 
 // Write writes the status data as a human-readable report to w.
@@ -538,6 +571,9 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		} else {
 			fmt.Fprintf(w, "  Total events:   %d\n", totalEvents)
 		}
+		if coverage.IndexSizeBytes > 0 {
+			fmt.Fprintf(w, "  Index size:     %s (MySQL binlog_events)\n", formatBytes(coverage.IndexSizeBytes))
+		}
 		fmt.Fprintf(w, "  Schema changes: %d\n", coverage.SchemaChanges)
 		if coverage.UncoveredDDLs > 0 {
 			fmt.Fprintf(w, "  Warning: %d DDL(s) detected without auto-snapshot (file mode) — recovery across these DDLs may require manual snapshot\n",
@@ -661,6 +697,8 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		LiveEvents           int64   `json:"live_events"`
 		ArchivedEvents       int64   `json:"archived_events"`
 		ArchiveEarliestEvent *string `json:"archive_earliest_event,omitempty"`
+		IndexSizeBytes       int64   `json:"index_size_bytes,omitempty"`
+		IndexSizeHuman       string  `json:"index_size_human,omitempty"`
 		SchemaChanges        int     `json:"schema_changes"`
 		UncoveredDDLs        int     `json:"uncovered_ddls"`
 	}
@@ -691,6 +729,8 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		BinlogFile   *string `json:"binlog_file,omitempty"`
 		BinlogPos    *int64  `json:"binlog_position,omitempty"`
 		GTIDSet      *string `json:"gtid_set,omitempty"`
+		Size         int64   `json:"size_bytes,omitempty"`
+		SizeHuman    string  `json:"size_human,omitempty"`
 	}
 	type jsonSummary struct {
 		Servers   []jsonServer    `json:"servers,omitempty"`
@@ -791,8 +831,12 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 			TotalEvents:    coverage.TotalEvents + coverage.ArchiveTotalRows,
 			LiveEvents:     coverage.TotalEvents,
 			ArchivedEvents: coverage.ArchiveTotalRows,
+			IndexSizeBytes: coverage.IndexSizeBytes,
 			SchemaChanges:  coverage.SchemaChanges,
 			UncoveredDDLs:  coverage.UncoveredDDLs,
+		}
+		if coverage.IndexSizeBytes > 0 {
+			jc.IndexSizeHuman = formatBytes(coverage.IndexSizeBytes)
 		}
 
 		// Effective earliest: archive may extend further back than live data.
@@ -821,6 +865,10 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 			SnapshotTime: b.SnapshotTime.Format(TSFmt),
 			Database:     b.Database,
 			Table:        b.Table,
+			Size:         b.Size,
+		}
+		if b.Size > 0 {
+			jb.SizeHuman = formatBytes(b.Size)
 		}
 		if b.BinlogFile != "" {
 			jb.BinlogFile = &b.BinlogFile
@@ -847,8 +895,8 @@ func writeBaselines(w io.Writer, baselines []BaselineInfo) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "=== Baselines ===")
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "SNAPSHOT\tDATABASE\tTABLE\tBINLOG_FILE\tBINLOG_POS\tGTID")
-	fmt.Fprintln(tw, "────────\t────────\t─────\t───────────\t──────────\t────")
+	fmt.Fprintln(tw, "SNAPSHOT\tDATABASE\tTABLE\tSIZE\tBINLOG_FILE\tBINLOG_POS\tGTID")
+	fmt.Fprintln(tw, "────────\t────────\t─────\t────\t───────────\t──────────\t────")
 	for _, b := range baselines {
 		binlogFile := "-"
 		if b.BinlogFile != "" {
@@ -862,9 +910,13 @@ func writeBaselines(w io.Writer, baselines []BaselineInfo) {
 		if b.GTIDSet != "" {
 			gtid = Truncate(b.GTIDSet, 40)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		size := "-"
+		if b.Size > 0 {
+			size = formatBytes(b.Size)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			b.SnapshotTime.Format(TSFmt),
-			b.Database, b.Table,
+			b.Database, b.Table, size,
 			binlogFile, binlogPos, gtid)
 	}
 	tw.Flush()

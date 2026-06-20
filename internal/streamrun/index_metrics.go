@@ -1,0 +1,94 @@
+package streamrun
+
+import (
+	"context"
+	"database/sql"
+	"log/slog"
+	"time"
+
+	drivermysql "github.com/go-sql-driver/mysql"
+
+	"github.com/dbtrail/dbtrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/status"
+)
+
+// defaultIndexMetricsInterval is how often the bintrail_index_* gauges are
+// refreshed from a status snapshot when no interval is configured (#351).
+const defaultIndexMetricsInterval = 60 * time.Second
+
+// startIndexMetricsScraper launches a goroutine that periodically publishes the
+// bintrail_index_* gauges (recovery floor, gap hours, storage bytes, partition
+// counts) for source, derived from a status snapshot of the index DB. It
+// returns immediately and stops when ctx is cancelled. A scrape failure is
+// logged and the previous gauge values are left in place — a slightly stale
+// reading beats a gap or a misleading zero. The work is a handful of
+// information_schema/aggregate queries on a timer, not a per-event path.
+func startIndexMetricsScraper(ctx context.Context, db *sql.DB, indexDSN, source string, intervalSeconds int) {
+	interval := time.Duration(intervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = defaultIndexMetricsInterval
+	}
+	dbName := ""
+	if c, err := drivermysql.ParseDSN(indexDSN); err == nil {
+		dbName = c.DBName
+	} else {
+		slog.Warn("index metrics scraper: could not parse index DSN for schema name; metrics disabled", "error", err)
+		return
+	}
+	m := observe.IndexForSource(source)
+	go func() {
+		// Scrape once promptly so the gauges populate without waiting a full
+		// interval, then on the ticker.
+		scrapeIndexMetrics(ctx, db, dbName, m)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				scrapeIndexMetrics(ctx, db, dbName, m)
+			}
+		}
+	}()
+}
+
+func scrapeIndexMetrics(ctx context.Context, db *sql.DB, dbName string, m *observe.IndexMetrics) {
+	data, err := status.CollectStatus(ctx, db, dbName)
+	if err != nil {
+		slog.Warn("index metrics scrape: could not collect status", "error", err)
+		return
+	}
+
+	snap := observe.IndexSnapshot{}
+	if data.Coverage != nil {
+		if data.Coverage.EarliestEvent.Valid {
+			snap.OldestEvent = data.Coverage.EarliestEvent.Time
+		}
+		if data.Coverage.LatestEvent.Valid {
+			snap.NewestEvent = data.Coverage.LatestEvent.Time
+		}
+		snap.Events = data.Coverage.TotalEvents
+		snap.MySQLBytes = data.Coverage.IndexSizeBytes
+	}
+	for _, p := range data.Parts {
+		if p.Name == "p_future" {
+			snap.FuturePartitions++
+		} else {
+			snap.ActivePartitions++
+		}
+	}
+	if data.Archives != nil {
+		snap.ParquetBytes = data.Archives.TotalSizeBytes
+	}
+	// Gap hours: hours rotated out of MySQL with no Parquet archive — holes in
+	// recovery coverage. Plan over the full range (nil since/until).
+	if plan, err := query.Plan(ctx, db, dbName, nil, nil); err != nil {
+		slog.Warn("index metrics scrape: could not plan gap hours", "error", err)
+	} else {
+		snap.GapHours = len(plan.GapHours)
+	}
+
+	m.Set(snap, time.Now())
+}

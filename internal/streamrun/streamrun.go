@@ -1105,14 +1105,17 @@ type Config struct {
 	// concurrent streams stay distinguishable on one /metrics endpoint.
 	// Empty = fall back to the resolved bintrail_id (or "default").
 	MetricsSource string
-	SSLMode       string
-	SSLCA         string
-	SSLCert       string
-	SSLKey        string
-	Format        string
-	Reset         bool
-	NoGapFill     bool
-	GapTimeout    int // seconds
+	// MetricsScrapeInterval is how often (seconds) the bintrail_index_* gauges
+	// are refreshed from a status snapshot. 0 = the 60s default.
+	MetricsScrapeInterval int
+	SSLMode               string
+	SSLCA                 string
+	SSLCert               string
+	SSLKey                string
+	Format                string
+	Reset                 bool
+	NoGapFill             bool
+	GapTimeout            int // seconds
 	// Hooks, when non-nil, lets a supervisor observe this stream's liveness
 	// without polling. Plain `bintrail stream` leaves it nil.
 	Hooks *Hooks
@@ -1549,6 +1552,15 @@ func One(ctx context.Context, cfg Config) error {
 		metricsSource = bintrailID
 	}
 	metrics := observe.ForSource(metricsSource)
+
+	// Index-state gauges (bintrail_index_*, #351): refresh periodically from a
+	// status snapshot whenever metrics are exposed — standalone --metrics-addr
+	// or under the `bintrail-console watch` supervisor (which sets MetricsSource
+	// and serves the process-global registry on its own endpoint). The scraper
+	// stops with ctx.
+	if cfg.MetricsAddr != "" || cfg.MetricsSource != "" {
+		startIndexMetricsScraper(ctx, indexDB, cfg.IndexDSN, metricsSource, cfg.MetricsScrapeInterval)
+	}
 
 	// ── 10. StreamParser + its synchronous DDL hook ──────────────────────────
 	sp := parser.NewStreamParser(resolver, filters, nil)

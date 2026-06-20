@@ -50,26 +50,27 @@ a checkpoint before exiting.`,
 }
 
 var (
-	strmIndexDSN    string
-	strmSourceDSN   string
-	strmFlavor      string
-	strmServerID    uint32
-	strmStartFile   string
-	strmStartPos    uint32
-	strmStartGTID   string
-	strmBatchSize   int
-	strmSchemas     string
-	strmTables      string
-	strmCheckpoint  int
-	strmMetricsAddr string
-	strmSSLMode     string
-	strmSSLCA       string
-	strmSSLCert     string
-	strmSSLKey      string
-	strmFormat      string
-	strmReset       bool
-	strmNoGapFill   bool
-	strmGapTimeout  int
+	strmIndexDSN              string
+	strmSourceDSN             string
+	strmFlavor                string
+	strmServerID              uint32
+	strmStartFile             string
+	strmStartPos              uint32
+	strmStartGTID             string
+	strmBatchSize             int
+	strmSchemas               string
+	strmTables                string
+	strmCheckpoint            int
+	strmMetricsAddr           string
+	strmMetricsScrapeInterval int
+	strmSSLMode               string
+	strmSSLCA                 string
+	strmSSLCert               string
+	strmSSLKey                string
+	strmFormat                string
+	strmReset                 bool
+	strmNoGapFill             bool
+	strmGapTimeout            int
 )
 
 func init() {
@@ -85,6 +86,7 @@ func init() {
 	streamCmd.Flags().StringVar(&strmTables, "tables", "", "Only index these tables (comma-separated, e.g. mydb.orders)")
 	streamCmd.Flags().IntVar(&strmCheckpoint, "checkpoint", 10, "Checkpoint interval in seconds")
 	streamCmd.Flags().StringVar(&strmMetricsAddr, "metrics-addr", "", "Address to expose Prometheus metrics (e.g. :9090); empty = disabled")
+	streamCmd.Flags().IntVar(&strmMetricsScrapeInterval, "metrics-scrape-interval", 60, "How often (seconds) to refresh the bintrail_index_* gauges from a status snapshot")
 	streamCmd.Flags().StringVar(&strmSSLMode, "ssl-mode", "preferred", "TLS mode: disabled, preferred, required, verify-ca, verify-identity")
 	streamCmd.Flags().StringVar(&strmSSLCA, "ssl-ca", "", "Path to CA certificate file for TLS verification (omit to use system CAs)")
 	streamCmd.Flags().StringVar(&strmSSLCert, "ssl-cert", "", "Path to client certificate file for mutual TLS")
@@ -107,27 +109,28 @@ func init() {
 // become values, with the host-supplied Deps attached.
 func streamConfigFromFlags() streamrun.Config {
 	return streamrun.Config{
-		IndexDSN:    strmIndexDSN,
-		SourceDSN:   strmSourceDSN,
-		Flavor:      strmFlavor,
-		ServerID:    strmServerID,
-		StartFile:   strmStartFile,
-		StartPos:    strmStartPos,
-		StartGTID:   strmStartGTID,
-		BatchSize:   strmBatchSize,
-		Schemas:     strmSchemas,
-		Tables:      strmTables,
-		Checkpoint:  strmCheckpoint,
-		MetricsAddr: strmMetricsAddr,
-		SSLMode:     strmSSLMode,
-		SSLCA:       strmSSLCA,
-		SSLCert:     strmSSLCert,
-		SSLKey:      strmSSLKey,
-		Format:      strmFormat,
-		Reset:       strmReset,
-		NoGapFill:   strmNoGapFill,
-		GapTimeout:  strmGapTimeout,
-		Deps:        streamdeps.Default(),
+		IndexDSN:              strmIndexDSN,
+		SourceDSN:             strmSourceDSN,
+		Flavor:                strmFlavor,
+		ServerID:              strmServerID,
+		StartFile:             strmStartFile,
+		StartPos:              strmStartPos,
+		StartGTID:             strmStartGTID,
+		BatchSize:             strmBatchSize,
+		Schemas:               strmSchemas,
+		Tables:                strmTables,
+		Checkpoint:            strmCheckpoint,
+		MetricsAddr:           strmMetricsAddr,
+		MetricsScrapeInterval: strmMetricsScrapeInterval,
+		SSLMode:               strmSSLMode,
+		SSLCA:                 strmSSLCA,
+		SSLCert:               strmSSLCert,
+		SSLKey:                strmSSLKey,
+		Format:                strmFormat,
+		Reset:                 strmReset,
+		NoGapFill:             strmNoGapFill,
+		GapTimeout:            strmGapTimeout,
+		Deps:                  streamdeps.Default(),
 	}
 }
 
