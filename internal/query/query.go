@@ -16,7 +16,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/event"
 )
 
 // mysqlToSecondsConst is the value of MySQL's TO_SECONDS('1970-01-01 00:00:00').
@@ -109,13 +109,13 @@ func LoadProfileRules(ctx context.Context, db *sql.DB, profile string) ([]Schema
 type Options struct {
 	Schema        string
 	Table         string
-	PKValues      string            // pipe-delimited PK, e.g. "12345" or "12345|2"
-	PKValuesIn    []string          // multi-PK lookup (mutually exclusive with PKValues)
-	EventType     *parser.EventType // nil = all types
+	PKValues      string           // pipe-delimited PK, e.g. "12345" or "12345|2"
+	PKValuesIn    []string         // multi-PK lookup (mutually exclusive with PKValues)
+	EventType     *event.EventType // nil = all types
 	GTID          string
 	Since         *time.Time
 	Until         *time.Time
-	ChangedColumn string // column name; matched via JSON_CONTAINS
+	ChangedColumn string     // column name; matched via JSON_CONTAINS
 	ColumnEq      []ColumnEq // match against values inside row_after / row_before
 	Flag          string     // return events from tables/columns carrying this flag
 	Limit         int        // 0 → no limit (no LIMIT clause emitted)
@@ -151,7 +151,7 @@ type ResultRow struct {
 	ConnectionID   *uint32 // nil for events indexed before this column was added
 	SchemaName     string
 	TableName      string
-	EventType      parser.EventType
+	EventType      event.EventType
 	PKValues       string
 	ChangedColumns []string
 	RowBefore      map[string]any // nil for INSERT
@@ -459,7 +459,7 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 			r.TableName = tableName.String
 		}
 		if eventType.Valid {
-			r.EventType = parser.EventType(eventType.Int32)
+			r.EventType = event.EventType(eventType.Int32)
 		}
 		if pkValues.Valid {
 			r.PKValues = pkValues.String
@@ -658,15 +658,15 @@ func writeCSV(rows []ResultRow, w io.Writer) (int, error) {
 
 // ─── Utility ─────────────────────────────────────────────────────────────────
 
-func eventTypeName(et parser.EventType) string {
+func eventTypeName(et event.EventType) string {
 	switch et {
-	case parser.EventInsert:
+	case event.EventInsert:
 		return "INSERT"
-	case parser.EventUpdate:
+	case event.EventUpdate:
 		return "UPDATE"
-	case parser.EventDelete:
+	case event.EventDelete:
 		return "DELETE"
-	case parser.EventSnapshot:
+	case event.EventSnapshot:
 		return "SNAPSHOT"
 	default:
 		return "UNKNOWN"

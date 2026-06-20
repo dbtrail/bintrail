@@ -17,9 +17,9 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
-	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -418,7 +418,7 @@ func wrapFetchError(qType QueryType, err error) error {
 //   - q.PKColumn == "": full-table reconstruction (issue #276).
 //     Dispatches to runFullTable.
 //
-// Dispatch is on PKColumn, not PKValue, so a literal `WHERE id = ''`
+// Dispatch is on PKColumn, not PKValue, so a literal `WHERE id = ”`
 // (legitimate against a NOT-NULL VARCHAR column) stays a single-row
 // point-lookup instead of silently flipping to a 100k-row table scan.
 //
@@ -652,7 +652,7 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 func extractFullTableImages(rows []query.ResultRow) []map[string]any {
 	images := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
-		if r.EventType == parser.EventDelete {
+		if r.EventType == event.EventDelete {
 			continue
 		}
 		// Empty row_after (rare — corrupted index) is dropped silently
@@ -1013,7 +1013,7 @@ func selectImage(rows []query.ResultRow) map[string]any {
 		return nil
 	}
 	latest := rows[0]
-	if latest.EventType == parser.EventDelete {
+	if latest.EventType == event.EventDelete {
 		return nil
 	}
 	if len(latest.RowAfter) > 0 {
@@ -1095,16 +1095,16 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 	return &mysql.Result{Resultset: rs}, nil
 }
 
-// eventTypeName turns parser.EventType (a uint8) into a human-readable
+// eventTypeName turns event.EventType (a uint8) into a human-readable
 // string for the _diff resultset. The parser package does not export a
 // String() method so this lookup lives here.
-func eventTypeName(t parser.EventType) string {
+func eventTypeName(t event.EventType) string {
 	switch t {
-	case parser.EventInsert:
+	case event.EventInsert:
 		return "INSERT"
-	case parser.EventUpdate:
+	case event.EventUpdate:
 		return "UPDATE"
-	case parser.EventDelete:
+	case event.EventDelete:
 		return "DELETE"
 	}
 	return fmt.Sprintf("type_%d", t)
@@ -1185,6 +1185,7 @@ func marshalImageOrdered(image map[string]any, ddlOrder []string) string {
 //     identical bytes because both route through FormatTextValue (a raw
 //     json.Number literal would diverge, e.g. "1e+21" vs "1000…0"). FLOAT(32-bit)
 //     is the known exception — see runSnapshotFullTable.
+//
 // The exact numeric type is recovered first so a BIGINT UNSIGNED > 2^63 stays
 // exact (int64 → uint64 → float64), falling back to the literal text.
 func numberToText(n json.Number) []byte {
@@ -1355,4 +1356,3 @@ func isHandshakeNoise(q string) bool {
 	}
 	return false
 }
-

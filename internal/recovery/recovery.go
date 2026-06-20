@@ -18,16 +18,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
-	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // Generator produces reversal SQL from indexed binlog events.
 type Generator struct {
 	db       *sql.DB
-	resolver *metadata.Resolver              // default resolver (latest snapshot); may be nil
-	cache    map[uint32]*metadata.Resolver   // per-snapshot resolvers, loaded lazily
+	resolver *metadata.Resolver            // default resolver (latest snapshot); may be nil
+	cache    map[uint32]*metadata.Resolver // per-snapshot resolvers, loaded lazily
 }
 
 // New creates a Generator. resolver may be nil — in that case, WHERE clauses
@@ -137,13 +137,13 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 
 func (g *Generator) generateStatement(row query.ResultRow) (string, error) {
 	switch row.EventType {
-	case parser.EventDelete:
+	case event.EventDelete:
 		return g.generateInsert(row) // DELETE → INSERT (restore the deleted row)
-	case parser.EventUpdate:
+	case event.EventUpdate:
 		return g.generateUpdate(row) // UPDATE → reverse UPDATE (restore before state)
-	case parser.EventInsert:
+	case event.EventInsert:
 		return g.generateDelete(row) // INSERT → DELETE (remove the inserted row)
-	case parser.EventSnapshot:
+	case event.EventSnapshot:
 		// Snapshot rows are read-only baseline state, not change events, so
 		// reversal SQL is undefined for them. Reject with a clear message
 		// instead of falling through to the generic "unknown event type"
@@ -409,13 +409,13 @@ func sortedKeys(m map[string]any) []string {
 	return keys
 }
 
-func eventTypeName(et parser.EventType) string {
+func eventTypeName(et event.EventType) string {
 	switch et {
-	case parser.EventInsert:
+	case event.EventInsert:
 		return "INSERT"
-	case parser.EventUpdate:
+	case event.EventUpdate:
 		return "UPDATE"
-	case parser.EventDelete:
+	case event.EventDelete:
 		return "DELETE"
 	default:
 		return "UNKNOWN"

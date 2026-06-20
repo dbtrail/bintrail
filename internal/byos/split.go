@@ -20,7 +20,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/event"
 )
 
 // SourceIdentity describes the source MySQL server that produced an event.
@@ -96,14 +96,14 @@ func PKHash(pkValues string) string {
 //
 // Returns an error for unsupported event types (DDL, GTID, commit boundaries).
 // Callers should filter these before calling SplitEvent.
-func SplitEvent(ev parser.Event, serverID string, ident SourceIdentity) (MetadataRecord, PayloadRecord, error) {
+func SplitEvent(ev event.Event, serverID string, ident SourceIdentity) (MetadataRecord, PayloadRecord, error) {
 	typeName, err := eventTypeName(ev.EventType)
 	if err != nil {
 		return MetadataRecord{}, PayloadRecord{}, err
 	}
 
 	hash := PKHash(ev.PKValues)
-	changed := parser.ChangedColumns(ev.RowBefore, ev.RowAfter)
+	changed := event.ChangedColumns(ev.RowBefore, ev.RowAfter)
 
 	meta := MetadataRecord{
 		PKHash:         hash,
@@ -138,16 +138,16 @@ func SplitEvent(ev parser.Event, serverID string, ident SourceIdentity) (Metadat
 	return meta, payload, nil
 }
 
-// eventTypeName converts a parser.EventType to the string representation
+// eventTypeName converts a event.EventType to the string representation
 // used in metadata and payload records. Returns an error for unsupported
 // event types (DDL, GTID, etc.).
-func eventTypeName(et parser.EventType) (string, error) {
+func eventTypeName(et event.EventType) (string, error) {
 	switch et {
-	case parser.EventInsert:
+	case event.EventInsert:
 		return "INSERT", nil
-	case parser.EventUpdate:
+	case event.EventUpdate:
 		return "UPDATE", nil
-	case parser.EventDelete:
+	case event.EventDelete:
 		return "DELETE", nil
 	default:
 		return "", fmt.Errorf("unsupported event type %d for BYOS split", et)

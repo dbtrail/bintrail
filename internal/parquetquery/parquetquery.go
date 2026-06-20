@@ -24,7 +24,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
-	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -1027,7 +1027,7 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 			EventTimestamp: eventTimestamp.Time,
 			SchemaName:     schemaName.String,
 			TableName:      tableName.String,
-			EventType:      parser.EventType(eventType.Int32),
+			EventType:      event.EventType(eventType.Int32),
 			PKValues:       pkValues.String,
 			SchemaVersion:  uint32(schemaVersion.Int32),
 		}

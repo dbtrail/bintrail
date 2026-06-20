@@ -8,88 +8,42 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"reflect"
 	"regexp"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // ─── Event types ─────────────────────────────────────────────────────────────
 
-// EventType represents the type of operation captured by a binlog event (DML or DDL).
-type EventType uint8
+// EventType is the source-agnostic event-type, moved to internal/event (#528).
+// Aliased here so the capture layer and existing callers keep using parser.EventType.
+type EventType = event.EventType
 
 const (
-	EventInsert EventType = 1
-	EventUpdate EventType = 2
-	EventDelete EventType = 3
-	EventDDL    EventType = 4
-	EventGTID   EventType = 5 // GTID-only tracking event (no row data)
-	// EventSnapshot is a synthetic event type emitted by query --include-snapshot
-	// for rows read from a mydumper baseline Parquet file. The parser never
-	// produces this type — it exists so baseline rows can flow through the
-	// same ResultRow pipeline as real binlog events.
-	EventSnapshot EventType = 6
-	// EventCommit marks a transaction commit boundary, emitted by the StreamParser
-	// at an XID_EVENT (InnoDB DML) and — as a catch-all when the next transaction's
-	// GTID_EVENT arrives — for transactions that carry a GTID but emit no XID and
-	// aren't table DDL: implicitly-committed DDL/DCL (GRANT, CREATE DATABASE,
-	// CREATE INDEX, ANALYZE TABLE, ...) and no-XID explicit terminators (XA COMMIT;
-	// a COMMIT of a non-transactional transaction — a normal InnoDB COMMIT ends in
-	// an XID_EVENT instead). It carries no row data, only the committed
-	// transaction's GTID. The consumer advances the durable GTID checkpoint ONLY on
-	// this event (and on EventDDL), never on the leading EventGTID, so a checkpoint
-	// can never claim a half-streamed transaction (#491). The file parser does not
-	// produce it.
-	EventCommit EventType = 7
+	EventInsert   = event.EventInsert
+	EventUpdate   = event.EventUpdate
+	EventDelete   = event.EventDelete
+	EventDDL      = event.EventDDL
+	EventGTID     = event.EventGTID
+	EventSnapshot = event.EventSnapshot
+	EventCommit   = event.EventCommit
 )
 
-// Event is a fully resolved binlog row event with column names attached.
-// It carries everything the indexer needs to write one row to binlog_events.
-// DDL events (EventType=4) carry DDLQuery and DDLType instead of row data.
-type Event struct {
-	BinlogFile    string
-	StartPos      uint64
-	EndPos        uint64
-	Timestamp     time.Time
-	GTID          string // empty when GTID is not enabled on the source
-	ConnectionID  uint32 // MySQL pseudo_thread_id from the transaction's QUERY(BEGIN) event; 0 = unknown
-	Schema        string
-	Table         string
-	EventType     EventType
-	PKValues      string         // pipe-delimited PK values in ordinal order
-	RowBefore     map[string]any // nil for INSERT
-	RowAfter      map[string]any // nil for DELETE
-	SchemaVersion uint32         // actual snapshot_id from schema_snapshots; updated by SwapResolver on DDL
-	DDLQuery      string         // original DDL statement (EventDDL only)
-	DDLType       DDLKind        // ALTER TABLE, CREATE TABLE, DROP TABLE, RENAME TABLE, TRUNCATE TABLE (EventDDL only)
-}
+// Event is the source-agnostic change event, moved to internal/event (#528).
+// Aliased here so the binlog parser and existing callers keep using parser.Event.
+type Event = event.Event
 
 // ─── Filters ─────────────────────────────────────────────────────────────────
 
-// Filters controls which schemas and tables produce events.
-// A nil map means "accept all" for that dimension.
-type Filters struct {
-	Schemas map[string]bool // keyed by schema name
-	Tables  map[string]bool // keyed by "schema.table"
-}
-
-// Matches returns true when the schema+table passes both filter dimensions.
-func (f *Filters) Matches(schema, table string) bool {
-	if f.Schemas != nil && !f.Schemas[schema] {
-		return false
-	}
-	if f.Tables != nil && !f.Tables[schema+"."+table] {
-		return false
-	}
-	return true
-}
+// Filters is the source-agnostic schema/table filter, moved to internal/event
+// (#528). Aliased here so the parser and existing callers keep using parser.Filters.
+type Filters = event.Filters
 
 // ─── Parser ──────────────────────────────────────────────────────────────────
 
@@ -484,31 +438,14 @@ func emitUpdates(
 // Pipe (|) and backslash (\) inside values are escaped to prevent ambiguity.
 // pkColumns must be in ordinal_position order (as returned by TableMeta.PKColumnMetas).
 func BuildPKValues(pkColumns []metadata.ColumnMeta, row map[string]any) string {
-	parts := make([]string, 0, len(pkColumns))
-	for _, col := range pkColumns {
-		val := fmt.Sprintf("%v", row[col.Name])
-		val = strings.ReplaceAll(val, `\`, `\\`)
-		val = strings.ReplaceAll(val, `|`, `\|`)
-		parts = append(parts, val)
-	}
-	return strings.Join(parts, "|")
+	return event.BuildPKValues(pkColumns, row)
 }
 
 // ChangedColumns returns the sorted list of column names whose values differ
 // between before and after images. Returns nil for INSERT/DELETE events where
 // one image is nil.
 func ChangedColumns(before, after map[string]any) []string {
-	if before == nil || after == nil {
-		return nil
-	}
-	var changed []string
-	for key := range before {
-		if !reflect.DeepEqual(before[key], after[key]) {
-			changed = append(changed, key)
-		}
-	}
-	sort.Strings(changed)
-	return changed
+	return event.ChangedColumns(before, after)
 }
 
 // formatGTID formats a MySQL GTID from the raw 16-byte server UUID (SID) and
@@ -523,15 +460,16 @@ func formatGTID(sid []byte, gno int64) string {
 		sid[0:4], sid[4:6], sid[6:8], sid[8:10], sid[10:16], gno)
 }
 
-// DDLKind identifies the type of DDL statement detected in a binlog QUERY_EVENT.
-type DDLKind string
+// DDLKind is the source-agnostic DDL-kind, moved to internal/event (#528).
+// Aliased here so the parser and existing callers keep using parser.DDLKind.
+type DDLKind = event.DDLKind
 
 const (
-	DDLAlterTable    DDLKind = "ALTER TABLE"
-	DDLCreateTable   DDLKind = "CREATE TABLE"
-	DDLDropTable     DDLKind = "DROP TABLE"
-	DDLRenameTable   DDLKind = "RENAME TABLE"
-	DDLTruncateTable DDLKind = "TRUNCATE TABLE"
+	DDLAlterTable    = event.DDLAlterTable
+	DDLCreateTable   = event.DDLCreateTable
+	DDLDropTable     = event.DDLDropTable
+	DDLRenameTable   = event.DDLRenameTable
+	DDLTruncateTable = event.DDLTruncateTable
 )
 
 // ddlTableRe extracts the schema and table name from DDL statements.

@@ -9,26 +9,26 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/event"
 )
 
-// ParseEventType converts an event-type string to a *parser.EventType.
+// ParseEventType converts an event-type string to a *event.EventType.
 // Returns nil for an empty string (meaning "all types").
-func ParseEventType(s string) (*parser.EventType, error) {
+func ParseEventType(s string) (*event.EventType, error) {
 	switch strings.ToUpper(s) {
 	case "":
 		return nil, nil
 	case "INSERT":
-		et := parser.EventInsert
+		et := event.EventInsert
 		return &et, nil
 	case "UPDATE":
-		et := parser.EventUpdate
+		et := event.EventUpdate
 		return &et, nil
 	case "DELETE":
-		et := parser.EventDelete
+		et := event.EventDelete
 		return &et, nil
 	case "SNAPSHOT":
-		et := parser.EventSnapshot
+		et := event.EventSnapshot
 		return &et, nil
 	default:
 		return nil, fmt.Errorf("invalid event type %q; must be INSERT, UPDATE, DELETE, or SNAPSHOT", s)
@@ -99,10 +99,10 @@ func ParseSchemaList(s string) []string {
 	return result
 }
 
-// BuildIndexFilters builds a parser.Filters from comma-separated schema and
+// BuildIndexFilters builds a event.Filters from comma-separated schema and
 // table flag values.
-func BuildIndexFilters(schemas, tables string) parser.Filters {
-	var f parser.Filters
+func BuildIndexFilters(schemas, tables string) event.Filters {
+	var f event.Filters
 	if schemas != "" {
 		f.Schemas = make(map[string]bool)
 		for s := range strings.SplitSeq(schemas, ",") {

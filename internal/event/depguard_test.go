@@ -1,0 +1,46 @@
+package event_test
+
+import (
+	"os/exec"
+	"strings"
+	"testing"
+)
+
+// TestReadLayerDoesNotLinkGoMySQL is the #528 guard: the read/recover/reconstruct
+// value stack consumes the source-agnostic event.Event, so it must NOT link the
+// go-mysql binlog library. A future change that re-imports internal/parser (which
+// pulls go-mysql) into any of these packages — directly or transitively — fails
+// here. This keeps the index/query/recover side swappable across MySQL and
+// PostgreSQL sources.
+//
+// internal/shim is deliberately NOT listed: it links go-mysql for its MySQL
+// wire-protocol server (go-mysql/server), which is its own dependency, unrelated
+// to the Event type. internal/parser and internal/streamrun are the capture layer
+// and legitimately link go-mysql.
+func TestReadLayerDoesNotLinkGoMySQL(t *testing.T) {
+	const banned = "github.com/go-mysql-org/go-mysql"
+	readPkgs := []string{
+		"github.com/dbtrail/dbtrail/internal/event",
+		"github.com/dbtrail/dbtrail/internal/indexer",
+		"github.com/dbtrail/dbtrail/internal/query",
+		"github.com/dbtrail/dbtrail/internal/recovery",
+		"github.com/dbtrail/dbtrail/internal/reconstruct",
+		"github.com/dbtrail/dbtrail/internal/parquetquery",
+		"github.com/dbtrail/dbtrail/internal/buffer",
+		"github.com/dbtrail/dbtrail/internal/byos",
+		"github.com/dbtrail/dbtrail/internal/cliutil",
+		"github.com/dbtrail/dbtrail/internal/console",
+	}
+	for _, pkg := range readPkgs {
+		out, err := exec.Command("go", "list", "-deps", pkg).CombinedOutput()
+		if err != nil {
+			t.Fatalf("go list -deps %s: %v\n%s", pkg, err, out)
+		}
+		for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+			dep := strings.TrimSpace(line)
+			if dep == banned || strings.HasPrefix(dep, banned+"/") {
+				t.Errorf("%s transitively links %s — the read layer must consume event.Event, not go-mysql", pkg, dep)
+			}
+		}
+	}
+}

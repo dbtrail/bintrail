@@ -20,7 +20,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 
-	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/event"
 )
 
 // snapshotEventIDBase is OR'd with the row index to synthesise a ResultRow
@@ -122,7 +122,7 @@ func FetchSnapshot(ctx context.Context, path string, opts Options) ([]ResultRow,
 			EventTimestamp: ts,
 			SchemaName:     opts.Schema,
 			TableName:      opts.Table,
-			EventType:      parser.EventSnapshot,
+			EventType:      event.EventSnapshot,
 			RowAfter:       rowAfter,
 		})
 		idx++
@@ -142,7 +142,7 @@ func FetchSnapshot(ctx context.Context, path string, opts Options) ([]ResultRow,
 // Returns (reason, true) when the source must be skipped, with a
 // human-readable reason for the slog message. Returns ("", false) otherwise.
 func shouldSkipSnapshot(opts Options) (string, bool) {
-	if opts.EventType != nil && *opts.EventType != parser.EventSnapshot {
+	if opts.EventType != nil && *opts.EventType != event.EventSnapshot {
 		return "--event-type ≠ SNAPSHOT", true
 	}
 	if opts.GTID != "" {

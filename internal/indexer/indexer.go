@@ -12,15 +12,15 @@ import (
 
 	mysql "github.com/go-sql-driver/mysql"
 
-	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/event"
 )
 
-// Indexer consumes parser.Events from a channel and batch-inserts them into
+// Indexer consumes event.Events from a channel and batch-inserts them into
 // the binlog_events table.
 type Indexer struct {
 	db        *sql.DB
 	batchSize int
-	onDDL     func(ev parser.Event) error
+	onDDL     func(ev event.Event) error
 }
 
 // New creates an Indexer writing to db with the given batch size.
@@ -34,14 +34,14 @@ func New(db *sql.DB, batchSize int) *Indexer {
 // SetOnDDL registers a callback invoked when a DDL event is received.
 // The current batch is flushed before the callback is called.
 // DDL events are NOT inserted into binlog_events.
-func (idx *Indexer) SetOnDDL(fn func(parser.Event) error) {
+func (idx *Indexer) SetOnDDL(fn func(event.Event) error) {
 	idx.onDDL = fn
 }
 
 // Run reads events from the channel until it is closed or ctx is cancelled,
 // flushing to MySQL in batches. Returns the total number of rows inserted.
-func (idx *Indexer) Run(ctx context.Context, events <-chan parser.Event) (int64, error) {
-	batch := make([]parser.Event, 0, idx.batchSize)
+func (idx *Indexer) Run(ctx context.Context, events <-chan event.Event) (int64, error) {
+	batch := make([]event.Event, 0, idx.batchSize)
 	var total int64
 
 	flush := func() error {
@@ -67,7 +67,7 @@ func (idx *Indexer) Run(ctx context.Context, events <-chan parser.Event) (int64,
 				return total, flush()
 			}
 			// DDL events: flush current batch, invoke callback, skip insertion.
-			if ev.EventType == parser.EventDDL {
+			if ev.EventType == event.EventDDL {
 				if err := flush(); err != nil {
 					return total, err
 				}
@@ -91,7 +91,7 @@ func (idx *Indexer) Run(ctx context.Context, events <-chan parser.Event) (int64,
 // InsertBatch writes a batch of events and returns the count of rows inserted.
 // This exported method allows callers (e.g. the stream command) that need
 // manual checkpoint control between batches.
-func (idx *Indexer) InsertBatch(batch []parser.Event) (int64, error) {
+func (idx *Indexer) InsertBatch(batch []event.Event) (int64, error) {
 	return idx.insertBatch(batch)
 }
 
@@ -103,7 +103,7 @@ func (idx *Indexer) BatchSize() int {
 // insertBatch writes a batch of events in a single multi-row INSERT.
 // event_id and pk_hash are omitted — they are AUTO_INCREMENT and STORED
 // generated respectively, so MySQL computes them on write.
-func (idx *Indexer) insertBatch(batch []parser.Event) (int64, error) {
+func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 	// 14 placeholders per row
 	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
 	insertSQL := `INSERT INTO binlog_events ` +
@@ -115,7 +115,7 @@ func (idx *Indexer) insertBatch(batch []parser.Event) (int64, error) {
 	for i := range batch {
 		ev := &batch[i]
 
-		changed, err := marshalJSON(parser.ChangedColumns(ev.RowBefore, ev.RowAfter))
+		changed, err := marshalJSON(event.ChangedColumns(ev.RowBefore, ev.RowAfter))
 		if err != nil {
 			return 0, fmt.Errorf("marshal changed_columns for %s.%s: %w", ev.Schema, ev.Table, err)
 		}
@@ -245,7 +245,7 @@ func EnsureSchema(db *sql.DB) error {
 		return err
 	}
 	// flavor records the source database flavor (mysql/mariadb) so a resume
-	// parses the saved gtid_set with the correct GTID parser. NOT NULL DEFAULT
+	// parses the saved gtid_set with the correct GTID event. NOT NULL DEFAULT
 	// 'mysql' means existing rows read back as mysql with no data migration,
 	// keeping every pre-MariaDB install unchanged.
 	return ensureColumn(db, "stream_state", "flavor",
@@ -307,7 +307,7 @@ func ensureColumn(db *sql.DB, table, column, alterSQL string) error {
 
 // InsertSchemaChange records a DDL detection in the schema_changes table.
 // snapshotID may be nil when no auto-snapshot was taken (file mode).
-func InsertSchemaChange(db *sql.DB, ev parser.Event, snapshotID *int) error {
+func InsertSchemaChange(db *sql.DB, ev event.Event, snapshotID *int) error {
 	var snapArg any
 	if snapshotID != nil {
 		snapArg = *snapshotID

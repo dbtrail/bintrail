@@ -18,7 +18,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -287,11 +287,11 @@ func WriteSQLResultsCSV(rows []map[string]any, cols []string, w io.Writer) error
 
 func applyEvent(state map[string]any, ev query.ResultRow) map[string]any {
 	switch ev.EventType {
-	case parser.EventInsert:
+	case event.EventInsert:
 		return copyMap(ev.RowAfter)
-	case parser.EventUpdate:
+	case event.EventUpdate:
 		return copyMap(ev.RowAfter)
-	case parser.EventDelete:
+	case event.EventDelete:
 		return nil
 	case 0:
 		// EventType==0 is the zero value, produced by the defensive
@@ -321,13 +321,13 @@ func copyMap(m map[string]any) map[string]any {
 	return out
 }
 
-func eventTypeName(et parser.EventType) string {
+func eventTypeName(et event.EventType) string {
 	switch et {
-	case parser.EventInsert:
+	case event.EventInsert:
 		return "INSERT"
-	case parser.EventUpdate:
+	case event.EventUpdate:
 		return "UPDATE"
-	case parser.EventDelete:
+	case event.EventDelete:
 		return "DELETE"
 	default:
 		return "UNKNOWN"

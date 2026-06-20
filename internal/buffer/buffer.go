@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -25,8 +25,8 @@ const idOffset = uint64(1) << 32
 
 // entry is a single event stored in the buffer.
 type entry struct {
-	row       query.ResultRow
-	pkHash    string // SHA-256 hex of pk_values
+	row        query.ResultRow
+	pkHash     string // SHA-256 hex of pk_values
 	approxSize int64  // estimated heap bytes
 }
 
@@ -73,7 +73,7 @@ func New(cfg Config) *Buffer {
 }
 
 // Insert converts parser events to result rows and appends them to the buffer.
-func (b *Buffer) Insert(events []parser.Event) {
+func (b *Buffer) Insert(events []event.Event) {
 	if len(events) == 0 {
 		return
 	}
@@ -105,7 +105,7 @@ func (b *Buffer) Insert(events []parser.Event) {
 			TableName:      ev.Table,
 			EventType:      ev.EventType,
 			PKValues:       ev.PKValues,
-			ChangedColumns: parser.ChangedColumns(ev.RowBefore, ev.RowAfter),
+			ChangedColumns: event.ChangedColumns(ev.RowBefore, ev.RowAfter),
 			RowBefore:      ev.RowBefore,
 			RowAfter:       ev.RowAfter,
 			SchemaVersion:  ev.SchemaVersion,

@@ -1,7 +1,7 @@
 package console
 
 import (
-	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -66,17 +66,17 @@ func toEventDTOs(rows []query.ResultRow) []eventDTO {
 	return out
 }
 
-// eventTypeName renders a parser.EventType as its canonical SQL keyword,
+// eventTypeName renders a event.EventType as its canonical SQL keyword,
 // matching the strings used elsewhere in the codebase (query, recovery).
-func eventTypeName(et parser.EventType) string {
+func eventTypeName(et event.EventType) string {
 	switch et {
-	case parser.EventInsert:
+	case event.EventInsert:
 		return "INSERT"
-	case parser.EventUpdate:
+	case event.EventUpdate:
 		return "UPDATE"
-	case parser.EventDelete:
+	case event.EventDelete:
 		return "DELETE"
-	case parser.EventSnapshot:
+	case event.EventSnapshot:
 		return "SNAPSHOT"
 	default:
 		return "UNKNOWN"

@@ -20,10 +20,10 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
-	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -49,7 +49,7 @@ import (
 //
 // PK columns with any other type (FLOAT, DOUBLE, BINARY, VARBINARY, BLOB,
 // BIT, JSON, spatial types) are rejected at ReconstructTable entry with a
-// hard error. Fixing those types requires modifying parser.BuildPKValues
+// hard error. Fixing those types requires modifying event.BuildPKValues
 // or internal/baseline/reader_sql.go — both are non-additive changes to
 // data already on disk — so they're deferred behind separate follow-up
 // issues.
@@ -145,7 +145,7 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	}
 
 	// Load schema resolver once (latest snapshot). All PK encoding goes
-	// through parser.BuildPKValues with the resolver's ColumnMetas so the
+	// through event.BuildPKValues with the resolver's ColumnMetas so the
 	// keys are byte-identical to what the indexer stored in pk_values.
 	resolver, err := metadata.NewResolver(db, 0)
 	if err != nil {
@@ -595,15 +595,15 @@ func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string
 		if err != nil {
 			return stats, fmt.Errorf("canonicalize baseline PK for %s.%s: %w", in.Schema, in.Table, err)
 		}
-		pk := parser.BuildPKValues(in.PKCols, pkMap)
+		pk := event.BuildPKValues(in.PKCols, pkMap)
 
 		if ev, ok := in.Changes[pk]; ok {
 			delete(in.Changes, pk)
 			switch ev.EventType {
-			case parser.EventDelete:
+			case event.EventDelete:
 				stats.DeletesSkipped++
 				continue
-			case parser.EventUpdate, parser.EventInsert:
+			case event.EventUpdate, event.EventInsert:
 				// Defensive: a non-DELETE event with nil RowAfter would
 				// otherwise emit an all-NULL tuple. This indicates a
 				// corrupt event or parser bug, not a normal code path.
@@ -639,7 +639,7 @@ func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string
 	sort.Strings(newPKs)
 	for _, pk := range newPKs {
 		ev := in.Changes[pk]
-		if ev.EventType == parser.EventDelete {
+		if ev.EventType == event.EventDelete {
 			continue
 		}
 		if ev.RowAfter == nil {
