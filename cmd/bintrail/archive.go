@@ -169,22 +169,10 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 		// including objects --deep was asked to verify but couldn't (#469).
 		return reconcileDryRunErr(&report, deepUnverified)
 	}
-	// Execute mode: exit 0 ⟺ no unaddressed drift remains. EVERY action
-	// this invocation's flags didn't execute counts — --prune without
-	// --repair must not silently mask insert/update drift the dry-run
-	// would have flagged (and vice versa).
-	pendingRepairs, pendingPrunes := 0, 0
-	if !arcRepair {
-		pendingRepairs = report.Inserts + report.Updates
-	}
-	if !arcPrune {
-		pendingPrunes = report.Prunes
-	}
-	if pendingRepairs+pendingPrunes+report.SkippedUnverified+report.SkippedRecent > 0 {
-		return fmt.Errorf("drift remains: %d insert/update(s) (need --repair), %d prune candidate(s) (need --prune), %d unverified, %d too recent",
-			pendingRepairs, pendingPrunes, report.SkippedUnverified, report.SkippedRecent)
-	}
-	return nil
+	// Execute mode: same #469 contract, distinct drift rule (unaddressed
+	// drift, not all drift). The shared helper guarantees deepUnverified is
+	// checked on BOTH the dry-run and execute paths — never dropped on one.
+	return reconcileExecuteErr(&report, deepUnverified, arcRepair, arcPrune)
 }
 
 // scanLocalArchive walks root for Hive-layout parquet files. Footer row
@@ -433,6 +421,37 @@ func applyUpsert(ctx context.Context, db *sql.DB, a archive.Action) error {
 func reconcileDryRunErr(rep *archive.Report, deepUnverified int) error {
 	if err := rep.Err(); err != nil {
 		return err
+	}
+	if deepUnverified > 0 {
+		return fmt.Errorf("%d file(s) could not be deep-verified (Parquet footer probe failed)", deepUnverified)
+	}
+	return nil
+}
+
+// reconcileExecuteErr is the execute-mode (--repair/--prune) exit decision,
+// the sibling of reconcileDryRunErr. Exit 0 ⟺ no UNADDRESSED drift remains:
+// EVERY action this invocation's flags didn't execute counts — --prune
+// without --repair must not silently mask insert/update drift the dry-run
+// would have flagged (and vice versa). The deepUnverified guard mirrors the
+// dry-run path (#469): --deep/--repair/--prune are independent flags, so
+// `reconcile --deep --repair` is exercisable, and --repair cannot fix a
+// footer it cannot read — a failed deep probe is unaddressed drift that must
+// fail the exit code, or a scheduled --deep --repair auto-remediation keyed
+// on the exit code reintroduces the green-run-hides-unverifiable-files bug.
+// (The drift rule differs from the dry-run's rep.Err(): dry-run fails on ALL
+// drift, execute only on what its flags left unaddressed — so this stays a
+// sibling, not a single shared helper.)
+func reconcileExecuteErr(rep *archive.Report, deepUnverified int, repair, prune bool) error {
+	pendingRepairs, pendingPrunes := 0, 0
+	if !repair {
+		pendingRepairs = rep.Inserts + rep.Updates
+	}
+	if !prune {
+		pendingPrunes = rep.Prunes
+	}
+	if pendingRepairs+pendingPrunes+rep.SkippedUnverified+rep.SkippedRecent > 0 {
+		return fmt.Errorf("drift remains: %d insert/update(s) (need --repair), %d prune candidate(s) (need --prune), %d unverified, %d too recent",
+			pendingRepairs, pendingPrunes, rep.SkippedUnverified, rep.SkippedRecent)
 	}
 	if deepUnverified > 0 {
 		return fmt.Errorf("%d file(s) could not be deep-verified (Parquet footer probe failed)", deepUnverified)

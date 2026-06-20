@@ -30,6 +30,37 @@ func TestReconcileDryRunErrFlagsDeepUnverified(t *testing.T) {
 	}
 }
 
+// TestReconcileExecuteErrFlagsDeepUnverified is the execute-mode (--repair/
+// --prune) sibling of the dry-run test: --deep/--repair/--prune are
+// independent flags, so a `reconcile --deep --repair` run with no remaining
+// drift but failed footer probes must STILL exit non-zero — --repair cannot
+// fix a footer it cannot read, and a scheduled auto-remediation keys on the
+// exit code. Without the shared deepUnverified guard this path returned nil
+// (silent exit 0), reintroducing #469 in execute mode.
+func TestReconcileExecuteErrFlagsDeepUnverified(t *testing.T) {
+	// Zero unaddressed drift (in sync, no pending actions), --repair --prune.
+	rep := &archive.Report{InSync: 3}
+
+	if err := reconcileExecuteErr(rep, 0, true, true); err != nil {
+		t.Fatalf("clean report with no footer failures should exit zero, got: %v", err)
+	}
+
+	err := reconcileExecuteErr(rep, 2, true, true)
+	if err == nil {
+		t.Fatal("execute mode must exit non-zero when --deep footer probes failed, got nil")
+	}
+	if !strings.Contains(err.Error(), "could not be deep-verified") {
+		t.Fatalf("error must name the deep-verify failure, got: %v", err)
+	}
+
+	// The pre-existing drift rule is preserved: unaddressed drift still wins,
+	// and a deep failure alongside it never lets the run exit 0.
+	drifted := &archive.Report{Inserts: 1}
+	if err := reconcileExecuteErr(drifted, 0, false, false); err == nil {
+		t.Fatal("pending insert without --repair must exit non-zero")
+	}
+}
+
 // TestReconcileReportJSONIncludesDeepUnverified pins #469: the footer-probe
 // failure count appears in --format json so a cron consumer can see it.
 func TestReconcileReportJSONIncludesDeepUnverified(t *testing.T) {

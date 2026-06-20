@@ -314,6 +314,33 @@ func TestDiffDeepUnverified(t *testing.T) {
 			t.Fatalf("DeepUnverified must stay zero without --deep, got %+v", rep)
 		}
 	})
+
+	// Over-count guard (pins the historical regression of the old per-probe
+	// counter, which counted once per BACKEND probe rather than once per key).
+	t.Run("dual-backend prefer-local: local VALID + S3 no-count → NOT counted", func(t *testing.T) {
+		// pickMeta PREFERS local; its footer read fine → picked count valid →
+		// genuinely deep-verified, even though the S3 footer was never read.
+		// A per-backend counter would (wrongly) count the unread S3 probe.
+		rep := Diff([]ScannedFile{
+			localFile(part, id, "/a/x.parquet", 100, 42),
+			s3NoCount("bkt", "k/events.parquet", 100),
+		}, inSyncRow(42), deep)
+		if rep.DeepUnverified != 0 {
+			t.Fatalf("local-valid pair must not be counted (pickMeta prefers local), got %+v", rep)
+		}
+	})
+
+	t.Run("dual-backend both no-count → counted ONCE per key, not per backend", func(t *testing.T) {
+		// Both footers failed for the SAME (partition, bintrail_id) → one pair →
+		// counted exactly once. A per-backend counter would inflate this to 2.
+		rep := Diff([]ScannedFile{
+			localNoCount("/a/x.parquet", 100),
+			s3NoCount("bkt", "k/events.parquet", 100),
+		}, inSyncRow(42), deep)
+		if rep.DeepUnverified != 1 {
+			t.Fatalf("both-failed pair must be counted once per key (not per backend), got %+v", rep)
+		}
+	})
 }
 
 // TestDiffDeterministicOrder: actions sort by (partition, bintrail_id).

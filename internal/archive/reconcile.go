@@ -210,6 +210,11 @@ func Diff(files []ScannedFile, rows []StateRow, opts DiffOptions) Report {
 		p := scanned[k]
 		row, exists := stateByKey[k]
 		if !exists {
+			// A footer-failed INSERT under --deep is surfaced via report.Inserts
+			// (drift → non-zero exit), NOT DeepUnverified — the row is missing
+			// entirely, so it's already unaddressed drift; the deep-unverified
+			// accounting below is only for EXISTING rows whose row_count check
+			// would otherwise be silently skipped. This placement is intentional.
 			report.add(insertAction(k, p.local, p.s3))
 			continue
 		}
