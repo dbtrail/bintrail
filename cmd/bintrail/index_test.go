@@ -37,6 +37,7 @@ func TestIndexCmd_requiredFlags(t *testing.T) {
 func TestIndexCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"index-dsn", "source-dsn", "binlog-dir", "files", "all", "batch-size", "schemas", "tables",
+		"skip-source-validation",
 	} {
 		if indexCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on indexCmd", name)
@@ -105,6 +106,45 @@ func TestRunIndex_filesSetPassesFirstGuard(t *testing.T) {
 	err := runIndex(indexCmd, nil) // fails later at config.Connect
 	if err != nil && strings.Contains(err.Error(), "--files or --all") {
 		t.Errorf("first guard should not fire when --files is set, got: %v", err)
+	}
+}
+
+// TestRunIndex_requiresSourceOrSkip verifies #493 part 2: without --source-dsn
+// the source pre-flight cannot run, so indexing must fail with an actionable
+// error instead of silently skipping validation. Passing
+// --skip-source-validation is the sanctioned opt-out (for offline binlogs);
+// it then fails later at the index DB connect, not at this guard.
+func TestRunIndex_requiresSourceOrSkip(t *testing.T) {
+	savedFiles, savedAll := idxFiles, idxAll
+	savedSource, savedSkip := idxSourceDSN, idxSkipSourceCheck
+	savedIndex := idxIndexDSN
+	t.Cleanup(func() {
+		idxFiles, idxAll = savedFiles, savedAll
+		idxSourceDSN, idxSkipSourceCheck = savedSource, savedSkip
+		idxIndexDSN = savedIndex
+	})
+
+	idxFiles = "binlog.000001"
+	idxAll = false
+	idxIndexDSN = "user:pass@tcp(127.0.0.1:1)/idx" // unreachable on purpose
+	idxSourceDSN = ""
+
+	// Neither --source-dsn nor --skip-source-validation → fail at the new guard.
+	idxSkipSourceCheck = false
+	err := runIndex(indexCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when neither --source-dsn nor --skip-source-validation is set")
+	}
+	if !strings.Contains(err.Error(), "--source-dsn is required") ||
+		!strings.Contains(err.Error(), "--skip-source-validation") {
+		t.Errorf("guard error should name both flags, got: %v", err)
+	}
+
+	// --skip-source-validation set → past the guard; fails later at index connect.
+	idxSkipSourceCheck = true
+	err = runIndex(indexCmd, nil)
+	if err != nil && strings.Contains(err.Error(), "--source-dsn is required") {
+		t.Errorf("--skip-source-validation should pass the source guard, got: %v", err)
 	}
 }
 

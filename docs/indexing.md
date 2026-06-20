@@ -36,12 +36,22 @@ bintrail index \
   --all
 ```
 
-With `--source-dsn`, `index` preflights the source
+`--source-dsn` lets `index` preflight the source
 (`binlog_format=ROW`, `binlog_row_image=FULL`, no `ON DELETE/UPDATE CASCADE`
-foreign keys) and auto-snapshots if no snapshot exists yet. `--all` discovers
-and processes every binlog file in `--binlog-dir` in order; `--files` takes an
-explicit comma-separated list. Tune write throughput with `--batch-size`
-(default 1000) and scope with `--schemas` / `--tables`.
+foreign keys) and auto-snapshot if no snapshot exists yet. It is **required**
+unless you pass `--skip-source-validation` to index offline binlogs against an
+already-captured snapshot — the silent skip is gone so a non-`FULL` source can't
+be indexed by accident.
+
+Either way, `index` also guards **every row event**: if a binlog event carries a
+partial row image (the signature of a session-level
+`binlog_row_image=MINIMAL`/`NOBLOB` that the one-shot server-wide check can't
+catch), `index` aborts loudly rather than store the absent columns as `NULL` and
+corrupt the before/after images `recover` relies on.
+
+`--all` discovers and processes every binlog file in `--binlog-dir` in order;
+`--files` takes an explicit comma-separated list. Tune write throughput with
+`--batch-size` (default 1000) and scope with `--schemas` / `--tables`.
 
 ---
 

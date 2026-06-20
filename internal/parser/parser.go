@@ -221,6 +221,28 @@ func rewriteInnerHeader(inner, outer *replication.EventHeader) {
 
 // ─── Row event handler ────────────────────────────────────────────────────────
 
+// firstPartialImage reports whether any row image in a RowsEvent omitted
+// columns — the signature of a non-FULL binlog_row_image (MINIMAL/NOBLOB). It
+// returns the absent column indices of the first partial image found, or nil
+// when every image is complete.
+//
+// go-mysql populates RowsEvent.SkippedColumns in lock-step with RowsEvent.Rows:
+// one entry per decoded image (for UPDATE there are two images per logical row —
+// before and after), each listing the column ordinals whose present-bit was
+// clear in the event's column bitmap. Under binlog_row_image=FULL every bit is
+// set, so each entry is an empty (non-nil) slice; under MINIMAL/NOBLOB the
+// omitted columns appear here while go-mysql pads them to nil in Rows.
+// Confirmed empirically against go-mysql v1.13.0, including that a FULL image of
+// a table with a VIRTUAL generated column yields no skips (no false positive).
+func firstPartialImage(skipped [][]int) []int {
+	for _, image := range skipped {
+		if len(image) > 0 {
+			return image
+		}
+	}
+	return nil
+}
+
 // handleRows processes a RowsEvent, resolving column names and dispatching to
 // the appropriate emit function. It is shared by Parser.ParseFile and StreamParser.Run.
 func handleRows(
@@ -271,6 +293,25 @@ func handleRows(
 			"binlog_columns", rowsEv.Table.ColumnCount,
 			"snapshot_columns", len(tm.Columns))
 		return nil
+	}
+
+	// Partial row image guard (#493): bintrail requires binlog_row_image=FULL.
+	// Under MINIMAL/NOBLOB, MySQL omits columns from the before/after image and
+	// go-mysql pads the absent positions to nil — which we would otherwise store
+	// as a genuine NULL, silently corrupting the before/after images that
+	// `recover` later trusts. The server-global SHOW VARIABLES check in
+	// `metadata.ValidateBinlogRowImage` is one-shot and session-settable, so it
+	// can be bypassed; this per-row check is the authoritative chokepoint that
+	// covers BOTH the file-index and stream paths. Fail loud rather than index
+	// NULL-filled rows.
+	if firstSkipped := firstPartialImage(rowsEv.SkippedColumns); firstSkipped != nil {
+		return fmt.Errorf(
+			"partial binlog row image detected at %s:%d for %s.%s (%d column(s) absent: %v); "+
+				"bintrail requires binlog_row_image=FULL — set it server-wide (a session-level "+
+				"override produced this event) and re-generate the binlog, or these events would "+
+				"be indexed with absent columns stored as NULL",
+			filename, binlogEv.Header.LogPos, schema, table,
+			len(firstSkipped), firstSkipped)
 	}
 
 	// LogPos points to the byte AFTER the event. Subtract EventSize to get start.

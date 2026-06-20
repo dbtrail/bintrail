@@ -35,15 +35,16 @@ Files already marked 'completed' in index_state are skipped.`,
 }
 
 var (
-	idxIndexDSN  string
-	idxSourceDSN string
-	idxBinlogDir string
-	idxFiles     string
-	idxAll       bool
-	idxBatchSize int
-	idxSchemas   string
-	idxTables    string
-	idxFormat    string
+	idxIndexDSN        string
+	idxSourceDSN       string
+	idxBinlogDir       string
+	idxFiles           string
+	idxAll             bool
+	idxBatchSize       int
+	idxSchemas         string
+	idxTables          string
+	idxFormat          string
+	idxSkipSourceCheck bool
 )
 
 func init() {
@@ -56,6 +57,8 @@ func init() {
 	indexCmd.Flags().StringVar(&idxSchemas, "schemas", "", "Only index events from these schemas (comma-separated)")
 	indexCmd.Flags().StringVar(&idxTables, "tables", "", "Only index these tables (comma-separated, e.g. mydb.orders,mydb.items)")
 	indexCmd.Flags().StringVar(&idxFormat, "format", "text", "Output format: text or json")
+	indexCmd.Flags().BoolVar(&idxSkipSourceCheck, "skip-source-validation", false,
+		"Index offline binlogs without --source-dsn, skipping the binlog_format/binlog_row_image/FK-cascade pre-flight (the per-row partial-image guard still applies)")
 	_ = indexCmd.MarkFlagRequired("index-dsn")
 	_ = indexCmd.MarkFlagRequired("binlog-dir")
 	bindCommandEnv(indexCmd)
@@ -69,6 +72,15 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	}
 	if !idxAll && idxFiles == "" {
 		return fmt.Errorf("either --files or --all must be specified")
+	}
+	// Without --source-dsn the binlog_format/binlog_row_image/FK-cascade
+	// pre-flight cannot run; silently skipping it (the old behavior) let a
+	// non-FULL source be indexed with NULL-filled partial images. Require an
+	// explicit opt-out so offline binlog indexing stays possible while the skip
+	// is never accidental (#493). The per-row partial-image guard in
+	// internal/parser still fires even under the opt-out.
+	if idxSourceDSN == "" && !idxSkipSourceCheck {
+		return fmt.Errorf("--source-dsn is required for source validation; pass --skip-source-validation to index offline binlogs without it")
 	}
 
 	ctx := cmd.Context()
@@ -98,7 +110,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Println("Source: no FK cascades \u2713")
 	} else {
-		slog.Warn("--source-dsn not provided; skipping source server validation")
+		slog.Warn("--skip-source-validation set: skipping binlog_format/binlog_row_image/FK-cascade pre-flight — the per-row partial-image guard still applies")
 	}
 
 	// ── 2. Index database connection ──────────────────────────────────────────

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -422,5 +423,136 @@ func TestTimestampUTC(t *testing.T) {
 	}
 	if ts.Unix() != epoch {
 		t.Errorf("expected epoch %d, got %d", epoch, ts.Unix())
+	}
+}
+
+// ─── Partial row image detection (#493) ──────────────────────────────────────
+
+// TestFirstPartialImage matches the shape go-mysql produces in
+// RowsEvent.SkippedColumns: one entry per decoded image, an empty (non-nil)
+// slice under binlog_row_image=FULL and a non-empty slice of absent column
+// ordinals under MINIMAL/NOBLOB. (Shapes confirmed empirically against
+// go-mysql v1.13.0: FULL UPDATE → [[] []], MINIMAL UPDATE → [[1 2 3] [0 2]].)
+func TestFirstPartialImage(t *testing.T) {
+	cases := []struct {
+		name    string
+		skipped [][]int
+		want    []int
+	}{
+		{"nil", nil, nil},
+		{"full_insert_or_delete", [][]int{{}}, nil},
+		{"full_update_both_images", [][]int{{}, {}}, nil},
+		{"minimal_delete_pk_only", [][]int{{1, 2, 3}}, []int{1, 2, 3}},
+		{"minimal_update_before_partial", [][]int{{1, 2, 3}, {0, 2}}, []int{1, 2, 3}},
+		{"minimal_update_only_after_partial", [][]int{{}, {0, 2}}, []int{0, 2}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := firstPartialImage(tc.skipped)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("firstPartialImage(%v) = %v, want %v", tc.skipped, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleRows_partialImageFailsLoud verifies that a RowsEvent carrying a
+// non-FULL image (some columns absent, as MINIMAL/NOBLOB produces) makes
+// handleRows return an error rather than emitting an event whose absent columns
+// would be stored as NULL. Both the file-index and stream paths return this
+// error directly, so a non-nil result aborts indexing.
+func TestHandleRows_partialImageFailsLoud(t *testing.T) {
+	tm := &metadata.TableMeta{
+		Schema: "shop",
+		Table:  "orders",
+		Columns: []metadata.ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+			{Name: "qty", OrdinalPosition: 2, DataType: "int"},
+		},
+		PKColumns: []string{"id"},
+	}
+	resolver := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{"shop.orders": tm})
+
+	binlogEv := &replication.BinlogEvent{
+		Header: &replication.EventHeader{
+			EventType: replication.UPDATE_ROWS_EVENTv2,
+			LogPos:    300,
+			EventSize: 100,
+		},
+		Event: &replication.RowsEvent{
+			Table: &replication.TableMapEvent{
+				Schema:      []byte("shop"),
+				Table:       []byte("orders"),
+				ColumnCount: 2,
+			},
+			// Before-image PK-only (qty absent → padded nil), after-image full.
+			Rows: [][]any{{int64(1), nil}, {int64(1), int64(9)}},
+			// MINIMAL before-image skips ordinal 1 (qty); after-image complete.
+			SkippedColumns: [][]int{{1}, {}},
+		},
+	}
+	rowsEv := binlogEv.Event.(*replication.RowsEvent)
+
+	out := make(chan Event, 4)
+	err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "0-1-1", 0, 1, out)
+	if err == nil {
+		t.Fatal("expected handleRows to fail loud on a partial row image, got nil")
+	}
+	if !strings.Contains(err.Error(), "partial binlog row image") {
+		t.Errorf("error should name the partial-image cause, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "FULL") {
+		t.Errorf("error should mention binlog_row_image=FULL, got: %v", err)
+	}
+	select {
+	case ev := <-out:
+		t.Errorf("no event must be emitted for a partial image; got %+v", ev)
+	default:
+	}
+}
+
+// TestHandleRows_fullImagePasses confirms the detector does not false-positive
+// on a FULL image, where every SkippedColumns entry is an empty slice (the
+// shape go-mysql produces even for a table containing a VIRTUAL generated
+// column — confirmed empirically against go-mysql v1.13.0).
+func TestHandleRows_fullImagePasses(t *testing.T) {
+	tm := &metadata.TableMeta{
+		Schema: "shop",
+		Table:  "orders",
+		Columns: []metadata.ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+			{Name: "qty", OrdinalPosition: 2, DataType: "int"},
+		},
+		PKColumns: []string{"id"},
+	}
+	resolver := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{"shop.orders": tm})
+
+	binlogEv := &replication.BinlogEvent{
+		Header: &replication.EventHeader{
+			EventType: replication.UPDATE_ROWS_EVENTv2,
+			LogPos:    300,
+			EventSize: 100,
+		},
+		Event: &replication.RowsEvent{
+			Table: &replication.TableMapEvent{
+				Schema:      []byte("shop"),
+				Table:       []byte("orders"),
+				ColumnCount: 2,
+			},
+			Rows:           [][]any{{int64(1), int64(5)}, {int64(1), int64(9)}},
+			SkippedColumns: [][]int{{}, {}},
+		},
+	}
+	rowsEv := binlogEv.Event.(*replication.RowsEvent)
+
+	out := make(chan Event, 4)
+	if err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "0-1-1", 0, 1, out); err != nil {
+		t.Fatalf("handleRows must not fail on a FULL image, got: %v", err)
+	}
+	select {
+	case <-out:
+		// expected: the UPDATE event was emitted
+	default:
+		t.Error("expected an UPDATE event to be emitted for a FULL image")
 	}
 }
