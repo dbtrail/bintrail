@@ -1,0 +1,195 @@
+================================================================================
+THIRD-PARTY NOTICES
+================================================================================
+
+bintrail (and the bintrail-mcp and bintrail-console binaries published from this
+repository) statically links a number of third-party Go modules and, through
+the precompiled libduckdb static library, a number of vendored C/C++ libraries.
+The licenses below are reproduced to satisfy their notice-retention terms.
+
+This file has two parts:
+
+  1. A MANUAL section, maintained by hand, covering components that the
+     automated tooling cannot see (the C/C++ libraries vendored inside the
+     precompiled libduckdb static library) plus a note on the one weak-copyleft
+     dependency (go-sql-driver/mysql, MPL-2.0).
+
+  2. A GENERATED section, produced by `make notices` (which runs
+     `go-licenses save` over ./cmd/bintrail, ./cmd/bintrail-mcp and
+     ./cmd/bintrail-console), reproducing the LICENSE — and, where present, the
+     NOTICE — file of every linked Go module.
+
+Regenerate with `make notices`. Do not edit the GENERATED section by hand.
+
+================================================================================
+PART 1 — MANUAL NOTICES
+================================================================================
+
+--------------------------------------------------------------------------------
+DuckDB engine (libduckdb) and the DuckDB Go driver
+--------------------------------------------------------------------------------
+
+The query/recovery/reconstruct paths link the DuckDB analytical engine via the
+precompiled `libduckdb` static library (shipped by the
+github.com/duckdb/duckdb-go-bindings/lib/<os>-<arch> modules) and the
+github.com/duckdb/duckdb-go/v2 Go driver. Both the engine and the driver are
+MIT-licensed:
+
+  - DuckDB engine: Copyright 2018-2026 Stichting DuckDB Foundation
+  - DuckDB Go driver: Copyright 2019 Marc Boeker
+
+(The driver's MIT text is reproduced verbatim in the GENERATED section below
+under github.com/duckdb/duckdb-go/v2; the engine carries the same MIT text.)
+
+    MIT License
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+Libraries vendored inside the precompiled libduckdb static library
+--------------------------------------------------------------------------------
+
+`go-licenses` analyses Go source only; it cannot see inside the precompiled
+`libduckdb` static library, which statically links several third-party C/C++
+libraries of its own. They are listed here for completeness. DuckDB's own
+authoritative third-party license listing is maintained upstream at:
+
+    https://github.com/duckdb/duckdb/tree/main/third_party
+
+The principal vendored libraries and their licenses:
+
+  - RE2 (regular-expression engine)
+      Copyright 2009 The RE2 Authors
+      License: BSD 3-Clause
+
+        Redistribution and use in source and binary forms, with or without
+        modification, are permitted provided that the following conditions are
+        met:
+
+           * Redistributions of source code must retain the above copyright
+             notice, this list of conditions and the following disclaimer.
+           * Redistributions in binary form must reproduce the above copyright
+             notice, this list of conditions and the following disclaimer in
+             the documentation and/or other materials provided with the
+             distribution.
+           * Neither the name of Google Inc. nor the names of its contributors
+             may be used to endorse or promote products derived from this
+             software without specific prior written permission.
+
+        THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+        "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+        LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+        A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+        OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+        SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+        LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+        DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+        THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+        (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+        OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+  - utf8proc (Unicode normalisation)
+      Copyright 2014-2021 Steven G. Johnson, Jiahao Chen, Tony Kelman,
+      Jonas Fonseca, and other contributors; portions Copyright Unicode, Inc.
+      License: MIT (expat-style)
+
+        Permission is hereby granted, free of charge, to any person obtaining a
+        copy of this software and associated documentation files (the
+        "Software"), to deal in the Software without restriction, including
+        without limitation the rights to use, copy, modify, merge, publish,
+        distribute, sublicense, and/or sell copies of the Software, and to
+        permit persons to whom the Software is furnished to do so, subject to
+        the following conditions:
+
+        The above copyright notice and this permission notice shall be included
+        in all copies or substantial portions of the Software.
+
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+        OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+        MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+        IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+        CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+        TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+        SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  - {fmt} (formatting library)
+      Copyright 2012-present Victor Zverovich and {fmt} contributors
+      License: MIT (with the standard {fmt} optional-bundled-test exception)
+
+        Permission is hereby granted, free of charge, to any person obtaining a
+        copy of this software and associated documentation files (the
+        "Software"), to deal in the Software without restriction, including
+        without limitation the rights to use, copy, modify, merge, publish,
+        distribute, sublicense, and/or sell copies of the Software, and to
+        permit persons to whom the Software is furnished to do so, subject to
+        the following conditions:
+
+        The above copyright notice and this permission notice shall be included
+        in all copies or substantial portions of the Software.
+
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+        OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+        MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+        IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+        CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+        TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+        SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  - fast_float (floating-point parsing)
+      Copyright 2021 The fast_float authors (Daniel Lemire and contributors)
+      License: Apache-2.0 OR MIT OR BSL-1.0 (tri-licensed; the MIT terms shown
+      above for utf8proc/fmt apply equally here).
+
+For the complete and authoritative set of libraries vendored into a given
+DuckDB release — including any not enumerated above — consult the upstream
+third_party directory linked at the top of this section.
+
+--------------------------------------------------------------------------------
+go-sql-driver/mysql (MPL-2.0) — weak-copyleft note
+--------------------------------------------------------------------------------
+
+github.com/go-sql-driver/mysql is licensed under the Mozilla Public License
+Version 2.0 (MPL-2.0), a weak (file-level) copyleft license — not MIT/BSD. Its
+full license text appears in the GENERATED section below.
+
+bintrail uses this module UNMODIFIED, so the obligations are light:
+
+  - retain this notice (satisfied by including the MPL-2.0 text in this file);
+  - keep the corresponding source available. The unmodified source is the
+    public upstream module at https://github.com/go-sql-driver/mysql (pinned in
+    this repository's go.mod), which is the source location offered for the
+    Covered Software.
+
+MPL-2.0 is file-scoped: it does NOT require bintrail itself to be open-sourced.
+Only if a `.go` file within this module were ever modified would that specific
+modified file have to be published under the MPL.
+
+================================================================================
+PART 2 — GENERATED NOTICES
+================================================================================
+
+The entries below are generated by `make notices`. Each entry reproduces the
+LICENSE (and, where the module ships one, the NOTICE) file of a linked Go
+module, exactly as distributed upstream.
+
+Note: the github.com/duckdb/duckdb-go-bindings/lib/<os>-<arch> entry listed
+below reflects the platform the file was generated on; the published Linux
+artifacts link the linux-amd64/linux-arm64 bindings. All
+duckdb-go-bindings/lib/<os>-<arch> modules carry the same MIT license (v0.3.3),
+and the DuckDB engine itself is covered by the manual section above.

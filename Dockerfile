@@ -40,5 +40,9 @@ RUN apt-get update && \
 COPY --from=builder /bintrail /usr/local/bin/bintrail
 COPY --from=builder /bintrail-mcp /usr/local/bin/bintrail-mcp
 
+# License-compliance notices (#428): our license + retained upstream notices
+# for the statically-linked MIT/MPL-2.0/BSD dependencies (DuckDB et al.).
+COPY --from=builder /src/LICENSE /src/NOTICE /src/THIRD-PARTY-NOTICES /usr/share/doc/bintrail/
+
 USER bintrail
 ENTRYPOINT ["bintrail"]

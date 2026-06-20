@@ -19,6 +19,15 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # Staleness guard for THIRD-PARTY-NOTICES (license compliance, #428).
+      # Keys off `go list -m all` (the module graph), NOT a go-licenses regen:
+      # regenerating in CI would mean a slow CGO build on every PR plus
+      # cross-platform nondeterminism (per-OS duckdb binding modules). If a
+      # dependency was added/removed/bumped without `make notices`, this fails
+      # with an actionable message.
+      - name: THIRD-PARTY-NOTICES staleness check
+        run: make check-notices
+
       - name: gofmt (warning-only)
         # The repo has pre-existing unformatted files; surface the list as a
         # warning but do not fail CI on it. Tighten to a hard fail once the

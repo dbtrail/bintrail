@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# CI staleness guard for THIRD-PARTY-NOTICES.
+#
+# Regenerating the notices file in CI would mean a slow CGO build on every PR
+# AND cross-platform nondeterminism (the per-OS duckdb binding modules differ
+# between the macOS dev machine and the linux runner) → flaky false failures.
+#
+# Instead we key off the dependency GRAPH, which is what actually drives notice
+# rot: if `go list -m all` changes, a module was added/removed/bumped and the
+# notices may be stale. The hash is deterministic and platform-independent (no
+# CGO, no build), so this is cheap and reliable.
+#
+# Exits non-zero with an actionable message when the committed marker no longer
+# matches the current module graph. Fix: `make notices` and commit the result.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+MARKER="$REPO_ROOT/THIRD-PARTY-NOTICES.deps.sha256"
+NOTICES="$REPO_ROOT/THIRD-PARTY-NOTICES"
+
+fail() { echo "ERROR: $*" >&2; exit 1; }
+
+[ -f "$NOTICES" ] || fail "THIRD-PARTY-NOTICES is missing. Run: make notices"
+[ -f "$MARKER" ]  || fail "THIRD-PARTY-NOTICES.deps.sha256 is missing. Run: make notices"
+
+want="$(cat "$MARKER")"
+have="$(go list -m all | shasum -a 256 | awk '{print $1}')"
+
+if [ "$want" != "$have" ]; then
+  echo "THIRD-PARTY-NOTICES is stale: the dependency graph has changed." >&2
+  echo "  committed graph hash: $want" >&2
+  echo "  current   graph hash: $have" >&2
+  echo "" >&2
+  echo "A dependency was added, removed, or bumped. Regenerate the notices:" >&2
+  echo "  make notices" >&2
+  echo "and commit THIRD-PARTY-NOTICES + THIRD-PARTY-NOTICES.deps.sha256." >&2
+  exit 1
+fi
+
+echo "THIRD-PARTY-NOTICES is in sync with the dependency graph."

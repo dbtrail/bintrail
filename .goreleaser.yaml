@@ -88,6 +88,16 @@ archives:
       - bintrail
       - bintrail-mcp
       - bintrail-console
+    # `files:` OVERRIDES GoReleaser's default set (LICENSE*/README*/CHANGELOG*),
+    # so the defaults are re-listed here alongside the license-compliance
+    # artifacts (#428): NOTICE + THIRD-PARTY-NOTICES carry the retained
+    # upstream notices for the statically-linked MIT/MPL-2.0/BSD dependencies.
+    files:
+      - LICENSE*
+      - README*
+      - CHANGELOG*
+      - NOTICE
+      - THIRD-PARTY-NOTICES
 
 checksum:
   name_template: "checksums.txt"
@@ -120,6 +130,15 @@ nfpms:
     bindir: /usr/bin
     dependencies:
       - ca-certificates
+    # License-compliance docs (#428): our own license + the retained upstream
+    # notices for statically-linked deps, installed where distro tooling looks.
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/bintrail/LICENSE
+      - src: NOTICE
+        dst: /usr/share/doc/bintrail/NOTICE
+      - src: THIRD-PARTY-NOTICES
+        dst: /usr/share/doc/bintrail/THIRD-PARTY-NOTICES
 
   # Separate package, mirroring the binary split: the core CLI stays UI-free
   # and the web console installs only where an operator wants it.
@@ -140,6 +159,14 @@ nfpms:
     bindir: /usr/bin
     dependencies:
       - ca-certificates
+    # Same notices as the core package, under this package's own doc dir (#428).
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/bintrail-console/LICENSE
+      - src: NOTICE
+        dst: /usr/share/doc/bintrail-console/NOTICE
+      - src: THIRD-PARTY-NOTICES
+        dst: /usr/share/doc/bintrail-console/THIRD-PARTY-NOTICES
 
 # ── Docker images (multi-arch, published to GHCR) ──────────
 # One image per arch, then a manifest stitching them into a single
@@ -159,6 +186,12 @@ dockers:
       - bintrail-mcp
     dockerfile: Dockerfile.goreleaser
     use: buildx
+    # Stage the license-compliance notices into the docker build context so the
+    # Dockerfile's COPY can pick them up (#428).
+    extra_files:
+      - LICENSE
+      - NOTICE
+      - THIRD-PARTY-NOTICES
     image_templates:
       - "ghcr.io/dbtrail/bintrail:{{ .Version }}-amd64"
     build_flag_templates:
@@ -178,6 +211,10 @@ dockers:
       - bintrail-mcp
     dockerfile: Dockerfile.goreleaser
     use: buildx
+    extra_files:
+      - LICENSE
+      - NOTICE
+      - THIRD-PARTY-NOTICES
     image_templates:
       - "ghcr.io/dbtrail/bintrail:{{ .Version }}-arm64"
     build_flag_templates:
@@ -198,6 +235,10 @@ dockers:
       - bintrail-console
     dockerfile: Dockerfile.bintrail-console.goreleaser
     use: buildx
+    extra_files:
+      - LICENSE
+      - NOTICE
+      - THIRD-PARTY-NOTICES
     image_templates:
       - "ghcr.io/dbtrail/bintrail-console:{{ .Version }}-amd64"
     build_flag_templates:
@@ -216,6 +257,10 @@ dockers:
       - bintrail-console
     dockerfile: Dockerfile.bintrail-console.goreleaser
     use: buildx
+    extra_files:
+      - LICENSE
+      - NOTICE
+      - THIRD-PARTY-NOTICES
     image_templates:
       - "ghcr.io/dbtrail/bintrail-console:{{ .Version }}-arm64"
     build_flag_templates:

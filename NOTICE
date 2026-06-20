@@ -2,3 +2,8 @@ bintrail
 Copyright (c) 2025 Daniel Guzman Burgos
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product statically links third-party software (DuckDB and ~90 other Go
+modules, plus C/C++ libraries vendored inside libduckdb). Their copyright and
+license notices are retained in the THIRD-PARTY-NOTICES file distributed
+alongside this NOTICE. Regenerate it with `make notices`.

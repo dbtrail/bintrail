@@ -12,7 +12,7 @@ GATEWAY_LDFLAGS=-ldflags "-X main.gatewayVersion=$(VERSION)"
 # bintrail-console reuses BINTRAIL_LDFLAGS: it injects the same
 # main.Version/CommitSHA/BuildDate vars as the core binary.
 
-.PHONY: all build build-mcp build-gateway build-console clean test console-e2e lint install build-all tidy deps
+.PHONY: all build build-mcp build-gateway build-console clean test console-e2e lint install build-all tidy deps notices check-notices
 
 all: build build-mcp build-gateway build-console
 
@@ -78,3 +78,15 @@ tidy:
 
 deps:
 	go mod download
+
+# Regenerate THIRD-PARTY-NOTICES (license-compliance artifact bundled in every
+# release channel). Runs go-licenses over the three published binary mains;
+# requires CGO_ENABLED=1 (DuckDB) and go-licenses on PATH:
+#   go install github.com/google/go-licenses@latest
+notices:
+	bash scripts/gen-notices.sh
+
+# CI staleness guard: fails if the dependency graph changed without a matching
+# `make notices` regeneration. Cheap — hashes `go list -m all`, no CGO build.
+check-notices:
+	bash scripts/check-notices.sh
