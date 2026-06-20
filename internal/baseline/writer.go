@@ -1,7 +1,9 @@
 package baseline
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -16,6 +18,17 @@ import (
 	"github.com/parquet-go/parquet-go/compress/snappy"
 	"github.com/parquet-go/parquet-go/compress/zstd"
 )
+
+// errZeroDate marks MySQL's all-zero DATE/DATETIME/TIMESTAMP pseudo-NULL
+// sentinel (`0000-00-00`, `0000-00-00 00:00:00`, fractional `.000000` variant).
+// These are LEGAL legacy MySQL values (a column with DEFAULT '0000-00-00
+// 00:00:00' carries them in every row) that Go's time parser rejects ("month
+// out of range"). They are representable as NULL — MySQL itself treats the zero
+// date as its pseudo-NULL — so WriteRow maps them to a deliberate NULL plus a
+// once-per-column warning, rather than aborting the whole baseline run. This is
+// distinct from a genuinely unrepresentable value (UNSIGNED overflow, garbage),
+// which would be silently corrupted by a NULL and must still fail loud.
+var errZeroDate = errors.New("zero date sentinel (mydumper pseudo-NULL)")
 
 // WriterConfig carries Parquet writer options.
 type WriterConfig struct {
@@ -32,6 +45,10 @@ type Writer struct {
 	parquetCols []Column
 	// mysqlOrder[parquetIdx] = original MySQL column index in the source data.
 	mysqlOrder []int
+	// zeroDateWarned tracks parquet column indexes already warned about a
+	// zero-date sentinel, so a legacy table with DEFAULT '0000-00-00' (the
+	// sentinel in every row) emits one warning per column, not per row.
+	zeroDateWarned map[int]bool
 }
 
 // NewWriter creates a new Parquet writer for the given table.
@@ -74,10 +91,11 @@ func NewWriter(path string, cols []Column, cfg WriterConfig) (*Writer, error) {
 
 	pw := parquet.NewWriter(f, opts...)
 	return &Writer{
-		pw:          pw,
-		file:        f,
-		parquetCols: parquetCols,
-		mysqlOrder:  mysqlOrder,
+		pw:             pw,
+		file:           f,
+		parquetCols:    parquetCols,
+		mysqlOrder:     mysqlOrder,
+		zeroDateWarned: make(map[int]bool),
 	}, nil
 }
 
@@ -97,16 +115,33 @@ func (w *Writer) WriteRow(values []string, nulls []bool) error {
 				raw = values[mysqlIdx]
 			}
 			converted, err := convertValue(col, raw)
-			if err != nil {
+			switch {
+			case errors.Is(err, errZeroDate):
+				// MySQL's all-zero date/datetime is a LEGAL pseudo-NULL that the
+				// Go time parser rejects. It is representable as NULL (that IS
+				// its semantics), so map it to a deliberate NULL and warn once
+				// per column — visible, not a silent drop. Aborting here would
+				// kill the baseline of any legacy table carrying DEFAULT
+				// '0000-00-00 00:00:00' (issue #506 review carve-out).
+				if !w.zeroDateWarned[parquetIdx] {
+					w.zeroDateWarned[parquetIdx] = true
+					slog.Warn("baseline: zero date mapped to NULL",
+						"column", col.Name, "type", col.MySQLType, "value", raw)
+				}
+				v = parquet.NullValue().Level(0, 0, parquetIdx)
+			case err != nil:
 				// Fail loud: silently coercing an unconvertible value to NULL
 				// publishes a lossy baseline (issue #503 item-3). This is a
 				// data-recovery tool — abort the run rather than hand back a
 				// snapshot that quietly dropped a value. Context lets the
-				// operator locate the offending row.
+				// operator locate the offending row. (A value that would be
+				// silently CORRUPTED by NULL — UNSIGNED overflow, garbage —
+				// still aborts; only the zero-date pseudo-NULL above does not.)
 				return fmt.Errorf("baseline: column %q (%s) value %q: %w",
 					col.Name, col.MySQLType, raw, err)
+			default:
+				v = converted.Level(0, 1, parquetIdx)
 			}
-			v = converted.Level(0, 1, parquetIdx)
 		}
 		row[parquetIdx] = v
 	}
@@ -209,6 +244,9 @@ func convertValue(col Column, raw string) (parquet.Value, error) {
 		return parquet.DoubleValue(f), nil
 
 	case "datetime", "timestamp":
+		if isZeroDate(raw) {
+			return parquet.Value{}, errZeroDate
+		}
 		us, err := parseDatetimeToMicros(raw)
 		if err != nil {
 			return parquet.Value{}, err
@@ -216,6 +254,9 @@ func convertValue(col Column, raw string) (parquet.Value, error) {
 		return parquet.Int64Value(us), nil
 
 	case "date":
+		if isZeroDate(raw) {
+			return parquet.Value{}, errZeroDate
+		}
 		days, err := parseDateToDays(raw)
 		if err != nil {
 			return parquet.Value{}, err
@@ -236,6 +277,16 @@ func convertValue(col Column, raw string) (parquet.Value, error) {
 		// String types and fallback.
 		return parquet.ByteArrayValue([]byte(raw)), nil
 	}
+}
+
+// isZeroDate reports whether raw is MySQL's all-zero date pseudo-NULL sentinel:
+// `0000-00-00`, `0000-00-00 00:00:00`, and the `.000000` fractional variant. The
+// `0000-00-00` prefix uniquely identifies the family (a real date never starts
+// with a zero year), so one prefix check covers DATE, DATETIME, and TIMESTAMP.
+// TIME is deliberately excluded — `00:00:00` is legal midnight, stored as a
+// string, and round-trips fine; it is not a pseudo-NULL.
+func isZeroDate(raw string) bool {
+	return strings.HasPrefix(strings.TrimSpace(raw), "0000-00-00")
 }
 
 // parseDatetimeToMicros parses MySQL DATETIME/TIMESTAMP strings to microseconds

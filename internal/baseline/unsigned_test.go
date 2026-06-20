@@ -1,11 +1,17 @@
 package baseline
 
 import (
+	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver — exercises the real read path
 	"github.com/parquet-go/parquet-go"
+
+	"github.com/dbtrail/dbtrail/internal/recovery"
 )
 
 // TestParseSchemaUnsigned pins the colRe attribute-tail match: the UNSIGNED flag
@@ -174,6 +180,78 @@ func TestWriteRowUnsignedRoundTrip(t *testing.T) {
 	}
 	if got := row[1].Int64(); got != 4294967295 {
 		t.Errorf("c_int_u: got %d, want 4294967295", got)
+	}
+}
+
+// TestWriteRowUnsignedDuckDBScan is the round-trip the TOOL actually performs:
+// every production consumer (reconstruct.ReadBaselineRow, fulltable.go, shim
+// _snapshot) reads baselines through DuckDB `parquet_scan`, not parquet-go's
+// manual reader. This pins that the unsigned maxima survive the real read path
+// AND format to the right SQL literal via recovery.FormatSQLValue — the chain
+// that turns a scanned value into recovery output (issue #506 review).
+//
+// Type expectations differ by column because schema.go widens INT UNSIGNED into
+// a SIGNED Int(64) but BIGINT UNSIGNED into Uint(64):
+//   - BIGINT UNSIGNED → DuckDB UBIGINT → Go uint64 (the load-bearing assertion:
+//     proves the real consumer never sees a negative for the unsigned maximum)
+//   - INT UNSIGNED    → DuckDB BIGINT  → Go int64 (positive, exact value)
+func TestWriteRowUnsignedDuckDBScan(t *testing.T) {
+	cols := []Column{
+		{Name: "c_big_u", MySQLType: "bigint", Unsigned: true, ParquetType: mysqlToParquetNode("bigint", true)},
+		{Name: "c_int_u", MySQLType: "int", Unsigned: true, ParquetType: mysqlToParquetNode("int", true)},
+	}
+
+	dir := t.TempDir()
+	outPath := filepath.Join(dir, "unsigned_duck.parquet")
+	w, err := NewWriter(outPath, cols, WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	// Values in MySQL (== alphabetical) order: c_big_u, c_int_u.
+	if err := w.WriteRow([]string{"18446744073709551615", "4294967295"}, []bool{false, false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	safePath := strings.ReplaceAll(outPath, "'", "''")
+	var big, intv any
+	row := db.QueryRowContext(context.Background(),
+		"SELECT c_big_u, c_int_u FROM parquet_scan('"+safePath+"')")
+	if err := row.Scan(&big, &intv); err != nil {
+		t.Fatalf("scan parquet_scan row: %v", err)
+	}
+
+	// BIGINT UNSIGNED max must come back as a concrete uint64 — a negative int64
+	// here would be the #506 corruption surfacing through the real consumer.
+	bigU, ok := big.(uint64)
+	if !ok {
+		t.Fatalf("c_big_u scanned as %T, want uint64", big)
+	}
+	if bigU != 18446744073709551615 {
+		t.Errorf("c_big_u = %d, want 18446744073709551615", bigU)
+	}
+	if got := recovery.FormatSQLValue(bigU); got != "18446744073709551615" {
+		t.Errorf("FormatSQLValue(c_big_u) = %q, want %q", got, "18446744073709551615")
+	}
+
+	// INT UNSIGNED widened into a signed Int(64) → scans as int64 (positive).
+	intI, ok := intv.(int64)
+	if !ok {
+		t.Fatalf("c_int_u scanned as %T, want int64", intv)
+	}
+	if intI != 4294967295 {
+		t.Errorf("c_int_u = %d, want 4294967295", intI)
+	}
+	if got := recovery.FormatSQLValue(intI); got != "4294967295" {
+		t.Errorf("FormatSQLValue(c_int_u) = %q, want %q", got, "4294967295")
 	}
 }
 

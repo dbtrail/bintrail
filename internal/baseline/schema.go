@@ -24,7 +24,10 @@ type Column struct {
 // the type token (plus an optional display width like int(10)), so a column
 // literally named `is_unsigned` or a COMMENT containing "unsigned" never trips
 // it — the name lives in group 1 inside backticks, separate from group 3.
-var colRe = regexp.MustCompile("^\\s+`([^`]+)`\\s+(\\w+)(?:\\s*\\([^)]*\\))?\\s*(unsigned)?")
+// The unsigned group is case-insensitive (`(?i:...)` inside a capture group, so
+// group 3 is preserved): mydumper emits lowercase by contract, but an uppercase
+// UNSIGNED from a hand-rolled schema must not silently fall through to signed.
+var colRe = regexp.MustCompile("^\\s+`([^`]+)`\\s+(\\w+)(?:\\s*\\([^)]*\\))?\\s*((?i:unsigned))?")
 
 // ParseSchema reads a mydumper <db>.<table>-schema.sql file and returns the
 // ordered list of columns with their Parquet type mappings.
