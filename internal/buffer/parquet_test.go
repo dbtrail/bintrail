@@ -1,11 +1,16 @@
 package buffer
 
 import (
+	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver — exercises the real read path
 	"github.com/parquet-go/parquet-go"
 
 	"github.com/dbtrail/dbtrail/internal/parser"
@@ -60,6 +65,63 @@ func TestWriteParquet_roundTrip(t *testing.T) {
 	// Verify metadata.
 	if _, ok := pf.Lookup("bintrail.buffer.version"); !ok {
 		t.Error("expected bintrail.buffer.version metadata key")
+	}
+}
+
+// TestWriteParquet_connectionIDUnsignedDuckDBScan pins the fail-loud regression
+// fix on the buffer write path: ResultRow.ConnectionID is *uint32 and is written
+// via FormatUint, so a value above int32's 2147483647 (a real CONNECTION_ID())
+// must round-trip through the unsigned-widened connection_id column rather than
+// abort the BYOS flush. Read back via DuckDB parquet_scan — the real consumer.
+func TestWriteParquet_connectionIDUnsignedDuckDBScan(t *testing.T) {
+	for _, connID := range []uint32{4294967295, 3000000000} {
+		t.Run(strconv.FormatUint(uint64(connID), 10), func(t *testing.T) {
+			dir := t.TempDir()
+			outPath := filepath.Join(dir, "conn.parquet")
+
+			cid := connID
+			rows := []query.ResultRow{{
+				EventID:        idOffset + 1,
+				BinlogFile:     "binlog.000001",
+				StartPos:       100,
+				EndPos:         200,
+				EventTimestamp: time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC),
+				SchemaName:     "db",
+				TableName:      "t",
+				EventType:      parser.EventInsert,
+				PKValues:       "1",
+				ConnectionID:   &cid,
+				RowAfter:       map[string]any{"id": 1},
+			}}
+
+			n, err := WriteParquet(rows, outPath, "none")
+			if err != nil {
+				t.Fatalf("WriteParquet(connection_id=%d): got error, want round-trip (fail-loud regression): %v", connID, err)
+			}
+			if n != 1 {
+				t.Fatalf("count = %d, want 1", n)
+			}
+
+			db, err := sql.Open("duckdb", "")
+			if err != nil {
+				t.Fatalf("open duckdb: %v", err)
+			}
+			defer db.Close()
+
+			safePath := strings.ReplaceAll(outPath, "'", "''")
+			var conn any
+			if err := db.QueryRowContext(context.Background(),
+				"SELECT connection_id FROM parquet_scan('"+safePath+"')").Scan(&conn); err != nil {
+				t.Fatalf("scan connection_id: %v", err)
+			}
+			got, ok := conn.(int64) // INT UNSIGNED widened to signed Int64 → DuckDB BIGINT
+			if !ok {
+				t.Fatalf("connection_id scanned as %T, want int64", conn)
+			}
+			if got != int64(connID) {
+				t.Errorf("connection_id = %d, want %d", got, connID)
+			}
+		})
 	}
 }
 

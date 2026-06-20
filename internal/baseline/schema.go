@@ -85,11 +85,23 @@ func BuildParquetSchema(cols []Column) *parquet.Schema {
 
 // MysqlToParquetNode maps a MySQL type token to the appropriate parquet-go node,
 // treating integer types as signed. Callers with an UNSIGNED column should build
-// the column via ParseSchema (which threads the attribute through) — this
-// signed-only entry point is preserved for external callers that pass a bare
-// type token (e.g. internal/archive, internal/byos).
+// the column via ParseSchema (which threads the attribute through) or via
+// MysqlToParquetNode2 — this signed-only entry point is preserved for external
+// callers that pass a bare type token (e.g. internal/archive, internal/byos).
 func MysqlToParquetNode(typeToken string) parquet.Node {
 	return mysqlToParquetNode(typeToken, false)
+}
+
+// MysqlToParquetNode2 is the unsigned-aware entry point for callers that hand-
+// build a Column from a bare type token (internal/archive.BinlogEventColumns,
+// internal/byos) rather than going through ParseSchema. It must be used for any
+// column backing an UNSIGNED MySQL type (e.g. connection_id is INT UNSIGNED):
+// the signed-only MysqlToParquetNode would emit an Int(32) column, and a value
+// past int32 (a CONNECTION_ID() above 2147483647) would then fail conversion
+// against that signed column. Passing unsigned=true widens it the same way
+// ParseSchema does (INT UNSIGNED → Int64, BIGINT UNSIGNED → Uint64).
+func MysqlToParquetNode2(typeToken string, unsigned bool) parquet.Node {
+	return mysqlToParquetNode(typeToken, unsigned)
 }
 
 // mysqlToParquetNode maps a MySQL type token (plus its UNSIGNED attribute) to the

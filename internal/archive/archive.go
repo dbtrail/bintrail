@@ -17,6 +17,14 @@ import (
 // BinlogEventColumns defines the 15 non-generated binlog_events columns in
 // MySQL table order (pk_hash is a stored generated column and is omitted).
 // Exported for reuse by the buffer package when writing Parquet files.
+//
+// event_id / start_pos / end_pos are BIGINT UNSIGNED in MySQL but are scanned as
+// sql.NullInt64 here (ArchivePartition) and never exceed int64 in practice —
+// AUTO_INCREMENT and binlog byte offsets stay well under 2^63 — so the signed
+// Int64 column they map to via MysqlToParquetNode is lossless. connection_id is
+// the one column that genuinely needs the unsigned widening below: it is INT
+// UNSIGNED (a CONNECTION_ID() can exceed int32's 2147483647) and is written via
+// FormatUint by the buffer path, so a signed Int(32) column would reject it.
 var BinlogEventColumns = []baseline.Column{
 	{Name: "event_id", MySQLType: "bigint", ParquetType: baseline.MysqlToParquetNode("bigint")},
 	{Name: "binlog_file", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
@@ -24,7 +32,7 @@ var BinlogEventColumns = []baseline.Column{
 	{Name: "end_pos", MySQLType: "bigint", ParquetType: baseline.MysqlToParquetNode("bigint")},
 	{Name: "event_timestamp", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
 	{Name: "gtid", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
-	{Name: "connection_id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+	{Name: "connection_id", MySQLType: "int", Unsigned: true, ParquetType: baseline.MysqlToParquetNode2("int", true)},
 	{Name: "schema_name", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 	{Name: "table_name", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 	{Name: "event_type", MySQLType: "tinyint", ParquetType: baseline.MysqlToParquetNode("tinyint")},

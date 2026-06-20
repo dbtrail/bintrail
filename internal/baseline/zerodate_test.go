@@ -114,6 +114,48 @@ func TestWriteRowZeroDateStillAbortsGarbage(t *testing.T) {
 	}
 }
 
+// TestWriteRowPartialZeroDateAborts pins that the carve-out is keyed on the
+// ALL-zero `0000-00-00` prefix only: a PARTIAL zero date (`2020-00-00`, a real
+// year with a zero month, or `2020-05-00 00:00:00`, a zero day) is NOT MySQL's
+// pseudo-NULL sentinel — Go's parser rejects it as out-of-range, and that must
+// still fail loud naming the column, not get silently carved to NULL.
+func TestWriteRowPartialZeroDateAborts(t *testing.T) {
+	cases := []struct {
+		name      string
+		mysqlType string
+		raw       string
+	}{
+		{"date_zero_month", "date", "2020-00-00"},
+		{"date_zero_day", "date", "2020-05-00"},
+		{"datetime_zero_month", "datetime", "2020-00-00 00:00:00"},
+		{"datetime_zero_day", "datetime", "2020-05-00 00:00:00"},
+		{"timestamp_zero_day", "timestamp", "2020-05-00 00:00:00"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cols := []Column{
+				{Name: "d", MySQLType: tc.mysqlType, ParquetType: mysqlToParquetNode(tc.mysqlType, false)},
+			}
+			dir := t.TempDir()
+			w, err := NewWriter(filepath.Join(dir, "partial.parquet"), cols, WriterConfig{Compression: "none", RowGroupSize: 100})
+			if err != nil {
+				t.Fatalf("NewWriter: %v", err)
+			}
+			defer w.Close()
+
+			err = w.WriteRow([]string{tc.raw}, []bool{false})
+			if err == nil {
+				t.Fatalf("WriteRow(%q) with partial-zero date: got nil, want loud failure (only all-zero is carved out)", tc.raw)
+			}
+			for _, want := range []string{"d", tc.raw} {
+				if !contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
 // TestParseSchemaUnsignedUppercase hardens the colRe case-insensitive group: an
 // uppercase UNSIGNED (hand-rolled schema; mydumper emits lowercase) must still
 // populate the attribute, not silently fall through to signed.

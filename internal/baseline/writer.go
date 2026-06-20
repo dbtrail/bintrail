@@ -26,8 +26,9 @@ import (
 // out of range"). They are representable as NULL — MySQL itself treats the zero
 // date as its pseudo-NULL — so WriteRow maps them to a deliberate NULL plus a
 // once-per-column warning, rather than aborting the whole baseline run. This is
-// distinct from a genuinely unrepresentable value (UNSIGNED overflow, garbage),
-// which would be silently corrupted by a NULL and must still fail loud.
+// distinct from a genuinely unrepresentable value (non-numeric garbage in an
+// integer column, an out-of-range literal), which would be silently corrupted
+// by a NULL and must still fail loud.
 var errZeroDate = errors.New("zero date sentinel (mydumper pseudo-NULL)")
 
 // WriterConfig carries Parquet writer options.
@@ -135,8 +136,10 @@ func (w *Writer) WriteRow(values []string, nulls []bool) error {
 				// data-recovery tool — abort the run rather than hand back a
 				// snapshot that quietly dropped a value. Context lets the
 				// operator locate the offending row. (A value that would be
-				// silently CORRUPTED by NULL — UNSIGNED overflow, garbage —
-				// still aborts; only the zero-date pseudo-NULL above does not.)
+				// silently CORRUPTED by NULL — e.g. non-numeric garbage in an
+				// int column, an out-of-range literal — still aborts; only the
+				// zero-date pseudo-NULL above does not. In-range UNSIGNED values
+				// no longer reach here: they are widened by convertValue.)
 				return fmt.Errorf("baseline: column %q (%s) value %q: %w",
 					col.Name, col.MySQLType, raw, err)
 			default:

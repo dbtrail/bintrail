@@ -1,10 +1,14 @@
 package archive
 
 import (
+	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver — exercises the real read path
 	"github.com/parquet-go/parquet-go"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
@@ -175,6 +179,76 @@ func TestWriteReadRoundTrip(t *testing.T) {
 
 	if _, ok := pf.Lookup("bintrail.archive.version"); !ok {
 		t.Error("expected bintrail.archive.version metadata key")
+	}
+}
+
+// TestWriteRowConnectionIDUnsignedDuckDBScan pins the fail-loud regression fix:
+// connection_id is INT UNSIGNED (a CONNECTION_ID() reaches 4294967295, past
+// int32). Before BinlogEventColumns widened it via MysqlToParquetNode2("int",
+// true), a value over 2147483647 hit the new fail-loud WriteRow against a signed
+// Int(32) column and ABORTED the whole partition archive. This drives the
+// production BinlogEventColumns through WriteRow with the unsigned maximum and a
+// mid-range value, then reads back via DuckDB parquet_scan (the real consumer):
+// both must round-trip, NOT abort and NOT become NULL.
+func TestWriteRowConnectionIDUnsignedDuckDBScan(t *testing.T) {
+	const connIDIdx = 6 // MySQL order: event_id, binlog_file, start_pos, end_pos, event_timestamp, gtid, connection_id
+
+	for _, connID := range []string{"4294967295", "3000000000"} {
+		t.Run(connID, func(t *testing.T) {
+			dir := t.TempDir()
+			outPath := filepath.Join(dir, "conn.parquet")
+			w, err := baseline.NewWriter(outPath, BinlogEventColumns,
+				baseline.WriterConfig{Compression: "none", RowGroupSize: 100})
+			if err != nil {
+				t.Fatalf("NewWriter: %v", err)
+			}
+
+			// Only connection_id and the truly-NOT-NULL columns carry a value;
+			// everything else is NULL so the row stays minimal.
+			values := make([]string, 15)
+			nulls := make([]bool, 15)
+			for i := range nulls {
+				nulls[i] = true
+			}
+			values[0], nulls[0] = "1", false // event_id
+			values[4], nulls[4] = "2026-02-19 10:00:00", false
+			values[connIDIdx], nulls[connIDIdx] = connID, false
+
+			if err := w.WriteRow(values, nulls); err != nil {
+				t.Fatalf("WriteRow(connection_id=%s): got error, want round-trip (fail-loud regression): %v", connID, err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			db, err := sql.Open("duckdb", "")
+			if err != nil {
+				t.Fatalf("open duckdb: %v", err)
+			}
+			defer db.Close()
+
+			safePath := strings.ReplaceAll(outPath, "'", "''")
+			var conn any
+			if err := db.QueryRowContext(context.Background(),
+				"SELECT connection_id FROM parquet_scan('"+safePath+"')").Scan(&conn); err != nil {
+				t.Fatalf("scan connection_id: %v", err)
+			}
+			// INT UNSIGNED widened to signed Int64 → DuckDB BIGINT → Go int64.
+			got, ok := conn.(int64)
+			if !ok {
+				t.Fatalf("connection_id scanned as %T, want int64", conn)
+			}
+			want := int64(0)
+			switch connID {
+			case "4294967295":
+				want = 4294967295
+			case "3000000000":
+				want = 3000000000
+			}
+			if got != want {
+				t.Errorf("connection_id = %d, want %d", got, want)
+			}
+		})
 	}
 }
 

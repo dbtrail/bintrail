@@ -255,6 +255,78 @@ func TestWriteRowUnsignedDuckDBScan(t *testing.T) {
 	}
 }
 
+// TestParseSchemaWiringUnsignedDuckDBScan exercises the FULL production chain —
+// ParseSchema (NOT a hand-built ParquetType) → NewWriter → WriteRow → DuckDB
+// parquet_scan — for UNSIGNED maxima. This is the one test that fails if the
+// schema.go call site regresses (e.g. ParseSchema calling
+// mysqlToParquetNode(typeToken, false)): every other unsigned test hand-builds
+// the ParquetType with explicit unsigned=true and would stay green under that
+// bug (MUT-D). Here the widening must come from ParseSchema itself.
+func TestParseSchemaWiringUnsignedDuckDBScan(t *testing.T) {
+	const schema = "CREATE TABLE `t` (\n" +
+		"  `c_big_u` bigint unsigned NOT NULL,\n" +
+		"  `c_int_u` int unsigned NOT NULL,\n" +
+		"  PRIMARY KEY (`c_int_u`)\n" +
+		") ENGINE=InnoDB;\n"
+
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "shop.t-schema.sql")
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cols, err := ParseSchema(schemaPath)
+	if err != nil {
+		t.Fatalf("ParseSchema: %v", err)
+	}
+
+	outPath := filepath.Join(dir, "wiring.parquet")
+	w, err := NewWriter(outPath, cols, WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	// Values in MySQL (schema) order: c_big_u, c_int_u.
+	if err := w.WriteRow([]string{"18446744073709551615", "4294967295"}, []bool{false, false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	safePath := strings.ReplaceAll(outPath, "'", "''")
+	var big, intv any
+	row := db.QueryRowContext(context.Background(),
+		"SELECT c_big_u, c_int_u FROM parquet_scan('"+safePath+"')")
+	if err := row.Scan(&big, &intv); err != nil {
+		t.Fatalf("scan parquet_scan row: %v", err)
+	}
+
+	// BIGINT UNSIGNED → DuckDB UBIGINT → Go uint64. Under MUT-D this column would
+	// be a signed Int64 (DuckDB BIGINT → int64) and the max would read negative.
+	bigU, ok := big.(uint64)
+	if !ok {
+		t.Fatalf("c_big_u scanned as %T, want uint64 (ParseSchema must widen BIGINT UNSIGNED to Uint64)", big)
+	}
+	if bigU != 18446744073709551615 {
+		t.Errorf("c_big_u = %d, want 18446744073709551615", bigU)
+	}
+
+	// INT UNSIGNED → widened to signed Int64 → DuckDB BIGINT → Go int64. Under
+	// MUT-D this would be an Int32 column and 4294967295 would fail to convert.
+	intI, ok := intv.(int64)
+	if !ok {
+		t.Fatalf("c_int_u scanned as %T, want int64 (ParseSchema must widen INT UNSIGNED to Int64)", intv)
+	}
+	if intI != 4294967295 {
+		t.Errorf("c_int_u = %d, want 4294967295", intI)
+	}
+}
+
 // TestWriteRowFailsLoudOnUnconvertible pins the #503 item-3 silencer fix: a
 // genuinely-unconvertible value must abort WriteRow with an error that names the
 // column and value — NOT silently become NULL. This exercises WriteRow (where
