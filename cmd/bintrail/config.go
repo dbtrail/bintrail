@@ -137,6 +137,7 @@ var envSections = []envSection{
 			{"BINTRAIL_SERVER_ID", ""},
 			{"BINTRAIL_BATCH_SIZE", "1000"},
 			{"BINTRAIL_METRICS_ADDR", ""},
+			{"BINTRAIL_METRICS_SCRAPE_INTERVAL", "60"},
 			{"BINTRAIL_STREAM_GAP_TIMEOUT", "30"},
 		},
 	},
