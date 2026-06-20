@@ -75,3 +75,44 @@ func TestReconcileReportTextSurfacesDeepUnverified(t *testing.T) {
 		t.Fatalf("healthy run must not mention deep-verify: %s", quiet.String())
 	}
 }
+
+// TestReconcileWiringFromReportDeepUnverified pins the command-layer wiring of
+// the decision-layer count: runArchiveReconcile sources deepUnverified from
+// report.DeepUnverified (the dual-backend / picked-Invalid signal), so a
+// zero-DRIFT report that nonetheless has DeepUnverified>0 still fails the
+// dry-run and shows up in both output modes. This is the integration point of
+// the review fix — the count now originates in archive.Diff, not a scan-time
+// probe counter.
+func TestReconcileWiringFromReportDeepUnverified(t *testing.T) {
+	// In sync (no actions), but one pair could not be deep-verified — the
+	// dual-backend silent-downgrade state archive.Diff now reports.
+	rep := &archive.Report{InSync: 2, DeepUnverified: 1}
+	deepUnverified := rep.DeepUnverified // mirrors runArchiveReconcile
+
+	// Dry-run must exit non-zero on the count even with zero diff actions.
+	if err := reconcileDryRunErr(rep, deepUnverified); err == nil {
+		t.Fatal("dry-run must fail when report.DeepUnverified>0 with no other drift")
+	} else if !strings.Contains(err.Error(), "could not be deep-verified") {
+		t.Fatalf("error must name the deep-verify failure, got: %v", err)
+	}
+
+	var jsonBuf bytes.Buffer
+	if err := writeReconcileReport(&jsonBuf, "json", rep, deepUnverified, 0, nil, false, false); err != nil {
+		t.Fatalf("writeReconcileReport json: %v", err)
+	}
+	var got reconcileReportJSON
+	if err := json.Unmarshal(jsonBuf.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonBuf.String())
+	}
+	if got.DeepUnverified != 1 {
+		t.Fatalf("deep_unverified = %d, want 1 (raw: %s)", got.DeepUnverified, jsonBuf.String())
+	}
+
+	var textBuf bytes.Buffer
+	if err := writeReconcileReport(&textBuf, "text", rep, deepUnverified, 0, nil, false, false); err != nil {
+		t.Fatalf("writeReconcileReport text: %v", err)
+	}
+	if !strings.Contains(textBuf.String(), "could not be deep-verified") {
+		t.Fatalf("text output must warn: %s", textBuf.String())
+	}
+}

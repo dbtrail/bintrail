@@ -112,11 +112,6 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 
 	var files []archive.ScannedFile
-	// deepUnverified counts S3 objects whose --deep footer probe failed:
-	// they were scanned but could NOT be deep-verified, so the row_count
-	// drift check silently skips them (#469). Surfaced in the report and,
-	// on the dry-run path, made to fail the cron monitor.
-	deepUnverified := 0
 	if arcDir != "" {
 		local, err := scanLocalArchive(arcDir)
 		if err != nil {
@@ -125,12 +120,11 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 		files = append(files, local...)
 	}
 	if arcS3 != "" {
-		remote, footerFailures, err := scanS3Archive(ctx, arcS3, arcRegion, arcDeep)
+		remote, err := scanS3Archive(ctx, arcS3, arcRegion, arcDeep)
 		if err != nil {
 			return fmt.Errorf("scan --archive-s3: %w", err)
 		}
 		files = append(files, remote...)
-		deepUnverified += footerFailures
 	}
 
 	db, err := config.Connect(arcIndexDSN)
@@ -151,6 +145,16 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 		PruneMinAge:  arcPruneMinAge,
 		Now:          time.Now().UTC(),
 	})
+
+	// deepUnverified counts scanned pairs --deep was asked to verify but whose
+	// picked row_count came back Invalid — the footer read failed on the
+	// backend pickMeta prefers, so the row_count drift check silently skipped
+	// them (#469). Computed at the decision layer (internal/archive) so it
+	// catches local footer failures AND the dual-backend prefer-local case,
+	// and never false-positives when the OTHER backend deep-verified the pair.
+	// Surfaced in the report and, on the dry-run path, made to fail the cron
+	// monitor.
+	deepUnverified := report.DeepUnverified
 
 	executed, execErrs := executeReconcileActions(ctx, db, report.Actions, arcRepair, arcPrune)
 
@@ -185,7 +189,10 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 
 // scanLocalArchive walks root for Hive-layout parquet files. Footer row
 // counts are always read locally — a local footer read is cheap and makes
-// repaired rows feed status totals correctly.
+// repaired rows feed status totals correctly. A failed local footer read
+// leaves RowCount Invalid (logged); under --deep that is surfaced by the
+// decision-layer deep-unverified count (archive.Diff → Report.DeepUnverified),
+// the same path that covers an unreadable S3 footer — see scanS3Archive.
 func scanLocalArchive(root string) ([]archive.ScannedFile, error) {
 	var out []archive.ScannedFile
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
@@ -244,31 +251,29 @@ func localParquetRowCount(path string, size int64) (int64, error) {
 // LastModified come free with the listing; row counts cost one metadata
 // read per object and are only fetched under --deep.
 //
-// The second return value is the count of S3 objects whose --deep footer
-// probe FAILED — these objects were scanned but NOT deep-verified. It can't
-// ride report.Err() (which only sees diff actions on the verified
-// RowCount), so the caller surfaces it separately and fails the dry-run on
-// it; a silent skip would let a "green" --deep cron run hide objects it was
-// asked to verify (#469).
-func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]archive.ScannedFile, int, error) {
+// A failed --deep footer read leaves RowCount Invalid (logged) — it is NOT
+// counted here. The deep-unverified accounting lives at the decision layer
+// (archive.Diff → Report.DeepUnverified), keyed on the PICKED row_count, so
+// it catches local footer failures and the dual-backend prefer-local case
+// too, and never over-counts an object the OTHER backend deep-verified (#469).
+func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]archive.ScannedFile, error) {
 	bucket, prefix, err := storage.ParseS3URL(s3URL)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	client, err := storage.NewS3Client(ctx, region)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	var out []archive.ScannedFile
-	footerFailures := 0
 	var token *string
 	for {
 		page, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket: &bucket, Prefix: &prefix, ContinuationToken: token,
 		})
 		if err != nil {
-			return nil, 0, fmt.Errorf("list s3://%s/%s: %w", bucket, prefix, err)
+			return nil, fmt.Errorf("list s3://%s/%s: %w", bucket, prefix, err)
 		}
 		for _, obj := range page.Contents {
 			if obj.Key == nil || !strings.HasSuffix(*obj.Key, ".parquet") {
@@ -293,7 +298,6 @@ func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]arch
 				if n, err := s3ParquetRowCount(ctx, bucket, *obj.Key); err == nil {
 					f.RowCount = sql.NullInt64{Int64: n, Valid: true}
 				} else {
-					footerFailures++
 					slog.Warn("reconcile: cannot read s3 parquet footer, row_count left unset",
 						"key", *obj.Key, "error", err)
 				}
@@ -305,7 +309,7 @@ func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]arch
 		}
 		token = page.NextContinuationToken
 	}
-	return out, footerFailures, nil
+	return out, nil
 }
 
 // s3ParquetRowCount reads num_rows from a Parquet footer in S3 via DuckDB
@@ -421,10 +425,11 @@ func applyUpsert(ctx context.Context, db *sql.DB, a archive.Action) error {
 }
 
 // reconcileDryRunErr is the dry-run cron-monitor exit decision: non-zero on
-// any archive_state drift (report.Err()) OR on any S3 object that --deep was
-// asked to verify but whose footer probe failed (#469). report.Err() itself
-// stays unchanged — the deep-unverified count is a scan-time signal that
-// can't ride the pure diff actions.
+// any archive_state drift (report.Err()) OR on any scanned pair that --deep
+// was asked to verify but whose picked row_count came back Invalid (#469).
+// report.Err() itself stays unchanged — the deep-unverified count is a
+// distinct signal (Report.DeepUnverified) that can't ride the pure diff
+// actions, since a silently-skipped row_count check produces no action.
 func reconcileDryRunErr(rep *archive.Report, deepUnverified int) error {
 	if err := rep.Err(); err != nil {
 		return err

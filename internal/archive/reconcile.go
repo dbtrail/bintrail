@@ -121,6 +121,18 @@ type Report struct {
 	Actions []Action
 
 	Inserts, Updates, Prunes, SkippedUnverified, SkippedRecent, InSync int
+
+	// DeepUnverified counts scanned (partition, bintrail_id) pairs that
+	// --deep was asked to verify but whose PICKED row_count came back Invalid
+	// — the footer read failed on the backend pickMeta prefers, so the deep
+	// row_count drift check (see updateAction) silently skipped them. Counting
+	// at the decision layer (where pickMeta runs) catches BOTH a failed local
+	// footer read AND the dual-backend prefer-local case: a row paired with a
+	// readable S3 footer but a broken local one would otherwise look
+	// deep-verified while the deep check was skipped on the unreadable local
+	// count. It does NOT false-positive when the picked count is valid — a
+	// partition genuinely deep-verified via the surviving backend (#469).
+	DeepUnverified int
 }
 
 // Err returns non-nil when drift exists (any insert/update/prune action) —
@@ -200,6 +212,19 @@ func Diff(files []ScannedFile, rows []StateRow, opts DiffOptions) Report {
 		if !exists {
 			report.add(insertAction(k, p.local, p.s3))
 			continue
+		}
+		// Deep-verify accounting at the decision layer: every key here has ≥1
+		// scanned file. If --deep was asked for but the PICKED row_count is
+		// Invalid (the preferred backend's footer read failed), updateAction's
+		// row_count drift check is skipped for this pair — a silent --deep
+		// downgrade. Count it so the dry-run fails and the report surfaces it,
+		// instead of relying on a per-backend probe counter that misses the
+		// dual-backend prefer-local case and over-counts when the OTHER
+		// backend verified it just fine.
+		if opts.Deep {
+			if _, rowCount := pickMeta(p.local, p.s3); !rowCount.Valid {
+				report.DeepUnverified++
+			}
 		}
 		if a, ok := updateAction(k, row, p.local, p.s3, opts); ok {
 			report.add(a)

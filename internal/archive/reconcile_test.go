@@ -209,6 +209,113 @@ func TestDiffPruneSafety(t *testing.T) {
 	})
 }
 
+// TestDiffDeepUnverified pins the decision-layer deep-verify accounting
+// (closes the dual-backend / local-only --deep silent-downgrade): when --deep
+// is asked for but the PICKED row_count is Invalid, the pair is counted in
+// Report.DeepUnverified even though it produces no diff action (so Err() stays
+// nil) — exactly the silent state the cron monitor must still fail on. A pair
+// deep-verified via the SURVIVING backend (picked count valid) must NOT be
+// counted: that is the over-count false-positive the raw per-backend probe
+// counter had.
+func TestDiffDeepUnverified(t *testing.T) {
+	// localFile/s3File always set a valid RowCount; build the broken-footer
+	// variants by hand (zero-value sql.NullInt64 = Invalid).
+	const part, id = "p_2026060510", "abc"
+	localNoCount := func(path string, size int64) ScannedFile {
+		return ScannedFile{PartitionName: part, BintrailID: id, Backend: BackendLocal,
+			LocalPath: path, SizeBytes: size, LastModified: tModified}
+	}
+	s3NoCount := func(bucket, key string, size int64) ScannedFile {
+		return ScannedFile{PartitionName: part, BintrailID: id, Backend: BackendS3,
+			S3Bucket: bucket, S3Key: key, SizeBytes: size, LastModified: tModified}
+	}
+	// An in-sync StateRow that matches size + the (S3) row_count, so no diff
+	// action is produced — the silent path.
+	inSyncRow := func(rowCount int64) []StateRow {
+		return []StateRow{{
+			PartitionName: part, BintrailID: id,
+			LocalPath:     nStr("/a/x.parquet"), FileSizeBytes: nInt(100), RowCount: nInt(rowCount),
+			S3Bucket: nStr("bkt"), S3Key: nStr("k/events.parquet"), S3UploadedAt: nTime(tModified),
+			ArchivedAt: tOld,
+		}}
+	}
+
+	deep := bothScanned()
+	deep.Deep = true
+
+	t.Run("dual-backend prefer-local: local footer failed, S3 valid → counted, no action", func(t *testing.T) {
+		// pickMeta PREFERS local; its row_count is Invalid → the deep
+		// row_count check is skipped, even though the S3 footer read fine.
+		s3Verified := s3File(part, id, "bkt", "k/events.parquet", 100)
+		s3Verified.RowCount = nInt(42) // S3 footer read fine — but pickMeta won't use it
+		files := []ScannedFile{
+			localNoCount("/a/x.parquet", 100),
+			s3Verified,
+		}
+		rep := Diff(files, inSyncRow(42), deep)
+		if rep.DeepUnverified != 1 {
+			t.Fatalf("dual-backend prefer-local footer failure must be deep-unverified, got %+v", rep)
+		}
+		// The downgrade is SILENT: no action, Err() nil — only DeepUnverified
+		// (and the command's dry-run-exit/JSON/WARNING wiring) catches it.
+		if len(rep.Actions) != 0 || rep.Err() != nil {
+			t.Fatalf("the silent-downgrade state must produce no action and nil Err(), got %+v err=%v", rep, rep.Err())
+		}
+	})
+
+	t.Run("local-only: footer failed → counted", func(t *testing.T) {
+		rep := Diff([]ScannedFile{localNoCount("/a/x.parquet", 100)},
+			[]StateRow{{PartitionName: part, BintrailID: id,
+				LocalPath: nStr("/a/x.parquet"), FileSizeBytes: nInt(100), RowCount: nInt(42), ArchivedAt: tOld}},
+			deep)
+		if rep.DeepUnverified != 1 {
+			t.Fatalf("local-only footer failure must be deep-unverified, got %+v", rep)
+		}
+	})
+
+	t.Run("S3-only: footer failed → counted (parity with the old per-probe counter)", func(t *testing.T) {
+		rep := Diff([]ScannedFile{s3NoCount("bkt", "k/events.parquet", 100)},
+			inSyncRow(42),
+			DiffOptions{ScannedS3: true, Deep: true, PruneMinAge: time.Hour, Now: tNow})
+		if rep.DeepUnverified != 1 {
+			t.Fatalf("S3-only footer failure must be deep-unverified, got %+v", rep)
+		}
+	})
+
+	t.Run("no false-positive: picked count valid → NOT counted", func(t *testing.T) {
+		// Local present with a VALID footer → picked count valid → genuinely
+		// deep-verified, must not inflate DeepUnverified.
+		rep := Diff([]ScannedFile{localFile(part, id, "/a/x.parquet", 100, 42)}, inSyncRow(42), deep)
+		if rep.DeepUnverified != 0 {
+			t.Fatalf("a deep-verified pair must not be counted, got %+v", rep)
+		}
+	})
+
+	t.Run("no false-positive via surviving backend: S3-only with a valid footer", func(t *testing.T) {
+		// S3-only file whose --deep footer read SUCCEEDED (valid RowCount, no
+		// local) → pickMeta returns the valid S3 count → not counted. Confirms
+		// the count keys on the PICKED value, not on any-backend-failed.
+		s3Verified := s3File(part, id, "bkt", "k/events.parquet", 100)
+		s3Verified.RowCount = nInt(42)
+		rep := Diff([]ScannedFile{s3Verified},
+			inSyncRow(42),
+			DiffOptions{ScannedS3: true, Deep: true, PruneMinAge: time.Hour, Now: tNow})
+		if rep.DeepUnverified != 0 {
+			t.Fatalf("a valid-S3-footer pair must not be counted, got %+v", rep)
+		}
+	})
+
+	t.Run("not counted without --deep", func(t *testing.T) {
+		rep := Diff([]ScannedFile{localNoCount("/a/x.parquet", 100)},
+			[]StateRow{{PartitionName: part, BintrailID: id,
+				LocalPath: nStr("/a/x.parquet"), FileSizeBytes: nInt(100), RowCount: nInt(42), ArchivedAt: tOld}},
+			bothScanned())
+		if rep.DeepUnverified != 0 {
+			t.Fatalf("DeepUnverified must stay zero without --deep, got %+v", rep)
+		}
+	})
+}
+
 // TestDiffDeterministicOrder: actions sort by (partition, bintrail_id).
 func TestDiffDeterministicOrder(t *testing.T) {
 	files := []ScannedFile{
