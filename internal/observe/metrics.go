@@ -173,6 +173,11 @@ type IndexSnapshot struct {
 	GapHours         int
 	MySQLBytes       int64
 	ParquetBytes     int64
+	// HaveCoverage reports whether the coverage load succeeded. Events and
+	// MySQLBytes come from it; when it degraded (false) they are NOT published,
+	// so a swallowed partial-load failure can't mask the real values with a 0 —
+	// the same misleading-zero defense as the OldestEvent/NewestEvent guards.
+	HaveCoverage bool
 }
 
 // IndexMetrics is the index gauge set curried to one source.
@@ -198,10 +203,14 @@ func (m *IndexMetrics) Set(snap IndexSnapshot, now time.Time) {
 	if !snap.NewestEvent.IsZero() {
 		indexNewestEvent.WithLabelValues(s).Set(float64(snap.NewestEvent.Unix()))
 	}
-	indexEventsTotal.WithLabelValues(s).Set(float64(snap.Events))
+	// events_total and storage_bytes{mysql} are coverage-derived — skip them on a
+	// degraded load so a swallowed failure can't publish a misleading 0.
+	if snap.HaveCoverage {
+		indexEventsTotal.WithLabelValues(s).Set(float64(snap.Events))
+		indexStorageBytes.WithLabelValues(s, "mysql").Set(float64(snap.MySQLBytes))
+	}
 	indexPartitions.WithLabelValues(s, "active").Set(float64(snap.ActivePartitions))
 	indexPartitions.WithLabelValues(s, "future").Set(float64(snap.FuturePartitions))
 	indexGapHours.WithLabelValues(s).Set(float64(snap.GapHours))
-	indexStorageBytes.WithLabelValues(s, "mysql").Set(float64(snap.MySQLBytes))
 	indexStorageBytes.WithLabelValues(s, "parquet").Set(float64(snap.ParquetBytes))
 }

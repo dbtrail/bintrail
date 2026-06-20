@@ -54,6 +54,13 @@ The **state of the index** — refreshed periodically (default 60s,
 > labelled per schema/table, which would grow unbounded as tables come and go.
 > Per-table baseline size is surfaced via `bintrail status --format json`
 > instead (the `size_bytes` field on each baseline).
+>
+> `gap_hours` counts holes **within the retained span** — from the oldest data
+> still known (live or archived) up to the newest explicit hourly partition. It
+> cannot detect holes entirely *before* the oldest surviving data (nothing
+> records that those hours ever existed), and the not-yet-rotated current hours
+> (`p_future`) are excluded, so a stream with no rotation loop never false-counts
+> them.
 
 ## PromQL recipes
 
@@ -70,17 +77,25 @@ bintrail_index_retention_horizon_seconds < 7 * 24 * 3600
 bintrail_index_gap_hours > 0
 ```
 
-**Index disk growth** — MySQL index size trend, to project a disk-full date:
+**Index disk growth** — MySQL index size trend, to project a disk-full date
+(two separate queries — current size, then the 7-day projection):
 
 ```promql
 bintrail_index_storage_bytes{location="mysql"}
+```
+
+```promql
 predict_linear(bintrail_index_storage_bytes{location="mysql"}[6h], 7 * 24 * 3600)
 ```
 
-**Stream stalled** — replication lag climbing or no events indexed:
+**Stream stalled** — replication lag climbing, **or** no events indexed (either
+condition is a separate alert):
 
 ```promql
 bintrail_stream_replication_lag_seconds > 300
+```
+
+```promql
 rate(bintrail_stream_events_indexed_total[5m]) == 0
 ```
 

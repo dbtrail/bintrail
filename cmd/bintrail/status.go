@@ -87,6 +87,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				var size int64
 				if fi, sErr := os.Stat(b.Path); sErr == nil {
 					size = fi.Size()
+				} else {
+					slog.Warn("could not stat baseline file for size", "path", b.Path, "error", sErr)
 				}
 				data.Baselines = append(data.Baselines, status.BaselineInfo{
 					SnapshotTime: b.SnapshotTime,

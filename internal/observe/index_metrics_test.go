@@ -14,6 +14,7 @@ func TestIndexMetricsSet(t *testing.T) {
 	now := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
 
 	m.Set(IndexSnapshot{
+		HaveCoverage:     true,
 		OldestEvent:      oldest,
 		NewestEvent:      newest,
 		Events:           1234,
@@ -63,5 +64,26 @@ func TestIndexMetricsSet_zeroTimestampsNotPublished(t *testing.T) {
 	// Aggregates without a time dimension are still published.
 	if got := testutil.ToFloat64(indexPartitions.WithLabelValues("empty-src", "active")); got != 1 {
 		t.Errorf("active partitions = %v, want 1", got)
+	}
+}
+
+// A degraded scrape (coverage load failed → HaveCoverage=false) must NOT
+// overwrite events_total / storage_bytes{mysql} with a misleading 0; the
+// partition counts (independent of coverage) still update.
+func TestIndexMetricsSet_degradedCoverageRetainsPriorGauges(t *testing.T) {
+	m := IndexForSource("degraded-src")
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	m.Set(IndexSnapshot{HaveCoverage: true, Events: 777, MySQLBytes: 555, ActivePartitions: 3}, now)
+	m.Set(IndexSnapshot{HaveCoverage: false, Events: 0, MySQLBytes: 0, ActivePartitions: 4}, now)
+
+	if got := testutil.ToFloat64(indexEventsTotal.WithLabelValues("degraded-src")); got != 777 {
+		t.Errorf("events_total = %v after degraded scrape, want retained 777", got)
+	}
+	if got := testutil.ToFloat64(indexStorageBytes.WithLabelValues("degraded-src", "mysql")); got != 555 {
+		t.Errorf("storage_bytes{mysql} = %v after degraded scrape, want retained 555", got)
+	}
+	if got := testutil.ToFloat64(indexPartitions.WithLabelValues("degraded-src", "active")); got != 4 {
+		t.Errorf("active partitions = %v, want updated 4 (independent of coverage)", got)
 	}
 }

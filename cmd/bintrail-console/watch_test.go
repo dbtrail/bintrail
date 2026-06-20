@@ -162,12 +162,13 @@ func TestResolveUpConsoleEnv(t *testing.T) {
 // future "let me delete this unused field" refactor can't change behavior.
 func TestWatchStreamConfig(t *testing.T) {
 	orig := struct {
-		src, idx, sch, tbl, fmtv string
-		batch, chk               int
-	}{upSourceDSN, upIndexDSN, upSchemas, upTables, upFormat, upBatchSize, upCheckpoint}
+		src, idx, sch, tbl, fmtv, met string
+		batch, chk, msi               int
+	}{upSourceDSN, upIndexDSN, upSchemas, upTables, upFormat, upMetricsAddr, upBatchSize, upCheckpoint, upMetricsScrapeInterval}
 	t.Cleanup(func() {
 		upSourceDSN, upIndexDSN, upSchemas, upTables, upFormat = orig.src, orig.idx, orig.sch, orig.tbl, orig.fmtv
 		upBatchSize, upCheckpoint = orig.batch, orig.chk
+		upMetricsAddr, upMetricsScrapeInterval = orig.met, orig.msi
 	})
 
 	upSourceDSN = "user:pass@tcp(source.example.com:3306)/src"
@@ -177,6 +178,8 @@ func TestWatchStreamConfig(t *testing.T) {
 	upBatchSize = 2500
 	upCheckpoint = 15
 	upFormat = "json"
+	upMetricsAddr = "" // primary stream gates index metrics on this being set
+	upMetricsScrapeInterval = 33
 
 	const passedServerID uint32 = 4242424242
 	cfg := watchStreamConfig(passedServerID)
@@ -203,6 +206,20 @@ func TestWatchStreamConfig(t *testing.T) {
 	// The daemon serves ONE /metrics endpoint for all streams; a per-stream
 	// bind here would conflict with it.
 	assertStr(t, "MetricsAddr", cfg.MetricsAddr, "")
+	if cfg.MetricsScrapeInterval != 33 {
+		t.Errorf("MetricsScrapeInterval = %d, want 33", cfg.MetricsScrapeInterval)
+	}
+	// IndexMetrics is the load-bearing wiring for the daemon's OWN primary
+	// stream (it sets neither MetricsAddr nor MetricsSource): it must be ON iff
+	// the daemon exposes /metrics (upMetricsAddr set), else the index gauges are
+	// silently never scraped.
+	if cfg.IndexMetrics {
+		t.Error("IndexMetrics = true with --metrics-addr unset, want false")
+	}
+	upMetricsAddr = ":9090"
+	if got := watchStreamConfig(passedServerID); !got.IndexMetrics {
+		t.Error("IndexMetrics = false with --metrics-addr set, want true")
+	}
 	if cfg.StartPos != 4 {
 		t.Errorf("StartPos = %d, want 4 (binlog magic-number header end)", cfg.StartPos)
 	}

@@ -61,7 +61,7 @@ func scrapeIndexMetrics(ctx context.Context, db *sql.DB, dbName string, m *obser
 		return
 	}
 
-	snap := observe.IndexSnapshot{}
+	snap := observe.IndexSnapshot{HaveCoverage: data.Coverage != nil}
 	if data.Coverage != nil {
 		if data.Coverage.EarliestEvent.Valid {
 			snap.OldestEvent = data.Coverage.EarliestEvent.Time
@@ -72,27 +72,35 @@ func scrapeIndexMetrics(ctx context.Context, db *sql.DB, dbName string, m *obser
 		snap.Events = data.Coverage.TotalEvents
 		snap.MySQLBytes = data.Coverage.IndexSizeBytes
 	}
+	var newestExplicit time.Time // newest EXPLICIT hourly partition (excludes p_future)
 	for _, p := range data.Parts {
 		if p.Name == "p_future" {
 			snap.FuturePartitions++
-		} else {
-			snap.ActivePartitions++
+			continue
+		}
+		snap.ActivePartitions++
+		if h, ok := query.ParsePartitionName(p.Name); ok && h.After(newestExplicit) {
+			newestExplicit = h
 		}
 	}
 	if data.Archives != nil {
 		snap.ParquetBytes = data.Archives.TotalSizeBytes
 	}
 
-	// Gap hours: hours rotated out of MySQL with no Parquet archive — holes in
-	// recovery coverage. query.Plan SHORT-CIRCUITS to a nil plan when given a
-	// nil range (planner.go), so we must pass a concrete window — and it has to
-	// reach back to the earliest data that SHOULD exist (live or archived) for
-	// the count to mean anything. An empty index has no span and no gaps.
+	// Gap hours: hours ROTATED OUT of MySQL and never archived — holes in
+	// recovery coverage. Two bounds matter: since reaches back to the earliest
+	// data that should exist (oldest live event or earliest archived hour) so a
+	// hole anywhere in the retained span is seen; until is the end of the EXPLICIT
+	// hourly partitions, because hours beyond that live in p_future (current data,
+	// never rotated) and counting them as gaps would make a no-rotation standalone
+	// stream report a steadily climbing false gap_hours (loadLivePartitionHours
+	// excludes p_future). A concrete range also keeps the scraper off query.Plan's
+	// nil-range short-circuit (the earlier nil-deref panic).
 	var archiveEarliest sql.NullTime
 	if data.Coverage != nil {
 		archiveEarliest = data.Coverage.ArchiveEarliestHour
 	}
-	if since, until, ok := gapScrapeRange(snap.OldestEvent, archiveEarliest, time.Now()); ok {
+	if since, until, ok := gapScrapeRange(snap.OldestEvent, archiveEarliest, newestExplicit); ok {
 		if plan, err := query.Plan(ctx, db, dbName, &since, &until); err != nil {
 			slog.Warn("index metrics scrape: could not plan gap hours", "error", err)
 		} else if plan != nil { // belt-and-suspenders: Plan can still return nil
@@ -104,19 +112,26 @@ func scrapeIndexMetrics(ctx context.Context, db *sql.DB, dbName string, m *obser
 }
 
 // gapScrapeRange returns the [since, until] window over which to count coverage
-// gap hours, or ok=false when the index has no data to span. since reaches back
-// to the earliest data that should exist — the earlier of the oldest live event
-// and the earliest archived hour — so a hole anywhere in the covered span is
-// seen. Returning a concrete (non-nil) range is also what keeps the scraper
-// from calling query.Plan with nil bounds, which it short-circuits to a nil
-// plan (the cause of an earlier nil-deref panic).
-func gapScrapeRange(oldest time.Time, archiveEarliest sql.NullTime, now time.Time) (since, until time.Time, ok bool) {
+// gap hours, or ok=false when there is no rotated span to measure. since is the
+// earlier of the oldest live event and the earliest archived hour (so a hole
+// anywhere in the retained span is seen); until is one hour past the newest
+// EXPLICIT hourly partition, so the not-yet-rotated p_future tail is excluded —
+// otherwise a no-rotation standalone stream over-counts current hours as gaps.
+// A concrete (non-nil) range also keeps the scraper off query.Plan's nil-range
+// short-circuit (the cause of an earlier nil-deref panic).
+func gapScrapeRange(oldest time.Time, archiveEarliest sql.NullTime, newestExplicit time.Time) (since, until time.Time, ok bool) {
 	since = oldest
 	if archiveEarliest.Valid && (since.IsZero() || archiveEarliest.Time.Before(since)) {
 		since = archiveEarliest.Time
 	}
-	if since.IsZero() {
+	// No data to anchor since, or no explicit partition to bound until → there is
+	// no rotated span to measure.
+	if since.IsZero() || newestExplicit.IsZero() {
 		return time.Time{}, time.Time{}, false
 	}
-	return since, now, true
+	until = newestExplicit.Add(time.Hour)
+	if !until.After(since) {
+		return time.Time{}, time.Time{}, false
+	}
+	return since, until, true
 }
