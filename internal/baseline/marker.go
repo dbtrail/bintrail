@@ -2,6 +2,7 @@ package baseline
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -42,12 +43,19 @@ const (
 // WriteSuccessMarker writes the _SUCCESS marker into snapshotDir and removes any
 // stale _INCOMPLETE marker left by an earlier failed attempt (the --retry path
 // can complete a snapshot that a previous run flagged incomplete).
+//
+// Only the _SUCCESS write is fatal: once it lands, SnapshotComplete reports
+// complete (it checks _SUCCESS first), so a failure to remove a leftover
+// _INCOMPLETE is harmless bookkeeping — surfacing it as an error would make a
+// genuinely-completed snapshot read as "could not write _SUCCESS". So we log
+// that case rather than return it.
 func WriteSuccessMarker(snapshotDir string) error {
 	if err := os.WriteFile(filepath.Join(snapshotDir, SuccessMarker), nil, 0o644); err != nil {
 		return fmt.Errorf("write %s marker: %w", SuccessMarker, err)
 	}
 	if err := os.Remove(filepath.Join(snapshotDir, IncompleteMarker)); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove stale %s marker: %w", IncompleteMarker, err)
+		slog.Warn("could not remove stale incomplete-snapshot marker (harmless; _SUCCESS decides completeness)",
+			"dir", snapshotDir, "marker", IncompleteMarker, "error", err)
 	}
 	return nil
 }
@@ -66,6 +74,11 @@ func WriteIncompleteMarker(snapshotDir string) error {
 // COMPLETE baseline, for local discovery. The rule (see the package comment):
 //   - _INCOMPLETE present, _SUCCESS absent → incomplete (false).
 //   - otherwise (marker-absent legacy snapshot, or _SUCCESS present) → complete.
+//
+// Operator note: snapshots produced before this release carry NEITHER marker
+// and are trusted as complete-by-default. If a pre-release run may have been
+// interrupted mid-way, re-run `bintrail baseline` for that snapshot — there is
+// no marker to flag it incomplete retroactively.
 func SnapshotComplete(snapshotDir string) bool {
 	if _, err := os.Stat(filepath.Join(snapshotDir, SuccessMarker)); err == nil {
 		return true

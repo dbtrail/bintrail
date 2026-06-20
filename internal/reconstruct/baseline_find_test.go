@@ -169,6 +169,50 @@ func TestS3IncompleteSnapshots(t *testing.T) {
 	}
 }
 
+// TestStaleWarningS3_errorReturnsFoundBaseline pins the #524 HIGH fix: the
+// advisory broad-glob (s3NewestSnapshot) must NOT fail an already-located
+// baseline. When the broad glob errors, staleWarningS3 returns the zero
+// StaleWarning ("not stale") and logs a warn — it never propagates the error,
+// so findBaselineS3 returns the baseline it already found.
+func TestStaleWarningS3_errorReturnsFoundBaseline(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close() // a closed *sql.DB makes s3NewestSnapshot's QueryContext error deterministically
+
+	using := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+
+	buf := captureWarns(t)
+	stale := staleWarningS3(context.Background(), db, "s3://bucket/prefix", "shop", "orders", using, at, map[string]bool{})
+	if stale.Stale() {
+		t.Fatalf("advisory staleness glob error must yield a non-stale (empty) StaleWarning, got %+v", stale)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("staleness check failed")) {
+		t.Fatalf("want a 'staleness check failed' warn on broad-glob error, got: %q", buf.String())
+	}
+}
+
+// TestS3IncompleteSnapshots_errorSurfaces pins the #524 LOW fix's contract: the
+// marker filter is a CORRECTNESS filter, so an error reading the markers must
+// surface (never silently treat all snapshots as complete-by-default). The
+// per-row Scan-error branch (continue→return) is defensive — glob() returns one
+// VARCHAR, so a Scan can't be made to fail with real DuckDB — but the loud-fail
+// contract is observable here via a closed *sql.DB, which makes the marker query
+// fail. Mirrors the hardened listBaselinesS3 Scan branch.
+func TestS3IncompleteSnapshots_errorSurfaces(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close() // closed DB → the marker QueryContext fails
+
+	if _, err := s3IncompleteSnapshots(context.Background(), db, "s3://bucket/prefix"); err == nil {
+		t.Fatal("s3IncompleteSnapshots must return an error when the marker glob/scan fails, not silently treat all snapshots as complete")
+	}
+}
+
 // TestS3NewestSnapshot exercises the broad newest-snapshot derivation used by
 // the S3 lookup (#466) against real DuckDB glob() on a local path: it returns
 // the newest COMPLETE snapshot at-or-before `at`, ignoring snapshots after `at`

@@ -106,3 +106,31 @@ func UploadFile(ctx context.Context, client *s3.Client, path, bucket, key string
 	}
 	return nil
 }
+
+// PutEmptyObject writes a zero-byte object at key. It is used to publish the
+// _INCOMPLETE / completeness markers on the S3 upload path without needing a
+// local file to walk (the local _INCOMPLETE marker is already removed once a
+// run succeeds).
+func PutEmptyObject(ctx context.Context, client *s3.Client, bucket, key string) error {
+	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   strings.NewReader(""),
+	}); err != nil {
+		return fmt.Errorf("put empty object s3://%s/%s: %w", bucket, key, err)
+	}
+	return nil
+}
+
+// DeleteObject removes a single object. Used to clean up the _INCOMPLETE marker
+// once an S3 snapshot upload completes; callers treat its failure as harmless
+// because completeness is decided by _SUCCESS-present first.
+func DeleteObject(ctx context.Context, client *s3.Client, bucket, key string) error {
+	if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	}); err != nil {
+		return fmt.Errorf("delete s3://%s/%s: %w", bucket, key, err)
+	}
+	return nil
+}

@@ -170,12 +170,21 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 // ~/.aws/config. When retry is true, files that already exist in S3 are
 // skipped (checked via HeadObject). Returns the number of files uploaded.
 //
-// The _SUCCESS completeness marker (#467) is uploaded LAST, after every other
-// file. WalkDir is lexical and "_SUCCESS" sorts before sibling schema dirs, so
-// a naive walk would publish the marker first; if the upload then died mid-way,
-// S3 would carry _SUCCESS without all the Parquet — the exact "partial looks
-// complete" failure #467 kills, recreated on the upload path. Deferring it keeps
-// the S3 snapshot un-marked-complete until its data is fully present.
+// The upload mirrors the local Run marker contract (#467) so a mid-upload death
+// leaves a snapshot that S3 discovery treats as INCOMPLETE, not complete:
+//
+//  1. _INCOMPLETE FIRST, per snapshot dir (a zero-byte object — the local
+//     _INCOMPLETE marker was already removed once Run succeeded, so there is no
+//     local file to walk).
+//  2. every data file.
+//  3. _SUCCESS LAST. WalkDir is lexical and "_SUCCESS" sorts before sibling
+//     schema dirs, so a naive walk would publish it first; deferring it keeps
+//     the S3 snapshot un-marked-complete until its data is fully present.
+//  4. best-effort _INCOMPLETE delete. s3IncompleteSnapshots only flags a
+//     snapshot incomplete when _INCOMPLETE is present AND _SUCCESS is absent, so
+//     a leftover _INCOMPLETE next to a published _SUCCESS is harmless — a failed
+//     delete never demotes a completed snapshot. (No S3 DeleteObject of partial
+//     data is attempted; resume via --retry overwrites in place.)
 func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string, retry bool) (int, error) {
 	bucket, prefix, err := storage.ParseS3URL(s3URL)
 	if err != nil {
@@ -209,6 +218,29 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string, re
 		return nil
 	}
 
+	// Snapshot dirs to upload, identified by a local _SUCCESS marker — only
+	// completed snapshots reach here post-Run. Each one's _INCOMPLETE marker is
+	// keyed off the snapshot dir, NOT off a walked file (Run already removed it).
+	snapDirs, err := snapshotDirsWithSuccess(outputDir)
+	if err != nil {
+		return 0, err
+	}
+	incompleteKey := func(snapDir string) (string, error) {
+		return storage.BuildS3Key(outputDir, filepath.Join(snapDir, baseline.IncompleteMarker), prefix)
+	}
+
+	// 1. Publish _INCOMPLETE FIRST so an interrupted upload reads as incomplete.
+	for _, snapDir := range snapDirs {
+		key, err := incompleteKey(snapDir)
+		if err != nil {
+			return 0, err
+		}
+		if err := storage.PutEmptyObject(ctx, client, bucket, key); err != nil {
+			return 0, err
+		}
+	}
+
+	// 2 & 3. Upload data files; defer the _SUCCESS marker(s) to the very end.
 	var count int
 	var successMarkers []string
 	err = filepath.WalkDir(outputDir, func(path string, d fs.DirEntry, walkErr error) error {
@@ -228,14 +260,47 @@ func uploadBaselineToS3(ctx context.Context, outputDir, s3URL, region string, re
 	if err != nil {
 		return count, err
 	}
-	// Everything else is uploaded; publish the completeness marker(s) last.
 	for _, path := range successMarkers {
 		if err := upload(path); err != nil {
 			return count, err
 		}
 		count++
 	}
+
+	// 4. Best-effort _INCOMPLETE cleanup — harmless to leave (see the func doc).
+	for _, snapDir := range snapDirs {
+		key, err := incompleteKey(snapDir)
+		if err != nil {
+			slog.Warn("could not build _INCOMPLETE marker key for cleanup", "snapshot", snapDir, "error", err)
+			continue
+		}
+		if err := storage.DeleteObject(ctx, client, bucket, key); err != nil {
+			slog.Warn("could not remove S3 _INCOMPLETE marker after upload (harmless; _SUCCESS decides completeness)",
+				"bucket", bucket, "key", key, "error", err)
+		}
+	}
 	return count, nil
+}
+
+// snapshotDirsWithSuccess returns the immediate child snapshot directories of
+// outputDir that carry a local _SUCCESS marker (i.e. completed snapshots). The
+// baseline layout is <output>/<timestamp>/..., so only one level is scanned.
+func snapshotDirsWithSuccess(outputDir string) ([]string, error) {
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		return nil, fmt.Errorf("read output directory %q: %w", outputDir, err)
+	}
+	var dirs []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		snapDir := filepath.Join(outputDir, e.Name())
+		if _, err := os.Stat(filepath.Join(snapDir, baseline.SuccessMarker)); err == nil {
+			dirs = append(dirs, snapDir)
+		}
+	}
+	return dirs, nil
 }
 
 // decryptDumpFiles walks inputDir and decrypts every .enc file using openssl,

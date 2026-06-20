@@ -412,6 +412,12 @@ func staleFallback(schema, table string, using, newestSnap time.Time) StaleWarni
 // listBaselinesS3 uses) — bounding the listing cost to a single extra glob —
 // to derive the newest complete snapshot at-or-before `at`, and ONE marker glob
 // (prefix/*/_SUCCESS and _INCOMPLETE) to exclude partial snapshots (#467).
+//
+// The two glob steps differ in fatality: the marker glob (s3IncompleteSnapshots)
+// is a CORRECTNESS filter — its error fails the lookup so a partial snapshot can
+// never slip through — while the broad newest-snapshot glob is purely ADVISORY
+// (staleWarningS3) and its error must NOT discard the already-located baseline
+// (#524 review).
 func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Time) (string, time.Time, StaleWarning, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -474,15 +480,33 @@ func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Ti
 	slices.SortFunc(candidates, func(a, b candidate) int { return b.t.Compare(a.t) })
 	best := candidates[0]
 
+	// `best` is a VALID located baseline. The staleness warning is ADVISORY, so
+	// its computation must never fail the recovery (see staleWarningS3).
+	stale := staleWarningS3(ctx, db, prefix, schema, table, best.t, at, incomplete)
+	return best.path, best.t, stale, nil
+}
+
+// staleWarningS3 derives the advisory staleness warning for an already-located
+// S3 baseline. The broad newest-snapshot glob (s3NewestSnapshot) lists every
+// parquet across all snapshots and is the most likely of the lookup's globs to
+// throttle/timeout on a large bucket; findBaselineS3 is on the per-request shim
+// `_snapshot` / console reconstruct hot path (no caching). A transient S3 blip
+// on this purely-advisory step must NOT throw away the baseline we already
+// found — that would fail a recovery that pre-#466 succeeded, the inverse of
+// the goal. So on error we warn and return the zero StaleWarning ("not stale");
+// only the FATAL filters (incomplete-snapshot exclusion, the table-scoped glob)
+// can fail the lookup (#524 review).
+func staleWarningS3(ctx context.Context, db *sql.DB, prefix, schema, table string, using, at time.Time, incomplete map[string]bool) StaleWarning {
 	// Broad scan for the newest complete snapshot at-or-before `at`, whether or
 	// not it contains this table — the missing piece that let S3 fall back
 	// silently (#466).
 	newestSnap, err := s3NewestSnapshot(ctx, db, prefix, at, incomplete)
 	if err != nil {
-		return "", time.Time{}, StaleWarning{}, err
+		slog.Warn("baseline: staleness check failed; returning the located baseline without a stale warning",
+			"schema", schema, "table", table, "error", err)
+		return StaleWarning{}
 	}
-	stale := staleFallback(schema, table, best.t, newestSnap)
-	return best.path, best.t, stale, nil
+	return staleFallback(schema, table, using, newestSnap)
 }
 
 // s3NewestSnapshot returns the newest complete snapshot timestamp at-or-before
@@ -546,7 +570,13 @@ func s3IncompleteSnapshots(ctx context.Context, db *sql.DB, prefix string) (map[
 	for rows.Next() {
 		var path string
 		if err := rows.Scan(&path); err != nil {
-			continue
+			// This is a CORRECTNESS filter, not an observability listing: a
+			// silently dropped row could be an _INCOMPLETE marker, which would
+			// demote its partial snapshot to complete-by-default (residual #467).
+			// Fail loud — the safe-on-error direction for a marker filter is
+			// "treat as incomplete / surface the error", never silently complete.
+			// Mirrors the hardened listBaselinesS3 Scan branch (#524 review).
+			return nil, fmt.Errorf("scan S3 baseline marker path: %w", err)
 		}
 		rest := strings.TrimPrefix(path, prefix+"/")
 		parts := strings.Split(rest, "/")
