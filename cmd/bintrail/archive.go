@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -111,6 +112,11 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 
 	var files []archive.ScannedFile
+	// deepUnverified counts S3 objects whose --deep footer probe failed:
+	// they were scanned but could NOT be deep-verified, so the row_count
+	// drift check silently skips them (#469). Surfaced in the report and,
+	// on the dry-run path, made to fail the cron monitor.
+	deepUnverified := 0
 	if arcDir != "" {
 		local, err := scanLocalArchive(arcDir)
 		if err != nil {
@@ -119,11 +125,12 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 		files = append(files, local...)
 	}
 	if arcS3 != "" {
-		remote, err := scanS3Archive(ctx, arcS3, arcRegion, arcDeep)
+		remote, footerFailures, err := scanS3Archive(ctx, arcS3, arcRegion, arcDeep)
 		if err != nil {
 			return fmt.Errorf("scan --archive-s3: %w", err)
 		}
 		files = append(files, remote...)
+		deepUnverified += footerFailures
 	}
 
 	db, err := config.Connect(arcIndexDSN)
@@ -147,15 +154,16 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 
 	executed, execErrs := executeReconcileActions(ctx, db, report.Actions, arcRepair, arcPrune)
 
-	if err := writeReconcileReport(os.Stdout, arcFormat, &report, executed, execErrs, arcRepair, arcPrune); err != nil {
+	if err := writeReconcileReport(os.Stdout, arcFormat, &report, deepUnverified, executed, execErrs, arcRepair, arcPrune); err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}
 	if len(execErrs) > 0 {
 		return fmt.Errorf("%d reconcile action(s) failed", len(execErrs))
 	}
 	if !arcRepair && !arcPrune {
-		// Dry-run: non-zero exit on any drift (the cron monitor contract).
-		return report.Err()
+		// Dry-run: non-zero exit on any drift (the cron monitor contract),
+		// including objects --deep was asked to verify but couldn't (#469).
+		return reconcileDryRunErr(&report, deepUnverified)
 	}
 	// Execute mode: exit 0 ⟺ no unaddressed drift remains. EVERY action
 	// this invocation's flags didn't execute counts — --prune without
@@ -235,24 +243,32 @@ func localParquetRowCount(path string, size int64) (int64, error) {
 // scanS3Archive lists the prefix for Hive-layout parquet objects. Size and
 // LastModified come free with the listing; row counts cost one metadata
 // read per object and are only fetched under --deep.
-func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]archive.ScannedFile, error) {
+//
+// The second return value is the count of S3 objects whose --deep footer
+// probe FAILED — these objects were scanned but NOT deep-verified. It can't
+// ride report.Err() (which only sees diff actions on the verified
+// RowCount), so the caller surfaces it separately and fails the dry-run on
+// it; a silent skip would let a "green" --deep cron run hide objects it was
+// asked to verify (#469).
+func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]archive.ScannedFile, int, error) {
 	bucket, prefix, err := storage.ParseS3URL(s3URL)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	client, err := storage.NewS3Client(ctx, region)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var out []archive.ScannedFile
+	footerFailures := 0
 	var token *string
 	for {
 		page, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket: &bucket, Prefix: &prefix, ContinuationToken: token,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("list s3://%s/%s: %w", bucket, prefix, err)
+			return nil, 0, fmt.Errorf("list s3://%s/%s: %w", bucket, prefix, err)
 		}
 		for _, obj := range page.Contents {
 			if obj.Key == nil || !strings.HasSuffix(*obj.Key, ".parquet") {
@@ -277,6 +293,7 @@ func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]arch
 				if n, err := s3ParquetRowCount(ctx, bucket, *obj.Key); err == nil {
 					f.RowCount = sql.NullInt64{Int64: n, Valid: true}
 				} else {
+					footerFailures++
 					slog.Warn("reconcile: cannot read s3 parquet footer, row_count left unset",
 						"key", *obj.Key, "error", err)
 				}
@@ -288,7 +305,7 @@ func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]arch
 		}
 		token = page.NextContinuationToken
 	}
-	return out, nil
+	return out, footerFailures, nil
 }
 
 // s3ParquetRowCount reads num_rows from a Parquet footer in S3 via DuckDB
@@ -403,16 +420,32 @@ func applyUpsert(ctx context.Context, db *sql.DB, a archive.Action) error {
 	return err
 }
 
+// reconcileDryRunErr is the dry-run cron-monitor exit decision: non-zero on
+// any archive_state drift (report.Err()) OR on any S3 object that --deep was
+// asked to verify but whose footer probe failed (#469). report.Err() itself
+// stays unchanged — the deep-unverified count is a scan-time signal that
+// can't ride the pure diff actions.
+func reconcileDryRunErr(rep *archive.Report, deepUnverified int) error {
+	if err := rep.Err(); err != nil {
+		return err
+	}
+	if deepUnverified > 0 {
+		return fmt.Errorf("%d file(s) could not be deep-verified (Parquet footer probe failed)", deepUnverified)
+	}
+	return nil
+}
+
 // reconcileReportJSON is the --format json shape.
 type reconcileReportJSON struct {
-	Actions  []reconcileActionJSON `json:"actions"`
-	Inserts  int                   `json:"inserts"`
-	Updates  int                   `json:"updates"`
-	Prunes   int                   `json:"prune_candidates"`
-	Skipped  int                   `json:"skipped"`
-	InSync   int                   `json:"in_sync"`
-	Executed int                   `json:"executed"`
-	Errors   []string              `json:"errors,omitempty"`
+	Actions        []reconcileActionJSON `json:"actions"`
+	Inserts        int                   `json:"inserts"`
+	Updates        int                   `json:"updates"`
+	Prunes         int                   `json:"prune_candidates"`
+	Skipped        int                   `json:"skipped"`
+	DeepUnverified int                   `json:"deep_unverified"`
+	InSync         int                   `json:"in_sync"`
+	Executed       int                   `json:"executed"`
+	Errors         []string              `json:"errors,omitempty"`
 }
 
 type reconcileActionJSON struct {
@@ -422,11 +455,12 @@ type reconcileActionJSON struct {
 	Reason     string `json:"reason,omitempty"`
 }
 
-func writeReconcileReport(w io.Writer, format string, rep *archive.Report, executed int, execErrs []error, repair, prune bool) error {
+func writeReconcileReport(w io.Writer, format string, rep *archive.Report, deepUnverified, executed int, execErrs []error, repair, prune bool) error {
 	if format == "json" {
 		j := reconcileReportJSON{
 			Inserts: rep.Inserts, Updates: rep.Updates, Prunes: rep.Prunes,
-			Skipped: rep.SkippedUnverified + rep.SkippedRecent, InSync: rep.InSync, Executed: executed,
+			Skipped: rep.SkippedUnverified + rep.SkippedRecent, DeepUnverified: deepUnverified,
+			InSync: rep.InSync, Executed: executed,
 		}
 		for _, a := range rep.Actions {
 			j.Actions = append(j.Actions, reconcileActionJSON{
@@ -436,7 +470,9 @@ func writeReconcileReport(w io.Writer, format string, rep *archive.Report, execu
 		for _, e := range execErrs {
 			j.Errors = append(j.Errors, e.Error())
 		}
-		return cliutil.OutputJSON(j)
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(j)
 	}
 
 	mode := "dry-run"
@@ -447,6 +483,9 @@ func writeReconcileReport(w io.Writer, format string, rep *archive.Report, execu
 		mode, rep.InSync, rep.Inserts, rep.Updates, rep.Prunes, rep.SkippedUnverified+rep.SkippedRecent)
 	for _, a := range rep.Actions {
 		fmt.Fprintf(w, "  [%s] %s / %s — %s\n", a.Kind, a.PartitionName, a.BintrailID, a.Reason)
+	}
+	if deepUnverified > 0 {
+		fmt.Fprintf(w, "WARNING: %d file(s) could not be deep-verified (Parquet footer probe failed)\n", deepUnverified)
 	}
 	if repair || prune {
 		fmt.Fprintf(w, "executed: %d action(s)\n", executed)
