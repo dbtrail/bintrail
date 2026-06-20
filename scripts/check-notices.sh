@@ -40,4 +40,7 @@ if [ "$want" != "$have" ]; then
   exit 1
 fi
 
-echo "THIRD-PARTY-NOTICES is in sync with the dependency graph."
+# Note: this only confirms the dependency GRAPH is unchanged since the notices
+# were generated; it does not re-hash the THIRD-PARTY-NOTICES body, so a manual
+# corruption of that file with an intact marker is not caught here.
+echo "dependency graph unchanged since THIRD-PARTY-NOTICES was generated."

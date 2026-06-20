@@ -50,8 +50,10 @@ CGO_ENABLED=1 go-licenses save "${MAINS[@]}" \
   --ignore github.com/dbtrail/dbtrail \
   --force
 
-# Assemble PART 2 into a temp file first, then concatenate header + body in one
-# write so a mid-run failure never leaves a half-written THIRD-PARTY-NOTICES.
+# Assemble PART 2 into a temp file first, then concatenate header + body into
+# the final file at the very end — so go-licenses failing mid-run aborts before
+# THIRD-PARTY-NOTICES is touched at all. (The final cat truncates-then-streams,
+# so it is not itself atomic against an interruption during that last write.)
 BODY="$(mktemp)"
 trap 'rm -rf "$SAVE_DIR" "$BODY"' EXIT
 
@@ -83,7 +85,7 @@ find "$SAVE_DIR" -type f \
       done
     done
 
-# header + generated body → final file, in one move.
+# header + generated body → final file (single cat; not a rename).
 cat "$HEADER" "$BODY" >"$OUT"
 
 # Stamp the dependency-graph hash so the CI staleness guard can detect drift
