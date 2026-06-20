@@ -224,7 +224,9 @@ func rewriteInnerHeader(inner, outer *replication.EventHeader) {
 // firstPartialImage reports whether any row image in a RowsEvent omitted
 // columns — the signature of a non-FULL binlog_row_image (MINIMAL/NOBLOB). It
 // returns the absent column indices of the first partial image found, or nil
-// when every image is complete.
+// when every image is complete. The returned indices are go-mysql's 0-based
+// column ordinals (NOT bintrail's 1-based metadata.ColumnMeta.OrdinalPosition);
+// the guard surfaces them verbatim in its error for diagnosis.
 //
 // go-mysql populates RowsEvent.SkippedColumns in lock-step with RowsEvent.Rows:
 // one entry per decoded image (for UPDATE there are two images per logical row —

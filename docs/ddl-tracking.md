@@ -46,6 +46,11 @@ When `--source-dsn` points to the source MySQL server, file mode behaves identic
 
 ### Without `--source-dsn`: Record Only
 
+> **Note:** since the source pre-flight became mandatory (#493), this flow now
+> requires an explicit opt-out — run `bintrail index --skip-source-validation ...`.
+> Without it, `index` aborts because `--source-dsn` is required; the silent
+> no-source skip was removed so a non-`FULL` source can't be indexed by accident.
+
 When no source connection is available (e.g., indexing binlogs from a decommissioned server), dbtrail records the DDL in `schema_changes` and logs a warning:
 
 ```

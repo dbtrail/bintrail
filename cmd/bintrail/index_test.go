@@ -98,10 +98,14 @@ func TestRunIndex_allSetPassesFirstGuard(t *testing.T) {
 // first guard even without --all.
 func TestRunIndex_filesSetPassesFirstGuard(t *testing.T) {
 	savedFiles, savedAll := idxFiles, idxAll
-	t.Cleanup(func() { idxFiles = savedFiles; idxAll = savedAll })
+	savedSkip := idxSkipSourceCheck
+	t.Cleanup(func() { idxFiles = savedFiles; idxAll = savedAll; idxSkipSourceCheck = savedSkip })
 
 	idxFiles = "binlog.000001"
 	idxAll = false
+	// Clear the source guard (#493) so execution again reaches config.Connect —
+	// the first guard under test, not the later --source-dsn requirement.
+	idxSkipSourceCheck = true
 
 	err := runIndex(indexCmd, nil) // fails later at config.Connect
 	if err != nil && strings.Contains(err.Error(), "--files or --all") {
