@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"bytes"
@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	binparser "github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -23,15 +25,17 @@ import (
 // ─── cobra command wiring ─────────────────────────────────────────────────────
 
 func TestQueryCmd_registered(t *testing.T) {
+	root := &cobra.Command{Use: "root"}
+	AddReadCommands(root)
 	found := false
-	for _, cmd := range rootCmd.Commands() {
+	for _, cmd := range root.Commands() {
 		if cmd.Use == "query" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("expected 'query' command to be registered under rootCmd")
+		t.Error("expected 'query' command to be registered by AddReadCommands")
 	}
 }
 
@@ -1295,10 +1299,10 @@ func TestSanitizeArchiveErrorMessage(t *testing.T) {
 	}
 }
 
-// ─── cleanPKList ─────────────────────────────────────────────────────────────
+// ─── CleanPKList ─────────────────────────────────────────────────────────────
 
 func TestCleanPKList_dedupAndTrim(t *testing.T) {
-	got, err := cleanPKList([]string{"1", " 2 ", "1", "3", "2"})
+	got, err := CleanPKList([]string{"1", " 2 ", "1", "3", "2"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1324,7 +1328,7 @@ func TestCleanPKList_rejectsEmpty(t *testing.T) {
 		{"trailing comma artifact", []string{"1", "2", ""}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := cleanPKList(tc.in)
+			_, err := CleanPKList(tc.in)
 			if err == nil {
 				t.Fatalf("expected error for input %v", tc.in)
 			}
@@ -1336,11 +1340,11 @@ func TestCleanPKList_rejectsEmpty(t *testing.T) {
 }
 
 func TestCleanPKList_nilAndEmpty(t *testing.T) {
-	got, err := cleanPKList(nil)
+	got, err := CleanPKList(nil)
 	if err != nil || got != nil {
 		t.Errorf("expected (nil, nil) for nil input, got (%v, %v)", got, err)
 	}
-	got, err = cleanPKList([]string{})
+	got, err = CleanPKList([]string{})
 	if err != nil || len(got) != 0 {
 		t.Errorf("expected empty result for empty input, got (%v, %v)", got, err)
 	}

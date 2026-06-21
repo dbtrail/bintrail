@@ -115,7 +115,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	if rPK != "" && len(rPKs) > 0 {
 		return fmt.Errorf("--pk and --pks are mutually exclusive; use one or the other")
 	}
-	cleanedPKs, err := cleanPKList(rPKs)
+	cleanedPKs, err := cli.CleanPKList(rPKs)
 	if err != nil {
 		return err
 	}

@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"context"
@@ -15,7 +15,6 @@ import (
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -99,11 +98,10 @@ func init() {
 	queryCmd.Flags().BoolVar(&qNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
 	queryCmd.Flags().BoolVar(&qIncludeSnapshot, "include-snapshot", false, "Also scan the mydumper baseline Parquet and emit matching rows as SNAPSHOT events (requires --baseline, --schema, --table)")
 	queryCmd.Flags().StringVar(&qBaseline, "baseline", "", "Path to a baseline Parquet file or directory containing <schema>/<table>.parquet (local path or s3:// URL); used with --include-snapshot")
-	cli.AddDuckDBTuningFlags(queryCmd)
+	AddDuckDBTuningFlags(queryCmd)
 	_ = queryCmd.MarkFlagRequired("index-dsn")
-	bindCommandEnv(queryCmd)
+	BindCommandEnv(queryCmd)
 
-	rootCmd.AddCommand(queryCmd)
 }
 
 func runQuery(cmd *cobra.Command, args []string) error {
@@ -118,7 +116,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	if qPK != "" && len(qPKs) > 0 {
 		return fmt.Errorf("--pk and --pks are mutually exclusive; use one or the other")
 	}
-	cleanedPKs, err := cleanPKList(qPKs)
+	cleanedPKs, err := CleanPKList(qPKs)
 	if err != nil {
 		return err
 	}
@@ -154,7 +152,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	if qNoArchive && (qArchiveDir != "" || qArchiveS3 != "") {
 		return fmt.Errorf("--no-archive cannot be combined with --archive-dir or --archive-s3")
 	}
-	duckTuning, err := cli.DuckDBTuningFromFlags(cmd)
+	duckTuning, err := DuckDBTuningFromFlags(cmd)
 	if err != nil {
 		return err
 	}
@@ -323,7 +321,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 			cmd.Context(),
 			archSources,
 			fetchOpts,
-			cli.TunedArchiveFetcher(duckTuning),
+			TunedArchiveFetcher(duckTuning),
 			os.Stderr,
 		)
 		if err != nil {
@@ -597,7 +595,7 @@ func eventTypeJSONName(t parser.EventType) string {
 	}
 }
 
-// cleanPKList normalizes the values collected from a --pks StringSliceVar flag:
+// CleanPKList normalizes the values collected from a --pks StringSliceVar flag:
 // trims surrounding whitespace, rejects empty entries, and deduplicates while
 // preserving input order. Duplicates are common when callers programmatically
 // compose the list (e.g. dbtrail SaaS batching N pending PKs with repeats from
@@ -608,7 +606,7 @@ func eventTypeJSONName(t parser.EventType) string {
 // --pks=,, invocation almost certainly indicates a shell interpolation bug,
 // and silently treating it as --pks with zero values would return "0 rows"
 // success output for a broken command.
-func cleanPKList(pks []string) ([]string, error) {
+func CleanPKList(pks []string) ([]string, error) {
 	if len(pks) == 0 {
 		return nil, nil
 	}
