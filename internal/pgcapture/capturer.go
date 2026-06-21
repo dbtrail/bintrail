@@ -1,0 +1,277 @@
+package pgcapture
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync/atomic"
+	"time"
+
+	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/dbtrail/dbtrail/internal/event"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+)
+
+// defaultStandbyInterval is used when StandbyInterval is unset and wal_sender_timeout
+// cannot be read (or is disabled). It is conservatively below the PostgreSQL default
+// wal_sender_timeout (60s) so a quiet stream still refreshes the server's liveness
+// timer well within the deadline.
+const defaultStandbyInterval = 10 * time.Second
+
+// standbyWriteTimeout bounds each standby status write so a stalled socket (TCP
+// backpressure while we are parked emitting, not draining) cannot block the loop —
+// and ctx-cancel — forever. See sendStandby.
+const standbyWriteTimeout = 10 * time.Second
+
+// Config binds everything Run needs. ReplDSN MUST carry replication=database (it is
+// a CopyBoth replication connection and cannot run queries); QueryDSN is a normal
+// connection used for the catalog PK lookup and the slot/publication checks.
+type Config struct {
+	ReplDSN     string
+	QueryDSN    string
+	SlotName    string
+	Publication string
+	Filters     event.Filters
+	StartLSN    pglogrepl.LSN // the resume checkpoint; 0 on first run (see ensureSlot — the gate is slot existence, not this)
+	// StandbyInterval is how often a standby status update is sent (server liveness +
+	// confirmed_flush_lsn feedback). 0 derives it from the server's wal_sender_timeout
+	// (timeout/3, floor 1s), falling back to defaultStandbyInterval. Tests set it low.
+	StandbyInterval time.Duration
+	Logger          *slog.Logger
+}
+
+// Capturer decodes a PostgreSQL logical-replication stream into event.Event. It
+// mirrors parser.StreamParser: a producer whose Run emits on an out channel,
+// returning nil on graceful ctx-cancel and a non-nil error on a decode/network
+// failure (so a supervisor reconnects). The one divergence from StreamParser is the
+// consumer→server feedback PostgreSQL requires: see AckCommitted.
+type Capturer struct {
+	cfg    Config
+	logger *slog.Logger
+	// lastAcked is the confirmed_flush_lsn the consumer has DURABLY persisted; every
+	// standby status update reports it and never anything ahead, so PostgreSQL can
+	// never release WAL for rows the index has not durably recorded.
+	lastAcked atomic.Uint64
+}
+
+// New constructs a Capturer. It does not open connections (Run does), mirroring
+// NewStreamParser's no-I/O constructor. logger may be nil (slog.Default()).
+func New(cfg Config) *Capturer {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Capturer{cfg: cfg, logger: logger}
+}
+
+// AckCommitted records the LSN the consumer has DURABLY persisted (its checkpoint
+// saved after the batch was flushed to the index). The Run loop reports this in
+// every standby status update and never a position ahead of it — the #491 invariant
+// in PostgreSQL clothing, here additionally guarding the source's WAL (acking before
+// persisting would let PostgreSQL drop WAL the index never recorded, unrecoverable).
+// The consumer (#534) must call this with the EventCommit commit LSN, only after its
+// saveCheckpoint succeeds. Safe to call concurrently with Run.
+func (c *Capturer) AckCommitted(lsn uint64) { c.lastAcked.Store(lsn) }
+
+// Run opens the replication + query connections, validates the publication, ensures
+// the slot, starts replication, and emits event.Event on out until ctx is cancelled.
+// It returns nil on graceful ctx-cancel and does NOT close out (the caller owns the
+// channel, mirroring streamrun).
+func (c *Capturer) Run(ctx context.Context, out chan<- event.Event) error {
+	if c.cfg.ReplDSN == "" || c.cfg.QueryDSN == "" || c.cfg.SlotName == "" || c.cfg.Publication == "" {
+		return fmt.Errorf("pgcapture: Run requires ReplDSN, QueryDSN, SlotName, and Publication")
+	}
+
+	replConn, err := pgconn.Connect(ctx, c.cfg.ReplDSN)
+	if err != nil {
+		return fmt.Errorf("pgcapture: connect replication: %w", err)
+	}
+	defer closeReplConn(replConn)
+
+	queryConn, err := pgx.Connect(ctx, c.cfg.QueryDSN)
+	if err != nil {
+		return fmt.Errorf("pgcapture: connect query: %w", err)
+	}
+	defer closeQueryConn(queryConn)
+
+	if err := validatePublication(ctx, queryConn, c.cfg.Publication, c.cfg.Filters); err != nil {
+		return err
+	}
+
+	startLSN, err := ensureSlot(ctx, replConn, queryConn, c.cfg.SlotName, c.cfg.StartLSN)
+	if err != nil {
+		return err
+	}
+
+	if err := pglogrepl.StartReplication(ctx, replConn, c.cfg.SlotName, startLSN, pglogrepl.StartReplicationOptions{
+		Mode:       pglogrepl.LogicalReplication,
+		PluginArgs: []string{"proto_version '1'", fmt.Sprintf("publication_names '%s'", c.cfg.Publication)},
+	}); err != nil {
+		return fmt.Errorf("pgcapture: start replication slot %q from %s: %w", c.cfg.SlotName, startLSN, err)
+	}
+	// Seed the durable cursor to the resume point: everything up to startLSN is
+	// already durably indexed (first run = ConsistentPoint, nothing precedes it).
+	c.lastAcked.Store(uint64(startLSN))
+	c.logger.Info("pgcapture: started", "slot", c.cfg.SlotName, "publication", c.cfg.Publication, "start_lsn", startLSN)
+
+	// Catalog-backed PKResolver over the query conn, bounded by the Run ctx (+ a
+	// timeout) so a hung catalog lookup cannot wedge or outlive the stream.
+	resolvePK := func(relationID uint32, schema, table string) ([]metadata.ColumnMeta, error) {
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return queryPK(qctx, queryConn, relationID)
+	}
+	decoder := NewDecoder(resolvePK, c.cfg.Filters, c.logger)
+
+	interval := c.cfg.StandbyInterval
+	if interval <= 0 {
+		interval = c.deriveStandbyInterval(ctx, queryConn)
+	}
+	standbyTicker := time.NewTicker(interval)
+	defer standbyTicker.Stop()
+
+	err = c.receiveLoop(ctx, replConn, decoder, out, interval, standbyTicker)
+	if ctx.Err() != nil {
+		return nil // graceful shutdown (ctx-cancel surfaced as a receive/emit error)
+	}
+	return err
+}
+
+// receiveLoop is the single-goroutine replication loop. pgconn is NOT concurrency-
+// safe, so everything — receiving, decoding, emitting, and sending standby updates —
+// happens here in sequence; a second goroutine touching the connection is barred.
+func (c *Capturer) receiveLoop(ctx context.Context, replConn *pgconn.PgConn, decoder *Decoder, out chan<- event.Event, interval time.Duration, standbyTicker *time.Ticker) error {
+	for {
+		// Deadline so a quiet server still triggers a periodic standby update.
+		recvCtx, cancel := context.WithDeadline(ctx, time.Now().Add(interval))
+		msg, err := replConn.ReceiveMessage(recvCtx)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err() // shutdown — Run translates to nil
+			}
+			if pgconn.Timeout(err) {
+				if err := c.sendStandby(replConn); err != nil {
+					return err
+				}
+				continue
+			}
+			return fmt.Errorf("pgcapture: receive message: %w", err)
+		}
+
+		cd, ok := msg.(*pgproto3.CopyData)
+		if !ok {
+			continue
+		}
+		switch cd.Data[0] {
+		case pglogrepl.PrimaryKeepaliveMessageByteID:
+			pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(cd.Data[1:])
+			if err != nil {
+				return fmt.Errorf("pgcapture: parse keepalive: %w", err)
+			}
+			if pkm.ReplyRequested {
+				if err := c.sendStandby(replConn); err != nil {
+					return err
+				}
+			}
+		case pglogrepl.XLogDataByteID:
+			xld, err := pglogrepl.ParseXLogData(cd.Data[1:])
+			if err != nil {
+				return fmt.Errorf("pgcapture: parse XLogData: %w", err)
+			}
+			logmsg, err := pglogrepl.Parse(xld.WALData)
+			if err != nil {
+				// A malformed logical message is stream desync, not noise — fail loud.
+				return fmt.Errorf("pgcapture: parse logical message at %s: %w", xld.WALStart, err)
+			}
+			ev, emit, err := decoder.Decode(logmsg)
+			if err != nil {
+				return err
+			}
+			if emit {
+				if err := c.emit(ctx, replConn, out, ev, standbyTicker); err != nil {
+					return err
+				}
+			}
+		}
+	}
+}
+
+// emit delivers one event on out. It must not let a slow consumer starve the
+// keepalive: while blocked it keeps sending standby updates on the ticker (which
+// satisfies wal_sender_timeout — the server resets its liveness timer on ANY client
+// message, no WAL consumption required) and stays responsive to ctx-cancel. It is
+// the keepalive-in-the-same-select pattern; a second goroutine is barred (pgconn is
+// not concurrency-safe). While parked here we are intentionally NOT draining the
+// server→client stream; sendStandby's bounded write keeps that backpressure from
+// wedging the loop.
+func (c *Capturer) emit(ctx context.Context, replConn *pgconn.PgConn, out chan<- event.Event, ev event.Event, standbyTicker *time.Ticker) error {
+	for {
+		select {
+		case out <- ev:
+			return nil
+		case <-standbyTicker.C:
+			if err := c.sendStandby(replConn); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// sendStandby reports the consumer's DURABLE position (lastAcked) as the WAL
+// write/flush position — never the received position — so confirmed_flush_lsn can
+// never advance past durably-indexed WAL. The write is bounded by a deadline:
+// SendStandbyStatusUpdate ignores its context and does a deadline-less net write,
+// which under TCP backpressure (we stop draining while parked in emit) could
+// otherwise block forever and deadlock the loop and ctx-cancel.
+func (c *Capturer) sendStandby(replConn *pgconn.PgConn) error {
+	lsn := pglogrepl.LSN(c.lastAcked.Load())
+	if nc := replConn.Conn(); nc != nil {
+		_ = nc.SetWriteDeadline(time.Now().Add(standbyWriteTimeout))
+		defer func() { _ = nc.SetWriteDeadline(time.Time{}) }()
+	}
+	if err := pglogrepl.SendStandbyStatusUpdate(context.Background(), replConn, pglogrepl.StandbyStatusUpdate{WALWritePosition: lsn}); err != nil {
+		return fmt.Errorf("pgcapture: send standby status (flushed=%s): %w", lsn, err)
+	}
+	return nil
+}
+
+// deriveStandbyInterval reads the server's wal_sender_timeout (milliseconds; 0 =
+// disabled) and returns a third of it (the cadence the walsender itself uses),
+// floored at 1s. It falls back to defaultStandbyInterval on any error or when the
+// timeout is disabled. This avoids baking in the 60s default — an operator who set a
+// shorter wal_sender_timeout would otherwise see the connection dropped.
+func (c *Capturer) deriveStandbyInterval(ctx context.Context, queryConn *pgx.Conn) time.Duration {
+	var ms int
+	err := queryConn.QueryRow(ctx, `SELECT setting::int FROM pg_settings WHERE name = 'wal_sender_timeout'`).Scan(&ms)
+	if err != nil || ms <= 0 {
+		return defaultStandbyInterval
+	}
+	interval := time.Duration(ms) * time.Millisecond / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	return interval
+}
+
+// closeReplConn / closeQueryConn close on a fresh background context: Run's ctx is
+// already cancelled exactly when a graceful shutdown runs these defers, and
+// pgconn/pgx Close take a context for the clean terminate message — passing the
+// cancelled ctx would skip it (an abrupt drop).
+func closeReplConn(conn *pgconn.PgConn) {
+	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = conn.Close(cctx)
+}
+
+func closeQueryConn(conn *pgx.Conn) {
+	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = conn.Close(cctx)
+}
