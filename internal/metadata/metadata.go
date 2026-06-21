@@ -759,11 +759,21 @@ func buildFKCascadeQuery(schemas []string) (string, []any) {
 	return query, args
 }
 
+// ErrFKCascadesFound is wrapped into the error ValidateNoFKCascades returns when
+// the source carries FK CASCADE constraints — as opposed to an operational
+// failure (a dropped connection, a permissions error reading
+// information_schema). Call sites use errors.Is to tell the two apart: a cascade
+// finding is now a warn-and-proceed signal, while a genuine query failure must
+// still abort. Without this distinction a real fault would be silently
+// downgraded to a warning and mislabeled as "cascades present".
+var ErrFKCascadesFound = errors.New("FK cascade constraints present on source")
+
 // ValidateNoFKCascades checks that none of the targeted schemas contain foreign
 // key constraints with CASCADE rules. When schemas is empty, all non-system,
 // non-bintrail-internal schemas are checked (see buildFKCascadeQuery). FK
 // cascades produce invisible side-effect row changes that make reversal SQL
-// unreliable.
+// unreliable. A cascade finding is returned wrapped in ErrFKCascadesFound; any
+// other returned error is an operational failure.
 func ValidateNoFKCascades(db *sql.DB, schemas []string) error {
 	query, args := buildFKCascadeQuery(schemas)
 
@@ -803,7 +813,7 @@ func ValidateNoFKCascades(db *sql.DB, schemas []string) error {
 				"source_schema", c.schema, "constraint", c.name,
 				"delete_rule", c.deleteRule, "update_rule", c.updateRule)
 		}
-		return fmt.Errorf("%d FK cascade constraint(s) found on source; reversal SQL from `recover` may not correctly handle cascade side-effects", len(found))
+		return fmt.Errorf("%d FK cascade constraint(s) found on source; reversal SQL from `recover` may not correctly handle cascade side-effects: %w", len(found), ErrFKCascadesFound)
 	}
 	return nil
 }
@@ -820,10 +830,12 @@ type FKCascadeEdge struct {
 }
 
 // CascadeConstraintsInIndex returns the CASCADE foreign-key edges recorded in
-// the latest schema snapshot's fk_constraints, optionally scoped to schemas.
-// Unlike ValidateNoFKCascades (which queries the source's information_schema),
-// this reads from the INDEX, so the source-less `recover` path can warn that
-// cascade-deleted child rows are not reversible by plain recover.
+// the latest snapshot that captured FK rows (MAX(snapshot_id) in fk_constraints),
+// optionally scoped to schemas. Unlike ValidateNoFKCascades (which queries the
+// source's information_schema), this reads from the INDEX, so the source-less
+// `recover` path can warn that cascade-deleted child rows are not reversible by
+// plain recover. (If a newer snapshot recorded zero FKs, this can surface a
+// cascade warning from an older snapshot — acceptable for a warn-only path.)
 //
 // Returns nil when fk_constraints is absent (index predates it) or carries no
 // cascade rules — including pre-cascade-recovery snapshots whose delete_rule/

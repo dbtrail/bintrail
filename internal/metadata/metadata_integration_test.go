@@ -4,6 +4,7 @@ package metadata
 
 import (
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 
@@ -24,6 +25,13 @@ func TestTakeSnapshotCapturesFKRules(t *testing.T) {
 		id  INT PRIMARY KEY,
 		pid INT,
 		CONSTRAINT fk_child FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE ON UPDATE CASCADE
+	) ENGINE=InnoDB`)
+	// A non-cascade (RESTRICT) child must be EXCLUDED by CascadeConstraintsInIndex —
+	// pins the delete_rule/update_rule = 'CASCADE' filter against being too permissive.
+	testutil.MustExec(t, sourceDB, `CREATE TABLE child_restrict (
+		id  INT PRIMARY KEY,
+		pid INT,
+		CONSTRAINT fk_restrict FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE RESTRICT ON UPDATE RESTRICT
 	) ENGINE=InnoDB`)
 
 	if _, err := TakeSnapshot(sourceDB, indexDB, []string{sourceName}); err != nil {
@@ -48,10 +56,15 @@ func TestTakeSnapshotCapturesFKRules(t *testing.T) {
 		t.Fatalf("CascadeConstraintsInIndex: %v", err)
 	}
 	if len(edges) != 1 {
-		t.Fatalf("want 1 cascade edge, got %d: %+v", len(edges), edges)
+		t.Fatalf("want exactly 1 cascade edge (RESTRICT child excluded), got %d: %+v", len(edges), edges)
 	}
 	if edges[0].Table != "child" || edges[0].DeleteRule != "CASCADE" || edges[0].ReferencedTable != "parent" {
 		t.Errorf("unexpected cascade edge: %+v", edges[0])
+	}
+	for _, e := range edges {
+		if e.Table == "child_restrict" {
+			t.Errorf("RESTRICT-only child must be excluded, but appeared: %+v", e)
+		}
 	}
 
 	// An unrelated schema yields no cascade edges.
@@ -404,8 +417,14 @@ func TestValidateNoFKCascades_cascade(t *testing.T) {
 		CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
 	)`)
 
-	if err := ValidateNoFKCascades(db, []string{dbName}); err == nil {
+	err := ValidateNoFKCascades(db, []string{dbName})
+	if err == nil {
 		t.Fatal("expected error for schema with FK cascade, got nil")
+	}
+	// The cascade finding must be wrapped in ErrFKCascadesFound so call sites can
+	// errors.Is it apart from an operational query failure (which must still abort).
+	if !errors.Is(err, ErrFKCascadesFound) {
+		t.Errorf("cascade error must wrap ErrFKCascadesFound, got: %v", err)
 	}
 }
 

@@ -1260,6 +1260,9 @@ func One(ctx context.Context, cfg Config) error {
 	fmt.Println("Source: binlog_row_image=FULL \u2713")
 
 	if err := cfg.Deps.ValidateNoFKCascades(sourceDB, cfg.Deps.ParseSchemaList(cfg.Schemas)); err != nil {
+		if !errors.Is(err, metadata.ErrFKCascadesFound) {
+			return err // genuine query/connection failure: abort as before
+		}
 		slog.Warn("FK cascade constraints present on source; streaming will proceed, "+
 			"but InnoDB executes cascades below the binlog (MySQL Bug #32506) so cascaded "+
 			"child-row deletes are NOT captured \u2014 plain `recover` cannot restore them. "+

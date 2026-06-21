@@ -262,22 +262,27 @@ func EnsureSchema(db *sql.DB) error {
 	//
 	// fk_constraints post-dates the original schema and may be absent on very
 	// old indexes (TakeSnapshot tolerates its absence). Only migrate it when
-	// present; `bintrail init` / a fresh snapshot creates it with the columns.
+	// present; `bintrail init` (the DDL) creates the table with these columns,
+	// and a snapshot then populates the rule once the table exists. The block is
+	// gated by `if hasFK` (rather than an early return) so any migration added
+	// after it still runs on an index that predates fk_constraints.
 	hasFK, err := tableExists(db, "fk_constraints")
 	if err != nil {
 		return err
 	}
-	if !hasFK {
-		return nil
+	if hasFK {
+		if err := ensureColumn(db, "fk_constraints", "delete_rule",
+			`ALTER TABLE fk_constraints ADD COLUMN delete_rule VARCHAR(16) NOT NULL DEFAULT '' COMMENT 'ON DELETE rule (CASCADE/RESTRICT/SET NULL/NO ACTION); empty for pre-cascade-recovery snapshots' AFTER referenced_column_name`,
+		); err != nil {
+			return err
+		}
+		if err := ensureColumn(db, "fk_constraints", "update_rule",
+			`ALTER TABLE fk_constraints ADD COLUMN update_rule VARCHAR(16) NOT NULL DEFAULT '' COMMENT 'ON UPDATE rule; empty for pre-cascade-recovery snapshots' AFTER delete_rule`,
+		); err != nil {
+			return err
+		}
 	}
-	if err := ensureColumn(db, "fk_constraints", "delete_rule",
-		`ALTER TABLE fk_constraints ADD COLUMN delete_rule VARCHAR(16) NOT NULL DEFAULT '' COMMENT 'ON DELETE rule (CASCADE/RESTRICT/SET NULL/NO ACTION); empty for pre-cascade-recovery snapshots' AFTER referenced_column_name`,
-	); err != nil {
-		return err
-	}
-	return ensureColumn(db, "fk_constraints", "update_rule",
-		`ALTER TABLE fk_constraints ADD COLUMN update_rule VARCHAR(16) NOT NULL DEFAULT '' COMMENT 'ON UPDATE rule; empty for pre-cascade-recovery snapshots' AFTER delete_rule`,
-	)
+	return nil
 }
 
 // tableExists reports whether a base table named `table` exists in the current
