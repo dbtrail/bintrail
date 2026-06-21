@@ -1,22 +1,26 @@
-package main
+package cli
 
 import (
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // ─── cobra command wiring ─────────────────────────────────────────────────────
 
 func TestReconstructCmd_registered(t *testing.T) {
+	root := &cobra.Command{Use: "root"}
+	AddReadCommands(root)
 	found := false
-	for _, cmd := range rootCmd.Commands() {
+	for _, cmd := range root.Commands() {
 		if cmd.Use == "reconstruct" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("expected 'reconstruct' command to be registered under rootCmd")
+		t.Error("expected 'reconstruct' command to be registered by AddReadCommands")
 	}
 }
 

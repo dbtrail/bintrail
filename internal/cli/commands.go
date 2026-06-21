@@ -8,10 +8,11 @@ import "github.com/spf13/cobra"
 // shim surface without duplicating the command definitions.
 //
 // Commands are migrated into internal/cli one slice at a time (#529); today this
-// registers status, query, and recover. As the others (reconstruct, shim) move,
-// they join this function.
+// registers status, query, recover, and reconstruct. As shim moves, it joins
+// this function.
 func AddReadCommands(root *cobra.Command) {
 	root.AddCommand(statusCmd)
 	root.AddCommand(queryCmd)
 	root.AddCommand(recoverCmd)
+	root.AddCommand(reconstructCmd)
 }

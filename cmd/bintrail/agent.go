@@ -7,9 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -295,7 +293,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		if agtBufferMaxEvents < 0 {
 			return fmt.Errorf("invalid --buffer-max-events %d: must be >= 0", agtBufferMaxEvents)
 		}
-		maxBytes, err := parseByteSize(agtBufferMaxBytes)
+		maxBytes, err := cliutil.ParseByteSize(agtBufferMaxBytes)
 		if err != nil {
 			return fmt.Errorf("invalid --buffer-max-bytes: %w", err)
 		}
@@ -1049,38 +1047,4 @@ func validateBYOSFlushConfig(byosMode bool, s3Bucket string) error {
 		return fmt.Errorf("BYOS mode (--source-dsn + --server-id) requires --s3-bucket (or BINTRAIL_S3_BUCKET) to flush events to durable storage; agent refuses to start to prevent silent data loss (the in-memory buffer would accumulate events and drop them on restart with no operator signal). See issue #289")
 	}
 	return nil
-}
-
-// parseByteSize parses a human-readable byte size string like "256MB" or "1GB".
-// Plain integers are treated as bytes. Returns 0 for "0" (unlimited).
-func parseByteSize(s string) (int64, error) {
-	s = strings.TrimSpace(s)
-	if s == "" || s == "0" {
-		return 0, nil
-	}
-
-	original := s
-	s = strings.ToUpper(s)
-
-	multiplier := int64(1)
-	switch {
-	case strings.HasSuffix(s, "GB"):
-		multiplier = 1 << 30
-		s = strings.TrimSuffix(s, "GB")
-	case strings.HasSuffix(s, "MB"):
-		multiplier = 1 << 20
-		s = strings.TrimSuffix(s, "MB")
-	case strings.HasSuffix(s, "KB"):
-		multiplier = 1 << 10
-		s = strings.TrimSuffix(s, "KB")
-	}
-
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || n < 0 {
-		return 0, fmt.Errorf("invalid byte size %q; expected a number with optional KB/MB/GB suffix, e.g. 256MB", original)
-	}
-	if n > math.MaxInt64/multiplier {
-		return 0, fmt.Errorf("byte size %q overflows int64", original)
-	}
-	return n * multiplier, nil
 }

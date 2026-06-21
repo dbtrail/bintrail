@@ -12,7 +12,7 @@ import "testing"
 //
 // Grow `want` as more read commands migrate into internal/cli (#529).
 func TestReadCommandsWiredOnRoot(t *testing.T) {
-	want := []string{"status", "query", "recover"}
+	want := []string{"status", "query", "recover", "reconstruct"}
 
 	have := make(map[string]bool)
 	for _, c := range rootCmd.Commands() {
