@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-21
+
+### Added
+- **PostgreSQL as a replication source (alpha)** (#527, #530, #531, #534). A new standalone binary, `bintrail-pg`, captures a live PostgreSQL logical-replication stream (the built-in `pgoutput` plugin — nothing is installed in your source database) and indexes every row change into the **same MySQL index** as a MySQL/MariaDB source, so the existing `query`, `recover`, `reconstruct`, `status`, and `shim` commands work unchanged over PostgreSQL data. `bintrail-pg stream` takes a replication DSN plus a query DSN, validates `wal_level = logical` and per-table `REPLICA IDENTITY FULL` (the PostgreSQL analog of `binlog_row_image = FULL`), and resumes from a durable LSN checkpoint. Under `REPLICA IDENTITY FULL`, unchanged out-of-line TOAST values are recovered from the before-image. Ships as its own image `ghcr.io/dbtrail/bintrail-pg` and its own `bintrail-pg` deb/rpm; PostgreSQL 14/15/16/17 are exercised in CI against a live server. This is an **alpha** capability — the data-safety hardening that gates beta (a type-fidelity matrix, replication-slot/WAL-retention monitoring, and DDL-drift detection) is still in progress, so read the limitations before relying on it.
+
+### Changed
+- **The source-agnostic read/recovery commands moved to a shared internal package** (#528, #529). `query`, `recover`, `reconstruct`, `status`, and `shim` now live in `internal/cli` and are registered identically by both the `bintrail` (MySQL/MariaDB) and the new `bintrail-pg` (PostgreSQL) binaries, so the read and recovery surface is byte-identical across source families. The core `bintrail` binary deliberately does **not** link the PostgreSQL capture stack (a build guard enforces this), keeping its dependency surface unchanged. No user-facing behavior change for existing `bintrail` invocations.
+
 ## [0.16.2] - 2026-06-20
 
 ### Changed
