@@ -538,5 +538,3 @@ func splitAndTrim(s, sep string) []string {
 	}
 	return out
 }
-
-// parseByteSize is defined in agent.go and reused here for --chunk-size.
