@@ -27,6 +27,12 @@ const defaultStandbyInterval = 10 * time.Second
 // and ctx-cancel — forever. See sendStandby.
 const standbyWriteTimeout = 10 * time.Second
 
+// startupTimeout bounds the one-shot catalog/slot work in Run (publication + slot
+// checks, consistent-point creation, wal_sender_timeout read) so a hung catalog
+// can't wedge Run before streaming begins. StartReplication and the receive loop
+// deliberately use the full run ctx — they are long-lived.
+const startupTimeout = 30 * time.Second
+
 // Config binds everything Run needs. ReplDSN MUST carry replication=database (it is
 // a CopyBoth replication connection and cannot run queries); QueryDSN is a normal
 // connection used for the catalog PK lookup and the slot/publication checks.
@@ -98,11 +104,17 @@ func (c *Capturer) Run(ctx context.Context, out chan<- event.Event) error {
 	}
 	defer closeQueryConn(queryConn)
 
-	if err := validatePublication(ctx, queryConn, c.cfg.Publication, c.cfg.Filters); err != nil {
+	// Bound the one-shot startup catalog/slot work so a hung catalog can't wedge Run
+	// before streaming begins (StartReplication and the receive loop below use the
+	// full run ctx — they are long-lived, these are not).
+	startupCtx, cancelStartup := context.WithTimeout(ctx, startupTimeout)
+	defer cancelStartup()
+
+	if err := validatePublication(startupCtx, queryConn, c.cfg.Publication, c.cfg.Filters); err != nil {
 		return err
 	}
 
-	startLSN, err := ensureSlot(ctx, replConn, queryConn, c.cfg.SlotName, c.cfg.StartLSN)
+	startLSN, err := ensureSlot(startupCtx, replConn, queryConn, c.cfg.SlotName, c.cfg.StartLSN)
 	if err != nil {
 		return err
 	}
@@ -129,7 +141,7 @@ func (c *Capturer) Run(ctx context.Context, out chan<- event.Event) error {
 
 	interval := c.cfg.StandbyInterval
 	if interval <= 0 {
-		interval = c.deriveStandbyInterval(ctx, queryConn)
+		interval = c.deriveStandbyInterval(startupCtx, queryConn)
 	}
 	standbyTicker := time.NewTicker(interval)
 	defer standbyTicker.Stop()

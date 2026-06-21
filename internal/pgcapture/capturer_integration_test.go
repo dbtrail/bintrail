@@ -224,6 +224,77 @@ func TestCapturer_PublicationCoverageFailsLoud(t *testing.T) {
 	}
 }
 
+// TestCapturer_CompositePKOrder proves PKValues uses primary-key declaration order,
+// not column/attnum order. The table's columns are (a, b, c) but its PRIMARY KEY is
+// (b, a) — so a naive attnum ordering would yield "10|20" where the correct key
+// order is "20|10". This is the one correctness-critical path the single-column
+// integration test leaves uncovered (wrong PK order silently corrupts pk_hash).
+func TestCapturer_CompositePKOrder(t *testing.T) {
+	baseDSN := testutil.SkipIfNoPostgres(t)
+	ctx := context.Background()
+
+	const slot = "bintrail_pgcap_ck"
+	const pub = "bintrail_pgcap_ck_pub"
+	const tbl = "pgcap_ck_t"
+
+	setup, err := pgx.Connect(ctx, baseDSN)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { setup.Close(context.Background()) })
+	cleanup := func() {
+		bg := context.Background()
+		_, _ = setup.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		_, _ = setup.Exec(bg, "DROP TABLE IF EXISTS "+tbl)
+		_, _ = setup.Exec(bg, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	mustExec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := setup.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+	// Columns declared a, b, c (attnums 1, 2, 3); key is (b, a) = attnums (2, 1).
+	mustExec(fmt.Sprintf("CREATE TABLE %s (a int, b int, c text, PRIMARY KEY (b, a))", tbl))
+	mustExec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", tbl))
+	mustExec(fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cap := pgcapture.New(pgcapture.Config{
+		ReplDSN:         replDSN(baseDSN),
+		QueryDSN:        baseDSN,
+		SlotName:        slot,
+		Publication:     pub,
+		Filters:         event.Filters{Tables: map[string]bool{"public." + tbl: true}},
+		StandbyInterval: 200 * time.Millisecond,
+	})
+	events := make(chan event.Event, 16)
+	runErr := make(chan error, 1)
+	go func() { runErr <- cap.Run(runCtx, events) }()
+	waitFor(t, 10*time.Second, func() bool {
+		var active bool
+		if err := setup.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&active); err != nil {
+			return false
+		}
+		return active
+	}, "replication slot to become active")
+
+	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (10, 20, 'x')", tbl)) // a=10, b=20
+
+	rows, _ := collect(t, events, 1, 10*time.Second)
+	ins := pick(t, rows, event.EventInsert)
+	if ins.PKValues != "20|10" {
+		t.Errorf("composite PKValues = %q, want %q (key order (b, a), not column/attnum order)", ins.PKValues, "20|10")
+	}
+
+	cancel()
+	<-runErr
+}
+
 // ── helpers ──
 
 func replDSN(base string) string {
