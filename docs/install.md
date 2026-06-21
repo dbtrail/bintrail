@@ -114,7 +114,8 @@ Multi-arch (`linux/amd64` + `linux/arm64`), signed with cosign, SBOM attached
 to every release. The image bundles both `bintrail` and `bintrail-mcp`; the
 web console ships as its own image, `ghcr.io/dbtrail/bintrail-console`
 (`serve` = read-only console, `watch` = stream + console daemon — what the
-Compose stack runs). See [docker.md](./docker.md) for signature verification,
+Compose stack runs). The PostgreSQL-source binary ships as its own image,
+`ghcr.io/dbtrail/bintrail-pg` (alpha). See [docker.md](./docker.md) for signature verification,
 `docker run` recipes, and the long-running stream container.
 
 ## Linux packages
@@ -135,7 +136,8 @@ sudo rpm -i bintrail_VERSION_linux_amd64.rpm
 
 The `bintrail` package carries the core CLI + `bintrail-mcp`; the web console
 is a separate `bintrail-console` package — install it only where an operator
-wants the UI.
+wants the UI. PostgreSQL-source capture is a separate `bintrail-pg` package
+(alpha) — install it only on hosts that capture from PostgreSQL.
 
 ## Go install
 
@@ -154,7 +156,8 @@ go build ./cmd/bintrail
 ```
 
 `make build` builds both `bintrail` and `bintrail-mcp` with version metadata;
-`make build-console` builds the `bintrail-console` web-console binary.
+`make build-console` builds the `bintrail-console` web-console binary;
+`make build-pg` builds the `bintrail-pg` PostgreSQL-source binary.
 
 > macOS binaries and a Homebrew tap are tracked in
 > [#349](https://github.com/dbtrail/dbtrail/issues/349) — today the

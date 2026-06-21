@@ -80,6 +80,35 @@ builds:
       - -X main.CommitSHA={{.Commit}}
       - -X main.BuildDate={{.Date}}
 
+  # bintrail-pg: the PostgreSQL-source binary (#534). Build-identical to
+  # bintrail-console — it links DuckDB via the shared read plane (CGO) plus the
+  # pure-Go pgx/pglogrepl capture stack — so the CGO/cross-compile block and the
+  # main.* ldflags var names mirror bintrail/bintrail-console verbatim. Ships in
+  # the release archives, as its own deb/rpm (nfpms below), and as its own image
+  # (ghcr.io/dbtrail/bintrail-pg — dockers/docker_manifests below).
+  - id: bintrail-pg
+    binary: bintrail-pg
+    main: ./cmd/bintrail-pg
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    overrides:
+      - goos: linux
+        goarch: arm64
+        env:
+          - CGO_ENABLED=1
+          - CC=aarch64-linux-gnu-gcc
+          - CXX=aarch64-linux-gnu-g++
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.CommitSHA={{.Commit}}
+      - -X main.BuildDate={{.Date}}
+
 archives:
   - formats:
       - tar.gz
@@ -88,6 +117,7 @@ archives:
       - bintrail
       - bintrail-mcp
       - bintrail-console
+      - bintrail-pg
     # `files:` OVERRIDES GoReleaser's default set (LICENSE*/README*/CHANGELOG*),
     # so the defaults are re-listed here alongside the license-compliance
     # artifacts (#428): NOTICE + THIRD-PARTY-NOTICES carry the retained
@@ -167,6 +197,35 @@ nfpms:
         dst: /usr/share/doc/bintrail-console/NOTICE
       - src: THIRD-PARTY-NOTICES
         dst: /usr/share/doc/bintrail-console/THIRD-PARTY-NOTICES
+
+  # Separate package for the PostgreSQL-source binary (#534), mirroring the
+  # console split: a PostgreSQL operator installs only bintrail-pg.
+  - id: bintrail-pg
+    package_name: bintrail-pg
+    ids:
+      - bintrail-pg
+    vendor: dbtrail
+    homepage: https://github.com/dbtrail/dbtrail
+    maintainer: Daniel <daniel@dbtrail.com>
+    description: >-
+      Capture a live PostgreSQL logical-replication stream into the bintrail
+      MySQL index with full before/after images, and generate reversal SQL for
+      recovery (PostgreSQL-source support is alpha).
+    license: Apache-2.0
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    dependencies:
+      - ca-certificates
+    # Same notices as the core package, under this package's own doc dir (#428).
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/bintrail-pg/LICENSE
+      - src: NOTICE
+        dst: /usr/share/doc/bintrail-pg/NOTICE
+      - src: THIRD-PARTY-NOTICES
+        dst: /usr/share/doc/bintrail-pg/THIRD-PARTY-NOTICES
 
 # ── Docker images (multi-arch, published to GHCR) ──────────
 # One image per arch, then a manifest stitching them into a single
@@ -272,6 +331,52 @@ dockers:
       - "--label=org.opencontainers.image.source=https://github.com/dbtrail/dbtrail"
       - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
+  # bintrail-pg: its own single-binary image (PMM-style split), same shape as
+  # the bintrail-console image pair above.
+  - id: bintrail-pg-amd64
+    goos: linux
+    goarch: amd64
+    ids:
+      - bintrail-pg
+    dockerfile: Dockerfile.bintrail-pg.goreleaser
+    use: buildx
+    extra_files:
+      - LICENSE
+      - NOTICE
+      - THIRD-PARTY-NOTICES
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail-pg:{{ .Version }}-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=bintrail-pg"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/dbtrail"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+
+  - id: bintrail-pg-arm64
+    goos: linux
+    goarch: arm64
+    ids:
+      - bintrail-pg
+    dockerfile: Dockerfile.bintrail-pg.goreleaser
+    use: buildx
+    extra_files:
+      - LICENSE
+      - NOTICE
+      - THIRD-PARTY-NOTICES
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail-pg:{{ .Version }}-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=bintrail-pg"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.source=https://github.com/dbtrail/dbtrail"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+
 docker_manifests:
   - name_template: "ghcr.io/dbtrail/bintrail:{{ .Version }}"
     image_templates:
@@ -297,6 +402,17 @@ docker_manifests:
     image_templates:
       - "ghcr.io/dbtrail/bintrail-console:{{ .Version }}-amd64"
       - "ghcr.io/dbtrail/bintrail-console:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/dbtrail/bintrail-pg:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail-pg:{{ .Version }}-amd64"
+      - "ghcr.io/dbtrail/bintrail-pg:{{ .Version }}-arm64"
+  # skip_push: auto — same prerelease gating as the core image's :latest.
+  - name_template: "ghcr.io/dbtrail/bintrail-pg:latest"
+    skip_push: "auto"
+    image_templates:
+      - "ghcr.io/dbtrail/bintrail-pg:{{ .Version }}-amd64"
+      - "ghcr.io/dbtrail/bintrail-pg:{{ .Version }}-arm64"
 
 # ── Homebrew tap (DEFERRED — do not uncomment until prerequisites exist) ──
 # Requires BOTH:

@@ -1,0 +1,29 @@
+# GoReleaser-only Dockerfile for the bintrail-pg image.
+#
+# Like Dockerfile.goreleaser (the core binary), this image just copies the
+# binary GoReleaser already cross-compiled. The build context root contains
+# `bintrail-pg` for the target arch — GoReleaser stages it there before
+# invoking `docker build`.
+#
+# Runtime base matches the core image (debian:bookworm-slim): glibc for
+# DuckDB's static libs (linked via the shared read plane) and a shell for
+# debugging. One binary per image (PMM-style) — the MySQL CLI ships as
+# ghcr.io/dbtrail/bintrail, the web console as ghcr.io/dbtrail/bintrail-console.
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    # Pin uid 999 to match the rest of the image family (the bundled compose
+    # chowns the index password secret to uid 999, mode 0600, for these
+    # processes to read — see docker-compose.yml).
+    useradd --system --no-create-home --uid 999 bintrail
+
+COPY bintrail-pg /usr/local/bin/bintrail-pg
+
+# License-compliance notices (#428). GoReleaser stages these into the build
+# context via the `dockers.*.extra_files` entries in .goreleaser.yaml.
+COPY LICENSE NOTICE THIRD-PARTY-NOTICES /usr/share/doc/bintrail-pg/
+
+USER bintrail
+ENTRYPOINT ["bintrail-pg"]
