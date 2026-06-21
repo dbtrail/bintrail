@@ -1,0 +1,97 @@
+// Command bintrail-pg is the PostgreSQL-source sibling of the core bintrail
+// binary. It captures a live PostgreSQL logical-replication stream into the SAME
+// MySQL index store (the "one index schema for all sources" red line, #527) and
+// serves the identical read plane — status, query, recover, reconstruct, shim —
+// over that index via internal/cli.AddReadCommands.
+//
+// Why a separate binary rather than a subcommand of bintrail: the PostgreSQL
+// capture path links jackc/pgx + pglogrepl, which the core MySQL binary must
+// stay free of (cmd/bintrail/pgfree_test.go enforces this). Splitting the
+// capture plane per source keeps each binary's dependency surface honest while
+// the read plane is shared code. The user wants a distinct `bintrail-pg` as the
+// recognizable artifact for the Postgres-recovery niche (#534).
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+
+	"github.com/spf13/cobra"
+
+	"github.com/dbtrail/dbtrail/internal/cli"
+	"github.com/dbtrail/dbtrail/internal/observe"
+)
+
+var (
+	logLevel  string
+	logFormat string
+)
+
+// Build-time variables injected via -ldflags. These are the SAME names the core
+// bintrail binary uses (main.Version/CommitSHA/BuildDate), so the Makefile's
+// BINTRAIL_LDFLAGS applies to this binary verbatim — exactly as bintrail-console
+// already reuses them.
+var (
+	Version   = "dev"
+	CommitSHA = "none"
+	BuildDate = "unknown"
+)
+
+var rootCmd = &cobra.Command{
+	Use:   "bintrail-pg",
+	Short: "PostgreSQL binlog (logical replication) indexer and recovery tool",
+	Long: `bintrail-pg captures a live PostgreSQL logical-replication stream and indexes
+every row change into a MySQL index table with full before/after images, then
+provides the same query and recovery capabilities as the core bintrail binary.
+The index is self-contained — recovery does not depend on the PostgreSQL WAL or
+the replication slot still existing.
+
+Capture requires REPLICA IDENTITY FULL on every replicated table so the
+before-image (and de-TOASTed unchanged values) is present in the WAL. See
+'bintrail-pg stream --help'.`,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		observe.Setup(os.Stderr, logFormat, logLevel)
+		return nil
+	},
+	SilenceErrors: true, // we handle error output ourselves in main()
+	SilenceUsage:  true, // don't print usage/help on errors — users can use --help
+}
+
+func init() {
+	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", Version, CommitSHA, BuildDate)
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
+	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log format: text or json")
+	// The source-agnostic read plane (status/query/recover/reconstruct/shim),
+	// shared verbatim with the core binary. The PostgreSQL capture command
+	// (stream) is registered in stream.go's init().
+	cli.AddReadCommands(rootCmd)
+}
+
+func main() {
+	err := rootCmd.Execute()
+	if err == nil {
+		return
+	}
+	if wantsJSON(rootCmd) {
+		json.NewEncoder(os.Stderr).Encode(map[string]string{"error": err.Error()})
+	} else {
+		fmt.Fprintln(os.Stderr, err)
+	}
+	os.Exit(1)
+}
+
+// wantsJSON reports whether the active command has a --format flag set to "json"
+// (the read commands do). Mirrors cmd/bintrail/main.go so error output is shaped
+// consistently across both binaries.
+func wantsJSON(root *cobra.Command) bool {
+	cmd, _, _ := root.Find(os.Args[1:])
+	if cmd == nil {
+		return false
+	}
+	f := cmd.Flags().Lookup("format")
+	if f == nil {
+		return false
+	}
+	return f.Value.String() == "json"
+}

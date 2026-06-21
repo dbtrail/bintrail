@@ -2,6 +2,7 @@ BINARY_NAME=bintrail
 MCP_BINARY=bintrail-mcp
 GATEWAY_BINARY=mcp-gateway
 CONSOLE_BINARY=bintrail-console
+PG_BINARY=bintrail-pg
 VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 BUILD_DATE=$(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -9,12 +10,12 @@ BUILD_DATE=$(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 BINTRAIL_LDFLAGS=-ldflags "-X main.Version=$(VERSION) -X main.CommitSHA=$(COMMIT) -X main.BuildDate=$(BUILD_DATE)"
 MCP_LDFLAGS=-ldflags "-X main.mcpVersion=$(VERSION)"
 GATEWAY_LDFLAGS=-ldflags "-X main.gatewayVersion=$(VERSION)"
-# bintrail-console reuses BINTRAIL_LDFLAGS: it injects the same
-# main.Version/CommitSHA/BuildDate vars as the core binary.
+# bintrail-console and bintrail-pg both reuse BINTRAIL_LDFLAGS: they inject the
+# same main.Version/CommitSHA/BuildDate vars as the core binary.
 
-.PHONY: all build build-mcp build-gateway build-console clean test console-e2e lint install build-all tidy deps notices check-notices
+.PHONY: all build build-mcp build-gateway build-console build-pg clean test console-e2e lint install build-all tidy deps notices check-notices
 
-all: build build-mcp build-gateway build-console
+all: build build-mcp build-gateway build-console build-pg
 
 build:
 	go build $(BINTRAIL_LDFLAGS) -o $(BINARY_NAME) ./cmd/bintrail
@@ -30,14 +31,21 @@ build-gateway:
 build-console:
 	go build $(BINTRAIL_LDFLAGS) -o $(CONSOLE_BINARY) ./cmd/bintrail-console
 
+# bintrail-pg links jackc/pgx + pglogrepl (PostgreSQL capture) plus DuckDB via
+# the shared read plane (query/reconstruct → parquetquery), so it requires
+# CGO_ENABLED=1 like the core bintrail and bintrail-console binaries.
+build-pg:
+	go build $(BINTRAIL_LDFLAGS) -o $(PG_BINARY) ./cmd/bintrail-pg
+
 install:
 	go install $(BINTRAIL_LDFLAGS) ./cmd/bintrail
 	go install $(MCP_LDFLAGS) ./cmd/bintrail-mcp
 	go install $(GATEWAY_LDFLAGS) ./cmd/mcp-gateway
 	go install $(BINTRAIL_LDFLAGS) ./cmd/bintrail-console
+	go install $(BINTRAIL_LDFLAGS) ./cmd/bintrail-pg
 
 clean:
-	rm -f $(BINARY_NAME) $(MCP_BINARY) $(GATEWAY_BINARY) $(CONSOLE_BINARY)
+	rm -f $(BINARY_NAME) $(MCP_BINARY) $(GATEWAY_BINARY) $(CONSOLE_BINARY) $(PG_BINARY)
 	go clean
 
 test:

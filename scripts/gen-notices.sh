@@ -7,9 +7,10 @@
 #                        the C/C++ libraries vendored inside the precompiled
 #                        libduckdb static library (which go-licenses cannot see)
 #                        plus the MPL-2.0 note for go-sql-driver/mysql.
-#   PART 2 (generated) — `go-licenses save` over the THREE published binary
-#                        mains (bintrail, bintrail-mcp, bintrail-console),
-#                        reproducing each linked Go module's LICENSE and, where
+#   PART 2 (generated) — `go-licenses save` over the FOUR published binary
+#                        mains (bintrail, bintrail-mcp, bintrail-console,
+#                        bintrail-pg), reproducing each linked Go module's
+#                        LICENSE and, where
 #                        present, NOTICE file.
 #
 # Output is deterministic (modules walked in sorted order, host-arch-only
@@ -28,7 +29,7 @@ OUT="$REPO_ROOT/THIRD-PARTY-NOTICES"
 HEADER="$REPO_ROOT/scripts/notices-header.txt"
 MARKER="$REPO_ROOT/THIRD-PARTY-NOTICES.deps.sha256"
 
-MAINS=(./cmd/bintrail ./cmd/bintrail-mcp ./cmd/bintrail-console)
+MAINS=(./cmd/bintrail ./cmd/bintrail-mcp ./cmd/bintrail-console ./cmd/bintrail-pg)
 
 if ! command -v go-licenses >/dev/null 2>&1; then
   echo "error: go-licenses not on PATH. Install it with:" >&2

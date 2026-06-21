@@ -2,9 +2,10 @@
 THIRD-PARTY NOTICES
 ================================================================================
 
-bintrail (and the bintrail-mcp and bintrail-console binaries published from this
-repository) statically links a number of third-party Go modules and, through
-the precompiled libduckdb static library, a number of vendored C/C++ libraries.
+bintrail (and the bintrail-mcp, bintrail-console and bintrail-pg binaries
+published from this repository) statically links a number of third-party Go
+modules and, through the precompiled libduckdb static library, a number of
+vendored C/C++ libraries.
 The licenses below are reproduced to satisfy their notice-retention terms.
 
 This file has two parts:
@@ -15,9 +16,9 @@ This file has two parts:
      dependency (go-sql-driver/mysql, MPL-2.0).
 
   2. A GENERATED section, produced by `make notices` (which runs
-     `go-licenses save` over ./cmd/bintrail, ./cmd/bintrail-mcp and
-     ./cmd/bintrail-console), reproducing the LICENSE — and, where present, the
-     NOTICE — file of every linked Go module.
+     `go-licenses save` over ./cmd/bintrail, ./cmd/bintrail-mcp,
+     ./cmd/bintrail-console and ./cmd/bintrail-pg), reproducing the LICENSE —
+     and, where present, the NOTICE — file of every linked Go module.
 
 Regenerate with `make notices`. Do not edit the GENERATED section by hand.
 
