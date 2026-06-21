@@ -369,6 +369,19 @@ func TestDecode_DeleteWithoutBeforeImageFailsLoud(t *testing.T) {
 	}
 }
 
+func TestDecode_TruncateNotIndexed(t *testing.T) {
+	// TRUNCATE has a real behavioral contract: it must be surfaced (warned) but
+	// NEVER indexed as a row event (DDL replay on the PG path is out of #530 scope).
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	_, emit, err := d.Decode(&pglogrepl.TruncateMessage{RelationNum: 1, RelationIDs: []uint32{1}})
+	if err != nil {
+		t.Fatalf("TRUNCATE: unexpected error: %v", err)
+	}
+	if emit {
+		t.Error("TRUNCATE must not be indexed (DDL replay out of #530 scope) — emit should be false")
+	}
+}
+
 func TestNewDecoder_NilPKResolverPanics(t *testing.T) {
 	defer func() {
 		if recover() == nil {

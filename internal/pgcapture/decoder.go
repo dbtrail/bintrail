@@ -220,7 +220,8 @@ func (d *Decoder) decodeUpdate(m *pglogrepl.UpdateMessage) (event.Event, bool, e
 	}
 	// OldTuple is the full old tuple ('O') under REPLICA IDENTITY FULL, a key-only
 	// tuple ('K') when a replica-identity column changed under a weaker identity, or
-	// absent when an UPDATE under RI DEFAULT left the key unchanged. Decoded as a
+	// absent when an UPDATE under a weaker identity (e.g. RI DEFAULT) left the
+	// replica-identity columns unchanged. Decoded as a
 	// before-image: a 'u' here fails loud (see decodeTuple) — under RI FULL it can't
 	// occur, and under a weaker identity it would mean a lost value.
 	var before map[string]any
@@ -300,16 +301,17 @@ const (
 //   - 't' (text)   → Go string (lossless; type-faithful rendering is #533's);
 //   - 'b' (binary) → error: the slice-2 capturer requests text format, so a binary
 //     datum is a misconfiguration we refuse rather than silently mishandle;
-//   - 'u' (unchanged TOAST):
-//   - in a before-image (roleBefore) → HARD ERROR. Under REPLICA IDENTITY FULL —
-//     the required mode (#531) — PostgreSQL detoasts and WAL-logs every replica-
-//     identity column (all columns, under FULL), so the before-image carries the
-//     real value, never 'u' (proven at the protocol level in the spike; PG commit
-//     1cd5802, back-patched to PG10+). A 'u' in a before-image therefore means the
-//     real value — the ONLY source for a DELETE's reversal INSERT — is gone, so we
-//     fail loud rather than silently store a marker. Unreachable in support.
-//   - in an after-image (roleAfter) → resolved from the before-image (Option B),
-//     else the structurally distinct unchanged-TOAST marker (never a plain string).
+//   - 'u' (unchanged TOAST) → in a before-image (roleBefore) a HARD ERROR; in an
+//     after-image (roleAfter) resolved from the before-image (Option B), else the
+//     structurally distinct unchanged-TOAST marker (never a plain string).
+//
+// Why a 'u' in a before-image is a hard error: under REPLICA IDENTITY FULL — the
+// required mode (#531) — PostgreSQL detoasts and WAL-logs every replica-identity
+// column (all columns, under FULL), so the before-image carries the real value,
+// never 'u' (proven at the protocol level in the spike; PG commit 1cd5802, back-
+// patched to PG10+). A 'u' in a before-image therefore means the real value — the
+// ONLY source for a DELETE's reversal INSERT — is gone, so we fail loud rather than
+// silently store a marker. Unreachable in support.
 //
 // before is the before-image, consulted only for roleAfter; nil otherwise.
 func (d *Decoder) decodeTuple(rel *relationInfo, t *pglogrepl.TupleData, role tupleRole, before map[string]any) (map[string]any, error) {
