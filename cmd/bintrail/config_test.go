@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/dbtrail/dbtrail/internal/cli"
 )
 
 func TestRunConfigInit(t *testing.T) {
@@ -94,22 +96,22 @@ func TestEnvBindingsAndSectionsConsistency(t *testing.T) {
 		}
 	}
 	// Every envBinding must appear in envSections.
-	for _, b := range envBindings {
+	for _, b := range cli.EnvBindings {
 		if !sectionVars[b.EnvVar] {
-			t.Errorf("envBindings has %s but envSections does not", b.EnvVar)
+			t.Errorf("cli.EnvBindings has %s but envSections does not", b.EnvVar)
 		}
 	}
-	// Every envSection entry must appear in envBindings. (The template-only
+	// Every envSection entry must appear in cli.EnvBindings. (The template-only
 	// BINTRAIL_CONSOLE_* exception is gone: those vars moved with the web
 	// console to the standalone bintrail-console binary.)
 	bindingVars := make(map[string]bool)
-	for _, b := range envBindings {
+	for _, b := range cli.EnvBindings {
 		bindingVars[b.EnvVar] = true
 	}
 	for _, sec := range envSections {
 		for _, entry := range sec.Bindings {
 			if !bindingVars[entry.EnvVar] {
-				t.Errorf("envSections has %s (in %q) but envBindings does not", entry.EnvVar, sec.Header)
+				t.Errorf("envSections has %s (in %q) but cli.EnvBindings does not", entry.EnvVar, sec.Header)
 			}
 		}
 	}
@@ -133,7 +135,7 @@ func TestGenerateEnvTemplate(t *testing.T) {
 
 	t.Run("all env vars present", func(t *testing.T) {
 		content := generateEnvTemplate()
-		for _, b := range envBindings {
+		for _, b := range cli.EnvBindings {
 			if !strings.Contains(content, b.EnvVar) {
 				t.Errorf("missing %s in template", b.EnvVar)
 			}

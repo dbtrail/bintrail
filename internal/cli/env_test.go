@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"os"
@@ -99,7 +99,7 @@ func TestBindCommandEnv(t *testing.T) {
 		cmd.Flags().StringVar(&dsn, "index-dsn", "", "test flag")
 
 		t.Setenv("BINTRAIL_INDEX_DSN", "from-env")
-		bindCommandEnv(cmd)
+		BindCommandEnv(cmd)
 
 		if dsn != "from-env" {
 			t.Errorf("dsn = %q, want %q", dsn, "from-env")
@@ -115,7 +115,7 @@ func TestBindCommandEnv(t *testing.T) {
 		cmd.Flags().StringVar(&dsn, "index-dsn", "default", "test flag")
 
 		t.Setenv("BINTRAIL_INDEX_DSN", "")
-		bindCommandEnv(cmd)
+		BindCommandEnv(cmd)
 
 		if dsn != "default" {
 			t.Errorf("dsn = %q, want %q", dsn, "default")
@@ -128,7 +128,7 @@ func TestBindCommandEnv(t *testing.T) {
 		cmd.PersistentFlags().StringVar(&dsn, "index-dsn", "", "test flag")
 
 		t.Setenv("BINTRAIL_INDEX_DSN", "persistent-env")
-		bindCommandEnv(cmd)
+		BindCommandEnv(cmd)
 
 		if dsn != "persistent-env" {
 			t.Errorf("dsn = %q, want %q", dsn, "persistent-env")
@@ -141,7 +141,7 @@ func TestBindCommandEnv(t *testing.T) {
 		cmd.Flags().IntVar(&batchSize, "batch-size", 1000, "test flag")
 
 		t.Setenv("BINTRAIL_BATCH_SIZE", "5000")
-		bindCommandEnv(cmd)
+		BindCommandEnv(cmd)
 
 		if batchSize != 5000 {
 			t.Errorf("batchSize = %d, want 5000", batchSize)

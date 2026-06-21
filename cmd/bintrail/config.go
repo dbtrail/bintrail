@@ -84,8 +84,8 @@ type envTemplateEntry struct {
 	Placeholder string // shown when no value is set (e.g. "user:pass@tcp(host:3306)/binlog_index")
 }
 
-// envSections defines the same env vars as envBindings (in envload.go),
-// grouped by category for template generation. Keep in sync with envBindings.
+// envSections defines the same env vars as cli.EnvBindings (in internal/cli),
+// grouped by category for template generation. Keep in sync with cli.EnvBindings.
 var envSections = []envSection{
 	{
 		Header: "Database connections",
