@@ -67,6 +67,63 @@ func validatePublication(ctx context.Context, conn *pgx.Conn, pubname string, fi
 	return nil
 }
 
+// validateReplicaIdentity is the PostgreSQL analog of metadata.ValidateBinlogRowImage:
+// it refuses a source that can't produce complete before-images. PostgreSQL's knob is
+// per-table (REPLICA IDENTITY), not a global like MySQL's binlog_row_image, so every
+// table the publication will stream must be at FULL.
+//
+//   - wal_level must be 'logical' (global) — logical replication is impossible
+//     otherwise.
+//   - Every table in pg_publication_tables (which expands FOR ALL TABLES to the actual
+//     set PostgreSQL will stream — NOT the narrower client-side Filters) must have
+//     pg_class.relreplident = 'f' (FULL). Under any weaker identity ('d' default,
+//     'i' using-index, 'n' nothing) an unchanged out-of-line TOAST value is GONE from
+//     the before-image (proven in the spike, Part A), so we fail loud rather than index
+//     partial, unrecoverable before-images.
+//
+// This is the startup gate; a fresh RelationMessage is the live signal when the
+// publication gains a table mid-stream.
+func validateReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication string) error {
+	var walLevel string
+	if err := conn.QueryRow(ctx, "SELECT current_setting('wal_level')").Scan(&walLevel); err != nil {
+		return fmt.Errorf("pgcapture: checking wal_level: %w", err)
+	}
+	if walLevel != "logical" {
+		return fmt.Errorf("pgcapture: wal_level is %q, must be 'logical' for logical replication", walLevel)
+	}
+
+	rows, err := conn.Query(ctx, `
+		SELECT pt.schemaname, pt.tablename, c.relreplident::text
+		FROM pg_publication_tables pt
+		JOIN pg_namespace n ON n.nspname = pt.schemaname
+		JOIN pg_class c ON c.relname = pt.tablename AND c.relnamespace = n.oid
+		WHERE pt.pubname = $1`, publication)
+	if err != nil {
+		return fmt.Errorf("pgcapture: checking replica identity for publication %q: %w", publication, err)
+	}
+	defer rows.Close()
+
+	var notFull []string
+	for rows.Next() {
+		var schema, table, relreplident string
+		if err := rows.Scan(&schema, &table, &relreplident); err != nil {
+			return fmt.Errorf("pgcapture: scanning replica identity for publication %q: %w", publication, err)
+		}
+		if relreplident != "f" {
+			notFull = append(notFull, fmt.Sprintf("%s.%s (relreplident=%s)", schema, table, relreplident))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("pgcapture: checking replica identity for publication %q: %w", publication, err)
+	}
+	if len(notFull) > 0 {
+		sort.Strings(notFull)
+		return fmt.Errorf("pgcapture: table(s) not at REPLICA IDENTITY FULL [%s] — before-images would be partial (an unchanged out-of-line TOAST value is lost under a weaker identity, so recovery would be wrong); run ALTER TABLE <t> REPLICA IDENTITY FULL",
+			strings.Join(notFull, ", "))
+	}
+	return nil
+}
+
 // ensureSlot returns the LSN to start replication from, creating the slot on first
 // run. The first-run-vs-resume decision is gated on slot EXISTENCE in
 // pg_replication_slots (NOT on savedLSN==0 — an empty saved checkpoint decodes to

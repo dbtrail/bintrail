@@ -181,6 +181,52 @@ func TestCapturer_Integration(t *testing.T) {
 // TestCapturer_PublicationCoverageFailsLoud proves the validate-don't-create gate:
 // a publication that omits a requested table fails loud rather than silently
 // streaming zero events for it.
+// TestCapturer_NonFullReplicaIdentityFailsLoud proves the #531-A RI-FULL validator:
+// a publication table left at the default replica identity (not FULL) makes Run fail
+// loud — its before-images would be partial (an unchanged out-of-line TOAST value
+// lost), which is unrecoverable.
+func TestCapturer_NonFullReplicaIdentityFailsLoud(t *testing.T) {
+	baseDSN := testutil.SkipIfNoPostgres(t)
+	ctx := context.Background()
+	const pub = "bintrail_pgcap_ri_pub"
+	const tbl = "pgcap_ri_t"
+
+	setup, err := pgx.Connect(ctx, baseDSN)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { setup.Close(context.Background()) })
+	cleanup := func() {
+		bg := context.Background()
+		_, _ = setup.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		_, _ = setup.Exec(bg, "DROP TABLE IF EXISTS "+tbl)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	// Default replica identity (NOT FULL) on purpose.
+	if _, err := setup.Exec(ctx, fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, body text)", tbl)); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := setup.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl)); err != nil {
+		t.Fatalf("create publication: %v", err)
+	}
+
+	cap := pgcapture.New(pgcapture.Config{
+		ReplDSN:     replDSN(baseDSN),
+		QueryDSN:    baseDSN,
+		SlotName:    "bintrail_pgcap_ri_slot",
+		Publication: pub,
+	})
+	err = cap.Run(ctx, make(chan event.Event, 1))
+	if err == nil {
+		t.Fatal("expected Run to fail loud on a table that is not at REPLICA IDENTITY FULL")
+	}
+	if !strings.Contains(err.Error(), "REPLICA IDENTITY FULL") {
+		t.Errorf("unexpected error (want RI-FULL failure): %v", err)
+	}
+}
+
 func TestCapturer_PublicationCoverageFailsLoud(t *testing.T) {
 	baseDSN := testutil.SkipIfNoPostgres(t)
 	ctx := context.Background()
@@ -249,6 +295,11 @@ func TestCapturer_ResumeMissingSlotFailsLoud(t *testing.T) {
 
 	if _, err := setup.Exec(ctx, fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY)", tbl)); err != nil {
 		t.Fatalf("create table: %v", err)
+	}
+	// RI FULL so the validator passes and Run reaches the slot-resume guard (the
+	// behavior under test here), not the RI check.
+	if _, err := setup.Exec(ctx, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", tbl)); err != nil {
+		t.Fatalf("alter replica identity: %v", err)
 	}
 	if _, err := setup.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl)); err != nil {
 		t.Fatalf("create publication: %v", err)

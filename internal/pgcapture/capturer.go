@@ -133,6 +133,9 @@ func (c *Capturer) Run(ctx context.Context, out chan<- event.Event) error {
 	if err := validatePublication(startupCtx, queryConn, c.cfg.Publication, c.cfg.Filters); err != nil {
 		return err
 	}
+	if err := validateReplicaIdentity(startupCtx, queryConn, c.cfg.Publication); err != nil {
+		return err
+	}
 
 	startLSN, err := ensureSlot(startupCtx, replConn, queryConn, c.cfg.SlotName, c.cfg.StartLSN, c.cfg.ExpectExistingSlot)
 	if err != nil {
