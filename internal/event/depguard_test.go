@@ -7,18 +7,27 @@ import (
 )
 
 // TestReadLayerDoesNotLinkGoMySQL is the #528 guard: the read/recover/reconstruct
-// value stack consumes the source-agnostic event.Event, so it must NOT link the
-// go-mysql binlog library. A future change that re-imports internal/parser (which
-// pulls go-mysql) into any of these packages — directly or transitively — fails
+// value stack consumes the source-agnostic event.Event, so it must NOT link ANY
+// capture library — neither the go-mysql binlog library (MySQL/MariaDB) nor the
+// PostgreSQL replication libraries (pgx + pglogrepl, added in #530 for
+// internal/pgcapture). A future change that re-imports internal/parser or
+// internal/pgcapture into any of these packages — directly or transitively — fails
 // here. This keeps the index/query/recover side swappable across MySQL and
 // PostgreSQL sources.
 //
 // internal/shim is deliberately NOT listed: it links go-mysql for its MySQL
 // wire-protocol server (go-mysql/server), which is its own dependency, unrelated
-// to the Event type. internal/parser and internal/streamrun are the capture layer
-// and legitimately link go-mysql.
+// to the Event type. internal/parser, internal/streamrun, and internal/pgcapture
+// are the capture layer and legitimately link their source drivers.
 func TestReadLayerDoesNotLinkGoMySQL(t *testing.T) {
-	const banned = "github.com/go-mysql-org/go-mysql"
+	// Capture libraries the read side must never link. pgx is a general PostgreSQL
+	// driver, but on the read side the index is always MySQL (go-sql-driver) — pgx
+	// is exclusively pgcapture's, so banning it on the read side is correct.
+	banned := []string{
+		"github.com/go-mysql-org/go-mysql",
+		"github.com/jackc/pglogrepl",
+		"github.com/jackc/pgx",
+	}
 	// The read/value stack. Add new read-side packages here as they are
 	// introduced — the guarantee is only as strong as this enumeration.
 	readPkgs := []string{
@@ -43,8 +52,10 @@ func TestReadLayerDoesNotLinkGoMySQL(t *testing.T) {
 		}
 		for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 			dep := strings.TrimSpace(line)
-			if dep == banned || strings.HasPrefix(dep, banned+"/") {
-				t.Errorf("%s transitively links %s — the read layer must consume event.Event, not go-mysql", pkg, dep)
+			for _, b := range banned {
+				if dep == b || strings.HasPrefix(dep, b+"/") {
+					t.Errorf("%s transitively links %s — the read layer must consume event.Event, not a capture library", pkg, dep)
+				}
 			}
 		}
 	}

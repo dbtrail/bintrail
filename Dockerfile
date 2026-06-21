@@ -1,6 +1,6 @@
 # ── Stage 1: build ─────────────────────────────────────────
 # Debian-based image required — DuckDB's pre-compiled static libs need glibc.
-FROM golang:1.24.7-bookworm AS builder
+FROM golang:1.25.11-bookworm AS builder
 
 ARG VERSION=dev
 ARG COMMIT=unknown
