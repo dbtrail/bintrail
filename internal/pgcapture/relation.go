@@ -53,11 +53,17 @@ type PKResolver func(relationID uint32, schema, table string) ([]metadata.Column
 
 // pkColumnsQuery returns a relation's primary-key column names in key order, given
 // the relation's OID (which equals the pgoutput RelationMessage RelationID).
+//
+// i.indkey is an int2vector; it is cast to int2[] before array_position because
+// array_position is declared over anyarray/anyelement and int2vector is a distinct
+// internal type whose implicit coercion to int2[] is not guaranteed across the
+// supported version range (PG14+). The explicit cast removes that version-dependence
+// — without it the ordering query could error on a floor-version server.
 const pkColumnsQuery = `SELECT a.attname
 FROM pg_index i
 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
 WHERE i.indrelid = $1 AND i.indisprimary
-ORDER BY array_position(i.indkey, a.attnum)`
+ORDER BY array_position(i.indkey::int2[], a.attnum)`
 
 // queryPK is the catalog-backed PKResolver body: it looks up a relation's primary-
 // key columns by OID on a regular (non-replication) connection. The capturer wires

@@ -81,7 +81,22 @@ func New(cfg Config) *Capturer {
 // persisting would let PostgreSQL drop WAL the index never recorded, unrecoverable).
 // The consumer (#534) must call this with the EventCommit commit LSN, only after its
 // saveCheckpoint succeeds. Safe to call concurrently with Run.
-func (c *Capturer) AckCommitted(lsn uint64) { c.lastAcked.Store(lsn) }
+func (c *Capturer) AckCommitted(lsn uint64) {
+	// Advance-only: lastAcked is durable progress, which is monotonic, so a stale or
+	// out-of-order ack (a consumer retry/ordering race) must not regress it — that
+	// would make the next standby update report a lower confirmed_flush_lsn. (Not a
+	// data-loss guard — PostgreSQL clamps a lower client LSN forward and re-delivers;
+	// this keeps the reported cursor monotonic by construction.)
+	for {
+		old := c.lastAcked.Load()
+		if lsn <= old {
+			return
+		}
+		if c.lastAcked.CompareAndSwap(old, lsn) {
+			return
+		}
+	}
+}
 
 // Run opens the replication + query connections, validates the publication, ensures
 // the slot, starts replication, and emits event.Event on out until ctx is cancelled.
@@ -255,10 +270,13 @@ func (c *Capturer) sendStandby(replConn *pgconn.PgConn) error {
 }
 
 // deriveStandbyInterval reads the server's wal_sender_timeout (milliseconds; 0 =
-// disabled) and returns a third of it (the cadence the walsender itself uses),
-// floored at 1s. It falls back to defaultStandbyInterval on any error or when the
-// timeout is disabled. This avoids baking in the 60s default — an operator who set a
-// shorter wal_sender_timeout would otherwise see the connection dropped.
+// disabled) and returns a third of it — so a quiet stream refreshes the server's
+// liveness timer ~3x per timeout window, comfortably under the drop threshold —
+// floored at 1s. (The walsender's own keepalive cadence is timeout/2; a third is
+// the deliberately more conservative client side.) It falls back to
+// defaultStandbyInterval on any error or when the timeout is disabled. This avoids
+// baking in the 60s default — an operator who set a shorter wal_sender_timeout would
+// otherwise see the connection dropped.
 func (c *Capturer) deriveStandbyInterval(ctx context.Context, queryConn *pgx.Conn) time.Duration {
 	var ms int
 	err := queryConn.QueryRow(ctx, `SELECT setting::int FROM pg_settings WHERE name = 'wal_sender_timeout'`).Scan(&ms)
