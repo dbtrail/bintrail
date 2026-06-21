@@ -1299,10 +1299,10 @@ func TestSanitizeArchiveErrorMessage(t *testing.T) {
 	}
 }
 
-// ─── CleanPKList ─────────────────────────────────────────────────────────────
+// ─── cleanPKList ─────────────────────────────────────────────────────────────
 
 func TestCleanPKList_dedupAndTrim(t *testing.T) {
-	got, err := CleanPKList([]string{"1", " 2 ", "1", "3", "2"})
+	got, err := cleanPKList([]string{"1", " 2 ", "1", "3", "2"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1328,7 +1328,7 @@ func TestCleanPKList_rejectsEmpty(t *testing.T) {
 		{"trailing comma artifact", []string{"1", "2", ""}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := CleanPKList(tc.in)
+			_, err := cleanPKList(tc.in)
 			if err == nil {
 				t.Fatalf("expected error for input %v", tc.in)
 			}
@@ -1340,11 +1340,11 @@ func TestCleanPKList_rejectsEmpty(t *testing.T) {
 }
 
 func TestCleanPKList_nilAndEmpty(t *testing.T) {
-	got, err := CleanPKList(nil)
+	got, err := cleanPKList(nil)
 	if err != nil || got != nil {
 		t.Errorf("expected (nil, nil) for nil input, got (%v, %v)", got, err)
 	}
-	got, err = CleanPKList([]string{})
+	got, err = cleanPKList([]string{})
 	if err != nil || len(got) != 0 {
 		t.Errorf("expected empty result for empty input, got (%v, %v)", got, err)
 	}

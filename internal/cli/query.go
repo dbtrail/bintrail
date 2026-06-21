@@ -116,7 +116,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	if qPK != "" && len(qPKs) > 0 {
 		return fmt.Errorf("--pk and --pks are mutually exclusive; use one or the other")
 	}
-	cleanedPKs, err := CleanPKList(qPKs)
+	cleanedPKs, err := cleanPKList(qPKs)
 	if err != nil {
 		return err
 	}
@@ -595,18 +595,19 @@ func eventTypeJSONName(t parser.EventType) string {
 	}
 }
 
-// CleanPKList normalizes the values collected from a --pks StringSliceVar flag:
-// trims surrounding whitespace, rejects empty entries, and deduplicates while
-// preserving input order. Duplicates are common when callers programmatically
-// compose the list (e.g. dbtrail SaaS batching N pending PKs with repeats from
-// retries); an unfiltered list would produce duplicate groups in grouped JSON
-// output and waste bind-parameter slots in the SQL IN clause.
+// cleanPKList normalizes the values collected from a --pks StringSliceVar flag
+// (shared by the query and recover commands): trims surrounding whitespace,
+// rejects empty entries, and deduplicates while preserving input order.
+// Duplicates are common when callers programmatically compose the list (e.g.
+// dbtrail SaaS batching N pending PKs with repeats from retries); an unfiltered
+// list would produce duplicate result rows/groups and waste bind-parameter slots
+// in the SQL IN clause.
 //
 // Returns an error on empty entries rather than silently dropping them — a
-// --pks=,, invocation almost certainly indicates a shell interpolation bug,
-// and silently treating it as --pks with zero values would return "0 rows"
-// success output for a broken command.
-func CleanPKList(pks []string) ([]string, error) {
+// --pks=,, invocation almost certainly indicates a shell interpolation bug, and
+// silently treating it as --pks with zero values would return a misleadingly
+// empty/no-op success for a broken command.
+func cleanPKList(pks []string) ([]string, error) {
 	if len(pks) == 0 {
 		return nil, nil
 	}

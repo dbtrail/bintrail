@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"bufio"
@@ -11,7 +11,6 @@ import (
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -90,11 +89,10 @@ func init() {
 	recoverCmd.Flags().StringVar(&rProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	recoverCmd.Flags().StringVar(&rFormat, "format", "text", "Output format: text or json")
 	recoverCmd.Flags().BoolVar(&rNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
-	cli.AddDuckDBTuningFlags(recoverCmd)
+	AddDuckDBTuningFlags(recoverCmd)
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
-	bindCommandEnv(recoverCmd)
+	BindCommandEnv(recoverCmd)
 
-	rootCmd.AddCommand(recoverCmd)
 }
 
 func runRecover(cmd *cobra.Command, args []string) error {
@@ -115,7 +113,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	if rPK != "" && len(rPKs) > 0 {
 		return fmt.Errorf("--pk and --pks are mutually exclusive; use one or the other")
 	}
-	cleanedPKs, err := cli.CleanPKList(rPKs)
+	cleanedPKs, err := cleanPKList(rPKs)
 	if err != nil {
 		return err
 	}
@@ -210,7 +208,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		dbName = cfg.DBName
 	}
 
-	duckTuning, err := cli.DuckDBTuningFromFlags(cmd)
+	duckTuning, err := DuckDBTuningFromFlags(cmd)
 	if err != nil {
 		return err
 	}
@@ -219,7 +217,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		DBName:         dbName,
 		NoArchive:      rNoArchive || rProfile != "",
 		AllowGaps:      true, // preserve recover's warn-and-continue behavior
-		ArchiveFetcher: cli.TunedArchiveFetcher(duckTuning),
+		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
 	})
 	if err != nil {
 		return err
