@@ -119,13 +119,13 @@ func TestSynthesizeVictims_ruleGate(t *testing.T) {
 			ReferencedSchema: "app", ReferencedTable: "parent", ReferencedColumn: "id",
 			DeleteRule: "RESTRICT", UpdateRule: "CASCADE"}, // ON UPDATE CASCADE only
 	}
-	victims, _, err := cascade.SynthesizeVictims(context.Background(), eng, fks,
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, fks,
 		[]query.ResultRow{parentDel}, cascade.Options{})
 	if err != nil {
 		t.Fatalf("SynthesizeVictims: %v", err)
 	}
-	if len(victims) != 0 {
-		t.Errorf("non-ON-DELETE-CASCADE edges must yield no victims, got %d: %+v", len(victims), victims)
+	if len(res.Victims) != 0 {
+		t.Errorf("non-ON-DELETE-CASCADE edges must yield no victims, got %d: %+v", len(res.Victims), res.Victims)
 	}
 }
 
@@ -150,16 +150,16 @@ func TestSynthesizeVictims_compositeFKSkipped(t *testing.T) {
 		{Schema: "app", Table: "child", ConstraintName: "fk_comp", Column: "pk2",
 			ReferencedSchema: "app", ReferencedTable: "parent", ReferencedColumn: "k2", DeleteRule: "CASCADE"},
 	}
-	victims, warnings, err := cascade.SynthesizeVictims(context.Background(), eng, fks,
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, fks,
 		[]query.ResultRow{parentDel}, cascade.Options{})
 	if err != nil {
 		t.Fatalf("SynthesizeVictims: %v", err)
 	}
-	if len(victims) != 0 {
-		t.Errorf("composite FK must be skipped, not mis-synthesized; got %d victims", len(victims))
+	if len(res.Victims) != 0 {
+		t.Errorf("composite FK must be skipped, not mis-synthesized; got %d victims", len(res.Victims))
 	}
-	if !strings.Contains(strings.Join(warnings, " "), "composite FK") {
-		t.Errorf("composite FK skip must warn; warnings: %v", warnings)
+	if res.Complete() || !strings.Contains(strings.Join(res.Incomplete, " "), "composite FK") {
+		t.Errorf("composite FK skip must flag incompleteness; Incomplete: %v", res.Incomplete)
 	}
 }
 
@@ -262,13 +262,14 @@ func TestSynthesizeVictims_selfRefAndCompositePK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadCascadeFKs: %v", err)
 	}
-	victims, warnings, err := cascade.SynthesizeVictims(ctx, eng, fks, nodeDeletes, cascade.Options{})
+	res, err := cascade.SynthesizeVictims(ctx, eng, fks, nodeDeletes, cascade.Options{})
 	if err != nil {
 		t.Fatalf("SynthesizeVictims: %v", err)
 	}
-	for _, w := range warnings {
-		t.Logf("warning: %s", w)
+	if !res.Complete() {
+		t.Errorf("expected a complete reconstruction, got Incomplete=%v", res.Incomplete)
 	}
+	victims := res.Victims
 	// Expect nodes 2,3,4 (self-ref recursion) + leaves 2|1, 2|2, 4|1 (composite PK).
 	got := map[string]bool{}
 	for _, v := range victims {
@@ -281,6 +282,39 @@ func TestSynthesizeVictims_selfRefAndCompositePK(t *testing.T) {
 	}
 	if len(victims) != 6 {
 		t.Errorf("want 6 victims, got %d: %v", len(victims), victimList(victims))
+	}
+
+	// node 4 was UPDATEd after its parent's last event; with the root-T window it
+	// must be recovered at its LATEST label ('c2'), not the stale insert ('c').
+	// The byte-exact checksum below also enforces this; assert it explicitly too.
+	for _, v := range victims {
+		if v.TableName == "node" && v.PKValues == "4" && v.RowBefore["label"] != "c2" {
+			t.Errorf("node 4 recovered at stale label %v, want c2", v.RowBefore["label"])
+		}
+	}
+
+	// Depth cap (read-only re-run on the same index): MaxDepth=1 must reconstruct
+	// only the root's direct children and flag the deeper subtree as incomplete.
+	resD, err := cascade.SynthesizeVictims(ctx, eng, fks, nodeDeletes, cascade.Options{MaxDepth: 1})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims(MaxDepth=1): %v", err)
+	}
+	if resD.Complete() || !strings.Contains(strings.Join(resD.Incomplete, " "), "MaxDepth") {
+		t.Errorf("MaxDepth=1 must flag depth incompleteness; Incomplete=%v", resD.Incomplete)
+	}
+	for _, v := range resD.Victims {
+		if v.TableName == "node" && v.PKValues == "4" {
+			t.Errorf("MaxDepth=1 must not reach grandchild node:4; got %v", victimList(resD.Victims))
+		}
+	}
+
+	// Candidate cap: CandidateLimit=1 truncates node 1's two children and flags it.
+	resC, err := cascade.SynthesizeVictims(ctx, eng, fks, nodeDeletes, cascade.Options{CandidateLimit: 1})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims(CandidateLimit=1): %v", err)
+	}
+	if resC.Complete() || !strings.Contains(strings.Join(resC.Incomplete, " "), "more than 1") {
+		t.Errorf("CandidateLimit=1 must flag truncation; Incomplete=%v", resC.Incomplete)
 	}
 
 	// Recover (root from binlog + synthesized subtree) and apply FK-checks-off.
@@ -322,5 +356,168 @@ func applyFKOff(t *testing.T, dbName, sqlText string) {
 	defer conn.Close()
 	if _, err := conn.Exec("SET FOREIGN_KEY_CHECKS=0;\n" + sqlText + "\nSET FOREIGN_KEY_CHECKS=1;"); err != nil {
 		t.Fatalf("apply recovery SQL: %v", err)
+	}
+}
+
+// captureAndIndex flushes to a clean binlog, runs dml (which performs the
+// inserts/updates/deletes to capture), seals + copies the file, and parses it
+// into the index. One captured window per call.
+func captureAndIndex(t *testing.T, sourceDB, indexDB *sql.DB, resolver *metadata.Resolver, sourceName string, dml func()) {
+	t.Helper()
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+	currentBinlog, _, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition: %v", err)
+	}
+	dml()
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+
+	tmpDir := t.TempDir()
+	cp := exec.Command("docker", "cp",
+		fmt.Sprintf("bintrail-test-mysql:/var/lib/mysql/%s", currentBinlog),
+		filepath.Join(tmpDir, currentBinlog))
+	if out, e := cp.CombinedOutput(); e != nil {
+		t.Fatalf("docker cp %s: %v\n%s", currentBinlog, e, out)
+	}
+	p := parser.New(tmpDir, resolver, parser.Filters{Schemas: map[string]bool{sourceName: true}}, nil)
+	idx := indexer.New(indexDB, 100)
+	events := make(chan parser.Event, 256)
+	perr := make(chan error, 1)
+	go func() { defer close(events); perr <- p.ParseFile(context.Background(), currentBinlog, events) }()
+	if _, e := idx.Run(context.Background(), events); e != nil {
+		t.Fatalf("indexer.Run: %v", e)
+	}
+	if e := <-perr; e != nil {
+		t.Fatalf("ParseFile: %v", e)
+	}
+}
+
+// TestSynthesizeVictims_multiPathDedup pins the multi-path dedup: a child
+// reachable from the deleted parent via TWO CASCADE FKs must be emitted ONCE,
+// or recovery would double-INSERT its PK and fail on apply.
+func TestSynthesizeVictims_multiPathDedup(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE p (id INT PRIMARY KEY) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE c (
+		id INT PRIMARY KEY, ref1 INT, ref2 INT,
+		CONSTRAINT fk1 FOREIGN KEY (ref1) REFERENCES p(id) ON DELETE CASCADE,
+		CONSTRAINT fk2 FOREIGN KEY (ref2) REFERENCES p(id) ON DELETE CASCADE
+	) ENGINE=InnoDB`)
+
+	stats, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+	resolver, err := metadata.NewResolver(indexDB, stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	captureAndIndex(t, sourceDB, indexDB, resolver, sourceName, func() {
+		testutil.MustExec(t, sourceDB, "INSERT INTO p VALUES (1)")
+		testutil.MustExec(t, sourceDB, "INSERT INTO c VALUES (100,1,1)") // references p=1 via BOTH FKs
+		time.Sleep(1100 * time.Millisecond)
+		testutil.MustExec(t, sourceDB, "DELETE FROM p WHERE id=1") // cascades c once
+	})
+
+	eng := query.New(indexDB)
+	del := event.EventDelete
+	parentDeletes := mustFetch(t, eng, query.Options{Schema: sourceName, Table: "p", EventType: &del})
+	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("LoadCascadeFKs: %v", err)
+	}
+
+	res, err := cascade.SynthesizeVictims(ctx, eng, fks, parentDeletes, cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if len(res.Victims) != 1 {
+		t.Fatalf("multi-path child must be emitted exactly once, got %d: %v", len(res.Victims), victimList(res.Victims))
+	}
+	if res.Victims[0].TableName != "c" || res.Victims[0].PKValues != "100" {
+		t.Errorf("want victim c:100, got %+v", res.Victims[0])
+	}
+}
+
+// TestSynthesizeVictims_multiRootIndependentT pins the breadth dimension of the
+// root-T fix: two independent cascades deleted at T_A ≪ T_B, each must use its
+// OWN root T. cb is updated BETWEEN T_A and T_B; only per-root T_B recovers its
+// latest 'b1' — a collapse to a single global T (first/min/now) recovers stale 'b0'.
+func TestSynthesizeVictims_multiRootIndependentT(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE pa (id INT PRIMARY KEY) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE pb (id INT PRIMARY KEY) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE ca (
+		id INT PRIMARY KEY, pid INT, val VARCHAR(16),
+		CONSTRAINT fka FOREIGN KEY (pid) REFERENCES pa(id) ON DELETE CASCADE
+	) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE cb (
+		id INT PRIMARY KEY, pid INT, val VARCHAR(16),
+		CONSTRAINT fkb FOREIGN KEY (pid) REFERENCES pb(id) ON DELETE CASCADE
+	) ENGINE=InnoDB`)
+
+	stats, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+	resolver, err := metadata.NewResolver(indexDB, stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	captureAndIndex(t, sourceDB, indexDB, resolver, sourceName, func() {
+		testutil.MustExec(t, sourceDB, "INSERT INTO pa VALUES (1)")
+		testutil.MustExec(t, sourceDB, "INSERT INTO pb VALUES (2)")
+		testutil.MustExec(t, sourceDB, "INSERT INTO ca VALUES (10,1,'a0')")
+		testutil.MustExec(t, sourceDB, "INSERT INTO cb VALUES (20,2,'b0')")
+		testutil.MustExec(t, sourceDB, "DELETE FROM pa WHERE id=1") // T_A: cascades ca
+		time.Sleep(1100 * time.Millisecond)
+		testutil.MustExec(t, sourceDB, "UPDATE cb SET val='b1' WHERE id=20") // between T_A and T_B
+		time.Sleep(1100 * time.Millisecond)
+		testutil.MustExec(t, sourceDB, "DELETE FROM pb WHERE id=2") // T_B: cascades cb
+	})
+
+	eng := query.New(indexDB)
+	del := event.EventDelete
+	paDel := mustFetch(t, eng, query.Options{Schema: sourceName, Table: "pa", EventType: &del})
+	pbDel := mustFetch(t, eng, query.Options{Schema: sourceName, Table: "pb", EventType: &del})
+	parentDeletes := append(append([]query.ResultRow{}, paDel...), pbDel...)
+	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("LoadCascadeFKs: %v", err)
+	}
+
+	res, err := cascade.SynthesizeVictims(ctx, eng, fks, parentDeletes, cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	byPK := map[string]query.ResultRow{}
+	for _, v := range res.Victims {
+		byPK[v.TableName+":"+v.PKValues] = v
+	}
+	ca, ok := byPK["ca:10"]
+	if !ok {
+		t.Fatalf("ca:10 missing; got %v", victimList(res.Victims))
+	}
+	if ca.RowBefore["val"] != "a0" {
+		t.Errorf("ca:10 val = %v, want a0", ca.RowBefore["val"])
+	}
+	cb, ok := byPK["cb:20"]
+	if !ok {
+		t.Fatalf("cb:20 missing; got %v", victimList(res.Victims))
+	}
+	if cb.RowBefore["val"] != "b1" {
+		t.Errorf("cb:20 recovered at %v, want b1 (per-root T regression — using a collapsed global T?)", cb.RowBefore["val"])
 	}
 }

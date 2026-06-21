@@ -163,13 +163,15 @@ func TestCascadeRecoverySpike(t *testing.T) {
 	}
 	parentDeletes := mustFetch(t, eng, query.Options{Schema: sourceName, Table: "parent", EventType: &del})
 
-	victims, warnings, err := cascade.SynthesizeVictims(ctx, eng, fks, parentDeletes, cascade.Options{})
+	res, err := cascade.SynthesizeVictims(ctx, eng, fks, parentDeletes, cascade.Options{})
 	if err != nil {
 		t.Fatalf("SynthesizeVictims: %v", err)
 	}
-	for _, w := range warnings {
-		t.Logf("warning: %s", w)
+	// A clean cascade within the window must reconstruct completely.
+	if !res.Complete() {
+		t.Errorf("expected a complete reconstruction, got Incomplete=%v", res.Incomplete)
 	}
+	victims := res.Victims
 	got := map[string]bool{}
 	for _, v := range victims {
 		got[v.TableName+":"+v.PKValues] = true
