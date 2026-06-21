@@ -245,7 +245,7 @@ func EnsureSchema(db *sql.DB) error {
 		return err
 	}
 	// flavor records the source database flavor (mysql/mariadb) so a resume
-	// parses the saved gtid_set with the correct GTID event. NOT NULL DEFAULT
+	// parses the saved gtid_set with the correct GTID parser. NOT NULL DEFAULT
 	// 'mysql' means existing rows read back as mysql with no data migration,
 	// keeping every pre-MariaDB install unchanged.
 	return ensureColumn(db, "stream_state", "flavor",

@@ -19,6 +19,8 @@ import (
 // and legitimately link go-mysql.
 func TestReadLayerDoesNotLinkGoMySQL(t *testing.T) {
 	const banned = "github.com/go-mysql-org/go-mysql"
+	// The read/value stack. Add new read-side packages here as they are
+	// introduced — the guarantee is only as strong as this enumeration.
 	readPkgs := []string{
 		"github.com/dbtrail/dbtrail/internal/event",
 		"github.com/dbtrail/dbtrail/internal/indexer",
@@ -30,6 +32,9 @@ func TestReadLayerDoesNotLinkGoMySQL(t *testing.T) {
 		"github.com/dbtrail/dbtrail/internal/byos",
 		"github.com/dbtrail/dbtrail/internal/cliutil",
 		"github.com/dbtrail/dbtrail/internal/console",
+		"github.com/dbtrail/dbtrail/internal/archive",
+		"github.com/dbtrail/dbtrail/internal/agent",
+		"github.com/dbtrail/dbtrail/internal/status",
 	}
 	for _, pkg := range readPkgs {
 		out, err := exec.Command("go", "list", "-deps", pkg).CombinedOutput()

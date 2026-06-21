@@ -418,7 +418,7 @@ func wrapFetchError(qType QueryType, err error) error {
 //   - q.PKColumn == "": full-table reconstruction (issue #276).
 //     Dispatches to runFullTable.
 //
-// Dispatch is on PKColumn, not PKValue, so a literal `WHERE id = ”`
+// Dispatch is on PKColumn, not PKValue, so a literal `WHERE id = ''`
 // (legitimate against a NOT-NULL VARCHAR column) stays a single-row
 // point-lookup instead of silently flipping to a 100k-row table scan.
 //
@@ -1096,7 +1096,7 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 }
 
 // eventTypeName turns event.EventType (a uint8) into a human-readable
-// string for the _diff resultset. The parser package does not export a
+// string for the _diff resultset. The event package does not export a
 // String() method so this lookup lives here.
 func eventTypeName(t event.EventType) string {
 	switch t {

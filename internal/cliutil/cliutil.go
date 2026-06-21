@@ -99,7 +99,7 @@ func ParseSchemaList(s string) []string {
 	return result
 }
 
-// BuildIndexFilters builds a event.Filters from comma-separated schema and
+// BuildIndexFilters builds an event.Filters from comma-separated schema and
 // table flag values.
 func BuildIndexFilters(schemas, tables string) event.Filters {
 	var f event.Filters

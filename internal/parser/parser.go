@@ -434,16 +434,14 @@ func emitUpdates(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// BuildPKValues produces a pipe-delimited string of PK values in ordinal order.
-// Pipe (|) and backslash (\) inside values are escaped to prevent ambiguity.
-// pkColumns must be in ordinal_position order (as returned by TableMeta.PKColumnMetas).
+// BuildPKValues forwards to event.BuildPKValues (kept for back-compat; the
+// canonical doc lives on event.BuildPKValues).
 func BuildPKValues(pkColumns []metadata.ColumnMeta, row map[string]any) string {
 	return event.BuildPKValues(pkColumns, row)
 }
 
-// ChangedColumns returns the sorted list of column names whose values differ
-// between before and after images. Returns nil for INSERT/DELETE events where
-// one image is nil.
+// ChangedColumns forwards to event.ChangedColumns (kept for back-compat; the
+// canonical doc lives on event.ChangedColumns).
 func ChangedColumns(before, after map[string]any) []string {
 	return event.ChangedColumns(before, after)
 }

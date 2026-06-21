@@ -66,7 +66,7 @@ func toEventDTOs(rows []query.ResultRow) []eventDTO {
 	return out
 }
 
-// eventTypeName renders a event.EventType as its canonical SQL keyword,
+// eventTypeName renders an event.EventType as its canonical SQL keyword,
 // matching the strings used elsewhere in the codebase (query, recovery).
 func eventTypeName(et event.EventType) string {
 	switch et {

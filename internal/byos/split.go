@@ -138,7 +138,7 @@ func SplitEvent(ev event.Event, serverID string, ident SourceIdentity) (Metadata
 	return meta, payload, nil
 }
 
-// eventTypeName converts a event.EventType to the string representation
+// eventTypeName converts an event.EventType to the string representation
 // used in metadata and payload records. Returns an error for unsupported
 // event types (DDL, GTID, etc.).
 func eventTypeName(et event.EventType) (string, error) {

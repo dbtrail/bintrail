@@ -1,12 +1,13 @@
-// Package event holds the source-agnostic row-event type that flows from any
-// capture backend (MySQL/MariaDB binlog via internal/parser, PostgreSQL WAL via
-// internal/pgcapture) into the indexer and the whole downstream value stack
-// (query, recover, reconstruct, shim, console).
+// Package event holds the source-agnostic row-event type that flows from a
+// capture backend into the indexer and the whole downstream value stack (query,
+// recover, reconstruct, shim, console). Today the MySQL/MariaDB binlog parser
+// (internal/parser) produces it; a planned PostgreSQL WAL decoder is intended to
+// produce the same Event without the read side linking any new capture library.
 //
-// It deliberately imports NO source driver (no go-mysql, no pgx): everything
-// downstream of an Event is source-neutral, so the read-side packages link no
-// capture library. The MySQL/MariaDB binlog parser and the Postgres logical
-// decoder both produce this same Event. (Extracted from internal/parser — #528.)
+// It deliberately imports NO source driver (no go-mysql): everything downstream
+// of an Event is source-neutral, so the read-side packages link no capture
+// library — enforced by TestReadLayerDoesNotLinkGoMySQL. (Extracted from
+// internal/parser — #528.)
 package event
 
 import (
@@ -51,22 +52,24 @@ const (
 // everything the indexer needs to write one row to binlog_events. DDL events
 // (EventType=EventDDL) carry DDLQuery and DDLType instead of row data.
 //
-// Position fields are source-agnostic. For a MySQL/MariaDB binlog source they
-// hold the binlog coordinates (BinlogFile + StartPos/EndPos byte offsets, and the
-// GTID when enabled). For a PostgreSQL logical-replication source they hold the
-// WAL position: the LSN occupies BinlogFile (as its canonical "X/Y" string) and
-// StartPos/EndPos (numeric), and GTID is unused (Postgres has no GTID — resume is
-// by LSN against a replication slot). The downstream stack treats these as opaque
-// position metadata, so no field rename is required to carry an LSN.
+// Position fields are source-agnostic — the downstream stack treats them as
+// opaque metadata (it never orders, compares, or computes on them). For a
+// MySQL/MariaDB binlog source they hold the binlog coordinates: BinlogFile plus
+// StartPos/EndPos byte offsets, and the GTID when enabled. A future PostgreSQL
+// WAL decoder is expected to reuse these same fields for the LSN (so no field
+// rename is needed to carry one); the exact LSN-encoding contract is that
+// backend's to define (#530), not something this type fixes today.
 type Event struct {
-	BinlogFile    string         // MySQL: binlog filename. Postgres: LSN as "X/Y".
-	StartPos      uint64         // MySQL: binlog byte offset. Postgres: numeric LSN.
-	EndPos        uint64         // MySQL: binlog byte offset. Postgres: numeric LSN.
-	Timestamp     time.Time
-	GTID          string         // empty when GTID is not enabled (MySQL) or N/A (Postgres)
-	ConnectionID  uint32         // MySQL pseudo_thread_id from the transaction's QUERY(BEGIN) event; 0 = unknown
-	Schema        string
-	Table         string
+	BinlogFile   string // MySQL: binlog filename. (Wide enough to also hold a future Postgres LSN string.)
+	StartPos     uint64 // MySQL: binlog byte offset. (uint64 also fits a Postgres LSN.)
+	EndPos       uint64 // MySQL: binlog byte offset. (uint64 also fits a Postgres LSN.)
+	Timestamp    time.Time
+	GTID         string // empty when GTID is not enabled on the source
+	ConnectionID uint32 // MySQL pseudo_thread_id from the transaction's QUERY(BEGIN) event; 0 = unknown
+	Schema       string
+	Table        string
+	// EventType numeric values are a PERSISTENCE CONTRACT: stored as a number in
+	// binlog_events.event_type and filtered by it. Never renumber existing values.
 	EventType     EventType
 	PKValues      string         // pipe-delimited PK values in ordinal order
 	RowBefore     map[string]any // nil for INSERT
@@ -126,6 +129,7 @@ func ChangedColumns(before, after map[string]any) []string {
 }
 
 // DDLKind identifies the type of DDL statement detected in a binlog QUERY_EVENT.
+// The string values are persisted in schema_changes.ddl_type; keep them stable.
 type DDLKind string
 
 const (
