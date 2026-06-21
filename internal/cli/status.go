@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"fmt"
@@ -42,9 +42,9 @@ func init() {
 	statusCmd.Flags().StringVar(&stFormat, "format", "text", "Output format: text or json")
 	statusCmd.Flags().StringVar(&stBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots (optional, shows baseline binlog positions)")
 	_ = statusCmd.MarkFlagRequired("index-dsn")
-	bindCommandEnv(statusCmd)
-
-	rootCmd.AddCommand(statusCmd)
+	BindCommandEnv(statusCmd)
+	// Registration on a root command happens via AddReadCommands(root), which
+	// each binary's main() calls — see commands.go (#529).
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {

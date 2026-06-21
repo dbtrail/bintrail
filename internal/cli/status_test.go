@@ -1,22 +1,29 @@
-package main
+package cli
 
 import (
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // ─── cobra command wiring ─────────────────────────────────────────────────────
 
+// TestStatusCmd_registered verifies AddReadCommands registers the status command
+// on a root (the post-#529 wiring: each binary's main calls AddReadCommands
+// instead of status.go reaching a package-global rootCmd).
 func TestStatusCmd_registered(t *testing.T) {
+	root := &cobra.Command{Use: "root"}
+	AddReadCommands(root)
 	found := false
-	for _, cmd := range rootCmd.Commands() {
+	for _, cmd := range root.Commands() {
 		if cmd.Use == "status" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("expected 'status' command to be registered under rootCmd")
+		t.Error("expected 'status' command to be registered by AddReadCommands")
 	}
 }
 
