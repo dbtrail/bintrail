@@ -10,7 +10,7 @@ import "testing"
 // shipped binary wires them in: a dropped AddReadCommands call would otherwise
 // let a command silently vanish from the CLI with the unit suite still green.
 //
-// Grow `want` as more read commands migrate into internal/cli (#529).
+// Add to `want` whenever a new read command is registered by cli.AddReadCommands.
 func TestReadCommandsWiredOnRoot(t *testing.T) {
 	want := []string{"status", "query", "recover", "reconstruct", "shim"}
 
