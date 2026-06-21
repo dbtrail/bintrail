@@ -151,6 +151,46 @@ func TestOne_EndToEnd_PostgresToIndexToRecovery(t *testing.T) {
 	}
 }
 
+// TestOne_CapturerFailureSurfaces proves the cancellation bridge in One: when the
+// capturer fails on its own (here: a non-existent publication makes cap.Run return
+// before streaming), One must surface that error PROMPTLY rather than hang forever
+// on a never-closed events channel under a never-cancelled parent ctx (the silent
+// hung-stream class). The 15s timeout is the hang detector.
+func TestOne_CapturerFailureSurfaces(t *testing.T) {
+	pgDSN := testutil.SkipIfNoPostgres(t)
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	_, dbName := testutil.CreateTestDB(t)
+	indexDSN := testutil.BaseDSN() + "/" + dbName
+
+	cfg := pgstreamrun.Config{
+		IndexDSN:    indexDSN,
+		ReplDSN:     replDSN(pgDSN),
+		QueryDSN:    pgDSN,
+		SlotName:    "bintrail_pgsr_fail_slot",
+		Publication: "bintrail_pgsr_nonexistent_pub", // does not exist → cap.Run fails
+		ServerID:    7,
+		Checkpoint:  200 * time.Millisecond,
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- pgstreamrun.One(runCtx, cfg) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("One returned nil; expected the capturer's publication failure to surface")
+		}
+		if !strings.Contains(err.Error(), "does not exist") {
+			t.Errorf("unexpected error (want publication failure): %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("One hung — a capturer failure was not surfaced (cancellation bridge missing)")
+	}
+}
+
 // ── helpers ──
 
 func replDSN(base string) string {

@@ -122,11 +122,27 @@ func One(ctx context.Context, cfg Config) error {
 	})
 	idx := indexer.New(indexDB, cfg.BatchSize)
 
+	// Bridge loop-exit and capturer-exit (mirrors streamrun.One). The capturer's
+	// Run does NOT close the events channel (its contract), so the wrapper goroutine
+	// closes it when Run returns: a capturer that dies on its own (slot lost
+	// mid-stream, decode desync, network drop) then makes streamLoopPG drain the
+	// remaining events and exit on the close, where One reads the real error and
+	// returns it for the supervisor to reconnect — instead of hanging forever on a
+	// never-closed channel under a never-cancelled parent ctx. The explicit cancel()
+	// after the loop covers the other direction: if streamLoopPG returns first, it
+	// unblocks the capturer's emit/receive so it can return.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	events := make(chan event.Event, defaultEventBuffer)
 	captureErr := make(chan error, 1)
-	go func() { captureErr <- cap.Run(ctx, events) }()
+	go func() {
+		defer close(events)
+		captureErr <- cap.Run(ctx, events)
+	}()
 
 	loopErr := streamLoopPG(ctx, events, idx, indexDB, cap, checkpointInterval, state, logger)
+	cancel() // loop exited first → unblock the capturer's emit/receive so it returns
 
 	// Run returns nil on ctx-cancel; only a real capture error matters.
 	capErr := <-captureErr
@@ -172,6 +188,11 @@ func streamLoopPG(
 		}
 		n, err := idx.InsertBatch(batch)
 		state.eventsIndexed += n
+		// Discard the batch unconditionally: InsertBatch is a single atomic INSERT
+		// (0 rows on error), and every flush-error path here is fatal — the loop
+		// aborts and PostgreSQL re-streams the whole tail from the unadvanced
+		// checkpoint. If a future change ever retries or continues past a flush
+		// error, this clear must move into the success branch or those rows are lost.
 		batch = batch[:0]
 		return err
 	}
