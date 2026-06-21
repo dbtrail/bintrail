@@ -3,9 +3,11 @@
 // bintrail's value stack — the PostgreSQL analog of the go-mysql binlog parser in
 // internal/parser. It shares zero code with that parser.
 //
-// This is the capture layer: it links the PostgreSQL replication libraries
-// (github.com/jackc/pglogrepl, github.com/jackc/pgx/v5). The read/value stack
-// (query, recover, reconstruct, shim, console) must NEVER import this package —
+// This is the capture layer: it links the PostgreSQL replication libraries —
+// github.com/jackc/pglogrepl in this slice, with github.com/jackc/pgx/v5 becoming
+// a direct dependency when the capturer (slice 2) opens the connection. The
+// read/value stack (query, recover, reconstruct, shim, console) must NEVER import
+// this package —
 // it consumes event.Event, which links no capture library. That boundary is
 // enforced by internal/event's TestReadLayerDoesNotLinkGoMySQL, which bans pgx and
 // pglogrepl from the read side alongside go-mysql.

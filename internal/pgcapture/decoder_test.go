@@ -310,6 +310,74 @@ func TestDecode_PKResolverErrorFailsLoud(t *testing.T) {
 	}
 }
 
+func TestDecode_ColumnCountMismatchFailsLoud(t *testing.T) {
+	// A tuple whose arity differs from its cached relation must hard-stop, not
+	// silently map columns to the wrong names.
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	mustDecode(t, d, relMsg(1, "public", "t", "id", "v")) // 2 columns
+	mustDecode(t, d, beginMsg())
+	_, _, err := d.Decode(&pglogrepl.InsertMessage{
+		RelationID: 1, Tuple: tuple(textCol("1")), // 1 column
+	})
+	if err == nil {
+		t.Error("expected error for a tuple whose column count differs from the relation")
+	}
+}
+
+func TestDecode_UnchangedToastInUpdateBeforeImageFailsLoud(t *testing.T) {
+	// An 'u' (unchanged-TOAST) in an UPDATE's OLD tuple means the real value — the
+	// one bintrail needs for recovery — is absent. Under RI FULL this never happens
+	// (PG detoasts replica-identity columns into the old tuple); if it does, fail
+	// loud rather than silently store a marker in the before-image.
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	mustDecode(t, d, relMsg(1, "public", "t", "id", "body"))
+	mustDecode(t, d, beginMsg())
+	_, _, err := d.Decode(&pglogrepl.UpdateMessage{
+		RelationID:   1,
+		OldTupleType: pglogrepl.UpdateMessageTupleTypeOld,
+		OldTuple:     tuple(textCol("1"), toastCol()), // 'u' in the BEFORE image
+		NewTuple:     tuple(textCol("1"), textCol("new")),
+	})
+	if err == nil {
+		t.Error("expected fail-loud error for an unchanged-TOAST datum in an UPDATE before-image")
+	}
+}
+
+func TestDecode_UnchangedToastInDeleteBeforeImageFailsLoud(t *testing.T) {
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	mustDecode(t, d, relMsg(1, "public", "t", "id", "body"))
+	mustDecode(t, d, beginMsg())
+	_, _, err := d.Decode(&pglogrepl.DeleteMessage{
+		RelationID:   1,
+		OldTupleType: pglogrepl.DeleteMessageTupleTypeOld,
+		OldTuple:     tuple(textCol("1"), toastCol()), // 'u' in the DELETE before-image
+	})
+	if err == nil {
+		t.Error("expected fail-loud error for an unchanged-TOAST datum in a DELETE before-image")
+	}
+}
+
+func TestDecode_DeleteWithoutBeforeImageFailsLoud(t *testing.T) {
+	// A DELETE's before-image is the only source for its reversal INSERT; a missing
+	// old tuple must fail loud, not index an un-keyed, un-reversible delete.
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	mustDecode(t, d, relMsg(1, "public", "t", "id"))
+	mustDecode(t, d, beginMsg())
+	_, _, err := d.Decode(&pglogrepl.DeleteMessage{RelationID: 1, OldTuple: nil})
+	if err == nil {
+		t.Error("expected fail-loud error for a DELETE carrying no before-image")
+	}
+}
+
+func TestNewDecoder_NilPKResolverPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("expected NewDecoder(nil, ...) to panic — a nil PKResolver must fail at the wiring site")
+		}
+	}()
+	pgcapture.NewDecoder(nil, event.Filters{}, nil)
+}
+
 // ─── filters + empty PK ───────────────────────────────────────────────────────
 
 func TestDecode_FilterSkipsNonMatching(t *testing.T) {

@@ -24,6 +24,12 @@ import (
 // it (RowAfter[col] = RowBefore[col]) and this marker is never persisted. The
 // marker is only reachable under a weaker replica identity, where it keeps the
 // column visible rather than silently dropped (the never-drop floor).
+//
+// Forward constraint: the collision-freedom argument ("every real value is a Go
+// string, the marker is a map") holds only while #530 stores all values as text.
+// When #533 introduces type-faithful rendering (e.g. parsing jsonb into a map),
+// non-string values appear and this structural-distinctness must be re-validated —
+// it is the same #533 that consumes relColumn's retained type OIDs.
 const UnchangedToastKey = "__bintrail_unchanged_toast__"
 
 // Decoder turns a pgoutput logical-replication message stream into source-neutral
@@ -62,6 +68,12 @@ type txnContext struct {
 // filters restricts which schema/table produce events (the zero Filters accepts
 // all). logger may be nil (slog.Default() is used).
 func NewDecoder(resolvePK PKResolver, filters event.Filters, logger *slog.Logger) *Decoder {
+	// resolvePK is mandatory (every row event needs a PK source). A nil resolver
+	// would otherwise survive construction and panic deep inside cacheRelation on
+	// the first RelationMessage; fail at the wiring site instead.
+	if resolvePK == nil {
+		panic("pgcapture: NewDecoder requires a non-nil PKResolver")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -131,9 +143,11 @@ func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
 		return event.Event{}, false, nil
 
 	default:
-		// proto_version 1 emits no in-progress-transaction streaming messages, so
-		// any other type is unexpected; log rather than fail (it carries no row
-		// data we could be silently dropping).
+		// The slice-2 capturer requests proto_version 1, which emits no in-progress-
+		// transaction streaming (v2) messages, so any other type is unexpected; log
+		// rather than fail (it carries no row data we could be silently dropping). A
+		// future bump to proto v2 would route real row-bearing stream messages here —
+		// revisit this branch before negotiating v2.
 		d.logger.Debug("pgcapture: ignoring unhandled message", "type", fmt.Sprintf("%T", msg))
 		return event.Event{}, false, nil
 	}
@@ -187,9 +201,9 @@ func (d *Decoder) decodeInsert(m *pglogrepl.InsertMessage) (event.Event, bool, e
 	if !d.filters.Matches(rel.schema, rel.table) {
 		return event.Event{}, false, nil
 	}
-	// INSERT carries only a new tuple, fully written — it never contains a 'u'
-	// (unchanged-TOAST) marker, so there is no before-image to resolve from.
-	after, err := d.decodeTuple(rel, m.Tuple, nil)
+	// INSERT carries only a new tuple, fully written — pgoutput never emits 'u' in
+	// an INSERT, so there is no before-image to resolve from.
+	after, err := d.decodeTuple(rel, m.Tuple, roleAfter, nil)
 	if err != nil {
 		return event.Event{}, false, err
 	}
@@ -204,22 +218,23 @@ func (d *Decoder) decodeUpdate(m *pglogrepl.UpdateMessage) (event.Event, bool, e
 	if !d.filters.Matches(rel.schema, rel.table) {
 		return event.Event{}, false, nil
 	}
-	// OldTuple is present as a full tuple ('O') only under REPLICA IDENTITY FULL, or
-	// as a key-only tuple ('K') when a replica-identity column changed; either form
-	// carries real values (never 'u'). It is absent when an UPDATE under RI DEFAULT
-	// left the key unchanged.
+	// OldTuple is the full old tuple ('O') under REPLICA IDENTITY FULL, a key-only
+	// tuple ('K') when a replica-identity column changed under a weaker identity, or
+	// absent when an UPDATE under RI DEFAULT left the key unchanged. Decoded as a
+	// before-image: a 'u' here fails loud (see decodeTuple) — under RI FULL it can't
+	// occur, and under a weaker identity it would mean a lost value.
 	var before map[string]any
 	if m.OldTuple != nil {
-		before, err = d.decodeTuple(rel, m.OldTuple, nil)
+		before, err = d.decodeTuple(rel, m.OldTuple, roleBefore, nil)
 		if err != nil {
 			return event.Event{}, false, err
 		}
 	}
 	// Resolve any 'u' in the new tuple from the before-image (Option B): under RI
-	// FULL the unchanged column's real value is in the before-image, so the after-
-	// image holds the TRUE post-update row state — making changed_columns correct
-	// and needing zero downstream handling.
-	after, err := d.decodeTuple(rel, m.NewTuple, before)
+	// FULL the unchanged column's real value is in the (now guaranteed 'u'-free)
+	// before-image, so the after-image holds the TRUE post-update row state — making
+	// changed_columns correct and needing zero downstream handling.
+	after, err := d.decodeTuple(rel, m.NewTuple, roleAfter, before)
 	if err != nil {
 		return event.Event{}, false, err
 	}
@@ -234,7 +249,15 @@ func (d *Decoder) decodeDelete(m *pglogrepl.DeleteMessage) (event.Event, bool, e
 	if !d.filters.Matches(rel.schema, rel.table) {
 		return event.Event{}, false, nil
 	}
-	before, err := d.decodeTuple(rel, m.OldTuple, nil)
+	// A DELETE's before-image is the ONLY source for its reversal INSERT. pgoutput
+	// always sends an old tuple for a DELETE (its decode requires 'K' or 'O'), and a
+	// table with no usable replica identity can't be DELETEd from under logical
+	// replication at all — so a missing old tuple is a broken invariant, not a
+	// supported case: fail loud rather than index an un-keyed, un-reversible row.
+	if m.OldTuple == nil {
+		return event.Event{}, false, fmt.Errorf("pgcapture: DELETE on %s.%s carries no before-image (no replica identity?) — cannot index an un-reversible delete", rel.schema, rel.table)
+	}
+	before, err := d.decodeTuple(rel, m.OldTuple, roleBefore, nil)
 	if err != nil {
 		return event.Event{}, false, err
 	}
@@ -256,18 +279,40 @@ func (d *Decoder) relationFor(oid uint32) (*relationInfo, error) {
 	return rel, nil
 }
 
+// tupleRole distinguishes how the decoder treats an unchanged-TOAST ('u') datum,
+// which is the only kind whose handling depends on which image a tuple is.
+type tupleRole uint8
+
+const (
+	// roleBefore = an old/before-image tuple. A 'u' here is a HARD ERROR (see
+	// decodeTuple): under REPLICA IDENTITY FULL the before-image always carries the
+	// real value, so a 'u' means the value bintrail needs for recovery is absent.
+	roleBefore tupleRole = iota
+	// roleAfter = a new/after-image tuple. A 'u' is resolved from the before-image
+	// (guaranteed real, since roleBefore rejects 'u'), falling back to the marker
+	// only when no before-image is available (a weaker-than-FULL replica identity).
+	roleAfter
+)
+
 // decodeTuple converts a pgoutput tuple to a column-name→value map in the cached
 // relation's column order:
 //   - 'n' (null)   → Go nil (SQL NULL);
 //   - 't' (text)   → Go string (lossless; type-faithful rendering is #533's);
-//   - 'u' (toast)  → resolveFrom[col] when present (Option B), else the structurally
-//     distinct unchanged-TOAST marker (never a plain string);
-//   - 'b' (binary) → error: pgcapture streams text format only, so a binary datum is
-//     a misconfiguration we refuse rather than silently mishandle.
+//   - 'b' (binary) → error: the slice-2 capturer requests text format, so a binary
+//     datum is a misconfiguration we refuse rather than silently mishandle;
+//   - 'u' (unchanged TOAST):
+//   - in a before-image (roleBefore) → HARD ERROR. Under REPLICA IDENTITY FULL —
+//     the required mode (#531) — PostgreSQL detoasts and WAL-logs every replica-
+//     identity column (all columns, under FULL), so the before-image carries the
+//     real value, never 'u' (proven at the protocol level in the spike; PG commit
+//     1cd5802, back-patched to PG10+). A 'u' in a before-image therefore means the
+//     real value — the ONLY source for a DELETE's reversal INSERT — is gone, so we
+//     fail loud rather than silently store a marker. Unreachable in support.
+//   - in an after-image (roleAfter) → resolved from the before-image (Option B),
+//     else the structurally distinct unchanged-TOAST marker (never a plain string).
 //
-// resolveFrom is the before-image for an UPDATE's new tuple, and nil otherwise (a
-// before-image and an INSERT contain no 'u').
-func (d *Decoder) decodeTuple(rel *relationInfo, t *pglogrepl.TupleData, resolveFrom map[string]any) (map[string]any, error) {
+// before is the before-image, consulted only for roleAfter; nil otherwise.
+func (d *Decoder) decodeTuple(rel *relationInfo, t *pglogrepl.TupleData, role tupleRole, before map[string]any) (map[string]any, error) {
 	if t == nil {
 		return nil, nil
 	}
@@ -284,8 +329,12 @@ func (d *Decoder) decodeTuple(rel *relationInfo, t *pglogrepl.TupleData, resolve
 		case pglogrepl.TupleDataTypeText:
 			row[name] = string(col.Data)
 		case pglogrepl.TupleDataTypeToast:
-			if resolveFrom != nil {
-				if v, ok := resolveFrom[name]; ok {
+			if role == roleBefore {
+				return nil, fmt.Errorf("pgcapture: unchanged-TOAST datum in the before-image of %s.%s column %q — the source must use REPLICA IDENTITY FULL so the real value is captured for recovery",
+					rel.schema, rel.table, name)
+			}
+			if before != nil {
+				if v, ok := before[name]; ok {
 					row[name] = v
 					continue
 				}
@@ -318,6 +367,11 @@ func (d *Decoder) rowEvent(rel *relationInfo, typ event.EventType, before, after
 		pkValues = event.BuildPKValues(rel.pkCols, pkSource)
 	}
 
+	// All rows of a logical-replication transaction are delivered at commit and
+	// share its LSN, so StartPos == EndPos == GTID for every row of a txn (unlike
+	// MySQL's distinct per-row byte offsets). This is intentional and safe: the
+	// downstream stack treats position fields as opaque metadata it never orders or
+	// compares on (see event.Event); the durable cursor advances on EventCommit.
 	lsn := d.txn.commitLSN.String()
 	return event.Event{
 		BinlogFile: lsn,

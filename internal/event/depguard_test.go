@@ -9,11 +9,11 @@ import (
 // TestReadLayerDoesNotLinkGoMySQL is the #528 guard: the read/recover/reconstruct
 // value stack consumes the source-agnostic event.Event, so it must NOT link ANY
 // capture library — neither the go-mysql binlog library (MySQL/MariaDB) nor the
-// PostgreSQL replication libraries (pgx + pglogrepl, added in #530 for
-// internal/pgcapture). A future change that re-imports internal/parser or
-// internal/pgcapture into any of these packages — directly or transitively — fails
-// here. This keeps the index/query/recover side swappable across MySQL and
-// PostgreSQL sources.
+// PostgreSQL replication libraries (pglogrepl, and pgx once the capturer lands in
+// slice 2; both are banned pre-emptively here for internal/pgcapture, #530). A
+// future change that re-imports internal/parser or internal/pgcapture into any of
+// these packages — directly or transitively — fails here. This keeps the
+// index/query/recover side swappable across MySQL and PostgreSQL sources.
 //
 // internal/shim is deliberately NOT listed: it links go-mysql for its MySQL
 // wire-protocol server (go-mysql/server), which is its own dependency, unrelated
