@@ -1,0 +1,376 @@
+# PostgreSQL as a source (alpha)
+
+bintrail can capture from a **PostgreSQL** server while the index database stays
+MySQL. PostgreSQL capture lives in its own binary, **`bintrail-pg`**. This is an
+**alpha** capability: the happy path is verified end-to-end against real
+PostgreSQL (14–17 in CI), but it has documented limitations (below) and narrower
+coverage than the MySQL path. Read the limitations before pointing it at
+production.
+
+**Scope:** PostgreSQL is supported as a **source** (the database you capture
+changes from). The **index** — where bintrail stores the indexed events — stays
+**MySQL** (one index schema for every source family). Pointing the index at
+PostgreSQL is not supported.
+
+**Nothing is installed in your PostgreSQL server.** bintrail-pg connects as an
+ordinary logical-replication **client** using PostgreSQL's built-in `pgoutput`
+plugin. It does **not** install an output plugin, a `CREATE EXTENSION`, an
+event trigger, or any other server-side component. You create one publication
+and set REPLICA IDENTITY; bintrail reads — it never writes to your source.
+
+---
+
+## Requirements at a glance
+
+| On the PostgreSQL source | Required? | Notes |
+|---|---|---|
+| **PostgreSQL 14+** | Yes (declared) | 14/15/16/17 tested in CI. 13 may work but is EOL — best-effort only. |
+| **`wal_level = logical`** | **Yes** | Server-wide; needs a **restart**. Validated at startup — bintrail-pg refuses to start otherwise. |
+| **A role with `REPLICATION`** | **Yes** | Used for the replication stream and to create the slot. |
+| **`REPLICA IDENTITY FULL`** on each captured table | **Yes** | The PostgreSQL analog of MySQL's `binlog_row_image = FULL`. Validated per table; refuses to start otherwise. |
+| **A `PUBLICATION`** covering those tables | **Yes — you create it** | bintrail-pg validates it exists and covers your tables; it does **not** create it. |
+| **A replication slot** | No — created for you | bintrail-pg creates the logical slot on first run and reuses it on restart. |
+| `max_replication_slots` ≥ 1, `max_wal_senders` ≥ 1 | Yes | Defaults (10) are usually fine. A slot consumes one of each. |
+
+The index MySQL has the same requirements as for any source — see
+[Streaming → index requirements](streaming.md).
+
+---
+
+## Install
+
+`bintrail-pg` ships as its own artifact alongside the core `bintrail` binary.
+
+**Docker image:**
+
+```bash
+docker pull ghcr.io/dbtrail/bintrail-pg:latest
+docker run --rm ghcr.io/dbtrail/bintrail-pg:latest --version
+```
+
+**Linux packages** (`.deb` / `.rpm`, amd64 + arm64) are attached to every
+[release](https://github.com/dbtrail/dbtrail/releases) as `bintrail-pg_*`:
+
+```bash
+# Debian/Ubuntu
+sudo dpkg -i bintrail-pg_*_linux_amd64.deb
+# RHEL/Fedora
+sudo rpm -i bintrail-pg_*_linux_amd64.rpm
+```
+
+**From source:**
+
+```bash
+git clone https://github.com/dbtrail/dbtrail && cd dbtrail
+make build-pg        # produces ./bintrail-pg (requires CGO — DuckDB is embedded)
+```
+
+`bintrail-pg` carries the PostgreSQL capture command (`stream`) plus the shared
+read/recovery commands (`query`, `recover`, `reconstruct`, `status`, `shim`) —
+the same ones the core binary exposes, working over the same index.
+
+---
+
+## PostgreSQL-side setup
+
+Run these once on the source, as a superuser (or the managed-database master
+user). Replace `shop` / table names with yours.
+
+### 1. Enable logical decoding (`wal_level = logical`)
+
+Logical replication is impossible without it, and bintrail-pg refuses to start
+if it is not set.
+
+```sql
+SHOW wal_level;        -- want: logical
+ALTER SYSTEM SET wal_level = 'logical';
+-- wal_level only takes effect after a RESTART (not a reload):
+--   self-hosted:  restart the postgres service
+--   managed (RDS/Aurora/Cloud SQL/Azure): set it in the parameter group and reboot
+```
+
+While you are there, make sure there is slot/sender headroom (defaults are
+usually fine; a slot uses one of each):
+
+```sql
+SHOW max_replication_slots;   -- ≥ 1
+SHOW max_wal_senders;         -- ≥ 1
+```
+
+### 2. Create a replication user
+
+bintrail-pg connects with a role that has the **`REPLICATION`** attribute (this
+is what lets it open a replication connection and create the slot). It only ever
+reads.
+
+```sql
+CREATE ROLE dbtrail WITH LOGIN REPLICATION PASSWORD 'change-me';
+GRANT CONNECT ON DATABASE shop TO dbtrail;
+```
+
+- The role does **not** need to be a superuser, and does **not** need `SELECT`
+  on your tables to stream changes (logical replication delivers the row data
+  over the WAL). It does read system catalogs (publications, replica identity,
+  primary keys) — readable by any role by default.
+- **Managed PostgreSQL:** the master user already has the replication privilege
+  (e.g. AWS grants `rds_replication`); you can capture as the master user, or
+  create a dedicated role and grant it the provider's replication role
+  (`GRANT rds_replication TO dbtrail;` on RDS/Aurora). See
+  [Managed PostgreSQL](#managed-postgresql) below.
+
+### 3. Set `REPLICA IDENTITY FULL` on every captured table
+
+This is the single most important step. By default PostgreSQL only puts the
+**primary-key** columns in the WAL for UPDATE/DELETE (`REPLICA IDENTITY
+DEFAULT`). bintrail needs the **full before-image** to generate correct reversal
+SQL — and, critically, an unchanged out-of-line **TOAST** value (a large
+text/bytea/json column) is only present in the before-image under
+`REPLICA IDENTITY FULL`. Under a weaker identity it is silently absent, and
+recovery would be wrong.
+
+```sql
+ALTER TABLE shop.orders   REPLICA IDENTITY FULL;
+ALTER TABLE shop.customers REPLICA IDENTITY FULL;
+-- repeat for every table you want to capture
+```
+
+bintrail-pg validates this for every table in the publication at startup **and**
+re-checks each table live as it appears in the stream, so a table added later
+without `REPLICA IDENTITY FULL` fails loud rather than silently losing data.
+
+> This is the direct counterpart of the MySQL/MariaDB `binlog_row_image = FULL`
+> requirement.
+
+### 4. Create a publication
+
+A **publication** is PostgreSQL's list of which tables get streamed. You create
+it; bintrail-pg validates that it exists and that it covers the tables you ask
+for, but **does not create it for you** (we never run DDL on your source).
+
+```sql
+-- Specific tables (recommended — you control exactly what is captured):
+CREATE PUBLICATION bintrail_pub FOR TABLE shop.orders, shop.customers;
+
+-- …or everything (requires superuser):
+CREATE PUBLICATION bintrail_pub FOR ALL TABLES;
+```
+
+To add a table later: `ALTER PUBLICATION bintrail_pub ADD TABLE shop.items;`
+(then set its `REPLICA IDENTITY FULL` too).
+
+### 5. The replication slot — created for you
+
+You do **not** need to create a replication slot. bintrail-pg creates a logical
+slot (named by `--slot`) on first run and resumes from it on every restart.
+
+> **Operational note (important):** a replication slot *retains WAL on the
+> source* until its consumer confirms it. If bintrail-pg is stopped for a long
+> time, the slot pins WAL and the source disk can fill. On PostgreSQL 13+ set
+> `max_slot_wal_keep_size` as a safety valve so an abandoned slot is capped
+> (it becomes `lost` instead of filling the disk; bintrail-pg then fails loud on
+> resume rather than silently skipping data). If you decommission a capture,
+> drop its slot: `SELECT pg_drop_replication_slot('<slot>');`.
+
+---
+
+## Running it
+
+PostgreSQL needs **two connection strings** — this is a protocol constraint, not
+a quirk:
+
+- **`--repl-dsn`** — a **replication** connection. Its connection string must
+  include `replication=database`. A replication connection runs in *walsender*
+  mode and cannot run ordinary SQL, which is why a second connection is needed.
+- **`--query-dsn`** — an ordinary connection, used for primary-key lookups in
+  the catalog and the startup validations.
+
+Both are standard PostgreSQL/libpq URLs (so TLS is configured the usual way, via
+`sslmode=` in the DSN).
+
+```bash
+bintrail-pg stream \
+  --index-dsn   'user:pw@tcp(index-host:3306)/binlog_index' \
+  --repl-dsn    'postgres://dbtrail:pw@pg-host:5432/shop?replication=database&sslmode=require' \
+  --query-dsn   'postgres://dbtrail:pw@pg-host:5432/shop?sslmode=require' \
+  --slot        bintrail_shop \
+  --publication bintrail_pub \
+  --server-id   201 \
+  --schemas     shop
+```
+
+That command: validates `wal_level`, the publication, and per-table
+`REPLICA IDENTITY FULL`; creates the slot `bintrail_shop` if absent; bootstraps
+the index tables if needed; then streams every row change into `binlog_events`.
+Send `SIGINT`/`SIGTERM` for a graceful shutdown (it flushes the batch and writes
+a final checkpoint).
+
+### Flags
+
+| Flag | Required | Meaning |
+|---|---|---|
+| `--index-dsn` | yes | The index MySQL database (env `BINTRAIL_INDEX_DSN`). |
+| `--repl-dsn` | yes | PostgreSQL replication DSN, must carry `replication=database` (env `BINTRAIL_PG_REPL_DSN`). |
+| `--query-dsn` | yes | PostgreSQL ordinary DSN for catalog/PK lookups (env `BINTRAIL_PG_QUERY_DSN`). |
+| `--slot` | yes | Logical replication slot name; created if absent (env `BINTRAIL_PG_SLOT`). |
+| `--publication` | yes | Publication name covering the tables to capture (env `BINTRAIL_PG_PUBLICATION`). |
+| `--server-id` | yes | A unique number identifying this source in the index — must differ from every other source (env `BINTRAIL_SERVER_ID`). |
+| `--schemas` | no | Only index these schemas (comma-separated). |
+| `--tables` | no | Only index these tables (comma-separated, e.g. `shop.orders`). |
+| `--start-lsn` | no | Explicit start LSN; **first run only**, ignored once a checkpoint exists. |
+| `--batch-size` | no | Events per batch insert (default 1000). |
+| `--checkpoint` | no | Checkpoint interval in seconds (default 5). |
+| `--partitions` | no | Index partitions for the one-time bootstrap (default 48). |
+
+Every flag has a `BINTRAIL_*` environment equivalent and can be set in a
+`.bintrail.env` file (see [the env-file convention](install.md)).
+
+### Resuming and re-seeding
+
+The durable checkpoint is the last committed **LSN**, stored in the index's
+`stream_state`. On restart bintrail-pg resumes from it automatically — re-running
+the same command is idempotent, and `--start-lsn` is ignored once a checkpoint
+exists.
+
+To start over from scratch you must drop the slot **and** clear the checkpoint —
+because in PostgreSQL the *slot* governs the resume position, so clearing the
+checkpoint alone does not rewind:
+
+```sql
+SELECT pg_drop_replication_slot('bintrail_shop');   -- on the source
+DELETE FROM stream_state WHERE id = 1;               -- on the index
+```
+
+---
+
+## Adding more servers
+
+Capture each PostgreSQL source by running its **own** `bintrail-pg stream`
+process with a **unique `--server-id`** and a unique `--slot`. There is no
+shared daemon for PostgreSQL sources in this release — one process per source
+(systemd unit, container, etc.).
+
+You can **view and recover** PostgreSQL-captured data in the read-only web
+console (`bintrail-console`), which reads the shared index — but the console's
+"+ Add server" / `watch` control plane is MySQL-oriented and does not yet drive
+PostgreSQL capture. Run `bintrail-pg stream` for the capture; use the console (or
+the `query`/`recover` CLI) to browse and recover.
+
+---
+
+## Querying and recovering
+
+Once events are flowing, the read/recovery commands work the same as for a MySQL
+source — they read the flavor-agnostic index:
+
+```bash
+bintrail-pg query   --index-dsn '…' --schema shop --table orders --limit 20
+bintrail-pg recover --index-dsn '…' --schema shop --table orders --pk 42 --dry-run
+bintrail-pg status  --index-dsn '…'
+```
+
+(The core `bintrail` binary works against the same index too — the read plane is
+identical across binaries.)
+
+**What's recoverable:** all INSERT/UPDATE/DELETE row changes with full
+before/after images. Under `REPLICA IDENTITY FULL`, unchanged out-of-line TOAST
+values are present in the before-image, so a reversal of a large-column row is
+correct. FK `ON DELETE CASCADE` / `SET NULL` cascades are visible in the stream
+(PostgreSQL performs them as ordinary row changes), so `recover` undoes them
+directly.
+
+> **Not yet for PostgreSQL:** full-table `reconstruct` and the time-travel
+> `shim` rely on a baseline snapshot, which is not yet wired for PostgreSQL
+> sources. `query` and `recover` (which work from the indexed deltas) are the
+> supported recovery surface for PostgreSQL in this release.
+
+---
+
+## Extensions and custom types
+
+- **bintrail installs nothing in your database.** Capture is via the built-in
+  `pgoutput` plugin only — no output plugin, no `CREATE EXTENSION`, no event
+  trigger. This is a deliberate red line, and it is what lets bintrail-pg work
+  against managed PostgreSQL (which forbids custom extensions).
+- **PostGIS works well.** Geometry columns stream as hex-EWKB, which embeds the
+  SRID and round-trips losslessly back into PostgreSQL — the target just needs
+  PostGIS installed. (Set `REPLICA IDENTITY FULL` as for any table; large
+  geometries are TOASTed, so FULL matters.)
+- **Other extension/custom types** (`vector`/pgvector, enums, ranges, composite
+  types) are captured **as their text representation**. Recovery into a target
+  that has the same extension installed works; treat exotic types as
+  best-effort and test your round-trip.
+- **TimescaleDB hypertables are out of scope.** Logical decoding emits the
+  underlying *chunk* tables (`_timescaledb_internal._hyper_*`), not the
+  hypertable, so a hypertable is not captured coherently in this release.
+
+---
+
+## Alpha limitations
+
+- **`UNLOGGED` tables are invisible.** They bypass the WAL by design, so logical
+  decoding never sees them — there is no signal, the changes are simply not
+  captured. Don't rely on bintrail for UNLOGGED data.
+- **`TRUNCATE` is visible but not reversible from the stream.** It is decoded as
+  an event but carries no rows, so there is nothing for `recover` to put back.
+- **Sequence cursors are not captured.** The materialized id values in your rows
+  *are* captured; the sequence's own `last_value` (a separate catalog object) is
+  not — logical decoding does not replicate sequences. After a restore, fix the
+  sequence with `SELECT setval('seq', (SELECT max(id) FROM t));`.
+- **`GENERATED ... AS IDENTITY` / generated columns** can need care on recovery
+  (`GENERATED ALWAYS AS IDENTITY` rejects an explicit insert; `STORED` generated
+  columns are absent from the stream before PostgreSQL 18). Treat as best-effort.
+- **`reconstruct` / time-travel `shim` are not wired for PostgreSQL** (no
+  baseline yet) — see above.
+- **No connection/forensics attribution.** `pgoutput` does not carry the backend
+  PID, so the per-connection forensics surface (available for MySQL) is empty
+  for PostgreSQL.
+- **One database per slot.** A logical slot is scoped to a single database; to
+  capture multiple databases on one cluster, run one `bintrail-pg stream` (and
+  slot/publication) per database.
+- **Not in the console control plane / no BYOS agent.** Capture is the
+  `bintrail-pg stream` CLI only in this release.
+
+These are the data-safety items that gate **beta**; they are being worked through
+the same way MariaDB was hardened before its beta.
+
+---
+
+## Managed PostgreSQL
+
+Logical replication works on the major managed offerings; the only setup
+difference is *how* you set `wal_level` and grant replication.
+
+| Provider | `wal_level = logical` | Replication privilege |
+|---|---|---|
+| **Amazon RDS / Aurora PostgreSQL** | Set `rds.logical_replication = 1` in the parameter group, then **reboot**. | Master user has it; grant others with `GRANT rds_replication TO <role>;`. |
+| **Google Cloud SQL** | Set the `cloudsql.logical_decoding` flag on, then restart. | Use a user with `cloudsqlsuperuser` / the replication grant. |
+| **Azure Database for PostgreSQL** | Set `wal_level = logical` (Flexible Server) and restart. | Grant `azure_pg_admin` / replication as documented. |
+
+In all cases bintrail-pg connects as a **client** — there is nothing to install
+on the managed instance beyond the publication and `REPLICA IDENTITY FULL`,
+which are plain SQL.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `wal_level is "replica", must be 'logical'` | Set `wal_level = logical` and **restart** the server (a reload is not enough). |
+| `publication "…" does not exist — create it` | Create the publication first (step 4) — bintrail-pg never creates it. |
+| `publication "…" does not cover requested table(s) […]` | Your `--schemas`/`--tables` include tables not in the publication; `ALTER PUBLICATION … ADD TABLE …` (or widen the publication). |
+| `table(s) not at REPLICA IDENTITY FULL […]` | Run `ALTER TABLE <t> REPLICA IDENTITY FULL` for the listed tables (step 3). |
+| `replication slot "…" is invalidated (wal_status=lost; max_slot_wal_keep_size exceeded)` | The source dropped WAL the slot still needed (slot was stopped too long). The data since the checkpoint is gone — start fresh (drop the slot, clear the checkpoint) and re-seed. Raise `max_slot_wal_keep_size`/keep the consumer running. |
+| `resuming from a saved checkpoint but replication slot "…" no longer exists` | The slot was dropped while a checkpoint still pointed at it. Creating a fresh slot would skip data, so bintrail-pg refuses — clear the checkpoint to start fresh if the gap is acceptable. |
+| `must include replication=database` (connection error on `--repl-dsn`) | Add `replication=database` to the `--repl-dsn` connection string. |
+| Permission denied opening replication / creating slot | The role needs the `REPLICATION` attribute (`ALTER ROLE <r> REPLICATION;`), or on managed PG the provider's replication grant. |
+
+---
+
+## See also
+
+- [Install](install.md) — all install methods and the env-file convention.
+- [Streaming](streaming.md) — index requirements and the streaming model.
+- [Query & Recovery](query-and-recovery.md) — querying history and generating
+  reversal SQL (flavor-agnostic — same for PostgreSQL, MySQL, and MariaDB).
+- [MariaDB as a source](mariadb.md) — the sibling alpha source.
