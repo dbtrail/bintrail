@@ -45,6 +45,12 @@ stream_state; on restart the stream resumes from it automatically, so re-running
 the same command is idempotent. --start-lsn only takes effect on the very first
 run (before any checkpoint exists); thereafter the checkpoint always wins.
 
+Re-seeding: once a checkpoint and slot exist, PostgreSQL resumes from the slot's
+position — --start-lsn cannot rewind to an earlier point (the older WAL may have
+been reclaimed). To force a fresh start, drop the replication slot on the source
+and clear the stream_state checkpoint row (DELETE FROM stream_state WHERE id=1),
+then re-run.
+
 Graceful shutdown: send SIGINT or SIGTERM to flush the current batch and write a
 final checkpoint before exiting.`,
 	RunE: runPGStream,

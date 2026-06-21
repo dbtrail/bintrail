@@ -75,7 +75,9 @@ func main() {
 		os.Exit(code)
 	}
 	if wantsJSON(rootCmd) {
-		json.NewEncoder(os.Stderr).Encode(map[string]string{"error": err.Error()})
+		if encErr := json.NewEncoder(os.Stderr).Encode(map[string]string{"error": err.Error()}); encErr != nil {
+			fmt.Fprintln(os.Stderr, err) // fall back to text so the message is never wholly lost
+		}
 	} else {
 		fmt.Fprintln(os.Stderr, err)
 	}

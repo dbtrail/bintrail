@@ -17,8 +17,8 @@ This file has two parts:
 
   2. A GENERATED section, produced by `make notices` (which runs
      `go-licenses save` over ./cmd/bintrail, ./cmd/bintrail-mcp,
-     ./cmd/bintrail-console and ./cmd/bintrail-pg), reproducing the LICENSE —
-     and, where present, the NOTICE — file of every linked Go module.
+     ./cmd/bintrail-console and ./cmd/bintrail-pg), reproducing the LICENSE
+     — and, where present, the NOTICE — file of every linked Go module.
 
 Regenerate with `make notices`. Do not edit the GENERATED section by hand.
 

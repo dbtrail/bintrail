@@ -163,6 +163,49 @@ func TestPGStreamConfigFromFlags_StartLSN(t *testing.T) {
 			t.Errorf("StartLSN = %d, want %d", cfg.StartLSN, uint64(want))
 		}
 	})
+
+	// start-lsn is the one connection setting whose env binding is otherwise
+	// only exercised indirectly — drive it through BINTRAIL_PG_START_LSN so a
+	// typo in that fallback's env-var name would fail this test.
+	t.Run("valid-from-env", func(t *testing.T) {
+		resetPGFlags()
+		setPGRequired()
+		t.Setenv("BINTRAIL_PG_START_LSN", "16/B374D848")
+		cfg, err := pgStreamConfigFromFlags()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want, _ := pglogrepl.ParseLSN("16/B374D848")
+		if cfg.StartLSN != uint64(want) {
+			t.Errorf("StartLSN = %d, want %d (env fallback)", cfg.StartLSN, uint64(want))
+		}
+	})
+}
+
+// TestPGStreamCmd_defaults pins the registered cobra flag defaults so a drift in
+// stream.go's IntVar registrations (e.g. --batch-size 1000→100) fails a test —
+// resetPGFlags() hardcodes these same literals, so without this guard a default
+// change would silently diverge from the documented user-facing behavior. Mirrors
+// cmd/bintrail/stream_test.go's TestStreamCmd_defaults.
+func TestPGStreamCmd_defaults(t *testing.T) {
+	cases := []struct {
+		flag string
+		want string
+	}{
+		{"batch-size", "1000"},
+		{"checkpoint", "5"},
+		{"partitions", "48"},
+	}
+	for _, tc := range cases {
+		f := streamCmd.Flag(tc.flag)
+		if f == nil {
+			t.Errorf("flag --%s not registered", tc.flag)
+			continue
+		}
+		if f.DefValue != tc.want {
+			t.Errorf("flag --%s: expected default %q, got %q", tc.flag, tc.want, f.DefValue)
+		}
+	}
 }
 
 // setPGRequired fills the PG-specific required settings so a test can exercise
