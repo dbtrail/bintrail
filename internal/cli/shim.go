@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"context"
@@ -168,8 +168,7 @@ func init() {
 	shimCmd.Flags().StringVar(&shBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots (from 'bintrail baseline'). Enables _snapshot baseline lookup so rows untouched within the retained binlog window still resolve at AS OF. _flashback stays binlog-only. Unset (default) makes _snapshot behave like _flashback.")
 	shimCmd.Flags().StringVar(&shBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/). Takes precedence over --baseline-dir. Uses the standard AWS credential chain. See --baseline-dir for what it enables.")
 	_ = shimCmd.MarkFlagRequired("index-dsn")
-	bindCommandEnv(shimCmd)
-	rootCmd.AddCommand(shimCmd)
+	BindCommandEnv(shimCmd)
 }
 
 func runShim(cmd *cobra.Command, args []string) error {
