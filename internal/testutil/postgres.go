@@ -11,15 +11,30 @@ import (
 // postgres://postgres:testpg@localhost:15533/pgtest).
 func PostgresDSN() string { return os.Getenv("BINTRAIL_TEST_PG_DSN") }
 
+// PostgresRequired reports whether PostgreSQL integration tests must RUN (and
+// fail rather than skip) when no DSN is configured. The dedicated CI job
+// (integration-postgres-source) sets BINTRAIL_REQUIRE_POSTGRES=1, where a live
+// PostgreSQL source is guaranteed — so a missing DSN there is a misconfiguration
+// to surface loudly, not a green-via-skip. The MySQL integration matrix leaves it
+// unset, so PG tests skip cleanly there. Mirrors MariaDBRequired.
+func PostgresRequired() bool {
+	return os.Getenv("BINTRAIL_REQUIRE_POSTGRES") == "1"
+}
+
 // SkipIfNoPostgres skips the test unless BINTRAIL_TEST_PG_DSN is set, and returns
 // the DSN. It is presence-only (no driver dependency) on purpose: the MySQL-based
 // CI integration jobs run `go test -tags integration ./...` WITHOUT setting it, so
 // PostgreSQL integration tests must skip cleanly there rather than fail or hang —
-// a live Postgres CI cell arrives with #534's matrix. Mirrors SkipIfNoMySQL.
+// the live Postgres CI cell is integration-postgres-source (#534's matrix), which
+// sets BINTRAIL_REQUIRE_POSTGRES=1 so a missing DSN there fails loud instead of
+// passing as green-via-skip. Mirrors SkipIfNoMySQL / SkipOrFailMariaDB.
 func SkipIfNoPostgres(t *testing.T) string {
 	t.Helper()
 	dsn := PostgresDSN()
 	if dsn == "" {
+		if PostgresRequired() {
+			t.Fatal("BINTRAIL_TEST_PG_DSN not set but BINTRAIL_REQUIRE_POSTGRES=1 — the integration-postgres-source CI job must provide a live PostgreSQL server")
+		}
 		t.Skip("skipping: BINTRAIL_TEST_PG_DSN not set (no live PostgreSQL with logical replication)")
 	}
 	return dsn
