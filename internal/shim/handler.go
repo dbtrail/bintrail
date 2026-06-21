@@ -418,9 +418,9 @@ func wrapFetchError(qType QueryType, err error) error {
 //   - q.PKColumn == "": full-table reconstruction (issue #276).
 //     Dispatches to runFullTable.
 //
-// Dispatch is on PKColumn, not PKValue, so a literal `WHERE id = ''`
-// (legitimate against a NOT-NULL VARCHAR column) stays a single-row
-// point-lookup instead of silently flipping to a 100k-row table scan.
+// Dispatch is on PKColumn, not PKValue, so a query whose PK value is the
+// empty string (legitimate against a NOT-NULL VARCHAR column) stays a
+// single-row point-lookup instead of silently flipping to a 100k-row table scan.
 //
 // Both shapes treat DELETE as "row did not exist at AsOf" — the
 // Oracle AS OF semantic the docs call out (docs/time-travel-sql.md).
