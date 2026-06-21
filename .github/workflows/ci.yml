@@ -182,8 +182,9 @@ jobs:
     runs-on: ubuntu-22.04
 
     # Spans the supported PostgreSQL range: 14 (declared minimum — PG13 is EOL)
-    # through 17 (newest GA). fail-fast: false so a regression on one version
-    # still reports the others, matching the MySQL matrix.
+    # through 17. fail-fast: false so a regression on one version still reports
+    # the others, matching the MySQL matrix. (PG18-specific stream changes — e.g.
+    # STORED generated columns now in the WAL — are tracked with the beta work.)
     strategy:
       fail-fast: false
       matrix:
@@ -247,13 +248,24 @@ jobs:
           docker logs bintrail-test-postgres >&2 || true
           exit 1
 
-      # Scoped to the two PostgreSQL packages by path (not -run): streamrun has
-      # its own TestOne_* MySQL tests, so a name filter would be ambiguous. The
-      # integration build tag plus the BINTRAIL_TEST_PG_DSN gate select the live
-      # tests; -p 1 serializes (they share one server, creating/dropping their
-      # own slots/publications).
+      # Scoped to the two PostgreSQL packages by path (not -run) so the selection
+      # is naming-independent — it won't accidentally catch a future TestOne_*-
+      # style test added elsewhere. -p 1 serializes (the tests share one server,
+      # creating/dropping their own slots/publications).
+      #
+      # Both packages ALSO hold non-tagged unit tests, so a build-tag or path
+      # drift that silently dropped the integration tests would still exit 0
+      # green with ZERO PG coverage (the BINTRAIL_REQUIRE_POSTGRES guard only
+      # fires when an integration test actually runs). Close that false-green by
+      # asserting the headline end-to-end test genuinely ran — not merely that
+      # `go test` exited 0. pipefail keeps the go-test exit code through the tee.
       - name: PostgreSQL-source integration tests
-        run: go test -tags=integration -race -p 1 -count=1 ./internal/pgcapture/ ./internal/pgstreamrun/
+        run: |
+          set -o pipefail
+          go test -tags=integration -race -p 1 -count=1 -v \
+            ./internal/pgcapture/ ./internal/pgstreamrun/ 2>&1 | tee /tmp/pg-it.out
+          grep -q -- '--- PASS: TestOne_EndToEnd_PostgresToIndexToRecovery' /tmp/pg-it.out \
+            || { echo "FATAL: PG end-to-end integration test did not run — false-green tripwire" >&2; exit 1; }
 
   console-e2e:
     # Headless-Chrome regression guard for the console SPA: go test never
