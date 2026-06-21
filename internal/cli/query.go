@@ -600,13 +600,15 @@ func eventTypeJSONName(t parser.EventType) string {
 // rejects empty entries, and deduplicates while preserving input order.
 // Duplicates are common when callers programmatically compose the list (e.g.
 // dbtrail SaaS batching N pending PKs with repeats from retries); an unfiltered
-// list would produce duplicate result rows/groups and waste bind-parameter slots
-// in the SQL IN clause.
+// list would emit duplicate groups in query's grouped-JSON output and waste
+// bind-parameter slots in the shared `pk_values IN (...)` clause. (The flat
+// query and recover paths use IN set-membership, so duplicate input PKs there
+// match each row once — the duplication harm is groups-only.)
 //
 // Returns an error on empty entries rather than silently dropping them — a
 // --pks=,, invocation almost certainly indicates a shell interpolation bug, and
-// silently treating it as --pks with zero values would return a misleadingly
-// empty/no-op success for a broken command.
+// silently treating it as --pks with zero values would mask a broken command (a
+// misleadingly empty query result, or an unintended over-broad recover).
 func cleanPKList(pks []string) ([]string, error) {
 	if len(pks) == 0 {
 		return nil, nil
