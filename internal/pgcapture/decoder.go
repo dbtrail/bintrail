@@ -158,6 +158,19 @@ func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
 // again after a relation's shape changes, so this doubles as cache invalidation —
 // the analog of the MySQL parser's SwapResolver-on-DDL.
 func (d *Decoder) cacheRelation(m *pglogrepl.RelationMessage) error {
+	// REPLICA IDENTITY FULL enforcement at the LIVE boundary, not just startup: a
+	// table added to a FOR ALL TABLES publication after Run started (or any mid-stream
+	// new relation) arrives here as a fresh RelationMessage at PostgreSQL's default
+	// identity ('d'), which the one-shot startup validator (validateReplicaIdentity)
+	// never re-checks. Without FULL the before-image is partial — an unchanged
+	// out-of-line TOAST value is gone — so fail loud here too rather than index
+	// unrecoverable rows (whose recovery WHERE would carry the unchanged-TOAST marker
+	// and match nothing). 'f' = FULL; 'd' default, 'i' using-index, 'n' nothing.
+	if m.ReplicaIdentity != 'f' {
+		return fmt.Errorf("pgcapture: relation %s.%s is not at REPLICA IDENTITY FULL (replica identity %q) — before-images would be partial; run ALTER TABLE %s.%s REPLICA IDENTITY FULL",
+			m.Namespace, m.RelationName, string(rune(m.ReplicaIdentity)), m.Namespace, m.RelationName)
+	}
+
 	cols := make([]relColumn, len(m.Columns))
 	for i, c := range m.Columns {
 		cols[i] = relColumn{name: c.Name, typeOID: c.DataType, typeMod: c.TypeModifier}

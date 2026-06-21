@@ -299,6 +299,23 @@ func TestDecode_PKColumnDriftFailsLoud(t *testing.T) {
 	}
 }
 
+func TestDecode_NonFullReplicaIdentityRelationFailsLoud(t *testing.T) {
+	// A relation that arrives NOT at REPLICA IDENTITY FULL — e.g. a table added to a
+	// FOR ALL TABLES publication after startup, which the one-shot startup validator
+	// never re-checks — must fail loud here at the RelationMessage (the live gate),
+	// not silently index partial before-images.
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	rel := relMsg(1, "public", "t", "id", "v")
+	rel.ReplicaIdentity = 'd' // default, not FULL
+	_, _, err := d.Decode(rel)
+	if err == nil {
+		t.Fatal("expected error for a relation not at REPLICA IDENTITY FULL")
+	}
+	if !strings.Contains(err.Error(), "REPLICA IDENTITY FULL") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
 func TestDecode_PKResolverErrorFailsLoud(t *testing.T) {
 	boom := pgcapture.PKResolver(func(_ uint32, _, _ string) ([]metadata.ColumnMeta, error) {
 		return nil, errBoom

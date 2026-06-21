@@ -81,8 +81,10 @@ func validatePublication(ctx context.Context, conn *pgx.Conn, pubname string, fi
 //     the before-image (proven in the spike, Part A), so we fail loud rather than index
 //     partial, unrecoverable before-images.
 //
-// This is the startup gate; a fresh RelationMessage is the live signal when the
-// publication gains a table mid-stream.
+// This is the STARTUP gate (existing tables); the decoder's cacheRelation
+// re-enforces REPLICA IDENTITY FULL on every RelationMessage, so a table added to a
+// FOR ALL TABLES publication mid-stream — which this one-shot check never re-runs for
+// — is caught at the live boundary too.
 func validateReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication string) error {
 	var walLevel string
 	if err := conn.QueryRow(ctx, "SELECT current_setting('wal_level')").Scan(&walLevel); err != nil {

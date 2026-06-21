@@ -225,15 +225,19 @@ func TestGenerateUpdate_basic(t *testing.T) {
 	assertSQL(t, stmt, "'shipped'")
 }
 
-func TestGenerateUpdate_pgOriginNoSentinelInPredicate(t *testing.T) {
-	// #531-B floor: a PostgreSQL-origin UPDATE that did not touch an out-of-line
-	// TOAST column. Under RI FULL (validated by #531-A) + Option B (the pgcapture
-	// decoder resolves the unchanged-TOAST marker from the before-image at decode
-	// time), BOTH images hold the real value. PG has no schema_snapshots, so recovery
-	// runs with a nil resolver (SchemaVersion 0 → all-columns WHERE) — it must NOT
-	// crash, the SET must restore the real before value, and NO sentinel may appear in
-	// any predicate. (PK-scoped WHERE is deferred to #533, which adds the offline PG
-	// schema metadata recovery would otherwise need.)
+func TestGenerateUpdate_pgOriginSchemaVersion0(t *testing.T) {
+	// A PostgreSQL-origin UPDATE recovers correctly through the real recovery path: PG
+	// has no schema_snapshots, so the row carries SchemaVersion 0 and recovery runs
+	// with a nil resolver (all-columns WHERE fallback). It must NOT crash and the SET
+	// must restore the real before value — including the out-of-line TOAST value that
+	// Option B resolved into both images at decode time. (PK-scoped WHERE is deferred
+	// to #533, which adds the offline PG schema metadata recovery would otherwise need.)
+	//
+	// The no-sentinel-in-recovery guarantee is enforced UPSTREAM, not here: the RI-FULL
+	// gate (validateReplicaIdentity + cacheRelation) ensures the before-image is always
+	// complete, so the unchanged-TOAST marker is never produced for a supported source
+	// and so can never reach recovery. The sentinel check below is therefore a cheap
+	// belt-and-suspenders, not the proof of that property.
 	const sentinel = "__bintrail_unchanged_toast__" // == pgcapture.UnchangedToastKey
 	const bigVal = "BIG-OUT-OF-LINE-TOAST-VALUE"
 	g := newGen() // nil resolver → all-cols WHERE fallback, like a PG-origin row
