@@ -355,6 +355,8 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		referenced_schema_name   VARCHAR(64)  NOT NULL,
 		referenced_table_name    VARCHAR(64)  NOT NULL,
 		referenced_column_name   VARCHAR(64)  NOT NULL,
+		delete_rule              VARCHAR(16)  NOT NULL DEFAULT '',
+		update_rule              VARCHAR(16)  NOT NULL DEFAULT '',
 		PRIMARY KEY (snapshot_id, schema_name, constraint_name, ordinal_position)
 	) ENGINE=InnoDB`)
 

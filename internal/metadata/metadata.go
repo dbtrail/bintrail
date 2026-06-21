@@ -315,6 +315,8 @@ type fkRow struct {
 	referencedSchemaName string
 	referencedTableName  string
 	referencedColumnName string
+	deleteRule           string // ON DELETE rule (CASCADE/RESTRICT/SET NULL/NO ACTION)
+	updateRule           string // ON UPDATE rule
 }
 
 // TakeSnapshot reads column metadata and foreign key constraints from
@@ -470,17 +472,19 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		for i := 0; i < len(fkRows); i += batchSize {
 			batch := fkRows[i:min(i+batchSize, len(fkRows))]
 
-			valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?),", len(batch)), ",")
+			valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
 			insertSQL := "INSERT INTO fk_constraints " +
 				"(snapshot_id, constraint_name, schema_name, table_name, column_name, " +
-				"ordinal_position, referenced_schema_name, referenced_table_name, referenced_column_name) VALUES " +
+				"ordinal_position, referenced_schema_name, referenced_table_name, referenced_column_name, " +
+				"delete_rule, update_rule) VALUES " +
 				valClause
 
-			insertArgs := make([]any, 0, len(batch)*9)
+			insertArgs := make([]any, 0, len(batch)*11)
 			for _, fk := range batch {
 				insertArgs = append(insertArgs,
 					nextID, fk.constraintName, fk.schemaName, fk.tableName, fk.columnName,
 					fk.ordinalPosition, fk.referencedSchemaName, fk.referencedTableName, fk.referencedColumnName,
+					fk.deleteRule, fk.updateRule,
 				)
 			}
 
@@ -518,7 +522,7 @@ func queryFKConstraints(sourceDB *sql.DB, schemas []string) ([]fkRow, error) {
 			SELECT kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME,
 			       kcu.COLUMN_NAME, kcu.ORDINAL_POSITION,
 			       kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME,
-			       kcu.REFERENCED_COLUMN_NAME
+			       kcu.REFERENCED_COLUMN_NAME, rc.DELETE_RULE, rc.UPDATE_RULE
 			FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
 			JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
 			    ON rc.CONSTRAINT_SCHEMA = kcu.TABLE_SCHEMA
@@ -532,7 +536,7 @@ func queryFKConstraints(sourceDB *sql.DB, schemas []string) ([]fkRow, error) {
 			SELECT kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME,
 			       kcu.COLUMN_NAME, kcu.ORDINAL_POSITION,
 			       kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME,
-			       kcu.REFERENCED_COLUMN_NAME
+			       kcu.REFERENCED_COLUMN_NAME, rc.DELETE_RULE, rc.UPDATE_RULE
 			FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
 			JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
 			    ON rc.CONSTRAINT_SCHEMA = kcu.TABLE_SCHEMA
@@ -558,6 +562,7 @@ func queryFKConstraints(sourceDB *sql.DB, schemas []string) ([]fkRow, error) {
 			&fk.constraintName, &fk.schemaName, &fk.tableName,
 			&fk.columnName, &fk.ordinalPosition,
 			&fk.referencedSchemaName, &fk.referencedTableName, &fk.referencedColumnName,
+			&fk.deleteRule, &fk.updateRule,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan FK row: %w", err)
 		}
@@ -801,6 +806,68 @@ func ValidateNoFKCascades(db *sql.DB, schemas []string) error {
 		return fmt.Errorf("%d FK cascade constraint(s) found on source; reversal SQL from `recover` may not correctly handle cascade side-effects", len(found))
 	}
 	return nil
+}
+
+// FKCascadeEdge describes a CASCADE foreign-key edge recorded in the index's
+// fk_constraints table (latest snapshot).
+type FKCascadeEdge struct {
+	Schema          string
+	Table           string
+	Column          string
+	ReferencedTable string
+	DeleteRule      string
+	UpdateRule      string
+}
+
+// CascadeConstraintsInIndex returns the CASCADE foreign-key edges recorded in
+// the latest schema snapshot's fk_constraints, optionally scoped to schemas.
+// Unlike ValidateNoFKCascades (which queries the source's information_schema),
+// this reads from the INDEX, so the source-less `recover` path can warn that
+// cascade-deleted child rows are not reversible by plain recover.
+//
+// Returns nil when fk_constraints is absent (index predates it) or carries no
+// cascade rules — including pre-cascade-recovery snapshots whose delete_rule/
+// update_rule columns are empty.
+func CascadeConstraintsInIndex(indexDB *sql.DB, schemas []string) ([]FKCascadeEdge, error) {
+	var exists bool
+	if err := indexDB.QueryRow(
+		"SELECT COUNT(*) > 0 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fk_constraints'",
+	).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("failed to check fk_constraints table: %w", err)
+	}
+	if !exists {
+		return nil, nil
+	}
+
+	query := `SELECT schema_name, table_name, column_name, referenced_table_name, delete_rule, update_rule
+		FROM fk_constraints
+		WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM fk_constraints)
+		  AND (delete_rule = 'CASCADE' OR update_rule = 'CASCADE')`
+	var args []any
+	if len(schemas) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
+		query += " AND schema_name IN (" + placeholders + ")"
+		for _, s := range schemas {
+			args = append(args, s)
+		}
+	}
+	query += " ORDER BY schema_name, table_name, column_name"
+
+	rows, err := indexDB.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query cascade FK constraints: %w", err)
+	}
+	defer rows.Close()
+
+	var out []FKCascadeEdge
+	for rows.Next() {
+		var e FKCascadeEdge
+		if err := rows.Scan(&e.Schema, &e.Table, &e.Column, &e.ReferencedTable, &e.DeleteRule, &e.UpdateRule); err != nil {
+			return nil, fmt.Errorf("failed to scan cascade FK row: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // EnsureResolver returns a Resolver loaded from the latest snapshot, taking a

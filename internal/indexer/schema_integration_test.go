@@ -62,6 +62,67 @@ func TestEnsureSchemaAddsFlavorColumn(t *testing.T) {
 	}
 }
 
+// TestEnsureSchemaAddsFKRuleColumns pins the cascade-recovery migration: a
+// pre-cascade install must gain fk_constraints.delete_rule/update_rule as
+// NOT NULL DEFAULT ” (existing rows backfill to "" = unknown), idempotently.
+func TestEnsureSchemaAddsFKRuleColumns(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Simulate a pre-cascade install: drop the columns + seed an old-shape row.
+	testutil.MustExec(t, db, `ALTER TABLE fk_constraints DROP COLUMN delete_rule, DROP COLUMN update_rule`)
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name,
+		 ordinal_position, referenced_schema_name, referenced_table_name, referenced_column_name)
+		VALUES (1,'fk','app','child','pid',1,'app','parent','id')`)
+
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	for _, col := range []string{"delete_rule", "update_rule"} {
+		var def, nullable string
+		if err := db.QueryRow(`SELECT COLUMN_DEFAULT, IS_NULLABLE FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fk_constraints' AND COLUMN_NAME = ?`,
+			col).Scan(&def, &nullable); err != nil {
+			t.Fatalf("read %s column: %v", col, err)
+		}
+		if def != "" {
+			t.Errorf("%s COLUMN_DEFAULT = %q, want \"\"", col, def)
+		}
+		if nullable != "NO" {
+			t.Errorf("%s IS_NULLABLE = %q, want \"NO\"", col, nullable)
+		}
+	}
+
+	// The pre-existing row must backfill to '' (unknown), not NULL.
+	var del, upd string
+	if err := db.QueryRow(`SELECT delete_rule, update_rule FROM fk_constraints WHERE constraint_name='fk'`).
+		Scan(&del, &upd); err != nil {
+		t.Fatalf("read backfilled row: %v", err)
+	}
+	if del != "" || upd != "" {
+		t.Errorf("backfilled rules = (%q,%q), want empty", del, upd)
+	}
+
+	// Idempotent: a second run must not error or re-add.
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema (second run): %v", err)
+	}
+}
+
+// TestEnsureSchemaToleratesMissingFKConstraints guards the regression where the
+// cascade-recovery migration would break EnsureSchema on very old indexes that
+// predate the fk_constraints table (TakeSnapshot already tolerates its absence).
+func TestEnsureSchemaToleratesMissingFKConstraints(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	testutil.MustExec(t, db, `DROP TABLE fk_constraints`)
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema must tolerate a missing fk_constraints table, got: %v", err)
+	}
+}
+
 // TestEnsureSchemaWidensColumnType pins the #472 migration: #212 created
 // schema_snapshots.column_type as VARCHAR(128), which a realistic ENUM
 // declaration exceeds — under strict mode the 1406 aborts the whole

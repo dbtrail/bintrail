@@ -193,10 +193,11 @@ Reversed: undo the 14:03 UPDATE first, then the 14:02 UPDATE, then the 14:01 INS
 > ordering `bintrail recover` applies — there is no FK-graph analysis, no
 > topological reordering across tables, and the generated script never emits
 > `SET FOREIGN_KEY_CHECKS`. Tables with `ON DELETE/UPDATE CASCADE` produce
-> side-effect row changes that reversal SQL cannot reliably undo
-> (`bintrail doctor` warns about them, and `stream`/`watch` — plus `index`
-> runs given a `--source-dsn` to validate against — refuse to start when the
-> source has them).
+> side-effect row changes (InnoDB runs cascades below the binlog, MySQL Bug
+> #32506, so cascaded child deletes are never captured) that plain `recover`
+> cannot reliably undo. `bintrail doctor`, and `stream`/`watch`/`index --source-dsn`,
+> warn about them and proceed (cascade schemas index normally). Dedicated
+> cascade recovery is in progress (#548).
 
 ### WHERE Clause Strategy
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -170,6 +171,31 @@ func runRecover(cmd *cobra.Command, args []string) error {
 
 	if err := indexer.EnsureSchema(db); err != nil {
 		return fmt.Errorf("schema migration: %w", err)
+	}
+
+	// Plain recover cannot reconstruct rows deleted by an FK ON DELETE CASCADE:
+	// InnoDB executes the cascade below the binlog (MySQL Bug #32506), so the
+	// cascaded child deletes were never indexed. Warn loudly when the targeted
+	// schema carries cascade FKs — the cascade-recovery path handles these.
+	var cascadeScope []string
+	if rSchema != "" {
+		cascadeScope = []string{rSchema}
+	}
+	if edges, cerr := metadata.CascadeConstraintsInIndex(db, cascadeScope); cerr != nil {
+		slog.Warn("could not check the index for FK cascade constraints", "error", cerr)
+	} else if len(edges) > 0 {
+		seen := map[string]bool{}
+		var tables []string
+		for _, e := range edges {
+			if k := e.Schema + "." + e.Table; !seen[k] {
+				seen[k] = true
+				tables = append(tables, k)
+			}
+		}
+		slog.Warn("target schema has FK ON DELETE/UPDATE CASCADE constraints; plain `recover` "+
+			"cannot reconstruct cascade-deleted child rows (they are never binlogged, MySQL Bug "+
+			"#32506); cascade recovery is in progress (#548)",
+			"cascade_child_tables", strings.Join(tables, ", "))
 	}
 
 	if rProfile != "" {

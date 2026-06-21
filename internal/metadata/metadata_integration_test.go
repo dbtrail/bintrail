@@ -10,6 +10,60 @@ import (
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
+// TestTakeSnapshotCapturesFKRules pins cascade-recovery Slice A: a snapshot of
+// a cascade schema records each FK's delete_rule/update_rule in fk_constraints,
+// and CascadeConstraintsInIndex surfaces the CASCADE edge for the source-less
+// recover-time warning.
+func TestTakeSnapshotCapturesFKRules(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE parent (id INT PRIMARY KEY) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE child (
+		id  INT PRIMARY KEY,
+		pid INT,
+		CONSTRAINT fk_child FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE ON UPDATE CASCADE
+	) ENGINE=InnoDB`)
+
+	if _, err := TakeSnapshot(sourceDB, indexDB, []string{sourceName}); err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	var del, upd string
+	if err := indexDB.QueryRow(`SELECT delete_rule, update_rule FROM fk_constraints
+		WHERE schema_name = ? AND table_name = 'child' AND column_name = 'pid'`,
+		sourceName).Scan(&del, &upd); err != nil {
+		t.Fatalf("read fk_constraints rule: %v", err)
+	}
+	if del != "CASCADE" {
+		t.Errorf("delete_rule = %q, want CASCADE", del)
+	}
+	if upd != "CASCADE" {
+		t.Errorf("update_rule = %q, want CASCADE", upd)
+	}
+
+	edges, err := CascadeConstraintsInIndex(indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("CascadeConstraintsInIndex: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Fatalf("want 1 cascade edge, got %d: %+v", len(edges), edges)
+	}
+	if edges[0].Table != "child" || edges[0].DeleteRule != "CASCADE" || edges[0].ReferencedTable != "parent" {
+		t.Errorf("unexpected cascade edge: %+v", edges[0])
+	}
+
+	// An unrelated schema yields no cascade edges.
+	none, err := CascadeConstraintsInIndex(indexDB, []string{"nonexistent_schema"})
+	if err != nil {
+		t.Fatalf("CascadeConstraintsInIndex(none): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("want 0 edges for an unrelated schema, got %d", len(none))
+	}
+}
+
 func TestTakeSnapshot_nonInnoDB(t *testing.T) {
 	sourceDB, sourceName := testutil.CreateTestDB(t)
 	indexDB, _ := testutil.CreateTestDB(t)

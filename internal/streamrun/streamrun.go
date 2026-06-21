@@ -1260,9 +1260,14 @@ func One(ctx context.Context, cfg Config) error {
 	fmt.Println("Source: binlog_row_image=FULL \u2713")
 
 	if err := cfg.Deps.ValidateNoFKCascades(sourceDB, cfg.Deps.ParseSchemaList(cfg.Schemas)); err != nil {
-		return err
+		slog.Warn("FK cascade constraints present on source; streaming will proceed, "+
+			"but InnoDB executes cascades below the binlog (MySQL Bug #32506) so cascaded "+
+			"child-row deletes are NOT captured \u2014 plain `recover` cannot restore them. "+
+			"Cascade recovery is in progress (#548).",
+			"detail", err.Error())
+	} else {
+		fmt.Println("Source: no FK cascades \u2713")
 	}
-	fmt.Println("Source: no FK cascades \u2713")
 
 	// Advisory only: warn (never block) when the declared flavor disagrees with
 	// the server's actual VERSION(). A mismatch \u2014 e.g. the default --source-flavor

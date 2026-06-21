@@ -106,9 +106,14 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		fmt.Println("Source: binlog_row_image=FULL \u2713")
 
 		if err := metadata.ValidateNoFKCascades(sourceDB, cliutil.ParseSchemaList(idxSchemas)); err != nil {
-			return err
+			slog.Warn("FK cascade constraints present on source; indexing will proceed, "+
+				"but InnoDB executes cascades below the binlog (MySQL Bug #32506) so cascaded "+
+				"child-row deletes are NOT captured \u2014 plain `recover` cannot restore them. "+
+				"Cascade recovery is in progress (#548).",
+				"detail", err.Error())
+		} else {
+			fmt.Println("Source: no FK cascades \u2713")
 		}
-		fmt.Println("Source: no FK cascades \u2713")
 	} else {
 		slog.Warn("--skip-source-validation set: skipping binlog_format/binlog_row_image/FK-cascade pre-flight — the per-row partial-image guard still applies")
 	}

@@ -266,6 +266,8 @@ const ddlFKConstraints = `CREATE TABLE IF NOT EXISTS fk_constraints (
     referenced_schema_name   VARCHAR(64)  NOT NULL,
     referenced_table_name    VARCHAR(64)  NOT NULL,
     referenced_column_name   VARCHAR(64)  NOT NULL,
+    delete_rule              VARCHAR(16)  NOT NULL DEFAULT '' COMMENT 'ON DELETE rule (CASCADE/RESTRICT/SET NULL/NO ACTION); empty for pre-cascade-recovery snapshots',
+    update_rule              VARCHAR(16)  NOT NULL DEFAULT '' COMMENT 'ON UPDATE rule; empty for pre-cascade-recovery snapshots',
     PRIMARY KEY (snapshot_id, schema_name, constraint_name, ordinal_position)
 ) ENGINE=InnoDB`
 

@@ -248,9 +248,47 @@ func EnsureSchema(db *sql.DB) error {
 	// parses the saved gtid_set with the correct GTID parser. NOT NULL DEFAULT
 	// 'mysql' means existing rows read back as mysql with no data migration,
 	// keeping every pre-MariaDB install unchanged.
-	return ensureColumn(db, "stream_state", "flavor",
+	if err := ensureColumn(db, "stream_state", "flavor",
 		`ALTER TABLE stream_state ADD COLUMN flavor VARCHAR(16) NOT NULL DEFAULT 'mysql' COMMENT 'source flavor: mysql or mariadb; selects the GTID parser on resume' AFTER gtid_set`,
+	); err != nil {
+		return err
+	}
+	// delete_rule/update_rule carry each FK's referential action so cascade
+	// recovery can tell which edges are ON DELETE CASCADE at recovery time.
+	// `recover` is source-less, so the rule must live in the index rather than
+	// be re-queried from the source. NOT NULL DEFAULT '' means pre-existing
+	// rows read back as "unknown" (treated as non-cascade) with no data
+	// migration; a fresh snapshot of the schema populates the real rule.
+	//
+	// fk_constraints post-dates the original schema and may be absent on very
+	// old indexes (TakeSnapshot tolerates its absence). Only migrate it when
+	// present; `bintrail init` / a fresh snapshot creates it with the columns.
+	hasFK, err := tableExists(db, "fk_constraints")
+	if err != nil {
+		return err
+	}
+	if !hasFK {
+		return nil
+	}
+	if err := ensureColumn(db, "fk_constraints", "delete_rule",
+		`ALTER TABLE fk_constraints ADD COLUMN delete_rule VARCHAR(16) NOT NULL DEFAULT '' COMMENT 'ON DELETE rule (CASCADE/RESTRICT/SET NULL/NO ACTION); empty for pre-cascade-recovery snapshots' AFTER referenced_column_name`,
+	); err != nil {
+		return err
+	}
+	return ensureColumn(db, "fk_constraints", "update_rule",
+		`ALTER TABLE fk_constraints ADD COLUMN update_rule VARCHAR(16) NOT NULL DEFAULT '' COMMENT 'ON UPDATE rule; empty for pre-cascade-recovery snapshots' AFTER delete_rule`,
 	)
+}
+
+// tableExists reports whether a base table named `table` exists in the current
+// database.
+func tableExists(db *sql.DB, table string) (bool, error) {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, table).Scan(&n); err != nil {
+		return false, fmt.Errorf("check table %s: %w", table, err)
+	}
+	return n > 0, nil
 }
 
 // ensureColumnWidened runs an idempotent ALTER TABLE MODIFY COLUMN: it

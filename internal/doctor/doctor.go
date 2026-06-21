@@ -416,18 +416,18 @@ func checkFKCascades(db *sql.DB, schemas []string) CheckResult {
 		Name:   "No FK CASCADE constraints",
 		Status: StatusWarn,
 		Detail: err.Error(),
-		Remediation: "Foreign keys with ON DELETE CASCADE or ON UPDATE CASCADE produce side-effect row changes\n" +
-			"that bintrail's reversal SQL cannot reliably undo. Two options:\n\n" +
+		Remediation: "Foreign keys with ON DELETE CASCADE or ON UPDATE CASCADE produce side-effect row\n" +
+			"changes that InnoDB executes below the binary log (MySQL Bug #32506), so plain\n" +
+			"`recover` cannot reconstruct cascade-deleted child rows. Options:\n\n" +
 			"  1. Drop or change the cascade rules:\n" +
 			"     ALTER TABLE <child> DROP FOREIGN KEY <fk_name>;\n" +
 			"     ALTER TABLE <child> ADD CONSTRAINT <fk_name> FOREIGN KEY (...) REFERENCES <parent>(...)\n" +
 			"         ON DELETE RESTRICT ON UPDATE RESTRICT;\n\n" +
-			"  2. Accept that reversal across cascades requires manual review.\n\n" +
-			"This check is a WARN here, but ingestion enforces it hard: `stream`/`watch`/`up`\n" +
-			"(and `index` runs given --source-dsn to validate against) refuse to start while\n" +
-			"cascade constraints exist — apply option 1 before streaming. Where events ARE\n" +
-			"indexed despite cascades (`index` without --source-dsn, `agent`), `recover` may\n" +
-			"produce incomplete SQL for the tables involved.",
+			"  2. Keep the cascades and recover cascade-deleted child rows manually for\n" +
+			"     now (full cascade recovery is in progress, #548).\n\n" +
+			"Ingestion (`stream`/`watch`/`up`/`index --source-dsn`) no longer refuses cascade\n" +
+			"schemas — it WARNS and proceeds — so the FK graph is captured for cascade recovery.\n" +
+			"Plain `recover` still produces incomplete SQL for cascade-affected tables.",
 	}
 }
 
