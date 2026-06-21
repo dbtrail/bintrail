@@ -43,6 +43,11 @@ type Config struct {
 	Publication string
 	Filters     event.Filters
 	StartLSN    pglogrepl.LSN // the resume checkpoint; 0 on first run (see ensureSlot — the gate is slot existence, not this)
+	// ExpectExistingSlot, set by the consumer when resuming from a saved checkpoint,
+	// makes ensureSlot fail loud if the slot is missing or invalidated (wal_status=
+	// 'lost') instead of silently creating a fresh slot that would skip the WAL since
+	// the checkpoint. Leave false on first run. See ensureSlot / #532.
+	ExpectExistingSlot bool
 	// StandbyInterval is how often a standby status update is sent (server liveness +
 	// confirmed_flush_lsn feedback). 0 derives it from the server's wal_sender_timeout
 	// (timeout/3, floor 1s), falling back to defaultStandbyInterval. Tests set it low.
@@ -129,7 +134,7 @@ func (c *Capturer) Run(ctx context.Context, out chan<- event.Event) error {
 		return err
 	}
 
-	startLSN, err := ensureSlot(startupCtx, replConn, queryConn, c.cfg.SlotName, c.cfg.StartLSN)
+	startLSN, err := ensureSlot(startupCtx, replConn, queryConn, c.cfg.SlotName, c.cfg.StartLSN, c.cfg.ExpectExistingSlot)
 	if err != nil {
 		return err
 	}

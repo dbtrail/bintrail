@@ -2,6 +2,7 @@ package pgcapture
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -82,19 +83,46 @@ func validatePublication(ctx context.Context, conn *pgx.Conn, pubname string, fi
 // The slot is permanent (Temporary defaults false) so it survives restarts — required
 // for resume. The flip side is source-side WAL retention if the consumer stalls
 // (the PG analog of binlog retention); WAL-retention monitoring is #532.
-func ensureSlot(ctx context.Context, replConn *pgconn.PgConn, queryConn *pgx.Conn, slotName string, savedLSN pglogrepl.LSN) (pglogrepl.LSN, error) {
-	var exists bool
-	if err := queryConn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)`, slotName).Scan(&exists); err != nil {
+//
+// expectExisting is set by the consumer when it is resuming from a saved checkpoint
+// (#534). In that case the slot MUST still exist and be valid: if it was dropped, or
+// invalidated by max_slot_wal_keep_size (wal_status='lost' — the PG13+ feature the
+// version floor is chosen to bound), the WAL since the checkpoint is gone, and
+// silently creating a fresh slot from a new ConsistentPoint would SKIP that data.
+// ensureSlot fails loud in that case rather than skip; the recovery policy
+// (re-baseline) is #532.
+func ensureSlot(ctx context.Context, replConn *pgconn.PgConn, queryConn *pgx.Conn, slotName string, savedLSN pglogrepl.LSN, expectExisting bool) (pglogrepl.LSN, error) {
+	var walStatus sql.NullString
+	found := true
+	err := queryConn.QueryRow(ctx, `SELECT wal_status FROM pg_replication_slots WHERE slot_name = $1`, slotName).Scan(&walStatus)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		found = false
+	case err != nil:
 		return 0, fmt.Errorf("pgcapture: checking replication slot %q: %w", slotName, err)
 	}
-	if exists {
+
+	// A 'lost' slot is unusable regardless of mode — its WAL has been removed.
+	if found && walStatus.String == "lost" {
+		return 0, fmt.Errorf("pgcapture: replication slot %q is invalidated (wal_status=lost; max_slot_wal_keep_size exceeded) — the WAL it needs is gone; re-baseline rather than resume", slotName)
+	}
+
+	if expectExisting {
+		if !found {
+			return 0, fmt.Errorf("pgcapture: resuming from a saved checkpoint but replication slot %q no longer exists — the WAL since the checkpoint is lost; re-baseline (creating a fresh slot would silently skip data)", slotName)
+		}
+		return savedLSN, nil
+	}
+	if found {
+		// First run but the slot already exists (a prior run created it, or a TOCTOU).
+		// Resume from it; PostgreSQL clamps savedLSN forward to the slot's own point.
 		return savedLSN, nil
 	}
 
 	res, err := pglogrepl.CreateReplicationSlot(ctx, replConn, slotName, "pgoutput", pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication})
 	if err != nil {
-		// TOCTOU: another capturer or a restart created the slot between the EXISTS
-		// check and now (SQLSTATE 42710 = duplicate_object). Treat as a resume.
+		// TOCTOU: another capturer or a restart created the slot between the check
+		// and now (SQLSTATE 42710 = duplicate_object). Treat as a resume.
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.SQLState() == "42710" {
 			return savedLSN, nil

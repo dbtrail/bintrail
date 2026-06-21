@@ -224,6 +224,53 @@ func TestCapturer_PublicationCoverageFailsLoud(t *testing.T) {
 	}
 }
 
+// TestCapturer_ResumeMissingSlotFailsLoud proves the resume guard (#534): when the
+// consumer resumes from a saved checkpoint (ExpectExistingSlot) but the slot is gone
+// (here: never created), Run fails loud rather than silently creating a fresh slot
+// from a new ConsistentPoint — which would skip the WAL since the checkpoint.
+func TestCapturer_ResumeMissingSlotFailsLoud(t *testing.T) {
+	baseDSN := testutil.SkipIfNoPostgres(t)
+	ctx := context.Background()
+	const pub = "bintrail_pgcap_resume_pub"
+	const tbl = "pgcap_resume_t"
+
+	setup, err := pgx.Connect(ctx, baseDSN)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { setup.Close(context.Background()) })
+	cleanup := func() {
+		bg := context.Background()
+		_, _ = setup.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		_, _ = setup.Exec(bg, "DROP TABLE IF EXISTS "+tbl)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	if _, err := setup.Exec(ctx, fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY)", tbl)); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := setup.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl)); err != nil {
+		t.Fatalf("create publication: %v", err)
+	}
+
+	cap := pgcapture.New(pgcapture.Config{
+		ReplDSN:            replDSN(baseDSN),
+		QueryDSN:           baseDSN,
+		SlotName:           "bintrail_pgcap_resume_absent_slot", // never created
+		Publication:        pub,
+		StartLSN:           0x1000, // a non-zero saved checkpoint
+		ExpectExistingSlot: true,   // resuming
+	})
+	err = cap.Run(ctx, make(chan event.Event, 1))
+	if err == nil {
+		t.Fatal("expected Run to fail loud when resuming but the slot is gone")
+	}
+	if !strings.Contains(err.Error(), "no longer exists") {
+		t.Errorf("unexpected error (want missing-slot resume failure): %v", err)
+	}
+}
+
 // TestCapturer_CompositePKOrder proves PKValues uses primary-key declaration order,
 // not column/attnum order. The table's columns are (a, b, c) but its PRIMARY KEY is
 // (b, a) — so a naive attnum ordering would yield "10|20" where the correct key
