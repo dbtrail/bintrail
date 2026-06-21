@@ -1,12 +1,15 @@
-// Package cli holds command-layer building blocks shared across bintrail
-// binaries. It exists so a second binary (the planned PostgreSQL-native
+// Package cli holds command-layer building blocks intended to be shared across
+// bintrail binaries. It exists so a second binary (the planned PostgreSQL-native
 // bintrail-pg, #527/#529) can register the same source-agnostic read/recover
 // commands and their shared flag/helper infrastructure without duplicating the
 // command layer that lives in package main today.
 //
-// This first file extracts the DuckDB resource-tuning flags shared by the
-// offline query/recover/reconstruct commands (#510/#511). Subsequent slices of
-// #529 move the env-binding helpers and the source-agnostic commands themselves.
+// Today it holds only shared flag/helper infrastructure — this first file
+// extracts the DuckDB resource-tuning flags shared by the offline
+// query/recover/reconstruct commands (#510/#511), and cmd/bintrail is its only
+// importer. Subsequent slices of #529 move the env-binding helpers and the
+// source-agnostic commands themselves, at which point bintrail-pg becomes a
+// second importer.
 package cli
 
 import (
