@@ -308,8 +308,8 @@ func TestResolveArchiveBintrailID_nullStreamStateErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when stream_state bintrail_id is NULL")
 	}
-	if !strings.Contains(err.Error(), "--bintrail-id is required") {
-		t.Errorf("error %q should explain --bintrail-id is required", err)
+	if !errors.Is(err, errNoArchiveBintrailID) {
+		t.Errorf("error %v should be errNoArchiveBintrailID (daemon fail-loud-at-startup depends on this sentinel)", err)
 	}
 }
 
@@ -328,8 +328,8 @@ func TestResolveArchiveBintrailID_noCheckpointErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when no stream_state row exists")
 	}
-	if !strings.Contains(err.Error(), "--bintrail-id is required") {
-		t.Errorf("error %q should explain --bintrail-id is required", err)
+	if !errors.Is(err, errNoArchiveBintrailID) {
+		t.Errorf("error %v should be errNoArchiveBintrailID (daemon fail-loud-at-startup depends on this sentinel)", err)
 	}
 }
 

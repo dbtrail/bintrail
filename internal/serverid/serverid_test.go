@@ -215,3 +215,18 @@ func TestSyntheticServerUUID(t *testing.T) {
 		seen[got] = key
 	}
 }
+
+// TestSyntheticServerUUID_GoldenValue pins the exact synthesis output for a fixed
+// input. The seed format ("mariadb|host:port") and the namespace constant are the
+// cross-version stability contract for the anchor: changing either silently
+// re-identifies EVERY MariaDB server, orphaning its existing S3 archives under a
+// new bintrail_id=<uuid>/ prefix. This golden assertion turns such a change into a
+// loud, intentional test failure that forces a migration decision. The literal was
+// captured from a real run against MariaDB on 127.0.0.1:13307.
+func TestSyntheticServerUUID_GoldenValue(t *testing.T) {
+	const want = "dcc224c0-020d-558f-93d4-2095282c8b90"
+	if got := SyntheticServerUUID("127.0.0.1", 13307); got != want {
+		t.Errorf("synthesis wire format changed: SyntheticServerUUID(127.0.0.1, 13307) = %q, want %q.\n"+
+			"A seed/namespace change re-identifies every MariaDB server — if this change is intentional, update the golden value AND plan an archive migration.", got, want)
+	}
+}

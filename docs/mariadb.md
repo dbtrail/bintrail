@@ -52,12 +52,14 @@ Identical to a MySQL source (see [Streaming → The Source MySQL User](streaming
 | `log_bin = ON` | Binary logging must be enabled. |
 | Source user grants | `REPLICATION SLAVE, REPLICATION CLIENT, SELECT` — the same set as MySQL. |
 
-> MariaDB does not have a `server_uuid` system variable. You will see a benign
-> `WARN … Unknown system variable 'server_uuid'` at startup — this is expected
-> and not an error. Because MySQL's stable identity anchor is absent, bintrail
-> **synthesizes a stable `bintrail_id` from the source address** (`host:port`)
-> instead. See [Server identity on MariaDB](#server-identity-on-mariadb) below —
-> it matters when you capture **more than one** MariaDB server.
+> MariaDB does not have a `server_uuid` system variable. bintrail detects this
+> and emits a benign `WARN … MariaDB source has no @@server_uuid; synthesized a
+> stable bintrail_id anchor …` at startup — expected, not an error. (You will
+> *not* see a raw `Unknown system variable 'server_uuid'` driver error: bintrail
+> swallows it and synthesizes instead.) Because MySQL's stable identity anchor is
+> absent, bintrail **synthesizes a stable `bintrail_id` from the source address**
+> (`host:port`) instead. See [Server identity on MariaDB](#server-identity-on-mariadb)
+> below — it matters when you capture **more than one** MariaDB server.
 
 ---
 
@@ -162,7 +164,7 @@ silently become the write key for every server. Two caveats:
 
 | Symptom | Cause / fix |
 |---|---|
-| `WARN … Unknown system variable 'server_uuid'` | Expected — MariaDB has no `server_uuid`. Benign; bintrail synthesizes a stable `bintrail_id` from the source address instead. See [Server identity on MariaDB](#server-identity-on-mariadb). |
+| `WARN … MariaDB source has no @@server_uuid; synthesized …` | Expected — MariaDB has no `server_uuid`. Benign; bintrail synthesizes a stable `bintrail_id` from the source address instead. See [Server identity on MariaDB](#server-identity-on-mariadb). |
 | `invalid Mysql GTID` when starting against MariaDB | You omitted `--source-flavor mariadb` — the MariaDB GTID set was parsed as a MySQL set. Add the flag. |
 | `WARN source flavor mismatch: configured … detected …` | `--source-flavor` doesn't match the server's actual flavor. Set it to match. |
 | `saved checkpoint is source flavor "mariadb" but "mysql" was requested` | You resumed a MariaDB checkpoint without `--source-flavor mariadb`. Add the flag, or `--reset` to start fresh. |

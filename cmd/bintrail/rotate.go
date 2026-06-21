@@ -91,12 +91,18 @@ func init() {
 	rootCmd.AddCommand(rotateCmd)
 }
 
+// errNoArchiveBintrailID is the precondition error from resolveArchiveBintrailID
+// when no archive bintrail_id can be determined (no CLI flag, no stream_state id,
+// no BINTRAIL_ID env). It is a PERMANENT misconfiguration that can never self-heal
+// on retry, so daemon mode fails loud on it at startup (via errors.Is) rather than
+// spinning silently while the index disk fills.
+var errNoArchiveBintrailID = errors.New("--bintrail-id is required when --archive-dir is set: no bintrail_id is recorded in stream_state to fall back to")
+
 // resolveArchiveBintrailID determines the bintrail_id used as the archive
 // S3/Hive partition key. Precedence:
 //
 //  1. An explicitly CLI-typed --bintrail-id — the operator's per-invocation
-//     intent. This preserves every existing invocation (the flag used to be
-//     required) byte-for-byte.
+//     intent. This preserves every existing CLI-typed invocation byte-for-byte.
 //  2. The per-server bintrail_id recorded in stream_state (resolved at
 //     stream/index time — the synthesized one for MariaDB, the
 //     @@server_uuid-derived one for MySQL).
@@ -109,8 +115,9 @@ func init() {
 // was typed on the CLI. This distinction is the whole point — a single GLOBAL
 // BINTRAIL_ID must NOT silently become the write key for every server, which
 // would collapse multiple servers' archives into one bintrail_id=<id>/ prefix
-// (the exact collision this guards against). It errors when nothing is
-// available, so an archive run can never write to an empty bintrail_id= prefix.
+// (the exact collision this guards against). It returns errNoArchiveBintrailID
+// when nothing is available, so an archive run can never write to an empty
+// bintrail_id= prefix.
 func resolveArchiveBintrailID(ctx context.Context, db *sql.DB, flagValue, envValue string) (string, error) {
 	// Tier 1: an explicitly CLI-typed flag (value differs from the env var).
 	if flagValue != "" && flagValue != envValue {
@@ -124,6 +131,14 @@ func resolveArchiveBintrailID(ctx context.Context, db *sql.DB, flagValue, envVal
 		return "", fmt.Errorf("read bintrail_id from stream_state: %w", err)
 	}
 	if id.Valid && id.String != "" {
+		// A non-empty flagValue at this point can only be env-derived (a CLI-typed
+		// value would have won Tier 1). If it disagrees with the per-server id, the
+		// env value is being overridden — surface it rather than silently honoring
+		// stream_state, since the flag help promises an explicit value wins.
+		if flagValue != "" && flagValue != id.String {
+			slog.Warn("--bintrail-id matches BINTRAIL_ID and was treated as environment-derived; using the per-server stream_state bintrail_id instead. To force a value, make --bintrail-id differ from BINTRAIL_ID (or unset BINTRAIL_ID)",
+				"requested", flagValue, "using", id.String)
+		}
 		return id.String, nil
 	}
 
@@ -134,7 +149,7 @@ func resolveArchiveBintrailID(ctx context.Context, db *sql.DB, flagValue, envVal
 			"bintrail_id", flagValue)
 		return flagValue, nil
 	}
-	return "", fmt.Errorf("--bintrail-id is required when --archive-dir is set: no bintrail_id is recorded in stream_state to fall back to")
+	return "", errNoArchiveBintrailID
 }
 
 func runRotate(cmd *cobra.Command, args []string) error {
@@ -244,6 +259,14 @@ func runRotate(cmd *cobra.Command, args []string) error {
 
 	slog.Info("rotate daemon started", "interval", interval)
 	if err := doRotation(ctx); err != nil && ctx.Err() == nil {
+		// A permanent precondition error (no resolvable archive bintrail_id) will
+		// never self-heal on the next tick, so spinning silently would hide a
+		// misconfig while the index disk fills. Fail loud at startup. Transient
+		// errors (DB blip, a not-yet-ready index DB) stay log-and-continue so the
+		// daemon self-heals on the next tick.
+		if errors.Is(err, errNoArchiveBintrailID) {
+			return fmt.Errorf("rotate --daemon cannot start: %w", err)
+		}
 		slog.Error("rotation failed", "error", err)
 	}
 

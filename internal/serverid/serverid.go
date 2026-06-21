@@ -1,7 +1,10 @@
 // Package serverid manages persistent server identities for bintrail.
-// Each MySQL server is assigned a unique bintrail_id (UUID) on first contact.
-// Identity resolution uses five rules to handle UUID regeneration, host
-// migration, and cloned-server conflicts while preserving the bintrail_id.
+// Each source server is assigned a unique bintrail_id (UUID) on first contact —
+// keyed on the server's @@server_uuid for MySQL, or on a synthesized
+// address-derived anchor for MariaDB (which has no @@server_uuid; see
+// SyntheticServerUUID). Identity resolution uses five rules to handle UUID
+// regeneration, host migration, and cloned-server conflicts while preserving the
+// bintrail_id.
 package serverid
 
 import (

@@ -63,6 +63,38 @@ func TestLoadSourceIdentityServerUUIDQueryFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "server_uuid") {
 		t.Errorf("error %q should mention server_uuid", err)
 	}
+	// Pin that the VERSION() probe is actually issued on the failure path — if the
+	// DetectFlavor guard were removed, this would catch it (unconsumed expectation).
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestLoadSourceIdentityUnknownFlavorPropagates covers the case where both
+// @@server_uuid AND VERSION() fail, so DetectFlavor returns "" (flavor
+// undeterminable). The original error MUST propagate — bintrail must never
+// fabricate a synthesized identity for a server whose flavor it cannot confirm
+// is MariaDB (a refactor of the guard to `== "mysql"` would regress exactly here).
+func TestLoadSourceIdentityUnknownFlavorPropagates(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT @@server_uuid").WillReturnError(errors.New("connection reset"))
+	mock.ExpectQuery("SELECT VERSION").WillReturnError(errors.New("connection reset")) // → DetectFlavor returns ""
+
+	_, err = LoadSourceIdentity(context.Background(), db, "u:p@tcp(h:3306)/")
+	if err == nil {
+		t.Fatal("expected error when flavor is undeterminable (VERSION() also fails)")
+	}
+	if !strings.Contains(err.Error(), "server_uuid") {
+		t.Errorf("error %q must propagate the original server_uuid failure, not synthesize", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
 }
 
 // TestLoadSourceIdentityMariaDBSynthesizes verifies that a MariaDB source (no
