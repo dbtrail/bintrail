@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -73,9 +76,9 @@ func init() {
 	rotateCmd.Flags().StringVar(&rotRetain, "retain", "", "Drop partitions older than this duration (e.g. 7d, 24h)")
 	rotateCmd.Flags().IntVar(&rotAddFuture, "add-future", 0, "Maintain at least N future hourly partitions beyond the current hour (declarative target; top-up only)")
 	rotateCmd.Flags().BoolVar(&rotNoReplace, "no-replace", false, "Do not auto-add future partitions to replace dropped ones (only top up toward --add-future)")
-	rotateCmd.Flags().StringVar(&rotArchiveDir, "archive-dir", "", "Directory to write Parquet archives before dropping partitions (required with --bintrail-id)")
+	rotateCmd.Flags().StringVar(&rotArchiveDir, "archive-dir", "", "Directory to write Parquet archives before dropping partitions")
 	rotateCmd.Flags().StringVar(&rotArchiveCompression, "archive-compression", "zstd", "Compression for archive Parquet files (zstd, snappy, gzip, none)")
-	rotateCmd.Flags().StringVar(&rotBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir is set); archives are written under bintrail_id=<uuid>/event_date=<date>/")
+	rotateCmd.Flags().StringVar(&rotBintrailID, "bintrail-id", "", "Server identity UUID for archive paths (bintrail_id=<uuid>/event_date=<date>/). When --archive-dir is set and this is omitted, the bintrail_id recorded in stream_state is used; an explicit value always wins")
 	rotateCmd.Flags().StringVar(&rotArchiveS3, "archive-s3", "", "S3 destination URL to upload Parquet archives after writing (requires --archive-dir; e.g. s3://my-bucket/archives/)")
 	rotateCmd.Flags().StringVar(&rotArchiveS3Region, "archive-s3-region", "", "AWS region for --archive-s3 (default: from AWS_REGION env var or ~/.aws/config)")
 	rotateCmd.Flags().BoolVar(&rotDaemon, "daemon", false, "Run continuously, repeating rotation on the --interval schedule until SIGINT/SIGTERM")
@@ -88,6 +91,52 @@ func init() {
 	rootCmd.AddCommand(rotateCmd)
 }
 
+// resolveArchiveBintrailID determines the bintrail_id used as the archive
+// S3/Hive partition key. Precedence:
+//
+//  1. An explicitly CLI-typed --bintrail-id — the operator's per-invocation
+//     intent. This preserves every existing invocation (the flag used to be
+//     required) byte-for-byte.
+//  2. The per-server bintrail_id recorded in stream_state (resolved at
+//     stream/index time — the synthesized one for MariaDB, the
+//     @@server_uuid-derived one for MySQL).
+//  3. A BINTRAIL_ID environment value, as a last resort (with a loud warning).
+//
+// flagValue carries whatever bindCommandEnv left on --bintrail-id, which may be
+// CLI-typed OR injected from BINTRAIL_ID — cobra cannot tell them apart, since
+// env binding uses Flags().Set (marking the flag Changed just like a CLI value).
+// We infer: a flagValue that differs from envValue (os.Getenv("BINTRAIL_ID"))
+// was typed on the CLI. This distinction is the whole point — a single GLOBAL
+// BINTRAIL_ID must NOT silently become the write key for every server, which
+// would collapse multiple servers' archives into one bintrail_id=<id>/ prefix
+// (the exact collision this guards against). It errors when nothing is
+// available, so an archive run can never write to an empty bintrail_id= prefix.
+func resolveArchiveBintrailID(ctx context.Context, db *sql.DB, flagValue, envValue string) (string, error) {
+	// Tier 1: an explicitly CLI-typed flag (value differs from the env var).
+	if flagValue != "" && flagValue != envValue {
+		return flagValue, nil
+	}
+
+	// Tier 2: the per-server id resolved into stream_state.
+	var id sql.NullString
+	err := db.QueryRowContext(ctx, "SELECT bintrail_id FROM stream_state WHERE id = 1").Scan(&id)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("read bintrail_id from stream_state: %w", err)
+	}
+	if id.Valid && id.String != "" {
+		return id.String, nil
+	}
+
+	// Tier 3: a BINTRAIL_ID env value, only when no per-server id exists. Warn —
+	// reusing one global id across servers collides their archives in S3.
+	if flagValue != "" {
+		slog.Warn("archiving under the global BINTRAIL_ID environment value: no per-server bintrail_id is recorded in stream_state. If you capture more than one server, set a per-source BINTRAIL_ID or pass an explicit --bintrail-id, or their archives will collide under one prefix",
+			"bintrail_id", flagValue)
+		return flagValue, nil
+	}
+	return "", fmt.Errorf("--bintrail-id is required when --archive-dir is set: no bintrail_id is recorded in stream_state to fall back to")
+}
+
 func runRotate(cmd *cobra.Command, args []string) error {
 	if !cliutil.IsValidOutputFormat(rotFormat) {
 		return fmt.Errorf("invalid --format %q; must be text or json", rotFormat)
@@ -95,9 +144,12 @@ func runRotate(cmd *cobra.Command, args []string) error {
 	if rotRetain == "" && rotAddFuture == 0 {
 		return fmt.Errorf("at least one of --retain or --add-future is required")
 	}
-	if rotArchiveDir != "" && rotBintrailID == "" {
-		return fmt.Errorf("--bintrail-id is required when --archive-dir is set")
-	}
+	// NOTE: --bintrail-id is no longer required at parse time when archiving. When
+	// it is omitted we fall back to the bintrail_id already resolved into
+	// stream_state (resolveArchiveBintrailID, inside doRotation, after the DB is
+	// open). An explicit --bintrail-id always wins. This needs the DB, so the
+	// "neither flag nor resolved id" failure surfaces on the first rotation rather
+	// than here.
 	if rotArchiveS3 != "" && rotArchiveDir == "" {
 		return fmt.Errorf("--archive-s3 requires --archive-dir")
 	}
@@ -140,6 +192,20 @@ func runRotate(cmd *cobra.Command, args []string) error {
 		if err := indexer.EnsureSchema(db); err != nil {
 			return fmt.Errorf("schema migration: %w", err)
 		}
+
+		// Resolve the bintrail_id used as the archive S3/Hive partition key. An
+		// explicit --bintrail-id wins; otherwise fall back to the id already
+		// resolved into stream_state (so MariaDB sources — which have no
+		// @@server_uuid and thus get a synthesized id — and MySQL alike namespace
+		// their archives correctly without the operator re-typing the id).
+		archiveBintrailID := rotBintrailID
+		if rotArchiveDir != "" {
+			archiveBintrailID, err = resolveArchiveBintrailID(ctx, db, rotBintrailID, os.Getenv("BINTRAIL_ID"))
+			if err != nil {
+				return err
+			}
+		}
+
 		res, err := rotation.Perform(ctx, db, dbName, rotation.Options{
 			RetainDur:          retainDur,
 			RetainRaw:          rotRetain,
@@ -147,7 +213,7 @@ func runRotate(cmd *cobra.Command, args []string) error {
 			NoReplace:          rotNoReplace,
 			ArchiveDir:         rotArchiveDir,
 			ArchiveCompression: rotArchiveCompression,
-			BintrailID:         rotBintrailID,
+			BintrailID:         archiveBintrailID,
 			ArchiveS3:          rotArchiveS3,
 			ArchiveS3Region:    rotArchiveS3Region,
 			Retry:              rotRetry,

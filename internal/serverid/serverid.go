@@ -273,6 +273,35 @@ func DecommissionServer(ctx context.Context, db *sql.DB, bintrailID string) erro
 	return nil
 }
 
+// mariadbIdentityNamespace is the fixed UUIDv5 namespace under which MariaDB
+// server-identity anchors are synthesized. MariaDB has no @@server_uuid, so
+// SyntheticServerUUID derives a stable, collision-resistant anchor from the
+// source address instead (see that function). The namespace is an arbitrary
+// constant — its only job is to keep these synthesized UUIDs in their own space,
+// disjoint from any real MySQL @@server_uuid.
+var mariadbIdentityNamespace = uuid.MustParse("d87207bb-1448-4136-b360-d029bbce63d4")
+
+// SyntheticServerUUID returns a deterministic UUIDv5 identity anchor for a
+// source that exposes no @@server_uuid (i.e. MariaDB). It is derived from the
+// source's host:port so that:
+//
+//   - the same server resolves to the same anchor across restarts (stable
+//     bintrail_id, stable archive prefix), and
+//   - two different MariaDB servers — necessarily reachable at distinct
+//     addresses — resolve to distinct anchors, so they auto-separate into
+//     distinct bintrail_id=<uuid>/ Parquet prefixes instead of colliding.
+//
+// The anchor feeds ResolveServer exactly like a real @@server_uuid: it is the
+// strong re-identification key, while the bintrail_id itself stays a fresh
+// random UUID assigned on first contact. Deriving from the address means a
+// server moved to a new host gets a new identity — an accepted MariaDB
+// limitation (MySQL's @@server_uuid survives migration; MariaDB has no
+// equivalent), not a correctness bug.
+func SyntheticServerUUID(host string, port uint16) string {
+	seed := fmt.Sprintf("mariadb|%s:%d", host, port)
+	return uuid.NewSHA1(mariadbIdentityNamespace, []byte(seed)).String()
+}
+
 // DeriveServerID returns a deterministic uint32 server-id by hashing the
 // source DSN's host:user:dbname triple. The same DSN always produces the same
 // ID, so `bintrail up` resumes cleanly across restarts without the user

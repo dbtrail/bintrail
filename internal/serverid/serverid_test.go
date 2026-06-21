@@ -3,6 +3,8 @@ package serverid
 import (
 	"fmt"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func makeServer(bintrailID, serverUUID, host string, port uint16, username string) Server {
@@ -171,5 +173,45 @@ func TestDeriveServerID(t *testing.T) {
 	// non-deterministic value (the silent-failure fix).
 	if _, err := DeriveServerID("not-a-dsn"); err == nil {
 		t.Error("expected error for unparseable DSN; got nil")
+	}
+}
+
+func TestSyntheticServerUUID(t *testing.T) {
+	// Deterministic: same host:port → same anchor across calls (stable
+	// bintrail_id and stable S3 archive prefix across restarts).
+	a := SyntheticServerUUID("10.0.0.5", 3306)
+	b := SyntheticServerUUID("10.0.0.5", 3306)
+	if a != b {
+		t.Errorf("not deterministic: %q != %q", a, b)
+	}
+
+	// Valid 36-char UUID — it lands in bintrail_servers.server_uuid CHAR(36).
+	if len(a) != 36 {
+		t.Errorf("SyntheticServerUUID = %q, want a 36-char UUID", a)
+	}
+	if _, err := uuid.Parse(a); err != nil {
+		t.Errorf("SyntheticServerUUID = %q is not a valid UUID: %v", a, err)
+	}
+
+	// Distinct addresses → distinct anchors. This is the property that keeps two
+	// MariaDB servers from colliding into the same bintrail_id=<uuid>/ prefix.
+	// A different host OR a different port must change the anchor.
+	cases := []struct {
+		host string
+		port uint16
+	}{
+		{"10.0.0.5", 3307}, // same host, different port
+		{"10.0.0.6", 3306}, // different host, same port
+		{"db.example.com", 3306},
+		{"127.0.0.1", 3306},
+	}
+	seen := map[string]string{a: "10.0.0.5:3306"}
+	for _, c := range cases {
+		got := SyntheticServerUUID(c.host, c.port)
+		key := fmt.Sprintf("%s:%d", c.host, c.port)
+		if prev, dup := seen[got]; dup {
+			t.Errorf("collision: %s and %s both produced %s", prev, key, got)
+		}
+		seen[got] = key
 	}
 }

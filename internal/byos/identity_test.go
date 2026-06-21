@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+
+	"github.com/dbtrail/dbtrail/internal/serverid"
 )
 
 func TestLoadSourceIdentityHappyPath(t *testing.T) {
@@ -36,6 +38,10 @@ func TestLoadSourceIdentityHappyPath(t *testing.T) {
 	}
 }
 
+// TestLoadSourceIdentityServerUUIDQueryFails confirms that on a MySQL source
+// (VERSION() does not contain "MariaDB") a failed @@server_uuid query is still
+// surfaced as an error — never silently replaced by a synthesized anchor. The
+// synthesis path is reserved for genuine MariaDB sources (next test).
 func TestLoadSourceIdentityServerUUIDQueryFails(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -44,27 +50,65 @@ func TestLoadSourceIdentityServerUUIDQueryFails(t *testing.T) {
 	defer db.Close()
 
 	mock.ExpectQuery("SELECT @@server_uuid").WillReturnError(errors.New("connection refused"))
+	// On failure, LoadSourceIdentity probes VERSION() to disambiguate MariaDB
+	// (no @@server_uuid, expected) from a real MySQL failure. A MySQL version
+	// string must keep the error propagating.
+	mock.ExpectQuery("SELECT VERSION").WillReturnRows(
+		sqlmock.NewRows([]string{"VERSION()"}).AddRow("8.0.36"))
 
 	_, err = LoadSourceIdentity(context.Background(), db, "u:p@tcp(h:3306)/")
 	if err == nil {
-		t.Fatal("expected error when @@server_uuid query fails")
+		t.Fatal("expected error when @@server_uuid query fails on a MySQL source")
 	}
 	if !strings.Contains(err.Error(), "server_uuid") {
 		t.Errorf("error %q should mention server_uuid", err)
 	}
 }
 
-func TestLoadSourceIdentityBadDSN(t *testing.T) {
+// TestLoadSourceIdentityMariaDBSynthesizes verifies that a MariaDB source (no
+// @@server_uuid; VERSION() contains "MariaDB") gets a stable synthesized anchor
+// derived from its address rather than an error or an empty identity.
+func TestLoadSourceIdentityMariaDBSynthesizes(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	defer db.Close()
 
-	mock.ExpectQuery("SELECT @@server_uuid").WillReturnRows(
-		sqlmock.NewRows([]string{"@@server_uuid"}).AddRow("uuid-x"))
+	mock.ExpectQuery("SELECT @@server_uuid").WillReturnError(
+		errors.New("Error 1193: Unknown system variable 'server_uuid'"))
+	mock.ExpectQuery("SELECT VERSION").WillReturnRows(
+		sqlmock.NewRows([]string{"VERSION()"}).AddRow("11.4.2-MariaDB-1:11.4.2+maria~ubu2404"))
 
-	// config.ParseSourceDSN rejects unix sockets — use that as the easy bad-DSN trigger.
+	ident, err := LoadSourceIdentity(context.Background(), db, "repl:secret@tcp(10.0.0.7:3306)/")
+	if err != nil {
+		t.Fatalf("unexpected error for MariaDB source: %v", err)
+	}
+	want := serverid.SyntheticServerUUID("10.0.0.7", 3306)
+	if ident.ServerUUID != want {
+		t.Errorf("ServerUUID = %q, want synthesized %q", ident.ServerUUID, want)
+	}
+	if ident.ServerUUID == "" {
+		t.Error("synthesized ServerUUID must not be empty")
+	}
+	if ident.Host != "10.0.0.7" || ident.Port != 3306 || ident.User != "repl" {
+		t.Errorf("identity = %+v, want host=10.0.0.7 port=3306 user=repl", ident)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestLoadSourceIdentityBadDSN(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// The DSN is parsed before any query, so an invalid DSN fails fast with no
+	// DB round-trip (no mock expectations needed). config.ParseSourceDSN rejects
+	// unix sockets — use that as the easy bad-DSN trigger.
 	_, err = LoadSourceIdentity(context.Background(), db, "u:p@unix(/tmp/sock)/")
 	if err == nil {
 		t.Fatal("expected error for unix-socket DSN")

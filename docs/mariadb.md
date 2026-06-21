@@ -53,8 +53,58 @@ Identical to a MySQL source (see [Streaming → The Source MySQL User](streaming
 | Source user grants | `REPLICATION SLAVE, REPLICATION CLIENT, SELECT` — the same set as MySQL. |
 
 > MariaDB does not have a `server_uuid` system variable. You will see a benign
-> `WARN … Unknown system variable 'server_uuid'` at startup — bintrail proceeds
-> without a `bintrail_id`. This is expected on MariaDB and not an error.
+> `WARN … Unknown system variable 'server_uuid'` at startup — this is expected
+> and not an error. Because MySQL's stable identity anchor is absent, bintrail
+> **synthesizes a stable `bintrail_id` from the source address** (`host:port`)
+> instead. See [Server identity on MariaDB](#server-identity-on-mariadb) below —
+> it matters when you capture **more than one** MariaDB server.
+
+---
+
+## Server identity on MariaDB
+
+On MySQL, bintrail derives each server's stable `bintrail_id` from `@@server_uuid`.
+MariaDB has no such variable, so bintrail **synthesizes the identity anchor from
+the source address** (`host:port`) and runs it through the same registration
+logic. The result is a normal `bintrail_id` recorded in `bintrail_servers` and
+`stream_state` — identical downstream behavior to MySQL.
+
+Two consequences worth understanding:
+
+- **Stable across restarts.** The same MariaDB server (same address) always
+  resolves to the same `bintrail_id`, so resume and archive paths are stable.
+- **Distinct per server — this is what keeps two servers apart in S3.** Parquet
+  archives are written under `bintrail_id=<id>/event_date=…/`. Two MariaDB
+  servers reached at distinct addresses synthesize **distinct** `bintrail_id`s
+  and land in **distinct** S3 prefixes automatically — no manual bookkeeping, no
+  collision.
+
+> **The address must actually differ per server.** Because the anchor is
+> `host:port`, two *different* MariaDB servers reached through the **same**
+> address (a shared proxy/VIP, or both via a `127.0.0.1` tunnel) synthesize the
+> **same** anchor and would collide under one prefix. Give each server a distinct
+> address, or pass an explicit `--bintrail-id` per server.
+
+When you archive with `bintrail rotate --archive-dir … [--archive-s3 …]`, you no
+longer need to pass `--bintrail-id` by hand: it defaults to the `bintrail_id`
+recorded in `stream_state` (the synthesized one for MariaDB). Precedence is
+**explicit `--bintrail-id` (typed on the CLI) > the `stream_state` id > a global
+`BINTRAIL_ID` env var** — so one `BINTRAIL_ID` in a shared `config.env` can never
+silently become the write key for every server. Two caveats:
+
+- A **file-based `bintrail index`** backfill records identity in `index_state`,
+  not `stream_state`, so `rotate` has nothing to fall back to — pass an explicit
+  `--bintrail-id` when archiving an index-only (never-streamed) source. It fails
+  loud ("no bintrail_id recorded in stream_state") rather than guessing.
+- A `BINTRAIL_ID` env var is used only as a last resort (no `stream_state` id),
+  and `rotate` warns when it does, since reusing one across servers collides them.
+
+> **Address changes split history.** Because the anchor is `host:port`, moving a
+> MariaDB server to a new address (or capturing the same server through two
+> different hostnames) yields a *new* `bintrail_id`, so its archives continue
+> under a new S3 prefix. This is the documented trade-off for MariaDB having no
+> migration-stable identity; pin a stable address, or pass an explicit
+> `--bintrail-id` to keep one identity across an address change.
 
 ---
 
@@ -112,7 +162,7 @@ Identical to a MySQL source (see [Streaming → The Source MySQL User](streaming
 
 | Symptom | Cause / fix |
 |---|---|
-| `WARN … Unknown system variable 'server_uuid'` | Expected — MariaDB has no `server_uuid`. Benign; bintrail proceeds without a `bintrail_id`. |
+| `WARN … Unknown system variable 'server_uuid'` | Expected — MariaDB has no `server_uuid`. Benign; bintrail synthesizes a stable `bintrail_id` from the source address instead. See [Server identity on MariaDB](#server-identity-on-mariadb). |
 | `invalid Mysql GTID` when starting against MariaDB | You omitted `--source-flavor mariadb` — the MariaDB GTID set was parsed as a MySQL set. Add the flag. |
 | `WARN source flavor mismatch: configured … detected …` | `--source-flavor` doesn't match the server's actual flavor. Set it to match. |
 | `saved checkpoint is source flavor "mariadb" but "mysql" was requested` | You resumed a MariaDB checkpoint without `--source-flavor mariadb`. Add the flag, or `--reset` to start fresh. |

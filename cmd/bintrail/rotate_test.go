@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 // ─── cobra command wiring ────────────────────────────────────────────────────
@@ -242,5 +246,156 @@ func TestRunRotate_daemonInvalidInterval(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--interval") {
 		t.Errorf("expected '--interval' in error, got: %v", err)
+	}
+}
+
+// ─── archive bintrail-id resolution (flag > stream_state fallback) ────────────
+
+func TestResolveArchiveBintrailID_flagWins(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// An explicit --bintrail-id must short-circuit before any DB read, so every
+	// existing invocation (which always passed the flag) is byte-for-byte
+	// unchanged and never depends on stream_state.
+	got, err := resolveArchiveBintrailID(context.Background(), db, "explicit-id", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "explicit-id" {
+		t.Errorf("got %q, want explicit-id", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expected no DB query when flag is set: %v", err)
+	}
+}
+
+func TestResolveArchiveBintrailID_fallsBackToStreamState(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT bintrail_id FROM stream_state").WillReturnRows(
+		sqlmock.NewRows([]string{"bintrail_id"}).AddRow("resolved-from-checkpoint"))
+
+	got, err := resolveArchiveBintrailID(context.Background(), db, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "resolved-from-checkpoint" {
+		t.Errorf("got %q, want resolved-from-checkpoint", got)
+	}
+}
+
+func TestResolveArchiveBintrailID_nullStreamStateErrors(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// A NULL bintrail_id (e.g. a pre-identity checkpoint) must NOT pass as a valid
+	// empty prefix — archiving to bintrail_id= would collide across servers.
+	mock.ExpectQuery("SELECT bintrail_id FROM stream_state").WillReturnRows(
+		sqlmock.NewRows([]string{"bintrail_id"}).AddRow(nil))
+
+	_, err = resolveArchiveBintrailID(context.Background(), db, "", "")
+	if err == nil {
+		t.Fatal("expected error when stream_state bintrail_id is NULL")
+	}
+	if !strings.Contains(err.Error(), "--bintrail-id is required") {
+		t.Errorf("error %q should explain --bintrail-id is required", err)
+	}
+}
+
+func TestResolveArchiveBintrailID_noCheckpointErrors(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// No stream_state row at all (rotate run before any stream/index).
+	mock.ExpectQuery("SELECT bintrail_id FROM stream_state").WillReturnRows(
+		sqlmock.NewRows([]string{"bintrail_id"}))
+
+	_, err = resolveArchiveBintrailID(context.Background(), db, "", "")
+	if err == nil {
+		t.Fatal("expected error when no stream_state row exists")
+	}
+	if !strings.Contains(err.Error(), "--bintrail-id is required") {
+		t.Errorf("error %q should explain --bintrail-id is required", err)
+	}
+}
+
+func TestResolveArchiveBintrailID_queryErrorPropagates(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT bintrail_id FROM stream_state").WillReturnError(
+		errors.New("connection reset"))
+
+	_, err = resolveArchiveBintrailID(context.Background(), db, "", "")
+	if err == nil {
+		t.Fatal("expected error when the stream_state query fails")
+	}
+	if !strings.Contains(err.Error(), "read bintrail_id from stream_state") {
+		t.Errorf("error %q should wrap the stream_state read failure", err)
+	}
+}
+
+// TestResolveArchiveBintrailID_envDoesNotOutrankStreamState is the regression
+// guard for the collision blocker: a value sourced from the global BINTRAIL_ID
+// env var (flagValue == envValue) must NOT win over the per-server bintrail_id in
+// stream_state. Otherwise one global BINTRAIL_ID set in config.env would make
+// every server archive under the same bintrail_id=<id>/ prefix in S3.
+func TestResolveArchiveBintrailID_envDoesNotOutrankStreamState(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT bintrail_id FROM stream_state").WillReturnRows(
+		sqlmock.NewRows([]string{"bintrail_id"}).AddRow("per-server-id"))
+
+	// flagValue == envValue → the flag was injected from BINTRAIL_ID, not typed.
+	got, err := resolveArchiveBintrailID(context.Background(), db, "global-env-id", "global-env-id")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "per-server-id" {
+		t.Errorf("got %q, want per-server-id (env must not outrank stream_state)", got)
+	}
+}
+
+// TestResolveArchiveBintrailID_envFallbackWhenNoStreamState confirms a global
+// BINTRAIL_ID is still honored as a last resort when no per-server id exists
+// (e.g. a file-index backfill with no stream_state row), so env-only workflows
+// keep working.
+func TestResolveArchiveBintrailID_envFallbackWhenNoStreamState(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT bintrail_id FROM stream_state").WillReturnRows(
+		sqlmock.NewRows([]string{"bintrail_id"})) // no row
+
+	got, err := resolveArchiveBintrailID(context.Background(), db, "env-id", "env-id")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "env-id" {
+		t.Errorf("got %q, want env-id (env fallback when no stream_state id)", got)
 	}
 }
