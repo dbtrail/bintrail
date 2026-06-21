@@ -1,4 +1,13 @@
-package main
+// Package cli holds command-layer building blocks shared across bintrail
+// binaries. It exists so a second binary (the planned PostgreSQL-native
+// bintrail-pg, #527/#529) can register the same source-agnostic read/recover
+// commands and their shared flag/helper infrastructure without duplicating the
+// command layer that lives in package main today.
+//
+// This first file extracts the DuckDB resource-tuning flags shared by the
+// offline query/recover/reconstruct commands (#510/#511). Subsequent slices of
+// #529 move the env-binding helpers and the source-agnostic commands themselves.
+package cli
 
 import (
 	"context"
@@ -40,7 +49,7 @@ func validateDuckDBMemoryLimit(s string) error {
 	return nil
 }
 
-// addDuckDBTuningFlags registers the shared DuckDB resource flags on the
+// AddDuckDBTuningFlags registers the shared DuckDB resource flags on the
 // offline query/recover/reconstruct commands. They lift the conservative,
 // container-safe DuckDB budget (threads=2, memory_limit=4GB) that
 // parquetquery.Fetch applies by default — useful on a dedicated box with
@@ -50,7 +59,7 @@ func validateDuckDBMemoryLimit(s string) error {
 //
 // --duckdb-threads default -1 (not 0) so 0 stays a meaningful explicit value:
 // "let DuckDB pick one thread per core". --duckdb-memory-limit "" means unset.
-func addDuckDBTuningFlags(cmd *cobra.Command) {
+func AddDuckDBTuningFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("ultrafast", false,
 		"trade DuckDB memory-safety for speed: let DuckDB self-tune to the host (all cores, ~80% RAM) instead of the container-safe 2 threads / 4GB cap — for big boxes, not small containers")
 	cmd.Flags().Int("duckdb-threads", -1,
@@ -59,7 +68,7 @@ func addDuckDBTuningFlags(cmd *cobra.Command) {
 		"override DuckDB memory limit, e.g. 16GB (empty keeps the mode default)")
 }
 
-// duckDBTuningFromFlags resolves the effective DuckDB tuning for a command.
+// DuckDBTuningFromFlags resolves the effective DuckDB tuning for a command.
 // Precedence: an explicit --duckdb-* flag wins over --ultrafast, which wins
 // over the conservative default. The granular flags let an operator tune to
 // their box without the all-or-nothing --ultrafast switch.
@@ -69,7 +78,7 @@ func addDuckDBTuningFlags(cmd *cobra.Command) {
 // best-effort downstream and would either silently fall back to the default
 // (a typo) or silently uncap on a negative value, neither of which an operator
 // who explicitly asked for a budget should get without being told.
-func duckDBTuningFromFlags(cmd *cobra.Command) (duckdbutil.Tuning, error) {
+func DuckDBTuningFromFlags(cmd *cobra.Command) (duckdbutil.Tuning, error) {
 	t := duckdbutil.DefaultTuning()
 	if ultrafast, _ := cmd.Flags().GetBool("ultrafast"); ultrafast {
 		t = duckdbutil.Ultrafast()
@@ -86,10 +95,10 @@ func duckDBTuningFromFlags(cmd *cobra.Command) (duckdbutil.Tuning, error) {
 	return t, nil
 }
 
-// tunedArchiveFetcher adapts a DuckDB Tuning into a query.ArchiveFetcher so the
+// TunedArchiveFetcher adapts a DuckDB Tuning into a query.ArchiveFetcher so the
 // CLI commands can inject their budget without changing parquetquery.Fetch's
 // signature (which other packages pass as a function value).
-func tunedArchiveFetcher(t duckdbutil.Tuning) query.ArchiveFetcher {
+func TunedArchiveFetcher(t duckdbutil.Tuning) query.ArchiveFetcher {
 	return func(ctx context.Context, opts query.Options, source string) ([]query.ResultRow, error) {
 		return parquetquery.FetchWithTuning(ctx, opts, source, t)
 	}

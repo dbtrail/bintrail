@@ -11,6 +11,7 @@ import (
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -89,7 +90,7 @@ func init() {
 	recoverCmd.Flags().StringVar(&rProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	recoverCmd.Flags().StringVar(&rFormat, "format", "text", "Output format: text or json")
 	recoverCmd.Flags().BoolVar(&rNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
-	addDuckDBTuningFlags(recoverCmd)
+	cli.AddDuckDBTuningFlags(recoverCmd)
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(recoverCmd)
 
@@ -209,7 +210,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		dbName = cfg.DBName
 	}
 
-	duckTuning, err := duckDBTuningFromFlags(cmd)
+	duckTuning, err := cli.DuckDBTuningFromFlags(cmd)
 	if err != nil {
 		return err
 	}
@@ -218,7 +219,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		DBName:         dbName,
 		NoArchive:      rNoArchive || rProfile != "",
 		AllowGaps:      true, // preserve recover's warn-and-continue behavior
-		ArchiveFetcher: tunedArchiveFetcher(duckTuning),
+		ArchiveFetcher: cli.TunedArchiveFetcher(duckTuning),
 	})
 	if err != nil {
 		return err

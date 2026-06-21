@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -118,7 +119,7 @@ func init() {
 	reconstructCmd.Flags().StringVar(&recTables, "tables", "", "Comma-separated schema.table list for --output-format=mydumper (e.g. mydb.orders,mydb.users)")
 	reconstructCmd.Flags().StringVar(&recChunkSize, "chunk-size", "256MB", "Max size per SQL chunk file in full-table mode (e.g. 64MB, 1GB)")
 	reconstructCmd.Flags().IntVar(&recParallelism, "parallelism", 0, "Max tables to reconstruct concurrently in full-table mode (default: runtime.NumCPU())")
-	addDuckDBTuningFlags(reconstructCmd)
+	cli.AddDuckDBTuningFlags(reconstructCmd)
 	bindCommandEnv(reconstructCmd)
 
 	rootCmd.AddCommand(reconstructCmd)
@@ -268,7 +269,7 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		Since:    &snapshotTime,
 		Until:    &at,
 	}
-	duckTuning, err := duckDBTuningFromFlags(cmd)
+	duckTuning, err := cli.DuckDBTuningFromFlags(cmd)
 	if err != nil {
 		return err
 	}
@@ -277,7 +278,7 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		DBName:         dbName,
 		NoArchive:      recNoArchive,
 		AllowGaps:      recAllowGaps,
-		ArchiveFetcher: tunedArchiveFetcher(duckTuning),
+		ArchiveFetcher: cli.TunedArchiveFetcher(duckTuning),
 	})
 	if err != nil {
 		// Surface CLI hints only at the CLI layer; the library types
@@ -471,7 +472,7 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 		baselineSrc = recBaselineS3
 	}
 
-	duckTuning, err := duckDBTuningFromFlags(cmd)
+	duckTuning, err := cli.DuckDBTuningFromFlags(cmd)
 	if err != nil {
 		return err
 	}
@@ -486,7 +487,7 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 		ChunkSize:      chunkSize,
 		Parallelism:    recParallelism,
 		AllowGaps:      recAllowGaps,
-		ArchiveFetcher: tunedArchiveFetcher(duckTuning),
+		ArchiveFetcher: cli.TunedArchiveFetcher(duckTuning),
 	}
 	reports, err := reconstruct.ReconstructTables(cmd.Context(), cfg)
 	if err != nil {

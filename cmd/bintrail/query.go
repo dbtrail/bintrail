@@ -15,6 +15,7 @@ import (
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -98,7 +99,7 @@ func init() {
 	queryCmd.Flags().BoolVar(&qNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
 	queryCmd.Flags().BoolVar(&qIncludeSnapshot, "include-snapshot", false, "Also scan the mydumper baseline Parquet and emit matching rows as SNAPSHOT events (requires --baseline, --schema, --table)")
 	queryCmd.Flags().StringVar(&qBaseline, "baseline", "", "Path to a baseline Parquet file or directory containing <schema>/<table>.parquet (local path or s3:// URL); used with --include-snapshot")
-	addDuckDBTuningFlags(queryCmd)
+	cli.AddDuckDBTuningFlags(queryCmd)
 	_ = queryCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(queryCmd)
 
@@ -153,7 +154,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	if qNoArchive && (qArchiveDir != "" || qArchiveS3 != "") {
 		return fmt.Errorf("--no-archive cannot be combined with --archive-dir or --archive-s3")
 	}
-	duckTuning, err := duckDBTuningFromFlags(cmd)
+	duckTuning, err := cli.DuckDBTuningFromFlags(cmd)
 	if err != nil {
 		return err
 	}
@@ -322,7 +323,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 			cmd.Context(),
 			archSources,
 			fetchOpts,
-			tunedArchiveFetcher(duckTuning),
+			cli.TunedArchiveFetcher(duckTuning),
 			os.Stderr,
 		)
 		if err != nil {

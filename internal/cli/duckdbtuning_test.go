@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"testing"
@@ -101,24 +101,24 @@ func TestDuckDBTuningFromFlags(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cmd := &cobra.Command{Use: "test"}
-			addDuckDBTuningFlags(cmd)
+			AddDuckDBTuningFlags(cmd)
 			for flag, val := range tt.flags {
 				if err := cmd.Flags().Set(flag, val); err != nil {
 					t.Fatalf("set --%s=%s: %v", flag, val, err)
 				}
 			}
-			got, err := duckDBTuningFromFlags(cmd)
+			got, err := DuckDBTuningFromFlags(cmd)
 			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("duckDBTuningFromFlags() = %+v, want error", got)
+					t.Fatalf("DuckDBTuningFromFlags() = %+v, want error", got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("duckDBTuningFromFlags() unexpected error: %v", err)
+				t.Fatalf("DuckDBTuningFromFlags() unexpected error: %v", err)
 			}
 			if got != tt.want {
-				t.Fatalf("duckDBTuningFromFlags() = %+v, want %+v", got, tt.want)
+				t.Fatalf("DuckDBTuningFromFlags() = %+v, want %+v", got, tt.want)
 			}
 		})
 	}
@@ -127,7 +127,7 @@ func TestDuckDBTuningFromFlags(t *testing.T) {
 // TestTunedArchiveFetcherNonNil: the adapter must always return a usable
 // fetcher (it is passed where a nil ArchiveFetcher is a hard error).
 func TestTunedArchiveFetcherNonNil(t *testing.T) {
-	if tunedArchiveFetcher(duckdbutil.DefaultTuning()) == nil {
-		t.Fatal("tunedArchiveFetcher returned nil")
+	if TunedArchiveFetcher(duckdbutil.DefaultTuning()) == nil {
+		t.Fatal("TunedArchiveFetcher returned nil")
 	}
 }
