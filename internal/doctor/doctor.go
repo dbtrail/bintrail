@@ -423,11 +423,12 @@ func checkFKCascades(db *sql.DB, schemas []string) CheckResult {
 			"     ALTER TABLE <child> DROP FOREIGN KEY <fk_name>;\n" +
 			"     ALTER TABLE <child> ADD CONSTRAINT <fk_name> FOREIGN KEY (...) REFERENCES <parent>(...)\n" +
 			"         ON DELETE RESTRICT ON UPDATE RESTRICT;\n\n" +
-			"  2. Keep the cascades and recover cascade-deleted child rows manually for\n" +
-			"     now (full cascade recovery is in progress, #548).\n\n" +
+			"  2. Keep the cascades and reconstruct cascade-deleted child rows with\n" +
+			"     `bintrail recover-cascade` (Phase-1: binlog-window; baseline fallback #552).\n\n" +
 			"Ingestion (`stream`/`watch`/`up`/`index --source-dsn`) no longer refuses cascade\n" +
 			"schemas — it WARNS and proceeds — so the FK graph is captured for cascade recovery.\n" +
-			"Plain `recover` still produces incomplete SQL for cascade-affected tables.",
+			"Plain `recover` still produces incomplete SQL for cascade-affected tables; use\n" +
+			"`recover-cascade` instead for those.",
 	}
 }
 

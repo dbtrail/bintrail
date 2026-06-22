@@ -112,7 +112,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 			slog.Warn("FK cascade constraints present on source; indexing will proceed, "+
 				"but InnoDB executes cascades below the binlog (MySQL Bug #32506) so cascaded "+
 				"child-row deletes are NOT captured \u2014 plain `recover` cannot restore them. "+
-				"Cascade recovery is in progress (#548).",
+				"Reconstruct them with `bintrail recover-cascade`.",
 				"detail", err.Error())
 		} else {
 			fmt.Println("Source: no FK cascades \u2713")

@@ -196,8 +196,35 @@ Reversed: undo the 14:03 UPDATE first, then the 14:02 UPDATE, then the 14:01 INS
 > side-effect row changes (InnoDB runs cascades below the binlog, MySQL Bug
 > #32506, so cascaded child deletes are never captured) that plain `recover`
 > cannot reliably undo. `bintrail doctor`, and `stream`/`watch`/`index --source-dsn`,
-> warn about them and proceed (cascade schemas index normally). Dedicated
-> cascade recovery is in progress (#548).
+> warn about them and proceed (cascade schemas index normally). To reconstruct
+> cascade-deleted rows, use **`bintrail recover-cascade`** (see below).
+
+### `recover-cascade`: reverse FK ON DELETE CASCADE
+
+`bintrail recover-cascade` reconstructs rows that an InnoDB `ON DELETE CASCADE`
+removed but never binlogged. It finds the deleted parent rows in the index,
+infers which child rows referenced them in their last indexed state, and emits
+reversal SQL that re-inserts **both** the parents and their cascade-deleted
+descendants (recursing through multi-level cascades), wrapped in
+`SET FOREIGN_KEY_CHECKS=0/1`. Like `recover`, it only generates SQL — review
+before applying.
+
+```bash
+bintrail recover-cascade --index-dsn "..." \
+  --schema shop --table orders --pk '42' --dry-run
+```
+
+- `--table` is the **parent** table whose delete cascaded; `--pk`/`--pks`,
+  `--since`/`--until` narrow which deleted parents to process.
+- `--lookback` (default `30d`) bounds how far back the last child state is
+  searched; `--max-depth` (default 5) bounds cascade recursion.
+- **Phase-1 limitation:** a child untouched within `--lookback` and absent from a
+  baseline is not reconstructed (baseline fallback is #552), and archived
+  partitions are not searched. When the result is provably partial the output is
+  flagged `INCOMPLETE RECOVERY` and the command exits non-zero unless
+  `--allow-incomplete` is given. If you have already re-created a deleted parent,
+  remove its `INSERT` from the output — `FOREIGN_KEY_CHECKS=0` does not suppress
+  primary-key violations.
 
 ### WHERE Clause Strategy
 
