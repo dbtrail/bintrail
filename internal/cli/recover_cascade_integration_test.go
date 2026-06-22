@@ -389,3 +389,54 @@ func TestRecoverCascade_phase2DedupCompositePK(t *testing.T) {
 		t.Errorf("composite child present in binlog AND baseline must dedup to ONE INSERT, got %d\n---\n%s", c, sql)
 	}
 }
+
+// TestRecoverCascade_setNullEmitsGuardedUpdate proves ON DELETE SET NULL recovery
+// end-to-end: a child that referenced the deleted parent (and survives with its
+// FK nulled) is restored by an idempotent UPDATE carrying the `... AND fk IS NULL`
+// guard — so a re-run or a later re-point of the child is never clobbered.
+func TestRecoverCascade_setNullEmitsGuardedUpdate(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	snapTs := "2026-06-01 00:00:00"
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "parent", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "pid", 2, "", "int", "YES")
+
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
+		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
+		VALUES (1, 'fk', ?, 'child', 'pid', 1, ?, 'parent', 'id', 'SET NULL', 'RESTRICT')`, dbName, dbName)
+
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	childTs := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	parentTs := h.Add(20 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, childTs, nil, dbName, "child", 1 /*INSERT*/, "10", nil, nil, []byte(`{"id":10,"pid":1}`))
+	testutil.InsertEvent(t, db, "b.000001", 20, 30, parentTs, nil, dbName, "parent", 3 /*DELETE*/, "1", nil, []byte(`{"id":1}`), nil)
+
+	out := filepath.Join(t.TempDir(), "cascade.sql")
+	cleanCascadeFlags(testutil.IntegrationDSN(dbName), dbName, out)
+	rcPK = "1"
+
+	if err := runCascadeCmd(t); err != nil {
+		t.Fatalf("runRecoverCascade: %v", err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	sql := string(b)
+	// The restore is a guarded UPDATE, not an INSERT (the child row survives).
+	wantUpdate := "UPDATE `" + dbName + "`.`child` SET `pid` = 1 WHERE `id` = 10 AND `pid` IS NULL"
+	if !strings.Contains(sql, wantUpdate) {
+		t.Errorf("missing guarded SET NULL restore %q\n---\n%s", wantUpdate, sql)
+	}
+	if strings.Contains(sql, "INSERT INTO `"+dbName+"`.`child`") {
+		t.Errorf("SET NULL child must be UPDATEd, not re-INSERTed\n---\n%s", sql)
+	}
+}

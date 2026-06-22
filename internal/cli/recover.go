@@ -193,9 +193,10 @@ func runRecover(cmd *cobra.Command, args []string) error {
 				tables = append(tables, k)
 			}
 		}
-		slog.Warn("target schema has FK ON DELETE/UPDATE CASCADE constraints; plain `recover` "+
-			"cannot reconstruct cascade-deleted child rows (they are never binlogged, MySQL Bug "+
-			"#32506); use `bintrail recover-cascade` to reconstruct them",
+		slog.Warn("target schema has FK ON DELETE CASCADE/SET NULL (or ON UPDATE CASCADE) "+
+			"constraints; plain `recover` cannot reconstruct cascade-deleted child rows or "+
+			"SET NULL'd FKs (they are never binlogged, MySQL Bug #32506); use "+
+			"`bintrail recover-cascade` to reconstruct them",
 			"cascade_child_tables", strings.Join(tables, ", "))
 	}
 

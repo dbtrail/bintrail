@@ -97,9 +97,9 @@ func TestLoadCascadeFKsFromIndex(t *testing.T) {
 }
 
 // TestSynthesizeVictims_ruleGate pins the deliberate non-bug: only ON DELETE
-// CASCADE edges are delete-synthesized. A pure RESTRICT edge and an
-// ON-UPDATE-CASCADE-only edge (the dbtrail conflation) must yield no victims —
-// and, being non-CASCADE, never even hit the index, so no events are needed.
+// CASCADE / SET NULL edges are synthesized. A pure RESTRICT edge and an
+// ON-UPDATE-CASCADE-only edge (the dbtrail conflation) must yield nothing — and,
+// being neither rule, never even hit the index, so no events are needed.
 func TestSynthesizeVictims_ruleGate(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	indexDB, _ := testutil.CreateTestDB(t)
@@ -125,9 +125,57 @@ func TestSynthesizeVictims_ruleGate(t *testing.T) {
 		t.Fatalf("SynthesizeVictims: %v", err)
 	}
 	if len(res.Victims) != 0 {
-		t.Errorf("non-ON-DELETE-CASCADE edges must yield no victims, got %d: %+v", len(res.Victims), res.Victims)
+		t.Errorf("non-CASCADE/SET-NULL edges must yield no victims, got %d: %+v", len(res.Victims), res.Victims)
+	}
+	if len(res.SetNullRows) != 0 {
+		t.Errorf("non-CASCADE/SET-NULL edges must yield no SET NULL restores, got %d: %+v", len(res.SetNullRows), res.SetNullRows)
 	}
 }
+
+// TestSynthesizeVictims_setNull pins ON DELETE SET NULL: a child that referenced
+// the deleted parent (and survives) becomes a SetNullRestore (not a victim), and
+// it is NOT recursed (no row was deleted). A child re-pointed away is excluded.
+func TestSynthesizeVictims_setNull(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+
+	T := time.Now().UTC()
+	h := T.Add(-30 * time.Minute).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	ts := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	// child 10 references parent 1 (SET NULL victim); child 13 re-pointed to 2.
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, ts, nil, dbName, "child", 1, "10", nil, nil, []byte(`{"id":10,"pid":1}`))
+	testutil.InsertEvent(t, db, "b.000001", 20, 30, ts, nil, dbName, "child", 1, "13", nil, nil, []byte(`{"id":13,"pid":1}`))
+	testutil.InsertEvent(t, db, "b.000001", 30, 40, ts, nil, dbName, "child", 2 /*UPDATE*/, "13", nil, []byte(`{"id":13,"pid":1}`), []byte(`{"id":13,"pid":2}`))
+
+	fks := []cascade.CascadeFK{{
+		Schema: dbName, Table: "child", ConstraintName: "fk", Column: "pid",
+		ReferencedSchema: dbName, ReferencedTable: "parent", ReferencedColumn: "id",
+		DeleteRule: "SET NULL",
+	}}
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, fks, parentDelete(dbName, T), cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if len(res.Victims) != 0 {
+		t.Errorf("SET NULL must produce no DELETE victims (rows survive), got %v", res.Victims)
+	}
+	if len(res.SetNullRows) != 1 || res.SetNullRows[0].PKValues != "10" || res.SetNullRows[0].Column != "pid" {
+		t.Fatalf("want one SET NULL restore for child:10 column pid, got %+v", res.SetNullRows)
+	}
+	if got := cascadeValToStr(res.SetNullRows[0].Value); got != "1" {
+		t.Errorf("restore value should be the parent key 1, got %q", got)
+	}
+	for _, sr := range res.SetNullRows {
+		if sr.PKValues == "13" {
+			t.Errorf("re-pointed child 13 must NOT be a SET NULL restore")
+		}
+	}
+}
+
+func cascadeValToStr(v any) string { return fmt.Sprintf("%v", v) }
 
 // TestSynthesizeVictims_compositeFKSkipped pins the composite-FK guard: a
 // multi-column CASCADE FK cannot be reconstructed by the single-column victim

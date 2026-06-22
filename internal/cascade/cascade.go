@@ -18,9 +18,12 @@
 // the existing recovery generator turns it into a restoring INSERT with no new
 // SQL path.
 //
-// Scope: Phase-1, binlog-history only — no baseline fallback yet, so a child
-// untouched within the lookback window is not reconstructed (Phase-2 baseline
-// fallback is deferred, #548). Design: drafts/cascade-recovery-port-2026-06-21.md.
+// ON DELETE SET NULL is handled too: the child row survives with its FK nulled,
+// so it becomes an idempotent restoring UPDATE (SetNullRestore) rather than an
+// INSERT. Phase-1 reconstructs children with a binlog event in the lookback
+// window; Phase-2 (a BaselineProvider) additionally recovers children present in
+// a baseline snapshot but untouched since. Design:
+// drafts/cascade-recovery-port-2026-06-21.md.
 package cascade
 
 import (
@@ -126,8 +129,21 @@ func (o Options) withDefaults() Options {
 // operational failure (e.g. an index query failed) that ALSO leaves Victims
 // partial; it is reported in Incomplete too, so checking either suffices.
 type Result struct {
-	Victims    []query.ResultRow
-	Incomplete []string
+	Victims     []query.ResultRow
+	SetNullRows []SetNullRestore
+	Incomplete  []string
+}
+
+// SetNullRestore describes a child whose foreign key an ON DELETE SET NULL
+// cascade nulled (MySQL ≤8.x never logs it). Unlike a CASCADE victim the row
+// still EXISTS — only its FK column was nulled — so recovery is an idempotent
+// UPDATE (restore Column = Value WHERE pk… AND Column IS NULL), not an INSERT.
+// The command renders it via recovery.FormatSetNullRestore.
+type SetNullRestore struct {
+	Schema, Table, Column string
+	Value                 any            // the parent key to restore into the FK column
+	PKValues              string         // dedup key (matches binlog pk_values)
+	Row                   map[string]any // last-known child row (for the PK WHERE)
 }
 
 // Complete reports whether the reconstruction covered everything it could find.
@@ -156,10 +172,12 @@ func SynthesizeVictims(
 	opts = opts.withDefaults()
 
 	var (
-		victims    []query.ResultRow
-		incomplete []string
-		errs       []error
+		victims     []query.ResultRow
+		setNullRows []SetNullRestore
+		incomplete  []string
+		errs        []error
 	)
+	setNullSeen := map[string]bool{} // "schema.table|pkvalues" → SET NULL restore emitted
 	// addIncomplete records a coverage caveat once per distinct key, so a wide
 	// cascade (many parent×FK iterations) cannot flood the list with near-
 	// identical strings and bury the important ones.
@@ -181,13 +199,15 @@ func SynthesizeVictims(
 		colsPerConstraint[fk.Schema+"."+fk.Table+"."+fk.ConstraintName]++
 	}
 
-	// Index CASCADE edges by the parent (referenced) table they protect.
-	// Gate on DeleteRule == "CASCADE" ONLY: dbtrail conflates delete_rule/
-	// update_rule (data_plane_router.py:2793), which runs DELETE synthesis on
-	// ON UPDATE CASCADE edges — a bug we deliberately do not port.
+	// Index CASCADE and SET NULL edges by the parent (referenced) table they
+	// protect. Gate on the DELETE rule ONLY: dbtrail conflates delete_rule/
+	// update_rule (data_plane_router.py:2793), which runs synthesis on ON UPDATE
+	// CASCADE edges — a bug we deliberately do not port. The emit branch (per
+	// edge) turns CASCADE into a DELETE→INSERT victim and SET NULL into an
+	// idempotent FK-restoring UPDATE.
 	byParent := map[string][]CascadeFK{}
 	for _, fk := range fks {
-		if fk.DeleteRule != "CASCADE" {
+		if fk.DeleteRule != "CASCADE" && fk.DeleteRule != "SET NULL" {
 			continue
 		}
 		ckey := fk.Schema + "." + fk.Table + "." + fk.ConstraintName
@@ -344,6 +364,22 @@ func SynthesizeVictims(
 						// Re-parented before the delete → it survived.
 						continue
 					}
+					if fk.DeleteRule == "SET NULL" {
+						// The child survives; only its FK was nulled. Restore it
+						// with an idempotent UPDATE (rendered with an `IS NULL`
+						// guard by the command) and do NOT recurse — no row was
+						// deleted, so nothing cascades from it.
+						skey := fk.Schema + "." + fk.Table + "|" + cev.PKValues
+						if setNullSeen[skey] {
+							continue
+						}
+						setNullSeen[skey] = true
+						setNullRows = append(setNullRows, SetNullRestore{
+							Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
+							Value: refVal, PKValues: cev.PKValues, Row: cev.RowAfter,
+						})
+						continue
+					}
 					vkey := fk.Schema + "." + fk.Table + "|" + cev.PKValues
 					if emitted[vkey] {
 						// Reached via another cascade path (diamond / multiple FKs
@@ -398,6 +434,18 @@ func SynthesizeVictims(
 							if touched[br.PKValues] {
 								continue // touched since baseline → handled by the binlog path
 							}
+							if fk.DeleteRule == "SET NULL" {
+								skey := fk.Schema + "." + fk.Table + "|" + br.PKValues
+								if setNullSeen[skey] {
+									continue
+								}
+								setNullSeen[skey] = true
+								setNullRows = append(setNullRows, SetNullRestore{
+									Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
+									Value: refVal, PKValues: br.PKValues, Row: br.Row,
+								})
+								continue
+							}
 							vkey := fk.Schema + "." + fk.Table + "|" + br.PKValues
 							if emitted[vkey] {
 								continue
@@ -424,7 +472,7 @@ func SynthesizeVictims(
 		}
 		layer = next
 	}
-	return Result{Victims: victims, Incomplete: incomplete}, errors.Join(errs...)
+	return Result{Victims: victims, SetNullRows: setNullRows, Incomplete: incomplete}, errors.Join(errs...)
 }
 
 // LoadCascadeFKs reads the FK graph WITH referential rules from the INDEX's

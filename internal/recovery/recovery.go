@@ -398,6 +398,33 @@ func QuoteName(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
+// FormatSetNullRestore emits an idempotent UPDATE that restores a foreign-key
+// column an ON DELETE SET NULL cascade nulled (MySQL ≤8.x never logs it). It
+// sets fkCol back to value, but ONLY for the row still in the nulled state
+// (WHERE pk… AND fkCol IS NULL) — so a re-run, a manual fix, or a later re-point
+// of the child is never clobbered (the cascade synthesis can't tell a
+// re-pointed child from a still-nulled one, because the re-point event doesn't
+// match the fk=parent scan that found the candidate). pkCols + row supply the
+// PK predicate; value is the parent key (typed, so it renders as a numeric
+// literal for an integer FK rather than a quoted string).
+func FormatSetNullRestore(schema, table, fkCol string, value any, pkCols []metadata.ColumnMeta, row map[string]any) (string, error) {
+	if len(pkCols) == 0 {
+		return "", fmt.Errorf("no PK columns for %s.%s SET NULL restore", schema, table)
+	}
+	where := make([]string, 0, len(pkCols)+1)
+	for _, c := range pkCols {
+		v, ok := row[c.Name]
+		if !ok {
+			return "", fmt.Errorf("PK column %q absent from %s.%s row for SET NULL restore", c.Name, schema, table)
+		}
+		where = append(where, QuoteName(c.Name)+" = "+FormatSQLValue(v))
+	}
+	where = append(where, QuoteName(fkCol)+" IS NULL")
+	return fmt.Sprintf("UPDATE %s.%s SET %s = %s WHERE %s",
+		QuoteName(schema), QuoteName(table), QuoteName(fkCol), FormatSQLValue(value),
+		strings.Join(where, " AND ")), nil
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func sortedKeys(m map[string]any) []string {

@@ -199,15 +199,22 @@ Reversed: undo the 14:03 UPDATE first, then the 14:02 UPDATE, then the 14:01 INS
 > warn about them and proceed (cascade schemas index normally). To reconstruct
 > cascade-deleted rows, use **`bintrail recover-cascade`** (see below).
 
-### `recover-cascade`: reverse FK ON DELETE CASCADE
+### `recover-cascade`: reverse FK ON DELETE CASCADE / SET NULL
 
-`bintrail recover-cascade` reconstructs rows that an InnoDB `ON DELETE CASCADE`
-removed but never binlogged. It finds the deleted parent rows in the index,
-infers which child rows referenced them in their last indexed state, and emits
-reversal SQL that re-inserts **both** the parents and their cascade-deleted
-descendants (recursing through multi-level cascades), wrapped in
-`SET FOREIGN_KEY_CHECKS=0/1`. Like `recover`, it only generates SQL — review
-before applying.
+`bintrail recover-cascade` reconstructs the side effects of an InnoDB
+`ON DELETE CASCADE` or `ON DELETE SET NULL` that were never binlogged. It finds
+the deleted parent rows in the index, infers which child rows referenced them in
+their last indexed state, and emits reversal SQL:
+
+- **ON DELETE CASCADE** → re-inserts **both** the parents and their
+  cascade-deleted descendants (recursing through multi-level cascades).
+- **ON DELETE SET NULL** → an **idempotent** `UPDATE` restoring each nulled FK,
+  guarded by `... AND fk IS NULL` so a re-run, a manual fix, or a later re-point
+  of the child is never clobbered (the child row survives — only its FK was
+  nulled — so it is not re-inserted).
+
+All wrapped in `SET FOREIGN_KEY_CHECKS=0/1`. Like `recover`, it only generates
+SQL — review before applying.
 
 ```bash
 bintrail recover-cascade --index-dsn "..." \
