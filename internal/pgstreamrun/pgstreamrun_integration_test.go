@@ -630,7 +630,7 @@ func TestOne_PGTypeRoundTripMatrix(t *testing.T) {
 		{"double", "double precision", "2.5"},
 		{"text_tricky", "text", `'O''Brien \ C:\back'`}, // quote + backslash escaping
 		{"varchar", "varchar(32)", "'hello world'"},
-		{"char", "char(5)", "'ab'"}, // blank-padded
+		{"char", "char(5)", "'ab'"}, // trailing blanks are insignificant in bpchar (trimmed on ::text); proves coercion, not padding-through-capture
 		{"boolean", "boolean", "true"},
 		{"uuid", "uuid", "'11111111-2222-3333-4444-555555555555'"},
 		{"bytea", "bytea", `'\xdeadbeef00'`},
@@ -733,7 +733,6 @@ func TestOne_PGTypeRoundTripMatrix(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			tbl := tblOf(c.name)
 			rows, err := query.New(indexDB).Fetch(ctx, query.Options{Schema: "public", Table: tbl, Order: "ASC"})

@@ -302,13 +302,13 @@ The following types are **round-trip tested** — insert → capture → index �
 | Category | Types | Notes |
 |---|---|---|
 | Integer | `smallint`, `integer`, `bigint` | exact |
-| Arbitrary precision | `numeric` / `decimal` | full **precision and scale** preserved — values > 2^53 and trailing zeros (`1.50`) survive |
+| Arbitrary precision | `numeric` (`decimal` is its alias) | full **precision and scale** preserved — values > 2^53 and trailing zeros (`1.50`) survive |
 | Floating point | `real`, `double precision` | |
-| Character | `text`, `varchar(n)`, `char(n)` | single quotes and backslashes escaped correctly (`standard_conforming_strings`); `char(n)` blank-padding preserved |
+| Character | `text`, `varchar(n)`, `char(n)` | single quotes and backslashes escaped correctly (`standard_conforming_strings`); `char(n)` round-trips (trailing blanks are insignificant in `bpchar` — PostgreSQL trims them on cast to text) |
 | Boolean | `boolean` | |
 | UUID | `uuid` | |
 | Binary | `bytea` | hex (`\x…`) form |
-| JSON | `json`, `jsonb` | including embedded quotes |
+| JSON | `json`, `jsonb` | `jsonb` tested with an embedded quote |
 | Date / time | `date`, `time`, `timestamp`, `timestamptz`, `interval` | a `timestamptz`'s text form follows the server timezone (consistent within an instance) |
 | Network | `inet`, `cidr`, `macaddr` | |
 | Bit string | `bit(n)`, `varbit` | |
@@ -342,10 +342,11 @@ your own round-trip.
   SRID and round-trips losslessly back into PostgreSQL — the target just needs
   PostGIS installed. (Set `REPLICA IDENTITY FULL` as for any table; large
   geometries are TOASTed, so FULL matters.)
-- **Other extension/custom types** (`vector`/pgvector, enums, ranges, composite
-  types) are captured **as their text representation**. Recovery into a target
-  that has the same extension installed works; treat exotic types as
-  best-effort and test your round-trip.
+- **Other extension/custom types** (`vector`/pgvector, composite types) are
+  captured **as their text representation**. Recovery into a target that has the
+  same extension installed works; treat exotic types as best-effort and test your
+  round-trip. (Enums and ranges are round-trip tested — see the
+  [Type support](#type-support) matrix.)
 - **TimescaleDB hypertables are out of scope.** Logical decoding emits the
   underlying *chunk* tables (`_timescaledb_internal._hyper_*`), not the
   hypertable, so a hypertable is not captured coherently in this release.
