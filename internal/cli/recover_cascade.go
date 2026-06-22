@@ -28,8 +28,9 @@ var recoverCascadeCmd = &cobra.Command{
 	Long: `Reconstruct rows that an InnoDB foreign-key ON DELETE CASCADE removed but
 never wrote to the binary log.
 
-On MySQL <= 8.x (and MariaDB) InnoDB runs FK cascades below the binlog, so only
-the parent DELETE is logged — the cascaded child deletes are invisible to plain
+On MySQL <= 8.x and MariaDB, InnoDB runs FK cascades below the binlog (fixed in
+MySQL 9.6), so only the parent DELETE is logged — the cascaded child deletes are
+invisible to plain
 ` + "`recover`" + ` (MySQL Bug #32506). This command finds the deleted parent rows in
 the index, infers which child rows referenced them in their last indexed state,
 and emits reversal SQL that re-inserts BOTH the parent rows and their
@@ -38,7 +39,7 @@ cascade-deleted descendants, wrapped in SET FOREIGN_KEY_CHECKS=0/1.
 It NEVER executes SQL — review the dry-run/output before applying.
 
 Phase-1 (binlog-window) recovery: a child untouched within --lookback and not in
-a baseline cannot be reconstructed (baseline fallback is tracked in #548/#552).
+a baseline cannot be reconstructed (baseline fallback is tracked in #552).
 The command searches the live index only — archived partitions are not scanned;
 when they exist, the output is flagged incomplete.
 
@@ -168,17 +169,33 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("fetch parent deletes: %w", err)
 	}
 
-	// Coverage caveats accumulate here (detectable gaps only); the always-on
-	// Phase-1 scope note is separate and printed unconditionally.
+	// Coverage caveats accumulate here (detectable gaps that gate exit); the
+	// always-on Phase-1 scope note is separate and printed unconditionally.
 	var caveats []string
 
-	// Live-only trap: if the index has archived partitions, a parent or child
-	// whose events were rotated out is invisible here. Signal it rather than
-	// let "nothing found" read as "nothing to recover".
+	// A plain empty match is legitimately "complete", but the operator must not
+	// read silence as "nothing was deleted" — it could be a wrong filter.
+	if len(parentDeletes) == 0 {
+		slog.Warn("no parent DELETE events matched in the live index; verify --schema/--table/--pk/--since/--until")
+	}
+
+	// Live-only trap: cascade recovery searches the LIVE index only.
+	//   - probe failure  → we cannot tell whether archives exist → coverage
+	//     unknown (hard caveat).
+	//   - archives exist AND nothing matched live → the deleted parent may itself
+	//     be archived → hard caveat (the dangerous "nothing found" case).
+	//   - archives exist but parents WERE found → a child whose events were
+	//     archived could still be missed → a visible warning, NOT a hard caveat:
+	//     otherwise every archived deployment trips INCOMPLETE on every run and
+	//     --allow-incomplete becomes routine, masking the real coverage gaps.
 	if archives, aerr := query.ResolveArchiveSources(cmd.Context(), db); aerr != nil {
-		slog.Warn("could not check for archived partitions", "error", aerr)
+		caveats = append(caveats, "could not determine whether archived partitions exist (probe failed: "+aerr.Error()+"); coverage is unknown")
 	} else if len(archives) > 0 {
-		caveats = append(caveats, "the index has archived partitions, which cascade recovery does NOT search (live index only); events rotated out may be missed")
+		if len(parentDeletes) == 0 {
+			caveats = append(caveats, "no parent DELETE matched in the live index, but the index has archived partitions (cascade recovery does NOT search them); the deleted parent may be archived")
+		} else {
+			slog.Warn("index has archived partitions, which cascade recovery does NOT search (live index only); a child whose events were archived may be missed")
+		}
 	}
 
 	if len(parentDeletes) >= rcLimit {
@@ -226,23 +243,34 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 			}
 		}
 		out := struct {
-			Parents    int      `json:"parents"`
-			Children   int      `json:"children"`
-			Statements int      `json:"statements"`
-			Complete   bool     `json:"complete"`
-			Incomplete []string `json:"incomplete,omitempty"`
-			Output     string   `json:"output,omitempty"`
-			SQL        string   `json:"sql,omitempty"`
+			Parents          int      `json:"parents"`
+			Children         int      `json:"children"`
+			Statements       int      `json:"statements"`
+			Complete         bool     `json:"complete"`
+			OperationalError bool     `json:"operational_error,omitempty"`
+			Incomplete       []string `json:"incomplete,omitempty"`
+			Output           string   `json:"output,omitempty"`
+			SQL              string   `json:"sql,omitempty"`
 		}{
 			Parents: len(parentDeletes), Children: len(res.Victims), Statements: n,
-			Complete: len(caveats) == 0 && synthErr == nil, Incomplete: caveats,
-			Output: rcOutput,
+			Complete: len(caveats) == 0 && synthErr == nil, OperationalError: synthErr != nil,
+			Incomplete: caveats, Output: rcOutput,
 		}
 		if rcOutput == "" {
 			out.SQL = buf.String()
 		}
-		// JSON carries `complete`; the consumer branches on it, so exit 0.
-		return cliutil.OutputJSON(out)
+		if err := cliutil.OutputJSON(out); err != nil {
+			return err
+		}
+		// Same exit contract as text mode: the `complete` field is on stdout, but
+		// a consumer gating on EXIT CODE must still see a non-zero exit when the
+		// recovery is partial. Returning an error here makes the root emit
+		// {"error":...} to stderr while the result stays on stdout (#568 review).
+		dest := "stdout"
+		if rcOutput != "" {
+			dest = rcOutput
+		}
+		return cascadeExit(dest, synthErr, caveats, rcAllowIncomplete)
 	}
 
 	var w io.Writer = os.Stdout
@@ -283,12 +311,19 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 		"complete", len(caveats) == 0 && synthErr == nil,
 		"output", dest, "duration_ms", time.Since(start).Milliseconds())
 
-	// An operational failure always exits non-zero. Coverage gaps exit non-zero
-	// unless the operator opted in with --allow-incomplete.
+	return cascadeExit(dest, synthErr, caveats, rcAllowIncomplete)
+}
+
+// cascadeExit returns the error the command should end with, shared by text and
+// JSON modes so the exit-code contract is identical: an operational failure
+// always exits non-zero (even with --allow-incomplete); detectable coverage
+// gaps exit non-zero unless --allow-incomplete. The SQL is already durable by
+// the time this is called, so the error reports "written but partial".
+func cascadeExit(dest string, synthErr error, caveats []string, allowIncomplete bool) error {
 	if synthErr != nil {
 		return fmt.Errorf("SQL written to %s but synthesis hit an operational failure (result is partial): %w", dest, synthErr)
 	}
-	if len(caveats) > 0 && !rcAllowIncomplete {
+	if len(caveats) > 0 && !allowIncomplete {
 		return fmt.Errorf("SQL written to %s but the recovery is INCOMPLETE (%d caveat(s) above); review, then re-run with --allow-incomplete to exit 0", dest, len(caveats))
 	}
 	return nil

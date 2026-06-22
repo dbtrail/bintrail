@@ -100,28 +100,45 @@ func TestRecoverCascade_endToEnd(t *testing.T) {
 	if strings.Contains(sql, "INCOMPLETE RECOVERY") {
 		t.Errorf("clean cascade should not be flagged incomplete\n---\n%s", sql)
 	}
+
+	// 0 parent deletes (a --pk that matches nothing), no archives: a legitimately
+	// empty result is complete and exits 0 (the operator gets a stderr warning).
+	rcPK = "999"
+	if err := runCascadeCmd(t); err != nil {
+		t.Errorf("0 matched parents with no archives must exit 0, got: %v", err)
+	}
 }
 
-// TestRecoverCascade_incompleteExit proves that a detectable coverage gap (here:
-// the index has archived partitions the live-only search can't see) flags the
-// output incomplete and makes the command exit non-zero unless --allow-incomplete.
-func TestRecoverCascade_incompleteExit(t *testing.T) {
-	testutil.SkipIfNoMySQL(t)
-	db, dbName, dsn := seedCascadeIndex(t)
-
-	// An archive_state row with an S3 location makes ResolveArchiveSources
-	// return non-empty (no disk dependency), tripping the live-only caveat.
+// addArchiveRow makes ResolveArchiveSources return non-empty (no disk
+// dependency) by registering an S3-located archived partition.
+func addArchiveRow(t *testing.T, db *sql.DB) {
+	t.Helper()
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(bintrail_id, partition_name, s3_bucket, s3_key)
 		VALUES ('bt', 'p_2026010100', 'bucket', 'bintrail_id=bt/p_2026010100/data.parquet')`)
+}
 
-	out := t.TempDir() + "/cascade.sql"
+// cleanCascadeFlags sets every recover-cascade global to a valid baseline for an
+// integration run, so no stale value leaks in from another test.
+func cleanCascadeFlags(dsn, dbName, out string) {
 	rcIndexDSN, rcSchema, rcTable = dsn, dbName, "parent"
 	rcPK, rcPKs, rcSince, rcUntil = "", nil, "", ""
 	rcOutput, rcDryRun, rcFormat = out, false, "text"
-	rcLookback, rcMaxDepth, rcLimit = "30d", 5, 1000
+	rcLookback, rcMaxDepth, rcLimit, rcAllowIncomplete = "30d", 5, 1000, false
+}
 
-	// Without --allow-incomplete: SQL is still written, but the command errors.
+// TestRecoverCascade_incompleteExit proves the dangerous "nothing found" case:
+// 0 live parents matched BUT the index has archived partitions (not searched) →
+// flagged incomplete, exit non-zero unless --allow-incomplete; SQL still written.
+func TestRecoverCascade_incompleteExit(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName, dsn := seedCascadeIndex(t)
+	addArchiveRow(t, db)
+
+	out := t.TempDir() + "/cascade.sql"
+	cleanCascadeFlags(dsn, dbName, out)
+	rcPK = "999" // matches no live parent → the "nothing found, but archives exist" trap
+
 	rcAllowIncomplete = false
 	err := runCascadeCmd(t)
 	if err == nil {
@@ -138,9 +155,54 @@ func TestRecoverCascade_incompleteExit(t *testing.T) {
 		t.Errorf("output should carry the incomplete header")
 	}
 
-	// With --allow-incomplete: same output, but exit 0.
 	rcAllowIncomplete = true
 	if err := runCascadeCmd(t); err != nil {
 		t.Fatalf("--allow-incomplete should exit 0, got: %v", err)
+	}
+}
+
+// TestRecoverCascade_archivesWithParentsNotBlocking pins the cry-wolf fix: when
+// parents ARE found, the presence of archives is a warning, NOT a hard caveat —
+// so a routine archived deployment doesn't force --allow-incomplete (which would
+// mask the real coverage gaps). Also exercises --pk filtering (pk=1 matches).
+func TestRecoverCascade_archivesWithParentsNotBlocking(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName, dsn := seedCascadeIndex(t)
+	addArchiveRow(t, db)
+
+	out := t.TempDir() + "/cascade.sql"
+	cleanCascadeFlags(dsn, dbName, out)
+	rcPK = "1" // matches the seeded parent delete → parents found
+
+	if err := runCascadeCmd(t); err != nil {
+		t.Fatalf("archives present but parents found must NOT block (cry-wolf), got: %v", err)
+	}
+	b, _ := os.ReadFile(out)
+	if strings.Contains(string(b), "INCOMPLETE RECOVERY") {
+		t.Errorf("found-parents + archives must not flag INCOMPLETE\n---\n%s", string(b))
+	}
+}
+
+// TestRecoverCascade_jsonExitParity pins the #568 fix: --format json must honor
+// the same exit contract as text — a partial result exits non-zero (the body's
+// `complete:false` is on stdout, but consumers gating on exit code must see it).
+func TestRecoverCascade_jsonExitParity(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName, dsn := seedCascadeIndex(t)
+	addArchiveRow(t, db)
+
+	out := t.TempDir() + "/cascade.sql"
+	cleanCascadeFlags(dsn, dbName, out)
+	rcFormat = "json"
+	rcPK = "999" // 0 parents + archives → incomplete
+
+	rcAllowIncomplete = false
+	if err := runCascadeCmd(t); err == nil {
+		t.Fatal("JSON mode must exit non-zero when incomplete, like text mode (#568)")
+	}
+	// --allow-incomplete suppresses the coverage-gap exit in JSON mode too.
+	rcAllowIncomplete = true
+	if err := runCascadeCmd(t); err != nil {
+		t.Fatalf("JSON + --allow-incomplete should exit 0, got: %v", err)
 	}
 }
