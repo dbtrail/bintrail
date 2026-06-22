@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,8 +21,63 @@ import (
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 	"github.com/dbtrail/dbtrail/internal/recovery"
 )
+
+// cascadeBaselineProvider implements cascade.BaselineProvider over
+// internal/reconstruct: it finds the child table's baseline snapshot, scans it
+// for rows referencing the deleted parent, and encodes each row's PK to match
+// binlog_events.pk_values so the cascade engine can dedup against Phase-1.
+type cascadeBaselineProvider struct {
+	source   string             // local dir or s3:// prefix
+	resolver *metadata.Resolver // for child PK columns
+}
+
+func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, table, fkCol, parentPK string, at time.Time, limit int) (cascade.BaselineLookup, bool, error) {
+	path, snap, _, err := reconstruct.FindBaseline(ctx, p.source, schema, table, at)
+	if err != nil {
+		if errors.Is(err, reconstruct.ErrNoBaseline) {
+			return cascade.BaselineLookup{}, false, nil // table not covered → Phase-1 only
+		}
+		return cascade.BaselineLookup{}, false, err
+	}
+	// Fetch one more than the cap so truncation is observable.
+	fetch := 0
+	if limit > 0 {
+		fetch = limit + 1
+	}
+	rows, err := reconstruct.ReadBaselineRows(ctx, path, map[string]string{fkCol: parentPK}, fetch)
+	if err != nil {
+		return cascade.BaselineLookup{}, false, err
+	}
+	trunc := false
+	if limit > 0 && len(rows) > limit {
+		trunc = true
+		rows = rows[:limit]
+	}
+
+	tm, err := p.resolver.Resolve(schema, table)
+	if err != nil {
+		return cascade.BaselineLookup{}, false, fmt.Errorf("resolve %s.%s PK for baseline: %w", schema, table, err)
+	}
+	pkCols := tm.PKColumnMetas()
+
+	out := make([]cascade.BaselineRow, 0, len(rows))
+	for _, r := range rows {
+		// Canonicalize PK values the same way the indexer encoded pk_values, so
+		// the dedup key matches a Phase-1 victim's PKValues exactly.
+		canon, cerr := reconstruct.CanonicalizePKMap(r, pkCols)
+		if cerr != nil {
+			return cascade.BaselineLookup{}, false, fmt.Errorf("canonicalize baseline PK for %s.%s: %w", schema, table, cerr)
+		}
+		out = append(out, cascade.BaselineRow{
+			PKValues: event.BuildPKValues(pkCols, canon),
+			Row:      r,
+		})
+	}
+	return cascade.BaselineLookup{SnapshotTime: snap, Rows: out, Truncated: trunc}, true, nil
+}
 
 var recoverCascadeCmd = &cobra.Command{
 	Use:   "recover-cascade",
@@ -71,6 +128,8 @@ var (
 	rcMaxDepth        int
 	rcLimit           int
 	rcAllowIncomplete bool
+	rcBaselineDir     string
+	rcBaselineS3      string
 )
 
 func init() {
@@ -89,6 +148,8 @@ func init() {
 	f.IntVar(&rcMaxDepth, "max-depth", 5, "Maximum cascade recursion depth (parent -> child -> grandchild ...)")
 	f.IntVar(&rcLimit, "limit", 1000, "Maximum number of parent DELETE events to process")
 	f.BoolVar(&rcAllowIncomplete, "allow-incomplete", false, "Exit 0 even when the reconstruction is provably partial (coverage gaps only; an operational failure still exits non-zero)")
+	f.StringVar(&rcBaselineDir, "baseline-dir", "", "Local baseline-snapshot directory for Phase-2 fallback (recovers children untouched within the lookback window)")
+	f.StringVar(&rcBaselineS3, "baseline-s3", "", "S3 baseline-snapshot prefix (s3://bucket/prefix) for Phase-2 fallback; alternative to --baseline-dir")
 	_ = recoverCascadeCmd.MarkFlagRequired("index-dsn")
 	_ = recoverCascadeCmd.MarkFlagRequired("schema")
 	_ = recoverCascadeCmd.MarkFlagRequired("table")
@@ -202,6 +263,22 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 		caveats = append(caveats, fmt.Sprintf("parent DELETE events were capped at --limit=%d; narrow --pk/--since/--until or raise --limit", rcLimit))
 	}
 
+	// Phase-2 baseline fallback provider — enabled when --baseline-dir or
+	// --baseline-s3 is set AND a schema snapshot is available (needed to encode
+	// each baseline row's PK to match binlog pk_values).
+	var baselineProvider cascade.BaselineProvider
+	baselineSrc := rcBaselineDir
+	if baselineSrc == "" {
+		baselineSrc = rcBaselineS3
+	}
+	if baselineSrc != "" {
+		if resolver == nil {
+			slog.Warn("baseline source set but no schema snapshot is available; Phase-2 fallback disabled (run `bintrail snapshot`)")
+		} else {
+			baselineProvider = &cascadeBaselineProvider{source: baselineSrc, resolver: resolver}
+		}
+	}
+
 	// ── Synthesize the cascade victims ────────────────────────────────────────
 	var res cascade.Result
 	var synthErr error
@@ -213,6 +290,7 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 		res, synthErr = cascade.SynthesizeVictims(cmd.Context(), eng, fks, parentDeletes, cascade.Options{
 			Lookback: lookback,
 			MaxDepth: rcMaxDepth,
+			Baseline: baselineProvider,
 		})
 	}
 	caveats = append(caveats, res.Incomplete...)
@@ -224,11 +302,12 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 
 	// ── Emit ──────────────────────────────────────────────────────────────────
 	hdr := cascadeHeader{
-		schema:   rcSchema,
-		table:    rcTable,
-		parents:  len(parentDeletes),
-		children: len(res.Victims),
-		caveats:  caveats,
+		schema:         rcSchema,
+		table:          rcTable,
+		parents:        len(parentDeletes),
+		children:       len(res.Victims),
+		caveats:        caveats,
+		baselineActive: baselineProvider != nil,
 	}
 
 	if rcFormat == "json" {
@@ -334,6 +413,7 @@ type cascadeHeader struct {
 	schema, table     string
 	parents, children int
 	caveats           []string
+	baselineActive    bool
 }
 
 // emitCascadeSQL writes the documented preamble, the FK-checks-off wrapper, and
@@ -344,9 +424,15 @@ func emitCascadeSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow
 	fmt.Fprintf(&b, "-- Re-inserts %d deleted parent row(s) and %d cascade-deleted child row(s)\n", hdr.parents, hdr.children)
 	b.WriteString("-- that InnoDB removed below the binlog (MySQL Bug #32506). NEVER auto-applied.\n")
 	b.WriteString("--\n")
-	b.WriteString("-- Phase-1 (binlog-window) recovery: a child untouched within --lookback and not\n")
-	b.WriteString("-- in a baseline is NOT reconstructed (baseline fallback: #552). \"Complete\" means\n")
-	b.WriteString("-- everything DETECTABLE was recovered, not that no row was missed.\n")
+	if hdr.baselineActive {
+		b.WriteString("-- Phase-2 baseline fallback ACTIVE: children present in a covered baseline are\n")
+		b.WriteString("-- reconstructed even if untouched within the window. Tables NOT covered by a\n")
+		b.WriteString("-- baseline are flagged above. \"Complete\" means everything DETECTABLE was recovered.\n")
+	} else {
+		b.WriteString("-- Phase-1 (binlog-window) recovery: a child untouched within --lookback and not\n")
+		b.WriteString("-- in a baseline is NOT reconstructed — pass --baseline-dir/--baseline-s3 to enable\n")
+		b.WriteString("-- Phase-2 fallback (#552). \"Complete\" means everything DETECTABLE was recovered.\n")
+	}
 	b.WriteString("--\n")
 	b.WriteString("-- If you have already re-created a deleted parent, delete its INSERT below:\n")
 	b.WriteString("-- SET FOREIGN_KEY_CHECKS=0 does NOT suppress PRIMARY KEY violations.\n")

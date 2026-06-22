@@ -267,6 +267,13 @@ func canonicalizePKMap(row map[string]any, pkCols []metadata.ColumnMeta) (map[st
 // their binlog-only path when it isn't supported.
 func SupportedPKType(dataType string) bool { return supportedPKType(dataType) }
 
+// CanonicalizePKMap is the exported form of canonicalizePKMap, for callers
+// outside this package (cascade Phase-2) that must encode a baseline Parquet
+// row's primary key to match binlog_events.pk_values for deduplication.
+func CanonicalizePKMap(row map[string]any, pkCols []metadata.ColumnMeta) (map[string]any, error) {
+	return canonicalizePKMap(row, pkCols)
+}
+
 // supportedPKType returns true if dataType is in the set of PK column types
 // that canonicalizePKValue handles correctly. Callers use this at the start
 // of a reconstruct run to warn operators about edge cases.

@@ -57,6 +57,20 @@ func FindBaseline(ctx context.Context, source, schema, table string, at time.Tim
 // first row matching pkFilter (column name → value string). Returns nil when
 // no row matches. Loads the httpfs extension automatically for s3:// paths.
 func ReadBaselineRow(ctx context.Context, path string, pkFilter map[string]string) (map[string]any, error) {
+	rows, err := ReadBaselineRows(ctx, path, pkFilter, 1)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	return rows[0], nil
+}
+
+// ReadBaselineRows returns every baseline row matching filter (an arbitrary
+// column→value map, AND-ed), up to limit rows (limit <= 0 = no cap). Unlike
+// ReadBaselineRow it is not restricted to the primary key, so cascade Phase-2
+// can scan a child snapshot by a foreign-key column and recover ALL matching
+// children. Values are bound as query parameters; column names are quoted
+// identifiers; the path is single-quote-escaped.
+func ReadBaselineRows(ctx context.Context, path string, filter map[string]string, limit int) ([]map[string]any, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, fmt.Errorf("open duckdb: %w", err)
@@ -74,7 +88,7 @@ func ReadBaselineRow(ctx context.Context, path string, pkFilter map[string]strin
 	}
 
 	// Build sorted conditions for deterministic SQL + arg ordering.
-	conds := buildCondsList(pkFilter)
+	conds := buildCondsList(filter)
 	safePath := strings.ReplaceAll(path, "'", "''")
 	q := "SELECT * FROM parquet_scan('" + safePath + "')"
 	if len(conds) > 0 {
@@ -84,7 +98,9 @@ func ReadBaselineRow(ctx context.Context, path string, pkFilter map[string]strin
 		}
 		q += " WHERE " + strings.Join(parts, " AND ")
 	}
-	q += " LIMIT 1"
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
 
 	args := make([]any, len(conds))
 	for i, c := range conds {
@@ -101,23 +117,23 @@ func ReadBaselineRow(ctx context.Context, path string, pkFilter map[string]strin
 	if err != nil {
 		return nil, fmt.Errorf("baseline columns: %w", err)
 	}
-	if !rows.Next() {
-		return nil, rows.Err() // nil when simply no rows; non-nil on iteration error
+	var out []map[string]any
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, fmt.Errorf("scan baseline row: %w", err)
+		}
+		row := make(map[string]any, len(cols))
+		for i, col := range cols {
+			row[col] = vals[i]
+		}
+		out = append(out, row)
 	}
-
-	vals := make([]any, len(cols))
-	ptrs := make([]any, len(cols))
-	for i := range vals {
-		ptrs[i] = &vals[i]
-	}
-	if err := rows.Scan(ptrs...); err != nil {
-		return nil, fmt.Errorf("scan baseline row: %w", err)
-	}
-	row := make(map[string]any, len(cols))
-	for i, col := range cols {
-		row[col] = vals[i]
-	}
-	return row, rows.Err()
+	return out, rows.Err()
 }
 
 // ExecSQL runs arbitrary SQL against an in-memory DuckDB instance and returns

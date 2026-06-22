@@ -54,12 +54,46 @@ type CascadeFK struct {
 	UpdateRule       string // ON UPDATE rule
 }
 
+// BaselineRow is one child row from a baseline snapshot, with its primary key
+// pre-encoded as a pipe-delimited string matching binlog_events.pk_values. The
+// caller (which owns the schema resolver) computes PKValues, so the cascade
+// engine needs no metadata/parser dependency.
+type BaselineRow struct {
+	PKValues string         // pipe-delimited, matches binlog_events.pk_values
+	Row      map[string]any // full column image → becomes the recovery INSERT
+}
+
+// BaselineLookup is the Phase-2 result for one (child table, parent-key) scan.
+type BaselineLookup struct {
+	SnapshotTime time.Time     // start of the delta window (widens the binlog scan)
+	Rows         []BaselineRow // child rows that referenced the parent at the snapshot
+	Truncated    bool          // more rows matched than the requested limit
+}
+
+// BaselineProvider supplies Phase-2 baseline fallback: the child rows that
+// referenced a deleted parent at the most recent baseline snapshot. It is
+// implemented by the command over internal/reconstruct; the cascade engine
+// depends only on this interface, so the Phase-1/Phase-2 merge logic is
+// unit-testable against a fake with canned rows (no Parquet fixture).
+type BaselineProvider interface {
+	// BaselineChildren returns the snapshot time and the child rows where
+	// fkCol == parentPK in the newest complete baseline for (schema, table) at
+	// or before `at`, capped at limit. ok is false when no baseline covers the
+	// table (the caller then runs Phase-1 only for it).
+	BaselineChildren(ctx context.Context, schema, table, fkCol, parentPK string, at time.Time, limit int) (lookup BaselineLookup, ok bool, err error)
+}
+
 // Options tunes the synthesis. Zero values fall back to the dbtrail SaaS
 // constants via withDefaults.
 type Options struct {
 	Lookback       time.Duration // how far before the parent delete to look for child state
 	MaxDepth       int           // multi-level cascade recursion cap
 	CandidateLimit int           // max child candidate rows per (parent event, FK)
+	// Baseline, when non-nil, enables Phase-2: untouched children present in a
+	// baseline snapshot (no binlog event within the window) are also recovered,
+	// and the binlog scan window is widened to the snapshot time. nil = Phase-1
+	// only (binlog-history within Lookback).
+	Baseline BaselineProvider
 }
 
 func (o Options) withDefaults() Options {
@@ -201,7 +235,6 @@ func SynthesizeVictims(
 				continue
 			}
 
-			since := item.rootTS.Add(-opts.Lookback)
 			until := item.rootTS
 
 			for _, fk := range byParent[pev.SchemaName+"."+pev.TableName] {
@@ -217,11 +250,39 @@ func SynthesizeVictims(
 				}
 				parentPK := valToString(refVal)
 
+				// Phase-1 window; widened to the baseline snapshot below.
+				since := item.rootTS.Add(-opts.Lookback)
+
+				// Phase-2: look up the child rows that referenced this parent at
+				// the baseline snapshot. Widen the binlog window to the snapshot
+				// time so the scan catches every child touched SINCE the baseline;
+				// the untouched ones are added after the scan.
+				var (
+					baseRows    []BaselineRow
+					baseSnap    time.Time
+					baseTrunc   bool
+					baseCovered bool
+				)
+				if opts.Baseline != nil {
+					bl, covered, berr := opts.Baseline.BaselineChildren(ctx, fk.Schema, fk.Table, fk.Column, parentPK, item.rootTS, opts.CandidateLimit)
+					switch {
+					case berr != nil:
+						addIncomplete("baselinefail:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+							"baseline lookup failed for %s.%s (recovery may be partial): %v", fk.Schema, fk.Table, berr))
+					case covered:
+						baseCovered, baseSnap, baseRows, baseTrunc = true, bl.SnapshotTime, bl.Rows, bl.Truncated
+						since = bl.SnapshotTime
+					default:
+						addIncomplete("nobaseline:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+							"no baseline covers %s.%s; children untouched within the lookback window are not reconstructed", fk.Schema, fk.Table))
+					}
+				}
+
 				// Latest event per child PK that referenced this parent within the
-				// lookback window. LimitPerPK=1 keeps the timestamp-latest event
-				// per pk_values. Fetch one MORE than CandidateLimit so an overflow
-				// is observable — with LimitPerPK=1 a plain LIMIT=CandidateLimit
-				// caps at exactly the limit and hides truncation.
+				// window. LimitPerPK=1 keeps the timestamp-latest event per
+				// pk_values. Fetch one MORE than CandidateLimit so an overflow is
+				// observable — with LimitPerPK=1 a plain LIMIT=CandidateLimit caps
+				// at exactly the limit and hides truncation.
 				cands, qerr := eng.Fetch(ctx, query.Options{
 					Schema:     fk.Schema,
 					Table:      fk.Table,
@@ -243,14 +304,23 @@ func SynthesizeVictims(
 						"victim query for %s.%s failed (recovery is partial): %v", fk.Schema, fk.Table, qerr))
 					continue
 				}
+				binlogTrunc := false
 				if len(cands) > opts.CandidateLimit {
+					binlogTrunc = true
 					addIncomplete("truncate:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
 						"%s.%s has more than %d cascade victims for one parent; the excess (and their descendants) were NOT reconstructed",
 						fk.Schema, fk.Table, opts.CandidateLimit))
 					cands = cands[:opts.CandidateLimit]
 				}
 
+				// touched = every child PK with an event matching fk=parentPK in
+				// the window (before filtering). Baseline augmentation skips these:
+				// a touched child is fully handled by the binlog path (emitted, or
+				// correctly filtered as re-parented/deleted) — so a re-parented
+				// child is not resurrected from its stale baseline state.
+				touched := make(map[string]bool, len(cands))
 				for _, cev := range cands {
+					touched[cev.PKValues] = true
 					switch {
 					case cev.EventType == event.EventDelete:
 						// Already gone before the cascade fired.
@@ -285,6 +355,49 @@ func SynthesizeVictims(
 					victims = append(victims, victim)
 					// May itself be a parent (grandchildren); keep the SAME root T.
 					next = append(next, layerItem{ev: victim, rootTS: item.rootTS})
+				}
+
+				// Phase-2 augmentation: add the baseline children that referenced
+				// this parent but had NO event in the window (untouched since the
+				// snapshot). Their state at T is the baseline row verbatim — a child
+				// with any post-baseline event would appear in `touched` (its first
+				// event carries before=parentPK and matches the fk scan), so
+				// ∉touched means zero deltas. Skip entirely when the binlog scan
+				// truncated: `touched` is then incomplete and a truncated-out
+				// re-parented/deleted child would be wrongly resurrected.
+				if baseCovered && len(baseRows) > 0 {
+					switch {
+					case binlogTrunc:
+						addIncomplete("baseline-skip:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+							"binlog scan truncated for %s.%s; skipped baseline augmentation to avoid resurrecting stale rows",
+							fk.Schema, fk.Table))
+					default:
+						if baseTrunc {
+							addIncomplete("baseline-truncate:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+								"more than %d baseline children for %s.%s; some untouched children were NOT reconstructed",
+								opts.CandidateLimit, fk.Schema, fk.Table))
+						}
+						for _, br := range baseRows {
+							if touched[br.PKValues] {
+								continue // touched since baseline → handled by the binlog path
+							}
+							vkey := fk.Schema + "." + fk.Table + "|" + br.PKValues
+							if emitted[vkey] {
+								continue
+							}
+							emitted[vkey] = true
+							victim := query.ResultRow{
+								EventTimestamp: baseSnap, // baseline rows have no event of their own
+								SchemaName:     fk.Schema,
+								TableName:      fk.Table,
+								EventType:      event.EventDelete,
+								PKValues:       br.PKValues,
+								RowBefore:      br.Row,
+							}
+							victims = append(victims, victim)
+							next = append(next, layerItem{ev: victim, rootTS: item.rootTS})
+						}
+					}
 				}
 			}
 		}

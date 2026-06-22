@@ -5,13 +5,16 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
@@ -125,6 +128,7 @@ func cleanCascadeFlags(dsn, dbName, out string) {
 	rcPK, rcPKs, rcSince, rcUntil = "", nil, "", ""
 	rcOutput, rcDryRun, rcFormat = out, false, "text"
 	rcLookback, rcMaxDepth, rcLimit, rcAllowIncomplete = "30d", 5, 1000, false
+	rcBaselineDir, rcBaselineS3 = "", ""
 }
 
 // TestRecoverCascade_incompleteExit proves the dangerous "nothing found" case:
@@ -204,5 +208,96 @@ func TestRecoverCascade_jsonExitParity(t *testing.T) {
 	rcAllowIncomplete = true
 	if err := runCascadeCmd(t); err != nil {
 		t.Fatalf("JSON + --allow-incomplete should exit 0, got: %v", err)
+	}
+}
+
+// writeChildBaseline writes a real Parquet snapshot of the `child` table at
+// parquetPath using DuckDB (the same engine ReadBaselineRows queries with).
+func writeChildBaseline(t *testing.T, parquetPath string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(parquetPath), 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	d, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer d.Close()
+	// child 10,11 reference parent 1 (cascade victims); 12 references parent 2.
+	q := fmt.Sprintf(
+		`COPY (SELECT * FROM (VALUES (10,1,'keep10'),(11,1,'keep11'),(12,2,'other')) AS t(id,pid,payload)) TO '%s' (FORMAT PARQUET)`,
+		strings.ReplaceAll(parquetPath, "'", "''"))
+	if _, err := d.Exec(q); err != nil {
+		t.Fatalf("write baseline parquet: %v", err)
+	}
+}
+
+// TestRecoverCascade_phase2BaselineRecoversUntouchedChild proves Phase-2
+// end-to-end through the real provider: children that exist ONLY in a baseline
+// snapshot (no binlog event — the gap Phase-1 misses) are recovered, scoped to
+// the deleted parent, with the run reported complete.
+func TestRecoverCascade_phase2BaselineRecoversUntouchedChild(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	// Schema snapshot so the resolver knows child PK (id) + columns.
+	snapTs := "2026-06-01 00:00:00"
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "parent", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "pid", 2, "", "int", "YES")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "payload", 3, "", "varchar", "YES")
+
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
+		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
+		VALUES (1, 'fk', ?, 'child', 'pid', 1, ?, 'parent', 'id', 'CASCADE', 'RESTRICT')`, dbName, dbName)
+
+	// Parent DELETE in the binlog; the children have NO binlog events — they
+	// live only in the baseline (the Phase-1 blind spot).
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	parentTs := h.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, parentTs, nil, dbName, "parent", 3 /*DELETE*/, "1", nil, []byte(`{"id":1}`), nil)
+
+	// Baseline snapshot dated before the parent delete.
+	baselineDir := t.TempDir()
+	snapDir := filepath.Join(baselineDir, "2026-06-01T00-00-00Z")
+	writeChildBaseline(t, filepath.Join(snapDir, dbName, "child.parquet"))
+	if err := baseline.WriteSuccessMarker(snapDir); err != nil {
+		t.Fatalf("write success marker: %v", err)
+	}
+
+	out := filepath.Join(t.TempDir(), "cascade.sql")
+	cleanCascadeFlags(testutil.IntegrationDSN(dbName), dbName, out)
+	rcPK = "1"
+	rcBaselineDir = baselineDir
+	defer func() { rcBaselineDir = "" }()
+
+	if err := runCascadeCmd(t); err != nil {
+		t.Fatalf("runRecoverCascade: %v", err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	sql := string(b)
+	for _, want := range []string{
+		"keep10", "keep11", // children recovered from the baseline
+		"Phase-2 baseline fallback ACTIVE",
+		"`" + dbName + "`.`parent`", // parent restored
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("output missing %q\n---\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "other") {
+		t.Errorf("child 12 (pid=2, different parent) must NOT be recovered\n---\n%s", sql)
+	}
+	if strings.Contains(sql, "INCOMPLETE RECOVERY") {
+		t.Errorf("a baseline-covered cascade must be complete\n---\n%s", sql)
 	}
 }

@@ -218,13 +218,18 @@ bintrail recover-cascade --index-dsn "..." \
   `--since`/`--until` narrow which deleted parents to process.
 - `--lookback` (default `30d`) bounds how far back the last child state is
   searched; `--max-depth` (default 5) bounds cascade recursion.
-- **Phase-1 limitation:** a child untouched within `--lookback` and absent from a
-  baseline is not reconstructed (baseline fallback is #552), and archived
-  partitions are not searched. When the result is provably partial the output is
-  flagged `INCOMPLETE RECOVERY` and the command exits non-zero unless
-  `--allow-incomplete` is given. If you have already re-created a deleted parent,
-  remove its `INSERT` from the output — `FOREIGN_KEY_CHECKS=0` does not suppress
-  primary-key violations.
+- **Phase-2 baseline fallback** (`--baseline-dir` or `--baseline-s3`): without a
+  baseline, a child untouched within `--lookback` (e.g. an insert-once row from
+  months ago) cannot be reconstructed — only children with a binlog event in the
+  window are visible. Point at a `bintrail baseline` snapshot and those untouched
+  children are recovered from it too, and the binlog window is widened to the
+  snapshot time. Tables not covered by the baseline are flagged incomplete.
+- **Still best-effort:** archived binlog partitions are not searched, and a table
+  with no baseline keeps the Phase-1 window limit. When the result is provably
+  partial the output is flagged `INCOMPLETE RECOVERY` and the command exits
+  non-zero unless `--allow-incomplete` is given. If you have already re-created a
+  deleted parent, remove its `INSERT` from the output — `FOREIGN_KEY_CHECKS=0`
+  does not suppress primary-key violations.
 
 ### WHERE Clause Strategy
 
