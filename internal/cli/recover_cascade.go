@@ -508,7 +508,7 @@ func emitCascadeSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow
 	} else {
 		b.WriteString("-- Phase-1 (binlog-window) recovery: a child untouched within --lookback and not\n")
 		b.WriteString("-- in a baseline is NOT reconstructed — pass --baseline-dir/--baseline-s3 to enable\n")
-		b.WriteString("-- Phase-2 fallback (#552). \"Complete\" means everything DETECTABLE was recovered.\n")
+		b.WriteString("-- Phase-2 fallback. \"Complete\" means everything DETECTABLE was recovered.\n")
 	}
 	b.WriteString("--\n")
 	b.WriteString("-- If you have already re-created a deleted parent, delete its INSERT below:\n")
