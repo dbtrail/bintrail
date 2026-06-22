@@ -263,7 +263,9 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 			resolver = nil
 		}
 	}
-	gen := recovery.New(h.IndexDB, resolver)
+	// DialectForIndex is nil-safe: h.IndexDB may be nil here, in which case it returns
+	// MySQLDialect (#533/#573).
+	gen := recovery.NewForDialect(h.IndexDB, resolver, recovery.DialectForIndex(h.IndexDB))
 
 	var buf bytes.Buffer
 	_, err := gen.GenerateSQLFromRows(rows, &buf)

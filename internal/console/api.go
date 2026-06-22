@@ -251,7 +251,10 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var buf bytes.Buffer
-	n, err := recovery.New(b.db, b.resolver).GenerateSQLFromRows(rows, &buf)
+	// Per-bundle dialect: the console is multi-server, so select from THIS server's
+	// index flavor (a PG-flavored index → PostgreSQL reversal SQL). DialectForIndex
+	// defaults to MySQL on any read failure (#533/#573).
+	n, err := recovery.NewForDialect(b.db, b.resolver, recovery.DialectForIndex(b.db)).GenerateSQLFromRows(rows, &buf)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return

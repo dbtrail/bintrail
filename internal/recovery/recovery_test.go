@@ -1024,6 +1024,14 @@ func TestDialectForFlavor(t *testing.T) {
 	}
 }
 
+func TestDialectForIndex_nilDB(t *testing.T) {
+	// A nil db (e.g. agent.IndexDB before it's opened) must not panic — DialectForIndex
+	// returns MySQLDialect, the safe default (#573).
+	if got := DialectForIndex(nil); got != MySQLDialect {
+		t.Errorf("DialectForIndex(nil) = %v, want MySQLDialect", got)
+	}
+}
+
 // TestGeneratePG_ScriptWrapper pins the standard_conforming_strings guard: a PG-dialect
 // script SET LOCALs it (so the escaping is self-defending regardless of the target
 // session), and the MySQL script does NOT emit it.

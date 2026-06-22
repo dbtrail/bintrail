@@ -481,7 +481,7 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 			}
 		}
 
-		gen := recovery.New(db, resolver)
+		gen := recovery.NewForDialect(db, resolver, recovery.DialectForIndex(db))
 		var buf bytes.Buffer
 		n, err := gen.GenerateSQLFromRows(rows, &buf)
 		if err != nil {

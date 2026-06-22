@@ -155,6 +155,40 @@ func TestIntegrationRecoverMatchesGenerator(t *testing.T) {
 	}
 }
 
+// TestIntegrationRecoverPGDialect proves the console recover surface emits
+// PostgreSQL-dialect SQL when the selected server's index is PG-flavored (#573):
+// the console is the reachable-today surface for PG customers (capture with
+// bintrail-pg, view/recover with the shared console). DialectForIndex reads the
+// per-bundle stream_state.flavor, so a 'postgres' flavor → double-quoted identifiers
+// + the standard_conforming_strings guard, NOT MySQL backticks.
+func TestIntegrationRecoverPGDialect(t *testing.T) {
+	srv, _ := seedConsoleData(t)
+	// Stamp the boot bundle's index as PostgreSQL-sourced (single-row stream_state).
+	if _, err := srv.cm.boot.db.Exec(
+		`INSERT INTO stream_state (id, mode, flavor, last_checkpoint, server_id)
+		 VALUES (1, 'gtid', 'postgres', UTC_TIMESTAMP(), 1)`); err != nil {
+		t.Fatalf("stamp stream_state flavor=postgres: %v", err)
+	}
+
+	rec, body := doReq(t, srv, "POST", "/api/recover", `{"schema":"app","table":"users"}`)
+	if rec.Code != 200 {
+		t.Fatalf("recover code = %d, body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.SQL, `"app"."users"`) {
+		t.Errorf("console PG recover must use double-quoted identifiers, got:\n%s", resp.SQL)
+	}
+	if !strings.Contains(resp.SQL, "SET LOCAL standard_conforming_strings = on;") {
+		t.Errorf("console PG recover must emit the standard_conforming_strings guard, got:\n%s", resp.SQL)
+	}
+	if strings.Contains(resp.SQL, "`") {
+		t.Errorf("console PG recover must NOT contain MySQL backticks, got:\n%s", resp.SQL)
+	}
+}
+
 // TestIntegrationRecoverWithTimeRangeSurfacesGap exercises the planner-active
 // recover path. testutil.InitIndexTables creates only the p_future partition,
 // so loadLivePartitionHours is empty and every hour in a bounded query range is

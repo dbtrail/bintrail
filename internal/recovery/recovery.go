@@ -80,11 +80,14 @@ func DialectForFlavor(flavor string) Dialect {
 
 // DialectForIndex returns the recovery dialect for an index database, read from the
 // source flavor recorded in stream_state (the index is single-source). Best-effort:
-// any read failure (no stream_state row on a file-indexed DB, very old schema)
-// returns MySQLDialect and never blocks recovery. This is the authoritative
-// selection every recover surface should use — `cli/recover.go` today; the console,
-// MCP, and agent recover paths adopt it in a follow-up.
+// a nil db, or any read failure (no stream_state row on a file-indexed DB, very old
+// schema), returns MySQLDialect and never blocks recovery. This is the authoritative
+// selection every recover surface uses (cli/recover.go, console, MCP, agent). The nil
+// guard lets a caller pass an as-yet-unopened handle (e.g. agent.IndexDB) directly.
 func DialectForIndex(db *sql.DB) Dialect {
+	if db == nil {
+		return MySQLDialect
+	}
 	var flavor string
 	if err := db.QueryRow("SELECT flavor FROM stream_state WHERE id = 1").Scan(&flavor); err != nil {
 		return MySQLDialect
