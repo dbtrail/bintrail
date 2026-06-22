@@ -223,7 +223,13 @@ func (g *Generator) generateStatement(row query.ResultRow) (string, error) {
 }
 
 // generateInsert reverses a DELETE event: reconstruct the deleted row from
-// row_before with a full INSERT, skipping STORED/VIRTUAL generated columns.
+// row_before with a full INSERT, skipping STORED/VIRTUAL generated columns. On the
+// PostgreSQL path it emits OVERRIDING SYSTEM VALUE so a GENERATED ALWAYS AS IDENTITY
+// column accepts its restored value (#557); the clause is a harmless no-op on tables
+// without such a column (verified PG14+), so it is emitted unconditionally rather
+// than gated on identity metadata — keeping the highest-frequency recovery op robust.
+// Identity columns are KEPT (the real id is the point of recovery); only generated
+// columns are omitted.
 func (g *Generator) generateInsert(row query.ResultRow) (string, error) {
 	if row.RowBefore == nil {
 		return "", fmt.Errorf("row_before is nil for DELETE event (event_id=%d)", row.EventID)
@@ -238,9 +244,14 @@ func (g *Generator) generateInsert(row query.ResultRow) (string, error) {
 		colParts = append(colParts, g.quoteName(col))
 		valParts = append(valParts, g.formatValue(row.RowBefore[col]))
 	}
-	return fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES (%s)",
+	overriding := ""
+	if g.dialect == PostgresDialect {
+		overriding = " OVERRIDING SYSTEM VALUE"
+	}
+	return fmt.Sprintf("INSERT INTO %s.%s (%s)%s VALUES (%s)",
 		g.quoteName(row.SchemaName), g.quoteName(row.TableName),
 		strings.Join(colParts, ", "),
+		overriding,
 		strings.Join(valParts, ", "),
 	), nil
 }
@@ -255,12 +266,15 @@ func (g *Generator) generateUpdate(row query.ResultRow) (string, error) {
 		return "", fmt.Errorf("row_after is nil for UPDATE event (event_id=%d)", row.EventID)
 	}
 
-	// SET clause: restore before-image values, skipping STORED/VIRTUAL generated columns.
+	// SET clause: restore before-image values, omitting columns PostgreSQL forbids in
+	// a SET — STORED/VIRTUAL generated columns AND GENERATED ALWAYS identity columns
+	// (#557). An identity-ALWAYS column can never be changed by an UPDATE, so omitting
+	// it from the restore is lossless.
 	r := g.resolverForRow(row)
-	genCols := generatedColsFromResolver(r, row.SchemaName, row.TableName)
+	skipCols := updateSetSkipCols(r, row.SchemaName, row.TableName)
 	var setParts []string
 	for _, col := range sortedKeys(row.RowBefore) {
-		if genCols[col] {
+		if skipCols[col] {
 			continue
 		}
 		setParts = append(setParts, g.quoteName(col)+" = "+g.formatValue(row.RowBefore[col]))
@@ -314,6 +328,34 @@ func generatedColsFromResolver(resolver *metadata.Resolver, schema, table string
 		}
 	}
 	return gen
+}
+
+// updateSetSkipCols returns the columns to omit from a reverse-UPDATE SET clause:
+// STORED/VIRTUAL generated columns AND PostgreSQL GENERATED ALWAYS identity columns
+// (#557) — PostgreSQL rejects `SET` on either ("column can only be updated to
+// DEFAULT"). Omitting an identity-ALWAYS column is lossless because such a column can
+// never be changed by an UPDATE (so its before-image equals its current value).
+// Returns nil when the resolver is absent or the table is not in the snapshot.
+func updateSetSkipCols(resolver *metadata.Resolver, schema, table string) map[string]bool {
+	if resolver == nil {
+		return nil
+	}
+	tm, err := resolver.Resolve(schema, table)
+	if err != nil {
+		slog.Warn("cannot determine generated/identity columns; reversal UPDATE may SET a generated or identity column",
+			"schema", schema, "table", table, "error", err)
+		return nil
+	}
+	var skip map[string]bool
+	for _, c := range tm.Columns {
+		if c.IsGenerated || c.IsIdentityAlways {
+			if skip == nil {
+				skip = make(map[string]bool)
+			}
+			skip[c.Name] = true
+		}
+	}
+	return skip
 }
 
 // pkWhereClause builds "pk_col = val AND ..." from the given resolver, in the

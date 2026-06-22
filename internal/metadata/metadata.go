@@ -30,6 +30,11 @@ type ColumnMeta struct {
 	DataType        string // e.g. "int", "datetime", "varchar" (information_schema.COLUMNS.DATA_TYPE)
 	ColumnType      string // full type declaration, e.g. "int(11) unsigned", "datetime(6)" (COLUMN_TYPE). Empty on pre-#212 snapshots.
 	IsGenerated     bool   // true for STORED or VIRTUAL generated columns
+	// IsIdentityAlways marks a PostgreSQL GENERATED ALWAYS AS IDENTITY column (#557).
+	// Recovery keeps it on a reverse-INSERT (with OVERRIDING SYSTEM VALUE) but omits
+	// it from a reverse-UPDATE SET (PostgreSQL rejects SET on it). Always false for
+	// MySQL/MariaDB snapshots (AUTO_INCREMENT accepts explicit values freely).
+	IsIdentityAlways bool
 }
 
 // TableMeta holds the column mapping for a table, derived from a schema snapshot.
@@ -90,7 +95,7 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	rows, err := db.Query(`
 		SELECT schema_name, table_name, column_name, ordinal_position,
 		       column_key, data_type, COALESCE(column_type, '') AS column_type,
-		       is_generated
+		       is_generated, is_identity_always
 		FROM schema_snapshots
 		WHERE snapshot_id = ?
 		ORDER BY schema_name, table_name, ordinal_position`,
@@ -107,9 +112,9 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	for rows.Next() {
 		var schemaName, tableName, columnName, columnKey, dataType, columnType string
 		var ordinalPosition int
-		var isGenerated bool
+		var isGenerated, isIdentityAlways bool
 
-		if err := rows.Scan(&schemaName, &tableName, &columnName, &ordinalPosition, &columnKey, &dataType, &columnType, &isGenerated); err != nil {
+		if err := rows.Scan(&schemaName, &tableName, &columnName, &ordinalPosition, &columnKey, &dataType, &columnType, &isGenerated, &isIdentityAlways); err != nil {
 			return nil, fmt.Errorf("failed to scan snapshot row: %w", err)
 		}
 
@@ -121,12 +126,13 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 		}
 
 		col := ColumnMeta{
-			Name:            columnName,
-			OrdinalPosition: ordinalPosition,
-			IsPK:            columnKey == "PRI",
-			DataType:        dataType,
-			ColumnType:      columnType,
-			IsGenerated:     isGenerated,
+			Name:             columnName,
+			OrdinalPosition:  ordinalPosition,
+			IsPK:             columnKey == "PRI",
+			DataType:         dataType,
+			ColumnType:       columnType,
+			IsGenerated:      isGenerated,
+			IsIdentityAlways: isIdentityAlways,
 		}
 		if columnType != "" {
 			sawColumnType = true
@@ -317,6 +323,11 @@ type PGRelationColumn struct {
 	IsPK    bool
 	TypeOID uint32
 	TypeMod int32
+	// IdentityAlways = GENERATED ALWAYS AS IDENTITY; Generated = STORED generated
+	// column. From a catalog lookup (the RelationMessage carries neither); they drive
+	// #557 recovery (OVERRIDING SYSTEM VALUE + the per-operation skip-sets).
+	IdentityAlways bool
+	Generated      bool
 }
 
 // PGRelationSchema is a PostgreSQL relation's shape as seen on the logical-
@@ -380,13 +391,13 @@ func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 	}
 
 	snapshotTime := time.Now().UTC()
-	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?,?),", len(rel.Columns)), ",")
+	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?),", len(rel.Columns)), ",")
 	insertSQL := "INSERT INTO schema_snapshots " +
 		"(snapshot_id, snapshot_time, schema_name, table_name, column_name, " +
 		"ordinal_position, column_key, data_type, column_type, is_nullable, column_default, is_generated, " +
-		"pg_type_oid, pg_type_mod) VALUES " + valClause
+		"pg_type_oid, pg_type_mod, is_identity_always) VALUES " + valClause
 
-	args := make([]any, 0, len(rel.Columns)*14)
+	args := make([]any, 0, len(rel.Columns)*15)
 	for _, c := range rel.Columns {
 		columnKey := ""
 		if c.IsPK {
@@ -394,8 +405,8 @@ func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 		}
 		args = append(args,
 			nextID, snapshotTime, rel.Schema, rel.Table, c.Name,
-			c.Ordinal, columnKey, "", nil, "", nil, false,
-			c.TypeOID, c.TypeMod,
+			c.Ordinal, columnKey, "", nil, "", nil, c.Generated,
+			c.TypeOID, c.TypeMod, c.IdentityAlways,
 		)
 	}
 	if _, err = tx.Exec(insertSQL, args...); err != nil {

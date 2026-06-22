@@ -246,6 +246,15 @@ func EnsureSchema(db *sql.DB) error {
 	); err != nil {
 		return err
 	}
+	// is_identity_always marks a PostgreSQL GENERATED ALWAYS AS IDENTITY column (#557).
+	// Recovery emits OVERRIDING SYSTEM VALUE on a reverse-INSERT and omits the column
+	// from a reverse-UPDATE SET (PostgreSQL rejects SET on it). NOT NULL DEFAULT 0 so
+	// existing rows + MySQL snapshots read back as "not identity" with no migration.
+	if err := ensureColumn(db, "schema_snapshots", "is_identity_always",
+		`ALTER TABLE schema_snapshots ADD COLUMN is_identity_always TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1 if PostgreSQL GENERATED ALWAYS AS IDENTITY; 0 for MySQL (#557)' AFTER pg_type_mod`,
+	); err != nil {
+		return err
+	}
 	// gap_lost_at/_detail record an unfillable-gap auto-advance durably
 	// (#402): the advanced checkpoint is persisted, so without these columns
 	// the only trace of the permanently lost events would be an in-memory

@@ -160,7 +160,13 @@ func (c *Capturer) Run(ctx context.Context, out chan<- event.Event) error {
 		defer cancel()
 		return queryPK(qctx, queryConn, relationID)
 	}
-	decoder := NewDecoder(resolvePK, c.cfg.Filters, c.logger)
+	// Catalog-backed AttrResolver (identity/generated, #557), same conn + bounding.
+	attrResolver := func(relationID uint32, schema, table string) (map[string]ColumnAttrs, error) {
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return queryColumnAttrs(qctx, queryConn, relationID)
+	}
+	decoder := NewDecoder(resolvePK, c.cfg.Filters, c.logger, WithAttrResolver(attrResolver))
 
 	interval := c.cfg.StandbyInterval
 	if interval <= 0 {

@@ -44,12 +44,24 @@ const UnchangedToastKey = "__bintrail_unchanged_toast__"
 // decode logic is fully unit-testable without a live PostgreSQL: the capturer wires
 // a catalog-query PKResolver, tests stub it.
 type Decoder struct {
-	resolvePK PKResolver
-	filters   event.Filters
-	logger    *slog.Logger
+	resolvePK    PKResolver
+	attrResolver AttrResolver // identity/generated flags (#557); nil = no flags
+	filters      event.Filters
+	logger       *slog.Logger
 
 	relations map[uint32]*relationInfo
 	txn       txnContext
+}
+
+// DecoderOption configures optional Decoder dependencies without churning the
+// NewDecoder call sites that don't need them.
+type DecoderOption func(*Decoder)
+
+// WithAttrResolver wires the catalog-backed identity/generated lookup (#557). The
+// capturer passes it; tests that don't exercise identity/generated omit it (the
+// flags then stay false, which is the safe default for the recovery skip-sets).
+func WithAttrResolver(r AttrResolver) DecoderOption {
+	return func(d *Decoder) { d.attrResolver = r }
 }
 
 // txnContext carries the in-flight transaction's commit metadata. pgoutput puts
@@ -68,8 +80,9 @@ type txnContext struct {
 // NewDecoder constructs a Decoder. resolvePK supplies primary-key columns per
 // relation (catalog-backed in the capturer, stubbed in tests) and must be non-nil.
 // filters restricts which schema/table produce events (the zero Filters accepts
-// all). logger may be nil (slog.Default() is used).
-func NewDecoder(resolvePK PKResolver, filters event.Filters, logger *slog.Logger) *Decoder {
+// all). logger may be nil (slog.Default() is used). Optional dependencies (e.g. the
+// identity/generated AttrResolver, #557) are passed as DecoderOptions.
+func NewDecoder(resolvePK PKResolver, filters event.Filters, logger *slog.Logger, opts ...DecoderOption) *Decoder {
 	// resolvePK is mandatory (every row event needs a PK source). A nil resolver
 	// would otherwise survive construction and panic deep inside cacheRelation on
 	// the first RelationMessage; fail at the wiring site instead.
@@ -79,12 +92,16 @@ func NewDecoder(resolvePK PKResolver, filters event.Filters, logger *slog.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Decoder{
+	d := &Decoder{
 		resolvePK: resolvePK,
 		filters:   filters,
 		logger:    logger,
 		relations: make(map[uint32]*relationInfo),
 	}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
 }
 
 // Decode processes one pgoutput message. It returns:
@@ -186,6 +203,24 @@ func (d *Decoder) cacheRelation(m *pglogrepl.RelationMessage) error {
 		cols[i] = relColumn{name: c.Name, typeOID: c.DataType, typeMod: c.TypeModifier}
 	}
 
+	// Identity/generated flags (#557) — not in the RelationMessage, so a catalog
+	// lookup, same as the PK. A genuine lookup failure fails loud rather than index
+	// rows recovery would emit un-runnable SQL for. (Absent resolver → flags stay
+	// false, the safe default for the recovery skip-sets.)
+	if d.attrResolver != nil {
+		attrs, err := d.attrResolver(m.RelationID, m.Namespace, m.RelationName)
+		if err != nil {
+			return fmt.Errorf("pgcapture: column-attr lookup for %s.%s (oid %d): %w",
+				m.Namespace, m.RelationName, m.RelationID, err)
+		}
+		for i := range cols {
+			if a, ok := attrs[cols[i].name]; ok {
+				cols[i].identityAlways = a.IdentityAlways
+				cols[i].generated = a.Generated
+			}
+		}
+	}
+
 	pkCols, err := d.resolvePK(m.RelationID, m.Namespace, m.RelationName)
 	if err != nil {
 		return fmt.Errorf("pgcapture: primary-key lookup for %s.%s (oid %d): %w",
@@ -248,11 +283,13 @@ func relationEvent(rel *relationInfo) event.Event {
 	cols := make([]metadata.PGRelationColumn, len(rel.columns))
 	for i, c := range rel.columns {
 		cols[i] = metadata.PGRelationColumn{
-			Name:    c.name,
-			Ordinal: i + 1,
-			IsPK:    pkNames[c.name],
-			TypeOID: c.typeOID,
-			TypeMod: c.typeMod,
+			Name:           c.name,
+			Ordinal:        i + 1,
+			IsPK:           pkNames[c.name],
+			TypeOID:        c.typeOID,
+			TypeMod:        c.typeMod,
+			IdentityAlways: c.identityAlways,
+			Generated:      c.generated,
 		}
 	}
 	return event.Event{

@@ -19,6 +19,13 @@ type relColumn struct {
 	name    string
 	typeOID uint32
 	typeMod int32
+	// identityAlways = GENERATED ALWAYS AS IDENTITY (pg_attribute.attidentity='a');
+	// generated = STORED generated column (attgenerated='s'). Both come from a catalog
+	// lookup (the RelationMessage carries neither) and drive #557 recovery: a reverse-
+	// INSERT omits generated columns (and emits OVERRIDING SYSTEM VALUE for identity),
+	// a reverse-UPDATE SET omits BOTH (PostgreSQL rejects SET on either).
+	identityAlways bool
+	generated      bool
 }
 
 // relationInfo is the decoder's cached knowledge of one relation, keyed by its
@@ -93,4 +100,56 @@ func queryPK(ctx context.Context, conn *pgx.Conn, relationID uint32) ([]metadata
 		return nil, fmt.Errorf("pgcapture: iterate PK columns for relation OID %d: %w", relationID, err)
 	}
 	return cols, nil
+}
+
+// ColumnAttrs are the per-column catalog flags the RelationMessage does not carry,
+// needed for #557 recovery correctness.
+type ColumnAttrs struct {
+	IdentityAlways bool // GENERATED ALWAYS AS IDENTITY (attidentity='a')
+	Generated      bool // STORED generated column (attgenerated='s')
+}
+
+// AttrResolver returns the identity/generated flags for a relation's columns, keyed
+// by column name. Catalog-backed in the capturer (pg_attribute), stubbed in tests.
+// A genuine lookup failure must return a non-nil error so the decoder fails loud
+// rather than index rows that recovery would generate un-runnable SQL for.
+type AttrResolver func(relationID uint32, schema, table string) (map[string]ColumnAttrs, error)
+
+// columnAttrsQuery reports, per live column of a relation, whether it is a
+// GENERATED ALWAYS identity column and/or a STORED generated column. attnum>0 skips
+// system columns; NOT attisdropped skips dropped ones. attidentity/attgenerated are
+// available on every supported version (PG14+).
+//
+// Intentional scope: attgenerated='s' flags STORED only. PG18 adds VIRTUAL generated
+// columns (attgenerated='v') and publish_generated_columns; those are out of scope for
+// a PG14–16 beta. A VIRTUAL column is computed on read and never materialized, so it is
+// not in the row image and a reverse INSERT/UPDATE would never reference it — but if
+// VIRTUAL support lands, extend this predicate to attgenerated IN ('s','v').
+const columnAttrsQuery = `SELECT attname, attidentity = 'a', attgenerated = 's'
+FROM pg_attribute
+WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped`
+
+// queryColumnAttrs is the catalog-backed AttrResolver body, on a regular (non-
+// replication) connection. The capturer wires it into a closure over its query conn
+// and the Run context; unit tests stub the AttrResolver directly.
+func queryColumnAttrs(ctx context.Context, conn *pgx.Conn, relationID uint32) (map[string]ColumnAttrs, error) {
+	rows, err := conn.Query(ctx, columnAttrsQuery, relationID)
+	if err != nil {
+		return nil, fmt.Errorf("pgcapture: query column attrs for relation OID %d: %w", relationID, err)
+	}
+	defer rows.Close()
+
+	attrs := make(map[string]ColumnAttrs)
+	for rows.Next() {
+		var name string
+		var identityAlways, generated bool
+		if err := rows.Scan(&name, &identityAlways, &generated); err != nil {
+			return nil, fmt.Errorf("pgcapture: scan column attrs for relation OID %d: %w", relationID, err)
+		}
+		attrs[name] = ColumnAttrs{IdentityAlways: identityAlways, Generated: generated}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgcapture: iterate column attrs for relation OID %d: %w", relationID, err)
+	}
+	return attrs, nil
 }
