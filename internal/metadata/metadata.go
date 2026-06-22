@@ -352,9 +352,9 @@ type PGRelationSchema struct {
 // loads each row's own snapshot_id), but a whole-schema consumer (console Tables(),
 // shim SHOW TABLES) must not assume MAX(snapshot_id) is the full schema.
 //
-// PG columns leave the MySQL-only fields empty/NULL: data_type='' and is_nullable=''
-// (both NOT NULL columns, hence empty string not NULL), column_type/column_default
-// NULL, is_generated 0. The PostgreSQL type identity rides the nullable
+// PG columns leave the MySQL-only fields empty/NULL: data_type and is_nullable are
+// the empty string (both NOT NULL columns, so empty string not NULL), column_type and
+// column_default NULL, is_generated 0. The PostgreSQL type identity rides the nullable
 // pg_type_oid/pg_type_mod columns for the deferred type-faithful renderer.
 func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 	if rel == nil || len(rel.Columns) == 0 {

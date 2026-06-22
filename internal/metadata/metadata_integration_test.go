@@ -3,8 +3,10 @@
 package metadata
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -693,4 +695,91 @@ func TestTakeSnapshot_longEnumColumnType(t *testing.T) {
 			t.Fatalf("fixture regression: status COLUMN_TYPE is %d chars, must exceed the old VARCHAR(128) to pin the widening", len(want))
 		}
 	}
+}
+
+// TestWritePGSnapshot_OracleRoundTrip pins the #533 schema/type oracle: a PostgreSQL
+// relation persisted via WritePGSnapshot reads back through the SAME metadata.Resolver
+// the MySQL path uses — a composite PK in table-ordinal order, with the type OID/typmod
+// round-tripped — and the pre-#212 UNSIGNED warning is suppressed for a PG snapshot
+// (all data_type empty) while STILL firing for a genuine pre-#212 MySQL snapshot.
+func TestWritePGSnapshot_OracleRoundTrip(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	rel := &PGRelationSchema{
+		Schema: "public", Table: "orders",
+		Columns: []PGRelationColumn{
+			{Name: "id", Ordinal: 1, IsPK: true, TypeOID: 23},                      // int4
+			{Name: "region", Ordinal: 2, IsPK: true, TypeOID: 25},                  // text — composite PK part
+			{Name: "amount", Ordinal: 3, IsPK: false, TypeOID: 1700, TypeMod: 100}, // numeric(p,s)
+		},
+	}
+	id, err := WritePGSnapshot(indexDB, rel)
+	if err != nil {
+		t.Fatalf("WritePGSnapshot: %v", err)
+	}
+	if id <= 0 {
+		t.Fatalf("snapshot_id = %d, want > 0", id)
+	}
+
+	// Load through the shared resolver; capture warnings — a PG snapshot must NOT trip
+	// the MySQL-only pre-#212 UNSIGNED warning (all data_type empty is the PG signature).
+	r := newResolverCapturingWarnings(t, indexDB, id, false /* wantWarning */)
+
+	tm, err := r.Resolve("public", "orders")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	// Composite PK preserved in table-ordinal order [id, region].
+	if got := tm.PKColumns; len(got) != 2 || got[0] != "id" || got[1] != "region" {
+		t.Errorf("PKColumns = %v, want [id region] (table-ordinal order)", got)
+	}
+	if pks := tm.PKColumnMetas(); len(pks) != 2 || pks[0].Name != "id" || pks[1].Name != "region" {
+		t.Errorf("PKColumnMetas = %+v, want id,region in order", pks)
+	}
+
+	// Type OID/typmod round-trip (read directly — slice-1 NewResolver does not surface them).
+	var oid, mod sql.NullInt64
+	if err := indexDB.QueryRow(
+		`SELECT pg_type_oid, pg_type_mod FROM schema_snapshots
+		 WHERE snapshot_id=? AND column_name='amount'`, id,
+	).Scan(&oid, &mod); err != nil {
+		t.Fatalf("select pg_type cols: %v", err)
+	}
+	if !oid.Valid || oid.Int64 != 1700 || !mod.Valid || mod.Int64 != 100 {
+		t.Errorf("amount pg_type_oid/mod = (%v,%v), want (1700,100)", oid, mod)
+	}
+
+	// Control: a genuine pre-#212 MySQL snapshot (non-empty data_type, NULL column_type)
+	// STILL trips the warning — the gate suppresses ONLY the all-empty-data_type PG case.
+	mysqlID := id + 1
+	if _, err := indexDB.Exec(
+		`INSERT INTO schema_snapshots
+		   (snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		    ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+		 VALUES (?, UTC_TIMESTAMP(), 'app', 'widgets', 'qty', 1, 'PRI', 'int', NULL, 'NO', 0)`,
+		mysqlID,
+	); err != nil {
+		t.Fatalf("insert pre-#212 MySQL snapshot: %v", err)
+	}
+	newResolverCapturingWarnings(t, indexDB, mysqlID, true /* wantWarning */)
+}
+
+// newResolverCapturingWarnings loads a snapshot with slog redirected to a buffer and
+// asserts whether the pre-#212 UNSIGNED warning fired.
+func newResolverCapturingWarnings(t *testing.T, db *sql.DB, snapshotID int, wantWarning bool) *Resolver {
+	t.Helper()
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	r, err := NewResolver(db, snapshotID)
+	slog.SetDefault(old)
+	if err != nil {
+		t.Fatalf("NewResolver(%d): %v", snapshotID, err)
+	}
+	got := strings.Contains(buf.String(), "#212")
+	if got != wantWarning {
+		t.Errorf("pre-#212 UNSIGNED warning fired=%v, want %v (snapshot %d):\n%s", got, wantWarning, snapshotID, buf.String())
+	}
+	return r
 }

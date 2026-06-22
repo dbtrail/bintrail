@@ -5,6 +5,7 @@ package pgstreamrun_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -188,6 +189,171 @@ func TestOne_CapturerFailureSurfaces(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("One hung — a capturer failure was not surfaced (cancellation bridge missing)")
+	}
+}
+
+// TestOne_MultiTable_PKScopedRecovery is the #533/#531-closure discriminator: with
+// TWO published tables, a row of the FIRST table that arrives AFTER the second
+// table's RelationMessage must still recover with a PK-SCOPED WHERE. A single scalar
+// "current snapshot id" would stamp it with the second table's snapshot, silently
+// degrading recovery to an all-columns WHERE — the multi-table blocker a single-table
+// test cannot catch (pgoutput sends a RelationMessage once per relation per session,
+// so the UPDATE of the first table has no fresh Relation preceding it). Also asserts
+// schema_snapshots carries column_key='PRI' and a non-NULL pg_type_oid per table, and
+// that no unchanged-TOAST sentinel is persisted under RI FULL.
+func TestOne_MultiTable_PKScopedRecovery(t *testing.T) {
+	pgDSN := testutil.SkipIfNoPostgres(t)
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	indexDB, dbName := testutil.CreateTestDB(t)
+	indexDSN := testutil.BaseDSN() + "/" + dbName
+
+	const slot = "bintrail_pgsr_mt"
+	const pub = "bintrail_pgsr_mt_pub"
+	const t1 = "pgsr_mt_t1"
+	const t2 = "pgsr_mt_t2"
+
+	pg, err := pgx.Connect(ctx, pgDSN)
+	if err != nil {
+		t.Fatalf("connect PG: %v", err)
+	}
+	t.Cleanup(func() { pg.Close(context.Background()) })
+
+	dropAll := func() {
+		bg := context.Background()
+		_, _ = pg.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		_, _ = pg.Exec(bg, "DROP TABLE IF EXISTS "+t1)
+		_, _ = pg.Exec(bg, "DROP TABLE IF EXISTS "+t2)
+		_, _ = pg.Exec(bg, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+	}
+	dropAll()
+	t.Cleanup(dropAll)
+
+	mustExec := func(sqlStr string, args ...any) {
+		t.Helper()
+		if _, err := pg.Exec(ctx, sqlStr, args...); err != nil {
+			t.Fatalf("exec %q: %v", sqlStr, err)
+		}
+	}
+	mustExec(fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, label text)", t1))
+	mustExec(fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, note text)", t2))
+	mustExec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", t1))
+	mustExec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", t2))
+	mustExec(fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s, %s", pub, t1, t2))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cfg := pgstreamrun.Config{
+		IndexDSN:    indexDSN,
+		ReplDSN:     replDSN(pgDSN),
+		QueryDSN:    pgDSN,
+		SlotName:    slot,
+		Publication: pub,
+		ServerID:    43,
+		BatchSize:   100,
+		Checkpoint:  200 * time.Millisecond,
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- pgstreamrun.One(runCtx, cfg) }()
+
+	waitFor(t, 15*time.Second, func() bool {
+		var active bool
+		if err := pg.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&active); err != nil {
+			return false
+		}
+		return active
+	}, "replication slot active")
+
+	// The interleave: INSERT t1, INSERT t2, then UPDATE t1 — the UPDATE t1 arrives
+	// AFTER t2's RelationMessage (and with no fresh Relation t1), so a single-scalar
+	// snapshot id would mis-stamp it with t2's snapshot. t2's UPDATE is the control.
+	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'one-before')", t1))
+	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'two-before')", t2))
+	mustExec(fmt.Sprintf("UPDATE %s SET label='one-after' WHERE id=1", t1))
+	mustExec(fmt.Sprintf("UPDATE %s SET note='two-after' WHERE id=1", t2))
+
+	waitFor(t, 15*time.Second, func() bool {
+		var n int
+		if err := indexDB.QueryRow("SELECT COUNT(*) FROM binlog_events WHERE table_name IN (?, ?)", t1, t2).Scan(&n); err != nil {
+			return false
+		}
+		return n >= 4
+	}, "2 INSERT + 2 UPDATE indexed")
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("One returned error: %v", err)
+	}
+
+	// For each table, the UPDATE reversal must use a PK-SCOPED WHERE (names the PK
+	// column, NOT the non-PK column). t1's UPDATE is the discriminator; t2's the control.
+	assertPKScoped := func(table, pkCol, nonPKCol string) {
+		t.Helper()
+		rows, err := query.New(indexDB).Fetch(ctx, query.Options{Schema: "public", Table: table, Order: "ASC"})
+		if err != nil {
+			t.Fatalf("query %s: %v", table, err)
+		}
+		var upd *query.ResultRow
+		for i := range rows {
+			if rows[i].EventType == event.EventUpdate {
+				upd = &rows[i]
+			}
+		}
+		if upd == nil {
+			t.Fatalf("%s: no UPDATE event indexed", table)
+		}
+		if upd.SchemaVersion == 0 {
+			t.Errorf("%s UPDATE has SchemaVersion 0 — not stamped with its table's snapshot id", table)
+		}
+		var buf bytes.Buffer
+		if _, err := recovery.New(indexDB, nil).GenerateSQLFromRows([]query.ResultRow{*upd}, &buf); err != nil {
+			t.Fatalf("%s recovery: %v", table, err)
+		}
+		_, where, ok := strings.Cut(buf.String(), " WHERE ")
+		if !ok {
+			t.Fatalf("%s reversal has no WHERE clause: %s", table, buf.String())
+		}
+		if !strings.Contains(where, pkCol) {
+			t.Errorf("%s reversal WHERE does not name PK %q (PK-scoped expected): %s", table, pkCol, where)
+		}
+		if strings.Contains(where, nonPKCol) {
+			t.Errorf("%s reversal WHERE references non-PK %q — all-columns fallback, NOT PK-scoped (snapshot mis-stamped?): %s", table, nonPKCol, where)
+		}
+	}
+	assertPKScoped(t1, "id", "label")
+	assertPKScoped(t2, "id", "note")
+
+	// The oracle: schema_snapshots carries the PK flag and the captured PG type OID.
+	for _, table := range []string{t1, t2} {
+		var columnKey string
+		var oid sql.NullInt64
+		if err := indexDB.QueryRow(
+			`SELECT column_key, pg_type_oid FROM schema_snapshots
+			 WHERE schema_name='public' AND table_name=? AND column_name='id'`, table,
+		).Scan(&columnKey, &oid); err != nil {
+			t.Fatalf("%s snapshot row: %v", table, err)
+		}
+		if columnKey != "PRI" {
+			t.Errorf("%s.id column_key=%q, want PRI", table, columnKey)
+		}
+		if !oid.Valid || oid.Int64 == 0 {
+			t.Errorf("%s.id pg_type_oid is NULL/0, want the captured int4 OID", table)
+		}
+	}
+
+	// No unchanged-TOAST sentinel persisted under RI FULL.
+	var sentinels int
+	const marker = "%__bintrail_unchanged_toast__%"
+	if err := indexDB.QueryRow(
+		`SELECT COUNT(*) FROM binlog_events
+		 WHERE table_name IN (?, ?) AND (row_before LIKE ? OR row_after LIKE ?)`,
+		t1, t2, marker, marker,
+	).Scan(&sentinels); err != nil {
+		t.Fatalf("sentinel scan: %v", err)
+	}
+	if sentinels != 0 {
+		t.Errorf("found %d rows carrying the unchanged-TOAST sentinel, want 0 under RI FULL", sentinels)
 	}
 }
 

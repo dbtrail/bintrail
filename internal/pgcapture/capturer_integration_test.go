@@ -430,9 +430,12 @@ func collect(t *testing.T, ch <-chan event.Event, wantRows int, timeout time.Dur
 	for len(rows) < wantRows {
 		select {
 		case ev := <-ch:
-			if ev.EventType == event.EventCommit {
+			switch ev.EventType {
+			case event.EventCommit:
 				commits = append(commits, ev)
-			} else {
+			case event.EventRelation:
+				// Schema/shape event (#533) — not a row; ignore for row collection.
+			default:
 				rows = append(rows, ev)
 			}
 		case <-deadline.C:
@@ -443,9 +446,12 @@ func collect(t *testing.T, ch <-chan event.Event, wantRows int, timeout time.Dur
 	for {
 		select {
 		case ev := <-ch:
-			if ev.EventType == event.EventCommit {
+			switch ev.EventType {
+			case event.EventCommit:
 				commits = append(commits, ev)
-			} else {
+			case event.EventRelation:
+				// Schema/shape event (#533) — not a row; ignore for row collection.
+			default:
 				rows = append(rows, ev)
 			}
 		default:
