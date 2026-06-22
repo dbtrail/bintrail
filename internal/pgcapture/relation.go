@@ -29,11 +29,15 @@ type relationInfo struct {
 	schema  string
 	table   string
 	columns []relColumn           // ordinal order, matching the tuple column order
-	pkCols  []metadata.ColumnMeta // primary-key columns in ordinal order (from a PKResolver)
+	pkCols  []metadata.ColumnMeta // primary-key columns in table-ordinal order (cacheRelation reorders the PKResolver's key-order result so pk_values aligns with the offline resolver)
 }
 
-// PKResolver returns the primary-key columns of a relation, in ordinal order, used
-// to build event.Event.PKValues.
+// PKResolver returns the primary-key columns of a relation, in primary-key (indkey)
+// KEY order — the catalog order, which for a composite PK declared out of column
+// order differs from table-ordinal order. cacheRelation reorders the result to
+// table-ordinal before caching, so the pk_values it builds align with the offline
+// resolver's metadata.PKColumnMetas (also table-ordinal). Used to build
+// event.Event.PKValues.
 //
 // It must source the PK from the catalog (pg_index.indisprimary), NOT from the
 // RelationMessage's per-column "key" flag: under REPLICA IDENTITY FULL — the mode

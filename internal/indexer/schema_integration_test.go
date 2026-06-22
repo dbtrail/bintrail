@@ -3,6 +3,7 @@
 package indexer
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/testutil"
@@ -132,14 +133,19 @@ func TestEnsureSchemaAddsPGTypeColumns(t *testing.T) {
 	}
 
 	for _, col := range []string{"pg_type_oid", "pg_type_mod"} {
-		var nullable string
-		if err := db.QueryRow(`SELECT IS_NULLABLE FROM information_schema.COLUMNS
+		var nullable, columnType string
+		if err := db.QueryRow(`SELECT IS_NULLABLE, COLUMN_TYPE FROM information_schema.COLUMNS
 			WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'schema_snapshots' AND COLUMN_NAME = ?`,
-			col).Scan(&nullable); err != nil {
+			col).Scan(&nullable, &columnType); err != nil {
 			t.Fatalf("read %s column: %v", col, err)
 		}
 		if nullable != "YES" {
 			t.Errorf("%s IS_NULLABLE = %q, want \"YES\" (MySQL snapshots leave it NULL)", col, nullable)
+		}
+		// pg_type_oid holds a PostgreSQL pg_type OID (uint32); high user-type OIDs
+		// exceed int32, so the column must be UNSIGNED or they'd silently truncate.
+		if col == "pg_type_oid" && !strings.Contains(strings.ToLower(columnType), "unsigned") {
+			t.Errorf("pg_type_oid COLUMN_TYPE = %q, want an UNSIGNED int (PG OIDs are uint32)", columnType)
 		}
 	}
 
