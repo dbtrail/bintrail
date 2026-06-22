@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/dbtrail/dbtrail/internal/event"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/pgstreamrun"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/recovery"
@@ -286,6 +287,18 @@ func TestOne_MultiTable_PKScopedRecovery(t *testing.T) {
 		t.Fatalf("One returned error: %v", err)
 	}
 
+	// Build the recovery generator EXACTLY as the `bintrail-pg recover` command does
+	// (internal/cli/recover.go): the index db + the latest-snapshot resolver. This is
+	// the load-bearing path — PK-scoped WHERE depends on resolverForRow lazy-loading
+	// each row's own snapshot from the db (a nil-db or pre-empting top-level resolver
+	// would silently emit all-columns WHERE). For a PG index the latest snapshot is a
+	// SINGLE table, so this also proves the top-level resolver does not pre-empt the
+	// other table's per-row resolution.
+	latestResolver, err := metadata.NewResolver(indexDB, 0)
+	if err != nil {
+		t.Fatalf("NewResolver(latest): %v", err)
+	}
+
 	// For each table, the UPDATE reversal must use a PK-SCOPED WHERE (names the PK
 	// column, NOT the non-PK column). t1's UPDATE is the discriminator; t2's the control.
 	assertPKScoped := func(table, pkCol, nonPKCol string) {
@@ -307,7 +320,7 @@ func TestOne_MultiTable_PKScopedRecovery(t *testing.T) {
 			t.Errorf("%s UPDATE has SchemaVersion 0 — not stamped with its table's snapshot id", table)
 		}
 		var buf bytes.Buffer
-		if _, err := recovery.New(indexDB, nil).GenerateSQLFromRows([]query.ResultRow{*upd}, &buf); err != nil {
+		if _, err := recovery.New(indexDB, latestResolver).GenerateSQLFromRows([]query.ResultRow{*upd}, &buf); err != nil {
 			t.Fatalf("%s recovery: %v", table, err)
 		}
 		_, where, ok := strings.Cut(buf.String(), " WHERE ")
@@ -323,6 +336,19 @@ func TestOne_MultiTable_PKScopedRecovery(t *testing.T) {
 	}
 	assertPKScoped(t1, "id", "label")
 	assertPKScoped(t2, "id", "note")
+
+	// EventRelation must never be persisted as a binlog_events row (the consumer
+	// handles it out-of-band). A bare count of indexed rows would pass even if it
+	// leaked in, so assert event_type=8 (EventRelation) has zero rows.
+	var relRows int
+	if err := indexDB.QueryRow(
+		"SELECT COUNT(*) FROM binlog_events WHERE event_type = ?", uint8(event.EventRelation),
+	).Scan(&relRows); err != nil {
+		t.Fatalf("count EventRelation rows: %v", err)
+	}
+	if relRows != 0 {
+		t.Errorf("found %d EventRelation rows persisted to binlog_events, want 0 (it must be consumed out-of-band)", relRows)
+	}
 
 	// The oracle: schema_snapshots carries the PK flag and the captured PG type OID.
 	for _, table := range []string{t1, t2} {
