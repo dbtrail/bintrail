@@ -285,6 +285,53 @@ directly.
 
 ---
 
+## Type support
+
+bintrail-pg captures every value as its PostgreSQL text representation (the
+`pgoutput` text format) and, on recovery, regenerates it as a standard-conforming
+quoted literal that the target column's input function coerces back. Because the
+value is stored verbatim as text — never reparsed through a numeric type in the
+index — the `numeric`-via-`float64` precision class that the MySQL path had to guard
+against simply cannot occur here.
+
+The following types are **round-trip tested** — insert → capture → index → `recover`
+→ re-execute the reversal against live PostgreSQL, asserting the column's canonical
+`::text` is byte-for-byte identical — in `internal/pgstreamrun`
+(`TestOne_PGTypeRoundTripMatrix`, run across the PG 14/15/16/17 CI matrix):
+
+| Category | Types | Notes |
+|---|---|---|
+| Integer | `smallint`, `integer`, `bigint` | exact |
+| Arbitrary precision | `numeric` / `decimal` | full **precision and scale** preserved — values > 2^53 and trailing zeros (`1.50`) survive |
+| Floating point | `real`, `double precision` | |
+| Character | `text`, `varchar(n)`, `char(n)` | single quotes and backslashes escaped correctly (`standard_conforming_strings`); `char(n)` blank-padding preserved |
+| Boolean | `boolean` | |
+| UUID | `uuid` | |
+| Binary | `bytea` | hex (`\x…`) form |
+| JSON | `json`, `jsonb` | including embedded quotes |
+| Date / time | `date`, `time`, `timestamp`, `timestamptz`, `interval` | a `timestamptz`'s text form follows the server timezone (consistent within an instance) |
+| Network | `inet`, `cidr`, `macaddr` | |
+| Bit string | `bit(n)`, `varbit` | |
+| Range | `int4range` | the other built-in range types share the same text mechanism |
+| Array | `integer[]`, `text[]` | element quoting/escaping (e.g. a comma inside an element) preserved |
+| Geometric | `point` | |
+| Enum | user `ENUM` types | recovered **by label** — the target must declare the same enum type |
+| Money | `money` | round-trips, but its text form is **locale-dependent** (`$`-prefixed); recover into a target with the same `lc_monetary` |
+
+The generated reversal SQL is PostgreSQL dialect (double-quoted identifiers,
+standard-conforming string escaping, a `SET LOCAL standard_conforming_strings = on`
+guard) — the dialect is selected automatically from the source recorded in the index,
+so `bintrail-pg recover`, the console, and the MCP server all emit valid PostgreSQL
+for a PostgreSQL source.
+
+**Untested / best-effort:** `hstore` and other extension-provided types are covered
+under [Extensions and custom types](#extensions-and-custom-types) below. Composite
+types, multi-dimensional arrays, and arrays containing `NULL` are not yet in the
+round-trip suite — they are captured as text and are expected to coerce, but verify
+your own round-trip.
+
+---
+
 ## Extensions and custom types
 
 - **bintrail installs nothing in your database.** Capture is via the built-in

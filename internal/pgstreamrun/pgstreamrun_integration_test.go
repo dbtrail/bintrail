@@ -592,6 +592,182 @@ func TestOne_PGDialect_ReversalExecutesAgainstPostgres(t *testing.T) {
 	}
 }
 
+// TestOne_PGTypeRoundTripMatrix is the #533 type-fidelity audit: for a broad set of
+// PostgreSQL types, a value flows PG → pgoutput → index → recover → EXECUTE the
+// reverse-INSERT against live PostgreSQL, and the column's canonical ::text rendering
+// must round-trip byte-for-byte (no silent precision/encoding loss). Each type is its
+// own table (id PK + val) so a per-type failure is isolated; one pgstreamrun session
+// captures them all. The documented type-support matrix (docs/postgres.md) is derived
+// from what this test proves — repro > cita.
+func TestOne_PGTypeRoundTripMatrix(t *testing.T) {
+	pgDSN := testutil.SkipIfNoPostgres(t)
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	indexDB, dbName := testutil.CreateTestDB(t)
+	indexDSN := testutil.BaseDSN() + "/" + dbName
+
+	const slot = "bintrail_pgtypes"
+	const pub = "bintrail_pgtypes_pub"
+
+	pg, err := pgx.Connect(ctx, pgDSN)
+	if err != nil {
+		t.Fatalf("connect PG: %v", err)
+	}
+	t.Cleanup(func() { pg.Close(context.Background()) })
+
+	// name → (column type DDL, value SQL as it appears in VALUES). Values are chosen
+	// scary-first: precision (>2^53), scale (trailing zero), escaping (quote+backslash),
+	// and the format-bearing types (bytea \x, arrays, ranges, bit, inet, json).
+	type tc struct{ name, typeDDL, valSQL string }
+	cases := []tc{
+		{"smallint", "smallint", "32767"},
+		{"integer", "integer", "-2147483648"},
+		{"bigint", "bigint", "9223372036854775807"},
+		{"numeric_big", "numeric", "18446744073709551615"}, // > 2^53, precision
+		{"numeric_scale", "numeric(12,2)", "1.50"},         // trailing-zero scale
+		{"real", "real", "3.5"},
+		{"double", "double precision", "2.5"},
+		{"text_tricky", "text", `'O''Brien \ C:\back'`}, // quote + backslash escaping
+		{"varchar", "varchar(32)", "'hello world'"},
+		{"char", "char(5)", "'ab'"}, // blank-padded
+		{"boolean", "boolean", "true"},
+		{"uuid", "uuid", "'11111111-2222-3333-4444-555555555555'"},
+		{"bytea", "bytea", `'\xdeadbeef00'`},
+		{"json", "json", `'{"k": "v"}'`},
+		{"jsonb", "jsonb", `'{"k": "v''s"}'`}, // embedded quote
+		{"date", "date", "'2026-06-22'"},
+		{"time", "time", "'12:34:56'"},
+		{"timestamp", "timestamp", "'2026-06-22 12:34:56'"},
+		{"timestamptz", "timestamptz", "'2026-06-22 12:34:56+00'"},
+		{"interval", "interval", "'1 day 02:03:04'"},
+		{"inet", "inet", "'192.168.1.10'"},
+		{"cidr", "cidr", "'10.0.0.0/8'"},
+		{"macaddr", "macaddr", "'08:00:2b:01:02:03'"},
+		{"bit", "bit(4)", "'1010'"},
+		{"varbit", "varbit", "'101'"},
+		{"int4range", "int4range", "'[1,10)'"},
+		{"int_array", "integer[]", "'{1,2,3}'"},
+		{"text_array", "text[]", `'{"a","b,c"}'`}, // element with a comma
+		{"point", "point", "'(1,2)'"},
+		{"money", "money", "'1.50'"}, // locale-dependent output ('$1.50'); same instance, so stable
+		{"enum", "mood", "'happy'"},  // custom enum (created below)
+	}
+
+	tblOf := func(name string) string { return "pgtype_" + name }
+	dropAll := func() {
+		bg := context.Background()
+		_, _ = pg.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		for _, c := range cases {
+			_, _ = pg.Exec(bg, "DROP TABLE IF EXISTS "+tblOf(c.name))
+		}
+		_, _ = pg.Exec(bg, "DROP TYPE IF EXISTS mood")
+		_, _ = pg.Exec(bg, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+	}
+	dropAll()
+	t.Cleanup(dropAll)
+
+	mustExec := func(sqlStr string) {
+		t.Helper()
+		if _, err := pg.Exec(ctx, sqlStr); err != nil {
+			t.Fatalf("exec %q: %v", sqlStr, err)
+		}
+	}
+	mustExec("CREATE TYPE mood AS ENUM ('happy','sad')")
+	tbls := make([]string, len(cases))
+	for i, c := range cases {
+		tbl := tblOf(c.name)
+		tbls[i] = tbl
+		mustExec(fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, val %s)", tbl, c.typeDDL))
+		mustExec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", tbl))
+	}
+	mustExec("CREATE PUBLICATION " + pub + " FOR TABLE " + strings.Join(tbls, ", "))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cfg := pgstreamrun.Config{
+		IndexDSN: indexDSN, ReplDSN: replDSN(pgDSN), QueryDSN: pgDSN,
+		SlotName: slot, Publication: pub, ServerID: 45,
+		BatchSize: 200, Checkpoint: 200 * time.Millisecond,
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- pgstreamrun.One(runCtx, cfg) }()
+	waitFor(t, 15*time.Second, func() bool {
+		var active bool
+		if err := pg.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&active); err != nil {
+			return false
+		}
+		return active
+	}, "replication slot active")
+
+	// INSERT then DELETE one row per type; capture the original canonical ::text first.
+	orig := make(map[string]string, len(cases))
+	for _, c := range cases {
+		tbl := tblOf(c.name)
+		mustExec(fmt.Sprintf("INSERT INTO %s (id, val) VALUES (1, %s)", tbl, c.valSQL))
+		var got sql.NullString
+		if err := pg.QueryRow(ctx, fmt.Sprintf("SELECT val::text FROM %s WHERE id=1", tbl)).Scan(&got); err != nil {
+			t.Fatalf("%s: capture original: %v", c.name, err)
+		}
+		orig[c.name] = got.String
+		mustExec(fmt.Sprintf("DELETE FROM %s WHERE id=1", tbl))
+	}
+
+	wantEvents := 2 * len(cases) // INSERT + DELETE per table
+	waitFor(t, 30*time.Second, func() bool {
+		var n int
+		if err := indexDB.QueryRow("SELECT COUNT(*) FROM binlog_events WHERE schema_name='public'").Scan(&n); err != nil {
+			return false
+		}
+		return n >= wantEvents
+	}, "all type events indexed")
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("One returned error: %v", err)
+	}
+
+	resolver, err := metadata.NewResolver(indexDB, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			tbl := tblOf(c.name)
+			rows, err := query.New(indexDB).Fetch(ctx, query.Options{Schema: "public", Table: tbl, Order: "ASC"})
+			if err != nil {
+				t.Fatalf("fetch: %v", err)
+			}
+			var del *query.ResultRow
+			for i := range rows {
+				if rows[i].EventType == event.EventDelete {
+					del = &rows[i]
+				}
+			}
+			if del == nil {
+				t.Fatalf("no DELETE event indexed for %s", tbl)
+			}
+			var buf bytes.Buffer
+			if _, err := recovery.NewForDialect(indexDB, resolver, recovery.PostgresDialect).
+				GenerateSQLFromRows([]query.ResultRow{*del}, &buf); err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			if _, err := pg.Exec(ctx, buf.String()); err != nil {
+				t.Fatalf("reverse INSERT did not execute against PostgreSQL: %v\nSQL:\n%s", err, buf.String())
+			}
+			var got sql.NullString
+			if err := pg.QueryRow(ctx, fmt.Sprintf("SELECT val::text FROM %s WHERE id=1", tbl)).Scan(&got); err != nil {
+				t.Fatalf("re-select: %v", err)
+			}
+			if got.String != orig[c.name] {
+				t.Errorf("round-trip mismatch (%s):\n got  %q\n want %q", c.typeDDL, got.String, orig[c.name])
+			}
+		})
+	}
+}
+
 // ── helpers ──
 
 func replDSN(base string) string {
