@@ -868,3 +868,134 @@ func TestFormatValue_byteSliceWithNullByte(t *testing.T) {
 		t.Errorf("arbitrary []byte: got %q", got)
 	}
 }
+
+// ─── PostgreSQL dialect (#533) ──────────────────────────────────────────────────
+
+func TestQuoteNamePG(t *testing.T) {
+	cases := map[string]string{
+		"id":     `"id"`,
+		"My Col": `"My Col"`,
+		`we"ird`: `"we""ird"`, // embedded double-quote doubled
+	}
+	for in, want := range cases {
+		if got := quoteNamePG(in); got != want {
+			t.Errorf("quoteNamePG(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestEscapePGString(t *testing.T) {
+	// standard_conforming_strings=on: double the single quote, leave backslash literal.
+	cases := map[string]string{
+		"O'Brien":                "O''Brien", // MySQL would emit O\'Brien → PG syntax error
+		`C:\path`:                `C:\path`,  // backslash NOT doubled — MySQL would → silent corruption
+		"plain":                  "plain",
+		"":                       "",
+		"a'b'c":                  "a''b''c",
+		`back\slash and 'quote'`: `back\slash and ''quote''`, // both together
+	}
+	for in, want := range cases {
+		if got := escapePGString(in); got != want {
+			t.Errorf("escapePGString(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFormatValuePG(t *testing.T) {
+	if got := formatValuePG(nil); got != "NULL" {
+		t.Errorf("nil → %q, want NULL", got)
+	}
+	if got := formatValuePG("O'Brien"); got != "'O''Brien'" {
+		t.Errorf("quote string → %q, want 'O''Brien'", got)
+	}
+	if got := formatValuePG(`C:\win`); got != `'C:\win'` {
+		t.Errorf("backslash string → %q, want '%s' (literal backslash, not doubled)", got, `C:\win`)
+	}
+	// Defensive json.Number path: >2^53 verbatim, no float64 rounding.
+	if got := formatValuePG(json.Number("18446744073709551615")); got != "18446744073709551615" {
+		t.Errorf("json.Number → %q, want verbatim", got)
+	}
+	if got := formatValuePG(true); got != "true" {
+		t.Errorf("bool true → %q, want true", got)
+	}
+}
+
+func TestGeneratePG_ReverseInsertDialect(t *testing.T) {
+	// A PostgreSQL-dialect reverse INSERT (from a DELETE event): double-quoted
+	// identifiers + standard-conforming string escaping; NO MySQL backticks / \' / X''.
+	g := NewForDialect(nil, nil, PostgresDialect)
+	row := query.ResultRow{
+		EventID: 1, SchemaName: "public", TableName: "t",
+		EventType: parser.EventDelete,
+		RowBefore: map[string]any{
+			"id":   "1",
+			"name": "O'Brien",
+			"path": `C:\win`,
+			"num":  "18446744073709551615",
+		},
+	}
+	stmt, err := g.generateInsert(row)
+	if err != nil {
+		t.Fatalf("generateInsert: %v", err)
+	}
+	if !strings.Contains(stmt, `INSERT INTO "public"."t"`) {
+		t.Errorf("want double-quoted schema.table, got: %s", stmt)
+	}
+	if strings.Contains(stmt, "`") {
+		t.Errorf("PG SQL must not contain backticks: %s", stmt)
+	}
+	if !strings.Contains(stmt, `'O''Brien'`) {
+		t.Errorf("want ''-doubled quote, got: %s", stmt)
+	}
+	if !strings.Contains(stmt, `'C:\win'`) || strings.Contains(stmt, `C:\\win`) {
+		t.Errorf("backslash must stay literal (not doubled), got: %s", stmt)
+	}
+}
+
+func TestGeneratePG_ReverseDeleteWhereDialect(t *testing.T) {
+	// PG reverse DELETE (from an INSERT event): PK-scoped WHERE with a double-quoted id.
+	resolver := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"public.t": {
+			Schema: "public", Table: "t",
+			Columns:   []metadata.ColumnMeta{{Name: "id", IsPK: true}, {Name: "v"}},
+			PKColumns: []string{"id"},
+		},
+	})
+	g := NewForDialect(nil, resolver, PostgresDialect)
+	row := query.ResultRow{
+		EventID: 2, SchemaName: "public", TableName: "t",
+		EventType: parser.EventInsert, SchemaVersion: 0,
+		RowAfter: map[string]any{"id": "5", "v": "x"},
+	}
+	stmt, err := g.generateDelete(row)
+	if err != nil {
+		t.Fatalf("generateDelete: %v", err)
+	}
+	if !strings.Contains(stmt, `DELETE FROM "public"."t" WHERE "id" = '5'`) {
+		t.Errorf("want PG PK-scoped WHERE, got: %s", stmt)
+	}
+	if strings.Contains(stmt, "`") {
+		t.Errorf("PG SQL must not contain backticks: %s", stmt)
+	}
+}
+
+// TestGenerate_MySQLDialectUnchanged guards the additive change: the default
+// (MySQL) generator output is byte-identical to before — backticks, not double quotes.
+func TestGenerate_MySQLDialectUnchanged(t *testing.T) {
+	g := newGen() // New(nil,nil) → MySQLDialect
+	row := query.ResultRow{
+		EventID: 1, SchemaName: "db", TableName: "t",
+		EventType: parser.EventDelete,
+		RowBefore: map[string]any{"id": "1", "name": "O'Brien"},
+	}
+	stmt, err := g.generateInsert(row)
+	if err != nil {
+		t.Fatalf("generateInsert: %v", err)
+	}
+	if !strings.Contains(stmt, "INSERT INTO `db`.`t`") {
+		t.Errorf("MySQL dialect must use backticks, got: %s", stmt)
+	}
+	if !strings.Contains(stmt, `'O\'Brien'`) {
+		t.Errorf("MySQL dialect must backslash-escape the quote, got: %s", stmt)
+	}
+}

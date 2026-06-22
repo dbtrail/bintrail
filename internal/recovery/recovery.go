@@ -23,17 +23,48 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
+// Dialect selects the SQL dialect for generated reversal SQL. The index is
+// single-source (stream_state.flavor), so the dialect is decided ONCE at
+// construction from that authoritative signal — never inferred per-row from
+// resolver/type presence, which would silently emit the wrong dialect for a row
+// whose snapshot failed to load (the all-columns fallback path).
+type Dialect int
+
+const (
+	// MySQLDialect emits MySQL/MariaDB SQL: backtick identifiers, X'..' hex blobs,
+	// backslash string escaping. The default, and the only dialect the MySQL-source
+	// path — and the reconstruct mydumper writer, via the exported FormatSQLValue/
+	// QuoteName — has ever produced.
+	MySQLDialect Dialect = iota
+	// PostgresDialect emits PostgreSQL SQL: double-quoted identifiers and
+	// standard-conforming-string escaping ('' doubling, no backslash). Values
+	// captured from pgoutput are already in PostgreSQL's canonical text form, so a
+	// quoted literal coerces into the target column's type on INSERT/UPDATE/WHERE —
+	// the dialect difference is identifier quoting + string escaping, not per-type
+	// literal forms (#533).
+	PostgresDialect
+)
+
 // Generator produces reversal SQL from indexed binlog events.
 type Generator struct {
 	db       *sql.DB
 	resolver *metadata.Resolver            // default resolver (latest snapshot); may be nil
 	cache    map[uint32]*metadata.Resolver // per-snapshot resolvers, loaded lazily
+	dialect  Dialect
 }
 
-// New creates a Generator. resolver may be nil — in that case, WHERE clauses
-// for UPDATE and DELETE reversals will use ALL row columns instead of just PKs.
+// New creates a Generator emitting MySQL-dialect SQL. resolver may be nil — in that
+// case, WHERE clauses for UPDATE and DELETE reversals will use ALL row columns
+// instead of just PKs.
 func New(db *sql.DB, resolver *metadata.Resolver) *Generator {
-	return &Generator{db: db, resolver: resolver}
+	return &Generator{db: db, resolver: resolver, dialect: MySQLDialect}
+}
+
+// NewForDialect is New with an explicit SQL dialect. Callers that know the source
+// flavor (e.g. `bintrail-pg recover` reading stream_state.flavor) pass
+// PostgresDialect; everything else uses New (MySQL).
+func NewForDialect(db *sql.DB, resolver *metadata.Resolver, dialect Dialect) *Generator {
+	return &Generator{db: db, resolver: resolver, dialect: dialect}
 }
 
 // resolverForRow returns the resolver matching the row's schema version.
@@ -168,11 +199,11 @@ func (g *Generator) generateInsert(row query.ResultRow) (string, error) {
 		if genCols[col] {
 			continue
 		}
-		colParts = append(colParts, QuoteName(col))
-		valParts = append(valParts, FormatSQLValue(row.RowBefore[col]))
+		colParts = append(colParts, g.quoteName(col))
+		valParts = append(valParts, g.formatValue(row.RowBefore[col]))
 	}
 	return fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES (%s)",
-		QuoteName(row.SchemaName), QuoteName(row.TableName),
+		g.quoteName(row.SchemaName), g.quoteName(row.TableName),
 		strings.Join(colParts, ", "),
 		strings.Join(valParts, ", "),
 	), nil
@@ -196,15 +227,15 @@ func (g *Generator) generateUpdate(row query.ResultRow) (string, error) {
 		if genCols[col] {
 			continue
 		}
-		setParts = append(setParts, QuoteName(col)+" = "+FormatSQLValue(row.RowBefore[col]))
+		setParts = append(setParts, g.quoteName(col)+" = "+g.formatValue(row.RowBefore[col]))
 	}
 
 	// WHERE uses row_after (current state), so the UPDATE finds the right row
 	// even if the PK itself was changed in the original UPDATE.
-	whereParts := pkWhereClauseFromResolver(r, row.SchemaName, row.TableName, row.RowAfter)
+	whereParts := g.pkWhereClause(r, row.SchemaName, row.TableName, row.RowAfter)
 
 	return fmt.Sprintf("UPDATE %s.%s SET %s WHERE %s",
-		QuoteName(row.SchemaName), QuoteName(row.TableName),
+		g.quoteName(row.SchemaName), g.quoteName(row.TableName),
 		strings.Join(setParts, ", "),
 		strings.Join(whereParts, " AND "),
 	), nil
@@ -217,9 +248,9 @@ func (g *Generator) generateDelete(row query.ResultRow) (string, error) {
 		return "", fmt.Errorf("row_after is nil for INSERT event (event_id=%d)", row.EventID)
 	}
 	r := g.resolverForRow(row)
-	whereParts := pkWhereClauseFromResolver(r, row.SchemaName, row.TableName, row.RowAfter)
+	whereParts := g.pkWhereClause(r, row.SchemaName, row.TableName, row.RowAfter)
 	return fmt.Sprintf("DELETE FROM %s.%s WHERE %s",
-		QuoteName(row.SchemaName), QuoteName(row.TableName),
+		g.quoteName(row.SchemaName), g.quoteName(row.TableName),
 		strings.Join(whereParts, " AND "),
 	), nil
 }
@@ -249,10 +280,13 @@ func generatedColsFromResolver(resolver *metadata.Resolver, schema, table string
 	return gen
 }
 
-// pkWhereClauseFromResolver builds "pk_col = val AND ..." from the given resolver.
-// Falls back to ALL columns if the table cannot be resolved (e.g. table was
-// dropped, or no snapshot was loaded).
-func pkWhereClauseFromResolver(resolver *metadata.Resolver, schema, table string, row map[string]any) []string {
+// pkWhereClause builds "pk_col = val AND ..." from the given resolver, in the
+// Generator's dialect. Falls back to ALL columns if the table cannot be resolved
+// (e.g. table was dropped, or no snapshot was loaded). Note: on the PostgreSQL
+// path the all-columns fallback can emit `"col" = '...'` for a json column, which
+// has no `=` operator in PostgreSQL (jsonb does) — PK-scoped (the #533 norm) avoids
+// it since PKs are scalars.
+func (g *Generator) pkWhereClause(resolver *metadata.Resolver, schema, table string, row map[string]any) []string {
 	if resolver != nil {
 		tm, err := resolver.Resolve(schema, table)
 		if err != nil {
@@ -269,7 +303,7 @@ func pkWhereClauseFromResolver(resolver *metadata.Resolver, schema, table string
 						allFound = false
 						break
 					}
-					parts = append(parts, QuoteName(pk.Name)+" = "+FormatSQLValue(v))
+					parts = append(parts, g.quoteName(pk.Name)+" = "+g.formatValue(v))
 				}
 				if allFound {
 					return parts
@@ -279,14 +313,14 @@ func pkWhereClauseFromResolver(resolver *metadata.Resolver, schema, table string
 	}
 	// Fallback: all columns — verbose but always uniquely identifies the row
 	// (assuming the table has no duplicates, which is true for well-formed data).
-	return allColsWhere(row)
+	return g.allColsWhere(row)
 }
 
-func allColsWhere(row map[string]any) []string {
+func (g *Generator) allColsWhere(row map[string]any) []string {
 	cols := sortedKeys(row)
 	parts := make([]string, len(cols))
 	for i, col := range cols {
-		parts[i] = QuoteName(col) + " = " + FormatSQLValue(row[col])
+		parts[i] = g.quoteName(col) + " = " + g.formatValue(row[col])
 	}
 	return parts
 }
@@ -396,6 +430,70 @@ func EscapeString(s string) string {
 // escaping any backticks in the name itself.
 func QuoteName(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
+}
+
+// ─── Dialect dispatch (#533) ───────────────────────────────────────────────────
+
+// quoteName quotes an identifier in the Generator's dialect.
+func (g *Generator) quoteName(name string) string {
+	if g.dialect == PostgresDialect {
+		return quoteNamePG(name)
+	}
+	return QuoteName(name)
+}
+
+// formatValue renders a value as a literal in the Generator's dialect.
+func (g *Generator) formatValue(v any) string {
+	if g.dialect == PostgresDialect {
+		return formatValuePG(v)
+	}
+	return FormatSQLValue(v)
+}
+
+// quoteNamePG wraps a PostgreSQL identifier in double quotes, doubling any embedded
+// double quote.
+func quoteNamePG(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// escapePGString escapes a string for a PostgreSQL single-quoted literal under
+// standard_conforming_strings=on (PostgreSQL's default for 15+ years; the emitted
+// SQL is portable under it): only the single quote is doubled. A backslash is a
+// LITERAL backslash and must NOT be doubled — doubling it (as MySQL escaping does)
+// would silently store two backslashes. PostgreSQL text cannot contain a NUL byte
+// and pgoutput never delivers one, so none is handled.
+func escapePGString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// formatValuePG renders a Go value as a PostgreSQL literal. Values captured from
+// pgoutput arrive here as Go strings (pgoutput text mode) or nil — and a quoted,
+// standard-conforming-escaped string coerces into the target column's type on
+// INSERT/UPDATE/WHERE, so no per-type literal forms are needed (a numeric, uuid,
+// bytea '\x..', jsonb, bool 't', timestamptz, etc. all coerce from their canonical
+// text). The non-string cases are DEFENSIVE: they should not occur on the
+// PostgreSQL path (which stores every value as text), but are handled so a stray
+// value never emits invalid SQL.
+func formatValuePG(v any) string {
+	if v == nil {
+		return "NULL"
+	}
+	switch val := v.(type) {
+	case string:
+		return "'" + escapePGString(val) + "'"
+	case json.Number:
+		// Defensive: PG values are stored as strings, not json.Number; if one
+		// appears, emit it verbatim (a valid numeric literal, no float64 rounding).
+		return string(val)
+	case bool:
+		if val {
+			return "true"
+		}
+		return "false"
+	default:
+		// Defensive: any other Go type → its text form, quoted + escaped.
+		return "'" + escapePGString(fmt.Sprintf("%v", val)) + "'"
+	}
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

@@ -383,6 +383,185 @@ func TestOne_MultiTable_PKScopedRecovery(t *testing.T) {
 	}
 }
 
+// TestOne_PGDialect_ReversalExecutesAgainstPostgres is the #533 PG-dialect proof:
+// the reversal SQL bintrail-pg generates for PG-origin rows is valid PostgreSQL — it
+// EXECUTES against the live source and round-trips the values, including the escaping
+// cases the MySQL dialect would break: a single quote (MySQL `\'` → PG syntax error)
+// and a backslash (MySQL `\\` → silently stored doubled). Mirrors the `bintrail-pg
+// recover` construction: recovery.NewForDialect(indexDB, NewResolver(indexDB,0),
+// PostgresDialect). Covers a reverse INSERT (VALUES, all scary types) and a reverse
+// DELETE (PK-scoped WHERE), each executed against PostgreSQL.
+func TestOne_PGDialect_ReversalExecutesAgainstPostgres(t *testing.T) {
+	pgDSN := testutil.SkipIfNoPostgres(t)
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	indexDB, dbName := testutil.CreateTestDB(t)
+	indexDSN := testutil.BaseDSN() + "/" + dbName
+
+	const slot = "bintrail_pgdialect"
+	const pub = "bintrail_pgdialect_pub"
+	const tbl = "pgdialect_t"
+
+	pg, err := pgx.Connect(ctx, pgDSN)
+	if err != nil {
+		t.Fatalf("connect PG: %v", err)
+	}
+	t.Cleanup(func() { pg.Close(context.Background()) })
+
+	dropAll := func() {
+		bg := context.Background()
+		_, _ = pg.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		_, _ = pg.Exec(bg, "DROP TABLE IF EXISTS "+tbl)
+		_, _ = pg.Exec(bg, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+	}
+	dropAll()
+	t.Cleanup(dropAll)
+
+	mustExec := func(sqlStr string, args ...any) {
+		t.Helper()
+		if _, err := pg.Exec(ctx, sqlStr, args...); err != nil {
+			t.Fatalf("exec %q: %v", sqlStr, err)
+		}
+	}
+	mustExec(fmt.Sprintf(`CREATE TABLE %s (
+		id int PRIMARY KEY, name text, num numeric, frac numeric, bin bytea,
+		uid uuid, doc jsonb, flag boolean, ts timestamptz)`, tbl))
+	mustExec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", tbl))
+	mustExec(fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cfg := pgstreamrun.Config{
+		IndexDSN: indexDSN, ReplDSN: replDSN(pgDSN), QueryDSN: pgDSN,
+		SlotName: slot, Publication: pub, ServerID: 44,
+		BatchSize: 100, Checkpoint: 200 * time.Millisecond,
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- pgstreamrun.One(runCtx, cfg) }()
+	waitFor(t, 15*time.Second, func() bool {
+		var active bool
+		if err := pg.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&active); err != nil {
+			return false
+		}
+		return active
+	}, "replication slot active")
+
+	// The escaping-critical value: a single quote AND a backslash. With MySQL escaping
+	// the quote would make the INSERT a syntax error and the backslash would be
+	// silently doubled. numeric > 2^53 guards precision; jsonb carries an embedded
+	// quote too.
+	const trickyName = `O'Brien \ C:\back`
+	const bigNum = "18446744073709551615"
+	selCanonical := fmt.Sprintf("SELECT name, num::text, frac::text, encode(bin,'hex'), uid::text, doc::text, flag::text, ts::text FROM %s WHERE id=1", tbl)
+	type rowText struct{ name, num, frac, bin, uid, doc, flag, ts string }
+	// frac=1.50 proves numeric SCALE fidelity (trailing zero), not just integer precision.
+	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (1, $1, $2, 1.50, '\\xdeadbeef', '11111111-1111-1111-1111-111111111111', $3, true, '2026-06-22 12:00:00+00')", tbl),
+		trickyName, bigNum, `{"k": "v's"}`)
+	// Capture PostgreSQL's canonical text rendering BEFORE the row is deleted.
+	var orig rowText
+	if err := pg.QueryRow(ctx, selCanonical).Scan(&orig.name, &orig.num, &orig.frac, &orig.bin, &orig.uid, &orig.doc, &orig.flag, &orig.ts); err != nil {
+		t.Fatalf("capture original canonical text: %v", err)
+	}
+	mustExec(fmt.Sprintf("DELETE FROM %s WHERE id=1", tbl))
+
+	waitFor(t, 15*time.Second, func() bool {
+		var n int
+		if err := indexDB.QueryRow("SELECT COUNT(*) FROM binlog_events WHERE table_name = ?", tbl).Scan(&n); err != nil {
+			return false
+		}
+		return n >= 2 // INSERT + DELETE
+	}, "INSERT+DELETE indexed")
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("One returned error: %v", err)
+	}
+
+	rows, err := query.New(indexDB).Fetch(ctx, query.Options{Schema: "public", Table: tbl, Order: "ASC"})
+	if err != nil {
+		t.Fatalf("query Fetch: %v", err)
+	}
+	var insRow, delRow *query.ResultRow
+	for i := range rows {
+		switch rows[i].EventType {
+		case event.EventInsert:
+			insRow = &rows[i]
+		case event.EventDelete:
+			delRow = &rows[i]
+		}
+	}
+	if insRow == nil || delRow == nil {
+		t.Fatalf("expected an INSERT and a DELETE event, got %d rows", len(rows))
+	}
+
+	// The bintrail-pg recover construction: index db + latest resolver + PG dialect.
+	resolver, err := metadata.NewResolver(indexDB, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	genPG := func(r query.ResultRow) string {
+		var buf bytes.Buffer
+		if _, err := recovery.NewForDialect(indexDB, resolver, recovery.PostgresDialect).
+			GenerateSQLFromRows([]query.ResultRow{r}, &buf); err != nil {
+			t.Fatalf("GenerateSQLFromRows: %v", err)
+		}
+		return buf.String()
+	}
+
+	// ── Reverse the DELETE → a reverse INSERT (VALUES, all scary types). The row is
+	// currently gone; executing the reversal against live PostgreSQL must reconstruct
+	// it byte-for-byte. A MySQL-dialect reversal would NOT execute here. ──
+	reverseInsert := genPG(*delRow)
+	if strings.Contains(reverseInsert, "`") {
+		t.Errorf("PG reversal contains MySQL backticks:\n%s", reverseInsert)
+	}
+	if _, err := pg.Exec(ctx, reverseInsert); err != nil {
+		t.Fatalf("PG-dialect reverse INSERT failed to execute against PostgreSQL: %v\nSQL:\n%s", err, reverseInsert)
+	}
+	var got rowText
+	if err := pg.QueryRow(ctx, selCanonical).Scan(&got.name, &got.num, &got.frac, &got.bin, &got.uid, &got.doc, &got.flag, &got.ts); err != nil {
+		t.Fatalf("re-select after reverse INSERT: %v", err)
+	}
+	if got != orig {
+		t.Errorf("round-trip mismatch:\n got  %+v\n want %+v", got, orig)
+	}
+	// The escaping killer, asserted independently of the canonical capture: the exact
+	// bytes must survive — quote round-tripped, backslash NOT doubled.
+	if got.name != trickyName {
+		t.Errorf("name = %q, want exactly %q (quote/backslash escaping bug)", got.name, trickyName)
+	}
+	if got.num != bigNum {
+		t.Errorf("numeric = %q, want %q (precision lost)", got.num, bigNum)
+	}
+	if got.frac != "1.50" {
+		t.Errorf("fractional numeric = %q, want \"1.50\" (scale/trailing-zero not preserved)", got.frac)
+	}
+	// Typed boolean read: the canonical SELECT renders bool as 't' on both sides, so a
+	// typed read is what actually proves the value (not the text) round-tripped.
+	var flagBool bool
+	if err := pg.QueryRow(ctx, fmt.Sprintf("SELECT flag FROM %s WHERE id=1", tbl)).Scan(&flagBool); err != nil {
+		t.Fatalf("typed bool read: %v", err)
+	}
+	if !flagBool {
+		t.Error("flag round-tripped as false, want true")
+	}
+
+	// ── Reverse the INSERT → a reverse DELETE (PK-scoped WHERE). Executing it must
+	// remove the row again — proving the PG WHERE dialect (double-quoted id) runs. ──
+	reverseDelete := genPG(*insRow)
+	if _, err := pg.Exec(ctx, reverseDelete); err != nil {
+		t.Fatalf("PG-dialect reverse DELETE failed to execute against PostgreSQL: %v\nSQL:\n%s", err, reverseDelete)
+	}
+	var cnt int
+	if err := pg.QueryRow(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE id=1", tbl)).Scan(&cnt); err != nil {
+		t.Fatalf("count after reverse DELETE: %v", err)
+	}
+	if cnt != 0 {
+		t.Errorf("reverse DELETE left %d rows, want 0 (PK-scoped WHERE did not match)", cnt)
+	}
+}
+
 // ── helpers ──
 
 func replDSN(base string) string {
