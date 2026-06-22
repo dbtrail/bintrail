@@ -323,11 +323,12 @@ type PGRelationColumn struct {
 	IsPK    bool
 	TypeOID uint32
 	TypeMod int32
-	// IdentityAlways = GENERATED ALWAYS AS IDENTITY; Generated = STORED generated
+	// IsIdentityAlways = GENERATED ALWAYS AS IDENTITY; IsGenerated = STORED generated
 	// column. From a catalog lookup (the RelationMessage carries neither); they drive
-	// #557 recovery (OVERRIDING SYSTEM VALUE + the per-operation skip-sets).
-	IdentityAlways bool
-	Generated      bool
+	// #557 recovery (OVERRIDING SYSTEM VALUE + the per-operation skip-sets). The two are
+	// mutually exclusive (a column is identity OR generated, never both).
+	IsIdentityAlways bool
+	IsGenerated      bool
 }
 
 // PGRelationSchema is a PostgreSQL relation's shape as seen on the logical-
@@ -405,8 +406,8 @@ func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 		}
 		args = append(args,
 			nextID, snapshotTime, rel.Schema, rel.Table, c.Name,
-			c.Ordinal, columnKey, "", nil, "", nil, c.Generated,
-			c.TypeOID, c.TypeMod, c.IdentityAlways,
+			c.Ordinal, columnKey, "", nil, "", nil, c.IsGenerated,
+			c.TypeOID, c.TypeMod, c.IsIdentityAlways,
 		)
 	}
 	if _, err = tx.Exec(insertSQL, args...); err != nil {

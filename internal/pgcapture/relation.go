@@ -19,13 +19,13 @@ type relColumn struct {
 	name    string
 	typeOID uint32
 	typeMod int32
-	// identityAlways = GENERATED ALWAYS AS IDENTITY (pg_attribute.attidentity='a');
-	// generated = STORED generated column (attgenerated='s'). Both come from a catalog
+	// isIdentityAlways = GENERATED ALWAYS AS IDENTITY (pg_attribute.attidentity='a');
+	// isGenerated = STORED generated column (attgenerated='s'). Both come from a catalog
 	// lookup (the RelationMessage carries neither) and drive #557 recovery: a reverse-
 	// INSERT omits generated columns (and emits OVERRIDING SYSTEM VALUE for identity),
 	// a reverse-UPDATE SET omits BOTH (PostgreSQL rejects SET on either).
-	identityAlways bool
-	generated      bool
+	isIdentityAlways bool
+	isGenerated      bool
 }
 
 // relationInfo is the decoder's cached knowledge of one relation, keyed by its
@@ -103,10 +103,11 @@ func queryPK(ctx context.Context, conn *pgx.Conn, relationID uint32) ([]metadata
 }
 
 // ColumnAttrs are the per-column catalog flags the RelationMessage does not carry,
-// needed for #557 recovery correctness.
+// needed for #557 recovery correctness. The two flags are mutually exclusive: a
+// PostgreSQL column is an identity column OR a generated column, never both.
 type ColumnAttrs struct {
-	IdentityAlways bool // GENERATED ALWAYS AS IDENTITY (attidentity='a')
-	Generated      bool // STORED generated column (attgenerated='s')
+	IsIdentityAlways bool // GENERATED ALWAYS AS IDENTITY (attidentity='a')
+	IsGenerated      bool // STORED generated column (attgenerated='s')
 }
 
 // AttrResolver returns the identity/generated flags for a relation's columns, keyed
@@ -142,11 +143,11 @@ func queryColumnAttrs(ctx context.Context, conn *pgx.Conn, relationID uint32) (m
 	attrs := make(map[string]ColumnAttrs)
 	for rows.Next() {
 		var name string
-		var identityAlways, generated bool
-		if err := rows.Scan(&name, &identityAlways, &generated); err != nil {
+		var isIdentityAlways, isGenerated bool
+		if err := rows.Scan(&name, &isIdentityAlways, &isGenerated); err != nil {
 			return nil, fmt.Errorf("pgcapture: scan column attrs for relation OID %d: %w", relationID, err)
 		}
-		attrs[name] = ColumnAttrs{IdentityAlways: identityAlways, Generated: generated}
+		attrs[name] = ColumnAttrs{IsIdentityAlways: isIdentityAlways, IsGenerated: isGenerated}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("pgcapture: iterate column attrs for relation OID %d: %w", relationID, err)

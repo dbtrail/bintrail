@@ -215,8 +215,8 @@ func (d *Decoder) cacheRelation(m *pglogrepl.RelationMessage) error {
 		}
 		for i := range cols {
 			if a, ok := attrs[cols[i].name]; ok {
-				cols[i].identityAlways = a.IdentityAlways
-				cols[i].generated = a.Generated
+				cols[i].isIdentityAlways = a.IsIdentityAlways
+				cols[i].isGenerated = a.IsGenerated
 			}
 		}
 	}
@@ -283,13 +283,13 @@ func relationEvent(rel *relationInfo) event.Event {
 	cols := make([]metadata.PGRelationColumn, len(rel.columns))
 	for i, c := range rel.columns {
 		cols[i] = metadata.PGRelationColumn{
-			Name:           c.name,
-			Ordinal:        i + 1,
-			IsPK:           pkNames[c.name],
-			TypeOID:        c.typeOID,
-			TypeMod:        c.typeMod,
-			IdentityAlways: c.identityAlways,
-			Generated:      c.generated,
+			Name:             c.name,
+			Ordinal:          i + 1,
+			IsPK:             pkNames[c.name],
+			TypeOID:          c.typeOID,
+			TypeMod:          c.typeMod,
+			IsIdentityAlways: c.isIdentityAlways,
+			IsGenerated:      c.isGenerated,
 		}
 	}
 	return event.Event{

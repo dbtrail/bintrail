@@ -165,6 +165,62 @@ func TestEnsureSchemaAddsPGTypeColumns(t *testing.T) {
 	}
 }
 
+// TestEnsureSchemaAddsIdentityColumn pins the #557 migration: a pre-#557 index lacks
+// schema_snapshots.is_identity_always, which NewResolver now requires. EnsureSchema must
+// add it (TINYINT NOT NULL DEFAULT 0), backfill existing rows to 0, and stay idempotent.
+// A pre-existing PostgreSQL GENERATED ALWAYS column reads back as not-identity until the
+// next snapshot re-writes the real flag — the bounded, self-healing window.
+func TestEnsureSchemaAddsIdentityColumn(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Simulate a pre-#557 install: drop the column EnsureSchema re-adds, after seeding a
+	// row that must survive and backfill to the default.
+	testutil.MustExec(t, db, `ALTER TABLE schema_snapshots DROP COLUMN is_identity_always`)
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+		VALUES (1, UTC_TIMESTAMP(), 'app', 't', 'id', 1, 'PRI', 'int', 'int', 'NO', 0)`)
+
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	// Column exists, NOT NULL with a 0 default — so pre-#557/MySQL rows are never NULL
+	// (NewResolver scans straight into a non-pointer bool; a NULL would error the scan).
+	var nullable, columnType string
+	var def *string
+	if err := db.QueryRow(`SELECT IS_NULLABLE, COLUMN_DEFAULT, COLUMN_TYPE FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'schema_snapshots' AND COLUMN_NAME = 'is_identity_always'`).
+		Scan(&nullable, &def, &columnType); err != nil {
+		t.Fatalf("read is_identity_always column: %v", err)
+	}
+	if nullable != "NO" {
+		t.Errorf("is_identity_always IS_NULLABLE = %q, want \"NO\"", nullable)
+	}
+	if def == nil || *def != "0" {
+		t.Errorf("is_identity_always COLUMN_DEFAULT = %v, want \"0\"", def)
+	}
+	if !strings.Contains(strings.ToLower(columnType), "tinyint") {
+		t.Errorf("is_identity_always COLUMN_TYPE = %q, want a tinyint", columnType)
+	}
+
+	// The pre-existing row backfills to 0 (not identity).
+	var isIdentity bool
+	if err := db.QueryRow(`SELECT is_identity_always FROM schema_snapshots WHERE column_name='id'`).
+		Scan(&isIdentity); err != nil {
+		t.Fatalf("read backfilled row: %v", err)
+	}
+	if isIdentity {
+		t.Error("existing row is_identity_always = true, want false (NOT NULL DEFAULT 0 backfill)")
+	}
+
+	// Idempotent: a second run must not error or re-add.
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema (second run): %v", err)
+	}
+}
+
 // TestEnsureSchemaToleratesMissingFKConstraints guards the regression where the
 // cascade-recovery migration would break EnsureSchema on very old indexes that
 // predate the fk_constraints table (TakeSnapshot already tolerates its absence).
