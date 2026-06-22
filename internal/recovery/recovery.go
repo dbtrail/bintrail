@@ -61,10 +61,35 @@ func New(db *sql.DB, resolver *metadata.Resolver) *Generator {
 }
 
 // NewForDialect is New with an explicit SQL dialect. Callers that know the source
-// flavor (e.g. `bintrail-pg recover` reading stream_state.flavor) pass
-// PostgresDialect; everything else uses New (MySQL).
+// flavor (e.g. `bintrail-pg recover` via DialectForIndex) pass PostgresDialect;
+// everything else uses New (MySQL).
 func NewForDialect(db *sql.DB, resolver *metadata.Resolver, dialect Dialect) *Generator {
 	return &Generator{db: db, resolver: resolver, dialect: dialect}
+}
+
+// DialectForFlavor maps a stream_state.flavor value to the recovery SQL dialect.
+// PostgreSQL gets its own dialect; MySQL, MariaDB, and an empty/unknown flavor all
+// use MySQL (the established default — MariaDB recovery SQL is MySQL-dialect). It
+// owns the canonical "postgres" flavor literal so callers don't re-derive it.
+func DialectForFlavor(flavor string) Dialect {
+	if flavor == "postgres" {
+		return PostgresDialect
+	}
+	return MySQLDialect
+}
+
+// DialectForIndex returns the recovery dialect for an index database, read from the
+// source flavor recorded in stream_state (the index is single-source). Best-effort:
+// any read failure (no stream_state row on a file-indexed DB, very old schema)
+// returns MySQLDialect and never blocks recovery. This is the authoritative
+// selection every recover surface should use — `cli/recover.go` today; the console,
+// MCP, and agent recover paths adopt it in a follow-up.
+func DialectForIndex(db *sql.DB) Dialect {
+	var flavor string
+	if err := db.QueryRow("SELECT flavor FROM stream_state WHERE id = 1").Scan(&flavor); err != nil {
+		return MySQLDialect
+	}
+	return DialectForFlavor(flavor)
 }
 
 // resolverForRow returns the resolver matching the row's schema version.
@@ -130,6 +155,14 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 	fmt.Fprintln(w, "-- IMPORTANT: Review carefully before applying to production.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "BEGIN;")
+	if g.dialect == PostgresDialect {
+		// escapePGString relies on standard_conforming_strings=on (PostgreSQL's
+		// default), under which a backslash is literal. If the operator applies this
+		// script in a session with it OFF, an unescaped backslash would be reinterpreted
+		// (silent corruption). SET LOCAL pins it for this transaction only, so the
+		// script defends its own escaping regardless of the target session's setting.
+		fmt.Fprintln(w, "SET LOCAL standard_conforming_strings = on;")
+	}
 
 	written := 0
 	for _, row := range rows {
@@ -490,6 +523,14 @@ func formatValuePG(v any) string {
 			return "true"
 		}
 		return "false"
+	case map[string]any, []any, json.RawMessage:
+		// Defensive, mirroring FormatSQLValue: a structured value → JSON, quoted. On
+		// the PG path the only structured value a row image can carry is the
+		// unchanged-TOAST sentinel map, reachable only via the all-columns WHERE
+		// fallback under a weaker-than-FULL replica identity (out of support; RI FULL
+		// resolves it at decode). JSON-marshalling keeps it valid, collision-distinct SQL.
+		b, _ := json.Marshal(val)
+		return "'" + escapePGString(string(b)) + "'"
 	default:
 		// Defensive: any other Go type → its text form, quoted + escaped.
 		return "'" + escapePGString(fmt.Sprintf("%v", val)) + "'"

@@ -918,6 +918,13 @@ func TestFormatValuePG(t *testing.T) {
 	if got := formatValuePG(true); got != "true" {
 		t.Errorf("bool true → %q, want true", got)
 	}
+	// Defensive structured-value path (mirrors FormatSQLValue): the only structured
+	// value a PG row image can carry is the unchanged-TOAST sentinel map, reachable
+	// only under a weaker-than-FULL replica identity (out of support). It must marshal
+	// to valid, quoted JSON, never panic or emit a bare Go %v rendering.
+	if got := formatValuePG(map[string]any{"__bintrail_unchanged_toast__": true}); got != `'{"__bintrail_unchanged_toast__":true}'` {
+		t.Errorf("map → %q, want quoted JSON", got)
+	}
 }
 
 func TestGeneratePG_ReverseInsertDialect(t *testing.T) {
@@ -979,8 +986,10 @@ func TestGeneratePG_ReverseDeleteWhereDialect(t *testing.T) {
 	}
 }
 
-// TestGenerate_MySQLDialectUnchanged guards the additive change: the default
-// (MySQL) generator output is byte-identical to before — backticks, not double quotes.
+// TestGenerate_MySQLDialectUnchanged guards the additive change: the default (MySQL)
+// generator still emits MySQL-dialect SQL — backtick identifiers and backslash quote
+// escaping, NOT the PG double-quote / doubled-single-quote forms — so the additive PG
+// path did not alter the shipping MySQL output.
 func TestGenerate_MySQLDialectUnchanged(t *testing.T) {
 	g := newGen() // New(nil,nil) → MySQLDialect
 	row := query.ResultRow{
@@ -997,5 +1006,48 @@ func TestGenerate_MySQLDialectUnchanged(t *testing.T) {
 	}
 	if !strings.Contains(stmt, `'O\'Brien'`) {
 		t.Errorf("MySQL dialect must backslash-escape the quote, got: %s", stmt)
+	}
+}
+
+func TestDialectForFlavor(t *testing.T) {
+	cases := map[string]Dialect{
+		"postgres": PostgresDialect,
+		"mysql":    MySQLDialect,
+		"mariadb":  MySQLDialect, // MariaDB recovery SQL is MySQL-dialect
+		"":         MySQLDialect, // absent/unknown → MySQL
+		"pg":       MySQLDialect, // only the exact canonical literal maps to Postgres
+	}
+	for flavor, want := range cases {
+		if got := DialectForFlavor(flavor); got != want {
+			t.Errorf("DialectForFlavor(%q) = %v, want %v", flavor, got, want)
+		}
+	}
+}
+
+// TestGeneratePG_ScriptWrapper pins the standard_conforming_strings guard: a PG-dialect
+// script SET LOCALs it (so the escaping is self-defending regardless of the target
+// session), and the MySQL script does NOT emit it.
+func TestGeneratePG_ScriptWrapper(t *testing.T) {
+	row := query.ResultRow{
+		EventID: 1, SchemaName: "public", TableName: "t",
+		EventType: parser.EventDelete, EventTimestamp: time.Unix(0, 0).UTC(),
+		RowBefore: map[string]any{"id": "1"},
+	}
+	const scs = "SET LOCAL standard_conforming_strings = on;"
+
+	var pgBuf bytes.Buffer
+	if _, err := NewForDialect(nil, nil, PostgresDialect).GenerateSQLFromRows([]query.ResultRow{row}, &pgBuf); err != nil {
+		t.Fatalf("PG GenerateSQLFromRows: %v", err)
+	}
+	if !strings.Contains(pgBuf.String(), scs) {
+		t.Errorf("PG script must contain %q, got:\n%s", scs, pgBuf.String())
+	}
+
+	var myBuf bytes.Buffer
+	if _, err := New(nil, nil).GenerateSQLFromRows([]query.ResultRow{row}, &myBuf); err != nil {
+		t.Fatalf("MySQL GenerateSQLFromRows: %v", err)
+	}
+	if strings.Contains(myBuf.String(), "standard_conforming_strings") {
+		t.Errorf("MySQL script must NOT emit the PG SCS guard, got:\n%s", myBuf.String())
 	}
 }

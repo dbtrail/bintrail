@@ -252,17 +252,10 @@ func runRecover(cmd *cobra.Command, args []string) error {
 
 	// ── Generate recovery SQL ─────────────────────────────────────────────────
 	// Select the SQL dialect from the source flavor recorded in the index
-	// (single-source per stream_state). PostgreSQL needs double-quoted identifiers
-	// and standard-conforming-string escaping; MySQL/MariaDB — and an absent or
-	// unknown flavor — keep the default backtick/backslash dialect. Best-effort: a
-	// read failure (no stream_state row on a file-indexed DB, very old schema)
-	// defaults to MySQL and never blocks recovery.
-	dialect := recovery.MySQLDialect
-	var srcFlavor string
-	if ferr := db.QueryRow("SELECT flavor FROM stream_state WHERE id = 1").Scan(&srcFlavor); ferr == nil && srcFlavor == "postgres" {
-		dialect = recovery.PostgresDialect
-	}
-	gen := recovery.NewForDialect(db, resolver, dialect)
+	// (single-source per stream_state) — PostgreSQL needs double-quoted identifiers
+	// and standard-conforming-string escaping; MySQL/MariaDB keep the default. The
+	// read is best-effort and defaults to MySQL (see recovery.DialectForIndex).
+	gen := recovery.NewForDialect(db, resolver, recovery.DialectForIndex(db))
 
 	if rDryRun {
 		if rFormat == "json" {
