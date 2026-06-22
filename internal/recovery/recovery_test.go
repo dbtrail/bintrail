@@ -868,3 +868,73 @@ func TestFormatValue_byteSliceWithNullByte(t *testing.T) {
 		t.Errorf("arbitrary []byte: got %q", got)
 	}
 }
+
+// ─── FormatSetNullRestore ────────────────────────────────────────────────────
+
+func TestFormatSetNullRestore_singlePKIntValue(t *testing.T) {
+	// An integer FK value (json.Number, as it arrives from the read path) must
+	// render as a bare numeric literal, and the guard `... AND fk IS NULL` must
+	// always be present so the UPDATE is idempotent.
+	pk := []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}
+	row := map[string]any{"id": json.Number("10"), "pid": nil}
+	got, err := FormatSetNullRestore("app", "child", "pid", json.Number("1"), pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "UPDATE `app`.`child` SET `pid` = 1 WHERE `id` = 10 AND `pid` IS NULL"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
+
+func TestFormatSetNullRestore_stringFKValueQuoted(t *testing.T) {
+	// A string FK value must be quoted+escaped; the IS NULL guard is unchanged.
+	pk := []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}
+	row := map[string]any{"id": json.Number("7")}
+	got, err := FormatSetNullRestore("app", "child", "owner", "o'brien", pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := `UPDATE ` + "`app`.`child`" + ` SET ` + "`owner`" + ` = 'o\'brien' WHERE ` + "`id`" + ` = 7 AND ` + "`owner`" + ` IS NULL`
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
+
+func TestFormatSetNullRestore_compositePK(t *testing.T) {
+	// Every PK column joins the WHERE with AND, before the IS NULL guard.
+	pk := []metadata.ColumnMeta{
+		{Name: "tenant_id", IsPK: true, DataType: "int"},
+		{Name: "id", IsPK: true, DataType: "int"},
+	}
+	row := map[string]any{"tenant_id": json.Number("3"), "id": json.Number("42")}
+	got, err := FormatSetNullRestore("app", "child", "pid", json.Number("9"), pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "UPDATE `app`.`child` SET `pid` = 9 WHERE `tenant_id` = 3 AND `id` = 42 AND `pid` IS NULL"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
+
+func TestFormatSetNullRestore_errNoPKColumns(t *testing.T) {
+	_, err := FormatSetNullRestore("app", "child", "pid", json.Number("1"), nil, map[string]any{"id": json.Number("10")})
+	if err == nil {
+		t.Fatal("expected error for empty pkCols, got nil")
+	}
+	if !strings.Contains(err.Error(), "no PK columns") {
+		t.Errorf("error should name the missing PK columns: %v", err)
+	}
+}
+
+func TestFormatSetNullRestore_errPKColumnAbsentFromRow(t *testing.T) {
+	pk := []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}
+	_, err := FormatSetNullRestore("app", "child", "pid", json.Number("1"), pk, map[string]any{"pid": nil})
+	if err == nil {
+		t.Fatal("expected error for PK column absent from row, got nil")
+	}
+	if !strings.Contains(err.Error(), "absent") {
+		t.Errorf("error should report the absent PK column: %v", err)
+	}
+}

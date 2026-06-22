@@ -1,5 +1,6 @@
-// Package cascade reconstructs child rows that an InnoDB foreign-key
-// ON DELETE CASCADE removed but never wrote to the binary log.
+// Package cascade reconstructs the side effects of an InnoDB foreign-key
+// ON DELETE CASCADE (deleted child rows) or ON DELETE SET NULL (nulled child
+// FKs) that InnoDB applied but never wrote to the binary log.
 //
 // On MySQL ≤ 8.x (and all MariaDB) InnoDB enforces FK cascades inside the
 // storage engine, below the SQL layer that writes the binlog — only the parent
@@ -177,7 +178,7 @@ func SynthesizeVictims(
 		incomplete  []string
 		errs        []error
 	)
-	setNullSeen := map[string]bool{} // "schema.table|pkvalues" → SET NULL restore emitted
+	setNullSeen := map[string]bool{} // "schema.table.column|pkvalues" → SET NULL restore emitted (per-COLUMN: one row may have several single-column SET NULL FKs)
 	// addIncomplete records a coverage caveat once per distinct key, so a wide
 	// cascade (many parent×FK iterations) cannot flood the list with near-
 	// identical strings and bury the important ones.
@@ -369,7 +370,13 @@ func SynthesizeVictims(
 						// with an idempotent UPDATE (rendered with an `IS NULL`
 						// guard by the command) and do NOT recurse — no row was
 						// deleted, so nothing cascades from it.
-						skey := fk.Schema + "." + fk.Table + "|" + cev.PKValues
+						//
+						// Key by COLUMN, not just the row: a child may carry two
+						// distinct single-column SET NULL FKs to the same deleted
+						// parent (e.g. manager_id + mentor_id → user.id). A row-only
+						// key would let the first FK's restore swallow the second's,
+						// leaving a column permanently NULL with no caveat.
+						skey := fk.Schema + "." + fk.Table + "." + fk.Column + "|" + cev.PKValues
 						if setNullSeen[skey] {
 							continue
 						}
@@ -435,7 +442,8 @@ func SynthesizeVictims(
 								continue // touched since baseline → handled by the binlog path
 							}
 							if fk.DeleteRule == "SET NULL" {
-								skey := fk.Schema + "." + fk.Table + "|" + br.PKValues
+								// Per-COLUMN key (see the Phase-1 branch above).
+								skey := fk.Schema + "." + fk.Table + "." + fk.Column + "|" + br.PKValues
 								if setNullSeen[skey] {
 									continue
 								}

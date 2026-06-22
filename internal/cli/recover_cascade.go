@@ -241,8 +241,10 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("schema migration: %w", err)
 	}
 
-	// Resolver enables PK-only WHERE clauses; best-effort (recovery here only
-	// emits INSERTs, so a nil resolver is harmless).
+	// Resolver enables PK-only WHERE clauses. Best-effort for the CASCADE path
+	// (INSERTs fall back to full row images), but REQUIRED for SET NULL restores
+	// (their WHERE needs the child PK columns) — emitCascadeSQL errors loudly,
+	// before writing anything, if SET NULL rows exist with a nil resolver.
 	resolver, err := metadata.NewResolver(db, 0)
 	if err != nil {
 		slog.Warn("could not load schema snapshot; recovery INSERTs still use full row images", "error", err)
@@ -413,6 +415,9 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	}
 	n, gerr := emitCascadeSQL(w, recovery.New(db, resolver), rows, res.SetNullRows, resolver, hdr)
 	if gerr != nil {
+		if closeFn != nil {
+			_ = closeFn() // best-effort: gerr is the real failure, don't mask it (and don't leak the fd)
+		}
 		return gerr
 	}
 	if closeFn != nil {
@@ -465,6 +470,29 @@ type cascadeHeader struct {
 // NULL FK restorations (idempotent guarded UPDATEs). Returns the total statement
 // count. resolver supplies child PK columns for the SET NULL WHERE clauses.
 func emitCascadeSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNullRows []cascade.SetNullRestore, resolver *metadata.Resolver, hdr cascadeHeader) (int, error) {
+	// Build every SET NULL restoration BEFORE writing a byte (all-or-nothing): a
+	// missing resolver, an unresolvable table, or an absent PK column must abort
+	// the whole emit cleanly — returning mid-script would leave the parent/child
+	// INSERTs written but drop the closing `SET FOREIGN_KEY_CHECKS=1`, handing the
+	// operator a script that re-enables nothing.
+	var setNullStmts []string
+	if len(setNullRows) > 0 {
+		if resolver == nil {
+			return 0, fmt.Errorf("a schema snapshot is required to restore SET NULL foreign keys (run `bintrail snapshot`)")
+		}
+		for _, sr := range setNullRows {
+			tm, terr := resolver.Resolve(sr.Schema, sr.Table)
+			if terr != nil {
+				return 0, fmt.Errorf("resolve %s.%s for SET NULL restore: %w", sr.Schema, sr.Table, terr)
+			}
+			stmt, ferr := recovery.FormatSetNullRestore(sr.Schema, sr.Table, sr.Column, sr.Value, tm.PKColumnMetas(), sr.Row)
+			if ferr != nil {
+				return 0, ferr
+			}
+			setNullStmts = append(setNullStmts, stmt)
+		}
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on %s.%s\n", hdr.schema, hdr.table)
 	fmt.Fprintf(&b, "-- Re-inserts %d deleted parent row(s) and %d cascade-deleted child row(s); restores %d SET NULL'd FK(s)\n", hdr.parents, hdr.children, hdr.setnulls)
@@ -500,23 +528,13 @@ func emitCascadeSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow
 
 	// SET NULL restorations: idempotent UPDATEs (… AND fk IS NULL) that only
 	// touch rows still in the post-cascade nulled state, so a re-run or a later
-	// re-point of the child is never clobbered.
-	if len(setNullRows) > 0 {
-		if resolver == nil {
-			return n, fmt.Errorf("a schema snapshot is required to restore SET NULL foreign keys (run `bintrail snapshot`)")
-		}
+	// re-point of the child is never clobbered. Pre-built above, so nothing here
+	// can fail after the INSERTs are already on disk.
+	if len(setNullStmts) > 0 {
 		if _, err := io.WriteString(w, "\n-- SET NULL FK restorations (idempotent: only rows whose FK is still NULL):\n"); err != nil {
 			return n, err
 		}
-		for _, sr := range setNullRows {
-			tm, terr := resolver.Resolve(sr.Schema, sr.Table)
-			if terr != nil {
-				return n, fmt.Errorf("resolve %s.%s for SET NULL restore: %w", sr.Schema, sr.Table, terr)
-			}
-			stmt, ferr := recovery.FormatSetNullRestore(sr.Schema, sr.Table, sr.Column, sr.Value, tm.PKColumnMetas(), sr.Row)
-			if ferr != nil {
-				return n, ferr
-			}
+		for _, stmt := range setNullStmts {
 			if _, werr := io.WriteString(w, stmt+";\n"); werr != nil {
 				return n, werr
 			}
