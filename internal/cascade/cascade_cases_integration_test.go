@@ -97,9 +97,9 @@ func TestLoadCascadeFKsFromIndex(t *testing.T) {
 }
 
 // TestSynthesizeVictims_ruleGate pins the deliberate non-bug: only ON DELETE
-// CASCADE edges are delete-synthesized. A pure RESTRICT edge and an
-// ON-UPDATE-CASCADE-only edge (the dbtrail conflation) must yield no victims —
-// and, being non-CASCADE, never even hit the index, so no events are needed.
+// CASCADE / SET NULL edges are synthesized. A pure RESTRICT edge and an
+// ON-UPDATE-CASCADE-only edge (the dbtrail conflation) must yield nothing — and,
+// being neither rule, never even hit the index, so no events are needed.
 func TestSynthesizeVictims_ruleGate(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	indexDB, _ := testutil.CreateTestDB(t)
@@ -125,9 +125,57 @@ func TestSynthesizeVictims_ruleGate(t *testing.T) {
 		t.Fatalf("SynthesizeVictims: %v", err)
 	}
 	if len(res.Victims) != 0 {
-		t.Errorf("non-ON-DELETE-CASCADE edges must yield no victims, got %d: %+v", len(res.Victims), res.Victims)
+		t.Errorf("non-CASCADE/SET-NULL edges must yield no victims, got %d: %+v", len(res.Victims), res.Victims)
+	}
+	if len(res.SetNullRows) != 0 {
+		t.Errorf("non-CASCADE/SET-NULL edges must yield no SET NULL restores, got %d: %+v", len(res.SetNullRows), res.SetNullRows)
 	}
 }
+
+// TestSynthesizeVictims_setNull pins ON DELETE SET NULL: a child that referenced
+// the deleted parent (and survives) becomes a SetNullRestore (not a victim), and
+// it is NOT recursed (no row was deleted). A child re-pointed away is excluded.
+func TestSynthesizeVictims_setNull(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+
+	T := time.Now().UTC()
+	h := T.Add(-30 * time.Minute).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	ts := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	// child 10 references parent 1 (SET NULL victim); child 13 re-pointed to 2.
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, ts, nil, dbName, "child", 1, "10", nil, nil, []byte(`{"id":10,"pid":1}`))
+	testutil.InsertEvent(t, db, "b.000001", 20, 30, ts, nil, dbName, "child", 1, "13", nil, nil, []byte(`{"id":13,"pid":1}`))
+	testutil.InsertEvent(t, db, "b.000001", 30, 40, ts, nil, dbName, "child", 2 /*UPDATE*/, "13", nil, []byte(`{"id":13,"pid":1}`), []byte(`{"id":13,"pid":2}`))
+
+	fks := []cascade.CascadeFK{{
+		Schema: dbName, Table: "child", ConstraintName: "fk", Column: "pid",
+		ReferencedSchema: dbName, ReferencedTable: "parent", ReferencedColumn: "id",
+		DeleteRule: "SET NULL",
+	}}
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, fks, parentDelete(dbName, T), cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if len(res.Victims) != 0 {
+		t.Errorf("SET NULL must produce no DELETE victims (rows survive), got %v", res.Victims)
+	}
+	if len(res.SetNullRows) != 1 || res.SetNullRows[0].PKValues != "10" || res.SetNullRows[0].Column != "pid" {
+		t.Fatalf("want one SET NULL restore for child:10 column pid, got %+v", res.SetNullRows)
+	}
+	if got := cascadeValToStr(res.SetNullRows[0].Value); got != "1" {
+		t.Errorf("restore value should be the parent key 1, got %q", got)
+	}
+	for _, sr := range res.SetNullRows {
+		if sr.PKValues == "13" {
+			t.Errorf("re-pointed child 13 must NOT be a SET NULL restore")
+		}
+	}
+}
+
+func cascadeValToStr(v any) string { return fmt.Sprintf("%v", v) }
 
 // TestSynthesizeVictims_compositeFKSkipped pins the composite-FK guard: a
 // multi-column CASCADE FK cannot be reconstructed by the single-column victim
@@ -519,5 +567,165 @@ func TestSynthesizeVictims_multiRootIndependentT(t *testing.T) {
 	}
 	if cb.RowBefore["val"] != "b1" {
 		t.Errorf("cb:20 recovered at %v, want b1 (per-root T regression — using a collapsed global T?)", cb.RowBefore["val"])
+	}
+}
+
+// TestSynthesizeVictims_setNullTwoColumnsSameRow is the regression for the #571
+// review CRITICAL: a SetNullRestore is per-COLUMN, but the dedup key was per-ROW,
+// so a child carrying TWO single-column SET NULL FKs to the same deleted parent
+// (e.g. mgr + mentor → parent.id) had its second column silently dropped. Both
+// columns must be restored, and the result must stay Complete.
+func TestSynthesizeVictims_setNullTwoColumnsSameRow(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+
+	T := time.Now().UTC()
+	h := T.Add(-30 * time.Minute).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	ts := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	// child 10 points at parent 1 via BOTH mgr and mentor; the cascade nulls both.
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, ts, nil, dbName, "child", 1, "10", nil, nil, []byte(`{"id":10,"mgr":1,"mentor":1}`))
+
+	fks := []cascade.CascadeFK{
+		{Schema: dbName, Table: "child", ConstraintName: "fk_mgr", Column: "mgr",
+			ReferencedSchema: dbName, ReferencedTable: "parent", ReferencedColumn: "id", DeleteRule: "SET NULL"},
+		{Schema: dbName, Table: "child", ConstraintName: "fk_mentor", Column: "mentor",
+			ReferencedSchema: dbName, ReferencedTable: "parent", ReferencedColumn: "id", DeleteRule: "SET NULL"},
+	}
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, fks, parentDelete(dbName, T), cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if len(res.Victims) != 0 {
+		t.Errorf("SET NULL produces no DELETE victims, got %v", res.Victims)
+	}
+	cols := map[string]bool{}
+	for _, sr := range res.SetNullRows {
+		if sr.PKValues != "10" {
+			t.Errorf("unexpected restore for pk=%s", sr.PKValues)
+		}
+		cols[sr.Column] = true
+	}
+	if len(res.SetNullRows) != 2 || !cols["mgr"] || !cols["mentor"] {
+		t.Fatalf("both mgr and mentor of child:10 must be restored (per-column key), got %+v", res.SetNullRows)
+	}
+	if !res.Complete() {
+		t.Errorf("two-column SET NULL restore should be complete, got %v", res.Incomplete)
+	}
+}
+
+// TestSynthesizeVictims_setNullGuardProtectsRepointedRow proves the `IS NULL`
+// guard is load-bearing, not decorative. A child re-pointed to a NEW parent after
+// the (unlogged) SET NULL still surfaces a STALE restore candidate — its pre-null
+// INSERT image is the only event matching the fk=parent scan, so a SetNullRestore
+// to the OLD parent IS emitted. Only the runtime `AND fk IS NULL` predicate stops
+// it from clobbering the live re-pointed value. This applies the generated UPDATE
+// against the real row and asserts the row is unchanged.
+func TestSynthesizeVictims_setNullGuardProtectsRepointedRow(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE parent (id INT PRIMARY KEY) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE child (
+		id  INT PRIMARY KEY,
+		mgr INT NULL,
+		CONSTRAINT fk_mgr FOREIGN KEY (mgr) REFERENCES parent(id) ON DELETE SET NULL
+	) ENGINE=InnoDB`)
+
+	stats, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+	resolver, err := metadata.NewResolver(indexDB, stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	testutil.MustExec(t, sourceDB, "INSERT INTO parent VALUES (1),(2)")
+
+	// Capture the whole child history: its INSERT (mgr=1, the stale candidate),
+	// the parent delete (InnoDB nulls child.mgr, UNLOGGED), then the operator's
+	// re-point to parent 2 (logged UPDATE before=NULL/after=2).
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+	currentBinlog, _, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition: %v", err)
+	}
+	testutil.MustExec(t, sourceDB, "INSERT INTO child VALUES (10,1)")
+	testutil.MustExec(t, sourceDB, "DELETE FROM parent WHERE id=1")
+	testutil.MustExec(t, sourceDB, "UPDATE child SET mgr=2 WHERE id=10")
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+
+	tmpDir := t.TempDir()
+	cp := exec.Command("docker", "cp",
+		fmt.Sprintf("bintrail-test-mysql:/var/lib/mysql/%s", currentBinlog),
+		filepath.Join(tmpDir, currentBinlog))
+	if out, cperr := cp.CombinedOutput(); cperr != nil {
+		t.Fatalf("docker cp %s: %v\n%s", currentBinlog, cperr, out)
+	}
+	p := parser.New(tmpDir, resolver, parser.Filters{Schemas: map[string]bool{sourceName: true}}, nil)
+	idx := indexer.New(indexDB, 100)
+	events := make(chan parser.Event, 256)
+	parseErr := make(chan error, 1)
+	go func() { defer close(events); parseErr <- p.ParseFile(ctx, currentBinlog, events) }()
+	if _, rerr := idx.Run(ctx, events); rerr != nil {
+		t.Fatalf("indexer.Run: %v", rerr)
+	}
+	if perr := <-parseErr; perr != nil {
+		t.Fatalf("ParseFile: %v", perr)
+	}
+
+	// Live truth after the re-point: child 10 now points at parent 2.
+	wantChild := checksum(t, sourceDB, "child")
+
+	eng := query.New(indexDB)
+	del := event.EventDelete
+	parentDeletes := mustFetch(t, eng, query.Options{Schema: sourceName, Table: "parent", EventType: &del})
+	if len(parentDeletes) != 1 || parentDeletes[0].PKValues != "1" {
+		t.Fatalf("want only the parent 1 delete indexed, got %v", pkList(parentDeletes))
+	}
+	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("LoadCascadeFKs: %v", err)
+	}
+	res, err := cascade.SynthesizeVictims(ctx, eng, fks, parentDeletes, cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	// The synthesis can't distinguish the re-pointed child from a still-nulled
+	// one, so it DOES emit a stale restore to mgr=1 — the guard is the defense.
+	if len(res.SetNullRows) != 1 || res.SetNullRows[0].PKValues != "10" {
+		t.Fatalf("expected one (stale) SET NULL restore for child:10, got %+v", res.SetNullRows)
+	}
+
+	tm, err := resolver.Resolve(sourceName, "child")
+	if err != nil {
+		t.Fatalf("resolve child: %v", err)
+	}
+	sr := res.SetNullRows[0]
+	stmt, err := recovery.FormatSetNullRestore(sr.Schema, sr.Table, sr.Column, sr.Value, tm.PKColumnMetas(), sr.Row)
+	if err != nil {
+		t.Fatalf("FormatSetNullRestore: %v", err)
+	}
+	if !strings.Contains(stmt, "IS NULL") {
+		t.Fatalf("restore must carry the IS NULL guard: %q", stmt)
+	}
+	applyFKOff(t, sourceName, stmt+";")
+
+	// The guard must have made the UPDATE a no-op: child 10 still points at 2.
+	if got := checksum(t, sourceDB, "child"); got != wantChild {
+		t.Errorf("guard failed: re-pointed child was clobbered (checksum want %d, got %d)", wantChild, got)
+	}
+	var mgr sql.NullInt64
+	if err := sourceDB.QueryRow("SELECT mgr FROM child WHERE id=10").Scan(&mgr); err != nil {
+		t.Fatalf("read child: %v", err)
+	}
+	if !mgr.Valid || mgr.Int64 != 2 {
+		t.Errorf("child 10 mgr should remain 2 (re-pointed), got %v", mgr)
 	}
 }

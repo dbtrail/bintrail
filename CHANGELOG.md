@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-22
+
+### Added
+- **Recover rows deleted by a foreign-key `ON DELETE CASCADE`, and restore foreign keys nulled by `ON DELETE SET NULL`** (#548; slices #549–#553). A new `recover-cascade` command reverses cascade side effects that InnoDB applies *below* the binary log: on MySQL 8.x and earlier (and all MariaDB), an FK cascade is enforced inside the storage engine, so only the parent `DELETE` is logged — the cascaded child deletes and SET-NULL updates are never recorded, and the normal delta-only `recover` has nothing to reverse. `recover-cascade` synthesizes the missing children from each child's last-known row image before the parent delete and emits restoring SQL — `INSERT`s for cascade-deleted rows, idempotent guarded `UPDATE`s (`… AND fk IS NULL`) for SET-NULL'd foreign keys — wrapped in `SET FOREIGN_KEY_CHECKS=0/1`. It is **dry-run only**: SQL is printed or written to `--output`, never executed. A baseline snapshot (`--baseline-dir`/`--baseline-s3`) extends recovery to children that have no binlog event within the lookback window. Coverage gaps (composite FKs, depth/candidate caps, archived-out windows) are reported and make the command exit non-zero unless `--allow-incomplete`. This is a free-core capability.
+- **PostgreSQL recovery is now scoped to the primary key offline** (#531, #533, #570). The `bintrail-pg` capture stream persists a per-table PostgreSQL schema/type oracle into the shared MySQL index, so the offline `recover` and `reconstruct` commands build a primary-key-scoped `WHERE` for PostgreSQL-origin rows without a live source connection (previously they fell back to an all-columns match). A dedicated PostgreSQL-as-source operator guide ships too (#565). Part of the ongoing PostgreSQL alpha (#527) — read the limitations before relying on it.
+
 ## [0.17.0] - 2026-06-21
 
 ### Added

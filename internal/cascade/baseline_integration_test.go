@@ -260,3 +260,47 @@ func TestPhase2_baselineTruncationFlagged(t *testing.T) {
 		t.Errorf("baseline truncation must be flagged; Incomplete=%v", res.Incomplete)
 	}
 }
+
+// setNullFK is cascadeFK's ON DELETE SET NULL sibling for the Phase-2 tests.
+func setNullFK(schema string) []cascade.CascadeFK {
+	return []cascade.CascadeFK{{
+		Schema: schema, Table: "child", ConstraintName: "fk", Column: "pid",
+		ReferencedSchema: schema, ReferencedTable: "parent", ReferencedColumn: "id",
+		DeleteRule: "SET NULL",
+	}}
+}
+
+// TestPhase2_setNullUntouchedBaselineChild: a child of a SET NULL FK present in
+// the baseline but untouched in the window becomes a SetNullRestore (its FK is
+// nulled, the row survives), NOT a delete victim — the SET NULL analogue of
+// TestPhase2_untouchedBaselineChildRecovered, exercising the Phase-2 br.Row path.
+func TestPhase2_setNullUntouchedBaselineChild(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+	T := time.Now().UTC()
+
+	fb := &fakeBaseline{
+		ok:   true,
+		snap: T.Add(-2 * time.Hour),
+		rows: []cascade.BaselineRow{{PKValues: "10", Row: map[string]any{"id": int64(10), "pid": int64(1), "payload": "keep"}}},
+	}
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, setNullFK(dbName), parentDelete(dbName, T),
+		cascade.Options{Baseline: fb})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if len(res.Victims) != 0 {
+		t.Errorf("SET NULL must produce no delete victims, got %v", res.Victims)
+	}
+	if len(res.SetNullRows) != 1 || res.SetNullRows[0].PKValues != "10" || res.SetNullRows[0].Column != "pid" {
+		t.Fatalf("want one baseline SET NULL restore for child:10/pid, got %+v", res.SetNullRows)
+	}
+	if res.SetNullRows[0].Row["payload"] != "keep" {
+		t.Errorf("baseline SET NULL restore should carry the baseline row, got %v", res.SetNullRows[0].Row)
+	}
+	if !res.Complete() {
+		t.Errorf("fully-covered baseline SET NULL should be complete, got %v", res.Incomplete)
+	}
+}

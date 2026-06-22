@@ -971,7 +971,7 @@ func CascadeConstraintsInIndex(indexDB *sql.DB, schemas []string) ([]FKCascadeEd
 	query := `SELECT schema_name, table_name, column_name, referenced_table_name, delete_rule, update_rule
 		FROM fk_constraints
 		WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM fk_constraints)
-		  AND (delete_rule = 'CASCADE' OR update_rule = 'CASCADE')`
+		  AND (delete_rule IN ('CASCADE', 'SET NULL') OR update_rule = 'CASCADE')`
 	var args []any
 	if len(schemas) > 0 {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
