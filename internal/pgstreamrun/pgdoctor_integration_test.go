@@ -77,6 +77,12 @@ func TestBuildPGReport_Integration(t *testing.T) {
 		if c := findCheck(t, r, "Replication slot health"); c.Status != doctor.StatusPass {
 			t.Errorf("slot health = %s (%s), want pass", c.Status, c.Detail)
 		}
+		// max_slot_wal_keep_size runs and reads the real setting: the dev/CI container
+		// leaves it at the -1 default, so it WARNs (the production red line). A bounded
+		// server would PASS; either way it must not FAIL or SKIP in a healthy run.
+		if c := findCheck(t, r, "max_slot_wal_keep_size"); c.Status != doctor.StatusWarn && c.Status != doctor.StatusPass {
+			t.Errorf("max_slot_wal_keep_size = %s (%s), want warn (unlimited) or pass (bounded)", c.Status, c.Detail)
+		}
 		if r.Failed != 0 {
 			t.Errorf("healthy source has %d failed checks, want 0", r.Failed)
 		}

@@ -91,15 +91,22 @@ func validateReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication st
 	return checkReplicaIdentityTables(ctx, conn, publication)
 }
 
+// ErrWALLevelNotLogical marks the "wal_level is readable but not 'logical'" case (a
+// genuine misconfiguration) so a caller — the doctor — can distinguish it from a
+// query failure (connection/permission/timeout) and give the right remediation
+// (restart-with-config vs retry) without mislabeling a transient blip as a config bug.
+var ErrWALLevelNotLogical = errors.New("wal_level is not 'logical'")
+
 // checkWALLevel verifies the (global) wal_level is 'logical' — logical replication
-// is impossible otherwise.
+// is impossible otherwise. A value-wrong result wraps ErrWALLevelNotLogical; a query
+// failure does not.
 func checkWALLevel(ctx context.Context, conn *pgx.Conn) error {
 	var walLevel string
 	if err := conn.QueryRow(ctx, "SELECT current_setting('wal_level')").Scan(&walLevel); err != nil {
 		return fmt.Errorf("pgcapture: checking wal_level: %w", err)
 	}
 	if walLevel != "logical" {
-		return fmt.Errorf("pgcapture: wal_level is %q, must be 'logical' for logical replication", walLevel)
+		return fmt.Errorf("pgcapture: wal_level is %q, must be 'logical' for logical replication: %w", walLevel, ErrWALLevelNotLogical)
 	}
 	return nil
 }
@@ -187,14 +194,13 @@ func CheckReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication strin
 // ensureSlot fails loud in that case rather than skip; the recovery policy
 // (re-baseline) is #532.
 func ensureSlot(ctx context.Context, replConn *pgconn.PgConn, queryConn *pgx.Conn, slotName string, savedLSN pglogrepl.LSN, expectExisting bool) (pglogrepl.LSN, error) {
-	health, err := QuerySlotHealth(ctx, queryConn, slotName)
+	found, walStatus, err := querySlotState(ctx, queryConn, slotName)
 	if err != nil {
 		return 0, err
 	}
-	found := health.Exists
 
 	// A 'lost' slot is unusable regardless of mode — its WAL has been removed.
-	if found && health.WalStatus == "lost" {
+	if found && walStatus == WalStatusLost {
 		return 0, fmt.Errorf("pgcapture: replication slot %q is invalidated (wal_status=lost; max_slot_wal_keep_size exceeded) — the WAL it needs is gone; re-baseline rather than resume", slotName)
 	}
 

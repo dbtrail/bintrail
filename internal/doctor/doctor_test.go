@@ -560,6 +560,53 @@ func TestDoctorReportWriteText(t *testing.T) {
 	}
 }
 
+// TestDoctorReportFooter pins the parameterized text footer (#532): a non-MySQL
+// caller (e.g. bintrail-pg doctor) can override the trailing guidance, and an empty
+// footer falls back to the default MySQL-oriented text — so existing callers (and the
+// JSON output) are unaffected.
+func TestDoctorReportFooter(t *testing.T) {
+	render := func(r *Report) string {
+		var buf bytes.Buffer
+		if err := r.Write(&buf, "text"); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		return buf.String()
+	}
+
+	// Custom footers: all-passed → ReadyFooter; has-failure → FixFooter.
+	passed := &Report{ReadyFooter: "CUSTOM READY", FixFooter: "CUSTOM FIX"}
+	passed.Add(CheckResult{Name: "p", Status: StatusPass})
+	if out := render(passed); !strings.Contains(out, "CUSTOM READY") || strings.Contains(out, "Ready to stream") {
+		t.Errorf("all-passed should render the custom ReadyFooter, not the default:\n%s", out)
+	}
+	failed := &Report{ReadyFooter: "CUSTOM READY", FixFooter: "CUSTOM FIX"}
+	failed.Add(CheckResult{Name: "f", Status: StatusFail})
+	if out := render(failed); !strings.Contains(out, "CUSTOM FIX") {
+		t.Errorf("has-failure should render the custom FixFooter:\n%s", out)
+	}
+
+	// Empty footers → the default MySQL guidance (back-compat for existing callers).
+	def := &Report{}
+	def.Add(CheckResult{Name: "p", Status: StatusPass})
+	if out := render(def); !strings.Contains(out, "Ready to stream. Run `bintrail up") {
+		t.Errorf("empty ReadyFooter should fall back to the MySQL default:\n%s", out)
+	}
+	defFail := &Report{}
+	defFail.Add(CheckResult{Name: "f", Status: StatusFail})
+	if out := render(defFail); !strings.Contains(out, "re-run `bintrail doctor`") {
+		t.Errorf("empty FixFooter should fall back to the MySQL default:\n%s", out)
+	}
+
+	// The footer fields must not leak into JSON.
+	var jbuf bytes.Buffer
+	if err := passed.Write(&jbuf, "json"); err != nil {
+		t.Fatalf("Write(json): %v", err)
+	}
+	if strings.Contains(jbuf.String(), "CUSTOM") {
+		t.Errorf("footer fields leaked into JSON:\n%s", jbuf.String())
+	}
+}
+
 // TestCheckSchemaVisibility_emptyVsInvisible pins the #402 discrimination:
 // zero tables because the schema is EMPTY routes the operator to "create a
 // table", zero tables because the schema is INVISIBLE routes to grants — the

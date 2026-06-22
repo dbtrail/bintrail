@@ -10,10 +10,21 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// PostgreSQL pg_replication_slots.wal_status values. They are named constants so the
+// safety-critical comparisons — the capture-time fail-loud in ensureSlot and the
+// doctor's FAIL/WARN mapping — do not hinge on bare string literals, where a typo
+// would silently disable the data-loss guard.
+const (
+	WalStatusReserved   = "reserved"   // within max_wal_size
+	WalStatusExtended   = "extended"   // beyond max_wal_size, still retained (by the slot or wal_keep_size)
+	WalStatusUnreserved = "unreserved" // past max_slot_wal_keep_size; the next checkpoint may invalidate the slot
+	WalStatusLost       = "lost"       // invalidated — the WAL it needed has been removed
+)
+
 // SlotHealth is the live WAL-retention state of a replication slot, read from
 // pg_replication_slots on a plain query connection. It is the foundation for #532
-// WAL-retention monitoring: ensureSlot uses it at capture startup, and bintrail-pg
-// doctor reports it on demand.
+// WAL-retention monitoring: bintrail-pg doctor reports it on demand. (Capture startup
+// uses the lighter, primary-agnostic querySlotState instead — see ensureSlot.)
 //
 // Health-only: callers REPORT a SlotHealth, they do not fail-loud on it. Failing
 // loud on an invalidated slot is ensureSlot's job (at capture time, where skipping
@@ -25,10 +36,11 @@ type SlotHealth struct {
 	Exists bool
 	// Active is true when a consumer (a walsender) currently holds the slot.
 	Active bool
-	// WalStatus is the slot's WAL-retention state: reserved (within max_wal_size),
-	// extended (beyond max_wal_size but within max_slot_wal_keep_size), unreserved
-	// (at risk — the next checkpoint may invalidate it), or lost (invalidated, its
-	// WAL removed). Empty when the slot is absent.
+	// WalStatus is the slot's WAL-retention state — one of the WalStatus* constants:
+	// reserved (within max_wal_size), extended (beyond max_wal_size, still retained by
+	// the slot or wal_keep_size), unreserved (past max_slot_wal_keep_size; the next
+	// checkpoint may invalidate it), or lost (invalidated, its WAL removed). Empty when
+	// the slot is absent.
 	WalStatus string
 	// RestartLSN is the oldest WAL the slot still needs; the WAL the slot pins runs
 	// from here to the server head. 0 when NULL (a just-created slot) or absent.
@@ -44,7 +56,8 @@ type SlotHealth struct {
 	// SafeWalSize is how much more WAL can be written before this slot risks
 	// invalidation (pg_replication_slots.safe_wal_size). Invalid (NULL) when
 	// max_slot_wal_keep_size = -1 (unlimited retention — the production red line the
-	// doctor warns about), because there is then no bound to be safely under.
+	// doctor warns about), because there is then no bound to be safely under; PostgreSQL
+	// also returns NULL once a slot is already lost.
 	SafeWalSize sql.NullInt64
 }
 
@@ -128,4 +141,23 @@ func QuerySlotHealth(ctx context.Context, conn *pgx.Conn, slotName string) (Slot
 		return SlotHealth{}, fmt.Errorf("pgcapture: querying slot health for %q: %w", slotName, err)
 	}
 	return r.toHealth()
+}
+
+// querySlotState reads only a slot's existence and wal_status — a primary-agnostic
+// catalog read. It is deliberately lighter than QuerySlotHealth, which adds the
+// primary-only pg_current_wal_lsn()/pg_wal_lsn_diff retention metrics (those error on
+// a standby, "recovery is in progress"). ensureSlot uses this at capture STARTUP so
+// capture is not gratuitously broken on a standby source; the richer QuerySlotHealth
+// is for the doctor health surface (documented primary). Returns exists=false with a
+// nil error when the slot is absent.
+func querySlotState(ctx context.Context, conn *pgx.Conn, slotName string) (exists bool, walStatus string, err error) {
+	var ws sql.NullString
+	err = conn.QueryRow(ctx, `SELECT wal_status FROM pg_replication_slots WHERE slot_name = $1`, slotName).Scan(&ws)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("pgcapture: checking replication slot %q: %w", slotName, err)
+	}
+	return true, ws.String, nil
 }

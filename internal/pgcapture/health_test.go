@@ -71,25 +71,26 @@ func TestSlotHealthRow_toHealth(t *testing.T) {
 		}
 	})
 
-	// A lost slot: wal_status=lost, safe_wal_size present (0), restart_lsn may still be set.
-	t.Run("lost-with-bounded-retention", func(t *testing.T) {
+	// A lost slot: wal_status=lost; PostgreSQL returns safe_wal_size NULL for a lost
+	// slot (as it does under unlimited retention), not 0.
+	t.Run("lost-safe-wal-null", func(t *testing.T) {
 		r := slotHealthRow{
 			active:        false,
-			walStatus:     nullStr("lost"),
+			walStatus:     nullStr(WalStatusLost),
 			restartLSN:    nullStr("0/1000000"),
 			currentWalLSN: nullStr("0/9000000"),
 			retainedBytes: nullInt(0),
-			safeWalSize:   nullInt(0),
+			safeWalSize:   sql.NullInt64{}, // NULL for a lost slot
 		}
 		h, err := r.toHealth()
 		if err != nil {
 			t.Fatalf("toHealth: %v", err)
 		}
-		if h.WalStatus != "lost" {
-			t.Errorf("WalStatus = %q, want lost", h.WalStatus)
+		if h.WalStatus != WalStatusLost {
+			t.Errorf("WalStatus = %q, want %q", h.WalStatus, WalStatusLost)
 		}
-		if !h.SafeWalSize.Valid || h.SafeWalSize.Int64 != 0 {
-			t.Errorf("SafeWalSize = %v, want valid 0", h.SafeWalSize)
+		if h.SafeWalSize.Valid {
+			t.Errorf("SafeWalSize = %v, want NULL (invalid) for a lost slot", h.SafeWalSize)
 		}
 	})
 

@@ -2,7 +2,9 @@ package pgstreamrun
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -10,6 +12,15 @@ import (
 	"github.com/dbtrail/dbtrail/internal/doctor"
 	"github.com/dbtrail/dbtrail/internal/pgcapture"
 )
+
+// doctorTimeout bounds the whole health report so `bintrail-pg doctor` can't hang for
+// the OS TCP timeout against a black-holed host (it is a connectivity-diagnosis tool).
+// Mirrors the MySQL doctor.Build 30s budget.
+const doctorTimeout = 30 * time.Second
+
+// dependentCheckNames are the checks BuildPGReport skips when wal_level is genuinely
+// not 'logical' — logical decoding is impossible, so they cannot meaningfully run.
+var dependentCheckNames = []string{"Publication coverage", "REPLICA IDENTITY FULL", "max_slot_wal_keep_size", "Replication slot health"}
 
 // PGDoctorConfig is the subset of stream settings a health check needs: a normal
 // (non-replication) connection to the source, the slot to inspect, and the
@@ -34,6 +45,9 @@ type PGDoctorConfig struct {
 // It lives in pgstreamrun (not internal/doctor) because the report builder links
 // pgx/pgcapture, which internal/doctor must stay free of (cmd/bintrail's pgfree ban).
 func BuildPGReport(ctx context.Context, cfg PGDoctorConfig) *doctor.Report {
+	ctx, cancel := context.WithTimeout(ctx, doctorTimeout)
+	defer cancel()
+
 	r := &doctor.Report{
 		ReadyFooter: "All checks passed. Run `bintrail-pg stream` to start (or resume) capture.",
 		FixFooter:   "Fix the failures above, then re-run `bintrail-pg doctor` to verify.",
@@ -52,21 +66,19 @@ func BuildPGReport(ctx context.Context, cfg PGDoctorConfig) *doctor.Report {
 	defer conn.Close(context.Background())
 	r.Add(doctor.CheckResult{Name: "Source PostgreSQL connection", Status: doctor.StatusPass})
 
-	// wal_level is the prerequisite for everything else; if it's wrong, the rest
-	// can't meaningfully run, so skip them rather than emit a cascade of failures.
-	if err := pgcapture.CheckWALLevel(ctx, conn); err != nil {
-		r.Add(doctor.CheckResult{
-			Name:        "wal_level = logical",
-			Status:      doctor.StatusFail,
-			Detail:      err.Error(),
-			Remediation: "Set wal_level=logical in postgresql.conf and restart the server (this setting is not reloadable).",
-		})
-		for _, name := range []string{"Publication coverage", "REPLICA IDENTITY FULL", "max_slot_wal_keep_size", "Replication slot health"} {
+	// wal_level is the prerequisite for everything else. A genuine misconfiguration
+	// (readable, but not 'logical') skips the dependent checks — they can't run. A
+	// query FAILURE, by contrast, must NOT skip them: the slot-health check runs its
+	// own query and would report the dangerous state honestly, so a transient blip must
+	// never silently suppress it.
+	walRes, skipDependents := walLevelResult(pgcapture.CheckWALLevel(ctx, conn))
+	r.Add(walRes)
+	if skipDependents {
+		for _, name := range dependentCheckNames {
 			r.Add(doctor.CheckResult{Name: name, Status: doctor.StatusSkip, Detail: "requires wal_level=logical"})
 		}
 		return r
 	}
-	r.Add(doctor.CheckResult{Name: "wal_level = logical", Status: doctor.StatusPass})
 
 	filters := cliutil.BuildIndexFilters(cfg.Schemas, cfg.Tables)
 
@@ -97,28 +109,62 @@ func BuildPGReport(ctx context.Context, cfg PGDoctorConfig) *doctor.Report {
 	return r
 }
 
-// addKeepSizeCheck reports max_slot_wal_keep_size — the production red line (#532).
-// -1 (unlimited) means a stalled slot can pin WAL until the source disk fills, with
-// no in-database bound; that is a WARN, not a FAIL (it is a recommendation, and a
-// running consumer keeps it safe), so it does not fail the command.
+// walLevelResult maps the CheckWALLevel outcome to its CheckResult and whether the
+// dependent checks must be SKIPped. It is pure (takes the error) so both branches —
+// value-wrong (skip) and query-failed (don't skip) — are unit-testable without a live
+// non-logical server. A genuine wal_level!=logical config error fails AND skips
+// (logical decoding is impossible); a query error fails but does NOT skip, so a
+// transient blip never suppresses the load-bearing slot-health check.
+func walLevelResult(err error) (doctor.CheckResult, bool) {
+	const name = "wal_level = logical"
+	switch {
+	case err == nil:
+		return doctor.CheckResult{Name: name, Status: doctor.StatusPass}, false
+	case errors.Is(err, pgcapture.ErrWALLevelNotLogical):
+		return doctor.CheckResult{
+			Name:        name,
+			Status:      doctor.StatusFail,
+			Detail:      err.Error(),
+			Remediation: "Set wal_level=logical in postgresql.conf and restart the server (this setting is not reloadable).",
+		}, true
+	default:
+		return doctor.CheckResult{
+			Name:        name,
+			Status:      doctor.StatusFail,
+			Detail:      err.Error(),
+			Remediation: "Could not read wal_level. Retry once (a transient connection drop or timeout is the common cause); if it persists, check the role's privileges on the source.",
+		}, false
+	}
+}
+
+// addKeepSizeCheck reads max_slot_wal_keep_size and adds its result (a query failure
+// is a WARN — keep-size is advisory). The mapping is the pure keepSizeResult.
 func addKeepSizeCheck(ctx context.Context, r *doctor.Report, conn *pgx.Conn) {
 	var setting string
 	if err := conn.QueryRow(ctx, "SELECT current_setting('max_slot_wal_keep_size')").Scan(&setting); err != nil {
 		r.Add(doctor.CheckResult{Name: "max_slot_wal_keep_size", Status: doctor.StatusWarn, Detail: "could not read: " + err.Error()})
 		return
 	}
+	r.Add(keepSizeResult(setting))
+}
+
+// keepSizeResult maps the max_slot_wal_keep_size setting — the production red line
+// (#532). -1 (unlimited) means a stalled slot can pin WAL until the source disk fills,
+// with no in-database bound; that is a WARN, not a FAIL (it is a recommendation, and a
+// running consumer keeps it safe), so it does not fail the command.
+func keepSizeResult(setting string) doctor.CheckResult {
+	const name = "max_slot_wal_keep_size"
 	if setting == "-1" {
-		r.Add(doctor.CheckResult{
-			Name:   "max_slot_wal_keep_size",
+		return doctor.CheckResult{
+			Name:   name,
 			Status: doctor.StatusWarn,
 			Detail: "-1 (unlimited retention)",
 			Remediation: "Unlimited WAL retention: if this stream stalls, its replication slot can pin WAL until the source disk fills — an outage. " +
 				"Set a bound (e.g. max_slot_wal_keep_size = '10GB') so PostgreSQL invalidates the slot instead; bintrail-pg then fails loud and you re-baseline. " +
 				"This is the single GA-gating operational risk (#532).",
-		})
-		return
+		}
 	}
-	r.Add(doctor.CheckResult{Name: "max_slot_wal_keep_size", Status: doctor.StatusPass, Detail: setting})
+	return doctor.CheckResult{Name: name, Status: doctor.StatusPass, Detail: setting}
 }
 
 // addSlotHealthCheck queries the slot's live state and adds its CheckResult. A query
@@ -155,9 +201,9 @@ func slotHealthResult(h pgcapture.SlotHealth, slotName string) doctor.CheckResul
 	}
 
 	switch h.WalStatus {
-	case "lost":
+	case pgcapture.WalStatusLost:
 		return doctor.CheckResult{Name: name, Status: doctor.StatusFail, Detail: detail, Remediation: lostSlotRemediation(slotName)}
-	case "extended", "unreserved":
+	case pgcapture.WalStatusExtended, pgcapture.WalStatusUnreserved:
 		return doctor.CheckResult{
 			Name:   name,
 			Status: doctor.StatusWarn,
@@ -166,9 +212,19 @@ func slotHealthResult(h pgcapture.SlotHealth, slotName string) doctor.CheckResul
 				"If it crosses, PostgreSQL invalidates the slot (wal_status=lost) and capture cannot resume — you must re-baseline. " +
 				"Make sure `bintrail-pg stream` is running and keeping up with the source's write rate.",
 		}
-	default:
-		// "reserved" (healthy) or an unexpected/empty value — show the detail, pass.
+	case pgcapture.WalStatusReserved, "":
+		// reserved = healthy; "" = a just-created slot that hasn't reserved WAL yet
+		// (restart_lsn NULL) — both benign.
 		return doctor.CheckResult{Name: name, Status: doctor.StatusPass, Detail: detail}
+	default:
+		// An unrecognized, non-empty status (e.g. a future PostgreSQL value) must not
+		// be silently shown as healthy — WARN so a new dangerous state can't slip through.
+		return doctor.CheckResult{
+			Name:        name,
+			Status:      doctor.StatusWarn,
+			Detail:      detail,
+			Remediation: fmt.Sprintf("Unrecognized wal_status %q — treating as non-fatal; verify the slot manually against your PostgreSQL version's pg_replication_slots docs.", h.WalStatus),
+		}
 	}
 }
 

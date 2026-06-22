@@ -60,6 +60,10 @@ type Report struct {
 // doctor, which cannot live in this package because internal/doctor must stay free
 // of the pgx/pglogrepl dependency (cmd/bintrail's pgfree ban). MySQL's own Build
 // uses the unexported add.
+//
+// Add (and the internal add) are the ONLY sanctioned way to grow a Report: appending
+// to the exported Checks slice directly would leave Passed/Failed/Warnings/Skipped
+// stale. Callers must always go through Add.
 func (r *Report) Add(c CheckResult) { r.add(c) }
 
 // binlogRetentionMinSeconds is the minimum binlog retention bintrail asks for

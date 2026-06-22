@@ -2,6 +2,8 @@ package pgstreamrun
 
 import (
 	"database/sql"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -18,10 +20,11 @@ func TestSlotHealthResult(t *testing.T) {
 	}{
 		{"absent", pgcapture.SlotHealth{Exists: false}, doctor.StatusSkip, "does not exist"},
 		{"reserved", pgcapture.SlotHealth{Exists: true, WalStatus: "reserved", Active: true}, doctor.StatusPass, "wal_status=reserved"},
+		{"empty-status-passes", pgcapture.SlotHealth{Exists: true, WalStatus: ""}, doctor.StatusPass, "wal_status="},
 		{"extended", pgcapture.SlotHealth{Exists: true, WalStatus: "extended"}, doctor.StatusWarn, "approaching"},
 		{"unreserved", pgcapture.SlotHealth{Exists: true, WalStatus: "unreserved"}, doctor.StatusWarn, "approaching"},
 		{"lost", pgcapture.SlotHealth{Exists: true, WalStatus: "lost"}, doctor.StatusFail, "re-baseline"},
-		{"unknown-status-passes", pgcapture.SlotHealth{Exists: true, WalStatus: "weird"}, doctor.StatusPass, "wal_status=weird"},
+		{"unknown-status-warns", pgcapture.SlotHealth{Exists: true, WalStatus: "weird"}, doctor.StatusWarn, "Unrecognized wal_status"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -68,6 +71,55 @@ func TestSlotHealthResult_safeWalSizeRendering(t *testing.T) {
 	if strings.Contains(noSafe.Detail, "safe_wal=") {
 		t.Errorf("safe_wal must be omitted when NULL: %q", noSafe.Detail)
 	}
+}
+
+// TestWalLevelResult pins the distinction the silent-failure review required: a
+// genuine wal_level!=logical config error FAILs and SKIPs dependents, while a query
+// failure FAILs but does NOT skip (so a transient blip never suppresses slot-health).
+func TestWalLevelResult(t *testing.T) {
+	t.Run("ok", func(t *testing.T) {
+		res, skip := walLevelResult(nil)
+		if res.Status != doctor.StatusPass || skip {
+			t.Errorf("nil err → got (%s, skip=%t), want (pass, false)", res.Status, skip)
+		}
+	})
+	t.Run("not-logical-skips", func(t *testing.T) {
+		err := fmt.Errorf("wrap: %w", pgcapture.ErrWALLevelNotLogical)
+		res, skip := walLevelResult(err)
+		if res.Status != doctor.StatusFail || !skip {
+			t.Errorf("not-logical → got (%s, skip=%t), want (fail, true)", res.Status, skip)
+		}
+		if !strings.Contains(res.Remediation, "restart the server") {
+			t.Errorf("not-logical remediation should mention the restart: %q", res.Remediation)
+		}
+	})
+	t.Run("query-error-does-not-skip", func(t *testing.T) {
+		res, skip := walLevelResult(errors.New("connection refused"))
+		if res.Status != doctor.StatusFail || skip {
+			t.Errorf("query error → got (%s, skip=%t), want (fail, false — must not suppress dependents)", res.Status, skip)
+		}
+		if !strings.Contains(res.Remediation, "Retry") {
+			t.Errorf("query-error remediation should suggest retry, not a server restart: %q", res.Remediation)
+		}
+	})
+}
+
+func TestKeepSizeResult(t *testing.T) {
+	t.Run("unlimited-warns", func(t *testing.T) {
+		res := keepSizeResult("-1")
+		if res.Status != doctor.StatusWarn {
+			t.Errorf("'-1' → %s, want warn (the production red line)", res.Status)
+		}
+		if !strings.Contains(res.Remediation, "disk fills") {
+			t.Errorf("unlimited remediation should name the disk-fill risk: %q", res.Remediation)
+		}
+	})
+	t.Run("bounded-passes", func(t *testing.T) {
+		res := keepSizeResult("10GB")
+		if res.Status != doctor.StatusPass || res.Detail != "10GB" {
+			t.Errorf("'10GB' → (%s, %q), want (pass, 10GB)", res.Status, res.Detail)
+		}
+	})
 }
 
 func TestFormatBytes(t *testing.T) {
