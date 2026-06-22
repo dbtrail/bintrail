@@ -2,7 +2,6 @@ package pgcapture
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -86,6 +85,15 @@ func validatePublication(ctx context.Context, conn *pgx.Conn, pubname string, fi
 // FOR ALL TABLES publication mid-stream — which this one-shot check never re-runs for
 // — is caught at the live boundary too.
 func validateReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication string) error {
+	if err := checkWALLevel(ctx, conn); err != nil {
+		return err
+	}
+	return checkReplicaIdentityTables(ctx, conn, publication)
+}
+
+// checkWALLevel verifies the (global) wal_level is 'logical' — logical replication
+// is impossible otherwise.
+func checkWALLevel(ctx context.Context, conn *pgx.Conn) error {
 	var walLevel string
 	if err := conn.QueryRow(ctx, "SELECT current_setting('wal_level')").Scan(&walLevel); err != nil {
 		return fmt.Errorf("pgcapture: checking wal_level: %w", err)
@@ -93,7 +101,12 @@ func validateReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication st
 	if walLevel != "logical" {
 		return fmt.Errorf("pgcapture: wal_level is %q, must be 'logical' for logical replication", walLevel)
 	}
+	return nil
+}
 
+// checkReplicaIdentityTables verifies every table the publication streams is at
+// REPLICA IDENTITY FULL (the per-table loop; wal_level is checked separately).
+func checkReplicaIdentityTables(ctx context.Context, conn *pgx.Conn, publication string) error {
 	rows, err := conn.Query(ctx, `
 		SELECT pt.schemaname, pt.tablename, c.relreplident::text
 		FROM pg_publication_tables pt
@@ -126,6 +139,29 @@ func validateReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication st
 	return nil
 }
 
+// The exported Check* functions are the report-only form of the capture-time
+// validate* guards above, for bintrail-pg doctor. They are pure probes (no CREATE,
+// no mutation) returning nil when healthy and a descriptive error otherwise; the
+// doctor converts that error into a CheckResult. They live here so the single
+// catalog-query source of truth (and its error wording) is shared with capture.
+
+// CheckWALLevel verifies wal_level = 'logical' on the source.
+func CheckWALLevel(ctx context.Context, conn *pgx.Conn) error {
+	return checkWALLevel(ctx, conn)
+}
+
+// CheckPublication verifies the publication exists and covers the requested tables.
+func CheckPublication(ctx context.Context, conn *pgx.Conn, publication string, filters event.Filters) error {
+	return validatePublication(ctx, conn, publication, filters)
+}
+
+// CheckReplicaIdentity verifies every table the publication streams is at REPLICA
+// IDENTITY FULL. It does NOT re-check wal_level (use CheckWALLevel for that), so the
+// doctor can report the two distinctly.
+func CheckReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication string) error {
+	return checkReplicaIdentityTables(ctx, conn, publication)
+}
+
 // ensureSlot returns the LSN to start replication from, creating the slot on first
 // run. The first-run-vs-resume decision is gated on slot EXISTENCE in
 // pg_replication_slots (NOT on savedLSN==0 — an empty saved checkpoint decodes to
@@ -151,18 +187,14 @@ func validateReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication st
 // ensureSlot fails loud in that case rather than skip; the recovery policy
 // (re-baseline) is #532.
 func ensureSlot(ctx context.Context, replConn *pgconn.PgConn, queryConn *pgx.Conn, slotName string, savedLSN pglogrepl.LSN, expectExisting bool) (pglogrepl.LSN, error) {
-	var walStatus sql.NullString
-	found := true
-	err := queryConn.QueryRow(ctx, `SELECT wal_status FROM pg_replication_slots WHERE slot_name = $1`, slotName).Scan(&walStatus)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		found = false
-	case err != nil:
-		return 0, fmt.Errorf("pgcapture: checking replication slot %q: %w", slotName, err)
+	health, err := QuerySlotHealth(ctx, queryConn, slotName)
+	if err != nil {
+		return 0, err
 	}
+	found := health.Exists
 
 	// A 'lost' slot is unusable regardless of mode — its WAL has been removed.
-	if found && walStatus.String == "lost" {
+	if found && health.WalStatus == "lost" {
 		return 0, fmt.Errorf("pgcapture: replication slot %q is invalidated (wal_status=lost; max_slot_wal_keep_size exceeded) — the WAL it needs is gone; re-baseline rather than resume", slotName)
 	}
 

@@ -1,0 +1,131 @@
+package pgcapture
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5"
+)
+
+// SlotHealth is the live WAL-retention state of a replication slot, read from
+// pg_replication_slots on a plain query connection. It is the foundation for #532
+// WAL-retention monitoring: ensureSlot uses it at capture startup, and bintrail-pg
+// doctor reports it on demand.
+//
+// Health-only: callers REPORT a SlotHealth, they do not fail-loud on it. Failing
+// loud on an invalidated slot is ensureSlot's job (at capture time, where skipping
+// WAL would silently lose data); a health/doctor surface must keep working precisely
+// so it can SHOW the bad state.
+type SlotHealth struct {
+	// Exists is false when no slot of that name is present (first run, or torn
+	// down). All other fields are zero in that case.
+	Exists bool
+	// Active is true when a consumer (a walsender) currently holds the slot.
+	Active bool
+	// WalStatus is the slot's WAL-retention state: reserved (within max_wal_size),
+	// extended (beyond max_wal_size but within max_slot_wal_keep_size), unreserved
+	// (at risk — the next checkpoint may invalidate it), or lost (invalidated, its
+	// WAL removed). Empty when the slot is absent.
+	WalStatus string
+	// RestartLSN is the oldest WAL the slot still needs; the WAL the slot pins runs
+	// from here to the server head. 0 when NULL (a just-created slot) or absent.
+	RestartLSN pglogrepl.LSN
+	// ConfirmedFlushLSN is how far the consumer has durably acked. 0 when NULL/absent.
+	ConfirmedFlushLSN pglogrepl.LSN
+	// CurrentWalLSN is the server's current WAL write head (pg_current_wal_lsn()).
+	CurrentWalLSN pglogrepl.LSN
+	// RetainedBytes is the WAL the slot pins on the source disk
+	// (pg_current_wal_lsn() - restart_lsn). This is the continuous early-warning
+	// signal — it rises before wal_status flips to lost. 0 when restart_lsn is NULL.
+	RetainedBytes int64
+	// SafeWalSize is how much more WAL can be written before this slot risks
+	// invalidation (pg_replication_slots.safe_wal_size). Invalid (NULL) when
+	// max_slot_wal_keep_size = -1 (unlimited retention — the production red line the
+	// doctor warns about), because there is then no bound to be safely under.
+	SafeWalSize sql.NullInt64
+}
+
+// slotHealthQuery reads one slot's retention state. LSN columns are cast to ::text so
+// they scan into a plain string regardless of the pg_lsn codec; restart_lsn /
+// confirmed_flush_lsn / safe_wal_size can be NULL (just-created slot, or unlimited
+// retention). retained_bytes is derived in SQL via pg_wal_lsn_diff. pg_current_wal_lsn()
+// assumes a primary (the source we capture from); on a standby it would error, which a
+// health surface reports rather than hides. The columns exist on every supported
+// version (PG14+).
+const slotHealthQuery = `SELECT
+	s.active,
+	s.wal_status,
+	s.restart_lsn::text,
+	s.confirmed_flush_lsn::text,
+	pg_current_wal_lsn()::text,
+	pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn)::bigint,
+	s.safe_wal_size
+FROM pg_replication_slots s
+WHERE s.slot_name = $1`
+
+// slotHealthRow is the raw catalog row, scanned with NULL-tolerant types before being
+// folded into a SlotHealth by toHealth (a pure step, unit-tested without a live PG).
+type slotHealthRow struct {
+	active            bool
+	walStatus         sql.NullString
+	restartLSN        sql.NullString
+	confirmedFlushLSN sql.NullString
+	currentWalLSN     sql.NullString
+	retainedBytes     sql.NullInt64
+	safeWalSize       sql.NullInt64
+}
+
+// toHealth converts a scanned row into a SlotHealth (Exists is always true here — the
+// absent case is handled by QuerySlotHealth before this is called). It parses the
+// text-form LSNs, treating NULL/empty as 0.
+func (r slotHealthRow) toHealth() (SlotHealth, error) {
+	h := SlotHealth{
+		Exists:        true,
+		Active:        r.active,
+		WalStatus:     r.walStatus.String,
+		RetainedBytes: r.retainedBytes.Int64, // .Int64 is 0 when NULL
+		SafeWalSize:   r.safeWalSize,
+	}
+	var err error
+	if h.RestartLSN, err = parseNullLSN(r.restartLSN); err != nil {
+		return SlotHealth{}, fmt.Errorf("restart_lsn: %w", err)
+	}
+	if h.ConfirmedFlushLSN, err = parseNullLSN(r.confirmedFlushLSN); err != nil {
+		return SlotHealth{}, fmt.Errorf("confirmed_flush_lsn: %w", err)
+	}
+	if h.CurrentWalLSN, err = parseNullLSN(r.currentWalLSN); err != nil {
+		return SlotHealth{}, fmt.Errorf("current_wal_lsn: %w", err)
+	}
+	return h, nil
+}
+
+// parseNullLSN parses a text-form LSN ("X/Y"), returning 0 for NULL/empty.
+func parseNullLSN(s sql.NullString) (pglogrepl.LSN, error) {
+	if !s.Valid || s.String == "" {
+		return 0, nil
+	}
+	return pglogrepl.ParseLSN(s.String)
+}
+
+// QuerySlotHealth reads the live WAL-retention state of slotName on a plain query
+// connection (never the replication conn, which is a walsender and cannot run SQL).
+// It returns SlotHealth{Exists: false} with a nil error when the slot is absent — an
+// expected state (first run, torn down), not an error — so callers can distinguish
+// "no slot" from "query failed".
+func QuerySlotHealth(ctx context.Context, conn *pgx.Conn, slotName string) (SlotHealth, error) {
+	var r slotHealthRow
+	err := conn.QueryRow(ctx, slotHealthQuery, slotName).Scan(
+		&r.active, &r.walStatus, &r.restartLSN, &r.confirmedFlushLSN,
+		&r.currentWalLSN, &r.retainedBytes, &r.safeWalSize,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SlotHealth{Exists: false}, nil
+	}
+	if err != nil {
+		return SlotHealth{}, fmt.Errorf("pgcapture: querying slot health for %q: %w", slotName, err)
+	}
+	return r.toHealth()
+}

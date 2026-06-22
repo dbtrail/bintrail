@@ -45,7 +45,22 @@ type Report struct {
 	Failed   int           `json:"failed"`
 	Warnings int           `json:"warnings"`
 	Skipped  int           `json:"skipped"`
+
+	// ReadyFooter / FixFooter customize the trailing one-line guidance in the TEXT
+	// output (the all-passed line and the has-failures line respectively). They are
+	// excluded from JSON. Empty values fall back to the default MySQL-oriented
+	// guidance, so existing callers are unaffected; a non-MySQL caller (e.g.
+	// bintrail-pg doctor) sets them to its own command names.
+	ReadyFooter string `json:"-"`
+	FixFooter   string `json:"-"`
 }
+
+// Add appends a check result and updates the counters. It is the exported entry
+// point for callers building a Report outside this package — e.g. the PostgreSQL
+// doctor, which cannot live in this package because internal/doctor must stay free
+// of the pgx/pglogrepl dependency (cmd/bintrail's pgfree ban). MySQL's own Build
+// uses the unexported add.
+func (r *Report) Add(c CheckResult) { r.add(c) }
 
 // binlogRetentionMinSeconds is the minimum binlog retention bintrail asks for
 // (docs/streaming.md:279). Hoisted so the check function and any test referring
@@ -754,10 +769,18 @@ func (r *Report) Write(w io.Writer, format string) error {
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "Passed: %d  Failed: %d  Warnings: %d  Skipped: %d\n",
 		r.Passed, r.Failed, r.Warnings, r.Skipped)
+	ready := r.ReadyFooter
+	if ready == "" {
+		ready = "Ready to stream. Run `bintrail up --source-dsn ... --index-dsn ...` to start."
+	}
+	fix := r.FixFooter
+	if fix == "" {
+		fix = "Fix the failures above, then re-run `bintrail doctor` to verify."
+	}
 	if r.Failed == 0 {
-		fmt.Fprintln(w, "\nReady to stream. Run `bintrail up --source-dsn ... --index-dsn ...` to start.")
+		fmt.Fprintln(w, "\n"+ready)
 	} else {
-		fmt.Fprintln(w, "\nFix the failures above, then re-run `bintrail doctor` to verify.")
+		fmt.Fprintln(w, "\n"+fix)
 	}
 	return nil
 }
