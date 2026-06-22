@@ -3,11 +3,13 @@ package pgcapture
 import (
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/jackc/pglogrepl"
 
 	"github.com/dbtrail/dbtrail/internal/event"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // UnchangedToastKey is the single key of the structurally-distinct marker the
@@ -104,7 +106,15 @@ func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
 		if err := d.cacheRelation(m); err != nil {
 			return event.Event{}, false, err
 		}
-		return event.Event{}, false, nil
+		// Emit a schema snapshot for the consumer to persist (#533), but only for an
+		// in-scope relation: cacheRelation caches EVERY relation so row decoding can
+		// resolve any OID, yet a filtered-out table must not write snapshot rows or
+		// stamp a SchemaVersion. Gate the EMIT, not the cache.
+		rel := d.relations[m.RelationID]
+		if !d.filters.Matches(rel.schema, rel.table) {
+			return event.Event{}, false, nil
+		}
+		return relationEvent(rel), true, nil
 
 	case *pglogrepl.InsertMessage:
 		return d.decodeInsert(m)
@@ -197,6 +207,25 @@ func (d *Decoder) cacheRelation(m *pglogrepl.RelationMessage) error {
 		}
 	}
 
+	// Order PK columns by their table-column (ordinal) position. The catalog query
+	// returns them in PK-KEY order, which diverges from table order for a composite
+	// PRIMARY KEY declared out of column order (e.g. PRIMARY KEY (b, a) on a table
+	// (a, b)). event.BuildPKValues here would then build pk_values in key order,
+	// while the offline resolver (metadata.PKColumnMetas) yields the PK columns in
+	// table-ordinal order — and reconstruct pairs the two POSITIONALLY, silently
+	// corrupting the merge. Reordering to table-ordinal keeps the cross-source
+	// invariant pk_values == BuildPKValues(resolver PKColumnMetas, row). Single-column
+	// PKs are unaffected; all pkCols names are present in cols (drift check above).
+	if len(pkCols) > 1 {
+		ordinalOf := make(map[string]int, len(cols))
+		for i, c := range cols {
+			ordinalOf[c.name] = i
+		}
+		sort.SliceStable(pkCols, func(a, b int) bool {
+			return ordinalOf[pkCols[a].Name] < ordinalOf[pkCols[b].Name]
+		})
+	}
+
 	d.relations[m.RelationID] = &relationInfo{
 		schema:  m.Namespace,
 		table:   m.RelationName,
@@ -204,6 +233,38 @@ func (d *Decoder) cacheRelation(m *pglogrepl.RelationMessage) error {
 		pkCols:  pkCols,
 	}
 	return nil
+}
+
+// relationEvent builds an EventRelation carrying the relation's shape for the
+// consumer to persist as a schema snapshot (the source-neutral, in-band analog of
+// MySQL's TakeSnapshot — no information_schema). IsPK is by name; rel.pkCols is
+// already in table-ordinal order (cacheRelation reordered it), so the snapshot's PK
+// columns align with the resolver. Ordinal is the table-column position.
+func relationEvent(rel *relationInfo) event.Event {
+	pkNames := make(map[string]bool, len(rel.pkCols))
+	for _, pk := range rel.pkCols {
+		pkNames[pk.Name] = true
+	}
+	cols := make([]metadata.PGRelationColumn, len(rel.columns))
+	for i, c := range rel.columns {
+		cols[i] = metadata.PGRelationColumn{
+			Name:    c.name,
+			Ordinal: i + 1,
+			IsPK:    pkNames[c.name],
+			TypeOID: c.typeOID,
+			TypeMod: c.typeMod,
+		}
+	}
+	return event.Event{
+		Schema:    rel.schema,
+		Table:     rel.table,
+		EventType: event.EventRelation,
+		Relation: &metadata.PGRelationSchema{
+			Schema:  rel.schema,
+			Table:   rel.table,
+			Columns: cols,
+		},
+	}
 }
 
 func (d *Decoder) decodeInsert(m *pglogrepl.InsertMessage) (event.Event, bool, error) {

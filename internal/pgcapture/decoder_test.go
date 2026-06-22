@@ -472,6 +472,80 @@ func TestDecode_TextValuesRoundTripAsStrings(t *testing.T) {
 	}
 }
 
+// ─── EventRelation schema emission (#533 — the schema/type oracle) ─────────────
+
+func TestDecode_RelationEmitsSchema(t *testing.T) {
+	// A RelationMessage now emits an EventRelation carrying the relation's shape for
+	// the consumer to persist as a schema snapshot. PK is flagged by name, ordinals
+	// are table positions, and the per-column type OID/typmod are carried.
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	m := relMsg(1, "public", "orders", "id", "amount")
+	m.Columns[0].DataType = 23      // int4
+	m.Columns[1].DataType = 1700    // numeric
+	m.Columns[1].TypeModifier = 100 // numeric(p,s) typmod
+	ev, emit := mustDecode(t, d, m)
+	if !emit || ev.EventType != event.EventRelation {
+		t.Fatalf("RelationMessage: emit=%v type=%d, want emit EventRelation", emit, ev.EventType)
+	}
+	if ev.Relation == nil || ev.Relation.Schema != "public" || ev.Relation.Table != "orders" {
+		t.Fatalf("Relation = %+v, want public.orders", ev.Relation)
+	}
+	if len(ev.Relation.Columns) != 2 {
+		t.Fatalf("got %d columns, want 2", len(ev.Relation.Columns))
+	}
+	id := ev.Relation.Columns[0]
+	if id.Name != "id" || id.Ordinal != 1 || !id.IsPK || id.TypeOID != 23 {
+		t.Errorf("col[0] = %+v, want {Name:id Ordinal:1 IsPK:true TypeOID:23}", id)
+	}
+	amt := ev.Relation.Columns[1]
+	if amt.Name != "amount" || amt.Ordinal != 2 || amt.IsPK || amt.TypeOID != 1700 || amt.TypeMod != 100 {
+		t.Errorf("col[1] = %+v, want {Name:amount Ordinal:2 IsPK:false TypeOID:1700 TypeMod:100}", amt)
+	}
+}
+
+func TestDecode_CompositePKReorderedToOrdinal(t *testing.T) {
+	// PRIMARY KEY (b, a) on columns (a, b, c): the catalog reports the PK in key
+	// order (b, a), but the decoder must reorder it to table-ordinal (a, b) so the
+	// pk_values it builds matches the offline resolver's metadata.PKColumnMetas
+	// (also ordinal) — the cross-source invariant reconstruct pairs positionally.
+	d := pgcapture.NewDecoder(pkResolver("b", "a"), event.Filters{}, nil) // key order (b, a)
+	rel, emit := mustDecode(t, d, relMsg(1, "public", "t", "a", "b", "c"))
+	if !emit {
+		t.Fatal("RelationMessage should emit an EventRelation")
+	}
+	cols := rel.Relation.Columns
+	if cols[0].Name != "a" || !cols[0].IsPK || cols[1].Name != "b" || !cols[1].IsPK || cols[2].IsPK {
+		t.Errorf("PK flags wrong (want a,b PK; c not): %+v", cols)
+	}
+
+	mustDecode(t, d, beginMsg())
+	ins, emit := mustDecode(t, d, &pglogrepl.InsertMessage{
+		RelationID: 1, Tuple: tuple(textCol("10"), textCol("20"), textCol("x")), // a=10, b=20, c=x
+	})
+	if !emit {
+		t.Fatal("INSERT should emit")
+	}
+	if ins.PKValues != "10|20" {
+		t.Errorf("PKValues = %q, want %q (table-ordinal (a, b), NOT catalog key order (b, a))", ins.PKValues, "10|20")
+	}
+}
+
+func TestDecode_RelationFilterGatesEmitNotCache(t *testing.T) {
+	// A filtered-out relation is still CACHED (so its rows can resolve OIDs) but must
+	// NOT emit an EventRelation — otherwise the consumer would persist a snapshot and
+	// stamp a SchemaVersion for a table the operator excluded.
+	d := pgcapture.NewDecoder(pkResolver("id"),
+		event.Filters{Tables: map[string]bool{"public.keep": true}}, nil)
+	_, emit := mustDecode(t, d, relMsg(1, "public", "skip", "id"))
+	if emit {
+		t.Error("RelationMessage for a filtered-out table must not emit an EventRelation")
+	}
+	_, emit = mustDecode(t, d, relMsg(2, "public", "keep", "id"))
+	if !emit {
+		t.Error("RelationMessage for an in-scope table must emit an EventRelation")
+	}
+}
+
 // ─── small helpers ────────────────────────────────────────────────────────────
 
 var errBoom = errBoomType("catalog unreachable")

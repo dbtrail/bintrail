@@ -159,6 +159,8 @@ const ddlSchemaSnapshots = `CREATE TABLE IF NOT EXISTS schema_snapshots (
     is_nullable      VARCHAR(3)   NOT NULL,
     column_default   TEXT         DEFAULT NULL,
     is_generated     TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '1 if STORED or VIRTUAL generated column',
+    pg_type_oid      INT UNSIGNED DEFAULT NULL COMMENT 'PostgreSQL pg_type OID (pgoutput RelationMessage); NULL for MySQL snapshots (#533)',
+    pg_type_mod      INT          DEFAULT NULL COMMENT 'PostgreSQL atttypmod (pgoutput RelationMessage); NULL for MySQL snapshots (#533)',
     INDEX idx_snapshot_id    (snapshot_id),
     INDEX idx_snapshot_table (snapshot_id, schema_name, table_name)
 ) ENGINE=InnoDB`

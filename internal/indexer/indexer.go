@@ -230,6 +230,22 @@ func EnsureSchema(db *sql.DB) error {
 	); err != nil {
 		return err
 	}
+	// pg_type_oid/pg_type_mod carry the PostgreSQL per-column type identity (pg_type
+	// OID + atttypmod) from a pgoutput RelationMessage (#533). They are captured at
+	// stream time because the offline recover path has no live PostgreSQL catalog to
+	// rebuild them from. Nullable: MySQL snapshots leave them NULL (MySQL uses
+	// data_type/column_type). WritePGSnapshot writes them; the type-faithful renderer
+	// that reads them is a later #533 slice.
+	if err := ensureColumn(db, "schema_snapshots", "pg_type_oid",
+		`ALTER TABLE schema_snapshots ADD COLUMN pg_type_oid INT UNSIGNED DEFAULT NULL COMMENT 'PostgreSQL pg_type OID (pgoutput RelationMessage); NULL for MySQL snapshots (#533)' AFTER is_generated`,
+	); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "schema_snapshots", "pg_type_mod",
+		`ALTER TABLE schema_snapshots ADD COLUMN pg_type_mod INT DEFAULT NULL COMMENT 'PostgreSQL atttypmod (pgoutput RelationMessage); NULL for MySQL snapshots (#533)' AFTER pg_type_oid`,
+	); err != nil {
+		return err
+	}
 	// gap_lost_at/_detail record an unfillable-gap auto-advance durably
 	// (#402): the advanced checkpoint is persisted, so without these columns
 	// the only trace of the permanently lost events would be an in-memory

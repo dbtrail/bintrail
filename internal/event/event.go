@@ -46,6 +46,14 @@ const (
 	// can never claim a half-streamed transaction (#491). The file parser does not
 	// produce it.
 	EventCommit EventType = 7
+	// EventRelation carries a PostgreSQL relation's shape (column names, ordinals,
+	// PK flags, type OIDs) in Relation, with no row data. The pgcapture decoder
+	// emits one when it sees a pgoutput RelationMessage for an in-scope table; the
+	// consumer persists it as a schema snapshot (metadata.WritePGSnapshot) and
+	// stamps subsequent rows' SchemaVersion (#533). It is NEVER written to
+	// binlog_events — the consumer handles it out-of-band — so it does not break the
+	// "EventType numeric values are a persistence contract" rule for stored rows.
+	EventRelation EventType = 8
 )
 
 // Event is a fully resolved change event with column names attached. It carries
@@ -77,6 +85,10 @@ type Event struct {
 	SchemaVersion uint32         // actual snapshot_id from schema_snapshots; updated by SwapResolver on DDL
 	DDLQuery      string         // original DDL statement (EventDDL only)
 	DDLType       DDLKind        // ALTER TABLE, CREATE TABLE, DROP TABLE, RENAME TABLE, TRUNCATE TABLE (EventDDL only)
+	// Relation carries a PostgreSQL relation's shape (EventRelation only); the
+	// consumer persists it as a schema snapshot and stamps subsequent rows'
+	// SchemaVersion. nil for every other event type; never written to binlog_events.
+	Relation *metadata.PGRelationSchema
 }
 
 // Filters controls which schemas and tables produce events.

@@ -24,6 +24,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/pgcapture"
 )
 
@@ -182,6 +183,16 @@ func streamLoopPG(
 
 	var lastCommitLSN uint64
 
+	// snapshotByTable maps "schema.table" → the snapshot_id of that table's most
+	// recent EventRelation (#533). Per-TABLE, not a single scalar: pgoutput sends a
+	// RelationMessage once per relation per session, so a second table's snapshot
+	// would otherwise clobber the first, and every later row of the first table would
+	// be stamped the wrong snapshot_id (recovery would silently fall back to an
+	// all-columns WHERE — #531 left unclosed for all but the last table). A map miss
+	// yields 0 → the safe SchemaVersion-0 all-columns fallback, which an in-scope row
+	// never hits (its RelationMessage always precedes it).
+	snapshotByTable := make(map[string]uint32)
+
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -246,9 +257,25 @@ func streamLoopPG(
 					return err
 				}
 				lastCommitLSN = ev.EndPos
+			case event.EventRelation:
+				// A relation's shape (#533): persist it as a schema snapshot and record
+				// its snapshot_id for stamping this table's subsequent rows. The snapshot
+				// commits immediately (its own txn), BEFORE the rows referencing it are
+				// flushed — so "snapshot durable before its rows durable" holds; it sits
+				// outside the flush→checkpoint→ack sequence, so it does not advance the
+				// cursor and does NOT force a flush (already-batched rows carry their own,
+				// already-persisted snapshot_ids — per-row schema_version makes a mixed
+				// batch correct). A crash before the next checkpoint just re-delivers and
+				// re-snapshots (a benign orphan id).
+				id, werr := metadata.WritePGSnapshot(indexDB, ev.Relation)
+				if werr != nil {
+					return fmt.Errorf("pgstreamrun: persist schema snapshot for %s.%s: %w", ev.Schema, ev.Table, werr)
+				}
+				snapshotByTable[ev.Schema+"."+ev.Table] = uint32(id)
 			case event.EventGTID:
 				// PostgreSQL does not emit a leading GTID marker; ignore defensively.
 			default:
+				ev.SchemaVersion = snapshotByTable[ev.Schema+"."+ev.Table]
 				batch = append(batch, ev)
 				if len(batch) >= idx.BatchSize() {
 					if err := flush(); err != nil {

@@ -102,6 +102,7 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 
 	r := &Resolver{snapshotID: snapshotID, tables: make(map[string]*TableMeta)}
 	sawColumnType := false
+	sawDataType := false
 
 	for rows.Next() {
 		var schemaName, tableName, columnName, columnKey, dataType, columnType string
@@ -130,6 +131,9 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 		if columnType != "" {
 			sawColumnType = true
 		}
+		if dataType != "" {
+			sawDataType = true
+		}
 		tm.Columns = append(tm.Columns, col)
 		if col.IsPK {
 			tm.PKColumns = append(tm.PKColumns, columnName)
@@ -144,7 +148,15 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	// integer columns are UNSIGNED and silently indexes them as-is. Warn once (not
 	// per row) so an operator who upgraded for the unsigned fix (#490) isn't misled
 	// into thinking a stale snapshot is corrected.
-	if len(r.tables) > 0 && !sawColumnType {
+	//
+	// Gate on sawDataType so this MySQL-only warning never fires for a PostgreSQL
+	// snapshot (#533): WritePGSnapshot leaves both data_type AND column_type empty
+	// (PG carries no MySQL DATA_TYPE/COLUMN_TYPE, and UNSIGNED sign-correction is a
+	// MySQL-only concern coerceUnsigned never runs for PG rows). A genuine pre-#212
+	// MySQL snapshot always has a non-empty data_type (from information_schema), so
+	// it still trips the warning; only the all-empty-data_type PG signature is
+	// suppressed.
+	if len(r.tables) > 0 && sawDataType && !sawColumnType {
 		slog.Warn("snapshot predates column_type capture (#212); UNSIGNED integer "+
 			"columns cannot be sign-corrected and are indexed with the wrong value when "+
 			"the high bit is set (unsigned PKs also corrupt pk_hash) — re-run "+
@@ -290,6 +302,111 @@ func coerceUnsigned(v any, col ColumnMeta) any {
 	default:
 		return v
 	}
+}
+
+// ─── PostgreSQL schema oracle (#533) ─────────────────────────────────────────
+
+// PGRelationColumn is one column of a PostgreSQL relation's shape, decoded in-band
+// from a pgoutput RelationMessage (no information_schema). Ordinal is the 1-based
+// table-column position; IsPK marks a primary-key column; TypeOID/TypeMod are the
+// pg_type OID and atttypmod, persisted now for the (deferred #533) type-faithful
+// renderer even though slice-1 stores values as text and does not read them.
+type PGRelationColumn struct {
+	Name    string
+	Ordinal int
+	IsPK    bool
+	TypeOID uint32
+	TypeMod int32
+}
+
+// PGRelationSchema is a PostgreSQL relation's shape as seen on the logical-
+// replication stream — the in-band, source-neutral payload an event.EventRelation
+// carries from the pgcapture decoder to the consumer, which persists it via
+// WritePGSnapshot. Columns are in table-ordinal order (so a primary key declared
+// out of column order still yields ordinal-order pk_values matching the resolver —
+// the pgcapture decoder reorders its catalog-key-order PK to match).
+//
+// It lives here, not in internal/event, because event imports metadata (so the
+// reverse would be an import cycle) and because WritePGSnapshot — its only
+// consumer — belongs next to TakeSnapshot.
+type PGRelationSchema struct {
+	Schema  string
+	Table   string
+	Columns []PGRelationColumn // table-ordinal order
+}
+
+// WritePGSnapshot persists one PostgreSQL relation's shape as a schema_snapshots
+// snapshot and returns the allocated snapshot_id. It is the PostgreSQL,
+// stream-time sibling of TakeSnapshot: where TakeSnapshot reads MySQL
+// information_schema for a whole schema, WritePGSnapshot takes one relation's
+// in-band shape (decoded from a pgoutput RelationMessage) so the offline recover
+// path can build a PK-scoped WHERE without a live PostgreSQL connection — closing
+// the remainder of #531 (PK-aware recovery on the PG path).
+//
+// Each call writes ONE table under a fresh snapshot_id (MAX+1), unlike MySQL where
+// one snapshot covers a whole schema: PostgreSQL relations arrive one
+// RelationMessage at a time, interleaved with rows, so each is its own snapshot and
+// each PG row is stamped (by the consumer) with its table's snapshot_id.
+// Consequence to respect in later slices: NewResolver(db, 0) (latest) yields a
+// SINGLE table for a PG index, not a whole-schema view — recovery is unaffected (it
+// loads each row's own snapshot_id), but a whole-schema consumer (console Tables(),
+// shim SHOW TABLES) must not assume MAX(snapshot_id) is the full schema.
+//
+// PG columns leave the MySQL-only fields empty/NULL: data_type='' and is_nullable=''
+// (both NOT NULL columns, hence empty string not NULL), column_type/column_default
+// NULL, is_generated 0. The PostgreSQL type identity rides the nullable
+// pg_type_oid/pg_type_mod columns for the deferred type-faithful renderer.
+func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
+	if rel == nil || len(rel.Columns) == 0 {
+		return 0, fmt.Errorf("metadata: WritePGSnapshot requires a relation with at least one column")
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("metadata: WritePGSnapshot begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Allocate the next snapshot_id inside the transaction (same scheme as
+	// TakeSnapshot). MySQL and PG snapshots coexist in one table with distinct ids.
+	var nextID int
+	if err = tx.QueryRow("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots").Scan(&nextID); err != nil {
+		return 0, fmt.Errorf("metadata: WritePGSnapshot allocate snapshot_id: %w", err)
+	}
+
+	snapshotTime := time.Now().UTC()
+	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?,?),", len(rel.Columns)), ",")
+	insertSQL := "INSERT INTO schema_snapshots " +
+		"(snapshot_id, snapshot_time, schema_name, table_name, column_name, " +
+		"ordinal_position, column_key, data_type, column_type, is_nullable, column_default, is_generated, " +
+		"pg_type_oid, pg_type_mod) VALUES " + valClause
+
+	args := make([]any, 0, len(rel.Columns)*14)
+	for _, c := range rel.Columns {
+		columnKey := ""
+		if c.IsPK {
+			columnKey = "PRI"
+		}
+		args = append(args,
+			nextID, snapshotTime, rel.Schema, rel.Table, c.Name,
+			c.Ordinal, columnKey, "", nil, "", nil, false,
+			c.TypeOID, c.TypeMod,
+		)
+	}
+	if _, err = tx.Exec(insertSQL, args...); err != nil {
+		return 0, fmt.Errorf("metadata: WritePGSnapshot insert %s.%s: %w", rel.Schema, rel.Table, err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		return 0, fmt.Errorf("metadata: WritePGSnapshot commit: %w", err)
+	}
+	committed = true
+	return nextID, nil
 }
 
 // ─── TakeSnapshot ────────────────────────────────────────────────────────────

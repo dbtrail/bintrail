@@ -322,11 +322,16 @@ func TestCapturer_ResumeMissingSlotFailsLoud(t *testing.T) {
 	}
 }
 
-// TestCapturer_CompositePKOrder proves PKValues uses primary-key declaration order,
-// not column/attnum order. The table's columns are (a, b, c) but its PRIMARY KEY is
-// (b, a) — so a naive attnum ordering would yield "10|20" where the correct key
-// order is "20|10". This is the one correctness-critical path the single-column
-// integration test leaves uncovered (wrong PK order silently corrupts pk_hash).
+// TestCapturer_CompositePKOrder proves PKValues uses TABLE-ORDINAL (column
+// declaration) order, matching the offline resolver's metadata.PKColumnMetas — NOT
+// PostgreSQL's primary-key KEY order. The table's columns are (a, b, c) but its
+// PRIMARY KEY is (b, a); the catalog returns the key in (b, a) order, so the decoder
+// REORDERS it to (a, b) ordinal order (#533). This is the cross-source invariant:
+// pk_values == BuildPKValues(resolver PKColumnMetas, row), which MySQL satisfies by
+// construction and reconstruct/fulltable.go relies on POSITIONALLY — a key-order
+// pk_values would silently corrupt the baseline+delta merge (and diverge pk_hash
+// from a MySQL source) for a composite PK declared out of column order. With
+// a=10, b=20 the ordinal order (a, b) yields "10|20".
 func TestCapturer_CompositePKOrder(t *testing.T) {
 	baseDSN := testutil.SkipIfNoPostgres(t)
 	ctx := context.Background()
@@ -356,6 +361,7 @@ func TestCapturer_CompositePKOrder(t *testing.T) {
 		}
 	}
 	// Columns declared a, b, c (attnums 1, 2, 3); key is (b, a) = attnums (2, 1).
+	// The decoder reorders the catalog's key-order PK to table-ordinal order (a, b).
 	mustExec(fmt.Sprintf("CREATE TABLE %s (a int, b int, c text, PRIMARY KEY (b, a))", tbl))
 	mustExec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", tbl))
 	mustExec(fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl))
@@ -385,8 +391,8 @@ func TestCapturer_CompositePKOrder(t *testing.T) {
 
 	rows, _ := collect(t, events, 1, 10*time.Second)
 	ins := pick(t, rows, event.EventInsert)
-	if ins.PKValues != "20|10" {
-		t.Errorf("composite PKValues = %q, want %q (key order (b, a), not column/attnum order)", ins.PKValues, "20|10")
+	if ins.PKValues != "10|20" {
+		t.Errorf("composite PKValues = %q, want %q (table-ordinal order (a, b), matching the offline resolver — NOT key order (b, a))", ins.PKValues, "10|20")
 	}
 
 	cancel()
