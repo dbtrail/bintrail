@@ -133,10 +133,13 @@ All wrapped in SET FOREIGN_KEY_CHECKS=0/1.
 
 It NEVER executes SQL — review the dry-run/output before applying.
 
-Phase-1 (binlog-window) recovery: a child untouched within --lookback and not in
-a baseline cannot be reconstructed (baseline fallback is tracked in #552).
-The command searches the live index only — archived partitions are not scanned;
-when they exist, the output is flagged incomplete.
+Phase-1 (binlog-window) recovers children with a binlog event within --lookback.
+A child untouched in that window (e.g. an insert-once row from months ago) needs
+Phase-2: point --baseline-dir/--baseline-s3 at a ` + "`bintrail baseline`" + ` snapshot and
+those untouched children are recovered from it too. When the result is provably
+partial — no baseline, a per-parent overflow, or archived partitions the live
+scan cannot see — it is flagged INCOMPLETE and the command exits non-zero unless
+--allow-incomplete.
 
 Examples:
   # Preview recovery for one accidentally-deleted parent and its cascade

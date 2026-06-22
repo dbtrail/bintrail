@@ -27,6 +27,7 @@ before/after images in a searchable index:
 
 - **See every change** — what changed and when, for every row, with before → after diffs
 - **Undo precisely** — generate exact reversal SQL for just the damaged rows
+- **Undo cascade deletes** — reconstruct child rows an `ON DELETE CASCADE` wiped out (and restore FKs an `ON DELETE SET NULL` cleared) that InnoDB removes *below* the binlog and most tools can't see — see [Query & Recovery](docs/query-and-recovery.md)
 - **Time-travel** — query any row (or table) as it was at any moment (requires ProxySQL — see [Time-Travel SQL](docs/time-travel-sql.md))
 - **Web console** — browse, recover, and add servers to monitor, all in the UI
 - **[MCP server](docs/mcp-server.md)** — Claude or any MCP client can search history and draft recoveries

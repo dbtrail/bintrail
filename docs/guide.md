@@ -119,6 +119,8 @@ mysql -u root -p mydb < recovery.sql
 
 **Verify** — query the index again or run a `SELECT` against the source to confirm the rows are back.
 
+> **Was the deleted row a parent in a foreign-key relationship?** An `ON DELETE CASCADE` may have taken child rows with it that InnoDB removed *below* the binlog — the query above won't show them, and plain `recover` can't bring them back. See **Scenario M** to reconstruct the whole subtree.
+
 ---
 
 ### Scenario B: A bad UPDATE went out — need to roll back column values
@@ -414,6 +416,58 @@ Redirect stderr only (stdout still shows query output):
 ```sh
 bintrail --log-level debug query --index-dsn "..." --schema mydb --table orders 2>debug.log
 ```
+
+---
+
+### Scenario M: An ON DELETE CASCADE also wiped out child rows
+
+**Situation:** Someone deleted a parent row — say `customers.id = 42` — and a foreign key with `ON DELETE CASCADE` took its orders, line items, and everything below them down with it. On MySQL 8.x and earlier (and MariaDB), InnoDB runs the cascade *inside the storage engine, below the binary log*, so only the parent `DELETE` was ever written. Plain `recover` has nothing to reverse for the children, and a normal query won't even show them as deleted — they vanished without a trace in the log.
+
+`bintrail recover-cascade` solves exactly this: it finds the deleted parent, infers which child rows pointed at it in their last indexed state, and reconstructs the whole subtree.
+
+**Preview the fix** — point it at the **parent** table and the deleted parent's PK:
+
+```sh
+bintrail recover-cascade \
+  --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --schema    shop \
+  --table     customers \
+  --pk        '42' \
+  --dry-run
+```
+
+The output re-INSERTs the parent and every cascade-deleted descendant — recursing through multi-level cascades (orders → line_items → …) — wrapped in `SET FOREIGN_KEY_CHECKS=0/1`. For an `ON DELETE SET NULL` foreign key the child row survived and only its FK was cleared, so you get an idempotent `UPDATE ... SET fk = <parent> WHERE pk = ... AND fk IS NULL` instead — safe to re-run, and it never clobbers a child you have since re-pointed.
+
+Process several deleted parents at once with `--pks '42,43,44'`, or a whole window with `--since`/`--until`.
+
+**Mind the coverage line.** recover-cascade rebuilds a child from its **last indexed state**, so it can only see children that have a binlog event within `--lookback` (default `30d`). An insert-once child that has not changed in months falls outside that window — it cannot be reconstructed from the binlog alone, and the command says so instead of silently dropping it:
+
+```
+-- !!! INCOMPLETE RECOVERY — the result is provably partial:
+--   - no baseline covers shop.line_items; children untouched within the lookback window are not reconstructed
+```
+
+When the output is flagged `INCOMPLETE RECOVERY` the command **exits non-zero**, so a script can't apply a half-recovery as if it were whole. To reach those untouched children, point it at a [baseline snapshot](dump-and-baseline.md) — they are recovered from the snapshot and the binlog window is widened back to the snapshot time:
+
+```sh
+bintrail recover-cascade \
+  --index-dsn    "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+  --schema shop --table customers --pk '42' \
+  --baseline-dir ./baseline \
+  --output       cascade-recovery.sql
+```
+
+**Review and apply** — read the SQL first, always. If you have already re-created the parent by hand, delete its `INSERT` from the file (`FOREIGN_KEY_CHECKS=0` does **not** suppress primary-key violations):
+
+```sh
+cat cascade-recovery.sql
+
+mysql -u root -p shop < cascade-recovery.sql
+```
+
+**Verify** — `SELECT` the parent and a child table to confirm the subtree is back.
+
+See [Query & Recovery](query-and-recovery.md) for the full flag reference and the exact best-effort boundaries.
 
 ---
 
