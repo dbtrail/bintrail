@@ -94,6 +94,14 @@ type Options struct {
 	// and the binlog scan window is widened to the snapshot time. nil = Phase-1
 	// only (binlog-history within Lookback).
 	Baseline BaselineProvider
+	// ArchivesPresent reports that the index has archived (rotated-out) binlog
+	// partitions. Phase-2's "untouched ⟹ baseline verbatim" rule assumes the
+	// live binlog is contiguous over [snapshot, T]; an archived partition in that
+	// window breaks it (a child re-parented/deleted in the gap would be absent
+	// from the live scan and wrongly resurrected from its stale baseline row).
+	// When true, baseline augmentation is skipped + flagged, exactly like a
+	// truncated binlog scan.
+	ArchivesPresent bool
 }
 
 func (o Options) withDefaults() Options {
@@ -370,6 +378,15 @@ func SynthesizeVictims(
 					case binlogTrunc:
 						addIncomplete("baseline-skip:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
 							"binlog scan truncated for %s.%s; skipped baseline augmentation to avoid resurrecting stale rows",
+							fk.Schema, fk.Table))
+					case opts.ArchivesPresent:
+						// The widened [snapshot, T] window may include archived partitions the
+						// live scan cannot see, so `touched` may be incomplete — a child
+						// re-parented/deleted in an archived gap would be wrongly resurrected
+						// from its stale baseline row. Skip, like the truncated-binlog case.
+						addIncomplete("baseline-skip-archived:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+							"index has archived partitions that may gap the [snapshot, T] window for %s.%s; "+
+								"skipped baseline augmentation to avoid resurrecting rows whose deletion/re-parent was archived",
 							fk.Schema, fk.Table))
 					default:
 						if baseTrunc {

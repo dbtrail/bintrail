@@ -224,12 +224,15 @@ bintrail recover-cascade --index-dsn "..." \
   window are visible. Point at a `bintrail baseline` snapshot and those untouched
   children are recovered from it too, and the binlog window is widened to the
   snapshot time. Tables not covered by the baseline are flagged incomplete.
-- **Still best-effort:** archived binlog partitions are not searched, and a table
-  with no baseline keeps the Phase-1 window limit. When the result is provably
-  partial the output is flagged `INCOMPLETE RECOVERY` and the command exits
-  non-zero unless `--allow-incomplete` is given. If you have already re-created a
-  deleted parent, remove its `INSERT` from the output — `FOREIGN_KEY_CHECKS=0`
-  does not suppress primary-key violations.
+- **Still best-effort:** baseline augmentation is skipped (and flagged) for a
+  table when the index has archived partitions (which the live scan can't see, so
+  a child re-parented or deleted in the gap can't be told apart from an untouched
+  one) or when one parent has more cascade victims than the per-parent cap. A
+  table with no baseline keeps the Phase-1 window limit. When the result is
+  provably partial the output is flagged `INCOMPLETE RECOVERY` and the command
+  exits non-zero unless `--allow-incomplete` is given. If you have already
+  re-created a deleted parent, remove its `INSERT` from the output —
+  `FOREIGN_KEY_CHECKS=0` does not suppress primary-key violations.
 
 ### WHERE Clause Strategy
 

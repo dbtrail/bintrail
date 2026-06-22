@@ -224,8 +224,14 @@ func writeChildBaseline(t *testing.T, parquetPath string) {
 	}
 	defer d.Close()
 	// child 10,11 reference parent 1 (cascade victims); 12 references parent 2.
+	// created_at is a TIMESTAMP so the test also verifies a DuckDB time.Time
+	// non-PK value renders as a MySQL DATETIME literal in the recovery SQL.
 	q := fmt.Sprintf(
-		`COPY (SELECT * FROM (VALUES (10,1,'keep10'),(11,1,'keep11'),(12,2,'other')) AS t(id,pid,payload)) TO '%s' (FORMAT PARQUET)`,
+		`COPY (SELECT * FROM (VALUES `+
+			`(10,1,'keep10',TIMESTAMP '2026-05-01 12:00:00'),`+
+			`(11,1,'keep11',TIMESTAMP '2026-05-02 13:00:00'),`+
+			`(12,2,'other',TIMESTAMP '2026-05-03 14:00:00')`+
+			`) AS t(id,pid,payload,created_at)) TO '%s' (FORMAT PARQUET)`,
 		strings.ReplaceAll(parquetPath, "'", "''"))
 	if _, err := d.Exec(q); err != nil {
 		t.Fatalf("write baseline parquet: %v", err)
@@ -250,6 +256,7 @@ func TestRecoverCascade_phase2BaselineRecoversUntouchedChild(t *testing.T) {
 	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "id", 1, "PRI", "int", "NO")
 	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "pid", 2, "", "int", "YES")
 	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "payload", 3, "", "varchar", "YES")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "created_at", 4, "", "datetime", "YES")
 
 	testutil.MustExec(t, db, `INSERT INTO fk_constraints
 		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
@@ -287,6 +294,7 @@ func TestRecoverCascade_phase2BaselineRecoversUntouchedChild(t *testing.T) {
 	sql := string(b)
 	for _, want := range []string{
 		"keep10", "keep11", // children recovered from the baseline
+		"'2026-05-01 12:00:00", // DuckDB time.Time non-PK value → MySQL DATETIME literal
 		"Phase-2 baseline fallback ACTIVE",
 		"`" + dbName + "`.`parent`", // parent restored
 	} {
@@ -299,5 +307,85 @@ func TestRecoverCascade_phase2BaselineRecoversUntouchedChild(t *testing.T) {
 	}
 	if strings.Contains(sql, "INCOMPLETE RECOVERY") {
 		t.Errorf("a baseline-covered cascade must be complete\n---\n%s", sql)
+	}
+}
+
+// writeCompositeChildBaseline writes a `child` snapshot with a composite PK (a,b).
+func writeCompositeChildBaseline(t *testing.T, parquetPath string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(parquetPath), 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	d, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer d.Close()
+	q := fmt.Sprintf(
+		`COPY (SELECT * FROM (VALUES (1,2,1,'c12')) AS t(a,b,pid,payload)) TO '%s' (FORMAT PARQUET)`,
+		strings.ReplaceAll(parquetPath, "'", "''"))
+	if _, err := d.Exec(q); err != nil {
+		t.Fatalf("write composite baseline parquet: %v", err)
+	}
+}
+
+// TestRecoverCascade_phase2DedupCompositePK pins the load-bearing dedup contract:
+// a child present in BOTH the binlog (touched, still referencing the parent) AND
+// the baseline must be emitted EXACTLY ONCE. If the provider's composite-PK
+// encoding (CanonicalizePKMap + BuildPKValues) diverged by one byte from the
+// indexer's pk_values, the dedup would miss and the recovery SQL would
+// double-INSERT the PK (which FOREIGN_KEY_CHECKS=0 does not suppress).
+func TestRecoverCascade_phase2DedupCompositePK(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	snapTs := "2026-06-01 00:00:00"
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "parent", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "a", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "b", 2, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "pid", 3, "", "int", "YES")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "payload", 4, "", "varchar", "YES")
+
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
+		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
+		VALUES (1, 'fk', ?, 'child', 'pid', 1, ?, 'parent', 'id', 'CASCADE', 'RESTRICT')`, dbName, dbName)
+
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	childTs := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	parentTs := h.Add(20 * time.Minute).Format("2006-01-02 15:04:05")
+	// child (a=1,b=2) is TOUCHED in the binlog (still referencing parent 1)...
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, childTs, nil, dbName, "child", 1 /*INSERT*/, "1|2", nil, nil, []byte(`{"a":1,"b":2,"pid":1,"payload":"c12"}`))
+	testutil.InsertEvent(t, db, "b.000001", 20, 30, parentTs, nil, dbName, "parent", 3 /*DELETE*/, "1", nil, []byte(`{"id":1}`), nil)
+
+	// ...and ALSO present in the baseline (same composite PK).
+	baselineDir := t.TempDir()
+	snapDir := filepath.Join(baselineDir, "2026-06-01T00-00-00Z")
+	writeCompositeChildBaseline(t, filepath.Join(snapDir, dbName, "child.parquet"))
+	if err := baseline.WriteSuccessMarker(snapDir); err != nil {
+		t.Fatalf("success marker: %v", err)
+	}
+
+	out := filepath.Join(t.TempDir(), "cascade.sql")
+	cleanCascadeFlags(testutil.IntegrationDSN(dbName), dbName, out)
+	rcPK = "1"
+	rcBaselineDir = baselineDir
+	defer func() { rcBaselineDir = "" }()
+
+	if err := runCascadeCmd(t); err != nil {
+		t.Fatalf("runRecoverCascade: %v", err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	sql := string(b)
+	if c := strings.Count(sql, "`"+dbName+"`.`child`"); c != 1 {
+		t.Errorf("composite child present in binlog AND baseline must dedup to ONE INSERT, got %d\n---\n%s", c, sql)
 	}
 }

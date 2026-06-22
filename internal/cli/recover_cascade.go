@@ -42,6 +42,22 @@ func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, 
 		}
 		return cascade.BaselineLookup{}, false, err
 	}
+
+	tm, err := p.resolver.Resolve(schema, table)
+	if err != nil {
+		return cascade.BaselineLookup{}, false, fmt.Errorf("resolve %s.%s for baseline: %w", schema, table, err)
+	}
+	// The FK filter binds parentPK as a STRING against the baseline column.
+	// DuckDB coerces it exactly for integer/string FK columns, but for
+	// DATETIME/DECIMAL/DATE the string form may not match the stored value and
+	// would silently zero-match. Refuse those (flagged as a coverage gap) rather
+	// than under-recover silently.
+	if !fkFilterSafe(columnDataType(tm, fkCol)) {
+		return cascade.BaselineLookup{}, false, fmt.Errorf(
+			"baseline scan of %s.%s by FK column %q (type %q) is unsupported (string match may not coerce); baseline augmentation skipped",
+			schema, table, fkCol, columnDataType(tm, fkCol))
+	}
+
 	// Fetch one more than the cap so truncation is observable.
 	fetch := 0
 	if limit > 0 {
@@ -57,12 +73,7 @@ func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, 
 		rows = rows[:limit]
 	}
 
-	tm, err := p.resolver.Resolve(schema, table)
-	if err != nil {
-		return cascade.BaselineLookup{}, false, fmt.Errorf("resolve %s.%s PK for baseline: %w", schema, table, err)
-	}
 	pkCols := tm.PKColumnMetas()
-
 	out := make([]cascade.BaselineRow, 0, len(rows))
 	for _, r := range rows {
 		// Canonicalize PK values the same way the indexer encoded pk_values, so
@@ -77,6 +88,29 @@ func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, 
 		})
 	}
 	return cascade.BaselineLookup{SnapshotTime: snap, Rows: out, Truncated: trunc}, true, nil
+}
+
+func columnDataType(tm *metadata.TableMeta, name string) string {
+	for _, c := range tm.Columns {
+		if c.Name == name {
+			return c.DataType
+		}
+	}
+	return ""
+}
+
+// fkFilterSafe reports whether a string-bound equality filter on a column of
+// this DATA_TYPE coerces exactly in DuckDB (integer + string families). Types
+// where the string form may diverge from the stored value (datetime, decimal,
+// date, …) are excluded so the baseline FK scan never silently zero-matches.
+func fkFilterSafe(dataType string) bool {
+	switch strings.ToLower(strings.TrimSpace(dataType)) {
+	case "int", "integer", "smallint", "tinyint", "mediumint", "bigint",
+		"char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum", "set":
+		return true
+	default:
+		return false
+	}
 }
 
 var recoverCascadeCmd = &cobra.Command{
@@ -148,7 +182,7 @@ func init() {
 	f.IntVar(&rcMaxDepth, "max-depth", 5, "Maximum cascade recursion depth (parent -> child -> grandchild ...)")
 	f.IntVar(&rcLimit, "limit", 1000, "Maximum number of parent DELETE events to process")
 	f.BoolVar(&rcAllowIncomplete, "allow-incomplete", false, "Exit 0 even when the reconstruction is provably partial (coverage gaps only; an operational failure still exits non-zero)")
-	f.StringVar(&rcBaselineDir, "baseline-dir", "", "Local baseline-snapshot directory for Phase-2 fallback (recovers children untouched within the lookback window)")
+	f.StringVar(&rcBaselineDir, "baseline-dir", "", "Local baseline-snapshot directory for Phase-2 fallback (also recovers children present in the snapshot but untouched since it)")
 	f.StringVar(&rcBaselineS3, "baseline-s3", "", "S3 baseline-snapshot prefix (s3://bucket/prefix) for Phase-2 fallback; alternative to --baseline-dir")
 	_ = recoverCascadeCmd.MarkFlagRequired("index-dsn")
 	_ = recoverCascadeCmd.MarkFlagRequired("schema")
@@ -249,9 +283,11 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	//     archived could still be missed → a visible warning, NOT a hard caveat:
 	//     otherwise every archived deployment trips INCOMPLETE on every run and
 	//     --allow-incomplete becomes routine, masking the real coverage gaps.
+	archivesExist := false
 	if archives, aerr := query.ResolveArchiveSources(cmd.Context(), db); aerr != nil {
 		caveats = append(caveats, "could not determine whether archived partitions exist (probe failed: "+aerr.Error()+"); coverage is unknown")
 	} else if len(archives) > 0 {
+		archivesExist = true
 		if len(parentDeletes) == 0 {
 			caveats = append(caveats, "no parent DELETE matched in the live index, but the index has archived partitions (cascade recovery does NOT search them); the deleted parent may be archived")
 		} else {
@@ -288,9 +324,10 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("load FK graph: %w", lerr)
 		}
 		res, synthErr = cascade.SynthesizeVictims(cmd.Context(), eng, fks, parentDeletes, cascade.Options{
-			Lookback: lookback,
-			MaxDepth: rcMaxDepth,
-			Baseline: baselineProvider,
+			Lookback:        lookback,
+			MaxDepth:        rcMaxDepth,
+			Baseline:        baselineProvider,
+			ArchivesPresent: archivesExist,
 		})
 	}
 	caveats = append(caveats, res.Incomplete...)

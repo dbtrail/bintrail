@@ -209,3 +209,54 @@ func TestPhase2_noBaselineCoverageFlagged(t *testing.T) {
 		t.Errorf("baseline lookup error must flag incompleteness; Incomplete=%v", res2.Incomplete)
 	}
 }
+
+// TestPhase2_archivesSkipBaseline pins the archive-gap guard (the #569 critical):
+// when the index has archived partitions, the live [snapshot,T] scan may be
+// gapped, so baseline augmentation is SKIPPED (a child re-parented/deleted in an
+// archived partition must not be resurrected from its stale baseline row).
+func TestPhase2_archivesSkipBaseline(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+	T := time.Now().UTC()
+
+	fb := &fakeBaseline{ok: true, snap: T.Add(-2 * time.Hour),
+		rows: []cascade.BaselineRow{{PKValues: "10", Row: map[string]any{"id": int64(10), "pid": int64(1)}}}}
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, cascadeFK(dbName), parentDelete(dbName, T),
+		cascade.Options{Baseline: fb, ArchivesPresent: true})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if len(res.Victims) != 0 {
+		t.Errorf("baseline augmentation must be skipped when archives present; got %v", res.Victims)
+	}
+	if res.Complete() || !strings.Contains(strings.Join(res.Incomplete, " "), "archived") {
+		t.Errorf("archive-gap skip must flag incompleteness; Incomplete=%v", res.Incomplete)
+	}
+}
+
+// TestPhase2_baselineTruncationFlagged pins the baseTrunc branch: the baseline
+// scan hit its cap (binlog NOT truncated) → the capped rows are still emitted but
+// the run is flagged incomplete.
+func TestPhase2_baselineTruncationFlagged(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+	T := time.Now().UTC()
+
+	fb := &fakeBaseline{ok: true, trunc: true, snap: T.Add(-2 * time.Hour),
+		rows: []cascade.BaselineRow{{PKValues: "10", Row: map[string]any{"id": int64(10), "pid": int64(1)}}}}
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, cascadeFK(dbName), parentDelete(dbName, T),
+		cascade.Options{Baseline: fb})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if k := victimKeys(res.Victims); len(res.Victims) != 1 || !k["child:10"] {
+		t.Errorf("capped baseline rows must still be emitted, got %v", res.Victims)
+	}
+	if res.Complete() || !strings.Contains(strings.Join(res.Incomplete, " "), "baseline children") {
+		t.Errorf("baseline truncation must be flagged; Incomplete=%v", res.Incomplete)
+	}
+}
