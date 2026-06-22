@@ -309,6 +309,7 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("GET /api/schemas", s.handleSchemas)
 	api.HandleFunc("GET /api/events", s.handleEvents)
 	api.HandleFunc("POST /api/recover", s.handleRecover)
+	api.HandleFunc("POST /api/recover-cascade", s.handleRecoverCascade)
 	api.HandleFunc("GET /api/capabilities", s.handleCapabilities)
 	api.HandleFunc("GET /api/reconstruct", s.handleReconstruct)
 	// Storage surfaces (read-only): the selected server's baseline snapshot

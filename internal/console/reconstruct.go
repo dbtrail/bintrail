@@ -27,8 +27,20 @@ type capabilitiesResponse struct {
 	// Monitor: this process can start/stop monitoring (a control-plane
 	// supervisor — `bintrail-console watch`). Process-global, not per-server:
 	// it is about what the PROCESS is, not about the selected connection.
-	Monitor bool         `json:"monitor"`
-	Auth    authCapsInfo `json:"auth"`
+	Monitor bool `json:"monitor"`
+	// RecoverCascade: the recover-cascade surface is available. Free tier (like
+	// recover), so available unless an RBAC redaction profile is active — under a
+	// profile cascade victim synthesis cannot honor redaction, so the endpoint
+	// refuses (see handleRecoverCascade). Process-global, like Monitor.
+	RecoverCascade bool `json:"recover_cascade"`
+	// RecoverCascadeBaseline: cascade recovery's Phase-2 (recover children
+	// untouched within the window) is active for this server. Per-server, and gated
+	// EXACTLY like the handler builds its provider — a baseline source AND a schema
+	// snapshot (resolver). baselineConfigured can be true with resolver==nil (a
+	// baseline dir set but `bintrail snapshot` never run), where the handler
+	// degrades to Phase-1; advertising true there would over-promise.
+	RecoverCascadeBaseline bool         `json:"recover_cascade_baseline"`
+	Auth                   authCapsInfo `json:"auth"`
 }
 
 // authCapsInfo tells the authenticated SPA how it got in and whether a
@@ -58,10 +70,17 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := capabilitiesResponse{
 		Monitor: s.monitorCtrl != nil,
-		Auth:    authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
+		// recover-cascade is the free tier (like recover) and process-global, gated
+		// only by the RBAC profile (which would make synthesis leak redacted data).
+		RecoverCascade: !s.rbacActive(),
+		Auth:           authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
 	}
 	if b, err := s.resolve(r); err == nil {
 		resp.Reconstruct = b.baselineConfigured
+		// Match the recover-cascade handler's Phase-2 gate exactly so the advertised
+		// capability can't over-promise (handler builds the provider only when both
+		// a baseline source and a resolver are present).
+		resp.RecoverCascadeBaseline = b.baselineConfigured && b.resolver != nil
 	} else if !errors.Is(err, ErrUnknownServer) && !errors.Is(err, errNoServers) {
 		// Expected for a bad X-Bintrail-Server header or a fresh install;
 		// anything else (e.g. a genuine connection failure) would silently
