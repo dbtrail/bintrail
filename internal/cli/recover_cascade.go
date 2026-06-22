@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/cascade"
+	"github.com/dbtrail/dbtrail/internal/cascaderecover"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/event"
@@ -246,8 +247,8 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 
 	// Resolver enables PK-only WHERE clauses. Best-effort for the CASCADE path
 	// (INSERTs fall back to full row images), but REQUIRED for SET NULL restores
-	// (their WHERE needs the child PK columns) — emitCascadeSQL errors loudly,
-	// before writing anything, if SET NULL rows exist with a nil resolver.
+	// (their WHERE needs the child PK columns) — cascaderecover.EmitSQL errors
+	// loudly, before writing anything, if SET NULL rows exist with a nil resolver.
 	resolver, err := metadata.NewResolver(db, 0)
 	if err != nil {
 		slog.Warn("could not load schema snapshot; recovery INSERTs still use full row images", "error", err)
@@ -347,19 +348,18 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	rows := append(append([]query.ResultRow{}, parentDeletes...), res.Victims...)
 
 	// ── Emit ──────────────────────────────────────────────────────────────────
-	hdr := cascadeHeader{
-		schema:         rcSchema,
-		table:          rcTable,
-		parents:        len(parentDeletes),
-		children:       len(res.Victims),
-		setnulls:       len(res.SetNullRows),
-		caveats:        caveats,
-		baselineActive: baselineProvider != nil,
+	hdr := cascaderecover.Header{
+		Schema:         rcSchema,
+		Table:          rcTable,
+		Parents:        len(parentDeletes),
+		Children:       len(res.Victims),
+		Caveats:        caveats,
+		BaselineActive: baselineProvider != nil,
 	}
 
 	if rcFormat == "json" {
 		var buf bytes.Buffer
-		n, gerr := emitCascadeSQL(&buf, recovery.New(db, resolver), rows, res.SetNullRows, resolver, hdr)
+		n, gerr := cascaderecover.EmitSQL(&buf, recovery.New(db, resolver), rows, res.SetNullRows, resolver, hdr)
 		if gerr != nil {
 			return gerr
 		}
@@ -416,7 +416,7 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 			return f.Close()
 		}
 	}
-	n, gerr := emitCascadeSQL(w, recovery.New(db, resolver), rows, res.SetNullRows, resolver, hdr)
+	n, gerr := cascaderecover.EmitSQL(w, recovery.New(db, resolver), rows, res.SetNullRows, resolver, hdr)
 	if gerr != nil {
 		if closeFn != nil {
 			_ = closeFn() // best-effort: gerr is the real failure, don't mask it (and don't leak the fd)
@@ -457,96 +457,4 @@ func cascadeExit(dest string, synthErr error, caveats []string, allowIncomplete 
 		return fmt.Errorf("SQL written to %s but the recovery is INCOMPLETE (%d caveat(s) above); review, then re-run with --allow-incomplete to exit 0", dest, len(caveats))
 	}
 	return nil
-}
-
-// cascadeHeader carries the values rendered into the SQL preamble.
-type cascadeHeader struct {
-	schema, table     string
-	parents, children int
-	setnulls          int
-	caveats           []string
-	baselineActive    bool
-}
-
-// emitCascadeSQL writes the documented preamble, the FK-checks-off wrapper, the
-// CASCADE reversal statements (DELETE→INSERT via the generator), and the SET
-// NULL FK restorations (idempotent guarded UPDATEs). Returns the total statement
-// count. resolver supplies child PK columns for the SET NULL WHERE clauses.
-func emitCascadeSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNullRows []cascade.SetNullRestore, resolver *metadata.Resolver, hdr cascadeHeader) (int, error) {
-	// Build every SET NULL restoration BEFORE writing a byte (all-or-nothing): a
-	// missing resolver, an unresolvable table, or an absent PK column must abort
-	// the whole emit cleanly — returning mid-script would leave the parent/child
-	// INSERTs written but drop the closing `SET FOREIGN_KEY_CHECKS=1`, handing the
-	// operator a script that re-enables nothing.
-	var setNullStmts []string
-	if len(setNullRows) > 0 {
-		if resolver == nil {
-			return 0, fmt.Errorf("a schema snapshot is required to restore SET NULL foreign keys (run `bintrail snapshot`)")
-		}
-		for _, sr := range setNullRows {
-			tm, terr := resolver.Resolve(sr.Schema, sr.Table)
-			if terr != nil {
-				return 0, fmt.Errorf("resolve %s.%s for SET NULL restore: %w", sr.Schema, sr.Table, terr)
-			}
-			stmt, ferr := recovery.FormatSetNullRestore(sr.Schema, sr.Table, sr.Column, sr.Value, tm.PKColumnMetas(), sr.Row)
-			if ferr != nil {
-				return 0, ferr
-			}
-			setNullStmts = append(setNullStmts, stmt)
-		}
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on %s.%s\n", hdr.schema, hdr.table)
-	fmt.Fprintf(&b, "-- Re-inserts %d deleted parent row(s) and %d cascade-deleted child row(s); restores %d SET NULL'd FK(s)\n", hdr.parents, hdr.children, hdr.setnulls)
-	b.WriteString("-- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.\n")
-	b.WriteString("--\n")
-	if hdr.baselineActive {
-		b.WriteString("-- Phase-2 baseline fallback ACTIVE: children present in a covered baseline are\n")
-		b.WriteString("-- reconstructed even if untouched within the window. Tables NOT covered by a\n")
-		b.WriteString("-- baseline are flagged above. \"Complete\" means everything DETECTABLE was recovered.\n")
-	} else {
-		b.WriteString("-- Phase-1 (binlog-window) recovery: a child untouched within --lookback and not\n")
-		b.WriteString("-- in a baseline is NOT reconstructed — pass --baseline-dir/--baseline-s3 to enable\n")
-		b.WriteString("-- Phase-2 fallback. \"Complete\" means everything DETECTABLE was recovered.\n")
-	}
-	b.WriteString("--\n")
-	b.WriteString("-- If you have already re-created a deleted parent, delete its INSERT below:\n")
-	b.WriteString("-- SET FOREIGN_KEY_CHECKS=0 does NOT suppress PRIMARY KEY violations.\n")
-	if len(hdr.caveats) > 0 {
-		b.WriteString("--\n-- !!! INCOMPLETE RECOVERY — the result is provably partial:\n")
-		for _, c := range hdr.caveats {
-			fmt.Fprintf(&b, "--   - %s\n", c)
-		}
-	}
-	b.WriteString("\nSET FOREIGN_KEY_CHECKS=0;\n\n")
-	if _, err := io.WriteString(w, b.String()); err != nil {
-		return 0, err
-	}
-
-	n, err := gen.GenerateSQLFromRows(rows, w)
-	if err != nil {
-		return 0, err
-	}
-
-	// SET NULL restorations: idempotent UPDATEs (… AND fk IS NULL) that only
-	// touch rows still in the post-cascade nulled state, so a re-run or a later
-	// re-point of the child is never clobbered. Pre-built above, so nothing here
-	// can fail after the INSERTs are already on disk.
-	if len(setNullStmts) > 0 {
-		if _, err := io.WriteString(w, "\n-- SET NULL FK restorations (idempotent: only rows whose FK is still NULL):\n"); err != nil {
-			return n, err
-		}
-		for _, stmt := range setNullStmts {
-			if _, werr := io.WriteString(w, stmt+";\n"); werr != nil {
-				return n, werr
-			}
-			n++
-		}
-	}
-
-	if _, err := io.WriteString(w, "\nSET FOREIGN_KEY_CHECKS=1;\n"); err != nil {
-		return n, err
-	}
-	return n, nil
 }
