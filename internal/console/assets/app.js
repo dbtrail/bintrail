@@ -738,6 +738,17 @@ function renderEvents(params) {
   const v = VIEW(); clear(v);
   v.append(pageHead("Events", el("p", { class: "page-sub", text: "Browse indexed row events with full before / after images." })));
 
+  // Forensics-degraded note (#595): PostgreSQL logical replication (pgoutput)
+  // carries no backend connection id, so actor attribution ("who changed this")
+  // is unavailable for PG sources. The free events surface never shows
+  // connection_id anyway (it is paid-forensics, dropped from eventDTO), but for
+  // PG it cannot be recovered upstream at all — say so rather than leave it an
+  // unexplained gap. capsCache.source is resolved before this paints.
+  if (capsCache.source === "postgresql") {
+    v.append(el("div", { class: "warn-item" }, icon("warn"),
+      el("span", { text: "Actor attribution (who-changed) is unavailable for PostgreSQL sources — the logical replication stream carries no backend connection id." })));
+  }
+
   const form = el("form", { id: "ev-form" });
   // search bar
   const searchwrap = el("div", { class: "ev-searchwrap" });
@@ -1387,6 +1398,13 @@ async function renderStatus() {
   const cov = data.coverage || {};
   const stream = data.stream || null;
   const arch = data.archives || null;
+  // Source-aware presentation: a PostgreSQL stream's cursor is an LSN, written
+  // across binlog_file (the "X/Y" string form, the one shown here) and
+  // binlog_position (the same value as a uint64, for resume); mode='gtid' is an
+  // internal detail. MySQL vocabulary would mislabel all of it. capsCache.source
+  // is resolved before this paints (bootSequence/switchServer await
+  // gateCapabilities → renderRoute).
+  const pg = capsCache.source === "postgresql";
 
   cards.append(statusCard("Summary", [
     ["total events (est.)", data.total_events_estimate, true],
@@ -1399,7 +1417,11 @@ async function renderStatus() {
     ["total events", cov.total_events],
     ["schema changes", cov.schema_changes],
   ]));
-  if (stream) cards.append(statusCard("Stream", [
+  if (stream) cards.append(statusCard(pg ? "Stream · PostgreSQL" : "Stream", pg ? [
+    ["source", "PostgreSQL · logical replication"],
+    ["LSN", stream.binlog_file],
+    ["events indexed", stream.events_indexed],
+  ] : [
     ["mode", stream.mode],
     ["binlog file", stream.binlog_file],
     ["position", stream.binlog_position],
@@ -1410,6 +1432,19 @@ async function renderStatus() {
     ["rows", arch.total_rows],
     ["size", arch.total_size_human],
   ]));
+  // Durable permanent-loss record (status JSON stream.gap_lost): an unfillable
+  // binlog gap (MySQL) or an invalidated/lost replication slot (PostgreSQL, #532).
+  // The index is valid only up to this point; capture must be re-baselined to
+  // resume. Surfaced loudly above the cards — flavor-agnostic, PG-worded note.
+  if (stream && stream.gap_lost) {
+    const lost = el("div", { class: "error-box" });
+    lost.append(el("b", { text: "⚠ Events permanently lost" }));
+    lost.append(el("div", { text: stream.gap_lost.detail ||
+      (pg ? "the replication slot was invalidated; capture must be re-baselined to resume"
+          : "an unfillable binlog gap was detected; capture must be re-baselined to resume") }));
+    lost.append(el("div", { text: "Detected: " + stream.gap_lost.at }));
+    v.append(lost);
+  }
   v.append(cards);
   viewEnter();
 }
@@ -1435,8 +1470,10 @@ function updateSideMeta(status) {
     clear(streamEl);
     streamEl.append("stream ");
     if (status.stream) {
-      streamEl.append(el("b", { text: status.stream.mode }));
-      if (status.stream.binlog_file) streamEl.append(" · " + status.stream.binlog_file);
+      // PG stores its LSN cursor in binlog_file; "gtid" mode is an internal detail.
+      const pg = capsCache.source === "postgresql";
+      streamEl.append(el("b", { text: pg ? "PostgreSQL" : status.stream.mode }));
+      if (status.stream.binlog_file) streamEl.append((pg ? " · LSN " : " · ") + status.stream.binlog_file);
     } else {
       streamEl.append(el("b", { text: "—" }));
     }

@@ -438,6 +438,33 @@ the paid **forensics** surface (who-changed / attribution): the events API drops
 every response. There is no gating, RBAC, or license code in the binary; the
 boundary is simply what the API chooses to serve.
 
+## PostgreSQL sources
+
+The console reads only the **index**, never the source database, so it works
+identically for a PostgreSQL source captured by `bintrail-pg`: the index schema
+is the same. It does adapt its **presentation** to the source family (reported
+per server as `source` in [`/api/capabilities`](#api), derived from
+`stream_state.flavor`):
+
+- **Stream vocabulary.** A PostgreSQL stream shows its cursor as an **LSN** (and
+  labels the source "PostgreSQL · logical replication") instead of MySQL binlog
+  file / position / GTID. Slot and publication *names* are capture-side
+  configuration and are not stored in the index, so the console does not show
+  them.
+- **Permanent-loss badge.** The Status page surfaces the durable loss record
+  (`stream_state.gap_lost_at`) — for PostgreSQL, an invalidated/lost replication
+  slot; for MySQL, an unfillable binlog gap. The index is valid only up to that
+  point and capture must be re-baselined to resume.
+- **Forensics note.** PostgreSQL logical replication (`pgoutput`) carries no
+  backend connection id, so actor attribution (who-changed) is unavailable
+  *upstream* — not merely dropped by the open-core boundary above. The Events
+  page says so for PostgreSQL sources rather than leaving it an unexplained gap.
+
+Live source-side signals — replication-slot lag, `wal_status`,
+`max_slot_wal_keep_size`, `REPLICA IDENTITY FULL` validation — are **not** shown
+here: they require querying the source PostgreSQL, which the index-only console
+never does. Use `bintrail-pg doctor` for those.
+
 ## API
 
 All endpoints return JSON. `/api/*` (except `healthz`) require
@@ -456,7 +483,7 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `GET /api/events` | Event browser. Query params: `schema, table, pk, event_type, gtid, since, until, changed_column, order, limit`. |
 | `POST /api/recover` | Undo-SQL generation. JSON body with the same filter fields (requires at least `schema`; an `order` field is accepted but ignored — recover always processes oldest-first). Returns `{sql, statement_count, row_count, warnings}`. |
 | `POST /api/recover-cascade` | Cascade-recovery SQL generation (reverse FK `ON DELETE CASCADE` / `SET NULL` side effects). JSON body: `schema, table` (the **parent**), `pk, pks, since, until, lookback, max_depth, allow_incomplete`. Returns `{sql, statement_count, victim_count, set_null_count, complete, incomplete}` — text only, never executed. Returns `403` under an active RBAC redaction profile (see [Cascade recovery](#cascade-recovery)). |
-| `GET /api/capabilities` | Reports enabled optional surfaces for the **selected server**, e.g. `{"reconstruct": true, "recover_cascade": true, "recover_cascade_baseline": false, "auth": {"password_set": true, "auth_kind": "session"}}`. The frontend uses it to show/hide gated tabs on every switch (`reconstruct` → Time-travel, `recover_cascade` → Cascade recovery) and to gate the logout affordance (`auth_kind` says how this request authenticated). |
+| `GET /api/capabilities` | Reports enabled optional surfaces for the **selected server**, e.g. `{"reconstruct": true, "recover_cascade": true, "recover_cascade_baseline": false, "source": "mysql", "auth": {"password_set": true, "auth_kind": "session"}}`. The frontend uses it to show/hide gated tabs on every switch (`reconstruct` → Time-travel, `recover_cascade` → Cascade recovery) and to gate the logout affordance (`auth_kind` says how this request authenticated). `source` (`"mysql"` or `"postgresql"`, read from the index's `stream_state.flavor`) drives **source-aware presentation** only — never a gate; see [PostgreSQL sources](#postgresql-sources). |
 | `GET /api/reconstruct` | Single-row point-in-time reconstruct (baseline-gated **per server**; 404 when not configured). Query params: `schema, table, pk, at, history, allow_gaps`. Returns `{found, deleted, state, history, baseline_time, event_count, warnings}`. |
 | `GET /api/servers` | List servers (masked: parsed host/port/user/dbname + `has_password`, never a DSN or password) plus `default_id`. |
 | `POST /api/servers` | Add a server to the registry (validates, does not connect; never runs DDL). |

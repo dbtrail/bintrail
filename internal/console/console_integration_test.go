@@ -189,6 +189,42 @@ func TestIntegrationRecoverPGDialect(t *testing.T) {
 	}
 }
 
+// TestIntegrationCapabilitiesSourcePostgres proves /api/capabilities reports the
+// source family per-server from stream_state.flavor (#595). The shared console
+// reads only the index, so this is the signal the frontend uses to present PG
+// vocabulary (LSN vs binlog file/pos/GTID) and the forensics-degraded note —
+// without ever probing the source database. A fresh/legacy index (no flavor row)
+// reads as "mysql" (the safe default); a PG-flavored index as "postgresql".
+func TestIntegrationCapabilitiesSourcePostgres(t *testing.T) {
+	srv, _ := seedConsoleData(t)
+
+	// Default: seedConsoleData writes no stream_state row, so DialectForIndex
+	// falls back to MySQL — capabilities must report the common case, never blank.
+	_, body := doReq(t, srv, "GET", "/api/capabilities", "")
+	var caps capabilitiesResponse
+	if err := json.Unmarshal(body, &caps); err != nil {
+		t.Fatal(err)
+	}
+	if caps.Source != "mysql" {
+		t.Errorf("a MySQL/legacy index must report source=mysql, got %q", caps.Source)
+	}
+
+	// Stamp the boot bundle's index as PostgreSQL-sourced (single-row stream_state).
+	if _, err := srv.cm.boot.db.Exec(
+		`INSERT INTO stream_state (id, mode, flavor, last_checkpoint, server_id)
+		 VALUES (1, 'gtid', 'postgres', UTC_TIMESTAMP(), 1)`); err != nil {
+		t.Fatalf("stamp stream_state flavor=postgres: %v", err)
+	}
+
+	_, body = doReq(t, srv, "GET", "/api/capabilities", "")
+	if err := json.Unmarshal(body, &caps); err != nil {
+		t.Fatal(err)
+	}
+	if caps.Source != "postgresql" {
+		t.Errorf("a PG-flavored index must report source=postgresql, got %q", caps.Source)
+	}
+}
+
 // TestIntegrationRecoverWithTimeRangeSurfacesGap exercises the planner-active
 // recover path. testutil.InitIndexTables creates only the p_future partition,
 // so loadLivePartitionHours is empty and every hour in a bounded query range is

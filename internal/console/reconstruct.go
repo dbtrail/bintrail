@@ -12,7 +12,26 @@ import (
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
+	"github.com/dbtrail/dbtrail/internal/recovery"
 )
+
+// Source labels for capabilitiesResponse.Source. The console reads only the
+// index, so the source family is whatever stream_state.flavor records — never a
+// live probe of the source database.
+const (
+	sourceMySQL    = "mysql"
+	sourcePostgres = "postgresql"
+)
+
+// sourceForDialect maps the index's recovery dialect to a source-family label.
+// PostgresDialect is set by DialectForFlavor("postgres"); everything else
+// (mysql, mariadb, or an unreadable/legacy index) collapses to "mysql".
+func sourceForDialect(d recovery.Dialect) string {
+	if d == recovery.PostgresDialect {
+		return sourcePostgres
+	}
+	return sourceMySQL
+}
 
 // reconstructMaxEvents caps the binlog events applied to a single row in the
 // [baseline, at] window. Reconstruct is scoped to one PK, so this is generous;
@@ -41,6 +60,15 @@ type capabilitiesResponse struct {
 	// degrades to Phase-1; advertising true there would over-promise.
 	RecoverCascadeBaseline bool         `json:"recover_cascade_baseline"`
 	Auth                   authCapsInfo `json:"auth"`
+	// Source names the selected server's source database family — "postgresql"
+	// or "mysql" — derived per-server from stream_state.flavor (the same field
+	// DialectForIndex reads). It drives source-aware PRESENTATION only: the
+	// frontend relabels stream vocabulary (LSN vs binlog file/pos/GTID) and shows
+	// a forensics-degraded note for PostgreSQL, whose pgoutput stream carries no
+	// backend connection id. NOT a capability gate — it never hides a surface,
+	// only renames or annotates what one shows. Defaults to "mysql" when the
+	// bundle can't be resolved, so a degraded console reads as the common case.
+	Source string `json:"source"`
 }
 
 // authCapsInfo tells the authenticated SPA how it got in and whether a
@@ -74,6 +102,9 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// only by the RBAC profile (which would make synthesis leak redacted data).
 		RecoverCascade: !s.rbacActive(),
 		Auth:           authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
+		// Default until the bundle resolves: a degraded console renders MySQL
+		// vocabulary (the common case), never a blank source.
+		Source: sourceMySQL,
 	}
 	if b, err := s.resolve(r); err == nil {
 		resp.Reconstruct = b.baselineConfigured
@@ -81,6 +112,10 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// capability can't over-promise (handler builds the provider only when both
 		// a baseline source and a resolver are present).
 		resp.RecoverCascadeBaseline = b.baselineConfigured && b.resolver != nil
+		// Per-server source family, read from this index's stream_state.flavor.
+		// DialectForIndex is nil-safe and legacy-tolerant (any read error → MySQL),
+		// so a pre-flavor index simply presents as MySQL.
+		resp.Source = sourceForDialect(recovery.DialectForIndex(b.db))
 	} else if !errors.Is(err, ErrUnknownServer) && !errors.Is(err, errNoServers) {
 		// Expected for a bad X-Bintrail-Server header or a fresh install;
 		// anything else (e.g. a genuine connection failure) would silently
