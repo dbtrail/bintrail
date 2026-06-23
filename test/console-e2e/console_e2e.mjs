@@ -151,6 +151,77 @@ try {
     ? ok("form: advanced section expanded for a BYO-index entry")
     : bad("form: advanced section expanded for a BYO-index entry", "collapsed — the byoIndex open-arm regressed");
 
+  // Scenario 6 — Cascade recovery tab (#580). The class/[data-capability] gating
+  // bug class is invisible to Go tests, so pin it here: the nav item + ⌘K entry
+  // appear when recover_cascade is on (free tier, true here — no RBAC profile),
+  // the tab renders its parent form, and — critically — both the nav item HIDES
+  // and the route REDIRECTS to overview when the capability is off.
+  await page.evaluate(() => closeServersModal());
+  const casc = await page.evaluate(() => {
+    const navItem = document.querySelector('.nav-item[data-route="cascade"]');
+    const cmds = (typeof cmdkCommands === "function") ? cmdkCommands().map((c) => c.label) : [];
+    return {
+      capOn: typeof capsCache !== "undefined" && !!capsCache.recover_cascade,
+      navPresent: !!navItem,
+      navVisible: navItem ? getComputedStyle(navItem).display !== "none" : false,
+      inPalette: cmds.includes("Cascade recovery"),
+    };
+  });
+  casc.capOn ? ok("cascade: recover_cascade capability reported") : bad("cascade: recover_cascade capability reported", "false — expected true (no RBAC profile)");
+  casc.navPresent ? ok("cascade: nav item present") : bad("cascade: nav item present", "missing from DOM");
+  casc.navVisible ? ok("cascade: nav item visible when capability on") : bad("cascade: nav item visible when capability on", "hidden despite cap-on");
+  casc.inPalette ? ok("cascade: command-palette entry present") : bad("cascade: command-palette entry present", "missing");
+
+  await page.evaluate(() => navigate("cascade"));
+  await page.waitForSelector("#cascade-form", { timeout: 5000 });
+  const cform = await page.evaluate(() => {
+    const f = document.getElementById("cascade-form");
+    if (!f) return { form: false };
+    const btn = Array.from(f.querySelectorAll("button")).find((b) => /Generate cascade recovery SQL/.test(b.textContent));
+    return {
+      form: true,
+      onRoute: location.pathname === "/cascade",
+      schema: !!f.querySelector('[name="schema"]'),
+      table: !!f.querySelector('[name="table"]'),
+      pk: !!f.querySelector('[name="pk"]'),
+      allowInc: !!f.querySelector('[name="allow_incomplete"]'),
+      genBtn: !!btn,
+      warnings: !!document.getElementById("cascade-warnings"),
+    };
+  });
+  cform.form ? ok("cascade: form renders on the tab") : bad("cascade: form renders on the tab", "#cascade-form missing");
+  cform.onRoute ? ok("cascade: navigates to /cascade") : bad("cascade: navigates to /cascade", "wrong route");
+  (cform.schema && cform.table && cform.pk) ? ok("cascade: parent schema/table/pk fields present") : bad("cascade: parent schema/table/pk fields present", JSON.stringify(cform));
+  cform.allowInc ? ok("cascade: allow-incomplete checkbox present") : bad("cascade: allow-incomplete checkbox present", "missing");
+  cform.genBtn ? ok("cascade: generate action present") : bad("cascade: generate action present", "button missing");
+  cform.warnings ? ok("cascade: warnings container present") : bad("cascade: warnings container present", "missing");
+
+  const off = await page.evaluate(() => {
+    capsCache.recover_cascade = false;
+    // Re-apply the same cap-on toggle gateCapabilities() runs (without refetching,
+    // which would reset the flag) — this is the exact class gating under test.
+    document.querySelectorAll("[data-capability]").forEach((n) => n.classList.toggle("cap-on", !!capsCache[n.dataset.capability]));
+    const navItem = document.querySelector('.nav-item[data-route="cascade"]');
+    const navHidden = navItem ? getComputedStyle(navItem).display === "none" : false;
+    // (a) navigate() guard: navigating to a gated route bounces to overview.
+    navigate("cascade");
+    const navGuard = location.pathname === "/overview";
+    // (b) renderCascade's OWN replaceState self-guard. A direct dispatch — a
+    // bookmarked/typed /cascade URL, Back/popstate, or boot — reaches renderRoute
+    // WITHOUT navigate()'s guard, so the in-render guard is the sole defense there.
+    // Force /cascade and call renderCascade directly: it must redirect AND render
+    // no form (deleting that guard would leave this the only failing assertion).
+    history.replaceState({}, "", "/cascade");
+    renderCascade({});
+    const renderGuard = location.pathname === "/overview" && !document.getElementById("cascade-form");
+    capsCache.recover_cascade = true; // restore for any later scenarios
+    document.querySelectorAll("[data-capability]").forEach((n) => n.classList.toggle("cap-on", !!capsCache[n.dataset.capability]));
+    return { navHidden, navGuard, renderGuard };
+  });
+  off.navHidden ? ok("cascade: nav item hides when capability off") : bad("cascade: nav item hides when capability off", "still visible — gating regression");
+  off.navGuard ? ok("cascade: navigate() guard redirects to overview when off") : bad("cascade: navigate() guard redirects to overview when off", "did not redirect");
+  off.renderGuard ? ok("cascade: renderCascade self-guard redirects direct/popstate entry when off") : bad("cascade: renderCascade self-guard redirects direct/popstate entry when off", "form rendered or no redirect — the in-render guard gap");
+
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));
 } catch (err) {
