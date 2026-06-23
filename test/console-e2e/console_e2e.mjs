@@ -236,12 +236,14 @@ try {
     const fresh = pgHealthCard({ ...base, checked_at: iso(3000) });
     const stale = pgHealthCard({ ...base, safe_wal_size: null, checked_at: iso(300000) });
     const noTs = pgHealthCard({ ...base }); // missing checked_at
+    const lost = pgHealthCard({ ...base, wal_status: "lost", safe_wal_size: null, checked_at: iso(3000) });
     const perr = pgHealthCard({ exists: false, replica_identity_not_full: [], checked_at: iso(2000), probe_error: "recovery is in progress" });
     const nofound = pgHealthCard({ exists: false, replica_identity_not_full: [], checked_at: iso(2000) });
     return {
       freshGreen: !fresh.classList.contains("card-stale") && /checked \d+s ago/.test(fresh.textContent) && !!fresh.querySelector(".hstat-ok"),
       staleMuted: stale.classList.contains("card-stale") && /daemon may be stopped/.test(stale.textContent),
       missingTsStale: noTs.classList.contains("card-stale"),
+      lostRed: !!lost.querySelector(".hstat-err") && /lost/.test(lost.textContent),
       probeErrVisible: /probe failing/i.test(perr.textContent) && /recovery is in progress/.test(perr.textContent) && !!perr.querySelector(".hstat-err"),
       notFoundShown: /not found yet/.test(nofound.textContent),
     };
@@ -249,6 +251,7 @@ try {
   ph.freshGreen ? ok("pg-health: fresh snapshot renders healthy + 'checked Ns ago'") : bad("pg-health: fresh snapshot renders healthy + 'checked Ns ago'", "missing fresh/ok state");
   ph.staleMuted ? ok("pg-health: stale snapshot degrades to muted/warn (never silent-green)") : bad("pg-health: stale snapshot degrades to muted/warn (never silent-green)", "no card-stale / warn footer");
   ph.missingTsStale ? ok("pg-health: missing checked_at reads as stale (fail-safe)") : bad("pg-health: missing checked_at reads as stale (fail-safe)", "rendered fresh");
+  ph.lostRed ? ok("pg-health: a lost slot renders with the red error chip (critical state never benign)") : bad("pg-health: a lost slot renders with the red error chip (critical state never benign)", "wal_status=lost not .hstat-err");
   ph.probeErrVisible ? ok("pg-health: probe failure shows 'probe failing' (not a blank panel)") : bad("pg-health: probe failure shows 'probe failing' (not a blank panel)", "probe_error not surfaced");
   ph.notFoundShown ? ok("pg-health: absent slot shows 'not found yet'") : bad("pg-health: absent slot shows 'not found yet'", "missing not-found state");
 

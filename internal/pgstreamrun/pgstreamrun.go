@@ -341,6 +341,13 @@ func streamLoopPG(
 		defer cancel()
 		snap, err := probe(pctx)
 		if err != nil {
+			// A cancellation is a graceful shutdown (the loop's ctx is done), not a
+			// source-side failure — don't persist a spurious "probe failing" snapshot that
+			// would make a clean stop look broken. A poll TIMEOUT (pctx deadline, ctx still
+			// live) is a real hung-source failure and DOES fall through to be recorded.
+			if ctx.Err() != nil {
+				return
+			}
 			logger.Warn("pgstreamrun: source-health probe failed; recording it so the console shows the failure, not a blank panel", "error", err)
 			// Persist the failure (not just log it): a never-written snapshot leaves the
 			// panel absent and the staleness net has nothing to age — the silent-failure

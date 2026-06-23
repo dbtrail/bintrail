@@ -326,9 +326,9 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 	// source_health (#599) is loaded by a SEPARATE best-effort query, not folded into the
 	// SELECTs above: it is newer than gap_lost_*, so adding it there would drag any index
 	// that has gap_lost but not yet source_health down to the base fallback (losing the
-	// loss record). The separate query degrades to "no health" only on the unknown-column
-	// error (a legacy/un-migrated index); any other error surfaces, since the core load
-	// already proved the DB reachable.
+	// loss record). The separate query degrades to "no health" on the unknown-column error
+	// (a legacy/un-migrated index) or an empty row; any OTHER error surfaces, since the core
+	// load already proved the DB reachable.
 	if err := loadSourceHealth(ctx, db, s); err != nil {
 		return nil, err
 	}

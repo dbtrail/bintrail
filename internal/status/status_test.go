@@ -1193,3 +1193,41 @@ func TestWriteStatusJSON_gapLost(t *testing.T) {
 		t.Errorf("healthy stream JSON must omit gap_lost:\n%s", buf2.String())
 	}
 }
+
+// TestWriteStatusJSON_sourceHealth pins the daemon→console emission seam (#599): the
+// raw source_health JSON must reach the API response verbatim as a nested object, and be
+// omitted when no daemon has polled. Pure unit (no MySQL) — this branch is the only thing
+// between the persisted snapshot and the panel; a break here silently blanks the panel.
+func TestWriteStatusJSON_sourceHealth(t *testing.T) {
+	var buf bytes.Buffer
+	stream := &StreamStateInfo{
+		Mode: "gtid", LastCheckpoint: time.Now(), ServerID: 7,
+		SourceHealth: sql.NullString{Valid: true, String: `{"wal_status":"reserved","checked_at":"2026-06-23T18:30:00Z"}`},
+	}
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil, stream); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Stream struct {
+			SourceHealth struct {
+				WalStatus string `json:"wal_status"`
+			} `json:"source_health"`
+		} `json:"stream"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if result.Stream.SourceHealth.WalStatus != "reserved" {
+		t.Errorf("stream.source_health did not pass through to JSON (the emission seam is broken): got wal_status=%q\n%s",
+			result.Stream.SourceHealth.WalStatus, buf.String())
+	}
+
+	// Omitted entirely when no daemon has polled (additive, omitempty).
+	var buf2 bytes.Buffer
+	if err := WriteStatusJSON(&buf2, nil, nil, nil, nil, nil, &StreamStateInfo{Mode: "gtid", LastCheckpoint: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf2.String(), "source_health") {
+		t.Errorf("a stream with no health snapshot must omit source_health:\n%s", buf2.String())
+	}
+}

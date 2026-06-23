@@ -1471,7 +1471,9 @@ const PG_HEALTH_STALE_SEC = 90;
 
 // pgHealthCard renders the persisted PostgreSQL replication-health snapshot. h is the
 // parsed stream.source_health object {exists,active,wal_status,retained_bytes,
-// safe_wal_size,restart_lsn,confirmed_flush_lsn,replica_identity_not_full,checked_at}.
+// safe_wal_size,restart_lsn,confirmed_flush_lsn,replica_identity_not_full,checked_at,
+// probe_error}. probe_error is the failed-probe discriminator: when set, this snapshot
+// records a probe failure (the slot fields are absent) and the card shows "probe failing".
 function pgHealthCard(h) {
   const card = el("div", { class: "card" });
   card.append(el("div", { class: "card-title", text: "Replication health" }));
