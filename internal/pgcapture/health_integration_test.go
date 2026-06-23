@@ -88,3 +88,51 @@ func TestQuerySlotHealth_Integration(t *testing.T) {
 		t.Errorf("dropped slot reported Exists=true: %+v", h)
 	}
 }
+
+// TestDropSlot_Integration covers the #532 teardown primitive: dropping an existing
+// slot reports dropped=true and removes it; dropping an absent slot is an idempotent
+// no-op (dropped=false, nil error).
+func TestDropSlot_Integration(t *testing.T) {
+	dsn := testutil.SkipIfNoPostgres(t)
+	ctx := context.Background()
+
+	const slot = "bintrail_dropslot_it"
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { conn.Close(context.Background()) })
+	cleanup := func() {
+		_, _ = conn.Exec(context.Background(),
+			"SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	// Absent → no-op.
+	if dropped, err := pgcapture.DropSlot(ctx, conn, slot); err != nil || dropped {
+		t.Fatalf("DropSlot(absent) = (%t, %v), want (false, nil)", dropped, err)
+	}
+
+	// Create, then drop → dropped=true and gone.
+	if _, err := conn.Exec(ctx, "SELECT pg_create_logical_replication_slot($1, 'pgoutput')", slot); err != nil {
+		t.Fatalf("create slot: %v", err)
+	}
+	dropped, err := pgcapture.DropSlot(ctx, conn, slot)
+	if err != nil || !dropped {
+		t.Fatalf("DropSlot(present) = (%t, %v), want (true, nil)", dropped, err)
+	}
+	h, err := pgcapture.QuerySlotHealth(ctx, conn, slot)
+	if err != nil {
+		t.Fatalf("QuerySlotHealth after drop: %v", err)
+	}
+	if h.Exists {
+		t.Error("slot still exists after DropSlot")
+	}
+
+	// Idempotent: dropping again is a no-op, not an error.
+	if dropped, err := pgcapture.DropSlot(ctx, conn, slot); err != nil || dropped {
+		t.Errorf("DropSlot(already dropped) = (%t, %v), want (false, nil)", dropped, err)
+	}
+}

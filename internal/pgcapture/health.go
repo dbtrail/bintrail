@@ -143,6 +143,23 @@ func QuerySlotHealth(ctx context.Context, conn *pgx.Conn, slotName string) (Slot
 	return r.toHealth()
 }
 
+// DropSlot idempotently drops the replication slot on a plain query connection, for
+// teardown/re-baseline (bintrail-pg reset). It returns dropped=false with a nil error
+// when the slot is already absent. It errors if the slot is ACTIVE — a live consumer
+// (a running `bintrail-pg stream`) holds it — surfacing PostgreSQL's "replication slot
+// is active for PID N" message; the caller must stop the stream first.
+func DropSlot(ctx context.Context, conn *pgx.Conn, slotName string) (bool, error) {
+	// The WHERE EXISTS guard makes this a no-op (0 rows) when the slot is absent, so it
+	// is idempotent; an active slot still raises an error from pg_drop_replication_slot.
+	tag, err := conn.Exec(ctx,
+		`SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)`,
+		slotName)
+	if err != nil {
+		return false, fmt.Errorf("pgcapture: dropping replication slot %q: %w", slotName, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // querySlotState reads only a slot's existence and wal_status — a primary-agnostic
 // catalog read. It is deliberately lighter than QuerySlotHealth, which adds the
 // primary-only pg_current_wal_lsn()/pg_wal_lsn_diff retention metrics (those error on

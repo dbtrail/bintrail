@@ -31,6 +31,7 @@ and set REPLICA IDENTITY; bintrail reads — it never writes to your source.
 | **A `PUBLICATION`** covering those tables | **Yes — you create it** | bintrail-pg validates it exists and covers your tables; it does **not** create it. |
 | **A replication slot** | No — created for you | bintrail-pg creates the logical slot on first run and reuses it on restart. |
 | `max_replication_slots` ≥ 1, `max_wal_senders` ≥ 1 | Yes | Defaults (10) are usually fine. A slot consumes one of each. |
+| **`max_slot_wal_keep_size`** set (not `-1`) | **Strongly recommended** | The production safety valve (PG 13+). Left unlimited (`-1`, the default), a stalled slot pins WAL until the source disk fills — an outage. Set a bound (e.g. `'10GB'`); `bintrail-pg doctor` WARNs while it's unlimited. See [the slot section](#5-the-replication-slot--created-for-you). |
 
 The index MySQL has the same requirements as for any source — see
 [Streaming → index requirements](streaming.md).
@@ -168,8 +169,30 @@ slot (named by `--slot`) on first run and resumes from it on every restart.
 > time, the slot pins WAL and the source disk can fill. On PostgreSQL 13+ set
 > `max_slot_wal_keep_size` as a safety valve so an abandoned slot is capped
 > (it becomes `lost` instead of filling the disk; bintrail-pg then fails loud on
-> resume rather than silently skipping data). If you decommission a capture,
-> drop its slot: `SELECT pg_drop_replication_slot('<slot>');`.
+> resume rather than silently skipping data). To decommission a capture, use
+> `bintrail-pg reset` (below) rather than dropping the slot by hand.
+
+#### Checking slot health
+
+`bintrail-pg doctor` reports the slot's live WAL-retention state on demand,
+alongside the capture prerequisites (`wal_level`, publication coverage, REPLICA
+IDENTITY FULL):
+
+```bash
+bintrail-pg doctor --query-dsn "$PG" --slot bintrail_shop --publication bintrail_shop_pub
+```
+
+- **`max_slot_wal_keep_size`** → WARN while unlimited (`-1`); set a bound to clear it.
+- **Replication slot health** → shows `wal_status` and how much WAL the slot is
+  retaining. The status progresses `reserved` → `extended` → `unreserved` →
+  `lost`; a `lost` (invalidated) slot is a loud **FAIL** with the re-baseline
+  recovery path.
+
+A permanently-lost stream is also recorded durably: once a slot is invalidated or
+dropped out from under a running capture, `bintrail status` shows a loud
+**`EVENTS PERMANENTLY LOST`** banner even after the process has exited. In every
+case the index up to the gap is still fully usable for recovery — recovery never
+needs the slot; only *resuming capture* requires a re-baseline.
 
 ---
 
@@ -233,12 +256,27 @@ exists.
 
 To start over from scratch you must drop the slot **and** clear the checkpoint —
 because in PostgreSQL the *slot* governs the resume position, so clearing the
-checkpoint alone does not rewind:
+checkpoint alone does not rewind. `bintrail-pg reset` does both (it drops the slot
+first, so an interrupted reset fails safe — "slot gone, checkpoint stale" rather
+than "checkpoint cleared, slot live"):
 
-```sql
-SELECT pg_drop_replication_slot('bintrail_shop');   -- on the source
-DELETE FROM stream_state WHERE id = 1;               -- on the index
+```bash
+bintrail-pg reset --query-dsn "$PG" --index-dsn "$IDX" --slot bintrail_shop --force
 ```
+
+`--force` confirms the destructive teardown. If the slot is already gone or `lost`
+(e.g. after a `max_slot_wal_keep_size` invalidation), pass `--index-only` to clear
+just the checkpoint:
+
+```bash
+bintrail-pg reset --index-dsn "$IDX" --index-only --force
+```
+
+This removes only capture-resume state; the index's recovery data is untouched.
+Under the hood it is the two-system teardown that otherwise has to be done by hand
+(`SELECT pg_drop_replication_slot('bintrail_shop')` on the source +
+`DELETE FROM stream_state WHERE id = 1` on the index). After a reset, re-seed the
+baseline and re-run `bintrail-pg stream`.
 
 ---
 
@@ -402,14 +440,18 @@ which are plain SQL.
 
 ## Troubleshooting
 
+> Tip: run `bintrail-pg doctor` to catch most of the rows below *before* they cost
+> you a debugging cycle — it checks `wal_level`, publication coverage, REPLICA
+> IDENTITY FULL, `max_slot_wal_keep_size`, and live slot health in one shot.
+
 | Symptom | Cause / fix |
 |---|---|
 | `wal_level is "replica", must be 'logical'` | Set `wal_level = logical` and **restart** the server (a reload is not enough). |
 | `publication "…" does not exist — create it` | Create the publication first (step 4) — bintrail-pg never creates it. |
 | `publication "…" does not cover requested table(s) […]` | Your `--schemas`/`--tables` include tables not in the publication; `ALTER PUBLICATION … ADD TABLE …` (or widen the publication). |
 | `table(s) not at REPLICA IDENTITY FULL […]` | Run `ALTER TABLE <t> REPLICA IDENTITY FULL` for the listed tables (step 3). |
-| `replication slot "…" is invalidated (wal_status=lost; max_slot_wal_keep_size exceeded)` | The source dropped WAL the slot still needed (slot was stopped too long). The data since the checkpoint is gone — start fresh (drop the slot, clear the checkpoint) and re-seed. Raise `max_slot_wal_keep_size`/keep the consumer running. |
-| `resuming from a saved checkpoint but replication slot "…" no longer exists` | The slot was dropped while a checkpoint still pointed at it. Creating a fresh slot would skip data, so bintrail-pg refuses — clear the checkpoint to start fresh if the gap is acceptable. |
+| `replication slot "…" is invalidated (wal_status=lost; max_slot_wal_keep_size exceeded)` | The source dropped WAL the slot still needed (slot was stopped too long). The data since the checkpoint is gone — `bintrail-pg reset` (drops the slot + clears the checkpoint), re-seed, and raise `max_slot_wal_keep_size` / keep the consumer running. `bintrail status` shows this as a loud `EVENTS PERMANENTLY LOST` banner. |
+| `resuming from a saved checkpoint but replication slot "…" no longer exists` | The slot was dropped while a checkpoint still pointed at it. Creating a fresh slot would skip data, so bintrail-pg refuses — `bintrail-pg reset --index-only` to clear the checkpoint and start fresh if the gap is acceptable. |
 | `must include replication=database` (connection error on `--repl-dsn`) | Add `replication=database` to the `--repl-dsn` connection string. |
 | Permission denied opening replication / creating slot | The role needs the `REPLICATION` attribute (`ALTER ROLE <r> REPLICATION;`), or on managed PG the provider's replication grant. |
 
