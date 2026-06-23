@@ -13,6 +13,7 @@ package pgstreamrun
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,6 +37,17 @@ const pgFlavor = "postgres"
 
 // defaultEventBuffer is the size of the channel between the capturer and the loop.
 const defaultEventBuffer = 1000
+
+// healthPollInterval is how often the loop polls the source for a health snapshot
+// (slot WAL-retention + REPLICA IDENTITY coverage) to persist for the console (#599).
+// Slot health changes slowly, so 30s keeps the catalog read cheap; the console's
+// staleness indicator degrades a snapshot older than a few intervals (a dead daemon
+// must not read as healthy). healthPollTimeout bounds one probe so a hung source can
+// only briefly pause event draining (the poll runs inline in the loop's select).
+const (
+	healthPollInterval = 30 * time.Second
+	healthPollTimeout  = 5 * time.Second
+)
 
 // Config binds everything One needs.
 type Config struct {
@@ -142,7 +154,12 @@ func One(ctx context.Context, cfg Config) error {
 		captureErr <- cap.Run(ctx, events)
 	}()
 
-	loopErr := streamLoopPG(ctx, events, idx, indexDB, cap, checkpointInterval, state, logger)
+	// The health probe reads slot/RI state on its own short-lived catalog connection
+	// (connect-per-poll), independent of the capturer's replication and query conns.
+	probe := func(c context.Context) (pgcapture.HealthSnapshot, error) {
+		return pgcapture.ProbeHealth(c, cfg.QueryDSN, cfg.SlotName, cfg.Publication)
+	}
+	loopErr := streamLoopPG(ctx, events, idx, indexDB, cap, checkpointInterval, probe, healthPollInterval, state, logger)
 	cancel() // loop exited first → unblock the capturer's emit/receive so it returns
 
 	// Run returns nil on ctx-cancel; only a real capture error matters.
@@ -201,6 +218,90 @@ func persistSlotLostPG(db *sql.DB, serverID uint32, detail string, logger *slog.
 	}
 }
 
+// sourceHealthJSON is the wire/persisted shape written to stream_state.source_health
+// (#599) — a clean, frontend-friendly projection of pgcapture.HealthSnapshot.
+// SlotHealth's sql.NullInt64 and pglogrepl.LSN do not marshal to a usable JSON shape,
+// so this flattens them: SafeWalSize is a *int64 (null = unlimited retention or an
+// already-lost slot), LSNs are their "X/Y" strings. CheckedAt is RFC3339 UTC so the
+// index-only console can compute staleness unambiguously — a frozen snapshot over a
+// dead daemon must read as stale, not healthy.
+type sourceHealthJSON struct {
+	Exists                 bool     `json:"exists"`
+	Active                 bool     `json:"active"`
+	WalStatus              string   `json:"wal_status"`
+	RetainedBytes          int64    `json:"retained_bytes"`
+	SafeWalSize            *int64   `json:"safe_wal_size"`
+	RestartLSN             string   `json:"restart_lsn"`
+	ConfirmedFlushLSN      string   `json:"confirmed_flush_lsn"`
+	ReplicaIdentityNotFull []string `json:"replica_identity_not_full"`
+	CheckedAt              string   `json:"checked_at"`
+	// ProbeError, when set, means this snapshot records a FAILED probe rather than a
+	// reading — the slot fields are absent/zero. Persisted so the console shows an
+	// explicit "probe failing" state instead of a blank panel (see buildProbeErrorJSON).
+	ProbeError string `json:"probe_error,omitempty"`
+}
+
+// buildSourceHealthJSON marshals a probe result + the wall-clock it was taken into the
+// wire shape. checkedAt is stamped by the caller (not inside, so a test is deterministic).
+func buildSourceHealthJSON(snap pgcapture.HealthSnapshot, checkedAt time.Time) ([]byte, error) {
+	h := sourceHealthJSON{
+		Exists:                 snap.Slot.Exists,
+		Active:                 snap.Slot.Active,
+		WalStatus:              snap.Slot.WalStatus,
+		RetainedBytes:          snap.Slot.RetainedBytes,
+		RestartLSN:             snap.Slot.RestartLSN.String(),
+		ConfirmedFlushLSN:      snap.Slot.ConfirmedFlushLSN.String(),
+		ReplicaIdentityNotFull: snap.ReplicaIdentityNotFull,
+		CheckedAt:              checkedAt.UTC().Format(time.RFC3339),
+	}
+	if snap.Slot.SafeWalSize.Valid {
+		v := snap.Slot.SafeWalSize.Int64
+		h.SafeWalSize = &v
+	}
+	if h.ReplicaIdentityNotFull == nil {
+		h.ReplicaIdentityNotFull = []string{} // marshal as [] not null — a cleaner contract for the frontend
+	}
+	return json.Marshal(h)
+}
+
+// buildProbeErrorJSON records a FAILED probe as a source_health snapshot so the console
+// renders an explicit "probe failing" state instead of nothing. Without this, a probe
+// that never once succeeds — a standby source (the slot-health query runs the
+// primary-only pg_current_wal_lsn()), or a query-DSN auth/network failure that begins
+// after startup — would leave the panel ABSENT, indistinguishable from "no daemon
+// configured", and the staleness indicator cannot age a snapshot that was never written.
+// That is a silent failure in the exact visibility path #599 exists to provide. The slot
+// fields stay zero; the frontend keys off probe_error.
+func buildProbeErrorJSON(probeErr string, checkedAt time.Time) ([]byte, error) {
+	return json.Marshal(sourceHealthJSON{
+		ReplicaIdentityNotFull: []string{},
+		CheckedAt:              checkedAt.UTC().Format(time.RFC3339),
+		ProbeError:             probeErr,
+	})
+}
+
+// saveSourceHealth persists the latest source-health snapshot to
+// stream_state.source_health (#599). Like persistSlotLostPG it is an UPSERT, not a bare
+// UPDATE: the daemon polls health before the first commit writes the row (the slot
+// exists from startup), so an `UPDATE ... WHERE id=1` would match zero rows and silently
+// drop every snapshot until the first checkpoint — the console would show no health on
+// an idle stream. The INSERT seeds the NOT NULL columns; ON DUPLICATE KEY touches ONLY
+// source_health, never the checkpoint/position columns (saveCheckpointPG owns those, so
+// a real checkpoint survives this write). Best-effort: a failed write is logged, never
+// fatal to the stream.
+func saveSourceHealth(db *sql.DB, serverID uint32, healthJSON []byte, logger *slog.Logger) {
+	_, err := db.Exec(`
+		INSERT INTO stream_state (id, mode, flavor, server_id, last_checkpoint, source_health)
+		VALUES (1, 'gtid', ?, ?, UTC_TIMESTAMP(), ?)
+		ON DUPLICATE KEY UPDATE
+			source_health = VALUES(source_health)`,
+		pgFlavor, serverID, healthJSON)
+	if err != nil {
+		logger.Warn("pgstreamrun: could not persist source-health snapshot; the console health panel will stay stale",
+			"error", err)
+	}
+}
+
 // streamLoopPG batches row events into the indexer and checkpoints the durable LSN.
 //
 // The checkpoint cursor is the last COMPLETE transaction's commit LSN (lastCommitLSN)
@@ -217,12 +318,45 @@ func streamLoopPG(
 	indexDB *sql.DB,
 	cap *pgcapture.Capturer,
 	checkpointInterval time.Duration,
+	probe func(context.Context) (pgcapture.HealthSnapshot, error),
+	healthInterval time.Duration,
 	state *pgStreamState,
 	logger *slog.Logger,
 ) error {
 	batch := make([]event.Event, 0, idx.BatchSize())
 	ticker := time.NewTicker(checkpointInterval)
 	defer ticker.Stop()
+
+	// Source-health polling (#599) shares the loop's single goroutine — no concurrent
+	// writer of the stream_state row, so saveSourceHealth can never race saveCheckpointPG.
+	// healthC stays nil when no probe is configured (the case then never fires).
+	var healthC <-chan time.Time
+	if probe != nil {
+		healthTicker := time.NewTicker(healthInterval)
+		defer healthTicker.Stop()
+		healthC = healthTicker.C
+	}
+	pollHealth := func() {
+		pctx, cancel := context.WithTimeout(ctx, healthPollTimeout)
+		defer cancel()
+		snap, err := probe(pctx)
+		if err != nil {
+			logger.Warn("pgstreamrun: source-health probe failed; recording it so the console shows the failure, not a blank panel", "error", err)
+			// Persist the failure (not just log it): a never-written snapshot leaves the
+			// panel absent and the staleness net has nothing to age — the silent-failure
+			// the visibility feature must not have. buildProbeErrorJSON cannot fail.
+			if errJSON, mErr := buildProbeErrorJSON(err.Error(), time.Now()); mErr == nil {
+				saveSourceHealth(indexDB, state.serverID, errJSON, logger)
+			}
+			return
+		}
+		healthJSON, err := buildSourceHealthJSON(snap, time.Now())
+		if err != nil {
+			logger.Warn("pgstreamrun: marshal source-health snapshot", "error", err)
+			return
+		}
+		saveSourceHealth(indexDB, state.serverID, healthJSON, logger)
+	}
 
 	var lastCommitLSN uint64
 
@@ -279,6 +413,13 @@ func streamLoopPG(
 			if err := checkpoint(); err != nil {
 				return err
 			}
+
+		case <-healthC:
+			// Inline in the loop (no second goroutine): a ~tens-of-ms catalog read every
+			// healthInterval, bounded by healthPollTimeout, so a hung source pauses event
+			// draining only briefly. Errors are logged, never fatal — a failed health
+			// poll must not abort the stream.
+			pollHealth()
 
 		case ev, ok := <-events:
 			if !ok {

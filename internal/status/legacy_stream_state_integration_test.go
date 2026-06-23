@@ -4,6 +4,7 @@ package status_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -45,5 +46,47 @@ func TestLoadStreamState_LegacyIndexMissingGapColumns(t *testing.T) {
 	}
 	if st.GapLostAt.Valid {
 		t.Errorf("a legacy index has no gap-loss record; GapLostAt should be invalid, got %v", st.GapLostAt)
+	}
+}
+
+// TestLoadStreamState_SourceHealth pins the #599 read path: a row with a source_health
+// JSON snapshot is returned verbatim, and an index missing the column (legacy / not yet
+// migrated — the console never migrates registry DSNs) must NOT error. The separate
+// best-effort query degrades to "no health" only on the unknown-column error.
+func TestLoadStreamState_SourceHealth(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+	db, _ := testutil.CreateTestDB(t)
+	if err := indexer.CreateIndexTables(ctx, db, 4, false, nil); err != nil {
+		t.Fatalf("CreateIndexTables: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO stream_state (id, mode, flavor, server_id, last_checkpoint, source_health)
+		 VALUES (1, 'gtid', 'postgres', 9, UTC_TIMESTAMP(), '{"wal_status":"reserved"}')`); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+
+	st, err := status.LoadStreamState(ctx, db)
+	if err != nil {
+		t.Fatalf("LoadStreamState: %v", err)
+	}
+	if st == nil || !st.SourceHealth.Valid {
+		t.Fatalf("expected a source_health snapshot, got %+v", st)
+	}
+	if !strings.Contains(st.SourceHealth.String, `"wal_status"`) {
+		t.Errorf("source_health not loaded verbatim: %q", st.SourceHealth.String)
+	}
+
+	// Legacy index without the column → the best-effort second query tolerates the
+	// unknown-column error, leaving SourceHealth invalid (no health, no error).
+	if _, err := db.ExecContext(ctx, "ALTER TABLE stream_state DROP COLUMN source_health"); err != nil {
+		t.Fatalf("drop source_health: %v", err)
+	}
+	st, err = status.LoadStreamState(ctx, db)
+	if err != nil {
+		t.Fatalf("LoadStreamState must not error on an index missing source_health, got: %v", err)
+	}
+	if st == nil || st.SourceHealth.Valid {
+		t.Errorf("a legacy index has no source_health; want invalid, got %+v", st)
 	}
 }

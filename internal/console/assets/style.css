@@ -1165,6 +1165,24 @@ button { font-family: inherit; }
   border-radius: var(--radius-sm); padding: 9px 12px; margin: 6px 0;
 }
 
+/* PostgreSQL replication-health card (#599) */
+.hstat { font-family: var(--f-mono); font-size: 12.5px; font-weight: 600; }
+.hstat-ok     { color: var(--insert); }
+.hstat-warn   { color: var(--orange-2); }
+.hstat-strong { text-decoration: underline; }
+.hstat-err    { color: var(--delete); }
+.hstat-muted  { color: var(--ink-3); }
+.hlist {
+  font-family: var(--f-mono); font-size: 11.5px; color: var(--orange-2);
+  margin: 4px 0 2px; padding-left: 2px; display: flex; flex-direction: column; gap: 2px;
+}
+.hstale {
+  font-family: var(--f-mono); font-size: 11px; color: var(--ink-3);
+  margin-top: 9px; padding-top: 7px; border-top: 1px solid var(--line-soft);
+}
+.hstale-warn { color: var(--orange-2); }
+.card-stale { opacity: 0.6; }
+
 /* point-in-time state table (Time-travel "Value as of T") */
 .statetable { width: 100%; border-collapse: collapse; font-family: var(--f-mono); font-size: 12.5px; }
 .statetable th, .statetable td {

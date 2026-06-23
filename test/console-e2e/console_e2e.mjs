@@ -222,6 +222,36 @@ try {
   off.navGuard ? ok("cascade: navigate() guard redirects to overview when off") : bad("cascade: navigate() guard redirects to overview when off", "did not redirect");
   off.renderGuard ? ok("cascade: renderCascade self-guard redirects direct/popstate entry when off") : bad("cascade: renderCascade self-guard redirects direct/popstate entry when off", "form rendered or no redirect — the in-render guard gap");
 
+  // Scenario 7 — PostgreSQL replication-health panel (#599). pgHealthCard is the
+  // load-bearing anti-silent-failure surface: a frozen snapshot over a stopped daemon
+  // must degrade to muted/warn (never render healthy-green), a missing/unparseable
+  // checked_at must read as stale (fail-safe), a recorded probe failure must show as
+  // "probe failing" (not a blank panel), and an absent slot reads "not found yet".
+  // Driven directly with fixtures — the seeded console is MySQL-sourced, so this
+  // unit-drives the render function rather than needing a live PG source.
+  const ph = await page.evaluate(() => {
+    const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
+    const base = { exists: true, active: true, wal_status: "reserved", retained_bytes: 16384,
+      safe_wal_size: 1073741824, replica_identity_not_full: [] };
+    const fresh = pgHealthCard({ ...base, checked_at: iso(3000) });
+    const stale = pgHealthCard({ ...base, safe_wal_size: null, checked_at: iso(300000) });
+    const noTs = pgHealthCard({ ...base }); // missing checked_at
+    const perr = pgHealthCard({ exists: false, replica_identity_not_full: [], checked_at: iso(2000), probe_error: "recovery is in progress" });
+    const nofound = pgHealthCard({ exists: false, replica_identity_not_full: [], checked_at: iso(2000) });
+    return {
+      freshGreen: !fresh.classList.contains("card-stale") && /checked \d+s ago/.test(fresh.textContent) && !!fresh.querySelector(".hstat-ok"),
+      staleMuted: stale.classList.contains("card-stale") && /daemon may be stopped/.test(stale.textContent),
+      missingTsStale: noTs.classList.contains("card-stale"),
+      probeErrVisible: /probe failing/i.test(perr.textContent) && /recovery is in progress/.test(perr.textContent) && !!perr.querySelector(".hstat-err"),
+      notFoundShown: /not found yet/.test(nofound.textContent),
+    };
+  });
+  ph.freshGreen ? ok("pg-health: fresh snapshot renders healthy + 'checked Ns ago'") : bad("pg-health: fresh snapshot renders healthy + 'checked Ns ago'", "missing fresh/ok state");
+  ph.staleMuted ? ok("pg-health: stale snapshot degrades to muted/warn (never silent-green)") : bad("pg-health: stale snapshot degrades to muted/warn (never silent-green)", "no card-stale / warn footer");
+  ph.missingTsStale ? ok("pg-health: missing checked_at reads as stale (fail-safe)") : bad("pg-health: missing checked_at reads as stale (fail-safe)", "rendered fresh");
+  ph.probeErrVisible ? ok("pg-health: probe failure shows 'probe failing' (not a blank panel)") : bad("pg-health: probe failure shows 'probe failing' (not a blank panel)", "probe_error not surfaced");
+  ph.notFoundShown ? ok("pg-health: absent slot shows 'not found yet'") : bad("pg-health: absent slot shows 'not found yet'", "missing not-found state");
+
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));
 } catch (err) {

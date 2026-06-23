@@ -92,6 +92,12 @@ type StreamStateInfo struct {
 	// human-readable context and may be absent. Both writers set them atomically.
 	GapLostAt     sql.NullTime
 	GapLostDetail sql.NullString
+	// SourceHealth is the latest source-side health snapshot a streaming daemon polled
+	// (#599) — for PostgreSQL, a JSON document with the replication slot's wal_status/lag
+	// and REPLICA IDENTITY coverage plus an embedded checked_at. Opaque here (raw JSON);
+	// the console renders it and computes staleness from checked_at. Invalid on a legacy
+	// index without the column or an index no daemon has polled.
+	SourceHealth sql.NullString
 }
 
 // CoverageInfo summarizes the restore coverage of the index.
@@ -313,6 +319,23 @@ func LoadServers(ctx context.Context, db *sql.DB) ([]ServerInfo, error) {
 // LoadStreamState loads the single row from stream_state (if any).
 // Returns nil with no error when the table is empty (no active stream).
 func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) {
+	s, err := loadStreamStateCore(ctx, db)
+	if err != nil || s == nil {
+		return s, err
+	}
+	// source_health (#599) is loaded by a SEPARATE best-effort query, not folded into the
+	// SELECTs above: it is newer than gap_lost_*, so adding it there would drag any index
+	// that has gap_lost but not yet source_health down to the base fallback (losing the
+	// loss record). The separate query degrades to "no health" only on the unknown-column
+	// error (a legacy/un-migrated index); any other error surfaces, since the core load
+	// already proved the DB reachable.
+	if err := loadSourceHealth(ctx, db, s); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func loadStreamStateCore(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) {
 	var s StreamStateInfo
 	err := db.QueryRowContext(ctx, `
 		SELECT mode, binlog_file, binlog_position, gtid_set,
@@ -338,6 +361,18 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 		return nil, err
 	}
 	return &s, nil
+}
+
+// loadSourceHealth augments an already-loaded StreamStateInfo with the source_health
+// column. It tolerates ONLY the unknown-column error (a legacy index missing the column)
+// and an empty row — there it leaves SourceHealth invalid (no health to show). Any other
+// error is returned, so a genuine fault is not silently hidden behind a blank panel.
+func loadSourceHealth(ctx context.Context, db *sql.DB, s *StreamStateInfo) error {
+	err := db.QueryRowContext(ctx, `SELECT source_health FROM stream_state WHERE id = 1`).Scan(&s.SourceHealth)
+	if isUnknownColumnErr(err) || errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return err
 }
 
 // loadStreamStateBase loads the stream_state columns guaranteed by the original CREATE
@@ -789,6 +824,10 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		LastCheckpoint string       `json:"last_checkpoint"`
 		ServerID       uint32       `json:"server_id"`
 		GapLost        *jsonGapLost `json:"gap_lost,omitempty"`
+		// SourceHealth is the raw source_health JSON passed through verbatim (#599):
+		// the console knows its shape (slot wal_status/lag, replica_identity_not_full,
+		// checked_at), this layer does not. Omitted when no daemon has polled.
+		SourceHealth json.RawMessage `json:"source_health,omitempty"`
 	}
 	type jsonBaseline struct {
 		SnapshotTime string  `json:"snapshot_time"`
@@ -883,6 +922,9 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		}
 		if stream.GapLostAt.Valid {
 			jstr.GapLost = &jsonGapLost{At: stream.GapLostAt.Time.Format(TSFmt), Detail: stream.GapLostDetail.String}
+		}
+		if stream.SourceHealth.Valid && stream.SourceHealth.String != "" {
+			jstr.SourceHealth = json.RawMessage(stream.SourceHealth.String)
 		}
 		out.Stream = jstr
 	}

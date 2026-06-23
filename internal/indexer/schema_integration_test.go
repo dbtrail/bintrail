@@ -63,6 +63,38 @@ func TestEnsureSchemaAddsFlavorColumn(t *testing.T) {
 	}
 }
 
+// TestEnsureSchemaAddsSourceHealthColumn pins the #599 migration: a pre-source-health
+// install must gain stream_state.source_health as a nullable JSON column, idempotently.
+func TestEnsureSchemaAddsSourceHealthColumn(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Simulate a pre-#599 install by dropping the column EnsureSchema re-adds.
+	testutil.MustExec(t, db, `ALTER TABLE stream_state DROP COLUMN source_health`)
+
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	var dataType, isNullable string
+	if err := db.QueryRow(`SELECT DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stream_state'
+		  AND COLUMN_NAME = 'source_health'`).Scan(&dataType, &isNullable); err != nil {
+		t.Fatalf("read source_health column: %v", err)
+	}
+	if dataType != "json" {
+		t.Errorf("source_health DATA_TYPE = %q, want \"json\"", dataType)
+	}
+	if isNullable != "YES" {
+		t.Errorf("source_health IS_NULLABLE = %q, want \"YES\"", isNullable)
+	}
+
+	// Idempotent: a second run must not error or re-add.
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema (second run): %v", err)
+	}
+}
+
 // TestEnsureSchemaAddsFKRuleColumns pins the cascade-recovery migration: a
 // pre-cascade install must gain fk_constraints.delete_rule/update_rule as
 // NOT NULL DEFAULT ” (existing rows backfill to "" = unknown), idempotently.

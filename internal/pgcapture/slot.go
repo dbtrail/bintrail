@@ -125,9 +125,12 @@ func checkWALLevel(ctx context.Context, conn *pgx.Conn) error {
 	return nil
 }
 
-// checkReplicaIdentityTables verifies every table the publication streams is at
-// REPLICA IDENTITY FULL (the per-table loop; wal_level is checked separately).
-func checkReplicaIdentityTables(ctx context.Context, conn *pgx.Conn, publication string) error {
+// replicaIdentityNotFull returns the sorted "schema.table (relreplident=x)" of every
+// published table NOT at REPLICA IDENTITY FULL. It is the single catalog-query source
+// of truth shared by the capture-time validator (which turns a non-empty list into a
+// fatal error) and the report-only QueryReplicaIdentityNotFull (which surfaces the list
+// for the console health panel). An empty result means every published table is FULL.
+func replicaIdentityNotFull(ctx context.Context, conn *pgx.Conn, publication string) ([]string, error) {
 	rows, err := conn.Query(ctx, `
 		SELECT pt.schemaname, pt.tablename, c.relreplident::text
 		FROM pg_publication_tables pt
@@ -135,7 +138,7 @@ func checkReplicaIdentityTables(ctx context.Context, conn *pgx.Conn, publication
 		JOIN pg_class c ON c.relname = pt.tablename AND c.relnamespace = n.oid
 		WHERE pt.pubname = $1`, publication)
 	if err != nil {
-		return fmt.Errorf("pgcapture: checking replica identity for publication %q: %w", publication, err)
+		return nil, fmt.Errorf("pgcapture: checking replica identity for publication %q: %w", publication, err)
 	}
 	defer rows.Close()
 
@@ -143,17 +146,27 @@ func checkReplicaIdentityTables(ctx context.Context, conn *pgx.Conn, publication
 	for rows.Next() {
 		var schema, table, relreplident string
 		if err := rows.Scan(&schema, &table, &relreplident); err != nil {
-			return fmt.Errorf("pgcapture: scanning replica identity for publication %q: %w", publication, err)
+			return nil, fmt.Errorf("pgcapture: scanning replica identity for publication %q: %w", publication, err)
 		}
 		if relreplident != "f" {
 			notFull = append(notFull, fmt.Sprintf("%s.%s (relreplident=%s)", schema, table, relreplident))
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("pgcapture: checking replica identity for publication %q: %w", publication, err)
+		return nil, fmt.Errorf("pgcapture: checking replica identity for publication %q: %w", publication, err)
+	}
+	sort.Strings(notFull)
+	return notFull, nil
+}
+
+// checkReplicaIdentityTables verifies every table the publication streams is at
+// REPLICA IDENTITY FULL (the per-table loop; wal_level is checked separately).
+func checkReplicaIdentityTables(ctx context.Context, conn *pgx.Conn, publication string) error {
+	notFull, err := replicaIdentityNotFull(ctx, conn, publication)
+	if err != nil {
+		return err
 	}
 	if len(notFull) > 0 {
-		sort.Strings(notFull)
 		return fmt.Errorf("pgcapture: table(s) not at REPLICA IDENTITY FULL [%s] — before-images would be partial (an unchanged out-of-line TOAST value is lost under a weaker identity, so recovery would be wrong); run ALTER TABLE <t> REPLICA IDENTITY FULL",
 			strings.Join(notFull, ", "))
 	}
@@ -181,6 +194,14 @@ func CheckPublication(ctx context.Context, conn *pgx.Conn, publication string, f
 // doctor can report the two distinctly.
 func CheckReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication string) error {
 	return checkReplicaIdentityTables(ctx, conn, publication)
+}
+
+// QueryReplicaIdentityNotFull is the report-only sibling of CheckReplicaIdentity: it
+// returns the published tables NOT at REPLICA IDENTITY FULL (empty = all FULL) instead
+// of folding them into a fatal error. The streaming daemon polls it for the console
+// health panel (#599) — a coverage signal the operator reads, not a startup gate.
+func QueryReplicaIdentityNotFull(ctx context.Context, conn *pgx.Conn, publication string) ([]string, error) {
+	return replicaIdentityNotFull(ctx, conn, publication)
 }
 
 // listUnloggedCaptureTables returns the "schema.table" of every UNLOGGED base table in

@@ -1432,6 +1432,10 @@ async function renderStatus() {
     ["rows", arch.total_rows],
     ["size", arch.total_size_human],
   ]));
+  // Replication-health panel (#599): the streaming daemon polls the PostgreSQL source
+  // (slot wal_status/lag + REPLICA IDENTITY coverage) and persists a snapshot to the
+  // index; this renders it. Gated on source==postgresql AND a snapshot existing.
+  if (pg && stream && stream.source_health) cards.append(pgHealthCard(stream.source_health));
   // Durable permanent-loss record (status JSON stream.gap_lost): an unfillable
   // binlog gap (MySQL) or an invalidated/lost replication slot (PostgreSQL, #532).
   // The index is valid only up to this point; capture must be re-baselined to
@@ -1457,6 +1461,91 @@ function statusCard(title, rows) {
       el("span", { class: "kv-v" + (big ? " big" : ""), text: val === null || val === undefined ? "—" : String(val) })));
   });
   return card;
+}
+
+// PG_HEALTH_STALE_SEC: a source_health snapshot older than this reads as STALE. The
+// daemon polls every 30s, so 90s ≈ 3 missed polls → likely stopped. Load-bearing, not
+// decoration: an index-only console cannot tell a frozen "reserved" from a live one, so
+// a stale snapshot must never render as healthy green (#599).
+const PG_HEALTH_STALE_SEC = 90;
+
+// pgHealthCard renders the persisted PostgreSQL replication-health snapshot. h is the
+// parsed stream.source_health object {exists,active,wal_status,retained_bytes,
+// safe_wal_size,restart_lsn,confirmed_flush_lsn,replica_identity_not_full,checked_at}.
+function pgHealthCard(h) {
+  const card = el("div", { class: "card" });
+  card.append(el("div", { class: "card-title", text: "Replication health" }));
+
+  // Staleness drives everything: an unparseable/old checked_at mutes the whole card and
+  // labels it, so a dead poller never reads healthy.
+  const checked = h.checked_at ? Date.parse(h.checked_at) : NaN;
+  const ageSec = isNaN(checked) ? Infinity : Math.max(0, (Date.now() - checked) / 1000);
+  const stale = ageSec >= PG_HEALTH_STALE_SEC;
+  if (stale) card.classList.add("card-stale");
+
+  // probe_error: the daemon could not read source health (e.g. a standby source, or a
+  // query-DSN failure). Show it explicitly — a recorded failure, never a blank panel or
+  // a misleading "all FULL". The slot/RI sections are skipped (their fields are absent).
+  if (h.probe_error) {
+    card.append(healthKV("status", el("span", { class: "hstat hstat-err", text: "probe failing" })));
+    card.append(el("div", { class: "hlist", text: h.probe_error }));
+  } else {
+    if (!h.exists) {
+      card.append(healthKV("slot", el("span", { class: "hstat hstat-muted", text: "not found yet" })));
+    } else {
+      card.append(healthKV("WAL status", el("span", { class: "hstat " + walStatusClass(h.wal_status), text: h.wal_status || "—" })));
+      card.append(healthKV("retained WAL", el("span", { class: "kv-v", text: humanBytes(h.retained_bytes) })));
+      card.append(healthKV("safe margin", el("span", { class: "kv-v", text: h.safe_wal_size == null ? "unlimited" : humanBytes(h.safe_wal_size) })));
+      card.append(healthKV("consumer", el("span", { class: "kv-v", text: h.active ? "connected" : "—" })));
+    }
+
+    const nf = h.replica_identity_not_full || [];
+    if (nf.length === 0) {
+      card.append(healthKV("replica identity", el("span", { class: "hstat hstat-ok", text: "all FULL ✓" })));
+    } else {
+      card.append(healthKV("replica identity", el("span", { class: "hstat hstat-warn", text: "⚠ " + nf.length + " not FULL" })));
+      const list = el("div", { class: "hlist" });
+      nf.forEach((t) => list.append(el("div", { text: t })));
+      card.append(list);
+    }
+  }
+
+  const foot = el("div", { class: "hstale" + (stale ? " hstale-warn" : "") });
+  foot.append(stale
+    ? "stale — last checked " + agoText(ageSec) + " (daemon may be stopped)"
+    : "checked " + agoText(ageSec));
+  card.append(foot);
+  return card;
+}
+
+function healthKV(k, valNode) {
+  return el("div", { class: "kv" }, el("span", { class: "kv-k", text: k }), valNode);
+}
+
+function walStatusClass(s) {
+  switch (s) {
+    case "reserved": return "hstat-ok";
+    case "extended": return "hstat-warn";
+    case "unreserved": return "hstat-warn hstat-strong";
+    case "lost": return "hstat-err";
+    default: return "hstat-muted";
+  }
+}
+
+function humanBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(1) + " " + u[i];
+}
+
+function agoText(sec) {
+  if (!isFinite(sec)) return "unknown";
+  if (sec < 60) return Math.round(sec) + "s ago";
+  if (sec < 3600) return Math.round(sec / 60) + "m ago";
+  return Math.round(sec / 3600) + "h ago";
 }
 
 function updateSideMeta(status) {

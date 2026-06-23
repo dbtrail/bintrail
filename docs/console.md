@@ -459,11 +459,19 @@ per server as `source` in [`/api/capabilities`](#api), derived from
   backend connection id, so actor attribution (who-changed) is unavailable
   *upstream* — not merely dropped by the open-core boundary above. The Events
   page says so for PostgreSQL sources rather than leaving it an unexplained gap.
-
-Live source-side signals — replication-slot lag, `wal_status`,
-`max_slot_wal_keep_size`, `REPLICA IDENTITY FULL` validation — are **not** shown
-here: they require querying the source PostgreSQL, which the index-only console
-never does. Use `bintrail-pg doctor` for those.
+- **Replication-health panel.** The Status page shows the replication slot's
+  WAL-retention state (`wal_status`, retained WAL, the safe margin before
+  invalidation) and whether every published table is at `REPLICA IDENTITY FULL`.
+  The console is still index-only: it never queries the source. Instead the
+  streaming daemon (`bintrail-pg stream` / `watch`) polls the source every ~30s
+  and persists a snapshot to the index (`stream_state.source_health`), which the
+  console renders. Because a snapshot can outlive a stopped daemon, the panel
+  shows **how recently it was checked** and **degrades a stale snapshot** (older
+  than ~90s) to muted with a warning — a frozen "reserved" must never read as
+  live-healthy. If the daemon cannot read the source at all (for example a
+  standby, where the slot-retention metrics are unavailable), the panel shows
+  **probe failing** with the reason rather than disappearing. For an on-demand,
+  always-live check, use `bintrail-pg doctor`.
 
 ## API
 

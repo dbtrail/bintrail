@@ -269,6 +269,16 @@ func EnsureSchema(db *sql.DB) error {
 	); err != nil {
 		return err
 	}
+	// source_health holds the latest source-side health snapshot a streaming
+	// daemon polls (#599): for PostgreSQL, replication-slot wal_status/lag and
+	// REPLICA IDENTITY coverage, with an embedded checked_at so the index-only
+	// console can show staleness. Source-agnostic JSON payload (one index schema
+	// for all source families); NULL on every index no daemon has polled.
+	if err := ensureColumn(db, "stream_state", "source_health",
+		`ALTER TABLE stream_state ADD COLUMN source_health JSON DEFAULT NULL COMMENT 'latest source-side health snapshot (PostgreSQL: replication-slot wal_status/lag + REPLICA IDENTITY coverage) with an embedded checked_at; serialized payload, source-agnostic column' AFTER gap_lost_detail`,
+	); err != nil {
+		return err
+	}
 	// flavor records the source database flavor (mysql/mariadb) so a resume
 	// parses the saved gtid_set with the correct GTID parser. NOT NULL DEFAULT
 	// 'mysql' means existing rows read back as mysql with no data migration,

@@ -143,6 +143,39 @@ func QuerySlotHealth(ctx context.Context, conn *pgx.Conn, slotName string) (Slot
 	return r.toHealth()
 }
 
+// HealthSnapshot is a point-in-time source-side health reading the streaming daemon
+// persists to the index for the console (#599): the replication slot's WAL-retention
+// state plus any published table not at REPLICA IDENTITY FULL. pgstreamrun owns the
+// serialized wire shape written to stream_state.source_health; this is the in-memory
+// form the probe returns.
+type HealthSnapshot struct {
+	Slot                   SlotHealth
+	ReplicaIdentityNotFull []string
+}
+
+// ProbeHealth opens a short-lived plain connection to queryDSN and reads current source
+// health: the slot's WAL-retention state (QuerySlotHealth) and the published tables not
+// at REPLICA IDENTITY FULL (QueryReplicaIdentityNotFull). Connect-per-call — the daemon
+// polls infrequently, so a dropped connection self-heals on the next poll; the caller
+// bounds the whole probe with a timeout. It never mutates the source.
+func ProbeHealth(ctx context.Context, queryDSN, slotName, publication string) (HealthSnapshot, error) {
+	conn, err := pgx.Connect(ctx, queryDSN)
+	if err != nil {
+		return HealthSnapshot{}, fmt.Errorf("pgcapture: health probe connect: %w", err)
+	}
+	defer conn.Close(context.Background())
+
+	slot, err := QuerySlotHealth(ctx, conn, slotName)
+	if err != nil {
+		return HealthSnapshot{}, err
+	}
+	notFull, err := QueryReplicaIdentityNotFull(ctx, conn, publication)
+	if err != nil {
+		return HealthSnapshot{}, err
+	}
+	return HealthSnapshot{Slot: slot, ReplicaIdentityNotFull: notFull}, nil
+}
+
 // DropSlot idempotently drops the replication slot on a plain query connection, for
 // teardown/re-baseline (bintrail-pg reset). It returns dropped=false with a nil error
 // when the slot is already absent. It errors if the slot is ACTIVE — a live consumer
