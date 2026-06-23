@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -15,9 +16,11 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/pgcapture"
 	"github.com/dbtrail/dbtrail/internal/pgstreamrun"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/recovery"
+	"github.com/dbtrail/dbtrail/internal/status"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
@@ -150,6 +153,109 @@ func TestOne_EndToEnd_PostgresToIndexToRecovery(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), bigVal) {
 		t.Error("reversal SQL does not contain the TOAST value — it did not round-trip into recovery")
+	}
+}
+
+// TestOne_LostSlotResume_PersistsLossBadge is the #532 slice-4 proof: when a resume
+// finds the replication slot gone (WAL behind the checkpoint is irrecoverable), One
+// returns the ErrSlotMissingOnResume sentinel AND durably records the permanent loss
+// in stream_state.gap_lost_at, so index-only `status` shows the loud badge after the
+// process has exited. (Dropping the slot is the deterministic trigger; a wal_status=lost
+// invalidation takes the same ErrSlotLost → persist path.)
+func TestOne_LostSlotResume_PersistsLossBadge(t *testing.T) {
+	pgDSN := testutil.SkipIfNoPostgres(t)
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	indexDB, dbName := testutil.CreateTestDB(t)
+	indexDSN := testutil.BaseDSN() + "/" + dbName
+
+	const slot = "bintrail_lostresume_it"
+	const pub = "bintrail_lostresume_it_pub"
+	const tbl = "lostresume_it_t"
+
+	pg, err := pgx.Connect(ctx, pgDSN)
+	if err != nil {
+		t.Fatalf("connect PG: %v", err)
+	}
+	t.Cleanup(func() { pg.Close(context.Background()) })
+
+	dropAll := func() {
+		bg := context.Background()
+		_, _ = pg.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		_, _ = pg.Exec(bg, "DROP TABLE IF EXISTS "+tbl)
+		_, _ = pg.Exec(bg, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+	}
+	dropAll()
+	t.Cleanup(dropAll)
+
+	mustExec := func(sql string) {
+		t.Helper()
+		if _, err := pg.Exec(ctx, sql); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+	mustExec(fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, v text)", tbl))
+	mustExec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", tbl))
+	mustExec(fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl))
+
+	cfg := pgstreamrun.Config{
+		IndexDSN: indexDSN, ReplDSN: replDSN(pgDSN), QueryDSN: pgDSN,
+		SlotName: slot, Publication: pub, ServerID: 51,
+		Tables: "public." + tbl, BatchSize: 100, Checkpoint: 200 * time.Millisecond,
+	}
+
+	// ── First run: create the slot, index a row, save a checkpoint, then stop. ──
+	runCtx, cancel := context.WithCancel(ctx)
+	runErr := make(chan error, 1)
+	go func() { runErr <- pgstreamrun.One(runCtx, cfg) }()
+	waitFor(t, 15*time.Second, func() bool {
+		var active bool
+		if err := pg.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&active); err != nil {
+			return false
+		}
+		return active
+	}, "replication slot active")
+	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'a')", tbl))
+	waitFor(t, 15*time.Second, func() bool {
+		var n int
+		if err := indexDB.QueryRow("SELECT COUNT(*) FROM binlog_events WHERE table_name = ?", tbl).Scan(&n); err != nil {
+			return false
+		}
+		return n >= 1 // a flush happened → a checkpoint row exists in stream_state
+	}, "first row indexed (checkpoint saved)")
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("first run returned error: %v", err)
+	}
+
+	// ── Drop the slot: the WAL behind the saved checkpoint is now gone. ──
+	mustExec(fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slot))
+
+	// ── Resume: One must fail loud with ErrSlotMissingOnResume (not silently create a
+	// fresh slot that skips data) AND record the permanent loss. ──
+	resumeCtx, resumeCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer resumeCancel()
+	err = pgstreamrun.One(resumeCtx, cfg)
+	if !errors.Is(err, pgcapture.ErrSlotMissingOnResume) {
+		t.Fatalf("resume error = %v, want ErrSlotMissingOnResume", err)
+	}
+
+	// The permanent-loss record is durable in the index.
+	st, err := status.LoadStreamState(ctx, indexDB)
+	if err != nil {
+		t.Fatalf("LoadStreamState: %v", err)
+	}
+	if st == nil || !st.GapLostAt.Valid {
+		t.Fatalf("gap_lost_at not set after a lost-slot resume: %+v", st)
+	}
+
+	// And index-only status (the same data the process would show after exiting)
+	// renders the loud badge.
+	var buf bytes.Buffer
+	status.WriteStatus(&buf, nil, nil, nil, nil, nil, st)
+	if !strings.Contains(buf.String(), "EVENTS PERMANENTLY LOST") {
+		t.Errorf("status does not show the permanent-loss badge:\n%s", buf.String())
 	}
 }
 

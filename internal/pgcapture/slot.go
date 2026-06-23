@@ -97,6 +97,16 @@ func validateReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication st
 // (restart-with-config vs retry) without mislabeling a transient blip as a config bug.
 var ErrWALLevelNotLogical = errors.New("wal_level is not 'logical'")
 
+// ErrSlotLost and ErrSlotMissingOnResume mark the two fatal resume conditions where
+// the WAL behind the saved checkpoint is irrecoverably gone — the slot was invalidated
+// (wal_status=lost) or dropped. ensureSlot wraps them (preserving its descriptive
+// message); the consumer (pgstreamrun.One) matches them with errors.Is to durably
+// record the permanent loss so index-only `status` can show it after the process exits.
+var (
+	ErrSlotLost            = errors.New("pgcapture: replication slot invalidated (wal_status=lost)")
+	ErrSlotMissingOnResume = errors.New("pgcapture: replication slot missing on resume")
+)
+
 // checkWALLevel verifies the (global) wal_level is 'logical' — logical replication
 // is impossible otherwise. A value-wrong result wraps ErrWALLevelNotLogical; a query
 // failure does not.
@@ -201,12 +211,12 @@ func ensureSlot(ctx context.Context, replConn *pgconn.PgConn, queryConn *pgx.Con
 
 	// A 'lost' slot is unusable regardless of mode — its WAL has been removed.
 	if found && walStatus == WalStatusLost {
-		return 0, fmt.Errorf("pgcapture: replication slot %q is invalidated (wal_status=lost; max_slot_wal_keep_size exceeded) — the WAL it needs is gone; re-baseline rather than resume", slotName)
+		return 0, fmt.Errorf("pgcapture: replication slot %q is invalidated (wal_status=lost; max_slot_wal_keep_size exceeded) — the WAL it needs is gone; re-baseline rather than resume: %w", slotName, ErrSlotLost)
 	}
 
 	if expectExisting {
 		if !found {
-			return 0, fmt.Errorf("pgcapture: resuming from a saved checkpoint but replication slot %q no longer exists — the WAL since the checkpoint is lost; re-baseline (creating a fresh slot would silently skip data)", slotName)
+			return 0, fmt.Errorf("pgcapture: resuming from a saved checkpoint but replication slot %q no longer exists — the WAL since the checkpoint is lost; re-baseline (creating a fresh slot would silently skip data): %w", slotName, ErrSlotMissingOnResume)
 		}
 		return savedLSN, nil
 	}

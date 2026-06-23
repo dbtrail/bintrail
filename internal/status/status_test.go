@@ -1079,7 +1079,7 @@ func TestStatusData_Write_equivalence(t *testing.T) {
 	}}
 	stream := &StreamStateInfo{
 		Mode: "gtid", BinlogFile: "binlog.000005", BinlogPosition: 12345,
-		GTIDSet: sql.NullString{Valid: true, String: "aaa-bbb:1-100"},
+		GTIDSet:       sql.NullString{Valid: true, String: "aaa-bbb:1-100"},
 		EventsIndexed: 267354, LastCheckpoint: ts, ServerID: 42,
 	}
 
@@ -1121,5 +1121,75 @@ func TestStatusData_WriteJSON_equivalence(t *testing.T) {
 
 	if got.String() != want.String() {
 		t.Errorf("StatusData.WriteJSON output differs from WriteStatusJSON:\ngot:\n%s\nwant:\n%s", got.String(), want.String())
+	}
+}
+
+// ─── permanently-lost badge (#532) ──────────────────────────────────────────────
+
+// gapLostStream builds a minimal stream with a permanent-loss record set. The badge
+// is flavor-agnostic (gap_lost_at is shared by MySQL binlog gaps and PostgreSQL
+// lost slots), so this fixture leaves the mode/flavor unset on purpose.
+func gapLostStream() *StreamStateInfo {
+	at := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	return &StreamStateInfo{
+		Mode:           "gtid",
+		EventsIndexed:  42,
+		LastCheckpoint: at,
+		ServerID:       7,
+		GapLostAt:      sql.NullTime{Valid: true, Time: at},
+		GapLostDetail:  sql.NullString{Valid: true, String: "replication slot invalidated (wal_status=lost)"},
+	}
+}
+
+func TestWriteStatus_permanentLossBadge(t *testing.T) {
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, nil, nil, gapLostStream())
+	out := buf.String()
+	for _, want := range []string{"EVENTS PERMANENTLY LOST", "replication slot invalidated", "re-baseline"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status text missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+func TestWriteStatus_noBadgeWhenNotLost(t *testing.T) {
+	// A healthy stream (gap_lost_at NULL) must NOT show the banner.
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, nil, nil, &StreamStateInfo{Mode: "gtid", ServerID: 7, LastCheckpoint: time.Now()})
+	if strings.Contains(buf.String(), "PERMANENTLY LOST") {
+		t.Errorf("healthy stream should not show the loss badge:\n%s", buf.String())
+	}
+}
+
+func TestWriteStatusJSON_gapLost(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil, gapLostStream()); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Stream struct {
+			GapLost *struct {
+				At     string `json:"at"`
+				Detail string `json:"detail"`
+			} `json:"gap_lost"`
+		} `json:"stream"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if result.Stream.GapLost == nil {
+		t.Fatalf("stream.gap_lost missing from JSON:\n%s", buf.String())
+	}
+	if result.Stream.GapLost.Detail != "replication slot invalidated (wal_status=lost)" {
+		t.Errorf("gap_lost.detail = %q", result.Stream.GapLost.Detail)
+	}
+
+	// And it is omitted entirely for a healthy stream (additive, omitempty).
+	var buf2 bytes.Buffer
+	if err := WriteStatusJSON(&buf2, nil, nil, nil, nil, nil, &StreamStateInfo{Mode: "gtid", LastCheckpoint: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf2.String(), "gap_lost") {
+		t.Errorf("healthy stream JSON must omit gap_lost:\n%s", buf2.String())
 	}
 }
