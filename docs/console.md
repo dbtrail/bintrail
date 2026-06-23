@@ -86,8 +86,15 @@ and searching events:
    with before→after diffs, then **Generate undo SQL** and copy/download the
    script. Arriving via an **Undo** action scopes it to that row and shows a
    context banner. **Nothing is ever executed.**
-5. **Status** — index health: partitions, coverage, stream lag, archives.
-6. **Settings** (under `watch` only) — **Storage** (rotation policy,
+5. **Cascade recovery** — reverse a foreign-key `ON DELETE CASCADE` / `SET NULL`
+   that InnoDB ran *below* the binlog: give it the **parent** table whose delete
+   cascaded and **Generate cascade recovery SQL** (copy/download). A provably
+   partial recovery shows a prominent **INCOMPLETE** banner listing every caveat,
+   so it never reads as a full restore. Free tier, but **hidden — its route
+   redirects to Overview — under an RBAC redaction profile**. See
+   [Cascade recovery](#cascade-recovery).
+6. **Status** — index health: partitions, coverage, stream lag, archives.
+7. **Settings** (under `watch` only) — **Storage** (rotation policy,
    per-source S3 archiving, baseline snapshots, AWS credential signals — see
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
    rotation dialog).
@@ -448,7 +455,8 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `GET /api/schemas` | Distinct schemas. `?schema=<name>` → that schema's tables. |
 | `GET /api/events` | Event browser. Query params: `schema, table, pk, event_type, gtid, since, until, changed_column, order, limit`. |
 | `POST /api/recover` | Undo-SQL generation. JSON body with the same filter fields (requires at least `schema`; an `order` field is accepted but ignored — recover always processes oldest-first). Returns `{sql, statement_count, row_count, warnings}`. |
-| `GET /api/capabilities` | Reports enabled optional surfaces for the **selected server**, e.g. `{"reconstruct": true, "auth": {"password_set": true, "auth_kind": "session"}}`. The frontend uses it to show/hide baseline-gated tabs on every switch and to gate the logout affordance (`auth_kind` says how this request authenticated). |
+| `POST /api/recover-cascade` | Cascade-recovery SQL generation (reverse FK `ON DELETE CASCADE` / `SET NULL` side effects). JSON body: `schema, table` (the **parent**), `pk, pks, since, until, lookback, max_depth, allow_incomplete`. Returns `{sql, statement_count, victim_count, set_null_count, complete, incomplete}` — text only, never executed. Returns `403` under an active RBAC redaction profile (see [Cascade recovery](#cascade-recovery)). |
+| `GET /api/capabilities` | Reports enabled optional surfaces for the **selected server**, e.g. `{"reconstruct": true, "recover_cascade": true, "recover_cascade_baseline": false, "auth": {"password_set": true, "auth_kind": "session"}}`. The frontend uses it to show/hide gated tabs on every switch (`reconstruct` → Time-travel, `recover_cascade` → Cascade recovery) and to gate the logout affordance (`auth_kind` says how this request authenticated). |
 | `GET /api/reconstruct` | Single-row point-in-time reconstruct (baseline-gated **per server**; 404 when not configured). Query params: `schema, table, pk, at, history, allow_gaps`. Returns `{found, deleted, state, history, baseline_time, event_count, warnings}`. |
 | `GET /api/servers` | List servers (masked: parsed host/port/user/dbname + `has_password`, never a DSN or password) plus `default_id`. |
 | `POST /api/servers` | Add a server to the registry (validates, does not connect; never runs DDL). |
@@ -464,11 +472,43 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `GET /api/baselines` | Read-only listing of the **selected server's** baseline snapshots, grouped per snapshot: `{configured, source, kind, reconstruct, snapshots: [{time, age_hours, tables, binlog_file, binlog_pos, gtid_set}]}` (coordinates local-only, capped at 50 snapshots). `502` when the configured source is unreadable. |
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 
-Every data endpoint (`status`, `schemas`, `events`, `recover`, `capabilities`,
-`reconstruct`, `baselines`) targets the server named by the
-`X-Bintrail-Server` request header; without the header they target the
-default entry (`storage` is the one process-global exception). Selection is
-stateless — concurrent clients can each target a different server.
+Every data endpoint (`status`, `schemas`, `events`, `recover`,
+`recover-cascade`, `capabilities`, `reconstruct`, `baselines`) targets the
+server named by the `X-Bintrail-Server` request header; without the header they
+target the default entry (`storage` is the one process-global exception).
+Selection is stateless — concurrent clients can each target a different server.
+
+### Cascade recovery
+
+On MySQL 8.x and earlier (and all MariaDB), InnoDB enforces a foreign-key `ON
+DELETE CASCADE` / `ON DELETE SET NULL` *below* the binary log — only the parent
+`DELETE` is logged, so the cascaded child deletes and SET-NULL updates are
+invisible to the normal **Recover** tab. The **Cascade recovery** tab
+reconstructs them: give it the **parent** table whose delete cascaded (schema /
+table / PK, plus optional `since`/`until`, `lookback`, `max-depth`) and
+**Generate cascade recovery SQL** — `INSERT`s for the cascade-deleted children
+and idempotent guarded `UPDATE`s (`… AND fk IS NULL`) for SET-NULL'd foreign
+keys, wrapped in `SET FOREIGN_KEY_CHECKS=0/1`. Copy or download it; **nothing is
+ever executed.** It is the in-console face of `bintrail recover-cascade` — see
+[query-and-recovery.md](query-and-recovery.md) for the full mechanism, the
+baseline Phase-2 fallback, and the coverage limits.
+
+**Coverage is surfaced, never hidden.** Phase-1 (live binlog window) recovery is
+partial by construction — a child not touched within `lookback` and not in a
+baseline cannot be reconstructed. When the result is provably partial (a coverage
+gap, a per-parent overflow, or archived-out partitions the live scan can't see)
+the tab shows a prominent **INCOMPLETE** banner listing every caveat — and the
+same caveats are embedded in the generated SQL's preamble, so a partial recovery
+can never read as a full restore even after you copy or download it.
+
+**Gating.** Cascade recovery is the free `query_explorer` tier, shown whenever
+the `recover_cascade` capability is true — which is whenever `recover` is,
+**except under an active RBAC redaction profile**. Cascade victim synthesis does
+not (yet) pass through the query engine's column redaction, so a `--profile`
+disables it: the tab is hidden, its route redirects to Overview, and `POST
+/api/recover-cascade` returns `403`. When a baseline is configured, the
+`recover_cascade_baseline` capability signals that Phase-2 (recovering children
+untouched within the window) is active for the selected server.
 
 ### Time-travel (reconstruct)
 
