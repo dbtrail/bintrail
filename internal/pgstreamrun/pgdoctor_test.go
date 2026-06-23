@@ -137,3 +137,40 @@ func TestFormatBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestUnloggedResult(t *testing.T) {
+	// #555: no UNLOGGED tables → PASS.
+	if got := unloggedResult(nil); got.Status != doctor.StatusPass {
+		t.Errorf("no unlogged → %s, want pass", got.Status)
+	}
+	// UNLOGGED tables present → WARN naming them (a silent capture hole made visible).
+	got := unloggedResult([]string{"public.cache", "public.tmp"})
+	if got.Status != doctor.StatusWarn {
+		t.Errorf("unlogged present → %s, want warn", got.Status)
+	}
+	if !strings.Contains(got.Detail, "public.cache") || !strings.Contains(got.Detail, "public.tmp") {
+		t.Errorf("detail should name the UNLOGGED tables, got %q", got.Detail)
+	}
+	if !strings.Contains(got.Remediation, "SET LOGGED") {
+		t.Errorf("remediation should mention SET LOGGED, got %q", got.Remediation)
+	}
+}
+
+func TestCascadeCoverageResult(t *testing.T) {
+	// #556: every cascade child covered → PASS.
+	if got := cascadeCoverageResult(nil); got.Status != doctor.StatusPass {
+		t.Errorf("no uncovered children → %s, want pass", got.Status)
+	}
+	// An uncovered cascade child → WARN naming the child, action, and parent.
+	got := cascadeCoverageResult([]pgcapture.CascadeChild{
+		{Child: "public.line_items", Parent: "public.orders", Action: "ON DELETE CASCADE"},
+	})
+	if got.Status != doctor.StatusWarn {
+		t.Errorf("uncovered child → %s, want warn", got.Status)
+	}
+	if !strings.Contains(got.Detail, "public.line_items") ||
+		!strings.Contains(got.Detail, "ON DELETE CASCADE") ||
+		!strings.Contains(got.Detail, "public.orders") {
+		t.Errorf("detail should name child + action + parent, got %q", got.Detail)
+	}
+}

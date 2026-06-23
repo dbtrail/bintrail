@@ -1,7 +1,9 @@
 package pgcapture_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -626,5 +628,82 @@ func TestDecode_NoAttrResolverDefaultsFalse(t *testing.T) {
 		if c.IsIdentityAlways || c.IsGenerated {
 			t.Errorf("col %s: flags should default false without an AttrResolver, got %+v", c.Name, c)
 		}
+	}
+}
+
+// ─── DDL drift: mid-stream shape change (#591) ─────────────────────────────────
+
+// TestDecode_RelationShapeChange_MidStream pins the DDL-drift gate (#591): pgoutput
+// re-emits a RelationMessage after a relation's shape changes (e.g. ALTER TABLE ... ADD
+// COLUMN), and cacheRelation must swap to the new shape so subsequent rows decode
+// against it — the analog of the MySQL parser's SwapResolver-on-DDL. This is the unit
+// half (no live PG); TestOne_DDLDrift_MidStreamAlter drives a real ALTER end-to-end.
+func TestDecode_RelationShapeChange_MidStream(t *testing.T) {
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+
+	// Initial shape: (id, a).
+	mustDecode(t, d, relMsg(1, "public", "t", "id", "a"))
+	mustDecode(t, d, beginMsg())
+	ev1, emit1 := mustDecode(t, d, &pglogrepl.InsertMessage{
+		RelationID: 1, Tuple: tuple(textCol("1"), textCol("x")),
+	})
+	if !emit1 {
+		t.Fatal("pre-ALTER INSERT should emit")
+	}
+	if len(ev1.RowAfter) != 2 || ev1.RowAfter["id"] != "1" || ev1.RowAfter["a"] != "x" {
+		t.Fatalf("pre-ALTER RowAfter = %v, want {id:1, a:x}", ev1.RowAfter)
+	}
+	if _, ok := ev1.RowAfter["b"]; ok {
+		t.Fatalf("pre-ALTER RowAfter must not carry column b: %v", ev1.RowAfter)
+	}
+	mustDecode(t, d, &pglogrepl.CommitMessage{CommitLSN: txnLSN, CommitTime: txnTime})
+
+	// Mid-stream shape change: (id, a, b) — the RelationMessage PostgreSQL re-emits after
+	// ALTER TABLE t ADD COLUMN b. Same OID, a new column set.
+	mustDecode(t, d, relMsg(1, "public", "t", "id", "a", "b"))
+	mustDecode(t, d, beginMsg())
+
+	// The DISCRIMINATOR: decoding a 3-column tuple only succeeds if cacheRelation swapped
+	// to the new 3-column shape. Against the stale 2-column relation, decodeTuple errors
+	// with a column-count mismatch (mustDecode would t.Fatal). A passing decode that
+	// dropped column b would be caught by the assertions below.
+	ev2, emit2 := mustDecode(t, d, &pglogrepl.InsertMessage{
+		RelationID: 1, Tuple: tuple(textCol("2"), textCol("y"), textCol("z")),
+	})
+	if !emit2 {
+		t.Fatal("post-ALTER INSERT should emit")
+	}
+	if len(ev2.RowAfter) != 3 {
+		t.Fatalf("post-ALTER RowAfter should have 3 columns (shape swapped), got %v", ev2.RowAfter)
+	}
+	if ev2.RowAfter["id"] != "2" || ev2.RowAfter["a"] != "y" || ev2.RowAfter["b"] != "z" {
+		t.Fatalf("post-ALTER RowAfter = %v, want {id:2, a:y, b:z} (new column b present)", ev2.RowAfter)
+	}
+}
+
+// ─── TimescaleDB out-of-scope guard (#559) ─────────────────────────────────────
+
+// TestDecode_TimescaleChunk_WarnsOnce pins the #559 guard: a TimescaleDB hypertable
+// chunk relation (under _timescaledb_internal) is flagged so the operator knows capture
+// targets the raw chunk, not the logical hypertable — and the warning fires ONCE even
+// across many chunks, and never for an ordinary relation.
+func TestDecode_TimescaleChunk_WarnsOnce(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	d := pgcapture.NewDecoder(pkResolver("ts"), event.Filters{}, logger)
+
+	// Two distinct chunks of the same hypertable → two RelationMessages.
+	mustDecode(t, d, relMsg(10, "_timescaledb_internal", "_hyper_1_1_chunk", "ts", "v"))
+	mustDecode(t, d, relMsg(11, "_timescaledb_internal", "_hyper_1_2_chunk", "ts", "v"))
+
+	if n := strings.Count(buf.String(), "TimescaleDB hypertable chunk detected"); n != 1 {
+		t.Fatalf("want exactly ONE TimescaleDB warning across two chunks, got %d:\n%s", n, buf.String())
+	}
+
+	// An ordinary (non-chunk) relation must not warn.
+	buf.Reset()
+	mustDecode(t, d, relMsg(12, "public", "metrics", "ts", "v"))
+	if strings.Contains(buf.String(), "TimescaleDB") {
+		t.Fatalf("ordinary relation must not warn: %s", buf.String())
 	}
 }

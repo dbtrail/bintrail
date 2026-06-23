@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,7 +21,7 @@ const doctorTimeout = 30 * time.Second
 
 // dependentCheckNames are the checks BuildPGReport skips when wal_level is genuinely
 // not 'logical' — logical decoding is impossible, so they cannot meaningfully run.
-var dependentCheckNames = []string{"Publication coverage", "REPLICA IDENTITY FULL", "max_slot_wal_keep_size", "Replication slot health"}
+var dependentCheckNames = []string{"Publication coverage", "REPLICA IDENTITY FULL", "No UNLOGGED tables", "FK cascade-child coverage", "max_slot_wal_keep_size", "Replication slot health"}
 
 // PGDoctorConfig is the subset of stream settings a health check needs: a normal
 // (non-replication) connection to the source, the slot to inspect, and the
@@ -104,6 +105,8 @@ func BuildPGReport(ctx context.Context, cfg PGDoctorConfig) *doctor.Report {
 		r.Add(doctor.CheckResult{Name: "REPLICA IDENTITY FULL", Status: doctor.StatusPass})
 	}
 
+	addUnloggedCheck(ctx, r, conn, cfg.Publication)
+	addCascadeCoverageCheck(ctx, r, conn, cfg.Publication)
 	addKeepSizeCheck(ctx, r, conn)
 	addSlotHealthCheck(ctx, r, conn, cfg.SlotName)
 	return r
@@ -165,6 +168,70 @@ func keepSizeResult(setting string) doctor.CheckResult {
 		}
 	}
 	return doctor.CheckResult{Name: name, Status: doctor.StatusPass, Detail: setting}
+}
+
+// addUnloggedCheck reports UNLOGGED tables in the publication (#555). The mapping is
+// the pure unloggedResult; a query failure is a WARN (the guard is advisory).
+func addUnloggedCheck(ctx context.Context, r *doctor.Report, conn *pgx.Conn, publication string) {
+	unlogged, err := pgcapture.ListUnloggedPublishedTables(ctx, conn, publication)
+	if err != nil {
+		r.Add(doctor.CheckResult{Name: "No UNLOGGED tables", Status: doctor.StatusWarn, Detail: "could not check: " + err.Error()})
+		return
+	}
+	r.Add(unloggedResult(unlogged))
+}
+
+// unloggedResult maps the UNLOGGED-table list (#555). UNLOGGED tables write no WAL, so
+// logical decoding captures NONE of their changes — a silent recovery hole. It is a
+// WARN, not a FAIL: an operator may keep ephemeral data UNLOGGED on purpose, so this
+// surfaces the gap loudly without failing the command. Pure (no I/O) for unit testing.
+func unloggedResult(unlogged []string) doctor.CheckResult {
+	const name = "No UNLOGGED tables"
+	if len(unlogged) == 0 {
+		return doctor.CheckResult{Name: name, Status: doctor.StatusPass}
+	}
+	return doctor.CheckResult{
+		Name:   name,
+		Status: doctor.StatusWarn,
+		Detail: strings.Join(unlogged, ", "),
+		Remediation: "These tables are UNLOGGED: PostgreSQL writes no WAL for them, so logical decoding captures NONE of their changes and they cannot be recovered. " +
+			"If they hold recoverable data, convert them with ALTER TABLE <t> SET LOGGED. If they are intentionally ephemeral, this is expected.",
+	}
+}
+
+// addCascadeCoverageCheck reports FK cascade children whose parent is published but the
+// child is not (#556). The mapping is the pure cascadeCoverageResult; a query failure
+// is a WARN (the guard is advisory).
+func addCascadeCoverageCheck(ctx context.Context, r *doctor.Report, conn *pgx.Conn, publication string) {
+	children, err := pgcapture.ListUncoveredCascadeChildren(ctx, conn, publication)
+	if err != nil {
+		r.Add(doctor.CheckResult{Name: "FK cascade-child coverage", Status: doctor.StatusWarn, Detail: "could not check: " + err.Error()})
+		return
+	}
+	r.Add(cascadeCoverageResult(children))
+}
+
+// cascadeCoverageResult maps the uncovered-cascade-child list (#556). On PostgreSQL an
+// ON DELETE CASCADE/SET NULL rewrites the child via real WAL ops, so `recover` works IF
+// the child is captured; a published parent with an unpublished cascade child means
+// those cascade rewrites are silently lost. WARN (not FAIL): the child may be
+// intentionally out of recovery scope. Pure (no I/O) for unit testing.
+func cascadeCoverageResult(children []pgcapture.CascadeChild) doctor.CheckResult {
+	const name = "FK cascade-child coverage"
+	if len(children) == 0 {
+		return doctor.CheckResult{Name: name, Status: doctor.StatusPass}
+	}
+	parts := make([]string, len(children))
+	for i, ch := range children {
+		parts[i] = fmt.Sprintf("%s (%s from %s)", ch.Child, ch.Action, ch.Parent)
+	}
+	return doctor.CheckResult{
+		Name:   name,
+		Status: doctor.StatusWarn,
+		Detail: strings.Join(parts, "; "),
+		Remediation: "These cascade child tables are not in the publication while their parent is: a delete on the parent fires ON DELETE CASCADE/SET NULL/SET DEFAULT, rewriting the child — and that change is not captured, so it cannot be recovered. " +
+			"Add each child to the publication (ALTER PUBLICATION ... ADD TABLE ...) and set it to REPLICA IDENTITY FULL.",
+	}
 }
 
 // addSlotHealthCheck queries the slot's live state and adds its CheckResult. A query

@@ -156,6 +156,144 @@ func TestOne_EndToEnd_PostgresToIndexToRecovery(t *testing.T) {
 	}
 }
 
+// TestOne_DDLDrift_MidStreamAlter is the integration half of the #591 DDL-drift gate:
+// an ALTER TABLE ... ADD COLUMN mid-stream must (1) decode the post-ALTER row against
+// the NEW shape (the added column is captured), (2) stamp it with a NEW schema_version
+// than the pre-ALTER row (the Relation-message-driven re-snapshot — the PG analog of
+// the MySQL #396 auto-snapshot-on-DDL), and (3) still produce valid reversal SQL.
+// Logical decoding streams no DDL, so this proves the RelationMessage shape-swap
+// (decoder.cacheRelation) end-to-end on live PostgreSQL — the behavior the decoder unit
+// test TestDecode_RelationShapeChange_MidStream pins in isolation.
+//
+// CI-only: needs a live PostgreSQL source (BINTRAIL_TEST_PG_DSN) + MySQL index; the
+// MySQL-only CI jobs skip it (a green local `go test` without PG does NOT exercise it).
+func TestOne_DDLDrift_MidStreamAlter(t *testing.T) {
+	pgDSN := testutil.SkipIfNoPostgres(t)
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	indexDB, dbName := testutil.CreateTestDB(t)
+	indexDSN := testutil.BaseDSN() + "/" + dbName
+
+	const slot = "bintrail_pgsr_ddl"
+	const pub = "bintrail_pgsr_ddl_pub"
+	const tbl = "pgsr_ddl_t"
+
+	pg, err := pgx.Connect(ctx, pgDSN)
+	if err != nil {
+		t.Fatalf("connect PG: %v", err)
+	}
+	t.Cleanup(func() { pg.Close(context.Background()) })
+
+	dropAll := func() {
+		bg := context.Background()
+		_, _ = pg.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		_, _ = pg.Exec(bg, "DROP TABLE IF EXISTS "+tbl)
+		_, _ = pg.Exec(bg, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+	}
+	dropAll()
+	t.Cleanup(dropAll)
+
+	mustExec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pg.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+	mustExec(fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, a text)", tbl))
+	mustExec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", tbl))
+	mustExec(fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cfg := pgstreamrun.Config{
+		IndexDSN:    indexDSN,
+		ReplDSN:     replDSN(pgDSN),
+		QueryDSN:    pgDSN,
+		SlotName:    slot,
+		Publication: pub,
+		ServerID:    43,
+		Tables:      "public." + tbl,
+		BatchSize:   100,
+		Checkpoint:  200 * time.Millisecond,
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- pgstreamrun.One(runCtx, cfg) }()
+
+	waitFor(t, 15*time.Second, func() bool {
+		var active bool
+		if err := pg.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&active); err != nil {
+			return false
+		}
+		return active
+	}, "replication slot active")
+
+	// Pre-ALTER row against the (id, a) shape; wait until it is indexed so its
+	// RelationMessage (the first snapshot) is durably recorded before the ALTER.
+	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'x')", tbl))
+	waitFor(t, 15*time.Second, func() bool {
+		var n int
+		_ = indexDB.QueryRow("SELECT COUNT(*) FROM binlog_events WHERE table_name = ? AND pk_values = '1'", tbl).Scan(&n)
+		return n >= 1
+	}, "pre-ALTER INSERT indexed")
+
+	// Mid-stream DDL: add a column. pgoutput emits no DDL, but it DOES re-emit a fresh
+	// RelationMessage carrying the new shape before the next row event.
+	mustExec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN b text", tbl))
+	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (2, 'y', 'z')", tbl))
+	waitFor(t, 15*time.Second, func() bool {
+		var n int
+		_ = indexDB.QueryRow("SELECT COUNT(*) FROM binlog_events WHERE table_name = ? AND pk_values = '2'", tbl).Scan(&n)
+		return n >= 1
+	}, "post-ALTER INSERT indexed")
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("One returned error: %v", err)
+	}
+
+	// (1) The post-ALTER row decoded against the NEW shape: the added column is captured.
+	rows, err := query.New(indexDB).Fetch(ctx, query.Options{Schema: "public", Table: tbl, Order: "ASC"})
+	if err != nil {
+		t.Fatalf("query Fetch: %v", err)
+	}
+	var post *query.ResultRow
+	for i := range rows {
+		if rows[i].PKValues == "2" {
+			post = &rows[i]
+		}
+	}
+	if post == nil {
+		t.Fatal("post-ALTER row (pk=2) not indexed")
+	}
+	if got := post.RowAfter["b"]; got != "z" {
+		t.Errorf("post-ALTER RowAfter[b] = %v, want %q (added column captured against the swapped shape)", got, "z")
+	}
+
+	// (2) The re-snapshot: the post-ALTER row carries a DIFFERENT schema_version than the
+	// pre-ALTER row. Equal versions would mean the mid-stream ALTER was not re-snapshotted.
+	var svPre, svPost int
+	if err := indexDB.QueryRow("SELECT schema_version FROM binlog_events WHERE table_name=? AND pk_values='1'", tbl).Scan(&svPre); err != nil {
+		t.Fatalf("read pre-ALTER schema_version: %v", err)
+	}
+	if err := indexDB.QueryRow("SELECT schema_version FROM binlog_events WHERE table_name=? AND pk_values='2'", tbl).Scan(&svPost); err != nil {
+		t.Fatalf("read post-ALTER schema_version: %v", err)
+	}
+	if svPost == svPre {
+		t.Errorf("post-ALTER schema_version (%d) equals pre-ALTER (%d) — the mid-stream ALTER did not trigger a re-snapshot", svPost, svPre)
+	}
+
+	// (3) Recovery still produces valid reversal SQL across the mixed-shape rows.
+	var buf bytes.Buffer
+	n, err := recovery.New(indexDB, nil).GenerateSQLFromRows(rows, &buf)
+	if err != nil {
+		t.Fatalf("GenerateSQLFromRows: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("no reversal statements generated for the mixed-shape rows")
+	}
+}
+
 // TestOne_LostSlotResume_PersistsLossBadge is the #532 slice-4 proof: when a resume
 // finds the replication slot gone (WAL behind the checkpoint is irrecoverable), One
 // returns the ErrSlotMissingOnResume sentinel AND durably records the permanent loss

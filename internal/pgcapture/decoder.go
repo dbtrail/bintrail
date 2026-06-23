@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -51,6 +52,11 @@ type Decoder struct {
 
 	relations map[uint32]*relationInfo
 	txn       txnContext
+
+	// timescaleWarned makes the TimescaleDB out-of-scope guard (#559) warn ONCE per
+	// stream: a busy hypertable has many chunk relations, and one warning per chunk
+	// would flood the log.
+	timescaleWarned bool
 }
 
 // DecoderOption configures optional Decoder dependencies without churning the
@@ -185,6 +191,21 @@ func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
 // again after a relation's shape changes, so this doubles as cache invalidation —
 // the analog of the MySQL parser's SwapResolver-on-DDL.
 func (d *Decoder) cacheRelation(m *pglogrepl.RelationMessage) error {
+	// TimescaleDB out-of-scope guard (#559): a hypertable's data lives in physical
+	// CHUNK tables (_hyper_<id>_<n>_chunk) under the _timescaledb_internal schema, and
+	// pgoutput streams those chunk relations by their physical names — so bintrail would
+	// index changes under _timescaledb_internal._hyper_* rather than the logical
+	// hypertable (a decode-granularity mismatch). We do NOT silently skip them, but the
+	// operator MUST know the captured target is the chunk, not the parent table — warn
+	// once, before the RI check below so the signal survives even if the chunk is not at
+	// FULL. This is BEFORE the cache write: the warning is about target identity, not a
+	// reason to stop.
+	if !d.timescaleWarned && isTimescaleChunk(m.Namespace, m.RelationName) {
+		d.logger.Warn("pgcapture: TimescaleDB hypertable chunk detected — bintrail indexes raw chunk relations under _timescaledb_internal, NOT the logical hypertable; TimescaleDB is out of scope (decode-granularity mismatch)",
+			"schema", m.Namespace, "table", m.RelationName)
+		d.timescaleWarned = true
+	}
+
 	// REPLICA IDENTITY FULL enforcement at the LIVE boundary, not just startup: a
 	// table added to a FOR ALL TABLES publication after Run started (or any mid-stream
 	// new relation) arrives here as a fresh RelationMessage at PostgreSQL's default
@@ -268,6 +289,17 @@ func (d *Decoder) cacheRelation(m *pglogrepl.RelationMessage) error {
 		pkCols:  pkCols,
 	}
 	return nil
+}
+
+// isTimescaleChunk reports whether a relation is a TimescaleDB hypertable chunk — the
+// internal physical tables (_hyper_<id>_<n>_chunk, or _dist_hyper_* for distributed
+// hypertables) under the _timescaledb_internal schema that pgoutput streams in place
+// of the logical hypertable. Used by the #559 out-of-scope guard. (TimescaleDB's
+// catalog/config schemas — _timescaledb_catalog, _timescaledb_config — are not chunk
+// data and are not flagged here.)
+func isTimescaleChunk(schema, table string) bool {
+	return schema == "_timescaledb_internal" &&
+		(strings.HasPrefix(table, "_hyper_") || strings.HasPrefix(table, "_dist_hyper_"))
 }
 
 // relationEvent builds an EventRelation carrying the relation's shape for the
