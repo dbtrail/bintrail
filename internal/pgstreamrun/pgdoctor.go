@@ -11,6 +11,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/doctor"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/pgcapture"
 )
 
@@ -105,7 +106,7 @@ func BuildPGReport(ctx context.Context, cfg PGDoctorConfig) *doctor.Report {
 		r.Add(doctor.CheckResult{Name: "REPLICA IDENTITY FULL", Status: doctor.StatusPass})
 	}
 
-	addUnloggedCheck(ctx, r, conn, cfg.Publication)
+	addUnloggedCheck(ctx, r, conn, cfg.Publication, filters)
 	addCascadeCoverageCheck(ctx, r, conn, cfg.Publication)
 	addKeepSizeCheck(ctx, r, conn)
 	addSlotHealthCheck(ctx, r, conn, cfg.SlotName)
@@ -172,8 +173,8 @@ func keepSizeResult(setting string) doctor.CheckResult {
 
 // addUnloggedCheck reports UNLOGGED tables in the publication (#555). The mapping is
 // the pure unloggedResult; a query failure is a WARN (the guard is advisory).
-func addUnloggedCheck(ctx context.Context, r *doctor.Report, conn *pgx.Conn, publication string) {
-	unlogged, err := pgcapture.ListUnloggedPublishedTables(ctx, conn, publication)
+func addUnloggedCheck(ctx context.Context, r *doctor.Report, conn *pgx.Conn, publication string, filters event.Filters) {
+	unlogged, err := pgcapture.ListUnloggedCaptureTables(ctx, conn, publication, filters)
 	if err != nil {
 		r.Add(doctor.CheckResult{Name: "No UNLOGGED tables", Status: doctor.StatusWarn, Detail: "could not check: " + err.Error()})
 		return

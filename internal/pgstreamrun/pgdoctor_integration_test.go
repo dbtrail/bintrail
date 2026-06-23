@@ -180,3 +180,96 @@ func TestBuildPGReport_LostSlot_Integration(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildPGReport_CoverageWarnings_Integration drives the two new advisory coverage
+// guards against live PostgreSQL — the catalog QUERIES themselves (listUnloggedCapture
+// Tables #555, listUncoveredCascadeChildren #556 incl. cascadeAction), which the pure
+// result-mapper unit tests cannot reach. The #555 query in particular MUST go through
+// pg_class (an UNLOGGED table is never in pg_publication_tables), so a live assertion is
+// the only thing that proves it actually fires.
+//
+// Requires BINTRAIL_TEST_PG_DSN; the MySQL CI jobs leave it unset and skip cleanly.
+func TestBuildPGReport_CoverageWarnings_Integration(t *testing.T) {
+	dsn := testutil.SkipIfNoPostgres(t)
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { conn.Close(context.Background()) })
+
+	mustExec := func(sql string) {
+		t.Helper()
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+
+	t.Run("unlogged-under-for-all-tables", func(t *testing.T) {
+		// #555: an UNLOGGED table is invisible to pg_publication_tables but real on
+		// pg_class; under FOR ALL TABLES the operator believes it is captured. The guard
+		// must scan pg_class and WARN. A Tables filter scopes the assertion to our table
+		// (so any unrelated UNLOGGED table on the dev server can't perturb it).
+		const pub = "bintrail_cov_all_pub"
+		const ult = "doctor_cov_unlogged"
+		dropAll := func() {
+			bg := context.Background()
+			_, _ = conn.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+			_, _ = conn.Exec(bg, "DROP TABLE IF EXISTS "+ult)
+		}
+		dropAll()
+		t.Cleanup(dropAll)
+
+		mustExec("CREATE UNLOGGED TABLE " + ult + " (id int PRIMARY KEY, v text)")
+		mustExec("CREATE PUBLICATION " + pub + " FOR ALL TABLES")
+
+		r := pgstreamrun.BuildPGReport(ctx, pgstreamrun.PGDoctorConfig{
+			QueryDSN: dsn, SlotName: "bintrail_cov_all_slot", Publication: pub,
+			Tables: "public." + ult,
+		})
+		c := findCheck(t, r, "No UNLOGGED tables")
+		if c.Status != doctor.StatusWarn {
+			t.Errorf("No UNLOGGED tables = %s (%s), want warn", c.Status, c.Detail)
+		}
+		if !strings.Contains(c.Detail, ult) {
+			t.Errorf("detail should name the UNLOGGED table %q, got %q", ult, c.Detail)
+		}
+	})
+
+	t.Run("uncovered-cascade-child", func(t *testing.T) {
+		// #556: a published parent whose ON DELETE CASCADE child is NOT published — the
+		// cascade rewrites on the child would be silently lost. The guard must WARN and
+		// name the child, the action, and the parent (exercises cascadeAction too).
+		const pub = "bintrail_cov_tbl_pub"
+		const parent = "doctor_cov_parent"
+		const child = "doctor_cov_child"
+		dropAll := func() {
+			bg := context.Background()
+			_, _ = conn.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+			_, _ = conn.Exec(bg, "DROP TABLE IF EXISTS "+child) // child first (FK)
+			_, _ = conn.Exec(bg, "DROP TABLE IF EXISTS "+parent)
+		}
+		dropAll()
+		t.Cleanup(dropAll)
+
+		mustExec("CREATE TABLE " + parent + " (id int PRIMARY KEY)")
+		mustExec("ALTER TABLE " + parent + " REPLICA IDENTITY FULL")
+		mustExec("CREATE TABLE " + child + " (id int PRIMARY KEY, pid int REFERENCES " + parent + "(id) ON DELETE CASCADE)")
+		mustExec("ALTER TABLE " + child + " REPLICA IDENTITY FULL")
+		mustExec("CREATE PUBLICATION " + pub + " FOR TABLE " + parent) // child intentionally omitted
+
+		r := pgstreamrun.BuildPGReport(ctx, pgstreamrun.PGDoctorConfig{
+			QueryDSN: dsn, SlotName: "bintrail_cov_tbl_slot", Publication: pub,
+		})
+		c := findCheck(t, r, "FK cascade-child coverage")
+		if c.Status != doctor.StatusWarn {
+			t.Errorf("FK cascade-child coverage = %s (%s), want warn", c.Status, c.Detail)
+		}
+		for _, want := range []string{child, "ON DELETE CASCADE", parent} {
+			if !strings.Contains(c.Detail, want) {
+				t.Errorf("detail should mention %q, got %q", want, c.Detail)
+			}
+		}
+	})
+}

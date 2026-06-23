@@ -707,3 +707,25 @@ func TestDecode_TimescaleChunk_WarnsOnce(t *testing.T) {
 		t.Fatalf("ordinary relation must not warn: %s", buf.String())
 	}
 }
+
+// TestDecode_TimescaleChunk_WarnsBeforeReplicaIdentityAbort locks the warn-BEFORE-RI
+// ordering (#559): a chunk relation that is NOT at REPLICA IDENTITY FULL must still emit
+// the out-of-scope warning before cacheRelation's RI-FULL check aborts decoding. The
+// warn is placed first deliberately so the operator gets the TimescaleDB signal even
+// when the chunk is rejected; a future refactor moving the warn below the RI check would
+// silently regress this, so pin it.
+func TestDecode_TimescaleChunk_WarnsBeforeReplicaIdentityAbort(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	d := pgcapture.NewDecoder(pkResolver("ts"), event.Filters{}, logger)
+
+	rel := relMsg(10, "_timescaledb_internal", "_hyper_1_1_chunk", "ts", "v")
+	rel.ReplicaIdentity = 'd' // NOT full → cacheRelation will abort
+	_, _, err := d.Decode(rel)
+	if err == nil {
+		t.Fatal("expected a REPLICA IDENTITY FULL error for a non-FULL chunk relation")
+	}
+	if !strings.Contains(buf.String(), "TimescaleDB hypertable chunk detected") {
+		t.Fatalf("the TimescaleDB warning must fire BEFORE the RI-FULL abort, got:\n%s", buf.String())
+	}
+}

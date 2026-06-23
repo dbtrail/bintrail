@@ -195,15 +195,20 @@ func (c *Capturer) Run(ctx context.Context, out chan<- event.Event) error {
 // logged at debug and never blocks the stream — these are advisory, and the same
 // catalog state is also reported by `bintrail-pg doctor`.
 func (c *Capturer) warnCaptureCoverage(ctx context.Context, conn *pgx.Conn) {
-	if unlogged, err := listUnloggedPublishedTables(ctx, conn, c.cfg.Publication); err != nil {
-		c.logger.Debug("pgcapture: could not check for UNLOGGED tables", "error", err)
+	// A probe FAILURE is itself surfaced as a WARN, not swallowed at Debug: at the
+	// default --log-level=info a Debug line is invisible, so downgrading the failure
+	// would silently disable the very guard this function exists to provide — the exact
+	// silent-failure class #555/#556 close. Visibility matches the doctor side, which
+	// also maps a probe failure to a WARN.
+	if unlogged, err := listUnloggedCaptureTables(ctx, conn, c.cfg.Publication, c.cfg.Filters); err != nil {
+		c.logger.Warn("pgcapture: UNLOGGED-table coverage check failed to run — could NOT determine whether a captured table writes no WAL (a silent recovery hole); run `bintrail-pg doctor` to re-check", "error", err)
 	} else if len(unlogged) > 0 {
-		c.logger.Warn("pgcapture: UNLOGGED table(s) in the publication produce no WAL — their changes are NOT captured and cannot be recovered (ALTER TABLE <t> SET LOGGED if you need them)",
+		c.logger.Warn("pgcapture: UNLOGGED table(s) in capture scope produce no WAL — their changes are NOT captured and cannot be recovered (ALTER TABLE <t> SET LOGGED if you need them)",
 			"tables", strings.Join(unlogged, ", "))
 	}
 
 	if children, err := listUncoveredCascadeChildren(ctx, conn, c.cfg.Publication); err != nil {
-		c.logger.Debug("pgcapture: could not check FK cascade-child coverage", "error", err)
+		c.logger.Warn("pgcapture: FK cascade-child coverage check failed to run — could NOT determine whether a cascade child is unpublished (cascade deletes would be silently lost); run `bintrail-pg doctor` to re-check", "error", err)
 	} else {
 		for _, ch := range children {
 			c.logger.Warn("pgcapture: FK cascade child is NOT in the publication — cascade deletes from its parent are not captured and cannot be recovered (add it to the publication)",
