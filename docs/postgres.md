@@ -184,9 +184,9 @@ bintrail-pg doctor --query-dsn "$PG" --slot bintrail_shop --publication bintrail
 
 - **`max_slot_wal_keep_size`** → WARN while unlimited (`-1`); set a bound to clear it.
 - **Replication slot health** → shows `wal_status` and how much WAL the slot is
-  retaining. The status progresses `reserved` → `extended` → `unreserved` →
-  `lost`; a `lost` (invalidated) slot is a loud **FAIL** with the re-baseline
-  recovery path.
+  retaining. The status progresses `reserved` (PASS) → `extended` / `unreserved`
+  (**WARN** — retaining WAL and approaching the limit; doctor still exits 0) →
+  `lost` (a loud **FAIL** with the re-baseline recovery path).
 
 A permanently-lost stream is also recorded durably: once a slot is invalidated or
 dropped out from under a running capture, `bintrail status` shows a loud

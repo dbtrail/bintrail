@@ -229,15 +229,16 @@ func slotHealthResult(h pgcapture.SlotHealth, slotName string) doctor.CheckResul
 }
 
 // lostSlotRemediation frames the lost-slot recovery path: capture is broken, but the
-// index (and therefore recovery) is not. The manual re-baseline SQL mirrors the
-// docs; the `bintrail-pg reset` convenience command is a later slice (#532).
+// index (and therefore recovery) is not. It points at `bintrail-pg reset`, which does
+// the dual-plane teardown (drop slot + clear checkpoint), with the manual SQL kept as
+// the under-the-hood explanation.
 func lostSlotRemediation(slotName string) string {
 	return "The replication slot is invalidated — the WAL it needs is gone, so capture cannot resume.\n" +
 		"The index is still fully usable for recovery (recovery never needs the slot).\n" +
 		"To resume capture you must re-baseline:\n" +
-		fmt.Sprintf("  1. on the source:  SELECT pg_drop_replication_slot('%s');\n", slotName) +
-		"  2. on the index:   DELETE FROM stream_state WHERE id = 1;\n" +
-		"  3. re-seed the baseline, then re-run `bintrail-pg stream`\n" +
+		fmt.Sprintf("  1. bintrail-pg reset --query-dsn <pg> --index-dsn <idx> --slot %s --force\n", slotName) +
+		"     (drops the slot on the source + clears the index checkpoint; --index-only if the slot is already gone)\n" +
+		"  2. re-seed the baseline, then re-run `bintrail-pg stream`\n" +
 		"Prevent recurrence: raise max_slot_wal_keep_size and keep the consumer running."
 }
 

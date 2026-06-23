@@ -48,7 +48,7 @@ func TestSlotHealthResult_lostHasRecoveryPath(t *testing.T) {
 	if got.Status != doctor.StatusFail {
 		t.Fatalf("lost slot must FAIL, got %q", got.Status)
 	}
-	for _, want := range []string{"pg_drop_replication_slot('s1')", "DELETE FROM stream_state", "recovery never needs the slot"} {
+	for _, want := range []string{"bintrail-pg reset", "--slot s1", "recovery never needs the slot"} {
 		if !strings.Contains(got.Remediation, want) {
 			t.Errorf("lost remediation missing %q:\n%s", want, got.Remediation)
 		}

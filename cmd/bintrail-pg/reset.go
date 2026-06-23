@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -88,54 +91,100 @@ func runPGReset(cmd *cobra.Command, args []string) error {
 		return errors.New("refusing to run a destructive teardown without --force — it drops the replication slot and clears the index checkpoint (recovery data is unaffected)")
 	}
 
-	ctx := cmd.Context()
-
-	// 1. Drop the slot on the source FIRST (unless --index-only). Ordering matters: a
-	//    half-failure then leaves "slot gone, checkpoint stale → next stream fails loud",
-	//    not "checkpoint cleared, slot live → silent skip".
-	if pgResetIndexOnly {
-		fmt.Fprintln(os.Stdout, "--index-only: leaving the source replication slot untouched.")
-	} else {
+	// Bind the two destructive steps as closures over the live connections, then run
+	// the (seam-injected, unit-tested) orchestration. The connections are opened lazily
+	// inside the closures so resetPlan owns the ordering: the SOURCE slot is dropped
+	// before the INDEX is touched at all.
+	dropFn := func(ctx context.Context) (bool, error) {
 		conn, err := pgx.Connect(ctx, pgResetQueryDSN)
 		if err != nil {
-			return fmt.Errorf("connect to source: %w", err)
+			return false, fmt.Errorf("connect to source: %w", err)
 		}
-		dropped, dropErr := pgcapture.DropSlot(ctx, conn, pgResetSlot)
-		conn.Close(ctx)
-		if dropErr != nil {
-			return fmt.Errorf("%w\n(if the slot is active, stop the running `bintrail-pg stream` first, or use --index-only if the slot is already gone)", dropErr)
+		defer conn.Close(ctx)
+		return pgcapture.DropSlot(ctx, conn, pgResetSlot)
+	}
+	clearFn := func(ctx context.Context) (int64, bool, error) {
+		idx, err := config.Connect(pgResetIndexDSN)
+		if err != nil {
+			return 0, false, fmt.Errorf("connect to index: %w", err)
 		}
+		defer idx.Close()
+		return clearCheckpoint(ctx, idx)
+	}
+	return resetPlan(cmd.Context(), pgResetIndexOnly, pgResetSlot, os.Stdout, dropFn, clearFn)
+}
+
+// resetPlan is the orchestration core of `bintrail-pg reset`, injected with the two
+// teardown steps so the ordering and partial-failure handling are unit-testable without
+// live databases.
+//
+// Ordering is the safety invariant: the SOURCE slot is dropped FIRST, then the INDEX
+// checkpoint is cleared. A failure between them leaves "slot gone, checkpoint stale →
+// next stream fails loud", never "checkpoint cleared, slot live → silent skip". If the
+// clear fails after the slot was already dropped, the error says so and points at
+// --index-only to finish.
+func resetPlan(
+	ctx context.Context,
+	indexOnly bool,
+	slot string,
+	out io.Writer,
+	dropFn func(context.Context) (bool, error),
+	clearFn func(context.Context) (rows int64, tableMissing bool, err error),
+) error {
+	slotHandled := false
+	if indexOnly {
+		fmt.Fprintln(out, "--index-only: leaving the source replication slot untouched.")
+	} else {
+		dropped, err := dropFn(ctx)
+		if err != nil {
+			return fmt.Errorf("%w\n(if the slot is active, stop the running `bintrail-pg stream` first, or use --index-only if the slot is already gone)", err)
+		}
+		slotHandled = true
 		if dropped {
-			fmt.Fprintf(os.Stdout, "Dropped replication slot %q on the source.\n", pgResetSlot)
+			fmt.Fprintf(out, "Dropped replication slot %q on the source.\n", slot)
 		} else {
-			fmt.Fprintf(os.Stdout, "Replication slot %q was already absent.\n", pgResetSlot)
+			fmt.Fprintf(out, "Replication slot %q was already absent.\n", slot)
 		}
 	}
 
-	// 2. Clear the index checkpoint.
-	idx, err := config.Connect(pgResetIndexDSN)
+	rows, tableMissing, err := clearFn(ctx)
 	if err != nil {
-		return fmt.Errorf("connect to index: %w", err)
-	}
-	defer idx.Close()
-	res, err := idx.ExecContext(ctx, "DELETE FROM stream_state WHERE id = 1")
-	if err != nil {
-		if isTableMissingErr(err) {
-			// A never-streamed index: nothing to clear.
-			fmt.Fprintln(os.Stdout, "No index checkpoint to clear (stream_state table absent).")
-			fmt.Fprintln(os.Stdout, "Done.")
-			return nil
+		if slotHandled {
+			// The source slot is already gone; tell the operator how to finish so they
+			// don't have to reason about the half-completed state.
+			return fmt.Errorf("clearing the index checkpoint: %w\n(the source slot was already dropped; once the index is reachable, re-run with --index-only to finish)", err)
 		}
 		return fmt.Errorf("clearing the index checkpoint: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	fmt.Fprintf(os.Stdout, "Cleared %d index checkpoint row(s).\n", n)
-	fmt.Fprintln(os.Stdout, "Done. Re-seed the baseline, then run `bintrail-pg stream` to start fresh.")
+	if tableMissing {
+		// 1146 also fires when --index-dsn points at the wrong database, so don't claim
+		// success unconditionally — name the ambiguity.
+		fmt.Fprintln(out, "No stream_state table in this index — either it was never streamed, or --index-dsn points at the wrong database. Nothing cleared.")
+		fmt.Fprintln(out, "Done.")
+		return nil
+	}
+	fmt.Fprintf(out, "Cleared %d index checkpoint row(s).\n", rows)
+	fmt.Fprintln(out, "Done. Re-seed the baseline, then run `bintrail-pg stream` to start fresh.")
 	return nil
 }
 
+// clearCheckpoint deletes the stream_state checkpoint row. It returns tableMissing=true
+// with a nil error when the stream_state table does not exist (MySQL 1146) — a
+// never-streamed index, or an --index-dsn pointing at the wrong database.
+func clearCheckpoint(ctx context.Context, db *sql.DB) (rows int64, tableMissing bool, err error) {
+	res, err := db.ExecContext(ctx, "DELETE FROM stream_state WHERE id = 1")
+	if err != nil {
+		if isTableMissingErr(err) {
+			return 0, true, nil
+		}
+		return 0, false, err
+	}
+	n, _ := res.RowsAffected()
+	return n, false, nil
+}
+
 // isTableMissingErr reports whether err is MySQL error 1146 (ER_NO_SUCH_TABLE), i.e.
-// the index has no stream_state table yet (never streamed) — nothing to reset.
+// the target has no stream_state table (never streamed, or wrong database).
 func isTableMissingErr(err error) bool {
 	var me *mysql.MySQLError
 	return errors.As(err, &me) && me.Number == 1146

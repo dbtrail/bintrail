@@ -354,6 +354,77 @@ func TestOne_LostSlot_FirstRun_SeedsLossBadge(t *testing.T) {
 	}
 }
 
+// TestDropSlot_ActiveSlotErrors covers DropSlot's safety branch: while a capture is
+// running and holds the slot, DropSlot must fail loud ("replication slot is active for
+// PID N") rather than silently no-op — so `bintrail-pg reset` tells the operator to
+// stop the stream first. A running One provides the live consumer.
+func TestDropSlot_ActiveSlotErrors(t *testing.T) {
+	pgDSN := testutil.SkipIfNoPostgres(t)
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	_, dbName := testutil.CreateTestDB(t) // One bootstraps the index tables itself
+	indexDSN := testutil.BaseDSN() + "/" + dbName
+
+	const slot = "bintrail_activedrop_it"
+	const pub = "bintrail_activedrop_it_pub"
+	const tbl = "activedrop_it_t"
+
+	pg, err := pgx.Connect(ctx, pgDSN)
+	if err != nil {
+		t.Fatalf("connect PG: %v", err)
+	}
+	t.Cleanup(func() { pg.Close(context.Background()) })
+	dropAll := func() {
+		bg := context.Background()
+		_, _ = pg.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		_, _ = pg.Exec(bg, "DROP TABLE IF EXISTS "+tbl)
+		_, _ = pg.Exec(bg, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+	}
+	dropAll()
+	t.Cleanup(dropAll)
+	for _, ddl := range []string{
+		fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, v text)", tbl),
+		fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", tbl),
+		fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl),
+	} {
+		if _, err := pg.Exec(ctx, ddl); err != nil {
+			t.Fatalf("exec %q: %v", ddl, err)
+		}
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- pgstreamrun.One(runCtx, pgstreamrun.Config{
+			IndexDSN: indexDSN, ReplDSN: replDSN(pgDSN), QueryDSN: pgDSN,
+			SlotName: slot, Publication: pub, ServerID: 53,
+			Tables: "public." + tbl, BatchSize: 100, Checkpoint: 200 * time.Millisecond,
+		})
+	}()
+	waitFor(t, 15*time.Second, func() bool {
+		var active bool
+		if err := pg.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&active); err != nil {
+			return false
+		}
+		return active
+	}, "replication slot active")
+
+	// A separate connection tries to drop the in-use slot — PostgreSQL refuses.
+	conn, err := pgx.Connect(ctx, pgDSN)
+	if err != nil {
+		t.Fatalf("connect drop conn: %v", err)
+	}
+	_, dropErr := pgcapture.DropSlot(ctx, conn, slot)
+	conn.Close(ctx)
+	if dropErr == nil || !strings.Contains(dropErr.Error(), "active") {
+		t.Errorf("DropSlot on an active slot = %v, want an 'active' error", dropErr)
+	}
+
+	cancel()
+	<-runErr
+}
+
 // TestOne_CapturerFailureSurfaces proves the cancellation bridge in One: when the
 // capturer fails on its own (here: a non-existent publication makes cap.Run return
 // before streaming), One must surface that error PROMPTLY rather than hang forever
