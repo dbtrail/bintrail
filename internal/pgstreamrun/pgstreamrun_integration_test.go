@@ -259,6 +259,101 @@ func TestOne_LostSlotResume_PersistsLossBadge(t *testing.T) {
 	}
 }
 
+// TestOne_LostSlot_FirstRun_SeedsLossBadge is the CRITICAL-review repro: a slot detected
+// lost (wal_status=lost) on a run with NO prior checkpoint row must still record the
+// permanent loss — persistSlotLostPG UPSERTs, seeding a complete stream_state row, so the
+// badge appears (a bare UPDATE would match zero rows and be silent). It also covers the
+// ErrSlotLost arm end-to-end through One (the ErrSlotMissingOnResume arm is the resume
+// test above). max_slot_wal_keep_size is server-wide; CI runs PG packages -p 1 and this
+// test is non-parallel, and t.Cleanup resets it even on failure.
+func TestOne_LostSlot_FirstRun_SeedsLossBadge(t *testing.T) {
+	pgDSN := testutil.SkipIfNoPostgres(t)
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	indexDB, dbName := testutil.CreateTestDB(t)
+	indexDSN := testutil.BaseDSN() + "/" + dbName
+
+	const slot = "bintrail_lostfirst_it"
+	const pub = "bintrail_lostfirst_it_pub"
+	const tbl = "lostfirst_it_t"
+
+	pg, err := pgx.Connect(ctx, pgDSN)
+	if err != nil {
+		t.Fatalf("connect PG: %v", err)
+	}
+	t.Cleanup(func() { pg.Close(context.Background()) })
+
+	mustExec := func(sql string) {
+		t.Helper()
+		if _, err := pg.Exec(ctx, sql); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+	t.Cleanup(func() {
+		bg := context.Background()
+		_, _ = pg.Exec(bg, "ALTER SYSTEM RESET max_slot_wal_keep_size")
+		_, _ = pg.Exec(bg, "SELECT pg_reload_conf()")
+		_, _ = pg.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		_, _ = pg.Exec(bg, "DROP TABLE IF EXISTS "+tbl)
+		_, _ = pg.Exec(bg, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+	})
+	// Start clean.
+	_, _ = pg.Exec(ctx, "DROP PUBLICATION IF EXISTS "+pub)
+	_, _ = pg.Exec(ctx, "DROP TABLE IF EXISTS "+tbl)
+	_, _ = pg.Exec(ctx, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+
+	mustExec(fmt.Sprintf("CREATE TABLE %s (id serial PRIMARY KEY, pad text)", tbl))
+	mustExec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", tbl))
+	mustExec(fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl))
+
+	// Bound retention, create an idle slot, churn WAL past the bound → next checkpoint
+	// invalidates it (wal_status=lost).
+	mustExec("ALTER SYSTEM SET max_slot_wal_keep_size = '1MB'")
+	mustExec("SELECT pg_reload_conf()")
+	mustExec(fmt.Sprintf("SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slot))
+	lost := false
+	for i := 0; i < 10 && !lost; i++ {
+		mustExec(fmt.Sprintf("INSERT INTO %s (pad) SELECT repeat('x', 900) FROM generate_series(1, 4000)", tbl))
+		mustExec("SELECT pg_switch_wal()")
+		mustExec("CHECKPOINT")
+		var status string
+		if err := pg.QueryRow(ctx, "SELECT wal_status FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&status); err != nil {
+			t.Fatalf("read wal_status: %v", err)
+		}
+		lost = status == "lost"
+	}
+	if !lost {
+		t.Skip("could not drive the slot to wal_status=lost on this server; skipping")
+	}
+
+	// First run with NO prior checkpoint row: ensureSlot detects the lost slot and One
+	// must fail loud AND seed the loss record (the upsert, not a no-op UPDATE).
+	runCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	err = pgstreamrun.One(runCtx, pgstreamrun.Config{
+		IndexDSN: indexDSN, ReplDSN: replDSN(pgDSN), QueryDSN: pgDSN,
+		SlotName: slot, Publication: pub, ServerID: 52,
+		Tables: "public." + tbl, BatchSize: 100, Checkpoint: 200 * time.Millisecond,
+	})
+	if !errors.Is(err, pgcapture.ErrSlotLost) {
+		t.Fatalf("first-run lost slot: One returned %v, want ErrSlotLost", err)
+	}
+
+	st, err := status.LoadStreamState(ctx, indexDB)
+	if err != nil {
+		t.Fatalf("LoadStreamState: %v", err)
+	}
+	if st == nil || !st.GapLostAt.Valid {
+		t.Fatalf("gap_lost_at not seeded after a first-run lost slot (the CRITICAL no-op): %+v", st)
+	}
+	var buf bytes.Buffer
+	status.WriteStatus(&buf, nil, nil, nil, nil, nil, st)
+	if !strings.Contains(buf.String(), "EVENTS PERMANENTLY LOST") {
+		t.Errorf("status does not show the permanent-loss badge:\n%s", buf.String())
+	}
+}
+
 // TestOne_CapturerFailureSurfaces proves the cancellation bridge in One: when the
 // capturer fails on its own (here: a non-existent publication makes cap.Run return
 // before streaming), One must surface that error PROMPTLY rather than hang forever

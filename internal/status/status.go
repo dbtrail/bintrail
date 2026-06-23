@@ -14,6 +14,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // IndexStateRow holds one row from the index_state table.
@@ -85,7 +87,9 @@ type StreamStateInfo struct {
 	// GapLostAt / GapLostDetail record that the stream permanently lost data it could
 	// not recover — an unfillable binlog gap (MySQL) or an invalidated/lost replication
 	// slot (PostgreSQL, #532). When set, the index is valid only up to the gap and
-	// capture must be re-baselined to resume; status surfaces them loudly.
+	// capture must be re-baselined to resume; status surfaces them loudly. GapLostAt is
+	// authoritative (the badge is gated on it alone); GapLostDetail is supplementary
+	// human-readable context and may be absent. Both writers set them atomically.
 	GapLostAt     sql.NullTime
 	GapLostDetail sql.NullString
 }
@@ -320,6 +324,13 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 		&s.EventsIndexed, &s.LastEventTime, &s.LastCheckpoint,
 		&s.ServerID, &s.BintrailID, &s.GapLostAt, &s.GapLostDetail,
 	)
+	// A legacy index predating the gap_lost_* columns (added by the cascade-recovery
+	// work), read before any migrating command (EnsureSchema) ran — the console never
+	// migrates registry DSNs — lacks those columns. Degrade gracefully to the base
+	// columns rather than erroring `status`; such an index simply has no loss record.
+	if isUnknownColumnErr(err) {
+		return loadStreamStateBase(ctx, db)
+	}
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -327,6 +338,37 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 		return nil, err
 	}
 	return &s, nil
+}
+
+// loadStreamStateBase loads the stream_state columns guaranteed by the original CREATE
+// TABLE (no gap_lost_*), for a legacy index that has not been migrated. The gap-loss
+// fields stay zero (no badge).
+func loadStreamStateBase(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) {
+	var s StreamStateInfo
+	err := db.QueryRowContext(ctx, `
+		SELECT mode, binlog_file, binlog_position, gtid_set,
+		       events_indexed, last_event_time, last_checkpoint,
+		       server_id, bintrail_id
+		FROM stream_state
+		WHERE id = 1`).Scan(
+		&s.Mode, &s.BinlogFile, &s.BinlogPosition, &s.GTIDSet,
+		&s.EventsIndexed, &s.LastEventTime, &s.LastCheckpoint,
+		&s.ServerID, &s.BintrailID,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// isUnknownColumnErr reports whether err is MySQL error 1054 (ER_BAD_FIELD_ERROR,
+// "Unknown column"), i.e. the index schema predates a column this build SELECTs.
+func isUnknownColumnErr(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1054
 }
 
 // StatusData holds all data sections loaded by CollectStatus.

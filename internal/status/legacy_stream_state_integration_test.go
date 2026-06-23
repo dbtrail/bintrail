@@ -1,0 +1,49 @@
+//go:build integration
+
+package status_test
+
+import (
+	"context"
+	"testing"
+
+	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/status"
+	"github.com/dbtrail/dbtrail/internal/testutil"
+)
+
+// TestLoadStreamState_LegacyIndexMissingGapColumns pins the #586 graceful fallback: a
+// pre-cascade index lacking gap_lost_at/gap_lost_detail — read before any migrating
+// command ran EnsureSchema (the console never migrates registry DSNs) — must NOT error
+// `status`. LoadStreamState falls back to the base columns and reports no loss record.
+func TestLoadStreamState_LegacyIndexMissingGapColumns(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+	db, _ := testutil.CreateTestDB(t)
+	if err := indexer.CreateIndexTables(ctx, db, 4, false, nil); err != nil {
+		t.Fatalf("CreateIndexTables: %v", err)
+	}
+	// Simulate a legacy index: drop the columns the cascade-recovery work added.
+	if _, err := db.ExecContext(ctx, "ALTER TABLE stream_state DROP COLUMN gap_lost_at, DROP COLUMN gap_lost_detail"); err != nil {
+		t.Fatalf("drop gap columns: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO stream_state (id, mode, server_id, last_checkpoint) VALUES (1, 'gtid', 7, UTC_TIMESTAMP())"); err != nil {
+		t.Fatalf("seed base row: %v", err)
+	}
+
+	st, err := status.LoadStreamState(ctx, db)
+	if err != nil {
+		t.Fatalf("LoadStreamState must not error on a legacy index, got: %v", err)
+	}
+	if st == nil {
+		t.Fatal("expected the base row, got nil")
+	}
+	if st.ServerID != 7 || st.Mode != "gtid" {
+		t.Errorf("base columns not loaded after fallback: %+v", st)
+	}
+	if st.GapLostAt.Valid {
+		t.Errorf("a legacy index has no gap-loss record; GapLostAt should be invalid, got %v", st.GapLostAt)
+	}
+}

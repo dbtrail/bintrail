@@ -156,7 +156,7 @@ func One(ctx context.Context, cfg Config) error {
 		// fatal error) so index-only `status` shows the loud badge even after we exit —
 		// otherwise the only trace is this one log line. Reuses the gap_lost_* columns.
 		if errors.Is(capErr, pgcapture.ErrSlotLost) || errors.Is(capErr, pgcapture.ErrSlotMissingOnResume) {
-			persistSlotLostPG(indexDB, capErr.Error(), logger)
+			persistSlotLostPG(indexDB, cfg.ServerID, capErr.Error(), logger)
 		}
 		return capErr
 	}
@@ -168,15 +168,35 @@ func One(ctx context.Context, cfg Config) error {
 // persistSlotLostPG durably records a lost/missing replication slot in the shared
 // stream_state.gap_lost_at/gap_lost_detail columns — the same machinery the MySQL path
 // uses for an unfillable binlog gap (streamrun.persistGapAutoAdvance), so index-only
-// `status` shows the loud "events permanently lost" badge after the process exits.
+// `status` shows the loud permanent-loss banner after the process exits.
 //
-// This is best-effort, layered on an ALREADY-fatal lost-slot error (no checkpoint is
-// advanced here — we are aborting): if the stamp fails we log and let the original
-// fatal error propagate, never masking it. The detail is the lost-slot error text,
-// which names the slot but carries no DSN/secret.
-func persistSlotLostPG(db *sql.DB, detail string, logger *slog.Logger) {
-	if _, err := db.Exec(`UPDATE stream_state SET gap_lost_at = UTC_TIMESTAMP(), gap_lost_detail = ? WHERE id = 1`, detail); err != nil {
-		logger.Error("pgstreamrun: could not persist lost-slot record; `status` will not show the permanent-loss badge",
+// It is an UPSERT, not a bare UPDATE: a slot can be detected lost on the very FIRST
+// ensureSlot — before any commit has written the stream_state row — so an
+// `UPDATE ... WHERE id=1` would match zero rows and silently record nothing (the exact
+// false-negative this slice prevents). The INSERT seeds a minimal but complete row
+// (mode/flavor/server_id/last_checkpoint are NOT NULL); ON DUPLICATE KEY preserves an
+// existing checkpoint and only stamps the loss (it does not touch last_checkpoint or
+// the position columns — saveCheckpointPG owns those, so a real checkpoint survives).
+//
+// Best-effort, layered on an ALREADY-fatal lost-slot error (no checkpoint is advanced —
+// we are aborting): if the stamp fails we log and let the original fatal error
+// propagate, never masking it. The detail is the lost-slot error text, which names the
+// slot but carries no DSN/secret.
+//
+// Mid-stream invalidation is NOT routed here: once streaming, a lost slot surfaces as a
+// raw replication-protocol error without the sentinel, so One returns it unstamped; the
+// supervisor re-invokes One, and ensureSlot re-detects the lost slot at startup, which
+// reaches this stamp on that next run.
+func persistSlotLostPG(db *sql.DB, serverID uint32, detail string, logger *slog.Logger) {
+	_, err := db.Exec(`
+		INSERT INTO stream_state (id, mode, flavor, server_id, last_checkpoint, gap_lost_at, gap_lost_detail)
+		VALUES (1, 'gtid', ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP(), ?)
+		ON DUPLICATE KEY UPDATE
+			gap_lost_at     = UTC_TIMESTAMP(),
+			gap_lost_detail = VALUES(gap_lost_detail)`,
+		pgFlavor, serverID, detail)
+	if err != nil {
+		logger.Error("pgstreamrun: could not persist lost-slot record; `status` will not show the permanent-loss banner",
 			"error", err, "detail", detail)
 	}
 }

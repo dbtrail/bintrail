@@ -102,9 +102,13 @@ var ErrWALLevelNotLogical = errors.New("wal_level is not 'logical'")
 // (wal_status=lost) or dropped. ensureSlot wraps them (preserving its descriptive
 // message); the consumer (pgstreamrun.One) matches them with errors.Is to durably
 // record the permanent loss so index-only `status` can show it after the process exits.
+// Base strings are bare (no "pgcapture:" prefix) because ensureSlot wraps them with a
+// "pgcapture: ...: %w" message; doubling the prefix would stutter, and the wrapped text
+// is stored verbatim in stream_state.gap_lost_detail / shown in the status badge. Mirrors
+// ErrWALLevelNotLogical's bare base string.
 var (
-	ErrSlotLost            = errors.New("pgcapture: replication slot invalidated (wal_status=lost)")
-	ErrSlotMissingOnResume = errors.New("pgcapture: replication slot missing on resume")
+	ErrSlotLost            = errors.New("replication slot invalidated (wal_status=lost)")
+	ErrSlotMissingOnResume = errors.New("replication slot missing on resume")
 )
 
 // checkWALLevel verifies the (global) wal_level is 'logical' — logical replication
