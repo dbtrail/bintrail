@@ -514,10 +514,10 @@ func TestFetch_orderDirectionDisjointRowSets(t *testing.T) {
 
 // TestFetch_wideRowSurvivesSmallSortBuffer reproduces the ER_OUT_OF_SORTMEMORY
 // (1038) class seen on a WordPress source: a single fat row image (wp_options
-// autoload blob, ~750K in the field) is wider than the stock 256K
-// sort_buffer_size, so a filesort that carries the wide JSON columns as addon
-// fields overflows and the whole query dies — even on the Overview/Events list
-// where only a handful of rows are oversized.
+// autoload blob, ~750K in the field) is wider than the stock default
+// sort_buffer_size (256K on MySQL 8.x), so a filesort that carries the wide JSON
+// columns as addon fields overflows and the whole query dies — even on the
+// Overview/Events list where only a handful of rows are oversized.
 //
 // The test pins the connection to the stock 256K buffer, proves with a control
 // query that a naive wide-column sort genuinely 1038s at that size, then asserts
@@ -525,12 +525,13 @@ func TestFetch_orderDirectionDisjointRowSets(t *testing.T) {
 // row with the ordering intact. A regression that re-introduces a wide-column
 // filesort fails here with 1038.
 //
-// Version note: this 1038 is MySQL-8.4-specific (the bundled index version).
-// MySQL 8.0 — which the project's integration MySQL on :13306 runs — degrades a
-// too-wide addon sort to the sort-by-rowid algorithm instead of erroring, so
-// the control cannot reproduce and the test SKIPs there (not a flake). The
-// version-independent guard is the unit test TestBuildQuery_wideColumnsNeverSorted,
-// which pins the SQL shape regardless of server version.
+// Version note: this 1038 is MySQL-8.4-specific. The CI integration matrix
+// (.github/workflows/ci.yml) runs the suite on BOTH 8.0 and 8.4 (port 13306):
+// on the 8.4 cell this test actively reproduces the 1038 and asserts the fix;
+// on the 8.0 cell it SKIPs (8.0 degrades a too-wide addon sort to sort-by-rowid
+// instead of erroring — not a flake). The version-independent guards that run
+// on every cell are the unit tests TestBuildQuery_wideColumnsNeverSorted (SQL
+// shape) and TestSortResults_orderingAndTieBreak (Go-side order).
 func TestFetch_wideRowSurvivesSmallSortBuffer(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)

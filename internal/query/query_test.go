@@ -672,6 +672,54 @@ func TestBuildQuery_wideColumnsNeverSorted(t *testing.T) {
 	}
 }
 
+// TestSortResults_orderingAndTieBreak is the version-independent guard for the
+// result ORDERING contract, which moved out of SQL and into Go when buildQuery
+// dropped its outer ORDER BY: the JOIN may hand rows back in any order, so
+// sortResults is now the sole source of truth for output order. Feeds a
+// deliberately shuffled slice with a timestamp tie and asserts the
+// (event_timestamp, event_id) total order for ASC, DESC, and the default
+// (empty Order normalises to ASC via OrderDirection, which Fetch always
+// applies). Runs on every CI invocation — the integration reproducer can't,
+// since the 1038 it needs is MySQL-8.4-specific.
+func TestSortResults_orderingAndTieBreak(t *testing.T) {
+	t0 := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Second)
+	// id 3 and id 1 share t0 — the timestamp tie must break on event_id.
+	in := []ResultRow{
+		{EventID: 3, EventTimestamp: t0},
+		{EventID: 5, EventTimestamp: t1},
+		{EventID: 1, EventTimestamp: t0},
+	}
+	clone := func() []ResultRow { return append([]ResultRow(nil), in...) }
+	ids := func(rows []ResultRow) []uint64 {
+		out := make([]uint64, len(rows))
+		for i, r := range rows {
+			out[i] = r.EventID
+		}
+		return out
+	}
+
+	asc := clone()
+	sortResults(asc, "ASC")
+	if got := ids(asc); got[0] != 1 || got[1] != 3 || got[2] != 5 {
+		t.Errorf("ASC order/tiebreak wrong: got %v want [1 3 5]", got)
+	}
+
+	desc := clone()
+	sortResults(desc, "DESC")
+	if got := ids(desc); got[0] != 5 || got[1] != 3 || got[2] != 1 {
+		t.Errorf("DESC order/tiebreak wrong: got %v want [5 3 1]", got)
+	}
+
+	// Empty/garbage Order must sort ASC — Fetch passes OrderDirection(opts.Order),
+	// and sortResults trusts that upstream normalisation (it checks dir=="DESC").
+	def := clone()
+	sortResults(def, OrderDirection(""))
+	if got := ids(def); got[0] != 1 || got[1] != 3 || got[2] != 5 {
+		t.Errorf("empty Order must sort ASC: got %v want [1 3 5]", got)
+	}
+}
+
 // TestBuildQuery_orderCaseInsensitive locks the normalisation rule:
 // "desc"/"Desc"/"DESC" all produce DESC; "asc"/"" all produce ASC.
 func TestBuildQuery_orderCaseInsensitive(t *testing.T) {

@@ -111,7 +111,8 @@ services:
     # window is acceptable). buffer-pool size is left at the default — it
     # depends on host RAM and is the operator's to tune (docs/deployment.md §3).
     #
-    # --sort-buffer-size=4M raises the stock 256K default. binlog_events stores
+    # --sort-buffer-size=4M raises the stock default (256K on MySQL 8.x).
+    # binlog_events stores
     # full before/after row images as JSON, and a single fat row (e.g. a
     # WordPress wp_options autoload blob, observed at ~750K) can exceed 256K. A
     # filesort that carries such a row as an addon field then dies with
