@@ -31,10 +31,31 @@ permissions:
   packages: write
   id-token: write # cosign keyless signing via GitHub OIDC
 
+env:
+  IMAGE: ghcr.io/dbtrail/bintrail-demo
+
 jobs:
-  build-push:
-    runs-on: ubuntu-22.04
+  # Build each arch on its OWN native runner instead of QEMU-emulating arm64
+  # on an amd64 host: the bintrail binary links DuckDB via CGO (a large C++
+  # compile) and emulated it can take 30+ min / OOM. Each leg pushes a
+  # tagless image BY DIGEST; the `merge` job stitches the digests into one
+  # multi-arch manifest list. (Docker's documented multi-runner pattern.)
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-22.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
+      - name: Prepare platform slug
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
         with:
           # On dispatch, build the tag's tree (checkout fails loudly if
@@ -42,7 +63,59 @@ jobs:
           # is the pushed ref anyway.
           ref: ${{ inputs.tag || github.ref }}
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: demo/image/Dockerfile
+          # Percona Server 8.0 + ProxySQL 2.6 both ship arm64 packages, so
+          # the demo builds natively on each arch (no cross-compile).
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Push by digest only (no tag here); the merge job applies tags.
+          # No provenance attestation: it would add per-platform attestation
+          # manifests to the index; the manifest list already carries both
+          # arches so a host resolves its native entry directly. Integrity
+          # comes from the cosign signature on the merged index.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          touch "${{ runner.temp }}/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
 
       - uses: docker/setup-buildx-action@v3
 
@@ -57,7 +130,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/dbtrail/bintrail-demo
+          images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }}
             # :latest stays off prereleases (tags containing '-', e.g.
@@ -65,28 +138,21 @@ jobs:
             # manifest in .goreleaser.yaml.
             type=raw,value=latest,enable=${{ !contains(inputs.tag || github.ref_name, '-') }}
 
-      - id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: demo/image/Dockerfile
-          # Multi-arch: Percona Server 8.0 + ProxySQL 2.6 both ship arm64
-          # packages, so the demo builds natively for ARM64 (Graviton) too.
-          # The arm64 leg cross-builds on this amd64 runner via the
-          # setup-qemu-action above.
-          platforms: linux/amd64,linux/arm64
-          # No provenance attestation: it would add per-platform attestation
-          # manifests to the image index. The manifest list itself already
-          # carries both linux/amd64 and linux/arm64, so a Docker host
-          # resolves its native entry directly. Keeping provenance off keeps
-          # the index a plain multi-platform manifest; supply-chain integrity
-          # still comes from the cosign signature.
-          provenance: false
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Create multi-arch manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # Intentional word-splitting: expand to multiple -t flags and
+          # multiple image@digest args (Docker's documented merge idiom).
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
 
-      - name: Sign image
+      - name: Inspect and sign
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "ghcr.io/dbtrail/bintrail-demo@${DIGEST}"
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          cosign sign --yes "${IMAGE}@${DIGEST}"
