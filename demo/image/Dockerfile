@@ -1,23 +1,24 @@
 # bintrail demo image — single-container evaluation demo (#350).
 #
-# Bundles: bintrail (built from this repo) + MySQL 8.0 (source AND index
-# in one instance) + ProxySQL preloaded for Time Travel SQL + a traffic
-# generator. EVALUATION ONLY — stateless, restart = fresh demo.
+# Bundles: bintrail (built from this repo) + Percona Server 8.0 (source
+# AND index in one instance) + ProxySQL preloaded for Time Travel SQL + a
+# traffic generator. EVALUATION ONLY — stateless, restart = fresh demo.
 #
 #   docker build -f demo/image/Dockerfile -t bintrail-demo .
 #   docker run --rm -p 6033:6033 bintrail-demo
 #
 # Base-image note: the runtime MUST be glibc-compatible with the builder.
-# mysql:8.0 (Oracle Linux 9, glibc 2.34) cannot run a bookworm-built
-# (glibc 2.36) binary — so the runtime is debian:bookworm-slim with
-# MySQL 8.0 from MySQL's apt repo and ProxySQL from repo.proxysql.com
-# (same install path docs/time-travel-sql.md documents). Alpine is out:
-# DuckDB's static libs need glibc (see docs/docker.md "Why not Alpine?").
+# The bintrail binary is built on golang:1.25-bookworm (glibc 2.36), so the
+# runtime is debian:bookworm-slim with Percona Server 8.0 and ProxySQL 2.6
+# from their bookworm apt repos (both built for bookworm, so glibc stays in
+# lockstep). Alpine is out: DuckDB's static libs need glibc (see
+# docs/docker.md "Why not Alpine?").
 #
-# amd64-only: MySQL's apt repo ships no arm64 packages for Debian
-# (Architectures: i386 amd64). Apple Silicon runs the image via
-# Rosetta/QEMU emulation — fine for an evaluation. On an ARM host build
-# with: docker build --platform linux/amd64 -f demo/image/Dockerfile .
+# Multi-arch (amd64 + arm64): MySQL's own Debian apt repo ships no arm64
+# packages (Architectures: i386 amd64), which is why this image used to be
+# amd64-only. Percona Server 8.0 is a drop-in MySQL with arm64 packages
+# (identical mysqld/mysql binaries and ROW binlog format), so the image now
+# builds and runs natively on ARM64 hosts (AWS Graviton, etc.).
 
 FROM golang:1.25-bookworm AS build
 
@@ -34,28 +35,36 @@ RUN go build -trimpath -ldflags "-s -w" -o /out/bintrail ./cmd/bintrail
 
 FROM debian:bookworm-slim
 
-# MySQL 8.0 (community, NOT default-mysql-server which is MariaDB and
-# has a different binlog format) + ProxySQL 2.6 + bintrail runtime deps.
+# Percona Server 8.0 (a drop-in MySQL — NOT default-mysql-server, which is
+# MariaDB with a different binlog format) + ProxySQL 2.6 + bintrail runtime
+# deps. Percona is used over MySQL community because its apt repo ships
+# arm64 packages (MySQL's Debian repo is amd64/i386-only); the mysqld/mysql
+# binaries and ROW binlog format are identical to upstream MySQL 8.0.
 # policy-rc.d blocks the packages' postinst from trying to start daemons
 # during the image build.
 RUN set -eux; \
     printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates gnupg wget; \
-    wget -qO /tmp/mysql.key 'https://repo.mysql.com/RPM-GPG-KEY-mysql-2025'; \
-    gpg --dearmor -o /usr/share/keyrings/mysql.gpg /tmp/mysql.key; \
-    echo 'deb [signed-by=/usr/share/keyrings/mysql.gpg] http://repo.mysql.com/apt/debian bookworm mysql-8.0' \
-        > /etc/apt/sources.list.d/mysql.list; \
+    # Percona Server 8.0 via percona-release: the official installer wires
+    # the repo + signing key for the detected architecture (amd64 or arm64).
+    # `enable ps-80 release` is the non-interactive form (`setup ps80` prompts
+    # without a TTY); the apt repo it adds is http, same posture as the MySQL
+    # community repo this replaced — integrity comes from the signed-by key.
+    wget -qO /tmp/percona-release.deb 'https://repo.percona.com/apt/percona-release_latest.generic_all.deb'; \
+    apt-get install -y --no-install-recommends /tmp/percona-release.deb; \
+    percona-release enable ps-80 release; \
+    # ProxySQL 2.6 — already multi-arch (amd64 + arm64).
     wget -qO /tmp/proxysql.key 'https://repo.proxysql.com/ProxySQL/proxysql-2.6.x/repo_pub_key'; \
     gpg --dearmor -o /usr/share/keyrings/proxysql.gpg /tmp/proxysql.key; \
     echo 'deb [signed-by=/usr/share/keyrings/proxysql.gpg] https://repo.proxysql.com/ProxySQL/proxysql-2.6.x/bookworm/ ./' \
         > /etc/apt/sources.list.d/proxysql.list; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        mysql-server mysql-client proxysql libstdc++6 procps; \
+        percona-server-server percona-server-client proxysql libstdc++6 procps; \
     apt-get purge -y gnupg wget; \
     apt-get autoremove -y; \
-    rm -rf /var/lib/apt/lists/* /tmp/*.key; \
+    rm -rf /var/lib/apt/lists/* /tmp/*.key /tmp/percona-release.deb; \
     # The demo is stateless: drop whatever datadir the package
     # postinst initialized (wrong config) — entrypoint.sh re-initializes
     # with demo/image/my.cnf at first boot.

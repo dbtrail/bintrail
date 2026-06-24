@@ -19,8 +19,11 @@ NAME="bintrail-demo-smoke"
 log() { echo "[smoke] $(date '+%H:%M:%S') $*"; }
 
 if [ -z "${SKIP_BUILD:-}" ]; then
-    log "Building image (amd64 — MySQL's Debian apt repo has no arm64)..."
-    docker build --platform linux/amd64 -f demo/image/Dockerfile -t "$IMAGE" .
+    # Build for the host's native architecture (Percona Server + ProxySQL
+    # both ship arm64, so this works on Graviton/Apple Silicon too). Override
+    # with PLATFORM=linux/amd64 to cross-build a specific arch.
+    log "Building image${PLATFORM:+ (${PLATFORM})}..."
+    docker build ${PLATFORM:+--platform "$PLATFORM"} -f demo/image/Dockerfile -t "$IMAGE" .
 fi
 
 cleanup() {
