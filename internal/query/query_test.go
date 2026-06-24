@@ -643,19 +643,31 @@ func TestBuildQuery_orderDESC_limitPerPK(t *testing.T) {
 // fat row image (e.g. a WordPress wp_options blob) overflows sort_buffer_size
 // and the query dies. Covers both the plain and per-PK shapes.
 func TestBuildQuery_wideColumnsNeverSorted(t *testing.T) {
+	// Includes the no-Limit shape, and asserts BOTH halves of the invariant so
+	// this guard is self-sufficient (not reliant on HasSuffix in sibling tests):
+	// the wide columns are absent from the sorted key subquery AND there is no
+	// outer ORDER BY after the JOIN — re-appending one over the wide outer
+	// SELECT would re-introduce the filesort without putting row_after in the
+	// key subquery, the exact regression shape this guards against.
 	for _, opts := range []Options{
 		{Schema: "db", Table: "t", Limit: 200, Order: "DESC"},
+		{Schema: "db", Table: "t", Limit: 0, Order: "DESC"},
 		{Schema: "db", Table: "t", PKValuesIn: []string{"1"}, LimitPerPK: 5, Limit: 200, Order: "DESC"},
+		{Schema: "db", Table: "t", PKValuesIn: []string{"1"}, LimitPerPK: 5, Limit: 0, Order: "DESC"},
 	} {
 		q, _ := buildQuery(opts)
-		// The key subquery is everything up to the JOIN's ON clause. row_after
-		// must not appear there — only in the outer SELECT list before "FROM".
+		// The key subquery is everything from the JOIN onward. row_after must not
+		// appear there — only in the outer SELECT list before "FROM".
 		keyPart := q
 		if i := strings.Index(q, " FROM binlog_events AS be JOIN ("); i >= 0 {
 			keyPart = q[i:]
 		}
 		if strings.Contains(keyPart, "row_after") || strings.Contains(keyPart, "row_before") {
 			t.Errorf("wide JSON columns must not appear inside the sorted key subquery: %s", q)
+		}
+		// No outer sort over the wide projection: the statement ends at the JOIN.
+		if !strings.HasSuffix(q, joinSuffix) {
+			t.Errorf("query must end at the JOIN (no outer ORDER BY over wide cols): %s", q)
 		}
 	}
 }
