@@ -511,3 +511,75 @@ func TestFetch_orderDirectionDisjointRowSets(t *testing.T) {
 			ascRows[0].EventTimestamp, descRows[len(descRows)-1].EventTimestamp)
 	}
 }
+
+// TestFetch_wideRowSurvivesSmallSortBuffer reproduces the ER_OUT_OF_SORTMEMORY
+// (1038) class seen on a WordPress source: a single fat row image (wp_options
+// autoload blob, ~750K in the field) is wider than the stock 256K
+// sort_buffer_size, so a filesort that carries the wide JSON columns as addon
+// fields overflows and the whole query dies — even on the Overview/Events list
+// where only a handful of rows are oversized.
+//
+// The test pins the connection to the stock 256K buffer, proves with a control
+// query that a naive wide-column sort genuinely 1038s at that size, then asserts
+// Fetch (which sorts narrow keys only via late materialization) returns every
+// row with the ordering intact. A regression that re-introduces a wide-column
+// filesort fails here with 1038.
+//
+// Version note: this 1038 is MySQL-8.4-specific (the bundled index version).
+// MySQL 8.0 — which the project's integration MySQL on :13306 runs — degrades a
+// too-wide addon sort to the sort-by-rowid algorithm instead of erroring, so
+// the control cannot reproduce and the test SKIPs there (not a flake). The
+// version-independent guard is the unit test TestBuildQuery_wideColumnsNeverSorted,
+// which pins the SQL shape regardless of server version.
+func TestFetch_wideRowSurvivesSmallSortBuffer(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Pin the whole pool to one connection at the stock MySQL default buffer so
+	// the fat row below genuinely cannot fit a wide-column filesort.
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("SET SESSION sort_buffer_size = 262144"); err != nil {
+		t.Fatalf("pin sort_buffer_size: %v", err)
+	}
+
+	ts := "2026-02-19 14:00:00"
+	for i := uint64(1); i <= 5; i++ {
+		testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts, nil,
+			"wordpress", "dbt_options", 1, fmt.Sprint(i),
+			nil, nil, []byte(fmt.Sprintf(`{"id":%d}`, i)))
+	}
+	// One fat image well over 256K — mimics a serialized wp_options autoload value.
+	fat := `{"option_value":"` + strings.Repeat("a", 400*1024) + `"}`
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, ts, nil,
+		"wordpress", "dbt_options", 1, "6", nil, nil, []byte(fat))
+
+	// Control: a naive wide-column filesort overflows the 256K buffer, proving
+	// the regression condition is real before we assert Fetch survives it.
+	ctrlRows, ctrlErr := db.Query(
+		"SELECT event_id, row_after FROM binlog_events ORDER BY event_timestamp DESC, event_id DESC LIMIT 200")
+	if ctrlErr == nil {
+		ctrlRows.Close()
+		t.Skip("test MySQL did not honor the 256K sort buffer; cannot reproduce 1038 here")
+	}
+	if !strings.Contains(ctrlErr.Error(), "1038") {
+		t.Fatalf("control query failed for an unexpected reason (wanted 1038): %v", ctrlErr)
+	}
+
+	// The real path must return all 6 rows at the same buffer that just broke
+	// the naive sort.
+	e := New(db)
+	rows, err := e.Fetch(context.Background(), Options{
+		Schema: "wordpress", Table: "dbt_options", Limit: 200, Order: "DESC",
+	})
+	if err != nil {
+		t.Fatalf("Fetch must survive a fat row at 256K sort buffer, got: %v", err)
+	}
+	if len(rows) != 6 {
+		t.Fatalf("expected 6 rows, got %d", len(rows))
+	}
+	// Ordering preserved by the Go-side sort: DESC ⇒ highest event_id first.
+	if rows[0].EventID < rows[len(rows)-1].EventID {
+		t.Errorf("expected DESC order by event_id, got first=%d last=%d",
+			rows[0].EventID, rows[len(rows)-1].EventID)
+	}
+}

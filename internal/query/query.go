@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -194,10 +195,37 @@ func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
 	if err != nil {
 		return nil, err
 	}
+	// buildQuery deliberately omits the outer ORDER BY (see there for why), so
+	// the JOIN may hand rows back in any order. Re-establish the total
+	// (event_timestamp, event_id) ordering here — the result set is already
+	// capped by the inner LIMIT, so this Go-side sort is cheap and keeps the
+	// "Fetch returns ordered rows" contract that recovery.GenerateSQL and the
+	// formatters rely on.
+	sortResults(results, OrderDirection(opts.Order))
 	if len(opts.RedactColumns) > 0 {
 		applyRedaction(results, opts.RedactColumns)
 	}
 	return results, nil
+}
+
+// sortResults orders rows by (event_timestamp, event_id) in dir ("ASC"/"DESC"),
+// matching what the old in-SQL outer ORDER BY produced. Both keys share the
+// direction so the order is total and deterministic across timestamp ties.
+func sortResults(rows []ResultRow, dir string) {
+	desc := dir == "DESC"
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := &rows[i], &rows[j]
+		if !a.EventTimestamp.Equal(b.EventTimestamp) {
+			if desc {
+				return a.EventTimestamp.After(b.EventTimestamp)
+			}
+			return a.EventTimestamp.Before(b.EventTimestamp)
+		}
+		if desc {
+			return a.EventID > b.EventID
+		}
+		return a.EventID < b.EventID
+	})
 }
 
 // Run executes the query and writes formatted results to w.
@@ -337,39 +365,56 @@ func buildQuery(opts Options) (string, []any) {
 		args = append(args, dt.Schema, dt.Table)
 	}
 
-	cols := `event_id, binlog_file, start_pos, end_pos, event_timestamp,
-	         gtid, connection_id, schema_name, table_name, event_type, pk_values,
-	         changed_columns, row_before, row_after, schema_version`
+	// Late materialization. A naive `SELECT <wide cols> ... ORDER BY
+	// event_timestamp ... LIMIT N` makes MySQL carry the wide JSON columns
+	// (row_before/row_after) through the filesort as "addon fields". A single
+	// fat row image (e.g. a WordPress wp_options autoload blob) larger than
+	// sort_buffer_size then overflows the sort buffer and the whole query dies
+	// with ER_OUT_OF_SORTMEMORY (1038) — even though only a handful of rows are
+	// oversized and the host has memory to spare. Raising sort_buffer_size only
+	// moves the cliff; an even fatter row re-breaks it.
+	//
+	// Instead, sort + limit on the NARROW key columns alone (a few bytes each,
+	// so the filesort never trips 1038 regardless of row width), then JOIN back
+	// to binlog_events on the primary key to fetch the wide columns for just
+	// those rows. No outer ORDER BY: it would re-introduce the wide-column
+	// filesort. Fetch re-establishes the final ordering in Go (sortResults).
+	//
+	// The PK is (event_id, event_timestamp) — joining on both keys keeps the
+	// match 1:1 and lets MySQL prune partitions on the eq_ref lookup.
+	cols := `be.event_id, be.binlog_file, be.start_pos, be.end_pos, be.event_timestamp,
+	         be.gtid, be.connection_id, be.schema_name, be.table_name, be.event_type, be.pk_values,
+	         be.changed_columns, be.row_before, be.row_after, be.schema_version`
 
 	dir := OrderDirection(opts.Order)
-	outerOrderBy := " ORDER BY event_timestamp " + dir + ", event_id " + dir
-
-	var q string
-	if opts.LimitPerPK > 0 {
-		// Per-PK cap via ROW_NUMBER. Inner ORDER BY DESC is fixed: it
-		// selects "latest N events per pk_values" regardless of the
-		// requested outer direction. Only the outer ORDER BY follows
-		// opts.Order so callers can pick the most recent or the earliest
-		// page across all PKs.
-		inner := "SELECT " + cols + ", ROW_NUMBER() OVER (PARTITION BY pk_values" +
-			" ORDER BY event_timestamp DESC, event_id DESC) AS bt_rn FROM binlog_events"
-		if len(where) > 0 {
-			inner += " WHERE " + strings.Join(where, " AND ")
-		}
-		q = "SELECT " + cols + " FROM (" + inner + ") AS t WHERE bt_rn <= ?"
-		args = append(args, opts.LimitPerPK)
-		q += outerOrderBy
-	} else {
-		q = "SELECT " + cols + " FROM binlog_events"
-		if len(where) > 0 {
-			q += " WHERE " + strings.Join(where, " AND ")
-		}
-		q += outerOrderBy
+	whereSQL := ""
+	if len(where) > 0 {
+		whereSQL = " WHERE " + strings.Join(where, " AND ")
 	}
+
+	var keys string
+	if opts.LimitPerPK > 0 {
+		// Per-PK cap via ROW_NUMBER over the narrow keys only. Inner ORDER BY
+		// DESC is fixed: it selects "latest N events per pk_values" regardless
+		// of the requested final direction.
+		window := "SELECT event_id, event_timestamp, ROW_NUMBER() OVER (PARTITION BY pk_values" +
+			" ORDER BY event_timestamp DESC, event_id DESC) AS bt_rn FROM binlog_events" + whereSQL
+		keys = "SELECT event_id, event_timestamp FROM (" + window + ") AS w WHERE bt_rn <= ?"
+		args = append(args, opts.LimitPerPK)
+	} else {
+		keys = "SELECT event_id, event_timestamp FROM binlog_events" + whereSQL
+	}
+	// The narrow ORDER BY + LIMIT only matters when paging: it decides WHICH N
+	// rows survive. With no LIMIT the selection is the whole filtered set, so
+	// the order is irrelevant here (Fetch sorts in Go anyway) — skip it.
 	if opts.Limit > 0 {
-		q += " LIMIT ?"
+		keys += " ORDER BY event_timestamp " + dir + ", event_id " + dir + " LIMIT ?"
 		args = append(args, opts.Limit)
 	}
+
+	q := "SELECT " + cols + " FROM binlog_events AS be" +
+		" JOIN (" + keys + ") AS k" +
+		" ON be.event_id = k.event_id AND be.event_timestamp = k.event_timestamp"
 
 	return q, args
 }

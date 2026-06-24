@@ -110,7 +110,18 @@ services:
     # (bintrail replays from the stream_state checkpoint, so a ≤1s recovery
     # window is acceptable). buffer-pool size is left at the default — it
     # depends on host RAM and is the operator's to tune (docs/deployment.md §3).
-    command: ["--innodb-flush-log-at-trx-commit=2"]
+    #
+    # --sort-buffer-size=4M raises the stock 256K default. binlog_events stores
+    # full before/after row images as JSON, and a single fat row (e.g. a
+    # WordPress wp_options autoload blob, observed at ~750K) can exceed 256K. A
+    # filesort that carries such a row as an addon field then dies with
+    # ER_OUT_OF_SORTMEMORY (1038). The query engine avoids this on the hot path
+    # by sorting narrow keys only (internal/query late materialization); 4M is
+    # defense-in-depth for any other sort, bounded and cheap at this index's low
+    # connection concurrency.
+    command:
+      - "--innodb-flush-log-at-trx-commit=2"
+      - "--sort-buffer-size=4M"
     environment:
       # 8.4 defaults to caching_sha2_password (native_password disabled);
       # bintrail's driver negotiates it over the plaintext Docker network.
