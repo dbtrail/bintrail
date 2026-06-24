@@ -97,6 +97,10 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          set -euo pipefail
+          # Guard against an empty/malformed build output silently producing
+          # a bad artifact filename that would poison the merge.
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "unexpected build digest: '$DIGEST'"; exit 1; }
           mkdir -p "${{ runner.temp }}/digests"
           touch "${{ runner.temp }}/digests/${DIGEST#sha256:}"
 
@@ -141,6 +145,10 @@ jobs:
       - name: Create multi-arch manifest list
         working-directory: ${{ runner.temp }}/digests
         run: |
+          set -euo pipefail
+          # failglob: an empty digests dir aborts here instead of passing a
+          # literal `*` to imagetools as a bogus source ref.
+          shopt -s failglob
           # Intentional word-splitting: expand to multiple -t flags and
           # multiple image@digest args (Docker's documented merge idiom).
           # shellcheck disable=SC2046
@@ -148,11 +156,23 @@ jobs:
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf "${IMAGE}@sha256:%s " *)
 
-      - name: Inspect and sign
+      - name: Inspect, verify both arches, and sign
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
+          set -euo pipefail
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          # Guard the PR's core promise: the published index MUST carry both
+          # arches. A partial build (one matrix leg's digest missing) would
+          # otherwise tag+sign a single-arch manifest green — exactly the
+          # regression this image's multi-arch support exists to prevent.
+          PLATFORMS=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
+            --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')
+          echo "manifest platforms: ${PLATFORMS}"
+          for want in linux/amd64 linux/arm64; do
+            case " ${PLATFORMS} " in *" ${want} "*) ;; *) echo "published manifest is missing ${want}"; exit 1 ;; esac
+          done
           DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
             --format '{{json .Manifest.Digest}}' | tr -d '"')
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "unexpected index digest: '$DIGEST'"; exit 1; }
           cosign sign --yes "${IMAGE}@${DIGEST}"

@@ -48,9 +48,11 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends ca-certificates gnupg wget; \
     # Percona Server 8.0 via percona-release: the official installer wires
     # the repo + signing key for the detected architecture (amd64 or arm64).
-    # `enable ps-80 release` is the non-interactive form (`setup ps80` prompts
-    # without a TTY); the apt repo it adds is http, same posture as the MySQL
-    # community repo this replaced — integrity comes from the signed-by key.
+    # `enable ps-80 release` is the documented non-interactive form and adds
+    # only this repo (vs `setup`, which can disable/reset other Percona repos).
+    # percona-release writes its own signed-by keyring entry
+    # (/usr/share/keyrings/percona-keyring.gpg), so the http apt repo is
+    # key-verified — same posture as the MySQL community repo this replaced.
     wget -qO /tmp/percona-release.deb 'https://repo.percona.com/apt/percona-release_latest.generic_all.deb'; \
     apt-get install -y --no-install-recommends /tmp/percona-release.deb; \
     percona-release enable ps-80 release; \
@@ -62,6 +64,12 @@ RUN set -eux; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         percona-server-server percona-server-client proxysql libstdc++6 procps; \
+    # Gate the swap: confirm the repo actually yielded Percona Server 8.0 (the
+    # ROW-binlog flavor the demo depends on). A wrong repo/component would
+    # otherwise install a different flavor or major and fail only at runtime.
+    v="$(mysqld --version)"; echo "$v"; \
+    case "$v" in *"Percona Server"*) ;; *) echo "FATAL: not Percona Server: $v"; exit 1;; esac; \
+    case "$v" in *"Ver 8.0."*) ;; *) echo "FATAL: not MySQL 8.0: $v"; exit 1;; esac; \
     apt-get purge -y gnupg wget; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/* /tmp/*.key /tmp/percona-release.deb; \
