@@ -58,8 +58,13 @@ type capabilitiesResponse struct {
 	// snapshot (resolver). baselineConfigured can be true with resolver==nil (a
 	// baseline dir set but `bintrail snapshot` never run), where the handler
 	// degrades to Phase-1; advertising true there would over-promise.
-	RecoverCascadeBaseline bool         `json:"recover_cascade_baseline"`
-	Auth                   authCapsInfo `json:"auth"`
+	RecoverCascadeBaseline bool `json:"recover_cascade_baseline"`
+	// BaselineTrigger: this process can create baseline snapshots in-process from
+	// the console (the watch daemon opted in with BINTRAIL_CONSOLE_BASELINE_TRIGGER=1).
+	// Process-global, like Monitor — the endpoint does the per-server validation
+	// (source + baseline destination configured).
+	BaselineTrigger bool         `json:"baseline_trigger"`
+	Auth            authCapsInfo `json:"auth"`
 	// Source names the selected server's source database family — "postgresql"
 	// or "mysql" — derived per-server from stream_state.flavor (the same field
 	// DialectForIndex reads). It drives source-aware PRESENTATION only: the
@@ -97,7 +102,8 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		kind = "session"
 	}
 	resp := capabilitiesResponse{
-		Monitor: s.monitorCtrl != nil,
+		Monitor:         s.monitorCtrl != nil,
+		BaselineTrigger: s.baselineCtrl != nil,
 		// recover-cascade is the free tier (like recover) and process-global, gated
 		// only by the RBAC profile (which would make synthesis leak redacted data).
 		RecoverCascade: !s.rbacActive(),

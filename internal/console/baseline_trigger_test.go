@@ -1,0 +1,226 @@
+package console
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// stubBaselineCtrl is a recording BaselineController for unit tests.
+type stubBaselineCtrl struct {
+	triggered []BaselineRequest
+	err       error
+	status    BaselineStatus
+}
+
+func (c *stubBaselineCtrl) Trigger(req BaselineRequest) error {
+	c.triggered = append(c.triggered, req)
+	return c.err
+}
+
+func (c *stubBaselineCtrl) Status(string) BaselineStatus { return c.status }
+
+// newBaselineTriggerServer builds a control-plane console with a recording baseline
+// controller wired in (mirrors newSupervisorServer for the monitor surface).
+func newBaselineTriggerServer(t *testing.T) (*Server, *stubBaselineCtrl) {
+	t.Helper()
+	reg, err := LoadRegistry(t.TempDir() + "/console-servers.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrl := &stubBaselineCtrl{status: BaselineStatus{State: "idle"}}
+	srv, err := New(Config{
+		Listen: "127.0.0.1:8090", Token: "t", Registry: reg,
+		MonitorCtrl: &stubMonitorCtrl{}, BaselineCtrl: ctrl,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv, ctrl
+}
+
+const baselineSecretPW = "s3cr3t-baseline-pw"
+
+// addBaselineEntry adds a registry entry with the given source/destination
+// configured, returning its generated id.
+func addBaselineEntry(t *testing.T, srv *Server, source, baselineS3, baselineDir, schemas string) string {
+	t.Helper()
+	e, err := srv.cm.reg.Add(ServerEntry{
+		Name:        "wp",
+		DSN:         "idx:idxpw@tcp(127.0.0.1:3306)/binlog_index",
+		SourceDSN:   source,
+		BaselineS3:  baselineS3,
+		BaselineDir: baselineDir,
+		Schemas:     schemas,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e.ID
+}
+
+// TestCapabilityBaselineTriggerGate: only a daemon that opted in (Config.BaselineCtrl)
+// advertises baseline_trigger; the standalone read-only console never does.
+func TestCapabilityBaselineTriggerGate(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		reg, _ := LoadRegistry("")
+		cfg := Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg}
+		if enabled {
+			cfg.BaselineCtrl = &stubBaselineCtrl{}
+		}
+		srv, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.cm.boot = &bundle{}
+		rec, body := doServersReq(t, srv, "GET", "/api/capabilities", "")
+		if rec.Code != 200 {
+			t.Fatalf("capabilities: code=%d body=%s", rec.Code, body)
+		}
+		var caps capabilitiesResponse
+		if err := json.Unmarshal(body, &caps); err != nil {
+			t.Fatal(err)
+		}
+		if caps.BaselineTrigger != enabled {
+			t.Errorf("baseline_trigger capability = %v, want %v", caps.BaselineTrigger, enabled)
+		}
+	}
+}
+
+// TestBaselineTrigger_disabledConsole: with no BaselineCtrl wired in, the trigger
+// endpoint refuses with 403 even on a control-plane console.
+func TestBaselineTrigger_disabledConsole(t *testing.T) {
+	reg, _ := LoadRegistry(t.TempDir() + "/console-servers.yaml")
+	srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg, MonitorCtrl: &stubMonitorCtrl{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := addBaselineEntry(t, srv, "u:p@tcp(127.0.0.1:3306)/", "s3://b/baselines/", "", "")
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline", "")
+	if rec.Code != 403 {
+		t.Fatalf("disabled console: code=%d, want 403", rec.Code)
+	}
+}
+
+// TestBaselineTrigger_requiresSource: an entry with a destination but no source
+// configured cannot be dumped — 400.
+func TestBaselineTrigger_requiresSource(t *testing.T) {
+	srv, ctrl := newBaselineTriggerServer(t)
+	id := addBaselineEntry(t, srv, "", "s3://b/baselines/", "", "")
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline", "")
+	if rec.Code != 400 {
+		t.Fatalf("no source: code=%d, want 400", rec.Code)
+	}
+	if len(ctrl.triggered) != 0 {
+		t.Fatalf("controller must not be triggered without a source")
+	}
+}
+
+// TestBaselineTrigger_requiresDestination: an entry with a source but no baseline
+// dir/S3 has nowhere for the snapshot to live — 400.
+func TestBaselineTrigger_requiresDestination(t *testing.T) {
+	srv, ctrl := newBaselineTriggerServer(t)
+	id := addBaselineEntry(t, srv, "u:p@tcp(127.0.0.1:3306)/", "", "", "")
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline", "")
+	if rec.Code != 400 {
+		t.Fatalf("no destination: code=%d, want 400", rec.Code)
+	}
+	if len(ctrl.triggered) != 0 {
+		t.Fatalf("controller must not be triggered without a destination")
+	}
+}
+
+// TestBaselineTrigger_unknownServer: a bad server id is 404, never a trigger.
+func TestBaselineTrigger_unknownServer(t *testing.T) {
+	srv, _ := newBaselineTriggerServer(t)
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers/deadbeef/baseline", "")
+	if rec.Code != 404 {
+		t.Fatalf("unknown server: code=%d, want 404", rec.Code)
+	}
+}
+
+// TestBaselineTrigger_happy: a fully-configured entry triggers a job (202), the
+// controller receives the source DSN + S3 destination + parsed schemas, and the
+// HTTP response never leaks the source password.
+func TestBaselineTrigger_happy(t *testing.T) {
+	srv, ctrl := newBaselineTriggerServer(t)
+	source := "repl:" + baselineSecretPW + "@tcp(10.0.0.5:3306)/"
+	id := addBaselineEntry(t, srv, source, "s3://my-bucket/baselines/", "", "wordpress, shop")
+
+	rec, body := doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline", "")
+	if rec.Code != 202 {
+		t.Fatalf("trigger: code=%d body=%s, want 202", rec.Code, body)
+	}
+	if len(ctrl.triggered) != 1 {
+		t.Fatalf("controller triggered %d times, want 1", len(ctrl.triggered))
+	}
+	got := ctrl.triggered[0]
+	if got.SourceDSN != source {
+		t.Errorf("SourceDSN = %q, want the entry's source", got.SourceDSN)
+	}
+	if got.S3 != "s3://my-bucket/baselines/" {
+		t.Errorf("S3 = %q, want the entry's baseline S3", got.S3)
+	}
+	if len(got.Schemas) != 2 || got.Schemas[0] != "wordpress" || got.Schemas[1] != "shop" {
+		t.Errorf("Schemas = %v, want [wordpress shop]", got.Schemas)
+	}
+	// The source password must never reach the HTTP response.
+	if strings.Contains(string(body), baselineSecretPW) {
+		t.Fatalf("response leaked the source password: %s", body)
+	}
+}
+
+// TestBaselineTrigger_alreadyRunning: ErrBaselineRunning from the controller maps
+// to 409 Conflict (one baseline at a time per server).
+func TestBaselineTrigger_alreadyRunning(t *testing.T) {
+	srv, ctrl := newBaselineTriggerServer(t)
+	ctrl.err = ErrBaselineRunning
+	id := addBaselineEntry(t, srv, "u:p@tcp(127.0.0.1:3306)/", "s3://b/baselines/", "", "")
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline", "")
+	if rec.Code != 409 {
+		t.Fatalf("already running: code=%d, want 409", rec.Code)
+	}
+}
+
+// TestBaselineStatus_returnsControllerState: GET reflects the controller's status.
+func TestBaselineStatus_returnsControllerState(t *testing.T) {
+	srv, ctrl := newBaselineTriggerServer(t)
+	ctrl.status = BaselineStatus{State: "succeeded", Tables: 47, Rows: 33391, Uploaded: 48}
+	id := addBaselineEntry(t, srv, "u:p@tcp(127.0.0.1:3306)/", "s3://b/baselines/", "", "")
+
+	rec, body := doServersReq(t, srv, "GET", "/api/servers/"+id+"/baseline", "")
+	if rec.Code != 200 {
+		t.Fatalf("status: code=%d body=%s, want 200", rec.Code, body)
+	}
+	var resp struct {
+		Baseline BaselineStatus `json:"baseline"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Baseline.State != "succeeded" || resp.Baseline.Tables != 47 || resp.Baseline.Uploaded != 48 {
+		t.Errorf("status = %+v, want the controller's succeeded state", resp.Baseline)
+	}
+}
+
+// TestSplitSchemas covers the comma-separated parse used to build the request.
+func TestSplitSchemas(t *testing.T) {
+	cases := map[string][]string{
+		"":              nil,
+		"a":             {"a"},
+		" a , b ,, c ":  {"a", "b", "c"},
+		"wordpress,wp2": {"wordpress", "wp2"},
+	}
+	for in, want := range cases {
+		got := splitSchemas(in)
+		if len(got) != len(want) {
+			t.Errorf("splitSchemas(%q) = %v, want %v", in, got, want)
+			continue
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("splitSchemas(%q)[%d] = %q, want %q", in, i, got[i], want[i])
+			}
+		}
+	}
+}

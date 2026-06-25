@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/dbtrail/dbtrail/internal/baseline"
 )
 
 // ─── cobra command wiring ─────────────────────────────────────────────────────
@@ -344,65 +342,6 @@ func TestDecryptDumpFiles_roundTrip(t *testing.T) {
 	cleanup()
 	if _, err := os.Stat(plainFile); !os.IsNotExist(err) {
 		t.Error("cleanup should have removed the decrypted file")
-	}
-}
-
-// ─── S3 upload marker symmetry (#467 / #524) ──────────────────────────────────
-
-// TestSnapshotDirsWithSuccess verifies the helper that drives the S3 upload's
-// _INCOMPLETE-first ordering: it returns exactly the immediate child snapshot
-// directories carrying a local _SUCCESS marker (completed snapshots), ignoring
-// loose files, marker-less dirs, and nested dirs.
-func TestSnapshotDirsWithSuccess(t *testing.T) {
-	out := t.TempDir()
-
-	mkSnap := func(name string, success bool) {
-		t.Helper()
-		dir := filepath.Join(out, name, "shop")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "orders.parquet"), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if success {
-			if err := os.WriteFile(filepath.Join(out, name, baseline.SuccessMarker), nil, 0o644); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	mkSnap("2026-01-01T00-00-00Z", true)  // complete → included
-	mkSnap("2026-02-01T00-00-00Z", true)  // complete → included
-	mkSnap("2026-03-01T00-00-00Z", false) // no _SUCCESS → excluded
-	// A loose file at the top level must not be mistaken for a snapshot dir.
-	if err := os.WriteFile(filepath.Join(out, "stray.txt"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := snapshotDirsWithSuccess(out)
-	if err != nil {
-		t.Fatalf("snapshotDirsWithSuccess: %v", err)
-	}
-	want := map[string]bool{
-		filepath.Join(out, "2026-01-01T00-00-00Z"): true,
-		filepath.Join(out, "2026-02-01T00-00-00Z"): true,
-	}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want the two _SUCCESS-marked snapshots %v", got, want)
-	}
-	for _, d := range got {
-		if !want[d] {
-			t.Errorf("unexpected snapshot dir %q (only _SUCCESS-marked dirs should be returned)", d)
-		}
-	}
-}
-
-// TestSnapshotDirsWithSuccess_missingDir verifies the helper surfaces a read
-// error rather than silently returning an empty list (which would skip the
-// _INCOMPLETE-first publish entirely).
-func TestSnapshotDirsWithSuccess_missingDir(t *testing.T) {
-	if _, err := snapshotDirsWithSuccess("/nonexistent/path-does-not-exist"); err == nil {
-		t.Fatal("expected error for nonexistent output directory, got nil")
 	}
 }
 

@@ -1737,8 +1737,17 @@ function baselinesPanel(b, servers) {
   const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
   let owner = cur ? serverLabel(cur) : "";
   if (!owner && b && !b.error && b.configured) owner = "daemon (--baseline-dir / --baseline-s3)";
-  panel.append(el("div", { class: "ov-panel-head" },
-    el("h2", { class: "ov-panel-title", text: "Baseline snapshots" + (owner ? " — " + owner : "") })));
+  const head = el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Baseline snapshots" + (owner ? " — " + owner : "") }));
+  // Create-baseline action: only when the daemon opted in (capsCache.baseline_trigger),
+  // a real server is selected, and it has a baseline destination configured (else the
+  // endpoint 400s). The endpoint still re-validates the source DSN server-side.
+  if (capsCache.baseline_trigger && cur && cur.id && b && !b.error && b.configured) {
+    const btn = el("button", { class: "btn btn-sm", type: "button", text: "Create baseline" });
+    btn.onclick = () => createBaseline(cur.id, btn);
+    head.append(btn);
+  }
+  panel.append(head);
   const list = el("div", { class: "stg-list" });
   if (!b || b.error) {
     list.append(el("div", { class: "ev-empty", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));
@@ -1767,6 +1776,51 @@ function baselinesPanel(b, servers) {
   }
   panel.append(list);
   return panel;
+}
+
+// createBaseline triggers an in-process baseline (dump→convert→upload) on the
+// daemon for the selected server, then polls until it finishes and refreshes the
+// Storage view so the new snapshot appears. The button is disabled while in flight.
+async function createBaseline(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Creating…"; }
+  const restore = () => { if (btn) { btn.disabled = false; btn.textContent = "Create baseline"; } };
+  try {
+    await api("/api/servers/" + encodeURIComponent(id) + "/baseline", { method: "POST", body: {} });
+  } catch (err) {
+    toast("Baseline failed: " + ((err && err.message) || err));
+    restore();
+    return;
+  }
+  toast("Baseline started — dumping the source and uploading…");
+  const done = await pollBaseline(id);
+  restore();
+  if (done && done.state === "succeeded") {
+    toast("Baseline complete: " + (done.tables || 0) + " table(s)" +
+      (done.uploaded ? ", " + done.uploaded + " file(s) uploaded" : ""));
+  } else if (done) {
+    toast("Baseline failed: " + (done.last_error || "unknown error"));
+  } else {
+    toast("Baseline still running — check back shortly.");
+  }
+  if (location.pathname === "/storage") renderStorage();
+}
+
+// pollBaseline polls the per-server baseline status until it leaves "running"
+// (or a ~20-minute cap). Returns the terminal status, or null if it never
+// settled within the cap. Transient poll errors are ignored and retried.
+async function pollBaseline(id) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 600; i++) {
+    await sleep(2000);
+    let st;
+    try {
+      st = (await api("/api/servers/" + encodeURIComponent(id) + "/baseline")).baseline;
+    } catch (_) {
+      continue; // a blip mid-dump shouldn't abort the wait
+    }
+    if (st && st.state !== "running") return st;
+  }
+  return null;
 }
 
 // ── schemas / tables cascade ──────────────────────────────────────────────────

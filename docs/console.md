@@ -279,7 +279,35 @@ across the rotation dialog and the per-server edit form):
   baseline source (`baseline_dir` / `baseline_s3`): each snapshot's timestamp,
   age, table count, and (local sources) the binlog coordinates its deltas
   start from. The empty states explain how to produce a first baseline
-  (`bintrail dump` → `bintrail baseline`).
+  (`bintrail dump` → `bintrail baseline`). When the **Create baseline** button
+  is enabled (see below) it sits in this panel's header.
+
+#### Creating a baseline from the console (opt-in)
+
+By default the console only *lists* baselines — you produce them with the
+`bintrail dump` → `bintrail baseline` CLI (or the compose `baseline` profile).
+A **Create baseline** button can run that pipeline for a monitored server
+straight from the Storage page, but it is **opt-in** and only on the `watch`
+daemon:
+
+- Start `watch` with `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1` (compose: set
+  `BASELINE_TRIGGER=1` in `.env`).
+- The server must have **both** a source DSN and a baseline destination
+  (`baseline_dir` or `baseline_s3`) configured; the button 400s otherwise.
+- Clicking it runs **dump → convert → upload entirely in-process**: the console
+  image bundles `mydumper` and runs it as a **local subprocess** — it never
+  mounts the docker socket, so a console compromise can never escalate to
+  host-root. The source DSN stays inside the process (never written to disk or
+  any HTTP response). One baseline at a time per server (409 while one runs).
+- For an `s3://` destination the dump is staged under
+  `BINTRAIL_CONSOLE_BASELINE_STAGING` (default a temp dir), uploaded, then
+  discarded; for a local `baseline_dir` it is written there. Region and
+  credentials come from the daemon's ambient AWS chain, like every other S3
+  access. When it finishes the new snapshot appears in the listing.
+
+The button is hidden on the read-only `serve` console and whenever the opt-in
+is off — the CLI/compose recipe in the empty state remains the always-available
+path.
 - **AWS credentials** — which ambient credential signals the daemon process
   can see: env keys (presence only, never values), `AWS_PROFILE`,
   `AWS_REGION`, a shared `~/.aws` config, ECS task-role / EKS IRSA markers.
@@ -325,6 +353,11 @@ across the rotation dialog and the per-server edit form):
 - `BINTRAIL_CONSOLE_ARCHIVE_STAGING` (`watch` only) — local staging dir for the
   Archive-to-S3 feature, same as `--archive-staging-dir`. AWS credentials for
   the upload come from the ambient chain (`AWS_*` / `~/.aws` / role).
+- `BINTRAIL_CONSOLE_BASELINE_TRIGGER` (`watch` only) — `1`/`true` enables the
+  opt-in **Create baseline** button (runs `mydumper` → convert → upload
+  in-process; see [The Storage page](#the-storage-page)). Off by default.
+- `BINTRAIL_CONSOLE_BASELINE_STAGING` (`watch` only) — local staging dir for
+  S3-destined baselines created by that button (default a temp subdir).
 
 There is deliberately **no** environment variable for the password itself —
 env vars leak through `docker inspect`, `ps e`, and `/proc`; the password is

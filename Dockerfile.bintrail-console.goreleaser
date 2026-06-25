@@ -11,7 +11,13 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    # mydumper powers the OPT-IN in-process baseline trigger (#613): with
+    # BINTRAIL_CONSOLE_BASELINE_TRIGGER=1 the watch daemon runs mydumper here as
+    # a LOCAL subprocess (no docker socket), then converts+uploads in-process.
+    # bookworm ships mydumper < 0.18, so the console's runner omits the
+    # lighter-locking flags (a baseline holds a brief read lock — acceptable for
+    # an occasional snapshot). Idle bytes when the trigger is not enabled.
+    apt-get install -y --no-install-recommends ca-certificates mydumper && \
     rm -rf /var/lib/apt/lists/* && \
     # Pin uid 999: the bundled compose chowns the index password secret to
     # uid 999 (mode 0600) for this process to read — see docker-compose.yml.

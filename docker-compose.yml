@@ -200,6 +200,14 @@ services:
       # Left empty by default: the gate is config-based, so setting it with no
       # snapshots would show a Time-travel tab with nothing behind it.
       BINTRAIL_CONSOLE_BASELINE_DIR: ${BASELINE_DIR:-}
+      # Opt-in "Create baseline" button (#613): set BASELINE_TRIGGER=1 in .env to
+      # let the console create baseline snapshots in-process (dump→convert→upload)
+      # for a monitored server. The console image bundles mydumper and runs it as
+      # a LOCAL subprocess — NO docker socket is mounted (the console never gets
+      # host-root). A server needs a source DSN AND a baseline dir/S3 configured.
+      # Off by default. Staging for S3-destined baselines lives on the state volume.
+      BINTRAIL_CONSOLE_BASELINE_TRIGGER: ${BASELINE_TRIGGER:-}
+      BINTRAIL_CONSOLE_BASELINE_STAGING: /var/lib/bintrail/baseline-staging
       # Password login (persists next to the registry). On first run the
       # console serves a "create your password" screen; later visits sign in.
       # There is deliberately NO password env var: docker inspect must never

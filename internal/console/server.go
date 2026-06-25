@@ -75,6 +75,12 @@ type Config struct {
 	// there and every monitor verb refuses at the endpoint with 403,
 	// mirroring how reconstruct gates on baselineConfigured.
 	MonitorCtrl MonitorController
+	// BaselineCtrl runs in-process baseline snapshots (dump→convert→upload) for
+	// a monitored server (#613). Wired in ONLY by `bintrail-console watch` when
+	// the operator opts in (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1); nil otherwise,
+	// where the trigger endpoint refuses with 403 and /api/capabilities reports
+	// baseline_trigger:false. Set together with MonitorCtrl (both control-plane).
+	BaselineCtrl BaselineController
 	// BaselineDir / BaselineS3 enable point-in-time reconstruct (Phase 2) on
 	// the boot entry. When either is set (and no RBAC profile is active), the
 	// "Reconstruct" surface is exposed. BaselineDir takes precedence;
@@ -131,6 +137,9 @@ type Server struct {
 	// monitorCtrl: non-nil only when this process is a control-plane
 	// supervisor (see Config.MonitorCtrl).
 	monitorCtrl MonitorController
+	// baselineCtrl: non-nil only when the watch daemon opted into in-process
+	// baseline creation (see Config.BaselineCtrl).
+	baselineCtrl BaselineController
 	// rotationDefaults are the daemon's --rotate-* values, the fallback GET
 	// /api/rotation reports when no console override is saved.
 	rotationDefaults RotationDefaults
@@ -243,6 +252,7 @@ func New(cfg Config) (*Server, error) {
 		redactCols:       cfg.RedactColumns,
 		allowedHosts:     cfg.AllowedHosts,
 		monitorCtrl:      cfg.MonitorCtrl,
+		baselineCtrl:     cfg.BaselineCtrl,
 		rotationDefaults: cfg.RotationDefaults,
 		cm:               newConnManager(cfg.Registry, profileActive),
 		authPath:         authPath,
@@ -332,6 +342,11 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("POST /api/servers/{id}/monitor/start", s.handleMonitorStart)
 	api.HandleFunc("POST /api/servers/{id}/monitor/stop", s.handleMonitorStop)
 	api.HandleFunc("GET /api/servers/{id}/monitor", s.handleMonitorStatus)
+	// Baseline trigger: enqueue an in-process baseline (dump→convert→upload) for
+	// a monitored server. 403 unless the watch daemon opted in
+	// (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1). GET polls the running/last state.
+	api.HandleFunc("POST /api/servers/{id}/baseline", s.handleBaselineTrigger)
+	api.HandleFunc("GET /api/servers/{id}/baseline", s.handleBaselineStatus)
 	// Global built-in-rotation policy: read the effective settings; PUT an
 	// override (refused on the read-only console — only the watch daemon runs
 	// the loop that consumes it).

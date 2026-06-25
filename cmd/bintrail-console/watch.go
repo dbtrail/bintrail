@@ -77,6 +77,13 @@ var (
 	upConsoleAllowedHost []string
 	upConsoleAllowSetup  bool
 	upArchiveStageDir    string
+	// upConsoleBaselineTrigger opts into in-process baseline creation from the
+	// console (#613). Env-only (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1) — off by
+	// default because it needs mydumper in the image and reaches the source DB.
+	upConsoleBaselineTrigger bool
+	// upBaselineStageDir is the local staging base for S3-destined baselines
+	// (BINTRAIL_CONSOLE_BASELINE_STAGING); default a temp subdir.
+	upBaselineStageDir string
 
 	upRotateRetain    string
 	upRotateInterval  string
@@ -354,6 +361,9 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
+	if upConsoleBaselineTrigger {
+		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir())
+	}
 
 	// Built-in rotation covers the boot index plus every per-source database
 	// the control plane provisions — the unattended quickstart's real data
@@ -452,6 +462,9 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// the HTTP requests that start them.
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
+	if upConsoleBaselineTrigger {
+		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir())
+	}
 
 	// Built-in rotation: boot index + every per-source database the control
 	// plane provisions, on the daemon lifecycle. Live settings provider so the
@@ -602,6 +615,24 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 			upArchiveStageDir = v
 		}
 	}
+	// Baseline trigger is env-only (no flag): opt-in plus an optional staging dir.
+	if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_TRIGGER"); v == "1" || v == "true" {
+		upConsoleBaselineTrigger = true
+	}
+	if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_STAGING"); v != "" {
+		upBaselineStageDir = v
+	}
+}
+
+// baselineStagingDir resolves the local staging base for baselines destined for
+// S3 (BINTRAIL_CONSOLE_BASELINE_STAGING). The dump and the staged Parquet are
+// written under a fresh temp subdir here per run and removed after upload, so a
+// leftover never causes a re-upload of an old snapshot. Default: an OS temp subdir.
+func baselineStagingDir() string {
+	if upBaselineStageDir != "" {
+		return upBaselineStageDir
+	}
+	return filepath.Join(os.TempDir(), "bintrail-baseline-staging")
 }
 
 // consoleOpts carries watch's console-surface settings into upConsoleConfig —
