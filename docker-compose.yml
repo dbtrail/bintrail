@@ -267,8 +267,9 @@ services:
     image: mydumper/mydumper:v1.0.3-1
     environment:
       BASELINE_SOURCE_DSN: ${BASELINE_SOURCE_DSN:-${SOURCE_DSN:-}}
-      # Comma-separated schemas to snapshot (defaults to SCHEMAS; empty =
-      # everything mydumper dumps by default).
+      # Comma-separated schemas to snapshot (defaults to SCHEMAS; empty = all
+      # USER schemas — the system schemas mysql/sys/performance_schema/
+      # information_schema are always excluded, see the dump command below).
       BASELINE_SCHEMAS: ${BASELINE_SCHEMAS:-${SCHEMAS:-}}
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -318,6 +319,15 @@ services:
             *,*) set -- "$$@" --regex "^($$(printf '%s' "$$schemas" | tr ',' '|'))\\." ;;
             *)   set -- "$$@" --database "$$schemas" ;;
           esac
+        else
+          # No explicit schemas: dump every USER schema but exclude the system
+          # ones. A least-privilege capture user (REPLICATION + SELECT, no
+          # SHOW VIEW) cannot read the sys views, so an unfiltered mydumper dies
+          # with "SHOW VIEW command denied ... sys.host_summary" — and the system
+          # schemas are useless as a baseline anyway. Negative-lookahead PCRE
+          # (mydumper uses PCRE) drops any system db, both bare and <db>.<table>;
+          # $$ is a literal $ after compose interpolation, \\. a literal \.
+          set -- "$$@" --regex "^(?!(mysql|sys|performance_schema|information_schema)($$|\\.))"
         fi
         set -- "$$@" --outputdir /dump/snapshot
         mydumper "$$@"
