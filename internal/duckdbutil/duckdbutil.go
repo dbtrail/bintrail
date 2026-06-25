@@ -17,47 +17,53 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-// LoadHTTPFS installs and loads the DuckDB httpfs extension on db, first pinning
-// a writable home directory. DuckDB extracts and caches extensions under
-// $HOME/.duckdb; a process running as a homeless user — a container user created
-// with `useradd --no-create-home`, so $HOME points at a directory that does not
-// exist — otherwise fails INSTALL with "IO Error: Can't find the home directory
-// at '/home/<user>'". The pragma and INSTALL run in ONE statement so they share
-// a single pooled connection (a separate SET could land on a different conn).
-// Callers wrap the returned error with their own context.
+// LoadHTTPFS installs and loads the DuckDB httpfs extension on db, first making
+// sure $HOME points at a writable directory. DuckDB extracts and caches
+// extensions under $HOME/.duckdb; a process running as a homeless user — a
+// container user created with `useradd --no-create-home`, so $HOME points at a
+// directory that does not exist — otherwise fails INSTALL with "IO Error: Can't
+// find the home directory at '/home/<user>'". Callers wrap the returned error
+// with their own context.
 func LoadHTTPFS(ctx context.Context, db execer) error {
-	_, err := db.ExecContext(ctx, homeDirPragma()+"INSTALL httpfs; LOAD httpfs;")
+	ensureWritableHome()
+	_, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;")
 	return err
 }
 
-// homeDirPragma returns a "SET home_directory='...'; " statement pinning a
-// guaranteed-existing, writable directory — or "" when $HOME already resolves to
-// an existing directory, so DuckDB's default is left untouched in the normal
-// case. The fallback directory is created best-effort under the OS temp dir.
-// The trailing space and semicolon let it be prepended directly to an INSTALL.
-func homeDirPragma() string {
+// ensureWritableHome points $HOME at an existing, writable directory when it is
+// not already, so DuckDB can install AND autoload its extensions on every pooled
+// connection. The env is the only lever that reaches all of them: a session
+// `SET home_directory` is connection-scoped and — critically — only covers an
+// explicit INSTALL, NOT the autoload that a `CREATE SECRET` / `parquet_scan`
+// triggers on its own connection (that autoload resolves the home from $HOME, so
+// it would still fail with "Can't find the home directory"). No-op when $HOME
+// already resolves to an existing directory, so a valid setup is never touched —
+// only an already-broken $HOME is changed. Best-effort: if no writable directory
+// can be provisioned at all, it logs at WARN and leaves $HOME as-is so DuckDB
+// surfaces its own error rather than this masking it.
+func ensureWritableHome() {
 	if h, err := os.UserHomeDir(); err == nil && h != "" {
 		if fi, statErr := os.Stat(h); statErr == nil && fi.IsDir() {
-			return "" // $HOME is usable — no override needed.
+			return // $HOME is usable — leave it alone.
 		}
 	}
 	dir := filepath.Join(os.TempDir(), "bintrail-duckdb")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		// $TMPDIR itself is broken/unwritable. Don't blindly re-pin os.TempDir()
-		// (it returns $TMPDIR verbatim with no existence check, which would
-		// resurface the very "Can't find the home directory" error this targets).
-		// MkdirTemp creates AND validates a writable dir; if even that fails the
-		// host has no usable temp space, so log loudly and skip the override —
-		// DuckDB then surfaces its own error rather than us masking it.
+		// $TMPDIR itself is broken/unwritable. Don't blindly trust os.TempDir()
+		// (it returns $TMPDIR verbatim with no existence check). MkdirTemp creates
+		// AND validates a writable dir; if even that fails the host has no usable
+		// temp space, so log loudly and leave $HOME untouched.
 		td, tmpErr := os.MkdirTemp("", "bintrail-duckdb-")
 		if tmpErr != nil {
-			slog.Warn("duckdb: could not create a writable home directory for extension install; S3 reads may fail",
+			slog.Warn("duckdb: could not provision a writable home directory for extension install; S3 reads may fail",
 				"tried", dir, "mkdir_error", err, "mkdtemp_error", tmpErr)
-			return ""
+			return
 		}
 		dir = td
 	}
-	return "SET home_directory='" + strings.ReplaceAll(dir, "'", "''") + "'; "
+	if err := os.Setenv("HOME", dir); err != nil {
+		slog.Warn("duckdb: could not set HOME for extension install; S3 reads may fail", "dir", dir, "error", err)
+	}
 }
 
 // EnableS3CredentialChain gives a DuckDB session AWS-SDK credentials for
@@ -107,7 +113,8 @@ func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region strin
 	if os.Getenv("BINTRAIL_DUCKDB_NO_AWS_EXT") != "" {
 		return
 	}
-	if _, err := db.ExecContext(ctx, homeDirPragma()+"INSTALL aws; LOAD aws;"); err != nil {
+	ensureWritableHome()
+	if _, err := db.ExecContext(ctx, "INSTALL aws; LOAD aws;"); err != nil {
 		if os.Getenv("AWS_ACCESS_KEY_ID") != "" {
 			slog.Debug("duckdb: aws extension unavailable; S3 reads fall back to env-key resolution",
 				"error", err)
@@ -122,6 +129,9 @@ func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region strin
 		secret += ", REGION '" + strings.ReplaceAll(region, "'", "''") + "'"
 	}
 	secret += ")"
+	// ensureWritableHome (above) has already pointed $HOME at a writable dir, so
+	// the httpfs autoload this CREATE SECRET triggers resolves its home correctly
+	// even under a homeless user.
 	if _, err := db.ExecContext(ctx, secret); err != nil {
 		slog.Warn("duckdb: AWS credential chain resolved no usable credentials for S3 reads",
 			"error", err)

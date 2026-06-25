@@ -38,7 +38,7 @@ RUN apt-get update && \
     mkdir -p /var/lib/bintrail && chown bintrail /var/lib/bintrail && \
     # Home dir for the bintrail user: DuckDB caches its httpfs/aws extensions
     # under $HOME/.duckdb for S3 baseline/reconstruct/archive reads and fails
-    # INSTALL without one. (The duckdbutil loader also pins a fallback dir.)
+    # INSTALL without one. (The duckdbutil loader pins a fallback if $HOME is missing.)
     mkdir -p /home/bintrail && chown bintrail /home/bintrail
 
 COPY --from=builder /bintrail /usr/local/bin/bintrail
