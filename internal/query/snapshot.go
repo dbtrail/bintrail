@@ -56,7 +56,7 @@ func FetchSnapshot(ctx context.Context, path string, opts Options) ([]ResultRow,
 	}
 	defer db.Close()
 	if strings.HasPrefix(path, "s3://") {
-		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return nil, fmt.Errorf("load httpfs: %w", err)
 		}
 		duckdbutil.EnableS3CredentialChain(ctx, db)

@@ -43,7 +43,19 @@ func homeDirPragma() string {
 	}
 	dir := filepath.Join(os.TempDir(), "bintrail-duckdb")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		dir = os.TempDir()
+		// $TMPDIR itself is broken/unwritable. Don't blindly re-pin os.TempDir()
+		// (it returns $TMPDIR verbatim with no existence check, which would
+		// resurface the very "Can't find the home directory" error this targets).
+		// MkdirTemp creates AND validates a writable dir; if even that fails the
+		// host has no usable temp space, so log loudly and skip the override —
+		// DuckDB then surfaces its own error rather than us masking it.
+		td, tmpErr := os.MkdirTemp("", "bintrail-duckdb-")
+		if tmpErr != nil {
+			slog.Warn("duckdb: could not create a writable home directory for extension install; S3 reads may fail",
+				"tried", dir, "mkdir_error", err, "mkdtemp_error", tmpErr)
+			return ""
+		}
+		dir = td
 	}
 	return "SET home_directory='" + strings.ReplaceAll(dir, "'", "''") + "'; "
 }

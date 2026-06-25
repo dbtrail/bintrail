@@ -308,7 +308,7 @@ func s3ParquetRowCount(ctx context.Context, bucket, key string) (int64, error) {
 		return 0, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer db.Close()
-	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+	if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 		return 0, fmt.Errorf("load httpfs extension: %w", err)
 	}
 	duckdbutil.EnableS3CredentialChain(ctx, db)
