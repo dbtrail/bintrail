@@ -9,15 +9,22 @@
 # glibc for DuckDB's static libs and a shell for debugging. One binary per
 # image (PMM-style) — the core CLI ships as ghcr.io/dbtrail/bintrail.
 FROM debian:bookworm-slim
+ARG TARGETARCH
 
+# mydumper powers the OPT-IN in-process baseline trigger (#613): with
+# BINTRAIL_CONSOLE_BASELINE_TRIGGER=1 the watch daemon runs mydumper here as a
+# LOCAL subprocess (no docker socket), then converts+uploads in-process. We pin
+# the SAME version the compose baseline-dump pipeline uses (mydumper v1.0.3-1) so
+# console-created baselines are identical to CLI/compose ones — bookworm's apt
+# mydumper is 0.10, too old for the CONSISTENT lock-free --trx-tables snapshot a
+# least-privilege replication user (no RELOAD/FLUSH_TABLES) needs (verified against
+# a real Percona 8.0 source). Idle bytes when the trigger is not enabled.
 RUN apt-get update && \
-    # mydumper powers the OPT-IN in-process baseline trigger (#613): with
-    # BINTRAIL_CONSOLE_BASELINE_TRIGGER=1 the watch daemon runs mydumper here as
-    # a LOCAL subprocess (no docker socket), then converts+uploads in-process.
-    # bookworm ships mydumper < 0.18, so the console's runner omits the
-    # lighter-locking flags (a baseline holds a brief read lock — acceptable for
-    # an occasional snapshot). Idle bytes when the trigger is not enabled.
-    apt-get install -y --no-install-recommends ca-certificates mydumper && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates wget libatomic1 libglib2.0-0 libpcre2-8-0 zstd && \
+    wget -q "https://github.com/mydumper/mydumper/releases/download/v1.0.3-1/mydumper_1.0.3-1.bookworm_${TARGETARCH}.deb" -O /tmp/mydumper.deb && \
+    dpkg -i /tmp/mydumper.deb && \
+    rm -f /tmp/mydumper.deb && \
     rm -rf /var/lib/apt/lists/* && \
     # Pin uid 999: the bundled compose chowns the index password secret to
     # uid 999 (mode 0600) for this process to read — see docker-compose.yml.

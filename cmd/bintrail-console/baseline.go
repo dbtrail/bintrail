@@ -142,10 +142,9 @@ func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stat
 
 // runMydumper invokes the bundled mydumper binary against the source DSN, writing
 // a consistent dump (with binlog coordinates in its metadata, which baseline.Run
-// reads) into dumpDir. The lighter-locking flags (--sync-thread-lock-mode /
-// --trx-tables, mydumper >= 0.18) are deliberately omitted: a baseline is an
-// occasional operation, and omitting them keeps this working on ANY mydumper
-// version the image happens to ship without a version probe.
+// reads) into dumpDir. The image pins the SAME mydumper version the compose
+// baseline-dump pipeline uses, so a console-created baseline matches a CLI/compose
+// one exactly.
 func runMydumper(ctx context.Context, sourceDSN string, schemas []string, dumpDir string) error {
 	host, port, user, password, err := config.ParseSourceDSN(sourceDSN)
 	if err != nil {
@@ -164,9 +163,22 @@ func runMydumper(ctx context.Context, sourceDSN string, schemas []string, dumpDi
 	return nil
 }
 
+// systemSchemaExcludeRegex dumps every USER schema but excludes the MySQL system
+// schemas, matching the compose baseline-dump pipeline (#612). A least-privilege
+// capture user (REPLICATION + SELECT, no SHOW VIEW) cannot read the sys views, so
+// an unfiltered mydumper dies with "SHOW VIEW command denied … sys.host_summary";
+// the system schemas are useless as a baseline anyway. mydumper uses PCRE, so the
+// negative lookahead drops a system db both bare and as <db>.<table>.
+const systemSchemaExcludeRegex = `^(?!(mysql|sys|performance_schema|information_schema)($|\.))`
+
 // buildConsoleMydumperArgs builds the mydumper argument slice for the console's
-// in-process dump. Single schema → --database; multiple → an anchored --regex;
-// none → all schemas. Extracted for unit testing without a live mydumper.
+// in-process dump. It mirrors `bintrail dump` / the compose baseline-dump
+// invocation: a CONSISTENT lock-free snapshot (--sync-thread-lock-mode NO_LOCK
+// --trx-tables — no global FTWRL, so a least-privilege replication user WITHOUT
+// RELOAD/FLUSH_TABLES can dump; verified against a real Percona 8.0 source).
+// Schema selection: single → --database; multiple → an anchored --regex; none →
+// every user schema with the system schemas excluded. Extracted for unit testing
+// without a live mydumper.
 func buildConsoleMydumperArgs(host string, port uint16, user, password string, schemas []string, dumpDir string) []string {
 	args := []string{
 		"--host", host,
@@ -175,6 +187,7 @@ func buildConsoleMydumperArgs(host string, port uint16, user, password string, s
 		"--threads", "4",
 		"--compress-protocol",
 		"--complete-insert",
+		"--sync-thread-lock-mode", "NO_LOCK", "--trx-tables",
 	}
 	if password != "" {
 		args = append(args, "--password", password)
@@ -184,6 +197,8 @@ func buildConsoleMydumperArgs(host string, port uint16, user, password string, s
 		args = append(args, "--database", schemas[0])
 	case len(schemas) > 1:
 		args = append(args, "--regex", "^("+strings.Join(schemas, "|")+")\\.")
+	default:
+		args = append(args, "--regex", systemSchemaExcludeRegex)
 	}
 	// --outputdir last: docker wrapper scripts read the last arg for the mount.
 	args = append(args, "--outputdir", dumpDir)

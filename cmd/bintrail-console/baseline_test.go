@@ -10,10 +10,28 @@ import (
 // invariants the dump relies on: a password only when present, and --outputdir
 // last (docker wrappers read the final arg as the mount path).
 func TestBuildConsoleMydumperArgs(t *testing.T) {
-	t.Run("no schema filter dumps everything", func(t *testing.T) {
+	t.Run("consistent lock-free flags always present", func(t *testing.T) {
+		// These let a least-privilege replication user (no RELOAD/FLUSH_TABLES)
+		// dump consistently — verified against a real Percona 8.0 source. Their
+		// absence is the bug that produced a schema-only dump.
+		args := buildConsoleMydumperArgs("h", 3306, "u", "pw", []string{"x"}, "/out")
+		if valueAfter(args, "--sync-thread-lock-mode") != "NO_LOCK" {
+			t.Errorf("missing --sync-thread-lock-mode NO_LOCK: %v", args)
+		}
+		if !has(args, "--trx-tables") {
+			t.Errorf("missing --trx-tables: %v", args)
+		}
+	})
+
+	t.Run("no schema filter excludes system schemas", func(t *testing.T) {
 		args := buildConsoleMydumperArgs("h", 3306, "u", "pw", nil, "/out")
-		if has(args, "--database") || has(args, "--regex") {
-			t.Errorf("no schema filter should add neither --database nor --regex: %v", args)
+		if has(args, "--database") {
+			t.Errorf("no schema filter must not use --database: %v", args)
+		}
+		// A least-privilege user can't read the sys views, so an unfiltered dump
+		// dies; the no-filter case must exclude the system schemas instead.
+		if v := valueAfter(args, "--regex"); v != systemSchemaExcludeRegex {
+			t.Errorf("--regex = %q, want the system-schema exclusion: %v", v, args)
 		}
 		assertOutputdirLast(t, args, "/out")
 	})
