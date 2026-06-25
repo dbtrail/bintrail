@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -41,7 +43,31 @@ func NewS3Client(ctx context.Context, region string) (*s3.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
+	// LoadDefaultConfig resolves region from AWS_REGION/AWS_DEFAULT_REGION and the
+	// shared config — but NOT from EC2/ECS IMDS. In an IAM-role-only deployment
+	// with no AWS_REGION set (e.g. the bundled console on EC2, where the in-process
+	// baseline upload passes region=""), the region ends up empty and every request
+	// fails with "region was not a valid DNS name". Fall back to the instance's
+	// IMDS region in that case.
+	if region == "" && awsCfg.Region == "" {
+		if r := imdsRegion(ctx, awsCfg); r != "" {
+			awsCfg.Region = r
+		}
+	}
 	return s3.NewFromConfig(awsCfg), nil
+}
+
+// imdsRegion best-effort fetches the EC2/ECS instance region from IMDS. Returns
+// "" off-instance or on any error; a short timeout keeps it from hanging where
+// IMDS is unreachable (a non-AWS host, or a hop-limited container).
+func imdsRegion(ctx context.Context, cfg aws.Config) string {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	out, err := imds.NewFromConfig(cfg).GetRegion(ctx, &imds.GetRegionInput{})
+	if err != nil || out == nil {
+		return ""
+	}
+	return out.Region
 }
 
 // BuildS3Key constructs the S3 object key for a file by computing its path
