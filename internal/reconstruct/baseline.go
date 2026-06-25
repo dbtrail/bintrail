@@ -81,7 +81,7 @@ func ReadBaselineRows(ctx context.Context, path string, filter map[string]string
 	}
 
 	if strings.HasPrefix(path, "s3://") {
-		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return nil, fmt.Errorf("load httpfs extension: %w", err)
 		}
 		duckdbutil.EnableS3CredentialChain(ctx, db)
@@ -150,7 +150,7 @@ func ExecSQL(ctx context.Context, source, sqlStr string) ([]map[string]any, []st
 	}
 
 	if strings.Contains(source, "s3://") || strings.Contains(sqlStr, "s3://") {
-		if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return nil, nil, fmt.Errorf("load httpfs extension: %w", err)
 		}
 		duckdbutil.EnableS3CredentialChain(ctx, db)
@@ -277,7 +277,7 @@ func listBaselinesS3(ctx context.Context, s3URL string) ([]BaselineFile, error) 
 	if err := pinDuckDBSessionUTC(ctx, db); err != nil {
 		return nil, err
 	}
-	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+	if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 		return nil, fmt.Errorf("load httpfs extension: %w", err)
 	}
 	duckdbutil.EnableS3CredentialChain(ctx, db)
@@ -444,7 +444,7 @@ func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Ti
 		return "", time.Time{}, StaleWarning{}, err
 	}
 
-	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+	if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 		return "", time.Time{}, StaleWarning{}, fmt.Errorf("load httpfs extension: %w", err)
 	}
 	duckdbutil.EnableS3CredentialChain(ctx, db)

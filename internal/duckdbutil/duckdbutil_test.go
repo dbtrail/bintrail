@@ -3,11 +3,55 @@ package duckdbutil
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
+
+// TestHomeDirPragma: no override when $HOME resolves to an existing directory
+// (the normal case), and a SET home_directory when it does not — the homeless
+// user case (`useradd --no-create-home`) that broke DuckDB's INSTALL.
+func TestHomeDirPragma(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // exists ⇒ leave DuckDB's default alone
+	if p := homeDirPragma(); p != "" {
+		t.Errorf("expected no pragma when $HOME exists, got %q", p)
+	}
+
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "does-not-exist"))
+	p := homeDirPragma()
+	if !strings.HasPrefix(p, "SET home_directory='") || !strings.HasSuffix(p, "'; ") {
+		t.Errorf("expected a SET home_directory pragma for a missing $HOME, got %q", p)
+	}
+}
+
+// TestLoadHTTPFSHomelessUser is the regression guard for the reported bug: a
+// process whose $HOME points at a non-existent directory (a container user
+// created with `useradd --no-create-home`) failed httpfs INSTALL with "Can't
+// find the home directory at '/home/...'". With the home_directory pin,
+// LoadHTTPFS must never surface that error — it may still fail on an offline
+// host (extension download), but never on the home directory — and the session
+// must stay usable.
+func TestLoadHTTPFSHomelessUser(t *testing.T) {
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "no-home-here"))
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := LoadHTTPFS(context.Background(), db); err != nil &&
+		strings.Contains(err.Error(), "home directory") {
+		t.Fatalf("LoadHTTPFS must not fail on the home directory for a homeless user: %v", err)
+	}
+
+	var one int
+	if err := db.QueryRow("SELECT 1").Scan(&one); err != nil || one != 1 {
+		t.Fatalf("session unusable after LoadHTTPFS: %v (got %d)", err, one)
+	}
+}
 
 // TestEnableS3CredentialChainKeepsSessionUsable: the helper is best-effort —
 // whether the aws extension installs (network) or not (offline), it must

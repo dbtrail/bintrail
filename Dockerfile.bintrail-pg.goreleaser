@@ -17,7 +17,11 @@ RUN apt-get update && \
     # Pin uid 999 to match the rest of the image family (the bundled compose
     # chowns the index password secret to uid 999, mode 0600, for these
     # processes to read — see docker-compose.yml).
-    useradd --system --no-create-home --uid 999 bintrail
+    useradd --system --no-create-home --uid 999 bintrail && \
+    # Home dir for the bintrail user: DuckDB caches its httpfs/aws extensions
+    # under $HOME/.duckdb for S3 baseline/reconstruct/archive reads and fails
+    # INSTALL without one. (The duckdbutil loader also pins a fallback dir.)
+    mkdir -p /home/bintrail && chown bintrail /home/bintrail
 
 COPY bintrail-pg /usr/local/bin/bintrail-pg
 

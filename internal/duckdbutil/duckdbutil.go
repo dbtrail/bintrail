@@ -7,8 +7,46 @@ import (
 	"database/sql"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 )
+
+// execer is the subset of *sql.DB / *sql.Conn / *sql.Tx that LoadHTTPFS needs,
+// so callers can load the extension on whichever handle they already hold.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// LoadHTTPFS installs and loads the DuckDB httpfs extension on db, first pinning
+// a writable home directory. DuckDB extracts and caches extensions under
+// $HOME/.duckdb; a process running as a homeless user — a container user created
+// with `useradd --no-create-home`, so $HOME points at a directory that does not
+// exist — otherwise fails INSTALL with "IO Error: Can't find the home directory
+// at '/home/<user>'". The pragma and INSTALL run in ONE statement so they share
+// a single pooled connection (a separate SET could land on a different conn).
+// Callers wrap the returned error with their own context.
+func LoadHTTPFS(ctx context.Context, db execer) error {
+	_, err := db.ExecContext(ctx, homeDirPragma()+"INSTALL httpfs; LOAD httpfs;")
+	return err
+}
+
+// homeDirPragma returns a "SET home_directory='...'; " statement pinning a
+// guaranteed-existing, writable directory — or "" when $HOME already resolves to
+// an existing directory, so DuckDB's default is left untouched in the normal
+// case. The fallback directory is created best-effort under the OS temp dir.
+// The trailing space and semicolon let it be prepended directly to an INSTALL.
+func homeDirPragma() string {
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		if fi, statErr := os.Stat(h); statErr == nil && fi.IsDir() {
+			return "" // $HOME is usable — no override needed.
+		}
+	}
+	dir := filepath.Join(os.TempDir(), "bintrail-duckdb")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		dir = os.TempDir()
+	}
+	return "SET home_directory='" + strings.ReplaceAll(dir, "'", "''") + "'; "
+}
 
 // EnableS3CredentialChain gives a DuckDB session AWS-SDK credentials for
 // s3:// access: the aws extension's credential_chain provider resolves the
@@ -57,7 +95,7 @@ func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region strin
 	if os.Getenv("BINTRAIL_DUCKDB_NO_AWS_EXT") != "" {
 		return
 	}
-	if _, err := db.ExecContext(ctx, "INSTALL aws; LOAD aws;"); err != nil {
+	if _, err := db.ExecContext(ctx, homeDirPragma()+"INSTALL aws; LOAD aws;"); err != nil {
 		if os.Getenv("AWS_ACCESS_KEY_ID") != "" {
 			slog.Debug("duckdb: aws extension unavailable; S3 reads fall back to env-key resolution",
 				"error", err)

@@ -745,7 +745,7 @@ func materializeBaselineLocal(ctx context.Context, path string) (string, func(),
 	}
 	defer db.Close()
 
-	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+	if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 		os.RemoveAll(tmpDir)
 		return "", nil, fmt.Errorf("load httpfs: %w", err)
 	}

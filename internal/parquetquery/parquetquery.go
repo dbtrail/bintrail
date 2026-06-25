@@ -184,7 +184,7 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 // Go-side early termination and per-file streaming are given up here — DuckDB
 // applies the global ORDER BY + LIMIT (top-N) natively across all files.
 func fetchS3Direct(ctx context.Context, db *sql.DB, files []string, region string, maxFileSize int64, opts query.Options) ([]query.ResultRow, error) {
-	if _, err := db.ExecContext(ctx, "INSTALL httpfs; LOAD httpfs;"); err != nil {
+	if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 		return nil, fmt.Errorf("load DuckDB httpfs for S3-direct read: %w", err)
 	}
 	// Pin the bucket's region so httpfs does not 301/PermanentRedirect on a

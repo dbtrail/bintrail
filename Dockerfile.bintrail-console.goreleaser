@@ -18,7 +18,11 @@ RUN apt-get update && \
     useradd --system --no-create-home --uid 999 bintrail && \
     # Writable state dir (console server registry, etc.) — a named volume
     # mounted here inherits the ownership; the container runs as uid 999.
-    mkdir -p /var/lib/bintrail && chown bintrail /var/lib/bintrail
+    mkdir -p /var/lib/bintrail && chown bintrail /var/lib/bintrail && \
+    # Home dir for the bintrail user: DuckDB caches its httpfs/aws extensions
+    # under $HOME/.duckdb for S3 reads and fails INSTALL without one. (The
+    # duckdbutil loader also pins a fallback dir — belt-and-suspenders.)
+    mkdir -p /home/bintrail && chown bintrail /home/bintrail
 
 COPY bintrail-console /usr/local/bin/bintrail-console
 

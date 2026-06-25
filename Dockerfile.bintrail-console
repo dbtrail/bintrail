@@ -39,7 +39,13 @@ RUN apt-get update && \
     # Writable state dir (console server registry, etc.). Pre-created and
     # chowned in the image so a named volume mounted here inherits the
     # ownership — the container runs as the non-root bintrail user.
-    mkdir -p /var/lib/bintrail && chown bintrail /var/lib/bintrail
+    mkdir -p /var/lib/bintrail && chown bintrail /var/lib/bintrail && \
+    # Home dir for the bintrail user. DuckDB extracts/caches its httpfs and aws
+    # extensions under $HOME/.duckdb for S3 baseline/archive reads; without an
+    # existing home the INSTALL fails with "Can't find the home directory at
+    # '/home/bintrail'". (The duckdbutil loader also pins a fallback dir, so
+    # this is belt-and-suspenders for the bundled image.)
+    mkdir -p /home/bintrail && chown bintrail /home/bintrail
 
 COPY --from=builder /bintrail-console /usr/local/bin/bintrail-console
 
