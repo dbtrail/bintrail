@@ -278,8 +278,11 @@ Notes:
 - If the run fails with `service "baseline-dump" didn't complete
   successfully`, the cause (a mydumper error, a FATAL from the DSN/schema
   guards) is in `docker compose --profile baseline logs baseline-dump`.
-- `BASELINE_SCHEMAS` defaults to `SCHEMAS`; empty dumps everything mydumper
-  covers by default. Snapshot only what you want to time-travel.
+- `BASELINE_SCHEMAS` defaults to `SCHEMAS`; empty dumps **all user schemas**
+  (the system schemas `mysql`/`sys`/`performance_schema`/`information_schema`
+  are always excluded — a least-privilege capture user can't read the `sys`
+  views, and they're useless as a baseline). Set it to snapshot only specific
+  schemas.
 - Take a fresh baseline after `ALTER TABLE` (reconstruct needs the snapshot
   schema to match the deltas), and periodically so the binlog window between
   baseline and "now" stays short. Old snapshots are plain directories — prune
@@ -311,7 +314,7 @@ surface, use the demo image ([demo.md](./demo.md)).
 | `INDEX_MYSQL_ROOT_PASSWORD` | compose (optional) | Pin the bundled index root password (set *before* first boot; default: randomly generated into the `bintrail-index-secret` volume) |
 | `BINTRAIL_TAG` | compose (optional) | Image tag to run (default `latest`) |
 | `BASELINE_SOURCE_DSN` | compose `baseline` profile | Source MySQL to snapshot (default: `SOURCE_DSN`) |
-| `BASELINE_SCHEMAS` | compose `baseline` profile | Comma-separated schemas to snapshot (default: `SCHEMAS`) |
+| `BASELINE_SCHEMAS` | compose `baseline` profile | Comma-separated schemas to snapshot (default: `SCHEMAS`; empty = all user schemas, system schemas excluded) |
 | `BASELINE_DIR` | compose (optional) | Baseline dir for the boot `SOURCE_DSN` entry — set `/var/lib/bintrail/baselines` after the first `baseline` profile run to enable Time-travel on it |
 | `BINTRAIL_INDEX_DSN` | bintrail-mcp | Index DSN for the MCP server |
 
