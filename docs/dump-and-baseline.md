@@ -193,6 +193,7 @@ bintrail baseline \
 | `--row-group-size` | `500000` | Rows per Parquet row group |
 | `--upload` | *(disabled)* | S3 URL to upload Parquet files after generation |
 | `--upload-region` | *(from AWS env)* | AWS region for `--upload` |
+| `--baseline-retain` | *(disabled)* | Prune local snapshots older than this (`Nd`/`Nh`) once a durable S3 copy exists (requires `--upload`) |
 | `--retry` | `false` | Skip tables whose Parquet file already exists and S3 objects already uploaded |
 | `--format` | `text` | Output format: `text` or `json` |
 
@@ -246,6 +247,30 @@ With `--retry`:
 
 This makes the command safe to re-run without duplicating work.
 
+### Pruning old local snapshots (`--baseline-retain`)
+
+Periodic baselines accumulate under `--output` forever — nothing in `bintrail rotate` or the daemon's rotation loop touches them. On a long-lived host this silently fills the disk, even though every snapshot is already in S3 and therefore redundant on local disk.
+
+`--baseline-retain` reclaims that space after a successful upload:
+
+```sh
+bintrail baseline \
+  --input           /tmp/mydumper-weekly \
+  --output          /data/baselines \
+  --upload          s3://my-bucket/baselines/ \
+  --upload-region   us-east-1 \
+  --baseline-retain 14d
+```
+
+It prunes a local snapshot **only** when all of these hold — pruning never risks data:
+
+- **A durable S3 copy exists.** The snapshot's `_SUCCESS` marker must be confirmed present in S3 at the same timestamp prefix. Without `--upload` (or on a local-only setup) the prune is a deliberate, logged no-op — a local snapshot with no S3 copy is the only copy, and the only copy is never deleted. (This mirrors `bintrail rotate`'s `PruneLocalAfterUpload && --archive-s3` rule.)
+- **It is not the newest snapshot for any table.** Time-travel resolves a table to the newest snapshot that contains it (`reconstruct`), so the newest snapshot per table is always kept — even when older than the retention window. Pruning only ever narrows how far *back* local Time-travel can reach, never the present.
+- **It is past the retention window** (and at least an hour old).
+- **It is complete.** A snapshot mid-write or resumable via `--retry` (an `_INCOMPLETE` marker) is never touched.
+
+The S3 copy is **not** pruned — only the redundant local copy. To prune on a long-lived daemon instead of from cron, `bintrail-console watch` takes the same `--baseline-retain` (alongside `--baseline-dir` and `--baseline-s3`) and runs the prune on its rotation cadence. Env: `BINTRAIL_BASELINE_RETAIN` (CLI) / `BINTRAIL_CONSOLE_BASELINE_RETAIN` (`watch`).
+
 ### No database connection required
 
 `bintrail baseline` reads only files — it never connects to MySQL. This means you can:
@@ -296,8 +321,11 @@ For audit or compliance purposes, you may want periodic full baselines. A weekly
   --input  /tmp/mydumper-weekly \
   --output /data/baselines \
   --upload s3://my-bucket/baselines/ \
+  --baseline-retain 30d \
   >> /var/log/bintrail-baseline.log 2>&1
 ```
+
+`--baseline-retain 30d` keeps the last month of snapshots on local disk and prunes older ones once they are safely in S3 — see [Pruning old local snapshots](#pruning-old-local-snapshots---baseline-retain) above. Without it, a weekly job grows `/data/baselines` without bound.
 
 ### On-demand
 

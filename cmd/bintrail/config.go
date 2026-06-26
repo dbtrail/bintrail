@@ -189,6 +189,12 @@ var envSections = []envSection{
 		},
 	},
 	{
+		Header: "Baseline retention (used by bintrail baseline; prunes local snapshots once a durable S3 copy exists)",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_BASELINE_RETAIN", ""},
+		},
+	},
+	{
 		Header: "DuckDB tuning (query/recover/reconstruct: trade memory-safety for speed)",
 		Bindings: []envTemplateEntry{
 			{"BINTRAIL_ULTRAFAST", ""},

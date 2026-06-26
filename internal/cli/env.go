@@ -60,6 +60,7 @@ var EnvBindings = []EnvBinding{
 	{"rotate-retain", "BINTRAIL_ROTATE_RETAIN"},
 	{"rotate-interval", "BINTRAIL_ROTATE_INTERVAL"},
 	{"rotate-add-future", "BINTRAIL_ROTATE_ADD_FUTURE"},
+	{"baseline-retain", "BINTRAIL_BASELINE_RETAIN"},
 	{"ultrafast", "BINTRAIL_ULTRAFAST"},
 	{"duckdb-threads", "BINTRAIL_DUCKDB_THREADS"},
 	{"duckdb-memory-limit", "BINTRAIL_DUCKDB_MEMORY_LIMIT"},

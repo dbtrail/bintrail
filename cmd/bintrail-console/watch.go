@@ -16,6 +16,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
@@ -66,17 +67,18 @@ var (
 	upSkipDoctor            bool
 	upFormat                string
 
-	upConsoleListen      string
-	upConsoleToken       string
-	upConsoleBaselineDir string
-	upConsoleBaselineS3  string
-	upConsoleServersFile string
-	upConsoleAuthFile    string
-	upConsoleTLSCert     string
-	upConsoleTLSKey      string
-	upConsoleAllowedHost []string
-	upConsoleAllowSetup  bool
-	upArchiveStageDir    string
+	upConsoleListen         string
+	upConsoleToken          string
+	upConsoleBaselineDir    string
+	upConsoleBaselineS3     string
+	upConsoleBaselineRetain string
+	upConsoleServersFile    string
+	upConsoleAuthFile       string
+	upConsoleTLSCert        string
+	upConsoleTLSKey         string
+	upConsoleAllowedHost    []string
+	upConsoleAllowSetup     bool
+	upArchiveStageDir       string
 	// upConsoleBaselineTrigger opts into in-process baseline creation from the
 	// console (#613). Env-only (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1) — off by
 	// default because it needs mydumper in the image and reaches the source DB.
@@ -157,6 +159,7 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleToken, "console-token", "", "Opt-in static token for API automation (never generated; humans use the console password)")
 	watchCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface")
 	watchCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
+	watchCmd.Flags().StringVar(&upConsoleBaselineRetain, "baseline-retain", "", "Periodically prune local --baseline-dir snapshots older than this (Nd/Nh) once a durable copy exists in --baseline-s3 (never deletes the only copy or the newest snapshot per table)")
 	watchCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML (default ~/.config/bintrail/console-servers.yaml)")
 	watchCmd.Flags().StringVar(&upConsoleAuthFile, "console-auth-file", "", "Path to the console auth file enabling password login (default ~/.config/bintrail/console-auth.yaml; created with `bintrail-console user set-password`)")
 	watchCmd.Flags().StringVar(&upConsoleTLSCert, "console-tls-cert", "", "TLS certificate file (PEM); serve the console over HTTPS (requires --console-tls-key)")
@@ -373,6 +376,11 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
 	})
 
+	// Reclaim local baseline snapshots that already have a durable S3 copy (#616).
+	if err := startBaselinePruneLoop(ctx, upConsoleBaselineDir, upConsoleBaselineS3, upConsoleBaselineRetain, upRotationCfg.Interval); err != nil {
+		return err
+	}
+
 	srv, err := console.New(cfg)
 	if err != nil {
 		return err
@@ -472,6 +480,11 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	rotation.StartLoop(ctx, rotationSettingsProvider(registry), func() []rotation.RotateTarget {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
 	})
+
+	// Reclaim local baseline snapshots that already have a durable S3 copy (#616).
+	if err := startBaselinePruneLoop(ctx, upConsoleBaselineDir, upConsoleBaselineS3, upConsoleBaselineRetain, upRotationCfg.Interval); err != nil {
+		return err
+	}
 
 	// With the console comes the multi-stream control plane, so /metrics is
 	// served once at the daemon level (per-source "source" labels keep the
@@ -580,6 +593,11 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 			upConsoleBaselineS3 = v
 		}
 	}
+	if !cmd.Flags().Changed("baseline-retain") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_RETAIN"); v != "" {
+			upConsoleBaselineRetain = v
+		}
+	}
 	if !cmd.Flags().Changed("console-servers-file") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_SERVERS"); v != "" {
 			upConsoleServersFile = v
@@ -633,6 +651,69 @@ func baselineStagingDir() string {
 		return upBaselineStageDir
 	}
 	return filepath.Join(os.TempDir(), "bintrail-baseline-staging")
+}
+
+// startBaselinePruneLoop launches a periodic prune of local baseline snapshots
+// under baselineDir, reclaiming the ones that already have a durable copy in
+// baselineS3 (#616). It is a no-op unless a retention window, a local dir, AND an
+// S3 source are ALL configured — a local snapshot with no durable counterpart is
+// the only copy and is never deleted (the same invariant rotation enforces with
+// PruneLocalAfterUpload && ArchiveS3 != ""). The loop runs on the daemon context
+// and stops when it is cancelled; it shares the rotation cadence (baselines
+// change far less often than partitions, so this interval is ample). A bad
+// --baseline-retain value is a fatal misconfiguration returned BEFORE the
+// goroutine starts, so a typo fails the daemon fast rather than spinning.
+func startBaselinePruneLoop(ctx context.Context, baselineDir, baselineS3, retainRaw string, interval time.Duration) error {
+	if retainRaw == "" {
+		return nil // retention not configured — leave baselines untouched
+	}
+	retain, err := cliutil.ParseRetain(retainRaw)
+	if err != nil {
+		return fmt.Errorf("--baseline-retain: %w", err)
+	}
+	if baselineDir == "" {
+		slog.Warn("--baseline-retain is set but --baseline-dir is not; nothing local to prune")
+		return nil
+	}
+	if baselineS3 == "" {
+		slog.Warn("--baseline-retain is set but --baseline-s3 is not; refusing to prune local baselines (they are the only copy)")
+		return nil
+	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	slog.Info("baseline prune loop enabled", "dir", baselineDir, "s3", baselineS3, "retain", retainRaw, "interval", interval)
+	go func() {
+		runOnce := func() {
+			res, err := baseline.PruneLocal(ctx, baseline.PruneOptions{
+				LocalDir: baselineDir,
+				S3URL:    baselineS3,
+				Retain:   retain,
+			})
+			if err != nil {
+				slog.Warn("baseline prune cycle failed", "error", err)
+				return
+			}
+			if len(res.Pruned) > 0 {
+				slog.Info("baseline prune cycle complete",
+					"pruned", len(res.Pruned), "reclaimed_bytes", res.ReclaimedBytes)
+			}
+		}
+		// One sweep shortly after startup (the min-age floor protects any
+		// just-created snapshot), then on the interval.
+		runOnce()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				runOnce()
+			}
+		}
+	}()
+	return nil
 }
 
 // consoleOpts carries watch's console-surface settings into upConsoleConfig —
