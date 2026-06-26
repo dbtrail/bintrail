@@ -356,16 +356,37 @@ func TestOne_LostSlotResume_PersistsLossBadge(t *testing.T) {
 	}, "replication slot active")
 	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (1, 'a')", tbl))
 	waitFor(t, 15*time.Second, func() bool {
-		var n int
-		if err := indexDB.QueryRow("SELECT COUNT(*) FROM binlog_events WHERE table_name = ?", tbl).Scan(&n); err != nil {
-			return false
+		// The resume path needs a DURABLE checkpoint, not just a flushed row. Polling
+		// binlog_events was the #607 race: checkpoint() runs flush() (row → binlog_events)
+		// but only calls saveCheckpointPG when lastCommitLSN != 0, so a ticker flush can
+		// land the row while the COMMIT is still undrained (lastCommitLSN == 0) — the row
+		// appears before any checkpoint exists. A resume then finds no prior cursor and
+		// never returns ErrSlotMissingOnResume. binlog_position (the commit LSN) is written
+		// ONLY by saveCheckpointPG, so a non-zero value is the real "resumable cursor
+		// durable" signal, and it is deterministic across PG versions.
+		var pos uint64
+		if err := indexDB.QueryRow("SELECT binlog_position FROM stream_state WHERE id = 1").Scan(&pos); err != nil {
+			return false // no row yet → keep waiting
 		}
-		return n >= 1 // a flush happened → a checkpoint row exists in stream_state
-	}, "first row indexed (checkpoint saved)")
+		return pos > 0
+	}, "first checkpoint persisted (resumable cursor durable)")
 	cancel()
 	if err := <-runErr; err != nil {
 		t.Fatalf("first run returned error: %v", err)
 	}
+
+	// One has returned, but PostgreSQL clearing the slot's active_pid (the walsender
+	// backend exiting) lags the client's clean Terminate — and that lag varies by PG
+	// version. Without this gate, the pg_drop_replication_slot below races the backend
+	// exit and errors 55006 "replication slot is active for PID" on PG 15/16 (it passed
+	// on 14/17): the #607 flake. Wait for the slot to go inactive before dropping it.
+	waitFor(t, 15*time.Second, func() bool {
+		var active bool
+		if err := pg.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&active); err != nil {
+			return false // slot row must still exist here (not dropped yet); transient → keep waiting
+		}
+		return !active
+	}, "replication slot inactive (walsender backend exited)")
 
 	// ── Drop the slot: the WAL behind the saved checkpoint is now gone. ──
 	mustExec(fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slot))
