@@ -99,14 +99,24 @@ func TestCapturer_Integration(t *testing.T) {
 	go func() { runErr <- cap.Run(runCtx, events) }()
 
 	// Wait until the slot is active (Run has started replication) before any DML, so
-	// every change below is within the captured range.
+	// every change below is within the captured range. `active` alone is not enough:
+	// a slot can be active=true while confirmed_flush_lsn is still NULL (the slot is
+	// acquired but confirmed_flush_lsn is not yet visible — it is populated from the
+	// consumer's standby feedback, initially the slot's consistent point), and
+	// confirmedFlush below
+	// scans confirmed_flush_lsn::text into a string — NULL then errors "cannot scan
+	// NULL into *string". That NULL window's timing is PG-version-sensitive (it bit
+	// PG 15). Gate on a non-NULL confirmed_flush_lsn so the baseline is the real
+	// consistent point.
 	waitFor(t, 10*time.Second, func() bool {
-		var active bool
-		if err := setup.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&active); err != nil {
+		var active, hasFlush bool
+		if err := setup.QueryRow(ctx,
+			"SELECT active, confirmed_flush_lsn IS NOT NULL FROM pg_replication_slots WHERE slot_name=$1",
+			slot).Scan(&active, &hasFlush); err != nil {
 			return false
 		}
-		return active
-	}, "replication slot to become active")
+		return active && hasFlush
+	}, "replication slot active with a confirmed_flush_lsn")
 
 	baseline := confirmedFlush(t, setup, slot) // ≈ the slot's consistent point
 
