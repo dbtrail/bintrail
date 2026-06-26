@@ -208,7 +208,7 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		return nil, err
 	}
 
-	return imagesToResult(images, h.effectiveColumnOrder(q))
+	return h.fullTableResult(q, images)
 }
 
 // pkColumnMetas returns the primary-key column metas of schema.table from the

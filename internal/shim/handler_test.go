@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"slices"
 	"strings"
@@ -940,6 +941,143 @@ func TestImagesToResultBuildsResultset(t *testing.T) {
 				t.Errorf("cols = %v, want %v", gotCols, tc.wantCols)
 			}
 		})
+	}
+}
+
+// TestFullTableColumns pins the #600 fix: the full-table column list
+// keeps ddlOrder verbatim (NULL-filling columns no image carries) AND
+// appends image-only keys (sorted) — most importantly a column dropped
+// between the AS OF instant and now, whose value is still in the index.
+func TestFullTableColumns(t *testing.T) {
+	cases := []struct {
+		name     string
+		images   []map[string]any
+		ddlOrder []string
+		want     []string
+	}{
+		{
+			// The reported bug: coupon_code was DROPPED after AS OF, so the
+			// latest snapshot (ddlOrder) is [id,total] but the captured image
+			// still carries coupon_code. Pre-#600 it was strict-projected away.
+			name:     "dropped_column_appended",
+			images:   []map[string]any{{"id": 1, "total": 100, "coupon_code": "SAVE10"}},
+			ddlOrder: []string{"id", "total"},
+			want:     []string{"id", "total", "coupon_code"},
+		},
+		{
+			// No schema drift across the window → byte-identical to ddlOrder.
+			name:     "no_drift_is_identity",
+			images:   []map[string]any{{"id": 1, "sku": "A", "qty": 3}},
+			ddlOrder: []string{"id", "sku", "qty"},
+			want:     []string{"id", "sku", "qty"},
+		},
+		{
+			// ddlOrder column absent from every image is still emitted (NULL on
+			// the wire) — the ADD-column-after semantics locked by
+			// TestImagesToResultDDLOrderStrictWhenSnapshotPresent. The fix must
+			// not regress this: it only APPENDS, never intersects.
+			name:     "missing_ddl_column_retained_plus_extra_appended",
+			images:   []map[string]any{{"id": 1, "coupon_code": "SAVE10"}},
+			ddlOrder: []string{"id", "total"},
+			want:     []string{"id", "total", "coupon_code"},
+		},
+		{
+			// Extras are the UNION across images, deduped and sorted — a column
+			// appearing only in a later event must not be dropped.
+			name: "extras_union_across_images_sorted",
+			images: []map[string]any{
+				{"id": 1, "zeta": 1},
+				{"id": 2, "alpha": 2},
+				{"id": 3, "zeta": 3},
+			},
+			ddlOrder: []string{"id"},
+			want:     []string{"id", "alpha", "zeta"},
+		},
+		{
+			// No resolved snapshot → union of all image keys, sorted.
+			name: "no_ddlorder_unions_image_keys",
+			images: []map[string]any{
+				{"id": 1, "sku": "A"},
+				{"id": 2, "sku": "B", "added": "X"},
+			},
+			ddlOrder: nil,
+			want:     []string{"added", "id", "sku"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := fullTableColumns(tc.images, tc.ddlOrder)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("fullTableColumns = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFullTableColumnsDoesNotMutateDDLOrder guards the append-into-caller
+// hazard: ddlOrder is shared (it comes from a cached resolver), so appending
+// extras must allocate a fresh slice, never scribble into ddlOrder's backing
+// array.
+func TestFullTableColumnsDoesNotMutateDDLOrder(t *testing.T) {
+	ddlOrder := make([]string, 2, 8) // spare capacity → append would reuse it
+	ddlOrder[0], ddlOrder[1] = "id", "total"
+	_ = fullTableColumns([]map[string]any{{"id": 1, "coupon_code": "X"}}, ddlOrder)
+	if !slices.Equal(ddlOrder, []string{"id", "total"}) {
+		t.Errorf("ddlOrder was mutated to %v; must stay [id total]", ddlOrder)
+	}
+}
+
+// TestFullTableColumnsMatchesSingleRowColumnSet pins acceptance criterion #3
+// of #600 (asymmetry gone) at the pure-function level for the REPORTED drop
+// case: when the image carries every latest-snapshot column plus a
+// since-dropped one, the full-table column SET equals the single-row
+// (orderColumns) set — so adding/removing a `WHERE pk=` never hides the
+// dropped column. (The two are not equal in general: full-table is a superset
+// that also NULL-fills snapshot columns no image carries — see
+// fullTableColumns' doc. Here every ddlOrder column is in the image, so the
+// superset collapses to equality.)
+func TestFullTableColumnsMatchesSingleRowColumnSet(t *testing.T) {
+	image := map[string]any{"id": 1, "total": 100, "coupon_code": "SAVE10"}
+	ddlOrder := []string{"id", "total"} // coupon_code dropped from latest snapshot
+
+	full := fullTableColumns([]map[string]any{image}, ddlOrder)
+	single := orderColumns(image, ddlOrder)
+
+	fullSet, singleSet := map[string]bool{}, map[string]bool{}
+	for _, c := range full {
+		fullSet[c] = true
+	}
+	for _, c := range single {
+		singleSet[c] = true
+	}
+	if !maps.Equal(fullSet, singleSet) {
+		t.Errorf("column set mismatch: full-table=%v single-row=%v", full, single)
+	}
+}
+
+// TestImagesToResultVerbatimNeverAppendsExtras pins the explicit-projection
+// contract: imagesToResultVerbatim projects onto cols EXACTLY, NULL-filling
+// missing keys and never surfacing an image-only key the user didn't list.
+// This is the multi-row counterpart of imageToResultVerbatim and the builder
+// fullTableResult routes #313 projections to.
+func TestImagesToResultVerbatimNeverAppendsExtras(t *testing.T) {
+	images := []map[string]any{
+		{"id": 1, "total": 100, "coupon_code": "SAVE10"}, // carries an off-projection key
+		{"id": 2, "total": 200},                          // missing nothing the user asked for
+	}
+	res, err := imagesToResultVerbatim(images, []string{"id", "total"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCols := make([]string, len(res.Resultset.Fields))
+	for i, f := range res.Resultset.Fields {
+		gotCols[i] = string(f.Name)
+	}
+	if want := []string{"id", "total"}; !slices.Equal(gotCols, want) {
+		t.Errorf("cols = %v, want %v (coupon_code must NOT be appended)", gotCols, want)
+	}
+	if got := len(res.Resultset.RowDatas); got != 2 {
+		t.Errorf("rows = %d, want 2", got)
 	}
 }
 
@@ -2273,11 +2411,15 @@ func TestHandleShowTablesFromVirtual(t *testing.T) {
 
 // ─── #313 column projection ───────────────────────────────────────────────────
 
-// TestEffectiveColumnOrder verifies the branch point that #313 added:
-// a non-nil q.Columns short-circuits the snapshot-driven DDL ordering
-// and returns the user's listed columns verbatim; a nil q.Columns
-// preserves the previous behaviour (delegate to columnOrderFor).
-func TestEffectiveColumnOrder(t *testing.T) {
+// TestFullTableResultProjection verifies the branch point #313 added and #600
+// re-confirmed: a non-nil q.Columns projects the user's columns VERBATIM (no
+// image-only keys appended), while a nil q.Columns (SELECT *) takes the
+// snapshot order and UNIONs image-only keys. The explicit-projection subtest
+// is the regression guard for #600: when imagesToResult began unioning extras,
+// the shared full-table path would have silently widened a user's `SELECT
+// id, name` to also include image keys they never asked for — fullTableResult
+// routes explicit projections to imagesToResultVerbatim to prevent that.
+func TestFullTableResultProjection(t *testing.T) {
 	resolverFn := func() (*metadata.Resolver, error) {
 		return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
 			"appdb.users": {
@@ -2295,40 +2437,52 @@ func TestEffectiveColumnOrder(t *testing.T) {
 		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		resolverFn: resolverFn,
 	}
+	// Image carries every snapshot column PLUS an off-snapshot key (legacy_col)
+	// — the since-dropped-column shape from #600.
+	images := []map[string]any{
+		{"id": 1, "email": "a@x", "name": "ann", "created_at": "t0", "legacy_col": "L"},
+	}
+	cols := func(res *gomysql.Result) []string {
+		got := make([]string, len(res.Resultset.Fields))
+		for i, f := range res.Resultset.Fields {
+			got[i] = string(f.Name)
+		}
+		return got
+	}
 
-	t.Run("nil_columns_uses_ddl_order", func(t *testing.T) {
-		q := TimeTravelQuery{Schema: "appdb", Table: "users", Columns: nil}
-		got := h.effectiveColumnOrder(q)
-		want := []string{"id", "email", "name", "created_at"}
-		if !slices.Equal(got, want) {
-			t.Errorf("got %v, want %v", got, want)
+	t.Run("select_star_unions_image_only_keys", func(t *testing.T) {
+		res, err := h.fullTableResult(TimeTravelQuery{Schema: "appdb", Table: "users"}, images)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"id", "email", "name", "created_at", "legacy_col"}
+		if got := cols(res); !slices.Equal(got, want) {
+			t.Errorf("SELECT * cols = %v, want %v (snapshot order + appended off-snapshot key)", got, want)
 		}
 	})
 
-	t.Run("explicit_columns_used_verbatim", func(t *testing.T) {
-		q := TimeTravelQuery{
-			Schema: "appdb", Table: "users",
-			Columns: []string{"id", "name"}, // user-requested order
+	t.Run("explicit_projection_is_verbatim_no_extras", func(t *testing.T) {
+		q := TimeTravelQuery{Schema: "appdb", Table: "users", Columns: []string{"id", "name"}}
+		res, err := h.fullTableResult(q, images)
+		if err != nil {
+			t.Fatal(err)
 		}
-		got := h.effectiveColumnOrder(q)
 		want := []string{"id", "name"}
-		if !slices.Equal(got, want) {
-			t.Errorf("got %v, want %v", got, want)
+		if got := cols(res); !slices.Equal(got, want) {
+			t.Errorf("explicit projection cols = %v, want %v "+
+				"(must NOT append email/created_at/legacy_col — user asked for exactly these)", got, want)
 		}
 	})
 
-	t.Run("explicit_columns_can_include_unknown", func(t *testing.T) {
-		// Unknown columns surface as NULL on the wire — that's a property
-		// of imageToResultVerbatim (for single-row) and imagesToResult
-		// (for multi-row). effectiveColumnOrder just returns the slice
-		// verbatim, which the verbatim sibling then projects through.
-		q := TimeTravelQuery{
-			Schema: "appdb", Table: "users",
-			Columns: []string{"id", "deleted_column"},
+	t.Run("explicit_columns_can_include_unknown_as_null", func(t *testing.T) {
+		// A listed column absent from the image stays in the projection as NULL.
+		q := TimeTravelQuery{Schema: "appdb", Table: "users", Columns: []string{"id", "deleted_column"}}
+		res, err := h.fullTableResult(q, images)
+		if err != nil {
+			t.Fatal(err)
 		}
-		got := h.effectiveColumnOrder(q)
 		want := []string{"id", "deleted_column"}
-		if !slices.Equal(got, want) {
+		if got := cols(res); !slices.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
 		}
 	})

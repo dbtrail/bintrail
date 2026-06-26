@@ -477,8 +477,8 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	// SELECT * and DROPS missing-from-image columns + APPENDS image
 	// columns absent from ddlOrder (alphabetically). Both behaviours
 	// silently expand and reshuffle the user's explicit projection. The
-	// multi-row sibling imagesToResult already uses cols verbatim, so
-	// runFullTable was unaffected.
+	// multi-row path makes the same split via fullTableResult
+	// (imagesToResultVerbatim vs imagesToResult).
 	if q.Columns != nil {
 		return imageToResultVerbatim(image, q.Columns)
 	}
@@ -508,23 +508,26 @@ func imageToResultVerbatim(image map[string]any, cols []string) (*mysql.Result, 
 	return &mysql.Result{Resultset: rs}, nil
 }
 
-// effectiveColumnOrder returns the column ordering for the multi-row
-// path (runFullTable → imagesToResult). A non-nil q.Columns means the
-// user listed columns explicitly (#313); imagesToResult uses its
-// ddlOrder argument verbatim and emits NULL for missing image keys —
-// the contract this function relies on.
+// fullTableResult builds the multi-row resultset for a full-table
+// time-travel query, dispatching on the projection the user asked for —
+// the exact split the single-row path makes between imageToResult and
+// imageToResultVerbatim (see runPointInTime):
 //
-// DO NOT pass the result of this function into the single-row
-// imageToResult: that path goes through orderColumns, which is
-// designed for SELECT * and silently drops missing-from-image entries
-// while appending image-only keys alphabetically. For single-row
-// user-projection results, use imageToResultVerbatim directly (see
-// runPointInTime).
-func (h *Handler) effectiveColumnOrder(q TimeTravelQuery) []string {
+//   - explicit columns (#313, q.Columns != nil) → imagesToResultVerbatim:
+//     project verbatim onto the user's list (NULL for any column an image
+//     lacks); a column they did NOT list must not reappear. Appending
+//     image-only keys here would silently widen the user's projection.
+//   - SELECT * (q.Columns == nil) → imagesToResult: latest-snapshot order
+//     as the base, plus any image-only keys — e.g. a column dropped between
+//     AS OF and now whose value is still captured in the index (#600).
+//
+// columnOrderFor stays latest-snapshot for SELECT *: it also backs SHOW
+// TABLES and PK validation, which must reflect today's schema.
+func (h *Handler) fullTableResult(q TimeTravelQuery, images []map[string]any) (*mysql.Result, error) {
 	if q.Columns != nil {
-		return q.Columns
+		return imagesToResultVerbatim(images, q.Columns)
 	}
-	return h.columnOrderFor(q.Schema, q.Table)
+	return imagesToResult(images, h.columnOrderFor(q.Schema, q.Table))
 }
 
 // runShowTablesFromVirtual answers `SHOW [FULL] TABLES FROM
@@ -642,7 +645,7 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
 	// before the images are extracted.
 	h.mapEventImages(q.Schema, q.Table, rows)
-	return imagesToResult(extractFullTableImages(rows), h.effectiveColumnOrder(q))
+	return h.fullTableResult(q, extractFullTableImages(rows))
 }
 
 // extractFullTableImages picks the post-image of every non-DELETE
@@ -666,43 +669,40 @@ func extractFullTableImages(rows []query.ResultRow) []map[string]any {
 	return images
 }
 
-// imagesToResult is the multi-row sibling of imageToResult. The
-// column list is computed once for the whole resultset so every row
-// in the wire resultset has the same shape, with NULL where a row's
-// image is missing a column.
-//
-// Column selection is snapshot-driven when possible: ddlOrder (taken
-// from the latest schema_snapshots row) is used verbatim when
-// present, even if no image carries every column — missing values
-// become NULL on the wire, matching how MySQL itself returns rows
-// from a table that was ALTER'd to add a column. When ddlOrder is
-// empty (no resolved snapshot for this table — first install, or
-// a snapshot that doesn't cover this schema/table), we fall back
-// to the *union* of every image's keys (sorted) — using the first
-// image alone would silently elide columns that appeared only in
-// later events of the same query.
+// imagesToResult is the SELECT * multi-row sibling of imageToResult. The
+// column list is computed once (by fullTableColumns: latest-snapshot order
+// plus any image-only keys, #600) for the whole resultset so every row in
+// the wire resultset has the same shape, with NULL where a row's image is
+// missing a column. For an explicit user projection use the verbatim sibling.
 //
 // Empty input → empty resultset.
 func imagesToResult(images []map[string]any, ddlOrder []string) (*mysql.Result, error) {
 	if len(images) == 0 {
 		return emptyResult(), nil
 	}
+	return buildImagesResult(images, fullTableColumns(images, ddlOrder))
+}
 
-	cols := ddlOrder
-	if len(cols) == 0 {
-		seen := make(map[string]struct{})
-		for _, img := range images {
-			for k := range img {
-				seen[k] = struct{}{}
-			}
-		}
-		cols = make([]string, 0, len(seen))
-		for k := range seen {
-			cols = append(cols, k)
-		}
-		sort.Strings(cols)
+// imagesToResultVerbatim is the multi-row sibling of imageToResultVerbatim:
+// it projects the images onto cols EXACTLY as given — the user's listed
+// columns (#313), in their order, with NULL for any column an image doesn't
+// carry. Unlike imagesToResult it never appends image-only keys: the user
+// asked for precisely these columns, so a column they did not list (e.g. one
+// dropped after the AS OF instant) must not reappear.
+//
+// Empty input → empty resultset.
+func imagesToResultVerbatim(images []map[string]any, cols []string) (*mysql.Result, error) {
+	if len(images) == 0 {
+		return emptyResult(), nil
 	}
+	return buildImagesResult(images, cols)
+}
 
+// buildImagesResult assembles the wire resultset: one row per image, each
+// projected onto cols (missing key → NULL). Shared by imagesToResult and
+// imagesToResultVerbatim so projection and serialization are identical; only
+// the column-derivation policy differs between the two callers.
+func buildImagesResult(images []map[string]any, cols []string) (*mysql.Result, error) {
 	values := make([][]any, len(images))
 	for i, img := range images {
 		row := make([]any, len(cols))
@@ -717,6 +717,81 @@ func imagesToResult(images []map[string]any, ddlOrder []string) (*mysql.Result, 
 		return nil, fmt.Errorf("build resultset: %w", err)
 	}
 	return &mysql.Result{Resultset: rs}, nil
+}
+
+// fullTableColumns computes the column emission order for a SELECT *
+// full-table resultset. It is the multi-image relative of orderColumns:
+// both APPEND image-only keys instead of strict-projecting them away, which
+// is what fixes the #600 WHERE-clause asymmetry — adding `WHERE pk=` no
+// longer hides a since-dropped column. (Full-table is a SUPERSET of the
+// single-row column set, not strictly equal: it additionally NULL-fills
+// ddlOrder columns no image carries, e.g. a column ADDED after AS OF. The
+// two sets coincide exactly when every ddlOrder column is present in the
+// images — the reported drop case.)
+//
+// Selection is snapshot-driven when possible:
+//
+//   - ddlOrder (the latest schema_snapshots row) is the base, used
+//     verbatim — every column in it appears even if no image carries it
+//     (NULL on the wire), matching how MySQL itself returns rows from a
+//     table that was ALTER'd to ADD a column after some rows existed.
+//   - Then any image-only keys (the union across every image, sorted)
+//     are APPENDED. These are columns present in the captured row images
+//     but absent from the latest snapshot — most importantly a column
+//     DROPPED between the AS OF instant and now. Its value is still in
+//     the index; strict-projecting onto ddlOrder alone (the pre-#600
+//     behavior) silently hid it. Appending surfaces it instead, exactly
+//     as the single-row path (orderColumns) already does.
+//   - When ddlOrder is empty (no resolved snapshot for this table —
+//     first install, or a snapshot that doesn't cover this schema/table),
+//     we fall back to the union of every image's keys (sorted) — using
+//     the first image alone would silently elide columns that appeared
+//     only in later events of the same query.
+//
+// No-drift equivalence: when no schema change spans the query window,
+// every image key is already in ddlOrder, so nothing is appended and the
+// column list is byte-identical to the pre-#600 ddlOrder-verbatim output.
+//
+// Pure function — extracted so the ordering rules can be unit-tested
+// without spinning up MySQL (mirrors orderColumns).
+func fullTableColumns(images []map[string]any, ddlOrder []string) []string {
+	if len(ddlOrder) == 0 {
+		seen := make(map[string]struct{})
+		for _, img := range images {
+			for k := range img {
+				seen[k] = struct{}{}
+			}
+		}
+		cols := make([]string, 0, len(seen))
+		for k := range seen {
+			cols = append(cols, k)
+		}
+		sort.Strings(cols)
+		return cols
+	}
+
+	inDDL := make(map[string]struct{}, len(ddlOrder))
+	for _, c := range ddlOrder {
+		inDDL[c] = struct{}{}
+	}
+	extraSet := make(map[string]struct{})
+	for _, img := range images {
+		for k := range img {
+			if _, ok := inDDL[k]; !ok {
+				extraSet[k] = struct{}{}
+			}
+		}
+	}
+	if len(extraSet) == 0 {
+		return ddlOrder
+	}
+	extras := make([]string, 0, len(extraSet))
+	for k := range extraSet {
+		extras = append(extras, k)
+	}
+	sort.Strings(extras)
+	// Fresh slice — never append into the caller's ddlOrder backing array.
+	return append(append([]string{}, ddlOrder...), extras...)
 }
 
 // validatePKColumn rejects time-travel queries whose WHERE column
