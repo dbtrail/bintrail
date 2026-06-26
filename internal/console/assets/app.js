@@ -39,7 +39,7 @@ const EVENT_CSV_COLUMNS = [
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
-const ROUTES = ["overview", "events", "timetravel", "recover", "cascade", "status", "storage"];
+const ROUTES = ["overview", "events", "timetravel", "recover", "status", "storage"];
 
 const MON_STATE_TITLES = {
   failed: "stream failing — retrying with backoff; press Start for details",
@@ -558,8 +558,6 @@ function navigate(route, params, push = true) {
   if (!ROUTES.includes(route)) route = "overview";
   // Reconstruct surface is gated; never navigate to a disabled Time-travel.
   if (route === "timetravel" && !capsCache.reconstruct) route = "overview";
-  // Cascade recovery is the free tier but refused under an RBAC profile.
-  if (route === "cascade" && !capsCache.recover_cascade) route = "overview";
   // Storage is a watch-daemon surface (rotation + archiving live there).
   if (route === "storage" && !capsCache.monitor) route = "overview";
   const qs = params && Object.keys(params).length
@@ -578,7 +576,6 @@ function renderRoute() {
     case "events": return renderEvents(params);
     case "timetravel": return renderTimetravel(params);
     case "recover": return renderRecover(params);
-    case "cascade": return renderCascade(params);
     case "status": return renderStatus();
     case "storage": return renderStorage();
     default: return renderOverview();
@@ -1127,7 +1124,24 @@ async function generateUndo(form) {
     renderWarnings(warns, data.warnings);
     lastSQL = data.sql || "";
     clear(out);
-    out.append(codePanel(lastSQL, data.statement_count + " statement(s) from " + data.row_count + " event(s)"));
+    // When the target is auto-detected as a foreign-key parent, the script also
+    // re-creates the child rows InnoDB cascade-deleted below the binlog — surface
+    // it so the larger script isn't a surprise (coverage caveats, if any, are in
+    // the warnings above).
+    if (data.cascade_detected) {
+      out.append(el("div", { class: "ctx-banner" },
+        el("span", { class: "badge b-baseline", text: "CASCADE" }),
+        el("div", { class: "ctx-main" },
+          el("span", { class: "ctx-eyebrow", text: "Foreign-key cascade detected — invisible children included" }),
+          el("span", { class: "ctx-detail", text:
+            "this script also re-creates " + (data.victim_count || 0) + " cascade-deleted child row(s)" +
+            (data.set_null_count ? " and restores " + data.set_null_count + " SET NULL'd FK(s)" : "") +
+            " that InnoDB removed below the binlog" }))));
+    }
+    const meta = data.cascade_detected
+      ? data.statement_count + " statement(s) · " + (data.victim_count || 0) + " cascade child row(s) · " + (data.set_null_count || 0) + " SET NULL restore(s)"
+      : data.statement_count + " statement(s) from " + data.row_count + " event(s)";
+    out.append(codePanel(lastSQL, meta));
   } catch (err) {
     if (gen !== serverGen) return;
     clear(warns); renderError(out, err);
@@ -1159,94 +1173,6 @@ function undoEvent(e) {
     type: e.event_type, time: e.event_timestamp,
   };
   navigate("recover");
-}
-
-// ── Cascade recovery ──────────────────────────────────────────────────────────
-
-function renderCascade(params) {
-  // Gated off (direct URL or Back): rewrite to /overview and re-dispatch.
-  // replaceState (not navigate) avoids re-entering this guard — see renderTimetravel.
-  if (!capsCache.recover_cascade) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
-  const v = VIEW(); clear(v);
-  const sub = el("p", { class: "page-sub" },
-    "Reverse a foreign-key ON DELETE CASCADE / SET NULL that InnoDB ran below the binlog. Give the ",
-    el("b", { text: "parent" }),
-    " table whose delete cascaded; its synthesized child victims become reversal SQL. ",
-    el("b", { text: "Nothing is ever executed" }),
-    " — review, then apply the script yourself.");
-  v.append(pageHead("Cascade recovery", sub));
-
-  const form = el("form", { class: "filters", id: "cascade-form" });
-  form.append(fieldSelect("Parent schema", "schema", "md", true, false, null, "— select —"));
-  form.append(fieldSelect("Parent table", "table", "md", false, true));
-  form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
-  form.append(fieldInput("Since", "since", "md", "YYYY-MM-DD HH:MM"));
-  form.append(fieldInput("Until", "until", "md", "YYYY-MM-DD HH:MM"));
-  form.append(fieldInput("Lookback", "lookback", "sm", "30d"));
-  form.append(fieldInput("Max depth", "max_depth", "sm", "5"));
-  const incField = el("div", { class: "field", style: "justify-content:flex-end" },
-    el("label", { class: "check" }, el("input", { type: "checkbox", name: "allow_incomplete" }), el("span", { text: "Allow incomplete" })));
-  form.append(incField);
-  const actions = el("div", { class: "filter-actions" });
-  actions.append(el("button", { class: "btn btn-primary", type: "submit", text: "Generate cascade recovery SQL" }));
-  form.append(actions);
-  v.append(form);
-
-  v.append(el("div", { id: "cascade-warnings", class: "warnings" }));
-  const out = el("div", { id: "cascade-out" });
-  out.append(el("div", { class: "tt-meta", text: "Pick a deleted parent row, then generate its cascade recovery SQL." }));
-  v.append(out);
-
-  form.addEventListener("submit", (e) => { e.preventDefault(); runCascade(form); });
-  wireSchemaCascade(form);
-  populateSchemas(form);
-
-  // Optional deep-link prefill (schema/table/pk) — survives the async schema load.
-  if (params && params.schema) {
-    setSelectWhenReady(form, "schema", params.schema, () => {
-      if (params.table) form.elements.table.value = params.table;
-      if (params.pk) form.elements.pk.value = params.pk;
-    });
-  }
-  viewEnter();
-}
-
-async function runCascade(form) {
-  const gen = serverGen;
-  const warns = $("#cascade-warnings", VIEW());
-  const out = $("#cascade-out", VIEW());
-  const f = Object.fromEntries(new FormData(form).entries());
-  if (!f.schema || !f.table) { clear(warns); renderError(out, "parent schema and table are required"); return; }
-  const body = {};
-  ["schema", "table", "pk", "since", "until", "lookback"].forEach((k) => { if (f[k] && f[k].trim()) body[k] = f[k].trim(); });
-  // max_depth must be a JSON int — a string fails Go's unmarshal; omit when blank.
-  if (f.max_depth && f.max_depth.trim()) {
-    const d = parseInt(f.max_depth.trim(), 10);
-    if (!Number.isNaN(d)) body.max_depth = d;
-  }
-  // allow_incomplete must be a real boolean (a server-side no-op, sent for symmetry).
-  body.allow_incomplete = !!(form.elements.allow_incomplete && form.elements.allow_incomplete.checked);
-  try {
-    const data = await api("/api/recover-cascade", { method: "POST", body });
-    if (gen !== serverGen) return;
-    // Coverage UX: a partial recovery must NEVER read as whole. Drive the banner
-    // off the response `complete` flag (NOT the allow_incomplete checkbox, which is
-    // a server-side no-op), and surface `incomplete` — the cascade response has no
-    // `warnings` key, so reading data.warnings would silently drop every caveat.
-    const caveats = data.incomplete || [];
-    if (!data.complete) {
-      renderWarnings(warns, ["INCOMPLETE — this recovery is provably partial; do not treat it as a full restore.", ...caveats]);
-    } else {
-      renderWarnings(warns, caveats);
-    }
-    lastSQL = data.sql || "";
-    clear(out);
-    out.append(codePanel(lastSQL,
-      data.statement_count + " statement(s) · " + data.victim_count + " victim(s) · " + data.set_null_count + " SET NULL restore(s)"));
-  } catch (err) {
-    if (gen !== serverGen) return;
-    clear(warns); renderError(out, err);
-  }
 }
 
 // ── Time-travel (reconstruct) ─────────────────────────────────────────────────
@@ -2422,7 +2348,6 @@ function cmdkCommands() {
     { group: "Navigate", label: "Status", run: () => navigate("status") },
   ];
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
-  if (capsCache.recover_cascade) cmds.push({ group: "Navigate", label: "Cascade recovery", run: () => navigate("cascade") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Storage", run: () => navigate("storage") });
   cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });
   if (capsCache.monitor) cmds.push({ group: "Actions", label: "Configure rotation…", run: () => { closeCmdk(); showRotationDialog(); } });

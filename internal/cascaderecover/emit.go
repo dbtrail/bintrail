@@ -38,6 +38,13 @@ type Header struct {
 	Parents, Children int
 	Caveats           []string
 	BaselineActive    bool
+	// Combined switches the preamble to the cascade-AWARE recover wording used
+	// when the console auto-detects a cascade parent inside a normal recover: the
+	// base reversal of the selected change(s) is composed with the synthesized
+	// children in ONE script, so the parent count and the "recover-cascade"
+	// framing no longer fit. The zero value (false) keeps the byte-identical
+	// `recover-cascade` preamble used by the CLI and the explicit endpoint.
+	Combined bool
 }
 
 // EmitSQL writes the documented preamble, the FK-checks-off wrapper, the CASCADE
@@ -70,9 +77,16 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on %s.%s\n", hdr.Schema, hdr.Table)
-	fmt.Fprintf(&b, "-- Re-inserts %d deleted parent row(s) and %d cascade-deleted child row(s); restores %d SET NULL'd FK(s)\n", hdr.Parents, hdr.Children, len(setNullRows))
-	b.WriteString("-- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.\n")
+	if hdr.Combined {
+		fmt.Fprintf(&b, "-- bintrail recover (cascade-aware): undo %s.%s, including the foreign-key ON DELETE\n", hdr.Schema, hdr.Table)
+		b.WriteString("-- CASCADE / SET NULL side effects InnoDB ran below the binlog (MySQL Bug #32506).\n")
+		fmt.Fprintf(&b, "-- Re-creates %d cascade-deleted child row(s) and restores %d SET NULL'd FK(s) alongside\n", hdr.Children, len(setNullRows))
+		b.WriteString("-- the reversal of the selected change(s). NEVER auto-applied.\n")
+	} else {
+		fmt.Fprintf(&b, "-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on %s.%s\n", hdr.Schema, hdr.Table)
+		fmt.Fprintf(&b, "-- Re-inserts %d deleted parent row(s) and %d cascade-deleted child row(s); restores %d SET NULL'd FK(s)\n", hdr.Parents, hdr.Children, len(setNullRows))
+		b.WriteString("-- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.\n")
+	}
 	b.WriteString("--\n")
 	if hdr.BaselineActive {
 		b.WriteString("-- Phase-2 baseline fallback ACTIVE: children present in a covered baseline are\n")

@@ -134,30 +134,110 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
+	synth, err := s.synthesizeCascade(r.Context(), b, cascadeSynthParams{
+		Schema:   body.Schema,
+		Table:    body.Table,
+		PK:       body.PK,
+		PKs:      body.PKs,
+		Since:    since,
+		Until:    until,
+		Lookback: lookback,
+		MaxDepth: maxDepth,
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// The explicit endpoint emits over its OWN live-only parent fetch (cascade
+	// recovery never reads archives), so the parents appear here; the synthesized
+	// victims are children-only, so the parent is re-inserted exactly once.
+	rows := append(append([]query.ResultRow{}, synth.ParentDeletes...), synth.Victims...)
+
+	var buf bytes.Buffer
+	// Per-bundle dialect (matches handleRecover). For a MySQL/MariaDB index — the
+	// only flavor cascade recovery supports — this is byte-identical to the CLI's
+	// recovery.New(MySQL).
+	gen := recovery.NewForDialect(b.db, b.resolver, recovery.DialectForIndex(b.db))
+	n, err := cascaderecover.EmitSQL(&buf, gen, rows, synth.SetNullRows, b.resolver, cascaderecover.Header{
+		Schema:         body.Schema,
+		Table:          body.Table,
+		Parents:        len(synth.ParentDeletes),
+		Children:       len(synth.Victims),
+		Caveats:        synth.Caveats,
+		BaselineActive: synth.BaselineActive,
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, recoverCascadeResponse{
+		SQL:            buf.String(),
+		StatementCount: n,
+		VictimCount:    len(synth.Victims),
+		SetNullCount:   len(synth.SetNullRows),
+		Complete:       len(synth.Caveats) == 0 && synth.SynthErr == nil,
+		Incomplete:     synth.Caveats,
+	})
+}
+
+// cascadeSynthParams are the already-parsed, validated inputs to a cascade victim
+// synthesis. Both the explicit POST /api/recover-cascade endpoint and the
+// auto-detected cascade branch of POST /api/recover build one and call
+// synthesizeCascade. A zero Lookback/MaxDepth falls back to the cascade engine's
+// defaults (30d / depth 5) — what the auto-detect path passes (the friction this
+// feature removes is making the operator know their FK graph, not tune knobs).
+type cascadeSynthParams struct {
+	Schema, Table string
+	PK            string
+	PKs           []string
+	Since, Until  *time.Time
+	Lookback      time.Duration
+	MaxDepth      int
+}
+
+// cascadeSynthResult carries the synthesized invisible extras plus coverage
+// caveats, WITHOUT any emitted SQL: each caller composes the final script over
+// its own base rows (the explicit endpoint over its live-only parent fetch; the
+// recover branch over the merged base rows) so neither double-inserts the parent.
+type cascadeSynthResult struct {
+	ParentDeletes  []query.ResultRow
+	Victims        []query.ResultRow
+	SetNullRows    []cascade.SetNullRestore
+	Caveats        []string
+	SynthErr       error // operational synthesis failure; its text is also folded into Caveats
+	BaselineActive bool
+}
+
+// synthesizeCascade fetches the parent DELETE events (LIVE index only — cascade
+// recovery never searches archives), probes archive coverage, sets up the
+// optional Phase-2 baseline fallback, and reconstructs the invisible cascade
+// victims / SET NULL restorations. It is the shared engine behind both cascade
+// surfaces; it emits NO SQL so each caller composes the script over its own base
+// rows. A returned error is an operational fetch/FK-load failure (caller 500s);
+// a PARTIAL synthesis is reported via SynthErr + Caveats, never an error.
+func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynthParams) (cascadeSynthResult, error) {
 	limit := clampLimit(0, recoverDefaultLimit, recoverMaxLimit)
 	del := event.EventDelete
 
-	// Fetch the parent DELETE events — LIVE index only (cascade recovery never
-	// searches archives; their presence is surfaced as a caveat below). DenyTables/
-	// RedactColumns are attached for consistency but are empty here (a profile would
-	// have been refused above).
+	// DenyTables/RedactColumns are attached for consistency but are empty here (an
+	// RBAC profile is refused upstream of every caller of synthesizeCascade).
 	parentDeletes, err := b.engine.Fetch(ctx, query.Options{
-		Schema:        body.Schema,
-		Table:         body.Table,
-		PKValues:      body.PK,
-		PKValuesIn:    body.PKs,
+		Schema:        p.Schema,
+		Table:         p.Table,
+		PKValues:      p.PK,
+		PKValuesIn:    p.PKs,
 		EventType:     &del,
-		Since:         since,
-		Until:         until,
+		Since:         p.Since,
+		Until:         p.Until,
 		Order:         "ASC",
 		Limit:         limit,
 		DenyTables:    s.denyTables,
 		RedactColumns: s.redactCols,
 	})
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "fetch parent deletes: "+err.Error())
-		return
+		return cascadeSynthResult{}, fmt.Errorf("fetch parent deletes: %w", err)
 	}
 
 	var caveats []string
@@ -203,14 +283,13 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 	var res cascade.Result
 	var synthErr error
 	if len(parentDeletes) > 0 {
-		fks, lerr := cascade.LoadCascadeFKs(ctx, b.db, []string{body.Schema})
+		fks, lerr := cascade.LoadCascadeFKs(ctx, b.db, []string{p.Schema})
 		if lerr != nil {
-			writeJSONError(w, http.StatusInternalServerError, "load FK graph: "+lerr.Error())
-			return
+			return cascadeSynthResult{}, fmt.Errorf("load FK graph: %w", lerr)
 		}
 		res, synthErr = cascade.SynthesizeVictims(ctx, b.engine, fks, parentDeletes, cascade.Options{
-			Lookback:        lookback,
-			MaxDepth:        maxDepth,
+			Lookback:        p.Lookback,
+			MaxDepth:        p.MaxDepth,
 			Baseline:        baselineProvider,
 			ArchivesPresent: archivesExist,
 		})
@@ -220,34 +299,110 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 		caveats = append(caveats, "an index query failed mid-synthesis; the result is partial: "+synthErr.Error())
 	}
 
-	rows := append(append([]query.ResultRow{}, parentDeletes...), res.Victims...)
-
-	var buf bytes.Buffer
-	// Per-bundle dialect (matches handleRecover). For a MySQL/MariaDB index — the
-	// only flavor cascade recovery supports — this is byte-identical to the CLI's
-	// recovery.New(MySQL).
-	gen := recovery.NewForDialect(b.db, b.resolver, recovery.DialectForIndex(b.db))
-	n, err := cascaderecover.EmitSQL(&buf, gen, rows, res.SetNullRows, b.resolver, cascaderecover.Header{
-		Schema:         body.Schema,
-		Table:          body.Table,
-		Parents:        len(parentDeletes),
-		Children:       len(res.Victims),
+	return cascadeSynthResult{
+		ParentDeletes:  parentDeletes,
+		Victims:        res.Victims,
+		SetNullRows:    res.SetNullRows,
 		Caveats:        caveats,
+		SynthErr:       synthErr,
 		BaselineActive: baselineProvider != nil,
+	}, nil
+}
+
+// cascadeParentDetect reports whether schema.table is the referenced (parent)
+// side of an ON DELETE CASCADE / SET NULL edge in the latest FK snapshot — the
+// cheap, one-index-query signal that a DELETE on it may have cascaded below the
+// binlog. Scoped to the parent's own schema, matching the synthesis (cascade only
+// reconstructs same-schema children). A detection error is returned so the caller
+// can log it and fall back to a plain recover; it must never abort one.
+func (s *Server) cascadeParentDetect(b *bundle, schema, table string) (bool, error) {
+	edges, err := metadata.CascadeConstraintsInIndex(b.db, []string{schema})
+	if err != nil {
+		return false, err
+	}
+	for _, e := range edges {
+		if e.ReferencedTable == table && (e.DeleteRule == "CASCADE" || e.DeleteRule == "SET NULL") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// rowsContainDeleteOn reports whether any row is a DELETE on the given table — the
+// precondition (besides cascade-parent-ness) for auto-routing a recover through
+// cascade synthesis. Undoing an INSERT/UPDATE never triggers an InnoDB cascade.
+func rowsContainDeleteOn(rows []query.ResultRow, table string) bool {
+	for _, r := range rows {
+		if r.EventType == event.EventDelete && r.TableName == table {
+			return true
+		}
+	}
+	return false
+}
+
+// cascadeRecoverResult is the combined cascade-aware reversal cascadeRecover
+// produces for an auto-detected parent DELETE.
+type cascadeRecoverResult struct {
+	SQL            string
+	StatementCount int
+	VictimCount    int
+	SetNullCount   int
+	Caveats        []string
+}
+
+// cascadeRecover composes ONE cascade-aware reversal script for a recover whose
+// target handleRecover auto-detected as a foreign-key parent: the base undo of
+// baseRows (already fetched — merged live+archive, RBAC-redacted, every event
+// type) PLUS the synthesized invisible children and SET NULL restorations, all
+// wrapped in SET FOREIGN_KEY_CHECKS=0/1. baseRows already contains the parent
+// DELETE(s); the synthesized victims are children-only (cascade never returns a
+// parent row), so the parent is re-inserted exactly once.
+func (s *Server) cascadeRecover(ctx context.Context, b *bundle, body recoverRequest, opts query.Options, baseRows []query.ResultRow) (cascadeRecoverResult, error) {
+	synth, err := s.synthesizeCascade(ctx, b, cascadeSynthParams{
+		Schema: body.Schema,
+		Table:  body.Table,
+		PK:     body.PK,
+		Since:  opts.Since,
+		Until:  opts.Until,
+		// Lookback/MaxDepth left zero → cascade engine defaults (30d / depth 5).
 	})
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
+		return cascadeRecoverResult{}, err
 	}
 
-	writeJSON(w, http.StatusOK, recoverCascadeResponse{
+	caveats := synth.Caveats
+	setNull := synth.SetNullRows
+	// SET NULL restorations need the schema snapshot for their PK WHERE clause
+	// (EmitSQL errors without a resolver). Rather than fail a recover that can
+	// still re-create the CASCADE-deleted rows, drop the restorations and flag
+	// them — never silently.
+	if b.resolver == nil && len(setNull) > 0 {
+		caveats = append(caveats, fmt.Sprintf(
+			"%d ON DELETE SET NULL restoration(s) were skipped: a schema snapshot is required for the restore (run `bintrail snapshot`)", len(setNull)))
+		setNull = nil
+	}
+
+	rows := append(append([]query.ResultRow{}, baseRows...), synth.Victims...)
+	var buf bytes.Buffer
+	gen := recovery.NewForDialect(b.db, b.resolver, recovery.DialectForIndex(b.db))
+	n, err := cascaderecover.EmitSQL(&buf, gen, rows, setNull, b.resolver, cascaderecover.Header{
+		Schema:         body.Schema,
+		Table:          body.Table,
+		Children:       len(synth.Victims),
+		Caveats:        caveats,
+		BaselineActive: synth.BaselineActive,
+		Combined:       true,
+	})
+	if err != nil {
+		return cascadeRecoverResult{}, err
+	}
+	return cascadeRecoverResult{
 		SQL:            buf.String(),
 		StatementCount: n,
-		VictimCount:    len(res.Victims),
-		SetNullCount:   len(res.SetNullRows),
-		Complete:       len(caveats) == 0 && synthErr == nil,
-		Incomplete:     caveats,
-	})
+		VictimCount:    len(synth.Victims),
+		SetNullCount:   len(setNull),
+		Caveats:        caveats,
+	}, nil
 }
 
 // cascadeBaselineProvider implements cascade.BaselineProvider over

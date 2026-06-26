@@ -7,9 +7,30 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
+
+// TestRowsContainDeleteOn locks the auto-cascade gate's delete precondition: a
+// recover only routes to cascade synthesis when the matched rows actually contain
+// a DELETE on the target table (an INSERT/UPDATE undo never cascades).
+func TestRowsContainDeleteOn(t *testing.T) {
+	rows := []query.ResultRow{
+		{TableName: "orders", EventType: event.EventInsert},
+		{TableName: "orders", EventType: event.EventUpdate},
+	}
+	if rowsContainDeleteOn(rows, "orders") {
+		t.Error("no DELETE present → want false")
+	}
+	rows = append(rows, query.ResultRow{TableName: "orders", EventType: event.EventDelete})
+	if !rowsContainDeleteOn(rows, "orders") {
+		t.Error("a DELETE on orders → want true")
+	}
+	if rowsContainDeleteOn(rows, "customers") {
+		t.Error("the DELETE is on orders, not customers → want false")
+	}
+}
 
 // TestRecoverCascade_validation covers the request-validation branches that
 // reject before any DB work — so a nil-DB boot server is enough.

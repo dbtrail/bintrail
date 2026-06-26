@@ -176,6 +176,208 @@ func TestIntegrationRecoverCascade_phase2HeaderWhenBaselineConfigured(t *testing
 	}
 }
 
+// TestIntegrationRecover_autoCascade_endToEnd is the merge's core guarantee: a
+// plain POST /api/recover on a foreign-key PARENT whose DELETE cascaded auto-
+// detects the cascade and emits ONE combined script — the parent re-INSERT AND
+// its two invisible children, inside the FK-checks wrapper — with cascade_detected
+// + victim_count set. No separate tab, no extra request. The parent must appear
+// exactly once (base rows carry it; synthesized victims are children-only).
+func TestIntegrationRecover_autoCascade_endToEnd(t *testing.T) {
+	srv, dbName := seedCascadeConsole(t, nil)
+
+	rec, body := doReq(t, srv, "POST", "/api/recover", `{"schema":"`+dbName+`","table":"parent"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+
+	if !resp.CascadeDetected {
+		t.Errorf("cascade_detected should be true for a parent DELETE recover\n---\n%s", resp.SQL)
+	}
+	if resp.VictimCount != 2 {
+		t.Errorf("victim_count = %d, want 2", resp.VictimCount)
+	}
+	for _, want := range []string{
+		"SET FOREIGN_KEY_CHECKS=0;",
+		"SET FOREIGN_KEY_CHECKS=1;",
+		"recover (cascade-aware)",                  // the Combined preamble, not "recover-cascade"
+		"Re-creates 2 cascade-deleted child row(s)", // Combined header counts the children
+		"`" + dbName + "`.`parent`",
+		"`" + dbName + "`.`child`",
+	} {
+		if !strings.Contains(resp.SQL, want) {
+			t.Errorf("SQL missing %q\n---\n%s", want, resp.SQL)
+		}
+	}
+	// Parent re-inserted exactly once (base rows), children exactly twice (victims).
+	if c := strings.Count(resp.SQL, "`"+dbName+"`.`parent`"); c != 1 {
+		t.Errorf("want the parent re-inserted once, got %d\n---\n%s", c, resp.SQL)
+	}
+	if c := strings.Count(resp.SQL, "`"+dbName+"`.`child`"); c != 2 {
+		t.Errorf("want 2 child INSERTs, got %d\n---\n%s", c, resp.SQL)
+	}
+	// connection_id is the paid-forensics boundary: the merged response carries SQL
+	// + counts only (no event rows), exactly like the legacy cascade endpoint.
+	if strings.Contains(string(body), "connection_id") {
+		t.Errorf("connection_id leaked into the recover response: %s", body)
+	}
+}
+
+// TestIntegrationRecover_autoCascade_skippedWhenNotParent locks the gate: a
+// recover on the CHILD table (INSERTs only, not a cascade parent) takes the plain
+// path — no cascade synthesis, no FK-checks wrapper — even though the table
+// participates in the same FK. cascade_detected stays false.
+func TestIntegrationRecover_autoCascade_skippedWhenNotParent(t *testing.T) {
+	srv, dbName := seedCascadeConsole(t, nil)
+
+	rec, body := doReq(t, srv, "POST", "/api/recover", `{"schema":"`+dbName+`","table":"child"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+	if resp.CascadeDetected {
+		t.Errorf("cascade_detected must be false for a non-parent (child) recover")
+	}
+	if strings.Contains(resp.SQL, "SET FOREIGN_KEY_CHECKS=0;") {
+		t.Errorf("plain recover should not emit the cascade FK-checks wrapper\n---\n%s", resp.SQL)
+	}
+}
+
+// TestIntegrationRecover_autoCascade_rbacWarns: under an RBAC profile cascade
+// synthesis is disabled (it cannot honor redaction), but a parent-DELETE recover
+// must NOT silently emit a parent-only script as if whole — it warns. The recover
+// itself still succeeds (unlike the cascade endpoint, which 403s).
+func TestIntegrationRecover_autoCascade_rbacWarns(t *testing.T) {
+	srv, dbName := seedCascadeConsole(t, func(c *Config) {
+		// A redact rule on an unrelated table is enough to activate the profile (the
+		// guard checks presence, not scope), and leaves the parent recover working.
+		c.RedactColumns = []query.SchemaTableColumn{{Schema: "app", Table: "child", Column: "pid"}}
+	})
+
+	rec, body := doReq(t, srv, "POST", "/api/recover", `{"schema":"`+dbName+`","table":"parent"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+	if resp.CascadeDetected {
+		t.Errorf("cascade synthesis must stay disabled under an RBAC profile")
+	}
+	var warned bool
+	for _, w := range resp.Warnings {
+		if strings.Contains(w, "RBAC redaction profile is active") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("a parent-DELETE recover under RBAC must warn that cascade children are NOT included; warnings=%v", resp.Warnings)
+	}
+}
+
+// TestIntegrationRecover_autoCascade_setNull covers the SET NULL arm of the
+// combined path: a parent whose child FK is ON DELETE SET NULL. Recover on the
+// parent must fold an idempotent guarded UPDATE (… AND fk IS NULL) into the same
+// FK-checks-wrapped script and report set_null_count, with zero victims (a
+// SET NULL child survives — it is restored, not re-inserted). Self-seeded (not
+// seedCascadeConsole, whose CASCADE counts other tests assert).
+func TestIntegrationRecover_autoCascade_setNull(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	childTs := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	parentTs := h.Add(20 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// One child row pointing at parent.id=1 via a SET NULL FK column `pid`, plus
+	// the parent DELETE (the cascade SET-NULL update InnoDB ran is NOT indexed).
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, childTs, nil,
+		dbName, "snchild", 1 /*INSERT*/, "20", nil, nil, []byte(`{"id":20,"pid":1}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, parentTs, nil,
+		dbName, "parent", 3 /*DELETE*/, "1", nil, []byte(`{"id":1}`), nil)
+
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
+		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
+		VALUES (1, 'fk_snchild', ?, 'snchild', 'pid', 1, ?, 'parent', 'id', 'SET NULL', 'RESTRICT')`,
+		dbName, dbName)
+
+	snapTs := h.Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "parent", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "snchild", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "snchild", "pid", 2, "", "int", "YES")
+
+	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, NoArchive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, body := doReq(t, srv, "POST", "/api/recover", `{"schema":"`+dbName+`","table":"parent"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+	if !resp.CascadeDetected {
+		t.Errorf("cascade_detected should be true for a SET NULL parent recover")
+	}
+	if resp.SetNullCount != 1 {
+		t.Errorf("set_null_count = %d, want 1", resp.SetNullCount)
+	}
+	if resp.VictimCount != 0 {
+		t.Errorf("victim_count = %d, want 0 (a SET NULL child survives — restored, not re-inserted)", resp.VictimCount)
+	}
+	for _, want := range []string{
+		"SET FOREIGN_KEY_CHECKS=0;",
+		"SET FOREIGN_KEY_CHECKS=1;",
+		"`" + dbName + "`.`parent`",  // the parent re-INSERT
+		"`" + dbName + "`.`snchild`", // the SET NULL restore UPDATE
+		"IS NULL",                    // the idempotent guard
+	} {
+		if !strings.Contains(resp.SQL, want) {
+			t.Errorf("SQL missing %q\n---\n%s", want, resp.SQL)
+		}
+	}
+}
+
+// TestIntegrationRecover_autoCascade_skippedForPostgres locks the dialect gate:
+// cascade auto-detection is a MySQL/MariaDB binlog blind-spot fix. A PostgreSQL-
+// flavored index captures cascade deletes as real events (no blind spot), so a
+// parent recover takes the plain path — no synthesis, no misleading "0 victims".
+func TestIntegrationRecover_autoCascade_skippedForPostgres(t *testing.T) {
+	srv, dbName := seedCascadeConsole(t, nil)
+	// Stamp the index as PostgreSQL-sourced (DialectForIndex reads stream_state.flavor).
+	testutil.MustExec(t, srv.cm.boot.db,
+		`INSERT INTO stream_state (id, mode, flavor, last_checkpoint, server_id)
+		 VALUES (1, 'gtid', 'postgres', UTC_TIMESTAMP(), 1)
+		 ON DUPLICATE KEY UPDATE flavor='postgres'`)
+
+	rec, body := doReq(t, srv, "POST", "/api/recover", `{"schema":"`+dbName+`","table":"parent"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+	if resp.CascadeDetected {
+		t.Errorf("cascade auto-detection must be skipped for a PG-flavored index")
+	}
+	if strings.Contains(resp.SQL, "SET FOREIGN_KEY_CHECKS=0;") {
+		t.Errorf("PG recover should not emit the MySQL cascade FK-checks wrapper\n---\n%s", resp.SQL)
+	}
+}
+
 // TestIntegrationRecoverCascade_refusedUnderProfile: an active redact/deny
 // profile both flips the capability to false and makes the endpoint 403 (cascade
 // victim synthesis cannot honor redaction — the leak guard).
