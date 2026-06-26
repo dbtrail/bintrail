@@ -269,7 +269,7 @@ It prunes a local snapshot **only** when all of these hold — pruning never ris
 - **It is past the retention window** (and at least an hour old).
 - **It is complete.** A snapshot mid-write or resumable via `--retry` (an `_INCOMPLETE` marker) is never touched.
 
-The S3 copy is **not** pruned — only the redundant local copy. To prune on a long-lived daemon instead of from cron, `bintrail-console watch` takes the same `--baseline-retain` (alongside `--baseline-dir` and `--baseline-s3`) and runs the prune on its rotation cadence. Env: `BINTRAIL_BASELINE_RETAIN` (CLI) / `BINTRAIL_CONSOLE_BASELINE_RETAIN` (`watch`).
+The S3 copy is **not** pruned — only the redundant local copy. To prune on a long-lived daemon instead of from cron, `bintrail-console watch` takes the same `--baseline-retain` and runs the prune on its rotation cadence. It reclaims both the global `--baseline-dir` (against `--baseline-s3`) and every monitored server's own baseline directory (against that server's S3 prefix) — including the per-server dirs the console **Create baseline** button writes into. Env: `BINTRAIL_BASELINE_RETAIN` (CLI) / `BINTRAIL_CONSOLE_BASELINE_RETAIN` (`watch`).
 
 ### No database connection required
 

@@ -376,8 +376,9 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
 	})
 
-	// Reclaim local baseline snapshots that already have a durable S3 copy (#616).
-	if err := startBaselinePruneLoop(ctx, upConsoleBaselineDir, upConsoleBaselineS3, upConsoleBaselineRetain, upRotationCfg.Interval); err != nil {
+	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
+	// the global --baseline-dir plus every registry server's per-server dir.
+	if err := startBaselinePruneLoop(ctx, registry, upConsoleBaselineDir, upConsoleBaselineS3, upConsoleBaselineRetain, upRotationCfg.Interval); err != nil {
 		return err
 	}
 
@@ -481,8 +482,9 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
 	})
 
-	// Reclaim local baseline snapshots that already have a durable S3 copy (#616).
-	if err := startBaselinePruneLoop(ctx, upConsoleBaselineDir, upConsoleBaselineS3, upConsoleBaselineRetain, upRotationCfg.Interval); err != nil {
+	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
+	// the global --baseline-dir plus every registry server's per-server dir.
+	if err := startBaselinePruneLoop(ctx, registry, upConsoleBaselineDir, upConsoleBaselineS3, upConsoleBaselineRetain, upRotationCfg.Interval); err != nil {
 		return err
 	}
 
@@ -653,17 +655,57 @@ func baselineStagingDir() string {
 	return filepath.Join(os.TempDir(), "bintrail-baseline-staging")
 }
 
+// baselinePruneTarget is one (local dir, durable S3) pair the prune loop reclaims.
+type baselinePruneTarget struct {
+	dir string
+	s3  string
+}
+
+// baselinePruneTargets collects every baseline directory the daemon should prune,
+// each paired with the S3 prefix that proves a snapshot is durable (#616):
+//   - the daemon-global --baseline-dir/--baseline-s3 (the compose baseline profile
+//     and the boot index write here), and
+//   - every registry server's BaselineDir/BaselineS3 — the PER-SERVER dirs the
+//     console "Create baseline" trigger (#613/#615) writes into (req.LocalDir =
+//     entry.BaselineDir), which the global flag does NOT cover.
+//
+// A target needs BOTH a dir (to prune) and an S3 prefix (to confirm durability);
+// dir-only or s3-only entries are skipped — a local snapshot with no S3 copy is
+// the only copy and is never deleted. Deduped so a server that reuses the global
+// dir is not pruned twice. Read fresh each cycle so a server added/edited from the
+// console is covered on the next tick without a restart (mirrors rotateTargets).
+func baselinePruneTargets(entries []console.ServerEntry, globalDir, globalS3 string) []baselinePruneTarget {
+	var targets []baselinePruneTarget
+	seen := map[string]bool{}
+	add := func(dir, s3 string) {
+		if dir == "" || s3 == "" {
+			return
+		}
+		key := dir + "\x00" + s3
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		targets = append(targets, baselinePruneTarget{dir: dir, s3: s3})
+	}
+	add(globalDir, globalS3)
+	for _, e := range entries {
+		add(e.BaselineDir, e.BaselineS3)
+	}
+	return targets
+}
+
 // startBaselinePruneLoop launches a periodic prune of local baseline snapshots
-// under baselineDir, reclaiming the ones that already have a durable copy in
-// baselineS3 (#616). It is a no-op unless a retention window, a local dir, AND an
-// S3 source are ALL configured — a local snapshot with no durable counterpart is
-// the only copy and is never deleted (the same invariant rotation enforces with
+// across every (dir + S3) target — the daemon-global pair plus every registry
+// server's per-server baseline dir (#616). Each target is reclaimed only where a
+// durable S3 copy exists; a dir with no S3 source is left untouched (its snapshots
+// are the only copy — the same invariant rotation enforces with
 // PruneLocalAfterUpload && ArchiveS3 != ""). The loop runs on the daemon context
-// and stops when it is cancelled; it shares the rotation cadence (baselines
-// change far less often than partitions, so this interval is ample). A bad
+// and stops when it is cancelled; it shares the rotation cadence (baselines change
+// far less often than partitions, so this interval is ample). A bad
 // --baseline-retain value is a fatal misconfiguration returned BEFORE the
 // goroutine starts, so a typo fails the daemon fast rather than spinning.
-func startBaselinePruneLoop(ctx context.Context, baselineDir, baselineS3, retainRaw string, interval time.Duration) error {
+func startBaselinePruneLoop(ctx context.Context, reg *console.Registry, globalDir, globalS3, retainRaw string, interval time.Duration) error {
 	if retainRaw == "" {
 		return nil // retention not configured — leave baselines untouched
 	}
@@ -671,32 +713,36 @@ func startBaselinePruneLoop(ctx context.Context, baselineDir, baselineS3, retain
 	if err != nil {
 		return fmt.Errorf("--baseline-retain: %w", err)
 	}
-	if baselineDir == "" {
-		slog.Warn("--baseline-retain is set but --baseline-dir is not; nothing local to prune")
-		return nil
-	}
-	if baselineS3 == "" {
-		slog.Warn("--baseline-retain is set but --baseline-s3 is not; refusing to prune local baselines (they are the only copy)")
-		return nil
+	if globalDir != "" && globalS3 == "" {
+		// The operator pointed retention at a local dir with no durable S3 source;
+		// warn once so the global dir not being reclaimed isn't a silent surprise.
+		// Per-server registry targets (added at runtime) may still have both.
+		slog.Warn("--baseline-retain is set and --baseline-dir is configured but --baseline-s3 is not; the global baseline dir will not be pruned (its snapshots are the only copy)")
 	}
 	if interval <= 0 {
 		interval = time.Hour
 	}
-	slog.Info("baseline prune loop enabled", "dir", baselineDir, "s3", baselineS3, "retain", retainRaw, "interval", interval)
+	slog.Info("baseline prune loop enabled", "retain", retainRaw, "interval", interval)
 	go func() {
 		runOnce := func() {
-			res, err := baseline.PruneLocal(ctx, baseline.PruneOptions{
-				LocalDir: baselineDir,
-				S3URL:    baselineS3,
-				Retain:   retain,
-			})
-			if err != nil {
-				slog.Warn("baseline prune cycle failed", "error", err)
-				return
+			var entries []console.ServerEntry
+			if reg != nil {
+				entries = reg.List()
 			}
-			if len(res.Pruned) > 0 {
-				slog.Info("baseline prune cycle complete",
-					"pruned", len(res.Pruned), "reclaimed_bytes", res.ReclaimedBytes)
+			for _, t := range baselinePruneTargets(entries, globalDir, globalS3) {
+				res, err := baseline.PruneLocal(ctx, baseline.PruneOptions{
+					LocalDir: t.dir,
+					S3URL:    t.s3,
+					Retain:   retain,
+				})
+				if err != nil {
+					slog.Warn("baseline prune cycle failed", "dir", t.dir, "error", err)
+					continue
+				}
+				if len(res.Pruned) > 0 {
+					slog.Info("baseline prune cycle complete",
+						"dir", t.dir, "pruned", len(res.Pruned), "reclaimed_bytes", res.ReclaimedBytes)
+				}
 			}
 		}
 		// One sweep shortly after startup (the min-age floor protects any

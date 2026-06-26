@@ -424,31 +424,54 @@ func TestArchiveStagingEnvFallback(t *testing.T) {
 	}
 }
 
-// TestStartBaselinePruneLoop_gating pins the four pre-goroutine outcomes: a
-// malformed --baseline-retain fails the daemon fast, and each missing-config case
-// is a nil no-op. It deliberately never exercises the all-gates-pass path, which
-// would start the goroutine and reach storage.NewS3Client.
+// TestStartBaselinePruneLoop_gating pins the pre-goroutine contract: a malformed
+// --baseline-retain fails the daemon fast, retention-unset is a no-op, and a valid
+// retain returns nil (the goroutine self-determines targets each cycle). It uses a
+// nil registry and an immediately-cancelled ctx so no live prune cycle runs.
 func TestStartBaselinePruneLoop_gating(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	cancel() // cancel up front: the goroutine's initial sweep is skipped (ctx.Err != nil)
 
 	// A malformed retain value is fatal BEFORE the goroutine starts.
-	if err := startBaselinePruneLoop(ctx, "/d", "s3://b/p", "garbage", time.Hour); err == nil {
+	if err := startBaselinePruneLoop(ctx, nil, "/d", "s3://b/p", "garbage", time.Hour); err == nil {
 		t.Error("malformed --baseline-retain must error before the goroutine starts")
 	}
-
-	// Each missing-config gate is a nil no-op (no goroutine).
-	cases := []struct {
-		name            string
-		dir, s3, retain string
-	}{
-		{"retention unset", "", "", ""},
-		{"no local dir", "", "s3://b/p", "7d"},
-		{"no S3 (only-copy guard)", "/d", "", "7d"},
+	// Retention unset → nil, no loop.
+	if err := startBaselinePruneLoop(ctx, nil, "/d", "s3://b/p", "", time.Hour); err != nil {
+		t.Errorf("retention unset must be a nil no-op, got %v", err)
 	}
-	for _, c := range cases {
-		if err := startBaselinePruneLoop(ctx, c.dir, c.s3, c.retain, time.Hour); err != nil {
-			t.Errorf("%s: gate must be a nil no-op, got %v", c.name, err)
+	// Valid retain (even with no usable target yet) → nil; targets are resolved
+	// per-cycle so a server added later is covered.
+	if err := startBaselinePruneLoop(ctx, nil, "", "", "7d", time.Hour); err != nil {
+		t.Errorf("valid retain must not error, got %v", err)
+	}
+}
+
+// TestBaselinePruneTargets pins target collection: the global pair plus every
+// registry server with BOTH a dir and an S3 prefix, dir/s3-only entries skipped,
+// and a server reusing the global dir deduped.
+func TestBaselinePruneTargets(t *testing.T) {
+	entries := []console.ServerEntry{
+		{BaselineDir: "/srv1/base", BaselineS3: "s3://b/srv1/"}, // both → target
+		{BaselineDir: "/srv2/base"},                             // dir only → skip (only copy)
+		{BaselineS3: "s3://b/srv3/"},                            // s3 only → skip (nothing local)
+		{BaselineDir: "/global", BaselineS3: "s3://b/global/"},  // duplicate of the global pair
+	}
+	got := baselinePruneTargets(entries, "/global", "s3://b/global/")
+	want := map[string]string{"/global": "s3://b/global/", "/srv1/base": "s3://b/srv1/"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d targets %+v, want %d", len(got), got, len(want))
+	}
+	for _, tgt := range got {
+		if want[tgt.dir] != tgt.s3 {
+			t.Errorf("unexpected target %+v", tgt)
 		}
+	}
+
+	if n := len(baselinePruneTargets(nil, "", "")); n != 0 {
+		t.Errorf("no config → no targets, got %d", n)
+	}
+	if n := len(baselinePruneTargets(nil, "/d", "")); n != 0 {
+		t.Errorf("global dir without S3 → no target (only copy), got %d", n)
 	}
 }
