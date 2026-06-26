@@ -135,6 +135,26 @@ func TestFullTableFlashback_DroppedColumn_Regression(t *testing.T) {
 	if !sameStringSet(ftFields, stFields) {
 		t.Errorf("_flashback vs _snapshot column set mismatch: %v vs %v", ftFields, stFields)
 	}
+
+	// An EXPLICIT full-table projection (#313) must stay verbatim through the
+	// real runPointInTime → runFullTable → fullTableResult dispatch: a column
+	// the user did NOT list (coupon_code) must not be appended back. This is
+	// the end-to-end regression guard for the #600 union fix — making the
+	// shared builder union unconditionally would have silently widened the
+	// user's projection.
+	projRes, err := h.runPointInTime(TimeTravelQuery{
+		Type:    TypeFlashback,
+		Schema:  "myapp",
+		Table:   "orders",
+		Columns: []string{"id", "total"},
+		AsOf:    asOf,
+	})
+	if err != nil {
+		t.Fatalf("explicit-projection runPointInTime: %v", err)
+	}
+	if projFields := fieldNames(projRes.Resultset.Fields); !slices.Equal(projFields, []string{"id", "total"}) {
+		t.Errorf("explicit full-table projection fields = %v, want exactly [id total] (coupon_code must NOT be appended)", projFields)
+	}
 }
 
 // TestFullTableFlashback_DroppedColumn_RealOracle runs the full lifecycle on

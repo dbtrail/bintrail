@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -790,8 +791,9 @@ func fullTableColumns(images []map[string]any, ddlOrder []string) []string {
 		extras = append(extras, k)
 	}
 	sort.Strings(extras)
-	// Fresh slice — never append into the caller's ddlOrder backing array.
-	return append(append([]string{}, ddlOrder...), extras...)
+	// slices.Concat allocates a fresh slice — never append into the caller's
+	// ddlOrder backing array (it comes from a cached resolver and is shared).
+	return slices.Concat(ddlOrder, extras)
 }
 
 // validatePKColumn rejects time-travel queries whose WHERE column

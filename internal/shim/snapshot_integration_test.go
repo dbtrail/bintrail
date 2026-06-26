@@ -630,6 +630,88 @@ func TestSnapshotBaseline_FullTableMerge(t *testing.T) {
 	}
 }
 
+// TestSnapshotBaseline_FullTableMerge_DroppedColumn pins #600 acceptance
+// criterion 4 on the path the other tests miss: the _snapshot BASELINE-MERGE
+// path (snapshot.go:211 → fullTableResult), not the degraded no-baseline path
+// that is byte-identical to _flashback. A column dropped between the baseline
+// instant and now lives only in the pre-drop baseline Parquet; the merge must
+// surface it on the never-touched baseline row even though the latest snapshot
+// (which drives columnOrderFor) no longer lists it.
+func TestSnapshotBaseline_FullTableMerge_DroppedColumn(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute) // pre-drop baseline + snapshot 1
+	dropTime := hourTop.Add(8 * time.Minute) // re-snapshot after DROP COLUMN
+	asOf := hourTop.Add(10 * time.Minute)
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// Snapshot 1 (pre-drop): orders(id, coupon_code, total). Snapshot 2 (post-
+	// drop, LATEST) drops coupon_code → columnOrderFor returns [id total].
+	snap1 := snapTime.UTC().Format("2006-01-02 15:04:05")
+	snap2 := dropTime.UTC().Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snap1, "myapp", "orders", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snap1, "myapp", "orders", "coupon_code", 2, "", "varchar", "YES")
+	testutil.InsertSnapshot(t, db, 1, snap1, "myapp", "orders", "total", 3, "", "int", "NO")
+	testutil.InsertSnapshot(t, db, 2, snap2, "myapp", "orders", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 2, snap2, "myapp", "orders", "total", 2, "", "int", "NO")
+
+	// Pre-drop baseline carrying the since-dropped column. id=1 never touched
+	// (its coupon_code can come only from the baseline); id=2 updated after.
+	ordersCols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "coupon_code", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+		{Name: "total", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+	}
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "orders", ordersCols, [][]string{
+		{"1", "SAVE10", "100"},
+		{"2", "OLD50", "200"},
+	})
+	// id=2 updated after the column was dropped: the event image no longer
+	// carries coupon_code, so id=2's coupon_code resolves to NULL on the wire.
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "orders", 2 /*update*/, "2", nil,
+		[]byte(`{"id":2,"total":200}`), []byte(`{"id":2,"total":250}`))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:   true,
+		NoArchive:   true,
+		IndexDBName: dbName,
+		BaselineDir: baselineDir,
+	}, slog.Default())
+
+	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "orders", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("full-table _snapshot: %v", err)
+	}
+	fields := fieldNames(res.Resultset.Fields)
+	cells := rowCells(t, res.Resultset)
+	t.Logf("baseline-merge _snapshot fields=%v rows=%v", fields, cells)
+
+	if !slices.Contains(fields, "coupon_code") {
+		t.Fatalf("baseline-merge _snapshot must surface the since-dropped coupon_code, got fields %v", fields)
+	}
+	ccIdx := slices.Index(fields, "coupon_code")
+	idIdx := slices.Index(fields, "id")
+	var sawRow1 bool
+	for _, row := range cells {
+		if row[idIdx] == "1" {
+			sawRow1 = true
+			if row[ccIdx] != "SAVE10" {
+				t.Errorf("never-touched baseline row id=1 coupon_code = %q, want SAVE10 (rows=%v)", row[ccIdx], cells)
+			}
+		}
+	}
+	if !sawRow1 {
+		t.Errorf("baseline-merge _snapshot dropped the never-touched baseline row id=1: %v", cells)
+	}
+}
+
 // TestSnapshotBaseline_FullTableRowCap proves the cost guardrail still bites on
 // the merged path: with the cap below the reconstructed row count, full-table
 // _snapshot returns ER_TOO_BIG_SELECT rather than buffering an unbounded
