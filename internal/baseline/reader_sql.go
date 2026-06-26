@@ -64,7 +64,18 @@ func ReadSQLFile(path string, fn func(values []string, nulls []bool) error) erro
 			// Find VALUES keyword (after any column list).
 			valIdx := strings.Index(upper, " VALUES")
 			if valIdx < 0 {
-				continue
+				// The line opens an INSERT/REPLACE but carries no VALUES clause.
+				// In a complete mydumper/mysqldump data file every INSERT/REPLACE
+				// statement has VALUES on this same line — so this is a truncated
+				// statement (a partial trailing line, #468 shape 1) or an
+				// unsupported layout (VALUES wrapped to a continuation line).
+				// Silently `continue`ing past it drops every row the statement
+				// carried with a clean exit and a short count — the #461 silent
+				// data-loss class at row granularity. Fail loud, matching the
+				// unterminated-INSERT guard below.
+				return fmt.Errorf("%s line %d: INSERT/REPLACE statement without a VALUES clause "+
+					"— dump file may be truncated or in an unsupported layout: %q",
+					path, lineNum, truncateForError(trimmed))
 			}
 			fragment = strings.TrimSpace(trimmed[valIdx+7:])
 		}
@@ -84,6 +95,16 @@ func ReadSQLFile(path string, fn func(values []string, nulls []bool) error) erro
 		return fmt.Errorf("%s: unterminated INSERT statement (missing ';') — dump file may be truncated", path)
 	}
 	return nil
+}
+
+// truncateForError caps a line excerpt used in an error message so a long
+// (but truncated) INSERT doesn't flood the log with the whole statement.
+func truncateForError(s string) string {
+	const max = 80
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 // parseSQLTuples parses a fragment of an INSERT's values portion:

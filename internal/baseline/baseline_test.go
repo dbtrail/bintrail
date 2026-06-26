@@ -671,6 +671,63 @@ func TestReadSQLRowTruncated(t *testing.T) {
 	}
 }
 
+func TestReadSQLRowTruncatedBeforeValues(t *testing.T) {
+	// #468 shape 1: a dump truncated mid-INSERT-header — the last physical line
+	// opens an INSERT/REPLACE but the truncation cut it off BEFORE the VALUES
+	// keyword. Pre-fix the reader `continue`d past it and exited cleanly with a
+	// short row count (silent data loss → wrong Time-travel reconstructions).
+	// It must now fail loudly. The preceding complete INSERT is intact.
+	cases := map[string]string{
+		"insert-header-only":      "INSERT INTO `orders` VALUES(1,'a');\nINSERT INTO `orders` (`id`,`na",
+		"replace-header-only":     "REPLACE INTO `orders` VALUES(1,'a');\nREPLACE INTO `orders` (`id`,`co",
+		"values-on-next-line":     "INSERT INTO `orders` VALUES(1,'a');\nINSERT INTO `orders` (`id`,`name`)\nVALUES(2,'b');\n",
+		"truncated-as-first-stmt": "INSERT INTO `orders` (`id`,`na",
+	}
+	for name, sqlData := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "shop.orders.00000.sql")
+			if err := os.WriteFile(path, []byte(sqlData), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var count int
+			err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+				count++
+				return nil
+			})
+			if err == nil {
+				t.Fatalf("expected error for INSERT/REPLACE without VALUES, got nil (parsed %d rows)", count)
+			}
+			if !strings.Contains(err.Error(), "VALUES") {
+				t.Errorf("error = %v, want it to mention the missing VALUES clause", err)
+			}
+		})
+	}
+}
+
+func TestReadSQLRowValuesAtLineEndStillParses(t *testing.T) {
+	// Guard against over-firing the shape-1 truncation check: the supported
+	// mydumper layout where VALUES ends the header line (tuples follow on
+	// continuation lines) keeps VALUES on the INSERT line, so it must NOT be
+	// mistaken for a truncated header.
+	const sqlData = "INSERT INTO `t` VALUES\n(1),\n(2),\n(3);\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.t.00000.sql")
+	if err := os.WriteFile(path, []byte(sqlData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		ids = append(ids, values[0])
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadSQLFile must accept VALUES-at-line-end layout: %v", err)
+	}
+	if got := strings.Join(ids, ","); got != "1,2,3" {
+		t.Errorf("ids = %q, want \"1,2,3\"", got)
+	}
+}
+
 func TestReadSQLRowMydumperBinaryJSON(t *testing.T) {
 	// Fixture is captured mydumper output (--complete-insert) for a table with
 	// VARBINARY, BLOB, BIT, and JSON columns holding adversarial bytes (',' ')'
