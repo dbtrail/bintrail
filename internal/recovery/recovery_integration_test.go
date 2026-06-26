@@ -5,6 +5,8 @@ package recovery
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -340,5 +342,219 @@ func assertContains(t *testing.T, s, want string) {
 	t.Helper()
 	if !strings.Contains(s, want) {
 		t.Errorf("expected %q in output:\n%s", want, s)
+	}
+}
+
+// ─── schema drift after the event (#601), real-path through the index DB ─────────
+
+// insertEvent601 inserts a binlog_events row with an explicit schema_version (the
+// event-time snapshot id) — testutil.InsertEvent always defaults it to 0, which would
+// make the event-time and latest resolvers identical and disable drift detection.
+func insertEvent601(t *testing.T, db *sql.DB, schemaVersion uint32, ts, schema, table string, eventType uint8, pk string, rowBefore, rowAfter []byte) {
+	t.Helper()
+	testutil.MustExec(t, db, `INSERT INTO binlog_events
+		(binlog_file, start_pos, end_pos, event_timestamp, gtid,
+		 schema_name, table_name, event_type, pk_values,
+		 changed_columns, row_before, row_after, schema_version)
+		VALUES ('binlog.000601', 100, 200, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+		ts, schema, table, eventType, pk, rowBefore, rowAfter, schemaVersion)
+}
+
+// snapshot601 seeds an orders snapshot. withCoupon controls whether the (non-PK)
+// coupon_code column is present, so a later snapshot can drop it.
+func snapshot601(t *testing.T, db *sql.DB, id int, snapTime string, withCoupon bool) {
+	t.Helper()
+	testutil.InsertSnapshot(t, db, id, snapTime, "mydb", "orders", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, id, snapTime, "mydb", "orders", "customer", 2, "", "varchar", "YES")
+	if withCoupon {
+		testutil.InsertSnapshot(t, db, id, snapTime, "mydb", "orders", "coupon_code", 3, "", "varchar", "YES")
+	}
+}
+
+// TestRecover601_droppedColumnRefused is the issue's repro: a DELETE captured while the
+// table still had coupon_code reverses to an INSERT that references it, but coupon_code
+// was dropped before now. The generator must refuse loudly and write nothing — emitting
+// the INSERT would fail to apply against the current table.
+func TestRecover601_droppedColumnRefused(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	snapshot601(t, db, 1, "2026-02-19 13:00:00", true)  // event-time: has coupon_code
+	snapshot601(t, db, 2, "2026-02-19 15:00:00", false) // latest: coupon_code dropped
+
+	insertEvent601(t, db, 1, "2026-02-19 14:00:00", "mydb", "orders", 3, "1",
+		[]byte(`{"id":1,"customer":"Alice","coupon_code":"SAVE10"}`), nil)
+
+	resolver, err := metadata.NewResolver(db, 0) // latest = snapshot 2
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	g := New(db, resolver)
+
+	var buf bytes.Buffer
+	_, err = g.GenerateSQL(context.Background(), query.Options{Schema: "mydb", Table: "orders", Limit: 100}, &buf)
+	if err == nil {
+		t.Fatalf("expected schema-drift refusal, got nil; output:\n%s", buf.String())
+	}
+	if !strings.Contains(err.Error(), "coupon_code") || !strings.Contains(err.Error(), "mydb.orders") {
+		t.Errorf("refusal must name mydb.orders and coupon_code, got: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("no partial output expected on refusal, got:\n%s", buf.String())
+	}
+}
+
+// TestRecover601_pkScopedDeleteNotRefused guards the false-positive boundary the advisor
+// flagged: an INSERT reverses to a DELETE whose WHERE references only the PK (still
+// present). The dropped non-PK column is never emitted, so this valid recovery must
+// proceed — detection follows what is emitted, not every column in the image.
+func TestRecover601_pkScopedDeleteNotRefused(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	snapshot601(t, db, 1, "2026-02-19 13:00:00", true)
+	snapshot601(t, db, 2, "2026-02-19 15:00:00", false)
+
+	insertEvent601(t, db, 1, "2026-02-19 14:00:00", "mydb", "orders", 1, "1",
+		nil, []byte(`{"id":1,"customer":"Alice","coupon_code":"SAVE10"}`))
+
+	resolver, err := metadata.NewResolver(db, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	g := New(db, resolver)
+
+	var buf bytes.Buffer
+	n, err := g.GenerateSQL(context.Background(), query.Options{Schema: "mydb", Table: "orders", Limit: 100}, &buf)
+	if err != nil {
+		t.Fatalf("PK-scoped recovery must not be refused: %v", err)
+	}
+	out := buf.String()
+	assertContains(t, out, "DELETE FROM")
+	assertContains(t, out, "`id`")
+	if strings.Contains(out, "coupon_code") {
+		t.Errorf("dropped non-PK column must not appear in a PK-scoped DELETE:\n%s", out)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 statement, got %d", n)
+	}
+}
+
+// TestRecover601_noDriftStillEmits confirms the detector does not fire when the column
+// is still present in the latest snapshot — the reversal emits normally, including the
+// non-PK column.
+func TestRecover601_noDriftStillEmits(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	snapshot601(t, db, 1, "2026-02-19 13:00:00", true)
+	snapshot601(t, db, 2, "2026-02-19 15:00:00", true) // latest STILL has coupon_code
+
+	insertEvent601(t, db, 1, "2026-02-19 14:00:00", "mydb", "orders", 3, "1",
+		[]byte(`{"id":1,"customer":"Alice","coupon_code":"SAVE10"}`), nil)
+
+	resolver, err := metadata.NewResolver(db, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	g := New(db, resolver)
+
+	var buf bytes.Buffer
+	n, err := g.GenerateSQL(context.Background(), query.Options{Schema: "mydb", Table: "orders", Limit: 100}, &buf)
+	if err != nil {
+		t.Fatalf("no-drift recovery must not be refused: %v", err)
+	}
+	assertContains(t, buf.String(), "INSERT INTO")
+	assertContains(t, buf.String(), "coupon_code")
+	if n != 1 {
+		t.Errorf("expected 1 statement, got %d", n)
+	}
+}
+
+// TestRecover601_updateSetDriftRefused covers the UPDATE-reversal SET path — the only
+// builder that combines SET columns (row_before) with WHERE columns, and the most common
+// event type. It also drifts TWO columns to exercise the per-table column accumulation in
+// the refusal message. A reverse-UPDATE restores row_before, so a column dropped after
+// the event lands in the SET clause and must trigger the refusal.
+func TestRecover601_updateSetDriftRefused(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// event-time snapshot (1): orders has coupon_code AND discount
+	testutil.InsertSnapshot(t, db, 1, "2026-02-19 13:00:00", "mydb", "orders", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, "2026-02-19 13:00:00", "mydb", "orders", "customer", 2, "", "varchar", "YES")
+	testutil.InsertSnapshot(t, db, 1, "2026-02-19 13:00:00", "mydb", "orders", "coupon_code", 3, "", "varchar", "YES")
+	testutil.InsertSnapshot(t, db, 1, "2026-02-19 13:00:00", "mydb", "orders", "discount", 4, "", "int", "YES")
+	// latest snapshot (2): both coupon_code and discount dropped
+	testutil.InsertSnapshot(t, db, 2, "2026-02-19 15:00:00", "mydb", "orders", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 2, "2026-02-19 15:00:00", "mydb", "orders", "customer", 2, "", "varchar", "YES")
+
+	// UPDATE event under snapshot 1: row_before (restored by SET) carries the dropped
+	// columns; row_after carries the PK used by the WHERE.
+	insertEvent601(t, db, 1, "2026-02-19 14:00:00", "mydb", "orders", 2, "1",
+		[]byte(`{"id":1,"customer":"Alice","coupon_code":"SAVE10","discount":5}`),
+		[]byte(`{"id":1,"customer":"Bob","coupon_code":"NONE","discount":0}`))
+
+	resolver, err := metadata.NewResolver(db, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	g := New(db, resolver)
+
+	var buf bytes.Buffer
+	_, err = g.GenerateSQL(context.Background(), query.Options{Schema: "mydb", Table: "orders", Limit: 100}, &buf)
+	if err == nil {
+		t.Fatalf("expected schema-drift refusal for UPDATE SET clause, got nil; output:\n%s", buf.String())
+	}
+	if !strings.Contains(err.Error(), "coupon_code") || !strings.Contains(err.Error(), "discount") {
+		t.Errorf("refusal must name BOTH drifted SET columns, got: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("no partial output expected on refusal, got:\n%s", buf.String())
+	}
+}
+
+// TestRecover601_tableDroppedFromLatestDegradesWithWarning covers the ambiguous case the
+// silent-failure review flagged: the table is absent from the latest snapshot (dropped
+// after the event, OR simply outside a scoped --schemas/--tables snapshot). Detection
+// cannot run, so the generator must DEGRADE (emit, not refuse — refusing would break
+// legitimate recovery of a scoped-out table) but must WARN rather than go silent.
+func TestRecover601_tableDroppedFromLatestDegradesWithWarning(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// event-time snapshot (1): orders exists.
+	testutil.InsertSnapshot(t, db, 1, "2026-02-19 13:00:00", "mydb", "orders", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, "2026-02-19 13:00:00", "mydb", "orders", "customer", 2, "", "varchar", "YES")
+	// latest snapshot (2): orders absent — only another table was captured.
+	testutil.InsertSnapshot(t, db, 2, "2026-02-19 15:00:00", "mydb", "customers", "id", 1, "PRI", "int", "NO")
+
+	insertEvent601(t, db, 1, "2026-02-19 14:00:00", "mydb", "orders", 3, "1",
+		[]byte(`{"id":1,"customer":"Alice"}`), nil)
+
+	// Capture slog to assert the detector announces it could not check (the fix: warn,
+	// don't go dark). SetDefault is restored on return.
+	var logbuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	resolver, err := metadata.NewResolver(db, 0) // latest = snapshot 2 (no orders)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	g := New(db, resolver)
+
+	var buf bytes.Buffer
+	n, err := g.GenerateSQL(context.Background(), query.Options{Schema: "mydb", Table: "orders", Limit: 100}, &buf)
+	if err != nil {
+		t.Fatalf("table absent from latest snapshot is ambiguous; must degrade, not refuse: %v", err)
+	}
+	assertContains(t, buf.String(), "INSERT INTO")
+	if !strings.Contains(logbuf.String(), "drift check") {
+		t.Errorf("detector must WARN when it cannot check drift, got logs:\n%s", logbuf.String())
+	}
+	if n != 1 {
+		t.Errorf("expected 1 statement, got %d", n)
 	}
 }

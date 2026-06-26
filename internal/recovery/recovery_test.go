@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1256,5 +1257,107 @@ func TestGenerate_MySQLIdentityUnaffected(t *testing.T) {
 	}
 	if strings.Contains(stmt, "OVERRIDING SYSTEM VALUE") {
 		t.Errorf("MySQL reverse INSERT must NOT emit OVERRIDING SYSTEM VALUE, got: %s", stmt)
+	}
+}
+
+// ─── schema-drift detection (#601) ──────────────────────────────────────────────
+
+// tableMeta601 builds a TableMeta with the given column names (ordinals assigned in
+// order). The first column is marked PK so PK-scoped paths resolve.
+func tableMeta601(cols ...string) *metadata.TableMeta {
+	tm := &metadata.TableMeta{Schema: "shop", Table: "orders"}
+	for i, c := range cols {
+		col := metadata.ColumnMeta{Name: c, OrdinalPosition: i + 1}
+		if i == 0 {
+			col.IsPK = true
+		}
+		tm.Columns = append(tm.Columns, col)
+	}
+	return tm
+}
+
+// TestDriftedColumns covers the pure detector: a column emitted by the reversal that the
+// event-time schema had but the current schema dropped/renamed is flagged; everything
+// else (still-present columns, columns added after the event, columns not emitted, and
+// missing schema knowledge) is not. This is the core of the #601 fail-loud decision.
+func TestDriftedColumns(t *testing.T) {
+	evt := tableMeta601("id", "customer", "coupon_code", "total")
+	cur := tableMeta601("id", "customer", "total") // coupon_code dropped after the event
+
+	cases := []struct {
+		name    string
+		emitted []string
+		evt     *metadata.TableMeta
+		cur     *metadata.TableMeta
+		want    []string
+	}{
+		{"dropped column flagged", []string{"coupon_code", "customer", "id", "total"}, evt, cur, []string{"coupon_code"}},
+		{"renamed: old name flagged", []string{"id", "promo"}, tableMeta601("id", "promo"), tableMeta601("id", "discount"), []string{"promo"}},
+		{"no drift when all emitted columns still present", []string{"customer", "id", "total"}, evt, cur, nil},
+		// A reverse-DELETE emits only the PK in its WHERE; the dropped non-PK column is
+		// never referenced, so the recovery is valid and must NOT be refused.
+		{"PK-only WHERE: dropped non-PK not flagged", []string{"id"}, evt, cur, nil},
+		// A column ADDED after the event (and not re-snapshotted) is absent from the
+		// event-time schema too — the gate prevents flagging it.
+		{"added-after column not flagged", []string{"id", "newcol"}, tableMeta601("id"), tableMeta601("id", "newcol"), nil},
+		{"duplicate emitted column deduped", []string{"coupon_code", "coupon_code"}, evt, cur, []string{"coupon_code"}},
+		{"nil event-time meta disables detection", []string{"coupon_code"}, nil, cur, nil},
+		{"nil current meta disables detection", []string{"coupon_code"}, evt, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := driftedColumns(tc.emitted, tc.evt, tc.cur)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("driftedColumns(%v) = %v, want %v", tc.emitted, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSchemaDriftError_namesTablesAndColumns asserts the refusal error is actionable:
+// it names every affected schema.table with its (sorted) drifted columns, in first-seen
+// table order, and carries the fail-loud framing.
+func TestSchemaDriftError_namesTablesAndColumns(t *testing.T) {
+	err := schemaDriftError(
+		map[string]map[string]bool{
+			"shop.orders":   {"coupon_code": true},
+			"shop.invoices": {"old_total": true, "memo": true},
+		},
+		[]string{"shop.orders", "shop.invoices"},
+	)
+	msg := err.Error()
+	for _, want := range []string{
+		"shop.orders (coupon_code)",
+		"shop.invoices (memo, old_total)", // columns sorted within a table
+		"refusing to emit",
+		"dropped or renamed",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q; got: %s", want, msg)
+		}
+	}
+	// Table order follows the supplied order slice (orders before invoices).
+	if strings.Index(msg, "shop.orders") > strings.Index(msg, "shop.invoices") {
+		t.Errorf("tables not in first-seen order: %s", msg)
+	}
+}
+
+// TestGenerateSQLFromRows_noResolverNoDriftRefusal proves detection degrades safely:
+// with no resolver (no schema knowledge), a reversal still emits normally — never
+// blocked. Without this, file-indexed DBs and the nil-resolver fallback would break.
+func TestGenerateSQLFromRows_noResolverNoDriftRefusal(t *testing.T) {
+	g := newGen() // db=nil, resolver=nil
+	rows := []query.ResultRow{{
+		EventID: 1, SchemaName: "shop", TableName: "orders",
+		EventType: parser.EventDelete,
+		RowBefore: map[string]any{"id": "1", "coupon_code": "SAVE10"},
+	}}
+	var buf bytes.Buffer
+	n, err := g.GenerateSQLFromRows(rows, &buf)
+	if err != nil {
+		t.Fatalf("no-resolver path must not refuse: %v", err)
+	}
+	if n != 1 || !strings.Contains(buf.String(), "INSERT INTO") {
+		t.Errorf("expected a normal INSERT, got n=%d out=%s", n, buf.String())
 	}
 }
