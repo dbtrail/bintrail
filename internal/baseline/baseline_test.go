@@ -672,11 +672,15 @@ func TestReadSQLRowTruncated(t *testing.T) {
 }
 
 func TestReadSQLRowTruncatedBeforeValues(t *testing.T) {
-	// #468 shape 1: a dump truncated mid-INSERT-header — the last physical line
-	// opens an INSERT/REPLACE but the truncation cut it off BEFORE the VALUES
-	// keyword. Pre-fix the reader `continue`d past it and exited cleanly with a
-	// short row count (silent data loss → wrong Time-travel reconstructions).
-	// It must now fail loudly. The preceding complete INSERT is intact.
+	// #468 shape 1 + the adjacent unsupported layout: the reader must fail
+	// loudly when an INSERT/REPLACE opening line carries no VALUES clause —
+	// whether because the dump was truncated mid-header (the header/first-stmt
+	// cases) or because VALUES was wrapped onto a continuation line (the
+	// values-on-next-line case, an unsupported layout, not truncation). Pre-fix
+	// the reader `continue`d past it and exited cleanly with a short row count
+	// (silent data loss → wrong Time-travel reconstructions). Cases with a
+	// preceding complete INSERT leave it intact; truncated-as-first-stmt has no
+	// preceding statement.
 	cases := map[string]string{
 		"insert-header-only":      "INSERT INTO `orders` VALUES(1,'a');\nINSERT INTO `orders` (`id`,`na",
 		"replace-header-only":     "REPLACE INTO `orders` VALUES(1,'a');\nREPLACE INTO `orders` (`id`,`co",
