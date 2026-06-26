@@ -277,8 +277,14 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case derr != nil:
 			// Detection is best-effort: a probe failure must never block a plain
-			// recover. Log and fall through to the plain path.
+			// recover — but it must NOT silently downgrade one either. If this table
+			// IS a cascade parent we couldn't tell, so warn that any cascade-deleted
+			// children may be missing (mirrors the RBAC arm below), then fall through
+			// to the plain path.
 			slog.Warn("console: cascade parent detection failed; recover proceeds without cascade synthesis", "error", derr)
+			warnings = append([]string{
+				"Could not check whether this table is a foreign-key parent (detection failed: " + derr.Error() + "). If it is, any cascade-deleted child rows are NOT included in the script below — retry, or use recover-cascade to reconstruct them.",
+			}, warnings...)
 		case isParent && s.rbacActive():
 			// Synthesis can't honor redaction (it would leak denied/redacted child
 			// rows), so it stays disabled under a profile — but SAY so, so a
@@ -289,8 +295,16 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		case isParent:
 			cres, cerr := s.cascadeRecover(r.Context(), b, body, opts, rows)
 			if cerr != nil {
-				writeJSONError(w, http.StatusInternalServerError, cerr.Error())
-				return
+				// Cascade synthesis is an ENHANCEMENT of the plain recover, not a
+				// precondition — the base rows were already fetched. A synthesis
+				// failure must not deny the recover the operator can still get;
+				// degrade to the plain path with a loud warning rather than 500ing
+				// the whole request (which would block even the parent-only undo).
+				slog.Warn("console: cascade synthesis failed; falling back to plain recover", "error", cerr)
+				warnings = append([]string{
+					"Cascade synthesis failed (" + cerr.Error() + "); the script below re-creates the parent only — cascade-deleted child rows are NOT included.",
+				}, warnings...)
+				break // out of the switch → plain recover below
 			}
 			cw := warnings
 			if len(cres.Caveats) > 0 {

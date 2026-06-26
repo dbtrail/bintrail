@@ -148,7 +148,7 @@ func TestIntegrationRecoverCascade_incompleteWithArchives(t *testing.T) {
 // → Phase-1). The capability advertises the sub-flag in lockstep.
 func TestIntegrationRecoverCascade_phase2HeaderWhenBaselineConfigured(t *testing.T) {
 	srv, dbName := seedCascadeConsole(t, func(c *Config) {
-		c.NoArchive = false        // required for baselineConfigured
+		c.NoArchive = false         // required for baselineConfigured
 		c.BaselineDir = t.TempDir() // empty dir → no baseline rows, provider still wired
 	})
 
@@ -203,7 +203,7 @@ func TestIntegrationRecover_autoCascade_endToEnd(t *testing.T) {
 	for _, want := range []string{
 		"SET FOREIGN_KEY_CHECKS=0;",
 		"SET FOREIGN_KEY_CHECKS=1;",
-		"recover (cascade-aware)",                  // the Combined preamble, not "recover-cascade"
+		"recover (cascade-aware)",                   // the Combined preamble, not "recover-cascade"
 		"Re-creates 2 cascade-deleted child row(s)", // Combined header counts the children
 		"`" + dbName + "`.`parent`",
 		"`" + dbName + "`.`child`",
@@ -279,6 +279,48 @@ func TestIntegrationRecover_autoCascade_rbacWarns(t *testing.T) {
 	}
 	if !warned {
 		t.Errorf("a parent-DELETE recover under RBAC must warn that cascade children are NOT included; warnings=%v", resp.Warnings)
+	}
+}
+
+// TestIntegrationRecover_autoCascade_mixedEvents pins the combined path's
+// data-integrity contract: a parent with BOTH a non-DELETE event (UPDATE) and a
+// DELETE in the window. The combined script must reverse the UPDATE AND re-create
+// the parent from the DELETE AND include the synthesized children — because
+// cascadeRecover emits over the MERGED base rows (every event type), while the
+// synthesis uses a DELETE-only parent fetch purely to discover children. A
+// refactor that emitted over the synthesis's DELETE-only parents would silently
+// drop the UPDATE reversal — a data-loss-shaped regression this test catches.
+func TestIntegrationRecover_autoCascade_mixedEvents(t *testing.T) {
+	srv, dbName := seedCascadeConsole(t, nil)
+	// A parent UPDATE between the children (h+10m) and the seeded parent DELETE
+	// (h+20m), on the same pk=1.
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour)
+	updTs := h.Add(15 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, srv.cm.boot.db, "binlog.000001", 250, 260, updTs, nil,
+		dbName, "parent", 2 /*UPDATE*/, "1", []byte(`["status"]`),
+		[]byte(`{"id":1,"status":"old"}`), []byte(`{"id":1,"status":"new"}`))
+
+	rec, body := doReq(t, srv, "POST", "/api/recover", `{"schema":"`+dbName+`","table":"parent"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+	if !resp.CascadeDetected || resp.VictimCount != 2 {
+		t.Errorf("want cascade_detected + 2 victims, got detected=%v victims=%d", resp.CascadeDetected, resp.VictimCount)
+	}
+	// The non-DELETE base reversal must survive alongside the parent re-INSERT and
+	// the 2 child INSERTs.
+	if !strings.Contains(resp.SQL, "UPDATE `"+dbName+"`.`parent`") {
+		t.Errorf("the parent UPDATE reversal was dropped from the combined script (regression: emitted over DELETE-only parents?)\n---\n%s", resp.SQL)
+	}
+	if !strings.Contains(resp.SQL, "INSERT INTO `"+dbName+"`.`parent`") {
+		t.Errorf("the parent re-INSERT (from the DELETE) is missing\n---\n%s", resp.SQL)
+	}
+	if c := strings.Count(resp.SQL, "`"+dbName+"`.`child`"); c != 2 {
+		t.Errorf("want 2 child INSERTs, got %d\n---\n%s", c, resp.SQL)
 	}
 }
 
