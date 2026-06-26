@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -420,5 +421,34 @@ func TestArchiveStagingEnvFallback(t *testing.T) {
 	resolveUpConsoleEnv(cmd)
 	if upArchiveStageDir != "/env/staging" {
 		t.Errorf("archive-staging-dir from env = %q, want /env/staging", upArchiveStageDir)
+	}
+}
+
+// TestStartBaselinePruneLoop_gating pins the four pre-goroutine outcomes: a
+// malformed --baseline-retain fails the daemon fast, and each missing-config case
+// is a nil no-op. It deliberately never exercises the all-gates-pass path, which
+// would start the goroutine and reach storage.NewS3Client.
+func TestStartBaselinePruneLoop_gating(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A malformed retain value is fatal BEFORE the goroutine starts.
+	if err := startBaselinePruneLoop(ctx, "/d", "s3://b/p", "garbage", time.Hour); err == nil {
+		t.Error("malformed --baseline-retain must error before the goroutine starts")
+	}
+
+	// Each missing-config gate is a nil no-op (no goroutine).
+	cases := []struct {
+		name            string
+		dir, s3, retain string
+	}{
+		{"retention unset", "", "", ""},
+		{"no local dir", "", "s3://b/p", "7d"},
+		{"no S3 (only-copy guard)", "/d", "", "7d"},
+	}
+	for _, c := range cases {
+		if err := startBaselinePruneLoop(ctx, c.dir, c.s3, c.retain, time.Hour); err != nil {
+			t.Errorf("%s: gate must be a nil no-op, got %v", c.name, err)
+		}
 	}
 }

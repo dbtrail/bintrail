@@ -700,8 +700,11 @@ func startBaselinePruneLoop(ctx context.Context, baselineDir, baselineS3, retain
 			}
 		}
 		// One sweep shortly after startup (the min-age floor protects any
-		// just-created snapshot), then on the interval.
-		runOnce()
+		// just-created snapshot), then on the interval — unless the daemon is
+		// already shutting down.
+		if ctx.Err() == nil {
+			runOnce()
+		}
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {

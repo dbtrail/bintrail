@@ -74,6 +74,16 @@ type PruneResult struct {
 	// KeptIncomplete counts snapshots skipped because they carry an _INCOMPLETE
 	// marker (an in-progress or --retry-resumable run — never our business).
 	KeptIncomplete int
+	// KeptUnreadable counts complete snapshots kept because their directory could
+	// not be fully enumerated (a transient os.ReadDir failure: fd exhaustion, an
+	// NFS/permission blip). We cannot prove such a snapshot is redundant, so the
+	// fail-safe direction for a delete is to keep it — reconstruct can still
+	// os.Stat its table files even when the dir cannot be listed.
+	KeptUnreadable int
+	// ProbeErrors counts snapshots whose S3 durability could not be confirmed due
+	// to a probe error (not a clean 404). A nonzero value means retention is not
+	// reclaiming everything it could because S3 was unreachable.
+	ProbeErrors int
 }
 
 // durableProbe reports whether a snapshot directory has a confirmed durable copy
@@ -152,27 +162,41 @@ func pruneWithProbe(ctx context.Context, opts PruneOptions, probe durableProbe) 
 	if err != nil {
 		return PruneResult{}, fmt.Errorf("baseline prune: %w", err)
 	}
-	keepers := computeKeepers(snaps)
+	keepers := computeKeepers(snaps, now)
 
-	// Confirm durability only for snapshots that could actually be pruned
-	// (complete, not a keeper) — keepers are never deleted, so probing them would
-	// waste HeadObject calls. A probe error is fail-safe: treat as NOT durable
-	// (keep), never as durable (which could delete the only copy).
+	// Confirm durability only for snapshots that could actually be pruned —
+	// complete, readable, not a keeper, and already past the retention/min-age
+	// floor. Keepers and recent snapshots are kept regardless of S3, so probing
+	// them would waste HeadObject calls. A probe error is fail-safe: treat as NOT
+	// durable (keep), never as durable (which could delete the only copy).
 	durable := make(map[string]bool)
+	var probeErrors int
 	for _, s := range snaps {
-		if !s.complete || keepers[s.name] {
+		if !s.complete || s.unreadable || keepers[s.name] {
 			continue
+		}
+		age := now.Sub(s.ts)
+		if age < opts.Retain || age < baselinePruneMinAge {
+			continue // too recent to prune → no need to confirm durability
 		}
 		ok, perr := probe(ctx, s.name)
 		if perr != nil {
 			slog.Warn("baseline prune: could not confirm S3 durability; keeping snapshot",
 				"snapshot", s.name, "error", perr)
+			probeErrors++
 			continue // absent from `durable` → planPrune keeps it
 		}
 		durable[s.name] = ok
 	}
 
 	pruneNames, res := planPrune(snaps, keepers, durable, opts.Retain, baselinePruneMinAge, now)
+	res.ProbeErrors = probeErrors
+	if probeErrors > 0 {
+		// One aggregate signal so a systemic S3 outage reads as "retention stalled
+		// because S3 is unreachable", not just a scatter of per-snapshot warns.
+		slog.Warn("baseline prune: S3 durability could not be confirmed for some snapshots; retention is not reclaiming all eligible disk",
+			"unconfirmed", probeErrors)
+	}
 
 	for _, name := range pruneNames {
 		size := dirSize(filepath.Join(opts.LocalDir, name))
@@ -208,6 +232,10 @@ func planPrune(snaps []localSnapshot, keepers, durable map[string]bool, retain, 
 		case !s.complete:
 			// _INCOMPLETE: an in-progress write or a --retry-resumable partial.
 			res.KeptIncomplete++
+		case s.unreadable:
+			// Could not enumerate the directory → cannot prove it is redundant.
+			// Force-keep (reconstruct can still os.Stat its table files).
+			res.KeptUnreadable++
 		case keepers[s.name]:
 			// Newest snapshot for some table — FindBaseline's target.
 			res.KeptKeeper++
@@ -225,11 +253,14 @@ func planPrune(snaps []localSnapshot, keepers, durable map[string]bool, retain, 
 
 // localSnapshot is one snapshot directory under a baseline root, classified for
 // pruning. tables is populated only for complete snapshots ("schema/table").
+// unreadable is set when a complete snapshot's directory could not be fully
+// enumerated; such a snapshot is force-kept (we cannot prove it is redundant).
 type localSnapshot struct {
-	name     string
-	ts       time.Time
-	complete bool
-	tables   []string
+	name       string
+	ts         time.Time
+	complete   bool
+	tables     []string
+	unreadable bool
 }
 
 // enumerateLocalSnapshots lists the snapshot directories under dir. Entries whose
@@ -256,7 +287,9 @@ func enumerateLocalSnapshots(dir string) ([]localSnapshot, error) {
 		snapDir := filepath.Join(dir, e.Name())
 		s := localSnapshot{name: e.Name(), ts: ts, complete: SnapshotComplete(snapDir)}
 		if s.complete {
-			s.tables = listSnapshotTables(snapDir)
+			tables, ok := listSnapshotTables(snapDir)
+			s.tables = tables
+			s.unreadable = !ok
 		}
 		out = append(out, s)
 	}
@@ -265,13 +298,26 @@ func enumerateLocalSnapshots(dir string) ([]localSnapshot, error) {
 
 // listSnapshotTables returns the "schema/table" pairs present in a snapshot
 // directory, mirroring the <timestamp>/<schema>/<table>.parquet layout that
-// DiscoverBaselines and reconstruct.ListBaselines both walk.
-func listSnapshotTables(snapDir string) []string {
+// DiscoverBaselines and reconstruct.ListBaselines both walk. ok is false when the
+// directory (or a schema subdir) could not be listed — a transient os.ReadDir
+// failure (fd exhaustion on a busy daemon, an NFS/permission blip).
+//
+// This is the fail-safe seam for the prune (the sibling LISTING walks Warn-and
+// -skip because under-reporting a listing is harmless). reconstruct selects a
+// table's baseline by os.Stat-ing the exact <schema>/<table>.parquet path, which
+// needs only search permission and survives a listing failure — so a snapshot we
+// CANNOT enumerate may still be the newest readable copy of a table. Reporting
+// such a snapshot as "contains no tables" would drop it from every table's keeper
+// set and make it prunable: a delete of data reconstruct can still read. So on
+// any enumeration failure we return ok=false, and the caller force-keeps the
+// snapshot rather than risk deleting a usable baseline.
+func listSnapshotTables(snapDir string) (tables []string, ok bool) {
 	dbDirs, err := os.ReadDir(snapDir)
 	if err != nil {
-		return nil
+		slog.Warn("baseline prune: unreadable snapshot directory; keeping it (cannot prove it is redundant)",
+			"path", snapDir, "error", err)
+		return nil, false
 	}
-	var tables []string
 	for _, dbDir := range dbDirs {
 		if !dbDir.IsDir() {
 			continue
@@ -279,7 +325,9 @@ func listSnapshotTables(snapDir string) []string {
 		schemaDir := filepath.Join(snapDir, dbDir.Name())
 		files, err := os.ReadDir(schemaDir)
 		if err != nil {
-			continue
+			slog.Warn("baseline prune: unreadable schema directory; keeping the snapshot",
+				"path", schemaDir, "error", err)
+			return nil, false // a table here could be this snapshot's unique copy
 		}
 		for _, f := range files {
 			if f.IsDir() || !strings.HasSuffix(f.Name(), ".parquet") {
@@ -288,19 +336,27 @@ func listSnapshotTables(snapDir string) []string {
 			tables = append(tables, dbDir.Name()+"/"+strings.TrimSuffix(f.Name(), ".parquet"))
 		}
 	}
-	return tables
+	return tables, true
 }
 
 // computeKeepers returns the set of snapshot directory names that must never be
 // pruned to keep Time-travel intact: for every table, the newest COMPLETE
-// snapshot that contains it. This is exactly reconstruct.FindBaseline's per-table
-// selection (newest complete snapshot containing the table) — deleting any member
-// would make at least one table's `at=now` reconstruct return ErrNoBaseline.
-func computeKeepers(snaps []localSnapshot) map[string]bool {
+// snapshot AT-OR-BEFORE now that contains it. This is exactly what
+// reconstruct.findBaselineLocal selects for an `at=now` reconstruct (newest
+// complete snapshot containing the table, filtered to `!t.After(at)`) — deleting
+// any member would make at least one table's present-time reconstruct return
+// ErrNoBaseline.
+//
+// The `now` filter matters: a future-dated snapshot (clock skew on the dump host,
+// or an explicit --timestamp) is invisible to findBaselineLocal for at=now, so it
+// must NOT be allowed to shadow the real present keeper here — otherwise the
+// genuine newest-at-or-before-now snapshot would look non-keeper and get pruned,
+// stranding the table (the future snapshot itself is kept by the recency floor).
+func computeKeepers(snaps []localSnapshot, now time.Time) map[string]bool {
 	newestName := make(map[string]string)  // table → snapshot dir name
 	newestTS := make(map[string]time.Time) // table → snapshot timestamp
 	for _, s := range snaps {
-		if !s.complete {
+		if !s.complete || s.ts.After(now) {
 			continue
 		}
 		for _, tbl := range s.tables {

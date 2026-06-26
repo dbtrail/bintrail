@@ -7,7 +7,26 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestResolveBaselineRetain pins the three --baseline-retain outcomes without the
+// dump→convert pipeline: unset → off, malformed → error, set-without-upload →
+// loud no-op (the only-copy guard), set-with-upload → prune.
+func TestResolveBaselineRetain(t *testing.T) {
+	if r, doPrune, err := resolveBaselineRetain("", "s3://b/p"); err != nil || doPrune || r != 0 {
+		t.Errorf("unset: got (%v, %v, %v), want (0, false, nil)", r, doPrune, err)
+	}
+	if _, _, err := resolveBaselineRetain("garbage", "s3://b/p"); err == nil {
+		t.Error("malformed --baseline-retain must error")
+	}
+	if r, doPrune, err := resolveBaselineRetain("7d", ""); err != nil || doPrune || r != 7*24*time.Hour {
+		t.Errorf("retain without --upload: got (%v, %v, %v), want (7d, false, nil)", r, doPrune, err)
+	}
+	if r, doPrune, err := resolveBaselineRetain("7d", "s3://b/p"); err != nil || !doPrune || r != 7*24*time.Hour {
+		t.Errorf("retain with --upload: got (%v, %v, %v), want (7d, true, nil)", r, doPrune, err)
+	}
+}
 
 // ─── cobra command wiring ─────────────────────────────────────────────────────
 

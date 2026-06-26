@@ -132,12 +132,62 @@ func TestComputeKeepers_perTableNewest(t *testing.T) {
 		{name: "2026-01-01T00-00-00Z", ts: mustParse("2026-01-01T00-00-00Z"), complete: true, tables: []string{"shop/orders", "shop/users"}},
 		{name: "2026-06-01T00-00-00Z", ts: mustParse("2026-06-01T00-00-00Z"), complete: true, tables: []string{"shop/orders", "shop/users"}},
 	}
-	keepers := computeKeepers(snaps)
+	keepers := computeKeepers(snaps, keepersNow)
 	if !keepers["2026-06-01T00-00-00Z"] {
 		t.Error("newest snapshot must be a keeper")
 	}
 	if keepers["2026-01-01T00-00-00Z"] {
 		t.Error("older snapshot whose tables all exist in a newer one must NOT be a keeper")
+	}
+}
+
+// keepersNow is a fixed "now" comfortably after every fixture timestamp, so all
+// snapshots are at-or-before now (computeKeepers excludes future-dated ones).
+var keepersNow = time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC)
+
+// PARTIAL OVERLAP is the discriminating union case (disjoint tables pass even
+// under a buggy "newest-for-ALL-my-tables" rule). old{orders,users} is superseded
+// for `users` by new{users} but remains the only snapshot with `orders`, so it
+// must stay a keeper — pruning it would strand shop/orders.
+func TestComputeKeepers_partialOverlapUnion(t *testing.T) {
+	snaps := []localSnapshot{
+		{name: "old", ts: mustParse("2026-01-01T00-00-00Z"), complete: true, tables: []string{"shop/orders", "shop/users"}},
+		{name: "new", ts: mustParse("2026-06-25T00-00-00Z"), complete: true, tables: []string{"shop/users"}},
+	}
+	keepers := computeKeepers(snaps, keepersNow)
+	if !keepers["old"] {
+		t.Error("old snapshot is the only one with shop/orders — must stay a keeper despite being superseded for shop/users")
+	}
+	if !keepers["new"] {
+		t.Error("new snapshot is the newest with shop/users — must be a keeper")
+	}
+}
+
+// A future-dated snapshot (clock skew / explicit --timestamp) is invisible to
+// findBaselineLocal for at=now, so it must not shadow the real present keeper.
+func TestComputeKeepers_futureSnapshotDoesNotShadowPresent(t *testing.T) {
+	now := time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC)
+	snaps := []localSnapshot{
+		{name: "present", ts: mustParse("2026-01-01T00-00-00Z"), complete: true, tables: []string{"shop/orders"}},
+		{name: "future", ts: mustParse("2099-01-01T00-00-00Z"), complete: true, tables: []string{"shop/orders"}},
+	}
+	keepers := computeKeepers(snaps, now)
+	if !keepers["present"] {
+		t.Error("the newest at-or-before-now snapshot with shop/orders must be a keeper")
+	}
+	if keepers["future"] {
+		t.Error("a future-dated snapshot must not be a keeper (findBaselineLocal can't use it for at=now)")
+	}
+}
+
+// An empty _SUCCESS snapshot (complete, zero tables) serves no table, so it is a
+// keeper for nothing — eligible for pruning when old+durable, never phantom-kept.
+func TestComputeKeepers_emptySnapshotNotAKeeper(t *testing.T) {
+	snaps := []localSnapshot{
+		{name: "empty", ts: mustParse("2026-01-01T00-00-00Z"), complete: true, tables: nil},
+	}
+	if computeKeepers(snaps, keepersNow)["empty"] {
+		t.Error("an empty _SUCCESS snapshot must not be a keeper")
 	}
 }
 
@@ -150,7 +200,7 @@ func TestComputeKeepers_staleScenario(t *testing.T) {
 		{name: "2026-01-01T00-00-00Z", ts: mustParse("2026-01-01T00-00-00Z"), complete: true, tables: []string{"shop/orders"}},
 		{name: "2026-02-01T00-00-00Z", ts: mustParse("2026-02-01T00-00-00Z"), complete: true, tables: []string{"shop/users"}},
 	}
-	keepers := computeKeepers(snaps)
+	keepers := computeKeepers(snaps, keepersNow)
 	if !keepers["2026-01-01T00-00-00Z"] {
 		t.Error("older snapshot is the only one with shop/orders — must be a keeper")
 	}
@@ -165,7 +215,7 @@ func TestComputeKeepers_incompleteIgnored(t *testing.T) {
 		{name: "complete", ts: mustParse("2026-01-01T00-00-00Z"), complete: true, tables: []string{"shop/orders"}},
 		{name: "incomplete", ts: mustParse("2026-06-01T00-00-00Z"), complete: false, tables: nil},
 	}
-	keepers := computeKeepers(snaps)
+	keepers := computeKeepers(snaps, keepersNow)
 	if !keepers["complete"] {
 		t.Error("the only complete snapshot with shop/orders must be a keeper")
 	}
@@ -373,5 +423,189 @@ func TestEnumerateLocalSnapshots_missingDirIsEmpty(t *testing.T) {
 	}
 	if len(snaps) != 0 {
 		t.Fatalf("missing dir must yield no snapshots, got %v", snaps)
+	}
+}
+
+// ─── fail-safe: unenumerable snapshot is never pruned ────────────────────────
+
+// Pure: an unreadable snapshot is force-kept regardless of durability/age.
+func TestPlanPrune_unreadableForceKept(t *testing.T) {
+	now := time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC)
+	snaps := []localSnapshot{
+		{name: "u", ts: now.Add(-365 * 24 * time.Hour), complete: true, unreadable: true},
+	}
+	// durable + old + non-keeper would normally prune; unreadable must override.
+	prune, res := planPrune(snaps, nil, map[string]bool{"u": true}, time.Hour, baselinePruneMinAge, now)
+	if len(prune) != 0 {
+		t.Fatalf("an unreadable snapshot must never be pruned, got %v", prune)
+	}
+	if res.KeptUnreadable != 1 {
+		t.Errorf("KeptUnreadable = %d, want 1", res.KeptUnreadable)
+	}
+}
+
+// End-to-end: a snapshot whose directory cannot be LISTED (transient ReadDir
+// failure, simulated with chmod 0111 — still stat-able, so reconstruct could read
+// it) must be kept, never deleted. This is the critical silent-data-loss path.
+func TestPruneWithProbe_unreadableSnapshotKept(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory read permissions; the 0111 trick is a no-op")
+	}
+	root := t.TempDir()
+	const unreadable = "2026-01-01T00-00-00Z" // old, durable — would be pruned if listable
+	const keeper = "2026-06-25T00-00-00Z"
+	makeSnapshot(t, root, unreadable, true, "shop/orders", "shop/users")
+	makeSnapshot(t, root, keeper, true, "shop/orders", "shop/users")
+
+	unreadablePath := filepath.Join(root, unreadable)
+	if err := os.Chmod(unreadablePath, 0o111); err != nil { // search but not read
+		t.Fatal(err)
+	}
+	defer os.Chmod(unreadablePath, 0o755) //nolint:errcheck // restore for TempDir cleanup
+
+	now := time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC)
+	probe := func(_ context.Context, _ string) (bool, error) { return true, nil }
+	res, err := pruneWithProbe(context.Background(), PruneOptions{
+		LocalDir: root, S3URL: "s3://b/p", Retain: 7 * 24 * time.Hour, Now: now,
+	}, probe)
+	if err != nil {
+		t.Fatalf("pruneWithProbe: %v", err)
+	}
+	if len(res.Pruned) != 0 {
+		t.Fatalf("an unreadable snapshot must NOT be pruned, got %v", res.Pruned)
+	}
+	if res.KeptUnreadable != 1 {
+		t.Errorf("KeptUnreadable = %d, want 1", res.KeptUnreadable)
+	}
+	if _, err := os.Stat(unreadablePath); err != nil {
+		t.Errorf("unreadable snapshot must survive, stat err = %v", err)
+	}
+	entries, _ := os.ReadDir(root)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), pruningSuffix) {
+			t.Errorf("unreadable snapshot must not be staged for deletion: %s", e.Name())
+		}
+	}
+}
+
+// ─── more end-to-end keeper protections ─────────────────────────────────────
+
+// Partial-overlap union: old{orders,users} is the only snapshot with shop/orders,
+// so it survives even though shop/users is superseded by new{users}.
+func TestPruneWithProbe_partialOverlapKeepsOlder(t *testing.T) {
+	root := t.TempDir()
+	const old = "2026-01-01T00-00-00Z"
+	const newer = "2026-06-25T00-00-00Z"
+	makeSnapshot(t, root, old, true, "shop/orders", "shop/users")
+	makeSnapshot(t, root, newer, true, "shop/users")
+
+	now := time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC)
+	probe := func(_ context.Context, _ string) (bool, error) { return true, nil }
+	res, err := pruneWithProbe(context.Background(), PruneOptions{
+		LocalDir: root, S3URL: "s3://b/p", Retain: 7 * 24 * time.Hour, Now: now,
+	}, probe)
+	if err != nil {
+		t.Fatalf("pruneWithProbe: %v", err)
+	}
+	if len(res.Pruned) != 0 {
+		t.Fatalf("old snapshot is the only one with shop/orders — must not be pruned, got %v", res.Pruned)
+	}
+	if _, err := os.Stat(filepath.Join(root, old)); err != nil {
+		t.Errorf("old snapshot must survive (it is the shop/orders keeper), stat err = %v", err)
+	}
+}
+
+// Regression for the future-snapshot data-loss edge: a future-dated snapshot must
+// not shadow the real present keeper (which would otherwise be pruned).
+func TestPruneWithProbe_futureSnapshotKeepsPresent(t *testing.T) {
+	root := t.TempDir()
+	const present = "2026-01-01T00-00-00Z" // old, durable, the real at=now keeper
+	const future = "2099-01-01T00-00-00Z"  // future-dated (clock skew / --timestamp)
+	makeSnapshot(t, root, present, true, "shop/orders")
+	makeSnapshot(t, root, future, true, "shop/orders")
+
+	now := time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC)
+	probe := func(_ context.Context, _ string) (bool, error) { return true, nil }
+	res, err := pruneWithProbe(context.Background(), PruneOptions{
+		LocalDir: root, S3URL: "s3://b/p", Retain: 7 * 24 * time.Hour, Now: now,
+	}, probe)
+	if err != nil {
+		t.Fatalf("pruneWithProbe: %v", err)
+	}
+	if len(res.Pruned) != 0 {
+		t.Fatalf("present snapshot is the at=now shop/orders keeper — must not be pruned, got %v", res.Pruned)
+	}
+	if _, err := os.Stat(filepath.Join(root, present)); err != nil {
+		t.Errorf("present keeper must survive a future-dated sibling, stat err = %v", err)
+	}
+}
+
+// Legacy marker-less snapshots are complete-by-default: the newest is a keeper,
+// an old durable one is reclaimable.
+func TestPruneWithProbe_legacyMarkerless(t *testing.T) {
+	root := t.TempDir()
+	const oldLegacy = "2026-01-01T00-00-00Z" // marker-less, old, durable, non-keeper → PRUNE
+	const newLegacy = "2026-06-25T00-00-00Z" // marker-less, newest → keeper
+	makeRawSnapshot(t, root, oldLegacy, "shop/orders")
+	makeRawSnapshot(t, root, newLegacy, "shop/orders")
+
+	now := time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC)
+	probe := func(_ context.Context, _ string) (bool, error) { return true, nil }
+	res, err := pruneWithProbe(context.Background(), PruneOptions{
+		LocalDir: root, S3URL: "s3://b/p", Retain: 7 * 24 * time.Hour, Now: now,
+	}, probe)
+	if err != nil {
+		t.Fatalf("pruneWithProbe: %v", err)
+	}
+	if len(res.Pruned) != 1 || res.Pruned[0] != oldLegacy {
+		t.Fatalf("legacy prune = %v, want [%s] (newest legacy kept as keeper)", res.Pruned, oldLegacy)
+	}
+	if _, err := os.Stat(filepath.Join(root, newLegacy)); err != nil {
+		t.Errorf("legacy newest (keeper) must survive, stat err = %v", err)
+	}
+}
+
+// ─── boundaries / misc ──────────────────────────────────────────────────────
+
+// A snapshot exactly `retain` old is prunable (predicate is age < retain → keep).
+func TestPlanPrune_retentionBoundary(t *testing.T) {
+	now := time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC)
+	retain := 7 * 24 * time.Hour
+	snaps := []localSnapshot{{name: "exact", ts: now.Add(-retain), complete: true}}
+	prune, _ := planPrune(snaps, nil, map[string]bool{"exact": true}, retain, baselinePruneMinAge, now)
+	if len(prune) != 1 || prune[0] != "exact" {
+		t.Fatalf("a snapshot exactly `retain` old must be prunable, got %v", prune)
+	}
+}
+
+func TestPruneLocal_malformedS3URL(t *testing.T) {
+	_, err := PruneLocal(context.Background(), PruneOptions{
+		LocalDir: t.TempDir(), S3URL: "not-an-s3-url", Retain: time.Hour,
+	})
+	if err == nil {
+		t.Error("a malformed S3URL must error before any deletion")
+	}
+}
+
+// makeRawSnapshot creates a snapshot directory with NO completeness marker — a
+// legacy (pre-#467) snapshot, which SnapshotComplete treats as complete-by-default.
+func makeRawSnapshot(t *testing.T, root, tsDir string, tables ...string) {
+	t.Helper()
+	snapDir := filepath.Join(root, tsDir)
+	if err := os.MkdirAll(snapDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tbl := range tables {
+		schema, table, ok := strings.Cut(tbl, "/")
+		if !ok {
+			t.Fatalf("table fixture %q must be schema/table", tbl)
+		}
+		tdir := filepath.Join(snapDir, schema)
+		if err := os.MkdirAll(tdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tdir, table+".parquet"), []byte("parquet-bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
