@@ -695,6 +695,28 @@ func baselinePruneTargets(entries []console.ServerEntry, globalDir, globalS3 str
 	return targets
 }
 
+// runBaselinePruneCycle prunes each target via pruneFn, one (dir + S3) pair at a
+// time. A failure on one target is logged and the rest still run — one bad dir
+// must not strand the others. pruneFn is injected (baseline.PruneLocal in
+// production) so the per-target iteration is unit-testable without S3.
+func runBaselinePruneCycle(ctx context.Context, targets []baselinePruneTarget, retain time.Duration, pruneFn func(context.Context, baseline.PruneOptions) (baseline.PruneResult, error)) {
+	for _, t := range targets {
+		res, err := pruneFn(ctx, baseline.PruneOptions{
+			LocalDir: t.dir,
+			S3URL:    t.s3,
+			Retain:   retain,
+		})
+		if err != nil {
+			slog.Warn("baseline prune cycle failed", "dir", t.dir, "error", err)
+			continue
+		}
+		if len(res.Pruned) > 0 {
+			slog.Info("baseline prune cycle complete",
+				"dir", t.dir, "pruned", len(res.Pruned), "reclaimed_bytes", res.ReclaimedBytes)
+		}
+	}
+}
+
 // startBaselinePruneLoop launches a periodic prune of local baseline snapshots
 // across every (dir + S3) target — the daemon-global pair plus every registry
 // server's per-server baseline dir (#616). Each target is reclaimed only where a
@@ -725,25 +747,29 @@ func startBaselinePruneLoop(ctx context.Context, reg *console.Registry, globalDi
 	slog.Info("baseline prune loop enabled", "retain", retainRaw, "interval", interval)
 	go func() {
 		runOnce := func() {
+			// Recover-guard the cycle: a panic in PruneLocal (live S3 calls, fs
+			// walks) must NEVER take down the daemon's primary forensic capture —
+			// this optional disk-reclaim feature shares the process with the
+			// stream. Mirrors rotation.StartLoop's guard (internal/rotation).
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("baseline prune cycle panicked; retention continues next tick", "panic", r)
+				}
+			}()
 			var entries []console.ServerEntry
 			if reg != nil {
 				entries = reg.List()
 			}
-			for _, t := range baselinePruneTargets(entries, globalDir, globalS3) {
-				res, err := baseline.PruneLocal(ctx, baseline.PruneOptions{
-					LocalDir: t.dir,
-					S3URL:    t.s3,
-					Retain:   retain,
-				})
-				if err != nil {
-					slog.Warn("baseline prune cycle failed", "dir", t.dir, "error", err)
-					continue
-				}
-				if len(res.Pruned) > 0 {
-					slog.Info("baseline prune cycle complete",
-						"dir", t.dir, "pruned", len(res.Pruned), "reclaimed_bytes", res.ReclaimedBytes)
+			// A per-server local baseline dir with no S3 prefix is the only copy —
+			// skipped, but warn (matching the global/CLI signal) so its unbounded
+			// growth isn't silent.
+			for _, e := range entries {
+				if e.BaselineDir != "" && e.BaselineS3 == "" {
+					slog.Warn("baseline-retain: server has a local baseline dir but no S3 prefix; its baselines are the only copy and will not be pruned",
+						"server", e.Name, "dir", e.BaselineDir)
 				}
 			}
+			runBaselinePruneCycle(ctx, baselinePruneTargets(entries, globalDir, globalS3), retain, baseline.PruneLocal)
 		}
 		// One sweep shortly after startup (the min-age floor protects any
 		// just-created snapshot), then on the interval — unless the daemon is

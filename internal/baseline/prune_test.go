@@ -319,6 +319,9 @@ func TestPruneWithProbe_probeErrorKeeps(t *testing.T) {
 	if len(res.Pruned) != 0 {
 		t.Fatalf("pruned = %v, want none (probe errored → keep)", res.Pruned)
 	}
+	if res.ProbeErrors != 1 {
+		t.Errorf("ProbeErrors = %d, want 1 (the old snapshot's probe errored)", res.ProbeErrors)
+	}
 	if _, err := os.Stat(filepath.Join(root, old)); err != nil {
 		t.Errorf("old snapshot must survive a probe error, stat err = %v", err)
 	}
@@ -608,4 +611,106 @@ func makeRawSnapshot(t *testing.T, root, tsDir string, tables ...string) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// The unreadable-detection wiring (`s.unreadable = !ok`) is exercised
+// deterministically by faking a readDir failure — independent of uid, so it runs
+// under a root CI where the chmod-0111 test (TestPruneWithProbe_unreadableSnapshotKept)
+// is skipped. Covers BOTH the snapshot-dir and the schema-dir ReadDir failure
+// levels (the silent-failure-hunter noted the schema-dir path lacked coverage).
+func TestPruneWithProbe_unreadableDetection(t *testing.T) {
+	for _, level := range []string{"snapshot-dir", "schema-dir"} {
+		t.Run(level, func(t *testing.T) {
+			root := t.TempDir()
+			const unreadable = "2026-01-01T00-00-00Z" // old, durable — pruned if listable
+			const keeper = "2026-06-25T00-00-00Z"
+			makeSnapshot(t, root, unreadable, true, "shop/orders", "shop/users")
+			makeSnapshot(t, root, keeper, true, "shop/orders", "shop/users")
+
+			failPath := filepath.Join(root, unreadable)
+			if level == "schema-dir" {
+				failPath = filepath.Join(root, unreadable, "shop")
+			}
+			orig := readDir
+			t.Cleanup(func() { readDir = orig })
+			readDir = func(p string) ([]os.DirEntry, error) {
+				if p == failPath {
+					return nil, os.ErrPermission
+				}
+				return orig(p)
+			}
+
+			now := time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC)
+			probe := func(_ context.Context, _ string) (bool, error) { return true, nil }
+			res, err := pruneWithProbe(context.Background(), PruneOptions{
+				LocalDir: root, S3URL: "s3://b/p", Retain: 7 * 24 * time.Hour, Now: now,
+			}, probe)
+			if err != nil {
+				t.Fatalf("pruneWithProbe: %v", err)
+			}
+			if len(res.Pruned) != 0 {
+				t.Fatalf("an unreadable snapshot must NOT be pruned, got %v", res.Pruned)
+			}
+			if res.KeptUnreadable != 1 {
+				t.Errorf("KeptUnreadable = %d, want 1", res.KeptUnreadable)
+			}
+			if _, err := os.Stat(filepath.Join(root, unreadable)); err != nil {
+				t.Errorf("unreadable snapshot must survive, stat err = %v", err)
+			}
+		})
+	}
+}
+
+// Invariant property: after a prune, every table that had a usable (complete,
+// at-or-before-now) baseline BEFORE the prune must STILL have one — the keeper
+// guarantee reconstruct.FindBaseline relies on at=now. Asserted as a property
+// (importing reconstruct here would be an import cycle); it catches a prune-side
+// regression that deletes a table's last at=now copy across a mix of overlapping,
+// disjoint, dropped-from-newer, recent, and future-dated snapshots.
+func TestPruneWithProbe_everyTableStillResolvable(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 6, 26, 0, 0, 0, 0, time.UTC)
+	makeSnapshot(t, root, "2026-01-01T00-00-00Z", true, "shop/orders", "shop/users") // old, both
+	makeSnapshot(t, root, "2026-02-01T00-00-00Z", true, "shop/orders")               // old, orders only
+	makeSnapshot(t, root, "2026-03-01T00-00-00Z", true, "shop/legacy")               // table only here
+	makeSnapshot(t, root, "2026-06-25T00-00-00Z", true, "shop/orders", "shop/users") // newest
+	makeSnapshot(t, root, "2099-01-01T00-00-00Z", true, "shop/orders")               // future-dated
+
+	before := tablesResolvable(t, root, now)
+	if len(before) == 0 {
+		t.Fatal("test bug: no tables resolvable before prune")
+	}
+	probe := func(_ context.Context, _ string) (bool, error) { return true, nil }
+	if _, err := pruneWithProbe(context.Background(), PruneOptions{
+		LocalDir: root, S3URL: "s3://b/p", Retain: 7 * 24 * time.Hour, Now: now,
+	}, probe); err != nil {
+		t.Fatalf("pruneWithProbe: %v", err)
+	}
+	after := tablesResolvable(t, root, now)
+	for tbl := range before {
+		if !after[tbl] {
+			t.Errorf("table %q was resolvable before the prune but not after — a keeper was deleted", tbl)
+		}
+	}
+}
+
+// tablesResolvable returns the "schema/table" set with at least one complete,
+// at-or-before-now snapshot containing them — the at=now reconstruct
+// resolvability condition, computed straight from disk.
+func tablesResolvable(t *testing.T, root string, now time.Time) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	snaps, err := enumerateLocalSnapshots(root)
+	if err != nil {
+		t.Fatalf("enumerate: %v", err)
+	}
+	for _, s := range snaps {
+		if !s.complete || s.ts.After(now) {
+			continue
+		}
+		for _, tbl := range s.tables {
+			out[tbl] = true
+		}
+	}
+	return out
 }

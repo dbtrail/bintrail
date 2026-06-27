@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/rotation"
 )
@@ -473,5 +475,43 @@ func TestBaselinePruneTargets(t *testing.T) {
 	}
 	if n := len(baselinePruneTargets(nil, "/d", "")); n != 0 {
 		t.Errorf("global dir without S3 → no target (only copy), got %d", n)
+	}
+}
+
+// TestRunBaselinePruneCycle pins the per-target CONSUMPTION (the point of commit
+// 3, which TestBaselinePruneTargets only pins at the collection boundary): each
+// deduped (dir, s3) target gets exactly one PruneLocal-shaped call with matching
+// options, and a failure on one target does not stop the others.
+func TestRunBaselinePruneCycle(t *testing.T) {
+	entries := []console.ServerEntry{
+		{BaselineDir: "/srv1", BaselineS3: "s3://b/srv1"},
+		{BaselineDir: "/global", BaselineS3: "s3://b/global"}, // duplicate of the global pair
+		{BaselineDir: "/srv2"},                                // dir-only → no target
+	}
+	targets := baselinePruneTargets(entries, "/global", "s3://b/global")
+
+	var calls []baseline.PruneOptions
+	pruneFn := func(_ context.Context, o baseline.PruneOptions) (baseline.PruneResult, error) {
+		calls = append(calls, o)
+		if o.LocalDir == "/srv1" {
+			return baseline.PruneResult{}, errors.New("boom") // one target fails
+		}
+		return baseline.PruneResult{Pruned: []string{"x"}}, nil
+	}
+	runBaselinePruneCycle(context.Background(), targets, 7*24*time.Hour, pruneFn)
+
+	// Two deduped targets (/global, /srv1) each called once; the /srv1 error did
+	// not stop /global.
+	want := map[string]string{"/global": "s3://b/global", "/srv1": "s3://b/srv1"}
+	if len(calls) != len(want) {
+		t.Fatalf("got %d prune calls %+v, want %d", len(calls), calls, len(want))
+	}
+	for _, c := range calls {
+		if want[c.LocalDir] != c.S3URL {
+			t.Errorf("unexpected prune call %+v", c)
+		}
+		if c.Retain != 7*24*time.Hour {
+			t.Errorf("Retain = %v, want 7d", c.Retain)
+		}
 	}
 }

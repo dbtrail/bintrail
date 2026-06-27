@@ -30,6 +30,14 @@ const baselinePruneMinAge = time.Hour
 // table files (which a reader would treat as complete and then get ErrNoBaseline).
 const pruningSuffix = ".pruning"
 
+// readDir is os.ReadDir, indirected ONLY so a test can force an enumeration
+// failure for a specific snapshot directory and exercise the unreadable
+// force-keep path deterministically — a chmod-based test is skipped under a
+// root-running CI, where it would otherwise be the safety net. Used solely by
+// listSnapshotTables (the per-snapshot enumeration that gates deletion); the
+// top-level directory walks deliberately keep os.ReadDir.
+var readDir = os.ReadDir
+
 // PruneOptions configures a local baseline-snapshot prune (#616).
 //
 // Pruning is a deliberate no-op (logged loudly) unless S3URL is set: a local
@@ -51,11 +59,18 @@ type PruneOptions struct {
 	Retain time.Duration
 	// Now is an injectable clock for tests; the zero value means time.Now().UTC().
 	Now time.Time
-	// DryRun logs what would be pruned without deleting anything.
+	// DryRun logs what would be pruned without deleting anything. NOTE: the zero
+	// value deletes — set DryRun to preview (matches rotation's convention).
 	DryRun bool
 }
 
 // PruneResult reports what a prune did, for the caller to log/surface.
+//
+// The Kept* counters are FIRST-MATCH reason codes, not independent set
+// memberships: a snapshot that is both a keeper and recent counts once, as
+// KeptKeeper (the order is incomplete > unreadable > keeper > recent
+// > not-durable). Together with len(Pruned) they partition the enumerated
+// snapshot set — every snapshot lands in exactly one bucket.
 type PruneResult struct {
 	// Pruned holds the snapshot directory names actually removed (or, under
 	// DryRun, that would be removed).
@@ -72,7 +87,8 @@ type PruneResult struct {
 	// window or younger than the safety floor.
 	KeptRecent int
 	// KeptIncomplete counts snapshots skipped because they carry an _INCOMPLETE
-	// marker (an in-progress or --retry-resumable run — never our business).
+	// marker (an in-progress write or a partial run resumable via --retry — never
+	// our business).
 	KeptIncomplete int
 	// KeptUnreadable counts complete snapshots kept because their directory could
 	// not be fully enumerated (a transient os.ReadDir failure: fd exhaustion, an
@@ -81,8 +97,11 @@ type PruneResult struct {
 	// os.Stat its table files even when the dir cannot be listed.
 	KeptUnreadable int
 	// ProbeErrors counts snapshots whose S3 durability could not be confirmed due
-	// to a probe error (not a clean 404). A nonzero value means retention is not
-	// reclaiming everything it could because S3 was unreachable.
+	// to a probe error (not a clean 404). It is a SUBSET of KeptNotDurable — those
+	// kept because the probe errored rather than cleanly reported absence; the two
+	// are different axes (where it landed vs why we couldn't confirm) and nothing
+	// sums them. A nonzero value means retention is not reclaiming everything it
+	// could because S3 was unreachable.
 	ProbeErrors int
 }
 
@@ -93,16 +112,21 @@ type PruneResult struct {
 type durableProbe func(ctx context.Context, snapshotName string) (bool, error)
 
 // PruneLocal removes redundant local baseline snapshots under opts.LocalDir,
-// honoring three invariants (#616):
+// honoring these invariants (#616), plus a recency floor and a force-keep for
+// snapshots whose directory can't be enumerated — both of which only ever keep
+// MORE:
 //
 //   - Never delete the only copy: a snapshot is pruned only when its _SUCCESS
 //     marker is confirmed present in S3 at the exact same timestamp prefix.
 //   - Never delete the newest usable snapshot: the newest COMPLETE snapshot
 //     containing each table is kept, matching reconstruct.FindBaseline's
 //     per-table selection — pruning it would break Time-travel for that table.
+//     A snapshot whose directory can't be listed is also force-kept: it may be
+//     the newest readable copy of a table (reconstruct os.Stats the file path).
 //   - Respect markers: _INCOMPLETE snapshots are never touched (they may be an
-//     in-progress write or a --retry-resumable partial), and a complete snapshot
-//     is renamed aside before deletion so a reader never sees a half-removed one.
+//     in-progress write or a partial run resumable via --retry), and a complete
+//     snapshot is renamed aside before deletion so a reader never sees a
+//     half-removed one.
 //
 // Pruning only ever narrows how far back local Time-travel reaches; the present
 // (an `at=now` reconstruct) always resolves to a kept keeper, never to a pruned
@@ -230,7 +254,7 @@ func planPrune(snaps []localSnapshot, keepers, durable map[string]bool, retain, 
 	for _, s := range snaps {
 		switch {
 		case !s.complete:
-			// _INCOMPLETE: an in-progress write or a --retry-resumable partial.
+			// _INCOMPLETE: an in-progress write or a partial run resumable via --retry.
 			res.KeptIncomplete++
 		case s.unreadable:
 			// Could not enumerate the directory → cannot prove it is redundant.
@@ -312,7 +336,7 @@ func enumerateLocalSnapshots(dir string) ([]localSnapshot, error) {
 // any enumeration failure we return ok=false, and the caller force-keeps the
 // snapshot rather than risk deleting a usable baseline.
 func listSnapshotTables(snapDir string) (tables []string, ok bool) {
-	dbDirs, err := os.ReadDir(snapDir)
+	dbDirs, err := readDir(snapDir)
 	if err != nil {
 		slog.Warn("baseline prune: unreadable snapshot directory; keeping it (cannot prove it is redundant)",
 			"path", snapDir, "error", err)
@@ -323,7 +347,7 @@ func listSnapshotTables(snapDir string) (tables []string, ok bool) {
 			continue
 		}
 		schemaDir := filepath.Join(snapDir, dbDir.Name())
-		files, err := os.ReadDir(schemaDir)
+		files, err := readDir(schemaDir)
 		if err != nil {
 			slog.Warn("baseline prune: unreadable schema directory; keeping the snapshot",
 				"path", schemaDir, "error", err)
