@@ -120,6 +120,32 @@ func TestConsistentTableChecksum_GeneratedColumnsExcluded(t *testing.T) {
 	}
 }
 
+func TestConsistentTableChecksum_DefaultTimestampColumnIncluded(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// A `DEFAULT CURRENT_TIMESTAMP` column reports EXTRA="DEFAULT_GENERATED" but
+	// is an ordinary, mydumper-dumped data column — it MUST be in the digest.
+	// Tables a and b carry the same id but different timestamp values, so if the
+	// column is included (correct) the digests differ; if it were wrongly
+	// excluded as "generated" the digests would falsely match.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+	testutil.MustExec(t, db, "INSERT INTO a (id, created_at) VALUES (1, '2021-01-01 00:00:00')")
+	testutil.MustExec(t, db, "INSERT INTO b (id, created_at) VALUES (1, '2022-06-15 12:30:00')")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest == cb.Digest {
+		t.Errorf("DEFAULT CURRENT_TIMESTAMP column excluded from digest (false match): both %s", ca.Digest)
+	}
+}
+
 func TestConsistentTableChecksum_UnsignedRenderedUnsigned(t *testing.T) {
 	db, schema := testutil.CreateTestDB(t)
 	// A BIGINT UNSIGNED value above 2^63 must render unsigned in the digest

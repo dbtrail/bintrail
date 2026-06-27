@@ -17,18 +17,33 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/fnv"
 	"strings"
+
+	"github.com/go-sql-driver/mysql"
 )
+
+// erUnknownSystemVariable is MySQL's error code for an unknown system variable
+// (ER_UNKNOWN_SYSTEM_VARIABLE). Matched by number rather than message text,
+// which is locale-dependent.
+const erUnknownSystemVariable = 1193
 
 // TableChecksum is a point-in-time fingerprint of a single source table.
 //
-// GTIDSet is @@gtid_executed captured inside the consistent-snapshot transaction
-// — the exact point against which a Parquet snapshot can later be compared. It is
-// empty on a server with GTIDs disabled (gtid_mode=OFF) or absent (MariaDB);
-// callers that need a position anchor on such servers capture it separately.
+// GTIDSet is @@gtid_executed captured just after the consistent snapshot opens —
+// the point against which a Parquet snapshot can later be compared. It is empty
+// on a server with GTIDs disabled (gtid_mode=OFF) or absent (MariaDB); callers
+// that need a position anchor on such servers capture it separately.
+//
+// @@gtid_executed is global state, not MVCC-filtered, so a commit landing in the
+// brief window between the snapshot opening and this read is reflected in the
+// GTID but not in the snapshot data. This lock-free window is the same one every
+// bintrail baseline carries (mydumper dumps with NO_LOCK and reads its metadata
+// GTID the same way); the digest itself is computed entirely over the snapshot
+// and is unaffected — only the anchor's precision is bounded by this window.
 //
 // Digest is a hex-encoded, order-independent multiset hash of the row contents.
 // Two tables holding the same rows in any physical or primary-key order produce
@@ -46,8 +61,9 @@ type TableChecksum struct {
 // ConsistentTableChecksum computes a TableChecksum for schema.table against the
 // live source db. The whole computation — GTID capture, column introspection,
 // and the table scan — runs on a single pinned connection inside
-// START TRANSACTION WITH CONSISTENT SNAPSHOT, so the digest, the row count, and
-// the captured GTID all describe the exact same snapshot of the data.
+// START TRANSACTION WITH CONSISTENT SNAPSHOT, so the digest and the row count
+// describe one snapshot of the data and the captured GTID anchors it (modulo the
+// lock-free window documented on TableChecksum.GTIDSet).
 //
 // The canonical form of every value is MySQL's text-protocol rendering with the
 // session time zone pinned to UTC. That rendering is already type-exact —
@@ -55,7 +71,10 @@ type TableChecksum struct {
 // fractional precision, DECIMAL is pre-formatted, JSON is normalized — so no
 // per-type canonicalization is reimplemented here. The Parquet side of the
 // comparison (#634) must reproduce this same contract: "MySQL text rendering,
-// session time zone UTC".
+// session time zone UTC". Two digests are only comparable when computed against
+// the same connection charset and server family — string transcoding and
+// FLOAT/DOUBLE text rendering depend on both — which is the natural case since
+// the baseline and its verify run against the same source.
 //
 // Generated columns (VIRTUAL/STORED) are excluded: mydumper does not dump them,
 // so they are absent from the baseline Parquet and must be absent here too.
@@ -159,8 +178,9 @@ func capturedGTID(ctx context.Context, conn *sql.Conn) (string, error) {
 	var gtid sql.NullString
 	err := conn.QueryRowContext(ctx, "SELECT @@global.gtid_executed").Scan(&gtid)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unknown system variable") {
-			return "", nil
+		var me *mysql.MySQLError
+		if errors.As(err, &me) && me.Number == erUnknownSystemVariable {
+			return "", nil // server has no @@gtid_executed (e.g. MariaDB)
 		}
 		return "", fmt.Errorf("read @@gtid_executed: %w", err)
 	}
@@ -170,9 +190,17 @@ func capturedGTID(ctx context.Context, conn *sql.Conn) (string, error) {
 // tableColumns returns the non-generated column names of schema.table in ordinal
 // order. Generated columns are excluded because mydumper omits them from the
 // dump, so they never reach the baseline Parquet.
+//
+// Generated-ness is read from GENERATION_EXPRESSION, not the EXTRA column: EXTRA
+// also reports "DEFAULT_GENERATED" for an ordinary column with an expression
+// default (e.g. created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP), so a substring
+// match on "GENERATED" would wrongly drop those real, dumped data columns and
+// make their corruption invisible to the fingerprint. GENERATION_EXPRESSION is
+// non-empty only for true VIRTUAL/STORED generated columns (empty in MySQL, NULL
+// in MariaDB for everything else).
 func tableColumns(ctx context.Context, conn *sql.Conn, schema, table string) ([]string, error) {
 	const q = `
-		SELECT COLUMN_NAME, EXTRA
+		SELECT COLUMN_NAME, GENERATION_EXPRESSION
 		FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY ORDINAL_POSITION`
@@ -184,13 +212,13 @@ func tableColumns(ctx context.Context, conn *sql.Conn, schema, table string) ([]
 
 	var cols []string
 	for rows.Next() {
-		var name, extra string
-		if err := rows.Scan(&name, &extra); err != nil {
+		var name string
+		var genExpr sql.NullString
+		if err := rows.Scan(&name, &genExpr); err != nil {
 			return nil, fmt.Errorf("scan column metadata of %s.%s: %w", schema, table, err)
 		}
-		// EXTRA reads e.g. "VIRTUAL GENERATED" / "STORED GENERATED".
-		if strings.Contains(strings.ToUpper(extra), "GENERATED") {
-			continue
+		if genExpr.Valid && strings.TrimSpace(genExpr.String) != "" {
+			continue // VIRTUAL/STORED generated column — not in the dump
 		}
 		cols = append(cols, name)
 	}
