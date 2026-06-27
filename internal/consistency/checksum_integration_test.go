@@ -4,10 +4,42 @@ package consistency
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
+
+func TestConsistentTableChecksum_TemporalDigestParseTimeIndependent(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE t (id INT PRIMARY KEY, ts DATETIME(6), d DATE, tstamp TIMESTAMP NULL)")
+	testutil.MustExec(t, db, "INSERT INTO t VALUES (1,'2021-01-01 00:00:00.123456','2021-03-04','2021-01-01 00:00:00')")
+
+	ctx := context.Background()
+	// Default test DSN sets parseTime=true (driver decodes DATE/DATETIME/
+	// TIMESTAMP into time.Time and re-renders RFC3339 on RawBytes scan).
+	withParse, err := ConsistentTableChecksum(ctx, db, schema, "t")
+	if err != nil {
+		t.Fatalf("checksum (parseTime=true): %v", err)
+	}
+
+	// Same data over a connection WITHOUT parseTime — the CAST(... AS CHAR) on
+	// temporal columns must make the digest identical, proving the canonical
+	// form is MySQL's native text, not a driver artifact.
+	rawDB, err := sql.Open("mysql", testutil.BaseDSN()+"/"+schema)
+	if err != nil {
+		t.Fatalf("open no-parseTime db: %v", err)
+	}
+	defer rawDB.Close()
+	noParse, err := ConsistentTableChecksum(ctx, rawDB, schema, "t")
+	if err != nil {
+		t.Fatalf("checksum (parseTime=false): %v", err)
+	}
+
+	if withParse.Digest != noParse.Digest {
+		t.Errorf("temporal digest depends on parseTime: %s != %s", withParse.Digest, noParse.Digest)
+	}
+}
 
 func TestConsistentTableChecksum_BasicAndDeterministic(t *testing.T) {
 	db, schema := testutil.CreateTestDB(t)

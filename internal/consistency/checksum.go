@@ -129,7 +129,7 @@ func ConsistentTableChecksum(ctx context.Context, db *sql.DB, schema, table stri
 	// Scan every row, hashing as we stream — no full-table buffering.
 	selectList := make([]string, len(cols))
 	for i, c := range cols {
-		selectList[i] = quoteIdent(c)
+		selectList[i] = selectExpr(c)
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s.%s",
 		strings.Join(selectList, ","), quoteIdent(schema), quoteIdent(table))
@@ -203,7 +203,14 @@ func capturedGTID(ctx context.Context, conn *sql.Conn) (string, error) {
 	return strings.TrimSpace(gtid.String), nil
 }
 
-// tableColumns returns the non-generated column names of schema.table in ordinal
+// column is a non-generated source column: its name and information_schema
+// DATA_TYPE (lower-case, e.g. "datetime", "bigint", "varchar").
+type column struct {
+	name     string
+	dataType string
+}
+
+// tableColumns returns the non-generated columns of schema.table in ordinal
 // order. Generated columns are excluded because mydumper omits them from the
 // dump, so they never reach the baseline Parquet.
 //
@@ -214,9 +221,9 @@ func capturedGTID(ctx context.Context, conn *sql.Conn) (string, error) {
 // make their corruption invisible to the fingerprint. GENERATION_EXPRESSION is
 // non-empty only for true VIRTUAL/STORED generated columns (empty in MySQL, NULL
 // in MariaDB for everything else).
-func tableColumns(ctx context.Context, conn *sql.Conn, schema, table string) ([]string, error) {
+func tableColumns(ctx context.Context, conn *sql.Conn, schema, table string) ([]column, error) {
 	const q = `
-		SELECT COLUMN_NAME, GENERATION_EXPRESSION
+		SELECT COLUMN_NAME, DATA_TYPE, GENERATION_EXPRESSION
 		FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY ORDINAL_POSITION`
@@ -226,22 +233,40 @@ func tableColumns(ctx context.Context, conn *sql.Conn, schema, table string) ([]
 	}
 	defer rows.Close()
 
-	var cols []string
+	var cols []column
 	for rows.Next() {
-		var name string
+		var name, dataType string
 		var genExpr sql.NullString
-		if err := rows.Scan(&name, &genExpr); err != nil {
+		if err := rows.Scan(&name, &dataType, &genExpr); err != nil {
 			return nil, fmt.Errorf("scan column metadata of %s.%s: %w", schema, table, err)
 		}
 		if genExpr.Valid && strings.TrimSpace(genExpr.String) != "" {
 			continue // VIRTUAL/STORED generated column — not in the dump
 		}
-		cols = append(cols, name)
+		cols = append(cols, column{name: name, dataType: strings.ToLower(dataType)})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate column metadata of %s.%s: %w", schema, table, err)
 	}
 	return cols, nil
+}
+
+// selectExpr returns the SELECT expression for a column. DATE/DATETIME/TIMESTAMP
+// columns are wrapped in CAST(... AS CHAR) to force MySQL's native text
+// rendering (e.g. "2021-01-01 00:00:00"). Without it, a connection opened with
+// parseTime=true (config.Connect and the test DSNs both do) makes the driver
+// decode these into time.Time and re-render them as RFC3339 ("2021-01-01T..Z"),
+// which is NOT what mydumper dumps or the binlog carries — so the digest would
+// not match a baseline. The CAST makes the canonical form parseTime-independent.
+// Other types (including TIME and YEAR, which the driver never parses) are read
+// as-is.
+func selectExpr(c column) string {
+	switch c.dataType {
+	case "date", "datetime", "timestamp":
+		return "CAST(" + quoteIdent(c.name) + " AS CHAR)"
+	default:
+		return quoteIdent(c.name)
+	}
 }
 
 // quoteIdent backtick-quotes a MySQL identifier, doubling any embedded backtick.

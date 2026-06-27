@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dbtrail/dbtrail/internal/consistency"
 )
 
 // Version is embedded in Parquet file metadata.
@@ -265,6 +267,13 @@ func processTable(ctx context.Context, tf TableFiles, outPath string, cfg Writer
 		}
 	}()
 
+	// Fingerprint the rows as they stream past, in MySQL column order. The
+	// digest is byte-identical to a live consistency.ConsistentTableChecksum of
+	// the same rows (#633), so the verify capstone (#634) can compare a baseline
+	// against its source. Tapping the parser values (MySQL's text rendering, the
+	// form ConsistentTableChecksum reads via the text protocol) costs one extra
+	// hash per row and needs no second pass over the dump.
+	hasher := consistency.NewHasher()
 	var rowCount int64
 	rowFn := func(values []string, nulls []bool) error {
 		if ctx.Err() != nil {
@@ -273,6 +282,7 @@ func processTable(ctx context.Context, tf TableFiles, outPath string, cfg Writer
 		if err := w.WriteRow(values, nulls); err != nil {
 			return err
 		}
+		hasher.AddStrings(values, nulls)
 		rowCount++
 		return nil
 	}
@@ -294,6 +304,12 @@ func processTable(ctx context.Context, tf TableFiles, outPath string, cfg Writer
 			return rowCount, fmt.Errorf("unknown format %q", tf.Format)
 		}
 	}
+
+	// Persist the content fingerprint and row count into the Parquet footer
+	// before closing. SetMetadata upserts, so these win even if the same keys
+	// were seeded at writer construction.
+	w.SetMetadata(MetaKeyContentDigest, hasher.Digest())
+	w.SetMetadata(MetaKeyRowCount, strconv.FormatInt(rowCount, 10))
 
 	closed = true
 	if err := w.Close(); err != nil {

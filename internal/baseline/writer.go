@@ -152,6 +152,14 @@ func (w *Writer) WriteRow(values []string, nulls []bool) error {
 	return err
 }
 
+// SetMetadata sets a key/value pair in the Parquet file metadata. It may be
+// called after rows are written and before Close — the metadata is serialized
+// into the file footer at Close — so it can carry values only known once all
+// rows have been seen (e.g. the row count and content digest, #633).
+func (w *Writer) SetMetadata(key, value string) {
+	w.pw.SetKeyValueMetadata(key, value)
+}
+
 // Close flushes and closes the Parquet writer and the underlying file.
 func (w *Writer) Close() error {
 	if err := w.pw.Close(); err != nil {
