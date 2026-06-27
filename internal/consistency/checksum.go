@@ -1,10 +1,14 @@
-// Package consistency provides primitives that prove a Parquet snapshot
-// faithfully represents the MySQL table it was taken from.
+// Package consistency provides primitives that detect, with overwhelming
+// probability, whether a Parquet snapshot diverges from the MySQL table it was
+// taken from.
 //
 // The foundation is ConsistentTableChecksum: a point-in-time, order-independent,
-// type-canonical fingerprint of a source table. Fidelity is only provable at a
-// frozen consistent point — you cannot compare a checksum of the Parquet against
-// a live table that has moved on. So the fingerprint is computed inside
+// type-canonical fingerprint of a source table. The fingerprint is a 64-bit
+// non-cryptographic multiset hash — sized to catch accidental corruption and
+// divergence (collision ≈ 2⁻⁶⁴ per comparison), not to resist an adversary who
+// can forge a colliding table. Fidelity is only checkable at a frozen consistent
+// point — you cannot compare a checksum of the Parquet against a live table that
+// has moved on. So the fingerprint is computed inside
 // START TRANSACTION WITH CONSISTENT SNAPSHOT and bound to the @@gtid_executed
 // captured at that same point. The baseline writer (issue #633) and the verify
 // capstone (issue #634) both call this primitive — at dump time and at audit
@@ -45,11 +49,12 @@ const erUnknownSystemVariable = 1193
 // GTID the same way); the digest itself is computed entirely over the snapshot
 // and is unaffected — only the anchor's precision is bounded by this window.
 //
-// Digest is a hex-encoded, order-independent multiset hash of the row contents.
-// Two tables holding the same rows in any physical or primary-key order produce
-// the same Digest; a single changed byte produces a different one; a
-// representation-only difference (e.g. JSON whitespace, which the server
-// normalizes) produces the same one.
+// Digest is a version-tagged, order-independent multiset hash of the row
+// contents (see digestVersion). Two tables holding the same rows in any physical
+// or primary-key order produce the same Digest; a single changed byte produces a
+// different one with overwhelming probability; a representation-only difference
+// (e.g. JSON whitespace, which MySQL normalizes on storage) produces the same
+// one.
 type TableChecksum struct {
 	Schema   string
 	Table    string
@@ -68,7 +73,8 @@ type TableChecksum struct {
 // The canonical form of every value is MySQL's text-protocol rendering with the
 // session time zone pinned to UTC. That rendering is already type-exact —
 // UNSIGNED integers print unsigned, DATETIME/TIMESTAMP carry their declared
-// fractional precision, DECIMAL is pre-formatted, JSON is normalized — so no
+// fractional precision, DECIMAL is pre-formatted, JSON is normalized (MySQL;
+// MariaDB stores JSON as LONGTEXT and renders it verbatim) — so no
 // per-type canonicalization is reimplemented here. The Parquet side of the
 // comparison (#634) must reproduce this same contract: "MySQL text rendering,
 // session time zone UTC". Two digests are only comparable when computed against
@@ -166,9 +172,19 @@ func ConsistentTableChecksum(ctx context.Context, db *sql.DB, schema, table stri
 	committed = true
 
 	res.RowCount = hasher.count()
-	res.Digest = hasher.digest()
+	res.Digest = digestVersion + hasher.digest()
 	return res, nil
 }
+
+// digestVersion tags the digest with the contract it was computed under — both
+// the Go-side encoding (field tagging, FNV-1a/64, additive fold) and the
+// MySQL-side rendering (text protocol, session tz UTC). Two digests are only
+// comparable when their tags match; because #634 compares with plain ==, an
+// incompatible contract fails loud instead of producing a false mismatch that
+// reads like real corruption. Persisted baselines (#633) carry this tag, so the
+// only free moment to introduce it is before the first baseline is written. Bump
+// to "v2:" if the encoding or rendering contract ever changes.
+const digestVersion = "v1:"
 
 // capturedGTID reads @@gtid_executed inside the snapshot. MySQL always exposes
 // this variable (empty string when gtid_mode=OFF); MariaDB does not have it, in
@@ -241,6 +257,9 @@ func quoteIdent(id string) string {
 // not cancel out two identical rows. Each field is length-prefixed and tagged so
 // a SQL NULL (tag 0x00) is distinct from an empty value (tag 0x01, length 0) and
 // no field-value boundary is ambiguous.
+//
+// The accumulator is 64-bit: this is a multiset fingerprint for accidental
+// corruption/divergence, not a tamper-resistant digest.
 type rowHasher struct {
 	h   hash.Hash64
 	acc uint64
@@ -249,6 +268,8 @@ type rowHasher struct {
 
 func newRowHasher() *rowHasher { return &rowHasher{h: fnv.New64a()} }
 
+// add folds one row into the accumulator. It hashes values synchronously and
+// must not retain the slice — the caller reuses one backing buffer per row.
 func (r *rowHasher) add(values [][]byte) {
 	r.h.Reset()
 	var lb [binary.MaxVarintLen64]byte

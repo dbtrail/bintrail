@@ -146,22 +146,115 @@ func TestConsistentTableChecksum_DefaultTimestampColumnIncluded(t *testing.T) {
 	}
 }
 
-func TestConsistentTableChecksum_UnsignedRenderedUnsigned(t *testing.T) {
+func TestConsistentTableChecksum_UnsignedHighValuesDiffer(t *testing.T) {
 	db, schema := testutil.CreateTestDB(t)
-	// A BIGINT UNSIGNED value above 2^63 must render unsigned in the digest
-	// (the classic UNSIGNED⇒negative corruption class, #490). We assert the
-	// checksum succeeds and the row is counted; the value is captured as its
-	// unsigned text form by the text protocol.
-	testutil.MustExec(t, db, "CREATE TABLE t (id INT PRIMARY KEY, big BIGINT UNSIGNED)")
-	testutil.MustExec(t, db, "INSERT INTO t VALUES (1, 18446744073709551615)")
+	// Two BIGINT UNSIGNED values above 2^63 that differ by 1 must produce
+	// different digests. This guards the classic UNSIGNED⇒negative corruption
+	// class (#490): a regression to typed/int64 scanning would collapse both to
+	// -1 / a wrapped value and the digests would falsely match. Asserting the
+	// digests DIFFER proves the high value is actually captured, not maxed.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, big BIGINT UNSIGNED)")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, big BIGINT UNSIGNED)")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, 18446744073709551615)")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, 18446744073709551614)")
 
 	ctx := context.Background()
-	c, err := ConsistentTableChecksum(ctx, db, schema, "t")
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
 	if err != nil {
-		t.Fatalf("checksum: %v", err)
+		t.Fatalf("checksum a: %v", err)
 	}
-	if c.RowCount != 1 {
-		t.Errorf("RowCount = %d, want 1", c.RowCount)
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest == cb.Digest {
+		t.Errorf("distinct high-unsigned values produced the same digest (UNSIGNED corruption escape): both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_BinaryBytesByteExact(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// VARBINARY values that differ only in an embedded NUL, a trailing NUL, or a
+	// high byte must produce different digests. sql.RawBytes is byte-exact; a
+	// regression to typed string scanning would truncate at the first 0x00 and
+	// silently collapse these — the project's _binary/\0 data-loss history.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, v VARBINARY(16))")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, v VARBINARY(16))")
+	// 0x61 0x00 0x62  vs  0x61 0x00 0x63 — identical up to and past an embedded NUL.
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, X'610062')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, X'610063')")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest == cb.Digest {
+		t.Errorf("binary values differing only past an embedded NUL produced the same digest (truncation escape): both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_DatetimeMicrosecondsDiffer(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// DATETIME(6) values differing only in microseconds must differ — guards
+	// against fractional-precision collapse.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, ts DATETIME(6))")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, ts DATETIME(6))")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, '2021-01-01 00:00:00.000001')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, '2021-01-01 00:00:00.000002')")
+
+	ctx := context.Background()
+	ca, _ := ConsistentTableChecksum(ctx, db, schema, "a")
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("DATETIME(6) microsecond difference collapsed: both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_DoubleLastDigitDiffersAndStable(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, d DOUBLE)")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, d DOUBLE)")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, 1.0000000000001)")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, 1.0000000000002)")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("DOUBLE last-digit difference collapsed: both %s", ca.Digest)
+	}
+	// Same-server re-read is deterministic despite float text-rendering caveat.
+	ca2, _ := ConsistentTableChecksum(ctx, db, schema, "a")
+	if ca.Digest != ca2.Digest {
+		t.Errorf("DOUBLE digest not stable across reads: %s != %s", ca.Digest, ca2.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_MultibyteStringsDiffer(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// Documents the charset contract: utf8mb4 multibyte content is captured
+	// byte-exact, so distinct multibyte strings differ and a re-read is stable.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, s VARCHAR(32)) CHARACTER SET utf8mb4")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, s VARCHAR(32)) CHARACTER SET utf8mb4")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, '日本語😀')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, '日本語😁')")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("distinct multibyte strings produced the same digest: both %s", ca.Digest)
 	}
 }
 
@@ -192,8 +285,8 @@ func TestConsistentTableChecksum_EmptyTable(t *testing.T) {
 	if c.RowCount != 0 {
 		t.Errorf("RowCount = %d, want 0", c.RowCount)
 	}
-	if c.Digest != "0000000000000000" {
-		t.Errorf("Digest = %q, want all-zero for empty table", c.Digest)
+	if c.Digest != "v1:0000000000000000" {
+		t.Errorf("Digest = %q, want version-tagged all-zero for empty table", c.Digest)
 	}
 }
 
@@ -202,6 +295,28 @@ func TestConsistentTableChecksum_MissingTableErrors(t *testing.T) {
 	ctx := context.Background()
 	if _, err := ConsistentTableChecksum(ctx, db, schema, "does_not_exist"); err == nil {
 		t.Error("expected error for missing table, got nil")
+	}
+}
+
+func TestConsistentTableChecksum_MariaDBGTIDAbsent(t *testing.T) {
+	testutil.SkipIfNoMariaDB(t)
+	db, schema := testutil.CreateTestMariaDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(64))")
+	testutil.MustExec(t, db, "INSERT INTO t VALUES (1,'alice'),(2,'bob')")
+
+	ctx := context.Background()
+	// MariaDB has no @@global.gtid_executed (error 1193). The checksum must
+	// still succeed with an empty GTID anchor, not fail — a wrong error constant
+	// or non-matching errors.As would break every MariaDB-source checksum.
+	c, err := ConsistentTableChecksum(ctx, db, schema, "t")
+	if err != nil {
+		t.Fatalf("checksum on MariaDB: %v", err)
+	}
+	if c.GTIDSet != "" {
+		t.Errorf("GTIDSet = %q on MariaDB, want empty", c.GTIDSet)
+	}
+	if c.RowCount != 2 {
+		t.Errorf("RowCount = %d, want 2", c.RowCount)
 	}
 }
 
