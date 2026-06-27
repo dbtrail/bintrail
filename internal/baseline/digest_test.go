@@ -60,6 +60,45 @@ func TestRun_PersistsContentDigestAndRowCount(t *testing.T) {
 	}
 }
 
+// TestReadParquetMetadata_CorruptRowCountClearsDigest verifies the contract
+// guard: a present digest paired with an unparseable row count must not be
+// returned as a trustworthy digest with RowCount=0 (which would read as a
+// verified-empty table). The reader clears the digest instead.
+func TestReadParquetMetadata_CorruptRowCountClearsDigest(t *testing.T) {
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "shop.t-schema.sql")
+	mustWrite(t, schemaPath, "CREATE TABLE `t` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n);\n")
+	cols, err := ParseSchema(schemaPath)
+	if err != nil {
+		t.Fatalf("ParseSchema: %v", err)
+	}
+
+	outPath := filepath.Join(dir, "t.parquet")
+	w, err := NewWriter(outPath, cols, WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.WriteRow([]string{"1"}, []bool{false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	w.SetMetadata(MetaKeyContentDigest, "v1:deadbeefdeadbeef")
+	w.SetMetadata(MetaKeyRowCount, "not-a-number") // corrupt
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	meta, err := ReadParquetMetadata(outPath)
+	if err != nil {
+		t.Fatalf("ReadParquetMetadata: %v", err)
+	}
+	if meta.ContentDigest != "" {
+		t.Errorf("ContentDigest = %q, want cleared (corrupt row count)", meta.ContentDigest)
+	}
+	if meta.RowCount != 0 {
+		t.Errorf("RowCount = %d, want 0", meta.RowCount)
+	}
+}
+
 func mustWrite(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

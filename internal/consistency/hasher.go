@@ -20,12 +20,19 @@ type Hasher struct {
 func NewHasher() *Hasher { return &Hasher{rh: newRowHasher()} }
 
 // AddStrings folds one row given the parallel value/null slices the baseline
-// dump parser yields, in MySQL column order (matching ConsistentTableChecksum's
-// ordinal SELECT order). A column is NULL when nulls[i] is true or absent — the
-// same rule WriteRow applies — so the persisted digest reflects exactly the
-// columns that reach the baseline. The string bytes are MySQL's text rendering
-// (mydumper dumps what MySQL's text protocol returns), identical to the
-// sql.RawBytes ConsistentTableChecksum hashes.
+// dump parser yields. A column is NULL when nulls[i] is true or absent.
+//
+// The string bytes are MySQL's text rendering (mydumper dumps what MySQL's text
+// protocol returns), so the digest matches a live ConsistentTableChecksum, which
+// hashes the same source text via CAST(... AS CHAR). It therefore fingerprints
+// the SOURCE rows, not the Parquet encoding: value transforms the baseline
+// writer applies downstream (e.g. a MySQL zero-date stored as Parquet NULL) are
+// deliberately not reflected here — see the call site for why mirroring them
+// would be wrong.
+//
+// Byte-identity with the live checksum holds only while the dump's column order
+// equals ordinal order (ConsistentTableChecksum SELECTs by ORDINAL_POSITION) —
+// normally true, since mydumper dumps columns in table order.
 func (h *Hasher) AddStrings(values []string, nulls []bool) {
 	row := make([][]byte, len(values))
 	for i := range values {

@@ -29,6 +29,17 @@ const (
 	// (consistency.Hasher, version-tagged). The digest is byte-identical to a
 	// live ConsistentTableChecksum of the same rows, so the verify capstone
 	// (#634) can compare a baseline against the source. Part of epic #631 (#633).
+	//
+	// The digest certifies SOURCE fidelity (the dump captured the same rows as
+	// the source), not Parquet-encoding fidelity: writer transforms such as
+	// zero-date→NULL are invisible to it (that is #634's concern). TIMESTAMP
+	// agreement assumes the dump used UTC (mydumper's default --tz-utc, which
+	// matches ConsistentTableChecksum's UTC session); an externally produced
+	// dump made with --skip-tz-utc on a non-UTC server would not match.
+	//
+	// Readers must treat RowCount as valid only when ContentDigest != ""; the
+	// readers clear ContentDigest if RowCount cannot be parsed, so the two are
+	// never returned in a trustworthy-digest / untrustworthy-count combination.
 	MetaKeyRowCount      = "bintrail.baseline_row_count"
 	MetaKeyContentDigest = "bintrail.baseline_content_digest"
 )
@@ -154,6 +165,11 @@ func ReadParquetMetadata(path string) (DumpMetadata, error) {
 		if parseErr != nil {
 			slog.Warn("corrupt baseline_row_count in Parquet metadata",
 				"path", path, "raw_value", v, "error", parseErr)
+			// A digest we can't pair with a trustworthy count is not usable:
+			// clearing it keeps the "ContentDigest != \"\" ⇒ RowCount valid"
+			// contract from ever being observed false (a 0 would otherwise read
+			// as a verified-empty table).
+			m.ContentDigest = ""
 		} else {
 			m.RowCount = n
 		}
@@ -192,6 +208,7 @@ func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, err
 	defer rows.Close()
 
 	var m DumpMetadata
+	var rowCountCorrupt bool
 	for rows.Next() {
 		// DuckDB returns key/value as BLOB (BYTE_ARRAY) when the Parquet
 		// metadata column stores raw bytes. Scan as []byte to be safe.
@@ -223,11 +240,18 @@ func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, err
 			} else {
 				slog.Warn("corrupt baseline_row_count in S3 Parquet metadata",
 					"path", path, "raw_value", val, "error", parseErr)
+				rowCountCorrupt = true
 			}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return DumpMetadata{}, fmt.Errorf("iterate metadata rows: %w", err)
+	}
+	// Applied after the loop: keys arrive as rows in arbitrary order, so the
+	// digest may be set after the count row. A digest we can't pair with a
+	// trustworthy count is not usable (see ReadParquetMetadata).
+	if rowCountCorrupt {
+		m.ContentDigest = ""
 	}
 	return m, nil
 }

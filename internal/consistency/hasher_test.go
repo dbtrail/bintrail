@@ -74,6 +74,26 @@ func TestHasher_OrderIndependentAndCounted(t *testing.T) {
 	}
 }
 
+func TestHasher_ZeroDateHashedAsStringNotNull(t *testing.T) {
+	// The tap must hash a MySQL zero-date as its non-null string — matching the
+	// live checksum's CAST(... AS CHAR) — even though the baseline writer stores
+	// it as Parquet NULL. Mirroring the writer here would false-mismatch every
+	// zero-date table against the source.
+	zeroDate := NewHasher()
+	zeroDate.AddStrings([]string{"1", "0000-00-00 00:00:00"}, []bool{false, false})
+
+	asNull := NewHasher()
+	asNull.AddStrings([]string{"1", "x"}, []bool{false, true})
+
+	if zeroDate.Digest() == asNull.Digest() {
+		t.Errorf("zero-date hashed as NULL instead of its string: %s", zeroDate.Digest())
+	}
+	want := expectedDigest([][][]byte{{[]byte("1"), []byte("0000-00-00 00:00:00")}})
+	if zeroDate.Digest() != want {
+		t.Errorf("zero-date digest %s != raw-string digest %s", zeroDate.Digest(), want)
+	}
+}
+
 func TestHasher_VersionTaggedAndEmpty(t *testing.T) {
 	h := NewHasher()
 	if got := h.Digest(); got != digestVersion+"0000000000000000" {
