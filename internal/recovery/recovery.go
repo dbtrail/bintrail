@@ -254,7 +254,8 @@ func schemaDriftError(drift map[string]map[string]bool, order []string) error {
 // buildStatement is generateStatement plus the set of columns the emitted SQL actually
 // references — schema-drift detection (#601) compares exactly those against the latest
 // snapshot, so the check can never diverge from what is emitted. generateStatement is a
-// thin wrapper kept for callers (and tests) that only need the SQL.
+// thin wrapper kept for the test call sites that only need the SQL (no production caller
+// uses it — GenerateSQLFromRows calls buildStatement directly).
 func (g *Generator) buildStatement(row query.ResultRow) (string, []string, error) {
 	switch row.EventType {
 	case event.EventDelete:
