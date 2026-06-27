@@ -455,6 +455,25 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 	if err != nil {
 		return fmt.Errorf("read baseline columns: %w", err)
 	}
+
+	// Fail loud on a column ADDED after the baseline (#602). This path projects
+	// every emitted row onto the baseline column set and writes the baseline's
+	// CREATE TABLE as the schema header; it does not reconstruct intermediate
+	// DDL. So a delta event's row_after key absent from the baseline columns
+	// would be dropped silently by rowAfterOrdered (its value never reaches the
+	// dump). Refuse instead, the same fail-loud choice the supportedPKType
+	// guard in ReconstructTable makes: a warning isn't enough because an
+	// operator running --log-level error would not see it and would get a dump
+	// silently missing a column. Detected up front, before the writer opens, so
+	// no partial chunk files are left on disk.
+	if extra := postBaselineColumns(in.Changes, colNames); len(extra) > 0 {
+		return fmt.Errorf(
+			"full-table reconstruct: %s.%s has column(s) %s present in delta events but absent from the baseline schema "+
+				"(added after the baseline snapshot); their values cannot be emitted without dropping data silently — "+
+				"re-run `bintrail baseline` to capture a snapshot that includes the new column(s)",
+			in.Schema, in.Table, strings.Join(extra, ", "))
+	}
+
 	mw, err := NewMydumperWriter(in.OutputDir, in.Schema, in.Table, colNames, in.ChunkSize)
 	if err != nil {
 		return fmt.Errorf("open mydumper writer: %w", err)
@@ -795,12 +814,49 @@ func zipMap(cols []string, vals []any) map[string]any {
 	return out
 }
 
+// postBaselineColumns returns, sorted and de-duplicated, the column names
+// that appear in some non-DELETE event's row_after image but are absent from
+// the baseline column set — i.e. columns ADDED to the source table after the
+// baseline snapshot. The mydumper writer projects every emitted row onto the
+// baseline columns (rowAfterOrdered), so these columns' values would be
+// dropped silently; mergeBaselineIntoWriter calls this up front to refuse the
+// run instead (#602). DELETE events carry no row_after and are skipped.
+func postBaselineColumns(changes map[string]*query.ResultRow, colNames []string) []string {
+	baseline := make(map[string]struct{}, len(colNames))
+	for _, c := range colNames {
+		baseline[c] = struct{}{}
+	}
+	extra := make(map[string]struct{})
+	for _, ev := range changes {
+		if ev == nil || ev.EventType == event.EventDelete || ev.RowAfter == nil {
+			continue
+		}
+		for col := range ev.RowAfter {
+			if _, ok := baseline[col]; !ok {
+				extra[col] = struct{}{}
+			}
+		}
+	}
+	if len(extra) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(extra))
+	for col := range extra {
+		out = append(out, col)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // rowAfterOrdered walks colNames and looks up each name in rowAfter (a
 // map[string]any from a binlog event's row_after image), returning a slice
-// of values aligned to the baseline Parquet column order. Missing columns
-// become nil (SQL NULL) with an slog.Warn — this covers the schema drift
-// case where a column was added to the source table between baseline time
-// and target time.
+// of values aligned to the baseline Parquet column order. A baseline column
+// absent from this event's row_after becomes nil (SQL NULL) with an slog.Warn
+// — e.g. a column DROPPED after the baseline (newer events stop carrying it)
+// or a partial image. The opposite direction — a column ADDED after the
+// baseline, present in row_after but not in colNames — is handled up front by
+// the postBaselineColumns guard in mergeBaselineIntoWriter, which refuses the
+// run rather than letting this function drop the value silently (#602).
 func rowAfterOrdered(rowAfter map[string]any, colNames []string, schema, table string) []any {
 	out := make([]any, len(colNames))
 	for i, col := range colNames {
