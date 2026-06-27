@@ -45,6 +45,13 @@ func (h *Hasher) AddStrings(values []string, nulls []bool) {
 	h.rh.add(row)
 }
 
+// AddBytes folds one row given its column values already rendered to bytes, in
+// ordinal column order. A nil element is SQL NULL (distinct from a non-nil empty
+// value). This is the form the verify capstone (#634) feeds after rendering a
+// reconstructed row to ConsistentTableChecksum's text-protocol form, so a
+// reconstructed digest can be compared to a live one.
+func (h *Hasher) AddBytes(values [][]byte) { h.rh.add(values) }
+
 // Digest returns the version-tagged hex digest accumulated so far. An empty
 // Hasher returns the version-tagged all-zero digest.
 func (h *Hasher) Digest() string { return digestVersion + h.rh.digest() }
