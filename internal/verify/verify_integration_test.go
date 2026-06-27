@@ -40,6 +40,7 @@ func TestVerifyTable_MatchesAndDetectsDivergence(t *testing.T) {
 		{"id", 1, "PRI", "int", "int", 0},
 		{"status", 2, "", "varchar", "varchar(64)", 0},
 		{"ts", 3, "", "datetime", "datetime(6)", 0},
+		{"amount", 5, "", "double", "double", 0},
 		// created_at is an ordinary DEFAULT CURRENT_TIMESTAMP column. The schema
 		// snapshotter's substring capture mis-flags it is_generated=1 (the
 		// DEFAULT_GENERATED trap) — set that here to lock that verify still hashes
@@ -57,14 +58,14 @@ func TestVerifyTable_MatchesAndDetectsDivergence(t *testing.T) {
 	// ── live SOURCE table at the FINAL (post-event) state ──
 	testutil.MustExec(t, db, fmt.Sprintf(
 		"CREATE TABLE `%s`.`orders` (`id` INT PRIMARY KEY, `status` VARCHAR(64), `ts` DATETIME(6),"+
-			" `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP)", dbName))
-	testutil.MustExec(t, db, fmt.Sprintf("INSERT INTO `%s`.`orders` (id,status,ts,created_at) VALUES"+
-		"(1,'a','2021-01-01 00:00:00.123456','2020-01-01 00:00:00'),"+
-		"(2,'shipped','2021-01-02 00:00:00.000000','2020-01-02 00:00:00'),"+
-		"(4,'new','2021-06-15 12:30:45.000000','2020-06-15 00:00:00')", dbName))
+			" `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP, `amount` DOUBLE)", dbName))
+	testutil.MustExec(t, db, fmt.Sprintf("INSERT INTO `%s`.`orders` (id,status,ts,created_at,amount) VALUES"+
+		"(1,'a','2021-01-01 00:00:00.123456','2020-01-01 00:00:00',1.5),"+
+		"(2,'shipped','2021-01-02 00:00:00.000000','2020-01-02 00:00:00',2.25),"+
+		"(4,'new','2021-06-15 12:30:45.000000','2020-06-15 00:00:00',9)", dbName))
 
 	// ── baseline Parquet at the INITIAL state {1:a, 2:b, 3:c} ──
-	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64),\n  `ts` DATETIME(6),\n  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`)\n);\n"
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64),\n  `ts` DATETIME(6),\n  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,\n  `amount` DOUBLE,\n  PRIMARY KEY (`id`)\n);\n"
 	baselineDir := t.TempDir()
 	// Keep the whole window recent and partition-covered: the baseline anchors at
 	// the previous hour and events land a couple of minutes ago, so [snapshot,
@@ -85,6 +86,7 @@ func TestVerifyTable_MatchesAndDetectsDivergence(t *testing.T) {
 		{Name: "status", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 		{Name: "ts", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
 		{Name: "created_at", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
+		{Name: "amount", MySQLType: "double", ParquetType: baseline.MysqlToParquetNode("double")},
 	}
 	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "orders.parquet"), cols,
 		baseline.WriterConfig{Compression: "zstd", RowGroupSize: 100,
@@ -93,11 +95,11 @@ func TestVerifyTable_MatchesAndDetectsDivergence(t *testing.T) {
 		t.Fatalf("NewWriter: %v", err)
 	}
 	for _, row := range [][]string{
-		{"1", "a", "2021-01-01 00:00:00.123456", "2020-01-01 00:00:00"},
-		{"2", "b", "2021-01-02 00:00:00.000000", "2020-01-02 00:00:00"},
-		{"3", "c", "2021-01-03 00:00:00.000000", "2020-01-03 00:00:00"},
+		{"1", "a", "2021-01-01 00:00:00.123456", "2020-01-01 00:00:00", "1.5"},
+		{"2", "b", "2021-01-02 00:00:00.000000", "2020-01-02 00:00:00", "2.25"},
+		{"3", "c", "2021-01-03 00:00:00.000000", "2020-01-03 00:00:00", "3.5"},
 	} {
-		if err := bw.WriteRow(row, []bool{false, false, false, false}); err != nil {
+		if err := bw.WriteRow(row, []bool{false, false, false, false, false}); err != nil {
 			t.Fatalf("WriteRow: %v", err)
 		}
 	}
@@ -112,12 +114,12 @@ func TestVerifyTable_MatchesAndDetectsDivergence(t *testing.T) {
 	ts1 := now.Add(-2 * time.Minute).Format("2006-01-02 15:04:05")
 	ts2 := now.Add(-1 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, dbName, "orders", 2 /*UPDATE*/, "2", nil,
-		[]byte(`{"id":2,"status":"b","ts":"2021-01-02 00:00:00.000000","created_at":"2020-01-02 00:00:00"}`),
-		[]byte(`{"id":2,"status":"shipped","ts":"2021-01-02 00:00:00.000000","created_at":"2020-01-02 00:00:00"}`))
+		[]byte(`{"id":2,"status":"b","ts":"2021-01-02 00:00:00.000000","created_at":"2020-01-02 00:00:00","amount":2.25}`),
+		[]byte(`{"id":2,"status":"shipped","ts":"2021-01-02 00:00:00.000000","created_at":"2020-01-02 00:00:00","amount":2.25}`))
 	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ts1, nil, dbName, "orders", 3 /*DELETE*/, "3", nil,
-		[]byte(`{"id":3,"status":"c","ts":"2021-01-03 00:00:00.000000","created_at":"2020-01-03 00:00:00"}`), nil)
+		[]byte(`{"id":3,"status":"c","ts":"2021-01-03 00:00:00.000000","created_at":"2020-01-03 00:00:00","amount":3.5}`), nil)
 	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, ts2, nil, dbName, "orders", 1 /*INSERT*/, "4", nil,
-		nil, []byte(`{"id":4,"status":"new","ts":"2021-06-15 12:30:45.000000","created_at":"2020-06-15 00:00:00"}`))
+		nil, []byte(`{"id":4,"status":"new","ts":"2021-06-15 12:30:45.000000","created_at":"2020-06-15 00:00:00","amount":9}`))
 
 	// ── stream_state with a GTID superset so the coverage check passes ──
 	var uuid string

@@ -188,8 +188,13 @@ func printVerifyReport(cmd *cobra.Command, results []verify.TableResult) error {
 			mismatch++
 		case verify.StatusError:
 			errored++
-		default:
+		case verify.StatusInconclusive:
 			inconclusive++
+		default:
+			// An unrecognized status (incl. the zero value) must not be filed
+			// under the benign inconclusive bucket — a verify tool's job is to
+			// not hand out false assurance. Count it as an error.
+			errored++
 		}
 		fmt.Fprintf(w, "%s.%s\t%s\t%d/%d\t%s\n",
 			r.Schema, r.Table, r.Status, r.SourceRows, r.ReconstructRows, r.Detail)

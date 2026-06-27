@@ -83,6 +83,12 @@ func renderCell(v any, col metadata.ColumnMeta) []byte {
 // renderTemporal formats a time.Time the way MySQL's CAST(col AS CHAR) does for
 // the column's declared type: DATE → "2006-01-02"; DATETIME/TIMESTAMP →
 // "2006-01-02 15:04:05" plus the column's fractional precision (0–6 digits).
+//
+// Precision comes from col.ColumnType, which is empty on pre-#212 schema
+// snapshots; with it empty a DATETIME(n>0) renders without its fraction and
+// would spuriously mismatch the source. Modern snapshots carry ColumnType, so
+// this only affects baselines/snapshots taken before #212 — re-run bintrail
+// snapshot to refresh.
 func renderTemporal(t time.Time, col metadata.ColumnMeta) []byte {
 	t = t.UTC()
 	if strings.EqualFold(strings.TrimSpace(col.DataType), "date") {

@@ -45,7 +45,7 @@ type TableResult struct {
 	SourceRows        int64
 	ReconstructRows   int64
 	GTID              string // source snapshot GTID the comparison is anchored to
-	Detail            string // reason for inconclusive/mismatch
+	Detail            string // reason for inconclusive/mismatch, or a note carried on a match (e.g. coverage-unverified)
 }
 
 // Config wires the three data sources verify needs.
@@ -64,11 +64,15 @@ type Config struct {
 // binlog, render the reconstructed rows into the source's text form, hash them,
 // and compare.
 //
-// Alignment: the source snapshot is frozen at its GTID; verify reconstructs to a
-// wall-clock asOf captured at the snapshot. On a quiescent source (run off-peak)
-// these coincide exactly; on an actively-written table, events on the snapshot
-// boundary can make a single run inconclusive — re-run, or wait for a quiet
-// window. GTID-precise alignment is a follow-up.
+// Alignment (load-bearing precondition): the source digest is anchored at the
+// GTID captured when the snapshot opens (T0, inside ConsistentTableChecksum);
+// asOf is wall-clock captured AFTER the full-table scan returns (T1). Any write
+// committed in the window (T0, T1] enters the reconstruct (Until=asOf) but not
+// the frozen source snapshot, so it surfaces as a divergence — a row-count or
+// content MISMATCH that FAILS the run (not a soft "inconclusive"). That window
+// spans the whole source scan (seconds to minutes on a large table), so verify
+// is only reliable on a quiescent source — run it off-peak. GTID-precise
+// alignment (reconstruct to exactly the snapshot's GTID) is a follow-up.
 func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableResult, error) {
 	res := TableResult{Schema: schema, Table: table}
 
@@ -199,23 +203,33 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 		res.Detail = coverageNote
 	}
 
-	// 6. Compare. Row count first: a difference is always a conclusive mismatch
-	// (real row loss/gain), never downgraded.
-	if res.ReconstructRows != res.SourceRows {
-		res.Status = StatusMismatch
-		res.Detail = fmt.Sprintf("row count differs: source=%d reconstructed=%d", res.SourceRows, res.ReconstructRows)
-		return res, nil
+	// 6. Compare.
+	status, detail := classify(res.SourceDigest, res.SourceRows, res.ReconstructDigest, res.ReconstructRows, deferredRepr)
+	res.Status = status
+	if detail != "" {
+		res.Detail = detail // a real reason overrides the coverage note
 	}
-	if res.ReconstructDigest == res.SourceDigest {
-		res.Status = StatusMatch
-		return res, nil
+	return res, nil
+}
+
+// classify is the pure comparison core. Row count is checked first: a difference
+// is always a conclusive mismatch (real row loss/gain) and is NEVER downgraded by
+// deferredRepr — that ordering is the guard against masking data loss on a table
+// that merely contains an ENUM/SET/JSON/binary column. At equal row count a
+// content difference is a mismatch, except when deferredRepr is set (a deferred
+// column may have changed and its event image isn't normalized yet), where it is
+// inconclusive rather than a false alarm.
+func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int64, deferredRepr bool) (Status, string) {
+	if reconRows != srcRows {
+		return StatusMismatch, fmt.Sprintf("row count differs: source=%d reconstructed=%d", srcRows, reconRows)
+	}
+	if reconDigest == srcDigest {
+		return StatusMatch, ""
 	}
 	if deferredRepr {
-		return inconclusive(res, "an ENUM/SET, JSON or binary column was changed by an event; its event-image normalization is deferred, so this content difference is not conclusive"), nil
+		return StatusInconclusive, "an ENUM/SET, JSON or binary column was changed by an event; its event-image normalization is deferred, so this content difference is not conclusive"
 	}
-	res.Status = StatusMismatch
-	res.Detail = "content digest differs at equal row count (in-place value divergence)"
-	return res, nil
+	return StatusMismatch, "content digest differs at equal row count (in-place value divergence)"
 }
 
 func inconclusive(res TableResult, detail string) TableResult {
@@ -248,8 +262,9 @@ func isNoBaseline(err error) bool { return errors.Is(err, reconstruct.ErrNoBasel
 // has, so the comparison is inconclusive rather than a mismatch.
 //
 // A source with GTIDs disabled (empty srcGTID) cannot be coverage-checked this
-// way; verify reports that as inconclusive rather than silently risking a false
-// mismatch.
+// way; verify proceeds without the coverage guarantee, flagging the result as
+// coverage-unverified (rather than blocking or reporting inconclusive) — it
+// returns (true, note).
 func indexCovers(ctx context.Context, indexDB *sql.DB, srcGTID string) (bool, string) {
 	if strings.TrimSpace(srcGTID) == "" {
 		// No GTID to check containment against (gtid_mode=OFF). Proceed without
