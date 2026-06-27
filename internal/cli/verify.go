@@ -122,7 +122,9 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 	for _, st := range tables {
 		res, err := verify.VerifyTable(cmd.Context(), cfg, st.schema, st.table)
 		if err != nil {
-			return fmt.Errorf("verify %s.%s: %w", st.schema, st.table, err)
+			// One table's hard error must not abort the run and hide the other
+			// tables' results (including real mismatches). Record it and continue.
+			res = verify.TableResult{Schema: st.schema, Table: st.table, Status: verify.StatusError, Detail: err.Error()}
 		}
 		results = append(results, res)
 	}
@@ -177,13 +179,15 @@ func printVerifyReport(cmd *cobra.Command, results []verify.TableResult) error {
 
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
 	fmt.Fprintln(w, "TABLE\tSTATUS\tROWS(src/recon)\tDETAIL")
-	var match, mismatch, inconclusive int
+	var match, mismatch, inconclusive, errored int
 	for _, r := range results {
 		switch r.Status {
 		case verify.StatusMatch:
 			match++
 		case verify.StatusMismatch:
 			mismatch++
+		case verify.StatusError:
+			errored++
 		default:
 			inconclusive++
 		}
@@ -191,10 +195,19 @@ func printVerifyReport(cmd *cobra.Command, results []verify.TableResult) error {
 			r.Schema, r.Table, r.Status, r.SourceRows, r.ReconstructRows, r.Detail)
 	}
 	w.Flush()
-	fmt.Fprintf(cmd.OutOrStdout(), "\n%d match, %d mismatch, %d inconclusive\n", match, mismatch, inconclusive)
+	fmt.Fprintf(cmd.OutOrStdout(), "\n%d match, %d mismatch, %d inconclusive, %d error\n",
+		match, mismatch, inconclusive, errored)
 
-	if mismatch > 0 {
+	// Fail the run on any divergence or hard error. Also fail when nothing was
+	// proven (zero matches) — an all-inconclusive run must not read as success
+	// ("recovery verified") to an operator or CI gate.
+	switch {
+	case mismatch > 0:
 		return fmt.Errorf("%d table(s) diverged from the source", mismatch)
+	case errored > 0:
+		return fmt.Errorf("%d table(s) could not be verified due to errors", errored)
+	case match == 0:
+		return fmt.Errorf("no tables were verified (%d inconclusive); nothing proven", inconclusive)
 	}
 	return nil
 }

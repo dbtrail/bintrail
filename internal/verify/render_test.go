@@ -42,10 +42,7 @@ func TestRenderCell_MatchesTextProtocolForm(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := renderCell(tc.v, tc.col)
-			if err != nil {
-				t.Fatalf("renderCell: %v", err)
-			}
+			got := renderCell(tc.v, tc.col)
 			if tc.want == nil {
 				if got != nil {
 					t.Errorf("got %q, want NULL (nil)", got)
@@ -59,9 +56,14 @@ func TestRenderCell_MatchesTextProtocolForm(t *testing.T) {
 	}
 }
 
-func TestRenderCell_UnsupportedTypeErrors(t *testing.T) {
-	if _, err := renderCell(struct{}{}, col("varchar", "varchar(64)")); err == nil {
-		t.Error("expected error for unsupported type")
+func TestRenderCell_JSONContainerCompletes(t *testing.T) {
+	// A JSON column changed by an event decodes to map[string]any; renderCell
+	// must produce deterministic bytes (so the digest completes) rather than
+	// erroring. Two equal maps render identically.
+	a := renderCell(map[string]any{"b": 2, "a": 1}, col("json", "json"))
+	b := renderCell(map[string]any{"a": 1, "b": 2}, col("json", "json"))
+	if a == nil || !bytes.Equal(a, b) {
+		t.Errorf("JSON container rendering not deterministic: %q vs %q", a, b)
 	}
 }
 

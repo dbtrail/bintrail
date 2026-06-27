@@ -61,6 +61,12 @@ type TableChecksum struct {
 	GTIDSet  string
 	RowCount int64
 	Digest   string
+	// Columns is the ordered set of column names the digest was computed over
+	// (ordinal order, generated columns excluded). A consumer that recomputes a
+	// digest to compare (the verify capstone #634) must hash exactly this set in
+	// this order, rather than re-deriving it — re-deriving from a schema snapshot
+	// risks a different generated-column membership and a spurious mismatch.
+	Columns []string
 }
 
 // ConsistentTableChecksum computes a TableChecksum for schema.table against the
@@ -128,8 +134,10 @@ func ConsistentTableChecksum(ctx context.Context, db *sql.DB, schema, table stri
 
 	// Scan every row, hashing as we stream — no full-table buffering.
 	selectList := make([]string, len(cols))
+	res.Columns = make([]string, len(cols))
 	for i, c := range cols {
 		selectList[i] = selectExpr(c)
+		res.Columns[i] = c.name
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s.%s",
 		strings.Join(selectList, ","), quoteIdent(schema), quoteIdent(table))

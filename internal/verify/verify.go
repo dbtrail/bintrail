@@ -30,6 +30,10 @@ const (
 	// version can't render to the source form). Never reported as a failure —
 	// an inconclusive result is not a divergence.
 	StatusInconclusive Status = "inconclusive"
+	// StatusError: verifying this table hit a hard error (e.g. the source read
+	// failed). Recorded per table so one table's error does not abort the run;
+	// the overall run still fails.
+	StatusError Status = "error"
 )
 
 // TableResult is the per-table verify outcome.
@@ -98,9 +102,12 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	// 2. Require the index to have indexed every event the source snapshot
 	// reflects, else a missing event would read as a (false) mismatch. Checked
 	// by GTID containment, which is correct even when the source has had no
-	// recent writes (a stale last_event_time does not mean "behind").
-	if covered, detail := indexCovers(ctx, cfg.IndexDB, src.GTIDSet); !covered {
-		return inconclusive(res, detail), nil
+	// recent writes (a stale last_event_time does not mean "behind"). A GTID-off
+	// source can't be checked this way — verify proceeds but flags the result
+	// as coverage-unverified rather than blocking.
+	covered, coverageNote := indexCovers(ctx, cfg.IndexDB, src.GTIDSet)
+	if !covered {
+		return inconclusive(res, coverageNote), nil
 	}
 
 	// 3. Find the baseline at-or-before asOf.
@@ -142,11 +149,32 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	}
 
 	// 5. Reconstruct the full table to asOf and hash each row in the source's
-	// text form.
-	orderedCols := nonGeneratedColumns(tm)
-	enumRisk := hasEnumOrSet(orderedCols) && len(changes) > 0
+	// text form. Hash exactly the column set ConsistentTableChecksum hashed, in
+	// its order — re-deriving the non-generated set from the schema snapshot
+	// risks a different generated-column membership (the DEFAULT_GENERATED trap)
+	// and a spurious mismatch.
+	colByName := make(map[string]metadata.ColumnMeta, len(tm.Columns))
+	for _, c := range tm.Columns {
+		colByName[c.Name] = c
+	}
+	orderedCols := make([]metadata.ColumnMeta, 0, len(src.Columns))
+	for _, name := range src.Columns {
+		cm, ok := colByName[name]
+		if !ok {
+			return inconclusive(res, fmt.Sprintf("source column %q is absent from the index schema snapshot; re-run bintrail snapshot", name)), nil
+		}
+		orderedCols = append(orderedCols, cm)
+	}
+	// ENUM/SET, JSON and binary columns whose value was changed by an event in
+	// the window can render differently on the event side than the source reads
+	// them (ENUM ordinal vs label, MySQL-canonical JSON text, base64 vs raw
+	// bytes); their faithful event-image normalization is deferred. When such a
+	// table mismatches at EQUAL row count, the difference is not conclusive. A
+	// row-count difference is always conclusive (real loss/gain) and is never
+	// masked by this.
+	deferredRepr := hasDeferredRepr(orderedCols) && len(changes) > 0
+
 	hasher := consistency.NewHasher()
-	var renderErr error
 	emitErr := reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
 		BaselinePath: baselinePath,
 		Schema:       schema,
@@ -156,45 +184,37 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	}, func(rowMap map[string]any) error {
 		cells := make([][]byte, len(orderedCols))
 		for i, c := range orderedCols {
-			b, err := renderCell(rowMap[c.Name], c)
-			if err != nil {
-				renderErr = fmt.Errorf("column %q: %w", c.Name, err)
-				return renderErr
-			}
-			cells[i] = b
+			cells[i] = renderCell(rowMap[c.Name], c)
 		}
 		hasher.AddBytes(cells)
 		return nil
 	})
 	if emitErr != nil {
-		if renderErr != nil {
-			// A value class this version can't render — inconclusive, not a failure.
-			return inconclusive(res, "reconstructed value could not be rendered to the source form: "+renderErr.Error()), nil
-		}
 		return res, fmt.Errorf("reconstruct %s.%s: %w", schema, table, emitErr)
 	}
 
 	res.ReconstructDigest = hasher.Digest()
 	res.ReconstructRows = hasher.Count()
+	if coverageNote != "" {
+		res.Detail = coverageNote
+	}
 
-	// 6. Compare.
-	if res.ReconstructDigest == res.SourceDigest && res.ReconstructRows == res.SourceRows {
+	// 6. Compare. Row count first: a difference is always a conclusive mismatch
+	// (real row loss/gain), never downgraded.
+	if res.ReconstructRows != res.SourceRows {
+		res.Status = StatusMismatch
+		res.Detail = fmt.Sprintf("row count differs: source=%d reconstructed=%d", res.SourceRows, res.ReconstructRows)
+		return res, nil
+	}
+	if res.ReconstructDigest == res.SourceDigest {
 		res.Status = StatusMatch
 		return res, nil
 	}
-	// A digest mismatch on a table whose ENUM/SET columns were changed by events
-	// is expected: binlog event images carry ENUM/SET ordinals, while the source
-	// and baseline carry labels, and ordinal→label mapping is deferred. Downgrade
-	// to inconclusive rather than cry wolf.
-	if enumRisk {
-		return inconclusive(res, "ENUM/SET column changed by an event; ordinal→label mapping is deferred, so a difference here is not conclusive"), nil
+	if deferredRepr {
+		return inconclusive(res, "an ENUM/SET, JSON or binary column was changed by an event; its event-image normalization is deferred, so this content difference is not conclusive"), nil
 	}
 	res.Status = StatusMismatch
-	if res.ReconstructRows != res.SourceRows {
-		res.Detail = fmt.Sprintf("row count differs: source=%d reconstructed=%d", res.SourceRows, res.ReconstructRows)
-	} else {
-		res.Detail = "content digest differs at equal row count (in-place value divergence)"
-	}
+	res.Detail = "content digest differs at equal row count (in-place value divergence)"
 	return res, nil
 }
 
@@ -204,23 +224,15 @@ func inconclusive(res TableResult, detail string) TableResult {
 	return res
 }
 
-// nonGeneratedColumns returns the table's columns in ordinal order excluding
-// generated columns — matching ConsistentTableChecksum's SELECT set.
-func nonGeneratedColumns(tm *metadata.TableMeta) []metadata.ColumnMeta {
-	out := make([]metadata.ColumnMeta, 0, len(tm.Columns))
-	for _, c := range tm.Columns {
-		if c.IsGenerated {
-			continue
-		}
-		out = append(out, c)
-	}
-	return out
-}
-
-func hasEnumOrSet(cols []metadata.ColumnMeta) bool {
+// hasDeferredRepr reports whether any column's event-image representation can
+// differ from how the source renders it in a way this version does not yet
+// normalize: ENUM/SET (ordinal vs label), JSON (MySQL-canonical text), and
+// binary families (base64 in the event image vs raw bytes from the source).
+func hasDeferredRepr(cols []metadata.ColumnMeta) bool {
 	for _, c := range cols {
 		switch strings.ToLower(c.DataType) {
-		case "enum", "set":
+		case "enum", "set", "json",
+			"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit":
 			return true
 		}
 	}
@@ -243,8 +255,8 @@ func indexCovers(ctx context.Context, indexDB *sql.DB, srcGTID string) (bool, st
 		// No GTID to check containment against (gtid_mode=OFF). Proceed without
 		// the coverage guarantee rather than blocking — a behind index on a
 		// GTID-off source is a narrow case the operator runs verify knowing the
-		// daemon is current. Documented limitation.
-		return true, ""
+		// daemon is current. The note surfaces the weaker guarantee in the result.
+		return true, "coverage unverified (source GTIDs disabled): assuming the index is current"
 	}
 	var idxGTID sql.NullString
 	err := indexDB.QueryRowContext(ctx,

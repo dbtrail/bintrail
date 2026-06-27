@@ -26,44 +26,57 @@ import (
 // DATE's date-only form and DATETIME/TIMESTAMP's declared fractional precision,
 // which the value's Go type alone cannot convey.
 //
-// Known divergence: FLOAT/DOUBLE text rendering between Go and MySQL is not
-// guaranteed byte-identical (baseline FLOAT is read as float32 and widened);
-// callers treat a float-only mismatch as inconclusive rather than a failure.
-func renderCell(v any, col metadata.ColumnMeta) ([]byte, error) {
+// renderCell never errors: it always produces bytes so the digest completes,
+// and the caller decides conclusiveness. A value class whose rendering can't be
+// guaranteed to match the source (FLOAT/DOUBLE text; JSON containers, which
+// MySQL normalizes differently than Go) renders best-effort and, for columns the
+// caller marks as deferred-representation, a resulting mismatch is reported
+// inconclusive rather than as a failure (see VerifyTable). FLOAT/DOUBLE are not
+// in the deferred set, so a float-only divergence surfaces as a (safe) mismatch,
+// never as a false match — there is intentionally no float-inconclusive downgrade
+// (that would create a masking path).
+func renderCell(v any, col metadata.ColumnMeta) []byte {
 	if v == nil {
-		return nil, nil
+		return nil
 	}
 	switch x := v.(type) {
 	case json.Number:
 		// Binlog event integers/decimals are JSON-decoded as json.Number, whose
 		// String() is the original literal — so an integer >2^53 stays exact
 		// (#496) instead of rounding through float64.
-		return []byte(x.String()), nil
+		return []byte(x.String())
 	case []byte:
-		return x, nil
+		return x
 	case string:
-		return []byte(x), nil
+		return []byte(x)
 	case time.Time:
-		return renderTemporal(x, col), nil
+		return renderTemporal(x, col)
 	case int64:
-		return []byte(strconv.FormatInt(x, 10)), nil
+		return []byte(strconv.FormatInt(x, 10))
 	case int32:
-		return []byte(strconv.FormatInt(int64(x), 10)), nil
+		return []byte(strconv.FormatInt(int64(x), 10))
 	case uint64:
-		return []byte(strconv.FormatUint(x, 10)), nil
+		return []byte(strconv.FormatUint(x, 10))
 	case uint32:
-		return []byte(strconv.FormatUint(uint64(x), 10)), nil
+		return []byte(strconv.FormatUint(uint64(x), 10))
 	case float64:
-		return []byte(strconv.FormatFloat(x, 'g', -1, 64)), nil
+		return []byte(strconv.FormatFloat(x, 'g', -1, 64))
 	case float32:
-		return []byte(strconv.FormatFloat(float64(x), 'g', -1, 32)), nil
+		return []byte(strconv.FormatFloat(float64(x), 'g', -1, 32))
 	case bool:
 		if x {
-			return []byte("1"), nil
+			return []byte("1")
 		}
-		return []byte("0"), nil
+		return []byte("0")
 	default:
-		return nil, fmt.Errorf("renderCell: unsupported value type %T for column %q", v, col.Name)
+		// JSON columns touched by an event decode to map[string]any / []any.
+		// Marshal deterministically (Go sorts map keys) so the digest completes;
+		// it won't match MySQL's canonical JSON text, but such columns are in the
+		// deferred-representation set so the mismatch is reported inconclusive.
+		if b, err := json.Marshal(v); err == nil {
+			return b
+		}
+		return []byte(fmt.Sprintf("%v", v))
 	}
 }
 
