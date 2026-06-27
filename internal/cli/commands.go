@@ -20,5 +20,6 @@ func AddReadCommands(root *cobra.Command) {
 	root.AddCommand(recoverCmd)
 	root.AddCommand(recoverCascadeCmd)
 	root.AddCommand(reconstructCmd)
+	root.AddCommand(verifyCmd)
 	root.AddCommand(shimCmd)
 }
