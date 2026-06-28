@@ -53,8 +53,8 @@ proven (all inconclusive). A source with only one baseline — no predecessor ye
 Add --explain (baseline-anchored mode) to print, below the report, a row-level
 drill-down of each mismatch: which primary keys diverged and, for changed rows,
 the differing columns with the reconstructed value vs the new baseline's. It
-reuses the same reconstruction the verdict came from — no live source, scratch
-database, or external tool.
+re-runs the same reconstruction the verdict came from (byte-identical by
+construction) — no live source, scratch database, or external tool.
 
 Examples:
   # Baseline-anchored (drift-free), all tables

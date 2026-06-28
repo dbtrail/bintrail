@@ -25,6 +25,11 @@ const (
 	diffExtra   = "extra"   // reconstructed by the recovery, absent from the new baseline
 )
 
+// deferredMarker stands in for a differing deferred-type (ENUM/SET/JSON/binary)
+// column whose value comparison is not normalized — shown instead of a raw,
+// misleading literal (an event-image ordinal/base64 read as corruption).
+const deferredMarker = "<representation-deferred: comparison not normalized>"
+
 // CellDiff is one column whose reconstructed value diverged from the new
 // baseline's, rendered in the SAME canonical text form the content digest
 // compares — so a reported diff is exactly what made the digests differ.
@@ -44,17 +49,24 @@ type RowDiff struct {
 
 // MismatchExplanation is the row-level drill-down for one mismatched table: which
 // primary keys diverged and how. It is the "which rows" the one-way content
-// digest cannot give — recomputed from the SAME reconstructed row streams the
-// digest used, so the diff and the verdict can never disagree. No live source,
-// no scratch DB, no external tool: an in-memory full-outer-join on the PK.
+// digest cannot give — produced by re-running the SAME reconstruction function
+// (SnapshotFullTableImages) over the SAME fixed window (the BaselinePair's
+// snapshots/anchor are immutable), so the row stream is byte-identical to the
+// digest's by construction and the diff and the verdict cannot disagree. No live
+// source, no scratch DB, no external tool: an in-memory full-outer-join on the PK.
 type MismatchExplanation struct {
 	Schema, Table, Anchor string
 	Diffs                 []RowDiff
-	Total                 int // total differing rows (Diffs is capped at maxExplainRows)
+	Total                 int            // total differing rows (Diffs is capped at maxExplainRows)
+	byKind                map[string]int // per-kind totals, for the overflow breakdown
 }
 
 func (ex *MismatchExplanation) add(d RowDiff) {
 	ex.Total++
+	if ex.byKind == nil {
+		ex.byKind = map[string]int{}
+	}
+	ex.byKind[d.Kind]++
 	if len(ex.Diffs) < maxExplainRows {
 		ex.Diffs = append(ex.Diffs, d)
 	}
@@ -70,8 +82,9 @@ type rowCells struct {
 // ExplainBaselinePairMismatch drills into a table VerifyBaselinePair already
 // reported as StatusMismatch, producing a row-level diff between the recovery
 // side (prev baseline reconstructed forward to the new baseline's anchor) and the
-// new baseline (truth). It reuses the SAME SnapshotFullTableImages row stream the
-// digest is built from, so the diff is guaranteed consistent with the verdict.
+// new baseline (truth). It re-runs the SAME SnapshotFullTableImages reconstruction
+// over the SAME fixed window the digest used, so the row stream is byte-identical
+// by construction and the diff is guaranteed consistent with the verdict.
 //
 // It re-derives the setup VerifyBaselinePair computed (resolver/columns/changes).
 // Because it runs only after a confirmed mismatch, the guards VerifyBaselinePair
@@ -148,9 +161,20 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 		}
 		var cells []CellDiff
 		for _, c := range orderedCols {
-			if !bytes.Equal(rec.cells[c.Name], t.cells[c.Name]) {
-				cells = append(cells, CellDiff{Column: c.Name, Recovery: displayCell(rec.cells[c.Name]), Baseline: displayCell(t.cells[c.Name])})
+			rv, bv := rec.cells[c.Name], t.cells[c.Name]
+			if cellEqual(rv, bv) {
+				continue
 			}
+			// A deferred-type column (ENUM/SET/JSON/binary) can still reach here —
+			// on a row-count mismatch (classify returns mismatch before the deferred
+			// check), or when it diverges with no in-window event. Its event-image
+			// form (ordinal, base64, Go-marshaled JSON) is NOT MySQL's source form,
+			// so a raw value pair would read as corruption. Flag it instead.
+			if isDeferredType(c.DataType) {
+				cells = append(cells, CellDiff{Column: c.Name, Recovery: deferredMarker, Baseline: deferredMarker})
+				continue
+			}
+			cells = append(cells, CellDiff{Column: c.Name, Recovery: displayCell(rv), Baseline: displayCell(bv)})
 		}
 		if len(cells) > 0 {
 			ex.add(RowDiff{PK: rec.pk, Kind: diffChanged, Cells: cells})
@@ -205,29 +229,45 @@ func collectRowsByPK(ctx context.Context, baselinePath, schema, table string, pk
 	return out, err
 }
 
-// pkKeyAndDisplay builds a join key (canonical PK bytes, NUL-joined so multi-
-// column keys can't collide) and a human label ("col=val, …"). Both sides render
-// the PK through the same renderCell, so equal logical keys produce equal keys.
+// pkKeyAndDisplay builds a join key and a human label ("col=val, …"). Each PK
+// part is length-prefixed before concatenation so a composite key is unambiguous
+// even if a value contains a NUL byte (a VARCHAR/CHAR PK legally can) — two
+// different multi-column keys can never collide. Both sides render the PK through
+// the same renderCell, so equal logical keys produce equal join keys.
 func pkKeyAndDisplay(rowMap map[string]any, pkCols []metadata.ColumnMeta) (key, display string) {
-	keyParts := make([]string, len(pkCols))
+	var b strings.Builder
 	dispParts := make([]string, len(pkCols))
 	for i, c := range pkCols {
 		v := renderCell(rowMap[c.Name], c)
-		keyParts[i] = string(v)
+		fmt.Fprintf(&b, "%d:", len(v))
+		b.Write(v)
 		dispParts[i] = c.Name + "=" + displayCell(v)
 	}
-	return strings.Join(keyParts, "\x00"), strings.Join(dispParts, ", ")
+	return b.String(), strings.Join(dispParts, ", ")
 }
 
-// displayCell renders a canonical cell for human output: NULL for an absent
-// value, the text form otherwise. Differing columns in a mismatch are
-// non-deferred types (ENUM/SET/JSON/binary changes are classified inconclusive,
-// never mismatch), so the text form is clean here.
+// displayCell renders a canonical cell for human output: NULL for a SQL NULL
+// (renderCell returns nil), the text form otherwise. Most differing columns are
+// non-deferred types and render cleanly; a deferred-TYPE column that reaches the
+// drill-down is flagged with deferredMarker upstream rather than shown literally,
+// because its event-image bytes (ordinal/base64/Go-JSON) are not the source form.
 func displayCell(b []byte) string {
 	if b == nil {
 		return "NULL"
 	}
 	return string(b)
+}
+
+// cellEqual compares two canonical cell renderings with the SAME NULL-vs-empty
+// distinction the content digest uses (rowHasher tags a nil/NULL differently from
+// a zero-length value). bytes.Equal alone treats nil and []byte("") as equal,
+// which would make the drill-down miss a NULL↔'' divergence the digest flagged —
+// breaking the "the diff agrees with the verdict" invariant.
+func cellEqual(a, b []byte) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	return bytes.Equal(a, b)
 }
 
 // Write prints the drill-down: one line per differing primary key.
@@ -256,6 +296,39 @@ func (ex *MismatchExplanation) Write(w io.Writer) {
 		}
 	}
 	if ex.Total > len(ex.Diffs) {
-		fmt.Fprintf(w, "  … and %d more differing row(s)\n", ex.Total-len(ex.Diffs))
+		over := ex.Total - len(ex.Diffs)
+		// Break the overflow down by kind (missing first) so the data-loss class —
+		// rows the recovery never reproduced — is never invisible behind the
+		// changed/extra rows that filled the cap first.
+		if bd := ex.overflowBreakdown(); bd != "" {
+			fmt.Fprintf(w, "  … and %d more differing row(s): %s\n", over, bd)
+		} else {
+			fmt.Fprintf(w, "  … and %d more differing row(s)\n", over)
+		}
 	}
+}
+
+// overflowBreakdown summarizes the differing rows that exceeded the cap, by kind
+// (missing/changed/extra). Returns "" when per-kind totals are unavailable (a
+// hand-built explanation that never went through add), so Write falls back to a
+// plain count.
+func (ex *MismatchExplanation) overflowBreakdown() string {
+	if len(ex.byKind) == 0 {
+		return ""
+	}
+	shown := map[string]int{}
+	for _, d := range ex.Diffs {
+		shown[d.Kind]++
+	}
+	var parts []string
+	for _, k := range []struct{ kind, label string }{
+		{diffMissing, "missing (not reproduced)"},
+		{diffChanged, "changed"},
+		{diffExtra, "extra"},
+	} {
+		if n := ex.byKind[k.kind] - shown[k.kind]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, k.label))
+		}
+	}
+	return strings.Join(parts, ", ")
 }

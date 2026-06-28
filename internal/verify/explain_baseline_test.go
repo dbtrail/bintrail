@@ -50,7 +50,8 @@ func TestMismatchExplanation_Write_rowCountOnly(t *testing.T) {
 
 // TestMismatchExplanation_add_caps locks the cap: detail is bounded at
 // maxExplainRows while Total keeps counting, so a pathological all-differ table
-// never dumps the whole table yet nothing is silently hidden.
+// never dumps the whole table yet nothing is silently hidden — and the overflow
+// line breaks the un-shown rows down by kind.
 func TestMismatchExplanation_add_caps(t *testing.T) {
 	ex := &MismatchExplanation{}
 	for i := 0; i < maxExplainRows+25; i++ {
@@ -61,5 +62,35 @@ func TestMismatchExplanation_add_caps(t *testing.T) {
 	}
 	if ex.Total != maxExplainRows+25 {
 		t.Errorf("Total = %d, want %d (counting continues past the cap)", ex.Total, maxExplainRows+25)
+	}
+	var buf bytes.Buffer
+	ex.Write(&buf)
+	if !strings.Contains(buf.String(), "25 extra") {
+		t.Errorf("want the overflow broken down by kind ('25 extra'), got:\n%s", buf.String())
+	}
+}
+
+// TestCellEqual locks the NULL-vs-empty distinction the drill-down must honor to
+// agree with the content digest: a SQL NULL (nil) and an empty value ([]byte(""))
+// are DIFFERENT, where plain bytes.Equal would call them equal and silently miss
+// a NULL↔'' divergence the verdict flagged.
+func TestCellEqual(t *testing.T) {
+	empty := []byte("")
+	for _, tc := range []struct {
+		name string
+		a, b []byte
+		want bool
+	}{
+		{"both NULL", nil, nil, true},
+		{"NULL vs empty", nil, empty, false},
+		{"empty vs NULL", empty, nil, false},
+		{"both empty", empty, empty, true},
+		{"equal values", []byte("x"), []byte("x"), true},
+		{"different values", []byte("x"), []byte("y"), false},
+		{"NULL vs value", nil, []byte("x"), false},
+	} {
+		if got := cellEqual(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: cellEqual(%q,%q)=%v, want %v", tc.name, tc.a, tc.b, got, tc.want)
+		}
 	}
 }
