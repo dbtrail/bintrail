@@ -192,6 +192,21 @@ func deferredReprChanged(cols []metadata.ColumnMeta, changes map[string]*query.R
 	return false
 }
 
+// AnyBaseline reports whether at least one complete baseline snapshot exists
+// under source. The CLI uses it on the "nothing to verify" path to tell two
+// physically different causes apart: a misconfigured or empty source (no
+// baselines at all — a broken baseline job → fail loud) from a legitimate first
+// run (exactly one baseline, no predecessor yet → genuinely nothing to compare).
+// FindBaselinePair collapses both into nil, nil, nil, so the distinction has to
+// be recovered here.
+func AnyBaseline(ctx context.Context, source string) (bool, error) {
+	files, err := reconstruct.ListBaselines(ctx, source)
+	if err != nil {
+		return false, err
+	}
+	return len(files) > 0, nil
+}
+
 // FindBaselinePair builds the verifiable table pairs from the two most recent
 // baseline snapshots under source: for every table present in both, the prev +
 // new Parquet paths, the prev snapshot time, and the new baseline's binlog

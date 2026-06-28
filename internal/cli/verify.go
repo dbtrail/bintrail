@@ -112,7 +112,20 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 		return fmt.Errorf("discover baseline pair: %w", err)
 	}
 	if len(pairs) == 0 && len(unpaired) == 0 {
-		fmt.Fprintln(cmd.OutOrStdout(), "fewer than two baselines under the source; nothing to verify yet")
+		// Two physically different causes reach here as "fewer than two
+		// baselines". A source with NO baselines at all is almost always a
+		// misconfiguration or a broken baseline job — exiting 0 there would let a
+		// CI/cron gate go permanently green while verifying nothing, the exact
+		// false-assurance this command exists to prevent. A source with exactly
+		// one baseline is a legitimate first run with no predecessor to compare.
+		any, err := verify.AnyBaseline(cmd.Context(), baselineSrc)
+		if err != nil {
+			return fmt.Errorf("list baselines under source: %w", err)
+		}
+		if !any {
+			return fmt.Errorf("no baselines found under %q; nothing to verify (check --baseline-dir/--baseline-s3 and that the baseline job is producing complete snapshots)", baselineSrc)
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), "only one baseline under the source; nothing to verify yet (no predecessor to compare against)")
 		return nil
 	}
 
@@ -147,6 +160,28 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 			Schema: u.Schema, Table: u.Table, Status: verify.StatusInconclusive,
 			Detail: "no predecessor baseline (new since the previous snapshot)",
 		})
+	}
+	// A table named in --tables that is absent from BOTH the paired and unpaired
+	// sets was never iterated above, so it would silently vanish from the report
+	// while the run still exited 0 on the other tables' matches — the exact
+	// silent-omission this command exists to prevent (and asymmetric with live
+	// mode, where a bogus --tables entry reaches VerifyTable and gates the exit).
+	// Surface each unseen request as an error so it appears and fails the run.
+	if want != nil {
+		seen := make(map[string]bool, len(results))
+		for _, r := range results {
+			seen[r.Schema+"."+r.Table] = true
+		}
+		for key := range want {
+			if seen[key] {
+				continue
+			}
+			schema, table, _ := strings.Cut(key, ".")
+			results = append(results, verify.TableResult{
+				Schema: schema, Table: table, Status: verify.StatusError,
+				Detail: "requested via --tables but not present in the latest baseline pair",
+			})
+		}
 	}
 	if len(results) == 0 {
 		return fmt.Errorf("no tables matched --tables in the baseline pair")
