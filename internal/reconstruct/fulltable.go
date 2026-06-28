@@ -781,6 +781,22 @@ func materializeBaselineLocal(ctx context.Context, path string) (string, func(),
 	return tmpPath, cleanup, nil
 }
 
+// ReadBaselineColumns returns the column names of a baseline Parquet file (local
+// or s3://). This is the authoritative non-generated column set for fingerprinting
+// the table: mydumper excludes true STORED/VIRTUAL generated columns from the dump
+// but keeps ordinary expression-default (DEFAULT_GENERATED) columns, so the Parquet
+// schema is exactly the set to hash — deriving it from a schema snapshot's
+// is_generated flag instead would wrongly drop DEFAULT_GENERATED columns (the
+// trap consistency.ConsistentTableChecksum documents) and silently under-verify them.
+func ReadBaselineColumns(ctx context.Context, path string) ([]string, error) {
+	localPath, cleanup, err := materializeBaselineLocal(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	return readBaselineColumns(ctx, localPath)
+}
+
 // readBaselineColumns opens the local Parquet file with DuckDB and returns
 // the column names in the order parquet_scan() emits them. This order is
 // the canonical column order for the emitted INSERT statements.

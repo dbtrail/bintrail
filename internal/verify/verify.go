@@ -257,11 +257,22 @@ func inconclusive(res TableResult, detail string) TableResult {
 // binary families (base64 in the event image vs raw bytes from the source).
 func hasDeferredRepr(cols []metadata.ColumnMeta) bool {
 	for _, c := range cols {
-		switch strings.ToLower(c.DataType) {
-		case "enum", "set", "json",
-			"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit":
+		if isDeferredType(c.DataType) {
 			return true
 		}
+	}
+	return false
+}
+
+// isDeferredType reports whether a column's event-image representation can differ
+// from how the baseline/source renders it in a way this version doesn't yet
+// normalize: ENUM/SET (ordinal vs label), JSON (MySQL-canonical text), binary
+// families (base64 in the event image vs raw bytes), BIT.
+func isDeferredType(dataType string) bool {
+	switch strings.ToLower(dataType) {
+	case "enum", "set", "json",
+		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit":
+		return true
 	}
 	return false
 }

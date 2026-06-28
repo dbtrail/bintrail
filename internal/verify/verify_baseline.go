@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -64,20 +66,37 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 			return inconclusive(res, fmt.Sprintf("primary-key column %q has type %q unsupported by the baseline canonicalizer", c.Name, c.DataType)), nil
 		}
 	}
-	if p.NewAnchor.File == "" {
-		return inconclusive(res, "new baseline has no recorded binlog anchor (pre-#633 baseline); cannot bound the reconstruction"), nil
+	// A real baseline anchor is never at binlog position 0; an empty file or a
+	// zero position means the anchor wasn't recorded (pre-#633) or its metadata
+	// is corrupt (the reader keeps the file but zeroes an unparseable position).
+	// Bounding the reconstruction at position 0 would cut it short and could pass
+	// a window that touched no rows as a (false) match — refuse instead.
+	if p.NewAnchor.File == "" || p.NewAnchor.Pos == 0 {
+		return inconclusive(res, "new baseline has no usable binlog anchor (missing or zero position); cannot bound the reconstruction"), nil
 	}
 
-	// Non-generated columns in ordinal order. Using IsGenerated is safe here:
-	// both sides hash the same set, so an over/under-inclusion is symmetric and
-	// cannot produce a false mismatch (unlike the live-source path, where the
-	// source and reconstruct derived the set independently).
-	orderedCols := make([]metadata.ColumnMeta, 0, len(tm.Columns))
+	// Hash exactly the columns the baseline Parquet holds. mydumper excludes true
+	// STORED/VIRTUAL generated columns but keeps ordinary DEFAULT_GENERATED ones
+	// (created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, …), so the Parquet schema is
+	// the correct set. Deriving it from the snapshot's is_generated flag would hit
+	// the DEFAULT_GENERATED trap (consistency.ConsistentTableChecksum's comment)
+	// and silently drop those real columns from the fingerprint — under-verifying
+	// them on BOTH sides, a false-match exposure.
+	colNames, err := reconstruct.ReadBaselineColumns(ctx, p.NewPath)
+	if err != nil {
+		return res, fmt.Errorf("read new baseline columns %s.%s: %w", p.Schema, p.Table, err)
+	}
+	colByName := make(map[string]metadata.ColumnMeta, len(tm.Columns))
 	for _, c := range tm.Columns {
-		if c.IsGenerated {
-			continue
+		colByName[c.Name] = c
+	}
+	orderedCols := make([]metadata.ColumnMeta, 0, len(colNames))
+	for _, name := range colNames {
+		cm, ok := colByName[name]
+		if !ok {
+			return inconclusive(res, fmt.Sprintf("baseline column %q is absent from the index schema snapshot; re-run bintrail snapshot", name)), nil
 		}
-		orderedCols = append(orderedCols, c)
+		orderedCols = append(orderedCols, cm)
 	}
 
 	// Latest event per PK in (prev snapshot, new anchor]. Lower bound by the
@@ -126,20 +145,55 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	res.ReconstructDigest = reconDigest
 	res.ReconstructRows = reconCount
 
-	deferredRepr := hasDeferredRepr(orderedCols) && len(changes) > 0
-	res.Status, res.Detail = classify(newDigest, newCount, reconDigest, reconCount, deferredRepr)
+	res.Status, res.Detail = classify(newDigest, newCount, reconDigest, reconCount, deferredReprChanged(orderedCols, changes))
 	return res, nil
+}
+
+// deferredReprChanged reports whether an ENUM/SET/JSON/binary column was actually
+// changed by an event in the window — the only case where the event-image renders
+// differently than the baseline reads it (ordinal vs label, base64 vs raw bytes,
+// canonical JSON). Gating on actual participation, not merely "the table contains
+// such a column and saw any change", keeps a real divergence on an unrelated
+// non-deferred column reportable as a mismatch instead of masking it inconclusive.
+func deferredReprChanged(cols []metadata.ColumnMeta, changes map[string]*query.ResultRow) bool {
+	deferred := make(map[string]bool)
+	for _, c := range cols {
+		if isDeferredType(c.DataType) {
+			deferred[c.Name] = true
+		}
+	}
+	if len(deferred) == 0 {
+		return false
+	}
+	for _, ev := range changes {
+		switch ev.EventType {
+		case event.EventInsert:
+			return true // an insert sets every column, including the deferred one
+		case event.EventUpdate:
+			for _, col := range ev.ChangedColumns {
+				if deferred[col] {
+					return true
+				}
+			}
+		}
+		// EventDelete removes the row from both sides — no value is rendered, so
+		// it cannot introduce a representation difference.
+	}
+	return false
 }
 
 // FindBaselinePair builds the verifiable table pairs from the two most recent
 // baseline snapshots under source: for every table present in both, the prev +
 // new Parquet paths, the prev snapshot time, and the new baseline's binlog
-// anchor (read from its Parquet metadata). Returns nil (nothing to verify) when
-// fewer than two snapshots exist — the first baseline has no predecessor.
-func FindBaselinePair(ctx context.Context, source string) ([]BaselinePair, error) {
+// anchor (read from its Parquet metadata). It also returns the "schema.table" of
+// tables in the new snapshot that have NO predecessor image (new since the prev
+// snapshot) so the caller can report them rather than silently dropping them — an
+// operator must be able to tell "verified" from "not present to verify". Returns
+// nil, nil, nil (nothing to verify) when fewer than two snapshots exist.
+func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair, unpaired []string, err error) {
 	files, err := reconstruct.ListBaselines(ctx, source)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// files are newest-snapshot-first; find the two most recent distinct times.
 	var tNew, tPrev time.Time
@@ -154,7 +208,7 @@ func FindBaselinePair(ctx context.Context, source string) ([]BaselinePair, error
 		}
 	}
 	if tNew.IsZero() || tPrev.IsZero() {
-		return nil, nil // fewer than two snapshots: nothing to verify yet
+		return nil, nil, nil // fewer than two snapshots: nothing to verify yet
 	}
 
 	newByTable := map[string]reconstruct.BaselineFile{}
@@ -169,15 +223,15 @@ func FindBaselinePair(ctx context.Context, source string) ([]BaselinePair, error
 		}
 	}
 
-	var pairs []BaselinePair
 	for key, nf := range newByTable {
 		pf, ok := prevByTable[key]
 		if !ok {
-			continue // table is new since the previous snapshot: no predecessor image
+			unpaired = append(unpaired, key) // new since the previous snapshot: no predecessor image
+			continue
 		}
 		meta, err := baseline.ReadParquetMetadataAny(ctx, nf.Path)
 		if err != nil {
-			return nil, fmt.Errorf("read new baseline metadata %s: %w", nf.Path, err)
+			return nil, nil, fmt.Errorf("read new baseline metadata %s: %w", nf.Path, err)
 		}
 		pairs = append(pairs, BaselinePair{
 			Schema:       nf.Schema,
@@ -189,5 +243,6 @@ func FindBaselinePair(ctx context.Context, source string) ([]BaselinePair, error
 			NewAnchor:    query.BinlogPos{File: meta.BinlogFile, Pos: uint64(meta.BinlogPos)},
 		})
 	}
-	return pairs, nil
+	sort.Strings(unpaired)
+	return pairs, unpaired, nil
 }

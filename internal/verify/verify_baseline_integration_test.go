@@ -68,41 +68,47 @@ func TestVerifyBaselinePair_MatchAndMismatch(t *testing.T) {
 	// schema snapshot so the resolver has columns + PK + datetime precision.
 	for _, c := range []struct {
 		name, key, dt, colType string
-		ord                    int
+		ord, isGen             int
 	}{
-		{"id", "PRI", "int", "int", 1},
-		{"status", "", "varchar", "varchar(64)", 2},
-		{"ts", "", "datetime", "datetime(6)", 3},
+		{"id", "PRI", "int", "int", 1, 0},
+		{"status", "", "varchar", "varchar(64)", 2, 0},
+		{"ts", "", "datetime", "datetime(6)", 3, 0},
+		// created_at is an ordinary DEFAULT CURRENT_TIMESTAMP column the snapshotter
+		// mis-flags is_generated=1 (DEFAULT_GENERATED trap). It IS in the baseline
+		// Parquet, so it must be hashed — locking that the column set comes from the
+		// Parquet, not the is_generated flag (else corruption here would read MATCH).
+		{"created_at", "", "datetime", "datetime", 4, 1},
 	} {
 		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
 			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
 			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
-			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', 0)`,
-			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', ?)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType, c.isGen)
 	}
 
 	baseDir := t.TempDir()
 	now := time.Now().UTC()
 	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
 	newTS := prevTS.Add(time.Hour)
-	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64),\n  `ts` DATETIME(6),\n  PRIMARY KEY (`id`)\n);\n"
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64),\n  `ts` DATETIME(6),\n  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`)\n);\n"
 	cols := []baseline.Column{
 		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
 		{Name: "status", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 		{Name: "ts", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
+		{Name: "created_at", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
 	}
 
 	// PREV baseline: initial state {1:a, 2:b, 3:c}.
 	writeTestBaseline(t, baseDir, prevTS, dbName, "orders", createSQL, cols, [][]string{
-		{"1", "a", "2021-01-01 00:00:00.000000"},
-		{"2", "b", "2021-01-02 00:00:00.000000"},
-		{"3", "c", "2021-01-03 00:00:00.000000"},
+		{"1", "a", "2021-01-01 00:00:00.000000", "2020-01-01 00:00:00"},
+		{"2", "b", "2021-01-02 00:00:00.000000", "2020-01-02 00:00:00"},
+		{"3", "c", "2021-01-03 00:00:00.000000", "2020-01-03 00:00:00"},
 	}, "binlog.000001", 200)
 	// NEW baseline: state at anchor binlog.000001:500 → {1:a, 2:shipped, 4:new}.
 	newRows := [][]string{
-		{"1", "a", "2021-01-01 00:00:00.000000"},
-		{"2", "shipped", "2021-01-02 00:00:00.000000"},
-		{"4", "new", "2021-06-15 12:30:45.000000"},
+		{"1", "a", "2021-01-01 00:00:00.000000", "2020-01-01 00:00:00"},
+		{"2", "shipped", "2021-01-02 00:00:00.000000", "2020-01-02 00:00:00"},
+		{"4", "new", "2021-06-15 12:30:45.000000", "2020-06-15 00:00:00"},
 	}
 	writeTestBaseline(t, baseDir, newTS, dbName, "orders", createSQL, cols, newRows, "binlog.000001", 500)
 
@@ -110,12 +116,12 @@ func TestVerifyBaselinePair_MatchAndMismatch(t *testing.T) {
 	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
 	ets := prevTS.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ets, nil, dbName, "orders", 2 /*UPDATE*/, "2", nil,
-		[]byte(`{"id":2,"status":"b","ts":"2021-01-02 00:00:00.000000"}`),
-		[]byte(`{"id":2,"status":"shipped","ts":"2021-01-02 00:00:00.000000"}`))
+		[]byte(`{"id":2,"status":"b","ts":"2021-01-02 00:00:00.000000","created_at":"2020-01-02 00:00:00"}`),
+		[]byte(`{"id":2,"status":"shipped","ts":"2021-01-02 00:00:00.000000","created_at":"2020-01-02 00:00:00"}`))
 	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, ets, nil, dbName, "orders", 3 /*DELETE*/, "3", nil,
-		[]byte(`{"id":3,"status":"c","ts":"2021-01-03 00:00:00.000000"}`), nil)
+		[]byte(`{"id":3,"status":"c","ts":"2021-01-03 00:00:00.000000","created_at":"2020-01-03 00:00:00"}`), nil)
 	testutil.InsertEvent(t, db, "binlog.000001", 400, 500, ets, nil, dbName, "orders", 1 /*INSERT*/, "4", nil,
-		nil, []byte(`{"id":4,"status":"new","ts":"2021-06-15 12:30:45.000000"}`))
+		nil, []byte(`{"id":4,"status":"new","ts":"2021-06-15 12:30:45.000000","created_at":"2020-06-15 00:00:00"}`))
 
 	resolver, err := metadata.NewResolver(db, 1)
 	if err != nil {
@@ -124,12 +130,15 @@ func TestVerifyBaselinePair_MatchAndMismatch(t *testing.T) {
 	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
 	ctx := context.Background()
 
-	pairs, err := FindBaselinePair(ctx, baseDir)
+	pairs, unpaired, err := FindBaselinePair(ctx, baseDir)
 	if err != nil {
 		t.Fatalf("FindBaselinePair: %v", err)
 	}
 	if len(pairs) != 1 {
 		t.Fatalf("expected 1 pair (orders), got %d", len(pairs))
+	}
+	if len(unpaired) != 0 {
+		t.Errorf("expected no unpaired tables, got %v", unpaired)
 	}
 
 	// MATCH: reconstruct(prev → anchor) == the new baseline.
@@ -142,10 +151,13 @@ func TestVerifyBaselinePair_MatchAndMismatch(t *testing.T) {
 			got.Status, got.Detail, got.SourceDigest, got.SourceRows, got.ReconstructDigest, got.ReconstructRows)
 	}
 
-	// MISMATCH: tamper the new baseline so it no longer equals the reconstruction.
+	// MISMATCH: tamper ONLY the created_at column (the DEFAULT_GENERATED one) in
+	// the new baseline. This must surface as a mismatch — proving created_at is in
+	// the digest. With the buggy is_generated-based column set it would be excluded
+	// and the tamper would falsely read MATCH.
 	tampered := make([][]string, len(newRows))
 	copy(tampered, newRows)
-	tampered[0] = []string{"1", "TAMPERED", "2021-01-01 00:00:00.000000"}
+	tampered[0] = []string{"1", "a", "2021-01-01 00:00:00.000000", "1999-12-31 00:00:00"}
 	writeTestBaseline(t, baseDir, newTS, dbName, "orders", createSQL, cols, tampered, "binlog.000001", 500)
 
 	got2, err := VerifyBaselinePair(ctx, cfg, pairs[0])
