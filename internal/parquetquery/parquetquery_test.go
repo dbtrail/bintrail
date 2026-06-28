@@ -149,6 +149,28 @@ func TestBuildQueryFromFilesConnectionIDSubstitution(t *testing.T) {
 	assertContains(t, q2, " connection_id,")
 }
 
+func TestBuildQueryFromFiles_untilPos(t *testing.T) {
+	files := []string{"s3://bucket/f.parquet"}
+	opts := query.Options{Schema: "mydb", Table: "orders",
+		UntilPos: &query.BinlogPos{File: "binlog.000007", Pos: 4242}, Limit: 10}
+	q, args := buildQueryFromFiles(files, opts, map[string]bool{"connection_id": true})
+	assertContains(t, q, "binlog_file < ?")
+	assertContains(t, q, "end_pos <= ?")
+	// schema, table, file, file, pos, limit
+	var files2, hasPos int
+	for _, a := range args {
+		switch a {
+		case "binlog.000007":
+			files2++
+		case uint64(4242):
+			hasPos++
+		}
+	}
+	if files2 != 2 || hasPos != 1 {
+		t.Errorf("expected file x2 + pos x1 in args, got files=%d pos=%d (%v)", files2, hasPos, args)
+	}
+}
+
 // ─── buildQuery (local glob path) ───────────────────────────────────────────
 
 func assertContains(t *testing.T, s, want string) {
@@ -662,7 +684,7 @@ func TestGenerateDatePrefixes(t *testing.T) {
 
 	t.Run("since only uses today as end", func(t *testing.T) {
 		// Use yesterday as since — should produce 2 prefixes (yesterday + today).
-		yesterday := time.Now().UTC().Truncate(24 * time.Hour).AddDate(0, 0, -1)
+		yesterday := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -1)
 		since := yesterday.Add(10 * time.Hour) // yesterday 10:00
 		got := generateDatePrefixes(base, &since, nil)
 		if got == nil {
@@ -677,7 +699,7 @@ func TestGenerateDatePrefixes(t *testing.T) {
 		// Use 5 days ago as until — should produce up to 31 prefixes
 		// but since start is capped to 31 days before now, result
 		// depends on the gap between now-31d and until.
-		fiveDaysAgo := time.Now().UTC().Truncate(24 * time.Hour).AddDate(0, 0, -5)
+		fiveDaysAgo := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -5)
 		got := generateDatePrefixes(base, nil, &fiveDaysAgo)
 		if got == nil {
 			t.Fatal("expected prefixes for until-only, got nil")
@@ -850,9 +872,9 @@ func TestCanTerminateEarly(t *testing.T) {
 		// cutoff was year 0001 → every later file appeared fully after cutoff
 		// → silent early-termination dropped real data.
 		results := []query.ResultRow{
-			mkRow(time.Time{}, 100),                                          // drift
-			mkRow(time.Time{}, 101),                                          // drift
-			mkRow(time.Date(2026, 3, 9, 13, 30, 0, 0, time.UTC), 1),          // real
+			mkRow(time.Time{}, 100),                                 // drift
+			mkRow(time.Time{}, 101),                                 // drift
+			mkRow(time.Date(2026, 3, 9, 13, 30, 0, 0, time.UTC), 1), // real
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
 		// limit=3 means we'd need 3 real-timestamp rows to ground a cutoff,
@@ -867,9 +889,9 @@ func TestCanTerminateEarly(t *testing.T) {
 		// on the real rows alone: sorted real rows at limit-th=2 is 10:30.
 		// Next file is hour=11 → can terminate.
 		results := []query.ResultRow{
-			mkRow(time.Time{}, 100),                                  // drift
+			mkRow(time.Time{}, 100), // drift
 			mkRow(time.Date(2026, 3, 9, 10, 30, 0, 0, time.UTC), 2),
-			mkRow(time.Time{}, 101),                                  // drift
+			mkRow(time.Time{}, 101), // drift
 			mkRow(time.Date(2026, 3, 9, 10, 15, 0, 0, time.UTC), 1),
 			mkRow(time.Date(2026, 3, 9, 10, 45, 0, 0, time.UTC), 3),
 		}

@@ -105,17 +105,35 @@ func LoadProfileRules(ctx context.Context, db *sql.DB, profile string) ([]Schema
 
 // ─── Options ─────────────────────────────────────────────────────────────────
 
+// BinlogPos is a binlog coordinate: a file name plus a byte position. It is used
+// as an exact upper bound for "events up to this point" (see Options.UntilPos),
+// matching events whose end position is at-or-before it. File comparison is
+// lexicographic, which equals numeric order for MySQL's zero-padded binlog names
+// within one server's sequence (the case for a baseline anchor).
+type BinlogPos struct {
+	File string
+	Pos  uint64
+}
+
 // Options specifies the filter criteria for querying binlog_events.
 // All fields are optional; nil / zero values are ignored when building SQL.
 type Options struct {
-	Schema        string
-	Table         string
-	PKValues      string           // pipe-delimited PK, e.g. "12345" or "12345|2"
-	PKValuesIn    []string         // multi-PK lookup (mutually exclusive with PKValues)
-	EventType     *event.EventType // nil = all types
-	GTID          string
-	Since         *time.Time
-	Until         *time.Time
+	Schema     string
+	Table      string
+	PKValues   string           // pipe-delimited PK, e.g. "12345" or "12345|2"
+	PKValuesIn []string         // multi-PK lookup (mutually exclusive with PKValues)
+	EventType  *event.EventType // nil = all types
+	GTID       string
+	Since      *time.Time
+	Until      *time.Time
+	// UntilPos, when set, bounds events to those at-or-before an exact binlog
+	// coordinate (file + end position) — independent of wall-clock time. It is
+	// the precise upper bound for "reconstruct the table to exactly this point"
+	// (a baseline's recorded anchor, #641). It refines, and does not replace, the
+	// Until time bound: callers pair it with Until so MySQL/the archive listing
+	// can still prune partitions/files by time, then UntilPos cuts the boundary
+	// exactly. nil = no position bound.
+	UntilPos      *BinlogPos
 	ChangedColumn string     // column name; matched via JSON_CONTAINS
 	ColumnEq      []ColumnEq // match against values inside row_after / row_before
 	Flag          string     // return events from tables/columns carrying this flag
@@ -311,6 +329,12 @@ func buildQuery(opts Options) (string, []any) {
 		where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", outerUntil))
 		where = append(where, "event_timestamp <= ?")
 		args = append(args, until)
+	}
+	if opts.UntilPos != nil {
+		// Exact binlog upper bound: events whose end position is at-or-before the
+		// anchor (an earlier file, or the same file no further than the position).
+		where = append(where, "(binlog_file < ? OR (binlog_file = ? AND end_pos <= ?))")
+		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.Pos)
 	}
 	if opts.ChangedColumn != "" {
 		// json.Marshal produces the JSON string representation (with quotes),

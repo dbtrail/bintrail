@@ -846,6 +846,12 @@ func buildFilters(opts query.Options) ([]string, []any) {
 		where = append(where, "event_timestamp <= ?")
 		args = append(args, *opts.Until)
 	}
+	if opts.UntilPos != nil {
+		// Exact binlog upper bound, mirroring the live-MySQL path (query.go):
+		// events whose end position is at-or-before the anchor.
+		where = append(where, "(binlog_file < ? OR (binlog_file = ? AND end_pos <= ?))")
+		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.Pos)
+	}
 	if opts.ChangedColumn != "" {
 		needle, _ := json.Marshal(opts.ChangedColumn)
 		where = append(where, "json_contains(changed_columns, ?)")

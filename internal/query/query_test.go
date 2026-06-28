@@ -139,6 +139,36 @@ func TestBuildQuery_changedColumn(t *testing.T) {
 	}
 }
 
+func TestBuildQuery_untilPos(t *testing.T) {
+	opts := Options{Schema: "db", Table: "t", UntilPos: &BinlogPos{File: "binlog.000007", Pos: 4242}}
+	q, args := buildQuery(opts)
+
+	if !strings.Contains(q, "binlog_file < ?") || !strings.Contains(q, "end_pos <= ?") {
+		t.Errorf("expected position bound in query: %s", q)
+	}
+	// Args: file (twice, for the OR branches) and the position.
+	var files, hasPos int
+	for _, a := range args {
+		switch a {
+		case "binlog.000007":
+			files++
+		case uint64(4242):
+			hasPos++
+		}
+	}
+	if files != 2 || hasPos != 1 {
+		t.Errorf("expected file x2 + pos x1 in args, got files=%d pos=%d (%v)", files, hasPos, args)
+	}
+}
+
+func TestBuildQuery_untilPosAbsentByDefault(t *testing.T) {
+	q, _ := buildQuery(Options{Schema: "db", Table: "t"})
+	// "end_pos" appears in the SELECT list; the bound is the WHERE fragment.
+	if strings.Contains(q, "end_pos <= ?") {
+		t.Errorf("position bound must be absent when UntilPos is nil: %s", q)
+	}
+}
+
 func TestBuildQuery_noLimit(t *testing.T) {
 	// Limit=0 means "no LIMIT clause" — callers (CLI, MCP) apply their own defaults.
 	q, args := buildQuery(Options{})

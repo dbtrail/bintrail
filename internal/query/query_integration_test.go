@@ -80,6 +80,36 @@ func TestFetch_eventTypeFilter(t *testing.T) {
 	}
 }
 
+func TestFetch_untilPos(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	ts := "2026-02-19 14:00:00"
+	// Three events across a position boundary. Anchor = binlog.000001 @ 300.
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts, nil, "mydb", "orders", 1, "1", nil, nil, []byte(`{"id":1}`)) // ≤ anchor
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ts, nil, "mydb", "orders", 1, "2", nil, nil, []byte(`{"id":2}`)) // == anchor (included)
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, ts, nil, "mydb", "orders", 1, "3", nil, nil, []byte(`{"id":3}`)) // > anchor (excluded)
+	testutil.InsertEvent(t, db, "binlog.000002", 100, 200, ts, nil, "mydb", "orders", 1, "4", nil, nil, []byte(`{"id":4}`)) // later file (excluded)
+
+	e := New(db)
+	rows, err := e.Fetch(context.Background(), Options{
+		Schema: "mydb", Table: "orders",
+		UntilPos: &BinlogPos{File: "binlog.000001", Pos: 300},
+		Limit:    100,
+	})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows at-or-before the anchor, got %d", len(rows))
+	}
+	for _, r := range rows {
+		if r.EndPos > 300 || r.BinlogFile != "binlog.000001" {
+			t.Errorf("row past the anchor leaked: %s @ %d", r.BinlogFile, r.EndPos)
+		}
+	}
+}
+
 func TestFetch_gtidFilter(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
