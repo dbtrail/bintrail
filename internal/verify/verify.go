@@ -178,27 +178,12 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	// masked by this.
 	deferredRepr := hasDeferredRepr(orderedCols) && len(changes) > 0
 
-	hasher := consistency.NewHasher()
-	emitErr := reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
-		BaselinePath: baselinePath,
-		Schema:       schema,
-		Table:        table,
-		PKCols:       pkCols,
-		Changes:      changes,
-	}, func(rowMap map[string]any) error {
-		cells := make([][]byte, len(orderedCols))
-		for i, c := range orderedCols {
-			cells[i] = renderCell(rowMap[c.Name], c)
-		}
-		hasher.AddBytes(cells)
-		return nil
-	})
+	reconDigest, reconCount, emitErr := reconstructDigest(ctx, baselinePath, schema, table, pkCols, changes, orderedCols)
 	if emitErr != nil {
 		return res, fmt.Errorf("reconstruct %s.%s: %w", schema, table, emitErr)
 	}
-
-	res.ReconstructDigest = hasher.Digest()
-	res.ReconstructRows = hasher.Count()
+	res.ReconstructDigest = reconDigest
+	res.ReconstructRows = reconCount
 	if coverageNote != "" {
 		res.Detail = coverageNote
 	}
@@ -230,6 +215,34 @@ func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int
 		return StatusInconclusive, "an ENUM/SET, JSON or binary column was changed by an event; its event-image normalization is deferred, so this content difference is not conclusive"
 	}
 	return StatusMismatch, "content digest differs at equal row count (in-place value divergence)"
+}
+
+// reconstructDigest reconstructs a table from baselinePath merged with changes,
+// renders each row's columns (in orderedCols order) to the canonical text form,
+// and returns the order-independent content digest + row count. Shared by the
+// live-source verify (VerifyTable) and the baseline-pair verify (#642): both
+// sides of any comparison must be produced by this one function so the digests
+// are byte-comparable by construction.
+func reconstructDigest(ctx context.Context, baselinePath, schema, table string, pkCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, orderedCols []metadata.ColumnMeta) (string, int64, error) {
+	hasher := consistency.NewHasher()
+	err := reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
+		BaselinePath: baselinePath,
+		Schema:       schema,
+		Table:        table,
+		PKCols:       pkCols,
+		Changes:      changes,
+	}, func(rowMap map[string]any) error {
+		cells := make([][]byte, len(orderedCols))
+		for i, c := range orderedCols {
+			cells[i] = renderCell(rowMap[c.Name], c)
+		}
+		hasher.AddBytes(cells)
+		return nil
+	})
+	if err != nil {
+		return "", 0, err
+	}
+	return hasher.Digest(), hasher.Count(), nil
 }
 
 func inconclusive(res TableResult, detail string) TableResult {
