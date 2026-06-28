@@ -748,6 +748,14 @@ func splitSchemaTable(entry string) (string, string, bool) {
 // can then query the resulting local file without an outbound connection.
 func materializeBaselineLocal(ctx context.Context, path string) (string, func(), error) {
 	if !strings.HasPrefix(path, "s3://") {
+		// At-rest integrity (#636): validate the local file against its snapshot's
+		// _MANIFEST before any reader trusts it (DuckDB validates nothing). Fail
+		// loud on corruption; a legacy snapshot with no manifest is a no-op. S3
+		// baselines are not validated here yet — the COPY below re-encodes them, so
+		// the temp is not byte-identical to the object — a follow-up.
+		if err := baseline.ValidateLocalFile(path); err != nil {
+			return "", nil, err
+		}
 		return path, func() {}, nil
 	}
 	// Download via DuckDB httpfs. Keep the temp file around until cleanup().

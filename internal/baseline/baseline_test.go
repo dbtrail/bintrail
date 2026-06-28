@@ -1341,6 +1341,59 @@ func TestWriteAndReadParquet(t *testing.T) {
 
 // ─── Run (orchestrator) ───────────────────────────────────────────────────────
 
+// TestRun_writesIntegrityManifest: a completed baseline writes the _MANIFEST
+// sidecar (#636), its crc32c matches the file's bytes, and the file validates
+// clean. End-to-end for the write-side hook (no DB — Run is mydumper-SQL→Parquet).
+func TestRun_writesIntegrityManifest(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"),
+		[]byte("INSERT INTO `orders` VALUES(1,10,'9.99','n','2025-01-01 00:00:00','2025-01-15');\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(context.Background(), Config{InputDir: inputDir, OutputDir: outputDir, Compression: "none", RowGroupSize: 100}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var parquetPath string
+	_ = filepath.Walk(outputDir, func(p string, info os.FileInfo, err error) error {
+		if err == nil && filepath.Ext(p) == ".parquet" {
+			parquetPath = p
+		}
+		return nil
+	})
+	if parquetPath == "" {
+		t.Fatal("no .parquet produced")
+	}
+	snap := filepath.Dir(filepath.Dir(parquetPath))
+
+	m, ok, err := LoadManifest(snap)
+	if err != nil || !ok {
+		t.Fatalf("a completed baseline must write a _MANIFEST: ok=%v err=%v", ok, err)
+	}
+	rel, _ := filepath.Rel(snap, parquetPath)
+	want, listed := m.Files[filepath.ToSlash(rel)]
+	if !listed {
+		t.Fatalf("manifest missing the table file %q: %v", rel, m.Files)
+	}
+	got, err := CRC32CFile(parquetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("manifest crc %s != file crc %s", want, got)
+	}
+	if err := ValidateLocalFile(parquetPath); err != nil {
+		t.Errorf("a freshly-written baseline must validate clean, got %v", err)
+	}
+}
+
 func TestRun(t *testing.T) {
 	inputDir := t.TempDir()
 	outputDir := t.TempDir()

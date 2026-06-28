@@ -85,6 +85,10 @@ func ReadBaselineRows(ctx context.Context, path string, filter map[string]string
 			return nil, fmt.Errorf("load httpfs extension: %w", err)
 		}
 		duckdbutil.EnableS3CredentialChain(ctx, db)
+	} else if err := baseline.ValidateLocalFile(path); err != nil {
+		// At-rest integrity (#636): fail loud on a corrupt local baseline before
+		// the cascade Phase-2 scan trusts it. S3 validation is a follow-up.
+		return nil, err
 	}
 
 	// Build sorted conditions for deterministic SQL + arg ordering.

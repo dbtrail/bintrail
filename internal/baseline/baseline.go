@@ -233,6 +233,15 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		}
 		return stats, errs[0]
 	}
+	// At-rest integrity manifest (#636): CRC-32C every Parquet file before the
+	// _SUCCESS marker, so a complete snapshot also carries its checksums. Best-
+	// effort — a manifest-write failure leaves the snapshot complete but
+	// unverifiable (it reads as "integrity not verified"), a degraded-
+	// observability outcome, not a data one, so it must not fail a good baseline.
+	if err := WriteManifest(snapDir); err != nil {
+		slog.Warn("could not write integrity manifest; this snapshot will read as integrity-not-verified",
+			"dir", snapDir, "error", err)
+	}
 	if err := WriteSuccessMarker(snapDir); err != nil {
 		// The snapshot is complete on disk but unmarked; without the _SUCCESS
 		// marker (and absent _INCOMPLETE) discovery still treats it as
