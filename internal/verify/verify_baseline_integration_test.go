@@ -183,6 +183,110 @@ func TestVerifyBaselinePair_MatchAndMismatch(t *testing.T) {
 	}
 }
 
+// TestExplainBaselinePairMismatch is the #644 acceptance: on a known divergence
+// between two at-rest baselines, the drill-down names the exact differing primary
+// keys and, for a changed row, the column with recovery-vs-baseline values — all
+// from the same reconstructed streams the digest used (no live source, scratch
+// DB, or external tool). It exercises all three diff kinds at once.
+func TestExplainBaselinePairMismatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"id", "PRI", "int", "int", 1},
+		{"status", "", "varchar", "varchar(64)", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64),\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "status", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	// prev {1:a, 2:b, 5:e}; new (truth) {1:a, 2:shipped, 7:g}.
+	writeTestBaseline(t, baseDir, prevTS, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "a"}, {"2", "b"}, {"5", "e"},
+	}, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "a"}, {"2", "shipped"}, {"7", "g"},
+	}, "binlog.000001", 300)
+
+	// One event in (prev, anchor]: id=2 updated b→"wrong" (diverges from the new
+	// baseline's "shipped"). Nothing touches 5 (recovery keeps it; truth dropped it)
+	// or 7 (truth has it; recovery never gets it) → changed + extra + missing.
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+	ets := prevTS.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ets, nil, dbName, "orders", 2 /*UPDATE*/, "2", nil,
+		[]byte(`{"id":2,"status":"b"}`), []byte(`{"id":2,"status":"wrong"}`))
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
+	ctx := context.Background()
+	pairs, _, _, err := FindBaselinePair(ctx, baseDir)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
+	}
+
+	// Precondition: it is a real mismatch.
+	got, err := VerifyBaselinePair(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair: %v", err)
+	}
+	if got.Status != StatusMismatch {
+		t.Fatalf("precondition: want mismatch, got %q (%s)", got.Status, got.Detail)
+	}
+
+	ex, err := ExplainBaselinePairMismatch(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("ExplainBaselinePairMismatch: %v", err)
+	}
+
+	changed := map[string]RowDiff{}
+	missing := map[string]bool{}
+	extra := map[string]bool{}
+	for _, d := range ex.Diffs {
+		switch d.Kind {
+		case diffChanged:
+			changed[d.PK] = d
+		case diffMissing:
+			missing[d.PK] = true
+		case diffExtra:
+			extra[d.PK] = true
+		}
+	}
+	if ex.Total != 3 {
+		t.Errorf("want 3 differing rows (1 changed, 1 extra, 1 missing), got Total=%d: %+v", ex.Total, ex.Diffs)
+	}
+	if d, ok := changed["id=2"]; !ok {
+		t.Errorf("want a changed row for id=2, got changed=%v", changed)
+	} else if len(d.Cells) != 1 || d.Cells[0].Column != "status" || d.Cells[0].Recovery != "wrong" || d.Cells[0].Baseline != "shipped" {
+		t.Errorf("id=2 cell diff = %+v; want status recovery=wrong baseline=shipped", d.Cells)
+	}
+	if !extra["id=5"] {
+		t.Errorf("want id=5 as extra (in recovery, not the new baseline), got extra=%v", extra)
+	}
+	if !missing["id=7"] {
+		t.Errorf("want id=7 as missing (in the new baseline, not reproduced), got missing=%v", missing)
+	}
+}
+
 // TestFindBaselinePair_UnpairedAndSelection locks two things: a table present
 // only in the new snapshot lands in `unpaired` (not silently dropped), and the
 // pair is built from the two most recent snapshots, ignoring an older third.

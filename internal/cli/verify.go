@@ -23,6 +23,7 @@ var (
 	vfyBaselineS3  string
 	vfyTables      string
 	vfyNoArchive   bool
+	vfyExplain     bool
 )
 
 var verifyCmd = &cobra.Command{
@@ -49,9 +50,18 @@ on any mismatch or error, or when comparable tables existed but none could be
 proven (all inconclusive). A source with only one baseline — no predecessor yet
 — is reported and exits zero.
 
+Add --explain (baseline-anchored mode) to print, below the report, a row-level
+drill-down of each mismatch: which primary keys diverged and, for changed rows,
+the differing columns with the reconstructed value vs the new baseline's. It
+reuses the same reconstruction the verdict came from — no live source, scratch
+database, or external tool.
+
 Examples:
   # Baseline-anchored (drift-free), all tables
   bintrail verify --index-dsn "..." --baseline-dir /data/baselines
+
+  # Baseline-anchored with a row-level drill-down on any mismatch
+  bintrail verify --index-dsn "..." --baseline-dir /data/baselines --explain
 
   # Live-source, specific tables, S3 baselines
   bintrail verify --source-dsn "..." --index-dsn "..." \
@@ -66,6 +76,7 @@ func init() {
 	verifyCmd.Flags().StringVar(&vfyBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/)")
 	verifyCmd.Flags().StringVar(&vfyTables, "tables", "", "Comma-separated schema.table list (default: all tables in the latest schema snapshot)")
 	verifyCmd.Flags().BoolVar(&vfyNoArchive, "no-archive", false, "Query live MySQL partitions only; skip Parquet archive discovery")
+	verifyCmd.Flags().BoolVar(&vfyExplain, "explain", false, "On a baseline-anchored mismatch, print a row-level drill-down (which primary keys diverged and how) below the report")
 	AddDuckDBTuningFlags(verifyCmd)
 }
 
@@ -144,6 +155,7 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 	}
 
 	results := make([]verify.TableResult, 0, len(pairs)+len(unpaired))
+	var toExplain []verify.BaselinePair // mismatched pairs to drill into when --explain
 	for _, p := range pairs {
 		if want != nil && !want[p.Schema+"."+p.Table] {
 			continue
@@ -153,6 +165,9 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 			res = verify.TableResult{Schema: p.Schema, Table: p.Table, Status: verify.StatusError, Detail: err.Error()}
 		}
 		results = append(results, res)
+		if vfyExplain && res.Status == verify.StatusMismatch {
+			toExplain = append(toExplain, p)
+		}
 	}
 	for _, u := range unpaired {
 		if want != nil && !want[u.Schema+"."+u.Table] {
@@ -202,7 +217,19 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 	if len(results) == 0 {
 		return fmt.Errorf("no tables matched --tables in the baseline pair")
 	}
-	return printVerifyReport(cmd, results)
+	reportErr := printVerifyReport(cmd, results)
+	// Drill-downs print AFTER the summary table so the verdict reads first, then
+	// the per-row detail for each mismatch. A drill-down failure is non-fatal — it
+	// must not mask the report's own (mismatch) exit status.
+	for _, p := range toExplain {
+		ex, err := verify.ExplainBaselinePairMismatch(cmd.Context(), cfg, p)
+		if err != nil {
+			fmt.Fprintf(cmd.OutOrStdout(), "\n--- mismatch drill-down: %s.%s — unavailable: %v ---\n", p.Schema, p.Table, err)
+			continue
+		}
+		ex.Write(cmd.OutOrStdout())
+	}
+	return reportErr
 }
 
 // runVerifyLive is the secondary mode: reconstruct each table to a consistent
