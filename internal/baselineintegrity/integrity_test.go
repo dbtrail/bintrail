@@ -114,3 +114,21 @@ func TestValidateLocalFile_corruptManifest(t *testing.T) {
 		t.Errorf("a corrupt manifest over intact data must degrade to skip, not fail; got %v", err)
 	}
 }
+
+// TestValidateLocalFile_unrecognizedVersion: a manifest whose version/algo this
+// binary doesn't recognize (a future format) degrades to a SKIP, never
+// ErrIntegrity — so an old binary can't brick recovery of a newer-but-intact
+// baseline by comparing its crc32c against a foreign digest.
+func TestValidateLocalFile_unrecognizedVersion(t *testing.T) {
+	snap := t.TempDir()
+	good := filepath.Join(snap, "db", "orders.parquet")
+	writeFileT(t, good, []byte("intact baseline data"))
+	// A v99/"future-hash" manifest with a deliberately WRONG digest for the file:
+	// without the version gate this would be an ErrIntegrity mismatch.
+	manifest := `{"version":99,"algo":"future-hash","files":{"db/orders.parquet":"deadbeef"}}`
+	writeFileT(t, filepath.Join(snap, ManifestName), []byte(manifest))
+
+	if err := ValidateLocalFile(good); err != nil {
+		t.Errorf("an unrecognized manifest version/algo must degrade to skip, got %v", err)
+	}
+}

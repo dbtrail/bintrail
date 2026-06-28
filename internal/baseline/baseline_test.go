@@ -1396,6 +1396,43 @@ func TestRun_writesIntegrityManifest(t *testing.T) {
 	}
 }
 
+// TestRun_fatalOnManifestWriteFailure locks the write-side safety contract (#636):
+// when the manifest can't be written, Run must FAIL and withhold _SUCCESS, so a
+// complete-but-manifestless snapshot — an undetectable downgrade at read time —
+// is never published. A refactor that softened the fatal return, or reordered
+// _SUCCESS before the manifest, would silently break this; this test catches both.
+func TestRun_fatalOnManifestWriteFailure(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"),
+		[]byte("INSERT INTO `orders` VALUES(1,10,'9.99','n','2025-01-01 00:00:00','2025-01-15');\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fixed timestamp → deterministic snapshot dir; pre-create _MANIFEST as a
+	// DIRECTORY so the final os.WriteFile hits EISDIR (fails even when run as root).
+	ts := time.Date(2025, 2, 28, 0, 0, 0, 0, time.UTC)
+	tsDir := strings.ReplaceAll(ts.Format(time.RFC3339), ":", "-")
+	snapDir := filepath.Join(outputDir, tsDir)
+	if err := os.MkdirAll(filepath.Join(snapDir, baselineintegrity.ManifestName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(context.Background(), Config{InputDir: inputDir, OutputDir: outputDir, Timestamp: ts, Compression: "none", RowGroupSize: 100}); err == nil {
+		t.Fatal("Run must fail when the integrity manifest cannot be written")
+	}
+	// _SUCCESS must be ABSENT — the snapshot stays _INCOMPLETE, excluded from discovery.
+	if _, statErr := os.Stat(filepath.Join(snapDir, SuccessMarker)); !os.IsNotExist(statErr) {
+		t.Errorf("_SUCCESS must not be written when the manifest write failed (stat err=%v)", statErr)
+	}
+}
+
 func TestRun(t *testing.T) {
 	inputDir := t.TempDir()
 	outputDir := t.TempDir()

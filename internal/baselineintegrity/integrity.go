@@ -8,8 +8,10 @@
 // would be read back as truth. The _MANIFEST sidecar closes that: it records a
 // CRC-32C over each table's Parquet file BYTES at write time, and the local
 // baseline read paths re-hash and compare, failing loud on a mismatch instead of
-// returning garbage rows. (S3 read-validation is a follow-up — the S3 read path
-// re-encodes the object into a non-byte-identical temp; see WarnS3IntegrityNotValidated.)
+// returning garbage rows. (S3 read-validation is a follow-up: no S3 read path
+// keeps a byte-identical local copy of the object for the manifest's raw-byte CRC
+// to check against — two stream directly via parquet_scan, one re-encodes via
+// DuckDB COPY to a temp; see WarnS3IntegrityNotValidated.)
 //
 // Scope is bit-rot / partial-write, NOT deliberate tampering: an attacker who
 // rewrites a Parquet file can also rewrite this manifest. True tamper-evidence
@@ -134,8 +136,10 @@ func LoadManifest(snapshotDir string) (m *Manifest, ok bool, err error) {
 //     This is the fail-loud case; the Parquet readers validate nothing.
 //   - nil (skip): "cannot verify" — there is no manifest (a legacy snapshot, or a
 //     path not under a snapshot directory), the file is absent from the manifest
-//     (added out-of-band after the manifest was written), OR the manifest itself
-//     is unreadable/unparseable (a rotted sidecar, logged). All mean "unverified",
+//     (added out-of-band after the manifest was written), the manifest is
+//     unreadable/unparseable (a rotted sidecar, logged), OR its version/algo is
+//     unrecognized (a newer format this binary can't validate, logged). All mean
+//     "unverified",
 //     NOT "data corrupt", so they degrade to a skip rather than denying recovery
 //     of possibly-intact data: the bit-rot guarded here is random, so a flip lands
 //     on the data (caught as a CRC mismatch with the manifest intact) OR on the
@@ -155,6 +159,15 @@ func ValidateLocalFile(path string) error {
 	}
 	if !ok {
 		return nil // no manifest — legacy/temp/test, not verifiable, not a failure
+	}
+	if m.Version != manifestVersion || m.Algo != "crc32c" {
+		// An unrecognized version/algo (a future v2 schema, or a different digest)
+		// is "cannot verify with THIS binary", not "data corrupt" — degrade to a
+		// skip, never ErrIntegrity, so an older binary can't brick recovery of a
+		// newer-but-intact baseline by comparing its crc32c against a foreign value.
+		slog.Warn("integrity manifest version/algo unrecognized; treating baseline as integrity-not-verified",
+			"snapshot", snapshotDir, "version", m.Version, "algo", m.Algo)
+		return nil
 	}
 	rel, err := filepath.Rel(snapshotDir, path)
 	if err != nil {
@@ -177,11 +190,12 @@ func ValidateLocalFile(path string) error {
 var s3IntegrityWarnOnce sync.Once
 
 // WarnS3IntegrityNotValidated logs, ONCE per process, that S3 baselines are not
-// at-rest validated on read (#636 covers local baselines; the S3 path re-encodes
-// the object, so the CRC manifest can't apply to the temp — a follow-up). The S3
-// read paths call this so an operator isn't falsely assured the durable store is
-// protected. Once-only because some read paths (cascade ReadBaselineRows) run in
-// tight loops.
+// at-rest validated on read (#636 covers local baselines; no S3 read path keeps a
+// byte-identical local copy of the object for the CRC to check against — two
+// stream directly via parquet_scan, one re-encodes via COPY — a follow-up). The
+// S3 read paths call this so an operator isn't falsely assured the durable store
+// is protected. Once-only because some read paths (cascade ReadBaselineRows) run
+// in tight loops.
 func WarnS3IntegrityNotValidated() {
 	s3IntegrityWarnOnce.Do(func() {
 		slog.Warn("S3 baseline at-rest integrity is NOT verified on read (#636 covers local baselines only); a corrupt S3 object is read as truth")
