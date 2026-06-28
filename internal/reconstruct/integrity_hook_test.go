@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 )
 
 // TestMaterializeBaselineLocal_validatesIntegrity pins the #636 read hook: the
@@ -24,7 +24,7 @@ func TestMaterializeBaselineLocal_validatesIntegrity(t *testing.T) {
 	if err := os.WriteFile(p, []byte("baseline parquet bytes — pretend this is a real file"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := baseline.WriteManifest(snap); err != nil {
+	if err := baselineintegrity.WriteManifest(snap); err != nil {
 		t.Fatal(err)
 	}
 
@@ -42,7 +42,7 @@ func TestMaterializeBaselineLocal_validatesIntegrity(t *testing.T) {
 	if err := os.WriteFile(p, []byte("CORRUPTED bytes — pretend bit-rot flipped these here"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := materializeBaselineLocal(context.Background(), p); !errors.Is(err, baseline.ErrIntegrity) {
+	if _, _, err := materializeBaselineLocal(context.Background(), p); !errors.Is(err, baselineintegrity.ErrIntegrity) {
 		t.Errorf("a corrupt baseline must fail loud with ErrIntegrity, got %v", err)
 	}
 

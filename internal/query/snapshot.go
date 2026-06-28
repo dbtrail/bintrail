@@ -18,8 +18,8 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 
+	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
-
 	"github.com/dbtrail/dbtrail/internal/event"
 )
 
@@ -56,10 +56,16 @@ func FetchSnapshot(ctx context.Context, path string, opts Options) ([]ResultRow,
 	}
 	defer db.Close()
 	if strings.HasPrefix(path, "s3://") {
+		baselineintegrity.WarnS3IntegrityNotValidated() // #636: S3 baselines not validated (follow-up)
 		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return nil, fmt.Errorf("load httpfs: %w", err)
 		}
 		duckdbutil.EnableS3CredentialChain(ctx, db)
+	} else if err := baselineintegrity.ValidateLocalFile(path); err != nil {
+		// At-rest integrity (#636): fail loud on a corrupt local baseline before
+		// `query --include-snapshot` reads its rows as snapshot events — the third
+		// local baseline read path, validated like reconstruct and recover.
+		return nil, err
 	}
 
 	ts, err := readSnapshotTimestamp(ctx, db, path)

@@ -1,0 +1,189 @@
+// Package baselineintegrity provides at-rest integrity for baseline Parquet
+// files (#636): a CRC-32C _MANIFEST sidecar written next to the _SUCCESS marker,
+// validated on every local read path.
+//
+// The Parquet readers validate nothing — DuckDB's parquet_scan and parquet-go's
+// OpenFile both trust the bytes, with no CRC validation and no pragma to force it
+// — so a file silently corrupted on disk or in S3 (bit-rot, a partial write)
+// would be read back as truth. The _MANIFEST sidecar closes that: it records a
+// CRC-32C over each table's Parquet file BYTES at write time, and the local
+// baseline read paths re-hash and compare, failing loud on a mismatch instead of
+// returning garbage rows. (S3 read-validation is a follow-up — the S3 read path
+// re-encodes the object into a non-byte-identical temp; see WarnS3IntegrityNotValidated.)
+//
+// Scope is bit-rot / partial-write, NOT deliberate tampering: an attacker who
+// rewrites a Parquet file can also rewrite this manifest. True tamper-evidence
+// needs signing or an external registry — a separate, larger effort, deliberately
+// out of scope here. The manifest is a SEPARATE file from the data it covers, so
+// corruption of one does not silently mask the other, and CRC-32C (Castagnoli,
+// hardware-accelerated) detects any flipped byte with no parquet-library dependency.
+//
+// The content_digest (#633) is a different thing: a source-fidelity fingerprint
+// of the ROWS, embedded in the Parquet metadata; it neither covers the file
+// encoding nor survives being rewritten. This manifest covers the bytes.
+//
+// It lives in its own package (not internal/baseline) so the read paths —
+// reconstruct and query — can import it without a cycle through baseline's own
+// test dependencies.
+package baselineintegrity
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+)
+
+// ManifestName is the per-snapshot integrity sidecar, written under the snapshot
+// directory alongside the _SUCCESS marker.
+const ManifestName = "_MANIFEST"
+
+// manifestVersion is the on-disk schema version of the manifest JSON.
+const manifestVersion = 1
+
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
+// ErrIntegrity is returned when a baseline file's CRC-32C does not match the
+// manifest — the file is corrupt (bit-rot or a partial write). Callers fail loud.
+var ErrIntegrity = errors.New("baseline integrity check failed (file corrupt)")
+
+// Manifest is the integrity sidecar: each Parquet file's path (relative to the
+// snapshot directory, forward-slashed so it is OS- and S3-portable) → its
+// CRC-32C hex digest.
+type Manifest struct {
+	Version int               `json:"version"`
+	Algo    string            `json:"algo"` // always "crc32c"
+	Files   map[string]string `json:"files"`
+}
+
+// CRC32CFile streams path through CRC-32C (Castagnoli) and returns the 8-char
+// lowercase hex digest.
+func CRC32CFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := crc32.New(crc32cTable)
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%08x", h.Sum32()), nil
+}
+
+// WriteManifest hashes every .parquet file under snapshotDir and writes the
+// integrity manifest. It is called on full baseline success, before the _SUCCESS
+// marker, so a snapshot that has _SUCCESS also has its manifest.
+func WriteManifest(snapshotDir string) error {
+	m := Manifest{Version: manifestVersion, Algo: "crc32c", Files: map[string]string{}}
+	err := filepath.WalkDir(snapshotDir, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".parquet") {
+			return walkErr
+		}
+		crc, err := CRC32CFile(p)
+		if err != nil {
+			return fmt.Errorf("crc32c %s: %w", p, err)
+		}
+		rel, err := filepath.Rel(snapshotDir, p)
+		if err != nil {
+			return err
+		}
+		m.Files[filepath.ToSlash(rel)] = crc
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(snapshotDir, ManifestName), b, 0o644)
+}
+
+// LoadManifest reads the integrity manifest from snapshotDir. ok=false with a nil
+// error means the manifest is ABSENT — a legacy snapshot written before #636,
+// which reads as "integrity not verified" rather than failing.
+func LoadManifest(snapshotDir string) (m *Manifest, ok bool, err error) {
+	b, err := os.ReadFile(filepath.Join(snapshotDir, ManifestName))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var parsed Manifest
+	if err := json.Unmarshal(b, &parsed); err != nil {
+		return nil, false, fmt.Errorf("parse %s: %w", ManifestName, err)
+	}
+	return &parsed, true, nil
+}
+
+// ValidateLocalFile checks a local baseline Parquet file against its snapshot's
+// integrity manifest (the snapshot directory is the file's grandparent,
+// <snapshot>/<db>/<table>.parquet). Outcomes:
+//   - nil (verified): the file's CRC-32C matches the manifest.
+//   - ErrIntegrity (wrapped): the CRC-32C does NOT match — the file is corrupt.
+//     This is the fail-loud case; the Parquet readers validate nothing.
+//   - nil (skip): "cannot verify" — there is no manifest (a legacy snapshot, or a
+//     path not under a snapshot directory), the file is absent from the manifest
+//     (added out-of-band after the manifest was written), OR the manifest itself
+//     is unreadable/unparseable (a rotted sidecar, logged). All mean "unverified",
+//     NOT "data corrupt", so they degrade to a skip rather than denying recovery
+//     of possibly-intact data: the bit-rot guarded here is random, so a flip lands
+//     on the data (caught as a CRC mismatch with the manifest intact) OR on the
+//     sidecar (degraded here) — not both. A rotted sidecar must never brick a
+//     good baseline, least of all in `verify` itself.
+//   - a non-ErrIntegrity error only when the data file cannot be opened/read
+//     (it would fail the subsequent read anyway).
+func ValidateLocalFile(path string) error {
+	snapshotDir := filepath.Dir(filepath.Dir(path))
+	m, ok, err := LoadManifest(snapshotDir)
+	if err != nil {
+		// Unreadable / unparseable manifest = cannot verify, not data corruption;
+		// degrade to a skip so a rotted sidecar can't deny recovery of good data.
+		slog.Warn("integrity manifest unreadable; treating baseline as integrity-not-verified",
+			"snapshot", snapshotDir, "error", err)
+		return nil
+	}
+	if !ok {
+		return nil // no manifest — legacy/temp/test, not verifiable, not a failure
+	}
+	rel, err := filepath.Rel(snapshotDir, path)
+	if err != nil {
+		return nil // path not under the snapshot dir — unexpected layout, skip
+	}
+	want, listed := m.Files[filepath.ToSlash(rel)]
+	if !listed {
+		return nil // file not in the manifest — skip rather than false-positive
+	}
+	got, err := CRC32CFile(path)
+	if err != nil {
+		return fmt.Errorf("read baseline for integrity check %s: %w", path, err)
+	}
+	if got != want {
+		return fmt.Errorf("%w: %s (crc32c %s, manifest %s)", ErrIntegrity, path, got, want)
+	}
+	return nil
+}
+
+var s3IntegrityWarnOnce sync.Once
+
+// WarnS3IntegrityNotValidated logs, ONCE per process, that S3 baselines are not
+// at-rest validated on read (#636 covers local baselines; the S3 path re-encodes
+// the object, so the CRC manifest can't apply to the temp — a follow-up). The S3
+// read paths call this so an operator isn't falsely assured the durable store is
+// protected. Once-only because some read paths (cascade ReadBaselineRows) run in
+// tight loops.
+func WarnS3IntegrityNotValidated() {
+	s3IntegrityWarnOnce.Do(func() {
+		slog.Warn("S3 baseline at-rest integrity is NOT verified on read (#636 covers local baselines only); a corrupt S3 object is read as truth")
+	})
+}

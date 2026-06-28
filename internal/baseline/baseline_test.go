@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/parquet-go/parquet-go"
+
+	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 )
 
 // ─── ParseMetadata ────────────────────────────────────────────────────────────
@@ -1373,7 +1375,7 @@ func TestRun_writesIntegrityManifest(t *testing.T) {
 	}
 	snap := filepath.Dir(filepath.Dir(parquetPath))
 
-	m, ok, err := LoadManifest(snap)
+	m, ok, err := baselineintegrity.LoadManifest(snap)
 	if err != nil || !ok {
 		t.Fatalf("a completed baseline must write a _MANIFEST: ok=%v err=%v", ok, err)
 	}
@@ -1382,14 +1384,14 @@ func TestRun_writesIntegrityManifest(t *testing.T) {
 	if !listed {
 		t.Fatalf("manifest missing the table file %q: %v", rel, m.Files)
 	}
-	got, err := CRC32CFile(parquetPath)
+	got, err := baselineintegrity.CRC32CFile(parquetPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != want {
 		t.Errorf("manifest crc %s != file crc %s", want, got)
 	}
-	if err := ValidateLocalFile(parquetPath); err != nil {
+	if err := baselineintegrity.ValidateLocalFile(parquetPath); err != nil {
 		t.Errorf("a freshly-written baseline must validate clean, got %v", err)
 	}
 }

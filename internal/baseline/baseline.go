@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 	"github.com/dbtrail/dbtrail/internal/consistency"
 )
 
@@ -234,13 +235,14 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		return stats, errs[0]
 	}
 	// At-rest integrity manifest (#636): CRC-32C every Parquet file before the
-	// _SUCCESS marker, so a complete snapshot also carries its checksums. Best-
-	// effort — a manifest-write failure leaves the snapshot complete but
-	// unverifiable (it reads as "integrity not verified"), a degraded-
-	// observability outcome, not a data one, so it must not fail a good baseline.
-	if err := WriteManifest(snapDir); err != nil {
-		slog.Warn("could not write integrity manifest; this snapshot will read as integrity-not-verified",
-			"dir", snapDir, "error", err)
+	// _SUCCESS marker, so a complete snapshot ALWAYS carries its checksums. Fatal,
+	// like the _SUCCESS write below: a complete-but-manifestless snapshot is an
+	// undetectable downgrade — at read time it is indistinguishable from a legacy
+	// (pre-#636) snapshot, so later corruption of its data would go unnoticed.
+	// Re-run rather than publish one. (A read-time rotted manifest is a different
+	// case — handled gracefully in ValidateLocalFile, not here.)
+	if err := baselineintegrity.WriteManifest(snapDir); err != nil {
+		return stats, fmt.Errorf("snapshot complete but could not write integrity manifest: %w", err)
 	}
 	if err := WriteSuccessMarker(snapDir); err != nil {
 		// The snapshot is complete on disk but unmarked; without the _SUCCESS

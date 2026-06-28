@@ -18,6 +18,7 @@ import (
 	mysqldriver "github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/event"
@@ -753,11 +754,12 @@ func materializeBaselineLocal(ctx context.Context, path string) (string, func(),
 		// loud on corruption; a legacy snapshot with no manifest is a no-op. S3
 		// baselines are not validated here yet — the COPY below re-encodes them, so
 		// the temp is not byte-identical to the object — a follow-up.
-		if err := baseline.ValidateLocalFile(path); err != nil {
+		if err := baselineintegrity.ValidateLocalFile(path); err != nil {
 			return "", nil, err
 		}
 		return path, func() {}, nil
 	}
+	baselineintegrity.WarnS3IntegrityNotValidated() // #636 covers local baselines only (S3 re-encode → follow-up)
 	// Download via DuckDB httpfs. Keep the temp file around until cleanup().
 	tmpDir, err := os.MkdirTemp("", "bintrail-baseline-*")
 	if err != nil {

@@ -1,4 +1,4 @@
-package baseline
+package baselineintegrity
 
 import (
 	"errors"
@@ -63,8 +63,8 @@ func TestManifest_roundtrip(t *testing.T) {
 	}
 }
 
-// TestValidateLocalFile covers all four outcomes: clean→nil, corrupt→ErrIntegrity,
-// no-manifest (legacy)→nil, and a file absent from the manifest→nil.
+// TestValidateLocalFile covers the verified, corrupt, no-manifest, and
+// not-listed outcomes.
 func TestValidateLocalFile(t *testing.T) {
 	snap := t.TempDir()
 	good := filepath.Join(snap, "db", "orders.parquet")
@@ -94,5 +94,23 @@ func TestValidateLocalFile(t *testing.T) {
 	writeFileT(t, extra, []byte("not listed in the manifest"))
 	if err := ValidateLocalFile(extra); err != nil {
 		t.Errorf("a file absent from the manifest must skip, got %v", err)
+	}
+}
+
+// TestValidateLocalFile_corruptManifest: a rotted / unparseable _MANIFEST must
+// degrade to a SKIP (warn), not hard-fail — "cannot verify" is not "data
+// corrupt", and a sidecar bit-flip must never brick recovery of intact data.
+func TestValidateLocalFile_corruptManifest(t *testing.T) {
+	snap := t.TempDir()
+	good := filepath.Join(snap, "db", "orders.parquet")
+	writeFileT(t, good, []byte("perfectly intact baseline data"))
+	if err := WriteManifest(snap); err != nil {
+		t.Fatal(err)
+	}
+	// Rot the sidecar into invalid JSON.
+	writeFileT(t, filepath.Join(snap, ManifestName), []byte("{not valid json at all"))
+
+	if err := ValidateLocalFile(good); err != nil {
+		t.Errorf("a corrupt manifest over intact data must degrade to skip, not fail; got %v", err)
 	}
 }
