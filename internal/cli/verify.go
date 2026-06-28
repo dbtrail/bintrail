@@ -45,7 +45,9 @@ the data. Two modes:
 Results are per table: match, mismatch, or inconclusive (no predecessor
 baseline, index behind, unsupported PK, coverage gap, or a value class this
 version can't yet compare — never reported as a failure). The run exits non-zero
-on any mismatch or error, or when nothing was verified.
+on any mismatch or error, or when comparable tables existed but none could be
+proven (all inconclusive). A source with only one baseline — no predecessor yet
+— is reported and exits zero.
 
 Examples:
   # Baseline-anchored (drift-free), all tables
@@ -107,7 +109,7 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 // runVerifyBaselinePair is the default, drift-free mode: compare the two most
 // recent baselines (#642). It reads no live source.
 func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName, baselineSrc string, duckTuning duckdbutil.Tuning) error {
-	pairs, unpaired, err := verify.FindBaselinePair(cmd.Context(), baselineSrc)
+	pairs, unpaired, prevOnly, err := verify.FindBaselinePair(cmd.Context(), baselineSrc)
 	if err != nil {
 		return fmt.Errorf("discover baseline pair: %w", err)
 	}
@@ -159,6 +161,20 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 		results = append(results, verify.TableResult{
 			Schema: u.Schema, Table: u.Table, Status: verify.StatusInconclusive,
 			Detail: "no predecessor baseline (new since the previous snapshot)",
+		})
+	}
+	// Tables in the previous baseline the newest snapshot no longer carries —
+	// dropped, or skipped by a subset ("--tables") re-baseline. Reported as
+	// inconclusive (not verified) so they appear instead of silently vanishing
+	// from a default all-tables run; the exit code is unchanged (inconclusive,
+	// like unpaired, does not by itself fail the run).
+	for _, d := range prevOnly {
+		if want != nil && !want[d.Schema+"."+d.Table] {
+			continue
+		}
+		results = append(results, verify.TableResult{
+			Schema: d.Schema, Table: d.Table, Status: verify.StatusInconclusive,
+			Detail: "present in the previous baseline but absent from the newest snapshot (dropped, or the newest baseline was run with --tables); not verified",
 		})
 	}
 	// A table named in --tables that is absent from BOTH the paired and unpaired

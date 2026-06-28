@@ -130,7 +130,7 @@ func TestVerifyBaselinePair_MatchAndMismatch(t *testing.T) {
 	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
 	ctx := context.Background()
 
-	pairs, unpaired, err := FindBaselinePair(ctx, baseDir)
+	pairs, unpaired, prevOnly, err := FindBaselinePair(ctx, baseDir)
 	if err != nil {
 		t.Fatalf("FindBaselinePair: %v", err)
 	}
@@ -139,6 +139,9 @@ func TestVerifyBaselinePair_MatchAndMismatch(t *testing.T) {
 	}
 	if len(unpaired) != 0 {
 		t.Errorf("expected no unpaired tables, got %v", unpaired)
+	}
+	if len(prevOnly) != 0 {
+		t.Errorf("expected no prev-only tables, got %v", prevOnly)
 	}
 
 	// MATCH: reconstruct(prev → anchor) == the new baseline.
@@ -198,7 +201,7 @@ func TestFindBaselinePair_UnpairedAndSelection(t *testing.T) {
 	writeTestBaseline(t, baseDir, newTS, "db", "orders", createSQL, cols, rows, "binlog.000001", 300)
 	writeTestBaseline(t, baseDir, newTS, "db", "fresh", createSQL, cols, rows, "binlog.000001", 300) // new-only
 
-	pairs, unpaired, err := FindBaselinePair(context.Background(), baseDir)
+	pairs, unpaired, _, err := FindBaselinePair(context.Background(), baseDir)
 	if err != nil {
 		t.Fatalf("FindBaselinePair: %v", err)
 	}
@@ -211,6 +214,40 @@ func TestFindBaselinePair_UnpairedAndSelection(t *testing.T) {
 	}
 	if len(unpaired) != 1 || unpaired[0].Table != "fresh" {
 		t.Errorf("expected 'fresh' in unpaired (new since prev), got %+v", unpaired)
+	}
+}
+
+// TestFindBaselinePair_PrevOnly locks the symmetric reverse of the unpaired
+// case: a table present in the previous snapshot but absent from the newest one
+// (a drop, or a subset "--tables" re-baseline) must surface in prevOnly, never
+// silently vanish. Without it a default verify could report a clean pass while
+// such a table was never checked or even printed.
+func TestFindBaselinePair_PrevOnly(t *testing.T) {
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	createSQL := "CREATE TABLE `t` (\n  `id` INT NOT NULL,\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")}}
+	rows := [][]string{{"1"}}
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := now.Truncate(time.Hour).Add(-1 * time.Hour)
+
+	// prev snapshot carries two tables; the newest re-snapshots only orders.
+	writeTestBaseline(t, baseDir, prevTS, "db", "orders", createSQL, cols, rows, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, prevTS, "db", "customers", createSQL, cols, rows, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, "db", "orders", createSQL, cols, rows, "binlog.000001", 300)
+
+	pairs, unpaired, prevOnly, err := FindBaselinePair(context.Background(), baseDir)
+	if err != nil {
+		t.Fatalf("FindBaselinePair: %v", err)
+	}
+	if len(pairs) != 1 || pairs[0].Table != "orders" {
+		t.Fatalf("expected one pair for orders, got %+v", pairs)
+	}
+	if len(unpaired) != 0 {
+		t.Errorf("expected no unpaired tables, got %+v", unpaired)
+	}
+	if len(prevOnly) != 1 || prevOnly[0].Table != "customers" {
+		t.Errorf("expected 'customers' in prevOnly (in prev, absent from newest), got %+v", prevOnly)
 	}
 }
 
@@ -256,7 +293,7 @@ func TestVerifyBaselinePair_UnchangedTable(t *testing.T) {
 		t.Fatalf("NewResolver: %v", err)
 	}
 	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
-	pairs, _, err := FindBaselinePair(context.Background(), baseDir)
+	pairs, _, _, err := FindBaselinePair(context.Background(), baseDir)
 	if err != nil || len(pairs) != 1 {
 		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
 	}

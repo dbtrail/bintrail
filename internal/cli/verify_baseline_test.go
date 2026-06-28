@@ -92,3 +92,34 @@ func TestRunVerifyBaselinePair_SingleBaseline(t *testing.T) {
 		t.Errorf("want an 'only one baseline' message, got %q", out.String())
 	}
 }
+
+// TestRunVerifyBaselinePair_TablesAbsent locks the no-silent-omission contract
+// for --tables: a requested table that exists in neither the paired nor the
+// unpaired set must surface as an error and fail the run, not vanish while the
+// other tables' matches keep the exit at 0. Two baselines for `orders` form a
+// real pair; --tables names a table that isn't there, so every real pair is
+// filtered out (the index is never touched — nil DBs are safe) and the unseen
+// request is the only result, as a StatusError.
+func TestRunVerifyBaselinePair_TablesAbsent(t *testing.T) {
+	baseDir := t.TempDir()
+	base := time.Now().UTC().Truncate(time.Hour)
+	writeMinimalBaseline(t, baseDir, "mydb", "orders", base.Add(-2*time.Hour))
+	writeMinimalBaseline(t, baseDir, "mydb", "orders", base.Add(-1*time.Hour))
+
+	vfyTables = "mydb.ghost"
+	t.Cleanup(func() { vfyTables = "" })
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	err := runVerifyBaselinePair(cmd, nil, nil, "", baseDir, duckdbutil.Tuning{})
+	if err == nil {
+		t.Fatalf("want a non-nil error (non-zero exit) for an absent --tables request, got nil; output:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "1 error") ||
+		!strings.Contains(out.String(), "not present in the latest baseline pair") {
+		t.Errorf("want the ghost table surfaced as an error, got output:\n%s", out.String())
+	}
+}

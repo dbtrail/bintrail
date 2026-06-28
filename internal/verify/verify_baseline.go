@@ -210,15 +210,25 @@ func AnyBaseline(ctx context.Context, source string) (bool, error) {
 // FindBaselinePair builds the verifiable table pairs from the two most recent
 // baseline snapshots under source: for every table present in both, the prev +
 // new Parquet paths, the prev snapshot time, and the new baseline's binlog
-// anchor (read from its Parquet metadata). It also returns the tables in the new
-// snapshot that have NO predecessor image (new since the prev snapshot) so the
-// caller can report them rather than silently dropping them — an
-// operator must be able to tell "verified" from "not present to verify". Returns
-// nil, nil, nil (nothing to verify) when fewer than two snapshots exist.
-func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair, unpaired []query.SchemaTable, err error) {
+// anchor (read from its Parquet metadata).
+//
+// It also surfaces the two asymmetric "can't pair" sets so the caller reports
+// them instead of silently dropping either — an operator must be able to tell
+// "verified" from "not present to verify":
+//   - unpaired: present in the NEW snapshot, absent from the prev (new since the
+//     prev snapshot — no predecessor image to reconstruct from).
+//   - prevOnly: present in the PREV snapshot, absent from the new. Either a table
+//     dropped between the snapshots, or the newest baseline was a subset (e.g.
+//     "bintrail baseline --tables") that didn't re-snapshot it. Without this the
+//     table would produce no report row at all on a default all-tables run — a
+//     silent omission that could let "recovery verified" hide untouched tables.
+//
+// Returns nil, nil, nil, nil (nothing to verify) when fewer than two snapshots
+// exist.
+func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair, unpaired, prevOnly []query.SchemaTable, err error) {
 	files, err := reconstruct.ListBaselines(ctx, source)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// files are newest-snapshot-first; find the two most recent distinct times.
 	var tNew, tPrev time.Time
@@ -233,7 +243,7 @@ func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair,
 		}
 	}
 	if tNew.IsZero() || tPrev.IsZero() {
-		return nil, nil, nil // fewer than two snapshots: nothing to verify yet
+		return nil, nil, nil, nil // fewer than two snapshots: nothing to verify yet
 	}
 
 	newByTable := map[string]reconstruct.BaselineFile{}
@@ -257,7 +267,7 @@ func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair,
 		}
 		meta, err := baseline.ReadParquetMetadataAny(ctx, nf.Path)
 		if err != nil {
-			return nil, nil, fmt.Errorf("read new baseline metadata %s: %w", nf.Path, err)
+			return nil, nil, nil, fmt.Errorf("read new baseline metadata %s: %w", nf.Path, err)
 		}
 		pairs = append(pairs, BaselinePair{
 			Schema:       nf.Schema,
@@ -269,11 +279,24 @@ func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair,
 			NewAnchor:    query.BinlogPos{File: meta.BinlogFile, Pos: uint64(meta.BinlogPos)},
 		})
 	}
-	sort.Slice(unpaired, func(i, j int) bool {
-		if unpaired[i].Schema != unpaired[j].Schema {
-			return unpaired[i].Schema < unpaired[j].Schema
+	// Symmetric to unpaired: tables in the prev snapshot the new one no longer
+	// carries. Reported, never silently dropped.
+	for key, pf := range prevByTable {
+		if _, ok := newByTable[key]; ok {
+			continue
 		}
-		return unpaired[i].Table < unpaired[j].Table
+		prevOnly = append(prevOnly, query.SchemaTable{Schema: pf.Schema, Table: pf.Table})
+	}
+	sortSchemaTables(unpaired)
+	sortSchemaTables(prevOnly)
+	return pairs, unpaired, prevOnly, nil
+}
+
+func sortSchemaTables(s []query.SchemaTable) {
+	sort.Slice(s, func(i, j int) bool {
+		if s[i].Schema != s[j].Schema {
+			return s[i].Schema < s[j].Schema
+		}
+		return s[i].Table < s[j].Table
 	})
-	return pairs, unpaired, nil
 }
