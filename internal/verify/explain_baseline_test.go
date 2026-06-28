@@ -70,6 +70,34 @@ func TestMismatchExplanation_add_caps(t *testing.T) {
 	}
 }
 
+// TestMismatchExplanation_Write_deferredCaveat: a drill-down that touched a
+// deferred-type column surfaces the caveat (its reconstructed value may be an
+// event image, not corruption); one that didn't must not show it.
+func TestMismatchExplanation_Write_deferredCaveat(t *testing.T) {
+	with := &MismatchExplanation{
+		Schema: "mydb", Table: "orders", Anchor: "binlog.000001:300",
+		Diffs:        []RowDiff{{PK: "id=2", Kind: diffChanged, Cells: []CellDiff{{Column: "kind", Recovery: "2", Baseline: "shipped"}}}},
+		Total:        1,
+		deferredSeen: true,
+	}
+	var b1 bytes.Buffer
+	with.Write(&b1)
+	if !strings.Contains(b1.String(), "deferred-type column") {
+		t.Errorf("want the deferred caveat, got:\n%s", b1.String())
+	}
+
+	without := &MismatchExplanation{
+		Schema: "mydb", Table: "orders", Anchor: "binlog.000001:300",
+		Diffs: []RowDiff{{PK: "id=2", Kind: diffChanged, Cells: []CellDiff{{Column: "status", Recovery: "wrong", Baseline: "shipped"}}}},
+		Total: 1,
+	}
+	var b2 bytes.Buffer
+	without.Write(&b2)
+	if strings.Contains(b2.String(), "deferred-type column") {
+		t.Errorf("no deferred column touched — caveat must not appear:\n%s", b2.String())
+	}
+}
+
 // TestCellEqual locks the NULL-vs-empty distinction the drill-down must honor to
 // agree with the content digest: a SQL NULL (nil) and an empty value ([]byte(""))
 // are DIFFERENT, where plain bytes.Equal would call them equal and silently miss

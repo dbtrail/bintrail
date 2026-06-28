@@ -25,10 +25,12 @@ const (
 	diffExtra   = "extra"   // reconstructed by the recovery, absent from the new baseline
 )
 
-// deferredMarker stands in for a differing deferred-type (ENUM/SET/JSON/binary)
-// column whose value comparison is not normalized — shown instead of a raw,
-// misleading literal (an event-image ordinal/base64 read as corruption).
-const deferredMarker = "<representation-deferred: comparison not normalized>"
+// deferredCaveat is printed once per drill-down when a deferred-type column
+// (ENUM/SET/JSON/binary) is among the diffs: its reconstructed value may be a
+// binlog event image (ordinal/base64/Go-JSON) rather than MySQL's source text, so
+// a shown value pair is not necessarily corruption. Surfaced rather than blanked
+// so a genuine baseline-vs-baseline drift in such a column is never hidden.
+const deferredCaveat = "  note: a deferred-type column (ENUM/SET/JSON/binary) is among the diffs — its reconstructed value may be an event image (ordinal/base64/JSON), not the source text; not necessarily corruption."
 
 // CellDiff is one column whose reconstructed value diverged from the new
 // baseline's, rendered in the SAME canonical text form the content digest
@@ -59,6 +61,7 @@ type MismatchExplanation struct {
 	Diffs                 []RowDiff
 	Total                 int            // total differing rows (Diffs is capped at maxExplainRows)
 	byKind                map[string]int // per-kind totals, for the overflow breakdown
+	deferredSeen          bool           // a deferred-type column appeared in a diff (drives the caveat)
 }
 
 func (ex *MismatchExplanation) add(d RowDiff) {
@@ -165,16 +168,17 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 			if cellEqual(rv, bv) {
 				continue
 			}
-			// A deferred-type column (ENUM/SET/JSON/binary) can still reach here —
-			// on a row-count mismatch (classify returns mismatch before the deferred
-			// check), or when it diverges with no in-window event. Its event-image
-			// form (ordinal, base64, Go-marshaled JSON) is NOT MySQL's source form,
-			// so a raw value pair would read as corruption. Flag it instead.
-			if isDeferredType(c.DataType) {
-				cells = append(cells, CellDiff{Column: c.Name, Recovery: deferredMarker, Baseline: deferredMarker})
-				continue
-			}
+			// Both values are shown raw. For a deferred-type column (ENUM/SET/JSON/
+			// binary) the recovery value MAY be an event image (ordinal/base64/
+			// Go-JSON) rather than MySQL's source text — see deferredCaveat, surfaced
+			// once per drill-down. We deliberately do NOT blank such cells: when the
+			// divergence is a baseline-vs-baseline drift (no in-window event), the
+			// values are directly comparable and hiding them would mask exactly the
+			// silent drift this command exists to catch.
 			cells = append(cells, CellDiff{Column: c.Name, Recovery: displayCell(rv), Baseline: displayCell(bv)})
+			if isDeferredType(c.DataType) {
+				ex.deferredSeen = true
+			}
 		}
 		if len(cells) > 0 {
 			ex.add(RowDiff{PK: rec.pk, Kind: diffChanged, Cells: cells})
@@ -247,10 +251,10 @@ func pkKeyAndDisplay(rowMap map[string]any, pkCols []metadata.ColumnMeta) (key, 
 }
 
 // displayCell renders a canonical cell for human output: NULL for a SQL NULL
-// (renderCell returns nil), the text form otherwise. Most differing columns are
-// non-deferred types and render cleanly; a deferred-TYPE column that reaches the
-// drill-down is flagged with deferredMarker upstream rather than shown literally,
-// because its event-image bytes (ordinal/base64/Go-JSON) are not the source form.
+// (renderCell returns nil), the text form otherwise. The text form is MySQL's
+// source bytes for non-deferred types; a deferred-type column (ENUM/SET/JSON/
+// binary) may instead carry an event-image form (see deferredCaveat), shown raw
+// so a real baseline-vs-baseline drift is never hidden.
 func displayCell(b []byte) string {
 	if b == nil {
 		return "NULL"
@@ -274,6 +278,9 @@ func cellEqual(a, b []byte) bool {
 func (ex *MismatchExplanation) Write(w io.Writer) {
 	fmt.Fprintf(w, "\n--- mismatch drill-down: %s.%s @ %s ---\n", ex.Schema, ex.Table, ex.Anchor)
 	fmt.Fprintln(w, "  recovery = previous baseline reconstructed to the anchor; baseline = the new baseline (truth)")
+	if ex.deferredSeen {
+		fmt.Fprintln(w, deferredCaveat)
+	}
 	if ex.Total == 0 {
 		// A mismatch can be flagged on row COUNT while every matched PK lines up
 		// cell-for-cell (e.g. a duplicate-PK pathology collapsing in the join).
