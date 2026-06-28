@@ -3,6 +3,7 @@
 package verify
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -383,6 +384,86 @@ func TestExplainBaselinePairMismatch_CompositePK(t *testing.T) {
 	}
 	if len(d.Cells) != 1 || d.Cells[0].Column != "status" || d.Cells[0].Recovery != "wrong" || d.Cells[0].Baseline != "shipped" {
 		t.Errorf("cell diff = %+v; want status recovery=wrong baseline=shipped", d.Cells)
+	}
+}
+
+// TestExplainBaselinePairMismatch_DeferredDrift exercises the deferred-type path
+// end to end: an ENUM column that drifts between the two baselines with NO
+// in-window event (the at-rest silent-drift case). Both sides are mydumper labels,
+// directly comparable, so the drill-down must show them RAW ("active" vs
+// "inactive") — never blanked, which would hide exactly the drift this command
+// exists to catch — and surface the representation caveat because a deferred-type
+// column is among the diffs.
+func TestExplainBaselinePairMismatch_DeferredDrift(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"id", "PRI", "int", "int", 1},
+		{"state", "", "enum", "enum('active','inactive')", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `state` ENUM('active','inactive'),\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "state", MySQLType: "enum", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	writeTestBaseline(t, baseDir, prevTS, dbName, "orders", createSQL, cols, [][]string{{"1", "active"}}, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, dbName, "orders", createSQL, cols, [][]string{{"1", "inactive"}}, "binlog.000001", 300)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
+	ctx := context.Background()
+	pairs, _, _, err := FindBaselinePair(ctx, baseDir)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
+	}
+	got, err := VerifyBaselinePair(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair: %v", err)
+	}
+	if got.Status != StatusMismatch {
+		t.Fatalf("precondition: an ENUM drift with no in-window event must be a mismatch (not inconclusive), got %q (%s)", got.Status, got.Detail)
+	}
+
+	ex, err := ExplainBaselinePairMismatch(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("ExplainBaselinePairMismatch: %v", err)
+	}
+	if ex.Total != 1 || len(ex.Diffs) != 1 {
+		t.Fatalf("want exactly 1 changed row, got Total=%d Diffs=%+v", ex.Total, ex.Diffs)
+	}
+	// Shown RAW (the revert): the marker would have blanked this real drift.
+	d := ex.Diffs[0]
+	if len(d.Cells) != 1 || d.Cells[0].Column != "state" || d.Cells[0].Recovery != "active" || d.Cells[0].Baseline != "inactive" {
+		t.Errorf("want state shown raw (recovery=active baseline=inactive), got %+v", d.Cells)
+	}
+	if !ex.deferredSeen {
+		t.Error("a deferred-type column was among the diffs; the caveat flag must be set")
+	}
+	var buf bytes.Buffer
+	ex.Write(&buf)
+	if !strings.Contains(buf.String(), "deferred-type column") {
+		t.Errorf("want the deferred caveat in the output, got:\n%s", buf.String())
 	}
 }
 
