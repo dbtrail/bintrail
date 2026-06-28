@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/verify"
 )
@@ -26,30 +27,38 @@ var (
 
 var verifyCmd = &cobra.Command{
 	Use:   "verify",
-	Short: "Verify that a recovery would reproduce the live source",
-	Long: `Reconstruct each table's current state from its baseline + indexed binlog
-events, fingerprint it, and compare to a consistent snapshot of the live source.
-A match proves a recovery would reproduce the source byte-for-byte; a mismatch
-flags a real divergence between the recovery chain and the source.
+	Short: "Verify that a recovery would reproduce the source",
+	Long: `Prove the recovery chain (baseline + indexed binlog) faithfully reproduces
+the data. Two modes:
 
-The source fingerprint reads the whole table at a consistent snapshot, so run
-this off-peak. Results are per table: match, mismatch, or inconclusive (index
-behind the snapshot, no baseline, unsupported PK, coverage gap, or a value class
-this version can't yet compare — never reported as a failure).
+  Baseline-anchored (default, drift-free) — omit --source-dsn. Compares the two
+  most recent baselines: reconstructs the previous baseline forward to the new
+  baseline's exact binlog anchor and fingerprints it against the new baseline.
+  Both sides are at-rest, so it reads no live source — run it any time after a
+  baseline (e.g. right after "bintrail baseline", or on a schedule). No
+  production impact.
+
+  Live-source — pass --source-dsn. Reconstructs each table to a consistent
+  snapshot of the live source and compares. Reads the whole table off the live
+  server, so run it off-peak.
+
+Results are per table: match, mismatch, or inconclusive (no predecessor
+baseline, index behind, unsupported PK, coverage gap, or a value class this
+version can't yet compare — never reported as a failure). The run exits non-zero
+on any mismatch or error, or when nothing was verified.
 
 Examples:
-  # All tables in the latest schema snapshot
-  bintrail verify --source-dsn "..." --index-dsn "..." \
-    --baseline-dir /data/baselines
+  # Baseline-anchored (drift-free), all tables
+  bintrail verify --index-dsn "..." --baseline-dir /data/baselines
 
-  # Specific tables, S3 baselines
+  # Live-source, specific tables, S3 baselines
   bintrail verify --source-dsn "..." --index-dsn "..." \
     --baseline-s3 s3://bucket/baselines --tables mydb.orders,mydb.users`,
 	RunE: runVerify,
 }
 
 func init() {
-	verifyCmd.Flags().StringVar(&vfySourceDSN, "source-dsn", "", "DSN for the live source MySQL database (required)")
+	verifyCmd.Flags().StringVar(&vfySourceDSN, "source-dsn", "", "DSN for the live source MySQL database; pass it for live-source mode, omit for baseline-anchored mode")
 	verifyCmd.Flags().StringVar(&vfyIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	verifyCmd.Flags().StringVar(&vfyBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots")
 	verifyCmd.Flags().StringVar(&vfyBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/)")
@@ -59,9 +68,6 @@ func init() {
 }
 
 func runVerify(cmd *cobra.Command, _ []string) error {
-	if vfySourceDSN == "" {
-		return fmt.Errorf("--source-dsn is required")
-	}
 	if vfyIndexDSN == "" {
 		return fmt.Errorf("--index-dsn is required")
 	}
@@ -73,12 +79,6 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("one of --baseline-dir or --baseline-s3 is required")
 	}
 
-	sourceDB, err := config.Connect(vfySourceDSN)
-	if err != nil {
-		return fmt.Errorf("connect to source database: %w", err)
-	}
-	defer sourceDB.Close()
-
 	indexDB, err := config.Connect(vfyIndexDSN)
 	if err != nil {
 		return fmt.Errorf("connect to index database: %w", err)
@@ -89,16 +89,79 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 	if cfg, parseErr := mysqldriver.ParseDSN(vfyIndexDSN); parseErr == nil {
 		indexDBName = cfg.DBName
 	}
-
 	resolver, err := metadata.NewResolver(indexDB, 0)
 	if err != nil {
 		return fmt.Errorf("load schema snapshot from index: %w", err)
 	}
-
 	duckTuning, err := DuckDBTuningFromFlags(cmd)
 	if err != nil {
 		return err
 	}
+
+	if vfySourceDSN != "" {
+		return runVerifyLive(cmd, indexDB, resolver, indexDBName, baselineSrc, duckTuning)
+	}
+	return runVerifyBaselinePair(cmd, indexDB, resolver, indexDBName, baselineSrc, duckTuning)
+}
+
+// runVerifyBaselinePair is the default, drift-free mode: compare the two most
+// recent baselines (#642). It reads no live source.
+func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName, baselineSrc string, duckTuning duckdbutil.Tuning) error {
+	pairs, unpaired, err := verify.FindBaselinePair(cmd.Context(), baselineSrc)
+	if err != nil {
+		return fmt.Errorf("discover baseline pair: %w", err)
+	}
+	if len(pairs) == 0 && len(unpaired) == 0 {
+		fmt.Fprintln(cmd.OutOrStdout(), "fewer than two baselines under the source; nothing to verify yet")
+		return nil
+	}
+
+	want, err := verifyTableFilter()
+	if err != nil {
+		return err
+	}
+	cfg := verify.BaselineConfig{
+		IndexDB:        indexDB,
+		Resolver:       resolver,
+		IndexDBName:    indexDBName,
+		NoArchive:      vfyNoArchive,
+		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
+	}
+
+	results := make([]verify.TableResult, 0, len(pairs)+len(unpaired))
+	for _, p := range pairs {
+		if want != nil && !want[p.Schema+"."+p.Table] {
+			continue
+		}
+		res, err := verify.VerifyBaselinePair(cmd.Context(), cfg, p)
+		if err != nil {
+			res = verify.TableResult{Schema: p.Schema, Table: p.Table, Status: verify.StatusError, Detail: err.Error()}
+		}
+		results = append(results, res)
+	}
+	for _, u := range unpaired {
+		if want != nil && !want[u.Schema+"."+u.Table] {
+			continue
+		}
+		results = append(results, verify.TableResult{
+			Schema: u.Schema, Table: u.Table, Status: verify.StatusInconclusive,
+			Detail: "no predecessor baseline (new since the previous snapshot)",
+		})
+	}
+	if len(results) == 0 {
+		return fmt.Errorf("no tables matched --tables in the baseline pair")
+	}
+	return printVerifyReport(cmd, results)
+}
+
+// runVerifyLive is the secondary mode: reconstruct each table to a consistent
+// snapshot of the live source and compare (#634).
+func runVerifyLive(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName, baselineSrc string, duckTuning duckdbutil.Tuning) error {
+	sourceDB, err := config.Connect(vfySourceDSN)
+	if err != nil {
+		return fmt.Errorf("connect to source database: %w", err)
+	}
+	defer sourceDB.Close()
 
 	tables, err := verifyTargetTables(cmd, indexDB)
 	if err != nil {
@@ -128,8 +191,23 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 		}
 		results = append(results, res)
 	}
-
 	return printVerifyReport(cmd, results)
+}
+
+// verifyTableFilter parses --tables into a "schema.table" set, or nil for all.
+func verifyTableFilter() (map[string]bool, error) {
+	if vfyTables == "" {
+		return nil, nil
+	}
+	want := map[string]bool{}
+	for _, entry := range splitAndTrim(vfyTables, ",") {
+		parts := strings.SplitN(entry, ".", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid --tables entry %q (want schema.table)", entry)
+		}
+		want[parts[0]+"."+parts[1]] = true
+	}
+	return want, nil
 }
 
 type schemaTable struct{ schema, table string }
