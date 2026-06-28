@@ -226,6 +226,47 @@ try {
   ph.probeErrVisible ? ok("pg-health: probe failure shows 'probe failing' (not a blank panel)") : bad("pg-health: probe failure shows 'probe failing' (not a blank panel)", "probe_error not surfaced");
   ph.notFoundShown ? ok("pg-health: absent slot shows 'not found yet'") : bad("pg-health: absent slot shows 'not found yet'", "missing not-found state");
 
+  // Scenario 8 — stream-continuity surface (#645). Fixture-drives continuityBox
+  // (pure, like pgHealthCard): the green "no gaps" affirmation must RENDER as the
+  // green ok-box (color actually applied, not just the class present), a stamped
+  // gap must render the red error-box and take precedence over a stale ok, and the
+  // unknown/legacy/missing/nil cases must show NEITHER box (no clean verdict from
+  // un-evaluated data). This is the only check that the new green badge displays
+  // correctly — the Go suite sees the JSON contract, never the pixels.
+  const cont = await page.evaluate(() => {
+    const okBox = continuityBox({ continuity: { status: "ok" } }, false);
+    const gapBox = continuityBox({ gap_lost: { at: "2026-06-22 12:00:00", detail: "unfillable binlog gap" } }, false);
+    const gapWins = continuityBox({ gap_lost: { at: "t", detail: "d" }, continuity: { status: "ok" } }, false);
+    const unknownBox = continuityBox({ continuity: { status: "unknown" } }, false);
+    const missingBox = continuityBox({ mode: "gtid" }, false); // legacy backend: no continuity field
+    const nilBox = continuityBox(null, false);
+    // The green box must actually be GREEN — append it and read the computed border
+    // color, so a CSS-cascade break (class present, color not applied) is caught.
+    let okBorder = "";
+    if (okBox) { document.body.appendChild(okBox); okBorder = getComputedStyle(okBox).borderColor; okBox.remove(); }
+    return {
+      okGreenClass: !!okBox && okBox.classList.contains("ok-box"),
+      okGreenText: !!okBox && /No gaps in captured stream/.test(okBox.textContent) && /does not assert the stream is live/.test(okBox.textContent),
+      okBorder,
+      gapRed: !!gapBox && gapBox.classList.contains("error-box") && /permanently lost/i.test(gapBox.textContent),
+      gapPrecedence: !!gapWins && gapWins.classList.contains("error-box"),
+      unknownNeither: unknownBox === null,
+      missingNeither: missingBox === null,
+      nilNeither: nilBox === null,
+    };
+  });
+  cont.okGreenClass ? ok("continuity: ok renders the green ok-box") : bad("continuity: ok renders the green ok-box", "no .ok-box");
+  cont.okGreenText ? ok("continuity: green box scoped to contiguity (not a liveness claim)") : bad("continuity: green box scoped to contiguity (not a liveness claim)", "wording missing/overclaims");
+  // any non-default, non-transparent border color proves the .ok-box class resolved (--insert green).
+  (cont.okBorder && cont.okBorder !== "rgba(0, 0, 0, 0)" && cont.okBorder !== "rgb(0, 0, 0)")
+    ? ok("continuity: green ok-box actually renders green (CSS applied)")
+    : bad("continuity: green ok-box actually renders green (CSS applied)", `borderColor=${cont.okBorder}`);
+  cont.gapRed ? ok("continuity: gap_lost renders the red error-box") : bad("continuity: gap_lost renders the red error-box", "no .error-box");
+  cont.gapPrecedence ? ok("continuity: gap_lost takes precedence over a stale ok") : bad("continuity: gap_lost takes precedence over a stale ok", "green won over a gap");
+  cont.unknownNeither ? ok("continuity: unknown shows neither box") : bad("continuity: unknown shows neither box", "rendered a box for unknown");
+  cont.missingNeither ? ok("continuity: missing continuity (legacy backend) shows no green") : bad("continuity: missing continuity (legacy backend) shows no green", "rendered green without continuity");
+  cont.nilNeither ? ok("continuity: nil stream shows neither box") : bad("continuity: nil stream shows neither box", "rendered a box for nil stream");
+
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));
 } catch (err) {

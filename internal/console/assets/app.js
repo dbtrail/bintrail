@@ -1362,30 +1362,10 @@ async function renderStatus() {
   // (slot wal_status/lag + REPLICA IDENTITY coverage) and persists a snapshot to the
   // index; this renders it. Gated on source==postgresql AND a snapshot existing.
   if (pg && stream && stream.source_health) cards.append(pgHealthCard(stream.source_health));
-  // Stream continuity. The loud red box is the durable permanent-loss record: an
-  // unfillable binlog gap (MySQL) or an invalidated/lost replication slot
-  // (PostgreSQL, #532); the index is valid only up to that point and capture must
-  // be re-baselined to resume. It keys on gap_lost, emitted independently of
-  // continuity — so a legacy backend that omits continuity still shows it on a
-  // lost stream. The green box is the affirmative counterpart and keys on
-  // continuity.status === "ok" (newer backends only); the two are mutually
-  // exclusive (gap_lost takes precedence). The green box asserts only
-  // gap-CONTIGUITY of the captured range — NOT that the stream is live or caught
-  // up; "unknown" (legacy index) and a missing continuity field both show neither.
-  if (stream && stream.gap_lost) {
-    const lost = el("div", { class: "error-box" });
-    lost.append(el("b", { text: "⚠ Events permanently lost" }));
-    lost.append(el("div", { text: stream.gap_lost.detail ||
-      (pg ? "the replication slot was invalidated; capture must be re-baselined to resume"
-          : "an unfillable binlog gap was detected; capture must be re-baselined to resume") }));
-    lost.append(el("div", { text: "Detected: " + stream.gap_lost.at }));
-    v.append(lost);
-  } else if (stream && stream.continuity && stream.continuity.status === "ok") {
-    const ok = el("div", { class: "ok-box" });
-    ok.append(el("b", { text: "✓ No gaps in captured stream" }));
-    ok.append(el("div", { text: "captured events are contiguous — does not assert the stream is live or caught up" }));
-    v.append(ok);
-  }
+  // Stream-continuity surface (see continuityBox) — appended above the cards so a
+  // permanent-loss alarm, or the affirmative all-clear, is the first thing read.
+  const continuity = continuityBox(stream, pg);
+  if (continuity) v.append(continuity);
   v.append(cards);
   viewEnter();
 }
@@ -1398,6 +1378,39 @@ function statusCard(title, rows) {
       el("span", { class: "kv-v" + (big ? " big" : ""), text: val === null || val === undefined ? "—" : String(val) })));
   });
   return card;
+}
+
+// continuityBox renders the stream-continuity surface, or null when there is
+// nothing to assert. The red error-box is the durable permanent-loss record: an
+// unfillable binlog gap (MySQL) or an invalidated/lost replication slot
+// (PostgreSQL, #532); the index is valid only up to that point and capture must
+// be re-baselined to resume. It keys on gap_lost, emitted independently of
+// continuity — so a legacy backend that omits continuity still shows it on a lost
+// stream. The green ok-box is the affirmative counterpart and keys on
+// continuity.status === "ok" (newer backends only); the two are mutually
+// exclusive (gap_lost takes precedence). The green box asserts only
+// gap-CONTIGUITY of the captured range — NOT that the stream is live or caught
+// up; "unknown" (legacy index) and a missing continuity field return null
+// (neither box). Pure and fixture-drivable, mirroring pgHealthCard — the
+// console-e2e harness pins the ok/gap_lost/neither states.
+function continuityBox(stream, pg) {
+  if (!stream) return null;
+  if (stream.gap_lost) {
+    const lost = el("div", { class: "error-box" });
+    lost.append(el("b", { text: "⚠ Events permanently lost" }));
+    lost.append(el("div", { text: stream.gap_lost.detail ||
+      (pg ? "the replication slot was invalidated; capture must be re-baselined to resume"
+          : "an unfillable binlog gap was detected; capture must be re-baselined to resume") }));
+    lost.append(el("div", { text: "Detected: " + stream.gap_lost.at }));
+    return lost;
+  }
+  if (stream.continuity && stream.continuity.status === "ok") {
+    const ok = el("div", { class: "ok-box" });
+    ok.append(el("b", { text: "✓ No gaps in captured stream" }));
+    ok.append(el("div", { text: "captured events are contiguous — does not assert the stream is live or caught up" }));
+    return ok;
+  }
+  return null;
 }
 
 // PG_HEALTH_STALE_SEC: a source_health snapshot older than this reads as STALE. The
