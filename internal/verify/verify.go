@@ -44,7 +44,7 @@ type TableResult struct {
 	ReconstructDigest string
 	SourceRows        int64
 	ReconstructRows   int64
-	GTID              string // source snapshot GTID the comparison is anchored to
+	Anchor            string // the point the comparison is anchored to: a GTID set (live-source path) or a binlog coordinate file:pos (baseline-pair path)
 	Detail            string // reason for inconclusive/mismatch, or a note carried on a match (e.g. coverage-unverified)
 }
 
@@ -100,7 +100,7 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	}
 	res.SourceDigest = src.Digest
 	res.SourceRows = src.RowCount
-	res.GTID = src.GTIDSet
+	res.Anchor = src.GTIDSet
 	asOf := time.Now().UTC()
 
 	// 2. Require the index to have indexed every event the source snapshot

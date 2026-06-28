@@ -167,4 +167,104 @@ func TestVerifyBaselinePair_MatchAndMismatch(t *testing.T) {
 	if got2.Status != StatusMismatch {
 		t.Errorf("after tampering status = %q (%s); want mismatch", got2.Status, got2.Detail)
 	}
+
+	// A zero anchor position must refuse (inconclusive), not bound at position 0.
+	badAnchor := pairs[0]
+	badAnchor.NewAnchor.Pos = 0
+	gotZero, err := VerifyBaselinePair(ctx, cfg, badAnchor)
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair (zero anchor): %v", err)
+	}
+	if gotZero.Status != StatusInconclusive {
+		t.Errorf("zero anchor: status = %q (%s); want inconclusive", gotZero.Status, gotZero.Detail)
+	}
+}
+
+// TestFindBaselinePair_UnpairedAndSelection locks two things: a table present
+// only in the new snapshot lands in `unpaired` (not silently dropped), and the
+// pair is built from the two most recent snapshots, ignoring an older third.
+func TestFindBaselinePair_UnpairedAndSelection(t *testing.T) {
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	createSQL := "CREATE TABLE `t` (\n  `id` INT NOT NULL,\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")}}
+	rows := [][]string{{"1"}}
+	oldTS := now.Truncate(time.Hour).Add(-3 * time.Hour)
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := now.Truncate(time.Hour).Add(-1 * time.Hour)
+
+	writeTestBaseline(t, baseDir, oldTS, "db", "orders", createSQL, cols, rows, "binlog.000001", 100) // ignored (older)
+	writeTestBaseline(t, baseDir, prevTS, "db", "orders", createSQL, cols, rows, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, "db", "orders", createSQL, cols, rows, "binlog.000001", 300)
+	writeTestBaseline(t, baseDir, newTS, "db", "fresh", createSQL, cols, rows, "binlog.000001", 300) // new-only
+
+	pairs, unpaired, err := FindBaselinePair(context.Background(), baseDir)
+	if err != nil {
+		t.Fatalf("FindBaselinePair: %v", err)
+	}
+	if len(pairs) != 1 || pairs[0].Table != "orders" {
+		t.Fatalf("expected one pair for orders (newest two snapshots), got %+v", pairs)
+	}
+	// The pair must use the prev (not the older) snapshot's path.
+	if !pairs[0].PrevSnapshot.Equal(prevTS) {
+		t.Errorf("pair PrevSnapshot = %v, want %v (must ignore the older snapshot)", pairs[0].PrevSnapshot, prevTS)
+	}
+	if len(unpaired) != 1 || unpaired[0].Table != "fresh" {
+		t.Errorf("expected 'fresh' in unpaired (new since prev), got %+v", unpaired)
+	}
+}
+
+// TestVerifyBaselinePair_UnchangedTable covers the most common pass case: the
+// prev baseline is content-identical to the new one and no events fall in the
+// window, so the reconstruction is pure baseline passthrough ⇒ match.
+func TestVerifyBaselinePair_UnchangedTable(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"id", "PRI", "int", "int", 1},
+		{"status", "", "varchar", "varchar(64)", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64),\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "status", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	rows := [][]string{{"1", "a"}, {"2", "b"}}
+	writeTestBaseline(t, baseDir, prevTS, dbName, "orders", createSQL, cols, rows, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, dbName, "orders", createSQL, cols, rows, "binlog.000001", 200)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
+	pairs, _, err := FindBaselinePair(context.Background(), baseDir)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
+	}
+	got, err := VerifyBaselinePair(context.Background(), cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Errorf("unchanged table: status = %q (%s); want match", got.Status, got.Detail)
+	}
 }

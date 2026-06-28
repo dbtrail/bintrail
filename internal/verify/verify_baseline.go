@@ -51,7 +51,7 @@ type BaselinePair struct {
 // there is no snapshot drift, no off-peak requirement, and no production impact.
 func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair) (TableResult, error) {
 	res := TableResult{Schema: p.Schema, Table: p.Table,
-		GTID: fmt.Sprintf("%s:%d", p.NewAnchor.File, p.NewAnchor.Pos)}
+		Anchor: fmt.Sprintf("%s:%d", p.NewAnchor.File, p.NewAnchor.Pos)}
 
 	tm, err := cfg.Resolver.Resolve(p.Schema, p.Table)
 	if err != nil {
@@ -73,6 +73,9 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	// a window that touched no rows as a (false) match — refuse instead.
 	if p.NewAnchor.File == "" || p.NewAnchor.Pos == 0 {
 		return inconclusive(res, "new baseline has no usable binlog anchor (missing or zero position); cannot bound the reconstruction"), nil
+	}
+	if !p.PrevSnapshot.Before(p.NewSnapshot) {
+		return inconclusive(res, "baseline pair is not in prev→new order (prev snapshot is not before new)"), nil
 	}
 
 	// Hash exactly the columns the baseline Parquet holds. mydumper excludes true
@@ -100,9 +103,16 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	}
 
 	// Latest event per PK in (prev snapshot, new anchor]. Lower bound by the
-	// previous snapshot time (the baseline supersedes older events); upper bound
-	// by the exact binlog anchor (#641) so the reconstruction lands precisely on
-	// the new baseline's point.
+	// previous snapshot's wall-clock TIME (the baseline supersedes older events);
+	// upper bound by the exact binlog anchor (#641) so the reconstruction lands
+	// precisely on the new baseline's point.
+	//
+	// The lower bound is the prev snapshot's directory timestamp, NOT its exact
+	// binlog anchor (a position lower bound is a follow-up). So a reported
+	// MISMATCH could in principle be a lower-bound artifact — a change committed
+	// between the prev baseline's true anchor and its directory timestamp. A
+	// reported MATCH is unaffected (a too-wide lower bound can only add a
+	// superseded older event, never drop a real one).
 	engine := query.New(cfg.IndexDB)
 	rows, _, err := query.FetchMerged(ctx, cfg.IndexDB, engine, query.FetchMergedOptions{
 		Opts: query.Options{
@@ -185,12 +195,12 @@ func deferredReprChanged(cols []metadata.ColumnMeta, changes map[string]*query.R
 // FindBaselinePair builds the verifiable table pairs from the two most recent
 // baseline snapshots under source: for every table present in both, the prev +
 // new Parquet paths, the prev snapshot time, and the new baseline's binlog
-// anchor (read from its Parquet metadata). It also returns the "schema.table" of
-// tables in the new snapshot that have NO predecessor image (new since the prev
-// snapshot) so the caller can report them rather than silently dropping them — an
+// anchor (read from its Parquet metadata). It also returns the tables in the new
+// snapshot that have NO predecessor image (new since the prev snapshot) so the
+// caller can report them rather than silently dropping them — an
 // operator must be able to tell "verified" from "not present to verify". Returns
 // nil, nil, nil (nothing to verify) when fewer than two snapshots exist.
-func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair, unpaired []string, err error) {
+func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair, unpaired []query.SchemaTable, err error) {
 	files, err := reconstruct.ListBaselines(ctx, source)
 	if err != nil {
 		return nil, nil, err
@@ -226,7 +236,8 @@ func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair,
 	for key, nf := range newByTable {
 		pf, ok := prevByTable[key]
 		if !ok {
-			unpaired = append(unpaired, key) // new since the previous snapshot: no predecessor image
+			// New since the previous snapshot: no predecessor image to compare.
+			unpaired = append(unpaired, query.SchemaTable{Schema: nf.Schema, Table: nf.Table})
 			continue
 		}
 		meta, err := baseline.ReadParquetMetadataAny(ctx, nf.Path)
@@ -243,6 +254,11 @@ func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair,
 			NewAnchor:    query.BinlogPos{File: meta.BinlogFile, Pos: uint64(meta.BinlogPos)},
 		})
 	}
-	sort.Strings(unpaired)
+	sort.Slice(unpaired, func(i, j int) bool {
+		if unpaired[i].Schema != unpaired[j].Schema {
+			return unpaired[i].Schema < unpaired[j].Schema
+		}
+		return unpaired[i].Table < unpaired[j].Table
+	})
 	return pairs, unpaired, nil
 }
