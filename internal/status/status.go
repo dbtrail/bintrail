@@ -92,6 +92,12 @@ type StreamStateInfo struct {
 	// human-readable context and may be absent. Both writers set them atomically.
 	GapLostAt     sql.NullTime
 	GapLostDetail sql.NullString
+	// GapColumnsPresent is true when the gap_lost_* columns existed and were read
+	// (the normal, migrated index). It is false only on a legacy index whose
+	// schema predates those columns, read before any migration — there the gap
+	// state was never evaluable, so the continuity verdict is "unknown" (not a
+	// false "ok" asserted from absent data), and --fail-on-gap fails closed.
+	GapColumnsPresent bool
 	// SourceHealth is the latest source-side health snapshot a streaming daemon polled
 	// (#599) — for PostgreSQL, a JSON document with the replication slot's wal_status/lag
 	// and REPLICA IDENTITY coverage plus an embedded checked_at. Opaque here (raw JSON);
@@ -360,6 +366,7 @@ func loadStreamStateCore(ctx context.Context, db *sql.DB) (*StreamStateInfo, err
 		}
 		return nil, err
 	}
+	s.GapColumnsPresent = true // the gap_lost_* columns were read — gap state is evaluable
 	return &s, nil
 }
 
@@ -556,14 +563,21 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		fmt.Fprintf(w, "  Last checkpoint: %s\n", stream.LastCheckpoint.Format(TSFmt))
 		fmt.Fprintf(w, "  Server ID:       %d\n", stream.ServerID)
 		// Always-present continuity verdict — the cheap "did I lose any events?"
-		// answer the gap detector already computes. Affirmative on the happy path
-		// (no gap stamped) so an operator can read "contiguous" at a glance, not
-		// only infer it from the absence of the loud banner below. The cursor it is
-		// contiguous up to is the Position / GTID set printed above.
-		if stream.GapLostAt.Valid {
+		// answer the gap detector already computes, surfaced so an operator reads
+		// it at a glance instead of inferring it from the absence of the loud
+		// banner below. It is strictly about gap-CONTIGUITY of the captured range
+		// (the cursor is the Position / GTID set above, when one is printed); it is
+		// deliberately NOT a liveness/lag check — a contiguous stream may still be
+		// stopped or behind. "not evaluated" guards a legacy index that never had
+		// the gap_lost_* columns, so a clean verdict is never asserted from
+		// un-evaluated data.
+		switch {
+		case stream.GapLostAt.Valid:
 			fmt.Fprintf(w, "  Continuity:      ⚠ GAP LOST at %s\n", stream.GapLostAt.Time.Format(TSFmt))
-		} else {
-			fmt.Fprintln(w, "  Continuity:      OK — no gaps detected")
+		case !stream.GapColumnsPresent:
+			fmt.Fprintln(w, "  Continuity:      not evaluated (legacy index — migrate the schema to enable gap detection)")
+		default:
+			fmt.Fprintln(w, "  Continuity:      no gaps in the captured range (not a liveness check)")
 		}
 		fmt.Fprintln(w)
 
@@ -824,10 +838,13 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		Detail string `json:"detail,omitempty"`
 	}
 	// jsonContinuity is the always-present, machine-readable continuity verdict —
-	// the affirmative counterpart to gap_lost. status is "ok" (the stream is
-	// contiguous, no events lost) or "gap_lost" (an unfillable gap was stamped;
-	// see the gap_lost object for at/detail). A CI/cron check or the console green
-	// badge keys on this; gap_lost stays for the loud red detail.
+	// the affirmative counterpart to gap_lost. status is one of:
+	//   "ok"       — no gap in the captured range (NOT a liveness/lag assertion;
+	//                a contiguous stream may still be stopped or behind)
+	//   "gap_lost" — an unfillable gap was stamped (see the gap_lost object)
+	//   "unknown"  — a legacy index without the gap_lost_* columns; the gap state
+	//                was never evaluable, so "ok" is not asserted from absent data
+	// The console green badge keys on "ok"; gap_lost stays for the loud red detail.
 	type jsonContinuity struct {
 		Status string `json:"status"`
 	}
@@ -939,10 +956,13 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 			s := stream.LastEventTime.Time.Format(TSFmt)
 			jstr.LastEventTime = &s
 		}
-		if stream.GapLostAt.Valid {
+		switch {
+		case stream.GapLostAt.Valid:
 			jstr.Continuity.Status = "gap_lost"
 			jstr.GapLost = &jsonGapLost{At: stream.GapLostAt.Time.Format(TSFmt), Detail: stream.GapLostDetail.String}
-		} else {
+		case !stream.GapColumnsPresent:
+			jstr.Continuity.Status = "unknown"
+		default:
 			jstr.Continuity.Status = "ok"
 		}
 		if stream.SourceHealth.Valid && stream.SourceHealth.String != "" {

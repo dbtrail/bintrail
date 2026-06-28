@@ -25,9 +25,11 @@ var statusCmd = &cobra.Command{
   - Summary        : aggregate file and event counts
 
 The Stream section also reports continuity — the cheap "did I lose any events?"
-verdict: "OK — no gaps detected", or a loud "GAP LOST" when an unfillable gap
-forced an auto-advance with permanent loss. Pass --fail-on-gap to turn that loss
-into a non-zero exit for CI/cron alerting (the default always exits 0).
+verdict: "no gaps in the captured range" (a contiguity check, not a liveness
+one), or a loud "GAP LOST" when an unfillable gap forced an auto-advance with
+permanent loss. Pass --fail-on-gap to exit non-zero on that loss — or when
+continuity can't be confirmed (fails closed) — for CI/cron alerting; by default
+a gap never changes the exit code.
 
 Partition row counts are estimates read from information_schema (no table scan).
 
@@ -47,7 +49,7 @@ func init() {
 	statusCmd.Flags().StringVar(&stIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	statusCmd.Flags().StringVar(&stFormat, "format", "text", "Output format: text or json")
 	statusCmd.Flags().StringVar(&stBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots (optional, shows baseline binlog positions)")
-	statusCmd.Flags().BoolVar(&stFailOnGap, "fail-on-gap", false, "Exit non-zero if the stream permanently lost data (an unfillable gap); for CI/cron alerting. Default: always exit 0")
+	statusCmd.Flags().BoolVar(&stFailOnGap, "fail-on-gap", false, "Exit non-zero if the stream lost data, or its continuity can't be confirmed (fails closed); for CI/cron alerting. By default a gap never changes the exit code")
 	_ = statusCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(statusCmd)
 	// Registration on a root command happens via AddReadCommands(root), which
@@ -121,14 +123,24 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		data.Write(os.Stdout)
 	}
 
-	// Opt-in alertable exit: --fail-on-gap turns a stamped, unrecovered gap into a
+	// Opt-in alertable exit: --fail-on-gap turns a non-OK continuity verdict into a
 	// non-zero exit for CI/cron — AFTER the report is written so the operator still
-	// sees the full status. Off by default, so status keeps exiting 0 as before
-	// (break-nothing for existing scripts).
-	if stFailOnGap && data.Stream != nil && data.Stream.GapLostAt.Valid {
+	// sees the full status. It FAILS CLOSED: a stamped gap, OR an inability to
+	// confirm the gap state (no stream row / a swallowed load error → nil stream,
+	// or a legacy index missing the gap columns) all alert — the flag exists to
+	// catch trouble, so "couldn't check" must not read as "fine". Off by default,
+	// so status keeps exiting 0 as before (break-nothing for existing scripts).
+	if stFailOnGap {
 		cmd.SilenceUsage = true
-		return fmt.Errorf("stream continuity: events permanently lost (gap detected at %s); index is valid only up to the gap, resume requires re-baseline",
-			data.Stream.GapLostAt.Time.Format(status.TSFmt))
+		switch {
+		case data.Stream == nil:
+			return fmt.Errorf("stream continuity: could not confirm gap state (no stream state loaded); failing closed under --fail-on-gap")
+		case !data.Stream.GapColumnsPresent:
+			return fmt.Errorf("stream continuity: could not confirm gap state (legacy index missing gap-detection columns; migrate the schema); failing closed under --fail-on-gap")
+		case data.Stream.GapLostAt.Valid:
+			return fmt.Errorf("stream continuity: events permanently lost (gap detected at %s); index is valid only up to the gap, resume requires re-baseline",
+				data.Stream.GapLostAt.Time.Format(status.TSFmt))
+		}
 	}
 	return nil
 }
