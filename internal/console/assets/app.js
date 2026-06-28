@@ -1362,10 +1362,14 @@ async function renderStatus() {
   // (slot wal_status/lag + REPLICA IDENTITY coverage) and persists a snapshot to the
   // index; this renders it. Gated on source==postgresql AND a snapshot existing.
   if (pg && stream && stream.source_health) cards.append(pgHealthCard(stream.source_health));
-  // Durable permanent-loss record (status JSON stream.gap_lost): an unfillable
-  // binlog gap (MySQL) or an invalidated/lost replication slot (PostgreSQL, #532).
-  // The index is valid only up to this point; capture must be re-baselined to
-  // resume. Surfaced loudly above the cards — flavor-agnostic, PG-worded note.
+  // Stream continuity (status JSON stream.continuity / stream.gap_lost) — the
+  // cheap "did I lose any events?" verdict. The loud red box is the durable
+  // permanent-loss record: an unfillable binlog gap (MySQL) or an invalidated/
+  // lost replication slot (PostgreSQL, #532); the index is valid only up to that
+  // point and capture must be re-baselined to resume. Its affirmative
+  // counterpart is the green "no data lost" box on the contiguous happy path.
+  // Both flavor-agnostic; gated on the always-present continuity.status when the
+  // backend emits it (a legacy backend without it simply shows neither).
   if (stream && stream.gap_lost) {
     const lost = el("div", { class: "error-box" });
     lost.append(el("b", { text: "⚠ Events permanently lost" }));
@@ -1374,6 +1378,11 @@ async function renderStatus() {
           : "an unfillable binlog gap was detected; capture must be re-baselined to resume") }));
     lost.append(el("div", { text: "Detected: " + stream.gap_lost.at }));
     v.append(lost);
+  } else if (stream && stream.continuity && stream.continuity.status === "ok") {
+    const ok = el("div", { class: "ok-box" });
+    ok.append(el("b", { text: "✓ No data lost" }));
+    ok.append(el("div", { text: "stream contiguous — no gaps detected" }));
+    v.append(ok);
   }
   v.append(cards);
   viewEnter();

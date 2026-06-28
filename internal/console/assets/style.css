@@ -1157,6 +1157,14 @@ button { font-family: inherit; }
   border-radius: var(--radius-sm); padding: 12px 14px; margin: 8px 0;
   white-space: pre-wrap;
 }
+/* affirmative counterpart to .error-box — the green "no data lost" continuity
+   confirmation, mapped onto the positive (insert) green of the palette. */
+.ok-box {
+  font-family: var(--f-mono); font-size: 12.5px; color: var(--insert);
+  background: var(--insert-bg); border: 1px solid var(--insert);
+  border-radius: var(--radius-sm); padding: 12px 14px; margin: 8px 0;
+  white-space: pre-wrap;
+}
 .warnings:empty { display: none; }
 .warn-item {
   display: flex; gap: 8px; align-items: flex-start;

@@ -24,6 +24,11 @@ var statusCmd = &cobra.Command{
   - Partitions     : all time-range partitions with estimated row counts
   - Summary        : aggregate file and event counts
 
+The Stream section also reports continuity — the cheap "did I lose any events?"
+verdict: "OK — no gaps detected", or a loud "GAP LOST" when an unfillable gap
+forced an auto-advance with permanent loss. Pass --fail-on-gap to turn that loss
+into a non-zero exit for CI/cron alerting (the default always exits 0).
+
 Partition row counts are estimates read from information_schema (no table scan).
 
 Example:
@@ -35,12 +40,14 @@ var (
 	stIndexDSN    string
 	stFormat      string
 	stBaselineDir string
+	stFailOnGap   bool
 )
 
 func init() {
 	statusCmd.Flags().StringVar(&stIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	statusCmd.Flags().StringVar(&stFormat, "format", "text", "Output format: text or json")
 	statusCmd.Flags().StringVar(&stBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots (optional, shows baseline binlog positions)")
+	statusCmd.Flags().BoolVar(&stFailOnGap, "fail-on-gap", false, "Exit non-zero if the stream permanently lost data (an unfillable gap); for CI/cron alerting. Default: always exit 0")
 	_ = statusCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(statusCmd)
 	// Registration on a root command happens via AddReadCommands(root), which
@@ -107,8 +114,21 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	slog.Info("status complete", "duration_ms", time.Since(start).Milliseconds())
 
 	if stFormat == "json" {
-		return data.WriteJSON(os.Stdout)
+		if err := data.WriteJSON(os.Stdout); err != nil {
+			return err
+		}
+	} else {
+		data.Write(os.Stdout)
 	}
-	data.Write(os.Stdout)
+
+	// Opt-in alertable exit: --fail-on-gap turns a stamped, unrecovered gap into a
+	// non-zero exit for CI/cron — AFTER the report is written so the operator still
+	// sees the full status. Off by default, so status keeps exiting 0 as before
+	// (break-nothing for existing scripts).
+	if stFailOnGap && data.Stream != nil && data.Stream.GapLostAt.Valid {
+		cmd.SilenceUsage = true
+		return fmt.Errorf("stream continuity: events permanently lost (gap detected at %s); index is valid only up to the gap, resume requires re-baseline",
+			data.Stream.GapLostAt.Time.Format(status.TSFmt))
+	}
 	return nil
 }

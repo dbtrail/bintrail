@@ -555,6 +555,16 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		}
 		fmt.Fprintf(w, "  Last checkpoint: %s\n", stream.LastCheckpoint.Format(TSFmt))
 		fmt.Fprintf(w, "  Server ID:       %d\n", stream.ServerID)
+		// Always-present continuity verdict — the cheap "did I lose any events?"
+		// answer the gap detector already computes. Affirmative on the happy path
+		// (no gap stamped) so an operator can read "contiguous" at a glance, not
+		// only infer it from the absence of the loud banner below. The cursor it is
+		// contiguous up to is the Position / GTID set printed above.
+		if stream.GapLostAt.Valid {
+			fmt.Fprintf(w, "  Continuity:      ⚠ GAP LOST at %s\n", stream.GapLostAt.Time.Format(TSFmt))
+		} else {
+			fmt.Fprintln(w, "  Continuity:      OK — no gaps detected")
+		}
 		fmt.Fprintln(w)
 
 		// Loud, unmissable banner when the stream permanently lost data (an unfillable
@@ -813,17 +823,26 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		At     string `json:"at"`
 		Detail string `json:"detail,omitempty"`
 	}
+	// jsonContinuity is the always-present, machine-readable continuity verdict —
+	// the affirmative counterpart to gap_lost. status is "ok" (the stream is
+	// contiguous, no events lost) or "gap_lost" (an unfillable gap was stamped;
+	// see the gap_lost object for at/detail). A CI/cron check or the console green
+	// badge keys on this; gap_lost stays for the loud red detail.
+	type jsonContinuity struct {
+		Status string `json:"status"`
+	}
 	type jsonStream struct {
-		BintrailID     *string      `json:"bintrail_id"`
-		Mode           string       `json:"mode"`
-		BinlogFile     string       `json:"binlog_file,omitempty"`
-		BinlogPosition uint64       `json:"binlog_position,omitempty"`
-		GTIDSet        *string      `json:"gtid_set,omitempty"`
-		EventsIndexed  int64        `json:"events_indexed"`
-		LastEventTime  *string      `json:"last_event_time"`
-		LastCheckpoint string       `json:"last_checkpoint"`
-		ServerID       uint32       `json:"server_id"`
-		GapLost        *jsonGapLost `json:"gap_lost,omitempty"`
+		BintrailID     *string        `json:"bintrail_id"`
+		Mode           string         `json:"mode"`
+		BinlogFile     string         `json:"binlog_file,omitempty"`
+		BinlogPosition uint64         `json:"binlog_position,omitempty"`
+		GTIDSet        *string        `json:"gtid_set,omitempty"`
+		EventsIndexed  int64          `json:"events_indexed"`
+		LastEventTime  *string        `json:"last_event_time"`
+		LastCheckpoint string         `json:"last_checkpoint"`
+		ServerID       uint32         `json:"server_id"`
+		Continuity     jsonContinuity `json:"continuity"`
+		GapLost        *jsonGapLost   `json:"gap_lost,omitempty"`
 		// SourceHealth is the raw source_health JSON passed through verbatim (#599):
 		// the console knows its shape (slot wal_status/lag, replica_identity_not_full,
 		// checked_at), this layer does not. Omitted when no daemon has polled.
@@ -921,7 +940,10 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 			jstr.LastEventTime = &s
 		}
 		if stream.GapLostAt.Valid {
+			jstr.Continuity.Status = "gap_lost"
 			jstr.GapLost = &jsonGapLost{At: stream.GapLostAt.Time.Format(TSFmt), Detail: stream.GapLostDetail.String}
+		} else {
+			jstr.Continuity.Status = "ok"
 		}
 		if stream.SourceHealth.Valid && stream.SourceHealth.String != "" {
 			jstr.SourceHealth = json.RawMessage(stream.SourceHealth.String)

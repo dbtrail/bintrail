@@ -130,3 +130,18 @@ func TestRunStatus_invalidFormat(t *testing.T) {
 		t.Errorf("expected 'invalid --format' in error, got: %v", err)
 	}
 }
+
+// ─── --fail-on-gap wiring (#645) ──────────────────────────────────────────────
+
+// TestStatusCmd_failOnGap_default pins the opt-in, break-nothing contract: the
+// flag exists and defaults to false, so status keeps exiting 0 unless asked to
+// alert. (The end-to-end exit-code behavior is covered by the integration test.)
+func TestStatusCmd_failOnGap_default(t *testing.T) {
+	f := statusCmd.Flag("fail-on-gap")
+	if f == nil {
+		t.Fatal("flag --fail-on-gap not registered on statusCmd")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("expected --fail-on-gap to default to false (break-nothing), got %q", f.DefValue)
+	}
+}

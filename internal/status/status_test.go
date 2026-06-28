@@ -1194,6 +1194,69 @@ func TestWriteStatusJSON_gapLost(t *testing.T) {
 	}
 }
 
+// ─── continuity verdict (#645) ──────────────────────────────────────────────────
+
+// TestWriteStatus_continuityLine pins the always-present continuity verdict in the
+// text Stream section: affirmative "OK — no gaps detected" on the happy path, and
+// a concise "GAP LOST" line when a gap was stamped (the loud banner, tested above,
+// stays for the detail).
+func TestWriteStatus_continuityLine(t *testing.T) {
+	var ok bytes.Buffer
+	WriteStatus(&ok, nil, nil, nil, nil, nil, &StreamStateInfo{Mode: "gtid", ServerID: 7, LastCheckpoint: time.Now()})
+	okOut := ok.String()
+	if !strings.Contains(okOut, "Continuity:") || !strings.Contains(okOut, "OK — no gaps detected") {
+		t.Errorf("healthy stream must show an affirmative continuity line:\n%s", okOut)
+	}
+	if strings.Contains(okOut, "GAP LOST") {
+		t.Errorf("healthy stream must not mention GAP LOST:\n%s", okOut)
+	}
+
+	var gap bytes.Buffer
+	WriteStatus(&gap, nil, nil, nil, nil, nil, gapLostStream())
+	gapOut := gap.String()
+	if !strings.Contains(gapOut, "Continuity:") || !strings.Contains(gapOut, "GAP LOST") {
+		t.Errorf("a gap-lost stream must show a GAP LOST continuity line:\n%s", gapOut)
+	}
+	if strings.Contains(gapOut, "OK — no gaps detected") {
+		t.Errorf("a gap-lost stream must not claim OK:\n%s", gapOut)
+	}
+}
+
+// TestWriteStatusJSON_continuity pins the always-present machine-readable verdict:
+// continuity.status is "ok" on the happy path and "gap_lost" when a gap was
+// stamped. Unlike gap_lost (omitempty), continuity is present in BOTH cases so a
+// CI/cron consumer or the console green badge can assert "ok" rather than infer it
+// from an absence.
+func TestWriteStatusJSON_continuity(t *testing.T) {
+	type parsed struct {
+		Stream struct {
+			Continuity struct {
+				Status string `json:"status"`
+			} `json:"continuity"`
+		} `json:"stream"`
+	}
+	for _, tc := range []struct {
+		name   string
+		stream *StreamStateInfo
+		want   string
+	}{
+		{"healthy", &StreamStateInfo{Mode: "gtid", LastCheckpoint: time.Now()}, "ok"},
+		{"gap", gapLostStream(), "gap_lost"},
+	} {
+		var buf bytes.Buffer
+		if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil, tc.stream); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		var got parsed
+		if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+			t.Fatalf("%s: invalid JSON: %v\n%s", tc.name, err, buf.String())
+		}
+		if got.Stream.Continuity.Status != tc.want {
+			t.Errorf("%s: continuity.status = %q, want %q\n%s", tc.name, got.Stream.Continuity.Status, tc.want, buf.String())
+		}
+	}
+}
+
 // TestWriteStatusJSON_sourceHealth pins the daemon→console emission seam (#599): the
 // raw source_health JSON must reach the API response verbatim as a nested object, and be
 // omitted when no daemon has polled. Pure unit (no MySQL) — this branch is the only thing
