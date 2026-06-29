@@ -471,6 +471,42 @@ See [Query & Recovery](query-and-recovery.md) for the full flag reference and th
 
 ---
 
+### Scenario N: Prove a recovery would actually work — before you need it
+
+You don't want to discover a broken recovery chain *during* an incident. `bintrail
+verify` reconstructs your data from the baseline + indexed binlog and checks it
+reproduces the source — per table, `match` / `mismatch` / `inconclusive`.
+
+**Run the drift-free check** (no live source, no production impact — safe on a
+schedule). It compares the two most recent baselines, reconstructing the older
+one forward to the newer one's binlog anchor:
+
+```sh
+bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines
+```
+
+It exits non-zero on any mismatch (or if comparable tables existed but none could
+be proven), so you can wire it into cron or CI as a recovery-readiness gate.
+
+**On a mismatch, drill down** to the exact diverging rows and columns:
+
+```sh
+bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines --explain
+```
+
+**Check the other half — the capture stream itself** — with the continuity
+signal, which flags any unfillable gap as permanently lost:
+
+```sh
+bintrail status --index-dsn "$IDX" --fail-on-gap
+```
+
+See [Verify recoveries](verify.md) for both modes and the exit-code semantics,
+and [Rotation & Status](rotation-and-status.md#stream-continuity-no-data-lost)
+for the continuity signal.
+
+---
+
 ## 4. Keeping dbtrail Running (Day-to-Day)
 
 **Re-indexing new binlog files:** Just run `index --all` again. Files already marked `completed` are skipped automatically — re-running is always safe.

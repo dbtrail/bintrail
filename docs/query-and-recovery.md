@@ -165,6 +165,11 @@ Equivalent env vars: `BINTRAIL_ULTRAFAST=1`, `BINTRAIL_DUCKDB_THREADS`, `BINTRAI
 
 The `recover` command also supports archive auto-discovery and the `--no-archive` flag, using the same merge logic as `query`. When archives are available, events are fetched from both MySQL and Parquet, merged, and then turned into reversal SQL.
 
+> **`recover` vs `reconstruct` vs `verify` — three different jobs.**
+> - **`recover`** (this page) undoes *specific touched rows* from stored before/after images — delta-only. It cannot materialize a whole table.
+> - **`reconstruct`** materializes a *full table or single row as of a point in time* by merging a baseline snapshot with binlog deltas — see [Dump & Baseline](dump-and-baseline.md) and [Time-Travel SQL](time-travel-sql.md).
+> - **`verify`** doesn't recover anything; it *proves* the reconstruct chain reproduces the source so your recoveries are trustworthy before you need them — see [Verify recoveries](verify.md).
+
 ### The Concept
 
 Recovery works because dbtrail stores **full before and after images** for every row event. To undo an operation, you simply reverse it:
