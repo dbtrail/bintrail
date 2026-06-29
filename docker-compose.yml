@@ -303,18 +303,31 @@ services:
   # Runs `bintrail shim` — an in-process MySQL-protocol server that answers the
   # virtual _flashback / _snapshot / _diff schemas against the bundled index.
   # Point a plain `mysql` client at :3308 and read historical row state — NO
-  # ProxySQL required:
+  # ProxySQL required.
   #
+  # SCOPE: this shim serves the boot `SOURCE_DSN` source — the one the `bintrail`
+  # service streams into `bintrail_index`. So it needs SOURCE_DSN set in .env AND
+  # the main stack running: the `bintrail` service creates the index tables and
+  # streams; the shim only reads, it never provisions. Bring it up WITH the full
+  # stack — `up -d`, NOT `up -d shim` (which would skip `bintrail` and leave the
+  # index empty):
+  #
+  #   # in .env: SOURCE_DSN=user:pass@tcp(your-db:3306)/yourdb
   #   SHIM_USER=analyst SHIM_PASSWORD='pick-a-strong-one' \
-  #     docker compose --profile flashback up -d shim
+  #     docker compose --profile flashback up -d
   #   mysql -h 127.0.0.1 -P 3308 -u analyst -p
-  #   mysql> USE myapp;
+  #   mysql> USE yourdb;
   #   mysql> SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 1;
   #
-  # This is a DEDICATED terminal for time-travel SQL: a normal SELECT on this
-  # connection returns ER_NOT_SUPPORTED_YET (1235). Transparently mixing normal
-  # and AS OF queries on one connection is what ProxySQL adds and is out of
-  # scope here — see docs/time-travel-sql.md.
+  # Sources added from the console UI stream into their OWN per-source index DB
+  # (bintrail_idx_<id>), NOT bintrail_index — to time-travel one of those, point
+  # INDEX_DSN at that database. Won't start / returns nothing? Almost always a
+  # missing SHIM_USER/SHIM_PASSWORD or an unset SOURCE_DSN — `docker compose logs
+  # shim` shows the FATAL line (the restart policy can bury it under `ps`).
+  #
+  # This is a DEDICATED terminal: a normal `SELECT * FROM orders` here returns
+  # ER_NOT_SUPPORTED_YET (1235). Transparently mixing normal and AS OF queries on
+  # one connection is what ProxySQL adds and is out of scope — docs/time-travel-sql.md.
   #
   # Opt-in because it needs YOU to choose the login it authenticates against —
   # there is deliberately no default credential on a MySQL port. Uses the CORE
@@ -334,9 +347,9 @@ services:
       # shipping a known credential on a MySQL port would be a footgun.
       SHIM_USER: ${SHIM_USER:-}
       SHIM_PASSWORD: ${SHIM_PASSWORD:-}
-      # Optional: derives the default schema so `_flashback.orders` resolves
-      # without a prior `USE` (parse-only — the shim never connects to it). If
-      # unset (the UI-driven multi-source path), just run `USE <db>` first.
+      # The source streamed into bintrail_index — also derives the default schema
+      # so `_flashback.orders` resolves without a prior `USE` (parse-only — the
+      # shim never connects to it). If unset, run `USE <db>` first in the client.
       SOURCE_DSN: ${SOURCE_DSN:-}
       # Bring your own index (default: the bundled MySQL, DSN built from the
       # generated password in the secret volume).
@@ -358,7 +371,14 @@ services:
         set -e
         if [ -z "$$SHIM_USER" ] || [ -z "$$SHIM_PASSWORD" ]; then
           echo "FATAL: set SHIM_USER and SHIM_PASSWORD to the login your mysql client will use, e.g." >&2
-          echo "  SHIM_USER=analyst SHIM_PASSWORD='...' docker compose --profile flashback up -d shim" >&2
+          echo "  SHIM_USER=analyst SHIM_PASSWORD='...' docker compose --profile flashback up -d" >&2
+          exit 1
+        fi
+        # A newline in a credential would fold in the single-quoted YAML into a
+        # silently-wrong value (auth then fails with no hint) — reject it loud,
+        # the same rejection `bintrail init-shim` makes.
+        if [ "$$(printf '%s' "$$SHIM_USER$$SHIM_PASSWORD" | wc -l)" -ne 0 ]; then
+          echo "FATAL: SHIM_USER / SHIM_PASSWORD must not contain a newline" >&2
           exit 1
         fi
         # Build the bundled-index DSN from the generated password unless the
@@ -385,6 +405,11 @@ services:
     depends_on:
       index-mysql:
         condition: service_healthy
+      # The shim only reads the index; the `bintrail` service is what creates
+      # the tables and streams the boot SOURCE_DSN source into bintrail_index.
+      # Depend on it so `up -d shim` can't start against an unprovisioned index.
+      bintrail:
+        condition: service_started
     restart: unless-stopped
 
   # ── Baselines (one-shot, opt-in `baseline` profile) ──────

@@ -28,8 +28,8 @@ There are two ways to put `AS OF` SQL in front of your data; they differ only in
    Simplest. The shim already speaks the MySQL protocol, so an analyst connects
    a `mysql` client directly to it and runs `_flashback` / `_snapshot` / `_diff`
    queries. Trade-off: that connection answers *only* time-travel queries (a
-   normal `SELECT` returns `ER_NOT_SUPPORTED_YET`, 1235). Use it when a person
-   or tool just needs to read historical state.
+   normal `SELECT` against a real table returns `ER_NOT_SUPPORTED_YET`, 1235).
+   Use it when a person or tool just needs to read historical state.
 2. **Transparent routing — ProxySQL in front (the rest of this guide).** Needed
    only when an application's *normal* connection must mix live queries and
    `AS OF` queries on the same endpoint. ProxySQL routes virtual-schema queries
@@ -38,18 +38,22 @@ There are two ways to put `AS OF` SQL in front of your data; they differ only in
 ### The dedicated terminal
 
 **With the Docker Compose stack**, the shim ships as the opt-in `flashback`
-profile — supply a login and bring it up:
+profile. It serves the boot `SOURCE_DSN` source, so set `SOURCE_DSN` in `.env`
+and bring it up *with* the full stack (`up -d`, not `up -d shim`, so the
+streaming `bintrail` service comes along — see [docker.md](./docker.md)):
 
 ```sh
 SHIM_USER=analyst SHIM_PASSWORD='pick-a-strong-one' \
-  docker compose --profile flashback up -d shim
+  docker compose --profile flashback up -d
 ```
 
 **Standalone** (the shim is a subcommand of the core `bintrail` binary), run it
 against your index — no ProxySQL, and the source MySQL need not even be
-reachable (the shim reads the index):
+reachable (the shim reads the index). `init-shim` reads `BINTRAIL_SOURCE_DSN`
+and `BINTRAIL_SERVER_ID` from the environment (or `.bintrail.env`):
 
 ```sh
+export BINTRAIL_SOURCE_DSN='user:pass@tcp(your-db:3306)/yourdb' BINTRAIL_SERVER_ID=prod-1
 bintrail init-shim --out shim.yaml          # then fill in mysql_user + mysql_password
 bintrail shim --shim-config shim.yaml \
   --index-dsn 'user:pass@tcp(127.0.0.1:3306)/bintrail_index'

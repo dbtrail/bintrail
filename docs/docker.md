@@ -299,15 +299,19 @@ console image deliberately omits it).
 **The `flashback` profile — a dedicated time-travel terminal (no ProxySQL).**
 The compose file ships an opt-in `shim` service: point a plain `mysql` client at
 it and read historical row state. It uses the core image against the bundled
-index, so the only thing you supply is the login the terminal authenticates
-with:
+index. It serves the **boot `SOURCE_DSN` source** — the one the `bintrail`
+service streams into `bintrail_index` — so it needs `SOURCE_DSN` set in `.env`
+**and** the main stack running (the `bintrail` service creates the index tables
+and streams; the shim only reads — it never provisions). Bring it up *with* the
+full stack — note `up -d`, not `up -d shim`, so `bintrail` comes along:
 
 ```sh
+# in .env: SOURCE_DSN=user:pass@tcp(your-db:3306)/yourdb
 SHIM_USER=analyst SHIM_PASSWORD='pick-a-strong-one' \
-  docker compose --profile flashback up -d shim
+  docker compose --profile flashback up -d
 
 mysql -h 127.0.0.1 -P 3308 -u analyst -p
-mysql> USE myapp;
+mysql> USE yourdb;
 mysql> SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
 mysql> SELECT * FROM _snapshot.orders  AS OF '2026-05-02 10:00:00';   -- full table (needs a baseline)
 mysql> SELECT * FROM _diff.orders BETWEEN '2026-05-01' AND '2026-05-02' WHERE id = 12345;
@@ -315,20 +319,30 @@ mysql> SELECT * FROM _diff.orders BETWEEN '2026-05-01' AND '2026-05-02' WHERE id
 
 This is a **dedicated** terminal for time-travel: a normal `SELECT * FROM orders`
 on this connection returns `ER_NOT_SUPPORTED_YET` (1235). The shim reads the
-index only (it never touches your source) and binds to host loopback. Notes:
+index only (it never touches your source). The shim process binds `0.0.0.0`
+inside the container — and logs a non-loopback warning, which is expected — while
+the `127.0.0.1:3308:3308` port mapping restricts host exposure to loopback. Notes:
 
 - **`_snapshot.*` (the full table as it was) needs a baseline.** Run the
   `baseline` profile (above), add `BASELINE_DIR=/var/lib/bintrail/baselines` to
-  `.env`, and recreate the shim (`docker compose --profile flashback up -d
-  shim`). Without it, `_flashback.*` returns only rows with binlog activity in
-  the retained window (a *partial* table), and full-table `_snapshot` degrades
-  to that behaviour.
-- **`SOURCE_DSN`** (if set) just supplies the default schema so `_flashback.orders`
-  resolves without a prior `USE`. On the UI-driven multi-source path it is unset
-  — run `USE <db>` first.
+  `.env`, and re-run `docker compose --profile flashback up -d`. Without it,
+  `_flashback.*` returns only rows with binlog activity in the retained window
+  (a *partial* table), and full-table `_snapshot` degrades to that behaviour.
+- **Sources added from the console UI are not served by this shim.** They stream
+  into their own per-source index database (`bintrail_idx_<id>`), not
+  `bintrail_index`. To time-travel one of those, point `INDEX_DSN` at that
+  database (one shim per source — see [time-travel-sql.md](./time-travel-sql.md)
+  "Single source MySQL per shim").
+- **Use a throwaway credential.** `SHIM_PASSWORD` is passed via the environment
+  (visible to `docker inspect`, like `AWS_SECRET_ACCESS_KEY` here) and written to
+  `/tmp/shim.yaml` in the container — make it a dedicated analyst login, not a
+  reused production password.
 - **MySQL 8.4 / driver clients**: the default auth plugin
   (`mysql_native_password`) works for the `mysql` CLI; set
   `SHIM_AUTH_METHOD=caching_sha2_password` for a driver that requires it.
+- **Bring-your-own index**: like the `bintrail` service, the `shim` service
+  mounts `bintrail-index-secret` and depends on `index-mysql` — adjust both if
+  you set `INDEX_DSN` and remove the bundled index.
 
 **Transparent routing (ProxySQL).** To let an application's *normal* connection
 mix live queries and `AS OF` queries on the same endpoint, put ProxySQL in front
