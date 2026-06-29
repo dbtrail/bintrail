@@ -137,6 +137,7 @@ When binlogs have been purged and the gap cannot be filled:
    ```
 2. The checkpoint is **immediately updated** to the new (advanced) position. This prevents a crash loop if the stream fails during startup — the next restart will not hit the same purged-binlog error.
 3. The stream resumes from the earliest available position.
+4. **The loss is recorded durably** — it is not just a log line that scrolls away. The gap is stamped in `stream_state` (`gap_lost_at` / `gap_lost_detail`), so `bintrail status` reports `Continuity: ⚠ GAP LOST` and a loud `=== ⚠ EVENTS PERMANENTLY LOST ===` banner from then on (and `continuity.status: "gap_lost"` under `--format json`), even after the capture process has exited. The index up to the gap stays valid for recovery; resuming capture cleanly requires a re-baseline. To alert on this in CI/cron, run `bintrail status --fail-on-gap` (exits non-zero, fails closed). See [Rotation & Status](rotation-and-status.md#stream-continuity-no-data-lost).
 
 ### The `--no-gap-fill` flag
 
