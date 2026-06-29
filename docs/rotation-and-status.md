@@ -256,7 +256,7 @@ bintrail status --index-dsn "..."
 It accepts `--format text` (default) or `--format json`, plus `--baseline-dir`
 (to list baseline snapshots) and `--fail-on-gap` (see continuity below).
 
-The status command produces a multi-section report, implemented in `internal/status/status.go`. The sections, in order:
+The status command produces a multi-section report. The sections, in order:
 
 | Section | Shown when | Contents |
 |---|---|---|
@@ -265,9 +265,9 @@ The status command produces a multi-section report, implemented in `internal/sta
 | **Indexed Files** | always | Every row in `index_state`, with the `bintrail_id` that indexed each file |
 | **Partitions** | always | Each partition's boundary and estimated row count |
 | **Archives** | `archive_state` has data | Archived-file / S3-upload counts |
-| **Restore Coverage** | always | Earliest/latest event, live + archived totals, **index size**, schema-change count |
-| **Summary** | always | Files grouped by server identity, with aggregated counts |
-| **Baselines** | `--baseline-dir` given | Baseline snapshots found on disk, with their binlog anchors and size |
+| **Restore Coverage** | best-effort (skipped on load error) | Earliest/latest event, live + archived totals, **index size**, schema-change count |
+| **Summary** | `index_state` has rows | Files grouped by server identity, with aggregated counts (a pure-streaming index has none) |
+| **Baselines** | `--baseline-dir` given **and** snapshots found | Baseline snapshots on disk, with their binlog anchors and size |
 
 ### Stream continuity ("no data lost")
 
@@ -283,12 +283,13 @@ about gap-**contiguity** of the captured range; it is **not** a liveness/lag che
   Position:        binlog.000042:99012
   Events indexed:  986655
   Last checkpoint: 2026-02-19 10:01:12
+  Server ID:       100
   Continuity:      no gaps in the captured range (not a liveness check)
 ```
 
 The verdict is one of three states:
 
-| Text | JSON `continuity.status` | Meaning |
+| Text | JSON `stream.continuity.status` | Meaning |
 |---|---|---|
 | `no gaps in the captured range` | `ok` | The captured range is contiguous — nothing was dropped |
 | `⚠ GAP LOST at <ts>` | `gap_lost` | An unfillable gap was stamped; the index is valid only up to the gap |
@@ -316,10 +317,13 @@ or an unloadable stream state also trips it:
 bintrail status --index-dsn "$IDX" --fail-on-gap || alert "dbtrail lost events"
 ```
 
-Under `--format json` the verdict is always present as a top-level `continuity`
-object (`{"status": "ok|gap_lost|unknown"}`), with a `gap_lost` object carrying the
-detail when applicable. The green "no gaps" badge in the [web console](console.md)
-keys on `continuity.status == "ok"`.
+Under `--format json` the verdict is **nested in the `stream` object** as
+`stream.continuity` (`{"status": "ok|gap_lost|unknown"}`), with a sibling
+`stream.gap_lost` object carrying the detail when applicable. It is present
+whenever the `stream` object is — i.e. once a checkpoint exists — so a
+CI check uses `jq -e '.stream.continuity.status == "ok"'` (a `null` from a
+missing `stream` is itself a "can't confirm" signal). The green "no gaps" badge
+in the [web console](console.md) keys on `stream.continuity.status == "ok"`.
 
 ### Sections in detail
 
@@ -349,7 +353,20 @@ p_future      MAXVALUE            0
 Total events (est.): 987654
 ```
 
-**Summary** — groups files by server identity and aggregates counts:
+**Archives** (shown when `archive_state` contains data) — archive and S3 upload statistics:
+
+```
+=== Archives ===
+  Total:  168 files (4.2 GB, 987654 rows)
+  Local:  168
+  S3:     168 (bucket: my-archive-bucket)
+```
+
+`S3: 0` means nothing has been uploaded yet. This section is loaded best-effort — if the `archive_state` table does not exist (older index databases created before the archiving feature), it is silently omitted.
+
+**Restore Coverage** follows the Archives section: the earliest/latest indexed event, live + archived event totals, the **index size** on disk (`binlog_events`), and the schema-change count.
+
+**Summary** (printed last, when `index_state` has rows) — groups files by server identity and aggregates counts:
 
 ```
 === Summary ===
@@ -363,17 +380,6 @@ Server (unknown)
 ```
 
 Files with a NULL `bintrail_id` are grouped under `Server (unknown)`. This is common when a shared index database receives files from multiple dbtrail instances (e.g. one per replica), or when upgrading from a version predating the server identity feature.
-
-**Archives** (shown when `archive_state` contains data) — archive and S3 upload statistics:
-
-```
-=== Archives ===
-  Total:  168 files (4.2 GB, 987654 rows)
-  Local:  168
-  S3:     168 (bucket: my-archive-bucket)
-```
-
-`S3: 0` means nothing has been uploaded yet. This section is loaded best-effort — if the `archive_state` table does not exist (older index databases created before the archiving feature), it is silently omitted. A **Restore Coverage** section follows it with the earliest/latest indexed event, live + archived event totals, the **index size** on disk (`binlog_events`), and the schema-change count.
 
 The row counts in the partitions section are **estimates** from `information_schema.PARTITIONS.TABLE_ROWS`. InnoDB doesn't maintain exact row counts, so these are good approximations for capacity planning but not for exact totals. For turning these estimates into a disk forecast, see [Capacity Planning](./capacity.md).
 

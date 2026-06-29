@@ -115,7 +115,7 @@ to every release. The image bundles both `bintrail` and `bintrail-mcp`; the
 web console ships as its own image, `ghcr.io/dbtrail/bintrail-console`
 (`serve` = read-only console, `watch` = stream + console daemon — what the
 Compose stack runs). The PostgreSQL-source binary ships as its own image,
-`ghcr.io/dbtrail/bintrail-pg` (alpha). See [docker.md](./docker.md) for signature verification,
+`ghcr.io/dbtrail/bintrail-pg` (beta). See [docker.md](./docker.md) for signature verification,
 `docker run` recipes, and the long-running stream container.
 
 ## Linux packages
@@ -137,7 +137,7 @@ sudo rpm -i bintrail_VERSION_linux_amd64.rpm
 The `bintrail` package carries the core CLI + `bintrail-mcp`; the web console
 is a separate `bintrail-console` package — install it only where an operator
 wants the UI. PostgreSQL-source capture is a separate `bintrail-pg` package
-(alpha) — install it only on hosts that capture from PostgreSQL.
+(beta) — install it only on hosts that capture from PostgreSQL.
 
 ## Go install
 

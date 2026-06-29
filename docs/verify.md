@@ -55,9 +55,12 @@ Results are **per table**, one of:
 ## Exit codes (for cron / CI)
 
 - **Non-zero** on any **mismatch** or error, **or** when comparable tables
-  existed but none could be proven (all inconclusive).
+  existed but none could be proven (all inconclusive). An `inconclusive` table
+  never *by itself* fails the run — but a run where *no* table could be proven does.
 - **Zero** when a source has only one baseline (no predecessor to compare yet) —
   this is reported, not failed.
+- **Non-zero** when *no* baselines are found at all — that's a misconfiguration
+  (wrong `--baseline-dir`/`--baseline-s3`), not a "nothing to do."
 
 This makes `bintrail verify` safe to wire straight into a pipeline: a clean exit
 means "nothing disproved the recovery chain."
@@ -82,6 +85,8 @@ diff tool involved.
 | `--tables` | *(all)* | Comma-separated `schema.table` list (default: all tables in the latest schema snapshot) |
 | `--no-archive` | `false` | Query live MySQL partitions only; skip Parquet archive discovery |
 | `--explain` | `false` | On a baseline-anchored mismatch, print a per-row drill-down |
+
+One of `--baseline-dir` or `--baseline-s3` is **required** — `verify` always reads baselines, in both modes.
 
 It also accepts the shared DuckDB tuning flags (`--ultrafast`,
 `--duckdb-threads`, `--duckdb-memory-limit`) — see the DuckDB resource tuning

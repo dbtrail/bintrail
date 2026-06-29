@@ -254,7 +254,7 @@ of a single `--pk`, and cap how many events are undone per key with
 (`--schema`/`--table`/`--event-type`/`--since`/`--until`/`--column-eq`/`--gtid`/`--flag`).
 
 **PostgreSQL sources:** when the source is PostgreSQL, `recover` emits
-PostgreSQL-dialect reversal SQL (identifier quoting and type literals) rather than
+PostgreSQL-dialect reversal SQL (double-quoted identifiers and string/boolean literals) rather than
 MySQL syntax — see [PostgreSQL](postgres.md#querying-and-recovering).
 
 ### WHERE Clause Strategy

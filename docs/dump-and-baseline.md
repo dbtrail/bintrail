@@ -222,7 +222,7 @@ Each snapshot also records its **binlog anchor** (the file/position/GTID where t
 
 ### At-rest integrity (the `_MANIFEST` sidecar)
 
-Alongside each snapshot, `bintrail baseline` writes a `_MANIFEST` sidecar holding a **CRC-32C** over every Parquet file's bytes. The local read paths that consume baselines — full-table `reconstruct`, cascade recovery, and `query --include-snapshot` — **re-validate the CRC on every read** and **fail loud** on a mismatch (bit-rot, a truncated/partial write), rather than silently reconstructing from corrupt data. Snapshots created before this feature (no `_MANIFEST`) are read without validation, so it degrades gracefully. S3 read-validation is not yet covered in this release (the bytes can be re-encoded in transit); local reads are.
+Alongside each snapshot, `bintrail baseline` writes a `_MANIFEST` sidecar holding a **CRC-32C** over every Parquet file's bytes. Every local read path that consumes a baseline — full-table and single-row `reconstruct`, cascade recovery, the time-travel shim's `_snapshot`, and `query --include-snapshot` — **re-validates the CRC on every read** and **fails loud** on a mismatch (bit-rot, a truncated/partial write), rather than silently reconstructing from corrupt data. Snapshots created before this feature (no `_MANIFEST`) are read without validation, so it degrades gracefully. S3 read-validation is not yet covered in this release (the bytes can be re-encoded in transit); local reads are.
 
 ### Upload to S3
 

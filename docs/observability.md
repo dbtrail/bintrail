@@ -112,7 +112,7 @@ time() - bintrail_index_newest_event_timestamp_seconds > 600
 (hours rotated out of MySQL but never archived). It does **not** signal a
 permanently lost capture stream — an unfillable binlog gap or a lost PostgreSQL
 replication slot. That verdict lives in `bintrail status` (the `Continuity:`
-line / `continuity.status` JSON field), and the alertable hook is its exit code:
+line / `stream.continuity.status` JSON field), and the alertable hook is its exit code:
 
 ```bash
 # in CI/cron — exits non-zero on gap_lost OR an unconfirmable state (fails closed)
