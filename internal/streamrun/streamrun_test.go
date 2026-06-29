@@ -22,13 +22,13 @@ import (
 	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
-// TestDrainParser_cancelsBeforeReceive verifies that drainParser cancels the
-// stream context before draining parseErrCh, so a parser goroutine that returns
-// only on cancellation (the real sp.Run behavior when blocked in GetEvent or on
-// a full events buffer) cannot wedge One. Without the cancel, One would hang
-// when streamLoop returns an error mid-stream — the #652 silent-wedge this
-// guards against. The 5s watchdog makes the regression observable: a drain that
-// forgot to cancel would block here and fail.
+// TestDrainParser_cancelsBeforeReceive verifies drainParser's contract in
+// isolation: it cancels the stream context BEFORE draining parseErrCh, so a
+// parser goroutine that returns only on cancellation (the real sp.Run blocking
+// behavior in GetEvent or on a full events buffer) is unblocked rather than left
+// to wedge One's drain (#652). It exercises the helper, not One()'s call site.
+// The 5s watchdog makes the regression observable: a drain that forgot to cancel
+// blocks here and fails (proven by reverting the cancel()).
 func TestDrainParser_cancelsBeforeReceive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
