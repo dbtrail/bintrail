@@ -129,10 +129,43 @@ services:
     # (maxAllowedPacket=0 → fetched from the server). This is a ceiling raise,
     # not a fix: events above 1G are still rejected and must — but do not yet
     # (#652) — fail loud rather than drop silently.
+    #
+    # Write-throughput tuning for the index workload (append-mostly batched
+    # INSERTs of large JSON row images). mysql:8.4 already ships most of the
+    # high-write defaults (io_capacity=10000, log_buffer=64M, flush_neighbors=0,
+    # change buffer + adaptive hash off), so only three overrides remain:
+    #
+    # --skip-log-bin: the index is a write-only sink — nothing replicates FROM
+    # it, and bintrail reconstructs by re-streaming from the SOURCE, never from
+    # the index's own binlog. 8.4 defaults log_bin=ON + sync_binlog=1, which
+    # writes a second full ROW copy of every JSON image AND fsyncs per commit —
+    # re-introducing the very fsync that --innodb-flush-log-at-trx-commit=2 was
+    # set to remove. Disabling it is the largest single write win and is what
+    # makes trx_commit=2 actually pay off. (Safe: gtid_mode=OFF by default; a
+    # GTID-enabled server would reject --skip-log-bin.)
+    #
+    # --innodb-redo-log-capacity=2G: 8.4 defaults to 100M (this knob replaced
+    # innodb_log_file_size in 8.0.30+). 100M is small for bursts of large JSON
+    # images and triggers sharp-checkpoint / async-flush stalls — the dominant
+    # throughput risk once trx_commit=2 removes the per-commit fsync. Costs disk
+    # under #innodb_redo (operator's to budget, see capacity.md), zero
+    # durability cost at trx_commit=2.
+    #
+    # --innodb-flush-method=O_DIRECT: 8.4 still defaults to fsync. O_DIRECT skips
+    # the OS page-cache double-buffering of dirty InnoDB pages, which matters for
+    # this LOB-heavy write path. Works on the local-driver named volume below; an
+    # operator who repoints the volume at an exotic filesystem may need to drop
+    # this one flag.
+    #
+    # Buffer pool stays at the 128M default — it is host-RAM dependent and the
+    # operator's to size (docs/deployment.md §3); we never hardcode a RAM number.
     command:
       - "--innodb-flush-log-at-trx-commit=2"
       - "--sort-buffer-size=4M"
       - "--max-allowed-packet=1G"
+      - "--skip-log-bin"
+      - "--innodb-redo-log-capacity=2147483648"
+      - "--innodb-flush-method=O_DIRECT"
     environment:
       # 8.4 defaults to caching_sha2_password (native_password disabled);
       # bintrail's driver negotiates it over the plaintext Docker network.

@@ -108,15 +108,22 @@ Budget roughly **1.2–1.6 KB per indexed event** (INSERT/DELETE ≈ 1.2 KB, UPD
 
 ### InnoDB tuning
 
+The **bundled** index (the `index-mysql` service in `docker-compose.yml`) already applies the write-throughput overrides below except `innodb_buffer_pool_size`, which is host-RAM dependent and left to you. The settings here are for a **BYO** index (`INDEX_DSN` pointing at your own MySQL):
+
 ```ini
 [mysqld]
-innodb_buffer_pool_size = 70%           # 50-70% of available RAM
+innodb_buffer_pool_size = 70%           # 50-70% of available RAM (the one you must size)
 innodb_flush_log_at_trx_commit = 2      # acceptable for index (not source)
-innodb_log_file_size = 1G
-innodb_flush_method = O_DIRECT
+innodb_redo_log_capacity = 2G           # 8.4 default is 100M — small for bursty large-row writes
+innodb_flush_method = O_DIRECT          # 8.4 still defaults to fsync
+skip_log_bin                            # the index is a write-only sink (see below)
 ```
 
 `innodb_flush_log_at_trx_commit = 2` trades a tiny recovery window (up to 1s of events) for significantly better write throughput. Since dbtrail can replay from the binlog position in `stream_state`, this tradeoff is acceptable.
+
+`skip_log_bin` disables the index server's **own** binary log. The index is a write-only sink — nothing replicates from it, and dbtrail reconstructs by re-streaming from the source, never from the index's binlog. Leaving it on writes a second full copy of every row image and (with the default `sync_binlog = 1`) fsyncs per commit, which cancels much of the `innodb_flush_log_at_trx_commit = 2` benefit. Only disable it on a dedicated index instance with `gtid_mode = OFF` (a GTID-enabled server rejects `skip_log_bin`).
+
+> **Note on MySQL 8.4 defaults:** `innodb_log_file_size` was replaced by `innodb_redo_log_capacity` in 8.0.30+. MySQL 8.4 LTS already ships several former hand-tunings as defaults (`innodb_io_capacity = 10000`, `innodb_log_buffer_size = 64M`, `innodb_flush_neighbors = 0`, change buffer and adaptive hash index off), so they no longer need setting.
 
 ## 4. Network Topology
 
