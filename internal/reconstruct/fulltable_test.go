@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -97,6 +98,94 @@ func TestMergeBaseline_passthroughOnly(t *testing.T) {
 		if !strings.Contains(chunk, want) {
 			t.Errorf("chunk missing %q:\n%s", want, chunk)
 		}
+	}
+}
+
+// writeBlobTextBaseline creates a baseline (id INT, tx TEXT, bl BLOB). TEXT maps
+// to parquet.String() (DuckDB scans it back as a Go string), BLOB to
+// ByteArrayType (DuckDB []byte) — the type asymmetry behind #660.
+func writeBlobTextBaseline(t *testing.T, rows [][]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "baseline.parquet")
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "tx", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
+		{Name: "bl", MySQLType: "blob", ParquetType: baseline.MysqlToParquetNode("blob")},
+	}
+	w, err := baseline.NewWriter(path, cols, baseline.WriterConfig{Compression: "none", RowGroupSize: 10})
+	if err != nil {
+		t.Fatalf("baseline.NewWriter: %v", err)
+	}
+	for _, r := range rows {
+		if err := w.WriteRow(r, []bool{false, false, false}); err != nil {
+			t.Fatalf("WriteRow: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("writer close: %v", err)
+	}
+	return path
+}
+
+// TestMergeBaseline_blobTextProvenance is the #660 anchor across the derivation
+// seam AND both value branches: BinaryCols is derived through the real
+// binaryColsFromTableMeta(tm) — NOT hand-injected, which is the test-vs-production
+// divergence that let the round-1 bug ship — an UNTOUCHED baseline TEXT whose
+// content is valid base64 must survive VERBATIM (the corruption case, since
+// DuckDB delivers it as a Go string), and a delta-event TEXT/BLOB are decoded
+// (string / X'hex'). Re-introducing a decode in rowAfterOrdered makes this fail.
+func TestMergeBaseline_blobTextProvenance(t *testing.T) {
+	baselinePath := writeBlobTextBaseline(t, [][]string{
+		{"1", "YWJjZA==", "RAW"}, // untouched; tx is valid base64 (of "abcd"); bl bytes "RAW"
+	})
+	outDir := t.TempDir()
+
+	// Derive the decode set through the production path, not by hand.
+	tm := &metadata.TableMeta{Columns: []metadata.ColumnMeta{
+		{Name: "id", DataType: "int"},
+		{Name: "tx", DataType: "text"},
+		{Name: "bl", DataType: "blob"},
+	}}
+
+	changes := map[string]*query.ResultRow{
+		pkStrForInt(2): {
+			EventType: event.EventInsert,
+			PKValues:  pkStrForInt(2),
+			RowAfter:  map[string]any{"id": float64(2), "tx": "aGVsbG8=", "bl": "QklO"}, // base64("hello"), base64("BIN")
+		},
+	}
+
+	rep := &TableReport{Schema: "mydb", Table: "t"}
+	if err := mergeBaselineIntoWriter(context.Background(), mergeInput{
+		LocalBaselinePath: baselinePath,
+		CreateTableSQL:    "-- test",
+		Schema:            "mydb",
+		Table:             "t",
+		PKCols:            pkColsIntID(),
+		Changes:           changes,
+		OutputDir:         outDir,
+		ChunkSize:         0,
+		BinaryCols:        binaryColsFromTableMeta(tm),
+	}, rep); err != nil {
+		t.Fatalf("mergeBaselineIntoWriter: %v", err)
+	}
+
+	chunk := mustReadOnlyChunk(t, outDir)
+	// Columns emit in the baseline's order (bl, id, tx). Baseline pass-through:
+	// TEXT verbatim (not 'abcd'), BLOB as the hex of its bytes.
+	if !strings.Contains(chunk, "(X'524157', 1, 'YWJjZA==')") {
+		t.Errorf("baseline row must emit hex BLOB + verbatim TEXT, got:\n%s", chunk)
+	}
+	if strings.Contains(chunk, "'abcd'") {
+		t.Errorf("baseline TEXT was wrongly base64-decoded (corruption, #660):\n%s", chunk)
+	}
+	// Delta event: BLOB decoded to X'hex', TEXT decoded to a string.
+	if !strings.Contains(chunk, "(X'42494e', 2, 'hello')") {
+		t.Errorf("delta-event BLOB/TEXT must be decoded, got:\n%s", chunk)
+	}
+	if strings.Contains(chunk, "'aGVsbG8='") || strings.Contains(chunk, "'QklO'") {
+		t.Errorf("delta-event value was not decoded:\n%s", chunk)
 	}
 }
 
