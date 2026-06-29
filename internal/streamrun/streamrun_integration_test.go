@@ -373,6 +373,48 @@ func TestStreamLoop_flushFailurePropagates(t *testing.T) {
 	}
 }
 
+// TestStreamLoop_saveCheckpointFailureDoesNotAbort verifies the deliberate split
+// in the fail-loud fix: a FLUSH failure aborts the stream, but a saveCheckpoint
+// failure stays a warning (it only re-streams from an older checkpoint on
+// restart — re-processing, not data loss). A regression that made checkpoint
+// errors abort would crash streams on transient stream_state write blips.
+//
+// binlog_events is kept (the flush succeeds) and stream_state is dropped (so
+// saveCheckpoint fails); streamLoop must still return nil.
+func TestStreamLoop_saveCheckpointFailureDoesNotAbort(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00",
+		"testdb", "orders", "id", 1, "PRI", "int", "NO")
+
+	idx := indexer.New(db, 10)
+
+	events := make(chan parser.Event, 1)
+	events <- parser.Event{
+		BinlogFile: "binlog.000001",
+		StartPos:   0,
+		EndPos:     100,
+		Timestamp:  time.Now().UTC(),
+		Schema:     "testdb",
+		Table:      "orders",
+		EventType:  parser.EventInsert,
+		PKValues:   "1",
+		RowAfter:   map[string]any{"id": int64(1)},
+	}
+	close(events)
+
+	// The flush (into binlog_events) succeeds; only saveCheckpoint fails.
+	testutil.MustExec(t, db, "DROP TABLE stream_state")
+
+	state := &streamState{mode: "position", serverID: 1}
+	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, observe.ForSource("test"), nil); err != nil {
+		t.Fatalf("a saveCheckpoint failure must NOT abort the stream, got: %v", err)
+	}
+	if state.eventsIndexed != 1 {
+		t.Errorf("expected the event to be indexed despite the checkpoint failure, got %d", state.eventsIndexed)
+	}
+}
+
 // ─── streamLoop live replication ───────────────────────────────────────────────────────
 
 // TestStreamLoop_liveReplication is a full end-to-end test that connects as a

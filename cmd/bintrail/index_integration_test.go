@@ -62,7 +62,67 @@ func TestRunIndex_failedFileReturnsNonZero(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected runIndex to return non-zero when a file fails to index, got nil (exit-0 silent failure — #652)")
 	}
-	if !strings.Contains(err.Error(), "failed") {
-		t.Errorf("expected a 'files failed' error, got: %v", err)
+	// Tight phrase from the aggregation error (index.go) so a setup regression
+	// that errors EARLY (e.g. "failed to connect to index database") can't make
+	// this pass for the wrong reason.
+	if !strings.Contains(err.Error(), "file(s) failed") {
+		t.Errorf("expected the per-file aggregation error, got: %v", err)
+	}
+}
+
+// TestRunIndex_allContinuesPastFailure verifies the --all resilience contract
+// the fix preserves: a failed file does NOT stop the loop (every file is still
+// attempted), and the run exits non-zero. With one garbage file the single-file
+// test cannot distinguish continue-then-fail from fail-fast; two files can —
+// both must get an index_state row (a fail-fast regression would skip file2).
+func TestRunIndex_allContinuesPastFailure(t *testing.T) {
+	indexDB, name := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+	testutil.InsertSnapshot(t, indexDB, 1, "2026-01-01 00:00:00",
+		"testdb", "orders", "id", 1, "PRI", "int", "NO")
+
+	dir := t.TempDir()
+	for _, f := range []string{"binlog.000001", "binlog.000002"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("not a valid binlog file"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
+
+	saved := struct {
+		index, source, binlogDir, files, format, schemas, tables string
+		all, skip                                                bool
+	}{idxIndexDSN, idxSourceDSN, idxBinlogDir, idxFiles, idxFormat, idxSchemas, idxTables, idxAll, idxSkipSourceCheck}
+	t.Cleanup(func() {
+		idxIndexDSN, idxSourceDSN, idxBinlogDir = saved.index, saved.source, saved.binlogDir
+		idxFiles, idxFormat, idxSchemas, idxTables = saved.files, saved.format, saved.schemas, saved.tables
+		idxAll, idxSkipSourceCheck = saved.all, saved.skip
+	})
+
+	idxIndexDSN = testutil.IntegrationDSN(name)
+	idxSourceDSN = ""
+	idxSkipSourceCheck = true
+	idxBinlogDir = dir
+	idxFiles = ""
+	idxAll = true // process every file in the dir
+	idxFormat = "text"
+	idxSchemas = ""
+	idxTables = ""
+
+	indexCmd.SetContext(context.Background())
+	err := runIndex(indexCmd, nil)
+	if err == nil {
+		t.Fatal("expected non-zero when files fail, got nil")
+	}
+
+	// Both files must have been attempted — proves the loop did not fail-fast on
+	// the first failure (the --all continue-on-failure contract).
+	var attempted int
+	if qerr := indexDB.QueryRow(
+		"SELECT COUNT(*) FROM index_state WHERE binlog_file IN ('binlog.000001','binlog.000002')",
+	).Scan(&attempted); qerr != nil {
+		t.Fatalf("count index_state: %v", qerr)
+	}
+	if attempted != 2 {
+		t.Errorf("expected both files attempted (--all continues past a failure), got %d index_state rows", attempted)
 	}
 }

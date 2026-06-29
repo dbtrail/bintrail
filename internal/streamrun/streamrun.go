@@ -1213,6 +1213,24 @@ func (d Deps) validate() error {
 // is cancelled or a fatal error occurs. It is self-contained by design: no
 // package globals, no signal handling, safe to run N instances concurrently
 // (each against its own index database).
+// drainParser stops the stream's parser goroutine and returns its final error.
+//
+// The parser (sp.Run) returns only when its context is cancelled — it is
+// otherwise blocked in GetEvent waiting for the next binlog event, or on a send
+// to a full events buffer. One derives a cancellable context whose deferred
+// cancel runs only once One returns, so when streamLoop returns an error
+// mid-stream (the ticker / batch-full / DDL flush paths, with the caller's ctx
+// still live) a bare `<-parseErrCh` would block forever and One would hang
+// instead of surfacing the failure to its supervisor — turning a fail-loud
+// abort into a silent wedge (#652). Cancelling BEFORE the receive guarantees the
+// parser unblocks. Idempotent on the clean-exit paths (the context is already
+// cancelled, or the parser already returned via close(events)); the resulting
+// context.Canceled error is filtered by the caller.
+func drainParser(cancel context.CancelFunc, parseErrCh <-chan error) error {
+	cancel()
+	return <-parseErrCh
+}
+
 func One(ctx context.Context, cfg Config) error {
 	if !cliutil.IsValidOutputFormat(cfg.Format) {
 		return fmt.Errorf("invalid --format %q; must be text or json", cfg.Format)
@@ -1655,7 +1673,7 @@ func One(ctx context.Context, cfg Config) error {
 	loopErr := streamLoop(ctx, events, idx, indexDB,
 		time.Duration(cfg.Checkpoint)*time.Second, state, metrics, cfg.Hooks)
 
-	parseErr := <-parseErrCh
+	parseErr := drainParser(cancel, parseErrCh)
 
 	// ── 12. Summary ───────────────────────────────────────────────────────────────
 	if loopErr != nil {

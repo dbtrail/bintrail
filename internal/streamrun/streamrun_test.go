@@ -1,6 +1,7 @@
 package streamrun
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -20,6 +21,36 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/parser"
 )
+
+// TestDrainParser_cancelsBeforeReceive verifies that drainParser cancels the
+// stream context before draining parseErrCh, so a parser goroutine that returns
+// only on cancellation (the real sp.Run behavior when blocked in GetEvent or on
+// a full events buffer) cannot wedge One. Without the cancel, One would hang
+// when streamLoop returns an error mid-stream — the #652 silent-wedge this
+// guards against. The 5s watchdog makes the regression observable: a drain that
+// forgot to cancel would block here and fail.
+func TestDrainParser_cancelsBeforeReceive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	parseErrCh := make(chan error, 1)
+	// Stand-in for sp.Run: it only returns once the context is cancelled.
+	go func() {
+		<-ctx.Done()
+		parseErrCh <- ctx.Err()
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- drainParser(cancel, parseErrCh) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("parser error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainParser hung: it must cancel the context before receiving so a ctx-blocked parser unblocks (#652)")
+	}
+}
 
 // selfSignedCAPEM generates a minimal self-signed CA certificate as PEM bytes.
 func selfSignedCAPEM(t *testing.T) []byte {
