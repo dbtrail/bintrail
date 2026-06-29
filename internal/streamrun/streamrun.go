@@ -964,10 +964,17 @@ func streamLoop(
 		return nil
 	}
 
-	checkpoint := func() {
+	// checkpoint flushes the pending batch, then persists the stream position.
+	// A flush failure is RETURNED to the caller so the stream aborts loudly and
+	// replays from the last durable checkpoint on restart — the same fail-loud
+	// contract the batch-full (len>=BatchSize) and DDL flushes already follow.
+	// Swallowing it here let an un-indexable event (e.g. one over the server's
+	// max_allowed_packet) be silently skipped (#652). A saveCheckpoint failure
+	// is NOT data loss — it only re-streams from an older checkpoint on restart —
+	// so it stays a warning.
+	checkpoint := func() error {
 		if err := flush(); err != nil {
-			slog.Warn("batch flush failed", "error", err)
-			return
+			return err
 		}
 		if err := saveCheckpoint(db, state); err != nil {
 			slog.Warn("saveCheckpoint failed", "error", err)
@@ -982,6 +989,7 @@ func streamLoop(
 				"pos", state.binlogPos,
 				"events_indexed", state.eventsIndexed)
 		}
+		return nil
 	}
 
 	// advanceGTID adds a committed transaction's GTID to the durable set. It is
@@ -1011,15 +1019,21 @@ func streamLoop(
 	for {
 		select {
 		case <-ctx.Done():
-			checkpoint()
+			if err := checkpoint(); err != nil {
+				return err
+			}
 			return nil
 
 		case <-ticker.C:
-			checkpoint()
+			if err := checkpoint(); err != nil {
+				return err
+			}
 
 		case ev, ok := <-events:
 			if !ok {
-				checkpoint()
+				if err := checkpoint(); err != nil {
+					return err
+				}
 				return nil
 			}
 			// Update position tracking from each event.

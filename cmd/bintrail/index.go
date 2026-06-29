@@ -219,28 +219,49 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	})
 
 	var totalEvents int64
+	var failedFiles int
 	for _, filename := range files {
 		n, err := indexFile(ctx, p, idx, indexDB, idxBinlogDir, filename, bintrailID)
 		totalEvents += n
 		if err != nil {
-			// Log and continue so --all processes remaining files.
+			// Log and continue so --all still processes the remaining files;
+			// the failure is surfaced as a non-zero exit after the loop (#652).
 			slog.Error("indexing failed", "file", filename, "error", err)
+			failedFiles++
 		}
 	}
 
-	slog.Info("indexing complete", "files_processed", len(files), "events_indexed", totalEvents)
+	slog.Info("indexing complete",
+		"files_processed", len(files),
+		"events_indexed", totalEvents,
+		"failed_files", failedFiles)
 
 	if idxFormat == "json" {
-		return cliutil.OutputJSON(struct {
+		if err := cliutil.OutputJSON(struct {
 			FilesProcessed int   `json:"files_processed"`
 			EventsIndexed  int64 `json:"events_indexed"`
+			FailedFiles    int   `json:"failed_files"`
 		}{
 			FilesProcessed: len(files),
 			EventsIndexed:  totalEvents,
-		})
+			FailedFiles:    failedFiles,
+		}); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("\nTotal events indexed: %d\n", totalEvents)
+		if failedFiles > 0 {
+			fmt.Printf("WARNING: %d of %d file(s) failed to index — see logs above\n", failedFiles, len(files))
+		}
 	}
 
-	fmt.Printf("\nTotal events indexed: %d\n", totalEvents)
+	// Fail loud: a file that could not be fully indexed (e.g. an event the
+	// server rejects as over max_allowed_packet) must not exit 0 and read as
+	// success to a cron/CI wrapper (#652). The per-file failure is already
+	// recorded as status='failed' in index_state.
+	if failedFiles > 0 {
+		return fmt.Errorf("indexing finished with %d of %d file(s) failed", failedFiles, len(files))
+	}
 	return nil
 }
 
