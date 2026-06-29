@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -357,6 +358,71 @@ func columnNameSet(cols []metadata.ColumnMeta) map[string]bool {
 // gated on identity metadata — keeping the highest-frequency recovery op robust.
 // Identity columns are KEPT (the real id is the point of recovery); only generated
 // columns are omitted.
+// base64Cols maps each column of a table that go-mysql delivers as []byte — the
+// BLOB and TEXT families (both binlog type MYSQL_TYPE_BLOB) — to whether it is
+// binary. marshalRow base64-encodes those non-JSON []byte values into the stored
+// JSON, so on recovery the value comes back as a base64 STRING that must be
+// decoded before emission or the reversal SQL writes the base64 text verbatim
+// (#653): binary → X'hex', text → a string literal. Returns nil (no coercion)
+// for a non-MySQL dialect, a nil resolver, or an unresolvable table.
+func (g *Generator) base64Cols(r *metadata.Resolver, schema, table string) map[string]bool {
+	if g.dialect != MySQLDialect || r == nil {
+		return nil
+	}
+	tm, err := r.Resolve(schema, table)
+	if err != nil {
+		return nil
+	}
+	var m map[string]bool
+	for _, c := range tm.Columns {
+		binary, ok := base64StoredKind(c.DataType)
+		if !ok {
+			continue
+		}
+		if m == nil {
+			m = make(map[string]bool)
+		}
+		m[c.Name] = binary
+	}
+	return m
+}
+
+// base64StoredKind reports whether a column's DataType is one go-mysql delivers
+// as []byte (so marshalRow base64-encodes it in storage), and if so whether it
+// is binary (true → emit X'hex') or text (false → emit a string literal).
+func base64StoredKind(dataType string) (binary, ok bool) {
+	switch strings.ToLower(dataType) {
+	case "blob", "tinyblob", "mediumblob", "longblob":
+		return true, true
+	case "text", "tinytext", "mediumtext", "longtext":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// decodeStoredBase64 reverses the storage-side base64 encoding of a BLOB/TEXT
+// value (see base64Cols). A BLOB/TEXT whose original bytes were valid JSON is
+// stored raw (decoded by query.UnmarshalRowImage to a map/array, not a string)
+// and passes through untouched. binary selects the decoded Go type so
+// FormatSQLValue emits X'hex' (binary) vs a quoted string (text). A value that
+// is not a decodable base64 string is returned unchanged (defensive — e.g. a
+// raw-JSON blob, NULL, or pre-existing non-base64 data).
+func decodeStoredBase64(v any, binary bool) any {
+	s, ok := v.(string)
+	if !ok {
+		return v
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return v
+	}
+	if binary {
+		return b
+	}
+	return string(b)
+}
+
 func (g *Generator) generateInsert(row query.ResultRow) (string, error) {
 	stmt, _, err := g.buildInsert(row)
 	return stmt, err
@@ -368,6 +434,7 @@ func (g *Generator) buildInsert(row query.ResultRow) (string, []string, error) {
 	}
 	r := g.resolverForRow(row)
 	genCols := generatedColsFromResolver(r, row.SchemaName, row.TableName)
+	b64 := g.base64Cols(r, row.SchemaName, row.TableName)
 	var cols, colParts, valParts []string
 	for _, col := range sortedKeys(row.RowBefore) {
 		if genCols[col] {
@@ -375,7 +442,11 @@ func (g *Generator) buildInsert(row query.ResultRow) (string, []string, error) {
 		}
 		cols = append(cols, col)
 		colParts = append(colParts, g.quoteName(col))
-		valParts = append(valParts, g.formatValue(row.RowBefore[col]))
+		v := row.RowBefore[col]
+		if binary, ok := b64[col]; ok {
+			v = decodeStoredBase64(v, binary)
+		}
+		valParts = append(valParts, g.formatValue(v))
 	}
 	overriding := ""
 	if g.dialect == PostgresDialect {
@@ -413,13 +484,18 @@ func (g *Generator) buildUpdate(row query.ResultRow) (string, []string, error) {
 	// The WHERE clause still PK-targets the column.
 	r := g.resolverForRow(row)
 	skipCols := updateSetSkipCols(r, row.SchemaName, row.TableName)
+	b64 := g.base64Cols(r, row.SchemaName, row.TableName)
 	var cols, setParts []string
 	for _, col := range sortedKeys(row.RowBefore) {
 		if skipCols[col] {
 			continue
 		}
 		cols = append(cols, col)
-		setParts = append(setParts, g.quoteName(col)+" = "+g.formatValue(row.RowBefore[col]))
+		v := row.RowBefore[col]
+		if binary, ok := b64[col]; ok {
+			v = decodeStoredBase64(v, binary)
+		}
+		setParts = append(setParts, g.quoteName(col)+" = "+g.formatValue(v))
 	}
 
 	// WHERE uses row_after (current state), so the UPDATE finds the right row
