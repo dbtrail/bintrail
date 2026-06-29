@@ -33,6 +33,10 @@
 # boundary: SUPPORT.md. Bring your own instead: set INDEX_DSN in .env (see
 # docs/docker.md).
 #
+# Opt-in profiles (neither runs by default): `baseline` (snapshot for the
+# console's Time-travel reconstruct) and `flashback` (a `mysql` time-travel
+# terminal on :3308 — set SHIM_USER/SHIM_PASSWORD; see docs/docker.md).
+#
 # For the full interactive demo (traffic generator, Grafana, Prometheus),
 # see demo/compose.yml instead.
 
@@ -290,6 +294,94 @@ services:
           exec bintrail-console watch --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN"
         fi
         exec bintrail-console watch --index-dsn "$$INDEX_DSN"
+    depends_on:
+      index-mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Time-travel SQL terminal (opt-in `flashback` profile) ─
+  # Runs `bintrail shim` — an in-process MySQL-protocol server that answers the
+  # virtual _flashback / _snapshot / _diff schemas against the bundled index.
+  # Point a plain `mysql` client at :3308 and read historical row state — NO
+  # ProxySQL required:
+  #
+  #   SHIM_USER=analyst SHIM_PASSWORD='pick-a-strong-one' \
+  #     docker compose --profile flashback up -d shim
+  #   mysql -h 127.0.0.1 -P 3308 -u analyst -p
+  #   mysql> USE myapp;
+  #   mysql> SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 1;
+  #
+  # This is a DEDICATED terminal for time-travel SQL: a normal SELECT on this
+  # connection returns ER_NOT_SUPPORTED_YET (1235). Transparently mixing normal
+  # and AS OF queries on one connection is what ProxySQL adds and is out of
+  # scope here — see docs/time-travel-sql.md.
+  #
+  # Opt-in because it needs YOU to choose the login it authenticates against —
+  # there is deliberately no default credential on a MySQL port. Uses the CORE
+  # image (the console image omits the `shim` command). Full-table _snapshot.*
+  # needs a baseline: run the `baseline` profile, then set BASELINE_DIR.
+  shim:
+    profiles: ["flashback"]
+    image: ghcr.io/dbtrail/bintrail:${BINTRAIL_TAG:-latest}
+    ports:
+      # Loopback only. The shim binds 0.0.0.0 INSIDE the container so this host
+      # mapping can reach it (it logs a non-loopback Warn for that bind, which
+      # is expected — the mapping below is the real exposure control). To reach
+      # it from another host, change to "3308:3308", ideally behind TLS/stunnel.
+      - "127.0.0.1:3308:3308"
+    environment:
+      # REQUIRED: the login your `mysql` client authenticates with. No default —
+      # shipping a known credential on a MySQL port would be a footgun.
+      SHIM_USER: ${SHIM_USER:-}
+      SHIM_PASSWORD: ${SHIM_PASSWORD:-}
+      # Optional: derives the default schema so `_flashback.orders` resolves
+      # without a prior `USE` (parse-only — the shim never connects to it). If
+      # unset (the UI-driven multi-source path), just run `USE <db>` first.
+      SOURCE_DSN: ${SOURCE_DSN:-}
+      # Bring your own index (default: the bundled MySQL, DSN built from the
+      # generated password in the secret volume).
+      INDEX_DSN: ${INDEX_DSN:-}
+      # Enables full-table _snapshot.* (baseline + deltas → complete rows). Set
+      # to /var/lib/bintrail/baselines after a `baseline` profile run — same
+      # path as the console's BASELINE_DIR. Empty = binlog-only _flashback.
+      BASELINE_DIR: ${BASELINE_DIR:-}
+      # Optional client auth plugin. The default (mysql_native_password) works
+      # for the `mysql` CLI; set caching_sha2_password for drivers that require
+      # it (those clients then need TLS or a primed SHA2 cache to the shim).
+      SHIM_AUTH_METHOD: ${SHIM_AUTH_METHOD:-}
+    volumes:
+      - bintrail-state:/var/lib/bintrail:ro   # read-only: baselines for _snapshot
+      - bintrail-index-secret:/run/secret:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -z "$$SHIM_USER" ] || [ -z "$$SHIM_PASSWORD" ]; then
+          echo "FATAL: set SHIM_USER and SHIM_PASSWORD to the login your mysql client will use, e.g." >&2
+          echo "  SHIM_USER=analyst SHIM_PASSWORD='...' docker compose --profile flashback up -d shim" >&2
+          exit 1
+        fi
+        # Build the bundled-index DSN from the generated password unless the
+        # operator brought their own. Plain assignment under `set -e` so an
+        # unreadable secret aborts loud (see the bintrail service for why).
+        if [ -z "$$INDEX_DSN" ]; then
+          INDEX_DSN="root:$$(cat /run/secret/index_password)@tcp(index-mysql:3306)/bintrail_index"
+        fi
+        # One-tenant shim.yaml in /tmp (regenerated from env every boot — not
+        # persisted, so the state volume stays read-only). server_id is a label
+        # (the shim does not filter events by it); source_dsn is parse-only.
+        # Single-quoted YAML (matching `bintrail init-shim`): the only escape is
+        # ' -> '', so a password with \ or " survives literally.
+        esc() { printf '%s' "$$1" | sed "s/'/''/g"; }
+        umask 077
+        printf "listen: '0.0.0.0:3308'\ntenants:\n  - server_id: 'compose-shim'\n    source_dsn: '%s'\n    mysql_user: '%s'\n    mysql_password: '%s'\n" \
+          "$$(esc "$$SOURCE_DSN")" "$$(esc "$$SHIM_USER")" "$$(esc "$$SHIM_PASSWORD")" > /tmp/shim.yaml
+        # The flag --listen (not shim.yaml's listen:) drives the actual bind, so
+        # 0.0.0.0 must be passed here for the host port mapping to reach it.
+        set -- shim --listen 0.0.0.0:3308 --shim-config /tmp/shim.yaml --index-dsn "$$INDEX_DSN"
+        [ -n "$$BASELINE_DIR" ] && set -- "$$@" --baseline-dir "$$BASELINE_DIR"
+        [ -n "$$SHIM_AUTH_METHOD" ] && set -- "$$@" --auth-method "$$SHIM_AUTH_METHOD"
+        exec bintrail "$$@"
     depends_on:
       index-mysql:
         condition: service_healthy
