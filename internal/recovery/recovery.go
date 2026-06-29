@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -348,6 +349,87 @@ func columnNameSet(cols []metadata.ColumnMeta) map[string]bool {
 	return s
 }
 
+// base64Cols maps each column of a table that go-mysql delivers as []byte — the
+// BLOB and TEXT families (both binlog type MYSQL_TYPE_BLOB) — to whether it is
+// binary. marshalRow base64-encodes those non-JSON []byte values into the stored
+// JSON, so on recovery the value comes back as a base64 STRING that must be
+// decoded before emission or the reversal SQL writes the base64 text verbatim
+// (#653): binary → X'hex', text → a string literal.
+//
+// Returns nil (no coercion) for a non-MySQL dialect, a nil resolver, or an
+// unresolvable table. In the last two cases BLOB/TEXT values are still emitted as
+// base64 — recover without usable schema metadata cannot type its columns; the
+// caller has already warned about the missing snapshot (resolverForRow /
+// pkWhereClause), so this does not warn again.
+func (g *Generator) base64Cols(r *metadata.Resolver, schema, table string) map[string]bool {
+	if g.dialect != MySQLDialect || r == nil {
+		return nil
+	}
+	tm, err := r.Resolve(schema, table)
+	if err != nil {
+		return nil
+	}
+	var m map[string]bool
+	for _, c := range tm.Columns {
+		binary, ok := base64StoredKind(c.DataType)
+		if !ok {
+			continue
+		}
+		if m == nil {
+			m = make(map[string]bool)
+		}
+		m[c.Name] = binary
+	}
+	return m
+}
+
+// base64StoredKind reports whether a column's DataType is in the BLOB or TEXT
+// family — the ones go-mysql delivers as []byte so marshalRow base64-encodes them
+// in storage — and if so whether it is binary (true → emit X'hex') or text
+// (false → emit a string literal). go-mysql also delivers GEOMETRY/VECTOR as
+// []byte, but they are deliberately out of scope: a bare X'hex'/string literal
+// can't load them (they need ST_GeomFromWKB / STRING_TO_VECTOR), so reversing
+// their base64 is no better than leaving it — a separate concern from #653.
+func base64StoredKind(dataType string) (binary, ok bool) {
+	switch strings.ToLower(dataType) {
+	case "blob", "tinyblob", "mediumblob", "longblob":
+		return true, true
+	case "text", "tinytext", "mediumtext", "longtext":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// decodeStoredBase64 reverses the storage-side base64 encoding of a BLOB/TEXT
+// value (see base64Cols). binary selects the decoded Go type so FormatSQLValue
+// emits X'hex' (binary) vs a quoted string (text). A value that is not a
+// decodable base64 string is returned unchanged (defensive — NULL, a raw-JSON
+// object/array blob, or pre-existing non-base64 data).
+//
+// Known lossy edge (pre-existing, NOT introduced here): marshalRow stores a
+// BLOB/TEXT whose bytes are valid JSON RAW, not base64. A valid-JSON OBJECT/ARRAY
+// blob comes back as a map/[]any (the string guard skips it). But a valid-JSON
+// SCALAR-STRING blob (bytes literally `"YWJj"`) comes back as the Go string
+// `YWJj`, indistinguishable from a base64-stored blob, and is wrongly decoded.
+// That value was already corrupted at capture (the outer quotes were stripped by
+// the raw-JSON promotion), so this only changes the flavor of an existing bug; a
+// real fix belongs at the storage encoding, out of scope for #653.
+func decodeStoredBase64(v any, binary bool) any {
+	s, ok := v.(string)
+	if !ok {
+		return v
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return v
+	}
+	if binary {
+		return b
+	}
+	return string(b)
+}
+
 // generateInsert reverses a DELETE event: reconstruct the deleted row from
 // row_before with a full INSERT, skipping STORED/VIRTUAL generated columns. On the
 // PostgreSQL path it emits OVERRIDING SYSTEM VALUE so a GENERATED ALWAYS AS IDENTITY
@@ -368,6 +450,7 @@ func (g *Generator) buildInsert(row query.ResultRow) (string, []string, error) {
 	}
 	r := g.resolverForRow(row)
 	genCols := generatedColsFromResolver(r, row.SchemaName, row.TableName)
+	b64 := g.base64Cols(r, row.SchemaName, row.TableName)
 	var cols, colParts, valParts []string
 	for _, col := range sortedKeys(row.RowBefore) {
 		if genCols[col] {
@@ -375,7 +458,11 @@ func (g *Generator) buildInsert(row query.ResultRow) (string, []string, error) {
 		}
 		cols = append(cols, col)
 		colParts = append(colParts, g.quoteName(col))
-		valParts = append(valParts, g.formatValue(row.RowBefore[col]))
+		v := row.RowBefore[col]
+		if binary, ok := b64[col]; ok {
+			v = decodeStoredBase64(v, binary)
+		}
+		valParts = append(valParts, g.formatValue(v))
 	}
 	overriding := ""
 	if g.dialect == PostgresDialect {
@@ -413,13 +500,18 @@ func (g *Generator) buildUpdate(row query.ResultRow) (string, []string, error) {
 	// The WHERE clause still PK-targets the column.
 	r := g.resolverForRow(row)
 	skipCols := updateSetSkipCols(r, row.SchemaName, row.TableName)
+	b64 := g.base64Cols(r, row.SchemaName, row.TableName)
 	var cols, setParts []string
 	for _, col := range sortedKeys(row.RowBefore) {
 		if skipCols[col] {
 			continue
 		}
 		cols = append(cols, col)
-		setParts = append(setParts, g.quoteName(col)+" = "+g.formatValue(row.RowBefore[col]))
+		v := row.RowBefore[col]
+		if binary, ok := b64[col]; ok {
+			v = decodeStoredBase64(v, binary)
+		}
+		setParts = append(setParts, g.quoteName(col)+" = "+g.formatValue(v))
 	}
 
 	// WHERE uses row_after (current state), so the UPDATE finds the right row
@@ -529,6 +621,10 @@ func (g *Generator) pkWhereClause(resolver *metadata.Resolver, schema, table str
 		} else {
 			pkCols := tm.PKColumnMetas()
 			if len(pkCols) > 0 {
+				// A BLOB/TEXT column can be a PK with a prefix length, and its
+				// row value is the same base64 string as elsewhere — decode it or
+				// the WHERE matches zero rows (silent no-op recovery, #653).
+				b64 := g.base64Cols(resolver, schema, table)
 				parts := make([]string, 0, len(pkCols))
 				names := make([]string, 0, len(pkCols))
 				allFound := true
@@ -537,6 +633,9 @@ func (g *Generator) pkWhereClause(resolver *metadata.Resolver, schema, table str
 					if !ok {
 						allFound = false
 						break
+					}
+					if binary, isB64 := b64[pk.Name]; isB64 {
+						v = decodeStoredBase64(v, binary)
 					}
 					parts = append(parts, g.quoteName(pk.Name)+" = "+g.formatValue(v))
 					names = append(names, pk.Name)

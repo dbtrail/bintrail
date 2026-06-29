@@ -15,6 +15,139 @@ import (
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
+// TestGenerateSQL_blobAndTextRoundTrip verifies #653: a BLOB column recovers as
+// an X'hex' literal of the original bytes, and a TEXT column as the original
+// string — not the base64 text both are STORED as (go-mysql delivers BLOB/TEXT
+// as []byte, which marshalRow base64-encodes). Pre-fix the reversal SQL emitted
+// the base64 strings verbatim, corrupting the restored values. The negative
+// assertions are the anchor: pre-fix the output DID contain the base64 strings.
+func TestGenerateSQL_blobAndTextRoundTrip(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Snapshot so the resolver types bl=blob (binary) and tx=text.
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "m", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "m", "bl", 2, "", "blob", "YES")
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "m", "tx", 3, "", "text", "YES")
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "m", "vc", 4, "", "varchar", "YES")
+
+	// row_before as stored: bl/tx are base64 strings (the storage encoding), vc a
+	// plain string, id a number. "QklOAEJMT0I=" = base64("BIN\0BLOB"),
+	// "aGVsbG8gdGV4dA==" = base64("hello text").
+	rowBefore := []byte(`{"id":1,"bl":"QklOAEJMT0I=","tx":"aGVsbG8gdGV4dA==","vc":"plain"}`)
+	testutil.InsertEvent(t, db,
+		"binlog.000001", 100, 200, "2026-02-19 14:00:00", nil,
+		"mydb", "m", 3, "1",
+		nil, rowBefore, nil,
+	)
+
+	resolver, err := metadata.NewResolver(db, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	g := New(db, resolver)
+	var buf bytes.Buffer
+	if _, err := g.GenerateSQL(context.Background(), query.Options{Schema: "mydb", Table: "m", Limit: 100}, &buf); err != nil {
+		t.Fatalf("GenerateSQL: %v", err)
+	}
+	out := buf.String()
+
+	// BLOB → exact hex of the original bytes B,I,N,0x00,B,L,O,B.
+	assertContains(t, out, "X'42494e00424c4f42'")
+	// TEXT → the readable original string.
+	assertContains(t, out, "'hello text'")
+	// VARCHAR (not base64-encoded in storage) → unchanged.
+	assertContains(t, out, "'plain'")
+	// Anchor: the base64 storage strings must NOT survive into the reversal SQL.
+	if strings.Contains(out, "QklOAEJMT0I=") {
+		t.Errorf("BLOB emitted as base64 text (corrupt round-trip, #653):\n%s", out)
+	}
+	if strings.Contains(out, "aGVsbG8gdGV4dA==") {
+		t.Errorf("TEXT emitted as base64 text (corrupt round-trip, #653):\n%s", out)
+	}
+}
+
+// TestGenerateSQL_updateSetBlobTextDecoded covers the SET-clause path of #653
+// (buildUpdate, the more common event type) plus the NULL and empty-blob edges:
+// a reverse-UPDATE must restore the BLOB as X'hex', the TEXT as a string, a NULL
+// blob as NULL, and an empty blob as X'' — never the base64 storage strings.
+func TestGenerateSQL_updateSetBlobTextDecoded(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "mu", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "mu", "bl", 2, "", "blob", "YES")
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "mu", "tx", 3, "", "text", "YES")
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "mu", "nb", 4, "", "blob", "YES")
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "mu", "eb", 5, "", "blob", "YES")
+
+	// UPDATE event (type 2): SET restores row_before, WHERE uses row_after PK.
+	// nb is a NULL blob, eb an empty blob ("" base64-decodes to []byte{} → X'').
+	rowBefore := []byte(`{"id":1,"bl":"QklOAEJMT0I=","tx":"aGVsbG8gdGV4dA==","nb":null,"eb":""}`)
+	rowAfter := []byte(`{"id":1,"bl":"QkFE","tx":"YmFk","nb":null,"eb":""}`)
+	testutil.InsertEvent(t, db,
+		"binlog.000001", 100, 200, "2026-02-19 14:00:00", nil,
+		"mydb", "mu", 2, "1",
+		nil, rowBefore, rowAfter,
+	)
+
+	resolver, err := metadata.NewResolver(db, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	g := New(db, resolver)
+	var buf bytes.Buffer
+	if _, err := g.GenerateSQL(context.Background(), query.Options{Schema: "mydb", Table: "mu", Limit: 100}, &buf); err != nil {
+		t.Fatalf("GenerateSQL: %v", err)
+	}
+	out := buf.String()
+
+	assertContains(t, out, "X'42494e00424c4f42'") // bl → hex of original bytes
+	assertContains(t, out, "'hello text'")         // tx → readable string
+	assertContains(t, out, "`nb` = NULL")          // NULL blob stays NULL
+	assertContains(t, out, "`eb` = X''")           // empty blob → X''
+	if strings.Contains(out, "QklOAEJMT0I=") || strings.Contains(out, "aGVsbG8gdGV4dA==") {
+		t.Errorf("SET clause emitted base64 text (#653):\n%s", out)
+	}
+}
+
+// TestGenerateSQL_textPKWhereDecoded covers the pkWhereClause path: a TEXT (or
+// BLOB) column can be a PK with a prefix length, and its WHERE value is the same
+// base64 string. Without decoding, the WHERE matches zero rows (silent no-op
+// recovery). The reverse-UPDATE's WHERE must use the decoded text, not base64.
+func TestGenerateSQL_textPKWhereDecoded(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "mk", "tk", 1, "PRI", "text", "NO")
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "mydb", "mk", "c", 2, "", "int", "YES")
+
+	// "a2V5MQ==" = base64("key1"). WHERE uses row_after's PK (tk).
+	rowBefore := []byte(`{"tk":"a2V5MQ==","c":1}`)
+	rowAfter := []byte(`{"tk":"a2V5MQ==","c":2}`)
+	testutil.InsertEvent(t, db,
+		"binlog.000001", 100, 200, "2026-02-19 14:00:00", nil,
+		"mydb", "mk", 2, "key1",
+		nil, rowBefore, rowAfter,
+	)
+
+	resolver, err := metadata.NewResolver(db, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	g := New(db, resolver)
+	var buf bytes.Buffer
+	if _, err := g.GenerateSQL(context.Background(), query.Options{Schema: "mydb", Table: "mk", Limit: 100}, &buf); err != nil {
+		t.Fatalf("GenerateSQL: %v", err)
+	}
+	out := buf.String()
+
+	assertContains(t, out, "WHERE `tk` = 'key1'") // decoded text PK, not base64
+	if strings.Contains(out, "a2V5MQ==") {
+		t.Errorf("WHERE clause emitted base64 PK — matches zero rows (#653):\n%s", out)
+	}
+}
+
 func TestGenerateSQL_deleteToInsert(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
