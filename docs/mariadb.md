@@ -8,7 +8,10 @@ pointing it at production.
 
 **Scope:** MariaDB is supported as a **source** (the database you capture
 changes from). The **index** — where bintrail stores the indexed events — stays
-**MySQL**. Pointing the index at MariaDB is not supported.
+**MySQL**. Pointing the index at MariaDB is not supported. Because the index is
+MySQL, the index-side tooling works unchanged: `query`, `recover`,
+`recover-cascade` (FK cascade recovery), and `verify` (consistency check) all
+apply to a MariaDB source.
 
 ---
 

@@ -430,8 +430,10 @@ your own round-trip.
 - **`GENERATED ... AS IDENTITY` / generated columns** can need care on recovery
   (`GENERATED ALWAYS AS IDENTITY` rejects an explicit insert; `STORED` generated
   columns are absent from the stream before PostgreSQL 18). Treat as best-effort.
-- **`reconstruct` / time-travel `shim` are not wired for PostgreSQL** (no
-  baseline yet) — see above.
+- **`reconstruct`, time-travel `shim`, and the baseline-anchored mode of
+  `verify` are not wired for PostgreSQL** (no baseline yet) — see above.
+  (`recover` and `recover-cascade` work; cascades are captured as ordinary row
+  changes — see [Querying and recovering](#querying-and-recovering).)
 - **No connection/forensics attribution.** `pgoutput` does not carry the backend
   PID, so the per-connection forensics surface (available for MySQL) is empty
   for PostgreSQL.

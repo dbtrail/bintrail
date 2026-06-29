@@ -45,6 +45,13 @@ detection on resume, which now works for MariaDB in both position and GTID mode.
 The MariaDB-specific setup, version support, alpha limitations, and
 troubleshooting live on the dedicated page: **[MariaDB](mariadb.md)**.
 
+## PostgreSQL as a source (beta)
+
+bintrail also captures from **PostgreSQL** (beta) via the separate `bintrail-pg`
+binary, over logical replication (`pgoutput`) — the index still stays MySQL.
+Setup, requirements, the slot/WAL operator boundary, type support, and beta
+limitations live on the dedicated page: **[PostgreSQL](postgres.md)**.
+
 ---
 
 ## The Problem
@@ -80,10 +87,16 @@ The `stream_state` table has exactly one row (enforced by a `CHECK (id = 1)` con
 | `last_event_time` | Timestamp of the last indexed event |
 | `last_checkpoint` | When the checkpoint was last written |
 | `server_id` | The `--server-id` used |
+| `bintrail_id` | The server identity this checkpoint belongs to |
+| `flavor` | Source flavor (`mysql` / `mariadb`; PostgreSQL capture uses its own LSN/slot state) |
+| `gap_lost_at` / `gap_lost_detail` | Stamped when an unfillable gap permanently lost data — see [Binlog Gap Detection](#binlog-gap-detection) and the [continuity signal](rotation-and-status.md#stream-continuity-no-data-lost) |
+| `source_health` | Periodic source-health snapshot (JSON) powering the console replication-health panel (e.g. a PostgreSQL slot's state) |
 
 **GTID accumulation**: In GTID mode, the stream state doesn't store just the latest GTID — it stores the entire accumulated executed GTID set. This is how MySQL replication works: when resuming, you tell MySQL "I've already seen all of these GTIDs, send me everything after."
 
 **Checkpoint interval**: Default 10 seconds, configurable via `--checkpoint`. This is the maximum amount of data you'd need to re-index if the process crashes — events between the last checkpoint and the crash are re-indexed on restart (they're deduplicated naturally because the same GTID/position is just re-received from MySQL).
+
+**Commit-boundary safety**: in GTID mode the checkpoint advances **only at transaction-commit boundaries**, never mid-transaction, so a saved `gtid_set` is always a set of fully-applied transactions — a crash can't persist a partial GTID that would skip the rest of that transaction on resume.
 
 ### Mode switching
 

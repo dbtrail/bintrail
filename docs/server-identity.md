@@ -174,6 +174,31 @@ mydb     orders     (table)   billing   2026-03-01 05:00:00
 
 `(table)` in the COLUMN field means the flag applies to the table as a whole.
 
+### `bintrail profile` and `bintrail access` commands
+
+Flags label *what* is sensitive; **profiles** and **access rules** decide *who*
+may see it. A profile is a named role; an access rule maps a profile to a flag
+with `allow` or `deny`. At query time, `--profile <name>` withholds denied tables
+and redacts (NULLs) denied columns.
+
+```sh
+# 1. Create a profile (a role)
+bintrail profile add marketing --description "Marketing analysts" --index-dsn "$IDX"
+
+# 2. Grant/deny that profile access to a flag
+bintrail access add --profile marketing --flag pii --permission deny --index-dsn "$IDX"
+
+# 3. Run a query/recover as that profile — pii-flagged columns come back NULL,
+#    deny-flagged tables are withheld
+bintrail query  --profile marketing --schema mydb --table customers --index-dsn "$IDX"
+bintrail recover --profile marketing --schema mydb --table orders   --index-dsn "$IDX" --dry-run
+```
+
+`profile remove <name>` deletes a profile and cascades to its access rules;
+`profile list` and `access list [--profile <name>]` show what's configured.
+`access remove --profile <name> --flag <flag>` drops a single rule. All take
+`--index-dsn`.
+
 ### `--flag` Filter on `query` and `recover`
 
 Once flags are applied, you can filter events to only those from flagged tables or columns:

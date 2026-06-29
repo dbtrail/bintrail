@@ -12,7 +12,7 @@ Before DDL tracking, the only solution was to notice the "column count mismatch"
 
 DDL tracking solves three problems:
 
-1. **Detection**: The parser identifies DDL statements (`ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`, `RENAME TABLE`) and emits them as events instead of just logging warnings.
+1. **Detection**: The parser identifies DDL statements (`ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`, `RENAME TABLE`, `TRUNCATE TABLE`) and emits them as events instead of just logging warnings.
 2. **Auto-snapshot**: When a DDL is detected and a source database connection is available, dbtrail automatically takes a new snapshot and hot-swaps the resolver — no manual intervention needed. This works in both stream mode (always has source connection) and file mode (when `--source-dsn` is provided).
 3. **Restore coverage**: The `status` command shows the time range of indexed events and warns about DDLs that weren't followed by a snapshot (file mode), so you know where recovery gaps might exist.
 

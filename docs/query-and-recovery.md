@@ -246,6 +246,17 @@ bintrail recover-cascade --index-dsn "..." \
   re-created a deleted parent, remove its `INSERT` from the output —
   `FOREIGN_KEY_CHECKS=0` does not suppress primary-key violations.
 
+### Recovering many rows at once
+
+To reverse a specific set of primary keys, pass `--pks` (comma-separated) instead
+of a single `--pk`, and cap how many events are undone per key with
+`--limit-per-pk`. These compose with the shared event filters
+(`--schema`/`--table`/`--event-type`/`--since`/`--until`/`--column-eq`/`--gtid`/`--flag`).
+
+**PostgreSQL sources:** when the source is PostgreSQL, `recover` emits
+PostgreSQL-dialect reversal SQL (identifier quoting and type literals) rather than
+MySQL syntax — see [PostgreSQL](postgres.md#querying-and-recovering).
+
 ### WHERE Clause Strategy
 
 For `UPDATE` and `DELETE` reversals, the generator needs a `WHERE` clause to identify the correct row in the current database state.

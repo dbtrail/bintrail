@@ -63,6 +63,8 @@ total_GB = Σ over sources ( events_per_day × retain_days × avg_event_bytes ) 
 
 Adding a server from the console is a disk decision, not just a connection — budget for it.
 
+**Baselines are separate storage.** A `bintrail baseline` snapshot (used for full-table time-travel and [`verify`](verify.md)) is Parquet, written to disk or S3 *outside* the index MySQL — so it is **not** part of `total_GB` above. Size it like an archive (≈30–60× smaller than the live index per the table above), one snapshot per dump; local snapshots can be pruned automatically once a durable S3 copy exists (`--baseline-retain`, see [Dump & Baseline](./dump-and-baseline.md)). `bintrail status` reports the live index size and per-snapshot baseline sizes directly.
+
 ### Estimating `events_per_day` before you have history
 
 If dbtrail isn't streaming yet, ask the source itself. On the production MySQL:
