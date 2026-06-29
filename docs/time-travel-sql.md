@@ -19,7 +19,65 @@ The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a
                                 └──────────┘                   └────────────┘
 ```
 
-The whole walkthrough takes about 10 minutes on a fresh Ubuntu 22.04 or Amazon Linux 2023 host that already has a populated dbtrail index.
+## Two ways to run time-travel SQL
+
+There are two ways to put `AS OF` SQL in front of your data; they differ only in
+*how the client connects*:
+
+1. **A dedicated terminal — point `mysql` straight at the shim (no ProxySQL).**
+   Simplest. The shim already speaks the MySQL protocol, so an analyst connects
+   a `mysql` client directly to it and runs `_flashback` / `_snapshot` / `_diff`
+   queries. Trade-off: that connection answers *only* time-travel queries (a
+   normal `SELECT` against a real table returns `ER_NOT_SUPPORTED_YET`, 1235).
+   Use it when a person or tool just needs to read historical state.
+2. **Transparent routing — ProxySQL in front (the rest of this guide).** Needed
+   only when an application's *normal* connection must mix live queries and
+   `AS OF` queries on the same endpoint. ProxySQL routes virtual-schema queries
+   to the shim and everything else to your real MySQL.
+
+### The dedicated terminal
+
+**With the Docker Compose stack**, the shim ships as the opt-in `flashback`
+profile. It serves the boot `SOURCE_DSN` source, so set `SOURCE_DSN` in `.env`
+and bring it up *with* the full stack (`up -d`, not `up -d shim`, so the
+streaming `bintrail` service comes along — see [docker.md](./docker.md)):
+
+```sh
+SHIM_USER=analyst SHIM_PASSWORD='pick-a-strong-one' \
+  docker compose --profile flashback up -d
+```
+
+**Standalone** (the shim is a subcommand of the core `bintrail` binary), run it
+against your index — no ProxySQL, and the source MySQL need not even be
+reachable (the shim reads the index). `init-shim` reads `BINTRAIL_SOURCE_DSN`
+and `BINTRAIL_SERVER_ID` from the environment (or `.bintrail.env`):
+
+```sh
+export BINTRAIL_SOURCE_DSN='user:pass@tcp(your-db:3306)/yourdb' BINTRAIL_SERVER_ID=prod-1
+bintrail init-shim --out shim.yaml          # then fill in mysql_user + mysql_password
+bintrail shim --shim-config shim.yaml \
+  --index-dsn 'user:pass@tcp(127.0.0.1:3306)/bintrail_index'
+```
+
+Either way, connect a plain `mysql` client to the shim's port (default `3308`)
+and query the virtual schemas:
+
+```sh
+mysql -h 127.0.0.1 -P 3308 -u analyst -p
+mysql> USE myapp;
+mysql> SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
+mysql> SELECT * FROM _snapshot.orders  AS OF '2026-05-02 10:00:00';   -- full table (needs a baseline)
+```
+
+`_snapshot.*` (the complete table as it was) requires a baseline configured with
+`--baseline-dir` / `--baseline-s3` (or `BASELINE_DIR` on the compose profile);
+without one, `_flashback.*` returns only rows with binlog activity in the
+retained window. The statement shapes and their semantics are identical on both
+paths — see **Step 6 — Run a time-travel query** below.
+
+---
+
+The ProxySQL walkthrough below takes about 10 minutes on a fresh Ubuntu 22.04 or Amazon Linux 2023 host that already has a populated dbtrail index.
 
 ---
 
