@@ -120,9 +120,18 @@ services:
     # by sorting narrow keys only (internal/query late materialization); 4M is
     # defense-in-depth for any other sort, bounded and cheap at this index's low
     # connection concurrency.
+    #
+    # --max-allowed-packet=1G raises the 64M stock default. A single INSERT into
+    # binlog_events carries the full before/after row images as JSON; a large
+    # BLOB/JSON value is base64-inflated ~1.33× and can exceed 64M, which the
+    # server would reject (#652). 1G is the MySQL maximum. bintrail's client
+    # honors this via config.Connect (maxAllowedPacket=0 → fetched from server).
+    # This is a ceiling raise, not a fix: events above 1G are still rejected and
+    # must fail loud rather than drop silently (see #652).
     command:
       - "--innodb-flush-log-at-trx-commit=2"
       - "--sort-buffer-size=4M"
+      - "--max-allowed-packet=1G"
     environment:
       # 8.4 defaults to caching_sha2_password (native_password disabled);
       # bintrail's driver negotiates it over the plaintext Docker network.

@@ -99,17 +99,11 @@ const defaultTimeout = 10 * time.Second
 // A 10-second TCP connect timeout is applied when the DSN does not specify one.
 // The caller is responsible for closing the returned *sql.DB.
 func Connect(dsn string) (*sql.DB, error) {
-	cfg, err := mysql.ParseDSN(dsn)
+	normalized, err := buildDSN(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("invalid DSN: %w", err)
+		return nil, err
 	}
-	cfg.ParseTime = true
-	cfg.Loc = time.UTC
-	if cfg.Timeout == 0 {
-		cfg.Timeout = defaultTimeout
-	}
-
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("mysql", normalized)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open MySQL connection: %w", err)
 	}
@@ -118,6 +112,45 @@ func Connect(dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to ping MySQL: %w", err)
 	}
 	return db, nil
+}
+
+// buildDSN applies bintrail's connection invariants to a user DSN and returns
+// the normalized DSN string. Split out from Connect so the invariants are unit
+// testable without a live server. Invariants: parseTime=true (DATETIME scans
+// into time.Time), Loc=UTC, a default connect timeout, and honoring the
+// server's max_allowed_packet.
+func buildDSN(dsn string) (string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("invalid DSN: %w", err)
+	}
+	cfg.ParseTime = true
+	cfg.Loc = time.UTC
+	if cfg.Timeout == 0 {
+		cfg.Timeout = defaultTimeout
+	}
+	// Honor the server's max_allowed_packet instead of the go-sql-driver's
+	// 64 MiB client-side default. binlog_events stores full before/after row
+	// images as JSON, and a large BLOB/JSON value (base64-inflated ~1.33×) can
+	// exceed 64 MiB; with the client capped at 64 MiB the driver rejects the
+	// write locally even when the server would accept it. maxAllowedPacket=0
+	// makes the driver fetch @@max_allowed_packet from the server (the bundled
+	// index MySQL raises it to 1 GiB; BYO indexes get whatever they set).
+	//
+	// This is a ceiling raise, not a fix — events larger than the server's
+	// max_allowed_packet are still rejected; that rejection must be handled
+	// fail-loud rather than silently dropped (see #652). An explicit
+	// maxAllowedPacket in the user's DSN is preserved.
+	if !dsnSpecifiesMaxAllowedPacket(dsn) {
+		cfg.MaxAllowedPacket = 0
+	}
+	return cfg.FormatDSN(), nil
+}
+
+// dsnSpecifiesMaxAllowedPacket reports whether the user's DSN already carries a
+// maxAllowedPacket parameter, so buildDSN does not override an explicit choice.
+func dsnSpecifiesMaxAllowedPacket(dsn string) bool {
+	return strings.Contains(strings.ToLower(dsn), "maxallowedpacket")
 }
 
 // ParseSourceDSN decomposes a go-sql-driver DSN into host, port, user, and

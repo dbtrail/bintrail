@@ -26,6 +26,57 @@ func TestConnect_locUTCApplied(t *testing.T) {
 	}
 }
 
+// TestBuildDSN_honorsServerMaxAllowedPacket verifies that buildDSN sets
+// MaxAllowedPacket=0 (fetch the limit from the server) instead of leaving the
+// driver's 64 MiB client-side default, so large row images up to the index
+// server's configured ceiling can be written. It re-parses the output to assert
+// on the resolved config (FormatDSN omits loc=UTC because UTC is the driver
+// default, so a string check would miss it). It also confirms the existing
+// invariants (ParseTime, Loc=UTC) survive the round-trip.
+func TestBuildDSN_honorsServerMaxAllowedPacket(t *testing.T) {
+	out, err := buildDSN("root:pass@tcp(127.0.0.1:3306)/bintrail_index")
+	if err != nil {
+		t.Fatalf("buildDSN: %v", err)
+	}
+	cfg, err := mysql.ParseDSN(out)
+	if err != nil {
+		t.Fatalf("re-parse buildDSN output %q: %v", out, err)
+	}
+	if cfg.MaxAllowedPacket != 0 {
+		t.Errorf("expected MaxAllowedPacket=0 (honor server limit), got %d", cfg.MaxAllowedPacket)
+	}
+	if !cfg.ParseTime {
+		t.Error("expected ParseTime=true preserved")
+	}
+	if cfg.Loc != time.UTC {
+		t.Errorf("expected Loc=UTC preserved, got %v", cfg.Loc)
+	}
+}
+
+// TestBuildDSN_explicitMaxAllowedPacketWins verifies precedence: an explicit
+// maxAllowedPacket in the user's DSN is not overridden by the server-honoring
+// default. Matches the project's CLI flag > env > default precedence ethos.
+func TestBuildDSN_explicitMaxAllowedPacketWins(t *testing.T) {
+	out, err := buildDSN("root:pass@tcp(127.0.0.1:3306)/db?maxAllowedPacket=33554432")
+	if err != nil {
+		t.Fatalf("buildDSN: %v", err)
+	}
+	cfg, err := mysql.ParseDSN(out)
+	if err != nil {
+		t.Fatalf("re-parse buildDSN output %q: %v", out, err)
+	}
+	if cfg.MaxAllowedPacket != 33554432 {
+		t.Errorf("explicit DSN maxAllowedPacket should be preserved, got %d", cfg.MaxAllowedPacket)
+	}
+}
+
+// TestBuildDSN_invalid surfaces a parse error rather than panicking.
+func TestBuildDSN_invalid(t *testing.T) {
+	if _, err := buildDSN("not-a-valid-dsn::::"); err == nil {
+		t.Error("expected error for invalid DSN, got nil")
+	}
+}
+
 // binlogStatusColumns matches the layout SHOW BINARY LOG STATUS /
 // SHOW MASTER STATUS returns: File, Position, Binlog_Do_DB,
 // Binlog_Ignore_DB, Executed_Gtid_Set. CurrentBinlogPosition scans
