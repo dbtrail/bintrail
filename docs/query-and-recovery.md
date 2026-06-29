@@ -290,5 +290,5 @@ COMMIT;
 Key properties:
 - Wrapped in `BEGIN` / `COMMIT` — all changes apply atomically or not at all.
 - Comments before each statement showing the original event ID, type, table, PK, timestamp, and GTID.
-- Generation errors emit a `-- ERROR ...` comment rather than halting — the script remains runnable (the transaction will roll back on the first error anyway).
+- Per-event generation errors emit a `-- ERROR ...` comment rather than halting — the script remains runnable (the transaction rolls back on the first error anyway). **Schema drift is the exception:** if a statement references a column dropped or renamed after the event, `recover` refuses up front — it writes nothing and exits non-zero (with `--output`, the target file is left empty), rather than emitting SQL that would fail at apply time. Always check the exit code before applying a generated file.
 - **Never auto-executed**: dbtrail only generates the file. Applying it is always a manual step.

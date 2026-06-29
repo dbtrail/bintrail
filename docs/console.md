@@ -425,10 +425,11 @@ A running server accepts it on the next login — no restart needed.
 The binary has no Supabase/RBAC backend to lean on, so the console defends
 itself:
 
-- **Loopback by default + a credential required.** A random 128-bit token is
-  generated for loopback binds and printed in the URL. Binding to a
-  non-loopback address (`0.0.0.0`, a LAN IP, …) **requires** an explicit
-  `--token` or a configured console password, or the command refuses to start.
+- **Loopback by default + a credential required.** On a loopback bind the
+  console prompts you to create a password on first run — no credential is ever
+  auto-generated for you. Binding to a non-loopback address (`0.0.0.0`, a LAN
+  IP, …) **requires** an explicit `--token` or a configured console password, or
+  the command refuses to start.
 - **Constant-time credential checks** (`crypto/subtle` for the token;
   sessions are looked up by SHA-256 of the presented value, so raw session
   tokens never live server-side; unknown-username logins still burn a full

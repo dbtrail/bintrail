@@ -215,7 +215,7 @@ journalctl -u bintrail-stream -f
 
 [docker.md](docker.md) is the canonical home for the image, `docker run`, and the compose stack. For production, harden that base:
 - Use Docker secrets or environment files instead of inline credentials
-- Pin image versions (`FROM golang:1.25.7-alpine` in your Dockerfile)
+- Pin image versions (`FROM golang:1.25.11-bookworm` in your Dockerfile — the DuckDB Go bindings link glibc, so an Alpine/musl base breaks at runtime)
 - Mount a named volume for any persistent state (the index MySQL is the real persistent state — dbtrail itself is stateless)
 - Set resource limits (`mem_limit`, `cpus`) on the bintrail container
 

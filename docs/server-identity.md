@@ -98,7 +98,7 @@ Server (unknown)
 
 The flag system lets you label tables and columns with named flags (e.g. `billing`, `pii`, `sensitive`). These flags are the foundation for role-based access control: access rules can then restrict which profiles may query data carrying each flag.
 
-**Current state**: The flag infrastructure (`table_flags`, `profiles`, `access_rules` tables and the `bintrail flag` CLI) is fully implemented. Profile enforcement with query-time column redaction is tracked in separate follow-up issues.
+**Current state**: Fully implemented and enforced. The flag registry (`table_flags`, `profiles`, `access_rules` tables, managed by the `bintrail flag`, `bintrail profile`, and `bintrail access` CLIs) is in place, and **profile enforcement is live**: pass `--profile <name>` to `query` or `recover` and the read path withholds denied tables and redacts (NULLs) flagged columns at query time. See [`bintrail profile` / `bintrail access`](#bintrail-profile-and-bintrail-access-commands) below.
 
 ### Database Tables
 

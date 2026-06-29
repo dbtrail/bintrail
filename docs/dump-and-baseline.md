@@ -116,7 +116,7 @@ bintrail dump \
   --output-dir /tmp/mydumper-output
 ```
 
-This dumps all user schemas from the source server into `/tmp/mydumper-output`.
+This dumps **every accessible schema** into `/tmp/mydumper-output` — bare `bintrail dump` applies no schema filter, so mydumper also tries `mysql`, `sys`, and `performance_schema`. Pass `--schemas mydb,otherdb` to scope it to your data: a least-privilege capture user (no `SHOW VIEW` on the `sys` views) **needs** that filter or the dump fails loudly. (The bundled Compose `baseline` profile excludes system schemas automatically; the bare CLI does not.)
 
 ### All flags
 

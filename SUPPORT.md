@@ -85,7 +85,11 @@ The boundary triage cites:
 
 ## Source server configuration (required for correct capture)
 
-dbtrail reads ROW-format binary logs from your **source** MySQL. Faithful capture
+dbtrail captures changes from your **source** database — **MySQL**, **MariaDB**
+(alpha), or **PostgreSQL** (beta); see [Supported source families](#supported-source-families)
+below. The requirements here cover a **MySQL** (and MariaDB) source's ROW-format
+binary logs; PostgreSQL's capture requirements (logical replication, `wal_level`,
+`REPLICA IDENTITY`) live in [docs/postgres.md](docs/postgres.md). Faithful capture
 requires the source to be configured **server-wide** (not just per-session):
 
 - `binlog_format = ROW`.

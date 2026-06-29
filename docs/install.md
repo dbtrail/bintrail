@@ -18,7 +18,7 @@ it's the first section — the same four lines as the README.
   and `SELECT`.
 - An **index MySQL 8.0+** database for dbtrail's data (the Compose stack
   bundles one).
-- Go 1.24+ — only when building from source.
+- Go 1.25+ (the module targets `go 1.25.11`) — only when building from source. The default `GOTOOLCHAIN=auto` fetches the right toolchain for you.
 
 ## Docker Compose (the bundled default)
 
