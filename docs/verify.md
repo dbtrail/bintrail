@@ -84,8 +84,8 @@ diff tool involved.
 | `--explain` | `false` | On a baseline-anchored mismatch, print a per-row drill-down |
 
 It also accepts the shared DuckDB tuning flags (`--ultrafast`,
-`--duckdb-threads`, `--duckdb-memory-limit`) — see
-[Query & Recovery](query-and-recovery.md#duckdb-resource-tuning).
+`--duckdb-threads`, `--duckdb-memory-limit`) — see the DuckDB resource tuning
+section in [Query & Recovery](query-and-recovery.md).
 
 ## How it relates to `recover` and `reconstruct`
 
