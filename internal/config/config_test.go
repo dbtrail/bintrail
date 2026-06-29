@@ -30,9 +30,10 @@ func TestConnect_locUTCApplied(t *testing.T) {
 // MaxAllowedPacket=0 (fetch the limit from the server) instead of leaving the
 // driver's 64 MiB client-side default, so large row images up to the index
 // server's configured ceiling can be written. It re-parses the output to assert
-// on the resolved config (FormatDSN omits loc=UTC because UTC is the driver
-// default, so a string check would miss it). It also confirms the existing
-// invariants (ParseTime, Loc=UTC) survive the round-trip.
+// on the resolved config. ParseTime and Timeout are meaningful checks here
+// (ParseDSN defaults them to false / 0); the Loc override is verified
+// separately in TestBuildDSN_forcesLocUTC (a plain DSN can't prove it because
+// ParseDSN already defaults Loc to UTC).
 func TestBuildDSN_honorsServerMaxAllowedPacket(t *testing.T) {
 	out, err := buildDSN("root:pass@tcp(127.0.0.1:3306)/bintrail_index")
 	if err != nil {
@@ -48,14 +49,34 @@ func TestBuildDSN_honorsServerMaxAllowedPacket(t *testing.T) {
 	if !cfg.ParseTime {
 		t.Error("expected ParseTime=true preserved")
 	}
-	if cfg.Loc != time.UTC {
-		t.Errorf("expected Loc=UTC preserved, got %v", cfg.Loc)
+	if cfg.Timeout != defaultTimeout {
+		t.Errorf("expected default Timeout=%v applied, got %v", defaultTimeout, cfg.Timeout)
 	}
 }
 
-// TestBuildDSN_explicitMaxAllowedPacketWins verifies precedence: an explicit
-// maxAllowedPacket in the user's DSN is not overridden by the server-honoring
-// default. Matches the project's CLI flag > env > default precedence ethos.
+// TestBuildDSN_forcesLocUTC verifies buildDSN overrides a user-supplied loc
+// with UTC. The input sets loc=Local (which survives a FormatDSN round-trip
+// unless overridden), so the assertion would fail if the cfg.Loc=UTC line were
+// removed — unlike a plain DSN, where ParseDSN already defaults Loc to UTC.
+func TestBuildDSN_forcesLocUTC(t *testing.T) {
+	out, err := buildDSN("root:pass@tcp(127.0.0.1:3306)/db?loc=Local")
+	if err != nil {
+		t.Fatalf("buildDSN: %v", err)
+	}
+	cfg, err := mysql.ParseDSN(out)
+	if err != nil {
+		t.Fatalf("re-parse buildDSN output %q: %v", out, err)
+	}
+	if cfg.Loc != time.UTC {
+		t.Errorf("expected Loc forced to UTC, got %v", cfg.Loc)
+	}
+}
+
+// TestBuildDSN_explicitMaxAllowedPacketWins verifies precedence: an explicit,
+// non-default maxAllowedPacket in the user's DSN is not overridden by the
+// server-honoring default. Matches the project's CLI flag > env > default
+// precedence ethos. 33554432 (32 MiB) differs from both the driver default
+// (67108864) and the server-honoring 0, so it genuinely discriminates.
 func TestBuildDSN_explicitMaxAllowedPacketWins(t *testing.T) {
 	out, err := buildDSN("root:pass@tcp(127.0.0.1:3306)/db?maxAllowedPacket=33554432")
 	if err != nil {
@@ -67,6 +88,43 @@ func TestBuildDSN_explicitMaxAllowedPacketWins(t *testing.T) {
 	}
 	if cfg.MaxAllowedPacket != 33554432 {
 		t.Errorf("explicit DSN maxAllowedPacket should be preserved, got %d", cfg.MaxAllowedPacket)
+	}
+}
+
+// TestBuildDSN_miscasedParamHonorsServer guards the precedence logic against the
+// casing class: a mis-cased maxAllowedPacket param is NOT recognized by the
+// case-sensitive go-sql-driver (it leaves MaxAllowedPacket at the default), so
+// buildDSN must fall through to the safe server-honoring 0 rather than silently
+// leave the client capped at 64 MiB. A substring/case-insensitive guard would
+// regress this.
+func TestBuildDSN_miscasedParamHonorsServer(t *testing.T) {
+	out, err := buildDSN("root:pass@tcp(127.0.0.1:3306)/db?MaxAllowedPacket=33554432")
+	if err != nil {
+		t.Fatalf("buildDSN: %v", err)
+	}
+	cfg, err := mysql.ParseDSN(out)
+	if err != nil {
+		t.Fatalf("re-parse buildDSN output %q: %v", out, err)
+	}
+	if cfg.MaxAllowedPacket != 0 {
+		t.Errorf("mis-cased param (ignored by the driver) should honor the server (0), got %d", cfg.MaxAllowedPacket)
+	}
+}
+
+// TestBuildDSN_credentialSubstringHonorsServer guards against a regression to
+// substring-matching the whole DSN: a password that contains the literal
+// "maxAllowedPacket" must NOT suppress the server-honoring default.
+func TestBuildDSN_credentialSubstringHonorsServer(t *testing.T) {
+	out, err := buildDSN("root:maxAllowedPacketX@tcp(127.0.0.1:3306)/db")
+	if err != nil {
+		t.Fatalf("buildDSN: %v", err)
+	}
+	cfg, err := mysql.ParseDSN(out)
+	if err != nil {
+		t.Fatalf("re-parse buildDSN output %q: %v", out, err)
+	}
+	if cfg.MaxAllowedPacket != 0 {
+		t.Errorf("a credential containing the param name must not suppress server-honoring (0), got %d", cfg.MaxAllowedPacket)
 	}
 }
 
