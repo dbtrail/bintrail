@@ -8,7 +8,7 @@ dbtrail indexes every INSERT, UPDATE, and DELETE from MySQL ROW-format binary lo
 
 dbtrail ingests changes two ways:
 
-- **`bintrail stream`** (and `bintrail up`, which wraps it) connects over the MySQL **replication protocol** — no access to binlog files on disk. This is the default, the only option for managed MySQL (RDS, Aurora, Cloud SQL), and runs anywhere with a TCP path to the source. See [Streaming](streaming.md). A **MariaDB** source is supported in alpha — see [MariaDB](mariadb.md). A **PostgreSQL** source is supported in alpha via the separate `bintrail-pg` binary — see [PostgreSQL](postgres.md).
+- **`bintrail stream`** (and `bintrail up`, which wraps it) connects over the MySQL **replication protocol** — no access to binlog files on disk. This is the default, the only option for managed MySQL (RDS, Aurora, Cloud SQL), and runs anywhere with a TCP path to the source. See [Streaming](streaming.md). A **MariaDB** source is supported in alpha — see [MariaDB](mariadb.md). A **PostgreSQL** source is supported in beta via the separate `bintrail-pg` binary — see [PostgreSQL](postgres.md).
 - **`bintrail index`** reads binlog **files** from a local path (`--binlog-dir`). Use it to **backfill** historical files on self-managed MySQL; it never reads remote, SSH, or object-storage paths, and it opens files read-only. See [Indexing](indexing.md).
 
 | | `bintrail index` | `bintrail stream` |
@@ -468,6 +468,42 @@ mysql -u root -p shop < cascade-recovery.sql
 **Verify** — `SELECT` the parent and a child table to confirm the subtree is back.
 
 See [Query & Recovery](query-and-recovery.md) for the full flag reference and the exact best-effort boundaries.
+
+---
+
+### Scenario N: Prove a recovery would actually work — before you need it
+
+You don't want to discover a broken recovery chain *during* an incident. `bintrail
+verify` reconstructs your data from the baseline + indexed binlog and checks it
+reproduces the source — per table, `match` / `mismatch` / `inconclusive`.
+
+**Run the drift-free check** (no live source, no production impact — safe on a
+schedule). It compares the two most recent baselines, reconstructing the older
+one forward to the newer one's binlog anchor:
+
+```sh
+bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines
+```
+
+It exits non-zero on any mismatch (or if comparable tables existed but none could
+be proven), so you can wire it into cron or CI as a recovery-readiness gate.
+
+**On a mismatch, drill down** to the exact diverging rows and columns:
+
+```sh
+bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines --explain
+```
+
+**Check the other half — the capture stream itself** — with the continuity
+signal, which flags any unfillable gap as permanently lost:
+
+```sh
+bintrail status --index-dsn "$IDX" --fail-on-gap
+```
+
+See [Verify recoveries](verify.md) for both modes and the exit-code semantics,
+and [Rotation & Status](rotation-and-status.md#stream-continuity-no-data-lost)
+for the continuity signal.
 
 ---
 

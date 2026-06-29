@@ -106,8 +106,25 @@ stream is up:
 time() - bintrail_index_newest_event_timestamp_seconds > 600
 ```
 
+## Permanent data loss is not a metric — alert on `status`
+
+`bintrail_index_gap_hours` counts coverage holes **within the retained span**
+(hours rotated out of MySQL but never archived). It does **not** signal a
+permanently lost capture stream — an unfillable binlog gap or a lost PostgreSQL
+replication slot. That verdict lives in `bintrail status` (the `Continuity:`
+line / `stream.continuity.status` JSON field), and the alertable hook is its exit code:
+
+```bash
+# in CI/cron — exits non-zero on gap_lost OR an unconfirmable state (fails closed)
+bintrail status --index-dsn "$IDX" --fail-on-gap
+```
+
+See [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
+A Prometheus gauge for this state is not exposed in this release.
+
 ## See also
 
 - [rotation-and-status.md](rotation-and-status.md) — `bintrail status` reports
-  the same coverage, index size, and per-table baseline size in text/JSON.
+  the same coverage, index size, and per-table baseline size in text/JSON, plus
+  the stream-continuity verdict.
 - [capacity.md](capacity.md) — sizing math and the `doctor` disk-capacity check.

@@ -165,6 +165,11 @@ Equivalent env vars: `BINTRAIL_ULTRAFAST=1`, `BINTRAIL_DUCKDB_THREADS`, `BINTRAI
 
 The `recover` command also supports archive auto-discovery and the `--no-archive` flag, using the same merge logic as `query`. When archives are available, events are fetched from both MySQL and Parquet, merged, and then turned into reversal SQL.
 
+> **`recover` vs `reconstruct` vs `verify` — three different jobs.**
+> - **`recover`** (this page) undoes *specific touched rows* from stored before/after images — delta-only. It cannot materialize a whole table.
+> - **`reconstruct`** materializes a *full table or single row as of a point in time* by merging a baseline snapshot with binlog deltas — see [Dump & Baseline](dump-and-baseline.md) and [Time-Travel SQL](time-travel-sql.md).
+> - **`verify`** doesn't recover anything; it *proves* the reconstruct chain reproduces the source so your recoveries are trustworthy before you need them — see [Verify recoveries](verify.md).
+
 ### The Concept
 
 Recovery works because dbtrail stores **full before and after images** for every row event. To undo an operation, you simply reverse it:
@@ -241,6 +246,17 @@ bintrail recover-cascade --index-dsn "..." \
   re-created a deleted parent, remove its `INSERT` from the output —
   `FOREIGN_KEY_CHECKS=0` does not suppress primary-key violations.
 
+### Recovering many rows at once
+
+To reverse a specific set of primary keys, pass `--pks` (comma-separated) instead
+of a single `--pk`, and cap how many events are undone per key with
+`--limit-per-pk`. These compose with the shared event filters
+(`--schema`/`--table`/`--event-type`/`--since`/`--until`/`--column-eq`/`--gtid`/`--flag`).
+
+**PostgreSQL sources:** when the source is PostgreSQL, `recover` emits
+PostgreSQL-dialect reversal SQL (double-quoted identifiers and string/boolean literals) rather than
+MySQL syntax — see [PostgreSQL](postgres.md#querying-and-recovering).
+
 ### WHERE Clause Strategy
 
 For `UPDATE` and `DELETE` reversals, the generator needs a `WHERE` clause to identify the correct row in the current database state.
@@ -290,5 +306,5 @@ COMMIT;
 Key properties:
 - Wrapped in `BEGIN` / `COMMIT` — all changes apply atomically or not at all.
 - Comments before each statement showing the original event ID, type, table, PK, timestamp, and GTID.
-- Generation errors emit a `-- ERROR ...` comment rather than halting — the script remains runnable (the transaction will roll back on the first error anyway).
+- Per-event generation errors emit a `-- ERROR ...` comment rather than halting — the script remains runnable (the transaction rolls back on the first error anyway). **Schema drift is the exception:** if a statement references a column dropped or renamed after the event, `recover` refuses up front — it writes nothing and exits non-zero (with `--output`, the target file is left empty), rather than emitting SQL that would fail at apply time. Always check the exit code before applying a generated file.
 - **Never auto-executed**: dbtrail only generates the file. Applying it is always a manual step.

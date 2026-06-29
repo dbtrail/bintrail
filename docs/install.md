@@ -18,7 +18,7 @@ it's the first section — the same four lines as the README.
   and `SELECT`.
 - An **index MySQL 8.0+** database for dbtrail's data (the Compose stack
   bundles one).
-- Go 1.24+ — only when building from source.
+- Go 1.25+ (the module targets `go 1.25.11`) — only when building from source. The default `GOTOOLCHAIN=auto` fetches the right toolchain for you.
 
 ## Docker Compose (the bundled default)
 
@@ -115,7 +115,7 @@ to every release. The image bundles both `bintrail` and `bintrail-mcp`; the
 web console ships as its own image, `ghcr.io/dbtrail/bintrail-console`
 (`serve` = read-only console, `watch` = stream + console daemon — what the
 Compose stack runs). The PostgreSQL-source binary ships as its own image,
-`ghcr.io/dbtrail/bintrail-pg` (alpha). See [docker.md](./docker.md) for signature verification,
+`ghcr.io/dbtrail/bintrail-pg` (beta). See [docker.md](./docker.md) for signature verification,
 `docker run` recipes, and the long-running stream container.
 
 ## Linux packages
@@ -137,7 +137,7 @@ sudo rpm -i bintrail_VERSION_linux_amd64.rpm
 The `bintrail` package carries the core CLI + `bintrail-mcp`; the web console
 is a separate `bintrail-console` package — install it only where an operator
 wants the UI. PostgreSQL-source capture is a separate `bintrail-pg` package
-(alpha) — install it only on hosts that capture from PostgreSQL.
+(beta) — install it only on hosts that capture from PostgreSQL.
 
 ## Go install
 

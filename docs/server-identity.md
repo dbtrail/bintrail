@@ -98,7 +98,7 @@ Server (unknown)
 
 The flag system lets you label tables and columns with named flags (e.g. `billing`, `pii`, `sensitive`). These flags are the foundation for role-based access control: access rules can then restrict which profiles may query data carrying each flag.
 
-**Current state**: The flag infrastructure (`table_flags`, `profiles`, `access_rules` tables and the `bintrail flag` CLI) is fully implemented. Profile enforcement with query-time column redaction is tracked in separate follow-up issues.
+**Current state**: Fully implemented and enforced. The flag registry (`table_flags`, `profiles`, `access_rules` tables, managed by the `bintrail flag`, `bintrail profile`, and `bintrail access` CLIs) is in place, and **profile enforcement is live**: pass `--profile <name>` to `query` or `recover` and the read path withholds denied tables and redacts (NULLs) flagged columns at query time. See [`bintrail profile` / `bintrail access`](#bintrail-profile-and-bintrail-access-commands) below.
 
 ### Database Tables
 
@@ -173,6 +173,31 @@ mydb     orders     (table)   billing   2026-03-01 05:00:00
 ```
 
 `(table)` in the COLUMN field means the flag applies to the table as a whole.
+
+### `bintrail profile` and `bintrail access` commands
+
+Flags label *what* is sensitive; **profiles** and **access rules** decide *who*
+may see it. A profile is a named role; an access rule maps a profile to a flag
+with `allow` or `deny`. At query time, `--profile <name>` withholds denied tables
+and redacts (NULLs) denied columns.
+
+```sh
+# 1. Create a profile (a role)
+bintrail profile add marketing --description "Marketing analysts" --index-dsn "$IDX"
+
+# 2. Grant/deny that profile access to a flag
+bintrail access add --profile marketing --flag pii --permission deny --index-dsn "$IDX"
+
+# 3. Run a query/recover as that profile — pii-flagged columns come back NULL,
+#    deny-flagged tables are withheld
+bintrail query  --profile marketing --schema mydb --table customers --index-dsn "$IDX"
+bintrail recover --profile marketing --schema mydb --table orders   --index-dsn "$IDX" --dry-run
+```
+
+`profile remove <name>` deletes a profile and cascades to its access rules;
+`profile list` and `access list [--profile <name>]` show what's configured.
+`access remove --profile <name> --flag <flag>` drops a single rule. All take
+`--index-dsn`.
 
 ### `--flag` Filter on `query` and `recover`
 

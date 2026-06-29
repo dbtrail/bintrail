@@ -28,7 +28,8 @@ before/after images in a searchable index:
 - **See every change** — what changed and when, for every row, with before → after diffs
 - **Undo precisely** — generate exact reversal SQL for just the damaged rows
 - **Undo cascade deletes** — reconstruct child rows an `ON DELETE CASCADE` wiped out (and restore FKs an `ON DELETE SET NULL` cleared) that InnoDB removes *below* the binlog and most tools can't see — see [Query & Recovery](docs/query-and-recovery.md)
-- **Time-travel** — query any row (or table) as it was at any moment (requires ProxySQL — see [Time-Travel SQL](docs/time-travel-sql.md))
+- **Time-travel** — query any row (or table) as it was at any moment, from the web console or the `reconstruct` CLI; the live SQL `AS OF` interface additionally needs ProxySQL — see [Time-Travel SQL](docs/time-travel-sql.md)
+- **Prove the safety net holds** — `bintrail verify` checks (off-line, drift-free) that a recovery would actually reproduce the source, and `bintrail status` flags any gap in the captured stream — so you find out *before* you need it — see [Verify](docs/verify.md)
 - **Web console** — browse, recover, and add servers to monitor, all in the UI
 - **[MCP server](docs/mcp-server.md)** — Claude or any MCP client can search history and draft recoveries
 
@@ -65,7 +66,7 @@ See [the demo image](docs/demo.md).
 |---|---|---|
 | [Install](docs/install.md) | [Query & Recovery](docs/query-and-recovery.md) | [Deployment](docs/deployment.md) · [Capacity](docs/capacity.md) |
 | [Quickstart](docs/quickstart.md) | [Web console](docs/console.md) | [Rotation & Status](docs/rotation-and-status.md) |
-| [DBA guide](docs/guide.md) | [Time-Travel SQL](docs/time-travel-sql.md) | [Docker](docs/docker.md) |
+| [DBA guide](docs/guide.md) | [Time-Travel SQL](docs/time-travel-sql.md) · [Verify recoveries](docs/verify.md) | [Docker](docs/docker.md) |
 | [30-second demo](docs/demo.md) | [Streaming](docs/streaming.md) · [Indexing](docs/indexing.md) | [Upload to S3](docs/upload.md) |
 | | [MariaDB source (alpha)](docs/mariadb.md) · [PostgreSQL source (beta)](docs/postgres.md) | [Server identity](docs/server-identity.md) |
 | | [MCP server](docs/mcp-server.md) | [Parquet debugging](docs/parquet-debugging.md) |

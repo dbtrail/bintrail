@@ -116,7 +116,7 @@ bintrail dump \
   --output-dir /tmp/mydumper-output
 ```
 
-This dumps all user schemas from the source server into `/tmp/mydumper-output`.
+This dumps **every accessible schema** into `/tmp/mydumper-output` — bare `bintrail dump` applies no schema filter, so mydumper also tries `mysql`, `sys`, and `performance_schema`. Pass `--schemas mydb,otherdb` to scope it to your data: a least-privilege capture user (no `SHOW VIEW` on the `sys` views) **needs** that filter or the dump fails loudly. (The bundled Compose `baseline` profile excludes system schemas automatically; the bare CLI does not.)
 
 ### All flags
 
@@ -129,6 +129,8 @@ This dumps all user schemas from the source server into `/tmp/mydumper-output`.
 | `--mydumper-path` | `mydumper` | Path to the mydumper binary. When set, skips Docker fallback. |
 | `--mydumper-image` | `mydumper/mydumper:latest` | Docker image for mydumper. Used only when no local binary is found. |
 | `--threads` | `4` | Number of parallel dump threads |
+| `--encrypt` | `false` | Encrypt dump files at rest using AES-256-CBC (requires `openssl` on `$PATH`) |
+| `--encrypt-key` | `~/.config/bintrail/dump.key` | Path to the encryption key file (generate with `bintrail generate-key`) |
 | `--format` | `text` | Output format: `text` or `json` |
 
 ### Schema and table filtering
@@ -191,6 +193,8 @@ bintrail baseline \
 | `--tables` | *(all)* | Comma-separated `db.table` filter |
 | `--compression` | `zstd` | Parquet compression: `zstd`, `snappy`, `gzip`, `none` |
 | `--row-group-size` | `500000` | Rows per Parquet row group |
+| `--encrypt` | `false` | Decrypt encrypted dump files (`.enc`, from `dump --encrypt`) before processing (requires `openssl` on `$PATH`) |
+| `--encrypt-key` | `~/.config/bintrail/dump.key` | Path to the decryption key file |
 | `--upload` | *(disabled)* | S3 URL to upload Parquet files after generation |
 | `--upload-region` | *(from AWS env)* | AWS region for `--upload` |
 | `--baseline-retain` | *(disabled)* | Prune local snapshots older than this (`Nd`/`Nh`) once a durable S3 copy exists (requires `--upload`) |
@@ -213,6 +217,12 @@ For example:
 ```
 
 The timestamp defaults to the `Started dump at:` time from mydumper's metadata file. Override it with `--timestamp` if needed.
+
+Each snapshot also records its **binlog anchor** (the file/position/GTID where the deltas on top of it begin) and, per table, a **content digest + row count** in the Parquet metadata (used by [`bintrail verify`](verify.md)). A `_SUCCESS` marker is written when the conversion completes; a partially-converted snapshot carries an `_INCOMPLETE` marker instead and is excluded from discovery (see [Pruning old local snapshots](#pruning-old-local-snapshots---baseline-retain)).
+
+### At-rest integrity (the `_MANIFEST` sidecar)
+
+Alongside each snapshot, `bintrail baseline` writes a `_MANIFEST` sidecar holding a **CRC-32C** over every Parquet file's bytes. Every local read path that consumes a baseline — full-table and single-row `reconstruct`, cascade recovery, the time-travel shim's `_snapshot`, and `query --include-snapshot` — **re-validates the CRC on every read** and **fails loud** on a mismatch (bit-rot, a truncated/partial write), rather than silently reconstructing from corrupt data. Snapshots created before this feature (no `_MANIFEST`) are read without validation, so it degrades gracefully. S3 read-validation is not yet covered in this release (the bytes can be re-encoded in transit); local reads are.
 
 ### Upload to S3
 

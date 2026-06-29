@@ -90,7 +90,12 @@ and searching events:
    Recover **auto-detects** it and folds the invisible children into the same
    script — no separate tab, no extra step. **Nothing is ever executed.** See
    [Recover and cascade](#cascade-recovery).
-5. **Status** — index health: partitions, coverage, stream lag, archives.
+5. **Status** — index health: partitions, coverage, stream lag, archives, and a
+   first-class **stream-continuity** signal — a green "✓ No gaps in captured
+   stream" badge when the captured range is contiguous, or a red "⚠ Events
+   permanently lost" record when an unfillable gap (or a lost PostgreSQL slot)
+   was detected. Both fire for any source family. See
+   [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
 6. **Settings** (under `watch` only) — **Storage** (rotation policy,
    per-source S3 archiving, baseline snapshots, AWS credential signals — see
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
@@ -425,10 +430,11 @@ A running server accepts it on the next login — no restart needed.
 The binary has no Supabase/RBAC backend to lean on, so the console defends
 itself:
 
-- **Loopback by default + a credential required.** A random 128-bit token is
-  generated for loopback binds and printed in the URL. Binding to a
-  non-loopback address (`0.0.0.0`, a LAN IP, …) **requires** an explicit
-  `--token` or a configured console password, or the command refuses to start.
+- **Loopback by default + a credential required.** On a loopback bind the
+  console prompts you to create a password on first run — no credential is ever
+  auto-generated for you. Binding to a non-loopback address (`0.0.0.0`, a LAN
+  IP, …) **requires** an explicit `--token` or a configured console password, or
+  the command refuses to start.
 - **Constant-time credential checks** (`crypto/subtle` for the token;
   sessions are looked up by SHA-256 of the presented value, so raw session
   tokens never live server-side; unknown-username logins still burn a full

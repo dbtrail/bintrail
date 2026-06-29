@@ -263,6 +263,8 @@ SELECT id, email, name FROM _flashback.users AS OF TIMESTAMP '2026-05-02 10:00:0
 
 The column list accepts bare identifiers only; backticks, schema-qualified columns (`users.id`), and aliases (`id AS user_id`) are not yet parsed and surface as `ER_PARSE_ERROR`. Columns the row image is missing (e.g. dropped post-event) come back as `NULL` — matching MySQL's behaviour after an `ALTER TABLE DROP COLUMN`.
 
+For a **full-table** `SELECT *` (no column list), dbtrail unions the columns present across the reconstructed rows, so a column that existed at the queried time but was **dropped afterward** still appears — with its historical values — rather than being silently hidden by the current (narrower) schema.
+
 The WHERE column must match the table's primary key. A WHERE on a non-PK column is rejected with a parser error rather than silently returning the wrong row.
 
 `SHOW TABLES FROM _flashback / _diff / _snapshot` returns the indexed tables in the current schema (from the latest `schema_snapshots` row) so an interactive `mysql>` session can explore the virtual schemas:

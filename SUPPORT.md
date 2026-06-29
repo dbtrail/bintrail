@@ -29,6 +29,9 @@ ship-vs-operate boundary below.
   (every row event, full before/after images).
 - dbtrail's own tooling for operating the index *data*: `rotate`, `status`,
   `doctor`, `archive reconcile`, Parquet archives and their queries.
+- The recovery and consistency tooling: `query`, `recover`, `recover-cascade`,
+  `reconstruct`, `baseline`, and `verify` (the data-consistency check that
+  proves a recovery would reproduce the source).
 - The web console, the MCP server, the time-travel shim.
 - The Docker images we publish, **including the pinned MySQL 8.4 index image
   bundled in docker-compose**: its build, tuned defaults, and documented
@@ -85,7 +88,11 @@ The boundary triage cites:
 
 ## Source server configuration (required for correct capture)
 
-dbtrail reads ROW-format binary logs from your **source** MySQL. Faithful capture
+dbtrail captures changes from your **source** database — **MySQL**, **MariaDB**
+(alpha), or **PostgreSQL** (beta); see [Supported source families](#supported-source-families)
+below. The requirements here cover a **MySQL** (and MariaDB) source's ROW-format
+binary logs; PostgreSQL's capture requirements (logical replication, `wal_level`,
+`REPLICA IDENTITY`) live in [docs/postgres.md](docs/postgres.md). Faithful capture
 requires the source to be configured **server-wide** (not just per-session):
 
 - `binlog_format = ROW`.
@@ -104,6 +111,37 @@ responsibility. Data captured while the source violated these requirements is ou
 of scope — configure the source (see
 [deployment.md → Source MySQL Requirements](docs/deployment.md#2-source-mysql-requirements))
 and re-index.
+
+## Supported source families
+
+dbtrail captures from three source families. **All of them index into the same
+MySQL index** — there is no per-source index store, and the index schema is
+identical across sources (that portability is deliberate). Pointing `--index-dsn`
+at a non-MySQL server is **not** supported.
+
+| Source | Status | Capture mechanism | Guide |
+|---|---|---|---|
+| **MySQL** 8.0+ (incl. Percona, RDS, Aurora, Cloud SQL) | Supported | ROW-format binlog over the replication protocol | [streaming.md](docs/streaming.md) |
+| **MariaDB** (target 11.4) | Alpha | ROW-format binlog (MariaDB GTID) | [mariadb.md](docs/mariadb.md) |
+| **PostgreSQL** | Beta — via the separate `bintrail-pg` binary | Logical replication (`pgoutput`) | [postgres.md](docs/postgres.md) |
+
+**We install nothing in your source database.** dbtrail connects as an ordinary
+read-only replication client. For PostgreSQL specifically, capture uses the
+**built-in `pgoutput`** logical-decoding plugin only — dbtrail never installs a
+custom output plugin, runs `CREATE EXTENSION`, adds an event trigger, or places
+any other server-side component in your source, and it never writes to the
+source. This keeps managed PostgreSQL (RDS/Aurora/Cloud SQL/Azure) in scope. We
+**validate** the source's configuration (`wal_level`, `REPLICA IDENTITY`, the
+publication); we never create it for you.
+
+**Operating the source-side capture prerequisites is the operator's
+responsibility** — the same ship-vs-operate split as the index. In particular, a
+PostgreSQL logical replication **slot retains WAL** until dbtrail consumes it: if
+`bintrail-pg` is stopped long enough, the slot can fill the source's disk. Sizing
+`max_slot_wal_keep_size`, monitoring slot lag, and the source's own disk are
+yours (`bintrail-pg doctor` reports slot/WAL health — see
+[postgres.md](docs/postgres.md)). Capturing from a misconfigured source
+(non-`FULL` row image, missing `REPLICA IDENTITY`, `PARTIAL_JSON`) is out of scope.
 
 ## Reporting issues
 

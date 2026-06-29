@@ -134,6 +134,7 @@ dbtrail never applies it for you. Check progress any time with
 | Time-travel: reconstruct full rows as of a point in time | [Dump and Baseline](./dump-and-baseline.md) — or the compose [`baseline` profile](./docker.md#baselines-and-time-travel-the-baseline-profile) |
 | Use RDS, Aurora, or Cloud SQL | [Streaming](./streaming.md) |
 | Understand the query and recovery options in depth | [Query and Recovery](./query-and-recovery.md) |
+| Prove a recovery would actually reproduce the source | [Verify recoveries](./verify.md) |
 | Archive old events to S3 before dropping | [Rotation and Status](./rotation-and-status.md#archiving-partitions-to-parquet) |
 | Plan disk space for the index MySQL | [Capacity Planning](./capacity.md) |
 | Use AI (Claude) to investigate changes | [MCP Server](./mcp-server.md) |

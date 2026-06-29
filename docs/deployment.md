@@ -117,11 +117,15 @@ innodb_flush_log_at_trx_commit = 2      # acceptable for index (not source)
 innodb_redo_log_capacity = 2G           # 8.4 default is 100M — small for bursty large-row writes
 innodb_flush_method = O_DIRECT          # 8.4 still defaults to fsync
 skip_log_bin                            # the index is a write-only sink (see below)
+max_allowed_packet = 1G                 # full JSON row images per INSERT — 64M default rejects large events
+sort_buffer_size = 4M                   # wide-row ORDER BY overflows the 256K default → Error 1038
 ```
 
 `innodb_flush_log_at_trx_commit = 2` trades a tiny recovery window (up to 1s of events) for significantly better write throughput. Since dbtrail can replay from the binlog position in `stream_state`, this tradeoff is acceptable.
 
 `skip_log_bin` disables the index server's **own** binary log. The index is a write-only sink — nothing replicates from it, and dbtrail reconstructs by re-streaming from the source, never from the index's binlog. Leaving it on writes a second full copy of every row image and (with the default `sync_binlog = 1`) fsyncs per commit, which cancels much of the `innodb_flush_log_at_trx_commit = 2` benefit. Only disable it on a dedicated index instance with `gtid_mode = OFF` (a GTID-enabled server rejects `skip_log_bin`).
+
+`max_allowed_packet` and `sort_buffer_size` matter specifically for the dbtrail index workload and are easy to miss: each `binlog_events` INSERT carries the full before/after JSON row images (base64-inflated ~1.33×), so a large row event can exceed MySQL's 64M default and be **rejected** (silent large-event loss, [#652](https://github.com/dbtrail/dbtrail/issues/652)); and an `ORDER BY` over wide rows overflows the 256K `sort_buffer_size` default with `Error 1038 (Out of sort memory)` ([#608](https://github.com/dbtrail/dbtrail/issues/608)). The bundled Compose index sets both already — a **BYO** index needs them set explicitly.
 
 > **Note on MySQL 8.4 defaults:** `innodb_log_file_size` was replaced by `innodb_redo_log_capacity` in 8.0.30+. MySQL 8.4 LTS already ships several former hand-tunings as defaults (`innodb_io_capacity = 10000`, `innodb_log_buffer_size = 64M`, `innodb_flush_neighbors = 0`, change buffer and adaptive hash index off), so they no longer need setting.
 
@@ -215,7 +219,7 @@ journalctl -u bintrail-stream -f
 
 [docker.md](docker.md) is the canonical home for the image, `docker run`, and the compose stack. For production, harden that base:
 - Use Docker secrets or environment files instead of inline credentials
-- Pin image versions (`FROM golang:1.25.7-alpine` in your Dockerfile)
+- Pin image versions (`FROM golang:1.25.11-bookworm` in your Dockerfile — the DuckDB Go bindings link glibc, so an Alpine/musl base breaks at runtime)
 - Mount a named volume for any persistent state (the index MySQL is the real persistent state — dbtrail itself is stateless)
 - Set resource limits (`mem_limit`, `cpus`) on the bintrail container
 
