@@ -63,8 +63,10 @@ func MapEventEnumLabels(db *sql.DB, latest *metadata.Resolver, schema, table str
 // Call this on fetched deltas BEFORE folding them onto a baseline: event images
 // only, never a baseline row (baseline rows are scanned raw from Parquet and
 // must not be decoded — a baseline TEXT value that happens to be valid base64
-// would be corrupted). The full-table merge path has its own decode
-// (decodeChangeBinaries) and must NOT call this — doing so would double-decode.
+// would be corrupted). The full-table merge path (ReconstructTable, #668) calls
+// this too, on the full events slice before its change map is built — callers
+// must call it exactly once per events slice, since decodeStoredBase64 is not
+// idempotent and a second pass would double-decode.
 //
 // Each column is typed at the snapshot in effect at its event's timestamp
 // (#475-style epoch awareness, matching MapEventEnumLabels): whether a value is
@@ -121,9 +123,6 @@ func DecodeEventBinaries(db *sql.DB, schema, table string, events []query.Result
 
 // decodeImageBinaries decodes the storage-side base64 of every BLOB/TEXT column
 // in one event image, in place. No-op when binCols is empty or image is nil.
-// The per-image sibling of decodeChangeBinaries (which decodes a change map's
-// RowAfter); kept separate so the single-row decode never touches the full-table
-// merge path.
 func decodeImageBinaries(image map[string]any, binCols map[string]bool) {
 	if len(binCols) == 0 || image == nil {
 		return

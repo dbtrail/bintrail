@@ -128,31 +128,26 @@ func writeBlobTextBaseline(t *testing.T, rows [][]string) string {
 	return path
 }
 
-// TestMergeBaseline_blobTextProvenance is the #660 anchor across the derivation
-// seam AND both value branches: BinaryCols is derived through the real
-// binaryColsFromTableMeta(tm) — NOT hand-injected, which is the test-vs-production
-// divergence that let the round-1 bug ship — an UNTOUCHED baseline TEXT whose
-// content is valid base64 must survive VERBATIM (the corruption case, since
-// DuckDB delivers it as a Go string), and a delta-event TEXT/BLOB are decoded
-// (string / X'hex'). Re-introducing a decode in rowAfterOrdered makes this fail.
+// TestMergeBaseline_blobTextProvenance is the #660/#668 anchor across both
+// value branches: an UNTOUCHED baseline TEXT whose content is valid base64
+// must survive VERBATIM (the corruption case, since DuckDB delivers it as a Go
+// string), and an already-decoded delta-event TEXT/BLOB (decode now happens
+// upstream, epoch-aware, via DecodeEventBinaries before mergeBaselineIntoWriter
+// ever sees the Changes map — #668) must reach the writer untouched, not
+// decoded a second time. Re-introducing a decode in rowAfterOrdered or
+// mergeBaselineIntoWriter makes this fail.
 func TestMergeBaseline_blobTextProvenance(t *testing.T) {
 	baselinePath := writeBlobTextBaseline(t, [][]string{
 		{"1", "YWJjZA==", "RAW"}, // untouched; tx is valid base64 (of "abcd"); bl bytes "RAW"
 	})
 	outDir := t.TempDir()
 
-	// Derive the decode set through the production path, not by hand.
-	tm := &metadata.TableMeta{Columns: []metadata.ColumnMeta{
-		{Name: "id", DataType: "int"},
-		{Name: "tx", DataType: "text"},
-		{Name: "bl", DataType: "blob"},
-	}}
-
 	changes := map[string]*query.ResultRow{
 		pkStrForInt(2): {
 			EventType: event.EventInsert,
 			PKValues:  pkStrForInt(2),
-			RowAfter:  map[string]any{"id": float64(2), "tx": "aGVsbG8=", "bl": "QklO"}, // base64("hello"), base64("BIN")
+			// Already decoded, as DecodeEventBinaries would leave it.
+			RowAfter: map[string]any{"id": float64(2), "tx": "hello", "bl": []byte("BIN")},
 		},
 	}
 
@@ -166,7 +161,6 @@ func TestMergeBaseline_blobTextProvenance(t *testing.T) {
 		Changes:           changes,
 		OutputDir:         outDir,
 		ChunkSize:         0,
-		BinaryCols:        binaryColsFromTableMeta(tm),
 	}, rep); err != nil {
 		t.Fatalf("mergeBaselineIntoWriter: %v", err)
 	}
@@ -180,12 +174,9 @@ func TestMergeBaseline_blobTextProvenance(t *testing.T) {
 	if strings.Contains(chunk, "'abcd'") {
 		t.Errorf("baseline TEXT was wrongly base64-decoded (corruption, #660):\n%s", chunk)
 	}
-	// Delta event: BLOB decoded to X'hex', TEXT decoded to a string.
+	// Delta event: already-decoded values must reach the writer unchanged.
 	if !strings.Contains(chunk, "(X'42494e', 2, 'hello')") {
-		t.Errorf("delta-event BLOB/TEXT must be decoded, got:\n%s", chunk)
-	}
-	if strings.Contains(chunk, "'aGVsbG8='") || strings.Contains(chunk, "'QklO'") {
-		t.Errorf("delta-event value was not decoded:\n%s", chunk)
+		t.Errorf("delta-event BLOB/TEXT must reach the writer already decoded, got:\n%s", chunk)
 	}
 }
 

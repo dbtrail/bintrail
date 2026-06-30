@@ -418,6 +418,15 @@ func ReconstructTable(
 	// ordinals.
 	MapEventEnumLabels(db, resolver, schema, table, events)
 
+	// BLOB/TEXT base64 → real value, each delta decoded with the snapshot in
+	// effect at its event time (#668; same epoch-aware approach as the ENUM/SET
+	// pass above and the single-row reconstruct path, #666). Must run before
+	// the merge map is built below so changes' RowAfter images carry decoded
+	// values for free — typing the decode columns from a single latest-snapshot
+	// resolve (the pre-#668 behavior) corrupts a column captured as VARCHAR at
+	// an old epoch and widened to TEXT later.
+	DecodeEventBinaries(db, schema, table, events)
+
 	// ── 5. Build the change map: PK string → last event for that PK ───────
 	// events is already sorted by (event_timestamp, event_id) via
 	// query.MergeResults, so the last write wins naturally.
@@ -444,7 +453,6 @@ func ReconstructTable(
 		Changes:           changes,
 		OutputDir:         cfg.OutputDir,
 		ChunkSize:         cfg.ChunkSize,
-		BinaryCols:        binaryColsFromTableMeta(tm),
 	}, rep); err != nil {
 		return nil, err
 	}
@@ -472,10 +480,6 @@ type mergeInput struct {
 	Changes           map[string]*query.ResultRow
 	OutputDir         string
 	ChunkSize         int64
-	// BinaryCols maps each BLOB/TEXT column to whether it is binary, so
-	// delta-event row_after values (stored base64) are decoded before emission
-	// (#660). nil = nothing to decode.
-	BinaryCols map[string]bool
 }
 
 // mergeBaselineIntoWriter streams the local baseline Parquet via DuckDB,
@@ -534,14 +538,12 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 		return err
 	}
 
-	// Decode the BLOB/TEXT base64 of the delta-event after-images up front, on
-	// the Changes map — the one place where every value is unambiguously
-	// event-sourced (loaded from binlog_events JSON, so blob/text are uniformly
-	// base64 strings). This covers BOTH event emit paths in mergeBaselineImages
-	// (the matched-PK emit and the leftover-INSERT drain, both reading
-	// in.Changes) without touching baseline pass-through rows, whose TEXT values
-	// arrive from the DuckDB scan as Go strings and must NOT be decoded (#660).
-	decodeChangeBinaries(in.Changes, in.BinaryCols)
+	// BLOB/TEXT base64 of the delta-event after-images is already decoded by
+	// the caller (DecodeEventBinaries, run epoch-aware over the full events
+	// slice before the Changes map was built, #668) — in.Changes entries alias
+	// those same event structs. Baseline pass-through rows are untouched here:
+	// their TEXT values arrive from the DuckDB scan as Go strings and must NOT
+	// be decoded (#660).
 
 	// emit re-orders each emitted row map into the baseline Parquet column
 	// order the writer was constructed with. For baseline pass-through rows
@@ -988,28 +990,6 @@ func binaryColsFromTableMeta(tm *metadata.TableMeta) map[string]bool {
 	return m
 }
 
-// decodeChangeBinaries decodes the storage-side base64 of BLOB/TEXT columns in
-// every delta event's RowAfter image, in place. Called before the merge, so
-// both event emit paths (matched-PK and leftover-INSERT) write decoded values.
-// In-place mutation matches MapEventEnumLabels, which already rewrites these
-// same RowAfter maps before the merge; nothing reads the pre-decode images
-// afterwards. No-op when binCols is empty.
-func decodeChangeBinaries(changes map[string]*query.ResultRow, binCols map[string]bool) {
-	if len(binCols) == 0 {
-		return
-	}
-	for _, rr := range changes {
-		if rr == nil || rr.RowAfter == nil {
-			continue
-		}
-		for col, binary := range binCols {
-			if v, ok := rr.RowAfter[col]; ok {
-				rr.RowAfter[col] = decodeStoredBase64(v, binary)
-			}
-		}
-	}
-}
-
 // rowAfterOrdered walks colNames and looks up each name in rowAfter (a
 // map[string]any from a binlog event's row_after image), returning a slice
 // of values aligned to the baseline Parquet column order. A baseline column
@@ -1024,8 +1004,8 @@ func decodeChangeBinaries(changes map[string]*query.ResultRow, binCols map[strin
 // here, so it must NOT base64-decode BLOB/TEXT values: a baseline TEXT value is
 // a Go string (DuckDB scans parquet.String() as string) indistinguishable from
 // a base64 event value, and decoding it would corrupt valid-base64 baseline
-// text. Event values are decoded upstream, on the Changes map, before the merge
-// (see decodeChangeBinaries in mergeBaselineIntoWriter, #660).
+// text. Event values are decoded upstream, epoch-aware, before the change map
+// is even built (see DecodeEventBinaries in ReconstructTable, #668).
 func rowAfterOrdered(rowAfter map[string]any, colNames []string, schema, table string) []any {
 	out := make([]any, len(colNames))
 	for i, col := range colNames {

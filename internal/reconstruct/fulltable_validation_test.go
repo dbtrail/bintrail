@@ -181,33 +181,6 @@ func TestBinaryColsFromTableMeta(t *testing.T) {
 	}
 }
 
-// TestDecodeChangeBinaries verifies #660: delta-event RowAfter BLOB/TEXT values
-// (base64 strings) are decoded in place (BLOB → []byte, TEXT → string), NULL is
-// left nil, and a non-base64-column value is untouched.
-func TestDecodeChangeBinaries(t *testing.T) {
-	rr := &query.ResultRow{RowAfter: map[string]any{
-		"id": float64(1),
-		"bl": "QklOAEJMT0I=",     // base64("BIN\0BLOB")
-		"tx": "aGVsbG8gdGV4dA==", // base64("hello text")
-		"bn": nil,                // NULL blob stays NULL
-	}}
-	changes := map[string]*query.ResultRow{"1": rr}
-	decodeChangeBinaries(changes, map[string]bool{"bl": true, "tx": false, "bn": true})
-
-	if got, ok := rr.RowAfter["bl"].([]byte); !ok || string(got) != "BIN\x00BLOB" {
-		t.Errorf("bl: expected decoded []byte \"BIN\\0BLOB\", got %T %v", rr.RowAfter["bl"], rr.RowAfter["bl"])
-	}
-	if got, ok := rr.RowAfter["tx"].(string); !ok || got != "hello text" {
-		t.Errorf("tx: expected decoded string \"hello text\", got %T %v", rr.RowAfter["tx"], rr.RowAfter["tx"])
-	}
-	if rr.RowAfter["bn"] != nil {
-		t.Errorf("bn: NULL must stay nil, got %v", rr.RowAfter["bn"])
-	}
-	if rr.RowAfter["id"] != float64(1) {
-		t.Errorf("id: non-blob/text column must be untouched, got %v", rr.RowAfter["id"])
-	}
-}
-
 // readFileInfo wraps os.Stat; kept tiny for test readability.
 func readFileInfo(path string) (fileInfoLike, error) {
 	return os.Stat(path)
