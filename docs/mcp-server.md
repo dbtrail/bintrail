@@ -151,6 +151,15 @@ both accept:
 (`since` / `until`) accept MySQL datetime (`2006-01-02 15:04:05`), RFC 3339, or
 date-only (`2006-01-02`) — the same formats as the CLI.
 
+**Query row ceiling ([#654](https://github.com/dbtrail/dbtrail/issues/654)).** The
+`query` tool caps an explicit `limit` at a hard ceiling (default **1,000,000
+rows**; env `BINTRAIL_MCP_QUERY_MAX_LIMIT`) so an oversized request can't exhaust
+the long-lived server's memory; when it caps, the returned text says so. A `limit`
+of `0` or omitted falls back to the tool default (100), not unbounded — the
+unbounded path is the `bintrail query` CLI, not the agent-facing tool. The
+`recover` tool is **not** capped this way: it refuses oversized output on a memory
+budget instead (see [Query and Recovery](query-and-recovery.md#recovery)).
+
 **Archive auto-discovery.** `query` and `recover` automatically discover Parquet
 archive sources from `archive_state` in the index database (or from the
 `BINTRAIL_ARCHIVE_S3` + `BINTRAIL_ID` env vars). When archives are found, results

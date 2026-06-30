@@ -141,7 +141,15 @@ That strictness deliberately includes stale registrations: an `archive_state` ro
 
 ### Memory Footprint
 
-The merge path loads **all matching rows** from all sources into memory before applying the limit. Filters (schema, table, time range, etc.) bound the result set in practice. For extremely broad queries against large archives, memory usage could be significant — apply at least a `--since`/`--until` range to keep the result set manageable.
+The merge path loads **all matching rows** from all sources into memory before applying the limit, so the result set is bounded by **row count** (`--limit`), not payload size. Filters (schema, table, time range) keep it manageable in practice — apply at least a `--since`/`--until` range for broad queries against large archives.
+
+Three offline commands hold their working set on the Go heap, so a BLOB/TEXT-heavy or very wide window can pressure memory at scale. Each has a break-nothing safeguard ([#654](https://github.com/dbtrail/dbtrail/issues/654)):
+
+- **`query --limit 0`** removes the row cap entirely — an unbounded scan into memory. It still works (some pipelines rely on it), but the command now prints a stderr warning; prefer a real `--limit N` or a tight `--since`/`--until` for large tables.
+- **`recover`** buffers the whole reversal script in memory before writing (it must, to refuse cleanly on schema drift), roughly doubling peak on top of the already-loaded events. `--max-script-bytes` (default `2GB`; env `BINTRAIL_RECOVER_MAX_BYTES`; `0` = unlimited) makes it **refuse** rather than render a multi-gigabyte script — see [Recovery](#recovery). The bound is on the rendered script, not the initial fetch, which stays `--limit`-bounded.
+- **`reconstruct --output-format mydumper`** holds every event in the baseline→target window plus a per-touched-row change map. `--warn-event-threshold` (default `5000000`; env `BINTRAIL_RECONSTRUCT_WARN_EVENTS`; `0` disables) logs a loud warning above the threshold so you can narrow `--at` or refresh the baseline before the run grows. It only warns — it never refuses.
+
+The MCP server applies its own agent-facing row ceiling on the `query` tool — see [the MCP tool reference](mcp-server.md#tool-parameters-and-behavior-reference).
 
 ### DuckDB resource tuning (`--ultrafast`)
 
@@ -256,6 +264,16 @@ of a single `--pk`, and cap how many events are undone per key with
 **PostgreSQL sources:** when the source is PostgreSQL, `recover` emits
 PostgreSQL-dialect reversal SQL (double-quoted identifiers and string/boolean literals) rather than
 MySQL syntax — see [PostgreSQL](postgres.md#querying-and-recovering).
+
+> **Large recoveries are bounded ([#654](https://github.com/dbtrail/dbtrail/issues/654)).** The whole
+> reversal script is buffered in memory before any byte is written, so a bulk recovery over
+> BLOB/TEXT-heavy rows can use a lot of RAM. `recover` **refuses** (loudly, writing nothing) when the
+> estimated script payload exceeds `--max-script-bytes` — default `2GB`, `0` disables, env
+> `BINTRAIL_RECOVER_MAX_BYTES`. If you hit it, narrow `--since`/`--until`/`--pk`/`--limit`, or raise the
+> budget. Note `--limit` caps the event **count** (default 1000); this budget guards the rendered
+> **script size**. Binary columns render to hex (~2× their stored bytes), so for binary-heavy tables set
+> the budget below the RAM you can actually spare. The same default guards `recover-cascade`, the
+> console, and the MCP `recover` tool, which inherit it with no configuration.
 
 ### WHERE Clause Strategy
 
