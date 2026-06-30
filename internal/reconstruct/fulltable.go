@@ -617,13 +617,15 @@ type mergeStats struct {
 //
 // This is the shared core for both the offline `bintrail reconstruct` writer
 // (mergeBaselineIntoWriter) and the shim full-table _snapshot path
-// (SnapshotFullTableImages), so the two reconstruction surfaces can never drift
-// in the merge ALGORITHM (baseline/event matching, ordering, drain). Per-value
-// decoding is NOT done here — the writer caller's decode happens further
-// upstream, on the full events slice in ReconstructTable, before the Changes
-// map this function drains is even built (DecodeEventBinaries, #668); the
-// shim's SnapshotFullTableImages caller does not decode at all yet (#672), so
-// the two surfaces currently DO diverge on emitted blob/text values.
+// (SnapshotFullTableImages, via runSnapshotFullTable), so the two reconstruction
+// surfaces can never drift in the merge ALGORITHM (baseline/event matching,
+// ordering, drain). Per-value decoding is NOT done here — every caller decodes
+// its own Changes map before it ever reaches this function: the writer caller
+// upstream in ReconstructTable, on the full events slice before the Changes
+// map is even built (DecodeEventBinaries, #668); the shim caller upstream in
+// runSnapshotFullTable, via mapEventImages (#661). `verify`'s two
+// SnapshotFullTableImages callers (reconstructDigest, the --explain drill-down)
+// are the remaining undecoded consumers (#672).
 func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string]any) error) (mergeStats, error) {
 	var stats mergeStats
 
