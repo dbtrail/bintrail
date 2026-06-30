@@ -8,6 +8,30 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
+// TestIsDeferredType pins the #672 addition: TEXT family types must be
+// deferred alongside BLOB/binary, since both are decoded by the same
+// epoch-aware DecodeEventBinaries call and degrade the same way (an
+// unresolvable epoch leaves the value as stored base64).
+func TestIsDeferredType(t *testing.T) {
+	deferred := []string{
+		"enum", "set", "json",
+		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit",
+		"text", "tinytext", "mediumtext", "longtext",
+		"TEXT", "Blob", // case-insensitive
+	}
+	for _, dt := range deferred {
+		if !isDeferredType(dt) {
+			t.Errorf("isDeferredType(%q) = false, want true", dt)
+		}
+	}
+	notDeferred := []string{"int", "varchar", "char", "datetime", "double", "decimal"}
+	for _, dt := range notDeferred {
+		if isDeferredType(dt) {
+			t.Errorf("isDeferredType(%q) = true, want false", dt)
+		}
+	}
+}
+
 func TestDeferredReprChanged(t *testing.T) {
 	intCol := metadata.ColumnMeta{Name: "n", DataType: "int"}
 	strCol := metadata.ColumnMeta{Name: "s", DataType: "varchar"}

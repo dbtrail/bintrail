@@ -134,6 +134,9 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 		}
 		return res, fmt.Errorf("fetch changes %s.%s: %w", p.Schema, p.Table, err)
 	}
+	// BLOB/TEXT base64 → real value, epoch-aware (#672). See verify.go's
+	// VerifyTable for the same wiring and its rationale.
+	reconstruct.DecodeEventBinaries(cfg.IndexDB, p.Schema, p.Table, rows)
 	changes := make(map[string]*query.ResultRow, len(rows))
 	for i := range rows {
 		changes[rows[i].PKValues] = &rows[i]

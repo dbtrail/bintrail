@@ -5,6 +5,8 @@ package verify
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -587,5 +589,136 @@ func TestVerifyBaselinePair_UnchangedTable(t *testing.T) {
 	}
 	if got.Status != StatusMatch {
 		t.Errorf("unchanged table: status = %q (%s); want match", got.Status, got.Detail)
+	}
+}
+
+// TestVerifyBaselinePair_TextEventDecoded is the #672 regression: a TEXT
+// column's in-window event value (stored base64, since go-mysql delivers
+// TEXT as []byte and marshalRow base64-encodes it) must be decoded before
+// SnapshotFullTableImages compares it to the baseline/source's plain text —
+// neither VerifyBaselinePair's digest nor ExplainBaselinePairMismatch's
+// drill-down decoded it before this fix, so a TEXT-only change (id=1 below)
+// would surface as a false mismatch even though nothing actually diverged.
+//
+// id=2's status is deliberately, genuinely wrong (unrelated to #672) so the
+// table-level result is a real mismatch and ExplainBaselinePairMismatch has
+// something to drill into — proving the TEXT decode neither masks a real
+// divergence nor gets masked by one.
+func TestVerifyBaselinePair_TextEventDecoded(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"id", "PRI", "int", "int", 1},
+		{"status", "", "varchar", "varchar(64)", 2},
+		{"body", "", "text", "text", 3},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64),\n  `body` TEXT,\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "status", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+		{Name: "body", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
+	}
+	// prev {1:a/hello, 2:b/static}; new (truth) {1:a/"updated text", 2:shipped/static}.
+	writeTestBaseline(t, baseDir, prevTS, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "a", "hello"}, {"2", "b", "static"},
+	}, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "a", "updated text"}, {"2", "shipped", "static"},
+	}, "binlog.000001", 300)
+
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+
+	// Events in (prev, anchor]: id=1's body is updated to "updated text" (matches
+	// truth once decoded); id=2's status is updated to a WRONG value ("wrong",
+	// diverges from truth's "shipped") while body is carried unchanged — every
+	// column appears in row_after under binlog_row_image=FULL, so body is
+	// base64-encoded here too even though its value didn't change.
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+	ets := prevTS.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 250, ets, nil, dbName, "orders", 2 /*UPDATE*/, "1", nil,
+		[]byte(fmt.Sprintf(`{"id":1,"status":"a","body":"%s"}`, b64("hello"))),
+		[]byte(fmt.Sprintf(`{"id":1,"status":"a","body":"%s"}`, b64("updated text"))))
+	testutil.InsertEvent(t, db, "binlog.000001", 250, 300, ets, nil, dbName, "orders", 2 /*UPDATE*/, "2", nil,
+		[]byte(fmt.Sprintf(`{"id":2,"status":"b","body":"%s"}`, b64("static"))),
+		[]byte(fmt.Sprintf(`{"id":2,"status":"wrong","body":"%s"}`, b64("static"))))
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
+	ctx := context.Background()
+	pairs, _, _, err := FindBaselinePair(ctx, baseDir)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
+	}
+
+	got, err := VerifyBaselinePair(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair: %v", err)
+	}
+	// Mismatch is expected: id=2's status genuinely diverges (unrelated to #672,
+	// predates it). If id=1's body decode were broken, this would ALSO be a
+	// mismatch, for the wrong reason — the explain assertions below are what
+	// distinguish "id=1 correctly excluded" from "id=1 spuriously included".
+	if got.Status != StatusMismatch {
+		t.Fatalf("status = %q (%s); want mismatch (id=2's status genuinely diverges)", got.Status, got.Detail)
+	}
+
+	ex, err := ExplainBaselinePairMismatch(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("ExplainBaselinePairMismatch: %v", err)
+	}
+
+	var id1Diff, id2Diff *RowDiff
+	for i := range ex.Diffs {
+		switch ex.Diffs[i].PK {
+		case "id=1":
+			id1Diff = &ex.Diffs[i]
+		case "id=2":
+			id2Diff = &ex.Diffs[i]
+		}
+	}
+
+	// id=1 (TEXT-only change) must NOT appear in the diff at all: its body was
+	// decoded from the event's stored base64 to "updated text", matching truth
+	// exactly. Pre-#672, the undecoded raw base64 would mismatch truth's plain
+	// "updated text" and id=1 would show up here as a spurious diffChanged.
+	if id1Diff != nil {
+		t.Errorf("id=1 (TEXT-only change) should not appear in diffs — body should have decoded to match truth, got: %+v", *id1Diff)
+	}
+
+	// id=2 (real status divergence) must still be reported, with EXACTLY the
+	// status cell — not also a spurious body cell. Pre-#672, body's undecoded
+	// base64 ("c3RhdGlj") would mismatch truth's plain "static" too, adding a
+	// second, spurious cell diff alongside the real one.
+	if id2Diff == nil {
+		t.Fatalf("id=2 (real status divergence) must appear in diffs")
+	}
+	if id2Diff.Kind != diffChanged {
+		t.Fatalf("id=2 diff kind = %q, want %q", id2Diff.Kind, diffChanged)
+	}
+	if len(id2Diff.Cells) != 1 || id2Diff.Cells[0].Column != "status" {
+		t.Fatalf("id=2 cells = %+v, want exactly one status cell (body must not appear — it decoded and matched)", id2Diff.Cells)
+	}
+	if id2Diff.Cells[0].Recovery != "wrong" || id2Diff.Cells[0].Baseline != "shipped" {
+		t.Errorf("id=2 status cell = %+v, want recovery=%q baseline=%q", id2Diff.Cells[0], "wrong", "shipped")
 	}
 }

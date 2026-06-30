@@ -147,6 +147,11 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 		}
 		return res, fmt.Errorf("fetch changes %s.%s: %w", schema, table, err)
 	}
+	// BLOB/TEXT base64 → real value, epoch-aware (#672; same helper #668 wired
+	// into the offline reconstruct writer path). SnapshotFullTableImages itself
+	// never decodes — every caller is responsible for decoding its own changes
+	// map first, same as the shim's runSnapshotFullTable does via mapEventImages.
+	reconstruct.DecodeEventBinaries(cfg.IndexDB, schema, table, rows)
 	changes := make(map[string]*query.ResultRow, len(rows))
 	for i := range rows {
 		changes[rows[i].PKValues] = &rows[i]
@@ -267,11 +272,17 @@ func hasDeferredRepr(cols []metadata.ColumnMeta) bool {
 // isDeferredType reports whether a column's event-image representation can differ
 // from how the baseline/source renders it in a way this version doesn't yet
 // normalize: ENUM/SET (ordinal vs label), JSON (MySQL-canonical text), binary
-// families (base64 in the event image vs raw bytes), BIT.
+// and text families (base64 in the event image vs raw bytes/string), BIT.
+// TEXT is listed alongside BLOB/binary (not just the binary families) because
+// both are decoded by the same epoch-aware DecodeEventBinaries call (#672) and
+// degrade the same way: an unresolvable epoch leaves the value as stored
+// base64 rather than guessing, so a TEXT column needs the same Inconclusive
+// safety net BLOB already has, not a narrower one.
 func isDeferredType(dataType string) bool {
 	switch strings.ToLower(dataType) {
 	case "enum", "set", "json",
-		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit":
+		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit",
+		"text", "tinytext", "mediumtext", "longtext":
 		return true
 	}
 	return false
