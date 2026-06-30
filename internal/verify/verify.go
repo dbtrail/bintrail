@@ -272,17 +272,22 @@ func hasDeferredRepr(cols []metadata.ColumnMeta) bool {
 // isDeferredType reports whether a column's event-image representation can differ
 // from how the baseline/source renders it in a way this version doesn't yet
 // normalize: ENUM/SET (ordinal vs label), JSON (MySQL-canonical text), binary
-// and text families (base64 in the event image vs raw bytes/string), BIT.
-// TEXT is listed alongside BLOB/binary (not just the binary families) because
-// both are decoded by the same epoch-aware DecodeEventBinaries call (#672) and
-// degrade the same way: an unresolvable epoch leaves the value as stored
-// base64 rather than guessing, so a TEXT column needs the same Inconclusive
-// safety net BLOB already has, not a narrower one.
+// families (base64 in the event image vs raw bytes), BIT.
+//
+// TEXT is deliberately NOT here, despite being decoded by the same
+// DecodeEventBinaries call as BLOB (#672): once decoded, a TEXT value is just
+// a string, directly comparable to the baseline/source text — unlike
+// ENUM/JSON/binary, decoding doesn't leave a representation gap to defer.
+// Deferring it anyway would mask genuine TEXT divergences as Inconclusive on
+// every table with a TEXT column (the common case, e.g. wp_options), which
+// defeats the point of decoding it in the first place. The narrow remaining
+// risk — an unresolvable epoch leaving a value as stored base64 — is the same
+// accepted risk DecodeEventBinaries already carries for its other callers
+// (recover, shim, reconstruct); it is not given a broader safety net here.
 func isDeferredType(dataType string) bool {
 	switch strings.ToLower(dataType) {
 	case "enum", "set", "json",
-		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit",
-		"text", "tinytext", "mediumtext", "longtext":
+		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit":
 		return true
 	}
 	return false

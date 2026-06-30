@@ -8,23 +8,26 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
-// TestIsDeferredType pins the #672 addition: TEXT family types must be
-// deferred alongside BLOB/binary, since both are decoded by the same
-// epoch-aware DecodeEventBinaries call and degrade the same way (an
-// unresolvable epoch leaves the value as stored base64).
+// TestIsDeferredType pins the case list, including the #672 decision: TEXT
+// family types are decoded by DecodeEventBinaries (same as BLOB) but are NOT
+// deferred — once decoded, TEXT is directly comparable to the baseline/source
+// text, unlike ENUM/JSON/binary, so deferring it would mask genuine
+// divergences instead of guarding against an unresolved representation gap.
 func TestIsDeferredType(t *testing.T) {
 	deferred := []string{
 		"enum", "set", "json",
 		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit",
-		"text", "tinytext", "mediumtext", "longtext",
-		"TEXT", "Blob", // case-insensitive
+		"BLOB", "Enum", // case-insensitive
 	}
 	for _, dt := range deferred {
 		if !isDeferredType(dt) {
 			t.Errorf("isDeferredType(%q) = false, want true", dt)
 		}
 	}
-	notDeferred := []string{"int", "varchar", "char", "datetime", "double", "decimal"}
+	notDeferred := []string{
+		"int", "varchar", "char", "datetime", "double", "decimal",
+		"text", "tinytext", "mediumtext", "longtext", "TEXT",
+	}
 	for _, dt := range notDeferred {
 		if isDeferredType(dt) {
 			t.Errorf("isDeferredType(%q) = true, want false", dt)

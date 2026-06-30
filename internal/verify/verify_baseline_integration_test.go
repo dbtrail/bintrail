@@ -722,3 +722,81 @@ func TestVerifyBaselinePair_TextEventDecoded(t *testing.T) {
 		t.Errorf("id=2 status cell = %+v, want recovery=%q baseline=%q", id2Diff.Cells[0], "wrong", "shipped")
 	}
 }
+
+// TestVerifyBaselinePair_TextOnlyChange_Match isolates VerifyBaselinePair's
+// OWN decode call (#672): a TEXT column changed by an in-window event, with
+// NO other divergence in the table, must report StatusMatch directly. Unlike
+// TestVerifyBaselinePair_TextEventDecoded above (which needs a genuine,
+// unrelated mismatch for ExplainBaselinePairMismatch to drill into, and so
+// can't tell VerifyBaselinePair's own decode apart from ExplainBaselinePair-
+// Mismatch's independent one), this test has nothing else that could produce
+// a mismatch — if VerifyBaselinePair's decode call were missing, the digest
+// would hash the raw base64 instead of "updated text" and this would report
+// StatusMismatch instead.
+func TestVerifyBaselinePair_TextOnlyChange_Match(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"id", "PRI", "int", "int", 1},
+		{"body", "", "text", "text", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `body` TEXT,\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "body", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
+	}
+	writeTestBaseline(t, baseDir, prevTS, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "hello"},
+	}, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "updated text"},
+	}, "binlog.000001", 300)
+
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+
+	// changed_columns is populated realistically here (unlike the nil used
+	// elsewhere in this file): there is no unrelated deferred-type column for
+	// deferredReprChanged to gate on, so this exercises the real indexer's
+	// ChangedColumns path without it affecting the outcome.
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+	ets := prevTS.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ets, nil, dbName, "orders", 2 /*UPDATE*/, "1", []byte(`["body"]`),
+		[]byte(fmt.Sprintf(`{"id":1,"body":"%s"}`, b64("hello"))),
+		[]byte(fmt.Sprintf(`{"id":1,"body":"%s"}`, b64("updated text"))))
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
+	ctx := context.Background()
+	pairs, _, _, err := FindBaselinePair(ctx, baseDir)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
+	}
+
+	got, err := VerifyBaselinePair(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Fatalf("status = %q (%s); want match (TEXT body should decode to \"updated text\", matching the new baseline)", got.Status, got.Detail)
+	}
+}

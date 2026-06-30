@@ -4,6 +4,7 @@ package verify
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -158,5 +159,99 @@ func TestVerifyTable_MatchesAndDetectsDivergence(t *testing.T) {
 	}
 	if got2.Status != StatusMismatch {
 		t.Errorf("after tampering status = %q (%s); want mismatch", got2.Status, got2.Detail)
+	}
+}
+
+// TestVerifyTable_TextEventDecoded is the #672 regression for the live-source
+// path: a TEXT column changed by an in-window event must decode before
+// comparison, the same fix TestVerifyBaselinePair_TextOnlyChange_Match proves
+// for the baseline-anchored path. Neither
+// TestVerifyTable_MatchesAndDetectsDivergence above nor any other existing
+// test in this package exercises a TEXT/BLOB column through VerifyTable, so
+// this closes the only one of the three #672 call sites that had zero
+// coverage. If VerifyTable's DecodeEventBinaries call were missing, the
+// reconstructed digest would hash the event's raw base64 instead of "updated
+// text" and this would report StatusMismatch.
+func TestVerifyTable_TextEventDecoded(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+		VALUES (1, UTC_TIMESTAMP(), ?, 'orders', 'id', 1, 'PRI', 'int', 'int', 'NO', 0)`, dbName)
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+		VALUES (1, UTC_TIMESTAMP(), ?, 'orders', 'body', 2, '', 'text', 'text', 'YES', 0)`, dbName)
+
+	// ── live SOURCE table at the FINAL (post-event) state ──
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"CREATE TABLE `%s`.`orders` (`id` INT PRIMARY KEY, `body` TEXT)", dbName))
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"INSERT INTO `%s`.`orders` (id,body) VALUES (1,'updated text')", dbName))
+
+	// ── baseline Parquet at the INITIAL state {1:hello} ──
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `body` TEXT,\n  PRIMARY KEY (`id`)\n);\n"
+	baselineDir := t.TempDir()
+	now := time.Now().UTC()
+	curHour := now.Truncate(time.Hour)
+	h1 := curHour.Add(-time.Hour)
+	h2 := curHour
+	tsDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
+	parquetDir := filepath.Join(baselineDir, tsDir, dbName)
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "body", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
+	}
+	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "orders.parquet"), cols,
+		baseline.WriterConfig{Compression: "zstd", RowGroupSize: 100,
+			Metadata: map[string]string{baseline.MetaKeyCreateTableSQL: createSQL}})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := bw.WriteRow([]string{"1", "hello"}, []bool{false, false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("baseline close: %v", err)
+	}
+
+	// ── binlog event: body updated, base64-encoded as TEXT is delivered ──
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	ts := now.Add(-1 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts, nil, dbName, "orders", 2 /*UPDATE*/, "1", []byte(`["body"]`),
+		[]byte(fmt.Sprintf(`{"id":1,"body":"%s"}`, b64("hello"))),
+		[]byte(fmt.Sprintf(`{"id":1,"body":"%s"}`, b64("updated text"))))
+
+	// ── stream_state with a GTID superset so the coverage check passes ──
+	var uuid string
+	if err := db.QueryRow("SELECT @@server_uuid").Scan(&uuid); err != nil {
+		t.Fatalf("server_uuid: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO stream_state
+		(id, mode, gtid_set, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, UTC_TIMESTAMP(), 1)`, uuid+":1-1000000")
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := Config{
+		SourceDB: db, IndexDB: db, Resolver: resolver,
+		BaselineSource: baselineDir, IndexDBName: dbName, NoArchive: true,
+	}
+
+	got, err := VerifyTable(context.Background(), cfg, dbName, "orders")
+	if err != nil {
+		t.Fatalf("VerifyTable: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Fatalf("status = %q (%s); want match (TEXT body should decode to \"updated text\", matching the live source)", got.Status, got.Detail)
 	}
 }

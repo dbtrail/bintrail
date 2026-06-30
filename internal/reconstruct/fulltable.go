@@ -623,9 +623,10 @@ type mergeStats struct {
 // its own Changes map before it ever reaches this function: the writer caller
 // upstream in ReconstructTable, on the full events slice before the Changes
 // map is even built (DecodeEventBinaries, #668); the shim caller upstream in
-// runSnapshotFullTable, via mapEventImages (#661). `verify`'s two
-// SnapshotFullTableImages callers (reconstructDigest, the --explain drill-down)
-// are the remaining undecoded consumers (#672).
+// runSnapshotFullTable, via mapEventImages (#661); `verify`'s callers
+// (reconstructDigest and ExplainBaselinePairMismatch) the same way, upstream
+// of their own Changes map builds (#672). Every SnapshotFullTableImages caller
+// now decodes before this function ever sees a value.
 func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string]any) error) (mergeStats, error) {
 	var stats mergeStats
 
