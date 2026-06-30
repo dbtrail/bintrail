@@ -92,7 +92,7 @@ func init() {
 	recoverCmd.Flags().StringVar(&rProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	recoverCmd.Flags().StringVar(&rFormat, "format", "text", "Output format: text or json")
 	recoverCmd.Flags().BoolVar(&rNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
-	recoverCmd.Flags().StringVar(&rMaxScriptBytes, "max-script-bytes", "2GB", "Refuse to generate a reversal script whose estimated row payload exceeds this size (e.g. 512MB, 4GB; 0 = unlimited). Guards against OOM on BLOB/TEXT-heavy recoveries (#654).")
+	recoverCmd.Flags().StringVar(&rMaxScriptBytes, "max-script-bytes", "2GB", "Refuse to generate a reversal script whose estimated row payload exceeds this size (e.g. 512MB, 4GB; 0 = unlimited). Bounds the rendered-script memory spike on BLOB/TEXT-heavy recoveries (#654).")
 	AddDuckDBTuningFlags(recoverCmd)
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(recoverCmd)

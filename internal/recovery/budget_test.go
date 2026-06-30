@@ -57,6 +57,17 @@ func TestEstimateScriptBytes(t *testing.T) {
 			wantMin: 3 << 20,
 			wantMax: (3 << 20) + 1<<10,
 		},
+		{
+			// A fat JSON column decodes to nested maps/arrays (the #652 class);
+			// the estimator must recurse into them, not fall to the 16-byte
+			// scalar default, or it under-counts the exact payload #654 targets.
+			name: "nested JSON column recurses (map + array)",
+			rows: []query.ResultRow{{EventType: event.EventDelete, PKValues: "1", RowBefore: map[string]any{
+				"doc": map[string]any{"a": big, "b": []any{big, "x"}},
+			}}},
+			wantMin: 2 << 20, // both nested 1 MiB values counted via recursion
+			wantMax: (2 << 20) + 1<<10,
+		},
 	}
 
 	for _, tc := range cases {
@@ -66,6 +77,20 @@ func TestEstimateScriptBytes(t *testing.T) {
 				t.Fatalf("EstimateScriptBytes = %d, want in [%d, %d]", got, tc.wantMin, tc.wantMax)
 			}
 		})
+	}
+}
+
+// TestNewDefaultsBudget pins the zero-config guard (#654): New / NewForDialect
+// must seed maxScriptBytes with DefaultMaxScriptBytes. The MCP recover tool, the
+// console, and recover-cascade never call SetMaxScriptBytes, so if a constructor
+// stopped defaulting the field (zero value = unlimited) the guard would silently
+// vanish for them while every SetMaxScriptBytes-using test still passed.
+func TestNewDefaultsBudget(t *testing.T) {
+	if got := New(nil, nil).maxScriptBytes; got != DefaultMaxScriptBytes {
+		t.Errorf("New() maxScriptBytes = %d, want DefaultMaxScriptBytes (%d)", got, DefaultMaxScriptBytes)
+	}
+	if got := NewForDialect(nil, nil, PostgresDialect).maxScriptBytes; got != DefaultMaxScriptBytes {
+		t.Errorf("NewForDialect() maxScriptBytes = %d, want DefaultMaxScriptBytes (%d)", got, DefaultMaxScriptBytes)
 	}
 }
 

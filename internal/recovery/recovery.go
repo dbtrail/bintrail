@@ -93,6 +93,22 @@ const DefaultMaxScriptBytes int64 = 2 << 30
 // sets it from --max-script-bytes; other callers keep DefaultMaxScriptBytes.
 func (g *Generator) SetMaxScriptBytes(n int64) { g.maxScriptBytes = n }
 
+// CheckScriptBudget returns a *ScriptBudgetError when rendering rows would exceed
+// the configured script-size budget (#654), or nil when within budget (or the
+// budget is disabled). GenerateSQLFromRows calls it before rendering; callers
+// that write their own preamble BEFORE GenerateSQLFromRows — e.g.
+// cascaderecover.EmitSQL — call it first so a refusal writes nothing instead of
+// leaving a dangling header (and, for cascade, a `SET FOREIGN_KEY_CHECKS=0`).
+func (g *Generator) CheckScriptBudget(rows []query.ResultRow) error {
+	if g.maxScriptBytes <= 0 {
+		return nil
+	}
+	if est := EstimateScriptBytes(rows); est > g.maxScriptBytes {
+		return &ScriptBudgetError{EstimatedBytes: est, Budget: g.maxScriptBytes}
+	}
+	return nil
+}
+
 // DialectForFlavor maps a stream_state.flavor value to the recovery SQL dialect.
 // PostgreSQL gets its own dialect; MySQL, MariaDB, and an empty/unknown flavor all
 // use MySQL (the established default — MariaDB recovery SQL is MySQL-dialect). It
@@ -185,10 +201,8 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 	// silently-wrong recovery — the same fail-loud stance as the schema-drift
 	// refusal below. The bound is on the rendered payload, not the initial fetch
 	// (the events are already loaded, row-count-bounded by --limit).
-	if g.maxScriptBytes > 0 {
-		if est := EstimateScriptBytes(rows); est > g.maxScriptBytes {
-			return 0, &ScriptBudgetError{EstimatedBytes: est, Budget: g.maxScriptBytes}
-		}
+	if err := g.CheckScriptBudget(rows); err != nil {
+		return 0, err
 	}
 
 	// Reverse so the most-recent event is undone first.

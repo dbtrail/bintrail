@@ -53,6 +53,15 @@ type Header struct {
 // resolver supplies child PK columns for the SET NULL WHERE clauses; gen must be
 // built from the same (or an equivalent) resolver (recovery.New(db, resolver)).
 func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNullRows []cascade.SetNullRestore, resolver *metadata.Resolver, hdr Header) (int, error) {
+	// Enforce the recover script-size budget BEFORE writing a byte (#654): EmitSQL
+	// emits its preamble (including `SET FOREIGN_KEY_CHECKS=0`) ahead of the
+	// generator, so without an up-front check a budget refusal would leave that
+	// dangling FK-disable on the writer. Refusing here keeps "emit nothing on
+	// refusal" consistent with the plain recover path.
+	if err := gen.CheckScriptBudget(rows); err != nil {
+		return 0, err
+	}
+
 	// Build every SET NULL restoration BEFORE writing a byte (all-or-nothing): a
 	// missing resolver, an unresolvable table, or an absent PK column must abort
 	// the whole emit cleanly — returning mid-script would leave the parent/child

@@ -2,11 +2,13 @@ package cascaderecover_test
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/cascade"
 	"github.com/dbtrail/dbtrail/internal/cascaderecover"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/recovery"
@@ -22,6 +24,37 @@ func emit(t *testing.T, hdr cascaderecover.Header, rows []query.ResultRow, setNu
 	var buf bytes.Buffer
 	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, resolver), rows, setNull, resolver, hdr)
 	return buf.String(), n, err
+}
+
+// TestEmitSQL_scriptBudgetRefusesCleanly verifies the #654 budget guard in the
+// cascade path: when the rows exceed the script-size budget, EmitSQL refuses
+// BEFORE writing its preamble, so it leaves NO dangling `SET FOREIGN_KEY_CHECKS=0`
+// on the writer (the footgun a refusal after the preamble would create).
+func TestEmitSQL_scriptBudgetRefusesCleanly(t *testing.T) {
+	hdr := cascaderecover.Header{Schema: "shop", Table: "orders", Parents: 1, Children: 0}
+	rows := []query.ResultRow{{
+		EventType:  event.EventDelete,
+		SchemaName: "shop", TableName: "orders",
+		PKValues:  "1",
+		RowBefore: map[string]any{"id": float64(1), "blob": strings.Repeat("x", 1<<20)}, // 1 MiB
+	}}
+
+	gen := recovery.New(nil, nil)
+	gen.SetMaxScriptBytes(1024) // tiny budget → the 1 MiB row trips it
+
+	var buf bytes.Buffer
+	n, err := cascaderecover.EmitSQL(&buf, gen, rows, nil, nil, hdr)
+
+	var be *recovery.ScriptBudgetError
+	if !errors.As(err, &be) {
+		t.Fatalf("want *ScriptBudgetError, got %v", err)
+	}
+	if n != 0 {
+		t.Errorf("want 0 statements on refusal, got %d", n)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("refusal must write nothing (no dangling FK-disable), wrote %d bytes: %q", buf.Len(), buf.String())
+	}
 }
 
 // TestEmitSQL_goldenPhase1 pins the byte-exact Phase-1 (no baseline) script: the
