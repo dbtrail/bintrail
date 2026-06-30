@@ -1051,7 +1051,7 @@ func (h *Handler) mapEventImages(schema, table string, rows []query.ResultRow) {
 		m.MapImage(rows[i].RowAfter)
 		// Decode AFTER the ENUM/SET map: the two passes touch disjoint columns
 		// (ENUM/SET are never BLOB/TEXT), so order is immaterial, but keeping the
-		// base64 decode last mirrors reconstruct.decodeChangeBinaries running
+		// base64 decode last mirrors reconstruct.DecodeEventBinaries running
 		// after MapEventEnumLabels. Event images only — never a baseline row, so
 		// _snapshot decodes its deltas pre-merge and never double-decodes the
 		// baseline value DuckDB scans straight to a Go string.

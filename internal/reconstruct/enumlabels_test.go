@@ -7,8 +7,7 @@ import (
 
 // TestDecodeImageBinaries pins the per-image base64 decode primitive used by
 // DecodeEventBinaries (#666): BLOB → []byte, TEXT → string, NULL stays nil, a
-// non-blob/text column and an absent column are untouched. Sibling of
-// TestDecodeChangeBinaries (the full-table change-map decoder).
+// non-blob/text column and an absent column are untouched.
 func TestDecodeImageBinaries(t *testing.T) {
 	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 	image := map[string]any{

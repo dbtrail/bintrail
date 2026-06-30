@@ -134,8 +134,12 @@ func writeBlobTextBaseline(t *testing.T, rows [][]string) string {
 // string), and an already-decoded delta-event TEXT/BLOB (decode now happens
 // upstream, epoch-aware, via DecodeEventBinaries before mergeBaselineIntoWriter
 // ever sees the Changes map — #668) must reach the writer untouched, not
-// decoded a second time. Re-introducing a decode in rowAfterOrdered or
-// mergeBaselineIntoWriter makes this fail.
+// decoded a second time. Re-introducing a decode in rowAfterOrdered makes this
+// fail directly; the delta-event "tx" fixture is itself valid base64 (like the
+// baseline fixture above it) so a reintroduced decode anywhere on the Changes
+// path — e.g. inside mergeBaselineIntoWriter — corrupts it and trips the
+// assertion below too, instead of silently no-op'ing on an already-decoded
+// value that doesn't happen to look like base64.
 func TestMergeBaseline_blobTextProvenance(t *testing.T) {
 	baselinePath := writeBlobTextBaseline(t, [][]string{
 		{"1", "YWJjZA==", "RAW"}, // untouched; tx is valid base64 (of "abcd"); bl bytes "RAW"
@@ -146,8 +150,10 @@ func TestMergeBaseline_blobTextProvenance(t *testing.T) {
 		pkStrForInt(2): {
 			EventType: event.EventInsert,
 			PKValues:  pkStrForInt(2),
-			// Already decoded, as DecodeEventBinaries would leave it.
-			RowAfter: map[string]any{"id": float64(2), "tx": "hello", "bl": []byte("BIN")},
+			// Already decoded, as DecodeEventBinaries would leave it. "test" is
+			// itself valid base64 (decodes to garbage bytes), on purpose: it's
+			// what catches a reintroduced double-decode on this path.
+			RowAfter: map[string]any{"id": float64(2), "tx": "test", "bl": []byte("BIN")},
 		},
 	}
 
@@ -174,8 +180,10 @@ func TestMergeBaseline_blobTextProvenance(t *testing.T) {
 	if strings.Contains(chunk, "'abcd'") {
 		t.Errorf("baseline TEXT was wrongly base64-decoded (corruption, #660):\n%s", chunk)
 	}
-	// Delta event: already-decoded values must reach the writer unchanged.
-	if !strings.Contains(chunk, "(X'42494e', 2, 'hello')") {
+	// Delta event: already-decoded values must reach the writer unchanged. "test"
+	// is valid base64, so a reintroduced decode here would corrupt it — this is
+	// what makes the assertion an actual double-decode regression guard.
+	if !strings.Contains(chunk, "(X'42494e', 2, 'test')") {
 		t.Errorf("delta-event BLOB/TEXT must reach the writer already decoded, got:\n%s", chunk)
 	}
 }
