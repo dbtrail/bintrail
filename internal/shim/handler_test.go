@@ -3,6 +3,7 @@ package shim
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,8 +74,8 @@ func TestResultsetValue_jsonNumber(t *testing.T) {
 		{"9223372036854775807", "9223372036854775807"},   // 2^63-1 → int64 branch
 		{"9223372036854775808", "9223372036854775808"},   // exactly 2^63 → uint64 branch
 		{"18446744073709551615", "18446744073709551615"}, // BIGINT UNSIGNED max → uint64
-		{"3.14", "3.14"},                                 // fractional → float64
-		{"1e1000", "1e1000"},                             // beyond float64 range → literal passthrough
+		{"3.14", "3.14"},     // fractional → float64
+		{"1e1000", "1e1000"}, // beyond float64 range → literal passthrough
 	}
 	for _, c := range cases {
 		b, ok := resultsetValue(json.Number(c.in)).([]byte)
@@ -142,11 +143,11 @@ func TestFullTableTextCell_jsonNumberMatchesNative(t *testing.T) {
 		num    json.Number
 		native any
 	}{
-		{"18446744073709551615", uint64(18446744073709551615)},   // BIGINT UNSIGNED max
+		{"18446744073709551615", uint64(18446744073709551615)}, // BIGINT UNSIGNED max
 		{"100", int64(100)},
-		{"-9223372036854775808", int64(-9223372036854775808)},    // BIGINT signed min
-		{"1e+21", float64(1e21)},                                 // extreme double: "1e+21" vs decimal
-		{"-1e+21", float64(-1e21)},                               // negative extreme double
+		{"-9223372036854775808", int64(-9223372036854775808)}, // BIGINT signed min
+		{"1e+21", float64(1e21)},                              // extreme double: "1e+21" vs decimal
+		{"-1e+21", float64(-1e21)},                            // negative extreme double
 		{"0.0000001", float64(1e-7)},
 		{"100.5", float64(100.5)},
 	}
@@ -708,7 +709,7 @@ func TestExtractFullTableImages(t *testing.T) {
 }
 
 // TestRunPointInTimeDispatchesByPKColumn pins the fix for the empty-
-// string PK collision: `WHERE id = ''` is a legitimate single-row
+// string PK collision: `WHERE id = ”` is a legitimate single-row
 // query against a NOT-NULL VARCHAR with empty default, and a dispatch
 // on q.PKValue would silently flip it into a 100k-row table scan.
 //
@@ -2506,7 +2507,7 @@ func TestImageToResultVerbatim(t *testing.T) {
 		image := map[string]any{
 			"id":         1,
 			"name":       "alice",
-			"email":      "a@b.com",   // image has email, user did NOT ask
+			"email":      "a@b.com",    // image has email, user did NOT ask
 			"created_at": "2026-05-02", // image has created_at, user did NOT ask
 		}
 		res, err := imageToResultVerbatim(image, []string{"id", "name"})
@@ -2593,5 +2594,182 @@ func TestMapEventImagesFallback(t *testing.T) {
 	bare.mapEventImages("myapp", "orders", rows2)
 	if rows2[0].RowAfter["status"] != float64(3) {
 		t.Errorf("bare handler must pass through, got %v", rows2[0].RowAfter["status"])
+	}
+}
+
+// TestMapEventImagesDecodesBlobText is the core unit proof for #661: the
+// storage-side base64 of BLOB/TEXT event values is decoded back to raw bytes /
+// strings in BOTH row images, in place, before emission — while non-BLOB/TEXT
+// columns, NULLs, and columns absent from an image are left untouched. Because
+// mapEventImages is the single chokepoint every event-sourced path traverses
+// before emit/merge (and never sees a baseline row), decoding here gives every
+// event-sourced emit path the fix with provenance-correctness for free.
+func TestMapEventImagesDecodesBlobText(t *testing.T) {
+	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	h := &Handler{
+		logger: silent,
+		resolverFn: func() (*metadata.Resolver, error) {
+			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+				"appdb.docs": {Schema: "appdb", Table: "docs", Columns: []metadata.ColumnMeta{
+					{Name: "id", OrdinalPosition: 1, DataType: "int", IsPK: true},
+					{Name: "body", OrdinalPosition: 2, DataType: "text"},
+					{Name: "payload", OrdinalPosition: 3, DataType: "blob"},
+				}},
+			}), nil
+		},
+	}
+	rawBlob := "\x00\xff\x7f\x80" // arbitrary non-UTF-8 bytes must survive
+	rows := []query.ResultRow{{
+		SchemaName:     "appdb",
+		TableName:      "docs",
+		EventTimestamp: time.Unix(1_700_000_000, 0).UTC(),
+		RowBefore: map[string]any{
+			"id": json.Number("1"), "body": b64("old bio"), "payload": b64("\x01\x02"),
+		},
+		RowAfter: map[string]any{
+			"id": json.Number("1"), "body": b64("hello world"), "payload": b64(rawBlob),
+		},
+	}}
+	h.mapEventImages("appdb", "docs", rows)
+
+	// TEXT family → decoded Go string.
+	if got := rows[0].RowAfter["body"]; got != "hello world" {
+		t.Errorf("RowAfter body = %#v, want decoded string %q", got, "hello world")
+	}
+	if got := rows[0].RowBefore["body"]; got != "old bio" {
+		t.Errorf("RowBefore body = %#v, want decoded string %q (both images decode, for _diff)", got, "old bio")
+	}
+	// BLOB family → decoded raw []byte, arbitrary bytes intact.
+	if got, ok := rows[0].RowAfter["payload"].([]byte); !ok || string(got) != rawBlob {
+		t.Errorf("RowAfter payload = %#v, want decoded []byte %q", rows[0].RowAfter["payload"], rawBlob)
+	}
+	// Non-BLOB/TEXT column untouched.
+	if got := rows[0].RowAfter["id"]; got != json.Number("1") {
+		t.Errorf("RowAfter id = %#v, want untouched json.Number(\"1\")", got)
+	}
+}
+
+// TestMapEventImagesDecodeEdgeCases pins the defensive branches of the #661
+// decode so a future refactor can't silently regress them: NULL values, a
+// value that is not a decodable base64 string, and a column absent from the
+// image must all be left as-is (no panic, no corruption).
+func TestMapEventImagesDecodeEdgeCases(t *testing.T) {
+	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := &Handler{
+		logger: silent,
+		resolverFn: func() (*metadata.Resolver, error) {
+			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+				"appdb.docs": {Schema: "appdb", Table: "docs", Columns: []metadata.ColumnMeta{
+					{Name: "id", OrdinalPosition: 1, DataType: "int", IsPK: true},
+					{Name: "body", OrdinalPosition: 2, DataType: "text"},
+					{Name: "payload", OrdinalPosition: 3, DataType: "blob"},
+				}},
+			}), nil
+		},
+	}
+	rows := []query.ResultRow{{
+		SchemaName:     "appdb",
+		TableName:      "docs",
+		EventTimestamp: time.Unix(1_700_000_000, 0).UTC(),
+		// body is NULL; payload key absent entirely (partial image).
+		RowAfter: map[string]any{"id": json.Number("1"), "body": nil},
+	}}
+	h.mapEventImages("appdb", "docs", rows)
+	if got, ok := rows[0].RowAfter["body"]; !ok || got != nil {
+		t.Errorf("NULL body = %#v, want nil untouched", got)
+	}
+	if _, present := rows[0].RowAfter["payload"]; present {
+		t.Errorf("absent payload column must not be materialized, got %#v", rows[0].RowAfter["payload"])
+	}
+
+	// A TEXT value that is not valid base64 is returned unchanged (the decode
+	// is best-effort — DecodeString errors fall through).
+	if got := decodeStoredBase64("not base64!!", false); got != "not base64!!" {
+		t.Errorf("non-base64 string = %#v, want unchanged", got)
+	}
+	if got := decodeStoredBase64(nil, true); got != nil {
+		t.Errorf("nil value = %#v, want nil", got)
+	}
+}
+
+// TestBase64StoredKind and TestBase64Cols pin the pure type predicates the
+// #661 decode is gated on.
+func TestBase64StoredKind(t *testing.T) {
+	binaryFamily := []string{"blob", "tinyblob", "mediumblob", "longblob"}
+	textFamily := []string{"text", "tinytext", "mediumtext", "longtext"}
+	for _, dt := range binaryFamily {
+		if binary, ok := base64StoredKind(dt); !ok || !binary {
+			t.Errorf("base64StoredKind(%q) = (%v,%v), want (true,true)", dt, binary, ok)
+		}
+	}
+	for _, dt := range textFamily {
+		if binary, ok := base64StoredKind(dt); !ok || binary {
+			t.Errorf("base64StoredKind(%q) = (%v,%v), want (false,true)", dt, binary, ok)
+		}
+	}
+	// Case-insensitive, and unrelated types are not decoded (incl. the
+	// deliberately-excluded geometry/vector families).
+	if binary, ok := base64StoredKind("LONGTEXT"); !ok || binary {
+		t.Errorf("base64StoredKind is not case-insensitive: got (%v,%v)", binary, ok)
+	}
+	for _, dt := range []string{"int", "varchar", "json", "geometry", "datetime", ""} {
+		if _, ok := base64StoredKind(dt); ok {
+			t.Errorf("base64StoredKind(%q) reported a decodable column, want none", dt)
+		}
+	}
+}
+
+func TestBase64Cols(t *testing.T) {
+	// Nil resolver → nil map (no schema = no safe typing, preserves pre-fix base64).
+	if got := base64Cols(nil, "appdb", "docs"); got != nil {
+		t.Errorf("base64Cols(nil) = %v, want nil", got)
+	}
+	r := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"appdb.docs": {Schema: "appdb", Table: "docs", Columns: []metadata.ColumnMeta{
+			{Name: "id", DataType: "int"},
+			{Name: "body", DataType: "text"},
+			{Name: "payload", DataType: "blob"},
+		}},
+	})
+	got := base64Cols(r, "appdb", "docs")
+	want := map[string]bool{"body": false, "payload": true}
+	if len(got) != len(want) || got["body"] != false || got["payload"] != true {
+		t.Errorf("base64Cols = %v, want %v", got, want)
+	}
+	// Unknown table → nil (not a panic).
+	if got := base64Cols(r, "appdb", "nope"); got != nil {
+		t.Errorf("base64Cols(unknown table) = %v, want nil", got)
+	}
+}
+
+// TestMapEventImagesDecodesExactlyOnce guards against a double-decode: every
+// stored BLOB/TEXT value is base64, but its decoded bytes can THEMSELVES be
+// valid base64. A real TEXT value of "SGVsbG8=" is stored as base64("SGVsbG8=");
+// one decode yields "SGVsbG8=", a second would yield "Hello". The single decode
+// in mapEventImages must return "SGVsbG8=" verbatim.
+func TestMapEventImagesDecodesExactlyOnce(t *testing.T) {
+	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := &Handler{
+		logger: silent,
+		resolverFn: func() (*metadata.Resolver, error) {
+			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+				"appdb.docs": {Schema: "appdb", Table: "docs", Columns: []metadata.ColumnMeta{
+					{Name: "id", OrdinalPosition: 1, DataType: "int", IsPK: true},
+					{Name: "body", OrdinalPosition: 2, DataType: "text"},
+				}},
+			}), nil
+		},
+	}
+	stored := base64.StdEncoding.EncodeToString([]byte("SGVsbG8=")) // a real value that is itself base64
+	rows := []query.ResultRow{{
+		SchemaName:     "appdb",
+		TableName:      "docs",
+		EventTimestamp: time.Unix(1_700_000_000, 0).UTC(),
+		RowAfter:       map[string]any{"id": json.Number("1"), "body": stored},
+	}}
+	h.mapEventImages("appdb", "docs", rows)
+	if got := rows[0].RowAfter["body"]; got != "SGVsbG8=" {
+		t.Errorf("body = %#v, want \"SGVsbG8=\" (decoded exactly once, not twice → \"Hello\")", got)
 	}
 }

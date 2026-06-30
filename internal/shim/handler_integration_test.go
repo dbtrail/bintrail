@@ -4,6 +4,7 @@ package shim
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -358,6 +359,101 @@ func TestRunPointInTime_EnumSetOrdinalsMapToLabels(t *testing.T) {
 	}
 }
 
+// TestRunPointInTime_BlobTextDecoded pins #661 end-to-end against a real index
+// DB: BLOB/TEXT columns are stored base64-encoded (marshalRow base64-encodes the
+// []byte go-mysql delivers), so _flashback must decode them before emission or
+// the client gets the base64 text instead of the real value. Covers the single-
+// row path, the full-table path (with a NULL row to exercise []byte + nil column
+// type-consistency), and _diff (TEXT renders as the real string in the audit JSON).
+func TestRunPointInTime_BlobTextDecoded(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, now)
+	snapTS := now.Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "myapp", "docs", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "myapp", "docs", "body", 2, "", "text", "YES")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "myapp", "docs", "payload", 3, "", "blob", "YES")
+
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	rawBlob := "\x00\xff\x7f\x80" // arbitrary non-UTF-8 bytes must survive the wire
+	eventTS := now.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+	// id=1: real text + binary blob, both stored base64.
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "docs", 1 /*insert*/, "1", nil, nil,
+		[]byte(fmt.Sprintf(`{"id":1,"body":%q,"payload":%q}`, b64("hello world"), b64(rawBlob))))
+	// id=2: NULL body, so the full-table BLOB/TEXT columns mix decoded values
+	// with NULL — the one case that could trip BuildSimpleTextResultset.
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 200, 300, eventTS, nil,
+		"myapp", "docs", 1 /*insert*/, "2", nil, nil,
+		[]byte(fmt.Sprintf(`{"id":2,"body":null,"payload":%q}`, b64("second"))))
+
+	h := NewHandlerWithConfig(db, Config{NoArchive: true, IndexDBName: dbName}, slog.Default())
+
+	// Single-row _flashback id=1.
+	res, err := h.runPointInTime(TimeTravelQuery{
+		Type: TypeFlashback, Schema: "myapp", Table: "docs",
+		PKColumn: "id", PKValue: "1", AsOf: now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("runPointInTime: %v", err)
+	}
+	cells := rowCells(t, res.Resultset)
+	if len(cells) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(cells))
+	}
+	if got, want := cells[0][1], "hello world"; got != want {
+		t.Errorf("body = %q, want %q (TEXT not decoded from base64)", got, want)
+	}
+	if got, want := cells[0][2], rawBlob; got != want {
+		t.Errorf("payload = %q, want %q (BLOB not decoded from base64)", got, want)
+	}
+
+	// Full-table _flashback: id=1 decoded, id=2 body NULL + payload decoded.
+	ftRes, err := h.runFullTable(TimeTravelQuery{
+		Type: TypeFlashback, Schema: "myapp", Table: "docs", AsOf: now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("full-table _flashback: %v", err)
+	}
+	byID := make(map[string][]string)
+	for _, c := range rowCells(t, ftRes.Resultset) {
+		byID[c[0]] = c
+	}
+	if len(byID) != 2 {
+		t.Fatalf("full-table: expected 2 rows, got %d (%v)", len(byID), byID)
+	}
+	if got, want := byID["1"][1], "hello world"; got != want {
+		t.Errorf("full-table id=1 body = %q, want %q", got, want)
+	}
+	if got, want := byID["2"][1], "NULL"; got != want {
+		t.Errorf("full-table id=2 body = %q, want %q (NULL must survive alongside decoded rows)", got, want)
+	}
+	if got, want := byID["2"][2], "second"; got != want {
+		t.Errorf("full-table id=2 payload = %q, want %q", got, want)
+	}
+
+	// _diff id=1: the audit JSON must carry the decoded TEXT, not the base64.
+	diffRes, err := h.runDiff(TimeTravelQuery{
+		Type: TypeDiff, Schema: "myapp", Table: "docs", PKValue: "1",
+		Since: now.Add(time.Minute), Until: now.Add(15 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("runDiff: %v", err)
+	}
+	diffCells := rowCells(t, diffRes.Resultset)
+	if len(diffCells) != 1 {
+		t.Fatalf("_diff: expected 1 row, got %d", len(diffCells))
+	}
+	if rowAfter := diffCells[0][5]; !strings.Contains(rowAfter, `"body":"hello world"`) {
+		t.Errorf("_diff row_after = %s, want body decoded to \"hello world\"", rowAfter)
+	}
+}
+
 // TestEnumLabels_FullChainFromRealSnapshot covers the wiring no other
 // test exercises end-to-end: real CREATE TABLE → metadata.TakeSnapshot
 // (capturing an ENUM declaration well past #212's old VARCHAR(128)
@@ -495,6 +591,71 @@ func TestEnumLabels_EpochAwareDecoding(t *testing.T) {
 		}
 		if got := cells[0][1]; got != tc.want {
 			t.Errorf("pk=%s: status = %q, want %q — %s", tc.pk, got, tc.want, tc.why)
+		}
+	}
+}
+
+// TestRunPointInTime_BlobTextEpochAware is the load-bearing proof that the #661
+// base64 decode is resolved at each event's epoch, not from the latest snapshot.
+// A column widened VARCHAR→TEXT across the flashback window is the trap: an old
+// VARCHAR value reached go-mysql as a Go string, so marshalRow stored it as a
+// PLAIN JSON string (never base64). If the decode used the latest (TEXT) snapshot
+// for the old event, a plain value that happens to be valid base64 ("test")
+// would be silently mangled to garbage bytes. The epoch-aware lookup types the
+// old event's column as VARCHAR → leaves it untouched, while the new TEXT event
+// is still decoded.
+func TestRunPointInTime_BlobTextEpochAware(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, now)
+
+	insertTyped := func(snapID int, snapTS, column string, ordinal int, key, dataType string) {
+		testutil.InsertSnapshot(t, db, snapID, snapTS, "myapp", "docs", column, ordinal, key, dataType, "YES")
+	}
+	snap1TS := now.Add(1 * time.Minute).Format("2006-01-02 15:04:05")
+	snap2TS := now.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	// Epoch 1: notes is VARCHAR (stored plain). Epoch 2: notes widened to TEXT.
+	insertTyped(1, snap1TS, "id", 1, "PRI", "int")
+	insertTyped(1, snap1TS, "notes", 2, "", "varchar")
+	insertTyped(2, snap2TS, "id", 1, "PRI", "int")
+	insertTyped(2, snap2TS, "notes", 2, "", "text")
+
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	// Event A in epoch 1: VARCHAR value stored as a PLAIN string. "test" is valid
+	// base64, so an epoch-blind decode would corrupt it.
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200,
+		now.Add(5*time.Minute).Format("2006-01-02 15:04:05"), nil,
+		"myapp", "docs", 1 /*insert*/, "1", nil, nil, []byte(`{"id":1,"notes":"test"}`))
+	// Event B in epoch 2: TEXT value stored base64-encoded.
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 300, 400,
+		now.Add(15*time.Minute).Format("2006-01-02 15:04:05"), nil,
+		"myapp", "docs", 1 /*insert*/, "2", nil, nil,
+		[]byte(fmt.Sprintf(`{"id":2,"notes":%q}`, b64("hi there"))))
+
+	h := NewHandlerWithConfig(db, Config{NoArchive: true, IndexDBName: dbName}, slog.Default())
+	asOf := now.Add(20 * time.Minute)
+	for _, tc := range []struct{ pk, want, why string }{
+		{"1", "test", "epoch-1 VARCHAR value was stored plain, NOT base64 — decoding it (latest=TEXT) corrupts it"},
+		{"2", "hi there", "epoch-2 TEXT value is base64-stored and must be decoded"},
+	} {
+		res, err := h.runPointInTime(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "docs",
+			PKColumn: "id", PKValue: tc.pk, AsOf: asOf,
+		})
+		if err != nil {
+			t.Fatalf("pk=%s: %v", tc.pk, err)
+		}
+		cells := rowCells(t, res.Resultset)
+		if len(cells) != 1 {
+			t.Fatalf("pk=%s: expected 1 row, got %d", tc.pk, len(cells))
+		}
+		if got := cells[0][1]; got != tc.want {
+			t.Errorf("pk=%s: notes = %q, want %q — %s", tc.pk, got, tc.want, tc.why)
 		}
 	}
 }

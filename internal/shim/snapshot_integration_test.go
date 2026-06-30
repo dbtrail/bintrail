@@ -4,6 +4,7 @@ package shim
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"os"
@@ -404,7 +405,7 @@ func TestSnapshotBaseline_DatetimePKResolvesFromBaseline(t *testing.T) {
 }
 
 // TestSnapshotBaseline_EmptyStringPK is a regression test for the empty-PK
-// filter bypass: `WHERE name = ''` against a NOT-NULL string PK is a
+// filter bypass: `WHERE name = ”` against a NOT-NULL string PK is a
 // documented legitimate shape, but Options.PKValues=="" disables the
 // pk_values filter in buildQuery. If runSnapshotPointInTime routed the
 // empty value through PKValues (not PKValuesIn), the fetch would return
@@ -627,6 +628,142 @@ func TestSnapshotBaseline_FullTableMerge(t *testing.T) {
 	}
 	if flash["2"] != "bob2" || flash["4"] != "dave" {
 		t.Errorf("full-table _flashback = %v, want id=2 bob2 and id=4 dave (rows with binlog activity)", flash)
+	}
+}
+
+// TestSnapshotBaseline_BlobTextProvenance is the load-bearing proof that the
+// #661 BLOB/TEXT decode respects provenance in the _snapshot merge: it decodes
+// ONLY event-sourced values, never baseline-origin ones. mapEventImages runs on
+// the delta events before the merge, so a never-touched baseline row whose TEXT
+// value happens to be valid base64 ("YWxpY2U=" → "alice") must pass through
+// verbatim, while a row updated post-baseline has its base64-stored event value
+// decoded. Decoding by Go-type at emit time would corrupt the baseline value;
+// decoding pre-merge on the events only is what keeps the two apart.
+func TestSnapshotBaseline_BlobTextProvenance(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// Snapshot types docs.body as TEXT so base64Cols flags it for decoding.
+	snapTS := snapTime.UTC().Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "myapp", "docs", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "myapp", "docs", "body", 2, "", "text", "YES")
+
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "body", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
+	}
+	// id=1 never touched in the binlog window; its baseline body LOOKS like
+	// base64. id=2 is updated post-baseline; its event body IS base64-stored.
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "docs", cols, [][]string{
+		{"1", "YWxpY2U="},
+		{"2", "bob-orig"},
+	})
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "docs", 2 /*update*/, "2", nil,
+		[]byte(fmt.Sprintf(`{"id":2,"body":%q}`, b64("bob-orig"))),
+		[]byte(fmt.Sprintf(`{"id":2,"body":%q}`, b64("bob-new"))))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:   true,
+		NoArchive:   true,
+		IndexDBName: dbName,
+		BaselineDir: baselineDir,
+	}, slog.Default())
+
+	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "docs", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("full-table _snapshot: %v", err)
+	}
+	got := rowsByKey(t, res.Resultset)
+	// Provenance guard: the baseline-origin value passes through verbatim — a
+	// regression that decoded it by column type would surface "alice" here.
+	if got["1"] != "YWxpY2U=" {
+		t.Errorf("id=1 body = %q, want \"YWxpY2U=\" verbatim — a baseline-origin value must NOT be base64-decoded", got["1"])
+	}
+	// The fix: the event-origin value IS decoded.
+	if got["2"] != "bob-new" {
+		t.Errorf("id=2 body = %q, want \"bob-new\" (event-sourced TEXT decoded from base64)", got["2"])
+	}
+}
+
+// TestSnapshotBaseline_BlobTextProvenanceSingleRow is the single-row sibling of
+// the provenance test above: it drives runSnapshotPointInTime (PKColumn set),
+// the one emission surface whose mapEventImages call (snapshot.go:440) the
+// full-table provenance test does not exercise. It guards both that decode call
+// (deleting it would leave id=2 base64) AND single-row baseline-vs-event
+// provenance (id=1 must pass through verbatim).
+func TestSnapshotBaseline_BlobTextProvenanceSingleRow(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+
+	snapTS := snapTime.UTC().Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "myapp", "docs", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "myapp", "docs", "body", 2, "", "text", "YES")
+
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "body", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
+	}
+	// id=1 never touched; its baseline body LOOKS like base64. id=2 updated.
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "docs", cols, [][]string{
+		{"1", "YWxpY2U="},
+		{"2", "bob-orig"},
+	})
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "docs", 2 /*update*/, "2", nil,
+		[]byte(fmt.Sprintf(`{"id":2,"body":%q}`, b64("bob-orig"))),
+		[]byte(fmt.Sprintf(`{"id":2,"body":%q}`, b64("bob-new"))))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:   true,
+		NoArchive:   true,
+		IndexDBName: dbName,
+		BaselineDir: baselineDir,
+	}, slog.Default())
+
+	bodyOf := func(pk string) string {
+		t.Helper()
+		res, err := h.runSnapshot(TimeTravelQuery{
+			Type: TypeSnapshot, Schema: "myapp", Table: "docs",
+			PKColumn: "id", PKValue: pk, AsOf: asOf,
+		})
+		if err != nil {
+			t.Fatalf("single-row _snapshot pk=%s: %v", pk, err)
+		}
+		cells := rowCells(t, res.Resultset)
+		if len(cells) != 1 {
+			t.Fatalf("pk=%s: expected 1 row, got %d (%v)", pk, len(cells), cells)
+		}
+		return cells[0][1] // columns are [id, body] in DDL order
+	}
+
+	// id=1 never touched → baseline value passes through verbatim (NOT decoded).
+	if got := bodyOf("1"); got != "YWxpY2U=" {
+		t.Errorf("single-row id=1 body = %q, want \"YWxpY2U=\" verbatim (baseline must NOT be base64-decoded)", got)
+	}
+	// id=2 updated → event value decoded.
+	if got := bodyOf("2"); got != "bob-new" {
+		t.Errorf("single-row id=2 body = %q, want \"bob-new\" (event-sourced TEXT decoded)", got)
 	}
 }
 

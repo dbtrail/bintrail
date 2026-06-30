@@ -3,6 +3,7 @@ package shim
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -979,15 +980,171 @@ func (h *Handler) mapEventImages(schema, table string, rows []query.ResultRow) {
 	if r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger); err == nil {
 		fallback = r
 	}
+	epochs := h.loadEpochs()
 	src := metadata.EnumMapperSource{
-		Epochs:      h.loadEpochs(),
+		Epochs:      epochs,
 		ResolverFor: h.epochResolver,
 		Fallback:    fallback,
+	}
+	// BLOB/TEXT columns are stored base64-encoded (marshalRow base64-encodes the
+	// []byte go-mysql delivers); decode them back to raw bytes / strings before
+	// emission so the wire resultset carries the real value, not its base64 text
+	// (#661, sibling of recover #662 / reconstruct #663).
+	//
+	// Resolve the decodable columns at EACH event's epoch, not from the latest
+	// snapshot, mirroring the ENUM/SET mapper beside it (#475). Whether a column
+	// is base64-stored depends on whether go-mysql delivered it as []byte
+	// (BLOB/TEXT) or string (VARCHAR/CHAR) when the event was captured — so a
+	// latest-snapshot lookup would wrongly decode an old plain-string value that
+	// happens to be valid base64 (e.g. "test") across a VARCHAR→TEXT widening,
+	// silently corrupting it.
+	//
+	// Unlike the ENUM mapper, base64 decode has NO latest-snapshot fallback:
+	// relabeling an ENUM by the latest definition is harmless (strings pass
+	// through), but base64-decoding by the wrong schema is destructive, and the
+	// degraded path is reachable in production — resolverCache is sticky on
+	// failure (serves a stale latest resolver) while loadEpochs returns nil
+	// uncached on a DB blip, so an empty epoch list can coincide with a non-nil
+	// latest fallback. When the event's epoch typing is unavailable we therefore
+	// leave the value as the base64 it was stored as (mirrors reconstruct #666).
+	// The lone exception is a no-DB test handler (indexDB nil), where the
+	// injected fallback is the sole schema source and decoding by it is intended.
+	// The per-epoch column map is memoized.
+	b64Memo := make(map[int]map[string]bool)
+	base64ColsAt := func(t time.Time) map[string]bool {
+		id, ok := metadata.EpochAt(epochs, t)
+		if !ok {
+			// Empty epoch list: in production decline (leave base64); only the
+			// no-DB test handler decodes via the injected fallback (bucket -1).
+			if h.indexDB != nil {
+				return nil
+			}
+			id = -1
+		}
+		// Memoize per epoch id BEFORE attempting the load, so a snapshot whose
+		// resolver consistently fails to load is probed at most once rather than
+		// once per row at that epoch (mirrors EnumMapperSource.MapperAt, which
+		// checks its memo before calling ResolverFor).
+		if m, seen := b64Memo[id]; seen {
+			return m
+		}
+		r := fallback // only reached for id == -1 (the no-DB test path)
+		if id != -1 {
+			// The event's epoch is known; type the column from THAT epoch's
+			// resolver. If it fails to load, leave the value as base64 rather
+			// than fall back to the latest snapshot — cross-epoch typing is the
+			// corruption risk this closure exists to avoid.
+			er, err := h.epochResolver(id)
+			if err != nil || er == nil {
+				b64Memo[id] = nil
+				return nil
+			}
+			r = er
+		}
+		m := base64Cols(r, schema, table)
+		b64Memo[id] = m
+		return m
 	}
 	for i := range rows {
 		m := src.MapperAt(schema, table, rows[i].EventTimestamp)
 		m.MapImage(rows[i].RowBefore)
 		m.MapImage(rows[i].RowAfter)
+		// Decode AFTER the ENUM/SET map: the two passes touch disjoint columns
+		// (ENUM/SET are never BLOB/TEXT), so order is immaterial, but keeping the
+		// base64 decode last mirrors reconstruct.decodeChangeBinaries running
+		// after MapEventEnumLabels. Event images only — never a baseline row, so
+		// _snapshot decodes its deltas pre-merge and never double-decodes the
+		// baseline value DuckDB scans straight to a Go string.
+		b64 := base64ColsAt(rows[i].EventTimestamp)
+		decodeImageBase64(rows[i].RowBefore, b64)
+		decodeImageBase64(rows[i].RowAfter, b64)
+	}
+}
+
+// base64StoredKind reports whether a column's DataType is in the BLOB or TEXT
+// family — the ones go-mysql delivers as []byte so marshalRow base64-encodes
+// them in storage — and if so whether it is binary (true → raw []byte) or text
+// (false → string). Local copy of the predicate added for recover (#662) and
+// reconstruct (#663); duplicated because those copies are unexported (#661 is
+// the third consumer — a future refactor may hoist one shared copy).
+//
+// GEOMETRY/VECTOR are also delivered as []byte but deliberately out of scope
+// here, matching the recover/reconstruct fixes.
+func base64StoredKind(dataType string) (binary, ok bool) {
+	switch strings.ToLower(dataType) {
+	case "blob", "tinyblob", "mediumblob", "longblob":
+		return true, true
+	case "text", "tinytext", "mediumtext", "longtext":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// decodeStoredBase64 reverses the storage-side base64 encoding of a BLOB/TEXT
+// value. binary selects the decoded Go type (true → []byte, false → string).
+// On the text resultset both render to the same wire bytes via
+// BuildSimpleTextResultset, but the distinction is load-bearing for _diff, which
+// JSON-marshals the image (marshalImageOrdered): a BLOB must stay []byte so it
+// re-base64-encodes cleanly rather than emit raw, possibly invalid-UTF-8 bytes
+// into the audit JSON. A value that is not a decodable base64 string is returned
+// unchanged (defensive — NULL, a raw-JSON object/array blob promoted by
+// marshalRow, or pre-existing non-base64 data).
+func decodeStoredBase64(v any, binary bool) any {
+	s, ok := v.(string)
+	if !ok {
+		return v
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return v
+	}
+	if binary {
+		return b
+	}
+	return string(b)
+}
+
+// base64Cols maps each BLOB/TEXT column of schema.table to whether it is binary,
+// using the SUPPLIED resolver — base64ColsAt passes the resolver in effect at
+// the event's epoch (NOT necessarily the latest snapshot), which is what keeps
+// an old VARCHAR value from being decoded across a VARCHAR→TEXT widening. Returns
+// nil when the resolver is nil, the table is unknown, or no column needs
+// decoding — in which case BLOB/TEXT values are left as the base64 they were
+// stored as (no usable schema means no safe typing; this preserves the pre-fix
+// behavior rather than guessing).
+func base64Cols(r *metadata.Resolver, schema, table string) map[string]bool {
+	if r == nil {
+		return nil
+	}
+	tm, err := r.Resolve(schema, table)
+	if err != nil {
+		return nil
+	}
+	var m map[string]bool
+	for _, c := range tm.Columns {
+		if binary, ok := base64StoredKind(c.DataType); ok {
+			if m == nil {
+				m = make(map[string]bool)
+			}
+			m[c.Name] = binary
+		}
+	}
+	return m
+}
+
+// decodeImageBase64 decodes the storage-side base64 of every BLOB/TEXT column in
+// one event image, in place. No-op when binCols is empty or image is nil. Iterates
+// binCols (typically a handful of columns) and only rewrites keys the image
+// carries, so a partial image is left otherwise untouched.
+func decodeImageBase64(image map[string]any, binCols map[string]bool) {
+	if len(binCols) == 0 || image == nil {
+		return
+	}
+	for col, binary := range binCols {
+		if v, ok := image[col]; ok {
+			image[col] = decodeStoredBase64(v, binary)
+		}
 	}
 }
 
