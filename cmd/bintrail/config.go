@@ -203,7 +203,7 @@ var envSections = []envSection{
 		},
 	},
 	{
-		Header: "Memory budgets (bound peak RAM at scale, #654)",
+		Header: "Memory guards at scale (recover refuses oversized scripts; reconstruct warns on large windows, #654)",
 		Bindings: []envTemplateEntry{
 			// recover: refuse a reversal script whose row payload exceeds this (0 = unlimited).
 			{"BINTRAIL_RECOVER_MAX_BYTES", "2GB"},

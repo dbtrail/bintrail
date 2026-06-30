@@ -1,6 +1,42 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestQueryResultNotice(t *testing.T) {
+	t.Run("ceiling supersedes the generic truncation notice", func(t *testing.T) {
+		// After a cap, n == limit (== ceiling), so the generic arm would also
+		// match; the ceiling message must win and must NOT say "increase the limit".
+		got := queryResultNotice(true, 5_000_000, 1_000_000, 1_000_000, 1_000_000)
+		if !strings.Contains(got, "exceeds the MCP query ceiling") {
+			t.Errorf("want ceiling message, got %q", got)
+		}
+		if !strings.Contains(got, "bintrail query") {
+			t.Errorf("want CLI escape-hatch hint, got %q", got)
+		}
+		if strings.Contains(got, "increase the limit") {
+			t.Errorf("ceiling notice must not tell the agent to increase the limit: %q", got)
+		}
+	})
+
+	t.Run("generic truncation notice when not capped and full", func(t *testing.T) {
+		got := queryResultNotice(false, 100, 1_000_000, 100, 100)
+		if !strings.Contains(got, "increase the limit") {
+			t.Errorf("want generic truncation notice, got %q", got)
+		}
+		if strings.Contains(got, "ceiling") {
+			t.Errorf("must not mention ceiling when no cap fired: %q", got)
+		}
+	})
+
+	t.Run("no notice below the limit", func(t *testing.T) {
+		if got := queryResultNotice(false, 100, 1_000_000, 42, 100); got != "" {
+			t.Errorf("want empty notice for a partial result, got %q", got)
+		}
+	})
+}
 
 func TestApplyQueryCeiling(t *testing.T) {
 	cases := []struct {

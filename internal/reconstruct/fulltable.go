@@ -104,6 +104,21 @@ func shouldWarnEvents(n, threshold int64) bool {
 	return threshold > 0 && n > threshold
 }
 
+// maybeWarnEventVolume emits the #654 large-window memory warning when the
+// fetched event count exceeds threshold (0 disables). Extracted from
+// ReconstructTable so the emission — not just the predicate — is unit-testable.
+func maybeWarnEventVolume(schema, table string, n int, threshold int64) {
+	if !shouldWarnEvents(int64(n), threshold) {
+		return
+	}
+	slog.Warn("reconstruct: very large event window — full-table reconstruct holds every event "+
+		"plus one change-map entry per touched row in memory and may exhaust RAM",
+		"schema", schema, "table", table,
+		"events", n, "threshold", threshold,
+		"hint", "narrow the window with a later --at or a fresher baseline snapshot, or raise/silence "+
+			"via --warn-event-threshold / BINTRAIL_RECONSTRUCT_WARN_EVENTS (0 disables)")
+}
+
 // ReconstructTables runs ReconstructTable concurrently for every entry in
 // cfg.Tables, sharing a single *sql.DB + *query.Engine + *metadata.Resolver.
 // Returns the list of reports in arbitrary order plus a joined error
@@ -389,21 +404,12 @@ func ReconstructTable(
 	}
 	rep.EventsApplied = int64(len(events))
 
-	// Large-window memory warning (#654). Full-table reconstruct holds the whole
-	// event slice plus one change-map entry per touched PK in RAM. len(events) is
-	// the real, archive-inclusive count (FetchMerged already merged live + Parquet),
-	// so no separate COUNT is needed — a live-only COUNT would undercount archived
-	// partitions. Advisory only: it fires before the change-map build below and
-	// tells the operator to narrow the next run; it cannot shrink the already-resident
+	// Large-window memory warning (#654). len(events) is the real, archive-inclusive
+	// count (FetchMerged already merged live + Parquet), so no separate COUNT is
+	// needed. Advisory only: it fires before the change-map build below and tells
+	// the operator to narrow the next run; it cannot shrink the already-resident
 	// slice (reconstruct warns, never refuses — the OOM at scale is unreproduced).
-	if shouldWarnEvents(int64(len(events)), cfg.WarnEventThreshold) {
-		slog.Warn("reconstruct: very large event window — full-table reconstruct holds every event "+
-			"plus one change-map entry per touched row in memory and may exhaust RAM",
-			"schema", schema, "table", table,
-			"events", len(events), "threshold", cfg.WarnEventThreshold,
-			"hint", "narrow the window with a later --at or a fresher baseline snapshot, or raise/silence "+
-				"via --warn-event-threshold / BINTRAIL_RECONSTRUCT_WARN_EVENTS (0 disables)")
-	}
+	maybeWarnEventVolume(schema, table, len(events), cfg.WarnEventThreshold)
 
 	// ENUM/SET ordinals → labels (#476), each delta decoded with the
 	// snapshot in effect at its event time (#475). Must run before the

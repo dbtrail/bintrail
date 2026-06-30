@@ -1,6 +1,61 @@
 package reconstruct
 
-import "testing"
+import (
+	"bytes"
+	"fmt"
+	"log/slog"
+	"strings"
+	"testing"
+)
+
+// TestMaybeWarnEventVolume exercises the warning EMISSION (not just the
+// predicate): a captured slog handler must see exactly one Warn record with the
+// right attributes above threshold, and nothing at/below threshold or disabled.
+func TestMaybeWarnEventVolume(t *testing.T) {
+	cases := []struct {
+		name      string
+		n         int
+		threshold int64
+		wantWarn  bool
+	}{
+		{"above threshold warns", 101, 100, true},
+		{"at threshold silent", 100, 100, false},
+		{"below threshold silent", 99, 100, false},
+		{"disabled (0) silent", 1 << 30, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			maybeWarnEventVolume("db", "orders", tc.n, tc.threshold)
+			out := buf.String()
+
+			if !tc.wantWarn {
+				if strings.Contains(out, "very large event window") {
+					t.Fatalf("expected no warn (n=%d threshold=%d), got %q", tc.n, tc.threshold, out)
+				}
+				return
+			}
+			if c := strings.Count(out, "very large event window"); c != 1 {
+				t.Fatalf("want exactly one warn record, got %d: %q", c, out)
+			}
+			for _, want := range []string{
+				`"schema":"db"`,
+				`"table":"orders"`,
+				fmt.Sprintf(`"events":%d`, tc.n),
+				fmt.Sprintf(`"threshold":%d`, tc.threshold),
+				"--warn-event-threshold",
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("warn record missing %s:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
 
 func TestShouldWarnEvents(t *testing.T) {
 	const thr = 5_000_000

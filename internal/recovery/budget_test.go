@@ -16,37 +16,45 @@ func TestEstimateScriptBytes(t *testing.T) {
 	cases := []struct {
 		name    string
 		rows    []query.ResultRow
-		wantMin int64 // estimate must be at least this (floor properties)
+		wantMin int64 // estimate must be at least this
 		wantMax int64 // and at most this (no wild over-count)
 	}{
 		{name: "empty", rows: nil, wantMin: 0, wantMax: 0},
 		{
-			name:    "small narrow row",
-			rows:    []query.ResultRow{{PKValues: "1", RowAfter: map[string]any{"id": float64(1), "name": "ann"}}},
+			name:    "small narrow insert",
+			rows:    []query.ResultRow{{EventType: event.EventInsert, PKValues: "1", RowAfter: map[string]any{"id": float64(1), "name": "ann"}}},
 			wantMin: 1,    // at least the PK + "name"+"ann" bytes
 			wantMax: 1024, // nowhere near a KB
 		},
 		{
-			name:    "one BLOB-heavy row dominates",
-			rows:    []query.ResultRow{{PKValues: "7", RowAfter: map[string]any{"id": float64(7), "blob": big}}},
-			wantMin: 1 << 20,             // at least the big value
-			wantMax: (1 << 20) + 1<<10,   // big value + small constant overhead
+			name:    "delete counts the before image (the rendered INSERT)",
+			rows:    []query.ResultRow{{EventType: event.EventDelete, PKValues: "7", RowBefore: map[string]any{"id": float64(7), "blob": big}}},
+			wantMin: 1 << 20,
+			wantMax: (1 << 20) + 1<<10,
 		},
 		{
-			name: "N rows roughly N times one",
+			name:    "insert counts the after image (conservative WHERE bound)",
+			rows:    []query.ResultRow{{EventType: event.EventInsert, PKValues: "7", RowAfter: map[string]any{"id": float64(7), "blob": big}}},
+			wantMin: 1 << 20,
+			wantMax: (1 << 20) + 1<<10,
+		},
+		{
+			// The bug fix (#654 review): a reverse UPDATE renders the BEFORE
+			// image only, so the fat after image must NOT inflate the estimate.
+			name:    "update ignores the after image",
+			rows:    []query.ResultRow{{EventType: event.EventUpdate, PKValues: "1", RowBefore: map[string]any{"k": "v"}, RowAfter: map[string]any{"blob": big}}},
+			wantMin: 1,
+			wantMax: 1024, // only the tiny before image + PK, NOT the 1 MiB after image
+		},
+		{
+			name: "N deletes roughly N times one",
 			rows: []query.ResultRow{
-				{PKValues: "1", RowAfter: map[string]any{"blob": big}},
-				{PKValues: "2", RowAfter: map[string]any{"blob": big}},
-				{PKValues: "3", RowAfter: map[string]any{"blob": big}},
+				{EventType: event.EventDelete, PKValues: "1", RowBefore: map[string]any{"blob": big}},
+				{EventType: event.EventDelete, PKValues: "2", RowBefore: map[string]any{"blob": big}},
+				{EventType: event.EventDelete, PKValues: "3", RowBefore: map[string]any{"blob": big}},
 			},
 			wantMin: 3 << 20,
 			wantMax: (3 << 20) + 1<<10,
-		},
-		{
-			name:    "before-image counted too",
-			rows:    []query.ResultRow{{PKValues: "1", RowBefore: map[string]any{"blob": big}, RowAfter: map[string]any{"blob": big}}},
-			wantMin: 2 << 20, // both images summed
-			wantMax: (2 << 20) + 1<<10,
 		},
 	}
 
@@ -62,7 +70,7 @@ func TestEstimateScriptBytes(t *testing.T) {
 
 // TestEstimateScriptBytes_monotonic confirms adding rows never lowers the estimate.
 func TestEstimateScriptBytes_monotonic(t *testing.T) {
-	row := query.ResultRow{PKValues: "1", RowAfter: map[string]any{"blob": strings.Repeat("y", 4096)}}
+	row := query.ResultRow{EventType: event.EventInsert, PKValues: "1", RowAfter: map[string]any{"blob": strings.Repeat("y", 4096)}}
 	var prev int64 = -1
 	for n := 0; n <= 5; n++ {
 		rows := make([]query.ResultRow, n)

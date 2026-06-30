@@ -412,16 +412,7 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 		if n > 0 && format != "json" {
 			text += fmt.Sprintf("\n%d row(s)\n", n)
 		}
-		switch {
-		case ceilingApplied:
-			// Supersede the generic truncation notice: telling the agent to
-			// "increase the limit" here would be wrong — its requested limit was
-			// the one we capped.
-			text += fmt.Sprintf("\nWarning: requested limit %d exceeds the MCP query ceiling of %d rows; capped to %d. "+
-				"Narrow your filters/time range, or run the `bintrail query` CLI for an unbounded export.\n", requestedLimit, ceiling, ceiling)
-		case n >= opts.Limit:
-			text += fmt.Sprintf("\nWarning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
-		}
+		text += queryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit)
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -765,6 +756,22 @@ func applyQueryCeiling(limit, max int) (int, bool) {
 		return max, true
 	}
 	return limit, false
+}
+
+// queryResultNotice composes the trailing warning appended to a query-tool
+// result. When the ceiling fired it SUPERSEDES the generic truncation notice —
+// telling an agent to "increase the limit" would be wrong, since the limit it
+// asked for is exactly the one that was capped (and after a cap n == limit makes
+// the generic arm true too, so order matters). Returns "" when no notice applies.
+func queryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit int) string {
+	switch {
+	case ceilingApplied:
+		return fmt.Sprintf("\nWarning: requested limit %d exceeds the MCP query ceiling of %d rows; capped to %d. "+
+			"Narrow your filters/time range, or run the `bintrail query` CLI for an unbounded export.\n", requestedLimit, ceiling, ceiling)
+	case n >= limit:
+		return fmt.Sprintf("\nWarning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", limit)
+	}
+	return ""
 }
 
 func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol string, columnEq []string, flagVal string, limit, defaultLimit int) (query.Options, error) {

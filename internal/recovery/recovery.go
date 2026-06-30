@@ -307,19 +307,39 @@ func (e *ScriptBudgetError) Error() string {
 		humanizeBytes(e.EstimatedBytes), humanizeBytes(e.Budget))
 }
 
-// EstimateScriptBytes returns a cheap lower-bound estimate of the row payload
-// GenerateSQLFromRows will render into the in-memory script buffer. It sums the
-// resident PK and before/after image bytes across all rows by walking the
-// already-decoded maps (allocation-free). The rendered SQL (hex/base64 escaping,
-// identifiers, comments) is larger, so this is a floor — adequate for catching
-// the GB-scale pathological windows the #654 guard targets, not byte-exact
+// EstimateScriptBytes approximates the row payload GenerateSQLFromRows will
+// render into the in-memory script buffer, per event type — matching what the
+// reversal actually emits, NOT the full resident row:
+//
+//   - DELETE → INSERT renders the before image (the row to restore) → RowBefore.
+//   - UPDATE → reverse UPDATE renders the before image in SET + the key → RowBefore
+//     (the after image is never rendered, so it is NOT counted).
+//   - INSERT → DELETE renders only a WHERE clause; with a known PK that is just
+//     the key, but without a resolver it falls back to the whole after image, so
+//     RowAfter is counted as the conservative upper bound.
+//
+// For DELETE/UPDATE this is a floor (the rendered SQL adds hex/base64 escaping,
+// identifiers and comments); for a PK-only INSERT→DELETE it is a conservative
+// over-estimate. It walks the already-decoded maps (allocation-free) and targets
+// the GB-scale pathological windows the #654 guard exists for, not byte-exact
 // accounting.
 func EstimateScriptBytes(rows []query.ResultRow) int64 {
 	var total int64
 	for i := range rows {
 		total += int64(len(rows[i].PKValues))
-		total += estimateRowBytes(rows[i].RowBefore)
-		total += estimateRowBytes(rows[i].RowAfter)
+		switch rows[i].EventType {
+		case event.EventDelete, event.EventUpdate:
+			// Reversal renders the before image (INSERT values / reverse-UPDATE SET).
+			total += estimateRowBytes(rows[i].RowBefore)
+		case event.EventInsert:
+			// Reversal renders a DELETE WHERE; RowBefore is nil here, so the
+			// after image is the only/largest possible rendered payload.
+			total += estimateRowBytes(rows[i].RowAfter)
+		default:
+			// EventSnapshot and any future type: GenerateSQLFromRows rejects them
+			// at render time, but be conservative and count both images.
+			total += estimateRowBytes(rows[i].RowBefore) + estimateRowBytes(rows[i].RowAfter)
+		}
 	}
 	return total
 }
