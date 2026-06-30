@@ -39,12 +39,13 @@ func TestEstimateScriptBytes(t *testing.T) {
 			wantMax: (1 << 20) + 1<<10,
 		},
 		{
-			// The bug fix (#654 review): a reverse UPDATE renders the BEFORE
-			// image only, so the fat after image must NOT inflate the estimate.
-			name:    "update ignores the after image",
+			// A reverse UPDATE renders SET(before) + WHERE(after) (buildUpdate
+			// keys the WHERE on row_after), so the fat after image MUST count —
+			// under-counting it would let an oversized UPDATE script slip the guard.
+			name:    "update counts both images (SET before + WHERE after)",
 			rows:    []query.ResultRow{{EventType: event.EventUpdate, PKValues: "1", RowBefore: map[string]any{"k": "v"}, RowAfter: map[string]any{"blob": big}}},
-			wantMin: 1,
-			wantMax: 1024, // only the tiny before image + PK, NOT the 1 MiB after image
+			wantMin: 1 << 20, // the 1 MiB after image is counted (WHERE clause)
+			wantMax: (1 << 20) + 1<<10,
 		},
 		{
 			name: "N deletes roughly N times one",

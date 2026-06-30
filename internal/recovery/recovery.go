@@ -307,39 +307,28 @@ func (e *ScriptBudgetError) Error() string {
 		humanizeBytes(e.EstimatedBytes), humanizeBytes(e.Budget))
 }
 
-// EstimateScriptBytes approximates the row payload GenerateSQLFromRows will
-// render into the in-memory script buffer, per event type — matching what the
-// reversal actually emits, NOT the full resident row:
-//
-//   - DELETE → INSERT renders the before image (the row to restore) → RowBefore.
-//   - UPDATE → reverse UPDATE renders the before image in SET + the key → RowBefore
-//     (the after image is never rendered, so it is NOT counted).
-//   - INSERT → DELETE renders only a WHERE clause; with a known PK that is just
-//     the key, but without a resolver it falls back to the whole after image, so
-//     RowAfter is counted as the conservative upper bound.
-//
-// For DELETE/UPDATE this is a floor (the rendered SQL adds hex/base64 escaping,
-// identifiers and comments); for a PK-only INSERT→DELETE it is a conservative
-// over-estimate. It walks the already-decoded maps (allocation-free) and targets
-// the GB-scale pathological windows the #654 guard exists for, not byte-exact
-// accounting.
+// EstimateScriptBytes returns a cheap estimate of the row payload
+// GenerateSQLFromRows will render into the in-memory script buffer (#654). It
+// sums the resident before- and after-image bytes plus the PK across every row,
+// walking the already-decoded maps (allocation-free). BOTH images are counted
+// because the reversal can reference either, and a reverse UPDATE references
+// both: DELETE→INSERT renders the before image; INSERT→DELETE renders the after
+// image in its WHERE clause; UPDATE renders the before image in SET AND the after
+// image in WHERE (see buildUpdate/buildDelete — the WHERE keys on row_after, the
+// nil-resolver fallback using every after column). Summing both never
+// under-counts the referenced payload, so the guard fails loud rather than
+// letting an oversized script through. The rendered SQL adds escaping (binary →
+// hex can roughly double a value) plus identifiers and comments, so this is a
+// payload proxy, not byte-exact — adequate for the GB-scale pathological windows
+// the guard targets. (A reverse DELETE of an INSERT whose PK is known renders
+// only the key, so this is then a conservative over-estimate — the safe, fail-
+// loud, recoverable direction.)
 func EstimateScriptBytes(rows []query.ResultRow) int64 {
 	var total int64
 	for i := range rows {
 		total += int64(len(rows[i].PKValues))
-		switch rows[i].EventType {
-		case event.EventDelete, event.EventUpdate:
-			// Reversal renders the before image (INSERT values / reverse-UPDATE SET).
-			total += estimateRowBytes(rows[i].RowBefore)
-		case event.EventInsert:
-			// Reversal renders a DELETE WHERE; RowBefore is nil here, so the
-			// after image is the only/largest possible rendered payload.
-			total += estimateRowBytes(rows[i].RowAfter)
-		default:
-			// EventSnapshot and any future type: GenerateSQLFromRows rejects them
-			// at render time, but be conservative and count both images.
-			total += estimateRowBytes(rows[i].RowBefore) + estimateRowBytes(rows[i].RowAfter)
-		}
+		total += estimateRowBytes(rows[i].RowBefore)
+		total += estimateRowBytes(rows[i].RowAfter)
 	}
 	return total
 }
