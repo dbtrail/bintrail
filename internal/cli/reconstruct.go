@@ -298,6 +298,10 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	// fallback here: if the epoch lookup fails, ordinals pass through
 	// raw — the pre-#476 CLI output.
 	reconstruct.MapEventEnumLabels(db, nil, recSchema, recTable, events)
+	// BLOB/TEXT columns are stored base64-encoded; decode them on the deltas
+	// before the ApplyAt/BuildHistory fold so the output carries the real value,
+	// not its base64 text (#666). Baseline rows are read raw and untouched.
+	reconstruct.DecodeEventBinaries(db, recSchema, recTable, events)
 
 	// Warn if there is a gap between the baseline binlog position and the
 	// first indexed event — events in that gap are missing from the reconstruction.

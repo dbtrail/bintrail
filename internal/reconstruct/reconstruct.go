@@ -8,6 +8,7 @@
 package reconstruct
 
 import (
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -112,6 +113,18 @@ func WriteHistoryJSON(entries []StateEntry, w io.Writer) error {
 	return enc.Encode(out)
 }
 
+// formatCell renders a state value as text for the table/CSV formatters. A
+// []byte — a decoded BLOB column (#666), or a baseline BLOB scanned by DuckDB —
+// is rendered as base64 to match the JSON output of the same command; fmt's
+// "%v" would otherwise print a raw decimal byte array (e.g. "[72 101 ...]").
+// Everything else uses the default "%v".
+func formatCell(v any) string {
+	if b, ok := v.([]byte); ok {
+		return base64.StdEncoding.EncodeToString(b)
+	}
+	return fmt.Sprintf("%v", v)
+}
+
 // WriteStateTable writes a single row state as aligned key-value pairs.
 func WriteStateTable(state map[string]any, w io.Writer) error {
 	if state == nil {
@@ -123,7 +136,7 @@ func WriteStateTable(state map[string]any, w io.Writer) error {
 	fmt.Fprintln(tw, "COLUMN\tVALUE")
 	fmt.Fprintln(tw, "──────\t─────")
 	for _, col := range sortedKeys(state) {
-		fmt.Fprintf(tw, "%s\t%v\n", col, state[col])
+		fmt.Fprintf(tw, "%s\t%s\n", col, formatCell(state[col]))
 	}
 	return nil
 }
@@ -148,7 +161,7 @@ func WriteHistoryTable(entries []StateEntry, w io.Writer) error {
 		if e.State != nil {
 			var parts []string
 			for _, col := range sortedKeys(e.State) {
-				parts = append(parts, fmt.Sprintf("%s=%v", col, e.State[col]))
+				parts = append(parts, fmt.Sprintf("%s=%s", col, formatCell(e.State[col])))
 			}
 			stateStr = strings.Join(parts, " ")
 		}
@@ -175,7 +188,7 @@ func WriteStateCSV(state map[string]any, w io.Writer) error {
 	}
 	vals := make([]string, len(keys))
 	for i, k := range keys {
-		vals[i] = fmt.Sprintf("%v", state[k])
+		vals[i] = formatCell(state[k])
 	}
 	if err := cw.Write(vals); err != nil {
 		return err
@@ -212,7 +225,7 @@ func WriteHistoryCSV(entries []StateEntry, w io.Writer) error {
 			if e.State == nil {
 				record = append(record, "")
 			} else {
-				record = append(record, fmt.Sprintf("%v", e.State[col]))
+				record = append(record, formatCell(e.State[col]))
 			}
 		}
 		if err := cw.Write(record); err != nil {

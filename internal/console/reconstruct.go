@@ -278,6 +278,10 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	// already labels and pass through. Must run before the fold below so
 	// both State and History carry labels.
 	reconstruct.MapEventEnumLabels(b.db, b.resolver, schema, table, rows)
+	// BLOB/TEXT columns are stored base64-encoded; decode them on the deltas
+	// before the fold so State/History carry the real value, not base64 text
+	// (#666). Baseline values are read raw from Parquet and pass through.
+	reconstruct.DecodeEventBinaries(b.db, schema, table, rows)
 
 	resp := reconstructResponse{
 		Schema: schema, Table: table, PK: pk,

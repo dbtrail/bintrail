@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -687,5 +688,101 @@ func TestRunReconstruct_archiveAwareE2E(t *testing.T) {
 	}
 	if !strings.Contains(history, `"live-state"`) {
 		t.Errorf("expected history to include the live event's state transition, got: %s", history)
+	}
+}
+
+// TestRunReconstruct_blobTextDecoded is the end-to-end proof for #666: a
+// single-row `bintrail reconstruct` whose answer is event-sourced must emit the
+// real BLOB/TEXT value, not the base64 it is stored as. Before the fix the
+// single-row path folded events via ApplyAt without decoding, so the output
+// carried the base64 text. schema_snapshots types `body` as TEXT so
+// DecodeEventBinaries flags it.
+func TestRunReconstruct_blobTextDecoded(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
+
+	// Type the table so the resolver flags `body` as TEXT (base64-stored).
+	snapTS := h1.Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "testdb", "docs", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "testdb", "docs", "body", 2, "", "text", "YES")
+
+	// Baseline: id=7, body="baseline-bio".
+	baselineDir := t.TempDir()
+	snapshotTSDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
+	parquetDir := filepath.Join(baselineDir, snapshotTSDir, "testdb")
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	baselinePath := filepath.Join(parquetDir, "docs.parquet")
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "body", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
+	}
+	w, err := baseline.NewWriter(baselinePath, cols, baseline.WriterConfig{Compression: "zstd", RowGroupSize: 100})
+	if err != nil {
+		t.Fatalf("baseline.NewWriter: %v", err)
+	}
+	if err := w.WriteRow([]string{"7", "baseline-bio"}, []bool{false, false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("writer close: %v", err)
+	}
+
+	// UPDATE event: body set to a new value, stored base64 (as marshalRow encodes
+	// the []byte go-mysql delivers for a TEXT column).
+	b64 := base64.StdEncoding.EncodeToString([]byte("updated bio ☃"))
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil,
+		"testdb", "docs", 2 /* UPDATE */, "7", nil,
+		[]byte(`{"id":7,"body":"`+base64.StdEncoding.EncodeToString([]byte("baseline-bio"))+`"}`),
+		[]byte(`{"id":7,"body":"`+b64+`"}`))
+
+	orig := captureRecFlags()
+	t.Cleanup(func() { applyRecFlags(orig) })
+	recIndexDSN = testutil.SnapshotDSN(dbName)
+	recSchema = "testdb"
+	recTable = "docs"
+	recPK = "7"
+	recPKColumns = "id"
+	recBaselineDir = baselineDir
+	recBaselineS3 = ""
+	recBaselineOnly = false
+	recHistory = false
+	recSQL = ""
+	recFormat = "json"
+	recNoArchive = true
+	recAllowGaps = true
+	recAt = h1.Add(45 * time.Minute).Format(time.RFC3339)
+
+	reconstructCmd.SetContext(context.Background())
+	t.Cleanup(func() { reconstructCmd.SetContext(nil) })
+
+	oldStdout := os.Stdout
+	t.Cleanup(func() { os.Stdout = oldStdout })
+	r, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = wPipe
+	runErr := runReconstruct(reconstructCmd, nil)
+	wPipe.Close()
+	os.Stdout = oldStdout
+	outBytes, _ := io.ReadAll(r)
+	out := string(outBytes)
+	if runErr != nil {
+		t.Fatalf("runReconstruct failed: %v\noutput: %s", runErr, out)
+	}
+	if !strings.Contains(out, "updated bio ☃") {
+		t.Errorf("expected decoded TEXT \"updated bio ☃\" in output, got: %s", out)
+	}
+	if strings.Contains(out, b64) {
+		t.Errorf("output still contains the base64 text %q (decode did not run): %s", b64, out)
 	}
 }

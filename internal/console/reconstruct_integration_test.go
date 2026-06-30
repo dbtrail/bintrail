@@ -3,6 +3,7 @@
 package console
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -297,5 +298,74 @@ func TestIntegrationReconstructEnumLabels(t *testing.T) {
 	if fmt.Sprint(r.History[0].State["status"]) != "pending" || fmt.Sprint(r.History[1].State["status"]) != "shipped" {
 		t.Errorf("history statuses = [%v, %v], want [pending, shipped]",
 			r.History[0].State["status"], r.History[1].State["status"])
+	}
+}
+
+// TestIntegrationReconstructBlobText pins #666 on the console Time-travel
+// surface — the literal sibling of the ENUM test above, and the surface the
+// issue names. A TEXT column is stored base64; the console reconstruct must
+// return it decoded in both State and History, not as base64. Guards against a
+// one-line deletion of the DecodeEventBinaries wiring silently reintroducing the
+// bug. TEXT (not BLOB): a decoded BLOB []byte re-base64-encodes in the JSON
+// response and would assert vacuously.
+func TestIntegrationReconstructBlobText(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	testutil.InsertSnapshot(t, db, 1, "2026-06-01 00:00:00", "app", "docs", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, "2026-06-01 00:00:00", "app", "docs", "body", 2, "", "text", "YES")
+
+	// Post-baseline UPDATE: body stored base64, as marshalRow encodes the []byte
+	// go-mysql delivers for a TEXT column.
+	b64 := base64.StdEncoding.EncodeToString([]byte("updated bio ☃"))
+	testutil.InsertEvent(t, db, "bin.000001", 4, 40, "2026-06-01 12:00:00", nil, "app", "docs", 2, "1",
+		[]byte(`["body"]`),
+		[]byte(`{"id":1,"body":"`+base64.StdEncoding.EncodeToString([]byte("baseline-bio"))+`"}`),
+		[]byte(`{"id":1,"body":"`+b64+`"}`))
+
+	baseDir := t.TempDir()
+	tsDir := strings.ReplaceAll(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339), ":", "-")
+	dir := filepath.Join(baseDir, tsDir, "app")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "body", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
+	}
+	w, err := baseline.NewWriter(filepath.Join(dir, "docs.parquet"), cols,
+		baseline.WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteRow([]string{"1", "baseline-bio"}, []bool{false, false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, BaselineDir: baseDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// After the delta: the TEXT value must come back decoded, not base64.
+	r := reconstructAt(t, srv, "schema=app&table=docs&pk=1&at=2026-06-01%2012:30:00&allow_gaps=true")
+	if !r.Found || fmt.Sprint(r.State["body"]) != "updated bio ☃" {
+		t.Errorf("at 12:30: found=%v body=%v, want decoded 'updated bio ☃'", r.Found, r.State["body"])
+	}
+	if fmt.Sprint(r.State["body"]) == b64 {
+		t.Errorf("body came back as base64 %q (decode did not run)", b64)
+	}
+
+	// History: the delta entry carries the decoded value too (the toStateEntryDTOs
+	// path the CLI E2E does not exercise).
+	r = reconstructAt(t, srv, "schema=app&table=docs&pk=1&at=2026-06-01%2012:30:00&history=true&allow_gaps=true")
+	if len(r.History) != 2 {
+		t.Fatalf("history len=%d, want 2: %+v", len(r.History), r.History)
+	}
+	if fmt.Sprint(r.History[1].State["body"]) != "updated bio ☃" {
+		t.Errorf("history[1] body = %v, want decoded 'updated bio ☃'", r.History[1].State["body"])
 	}
 }
