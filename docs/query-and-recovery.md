@@ -143,7 +143,7 @@ That strictness deliberately includes stale registrations: an `archive_state` ro
 
 The merge path loads **all matching rows** from all sources into memory before applying the limit, so the result set is bounded by **row count** (`--limit`), not payload size. Filters (schema, table, time range) keep it manageable in practice — apply at least a `--since`/`--until` range for broad queries against large archives.
 
-Three offline commands hold their working set on the Go heap, so a BLOB/TEXT-heavy or very wide window can pressure memory at scale. Each has a break-nothing safeguard ([#654](https://github.com/dbtrail/dbtrail/issues/654)):
+Three offline commands hold their working set in memory, so a BLOB/TEXT-heavy or very wide window can pressure RAM at scale. Each has a break-nothing safeguard ([#654](https://github.com/dbtrail/dbtrail/issues/654)):
 
 - **`query --limit 0`** removes the row cap entirely — an unbounded scan into memory. It still works (some pipelines rely on it), but the command now prints a stderr warning; prefer a real `--limit N` or a tight `--since`/`--until` for large tables.
 - **`recover`** buffers the whole reversal script in memory before writing (it must, to refuse cleanly on schema drift), roughly doubling peak on top of the already-loaded events. `--max-script-bytes` (default `2GB`; env `BINTRAIL_RECOVER_MAX_BYTES`; `0` = unlimited) makes it **refuse** rather than render a multi-gigabyte script — see [Recovery](#recovery). The bound is on the rendered script, not the initial fetch, which stays `--limit`-bounded.
