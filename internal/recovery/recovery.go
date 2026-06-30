@@ -53,21 +53,45 @@ type Generator struct {
 	resolver *metadata.Resolver            // default resolver (latest snapshot); may be nil
 	cache    map[uint32]*metadata.Resolver // per-snapshot resolvers, loaded lazily
 	dialect  Dialect
+	// maxScriptBytes bounds the estimated row payload GenerateSQLFromRows will
+	// render before it refuses (#654). 0 = unlimited. Defaults to
+	// DefaultMaxScriptBytes in the constructors so every caller — CLI, the MCP
+	// recover tool, the console, recover-cascade — is guarded with zero config;
+	// the recover CLI overrides it via SetMaxScriptBytes (--max-script-bytes).
+	maxScriptBytes int64
 }
 
 // New creates a Generator emitting MySQL-dialect SQL. resolver may be nil — in that
 // case, WHERE clauses for UPDATE and DELETE reversals will use ALL row columns
 // instead of just PKs.
 func New(db *sql.DB, resolver *metadata.Resolver) *Generator {
-	return &Generator{db: db, resolver: resolver, dialect: MySQLDialect}
+	return &Generator{db: db, resolver: resolver, dialect: MySQLDialect, maxScriptBytes: DefaultMaxScriptBytes}
 }
 
 // NewForDialect is New with an explicit SQL dialect. Callers that know the source
 // flavor (e.g. `bintrail-pg recover` via DialectForIndex) pass PostgresDialect;
 // everything else uses New (MySQL).
 func NewForDialect(db *sql.DB, resolver *metadata.Resolver, dialect Dialect) *Generator {
-	return &Generator{db: db, resolver: resolver, dialect: dialect}
+	return &Generator{db: db, resolver: resolver, dialect: dialect, maxScriptBytes: DefaultMaxScriptBytes}
 }
+
+// DefaultMaxScriptBytes is the default ceiling on the estimated row payload of a
+// reversal script. Above it, GenerateSQLFromRows refuses rather than buffering
+// the whole script into RAM (#654): rendering builds a second full copy on top
+// of the already-resident events, so a multi-gigabyte script roughly doubles
+// peak memory. 2 GiB is deliberately generous — an ordinary recover renders
+// kilobytes to megabytes, and a 2 GiB SQL script is already past being
+// reviewable or appliable; only BLOB/TEXT-heavy windows approach it. The recover
+// CLI exposes --max-script-bytes / BINTRAIL_RECOVER_MAX_BYTES to raise it or set
+// 0 to disable. The bound is on the *rendered script*, not end-to-end memory:
+// the events are fetched (row-count-bounded by --limit) before this runs, so it
+// caps the render doubling, not the initial fetch.
+const DefaultMaxScriptBytes int64 = 2 << 30
+
+// SetMaxScriptBytes overrides the reversal-script payload budget enforced by
+// GenerateSQLFromRows. n <= 0 disables the guard (unlimited). The recover CLI
+// sets it from --max-script-bytes; other callers keep DefaultMaxScriptBytes.
+func (g *Generator) SetMaxScriptBytes(n int64) { g.maxScriptBytes = n }
 
 // DialectForFlavor maps a stream_state.flavor value to the recovery SQL dialect.
 // PostgreSQL gets its own dialect; MySQL, MariaDB, and an empty/unknown flavor all
@@ -152,6 +176,19 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 	if len(rows) == 0 {
 		fmt.Fprintln(w, "-- No events matched the specified criteria.")
 		return 0, nil
+	}
+
+	// Bound peak memory before rendering (#654). The whole script is buffered
+	// into RAM (body, below) on top of the already-resident events, so a
+	// pathological BLOB/TEXT window roughly doubles peak. Refuse up front rather
+	// than emit a truncated script: a partial reversal applied to production is a
+	// silently-wrong recovery — the same fail-loud stance as the schema-drift
+	// refusal below. The bound is on the rendered payload, not the initial fetch
+	// (the events are already loaded, row-count-bounded by --limit).
+	if g.maxScriptBytes > 0 {
+		if est := EstimateScriptBytes(rows); est > g.maxScriptBytes {
+			return 0, &ScriptBudgetError{EstimatedBytes: est, Budget: g.maxScriptBytes}
+		}
 	}
 
 	// Reverse so the most-recent event is undone first.
@@ -248,6 +285,99 @@ func schemaDriftError(drift map[string]map[string]bool, order []string) error {
 		"snapshot no longer has (dropped or renamed after the event was captured), so the SQL would not apply to "+
 		"the current table: %s. Re-snapshot if the table actually still has these columns; otherwise reconcile the "+
 		"column(s) by hand", strings.Join(parts, "; "))
+}
+
+// ─── Script-size budget (#654) ─────────────────────────────────────────────────
+
+// ScriptBudgetError is returned by GenerateSQLFromRows when the estimated row
+// payload of the matched events exceeds the configured script-size budget
+// (#654). It is a fail-loud refusal, not a truncation: a partial reversal script
+// applied to a production database is a silently-wrong recovery, so recover
+// refuses to emit anything. The recover CLI wraps it with command-specific
+// guidance; the typed fields let other callers report it however they like.
+type ScriptBudgetError struct {
+	EstimatedBytes int64 // estimated row payload to render
+	Budget         int64 // the configured ceiling that was exceeded
+}
+
+func (e *ScriptBudgetError) Error() string {
+	return fmt.Sprintf("recover: refusing to generate the reversal script — the matched events hold ~%s "+
+		"of row data, over the script-size budget of %s. Rendering the SQL would roughly double peak memory "+
+		"(the events are already loaded). Narrow the recovery window, or raise/disable the budget (0 = unlimited)",
+		humanizeBytes(e.EstimatedBytes), humanizeBytes(e.Budget))
+}
+
+// EstimateScriptBytes returns a cheap lower-bound estimate of the row payload
+// GenerateSQLFromRows will render into the in-memory script buffer. It sums the
+// resident PK and before/after image bytes across all rows by walking the
+// already-decoded maps (allocation-free). The rendered SQL (hex/base64 escaping,
+// identifiers, comments) is larger, so this is a floor — adequate for catching
+// the GB-scale pathological windows the #654 guard targets, not byte-exact
+// accounting.
+func EstimateScriptBytes(rows []query.ResultRow) int64 {
+	var total int64
+	for i := range rows {
+		total += int64(len(rows[i].PKValues))
+		total += estimateRowBytes(rows[i].RowBefore)
+		total += estimateRowBytes(rows[i].RowAfter)
+	}
+	return total
+}
+
+func estimateRowBytes(m map[string]any) int64 {
+	var t int64
+	for k, v := range m {
+		t += int64(len(k)) + estimateValueBytes(v)
+	}
+	return t
+}
+
+// estimateValueBytes approximates the in-memory footprint of a JSON-decoded
+// value. Strings ([]byte base64 / TEXT / hex) and json.Number dominate the
+// payload of fat rows, so their exact length is counted; scalars get a small
+// constant. After json.Unmarshal into map[string]any, numbers are float64 (see
+// the codebase's JSON round-trip note), with json.Number covered for UseNumber
+// callers.
+func estimateValueBytes(v any) int64 {
+	switch x := v.(type) {
+	case nil:
+		return 0
+	case string:
+		return int64(len(x))
+	case []byte:
+		return int64(len(x))
+	case json.Number:
+		return int64(len(x))
+	case bool:
+		return 1
+	case float64:
+		return 8
+	case map[string]any:
+		return estimateRowBytes(x)
+	case []any:
+		var t int64
+		for _, e := range x {
+			t += estimateValueBytes(e)
+		}
+		return t
+	default:
+		return 16
+	}
+}
+
+// humanizeBytes formats a byte count with a binary KB/MB/GB suffix, matching the
+// units cliutil.ParseByteSize accepts on the --max-script-bytes flag.
+func humanizeBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2fGB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.2fMB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.2fKB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }
 
 // ─── Statement generators ─────────────────────────────────────────────────────

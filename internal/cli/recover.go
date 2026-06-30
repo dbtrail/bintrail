@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -51,24 +52,25 @@ Examples:
 }
 
 var (
-	rIndexDSN   string
-	rSchema     string
-	rTable      string
-	rPK         string
-	rPKs        []string
-	rLimitPerPK int
-	rEventType  string
-	rGTID       string
-	rSince      string
-	rUntil      string
-	rFlag       string
-	rOutput     string
-	rDryRun     bool
-	rLimit      int
-	rProfile    string
-	rFormat     string
-	rNoArchive  bool
-	rColumnEq   []string
+	rIndexDSN       string
+	rSchema         string
+	rTable          string
+	rPK             string
+	rPKs            []string
+	rLimitPerPK     int
+	rEventType      string
+	rGTID           string
+	rSince          string
+	rUntil          string
+	rFlag           string
+	rOutput         string
+	rDryRun         bool
+	rLimit          int
+	rProfile        string
+	rFormat         string
+	rNoArchive      bool
+	rColumnEq       []string
+	rMaxScriptBytes string
 )
 
 func init() {
@@ -90,6 +92,7 @@ func init() {
 	recoverCmd.Flags().StringVar(&rProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	recoverCmd.Flags().StringVar(&rFormat, "format", "text", "Output format: text or json")
 	recoverCmd.Flags().BoolVar(&rNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
+	recoverCmd.Flags().StringVar(&rMaxScriptBytes, "max-script-bytes", "2GB", "Refuse to generate a reversal script whose estimated row payload exceeds this size (e.g. 512MB, 4GB; 0 = unlimited). Guards against OOM on BLOB/TEXT-heavy recoveries (#654).")
 	AddDuckDBTuningFlags(recoverCmd)
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(recoverCmd)
@@ -145,6 +148,10 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	until, err := cliutil.ParseTime(rUntil)
 	if err != nil {
 		return fmt.Errorf("--until: %w", err)
+	}
+	maxScriptBytes, err := cliutil.ParseByteSize(rMaxScriptBytes)
+	if err != nil {
+		return fmt.Errorf("invalid --max-script-bytes: %w", err)
 	}
 
 	opts := query.Options{
@@ -257,6 +264,10 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	// and standard-conforming-string escaping; MySQL/MariaDB keep the default. The
 	// read is best-effort and defaults to MySQL (see recovery.DialectForIndex).
 	gen := recovery.NewForDialect(db, resolver, recovery.DialectForIndex(db))
+	// Bound the in-memory reversal script (#654): refuse before rendering when
+	// the matched events would render past the budget, rather than buffering a
+	// multi-GB script. 0 (from --max-script-bytes 0) disables the guard.
+	gen.SetMaxScriptBytes(maxScriptBytes)
 
 	if rDryRun {
 		if rFormat == "json" {
@@ -264,7 +275,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 			var buf bytes.Buffer
 			n, err := gen.GenerateSQLFromRows(rows, &buf)
 			if err != nil {
-				return err
+				return wrapScriptBudget(err)
 			}
 			slog.Info("recovery SQL generated",
 				"statements", n, "dry_run", true,
@@ -278,7 +289,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 
 		n, err := gen.GenerateSQLFromRows(rows, os.Stdout)
 		if err != nil {
-			return err
+			return wrapScriptBudget(err)
 		}
 		slog.Info("recovery SQL generated",
 			"statements", n, "dry_run", true,
@@ -302,7 +313,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	bw := bufio.NewWriter(f)
 	n, err := gen.GenerateSQLFromRows(rows, bw)
 	if err != nil {
-		return err
+		return wrapScriptBudget(err)
 	}
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("failed to flush output file: %w", err)
@@ -329,4 +340,18 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", rLimit)
 	}
 	return nil
+}
+
+// wrapScriptBudget adds recover-CLI-specific guidance to a recovery
+// ScriptBudgetError (#654); any other error passes through unchanged. The typed
+// error already states the sizes; this names the knobs the operator can turn.
+func wrapScriptBudget(err error) error {
+	var be *recovery.ScriptBudgetError
+	if errors.As(err, &be) {
+		return fmt.Errorf("%w. Narrow the recovery with --since/--until, a specific --pk/--pks, or a smaller "+
+			"--limit (default 1000 events); or raise the budget with --max-script-bytes (e.g. 4GB) or "+
+			"BINTRAIL_RECOVER_MAX_BYTES (0 = unlimited). Note: --limit bounds the event count; this budget "+
+			"guards the rendered script size, not the initial fetch", err)
+	}
+	return err
 }

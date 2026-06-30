@@ -64,6 +64,8 @@ var EnvBindings = []EnvBinding{
 	{"ultrafast", "BINTRAIL_ULTRAFAST"},
 	{"duckdb-threads", "BINTRAIL_DUCKDB_THREADS"},
 	{"duckdb-memory-limit", "BINTRAIL_DUCKDB_MEMORY_LIMIT"},
+	{"max-script-bytes", "BINTRAIL_RECOVER_MAX_BYTES"},
+	{"warn-event-threshold", "BINTRAIL_RECONSTRUCT_WARN_EVENTS"},
 }
 
 var envOnce sync.Once

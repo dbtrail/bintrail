@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -337,6 +338,19 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 			return errorResult(err), nil, nil
 		}
 
+		// Hard ceiling on an explicit, oversized limit (#654). buildQueryOptions
+		// already coerces limit<=0 to the default, so this only bounds a large
+		// EXPLICIT value an agent might pass. It is applied here, per-tool, on the
+		// local opts — NOT in the shared buildQueryOptions, because the recover
+		// tool must refuse on size, not silently cap a read.
+		ceiling := mcpQueryMaxLimit()
+		requestedLimit := opts.Limit
+		ceilingApplied := false
+		if c, did := applyQueryCeiling(opts.Limit, ceiling); did {
+			opts.Limit = c
+			ceilingApplied = true
+		}
+
 		if args.Profile != "" {
 			denyTables, redactCols, err := query.LoadProfileRules(ctx, db, args.Profile)
 			if err != nil {
@@ -398,7 +412,14 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 		if n > 0 && format != "json" {
 			text += fmt.Sprintf("\n%d row(s)\n", n)
 		}
-		if n >= opts.Limit {
+		switch {
+		case ceilingApplied:
+			// Supersede the generic truncation notice: telling the agent to
+			// "increase the limit" here would be wrong — its requested limit was
+			// the one we capped.
+			text += fmt.Sprintf("\nWarning: requested limit %d exceeds the MCP query ceiling of %d rows; capped to %d. "+
+				"Narrow your filters/time range, or run the `bintrail query` CLI for an unbounded export.\n", requestedLimit, ceiling, ceiling)
+		case n >= opts.Limit:
 			text += fmt.Sprintf("\nWarning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
 		}
 
@@ -715,6 +736,35 @@ func resolveArchiveSources(ctx context.Context, db *sql.DB) []string {
 		return nil
 	}
 	return sources
+}
+
+// defaultMCPQueryMaxLimit is the hard row ceiling for the MCP query tool (#654):
+// a backstop against a pathological explicit limit OOMing the long-lived server.
+// ~1M rows is multiple GB worst-case at the project's per-row sizing — far above
+// any legitimate agent query, yet bounded. The unbounded escape hatch is the
+// `bintrail query` CLI, so this is deliberately not disengageable via env.
+const defaultMCPQueryMaxLimit = 1_000_000
+
+// mcpQueryMaxLimit returns the MCP query-tool row ceiling. BINTRAIL_MCP_QUERY_MAX_LIMIT
+// raises or lowers it; an empty/invalid/<=0 value falls back to the default
+// rather than disabling the ceiling (the CLI is the unbounded path, not the
+// agent-facing tool).
+func mcpQueryMaxLimit() int {
+	if v := os.Getenv("BINTRAIL_MCP_QUERY_MAX_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMCPQueryMaxLimit
+}
+
+// applyQueryCeiling caps limit to max, returning the (possibly capped) limit and
+// whether a cap was applied. max <= 0 disables capping.
+func applyQueryCeiling(limit, max int) (int, bool) {
+	if max > 0 && limit > max {
+		return max, true
+	}
+	return limit, false
 }
 
 func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol string, columnEq []string, flagVal string, limit, defaultLimit int) (query.Options, error) {

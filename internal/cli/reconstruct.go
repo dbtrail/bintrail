@@ -95,6 +95,7 @@ var (
 	recTables       string
 	recChunkSize    string
 	recParallelism  int
+	recWarnEvents   int64
 )
 
 func init() {
@@ -118,6 +119,7 @@ func init() {
 	reconstructCmd.Flags().StringVar(&recTables, "tables", "", "Comma-separated schema.table list for --output-format=mydumper (e.g. mydb.orders,mydb.users)")
 	reconstructCmd.Flags().StringVar(&recChunkSize, "chunk-size", "256MB", "Max size per SQL chunk file in full-table mode (e.g. 64MB, 1GB)")
 	reconstructCmd.Flags().IntVar(&recParallelism, "parallelism", 0, "Max tables to reconstruct concurrently in full-table mode (default: runtime.NumCPU())")
+	reconstructCmd.Flags().Int64Var(&recWarnEvents, "warn-event-threshold", 5_000_000, "Full-table mode: log a memory warning when a table's reconstruct window exceeds this many events (full-table reconstruct holds them all in RAM, #654; 0 disables)")
 	AddDuckDBTuningFlags(reconstructCmd)
 	BindCommandEnv(reconstructCmd)
 
@@ -452,6 +454,9 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 	if err != nil {
 		return fmt.Errorf("--chunk-size: %w", err)
 	}
+	if recWarnEvents < 0 {
+		return fmt.Errorf("--warn-event-threshold must be >= 0 (0 disables)")
+	}
 
 	// ── Parse --tables (comma-separated schema.table list) ────────────────
 	tables := splitAndTrim(recTables, ",")
@@ -477,15 +482,16 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 
 	// ── Run ────────────────────────────────────────────────────────────────
 	cfg := reconstruct.FullTableConfig{
-		IndexDSN:       recIndexDSN,
-		BaselineSrc:    baselineSrc,
-		Tables:         tables,
-		At:             at,
-		OutputDir:      recOutputDir,
-		ChunkSize:      chunkSize,
-		Parallelism:    recParallelism,
-		AllowGaps:      recAllowGaps,
-		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
+		IndexDSN:           recIndexDSN,
+		BaselineSrc:        baselineSrc,
+		Tables:             tables,
+		At:                 at,
+		OutputDir:          recOutputDir,
+		ChunkSize:          chunkSize,
+		Parallelism:        recParallelism,
+		AllowGaps:          recAllowGaps,
+		WarnEventThreshold: recWarnEvents,
+		ArchiveFetcher:     TunedArchiveFetcher(duckTuning),
 	}
 	reports, err := reconstruct.ReconstructTables(cmd.Context(), cfg)
 	if err != nil {

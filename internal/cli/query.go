@@ -104,6 +104,19 @@ func init() {
 
 }
 
+// limitWarning returns a stderr warning when the query --limit is unbounded
+// (0 or negative → no LIMIT clause, a full scan buffered into memory, #654), or
+// "" when the limit is bounded. The query path deliberately keeps limit=0
+// working (it is a live internal contract used by reconstruct/verify/shim); this
+// only alerts the operator, it never changes the limit.
+func limitWarning(limit int) string {
+	if limit > 0 {
+		return ""
+	}
+	return "Warning: --limit 0 returns ALL matching rows with no bound; a very large result set may " +
+		"exhaust memory. Pass --limit N to bound the result, or narrow --since/--until."
+}
+
 func runQuery(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 	// ── Validate flag combinations ────────────────────────────────────────────
@@ -126,6 +139,9 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	if qLimitPerPK > 0 && qPK == "" && len(qPKs) == 0 {
 		return fmt.Errorf("--limit-per-pk requires --pk or --pks")
+	}
+	if w := limitWarning(qLimit); w != "" {
+		fmt.Fprintln(os.Stderr, w)
 	}
 	if qChangedCol != "" && (qSchema == "" || qTable == "") {
 		return fmt.Errorf("--changed-column requires both --schema and --table")

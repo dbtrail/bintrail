@@ -202,6 +202,15 @@ var envSections = []envSection{
 			{"BINTRAIL_DUCKDB_MEMORY_LIMIT", ""},
 		},
 	},
+	{
+		Header: "Memory budgets (bound peak RAM at scale, #654)",
+		Bindings: []envTemplateEntry{
+			// recover: refuse a reversal script whose row payload exceeds this (0 = unlimited).
+			{"BINTRAIL_RECOVER_MAX_BYTES", "2GB"},
+			// reconstruct: warn when a full-table window exceeds this many events (0 disables).
+			{"BINTRAIL_RECONSTRUCT_WARN_EVENTS", "5000000"},
+		},
+	},
 	// The BINTRAIL_CONSOLE_* vars moved with the web console to the standalone
 	// bintrail-console binary (serve/watch), which reads the same env file —
 	// they are no longer advertised in the core CLI's template.
