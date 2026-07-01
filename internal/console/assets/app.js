@@ -627,15 +627,15 @@ function buildOverview(status, eventsData) {
     else if (e.event_type === "DELETE") s.delete++;
   }
   const tables = Array.from(byTable.values()).sort((a, b) => b.total - a.total);
-  const latest = cov.latest_event || (events[0] && events[0].event_timestamp) || "—";
-  const earliest = cov.earliest_event || (events.length ? events[events.length - 1].event_timestamp : "—");
+  const latest = (events[0] && events[0].event_timestamp) || "—";
+  const earliest = events.length ? events[events.length - 1].event_timestamp : "—";
 
   const v = VIEW(); clear(v);
 
   const sub = el("p", { class: "page-sub" },
     "What changed recently, and where — your starting point. ",
     el("b", { text: deletes + " delete(s)" }),
-    " in the latest window: the ones worth a look first.");
+    " in the last " + events.length + " event(s): the ones worth a look first.");
   v.append(pageHead("Overview", sub));
 
   // stats
@@ -676,7 +676,7 @@ function buildOverview(status, eventsData) {
   tables.slice(0, 12).forEach((s) => tbox.append(ovTableRow(s)));
   tablesPanel.append(tbox);
   tablesPanel.append(el("div", { class: "ov-coverage" },
-    el("span", { text: "coverage" }), " ",
+    el("span", { text: "window" }), " ",
     el("b", { text: earliest }), " → ", el("b", { text: latest })));
   grid.append(tablesPanel);
 
