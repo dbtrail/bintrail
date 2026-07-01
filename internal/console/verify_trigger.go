@@ -157,7 +157,7 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.rbacActive() {
 		writeJSONError(w, http.StatusForbidden,
-			"verification isn't available while an access-control profile is active — it reads full data without redacting anything")
+			"verification isn't available while an access-control profile is active — baseline and live-source reads aren't redacted")
 		return
 	}
 	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
@@ -244,7 +244,7 @@ func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.rbacActive() {
 		writeJSONError(w, http.StatusForbidden,
-			"verification isn't available while an access-control profile is active — it reads full data without redacting anything")
+			"verification isn't available while an access-control profile is active — baseline reads aren't redacted")
 		return
 	}
 	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))

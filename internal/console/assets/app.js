@@ -2546,7 +2546,7 @@ async function saveServer(form) {
     if (res && res.started && !doctorWarnings(res.doctor)) { hideServerForm(); toast("Monitoring started — events will appear within a minute"); }
     else if (res && res.started) { renderDoctor(res.doctor); formMsg("Monitoring started — review the warnings below", false); }
     else if (res) { renderDoctor(res.doctor); formMsg("Startup checks failed — fix the items below and save again", true); }
-    else { formMsg("Could not start monitoring — see the error message above and try again", true); } // startMonitor returned null (transport error)
+    else { formMsg("Could not start monitoring — check the notification for details and try again", true); } // startMonitor returned null (transport error)
     return;
   }
   hideServerForm();
