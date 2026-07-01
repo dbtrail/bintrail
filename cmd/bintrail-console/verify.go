@@ -105,18 +105,29 @@ func (s *verifySupervisor) Status(serverID string) console.VerifyStatus {
 // comment). It opens its own short-lived index connection: the triggering
 // run's connection is already closed by the time an operator clicks Explain.
 func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.VerifyExplanation, error) {
+	// Copy everything needed out of the job under the SAME critical section:
+	// j.pairs is a plain map, mutated by cachePair from the run's goroutine
+	// while a run is still in flight (mismatches on later tables cache in
+	// after earlier ones have already been polled/explained) — reading it
+	// after releasing the lock would race that write.
 	s.mu.Lock()
 	j, ok := s.jobs[serverID]
-	s.mu.Unlock()
-	if !ok || j.mode != console.VerifyModeBaselineAnchored {
-		return nil, console.ErrExplainUnavailable
+	var (
+		indexDSN  string
+		noArchive bool
+		pair      verify.BaselinePair
+		pairOK    bool
+	)
+	if ok && j.mode == console.VerifyModeBaselineAnchored {
+		indexDSN, noArchive = j.indexDSN, j.noArchive
+		pair, pairOK = j.pairs[schema+"."+table]
 	}
-	pair, ok := j.pairs[schema+"."+table]
-	if !ok {
+	s.mu.Unlock()
+	if !pairOK {
 		return nil, console.ErrExplainUnavailable
 	}
 
-	db, err := config.Connect(j.indexDSN)
+	db, err := config.Connect(indexDSN)
 	if err != nil {
 		return nil, fmt.Errorf("connect index: %w", err)
 	}
@@ -128,8 +139,8 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 	// The pair already carries the resolved Prev/New Parquet paths — no need
 	// to re-resolve a baseline source dir/S3 prefix here.
 	cfg := verify.BaselineConfig{
-		IndexDB: db, Resolver: resolver, IndexDBName: indexDBName(j.indexDSN),
-		NoArchive: j.noArchive, ArchiveFetcher: parquetquery.Fetch,
+		IndexDB: db, Resolver: resolver, IndexDBName: indexDBName(indexDSN),
+		NoArchive: noArchive, ArchiveFetcher: parquetquery.Fetch,
 	}
 
 	ex, err := verify.ExplainBaselinePairMismatch(s.ctx, cfg, pair)
@@ -158,6 +169,16 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 // so Status polls see progress mid-run — internal/verify has no progress
 // callback of its own; this loop IS the streaming.
 func (s *verifySupervisor) run(req console.VerifyRequest, baselineSrc string) {
+	// A panic here must NEVER take down the daemon: this background goroutine
+	// shares the process with the stream and console under `watch`. Mirrors
+	// rotation.StartLoop's and the baseline-prune loop's guard.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("verify: run panicked", "server", req.ServerID, "panic", r)
+			s.finish(req.ServerID, fmt.Errorf("internal error: %v", r))
+		}
+	}()
+
 	db, err := config.Connect(req.IndexDSN)
 	if err != nil {
 		s.finish(req.ServerID, fmt.Errorf("connect index: %w", err))
@@ -401,8 +422,14 @@ func (s *verifySupervisor) cachePair(serverID, key string, p verify.BaselinePair
 	j.pairs[key] = p
 }
 
-// setNote records a benign informational message for the run (e.g. "only one
-// baseline yet") and marks it succeeded — this is not a failure.
+// setNote records a benign informational message for the run in progress
+// (e.g. "only one baseline yet") WITHOUT changing State — finish, called
+// once at the tail of run() regardless of which branch it took, is the sole
+// place that transitions State out of "running". Setting State here too
+// would let it leave "running" before the goroutine's actual terminal call,
+// opening a window where a second concurrent Trigger for the same server is
+// wrongly admitted (State != "running" already) and finish's caller ends up
+// racing two jobs' state under one map entry.
 func (s *verifySupervisor) setNote(serverID, note string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -410,15 +437,14 @@ func (s *verifySupervisor) setNote(serverID, note string) {
 	if !ok {
 		return
 	}
-	j.status.State = "succeeded"
 	j.status.Note = note
-	j.status.FinishedAt = nowStamp()
 }
 
-// finish marks a run's terminal state. err (from the run's own setup, e.g. a
-// connect failure) fails the whole run; per-table failures never reach here —
-// they are recorded as StatusError results by appendResult instead, exactly
-// like internal/cli/verify.go's per-table error isolation.
+// finish marks a run's terminal state — the ONLY place State leaves
+// "running" (see setNote). err (from the run's own setup, e.g. a connect
+// failure) fails the whole run; per-table failures never reach here — they
+// are recorded as StatusError results by appendResult instead, exactly like
+// internal/cli/verify.go's per-table error isolation.
 func (s *verifySupervisor) finish(serverID string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -426,9 +452,6 @@ func (s *verifySupervisor) finish(serverID string, err error) {
 	if !ok {
 		j = &verifyJob{status: console.VerifyStatus{}}
 		s.jobs[serverID] = j
-	}
-	if j.status.State == "succeeded" {
-		return // setNote already finalized this run (the one-baseline no-op path)
 	}
 	j.status.FinishedAt = nowStamp()
 	if err != nil {

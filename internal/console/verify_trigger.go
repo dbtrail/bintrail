@@ -3,6 +3,7 @@ package console
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 )
 
@@ -168,27 +169,36 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 		Mode   string   `json:"mode"`
 		Tables []string `json:"tables"`
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body) // no/empty body = defaults
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		// EOF = no/empty body = defaults. Any other decode error means the
+		// caller's actual request (e.g. an explicit live-source mode) must
+		// not be silently substituted with the baseline-anchored default.
+		writeJSONError(w, http.StatusBadRequest, "malformed request body: "+err.Error())
+		return
 	}
 	mode := VerifyModeBaselineAnchored
 	if body.Mode != "" {
 		mode = VerifyMode(body.Mode)
 	}
 	switch mode {
-	case VerifyModeBaselineAnchored:
-		if e.BaselineDir == "" && e.BaselineS3 == "" {
-			writeJSONError(w, http.StatusBadRequest,
-				"this server has no baseline destination configured; set a baseline directory or S3 prefix first (Edit → Advanced)")
-			return
-		}
-	case VerifyModeLiveSource:
-		if e.SourceDSN == "" {
-			writeJSONError(w, http.StatusBadRequest, "this server has no source configured; set the source connection first")
-			return
-		}
+	case VerifyModeBaselineAnchored, VerifyModeLiveSource:
 	default:
 		writeJSONError(w, http.StatusBadRequest, "unknown mode (want baseline-anchored or live-source)")
+		return
+	}
+	// Both modes need a baseline destination — mirrors internal/cli/verify.go,
+	// which requires --baseline-dir/--baseline-s3 before the mode split, not
+	// just for baseline-anchored. Live-source still reconstructs each table
+	// from baseline + deltas (internal/verify.VerifyTable); without one every
+	// table degrades to inconclusive AFTER a full off-peak read of the live
+	// table, which the CLI refuses up front instead of wasting that read.
+	if e.BaselineDir == "" && e.BaselineS3 == "" {
+		writeJSONError(w, http.StatusBadRequest,
+			"this server has no baseline destination configured; set a baseline directory or S3 prefix first (Edit → Advanced)")
+		return
+	}
+	if mode == VerifyModeLiveSource && e.SourceDSN == "" {
+		writeJSONError(w, http.StatusBadRequest, "this server has no source configured; set the source connection first")
 		return
 	}
 

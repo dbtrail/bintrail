@@ -1864,6 +1864,7 @@ async function createVerify(id, mode, btn, resultsEl) {
   toast("Verification started…");
   const done = await pollVerify(id, (st) => renderVerifyResults(resultsEl, st, id));
   restore();
+  if (done) renderVerifyResults(resultsEl, done, id);
   if (done && done.state === "succeeded") {
     const s = done.summary || {};
     toast(done.note || ("Verification complete: " + s.match + " match, " + s.mismatch + " mismatch, " +
@@ -1886,8 +1887,17 @@ async function pollVerify(id, onTick) {
     let st;
     try {
       st = (await api("/api/servers/" + encodeURIComponent(id) + "/verify")).verify;
-    } catch (_) {
-      continue; // a blip mid-run shouldn't abort the wait
+    } catch (err) {
+      // 403/404 are durable (the feature got disabled, an RBAC profile came
+      // on, or the server was deleted mid-run) — the run this poll is
+      // watching is gone or unreachable, so retrying for the full ~20-minute
+      // cap would just leave the button stuck on "Running…". Everything else
+      // (network blip, 5xx) is presumed transient and retried. 401 is already
+      // handled centrally by api()'s sign-in gate.
+      if (err && (err.status === 403 || err.status === 404)) {
+        return { state: "failed", last_error: (err && err.message) || String(err) };
+      }
+      continue;
     }
     if (st && onTick) onTick(st);
     if (st && st.state !== "running") return st;
