@@ -267,6 +267,42 @@ try {
   cont.missingNeither ? ok("continuity: missing continuity (legacy backend) shows no green") : bad("continuity: missing continuity (legacy backend) shows no green", "rendered green without continuity");
   cont.nilNeither ? ok("continuity: nil stream shows neither box") : bad("continuity: nil stream shows neither box", "rendered a box for nil stream");
 
+  // Scenario 9 — Storage page AWS-credentials card (#681). credentialsCard is
+  // pure (like pgHealthCard/continuityBox): it must lead with a plain-language
+  // summary of which credential source is active, never leave the raw signals
+  // as the only content, and each of the mutually-favored signals (static
+  // env keys > IAM role > shared config > none) must produce distinct copy —
+  // an IAM-role or shared-config setup must never read as "no credentials".
+  const cred = await page.evaluate(() => {
+    const mk = (aws) => credentialsCard({ aws });
+    const none = mk({ access_key_env: false, profile: "", region_env: "", shared_config: false, container_creds: false, web_identity: false });
+    const keys = mk({ access_key_env: true, profile: "", region_env: "", shared_config: false, container_creds: false, web_identity: false });
+    const ecs = mk({ access_key_env: false, profile: "", region_env: "", shared_config: false, container_creds: true, web_identity: false });
+    const irsa = mk({ access_key_env: false, profile: "", region_env: "", shared_config: false, container_creds: false, web_identity: true });
+    const shared = mk({ access_key_env: false, profile: "default", region_env: "", shared_config: true, container_creds: false, web_identity: false });
+    const adv = none.querySelector("details.form-advanced");
+    return {
+      noneSummary: /No static credentials configured/.test(none.textContent),
+      keysSummary: /Static access keys configured via environment/.test(keys.textContent),
+      ecsSummary: /ECS task role detected/.test(ecs.textContent),
+      irsaSummary: /EKS IRSA detected/.test(irsa.textContent),
+      sharedSummary: /shared ~\/\.aws config\/profile/.test(shared.textContent),
+      hasDisclosure: !!adv,
+      disclosureCollapsed: !!adv && !adv.open,
+      hasToggle: !!none.querySelector("summary.form-adv-summary"),
+      rawRowCount: none.querySelectorAll(".kv").length,
+    };
+  });
+  cred.noneSummary ? ok("aws-creds: no signals renders the ambient-chain summary") : bad("aws-creds: no signals renders the ambient-chain summary", "wording missing");
+  cred.keysSummary ? ok("aws-creds: static env keys take priority in the summary") : bad("aws-creds: static env keys take priority in the summary", "wording missing");
+  cred.ecsSummary ? ok("aws-creds: ECS task role reads as an IAM role, not an error") : bad("aws-creds: ECS task role reads as an IAM role, not an error", "wording missing");
+  cred.irsaSummary ? ok("aws-creds: EKS IRSA reads as an IAM role, not an error") : bad("aws-creds: EKS IRSA reads as an IAM role, not an error", "wording missing");
+  cred.sharedSummary ? ok("aws-creds: shared ~/.aws config/profile never reads as 'no credentials'") : bad("aws-creds: shared ~/.aws config/profile never reads as 'no credentials'", "wording missing/contradicts raw signal");
+  cred.hasDisclosure ? ok("aws-creds: raw signals are folded behind a details disclosure") : bad("aws-creds: raw signals are folded behind a details disclosure", "no details.form-advanced");
+  cred.disclosureCollapsed ? ok("aws-creds: raw-signals disclosure is collapsed by default") : bad("aws-creds: raw-signals disclosure is collapsed by default", "rendered open");
+  cred.hasToggle ? ok("aws-creds: disclosure uses the app's toggle style") : bad("aws-creds: disclosure uses the app's toggle style", "missing summary.form-adv-summary");
+  cred.rawRowCount === 4 ? ok("aws-creds: all four raw signal rows still render") : bad("aws-creds: all four raw signal rows still render", `rawRowCount=${cred.rawRowCount}`);
+
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));
 } catch (err) {

@@ -1608,6 +1608,7 @@ function credentialsCard(storage) {
   if (aws.access_key_env) summary = "Static access keys configured via environment.";
   else if (aws.container_creds) summary = "Using an IAM role (ECS task role detected).";
   else if (aws.web_identity) summary = "Using an IAM role (EKS IRSA detected).";
+  else if (aws.shared_config || aws.profile) summary = "Using credentials from a shared ~/.aws config/profile.";
   card.append(el("p", { class: "stg-hint", text: summary }));
   const adv = el("details", { class: "form-advanced" },
     el("summary", { class: "form-adv-summary", text: "Raw signals" }));
