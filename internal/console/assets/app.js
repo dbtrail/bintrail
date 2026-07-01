@@ -807,17 +807,22 @@ function renderEvents(params) {
   viewEnter();
 }
 
-function fieldInput(label, name, size, placeholder) {
+function fieldLabel(label, required) {
+  const lbl = el("label", { class: "field-label" }, label);
+  if (required) lbl.append(el("span", { class: "field-required", title: "Required", text: " *" }));
+  return lbl;
+}
+function fieldInput(label, name, size, placeholder, required) {
   return el("div", { class: "field field--" + size },
-    el("label", { class: "field-label", text: label }),
+    fieldLabel(label, required),
     el("input", { class: "input", name, placeholder: placeholder || "" }));
 }
-function fieldSelect(label, name, size, isSchema, isTable, options, anyLabel) {
+function fieldSelect(label, name, size, isSchema, isTable, options, anyLabel, required) {
   const sel = el("select", { class: "select" + (isSchema ? " schema-select" : "") + (isTable ? " table-select" : ""), name });
   if (options) options.forEach((o) => sel.append(opt(o, o === "" ? (anyLabel || "any") : o)));
   else sel.append(opt("", "any"));
   return el("div", { class: "field field--" + size },
-    el("label", { class: "field-label", text: label }), sel);
+    fieldLabel(label, required), sel);
 }
 
 // parseSmartQuery turns "type:delete pk:1006 orders" into structured filters +
@@ -1190,8 +1195,8 @@ function renderTimetravel(params) {
 
   const form = el("form", { class: "filters", id: "tt-form" });
   form.append(fieldSelect("Schema", "schema", "md", true, false, null, "— select —"));
-  form.append(fieldSelect("Table", "table", "md", false, true));
-  form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
+  form.append(fieldSelect("Table", "table", "md", false, true, null, null, true));
+  form.append(fieldInput("PK", "pk", "sm", "42 or 42|7", true));
   form.append(fieldInput("As of", "at", "md", "YYYY-MM-DD HH:MM (default: now)"));
   const gapsField = el("div", { class: "field", style: "justify-content:flex-end" },
     el("label", { class: "check" }, el("input", { type: "checkbox", name: "allow_gaps" }), el("span", { text: "Allow coverage gaps" })));
