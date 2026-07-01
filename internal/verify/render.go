@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
@@ -134,18 +135,20 @@ func temporalPrecision(columnType string) int {
 // happen inside an object; touching scalars would only add risk (whitespace/
 // escaping differences) for no benefit.
 //
-// This exists for one specific gap: a MySQL TEXT/LONGTEXT column (not the
-// native JSON type) whose stored value happens to be JSON text — a common
-// pattern for plugins that json_encode() into a text field. Once an event
-// touches such a row, its event-image round-trips through Go's
-// map[string]any (query.UnmarshalRowImage), which loses the original key
-// order; renderCell's default case then re-marshals it with Go's own
-// (alphabetically sorted) key order, while a baseline dump's text preserves
-// the source's original order verbatim. Two renderings of identical data
-// disagree on bytes alone. A column typed as MySQL's native JSON already has
-// a narrower version of this same gap, covered by isDeferredType's
-// inconclusive downgrade — this closes it more precisely, for the case
-// canonicalization can actually resolve to a genuine match rather than
+// This operates on the RENDERED bytes, not the column's declared SQL type, so
+// it applies to any value that renders JSON-shaped — a native MySQL JSON
+// column, and equally a MySQL TEXT/LONGTEXT column (not the native JSON type)
+// whose stored value happens to be JSON text, a common pattern for plugins
+// that json_encode() into a text field. That TEXT case is the gap this
+// primarily exists to close: once an event touches such a row, its
+// event-image round-trips through Go's map[string]any
+// (query.UnmarshalRowImage), which loses the original key order; renderCell's
+// default case then re-marshals it with Go's own (alphabetically sorted) key
+// order, while a baseline dump's text preserves the source's original order
+// verbatim. Two renderings of identical data disagree on bytes alone. A
+// column typed as MySQL's native JSON already had a narrower version of this
+// same gap, covered by isDeferredType's inconclusive downgrade — this closes
+// it more precisely there too, resolving to a genuine match rather than
 // merely downgrading to "can't tell": see renderCellCanonicalJSON.
 //
 // UseNumber preserves large-integer/decimal literals exactly, the same
@@ -163,6 +166,27 @@ func canonicalizeJSONContainer(b []byte) ([]byte, bool) {
 	if !json.Valid(t) {
 		return b, false
 	}
+	// Not eligible to canonicalize: raw content this transform would corrupt
+	// or hide a divergence in, rather than merely reorder.
+	//   - invalid UTF-8: both json.Decode/Encode replace it with U+FFFD, so two
+	//     DIFFERENT invalid byte sequences could canonicalize to the SAME
+	//     output — silently erasing a real difference.
+	//   - a repeated key within one object: decoding into map[string]any keeps
+	//     only the last occurrence (Go's stdlib behavior), which would make
+	//     `{"a":1,"a":2}` and `{"a":2}` compare equal — but those are NOT the
+	//     same source bytes, and if that duplicate-keyed value came from
+	//     event-image reconstruction, this is exactly the kind of divergence
+	//     verify exists to catch, not paper over.
+	// Both leave b returned unchanged, so a genuinely malformed/duplicated
+	// value still falls back to the pre-fix byte comparison (conservative:
+	// worst case reports a mismatch verify's caller downgrades to
+	// inconclusive or a human reviews, never a silently masked one).
+	if !utf8.Valid(t) {
+		return b, false
+	}
+	if hasDuplicateObjectKeys(t) {
+		return b, false
+	}
 	dec := json.NewDecoder(bytes.NewReader(t))
 	dec.UseNumber()
 	var v any
@@ -176,6 +200,65 @@ func canonicalizeJSONContainer(b []byte) ([]byte, bool) {
 		return b, false
 	}
 	return bytes.TrimRight(buf.Bytes(), "\n"), true
+}
+
+// hasDuplicateObjectKeys reports whether any JSON object within data (already
+// confirmed json.Valid) repeats a key at the same nesting level — a case
+// Go's map[string]any decode would silently collapse to last-key-wins,
+// exactly the kind of information loss canonicalizeJSONContainer must not
+// introduce. Walks the raw token stream (not a map) so duplicates are visible
+// before any collapsing decode runs.
+func hasDuplicateObjectKeys(data []byte) bool {
+	dup, _ := walkForDuplicateKeys(json.NewDecoder(bytes.NewReader(data)))
+	return dup
+}
+
+// walkForDuplicateKeys consumes exactly one JSON value (scalar, object, or
+// array) from dec and reports whether a duplicate object key was found
+// anywhere within it, recursing into nested objects/arrays. err is non-nil
+// only on a stream read failure, which cannot happen against
+// already-json.Valid input; callers treat that case as "no duplicate found"
+// (the same conservative, fall-back-to-raw-bytes behavior every other
+// canonicalizeJSONContainer failure path takes).
+func walkForDuplicateKeys(dec *json.Decoder) (bool, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return false, err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return false, nil // scalar value: string/number/bool/null, no keys to check
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]bool)
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return false, err
+			}
+			key, _ := keyTok.(string) // object keys are always strings per the JSON grammar
+			if seen[key] {
+				return true, nil
+			}
+			seen[key] = true
+			if dup, err := walkForDuplicateKeys(dec); dup || err != nil {
+				return dup, err
+			}
+		}
+		_, err := dec.Token() // consume the closing '}'
+		return false, err
+	case '[':
+		for dec.More() {
+			if dup, err := walkForDuplicateKeys(dec); dup || err != nil {
+				return dup, err
+			}
+		}
+		_, err := dec.Token() // consume the closing ']'
+		return false, err
+	default:
+		return false, nil // stray '}'/']' — unreachable against valid JSON
+	}
 }
 
 // renderCellCanonicalJSON renders a cell like renderCell, additionally

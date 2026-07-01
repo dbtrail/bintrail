@@ -67,6 +67,116 @@ func TestRenderCell_JSONContainerCompletes(t *testing.T) {
 	}
 }
 
+// TestCanonicalizeJSONContainer_KeyOrderOnly is the core fix: two JSON objects
+// carrying the same key/value pairs in a different order canonicalize to the
+// SAME bytes, and a genuinely different value does NOT.
+func TestCanonicalizeJSONContainer_KeyOrderOnly(t *testing.T) {
+	a, aOK := canonicalizeJSONContainer([]byte(`{"a":1,"b":2}`))
+	b, bOK := canonicalizeJSONContainer([]byte(`{"b":2,"a":1}`))
+	if !aOK || !bOK {
+		t.Fatalf("expected both to canonicalize: aOK=%v bOK=%v", aOK, bOK)
+	}
+	if string(a) != string(b) {
+		t.Errorf("key-order-only difference should canonicalize identically, got %q vs %q", a, b)
+	}
+	c, cOK := canonicalizeJSONContainer([]byte(`{"a":1,"b":3}`))
+	if !cOK {
+		t.Fatal("expected c to canonicalize")
+	}
+	if string(a) == string(c) {
+		t.Error("genuinely different values must NOT canonicalize to the same bytes")
+	}
+}
+
+// TestCanonicalizeJSONContainer_ScalarsAndNonJSONUntouched: scalars (a bare
+// number/bool/null/quoted string, even though each is independently valid
+// JSON) and non-JSON text are left exactly as-is — canonicalization is scoped
+// to object/array containers only.
+func TestCanonicalizeJSONContainer_ScalarsAndNonJSONUntouched(t *testing.T) {
+	for _, in := range []string{"42", "true", "false", "null", `"hello"`, "not json at all", ""} {
+		got, ok := canonicalizeJSONContainer([]byte(in))
+		if ok {
+			t.Errorf("canonicalizeJSONContainer(%q): ok=true, want false (not a container)", in)
+		}
+		if string(got) != in {
+			t.Errorf("canonicalizeJSONContainer(%q) = %q, want input returned unchanged", in, got)
+		}
+	}
+}
+
+// TestCanonicalizeJSONContainer_LargeNumberPrecisionPreserved guards the
+// #496-class risk: decoding through UseNumber and re-marshaling must not
+// round an integer that overflows float64's exact range, or reformat a
+// decimal literal.
+func TestCanonicalizeJSONContainer_LargeNumberPrecisionPreserved(t *testing.T) {
+	for _, in := range []string{
+		`{"n":9223372036854775807}`,  // max int64, loses precision through float64
+		`{"n":18446744073709551615}`, // max uint64
+		`{"n":1.50}`,                 // trailing zero a naive float64 round-trip drops
+	} {
+		got, ok := canonicalizeJSONContainer([]byte(in))
+		if !ok {
+			t.Fatalf("canonicalizeJSONContainer(%q): want ok=true", in)
+		}
+		if string(got) != in {
+			t.Errorf("canonicalizeJSONContainer(%q) = %q, want the number literal preserved exactly", in, got)
+		}
+	}
+}
+
+// TestCanonicalizeJSONContainer_DuplicateKeysRefused is the fix for a review
+// finding: decoding into map[string]any silently keeps only the LAST of a
+// repeated object key. If canonicalizeJSONContainer collapsed
+// {"a":1,"a":2} to {"a":2}, it would make that value indistinguishable from
+// a baseline that never had the duplicate — masking a real divergence
+// instead of merely reordering one. Must refuse (ok=false, raw bytes
+// returned) whenever ANY object in the value repeats a key, at any nesting
+// depth, inside an array or not — never silently collapse it.
+func TestCanonicalizeJSONContainer_DuplicateKeysRefused(t *testing.T) {
+	cases := []string{
+		`{"a":1,"a":2}`,                   // top-level duplicate
+		`{"outer":{"a":1,"a":2}}`,         // duplicate in a nested object
+		`[{"a":1},{"b":1,"b":2}]`,         // duplicate inside an array element
+		`{"a":{"x":1},"b":{"x":1,"x":2}}`, // duplicate in one branch, not the sibling
+	}
+	for _, in := range cases {
+		got, ok := canonicalizeJSONContainer([]byte(in))
+		if ok {
+			t.Errorf("canonicalizeJSONContainer(%q): ok=true, want false (must refuse a duplicate key)", in)
+		}
+		if string(got) != in {
+			t.Errorf("canonicalizeJSONContainer(%q) = %q, want input returned unchanged on refusal", in, got)
+		}
+	}
+	// A key repeated only as a VALUE (not a key) must NOT trip the guard.
+	clean := `{"a":"a","b":"a"}`
+	if _, ok := canonicalizeJSONContainer([]byte(clean)); !ok {
+		t.Errorf("canonicalizeJSONContainer(%q): want ok=true (no key is actually duplicated)", clean)
+	}
+}
+
+// TestCanonicalizeJSONContainer_InvalidUTF8Refused is the fix for a review
+// finding: encoding/json replaces invalid UTF-8 bytes with U+FFFD on
+// decode/re-encode, so two DIFFERENT invalid byte sequences could
+// canonicalize to the SAME output — silently erasing a real difference.
+// Must refuse whenever the input is not valid UTF-8.
+func TestCanonicalizeJSONContainer_InvalidUTF8Refused(t *testing.T) {
+	bad := []byte{'{', '"', 's', '"', ':', '"', 0xff, 0xfe, '"', '}'}
+	got, ok := canonicalizeJSONContainer(bad)
+	if ok {
+		t.Errorf("canonicalizeJSONContainer(invalid UTF-8): ok=true, want false")
+	}
+	if !bytes.Equal(got, bad) {
+		t.Errorf("canonicalizeJSONContainer(invalid UTF-8) = %q, want input returned unchanged on refusal", got)
+	}
+}
+
+func TestRenderCellCanonicalJSON_NullPassesThrough(t *testing.T) {
+	if got := renderCellCanonicalJSON(nil, col("json", "json")); got != nil {
+		t.Errorf("renderCellCanonicalJSON(nil, ...) = %q, want nil (SQL NULL)", got)
+	}
+}
+
 func TestTemporalPrecision(t *testing.T) {
 	cases := map[string]int{
 		"datetime":      0,
