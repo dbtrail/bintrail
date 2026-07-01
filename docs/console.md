@@ -284,16 +284,17 @@ across the rotation dialog and the per-server edit form):
   (`bintrail dump` → `bintrail baseline`). When the **Create baseline** button
   is enabled (see below) it sits in this panel's header.
 
-#### Creating a baseline from the console (opt-in)
+#### Creating a baseline from the console
 
 By default the console only *lists* baselines — you produce them with the
 `bintrail dump` → `bintrail baseline` CLI (or the compose `baseline` profile).
 A **Create baseline** button can run that pipeline for a monitored server
-straight from the Storage page, but it is **opt-in** and only on the `watch`
-daemon:
+straight from the Storage page, and it only runs on the `watch` daemon:
 
-- Start `watch` with `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1` (compose: set
-  `BASELINE_TRIGGER=1` in `.env`).
+- A bare `watch` invocation (no compose) has this **opt-in** and off by
+  default — start it with `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`. The bundled
+  compose stack flips this to **on by default**; set `BASELINE_TRIGGER=0` in
+  `.env` to opt out there.
 - The server must have **both** a source DSN and a baseline destination
   (`baseline_dir` or `baseline_s3`) configured; the button 400s otherwise.
 - Clicking it runs **dump → convert → upload entirely in-process**: the console
@@ -307,9 +308,9 @@ daemon:
   credentials come from the daemon's ambient AWS chain, like every other S3
   access. When it finishes the new snapshot appears in the listing.
 
-The button is hidden on the read-only `serve` console and whenever the opt-in
-is off — the CLI/compose recipe in the empty state remains the always-available
-path.
+The button is hidden on the read-only `serve` console and whenever the trigger
+is disabled — the CLI/compose recipe in the empty state remains the
+always-available path.
 - **AWS credentials** — which ambient credential signals the daemon process
   can see: env keys (presence only, never values), `AWS_PROFILE`,
   `AWS_REGION`, a shared `~/.aws` config, ECS task-role / EKS IRSA markers.
@@ -356,8 +357,10 @@ path.
   Archive-to-S3 feature, same as `--archive-staging-dir`. AWS credentials for
   the upload come from the ambient chain (`AWS_*` / `~/.aws` / role).
 - `BINTRAIL_CONSOLE_BASELINE_TRIGGER` (`watch` only) — `1`/`true` enables the
-  opt-in **Create baseline** button (runs `mydumper` → convert → upload
-  in-process; see [The Storage page](#the-storage-page)). Off by default.
+  **Create baseline** button (runs `mydumper` → convert → upload in-process;
+  see [The Storage page](#the-storage-page)). Off by default for a bare
+  `watch` invocation; the bundled compose stack sets this on by default (see
+  [docker.md](docker.md) — `BASELINE_TRIGGER=0` in `.env` opts out there).
 - `BINTRAIL_CONSOLE_BASELINE_STAGING` (`watch` only) — local staging dir for
   S3-destined baselines created by that button (default a temp subdir).
 
