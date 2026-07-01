@@ -157,7 +157,9 @@ func temporalPrecision(columnType string) int {
 // a human reading a mismatch cell would otherwise have to puzzle over.
 //
 // Returns the input unchanged with ok=false when b is not a JSON
-// object/array, or fails to parse.
+// object/array, fails to parse, is not valid UTF-8, decodes to a value
+// containing U+FFFD (see the surrogate-escape note below), or contains a
+// duplicate object key at any depth.
 func canonicalizeJSONContainer(b []byte) ([]byte, bool) {
 	t := bytes.TrimSpace(b)
 	if len(t) == 0 || (t[0] != '{' && t[0] != '[') {
@@ -168,16 +170,16 @@ func canonicalizeJSONContainer(b []byte) ([]byte, bool) {
 	}
 	// Not eligible to canonicalize: raw content this transform would corrupt
 	// or hide a divergence in, rather than merely reorder.
-	//   - invalid UTF-8: both json.Decode/Encode replace it with U+FFFD, so two
-	//     DIFFERENT invalid byte sequences could canonicalize to the SAME
-	//     output — silently erasing a real difference.
+	//   - invalid UTF-8 bytes: both json.Decode/Encode replace them with
+	//     U+FFFD, so two DIFFERENT invalid byte sequences could canonicalize
+	//     to the SAME output — silently erasing a real difference.
 	//   - a repeated key within one object: decoding into map[string]any keeps
 	//     only the last occurrence (Go's stdlib behavior), which would make
 	//     `{"a":1,"a":2}` and `{"a":2}` compare equal — but those are NOT the
 	//     same source bytes, and if that duplicate-keyed value came from
 	//     event-image reconstruction, this is exactly the kind of divergence
 	//     verify exists to catch, not paper over.
-	// Both leave b returned unchanged, so a genuinely malformed/duplicated
+	// All leave b returned unchanged, so a genuinely malformed/duplicated
 	// value still falls back to the pre-fix byte comparison (conservative:
 	// worst case reports a mismatch verify's caller downgrades to
 	// inconclusive or a human reviews, never a silently masked one).
@@ -199,14 +201,30 @@ func canonicalizeJSONContainer(b []byte) ([]byte, bool) {
 	if err := enc.Encode(v); err != nil {
 		return b, false
 	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), true
+	out := bytes.TrimRight(buf.Bytes(), "\n")
+	// An unpaired \uD800-\uDFFF surrogate escape is valid JSON syntax AND
+	// valid raw UTF-8 (it's just six ASCII characters before unescaping), so
+	// utf8.Valid(t) above does not catch it — the invalidity only appears
+	// once json.Decode unescapes the string content, where Go silently
+	// substitutes U+FFFD, same as it does for invalid raw bytes. Two
+	// DIFFERENT unpaired surrogates would decode to the identical U+FFFD and
+	// canonicalize to the identical output. Refuse whenever the canonical
+	// form contains U+FFFD: a real, intentional U+FFFD in source data is
+	// vanishingly rare, and the cost of a false refusal here is only a
+	// fallback to raw-byte comparison, not a wrong answer.
+	if bytes.ContainsRune(out, utf8.RuneError) {
+		return b, false
+	}
+	return out, true
 }
 
 // hasDuplicateObjectKeys reports whether any JSON object within data (already
-// confirmed json.Valid) repeats a key at the same nesting level — a case
-// Go's map[string]any decode would silently collapse to last-key-wins,
-// exactly the kind of information loss canonicalizeJSONContainer must not
-// introduce. Walks the raw token stream (not a map) so duplicates are visible
+// confirmed json.Valid) repeats a key WITHIN THAT SAME OBJECT — a case Go's
+// map[string]any decode would silently collapse to last-key-wins, exactly the
+// kind of information loss canonicalizeJSONContainer must not introduce. Two
+// sibling objects (or an object and its parent) reusing the same key name is
+// NOT a duplicate — key uniqueness is scoped per object, not per nesting
+// depth. Walks the raw token stream (not a map) so duplicates are visible
 // before any collapsing decode runs.
 func hasDuplicateObjectKeys(data []byte) bool {
 	dup, _ := walkForDuplicateKeys(json.NewDecoder(bytes.NewReader(data)))

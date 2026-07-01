@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
@@ -135,9 +136,13 @@ func TestCanonicalizeJSONContainer_LargeNumberPrecisionPreserved(t *testing.T) {
 func TestCanonicalizeJSONContainer_DuplicateKeysRefused(t *testing.T) {
 	cases := []string{
 		`{"a":1,"a":2}`,                   // top-level duplicate
+		`{"a":1,"a":1}`,                   // duplicate with the SAME value — a "compare the final decoded map" approach would miss this; the structural walker must not
 		`{"outer":{"a":1,"a":2}}`,         // duplicate in a nested object
 		`[{"a":1},{"b":1,"b":2}]`,         // duplicate inside an array element
 		`{"a":{"x":1},"b":{"x":1,"x":2}}`, // duplicate in one branch, not the sibling
+		`{"a":1,"b":2,"a":3}`,             // duplicate not adjacent to its first occurrence
+		`[[{"a":1,"a":2}]]`,               // duplicate nested inside array-in-array
+		"{\"\\u0061\":1,\"a\":2}",         // duplicate via a differently-escaped but identical decoded key
 	}
 	for _, in := range cases {
 		got, ok := canonicalizeJSONContainer([]byte(in))
@@ -168,6 +173,30 @@ func TestCanonicalizeJSONContainer_InvalidUTF8Refused(t *testing.T) {
 	}
 	if !bytes.Equal(got, bad) {
 		t.Errorf("canonicalizeJSONContainer(invalid UTF-8) = %q, want input returned unchanged on refusal", got)
+	}
+}
+
+// TestCanonicalizeJSONContainer_UnpairedSurrogateRefused is the fix for a
+// second review finding, distinct from the raw-invalid-UTF-8 case above: a
+// \uD800-\uDFFF escape is valid JSON syntax and valid RAW UTF-8 (it's just
+// ASCII characters before unescaping), so it passes json.Valid AND
+// utf8.Valid(t) — the invalidity only appears once json.Decode unescapes the
+// string, where Go substitutes U+FFFD, same as for raw invalid bytes. Two
+// DIFFERENT unpaired surrogates would otherwise canonicalize to the
+// identical U+FFFD and compare equal.
+func TestCanonicalizeJSONContainer_UnpairedSurrogateRefused(t *testing.T) {
+	one := []byte(`{"s":"\uD800"}`)
+	other := []byte(`{"s":"\uDEAD"}`)
+	if !utf8.Valid(one) || !utf8.Valid(other) {
+		t.Fatal("precondition: the raw bytes (escape sequences, not yet decoded) must be valid UTF-8")
+	}
+	gotOne, okOne := canonicalizeJSONContainer(one)
+	gotOther, okOther := canonicalizeJSONContainer(other)
+	if okOne || okOther {
+		t.Errorf("canonicalizeJSONContainer(unpaired surrogate): okOne=%v okOther=%v, want both false", okOne, okOther)
+	}
+	if !bytes.Equal(gotOne, one) || !bytes.Equal(gotOther, other) {
+		t.Errorf("got %q / %q, want both inputs returned unchanged on refusal", gotOne, gotOther)
 	}
 }
 
