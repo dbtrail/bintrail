@@ -51,8 +51,11 @@ func makeGTIDEvent(gno int64) *replication.BinlogEvent {
 // makeAnonymousGTIDEvent builds a BinlogEvent wrapping a GTIDEvent tagged as
 // ANONYMOUS_GTID_EVENT (gtid_mode=OFF) — the header EventType is what
 // distinguishes it from makeGTIDEvent's "real" GTID_EVENT; go-mysql decodes
-// both into the same GTIDEvent struct, with an all-zero SID for the anonymous
-// case, matching what the source actually sends on the wire (#678).
+// both into the same GTIDEvent struct. The all-zero SID mirrors what #678
+// observed go-mysql decode for an anonymous event, but isn't load-bearing
+// here: formatGTID's eventType check fires before it ever looks at SID, so
+// this fixture would behave identically with a non-zero SID (see
+// TestFormatGTID_anonymousEvent, which asserts exactly that).
 func makeAnonymousGTIDEvent(gno int64) *replication.BinlogEvent {
 	sid := make([]byte, 16)
 	return &replication.BinlogEvent{
@@ -238,6 +241,40 @@ func TestStreamParser_gtidThenFilteredRows(t *testing.T) {
 	ev := <-out
 	if ev.EventType != EventGTID {
 		t.Errorf("expected EventGTID (%d), got %d", EventGTID, ev.EventType)
+	}
+}
+
+// TestStreamParser_anonymousGTIDThenRowsEmitsEmptyGTID verifies the actual
+// production impact of #678: a row event following an ANONYMOUS_GTID_LOG_EVENT
+// must carry an empty GTID, not the fake zero-UUID formatGTID used to produce.
+// This is the field indexer.InsertBatch stores into binlog_events.gtid (via
+// nullOrString) — TestStreamParser_anonymousGTIDEventEmitsNoTrackingEvent only
+// covers the lower-stakes tracking-event side of the fix.
+func TestStreamParser_anonymousGTIDThenRowsEmitsEmptyGTID(t *testing.T) {
+	sp := NewStreamParser(makeOrdersResolver(), Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	rowsEv := &replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.WRITE_ROWS_EVENTv2, LogPos: 200, EventSize: 100},
+		Event: &replication.RowsEvent{
+			Table: &replication.TableMapEvent{Schema: []byte("shop"), Table: []byte("orders"), ColumnCount: 2},
+			Rows:  [][]any{{int64(1), int64(10)}},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel, makeAnonymousGTIDEvent(0), rowsEv)
+
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+	evs := drainAll(out)
+	if len(evs) != 1 || evs[0].EventType != EventInsert {
+		t.Fatalf("expected 1 EventInsert (no GTID tracking event), got %v", typesOf(evs))
+	}
+	if evs[0].GTID != "" {
+		t.Errorf("expected empty GTID on the row event following an anonymous GTID, got %q", evs[0].GTID)
 	}
 }
 

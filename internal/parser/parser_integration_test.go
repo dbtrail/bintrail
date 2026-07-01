@@ -173,6 +173,14 @@ func TestParseFile_realBinlog(t *testing.T) {
 		if ev.PKValues == "" {
 			t.Errorf("event[%d]: expected non-empty PKValues", i)
 		}
+		// The test MySQL runs with gtid_mode=OFF (no --gtid-mode flag in CI's
+		// docker run, and OFF is the stock default) — every transaction is
+		// still wrapped in an ANONYMOUS_GTID_LOG_EVENT, which must format to
+		// an empty GTID, not the fake "00000000-...-000000000000:0" #678
+		// produced before the fix.
+		if ev.GTID != "" {
+			t.Errorf("event[%d]: expected empty GTID (gtid_mode=OFF source), got %q", i, ev.GTID)
+		}
 
 		switch ev.EventType {
 		case parser.EventInsert:
