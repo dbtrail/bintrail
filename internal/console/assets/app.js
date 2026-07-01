@@ -1610,7 +1610,7 @@ function credentialsCard(storage) {
   else if (aws.web_identity) summary = "Using an IAM role (EKS IRSA detected).";
   card.append(el("p", { class: "stg-hint", text: summary }));
   const adv = el("details", { class: "form-advanced" },
-    el("summary", { text: "Raw signals" }));
+    el("summary", { class: "form-adv-summary", text: "Raw signals" }));
   kvRow(adv, "access keys (env)", aws.access_key_env ? "set" : "not set");
   kvRow(adv, "profile (env)", aws.profile || "—");
   kvRow(adv, "region (env)", aws.region_env || "—");
