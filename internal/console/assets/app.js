@@ -1794,7 +1794,13 @@ async function pollBaseline(id) {
 // configured; verify_live_source: a source DSN is also configured), both
 // re-enforced server-side so this gating is UX only.
 function verifyPanel(servers) {
-  const panel = el("section", { class: "ov-panel" });
+  // Full-width: ov-grid is a 2-column grid (archiving | baselines) with
+  // align-items:start, and Baseline snapshots routinely runs much taller
+  // than S3 archiving (one row per snapshot) — a 3rd item left to the grid's
+  // normal auto-placement lands in row 2 col 1, floating under the SHORT
+  // sibling with a large dead gap to its right where the tall one still
+  // extends. Spanning both columns puts it in its own row instead.
+  const panel = el("section", { class: "ov-panel vfy-panel-full" });
   const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
   const head = el("div", { class: "ov-panel-head" }, el("h2", { class: "ov-panel-title", text: "Verification" }));
   const list = el("div", { class: "stg-list vfy-list" });

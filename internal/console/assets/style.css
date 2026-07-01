@@ -1282,6 +1282,7 @@ button { font-family: inherit; }
 .stg-empty-sub { margin: 0; font-size: 12.5px; color: var(--ink-3); max-width: 52ch; }
 
 /* Verification panel (#677) */
+.vfy-panel-full { grid-column: 1 / -1; }
 .vfy-actions { display: flex; align-items: center; gap: 8px; }
 .vfy-mode { max-width: 260px; }
 .vfy-livewarn { margin: 0 0 8px; color: var(--orange-2); }

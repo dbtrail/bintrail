@@ -43,6 +43,17 @@ upgrades to be a deliberate, one-line edit rather than whatever `latest`
 currently points to — useful once you're past initial eval and want
 predictable upgrades.
 
+**`docker compose pull` only updates images — it never touches
+`docker-compose.yml` itself.** A release that adds a new service, env var, or
+default (e.g. the `VERIFY_TRIGGER` default-on wiring in 0.26.0) only takes
+effect if your copy of `docker-compose.yml` actually has that line — an
+older file on disk keeps running with whatever it already had, silently,
+with no error. If a newer feature seems missing or a documented default
+doesn't match what you see, re-download `docker-compose.yml` (the curl in
+[Quick start](../README.md)) and diff it against your customized copy before
+`up -d`, or add the specific new line by hand if you've heavily customized
+the file.
+
 Data volumes (`bintrail-index-data`, `bintrail-index-secret`,
 `bintrail-state`, including saved console servers) carry over unchanged
 across a `pull && up -d` — only the images and `docker-compose.yml` itself
