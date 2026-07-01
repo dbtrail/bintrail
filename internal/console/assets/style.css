@@ -1280,6 +1280,14 @@ button { font-family: inherit; }
 .stg-empty { padding: 14px 4px; display: flex; flex-direction: column; gap: 7px; }
 .stg-empty-lead { margin: 0; font-size: 13.5px; font-weight: 600; color: var(--ink-2); }
 .stg-empty-sub { margin: 0; font-size: 12.5px; color: var(--ink-3); max-width: 52ch; }
+
+/* Verification panel (#677) */
+.vfy-actions { display: flex; align-items: center; gap: 8px; }
+.vfy-mode { max-width: 260px; }
+.vfy-livewarn { margin: 0 0 8px; color: var(--orange-2); }
+.vfy-results { display: flex; flex-direction: column; gap: 8px; }
+.vfy-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.vfy-explain-pre { max-height: 50vh; overflow-y: auto; }
 .stg-code {
   font-family: var(--f-mono); font-size: 11.5px; color: var(--ink-2);
   background: var(--surface-3); border-radius: 4px; padding: 7px 10px;

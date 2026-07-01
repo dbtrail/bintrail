@@ -81,6 +81,12 @@ type Config struct {
 	// where the trigger endpoint refuses with 403 and /api/capabilities reports
 	// baseline_trigger:false. Set together with MonitorCtrl (both control-plane).
 	BaselineCtrl BaselineController
+	// VerifyCtrl runs bintrail verify's engine in-process for a monitored
+	// server (#677). Wired in ONLY by `bintrail-console watch` when the
+	// operator opts in (BINTRAIL_CONSOLE_VERIFY_TRIGGER=1); nil otherwise,
+	// where the trigger endpoint refuses with 403 and /api/capabilities reports
+	// verify_trigger:false. Set together with MonitorCtrl (both control-plane).
+	VerifyCtrl VerifyController
 	// BaselineDir / BaselineS3 enable point-in-time reconstruct (Phase 2) on
 	// the boot entry. When either is set (and no RBAC profile is active), the
 	// "Reconstruct" surface is exposed. BaselineDir takes precedence;
@@ -140,6 +146,9 @@ type Server struct {
 	// baselineCtrl: non-nil only when the watch daemon opted into in-process
 	// baseline creation (see Config.BaselineCtrl).
 	baselineCtrl BaselineController
+	// verifyCtrl: non-nil only when the watch daemon opted into in-process
+	// verify runs (see Config.VerifyCtrl).
+	verifyCtrl VerifyController
 	// rotationDefaults are the daemon's --rotate-* values, the fallback GET
 	// /api/rotation reports when no console override is saved.
 	rotationDefaults RotationDefaults
@@ -253,6 +262,7 @@ func New(cfg Config) (*Server, error) {
 		allowedHosts:     cfg.AllowedHosts,
 		monitorCtrl:      cfg.MonitorCtrl,
 		baselineCtrl:     cfg.BaselineCtrl,
+		verifyCtrl:       cfg.VerifyCtrl,
 		rotationDefaults: cfg.RotationDefaults,
 		cm:               newConnManager(cfg.Registry, profileActive),
 		authPath:         authPath,
@@ -306,6 +316,22 @@ func (s *Server) resolveOr(w http.ResponseWriter, r *http.Request) *bundle {
 	return nil
 }
 
+// selectedEntry returns the registry entry behind the request's effective
+// server selection (header, or the default when absent), for capability
+// hints that need registry-only fields (e.g. SourceDSN) a bundle doesn't
+// carry. False for the boot entry (not in the registry) or an unresolvable
+// selection — callers must treat that as "no hint available", not an error.
+func (s *Server) selectedEntry(r *http.Request) (ServerEntry, bool) {
+	id := r.Header.Get(serverHeader)
+	if id == "" {
+		id = s.cm.defaultID()
+	}
+	if id == "" || id == bootServerID {
+		return ServerEntry{}, false
+	}
+	return s.cm.reg.Get(id)
+}
+
 // buildHandler wires the route tree and middleware chain:
 //   - host guard on EVERY request (DNS-rebinding defense)
 //   - three static security headers on every response
@@ -347,6 +373,9 @@ func (s *Server) buildHandler() http.Handler {
 	// (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1). GET polls the running/last state.
 	api.HandleFunc("POST /api/servers/{id}/baseline", s.handleBaselineTrigger)
 	api.HandleFunc("GET /api/servers/{id}/baseline", s.handleBaselineStatus)
+	api.HandleFunc("POST /api/servers/{id}/verify", s.handleVerifyTrigger)
+	api.HandleFunc("GET /api/servers/{id}/verify", s.handleVerifyStatus)
+	api.HandleFunc("GET /api/servers/{id}/verify/explain", s.handleVerifyExplain)
 	// Global built-in-rotation policy: read the effective settings; PUT an
 	// override (refused on the read-only console — only the watch daemon runs
 	// the loop that consumes it).

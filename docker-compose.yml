@@ -259,6 +259,16 @@ services:
       # volume.
       BINTRAIL_CONSOLE_BASELINE_TRIGGER: ${BASELINE_TRIGGER:-1}
       BINTRAIL_CONSOLE_BASELINE_STAGING: /var/lib/bintrail/baseline-staging
+      # "Run verification" button (#677): lets the console run `bintrail verify`
+      # in-process for a monitored server (trigger, poll per-table results,
+      # explain a mismatch) — the same read-only baseline/index reads the
+      # console already does for Reconstruct, no subprocess and no live-source
+      # read in its default (baseline-anchored) mode. Lower risk than the
+      # Create-baseline button above, so it defaults ON without an opt-in
+      # period; set VERIFY_TRIGGER=0 in .env to disable. A server still needs
+      # a baseline dir/S3 configured (baseline-anchored) or a source DSN
+      # (live-source) before the button does anything.
+      BINTRAIL_CONSOLE_VERIFY_TRIGGER: ${VERIFY_TRIGGER:-1}
       # Password login (persists next to the registry). On first run the
       # console serves a "create your password" screen; later visits sign in.
       # There is deliberately NO password env var: docker inspect must never

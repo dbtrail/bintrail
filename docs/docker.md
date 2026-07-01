@@ -274,6 +274,12 @@ set `BASELINE_TRIGGER=0` in `.env` to disable it. The button still needs a
 source DSN and a baseline dir/S3 configured on the server before it does
 anything.
 
+The same Storage page also has a **Verification** panel (also on by default;
+`VERIFY_TRIGGER=0` in `.env` to disable) that runs `bintrail verify` in-process
+for the selected server — trigger a run, watch per-table match/mismatch/
+inconclusive results land, and drill into a mismatch — see
+[console.md](console.md#running-verification-from-the-console).
+
 Notes:
 
 - The dump uses mydumper light locking (`--sync-thread-lock-mode NO_LOCK
@@ -372,6 +378,7 @@ surface, use the demo image ([demo.md](./demo.md)).
 | `BASELINE_SCHEMAS` | compose `baseline` profile | Comma-separated schemas to snapshot (default: `SCHEMAS`; empty = all user schemas, system schemas excluded) |
 | `BASELINE_DIR` | compose (optional) | Baseline dir for the boot `SOURCE_DSN` entry — set `/var/lib/bintrail/baselines` after the first `baseline` profile run to enable Time-travel on it. Also enables full-table `_snapshot.*` on the `flashback` profile shim |
 | `BASELINE_TRIGGER` | compose (optional) | Enables the console's in-process **Create baseline** button (dump→convert→upload) for a monitored server; **on by default** — set `BASELINE_TRIGGER=0` to disable |
+| `VERIFY_TRIGGER` | compose (optional) | Enables the console's Storage **Verification** panel (runs `bintrail verify` in-process) for a monitored server; **on by default** — set `VERIFY_TRIGGER=0` to disable |
 | `SHIM_USER` | compose `flashback` profile | Login the time-travel `mysql` terminal authenticates with (required to start the `shim` service) |
 | `SHIM_PASSWORD` | compose `flashback` profile | Cleartext password for `SHIM_USER` (required) |
 | `SHIM_AUTH_METHOD` | compose `flashback` profile (optional) | Client auth plugin for the shim (default `mysql_native_password`; set `caching_sha2_password` for drivers that require it) |

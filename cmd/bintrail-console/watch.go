@@ -86,6 +86,12 @@ var (
 	// upBaselineStageDir is the local staging base for S3-destined baselines
 	// (BINTRAIL_CONSOLE_BASELINE_STAGING); default a temp subdir.
 	upBaselineStageDir string
+	// upConsoleVerifyTrigger opts into in-process bintrail verify runs from the
+	// console (#677). Env-only (BINTRAIL_CONSOLE_VERIFY_TRIGGER=1) — off by
+	// default for a bare `watch` invocation; unlike baseline-trigger it starts
+	// no subprocess and reads no live source in its default (baseline-anchored)
+	// mode, so the bundled compose stack defaults it ON (see docker-compose.yml).
+	upConsoleVerifyTrigger bool
 
 	upRotateRetain    string
 	upRotateInterval  string
@@ -367,6 +373,9 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir())
 	}
+	if upConsoleVerifyTrigger {
+		cfg.VerifyCtrl = newVerifySupervisor(ctx)
+	}
 
 	// Built-in rotation covers the boot index plus every per-source database
 	// the control plane provisions — the unattended quickstart's real data
@@ -473,6 +482,9 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	cfg.MonitorCtrl = supervisor
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir())
+	}
+	if upConsoleVerifyTrigger {
+		cfg.VerifyCtrl = newVerifySupervisor(ctx)
 	}
 
 	// Built-in rotation: boot index + every per-source database the control
@@ -641,6 +653,10 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 	}
 	if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_STAGING"); v != "" {
 		upBaselineStageDir = v
+	}
+	// Verify trigger is env-only (no flag), same shape as baseline trigger.
+	if v := os.Getenv("BINTRAIL_CONSOLE_VERIFY_TRIGGER"); v == "1" || v == "true" {
+		upConsoleVerifyTrigger = true
 	}
 }
 

@@ -1,0 +1,456 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/go-sql-driver/mysql"
+
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/parquetquery"
+	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/verify"
+)
+
+// verifySupervisor implements console.VerifyController by running
+// internal/verify's engine IN-PROCESS, one table at a time in a background
+// goroutine — the same functions internal/cli/verify.go calls, looped here
+// instead of printed (#677). It is fully self-sufficient like
+// baselineSupervisor: it opens its own index/source connections per run
+// rather than reaching into the console's per-server bundle, so it needs
+// nothing from internal/console beyond the DTOs/interface it implements.
+//
+// One job at a time per server, tracked in-memory — like baseline, the
+// durable record (when there is one) is the baseline snapshots themselves;
+// a verify run's result has no artifact of its own, so a console restart
+// loses it (mirrors BaselineStatus's "idle if never run in this process").
+type verifySupervisor struct {
+	ctx context.Context // daemon lifecycle; cancels an in-flight run on shutdown
+
+	mu   sync.Mutex
+	jobs map[string]*verifyJob
+}
+
+// verifyJob is the mutable per-server job state: the pollable status PLUS the
+// bookkeeping Explain needs that must never reach the wire — the exact
+// BaselinePair each mismatched table was verified against, and enough of the
+// request to reopen a connection on demand. Re-deriving the pair via a fresh
+// FindBaselinePair at explain time would risk explaining a DIFFERENT pair
+// than the one the displayed verdict came from, if a new baseline landed
+// in between (see internal/verify.FindBaselinePair's doc comment).
+type verifyJob struct {
+	status console.VerifyStatus
+	mode   console.VerifyMode
+
+	indexDSN  string
+	noArchive bool
+
+	// pairs caches the BaselinePair behind every table this run reported as a
+	// mismatch, keyed "schema.table". Only populated for baseline-anchored
+	// runs (live-source has no explain support in the engine).
+	pairs map[string]verify.BaselinePair
+}
+
+// newVerifySupervisor builds a supervisor bound to the daemon context.
+func newVerifySupervisor(ctx context.Context) *verifySupervisor {
+	return &verifySupervisor{ctx: ctx, jobs: make(map[string]*verifyJob)}
+}
+
+// Trigger starts a verify run in the background; returns
+// console.ErrVerifyRunning if one is already in flight for this server.
+func (s *verifySupervisor) Trigger(req console.VerifyRequest) error {
+	s.mu.Lock()
+	if j, ok := s.jobs[req.ServerID]; ok && j.status.State == "running" {
+		s.mu.Unlock()
+		return console.ErrVerifyRunning
+	}
+	baselineSrc := req.BaselineDir
+	if baselineSrc == "" {
+		baselineSrc = req.BaselineS3
+	}
+	s.jobs[req.ServerID] = &verifyJob{
+		status:    console.VerifyStatus{State: "running", Mode: req.Mode, Since: nowStamp()},
+		mode:      req.Mode,
+		indexDSN:  req.IndexDSN,
+		noArchive: req.NoArchive,
+	}
+	s.mu.Unlock()
+
+	slog.Info("verify: starting in-process run", "server", req.ServerName, "id", req.ServerID, "mode", req.Mode)
+	go s.run(req, baselineSrc)
+	return nil
+}
+
+// Status returns a copy of the latest known run state (idle if never run here).
+func (s *verifySupervisor) Status(serverID string) console.VerifyStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if j, ok := s.jobs[serverID]; ok {
+		return j.status
+	}
+	return console.VerifyStatus{State: "idle"}
+}
+
+// Explain re-runs the row-level drill-down for one table the last completed
+// baseline-anchored run reported as a mismatch, using the EXACT BaselinePair
+// that run verified — never a freshly re-derived one (see verifyJob's doc
+// comment). It opens its own short-lived index connection: the triggering
+// run's connection is already closed by the time an operator clicks Explain.
+func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.VerifyExplanation, error) {
+	s.mu.Lock()
+	j, ok := s.jobs[serverID]
+	s.mu.Unlock()
+	if !ok || j.mode != console.VerifyModeBaselineAnchored {
+		return nil, console.ErrExplainUnavailable
+	}
+	pair, ok := j.pairs[schema+"."+table]
+	if !ok {
+		return nil, console.ErrExplainUnavailable
+	}
+
+	db, err := config.Connect(j.indexDSN)
+	if err != nil {
+		return nil, fmt.Errorf("connect index: %w", err)
+	}
+	defer db.Close()
+	resolver, err := metadata.NewResolver(db, 0)
+	if err != nil {
+		return nil, fmt.Errorf("load schema snapshot: %w", err)
+	}
+	// The pair already carries the resolved Prev/New Parquet paths — no need
+	// to re-resolve a baseline source dir/S3 prefix here.
+	cfg := verify.BaselineConfig{
+		IndexDB: db, Resolver: resolver, IndexDBName: indexDBName(j.indexDSN),
+		NoArchive: j.noArchive, ArchiveFetcher: parquetquery.Fetch,
+	}
+
+	ex, err := verify.ExplainBaselinePairMismatch(s.ctx, cfg, pair)
+	if err != nil {
+		return nil, fmt.Errorf("explain %s.%s: %w", schema, table, err)
+	}
+
+	var buf bytes.Buffer
+	ex.Write(&buf)
+	diffs := make([]console.VerifyRowDiff, len(ex.Diffs))
+	for i, d := range ex.Diffs {
+		cells := make([]console.VerifyCellDiff, len(d.Cells))
+		for j, c := range d.Cells {
+			cells[j] = console.VerifyCellDiff{Column: c.Column, Recovery: c.Recovery, Baseline: c.Baseline}
+		}
+		diffs[i] = console.VerifyRowDiff{PK: d.PK, Kind: d.Kind, Cells: cells}
+	}
+	return &console.VerifyExplanation{
+		Schema: ex.Schema, Table: ex.Table, Anchor: ex.Anchor,
+		Total: ex.Total, Diffs: diffs, Rendered: buf.String(),
+	}, nil
+}
+
+// run drives the verify engine to completion and publishes the final state.
+// Per-table results are appended as each table completes (see appendResult)
+// so Status polls see progress mid-run — internal/verify has no progress
+// callback of its own; this loop IS the streaming.
+func (s *verifySupervisor) run(req console.VerifyRequest, baselineSrc string) {
+	db, err := config.Connect(req.IndexDSN)
+	if err != nil {
+		s.finish(req.ServerID, fmt.Errorf("connect index: %w", err))
+		return
+	}
+	defer db.Close()
+	resolver, err := metadata.NewResolver(db, 0)
+	if err != nil {
+		// Hard requirement, no fallback — mirrors internal/cli/verify.go: a
+		// missing schema snapshot means verify cannot resolve primary keys.
+		s.finish(req.ServerID, fmt.Errorf("load schema snapshot (run `bintrail snapshot`): %w", err))
+		return
+	}
+	dbName := indexDBName(req.IndexDSN)
+
+	var runErr error
+	switch req.Mode {
+	case console.VerifyModeLiveSource:
+		runErr = s.runLiveSource(req, db, resolver, dbName)
+	default:
+		runErr = s.runBaselineAnchored(req, baselineSrc, db, resolver, dbName)
+	}
+	s.finish(req.ServerID, runErr)
+}
+
+func (s *verifySupervisor) runBaselineAnchored(req console.VerifyRequest, baselineSrc string, indexDB *sql.DB, resolver *metadata.Resolver, dbName string) error {
+	ctx := s.ctx
+	pairs, unpaired, prevOnly, err := verify.FindBaselinePair(ctx, baselineSrc)
+	if err != nil {
+		return fmt.Errorf("list baselines: %w", err)
+	}
+	if len(pairs) == 0 && len(unpaired) == 0 {
+		any, err := verify.AnyBaseline(ctx, baselineSrc)
+		if err != nil {
+			return fmt.Errorf("list baselines: %w", err)
+		}
+		if !any {
+			return fmt.Errorf("no baselines found under the configured baseline destination")
+		}
+		s.setNote(req.ServerID, "only one baseline exists for this server yet — nothing to compare")
+		return nil
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Schema != pairs[j].Schema {
+			return pairs[i].Schema < pairs[j].Schema
+		}
+		return pairs[i].Table < pairs[j].Table
+	})
+
+	filter, seen := tableFilter(req.Tables)
+	cfg := verify.BaselineConfig{
+		IndexDB: indexDB, Resolver: resolver, IndexDBName: dbName,
+		NoArchive: req.NoArchive, ArchiveFetcher: parquetquery.Fetch,
+	}
+
+	for _, p := range pairs {
+		key := p.Schema + "." + p.Table
+		if filter != nil && !filter[key] {
+			continue
+		}
+		delete(seen, key)
+		res, err := verify.VerifyBaselinePair(ctx, cfg, p)
+		if err != nil {
+			res = verify.TableResult{Schema: p.Schema, Table: p.Table, Status: verify.StatusError, Detail: err.Error()}
+		}
+		if res.Status == verify.StatusMismatch {
+			s.cachePair(req.ServerID, key, p)
+		}
+		s.appendResult(req.ServerID, toWireResult(res, res.Status == verify.StatusMismatch))
+	}
+	for _, st := range unpaired {
+		key := st.Schema + "." + st.Table
+		if filter != nil && !filter[key] {
+			continue
+		}
+		delete(seen, key)
+		s.appendResult(req.ServerID, console.VerifyTableResult{
+			Schema: st.Schema, Table: st.Table, Status: string(verify.StatusInconclusive),
+			Detail: "new since the previous baseline — no predecessor image to reconstruct from",
+		})
+	}
+	for _, st := range prevOnly {
+		key := st.Schema + "." + st.Table
+		if filter != nil && !filter[key] {
+			continue
+		}
+		delete(seen, key)
+		s.appendResult(req.ServerID, console.VerifyTableResult{
+			Schema: st.Schema, Table: st.Table, Status: string(verify.StatusInconclusive),
+			Detail: "absent from the newest baseline (dropped, or the newest baseline was a --tables subset)",
+		})
+	}
+	for key := range seen {
+		schema, table, _ := strings.Cut(key, ".")
+		s.appendResult(req.ServerID, console.VerifyTableResult{
+			Schema: schema, Table: table, Status: string(verify.StatusError),
+			Detail: "requested via the tables filter but not present in the latest baseline pair",
+		})
+	}
+	return nil
+}
+
+func (s *verifySupervisor) runLiveSource(req console.VerifyRequest, indexDB *sql.DB, resolver *metadata.Resolver, dbName string) error {
+	ctx := s.ctx
+	sourceDB, err := config.Connect(req.SourceDSN)
+	if err != nil {
+		return fmt.Errorf("connect source: %w", err)
+	}
+	defer sourceDB.Close()
+
+	tables, err := liveSourceTargetTables(ctx, indexDB, req.Tables)
+	if err != nil {
+		return fmt.Errorf("resolve target tables: %w", err)
+	}
+
+	baselineSrc := req.BaselineDir
+	if baselineSrc == "" {
+		baselineSrc = req.BaselineS3
+	}
+	cfg := verify.Config{
+		SourceDB: sourceDB, IndexDB: indexDB, Resolver: resolver,
+		BaselineSource: baselineSrc, IndexDBName: dbName,
+		NoArchive: req.NoArchive, ArchiveFetcher: parquetquery.Fetch,
+	}
+	for _, st := range tables {
+		res, err := verify.VerifyTable(ctx, cfg, st.Schema, st.Table)
+		if err != nil {
+			res = verify.TableResult{Schema: st.Schema, Table: st.Table, Status: verify.StatusError, Detail: err.Error()}
+		}
+		// Live-source mismatches have no explain support in the engine.
+		s.appendResult(req.ServerID, toWireResult(res, false))
+	}
+	return nil
+}
+
+// liveSourceTargetTables mirrors internal/cli/verify.go's unexported
+// verifyTargetTables: an explicit --tables-style filter, or every table in
+// the latest schema snapshot. No new internal/verify logic — this is the same
+// small orchestration query the CLI runs, kept local since the CLI's helper
+// isn't exported.
+func liveSourceTargetTables(ctx context.Context, indexDB *sql.DB, tables []string) ([]query.SchemaTable, error) {
+	if len(tables) > 0 {
+		out := make([]query.SchemaTable, 0, len(tables))
+		for _, t := range tables {
+			schema, table, ok := strings.Cut(t, ".")
+			if !ok {
+				return nil, fmt.Errorf("invalid table filter %q (want schema.table)", t)
+			}
+			out = append(out, query.SchemaTable{Schema: schema, Table: table})
+		}
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].Schema != out[j].Schema {
+				return out[i].Schema < out[j].Schema
+			}
+			return out[i].Table < out[j].Table
+		})
+		return out, nil
+	}
+	rows, err := indexDB.QueryContext(ctx,
+		`SELECT DISTINCT schema_name, table_name FROM schema_snapshots
+		 WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM schema_snapshots)
+		 ORDER BY schema_name, table_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []query.SchemaTable
+	for rows.Next() {
+		var st query.SchemaTable
+		if err := rows.Scan(&st.Schema, &st.Table); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// tableFilter builds a lookup set from a "schema.table" list (nil filter = no
+// restriction) plus a mutable "seen" copy the caller deletes from as each
+// entry is matched — whatever remains at the end was requested but never
+// found, mirroring the CLI's --tables-not-present-in-pair StatusError.
+func tableFilter(tables []string) (filter map[string]bool, seen map[string]bool) {
+	if len(tables) == 0 {
+		return nil, nil
+	}
+	filter = make(map[string]bool, len(tables))
+	seen = make(map[string]bool, len(tables))
+	for _, t := range tables {
+		filter[t] = true
+		seen[t] = true
+	}
+	return filter, seen
+}
+
+func toWireResult(res verify.TableResult, explainable bool) console.VerifyTableResult {
+	return console.VerifyTableResult{
+		Schema: res.Schema, Table: res.Table, Status: string(res.Status), Detail: res.Detail,
+		SourceRows: res.SourceRows, ReconstructRows: res.ReconstructRows, Anchor: res.Anchor,
+		Explainable: explainable,
+	}
+}
+
+// appendResult publishes one table's outcome under the job lock, so a
+// concurrent Status() poll sees it immediately — the "as they land" progress
+// #677 asks for.
+func (s *verifySupervisor) appendResult(serverID string, tr console.VerifyTableResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[serverID]
+	if !ok {
+		return // job was cleared out from under us; drop (defensive, shouldn't happen)
+	}
+	j.status.Results = append(j.status.Results, tr)
+	switch verify.Status(tr.Status) {
+	case verify.StatusMatch:
+		j.status.Summary.Match++
+	case verify.StatusMismatch:
+		j.status.Summary.Mismatch++
+	case verify.StatusInconclusive:
+		j.status.Summary.Inconclusive++
+	default:
+		j.status.Summary.Error++
+	}
+}
+
+// cachePair records the BaselinePair behind a mismatched table for a later
+// on-demand Explain call. Must be called before appendResult's status update
+// is polled by a racing Explain — both are under s.mu, and cachePair always
+// runs first in the caller, so a client can never observe Explainable:true
+// before the pair is actually cached.
+func (s *verifySupervisor) cachePair(serverID, key string, p verify.BaselinePair) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[serverID]
+	if !ok {
+		return
+	}
+	if j.pairs == nil {
+		j.pairs = make(map[string]verify.BaselinePair)
+	}
+	j.pairs[key] = p
+}
+
+// setNote records a benign informational message for the run (e.g. "only one
+// baseline yet") and marks it succeeded — this is not a failure.
+func (s *verifySupervisor) setNote(serverID, note string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[serverID]
+	if !ok {
+		return
+	}
+	j.status.State = "succeeded"
+	j.status.Note = note
+	j.status.FinishedAt = nowStamp()
+}
+
+// finish marks a run's terminal state. err (from the run's own setup, e.g. a
+// connect failure) fails the whole run; per-table failures never reach here —
+// they are recorded as StatusError results by appendResult instead, exactly
+// like internal/cli/verify.go's per-table error isolation.
+func (s *verifySupervisor) finish(serverID string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[serverID]
+	if !ok {
+		j = &verifyJob{status: console.VerifyStatus{}}
+		s.jobs[serverID] = j
+	}
+	if j.status.State == "succeeded" {
+		return // setNote already finalized this run (the one-baseline no-op path)
+	}
+	j.status.FinishedAt = nowStamp()
+	if err != nil {
+		j.status.State = "failed"
+		j.status.LastError = err.Error()
+		slog.Error("verify: run failed", "server", serverID, "error", err)
+		return
+	}
+	j.status.State = "succeeded"
+	slog.Info("verify: run complete", "server", serverID,
+		"match", j.status.Summary.Match, "mismatch", j.status.Summary.Mismatch,
+		"inconclusive", j.status.Summary.Inconclusive, "error", j.status.Summary.Error)
+}
+
+// indexDBName extracts the database name from an index DSN, mirroring
+// internal/cli/verify.go's own tolerant handling: a parse failure just leaves
+// it empty rather than failing the run (IndexDBName is used for planner
+// diagnostics, not correctness).
+func indexDBName(dsn string) string {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return ""
+	}
+	return cfg.DBName
+}

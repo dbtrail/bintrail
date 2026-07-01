@@ -63,8 +63,21 @@ type capabilitiesResponse struct {
 	// the console (the watch daemon opted in with BINTRAIL_CONSOLE_BASELINE_TRIGGER=1).
 	// Process-global, like Monitor — the endpoint does the per-server validation
 	// (source + baseline destination configured).
-	BaselineTrigger bool         `json:"baseline_trigger"`
-	Auth            authCapsInfo `json:"auth"`
+	BaselineTrigger bool `json:"baseline_trigger"`
+	// VerifyTrigger: this process can run bintrail verify in-process from the
+	// console (the watch daemon opted in with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1).
+	// Process-global, like BaselineTrigger — the endpoint does the per-server/
+	// per-mode validation.
+	VerifyTrigger bool `json:"verify_trigger"`
+	// Verify: baseline-anchored verify is usable for the SELECTED server — a
+	// baseline destination is configured, mirroring Reconstruct's gate (both
+	// read baseline state with no RBAC redaction, so an active profile also
+	// forces this false — see rbacActive() below). Per-server.
+	Verify bool `json:"verify"`
+	// VerifyLiveSource: live-source verify is additionally usable — the
+	// selected server also has a source DSN configured. Per-server.
+	VerifyLiveSource bool         `json:"verify_live_source"`
+	Auth             authCapsInfo `json:"auth"`
 	// Source names the selected server's source database family — "postgresql"
 	// or "mysql" — derived per-server from stream_state.flavor (the same field
 	// DialectForIndex reads). It drives source-aware PRESENTATION only: the
@@ -104,6 +117,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	resp := capabilitiesResponse{
 		Monitor:         s.monitorCtrl != nil,
 		BaselineTrigger: s.baselineCtrl != nil,
+		VerifyTrigger:   s.verifyCtrl != nil,
 		// recover-cascade is the free tier (like recover) and process-global, gated
 		// only by the RBAC profile (which would make synthesis leak redacted data).
 		RecoverCascade: !s.rbacActive(),
@@ -118,6 +132,15 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// capability can't over-promise (handler builds the provider only when both
 		// a baseline source and a resolver are present).
 		resp.RecoverCascadeBaseline = b.baselineConfigured && b.resolver != nil
+		// Verify's engine (baseline-anchored and live-source alike) carries no RBAC
+		// redaction — see verify_trigger.go — so an active profile forces both
+		// false here exactly as it forces Reconstruct false via baselineConfigured.
+		if s.verifyCtrl != nil && !s.rbacActive() {
+			resp.Verify = b.baselineSrc != ""
+			if e, ok := s.selectedEntry(r); ok {
+				resp.VerifyLiveSource = e.SourceDSN != ""
+			}
+		}
 		// Per-server source family, read from this index's stream_state.flavor.
 		// DialectForIndex is nil-safe and legacy-tolerant (any read error → MySQL),
 		// so a pre-flavor index simply presents as MySQL.

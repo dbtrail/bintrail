@@ -1576,6 +1576,7 @@ function buildStorage(serversRes, rotation, storage, baselines) {
   const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
   grid.append(archivingPanel(servers, serversErr));
   grid.append(baselinesPanel(baselines, servers));
+  grid.append(verifyPanel(servers));
   v.append(grid);
   viewEnter();
 }
@@ -1785,6 +1786,187 @@ async function pollBaseline(id) {
   }
   return null;
 }
+
+// verifyPanel (#677): trigger/poll/explain the recovery-chain verification
+// engine (`bintrail verify`) for the selected server. Mirrors baselinesPanel's
+// structure — its own capability gate (verify_trigger, process-global, like
+// baseline_trigger) plus a per-server precondition (verify: a baseline is
+// configured; verify_live_source: a source DSN is also configured), both
+// re-enforced server-side so this gating is UX only.
+function verifyPanel(servers) {
+  const panel = el("section", { class: "ov-panel" });
+  const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
+  const head = el("div", { class: "ov-panel-head" }, el("h2", { class: "ov-panel-title", text: "Verification" }));
+  const list = el("div", { class: "stg-list vfy-list" });
+
+  if (!capsCache.verify_trigger) {
+    list.append(el("div", { class: "stg-empty" },
+      el("p", { class: "stg-empty-lead", text: "Verification from the console is not enabled." }),
+      el("p", { class: "stg-empty-sub", text:
+        "Start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 (the bundled compose stack enables this by default; set VERIFY_TRIGGER=0 in .env to disable)." })));
+    panel.append(head, list);
+    return panel;
+  }
+  if (!cur || !cur.id) {
+    list.append(el("div", { class: "ev-empty", text: "Select a server to run verification." }));
+    panel.append(head, list);
+    return panel;
+  }
+
+  const modeSel = el("select", { class: "select vfy-mode" },
+    el("option", { value: "baseline-anchored", text: "Baseline-anchored (drift-free)" }));
+  if (capsCache.verify_live_source) {
+    modeSel.append(el("option", { value: "live-source", text: "Live-source (reads the whole table)" }));
+  }
+  const warn = el("p", { class: "form-hint vfy-livewarn", hidden: true, text:
+    "Live-source reads the entire table off your live source at a consistent snapshot — this can take a while and adds load. Run it off-peak." });
+  modeSel.onchange = () => { warn.hidden = modeSel.value !== "live-source"; };
+
+  const results = el("div", { class: "vfy-results" });
+  const btn = el("button", { class: "btn btn-sm", type: "button", text: "Run verification" });
+  const configured = !!capsCache.verify;
+  btn.disabled = !configured;
+  btn.onclick = () => createVerify(cur.id, modeSel.value, btn, results);
+  head.append(el("div", { class: "vfy-actions" }, modeSel, btn));
+  panel.append(head);
+
+  if (!configured) {
+    list.append(el("div", { class: "stg-empty" },
+      el("p", { class: "stg-empty-lead", text: "No baseline configured for this server yet." }),
+      el("p", { class: "stg-empty-sub", text:
+        "Baseline-anchored verification compares the two most recent baseline snapshots. Set a baseline directory or S3 prefix (Manage servers → Edit → Advanced) and create at least two snapshots." })));
+  } else {
+    list.append(warn);
+    renderVerifyResults(results, null, cur.id);
+    list.append(results);
+  }
+  panel.append(list);
+  return panel;
+}
+
+// createVerify triggers an in-process verify run on the daemon for the
+// selected server, then polls until it finishes, updating resultsEl live
+// after every poll tick so results appear "as they land" (#677) — the engine
+// itself has no progress callback; the console's own poll loop is the only
+// source of incremental updates.
+async function createVerify(id, mode, btn, resultsEl) {
+  if (btn) { btn.disabled = true; btn.textContent = "Running…"; }
+  const restore = () => { if (btn) { btn.disabled = false; btn.textContent = "Run verification"; } };
+  let status;
+  try {
+    status = (await api("/api/servers/" + encodeURIComponent(id) + "/verify", { method: "POST", body: { mode } })).verify;
+  } catch (err) {
+    toast("Verify failed: " + ((err && err.message) || err));
+    restore();
+    return;
+  }
+  renderVerifyResults(resultsEl, status, id);
+  toast("Verification started…");
+  const done = await pollVerify(id, (st) => renderVerifyResults(resultsEl, st, id));
+  restore();
+  if (done && done.state === "succeeded") {
+    const s = done.summary || {};
+    toast(done.note || ("Verification complete: " + s.match + " match, " + s.mismatch + " mismatch, " +
+      s.inconclusive + " inconclusive, " + s.error + " error"));
+  } else if (done) {
+    toast("Verification failed: " + (done.last_error || "unknown error"));
+  } else {
+    toast("Verification still running — check back shortly.");
+  }
+}
+
+// pollVerify polls the per-server verify status until it leaves "running" (or
+// a ~20-minute cap), invoking onTick after every poll so the caller can
+// re-render mid-run progress. Returns the terminal status, or null if it
+// never settled within the cap. Transient poll errors are ignored and retried.
+async function pollVerify(id, onTick) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 600; i++) {
+    await sleep(2000);
+    let st;
+    try {
+      st = (await api("/api/servers/" + encodeURIComponent(id) + "/verify")).verify;
+    } catch (_) {
+      continue; // a blip mid-run shouldn't abort the wait
+    }
+    if (st && onTick) onTick(st);
+    if (st && st.state !== "running") return st;
+  }
+  return null;
+}
+
+const VFY_STATUS_CLASS = { match: "pass", mismatch: "fail", error: "fail", inconclusive: "warn" };
+const VFY_STATUS_MARK = { pass: "✓", fail: "✗", warn: "!" };
+
+// renderVerifyResults draws the current run's summary + per-table cards into
+// container, reusing the doctor preflight card styling (pass/fail/warn) since
+// both are "a list of named checks, each with a status and free-text detail".
+function renderVerifyResults(container, status, id) {
+  clear(container);
+  if (!status || status.state === "idle") {
+    container.append(el("div", { class: "ev-empty", text: "No verification run yet." }));
+    return;
+  }
+  const stateLabel = { running: "RUNNING", succeeded: "DONE", failed: "FAILED" }[status.state] || status.state.toUpperCase();
+  const summaryRow = el("div", { class: "vfy-summary" },
+    el("span", { class: "chip chip-mon", text: stateLabel }));
+  if (status.mode) summaryRow.append(el("span", { class: "stg-age", text: status.mode }));
+  const s = status.summary || {};
+  if (status.results && status.results.length) {
+    summaryRow.append(el("span", { class: "stg-age", text:
+      s.match + " match · " + s.mismatch + " mismatch · " + s.inconclusive + " inconclusive · " + s.error + " error" }));
+  }
+  container.append(summaryRow);
+  if (status.note) container.append(el("p", { class: "form-hint", text: status.note }));
+  if (status.last_error) container.append(el("p", { class: "form-msg err", text: status.last_error }));
+
+  const cards = el("div", { class: "doctor-cards" });
+  (status.results || []).forEach((r) => {
+    const cls = VFY_STATUS_CLASS[r.status] || "warn";
+    const card = el("div", { class: "doctor-card " + cls });
+    card.append(el("span", { class: "dc-mark", text: VFY_STATUS_MARK[cls] || "?" }));
+    const body = el("div", { class: "dc-body" },
+      el("div", { class: "dc-name", text: r.schema + "." + r.table + " — " + r.status + (r.detail ? " — " + r.detail : "") }));
+    if (r.explainable) {
+      const explainBtn = el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Explain" });
+      explainBtn.onclick = () => openVerifyExplain(id, r.schema, r.table);
+      body.append(explainBtn);
+    }
+    card.append(body);
+    cards.append(card);
+  });
+  container.append(cards);
+}
+
+// openVerifyExplain fetches and shows the row-level drill-down for one
+// mismatched table, re-using the modal chrome showRotationDialog established.
+async function openVerifyExplain(id, schema, table) {
+  let ex;
+  try {
+    ex = (await api("/api/servers/" + encodeURIComponent(id) + "/verify/explain" +
+      "?schema=" + encodeURIComponent(schema) + "&table=" + encodeURIComponent(table))).explain;
+  } catch (err) {
+    toast("Explain failed: " + ((err && err.message) || err));
+    return;
+  }
+  const mount = document.getElementById("modal");
+  const scrim = el("div", { class: "modal-scrim show" });
+  const modal = el("div", { class: "modal", role: "dialog", "aria-label": "Verify mismatch drill-down" });
+  const head = el("div", { class: "modal-head" });
+  head.append(el("h2", { class: "modal-title", text: "Mismatch: " + ex.schema + "." + ex.table }));
+  head.append(el("p", { class: "modal-desc", text: ex.total + " differing row(s) at " + ex.anchor }));
+  head.append(el("button", { class: "modal-x", type: "button", text: "✕", onclick: closeVerifyExplain }));
+  modal.append(head);
+  modal.append(el("pre", { class: "dc-rem vfy-explain-pre", text: ex.rendered }));
+  const foot = el("div", { class: "modal-foot" });
+  foot.append(el("button", { class: "btn btn-ghost", type: "button", text: "Close", onclick: closeVerifyExplain }));
+  modal.append(foot);
+  scrim.append(modal);
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) closeVerifyExplain(); });
+  mount.replaceChildren(scrim);
+}
+
+function closeVerifyExplain() { document.getElementById("modal").replaceChildren(); }
 
 // ── schemas / tables cascade ──────────────────────────────────────────────────
 

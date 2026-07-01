@@ -311,6 +311,44 @@ straight from the Storage page, and it only runs on the `watch` daemon:
 The button is hidden on the read-only `serve` console and whenever the trigger
 is disabled — the CLI/compose recipe in the empty state remains the
 always-available path.
+
+#### Running verification from the console
+
+The Storage page's **Verification** panel runs [`bintrail verify`](verify.md)
+in-process for the selected server — trigger a run, watch per-table results
+land as they complete, and drill into a mismatch — instead of only reading
+results a `verify` cron/CI run produced elsewhere:
+
+- Like the Create-baseline button, this only runs on the `watch` daemon; a
+  bare invocation needs `BINTRAIL_CONSOLE_VERIFY_TRIGGER=1`, while the bundled
+  compose stack enables it **by default** (`VERIFY_TRIGGER=0` in `.env` opts
+  out). Unlike baseline creation it starts no subprocess and, in its default
+  mode, reads no live source — the same in-process baseline/index reads the
+  console already does for Time-travel — so it skips the opt-in-then-flip
+  cycle baseline-trigger went through.
+- **Baseline-anchored** (the default) compares the two most recent baseline
+  snapshots, drift-free — no live source read. It needs a baseline
+  destination configured (same precondition as Time-travel) and at least two
+  snapshots; with only one, the run reports a benign "nothing to compare yet"
+  note rather than an error.
+- **Live-source** reconstructs each table to a consistent snapshot of the
+  actual source and compares — it needs the server's source DSN and reads the
+  *whole table* off production, so the panel warns to run it off-peak (see
+  [verify.md](verify.md)'s own warning). It only appears in the mode selector
+  when the server has a source DSN configured.
+- Per-table results are colored match / mismatch / inconclusive / error, the
+  same four outcomes `bintrail verify` reports. A mismatch found by a
+  baseline-anchored run gets an **Explain** button — an on-demand,
+  never-precomputed row-level drill-down (`--explain`'s console equivalent),
+  re-run only when clicked. Live-source mismatches have no explain support
+  (mirroring the CLI).
+- One run at a time per server (409 while one is in flight). Like baseline
+  jobs, a run's result lives only in the daemon's memory — restarting the
+  console loses it; there is no persisted run history.
+- Verify's baseline/live-source reads carry no RBAC redaction (like Time-travel's),
+  so the panel and its endpoints are unavailable whenever an RBAC profile
+  (`--profile`) is active.
+
 - **AWS credentials** — which ambient credential signals the daemon process
   can see: env keys (presence only, never values), `AWS_PROFILE`,
   `AWS_REGION`, a shared `~/.aws` config, ECS task-role / EKS IRSA markers.
@@ -363,6 +401,12 @@ always-available path.
   [docker.md](docker.md) — `BASELINE_TRIGGER=0` in `.env` opts out there).
 - `BINTRAIL_CONSOLE_BASELINE_STAGING` (`watch` only) — local staging dir for
   S3-destined baselines created by that button (default a temp subdir).
+- `BINTRAIL_CONSOLE_VERIFY_TRIGGER` (`watch` only) — `1`/`true` enables the
+  Storage page's **Verification** panel (runs `bintrail verify` in-process;
+  see [Running verification from the console](#running-verification-from-the-console)).
+  Off by default for a bare `watch` invocation; the bundled compose stack sets
+  this on by default (see [docker.md](docker.md) — `VERIFY_TRIGGER=0` in
+  `.env` opts out there).
 
 There is deliberately **no** environment variable for the password itself —
 env vars leak through `docker inspect`, `ps e`, and `/proc`; the password is
