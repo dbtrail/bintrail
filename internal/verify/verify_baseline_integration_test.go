@@ -800,3 +800,136 @@ func TestVerifyBaselinePair_TextOnlyChange_Match(t *testing.T) {
 		t.Fatalf("status = %q (%s); want match (TEXT body should decode to \"updated text\", matching the new baseline)", got.Status, got.Detail)
 	}
 }
+
+// TestVerifyBaselinePair_JSONValuedTextColumn_KeyOrderIsAMatch is a repro +
+// regression test for a user-reported false MISMATCH: a TEXT/LONGTEXT column
+// (not MySQL's native JSON type — e.g. a plugin storing json_encode()'d PHP
+// data, like the wp_aiowps_audit_log.details case reported live) whose stored
+// value happens to be valid JSON text.
+//
+// Root cause: indexer.marshalRow promotes ANY []byte value that is valid JSON
+// to json.RawMessage before writing binlog_events.row_after — regardless of
+// the column's declared SQL type — so this TEXT column's event image is
+// stored as a NESTED JSON object, not a quoted string (mirrored here by
+// writing `"details":{...}` directly rather than through the b64 TEXT path).
+// When verify reads it back, it decodes to map[string]any (Go maps have no
+// stable order); renderCell's default case re-marshals it via json.Marshal,
+// which ALWAYS sorts object keys alphabetically. The baseline (Parquet) side
+// renders the SAME logical value verbatim from its stored string, preserving
+// whatever key order the source originally serialized. isDeferredType("text")
+// is false by design (#672), so this never got the ENUM/JSON/binary
+// inconclusive downgrade either — two byte-different renderings of identical
+// data reported a hard MISMATCH.
+//
+// Fixed by renderCellCanonicalJSON: the baseline-anchored comparison
+// canonicalizes JSON object/array values on BOTH sides, so this now reports a
+// genuine StatusMatch — not merely "inconclusive". id=2 in the same table
+// proves the fix isn't a blanket "ignore JSON columns" — a GENUINE content
+// divergence in the same JSON-valued TEXT column must still surface as a real
+// mismatch.
+func TestVerifyBaselinePair_JSONValuedTextColumn_KeyOrderIsAMatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"id", "PRI", "int", "int", 1},
+		{"details", "", "text", "longtext", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'audit_log', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `audit_log` (\n  `id` INT NOT NULL,\n  `details` LONGTEXT,\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "details", MySQLType: "longtext", ParquetType: baseline.MysqlToParquetNode("longtext")},
+	}
+	// Both rows are NEW in this window — present only in the new baseline,
+	// exactly like a WordPress audit log's append-only inserts.
+	// id=1: same JSON content as its event, keys in a different order —
+	//       must resolve to a MATCH (the bug this test guards).
+	// id=2: GENUINELY different JSON content (known:true vs known:false) —
+	//       must still resolve to a MISMATCH (canonicalization must not mask
+	//       a real divergence).
+	writeTestBaseline(t, baseDir, prevTS, dbName, "audit_log", createSQL, cols, nil, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, dbName, "audit_log", createSQL, cols, [][]string{
+		{"1", `{"failed_login":{"imported":false,"username":"dbtrail-admin","known":true}}`},
+		{"2", `{"failed_login":{"imported":false,"username":"demo-bot","known":false}}`},
+	}, "binlog.000001", 300)
+
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+	ets := prevTS.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	// row_after embeds `details` as a NESTED JSON OBJECT (matching marshalRow's
+	// json.RawMessage promotion for any valid-JSON []byte, TEXT column or not).
+	// id=1: same logical value as the baseline, keys in a different order.
+	// id=2: a genuinely different "known" value — the baseline's "truth" wins,
+	//       so recovering this event's value must be reported as a mismatch.
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 250, ets, nil, dbName, "audit_log", 1 /*INSERT*/, "1", nil,
+		nil, []byte(`{"id":1,"details":{"failed_login":{"imported":false,"username":"dbtrail-admin","known":true}}}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 250, 300, ets, nil, dbName, "audit_log", 1 /*INSERT*/, "2", nil,
+		nil, []byte(`{"id":2,"details":{"failed_login":{"imported":false,"username":"demo-bot","known":true}}}`))
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
+	ctx := context.Background()
+	pairs, _, _, err := FindBaselinePair(ctx, baseDir)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
+	}
+
+	got, err := VerifyBaselinePair(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair: %v", err)
+	}
+	if got.Status != StatusMismatch {
+		t.Fatalf("precondition: id=2's genuine divergence must make this a mismatch, got %q (%s)", got.Status, got.Detail)
+	}
+
+	ex, err := ExplainBaselinePairMismatch(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("ExplainBaselinePairMismatch: %v", err)
+	}
+
+	var id1Diff, id2Diff *RowDiff
+	for i := range ex.Diffs {
+		switch ex.Diffs[i].PK {
+		case "id=1":
+			id1Diff = &ex.Diffs[i]
+		case "id=2":
+			id2Diff = &ex.Diffs[i]
+		}
+	}
+
+	// id=1 (key-order-only difference) must NOT appear in the diff: the fix.
+	if id1Diff != nil {
+		t.Errorf("id=1 (same JSON, different key order) should not appear in diffs — canonicalization should have matched it, got: %+v", *id1Diff)
+	}
+
+	// id=2 (genuine content divergence) must still be reported, with the
+	// baseline's real "known":false winning over the event's "known":true —
+	// proving canonicalization compares CONTENT, not just "is it JSON".
+	if id2Diff == nil {
+		t.Fatalf("id=2 (genuine known:true vs known:false divergence) must appear in diffs")
+	}
+	if id2Diff.Kind != diffChanged || len(id2Diff.Cells) != 1 || id2Diff.Cells[0].Column != "details" {
+		t.Fatalf("id=2 diff = %+v, want exactly one changed 'details' cell", *id2Diff)
+	}
+	if !strings.Contains(id2Diff.Cells[0].Recovery, `"known":true`) || !strings.Contains(id2Diff.Cells[0].Baseline, `"known":false`) {
+		t.Errorf("id=2 details cell = %+v, want recovery to carry known:true and baseline known:false", id2Diff.Cells[0])
+	}
+}

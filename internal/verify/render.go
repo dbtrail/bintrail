@@ -5,6 +5,7 @@
 package verify
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -123,4 +124,80 @@ func temporalPrecision(columnType string) int {
 		return 0
 	}
 	return n
+}
+
+// canonicalizeJSONContainer re-renders a JSON object/array value from its
+// decoded form, so two byte-different-but-semantically-equal serializations
+// of the same JSON content compare equal. Scoped to CONTAINERS ({...}/[...])
+// only — a scalar that happens to also be valid JSON (a bare number, "true",
+// or a quoted string) is left untouched, since key-order drift can only
+// happen inside an object; touching scalars would only add risk (whitespace/
+// escaping differences) for no benefit.
+//
+// This exists for one specific gap: a MySQL TEXT/LONGTEXT column (not the
+// native JSON type) whose stored value happens to be JSON text — a common
+// pattern for plugins that json_encode() into a text field. Once an event
+// touches such a row, its event-image round-trips through Go's
+// map[string]any (query.UnmarshalRowImage), which loses the original key
+// order; renderCell's default case then re-marshals it with Go's own
+// (alphabetically sorted) key order, while a baseline dump's text preserves
+// the source's original order verbatim. Two renderings of identical data
+// disagree on bytes alone. A column typed as MySQL's native JSON already has
+// a narrower version of this same gap, covered by isDeferredType's
+// inconclusive downgrade — this closes it more precisely, for the case
+// canonicalization can actually resolve to a genuine match rather than
+// merely downgrading to "can't tell": see renderCellCanonicalJSON.
+//
+// UseNumber preserves large-integer/decimal literals exactly, the same
+// precision requirement renderCell's json.Number case already protects
+// (#496). SetEscapeHTML(false) avoids gratuitously mangling '<'/'>'/'&' that
+// a human reading a mismatch cell would otherwise have to puzzle over.
+//
+// Returns the input unchanged with ok=false when b is not a JSON
+// object/array, or fails to parse.
+func canonicalizeJSONContainer(b []byte) ([]byte, bool) {
+	t := bytes.TrimSpace(b)
+	if len(t) == 0 || (t[0] != '{' && t[0] != '[') {
+		return b, false
+	}
+	if !json.Valid(t) {
+		return b, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(t))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return b, false
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return b, false
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), true
+}
+
+// renderCellCanonicalJSON renders a cell like renderCell, additionally
+// canonicalizing a JSON object/array value (see canonicalizeJSONContainer)
+// so a pure representation difference doesn't register as a content
+// difference.
+//
+// Used ONLY by the baseline-anchored comparison (VerifyBaselinePair,
+// ExplainBaselinePairMismatch): both operands there are produced by this
+// same package, so canonicalizing them symmetrically cannot introduce a new
+// disagreement. The live-source comparison (VerifyTable) keeps using
+// renderCell unwrapped — its OTHER operand is MySQL's own raw text via
+// internal/consistency.ConsistentTableChecksum, which this package does not
+// control and does not canonicalize; wrapping only one side there would
+// create a new mismatch instead of fixing one.
+func renderCellCanonicalJSON(v any, col metadata.ColumnMeta) []byte {
+	b := renderCell(v, col)
+	if b == nil {
+		return nil
+	}
+	if canon, ok := canonicalizeJSONContainer(b); ok {
+		return canon
+	}
+	return b
 }
