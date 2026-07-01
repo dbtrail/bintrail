@@ -241,6 +241,23 @@ func TestVerifyTrigger_requiresSourceForLiveSource(t *testing.T) {
 	}
 }
 
+// TestVerifyTrigger_liveSourceRequiresBaselineDestination: live-source mode
+// ALSO needs a baseline destination — internal/verify.VerifyTable still
+// reconstructs from baseline + deltas, so without one every table would
+// degrade to inconclusive only AFTER a full off-peak read of the live
+// table. A source DSN alone must not be enough to trigger it.
+func TestVerifyTrigger_liveSourceRequiresBaselineDestination(t *testing.T) {
+	srv, ctrl := newVerifyTriggerServer(t)
+	id := addVerifyEntry(t, srv, "u:p@tcp(127.0.0.1:3306)/", "", "")
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers/"+id+"/verify", `{"mode":"live-source"}`)
+	if rec.Code != 400 {
+		t.Fatalf("no baseline destination: code=%d, want 400", rec.Code)
+	}
+	if len(ctrl.triggered) != 0 {
+		t.Fatal("controller must not be triggered without a baseline destination, even in live-source mode")
+	}
+}
+
 // TestVerifyTrigger_unknownMode: an unrecognized mode string is 400, not
 // silently defaulted.
 func TestVerifyTrigger_unknownMode(t *testing.T) {

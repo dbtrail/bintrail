@@ -133,10 +133,14 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// a baseline source and a resolver are present).
 		resp.RecoverCascadeBaseline = b.baselineConfigured && b.resolver != nil
 		// Verify's engine (baseline-anchored and live-source alike) carries no RBAC
-		// redaction — see verify_trigger.go — so an active profile forces both
-		// false here exactly as it forces Reconstruct false via baselineConfigured.
+		// redaction — see verify_trigger.go — so this reuses baselineConfigured
+		// verbatim (not just b.baselineSrc != ""): that field already folds in
+		// !noArchive, and verify's own query.FetchMerged calls respect NoArchive
+		// too, so a no-archive server would otherwise advertise verify:true and
+		// then reliably fail with a coverage-gap error on any window touching a
+		// rotated-out hour — worse than just hiding it, like Reconstruct does.
 		if s.verifyCtrl != nil && !s.rbacActive() {
-			resp.Verify = b.baselineSrc != ""
+			resp.Verify = b.baselineConfigured
 			if e, ok := s.selectedEntry(r); ok {
 				resp.VerifyLiveSource = e.SourceDSN != ""
 			}

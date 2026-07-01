@@ -43,9 +43,15 @@ type verifySupervisor struct {
 // bookkeeping Explain needs that must never reach the wire — the exact
 // BaselinePair each mismatched table was verified against, and enough of the
 // request to reopen a connection on demand. Re-deriving the pair via a fresh
-// FindBaselinePair at explain time would risk explaining a DIFFERENT pair
-// than the one the displayed verdict came from, if a new baseline landed
-// in between (see internal/verify.FindBaselinePair's doc comment).
+// internal/verify.FindBaselinePair call at explain time would risk explaining
+// a DIFFERENT pair than the one the displayed verdict came from, if a new
+// baseline landed in between (FindBaselinePair always picks the two MOST
+// RECENT snapshots).
+//
+// Every field is read/written ONLY while holding verifySupervisor.mu — a
+// plain map (pairs) and a growing slice (status.Results) make an unlocked
+// read from one goroutine race a locked write from another (see Explain's
+// and appendResult's comments for the specific hazard this closes).
 type verifyJob struct {
 	status console.VerifyStatus
 	mode   console.VerifyMode
