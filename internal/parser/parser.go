@@ -125,7 +125,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 
 		switch ev := binlogEv.Event.(type) {
 		case *replication.GTIDEvent:
-			currentGTID = formatGTID(ev.SID, ev.GNO)
+			currentGTID = formatGTID(binlogEv.Header.EventType, ev.SID, ev.GNO)
 
 		case *replication.MariadbGTIDEvent:
 			// MariaDB source: the GTID arrives as domain-server-seq (e.g.
@@ -447,9 +447,17 @@ func ChangedColumns(before, after map[string]any) []string {
 }
 
 // formatGTID formats a MySQL GTID from the raw 16-byte server UUID (SID) and
-// the group number (GNO). Returns an empty string if SID is not 16 bytes
-// (GTID not enabled on the source server).
-func formatGTID(sid []byte, gno int64) string {
+// the group number (GNO). Returns an empty string when there is no real GTID
+// to report: eventType is ANONYMOUS_GTID_EVENT (gtid_mode=OFF still wraps
+// every transaction in this event; go-mysql decodes it into the same
+// GTIDEvent struct as a real GTID_EVENT, with a 16-zero-byte SID that would
+// otherwise pass the length check below and format into a fake-but-valid-
+// looking GTID, e.g. "00000000-0000-0000-0000-000000000000:0" — #678), or SID
+// is not 16 bytes.
+func formatGTID(eventType replication.EventType, sid []byte, gno int64) string {
+	if eventType == replication.ANONYMOUS_GTID_EVENT {
+		return ""
+	}
 	if len(sid) != 16 {
 		return ""
 	}

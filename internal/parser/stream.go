@@ -170,7 +170,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			if err := emitCommit(binlogEv.Header); err != nil {
 				return err
 			}
-			currentGTID = formatGTID(ev.SID, ev.GNO)
+			currentGTID = formatGTID(binlogEv.Header.EventType, ev.SID, ev.GNO)
 			if err := emitGTIDTracking(binlogEv.Header); err != nil {
 				return err
 			}

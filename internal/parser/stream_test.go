@@ -48,6 +48,19 @@ func makeGTIDEvent(gno int64) *replication.BinlogEvent {
 	}
 }
 
+// makeAnonymousGTIDEvent builds a BinlogEvent wrapping a GTIDEvent tagged as
+// ANONYMOUS_GTID_EVENT (gtid_mode=OFF) — the header EventType is what
+// distinguishes it from makeGTIDEvent's "real" GTID_EVENT; go-mysql decodes
+// both into the same GTIDEvent struct, with an all-zero SID for the anonymous
+// case, matching what the source actually sends on the wire (#678).
+func makeAnonymousGTIDEvent(gno int64) *replication.BinlogEvent {
+	sid := make([]byte, 16)
+	return &replication.BinlogEvent{
+		Header: &replication.EventHeader{EventType: replication.ANONYMOUS_GTID_EVENT},
+		Event:  &replication.GTIDEvent{SID: sid, GNO: gno},
+	}
+}
+
 // makeQueryEvent builds a BinlogEvent wrapping a QueryEvent.
 func makeQueryEvent(query string) *replication.BinlogEvent {
 	return &replication.BinlogEvent{
@@ -225,6 +238,29 @@ func TestStreamParser_gtidThenFilteredRows(t *testing.T) {
 	ev := <-out
 	if ev.EventType != EventGTID {
 		t.Errorf("expected EventGTID (%d), got %d", EventGTID, ev.EventType)
+	}
+}
+
+// TestStreamParser_anonymousGTIDEventEmitsNoTrackingEvent verifies that an
+// ANONYMOUS_GTID_LOG_EVENT (gtid_mode=OFF, still wraps every transaction) does
+// NOT emit an EventGTID tracking event — currentGTID must stay empty rather
+// than formatting the wire's zero SID into a fake GTID (#678). Contrast with
+// TestStreamParser_gtidEventEmitsTrackingEvent, which asserts exactly one
+// EventGTID for the real GTID_EVENT case.
+func TestStreamParser_anonymousGTIDEventEmitsNoTrackingEvent(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel, makeAnonymousGTIDEvent(0))
+
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+	if len(out) != 0 {
+		evs := drainAll(out)
+		t.Fatalf("expected no tracking event for an anonymous GTID, got %d: %+v", len(evs), evs)
 	}
 }
 

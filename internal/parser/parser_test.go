@@ -140,7 +140,7 @@ func TestBuildPKValues_emptyPKColumns(t *testing.T) {
 func TestFormatGTID_valid(t *testing.T) {
 	// UUID "3e11fa47-71ca-11e1-9e33-c80aa9429562", GNO=42
 	sid := []byte{0x3e, 0x11, 0xfa, 0x47, 0x71, 0xca, 0x11, 0xe1, 0x9e, 0x33, 0xc8, 0x0a, 0xa9, 0x42, 0x95, 0x62}
-	got := formatGTID(sid, 42)
+	got := formatGTID(replication.GTID_EVENT, sid, 42)
 	want := "3e11fa47-71ca-11e1-9e33-c80aa9429562:42"
 	if got != want {
 		t.Errorf("expected %q, got %q", want, got)
@@ -149,9 +149,22 @@ func TestFormatGTID_valid(t *testing.T) {
 
 func TestFormatGTID_shortSID(t *testing.T) {
 	// Fewer than 16 bytes → GTID not enabled → empty string.
-	got := formatGTID([]byte{0x01, 0x02}, 1)
+	got := formatGTID(replication.GTID_EVENT, []byte{0x01, 0x02}, 1)
 	if got != "" {
 		t.Errorf("expected empty string for short SID, got %q", got)
+	}
+}
+
+func TestFormatGTID_anonymousEvent(t *testing.T) {
+	// ANONYMOUS_GTID_LOG_EVENT (gtid_mode=OFF still wraps every transaction in
+	// this event; go-mysql decodes it into the same GTIDEvent struct as a real
+	// GTID_EVENT) must never format into a GTID, even with a well-formed
+	// 16-byte SID — #678: a 16-zero-byte SID was passing the length check and
+	// producing a fake-but-valid-looking GTID.
+	sid := []byte{0x3e, 0x11, 0xfa, 0x47, 0x71, 0xca, 0x11, 0xe1, 0x9e, 0x33, 0xc8, 0x0a, 0xa9, 0x42, 0x95, 0x62}
+	got := formatGTID(replication.ANONYMOUS_GTID_EVENT, sid, 0)
+	if got != "" {
+		t.Errorf("expected empty string for ANONYMOUS_GTID_EVENT, got %q", got)
 	}
 }
 
