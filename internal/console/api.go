@@ -115,10 +115,10 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 	// A PK or changed-column filter is only meaningful when scoped to one
 	// table; mirror the MCP/CLI validation so the index isn't scanned blindly.
 	if p.PK != "" && (p.Schema == "" || p.Table == "") {
-		return query.Options{}, errors.New("pk filter requires both schema and table")
+		return query.Options{}, errors.New("the PK filter needs both a schema and a table")
 	}
 	if p.ChangedColumn != "" && (p.Schema == "" || p.Table == "") {
-		return query.Options{}, errors.New("changed_column filter requires both schema and table")
+		return query.Options{}, errors.New("the changed-column filter needs both a schema and a table")
 	}
 
 	// Default to newest-first, the natural order for a browsing UI.
@@ -238,7 +238,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// Refuse to generate an undo script for the entire index; a recovery must
 	// be scoped to at least one schema.
 	if opts.Schema == "" {
-		writeJSONError(w, http.StatusBadRequest, "recover requires at least a schema filter")
+		writeJSONError(w, http.StatusBadRequest, "choose at least a schema to search")
 		return
 	}
 

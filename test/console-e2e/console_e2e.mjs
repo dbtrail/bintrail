@@ -246,7 +246,7 @@ try {
     if (okBox) { document.body.appendChild(okBox); okBorder = getComputedStyle(okBox).borderColor; okBox.remove(); }
     return {
       okGreenClass: !!okBox && okBox.classList.contains("ok-box"),
-      okGreenText: !!okBox && /No gaps in captured stream/.test(okBox.textContent) && /does not assert the stream is live/.test(okBox.textContent),
+      okGreenText: !!okBox && /No gaps in captured stream/.test(okBox.textContent) && /doesn't mean the stream is currently running/.test(okBox.textContent),
       okBorder,
       gapRed: !!gapBox && gapBox.classList.contains("error-box") && /permanently lost/i.test(gapBox.textContent),
       gapPrecedence: !!gapWins && gapWins.classList.contains("error-box"),
@@ -282,11 +282,11 @@ try {
     const shared = mk({ access_key_env: false, profile: "default", region_env: "", shared_config: true, container_creds: false, web_identity: false });
     const adv = none.querySelector("details.form-advanced");
     return {
-      noneSummary: /No static credentials configured/.test(none.textContent),
-      keysSummary: /Static access keys configured via environment/.test(keys.textContent),
-      ecsSummary: /ECS task role detected/.test(ecs.textContent),
-      irsaSummary: /EKS IRSA detected/.test(irsa.textContent),
-      sharedSummary: /shared ~\/\.aws config\/profile/.test(shared.textContent),
+      noneSummary: /No credentials set directly/.test(none.textContent),
+      keysSummary: /access keys set in an environment variable/.test(keys.textContent),
+      ecsSummary: /found an ECS task role/.test(ecs.textContent),
+      irsaSummary: /EKS service-account role/.test(irsa.textContent),
+      sharedSummary: /shared ~\/\.aws config file/.test(shared.textContent),
       hasDisclosure: !!adv,
       disclosureCollapsed: !!adv && !adv.open,
       hasToggle: !!none.querySelector("summary.form-adv-summary"),

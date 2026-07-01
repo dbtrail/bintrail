@@ -42,9 +42,9 @@ function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 const ROUTES = ["overview", "events", "timetravel", "recover", "status", "storage"];
 
 const MON_STATE_TITLES = {
-  failed: "stream failing — retrying with backoff; press Start for details",
-  stalled: "stream is connected but has made no progress for several minutes",
-  lost_position: "binlogs were purged past the saved position — events in the gap are permanently lost; current changes are still streaming",
+  failed: "connection is failing and retrying automatically; press Start for details",
+  stalled: "connected, but hasn't made progress for several minutes",
+  lost_position: "some old changes were deleted before dbtrail could capture them — those are permanently lost, but current changes are still being captured",
 };
 
 // Static decorative SVGs (module constants — parsed by svgEl via DOMParser).
@@ -277,7 +277,7 @@ function showLoginOverlay(opts) {
 
   if (!opts.passwordLogin) {
     panel.append(el("p", { class: "modal-desc", text: opts.message || "" }));
-    panel.append(el("p", { class: "modal-desc", text: "Open the access link printed by bintrail-console — it carries the token this page needs." }));
+    panel.append(el("p", { class: "modal-desc", text: "Open the link printed when bintrail-console started — it has the access token this page needs." }));
     scrim.append(panel);
     mount.replaceChildren(scrim);
     return;
@@ -337,7 +337,7 @@ async function submitSetup(form, msg) {
     return;
   }
   let data;
-  try { data = await res.json(); } catch (_) { loginMsg(msg, "Malformed response."); return; }
+  try { data = await res.json(); } catch (_) { loginMsg(msg, "Unexpected response from the server — try again."); return; }
   TOKEN = data.token || "";
   try { sessionStorage.setItem(TOKEN_KEY, TOKEN); } catch (_) {}
   unauthorizedHandled = false;
@@ -385,7 +385,7 @@ async function submitLogin(form, msg) {
     return;
   }
   let data;
-  try { data = await res.json(); } catch (_) { loginMsg(msg, "Malformed login response."); return; }
+  try { data = await res.json(); } catch (_) { loginMsg(msg, "Unexpected response from the server — try again."); return; }
   TOKEN = data.token || "";
   try { sessionStorage.setItem(TOKEN_KEY, TOKEN); } catch (_) {}
   unauthorizedHandled = false;
@@ -422,8 +422,8 @@ function showPasswordDialog() {
   const panel = el("div", { class: "modal login-panel", role: "dialog", "aria-label": "Console password" });
   panel.append(el("h2", { class: "modal-title", text: firstSet ? "Set console password" : "Change console password" }));
   panel.append(el("p", { class: "modal-desc", text: firstSet
-    ? "Enables username+password sign-in next to the access token."
-    : "Rotating the password signs out every other session." }));
+    ? "Lets you sign in with a username and password instead of just the access token."
+    : "Changing your password signs you out of every other open session." }));
 
   const form = el("form", { class: "login-form" });
   if (!firstSet) {
@@ -475,7 +475,7 @@ async function submitPasswordChange(form, msg, firstSet) {
     return;
   }
   let data;
-  try { data = await res.json(); } catch (_) { loginMsg(msg, "Malformed response."); return; }
+  try { data = await res.json(); } catch (_) { loginMsg(msg, "Unexpected response from the server — try again."); return; }
   // Every other session just died; this tab continues on the fresh one.
   TOKEN = data.token || TOKEN;
   try { sessionStorage.setItem(TOKEN_KEY, TOKEN); } catch (_) {}
@@ -743,7 +743,7 @@ function renderEvents(params) {
   // unexplained gap. capsCache.source is resolved before this paints.
   if (capsCache.source === "postgresql") {
     v.append(el("div", { class: "warn-item" }, icon("warn"),
-      el("span", { text: "Actor attribution (who-changed) is unavailable for PostgreSQL sources — the logical replication stream carries no backend connection id." })));
+      el("span", { text: "Who made each change isn't available for PostgreSQL sources — Postgres's replication stream doesn't include that information." })));
   }
 
   const form = el("form", { id: "ev-form" });
@@ -1122,7 +1122,7 @@ async function generateUndo(form) {
   const f = Object.fromEntries(new FormData(form).entries());
   const body = {};
   ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) body[k] = f[k].trim(); });
-  if (!body.schema) { renderError(out, "recover requires at least a schema filter"); return; }
+  if (!body.schema) { renderError(out, "Choose at least a schema to search."); return; }
   try {
     const data = await api("/api/recover", { method: "POST", body });
     if (gen !== serverGen) return;
@@ -1137,11 +1137,10 @@ async function generateUndo(form) {
       out.append(el("div", { class: "ctx-banner" },
         el("span", { class: "badge b-baseline", text: "CASCADE" }),
         el("div", { class: "ctx-main" },
-          el("span", { class: "ctx-eyebrow", text: "Foreign-key cascade detected — invisible children included" }),
+          el("span", { class: "ctx-eyebrow", text: "Also restoring rows that were deleted automatically along with this one" }),
           el("span", { class: "ctx-detail", text:
-            "this script also re-creates " + (data.victim_count || 0) + " cascade-deleted child row(s)" +
-            (data.set_null_count ? " and restores " + data.set_null_count + " SET NULL'd FK(s)" : "") +
-            " that InnoDB removed below the binlog" }))));
+            "this script also restores " + (data.victim_count || 0) + " related row(s) that MySQL deleted automatically" +
+            (data.set_null_count ? " and fixes " + data.set_null_count + " reference(s) that were cleared automatically" : "") }))));
     }
     const meta = data.cascade_detected
       ? data.statement_count + " statement(s) · " + (data.victim_count || 0) + " cascade child row(s) · " + (data.set_null_count || 0) + " SET NULL restore(s)"
@@ -1167,7 +1166,7 @@ function codePanel(sql, metaLabel) {
   return panel;
 }
 function copySQL() {
-  navigator.clipboard.writeText(lastSQL).then(() => toast("SQL copied to clipboard"), () => toast("copy failed"));
+  navigator.clipboard.writeText(lastSQL).then(() => toast("SQL copied to clipboard"), () => toast("Copy failed."));
 }
 function downloadSQL() { downloadBlob("dbtrail-undo.sql", lastSQL, "application/sql"); }
 
@@ -1190,7 +1189,7 @@ function renderTimetravel(params) {
   if (!capsCache.reconstruct) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
   const v = VIEW(); clear(v);
   const sub = el("p", { class: "page-sub" },
-    "Reconstruct a single row's full state as of a point in time — baseline snapshot + binlog deltas. Pick a row and a moment; see its value then, or its complete change history.");
+    "See what a row looked like at any moment in the past — your latest full snapshot plus every change since. Pick a row and a time to see its value then, or see its entire history.");
   v.append(pageHead("Time-travel", sub));
 
   const form = el("form", { class: "filters", id: "tt-form" });
@@ -1199,17 +1198,17 @@ function renderTimetravel(params) {
   form.append(fieldInput("PK", "pk", "sm", "42 or 42|7", true));
   form.append(fieldInput("As of", "at", "md", "YYYY-MM-DD HH:MM (default: now)"));
   const gapsField = el("div", { class: "field", style: "justify-content:flex-end" },
-    el("label", { class: "check" }, el("input", { type: "checkbox", name: "allow_gaps" }), el("span", { text: "Allow coverage gaps" })));
+    el("label", { class: "check" }, el("input", { type: "checkbox", name: "allow_gaps" }), el("span", { text: "Continue even if some history is missing" })));
   form.append(gapsField);
   const actions = el("div", { class: "filter-actions" });
   actions.append(el("button", { class: "btn btn-ghost", type: "button", text: "Full history", onclick: () => runReconstruct(form, true) }));
-  actions.append(el("button", { class: "btn btn-primary", type: "submit", text: "Value as of T" }));
+  actions.append(el("button", { class: "btn btn-primary", type: "submit", text: "Value at that time" }));
   form.append(actions);
   v.append(form);
 
   v.append(el("div", { id: "tt-warnings", class: "warnings" }));
   const out = el("div", { id: "tt-out" });
-  out.append(el("div", { class: "tt-meta", text: "Run a query to reconstruct this row's state." }));
+  out.append(el("div", { class: "tt-meta", text: "Fill in a row above and pick a button to see what it looked like." }));
   v.append(out);
 
   form.addEventListener("submit", (e) => { e.preventDefault(); runReconstruct(form, false); });
@@ -1223,7 +1222,7 @@ async function runReconstruct(form, history) {
   const warns = $("#tt-warnings", VIEW());
   const out = $("#tt-out", VIEW());
   const f = Object.fromEntries(new FormData(form).entries());
-  if (!f.schema || !f.table || !f.pk) { clear(warns); renderError(out, "schema, table, and pk are required"); return; }
+  if (!f.schema || !f.table || !f.pk) { clear(warns); renderError(out, "Schema, table, and PK are all required."); return; }
   const params = { schema: f.schema, table: f.table, pk: f.pk };
   if (f.at && f.at.trim()) params.at = f.at.trim();
   if (form.elements.allow_gaps && form.elements.allow_gaps.checked) params.allow_gaps = "true";
@@ -1265,7 +1264,7 @@ function stateTable(state) {
 function renderTimeline(container, data) {
   const entries = data.history || [];
   container.append(reconstructMeta(data, "history through " + data.at + " · " + entries.length + " state(s)"));
-  if (!entries.length) { container.append(el("div", { class: "deleted-note", text: "No history for this primary key in the covered window." })); return; }
+  if (!entries.length) { container.append(el("div", { class: "deleted-note", text: "No history for this primary key in the time range that's been indexed." })); return; }
 
   const tl = el("div", { class: "timeline", id: "timeline" });
   let prev = null;
@@ -1322,7 +1321,7 @@ async function renderStatus() {
   updateSideMeta(data);
 
   const v = VIEW(); clear(v);
-  const sub = el("p", { class: "page-sub", text: "Index health at a glance — coverage window, stream position, and what's been captured." });
+  const sub = el("p", { class: "page-sub", text: "A quick health check — what's been captured, how far back it goes, and where live capture stands right now." });
   v.append(pageHead("Status", sub));
 
   const cards = el("div", { class: "cards" });
@@ -1404,15 +1403,15 @@ function continuityBox(stream, pg) {
     const lost = el("div", { class: "error-box" });
     lost.append(el("b", { text: "⚠ Events permanently lost" }));
     lost.append(el("div", { text: stream.gap_lost.detail ||
-      (pg ? "the replication slot was invalidated; capture must be re-baselined to resume"
-          : "an unfillable binlog gap was detected; capture must be re-baselined to resume") }));
+      (pg ? "The replication slot PostgreSQL was using got invalidated. To keep capturing changes, create a new baseline and start over."
+          : "A gap in the binlog can't be filled — some history is permanently missing. To keep capturing changes, create a new baseline and start over.") }));
     lost.append(el("div", { text: "Detected: " + stream.gap_lost.at }));
     return lost;
   }
   if (stream.continuity && stream.continuity.status === "ok") {
     const ok = el("div", { class: "ok-box" });
     ok.append(el("b", { text: "✓ No gaps in captured stream" }));
-    ok.append(el("div", { text: "captured events are contiguous — does not assert the stream is live or caught up" }));
+    ok.append(el("div", { text: "No gaps in what's been captured so far — this doesn't mean the stream is currently running or caught up." }));
     return ok;
   }
   return null;
@@ -1562,7 +1561,7 @@ function buildStorage(serversRes, rotation, storage, baselines) {
   const serversErr = serversRes && serversRes.error;
   const v = VIEW(); clear(v);
   const sub = el("p", { class: "page-sub" },
-    "S3 archiving, rotation, and the baselines Time-travel reads. ",
+    "Where old data goes, how long it's kept, and the snapshots Time-travel uses. ",
     el("b", { text: "No credentials are stored here." }));
   v.append(pageHead("Storage", sub));
 
@@ -1597,7 +1596,7 @@ function rotationCard(rot) {
   kvRow(card, "interval", rot.interval);
   kvRow(card, "future partitions", rot.add_future);
   kvRow(card, "policy", rot.source === "override" ? "console override (live)" : "daemon defaults");
-  if (!rot.enabled) card.append(el("p", { class: "form-hint", text: "Rotation is OFF at the daemon (--rotate-retain off) — saved changes need a restart." }));
+  if (!rot.enabled) card.append(el("p", { class: "form-hint", text: "Rotation is turned off. Changes you save here won't take effect until the daemon restarts." }));
   card.append(el("div", { class: "stg-cardfoot" },
     el("button", { class: "btn btn-sm", type: "button", text: "Edit rotation…", onclick: showRotationDialog })));
   return card;
@@ -1610,11 +1609,11 @@ function credentialsCard(storage) {
     card.append(el("p", { class: "form-hint", text: "Could not read the daemon's credential signals" + (storage && storage.error ? ": " + storage.error : ".") }));
     return card;
   }
-  let summary = "No static credentials configured — relying on the ambient AWS credential chain (this includes EC2 instance roles, invisible here).";
-  if (aws.access_key_env) summary = "Static access keys configured via environment.";
-  else if (aws.container_creds) summary = "Using an IAM role (ECS task role detected).";
-  else if (aws.web_identity) summary = "Using an IAM role (EKS IRSA detected).";
-  else if (aws.shared_config || aws.profile) summary = "Using credentials from a shared ~/.aws config/profile.";
+  let summary = "No credentials set directly — relying on your AWS environment (for example, an EC2 instance role) to provide them automatically.";
+  if (aws.access_key_env) summary = "Using access keys set in an environment variable.";
+  else if (aws.container_creds) summary = "Using an IAM role (found an ECS task role).";
+  else if (aws.web_identity) summary = "Using an IAM role (found an EKS service-account role).";
+  else if (aws.shared_config || aws.profile) summary = "Using credentials from a shared ~/.aws config file.";
   card.append(el("p", { class: "stg-hint", text: summary }));
   const adv = el("details", { class: "form-advanced" },
     el("summary", { class: "form-adv-summary", text: "Raw signals" }));
@@ -1625,7 +1624,7 @@ function credentialsCard(storage) {
   if (aws.container_creds) kvRow(adv, "ECS task role", "detected");
   if (aws.web_identity) kvRow(adv, "EKS IRSA", "detected");
   card.append(adv);
-  card.append(el("p", { class: "form-hint", text: "IAM roles work even when nothing shows as set here." }));
+  card.append(el("p", { class: "form-hint", text: "Note: an IAM role can still be active even if none of the signals above show as set." }));
   return card;
 }
 
@@ -1683,7 +1682,7 @@ function archivingPanel(servers, serversErr) {
     sources.forEach((s) => {
       const row = el("div", { class: "stg-row" });
       row.append(el("span", { class: "stg-name", text: s.name }));
-      row.append(el("span", { class: "stg-dest" + (s.archive_s3 ? "" : " muted"), text: s.archive_s3 || "drop-only (no S3 destination)" }));
+      row.append(el("span", { class: "stg-dest" + (s.archive_s3 ? "" : " muted"), text: s.archive_s3 || "not archived — old data is deleted, not saved" }));
       if (s.monitor_state) row.append(el("span", { class: "chip chip-mon", text: s.monitor_state.replace("_", " ").toUpperCase(), title: MON_STATE_TITLES[s.monitor_state] || ("monitoring " + s.monitor_state) }));
       row.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Configure",
         onclick: () => { openServersModal(); editServer(s.id); } }));
@@ -1692,7 +1691,7 @@ function archivingPanel(servers, serversErr) {
   }
   panel.append(list);
   panel.append(el("p", { class: "form-hint stg-foot", text:
-    "Rotated partitions upload as Parquet before being dropped, so history survives retention." }));
+    "Old data is saved to S3 before it's deleted locally, so your history isn't lost." }));
   return panel;
 }
 
@@ -1718,7 +1717,7 @@ function baselinesPanel(b, servers) {
   } else if (!b.configured) {
     list.append(el("div", { class: "stg-empty" },
       el("p", { class: "stg-empty-lead", text: "No baselines configured." }),
-      el("p", { class: "stg-empty-sub", text: "A baseline is a full-table snapshot — with one, Time-travel reconstructs complete rows, not just rows with recent changes." }),
+      el("p", { class: "stg-empty-sub", text: "A baseline is a full copy of your table at one point in time. With one, Time-travel can show complete rows — not just the ones that changed recently." }),
       el("p", { class: "stg-empty-sub", text: "1. Create snapshots:" }),
       el("code", { class: "stg-code", text: "docker compose --profile baseline run --rm baseline" }),
       el("p", { class: "stg-empty-sub", text: "2. " + baselineConfigHint(cur) })));
@@ -1726,7 +1725,7 @@ function baselinesPanel(b, servers) {
     list.append(el("div", { class: "stg-empty" },
       el("p", { class: "stg-empty-lead", text: "Source configured, no snapshots found." }),
       el("code", { class: "stg-code", text: b.source }),
-      el("p", { class: "stg-empty-sub", text: "Run bintrail dump + bintrail baseline to create the first one. The path must point at the snapshots' parent directory (<timestamp>/<schema>/<table>.parquet)." })));
+      el("p", { class: "stg-empty-sub", text: "Run bintrail dump and bintrail baseline to create your first snapshot. The path must point at the folder that contains the snapshots, not a specific file (<timestamp>/<schema>/<table>.parquet)." })));
   } else {
     b.snapshots.forEach((sn) => {
       const row = el("div", { class: "stg-row" });
@@ -1755,7 +1754,7 @@ async function createBaseline(id, btn) {
     restore();
     return;
   }
-  toast("Baseline started — dumping the source and uploading…");
+  toast("Baseline started — copying your data and uploading it…");
   const done = await pollBaseline(id);
   restore();
   if (done && done.state === "succeeded") {
@@ -1807,9 +1806,9 @@ function verifyPanel(servers) {
 
   if (!capsCache.verify_trigger) {
     list.append(el("div", { class: "stg-empty" },
-      el("p", { class: "stg-empty-lead", text: "Verification from the console is not enabled." }),
+      el("p", { class: "stg-empty-lead", text: "Verification from the console is turned off." }),
       el("p", { class: "stg-empty-sub", text:
-        "Start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 (the bundled compose stack enables this by default; set VERIFY_TRIGGER=0 in .env to disable)." })));
+        "Ask whoever manages this server to turn it on (set BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 and restart). Already on the default setup? Re-download docker-compose.yml — running \"docker compose pull\" alone doesn't add new settings to a file you already have." })));
     panel.append(head, list);
     return panel;
   }
@@ -1820,12 +1819,12 @@ function verifyPanel(servers) {
   }
 
   const modeSel = el("select", { class: "select vfy-mode" },
-    el("option", { value: "baseline-anchored", text: "Baseline-anchored (drift-free)" }));
+    el("option", { value: "baseline-anchored", text: "Compare two saved snapshots (recommended)" }));
   if (capsCache.verify_live_source) {
-    modeSel.append(el("option", { value: "live-source", text: "Live-source (reads the whole table)" }));
+    modeSel.append(el("option", { value: "live-source", text: "Compare against your live database (slower)" }));
   }
   const warn = el("p", { class: "form-hint vfy-livewarn", hidden: true, text:
-    "Live-source reads the entire table off your live source at a consistent snapshot — this can take a while and adds load. Run it off-peak." });
+    "This reads your entire live table — it can take a while and adds load on your database. Best run outside busy hours." });
   modeSel.onchange = () => { warn.hidden = modeSel.value !== "live-source"; };
 
   const results = el("div", { class: "vfy-results" });
@@ -1838,9 +1837,9 @@ function verifyPanel(servers) {
 
   if (!configured) {
     list.append(el("div", { class: "stg-empty" },
-      el("p", { class: "stg-empty-lead", text: "No baseline configured for this server yet." }),
+      el("p", { class: "stg-empty-lead", text: "No baseline set up for this server yet." }),
       el("p", { class: "stg-empty-sub", text:
-        "Baseline-anchored verification compares the two most recent baseline snapshots. Set a baseline directory or S3 prefix (Manage servers → Edit → Advanced) and create at least two snapshots." })));
+        "This checks your two most recent snapshots against each other. Set a baseline location (Manage servers → Edit → Advanced) and create at least two snapshots to use it." })));
   } else {
     list.append(warn);
     renderVerifyResults(results, null, cur.id);
@@ -1913,6 +1912,7 @@ async function pollVerify(id, onTick) {
 
 const VFY_STATUS_CLASS = { match: "pass", mismatch: "fail", error: "fail", inconclusive: "warn" };
 const VFY_STATUS_MARK = { pass: "✓", fail: "✗", warn: "!" };
+const VFY_MODE_LABEL = { "baseline-anchored": "compared two saved snapshots", "live-source": "compared against the live database" };
 
 // renderVerifyResults draws the current run's summary + per-table cards into
 // container, reusing the doctor preflight card styling (pass/fail/warn) since
@@ -1926,7 +1926,7 @@ function renderVerifyResults(container, status, id) {
   const stateLabel = { running: "RUNNING", succeeded: "DONE", failed: "FAILED" }[status.state] || status.state.toUpperCase();
   const summaryRow = el("div", { class: "vfy-summary" },
     el("span", { class: "chip chip-mon", text: stateLabel }));
-  if (status.mode) summaryRow.append(el("span", { class: "stg-age", text: status.mode }));
+  if (status.mode) summaryRow.append(el("span", { class: "stg-age", text: VFY_MODE_LABEL[status.mode] || status.mode }));
   const s = status.summary || {};
   if (status.results && status.results.length) {
     summaryRow.append(el("span", { class: "stg-age", text:
@@ -2189,7 +2189,7 @@ async function loadServers() {
         .concat(servers.filter((s) => s.kind === "ephemeral"));
       ordered.forEach((s) => {
         const o = opt(s.id, serverLabel(s));
-        if (s.kind === "ephemeral") o.title = "The daemon's own index database (from --index-dsn); managed by the command line";
+        if (s.kind === "ephemeral") o.title = "The daemon's own index database (set with --index-dsn on the command line)";
         sel.append(o);
       });
       sel.value = currentServer || defaultServerId;
@@ -2223,10 +2223,10 @@ function buildServersModal() {
   const head = el("div", { class: "modal-head" });
   head.append(el("h2", { class: "modal-title", text: "Servers" }));
   const desc = el("p", { class: "modal-desc" },
-    "Named connections to dbtrail index databases, stored in a local file on the console host. ");
+    "The servers you're monitoring with dbtrail, saved in a file on this machine. ");
   desc.append(el("span", { "data-capability": "monitor" },
     "This process can also ", el("b", { text: "monitor" }),
-    " a source MySQL: add one below and dbtrail runs the preflight checks, provisions an index for it, and starts streaming — no terminal needed."));
+    " a new MySQL database for you: add one below and dbtrail checks it's ready, sets up its index, and starts capturing changes — no terminal needed."));
   head.append(desc);
   head.append(el("button", { class: "modal-x", type: "button", text: "✕", onclick: closeServersModal }));
   modal.append(head);
@@ -2264,7 +2264,7 @@ async function showRotationDialog() {
   if (loginGateRaised) return;
   let cur;
   try { cur = await api("/api/rotation"); }
-  catch (err) { toast("failed to load rotation settings: " + ((err && err.message) || err)); return; }
+  catch (err) { toast("Could not load rotation settings: " + ((err && err.message) || err)); return; }
 
   const mount = document.getElementById("modal");
   const scrim = el("div", { class: "modal-scrim show" });
@@ -2273,7 +2273,7 @@ async function showRotationDialog() {
   const head = el("div", { class: "modal-head" });
   head.append(el("h2", { class: "modal-title", text: "Rotation" }));
   head.append(el("p", { class: "modal-desc", text:
-    "The daemon drops index partitions older than the retention window every interval, keeping a few future partitions ready. One shared schedule covers every monitored source; changes take effect on the next cycle." }));
+    "On a regular schedule, the daemon deletes indexed data older than the retention period below, and gets ready ahead of time for new data coming in. One schedule applies to every server being monitored; changes take effect on the next run." }));
   head.append(el("button", { class: "modal-x", type: "button", text: "✕", onclick: closeRotationDialog }));
   modal.append(head);
 
@@ -2288,9 +2288,9 @@ async function showRotationDialog() {
   form.elements.add_future.value = (cur.add_future != null ? cur.add_future : "");
 
   const note = el("p", { class: "form-hint", style: "margin-top:10px" });
-  if (!cur.enabled) note.textContent = "Rotation is OFF at the daemon (--rotate-retain off). Saved changes need a daemon restart to take effect.";
-  else if (cur.source === "default") note.textContent = "Currently using the daemon defaults (--rotate-* / BINTRAIL_ROTATE_*). Saving creates a console override that applies live.";
-  else note.textContent = "A console override is active, applied live each cycle.";
+  if (!cur.enabled) note.textContent = "Rotation is turned off. Your changes will be saved but won't take effect until the daemon restarts.";
+  else if (cur.source === "default") note.textContent = "Currently using the daemon's built-in defaults. Saving here creates a custom setting that takes effect immediately.";
+  else note.textContent = "A custom setting is active and takes effect immediately.";
   form.append(note);
 
   const msg = el("div", { class: "form-msg" });
@@ -2325,7 +2325,7 @@ async function submitRotation(form, msg, wasEnabled) {
   closeRotationDialog();
   // When the daemon booted with rotation off the loop isn't running, so the
   // save is inert until a restart — say so rather than implying it took effect.
-  toast(wasEnabled ? "Rotation settings saved" : "Saved — rotation is off at the daemon; restart to apply");
+  toast(wasEnabled ? "Rotation settings saved" : "Saved — rotation is off, so this won't take effect until the daemon restarts");
 }
 
 async function refreshServersList() {
@@ -2347,7 +2347,7 @@ function serverRow(s) {
     el("span", { class: "health-dot" + (s.connected ? " ok" : ""), title: s.connected ? "connected" : "not connected yet" }),
     serverLabel(s));
   item.append(nm);
-  if (s.kind === "ephemeral") item.append(el("span", { class: "chip chip-cli", text: "CLI", title: "From --index-dsn; managed by the command line" }));
+  if (s.kind === "ephemeral") item.append(el("span", { class: "chip chip-cli", text: "CLI", title: "Set from the command line with --index-dsn" }));
   if (s.reconstruct) item.append(el("span", { class: "chip chip-tt", text: "TT", title: "Baseline configured: Time-travel available" }));
   if (s.monitor_state) item.append(el("span", { class: "chip chip-mon", text: s.monitor_state.replace("_", " ").toUpperCase(), title: MON_STATE_TITLES[s.monitor_state] || ("monitoring " + s.monitor_state) }));
 
@@ -2395,7 +2395,7 @@ function buildServerForm() {
 
   const mon = el("fieldset", { class: "form-section", "data-capability": "monitor" });
   mon.append(el("legend", { class: "form-legend", text: "Monitor a source MySQL" }));
-  mon.append(el("p", { class: "form-hint", text: "Paste the server to watch — dbtrail runs the preflight checks, provisions an index database for it automatically, and starts streaming. Nothing else to fill in beyond a name." }));
+  mon.append(el("p", { class: "form-hint", text: "Paste the server you want to watch — dbtrail checks that it's ready, creates an index database for it automatically, and starts capturing changes. Nothing else to fill in beyond a name." }));
   const monGrid = el("div", { class: "form-grid" });
   monGrid.append(srvField("Source host", "source_host", { placeholder: "db.example.com" }));
   monGrid.append(srvField("Source port", "source_port", { placeholder: "3306" }));
@@ -2415,7 +2415,7 @@ function buildServerForm() {
   mon.append(el("pre", { class: "form-code", text:
     "CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';\n" +
     "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';" }));
-  mon.append(el("p", { class: "form-hint", style: "margin-top:10px", text: "Archive to S3: rotated partitions upload here as Parquet before they're dropped, so the history survives retention and stays queryable. Needs AWS credentials on the daemon (env / role)." }));
+  mon.append(el("p", { class: "form-hint", style: "margin-top:10px", text: "Archive to S3: old data is uploaded here before it's deleted locally, so your history is kept and can still be searched. Needs AWS credentials set up on the daemon (environment variables or an IAM role)." }));
   form.append(mon);
 
   // BYO index is the advanced path — collapsed behind a <details> so the
@@ -2435,7 +2435,7 @@ function buildServerForm() {
   idxGrid.append(srvField("Baseline S3", "baseline_s3", { placeholder: "s3://bucket/prefix/" }));
   idx.append(idxGrid);
   idx.append(el("label", { class: "check", style: "margin-top:10px" },
-    el("input", { type: "checkbox", name: "no_archive" }), el("span", { text: "Disable archive auto-discovery" })));
+    el("input", { type: "checkbox", name: "no_archive" }), el("span", { text: "Don't automatically include archived data in queries" })));
   adv.append(idx);
   form.append(adv);
 
@@ -2524,7 +2524,7 @@ async function editServer(id) {
   // as an uncaught error, not masquerade as "failed to load server".
   let s;
   try { s = await api("/api/servers/" + encodeURIComponent(id)); }
-  catch (err) { toast("failed to load server: " + ((err && err.message) || err)); return false; }
+  catch (err) { toast("Could not load server: " + ((err && err.message) || err)); return false; }
   showServerForm(s);
   return true;
 }
@@ -2540,13 +2540,13 @@ async function saveServer(form) {
   // Zero-terminal auto-start: a monitor-capable process with a source DSN starts
   // streaming on save (after preflight). Doctor warnings keep the form open.
   if (capsCache.monitor && saved.has_source && !isLiveMonitorState(saved.monitor_state)) {
-    formMsg("running preflight checks…", false);
+    formMsg("Running startup checks…", false);
     const res = await startMonitor(saved.id);
     await refreshServersList();
     if (res && res.started && !doctorWarnings(res.doctor)) { hideServerForm(); toast("Monitoring started — events will appear within a minute"); }
-    else if (res && res.started) { renderDoctor(res.doctor); formMsg("monitoring started — review the warnings below", false); }
-    else if (res) { renderDoctor(res.doctor); formMsg("preflight failed — fix the items below and Save again", true); }
-    else { formMsg("could not start monitoring — see the error toast and try again", true); } // startMonitor returned null (transport error)
+    else if (res && res.started) { renderDoctor(res.doctor); formMsg("Monitoring started — review the warnings below", false); }
+    else if (res) { renderDoctor(res.doctor); formMsg("Startup checks failed — fix the items below and save again", true); }
+    else { formMsg("Could not start monitoring — see the error message above and try again", true); } // startMonitor returned null (transport error)
     return;
   }
   hideServerForm();
@@ -2557,7 +2557,7 @@ async function saveServer(form) {
 async function deleteServer(s) {
   if (!window.confirm('Remove server "' + s.name + '"? This only removes the saved connection — nothing happens to the server itself.')) return;
   try { await api("/api/servers/" + encodeURIComponent(s.id), { method: "DELETE" }); }
-  catch (err) { toast("delete failed: " + ((err && err.message) || err)); return; }
+  catch (err) { toast("Could not remove server: " + ((err && err.message) || err)); return; }
   if (currentServer === s.id) { await switchServer(""); const sel = document.getElementById("server-select"); if (sel) sel.value = defaultServerId; }
   await refreshServersList();
   toast("Server removed");
@@ -2569,13 +2569,13 @@ function testResultText(res) {
   // provision_pending: a monitored source whose per-source index isn't created
   // yet (Start creates it). Reachable server, normal pre-Start state — render
   // it as a neutral hint, not a red failure.
-  if (res.provision_pending) return "○ " + (res.error || "index not provisioned yet — click Start");
+  if (res.provision_pending) return "○ " + (res.error || "index not created yet — click Start");
   if (!res.ok) return "✗ " + (res.error || "unreachable");
   let s = "✓ ok · " + res.latency_ms + " ms";
   if (res.server_version) s += " · MySQL " + res.server_version;
   // has_index/schema_current are tri-state: absent = the metadata lookup itself
   // failed (unknown) — never render that as the confident negative.
-  if (res.has_index === false) s += " · no binlog_events table (not a dbtrail index?)";
+  if (res.has_index === false) s += " · doesn't look like a dbtrail index (missing the binlog_events table)";
   else if (res.has_index === undefined || res.schema_current === undefined) s += " · index metadata unavailable";
   else if (res.schema_current === false) s += " · index schema outdated (run bintrail index/stream once)";
   return s;
@@ -2621,7 +2621,7 @@ function renderDoctor(report) {
 
 async function startMonitor(id) {
   try { return await api("/api/servers/" + encodeURIComponent(id) + "/monitor/start", { method: "POST", body: {} }); }
-  catch (err) { toast("start failed: " + ((err && err.message) || err)); return null; }
+  catch (err) { toast("Could not start: " + ((err && err.message) || err)); return null; }
 }
 
 async function startMonitorRow(id) {
@@ -2634,13 +2634,13 @@ async function startMonitorRow(id) {
   const opened = await editServer(id);
   if (opened) {
     renderDoctor(res.doctor);
-    formMsg(res.started ? "monitoring started — review the warnings below" : "preflight failed — fix the items below, Save, and Start again", !res.started);
-  } else { toast(res.started ? "Monitoring started — with warnings" : "Preflight failed"); }
+    formMsg(res.started ? "Monitoring started — review the warnings below" : "Startup checks failed — fix the items below, save, and start again", !res.started);
+  } else { toast(res.started ? "Monitoring started — with warnings" : "Startup checks failed"); }
 }
 
 async function stopMonitorRow(id) {
   try { await api("/api/servers/" + encodeURIComponent(id) + "/monitor/stop", { method: "POST", body: {} }); toast("Monitoring stopped"); }
-  catch (err) { toast("stop failed: " + ((err && err.message) || err)); }
+  catch (err) { toast("Could not stop: " + ((err && err.message) || err)); }
   await refreshServersList();
 }
 
@@ -2762,7 +2762,7 @@ async function bootSequence() {
   // error when its fetch fails.
   try { servers = await loadServers(); } catch (err) {
     if (err && err.status === 401) return null;
-    toast("couldn't load servers: " + ((err && err.message) || err));
+    toast("Could not load servers: " + ((err && err.message) || err));
   }
   try { await gateCapabilities(); } catch (err) {
     if (err && err.status === 401) return null;

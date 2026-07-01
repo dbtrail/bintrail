@@ -157,7 +157,7 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.rbacActive() {
 		writeJSONError(w, http.StatusForbidden,
-			"verify is not available while an RBAC profile is active — its baseline/live-source reads carry no redaction")
+			"verification isn't available while an access-control profile is active — it reads full data without redacting anything")
 		return
 	}
 	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
@@ -194,7 +194,7 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 	// table, which the CLI refuses up front instead of wasting that read.
 	if e.BaselineDir == "" && e.BaselineS3 == "" {
 		writeJSONError(w, http.StatusBadRequest,
-			"this server has no baseline destination configured; set a baseline directory or S3 prefix first (Edit → Advanced)")
+			"this server has no baseline location set up; set a baseline directory or S3 location first (Edit → Advanced)")
 		return
 	}
 	if mode == VerifyModeLiveSource && e.SourceDSN == "" {
@@ -244,7 +244,7 @@ func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.rbacActive() {
 		writeJSONError(w, http.StatusForbidden,
-			"verify is not available while an RBAC profile is active — its baseline reads carry no redaction")
+			"verification isn't available while an access-control profile is active — it reads full data without redacting anything")
 		return
 	}
 	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))

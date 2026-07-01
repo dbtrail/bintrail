@@ -750,10 +750,10 @@ func buildSourceDSN(req serverRequest, stored string) (string, error) {
 		cfg.Passwd = *req.SourcePassword
 	}
 	if cfg.Addr == "" {
-		return "", errors.New("source_host is required")
+		return "", errors.New("source host is required")
 	}
 	if cfg.User == "" {
-		return "", errors.New("source_user is required")
+		return "", errors.New("source user is required")
 	}
 	return cfg.FormatDSN(), nil
 }

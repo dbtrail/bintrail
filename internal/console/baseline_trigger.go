@@ -79,7 +79,7 @@ func (s *Server) handleBaselineTrigger(w http.ResponseWriter, r *http.Request) {
 	}
 	if e.BaselineDir == "" && e.BaselineS3 == "" {
 		writeJSONError(w, http.StatusBadRequest,
-			"this server has no baseline destination configured; set a baseline directory or S3 prefix first (Edit → Advanced)")
+			"this server has no baseline location set up; set a baseline directory or S3 location first (Edit → Advanced)")
 		return
 	}
 

@@ -205,14 +205,14 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	// redaction, so the gate must not leak from one server's config to another.
 	if !b.baselineConfigured {
 		writeJSONError(w, http.StatusNotFound,
-			"reconstruct is not available for this server (no baseline configured, an RBAC profile is active, or no-archive is set)")
+			"time-travel isn't available for this server (no baseline is set up, an access-control profile is active, or archive access is disabled)")
 		return
 	}
 
 	q := r.URL.Query()
 	schema, table, pk := q.Get("schema"), q.Get("table"), q.Get("pk")
 	if schema == "" || table == "" || pk == "" {
-		writeJSONError(w, http.StatusBadRequest, "reconstruct requires schema, table, and pk")
+		writeJSONError(w, http.StatusBadRequest, "schema, table, and pk are all required")
 		return
 	}
 
@@ -288,7 +288,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) {
 			writeJSONError(w, http.StatusUnprocessableEntity,
-				"refusing to reconstruct over a coverage gap — "+err.Error()+" (pass allow_gaps=true to override)")
+				"can't reconstruct across a gap in the captured history — "+err.Error()+" (check \"Continue even if some history is missing\" to proceed anyway)")
 			return
 		}
 		writeFetchError(w, err)

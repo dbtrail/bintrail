@@ -100,7 +100,7 @@ func (s *Server) handleRotationUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.AddFuture < 0 {
-		writeJSONError(w, http.StatusBadRequest, "add_future cannot be negative")
+		writeJSONError(w, http.StatusBadRequest, "future partitions cannot be negative")
 		return
 	}
 	if err := s.cm.reg.SetRotation(RotationConfig{Retain: retain, Interval: interval, AddFuture: req.AddFuture}); err != nil {
