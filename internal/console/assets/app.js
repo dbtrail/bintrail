@@ -1604,14 +1604,21 @@ function credentialsCard(storage) {
     card.append(el("p", { class: "form-hint", text: "Could not read the daemon's credential signals" + (storage && storage.error ? ": " + storage.error : ".") }));
     return card;
   }
-  kvRow(card, "access keys (env)", aws.access_key_env ? "set" : "not set");
-  kvRow(card, "profile (env)", aws.profile || "—");
-  kvRow(card, "region (env)", aws.region_env || "—");
-  kvRow(card, "~/.aws config", aws.shared_config ? "present" : "absent");
-  if (aws.container_creds) kvRow(card, "ECS task role", "detected");
-  if (aws.web_identity) kvRow(card, "EKS IRSA", "detected");
-  card.append(el("p", { class: "form-hint stg-hint", text:
-    "Resolved from the daemon's AWS credential chain. IAM roles work even when nothing shows as set here." }));
+  let summary = "No static credentials configured — relying on the ambient AWS credential chain (this includes EC2 instance roles, invisible here).";
+  if (aws.access_key_env) summary = "Static access keys configured via environment.";
+  else if (aws.container_creds) summary = "Using an IAM role (ECS task role detected).";
+  else if (aws.web_identity) summary = "Using an IAM role (EKS IRSA detected).";
+  card.append(el("p", { class: "stg-hint", text: summary }));
+  const adv = el("details", { class: "form-advanced" },
+    el("summary", { text: "Raw signals" }));
+  kvRow(adv, "access keys (env)", aws.access_key_env ? "set" : "not set");
+  kvRow(adv, "profile (env)", aws.profile || "—");
+  kvRow(adv, "region (env)", aws.region_env || "—");
+  kvRow(adv, "~/.aws config", aws.shared_config ? "present" : "absent");
+  if (aws.container_creds) kvRow(adv, "ECS task role", "detected");
+  if (aws.web_identity) kvRow(adv, "EKS IRSA", "detected");
+  card.append(adv);
+  card.append(el("p", { class: "form-hint", text: "IAM roles work even when nothing shows as set here." }));
   return card;
 }
 
