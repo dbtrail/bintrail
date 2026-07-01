@@ -1967,13 +1967,35 @@ async function openVerifyExplain(id, schema, table) {
   }
   const mount = document.getElementById("modal");
   const scrim = el("div", { class: "modal-scrim show" });
-  const modal = el("div", { class: "modal", role: "dialog", "aria-label": "Verify mismatch drill-down" });
+  const modal = el("div", { class: "modal vfy-explain-modal", role: "dialog", "aria-label": "Verify mismatch drill-down" });
   const head = el("div", { class: "modal-head" });
-  head.append(el("h2", { class: "modal-title", text: "Mismatch: " + ex.schema + "." + ex.table }));
-  head.append(el("p", { class: "modal-desc", text: ex.total + " differing row(s) at " + ex.anchor }));
+  head.append(el("h2", { class: "modal-title", text: ex.schema + "." + ex.table + " doesn't match" }));
+  head.append(el("p", { class: "modal-desc", text:
+    (ex.total === 1 ? "1 row differs" : ex.total + " rows differ") +
+    " — checked against binlog position " + ex.anchor + "." }));
+  head.append(el("p", { class: "modal-desc", text:
+    "Recovered = what replaying the change log on top of the older snapshot produced. Baseline (real) = the actual values from the newer, trusted snapshot." }));
   head.append(el("button", { class: "modal-x", type: "button", text: "✕", onclick: closeVerifyExplain }));
   modal.append(head);
-  modal.append(el("pre", { class: "dc-rem vfy-explain-pre", text: ex.rendered }));
+
+  const body = el("div", { class: "vfy-explain-body" });
+  if (!ex.diffs || !ex.diffs.length) {
+    body.append(el("p", { class: "form-hint", text:
+      "The row count differs, but no per-row content difference was found — see raw output below." }));
+  } else {
+    ex.diffs.forEach((d) => body.append(verifyDiffCard(d)));
+    if (ex.total > ex.diffs.length) {
+      body.append(el("p", { class: "form-hint", text:
+        "…and " + (ex.total - ex.diffs.length) + " more differing row(s), not shown here." }));
+    }
+  }
+  modal.append(body);
+
+  const raw = el("details", { class: "form-advanced vfy-explain-raw" },
+    el("summary", { class: "form-adv-summary", text: "Raw output" }));
+  raw.append(el("pre", { class: "dc-rem vfy-explain-pre", text: ex.rendered }));
+  modal.append(raw);
+
   const foot = el("div", { class: "modal-foot" });
   foot.append(el("button", { class: "btn btn-ghost", type: "button", text: "Close", onclick: closeVerifyExplain }));
   modal.append(foot);
@@ -1983,6 +2005,57 @@ async function openVerifyExplain(id, schema, table) {
 }
 
 function closeVerifyExplain() { document.getElementById("modal").replaceChildren(); }
+
+const VFY_KIND_LABEL = {
+  changed: "Value differs",
+  missing: "Missing from recovery",
+  extra: "Unexpected in recovery",
+};
+const VFY_KIND_CLASS = { changed: "warn", missing: "fail", extra: "fail" };
+const VFY_KIND_NOTE = {
+  missing: "This row exists in the real baseline, but replaying the change log never reproduced it.",
+  extra: "Replaying the change log produced this row, but it isn't in the real baseline.",
+};
+
+// verifyDiffCard renders one RowDiff, reusing the doctor-preflight card
+// styling already established for verify's own match/mismatch/inconclusive
+// results — same "named check + status + detail" shape.
+function verifyDiffCard(d) {
+  const cls = VFY_KIND_CLASS[d.kind] || "warn";
+  const card = el("div", { class: "doctor-card " + cls });
+  card.append(el("span", { class: "dc-mark", text: cls === "fail" ? "✗" : "!" }));
+  const bodyEl = el("div", { class: "dc-body" },
+    el("div", { class: "dc-name", text: (VFY_KIND_LABEL[d.kind] || d.kind) + " — " + d.pk }));
+  if (VFY_KIND_NOTE[d.kind]) {
+    bodyEl.append(el("p", { class: "form-hint", text: VFY_KIND_NOTE[d.kind] }));
+  } else if (d.cells && d.cells.length) {
+    bodyEl.append(verifyDiffCellsTable(d.cells));
+  }
+  card.append(bodyEl);
+  return card;
+}
+
+function verifyDiffCellsTable(cells) {
+  const table = el("table", { class: "vfy-diff-table" });
+  table.append(el("thead", {}, el("tr", {},
+    el("th", { text: "Column" }), el("th", { text: "Recovered" }), el("th", { text: "Baseline (real)" }))));
+  const tbody = el("tbody");
+  cells.forEach((c) => tbody.append(el("tr", {},
+    el("td", { text: c.column }),
+    el("td", {}, verifyDiffValue(c.recovery)),
+    el("td", {}, verifyDiffValue(c.baseline)))));
+  table.append(tbody);
+  return table;
+}
+
+// verifyDiffValue styles a NULL cell distinctly from the literal text "NULL"
+// a real value could (rarely) contain — a display-only best effort, not a
+// data distinction: the underlying comparison that flagged this diff already
+// happened server-side against the real NULL-vs-empty-aware bytes.
+function verifyDiffValue(v) {
+  if (v === "NULL") return el("span", { class: "vfy-null", text: "NULL" });
+  return document.createTextNode(v);
+}
 
 // ── schemas / tables cascade ──────────────────────────────────────────────────
 
