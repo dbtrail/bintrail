@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
-	"unicode/utf8"
 
 	mysql "github.com/go-sql-driver/mysql"
 
@@ -127,7 +126,7 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 		if batch[i].QueryText == "" {
 			continue
 		}
-		sanitized[i] = sanitizeQueryText(batch[i].QueryText)
+		sanitized[i] = event.SanitizeQueryText(batch[i].QueryText)
 		if _, ok := seen[sanitized[i]]; !ok {
 			seen[sanitized[i]] = struct{}{}
 			distinct = append(distinct, sanitized[i])
@@ -182,47 +181,61 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 
 // ─── Query-text enrichment (#699) ─────────────────────────────────────────────
 
-// maxQueryTextBytes caps the stored query_text. ROWS_QUERY/ANNOTATE events
-// carry the FULL original statement — a bulk INSERT can run to megabytes — and
-// every row event of that statement repeats the text in the batch INSERT args,
-// so uncapped text could blow past max_allowed_packet on the index connection
-// and fail the whole batch. 16 KiB keeps any realistic hand-written or ORM
-// statement intact; only bulk-statement tails are cut.
-const maxQueryTextBytes = 16 * 1024
-
-// queryTextTruncationMarker is appended to a capped query_text so a forensics
-// reader can tell a truncated statement from a complete one.
-const queryTextTruncationMarker = " /* bintrail:truncated */"
-
-// sanitizeQueryText prepares a captured statement for storage: it replaces
-// invalid UTF-8 (a _binary'...' literal embeds raw bytes, which strict mode
-// would reject with error 1366, aborting the whole batch INSERT) and caps the
-// byte length at a rune boundary, appending queryTextTruncationMarker when cut.
-func sanitizeQueryText(s string) string {
-	if s == "" {
-		return ""
-	}
-	s = strings.ToValidUTF8(s, "�")
-	if len(s) <= maxQueryTextBytes {
-		return s
-	}
-	cut := maxQueryTextBytes
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut] + queryTextTruncationMarker
-}
-
-// digestStatements resolves each distinct statement text to its
-// STATEMENT_DIGEST() hash in ONE round trip on the index connection
-// (STATEMENT_DIGEST exists on MySQL 8.0+, the index contract floor). The
-// digest is an enrichment: on any failure it degrades to a nil map (all
-// query_hash values NULL) while query_text is still stored, and the failure
-// is logged once per Indexer.
+// digestStatements resolves distinct statement texts to their
+// STATEMENT_DIGEST() hashes on the index connection (STATEMENT_DIGEST exists
+// on MySQL 8.0+, the index contract floor). Texts ending in the truncation
+// marker are skipped up front: a capped statement ends mid-token, so its
+// digest would both fail to parse (MySQL error 3676) and misrepresent the
+// statement's true shape — NULL is the honest value.
+//
+// The happy path is ONE combined SELECT over all texts. That SELECT fails as
+// a unit when ANY single text is unparseable, so on error it falls back to
+// per-text digests — one bad statement can then never null the whole batch's
+// hashes. The digest is an enrichment: every failure degrades to a missing
+// map entry (NULL query_hash) while query_text is still stored; only the
+// all-texts-failed case (e.g. an index without STATEMENT_DIGEST) warns, once
+// per Indexer.
 func (idx *Indexer) digestStatements(texts []string) map[string]string {
-	if len(texts) == 0 {
+	candidates := make([]string, 0, len(texts))
+	for _, t := range texts {
+		if !strings.HasSuffix(t, event.QueryTextTruncationMarker) {
+			candidates = append(candidates, t)
+		}
+	}
+	if len(candidates) == 0 {
 		return nil
 	}
+
+	if out, err := idx.digestCombined(candidates); err == nil {
+		return out
+	}
+
+	out := make(map[string]string, len(candidates))
+	failures := 0
+	var lastErr error
+	for _, t := range candidates {
+		var v sql.NullString
+		if err := idx.db.QueryRow("SELECT STATEMENT_DIGEST(?)", t).Scan(&v); err != nil {
+			failures++
+			lastErr = err
+			continue
+		}
+		if v.Valid {
+			out[t] = v.String
+		}
+	}
+	if failures == len(candidates) {
+		idx.digestWarnOnce.Do(func() {
+			slog.Warn("STATEMENT_DIGEST failed for every statement in a batch — query_hash will be NULL (query_text is unaffected)",
+				"error", lastErr)
+		})
+	}
+	return out
+}
+
+// digestCombined runs the single-round-trip form: one SELECT with one
+// STATEMENT_DIGEST expression per text.
+func (idx *Indexer) digestCombined(texts []string) (map[string]string, error) {
 	var sb strings.Builder
 	sb.WriteString("SELECT STATEMENT_DIGEST(?)")
 	for range len(texts) - 1 {
@@ -238,11 +251,7 @@ func (idx *Indexer) digestStatements(texts []string) map[string]string {
 		ptrs[i] = &vals[i]
 	}
 	if err := idx.db.QueryRow(sb.String(), args...).Scan(ptrs...); err != nil {
-		idx.digestWarnOnce.Do(func() {
-			slog.Warn("STATEMENT_DIGEST unavailable on the index connection — query_hash will be NULL (query_text is unaffected)",
-				"error", err)
-		})
-		return nil
+		return nil, err
 	}
 	out := make(map[string]string, len(texts))
 	for i, t := range texts {
@@ -250,7 +259,7 @@ func (idx *Indexer) digestStatements(texts []string) map[string]string {
 			out[t] = vals[i].String
 		}
 	}
-	return out
+	return out, nil
 }
 
 // ─── Serialisation helpers ────────────────────────────────────────────────────

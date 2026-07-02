@@ -53,6 +53,14 @@ func makeOrdersInsertEvent(id, amount int64) *replication.BinlogEvent {
 	}
 }
 
+// makeOrdersInsertEventFlags is makeOrdersInsertEvent with explicit RowsEvent
+// flags (STMT_END_F marks the last rows event of a statement).
+func makeOrdersInsertEventFlags(id, amount int64, flags uint16) *replication.BinlogEvent {
+	ev := makeOrdersInsertEvent(id, amount)
+	ev.Event.(*replication.RowsEvent).Flags = flags
+	return ev
+}
+
 // dmlOf filters the emitted stream down to row-DML events (drops the GTID
 // tracking and commit boundary events that ride along).
 func dmlOf(evs []Event) []Event {
@@ -218,5 +226,48 @@ func TestStreamParser_queryTextInsideTransactionPayload(t *testing.T) {
 	}
 	if got, want := dml[0].QueryText, "INSERT INTO shop.orders VALUES (1, 10)"; got != want {
 		t.Errorf("QueryText = %q, want %q (from inner ROWS_QUERY)", got, want)
+	}
+}
+
+// TestStreamParser_queryTextClearedAtStatementEnd pins the STMT_END_F clear:
+// MySQL allows SET SESSION binlog_rows_query_log_events=OFF INSIDE an open
+// transaction, so a later statement in the SAME transaction can emit rows with
+// no ROWS_QUERY of its own — it must NOT inherit the previous statement's
+// text (there is no GTID/QUERY boundary in between to clear it). The last
+// rows event of a statement carries STMT_END_F; that is the boundary.
+func TestStreamParser_queryTextClearedAtStatementEnd(t *testing.T) {
+	sp := NewStreamParser(makeOrdersResolver(), Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 16)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel,
+		makeRotate("binlog.000001"),
+		makeGTIDEvent(1),
+		makeQueryEvent("BEGIN"),
+		// Statement 1: logged, spans TWO chained rows events — only the
+		// second carries STMT_END_F; both must share the text.
+		makeRowsQueryEvent("INSERT INTO shop.orders VALUES (1, 10), (2, 20)"),
+		makeOrdersInsertEventFlags(1, 10, 0),
+		makeOrdersInsertEventFlags(2, 20, replication.RowsEventStmtEndFlag),
+		// Statement 2, SAME transaction: variable toggled off — no
+		// ROWS_QUERY. Its rows must carry NO text.
+		makeOrdersInsertEventFlags(3, 30, replication.RowsEventStmtEndFlag),
+		makeXIDEvent(900),
+	)
+
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	dml := dmlOf(drainAll(out))
+	if len(dml) != 3 {
+		t.Fatalf("expected 3 DML events, got %d", len(dml))
+	}
+	want := "INSERT INTO shop.orders VALUES (1, 10), (2, 20)"
+	if dml[0].QueryText != want || dml[1].QueryText != want {
+		t.Errorf("chained rows events of one statement must share its text, got %q / %q", dml[0].QueryText, dml[1].QueryText)
+	}
+	if dml[2].QueryText != "" {
+		t.Errorf("statement after mid-transaction toggle must carry NO text, got %q (stale attribution)", dml[2].QueryText)
 	}
 }

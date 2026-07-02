@@ -83,7 +83,7 @@ SET GLOBAL binlog_annotate_row_events = ON;
 
 Notes:
 
-- Statements longer than 16 KiB are stored truncated, ending in `/* bintrail:truncated */`.
+- Statements longer than 16 KiB are stored truncated, ending in `/* bintrail:truncated */`. Truncated statements are not digested (`query_hash` stays `NULL`) — a mid-token fragment would misrepresent the statement's shape.
 - Under an active `--profile`, `query_text` and `query_hash` are withheld on **every** row, not just rows of flagged tables — a single statement can touch several tables, so its text can embed values of a column your profile redacts even when the row itself belongs to another table.
 - The web console never shows these fields (same boundary as `connection_id`).
 

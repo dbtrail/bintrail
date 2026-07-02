@@ -246,6 +246,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		}
 		opts.DenyTables = denyTables
 		opts.RedactColumns = redactCols
+		opts.ProfileActive = true
 	}
 
 	engine := query.New(db)

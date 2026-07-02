@@ -15,6 +15,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
@@ -251,6 +252,15 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("connect to index database: %w", err)
 	}
 	defer db.Close()
+
+	// Idempotent schema migration: the query engine SELECTs
+	// post-initial-schema binlog_events columns (query_text/query_hash,
+	// #699); without this, single-row/--history reconstruct against a
+	// pre-upgrade index 1054s while full-table mode (which already calls
+	// EnsureSchema in reconstruct.ReconstructTable) self-heals.
+	if err := indexer.EnsureSchema(db); err != nil {
+		return fmt.Errorf("ensure index schema: %w", err)
+	}
 
 	engine := query.New(db)
 

@@ -155,6 +155,11 @@ type Options struct {
 
 	DenyTables    []SchemaTable       // tables excluded by RBAC profile
 	RedactColumns []SchemaTableColumn // column values nulled out by RBAC profile
+	// ProfileActive is set by callers whenever a profile NAME was supplied,
+	// even if it resolved to zero deny/redact rules (a nonexistent or empty
+	// profile). It forces the redaction pass so QueryText/QueryHash are
+	// withheld under EVERY named profile — see applyRedaction (#699).
+	ProfileActive bool
 }
 
 // ─── ResultRow ────────────────────────────────────────────────────────────────
@@ -222,10 +227,11 @@ func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
 	// "Fetch returns ordered rows" contract that recovery.GenerateSQL and the
 	// formatters rely on.
 	sortResults(results, OrderDirection(opts.Order))
-	// Redaction also fires on DenyTables-only profiles: query_text is
-	// per-STATEMENT, so rows of an ALLOWED table can carry a statement whose
-	// literals belong to a denied sibling table — see applyRedaction (#699).
-	if len(opts.RedactColumns) > 0 || len(opts.DenyTables) > 0 {
+	// Redaction also fires on DenyTables-only profiles — and on a named
+	// profile with ZERO rules (ProfileActive): query_text is per-STATEMENT,
+	// so rows of an ALLOWED table can carry a statement whose literals
+	// belong to a denied sibling table — see applyRedaction (#699).
+	if opts.ProfileActive || len(opts.RedactColumns) > 0 || len(opts.DenyTables) > 0 {
 		applyRedaction(results, opts.RedactColumns)
 	}
 	return results, nil

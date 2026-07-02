@@ -161,3 +161,106 @@ func TestParseFile_queryTextAbsentWhenVariableOff(t *testing.T) {
 		}
 	}
 }
+
+// TestParseFile_queryTextMidTransactionToggle is the regression guard for the
+// stale-attribution bug the #699 review reproduced: MySQL allows
+// SET SESSION binlog_rows_query_log_events=OFF INSIDE an open transaction, so
+// a later statement in the SAME transaction emits rows with no ROWS_QUERY of
+// its own. Those rows must carry NO text — never the previous statement's
+// (a confidently wrong forensic attribution). The STMT_END_F clear is what
+// makes this hold; GTID/QUERY boundaries do not exist mid-transaction.
+func TestParseFile_queryTextMidTransactionToggle(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id     INT PRIMARY KEY,
+		amount DECIMAL(10,2) NOT NULL
+	)`)
+
+	stats, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshot failed: %v", err)
+	}
+	resolver, err := metadata.NewResolver(indexDB, stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("NewResolver failed: %v", err)
+	}
+
+	ctx := context.Background()
+	conn, err := sourceDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("Conn failed: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "SET SESSION binlog_rows_query_log_events = ON"); err != nil {
+		var myErr *drivermysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1193 {
+			t.Skipf("binlog_rows_query_log_events not supported on this server: %v", err)
+		}
+		t.Fatalf("SET SESSION failed for a non-version reason: %v", err)
+	}
+
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+	currentBinlog, _, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition failed: %v", err)
+	}
+
+	firstSQL := "INSERT INTO orders (id, amount) VALUES (1, 10.00)"
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx failed: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, firstSQL); err != nil {
+		t.Fatalf("INSERT #1 failed: %v", err)
+	}
+	// Toggle OFF inside the open transaction — allowed by MySQL.
+	if _, err := tx.ExecContext(ctx, "SET SESSION binlog_rows_query_log_events = OFF"); err != nil {
+		t.Fatalf("mid-transaction SET SESSION OFF failed: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO orders (id, amount) VALUES (2, 20.00)"); err != nil {
+		t.Fatalf("INSERT #2 failed: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("COMMIT failed: %v", err)
+	}
+
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+
+	tmpDir := t.TempDir()
+	cpCmd := exec.Command("docker", "cp",
+		fmt.Sprintf("bintrail-test-mysql:/var/lib/mysql/%s", currentBinlog),
+		filepath.Join(tmpDir, currentBinlog),
+	)
+	if out, err := cpCmd.CombinedOutput(); err != nil {
+		t.Fatalf("docker cp %s failed: %v\n%s", currentBinlog, err, out)
+	}
+
+	p := parser.New(tmpDir, resolver, parser.Filters{
+		Schemas: map[string]bool{sourceName: true},
+	}, nil)
+
+	events := make(chan parser.Event, 100)
+	done := make(chan error, 1)
+	go func() {
+		defer close(events)
+		done <- p.ParseFile(context.Background(), currentBinlog, events)
+	}()
+	all := drainEvents(events)
+	if err := <-done; err != nil {
+		t.Fatalf("ParseFile failed: %v", err)
+	}
+
+	dml := dmlEvents(all)
+	if len(dml) != 2 {
+		t.Fatalf("expected 2 DML events, got %d", len(dml))
+	}
+	if dml[0].QueryText != firstSQL {
+		t.Errorf("row 1: QueryText = %q, want %q", dml[0].QueryText, firstSQL)
+	}
+	if dml[1].QueryText != "" {
+		t.Errorf("row 2: QueryText = %q, want EMPTY — a statement that logged no ROWS_QUERY must never inherit the previous statement's text", dml[1].QueryText)
+	}
+}

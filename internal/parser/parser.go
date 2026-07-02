@@ -161,15 +161,28 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 		case *replication.RowsQueryEvent:
 			// The original SQL statement (binlog_rows_query_log_events=ON),
 			// emitted right before the statement's TABLE_MAP + rows events.
-			currentQueryText = string(ev.Query)
+			// Sanitized ONCE here at the capture boundary — every downstream
+			// path (index INSERT, BYOS buffer/payload) sees bounded, valid
+			// UTF-8 text.
+			currentQueryText = event.SanitizeQueryText(string(ev.Query))
 
 		case *replication.MariadbAnnotateRowsEvent:
 			// MariaDB's positional sibling of ROWS_QUERY_EVENT
 			// (binlog_annotate_row_events=ON).
-			currentQueryText = string(ev.Query)
+			currentQueryText = event.SanitizeQueryText(string(ev.Query))
 
 		case *replication.RowsEvent:
-			return handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentQueryText, p.schemaVersion.Load(), events)
+			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentQueryText, p.schemaVersion.Load(), events)
+			// The LAST rows event of a statement carries STMT_END_F — the
+			// actual statement boundary. Clearing here keeps one statement's
+			// text alive across its chained/split rows events, while a later
+			// statement in the SAME transaction that logged no ROWS_QUERY
+			// (variable toggled off mid-transaction — MySQL allows it; there
+			// is no GTID/QUERY boundary in between) can never inherit it.
+			if ev.Flags&replication.RowsEventStmtEndFlag != 0 {
+				currentQueryText = ""
+			}
+			return err
 
 		case *replication.TransactionPayloadEvent:
 			for _, inner := range ev.Events {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
@@ -236,16 +237,26 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 		case *replication.RowsQueryEvent:
 			// The original SQL statement (binlog_rows_query_log_events=ON),
 			// emitted right before the statement's TABLE_MAP + rows events.
-			currentQueryText = string(ev.Query)
+			// Sanitized ONCE here at the capture boundary — every downstream
+			// path (index INSERT, BYOS buffer/payload) sees bounded, valid
+			// UTF-8 text.
+			currentQueryText = event.SanitizeQueryText(string(ev.Query))
 
 		case *replication.MariadbAnnotateRowsEvent:
 			// MariaDB's positional sibling of ROWS_QUERY_EVENT
 			// (binlog_annotate_row_events=ON on the source; only sent when the
 			// syncer requested BINLOG_SEND_ANNOTATE_ROWS_EVENT).
-			currentQueryText = string(ev.Query)
+			currentQueryText = event.SanitizeQueryText(string(ev.Query))
 
 		case *replication.RowsEvent:
-			return handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentQueryText, sp.schemaVersion.Load(), out)
+			err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentQueryText, sp.schemaVersion.Load(), out)
+			// Statement boundary — see the file parser's RowsEvent case: the
+			// STMT_END_F clear prevents a ROWS_QUERY-less later statement in
+			// the same transaction from inheriting this statement's text.
+			if ev.Flags&replication.RowsEventStmtEndFlag != 0 {
+				currentQueryText = ""
+			}
+			return err
 
 		case *replication.TransactionPayloadEvent:
 			for _, inner := range ev.Events {
