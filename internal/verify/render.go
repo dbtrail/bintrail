@@ -329,7 +329,8 @@ func walkForDuplicateKeys(dec *json.Decoder) (bool, error) {
 //     manipulation, a replication gap) — which already breaks verify's
 //     guarantee for every column type, not something this normalization
 //     introduces. See TestVerifyBaselinePair_StaleZeroDateVsGenuineNull_AcceptedRisk
-//     for the concrete case this accepts, and #693 for the tracking issue.
+//     for the concrete case this accepts — a deliberate, reviewed trade-off,
+//     not open follow-up work.
 //
 // Used ONLY by the baseline-anchored comparison (VerifyBaselinePair,
 // ExplainBaselinePairMismatch): both operands there are produced by this
