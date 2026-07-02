@@ -120,6 +120,8 @@ func buildBinlogEventsDDL(parts []string, encrypt bool) string {
     row_before      JSON             DEFAULT NULL COMMENT 'full row before image (UPDATE, DELETE)',
     row_after       JSON             DEFAULT NULL COMMENT 'full row after image (INSERT, UPDATE)',
     schema_version  INT UNSIGNED     NOT NULL DEFAULT 0 COMMENT 'snapshot_id from schema_snapshots at index time; enables per-row resolver lookup for recovery',
+    query_text      MEDIUMTEXT       DEFAULT NULL COMMENT 'original SQL statement from ROWS_QUERY/ANNOTATE_ROWS; NULL unless binlog_rows_query_log_events (MySQL) / binlog_annotate_row_events (MariaDB) is ON at the source (#699)',
+    query_hash      CHAR(64)         DEFAULT NULL COMMENT 'STATEMENT_DIGEST(query_text) computed on the index connection at index time; groups statements by normalized shape (#699)',
     PRIMARY KEY (event_id, event_timestamp),
     INDEX idx_row_lookup (schema_name, table_name, event_timestamp),
     INDEX idx_pk_hash    (schema_name, table_name, pk_hash, event_timestamp),

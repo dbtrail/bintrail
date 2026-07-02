@@ -67,7 +67,7 @@ func WriteParquet(rows []query.ResultRow, outputPath, compression string) (int64
 
 // rowToParquet converts a ResultRow to the string values and null flags
 // expected by baseline.Writer.WriteRow. Column order matches
-// archive.BinlogEventColumns (15 columns).
+// archive.BinlogEventColumns (17 columns).
 func rowToParquet(r *query.ResultRow) ([]string, []bool, error) {
 	gtidStr := ""
 	gtidNull := true
@@ -81,6 +81,20 @@ func rowToParquet(r *query.ResultRow) ([]string, []bool, error) {
 	if r.ConnectionID != nil {
 		connIDStr = strconv.FormatUint(uint64(*r.ConnectionID), 10)
 		connIDNull = false
+	}
+
+	queryTextStr := ""
+	queryTextNull := true
+	if r.QueryText != nil {
+		queryTextStr = *r.QueryText
+		queryTextNull = false
+	}
+
+	queryHashStr := ""
+	queryHashNull := true
+	if r.QueryHash != nil {
+		queryHashStr = *r.QueryHash
+		queryHashNull = false
 	}
 
 	changedCols, changedNull, err := marshalJSONField(r.ChangedColumns)
@@ -112,6 +126,8 @@ func rowToParquet(r *query.ResultRow) ([]string, []bool, error) {
 		rowBefore,
 		rowAfter,
 		strconv.FormatUint(uint64(r.SchemaVersion), 10),
+		queryTextStr,
+		queryHashStr,
 	}
 
 	nulls := []bool{
@@ -123,6 +139,8 @@ func rowToParquet(r *query.ResultRow) ([]string, []bool, error) {
 		beforeNull,
 		afterNull,
 		false,
+		queryTextNull,
+		queryHashNull,
 	}
 
 	return values, nulls, nil

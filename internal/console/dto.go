@@ -13,13 +13,15 @@ const consoleTSFormat = "2006-01-02 15:04:05"
 // eventDTO is the JSON-serialisable view of a query.ResultRow exposed by the
 // console's read-only API.
 //
-// It deliberately OMITS connection_id. That field — the MySQL pseudo_thread_id
-// of the transaction that produced the change — is actor-attribution data and
-// belongs to the paid "forensics" surface (who-changed / audit), not the free
+// It deliberately OMITS connection_id, query_text, and query_hash. Those
+// fields — the MySQL pseudo_thread_id of the transaction that produced the
+// change, and the originating SQL statement + its STATEMENT_DIGEST (#699) —
+// are actor/statement-attribution data and belong to the paid "forensics"
+// surface (who-changed / what-statement / audit), not the free
 // "query_explorer" surface this console exposes. The omission is the entire
-// open-core boundary for the events API: query.ResultRow carries ConnectionID,
-// the package's own jsonRow serialises it, but this DTO drops it on the way out.
-// Do not add it here without crossing the licensing line.
+// open-core boundary for the events API: query.ResultRow carries those fields,
+// the package's own jsonRow serialises them, but this DTO drops them on the
+// way out. Do not add them here without crossing the licensing line.
 type eventDTO struct {
 	EventID        uint64         `json:"event_id"`
 	BinlogFile     string         `json:"binlog_file"`
@@ -37,7 +39,8 @@ type eventDTO struct {
 }
 
 // toEventDTO maps a query.ResultRow to the redacted wire view, dropping
-// connection_id and stringifying the event type and timestamp.
+// connection_id/query_text/query_hash and stringifying the event type and
+// timestamp.
 func toEventDTO(r query.ResultRow) eventDTO {
 	return eventDTO{
 		EventID:        r.EventID,

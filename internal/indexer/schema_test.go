@@ -25,6 +25,9 @@ func TestBuildBinlogEventsDDL_noEncrypt(t *testing.T) {
 	if !strings.Contains(ddl, "schema_version") {
 		t.Error("expected schema_version column in DDL")
 	}
+	if !strings.Contains(ddl, "query_text") || !strings.Contains(ddl, "query_hash") {
+		t.Error("expected query_text and query_hash columns in DDL (#699)")
+	}
 }
 
 func TestBuildBinlogEventsDDL_withEncrypt(t *testing.T) {

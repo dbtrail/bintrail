@@ -136,6 +136,7 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 	report.add(checkBinlogFormat(sourceDB))
 	report.add(checkBinlogRowImage(sourceDB))
 	report.add(checkBinlogRetention(sourceDB))
+	report.add(checkStatementCapture(sourceDB))
 	report.add(checkReplicationGrants(ctx, sourceDB))
 	report.add(checkFKCascades(sourceDB, schemas))
 	report.add(checkSchemaVisibility(ctx, sourceDB, schemas))
@@ -320,6 +321,55 @@ func checkBinlogRetention(db *sql.DB) CheckResult {
 		Name:   "Binlog retention >= 2 days",
 		Status: StatusPass,
 		Detail: fmt.Sprintf("%dh", seconds/3600),
+	}
+}
+
+// checkStatementCapture reports whether the source logs the original SQL
+// statement alongside each row event (#699): MySQL's
+// binlog_rows_query_log_events or MariaDB's binlog_annotate_row_events. The
+// capture is OPTIONAL — it feeds the query_text/query_hash forensics columns —
+// so this check never FAILs: ON → PASS, OFF → WARN with an enable suggestion
+// (validate, never set), variable absent on both probes → SKIP. Both probes use
+// SELECT @@var, which errors (MySQL 1193) rather than returning rows for a
+// variable the flavor doesn't have — the checkBinlogRetention fallback pattern.
+func checkStatementCapture(db *sql.DB) CheckResult {
+	const name = "Statement capture (query_text)"
+	isOn := func(val string) bool { return val == "1" || strings.EqualFold(val, "ON") }
+
+	var val string
+	if err := db.QueryRow("SELECT @@binlog_rows_query_log_events").Scan(&val); err == nil {
+		if isOn(val) {
+			return CheckResult{Name: name, Status: StatusPass, Detail: "binlog_rows_query_log_events=ON"}
+		}
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "binlog_rows_query_log_events=OFF — events index without the originating SQL statement (query_text stays NULL)",
+			Remediation: "Optional: log the original statement with each row event so `bintrail query` can show it (dynamic, no restart; costs binlog bytes per statement):\n\n" +
+				"  SET PERSIST binlog_rows_query_log_events = ON;",
+		}
+	}
+
+	// MariaDB names the same capability binlog_annotate_row_events
+	// (default ON since 10.2.4).
+	if err := db.QueryRow("SELECT @@binlog_annotate_row_events").Scan(&val); err == nil {
+		if isOn(val) {
+			return CheckResult{Name: name, Status: StatusPass, Detail: "binlog_annotate_row_events=ON"}
+		}
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "binlog_annotate_row_events=OFF — events index without the originating SQL statement (query_text stays NULL)",
+			Remediation: "Optional: log the original statement with each row event so `bintrail query` can show it:\n\n" +
+				"  SET GLOBAL binlog_annotate_row_events = ON;\n\n" +
+				"Persist it in my.cnf ([mysqld] binlog_annotate_row_events=ON) to survive restarts.",
+		}
+	}
+
+	return CheckResult{
+		Name:   name,
+		Status: StatusSkip,
+		Detail: "neither binlog_rows_query_log_events nor binlog_annotate_row_events is available on this server",
 	}
 }
 

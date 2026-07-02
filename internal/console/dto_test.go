@@ -13,10 +13,13 @@ import (
 )
 
 // TestEventDTOOmitsConnectionID is the load-bearing open-core test: the events
-// API must never expose connection_id (actor attribution = paid forensics).
+// API must never expose connection_id (actor attribution = paid forensics),
+// nor query_text/query_hash (statement attribution = paid forensics, #699).
 func TestEventDTOOmitsConnectionID(t *testing.T) {
 	cid := uint32(98765)
 	gtid := "uuid:1-10"
+	qText := "UPDATE users SET email='b@x' WHERE id=42"
+	qHash := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 	row := query.ResultRow{
 		EventID:        1,
 		EventTimestamp: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
@@ -29,6 +32,8 @@ func TestEventDTOOmitsConnectionID(t *testing.T) {
 		ChangedColumns: []string{"email"},
 		RowBefore:      map[string]any{"email": "a@x"},
 		RowAfter:       map[string]any{"email": "b@x"},
+		QueryText:      &qText, // present on the source row…
+		QueryHash:      &qHash, // present on the source row…
 	}
 
 	b, err := json.Marshal(toEventDTO(row))
@@ -43,6 +48,12 @@ func TestEventDTOOmitsConnectionID(t *testing.T) {
 	}
 	if strings.Contains(js, "98765") {
 		t.Errorf("eventDTO JSON must not leak the connection id value: %s", js)
+	}
+	if strings.Contains(js, "query_text") || strings.Contains(js, "query_hash") {
+		t.Errorf("eventDTO JSON must not contain query_text/query_hash keys: %s", js)
+	}
+	if strings.Contains(js, "WHERE id=42") || strings.Contains(js, qHash) {
+		t.Errorf("eventDTO JSON must not leak the statement text or its digest: %s", js)
 	}
 
 	for _, want := range []string{

@@ -94,6 +94,12 @@ func (b *Buffer) Insert(events []event.Event) {
 			connID = &v
 		}
 
+		var queryText *string
+		if ev.QueryText != "" {
+			s := ev.QueryText
+			queryText = &s
+		}
+
 		row := query.ResultRow{
 			BinlogFile:     ev.BinlogFile,
 			StartPos:       ev.StartPos,
@@ -109,6 +115,10 @@ func (b *Buffer) Insert(events []event.Event) {
 			RowBefore:      ev.RowBefore,
 			RowAfter:       ev.RowAfter,
 			SchemaVersion:  ev.SchemaVersion,
+			QueryText:      queryText,
+			// QueryHash stays nil: the digest is an index-side enrichment
+			// (STATEMENT_DIGEST on the index connection) and the BYOS buffer
+			// has no index database.
 		}
 
 		sz := estimateRowSize(&row)
@@ -325,6 +335,9 @@ func estimateRowSize(r *query.ResultRow) int64 {
 
 	if r.GTID != nil {
 		n += int64(len(*r.GTID))
+	}
+	if r.QueryText != nil {
+		n += int64(len(*r.QueryText))
 	}
 	for _, c := range r.ChangedColumns {
 		n += int64(len(c))

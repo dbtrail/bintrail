@@ -8,7 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
+	"unicode/utf8"
 
 	mysql "github.com/go-sql-driver/mysql"
 
@@ -21,6 +24,9 @@ type Indexer struct {
 	db        *sql.DB
 	batchSize int
 	onDDL     func(ev event.Event) error
+	// digestWarnOnce rate-limits the STATEMENT_DIGEST-unavailable warning to
+	// one line per Indexer — without it a non-8.0 index would warn every batch.
+	digestWarnOnce sync.Once
 }
 
 // New creates an Indexer writing to db with the given batch size.
@@ -104,14 +110,32 @@ func (idx *Indexer) BatchSize() int {
 // event_id and pk_hash are omitted — they are AUTO_INCREMENT and STORED
 // generated respectively, so MySQL computes them on write.
 func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
-	// 14 placeholders per row
-	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
+	// 16 placeholders per row
+	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
 	insertSQL := `INSERT INTO binlog_events ` +
 		`(binlog_file, start_pos, end_pos, event_timestamp, gtid, connection_id, ` +
 		`schema_name, table_name, event_type, pk_values, ` +
-		`changed_columns, row_before, row_after, schema_version) VALUES ` + valClause
+		`changed_columns, row_before, row_after, schema_version, query_text, query_hash) VALUES ` + valClause
 
-	args := make([]any, 0, len(batch)*14)
+	// Sanitize each event's captured statement text, then resolve the batch's
+	// DISTINCT texts to STATEMENT_DIGEST hashes in one round trip (#699).
+	// Sanitizing first keeps the stored hash consistent with the stored text.
+	sanitized := make([]string, len(batch))
+	var distinct []string
+	seen := make(map[string]struct{})
+	for i := range batch {
+		if batch[i].QueryText == "" {
+			continue
+		}
+		sanitized[i] = sanitizeQueryText(batch[i].QueryText)
+		if _, ok := seen[sanitized[i]]; !ok {
+			seen[sanitized[i]] = struct{}{}
+			distinct = append(distinct, sanitized[i])
+		}
+	}
+	digests := idx.digestStatements(distinct)
+
+	args := make([]any, 0, len(batch)*16)
 	for i := range batch {
 		ev := &batch[i]
 
@@ -143,6 +167,8 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 			rowBefore,
 			rowAfter,
 			ev.SchemaVersion,
+			nullOrString(sanitized[i]),
+			nullOrString(digests[sanitized[i]]),
 		)
 	}
 
@@ -152,6 +178,79 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 	}
 	n, _ := result.RowsAffected()
 	return n, nil
+}
+
+// ─── Query-text enrichment (#699) ─────────────────────────────────────────────
+
+// maxQueryTextBytes caps the stored query_text. ROWS_QUERY/ANNOTATE events
+// carry the FULL original statement — a bulk INSERT can run to megabytes — and
+// every row event of that statement repeats the text in the batch INSERT args,
+// so uncapped text could blow past max_allowed_packet on the index connection
+// and fail the whole batch. 16 KiB keeps any realistic hand-written or ORM
+// statement intact; only bulk-statement tails are cut.
+const maxQueryTextBytes = 16 * 1024
+
+// queryTextTruncationMarker is appended to a capped query_text so a forensics
+// reader can tell a truncated statement from a complete one.
+const queryTextTruncationMarker = " /* bintrail:truncated */"
+
+// sanitizeQueryText prepares a captured statement for storage: it replaces
+// invalid UTF-8 (a _binary'...' literal embeds raw bytes, which strict mode
+// would reject with error 1366, aborting the whole batch INSERT) and caps the
+// byte length at a rune boundary, appending queryTextTruncationMarker when cut.
+func sanitizeQueryText(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = strings.ToValidUTF8(s, "�")
+	if len(s) <= maxQueryTextBytes {
+		return s
+	}
+	cut := maxQueryTextBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + queryTextTruncationMarker
+}
+
+// digestStatements resolves each distinct statement text to its
+// STATEMENT_DIGEST() hash in ONE round trip on the index connection
+// (STATEMENT_DIGEST exists on MySQL 8.0+, the index contract floor). The
+// digest is an enrichment: on any failure it degrades to a nil map (all
+// query_hash values NULL) while query_text is still stored, and the failure
+// is logged once per Indexer.
+func (idx *Indexer) digestStatements(texts []string) map[string]string {
+	if len(texts) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	sb.WriteString("SELECT STATEMENT_DIGEST(?)")
+	for range len(texts) - 1 {
+		sb.WriteString(", STATEMENT_DIGEST(?)")
+	}
+	args := make([]any, len(texts))
+	for i, t := range texts {
+		args[i] = t
+	}
+	vals := make([]sql.NullString, len(texts))
+	ptrs := make([]any, len(texts))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if err := idx.db.QueryRow(sb.String(), args...).Scan(ptrs...); err != nil {
+		idx.digestWarnOnce.Do(func() {
+			slog.Warn("STATEMENT_DIGEST unavailable on the index connection — query_hash will be NULL (query_text is unaffected)",
+				"error", err)
+		})
+		return nil
+	}
+	out := make(map[string]string, len(texts))
+	for i, t := range texts {
+		if vals[i].Valid {
+			out[t] = vals[i].String
+		}
+	}
+	return out
 }
 
 // ─── Serialisation helpers ────────────────────────────────────────────────────
@@ -252,6 +351,25 @@ func EnsureSchema(db *sql.DB) error {
 	// existing rows + MySQL snapshots read back as "not identity" with no migration.
 	if err := ensureColumn(db, "schema_snapshots", "is_identity_always",
 		`ALTER TABLE schema_snapshots ADD COLUMN is_identity_always TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1 if PostgreSQL GENERATED ALWAYS AS IDENTITY; 0 for MySQL (#557)' AFTER pg_type_mod`,
+	); err != nil {
+		return err
+	}
+	// query_text/query_hash carry the original SQL statement that produced each
+	// row event (#699): the text from the binlog's ROWS_QUERY/ANNOTATE_ROWS
+	// event (opt-in on the source via binlog_rows_query_log_events /
+	// binlog_annotate_row_events), and its STATEMENT_DIGEST computed on the
+	// index connection at insert time. Nullable: rows indexed before this
+	// column existed, or while capture is off at the source, read back NULL.
+	// MEDIUMTEXT (not TEXT): a bulk statement easily exceeds 64 KB and a 1406
+	// under strict mode would abort the whole batch INSERT; the indexer also
+	// caps the stored text at maxQueryTextBytes as defense in depth.
+	if err := ensureColumn(db, "binlog_events", "query_text",
+		`ALTER TABLE binlog_events ADD COLUMN query_text MEDIUMTEXT DEFAULT NULL COMMENT 'original SQL statement from ROWS_QUERY/ANNOTATE_ROWS; NULL unless binlog_rows_query_log_events (MySQL) / binlog_annotate_row_events (MariaDB) is ON at the source (#699)' AFTER schema_version`,
+	); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "binlog_events", "query_hash",
+		`ALTER TABLE binlog_events ADD COLUMN query_hash CHAR(64) DEFAULT NULL COMMENT 'STATEMENT_DIGEST(query_text) computed on the index connection at index time; groups statements by normalized shape (#699)' AFTER query_text`,
 	); err != nil {
 		return err
 	}

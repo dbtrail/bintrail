@@ -206,7 +206,7 @@ func TestHandleRows_unhandledEventTypeLogsNotSilent(t *testing.T) {
 	rowsEv := binlogEv.Event.(*replication.RowsEvent)
 
 	out := make(chan Event, 4)
-	if err := handleRows(context.Background(), logger, resolver, &Filters{}, binlogEv, rowsEv, "mariadb-bin.000001", "0-1-1", 0, 1, out); err != nil {
+	if err := handleRows(context.Background(), logger, resolver, &Filters{}, binlogEv, rowsEv, "mariadb-bin.000001", "0-1-1", 0, "", 1, out); err != nil {
 		t.Fatalf("handleRows: %v", err)
 	}
 
@@ -507,7 +507,7 @@ func TestHandleRows_partialImageFailsLoud(t *testing.T) {
 	rowsEv := binlogEv.Event.(*replication.RowsEvent)
 
 	out := make(chan Event, 4)
-	err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "0-1-1", 0, 1, out)
+	err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "0-1-1", 0, "", 1, out)
 	if err == nil {
 		t.Fatal("expected handleRows to fail loud on a partial row image, got nil")
 	}
@@ -559,7 +559,7 @@ func TestHandleRows_fullImagePasses(t *testing.T) {
 	rowsEv := binlogEv.Event.(*replication.RowsEvent)
 
 	out := make(chan Event, 4)
-	if err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "0-1-1", 0, 1, out); err != nil {
+	if err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "0-1-1", 0, "", 1, out); err != nil {
 		t.Fatalf("handleRows must not fail on a FULL image, got: %v", err)
 	}
 	select {

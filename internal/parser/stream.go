@@ -85,6 +85,12 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	var currentFile string
 	var currentGTID string
 	var currentConnectionID uint32 // pseudo_thread_id from most recent QueryEvent
+	// currentQueryText holds the original SQL statement from the most recent
+	// ROWS_QUERY_EVENT (MySQL, binlog_rows_query_log_events=ON) or
+	// ANNOTATE_ROWS event (MariaDB, binlog_annotate_row_events=ON; the syncer
+	// must request it via BINLOG_SEND_ANNOTATE_ROWS_EVENT). Statement-scoped —
+	// see the file parser's currentQueryText for the full contract.
+	var currentQueryText string
 
 	// emitCommit signals a transaction commit boundary so the stream consumer can
 	// advance the durable GTID checkpoint only after the transaction's rows have
@@ -171,6 +177,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 				return err
 			}
 			currentGTID = formatGTID(binlogEv.Header.EventType, ev.SID, ev.GNO)
+			currentQueryText = "" // transaction boundary — statement text never crosses it
 			if err := emitGTIDTracking(binlogEv.Header); err != nil {
 				return err
 			}
@@ -186,12 +193,16 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 				return err
 			}
 			currentGTID = ev.GTID.String()
+			currentQueryText = ""
 			if err := emitGTIDTracking(binlogEv.Header); err != nil {
 				return err
 			}
 
 		case *replication.QueryEvent:
 			currentConnectionID = ev.SlaveProxyID
+			// New statement scope (BEGIN of the next transaction, or a DDL) —
+			// the previous statement's ROWS_QUERY text is stale.
+			currentQueryText = ""
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
 			if ddlEv, ok := parseDDL(sp.logger, currentFile, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), sp.schemaVersion.Load()); ok {
 				select {
@@ -217,12 +228,24 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 		case *replication.XIDEvent:
 			// InnoDB transaction commit — the boundary at which it's safe to
 			// advance the durable GTID checkpoint (#491).
+			currentQueryText = ""
 			if err := emitCommit(binlogEv.Header); err != nil {
 				return err
 			}
 
+		case *replication.RowsQueryEvent:
+			// The original SQL statement (binlog_rows_query_log_events=ON),
+			// emitted right before the statement's TABLE_MAP + rows events.
+			currentQueryText = string(ev.Query)
+
+		case *replication.MariadbAnnotateRowsEvent:
+			// MariaDB's positional sibling of ROWS_QUERY_EVENT
+			// (binlog_annotate_row_events=ON on the source; only sent when the
+			// syncer requested BINLOG_SEND_ANNOTATE_ROWS_EVENT).
+			currentQueryText = string(ev.Query)
+
 		case *replication.RowsEvent:
-			return handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, sp.schemaVersion.Load(), out)
+			return handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentQueryText, sp.schemaVersion.Load(), out)
 
 		case *replication.TransactionPayloadEvent:
 			for _, inner := range ev.Events {

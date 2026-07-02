@@ -77,6 +77,14 @@ type PayloadRecord struct {
 	RowAfter       map[string]any `json:"row_after,omitempty"`
 	ChangedColumns []string       `json:"changed_columns,omitempty"`
 	SchemaVersion  uint32         `json:"schema_version"`
+	// QueryText is the original SQL statement (#699). PAYLOAD-ONLY by design:
+	// statement text embeds literal column values — row-level data in another
+	// form — so it must never appear on MetadataRecord ("only indexing
+	// metadata — no row-level data"). Empty when the source does not log
+	// ROWS_QUERY/ANNOTATE events. There is no query_hash here: the digest is
+	// an index-side enrichment (STATEMENT_DIGEST on the index connection) and
+	// the BYOS pipeline has no index database.
+	QueryText string `json:"query_text,omitempty"`
 }
 
 // PKHash computes the SHA-256 hex digest of pkValues, matching MySQL's
@@ -133,6 +141,7 @@ func SplitEvent(ev event.Event, serverID string, ident SourceIdentity) (Metadata
 		RowAfter:       maps.Clone(ev.RowAfter),
 		ChangedColumns: slices.Clone(changed),
 		SchemaVersion:  ev.SchemaVersion,
+		QueryText:      ev.QueryText,
 	}
 
 	return meta, payload, nil

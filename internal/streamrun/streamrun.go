@@ -1518,6 +1518,16 @@ func One(ctx context.Context, cfg Config) error {
 		MaxReconnectAttempts: 0, // infinite retry
 		TLSConfig:            tlsCfg,
 	}
+	if cfg.Flavor == "mariadb" {
+		// Ask the MariaDB source to send ANNOTATE_ROWS events (the original
+		// SQL statement, MariaDB's sibling of MySQL's ROWS_QUERY_EVENT) over
+		// the replication stream. Unlike MySQL — which sends ROWS_QUERY
+		// unconditionally when binlog_rows_query_log_events=ON — MariaDB only
+		// forwards ANNOTATE events to a replica that set this dump flag, even
+		// when binlog_annotate_row_events=ON wrote them to the binlog (#699).
+		// Harmless when the source has annotation off: no events, no cost.
+		syncerCfg.DumpCommandFlag |= replication.BINLOG_SEND_ANNOTATE_ROWS_EVENT
+	}
 
 	// Use a closure defer so the active syncer is always closed on exit,
 	// even if we replace it during the preferred-mode TLS fallback below.

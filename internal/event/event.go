@@ -74,8 +74,15 @@ type Event struct {
 	Timestamp    time.Time
 	GTID         string // empty when GTID is not enabled on the source
 	ConnectionID uint32 // MySQL pseudo_thread_id from the transaction's QUERY(BEGIN) event; 0 = unknown
-	Schema       string
-	Table        string
+	// QueryText is the original SQL statement that produced this row event,
+	// captured from the statement's ROWS_QUERY_EVENT (MySQL,
+	// binlog_rows_query_log_events=ON) or ANNOTATE_ROWS event (MariaDB,
+	// binlog_annotate_row_events=ON). Empty when the source does not log it —
+	// capture is opt-in on the source (#699). Statement-scoped: a multi-statement
+	// transaction stamps each statement's own text onto its rows.
+	QueryText string
+	Schema    string
+	Table     string
 	// EventType numeric values are a PERSISTENCE CONTRACT: stored as a number in
 	// binlog_events.event_type and filtered by it. Never renumber existing values.
 	EventType     EventType

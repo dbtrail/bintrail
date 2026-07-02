@@ -817,6 +817,44 @@ func TestLimitPerPK_zero_passthrough(t *testing.T) {
 	}
 }
 
+// TestApplyRedaction_blanksQueryTextEverywhere pins the #699 policy: the
+// captured statement text (and its digest) is per-STATEMENT, not per-table —
+// a multi-table statement stamps the same text, literal values included, onto
+// rows of EVERY table it touched. So whenever redaction runs, QueryText and
+// QueryHash are blanked on ALL rows, including rows of tables with no
+// redaction rule of their own.
+func TestApplyRedaction_blanksQueryTextEverywhere(t *testing.T) {
+	qText := "UPDATE mydb.orders o JOIN mydb.products p SET o.amount=100, p.price=5"
+	qHash := strings.Repeat("ab", 32)
+	rows := []ResultRow{
+		{
+			SchemaName: "mydb", TableName: "orders",
+			RowBefore: map[string]any{"amount": float64(100)},
+			QueryText: &qText, QueryHash: &qHash,
+		},
+		{
+			// Different table, NO redaction rule — still must not carry the
+			// statement (it embeds the redacted table's literals).
+			SchemaName: "mydb", TableName: "products",
+			RowBefore: map[string]any{"price": float64(5)},
+			QueryText: &qText, QueryHash: &qHash,
+		},
+	}
+	redact := []SchemaTableColumn{
+		{Schema: "mydb", Table: "orders", Column: "amount"},
+	}
+	applyRedaction(rows, redact)
+
+	for i := range rows {
+		if rows[i].QueryText != nil {
+			t.Errorf("row %d: QueryText must be blanked under an active profile, got %q", i, *rows[i].QueryText)
+		}
+		if rows[i].QueryHash != nil {
+			t.Errorf("row %d: QueryHash must be blanked with the text, got %q", i, *rows[i].QueryHash)
+		}
+	}
+}
+
 func TestApplyRedaction_wrongTable(t *testing.T) {
 	rows := []ResultRow{{
 		SchemaName: "mydb",
