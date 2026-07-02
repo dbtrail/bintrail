@@ -353,7 +353,9 @@ func TestCheckRowMetadata(t *testing.T) {
 	}{
 		{"FULL", row("FULL"), StatusPass, "binlog_row_metadata=FULL", false},
 		{"MINIMAL", row("MINIMAL"), StatusWarn, "binlog_row_metadata=MINIMAL", true},
-		{"variable absent", errResp("Error 1193: Unknown system variable"), StatusSkip, "not available", false},
+		{"MariaDB NO_LOG default", row("NO_LOG"), StatusWarn, "binlog_row_metadata=NO_LOG", true},
+		{"variable absent", mysqlErrResp(1193, "Unknown system variable 'binlog_row_metadata'"), StatusSkip, "not available", false},
+		{"transient read failure", errResp("driver: bad connection"), StatusWarn, "could not read binlog_row_metadata: driver: bad connection", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -394,6 +396,12 @@ type mockSQLScalar struct {
 
 func row(v string) mockSQLScalar       { return mockSQLScalar{value: v} }
 func errResp(msg string) mockSQLScalar { return mockSQLScalar{err: errors.New(msg)} }
+
+// mysqlErrResp mocks a typed MySQL server error (e.g. 1193 unknown system
+// variable) so checks that discriminate by error number can be exercised.
+func mysqlErrResp(number uint16, msg string) mockSQLScalar {
+	return mockSQLScalar{err: &mysql.MySQLError{Number: number, Message: msg}}
+}
 
 func (r mockSQLScalar) apply(exp *sqlmock.ExpectedQuery, col string) {
 	if r.err != nil {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
@@ -59,9 +60,14 @@ func driftRowsEvent(columnNames []string) *replication.BinlogEvent {
 
 func runHandleRows(t *testing.T, binlogEv *replication.BinlogEvent) ([]Event, error) {
 	t.Helper()
+	return runHandleRowsWith(t, driftResolver(), binlogEv, &bytes.Buffer{})
+}
+
+func runHandleRowsWith(t *testing.T, resolver *metadata.Resolver, binlogEv *replication.BinlogEvent, logBuf *bytes.Buffer) ([]Event, error) {
+	t.Helper()
 	rowsEv := binlogEv.Event.(*replication.RowsEvent)
 	out := make(chan Event, 4)
-	err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), driftResolver(), &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 9, out)
+	err := handleRows(context.Background(), newTestLogger(logBuf), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 9, out)
 	close(out)
 	var evs []Event
 	for ev := range out {
@@ -144,5 +150,93 @@ func TestStreamParser_driftErrorPropagates(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "schema drift") {
 		t.Errorf("error = %v, want schema-drift", err)
+	}
+}
+
+// driftResolverAt is driftResolver with an explicit snapshot creation time,
+// for the historical-vs-stale distinction tests.
+func driftResolverAt(snapTime time.Time) *metadata.Resolver {
+	tm := &metadata.TableMeta{
+		Schema: "shop",
+		Table:  "orders",
+		Columns: []metadata.ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+			{Name: "amount", OrdinalPosition: 2, DataType: "int"},
+		},
+		PKColumns: []string{"id"},
+	}
+	return metadata.NewResolverFromTablesAt(9, snapTime, map[string]*metadata.TableMeta{"shop.orders": tm})
+}
+
+// driftRowsEventAt is driftRowsEvent with an explicit event timestamp.
+func driftRowsEventAt(columnNames []string, ts time.Time) *replication.BinlogEvent {
+	ev := driftRowsEvent(columnNames)
+	ev.Header.Timestamp = uint32(ts.Unix())
+	return ev
+}
+
+// A divergence on an event OLDER than the snapshot is a routine historical
+// state (re-indexing history after a rename; stream backlog catch-up) — a
+// hard error would be a permanent dead end whose remediation (re-snapshot)
+// is a no-op. It must warn and proceed under the snapshot's names.
+func TestHandleRows_preSnapshotDriftWarnsAndProceeds(t *testing.T) {
+	snapTime := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	eventTime := snapTime.Add(-1 * time.Hour) // event predates the snapshot
+
+	var logBuf bytes.Buffer
+	evs, err := runHandleRowsWith(t, driftResolverAt(snapTime),
+		driftRowsEventAt([]string{"id", "total"}, eventTime), &logBuf)
+	if err != nil {
+		t.Fatalf("pre-snapshot divergence must not hard-error: %v", err)
+	}
+	if len(evs) != 1 {
+		t.Fatalf("pre-snapshot event must still index, got %d events", len(evs))
+	}
+	if evs[0].RowAfter["amount"] != int64(10) {
+		t.Errorf("values must index under the SNAPSHOT's names, got %v", evs[0].RowAfter)
+	}
+	logged := logBuf.String()
+	for _, want := range []string{"pre-snapshot", "total", "amount"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("historical divergence must warn naming both sides; logs missing %q: %s", want, logged)
+		}
+	}
+}
+
+// A divergence on an event AT-OR-AFTER the snapshot is the genuine stale
+// case — hard error, and re-snapshotting actually converges.
+func TestHandleRows_postSnapshotDriftFailsLoud(t *testing.T) {
+	snapTime := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	eventTime := snapTime.Add(1 * time.Hour) // event AFTER the snapshot
+
+	evs, err := runHandleRowsWith(t, driftResolverAt(snapTime),
+		driftRowsEventAt([]string{"id", "total"}, eventTime), &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("post-snapshot divergence must hard-error (stale snapshot)")
+	}
+	if !strings.Contains(err.Error(), "schema drift") {
+		t.Errorf("error = %v, want schema-drift", err)
+	}
+	if len(evs) != 0 {
+		t.Errorf("stale-snapshot drift must emit no events, got %d", len(evs))
+	}
+}
+
+// MySQL treats the Turkish dotted/dotless I pair (İ U+0130, ı U+0131) as
+// equal to I/i in identifiers, but Unicode simple folding does not — a legal
+// case-style rename İstanbul→istanbul must NOT be drift.
+func TestMysqlIdentEqualFold_turkishDottedI(t *testing.T) {
+	cases := [][2]string{
+		{"İstanbul", "istanbul"},
+		{"ıspanak", "ISPANAK"},
+		{"amount", "AMOUNT"},
+	}
+	for _, c := range cases {
+		if !mysqlIdentEqualFold(c[0], c[1]) {
+			t.Errorf("mysqlIdentEqualFold(%q, %q) = false, want true (MySQL treats them as the same identifier)", c[0], c[1])
+		}
+	}
+	if mysqlIdentEqualFold("amount", "total") {
+		t.Error("distinct identifiers must not fold equal")
 	}
 }

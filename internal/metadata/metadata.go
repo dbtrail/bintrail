@@ -72,7 +72,13 @@ type SnapshotStats struct {
 // It holds the full snapshot in memory for fast per-event lookups during indexing.
 type Resolver struct {
 	snapshotID int
-	tables     map[string]*TableMeta // key: "schema.table"
+	// snapshotTime is the snapshot's creation time (schema_snapshots.
+	// snapshot_time, stamped from the bintrail host clock by TakeSnapshot).
+	// Zero = unknown (test resolvers built via NewResolverFromTables).
+	// The #700 drift guard uses it to tell a STALE snapshot (event newer
+	// than the snapshot) from a routine HISTORICAL event (older).
+	snapshotTime time.Time
+	tables       map[string]*TableMeta // key: "schema.table"
 }
 
 // NewResolver loads all table metadata for the given snapshot from the index
@@ -106,6 +112,17 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	defer rows.Close()
 
 	r := &Resolver{snapshotID: snapshotID, tables: make(map[string]*TableMeta)}
+
+	// Snapshot creation time (all rows of one snapshot share it; MIN is
+	// defensive). Best-effort: a scan failure leaves it zero (unknown), which
+	// the #700 drift guard treats as strict.
+	var snapTime sql.NullTime
+	if err := db.QueryRow(
+		"SELECT MIN(snapshot_time) FROM schema_snapshots WHERE snapshot_id = ?",
+		snapshotID).Scan(&snapTime); err == nil && snapTime.Valid {
+		r.snapshotTime = snapTime.Time
+	}
+
 	sawColumnType := false
 	sawDataType := false
 
@@ -174,13 +191,24 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 }
 
 // NewResolverFromTables creates a Resolver directly from a pre-built table map.
-// The map key must be "schema.table". Primarily useful for testing.
+// The map key must be "schema.table". Primarily useful for testing. The
+// snapshot time is left zero (unknown) — use NewResolverFromTablesAt to set it.
 func NewResolverFromTables(snapshotID int, tables map[string]*TableMeta) *Resolver {
 	return &Resolver{snapshotID: snapshotID, tables: tables}
 }
 
+// NewResolverFromTablesAt is NewResolverFromTables with an explicit snapshot
+// creation time, for tests exercising the #700 historical-event distinction.
+func NewResolverFromTablesAt(snapshotID int, snapshotTime time.Time, tables map[string]*TableMeta) *Resolver {
+	return &Resolver{snapshotID: snapshotID, snapshotTime: snapshotTime, tables: tables}
+}
+
 // SnapshotID returns the snapshot ID this resolver was loaded from.
 func (r *Resolver) SnapshotID() int { return r.snapshotID }
+
+// SnapshotTime returns the snapshot's creation time; zero when unknown
+// (resolvers built by NewResolverFromTables without an explicit time).
+func (r *Resolver) SnapshotTime() time.Time { return r.snapshotTime }
 
 // TableCount returns the number of tables in this resolver.
 func (r *Resolver) TableCount() int { return len(r.tables) }
