@@ -226,7 +226,7 @@ func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int
 // renders each row's columns (in orderedCols order) via render, and returns the
 // order-independent content digest + row count. Shared by the live-source
 // verify (VerifyTable, which passes plain renderCell) and the baseline-pair
-// verify (#642, which passes renderCellCanonicalJSON — see its doc comment for
+// verify (#642, which passes renderCellBaselineAnchored — see its doc comment for
 // why that canonicalization is safe only there): both sides of any one
 // comparison must be produced with the SAME render func so the digests are
 // byte-comparable by construction.

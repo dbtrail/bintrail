@@ -821,7 +821,7 @@ func TestVerifyBaselinePair_TextOnlyChange_Match(t *testing.T) {
 // inconclusive downgrade either — two byte-different renderings of identical
 // data reported a hard MISMATCH.
 //
-// Fixed by renderCellCanonicalJSON: the baseline-anchored comparison
+// Fixed by renderCellBaselineAnchored: the baseline-anchored comparison
 // canonicalizes JSON object/array values on BOTH sides, so this now reports a
 // genuine StatusMatch — not merely "inconclusive". id=2 in the same table
 // proves the fix isn't a blanket "ignore JSON columns" — a GENUINE content
@@ -935,7 +935,7 @@ func TestVerifyBaselinePair_JSONValuedTextColumn_KeyOrderIsAMatch(t *testing.T) 
 }
 
 // TestVerifyBaselinePair_JSONValuedTextColumn_Isolated_Match isolates
-// VerifyBaselinePair's OWN digest wiring (the two renderCellCanonicalJSON
+// VerifyBaselinePair's OWN digest wiring (the two renderCellBaselineAnchored
 // calls in verify_baseline.go) for the JSON-key-order fix — the same way
 // TestVerifyBaselinePair_TextOnlyChange_Match isolates the sibling #672
 // TEXT-decode fix.
@@ -1100,5 +1100,169 @@ func TestVerifyBaselinePair_DuplicateJSONKey_StaysMismatch(t *testing.T) {
 	}
 	if got.Status != StatusMismatch {
 		t.Fatalf("status = %q (%s); want mismatch — a baseline with a genuine duplicate JSON key must never silently match an already-collapsed recovered value", got.Status, got.Detail)
+	}
+}
+
+// TestVerifyBaselinePair_ZeroDateSentinel_IsAMatch is a repro + regression
+// test for a second user-reported false MISMATCH, this time on
+// wp_actionscheduler_actions.last_attempt_gmt/last_attempt_local: baseline
+// (real) showed NULL, recovered showed "0000-00-00 00:00:00" — same
+// underlying data, different representation.
+//
+// Root cause: internal/baseline.Writer.WriteRow deliberately maps MySQL's
+// all-zero date/datetime pseudo-NULL to Parquet NULL for every zero-date
+// value (Go's time parser rejects '0000-00-00' outright — see
+// internal/baseline/writer.go's errZeroDate). A row touched by an event
+// still carries the literal sentinel text in its image (go-mysql can't
+// parse it into a time.Time either, so it decodes as a plain string), which
+// renderCell passes through verbatim. Comparing the baseline's NULL against
+// the event image's literal sentinel text — for the SAME underlying
+// zero-date value — reported a hard mismatch.
+//
+// This table has nothing else that could cause a mismatch: if
+// renderCellBaselineAnchored's isZeroDateSentinel normalization weren't
+// wired into VerifyBaselinePair's own digest, this test — not just an
+// Explain drill-down — would report StatusMismatch.
+func TestVerifyBaselinePair_ZeroDateSentinel_IsAMatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"action_id", "PRI", "int", "int", 1},
+		{"last_attempt_gmt", "", "datetime", "datetime", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'actionscheduler_actions', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `actionscheduler_actions` (\n  `action_id` INT NOT NULL,\n  `last_attempt_gmt` DATETIME,\n  PRIMARY KEY (`action_id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "action_id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "last_attempt_gmt", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
+	}
+	// Both baselines carry the literal zero-date sentinel as the raw MySQL
+	// text — writeTestBaseline routes it through the REAL WriteRow, whose
+	// own errZeroDate handling converts it to Parquet NULL unconditionally,
+	// exactly reproducing how a real baseline dump would render it. The
+	// ONLY row in the table, so nothing else can cause a mismatch.
+	writeTestBaseline(t, baseDir, prevTS, dbName, "actionscheduler_actions", createSQL, cols, [][]string{
+		{"577", "0000-00-00 00:00:00"},
+	}, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, dbName, "actionscheduler_actions", createSQL, cols, [][]string{
+		{"577", "0000-00-00 00:00:00"},
+	}, "binlog.000001", 300)
+
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+	ets := prevTS.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	// An UPDATE event touches this row; its image carries the literal
+	// zero-date sentinel text (go-mysql can't decode it into a time.Time),
+	// exactly as MySQL's own row-image would.
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ets, nil, dbName, "actionscheduler_actions", 2 /*UPDATE*/, "577", []byte(`["last_attempt_gmt"]`),
+		[]byte(`{"action_id":577,"last_attempt_gmt":"0000-00-00 00:00:00"}`),
+		[]byte(`{"action_id":577,"last_attempt_gmt":"0000-00-00 00:00:00"}`))
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
+	ctx := context.Background()
+	pairs, _, _, err := FindBaselinePair(ctx, baseDir)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
+	}
+
+	got, err := VerifyBaselinePair(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Fatalf("status = %q (%s); want match — a baseline NULL for a temporal column can only have come from WriteRow's own zero-date substitution, so it must agree with an event image's literal zero-date sentinel", got.Status, got.Detail)
+	}
+}
+
+// TestVerifyBaselinePair_ZeroDateVsRealNull_StaysMismatch proves the
+// zero-date normalization is narrowly scoped: a GENUINE divergence — the
+// event recovers a real, non-zero-date value while the baseline is NULL
+// (from the SAME zero-date substitution TestVerifyBaselinePair_
+// ZeroDateSentinel_IsAMatch exercises) — must still be reported as a
+// mismatch. isZeroDateSentinel must only match the exact sentinel text, not
+// "any value when the baseline happens to be NULL."
+func TestVerifyBaselinePair_ZeroDateVsRealNull_StaysMismatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"action_id", "PRI", "int", "int", 1},
+		{"last_attempt_gmt", "", "datetime", "datetime", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'actionscheduler_actions', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `actionscheduler_actions` (\n  `action_id` INT NOT NULL,\n  `last_attempt_gmt` DATETIME,\n  PRIMARY KEY (`action_id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "action_id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "last_attempt_gmt", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
+	}
+	// Both baselines carry the zero-date-substituted NULL, same as the sibling
+	// match test — the divergence this test proves is NOT masked comes from
+	// the event's recovered value, not from how the baseline got to NULL.
+	writeTestBaseline(t, baseDir, prevTS, dbName, "actionscheduler_actions", createSQL, cols, [][]string{
+		{"577", "0000-00-00 00:00:00"},
+	}, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, dbName, "actionscheduler_actions", createSQL, cols, [][]string{
+		{"577", "0000-00-00 00:00:00"},
+	}, "binlog.000001", 300)
+
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+	ets := prevTS.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	// The event recovers a REAL, non-zero-date timestamp — genuinely
+	// different from the baseline's NULL, not a representation artifact.
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ets, nil, dbName, "actionscheduler_actions", 2 /*UPDATE*/, "577", []byte(`["last_attempt_gmt"]`),
+		[]byte(`{"action_id":577,"last_attempt_gmt":null}`),
+		[]byte(`{"action_id":577,"last_attempt_gmt":"2026-06-15 12:30:45"}`))
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
+	ctx := context.Background()
+	pairs, _, _, err := FindBaselinePair(ctx, baseDir)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
+	}
+
+	got, err := VerifyBaselinePair(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair: %v", err)
+	}
+	if got.Status != StatusMismatch {
+		t.Fatalf("status = %q (%s); want mismatch — a real recovered value diverging from a genuine baseline NULL must not be swallowed by the zero-date equivalence", got.Status, got.Detail)
 	}
 }

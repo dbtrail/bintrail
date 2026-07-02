@@ -57,6 +57,49 @@ func TestRenderCell_MatchesTextProtocolForm(t *testing.T) {
 	}
 }
 
+// TestIsZeroDateSentinel_TemporalOnly is the fix for a user-reported false
+// MISMATCH: a baseline shows NULL for a zero-date value (internal/baseline's
+// WriteRow maps it there unconditionally), while an event-touched row's
+// image still carries the literal '0000-00-00...' sentinel text. Must
+// recognize DATE/DATETIME/TIMESTAMP's zero-date family, in all three forms,
+// and must NOT fire for TIME (where '00:00:00' is legal midnight, not a
+// pseudo-NULL) or for a column that merely happens to hold that text as
+// ordinary data.
+func TestIsZeroDateSentinel_TemporalOnly(t *testing.T) {
+	cases := []struct {
+		dataType string
+		value    string
+		want     bool
+	}{
+		{"date", "0000-00-00", true},
+		{"datetime", "0000-00-00 00:00:00", true},
+		{"timestamp", "0000-00-00 00:00:00.000000", true},
+		{"DATETIME", "0000-00-00 00:00:00", true}, // case-insensitive DataType
+		{"datetime", "  0000-00-00 00:00:00  ", true},
+		{"datetime", "2026-06-15 12:30:45", false}, // a real date, same column type
+		{"time", "00:00:00", false},                // legal midnight, not a pseudo-NULL
+		{"varchar", "0000-00-00 00:00:00", false},  // ordinary text data, not a temporal column
+	}
+	for _, tc := range cases {
+		got := isZeroDateSentinel([]byte(tc.value), col(tc.dataType, tc.dataType))
+		if got != tc.want {
+			t.Errorf("isZeroDateSentinel(%q, dataType=%q) = %v, want %v", tc.value, tc.dataType, got, tc.want)
+		}
+	}
+}
+
+func TestRenderCellBaselineAnchored_ZeroDateNormalizesToNull(t *testing.T) {
+	got := renderCellBaselineAnchored("0000-00-00 00:00:00", col("datetime", "datetime"))
+	if got != nil {
+		t.Errorf("renderCellBaselineAnchored(zero-date, datetime col) = %q, want nil (NULL)", got)
+	}
+	// A real value for the same column type must render normally, untouched.
+	got2 := renderCellBaselineAnchored("2026-06-15 12:30:45", col("datetime", "datetime"))
+	if string(got2) != "2026-06-15 12:30:45" {
+		t.Errorf("renderCellBaselineAnchored(real date) = %q, want the value unchanged", got2)
+	}
+}
+
 func TestRenderCell_JSONContainerCompletes(t *testing.T) {
 	// A JSON column changed by an event decodes to map[string]any; renderCell
 	// must produce deterministic bytes (so the digest completes) rather than
@@ -201,8 +244,8 @@ func TestCanonicalizeJSONContainer_UnpairedSurrogateRefused(t *testing.T) {
 }
 
 func TestRenderCellCanonicalJSON_NullPassesThrough(t *testing.T) {
-	if got := renderCellCanonicalJSON(nil, col("json", "json")); got != nil {
-		t.Errorf("renderCellCanonicalJSON(nil, ...) = %q, want nil (SQL NULL)", got)
+	if got := renderCellBaselineAnchored(nil, col("json", "json")); got != nil {
+		t.Errorf("renderCellBaselineAnchored(nil, ...) = %q, want nil (SQL NULL)", got)
 	}
 }
 

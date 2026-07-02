@@ -210,7 +210,7 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 // streamRowsByPK reconstructs baselinePath+changes and invokes emit once per row
 // with its PK key (for joining) and canonical per-column bytes. It is the digest
 // row stream (reconstructDigest) re-pointed at a diff instead of a hash — using
-// the SAME renderCellCanonicalJSON reconstructDigest's baseline-anchored callers
+// the SAME renderCellBaselineAnchored reconstructDigest's baseline-anchored callers
 // use, so a row this drill-down shows as differing is exactly a row the digest
 // that flagged the mismatch also saw as differing (cellEqual's invariant).
 func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, emit func(key string, r rowCells) error) error {
@@ -224,7 +224,7 @@ func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkC
 		key, pk := pkKeyAndDisplay(rowMap, pkCols)
 		cells := make(map[string][]byte, len(orderedCols))
 		for _, c := range orderedCols {
-			cells[c.Name] = renderCellCanonicalJSON(rowMap[c.Name], c)
+			cells[c.Name] = renderCellBaselineAnchored(rowMap[c.Name], c)
 		}
 		return emit(key, rowCells{pk: pk, cells: cells})
 	})
