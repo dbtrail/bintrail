@@ -566,3 +566,213 @@ func TestVerifyTable_ZeroDateVsRealNull_StaysMismatch(t *testing.T) {
 		t.Fatalf("status = %q (%s); want mismatch — a real live value diverging from a zero-date-derived baseline NULL must not be swallowed by the zero-date equivalence", got.Status, got.Detail)
 	}
 }
+
+// TestVerifyTable_DuplicateJSONKey_StaysMismatch is the live-source
+// counterpart of TestVerifyBaselinePair_DuplicateJSONKey_StaysMismatch: the
+// duplicate-JSON-key guard (canonicalizeJSONContainer's hasDuplicateObjectKeys
+// bail, see internal/verify/render.go) must survive through the NEW raw-bytes
+// code path this PR adds (ConsistentTableChecksumNormalized's hook), not just
+// the Go-value path (renderCellNormalized) the baseline-anchored test already
+// covers.
+//
+// A duplicate key can only survive verbatim on the LIVE side: it's a plain
+// string in a TEXT column, which MySQL does not validate/normalize as JSON.
+// It cannot survive in an event's row_after — row_after is itself a MySQL
+// JSON-typed column in bintrail's own index schema, and MySQL collapses a
+// duplicate key to last-value-wins AT INSERT TIME, before any Go code runs
+// (same reasoning, confirmed empirically, as the baseline-anchored sibling
+// test). So the event below is written pre-collapsed (single key), matching
+// what indexing a real duplicate-keyed write would actually produce — which
+// is genuinely, unavoidably different from the live source's duplicate-keyed
+// TEXT value.
+func TestVerifyTable_DuplicateJSONKey_StaysMismatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"id", "PRI", "int", "int", 1},
+		{"details", "", "text", "longtext", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'audit_log', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	// ── live SOURCE table: a GENUINE duplicate key, verbatim TEXT ──
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"CREATE TABLE `%s`.`audit_log` (`id` INT PRIMARY KEY, `details` LONGTEXT)", dbName))
+	testutil.MustExec(t, db, fmt.Sprintf(
+		`INSERT INTO `+"`%s`.`audit_log`"+` (id,details) VALUES (1,'{"a":1,"a":2}')`, dbName))
+
+	// ── baseline Parquet: placeholder, since the row is event-touched ──
+	createSQL := "CREATE TABLE `audit_log` (\n  `id` INT NOT NULL,\n  `details` LONGTEXT,\n  PRIMARY KEY (`id`)\n);\n"
+	baselineDir := t.TempDir()
+	now := time.Now().UTC()
+	curHour := now.Truncate(time.Hour)
+	h1 := curHour.Add(-time.Hour)
+	h2 := curHour
+	tsDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
+	parquetDir := filepath.Join(baselineDir, tsDir, dbName)
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "details", MySQLType: "longtext", ParquetType: baseline.MysqlToParquetNode("longtext")},
+	}
+	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "audit_log.parquet"), cols,
+		baseline.WriterConfig{Compression: "zstd", RowGroupSize: 100,
+			Metadata: map[string]string{baseline.MetaKeyCreateTableSQL: createSQL}})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := bw.WriteRow([]string{"1", `{"placeholder":true}`}, []bool{false, false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("baseline close: %v", err)
+	}
+
+	// ── binlog event: row_after is pre-collapsed, as MySQL's own JSON column
+	// would store it, regardless of what bytes were sent ──
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	ts := now.Add(-1 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts, nil, dbName, "audit_log", 2 /*UPDATE*/, "1", []byte(`["details"]`),
+		[]byte(`{"id":1,"details":{"placeholder":true}}`),
+		[]byte(`{"id":1,"details":{"a":2}}`))
+
+	var uuid string
+	if err := db.QueryRow("SELECT @@server_uuid").Scan(&uuid); err != nil {
+		t.Fatalf("server_uuid: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO stream_state
+		(id, mode, gtid_set, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, UTC_TIMESTAMP(), 1)`, uuid+":1-1000000")
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := Config{
+		SourceDB: db, IndexDB: db, Resolver: resolver,
+		BaselineSource: baselineDir, IndexDBName: dbName, NoArchive: true,
+	}
+
+	got, err := VerifyTable(context.Background(), cfg, dbName, "audit_log")
+	if err != nil {
+		t.Fatalf("VerifyTable: %v", err)
+	}
+	if got.Status != StatusMismatch {
+		t.Fatalf("status = %q (%s); want mismatch — a live source with a genuine duplicate JSON key must never silently match an already-collapsed recovered value", got.Status, got.Detail)
+	}
+}
+
+// TestVerifyTable_StaleZeroDateVsGenuineNull_AcceptedRisk is the live-source
+// counterpart of TestVerifyBaselinePair_StaleZeroDateVsGenuineNull_AcceptedRisk,
+// pinning the SAME accepted trade-off (see renderCellNormalized's doc
+// comment) through this path too: the live source is genuinely NULL for a
+// reason unrelated to zero-dates; the only in-window event faithfully
+// captured a real write that set the column to the zero-date sentinel, and
+// nothing later in the binlog moved this PK past it. This can only happen if
+// the source transitioned zero-date -> NULL via a write the binlog never saw
+// — which already breaks verify's guarantee for every column type in every
+// mode, not something this normalization introduces or widens for
+// live-source specifically.
+func TestVerifyTable_StaleZeroDateVsGenuineNull_AcceptedRisk(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"action_id", "PRI", "int", "int", 1},
+		{"last_attempt_gmt", "", "datetime", "datetime", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'actionscheduler_actions', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	// ── live SOURCE table: a GENUINE NULL, unrelated to zero-dates — the
+	// "reset out-of-band, binlog never saw it" state ──
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"CREATE TABLE `%s`.`actionscheduler_actions` (`action_id` INT PRIMARY KEY, `last_attempt_gmt` DATETIME)", dbName))
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"INSERT INTO `%s`.`actionscheduler_actions` (action_id,last_attempt_gmt) VALUES (577,NULL)", dbName))
+
+	// ── baseline Parquet: an ordinary, unrelated value — the in-window event
+	// below is what recon actually reflects for this PK, not this row ──
+	createSQL := "CREATE TABLE `actionscheduler_actions` (\n  `action_id` INT NOT NULL,\n  `last_attempt_gmt` DATETIME,\n  PRIMARY KEY (`action_id`)\n);\n"
+	baselineDir := t.TempDir()
+	now := time.Now().UTC()
+	curHour := now.Truncate(time.Hour)
+	h1 := curHour.Add(-time.Hour)
+	h2 := curHour
+	tsDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
+	parquetDir := filepath.Join(baselineDir, tsDir, dbName)
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	cols := []baseline.Column{
+		{Name: "action_id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "last_attempt_gmt", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
+	}
+	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "actionscheduler_actions.parquet"), cols,
+		baseline.WriterConfig{Compression: "zstd", RowGroupSize: 100,
+			Metadata: map[string]string{baseline.MetaKeyCreateTableSQL: createSQL}})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := bw.WriteRow([]string{"577", "2026-05-01 00:00:00"}, []bool{false, false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("baseline close: %v", err)
+	}
+
+	// ── the only in-window event for this PK: a real, faithfully-captured
+	// write setting the column to the zero-date sentinel. Nothing later in
+	// the binlog moves this PK past it ──
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	ts := now.Add(-1 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts, nil, dbName, "actionscheduler_actions", 2 /*UPDATE*/, "577", []byte(`["last_attempt_gmt"]`),
+		[]byte(`{"action_id":577,"last_attempt_gmt":"2026-05-01 00:00:00"}`),
+		[]byte(`{"action_id":577,"last_attempt_gmt":"0000-00-00 00:00:00"}`))
+
+	var uuid string
+	if err := db.QueryRow("SELECT @@server_uuid").Scan(&uuid); err != nil {
+		t.Fatalf("server_uuid: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO stream_state
+		(id, mode, gtid_set, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, UTC_TIMESTAMP(), 1)`, uuid+":1-1000000")
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := Config{
+		SourceDB: db, IndexDB: db, Resolver: resolver,
+		BaselineSource: baselineDir, IndexDBName: dbName, NoArchive: true,
+	}
+
+	got, err := VerifyTable(context.Background(), cfg, dbName, "actionscheduler_actions")
+	if err != nil {
+		t.Fatalf("VerifyTable: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Fatalf("status = %q (%s); this test pins the accepted-risk behavior — if this now fails, the zero-date normalization's blast radius changed and this comment/test pair needs re-evaluating, not just updating the assertion", got.Status, got.Detail)
+	}
+}

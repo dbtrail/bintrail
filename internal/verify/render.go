@@ -328,10 +328,16 @@ func walkForDuplicateKeys(dec *json.Decoder) (bool, error) {
 //     source transitioned zero-date -> NULL through a write the binlog never
 //     saw (sql_log_bin=0, direct file manipulation, a replication gap) —
 //     which already breaks verify's guarantee for every column type, not
-//     something this normalization introduces. See
-//     TestVerifyBaselinePair_StaleZeroDateVsGenuineNull_AcceptedRisk for the
-//     concrete case this accepts — a deliberate, reviewed trade-off, not
-//     open follow-up work.
+//     something this normalization introduces. This holds identically for
+//     both comparisons below — masking requires BOTH sides to already land
+//     in the {NULL, zero-date} equivalence class, regardless of which side
+//     is a baseline reconstruction and which is MySQL ground truth; live-
+//     source does not widen the risk, it just makes "the other side" MySQL
+//     itself instead of another baseline. See
+//     TestVerifyBaselinePair_StaleZeroDateVsGenuineNull_AcceptedRisk and its
+//     live-source sibling TestVerifyTable_StaleZeroDateVsGenuineNull_AcceptedRisk
+//     for the concrete case this accepts — a deliberate, reviewed trade-off,
+//     not open follow-up work.
 //
 // Used by both verify comparisons, each pairing it with a same-package
 // renderer on the OTHER side so the normalization is applied symmetrically

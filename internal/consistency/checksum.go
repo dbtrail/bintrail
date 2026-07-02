@@ -194,6 +194,11 @@ func consistentTableChecksum(ctx context.Context, db *sql.DB, schema, table stri
 		}
 		for i := range dest {
 			// nil RawBytes is SQL NULL; a non-nil empty slice is an empty value.
+			// normalize (when it returns its input unchanged) and the
+			// fallthrough default both alias dest[i]'s backing buffer, which
+			// the driver reuses on the NEXT rows.Scan — safe only because
+			// hasher.add below runs synchronously and copies every byte
+			// before this loop iterates again. Do not defer or buffer this.
 			switch {
 			case dest[i] == nil:
 				values[i] = nil
