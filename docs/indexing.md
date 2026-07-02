@@ -23,6 +23,17 @@ relationships) into the index so events can be decoded into named columns.
   **skips that table's events** rather than corrupting data. The fix is to
   re-run `bintrail snapshot`. To automate this, see
   [DDL tracking](ddl-tracking.md).
+- **Same-count changes are the dangerous ones.** A column rename (or a
+  `DROP COLUMN` + `ADD COLUMN` in one `ALTER`) keeps the count equal, so the
+  count check can't see it — values would silently index under the wrong
+  column names. If the source sets `binlog_row_metadata=FULL` (MySQL 8.0+,
+  MariaDB 10.5+ — `bintrail doctor` reports it), every binlog event also
+  carries its real column names and dbtrail verifies the snapshot against
+  them, **stopping with a loud error** instead of indexing corrupt data:
+
+  ```sql
+  SET PERSIST binlog_row_metadata = 'FULL';  -- optional, a few bytes per TABLE_MAP event
+  ```
 
 ---
 

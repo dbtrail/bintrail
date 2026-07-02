@@ -251,6 +251,35 @@ func handleRows(
 		return nil
 	}
 
+	// Column NAME cross-check (#700): with binlog_row_metadata=FULL the
+	// TABLE_MAP event embeds the table's real column names at write time,
+	// giving us per-event ground truth to hold the snapshot against. This
+	// catches the drift class the count guard above CANNOT see: a same-count
+	// schema change (a column rename, or a DROP+ADD in one ALTER) leaves the
+	// count equal while every value after the changed ordinal would be
+	// attributed to the WRONG column name — silent corruption, worse than the
+	// count-mismatch skip. Fail loud like the partial-image guard below: this
+	// is the authoritative chokepoint covering both the file-index and stream
+	// paths, and proceeding would write wrong data that `recover` later
+	// trusts. The compare is case-insensitive (MySQL column names are
+	// case-insensitive; a case-only rename does not change the mapping) and
+	// includes generated columns (present in both the snapshot and the FULL
+	// row image). Under the default binlog_row_metadata=MINIMAL the event
+	// carries no names and the check degrades to a no-op.
+	if names := rowsEv.Table.ColumnNameString(); len(names) > 0 && len(names) == len(tm.Columns) {
+		for i := range names {
+			if !strings.EqualFold(names[i], tm.Columns[i].Name) {
+				return fmt.Errorf(
+					"schema drift detected at %s:%d for %s.%s: binlog TABLE_MAP column %d is %q but schema snapshot %d has %q; "+
+						"the snapshot is stale (a column was renamed, or dropped and re-added, since it was taken) and indexing "+
+						"these events would attribute row values to the wrong columns — run `bintrail snapshot` against the "+
+						"current schema and re-index from this point",
+					filename, binlogEv.Header.LogPos, schema, table,
+					i+1, names[i], schemaVersion, tm.Columns[i].Name)
+			}
+		}
+	}
+
 	// Partial row image guard (#493): bintrail requires binlog_row_image=FULL.
 	// Under MINIMAL/NOBLOB, MySQL omits columns from the before/after image and
 	// go-mysql pads the absent positions to nil — which we would otherwise store

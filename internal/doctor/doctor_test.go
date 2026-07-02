@@ -341,6 +341,51 @@ func TestCheckBinlogRetention(t *testing.T) {
 	}
 }
 
+// TestCheckRowMetadata pins the #700 advisory check: PASS on FULL, WARN
+// (never FAIL) on MINIMAL, SKIP when the variable does not exist.
+func TestCheckRowMetadata(t *testing.T) {
+	tests := []struct {
+		name            string
+		probe           mockSQLScalar
+		wantStatus      CheckStatus
+		wantDetailFrag  string
+		wantRemediation bool
+	}{
+		{"FULL", row("FULL"), StatusPass, "binlog_row_metadata=FULL", false},
+		{"MINIMAL", row("MINIMAL"), StatusWarn, "binlog_row_metadata=MINIMAL", true},
+		{"variable absent", errResp("Error 1193: Unknown system variable"), StatusSkip, "not available", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			exp := mock.ExpectQuery("SELECT @@binlog_row_metadata")
+			tt.probe.apply(exp, "@@binlog_row_metadata")
+
+			got := checkRowMetadata(db)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
+			}
+			if tt.wantRemediation && got.Remediation == "" {
+				t.Error("expected remediation but got none")
+			}
+			if got.Status == StatusFail {
+				t.Error("binlog_row_metadata is optional — the check must never FAIL")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
 // mockSQLScalar is a single-value SELECT mock — value xor err.
 type mockSQLScalar struct {
 	value string
