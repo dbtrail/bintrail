@@ -91,6 +91,38 @@ type TableChecksum struct {
 // Generated columns (VIRTUAL/STORED) are excluded: mydumper does not dump them,
 // so they are absent from the baseline Parquet and must be absent here too.
 func ConsistentTableChecksum(ctx context.Context, db *sql.DB, schema, table string) (TableChecksum, error) {
+	return consistentTableChecksum(ctx, db, schema, table, nil)
+}
+
+// ConsistentTableChecksumNormalized is ConsistentTableChecksum with an extra
+// per-column hook: normalize, when non-nil, rewrites a scanned column's raw
+// text-protocol bytes before it is folded into the digest.
+//
+// This exists so a caller comparing this digest against a digest computed by
+// a DIFFERENT renderer (internal/verify's reconstruct, in the live-source
+// verify path) can rewrite away known representation-only gaps between the
+// two — e.g. a MySQL zero-date sentinel the reconstruct side normalizes to
+// NULL, or a JSON-shaped TEXT value the reconstruct side re-serializes in
+// canonical key order — symmetrically on THIS side too, the same way
+// internal/verify's own renderCellNormalized does for its side. Applying the
+// SAME normalization asymmetrically (only one side) would trade one false
+// mismatch for a different one; this package intentionally does not import
+// internal/verify to decide what "normalized" means — the caller supplies
+// that policy as a closure, keeping this package's only knowledge of the
+// concept a raw-bytes-in, raw-bytes-out hook.
+//
+// normalize receives the column's information_schema.COLUMNS DATA_TYPE
+// (lower-case) and is never called for a genuine SQL NULL (nil raw bytes) —
+// there is nothing to rewrite. It is not called by ConsistentTableChecksum
+// (nil hook, unmodified behavior) — callers that persist this digest
+// independently of internal/verify (e.g. the baseline writer, #633) must not
+// normalize, since their digest is compared against ANOTHER raw, unnormalized
+// rendering of the same contract, not against a reconstruct digest.
+func ConsistentTableChecksumNormalized(ctx context.Context, db *sql.DB, schema, table string, normalize func(raw []byte, dataType string) []byte) (TableChecksum, error) {
+	return consistentTableChecksum(ctx, db, schema, table, normalize)
+}
+
+func consistentTableChecksum(ctx context.Context, db *sql.DB, schema, table string, normalize func(raw []byte, dataType string) []byte) (TableChecksum, error) {
 	res := TableChecksum{Schema: schema, Table: table}
 
 	conn, err := db.Conn(ctx)
@@ -162,9 +194,12 @@ func ConsistentTableChecksum(ctx context.Context, db *sql.DB, schema, table stri
 		}
 		for i := range dest {
 			// nil RawBytes is SQL NULL; a non-nil empty slice is an empty value.
-			if dest[i] == nil {
+			switch {
+			case dest[i] == nil:
 				values[i] = nil
-			} else {
+			case normalize != nil:
+				values[i] = normalize(dest[i], cols[i].dataType)
+			default:
 				values[i] = dest[i]
 			}
 		}

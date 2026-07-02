@@ -4,6 +4,7 @@ package verify
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -253,5 +254,315 @@ func TestVerifyTable_TextEventDecoded(t *testing.T) {
 	}
 	if got.Status != StatusMatch {
 		t.Fatalf("status = %q (%s); want match (TEXT body should decode to \"updated text\", matching the live source)", got.Status, got.Detail)
+	}
+}
+
+// mustExecOnPinnedConn runs query on a single pinned connection, so a session
+// variable set beforehand (e.g. sql_mode) is guaranteed to apply to it — a
+// plain *sql.DB.Exec call may be routed to a different pooled connection than
+// whatever SET SESSION ran on. The connection is released back to the pool
+// afterward; nothing about the effect being tested (a value already stored in
+// a table) depends on which connection reads it back later.
+func mustExecOnPinnedConn(t *testing.T, db *sql.DB, stmts ...string) {
+	t.Helper()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("pin connection: %v", err)
+	}
+	defer conn.Close()
+	for _, s := range stmts {
+		if _, err := conn.ExecContext(context.Background(), s); err != nil {
+			t.Fatalf("exec %q: %v", s, err)
+		}
+	}
+}
+
+// TestVerifyTable_JSONValuedTextColumn_KeyOrderIsAMatch is the live-source
+// counterpart of TestVerifyBaselinePair_JSONValuedTextColumn_Isolated_Match —
+// #693's live-source half of the JSON-key-order false MISMATCH. The live
+// source's TEXT column holds JSON text in a non-alphabetical key order (MySQL
+// stores TEXT verbatim, preserving whatever order it was written in); the
+// reconstructed side decodes the event image through Go's map[string]any and
+// re-serializes it alphabetically. Without ConsistentTableChecksumNormalized
+// wired into VerifyTable's source-side digest, these compare byte-unequal
+// despite being the same JSON content — this table's only row has nothing
+// else that could cause a mismatch.
+func TestVerifyTable_JSONValuedTextColumn_KeyOrderIsAMatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"id", "PRI", "int", "int", 1},
+		{"details", "", "text", "longtext", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'audit_log', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	// ── live SOURCE table: non-alphabetical key order, verbatim MySQL text ──
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"CREATE TABLE `%s`.`audit_log` (`id` INT PRIMARY KEY, `details` LONGTEXT)", dbName))
+	testutil.MustExec(t, db, fmt.Sprintf(
+		`INSERT INTO `+"`%s`.`audit_log`"+` (id,details) VALUES (1,'{"c":3,"a":1,"b":2}')`, dbName))
+
+	// ── baseline Parquet holding the same logical value ──
+	createSQL := "CREATE TABLE `audit_log` (\n  `id` INT NOT NULL,\n  `details` LONGTEXT,\n  PRIMARY KEY (`id`)\n);\n"
+	baselineDir := t.TempDir()
+	now := time.Now().UTC()
+	curHour := now.Truncate(time.Hour)
+	h1 := curHour.Add(-time.Hour)
+	h2 := curHour
+	tsDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
+	parquetDir := filepath.Join(baselineDir, tsDir, dbName)
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "details", MySQLType: "longtext", ParquetType: baseline.MysqlToParquetNode("longtext")},
+	}
+	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "audit_log.parquet"), cols,
+		baseline.WriterConfig{Compression: "zstd", RowGroupSize: 100,
+			Metadata: map[string]string{baseline.MetaKeyCreateTableSQL: createSQL}})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := bw.WriteRow([]string{"1", `{"c":3,"a":1,"b":2}`}, []bool{false, false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("baseline close: %v", err)
+	}
+
+	// ── binlog event: an UPDATE touches details with the SAME logical value,
+	// embedded as a nested JSON object (matching marshalRow's promotion) ──
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	ts := now.Add(-1 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts, nil, dbName, "audit_log", 2 /*UPDATE*/, "1", []byte(`["details"]`),
+		[]byte(`{"id":1,"details":{"c":3,"a":1,"b":2}}`),
+		[]byte(`{"id":1,"details":{"c":3,"a":1,"b":2}}`))
+
+	var uuid string
+	if err := db.QueryRow("SELECT @@server_uuid").Scan(&uuid); err != nil {
+		t.Fatalf("server_uuid: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO stream_state
+		(id, mode, gtid_set, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, UTC_TIMESTAMP(), 1)`, uuid+":1-1000000")
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := Config{
+		SourceDB: db, IndexDB: db, Resolver: resolver,
+		BaselineSource: baselineDir, IndexDBName: dbName, NoArchive: true,
+	}
+
+	got, err := VerifyTable(context.Background(), cfg, dbName, "audit_log")
+	if err != nil {
+		t.Fatalf("VerifyTable: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Fatalf("status = %q (%s); want match — same JSON content in a different key order is a representation-only difference, not a real divergence\n  source=%s recon=%s",
+			got.Status, got.Detail, got.SourceDigest, got.ReconstructDigest)
+	}
+}
+
+// TestVerifyTable_ZeroDateSentinel_IsAMatch is the live-source counterpart of
+// TestVerifyBaselinePair_ZeroDateSentinel_IsAMatch — #693's live-source half
+// of the zero-date-vs-NULL false MISMATCH. The live source genuinely holds
+// the zero-date sentinel right now (sql_mode relaxed for the one INSERT below,
+// mirroring how a legacy/non-strict production database ends up with one in
+// the first place); the row is never touched by any binlog event, so the
+// reconstructed side reads the baseline Parquet passthrough, where
+// internal/baseline.Writer.WriteRow already substituted NULL for the same
+// zero-date value at dump time. Without ConsistentTableChecksumNormalized
+// wired into VerifyTable's source-side digest, MySQL's live CAST(...AS CHAR)
+// still renders the literal sentinel text, so this compares byte-unequal
+// against the baseline's NULL despite being the same underlying value.
+func TestVerifyTable_ZeroDateSentinel_IsAMatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"action_id", "PRI", "int", "int", 1},
+		{"last_attempt_gmt", "", "datetime", "datetime", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'actionscheduler_actions', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	// ── live SOURCE table: genuinely holds the zero-date sentinel right now ──
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"CREATE TABLE `%s`.`actionscheduler_actions` (`action_id` INT PRIMARY KEY, `last_attempt_gmt` DATETIME)", dbName))
+	mustExecOnPinnedConn(t, db,
+		"SET SESSION sql_mode=''",
+		fmt.Sprintf("INSERT INTO `%s`.`actionscheduler_actions` (action_id,last_attempt_gmt) VALUES (577,'0000-00-00 00:00:00')", dbName))
+
+	// ── baseline Parquet: WriteRow substitutes the same zero-date to NULL ──
+	createSQL := "CREATE TABLE `actionscheduler_actions` (\n  `action_id` INT NOT NULL,\n  `last_attempt_gmt` DATETIME,\n  PRIMARY KEY (`action_id`)\n);\n"
+	baselineDir := t.TempDir()
+	now := time.Now().UTC()
+	curHour := now.Truncate(time.Hour)
+	h1 := curHour.Add(-time.Hour)
+	tsDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
+	parquetDir := filepath.Join(baselineDir, tsDir, dbName)
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	cols := []baseline.Column{
+		{Name: "action_id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "last_attempt_gmt", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
+	}
+	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "actionscheduler_actions.parquet"), cols,
+		baseline.WriterConfig{Compression: "zstd", RowGroupSize: 100,
+			Metadata: map[string]string{baseline.MetaKeyCreateTableSQL: createSQL}})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := bw.WriteRow([]string{"577", "0000-00-00 00:00:00"}, []bool{false, false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("baseline close: %v", err)
+	}
+
+	// ── no binlog event touches this PK: recon is a pure baseline passthrough ──
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, curHour})
+
+	var uuid string
+	if err := db.QueryRow("SELECT @@server_uuid").Scan(&uuid); err != nil {
+		t.Fatalf("server_uuid: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO stream_state
+		(id, mode, gtid_set, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, UTC_TIMESTAMP(), 1)`, uuid+":1-1000000")
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := Config{
+		SourceDB: db, IndexDB: db, Resolver: resolver,
+		BaselineSource: baselineDir, IndexDBName: dbName, NoArchive: true,
+	}
+
+	got, err := VerifyTable(context.Background(), cfg, dbName, "actionscheduler_actions")
+	if err != nil {
+		t.Fatalf("VerifyTable: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Fatalf("status = %q (%s); want match — the live zero-date sentinel and the baseline's zero-date-substituted NULL are the same underlying value\n  source=%s recon=%s",
+			got.Status, got.Detail, got.SourceDigest, got.ReconstructDigest)
+	}
+}
+
+// TestVerifyTable_ZeroDateVsRealNull_StaysMismatch is the live-source
+// counterpart of TestVerifyBaselinePair_ZeroDateVsRealNull_StaysMismatch:
+// proves the zero-date normalization stays narrowly scoped through the
+// live-source path too. The live source holds a REAL, non-zero-date value;
+// the reconstructed side is NULL from the SAME zero-date substitution the
+// sibling match test above exercises (nothing in the window corrects it).
+// isZeroDateSentinel must only match the exact sentinel text, not "any real
+// value when the other side happens to be NULL" — a genuine divergence must
+// not be swallowed by the normalization meant to fix a representation
+// artifact.
+func TestVerifyTable_ZeroDateVsRealNull_StaysMismatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"action_id", "PRI", "int", "int", 1},
+		{"last_attempt_gmt", "", "datetime", "datetime", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'actionscheduler_actions', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	// ── live SOURCE table: a REAL, non-zero-date value ──
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"CREATE TABLE `%s`.`actionscheduler_actions` (`action_id` INT PRIMARY KEY, `last_attempt_gmt` DATETIME)", dbName))
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"INSERT INTO `%s`.`actionscheduler_actions` (action_id,last_attempt_gmt) VALUES (577,'2026-06-15 12:30:45')", dbName))
+
+	// ── baseline Parquet: zero-date at dump time, substituted to NULL ──
+	createSQL := "CREATE TABLE `actionscheduler_actions` (\n  `action_id` INT NOT NULL,\n  `last_attempt_gmt` DATETIME,\n  PRIMARY KEY (`action_id`)\n);\n"
+	baselineDir := t.TempDir()
+	now := time.Now().UTC()
+	curHour := now.Truncate(time.Hour)
+	h1 := curHour.Add(-time.Hour)
+	tsDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
+	parquetDir := filepath.Join(baselineDir, tsDir, dbName)
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	cols := []baseline.Column{
+		{Name: "action_id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "last_attempt_gmt", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
+	}
+	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "actionscheduler_actions.parquet"), cols,
+		baseline.WriterConfig{Compression: "zstd", RowGroupSize: 100,
+			Metadata: map[string]string{baseline.MetaKeyCreateTableSQL: createSQL}})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := bw.WriteRow([]string{"577", "0000-00-00 00:00:00"}, []bool{false, false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("baseline close: %v", err)
+	}
+
+	// ── no binlog event touches this PK: recon is a pure baseline passthrough ──
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, curHour})
+
+	var uuid string
+	if err := db.QueryRow("SELECT @@server_uuid").Scan(&uuid); err != nil {
+		t.Fatalf("server_uuid: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO stream_state
+		(id, mode, gtid_set, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, UTC_TIMESTAMP(), 1)`, uuid+":1-1000000")
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := Config{
+		SourceDB: db, IndexDB: db, Resolver: resolver,
+		BaselineSource: baselineDir, IndexDBName: dbName, NoArchive: true,
+	}
+
+	got, err := VerifyTable(context.Background(), cfg, dbName, "actionscheduler_actions")
+	if err != nil {
+		t.Fatalf("VerifyTable: %v", err)
+	}
+	if got.Status != StatusMismatch {
+		t.Fatalf("status = %q (%s); want mismatch — a real live value diverging from a zero-date-derived baseline NULL must not be swallowed by the zero-date equivalence", got.Status, got.Detail)
 	}
 }

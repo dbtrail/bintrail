@@ -143,17 +143,17 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	}
 
 	// Recovery side: reconstruct the previous baseline forward to the anchor.
-	// renderCellBaselineAnchored (not plain renderCell): both operands here come
+	// renderCellNormalized (not plain renderCell): both operands here come
 	// from this package, so canonicalizing a JSON object/array value the SAME
 	// way on both sides closes the false-mismatch gap a TEXT/JSON column's
 	// event-image round-trip can otherwise open (see its doc comment) without
 	// risking the live-source comparison, which this function is not used for.
-	reconDigest, reconCount, err := reconstructDigest(ctx, p.PrevPath, p.Schema, p.Table, pkCols, changes, orderedCols, renderCellBaselineAnchored)
+	reconDigest, reconCount, err := reconstructDigest(ctx, p.PrevPath, p.Schema, p.Table, pkCols, changes, orderedCols, renderCellNormalized)
 	if err != nil {
 		return res, fmt.Errorf("reconstruct prev %s.%s: %w", p.Schema, p.Table, err)
 	}
 	// Truth side: the new baseline as-is (no events), via the same path.
-	newDigest, newCount, err := reconstructDigest(ctx, p.NewPath, p.Schema, p.Table, pkCols, map[string]*query.ResultRow{}, orderedCols, renderCellBaselineAnchored)
+	newDigest, newCount, err := reconstructDigest(ctx, p.NewPath, p.Schema, p.Table, pkCols, map[string]*query.ResultRow{}, orderedCols, renderCellNormalized)
 	if err != nil {
 		return res, fmt.Errorf("read new baseline %s.%s: %w", p.Schema, p.Table, err)
 	}

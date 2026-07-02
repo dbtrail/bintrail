@@ -169,7 +169,7 @@ func isZeroDateSentinel(b []byte, col metadata.ColumnMeta) bool {
 // column typed as MySQL's native JSON already had a narrower version of this
 // same gap, covered by isDeferredType's inconclusive downgrade — this closes
 // it more precisely there too, resolving to a genuine match rather than
-// merely downgrading to "can't tell": see renderCellBaselineAnchored.
+// merely downgrading to "can't tell": see renderCellNormalized.
 //
 // UseNumber preserves large-integer/decimal literals exactly, the same
 // precision requirement renderCell's json.Number case already protects
@@ -299,10 +299,11 @@ func walkForDuplicateKeys(dec *json.Decoder) (bool, error) {
 	}
 }
 
-// renderCellBaselineAnchored renders a cell like renderCell, additionally
+// renderCellNormalized renders a cell like renderCell, additionally
 // normalizing two known representation gaps between an event-image value and
-// a baseline-Parquet value of the SAME underlying data, so a pure
-// representation difference doesn't register as a content difference:
+// the SAME underlying data rendered independently on the comparison's other
+// side, so a pure representation difference doesn't register as a content
+// difference:
 //
 //   - a JSON object/array value (see canonicalizeJSONContainer) — Go's
 //     map[string]any decode loses object key order, which renderCell's
@@ -312,41 +313,57 @@ func walkForDuplicateKeys(dec *json.Decoder) (bool, error) {
 //     '0000-00-00'-family pseudo-NULL to Parquet NULL, unconditionally, for
 //     EVERY zero-date value (Go's time parser rejects it outright). An
 //     event-touched row's image still carries the literal sentinel text, so
-//     recon renders the string while a same-valued baseline cell renders
-//     NULL. This mapping only runs one direction (string → nil): it does NOT
-//     touch a genuine NULL.
+//     recon renders the string while a same-valued baseline or live-source
+//     cell can render NULL. This mapping only runs one direction (string →
+//     nil): it does NOT touch a genuine NULL.
 //
-//     A baseline NULL for a temporal column is NOT provably zero-date-only —
-//     WriteRow also NULLs a temporal column for a genuine SQL NULL (the
-//     ordinary isNull path, checked before errZeroDate even runs), and that
-//     information is already indistinguishable at rest: both paths write the
-//     identical parquet.NullValue(). So this normalization is safe under
-//     verify's baseline assumption that the binlog captured every write to
-//     the row: if it did, recon's zero-date-text cell and the baseline's
-//     NULL cell are the same underlying value, whichever path produced the
-//     NULL. It stops being safe only if the source transitioned zero-date ->
-//     NULL through a write the binlog never saw (sql_log_bin=0, direct file
-//     manipulation, a replication gap) — which already breaks verify's
-//     guarantee for every column type, not something this normalization
-//     introduces. See TestVerifyBaselinePair_StaleZeroDateVsGenuineNull_AcceptedRisk
-//     for the concrete case this accepts — a deliberate, reviewed trade-off,
-//     not open follow-up work.
+//     A NULL for a temporal column is NOT provably zero-date-only — the
+//     writer that produced it (internal/baseline.Writer.WriteRow, or MySQL
+//     itself) also NULLs a temporal column for a genuine SQL NULL, and that
+//     information is already indistinguishable at rest. So this
+//     normalization is safe under verify's assumption that the binlog
+//     captured every write to the row: if it did, recon's zero-date-text
+//     cell and the other side's NULL cell are the same underlying value,
+//     whichever path produced the NULL. It stops being safe only if the
+//     source transitioned zero-date -> NULL through a write the binlog never
+//     saw (sql_log_bin=0, direct file manipulation, a replication gap) —
+//     which already breaks verify's guarantee for every column type, not
+//     something this normalization introduces. See
+//     TestVerifyBaselinePair_StaleZeroDateVsGenuineNull_AcceptedRisk for the
+//     concrete case this accepts — a deliberate, reviewed trade-off, not
+//     open follow-up work.
 //
-// Used ONLY by the baseline-anchored comparison (VerifyBaselinePair,
-// ExplainBaselinePairMismatch): both operands there are produced by this
-// same package, so normalizing them symmetrically cannot introduce a new
-// disagreement. The live-source comparison (VerifyTable) keeps using
-// renderCell unwrapped — its OTHER operand is MySQL's own raw text via
-// internal/consistency.ConsistentTableChecksum, which this package does not
-// control and does not normalize; wrapping only one side there would create
-// a new mismatch instead of fixing one (MySQL's live CAST(...AS CHAR) still
-// renders a zero-date as the literal sentinel text, same as an event image —
-// only the BASELINE side ever substitutes NULL).
-func renderCellBaselineAnchored(v any, col metadata.ColumnMeta) []byte {
-	b := renderCell(v, col)
+// Used by both verify comparisons, each pairing it with a same-package
+// renderer on the OTHER side so the normalization is applied symmetrically
+// (asymmetric application would trade one false mismatch for a different
+// one):
+//
+//   - baseline-anchored (VerifyBaselinePair, ExplainBaselinePairMismatch):
+//     both operands are produced by this package's own reconstructDigest, so
+//     wiring this renderer into both sides is sufficient.
+//   - live-source (VerifyTable): the other operand is MySQL's own raw text
+//     via internal/consistency.ConsistentTableChecksum, which this package
+//     does not render. VerifyTable pairs this renderer with
+//     ConsistentTableChecksumNormalized, passing normalizeRenderedBytes as
+//     that function's hook — the same normalization logic, applied to
+//     already-scanned bytes instead of a Go value, so both sides agree on
+//     what counts as a representation-only difference.
+func renderCellNormalized(v any, col metadata.ColumnMeta) []byte {
+	return normalizeRenderedBytes(renderCell(v, col), col.DataType)
+}
+
+// normalizeRenderedBytes applies renderCellNormalized's representation-gap
+// normalization directly to already-rendered bytes, for a context that
+// doesn't go through renderCell — internal/consistency.ConsistentTableChecksum's
+// raw MySQL scan (see ConsistentTableChecksumNormalized and its use in
+// VerifyTable). Both call sites must apply the identical logic for the two
+// sides of a comparison to be symmetric, so renderCellNormalized itself calls
+// this rather than duplicating the checks.
+func normalizeRenderedBytes(b []byte, dataType string) []byte {
 	if b == nil {
 		return nil
 	}
+	col := metadata.ColumnMeta{DataType: dataType}
 	if isZeroDateSentinel(b, col) {
 		return nil
 	}

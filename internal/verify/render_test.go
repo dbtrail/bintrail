@@ -89,14 +89,14 @@ func TestIsZeroDateSentinel_TemporalOnly(t *testing.T) {
 }
 
 func TestRenderCellBaselineAnchored_ZeroDateNormalizesToNull(t *testing.T) {
-	got := renderCellBaselineAnchored("0000-00-00 00:00:00", col("datetime", "datetime"))
+	got := renderCellNormalized("0000-00-00 00:00:00", col("datetime", "datetime"))
 	if got != nil {
-		t.Errorf("renderCellBaselineAnchored(zero-date, datetime col) = %q, want nil (NULL)", got)
+		t.Errorf("renderCellNormalized(zero-date, datetime col) = %q, want nil (NULL)", got)
 	}
 	// A real value for the same column type must render normally, untouched.
-	got2 := renderCellBaselineAnchored("2026-06-15 12:30:45", col("datetime", "datetime"))
+	got2 := renderCellNormalized("2026-06-15 12:30:45", col("datetime", "datetime"))
 	if string(got2) != "2026-06-15 12:30:45" {
-		t.Errorf("renderCellBaselineAnchored(real date) = %q, want the value unchanged", got2)
+		t.Errorf("renderCellNormalized(real date) = %q, want the value unchanged", got2)
 	}
 }
 
@@ -244,8 +244,8 @@ func TestCanonicalizeJSONContainer_UnpairedSurrogateRefused(t *testing.T) {
 }
 
 func TestRenderCellCanonicalJSON_NullPassesThrough(t *testing.T) {
-	if got := renderCellBaselineAnchored(nil, col("json", "json")); got != nil {
-		t.Errorf("renderCellBaselineAnchored(nil, ...) = %q, want nil (SQL NULL)", got)
+	if got := renderCellNormalized(nil, col("json", "json")); got != nil {
+		t.Errorf("renderCellNormalized(nil, ...) = %q, want nil (SQL NULL)", got)
 	}
 }
 

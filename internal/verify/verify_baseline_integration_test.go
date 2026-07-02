@@ -859,7 +859,7 @@ func TestVerifyBaselinePair_TextOnlyChange_Match(t *testing.T) {
 // inconclusive downgrade either — two byte-different renderings of identical
 // data reported a hard MISMATCH.
 //
-// Fixed by renderCellBaselineAnchored: the baseline-anchored comparison
+// Fixed by renderCellNormalized: the baseline-anchored comparison
 // canonicalizes JSON object/array values on BOTH sides, so this now reports a
 // genuine StatusMatch — not merely "inconclusive". id=2 in the same table
 // proves the fix isn't a blanket "ignore JSON columns" — a GENUINE content
@@ -973,7 +973,7 @@ func TestVerifyBaselinePair_JSONValuedTextColumn_KeyOrderIsAMatch(t *testing.T) 
 }
 
 // TestVerifyBaselinePair_JSONValuedTextColumn_Isolated_Match isolates
-// VerifyBaselinePair's OWN digest wiring (the two renderCellBaselineAnchored
+// VerifyBaselinePair's OWN digest wiring (the two renderCellNormalized
 // calls in verify_baseline.go) for the JSON-key-order fix — the same way
 // TestVerifyBaselinePair_TextOnlyChange_Match isolates the sibling #672
 // TEXT-decode fix.
@@ -1158,7 +1158,7 @@ func TestVerifyBaselinePair_DuplicateJSONKey_StaysMismatch(t *testing.T) {
 // zero-date value — reported a hard mismatch.
 //
 // This table has nothing else that could cause a mismatch: if
-// renderCellBaselineAnchored's isZeroDateSentinel normalization weren't
+// renderCellNormalized's isZeroDateSentinel normalization weren't
 // wired into VerifyBaselinePair's own digest, this test — not just an
 // Explain drill-down — would report StatusMismatch.
 func TestVerifyBaselinePair_ZeroDateSentinel_IsAMatch(t *testing.T) {

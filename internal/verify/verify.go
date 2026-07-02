@@ -93,8 +93,12 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 		}
 	}
 
-	// 1. Live source fingerprint at a consistent snapshot.
-	src, err := consistency.ConsistentTableChecksum(ctx, cfg.SourceDB, schema, table)
+	// 1. Live source fingerprint at a consistent snapshot. Normalized (see
+	// renderCellNormalized) so it stays symmetric with step 5's reconstruct
+	// digest: both sides must agree on what counts as a representation-only
+	// difference, or normalizing only one would trade one false mismatch for
+	// another.
+	src, err := consistency.ConsistentTableChecksumNormalized(ctx, cfg.SourceDB, schema, table, normalizeRenderedBytes)
 	if err != nil {
 		return res, fmt.Errorf("source checksum %s.%s: %w", schema, table, err)
 	}
@@ -183,7 +187,7 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	// masked by this.
 	deferredRepr := hasDeferredRepr(orderedCols) && len(changes) > 0
 
-	reconDigest, reconCount, emitErr := reconstructDigest(ctx, baselinePath, schema, table, pkCols, changes, orderedCols, renderCell)
+	reconDigest, reconCount, emitErr := reconstructDigest(ctx, baselinePath, schema, table, pkCols, changes, orderedCols, renderCellNormalized)
 	if emitErr != nil {
 		return res, fmt.Errorf("reconstruct %s.%s: %w", schema, table, emitErr)
 	}
@@ -225,11 +229,12 @@ func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int
 // reconstructDigest reconstructs a table from baselinePath merged with changes,
 // renders each row's columns (in orderedCols order) via render, and returns the
 // order-independent content digest + row count. Shared by the live-source
-// verify (VerifyTable, which passes plain renderCell) and the baseline-pair
-// verify (#642, which passes renderCellBaselineAnchored — see its doc comment for
-// why that canonicalization is safe only there): both sides of any one
-// comparison must be produced with the SAME render func so the digests are
-// byte-comparable by construction.
+// verify (VerifyTable) and the baseline-pair verify (#642) — both now pass
+// renderCellNormalized (see its doc comment for why the normalization it
+// applies is safe, and how each caller keeps it symmetric with the OTHER
+// side of its own comparison): both sides of any one comparison must be
+// produced with the SAME render func so the digests are byte-comparable by
+// construction.
 func reconstructDigest(ctx context.Context, baselinePath, schema, table string, pkCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, orderedCols []metadata.ColumnMeta, render func(any, metadata.ColumnMeta) []byte) (string, int64, error) {
 	hasher := consistency.NewHasher()
 	err := reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
