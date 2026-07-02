@@ -18,7 +18,6 @@ import (
 	"sync"
 	"time"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	_ "github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/sync/errgroup"
@@ -26,6 +25,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 // Fetch queries Parquet archive files (local or S3) using DuckDB and returns matching events.
@@ -281,9 +281,9 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 		return nil, 0, "", nil, err
 	}
 
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := storage.LoadAWSConfig(ctx, "")
 	if err != nil {
-		return nil, 0, "", nil, fmt.Errorf("load AWS config: %w", err)
+		return nil, 0, "", nil, err
 	}
 
 	// Detect the bucket's actual region via GetBucketLocation (must be called

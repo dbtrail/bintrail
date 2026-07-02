@@ -35,26 +35,43 @@ func ParseS3URL(u string) (bucket, prefix string, err error) {
 // region is optional — if empty, the SDK resolves it from AWS_REGION env var
 // or ~/.aws/config.
 func NewS3Client(ctx context.Context, region string) (*s3.Client, error) {
+	awsCfg, err := LoadAWSConfig(ctx, region)
+	if err != nil {
+		return nil, err
+	}
+	return s3.NewFromConfig(awsCfg), nil
+}
+
+// LoadAWSConfig loads the default AWS config (credential chain, region) for
+// S3 access. region is optional — if empty, the SDK resolves it from
+// AWS_REGION/AWS_DEFAULT_REGION env var or ~/.aws/config.
+//
+// LoadDefaultConfig resolves region from AWS_REGION/AWS_DEFAULT_REGION and the
+// shared config — but NOT from EC2/ECS IMDS. In an IAM-role-only deployment
+// with no AWS_REGION set (e.g. the bundled console on EC2), the region ends
+// up empty and every S3 request fails with "region was not a valid DNS name".
+// This surfaces even when the caller goes on to probe a bucket's own region
+// (e.g. via GetBucketLocation) as a fallback, since that probe typically
+// itself requires an IAM permission (s3:GetBucketLocation) a minimal,
+// least-privilege policy may not grant — leaving the caller with only this
+// empty region to fall back to. So every caller that loads AWS config for S3
+// access should go through this shared helper, not awsconfig.LoadDefaultConfig
+// directly, to get the same IMDS fallback.
+func LoadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
 	opts := []func(*awsconfig.LoadOptions) error{}
 	if region != "" {
 		opts = append(opts, awsconfig.WithRegion(region))
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("load AWS config: %w", err)
+		return awsCfg, fmt.Errorf("load AWS config: %w", err)
 	}
-	// LoadDefaultConfig resolves region from AWS_REGION/AWS_DEFAULT_REGION and the
-	// shared config — but NOT from EC2/ECS IMDS. In an IAM-role-only deployment
-	// with no AWS_REGION set (e.g. the bundled console on EC2, where the in-process
-	// baseline upload passes region=""), the region ends up empty and every request
-	// fails with "region was not a valid DNS name". Fall back to the instance's
-	// IMDS region in that case.
 	if region == "" && awsCfg.Region == "" {
 		if r := imdsRegion(ctx, awsCfg); r != "" {
 			awsCfg.Region = r
 		}
 	}
-	return s3.NewFromConfig(awsCfg), nil
+	return awsCfg, nil
 }
 
 // imdsRegion best-effort fetches the EC2/ECS instance region from IMDS. Returns

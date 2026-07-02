@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -66,13 +65,9 @@ func NewS3Backend(ctx context.Context, cfg S3Config) (*S3Backend, error) {
 
 // newS3Client creates an S3 client from config.
 func newS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
-	var opts []func(*awsconfig.LoadOptions) error
-	if cfg.Region != "" {
-		opts = append(opts, awsconfig.WithRegion(cfg.Region))
-	}
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	awsCfg, err := LoadAWSConfig(ctx, cfg.Region)
 	if err != nil {
-		return nil, fmt.Errorf("storage: load AWS config: %w", err)
+		return nil, fmt.Errorf("storage: %w", err)
 	}
 
 	var s3Opts []func(*s3.Options)
