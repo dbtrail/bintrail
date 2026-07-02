@@ -314,11 +314,22 @@ func walkForDuplicateKeys(dec *json.Decoder) (bool, error) {
 //     event-touched row's image still carries the literal sentinel text, so
 //     recon renders the string while a same-valued baseline cell renders
 //     NULL. This mapping only runs one direction (string → nil): it does NOT
-//     touch a genuine NULL, and a baseline NULL for a temporal column
-//     provably can ONLY have come from this exact conversion (WriteRow has
-//     no other path to NULL a temporal column) — so treating a zero-date
-//     string as NULL here cannot mask an unrelated true-NULL-vs-real-value
-//     divergence.
+//     touch a genuine NULL.
+//
+//     A baseline NULL for a temporal column is NOT provably zero-date-only —
+//     WriteRow also NULLs a temporal column for a genuine SQL NULL (the
+//     ordinary isNull path, checked before errZeroDate even runs), and that
+//     information is already indistinguishable at rest: both paths write the
+//     identical parquet.NullValue(). So this normalization is safe under
+//     verify's baseline assumption that the binlog captured every write to
+//     the row: if it did, recon's zero-date-text cell and the baseline's
+//     NULL cell are the same underlying value, whichever path produced the
+//     NULL. It stops being safe only if the source transitioned zero-date ->
+//     NULL through a write the binlog never saw (sql_log_bin=0, direct file
+//     manipulation, a replication gap) — which already breaks verify's
+//     guarantee for every column type, not something this normalization
+//     introduces. See TestVerifyBaselinePair_StaleZeroDateVsGenuineNull_AcceptedRisk
+//     for the concrete case this accepts, and #693 for the tracking issue.
 //
 // Used ONLY by the baseline-anchored comparison (VerifyBaselinePair,
 // ExplainBaselinePairMismatch): both operands there are produced by this
