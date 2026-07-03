@@ -1,7 +1,6 @@
 package forensics
 
 import (
-	"bufio"
 	"io"
 	"strings"
 	"time"
@@ -48,11 +47,11 @@ const minEpochMicrosDigits = 13
 
 // parseMariaDBFile parses the file-based audit log from the MariaDB
 // server_audit plugin family (upstream MariaDB, AWS RDS MySQL fork, Aurora
-// Advanced Auditing). Malformed lines are skipped and counted; notes carries
-// at most one local-time caveat when local-time dialect lines were parsed.
+// Advanced Auditing). Malformed or oversized lines are skipped and counted;
+// notes carries at most one local-time caveat when local-time dialect lines
+// were parsed.
 func parseMariaDBFile(r io.Reader, filter auditLogFilter) (events []AuditEvent, totalScanned, skipped int, notes []string, err error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 256*1024), 1024*1024)
+	scanner := newAuditLineScanner(r)
 	localTimeSeen := false
 
 	for scanner.Scan() {
@@ -83,6 +82,7 @@ func parseMariaDBFile(r io.Reader, filter auditLogFilter) (events []AuditEvent, 
 	if localTimeSeen {
 		notes = append(notes, mariadbLocalTimeNote)
 	}
+	skipped = foldOversized(scanner, skipped)
 	return events, totalScanned, skipped, notes, scanner.Err()
 }
 

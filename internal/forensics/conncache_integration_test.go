@@ -147,34 +147,65 @@ func TestIntegrationHasAuditPlugin_NoneInstalled(t *testing.T) {
 	}
 }
 
-// TestIntegrationAuditPluginSkipsPoller pins the skip branch: with an audit
-// plugin "present" (probe stubbed — the container has none to install), the
-// poller must exit on its own without ever writing to connection_cache.
-func TestIntegrationAuditPluginSkipsPoller(t *testing.T) {
+// TestIntegrationAuditPluginSkipsPollingButStillSweeps pins the audit-present
+// branch (#3): polling is suppressed (the audit log carries better history),
+// but the retention sweep must keep running so connection_cache rows captured
+// before the plugin was installed still age out — otherwise they persist
+// forever and tier 2b attributes old events to a frozen, possibly reused
+// identity. The loop runs until the context is cancelled.
+func TestIntegrationAuditPluginSkipsPollingButStillSweeps(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
+
+	// A pre-audit row past the retention window (must be swept) and a fresh row
+	// (must survive).
+	testutil.MustExec(t, db, `INSERT INTO connection_cache
+		(connection_id, user, host, db, command, cached_at, last_seen) VALUES
+		(201, 'preaudit', 'oldhost:1', NULL, 'Sleep', NOW() - INTERVAL 2 DAY, NOW() - INTERVAL 2 DAY),
+		(202, 'fresh', 'newhost:2', 'app', 'Query', NOW(), NOW())`)
 
 	old := auditProbe
 	auditProbe = func(context.Context, *sql.DB) bool { return true }
 	defer func() { auditProbe = old }()
 
-	done := StartConnCachePoller(context.Background(), ConnCacheConfig{
+	ctx, cancel := context.WithCancel(context.Background())
+	done := StartConnCachePoller(ctx, ConnCacheConfig{
 		SourceDSN: sourceDSN(),
 		IndexDSN:  testutil.IntegrationDSN(dbName),
-		Retention: DefaultRetention,
+		Retention: 24 * time.Hour,
 	})
-	select {
-	case <-done: // exits on its own — no context cancel involved
-	case <-time.After(30 * time.Second):
-		t.Fatal("poller did not exit after audit-plugin detection")
+
+	// The immediate sweep on the audit branch prunes the 2-day-old row.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		cached, err := LookupCachedThreads(context.Background(), db, []int64{201})
+		if err != nil {
+			t.Fatalf("LookupCachedThreads: %v", err)
+		}
+		if _, ok := cached[201]; !ok {
+			break // swept
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pre-audit row was not swept on the audit-present branch — the retention sweep is not running")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
+	// Polling is suppressed: no live-session rows were added, so only the fresh
+	// pre-inserted row (202) remains.
 	var n int
 	if err := db.QueryRow("SELECT COUNT(*) FROM connection_cache").Scan(&n); err != nil {
 		t.Fatalf("count connection_cache: %v", err)
 	}
-	if n != 0 {
-		t.Fatalf("connection_cache has %d rows, want 0 — an audit plugin must suppress polling", n)
+	if n != 1 {
+		t.Errorf("connection_cache has %d rows, want 1 (only the fresh row — polling must be suppressed)", n)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("sweep loop did not stop on context cancel")
 	}
 }
 

@@ -3,16 +3,19 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -281,6 +284,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 			slog.Info("recovery SQL generated",
 				"statements", n, "dry_run", true,
 				"duration_ms", time.Since(start).Milliseconds())
+			auditRecoverGenerated(cmd.Context(), n, true, "")
 			return cliutil.OutputJSON(struct {
 				Statements int    `json:"statements"`
 				DryRun     bool   `json:"dry_run"`
@@ -295,6 +299,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		slog.Info("recovery SQL generated",
 			"statements", n, "dry_run", true,
 			"duration_ms", time.Since(start).Milliseconds())
+		auditRecoverGenerated(cmd.Context(), n, true, "")
 		if n > 0 {
 			fmt.Fprintf(os.Stderr, "\n%d reversal statement(s) generated.\n", n)
 		}
@@ -323,6 +328,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	slog.Info("recovery SQL generated",
 		"statements", n, "dry_run", false, "output", rOutput,
 		"duration_ms", time.Since(start).Milliseconds())
+	auditRecoverGenerated(cmd.Context(), n, false, rOutput)
 
 	if rFormat == "json" {
 		return cliutil.OutputJSON(struct {
@@ -355,4 +361,23 @@ func wrapScriptBudget(err error) error {
 			"guards the rendered script size, not the initial fetch", err)
 	}
 	return err
+}
+
+// auditRecoverGenerated reports a generated reversal script to the
+// audit seam. ext.Record is a no-op unless an embedding distribution
+// installed a sink — the OSS binary pays one nil check.
+func auditRecoverGenerated(ctx context.Context, statements int, dryRun bool, output string) {
+	ext.Record(ctx, ext.AuditEvent{
+		Surface: "cli",
+		Action:  "recover.generate",
+		Actor:   ext.ProcessActor(rProfile),
+		Schema:  rSchema,
+		Table:   rTable,
+		Detail: map[string]string{
+			"statements": strconv.Itoa(statements),
+			"dry_run":    strconv.FormatBool(dryRun),
+			"output":     output,
+			"gtid":       rGTID,
+		},
+	})
 }

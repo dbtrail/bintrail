@@ -274,6 +274,185 @@ func TestNewResolver_emptyTable(t *testing.T) {
 	}
 }
 
+// ─── NewLatestPerTableResolver (#603) ─────────────────────────────────────────
+
+// TestNewLatestPerTableResolver_pgPerTableSnapshots pins the PG layout that
+// motivated #603: WritePGSnapshot writes ONE table per snapshot_id, so the
+// single-latest-snapshot resolver sees only the last table that saw DML. The
+// per-table-newest union must surface every table, each under its own newest
+// shape.
+func TestNewLatestPerTableResolver_pgPerTableSnapshots(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	rel := func(table string, extraCols ...string) *PGRelationSchema {
+		r := &PGRelationSchema{Schema: "public", Table: table,
+			Columns: []PGRelationColumn{{Name: "id", Ordinal: 1, IsPK: true, TypeOID: 23, TypeMod: -1}}}
+		for i, c := range extraCols {
+			r.Columns = append(r.Columns, PGRelationColumn{Name: c, Ordinal: i + 2, TypeOID: 25, TypeMod: -1})
+		}
+		return r
+	}
+
+	for _, tbl := range []string{"users", "orders"} {
+		if _, err := WritePGSnapshot(indexDB, rel(tbl, "v1")); err != nil {
+			t.Fatalf("WritePGSnapshot(%s): %v", tbl, err)
+		}
+	}
+	// users evolves (a later RelationMessage after an ALTER): its NEWEST
+	// per-table snapshot must win over its older one.
+	if _, err := WritePGSnapshot(indexDB, rel("users", "v1", "v2")); err != nil {
+		t.Fatalf("WritePGSnapshot(users v2): %v", err)
+	}
+
+	r, err := NewLatestPerTableResolver(indexDB)
+	if err != nil {
+		t.Fatalf("NewLatestPerTableResolver: %v", err)
+	}
+
+	tables := r.Tables("public")
+	if len(tables) != 2 {
+		names := make([]string, 0, len(tables))
+		for _, tm := range tables {
+			names = append(names, tm.Table)
+		}
+		t.Fatalf("Tables(public) = %v, want [orders users]", names)
+	}
+	users, err := r.Resolve("public", "users")
+	if err != nil {
+		t.Fatalf("Resolve(public.users): %v", err)
+	}
+	if len(users.Columns) != 3 {
+		t.Errorf("users columns = %d, want 3 (newest per-table snapshot must win)", len(users.Columns))
+	}
+	if got := users.PKColumns; len(got) != 1 || got[0] != "id" {
+		t.Errorf("users PKColumns = %v, want [id]", got)
+	}
+	orders, err := r.Resolve("public", "orders")
+	if err != nil {
+		t.Fatalf("Resolve(public.orders): %v", err)
+	}
+	if len(orders.Columns) != 2 {
+		t.Errorf("orders columns = %d, want 2", len(orders.Columns))
+	}
+}
+
+// TestNewLatestPerTableResolver_mysqlEquivalenceAndDroppedTable pins the two
+// MySQL-layout properties the union must hold:
+//
+//  1. Strict generalization: for a table present in the latest whole-schema
+//     snapshot, the union resolves the SAME shape NewResolver(db, 0) does.
+//  2. Documented retention semantic: a table present only in an OLDER
+//     snapshot (dropped at the source, then re-snapshotted) stays resolvable
+//     under its last-known shape — its indexed history remains addressable
+//     by the shim's time-travel surfaces (the table-level analog of #600's
+//     dropped-column surfacing).
+func TestNewLatestPerTableResolver_mysqlEquivalenceAndDroppedTable(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	// Snapshot 1: orders (2 cols) + legacy (1 col). Snapshot 2: orders only
+	// (3 cols) — legacy was dropped before the re-snapshot.
+	testutil.InsertSnapshot(t, indexDB, 1, "2026-02-18 10:00:00", "mydb", "orders", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, indexDB, 1, "2026-02-18 10:00:00", "mydb", "orders", "name", 2, "", "varchar", "YES")
+	testutil.InsertSnapshot(t, indexDB, 1, "2026-02-18 10:00:00", "mydb", "legacy", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, indexDB, 2, "2026-02-19 10:00:00", "mydb", "orders", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, indexDB, 2, "2026-02-19 10:00:00", "mydb", "orders", "name", 2, "", "varchar", "YES")
+	testutil.InsertSnapshot(t, indexDB, 2, "2026-02-19 10:00:00", "mydb", "orders", "status", 3, "", "varchar", "NO")
+
+	r, err := NewLatestPerTableResolver(indexDB)
+	if err != nil {
+		t.Fatalf("NewLatestPerTableResolver: %v", err)
+	}
+
+	// (1) orders resolves identically to the single-latest-snapshot view.
+	latest, err := NewResolver(indexDB, 0)
+	if err != nil {
+		t.Fatalf("NewResolver(db, 0): %v", err)
+	}
+	fromLatest, err := latest.Resolve("mydb", "orders")
+	if err != nil {
+		t.Fatalf("latest Resolve(mydb.orders): %v", err)
+	}
+	fromUnion, err := r.Resolve("mydb", "orders")
+	if err != nil {
+		t.Fatalf("union Resolve(mydb.orders): %v", err)
+	}
+	if len(fromUnion.Columns) != len(fromLatest.Columns) || len(fromUnion.Columns) != 3 {
+		t.Errorf("union orders columns = %d, latest = %d, want both 3",
+			len(fromUnion.Columns), len(fromLatest.Columns))
+	}
+
+	// (2) legacy (only in snapshot 1) is retained under its last-known shape.
+	legacy, err := r.Resolve("mydb", "legacy")
+	if err != nil {
+		t.Fatalf("union Resolve(mydb.legacy): %v (dropped table must stay resolvable)", err)
+	}
+	if len(legacy.Columns) != 1 {
+		t.Errorf("legacy columns = %d, want 1", len(legacy.Columns))
+	}
+	// And it lists in the schema's table view (SHOW TABLES backing).
+	names := make([]string, 0)
+	for _, tm := range r.Tables("mydb") {
+		names = append(names, tm.Table)
+	}
+	if len(names) != 2 || names[0] != "legacy" || names[1] != "orders" {
+		t.Errorf("Tables(mydb) = %v, want [legacy orders]", names)
+	}
+}
+
+// TestNewLatestPerTableResolver_pre212WarnsPerTable pins the per-table
+// pre-#212 warning: in a union, one post-#212 table (column_type captured)
+// must NOT silence the warning for a retained table whose newest shape
+// predates column_type — and the warning must name the affected table.
+func TestNewLatestPerTableResolver_pre212WarnsPerTable(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	// "stale" (snapshot 1): data_type only — the pre-#212 signature.
+	testutil.InsertSnapshot(t, indexDB, 1, "2026-02-18 10:00:00", "mydb", "stale", "id", 1, "PRI", "int", "NO")
+	// "fresh" (snapshot 2): column_type present — post-#212.
+	if _, err := indexDB.Exec(`INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable)
+		VALUES (2, '2026-02-19 10:00:00', 'mydb', 'fresh', 'id', 1, 'PRI', 'int', 'int unsigned', 'NO')`); err != nil {
+		t.Fatalf("insert post-#212 row: %v", err)
+	}
+
+	var logbuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	if _, err := NewLatestPerTableResolver(indexDB); err != nil {
+		t.Fatalf("NewLatestPerTableResolver: %v", err)
+	}
+
+	logs := logbuf.String()
+	if !strings.Contains(logs, "predates column_type capture") {
+		t.Errorf("expected pre-#212 warning (a post-#212 table must not silence it); logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "mydb.stale") {
+		t.Errorf("warning must name the affected table mydb.stale; logs:\n%s", logs)
+	}
+	if strings.Contains(logs, "mydb.fresh") {
+		t.Errorf("warning must not name the post-#212 table mydb.fresh; logs:\n%s", logs)
+	}
+}
+
+// TestNewLatestPerTableResolver_empty pins the ErrNoSnapshots sentinel: an
+// empty schema_snapshots must return the same benign first-install signal
+// NewResolver does, so the shim's empty-set SHOW TABLES path keeps working.
+func TestNewLatestPerTableResolver_empty(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	_, err := NewLatestPerTableResolver(indexDB)
+	if !errors.Is(err, ErrNoSnapshots) {
+		t.Errorf("expected ErrNoSnapshots, got %v", err)
+	}
+}
+
 func TestResolver_pkColumns(t *testing.T) {
 	indexDB, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, indexDB)
