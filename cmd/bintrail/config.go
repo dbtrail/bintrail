@@ -189,6 +189,12 @@ var envSections = []envSection{
 		},
 	},
 	{
+		Header: "Forensics attribution (used by bintrail up / bintrail-console watch; 0 disables the session-identity poller)",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_ATTRIBUTION_RETENTION", "24h"},
+		},
+	},
+	{
 		Header: "Baseline retention (used by bintrail baseline; prunes local snapshots once a durable S3 copy exists)",
 		Bindings: []envTemplateEntry{
 			{"BINTRAIL_BASELINE_RETAIN", ""},

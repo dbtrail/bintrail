@@ -1,0 +1,2 @@
+{"timestamp":"2024-06-15T10:30:00Z","class":"general","event":"status","login":{"user":"root","host":"localhost"},"general_data":{"query":"SELECT 1"},"connection_id":42,"status":0}
+{"timestamp":"2024-06-15T10:31:00Z","class":"connection","event":"connect","login":{"user":"app","host":"10.0.0.5"},"connection_id":43,"status":0}
