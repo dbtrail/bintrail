@@ -5,9 +5,10 @@
 // vendor events into a common shape.
 //
 // Logs are read from the local filesystem by default; for AWS-managed
-// servers a remote source exists — the RDS file API (auditlog_rds.go) —
-// selected explicitly via AuditReadOptions.Source or automatically when
-// the configured log file is not on local disk and the DSN host is an RDS
+// servers two remote sources exist — the RDS file API (auditlog_rds.go)
+// and CloudWatch Logs (auditlog_cloudwatch.go) — selected explicitly via
+// AuditReadOptions.Source or, for the RDS file API, automatically when the
+// configured log file is not on local disk and the DSN host is an RDS
 // endpoint.
 package forensics
 
@@ -82,6 +83,10 @@ const (
 	// AuditSourceRDS reads through the RDS file API
 	// (DescribeDBLogFiles + DownloadDBLogFilePortion). Requires SourceHost.
 	AuditSourceRDS AuditSource = "rds"
+	// AuditSourceCloudWatch reads the CloudWatch Logs export
+	// (/aws/rds/{instance|cluster}/<id>/audit) via FilterLogEvents.
+	// Requires SourceHost or CloudWatchLogGroup; never touches sourceDB.
+	AuditSourceCloudWatch AuditSource = "cloudwatch"
 )
 
 // AuditReadOptions controls ReadAuditLog discovery, filtering, and paging.
@@ -117,6 +122,9 @@ type AuditReadOptions struct {
 	// instance/cluster id and region — for the remote sources and the
 	// automatic local→RDS fallback. Optional for purely local reads.
 	SourceHost string
+	// CloudWatchLogGroup overrides the log group derived from SourceHost
+	// for AuditSourceCloudWatch (e.g. "/aws/rds/cluster/mydb/audit").
+	CloudWatchLogGroup string
 }
 
 // AuditReadResult is the outcome of ReadAuditLog. JSON field names match the
@@ -197,7 +205,8 @@ const (
 // when no file-path variable exists but server_audit_logging is ON (Aurora
 // Advanced Auditing exposes no path variable). AuditSourceRDS forces the
 // API path; sourceDB is then only used for best-effort discovery and may
-// be nil.
+// be nil. AuditSourceCloudWatch reads the CloudWatch Logs export and never
+// touches sourceDB.
 //
 // Parse errors inside a file are non-fatal: they surface as Warnings on the
 // result alongside the events parsed so far. On a non-nil error the returned
@@ -211,6 +220,8 @@ func ReadAuditLog(ctx context.Context, sourceDB *sql.DB, opts AuditReadOptions) 
 	switch opts.Source {
 	case AuditSourceRDS:
 		return readAuditRDSExplicit(ctx, sourceDB, opts, tailLines)
+	case AuditSourceCloudWatch:
+		return readAuditCloudWatch(ctx, opts)
 	case AuditSourceAuto, AuditSourceLocal:
 		// The local flow below.
 	default:
