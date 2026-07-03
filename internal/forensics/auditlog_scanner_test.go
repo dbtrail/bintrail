@@ -71,6 +71,29 @@ func TestAuditLineScanner_OversizedSkippedMidStream(t *testing.T) {
 	}
 }
 
+// TestAuditLineScanner_MultipleConsecutiveOversized: several over-long lines in
+// a row are each drained, skipped, and counted, and the valid lines bracketing
+// them still come through — the scan never gets "stuck" on a run of big records.
+func TestAuditLineScanner_MultipleConsecutiveOversized(t *testing.T) {
+	huge := strings.Repeat("x", maxAuditLineBytes+1)
+	in := "a\n" + huge + "\n" + huge + "\n" + huge + "\nb\n"
+
+	sc := newAuditLineScanner(strings.NewReader(in))
+	var got []string
+	for sc.Scan() {
+		got = append(got, sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("lines = %q, want [a b] (all three oversized records skipped)", got)
+	}
+	if sc.Skipped() != 3 {
+		t.Errorf("Skipped() = %d, want 3", sc.Skipped())
+	}
+}
+
 // TestAuditLineScanner_OversizedFinalLineNoNewline: an oversized last line with
 // no trailing newline is skipped (counted) and ends the scan cleanly, not as an
 // error.
@@ -94,10 +117,11 @@ func TestAuditLineScanner_OversizedFinalLineNoNewline(t *testing.T) {
 }
 
 // TestAuditLineScanner_BoundaryKeptAndSpanningFills pins two size edges: a line
-// of exactly maxAuditLineBytes content is KEPT (not skipped — matching the old
-// scanner's max-token semantics), and a valid line larger than the 256 KB
-// internal read buffer (so it arrives in multiple ReadSlice fragments) is
-// reassembled intact.
+// of exactly maxAuditLineBytes content is KEPT (the old bufio.Scanner actually
+// aborted here — it needed buffer room for the trailing newline too; this
+// scanner is deliberately one byte more permissive and never drops a line the
+// old one kept), and a valid line larger than the 256 KB internal read buffer
+// (so it arrives in multiple ReadSlice fragments) is reassembled intact.
 func TestAuditLineScanner_BoundaryKeptAndSpanningFills(t *testing.T) {
 	t.Run("exactly at the byte bound is kept", func(t *testing.T) {
 		line := strings.Repeat("a", maxAuditLineBytes)

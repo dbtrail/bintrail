@@ -3,6 +3,7 @@ package forensics
 import (
 	"bufio"
 	"io"
+	"log/slog"
 )
 
 // maxAuditLineBytes bounds a single audit record. A line longer than this is
@@ -82,9 +83,11 @@ func (s *auditLineScanner) readLine() (line string, tooLong bool, err error) {
 		frag, e := s.r.ReadSlice('\n')
 		// contentLen is the line length excluding the single '\n' delimiter,
 		// which ReadSlice includes only on the terminating fragment (e == nil).
-		// Comparing content (not content+delimiter) keeps the threshold aligned
-		// with bufio.Scanner's max-token size: a line of exactly
-		// maxAuditLineBytes is kept, not skipped.
+		// Comparing content (not content+delimiter) means a line of exactly
+		// maxAuditLineBytes is kept. That is one byte more permissive than the
+		// old bufio.Scanner, which had to fit content+'\n' in its 1 MB buffer
+		// and so aborted at maxAuditLineBytes content — a safe divergence: every
+		// line the old scanner kept, this one keeps too; none is dropped.
 		contentLen := len(buf) + len(frag)
 		if e == nil && contentLen > 0 {
 			contentLen--
@@ -128,6 +131,23 @@ func (s *auditLineScanner) finish(err error) {
 func (s *auditLineScanner) Text() string { return s.line }
 func (s *auditLineScanner) Err() error   { return s.err }
 func (s *auditLineScanner) Skipped() int { return s.skipped }
+
+// foldOversized adds the scanner's oversized-line drops to a parser's running
+// skip count and, when any occurred, logs them distinctly. They still count in
+// skipped_lines (the total the caller reports), but an oversized drop is a whole
+// audit record discarded for size — not a malformed line — and in a forensics
+// context the dropped record may be the one that names the actor, so operators
+// need it surfaced rather than folded away silently. Every scanner-backed parser
+// calls this once, after its scan loop.
+func foldOversized(scanner *auditLineScanner, skipped int) int {
+	if n := scanner.Skipped(); n > 0 {
+		slog.Warn("forensics: skipped audit record(s) exceeding the 1 MiB parser line limit; "+
+			"attribution from those records is unavailable (raise the limit at the source or shorten the query text)",
+			"oversized_records", n)
+		return skipped + n
+	}
+	return skipped
+}
 
 // trimTrailingNewline strips a trailing "\n" then a trailing "\r", replicating
 // bufio.ScanLines' dropCR so the line sequence is identical to bufio.Scanner's

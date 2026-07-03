@@ -65,7 +65,7 @@ func parsePerconaCSV(r io.Reader, filter auditLogFilter) ([]AuditEvent, int, int
 			break
 		}
 	}
-	skipped += scanner.Skipped()
+	skipped = foldOversized(scanner, skipped)
 	return events, totalScanned, skipped, scanner.Err()
 }
 

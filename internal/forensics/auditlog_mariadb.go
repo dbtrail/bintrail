@@ -82,7 +82,7 @@ func parseMariaDBFile(r io.Reader, filter auditLogFilter) (events []AuditEvent, 
 	if localTimeSeen {
 		notes = append(notes, mariadbLocalTimeNote)
 	}
-	skipped += scanner.Skipped()
+	skipped = foldOversized(scanner, skipped)
 	return events, totalScanned, skipped, notes, scanner.Err()
 }
 
