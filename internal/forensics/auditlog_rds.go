@@ -381,57 +381,103 @@ func (r *rdsLogReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	// Fetch the next page.
-	input := &rds.DownloadDBLogFilePortionInput{
-		DBInstanceIdentifier: &r.dbIdentifier,
-		LogFileName:          &r.logFileName,
-	}
-	// Tail mode on the first call: set NumberOfLines, leave Marker nil.
-	tailFirstCall := !r.firstPage && r.tailLines > 0
-	if tailFirstCall {
-		n := r.tailLines
-		input.NumberOfLines = &n
-	} else if r.marker != nil {
-		input.Marker = r.marker
-	}
-	r.firstPage = true
-
-	resp, err := r.client.DownloadDBLogFilePortion(r.ctx, input)
-	if err != nil {
-		r.err = err
-		return 0, err
-	}
-
-	if resp.LogFileData == nil || *resp.LogFileData == "" {
-		r.done = true
-		return 0, io.EOF
-	}
-
-	data := *resp.LogFileData
-	// A tail-mode fetch typically lands mid-line. Discard everything up to
-	// (and including) the first newline so downstream parsers see whole
-	// records only.
-	if tailFirstCall && !r.tailStripped {
-		if idx := strings.IndexByte(data, '\n'); idx >= 0 {
-			data = data[idx+1:]
+	// Fetch pages until one yields data or AWS signals no more is pending.
+	// AdditionalDataPending — not an empty chunk — is the authoritative
+	// "keep going" signal: an actively-written audit log can return an empty
+	// portion mid-file, so ending the scan on the first empty chunk would
+	// silently truncate the very full scan the Marker="0" branch exists to
+	// make complete.
+	for {
+		input := &rds.DownloadDBLogFilePortionInput{
+			DBInstanceIdentifier: &r.dbIdentifier,
+			LogFileName:          &r.logFileName,
 		}
-		r.tailStripped = true
-	}
+		// Tail mode on the first call: set NumberOfLines, leave Marker nil.
+		tailFirstCall := !r.firstPage && r.tailLines > 0
+		switch {
+		case tailFirstCall:
+			n := r.tailLines
+			input.NumberOfLines = &n
+		case !r.firstPage:
+			// First page of a full (non-tail) scan: start from the beginning of
+			// the file. DownloadDBLogFilePortion with neither Marker nor
+			// NumberOfLines returns only the most-recent ~10000 lines / 1 MB (the
+			// tail), silently dropping older records; Marker="0" reads from the
+			// start and paginates forward via resp.Marker.
+			startMarker := "0"
+			input.Marker = &startMarker
+		case r.marker != nil:
+			input.Marker = r.marker
+		default:
+			// AWS reported more data pending on the previous page but returned
+			// no marker to continue from. Refuse rather than re-issue a
+			// marker-less request, which would silently re-fetch the tail.
+			r.err = fmt.Errorf("reading RDS audit log %q: more data was pending but RDS returned no marker to continue", r.logFileName)
+			return 0, r.err
+		}
+		r.firstPage = true
 
-	r.buf = []byte(data)
-	r.marker = resp.Marker
-	if resp.AdditionalDataPending == nil || !*resp.AdditionalDataPending {
-		r.done = true
-	}
-	// Tail mode is single-page — treating subsequent markers as "forward
-	// from the end" would duplicate the records already fetched.
-	if tailFirstCall {
-		r.done = true
-	}
+		resp, err := r.client.DownloadDBLogFilePortion(r.ctx, input)
+		if err != nil {
+			r.err = err
+			return 0, err
+		}
 
-	n := copy(p, r.buf)
-	r.buf = r.buf[n:]
-	return n, nil
+		pending := resp.AdditionalDataPending != nil && *resp.AdditionalDataPending
+
+		data := ""
+		if resp.LogFileData != nil {
+			data = *resp.LogFileData
+		}
+		// A tail-mode fetch typically lands mid-line. Discard everything up to
+		// (and including) the first newline so downstream parsers see whole
+		// records only.
+		if tailFirstCall && !r.tailStripped {
+			if idx := strings.IndexByte(data, '\n'); idx >= 0 {
+				data = data[idx+1:]
+			}
+			r.tailStripped = true
+		}
+
+		prevMarker := r.marker
+		r.marker = resp.Marker
+
+		// Termination is driven by AdditionalDataPending. Tail mode is
+		// single-page — following subsequent markers would re-fetch "forward
+		// from the end" and duplicate the records already returned.
+		if tailFirstCall || !pending {
+			r.done = true
+		}
+
+		if data != "" {
+			r.buf = []byte(data)
+			n := copy(p, r.buf)
+			r.buf = r.buf[n:]
+			return n, nil
+		}
+
+		// Empty chunk. If nothing more is pending, it's a clean EOF.
+		if r.done {
+			return 0, io.EOF
+		}
+		// More is pending but this page was empty: continue with the advanced
+		// marker — unless it did not advance, which would loop forever.
+		if !markerAdvanced(prevMarker, r.marker) {
+			r.err = fmt.Errorf("reading RDS audit log %q: RDS reported data pending but returned an empty page without advancing the marker", r.logFileName)
+			return 0, r.err
+		}
+	}
+}
+
+// markerAdvanced reports whether the pagination marker changed between two
+// DownloadDBLogFilePortion responses (a nil/non-nil transition, or a different
+// value). Used to break out of an empty-but-pending fetch loop that is making
+// no progress.
+func markerAdvanced(prev, cur *string) bool {
+	if (prev == nil) != (cur == nil) {
+		return true
+	}
+	return prev != nil && *prev != *cur
 }
 
 // ---------------------------------------------------------------------------

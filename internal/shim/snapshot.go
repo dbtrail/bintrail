@@ -211,8 +211,8 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	return h.fullTableResult(q, images)
 }
 
-// pkColumnMetas returns the primary-key column metas of schema.table from the
-// latest schema snapshot, for canonicalizing baseline PK values. The bool is
+// pkColumnMetas returns the primary-key column metas of schema.table from its
+// newest schema snapshot, for canonicalizing baseline PK values. The bool is
 // false when the resolver is unavailable or the table isn't in the snapshot —
 // callers treat that as "can't safely attempt a baseline merge" and fall back
 // to the binlog-only path.
@@ -438,7 +438,14 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 	// need this — the baseline image already carries labels (mydumper
 	// dumps strings) and string values pass through the mapper untouched.
 	h.mapEventImages(q.Schema, q.Table, rows)
-	state := reconstruct.ApplyAt(baselineRow, rows, q.AsOf)
+	state, err := reconstruct.ApplyAt(baselineRow, rows, q.AsOf)
+	if err != nil {
+		// A residual unchanged-TOAST marker (#592) — a capture-invariant
+		// violation, i.e. a server-side data fault: plain error →
+		// ER_UNKNOWN_ERROR (1105), same as a baseline-source failure above.
+		// Refusing beats serving the marker's JSON as the column value.
+		return nil, err
+	}
 	if state == nil {
 		// Either the row never existed at AsOf (no baseline image and no
 		// INSERT in the window) or its latest event was a DELETE.
@@ -453,8 +460,8 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 	return imageToResult(state, h.columnOrderFor(q.Schema, q.Table))
 }
 
-// pkDataType returns the DATA_TYPE of pkCol in schema.table from the
-// latest schema snapshot. The bool is false when the resolver is
+// pkDataType returns the DATA_TYPE of pkCol in schema.table from its
+// newest schema snapshot. The bool is false when the resolver is
 // unavailable or the column isn't found — callers treat that as "can't
 // safely attempt a baseline match" and fall back to the binlog-only
 // path.

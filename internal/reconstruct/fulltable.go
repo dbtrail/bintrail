@@ -498,6 +498,15 @@ type mergeInput struct {
 // still runs and unlinks half-written chunk files, so callers never observe
 // stray partial output on disk.
 func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableReport) (retErr error) {
+	// Fail loud on a residual unchanged-TOAST marker (#592), before the writer
+	// opens (same up-front stance as the #602 refusal below): every change in
+	// the map is destined for the output, so a marker anywhere in it would be
+	// written into the reconstructed dump as the marker's JSON — silent
+	// corruption.
+	if err := checkChangesToast(in.Changes); err != nil {
+		return err
+	}
+
 	colNames, err := readBaselineColumns(ctx, in.LocalBaselinePath)
 	if err != nil {
 		return fmt.Errorf("read baseline columns: %w", err)
@@ -770,6 +779,12 @@ type SnapshotFullTableInput struct {
 // missing baseline or an unsupported PK type should instead fall back to a
 // binlog-only path.
 func SnapshotFullTableImages(ctx context.Context, in SnapshotFullTableInput, emit func(map[string]any) error) error {
+	// Residual unchanged-TOAST marker (#592) → refuse before materializing the
+	// baseline (possibly an S3 download); see mergeBaselineIntoWriter.
+	if err := checkChangesToast(in.Changes); err != nil {
+		return err
+	}
+
 	localPath, cleanup, err := materializeBaselineLocal(ctx, in.BaselinePath)
 	if err != nil {
 		return fmt.Errorf("materialize baseline: %w", err)
@@ -787,6 +802,22 @@ func SnapshotFullTableImages(ctx context.Context, in SnapshotFullTableInput, emi
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
+
+// checkChangesToast scans a full-table change map for a residual
+// unchanged-TOAST marker (#592). Both full-table entry points (the mydumper
+// writer and the shim's in-memory _snapshot) call it BEFORE any IO — every
+// change is destined for the output (an UPDATE/INSERT overwrites the baseline
+// row with its row_after, a leftover change is appended as a new row), so a
+// marker anywhere in the map means the output would carry the marker's JSON
+// instead of a real value.
+func checkChangesToast(changes map[string]*query.ResultRow) error {
+	for _, ev := range changes {
+		if err := checkEventToast(*ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // splitSchemaTable parses "db.table" into (db, table, true). Rejects entries
 // with zero or more than one dot.

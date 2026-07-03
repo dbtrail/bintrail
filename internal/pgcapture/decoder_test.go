@@ -257,6 +257,48 @@ func TestDecode_NullVsEmptyVsToastMarker(t *testing.T) {
 	}
 }
 
+// TestDecode_ToastMarkerMatchedByReadSideGuard is the producer→matcher CONTRACT
+// test (#592): the exact value the decoder emits for an unresolvable 'u' must be
+// detected by event.IsUnchangedToastMarker — both as emitted and after the
+// persisted round trip (json.Marshal at index time → query.UnmarshalRowImage,
+// UseNumber, on the read side). The matcher is deliberately STRICT (exactly the
+// one-key true map), so this is the one test that fails if the decoder ever
+// changes the marker's shape (say, adds a second key): without it the matcher
+// would go silently blind — every read-side guard green while detecting nothing.
+func TestDecode_ToastMarkerMatchedByReadSideGuard(t *testing.T) {
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	mustDecode(t, d, relMsg(1, "public", "t", "id", "body"))
+	mustDecode(t, d, beginMsg())
+
+	// RI-DEFAULT-style UPDATE with no old tuple: 'u' cannot be resolved, so the
+	// decoder emits the residual marker — the exact shape the read side must catch.
+	ev, _ := mustDecode(t, d, &pglogrepl.UpdateMessage{
+		RelationID:   1,
+		OldTupleType: pglogrepl.UpdateMessageTupleTypeNone,
+		NewTuple:     tuple(textCol("1"), toastCol()),
+	})
+
+	if !event.IsUnchangedToastMarker(ev.RowAfter["body"]) {
+		t.Fatalf("read-side matcher does not recognize the decoder-emitted marker %#v — "+
+			"the #592 guards are blind to what the decoder actually produces", ev.RowAfter["body"])
+	}
+
+	// Persisted round trip: the indexer json.Marshals the row image into
+	// binlog_events, and every #592 guard consumes images decoded by
+	// query.UnmarshalRowImage (UseNumber). The marker must survive that exact path.
+	blob, err := json.Marshal(ev.RowAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := query.UnmarshalRowImage(blob)
+	if !event.IsUnchangedToastMarker(got["body"]) {
+		t.Fatalf("marker lost through the index round trip (json.Marshal → UnmarshalRowImage): %#v", got["body"])
+	}
+	if cols := event.UnresolvedToastColumns(got); len(cols) != 1 || cols[0] != "body" {
+		t.Errorf("UnresolvedToastColumns = %v, want [body]", cols)
+	}
+}
+
 // ─── fail-loud invariants ─────────────────────────────────────────────────────
 
 func TestDecode_BinaryDatumFailsLoud(t *testing.T) {

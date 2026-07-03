@@ -1,0 +1,30 @@
+name: oss-firewall
+
+# This repo is Apache 2.0: anything merged here is open source forever.
+# This guard rejects the only mechanically-detectable breach — Go
+# imports or module requirements pointing at private nethalo/* repos.
+# (Plain-text references like issue links "nethalo/dbtrail#123" in
+# comments are fine and intentionally not matched.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Forbid private-module references
+        run: |
+          fail=0
+          if grep -rn --include='*.go' -E '"github\.com/nethalo/' .; then
+            echo '::error::Go import of a private nethalo/* module — the public repo must never depend on private code'
+            fail=1
+          fi
+          if grep -n 'github.com/nethalo/' go.mod go.sum 2>/dev/null; then
+            echo '::error::go.mod/go.sum references a private nethalo/* module'
+            fail=1
+          fi
+          exit $fail

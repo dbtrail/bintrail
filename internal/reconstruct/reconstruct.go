@@ -33,23 +33,33 @@ type StateEntry struct {
 }
 
 // ApplyAt applies binlog events to initialState up to and including at,
-// returning the final row state. Returns nil if the row was deleted.
+// returning the final row state. Returns a nil state if the row was deleted.
 // Events must be sorted by (event_timestamp, event_id).
-func ApplyAt(initialState map[string]any, events []query.ResultRow, at time.Time) map[string]any {
+//
+// It fails loud on a residual unchanged-TOAST marker (#592) in any folded
+// event's row image: the marker means the capture invariant (REPLICA IDENTITY
+// FULL resolves every unchanged TOAST value at decode time) was violated, so
+// the reconstructed state would silently carry the marker instead of the real
+// value. Events after `at` are never inspected — they are not folded.
+func ApplyAt(initialState map[string]any, events []query.ResultRow, at time.Time) (map[string]any, error) {
 	state := copyMap(initialState)
 	for _, ev := range events {
 		if ev.EventTimestamp.After(at) {
 			break
 		}
+		if err := checkEventToast(ev); err != nil {
+			return nil, err
+		}
 		state = applyEvent(state, ev)
 	}
-	return state
+	return state, nil
 }
 
 // BuildHistory applies events chronologically up to at and returns a StateEntry
 // for each state transition, starting with the baseline as the first entry.
-// Events must be sorted by (event_timestamp, event_id).
-func BuildHistory(initialState map[string]any, baselineTime time.Time, events []query.ResultRow, at time.Time) []StateEntry {
+// Events must be sorted by (event_timestamp, event_id). Like ApplyAt, it fails
+// loud on a residual unchanged-TOAST marker (#592) in any folded event.
+func BuildHistory(initialState map[string]any, baselineTime time.Time, events []query.ResultRow, at time.Time) ([]StateEntry, error) {
 	entries := []StateEntry{{
 		Time:   baselineTime,
 		Source: "baseline",
@@ -59,6 +69,9 @@ func BuildHistory(initialState map[string]any, baselineTime time.Time, events []
 	for _, ev := range events {
 		if ev.EventTimestamp.After(at) {
 			break
+		}
+		if err := checkEventToast(ev); err != nil {
+			return nil, err
 		}
 		current = applyEvent(current, ev)
 		gtid := ""
@@ -73,7 +86,7 @@ func BuildHistory(initialState map[string]any, baselineTime time.Time, events []
 			State:   copyMap(current),
 		})
 	}
-	return entries
+	return entries, nil
 }
 
 // ─── Formatters ───────────────────────────────────────────────────────────────
@@ -297,6 +310,15 @@ func WriteSQLResultsCSV(rows []map[string]any, cols []string, w io.Writer) error
 }
 
 // ─── internal helpers ─────────────────────────────────────────────────────────
+
+// checkEventToast fails loud when either row image of an event carries a
+// residual unchanged-TOAST marker (#592). Both images are checked — only
+// row_after is folded into state, but a marker in EITHER image proves the
+// capture invariant was violated for this event, and refusing is always safer
+// than emitting a state whose provenance is broken.
+func checkEventToast(ev query.ResultRow) error {
+	return event.CheckUnresolvedToast(ev.SchemaName, ev.TableName, ev.PKValues, ev.RowBefore, ev.RowAfter)
+}
 
 func applyEvent(state map[string]any, ev query.ResultRow) map[string]any {
 	switch ev.EventType {

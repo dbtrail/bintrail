@@ -63,6 +63,11 @@ func seedReconstruct(t *testing.T) *Server {
 	// must still return its state (the post-baseline-INSERT case).
 	testutil.InsertEvent(t, db, "bin.000001", 120, 160, "2026-06-01 11:00:00", nil, "app", "users", 1, "2",
 		nil, nil, []byte(`{"id":2,"name":"bob"}`))
+	// id=3 carries a residual unchanged-TOAST marker (#592) in its row image —
+	// used ONLY by TestIntegrationReconstructToastMarkerRefused (every other test
+	// queries pk=1/2/999, so this row is invisible to them).
+	testutil.InsertEvent(t, db, "bin.000001", 160, 200, "2026-06-01 11:30:00", nil, "app", "users", 1, "3",
+		nil, nil, []byte(`{"id":3,"name":{"__bintrail_unchanged_toast__":true}}`))
 
 	baseDir := t.TempDir()
 	writeBaselineParquet(t, baseDir, "app", "users", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), "1", "alice")
@@ -212,6 +217,29 @@ func TestIntegrationReconstructEventCap(t *testing.T) {
 	rec, body := doReq(t, srv, "GET", "/api/reconstruct?schema=app&table=users&pk=1&at=2026-06-01%2015:00:00&allow_gaps=true", "")
 	if rec.Code != 422 {
 		t.Errorf("event cap exceeded: code=%d, want 422 (body=%s)", rec.Code, body)
+	}
+}
+
+// TestIntegrationReconstructToastMarkerRefused: a residual unchanged-TOAST
+// marker (#592) in a folded event must refuse with 422 (the captured history is
+// not usable — same class as the gap/cap refusals above), NOT 500, in both
+// state and history modes. The body must carry the marker message so the 422 is
+// attributable to the capture-invariant violation, not the coverage gap
+// (allow_gaps=true rules the gap out).
+func TestIntegrationReconstructToastMarkerRefused(t *testing.T) {
+	srv := seedReconstruct(t)
+	for _, mode := range []string{"", "&history=true"} {
+		rec, body := doReq(t, srv, "GET",
+			"/api/reconstruct?schema=app&table=users&pk=3&at=2026-06-01%2012:00:00&allow_gaps=true"+mode, "")
+		if rec.Code != 422 {
+			t.Errorf("toast marker (mode=%q): code=%d, want 422 (body=%s)", mode, rec.Code, body)
+			continue
+		}
+		for _, want := range []string{"unresolved unchanged-TOAST marker", "capture invariant violated", "name"} {
+			if !strings.Contains(string(body), want) {
+				t.Errorf("toast marker (mode=%q): body missing %q: %s", mode, want, body)
+			}
+		}
 	}
 }
 

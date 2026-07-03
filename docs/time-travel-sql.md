@@ -325,7 +325,7 @@ For a **full-table** `SELECT *` (no column list), dbtrail unions the columns pre
 
 The WHERE column must match the table's primary key. A WHERE on a non-PK column is rejected with a parser error rather than silently returning the wrong row.
 
-`SHOW TABLES FROM _flashback / _diff / _snapshot` returns the indexed tables in the current schema (from the latest `schema_snapshots` row) so an interactive `mysql>` session can explore the virtual schemas:
+`SHOW TABLES FROM _flashback / _diff / _snapshot` returns every table in the current schema that dbtrail has schema knowledge of (the newest snapshot per table, so PostgreSQL-source indexes — which record one table per snapshot — list all their tables too). A table that was since dropped at the source still appears: its indexed history remains queryable with `AS OF`. This lets an interactive `mysql>` session explore the virtual schemas:
 
 ```sql
 USE myapp;

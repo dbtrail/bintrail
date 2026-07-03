@@ -22,6 +22,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/server"
 	_ "github.com/go-sql-driver/mysql" // database/sql driver registration
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -832,6 +833,59 @@ func emptyBinlogEventsRows() *sqlmock.Rows {
 // images[0]'s keys would silently drop a column added by a later
 // event in the same query (e.g. a row captured pre-ALTER followed
 // by a row captured post-ALTER).
+// TestImagesToResult_unresolvedToastMarker is the #592 guard on the shim's
+// time-travel read surface: a row image carrying the residual unchanged-TOAST
+// marker must abort the client query with a loud error, never serve the
+// marker's JSON as the column value. The check is cell-level, so a verbatim
+// projection that does NOT include the marker column still succeeds — the
+// values actually served are real.
+func TestImagesToResult_unresolvedToastMarker(t *testing.T) {
+	marker := map[string]any{event.UnchangedToastKey: true}
+	images := []map[string]any{
+		{"id": "1", "body": "fine"},
+		{"id": "2", "body": marker},
+	}
+
+	assertToastErr := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("expected a loud error for a marker-carrying image")
+		}
+		for _, want := range []string{"unresolved unchanged-TOAST marker", "capture invariant violated", "body"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error missing %q:\n%s", want, err)
+			}
+		}
+	}
+
+	// SELECT * multi-row (_flashback full-table path).
+	if _, err := imagesToResult(images, []string{"id", "body"}); err == nil {
+		t.Fatal("imagesToResult: expected error")
+	} else {
+		assertToastErr(t, err)
+	}
+
+	// Verbatim multi-row: marker column projected → refuse.
+	_, err := imagesToResultVerbatim(images, []string{"body"})
+	assertToastErr(t, err)
+
+	// Verbatim multi-row: marker column NOT projected → the served cells are
+	// clean, so the query succeeds.
+	if _, err := imagesToResultVerbatim(images, []string{"id"}); err != nil {
+		t.Fatalf("marker in an unprojected column must not refuse: %v", err)
+	}
+
+	// Single-row siblings (point-lookup path).
+	single := map[string]any{"id": "2", "body": marker}
+	_, err = imageToResult(single, []string{"id", "body"})
+	assertToastErr(t, err)
+	_, err = imageToResultVerbatim(single, []string{"id", "body"})
+	assertToastErr(t, err)
+	if _, err := imageToResultVerbatim(single, []string{"id"}); err != nil {
+		t.Fatalf("single-row verbatim: marker in an unprojected column must not refuse: %v", err)
+	}
+}
+
 func TestImagesToResultColumnsFromUnionWhenNoDDLOrder(t *testing.T) {
 	images := []map[string]any{
 		{"id": 1, "sku": "A"},                           // pre-ALTER

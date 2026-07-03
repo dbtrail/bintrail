@@ -205,6 +205,25 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 		return 0, err
 	}
 
+	// Fail loud on a residual unchanged-TOAST marker (#592). Under the required
+	// REPLICA IDENTITY FULL the PostgreSQL decoder resolves every unchanged
+	// TOAST value at decode time, so the marker is never persisted for a
+	// supported source — one in a fetched row means the capture invariant was
+	// violated and the stored image does not carry the real value. The refusal
+	// must be UP FRONT, before a single byte reaches w: a per-statement error in
+	// the render loop below demotes to a SQL comment and the script keeps
+	// rendering, and a reversal that writes the marker's JSON into a real column
+	// is silent corruption — the same fail-loud stance as the schema-drift
+	// refusal (#601) and the script-budget refusal (#654). Both images are
+	// scanned because both are consumed (SET from row_before, WHERE from
+	// row_after).
+	for _, row := range rows {
+		if err := event.CheckUnresolvedToast(row.SchemaName, row.TableName, row.PKValues,
+			row.RowBefore, row.RowAfter); err != nil {
+			return 0, err
+		}
+	}
+
 	// Reverse so the most-recent event is undone first.
 	// For multiple UPDATEs on the same row this yields the correct
 	// rollback order automatically.
@@ -981,9 +1000,12 @@ func formatValuePG(v any) string {
 	case map[string]any, []any, json.RawMessage:
 		// Defensive, mirroring FormatSQLValue: a structured value → JSON, quoted. On
 		// the PG path the only structured value a row image can carry is the
-		// unchanged-TOAST sentinel map, reachable only via the all-columns WHERE
-		// fallback under a weaker-than-FULL replica identity (out of support; RI FULL
-		// resolves it at decode). JSON-marshalling keeps it valid, collision-distinct SQL.
+		// unchanged-TOAST sentinel map — but a marker can no longer reach here through
+		// the real path: GenerateSQLFromRows scans every row image and refuses up
+		// front (#592, event.CheckUnresolvedToast), because the render loop demotes
+		// per-statement errors to SQL comments and this function has no error return.
+		// The JSON-marshal below is last-resort rendering for any OTHER stray
+		// structured value, kept valid, collision-distinct SQL.
 		b, _ := json.Marshal(val)
 		return "'" + escapePGString(string(b)) + "'"
 	default:

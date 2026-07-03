@@ -3,9 +3,12 @@ package forensics
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -129,4 +132,101 @@ func openLazyDB(t *testing.T, dsn string) *sql.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+// TestCleanupConnectionCache_SubSecondRetention guards #8: a positive
+// sub-second --attribution-retention must not truncate to INTERVAL 0 SECOND
+// (which would DELETE every row, including live sessions). It is rounded up to
+// the minimum meaningful window of 1 second (last_seen is second-precision).
+func TestCleanupConnectionCache_SubSecondRetention(t *testing.T) {
+	tests := []struct {
+		name      string
+		retention time.Duration
+		wantSecs  int64
+	}{
+		{"half a second rounds up to 1", 500 * time.Millisecond, 1},
+		{"one nanosecond rounds up to 1", time.Nanosecond, 1},
+		{"exactly one second", time.Second, 1},
+		{"24h is exact", 24 * time.Hour, 86400},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+			mock.ExpectExec("DELETE FROM connection_cache").
+				WithArgs(tt.wantSecs).
+				WillReturnResult(sqlmock.NewResult(0, 0))
+
+			if err := cleanupConnectionCache(context.Background(), db, tt.retention); err != nil {
+				t.Fatalf("cleanupConnectionCache: %v", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("retention interval mismatch — sub-second must not become INTERVAL 0: %v", err)
+			}
+		})
+	}
+}
+
+// signalingArg is a sqlmock argument matcher that closes fired (once) when the
+// expected bound value is matched, giving a test a happens-before hook to know
+// a query has reached the driver — without racing on sqlmock's internals.
+type signalingArg struct {
+	want  int64
+	fired chan struct{}
+	once  sync.Once
+}
+
+func (s *signalingArg) Match(v driver.Value) bool {
+	if n, ok := v.(int64); ok && n == s.want {
+		s.once.Do(func() { close(s.fired) })
+		return true
+	}
+	return false
+}
+
+// TestSweepLoop_ImmediateSweepThenExitsOnCancel guards the fast-lane coverage
+// of #3's audit-present branch (the end-to-end behavior is pinned by the
+// integration test, which needs a MySQL container). sweepLoop must run one
+// retention sweep immediately — pruning the pre-audit backlog without waiting a
+// full cleanupInterval — and then exit promptly when the context is cancelled.
+func TestSweepLoop_ImmediateSweepThenExitsOnCancel(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Exactly one DELETE is expected: the immediate sweep. cleanupInterval is an
+	// hour, so the ticker cannot fire within the test window.
+	sig := &signalingArg{want: 86400, fired: make(chan struct{})} // 24h in seconds
+	mock.ExpectExec("DELETE FROM connection_cache").
+		WithArgs(sig).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		sweepLoop(ctx, db, 24*time.Hour)
+		close(done)
+	}()
+
+	select {
+	case <-sig.fired: // the immediate sweep issued its DELETE
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("sweepLoop did not run an immediate sweep before blocking on its ticker")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sweepLoop did not exit promptly on context cancel")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected sweep queries — only the immediate sweep should run: %v", err)
+	}
 }

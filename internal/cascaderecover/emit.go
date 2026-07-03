@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/dbtrail/dbtrail/internal/cascade"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/recovery"
@@ -60,6 +61,18 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 	// refusal" consistent with the plain recover path.
 	if err := gen.CheckScriptBudget(rows); err != nil {
 		return 0, err
+	}
+
+	// Fail loud on a residual unchanged-TOAST marker (#592) BEFORE writing a
+	// byte, hoisted for the same reason as the budget check above: the preamble
+	// (including `SET FOREIGN_KEY_CHECKS=0`) hits the writer ahead of the
+	// generator, so GenerateSQLFromRows' own up-front refusal would come too
+	// late and leave a dangling FK-disable in the output.
+	for _, row := range rows {
+		if err := event.CheckUnresolvedToast(row.SchemaName, row.TableName, row.PKValues,
+			row.RowBefore, row.RowAfter); err != nil {
+			return 0, err
+		}
 	}
 
 	// Build every SET NULL restoration BEFORE writing a byte (all-or-nothing): a

@@ -395,7 +395,10 @@ func runReconstructSQL(cmd *cobra.Command, start time.Time) error {
 // writeReconstructOutput formats the reconstructed state (or history) to w.
 func writeReconstructOutput(baselineRow map[string]any, events []query.ResultRow, snapshotTime, at time.Time, history bool, format string, w io.Writer) error {
 	if history {
-		entries := reconstruct.BuildHistory(baselineRow, snapshotTime, events, at)
+		entries, err := reconstruct.BuildHistory(baselineRow, snapshotTime, events, at)
+		if err != nil {
+			return err
+		}
 		switch format {
 		case "json":
 			return reconstruct.WriteHistoryJSON(entries, w)
@@ -405,7 +408,10 @@ func writeReconstructOutput(baselineRow map[string]any, events []query.ResultRow
 			return reconstruct.WriteHistoryTable(entries, w)
 		}
 	}
-	state := reconstruct.ApplyAt(baselineRow, events, at)
+	state, err := reconstruct.ApplyAt(baselineRow, events, at)
+	if err != nil {
+		return err
+	}
 	switch format {
 	case "json":
 		return reconstruct.WriteStateJSON(state, w)

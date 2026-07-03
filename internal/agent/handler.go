@@ -62,6 +62,13 @@ type DefaultHandler struct {
 	// Nil disables forensics_query support.
 	SourceDB *sql.DB
 
+	// SourceHost is the resolved host[:port] of the source server (from the
+	// agent's --source-dsn). It lets the audit-log tier reach the RDS/CloudWatch
+	// remote sources for a managed RDS/Aurora source whose audit log is not on
+	// a local filesystem. Empty => local-file audit reads only. A per-request
+	// ForensicsAuditLogRequest.SourceHost overrides it.
+	SourceHost string
+
 	// ArchiveSources lists Parquet archive paths (local dirs or s3:// URLs).
 	ArchiveSources []string
 
@@ -402,24 +409,43 @@ func (h *DefaultHandler) HandleForensicsUsers(ctx context.Context) (ForensicsUse
 	return ForensicsUsersResult{Users: users}, nil
 }
 
-// HandleForensicsAuditLog discovers and parses the audit log configured on
-// the source server. Local-filesystem files only — the audit log must be
-// reachable from the host the agent runs on (remote RDS/CloudWatch sources
-// are out of scope here).
+// HandleForensicsAuditLog discovers and parses the audit log configured on the
+// source server. In auto mode (req.Source==""), it reads local-filesystem files
+// and falls back to the RDS file API when the resolved host is an RDS/Aurora
+// endpoint; req.Source can force "local", "rds", or "cloudwatch". The host is
+// resolved via resolveAuditSourceHost (per-request req.SourceHost, else the
+// agent's own --source-dsn host), so a managed RDS/Aurora instance whose log is
+// not on local disk is reachable without the caller supplying the endpoint.
 func (h *DefaultHandler) HandleForensicsAuditLog(ctx context.Context, req ForensicsAuditLogRequest) (forensics.AuditReadResult, error) {
 	if err := h.requireSourceDB(); err != nil {
 		return forensics.AuditReadResult{}, err
 	}
+	host := resolveAuditSourceHost(req.SourceHost, h.SourceHost)
 	return forensics.ReadAuditLog(ctx, h.SourceDB, forensics.AuditReadOptions{
-		Since:          req.Since,
-		Until:          req.Until,
-		User:           req.User,
-		EventType:      req.EventType,
-		Limit:          req.Limit,
-		Offset:         req.Offset,
-		IncludeRotated: req.IncludeRotated,
-		TailLines:      req.TailLines,
+		Since:              req.Since,
+		Until:              req.Until,
+		User:               req.User,
+		EventType:          req.EventType,
+		Limit:              req.Limit,
+		Offset:             req.Offset,
+		IncludeRotated:     req.IncludeRotated,
+		TailLines:          req.TailLines,
+		Source:             forensics.AuditSource(req.Source),
+		SourceHost:         host,
+		CloudWatchLogGroup: req.CloudWatchLogGroup,
 	})
+}
+
+// resolveAuditSourceHost picks the host used to reach the RDS/CloudWatch remote
+// audit sources: a per-request SourceHost wins, otherwise the agent's own source
+// host (from --source-dsn). Without a non-empty result the audit tier stays on
+// the local-file path — the wiring gap that made the RDS/Aurora reader dead code
+// before it was threaded through, so this fallback is pinned by a test.
+func resolveAuditSourceHost(reqHost, handlerHost string) string {
+	if reqHost != "" {
+		return reqHost
+	}
+	return handlerHost
 }
 
 // byosPKHash computes SHA-256 hex digest of pkValues, matching the
