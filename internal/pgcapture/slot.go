@@ -437,15 +437,24 @@ func ensureSlot(ctx context.Context, replConn *pgconn.PgConn, queryConn *pgx.Con
 // replConnect lazily opens a REPLICATION connection (replication=database) and
 // is called ONLY when the slot must actually be created; pass nil when no
 // replication DSN is available, in which case a missing slot is an actionable
-// error rather than a silent skip. The caller owns closing the returned
-// connection — EnsureSlotExists closes it itself before returning.
+// error rather than a silent skip. EnsureSlotExists owns the connection it
+// opens through replConnect and closes it before returning — the caller never
+// sees it.
 //
-// It shares ensureSlot's safety semantics: a wal_status=lost slot fails loud
-// (wrapping ErrSlotLost), and a create racing another capturer (SQLSTATE 42710)
-// is treated as success — the slot exists either way (the ensureSlot TOCTOU rule).
-// Returns created=true only when this call created the slot.
+// Slot identity is SCOPED, not name-only (review medium): pg_replication_slots
+// is cluster-wide, so a same-named PHYSICAL slot, a non-pgoutput logical slot,
+// or a logical slot for a DIFFERENT database would satisfy a bare name match
+// while anchoring nothing — the baseline would publish with a void ordering
+// guarantee. A name collision with anything that is not a pgoutput logical
+// slot on the current database fails loud.
+//
+// It shares ensureSlot's other safety semantics: a wal_status=lost slot fails
+// loud (wrapping ErrSlotLost), and a create racing another capturer (SQLSTATE
+// 42710) re-checks the scoped state — success only if the raced slot is
+// actually ours in kind. Returns created=true only when this call created the
+// slot.
 func EnsureSlotExists(ctx context.Context, queryConn *pgx.Conn, slotName string, replConnect func(context.Context) (*pgconn.PgConn, error)) (created bool, err error) {
-	found, walStatus, err := querySlotState(ctx, queryConn, slotName)
+	found, walStatus, err := queryScopedSlotState(ctx, queryConn, slotName)
 	if err != nil {
 		return false, err
 	}
@@ -465,14 +474,46 @@ func EnsureSlotExists(ctx context.Context, queryConn *pgx.Conn, slotName string,
 	defer replConn.Close(ctx)
 	_, err = pglogrepl.CreateReplicationSlot(ctx, replConn, slotName, "pgoutput", pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication})
 	if err != nil {
-		// TOCTOU: another capturer created the slot between the check and now
-		// (SQLSTATE 42710 = duplicate_object). The slot exists — that is what
-		// this function guarantees — so treat it as success.
+		// TOCTOU: something created a slot with this name between the check and
+		// now (SQLSTATE 42710 = duplicate_object). Re-check with the SCOPED
+		// query: only a pgoutput logical slot on this database counts as "the
+		// slot exists"; a raced foreign slot (physical / other plugin / other
+		// database) is the collision error, not success.
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.SQLState() == "42710" {
-			return false, nil
+			raceFound, _, raceErr := queryScopedSlotState(ctx, queryConn, slotName)
+			if raceErr != nil {
+				return false, raceErr
+			}
+			if raceFound {
+				return false, nil
+			}
+			return false, fmt.Errorf("pgcapture: replication slot %q was created concurrently but is not visible as a pgoutput logical slot on this database — retry, or resolve the name collision", slotName)
 		}
 		return false, fmt.Errorf("pgcapture: creating replication slot %q: %w", slotName, err)
 	}
 	return true, nil
+}
+
+// queryScopedSlotState is querySlotState with slot IDENTITY checks: it reports
+// existence and wal_status only for a LOGICAL pgoutput slot belonging to the
+// CURRENT database. A same-named slot of any other kind is a loud, actionable
+// error — anchoring a baseline (or a resume decision) on a foreign slot would
+// void every ordering guarantee while looking healthy.
+func queryScopedSlotState(ctx context.Context, conn *pgx.Conn, slotName string) (found bool, walStatus string, err error) {
+	var slotType, plugin, database, curDB string
+	err = conn.QueryRow(ctx, `
+		SELECT slot_type, coalesce(plugin, ''), coalesce(database, ''), coalesce(wal_status, ''), current_database()
+		FROM pg_replication_slots WHERE slot_name = $1`, slotName).
+		Scan(&slotType, &plugin, &database, &walStatus, &curDB)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("pgcapture: checking replication slot %q: %w", slotName, err)
+	}
+	if slotType != "logical" || plugin != "pgoutput" || database != curDB {
+		return false, "", fmt.Errorf("pgcapture: replication slot %q exists but is not a pgoutput logical slot on database %q (slot_type=%q, plugin=%q, database=%q) — it cannot anchor this source; use a different --slot name or remove the conflicting slot", slotName, curDB, slotType, plugin, database)
+	}
+	return true, walStatus, nil
 }

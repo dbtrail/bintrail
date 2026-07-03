@@ -114,7 +114,15 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	if err := os.MkdirAll(snapDir, 0o755); err != nil {
 		return Stats{}, fmt.Errorf("create snapshot directory %s: %w", snapDir, err)
 	}
-	markIncomplete(snapDir)
+	// The marker write is FATAL: marker-absent directories are
+	// complete-by-default (legacy compat), so proceeding without _INCOMPLETE
+	// and then dying uncatchably mid-conversion would leave a markerless
+	// partial snapshot that discovery serves as complete — the very #467 hole
+	// the marker closes. A run whose crash-safety net failed to deploy (e.g.
+	// ENOSPC) has nothing to salvage; abort before any table converts.
+	if err := WriteIncompleteMarker(snapDir); err != nil {
+		return Stats{}, fmt.Errorf("could not write incomplete-snapshot marker in %s (refusing to convert without the crash-safety marker): %w", snapDir, err)
+	}
 
 	// Process tables in parallel with bounded concurrency.
 	concurrency := runtime.NumCPU()
@@ -252,14 +260,6 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		return stats, fmt.Errorf("snapshot complete but could not write %s marker: %w", SuccessMarker, err)
 	}
 	return stats, nil
-}
-
-// markIncomplete best-effort flags a partial snapshot directory. A run already
-// failing must not be masked by a marker-write error, so we only log it.
-func markIncomplete(snapDir string) {
-	if err := WriteIncompleteMarker(snapDir); err != nil {
-		slog.Warn("could not write incomplete-snapshot marker", "dir", snapDir, "error", err)
-	}
 }
 
 // processTable converts a single table's mydumper files to Parquet.

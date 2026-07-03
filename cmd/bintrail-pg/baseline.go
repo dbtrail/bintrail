@@ -65,7 +65,7 @@ func init() {
 	pgBaselineCmd.Flags().StringVar(&pgbCompression, "compression", "zstd", "Parquet compression codec: zstd, snappy, gzip, none")
 	pgBaselineCmd.Flags().IntVar(&pgbRowGroupSize, "row-group-size", 500_000, "Rows per Parquet row group")
 	pgBaselineCmd.Flags().IntVar(&pgbParallelism, "parallelism", 0, "Concurrent table COPYs, each on its own connection sharing the snapshot (0 = number of CPUs)")
-	pgBaselineCmd.Flags().BoolVar(&pgbRetry, "retry", false, "Skip tables whose output Parquet file already exists")
+	pgBaselineCmd.Flags().BoolVar(&pgbRetry, "retry", false, "With --upload: skip S3 objects that were already uploaded (local Parquet generation always runs fresh — every run is a new timestamped snapshot)")
 	pgBaselineCmd.Flags().StringVar(&pgbUpload, "upload", "", "S3 destination URL to upload Parquet files after generation (e.g. s3://my-bucket/baselines/)")
 	pgBaselineCmd.Flags().StringVar(&pgbUploadRegion, "upload-region", "", "AWS region for --upload (default: from AWS_REGION env var or ~/.aws/config)")
 	_ = pgBaselineCmd.MarkFlagRequired("output")
@@ -111,7 +111,6 @@ func pgBaselineConfigFromFlags() (pgbaseline.Config, error) {
 		Compression:  pgbCompression,
 		RowGroupSize: pgbRowGroupSize,
 		Parallelism:  pgbParallelism,
-		Retry:        pgbRetry,
 	}, nil
 }
 

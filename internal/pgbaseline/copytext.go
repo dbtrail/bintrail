@@ -31,7 +31,7 @@ func parseCopyTextLine(line []byte, wantCols int) (values []string, nulls []bool
 	// Raw tabs are always field separators (see grammar note above).
 	fields := bytes.Split(line, []byte{'\t'})
 	if len(fields) != wantCols {
-		return nil, nil, fmt.Errorf("row has %d fields, want %d (line %q)", len(fields), wantCols, line)
+		return nil, nil, fmt.Errorf("row has %d fields, want %d (line %q)", len(fields), wantCols, truncForErr(line))
 	}
 	values = make([]string, len(fields))
 	nulls = make([]bool, len(fields))
@@ -71,7 +71,7 @@ func unescapeCopyText(f []byte) (string, error) {
 		}
 		i++
 		if i >= len(f) {
-			return "", fmt.Errorf("truncated escape: field ends with a lone backslash (%q)", f)
+			return "", fmt.Errorf("truncated escape: field ends with a lone backslash (%q)", truncForErr(f))
 		}
 		switch f[i] {
 		case 'b':
@@ -89,7 +89,7 @@ func unescapeCopyText(f []byte) (string, error) {
 		case '\\':
 			out = append(out, '\\')
 		default:
-			return "", fmt.Errorf("unexpected escape %q in COPY text output (%q) — COPY TO emits only \\b \\f \\n \\r \\t \\v \\\\", string(f[i]), f)
+			return "", fmt.Errorf("unexpected escape %q in COPY text output (%q) — COPY TO emits only \\b \\f \\n \\r \\t \\v \\\\", string(f[i]), truncForErr(f))
 		}
 	}
 	return string(out), nil
@@ -128,17 +128,18 @@ func (s *copyTextSink) Write(p []byte) (int, error) {
 	}
 }
 
-// Flush handles a final unterminated line. COPY TO terminates every row with
-// a newline, so leftover bytes normally mean a truncated transfer — but the
-// caller only reaches Flush after CopyTo returned success, so parse the tail
-// as a row rather than drop it.
+// Flush verifies the stream ended cleanly. COPY TO terminates EVERY row with
+// a newline, so leftover buffered bytes after a successful CopyTo are a
+// protocol anomaly — treating the tail as a row would quietly accept a
+// truncated or desynced stream, so it is an error instead (review blocker;
+// the server-count check in processTable is the second line of defense).
 func (s *copyTextSink) Flush() error {
 	if len(s.buf) == 0 {
 		return nil
 	}
-	line := s.buf
+	tail := s.buf
 	s.buf = nil
-	return s.consumeLine(line)
+	return fmt.Errorf("COPY stream ended with an unterminated %d-byte line (%q) — protocol anomaly, refusing to accept a possibly truncated row", len(tail), truncForErr(tail))
 }
 
 func (s *copyTextSink) consumeLine(line []byte) error {
@@ -157,4 +158,17 @@ func (s *copyTextSink) consumeLine(line []byte) error {
 	}
 	s.rows++
 	return nil
+}
+
+// truncForErr caps raw COPY content quoted into error messages: the message
+// must locate the problem, not dump row contents (which may be sensitive)
+// into logs.
+func truncForErr(b []byte) []byte {
+	const max = 80
+	if len(b) <= max {
+		return b
+	}
+	out := make([]byte, max, max+3)
+	copy(out, b[:max])
+	return append(out, "..."...)
 }

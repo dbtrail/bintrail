@@ -127,6 +127,13 @@ func warnPartitioned(tables []tableInfo, publication string, logger *slog.Logger
 // PostgreSQL on any re-INSERT anyway (recovery already omits generated
 // columns from reverse-INSERTs, #557). Dropped columns are excluded too,
 // which also matches the delta path.
+//
+// Publication COLUMN LISTS (PG15+, `FOR TABLE t (a, b)`) are not a divergence
+// risk here: bintrail requires REPLICA IDENTITY FULL on every captured table,
+// and PostgreSQL rejects UPDATE/DELETE on a table published with a column
+// list narrower than its replica identity — so any table whose mutations the
+// delta path can capture is effectively published with ALL columns, matching
+// the full catalog set selected below.
 func loadColumns(ctx context.Context, conn *pgx.Conn, schema, table string, logger *slog.Logger) ([]string, error) {
 	rows, err := conn.Query(ctx, `
 		SELECT a.attname, a.attgenerated <> ''

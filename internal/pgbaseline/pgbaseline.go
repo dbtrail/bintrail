@@ -71,10 +71,16 @@ type Config struct {
 	Compression  string // "zstd" (default), "snappy", "gzip", "none"
 	RowGroupSize int    // rows per row group; <=0 → 500_000
 	Parallelism  int    // concurrent table COPYs; <=0 → runtime.NumCPU()
-	Retry        bool   // skip tables whose output Parquet file already exists
 
 	Logger *slog.Logger // nil → slog.Default()
 }
+
+// testHookAfterSnapshot, when non-nil, runs right after the snapshot
+// transaction is established and the anchor LSN is read — the seam the
+// concurrent-writer boundary test uses to commit rows that must land OUTSIDE
+// the snapshot (and therefore inside the delta stream, at LSN > anchor).
+// Test-only; never set in production code.
+var testHookAfterSnapshot func()
 
 // Stats describes the outcome of a baseline run.
 type Stats struct {
@@ -153,6 +159,9 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		return Stats{}, fmt.Errorf("pgbaseline: parse anchor LSN %q: %w", anchorText, err)
 	}
 	snapshotTime = snapshotTime.UTC()
+	if testHookAfterSnapshot != nil {
+		testHookAfterSnapshot()
+	}
 
 	// Discovery + column resolution run INSIDE the snapshot transaction, so
 	// the schema the Parquet files carry is consistent with the copied data.
@@ -206,8 +215,15 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	if err := os.MkdirAll(snapDir, 0o755); err != nil {
 		return Stats{}, fmt.Errorf("pgbaseline: create snapshot directory %s: %w", snapDir, err)
 	}
+	// The marker write is FATAL, not best-effort: marker-absent directories
+	// are complete-by-default (legacy compat), so continuing without the
+	// _INCOMPLETE flag and then dying uncatchably (SIGKILL/OOM/power loss)
+	// mid-COPY would leave a markerless partial snapshot that discovery
+	// serves as the newest complete baseline — the exact #467 silent loss
+	// the marker exists to close. A run whose crash-safety net failed to
+	// deploy has nothing to salvage; abort before any table is copied.
 	if err := baseline.WriteIncompleteMarker(snapDir); err != nil {
-		logger.Warn("pgbaseline: could not write incomplete-snapshot marker", "dir", snapDir, "error", err)
+		return Stats{}, fmt.Errorf("pgbaseline: could not write incomplete-snapshot marker in %s (refusing to copy without the crash-safety marker): %w", snapDir, err)
 	}
 
 	stats := Stats{AnchorLSN: uint64(anchorLSN), SnapshotTime: snapshotTime, SlotCreated: created}
@@ -216,7 +232,18 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		mu   sync.Mutex
 		errs []error
 	)
-	work := make(chan tableInfo)
+	// The work channel is BUFFERED to len(tables) and fully fed + closed
+	// BEFORE any worker starts: a worker that exits early (context cancelled,
+	// openWorkerConn failure — e.g. SQLSTATE 53300 near max_connections) then
+	// simply stops draining, and the remaining sends can never block. An
+	// unbuffered channel fed after worker startup deadlocked Run whenever the
+	// surviving workers were fewer than the remaining tables (review blocker).
+	work := make(chan tableInfo, len(tables))
+	for _, t := range tables {
+		work <- t
+	}
+	close(work)
+
 	var wg sync.WaitGroup
 	for w := 0; w < concurrency; w++ {
 		wg.Add(1)
@@ -229,6 +256,10 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 				var err error
 				wconn, err = openWorkerConn(ctx, cfg.QueryDSN, snapshotID)
 				if err != nil {
+					// Logged HERE, not only surfaced via the return: with
+					// multiple failures only the first reaches the caller,
+					// and this one is actionable (connection limits).
+					logger.Error("pgbaseline: parallel worker could not open its connection", "error", err)
 					mu.Lock()
 					errs = append(errs, err)
 					mu.Unlock()
@@ -243,7 +274,7 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 				if ctx.Err() != nil {
 					return
 				}
-				n, skipped, err := processTable(ctx, wconn, t, cfg.OutputDir, tsDir, tsStr, uint64(anchorLSN), compression, rowGroupSize, cfg.Retry, logger)
+				n, err := processTable(ctx, wconn, t, cfg.OutputDir, tsDir, tsStr, uint64(anchorLSN), compression, rowGroupSize, logger)
 				mu.Lock()
 				if err != nil {
 					logger.Error("pgbaseline: failed to process table",
@@ -253,19 +284,13 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 					stats.TablesProcessed++
 					stats.FilesWritten++
 					stats.RowsWritten += n
-					if !skipped {
-						logger.Info("pgbaseline: table complete",
-							"schema", t.Schema, "table", t.Table, "rows", n)
-					}
+					logger.Info("pgbaseline: table complete",
+						"schema", t.Schema, "table", t.Table, "rows", n)
 				}
 				mu.Unlock()
 			}
 		}()
 	}
-	for _, t := range tables {
-		work <- t
-	}
-	close(work)
 	wg.Wait()
 
 	// Every early return below leaves the _INCOMPLETE marker in place; only
@@ -276,7 +301,9 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	}
 	if len(errs) > 0 {
 		if len(errs) > 1 {
-			return stats, fmt.Errorf("pgbaseline: %d of %d tables failed (others logged); first: %w", len(errs), len(tables), errs[0])
+			// Every failure (table AND worker-connection) was logged at append
+			// time above; the wrapped error carries the first for errors.Is/As.
+			return stats, fmt.Errorf("pgbaseline: %d failures across %d tables (all logged); first: %w", len(errs), len(tables), errs[0])
 		}
 		return stats, errs[0]
 	}
@@ -309,18 +336,16 @@ func openWorkerConn(ctx context.Context, dsn, snapshotID string) (*pgx.Conn, err
 	return c, nil
 }
 
-// processTable COPYs one table into its Parquet file. Returns rows written and
-// whether the table was retry-skipped.
-func processTable(ctx context.Context, conn *pgx.Conn, t tableInfo, outputDir, tsDir, tsStr string, anchorLSN uint64, compression string, rowGroupSize int, retry bool, logger *slog.Logger) (int64, bool, error) {
+// processTable COPYs one table into its Parquet file. Returns rows written.
+//
+// There is deliberately NO local skip-if-exists here (review medium): every
+// run gets a fresh now()-named snapshot directory, so a prior run's file can
+// never legitimately be at this path — and blindly trusting any size>0 file
+// would CRC-certify a stale or partial Parquet (possibly carrying another
+// anchor's MetaKeyLSN) into a _SUCCESS baseline. The CLI's --retry applies
+// only to baseline.Upload's S3 object skip, which keys on real object state.
+func processTable(ctx context.Context, conn *pgx.Conn, t tableInfo, outputDir, tsDir, tsStr string, anchorLSN uint64, compression string, rowGroupSize int, logger *slog.Logger) (int64, error) {
 	outPath := filepath.Join(outputDir, tsDir, t.Schema, t.Table+".parquet")
-
-	if retry {
-		if fi, err := os.Stat(outPath); err == nil && fi.Size() > 0 {
-			logger.Info("pgbaseline: skipping existing file (--retry)",
-				"schema", t.Schema, "table", t.Table, "file", outPath)
-			return 0, true, nil
-		}
-	}
 
 	md := map[string]string{
 		"bintrail.snapshot_timestamp": tsStr,
@@ -343,7 +368,7 @@ func processTable(ctx context.Context, conn *pgx.Conn, t tableInfo, outputDir, t
 		Metadata:     md,
 	})
 	if err != nil {
-		return 0, false, fmt.Errorf("create writer: %w", err)
+		return 0, fmt.Errorf("create writer: %w", err)
 	}
 	var closed bool
 	defer func() {
@@ -374,17 +399,25 @@ func processTable(ctx context.Context, conn *pgx.Conn, t tableInfo, outputDir, t
 	}
 	copySQL := fmt.Sprintf("COPY (SELECT %s FROM %s) TO STDOUT (FORMAT text)",
 		strings.Join(colList, ", "), pgx.Identifier{t.Schema, t.Table}.Sanitize())
-	if _, err := conn.PgConn().CopyTo(ctx, sink, copySQL); err != nil {
-		return sink.rows, false, fmt.Errorf("copy %s.%s: %w", t.Schema, t.Table, err)
+	tag, err := conn.PgConn().CopyTo(ctx, sink, copySQL)
+	if err != nil {
+		return sink.rows, fmt.Errorf("copy %s.%s: %w", t.Schema, t.Table, err)
 	}
 	if err := sink.Flush(); err != nil {
-		return sink.rows, false, fmt.Errorf("copy %s.%s (final row): %w", t.Schema, t.Table, err)
+		return sink.rows, fmt.Errorf("copy %s.%s: %w", t.Schema, t.Table, err)
+	}
+	// Belt-and-suspenders integrity check (review blocker): the server's COPY
+	// command tag carries ITS row count. Any parser desync — a line silently
+	// mis-split, a skipped `\.`, a lost chunk — surfaces here as a count
+	// mismatch instead of a truncated baseline that looks complete.
+	if want := tag.RowsAffected(); want != sink.rows {
+		return sink.rows, fmt.Errorf("copy %s.%s: parsed %d rows but the server reported %d — COPY parser desync, refusing to publish a truncated baseline", t.Schema, t.Table, sink.rows, want)
 	}
 
 	closed = true
 	if err := w.Close(); err != nil {
 		os.Remove(outPath)
-		return sink.rows, false, fmt.Errorf("close writer: %w", err)
+		return sink.rows, fmt.Errorf("close writer: %w", err)
 	}
-	return sink.rows, false, nil
+	return sink.rows, nil
 }

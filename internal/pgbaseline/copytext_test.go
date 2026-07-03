@@ -100,9 +100,10 @@ func TestCopyTextSink_ChunkedWrites(t *testing.T) {
 	}
 }
 
-// TestCopyTextSink_FlushUnterminatedLine parses a final row lacking its
-// trailing newline (defensive; COPY TO always terminates rows).
-func TestCopyTextSink_FlushUnterminatedLine(t *testing.T) {
+// TestCopyTextSink_FlushUnterminatedLineIsError: COPY TO terminates every row
+// with a newline, so leftover bytes at Flush are a protocol anomaly and must
+// FAIL rather than be accepted as a possibly-truncated row.
+func TestCopyTextSink_FlushUnterminatedLineIsError(t *testing.T) {
 	var got [][]string
 	sink := newCopyTextSink(1, func(values []string, nulls []bool) error {
 		got = append(got, append([]string(nil), values...))
@@ -111,20 +112,80 @@ func TestCopyTextSink_FlushUnterminatedLine(t *testing.T) {
 	if _, err := sink.Write([]byte("a\nb")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if err := sink.Flush(); err != nil {
-		t.Fatalf("Flush: %v", err)
+	err := sink.Flush()
+	if err == nil {
+		t.Fatal("Flush accepted an unterminated trailing line, want a protocol-anomaly error")
 	}
-	want := [][]string{{"a"}, {"b"}}
+	if !strings.Contains(err.Error(), "unterminated") {
+		t.Errorf("Flush error %q does not name the unterminated line", err)
+	}
+	want := [][]string{{"a"}} // only the complete line was emitted
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rows = %q, want %q", got, want)
 	}
-	// Flush again is a no-op.
-	if err := sink.Flush(); err != nil {
-		t.Fatalf("second Flush: %v", err)
+	// A clean stream flushes without error.
+	clean := newCopyTextSink(1, func([]string, []bool) error { return nil })
+	if _, err := clean.Write([]byte("a\n")); err != nil {
+		t.Fatalf("Write: %v", err)
 	}
-	if len(got) != 2 {
-		t.Errorf("second Flush re-emitted rows: %d", len(got))
+	if err := clean.Flush(); err != nil {
+		t.Fatalf("clean Flush: %v", err)
 	}
+}
+
+// FuzzParseCopyTextLine round-trips arbitrary field content through the
+// PG-output escaping rules and the parser: escape(f1) + TAB + escape(f2) must
+// parse back to exactly (f1, f2). The escaper below mirrors what COPY TO
+// (FORMAT text) emits, so any divergence is a parser bug.
+func FuzzParseCopyTextLine(f *testing.F) {
+	f.Add("plain", "value")
+	f.Add("tab\there", "new\nline")
+	f.Add(`back\slash`, `\N`)
+	f.Add("", "café 日本語 🎉")
+	f.Add("\b\f\v\r", "\x00weird\x1f")
+	f.Fuzz(func(t *testing.T, f1, f2 string) {
+		line := append(escapeCopyText(f1), '\t')
+		line = append(line, escapeCopyText(f2)...)
+		values, nulls, err := parseCopyTextLine(line, 2)
+		if err != nil {
+			t.Fatalf("parseCopyTextLine(%q): %v", line, err)
+		}
+		if nulls[0] || nulls[1] {
+			t.Fatalf("escaped non-NULL fields parsed as NULL: %v", nulls)
+		}
+		if values[0] != f1 || values[1] != f2 {
+			t.Fatalf("round-trip mismatch: got (%q, %q), want (%q, %q)", values[0], values[1], f1, f2)
+		}
+	})
+}
+
+// escapeCopyText mirrors PostgreSQL's COPY TO (FORMAT text) output escaping —
+// the oracle for the fuzz round-trip. Per the COPY docs, exactly backslash,
+// tab, newline, carriage return, backspace, form feed, and vertical tab are
+// escaped on output; everything else is emitted verbatim.
+func escapeCopyText(s string) []byte {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			out = append(out, '\\', '\\')
+		case '\t':
+			out = append(out, '\\', 't')
+		case '\n':
+			out = append(out, '\\', 'n')
+		case '\r':
+			out = append(out, '\\', 'r')
+		case '\b':
+			out = append(out, '\\', 'b')
+		case '\f':
+			out = append(out, '\\', 'f')
+		case '\v':
+			out = append(out, '\\', 'v')
+		default:
+			out = append(out, s[i])
+		}
+	}
+	return out
 }
 
 // TestCopyTextSink_EndOfDataMarkerSkipped ignores a defensive `\.` line.
