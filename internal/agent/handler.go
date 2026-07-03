@@ -417,13 +417,7 @@ func (h *DefaultHandler) HandleForensicsAuditLog(ctx context.Context, req Forens
 	if err := h.requireSourceDB(); err != nil {
 		return forensics.AuditReadResult{}, err
 	}
-	// Per-request SourceHost wins; otherwise fall back to the agent's own
-	// source host so a BYOS agent on RDS/Aurora reaches the remote audit source
-	// without the caller having to supply the endpoint.
-	host := req.SourceHost
-	if host == "" {
-		host = h.SourceHost
-	}
+	host := resolveAuditSourceHost(req.SourceHost, h.SourceHost)
 	return forensics.ReadAuditLog(ctx, h.SourceDB, forensics.AuditReadOptions{
 		Since:              req.Since,
 		Until:              req.Until,
@@ -437,6 +431,18 @@ func (h *DefaultHandler) HandleForensicsAuditLog(ctx context.Context, req Forens
 		SourceHost:         host,
 		CloudWatchLogGroup: req.CloudWatchLogGroup,
 	})
+}
+
+// resolveAuditSourceHost picks the host used to reach the RDS/CloudWatch remote
+// audit sources: a per-request SourceHost wins, otherwise the agent's own source
+// host (from --source-dsn). Without a non-empty result the audit tier stays on
+// the local-file path — the wiring gap that made the RDS/Aurora reader dead code
+// before it was threaded through, so this fallback is pinned by a test.
+func resolveAuditSourceHost(reqHost, handlerHost string) string {
+	if reqHost != "" {
+		return reqHost
+	}
+	return handlerHost
 }
 
 // byosPKHash computes SHA-256 hex digest of pkValues, matching the

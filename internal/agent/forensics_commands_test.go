@@ -332,3 +332,30 @@ func TestDefaultHandler_forensicsCommandsRequireSourceDSN(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveAuditSourceHost pins the audit-source-host resolution the RDS/
+// CloudWatch remote reader depends on (#705): a per-request SourceHost wins,
+// otherwise the agent's own source host (from --source-dsn). An empty result
+// keeps the audit tier on the local-file path — the exact wiring gap that made
+// the RDS/Aurora reader dead code before it was threaded through, so this
+// guards against a refactor silently dropping the fallback.
+func TestResolveAuditSourceHost(t *testing.T) {
+	tests := []struct {
+		name        string
+		reqHost     string
+		handlerHost string
+		want        string
+	}{
+		{"request overrides handler", "req.us-east-1.rds.amazonaws.com", "agent.us-west-2.rds.amazonaws.com", "req.us-east-1.rds.amazonaws.com"},
+		{"falls back to agent source host", "", "agent.us-west-2.rds.amazonaws.com", "agent.us-west-2.rds.amazonaws.com"},
+		{"both empty stays local-only", "", "", ""},
+		{"request set, handler empty", "req.eu-west-1.rds.amazonaws.com", "", "req.eu-west-1.rds.amazonaws.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveAuditSourceHost(tt.reqHost, tt.handlerHost); got != tt.want {
+				t.Errorf("resolveAuditSourceHost(%q, %q) = %q, want %q", tt.reqHost, tt.handlerHost, got, tt.want)
+			}
+		})
+	}
+}
