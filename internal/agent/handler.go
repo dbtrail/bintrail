@@ -409,10 +409,13 @@ func (h *DefaultHandler) HandleForensicsUsers(ctx context.Context) (ForensicsUse
 	return ForensicsUsersResult{Users: users}, nil
 }
 
-// HandleForensicsAuditLog discovers and parses the audit log configured on
-// the source server. Local-filesystem files only — the audit log must be
-// reachable from the host the agent runs on (remote RDS/CloudWatch sources
-// are out of scope here).
+// HandleForensicsAuditLog discovers and parses the audit log configured on the
+// source server. In auto mode (req.Source==""), it reads local-filesystem files
+// and falls back to the RDS file API when the resolved host is an RDS/Aurora
+// endpoint; req.Source can force "local", "rds", or "cloudwatch". The host is
+// resolved via resolveAuditSourceHost (per-request req.SourceHost, else the
+// agent's own --source-dsn host), so a managed RDS/Aurora instance whose log is
+// not on local disk is reachable without the caller supplying the endpoint.
 func (h *DefaultHandler) HandleForensicsAuditLog(ctx context.Context, req ForensicsAuditLogRequest) (forensics.AuditReadResult, error) {
 	if err := h.requireSourceDB(); err != nil {
 		return forensics.AuditReadResult{}, err

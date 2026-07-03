@@ -303,6 +303,74 @@ func TestRDSLogReader_FullScanStartsFromBeginning(t *testing.T) {
 	}
 }
 
+// TestRDSLogReader_EmptyPageWithPendingContinues guards against silently
+// truncating the scan: DownloadDBLogFilePortion may return an empty chunk with
+// AdditionalDataPending=true mid-file (e.g. an actively-written log). The reader
+// must follow the marker to the next page, not treat the empty chunk as EOF.
+func TestRDSLogReader_EmptyPageWithPendingContinues(t *testing.T) {
+	empty := ""
+	realData := "20260413 12:00:00,host,admin,10.0.0.1,42,100,QUERY,mydb,'SELECT 1',0,,\n"
+	m1 := "m1"
+	mock := &mockRDSClient{
+		downloadPages: []*rds.DownloadDBLogFilePortionOutput{
+			{LogFileData: &empty, AdditionalDataPending: boolPtr(true), Marker: &m1},
+			{LogFileData: &realData, AdditionalDataPending: boolPtr(false)},
+		},
+	}
+	reader := newRDSLogReader(context.Background(), mock, "test-db", "audit/server_audit.log")
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(got) != realData {
+		t.Errorf("got %q, want %q — an empty page with AdditionalDataPending=true must not end the scan", string(got), realData)
+	}
+	if mock.downloadCalls != 2 {
+		t.Errorf("download calls = %d, want 2 (must fetch past the empty page)", mock.downloadCalls)
+	}
+}
+
+// TestRDSLogReader_PendingWithoutMarkerErrors: if AWS reports more data pending
+// but returns no marker to continue, the reader must error rather than re-issue
+// a marker-less request (which would silently re-fetch the tail forever).
+func TestRDSLogReader_PendingWithoutMarkerErrors(t *testing.T) {
+	data := "20260413 12:00:00,host,admin,10.0.0.1,42,100,QUERY,mydb,'SELECT 1',0,,\n"
+	mock := &mockRDSClient{
+		downloadPages: []*rds.DownloadDBLogFilePortionOutput{
+			{LogFileData: &data, AdditionalDataPending: boolPtr(true)}, // pending, but no Marker
+		},
+	}
+	reader := newRDSLogReader(context.Background(), mock, "test-db", "audit/server_audit.log")
+	_, err := io.ReadAll(reader)
+	if err == nil {
+		t.Fatal("expected an error when RDS reports data pending but returns no marker to continue")
+	}
+	if !strings.Contains(err.Error(), "no marker to continue") {
+		t.Errorf("error = %v, want a 'no marker to continue' message", err)
+	}
+}
+
+// TestRDSLogReader_PendingNonAdvancingMarkerErrors: an empty page that keeps
+// reporting pending with an unchanged marker must break rather than loop.
+func TestRDSLogReader_PendingNonAdvancingMarkerErrors(t *testing.T) {
+	empty := ""
+	stuck := "stuck"
+	mock := &mockRDSClient{
+		downloadPages: []*rds.DownloadDBLogFilePortionOutput{
+			{LogFileData: &empty, AdditionalDataPending: boolPtr(true), Marker: &stuck},
+			{LogFileData: &empty, AdditionalDataPending: boolPtr(true), Marker: &stuck},
+		},
+	}
+	reader := newRDSLogReader(context.Background(), mock, "test-db", "audit/server_audit.log")
+	_, err := io.ReadAll(reader)
+	if err == nil {
+		t.Fatal("expected an error when an empty page reports pending without advancing the marker")
+	}
+	if !strings.Contains(err.Error(), "without advancing the marker") {
+		t.Errorf("error = %v, want a non-advancing-marker message", err)
+	}
+}
+
 func TestRDSLogReader_EmptyFile(t *testing.T) {
 	empty := ""
 	mock := &mockRDSClient{

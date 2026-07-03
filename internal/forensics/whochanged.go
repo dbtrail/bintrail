@@ -105,10 +105,12 @@ type WhoChangedDeps struct {
 	// live performance_schema tiers. nil skips those tiers (index-only mode).
 	SourceDB *sql.DB
 	// SourceHost is the resolved host[:port] of the source server (from the
-	// source DSN). It lets the audit-log tier reach the RDS/CloudWatch remote
-	// sources when the server's audit log is not on the local filesystem
-	// (managed RDS/Aurora) — without it, AuditSourceAuto never leaves the
-	// local-file path and the RDS/Aurora audit tier is silently never tried.
+	// source DSN). It lets the audit-log tier reach the RDS/Aurora audit source
+	// (the RDS file API) when the server's audit log is not on the local
+	// filesystem — without it, AuditSourceAuto never leaves the local-file path
+	// and the RDS/Aurora audit tier is silently never tried. (The who-changed
+	// path always runs auto mode, which never reaches CloudWatch; that source is
+	// only selected by an explicit Source="cloudwatch" on the agent request.)
 	// Empty => local-file audit reads only.
 	SourceHost string
 	// IndexDB is the bintrail index database, used for the connection_cache
@@ -442,9 +444,10 @@ func attributeEvents(ctx context.Context, deps WhoChangedDeps, rows []query.Resu
 // the zone offset. Percona/Enterprise JSON timestamps carry Z and are exact.
 //
 // sourceHost is the source server's host[:port]; passing it through as
-// AuditReadOptions.SourceHost lets AuditSourceAuto fall back to the RDS file
-// API (or, when configured, CloudWatch Logs) for a managed RDS/Aurora source
-// whose audit log is not on the local filesystem. Empty => local-file only.
+// AuditReadOptions.SourceHost lets AuditSourceAuto fall back to the RDS file API
+// for a managed RDS/Aurora source whose audit log is not on the local
+// filesystem. Empty => local-file only. (Auto mode never reaches CloudWatch —
+// that source requires an explicit Source="cloudwatch".)
 func auditReadOptionsFor(rows []query.ResultRow, sourceHost string) AuditReadOptions {
 	minTS, maxTS := rows[0].EventTimestamp, rows[0].EventTimestamp
 	for _, r := range rows[1:] {
