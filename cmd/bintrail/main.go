@@ -48,6 +48,10 @@ func init() {
 	// Register the source-agnostic read commands that have moved to internal/cli
 	// (#529) so a future bintrail-pg can register the same set. Today: status.
 	cli.AddReadCommands(rootCmd)
+	// Forensics commands are MySQL-family-only (performance_schema, audit
+	// plugins), so they register here — like doctor — and NOT via
+	// AddReadCommands, which bintrail-pg shares (#706).
+	cli.AddForensicsCommands(rootCmd)
 }
 
 func main() {
