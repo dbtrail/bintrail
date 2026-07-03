@@ -168,6 +168,18 @@ type ForensicsAuditLogRequest struct {
 	Offset         int       `json:"offset,omitempty"`
 	IncludeRotated bool      `json:"include_rotated,omitempty"`
 	TailLines      int       `json:"tail_lines,omitempty"`
+	// Source selects where the audit log is read from ("" = auto: local file,
+	// then the RDS file API when SourceHost looks like an RDS/Aurora endpoint;
+	// "local"/"rds"/"cloudwatch" force a source). See forensics.AuditSource.
+	Source string `json:"source,omitempty"`
+	// SourceHost overrides the host used to detect/reach the RDS/CloudWatch
+	// remote audit sources. Empty => the agent's own source host (derived from
+	// its --source-dsn), so a BYOS agent on RDS/Aurora works without the caller
+	// knowing the endpoint.
+	SourceHost string `json:"source_host,omitempty"`
+	// CloudWatchLogGroup names the log group when Source="cloudwatch"
+	// (e.g. /aws/rds/instance/<id>/audit or /aws/rds/cluster/<id>/audit).
+	CloudWatchLogGroup string `json:"cloudwatch_log_group,omitempty"`
 }
 
 // ForensicsUsersResult holds the user accounts known to the source server,

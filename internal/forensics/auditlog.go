@@ -412,7 +412,9 @@ func discoverDataDir(ctx context.Context, db *sql.DB) (string, []string) {
 
 // collectAuditLogFiles returns the primary audit log file and, when
 // includeRotated is true, any rotated variants (*.1, *.2, audit.log-20240101,
-// ...) sorted newest-first by mtime, capped at maxRotatedFiles.
+// ...) sorted newest-first by mtime, capped at maxRotatedFiles. The second
+// return is a warnings slice, non-empty when the cap dropped the oldest
+// rotated files so the truncation is reported rather than silent.
 func collectAuditLogFiles(primary string, includeRotated bool) ([]string, []string) {
 	var files []string
 	if _, err := os.Stat(primary); err == nil {
@@ -428,7 +430,7 @@ func collectAuditLogFiles(primary string, includeRotated bool) ([]string, []stri
 	if err != nil {
 		return files, []string{fmt.Sprintf("could not list directory %s for rotated files: %v", dir, err)}
 	}
-	rotated := 0
+	var rotatedFiles []string
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -439,28 +441,32 @@ func collectAuditLogFiles(primary string, includeRotated bool) ([]string, []stri
 		}
 		// Match patterns like "audit.log.1" or "audit.log-20240101".
 		if strings.HasPrefix(name, base+".") || strings.HasPrefix(name, base+"-") {
-			files = append(files, filepath.Join(dir, name))
-			rotated++
-			if rotated >= maxRotatedFiles {
-				break
-			}
+			rotatedFiles = append(rotatedFiles, filepath.Join(dir, name))
 		}
 	}
 
-	// Sort: primary first, then rotated newest-first (higher suffix = older
-	// in most rotation schemes, but we sort by mtime descending for
-	// accuracy).
-	if len(files) > 1 {
-		sort.Slice(files[1:], func(i, j int) bool {
-			fi, _ := os.Stat(files[1+i])
-			fj, _ := os.Stat(files[1+j])
-			if fi == nil || fj == nil {
-				return files[1+i] > files[1+j]
-			}
-			return fi.ModTime().After(fj.ModTime())
-		})
+	// Sort rotated files newest-first by mtime BEFORE applying the cap — capping
+	// during the directory walk (which is in filename order) would keep the
+	// oldest maxRotatedFiles and silently drop the most-recent history, the
+	// opposite of what a forensic query wants.
+	sort.Slice(rotatedFiles, func(i, j int) bool {
+		fi, _ := os.Stat(rotatedFiles[i])
+		fj, _ := os.Stat(rotatedFiles[j])
+		if fi == nil || fj == nil {
+			return rotatedFiles[i] > rotatedFiles[j]
+		}
+		return fi.ModTime().After(fj.ModTime())
+	})
+
+	var warnings []string
+	if len(rotatedFiles) > maxRotatedFiles {
+		warnings = append(warnings, fmt.Sprintf(
+			"found %d rotated audit files under %s; scanning the %d most recent — older history was not read",
+			len(rotatedFiles), dir, maxRotatedFiles))
+		rotatedFiles = rotatedFiles[:maxRotatedFiles]
 	}
-	return files, nil
+	files = append(files, rotatedFiles...)
+	return files, warnings
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +485,10 @@ func detectAuditLogFormat(path string, variant AuditVariant) AuditFormat {
 
 	buf := make([]byte, 512)
 	n, err := f.Read(buf)
-	if err != nil && n == 0 {
+	if err != nil && err != io.EOF && n == 0 {
+		// A genuine read error (not an empty file, which Read reports as EOF
+		// with n==0). An empty file falls through to the extension/variant
+		// fallback so a valid-but-empty log is not rejected as unknown-format.
 		return AuditFormatUnknown
 	}
 	sample := strings.TrimSpace(string(buf[:n]))
@@ -499,7 +508,11 @@ func detectAuditLogFormat(path string, variant AuditVariant) AuditFormat {
 
 	// Content-based detection.
 	if len(sample) == 0 {
-		return AuditFormatUnknown
+		// A valid-but-empty audit file (freshly rotated, freshly enabled, or a
+		// quiet server) has no bytes to sniff. Fall back to the discovered
+		// plugin variant so it is treated as its real format and parses to zero
+		// events, rather than being rejected as "unknown format".
+		return formatFromVariant(variant)
 	}
 	switch sample[0] {
 	case '{', '[':

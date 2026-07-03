@@ -484,10 +484,13 @@ func TestAuditReadOptionsFor(t *testing.T) {
 		wcEvent(t, 2, "09:00:00", 42), // earliest
 		wcEvent(t, 3, "11:30:00", 42), // latest
 	}
-	opts := auditReadOptionsFor(rows)
+	opts := auditReadOptionsFor(rows, "mydb.abc123.us-east-1.rds.amazonaws.com:3306")
 
 	if opts.TailLines >= 0 {
 		t.Errorf("TailLines = %d, want < 0 (full scan): tail auto-mode silently drops older brackets", opts.TailLines)
+	}
+	if opts.SourceHost != "mydb.abc123.us-east-1.rds.amazonaws.com:3306" {
+		t.Errorf("SourceHost = %q, want the source host threaded through so AuditSourceAuto can reach the RDS fallback", opts.SourceHost)
 	}
 	if !opts.IncludeRotated {
 		t.Error("IncludeRotated = false; a 24h window routinely spans a rotation")

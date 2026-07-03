@@ -230,6 +230,11 @@ func TestDetectAuditLogFormat_ContentBased(t *testing.T) {
 		{"aurora_epoch_with_mariadb_hint", `1520091734997155,server,root`, AuditVariantMariaDB, AuditFormatMariaDB},
 		{"percona_csv", `"2024-06-15","root","localhost"`, "", AuditFormatCSV},
 		{"undetectable", `garbage content`, "", AuditFormatUnknown},
+		// A valid-but-empty file falls back to the discovered variant so it is
+		// parsed (to zero events), not rejected as "unknown format" (#5).
+		{"empty_mariadb_variant", "", AuditVariantMariaDB, AuditFormatMariaDB},
+		{"empty_whitespace_mariadb", "   \n\t\n", AuditVariantMariaDB, AuditFormatMariaDB},
+		{"empty_no_variant", "", "", AuditFormatUnknown},
 	}
 
 	for _, tt := range tests {
@@ -338,17 +343,50 @@ func TestCollectAuditLogFiles(t *testing.T) {
 		}
 	})
 
-	t.Run("rotated collection capped at maxRotatedFiles", func(t *testing.T) {
+	t.Run("cap keeps the NEWEST rotated files and warns on the drop", func(t *testing.T) {
 		dir := t.TempDir()
 		primary := filepath.Join(dir, "audit.log")
 		mustWrite(t, primary, "p")
-		for i := range maxRotatedFiles + 5 {
-			mustWrite(t, filepath.Join(dir, fmt.Sprintf("audit.log.%d", i)), "r")
+		// Create more rotated files than the cap, with mtimes ascending in
+		// index order (file .0 oldest, .(N+4) newest). Filenames are in a fixed
+		// zero-padded order so os.ReadDir returns them oldest-first — the order
+		// the pre-fix code capped in, which would keep the oldest.
+		total := maxRotatedFiles + 5
+		now := time.Now()
+		for i := range total {
+			p := filepath.Join(dir, fmt.Sprintf("audit.log.%03d", i))
+			mustWrite(t, p, "r")
+			mt := now.Add(time.Duration(i-total) * time.Minute)
+			if err := os.Chtimes(p, mt, mt); err != nil {
+				t.Fatal(err)
+			}
 		}
 
-		files, _ := collectAuditLogFiles(primary, true)
+		files, warns := collectAuditLogFiles(primary, true)
 		if len(files) != 1+maxRotatedFiles {
-			t.Errorf("len(files) = %d, want %d (primary + cap)", len(files), 1+maxRotatedFiles)
+			t.Fatalf("len(files) = %d, want %d (primary + cap)", len(files), 1+maxRotatedFiles)
+		}
+		if !warningsContain(warns, "older history was not read") {
+			t.Errorf("expected a truncation warning, got %v", warns)
+		}
+		// The newest rotated file (.(total-1)) must be kept; the oldest (.000)
+		// must be dropped — the pre-fix behaviour was the reverse.
+		newest := filepath.Join(dir, fmt.Sprintf("audit.log.%03d", total-1))
+		oldest := filepath.Join(dir, "audit.log.000")
+		var haveNewest, haveOldest bool
+		for _, f := range files {
+			if f == newest {
+				haveNewest = true
+			}
+			if f == oldest {
+				haveOldest = true
+			}
+		}
+		if !haveNewest {
+			t.Error("cap dropped the NEWEST rotated file; must keep the most recent history")
+		}
+		if haveOldest {
+			t.Error("cap kept the OLDEST rotated file; the newest should win")
 		}
 	})
 }
@@ -868,6 +906,36 @@ func TestReadAuditLog_UnknownFormat(t *testing.T) {
 	_, err = ReadAuditLog(context.Background(), db, AuditReadOptions{})
 	if !errors.Is(err, ErrAuditUnknownFormat) {
 		t.Fatalf("err = %v, want ErrAuditUnknownFormat", err)
+	}
+}
+
+// TestReadAuditLog_EmptyFileNoError: a validly-configured but empty audit log
+// (post-rotation / freshly enabled / quiet server) resolves to its discovered
+// plugin variant's format and parses to zero events, rather than hard-failing
+// with ErrAuditUnknownFormat as it did before detectAuditLogFormat fell back to
+// the variant on empty content (#5).
+func TestReadAuditLog_EmptyFileNoError(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	mustWrite(t, logPath, "") // zero bytes
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	// An empty plugins row makes detectVariantFromPlugin return its
+	// MySQLEnterprise default (→ JSON), so detection resolves a concrete format
+	// and the empty file parses to zero events via the #5 variant fallback.
+	mock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(variableRows("audit_log_file", logPath))
+	mock.ExpectQuery(pluginsSQL).WillReturnRows(pluginRows())
+
+	res, err := ReadAuditLog(context.Background(), db, AuditReadOptions{})
+	if err != nil {
+		t.Fatalf("err = %v, want nil — an empty (validly-configured) audit log must not be a hard error", err)
+	}
+	if len(res.Events) != 0 {
+		t.Errorf("events = %d, want 0", len(res.Events))
 	}
 }
 

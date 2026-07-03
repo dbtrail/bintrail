@@ -338,6 +338,103 @@ directly.
 
 ---
 
+## Sequences after recovery
+
+Restoring **row data** does not restore the **sequence cursor** behind a
+`SERIAL` or `IDENTITY` column. This is the classic PostgreSQL dump/restore
+gotcha, and it applies to bintrail-recovered data too — read this section if
+your tables use auto-generated ids.
+
+### Why this happens
+
+PostgreSQL's logical decoding does not replicate sequence state. In the words
+of the PostgreSQL docs: *"Sequence data is not replicated. The data in serial
+or identity columns backed by sequences will of course be replicated as part
+of the table, but the sequence itself would still show the start value on the
+subscriber."*
+
+For bintrail that means:
+
+- The **id values in your rows are fully captured** — the materialized id
+  rides in the row image, and `recover` puts it back verbatim. No data is lost.
+- The sequence's own `last_value` is a **separate catalog object** bintrail
+  never sees. Nothing in the index knows how far the sequence had advanced.
+
+So after loading recovered rows into a target, the sequence can lag behind the
+ids that are now in the table — and the next `INSERT` that draws from it fails
+with a duplicate-key error on the primary key.
+
+This is the same boundary MySQL has with `AUTO_INCREMENT`, with one twist:
+in PostgreSQL, an INSERT that supplies an **explicit id** (which is exactly
+what `recover`'s reversal SQL does) never advances the sequence.
+
+### When you need to fix the sequence
+
+- **Recovering into a fresh or restored target** (a different database, or the
+  same database rebuilt from a backup): **always**. The target's sequence
+  reflects the backup — or the start value — not the history you just replayed.
+- **After the sequence was reset on the source** (`TRUNCATE … RESTART
+  IDENTITY`, a manual `setval`, `ALTER SEQUENCE … RESTART`): **yes** — the
+  recovered ids are ahead of the rewound cursor.
+- **Applying `recover` output on the same live database where the rows were
+  deleted**: usually **not needed**. The sequence advanced when the rows were
+  first inserted, and a sequence never goes backward on its own — the cursor is
+  still past the re-inserted ids. Running the fix anyway is cheap and harmless,
+  so when in doubt, run it.
+
+### The fix: `setval` to MAX(id)
+
+After the recovered rows are loaded, point each sequence just past the highest
+id actually in the table. `pg_get_serial_sequence` finds the sequence name for
+you (it works for both `SERIAL` and `IDENTITY` columns):
+
+```sql
+SELECT setval(
+  pg_get_serial_sequence('shop.orders', 'id'),
+  COALESCE((SELECT MAX(id) FROM shop.orders), 0) + 1,
+  false
+);
+```
+
+The `+ 1, false` form makes the next `nextval` return exactly `MAX(id) + 1`,
+and handles an empty table (next value is 1). Run one `setval` per
+sequence-backed column — a table can have more than one.
+
+Avoid running it while writers are actively inserting into the table (the
+`MAX` and the `setval` are not atomic together); recovery windows are normally
+quiesced anyway.
+
+To fix **every owned sequence in a schema** at once, generate the statements
+from the catalog (covers `SERIAL` and `IDENTITY` columns; run the output it
+prints):
+
+```sql
+SELECT format(
+  'SELECT setval(%L, COALESCE((SELECT MAX(%I) FROM %I.%I), 0) + 1, false);',
+  quote_ident(sn.nspname) || '.' || quote_ident(seq.relname),
+  att.attname, tn.nspname, tbl.relname
+)
+FROM pg_class seq
+JOIN pg_namespace sn ON sn.oid = seq.relnamespace
+JOIN pg_depend dep ON dep.objid = seq.oid AND dep.deptype IN ('a', 'i')
+JOIN pg_class tbl ON tbl.oid = dep.refobjid
+JOIN pg_namespace tn ON tn.oid = tbl.relnamespace
+JOIN pg_attribute att ON att.attrelid = tbl.oid AND att.attnum = dep.refobjsubid
+WHERE seq.relkind = 'S'
+  AND tn.nspname = 'shop';   -- your schema
+```
+
+### Out of scope: standalone sequences
+
+A **standalone sequence** — one whose `nextval` values are used directly
+(counters, ticket numbers) and never land in a captured table — is
+**irrecoverable from bintrail**. Its values never entered the row history, so
+there is nothing to derive a cursor from. If such sequences matter to you,
+snapshot them by other means (e.g. include them in your regular dumps —
+`pg_dump` records sequence state).
+
+---
+
 ## Type support
 
 bintrail-pg captures every value as its PostgreSQL text representation (the
@@ -425,8 +522,9 @@ your own round-trip.
   an event but carries no rows, so there is nothing for `recover` to put back.
 - **Sequence cursors are not captured.** The materialized id values in your rows
   *are* captured; the sequence's own `last_value` (a separate catalog object) is
-  not — logical decoding does not replicate sequences. After a restore, fix the
-  sequence with `SELECT setval('seq', (SELECT max(id) FROM t));`.
+  not — logical decoding does not replicate sequences. After a restore, re-point
+  each `SERIAL`/`IDENTITY` sequence past `MAX(id)` — recipe and when it matters
+  in [Sequences after recovery](#sequences-after-recovery).
 - **`GENERATED ... AS IDENTITY` / generated columns** can need care on recovery
   (`GENERATED ALWAYS AS IDENTITY` rejects an explicit insert; `STORED` generated
   columns are absent from the stream before PostgreSQL 18). Treat as best-effort.
