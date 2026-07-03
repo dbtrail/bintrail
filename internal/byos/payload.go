@@ -26,6 +26,7 @@ var payloadColumns = []baseline.Column{
 	{Name: "row_after", MySQLType: "json", ParquetType: baseline.MysqlToParquetNode("json")},
 	{Name: "changed_columns", MySQLType: "json", ParquetType: baseline.MysqlToParquetNode("json")},
 	{Name: "schema_version", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+	{Name: "query_text", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
 }
 
 // PayloadWriter writes payload records to a storage backend as Parquet files,
@@ -174,6 +175,7 @@ func marshalPayloadRow(r *PayloadRecord) ([]string, []bool, error) {
 		string(rowAfter),
 		string(changed),
 		strconv.FormatUint(uint64(r.SchemaVersion), 10),
+		r.QueryText,
 	}
 	nulls := []bool{
 		false, // pk_hash
@@ -185,7 +187,8 @@ func marshalPayloadRow(r *PayloadRecord) ([]string, []bool, error) {
 		r.RowBefore == nil,
 		r.RowAfter == nil,
 		r.ChangedColumns == nil,
-		false, // schema_version
+		false,             // schema_version
+		r.QueryText == "", // query_text: empty = not captured = NULL
 	}
 	return values, nulls, nil
 }

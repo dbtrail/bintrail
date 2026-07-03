@@ -136,9 +136,13 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 	report.add(checkBinlogFormat(sourceDB))
 	report.add(checkBinlogRowImage(sourceDB))
 	report.add(checkBinlogRetention(sourceDB))
+	report.add(checkStatementCapture(sourceDB))
+	report.add(checkRowMetadata(sourceDB))
 	report.add(checkReplicationGrants(ctx, sourceDB))
 	report.add(checkFKCascades(sourceDB, schemas))
 	report.add(checkSchemaVisibility(ctx, sourceDB, schemas))
+	report.add(checkPerformanceSchema(ctx, sourceDB))
+	report.add(checkAuditPlugin(ctx, sourceDB))
 
 	// ── Index MySQL checks (optional) ─────────────────────────────────────────
 	if indexDSN != "" {
@@ -320,6 +324,130 @@ func checkBinlogRetention(db *sql.DB) CheckResult {
 		Name:   "Binlog retention >= 2 days",
 		Status: StatusPass,
 		Detail: fmt.Sprintf("%dh", seconds/3600),
+	}
+}
+
+// checkStatementCapture reports whether the source logs the original SQL
+// statement alongside each row event (#699): MySQL's
+// binlog_rows_query_log_events or MariaDB's binlog_annotate_row_events. The
+// capture is OPTIONAL — it feeds the query_text/query_hash forensics columns —
+// so this check never FAILs: ON → PASS, OFF → WARN with an enable suggestion
+// (validate, never set), variable absent on both probes → SKIP. Both probes use
+// SELECT @@var, which errors (MySQL 1193) rather than returning rows for a
+// variable the flavor doesn't have — the checkBinlogRetention fallback pattern.
+func checkStatementCapture(db *sql.DB) CheckResult {
+	const name = "Statement capture (query_text)"
+	isOn := func(val string) bool { return val == "1" || strings.EqualFold(val, "ON") }
+	// Only MySQL error 1193 (unknown system variable) means the variable is
+	// genuinely absent; any other failure is a read problem and must surface
+	// the real error rather than a fabricated flavor diagnosis.
+	isUnknownVar := func(err error) bool {
+		var myErr *mysql.MySQLError
+		return errors.As(err, &myErr) && myErr.Number == 1193
+	}
+
+	var val string
+	err := db.QueryRow("SELECT @@binlog_rows_query_log_events").Scan(&val)
+	if err == nil {
+		if isOn(val) {
+			return CheckResult{Name: name, Status: StatusPass, Detail: "binlog_rows_query_log_events=ON"}
+		}
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "binlog_rows_query_log_events=OFF — events index without the originating SQL statement (query_text stays NULL)",
+			Remediation: "Optional: log the original statement with each row event so `bintrail query` can show it (dynamic, no restart; costs binlog bytes per statement):\n\n" +
+				"  SET PERSIST binlog_rows_query_log_events = ON;",
+		}
+	}
+	if !isUnknownVar(err) {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not read binlog_rows_query_log_events: " + err.Error(),
+		}
+	}
+
+	// MariaDB names the same capability binlog_annotate_row_events
+	// (default ON since 10.2.4). Note stream capture additionally requires
+	// `--source-flavor mariadb` so the syncer requests ANNOTATE events.
+	err = db.QueryRow("SELECT @@binlog_annotate_row_events").Scan(&val)
+	if err == nil {
+		if isOn(val) {
+			return CheckResult{
+				Name:   name,
+				Status: StatusPass,
+				Detail: "binlog_annotate_row_events=ON (MariaDB; stream capture also needs --source-flavor mariadb)",
+			}
+		}
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "binlog_annotate_row_events=OFF — events index without the originating SQL statement (query_text stays NULL)",
+			Remediation: "Optional: log the original statement with each row event so `bintrail query` can show it (stream capture also needs `--source-flavor mariadb`):\n\n" +
+				"  SET GLOBAL binlog_annotate_row_events = ON;\n\n" +
+				"Persist it in my.cnf ([mysqld] binlog_annotate_row_events=ON) to survive restarts.",
+		}
+	}
+	if !isUnknownVar(err) {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not read binlog_annotate_row_events: " + err.Error(),
+		}
+	}
+
+	return CheckResult{
+		Name:   name,
+		Status: StatusSkip,
+		Detail: "neither binlog_rows_query_log_events nor binlog_annotate_row_events is available on this server",
+	}
+}
+
+// checkRowMetadata reports whether the source embeds column names in every
+// binlog TABLE_MAP event (#700): binlog_row_metadata=FULL (MySQL 8.0+,
+// MariaDB 10.5+) lets bintrail cross-check the schema snapshot against
+// per-event ground truth and fail loud on a stale snapshot — including the
+// same-column-count drift (a rename, or a DROP+ADD in one ALTER) that the
+// count guard cannot see and that would otherwise index values under the
+// wrong column names. The setting is OPTIONAL, so this check never FAILs:
+// FULL → PASS, MINIMAL → WARN with an enable suggestion (validate, never
+// set), variable absent → SKIP.
+func checkRowMetadata(db *sql.DB) CheckResult {
+	const name = "Schema-drift detection (binlog_row_metadata)"
+	var val string
+	if err := db.QueryRow("SELECT @@binlog_row_metadata").Scan(&val); err != nil {
+		// Only MySQL error 1193 (unknown system variable) means the server
+		// genuinely lacks the variable (MySQL 5.7, MariaDB <10.5). Any other
+		// failure is a read problem — surface the real error instead of a
+		// fabricated version diagnosis (unlike checkBinlogRetention, which
+		// treats any error on the modern variable as absent and falls back).
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1193 {
+			return CheckResult{
+				Name:   name,
+				Status: StatusSkip,
+				Detail: "binlog_row_metadata is not available on this server (needs MySQL 8.0+ or MariaDB 10.5+)",
+			}
+		}
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not read binlog_row_metadata: " + err.Error(),
+		}
+	}
+	if strings.EqualFold(val, "FULL") {
+		return CheckResult{Name: name, Status: StatusPass, Detail: "binlog_row_metadata=FULL"}
+	}
+	return CheckResult{
+		Name:   name,
+		Status: StatusWarn,
+		Detail: "binlog_row_metadata=" + val + " — a stale schema snapshot cannot be detected at capture time (a same-column-count change like a rename would index values under the wrong column names)",
+		Remediation: "Optional: embed column names in row-event metadata so bintrail can verify the snapshot against every event (dynamic, no restart; adds a handful of bytes per column to each TABLE_MAP event):\n\n" +
+			"  -- MySQL 8.0+:\n" +
+			"  SET PERSIST binlog_row_metadata = 'FULL';\n\n" +
+			"  -- MariaDB 10.5+ (no SET PERSIST; persist it in my.cnf under [mysqld]):\n" +
+			"  SET GLOBAL binlog_row_metadata = 'FULL';",
 	}
 }
 
@@ -543,6 +671,175 @@ func countVisibleSchemas(ctx context.Context, db *sql.DB, schemas []string) (int
 	var n int
 	err := db.QueryRowContext(ctx, query, args...).Scan(&n)
 	return n, err
+}
+
+// forensicsConsumers are the performance_schema setup_consumers rows the
+// forensic activity queries (user_activity / ddl_history) read from. Listed in
+// the order they should appear in the check detail.
+var forensicsConsumers = []string{"events_statements_history", "events_statements_history_long"}
+
+// checkPerformanceSchema reports whether performance_schema — and the two
+// statement-history consumers forensics reads — are available on the source.
+// Forensics is optional, so a missing or degraded source is WARN, never FAIL:
+// streaming must not be blocked because attribution data is unavailable.
+// Validate, never set: the check reports state with copy-pasteable
+// remediation; it never writes to the source server.
+func checkPerformanceSchema(ctx context.Context, db *sql.DB) CheckResult {
+	const name = "performance_schema (forensics)"
+
+	var varName, varValue string
+	err := db.QueryRowContext(ctx,
+		"SHOW GLOBAL VARIABLES LIKE 'performance_schema'").Scan(&varName, &varValue)
+	if err != nil {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not read the performance_schema variable: " + err.Error(),
+		}
+	}
+	if !strings.EqualFold(varValue, "ON") {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: fmt.Sprintf("performance_schema=%s — forensic attribution (who-changed, user activity) unavailable", varValue),
+			Remediation: "Enable performance_schema in my.cnf and restart MySQL (it cannot be enabled at runtime):\n\n" +
+				"  [mysqld]\n" +
+				"  performance_schema = ON\n" +
+				"  performance-schema-consumer-events-statements-history = ON\n" +
+				"  performance-schema-consumer-events-statements-history-long = ON\n\n" +
+				"It is enabled by default on MySQL 8.0+. On RDS/Aurora, set the (static) performance_schema\n" +
+				"parameter in the parameter group and reboot; enabling Performance Insights also turns it on.",
+		}
+	}
+
+	// performance_schema is ON — check the statement-history consumers.
+	rows, err := db.QueryContext(ctx,
+		"SELECT NAME, ENABLED FROM performance_schema.setup_consumers "+
+			"WHERE NAME IN ('events_statements_history', 'events_statements_history_long')")
+	if err != nil {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "ON, but could not read setup_consumers: " + err.Error(),
+		}
+	}
+	defer rows.Close()
+
+	enabled := map[string]bool{}
+	for rows.Next() {
+		var consumer, state string
+		if err := rows.Scan(&consumer, &state); err != nil {
+			return CheckResult{
+				Name:   name,
+				Status: StatusWarn,
+				Detail: "ON, but could not scan setup_consumers: " + err.Error(),
+			}
+		}
+		enabled[consumer] = strings.EqualFold(state, "YES")
+	}
+	if err := rows.Err(); err != nil {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "ON, but could not read setup_consumers: " + err.Error(),
+		}
+	}
+
+	var off []string
+	for _, c := range forensicsConsumers {
+		if !enabled[c] {
+			off = append(off, c)
+		}
+	}
+	if len(off) == 0 {
+		return CheckResult{
+			Name:   name,
+			Status: StatusPass,
+			Detail: "ON (statement history consumers enabled)",
+		}
+	}
+	var updates strings.Builder
+	for _, c := range off {
+		fmt.Fprintf(&updates, "  UPDATE performance_schema.setup_consumers SET ENABLED = 'YES' WHERE NAME = '%s';\n", c)
+	}
+	return CheckResult{
+		Name:   name,
+		Status: StatusWarn,
+		Detail: fmt.Sprintf("ON, but consumer(s) disabled: %s — forensic statement history will be missing", strings.Join(off, ", ")),
+		Remediation: "Enable the statement-history consumer(s) at runtime:\n\n" +
+			updates.String() +
+			"\nAnd persist across restarts in my.cnf:\n\n" +
+			"  [mysqld]\n" +
+			"  performance-schema-consumer-events-statements-history = ON\n" +
+			"  performance-schema-consumer-events-statements-history-long = ON\n\n" +
+			"On RDS/Aurora there is NO parameter-group option for setup_consumers, so the runtime\n" +
+			"UPDATE does not survive a reboot — re-assert it after every reboot.",
+	}
+}
+
+// checkAuditPlugin reports whether an audit-log plugin (MariaDB server_audit /
+// its AWS RDS fork, Percona Audit Log, or MySQL Enterprise Audit) is active on
+// the source. An audit log is the strongest forensic attribution source
+// (persisted to disk, survives disconnects), but entirely optional — so absent
+// or unreadable is WARN, never FAIL. Validate, never set.
+func checkAuditPlugin(ctx context.Context, db *sql.DB) CheckResult {
+	const name = "Audit log plugin (forensics)"
+
+	rows, err := db.QueryContext(ctx,
+		"SELECT PLUGIN_NAME FROM information_schema.PLUGINS "+
+			"WHERE UPPER(PLUGIN_NAME) LIKE '%AUDIT%' AND PLUGIN_STATUS = 'ACTIVE'")
+	if err != nil {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not query information_schema.PLUGINS: " + err.Error(),
+		}
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var plugin string
+		if err := rows.Scan(&plugin); err != nil {
+			return CheckResult{
+				Name:   name,
+				Status: StatusWarn,
+				Detail: "could not scan plugin row: " + err.Error(),
+			}
+		}
+		// Skip the RDS internal audit plugin — it's not queryable via SQL.
+		if strings.Contains(strings.ToUpper(plugin), "RDS_SECURITY") {
+			continue
+		}
+		return CheckResult{
+			Name:   name,
+			Status: StatusPass,
+			Detail: plugin + " active",
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not read plugin rows: " + err.Error(),
+		}
+	}
+
+	return CheckResult{
+		Name:   name,
+		Status: StatusWarn,
+		Detail: "no audit log plugin active — forensic attribution falls back to performance_schema's in-memory ring buffers",
+		Remediation: "An audit plugin gives durable who-ran-what history. Pick the one for your server variant:\n\n" +
+			"  -- MariaDB (built in):\n" +
+			"  INSTALL SONAME 'server_audit';\n" +
+			"  SET GLOBAL server_audit_logging = ON;\n\n" +
+			"  -- Percona Server (free):\n" +
+			"  INSTALL PLUGIN audit_log SONAME 'audit_log.so';\n" +
+			"  SET GLOBAL audit_log_policy = 'ALL';\n\n" +
+			"  -- MySQL Community: no free audit plugin; MySQL Enterprise Audit requires an Enterprise license.\n\n" +
+			"On RDS for MySQL, add the MARIADB_AUDIT_PLUGIN option to the instance's option group;\n" +
+			"on Aurora MySQL, set server_audit_logging=1 in the cluster parameter group.\n" +
+			"Run `bintrail doctor` again afterwards; the forensics setup guide has the full walkthrough.",
+	}
 }
 
 func checkIndexConnection(ctx context.Context, dsn, dbName string) CheckResult {

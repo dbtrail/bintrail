@@ -145,7 +145,11 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 		MaxDepth: maxDepth,
 	})
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		// writeFetchError, not a bare 500: a registry index that predates a
+		// post-initial-schema binlog_events column (query_text/query_hash,
+		// #699) fails the parent fetch with MySQL 1054, and the operator
+		// should get the same actionable 422 the sibling tabs show.
+		writeFetchError(w, err)
 		return
 	}
 

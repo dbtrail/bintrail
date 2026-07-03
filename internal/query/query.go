@@ -155,6 +155,11 @@ type Options struct {
 
 	DenyTables    []SchemaTable       // tables excluded by RBAC profile
 	RedactColumns []SchemaTableColumn // column values nulled out by RBAC profile
+	// ProfileActive is set by callers whenever a profile NAME was supplied,
+	// even if it resolved to zero deny/redact rules (a nonexistent or empty
+	// profile). It forces the redaction pass so QueryText/QueryHash are
+	// withheld under EVERY named profile — see applyRedaction (#699).
+	ProfileActive bool
 }
 
 // ─── ResultRow ────────────────────────────────────────────────────────────────
@@ -176,6 +181,8 @@ type ResultRow struct {
 	RowBefore      map[string]any // nil for INSERT
 	RowAfter       map[string]any // nil for DELETE
 	SchemaVersion  uint32         // snapshot_id at index time; 0 for pre-migration data
+	QueryText      *string        // original SQL statement (#699); nil unless the source logs ROWS_QUERY/ANNOTATE events
+	QueryHash      *string        // STATEMENT_DIGEST of QueryText computed at index time (#699); nil when text absent or digest unavailable
 }
 
 // OrderDirection normalises an Options.Order value to a SQL direction keyword
@@ -220,7 +227,11 @@ func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
 	// "Fetch returns ordered rows" contract that recovery.GenerateSQL and the
 	// formatters rely on.
 	sortResults(results, OrderDirection(opts.Order))
-	if len(opts.RedactColumns) > 0 {
+	// Redaction also fires on DenyTables-only profiles — and on a named
+	// profile with ZERO rules (ProfileActive): query_text is per-STATEMENT,
+	// so rows of an ALLOWED table can carry a statement whose literals
+	// belong to a denied sibling table — see applyRedaction (#699).
+	if opts.ProfileActive || len(opts.RedactColumns) > 0 || len(opts.DenyTables) > 0 {
 		applyRedaction(results, opts.RedactColumns)
 	}
 	return results, nil
@@ -408,7 +419,7 @@ func buildQuery(opts Options) (string, []any) {
 	// match 1:1 and lets MySQL prune partitions on the eq_ref lookup.
 	cols := `be.event_id, be.binlog_file, be.start_pos, be.end_pos, be.event_timestamp,
 	         be.gtid, be.connection_id, be.schema_name, be.table_name, be.event_type, be.pk_values,
-	         be.changed_columns, be.row_before, be.row_after, be.schema_version`
+	         be.changed_columns, be.row_before, be.row_after, be.schema_version, be.query_text, be.query_hash`
 
 	dir := OrderDirection(opts.Order)
 	whereSQL := ""
@@ -444,6 +455,17 @@ func buildQuery(opts Options) (string, []any) {
 }
 
 // applyRedaction nulls out denied column values in RowBefore and RowAfter maps.
+//
+// It also blanks QueryText/QueryHash on EVERY row, not just rows of flagged
+// tables (#699): the captured statement is per-STATEMENT, not per-table — a
+// multi-table UPDATE (or a trigger cascade) stamps the SAME text, literal
+// values included, onto row events of every table it touched, so per-table
+// blanking would still leak a redacted column's value through an unflagged
+// sibling table's rows. The hash is blanked with the text: a stable digest
+// leaks statement shape and permits dictionary confirmation of embedded
+// values. This mirrors the codebase's "a surface that cannot honor redaction
+// is disabled entirely under a profile" pattern (archives, cascade,
+// reconstruct).
 func applyRedaction(rows []ResultRow, redact []SchemaTableColumn) {
 	type colKey struct{ schema, table, column string }
 	set := make(map[colKey]struct{}, len(redact))
@@ -452,6 +474,8 @@ func applyRedaction(rows []ResultRow, redact []SchemaTableColumn) {
 	}
 	for i := range rows {
 		r := &rows[i]
+		r.QueryText = nil
+		r.QueryHash = nil
 		for col := range r.RowBefore {
 			if _, ok := set[colKey{r.SchemaName, r.TableName, col}]; ok {
 				r.RowBefore[col] = nil
@@ -492,13 +516,15 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 			eventType      sql.NullInt32
 			pkValues       sql.NullString
 			schemaVersion  sql.NullInt32
+			queryText      sql.NullString
+			queryHash      sql.NullString
 		)
 		var changedCols, rowBefore, rowAfter []byte
 
 		if err := rows.Scan(
 			&r.EventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
 			&gtid, &connID, &schemaName, &tableName, &eventType, &pkValues,
-			&changedCols, &rowBefore, &rowAfter, &schemaVersion,
+			&changedCols, &rowBefore, &rowAfter, &schemaVersion, &queryText, &queryHash,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan result row: %w", err)
 		}
@@ -535,6 +561,12 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 		}
 		if schemaVersion.Valid {
 			r.SchemaVersion = uint32(schemaVersion.Int32)
+		}
+		if queryText.Valid {
+			r.QueryText = &queryText.String
+		}
+		if queryHash.Valid {
+			r.QueryHash = &queryHash.String
 		}
 		if changedCols != nil {
 			_ = json.Unmarshal(changedCols, &r.ChangedColumns)
@@ -634,6 +666,8 @@ type jsonRow struct {
 	ChangedColumns []string       `json:"changed_columns"`
 	RowBefore      map[string]any `json:"row_before"`
 	RowAfter       map[string]any `json:"row_after"`
+	QueryText      *string        `json:"query_text"`
+	QueryHash      *string        `json:"query_hash"`
 }
 
 func writeJSON(rows []ResultRow, w io.Writer) (int, error) {
@@ -654,6 +688,8 @@ func writeJSON(rows []ResultRow, w io.Writer) (int, error) {
 			ChangedColumns: r.ChangedColumns,
 			RowBefore:      r.RowBefore,
 			RowAfter:       r.RowAfter,
+			QueryText:      r.QueryText,
+			QueryHash:      r.QueryHash,
 		}
 	}
 	enc := json.NewEncoder(w)
@@ -668,7 +704,7 @@ func writeJSON(rows []ResultRow, w io.Writer) (int, error) {
 var csvHeaders = []string{
 	"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 	"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
-	"changed_columns", "row_before", "row_after",
+	"changed_columns", "row_before", "row_after", "query_text", "query_hash",
 }
 
 func writeCSV(rows []ResultRow, w io.Writer) (int, error) {
@@ -701,6 +737,14 @@ func writeCSV(rows []ResultRow, w io.Writer) (int, error) {
 			b, _ := json.Marshal(r.RowAfter)
 			after = string(b)
 		}
+		queryText := ""
+		if r.QueryText != nil {
+			queryText = *r.QueryText
+		}
+		queryHash := ""
+		if r.QueryHash != nil {
+			queryHash = *r.QueryHash
+		}
 		record := []string{
 			fmt.Sprintf("%d", r.EventID),
 			r.BinlogFile,
@@ -716,6 +760,8 @@ func writeCSV(rows []ResultRow, w io.Writer) (int, error) {
 			changed,
 			before,
 			after,
+			queryText,
+			queryHash,
 		}
 		if err := cw.Write(record); err != nil {
 			return i, err

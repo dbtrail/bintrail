@@ -41,6 +41,8 @@ var BinlogEventColumns = []baseline.Column{
 	{Name: "row_before", MySQLType: "json", ParquetType: baseline.MysqlToParquetNode("json")},
 	{Name: "row_after", MySQLType: "json", ParquetType: baseline.MysqlToParquetNode("json")},
 	{Name: "schema_version", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+	{Name: "query_text", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
+	{Name: "query_hash", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 }
 
 // ArchivePartition writes all rows from the named partition of binlog_events
@@ -76,7 +78,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 	q := fmt.Sprintf(
 		"SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp,"+
 			" gtid, connection_id, schema_name, table_name, event_type, pk_values,"+
-			" changed_columns, row_before, row_after, schema_version"+
+			" changed_columns, row_before, row_after, schema_version, query_text, query_hash"+
 			" FROM `%s`.`binlog_events` PARTITION (`%s`) ORDER BY event_id",
 		dbName, partition,
 	)
@@ -110,11 +112,13 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			rowBefore      []byte // nil = NULL
 			rowAfter       []byte // nil = NULL
 			schemaVersion  sql.NullInt32
+			queryText      sql.NullString
+			queryHash      sql.NullString
 		)
 		if err := rows.Scan(
 			&eventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
 			&gtid, &connID, &schemaName, &tableName, &eventType, &pkValues,
-			&changedColumns, &rowBefore, &rowAfter, &schemaVersion,
+			&changedColumns, &rowBefore, &rowAfter, &schemaVersion, &queryText, &queryHash,
 		); err != nil {
 			return rowCount, fmt.Errorf("scan row: %w", err)
 		}
@@ -144,6 +148,8 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			string(rowBefore),
 			string(rowAfter),
 			strconv.FormatInt(int64(schemaVersion.Int32), 10),
+			queryText.String,
+			queryHash.String,
 		}
 		nulls := []bool{
 			false, // event_id (AUTO_INCREMENT, cannot be NULL)
@@ -161,6 +167,8 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			rowBefore == nil,
 			rowAfter == nil,
 			!schemaVersion.Valid,
+			!queryText.Valid,
+			!queryHash.Valid,
 		}
 
 		if err := w.WriteRow(values, nulls); err != nil {

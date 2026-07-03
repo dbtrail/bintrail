@@ -475,16 +475,26 @@ func atoiDefault(s string, def int) int {
 }
 
 // writeFetchError maps a cross-source fetch failure onto the right HTTP
-// response. The interesting case: a registry index that predates the
-// connection_id column fails the events SELECT with MySQL error 1054. The
+// response. The interesting case: a registry index that predates one of the
+// post-initial-schema binlog_events columns (connection_id, or #699's
+// query_text/query_hash) fails the events SELECT with MySQL error 1054. The
 // console deliberately never migrates registry servers (EnsureSchema — an
 // ALTER — is confined to the command-line DSN), so instead of a cryptic 500 we
 // return an actionable 422 telling the operator how to migrate.
 func writeFetchError(w http.ResponseWriter, err error) {
 	var myErr *mysql.MySQLError
-	if errors.As(err, &myErr) && myErr.Number == 1054 && strings.Contains(myErr.Message, "connection_id") {
+	if errors.As(err, &myErr) && myErr.Number == 1054 &&
+		(strings.Contains(myErr.Message, "connection_id") ||
+			strings.Contains(myErr.Message, "query_text") ||
+			strings.Contains(myErr.Message, "query_hash")) {
+		col := "connection_id"
+		for _, c := range []string{"query_text", "query_hash"} {
+			if strings.Contains(myErr.Message, c) {
+				col = c
+			}
+		}
 		writeJSONError(w, http.StatusUnprocessableEntity,
-			"this index predates the connection_id column, and the console never migrates servers added in the UI; "+
+			"this index predates the "+col+" column, and the console never migrates servers added in the UI; "+
 				"run a writer command against it once (bintrail index / stream / agent), or start a console with --index-dsn pointing at it")
 		return
 	}

@@ -341,6 +341,112 @@ func TestCheckBinlogRetention(t *testing.T) {
 	}
 }
 
+// TestCheckStatementCapture pins the #699 advisory check: PASS when the
+// source logs statement text, WARN (never FAIL) when it doesn't, MariaDB
+// fallback probe when the MySQL variable is absent, SKIP when neither exists.
+func TestCheckStatementCapture(t *testing.T) {
+	tests := []struct {
+		name            string
+		mysqlVar        mockSQLScalar  // SELECT @@binlog_rows_query_log_events
+		mariaVar        *mockSQLScalar // SELECT @@binlog_annotate_row_events (only probed on a 1193 from mysqlVar)
+		wantStatus      CheckStatus
+		wantDetailFrag  string
+		wantRemediation bool
+	}{
+		{"mysql ON", row("1"), nil, StatusPass, "binlog_rows_query_log_events=ON", false},
+		{"mysql OFF", row("0"), nil, StatusWarn, "binlog_rows_query_log_events=OFF", true},
+		{"mariadb ON", mysqlErrResp(1193, "Unknown system variable 'binlog_rows_query_log_events'"), ptr(row("1")), StatusPass, "binlog_annotate_row_events=ON", false},
+		{"mariadb OFF", mysqlErrResp(1193, "Unknown system variable 'binlog_rows_query_log_events'"), ptr(row("OFF")), StatusWarn, "binlog_annotate_row_events=OFF", true},
+		{"neither variable", mysqlErrResp(1193, "Unknown system variable"), ptr(mysqlErrResp(1193, "Unknown system variable")), StatusSkip, "neither", false},
+		// A non-1193 failure is a READ problem, not a flavor fact — the real
+		// error must surface instead of a fabricated "not available" claim.
+		{"transient read failure", errResp("driver: bad connection"), nil, StatusWarn, "could not read binlog_rows_query_log_events: driver: bad connection", false},
+		{"mariadb probe read failure", mysqlErrResp(1193, "Unknown system variable"), ptr(errResp("driver: bad connection")), StatusWarn, "could not read binlog_annotate_row_events: driver: bad connection", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			exp := mock.ExpectQuery("SELECT @@binlog_rows_query_log_events")
+			tt.mysqlVar.apply(exp, "@@binlog_rows_query_log_events")
+			if tt.mariaVar != nil {
+				mexp := mock.ExpectQuery("SELECT @@binlog_annotate_row_events")
+				tt.mariaVar.apply(mexp, "@@binlog_annotate_row_events")
+			}
+
+			got := checkStatementCapture(db)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
+			}
+			if tt.wantRemediation && got.Remediation == "" {
+				t.Error("expected remediation but got none")
+			}
+			if got.Status == StatusFail {
+				t.Error("statement capture is optional — the check must never FAIL")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// TestCheckRowMetadata pins the #700 advisory check: PASS on FULL, WARN
+// (never FAIL) on MINIMAL, SKIP when the variable does not exist.
+func TestCheckRowMetadata(t *testing.T) {
+	tests := []struct {
+		name            string
+		probe           mockSQLScalar
+		wantStatus      CheckStatus
+		wantDetailFrag  string
+		wantRemediation bool
+	}{
+		{"FULL", row("FULL"), StatusPass, "binlog_row_metadata=FULL", false},
+		{"MINIMAL", row("MINIMAL"), StatusWarn, "binlog_row_metadata=MINIMAL", true},
+		{"MariaDB NO_LOG default", row("NO_LOG"), StatusWarn, "binlog_row_metadata=NO_LOG", true},
+		{"variable absent", mysqlErrResp(1193, "Unknown system variable 'binlog_row_metadata'"), StatusSkip, "not available", false},
+		{"transient read failure", errResp("driver: bad connection"), StatusWarn, "could not read binlog_row_metadata: driver: bad connection", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			exp := mock.ExpectQuery("SELECT @@binlog_row_metadata")
+			tt.probe.apply(exp, "@@binlog_row_metadata")
+
+			got := checkRowMetadata(db)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
+			}
+			if tt.wantRemediation && got.Remediation == "" {
+				t.Error("expected remediation but got none")
+			}
+			if got.Status == StatusFail {
+				t.Error("binlog_row_metadata is optional — the check must never FAIL")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
 // mockSQLScalar is a single-value SELECT mock — value xor err.
 type mockSQLScalar struct {
 	value string
@@ -349,6 +455,12 @@ type mockSQLScalar struct {
 
 func row(v string) mockSQLScalar       { return mockSQLScalar{value: v} }
 func errResp(msg string) mockSQLScalar { return mockSQLScalar{err: errors.New(msg)} }
+
+// mysqlErrResp mocks a typed MySQL server error (e.g. 1193 unknown system
+// variable) so checks that discriminate by error number can be exercised.
+func mysqlErrResp(number uint16, msg string) mockSQLScalar {
+	return mockSQLScalar{err: &mysql.MySQLError{Number: number, Message: msg}}
+}
 
 func (r mockSQLScalar) apply(exp *sqlmock.ExpectedQuery, col string) {
 	if r.err != nil {

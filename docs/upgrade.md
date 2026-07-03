@@ -122,7 +122,8 @@ non-tagged commit.
 **Automatic:** the index schema. Every command that opens the index via a
 CLI-typed `--index-dsn` (`init`, `index`, `stream`, `agent`, `query`,
 `recover`, `rotate`, `bintrail-console serve`/`watch` against their own
-`--index-dsn`) calls `EnsureSchema` on startup — it adds any columns/tables
+`--index-dsn`) calls `EnsureSchema` on startup — including the read-only
+commands (`query`, `recover`, `verify`, `reconstruct`, `shim`, the MCP tools) — it adds any columns/tables
 introduced since your index was created, idempotently (checks
 `information_schema` first, never re-runs a migration). No `bintrail init`
 re-run needed; just start the new binary against the same index.

@@ -995,7 +995,13 @@ func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Reso
 		})
 	}
 
-	return metadata.NewResolverFromTables(0, tables), nil
+	// The resolver reflects the LIVE schema read moments ago, so its
+	// creation time is exactly now. Without it the #700 drift guard runs in
+	// zero-time strict mode: an agent catching up through backlog written
+	// before a column rename would hard-error on every restart, with a
+	// remediation (`bintrail snapshot`) that does nothing for this
+	// resolver — it never reads schema_snapshots.
+	return metadata.NewResolverFromTablesAt(0, time.Now().UTC(), tables), nil
 }
 
 // validateServerUUID enforces that --server-uuid (when supplied) is a

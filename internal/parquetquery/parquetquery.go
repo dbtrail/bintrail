@@ -703,14 +703,10 @@ func fileArrayLiteral(files []string) string {
 func buildQueryFromFiles(files []string, opts query.Options, cols map[string]bool) (string, []any) {
 	where, args := buildFilters(opts)
 
-	connCol := "connection_id"
-	if !cols["connection_id"] {
-		connCol = "NULL::INT32 AS connection_id"
-	}
-
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
-		" gtid, " + connCol + ", schema_name, table_name, event_type, pk_values," +
-		" changed_columns, row_before, row_after, schema_version" +
+		" gtid, " + optionalCol(cols, "connection_id", "INT32") + ", schema_name, table_name, event_type, pk_values," +
+		" changed_columns, row_before, row_after, schema_version," +
+		" " + optionalCol(cols, "query_text", "VARCHAR") + ", " + optionalCol(cols, "query_hash", "VARCHAR") +
 		" FROM parquet_scan(" + fileArrayLiteral(files) + ", hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -750,7 +746,7 @@ func buildUnsortedQuery(path string, opts query.Options) (string, []any) {
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
-		" changed_columns, row_before, row_after, schema_version" +
+		" changed_columns, row_before, row_after, schema_version, query_text, query_hash" +
 		" FROM parquet_scan('" + safePath + "', union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -774,7 +770,7 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
-		" changed_columns, row_before, row_after, schema_version" +
+		" changed_columns, row_before, row_after, schema_version, query_text, query_hash" +
 		" FROM parquet_scan('" + safeGlob + "', hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -909,22 +905,29 @@ func parquetColumns(ctx context.Context, db *sql.DB, path string) (map[string]bo
 	return cols, nil
 }
 
+// optionalCol returns the bare column name when the scanned parquet source has
+// it, or a typed-NULL alias when absent. This handles backward compatibility
+// when reading archive files written before a schema-adding release (e.g.
+// pre-v0.4.4 files lack connection_id; pre-#699 files lack query_text and
+// query_hash) — parquet_scan with an explicit column list errors when the
+// column exists in NONE of the scanned files, even under union_by_name.
+func optionalCol(cols map[string]bool, name, sqlType string) string {
+	if cols[name] {
+		return name
+	}
+	return "NULL::" + sqlType + " AS " + name
+}
+
 // buildQueryForFile constructs a DuckDB query for a single parquet file,
 // substituting typed NULLs for optional columns not present in the file.
-// This handles backward compatibility when reading archive files written
-// before a schema-adding release (e.g., pre-v0.4.4 files lack connection_id).
 func buildQueryForFile(path string, opts query.Options, cols map[string]bool) (string, []any) {
 	where, args := buildFilters(opts)
 	safePath := strings.ReplaceAll(path, "'", "''")
 
-	connCol := "connection_id"
-	if !cols["connection_id"] {
-		connCol = "NULL::INT32 AS connection_id"
-	}
-
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
-		" gtid, " + connCol + ", schema_name, table_name, event_type, pk_values," +
-		" changed_columns, row_before, row_after, schema_version" +
+		" gtid, " + optionalCol(cols, "connection_id", "INT32") + ", schema_name, table_name, event_type, pk_values," +
+		" changed_columns, row_before, row_after, schema_version," +
+		" " + optionalCol(cols, "query_text", "VARCHAR") + ", " + optionalCol(cols, "query_hash", "VARCHAR") +
 		" FROM parquet_scan('" + safePath + "', hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -1016,11 +1019,13 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 			rowBefore      sql.NullString
 			rowAfter       sql.NullString
 			schemaVersion  sql.NullInt32
+			queryText      sql.NullString
+			queryHash      sql.NullString
 		)
 		if err := rows.Scan(
 			&eventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
 			&gtid, &connID, &schemaName, &tableName, &eventType, &pkValues,
-			&changedCols, &rowBefore, &rowAfter, &schemaVersion,
+			&changedCols, &rowBefore, &rowAfter, &schemaVersion, &queryText, &queryHash,
 		); err != nil {
 			return nil, fmt.Errorf("scan parquet result: %w", err)
 		}
@@ -1043,6 +1048,12 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 		if connID.Valid {
 			v := uint32(connID.Int64)
 			r.ConnectionID = &v
+		}
+		if queryText.Valid {
+			r.QueryText = &queryText.String
+		}
+		if queryHash.Valid {
+			r.QueryHash = &queryHash.String
 		}
 		if changedCols.Valid && changedCols.String != "" {
 			_ = json.Unmarshal([]byte(changedCols.String), &r.ChangedColumns)

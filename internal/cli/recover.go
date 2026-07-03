@@ -214,6 +214,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		}
 		opts.DenyTables = denyTables
 		opts.RedactColumns = redactCols
+		opts.ProfileActive = true
 	}
 
 	// ── Load schema resolver (best-effort; non-fatal) ─────────────────────────

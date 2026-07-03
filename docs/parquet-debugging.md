@@ -18,7 +18,7 @@ Verify with `duckdb --version`.
 
 ## Parquet Column Schema
 
-Archive Parquet files contain 15 columns (the `pk_hash` stored generated column is omitted):
+Archive Parquet files contain 17 columns (the `pk_hash` stored generated column is omitted):
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -37,6 +37,8 @@ Archive Parquet files contain 15 columns (the `pk_hash` stored generated column 
 | `row_before` | VARCHAR | JSON object of the row before the event (nullable) |
 | `row_after` | VARCHAR | JSON object of the row after the event (nullable) |
 | `schema_version` | INT | Schema snapshot version at index time |
+| `query_text` | VARCHAR | Original SQL statement, when the source logs it (nullable; archives written before statement capture existed lack the column entirely — readers substitute NULL) |
+| `query_hash` | VARCHAR | `STATEMENT_DIGEST()` of `query_text` (nullable) |
 
 ---
 

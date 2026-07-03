@@ -242,6 +242,8 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		row_before      JSON             DEFAULT NULL,
 		row_after       JSON             DEFAULT NULL,
 		schema_version  INT UNSIGNED     NOT NULL DEFAULT 0,
+		query_text      MEDIUMTEXT       DEFAULT NULL,
+		query_hash      CHAR(64)         DEFAULT NULL,
 		PRIMARY KEY (event_id, event_timestamp),
 		INDEX idx_row_lookup (schema_name, table_name, event_timestamp),
 		INDEX idx_pk_hash    (schema_name, table_name, pk_hash, event_timestamp),
@@ -376,6 +378,17 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		ddl_query       TEXT NOT NULL,
 		snapshot_id     INT UNSIGNED DEFAULT NULL,
 		INDEX idx_detected_at (detected_at)
+	) ENGINE=InnoDB`)
+
+	MustExec(t, db, `CREATE TABLE IF NOT EXISTS connection_cache (
+		connection_id         BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+		user                  VARCHAR(128),
+		host                  VARCHAR(255),
+		db                    VARCHAR(128),
+		command               VARCHAR(64),
+		connection_attributes JSON,
+		cached_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		last_seen             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	) ENGINE=InnoDB`)
 }
 

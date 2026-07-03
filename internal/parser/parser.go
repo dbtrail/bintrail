@@ -109,6 +109,17 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	// recent QueryEvent. For DML transactions, this is the QUERY(BEGIN)
 	// event that precedes the row events.
 	var currentConnectionID uint32
+	// currentQueryText holds the original SQL statement from the most recent
+	// ROWS_QUERY_EVENT (MySQL, binlog_rows_query_log_events=ON) or
+	// ANNOTATE_ROWS event (MariaDB, binlog_annotate_row_events=ON). It is
+	// statement-scoped: each statement's event overwrites the previous one,
+	// and one statement's text covers ALL of its (possibly chained) rows
+	// events. Cleared in three places, each load-bearing: QUERY and GTID
+	// boundaries (across transactions), and the STMT_END_F rows event (the
+	// statement boundary WITHIN a transaction — the only clear that stops a
+	// later ROWS_QUERY-less statement in the same transaction from inheriting
+	// stale text when the variable is toggled off mid-transaction).
+	var currentQueryText string
 
 	bp := replication.NewBinlogParser()
 
@@ -126,15 +137,21 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 		switch ev := binlogEv.Event.(type) {
 		case *replication.GTIDEvent:
 			currentGTID = formatGTID(binlogEv.Header.EventType, ev.SID, ev.GNO)
+			currentQueryText = "" // transaction boundary — statement text never crosses it
 
 		case *replication.MariadbGTIDEvent:
 			// MariaDB source: the GTID arrives as domain-server-seq (e.g.
 			// "0-1-100"). ev.GTID.String() returns "" for the zero GTID,
 			// mirroring formatGTID's not-enabled behavior.
 			currentGTID = ev.GTID.String()
+			currentQueryText = ""
 
 		case *replication.QueryEvent:
 			currentConnectionID = ev.SlaveProxyID
+			// A new QUERY (BEGIN of the next transaction, or a DDL) opens a new
+			// statement scope; any ROWS_QUERY text from the previous statement
+			// is stale. The statement's own ROWS_QUERY_EVENT arrives AFTER this.
+			currentQueryText = ""
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
 			if ddlEv, ok := parseDDL(p.logger, filename, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), p.schemaVersion.Load()); ok {
 				select {
@@ -144,8 +161,31 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 				}
 			}
 
+		case *replication.RowsQueryEvent:
+			// The original SQL statement (binlog_rows_query_log_events=ON),
+			// emitted right before the statement's TABLE_MAP + rows events.
+			// Sanitized ONCE here at the capture boundary — every downstream
+			// path (index INSERT, BYOS buffer/payload) sees bounded, valid
+			// UTF-8 text.
+			currentQueryText = event.SanitizeQueryText(string(ev.Query))
+
+		case *replication.MariadbAnnotateRowsEvent:
+			// MariaDB's positional sibling of ROWS_QUERY_EVENT
+			// (binlog_annotate_row_events=ON).
+			currentQueryText = event.SanitizeQueryText(string(ev.Query))
+
 		case *replication.RowsEvent:
-			return handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, p.schemaVersion.Load(), events)
+			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentQueryText, p.schemaVersion.Load(), events)
+			// The LAST rows event of a statement carries STMT_END_F — the
+			// actual statement boundary. Clearing here keeps one statement's
+			// text alive across its chained/split rows events, while a later
+			// statement in the SAME transaction that logged no ROWS_QUERY
+			// (variable toggled off mid-transaction — MySQL allows it; there
+			// is no GTID/QUERY boundary in between) can never inherit it.
+			if ev.Flags&replication.RowsEventStmtEndFlag != 0 {
+				currentQueryText = ""
+			}
+			return err
 
 		case *replication.TransactionPayloadEvent:
 			for _, inner := range ev.Events {
@@ -210,6 +250,7 @@ func handleRows(
 	rowsEv *replication.RowsEvent,
 	filename, currentGTID string,
 	connectionID uint32,
+	queryText string,
 	schemaVersion uint32,
 	out chan<- Event,
 ) error {
@@ -251,6 +292,78 @@ func handleRows(
 		return nil
 	}
 
+	// Column NAME cross-check (#700): with binlog_row_metadata=FULL the
+	// TABLE_MAP event embeds the table's real column names at write time,
+	// giving us per-event ground truth to hold the snapshot against. This
+	// catches the drift class the count guard above CANNOT see: a same-count
+	// schema change (a column rename, or a DROP+ADD in one ALTER) leaves the
+	// count equal while every value after the changed ordinal would be
+	// attributed to the WRONG column name — silent corruption, worse than the
+	// count-mismatch skip. The compare is case-insensitive per MySQL's
+	// identifier rules (a case-only rename does not change the mapping) and
+	// includes generated columns (present in both the snapshot and the FULL
+	// TABLE_MAP metadata — a different knob from the #493 guard's
+	// binlog_row_image below). Under the default binlog_row_metadata=MINIMAL the event
+	// carries no names and the check degrades to a no-op.
+	//
+	// A divergence splits on the event's age relative to the snapshot:
+	//
+	//   * Event AT-OR-AFTER the snapshot → the snapshot is STALE (the schema
+	//     changed after it was taken). Fail loud like the partial-image guard
+	//     below — proceeding would write wrong data that `recover` later
+	//     trusts, and the remediation (re-run `bintrail snapshot`) genuinely
+	//     converges: the fresh snapshot matches these events.
+	//
+	//   * Event BEFORE the snapshot → a routine historical state, not a
+	//     stale snapshot: re-indexing old files after a rename, or a stream
+	//     catching up through a backlog written before the operator
+	//     re-snapshotted. Re-snapshotting is a NO-OP here (the old names are
+	//     baked into the binlog), so a hard error would be a permanent dead
+	//     end with no converging remediation. Proceed exactly as before
+	//     #700 — values index under the snapshot's CURRENT names, which is
+	//     positionally correct for a pure rename (and is what makes the
+	//     generated recovery SQL executable against the live table) — and
+	//     warn loudly per rows event, the count guard's verbosity class.
+	//
+	// The snapshot time comes from the bintrail host clock (TakeSnapshot)
+	// while event timestamps come from the source server; a large clock skew
+	// can misclassify a rename taken moments around the snapshot — the
+	// failure mode is a loud warning instead of a hard stop, never silence.
+	// A zero snapshot time (unknown) stays strict,
+	// and so does a zero EVENT timestamp (tool-generated/rewritten binlogs
+	// occasionally carry zeroed headers — an unknown age must not take the
+	// lenient path).
+	if names := rowsEv.Table.ColumnNameString(); len(names) > 0 && len(names) == len(tm.Columns) {
+		for i := range names {
+			if mysqlIdentEqualFold(names[i], tm.Columns[i].Name) {
+				continue
+			}
+			eventTime := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
+			if snapTime := resolver.SnapshotTime(); binlogEv.Header.Timestamp != 0 && !snapTime.IsZero() && eventTime.Before(snapTime) {
+				logger.Warn("column names differ from snapshot for a pre-snapshot event — indexing under the snapshot's names",
+					"file", filename,
+					"pos", binlogEv.Header.LogPos,
+					"schema", schema,
+					"table", table,
+					"ordinal", i+1,
+					"binlog_column", names[i],
+					"snapshot_column", tm.Columns[i].Name,
+					"event_time", eventTime,
+					"snapshot_time", snapTime)
+				break
+			}
+			return fmt.Errorf(
+				"schema drift detected at %s:%d for %s.%s: binlog TABLE_MAP column %d is %q but schema snapshot %d has %q; "+
+					"the snapshot is stale (a column was renamed, or dropped and re-added, since it was taken) and indexing "+
+					"these events would attribute row values to the wrong columns — run `bintrail snapshot` against the "+
+					"current schema, then re-run indexing (a failed file re-indexes from the start; a stream resumes from "+
+					"its checkpoint); if this event actually PREDATES the snapshot, check for clock skew between the "+
+					"bintrail host and the source server",
+				filename, binlogEv.Header.LogPos, schema, table,
+				i+1, names[i], schemaVersion, tm.Columns[i].Name)
+		}
+	}
+
 	// Partial row image guard (#493): bintrail requires binlog_row_image=FULL.
 	// Under MINIMAL/NOBLOB, MySQL omits columns from the before/after image and
 	// go-mysql pads the absent positions to nil — which we would otherwise store
@@ -280,17 +393,17 @@ func handleRows(
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2:
-		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
 
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2:
-		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
 
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
 		replication.UPDATE_ROWS_EVENTv2:
-		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
 
 	default:
 		// A RowsEvent whose type matches none of the above — e.g. MariaDB's
@@ -319,6 +432,7 @@ func emitInserts(
 	rows [][]any,
 	schema, table, filename, gtid string,
 	connectionID uint32,
+	queryText string,
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
@@ -334,7 +448,7 @@ func emitInserts(
 		}
 		ev := Event{
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
-			Timestamp: ts, GTID: gtid, ConnectionID: connectionID,
+			Timestamp: ts, GTID: gtid, ConnectionID: connectionID, QueryText: queryText,
 			Schema: schema, Table: table, EventType: EventInsert,
 			PKValues:      BuildPKValues(pkCols, named),
 			RowAfter:      named,
@@ -356,6 +470,7 @@ func emitDeletes(
 	rows [][]any,
 	schema, table, filename, gtid string,
 	connectionID uint32,
+	queryText string,
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
@@ -371,7 +486,7 @@ func emitDeletes(
 		}
 		ev := Event{
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
-			Timestamp: ts, GTID: gtid, ConnectionID: connectionID,
+			Timestamp: ts, GTID: gtid, ConnectionID: connectionID, QueryText: queryText,
 			Schema: schema, Table: table, EventType: EventDelete,
 			PKValues:      BuildPKValues(pkCols, named),
 			RowBefore:     named,
@@ -393,6 +508,7 @@ func emitUpdates(
 	rows [][]any,
 	schema, table, filename, gtid string,
 	connectionID uint32,
+	queryText string,
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
@@ -416,7 +532,7 @@ func emitUpdates(
 		}
 		ev := Event{
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
-			Timestamp: ts, GTID: gtid, ConnectionID: connectionID,
+			Timestamp: ts, GTID: gtid, ConnectionID: connectionID, QueryText: queryText,
 			Schema: schema, Table: table, EventType: EventUpdate,
 			PKValues:      BuildPKValues(pkCols, before), // PK from before-image
 			RowBefore:     before,
@@ -433,6 +549,30 @@ func emitUpdates(
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// mysqlIdentEqualFold reports whether two column identifiers are equal under
+// MySQL's case-insensitive identifier comparison. strings.EqualFold covers
+// every case MySQL folds except the Turkish dotted/dotless I pair: MySQL's
+// identifier collation treats İ (U+0130) and ı (U+0131) as equal to I/i
+// (verified on 8.4: CREATE TABLE t (i INT, İ INT) fails with a duplicate-
+// column error, and RENAME COLUMN İstanbul TO istanbul succeeds as a
+// case-style rename), while Unicode simple folding maps neither to 'i' — so
+// a plain EqualFold would flag that legal case-style rename as drift (#700).
+// Accents are NOT folded by MySQL identifiers (verified on 8.4: CREATE TABLE
+// t (e INT, é INT) succeeds with two distinct columns), so no wider
+// normalization is needed.
+func mysqlIdentEqualFold(a, b string) bool {
+	if strings.EqualFold(a, b) {
+		return true
+	}
+	dotless := func(r rune) rune {
+		if r == 'İ' || r == 'ı' {
+			return 'i'
+		}
+		return r
+	}
+	return strings.EqualFold(strings.Map(dotless, a), strings.Map(dotless, b))
+}
 
 // BuildPKValues forwards to event.BuildPKValues (kept for back-compat; the
 // canonical doc lives on event.BuildPKValues).

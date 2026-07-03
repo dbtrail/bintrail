@@ -94,6 +94,12 @@ func (b *Buffer) Insert(events []event.Event) {
 			connID = &v
 		}
 
+		var queryText *string
+		if ev.QueryText != "" {
+			s := ev.QueryText
+			queryText = &s
+		}
+
 		row := query.ResultRow{
 			BinlogFile:     ev.BinlogFile,
 			StartPos:       ev.StartPos,
@@ -109,6 +115,10 @@ func (b *Buffer) Insert(events []event.Event) {
 			RowBefore:      ev.RowBefore,
 			RowAfter:       ev.RowAfter,
 			SchemaVersion:  ev.SchemaVersion,
+			QueryText:      queryText,
+			// QueryHash stays nil: the digest is an index-side enrichment
+			// (STATEMENT_DIGEST on the index connection) and the BYOS buffer
+			// has no index database.
 		}
 
 		sz := estimateRowSize(&row)
@@ -147,7 +157,19 @@ func (b *Buffer) Fetch(_ context.Context, opts query.Options) []query.ResultRow 
 		if !matchesOpts(e, opts) {
 			continue
 		}
-		results = append(results, e.row)
+		row := e.row
+		// The #699 statement-text invariant (see query.applyRedaction): the
+		// captured statement is per-STATEMENT, not per-table, so under ANY
+		// active profile it is withheld on every row. The buffer path does
+		// not implement column redaction (the agent handler never plumbs
+		// profiles today), but if profile options ever reach it, statement
+		// text must not be the surface that leaks. The stored entry is
+		// untouched — row is a copy, and QueryText is only niled on it.
+		if opts.ProfileActive || len(opts.RedactColumns) > 0 || len(opts.DenyTables) > 0 {
+			row.QueryText = nil
+			row.QueryHash = nil
+		}
+		results = append(results, row)
 		if len(results) >= limit {
 			break
 		}
@@ -325,6 +347,9 @@ func estimateRowSize(r *query.ResultRow) int64 {
 
 	if r.GTID != nil {
 		n += int64(len(*r.GTID))
+	}
+	if r.QueryText != nil {
+		n += int64(len(*r.QueryText))
 	}
 	for _, c := range r.ChangedColumns {
 		n += int64(len(c))

@@ -21,6 +21,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/shim"
 )
 
@@ -225,6 +226,16 @@ func runShim(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ping index DB: %w", err)
 	}
 	pingCancel()
+
+	// Idempotent schema migration (CLI-typed DSN — the one-DDL boundary):
+	// the shared query engine SELECTs post-initial-schema binlog_events
+	// columns (query_text/query_hash, #699). Without this a shim restarted
+	// on a new binary against an index last written by an older one would
+	// abort EVERY _flashback/_snapshot client query with MySQL error 1054
+	// until some unrelated writer command migrated the index.
+	if err := indexer.EnsureSchema(db); err != nil {
+		return fmt.Errorf("ensure index schema: %w", err)
+	}
 
 	listener, err := net.Listen("tcp", shListen)
 	if err != nil {

@@ -531,6 +531,27 @@ func TestBuildQueryForFileMissingConnectionID(t *testing.T) {
 	assertContains(t, q, "table_name = ?")
 }
 
+// Pre-#699 archives lack query_text/query_hash — both builders must
+// substitute typed NULLs so old files keep reading back, and select the real
+// columns when present.
+func TestBuildQueryQueryTextSubstitution(t *testing.T) {
+	old := map[string]bool{"connection_id": true} // pre-#699, post-v0.4.4 archive
+	cur := map[string]bool{"connection_id": true, "query_text": true, "query_hash": true}
+
+	q, _ := buildQueryForFile("/tmp/old.parquet", query.Options{Limit: 10}, old)
+	assertContains(t, q, "NULL::VARCHAR AS query_text")
+	assertContains(t, q, "NULL::VARCHAR AS query_hash")
+
+	q2, _ := buildQueryForFile("/tmp/new.parquet", query.Options{Limit: 10}, cur)
+	if strings.Contains(q2, "NULL::VARCHAR AS query_text") || strings.Contains(q2, "NULL::VARCHAR AS query_hash") {
+		t.Errorf("should select the real query_text/query_hash when present, got: %s", q2)
+	}
+
+	q3, _ := buildQueryFromFiles([]string{"s3://b/old.parquet"}, query.Options{Limit: 10}, old)
+	assertContains(t, q3, "NULL::VARCHAR AS query_text")
+	assertContains(t, q3, "NULL::VARCHAR AS query_hash")
+}
+
 // ─── parseFileHour ──────────────────────────────────────────────────────────
 
 func TestParseFileHour(t *testing.T) {

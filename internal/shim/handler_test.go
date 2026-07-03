@@ -783,7 +783,7 @@ func TestRunPointInTimeDispatchesByPKColumn(t *testing.T) {
 			rows.AddRow(int64(i+1), "binlog.000001", int64(100), int64(200), now,
 				nil, nil, "myapp", "orders", parser.EventInsert,
 				fmt.Sprintf("%d", i+1), nil, nil,
-				fmt.Sprintf(`{"id":%d,"sku":"X"}`, i+1), 0)
+				fmt.Sprintf(`{"id":%d,"sku":"X"}`, i+1), 0, nil, nil)
 		}
 		mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
 
@@ -818,6 +818,7 @@ func binlogEventsColumns() []string {
 		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 		"gtid", "connection_id", "schema_name", "table_name", "event_type",
 		"pk_values", "changed_columns", "row_before", "row_after", "schema_version",
+		"query_text", "query_hash",
 	}
 }
 
@@ -1514,7 +1515,7 @@ func TestRunPointInTimeInvokesArchiveFetcher(t *testing.T) {
 	// Live MySQL fetch may or may not run depending on planner output;
 	// stub it permissive (no expected rows) so a call is fine.
 	mock.ExpectQuery("FROM binlog_events").
-		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version"}))
+		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash"}))
 
 	called := false
 	fakeFetcher := func(ctx context.Context, opts query.Options, src string) ([]query.ResultRow, error) {
@@ -1592,7 +1593,7 @@ func TestRunFullTableEnforcesCostCap(t *testing.T) {
 			int64(i+1), "binlog.000001", int64(100), int64(200), now,
 			nil, nil, "myapp", "orders", parser.EventInsert,
 			fmt.Sprintf("%d", i+1), nil, nil,
-			fmt.Sprintf(`{"id":%d,"sku":"X"}`, i+1), 0,
+			fmt.Sprintf(`{"id":%d,"sku":"X"}`, i+1), 0, nil, nil,
 		)
 	}
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
@@ -1665,7 +1666,7 @@ func TestRunPointInTimeStrictModePropagatesArchiveError(t *testing.T) {
 	mock.ExpectQuery("information_schema.PARTITIONS").
 		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME", "PARTITION_DESCRIPTION"}))
 	mock.ExpectQuery("FROM binlog_events").
-		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version"}))
+		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash"}))
 
 	archiveErr := errors.New("synthetic archive failure (e.g. S3 throttling)")
 	failingFetcher := func(ctx context.Context, opts query.Options, src string) ([]query.ResultRow, error) {
@@ -1721,7 +1722,7 @@ func TestPlannerScopesPartitionsToIndexDB(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME"}).
 			AddRow("p_2026050415"))
 	mock.ExpectQuery("FROM binlog_events").
-		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version"}))
+		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash"}))
 
 	h := &Handler{
 		indexDB: db,
@@ -1770,7 +1771,7 @@ func TestRunDiffScopesPartitionsToIndexDB(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME"}).
 			AddRow("p_2026050415"))
 	mock.ExpectQuery("FROM binlog_events").
-		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version"}))
+		WillReturnRows(sqlmock.NewRows([]string{"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp", "gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values", "changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash"}))
 
 	h := &Handler{
 		indexDB: db,

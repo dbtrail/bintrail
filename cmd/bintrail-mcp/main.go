@@ -332,6 +332,14 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 		}
 		defer db.Close()
 
+		// Same idempotent migration as the recover tool below: the query
+		// engine SELECTs post-initial-schema binlog_events columns
+		// (query_text/query_hash, #699) and the MCP server opens a fresh DB
+		// per tool call, so the migration has to run here.
+		if err := indexer.EnsureSchema(db); err != nil {
+			return errorResult(fmt.Errorf("ensure index schema: %w", err)), nil, nil
+		}
+
 		opts, err := buildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
 			args.GTID, args.Since, args.Until, args.ChangedColumn, args.ColumnEq, args.Flag, args.Limit, 100)
 		if err != nil {
@@ -358,6 +366,7 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 			}
 			opts.DenyTables = denyTables
 			opts.RedactColumns = redactCols
+			opts.ProfileActive = true
 		}
 
 		format := args.Format
@@ -453,6 +462,7 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 			}
 			opts.DenyTables = denyTables
 			opts.RedactColumns = redactCols
+			opts.ProfileActive = true
 		}
 
 		// Load schema resolver best-effort for PK-only WHERE clauses.

@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
@@ -74,8 +75,15 @@ type Event struct {
 	Timestamp    time.Time
 	GTID         string // empty when GTID is not enabled on the source
 	ConnectionID uint32 // MySQL pseudo_thread_id from the transaction's QUERY(BEGIN) event; 0 = unknown
-	Schema       string
-	Table        string
+	// QueryText is the original SQL statement that produced this row event,
+	// captured from the statement's ROWS_QUERY_EVENT (MySQL,
+	// binlog_rows_query_log_events=ON) or ANNOTATE_ROWS event (MariaDB,
+	// binlog_annotate_row_events=ON). Empty when the source does not log it —
+	// capture is opt-in on the source (#699). Statement-scoped: a multi-statement
+	// transaction stamps each statement's own text onto its rows.
+	QueryText string
+	Schema    string
+	Table     string
 	// EventType numeric values are a PERSISTENCE CONTRACT: stored as a number in
 	// binlog_events.event_type and filtered by it. Never renumber existing values.
 	EventType     EventType
@@ -138,6 +146,45 @@ func ChangedColumns(before, after map[string]any) []string {
 	}
 	sort.Strings(changed)
 	return changed
+}
+
+// ─── Query-text sanitization (#699) ──────────────────────────────────────────
+
+// MaxQueryTextBytes caps a captured statement's stored size. ROWS_QUERY/
+// ANNOTATE events carry the FULL original statement — a bulk INSERT can run to
+// megabytes — and every row event of that statement carries the text, so an
+// uncapped statement would bloat the batch INSERT on the index path and the
+// buffer/payload Parquet on the BYOS path. 16 KiB keeps any realistic
+// hand-written or ORM statement intact; only bulk-statement tails are cut.
+const MaxQueryTextBytes = 16 * 1024
+
+// QueryTextTruncationMarker is appended to a capped statement so a forensics
+// reader can tell a truncated statement from a complete one. (A truncated
+// statement is deliberately NOT fed to STATEMENT_DIGEST — it usually ends
+// mid-token and would not parse.)
+const QueryTextTruncationMarker = " /* bintrail:truncated */"
+
+// SanitizeQueryText prepares a captured statement for storage: it replaces
+// invalid UTF-8 (a _binary'...' literal embeds raw bytes, which MySQL strict
+// mode would reject with error 1366, aborting the whole batch INSERT) and
+// caps the byte length at a rune boundary, appending
+// QueryTextTruncationMarker when cut. Applied ONCE at the capture boundary
+// (the parsers' ROWS_QUERY/ANNOTATE cases) so every downstream path — index
+// batch INSERT, BYOS buffer accounting, payload Parquet — sees bounded, valid
+// text; the indexer re-applies it as defense in depth.
+func SanitizeQueryText(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = strings.ToValidUTF8(s, "�")
+	if len(s) <= MaxQueryTextBytes {
+		return s
+	}
+	cut := MaxQueryTextBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + QueryTextTruncationMarker
 }
 
 // DDLKind identifies the type of DDL statement detected in a binlog QUERY_EVENT.
