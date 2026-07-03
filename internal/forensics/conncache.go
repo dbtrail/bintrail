@@ -298,9 +298,6 @@ func upsertBatch(ctx context.Context, indexDB *sql.DB, conns []cachedConn, attrM
 	return err
 }
 
-// cleanupConnectionCache deletes cached entries whose last_seen timestamp is
-// older than the retention window. Active connections keep their last_seen
-// fresh via the poller, so only genuinely stale entries are removed.
 // sweepConnectionCache runs one retention sweep, panic-recovered so a failure
 // never takes down its caller's loop. Shared by pollLoop and sweepLoop.
 func sweepConnectionCache(ctx context.Context, indexDB *sql.DB, retention time.Duration) {
@@ -333,6 +330,9 @@ func sweepLoop(ctx context.Context, indexDB *sql.DB, retention time.Duration) {
 	}
 }
 
+// cleanupConnectionCache deletes cached entries whose last_seen timestamp is
+// older than the retention window. Active connections keep their last_seen
+// fresh via the poller, so only genuinely stale entries are removed.
 func cleanupConnectionCache(ctx context.Context, indexDB *sql.DB, retention time.Duration) error {
 	cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
