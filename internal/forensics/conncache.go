@@ -100,7 +100,12 @@ func StartConnCachePoller(ctx context.Context, cfg ConnCacheConfig) <-chan struc
 		indexDB.SetMaxIdleConns(1)
 
 		if auditProbe(ctx, sourceDB) {
-			slog.Info("connection-cache: active audit plugin detected on the source — not polling (the audit log carries better session history at lower cost)")
+			slog.Info("connection-cache: active audit plugin detected on the source — not polling (the audit log carries better session history at lower cost); running retention sweeps so any pre-audit cached rows still age out")
+			// Polling is skipped, but connection_cache rows captured before the
+			// audit plugin was installed must still be pruned per the retention
+			// window — otherwise they persist forever and tier-2b would
+			// attribute old events to a frozen, possibly reused identity.
+			sweepLoop(ctx, indexDB, cfg.Retention)
 			return
 		}
 
@@ -135,16 +140,7 @@ func pollLoop(ctx context.Context, sourceDB, indexDB *sql.DB, retention time.Dur
 			consecutiveFailures = 0
 		}
 	}
-	sweep := func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("connection-cache: retention sweep panicked; sweep continues next tick", "panic", r)
-			}
-		}()
-		if err := cleanupConnectionCache(ctx, indexDB, retention); err != nil && ctx.Err() == nil {
-			slog.Warn("connection-cache: retention sweep error", "error", err)
-		}
-	}
+	sweep := func() { sweepConnectionCache(ctx, indexDB, retention) }
 
 	pollTicker := time.NewTicker(pollInterval)
 	defer pollTicker.Stop()
@@ -305,13 +301,54 @@ func upsertBatch(ctx context.Context, indexDB *sql.DB, conns []cachedConn, attrM
 // cleanupConnectionCache deletes cached entries whose last_seen timestamp is
 // older than the retention window. Active connections keep their last_seen
 // fresh via the poller, so only genuinely stale entries are removed.
+// sweepConnectionCache runs one retention sweep, panic-recovered so a failure
+// never takes down its caller's loop. Shared by pollLoop and sweepLoop.
+func sweepConnectionCache(ctx context.Context, indexDB *sql.DB, retention time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("connection-cache: retention sweep panicked; sweep continues next tick", "panic", r)
+		}
+	}()
+	if err := cleanupConnectionCache(ctx, indexDB, retention); err != nil && ctx.Err() == nil {
+		slog.Warn("connection-cache: retention sweep error", "error", err)
+	}
+}
+
+// sweepLoop runs only the retention sweep (no polling) until ctx is cancelled.
+// Used when an audit plugin is active on the source: polling is skipped in
+// favour of the audit log, but connection_cache rows captured before the plugin
+// was installed must still age out per the retention window. It sweeps once
+// immediately to prune the pre-audit backlog, then on each cleanup tick.
+func sweepLoop(ctx context.Context, indexDB *sql.DB, retention time.Duration) {
+	sweepConnectionCache(ctx, indexDB, retention)
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweepConnectionCache(ctx, indexDB, retention)
+		}
+	}
+}
+
 func cleanupConnectionCache(ctx context.Context, indexDB *sql.DB, retention time.Duration) error {
 	cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	secs := int64(retention.Seconds())
+	if secs < 1 {
+		// Retention is positive here (StartConnCachePoller gates <= 0 before
+		// polling), but under one second int64(Seconds()) truncates to 0 —
+		// which would DELETE every row, including live sessions. last_seen is
+		// second-precision, so round a sub-second window up to the minimum
+		// meaningful value instead of wiping the cache.
+		secs = 1
+	}
 	result, err := indexDB.ExecContext(cleanupCtx,
 		"DELETE FROM connection_cache WHERE last_seen < NOW() - INTERVAL ? SECOND",
-		int64(retention.Seconds()))
+		secs)
 	if err != nil {
 		return fmt.Errorf("cleanup query: %w", err)
 	}

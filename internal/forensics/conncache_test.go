@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -129,4 +130,40 @@ func openLazyDB(t *testing.T, dsn string) *sql.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+// TestCleanupConnectionCache_SubSecondRetention guards #8: a positive
+// sub-second --attribution-retention must not truncate to INTERVAL 0 SECOND
+// (which would DELETE every row, including live sessions). It is rounded up to
+// the minimum meaningful window of 1 second (last_seen is second-precision).
+func TestCleanupConnectionCache_SubSecondRetention(t *testing.T) {
+	tests := []struct {
+		name      string
+		retention time.Duration
+		wantSecs  int64
+	}{
+		{"half a second rounds up to 1", 500 * time.Millisecond, 1},
+		{"one nanosecond rounds up to 1", time.Nanosecond, 1},
+		{"exactly one second", time.Second, 1},
+		{"24h is exact", 24 * time.Hour, 86400},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+			mock.ExpectExec("DELETE FROM connection_cache").
+				WithArgs(tt.wantSecs).
+				WillReturnResult(sqlmock.NewResult(0, 0))
+
+			if err := cleanupConnectionCache(context.Background(), db, tt.retention); err != nil {
+				t.Fatalf("cleanupConnectionCache: %v", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("retention interval mismatch — sub-second must not become INTERVAL 0: %v", err)
+			}
+		})
+	}
 }
