@@ -83,7 +83,8 @@ func (c *ChannelConfig) maxReconnectAttempts() int {
 
 // Channel manages an outbound WebSocket connection to dbtrail. It
 // reconnects automatically with exponential backoff and sends periodic
-// heartbeats. Incoming commands are dispatched to the provided Handler.
+// heartbeats. Incoming commands are dispatched to the provided Handler —
+// see the package doc (command.go) for the full command vocabulary.
 type Channel struct {
 	cfg            ChannelConfig
 	handler        Handler

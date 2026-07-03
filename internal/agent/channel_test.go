@@ -15,14 +15,21 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/dbtrail/dbtrail/internal/forensics"
 )
 
 // ─── dispatch tests ──────────────────────────────────────────────────────────
 
 type stubHandler struct {
-	resolvePK  func(context.Context, ResolvePKRequest) ([]PKResult, error)
-	recover    func(context.Context, RecoverRequest) (string, error)
-	forensics  func(context.Context, ForensicsQueryRequest) (*ForensicsResult, error)
+	resolvePK    func(context.Context, ResolvePKRequest) ([]PKResult, error)
+	recover      func(context.Context, RecoverRequest) (string, error)
+	forensics    func(context.Context, ForensicsQueryRequest) (*ForensicsResult, error)
+	capabilities func(context.Context) (forensics.Capabilities, error)
+	enrich       func(context.Context, ForensicsEnrichRequest) (forensics.EnrichResult, error)
+	activity     func(context.Context, ForensicsActivityRequest) (forensics.ActivityResult, error)
+	users        func(context.Context) (ForensicsUsersResult, error)
+	auditLog     func(context.Context, ForensicsAuditLogRequest) (forensics.AuditReadResult, error)
 }
 
 func (s *stubHandler) HandleResolvePK(ctx context.Context, req ResolvePKRequest) ([]PKResult, error) {
@@ -33,6 +40,21 @@ func (s *stubHandler) HandleRecover(ctx context.Context, req RecoverRequest) (st
 }
 func (s *stubHandler) HandleForensicsQuery(ctx context.Context, req ForensicsQueryRequest) (*ForensicsResult, error) {
 	return s.forensics(ctx, req)
+}
+func (s *stubHandler) HandleForensicsCapabilities(ctx context.Context) (forensics.Capabilities, error) {
+	return s.capabilities(ctx)
+}
+func (s *stubHandler) HandleForensicsEnrich(ctx context.Context, req ForensicsEnrichRequest) (forensics.EnrichResult, error) {
+	return s.enrich(ctx, req)
+}
+func (s *stubHandler) HandleForensicsActivity(ctx context.Context, req ForensicsActivityRequest) (forensics.ActivityResult, error) {
+	return s.activity(ctx, req)
+}
+func (s *stubHandler) HandleForensicsUsers(ctx context.Context) (ForensicsUsersResult, error) {
+	return s.users(ctx)
+}
+func (s *stubHandler) HandleForensicsAuditLog(ctx context.Context, req ForensicsAuditLogRequest) (forensics.AuditReadResult, error) {
+	return s.auditLog(ctx, req)
 }
 
 func TestDispatch_resolvePK(t *testing.T) {
