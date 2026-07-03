@@ -464,25 +464,36 @@ func TestParseAuditLogFiles_UnreadableFileWarnsAndContinues(t *testing.T) {
 	}
 }
 
-// TestParseAuditLogFiles_ParseErrorNonFatal: a scanner failure mid-file
-// (line exceeding the 1 MB buffer) must surface as a warning with partial
-// results, never as a fatal error — the SaaS contract this port preserves.
-func TestParseAuditLogFiles_ParseErrorNonFatal(t *testing.T) {
+// TestParseAuditLogFiles_OversizedRecordSkippedNotFatal: a single record larger
+// than maxAuditLineBytes must be skipped and counted, NOT abort the scan —
+// records after it still parse. The old bufio.Scanner returned ErrTooLong here
+// and dropped the rest of the file; the whole point of the fix is that a valid
+// record following an oversized one is still returned (#7).
+func TestParseAuditLogFiles_OversizedRecordSkippedNotFatal(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "audit.json")
 	mustWrite(t, path,
 		`{"timestamp":"2024-06-15T10:30:00Z","name":"Query","user":"root"}`+"\n"+
-			`{"timestamp":"2024-06-15T10:31:00Z","name":"Query","pad":"`+strings.Repeat("x", 2<<20)+`"}`+"\n")
+			`{"timestamp":"2024-06-15T10:31:00Z","name":"Query","pad":"`+strings.Repeat("x", 2<<20)+`"}`+"\n"+
+			`{"timestamp":"2024-06-15T10:32:00Z","name":"Query","user":"dave"}`+"\n")
 
 	res, err := parseAuditLogFiles([]string{path}, AuditFormatJSON, auditLogFilter{}, 0, 10, 0)
 	if err != nil {
 		t.Fatalf("parseAuditLogFiles returned fatal error: %v", err)
 	}
-	if len(res.events) != 1 {
-		t.Errorf("events = %d, want 1 partial result", len(res.events))
+	// Both bracketing records parse — proving the scan continued past the
+	// oversized middle record instead of aborting on it.
+	if len(res.events) != 2 {
+		t.Fatalf("events = %d, want 2 (records before AND after the oversized one)", len(res.events))
 	}
-	if !warningsContain(res.warnings, "parse error in") {
-		t.Errorf("warnings = %v, want a 'parse error in' entry", res.warnings)
+	if got := res.events[0].User; got != "root" {
+		t.Errorf("first event user = %q, want root", got)
+	}
+	if got := res.events[1].User; got != "dave" {
+		t.Errorf("second event user = %q, want dave — the record after the oversized one was lost", got)
+	}
+	if res.skippedLines < 1 {
+		t.Errorf("skippedLines = %d, want >= 1 (the oversized record counted as skipped)", res.skippedLines)
 	}
 }
 
