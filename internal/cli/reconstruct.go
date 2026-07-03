@@ -321,41 +321,49 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	// on the numeric WAL LSN (baseline.MetaKeyLSN); MySQL/MariaDB on binlog
 	// file+pos. PG LSN TEXT ("0/1A2B3C4") is NOT lexically ordered, so the
 	// binlog_file column must never be compared for a PG source — see
-	// reconstruct.GapDetected.
-	flavor := query.SourceFlavor(db)
-	isPostgres := flavor == "postgres"
-	anchorPresent := bmeta.BinlogFile != ""
-	if isPostgres {
-		anchorPresent = bmeta.LSN != 0
-	}
-	if !anchorPresent && len(events) > 0 {
-		slog.Info("gap detection skipped — baseline lacks position metadata; consider re-running 'bintrail baseline' to embed position data",
-			"flavor", flavor)
-	}
-	if anchorPresent && len(events) > 0 {
+	// reconstruct.GapDetected and resolveGapCheck.
+	if len(events) > 0 {
 		first := events[0]
-		// A first event with no comparable position — NULL binlog_file (MySQL)
-		// or a zero LSN (PostgreSQL; 0 is not a valid WAL position) — skips the
-		// gap check rather than silently degrade to "no gap" (mirrors the
-		// anchor-absent branch above). See dbtrail/bintrail#318.
-		eventPosMissing := first.BinlogFile == ""
-		if isPostgres {
-			eventPosMissing = first.StartPos == 0
+		flavor, lineageGuard, anchorPresent, eventPosMissing := resolveGapCheck(
+			query.SourceFlavor(db), bmeta, first.BinlogFile, first.StartPos)
+		if lineageGuard {
+			slog.Warn("source flavor unknown but baseline carries an LSN anchor — treating source as postgres for gap detection (LSN text is never compared lexically)",
+				"baseline_lsn", bmeta.LSN)
 		}
-		if eventPosMissing {
+		switch {
+		case !anchorPresent && flavor == "postgres":
+			// The permanent steady state for every PG baseline until the
+			// LSN-writing producer ships (#593 slice C): the reconstruction may
+			// contain an undetectable hole, which deserves the same visibility
+			// as the #318 missing-event-position warn below — not an INFO line
+			// invisible at --log-level warn. No remediation command exists yet
+			// ("bintrail baseline" is the MySQL/mydumper pipeline), so the
+			// message must not recommend one.
+			slog.Warn("gap detection unavailable — this baseline predates LSN anchoring (no bintrail.baseline_lsn metadata); a gap between the baseline and the first indexed event would go undetected",
+				"flavor", flavor)
+		case !anchorPresent:
+			slog.Info("gap detection skipped — baseline lacks position metadata; consider re-running 'bintrail baseline' to embed position data",
+				"flavor", flavor)
+		case eventPosMissing:
+			// A first event with no comparable position — NULL binlog_file
+			// (MySQL) or a zero LSN (PostgreSQL; 0 is not a valid WAL position)
+			// — skips the gap check rather than silently degrade to "no gap".
+			// See dbtrail/bintrail#318.
 			slog.Warn("gap detection skipped — first indexed event lacks position metadata",
 				"event_id", first.EventID,
 				"baseline_file", bmeta.BinlogFile,
 				"baseline_pos", bmeta.BinlogPos,
-				"baseline_lsn", bmeta.LSN)
-		} else if reconstruct.GapDetected(flavor, first.BinlogFile, first.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN) {
+				"baseline_lsn", bmeta.LSN,
+				"flavor", flavor)
+		case reconstruct.GapDetected(flavor, first.BinlogFile, first.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN):
 			slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
 				"baseline_file", bmeta.BinlogFile,
 				"baseline_pos", bmeta.BinlogPos,
 				"baseline_gtid", bmeta.GTIDSet,
 				"baseline_lsn", bmeta.LSN,
 				"first_event_file", first.BinlogFile,
-				"first_event_pos", first.StartPos)
+				"first_event_pos", first.StartPos,
+				"flavor", flavor)
 		}
 	}
 
@@ -571,4 +579,30 @@ func splitAndTrim(s, sep string) []string {
 		}
 	}
 	return out
+}
+
+// resolveGapCheck computes the flavor-dependent decisions of runReconstruct's
+// baseline↔first-event gap check. effectiveFlavor is what
+// reconstruct.GapDetected must be called with; lineageGuard reports that the
+// stream_state flavor read came back empty while the baseline carries an LSN
+// anchor — the baseline itself proves a PostgreSQL lineage, so PG semantics
+// are forced rather than ever falling through to the MySQL lexical compare on
+// LSN text (that path being unreachable today only because PG baselines leave
+// BinlogFile empty is a convention, not an invariant — this guard makes it
+// structural, #593). anchorPresent reports whether the baseline has a
+// comparable anchor for its flavor (binlog file vs LSN); eventPosMissing
+// whether the first event lacks one (NULL binlog_file for MySQL; a zero
+// StartPos for PG — 0 is not a valid WAL position).
+func resolveGapCheck(flavor string, bmeta baseline.DumpMetadata, firstFile string, firstStartPos uint64) (effectiveFlavor string, lineageGuard, anchorPresent, eventPosMissing bool) {
+	if flavor == "" && bmeta.LSN != 0 {
+		flavor = "postgres"
+		lineageGuard = true
+	}
+	anchorPresent = bmeta.BinlogFile != ""
+	eventPosMissing = firstFile == ""
+	if flavor == "postgres" {
+		anchorPresent = bmeta.LSN != 0
+		eventPosMissing = firstStartPos == 0
+	}
+	return flavor, lineageGuard, anchorPresent, eventPosMissing
 }

@@ -1,6 +1,10 @@
 package query
 
-import "database/sql"
+import (
+	"database/sql"
+	"errors"
+	"log/slog"
+)
 
 // SourceFlavor returns the source flavor recorded in stream_state ("mysql",
 // "mariadb", "postgres"), the authoritative single-source signal for an index
@@ -9,12 +13,25 @@ import "database/sql"
 // MySQL-family semantics, the established default (see
 // recovery.DialectForFlavor, which owns the canonical "postgres" literal).
 // The nil guard lets a caller pass an as-yet-unopened handle directly.
+//
+// Failures are logged, not swallowed: a missing row (sql.ErrNoRows) is the
+// expected shape of a file-indexed / pre-stream index and logs at Debug, but
+// any other error (connection blip, old schema without the flavor column) is
+// indistinguishable from a legitimate MySQL index once flattened to "" — and
+// on the recover path "" selects the MySQL dialect, so a silent flatten is a
+// latent wrong-SQL vector. Those log at Warn.
 func SourceFlavor(db *sql.DB) string {
 	if db == nil {
 		return ""
 	}
 	var flavor string
 	if err := db.QueryRow("SELECT flavor FROM stream_state WHERE id = 1").Scan(&flavor); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			slog.Debug("source flavor unavailable — no stream_state row (file-indexed or pre-stream index); defaulting to MySQL-family semantics")
+		} else {
+			slog.Warn("source flavor read failed — defaulting to MySQL-family semantics; recovery SQL dialect and gap-check semantics may be wrong for a non-MySQL source",
+				"error", err)
+		}
 		return ""
 	}
 	return flavor
