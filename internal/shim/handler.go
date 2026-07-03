@@ -31,7 +31,7 @@ import (
 // rule, hits the real MySQL, and gets ER_BAD_DB (1049 "Unknown database
 // '_flashback'") — the #1 first-thing-a-DBA-types friction in interactive
 // time-travel sessions. The shim answers with the table list from the
-// latest schema snapshot.
+// newest schema snapshot per table (see runShowTablesFromVirtual).
 //
 // `SHOW TABLES FROM <realdb>` does NOT match this regex (the schema
 // alternation is anchored to the three virtual prefixes) so legitimate
@@ -92,13 +92,16 @@ type Handler struct {
 	// `bintrail query` and `bintrail recover` use) — exposed as a field
 	// so tests can inject a fake without DuckDB or real S3.
 	archiveFetcher query.ArchiveFetcher
-	// resolverFn loads a metadata.Resolver from the latest
-	// schema_snapshots row. Production wires this to
-	// metadata.NewResolver(indexDB, 0), which issues a MAX(snapshot_id)
-	// lookup plus a full per-snapshot row scan that materialises every
-	// table's column metadata into memory — non-trivial under load.
-	// Tests inject a fake to exercise the column-ordering paths without
-	// an indexDB.
+	// resolverFn loads the whole-schema metadata.Resolver. Production
+	// wires this to metadata.NewLatestPerTableResolver(indexDB) — the
+	// newest snapshot PER TABLE, unioned across schema_snapshots — NOT
+	// NewResolver(indexDB, 0) (single latest snapshot_id): a PostgreSQL
+	// source writes ONE table per snapshot_id, so "latest snapshot"
+	// would be just the last table that saw DML (#603); for MySQL the
+	// union is a strict generalization (the latest whole-schema snapshot
+	// already wins per table). The load materialises every table's
+	// column metadata into memory — non-trivial under load. Tests inject
+	// a fake to exercise the column-ordering paths without an indexDB.
 	//
 	// Wrapped by resolverCache below so successive queries share one
 	// load for up to resolverCacheTTL; a fresh `bintrail snapshot`
@@ -308,7 +311,7 @@ func NewHandlerWithConfig(indexDB *sql.DB, cfg Config, logger *slog.Logger) *Han
 		cfg:            cfg,
 		logger:         logger,
 		archiveFetcher: parquetquery.Fetch,
-		resolverFn:     func() (*metadata.Resolver, error) { return metadata.NewResolver(indexDB, 0) },
+		resolverFn:     func() (*metadata.Resolver, error) { return metadata.NewLatestPerTableResolver(indexDB) },
 	}
 }
 
@@ -333,8 +336,8 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 	h.mu.Unlock()
 
 	// SHOW TABLES FROM _flashback/_diff/_snapshot (#315). Intercepted
-	// here, before Parse(), so the table list comes from the latest
-	// schema snapshot rather than letting the query fall through to the
+	// here, before Parse(), so the table list comes from the schema
+	// snapshots rather than letting the query fall through to the
 	// real MySQL (which returns ER_BAD_DB on the virtual schema).
 	if m := showTablesFromVirtualRE.FindStringSubmatch(qstr); m != nil {
 		return h.runShowTablesFromVirtual(currentDB, m[1])
@@ -519,12 +522,14 @@ func imageToResultVerbatim(image map[string]any, cols []string) (*mysql.Result, 
 //     project verbatim onto the user's list (NULL for any column an image
 //     lacks); a column they did NOT list must not reappear. Appending
 //     image-only keys here would silently widen the user's projection.
-//   - SELECT * (q.Columns == nil) → imagesToResult: latest-snapshot order
-//     as the base, plus any image-only keys — e.g. a column dropped between
-//     AS OF and now whose value is still captured in the index (#600).
+//   - SELECT * (q.Columns == nil) → imagesToResult: the table's newest
+//     snapshot order as the base, plus any image-only keys — e.g. a column
+//     dropped between AS OF and now whose value is still captured in the
+//     index (#600).
 //
-// columnOrderFor stays latest-snapshot for SELECT *: it also backs SHOW
-// TABLES and PK validation, which must reflect today's schema.
+// columnOrderFor stays newest-snapshot-per-table for SELECT * (#603): it
+// also backs SHOW TABLES and PK validation, which must reflect the table's
+// current (last-snapshotted) schema, not the shape at AS OF.
 func (h *Handler) fullTableResult(q TimeTravelQuery, images []map[string]any) (*mysql.Result, error) {
 	if q.Columns != nil {
 		return imagesToResultVerbatim(images, q.Columns)
@@ -535,9 +540,15 @@ func (h *Handler) fullTableResult(q TimeTravelQuery, images []map[string]any) (*
 // runShowTablesFromVirtual answers `SHOW [FULL] TABLES FROM
 // _flashback/_diff/_snapshot` (#315). The virtual schemas have no MySQL
 // counterpart on the backend, so passing the query through ProxySQL would
-// hit ER_BAD_DB. Instead we return the list of tables present in the
-// latest schema snapshot for currentDB — every one of those tables is a
-// legitimate target for `SELECT * FROM <virtualSchema>.<table> ...`.
+// hit ER_BAD_DB. Instead we return every table of currentDB the index has
+// schema knowledge of — the newest snapshot per table, unioned across
+// schema_snapshots (#603; see metadata.NewLatestPerTableResolver). For a
+// MySQL source that equals the latest whole-schema snapshot; for a
+// PostgreSQL source (one table per snapshot_id) it is the only complete
+// view. A table now dropped at the source still lists under its last-known
+// shape — its indexed history is a legitimate target for
+// `SELECT * FROM <virtualSchema>.<table> AS OF ...`, same rationale as the
+// dropped-column surfacing in #600.
 //
 // `virtualSchema` is the literal `_flashback` / `_diff` / `_snapshot`
 // captured from the SHOW; it's used only for the resultset column name
@@ -605,8 +616,8 @@ func (h *Handler) runShowTablesFromVirtual(currentDB, virtualSchema string) (*my
 // cap is exceeded we return ER_TOO_BIG_SELECT (1104). Operators
 // narrow the AS OF range or fall back to PK-filtered queries.
 //
-// Cross-row column handling: column order is taken from the latest
-// schema_snapshots row (same DDL order as point-lookup and _diff).
+// Cross-row column handling: column order is taken from the table's
+// newest schema snapshot (same DDL order as point-lookup and _diff).
 // Rows whose images carry columns missing from that snapshot get
 // those columns dropped — same behaviour as a regular MySQL
 // `SELECT *` after an ALTER TABLE that removed a column.
@@ -733,13 +744,13 @@ func buildImagesResult(images []map[string]any, cols []string) (*mysql.Result, e
 //
 // Selection is snapshot-driven when possible:
 //
-//   - ddlOrder (the latest schema_snapshots row) is the base, used
+//   - ddlOrder (the table's newest schema snapshot) is the base, used
 //     verbatim — every column in it appears even if no image carries it
 //     (NULL on the wire), matching how MySQL itself returns rows from a
 //     table that was ALTER'd to ADD a column after some rows existed.
 //   - Then any image-only keys (the union across every image, sorted)
 //     are APPENDED. These are columns present in the captured row images
-//     but absent from the latest snapshot — most importantly a column
+//     but absent from the table's newest snapshot — most importantly a column
 //     DROPPED between the AS OF instant and now. Its value is still in
 //     the index; strict-projecting onto ddlOrder alone (the pre-#600
 //     behavior) silently hid it. Appending surfaces it instead, exactly
@@ -819,9 +830,11 @@ func fullTableColumns(images []map[string]any, ddlOrder []string) []string {
 //     runs, the wire response still degrades to alphabetical column
 //     order, and operators see the same Debug/Warn split logs they
 //     get from columnOrderFor for the same condition.
-//   - table not in latest snapshot → permissive, same rationale.
-//     Tables created after the most recent snapshot are common and
-//     self-fix on the next `bintrail snapshot` run.
+//   - table not in any snapshot → permissive, same rationale.
+//     Tables created after the most recent snapshot (MySQL) or that
+//     have not yet seen DML on the stream (PostgreSQL, whose
+//     snapshots are written per RelationMessage) are common and
+//     self-fix on the next snapshot / first DML.
 //   - len(PKColumns) == 0 → table snapshot is present but has no PK
 //     declared. The shim can't safely correlate row state without a
 //     PK, so reject with 1064. validateTables enforces PK presence
@@ -862,7 +875,7 @@ func (h *Handler) validatePKColumn(q TimeTravelQuery) error {
 	}
 	tm, err := r.Resolve(q.Schema, q.Table)
 	if err != nil {
-		h.logger.Debug("shim: table not in latest snapshot; skipping PK validation",
+		h.logger.Debug("shim: table not in any snapshot; skipping PK validation",
 			"err", err, "schema", q.Schema, "table", q.Table)
 		return nil
 	}
@@ -906,9 +919,11 @@ func (h *Handler) columnOrderFor(schema, table string) []string {
 	return cols
 }
 
-// tableMetaFor returns the table's metadata from the latest schema
-// snapshot, or nil when it can't be resolved. nil is the graceful-
-// degradation signal shared by every consumer (columnOrderFor's
+// tableMetaFor returns the table's metadata from its newest schema
+// snapshot (per-table union across schema_snapshots, #603 — correct
+// for PostgreSQL's one-table-per-snapshot_id layout as well as MySQL's
+// whole-schema snapshots), or nil when it can't be resolved. nil is the
+// graceful-degradation signal shared by every consumer (columnOrderFor's
 // alphabetical fallback): a broken or absent snapshot must never turn
 // a working query into an error.
 //
@@ -921,9 +936,10 @@ func (h *Handler) columnOrderFor(schema, table string) []string {
 //   - any other resolver-load error → Warn. Index DB is unreachable
 //     or schema_snapshots is unreadable — a real config/infra
 //     problem the operator should see at default --log-level info.
-//   - table not in snapshot → Debug. Common for tables created
-//     after the latest snapshot was taken; benign and self-fixing
-//     once a fresh snapshot runs.
+//   - table not in any snapshot → Debug. Common for tables created
+//     after the latest snapshot was taken (or, on a PG source, that
+//     have not yet seen DML); benign and self-fixing once a fresh
+//     snapshot runs.
 //
 // A degraded-but-deterministic fallback is strictly better than a
 // hard failure on what is otherwise a working query — but the
@@ -945,7 +961,7 @@ func (h *Handler) tableMetaFor(schema, table string) *metadata.TableMeta {
 	}
 	tm, err := r.Resolve(schema, table)
 	if err != nil {
-		h.logger.Debug("shim: table not in latest snapshot; proceeding without snapshot metadata",
+		h.logger.Debug("shim: table not in any snapshot; proceeding without snapshot metadata",
 			"err", err, "schema", schema, "table", table)
 		return nil
 	}
@@ -964,8 +980,8 @@ const epochResolverCacheCap = 8
 // its timestamp (#475): an enum reshaped between two events renders
 // each event under its own definition instead of mislabeling old
 // ordinals with the latest one. Degradation ladder: epoch lookup
-// unavailable → latest snapshot (the pre-#475 behavior); nothing
-// resolvable → pass-through (raw ordinals, never a guessed label).
+// unavailable → the table's newest snapshot (the pre-#475 behavior);
+// nothing resolvable → pass-through (raw ordinals, never a guessed label).
 //
 // Call this on fetched rows BEFORE any merge or text coercion — the
 // _snapshot paths fold row_after wholesale into the reconstructed
@@ -1171,7 +1187,7 @@ func (h *Handler) loadEpochs() []metadata.SnapshotEpoch {
 
 	epochs, err := metadata.LoadSnapshotEpochs(h.indexDB)
 	if err != nil {
-		h.logger.Debug("shim: snapshot epoch lookup failed; decoding ENUM/SET with the latest snapshot", "err", err)
+		h.logger.Debug("shim: snapshot epoch lookup failed; decoding ENUM/SET with the table's newest snapshot", "err", err)
 		return nil
 	}
 	h.epochListMu.Lock()

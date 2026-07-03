@@ -130,23 +130,54 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 		r.snapshotTime = snapTime.Time
 	}
 
-	sawColumnType := false
-	sawDataType := false
+	sawColumnType, sawDataType, err := scanSnapshotRows(rows, r.tables)
+	if err != nil {
+		return nil, err
+	}
 
+	// Pre-#212 snapshots have no column_type, so coerceUnsigned cannot tell which
+	// integer columns are UNSIGNED and silently indexes them as-is. Warn once (not
+	// per row) so an operator who upgraded for the unsigned fix (#490) isn't misled
+	// into thinking a stale snapshot is corrected.
+	//
+	// Gate on sawDataType so this MySQL-only warning never fires for a PostgreSQL
+	// snapshot (#533): WritePGSnapshot leaves both data_type AND column_type empty
+	// (PG carries no MySQL DATA_TYPE/COLUMN_TYPE, and UNSIGNED sign-correction is a
+	// MySQL-only concern coerceUnsigned never runs for PG rows). A genuine pre-#212
+	// MySQL snapshot always has a non-empty data_type (from information_schema), so
+	// it still trips the warning; only the all-empty-data_type PG signature is
+	// suppressed.
+	if len(r.tables) > 0 && sawDataType && !sawColumnType {
+		slog.Warn("snapshot predates column_type capture (#212); UNSIGNED integer "+
+			"columns cannot be sign-corrected and are indexed with the wrong value when "+
+			"the high bit is set (unsigned PKs also corrupt pk_hash) — re-run "+
+			"`bintrail snapshot` to enable the fix",
+			"snapshot_id", snapshotID)
+	}
+
+	return r, nil
+}
+
+// scanSnapshotRows consumes a schema_snapshots result set (the 9-column
+// SELECT shared by NewResolver and NewLatestPerTableResolver) into tables,
+// keyed "schema.table". It reports whether any row carried a non-empty
+// column_type / data_type so callers can emit the pre-#212 warning (see
+// NewResolver) with their own context attributes.
+func scanSnapshotRows(rows *sql.Rows, tables map[string]*TableMeta) (sawColumnType, sawDataType bool, err error) {
 	for rows.Next() {
 		var schemaName, tableName, columnName, columnKey, dataType, columnType string
 		var ordinalPosition int
 		var isGenerated, isIdentityAlways bool
 
 		if err := rows.Scan(&schemaName, &tableName, &columnName, &ordinalPosition, &columnKey, &dataType, &columnType, &isGenerated, &isIdentityAlways); err != nil {
-			return nil, fmt.Errorf("failed to scan snapshot row: %w", err)
+			return false, false, fmt.Errorf("failed to scan snapshot row: %w", err)
 		}
 
 		key := schemaName + "." + tableName
-		tm, ok := r.tables[key]
+		tm, ok := tables[key]
 		if !ok {
 			tm = &TableMeta{Schema: schemaName, Table: tableName}
-			r.tables[key] = tm
+			tables[key] = tm
 		}
 
 		col := ColumnMeta{
@@ -171,27 +202,81 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate snapshot rows: %w", err)
+		return false, false, fmt.Errorf("failed to iterate snapshot rows: %w", err)
+	}
+	return sawColumnType, sawDataType, nil
+}
+
+// NewLatestPerTableResolver loads, for EVERY (schema, table) present anywhere
+// in schema_snapshots, that table's NEWEST snapshot rows — a whole-schema
+// union view that is correct for both snapshot layouts (#603):
+//
+//   - MySQL/MariaDB: TakeSnapshot writes the whole schema under one
+//     snapshot_id, so for every table present in the latest snapshot the
+//     per-table-newest rows ARE the latest snapshot — a strict
+//     generalization of NewResolver(db, 0).
+//   - PostgreSQL: WritePGSnapshot writes ONE table per snapshot_id (a fresh
+//     MAX+1 on every pgoutput RelationMessage), so "latest snapshot" is just
+//     the last table that saw DML. The per-table-newest union is the only
+//     whole-schema view a PG index has.
+//
+// Deliberate semantic (both source families): a table that appears ONLY in
+// older snapshots — dropped (or renamed) at the source and re-snapshotted
+// since — is still included, under its last-known shape. Its indexed history
+// remains addressable (`SELECT * FROM _flashback.dropped AS OF <ts>` works
+// off binlog_events, not the live schema), so hiding it from SHOW TABLES /
+// column-order lookups would be the table-level analog of the dropped-column
+// view bug fixed in #600. A re-created table resolves to its newest shape
+// (last-write-wins per table).
+//
+// Scope: read/list surfaces only (the shim's SHOW TABLES, columnOrderFor and
+// PK validation). Do NOT hand this resolver to the indexing/stream paths:
+// SnapshotID() is 0 (the union spans many snapshot_ids, so there is no
+// single id to stamp schema_version with) and SnapshotTime() is zero, which
+// the #700 drift guard treats as strict.
+//
+// Returns ErrNoSnapshots when schema_snapshots is empty — same benign
+// first-install sentinel as NewResolver.
+func NewLatestPerTableResolver(db *sql.DB) (*Resolver, error) {
+	// The derived table groups on (schema_name, table_name) — a loose scan
+	// over idx_snapshot_table. Callers cache the resolver (the shim's 30s
+	// resolverCache), so the scan cost is bounded per TTL window, not per
+	// query.
+	rows, err := db.Query(`
+		SELECT s.schema_name, s.table_name, s.column_name, s.ordinal_position,
+		       s.column_key, s.data_type, COALESCE(s.column_type, '') AS column_type,
+		       s.is_generated, s.is_identity_always
+		FROM schema_snapshots s
+		JOIN (
+			SELECT schema_name, table_name, MAX(snapshot_id) AS snapshot_id
+			FROM schema_snapshots
+			GROUP BY schema_name, table_name
+		) latest
+		  ON latest.schema_name = s.schema_name
+		 AND latest.table_name  = s.table_name
+		 AND latest.snapshot_id = s.snapshot_id
+		ORDER BY s.schema_name, s.table_name, s.ordinal_position`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query per-table-newest snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	r := &Resolver{tables: make(map[string]*TableMeta)}
+	sawColumnType, sawDataType, err := scanSnapshotRows(rows, r.tables)
+	if err != nil {
+		return nil, err
+	}
+	if len(r.tables) == 0 {
+		return nil, ErrNoSnapshots
 	}
 
-	// Pre-#212 snapshots have no column_type, so coerceUnsigned cannot tell which
-	// integer columns are UNSIGNED and silently indexes them as-is. Warn once (not
-	// per row) so an operator who upgraded for the unsigned fix (#490) isn't misled
-	// into thinking a stale snapshot is corrected.
-	//
-	// Gate on sawDataType so this MySQL-only warning never fires for a PostgreSQL
-	// snapshot (#533): WritePGSnapshot leaves both data_type AND column_type empty
-	// (PG carries no MySQL DATA_TYPE/COLUMN_TYPE, and UNSIGNED sign-correction is a
-	// MySQL-only concern coerceUnsigned never runs for PG rows). A genuine pre-#212
-	// MySQL snapshot always has a non-empty data_type (from information_schema), so
-	// it still trips the warning; only the all-empty-data_type PG signature is
-	// suppressed.
-	if len(r.tables) > 0 && sawDataType && !sawColumnType {
-		slog.Warn("snapshot predates column_type capture (#212); UNSIGNED integer "+
-			"columns cannot be sign-corrected and are indexed with the wrong value when "+
-			"the high bit is set (unsigned PKs also corrupt pk_hash) — re-run "+
-			"`bintrail snapshot` to enable the fix",
-			"snapshot_id", snapshotID)
+	// Same pre-#212 stale-snapshot warning as NewResolver (see the rationale
+	// there, including the PG all-empty-data_type suppression from #533).
+	if sawDataType && !sawColumnType {
+		slog.Warn("snapshot predates column_type capture (#212); UNSIGNED integer " +
+			"columns cannot be sign-corrected and are indexed with the wrong value when " +
+			"the high bit is set (unsigned PKs also corrupt pk_hash) — re-run " +
+			"`bintrail snapshot` to enable the fix")
 	}
 
 	return r, nil
@@ -245,6 +330,12 @@ func (r *Resolver) Resolve(schema, table string) (*TableMeta, error) {
 	key := schema + "." + table
 	tm, ok := r.tables[key]
 	if !ok {
+		if r.snapshotID == 0 {
+			// Per-table-newest union resolvers (NewLatestPerTableResolver)
+			// span many snapshot_ids; "snapshot 0" would misread as a real id.
+			return nil, fmt.Errorf("table %s.%s not found in any schema snapshot; consider re-running `bintrail snapshot`",
+				schema, table)
+		}
 		return nil, fmt.Errorf("table %s.%s not found in snapshot %d; consider re-running `bintrail snapshot`",
 			schema, table, r.snapshotID)
 	}
@@ -397,7 +488,8 @@ type PGRelationSchema struct {
 // Consequence to respect in later slices: NewResolver(db, 0) (latest) yields a
 // SINGLE table for a PG index, not a whole-schema view — recovery is unaffected (it
 // loads each row's own snapshot_id), but a whole-schema consumer (console Tables(),
-// shim SHOW TABLES) must not assume MAX(snapshot_id) is the full schema.
+// shim SHOW TABLES) must not assume MAX(snapshot_id) is the full schema; use
+// NewLatestPerTableResolver instead (#603 — the shim does).
 //
 // PG columns leave the MySQL-only fields empty/NULL: data_type and is_nullable are
 // the empty string (both NOT NULL columns, so empty string not NULL), column_type and

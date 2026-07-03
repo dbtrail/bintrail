@@ -211,8 +211,8 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	return h.fullTableResult(q, images)
 }
 
-// pkColumnMetas returns the primary-key column metas of schema.table from the
-// latest schema snapshot, for canonicalizing baseline PK values. The bool is
+// pkColumnMetas returns the primary-key column metas of schema.table from its
+// newest schema snapshot, for canonicalizing baseline PK values. The bool is
 // false when the resolver is unavailable or the table isn't in the snapshot —
 // callers treat that as "can't safely attempt a baseline merge" and fall back
 // to the binlog-only path.
@@ -453,8 +453,8 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 	return imageToResult(state, h.columnOrderFor(q.Schema, q.Table))
 }
 
-// pkDataType returns the DATA_TYPE of pkCol in schema.table from the
-// latest schema snapshot. The bool is false when the resolver is
+// pkDataType returns the DATA_TYPE of pkCol in schema.table from its
+// newest schema snapshot. The bool is false when the resolver is
 // unavailable or the column isn't found — callers treat that as "can't
 // safely attempt a baseline match" and fall back to the binlog-only
 // path.
