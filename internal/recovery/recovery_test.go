@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -239,7 +240,7 @@ func TestGenerateUpdate_pgOriginSchemaVersion0(t *testing.T) {
 	// complete, so the unchanged-TOAST marker is never produced for a supported source
 	// and so can never reach recovery. The sentinel check below is therefore a cheap
 	// belt-and-suspenders, not the proof of that property.
-	const sentinel = "__bintrail_unchanged_toast__" // == pgcapture.UnchangedToastKey
+	const sentinel = event.UnchangedToastKey // canonical home since #592 (aliased by pgcapture)
 	const bigVal = "BIG-OUT-OF-LINE-TOAST-VALUE"
 	g := newGen() // nil resolver → all-cols WHERE fallback, like a PG-origin row
 	row := query.ResultRow{
@@ -671,6 +672,83 @@ func TestGenerateSQLFromRows_reverseOrder(t *testing.T) {
 	}
 }
 
+// TestGenerateSQLFromRows_unresolvedToastMarker is the #592 acceptance test: a
+// synthetic row carrying the residual unchanged-TOAST marker must make recover
+// fail LOUD — a hard error and zero bytes written — never a script that
+// silently marshals the marker into the column ({"__bintrail_unchanged_toast__":true}).
+// The refusal is up front because the render loop demotes per-statement errors
+// to SQL comments. Checked in both dialects and both images: the marker is a
+// capture-invariant violation wherever it appears.
+func TestGenerateSQLFromRows_unresolvedToastMarker(t *testing.T) {
+	marker := map[string]any{event.UnchangedToastKey: true}
+	cases := []struct {
+		name string
+		gen  *Generator
+		row  query.ResultRow
+	}{
+		{
+			name: "pg dialect, marker in row_before of UPDATE",
+			gen:  NewForDialect(nil, nil, PostgresDialect),
+			row: query.ResultRow{
+				EventID: 1, SchemaName: "public", TableName: "docs",
+				EventType: parser.EventUpdate, PKValues: "7",
+				RowBefore: map[string]any{"id": "7", "body": marker},
+				RowAfter:  map[string]any{"id": "7", "body": "new"},
+			},
+		},
+		{
+			name: "pg dialect, marker in row_after of INSERT",
+			gen:  NewForDialect(nil, nil, PostgresDialect),
+			row: query.ResultRow{
+				EventID: 2, SchemaName: "public", TableName: "docs",
+				EventType: parser.EventInsert, PKValues: "8",
+				RowAfter: map[string]any{"id": "8", "body": marker},
+			},
+		},
+		{
+			name: "mysql dialect, marker in row_before of DELETE",
+			gen:  newGen(),
+			row: query.ResultRow{
+				EventID: 3, SchemaName: "db", TableName: "t",
+				EventType: parser.EventDelete, PKValues: "9",
+				RowBefore: map[string]any{"id": "9", "body": marker},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			n, err := tc.gen.GenerateSQLFromRows([]query.ResultRow{tc.row}, &buf)
+			if err == nil {
+				t.Fatalf("expected a loud error, got n=%d output:\n%s", n, buf.String())
+			}
+			for _, want := range []string{"unresolved unchanged-TOAST marker", "capture invariant violated", "body"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error missing %q:\n%s", want, err)
+				}
+			}
+			if buf.Len() != 0 {
+				t.Errorf("refusal must write NOTHING, got %d bytes:\n%s", buf.Len(), buf.String())
+			}
+			if n != 0 {
+				t.Errorf("expected 0 statements, got %d", n)
+			}
+		})
+	}
+
+	// A clean sibling row still generates: the guard must not trip on ordinary
+	// structured values that are not the marker (e.g. a MySQL JSON column).
+	var buf bytes.Buffer
+	clean := query.ResultRow{
+		EventID: 4, SchemaName: "db", TableName: "t",
+		EventType: parser.EventInsert, PKValues: "10",
+		RowAfter: map[string]any{"id": "10", "attrs": map[string]any{"nested": true, "n": float64(1)}},
+	}
+	if _, err := newGen().GenerateSQLFromRows([]query.ResultRow{clean}, &buf); err != nil {
+		t.Fatalf("non-marker structured value must not trip the guard: %v", err)
+	}
+}
+
 // ─── resolverForRow ──────────────────────────────────────────────────────────
 
 func TestResolverForRow_zeroVersionReturnsFallback(t *testing.T) {
@@ -919,11 +997,13 @@ func TestFormatValuePG(t *testing.T) {
 	if got := formatValuePG(true); got != "true" {
 		t.Errorf("bool true → %q, want true", got)
 	}
-	// Defensive structured-value path (mirrors FormatSQLValue): the only structured
-	// value a PG row image can carry is the unchanged-TOAST sentinel map, reachable
-	// only under a weaker-than-FULL replica identity (out of support). It must marshal
-	// to valid, quoted JSON, never panic or emit a bare Go %v rendering.
-	if got := formatValuePG(map[string]any{"__bintrail_unchanged_toast__": true}); got != `'{"__bintrail_unchanged_toast__":true}'` {
+	// Defensive structured-value path (mirrors FormatSQLValue): a stray structured
+	// value must marshal to valid, quoted JSON, never panic or emit a bare Go %v
+	// rendering. The unchanged-TOAST marker specifically can no longer reach this
+	// function through the real path — GenerateSQLFromRows refuses up front (#592,
+	// TestGenerateSQLFromRows_unresolvedToastMarker) — so this pins only the
+	// last-resort rendering of a direct call.
+	if got := formatValuePG(map[string]any{"some": "object"}); got != `'{"some":"object"}'` {
 		t.Errorf("map → %q, want quoted JSON", got)
 	}
 }

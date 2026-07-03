@@ -438,7 +438,14 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 	// need this — the baseline image already carries labels (mydumper
 	// dumps strings) and string values pass through the mapper untouched.
 	h.mapEventImages(q.Schema, q.Table, rows)
-	state := reconstruct.ApplyAt(baselineRow, rows, q.AsOf)
+	state, err := reconstruct.ApplyAt(baselineRow, rows, q.AsOf)
+	if err != nil {
+		// A residual unchanged-TOAST marker (#592) — a capture-invariant
+		// violation, i.e. a server-side data fault: plain error →
+		// ER_UNKNOWN_ERROR (1105), same as a baseline-source failure above.
+		// Refusing beats serving the marker's JSON as the column value.
+		return nil, err
+	}
 	if state == nil {
 		// Either the row never existed at AsOf (no baseline image and no
 		// INSERT in the window) or its latest event was a DELETE.

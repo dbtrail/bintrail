@@ -101,6 +101,59 @@ func TestMergeBaseline_passthroughOnly(t *testing.T) {
 	}
 }
 
+// TestMergeBaseline_unresolvedToastMarker is the #592 guard on the full-table
+// path: a change-map event carrying the residual unchanged-TOAST marker must
+// refuse the whole table BEFORE any output exists — writing the marker's JSON
+// into a reconstructed dump is silent corruption. The up-front scan in
+// mergeBaselineImages covers both this mydumper writer path and the shim's
+// full-table _snapshot path.
+func TestMergeBaseline_unresolvedToastMarker(t *testing.T) {
+	baselinePath := writeTestBaseline(t, [][]string{
+		{"1", "new"},
+		{"2", "paid"},
+	})
+	outDir := t.TempDir()
+
+	rep := &TableReport{Schema: "mydb", Table: "orders"}
+	err := mergeBaselineIntoWriter(context.Background(), mergeInput{
+		LocalBaselinePath: baselinePath,
+		CreateTableSQL:    "-- test",
+		Schema:            "mydb",
+		Table:             "orders",
+		PKCols:            pkColsIntID(),
+		Changes: map[string]*query.ResultRow{
+			pkStrForInt(2): {
+				EventType:  event.EventUpdate,
+				SchemaName: "mydb", TableName: "orders", PKValues: pkStrForInt(2),
+				RowAfter: map[string]any{"id": "2", "status": toastMarker()},
+			},
+		},
+		OutputDir: outDir,
+		ChunkSize: 0,
+	}, rep)
+	if err == nil {
+		t.Fatal("expected a loud error for a marker-carrying change")
+	}
+	for _, want := range []string{"unresolved unchanged-TOAST marker", "capture invariant violated", "mydb.orders", "status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q:\n%s", want, err)
+		}
+	}
+	// The scan runs BEFORE the writer opens, so the refusal must leave nothing
+	// behind — not even the schema header file.
+	entries, rerr := os.ReadDir(outDir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 0 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("refusal left partial output in outDir: %v", names)
+	}
+}
+
 // writeBlobTextBaseline creates a baseline (id INT, tx TEXT, bl BLOB). TEXT maps
 // to parquet.String() (DuckDB scans it back as a Go string), BLOB to
 // ByteArrayType (DuckDB []byte) — the type asymmetry behind #660.

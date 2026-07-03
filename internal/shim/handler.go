@@ -501,7 +501,12 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 func imageToResultVerbatim(image map[string]any, cols []string) (*mysql.Result, error) {
 	row := make([]any, len(cols))
 	for i, c := range cols {
-		row[i] = resultsetValue(image[c]) // nil for missing key → NULL on wire
+		v := image[c] // nil for missing key → NULL on wire
+		// Residual unchanged-TOAST marker → refuse (#592); see buildImagesResult.
+		if event.IsUnchangedToastMarker(v) {
+			return nil, event.UnresolvedToastError("", "", "", []string{c})
+		}
+		row[i] = resultsetValue(v)
 	}
 	rs, err := mysql.BuildSimpleTextResultset(cols, [][]any{row})
 	if err != nil {
@@ -709,7 +714,16 @@ func buildImagesResult(images []map[string]any, cols []string) (*mysql.Result, e
 	for i, img := range images {
 		row := make([]any, len(cols))
 		for j, c := range cols {
-			row[j] = resultsetValue(img[c])
+			v := img[c]
+			// Fail loud on a residual unchanged-TOAST marker (#592): serving it
+			// would render the marker's JSON as the column value — silently wrong
+			// data on the wire, the exact failure the shim's no-partial-resultset
+			// stance (--allow-gaps) exists to prevent. Cell-level so a verbatim
+			// projection that does NOT include the marker column still succeeds.
+			if event.IsUnchangedToastMarker(v) {
+				return nil, event.UnresolvedToastError("", "", "", []string{c})
+			}
+			row[j] = resultsetValue(v)
 		}
 		values[i] = row
 	}
@@ -1468,7 +1482,12 @@ func imageToResult(image map[string]any, ddlOrder []string) (*mysql.Result, erro
 	cols := orderColumns(image, ddlOrder)
 	row := make([]any, len(cols))
 	for i, c := range cols {
-		row[i] = resultsetValue(image[c])
+		v := image[c]
+		// Residual unchanged-TOAST marker → refuse (#592); see buildImagesResult.
+		if event.IsUnchangedToastMarker(v) {
+			return nil, event.UnresolvedToastError("", "", "", []string{c})
+		}
+		row[i] = resultsetValue(v)
 	}
 
 	rs, err := mysql.BuildSimpleTextResultset(cols, [][]any{row})
