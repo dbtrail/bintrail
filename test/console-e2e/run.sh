@@ -68,6 +68,19 @@ curl -fsS -X POST \
   -d '{"name":"wp","source_host":"127.0.0.1","source_port":"13306","source_user":"dbtrail","source_password":"x"}' \
   "http://127.0.0.1:$PORT/api/servers" >/dev/null
 
+# Forensics who-changed happy-path fixture (#708): one real row in the boot
+# index ($IDX_DB, already schema-migrated by the daemon's own EnsureSchema on
+# startup). The "byo-idx" server created below by scenario 5 points at this
+# exact database with no source configured — reusing it here gives the
+# who-changed scenarios both a working index AND the "no source" capability
+# state without a second fixture.
+echo "==> seed one binlog_events row for the forensics who-changed scenarios"
+mysql_exec -e "
+USE $IDX_DB;
+INSERT INTO binlog_events (binlog_file, start_pos, end_pos, event_timestamp, connection_id, schema_name, table_name, event_type, pk_values, changed_columns, row_before, row_after, schema_version)
+VALUES ('bin.000001', 4, 40, NOW(), 4242, 'fx_e2e', 'probe', 2, '1', JSON_ARRAY('val'), JSON_OBJECT('val','a'), JSON_OBJECT('val','b'), 0);
+"
+
 echo "==> install node deps"
 (cd "$HERE" && npm install --no-audit --no-fund --silent)
 if [ "${PW_CHANNEL:-}" = "" ]; then

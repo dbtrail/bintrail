@@ -13,9 +13,9 @@
 //  3. Every async render captures `serverGen` before its await and bails if a
 //     server switch happened mid-flight (no cross-server repaint).
 //  4. Capability gating toggles the `.cap-on` class on [data-capability] nodes.
-//  5. Exports stay connection_id-free: CSV via the EVENT_CSV_COLUMNS allowlist;
-//     JSON only because the server's eventDTO omits connection_id (it serializes
-//     rows as-is). The open-core line is enforced server-side — don't add it.
+//  5. CSV export (EVENT_CSV_COLUMNS) and the JSON view stay in lockstep: both
+//     mirror whatever eventDTO serializes server-side (including connection_id,
+//     per epic #701 D1) — CSV is not a separate, narrower boundary to maintain.
 //  6. The DOM is built with el()/textContent only — no innerHTML anywhere. The
 //     one string→DOM path is svgEl(), which DOMParses STATIC icon constants
 //     (never data) into SVG nodes. No value from the API touches markup.
@@ -27,19 +27,19 @@ const TOKEN_KEY = "bintrail_console_token";
 const SERVER_KEY = "bintrail_console_server";
 const ONBOARD_KEY = "bintrail_console_onboarded";
 
-// Export columns. connection_id is DELIBERATELY ABSENT — it is paid-forensics
-// data and the console (query_explorer surface) never exposes it.
+// Export columns. connection_id is INCLUDED (epic #701 D1 — no longer a
+// gated field on the events API; CSV mirrors the JSON view exactly).
 const EVENT_CSV_COLUMNS = [
   "event_id", "event_timestamp", "schema_name", "table_name", "event_type",
-  "pk_values", "changed_columns", "gtid", "binlog_file", "start_pos", "end_pos",
-  "row_before", "row_after",
+  "pk_values", "changed_columns", "gtid", "connection_id", "binlog_file",
+  "start_pos", "end_pos", "row_before", "row_after",
 ];
 
 // event_type → badge modifier class.
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
-const ROUTES = ["overview", "events", "timetravel", "recover", "status", "storage"];
+const ROUTES = ["overview", "events", "forensics", "timetravel", "recover", "status", "storage"];
 
 const MON_STATE_TITLES = {
   failed: "connection is failing and retrying automatically; press Start for details",
@@ -574,6 +574,7 @@ function renderRoute() {
   switch (route) {
     case "overview": return renderOverview();
     case "events": return renderEvents(params);
+    case "forensics": return renderForensics(params);
     case "timetravel": return renderTimetravel(params);
     case "recover": return renderRecover(params);
     case "status": return renderStatus();
@@ -1005,6 +1006,329 @@ function downloadEventsCSV(events) {
   const lines = [EVENT_CSV_COLUMNS.join(",")];
   (events || []).forEach((ev) => lines.push(EVENT_CSV_COLUMNS.map((c) => csvCell(ev[c])).join(",")));
   downloadBlob("dbtrail-events.csv", lines.join("\r\n"), "text/csv");
+}
+
+// ── Forensics ────────────────────────────────────────────────────────────────
+// Who changed a row, and three general investigation queries (user activity,
+// connection history, DDL history) against the SOURCE server's
+// performance_schema / audit log (epic #701). Unlike Events (index-only),
+// these hit /api/forensics/*. Capabilities and who-changed degrade to a setup
+// prompt / index-only attribution when the selected server has no source
+// connection configured — but user-activity, connection-history, and
+// ddl-history have no index-side fallback and error instead (handled the
+// same way any other query error is: renderError in the results panel).
+
+const FX_MODES = [
+  { id: "who_changed", label: "Who changed", desc: "Trace who modified rows in a table (schema and table required, PK optional)." },
+  { id: "user_activity", label: "User activity", desc: "Recent statements by a MySQL user." },
+  { id: "connection_history", label: "Connections", desc: "Current/recent connections from a user or host." },
+  { id: "ddl_history", label: "DDL history", desc: "Recent CREATE / ALTER / DROP statements." },
+];
+
+const FX_ACTIVITY_COLS = {
+  user_activity: [["user", "User"], ["host", "Host"], ["sql_text", "SQL"], ["duration_ms", "Duration (ms)"], ["rows_affected", "Rows affected"], ["connection_id", "Conn ID"]],
+  connection_history: [["user", "User"], ["host", "Host"], ["current_db", "Database"], ["command", "Command"], ["time_seconds", "Time (s)"], ["connection_id", "Conn ID"]],
+  ddl_history: [["user", "User"], ["host", "Host"], ["sql_text", "SQL"], ["duration_ms", "Duration (ms)"], ["connection_id", "Conn ID"]],
+};
+
+function renderForensics(params) {
+  // Landed on /forensics but the feature is gated off (direct URL, Back, or a
+  // stale bookmark) — same redirect-then-redispatch shape as Time-travel.
+  if (!capsCache.forensics) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
+  const v = VIEW(); clear(v);
+  v.append(pageHead("Forensics", el("p", { class: "page-sub", text:
+    "Investigate who changed a row, or what a user, connection, or schema did — reads your source database's performance_schema and audit log directly." })));
+
+  v.append(el("div", { class: "fx-caps", id: "fx-caps" }, el("div", { class: "view-loading", text: "Detecting forensic sources…" })));
+
+  const mode = (params && FX_MODES.some((m) => m.id === params.mode)) ? params.mode : "who_changed";
+  const tabs = el("div", { class: "fx-modes" });
+  FX_MODES.forEach((m) => tabs.append(el("button", {
+    type: "button", class: "fx-mode-tab" + (m.id === mode ? " on" : ""),
+    onclick: () => navigate("forensics", { mode: m.id }, true), text: m.label,
+  })));
+  v.append(tabs);
+  v.append(el("p", { class: "fx-mode-desc", text: (FX_MODES.find((m) => m.id === mode) || FX_MODES[0]).desc }));
+
+  const form = el("form", { class: "filters", id: "fx-form" });
+  if (mode === "who_changed" || mode === "ddl_history") {
+    form.append(fieldSelect("Schema", "schema", "md", true, false, null, "— select —", mode === "who_changed"));
+  }
+  if (mode === "who_changed") {
+    form.append(fieldSelect("Table", "table", "md", false, true, null, null, true));
+    form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
+  }
+  if (mode === "user_activity" || mode === "connection_history") {
+    form.append(fieldInput("User", "user", "md", "app_rw", mode === "user_activity"));
+  }
+  if (mode === "connection_history") {
+    form.append(fieldInput("Host", "host", "md", "10.0.1.%"));
+  }
+  form.append(fieldInput("Since", "since", "md", "YYYY-MM-DD HH:MM"));
+  form.append(fieldInput("Until", "until", "md", "YYYY-MM-DD HH:MM"));
+  form.append(fieldSelect("Limit", "limit", "sm", false, false, ["50", "100", "500"], null));
+  form.append(fieldSelect("Order", "order", "sm", false, false, ["DESC", "ASC"], null));
+  const actions = el("div", { class: "filter-actions" });
+  actions.append(el("button", { class: "btn btn-primary", type: "submit", text: "Investigate" }));
+  form.append(actions);
+  v.append(form);
+
+  v.append(el("div", { id: "fx-warnings", class: "warnings" }));
+  const out = el("div", { id: "fx-out" });
+  out.append(el("div", { class: "ev-empty", text: "Set the filters above and run an investigation." }));
+  v.append(out);
+
+  form.addEventListener("submit", (e) => { e.preventDefault(); runForensicsQuery(mode, form); });
+  if (mode === "who_changed" || mode === "ddl_history") { wireSchemaCascade(form); populateSchemas(form); }
+
+  fxLoadCapabilities();
+  viewEnter();
+}
+
+async function fxLoadCapabilities() {
+  const gen = serverGen;
+  const box = $("#fx-caps", VIEW());
+  if (!box) return;
+  try {
+    // api() returns null for an empty-body 200 (a real shape on some other
+    // endpoints, e.g. DELETE) — this endpoint always serializes a full
+    // struct, but build the banner from {} rather than trust that forever.
+    const caps = (await api("/api/forensics/capabilities")) || {};
+    if (gen !== serverGen) return;
+    clear(box);
+    box.append(buildFxCapsBanner(caps));
+  } catch (err) {
+    if (gen !== serverGen) return;
+    clear(box); renderError(box, err);
+  }
+}
+
+function buildFxCapsBanner(caps) {
+  const wrap = el("div", { class: "fx-caps-banner" });
+  if (!caps.source_configured) {
+    wrap.append(el("div", { class: "stg-empty" },
+      el("p", { class: "stg-empty-lead", text: "No source connection configured for this server." }),
+      el("p", { class: "stg-empty-sub", text:
+        "Who-changed still works from the index alone (connection_cache and binlog-only attribution), but user activity, " +
+        "connection history, and DDL history all read the source directly. Add a source connection from Manage servers → Edit to unlock them." })));
+    return wrap;
+  }
+  const ps = caps.performance_schema || {};
+  const al = caps.audit_log || {};
+  const row = el("div", { class: "fx-caps-row" });
+  row.append(el("div", { class: "fx-caps-item" },
+    el("span", { class: "fx-caps-dot" + (ps.enabled ? " on" : "") }),
+    el("span", { class: "fx-caps-label", text: "performance_schema" }),
+    ps.enabled ? el("span", { class: "fx-caps-detail", text: fxPerfSchemaDetail(ps) }) : null));
+  row.append(el("div", { class: "fx-caps-item" },
+    el("span", { class: "fx-caps-dot" + (al.installed ? " on" : "") }),
+    el("span", { class: "fx-caps-label", text: "audit log" }),
+    (al.installed && al.variant) ? el("span", { class: "fx-caps-detail", text: al.variant }) : null));
+  wrap.append(row);
+  if (!ps.enabled && !al.installed) {
+    wrap.append(el("div", { class: "warn-item" }, icon("warn"),
+      el("span", { text: "No forensic sources detected on this server — results fall back to index-only attribution and fallback SQL." })));
+  }
+  if (caps.setup_guide && caps.setup_guide.recommendations && caps.setup_guide.recommendations.length) {
+    wrap.append(buildFxGuide(caps.setup_guide));
+  }
+  return wrap;
+}
+
+function fxPerfSchemaDetail(ps) {
+  const c = ps.consumers || {};
+  return [
+    c.events_statements_history_long ? "history_long" : null,
+    c.events_statements_history ? "history" : null,
+    ps.threads_accessible ? "threads" : null,
+  ].filter(Boolean).join(" + ");
+}
+
+function buildFxGuide(guide) {
+  const panel = el("div", { class: "fx-guide" });
+  const toggle = el("button", { class: "fx-guide-toggle", type: "button" },
+    el("span", { text: "Improve forensics data" }),
+    el("span", { class: "fx-guide-count", text: guide.recommendations.length + " recommendation" + (guide.recommendations.length === 1 ? "" : "s") }),
+    icon("caret", "ev-caret fx-guide-caret"));
+  const content = el("div", { class: "fx-guide-content", hidden: true });
+  content.append(el("p", { class: "stg-empty-sub", text: guide.summary }));
+  guide.recommendations.forEach((rec) => {
+    const card = el("div", { class: "fx-guide-rec" });
+    card.append(el("div", { class: "fx-guide-rec-head" },
+      el("span", { class: "fx-priority fx-priority-" + rec.priority, text: rec.priority }),
+      el("b", { text: rec.title }),
+      el("span", { class: "fx-caps-detail", text: rec.category.replace("_", " ") })));
+    card.append(el("p", { class: "stg-empty-sub", text: rec.description }));
+    if (rec.runtime_sql && rec.runtime_sql.length) {
+      card.append(buildFxCopyBlock("Runtime SQL (temporary, until restart)", rec.runtime_sql.join("\n\n")));
+    }
+    if (rec.mycnf_snippet) {
+      card.append(buildFxCopyBlock("my.cnf (persistent, survives restart)", rec.mycnf_snippet));
+    }
+    content.append(card);
+  });
+  toggle.addEventListener("click", () => {
+    const open = toggle.classList.toggle("on");
+    content.hidden = !open;
+  });
+  panel.append(toggle, content);
+  return panel;
+}
+
+function buildFxCopyBlock(label, text) {
+  const block = el("div", { class: "fx-sql-block" });
+  const copyBtn = el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Copy" });
+  copyBtn.addEventListener("click", () => navigator.clipboard.writeText(text).then(
+    () => { copyBtn.textContent = "Copied"; setTimeout(() => { copyBtn.textContent = "Copy"; }, 1500); },
+    () => toast("Copy failed.")));
+  block.append(el("div", { class: "fx-sql-block-head" }, el("span", { class: "form-hint", text: label }), copyBtn));
+  block.append(el("pre", { class: "fx-sql", text }));
+  return block;
+}
+
+async function runForensicsQuery(mode, form) {
+  const gen = serverGen;
+  const warns = $("#fx-warnings", VIEW());
+  const out = $("#fx-out", VIEW());
+  if (!out) return;
+  const f = Object.fromEntries(new FormData(form).entries());
+
+  if (mode === "who_changed" && (!f.schema || !f.table)) {
+    clear(warns); renderError(out, "Schema and table are required for who-changed."); return;
+  }
+  if (mode === "user_activity" && !f.user) {
+    clear(warns); renderError(out, "A user is required for user activity."); return;
+  }
+  if (mode === "connection_history" && !f.user && !f.host) {
+    clear(warns); renderError(out, "A user or host is required for connection history."); return;
+  }
+
+  clear(warns);
+  clear(out);
+  out.append(el("div", { class: "view-loading", text: "Investigating…" }));
+
+  try {
+    let data;
+    if (mode === "who_changed") {
+      data = await api("/api/forensics/who-changed", { method: "POST", body: {
+        schema: f.schema, table: f.table, pk: f.pk || undefined,
+        since: f.since || undefined, until: f.until || undefined,
+        limit: f.limit ? Number(f.limit) : undefined, order: f.order || undefined,
+      } });
+    } else {
+      data = await api("/api/forensics/activity", { method: "POST", body: {
+        query_type: mode, user: f.user || undefined, host: f.host || undefined,
+        schema: f.schema || undefined, since: f.since || undefined, until: f.until || undefined,
+        limit: f.limit ? Number(f.limit) : undefined, order: f.order || undefined,
+      } });
+    }
+    if (gen !== serverGen) return;
+    clear(out);
+    if (data.notes && data.notes.length) renderWarnings(warns, data.notes);
+    if (mode === "who_changed") buildWhoChangedTimeline(out, data);
+    else buildActivityTable(out, mode, data);
+    buildFallbackPanel(out, data.fallback_queries);
+  } catch (err) {
+    if (gen !== serverGen) return;
+    clear(out); renderError(out, err);
+  }
+}
+
+function buildWhoChangedTimeline(container, data) {
+  const events = data.events || [];
+  const bar = el("div", { class: "result-bar" });
+  bar.append(el("span", { class: "result-count" },
+    el("b", { text: String(data.total_count != null ? data.total_count : events.length) }), " change(s) found"));
+  if (data.applied_default_window) {
+    bar.append(el("span", { class: "fx-note-inline", text: "showing the last 24 hours (no time range given)" }));
+  }
+  container.append(bar);
+
+  if (!events.length) {
+    container.append(el("div", { class: "ev-empty", text: "No changes found. Try widening the time range or filters." }));
+    return;
+  }
+
+  const list = el("div", { class: "fx-timeline", id: "fx-timeline" });
+  events.forEach((e, i) => {
+    const a = e.attribution;
+    const summary = el("div", { class: "fx-timeline-summary", "data-fx-ev": i, tabindex: "0" },
+      badge(e.event_type),
+      el("span", { class: "ev-time", text: e.timestamp }),
+      el("span", { class: "ev-table", text: e.schema + "." + e.table }),
+      el("span", { class: "ev-pk", text: "PK: " + e.pk_values }),
+      a ? el("span", { class: "fx-who", text: a.user + (a.host ? "@" + a.host : "") })
+        : el("span", { class: "fx-who fx-who-unknown", text: "unattributed" }),
+      icon("caret", "ev-caret"));
+    const detail = el("div", { class: "fx-timeline-detail", hidden: true });
+    let built = false;
+    summary.addEventListener("click", () => {
+      const open = summary.classList.toggle("open");
+      detail.hidden = !open;
+      if (open && !built) { detail.append(buildFxWhoChangedDetail(e)); built = true; }
+    });
+    list.append(el("div", { class: "fx-timeline-item" },
+      el("div", { class: "fx-timeline-marker" }, el("span", { class: "fx-timeline-dot" })),
+      el("div", { class: "fx-timeline-content" }, summary, detail)));
+  });
+  container.append(list);
+}
+
+function buildFxWhoChangedDetail(e) {
+  const wrap = el("div", { class: "fx-detail" });
+  const a = e.attribution;
+  if (a) {
+    wrap.append(healthKV("User", el("span", { class: "kv-v", text: a.user || "—" })));
+    if (a.host) wrap.append(healthKV("Host", el("span", { class: "kv-v", text: a.host })));
+    if (e.connection_id != null) wrap.append(healthKV("Connection ID", el("span", { class: "kv-v", text: String(e.connection_id) })));
+    if (a.client_program) wrap.append(healthKV("Client", el("span", { class: "kv-v", text: a.client_program })));
+    wrap.append(healthKV("Source", el("span", { class: "kv-v", text: a.source })));
+    wrap.append(healthKV("Confidence", el("span", { class: "kv-v", text: a.confidence })));
+    if (a.audit_sql) wrap.append(buildFxCopyBlock("Matching audit-log record", a.audit_sql));
+  } else {
+    wrap.append(el("p", { class: "stg-empty-sub", text: "No forensic attribution available for this event." }));
+  }
+  if (e.query_text) wrap.append(buildFxCopyBlock("Captured statement (ROWS_QUERY / ANNOTATE_ROWS)", e.query_text));
+  return wrap;
+}
+
+function buildActivityTable(container, mode, data) {
+  const rows = (mode === "connection_history" ? data.connections : data.events) || [];
+  const bar = el("div", { class: "result-bar" });
+  bar.append(el("span", { class: "result-count" }, el("b", { text: String(data.count != null ? data.count : rows.length) }), " result(s)"));
+  if (data.source) bar.append(el("span", { class: "chip chip-mon", text: data.source }));
+  container.append(bar);
+  if (data.note) container.append(el("div", { class: "warn-item" }, icon("warn"), el("span", { text: data.note })));
+
+  if (!rows.length) {
+    container.append(el("div", { class: "ev-empty", text: "No results. Try widening the time range or filters." }));
+    return;
+  }
+  const cols = FX_ACTIVITY_COLS[mode] || FX_ACTIVITY_COLS.user_activity;
+  const table = el("table", { class: "fx-table" });
+  const headRow = el("tr");
+  cols.forEach(([, label]) => headRow.append(el("th", { text: label })));
+  const tbody = el("tbody");
+  rows.forEach((r) => {
+    const tr = el("tr");
+    cols.forEach(([key]) => {
+      let v = r[key];
+      if (key === "sql_text" && typeof v === "string" && v.length > 100) v = v.slice(0, 100) + "…";
+      tr.append(el("td", { text: v == null || v === "" ? "—" : String(v) }));
+    });
+    tbody.append(tr);
+  });
+  table.append(el("thead", {}, headRow), tbody);
+  container.append(el("div", { class: "fx-table-wrap" }, table));
+}
+
+function buildFallbackPanel(container, queries) {
+  if (!queries || !queries.length) return;
+  const panel = el("div", { class: "fx-fallback" });
+  panel.append(el("div", { class: "ov-panel-title", text: "Fallback SQL queries" }),
+    el("p", { class: "stg-empty-sub", text: "Run these manually against your source database to investigate further." }));
+  queries.forEach((fq) => panel.append(buildFxCopyBlock(fq.description, fq.sql)));
+  container.append(panel);
 }
 
 // ── Recover ────────────────────────────────────────────────────────────────

@@ -42,9 +42,11 @@ type recoverCascadeRequest struct {
 	AllowIncomplete bool `json:"allow_incomplete"`
 }
 
-// recoverCascadeResponse is text + structured coverage only — never event rows,
-// so it stays inside the free query_explorer boundary (connection_id can never
-// leak, exactly like recoverResponse).
+// recoverCascadeResponse is text + structured coverage only — never event
+// rows, so it stays outside the events-API boundary entirely (there is no
+// connection_id/query_text/query_hash field to gate here, exactly like
+// recoverResponse). This holds independent of the #701 D1 boundary move —
+// connection_id is no longer gated on the events API either, see dto.go.
 type recoverCascadeResponse struct {
 	SQL            string `json:"sql"`
 	StatementCount int    `json:"statement_count"`

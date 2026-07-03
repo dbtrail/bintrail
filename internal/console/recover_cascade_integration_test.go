@@ -94,8 +94,10 @@ func TestIntegrationRecoverCascade_endToEnd(t *testing.T) {
 	if !resp.Complete {
 		t.Errorf("a clean cascade with no archives should be complete; incomplete=%v", resp.Incomplete)
 	}
-	// connection_id is the paid-forensics boundary: it must never appear in the
-	// cascade response (the response carries SQL + counts only, no event rows).
+	// connection_id is no longer a redacted field on the events API (#701 D1),
+	// but this assertion was never really about that boundary: the cascade
+	// response carries SQL + counts only, never event rows, so the key has no
+	// path onto the wire here regardless. Kept as a shape guard.
 	if strings.Contains(string(body), "connection_id") {
 		t.Errorf("connection_id leaked into the cascade response: %s", body)
 	}
@@ -219,8 +221,9 @@ func TestIntegrationRecover_autoCascade_endToEnd(t *testing.T) {
 	if c := strings.Count(resp.SQL, "`"+dbName+"`.`child`"); c != 2 {
 		t.Errorf("want 2 child INSERTs, got %d\n---\n%s", c, resp.SQL)
 	}
-	// connection_id is the paid-forensics boundary: the merged response carries SQL
-	// + counts only (no event rows), exactly like the legacy cascade endpoint.
+	// Same shape guard as the cascade endpoint above (#701 D1 note): the merged
+	// response carries SQL + counts only, no event rows, so connection_id has
+	// no path onto the wire here independent of the events-API boundary.
 	if strings.Contains(string(body), "connection_id") {
 		t.Errorf("connection_id leaked into the recover response: %s", body)
 	}

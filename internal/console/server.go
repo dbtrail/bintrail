@@ -348,6 +348,16 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("POST /api/recover-cascade", s.handleRecoverCascade)
 	api.HandleFunc("GET /api/capabilities", s.handleCapabilities)
 	api.HandleFunc("GET /api/reconstruct", s.handleReconstruct)
+	// Forensics investigation surface (epic #701): who changed a row, and the
+	// three general activity queries. Selected-server-scoped via the same
+	// X-Bintrail-Server header as /api/events, not the /api/servers/{id}/...
+	// path convention — forensics is a passive investigative tab bound to
+	// whichever server the UI has selected, like Events/Explorer, not an
+	// explicitly-targeted background action like verify/baseline.
+	api.HandleFunc("GET /api/forensics/capabilities", s.handleForensicsCapabilities)
+	api.HandleFunc("GET /api/forensics/users", s.handleForensicsUsers)
+	api.HandleFunc("POST /api/forensics/who-changed", s.handleForensicsWhoChanged)
+	api.HandleFunc("POST /api/forensics/activity", s.handleForensicsActivity)
 	// Storage surfaces (read-only): the selected server's baseline snapshot
 	// listing, and the process's ambient AWS credential signals (presence
 	// booleans and non-secret names — never values).

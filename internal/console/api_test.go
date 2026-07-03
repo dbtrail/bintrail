@@ -101,10 +101,12 @@ func TestBuildOptionsAttachesRBAC(t *testing.T) {
 	}
 }
 
-// TestEventsHandlerOmitsConnectionID exercises handleEvents at the HTTP layer
-// with sqlmock and asserts the open-core boundary holds over real data flow:
-// the source row carries connection_id, the response must not.
-func TestEventsHandlerOmitsConnectionID(t *testing.T) {
+// TestEventsHandlerIncludesConnectionID exercises handleEvents at the HTTP
+// layer with sqlmock and asserts the #701 D1 boundary move holds over real
+// data flow: the source row carries connection_id, and the response now does
+// too — while query_text/query_hash (#699, untouched by this epic) still
+// never reach the wire.
+func TestEventsHandlerIncludesConnectionID(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
@@ -142,8 +144,8 @@ func TestEventsHandlerOmitsConnectionID(t *testing.T) {
 			t.Errorf("events response must not contain %q: %s", banned, body)
 		}
 	}
-	if strings.Contains(body, "connection_id") || strings.Contains(body, "4242") {
-		t.Errorf("events HTTP response leaked connection_id: %s", body)
+	if !strings.Contains(body, "connection_id") || !strings.Contains(body, "4242") {
+		t.Errorf("events HTTP response must carry connection_id (#701 D1): %s", body)
 	}
 	var resp eventsResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {

@@ -12,10 +12,12 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
-// TestEventDTOOmitsConnectionID is the load-bearing open-core test: the events
-// API must never expose connection_id (actor attribution = paid forensics),
-// nor query_text/query_hash (statement attribution = paid forensics, #699).
-func TestEventDTOOmitsConnectionID(t *testing.T) {
+// TestEventDTOIncludesConnectionID is the load-bearing open-core test,
+// updated for epic #701 decision D1: the events API now exposes connection_id
+// (the entitlement seam moved to internal/forensics.Enabled, checked at
+// surface entry points) but still omits query_text/query_hash — a distinct,
+// still-live boundary (#699) this epic does not touch.
+func TestEventDTOIncludesConnectionID(t *testing.T) {
 	cid := uint32(98765)
 	gtid := "uuid:1-10"
 	qText := "UPDATE users SET email='b@x' WHERE id=42"
@@ -42,13 +44,14 @@ func TestEventDTOOmitsConnectionID(t *testing.T) {
 	}
 	js := string(b)
 
-	// …but must NOT cross into the redacted wire view.
-	if strings.Contains(js, "connection_id") {
-		t.Errorf("eventDTO JSON must not contain connection_id key: %s", js)
+	// …and now crosses into the wire view.
+	if !strings.Contains(js, "connection_id") {
+		t.Errorf("eventDTO JSON must contain the connection_id key: %s", js)
 	}
-	if strings.Contains(js, "98765") {
-		t.Errorf("eventDTO JSON must not leak the connection id value: %s", js)
+	if !strings.Contains(js, "98765") {
+		t.Errorf("eventDTO JSON must carry the connection id value: %s", js)
 	}
+	// …but query_text/query_hash (#699) still must not.
 	if strings.Contains(js, "query_text") || strings.Contains(js, "query_hash") {
 		t.Errorf("eventDTO JSON must not contain query_text/query_hash keys: %s", js)
 	}
@@ -58,7 +61,7 @@ func TestEventDTOOmitsConnectionID(t *testing.T) {
 
 	for _, want := range []string{
 		"event_id", "schema_name", "table_name", "event_type",
-		"pk_values", "changed_columns", "row_before", "row_after", "gtid",
+		"pk_values", "changed_columns", "row_before", "row_after", "gtid", "connection_id",
 	} {
 		if !strings.Contains(js, want) {
 			t.Errorf("eventDTO JSON missing expected field %q: %s", want, js)
@@ -71,6 +74,9 @@ func TestEventDTOOmitsConnectionID(t *testing.T) {
 	}
 	if dto.EventTimestamp != "2026-01-02 03:04:05" {
 		t.Errorf("EventTimestamp = %q, want 2026-01-02 03:04:05", dto.EventTimestamp)
+	}
+	if dto.ConnectionID == nil || *dto.ConnectionID != cid {
+		t.Errorf("ConnectionID = %v, want %d", dto.ConnectionID, cid)
 	}
 }
 
@@ -100,6 +106,8 @@ func TestToEventDTOsNonNil(t *testing.T) {
 // may expose. A new field added to eventDTO (or a future sensitive field on
 // query.ResultRow copied through toEventDTO) fails this test until the allowlist
 // is consciously updated — catching a leak that name-specific checks would miss.
+// connection_id is on the allowlist (#701 D1); query_text/query_hash are not
+// (#699, untouched by this epic).
 func TestEventDTOFieldAllowlist(t *testing.T) {
 	cid := uint32(1)
 	gtid := "g:1"
@@ -125,7 +133,7 @@ func TestEventDTOFieldAllowlist(t *testing.T) {
 	sort.Strings(got)
 
 	want := []string{
-		"binlog_file", "changed_columns", "end_pos", "event_id",
+		"binlog_file", "changed_columns", "connection_id", "end_pos", "event_id",
 		"event_timestamp", "event_type", "gtid", "pk_values",
 		"row_after", "row_before", "schema_name", "start_pos", "table_name",
 	}

@@ -13,15 +13,18 @@ const consoleTSFormat = "2006-01-02 15:04:05"
 // eventDTO is the JSON-serialisable view of a query.ResultRow exposed by the
 // console's read-only API.
 //
-// It deliberately OMITS connection_id, query_text, and query_hash. Those
-// fields — the MySQL pseudo_thread_id of the transaction that produced the
-// change, and the originating SQL statement + its STATEMENT_DIGEST (#699) —
-// are actor/statement-attribution data and belong to the paid "forensics"
-// surface (who-changed / what-statement / audit), not the free
-// "query_explorer" surface this console exposes. The omission is the entire
-// open-core boundary for the events API: query.ResultRow carries those fields,
-// the package's own jsonRow serialises them, but this DTO drops them on the
-// way out. Do not add them here without crossing the licensing line.
+// connection_id is INCLUDED (epic #701 decision D1): the scattered
+// per-field redaction that used to hide it here is retired in favor of a
+// single entitlement seam, internal/forensics.Enabled, checked at surface
+// entry points (this console's forensics_api.go among them). dbtrail OSS
+// ships forensics enabled today, so the general events surface carries the
+// same session-identity field the forensics surface does — there is no
+// separate "free" events view to protect it from anymore.
+//
+// query_text and query_hash remain OMITTED. That is a distinct, still-live
+// boundary (#699, "what statement produced this row") that this epic does
+// NOT touch — this DTO has simply never grown a consumer for statement text.
+// Do not add them here without a surface that actually reads them.
 type eventDTO struct {
 	EventID        uint64         `json:"event_id"`
 	BinlogFile     string         `json:"binlog_file"`
@@ -29,6 +32,7 @@ type eventDTO struct {
 	EndPos         uint64         `json:"end_pos"`
 	EventTimestamp string         `json:"event_timestamp"`
 	GTID           *string        `json:"gtid"`
+	ConnectionID   *uint32        `json:"connection_id"`
 	SchemaName     string         `json:"schema_name"`
 	TableName      string         `json:"table_name"`
 	EventType      string         `json:"event_type"`
@@ -38,9 +42,9 @@ type eventDTO struct {
 	RowAfter       map[string]any `json:"row_after"`
 }
 
-// toEventDTO maps a query.ResultRow to the redacted wire view, dropping
-// connection_id/query_text/query_hash and stringifying the event type and
-// timestamp.
+// toEventDTO maps a query.ResultRow to the wire view: connection_id now
+// passes through (#701 D1); query_text/query_hash are still dropped (#699);
+// the event type and timestamp are stringified.
 func toEventDTO(r query.ResultRow) eventDTO {
 	return eventDTO{
 		EventID:        r.EventID,
@@ -49,6 +53,7 @@ func toEventDTO(r query.ResultRow) eventDTO {
 		EndPos:         r.EndPos,
 		EventTimestamp: r.EventTimestamp.Format(consoleTSFormat),
 		GTID:           r.GTID,
+		ConnectionID:   r.ConnectionID,
 		SchemaName:     r.SchemaName,
 		TableName:      r.TableName,
 		EventType:      eventTypeName(r.EventType),

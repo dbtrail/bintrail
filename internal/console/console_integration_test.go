@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -65,8 +66,11 @@ func TestIntegrationEventsAPI(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("events code = %d, body = %s", rec.Code, body)
 	}
-	if strings.Contains(string(body), "connection_id") {
-		t.Errorf("events response must not contain connection_id: %s", body)
+	// #701 D1: connection_id is no longer a redacted field on the events API —
+	// the entitlement seam moved to forensics.Enabled, checked at surface entry
+	// points, not per-field here.
+	if !strings.Contains(string(body), "connection_id") {
+		t.Errorf("events response must contain connection_id (#701 D1): %s", body)
 	}
 	var resp eventsResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -74,6 +78,60 @@ func TestIntegrationEventsAPI(t *testing.T) {
 	}
 	if resp.Count != 2 {
 		t.Errorf("event count = %d, want 2", resp.Count)
+	}
+}
+
+// TestIntegrationForensicsCapabilitiesAndUsers_realSource drives GET
+// /api/forensics/capabilities and /api/forensics/users against a server whose
+// SourceDSN points at the real test MySQL — the "source configured and
+// reachable" success path forensics_api_test.go's sqlmock-based tests can't
+// reach (config.Connect opens a real DSN, not an injectable seam). Without
+// this, breaking openForensicsSource so it always reports "not configured"
+// would pass every existing test.
+func TestIntegrationForensicsCapabilitiesAndUsers_realSource(t *testing.T) {
+	srv, _ := seedConsoleData(t)
+	_, idxDBName := testutil.CreateTestDB(t)
+
+	rec, body := doReq(t, srv, "POST", "/api/servers", `{
+		"name":"fx-src",
+		"host":"127.0.0.1","port":"13306","user":"root","password":"testroot","dbname":"`+idxDBName+`",
+		"source_host":"127.0.0.1","source_port":"13306","source_user":"root","source_password":"testroot"
+	}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create server: status = %d, body = %s", rec.Code, body)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, body = doReqOn(t, srv, created.ID, "GET", "/api/forensics/capabilities", "")
+	if rec.Code != 200 {
+		t.Fatalf("capabilities: status = %d, body = %s", rec.Code, body)
+	}
+	var caps forensicsCapabilitiesResponse
+	if err := json.Unmarshal(body, &caps); err != nil {
+		t.Fatal(err)
+	}
+	if !caps.SourceConfigured {
+		t.Errorf("source_configured should be true for a server with a real, reachable source: %s", body)
+	}
+	if caps.ServerInfo.Version == "" {
+		t.Errorf("expected a real server_info.version detected from a live MySQL connection: %s", body)
+	}
+
+	rec, body = doReqOn(t, srv, created.ID, "GET", "/api/forensics/users", "")
+	if rec.Code != 200 {
+		t.Fatalf("users: status = %d, body = %s", rec.Code, body)
+	}
+	var usersResp forensicsUsersResponse
+	if err := json.Unmarshal(body, &usersResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(usersResp.Users) == 0 {
+		t.Errorf("expected at least one real MySQL user account (root) from mysql.user: %s", body)
 	}
 }
 

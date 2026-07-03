@@ -151,6 +151,107 @@ try {
     ? ok("form: advanced section expanded for a BYO-index entry")
     : bad("form: advanced section expanded for a BYO-index entry", "collapsed — the byoIndex open-arm regressed");
 
+  // Scenario 5b — Forensics (#708): the "byo-idx" server just created has NO
+  // source configured but points at a real, schema-migrated index carrying
+  // one row run.sh seeded directly — covering both required states in one
+  // fixture: the no-source setup prompt, and the who-changed happy path.
+  //
+  // Bumps serverGen and clears schemaCache/tablesCache by hand rather than
+  // calling switchServer(): switchServer's own renderRoute() re-renders
+  // whatever route is CURRENT (still whatever scenario 4 left it on) before
+  // this scenario's navigate("forensics") fires — two renders racing under
+  // the SAME just-bumped serverGen (navigate() doesn't bump it further), so
+  // if the first (stale-route) render's fetch resolves after forensics has
+  // already painted, its own serverGen check still passes and it clobbers
+  // #view out from under this scenario. Bumping/clearing without triggering
+  // a render, then navigating exactly once, avoids the race while still
+  // fixing the cache-poisoning switchServer would have fixed.
+  await page.evaluate(() => closeServersModal());
+  await page.evaluate((id) => { setCurrentServer(id); serverGen++; schemaCache = null; tablesCache.clear(); }, byoId);
+  await page.evaluate(() => navigate("forensics"));
+  await page.waitForSelector("#fx-caps", { timeout: 5000 });
+  await page.waitForFunction(
+    () => !document.getElementById("fx-caps").querySelector(".view-loading"),
+    { timeout: 8000 },
+  );
+  const capsGate = await page.evaluate(() => ({
+    navVisible: (() => {
+      const n = document.querySelector('.nav-item[data-route="forensics"]');
+      return !!n && getComputedStyle(n).display !== "none";
+    })(),
+    noSourcePrompt: /No source connection configured/.test(document.getElementById("fx-caps").textContent),
+  }));
+  capsGate.navVisible
+    ? ok("forensics: nav item visible (capsCache.forensics gate)")
+    : bad("forensics: nav item visible (capsCache.forensics gate)", "hidden — forensics capability not advertised");
+  capsGate.noSourcePrompt
+    ? ok("forensics: no-source-configured setup prompt renders")
+    : bad("forensics: no-source-configured setup prompt renders", "expected copy missing from #fx-caps");
+
+  await page.waitForFunction(
+    () => { const s = document.querySelector('#fx-form [name="schema"]'); return s && [...s.options].some((o) => o.value === "fx_e2e"); },
+    { timeout: 8000 },
+  );
+  await page.evaluate(() => {
+    const form = document.getElementById("fx-form");
+    form.elements.schema.value = "fx_e2e";
+    form.elements.schema.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  // loadTables() (fired by the change event above) is async and its latency
+  // depends on whether byo-idx's bundle is already open (single-flighted lazy
+  // connect) — poll for the real "probe" option instead of a fixed sleep, so
+  // this doesn't flake under load.
+  await page.waitForFunction(
+    () => { const s = document.querySelector('#fx-form [name="table"]'); return s && [...s.options].some((o) => o.value === "probe"); },
+    { timeout: 8000 },
+  );
+  await page.evaluate(() => {
+    const form = document.getElementById("fx-form");
+    form.elements.table.value = "probe";
+    form.elements.since.value = "2000-01-01 00:00:00";
+    form.requestSubmit();
+  });
+  // The query itself is async (index fetch, possibly a lazy bundle open) —
+  // poll for either outcome (timeline rendered, or an error box) rather than
+  // a fixed sleep.
+  await page.waitForFunction(
+    () => !!document.getElementById("fx-timeline") || !!document.querySelector("#fx-out .error, #fx-out .empty"),
+    { timeout: 8000 },
+  );
+  const who = await page.evaluate(() => {
+    const timeline = document.getElementById("fx-timeline");
+    return {
+      rendered: !!timeline,
+      hasBadge: !!timeline && !!timeline.querySelector(".badge.b-update"),
+      hasPK: !!timeline && /PK: 1/.test(timeline.textContent),
+      fallbackPanel: !!document.querySelector(".fx-fallback"),
+    };
+  });
+  who.rendered
+    ? ok("forensics: who-changed happy path renders the timeline")
+    : bad("forensics: who-changed happy path renders the timeline", "no #fx-timeline");
+  who.hasBadge
+    ? ok("forensics: who-changed event shows its UPDATE badge")
+    : bad("forensics: who-changed event shows its UPDATE badge", "no .b-update badge");
+  who.hasPK
+    ? ok("forensics: who-changed event shows its PK")
+    : bad("forensics: who-changed event shows its PK", "PK: 1 not found in timeline");
+  who.fallbackPanel
+    ? ok("forensics: fallback SQL panel renders for an unattributed event")
+    : bad("forensics: fallback SQL panel renders for an unattributed event", "no .fx-fallback");
+
+  // Restore the default server selection and invalidate the caches byo-idx's
+  // populateSchemas call wrote into (same reasoning as the switch above: a
+  // bare setCurrentServer("") would restore the selection but leave
+  // schemaCache/tablesCache holding byo-idx's data). Bump/clear by hand
+  // rather than calling switchServer(), which would also fire its own
+  // renderRoute() — an extra, redundant re-render of the current (forensics)
+  // route racing scenario 6's very next navigate() under the same
+  // just-bumped serverGen, for the exact reason explained at the switch-in
+  // above. No render is needed here at all: scenario 6's navigate() builds
+  // whatever view it needs from a clean, cache-invalidated state.
+  await page.evaluate(() => { setCurrentServer(""); serverGen++; schemaCache = null; tablesCache.clear(); });
+
   // Scenario 6 — Recover/Cascade merge. Cascade recovery is no longer a separate
   // tab: it is auto-detected inside the single Recover flow (the backend routes by
   // detection and folds the invisible children into one script when the target is
