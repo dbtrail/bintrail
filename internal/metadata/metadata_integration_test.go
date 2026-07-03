@@ -401,6 +401,45 @@ func TestNewLatestPerTableResolver_mysqlEquivalenceAndDroppedTable(t *testing.T)
 	}
 }
 
+// TestNewLatestPerTableResolver_pre212WarnsPerTable pins the per-table
+// pre-#212 warning: in a union, one post-#212 table (column_type captured)
+// must NOT silence the warning for a retained table whose newest shape
+// predates column_type — and the warning must name the affected table.
+func TestNewLatestPerTableResolver_pre212WarnsPerTable(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	// "stale" (snapshot 1): data_type only — the pre-#212 signature.
+	testutil.InsertSnapshot(t, indexDB, 1, "2026-02-18 10:00:00", "mydb", "stale", "id", 1, "PRI", "int", "NO")
+	// "fresh" (snapshot 2): column_type present — post-#212.
+	if _, err := indexDB.Exec(`INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable)
+		VALUES (2, '2026-02-19 10:00:00', 'mydb', 'fresh', 'id', 1, 'PRI', 'int', 'int unsigned', 'NO')`); err != nil {
+		t.Fatalf("insert post-#212 row: %v", err)
+	}
+
+	var logbuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	if _, err := NewLatestPerTableResolver(indexDB); err != nil {
+		t.Fatalf("NewLatestPerTableResolver: %v", err)
+	}
+
+	logs := logbuf.String()
+	if !strings.Contains(logs, "predates column_type capture") {
+		t.Errorf("expected pre-#212 warning (a post-#212 table must not silence it); logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "mydb.stale") {
+		t.Errorf("warning must name the affected table mydb.stale; logs:\n%s", logs)
+	}
+	if strings.Contains(logs, "mydb.fresh") {
+		t.Errorf("warning must not name the post-#212 table mydb.fresh; logs:\n%s", logs)
+	}
+}
+
 // TestNewLatestPerTableResolver_empty pins the ErrNoSnapshots sentinel: an
 // empty schema_snapshots must return the same benign first-install signal
 // NewResolver does, so the shim's empty-set SHOW TABLES path keeps working.
