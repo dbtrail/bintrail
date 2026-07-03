@@ -71,9 +71,15 @@ func NewWriter(path string, cols []Column, cfg WriterConfig) (*Writer, error) {
 	// parquet.Group sorts Fields() alphabetically, so we must track the mapping.
 	parquetCols, mysqlOrder := sortColumnsForParquet(cols)
 
-	// Build parquet.Group from sorted columns.
+	// Build parquet.Group from sorted columns. A RawText column (PostgreSQL
+	// baseline, #593) is unconditionally an optional string — its values are
+	// stored verbatim, so the MySQL type mapping in ParquetType is bypassed.
 	group := make(parquet.Group, len(parquetCols))
 	for _, c := range parquetCols {
+		if c.RawText {
+			group[c.Name] = parquet.Optional(parquet.String())
+			continue
+		}
 		group[c.Name] = c.ParquetType
 	}
 	schema := parquet.NewSchema("row", group)
@@ -196,6 +202,11 @@ func sortColumnsForParquet(cols []Column) ([]Column, []int) {
 // convertValue converts a string value to the appropriate parquet.Value for the
 // column's MySQL type. Caller sets Level after.
 func convertValue(col Column, raw string) (parquet.Value, error) {
+	if col.RawText {
+		// PostgreSQL baseline (#593): the value is already the source's text
+		// rendering and is stored verbatim — no parsing, no type conversion.
+		return parquet.ByteArrayValue([]byte(raw)), nil
+	}
 	switch col.MySQLType {
 	case "tinyint", "smallint", "mediumint":
 		// These fit int32 whether signed or unsigned (max 16777215 for

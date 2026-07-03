@@ -16,6 +16,14 @@ type Column struct {
 	MySQLType   string // raw type token e.g. "int", "varchar", "datetime"
 	Unsigned    bool   // true when the column carries the UNSIGNED attribute
 	ParquetType parquet.Node
+	// RawText marks a column whose values are stored VERBATIM as optional
+	// Parquet strings, bypassing the MySQL type mapping entirely (both the
+	// schema node and convertValue). Used by the PostgreSQL baseline producer
+	// (#593): PG values arrive as pgoutput-style text and must round-trip
+	// byte-identically so the PK join with the delta path stays an identity
+	// string match — no type conversion, ever. MySQL callers never set it,
+	// so the mydumper paths are untouched.
+	RawText bool
 }
 
 // colRe matches a column definition line from mydumper's schema SQL output.

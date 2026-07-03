@@ -426,3 +426,53 @@ func ensureSlot(ctx context.Context, replConn *pgconn.PgConn, queryConn *pgx.Con
 	}
 	return lsn, nil
 }
+
+// EnsureSlotExists guarantees the named permanent pgoutput slot exists, creating
+// it when absent. It is the baseline producer's (#593) slot seam: the baseline
+// must ensure the slot BEFORE opening its snapshot transaction so the slot's
+// consistent_point ≤ the baseline anchor LSN (overlap redelivery is harmless —
+// reconstruct's merge is last-write-wins idempotent — but a slot created AFTER
+// the anchor would silently skip the deltas in between).
+//
+// replConnect lazily opens a REPLICATION connection (replication=database) and
+// is called ONLY when the slot must actually be created; pass nil when no
+// replication DSN is available, in which case a missing slot is an actionable
+// error rather than a silent skip. The caller owns closing the returned
+// connection — EnsureSlotExists closes it itself before returning.
+//
+// It shares ensureSlot's safety semantics: a wal_status=lost slot fails loud
+// (wrapping ErrSlotLost), and a create racing another capturer (SQLSTATE 42710)
+// is treated as success — the slot exists either way (the ensureSlot TOCTOU rule).
+// Returns created=true only when this call created the slot.
+func EnsureSlotExists(ctx context.Context, queryConn *pgx.Conn, slotName string, replConnect func(context.Context) (*pgconn.PgConn, error)) (created bool, err error) {
+	found, walStatus, err := querySlotState(ctx, queryConn, slotName)
+	if err != nil {
+		return false, err
+	}
+	if found && walStatus == WalStatusLost {
+		return false, fmt.Errorf("pgcapture: replication slot %q is invalidated (wal_status=lost; max_slot_wal_keep_size exceeded) — drop and recreate it (the stream must also re-baseline): %w", slotName, ErrSlotLost)
+	}
+	if found {
+		return false, nil
+	}
+	if replConnect == nil {
+		return false, fmt.Errorf("pgcapture: replication slot %q does not exist and no replication connection is configured — provide --repl-dsn (replication=database) so the slot can be created, or create it first (e.g. by running `bintrail-pg stream`)", slotName)
+	}
+	replConn, err := replConnect(ctx)
+	if err != nil {
+		return false, fmt.Errorf("pgcapture: connecting to create replication slot %q: %w", slotName, err)
+	}
+	defer replConn.Close(ctx)
+	_, err = pglogrepl.CreateReplicationSlot(ctx, replConn, slotName, "pgoutput", pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication})
+	if err != nil {
+		// TOCTOU: another capturer created the slot between the check and now
+		// (SQLSTATE 42710 = duplicate_object). The slot exists — that is what
+		// this function guarantees — so treat it as success.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.SQLState() == "42710" {
+			return false, nil
+		}
+		return false, fmt.Errorf("pgcapture: creating replication slot %q: %w", slotName, err)
+	}
+	return true, nil
+}

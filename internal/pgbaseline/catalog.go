@@ -1,0 +1,168 @@
+package pgbaseline
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/dbtrail/dbtrail/internal/event"
+)
+
+// tableInfo is one table selected for the baseline, discovered from
+// pg_publication_tables — the SAME view that defines what pgoutput streams, so
+// the baseline's table naming matches the delta path's by construction:
+// publish_via_partition_root=true lists (and streams) the partitioned PARENT;
+// false lists (and streams) the LEAF partitions. Either way the name here is
+// the name deltas arrive under, which is what makes the reconstruct merge join.
+type tableInfo struct {
+	Schema string
+	Table  string
+	// PartitionParent marks a partitioned table parent (relkind='p', i.e. the
+	// publication has publish_via_partition_root=true). COPY (SELECT ...) on
+	// the parent reads all partitions under the parent name — correct — but
+	// the operator must not flip pubviaroot between baseline and stream, or
+	// the names silently stop joining; discovery warns loudly on these.
+	PartitionParent bool
+	// LeafPartition marks a leaf of a partitioned table streamed under its own
+	// name (pubviaroot=false). Same flip warning applies.
+	LeafPartition bool
+
+	// Columns are the live, non-dropped, non-generated columns in attnum
+	// order, resolved inside the snapshot transaction (loadColumns).
+	Columns []string
+}
+
+// discoverTables lists the tables the publication streams, narrowed by the
+// client-side schema/table filters. It must run INSIDE the snapshot
+// transaction so the discovered set is consistent with the copied data.
+func discoverTables(ctx context.Context, conn *pgx.Conn, publication string, filters event.Filters, logger *slog.Logger) ([]tableInfo, error) {
+	// Existence first, so an absent publication gets the actionable message
+	// rather than an empty-set one (mirrors pgcapture.validatePublication).
+	var allTables bool
+	err := conn.QueryRow(ctx, `SELECT puballtables FROM pg_publication WHERE pubname = $1`, publication).Scan(&allTables)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("pgbaseline: publication %q does not exist — create it (CREATE PUBLICATION) covering the tables to capture", publication)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("pgbaseline: checking publication %q: %w", publication, err)
+	}
+
+	rows, err := conn.Query(ctx, `
+		SELECT pt.schemaname, pt.tablename, c.relkind = 'p', c.relispartition
+		FROM pg_publication_tables pt
+		JOIN pg_namespace n ON n.nspname = pt.schemaname
+		JOIN pg_class c ON c.relname = pt.tablename AND c.relnamespace = n.oid
+		WHERE pt.pubname = $1
+		ORDER BY pt.schemaname, pt.tablename`, publication)
+	if err != nil {
+		return nil, fmt.Errorf("pgbaseline: listing tables of publication %q: %w", publication, err)
+	}
+	defer rows.Close()
+
+	var tables []tableInfo
+	for rows.Next() {
+		var t tableInfo
+		if err := rows.Scan(&t.Schema, &t.Table, &t.PartitionParent, &t.LeafPartition); err != nil {
+			return nil, fmt.Errorf("pgbaseline: scanning tables of publication %q: %w", publication, err)
+		}
+		if !filters.Matches(t.Schema, t.Table) {
+			continue
+		}
+		tables = append(tables, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgbaseline: listing tables of publication %q: %w", publication, err)
+	}
+
+	warnPartitioned(tables, publication, logger)
+	return tables, nil
+}
+
+// warnPartitioned surfaces the partitioned-table naming contract (#593 sharp
+// edge, mirroring the TimescaleDB chunk warn in pgcapture): the baseline
+// stores each table under the name pg_publication_tables lists — the same
+// name pgoutput streams deltas under — so baseline and deltas join today.
+// What silently breaks the join is CHANGING publish_via_partition_root
+// between the baseline and the stream (parent-named baseline vs leaf-named
+// deltas, or vice versa: the merge finds no rows and reconstruct degrades to
+// baseline-only without an error). One warning per shape, not per table.
+func warnPartitioned(tables []tableInfo, publication string, logger *slog.Logger) {
+	var parents, leaves []string
+	for _, t := range tables {
+		if t.PartitionParent {
+			parents = append(parents, t.Schema+"."+t.Table)
+		}
+		if t.LeafPartition {
+			leaves = append(leaves, t.Schema+"."+t.Table)
+		}
+	}
+	sort.Strings(parents)
+	sort.Strings(leaves)
+	if len(parents) > 0 {
+		logger.Warn("pgbaseline: partitioned table parent(s) in publication — baseline reads ALL partitions under the PARENT name (publish_via_partition_root=true); do NOT change publish_via_partition_root afterwards or deltas will arrive under leaf names and silently never join this baseline",
+			"publication", publication, "tables", parents)
+	}
+	if len(leaves) > 0 {
+		logger.Warn("pgbaseline: leaf partition(s) in publication — baseline stores each LEAF under its own name (publish_via_partition_root=false); do NOT change publish_via_partition_root afterwards or deltas will arrive under the parent name and silently never join this baseline",
+			"publication", publication, "tables", leaves)
+	}
+}
+
+// loadColumns resolves a table's column list inside the snapshot transaction,
+// in attnum order: live (attnum>0), not dropped, and NOT generated.
+//
+// Generated-column decision (#593 sharp edge): GENERATED ALWAYS ... STORED
+// columns are EXCLUDED from the baseline on purpose. On PG 14–17 pgoutput
+// never publishes generated columns — the RelationMessage column list (which
+// internal/pgcapture's decoder maps tuples through) omits them, so delta row
+// images (row_before/row_after) do not carry them. Reconstruct's merge is
+// last-write-wins on whole row images: had the baseline included a generated
+// column, every TOUCHED row would lose it (row_after wins) while untouched
+// rows kept it — a silently inconsistent column set. Excluding it here keeps
+// baseline and delta column sets identical; the column is recomputed by
+// PostgreSQL on any re-INSERT anyway (recovery already omits generated
+// columns from reverse-INSERTs, #557). Dropped columns are excluded too,
+// which also matches the delta path.
+func loadColumns(ctx context.Context, conn *pgx.Conn, schema, table string, logger *slog.Logger) ([]string, error) {
+	rows, err := conn.Query(ctx, `
+		SELECT a.attname, a.attgenerated <> ''
+		FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2
+		  AND a.attnum > 0 AND NOT a.attisdropped
+		ORDER BY a.attnum`, schema, table)
+	if err != nil {
+		return nil, fmt.Errorf("pgbaseline: listing columns of %s.%s: %w", schema, table, err)
+	}
+	defer rows.Close()
+
+	var cols, generated []string
+	for rows.Next() {
+		var name string
+		var isGenerated bool
+		if err := rows.Scan(&name, &isGenerated); err != nil {
+			return nil, fmt.Errorf("pgbaseline: scanning columns of %s.%s: %w", schema, table, err)
+		}
+		if isGenerated {
+			generated = append(generated, name)
+			continue
+		}
+		cols = append(cols, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgbaseline: listing columns of %s.%s: %w", schema, table, err)
+	}
+	if len(generated) > 0 {
+		logger.Info("pgbaseline: excluding STORED generated column(s) — pgoutput does not stream them on PG 14–17, so the delta path never carries them; keeping them out of the baseline keeps the merged column set consistent (PostgreSQL recomputes them on re-INSERT)",
+			"table", schema+"."+table, "columns", generated)
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("pgbaseline: table %s.%s has no copyable columns (all dropped or generated)", schema, table)
+	}
+	return cols, nil
+}
