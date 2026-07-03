@@ -147,6 +147,12 @@ func runWhoChanged(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("source database unreachable: %w", err)
 		}
 		deps.SourceDB = sourceDB
+		// Carry the source host so the audit tier can reach the RDS/CloudWatch
+		// remote sources when the log lives on AWS-managed storage (RDS/Aurora)
+		// rather than a local file. The audit source normalizes host[:port].
+		if cfg, perr := mysqldriver.ParseDSN(wcSourceDSN); perr == nil {
+			deps.SourceHost = cfg.Addr
+		}
 	}
 
 	// Fetch through the shared live-index + archive pipeline (auto-discovery

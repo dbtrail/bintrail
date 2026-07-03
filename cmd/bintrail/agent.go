@@ -207,6 +207,12 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		defer db.Close()
 		sourceDB = db
 		handler.SourceDB = db
+		// Carry the source host so the forensics audit tier can reach the
+		// RDS/CloudWatch remote sources when this agent runs against a managed
+		// RDS/Aurora instance whose audit log is not on a local filesystem.
+		if host, _, _, _, perr := config.ParseSourceDSN(agtSourceDSN); perr == nil {
+			handler.SourceHost = host
+		}
 	}
 
 	// Capture source server identity (architecture §22.11) for BYOS metadata

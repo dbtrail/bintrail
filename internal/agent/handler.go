@@ -62,6 +62,13 @@ type DefaultHandler struct {
 	// Nil disables forensics_query support.
 	SourceDB *sql.DB
 
+	// SourceHost is the resolved host[:port] of the source server (from the
+	// agent's --source-dsn). It lets the audit-log tier reach the RDS/CloudWatch
+	// remote sources for a managed RDS/Aurora source whose audit log is not on
+	// a local filesystem. Empty => local-file audit reads only. A per-request
+	// ForensicsAuditLogRequest.SourceHost overrides it.
+	SourceHost string
+
 	// ArchiveSources lists Parquet archive paths (local dirs or s3:// URLs).
 	ArchiveSources []string
 
@@ -410,15 +417,25 @@ func (h *DefaultHandler) HandleForensicsAuditLog(ctx context.Context, req Forens
 	if err := h.requireSourceDB(); err != nil {
 		return forensics.AuditReadResult{}, err
 	}
+	// Per-request SourceHost wins; otherwise fall back to the agent's own
+	// source host so a BYOS agent on RDS/Aurora reaches the remote audit source
+	// without the caller having to supply the endpoint.
+	host := req.SourceHost
+	if host == "" {
+		host = h.SourceHost
+	}
 	return forensics.ReadAuditLog(ctx, h.SourceDB, forensics.AuditReadOptions{
-		Since:          req.Since,
-		Until:          req.Until,
-		User:           req.User,
-		EventType:      req.EventType,
-		Limit:          req.Limit,
-		Offset:         req.Offset,
-		IncludeRotated: req.IncludeRotated,
-		TailLines:      req.TailLines,
+		Since:              req.Since,
+		Until:              req.Until,
+		User:               req.User,
+		EventType:          req.EventType,
+		Limit:              req.Limit,
+		Offset:             req.Offset,
+		IncludeRotated:     req.IncludeRotated,
+		TailLines:          req.TailLines,
+		Source:             forensics.AuditSource(req.Source),
+		SourceHost:         host,
+		CloudWatchLogGroup: req.CloudWatchLogGroup,
 	})
 }
 
