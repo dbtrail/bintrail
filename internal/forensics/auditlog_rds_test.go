@@ -242,6 +242,135 @@ func TestRDSLogReader_MultiPage(t *testing.T) {
 	}
 }
 
+// semanticRDSClient emulates DownloadDBLogFilePortion's real Marker semantics
+// for the full-scan regression test: a call with neither Marker nor
+// NumberOfLines returns only the tail (per the AWS API, the most-recent portion
+// of the file); Marker="0" returns from the start.
+type semanticRDSClient struct {
+	fromStart string
+	tail      string
+	inputs    []rds.DownloadDBLogFilePortionInput
+	served    bool
+}
+
+func (m *semanticRDSClient) DescribeDBLogFiles(context.Context, *rds.DescribeDBLogFilesInput, ...func(*rds.Options)) (*rds.DescribeDBLogFilesOutput, error) {
+	return &rds.DescribeDBLogFilesOutput{}, nil
+}
+
+func (m *semanticRDSClient) DownloadDBLogFilePortion(_ context.Context, params *rds.DownloadDBLogFilePortionInput, _ ...func(*rds.Options)) (*rds.DownloadDBLogFilePortionOutput, error) {
+	m.inputs = append(m.inputs, *params)
+	if m.served {
+		empty := ""
+		return &rds.DownloadDBLogFilePortionOutput{LogFileData: &empty, AdditionalDataPending: boolPtr(false)}, nil
+	}
+	m.served = true
+	data := m.tail
+	if params.Marker != nil && *params.Marker == "0" {
+		data = m.fromStart
+	}
+	return &rds.DownloadDBLogFilePortionOutput{LogFileData: &data, AdditionalDataPending: boolPtr(false)}, nil
+}
+
+// TestRDSLogReader_FullScanStartsFromBeginning guards the blocker fix: a
+// non-tail (full) scan MUST send Marker="0" on the first
+// DownloadDBLogFilePortion call. With neither Marker nor NumberOfLines the RDS
+// API returns only the most-recent ~10000 lines / 1 MB (the tail), silently
+// dropping older records — precisely the who-changed full-scan path
+// (auditReadOptionsFor sets TailLines:-1). The semantic mock reproduces that
+// AWS behaviour, so this test fails on the pre-fix reader.
+func TestRDSLogReader_FullScanStartsFromBeginning(t *testing.T) {
+	const oldRec = "20260413 09:00:00,host,admin,10.0.0.1,42,100,QUERY,mydb,'oldest',0,,\n"
+	const newRec = "20260413 12:00:00,host,admin,10.0.0.1,42,101,QUERY,mydb,'newest',0,,\n"
+
+	sem := &semanticRDSClient{fromStart: oldRec + newRec, tail: newRec}
+	reader := newRDSLogReader(context.Background(), sem, "test-db", "audit/server_audit.log")
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	if len(sem.inputs) == 0 {
+		t.Fatal("no DownloadDBLogFilePortion call recorded")
+	}
+	if first := sem.inputs[0]; first.Marker == nil || *first.Marker != "0" {
+		t.Errorf("first full-scan call Marker = %v, want \"0\"; without it the RDS API returns only the tail and drops older records", first.Marker)
+	}
+	if !strings.Contains(string(got), "oldest") {
+		t.Error("full scan dropped the oldest record — the reader read only the tail (Marker=\"0\" not sent on the first call)")
+	}
+	if !strings.Contains(string(got), "newest") {
+		t.Error("full scan missing the newest record")
+	}
+}
+
+// TestRDSLogReader_EmptyPageWithPendingContinues guards against silently
+// truncating the scan: DownloadDBLogFilePortion may return an empty chunk with
+// AdditionalDataPending=true mid-file (e.g. an actively-written log). The reader
+// must follow the marker to the next page, not treat the empty chunk as EOF.
+func TestRDSLogReader_EmptyPageWithPendingContinues(t *testing.T) {
+	empty := ""
+	realData := "20260413 12:00:00,host,admin,10.0.0.1,42,100,QUERY,mydb,'SELECT 1',0,,\n"
+	m1 := "m1"
+	mock := &mockRDSClient{
+		downloadPages: []*rds.DownloadDBLogFilePortionOutput{
+			{LogFileData: &empty, AdditionalDataPending: boolPtr(true), Marker: &m1},
+			{LogFileData: &realData, AdditionalDataPending: boolPtr(false)},
+		},
+	}
+	reader := newRDSLogReader(context.Background(), mock, "test-db", "audit/server_audit.log")
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(got) != realData {
+		t.Errorf("got %q, want %q — an empty page with AdditionalDataPending=true must not end the scan", string(got), realData)
+	}
+	if mock.downloadCalls != 2 {
+		t.Errorf("download calls = %d, want 2 (must fetch past the empty page)", mock.downloadCalls)
+	}
+}
+
+// TestRDSLogReader_PendingWithoutMarkerErrors: if AWS reports more data pending
+// but returns no marker to continue, the reader must error rather than re-issue
+// a marker-less request (which would silently re-fetch the tail forever).
+func TestRDSLogReader_PendingWithoutMarkerErrors(t *testing.T) {
+	data := "20260413 12:00:00,host,admin,10.0.0.1,42,100,QUERY,mydb,'SELECT 1',0,,\n"
+	mock := &mockRDSClient{
+		downloadPages: []*rds.DownloadDBLogFilePortionOutput{
+			{LogFileData: &data, AdditionalDataPending: boolPtr(true)}, // pending, but no Marker
+		},
+	}
+	reader := newRDSLogReader(context.Background(), mock, "test-db", "audit/server_audit.log")
+	_, err := io.ReadAll(reader)
+	if err == nil {
+		t.Fatal("expected an error when RDS reports data pending but returns no marker to continue")
+	}
+	if !strings.Contains(err.Error(), "no marker to continue") {
+		t.Errorf("error = %v, want a 'no marker to continue' message", err)
+	}
+}
+
+// TestRDSLogReader_PendingNonAdvancingMarkerErrors: an empty page that keeps
+// reporting pending with an unchanged marker must break rather than loop.
+func TestRDSLogReader_PendingNonAdvancingMarkerErrors(t *testing.T) {
+	empty := ""
+	stuck := "stuck"
+	mock := &mockRDSClient{
+		downloadPages: []*rds.DownloadDBLogFilePortionOutput{
+			{LogFileData: &empty, AdditionalDataPending: boolPtr(true), Marker: &stuck},
+			{LogFileData: &empty, AdditionalDataPending: boolPtr(true), Marker: &stuck},
+		},
+	}
+	reader := newRDSLogReader(context.Background(), mock, "test-db", "audit/server_audit.log")
+	_, err := io.ReadAll(reader)
+	if err == nil {
+		t.Fatal("expected an error when an empty page reports pending without advancing the marker")
+	}
+	if !strings.Contains(err.Error(), "without advancing the marker") {
+		t.Errorf("error = %v, want a non-advancing-marker message", err)
+	}
+}
+
 func TestRDSLogReader_EmptyFile(t *testing.T) {
 	empty := ""
 	mock := &mockRDSClient{

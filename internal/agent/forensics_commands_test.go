@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/dbtrail/dbtrail/internal/forensics"
 )
 
@@ -330,5 +331,52 @@ func TestDefaultHandler_forensicsCommandsRequireSourceDSN(t *testing.T) {
 				t.Errorf("error = %v, want 'require --source-dsn'", err)
 			}
 		})
+	}
+}
+
+// TestResolveAuditSourceHost pins the audit-source-host resolution the RDS/
+// CloudWatch remote reader depends on (#705): a per-request SourceHost wins,
+// otherwise the agent's own source host (from --source-dsn). An empty result
+// keeps the audit tier on the local-file path — the exact wiring gap that made
+// the RDS/Aurora reader dead code before it was threaded through, so this
+// guards against a refactor silently dropping the fallback.
+func TestResolveAuditSourceHost(t *testing.T) {
+	tests := []struct {
+		name        string
+		reqHost     string
+		handlerHost string
+		want        string
+	}{
+		{"request overrides handler", "req.us-east-1.rds.amazonaws.com", "agent.us-west-2.rds.amazonaws.com", "req.us-east-1.rds.amazonaws.com"},
+		{"falls back to agent source host", "", "agent.us-west-2.rds.amazonaws.com", "agent.us-west-2.rds.amazonaws.com"},
+		{"both empty stays local-only", "", "", ""},
+		{"request set, handler empty", "req.eu-west-1.rds.amazonaws.com", "", "req.eu-west-1.rds.amazonaws.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveAuditSourceHost(tt.reqHost, tt.handlerHost); got != tt.want {
+				t.Errorf("resolveAuditSourceHost(%q, %q) = %q, want %q", tt.reqHost, tt.handlerHost, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHandleForensicsAuditLog_ThreadsSource proves HandleForensicsAuditLog
+// passes req.Source into the AuditReadOptions it hands to ReadAuditLog: an
+// unsupported source reaches ReadAuditLog's dispatch and errors immediately
+// (before any SQL/AWS), which only happens if the field is threaded — a dropped
+// Source would default to "" (auto) and not produce this error. Complements
+// TestResolveAuditSourceHost, which pins the host fallback logic.
+func TestHandleForensicsAuditLog_ThreadsSource(t *testing.T) {
+	db, _, err := sqlmock.New() // no queries expected: dispatch errors first
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	h := &DefaultHandler{SourceDB: db, SourceHost: "agent.host"}
+	_, err = h.HandleForensicsAuditLog(context.Background(), ForensicsAuditLogRequest{Source: "bogus-source"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported audit source") {
+		t.Fatalf("err = %v, want 'unsupported audit source' — req.Source not threaded into the read options?", err)
 	}
 }

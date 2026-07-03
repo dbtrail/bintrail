@@ -9,12 +9,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -297,6 +299,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 			"results", n,
 			"format", qFormat,
 			"duration_ms", time.Since(start).Milliseconds())
+		auditQueryRun(cmd.Context(), n)
 		if qFormat == "table" && n > 0 {
 			fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
 		}
@@ -372,6 +375,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		"results", n,
 		"format", qFormat,
 		"duration_ms", time.Since(start).Milliseconds())
+	auditQueryRun(cmd.Context(), n)
 	if qFormat == "table" && n > 0 {
 		fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
 	}
@@ -670,4 +674,21 @@ func archiveSources() []string {
 		sources = append(sources, base+"/bintrail_id="+qBintrailID)
 	}
 	return sources
+}
+
+// auditQueryRun reports a completed index query to the audit seam.
+// ext.Record is a no-op unless an embedding distribution installed a
+// sink — the OSS binary pays one nil check.
+func auditQueryRun(ctx context.Context, results int) {
+	ext.Record(ctx, ext.AuditEvent{
+		Surface: "cli",
+		Action:  "query.run",
+		Actor:   ext.ProcessActor(qProfile),
+		Schema:  qSchema,
+		Table:   qTable,
+		Detail: map[string]string{
+			"results": strconv.Itoa(results),
+			"format":  qFormat,
+		},
+	})
 }
