@@ -32,7 +32,7 @@ func makeRecoverEvent(now time.Time, pk string, gtid string) parser.Event {
 }
 
 // TestHandleRecover_filterByGTID is the regression test for
-// nethalo/dbtrail#1512.  The SaaS side forwards ``params.gtid`` in the
+// nethalo/dbtrail#1512.  The SaaS side forwards “params.gtid“ in the
 // WebSocket recover payload; this test confirms the BYOS agent honours
 // it as the precise scope and ignores other events in the same table.
 //
@@ -172,7 +172,7 @@ func TestHandleRecover_gtidNoMatch_largeFallback(t *testing.T) {
 }
 
 // TestRecoverRequestJSON_gtid pins the wire format: the SaaS side sends
-// ``"gtid"`` (lowercase) and the agent must decode it into the GTID
+// “"gtid"“ (lowercase) and the agent must decode it into the GTID
 // field.  A typo in the JSON tag would silently drop the field again.
 func TestRecoverRequestJSON_gtid(t *testing.T) {
 	raw := `{"schema":"shop","table":"orders","pk_hashes":["x"],"time_start":"0001-01-01T00:00:00Z","time_end":"0001-01-01T00:00:00Z","gtid":"abc:42"}`
@@ -192,7 +192,7 @@ func TestRecoverRequestJSON_gtid(t *testing.T) {
 }
 
 // TestRecoverRequestJSON_backwardCompat confirms a payload WITHOUT the
-// ``gtid`` key (the pre-fix SaaS shape) still decodes cleanly.  This is
+// “gtid“ key (the pre-fix SaaS shape) still decodes cleanly.  This is
 // the forward/backward-compat guarantee — an older SaaS can still talk
 // to a newer agent.
 func TestRecoverRequestJSON_backwardCompat(t *testing.T) {
