@@ -174,6 +174,10 @@ jobs:
       - name: Teardown (always)
         if: always()
         run: |
+          # Deletes are best-effort (set +e: a half-provisioned run must still
+          # tear down whatever DID get created), but the step FAILS at the end
+          # if anything is left behind — a leaked billable resource must turn
+          # the run red, never show green.
           set +e
           if [ "$FLAVOR" = "rds" ]; then
             aws rds delete-db-instance --db-instance-identifier "$NAME" \
@@ -183,19 +187,46 @@ jobs:
           else
             aws rds delete-db-instance --db-instance-identifier "$NAME-1" \
               --skip-final-snapshot >/dev/null
+            # The member instance must be fully GONE before delete-db-cluster:
+            # deleting a cluster that still has a member is rejected with
+            # InvalidDBClusterStateFault, and the cluster (+ its parameter
+            # group) would leak.
+            aws rds wait db-instance-deleted --db-instance-identifier "$NAME-1"
             aws rds delete-db-cluster --db-cluster-identifier "$NAME" \
               --skip-final-snapshot >/dev/null
-            aws rds wait db-instance-deleted --db-instance-identifier "$NAME-1"
-            # the cluster finishes deleting shortly after its last instance
             for i in $(seq 1 30); do
               aws rds describe-db-clusters --db-cluster-identifier "$NAME" >/dev/null 2>&1 || break
               sleep 20
             done
             aws rds delete-db-cluster-parameter-group --db-cluster-parameter-group-name "$NAME"
           fi
-          [ -n "${SG:-}" ] && aws ec2 delete-security-group --group-id "$SG"
-          echo "teardown finished; verify nothing tagged Project=$RUN_TAG remains:"
-          aws rds describe-db-instances \
-            --query "DBInstances[?starts_with(DBInstanceIdentifier,'$NAME')].DBInstanceIdentifier" --output text
-          aws rds describe-db-clusters \
-            --query "DBClusters[?starts_with(DBClusterIdentifier,'$NAME')].DBClusterIdentifier" --output text
+          if [ -n "${SG:-}" ]; then
+            # ENIs of a just-deleted instance can hold the SG briefly — retry.
+            for i in $(seq 1 10); do
+              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null && break
+              sleep 15
+            done
+          fi
+
+          # Verification gate: anything still present fails the job loudly.
+          LEFT=""
+          LEFT_I=$(aws rds describe-db-instances \
+            --query "DBInstances[?starts_with(DBInstanceIdentifier,'$NAME')].DBInstanceIdentifier" --output text)
+          [ -n "$LEFT_I" ] && LEFT="$LEFT db-instances:[$LEFT_I]"
+          LEFT_C=$(aws rds describe-db-clusters \
+            --query "DBClusters[?starts_with(DBClusterIdentifier,'$NAME')].DBClusterIdentifier" --output text)
+          [ -n "$LEFT_C" ] && LEFT="$LEFT db-clusters:[$LEFT_C]"
+          if aws rds describe-db-parameter-groups --db-parameter-group-name "$NAME" >/dev/null 2>&1; then
+            LEFT="$LEFT db-parameter-group:[$NAME]"
+          fi
+          if aws rds describe-db-cluster-parameter-groups --db-cluster-parameter-group-name "$NAME" >/dev/null 2>&1; then
+            LEFT="$LEFT db-cluster-parameter-group:[$NAME]"
+          fi
+          if [ -n "${SG:-}" ] && aws ec2 describe-security-groups --group-ids "$SG" >/dev/null 2>&1; then
+            LEFT="$LEFT security-group:[$SG]"
+          fi
+          if [ -n "$LEFT" ]; then
+            echo "::error::teardown incomplete — leaked resources:$LEFT (delete manually; all are tagged Project=$RUN_TAG)"
+            exit 1
+          fi
+          echo "teardown verified: nothing named ${NAME}* remains"
