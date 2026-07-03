@@ -340,7 +340,8 @@ func checkRowMetadata(db *sql.DB) CheckResult {
 		// Only MySQL error 1193 (unknown system variable) means the server
 		// genuinely lacks the variable (MySQL 5.7, MariaDB <10.5). Any other
 		// failure is a read problem — surface the real error instead of a
-		// fabricated version diagnosis (checkBinlogRetention's pattern).
+		// fabricated version diagnosis (unlike checkBinlogRetention, which
+		// treats any error on the modern variable as absent and falls back).
 		var myErr *mysql.MySQLError
 		if errors.As(err, &myErr) && myErr.Number == 1193 {
 			return CheckResult{
@@ -362,7 +363,7 @@ func checkRowMetadata(db *sql.DB) CheckResult {
 		Name:   name,
 		Status: StatusWarn,
 		Detail: "binlog_row_metadata=" + val + " — a stale schema snapshot cannot be detected at capture time (a same-column-count change like a rename would index values under the wrong column names)",
-		Remediation: "Optional: embed column names in row-event metadata so bintrail can verify the snapshot against every event (dynamic, no restart; adds a few bytes per TABLE_MAP event):\n\n" +
+		Remediation: "Optional: embed column names in row-event metadata so bintrail can verify the snapshot against every event (dynamic, no restart; adds a handful of bytes per column to each TABLE_MAP event):\n\n" +
 			"  -- MySQL 8.0+:\n" +
 			"  SET PERSIST binlog_row_metadata = 'FULL';\n\n" +
 			"  -- MariaDB 10.5+ (no SET PERSIST; persist it in my.cnf under [mysqld]):\n" +

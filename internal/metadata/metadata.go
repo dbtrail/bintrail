@@ -73,10 +73,12 @@ type SnapshotStats struct {
 type Resolver struct {
 	snapshotID int
 	// snapshotTime is the snapshot's creation time (schema_snapshots.
-	// snapshot_time, stamped from the bintrail host clock by TakeSnapshot).
-	// Zero = unknown (test resolvers built via NewResolverFromTables).
-	// The #700 drift guard uses it to tell a STALE snapshot (event newer
-	// than the snapshot) from a routine HISTORICAL event (older).
+	// snapshot_time, stamped from the bintrail host clock by TakeSnapshot
+	// and WritePGSnapshot). Zero = unknown: any constructor that does not
+	// set it — NewResolverFromTables without the At variant — which the
+	// #700 drift guard treats as strict. The guard uses it to tell a STALE
+	// snapshot (event at-or-after the snapshot) from a routine HISTORICAL
+	// event (before it).
 	snapshotTime time.Time
 	tables       map[string]*TableMeta // key: "schema.table"
 }
@@ -114,12 +116,17 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	r := &Resolver{snapshotID: snapshotID, tables: make(map[string]*TableMeta)}
 
 	// Snapshot creation time (all rows of one snapshot share it; MIN is
-	// defensive). Best-effort: a scan failure leaves it zero (unknown), which
-	// the #700 drift guard treats as strict.
+	// defensive). Best-effort: a failure leaves it zero (unknown), which the
+	// #700 drift guard treats as STRICT — silently flipping historical
+	// events from warn-and-proceed to hard-error — so the cause must be in
+	// the logs, never swallowed.
 	var snapTime sql.NullTime
 	if err := db.QueryRow(
 		"SELECT MIN(snapshot_time) FROM schema_snapshots WHERE snapshot_id = ?",
-		snapshotID).Scan(&snapTime); err == nil && snapTime.Valid {
+		snapshotID).Scan(&snapTime); err != nil {
+		slog.Warn("could not read the snapshot's creation time — the schema-drift guard will treat ALL diverging events as stale (hard error), including historical ones",
+			"snapshot_id", snapshotID, "error", err)
+	} else if snapTime.Valid {
 		r.snapshotTime = snapTime.Time
 	}
 

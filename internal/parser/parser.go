@@ -261,7 +261,8 @@ func handleRows(
 	// count-mismatch skip. The compare is case-insensitive per MySQL's
 	// identifier rules (a case-only rename does not change the mapping) and
 	// includes generated columns (present in both the snapshot and the FULL
-	// row image). Under the default binlog_row_metadata=MINIMAL the event
+	// TABLE_MAP metadata — a different knob from the #493 guard's
+	// binlog_row_image below). Under the default binlog_row_metadata=MINIMAL the event
 	// carries no names and the check degrades to a no-op.
 	//
 	// A divergence splits on the event's age relative to the snapshot:
@@ -287,14 +288,17 @@ func handleRows(
 	// while event timestamps come from the source server; a large clock skew
 	// can misclassify a rename taken moments around the snapshot — the
 	// failure mode is a loud warning instead of a hard stop, never silence.
-	// A zero snapshot time (unknown) stays strict.
+	// A zero snapshot time (unknown) stays strict,
+	// and so does a zero EVENT timestamp (tool-generated/rewritten binlogs
+	// occasionally carry zeroed headers — an unknown age must not take the
+	// lenient path).
 	if names := rowsEv.Table.ColumnNameString(); len(names) > 0 && len(names) == len(tm.Columns) {
 		for i := range names {
 			if mysqlIdentEqualFold(names[i], tm.Columns[i].Name) {
 				continue
 			}
 			eventTime := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
-			if snapTime := resolver.SnapshotTime(); !snapTime.IsZero() && eventTime.Before(snapTime) {
+			if snapTime := resolver.SnapshotTime(); binlogEv.Header.Timestamp != 0 && !snapTime.IsZero() && eventTime.Before(snapTime) {
 				logger.Warn("column names differ from snapshot for a pre-snapshot event — indexing under the snapshot's names",
 					"file", filename,
 					"pos", binlogEv.Header.LogPos,
@@ -312,7 +316,8 @@ func handleRows(
 					"the snapshot is stale (a column was renamed, or dropped and re-added, since it was taken) and indexing "+
 					"these events would attribute row values to the wrong columns — run `bintrail snapshot` against the "+
 					"current schema, then re-run indexing (a failed file re-indexes from the start; a stream resumes from "+
-					"its checkpoint)",
+					"its checkpoint); if this event actually PREDATES the snapshot, check for clock skew between the "+
+					"bintrail host and the source server",
 				filename, binlogEv.Header.LogPos, schema, table,
 				i+1, names[i], schemaVersion, tm.Columns[i].Name)
 		}
@@ -509,6 +514,9 @@ func emitUpdates(
 // column error, and RENAME COLUMN İstanbul TO istanbul succeeds as a
 // case-style rename), while Unicode simple folding maps neither to 'i' — so
 // a plain EqualFold would flag that legal case-style rename as drift (#700).
+// Accents are NOT folded by MySQL identifiers (verified on 8.4: CREATE TABLE
+// t (e INT, é INT) succeeds with two distinct columns), so no wider
+// normalization is needed.
 func mysqlIdentEqualFold(a, b string) bool {
 	if strings.EqualFold(a, b) {
 		return true

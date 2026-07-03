@@ -240,3 +240,72 @@ func TestMysqlIdentEqualFold_turkishDottedI(t *testing.T) {
 		t.Error("distinct identifiers must not fold equal")
 	}
 }
+
+// The boundary case: an event in the SAME second as the snapshot (1s binlog
+// timestamp granularity makes this the common real tie) must take the
+// hard-error side — "at-or-after" — so a refactor to eventTime.After() can't
+// silently flip ties onto the warn-and-proceed (corruption) side.
+func TestHandleRows_snapshotTimeTieFailsLoud(t *testing.T) {
+	snapTime := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	evs, err := runHandleRowsWith(t, driftResolverAt(snapTime),
+		driftRowsEventAt([]string{"id", "total"}, snapTime), &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("event at exactly the snapshot time must hard-error (at-or-after = stale)")
+	}
+	if len(evs) != 0 {
+		t.Errorf("tie must emit no events, got %d", len(evs))
+	}
+}
+
+// A zero EVENT timestamp (tool-generated/rewritten binlogs) is an unknown
+// age — it must stay strict, not classify as pre-snapshot lenient.
+func TestHandleRows_zeroEventTimestampStaysStrict(t *testing.T) {
+	snapTime := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	ev := driftRowsEvent([]string{"id", "total"})
+	ev.Header.Timestamp = 0
+	evs, err := runHandleRowsWith(t, driftResolverAt(snapTime), ev, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("zero event timestamp must stay strict (unknown age), got warn-and-proceed")
+	}
+	if len(evs) != 0 {
+		t.Errorf("expected no events, got %d", len(evs))
+	}
+}
+
+// Pins the deliberate asymmetry: names present but COUNT differing takes the
+// pre-existing count-guard warn-and-skip (parser.go count validation), never
+// the drift hard error — and the len(names)==len(tm.Columns) gate is what
+// keeps the name loop in bounds.
+func TestHandleRows_namesPresentCountDiffersTakesCountGuard(t *testing.T) {
+	tme := &replication.TableMapEvent{
+		Schema:      []byte("shop"),
+		Table:       []byte("orders"),
+		ColumnCount: 1, // table now has ONE column; snapshot has two
+		ColumnName:  [][]byte{[]byte("id")},
+	}
+	binlogEv := &replication.BinlogEvent{
+		Header: &replication.EventHeader{
+			EventType: replication.WRITE_ROWS_EVENTv2,
+			LogPos:    200,
+			EventSize: 100,
+		},
+		Event: &replication.RowsEvent{
+			Table: tme,
+			Rows:  [][]any{{int64(1)}},
+		},
+	}
+
+	var logBuf bytes.Buffer
+	evs, err := runHandleRowsWith(t, driftResolver(), binlogEv, &logBuf)
+	if err != nil {
+		t.Fatalf("count divergence must take the count-guard skip, not the drift error: %v", err)
+	}
+	if len(evs) != 0 {
+		t.Errorf("count guard must skip the event, got %d emitted", len(evs))
+	}
+	if !strings.Contains(logBuf.String(), "column count mismatch") {
+		t.Errorf("expected the count-guard warn, got logs: %s", logBuf.String())
+	}
+}
