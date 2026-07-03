@@ -3,6 +3,7 @@
 package indexer
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -250,6 +251,61 @@ func TestEnsureSchemaAddsIdentityColumn(t *testing.T) {
 	// Idempotent: a second run must not error or re-add.
 	if err := EnsureSchema(db); err != nil {
 		t.Fatalf("EnsureSchema (second run): %v", err)
+	}
+}
+
+// TestEnsureSchemaCreatesConnectionCache pins the existing-install half of the
+// #703 migration: an index predating the forensics connection cache must gain
+// the connection_cache table (BIGINT UNSIGNED connection_id PK), idempotently.
+func TestEnsureSchemaCreatesConnectionCache(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Simulate a pre-#703 install by dropping the table EnsureSchema re-adds.
+	testutil.MustExec(t, db, `DROP TABLE connection_cache`)
+
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	var columnType, columnKey string
+	if err := db.QueryRow(`SELECT COLUMN_TYPE, COLUMN_KEY FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'connection_cache'
+		  AND COLUMN_NAME = 'connection_id'`).Scan(&columnType, &columnKey); err != nil {
+		t.Fatalf("read connection_id column: %v", err)
+	}
+	// MySQL connection IDs are unsigned 64-bit; a signed or narrower column
+	// would silently truncate high IDs on long-lived servers.
+	if !strings.Contains(strings.ToLower(columnType), "bigint") ||
+		!strings.Contains(strings.ToLower(columnType), "unsigned") {
+		t.Errorf("connection_id COLUMN_TYPE = %q, want BIGINT UNSIGNED", columnType)
+	}
+	if columnKey != "PRI" {
+		t.Errorf("connection_id COLUMN_KEY = %q, want PRI (the upsert relies on the PK)", columnKey)
+	}
+
+	// Idempotent: a second run must not error or re-create.
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema (second run): %v", err)
+	}
+}
+
+// TestCreateIndexTablesIncludesConnectionCache pins the fresh-install half of
+// #703: `bintrail init` (CreateIndexTables) creates connection_cache too.
+func TestCreateIndexTablesIncludesConnectionCache(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+
+	if err := CreateIndexTables(context.Background(), db, 2, false, nil); err != nil {
+		t.Fatalf("CreateIndexTables: %v", err)
+	}
+
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'connection_cache'`).Scan(&n); err != nil {
+		t.Fatalf("check connection_cache: %v", err)
+	}
+	if n != 1 {
+		t.Fatal("fresh install (CreateIndexTables) did not create connection_cache")
 	}
 }
 
