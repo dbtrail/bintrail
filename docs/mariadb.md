@@ -137,8 +137,18 @@ silently become the write key for every server. Two caveats:
 - **File-based `bintrail index`** over MariaDB binlog files.
 - All row events (INSERT/UPDATE/DELETE) with before/after images, including
   `UNSIGNED`, `DECIMAL`, and DDL detection / auto-snapshot.
-- MariaDB-only binlog events (`Annotate_rows`, `Gtid_list`, `Binlog_checkpoint`)
-  are skipped transparently.
+- **Statement capture** (`query_text`/`query_hash`): MariaDB's `Annotate_rows`
+  event carries the originating SQL statement and is captured like MySQL's
+  `ROWS_QUERY_EVENT`. `binlog_annotate_row_events` is ON by default since
+  10.2.4; streaming already works because `--source-flavor mariadb` makes the
+  syncer request the events. See
+  [query-and-recovery.md](query-and-recovery.md#statement-capture-query_text-and-query_hash).
+- **Capture-time schema-drift detection**: `binlog_row_metadata=FULL` works on
+  MariaDB 10.5+ (`SET GLOBAL` — MariaDB has no `SET PERSIST`; persist it in
+  `my.cnf`). The default is `NO_LOG`, so it's opt-in. See
+  [indexing.md](indexing.md).
+- Other MariaDB-only binlog events (`Gtid_list`, `Binlog_checkpoint`) are
+  skipped transparently.
 
 ---
 
