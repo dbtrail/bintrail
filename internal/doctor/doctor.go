@@ -137,6 +137,7 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 	report.add(checkBinlogRowImage(sourceDB))
 	report.add(checkBinlogRetention(sourceDB))
 	report.add(checkStatementCapture(sourceDB))
+	report.add(checkRowMetadata(sourceDB))
 	report.add(checkReplicationGrants(ctx, sourceDB))
 	report.add(checkFKCascades(sourceDB, schemas))
 	report.add(checkSchemaVisibility(ctx, sourceDB, schemas))
@@ -400,6 +401,53 @@ func checkStatementCapture(db *sql.DB) CheckResult {
 		Name:   name,
 		Status: StatusSkip,
 		Detail: "neither binlog_rows_query_log_events nor binlog_annotate_row_events is available on this server",
+	}
+}
+
+// checkRowMetadata reports whether the source embeds column names in every
+// binlog TABLE_MAP event (#700): binlog_row_metadata=FULL (MySQL 8.0+,
+// MariaDB 10.5+) lets bintrail cross-check the schema snapshot against
+// per-event ground truth and fail loud on a stale snapshot — including the
+// same-column-count drift (a rename, or a DROP+ADD in one ALTER) that the
+// count guard cannot see and that would otherwise index values under the
+// wrong column names. The setting is OPTIONAL, so this check never FAILs:
+// FULL → PASS, MINIMAL → WARN with an enable suggestion (validate, never
+// set), variable absent → SKIP.
+func checkRowMetadata(db *sql.DB) CheckResult {
+	const name = "Schema-drift detection (binlog_row_metadata)"
+	var val string
+	if err := db.QueryRow("SELECT @@binlog_row_metadata").Scan(&val); err != nil {
+		// Only MySQL error 1193 (unknown system variable) means the server
+		// genuinely lacks the variable (MySQL 5.7, MariaDB <10.5). Any other
+		// failure is a read problem — surface the real error instead of a
+		// fabricated version diagnosis (unlike checkBinlogRetention, which
+		// treats any error on the modern variable as absent and falls back).
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1193 {
+			return CheckResult{
+				Name:   name,
+				Status: StatusSkip,
+				Detail: "binlog_row_metadata is not available on this server (needs MySQL 8.0+ or MariaDB 10.5+)",
+			}
+		}
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not read binlog_row_metadata: " + err.Error(),
+		}
+	}
+	if strings.EqualFold(val, "FULL") {
+		return CheckResult{Name: name, Status: StatusPass, Detail: "binlog_row_metadata=FULL"}
+	}
+	return CheckResult{
+		Name:   name,
+		Status: StatusWarn,
+		Detail: "binlog_row_metadata=" + val + " — a stale schema snapshot cannot be detected at capture time (a same-column-count change like a rename would index values under the wrong column names)",
+		Remediation: "Optional: embed column names in row-event metadata so bintrail can verify the snapshot against every event (dynamic, no restart; adds a handful of bytes per column to each TABLE_MAP event):\n\n" +
+			"  -- MySQL 8.0+:\n" +
+			"  SET PERSIST binlog_row_metadata = 'FULL';\n\n" +
+			"  -- MariaDB 10.5+ (no SET PERSIST; persist it in my.cnf under [mysqld]):\n" +
+			"  SET GLOBAL binlog_row_metadata = 'FULL';",
 	}
 }
 

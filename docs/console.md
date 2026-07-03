@@ -76,7 +76,7 @@ and searching events:
    in place to a before→after diff; `j`/`k` move the cursor, `↵` expands, `u`
    jumps to Recover. Results carry **JSON / CSV** export — client-side over the
    rows already on screen, so it stays within the result caps and — like the
-   on-screen rows — never includes `connection_id`.
+   on-screen rows — never includes `connection_id`, `query_text`, or `query_hash`.
 3. **Time-travel** — single-row point-in-time reconstruct, drawn as a timeline
    (baseline snapshot → each change, with a **Restore to this state** jump to
    Recover). Appears **only when a baseline is configured**
@@ -516,10 +516,12 @@ itself:
 
 The console exposes only the free **query_explorer** surface (event query +
 recovery-SQL generation), available on every tier. It deliberately stays out of
-the paid **forensics** surface (who-changed / attribution): the events API drops
-`connection_id` — the MySQL `pseudo_thread_id` of the writing transaction — from
-every response. There is no gating, RBAC, or license code in the binary; the
-boundary is simply what the API chooses to serve.
+the paid **forensics** surface (who-changed / what-statement / attribution): the
+events API drops `connection_id` — the MySQL `pseudo_thread_id` of the writing
+transaction — and `query_text`/`query_hash` — the originating SQL statement and
+its normalized digest — from every response. There is no gating, RBAC, or
+license code in the binary; the boundary is simply what the API chooses to
+serve.
 
 ## PostgreSQL sources
 

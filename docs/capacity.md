@@ -33,6 +33,14 @@ Measured against the real `binlog_events` schema on MySQL 8.0 (InnoDB defaults, 
 
 Two practical notes:
 
+- **Statement capture** (`binlog_rows_query_log_events=ON` / MariaDB
+  `binlog_annotate_row_events`, see
+  [query-and-recovery.md](query-and-recovery.md)) stores the originating SQL
+  statement on **every row event it produced** — a 500-row bulk `DELETE`
+  stores the same text 500 times (capped at 16 KB per copy, plus a 64-byte
+  digest). For hand-written/ORM statements this adds roughly the statement's
+  length per event; for bulk-statement-heavy workloads it can dominate, which
+  is one reason capture is opt-in at the source.
 - **Rows with very large TEXT/JSON values** (image > ~8 KB) move off-page in InnoDB: each image is stored in whole 16 KB chunks, and an UPDATE stores two of them. A table with a 20 KB JSON blob costs ~40 KB *per UPDATE event*. If you have such a table and it's hot, it will dominate your index — consider excluding it with `--schemas`/`--tables` filters.
 - **Sparse partitions have a fixed floor.** Each hourly partition is its own `.ibd` file with its own B-trees (a few hundred KB even when nearly empty). For low-traffic deployments the per-partition floor, not the per-event cost, can dominate — don't multiply a per-row number across near-empty hours.
 

@@ -1,11 +1,15 @@
 // Package forensics provides audit-log and connection forensics primitives
 // for MySQL-family servers: audit plugin discovery via SHOW GLOBAL VARIABLES,
-// on-disk audit log parsing (MariaDB/RDS/Aurora CSV dialects, Percona CSV,
+// audit log parsing (MariaDB/RDS/Aurora CSV dialects, Percona CSV,
 // Percona/MySQL Enterprise JSON, MySQL Enterprise XML), and normalisation of
 // vendor events into a common shape.
 //
-// Remote log sources (RDS/CloudWatch APIs) are intentionally out of scope
-// here — this package only reads files reachable on the local filesystem.
+// Logs are read from the local filesystem by default; for AWS-managed
+// servers two remote sources exist — the RDS file API (auditlog_rds.go)
+// and CloudWatch Logs (auditlog_cloudwatch.go) — selected explicitly via
+// AuditReadOptions.Source or, for the RDS file API, automatically when the
+// configured log file is not on local disk and the DSN host is an RDS
+// endpoint.
 package forensics
 
 import (
@@ -65,6 +69,26 @@ const (
 	AuditFormatUnknown AuditFormat = "unknown"
 )
 
+// AuditSource selects where ReadAuditLog reads the audit log from.
+type AuditSource string
+
+// Audit log sources.
+const (
+	// AuditSourceAuto (the zero value) reads local files, falling back to
+	// the RDS file API when the configured log file is not on local disk
+	// and SourceHost is an RDS endpoint.
+	AuditSourceAuto AuditSource = ""
+	// AuditSourceLocal reads the local filesystem only — never AWS APIs.
+	AuditSourceLocal AuditSource = "local"
+	// AuditSourceRDS reads through the RDS file API
+	// (DescribeDBLogFiles + DownloadDBLogFilePortion). Requires SourceHost.
+	AuditSourceRDS AuditSource = "rds"
+	// AuditSourceCloudWatch reads the CloudWatch Logs export
+	// (/aws/rds/{instance|cluster}/<id>/audit) via FilterLogEvents.
+	// Requires SourceHost or CloudWatchLogGroup; never touches sourceDB.
+	AuditSourceCloudWatch AuditSource = "cloudwatch"
+)
+
 // AuditReadOptions controls ReadAuditLog discovery, filtering, and paging.
 type AuditReadOptions struct {
 	// Since / Until bound events by timestamp. Zero values disable the bound.
@@ -85,10 +109,22 @@ type AuditReadOptions struct {
 	IncludeRotated bool
 	// TailLines controls tail-mode reading:
 	//   > 0: read only approximately the last N lines of each file
-	//        (estimated at 256 bytes/line, seeking near the end);
+	//        (estimated at 256 bytes/line, seeking near the end; the RDS
+	//        source passes N to the API's NumberOfLines instead);
 	//     0: auto — defaults to 10000 when Since is set, full scan otherwise;
 	//   < 0: force a full scan even when Since is set.
 	TailLines int
+	// Source selects the log source. See the AuditSource constants; the
+	// zero value is auto (local file with RDS fallback for RDS hosts).
+	Source AuditSource
+	// SourceHost is the hostname the source DSN points at (bare hostname;
+	// a :port suffix is tolerated). It enables RDS endpoint detection —
+	// instance/cluster id and region — for the remote sources and the
+	// automatic local→RDS fallback. Optional for purely local reads.
+	SourceHost string
+	// CloudWatchLogGroup overrides the log group derived from SourceHost
+	// for AuditSourceCloudWatch (e.g. "/aws/rds/cluster/mydb/audit").
+	CloudWatchLogGroup string
 }
 
 // AuditReadResult is the outcome of ReadAuditLog. JSON field names match the
@@ -102,6 +138,9 @@ type AuditReadResult struct {
 	FilePath       string       `json:"file_path"`
 	FilesRead      int          `json:"files_read"`
 	Warnings       []string     `json:"warnings,omitempty"`
+	// Source reports which source actually served the read — relevant in
+	// auto mode, where a local read can fall back to the RDS file API.
+	Source AuditSource `json:"source,omitempty"`
 }
 
 // Sentinel errors for the discovery pipeline. Callers can errors.Is on these
@@ -148,7 +187,8 @@ const (
 )
 
 // ReadAuditLog discovers the audit log configured on sourceDB, parses the
-// on-disk file(s), and returns events matching opts. The flow is:
+// file(s) from the source selected by opts.Source, and returns events
+// matching opts. The local flow is:
 //
 //  1. SHOW GLOBAL VARIABLES LIKE 'audit_log_file' (MySQL Enterprise /
 //     Percona), then 'server_audit_file_path' (MariaDB family);
@@ -159,6 +199,15 @@ const (
 //     format-specific parsing with since/until/user/event_type filters and
 //     offset/limit paging.
 //
+// In auto mode (Source zero value) the RDS file API takes over when the
+// discovered log file is not on the local filesystem and SourceHost is an
+// RDS endpoint — bintrail typically runs off-host against RDS — and also
+// when no file-path variable exists but server_audit_logging is ON (Aurora
+// Advanced Auditing exposes no path variable). AuditSourceRDS forces the
+// API path; sourceDB is then only used for best-effort discovery and may
+// be nil. AuditSourceCloudWatch reads the CloudWatch Logs export and never
+// touches sourceDB.
+//
 // Parse errors inside a file are non-fatal: they surface as Warnings on the
 // result alongside the events parsed so far. On a non-nil error the returned
 // result still carries any warnings accumulated before the failure.
@@ -168,6 +217,17 @@ func ReadAuditLog(ctx context.Context, sourceDB *sql.DB, opts AuditReadOptions) 
 	}
 	tailLines := resolveTailLines(opts.TailLines, opts.Since)
 
+	switch opts.Source {
+	case AuditSourceRDS:
+		return readAuditRDSExplicit(ctx, sourceDB, opts, tailLines)
+	case AuditSourceCloudWatch:
+		return readAuditCloudWatch(ctx, opts)
+	case AuditSourceAuto, AuditSourceLocal:
+		// The local flow below.
+	default:
+		return AuditReadResult{}, fmt.Errorf("unsupported audit source %q", opts.Source)
+	}
+
 	var res AuditReadResult
 
 	filePath, variant, warns, discoverErr := discoverAuditLogFile(ctx, sourceDB)
@@ -175,6 +235,12 @@ func ReadAuditLog(ctx context.Context, sourceDB *sql.DB, opts AuditReadOptions) 
 	if filePath == "" {
 		if discoverErr != nil {
 			return res, fmt.Errorf("failed to query audit log configuration: %w", discoverErr)
+		}
+		// Aurora Advanced Auditing exposes no file-path variable; when the
+		// host is an RDS endpoint and auditing is on, read via the RDS API
+		// with the default audit/ directory.
+		if opts.Source == AuditSourceAuto && rdsHostCandidate(opts.SourceHost) && serverAuditLoggingOn(ctx, sourceDB) {
+			return readAuditRDS(ctx, opts, "", AuditVariantMariaDB, res.Warnings, tailLines)
 		}
 		return res, ErrAuditNotConfigured
 	}
@@ -210,8 +276,14 @@ func ReadAuditLog(ctx context.Context, sourceDB *sql.DB, opts AuditReadOptions) 
 	files, collectWarns := collectAuditLogFiles(filePath, opts.IncludeRotated)
 	res.Warnings = append(res.Warnings, collectWarns...)
 	if len(files) == 0 {
+		// The audit plugin is configured but its file is not on the local
+		// filesystem — bintrail is likely running off-host against RDS.
+		if opts.Source == AuditSourceAuto && rdsHostCandidate(opts.SourceHost) {
+			return readAuditRDS(ctx, opts, filePath, variant, res.Warnings, tailLines)
+		}
 		return res, fmt.Errorf("%w: %s", ErrAuditFileNotFound, filePath)
 	}
+	res.Source = AuditSourceLocal
 
 	format := detectAuditLogFormat(files[0], variant)
 	res.FormatDetected = format
