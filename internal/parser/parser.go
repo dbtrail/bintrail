@@ -114,8 +114,11 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	// ANNOTATE_ROWS event (MariaDB, binlog_annotate_row_events=ON). It is
 	// statement-scoped: each statement's event overwrites the previous one,
 	// and one statement's text covers ALL of its (possibly chained) rows
-	// events. Cleared at QUERY and GTID boundaries so a statement that logged
-	// no text (variable toggled off mid-stream) can never inherit a stale one.
+	// events. Cleared in three places, each load-bearing: QUERY and GTID
+	// boundaries (across transactions), and the STMT_END_F rows event (the
+	// statement boundary WITHIN a transaction — the only clear that stops a
+	// later ROWS_QUERY-less statement in the same transaction from inheriting
+	// stale text when the variable is toggled off mid-transaction).
 	var currentQueryText string
 
 	bp := replication.NewBinlogParser()

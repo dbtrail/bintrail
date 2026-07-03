@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	mysql "github.com/go-sql-driver/mysql"
 
@@ -26,6 +27,18 @@ type Indexer struct {
 	// digestWarnOnce rate-limits the STATEMENT_DIGEST-unavailable warning to
 	// one line per Indexer — without it a non-8.0 index would warn every batch.
 	digestWarnOnce sync.Once
+	// digestPartialWarnOnce rate-limits the some-statements-failed warning:
+	// a systematic-but-partial condition (one application's statements always
+	// tripping the digest) must be discoverable without waiting for the
+	// all-failed case, but must not warn on every batch either.
+	digestPartialWarnOnce sync.Once
+	// digestUnavailable short-circuits digesting for the Indexer's lifetime
+	// once the index has proven it lacks STATEMENT_DIGEST entirely (MySQL
+	// error 1305, unknown function — e.g. a MariaDB index outside the 8.0+
+	// contract). Without it a long-lived stream daemon would pay one failed
+	// combined SELECT plus N failed per-text SELECTs on every batch, forever,
+	// after its single warning line.
+	digestUnavailable bool
 }
 
 // New creates an Indexer writing to db with the given batch size.
@@ -184,18 +197,23 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 // digestStatements resolves distinct statement texts to their
 // STATEMENT_DIGEST() hashes on the index connection (STATEMENT_DIGEST exists
 // on MySQL 8.0+, the index contract floor). Texts ending in the truncation
-// marker are skipped up front: a capped statement ends mid-token, so its
-// digest would both fail to parse (MySQL error 3676) and misrepresent the
-// statement's true shape — NULL is the honest value.
+// marker are skipped up front: a truncated fragment misrepresents the
+// statement's true shape — NULL is the honest value — and it usually ends
+// mid-token, failing to parse anyway (MySQL error 3676).
 //
 // The happy path is ONE combined SELECT over all texts. That SELECT fails as
 // a unit when ANY single text is unparseable, so on error it falls back to
 // per-text digests — one bad statement can then never null the whole batch's
 // hashes. The digest is an enrichment: every failure degrades to a missing
-// map entry (NULL query_hash) while query_text is still stored; only the
-// all-texts-failed case (e.g. an index without STATEMENT_DIGEST) warns, once
-// per Indexer.
+// map entry (NULL query_hash) while query_text is still stored. Failures are
+// surfaced without flooding: per-statement details at debug, plus one
+// warning per Indexer for the first partial failure and one for the first
+// all-failed batch; a missing STATEMENT_DIGEST function (1305) additionally
+// disables digesting for the Indexer's lifetime.
 func (idx *Indexer) digestStatements(texts []string) map[string]string {
+	if idx.digestUnavailable {
+		return nil
+	}
 	candidates := make([]string, 0, len(texts))
 	for _, t := range texts {
 		if !strings.HasSuffix(t, event.QueryTextTruncationMarker) {
@@ -206,11 +224,24 @@ func (idx *Indexer) digestStatements(texts []string) map[string]string {
 		return nil
 	}
 
-	if out, err := idx.digestCombined(candidates); err == nil {
+	out, combinedErr := idx.digestCombined(candidates)
+	if combinedErr == nil {
 		return out
 	}
+	// ER_SP_DOES_NOT_EXIST: the index simply has no STATEMENT_DIGEST function
+	// — no per-text retry can succeed now or later. Warn once and stop trying.
+	var myErr *mysql.MySQLError
+	if errors.As(combinedErr, &myErr) && myErr.Number == 1305 {
+		idx.digestUnavailable = true
+		idx.digestWarnOnce.Do(func() {
+			slog.Warn("STATEMENT_DIGEST is not available on the index connection — query_hash will be NULL for all events (query_text is unaffected)",
+				"error", combinedErr)
+		})
+		return nil
+	}
+	slog.Debug("combined STATEMENT_DIGEST failed — falling back to per-text digests", "error", combinedErr)
 
-	out := make(map[string]string, len(candidates))
+	out = make(map[string]string, len(candidates))
 	failures := 0
 	var lastErr error
 	for _, t := range candidates {
@@ -218,19 +249,44 @@ func (idx *Indexer) digestStatements(texts []string) map[string]string {
 		if err := idx.db.QueryRow("SELECT STATEMENT_DIGEST(?)", t).Scan(&v); err != nil {
 			failures++
 			lastErr = err
+			slog.Debug("STATEMENT_DIGEST failed for one statement — query_hash stays NULL for it",
+				"error", err, "statement_prefix", truncateForLog(t))
 			continue
 		}
 		if v.Valid {
 			out[t] = v.String
 		}
 	}
-	if failures == len(candidates) {
+	switch {
+	case failures == len(candidates):
 		idx.digestWarnOnce.Do(func() {
 			slog.Warn("STATEMENT_DIGEST failed for every statement in a batch — query_hash will be NULL (query_text is unaffected)",
 				"error", lastErr)
 		})
+	case failures > 0:
+		// Partial failure: a systematic condition affecting one application's
+		// statements would otherwise stay invisible until someone notices
+		// NULL hashes in query results months later.
+		idx.digestPartialWarnOnce.Do(func() {
+			slog.Warn("STATEMENT_DIGEST failed for some statements — their query_hash stays NULL (per-statement details at debug level; this warning prints once)",
+				"failed", failures, "of", len(candidates), "error", lastErr)
+		})
 	}
 	return out
+}
+
+// truncateForLog bounds a statement text for a debug log line, cutting at a
+// rune boundary (the input is sanitized UTF-8; keep it valid).
+func truncateForLog(s string) string {
+	const max = 120
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // digestCombined runs the single-round-trip form: one SELECT with one
@@ -369,9 +425,11 @@ func EnsureSchema(db *sql.DB) error {
 	// binlog_annotate_row_events), and its STATEMENT_DIGEST computed on the
 	// index connection at insert time. Nullable: rows indexed before this
 	// column existed, or while capture is off at the source, read back NULL.
-	// MEDIUMTEXT (not TEXT): a bulk statement easily exceeds 64 KB and a 1406
-	// under strict mode would abort the whole batch INSERT; the indexer also
-	// caps the stored text at maxQueryTextBytes as defense in depth.
+	// event.SanitizeQueryText caps every text at event.MaxQueryTextBytes
+	// (16 KiB) before it reaches this column; MEDIUMTEXT (not TEXT) is
+	// headroom on top of that cap, so raising the cap — or any future path
+	// that bypasses sanitization — cannot turn into a strict-mode 1406 that
+	// aborts a whole batch INSERT.
 	if err := ensureColumn(db, "binlog_events", "query_text",
 		`ALTER TABLE binlog_events ADD COLUMN query_text MEDIUMTEXT DEFAULT NULL COMMENT 'original SQL statement from ROWS_QUERY/ANNOTATE_ROWS; NULL unless binlog_rows_query_log_events (MySQL) / binlog_annotate_row_events (MariaDB) is ON at the source (#699)' AFTER schema_version`,
 	); err != nil {

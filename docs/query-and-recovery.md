@@ -66,20 +66,20 @@ Results can be formatted three ways:
 
 When the source logs the original SQL statement alongside row events, `bintrail` stores it with every indexed event and shows it in the `json` and `csv` output (the `table` format omits it to stay scannable):
 
-- **`query_text`** — the literal statement that produced the row event (`UPDATE users SET ...`), exactly as the application sent it. One statement covers all of its rows: a 500-row bulk `DELETE` yields 500 events sharing the same text, and each statement in a multi-statement transaction carries its own.
+- **`query_text`** — the literal statement that produced the row event (`UPDATE users SET ...`), as the application sent it (subject to the sanitization notes below). One statement covers all of its rows: a 500-row bulk `DELETE` yields 500 events sharing the same text, and each statement in a multi-statement transaction carries its own.
 - **`query_hash`** — MySQL's `STATEMENT_DIGEST()` of that text, computed against the **index** server at index time. Statements that differ only in literal values share one hash, so you can group by it to find the query patterns mutating a table ("which statement shape is behind this DELETE volume?").
 
-Capture is **opt-in at the source** and off by default:
+Capture is **opt-in at the source** — off by default on MySQL, on by default on MariaDB 10.2.4+:
 
 ```sql
 -- MySQL (dynamic, no restart; costs binlog bytes per statement):
 SET PERSIST binlog_rows_query_log_events = ON;
 
--- MariaDB (default ON since 10.2):
+-- MariaDB (default ON since 10.2.4):
 SET GLOBAL binlog_annotate_row_events = ON;
 ```
 
-`bintrail doctor` reports the setting. Events indexed while capture is off (and all events indexed before upgrading) simply have `NULL` in both columns — nothing else changes.
+`bintrail doctor` reports the setting. On MariaDB, **streaming** capture additionally needs `--source-flavor mariadb` — the server only forwards ANNOTATE events to a replica that asks for them (file-based `bintrail index` reads them regardless). Events indexed while capture is off (and all events indexed before upgrading) simply have `NULL` in both columns — nothing else changes.
 
 Notes:
 

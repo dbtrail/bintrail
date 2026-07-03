@@ -348,16 +348,20 @@ func TestCheckStatementCapture(t *testing.T) {
 	tests := []struct {
 		name            string
 		mysqlVar        mockSQLScalar  // SELECT @@binlog_rows_query_log_events
-		mariaVar        *mockSQLScalar // SELECT @@binlog_annotate_row_events (only probed on mysqlVar error)
+		mariaVar        *mockSQLScalar // SELECT @@binlog_annotate_row_events (only probed on a 1193 from mysqlVar)
 		wantStatus      CheckStatus
 		wantDetailFrag  string
 		wantRemediation bool
 	}{
 		{"mysql ON", row("1"), nil, StatusPass, "binlog_rows_query_log_events=ON", false},
 		{"mysql OFF", row("0"), nil, StatusWarn, "binlog_rows_query_log_events=OFF", true},
-		{"mariadb ON", errResp("Error 1193: Unknown system variable"), ptr(row("1")), StatusPass, "binlog_annotate_row_events=ON", false},
-		{"mariadb OFF", errResp("Error 1193: Unknown system variable"), ptr(row("OFF")), StatusWarn, "binlog_annotate_row_events=OFF", true},
-		{"neither variable", errResp("Error 1193"), ptr(errResp("Error 1193")), StatusSkip, "neither", false},
+		{"mariadb ON", mysqlErrResp(1193, "Unknown system variable 'binlog_rows_query_log_events'"), ptr(row("1")), StatusPass, "binlog_annotate_row_events=ON", false},
+		{"mariadb OFF", mysqlErrResp(1193, "Unknown system variable 'binlog_rows_query_log_events'"), ptr(row("OFF")), StatusWarn, "binlog_annotate_row_events=OFF", true},
+		{"neither variable", mysqlErrResp(1193, "Unknown system variable"), ptr(mysqlErrResp(1193, "Unknown system variable")), StatusSkip, "neither", false},
+		// A non-1193 failure is a READ problem, not a flavor fact — the real
+		// error must surface instead of a fabricated "not available" claim.
+		{"transient read failure", errResp("driver: bad connection"), nil, StatusWarn, "could not read binlog_rows_query_log_events: driver: bad connection", false},
+		{"mariadb probe read failure", mysqlErrResp(1193, "Unknown system variable"), ptr(errResp("driver: bad connection")), StatusWarn, "could not read binlog_annotate_row_events: driver: bad connection", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -404,6 +408,12 @@ type mockSQLScalar struct {
 
 func row(v string) mockSQLScalar       { return mockSQLScalar{value: v} }
 func errResp(msg string) mockSQLScalar { return mockSQLScalar{err: errors.New(msg)} }
+
+// mysqlErrResp mocks a typed MySQL server error (e.g. 1193 unknown system
+// variable) so checks that discriminate by error number can be exercised.
+func mysqlErrResp(number uint16, msg string) mockSQLScalar {
+	return mockSQLScalar{err: &mysql.MySQLError{Number: number, Message: msg}}
+}
 
 func (r mockSQLScalar) apply(exp *sqlmock.ExpectedQuery, col string) {
 	if r.err != nil {

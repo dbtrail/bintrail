@@ -335,9 +335,17 @@ func checkBinlogRetention(db *sql.DB) CheckResult {
 func checkStatementCapture(db *sql.DB) CheckResult {
 	const name = "Statement capture (query_text)"
 	isOn := func(val string) bool { return val == "1" || strings.EqualFold(val, "ON") }
+	// Only MySQL error 1193 (unknown system variable) means the variable is
+	// genuinely absent; any other failure is a read problem and must surface
+	// the real error rather than a fabricated flavor diagnosis.
+	isUnknownVar := func(err error) bool {
+		var myErr *mysql.MySQLError
+		return errors.As(err, &myErr) && myErr.Number == 1193
+	}
 
 	var val string
-	if err := db.QueryRow("SELECT @@binlog_rows_query_log_events").Scan(&val); err == nil {
+	err := db.QueryRow("SELECT @@binlog_rows_query_log_events").Scan(&val)
+	if err == nil {
 		if isOn(val) {
 			return CheckResult{Name: name, Status: StatusPass, Detail: "binlog_rows_query_log_events=ON"}
 		}
@@ -349,20 +357,40 @@ func checkStatementCapture(db *sql.DB) CheckResult {
 				"  SET PERSIST binlog_rows_query_log_events = ON;",
 		}
 	}
+	if !isUnknownVar(err) {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not read binlog_rows_query_log_events: " + err.Error(),
+		}
+	}
 
 	// MariaDB names the same capability binlog_annotate_row_events
-	// (default ON since 10.2.4).
-	if err := db.QueryRow("SELECT @@binlog_annotate_row_events").Scan(&val); err == nil {
+	// (default ON since 10.2.4). Note stream capture additionally requires
+	// `--source-flavor mariadb` so the syncer requests ANNOTATE events.
+	err = db.QueryRow("SELECT @@binlog_annotate_row_events").Scan(&val)
+	if err == nil {
 		if isOn(val) {
-			return CheckResult{Name: name, Status: StatusPass, Detail: "binlog_annotate_row_events=ON"}
+			return CheckResult{
+				Name:   name,
+				Status: StatusPass,
+				Detail: "binlog_annotate_row_events=ON (MariaDB; stream capture also needs --source-flavor mariadb)",
+			}
 		}
 		return CheckResult{
 			Name:   name,
 			Status: StatusWarn,
 			Detail: "binlog_annotate_row_events=OFF — events index without the originating SQL statement (query_text stays NULL)",
-			Remediation: "Optional: log the original statement with each row event so `bintrail query` can show it:\n\n" +
+			Remediation: "Optional: log the original statement with each row event so `bintrail query` can show it (stream capture also needs `--source-flavor mariadb`):\n\n" +
 				"  SET GLOBAL binlog_annotate_row_events = ON;\n\n" +
 				"Persist it in my.cnf ([mysqld] binlog_annotate_row_events=ON) to survive restarts.",
+		}
+	}
+	if !isUnknownVar(err) {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not read binlog_annotate_row_events: " + err.Error(),
 		}
 	}
 

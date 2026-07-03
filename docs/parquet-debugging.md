@@ -18,7 +18,7 @@ Verify with `duckdb --version`.
 
 ## Parquet Column Schema
 
-Archive Parquet files contain 15 columns (the `pk_hash` stored generated column is omitted):
+Archive Parquet files contain 17 columns (the `pk_hash` stored generated column is omitted):
 
 | Column | Type | Description |
 |--------|------|-------------|
