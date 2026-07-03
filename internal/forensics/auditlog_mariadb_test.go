@@ -305,6 +305,34 @@ func TestParseMariaDBFile_LocalTimeNote(t *testing.T) {
 	})
 }
 
+// TestParseMariaDBFile_OversizedRecordSkippedNotFatal proves the oversized-skip
+// path through a CSV parser (the end-to-end JSON case lives in auditlog_test.go):
+// a >1 MB record is skipped and counted, and the record AFTER it still parses —
+// the whole point of replacing bufio.Scanner, which aborted the file here.
+func TestParseMariaDBFile_OversizedRecordSkippedNotFatal(t *testing.T) {
+	l1 := `20240615 10:30:01,server1,alice,localhost,42,1,QUERY,test,'SELECT 1',0`
+	// The oversized record's internal shape is irrelevant — the scanner drops it
+	// by length before the CSV parser ever sees it.
+	huge := `20240615 10:30:02,server1,bob,localhost,43,2,QUERY,test,'` + strings.Repeat("x", maxAuditLineBytes+1) + `',0`
+	l3 := `20240615 10:30:03,server1,dave,localhost,44,3,QUERY,test,'SELECT 2',0`
+	input := l1 + "\n" + huge + "\n" + l3 + "\n"
+
+	events, _, skipped, _, err := parseMariaDBFile(strings.NewReader(input), auditLogFilter{})
+	if err != nil {
+		t.Fatalf("parseMariaDBFile: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2 (records bracketing the oversized one)", len(events))
+	}
+	if events[0].User != "alice" || events[1].User != "dave" {
+		t.Errorf("users = [%s, %s], want [alice, dave] — the record after the oversized one was lost",
+			events[0].User, events[1].User)
+	}
+	if skipped < 1 {
+		t.Errorf("skipped = %d, want >= 1 (the oversized record counted)", skipped)
+	}
+}
+
 // TestParseMariaDBFile_EpochMicrosFiltering proves that time filters work on
 // Aurora lines end-to-end: the epoch is normalised to RFC 3339 before the
 // filter runs.

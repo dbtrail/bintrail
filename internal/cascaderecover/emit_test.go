@@ -57,6 +57,38 @@ func TestEmitSQL_scriptBudgetRefusesCleanly(t *testing.T) {
 	}
 }
 
+// TestEmitSQL_unresolvedToastMarkerRefusesCleanly verifies the #592 guard on
+// the cascade path, hoisted for the same reason as the budget guard above: a
+// row carrying the residual unchanged-TOAST marker must refuse BEFORE the
+// preamble is written, leaving NO dangling `SET FOREIGN_KEY_CHECKS=0` on the
+// writer — GenerateSQLFromRows' own refusal would come after the preamble.
+func TestEmitSQL_unresolvedToastMarkerRefusesCleanly(t *testing.T) {
+	hdr := cascaderecover.Header{Schema: "shop", Table: "orders", Parents: 1, Children: 0}
+	rows := []query.ResultRow{{
+		EventType:  event.EventDelete,
+		SchemaName: "shop", TableName: "orders",
+		PKValues:  "1",
+		RowBefore: map[string]any{"id": "1", "body": map[string]any{event.UnchangedToastKey: true}},
+	}}
+
+	var buf bytes.Buffer
+	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, nil), rows, nil, nil, hdr)
+	if err == nil {
+		t.Fatalf("expected a loud error, got n=%d output:\n%s", n, buf.String())
+	}
+	for _, want := range []string{"unresolved unchanged-TOAST marker", "capture invariant violated", "shop.orders", "body"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q:\n%s", want, err)
+		}
+	}
+	if n != 0 {
+		t.Errorf("want 0 statements on refusal, got %d", n)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("refusal must write nothing (no dangling FK-disable), wrote %d bytes: %q", buf.Len(), buf.String())
+	}
+}
+
 // TestEmitSQL_goldenPhase1 pins the byte-exact Phase-1 (no baseline) script: the
 // full preamble (including the literal em-dash in the Phase-1 line), the
 // FK-checks wrapper, and the empty-result body.

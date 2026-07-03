@@ -101,6 +101,102 @@ func TestMergeBaseline_passthroughOnly(t *testing.T) {
 	}
 }
 
+// TestMergeBaseline_unresolvedToastMarker is the #592 guard on the full-table
+// mydumper path: a change-map event carrying the residual unchanged-TOAST
+// marker must refuse the whole table BEFORE any output exists — writing the
+// marker's JSON into a reconstructed dump is silent corruption. The
+// checkChangesToast scan runs at the top of mergeBaselineIntoWriter, before the
+// writer opens; the shim's full-table _snapshot entry point has its own call
+// (TestSnapshotFullTableImages_unresolvedToastMarker below).
+func TestMergeBaseline_unresolvedToastMarker(t *testing.T) {
+	baselinePath := writeTestBaseline(t, [][]string{
+		{"1", "new"},
+		{"2", "paid"},
+	})
+	outDir := t.TempDir()
+
+	rep := &TableReport{Schema: "mydb", Table: "orders"}
+	err := mergeBaselineIntoWriter(context.Background(), mergeInput{
+		LocalBaselinePath: baselinePath,
+		CreateTableSQL:    "-- test",
+		Schema:            "mydb",
+		Table:             "orders",
+		PKCols:            pkColsIntID(),
+		Changes: map[string]*query.ResultRow{
+			pkStrForInt(2): {
+				EventType:  event.EventUpdate,
+				SchemaName: "mydb", TableName: "orders", PKValues: pkStrForInt(2),
+				RowAfter: map[string]any{"id": "2", "status": toastMarker()},
+			},
+		},
+		OutputDir: outDir,
+		ChunkSize: 0,
+	}, rep)
+	if err == nil {
+		t.Fatal("expected a loud error for a marker-carrying change")
+	}
+	for _, want := range []string{"unresolved unchanged-TOAST marker", "capture invariant violated", "mydb.orders", "status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q:\n%s", want, err)
+		}
+	}
+	// The scan runs BEFORE the writer opens, so the refusal must leave nothing
+	// behind — not even the schema header file.
+	entries, rerr := os.ReadDir(outDir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 0 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("refusal left partial output in outDir: %v", names)
+	}
+}
+
+// TestSnapshotFullTableImages_unresolvedToastMarker pins the #592 guard on the
+// shim's full-table _snapshot entry point INDEPENDENTLY of the mydumper path: a
+// refactor that dropped the checkChangesToast call from SnapshotFullTableImages
+// (leaving only mergeBaselineIntoWriter's) would stay green everywhere else.
+// The BaselinePath deliberately points nowhere and the emit callback records
+// invocations: the refusal must happen BEFORE baseline materialization (no
+// "materialize baseline" error; in production that step can be an S3 download)
+// and before a single row is emitted.
+func TestSnapshotFullTableImages_unresolvedToastMarker(t *testing.T) {
+	emitted := 0
+	err := SnapshotFullTableImages(context.Background(), SnapshotFullTableInput{
+		BaselinePath: "/nonexistent/never-touched/baseline.parquet",
+		Schema:       "mydb",
+		Table:        "orders",
+		PKCols:       pkColsIntID(),
+		Changes: map[string]*query.ResultRow{
+			pkStrForInt(1): {
+				EventType:  event.EventUpdate,
+				SchemaName: "mydb", TableName: "orders", PKValues: pkStrForInt(1),
+				RowAfter: map[string]any{"id": "1", "status": toastMarker()},
+			},
+		},
+	}, func(map[string]any) error {
+		emitted++
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected a loud error for a marker-carrying change")
+	}
+	for _, want := range []string{"unresolved unchanged-TOAST marker", "capture invariant violated", "mydb.orders", "status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q:\n%s", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "materialize baseline") {
+		t.Errorf("refusal must fire BEFORE baseline materialization, got: %v", err)
+	}
+	if emitted != 0 {
+		t.Errorf("refusal must emit no rows, emitted %d", emitted)
+	}
+}
+
 // writeBlobTextBaseline creates a baseline (id INT, tx TEXT, bl BLOB). TEXT maps
 // to parquet.String() (DuckDB scans it back as a Go string), BLOB to
 // ByteArrayType (DuckDB []byte) — the type asymmetry behind #660.

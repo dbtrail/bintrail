@@ -327,10 +327,23 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	//    outcomes: present-with-state / existed-then-deleted-as-of-`at` / never.
 	existed := baselineRow != nil || len(rows) > 0
 	if history {
+		entries, err := reconstruct.BuildHistory(baselineRow, snapshotTime, rows, atTime)
+		if err != nil {
+			// Residual unchanged-TOAST marker (#592): the stored images can't
+			// yield a correct reconstruction. 422 like the coverage-gap refusal —
+			// the request is well-formed, the captured history is not usable.
+			writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
 		resp.Found = existed
-		resp.History = toStateEntryDTOs(reconstruct.BuildHistory(baselineRow, snapshotTime, rows, atTime))
+		resp.History = toStateEntryDTOs(entries)
 	} else {
-		switch state := reconstruct.ApplyAt(baselineRow, rows, atTime); {
+		state, err := reconstruct.ApplyAt(baselineRow, rows, atTime)
+		if err != nil {
+			writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		switch {
 		case state != nil:
 			resp.Found, resp.State = true, state
 		case existed:

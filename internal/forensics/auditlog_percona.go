@@ -1,7 +1,6 @@
 package forensics
 
 import (
-	"bufio"
 	"io"
 	"strings"
 )
@@ -17,8 +16,7 @@ import (
 func parsePerconaCSV(r io.Reader, filter auditLogFilter) ([]AuditEvent, int, int, error) {
 	var events []AuditEvent
 	totalScanned, skipped := 0, 0
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 256*1024), 1024*1024)
+	scanner := newAuditLineScanner(r)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -67,6 +65,7 @@ func parsePerconaCSV(r io.Reader, filter auditLogFilter) ([]AuditEvent, int, int
 			break
 		}
 	}
+	skipped = foldOversized(scanner, skipped)
 	return events, totalScanned, skipped, scanner.Err()
 }
 

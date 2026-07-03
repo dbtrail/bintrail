@@ -15,25 +15,13 @@ import (
 
 // UnchangedToastKey is the single key of the structurally-distinct marker the
 // decoder emits for an unchanged-TOAST value ('u') that could NOT be resolved from
-// the before-image. It is a one-key map[string]any, deliberately NOT a plain
-// string, so it can never collide with a real text column that legitimately holds
-// the literal "<unchanged-toast>": the indexer serializes a map as a JSON object,
-// while every real text value is a Go string, so the two are structurally distinct
-// on disk and any consumer can detect the marker by a type switch on the reserved
-// key.
-//
-// Under REPLICA IDENTITY FULL — the mode bintrail requires (#531) — the before-
-// image always carries the real unchanged value, so the decoder resolves 'u' from
-// it (RowAfter[col] = RowBefore[col]) and this marker is never persisted. The
-// marker is only reachable under a weaker replica identity, where it keeps the
-// column visible rather than silently dropped (the never-drop floor).
-//
-// Forward constraint: the collision-freedom argument ("every real value is a Go
-// string, the marker is a map") holds only while #530 stores all values as text.
-// When #533 introduces type-faithful rendering (e.g. parsing jsonb into a map),
-// non-string values appear and this structural-distinctness must be re-validated —
-// it is the same #533 that consumes relColumn's retained type OIDs.
-const UnchangedToastKey = "__bintrail_unchanged_toast__"
+// the before-image. The canonical constant and its full rationale (why a one-key
+// map, the RI-FULL never-persisted invariant, the #533 forward constraint) live in
+// the source-neutral internal/event package: the read side — recovery, reconstruct,
+// the shim — must detect a residual marker and fail loud (#592), and the #528
+// depguard bans those packages from linking pgcapture. Aliased here so the decoder
+// and its tests keep reading naturally.
+const UnchangedToastKey = event.UnchangedToastKey
 
 // Decoder turns a pgoutput logical-replication message stream into source-neutral
 // event.Event values. It is stateful across messages within a stream: it caches

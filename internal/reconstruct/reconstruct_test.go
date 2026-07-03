@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -27,10 +28,38 @@ var (
 	t3 = time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
 )
 
+// mustApplyAt / mustBuildHistory wrap the fold entry points for the tests that
+// exercise fold SEMANTICS, where an error (only possible from the #592
+// unchanged-TOAST guard) is a test failure. The guard itself is tested
+// explicitly in TestApplyAt_unresolvedToastMarker* below.
+func mustApplyAt(t *testing.T, initialState map[string]any, events []query.ResultRow, at time.Time) map[string]any {
+	t.Helper()
+	state, err := ApplyAt(initialState, events, at)
+	if err != nil {
+		t.Fatalf("ApplyAt: %v", err)
+	}
+	return state
+}
+
+func mustBuildHistory(t *testing.T, initialState map[string]any, baselineTime time.Time, events []query.ResultRow, at time.Time) []StateEntry {
+	t.Helper()
+	entries, err := BuildHistory(initialState, baselineTime, events, at)
+	if err != nil {
+		t.Fatalf("BuildHistory: %v", err)
+	}
+	return entries
+}
+
+// toastMarker builds the exact residual unchanged-TOAST marker shape the PG
+// decoder emits and the index round-trips (#592).
+func toastMarker() map[string]any {
+	return map[string]any{event.UnchangedToastKey: true}
+}
+
 // ─── ApplyAt ──────────────────────────────────────────────────────────────────
 
 func TestApplyAt_noEvents(t *testing.T) {
-	state := ApplyAt(baselineState, nil, t3)
+	state := mustApplyAt(t, baselineState, nil, t3)
 	if state == nil {
 		t.Fatal("expected non-nil state with no events")
 	}
@@ -46,7 +75,7 @@ func TestApplyAt_insert(t *testing.T) {
 		EventType:      parser.EventInsert,
 		RowAfter:       after,
 	}}
-	state := ApplyAt(nil, events, t3)
+	state := mustApplyAt(t, nil, events, t3)
 	if state == nil {
 		t.Fatal("expected non-nil state after INSERT")
 	}
@@ -62,7 +91,7 @@ func TestApplyAt_update(t *testing.T) {
 		EventType:      parser.EventUpdate,
 		RowAfter:       after,
 	}}
-	state := ApplyAt(baselineState, events, t3)
+	state := mustApplyAt(t, baselineState, events, t3)
 	if state["status"] != "published" {
 		t.Errorf("expected status=published after UPDATE, got %v", state["status"])
 	}
@@ -77,7 +106,7 @@ func TestApplyAt_delete(t *testing.T) {
 		EventType:      parser.EventDelete,
 		RowBefore:      baselineState,
 	}}
-	state := ApplyAt(baselineState, events, t3)
+	state := mustApplyAt(t, baselineState, events, t3)
 	if state != nil {
 		t.Errorf("expected nil state after DELETE, got %v", state)
 	}
@@ -91,7 +120,7 @@ func TestApplyAt_cutoff(t *testing.T) {
 		EventType:      parser.EventUpdate,
 		RowAfter:       after,
 	}}
-	state := ApplyAt(baselineState, events, t1)
+	state := mustApplyAt(t, baselineState, events, t1)
 	if state["status"] != "draft" {
 		t.Errorf("expected status=draft (event not yet applied at t1), got %v", state["status"])
 	}
@@ -107,11 +136,11 @@ func TestApplyAt_insertUpdateDelete(t *testing.T) {
 	}
 
 	// Final state (after DELETE): nil.
-	if state := ApplyAt(nil, events, t3); state != nil {
+	if state := mustApplyAt(t, nil, events, t3); state != nil {
 		t.Errorf("expected nil state after INSERT→UPDATE→DELETE, got %v", state)
 	}
 	// At t2 (after UPDATE, before DELETE): active.
-	state := ApplyAt(nil, events, t2)
+	state := mustApplyAt(t, nil, events, t2)
 	if state == nil {
 		t.Fatal("expected non-nil state at t2")
 	}
@@ -122,17 +151,101 @@ func TestApplyAt_insertUpdateDelete(t *testing.T) {
 
 func TestApplyAt_independentCopy(t *testing.T) {
 	// Modifying the returned state must not affect baselineState.
-	state := ApplyAt(baselineState, nil, t3)
+	state := mustApplyAt(t, baselineState, nil, t3)
 	state["status"] = "mutated"
 	if baselineState["status"] != "draft" {
 		t.Error("ApplyAt must return an independent copy of the state")
 	}
 }
 
+// TestApplyAt_unresolvedToastMarker is the #592 acceptance test for the
+// reconstruct fold: a synthetic event carrying the residual unchanged-TOAST
+// marker must fail LOUD, never fold the marker into the reconstructed state.
+func TestApplyAt_unresolvedToastMarker(t *testing.T) {
+	events := []query.ResultRow{{
+		EventTimestamp: t1,
+		EventType:      parser.EventUpdate,
+		SchemaName:     "public", TableName: "docs", PKValues: "42",
+		RowAfter: map[string]any{"id": "42", "body": toastMarker()},
+	}}
+	state, err := ApplyAt(baselineState, events, t3)
+	if err == nil {
+		t.Fatalf("expected a loud error, got state %v", state)
+	}
+	for _, want := range []string{"unresolved unchanged-TOAST marker", "capture invariant violated", "public.docs", "body"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q:\n%s", want, err)
+		}
+	}
+	// Same guard on the marker sitting in row_before: either image proves the
+	// capture invariant was violated for this event.
+	events[0].RowAfter = map[string]any{"id": "42", "body": "real"}
+	events[0].RowBefore = map[string]any{"id": "42", "body": toastMarker()}
+	if _, err := ApplyAt(baselineState, events, t3); err == nil {
+		t.Error("expected a loud error for a marker in row_before")
+	}
+}
+
+// A marker in an event AFTER the cutoff is never folded, so it must not refuse:
+// the reconstruction at `at` is built entirely from clean images.
+func TestApplyAt_unresolvedToastMarkerAfterCutoffIgnored(t *testing.T) {
+	events := []query.ResultRow{
+		{EventTimestamp: t1, EventType: parser.EventUpdate,
+			RowAfter: map[string]any{"id": int64(42), "status": "active"}},
+		{EventTimestamp: t3, EventType: parser.EventUpdate,
+			RowAfter: map[string]any{"id": int64(42), "status": toastMarker()}},
+	}
+	state, err := ApplyAt(baselineState, events, t2)
+	if err != nil {
+		t.Fatalf("marker beyond the cutoff must not refuse: %v", err)
+	}
+	if state["status"] != "active" {
+		t.Errorf("expected status=active at t2, got %v", state["status"])
+	}
+}
+
+func TestBuildHistory_unresolvedToastMarker(t *testing.T) {
+	events := []query.ResultRow{{
+		EventTimestamp: t1, EventType: parser.EventInsert,
+		SchemaName: "public", TableName: "docs", PKValues: "42",
+		RowAfter: map[string]any{"id": "42", "body": toastMarker()},
+	}}
+	entries, err := BuildHistory(nil, t0, events, t3)
+	if err == nil {
+		t.Fatalf("expected a loud error, got %d entries", len(entries))
+	}
+	if !strings.Contains(err.Error(), "unresolved unchanged-TOAST marker") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// Sibling of TestApplyAt_unresolvedToastMarkerAfterCutoffIgnored: BuildHistory
+// shares the identical cutoff break, so a marker in an event AFTER `at` is
+// never folded and must not refuse — the history at `at` is built entirely
+// from clean images.
+func TestBuildHistory_unresolvedToastMarkerAfterCutoffIgnored(t *testing.T) {
+	events := []query.ResultRow{
+		{EventTimestamp: t1, EventType: parser.EventUpdate,
+			RowAfter: map[string]any{"id": int64(42), "status": "active"}},
+		{EventTimestamp: t3, EventType: parser.EventUpdate,
+			RowAfter: map[string]any{"id": int64(42), "status": toastMarker()}},
+	}
+	entries, err := BuildHistory(baselineState, t0, events, t2)
+	if err != nil {
+		t.Fatalf("marker beyond the cutoff must not refuse: %v", err)
+	}
+	if len(entries) != 2 { // baseline + the t1 UPDATE
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if entries[1].State["status"] != "active" {
+		t.Errorf("expected status=active at t2, got %v", entries[1].State["status"])
+	}
+}
+
 // ─── BuildHistory ─────────────────────────────────────────────────────────────
 
 func TestBuildHistory_baselineOnly(t *testing.T) {
-	entries := BuildHistory(baselineState, t0, nil, t3)
+	entries := mustBuildHistory(t, baselineState, t0, nil, t3)
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 entry (baseline only), got %d", len(entries))
 	}
@@ -156,7 +269,7 @@ func TestBuildHistory_insertUpdateDelete(t *testing.T) {
 		{EventTimestamp: t2, EventType: parser.EventUpdate, RowAfter: updated, EventID: 20, GTID: &gtidStr},
 		{EventTimestamp: t3, EventType: parser.EventDelete, RowBefore: updated, EventID: 30},
 	}
-	entries := BuildHistory(nil, t0, events, t3)
+	entries := mustBuildHistory(t, nil, t0, events, t3)
 
 	if len(entries) != 4 { // baseline + 3 events
 		t.Fatalf("expected 4 entries, got %d", len(entries))
@@ -183,7 +296,7 @@ func TestBuildHistory_cutoff(t *testing.T) {
 		EventID:        99,
 	}}
 	// at=t2: delete at t3 should not appear.
-	entries := BuildHistory(baselineState, t0, events, t2)
+	entries := mustBuildHistory(t, baselineState, t0, events, t2)
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 entry (delete excluded by cutoff), got %d", len(entries))
 	}

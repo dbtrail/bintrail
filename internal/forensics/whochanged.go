@@ -17,12 +17,14 @@ import (
 type Confidence string
 
 // Confidence tiers (epic #701): exact means the identity join is positively
-// bounded (an audit-log CONNECT..DISCONNECT lifetime containing the event, a
-// GTID transaction join, or a live performance_schema session); corroborated
-// means the identity matched but its session lifetime could not be verified
-// (nearest audit record without brackets, or the connection_cache); heuristic
-// means we had to choose between multiple plausible identities (e.g. two audit
-// lifetimes abutting within the log's one-second granularity).
+// bounded (an audit-log CONNECT..DISCONNECT lifetime containing the event, or a
+// GTID transaction join); corroborated means the identity matched but its
+// session lifetime could not be verified (nearest audit record without
+// brackets, the connection_cache, or a live performance_schema session — which
+// reflects the current holder of the connection id, and that id may have been
+// reused since the event); heuristic means we had to choose between multiple
+// plausible identities (e.g. two audit lifetimes abutting within the log's
+// one-second granularity).
 const (
 	ConfidenceExact        Confidence = "exact"
 	ConfidenceCorroborated Confidence = "corroborated"
@@ -104,6 +106,15 @@ type WhoChangedDeps struct {
 	// SourceDB is the watched MySQL server, used for the audit-log, GTID, and
 	// live performance_schema tiers. nil skips those tiers (index-only mode).
 	SourceDB *sql.DB
+	// SourceHost is the resolved host[:port] of the source server (from the
+	// source DSN). It lets the audit-log tier reach the RDS/Aurora audit source
+	// (the RDS file API) when the server's audit log is not on the local
+	// filesystem — without it, AuditSourceAuto never leaves the local-file path
+	// and the RDS/Aurora audit tier is silently never tried. (The who-changed
+	// path always runs auto mode, which never reaches CloudWatch; that source is
+	// only selected by an explicit Source="cloudwatch" on the agent request.)
+	// Empty => local-file audit reads only.
+	SourceHost string
 	// IndexDB is the bintrail index database, used for the connection_cache
 	// tier (#703). nil skips that tier.
 	IndexDB *sql.DB
@@ -304,7 +315,7 @@ func attributeEvents(ctx context.Context, deps WhoChangedDeps, rows []query.Resu
 				"index-side sources ran.")
 			deps.SourceDB = nil // local copy: disable the source tiers below
 		} else if caps.AuditLog.Installed {
-			auditRes, aerr := ReadAuditLog(ctx, deps.SourceDB, auditReadOptionsFor(rows))
+			auditRes, aerr := ReadAuditLog(ctx, deps.SourceDB, auditReadOptionsFor(rows, deps.SourceHost))
 			switch {
 			case aerr != nil:
 				// Not configured / file on another host / unknown format —
@@ -433,7 +444,13 @@ func attributeEvents(ctx context.Context, deps WhoChangedDeps, rows []query.Resu
 // (MariaDB family writes server-local time) are parsed as UTC, so on a server
 // whose local time is not UTC the audit window and interval matching skew by
 // the zone offset. Percona/Enterprise JSON timestamps carry Z and are exact.
-func auditReadOptionsFor(rows []query.ResultRow) AuditReadOptions {
+//
+// sourceHost is the source server's host[:port]; passing it through as
+// AuditReadOptions.SourceHost lets AuditSourceAuto fall back to the RDS file API
+// for a managed RDS/Aurora source whose audit log is not on the local
+// filesystem. Empty => local-file only. (Auto mode never reaches CloudWatch —
+// that source requires an explicit Source="cloudwatch".)
+func auditReadOptionsFor(rows []query.ResultRow, sourceHost string) AuditReadOptions {
 	minTS, maxTS := rows[0].EventTimestamp, rows[0].EventTimestamp
 	for _, r := range rows[1:] {
 		if r.EventTimestamp.Before(minTS) {
@@ -447,6 +464,7 @@ func auditReadOptionsFor(rows []query.ResultRow) AuditReadOptions {
 		Since:          minTS.Add(-auditWindowPad),
 		Until:          maxTS.Add(auditWindowPad),
 		Limit:          auditMaxLimit,
+		SourceHost:     sourceHost,
 		IncludeRotated: true,
 		TailLines:      -1,
 	}
@@ -513,7 +531,13 @@ func lookupLiveThreads(ctx context.Context, sourceDB *sql.DB, ids []int64) (map[
 				Host:          ti.Host,
 				ClientProgram: ti.ConnAttrs["program_name"],
 				Source:        AttributionSourcePerfSchema,
-				Confidence:    ConfidenceExact,
+				// Corroborated, not exact: this is the CURRENT holder of the
+				// connection id, whose lifetime is not bounded against the
+				// event. A reused id (or COM_CHANGE_USER) can make the live
+				// session a different actor than the one that ran the event —
+				// the exact tiers (audit CONNECT..DISCONNECT, GTID) are the ones
+				// that positively bound identity to the event.
+				Confidence: ConfidenceCorroborated,
 			}
 		}
 	}

@@ -1,7 +1,6 @@
 package forensics
 
 import (
-	"bufio"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -23,8 +22,7 @@ import (
 func parseAuditJSON(r io.Reader, filter auditLogFilter) ([]AuditEvent, int, int, error) {
 	var events []AuditEvent
 	totalScanned, skipped := 0, 0
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 256*1024), 1024*1024) // up to 1 MB per line
+	scanner := newAuditLineScanner(r)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -57,6 +55,7 @@ func parseAuditJSON(r io.Reader, filter auditLogFilter) ([]AuditEvent, int, int,
 			break
 		}
 	}
+	skipped = foldOversized(scanner, skipped)
 	return events, totalScanned, skipped, scanner.Err()
 }
 
