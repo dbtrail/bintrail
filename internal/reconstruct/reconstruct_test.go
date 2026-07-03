@@ -219,6 +219,29 @@ func TestBuildHistory_unresolvedToastMarker(t *testing.T) {
 	}
 }
 
+// Sibling of TestApplyAt_unresolvedToastMarkerAfterCutoffIgnored: BuildHistory
+// shares the identical cutoff break, so a marker in an event AFTER `at` is
+// never folded and must not refuse — the history at `at` is built entirely
+// from clean images.
+func TestBuildHistory_unresolvedToastMarkerAfterCutoffIgnored(t *testing.T) {
+	events := []query.ResultRow{
+		{EventTimestamp: t1, EventType: parser.EventUpdate,
+			RowAfter: map[string]any{"id": int64(42), "status": "active"}},
+		{EventTimestamp: t3, EventType: parser.EventUpdate,
+			RowAfter: map[string]any{"id": int64(42), "status": toastMarker()}},
+	}
+	entries, err := BuildHistory(baselineState, t0, events, t2)
+	if err != nil {
+		t.Fatalf("marker beyond the cutoff must not refuse: %v", err)
+	}
+	if len(entries) != 2 { // baseline + the t1 UPDATE
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if entries[1].State["status"] != "active" {
+		t.Errorf("expected status=active at t2, got %v", entries[1].State["status"])
+	}
+}
+
 // ─── BuildHistory ─────────────────────────────────────────────────────────────
 
 func TestBuildHistory_baselineOnly(t *testing.T) {

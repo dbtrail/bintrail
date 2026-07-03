@@ -1,12 +1,12 @@
 package event_test
 
 import (
-	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/event"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // TestUnchangedToastKeyStable pins the on-disk contract: the marker is
@@ -22,13 +22,14 @@ func TestUnchangedToastKeyStable(t *testing.T) {
 func TestIsUnchangedToastMarker(t *testing.T) {
 	marker := map[string]any{event.UnchangedToastKey: true}
 
-	// The marker as the decoder emits it, and as it round-trips through the
-	// index's JSON columns (json.Unmarshal of {"__bintrail_unchanged_toast__":true}).
-	var roundTripped any
-	if err := json.Unmarshal([]byte(`{"`+event.UnchangedToastKey+`":true}`), &roundTripped); err != nil {
-		t.Fatal(err)
+	// The marker as the decoder emits it, and as it comes back out of a stored
+	// row image via query.UnmarshalRowImage (UseNumber) — the REAL read-path
+	// decoder every #592 guard consumes images from, not a plain json.Unmarshal.
+	image := query.UnmarshalRowImage([]byte(`{"body":{"` + event.UnchangedToastKey + `":true}}`))
+	if image == nil {
+		t.Fatal("UnmarshalRowImage returned nil for a valid image")
 	}
-	for name, v := range map[string]any{"decoder shape": marker, "JSON round-trip": roundTripped} {
+	for name, v := range map[string]any{"decoder shape": marker, "UnmarshalRowImage round-trip": image["body"]} {
 		if !event.IsUnchangedToastMarker(v) {
 			t.Errorf("%s: expected marker to be detected: %#v", name, v)
 		}
