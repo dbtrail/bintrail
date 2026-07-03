@@ -115,8 +115,12 @@ func TestIntegrationWhoChanged_LiveThenCacheCascade(t *testing.T) {
 	if live.Attribution.Source != AttributionSourcePerfSchema {
 		t.Errorf("live source = %q, want %q", live.Attribution.Source, AttributionSourcePerfSchema)
 	}
-	if live.Attribution.Confidence != ConfidenceExact {
-		t.Errorf("live confidence = %q, want %q", live.Attribution.Confidence, ConfidenceExact)
+	// Corroborated, not exact: the live performance_schema tier reports the
+	// current holder of the connection id, whose session lifetime is not bounded
+	// against the event (a reused id could be a different actor). Only the audit
+	// CONNECT..DISCONNECT and GTID tiers earn "exact".
+	if live.Attribution.Confidence != ConfidenceCorroborated {
+		t.Errorf("live confidence = %q, want %q", live.Attribution.Confidence, ConfidenceCorroborated)
 	}
 	if live.Attribution.User != "root" {
 		t.Errorf("live user = %q, want root", live.Attribution.User)

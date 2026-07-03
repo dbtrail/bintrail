@@ -17,12 +17,14 @@ import (
 type Confidence string
 
 // Confidence tiers (epic #701): exact means the identity join is positively
-// bounded (an audit-log CONNECT..DISCONNECT lifetime containing the event, a
-// GTID transaction join, or a live performance_schema session); corroborated
-// means the identity matched but its session lifetime could not be verified
-// (nearest audit record without brackets, or the connection_cache); heuristic
-// means we had to choose between multiple plausible identities (e.g. two audit
-// lifetimes abutting within the log's one-second granularity).
+// bounded (an audit-log CONNECT..DISCONNECT lifetime containing the event, or a
+// GTID transaction join); corroborated means the identity matched but its
+// session lifetime could not be verified (nearest audit record without
+// brackets, the connection_cache, or a live performance_schema session — which
+// reflects the current holder of the connection id, and that id may have been
+// reused since the event); heuristic means we had to choose between multiple
+// plausible identities (e.g. two audit lifetimes abutting within the log's
+// one-second granularity).
 const (
 	ConfidenceExact        Confidence = "exact"
 	ConfidenceCorroborated Confidence = "corroborated"
@@ -529,7 +531,13 @@ func lookupLiveThreads(ctx context.Context, sourceDB *sql.DB, ids []int64) (map[
 				Host:          ti.Host,
 				ClientProgram: ti.ConnAttrs["program_name"],
 				Source:        AttributionSourcePerfSchema,
-				Confidence:    ConfidenceExact,
+				// Corroborated, not exact: this is the CURRENT holder of the
+				// connection id, whose lifetime is not bounded against the
+				// event. A reused id (or COM_CHANGE_USER) can make the live
+				// session a different actor than the one that ran the event —
+				// the exact tiers (audit CONNECT..DISCONNECT, GTID) are the ones
+				// that positively bound identity to the event.
+				Confidence: ConfidenceCorroborated,
 			}
 		}
 	}
