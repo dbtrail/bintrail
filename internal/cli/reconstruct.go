@@ -315,33 +315,47 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	// not its base64 text (#666). Baseline rows are read raw and untouched.
 	reconstruct.DecodeEventBinaries(db, recSchema, recTable, events)
 
-	// Warn if there is a gap between the baseline binlog position and the
-	// first indexed event — events in that gap are missing from the reconstruction.
-	if bmeta.BinlogFile == "" && len(events) > 0 {
-		slog.Info("gap detection skipped — baseline lacks binlog position metadata; consider re-running 'bintrail baseline' to embed position data")
+	// Warn if there is a gap between the baseline position and the first indexed
+	// event — events in that gap are missing from the reconstruction. The
+	// comparable anchor is flavor-dependent (#593): PostgreSQL baselines anchor
+	// on the numeric WAL LSN (baseline.MetaKeyLSN); MySQL/MariaDB on binlog
+	// file+pos. PG LSN TEXT ("0/1A2B3C4") is NOT lexically ordered, so the
+	// binlog_file column must never be compared for a PG source — see
+	// reconstruct.GapDetected.
+	flavor := query.SourceFlavor(db)
+	isPostgres := flavor == "postgres"
+	anchorPresent := bmeta.BinlogFile != ""
+	if isPostgres {
+		anchorPresent = bmeta.LSN != 0
 	}
-	if bmeta.BinlogFile != "" && len(events) > 0 {
+	if !anchorPresent && len(events) > 0 {
+		slog.Info("gap detection skipped — baseline lacks position metadata; consider re-running 'bintrail baseline' to embed position data",
+			"flavor", flavor)
+	}
+	if anchorPresent && len(events) > 0 {
 		first := events[0]
-		// A NULL binlog_file on the first event has no comparable position —
-		// skip the gap check rather than silently degrade to "no gap"
-		// (mirrors the bmeta.BinlogFile == "" branch above).
-		// See dbtrail/bintrail#318.
-		if first.BinlogFile == "" {
-			slog.Warn("gap detection skipped — first indexed event lacks binlog_file metadata",
+		// A first event with no comparable position — NULL binlog_file (MySQL)
+		// or a zero LSN (PostgreSQL; 0 is not a valid WAL position) — skips the
+		// gap check rather than silently degrade to "no gap" (mirrors the
+		// anchor-absent branch above). See dbtrail/bintrail#318.
+		eventPosMissing := first.BinlogFile == ""
+		if isPostgres {
+			eventPosMissing = first.StartPos == 0
+		}
+		if eventPosMissing {
+			slog.Warn("gap detection skipped — first indexed event lacks position metadata",
 				"event_id", first.EventID,
 				"baseline_file", bmeta.BinlogFile,
-				"baseline_pos", bmeta.BinlogPos)
-		} else {
-			gap := first.BinlogFile > bmeta.BinlogFile ||
-				(first.BinlogFile == bmeta.BinlogFile && first.StartPos > uint64(bmeta.BinlogPos))
-			if gap {
-				slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
-					"baseline_file", bmeta.BinlogFile,
-					"baseline_pos", bmeta.BinlogPos,
-					"baseline_gtid", bmeta.GTIDSet,
-					"first_event_file", first.BinlogFile,
-					"first_event_pos", first.StartPos)
-			}
+				"baseline_pos", bmeta.BinlogPos,
+				"baseline_lsn", bmeta.LSN)
+		} else if reconstruct.GapDetected(flavor, first.BinlogFile, first.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN) {
+			slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
+				"baseline_file", bmeta.BinlogFile,
+				"baseline_pos", bmeta.BinlogPos,
+				"baseline_gtid", bmeta.GTIDSet,
+				"baseline_lsn", bmeta.LSN,
+				"first_event_file", first.BinlogFile,
+				"first_event_pos", first.StartPos)
 		}
 	}
 

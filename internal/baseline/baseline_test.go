@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1821,6 +1822,85 @@ func TestReadParquetMetadata_noPosition(t *testing.T) {
 	if m.GTIDSet != "" {
 		t.Errorf("GTIDSet = %q, want empty", m.GTIDSet)
 	}
+	if m.LSN != 0 {
+		t.Errorf("LSN = %d, want 0", m.LSN)
+	}
+}
+
+// Round-trip of the PG WAL LSN anchor (#593 slice A): written as the decimal
+// string of the uint64 LSN, read back numerically.
+func TestReadParquetMetadata_LSN(t *testing.T) {
+	outPath := filepath.Join(t.TempDir(), "test.parquet")
+	cols := []Column{
+		{Name: "id", MySQLType: "int", ParquetType: parquet.Leaf(parquet.Int32Type)},
+	}
+	// 1/6B37B4C8 — an LSN whose text form would be lexically treacherous;
+	// the metadata stores the plain decimal uint64.
+	const wantLSN uint64 = 6093515976
+	w, err := NewWriter(outPath, cols, WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 100,
+		Metadata: map[string]string{
+			MetaKeyLSN: strconv.FormatUint(wantLSN, 10),
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.WriteRow([]string{"1"}, []bool{false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	m, err := ReadParquetMetadata(outPath)
+	if err != nil {
+		t.Fatalf("ReadParquetMetadata: %v", err)
+	}
+	if m.LSN != wantLSN {
+		t.Errorf("LSN = %d, want %d", m.LSN, wantLSN)
+	}
+	if m.BinlogFile != "" || m.BinlogPos != 0 {
+		t.Errorf("BinlogFile/BinlogPos = %q/%d, want empty/0 (PG baseline)", m.BinlogFile, m.BinlogPos)
+	}
+}
+
+// A corrupt LSN value warns and leaves LSN zero (mirrors the BinlogPos branch);
+// the read itself must not fail.
+func TestReadParquetMetadata_corruptLSN(t *testing.T) {
+	outPath := filepath.Join(t.TempDir(), "test.parquet")
+	cols := []Column{
+		{Name: "id", MySQLType: "int", ParquetType: parquet.Leaf(parquet.Int32Type)},
+	}
+	w, err := NewWriter(outPath, cols, WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 100,
+		Metadata: map[string]string{
+			MetaKeyLSN:        "0/1A2B3C4", // LSN TEXT form — not the decimal contract
+			MetaKeyBinlogFile: "binlog.000042",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.WriteRow([]string{"1"}, []bool{false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	m, err := ReadParquetMetadata(outPath)
+	if err != nil {
+		t.Fatalf("ReadParquetMetadata: %v", err)
+	}
+	if m.LSN != 0 {
+		t.Errorf("LSN = %d, want 0 (corrupt value zeroed)", m.LSN)
+	}
+	if m.BinlogFile != "binlog.000042" {
+		t.Errorf("BinlogFile = %q, want %q (other keys unaffected)", m.BinlogFile, "binlog.000042")
+	}
 }
 
 // ─── parseBaselineDirTimestamp ────────────────────────────────────────────────
@@ -1920,6 +2000,52 @@ func TestDiscoverBaselines(t *testing.T) {
 	}
 	if b.GTIDSet != "abc:1-100" {
 		t.Errorf("GTIDSet = %q, want %q", b.GTIDSet, "abc:1-100")
+	}
+	if b.LSN != 0 {
+		t.Errorf("LSN = %d, want 0 (key absent on a MySQL baseline)", b.LSN)
+	}
+}
+
+// A PG-source baseline (#593) carries its WAL LSN anchor through discovery.
+func TestDiscoverBaselines_LSN(t *testing.T) {
+	baseDir := t.TempDir()
+	snapshotDir := filepath.Join(baseDir, "2026-06-01T00-00-00Z", "pgdb")
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parquetPath := filepath.Join(snapshotDir, "orders.parquet")
+	cols := []Column{
+		{Name: "id", MySQLType: "int", ParquetType: parquet.Leaf(parquet.Int32Type)},
+	}
+	w, err := NewWriter(parquetPath, cols, WriterConfig{
+		Compression:  "none",
+		RowGroupSize: 100,
+		Metadata: map[string]string{
+			MetaKeyLSN: "6093515976", // 1/6B37B4C8
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteRow([]string{"1"}, []bool{false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := DiscoverBaselines(baseDir)
+	if err != nil {
+		t.Fatalf("DiscoverBaselines: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d baselines, want 1", len(results))
+	}
+	if results[0].LSN != 6093515976 {
+		t.Errorf("LSN = %d, want 6093515976", results[0].LSN)
+	}
+	if results[0].BinlogFile != "" {
+		t.Errorf("BinlogFile = %q, want empty (PG baseline has no binlog keys)", results[0].BinlogFile)
 	}
 }
 

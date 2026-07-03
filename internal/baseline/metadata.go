@@ -24,6 +24,12 @@ const (
 	MetaKeyBinlogPos      = "bintrail.baseline_binlog_position"
 	MetaKeyGTIDSet        = "bintrail.baseline_gtid_set"
 	MetaKeyCreateTableSQL = "bintrail.create_table_sql"
+	// MetaKeyLSN anchors a PostgreSQL-source baseline: the WAL LSN at which the
+	// snapshot is consistent (the slot's consistent_point), stored as the decimal
+	// string of the uint64 LSN. Deltas for the table start strictly after this
+	// point. Absent on MySQL/MariaDB baselines (which use the binlog file/pos/GTID
+	// keys above) and on PG baselines taken before #593 slice A. Part of #593.
+	MetaKeyLSN = "bintrail.baseline_lsn"
 	// MetaKeyRowCount and MetaKeyContentDigest record, per table, how many rows
 	// the baseline ingested and an order-independent content fingerprint of them
 	// (consistency.Hasher, version-tagged). The digest is byte-identical to a
@@ -54,6 +60,7 @@ type DumpMetadata struct {
 	CreateTableSQL string // raw mydumper -schema.sql bytes; set for baselines written after #187
 	ContentDigest  string // version-tagged content fingerprint; set after #633, empty when absent (old baselines)
 	RowCount       int64  // rows ingested into this table's baseline; valid only when ContentDigest != ""
+	LSN            uint64 // PostgreSQL WAL LSN anchor (MetaKeyLSN); 0 = absent (MySQL baseline, or pre-#593 PG baseline)
 }
 
 // ParseMetadata reads the mydumper "metadata" file in inputDir and returns the
@@ -151,6 +158,15 @@ func ReadParquetMetadata(path string) (DumpMetadata, error) {
 			m.BinlogPos = pos
 		}
 	}
+	if v, ok := pf.Lookup(MetaKeyLSN); ok {
+		lsn, parseErr := strconv.ParseUint(v, 10, 64)
+		if parseErr != nil {
+			slog.Warn("corrupt baseline_lsn in Parquet metadata",
+				"path", path, "raw_value", v, "error", parseErr)
+		} else {
+			m.LSN = lsn
+		}
+	}
 	if v, ok := pf.Lookup(MetaKeyGTIDSet); ok {
 		m.GTIDSet = v
 	}
@@ -226,6 +242,13 @@ func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, err
 				m.BinlogPos = pos
 			} else {
 				slog.Warn("corrupt baseline_binlog_position in S3 Parquet metadata",
+					"path", path, "raw_value", val, "error", parseErr)
+			}
+		case MetaKeyLSN:
+			if lsn, parseErr := strconv.ParseUint(val, 10, 64); parseErr == nil {
+				m.LSN = lsn
+			} else {
+				slog.Warn("corrupt baseline_lsn in S3 Parquet metadata",
 					"path", path, "raw_value", val, "error", parseErr)
 			}
 		case MetaKeyGTIDSet:

@@ -16,6 +16,7 @@ type BaselineInfo struct {
 	BinlogFile   string
 	BinlogPos    int64
 	GTIDSet      string
+	LSN          uint64 // PostgreSQL WAL LSN anchor; 0 = absent (MySQL baseline, or pre-#593 PG baseline)
 	Path         string
 }
 
@@ -88,6 +89,7 @@ func DiscoverBaselines(dir string) ([]BaselineInfo, error) {
 					info.BinlogFile = meta.BinlogFile
 					info.BinlogPos = meta.BinlogPos
 					info.GTIDSet = meta.GTIDSet
+					info.LSN = meta.LSN
 				} else {
 					slog.Warn("could not read Parquet metadata for baseline", "path", filePath, "error", err)
 				}
