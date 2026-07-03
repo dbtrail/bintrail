@@ -394,36 +394,62 @@ func TestWriteTable_singleRow(t *testing.T) {
 
 func TestWriteJSON_structure(t *testing.T) {
 	ts := time.Date(2026, 2, 19, 14, 0, 1, 0, time.UTC)
-	rows := []ResultRow{{
-		EventID:        7,
-		EventTimestamp: ts,
-		SchemaName:     "s",
-		TableName:      "t",
-		EventType:      parser.EventInsert,
-		PKValues:       "1",
-		RowAfter:       map[string]any{"id": float64(1), "name": "Alice"},
-	}}
+	qText := "INSERT INTO s.t (id, name) VALUES (1, 'Alice')"
+	qHash := "abc123"
+	rows := []ResultRow{
+		{
+			EventID:        7,
+			EventTimestamp: ts,
+			SchemaName:     "s",
+			TableName:      "t",
+			EventType:      parser.EventInsert,
+			PKValues:       "1",
+			RowAfter:       map[string]any{"id": float64(1), "name": "Alice"},
+			QueryText:      &qText,
+			QueryHash:      &qHash,
+		},
+		{
+			EventID:        8,
+			EventTimestamp: ts,
+			SchemaName:     "s",
+			TableName:      "t",
+			EventType:      parser.EventInsert,
+			PKValues:       "2",
+			// QueryText/QueryHash nil: statement not captured.
+		},
+	}
 	var buf bytes.Buffer
 	n, err := writeJSON(rows, &buf)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("expected 1 row, got %d", n)
+	if n != 2 {
+		t.Errorf("expected 2 rows, got %d", n)
 	}
 
 	var out []map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
 		t.Fatalf("output is not valid JSON: %v\n%s", err, buf.String())
 	}
-	if len(out) != 1 {
-		t.Fatalf("expected 1 JSON element, got %d", len(out))
+	if len(out) != 2 {
+		t.Fatalf("expected 2 JSON elements, got %d", len(out))
 	}
 	if out[0]["event_type"] != "INSERT" {
 		t.Errorf("expected event_type=INSERT, got %v", out[0]["event_type"])
 	}
 	if out[0]["event_id"] != float64(7) {
 		t.Errorf("expected event_id=7, got %v", out[0]["event_id"])
+	}
+	// #699 forensics fields: populated row carries them, uncaptured row
+	// serializes explicit nulls (jsonRow has no omitempty on them).
+	if out[0]["query_text"] != qText {
+		t.Errorf("query_text = %v, want %q", out[0]["query_text"], qText)
+	}
+	if out[0]["query_hash"] != qHash {
+		t.Errorf("query_hash = %v, want %q", out[0]["query_hash"], qHash)
+	}
+	if v, present := out[1]["query_text"]; !present || v != nil {
+		t.Errorf("uncaptured row must serialize query_text as null, got %v (present=%v)", v, present)
 	}
 }
 
@@ -450,6 +476,8 @@ func TestBuildQuery_gtidFilter(t *testing.T) {
 
 func TestWriteCSV_headersAndRow(t *testing.T) {
 	ts := time.Date(2026, 2, 19, 14, 0, 1, 0, time.UTC)
+	qText := "DELETE FROM db.tbl WHERE id = 99"
+	qHash := "feed99"
 	rows := []ResultRow{{
 		EventID:        3,
 		BinlogFile:     "binlog.000001",
@@ -458,6 +486,8 @@ func TestWriteCSV_headersAndRow(t *testing.T) {
 		TableName:      "tbl",
 		EventType:      parser.EventDelete,
 		PKValues:       "99",
+		QueryText:      &qText,
+		QueryHash:      &qHash,
 	}}
 	var buf bytes.Buffer
 	n, err := writeCSV(rows, &buf)
@@ -476,6 +506,14 @@ func TestWriteCSV_headersAndRow(t *testing.T) {
 	}
 	if !strings.Contains(lines[1], "DELETE") {
 		t.Errorf("expected DELETE in data row, got: %s", lines[1])
+	}
+	// #699: the two appended columns must stay in lockstep between csvHeaders
+	// and the record slice — a one-sided append silently shifts CSV columns.
+	if !strings.HasSuffix(lines[0], ",query_text,query_hash") {
+		t.Errorf("expected header to end with query_text,query_hash, got: %s", lines[0])
+	}
+	if !strings.Contains(lines[1], qText) || !strings.HasSuffix(lines[1], ","+qHash) {
+		t.Errorf("expected statement text and trailing hash in data row, got: %s", lines[1])
 	}
 }
 
@@ -814,6 +852,44 @@ func TestLimitPerPK_zero_passthrough(t *testing.T) {
 	got := LimitPerPK(rows, 0)
 	if len(got) != 2 {
 		t.Errorf("LimitPerPK(_, 0) should be a passthrough, got %d rows", len(got))
+	}
+}
+
+// TestApplyRedaction_blanksQueryTextEverywhere pins the #699 policy: the
+// captured statement text (and its digest) is per-STATEMENT, not per-table —
+// a multi-table statement stamps the same text, literal values included, onto
+// rows of EVERY table it touched. So whenever redaction runs, QueryText and
+// QueryHash are blanked on ALL rows, including rows of tables with no
+// redaction rule of their own.
+func TestApplyRedaction_blanksQueryTextEverywhere(t *testing.T) {
+	qText := "UPDATE mydb.orders o JOIN mydb.products p SET o.amount=100, p.price=5"
+	qHash := strings.Repeat("ab", 32)
+	rows := []ResultRow{
+		{
+			SchemaName: "mydb", TableName: "orders",
+			RowBefore: map[string]any{"amount": float64(100)},
+			QueryText: &qText, QueryHash: &qHash,
+		},
+		{
+			// Different table, NO redaction rule — still must not carry the
+			// statement (it embeds the redacted table's literals).
+			SchemaName: "mydb", TableName: "products",
+			RowBefore: map[string]any{"price": float64(5)},
+			QueryText: &qText, QueryHash: &qHash,
+		},
+	}
+	redact := []SchemaTableColumn{
+		{Schema: "mydb", Table: "orders", Column: "amount"},
+	}
+	applyRedaction(rows, redact)
+
+	for i := range rows {
+		if rows[i].QueryText != nil {
+			t.Errorf("row %d: QueryText must be blanked under an active profile, got %q", i, *rows[i].QueryText)
+		}
+		if rows[i].QueryHash != nil {
+			t.Errorf("row %d: QueryHash must be blanked with the text, got %q", i, *rows[i].QueryHash)
+		}
 	}
 }
 

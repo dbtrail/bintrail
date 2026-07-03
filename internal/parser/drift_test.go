@@ -67,7 +67,7 @@ func runHandleRowsWith(t *testing.T, resolver *metadata.Resolver, binlogEv *repl
 	t.Helper()
 	rowsEv := binlogEv.Event.(*replication.RowsEvent)
 	out := make(chan Event, 4)
-	err := handleRows(context.Background(), newTestLogger(logBuf), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 9, out)
+	err := handleRows(context.Background(), newTestLogger(logBuf), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, "", 9, out)
 	close(out)
 	var evs []Event
 	for ev := range out {

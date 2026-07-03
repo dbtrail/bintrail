@@ -109,6 +109,17 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	// recent QueryEvent. For DML transactions, this is the QUERY(BEGIN)
 	// event that precedes the row events.
 	var currentConnectionID uint32
+	// currentQueryText holds the original SQL statement from the most recent
+	// ROWS_QUERY_EVENT (MySQL, binlog_rows_query_log_events=ON) or
+	// ANNOTATE_ROWS event (MariaDB, binlog_annotate_row_events=ON). It is
+	// statement-scoped: each statement's event overwrites the previous one,
+	// and one statement's text covers ALL of its (possibly chained) rows
+	// events. Cleared in three places, each load-bearing: QUERY and GTID
+	// boundaries (across transactions), and the STMT_END_F rows event (the
+	// statement boundary WITHIN a transaction — the only clear that stops a
+	// later ROWS_QUERY-less statement in the same transaction from inheriting
+	// stale text when the variable is toggled off mid-transaction).
+	var currentQueryText string
 
 	bp := replication.NewBinlogParser()
 
@@ -126,15 +137,21 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 		switch ev := binlogEv.Event.(type) {
 		case *replication.GTIDEvent:
 			currentGTID = formatGTID(binlogEv.Header.EventType, ev.SID, ev.GNO)
+			currentQueryText = "" // transaction boundary — statement text never crosses it
 
 		case *replication.MariadbGTIDEvent:
 			// MariaDB source: the GTID arrives as domain-server-seq (e.g.
 			// "0-1-100"). ev.GTID.String() returns "" for the zero GTID,
 			// mirroring formatGTID's not-enabled behavior.
 			currentGTID = ev.GTID.String()
+			currentQueryText = ""
 
 		case *replication.QueryEvent:
 			currentConnectionID = ev.SlaveProxyID
+			// A new QUERY (BEGIN of the next transaction, or a DDL) opens a new
+			// statement scope; any ROWS_QUERY text from the previous statement
+			// is stale. The statement's own ROWS_QUERY_EVENT arrives AFTER this.
+			currentQueryText = ""
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
 			if ddlEv, ok := parseDDL(p.logger, filename, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), p.schemaVersion.Load()); ok {
 				select {
@@ -144,8 +161,31 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 				}
 			}
 
+		case *replication.RowsQueryEvent:
+			// The original SQL statement (binlog_rows_query_log_events=ON),
+			// emitted right before the statement's TABLE_MAP + rows events.
+			// Sanitized ONCE here at the capture boundary — every downstream
+			// path (index INSERT, BYOS buffer/payload) sees bounded, valid
+			// UTF-8 text.
+			currentQueryText = event.SanitizeQueryText(string(ev.Query))
+
+		case *replication.MariadbAnnotateRowsEvent:
+			// MariaDB's positional sibling of ROWS_QUERY_EVENT
+			// (binlog_annotate_row_events=ON).
+			currentQueryText = event.SanitizeQueryText(string(ev.Query))
+
 		case *replication.RowsEvent:
-			return handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, p.schemaVersion.Load(), events)
+			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentQueryText, p.schemaVersion.Load(), events)
+			// The LAST rows event of a statement carries STMT_END_F — the
+			// actual statement boundary. Clearing here keeps one statement's
+			// text alive across its chained/split rows events, while a later
+			// statement in the SAME transaction that logged no ROWS_QUERY
+			// (variable toggled off mid-transaction — MySQL allows it; there
+			// is no GTID/QUERY boundary in between) can never inherit it.
+			if ev.Flags&replication.RowsEventStmtEndFlag != 0 {
+				currentQueryText = ""
+			}
+			return err
 
 		case *replication.TransactionPayloadEvent:
 			for _, inner := range ev.Events {
@@ -210,6 +250,7 @@ func handleRows(
 	rowsEv *replication.RowsEvent,
 	filename, currentGTID string,
 	connectionID uint32,
+	queryText string,
 	schemaVersion uint32,
 	out chan<- Event,
 ) error {
@@ -352,17 +393,17 @@ func handleRows(
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2:
-		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
 
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2:
-		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
 
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
 		replication.UPDATE_ROWS_EVENTv2:
-		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
 
 	default:
 		// A RowsEvent whose type matches none of the above — e.g. MariaDB's
@@ -391,6 +432,7 @@ func emitInserts(
 	rows [][]any,
 	schema, table, filename, gtid string,
 	connectionID uint32,
+	queryText string,
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
@@ -406,7 +448,7 @@ func emitInserts(
 		}
 		ev := Event{
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
-			Timestamp: ts, GTID: gtid, ConnectionID: connectionID,
+			Timestamp: ts, GTID: gtid, ConnectionID: connectionID, QueryText: queryText,
 			Schema: schema, Table: table, EventType: EventInsert,
 			PKValues:      BuildPKValues(pkCols, named),
 			RowAfter:      named,
@@ -428,6 +470,7 @@ func emitDeletes(
 	rows [][]any,
 	schema, table, filename, gtid string,
 	connectionID uint32,
+	queryText string,
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
@@ -443,7 +486,7 @@ func emitDeletes(
 		}
 		ev := Event{
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
-			Timestamp: ts, GTID: gtid, ConnectionID: connectionID,
+			Timestamp: ts, GTID: gtid, ConnectionID: connectionID, QueryText: queryText,
 			Schema: schema, Table: table, EventType: EventDelete,
 			PKValues:      BuildPKValues(pkCols, named),
 			RowBefore:     named,
@@ -465,6 +508,7 @@ func emitUpdates(
 	rows [][]any,
 	schema, table, filename, gtid string,
 	connectionID uint32,
+	queryText string,
 	startPos, endPos uint64,
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
@@ -488,7 +532,7 @@ func emitUpdates(
 		}
 		ev := Event{
 			BinlogFile: filename, StartPos: startPos, EndPos: endPos,
-			Timestamp: ts, GTID: gtid, ConnectionID: connectionID,
+			Timestamp: ts, GTID: gtid, ConnectionID: connectionID, QueryText: queryText,
 			Schema: schema, Table: table, EventType: EventUpdate,
 			PKValues:      BuildPKValues(pkCols, before), // PK from before-image
 			RowBefore:     before,

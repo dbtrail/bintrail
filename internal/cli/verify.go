@@ -12,6 +12,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
+	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/verify"
 )
@@ -97,6 +98,15 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("connect to index database: %w", err)
 	}
 	defer indexDB.Close()
+
+	// Idempotent schema migration (CLI-typed DSN — the one-DDL boundary):
+	// the shared query engine SELECTs post-initial-schema binlog_events
+	// columns (connection_id, query_text/query_hash #699), so verify against
+	// an index last written by an older binary would otherwise fail with
+	// MySQL error 1054 — a false drift alert.
+	if err := indexer.EnsureSchema(indexDB); err != nil {
+		return fmt.Errorf("ensure index schema: %w", err)
+	}
 
 	var indexDBName string
 	if cfg, parseErr := mysqldriver.ParseDSN(vfyIndexDSN); parseErr == nil {

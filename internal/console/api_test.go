@@ -114,13 +114,14 @@ func TestEventsHandlerOmitsConnectionID(t *testing.T) {
 	cols := []string{
 		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
-		"changed_columns", "row_before", "row_after", "schema_version",
+		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
 	}
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	rows := sqlmock.NewRows(cols).AddRow(
 		int64(1), "bin.000001", int64(4), int64(40), ts,
 		nil, int64(4242), "app", "users", int64(parser.EventUpdate), "7",
 		[]byte(`["email"]`), []byte(`{"email":"a@x"}`), []byte(`{"email":"b@x"}`), int64(0),
+		"UPDATE users SET email='b@x'", "cafe0000",
 	)
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
 
@@ -133,6 +134,14 @@ func TestEventsHandlerOmitsConnectionID(t *testing.T) {
 		t.Fatalf("events status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
+	// #699 forensics fields ride the same open-core boundary as
+	// connection_id: the mock row above feeds a statement + digest through
+	// the handler, and neither key nor value may reach the wire.
+	for _, banned := range []string{"query_text", "query_hash", "UPDATE users SET", "cafe0000"} {
+		if strings.Contains(body, banned) {
+			t.Errorf("events response must not contain %q: %s", banned, body)
+		}
+	}
 	if strings.Contains(body, "connection_id") || strings.Contains(body, "4242") {
 		t.Errorf("events HTTP response leaked connection_id: %s", body)
 	}
@@ -176,7 +185,7 @@ func TestRecoverIsReadOnly(t *testing.T) {
 	cols := []string{
 		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
-		"changed_columns", "row_before", "row_after", "schema_version",
+		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
 	}
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	// An INSERT event (event_type=1); its reversal is a DELETE built from
@@ -186,6 +195,7 @@ func TestRecoverIsReadOnly(t *testing.T) {
 		int64(1), "bin.000001", int64(4), int64(40), ts,
 		nil, nil, "app", "users", int64(parser.EventInsert), "42",
 		nil, nil, []byte(`{"id":42,"email":"a@x"}`), int64(0),
+		nil, nil,
 	)
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(resultRows)
 

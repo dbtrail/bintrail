@@ -125,6 +125,74 @@ func TestWriteParquet_connectionIDUnsignedDuckDBScan(t *testing.T) {
 	}
 }
 
+// TestWriteParquet_queryTextRoundTrip pins #699 on the buffer write path:
+// a captured statement round-trips through the query_text column, and a row
+// without one reads back NULL (not empty string). Read back via DuckDB
+// parquet_scan — the real consumer.
+func TestWriteParquet_queryTextRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	outPath := filepath.Join(dir, "qtext.parquet")
+
+	stmt := "INSERT INTO db.t (id) VALUES (1)"
+	withText := query.ResultRow{
+		EventID:        idOffset + 1,
+		BinlogFile:     "binlog.000001",
+		StartPos:       100,
+		EndPos:         200,
+		EventTimestamp: time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC),
+		SchemaName:     "db",
+		TableName:      "t",
+		EventType:      parser.EventInsert,
+		PKValues:       "1",
+		RowAfter:       map[string]any{"id": 1},
+		QueryText:      &stmt,
+	}
+	withoutText := withText
+	withoutText.EventID = idOffset + 2
+	withoutText.PKValues = "2"
+	withoutText.QueryText = nil
+
+	n, err := WriteParquet([]query.ResultRow{withText, withoutText}, outPath, "none")
+	if err != nil {
+		t.Fatalf("WriteParquet: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("count = %d, want 2", n)
+	}
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	safePath := strings.ReplaceAll(outPath, "'", "''")
+	rows, err := db.QueryContext(context.Background(),
+		"SELECT query_text FROM parquet_scan('"+safePath+"') ORDER BY event_id")
+	if err != nil {
+		t.Fatalf("scan query_text: %v", err)
+	}
+	defer rows.Close()
+
+	var got []sql.NullString
+	for rows.Next() {
+		var v sql.NullString
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, v)
+	}
+	if len(got) != 2 {
+		t.Fatalf("rows = %d, want 2", len(got))
+	}
+	if !got[0].Valid || got[0].String != stmt {
+		t.Errorf("row 1 query_text = %+v, want %q", got[0], stmt)
+	}
+	if got[1].Valid {
+		t.Errorf("row 2 query_text = %q, want NULL (statement not captured)", got[1].String)
+	}
+}
+
 func TestWriteParquet_nullableFields(t *testing.T) {
 	dir := t.TempDir()
 	outPath := filepath.Join(dir, "nulls.parquet")

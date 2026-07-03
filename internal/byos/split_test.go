@@ -1,6 +1,8 @@
 package byos
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +120,44 @@ func TestSplitEventInsert(t *testing.T) {
 	}
 	if payload.SchemaVersion != 5 {
 		t.Errorf("payload.SchemaVersion = %d, want 5", payload.SchemaVersion)
+	}
+}
+
+// TestSplitEventQueryTextPayloadOnly pins the #699 BYOS boundary: the
+// captured statement text embeds literal column values (row-level data in
+// another form), so it flows to the customer-side PayloadRecord ONLY and must
+// never appear in the MetadataRecord sent to the dbtrail API.
+func TestSplitEventQueryTextPayloadOnly(t *testing.T) {
+	ev := parser.Event{
+		Timestamp: time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC),
+		Schema:    "mydb",
+		Table:     "users",
+		EventType: parser.EventInsert,
+		PKValues:  "42",
+		RowAfter:  map[string]any{"id": 42, "ssn": "123-45-6789"},
+		QueryText: "INSERT INTO users (id, ssn) VALUES (42, '123-45-6789')",
+	}
+
+	meta, payload, err := SplitEvent(ev, "server-1", SourceIdentity{})
+	if err != nil {
+		t.Fatalf("SplitEvent: %v", err)
+	}
+
+	if payload.QueryText != ev.QueryText {
+		t.Errorf("payload.QueryText = %q, want the captured statement", payload.QueryText)
+	}
+
+	// The metadata wire form must carry neither the key nor the value.
+	b, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	js := string(b)
+	if strings.Contains(js, "query_text") {
+		t.Errorf("MetadataRecord JSON must not contain a query_text key: %s", js)
+	}
+	if strings.Contains(js, "123-45-6789") {
+		t.Errorf("MetadataRecord JSON must not leak statement literals: %s", js)
 	}
 }
 
