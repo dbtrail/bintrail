@@ -388,10 +388,19 @@ func (r *rdsLogReader) Read(p []byte) (int, error) {
 	}
 	// Tail mode on the first call: set NumberOfLines, leave Marker nil.
 	tailFirstCall := !r.firstPage && r.tailLines > 0
-	if tailFirstCall {
+	switch {
+	case tailFirstCall:
 		n := r.tailLines
 		input.NumberOfLines = &n
-	} else if r.marker != nil {
+	case !r.firstPage:
+		// First page of a full (non-tail) scan: start from the beginning of
+		// the file. DownloadDBLogFilePortion with neither Marker nor
+		// NumberOfLines returns only the most-recent ~10000 lines / 1 MB (the
+		// tail), silently dropping older records; Marker="0" reads from the
+		// start and paginates forward via resp.Marker.
+		startMarker := "0"
+		input.Marker = &startMarker
+	case r.marker != nil:
 		input.Marker = r.marker
 	}
 	r.firstPage = true

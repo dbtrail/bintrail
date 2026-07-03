@@ -242,6 +242,67 @@ func TestRDSLogReader_MultiPage(t *testing.T) {
 	}
 }
 
+// semanticRDSClient emulates DownloadDBLogFilePortion's real Marker semantics
+// for the full-scan regression test: a call with neither Marker nor
+// NumberOfLines returns only the tail (per the AWS API, the most-recent portion
+// of the file); Marker="0" returns from the start.
+type semanticRDSClient struct {
+	fromStart string
+	tail      string
+	inputs    []rds.DownloadDBLogFilePortionInput
+	served    bool
+}
+
+func (m *semanticRDSClient) DescribeDBLogFiles(context.Context, *rds.DescribeDBLogFilesInput, ...func(*rds.Options)) (*rds.DescribeDBLogFilesOutput, error) {
+	return &rds.DescribeDBLogFilesOutput{}, nil
+}
+
+func (m *semanticRDSClient) DownloadDBLogFilePortion(_ context.Context, params *rds.DownloadDBLogFilePortionInput, _ ...func(*rds.Options)) (*rds.DownloadDBLogFilePortionOutput, error) {
+	m.inputs = append(m.inputs, *params)
+	if m.served {
+		empty := ""
+		return &rds.DownloadDBLogFilePortionOutput{LogFileData: &empty, AdditionalDataPending: boolPtr(false)}, nil
+	}
+	m.served = true
+	data := m.tail
+	if params.Marker != nil && *params.Marker == "0" {
+		data = m.fromStart
+	}
+	return &rds.DownloadDBLogFilePortionOutput{LogFileData: &data, AdditionalDataPending: boolPtr(false)}, nil
+}
+
+// TestRDSLogReader_FullScanStartsFromBeginning guards the blocker fix: a
+// non-tail (full) scan MUST send Marker="0" on the first
+// DownloadDBLogFilePortion call. With neither Marker nor NumberOfLines the RDS
+// API returns only the most-recent ~10000 lines / 1 MB (the tail), silently
+// dropping older records — precisely the who-changed full-scan path
+// (auditReadOptionsFor sets TailLines:-1). The semantic mock reproduces that
+// AWS behaviour, so this test fails on the pre-fix reader.
+func TestRDSLogReader_FullScanStartsFromBeginning(t *testing.T) {
+	const oldRec = "20260413 09:00:00,host,admin,10.0.0.1,42,100,QUERY,mydb,'oldest',0,,\n"
+	const newRec = "20260413 12:00:00,host,admin,10.0.0.1,42,101,QUERY,mydb,'newest',0,,\n"
+
+	sem := &semanticRDSClient{fromStart: oldRec + newRec, tail: newRec}
+	reader := newRDSLogReader(context.Background(), sem, "test-db", "audit/server_audit.log")
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	if len(sem.inputs) == 0 {
+		t.Fatal("no DownloadDBLogFilePortion call recorded")
+	}
+	if first := sem.inputs[0]; first.Marker == nil || *first.Marker != "0" {
+		t.Errorf("first full-scan call Marker = %v, want \"0\"; without it the RDS API returns only the tail and drops older records", first.Marker)
+	}
+	if !strings.Contains(string(got), "oldest") {
+		t.Error("full scan dropped the oldest record — the reader read only the tail (Marker=\"0\" not sent on the first call)")
+	}
+	if !strings.Contains(string(got), "newest") {
+		t.Error("full scan missing the newest record")
+	}
+}
+
 func TestRDSLogReader_EmptyFile(t *testing.T) {
 	empty := ""
 	mock := &mockRDSClient{
