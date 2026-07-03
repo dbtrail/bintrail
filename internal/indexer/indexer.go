@@ -502,6 +502,20 @@ func EnsureSchema(db *sql.DB) error {
 			return err
 		}
 	}
+	// connection_cache post-dates the original schema (#703): the forensics
+	// poller persists session identity here so attribution survives
+	// disconnects. A whole-table migration, so it is presence-checked first —
+	// an up-to-date index keeps EnsureSchema write-free (ensureColumn's
+	// contract), which matters for index users without CREATE privilege.
+	hasConnCache, err := tableExists(db, "connection_cache")
+	if err != nil {
+		return err
+	}
+	if !hasConnCache {
+		if _, err := db.Exec(ddlConnectionCache); err != nil {
+			return fmt.Errorf("failed to create connection_cache: %w", err)
+		}
+	}
 	return nil
 }
 

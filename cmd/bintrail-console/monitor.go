@@ -15,6 +15,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/doctor"
+	"github.com/dbtrail/dbtrail/internal/forensics"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/serverid"
 	"github.com/dbtrail/dbtrail/internal/streamdeps"
@@ -426,6 +427,24 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 			job.lockDB.Close() // releases the advisory lock
 		}
 	}()
+
+	// Forensics: cache this source's live session identity into its
+	// per-source index database so attribution survives disconnects. Scoped
+	// to the supervision session (stopped when run returns — stop verb,
+	// circuit breaker, daemon shutdown), and deliberately spanning crash-loop
+	// backoff gaps: identities captured while the stream is down attribute
+	// the events gap-fill indexes afterwards. Gate-checked at the surface
+	// (#701 D1); --attribution-retention 0 disables it inside the poller.
+	// The SourceDSN guard keeps direct run() callers (tests) poller-free.
+	if forensics.Enabled() && e.SourceDSN != "" {
+		pollerCtx, stopPoller := context.WithCancel(ctx)
+		defer stopPoller()
+		forensics.StartConnCachePoller(pollerCtx, forensics.ConnCacheConfig{
+			SourceDSN: e.SourceDSN,
+			IndexDSN:  e.DSN,
+			Retention: upAttributionRetention,
+		})
+	}
 
 	attempt := 0
 	var crashLoopSince time.Time // first failure of the current loop; zero = healthy

@@ -292,6 +292,78 @@ func handleRows(
 		return nil
 	}
 
+	// Column NAME cross-check (#700): with binlog_row_metadata=FULL the
+	// TABLE_MAP event embeds the table's real column names at write time,
+	// giving us per-event ground truth to hold the snapshot against. This
+	// catches the drift class the count guard above CANNOT see: a same-count
+	// schema change (a column rename, or a DROP+ADD in one ALTER) leaves the
+	// count equal while every value after the changed ordinal would be
+	// attributed to the WRONG column name — silent corruption, worse than the
+	// count-mismatch skip. The compare is case-insensitive per MySQL's
+	// identifier rules (a case-only rename does not change the mapping) and
+	// includes generated columns (present in both the snapshot and the FULL
+	// TABLE_MAP metadata — a different knob from the #493 guard's
+	// binlog_row_image below). Under the default binlog_row_metadata=MINIMAL the event
+	// carries no names and the check degrades to a no-op.
+	//
+	// A divergence splits on the event's age relative to the snapshot:
+	//
+	//   * Event AT-OR-AFTER the snapshot → the snapshot is STALE (the schema
+	//     changed after it was taken). Fail loud like the partial-image guard
+	//     below — proceeding would write wrong data that `recover` later
+	//     trusts, and the remediation (re-run `bintrail snapshot`) genuinely
+	//     converges: the fresh snapshot matches these events.
+	//
+	//   * Event BEFORE the snapshot → a routine historical state, not a
+	//     stale snapshot: re-indexing old files after a rename, or a stream
+	//     catching up through a backlog written before the operator
+	//     re-snapshotted. Re-snapshotting is a NO-OP here (the old names are
+	//     baked into the binlog), so a hard error would be a permanent dead
+	//     end with no converging remediation. Proceed exactly as before
+	//     #700 — values index under the snapshot's CURRENT names, which is
+	//     positionally correct for a pure rename (and is what makes the
+	//     generated recovery SQL executable against the live table) — and
+	//     warn loudly per rows event, the count guard's verbosity class.
+	//
+	// The snapshot time comes from the bintrail host clock (TakeSnapshot)
+	// while event timestamps come from the source server; a large clock skew
+	// can misclassify a rename taken moments around the snapshot — the
+	// failure mode is a loud warning instead of a hard stop, never silence.
+	// A zero snapshot time (unknown) stays strict,
+	// and so does a zero EVENT timestamp (tool-generated/rewritten binlogs
+	// occasionally carry zeroed headers — an unknown age must not take the
+	// lenient path).
+	if names := rowsEv.Table.ColumnNameString(); len(names) > 0 && len(names) == len(tm.Columns) {
+		for i := range names {
+			if mysqlIdentEqualFold(names[i], tm.Columns[i].Name) {
+				continue
+			}
+			eventTime := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
+			if snapTime := resolver.SnapshotTime(); binlogEv.Header.Timestamp != 0 && !snapTime.IsZero() && eventTime.Before(snapTime) {
+				logger.Warn("column names differ from snapshot for a pre-snapshot event — indexing under the snapshot's names",
+					"file", filename,
+					"pos", binlogEv.Header.LogPos,
+					"schema", schema,
+					"table", table,
+					"ordinal", i+1,
+					"binlog_column", names[i],
+					"snapshot_column", tm.Columns[i].Name,
+					"event_time", eventTime,
+					"snapshot_time", snapTime)
+				break
+			}
+			return fmt.Errorf(
+				"schema drift detected at %s:%d for %s.%s: binlog TABLE_MAP column %d is %q but schema snapshot %d has %q; "+
+					"the snapshot is stale (a column was renamed, or dropped and re-added, since it was taken) and indexing "+
+					"these events would attribute row values to the wrong columns — run `bintrail snapshot` against the "+
+					"current schema, then re-run indexing (a failed file re-indexes from the start; a stream resumes from "+
+					"its checkpoint); if this event actually PREDATES the snapshot, check for clock skew between the "+
+					"bintrail host and the source server",
+				filename, binlogEv.Header.LogPos, schema, table,
+				i+1, names[i], schemaVersion, tm.Columns[i].Name)
+		}
+	}
+
 	// Partial row image guard (#493): bintrail requires binlog_row_image=FULL.
 	// Under MINIMAL/NOBLOB, MySQL omits columns from the before/after image and
 	// go-mysql pads the absent positions to nil — which we would otherwise store
@@ -477,6 +549,30 @@ func emitUpdates(
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// mysqlIdentEqualFold reports whether two column identifiers are equal under
+// MySQL's case-insensitive identifier comparison. strings.EqualFold covers
+// every case MySQL folds except the Turkish dotted/dotless I pair: MySQL's
+// identifier collation treats İ (U+0130) and ı (U+0131) as equal to I/i
+// (verified on 8.4: CREATE TABLE t (i INT, İ INT) fails with a duplicate-
+// column error, and RENAME COLUMN İstanbul TO istanbul succeeds as a
+// case-style rename), while Unicode simple folding maps neither to 'i' — so
+// a plain EqualFold would flag that legal case-style rename as drift (#700).
+// Accents are NOT folded by MySQL identifiers (verified on 8.4: CREATE TABLE
+// t (e INT, é INT) succeeds with two distinct columns), so no wider
+// normalization is needed.
+func mysqlIdentEqualFold(a, b string) bool {
+	if strings.EqualFold(a, b) {
+		return true
+	}
+	dotless := func(r rune) rune {
+		if r == 'İ' || r == 'ı' {
+			return 'i'
+		}
+		return r
+	}
+	return strings.EqualFold(strings.Map(dotless, a), strings.Map(dotless, b))
+}
 
 // BuildPKValues forwards to event.BuildPKValues (kept for back-compat; the
 // canonical doc lives on event.BuildPKValues).

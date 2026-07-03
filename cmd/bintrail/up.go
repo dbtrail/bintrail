@@ -5,11 +5,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/doctor"
+	"github.com/dbtrail/dbtrail/internal/forensics"
 	"github.com/dbtrail/dbtrail/internal/rotation"
 	"github.com/dbtrail/dbtrail/internal/serverid"
 )
@@ -57,6 +59,8 @@ var (
 	upRotateInterval  string
 	upRotateAddFuture int
 
+	upAttributionRetention time.Duration
+
 	// upRotationCfg holds the parsed built-in-rotation settings from runUp's
 	// validation, read at the phase-3 start site (the cobra-accumulator
 	// pattern; the parsing and the loop itself live in internal/rotation).
@@ -78,6 +82,7 @@ func init() {
 	upCmd.Flags().StringVar(&upRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
 	upCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
 	upCmd.Flags().IntVar(&upRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
+	upCmd.Flags().DurationVar(&upAttributionRetention, "attribution-retention", forensics.DefaultRetention, "Forensics: keep disconnected-session identity (connection_cache) for this long; 0 disables the poller")
 	// --source-dsn is validated in runUp instead of MarkFlagRequired so the
 	// rotation settings parse first (fail-fast on a typo before any phase
 	// runs) — see TestRunUp_explicitRetentionWiring, which relies on that
@@ -199,6 +204,18 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 	rotation.StartLoop(rotCtx, func() rotation.Settings { return upRotationCfg }, func() []rotation.RotateTarget {
 		return []rotation.RotateTarget{{DSN: upIndexDSN}}
 	})
+	// Forensics: cache live session identity (user/host/program per
+	// connection_id) into the index so attribution survives disconnects.
+	// Same lifecycle and contract as rotation: a secondary job that is never
+	// fatal to the stream. Gate-checked at the surface (#701 D1);
+	// --attribution-retention 0 disables it inside StartConnCachePoller.
+	if forensics.Enabled() {
+		forensics.StartConnCachePoller(rotCtx, forensics.ConnCacheConfig{
+			SourceDSN: upSourceDSN,
+			IndexDSN:  upIndexDSN,
+			Retention: upAttributionRetention,
+		})
+	}
 	return runStream(cmd, args)
 }
 
