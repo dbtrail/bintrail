@@ -130,7 +130,7 @@ read-only replication client. For PostgreSQL specifically, capture uses the
 **built-in `pgoutput`** logical-decoding plugin only — dbtrail never installs a
 custom output plugin, runs `CREATE EXTENSION`, adds an event trigger, or places
 any other server-side component in your source, and it never writes to the
-source. This keeps managed PostgreSQL (RDS/Aurora/Cloud SQL/Azure) in scope. We
+source. This keeps managed PostgreSQL (RDS/Aurora/Cloud SQL) in scope. We
 **validate** the source's configuration (`wal_level`, `REPLICA IDENTITY`, the
 publication); we never create it for you.
 

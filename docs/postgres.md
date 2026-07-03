@@ -88,7 +88,7 @@ SHOW wal_level;        -- want: logical
 ALTER SYSTEM SET wal_level = 'logical';
 -- wal_level only takes effect after a RESTART (not a reload):
 --   self-hosted:  restart the postgres service
---   managed (RDS/Aurora/Cloud SQL/Azure): set it in the parameter group and reboot
+--   managed (RDS/Aurora/Cloud SQL): set it in the parameter group and reboot
 ```
 
 While you are there, make sure there is slot/sender headroom (defaults are
@@ -447,22 +447,43 @@ The data-safety items that gated **beta** are now closed (type fidelity,
 identity/generated recovery, slot/WAL monitoring, RI-FULL validation, DDL-drift
 handling, and the silent-loss coverage guards above). Source-aware console
 presentation, including the live replication-health panel, shipped in v0.20.1.
-The remaining limitations — full-table `reconstruct` / time-travel via a
-PostgreSQL baseline, and a managed-PostgreSQL smoke matrix — are tracked toward
-**GA** in [#597](https://github.com/dbtrail/dbtrail/issues/597).
+The remaining limitation — full-table `reconstruct` / time-travel via a
+PostgreSQL baseline — is tracked toward **GA** in
+[#597](https://github.com/dbtrail/dbtrail/issues/597). The managed-PostgreSQL
+smoke covers RDS and Aurora — see
+[Managed PostgreSQL](#managed-postgresql).
 
 ---
 
 ## Managed PostgreSQL
 
-Logical replication works on the major managed offerings; the only setup
+Logical replication works on managed offerings that expose it; the only setup
 difference is *how* you set `wal_level` and grant replication.
 
-| Provider | `wal_level = logical` | Replication privilege |
-|---|---|---|
-| **Amazon RDS / Aurora PostgreSQL** | Set `rds.logical_replication = 1` in the parameter group, then **reboot**. | Master user has it; grant others with `GRANT rds_replication TO <role>;`. |
-| **Google Cloud SQL** | Set the `cloudsql.logical_decoding` flag on, then restart. | Use a user with `cloudsqlsuperuser` / the replication grant. |
-| **Azure Database for PostgreSQL** | Set `wal_level = logical` (Flexible Server) and restart. | Grant `azure_pg_admin` / replication as documented. |
+| Provider | Validated? | `wal_level = logical` | Replication privilege |
+|---|---|---|---|
+| **Amazon RDS for PostgreSQL** | **Smoke-validated** (PostgreSQL 16) | Set `rds.logical_replication = 1` in the parameter group, then **reboot**. (A parameter group set at *instance creation* applies at the initial boot — no reboot needed.) | Master user has it (`rds_replication`); grant others with `GRANT rds_replication TO <role>;`. |
+| **Amazon Aurora PostgreSQL** | **Smoke-validated** (16-compatible, Serverless v2) | Same, in the **cluster** parameter group. | Same as RDS. |
+| **Google Cloud SQL** | Documented only — **not validated** | Set the `cloudsql.logical_decoding` flag on, then restart. | Use a user with `cloudsqlsuperuser` / the replication grant. |
+
+**Smoke-validated** means the full pipeline was exercised end-to-end against a
+real instance of that flavor: `bintrail-pg doctor` passes, `stream` creates its
+slot and captures INSERT/UPDATE/DELETE into `binlog_events` with full
+before/after images, and `recover` generates a correct reversal. The smoke is
+`scripts/managed-pg-smoke.sh` (it runs against *any* PostgreSQL DSN — the
+managed part is the provisioning), and a gated CI job
+(`.github/workflows/managed-pg-smoke.yml`, `workflow_dispatch`-only) provisions
+an ephemeral RDS or Aurora instance, runs it, and tears everything down.
+
+Cloud SQL is *expected* to work — bintrail-pg is an ordinary
+logical-replication client — but it has **not** been smoke-validated, so its
+row is setup documentation, not a support claim. Extending the validated
+matrix follows demand ([#535](https://github.com/dbtrail/dbtrail/issues/535)).
+
+Two observations from the RDS/Aurora validation runs: the master user captures
+out of the box (it already holds `rds_replication`), and both flavors default
+`max_slot_wal_keep_size` to `-1` (unlimited) — `doctor` WARNs about it; set a
+bound as you would for any production source.
 
 In all cases bintrail-pg connects as a **client** — there is nothing to install
 on the managed instance beyond the publication and `REPLICA IDENTITY FULL`,
