@@ -3,6 +3,8 @@ package forensics
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,5 +167,66 @@ func TestCleanupConnectionCache_SubSecondRetention(t *testing.T) {
 				t.Errorf("retention interval mismatch — sub-second must not become INTERVAL 0: %v", err)
 			}
 		})
+	}
+}
+
+// signalingArg is a sqlmock argument matcher that closes fired (once) when the
+// expected bound value is matched, giving a test a happens-before hook to know
+// a query has reached the driver — without racing on sqlmock's internals.
+type signalingArg struct {
+	want  int64
+	fired chan struct{}
+	once  sync.Once
+}
+
+func (s *signalingArg) Match(v driver.Value) bool {
+	if n, ok := v.(int64); ok && n == s.want {
+		s.once.Do(func() { close(s.fired) })
+		return true
+	}
+	return false
+}
+
+// TestSweepLoop_ImmediateSweepThenExitsOnCancel guards the fast-lane coverage
+// of #3's audit-present branch (the end-to-end behavior is pinned by the
+// integration test, which needs a MySQL container). sweepLoop must run one
+// retention sweep immediately — pruning the pre-audit backlog without waiting a
+// full cleanupInterval — and then exit promptly when the context is cancelled.
+func TestSweepLoop_ImmediateSweepThenExitsOnCancel(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Exactly one DELETE is expected: the immediate sweep. cleanupInterval is an
+	// hour, so the ticker cannot fire within the test window.
+	sig := &signalingArg{want: 86400, fired: make(chan struct{})} // 24h in seconds
+	mock.ExpectExec("DELETE FROM connection_cache").
+		WithArgs(sig).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		sweepLoop(ctx, db, 24*time.Hour)
+		close(done)
+	}()
+
+	select {
+	case <-sig.fired: // the immediate sweep issued its DELETE
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("sweepLoop did not run an immediate sweep before blocking on its ticker")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sweepLoop did not exit promptly on context cancel")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected sweep queries — only the immediate sweep should run: %v", err)
 	}
 }

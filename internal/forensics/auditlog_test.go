@@ -924,7 +924,9 @@ func TestReadAuditLog_EmptyFileNoError(t *testing.T) {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	defer db.Close()
-	// No variant hint (no plugins row) so detection can't fall back to a format.
+	// An empty plugins row makes detectVariantFromPlugin return its
+	// MySQLEnterprise default (→ JSON), so detection resolves a concrete format
+	// and the empty file parses to zero events via the #5 variant fallback.
 	mock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(variableRows("audit_log_file", logPath))
 	mock.ExpectQuery(pluginsSQL).WillReturnRows(pluginRows())
 

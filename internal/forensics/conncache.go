@@ -63,8 +63,10 @@ type cachedConn struct {
 // fatal to the caller — connection failures and per-cycle panics are logged
 // and retried, because attribution capture is a secondary job that must never
 // take down the stream (the primary forensic capture). When the source has an
-// active audit plugin the poller logs and does not poll: audit logs carry
-// better session history at lower cost. The loop stops when ctx is cancelled;
+// active audit plugin the poller does not poll — audit logs carry better
+// session history at lower cost — but it keeps running retention sweeps until
+// ctx is cancelled, so connection_cache rows captured before the plugin was
+// installed still age out. The loop stops when ctx is cancelled;
 // the returned channel closes when it has fully exited (used by tests for
 // deterministic shutdown; production callers may ignore it).
 func StartConnCachePoller(ctx context.Context, cfg ConnCacheConfig) <-chan struct{} {
@@ -103,7 +105,7 @@ func StartConnCachePoller(ctx context.Context, cfg ConnCacheConfig) <-chan struc
 			slog.Info("connection-cache: active audit plugin detected on the source — not polling (the audit log carries better session history at lower cost); running retention sweeps so any pre-audit cached rows still age out")
 			// Polling is skipped, but connection_cache rows captured before the
 			// audit plugin was installed must still be pruned per the retention
-			// window — otherwise they persist forever and tier-2b would
+			// window — otherwise they persist forever and tier 2b would
 			// attribute old events to a frozen, possibly reused identity.
 			sweepLoop(ctx, indexDB, cfg.Retention)
 			return

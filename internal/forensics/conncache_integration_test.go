@@ -151,7 +151,7 @@ func TestIntegrationHasAuditPlugin_NoneInstalled(t *testing.T) {
 // branch (#3): polling is suppressed (the audit log carries better history),
 // but the retention sweep must keep running so connection_cache rows captured
 // before the plugin was installed still age out — otherwise they persist
-// forever and tier-2b attributes old events to a frozen, possibly reused
+// forever and tier 2b attributes old events to a frozen, possibly reused
 // identity. The loop runs until the context is cancelled.
 func TestIntegrationAuditPluginSkipsPollingButStillSweeps(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)

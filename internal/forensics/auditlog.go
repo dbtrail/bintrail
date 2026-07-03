@@ -412,7 +412,9 @@ func discoverDataDir(ctx context.Context, db *sql.DB) (string, []string) {
 
 // collectAuditLogFiles returns the primary audit log file and, when
 // includeRotated is true, any rotated variants (*.1, *.2, audit.log-20240101,
-// ...) sorted newest-first by mtime, capped at maxRotatedFiles.
+// ...) sorted newest-first by mtime, capped at maxRotatedFiles. The second
+// return is a warnings slice, non-empty when the cap dropped the oldest
+// rotated files so the truncation is reported rather than silent.
 func collectAuditLogFiles(primary string, includeRotated bool) ([]string, []string) {
 	var files []string
 	if _, err := os.Stat(primary); err == nil {
