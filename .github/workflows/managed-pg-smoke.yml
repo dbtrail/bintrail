@@ -1,0 +1,232 @@
+# Managed-PostgreSQL smoke (#594): provision an EPHEMERAL managed PostgreSQL
+# (Amazon RDS or Aurora), run the end-to-end capture smoke against it
+# (scripts/managed-pg-smoke.sh: doctor → stream → INSERT/UPDATE/DELETE →
+# assert 3 events in binlog_events → recover reversal SQL), then tear
+# everything down — teardown runs even when the smoke fails.
+#
+# OPT-IN ONLY (workflow_dispatch): this creates real AWS resources (a
+# db.t4g.micro / an Aurora Serverless v2 0.5-ACU instance for ~15 minutes —
+# well under $1 per run). It is deliberately NOT wired to push/PR/schedule.
+#
+# Required repository secrets:
+#   AWS_SMOKE_ACCESS_KEY_ID       credentials of an IAM principal allowed to
+#   AWS_SMOKE_SECRET_ACCESS_KEY   manage RDS instances/clusters/parameter
+#                                 groups and EC2 security groups in the
+#                                 target region (no other services needed)
+#
+# Optional repository variables:
+#   AWS_SMOKE_REGION              region to provision in (default us-west-2)
+#
+# Everything is created with a per-run name suffix and tag
+# Project=bintrail-pg-smoke; the security group only admits port 5432 from
+# the runner's own egress IP. Expand the flavor matrix (Cloud SQL, …) only
+# with ICP evidence — see #535.
+
+name: managed-pg-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "Managed flavor to smoke"
+        type: choice
+        required: true
+        default: rds
+        options: [rds, aurora]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_SMOKE_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SMOKE_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_SMOKE_REGION || 'us-west-2' }}
+      FLAVOR: ${{ inputs.flavor }}
+      RUN_TAG: bintrail-pg-smoke
+      # Per-run resource names (parallel runs never collide).
+      NAME: bintrail-pg-smoke-${{ github.run_id }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build bintrail-pg (CGO)
+        run: go build -o ./bintrail-pg ./cmd/bintrail-pg
+
+      - name: Start MySQL index (bintrail-test-mysql, 8.4)
+        run: |
+          docker run -d --name bintrail-test-mysql \
+            -e MYSQL_ROOT_PASSWORD=testroot \
+            -p 13306:3306 \
+            mysql:8.4 \
+            --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          for i in $(seq 1 60); do
+            if docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent 2>/dev/null; then
+              echo "MySQL index is ready."; exit 0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready in time" >&2
+          docker logs bintrail-test-mysql >&2 || true
+          exit 1
+
+      - name: Install psql client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+
+      - name: Provision managed PostgreSQL (${{ inputs.flavor }})
+        id: provision
+        run: |
+          set -euo pipefail
+          PGPASS=$(openssl rand -hex 16)
+          echo "::add-mask::$PGPASS"
+          echo "PGPASS=$PGPASS" >> "$GITHUB_ENV"
+
+          MYIP=$(curl -s https://checkip.amazonaws.com)
+          VPC=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true \
+                --query 'Vpcs[0].VpcId' --output text)
+          SG=$(aws ec2 create-security-group \
+                --group-name "$NAME" --vpc-id "$VPC" \
+                --description "ephemeral SG for bintrail managed-PG smoke (#594)" \
+                --tag-specifications "ResourceType=security-group,Tags=[{Key=Project,Value=$RUN_TAG}]" \
+                --query GroupId --output text)
+          echo "SG=$SG" >> "$GITHUB_ENV"
+          aws ec2 authorize-security-group-ingress --group-id "$SG" \
+            --protocol tcp --port 5432 --cidr "${MYIP}/32" >/dev/null
+
+          if [ "$FLAVOR" = "rds" ]; then
+            # Static parameter set BEFORE instance creation is applied at the
+            # initial boot — no reboot needed (verified in the live run).
+            aws rds create-db-parameter-group \
+              --db-parameter-group-name "$NAME" \
+              --db-parameter-group-family postgres16 \
+              --description "bintrail #594 smoke: rds.logical_replication=1" \
+              --tags Key=Project,Value=$RUN_TAG >/dev/null
+            aws rds modify-db-parameter-group \
+              --db-parameter-group-name "$NAME" \
+              --parameters "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot" >/dev/null
+            aws rds create-db-instance \
+              --db-instance-identifier "$NAME" \
+              --engine postgres --engine-version 16.14 \
+              --db-instance-class db.t4g.micro \
+              --allocated-storage 20 --storage-type gp3 \
+              --master-username postgres --master-user-password "$PGPASS" \
+              --db-name smoke \
+              --db-parameter-group-name "$NAME" \
+              --vpc-security-group-ids "$SG" \
+              --publicly-accessible \
+              --backup-retention-period 0 --no-multi-az \
+              --no-deletion-protection --no-auto-minor-version-upgrade \
+              --tags Key=Project,Value=$RUN_TAG >/dev/null
+            aws rds wait db-instance-available --db-instance-identifier "$NAME"
+            HOST=$(aws rds describe-db-instances --db-instance-identifier "$NAME" \
+                   --query 'DBInstances[0].Endpoint.Address' --output text)
+          else
+            aws rds create-db-cluster-parameter-group \
+              --db-cluster-parameter-group-name "$NAME" \
+              --db-parameter-group-family aurora-postgresql16 \
+              --description "bintrail #594 smoke: rds.logical_replication=1" \
+              --tags Key=Project,Value=$RUN_TAG >/dev/null
+            aws rds modify-db-cluster-parameter-group \
+              --db-cluster-parameter-group-name "$NAME" \
+              --parameters "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot" >/dev/null
+            aws rds create-db-cluster \
+              --db-cluster-identifier "$NAME" \
+              --engine aurora-postgresql --engine-version 16.13 \
+              --master-username postgres --master-user-password "$PGPASS" \
+              --database-name smoke \
+              --db-cluster-parameter-group-name "$NAME" \
+              --vpc-security-group-ids "$SG" \
+              --serverless-v2-scaling-configuration MinCapacity=0.5,MaxCapacity=1 \
+              --backup-retention-period 1 --no-deletion-protection \
+              --tags Key=Project,Value=$RUN_TAG >/dev/null
+            aws rds create-db-instance \
+              --db-instance-identifier "$NAME-1" \
+              --db-cluster-identifier "$NAME" \
+              --engine aurora-postgresql \
+              --db-instance-class db.serverless \
+              --publicly-accessible --no-auto-minor-version-upgrade \
+              --tags Key=Project,Value=$RUN_TAG >/dev/null
+            aws rds wait db-instance-available --db-instance-identifier "$NAME-1"
+            HOST=$(aws rds describe-db-clusters --db-cluster-identifier "$NAME" \
+                   --query 'DBClusters[0].Endpoint' --output text)
+          fi
+          echo "PGHOST=$HOST" >> "$GITHUB_ENV"
+          echo "provisioned $FLAVOR at $HOST"
+
+      - name: Run the smoke
+        run: |
+          set -euo pipefail
+          docker exec bintrail-test-mysql \
+            mysql -uroot -ptestroot -e "CREATE DATABASE smoke_${FLAVOR};"
+          export SMOKE_PG_URL="postgres://postgres:${PGPASS}@${PGHOST}:5432/smoke?sslmode=require"
+          export SMOKE_INDEX_DSN="root:testroot@tcp(127.0.0.1:13306)/smoke_${FLAVOR}"
+          export SMOKE_BINTRAIL_PG=./bintrail-pg
+          ./scripts/managed-pg-smoke.sh
+
+      - name: Teardown (always)
+        if: always()
+        run: |
+          # Deletes are best-effort (set +e: a half-provisioned run must still
+          # tear down whatever DID get created), but the step FAILS at the end
+          # if anything is left behind — a leaked billable resource must turn
+          # the run red, never show green.
+          set +e
+          if [ "$FLAVOR" = "rds" ]; then
+            aws rds delete-db-instance --db-instance-identifier "$NAME" \
+              --skip-final-snapshot --delete-automated-backups >/dev/null
+            aws rds wait db-instance-deleted --db-instance-identifier "$NAME"
+            aws rds delete-db-parameter-group --db-parameter-group-name "$NAME"
+          else
+            aws rds delete-db-instance --db-instance-identifier "$NAME-1" \
+              --skip-final-snapshot >/dev/null
+            # The member instance must be fully GONE before delete-db-cluster:
+            # deleting a cluster that still has a member is rejected with
+            # InvalidDBClusterStateFault, and the cluster (+ its parameter
+            # group) would leak.
+            aws rds wait db-instance-deleted --db-instance-identifier "$NAME-1"
+            aws rds delete-db-cluster --db-cluster-identifier "$NAME" \
+              --skip-final-snapshot >/dev/null
+            for i in $(seq 1 30); do
+              aws rds describe-db-clusters --db-cluster-identifier "$NAME" >/dev/null 2>&1 || break
+              sleep 20
+            done
+            aws rds delete-db-cluster-parameter-group --db-cluster-parameter-group-name "$NAME"
+          fi
+          if [ -n "${SG:-}" ]; then
+            # ENIs of a just-deleted instance can hold the SG briefly — retry.
+            for i in $(seq 1 10); do
+              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null && break
+              sleep 15
+            done
+          fi
+
+          # Verification gate: anything still present fails the job loudly.
+          LEFT=""
+          LEFT_I=$(aws rds describe-db-instances \
+            --query "DBInstances[?starts_with(DBInstanceIdentifier,'$NAME')].DBInstanceIdentifier" --output text)
+          [ -n "$LEFT_I" ] && LEFT="$LEFT db-instances:[$LEFT_I]"
+          LEFT_C=$(aws rds describe-db-clusters \
+            --query "DBClusters[?starts_with(DBClusterIdentifier,'$NAME')].DBClusterIdentifier" --output text)
+          [ -n "$LEFT_C" ] && LEFT="$LEFT db-clusters:[$LEFT_C]"
+          if aws rds describe-db-parameter-groups --db-parameter-group-name "$NAME" >/dev/null 2>&1; then
+            LEFT="$LEFT db-parameter-group:[$NAME]"
+          fi
+          if aws rds describe-db-cluster-parameter-groups --db-cluster-parameter-group-name "$NAME" >/dev/null 2>&1; then
+            LEFT="$LEFT db-cluster-parameter-group:[$NAME]"
+          fi
+          if [ -n "${SG:-}" ] && aws ec2 describe-security-groups --group-ids "$SG" >/dev/null 2>&1; then
+            LEFT="$LEFT security-group:[$SG]"
+          fi
+          if [ -n "$LEFT" ]; then
+            echo "::error::teardown incomplete — leaked resources:$LEFT (delete manually; all are tagged Project=$RUN_TAG)"
+            exit 1
+          fi
+          echo "teardown verified: nothing named ${NAME}* remains"

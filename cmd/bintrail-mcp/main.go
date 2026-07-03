@@ -43,6 +43,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -423,6 +424,15 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 		}
 		text += queryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit)
 
+		ext.Record(ctx, ext.AuditEvent{
+			Surface: "mcp",
+			Action:  "query.run",
+			Actor:   ext.ProcessActor(args.Profile),
+			Schema:  args.Schema,
+			Table:   args.Table,
+			Detail:  map[string]string{"results": strconv.Itoa(n), "format": format},
+		})
+
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: text},
@@ -520,6 +530,19 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 		if n >= opts.Limit {
 			text += fmt.Sprintf("\n-- Warning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
 		}
+
+		ext.Record(ctx, ext.AuditEvent{
+			Surface: "mcp",
+			Action:  "recover.generate",
+			Actor:   ext.ProcessActor(args.Profile),
+			Schema:  args.Schema,
+			Table:   args.Table,
+			Detail: map[string]string{
+				"statements": strconv.Itoa(n),
+				"dry_run":    "true", // MCP recover always returns the script, never applies it
+				"gtid":       args.GTID,
+			},
+		})
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{

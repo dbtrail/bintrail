@@ -88,7 +88,7 @@ SHOW wal_level;        -- want: logical
 ALTER SYSTEM SET wal_level = 'logical';
 -- wal_level only takes effect after a RESTART (not a reload):
 --   self-hosted:  restart the postgres service
---   managed (RDS/Aurora/Cloud SQL/Azure): set it in the parameter group and reboot
+--   managed (RDS/Aurora/Cloud SQL): set it in the parameter group and reboot
 ```
 
 While you are there, make sure there is slot/sender headroom (defaults are
@@ -338,6 +338,103 @@ directly.
 
 ---
 
+## Sequences after recovery
+
+Restoring **row data** does not restore the **sequence cursor** behind a
+`SERIAL` or `IDENTITY` column. This is the classic PostgreSQL dump/restore
+gotcha, and it applies to bintrail-recovered data too — read this section if
+your tables use auto-generated ids.
+
+### Why this happens
+
+PostgreSQL's logical decoding does not replicate sequence state. In the words
+of the PostgreSQL docs: *"Sequence data is not replicated. The data in serial
+or identity columns backed by sequences will of course be replicated as part
+of the table, but the sequence itself would still show the start value on the
+subscriber."*
+
+For bintrail that means:
+
+- The **id values in your rows are fully captured** — the materialized id
+  rides in the row image, and `recover` puts it back verbatim. No data is lost.
+- The sequence's own `last_value` is a **separate catalog object** bintrail
+  never sees. Nothing in the index knows how far the sequence had advanced.
+
+So after loading recovered rows into a target, the sequence can lag behind the
+ids that are now in the table — and the next `INSERT` that draws from it fails
+with a duplicate-key error on the primary key.
+
+This is the same boundary MySQL has with `AUTO_INCREMENT`, with one twist:
+in PostgreSQL, an INSERT that supplies an **explicit id** (which is exactly
+what `recover`'s reversal SQL does) never advances the sequence.
+
+### When you need to fix the sequence
+
+- **Recovering into a fresh or restored target** (a different database, or the
+  same database rebuilt from a backup): **always**. The target's sequence
+  reflects the backup — or the start value — not the history you just replayed.
+- **After the sequence was reset on the source** (`TRUNCATE … RESTART
+  IDENTITY`, a manual `setval`, `ALTER SEQUENCE … RESTART`): **yes** — the
+  recovered ids are ahead of the rewound cursor.
+- **Applying `recover` output on the same live database where the rows were
+  deleted**: usually **not needed**. The sequence advanced when the rows were
+  first inserted, and a sequence never goes backward on its own — the cursor is
+  still past the re-inserted ids. Running the fix anyway is cheap and harmless,
+  so when in doubt, run it.
+
+### The fix: `setval` to MAX(id)
+
+After the recovered rows are loaded, point each sequence just past the highest
+id actually in the table. `pg_get_serial_sequence` finds the sequence name for
+you (it works for both `SERIAL` and `IDENTITY` columns):
+
+```sql
+SELECT setval(
+  pg_get_serial_sequence('shop.orders', 'id'),
+  COALESCE((SELECT MAX(id) FROM shop.orders), 0) + 1,
+  false
+);
+```
+
+The `+ 1, false` form makes the next `nextval` return exactly `MAX(id) + 1`,
+and handles an empty table (next value is 1). Run one `setval` per
+sequence-backed column — a table can have more than one.
+
+Avoid running it while writers are actively inserting into the table (the
+`MAX` and the `setval` are not atomic together); recovery windows are normally
+quiesced anyway.
+
+To fix **every owned sequence in a schema** at once, generate the statements
+from the catalog (covers `SERIAL` and `IDENTITY` columns; run the output it
+prints):
+
+```sql
+SELECT format(
+  'SELECT setval(%L, COALESCE((SELECT MAX(%I) FROM %I.%I), 0) + 1, false);',
+  quote_ident(sn.nspname) || '.' || quote_ident(seq.relname),
+  att.attname, tn.nspname, tbl.relname
+)
+FROM pg_class seq
+JOIN pg_namespace sn ON sn.oid = seq.relnamespace
+JOIN pg_depend dep ON dep.objid = seq.oid AND dep.deptype IN ('a', 'i')
+JOIN pg_class tbl ON tbl.oid = dep.refobjid
+JOIN pg_namespace tn ON tn.oid = tbl.relnamespace
+JOIN pg_attribute att ON att.attrelid = tbl.oid AND att.attnum = dep.refobjsubid
+WHERE seq.relkind = 'S'
+  AND tn.nspname = 'shop';   -- your schema
+```
+
+### Out of scope: standalone sequences
+
+A **standalone sequence** — one whose `nextval` values are used directly
+(counters, ticket numbers) and never land in a captured table — is
+**irrecoverable from bintrail**. Its values never entered the row history, so
+there is nothing to derive a cursor from. If such sequences matter to you,
+snapshot them by other means (e.g. include them in your regular dumps —
+`pg_dump` records sequence state).
+
+---
+
 ## Type support
 
 bintrail-pg captures every value as its PostgreSQL text representation (the
@@ -425,8 +522,9 @@ your own round-trip.
   an event but carries no rows, so there is nothing for `recover` to put back.
 - **Sequence cursors are not captured.** The materialized id values in your rows
   *are* captured; the sequence's own `last_value` (a separate catalog object) is
-  not — logical decoding does not replicate sequences. After a restore, fix the
-  sequence with `SELECT setval('seq', (SELECT max(id) FROM t));`.
+  not — logical decoding does not replicate sequences. After a restore, re-point
+  each `SERIAL`/`IDENTITY` sequence past `MAX(id)` — recipe and when it matters
+  in [Sequences after recovery](#sequences-after-recovery).
 - **`GENERATED ... AS IDENTITY` / generated columns** can need care on recovery
   (`GENERATED ALWAYS AS IDENTITY` rejects an explicit insert; `STORED` generated
   columns are absent from the stream before PostgreSQL 18). Treat as best-effort.
@@ -447,22 +545,43 @@ The data-safety items that gated **beta** are now closed (type fidelity,
 identity/generated recovery, slot/WAL monitoring, RI-FULL validation, DDL-drift
 handling, and the silent-loss coverage guards above). Source-aware console
 presentation, including the live replication-health panel, shipped in v0.20.1.
-The remaining limitations — full-table `reconstruct` / time-travel via a
-PostgreSQL baseline, and a managed-PostgreSQL smoke matrix — are tracked toward
-**GA** in [#597](https://github.com/dbtrail/dbtrail/issues/597).
+The remaining limitation — full-table `reconstruct` / time-travel via a
+PostgreSQL baseline — is tracked toward **GA** in
+[#597](https://github.com/dbtrail/dbtrail/issues/597). The managed-PostgreSQL
+smoke covers RDS and Aurora — see
+[Managed PostgreSQL](#managed-postgresql).
 
 ---
 
 ## Managed PostgreSQL
 
-Logical replication works on the major managed offerings; the only setup
+Logical replication works on managed offerings that expose it; the only setup
 difference is *how* you set `wal_level` and grant replication.
 
-| Provider | `wal_level = logical` | Replication privilege |
-|---|---|---|
-| **Amazon RDS / Aurora PostgreSQL** | Set `rds.logical_replication = 1` in the parameter group, then **reboot**. | Master user has it; grant others with `GRANT rds_replication TO <role>;`. |
-| **Google Cloud SQL** | Set the `cloudsql.logical_decoding` flag on, then restart. | Use a user with `cloudsqlsuperuser` / the replication grant. |
-| **Azure Database for PostgreSQL** | Set `wal_level = logical` (Flexible Server) and restart. | Grant `azure_pg_admin` / replication as documented. |
+| Provider | Validated? | `wal_level = logical` | Replication privilege |
+|---|---|---|---|
+| **Amazon RDS for PostgreSQL** | **Smoke-validated** (PostgreSQL 16) | Set `rds.logical_replication = 1` in the parameter group, then **reboot**. (A parameter group set at *instance creation* applies at the initial boot — no reboot needed.) | Master user has it (`rds_replication`); grant others with `GRANT rds_replication TO <role>;`. |
+| **Amazon Aurora PostgreSQL** | **Smoke-validated** (16-compatible, Serverless v2) | Same, in the **cluster** parameter group. | Same as RDS. |
+| **Google Cloud SQL** | Documented only — **not validated** | Set the `cloudsql.logical_decoding` flag on, then restart. | Use a user with `cloudsqlsuperuser` / the replication grant. |
+
+**Smoke-validated** means the full pipeline was exercised end-to-end against a
+real instance of that flavor: `bintrail-pg doctor` passes, `stream` creates its
+slot and captures INSERT/UPDATE/DELETE into `binlog_events` with full
+before/after images, and `recover` generates a correct reversal. The smoke is
+`scripts/managed-pg-smoke.sh` (it runs against *any* PostgreSQL DSN — the
+managed part is the provisioning), and a gated CI job
+(`.github/workflows/managed-pg-smoke.yml`, `workflow_dispatch`-only) provisions
+an ephemeral RDS or Aurora instance, runs it, and tears everything down.
+
+Cloud SQL is *expected* to work — bintrail-pg is an ordinary
+logical-replication client — but it has **not** been smoke-validated, so its
+row is setup documentation, not a support claim. Extending the validated
+matrix follows demand ([#535](https://github.com/dbtrail/dbtrail/issues/535)).
+
+Two observations from the RDS/Aurora validation runs: the master user captures
+out of the box (it already holds `rds_replication`), and both flavors default
+`max_slot_wal_keep_size` to `-1` (unlimited) — `doctor` WARNs about it; set a
+bound as you would for any production source.
 
 In all cases bintrail-pg connects as a **client** — there is nothing to install
 on the managed instance beyond the publication and `REPLICA IDENTITY FULL`,

@@ -147,6 +147,14 @@ func runWhoChanged(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("source database unreachable: %w", err)
 		}
 		deps.SourceDB = sourceDB
+		// Carry the source host (bare, port stripped) so the audit tier can
+		// reach the RDS file API when the log lives on AWS-managed storage
+		// (RDS/Aurora) rather than a local file. ParseSourceDSN returns the host
+		// without the port, matching the agent's derivation; a unix-socket DSN
+		// errors here and leaves SourceHost empty (correctly local-file-only).
+		if host, _, _, _, perr := config.ParseSourceDSN(wcSourceDSN); perr == nil {
+			deps.SourceHost = host
+		}
 	}
 
 	// Fetch through the shared live-index + archive pipeline (auto-discovery
