@@ -219,10 +219,10 @@ try {
   // The query itself is async (index fetch, possibly a lazy bundle open) —
   // poll for any outcome (timeline rendered, the "no changes found" empty
   // state, or a rendered error) rather than a fixed sleep. Matches the
-  // actual classes renderError()/buildWhoChangedTimeline() use — NOT
-  // generic ".error"/".empty" names, which don't exist in this file.
+  // actual classes renderError()/buildWhoChangedTimeline() use — NOT a
+  // generic ".error"/".empty" name, which doesn't exist in this file.
   await page.waitForFunction(
-    () => !!document.getElementById("fx-timeline") || !!document.querySelector("#fx-out .error-box, #fx-out .ev-empty, #fx-out .empty"),
+    () => !!document.getElementById("fx-timeline") || !!document.querySelector("#fx-out .error-box, #fx-out .ev-empty"),
     { timeout: 8000 },
   );
   const who = await page.evaluate(() => {
@@ -412,13 +412,17 @@ try {
   cred.rawRowCount === 4 ? ok("aws-creds: all four raw signal rows still render") : bad("aws-creds: all four raw signal rows still render", `rawRowCount=${cred.rawRowCount}`);
 
   // Scenario 10 — Forensics setup-guide panel (#708). buildFxCapsBanner is pure
-  // (like pgHealthCard/continuityBox/credentialsCard): the real test MySQL fixture
-  // always reports performance_schema enabled with no recommendations, so Scenario
-  // 5b's who-changed run never exercises the degraded-capabilities/setup-guide path
-  // — the panel + its copy-to-clipboard blocks have never rendered in a browser
-  // until this fixture-driven check. Feeds buildFxCapsBanner synthetic capability
-  // payloads directly, mirroring the no-source, fully-capable, and degraded-with-
-  // recommendations states.
+  // (like pgHealthCard/continuityBox/credentialsCard): the only live-browser
+  // forensics scenario (5b) uses byo-idx, which has no source connection
+  // configured at all — handleForensicsCapabilities short-circuits before ever
+  // calling DetectCapabilities/BuildSetupGuide, so neither the fully-capable
+  // nor the degraded-with-recommendations state ever renders in a real browser.
+  // (Even a source-configured probe against the stock test MySQL would show
+  // recommendations, not the fully-capable state — events_statements_history_long
+  // and the audit plugin are both off by default — so there's no live fixture
+  // that reaches this UI path either way.) Feeds buildFxCapsBanner synthetic
+  // capability payloads directly, mirroring the no-source, fully-capable, and
+  // degraded-with-recommendations states.
   const fxGuide = await page.evaluate(() => {
     const noSource = buildFxCapsBanner({ source_configured: false });
     const fullyCapable = buildFxCapsBanner({

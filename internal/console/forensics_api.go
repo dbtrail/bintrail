@@ -87,26 +87,32 @@ func (s *Server) forensicsRefused(w http.ResponseWriter) bool {
 	return false
 }
 
+// errSourceNotConfigured is openForensicsSource's sentinel for "this server
+// has no source connection set up at all" — distinct from any other error
+// (which means a source IS configured but couldn't be reached: a genuine
+// misconfiguration or outage the caller must surface, not silently relabel
+// as "not configured"). Conflating the two used to leave an operator staring
+// at "add a source connection" for a server that already has one. Encoding
+// this as the error itself (rather than a separate bool alongside err) makes
+// the fourth, illegal combination — "not configured" AND "some other error"
+// — unrepresentable, instead of relying on every call site to check them in
+// the right order.
+var errSourceNotConfigured = errors.New("no source connection configured")
+
 // openForensicsSource opens the selected server's source connection for the
 // forensic data-source queries (performance_schema, audit log, mysql.user).
-//
-// It distinguishes "no source configured" (configured=false, err=nil — the
-// caller renders a setup prompt, same as before this DSN was ever typed) from
-// "a source IS configured but can't be reached" (configured=true, err set —
-// a genuine misconfiguration or outage the caller must surface, not silently
-// relabel as "not configured"). Conflating the two used to leave an operator
-// staring at "add a source connection" for a server that already has one.
-// The returned db must be closed by the caller when err is nil and
-// configured is true.
-func (s *Server) openForensicsSource(r *http.Request) (db *sql.DB, host string, configured bool, err error) {
+// Callers distinguish the three outcomes with errors.Is(err, errSourceNotConfigured)
+// then a plain err != nil check. The returned db must be closed by the
+// caller whenever err is nil.
+func (s *Server) openForensicsSource(r *http.Request) (db *sql.DB, host string, err error) {
 	e, found := s.selectedEntry(r)
 	if !found || e.SourceDSN == "" {
-		return nil, "", false, nil
+		return nil, "", errSourceNotConfigured
 	}
 	db, cerr := config.Connect(e.SourceDSN)
 	if cerr != nil {
 		slog.Warn("forensics: source connect failed", "server", e.Name, "error", cerr)
-		return nil, "", true, errors.New(scrubDSNError(cerr, e.SourceDSN))
+		return nil, "", errors.New(scrubDSNError(cerr, e.SourceDSN))
 	}
 	// A DSN shape Connect accepts but ParseSourceDSN rejects (e.g. a
 	// unix-socket source) just loses SourceHost — degrading the RDS/Aurora
@@ -117,7 +123,7 @@ func (s *Server) openForensicsSource(r *http.Request) (db *sql.DB, host string, 
 	if perr != nil {
 		slog.Warn("forensics: could not derive source host for RDS/Aurora audit-log discovery", "server", e.Name, "error", perr)
 	}
-	return db, host, true, nil
+	return db, host, nil
 }
 
 // handleForensicsCapabilities serves GET /api/forensics/capabilities:
@@ -133,8 +139,8 @@ func (s *Server) handleForensicsCapabilities(w http.ResponseWriter, r *http.Requ
 	if s.forensicsRefused(w) {
 		return
 	}
-	sourceDB, _, configured, err := s.openForensicsSource(r)
-	if !configured {
+	sourceDB, _, err := s.openForensicsSource(r)
+	if errors.Is(err, errSourceNotConfigured) {
 		writeJSON(w, http.StatusOK, forensicsCapabilitiesResponse{})
 		return
 	}
@@ -165,8 +171,8 @@ func (s *Server) handleForensicsUsers(w http.ResponseWriter, r *http.Request) {
 	if s.forensicsRefused(w) {
 		return
 	}
-	sourceDB, _, configured, err := s.openForensicsSource(r)
-	if !configured {
+	sourceDB, _, err := s.openForensicsSource(r)
+	if errors.Is(err, errSourceNotConfigured) {
 		writeJSON(w, http.StatusOK, forensicsUsersResponse{Users: []string{}})
 		return
 	}
@@ -227,21 +233,23 @@ func (s *Server) handleForensicsWhoChanged(w http.ResponseWriter, r *http.Reques
 		return rows, ferr
 	}
 	var sourceUnreachable string
-	if sourceDB, host, configured, serr := s.openForensicsSource(r); configured {
-		if serr != nil {
-			// Degrade, per the library's own "degradation is an answer"
-			// design (deps.SourceDB stays nil, same as index-only mode) —
-			// but say so, exactly like DetectCapabilities' own unreachable-
-			// source note would have, so this doesn't read as a silent
-			// downgrade to a worse attribution tier.
-			sourceUnreachable = "This server's source connection is configured but could not be reached, " +
-				"so the audit-log, GTID, and performance_schema attribution tiers were not consulted; " +
-				"only index-side sources ran."
-		} else {
-			defer sourceDB.Close()
-			deps.SourceDB = sourceDB
-			deps.SourceHost = host
-		}
+	switch sourceDB, host, serr := s.openForensicsSource(r); {
+	case errors.Is(serr, errSourceNotConfigured):
+		// No source at all — same as always, deps.SourceDB stays nil and
+		// WhoChanged runs index-only tiers with no note (nothing changed).
+	case serr != nil:
+		// Degrade, per the library's own "degradation is an answer" design
+		// (deps.SourceDB stays nil, same as index-only mode) — but say so,
+		// exactly like DetectCapabilities' own unreachable-source note
+		// would have, so this doesn't read as a silent downgrade to a
+		// worse attribution tier.
+		sourceUnreachable = "This server's source connection is configured but could not be reached, " +
+			"so the audit-log, GTID, and performance_schema attribution tiers were not consulted; " +
+			"only index-side sources ran."
+	default:
+		defer sourceDB.Close()
+		deps.SourceDB = sourceDB
+		deps.SourceHost = host
 	}
 
 	res, err := forensics.WhoChanged(r.Context(), deps, forensics.WhoChangedParams{
@@ -301,8 +309,8 @@ func (s *Server) handleForensicsActivity(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	sourceDB, _, configured, err := s.openForensicsSource(r)
-	if !configured {
+	sourceDB, _, err := s.openForensicsSource(r)
+	if errors.Is(err, errSourceNotConfigured) {
 		writeJSONError(w, http.StatusBadRequest,
 			"this server has no source connection configured; set the source connection first")
 		return
@@ -324,7 +332,14 @@ func (s *Server) handleForensicsActivity(w http.ResponseWriter, r *http.Request)
 		Order:  body.Order,
 	})
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		// By this point query_type/user/host preconditions are already
+		// validated above and forensics.Activity re-checks nothing new — any
+		// error here is a genuine query failure against a source that DID
+		// connect (e.g. missing performance_schema/mysql.user grants), never
+		// a client mistake. A bare 400 would tell an operator their filters
+		// are wrong when the real problem is server-side; match the other
+		// three forensics handlers' precedent (502/writeFetchError) instead.
+		writeJSONError(w, http.StatusBadGateway, "could not run the forensic query: "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
