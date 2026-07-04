@@ -147,7 +147,7 @@ func TestBuildSetupGuideAuditVariants(t *testing.T) {
 		wantTitle     string
 		wantSQLSubstr string
 	}{
-		{"percona", "Install Percona Audit Log Plugin", "INSTALL PLUGIN audit_log SONAME 'audit_log.so';"},
+		{"percona", "Install Percona Audit Log Filter Plugin", "INSTALL PLUGIN audit_log_filter SONAME 'audit_log_filter.so';"},
 		{"mariadb", "Enable MariaDB Audit Plugin", "INSTALL SONAME 'server_audit';"},
 		{"mysql", "Install an audit log plugin", "INSTALL PLUGIN audit_log SONAME 'audit_log.so';"},
 	}

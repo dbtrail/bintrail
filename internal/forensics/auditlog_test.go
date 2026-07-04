@@ -663,10 +663,11 @@ func TestParseAuditLogFiles_Fixtures(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 const (
-	showAuditLogFileSQL    = "SHOW GLOBAL VARIABLES LIKE 'audit_log_file'"
-	showServerAuditPathSQL = "SHOW GLOBAL VARIABLES LIKE 'server_audit_file_path'"
-	showDataDirSQL         = "SHOW GLOBAL VARIABLES LIKE 'datadir'"
-	pluginsSQL             = "SELECT PLUGIN_NAME, PLUGIN_DESCRIPTION FROM information_schema.PLUGINS"
+	showAuditLogFileSQL       = "SHOW GLOBAL VARIABLES LIKE 'audit_log_file'"
+	showAuditLogFilterFileSQL = "SHOW GLOBAL VARIABLES LIKE 'audit_log_filter_file'"
+	showServerAuditPathSQL    = "SHOW GLOBAL VARIABLES LIKE 'server_audit_file_path'"
+	showDataDirSQL            = "SHOW GLOBAL VARIABLES LIKE 'datadir'"
+	pluginsSQL                = "SELECT PLUGIN_NAME, PLUGIN_DESCRIPTION FROM information_schema.PLUGINS"
 )
 
 func variableRows(name, value string) *sqlmock.Rows {
@@ -692,6 +693,7 @@ func TestReadAuditLog_NotConfigured(t *testing.T) {
 	}
 	defer db.Close()
 	mock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	mock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(noVariableRows())
 	mock.ExpectQuery(showServerAuditPathSQL).WillReturnRows(noVariableRows())
 
 	_, err = ReadAuditLog(context.Background(), db, AuditReadOptions{})
@@ -713,6 +715,7 @@ func TestReadAuditLog_DiscoveryQueryFailureIsNotNotConfigured(t *testing.T) {
 	defer db.Close()
 	connErr := errors.New("connection refused")
 	mock.ExpectQuery(showAuditLogFileSQL).WillReturnError(connErr)
+	mock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnError(connErr)
 	mock.ExpectQuery(showServerAuditPathSQL).WillReturnError(connErr)
 
 	_, err = ReadAuditLog(context.Background(), db, AuditReadOptions{})
@@ -774,6 +777,7 @@ func TestReadAuditLog_MariaDBFallbackDiscovery(t *testing.T) {
 	}
 	defer db.Close()
 	mock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	mock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(noVariableRows())
 	mock.ExpectQuery(showServerAuditPathSQL).WillReturnRows(variableRows("server_audit_file_path", logPath))
 
 	res, err := ReadAuditLog(context.Background(), db, AuditReadOptions{})
@@ -791,6 +795,65 @@ func TestReadAuditLog_MariaDBFallbackDiscovery(t *testing.T) {
 	}
 	if !warningsContain(res.Warnings, "server-local time") {
 		t.Errorf("Warnings = %v, want the local-time caveat", res.Warnings)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestReadAuditLog_PerconaAuditLogFilterDiscovery: audit_log_file misses (no
+// legacy plugin), audit_log_filter_file hits — Percona's newer Audit Log
+// Filter plugin. Its NEW-format XML output is field-compatible with the
+// existing MySQL Enterprise/legacy-Percona XML parser, so no new parser is
+// exercised here, only discovery + variant tagging.
+func TestReadAuditLog_PerconaAuditLogFilterDiscovery(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit_filter.log")
+	mustWrite(t, logPath,
+		`<?xml version="1.0" encoding="utf-8"?>`+"\n"+
+			`<AUDIT>`+"\n"+
+			`  <AUDIT_RECORD>`+"\n"+
+			`    <NAME>TableInsert</NAME>`+"\n"+
+			`    <TIMESTAMP>2024-06-15T10:30:00</TIMESTAMP>`+"\n"+
+			`    <CONNECTION_ID>99</CONNECTION_ID>`+"\n"+
+			`    <DB>mydb</DB>`+"\n"+
+			`    <SQLTEXT>INSERT INTO t1 VALUES(1)</SQLTEXT>`+"\n"+
+			`  </AUDIT_RECORD>`+"\n"+
+			`  <AUDIT_RECORD>`+"\n"+
+			`    <NAME>Connect</NAME>`+"\n"+
+			`    <TIMESTAMP>2024-06-15T10:31:00</TIMESTAMP>`+"\n"+
+			`    <CONNECTION_ID>100</CONNECTION_ID>`+"\n"+
+			`    <USER>root</USER>`+"\n"+
+			`    <HOST>localhost</HOST>`+"\n"+
+			`  </AUDIT_RECORD>`+"\n"+
+			`</AUDIT>`+"\n")
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	mock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(variableRows("audit_log_filter_file", logPath))
+
+	res, err := ReadAuditLog(context.Background(), db, AuditReadOptions{})
+	if err != nil {
+		t.Fatalf("ReadAuditLog: %v", err)
+	}
+	if res.Variant != AuditVariantPerconaFilter {
+		t.Errorf("Variant = %q, want percona_filter", res.Variant)
+	}
+	if res.FormatDetected != AuditFormatXML {
+		t.Errorf("FormatDetected = %q, want xml", res.FormatDetected)
+	}
+	if res.FilePath != logPath {
+		t.Errorf("FilePath = %q, want %q", res.FilePath, logPath)
+	}
+	if len(res.Events) != 2 || res.Events[0].SQLText != "INSERT INTO t1 VALUES(1)" {
+		t.Errorf("Events = %+v, want 2 events with the insert first", res.Events)
+	}
+	if res.Events[1].User != "root" || res.Events[1].Host != "localhost" {
+		t.Errorf("Events[1] = %+v, want User=root Host=localhost", res.Events[1])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)

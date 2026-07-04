@@ -178,9 +178,12 @@ func detectAuditLog(ctx context.Context, db *sql.DB) AuditLogCapabilities {
 		caps.PluginName = name
 		caps.PluginStatus = status
 
-		// Determine variant based on plugin name.
+		// Determine variant based on plugin name. audit_log_filter is
+		// Percona-exclusive (its PLUGIN_DESCRIPTION is just "Audit log",
+		// so the name/description substring check below would miss it).
 		switch {
-		case strings.Contains(upperName, "PERCONA") || strings.Contains(strings.ToUpper(description), "PERCONA"):
+		case strings.EqualFold(name, "audit_log_filter") ||
+			strings.Contains(upperName, "PERCONA") || strings.Contains(strings.ToUpper(description), "PERCONA"):
 			caps.Variant = "percona"
 		case strings.Contains(upperName, "SERVER_AUDIT") || strings.Contains(upperName, "MARIADB"):
 			caps.Variant = "mariadb"
@@ -213,6 +216,8 @@ func detectAuditLogConfig(ctx context.Context, db *sql.DB) map[string]string {
 		"audit_log_format",
 		"audit_log_file",
 		"audit_log_policy",
+		"audit_log_filter_format",  // Percona Audit Log Filter plugin
+		"audit_log_filter_file",    // Percona Audit Log Filter plugin
 		"server_audit_logging",     // MariaDB
 		"server_audit_file_path",   // MariaDB
 		"server_audit_output_type", // MariaDB

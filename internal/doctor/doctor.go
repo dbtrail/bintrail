@@ -832,9 +832,12 @@ func checkAuditPlugin(ctx context.Context, db *sql.DB) CheckResult {
 			"  -- MariaDB (built in):\n" +
 			"  INSTALL SONAME 'server_audit';\n" +
 			"  SET GLOBAL server_audit_logging = ON;\n\n" +
-			"  -- Percona Server (free):\n" +
-			"  INSTALL PLUGIN audit_log SONAME 'audit_log.so';\n" +
-			"  SET GLOBAL audit_log_policy = 'ALL';\n\n" +
+			"  -- Percona Server (free, Audit Log Filter plugin — supersedes the legacy audit_log plugin):\n" +
+			"  CREATE TABLE IF NOT EXISTS mysql.audit_log_filter (filter_id INT UNSIGNED NOT NULL AUTO_INCREMENT, name VARCHAR(255) NOT NULL, filter JSON NOT NULL, PRIMARY KEY (filter_id), UNIQUE KEY filter_name (name)) ENGINE=InnoDB;\n" +
+			"  CREATE TABLE IF NOT EXISTS mysql.audit_log_user (username VARCHAR(32) NOT NULL, userhost VARCHAR(255) NOT NULL, filtername VARCHAR(255) NOT NULL, PRIMARY KEY (username, userhost), FOREIGN KEY (filtername) REFERENCES mysql.audit_log_filter(name)) ENGINE=InnoDB;\n" +
+			"  INSTALL PLUGIN audit_log_filter SONAME 'audit_log_filter.so';\n" +
+			"  SELECT audit_log_filter_set_filter('log_all', '{\"filter\": {\"log\": true}}');\n" +
+			"  SELECT audit_log_filter_set_user('%', 'log_all');\n\n" +
 			"  -- MySQL Community: no free audit plugin; MySQL Enterprise Audit requires an Enterprise license.\n\n" +
 			"On RDS for MySQL, add the MARIADB_AUDIT_PLUGIN option to the instance's option group;\n" +
 			"on Aurora MySQL, set server_audit_logging=1 in the cluster parameter group.\n" +

@@ -202,26 +202,46 @@ func auditRecommendation(variant string) SetupRecommendation {
 	if variant == "percona" {
 		return SetupRecommendation{
 			Category: "audit_plugin",
-			Title:    "Install Percona Audit Log Plugin",
+			Title:    "Install Percona Audit Log Filter Plugin",
 			Description: "No audit log plugin detected. Percona Server includes the free, " +
-				"open-source Audit Log Plugin that captures comprehensive query " +
-				"history for long-term forensic investigation.",
+				"open-source Audit Log Filter plugin — Percona's recommended audit " +
+				"plugin, which supersedes the legacy Audit Log plugin — capturing " +
+				"comprehensive query history for long-term forensic investigation.",
 			Impact: "Captures all SQL statements with user, host, timestamp, and " +
 				"connection metadata. Provides forensic data beyond " +
 				"performance_schema's ring buffer — persisted to disk.",
-			PerformanceNote: "JSON format logging adds moderate I/O overhead. Use " +
-				"audit_log_policy = LOGINS for minimal impact (connection " +
-				"events only) or ALL for full query logging.",
+			PerformanceNote: "Logging every statement adds moderate I/O overhead. Narrow " +
+				"the filter definition to the connection and table_access classes " +
+				"(e.g. insert/update/delete only, skipping read) for lower overhead " +
+				"than logging everything including SELECTs.",
 			RuntimeSQL: []string{
-				"INSTALL PLUGIN audit_log SONAME 'audit_log.so';",
-				"SET GLOBAL audit_log_policy = 'ALL';",
-				"SET GLOBAL audit_log_format = 'JSON';",
+				"CREATE TABLE IF NOT EXISTS mysql.audit_log_filter (\n" +
+					"  filter_id INT UNSIGNED NOT NULL AUTO_INCREMENT,\n" +
+					"  name VARCHAR(255) NOT NULL,\n" +
+					"  filter JSON NOT NULL,\n" +
+					"  PRIMARY KEY (filter_id),\n" +
+					"  UNIQUE KEY filter_name (name)\n" +
+					") ENGINE=InnoDB;",
+				"CREATE TABLE IF NOT EXISTS mysql.audit_log_user (\n" +
+					"  username VARCHAR(32) NOT NULL,\n" +
+					"  userhost VARCHAR(255) NOT NULL,\n" +
+					"  filtername VARCHAR(255) NOT NULL,\n" +
+					"  PRIMARY KEY (username, userhost),\n" +
+					"  FOREIGN KEY (filtername) REFERENCES mysql.audit_log_filter(name)\n" +
+					") ENGINE=InnoDB;",
+				"INSTALL PLUGIN audit_log_filter SONAME 'audit_log_filter.so';",
+				`SELECT audit_log_filter_set_filter('log_all', '{"filter": {"log": true}}');`,
+				"SELECT audit_log_filter_set_user('%', 'log_all');",
 			},
 			MycnfSnippet: "[mysqld]\n" +
-				"plugin-load-add = audit_log.so\n" +
-				"audit_log_policy = ALL\n" +
-				"audit_log_format = JSON\n" +
-				"audit_log_file = /var/log/mysql/audit.log",
+				"plugin-load-add = audit_log_filter.so\n" +
+				"audit_log_filter_file = /var/log/mysql/audit_filter.log\n" +
+				"\n" +
+				"# audit_log_filter_file/_format/_strategy require a server restart to\n" +
+				"# take effect (not dynamic) — the default NEW format is left as-is here\n" +
+				"# since it's the one bintrail's audit-log reader is verified against.\n" +
+				"# Which events get logged is controlled separately, at runtime, via\n" +
+				"# audit_log_filter_set_filter().",
 			Priority: "medium",
 		}
 	}
@@ -260,7 +280,7 @@ func auditRecommendation(variant string) SetupRecommendation {
 		Description: "No audit log plugin detected. MySQL Enterprise Edition includes " +
 			"the Enterprise Audit plugin (commercial license required). " +
 			"Alternatively, consider migrating to Percona Server (free, " +
-			"drop-in replacement) for the open-source Percona Audit Log Plugin.",
+			"drop-in replacement) for the open-source Percona Audit Log Filter Plugin.",
 		Impact: "Captures all SQL statements with user, host, timestamp, and " +
 			"connection metadata. Provides forensic data beyond " +
 			"performance_schema's ring buffer — persisted to disk.",
@@ -277,7 +297,7 @@ func auditRecommendation(variant string) SetupRecommendation {
 			"audit_log_policy = ALL\n" +
 			"\n" +
 			"# Option 2: Migrate to Percona Server (free, drop-in replacement)\n" +
-			"# and use the Percona Audit Log Plugin (see Percona docs)",
+			"# and use the Percona Audit Log Filter Plugin (see Percona docs)",
 		Priority: "medium",
 	}
 }

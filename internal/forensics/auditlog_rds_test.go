@@ -116,6 +116,7 @@ func TestFormatFromVariant(t *testing.T) {
 	}{
 		{AuditVariantMariaDB, AuditFormatMariaDB},
 		{AuditVariantPercona, AuditFormatCSV},
+		{AuditVariantPerconaFilter, AuditFormatXML},
 		{AuditVariantMySQLEnterprise, AuditFormatJSON},
 		{AuditVariant("bogus"), AuditFormatUnknown},
 		{AuditVariant(""), AuditFormatUnknown},
@@ -1038,6 +1039,7 @@ func TestReadAuditLog_ExplicitRDSSource_WithDiscovery(t *testing.T) {
 	}
 	defer db.Close()
 	dbmock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	dbmock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditPathSQL).WillReturnRows(variableRows("server_audit_file_path", "/rdsdbdata/log/audit/server_audit.log"))
 
 	mock := &mockRDSClient{
@@ -1073,6 +1075,7 @@ func TestReadAuditLog_AutoFallsBackToRDS(t *testing.T) {
 	}
 	defer db.Close()
 	dbmock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	dbmock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditPathSQL).WillReturnRows(variableRows("server_audit_file_path", "/rdsdbdata/log/audit/server_audit.log"))
 
 	mock := &mockRDSClient{
@@ -1106,6 +1109,7 @@ func TestReadAuditLog_AutoNoFallbackForNonRDSHost(t *testing.T) {
 	}
 	defer db.Close()
 	dbmock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	dbmock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditPathSQL).WillReturnRows(variableRows("server_audit_file_path", "/rdsdbdata/log/audit/server_audit.log"))
 
 	swapRDSFactory(t, nil, nil) // must not be reached
@@ -1127,6 +1131,7 @@ func TestReadAuditLog_LocalSourceNeverFallsBack(t *testing.T) {
 	}
 	defer db.Close()
 	dbmock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	dbmock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditPathSQL).WillReturnRows(variableRows("server_audit_file_path", "/rdsdbdata/log/audit/server_audit.log"))
 
 	swapRDSFactory(t, nil, nil) // must not be reached
@@ -1150,6 +1155,7 @@ func TestReadAuditLog_AuroraNotConfiguredFallback(t *testing.T) {
 	}
 	defer db.Close()
 	dbmock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	dbmock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditPathSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditLoggingSQL).WillReturnRows(variableRows("server_audit_logging", "ON"))
 
@@ -1188,6 +1194,7 @@ func TestReadAuditLog_NotConfiguredWithoutAuditLogging(t *testing.T) {
 	}
 	defer db.Close()
 	dbmock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	dbmock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditPathSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditLoggingSQL).WillReturnRows(noVariableRows())
 

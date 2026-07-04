@@ -32,12 +32,14 @@ var auditConfigVarNames = []string{
 	"audit_log_format",
 	"audit_log_file",
 	"audit_log_policy",
+	"audit_log_filter_format",
+	"audit_log_filter_file",
 	"server_audit_logging",
 	"server_audit_file_path",
 	"server_audit_output_type",
 }
 
-// expectAuditConfigVars registers the six well-known SHOW GLOBAL VARIABLES
+// expectAuditConfigVars registers the eight well-known SHOW GLOBAL VARIABLES
 // probes; vars named in values return a row, the rest return empty.
 func expectAuditConfigVars(m sqlmock.Sqlmock, values map[string]string) {
 	for _, v := range auditConfigVarNames {
@@ -223,6 +225,27 @@ func TestDetectAuditLog(t *testing.T) {
 			checkConfig: map[string]string{
 				"audit_log_format": "JSON",
 				"audit_log_file":   "/var/lib/mysql/audit.log",
+			},
+		},
+		{
+			name: "percona variant by audit_log_filter plugin name",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("FROM information_schema.PLUGINS").
+					WillReturnRows(pluginRows([3]string{"audit_log_filter", "ACTIVE", "Audit log"}))
+				expectAuditConfigVars(m, map[string]string{
+					"audit_log_filter_format": "JSON",
+					"audit_log_filter_file":   "/var/lib/mysql/audit_filter.json",
+				})
+			},
+			want: AuditLogCapabilities{
+				Installed:    true,
+				PluginName:   "audit_log_filter",
+				PluginStatus: "ACTIVE",
+				Variant:      "percona",
+			},
+			checkConfig: map[string]string{
+				"audit_log_filter_format": "JSON",
+				"audit_log_filter_file":   "/var/lib/mysql/audit_filter.json",
 			},
 		},
 		{

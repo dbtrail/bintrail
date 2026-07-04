@@ -48,7 +48,7 @@ func fetchVia(eng *query.Engine) func(context.Context, query.Options) ([]query.R
 //	    an explanatory note and fallback SQL, never an error.
 //
 // The audit tier is unit-fixture territory (the test container runs no audit
-// plugin), and the GTID tier disables itself unless gtid_mode=ON.
+// plugin).
 func TestIntegrationWhoChanged_LiveThenCacheCascade(t *testing.T) {
 	indexDB, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, indexDB)
@@ -118,7 +118,7 @@ func TestIntegrationWhoChanged_LiveThenCacheCascade(t *testing.T) {
 	// Corroborated, not exact: the live performance_schema tier reports the
 	// current holder of the connection id, whose session lifetime is not bounded
 	// against the event (a reused id could be a different actor). Only the audit
-	// CONNECT..DISCONNECT and GTID tiers earn "exact".
+	// CONNECT..DISCONNECT tier earns "exact".
 	if live.Attribution.Confidence != ConfidenceCorroborated {
 		t.Errorf("live confidence = %q, want %q", live.Attribution.Confidence, ConfidenceCorroborated)
 	}

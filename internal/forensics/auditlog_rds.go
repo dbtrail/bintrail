@@ -492,6 +492,11 @@ func formatFromVariant(variant AuditVariant) AuditFormat {
 		return AuditFormatMariaDB
 	case AuditVariantPercona:
 		return AuditFormatCSV
+	case AuditVariantPerconaFilter:
+		// audit_log_filter never writes CSV — only NEW (XML-compatible,
+		// its default) or JSON. NEW is the safer guess for an empty/unread
+		// file since it's the format bintrail's reader is verified against.
+		return AuditFormatXML
 	case AuditVariantMySQLEnterprise:
 		return AuditFormatJSON
 	default:
