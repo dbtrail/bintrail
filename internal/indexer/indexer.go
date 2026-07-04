@@ -338,6 +338,15 @@ func marshalRow(row map[string]any) ([]byte, error) {
 	// (#736). Restricting to object/array payloads mirrors
 	// query.looksLikeJSONContainer, which guards the same ambiguity on the
 	// baseline/Parquet read side.
+	//
+	// Residual, accepted ambiguity (not fixed here, same limit as the
+	// baseline-side guard above): a plain TEXT/BLOB value whose content
+	// genuinely LOOKS like a JSON object/array (e.g. literal text
+	// `{"a":1}`) is still promoted, same as before. Resolving this fully
+	// would require tagging each captured value with its real column type
+	// at the point it's read (available via metadata.Resolver.MapRow, but
+	// not carried through to here) rather than guessing from content —
+	// a deeper fix, out of scope for #736's reported corruption class.
 	normalized := make(map[string]any, len(row))
 	for k, v := range row {
 		if b, ok := v.([]byte); ok && looksLikeJSONContainer(b) && json.Valid(b) {

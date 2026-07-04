@@ -1133,8 +1133,15 @@ func base64StoredKind(dataType string) (binary, ok bool) {
 // string. That value IS the column's original textual literal, so it is
 // restored directly. A value that decoded to Go nil (originally the string
 // "null") is NOT repairable — indistinguishable from a genuine SQL NULL —
-// and is left as nil.
+// and is left as nil. Likewise a bare JSON *string* scalar (bytes like
+// `"YWJj"`, quotes included) decodes to a plain Go string that still carries
+// those quote characters as content, indistinguishable from genuine base64
+// content — not repairable either. Both gaps apply not only to historical
+// data captured before #736, but also going forward to a genuine JSON
+// column whose top-level value is itself a bare scalar (legal MySQL, but
+// rare); a real fix belongs at the storage encoding, out of scope here.
 func decodeStoredBase64(v any, binary bool) any {
+	var text string
 	switch val := v.(type) {
 	case string:
 		b, err := base64.StdEncoding.DecodeString(val)
@@ -1146,22 +1153,16 @@ func decodeStoredBase64(v any, binary bool) any {
 		}
 		return string(b)
 	case bool:
-		text := "false"
-		if val {
-			text = "true"
-		}
-		if binary {
-			return []byte(text)
-		}
-		return text
+		text = strconv.FormatBool(val)
 	case json.Number:
-		if binary {
-			return []byte(string(val))
-		}
-		return string(val)
+		text = string(val)
 	default:
 		return v
 	}
+	if binary {
+		return []byte(text)
+	}
+	return text
 }
 
 // base64Cols maps each BLOB/TEXT column of schema.table to whether it is binary,

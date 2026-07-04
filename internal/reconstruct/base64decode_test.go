@@ -3,6 +3,7 @@ package reconstruct
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -52,6 +53,21 @@ func TestDecodeStoredBase64_nilNotGuessed(t *testing.T) {
 	// must be left as nil rather than guessed at.
 	if got := decodeStoredBase64(nil, false); got != nil {
 		t.Errorf("expected nil to pass through unchanged, got %v", got)
+	}
+}
+
+func TestDecodeStoredBase64_jsonContainerUnaffected(t *testing.T) {
+	// #736 added "json" to base64StoredKind, so decodeStoredBase64 is now
+	// invoked for JSON-typed columns too — a genuine JSON object/array value
+	// (the overwhelmingly common case) must pass through completely
+	// unchanged, not just fall into some accidental no-op.
+	obj := map[string]any{"a": json.Number("1")}
+	if got := decodeStoredBase64(obj, false); fmt.Sprintf("%v", got) != fmt.Sprintf("%v", obj) {
+		t.Errorf("expected map[string]any to pass through unchanged, got %v (%T)", got, got)
+	}
+	arr := []any{json.Number("1"), json.Number("2")}
+	if got := decodeStoredBase64(arr, false); fmt.Sprintf("%v", got) != fmt.Sprintf("%v", arr) {
+		t.Errorf("expected []any to pass through unchanged, got %v (%T)", got, got)
 	}
 }
 

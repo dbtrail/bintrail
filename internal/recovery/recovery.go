@@ -589,11 +589,17 @@ func base64StoredKind(dataType string) (binary, ok bool) {
 // than left corrupted. A value that decoded to Go nil (originally the
 // string "null") is NOT repairable here — it is indistinguishable from a
 // genuine SQL NULL and is left as nil (documented limitation, not guessed
-// at). Likewise a value that was a bare JSON *string* scalar (bytes like
-// `"YWJj"`) decodes to a plain Go string, indistinguishable from genuine
-// base64 content, and is not repairable either — both are pre-existing,
-// accepted edges of historical data captured before #736.
+// at). Likewise a bare JSON *string* scalar (bytes like `"YWJj"`, quotes
+// included) decodes to a plain Go string that still carries those quote
+// characters as content — indistinguishable from genuine base64 content, so
+// it is not repairable either. Both gaps apply not only to historical data
+// captured before #736, but also going forward to a genuine JSON column
+// whose top-level value is itself a bare scalar (legal MySQL, but rare) —
+// same pre-existing, accepted limitation as the historical case, not a new
+// one; a real fix belongs at the storage encoding (tagging values by column
+// type at capture time), out of scope here.
 func decodeStoredBase64(v any, binary bool) any {
+	var text string
 	switch val := v.(type) {
 	case string:
 		b, err := base64.StdEncoding.DecodeString(val)
@@ -605,22 +611,16 @@ func decodeStoredBase64(v any, binary bool) any {
 		}
 		return string(b)
 	case bool:
-		text := "false"
-		if val {
-			text = "true"
-		}
-		if binary {
-			return []byte(text)
-		}
-		return text
+		text = strconv.FormatBool(val)
 	case json.Number:
-		if binary {
-			return []byte(string(val))
-		}
-		return string(val)
+		text = string(val)
 	default:
 		return v
 	}
+	if binary {
+		return []byte(text)
+	}
+	return text
 }
 
 // generateInsert reverses a DELETE event: reconstruct the deleted row from
