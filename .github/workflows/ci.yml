@@ -6,7 +6,45 @@ on:
   pull_request:
 
 jobs:
+  # Detects which parts of the tree changed so the expensive jobs below can
+  # skip themselves on PRs that can't possibly affect them (e.g. a console
+  # JS/CSS-only change has no way to break the MySQL/MariaDB/Postgres capture
+  # path). Every downstream job below still gets job-level `if:`, NOT a
+  # top-level `on.pull_request.paths` filter — all of unit/integration/
+  # integration-mariadb-source/integration-postgres-source/console-e2e are
+  # REQUIRED status checks on main's branch protection, and a workflow that
+  # never triggers at all never reports those contexts, which leaves a PR
+  # stuck on "Expected — waiting for status to be reported" forever. A
+  # job-level `if:` still reports a `skipped` conclusion, which GitHub
+  # treats as satisfying a required check.
+  changes:
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: read
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      console: ${{ steps.filter.outputs.console }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            go:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Makefile'
+              - 'migrations/**'
+              - 'test/console-e2e/**'
+              - '.github/workflows/ci.yml'
+            console:
+              - 'internal/console/**'
+              - 'cmd/bintrail-console/**'
+
   unit:
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.go == 'true' || needs.changes.outputs.console == 'true'
     runs-on: ubuntu-22.04
 
     steps:
@@ -39,6 +77,8 @@ jobs:
         run: go test ./... -race -count=1
 
   integration:
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-22.04
 
     # Two supported cells: the BYO contract floor (8.0) and the bundled index
@@ -112,6 +152,8 @@ jobs:
     # the 8.0/8.4 matrix above stays byte-identical. Runs only the MariaDB-named
     # tests (-run); the MySQL-only MariaDB tests (sqlmock/index-side) also run in
     # the matrix job, where the live-replication test skips for lack of a source.
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-22.04
 
     env:
@@ -179,6 +221,8 @@ jobs:
     # the MySQL index container can't provide. The end-to-end test
     # (TestOne_EndToEnd_PostgresToIndexToRecovery) streams PG changes INTO the
     # MySQL index and generates recovery SQL, so both servers must be present.
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-22.04
 
     # Spans the supported PostgreSQL range: 14 (declared minimum — PG13 is EOL)
@@ -273,6 +317,8 @@ jobs:
     # form that auto-expands, a raw error wall, the control plane vanishing on
     # a broken server selection) are invisible to the Go suite. Each scenario
     # pins a bug that shipped in 0.13.3.
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.go == 'true' || needs.changes.outputs.console == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
