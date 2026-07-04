@@ -244,7 +244,7 @@ func (s *Server) handleForensicsWhoChanged(w http.ResponseWriter, r *http.Reques
 		// would have, so this doesn't read as a silent downgrade to a
 		// worse attribution tier.
 		sourceUnreachable = "This server's source connection is configured but could not be reached, " +
-			"so the audit-log, GTID, and performance_schema attribution tiers were not consulted; " +
+			"so the audit-log and performance_schema attribution tiers were not consulted; " +
 			"only index-side sources ran."
 	default:
 		defer sourceDB.Close()

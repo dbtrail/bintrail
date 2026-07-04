@@ -17,8 +17,8 @@ import (
 type Confidence string
 
 // Confidence tiers (epic #701): exact means the identity join is positively
-// bounded (an audit-log CONNECT..DISCONNECT lifetime containing the event, or a
-// GTID transaction join); corroborated means the identity matched but its
+// bounded (an audit-log CONNECT..DISCONNECT lifetime containing the
+// event); corroborated means the identity matched but its
 // session lifetime could not be verified (nearest audit record without
 // brackets, the connection_cache, or a live performance_schema session — which
 // reflects the current holder of the connection id, and that id may have been
@@ -34,7 +34,6 @@ const (
 // Attribution sources, from most to least durable.
 const (
 	AttributionSourceAuditLog   = "audit_log"
-	AttributionSourceGTID       = "gtid"
 	AttributionSourcePerfSchema = "performance_schema"
 	AttributionSourceConnCache  = "connection_cache"
 )
@@ -103,8 +102,8 @@ type WhoChangedParams struct {
 type WhoChangedDeps struct {
 	// Fetch returns binlog events matching opts. Required.
 	Fetch func(ctx context.Context, opts query.Options) ([]query.ResultRow, error)
-	// SourceDB is the watched MySQL server, used for the audit-log, GTID, and
-	// live performance_schema tiers. nil skips those tiers (index-only mode).
+	// SourceDB is the watched MySQL server, used for the audit-log and live
+	// performance_schema tiers. nil skips those tiers (index-only mode).
 	SourceDB *sql.DB
 	// SourceHost is the resolved host[:port] of the source server (from the
 	// source DSN). It lets the audit-log tier reach the RDS/Aurora audit source
@@ -149,7 +148,7 @@ const (
 
 // WhoChanged fetches the binlog events matching params and attributes each to
 // a database session through the tier cascade: audit log (lifetime-bounded),
-// GTID transaction join, live performance_schema, connection_cache, and
+// live performance_schema, connection_cache, and
 // finally binlog-only with an explanatory note — degradation is an answer,
 // never an error. Only parameter validation and the binlog fetch itself can
 // fail; every attribution source degrades to the next tier.
@@ -308,9 +307,9 @@ func attributeEvents(ctx context.Context, deps WhoChangedDeps, rows []query.Resu
 	if deps.SourceDB != nil {
 		caps, err := DetectCapabilities(ctx, deps.SourceDB)
 		if err != nil {
-			slog.Warn("who-changed: source unreachable; skipping audit/gtid/performance_schema tiers",
+			slog.Warn("who-changed: source unreachable; skipping audit/performance_schema tiers",
 				"error", err)
-			notes = append(notes, "The source server was unreachable, so the audit-log, GTID, "+
+			notes = append(notes, "The source server was unreachable, so the audit-log "+
 				"and performance_schema attribution sources were NOT consulted; only "+
 				"index-side sources ran.")
 			deps.SourceDB = nil // local copy: disable the source tiers below
@@ -350,39 +349,6 @@ func attributeEvents(ctx context.Context, deps WhoChangedDeps, rows []query.Resu
 				}
 				for i, a := range attributeFromAudit(rows, auditRes.Events, truncated) {
 					attr[i] = a
-				}
-			}
-		}
-	}
-
-	// ── Tier 1.5: GTID — exact transaction join, detect-and-use ─────────────
-	// Runs only for events the audit tier left unresolved and only when
-	// gtid_mode is usable (never assumed: RDS/Aurora default OFF_PERMISSIVE,
-	// MariaDB has a different GTID model and no gtid_mode variable at all).
-	if deps.SourceDB != nil {
-		var gtids []string
-		seen := map[string]struct{}{}
-		for i := range rows {
-			if _, done := attr[i]; done {
-				continue
-			}
-			if g := rows[i].GTID; g != nil && *g != "" {
-				if _, dup := seen[*g]; !dup {
-					seen[*g] = struct{}{}
-					gtids = append(gtids, *g)
-				}
-			}
-		}
-		if len(gtids) > 0 && gtidAttributionUsable(ctx, deps.SourceDB) {
-			byGTID := attributeFromGTID(ctx, deps.SourceDB, gtids)
-			for i := range rows {
-				if _, done := attr[i]; done {
-					continue
-				}
-				if g := rows[i].GTID; g != nil {
-					if a, ok := byGTID[*g]; ok {
-						attr[i] = a
-					}
 				}
 			}
 		}
@@ -535,8 +501,8 @@ func lookupLiveThreads(ctx context.Context, sourceDB *sql.DB, ids []int64) (map[
 				// connection id, whose lifetime is not bounded against the
 				// event. A reused id (or COM_CHANGE_USER) can make the live
 				// session a different actor than the one that ran the event —
-				// the exact tiers (audit CONNECT..DISCONNECT, GTID) are the ones
-				// that positively bound identity to the event.
+				// the exact tier (audit CONNECT..DISCONNECT) is the one
+				// that positively bounds identity to the event.
 				Confidence: ConfidenceCorroborated,
 			}
 		}
@@ -788,87 +754,6 @@ func absDuration(d time.Duration) time.Duration {
 		return -d
 	}
 	return d
-}
-
-// ---------------------------------------------------------------------------
-// GTID tier: exact transaction join against performance_schema
-// ---------------------------------------------------------------------------
-
-// gtidAttributionUsable reports whether the source's GTID mode makes the
-// binlog gtid ↔ events_transactions_history join meaningful: ON or
-// ON_PERMISSIVE (new transactions carry GTIDs). Detect-and-use, never assume —
-// RDS/Aurora default OFF_PERMISSIVE, and MariaDB (different GTID model) has no
-// gtid_mode variable at all, so any probe failure means "not usable".
-func gtidAttributionUsable(ctx context.Context, sourceDB *sql.DB) bool {
-	var name, value string
-	err := sourceDB.QueryRowContext(ctx, "SHOW GLOBAL VARIABLES LIKE 'gtid_mode'").Scan(&name, &value)
-	if err != nil {
-		slog.Debug("who-changed: gtid_mode probe failed; skipping GTID tier", "error", err)
-		return false
-	}
-	return strings.HasPrefix(strings.ToUpper(value), "ON")
-}
-
-// attributeFromGTID joins binlog GTIDs against
-// performance_schema.events_transactions_history_long (then the per-thread
-// events_transactions_history) to the owning thread's user/host — an exact
-// transaction-level join, immune to connection-id reuse. Only live threads
-// resolve (performance_schema forgets a thread at disconnect); failures and
-// misses degrade silently to the next tier.
-func attributeFromGTID(ctx context.Context, sourceDB *sql.DB, gtids []string) map[string]Attribution {
-	out := map[string]Attribution{}
-	for _, table := range []string{"events_transactions_history_long", "events_transactions_history"} {
-		var missing []string
-		for _, g := range gtids {
-			if _, ok := out[g]; !ok {
-				missing = append(missing, g)
-			}
-		}
-		if len(missing) == 0 {
-			break
-		}
-
-		placeholders := make([]string, len(missing))
-		args := make([]any, len(missing))
-		for i, g := range missing {
-			placeholders[i] = "?"
-			args[i] = g
-		}
-		//nolint:gosec // table is one of two hardcoded constants above
-		rows, err := sourceDB.QueryContext(ctx, fmt.Sprintf(
-			"SELECT eth.GTID, t.PROCESSLIST_USER, t.PROCESSLIST_HOST "+
-				"FROM performance_schema.%s eth "+
-				"JOIN performance_schema.threads t ON t.THREAD_ID = eth.THREAD_ID "+
-				"WHERE eth.GTID IN (%s)", table, strings.Join(placeholders, ",")), args...)
-		if err != nil {
-			// Unlike the routine gtid_mode-absent probe miss (Debug), a failed
-			// join with gtid_mode ON is notable: consumers off or missing
-			// grants. Warn like the live tier's equivalent failure.
-			slog.Warn("who-changed: GTID tier query failed; continuing cascade",
-				"table", table, "error", err)
-			continue
-		}
-		for rows.Next() {
-			var gtid string
-			var user, host sql.NullString
-			if err := rows.Scan(&gtid, &user, &host); err != nil {
-				slog.Warn("who-changed: scan GTID join row", "error", err)
-				continue
-			}
-			if user.String == "" {
-				continue
-			}
-			out[gtid] = Attribution{
-				User: user.String, Host: host.String,
-				Source: AttributionSourceGTID, Confidence: ConfidenceExact,
-			}
-		}
-		if err := rows.Err(); err != nil {
-			slog.Warn("who-changed: iterate GTID join rows", "error", err)
-		}
-		rows.Close()
-	}
-	return out
 }
 
 // eventTypeName renders an event type for who-changed output using the same

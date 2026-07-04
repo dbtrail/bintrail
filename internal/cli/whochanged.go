@@ -38,12 +38,10 @@ and a confidence grade (exact / corroborated / heuristic):
   1. audit log        — durable identity, works after disconnect; each
                         connection id is bounded by its CONNECT..DISCONNECT
                         lifetime so id reuse (pool churn) cannot misattribute
-  2. GTID join        — exact transaction match via performance_schema
-                        (only when gtid_mode is ON; never assumed)
-  3. performance_schema — live sessions on the source
-  4. connection_cache — identities cached by 'bintrail up' for sessions that
+  2. performance_schema — live sessions on the source
+  3. connection_cache — identities cached by 'bintrail up' for sessions that
                         already disconnected (--attribution-retention)
-  5. binlog only      — no identity available; the event is still returned
+  4. binlog only      — no identity available; the event is still returned
                         with an explanatory note, never an error
 
 When the source captures the original statement per row event
@@ -81,7 +79,7 @@ var (
 func init() {
 	f := whoChangedCmd.Flags()
 	f.StringVar(&wcIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
-	f.StringVar(&wcSourceDSN, "source-dsn", "", "DSN for the source MySQL server (optional; enables the audit-log, GTID, and performance_schema tiers)")
+	f.StringVar(&wcSourceDSN, "source-dsn", "", "DSN for the source MySQL server (optional; enables the audit-log and performance_schema tiers)")
 	f.StringVar(&wcSchema, "schema", "", "Schema of the changed table (required)")
 	f.StringVar(&wcTable, "table", "", "Changed table (required)")
 	f.StringVar(&wcPK, "pk", "", "Restrict to a single row's primary key (pipe-delimited for composite PKs)")
