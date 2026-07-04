@@ -48,12 +48,6 @@ Three realistic setups:
 | Very short sessions (connect → write → disconnect in < 0.5 s)? | ❌ | ⚠️ can slip between two polls | ✅ |
 | Which **SQL statement** made the change? | ✅ if `binlog_rows_query_log_events=ON` — independent of all of this, see [below](#the-statement-itself-query_text) | same | same, plus the audit log's own copy |
 
-One nuance: with `gtid_mode=ON` **and** transaction instrumentation enabled in
-performance_schema (off by default), a still-connected session's transaction
-can be matched exactly even in columns A/B — a narrow case in practice, since
-RDS/Aurora default `gtid_mode` off and the needed consumers are disabled by
-default.
-
 The honest summary: **without an audit plugin, dbtrail can only name sessions
 it (or MySQL) was watching at the right moment. With one, it can name sessions
 after the fact and prove the match.** If "who did this?" matters to you
@@ -65,8 +59,8 @@ Forensics page tell you exactly how for your server flavor.
 Every attribution carries a label. In plain terms:
 
 - **exact** — dbtrail can prove it: the audit log shows that connection
-  belonged to this user *and was open when the change happened* (or the
-  transaction itself was matched). Id-number reuse cannot fool this.
+  belonged to this user *and was open when the change happened*. Id-number
+  reuse cannot fool this.
 - **corroborated** — the name matches the connection number, but dbtrail
   cannot prove that session was open at the event's moment. Usually right;
   connection numbers are reused (especially after a server restart), so treat
@@ -185,13 +179,14 @@ reality — not of dbtrail, and not fixable by any product:
 
 | Command | What it answers | Needs |
 |---|---|---|
-| `bintrail who-changed` | "Who changed these rows?" — the main forensic command. Attributes indexed changes via audit log → GTID transaction match → live sessions → identity cache, labels each answer, explains every gap. Without `--source-dsn` only index-side evidence is used. | `--index-dsn`; `--source-dsn` recommended |
+| `bintrail who-changed` | "Who changed these rows?" — the main forensic command. Attributes indexed changes via audit log → live sessions → identity cache, labels each answer, explains every gap. Without `--source-dsn` only index-side evidence is used. | `--index-dsn`; `--source-dsn` recommended |
 | `bintrail user-activity --user X` | "What is this user running **right now / very recently**?" — live view, short window, no time filter (see limit 2 above). | `--source-dsn` |
 | `bintrail connection-history` | "Who is connected right now?" (its fallback SQL adds cumulative per-account connection totals to run yourself) | `--source-dsn` |
-| `bintrail ddl-history` | Recent DDL seen in the live statement buffer. For real DDL history, prefer dbtrail's own durable record: `bintrail query --event-type ddl` or [DDL tracking](ddl-tracking.md). | `--source-dsn` |
 
-All accept `--format json`. The web console has the same surface on its
-**Forensics** page (who-changed, the activity queries, a capabilities check,
+All accept `--format json`. (Looking for DDL history? That is served durably
+from the index, not from performance_schema: `bintrail query --event-type ddl`
+— see [DDL tracking](ddl-tracking.md).) The web console has the same surface on its
+**Forensics** page (who-changed, the investigation queries, a capabilities check,
 and the setup guide). Note: the console refuses forensics queries while an
 RBAC access profile is active, because forensic output contains unredacted
 SQL and session identity.

@@ -85,9 +85,9 @@ and searching events:
    (`--baseline-dir`/`--baseline-s3`); otherwise it is hidden, never shown
    empty. See [Time-travel](#time-travel-reconstruct).
 4. **Forensics** — "who changed this?": attribute indexed changes to database
-   sessions (user, host, client program) through the audit-log / GTID /
-   live-session / identity-cache cascade, plus the three investigation queries (user activity,
-   connection history, DDL history), a capabilities check of the source, and a
+   sessions (user, host, client program) through the audit-log / live-session /
+   identity-cache cascade, plus the investigation queries (user activity,
+   connection history), a capabilities check of the source, and a
    tailored setup guide. Refuses to answer while an RBAC access profile is
    active — forensic output contains unredacted SQL and session identity. See
    [Forensics](forensics.md).
@@ -593,7 +593,7 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `GET /api/forensics/capabilities` | Forensic data sources available on the **selected server's** source (performance_schema state, audit plugin variant/config, server info) plus a tailored `setup_guide`. Needs a source connection; `403` under an active RBAC profile. |
 | `GET /api/forensics/users` | Known MySQL users on the source (for the who-changed/activity form dropdowns). Same gating. |
 | `POST /api/forensics/who-changed` | Attribute indexed changes to sessions. JSON body: `schema, table` (required), `pk, since, until, limit, order`. Returns events with per-event `attribution` (`user, host, client_program, source, confidence`) and the honest `notes`. Same gating. |
-| `POST /api/forensics/activity` | The three investigation queries: `query_type` = `user_activity` \| `connection_history` \| `ddl_history` plus their filters. Same gating. |
+| `POST /api/forensics/activity` | The investigation queries: `query_type` = `user_activity` \| `connection_history` plus their filters. Same gating. |
 | `GET /api/reconstruct` | Single-row point-in-time reconstruct (baseline-gated **per server**; 404 when not configured). Query params: `schema, table, pk, at, history, allow_gaps`. Returns `{found, deleted, state, history, baseline_time, event_count, warnings}`. |
 | `GET /api/servers` | List servers (masked: parsed host/port/user/dbname + `has_password`, never a DSN or password) plus `default_id`. |
 | `POST /api/servers` | Add a server to the registry (validates, does not connect; never runs DDL). |
