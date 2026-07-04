@@ -411,6 +411,70 @@ try {
   cred.hasToggle ? ok("aws-creds: disclosure uses the app's toggle style") : bad("aws-creds: disclosure uses the app's toggle style", "missing summary.form-adv-summary");
   cred.rawRowCount === 4 ? ok("aws-creds: all four raw signal rows still render") : bad("aws-creds: all four raw signal rows still render", `rawRowCount=${cred.rawRowCount}`);
 
+  // Scenario 10 — Forensics setup-guide panel (#708). buildFxCapsBanner is pure
+  // (like pgHealthCard/continuityBox/credentialsCard): the real test MySQL fixture
+  // always reports performance_schema enabled with no recommendations, so Scenario
+  // 5b's who-changed run never exercises the degraded-capabilities/setup-guide path
+  // — the panel + its copy-to-clipboard blocks have never rendered in a browser
+  // until this fixture-driven check. Feeds buildFxCapsBanner synthetic capability
+  // payloads directly, mirroring the no-source, fully-capable, and degraded-with-
+  // recommendations states.
+  const fxGuide = await page.evaluate(() => {
+    const noSource = buildFxCapsBanner({ source_configured: false });
+    const fullyCapable = buildFxCapsBanner({
+      source_configured: true,
+      performance_schema: { enabled: true, consumers: { events_statements_history_long: true }, threads_accessible: true },
+      audit_log: { installed: true, variant: "MariaDB" },
+    });
+    const degraded = buildFxCapsBanner({
+      source_configured: true,
+      performance_schema: { enabled: false, consumers: {}, threads_accessible: false },
+      audit_log: { installed: false },
+      setup_guide: {
+        summary: "Enable performance_schema consumers to unlock full attribution.",
+        recommendations: [
+          {
+            priority: "high",
+            category: "performance_schema",
+            title: "Enable events_statements_history_long",
+            description: "Without this consumer, statement text cannot be correlated to row changes.",
+            runtime_sql: ["UPDATE performance_schema.setup_consumers SET enabled='YES' WHERE name='events_statements_history_long';"],
+            mycnf_snippet: "[mysqld]\nperformance-schema-consumer-events-statements-history-long=ON",
+          },
+        ],
+      },
+    });
+    document.body.appendChild(degraded);
+    const toggle = degraded.querySelector(".fx-guide-toggle");
+    const contentBeforeClick = degraded.querySelector(".fx-guide-content");
+    const hiddenBeforeClick = contentBeforeClick ? contentBeforeClick.hidden : null;
+    toggle && toggle.click();
+    const hiddenAfterClick = contentBeforeClick ? contentBeforeClick.hidden : null;
+    const copyBtn = degraded.querySelector(".fx-sql-block .btn");
+    const result = {
+      noSourcePrompt: !!noSource && /No source connection configured/.test(noSource.textContent),
+      fullyCapableNoGuide: !!fullyCapable && !fullyCapable.querySelector(".fx-guide"),
+      degradedHasGuide: !!degraded.querySelector(".fx-guide"),
+      guideCollapsedByDefault: hiddenBeforeClick === true,
+      guideExpandsOnClick: hiddenAfterClick === false,
+      hasPriorityBadge: !!degraded.querySelector(".fx-priority-high"),
+      hasRuntimeSqlBlock: Array.from(degraded.querySelectorAll(".fx-sql")).some((n) => /events_statements_history_long/.test(n.textContent)),
+      hasMycnfBlock: Array.from(degraded.querySelectorAll(".fx-sql")).some((n) => /performance-schema-consumer/.test(n.textContent)),
+      hasCopyButton: !!copyBtn && copyBtn.textContent.trim() === "Copy",
+    };
+    degraded.remove();
+    return result;
+  });
+  fxGuide.noSourcePrompt ? ok("forensics: no-source state shows the setup prompt") : bad("forensics: no-source state shows the setup prompt", "prompt text missing");
+  fxGuide.fullyCapableNoGuide ? ok("forensics: fully-capable source renders no guide panel") : bad("forensics: fully-capable source renders no guide panel", "guide rendered with no recommendations");
+  fxGuide.degradedHasGuide ? ok("forensics: degraded capabilities render the setup-guide panel") : bad("forensics: degraded capabilities render the setup-guide panel", "no .fx-guide");
+  fxGuide.guideCollapsedByDefault ? ok("forensics: setup guide is collapsed by default") : bad("forensics: setup guide is collapsed by default", "rendered expanded");
+  fxGuide.guideExpandsOnClick ? ok("forensics: setup guide expands on toggle click") : bad("forensics: setup guide expands on toggle click", "stayed collapsed");
+  fxGuide.hasPriorityBadge ? ok("forensics: recommendation shows its priority badge") : bad("forensics: recommendation shows its priority badge", "no .fx-priority-high");
+  fxGuide.hasRuntimeSqlBlock ? ok("forensics: runtime SQL snippet renders") : bad("forensics: runtime SQL snippet renders", "missing runtime SQL text");
+  fxGuide.hasMycnfBlock ? ok("forensics: my.cnf snippet renders") : bad("forensics: my.cnf snippet renders", "missing my.cnf text");
+  fxGuide.hasCopyButton ? ok("forensics: copy-to-clipboard button renders") : bad("forensics: copy-to-clipboard button renders", "no Copy button");
+
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));
 } catch (err) {
