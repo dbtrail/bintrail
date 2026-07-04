@@ -1213,26 +1213,24 @@ function downloadEventsCSV(events) {
 }
 
 // ── Forensics ────────────────────────────────────────────────────────────────
-// Who changed a row, and three general investigation queries (user activity,
-// connection history, DDL history) against the SOURCE server's
+// Who changed a row, and two general investigation queries (user activity,
+// connection history) against the SOURCE server's
 // performance_schema / audit log (epic #701). Unlike Events (index-only),
 // these hit /api/forensics/*. Capabilities and who-changed degrade to a setup
 // prompt / index-only attribution when the selected server has no source
-// connection configured — but user-activity, connection-history, and
-// ddl-history have no index-side fallback and error instead (handled the
-// same way any other query error is: renderError in the results panel).
+// connection configured — but user-activity and connection-history have no
+// index-side fallback and error instead (handled the same way any other
+// query error is: renderError in the results panel).
 
 const FX_MODES = [
   { id: "who_changed", label: "Who changed", desc: "Trace who modified rows in a table (schema and table required, PK optional)." },
   { id: "user_activity", label: "User activity", desc: "Recent statements by a MySQL user." },
   { id: "connection_history", label: "Connections", desc: "Current/recent connections from a user or host." },
-  { id: "ddl_history", label: "DDL history", desc: "Recent CREATE / ALTER / DROP statements." },
 ];
 
 const FX_ACTIVITY_COLS = {
   user_activity: [["user", "User"], ["host", "Host"], ["sql_text", "SQL"], ["duration_ms", "Duration (ms)"], ["rows_affected", "Rows affected"], ["connection_id", "Conn ID"]],
   connection_history: [["user", "User"], ["host", "Host"], ["current_db", "Database"], ["command", "Command"], ["time_seconds", "Time (s)"], ["connection_id", "Conn ID"]],
-  ddl_history: [["user", "User"], ["host", "Host"], ["sql_text", "SQL"], ["duration_ms", "Duration (ms)"], ["connection_id", "Conn ID"]],
 };
 
 function renderForensics(params) {
@@ -1255,10 +1253,8 @@ function renderForensics(params) {
   v.append(el("p", { class: "fx-mode-desc", text: (FX_MODES.find((m) => m.id === mode) || FX_MODES[0]).desc }));
 
   const form = el("form", { class: "filters", id: "fx-form" });
-  if (mode === "who_changed" || mode === "ddl_history") {
-    form.append(fieldSelect("Schema", "schema", "md", true, false, null, "— select —", mode === "who_changed"));
-  }
   if (mode === "who_changed") {
+    form.append(fieldSelect("Schema", "schema", "md", true, false, null, "— select —", true));
     form.append(fieldSelect("Table", "table", "md", false, true, null, null, true));
     form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
   }
@@ -1283,7 +1279,7 @@ function renderForensics(params) {
   v.append(out);
 
   form.addEventListener("submit", (e) => { e.preventDefault(); runForensicsQuery(mode, form); });
-  if (mode === "who_changed" || mode === "ddl_history") { wireSchemaCascade(form); populateSchemas(form); }
+  if (mode === "who_changed") { wireSchemaCascade(form); populateSchemas(form); }
 
   fxLoadCapabilities();
   viewEnter();
@@ -1313,8 +1309,8 @@ function buildFxCapsBanner(caps) {
     wrap.append(el("div", { class: "stg-empty" },
       el("p", { class: "stg-empty-lead", text: "No source connection configured for this server." }),
       el("p", { class: "stg-empty-sub", text:
-        "Who-changed still works from the index alone (connection_cache and binlog-only attribution), but user activity, " +
-        "connection history, and DDL history all read the source directly. Add a source connection from Manage servers → Edit to unlock them." })));
+        "Who-changed still works from the index alone (connection_cache and binlog-only attribution), but user activity " +
+        "and connection history read the source directly. Add a source connection from Manage servers → Edit to unlock them." })));
     return wrap;
   }
   const ps = caps.performance_schema || {};
@@ -1422,7 +1418,7 @@ async function runForensicsQuery(mode, form) {
     } else {
       data = await api("/api/forensics/activity", { method: "POST", body: {
         query_type: mode, user: f.user || undefined, host: f.host || undefined,
-        schema: f.schema || undefined, since: f.since || undefined, until: f.until || undefined,
+        since: f.since || undefined, until: f.until || undefined,
         limit: f.limit ? Number(f.limit) : undefined, order: f.order || undefined,
       } });
     }

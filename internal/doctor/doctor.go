@@ -674,8 +674,8 @@ func countVisibleSchemas(ctx context.Context, db *sql.DB, schemas []string) (int
 }
 
 // forensicsConsumers are the performance_schema setup_consumers rows the
-// forensic activity queries (user_activity / ddl_history) read from. Listed in
-// the order they should appear in the check detail.
+// user_activity forensic query reads from. Listed in the order they should
+// appear in the check detail.
 var forensicsConsumers = []string{"events_statements_history", "events_statements_history_long"}
 
 // checkPerformanceSchema reports whether performance_schema — and the two

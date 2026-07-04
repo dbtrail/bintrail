@@ -12,7 +12,7 @@ import "testing"
 // bintrail-pg — which shares AddReadCommands — must not grow them. Like
 // doctor, they are registered by this binary only.
 func TestForensicsCommandsWiredOnRoot(t *testing.T) {
-	want := []string{"who-changed", "user-activity", "connection-history", "ddl-history"}
+	want := []string{"who-changed", "user-activity", "connection-history"}
 
 	have := make(map[string]bool)
 	for _, c := range rootCmd.Commands() {

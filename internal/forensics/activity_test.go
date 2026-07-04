@@ -268,37 +268,9 @@ func TestActivityConnectionHistoryFallbackOnQueryError(t *testing.T) {
 	}
 }
 
-func TestActivityDDLHistoryHappyPath(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	ddlCols := []string{"connection_id", "user", "host", "sql_text", "duration_ms"}
-	mock.ExpectQuery("events_statements_history_long esh").
-		WithArgs("shop").
-		WillReturnRows(sqlmock.NewRows(ddlCols).
-			AddRow(3, "admin", "10.0.0.9", "ALTER TABLE orders ADD COLUMN note TEXT", 88.0))
-
-	res, err := Activity(t.Context(), db, ActivityQuery{Type: QueryDDLHistory, Schema: "shop"})
-	if err != nil {
-		t.Fatalf("Activity: %v", err)
-	}
-	if res.Source != "performance_schema" || res.Count != 1 {
-		t.Fatalf("result = source=%q count=%d, want performance_schema/1", res.Source, res.Count)
-	}
-	if res.Events[0]["sql_text"] != "ALTER TABLE orders ADD COLUMN note TEXT" {
-		t.Errorf("sql_text = %v", res.Events[0]["sql_text"])
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet expectations: %v", err)
-	}
-}
-
-// TestActivityDDLHistoryFallbackCapsLimit exercises the DDL fallback path and
+// TestActivityUserActivityFallbackCapsLimit exercises the fallback path and
 // pins the limit cap: 5000 must clamp to 1000 in the generated SQL.
-func TestActivityDDLHistoryFallbackCapsLimit(t *testing.T) {
+func TestActivityUserActivityFallbackCapsLimit(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -308,7 +280,7 @@ func TestActivityDDLHistoryFallbackCapsLimit(t *testing.T) {
 	mock.ExpectQuery("events_statements_history_long esh").
 		WillReturnError(errors.New("denied"))
 
-	res, err := Activity(t.Context(), db, ActivityQuery{Type: QueryDDLHistory, Limit: 5000})
+	res, err := Activity(t.Context(), db, ActivityQuery{Type: QueryUserActivity, User: "app_user", Limit: 5000})
 	if err != nil {
 		t.Fatalf("Activity: %v", err)
 	}
@@ -397,20 +369,6 @@ func TestGenerateConnectionFallback(t *testing.T) {
 	hostOnly := generateConnectionFallback("", "10.0.1.50", 50)
 	if strings.Contains(hostOnly[0].SQL, "USER =") {
 		t.Errorf("host-only filter must not reference USER: %s", hostOnly[0].SQL)
-	}
-}
-
-func TestGenerateDDLFallback(t *testing.T) {
-	queries := generateDDLFallback("mydb", "2026-03-01", "2026-03-10", 50)
-
-	if len(queries) < 1 {
-		t.Fatalf("expected at least 1 fallback query, got %d", len(queries))
-	}
-	genLog := queries[len(queries)-1]
-	for _, want := range []string{"mydb", "2026-03-01", "2026-03-10", "general_log"} {
-		if !strings.Contains(genLog.SQL, want) {
-			t.Errorf("general_log DDL fallback missing %q: %s", want, genLog.SQL)
-		}
 	}
 }
 

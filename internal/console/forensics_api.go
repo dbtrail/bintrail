@@ -56,12 +56,11 @@ type whoChangedRequest struct {
 
 // forensicsActivityRequest is the JSON body accepted by POST
 // /api/forensics/activity. QueryType selects one of forensics'
-// QueryUserActivity/QueryConnectionHistory/QueryDDLHistory.
+// QueryUserActivity/QueryConnectionHistory.
 type forensicsActivityRequest struct {
 	QueryType string `json:"query_type"`
 	User      string `json:"user"`
 	Host      string `json:"host"`
-	Schema    string `json:"schema"`
 	Since     string `json:"since"`
 	Until     string `json:"until"`
 	Limit     int    `json:"limit"`
@@ -279,9 +278,9 @@ func (s *Server) handleForensicsWhoChanged(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, res)
 }
 
-// handleForensicsActivity serves POST /api/forensics/activity: the three
-// general investigation modes (user_activity / connection_history /
-// ddl_history) against the selected server's performance_schema. Unlike
+// handleForensicsActivity serves POST /api/forensics/activity: the two
+// general investigation modes (user_activity / connection_history)
+// against the selected server's performance_schema. Unlike
 // who-changed, these modes have no index-side fallback — they require a
 // configured source connection.
 func (s *Server) handleForensicsActivity(w http.ResponseWriter, r *http.Request) {
@@ -294,10 +293,10 @@ func (s *Server) handleForensicsActivity(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	switch body.QueryType {
-	case forensics.QueryUserActivity, forensics.QueryConnectionHistory, forensics.QueryDDLHistory:
+	case forensics.QueryUserActivity, forensics.QueryConnectionHistory:
 	default:
 		writeJSONError(w, http.StatusBadRequest,
-			"query_type must be one of user_activity, connection_history, ddl_history")
+			"query_type must be one of user_activity, connection_history")
 		return
 	}
 	if body.QueryType == forensics.QueryUserActivity && body.User == "" {
@@ -322,14 +321,13 @@ func (s *Server) handleForensicsActivity(w http.ResponseWriter, r *http.Request)
 	defer sourceDB.Close()
 
 	res, err := forensics.Activity(r.Context(), sourceDB, forensics.ActivityQuery{
-		Type:   body.QueryType,
-		User:   body.User,
-		Host:   body.Host,
-		Schema: body.Schema,
-		Since:  body.Since,
-		Until:  body.Until,
-		Limit:  body.Limit,
-		Order:  body.Order,
+		Type:  body.QueryType,
+		User:  body.User,
+		Host:  body.Host,
+		Since: body.Since,
+		Until: body.Until,
+		Limit: body.Limit,
+		Order: body.Order,
 	})
 	if err != nil {
 		// By this point query_type/user/host preconditions are already

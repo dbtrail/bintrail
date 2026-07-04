@@ -53,7 +53,7 @@ type capabilitiesResponse struct {
 	// profile cascade victim synthesis cannot honor redaction, so the endpoint
 	// refuses (see handleRecoverCascade). Process-global, like Monitor.
 	RecoverCascade bool `json:"recover_cascade"`
-	// Forensics: the who-changed/user-activity/connection-history/ddl-history
+	// Forensics: the who-changed/user-activity/connection-history
 	// investigation surface is available (epic #701). Gated by the single
 	// entitlement seam (forensics.Enabled) and, like RecoverCascade, refused
 	// while an RBAC redaction profile is active — forensic output includes
@@ -61,7 +61,7 @@ type capabilitiesResponse struct {
 	// the selected server's bundle — per-server "no source configured" is a
 	// property of the SELECTED server, handled inside the forensics endpoints
 	// themselves (who-changed degrades to index-only attribution; the other
-	// three modes have no fallback and error), not this process-wide flag.
+	// two modes have no fallback and error), not this process-wide flag.
 	Forensics bool `json:"forensics"`
 	// RecoverCascadeBaseline: cascade recovery's Phase-2 (recover children
 	// untouched within the window) is active for this server. Per-server, and gated

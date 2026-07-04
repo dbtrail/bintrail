@@ -25,7 +25,7 @@ func AddReadCommands(root *cobra.Command) {
 }
 
 // AddForensicsCommands registers the forensics read commands: who-changed,
-// user-activity, connection-history, and ddl-history (#706).
+// user-activity, and connection-history (#706).
 //
 // Deliberately NOT part of AddReadCommands: these commands interrogate
 // MySQL-family sources (performance_schema, the audit-plugin family, binlog
@@ -38,5 +38,4 @@ func AddForensicsCommands(root *cobra.Command) {
 	root.AddCommand(whoChangedCmd)
 	root.AddCommand(userActivityCmd)
 	root.AddCommand(connectionHistoryCmd)
-	root.AddCommand(ddlHistoryCmd)
 }

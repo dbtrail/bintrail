@@ -91,8 +91,8 @@ func BuildSetupGuide(caps Capabilities) SetupGuide {
 				Description: "The events_statements_history_long consumer is disabled. This " +
 					"global ring buffer stores recent SQL statements across all " +
 					"connections — critical for forensic investigation of past activity.",
-				Impact: "Enables user_activity queries and DDL history across all " +
-					"connections. This is the primary data source for forensic " +
+				Impact: "Enables user_activity queries across all connections. " +
+					"This is the primary data source for forensic " +
 					"statement analysis.",
 				PerformanceNote: "Stores the last 10,000 statements globally by default. " +
 					"Memory usage is fixed (not per-connection). Adjust " +

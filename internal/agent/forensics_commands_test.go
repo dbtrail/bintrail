@@ -117,7 +117,10 @@ func TestDispatch_forensicsActivity(t *testing.T) {
 			}, nil
 		},
 	}
-	// SaaS wire shape (models/forensics.py ForensicsQueryParams).
+	// SaaS wire shape (models/forensics.py ForensicsQueryParams). The "schema"
+	// key belonged to the removed DDL-history mode; older callers may still
+	// send it, so the payload keeps it here to pin that it is ignored, not a
+	// decode error.
 	raw := `{"query_type":"user_activity","user":"app","host":"10.0.0.5",` +
 		`"schema":"shop","since":"2026-07-01T00:00:00","until":"2026-07-02 00:00:00",` +
 		`"limit":25,"order":"ASC"}`
@@ -127,7 +130,7 @@ func TestDispatch_forensicsActivity(t *testing.T) {
 		t.Fatalf("unexpected error: %s", resp.Error)
 	}
 	want := ForensicsActivityRequest{
-		QueryType: "user_activity", User: "app", Host: "10.0.0.5", Schema: "shop",
+		QueryType: "user_activity", User: "app", Host: "10.0.0.5",
 		Since: "2026-07-01T00:00:00", Until: "2026-07-02 00:00:00", Limit: 25, Order: "ASC",
 	}
 	if got != want {
@@ -315,7 +318,7 @@ func TestDefaultHandler_forensicsCommandsRequireSourceDSN(t *testing.T) {
 			return err
 		},
 		"forensics_activity": func() error {
-			_, err := h.HandleForensicsActivity(ctx, ForensicsActivityRequest{QueryType: "ddl_history"})
+			_, err := h.HandleForensicsActivity(ctx, ForensicsActivityRequest{QueryType: "user_activity"})
 			return err
 		},
 		"forensics_users": func() error { _, err := h.HandleForensicsUsers(ctx); return err },

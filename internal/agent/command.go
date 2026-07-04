@@ -13,8 +13,8 @@
 //     server (performance_schema, audit plugin, server variant)
 //   - forensics_enrich        — live thread/connection attribution for a
 //     set of connection IDs
-//   - forensics_activity      — user_activity / connection_history /
-//     ddl_history queries against performance_schema
+//   - forensics_activity      — user_activity / connection_history
+//     queries against performance_schema
 //   - forensics_users         — list known MySQL user accounts
 //   - forensics_audit_log     — parse the server's on-disk audit log
 //
@@ -140,14 +140,13 @@ type ForensicsEnrichRequest struct {
 }
 
 // ForensicsActivityRequest is the payload for "forensics_activity" commands.
-// QueryType selects the mode ("user_activity", "connection_history", or
-// "ddl_history"); the remaining fields are mode-specific filters — see
-// forensics.ActivityQuery for which apply to which mode.
+// QueryType selects the mode ("user_activity" or "connection_history"); the
+// remaining fields are mode-specific filters — see forensics.ActivityQuery
+// for which apply to which mode.
 type ForensicsActivityRequest struct {
 	QueryType string `json:"query_type"`
 	User      string `json:"user,omitempty"`
 	Host      string `json:"host,omitempty"`
-	Schema    string `json:"schema,omitempty"`
 	// Since/Until accept MySQL DATETIME or ISO 8601 strings.
 	Since string `json:"since,omitempty"`
 	Until string `json:"until,omitempty"`

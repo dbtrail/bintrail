@@ -228,7 +228,7 @@ func TestHandleForensicsActivity_NoSourceConfigured(t *testing.T) {
 	s := newBootServer(nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/forensics/activity",
-		strings.NewReader(`{"query_type":"ddl_history"}`))
+		strings.NewReader(`{"query_type":"connection_history","user":"root"}`))
 	s.handleForensicsActivity(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())

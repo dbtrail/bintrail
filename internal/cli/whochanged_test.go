@@ -18,7 +18,7 @@ func TestAddForensicsCommands_RegistersAll(t *testing.T) {
 	root := &cobra.Command{Use: "test-root"}
 	AddForensicsCommands(root)
 
-	want := []string{"who-changed", "user-activity", "connection-history", "ddl-history"}
+	want := []string{"who-changed", "user-activity", "connection-history"}
 	have := map[string]bool{}
 	for _, c := range root.Commands() {
 		have[c.Use] = true
@@ -47,7 +47,6 @@ func TestForensicsCommands_GateClosed(t *testing.T) {
 		{"who-changed", runWhoChanged, whoChangedCmd},
 		{"user-activity", runUserActivity, userActivityCmd},
 		{"connection-history", runConnectionHistory, connectionHistoryCmd},
-		{"ddl-history", runDDLHistory, ddlHistoryCmd},
 	}
 	for _, tc := range cases {
 		err := tc.run(tc.cmd, nil)

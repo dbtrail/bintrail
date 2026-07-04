@@ -377,22 +377,21 @@ func (h *DefaultHandler) HandleForensicsEnrich(ctx context.Context, req Forensic
 	return forensics.EnrichThreads(ctx, h.SourceDB, req.ThreadIDs)
 }
 
-// HandleForensicsActivity runs one of the three fixed activity queries
-// (user_activity, connection_history, ddl_history) against
-// performance_schema on the source server.
+// HandleForensicsActivity runs one of the two fixed activity queries
+// (user_activity, connection_history) against performance_schema on the
+// source server.
 func (h *DefaultHandler) HandleForensicsActivity(ctx context.Context, req ForensicsActivityRequest) (forensics.ActivityResult, error) {
 	if err := h.requireSourceDB(); err != nil {
 		return forensics.ActivityResult{}, err
 	}
 	return forensics.Activity(ctx, h.SourceDB, forensics.ActivityQuery{
-		Type:   req.QueryType,
-		User:   req.User,
-		Host:   req.Host,
-		Schema: req.Schema,
-		Since:  req.Since,
-		Until:  req.Until,
-		Limit:  req.Limit,
-		Order:  req.Order,
+		Type:  req.QueryType,
+		User:  req.User,
+		Host:  req.Host,
+		Since: req.Since,
+		Until: req.Until,
+		Limit: req.Limit,
+		Order: req.Order,
 	})
 }
 

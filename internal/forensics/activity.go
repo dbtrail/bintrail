@@ -12,17 +12,15 @@ import (
 const (
 	QueryUserActivity      = "user_activity"
 	QueryConnectionHistory = "connection_history"
-	QueryDDLHistory        = "ddl_history"
 )
 
-// ActivityQuery selects one of the three forensic activity query modes and
+// ActivityQuery selects one of the two forensic activity query modes and
 // carries its filters. Fields not used by the selected Type are ignored.
 type ActivityQuery struct {
-	// Type is one of QueryUserActivity, QueryConnectionHistory, QueryDDLHistory.
-	Type   string
-	User   string // required for user_activity; optional filter for connection_history
-	Host   string // optional filter for connection_history (one of User/Host required there)
-	Schema string // optional filter for ddl_history
+	// Type is one of QueryUserActivity, QueryConnectionHistory.
+	Type string
+	User string // required for user_activity; optional filter for connection_history
+	Host string // optional filter for connection_history (one of User/Host required there)
 	// Since/Until accept MySQL DATETIME or ISO 8601 strings. performance_schema
 	// ring buffers have no wall-clock column, so these only shape the generated
 	// fallback SQL (general_log filters) — they never filter the live query.
@@ -33,7 +31,7 @@ type ActivityQuery struct {
 }
 
 // ActivityResult is the outcome of an activity query. Events is populated for
-// user_activity and ddl_history; Connections for connection_history. When the
+// user_activity; Connections for connection_history. When the
 // needed performance_schema data is unavailable, Source is "fallback" and
 // FallbackQueries carries executable SQL for manual investigation —
 // fallback-over-error is the point: a degraded source is an answer, not an
@@ -48,8 +46,8 @@ type ActivityResult struct {
 	FallbackQueries []FallbackQuery  `json:"fallback_queries,omitempty"`
 }
 
-// Activity runs a general forensic query (user activity, connection history,
-// or DDL history) against performance_schema on the source server. It returns
+// Activity runs a general forensic query (user activity or connection
+// history) against performance_schema on the source server. It returns
 // an error only for invalid parameters or an unknown query type; data-source
 // failures degrade to fallback SQL inside the result.
 func Activity(ctx context.Context, sourceDB *sql.DB, q ActivityQuery) (ActivityResult, error) {
@@ -73,11 +71,9 @@ func Activity(ctx context.Context, sourceDB *sql.DB, q ActivityQuery) (ActivityR
 			return ActivityResult{}, fmt.Errorf("user or host is required for %s query", QueryConnectionHistory)
 		}
 		return handleConnectionHistory(ctx, sourceDB, q.User, q.Host, limit, ascending), nil
-	case QueryDDLHistory:
-		return handleDDLHistory(ctx, sourceDB, q.Schema, q.Since, q.Until, limit, ascending), nil
 	default:
-		return ActivityResult{}, fmt.Errorf("unknown query_type %q: must be %s, %s, or %s",
-			q.Type, QueryUserActivity, QueryConnectionHistory, QueryDDLHistory)
+		return ActivityResult{}, fmt.Errorf("unknown query_type %q: must be %s or %s",
+			q.Type, QueryUserActivity, QueryConnectionHistory)
 	}
 }
 
@@ -439,93 +435,6 @@ func queryConnections(ctx context.Context, db *sql.DB, user, host string, limit 
 	return connections, rows.Err()
 }
 
-// handleDDLHistory queries for DDL events from performance_schema.
-func handleDDLHistory(ctx context.Context, db *sql.DB, schema, since, until string, limit int, ascending bool) ActivityResult {
-	since = normalizeTimestamp(since)
-	until = normalizeTimestamp(until)
-
-	// Try events_statements_history_long for DDL statements.
-	events, err := queryDDLStatements(ctx, db, schema, limit, ascending)
-	if err != nil {
-		slog.Warn("forensics: ddl_history query failed", "error", err)
-		return ActivityResult{
-			Events:          []map[string]any{},
-			Source:          "fallback",
-			FallbackQueries: generateDDLFallback(schema, since, until, limit),
-			Note:            perfSchemaGrantNote(err),
-		}
-	}
-
-	return ActivityResult{
-		Events: events,
-		Source: "performance_schema",
-		Count:  len(events),
-	}
-}
-
-// queryDDLStatements finds DDL statements in events_statements_history_long.
-func queryDDLStatements(ctx context.Context, db *sql.DB, schema string, limit int, ascending bool) ([]map[string]any, error) {
-	query := `SELECT
-		t.PROCESSLIST_ID AS connection_id,
-		t.PROCESSLIST_USER AS user,
-		t.PROCESSLIST_HOST AS host,
-		esh.SQL_TEXT AS sql_text,
-		esh.TIMER_WAIT / 1000000000 AS duration_ms
-	FROM performance_schema.events_statements_history_long esh
-	JOIN performance_schema.threads t ON t.THREAD_ID = esh.THREAD_ID
-	WHERE (esh.SQL_TEXT LIKE 'CREATE %'
-		OR esh.SQL_TEXT LIKE 'ALTER %'
-		OR esh.SQL_TEXT LIKE 'DROP %'
-		OR esh.SQL_TEXT LIKE 'RENAME %'
-		OR esh.SQL_TEXT LIKE 'TRUNCATE %')`
-
-	var args []any
-	if schema != "" {
-		query += " AND esh.CURRENT_SCHEMA = ?"
-		args = append(args, schema)
-	}
-	orderDir := "DESC"
-	if ascending {
-		orderDir = "ASC"
-	}
-	query += " ORDER BY esh.TIMER_START " + orderDir
-	query += fmt.Sprintf(" LIMIT %d", limit)
-
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query DDL statements: %w", err)
-	}
-	defer rows.Close()
-
-	var events []map[string]any
-	for rows.Next() {
-		var connID int64
-		var sqlUser, host string
-		var sqlText sql.NullString
-		var durationMS float64
-
-		if err := rows.Scan(&connID, &sqlUser, &host, &sqlText, &durationMS); err != nil {
-			slog.Warn("forensics: scan DDL row", "error", err)
-			continue
-		}
-
-		event := map[string]any{
-			"connection_id": connID,
-			"user":          sqlUser,
-			"host":          host,
-			"duration_ms":   durationMS,
-		}
-		if sqlText.Valid {
-			event["sql_text"] = sqlText.String
-		}
-		events = append(events, event)
-	}
-	if events == nil {
-		events = []map[string]any{}
-	}
-	return events, rows.Err()
-}
-
 // ---------------------------------------------------------------------------
 // Fallback query generators — used when performance_schema data is unavailable
 // ---------------------------------------------------------------------------
@@ -612,38 +521,4 @@ func generateConnectionFallback(user, host string, limit int) []FallbackQuery {
 				"FROM performance_schema.hosts WHERE HOST IS NOT NULL ORDER BY TOTAL_CONNECTIONS DESC",
 		},
 	}
-}
-
-func generateDDLFallback(schema, since, until string, limit int) []FallbackQuery {
-	queries := []FallbackQuery{
-		{
-			Description: "Use bintrail's indexed DDL events instead",
-			SQL:         "-- Use `bintrail query --event-type ddl` or the list_schema_changes MCP tool instead",
-		},
-	}
-
-	timeFilter := ""
-	if since != "" {
-		timeFilter += fmt.Sprintf(" AND event_time >= '%s'", sqlEscape(since))
-	}
-	if until != "" {
-		timeFilter += fmt.Sprintf(" AND event_time <= '%s'", sqlEscape(until))
-	}
-	schemaFilter := ""
-	if schema != "" {
-		schemaFilter = fmt.Sprintf(" AND argument LIKE '%%%s%%'", sqlEscape(schema))
-	}
-
-	queries = append(queries, FallbackQuery{
-		Description: "Check general log for DDL statements (if general_log is ON)",
-		SQL: fmt.Sprintf(
-			"SELECT event_time, user_host, thread_id, argument "+
-				"FROM mysql.general_log "+
-				"WHERE command_type = 'Query' "+
-				"AND (argument LIKE 'CREATE %%' OR argument LIKE 'ALTER %%' "+
-				"OR argument LIKE 'DROP %%' OR argument LIKE 'RENAME %%')%s%s "+
-				"ORDER BY event_time DESC LIMIT %d", schemaFilter, timeFilter, limit),
-	})
-
-	return queries
 }

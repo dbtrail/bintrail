@@ -282,7 +282,7 @@ func printFallbackQueries(w io.Writer, fqs []forensics.FallbackQuery) {
 	}
 }
 
-// ─── user-activity / connection-history / ddl-history ────────────────────────
+// ─── user-activity / connection-history ──────────────────────────────────────
 
 var userActivityCmd = &cobra.Command{
 	Use:   "user-activity",
@@ -309,27 +309,12 @@ Example:
 	RunE: runConnectionHistory,
 }
 
-var ddlHistoryCmd = &cobra.Command{
-	Use:   "ddl-history",
-	Short: "Show recent DDL statements from performance_schema",
-	Long: `Find CREATE/ALTER/DROP/RENAME/TRUNCATE statements in the source server's
-performance_schema statement history, optionally filtered by schema. For
-durable DDL history use the index instead: bintrail query --event-type DDL.
-
-Example:
-  bintrail ddl-history --source-dsn "$SRC" --schema shop`,
-	RunE: runDDLHistory,
-}
-
 var (
 	uaSourceDSN, uaUser, uaSince, uaUntil, uaOrder, uaFormat string
 	uaLimit                                                  int
 
 	chSourceDSN, chUser, chHost, chOrder, chFormat string
 	chLimit                                        int
-
-	dhSourceDSN, dhSchema, dhSince, dhUntil, dhOrder, dhFormat string
-	dhLimit                                                    int
 )
 
 func init() {
@@ -354,17 +339,6 @@ func init() {
 	f.StringVar(&chFormat, "format", "table", "Output format: table or json")
 	_ = connectionHistoryCmd.MarkFlagRequired("source-dsn")
 	BindCommandEnv(connectionHistoryCmd)
-
-	f = ddlHistoryCmd.Flags()
-	f.StringVar(&dhSourceDSN, "source-dsn", "", "DSN for the source MySQL server (required)")
-	f.StringVar(&dhSchema, "schema", "", "Filter DDL by schema")
-	f.StringVar(&dhSince, "since", "", "Time lower bound; shapes the generated fallback SQL only")
-	f.StringVar(&dhUntil, "until", "", "Time upper bound; shapes the generated fallback SQL only")
-	f.IntVar(&dhLimit, "limit", 50, "Maximum number of statements to return (capped at 1000)")
-	f.StringVar(&dhOrder, "order", "DESC", "Sort direction: ASC (oldest first) or DESC (newest first)")
-	f.StringVar(&dhFormat, "format", "table", "Output format: table or json")
-	_ = ddlHistoryCmd.MarkFlagRequired("source-dsn")
-	BindCommandEnv(ddlHistoryCmd)
 }
 
 func runUserActivity(cmd *cobra.Command, args []string) error {
@@ -394,18 +368,7 @@ func runConnectionHistory(cmd *cobra.Command, args []string) error {
 	})
 }
 
-func runDDLHistory(cmd *cobra.Command, args []string) error {
-	return runActivity(cmd, dhFormat, dhSourceDSN, forensics.ActivityQuery{
-		Type:   forensics.QueryDDLHistory,
-		Schema: dhSchema,
-		Since:  dhSince,
-		Until:  dhUntil,
-		Limit:  dhLimit,
-		Order:  dhOrder,
-	})
-}
-
-// runActivity is the shared body of the three thin activity wrappers over
+// runActivity is the shared body of the two thin activity wrappers over
 // forensics.Activity (#716): gate, validate, connect, query, render.
 func runActivity(cmd *cobra.Command, format, sourceDSN string, q forensics.ActivityQuery) error {
 	if !forensics.Enabled() {
