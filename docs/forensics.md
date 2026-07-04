@@ -48,6 +48,12 @@ Three realistic setups:
 | Very short sessions (connect → write → disconnect in < 0.5 s)? | ❌ | ⚠️ can slip between two polls | ✅ |
 | Which **SQL statement** made the change? | ✅ if `binlog_rows_query_log_events=ON` — independent of all of this, see [below](#the-statement-itself-query_text) | same | same, plus the audit log's own copy |
 
+One nuance: with `gtid_mode=ON` **and** transaction instrumentation enabled in
+performance_schema (off by default), a still-connected session's transaction
+can be matched exactly even in columns A/B — a narrow case in practice, since
+RDS/Aurora default `gtid_mode` off and the needed consumers are disabled by
+default.
+
 The honest summary: **without an audit plugin, dbtrail can only name sessions
 it (or MySQL) was watching at the right moment. With one, it can name sessions
 after the fact and prove the match.** If "who did this?" matters to you
@@ -120,7 +126,7 @@ Supported families:
 |---|---|---|
 | Percona Server | `audit_log` | free; JSON/CSV/XML formats. The newer `audit_log_filter` plugin is detected but not yet readable — [#747](https://github.com/dbtrail/dbtrail/issues/747) |
 | MariaDB | `server_audit` | free; also the dialect used by RDS MySQL/MariaDB |
-| RDS / Aurora MySQL | MariaDB Audit Plugin (via option group / advanced auditing) | dbtrail reads the logs through the AWS API — needs `rds:DescribeDBLogFiles` + `rds:DownloadDBLogFilePortion` on the host's IAM role; optionally through CloudWatch Logs if you export them |
+| RDS / Aurora MySQL | MariaDB Audit Plugin (via option group / advanced auditing) | dbtrail reads the logs through the AWS API — needs `rds:DescribeDBLogFiles` + `rds:DownloadDBLogFilePortion` on the host's IAM role. (A CloudWatch Logs reader exists in the library but is not used by `who-changed` today.) |
 | MySQL Community | none built in | MySQL Enterprise Audit exists (commercial); Percona Server is a free drop-in alternative |
 
 Run `bintrail doctor --source-dsn "$SRC"` — it detects what you have and
@@ -179,9 +185,9 @@ reality — not of dbtrail, and not fixable by any product:
 
 | Command | What it answers | Needs |
 |---|---|---|
-| `bintrail who-changed` | "Who changed these rows?" — the main forensic command. Attributes indexed changes via audit log → live sessions → identity cache, labels each answer, explains every gap. Without `--source-dsn` only index-side evidence is used. | `--index-dsn`; `--source-dsn` recommended |
+| `bintrail who-changed` | "Who changed these rows?" — the main forensic command. Attributes indexed changes via audit log → GTID transaction match → live sessions → identity cache, labels each answer, explains every gap. Without `--source-dsn` only index-side evidence is used. | `--index-dsn`; `--source-dsn` recommended |
 | `bintrail user-activity --user X` | "What is this user running **right now / very recently**?" — live view, short window, no time filter (see limit 2 above). | `--source-dsn` |
-| `bintrail connection-history` | "Who is connected right now (and how often has this account connected)?" | `--source-dsn` |
+| `bintrail connection-history` | "Who is connected right now?" (its fallback SQL adds cumulative per-account connection totals to run yourself) | `--source-dsn` |
 | `bintrail ddl-history` | Recent DDL seen in the live statement buffer. For real DDL history, prefer dbtrail's own durable record: `bintrail query --event-type ddl` or [DDL tracking](ddl-tracking.md). | `--source-dsn` |
 
 All accept `--format json`. The web console has the same surface on its

@@ -744,8 +744,9 @@ function renderEvents(params) {
   // Forensics-degraded note (#595): PostgreSQL logical replication (pgoutput)
   // carries no backend connection id, so actor attribution ("who changed this")
   // is unavailable for PG sources — unlike MySQL, it cannot be recovered
-  // upstream at all, so say so rather than leave the Forensics view an
-  // unexplained gap. capsCache.source is resolved before this paints.
+  // upstream at all, so say so here on the Events page rather than leave the
+  // missing attribution an unexplained gap. capsCache.source is resolved
+  // before this paints.
   if (capsCache.source === "postgresql") {
     v.append(el("div", { class: "warn-item" }, icon("warn"),
       el("span", { text: "Who made each change isn't available for PostgreSQL sources — Postgres's replication stream doesn't include that information." })));
@@ -1187,7 +1188,7 @@ function moveCursor(delta) {
   row.scrollIntoView({ block: "nearest" });
 }
 
-// ── exports (connection_id-free) ──────────────────────────────────────────────
+// ── exports (client-side, over the redacted rows on screen) ──────────────────────────────────────────────
 
 function downloadBlob(filename, content, mime) {
   try {
