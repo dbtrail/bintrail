@@ -209,7 +209,7 @@ func TestIntegrationEnrichThreads(t *testing.T) {
 	}
 }
 
-// TestIntegrationActivity runs the three query modes live. Ring-buffer
+// TestIntegrationActivity runs the two query modes live. Ring-buffer
 // contents depend on server history, so assertions target the contract:
 // no errors, and fallback (with executable SQL) whenever data is absent.
 func TestIntegrationActivity(t *testing.T) {
