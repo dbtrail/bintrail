@@ -147,9 +147,10 @@ type AuditReadResult struct {
 // to map them to their surface's error taxonomy (CLI exit codes, MCP errors,
 // agent responses).
 var (
-	// ErrAuditNotConfigured means neither audit_log_file (MySQL
-	// Enterprise / Percona) nor server_audit_file_path (MariaDB family) is
-	// set on the server: no audit plugin is configured.
+	// ErrAuditNotConfigured means none of audit_log_file (MySQL Enterprise /
+	// legacy Percona), audit_log_filter_file (Percona's newer Audit Log
+	// Filter plugin), or server_audit_file_path (MariaDB family) is set on
+	// the server: no audit plugin is configured.
 	ErrAuditNotConfigured = errors.New("no audit log file configured on this server")
 	// ErrAuditFileNotFound means the server reports an audit log path but
 	// no such file exists on the local filesystem (e.g. bintrail runs on a
@@ -191,8 +192,11 @@ const (
 // matching opts. The local flow is:
 //
 //  1. SHOW GLOBAL VARIABLES LIKE 'audit_log_file' (MySQL Enterprise /
-//     Percona), then 'server_audit_file_path' (MariaDB family);
-//  2. variant disambiguation via information_schema.PLUGINS;
+//     legacy Percona), then 'audit_log_filter_file' (Percona's newer Audit
+//     Log Filter plugin), then 'server_audit_file_path' (MariaDB family);
+//  2. variant disambiguation via information_schema.PLUGINS (only needed
+//     for audit_log_file, which both MySQL Enterprise and legacy Percona
+//     expose — audit_log_filter_file is Percona-exclusive);
 //  3. relative paths resolved against the server datadir, with path
 //     traversal hardening;
 //  4. rotated-file collection (opt-in, capped), tail-mode seeking, and
@@ -352,6 +356,19 @@ func discoverAuditLogFile(ctx context.Context, db *sql.DB) (path string, variant
 	}
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		warns = append(warns, fmt.Sprintf("failed to query audit_log_file variable: %v", scanErr))
+		err = scanErr
+	}
+
+	// Try Percona's newer Audit Log Filter plugin, which supersedes the
+	// legacy audit_log plugin as of Percona Server 8.0.34-26. The variable
+	// is Percona-exclusive, so no plugin-table lookup is needed to pick the
+	// variant.
+	scanErr = db.QueryRowContext(ctx, "SHOW GLOBAL VARIABLES LIKE 'audit_log_filter_file'").Scan(&varName, &varValue)
+	if scanErr == nil && varValue != "" {
+		return varValue, AuditVariantPercona, warns, nil
+	}
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		warns = append(warns, fmt.Sprintf("failed to query audit_log_filter_file variable: %v", scanErr))
 		err = scanErr
 	}
 

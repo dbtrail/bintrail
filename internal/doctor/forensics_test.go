@@ -199,7 +199,7 @@ func TestCheckAuditPlugin(t *testing.T) {
 			wantDetailFrag: "no audit log plugin active",
 			wantRemedFrags: []string{
 				"INSTALL SONAME 'server_audit';",
-				"INSTALL PLUGIN audit_log SONAME 'audit_log.so';",
+				"INSTALL PLUGIN audit_log_filter SONAME 'audit_log_filter.so';",
 				"MARIADB_AUDIT_PLUGIN",
 				"server_audit_logging=1",
 			},

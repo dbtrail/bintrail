@@ -1150,6 +1150,7 @@ func TestReadAuditLog_AuroraNotConfiguredFallback(t *testing.T) {
 	}
 	defer db.Close()
 	dbmock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	dbmock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditPathSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditLoggingSQL).WillReturnRows(variableRows("server_audit_logging", "ON"))
 
@@ -1188,6 +1189,7 @@ func TestReadAuditLog_NotConfiguredWithoutAuditLogging(t *testing.T) {
 	}
 	defer db.Close()
 	dbmock.ExpectQuery(showAuditLogFileSQL).WillReturnRows(noVariableRows())
+	dbmock.ExpectQuery(showAuditLogFilterFileSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditPathSQL).WillReturnRows(noVariableRows())
 	dbmock.ExpectQuery(showServerAuditLoggingSQL).WillReturnRows(noVariableRows())
 
