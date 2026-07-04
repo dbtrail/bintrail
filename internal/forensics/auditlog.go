@@ -48,8 +48,16 @@ type AuditVariant string
 // Known audit plugin variants.
 const (
 	AuditVariantMySQLEnterprise AuditVariant = "mysql_enterprise"
-	AuditVariantPercona         AuditVariant = "percona"
-	AuditVariantMariaDB         AuditVariant = "mariadb"
+	// AuditVariantPercona is the legacy audit_log plugin (audit_log_file),
+	// shared with MySQL Enterprise. It supports CSV, JSON, or XML depending
+	// on audit_log_format.
+	AuditVariantPercona AuditVariant = "percona"
+	// AuditVariantPerconaFilter is Percona's newer Audit Log Filter plugin
+	// (audit_log_filter_file) — a distinct constant from AuditVariantPercona
+	// because the two plugins support different format sets: this one never
+	// writes CSV, only NEW (XML-compatible) or JSON.
+	AuditVariantPerconaFilter AuditVariant = "percona_filter"
+	AuditVariantMariaDB       AuditVariant = "mariadb"
 )
 
 // AuditFormat identifies the on-disk audit log file format.
@@ -365,7 +373,7 @@ func discoverAuditLogFile(ctx context.Context, db *sql.DB) (path string, variant
 	// variant.
 	scanErr = db.QueryRowContext(ctx, "SHOW GLOBAL VARIABLES LIKE 'audit_log_filter_file'").Scan(&varName, &varValue)
 	if scanErr == nil && varValue != "" {
-		return varValue, AuditVariantPercona, warns, nil
+		return varValue, AuditVariantPerconaFilter, warns, nil
 	}
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		warns = append(warns, fmt.Sprintf("failed to query audit_log_filter_file variable: %v", scanErr))

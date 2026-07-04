@@ -840,8 +840,8 @@ func TestReadAuditLog_PerconaAuditLogFilterDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadAuditLog: %v", err)
 	}
-	if res.Variant != AuditVariantPercona {
-		t.Errorf("Variant = %q, want percona", res.Variant)
+	if res.Variant != AuditVariantPerconaFilter {
+		t.Errorf("Variant = %q, want percona_filter", res.Variant)
 	}
 	if res.FormatDetected != AuditFormatXML {
 		t.Errorf("FormatDetected = %q, want xml", res.FormatDetected)
