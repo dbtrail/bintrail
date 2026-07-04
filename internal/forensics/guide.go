@@ -235,12 +235,13 @@ func auditRecommendation(variant string) SetupRecommendation {
 			},
 			MycnfSnippet: "[mysqld]\n" +
 				"plugin-load-add = audit_log_filter.so\n" +
-				"audit_log_filter_format = JSON\n" +
-				"audit_log_filter_file = /var/log/mysql/audit_filter.json\n" +
+				"audit_log_filter_file = /var/log/mysql/audit_filter.log\n" +
 				"\n" +
-				"# audit_log_filter_format/_file/_strategy require a server restart to\n" +
-				"# take effect (not dynamic). Which events get logged is controlled\n" +
-				"# separately, at runtime, via audit_log_filter_set_filter().",
+				"# audit_log_filter_file/_format/_strategy require a server restart to\n" +
+				"# take effect (not dynamic) — the default NEW format is left as-is here\n" +
+				"# since it's the one bintrail's audit-log reader is verified against.\n" +
+				"# Which events get logged is controlled separately, at runtime, via\n" +
+				"# audit_log_filter_set_filter().",
 			Priority: "medium",
 		}
 	}
