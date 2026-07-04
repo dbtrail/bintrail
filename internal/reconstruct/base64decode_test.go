@@ -1,0 +1,63 @@
+package reconstruct
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"testing"
+)
+
+func TestDecodeStoredBase64_stringUnaffected(t *testing.T) {
+	// Normal base64-stored TEXT/BLOB values must round-trip exactly as before.
+	encoded := base64.StdEncoding.EncodeToString([]byte("hello"))
+	if got := decodeStoredBase64(encoded, false); got != "hello" {
+		t.Errorf("text decode: got %v, want %q", got, "hello")
+	}
+	if got := decodeStoredBase64(encoded, true); string(got.([]byte)) != "hello" {
+		t.Errorf("binary decode: got %v, want []byte(hello)", got)
+	}
+	if got := decodeStoredBase64("not-base64!!", false); got != "not-base64!!" {
+		t.Errorf("undecodable string must pass through unchanged, got %v", got)
+	}
+}
+
+func TestDecodeStoredBase64_boolRepaired(t *testing.T) {
+	// #736: a TEXT/BLOB value mis-promoted to a JSON bool by the pre-fix
+	// marshalRow (e.g. the literal string "false") must be restored to its
+	// original textual literal, not left as a stray Go bool.
+	if got := decodeStoredBase64(false, false); got != "false" {
+		t.Errorf("text: got %v (%T), want %q", got, got, "false")
+	}
+	if got := decodeStoredBase64(true, false); got != "true" {
+		t.Errorf("text: got %v (%T), want %q", got, got, "true")
+	}
+	if got := decodeStoredBase64(false, true); string(got.([]byte)) != "false" {
+		t.Errorf("binary: got %v, want []byte(false)", got)
+	}
+}
+
+func TestDecodeStoredBase64_jsonNumberRepaired(t *testing.T) {
+	// #736: a TEXT/BLOB value mis-promoted to a JSON number (e.g. the literal
+	// string "123") must be restored to its original textual literal.
+	if got := decodeStoredBase64(json.Number("123"), false); got != "123" {
+		t.Errorf("text: got %v (%T), want %q", got, got, "123")
+	}
+	if got := decodeStoredBase64(json.Number("0"), true); string(got.([]byte)) != "0" {
+		t.Errorf("binary: got %v, want []byte(0)", got)
+	}
+}
+
+func TestDecodeStoredBase64_nilNotGuessed(t *testing.T) {
+	// A value that decoded to Go nil (originally the string "null", per the
+	// pre-fix bug, OR a genuine SQL NULL — indistinguishable after the fact)
+	// must be left as nil rather than guessed at.
+	if got := decodeStoredBase64(nil, false); got != nil {
+		t.Errorf("expected nil to pass through unchanged, got %v", got)
+	}
+}
+
+func TestBase64StoredKind_json(t *testing.T) {
+	binary, ok := base64StoredKind("json")
+	if !ok || binary {
+		t.Errorf("expected json => (binary=false, ok=true), got (%v, %v)", binary, ok)
+	}
+}

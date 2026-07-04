@@ -2768,10 +2768,36 @@ func TestBase64StoredKind(t *testing.T) {
 	if binary, ok := base64StoredKind("LONGTEXT"); !ok || binary {
 		t.Errorf("base64StoredKind is not case-insensitive: got (%v,%v)", binary, ok)
 	}
-	for _, dt := range []string{"int", "varchar", "json", "geometry", "datetime", ""} {
+	for _, dt := range []string{"int", "varchar", "geometry", "datetime", ""} {
 		if _, ok := base64StoredKind(dt); ok {
 			t.Errorf("base64StoredKind(%q) reported a decodable column, want none", dt)
 		}
+	}
+	// "json" IS decodable (#736): marshalRow only embeds raw JSON for
+	// object/array payloads now, so a JSON column holding a bare scalar
+	// top-level value (rare, but legal) takes this same base64 path.
+	if binary, ok := base64StoredKind("json"); !ok || binary {
+		t.Errorf("base64StoredKind(%q) = (%v,%v), want (false,true)", "json", binary, ok)
+	}
+}
+
+func TestDecodeStoredBase64_boolAndNumberRepaired(t *testing.T) {
+	// #736: a TEXT/BLOB value mis-promoted to a JSON scalar by the pre-fix
+	// marshalRow (e.g. the literal string "false" or "123") must be restored
+	// to its original textual literal, not left as a stray Go bool/number. A
+	// value that decoded to nil (originally "null") stays nil — unrecoverable,
+	// indistinguishable from a genuine SQL NULL.
+	if got := decodeStoredBase64(false, false); got != "false" {
+		t.Errorf("bool text: got %v (%T), want %q", got, got, "false")
+	}
+	if got := decodeStoredBase64(true, true); string(got.([]byte)) != "true" {
+		t.Errorf("bool binary: got %v, want []byte(true)", got)
+	}
+	if got := decodeStoredBase64(json.Number("123"), false); got != "123" {
+		t.Errorf("number text: got %v (%T), want %q", got, got, "123")
+	}
+	if got := decodeStoredBase64(nil, false); got != nil {
+		t.Errorf("nil must pass through unchanged, got %v", got)
 	}
 }
 

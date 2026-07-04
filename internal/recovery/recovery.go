@@ -557,11 +557,17 @@ func (g *Generator) base64Cols(r *metadata.Resolver, schema, table string) map[s
 // []byte, but they are deliberately out of scope: a bare X'hex'/string literal
 // can't load them (they need ST_GeomFromWKB / STRING_TO_VECTOR), so reversing
 // their base64 is no better than leaving it — a separate concern from #653.
+//
+// "json" is included (non-binary) as a defense-in-depth companion to #736:
+// marshalRow now only promotes a []byte to raw JSON when it looks like a
+// JSON container ({ or [), so a JSON column whose top-level value is itself a
+// bare scalar (rare, but legal) falls through to this same base64 path
+// instead of failing to round-trip.
 func base64StoredKind(dataType string) (binary, ok bool) {
 	switch strings.ToLower(dataType) {
 	case "blob", "tinyblob", "mediumblob", "longblob":
 		return true, true
-	case "text", "tinytext", "mediumtext", "longtext":
+	case "text", "tinytext", "mediumtext", "longtext", "json":
 		return false, true
 	default:
 		return false, false
@@ -571,30 +577,50 @@ func base64StoredKind(dataType string) (binary, ok bool) {
 // decodeStoredBase64 reverses the storage-side base64 encoding of a BLOB/TEXT
 // value (see base64Cols). binary selects the decoded Go type so FormatSQLValue
 // emits X'hex' (binary) vs a quoted string (text). A value that is not a
-// decodable base64 string is returned unchanged (defensive — NULL, a raw-JSON
-// object/array blob, or pre-existing non-base64 data).
+// decodable base64 string is returned unchanged (defensive — NULL or
+// pre-existing non-base64 data).
 //
-// Known lossy edge (pre-existing, NOT introduced here): marshalRow stores a
-// BLOB/TEXT whose bytes are valid JSON RAW, not base64. A valid-JSON OBJECT/ARRAY
-// blob comes back as a map/[]any (the string guard skips it). But a valid-JSON
-// SCALAR-STRING blob (bytes literally `"YWJj"`) comes back as the Go string
-// `YWJj`, indistinguishable from a base64-stored blob, and is wrongly decoded.
-// That value was already corrupted at capture (the outer quotes were stripped by
-// the raw-JSON promotion), so this only changes the flavor of an existing bug; a
-// real fix belongs at the storage encoding, out of scope for #653.
+// bool/json.Number repair (#736): events indexed before marshalRow was fixed
+// to gate on looksLikeJSONContainer may hold a BLOB/TEXT value that was
+// mis-promoted to a bare JSON scalar — e.g. the literal string "false" stored
+// as the JSON boolean false instead of the string "false". Decoding such a
+// value yields a Go bool/json.Number instead of a string; since that value
+// IS the column's original textual literal, it is restored directly rather
+// than left corrupted. A value that decoded to Go nil (originally the
+// string "null") is NOT repairable here — it is indistinguishable from a
+// genuine SQL NULL and is left as nil (documented limitation, not guessed
+// at). Likewise a value that was a bare JSON *string* scalar (bytes like
+// `"YWJj"`) decodes to a plain Go string, indistinguishable from genuine
+// base64 content, and is not repairable either — both are pre-existing,
+// accepted edges of historical data captured before #736.
 func decodeStoredBase64(v any, binary bool) any {
-	s, ok := v.(string)
-	if !ok {
+	switch val := v.(type) {
+	case string:
+		b, err := base64.StdEncoding.DecodeString(val)
+		if err != nil {
+			return v
+		}
+		if binary {
+			return b
+		}
+		return string(b)
+	case bool:
+		text := "false"
+		if val {
+			text = "true"
+		}
+		if binary {
+			return []byte(text)
+		}
+		return text
+	case json.Number:
+		if binary {
+			return []byte(string(val))
+		}
+		return string(val)
+	default:
 		return v
 	}
-	b, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return v
-	}
-	if binary {
-		return b
-	}
-	return string(b)
 }
 
 // generateInsert reverses a DELETE event: reconstruct the deleted row from

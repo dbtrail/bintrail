@@ -1,7 +1,9 @@
 package indexer
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -99,6 +101,110 @@ func TestMarshalRow_invalidJSONBytes_base64(t *testing.T) {
 	// Value should be a base64 string, not an object.
 	if _, ok := decoded["blob"].(string); !ok {
 		t.Errorf("expected base64 string for invalid JSON bytes, got %T: %v", decoded["blob"], decoded["blob"])
+	}
+}
+
+func TestMarshalRow_bareJSONScalarBytes_notPromoted(t *testing.T) {
+	// A TEXT/BLOB column whose content happens to be a bare JSON scalar
+	// ("false", "true", "null", or a numeric string) must NOT be promoted to
+	// a raw JSON literal (#736) — go-mysql delivers TEXT/BLOB as []byte just
+	// like real JSON columns, and json.Valid alone can't tell them apart. It
+	// must instead fall through to the ordinary []byte handling (base64), so
+	// the original string round-trips intact via the existing BLOB/TEXT
+	// decode path.
+	cases := []struct {
+		name string
+		val  string
+	}{
+		{"false", "false"},
+		{"true", "true"},
+		{"null", "null"},
+		{"zero", "0"},
+		{"number", "123"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := map[string]any{"option_value": []byte(tc.val)}
+			got, err := marshalRow(row)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			var decoded map[string]any
+			if err := json.Unmarshal(got, &decoded); err != nil {
+				t.Fatalf("output is not valid JSON: %v", err)
+			}
+			b64, ok := decoded["option_value"].(string)
+			if !ok {
+				t.Fatalf("expected base64 string, got %T: %v — the scalar was wrongly promoted to a raw JSON literal", decoded["option_value"], decoded["option_value"])
+			}
+			roundTripped, err := base64.StdEncoding.DecodeString(b64)
+			if err != nil {
+				t.Fatalf("value is not valid base64: %v", err)
+			}
+			if string(roundTripped) != tc.val {
+				t.Errorf("expected round-tripped value %q, got %q", tc.val, roundTripped)
+			}
+		})
+	}
+}
+
+func TestMarshalRow_jsonObjectAndArrayBytes_stillPromoted(t *testing.T) {
+	// A genuine JSON container (object/array) must still be embedded as raw
+	// JSON, not base64 — the container-shape gate must not regress the
+	// existing JSON-column behavior.
+	cases := []struct {
+		name string
+		val  string
+	}{
+		{"object", `{"a":1}`},
+		{"array", `[1,2,3]`},
+		{"leadingWhitespace", "  \n[1,2,3]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := map[string]any{"data": []byte(tc.val)}
+			got, err := marshalRow(row)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var decoded map[string]json.RawMessage
+			if err := json.Unmarshal(got, &decoded); err != nil {
+				t.Fatalf("output is not valid JSON: %v", err)
+			}
+			if !json.Valid(decoded["data"]) {
+				t.Fatalf("expected embedded raw JSON, got %s", decoded["data"])
+			}
+			if string(decoded["data"]) == fmt.Sprintf("%q", tc.val) {
+				t.Fatalf("value was base64/string-encoded instead of embedded as raw JSON: %s", decoded["data"])
+			}
+		})
+	}
+}
+
+func TestLooksLikeJSONContainer(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"object", `{"a":1}`, true},
+		{"array", `[1,2,3]`, true},
+		{"leadingWhitespace", "  \t\n[1]", true},
+		{"false", "false", false},
+		{"true", "true", false},
+		{"null", "null", false},
+		{"number", "123", false},
+		{"quotedString", `"abc"`, false},
+		{"empty", "", false},
+		{"onlyWhitespace", "   ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := looksLikeJSONContainer([]byte(tc.in)); got != tc.want {
+				t.Errorf("looksLikeJSONContainer(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 

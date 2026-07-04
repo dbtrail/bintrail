@@ -321,23 +321,52 @@ func (idx *Indexer) digestCombined(texts []string) (map[string]string, error) {
 // ─── Serialisation helpers ────────────────────────────────────────────────────
 
 // marshalRow encodes a named row map to JSON, returning nil for a nil map.
-// []byte values that contain valid JSON (e.g. from MySQL JSON columns) are
-// embedded as raw JSON rather than base64-encoded.
+// []byte values that contain a JSON object/array (e.g. from MySQL JSON
+// columns) are embedded as raw JSON rather than base64-encoded.
 func marshalRow(row map[string]any) ([]byte, error) {
 	if row == nil {
 		return nil, nil
 	}
 	// Promote valid-JSON []byte values to json.RawMessage so they are embedded
-	// rather than base64-encoded in the output JSON.
+	// rather than base64-encoded in the output JSON. Gated on
+	// looksLikeJSONContainer, not bare json.Valid: go-mysql delivers
+	// TEXT/BLOB columns as []byte too (MySQL's binlog row format has no
+	// separate wire type for JSON vs. TEXT/BLOB), so a plain TEXT value that
+	// happens to be the literal string "false"/"true"/"null" or a bare
+	// numeric string ("0", "123") is also valid JSON — json.Valid alone would
+	// silently turn that string into a JSON bool/null/number, corrupting it
+	// (#736). Restricting to object/array payloads mirrors
+	// query.looksLikeJSONContainer, which guards the same ambiguity on the
+	// baseline/Parquet read side.
 	normalized := make(map[string]any, len(row))
 	for k, v := range row {
-		if b, ok := v.([]byte); ok && json.Valid(b) {
+		if b, ok := v.([]byte); ok && looksLikeJSONContainer(b) && json.Valid(b) {
 			normalized[k] = json.RawMessage(b)
 		} else {
 			normalized[k] = v
 		}
 	}
 	return json.Marshal(normalized)
+}
+
+// looksLikeJSONContainer reports whether b's first non-whitespace byte is '{'
+// or '[' — a cheap prefix test that distinguishes JSON object/array payloads
+// from bare string/numeric/bool/null literals that json.Valid would also
+// accept. Deliberate duplicate of query.looksLikeJSONContainer (same
+// rationale, different package — not worth a shared dependency for one
+// pure function).
+func looksLikeJSONContainer(b []byte) bool {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '{', '[':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // marshalJSON encodes v to JSON, returning nil if v is nil.
