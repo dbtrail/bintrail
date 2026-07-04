@@ -53,6 +53,7 @@ const ICONS = {
   caret: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"></path></svg>`,
   file: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path><path d="M14 3v5h5"></path></svg>`,
   warn: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`,
+  calendar: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 10h18"></path></svg>`,
 };
 
 // ── module state ─────────────────────────────────────────────────────────────
@@ -567,6 +568,10 @@ function navigate(route, params, push = true) {
 }
 
 function renderRoute() {
+  // The date-picker popover lives in document.body (position:fixed), outside
+  // the #view subtree route changes normally clear — there's no per-view
+  // teardown hook in this codebase to hang that cleanup on otherwise.
+  closeDatePicker();
   const route = routeFromLocation();
   setActiveNav(route);
   cursorIdx = -1;
@@ -768,8 +773,8 @@ function renderEvents(params) {
   adv.append(fieldInput("PK", "pk", "sm", "1006"));
   adv.append(fieldSelect("Type", "event_type", "sm", false, false, ["", "INSERT", "UPDATE", "DELETE"], "any"));
   adv.append(fieldInput("Changed column", "changed_column", "md", "email"));
-  adv.append(fieldInput("Since", "since", "md", "YYYY-MM-DD HH:MM"));
-  adv.append(fieldInput("Until", "until", "md", "YYYY-MM-DD HH:MM"));
+  adv.append(fieldDateInput("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS"));
+  adv.append(fieldDateInput("Until (UTC)", "until", "md", "YYYY-MM-DD HH:MM:SS"));
   adv.append(fieldInput("Limit", "limit", "sm", "100"));
   form.append(adv);
   v.append(form);
@@ -824,6 +829,205 @@ function fieldSelect(label, name, size, isSchema, isTable, options, anyLabel, re
   else sel.append(opt("", "any"));
   return el("div", { class: "field field--" + size },
     fieldLabel(label, required), sel);
+}
+
+// ── date/time picker (calendar + clock) for Since/Until/At filter fields ────
+// event_timestamp round-trips through consoleTSFormat under the UTC location
+// config.Connect forces on every index-DB connection (internal/config), so
+// "today"/"now" here mean UTC today/now — using local Date getters would
+// silently offset every filter the picker writes relative to the UTC values
+// the events list shows.
+const DT_DOW = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+const DT_MON = ["January", "February", "March", "April", "May", "June", "July",
+  "August", "September", "October", "November", "December"];
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+function fmtDT(y, mo, d, h, mi) { return `${y}-${pad2(mo + 1)}-${pad2(d)} ${pad2(h)}:${pad2(mi)}:00`; }
+function daysInMonth(y, mo) { return new Date(Date.UTC(y, mo + 1, 0)).getUTCDate(); }
+
+// Seeds the picker from whatever's already typed. Matches the shape of the
+// formats cliutil.ParseTime accepts (MySQL datetime, RFC3339, date-only) —
+// not full semantic equivalence: a non-UTC RFC3339 offset is ignored, and
+// out-of-range components are rejected here even though a trailing offset
+// would shift them back in range on the Go side. Anything that doesn't match
+// or fails range validation (or an empty field) leaves the typed text alone
+// and just opens on today's UTC date — Date.UTC() silently rolls over
+// invalid values instead of erroring, so an unchecked "2026-02-30" would
+// otherwise render a header/grid for a different month than the day count
+// implies.
+function parseDTValue(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/.exec((s || "").trim());
+  if (!m) return null;
+  const y = +m[1], mo = +m[2] - 1, d = +m[3];
+  const h = m[4] ? +m[4] : 0, mi = m[5] ? +m[5] : 0;
+  if (mo < 0 || mo > 11 || h > 23 || mi > 59) return null;
+  if (d < 1 || d > daysInMonth(y, mo)) return null;
+  return { y, mo, d, h, mi };
+}
+
+let openDT = null; // { pop, trigger, cleanup() } — one date picker open at a time
+
+function closeDatePicker() {
+  if (!openDT) return;
+  openDT.cleanup();
+  openDT.pop.remove();
+  openDT = null;
+}
+
+// Setting .value programmatically doesn't fire native input/change events.
+// The Events view's debounced auto-search relies on them (form listeners at
+// runEventsQuery's call site); Forensics/Recover/Time-travel are submit-only
+// and ignore them, so the dispatch is a harmless no-op there — kept for
+// consistency rather than because every caller needs it.
+function applyDTValue(input, y, mo, d, h, mi) {
+  input.value = fmtDT(y, mo, d, h, mi);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function clearDTValue(input) {
+  input.value = "";
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function toggleDatePicker(input, trigger) {
+  if (openDT && openDT.trigger === trigger) { closeDatePicker(); return; }
+  closeDatePicker();
+
+  const now = new Date();
+  const seed = parseDTValue(input.value) || {
+    y: now.getUTCFullYear(), mo: now.getUTCMonth(), d: now.getUTCDate(), h: 0, mi: 0,
+  };
+  const state = { view: { y: seed.y, mo: seed.mo }, sel: { y: seed.y, mo: seed.mo, d: seed.d }, h: seed.h, mi: seed.mi };
+
+  // Rendered into document.body, not in-flow — see the .dt-pop rule in
+  // style.css for why (an ancestor overflow:hidden would clip it otherwise).
+  const pop = el("div", { class: "dt-pop" });
+  document.body.append(pop);
+  renderDTPop(pop, state, input);
+
+  const rect = trigger.getBoundingClientRect();
+  const pw = pop.getBoundingClientRect().width;
+  let left = rect.left + window.scrollX;
+  const maxLeft = window.scrollX + window.innerWidth - pw - 8;
+  if (left > maxLeft) left = Math.max(window.scrollX + 8, maxLeft);
+  pop.style.top = (rect.bottom + window.scrollY + 6) + "px";
+  pop.style.left = left + "px";
+
+  // Self-cleaning: if the view was rebuilt out from under us (route change
+  // via renderRoute already calls closeDatePicker, but this is the backstop)
+  // the listener removes itself instead of acting on stale state.
+  const onDocClick = (e) => {
+    if (!pop.isConnected) { document.removeEventListener("click", onDocClick, true); return; }
+    if (pop.contains(e.target) || e.target === trigger || trigger.contains(e.target)) return;
+    closeDatePicker();
+  };
+  const onKey = (e) => {
+    if (!pop.isConnected) { document.removeEventListener("keydown", onKey, true); return; }
+    if (e.key === "Escape") closeDatePicker();
+  };
+  const onDismiss = () => { if (pop.isConnected) closeDatePicker(); };
+  document.addEventListener("click", onDocClick, true);
+  document.addEventListener("keydown", onKey, true);
+  window.addEventListener("scroll", onDismiss, true);
+  window.addEventListener("resize", onDismiss);
+
+  openDT = {
+    pop, trigger,
+    cleanup() {
+      document.removeEventListener("click", onDocClick, true);
+      document.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("scroll", onDismiss, true);
+      window.removeEventListener("resize", onDismiss);
+    },
+  };
+}
+
+function renderDTPop(pop, state, input) {
+  clear(pop);
+
+  const head = el("div", { class: "dt-head" });
+  head.append(
+    el("button", { class: "dt-nav dt-nav-prev", type: "button", "aria-label": "Previous month", onclick: () => {
+      state.view.mo--; if (state.view.mo < 0) { state.view.mo = 11; state.view.y--; }
+      renderDTPop(pop, state, input);
+    } }, icon("caret", "dt-nav-ic")),
+    el("span", { class: "dt-month", text: `${DT_MON[state.view.mo]} ${state.view.y}` }),
+    el("button", { class: "dt-nav", type: "button", "aria-label": "Next month", onclick: () => {
+      state.view.mo++; if (state.view.mo > 11) { state.view.mo = 0; state.view.y++; }
+      renderDTPop(pop, state, input);
+    } }, icon("caret", "dt-nav-ic")));
+  pop.append(head);
+
+  const grid = el("div", { class: "dt-grid" });
+  DT_DOW.forEach((d) => grid.append(el("span", { class: "dt-dow", text: d })));
+
+  const firstDow = new Date(Date.UTC(state.view.y, state.view.mo, 1)).getUTCDay();
+  const nDays = daysInMonth(state.view.y, state.view.mo);
+  const prevY = state.view.mo === 0 ? state.view.y - 1 : state.view.y;
+  const prevMo = state.view.mo === 0 ? 11 : state.view.mo - 1;
+  const prevNDays = daysInMonth(prevY, prevMo);
+  const nextY = state.view.mo === 11 ? state.view.y + 1 : state.view.y;
+  const nextMo = state.view.mo === 11 ? 0 : state.view.mo + 1;
+  const today = new Date();
+
+  const dayCell = (y, mo, d, muted) => {
+    const isToday = y === today.getUTCFullYear() && mo === today.getUTCMonth() && d === today.getUTCDate();
+    const isSel = y === state.sel.y && mo === state.sel.mo && d === state.sel.d;
+    return el("button", {
+      class: "dt-day" + (muted ? " is-muted" : "") + (isToday ? " is-today" : "") + (isSel ? " is-sel" : ""),
+      type: "button", text: String(d),
+      onclick: () => { state.sel = { y, mo, d }; state.view = { y, mo }; renderDTPop(pop, state, input); },
+    });
+  };
+  for (let i = firstDow - 1; i >= 0; i--) grid.append(dayCell(prevY, prevMo, prevNDays - i, true));
+  for (let d = 1; d <= nDays; d++) grid.append(dayCell(state.view.y, state.view.mo, d, false));
+  const trailing = (7 - ((firstDow + nDays) % 7)) % 7;
+  for (let d = 1; d <= trailing; d++) grid.append(dayCell(nextY, nextMo, d, true));
+  pop.append(grid);
+
+  const timeRow = el("div", { class: "dt-time" });
+  const hSel = el("select", { class: "select dt-time-select", "aria-label": "Hour" });
+  for (let h = 0; h < 24; h++) hSel.append(opt(String(h), pad2(h)));
+  hSel.value = String(state.h);
+  hSel.addEventListener("change", () => { state.h = +hSel.value; });
+  const miSel = el("select", { class: "select dt-time-select", "aria-label": "Minute" });
+  for (let mi = 0; mi < 60; mi++) miSel.append(opt(String(mi), pad2(mi)));
+  miSel.value = String(state.mi);
+  miSel.addEventListener("change", () => { state.mi = +miSel.value; });
+  timeRow.append(hSel, el("span", { class: "dt-time-sep", text: ":" }), miSel,
+    el("span", { class: "dt-tz", text: "UTC" }));
+  pop.append(timeRow);
+
+  const foot = el("div", { class: "dt-foot" });
+  foot.append(
+    el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Now", onclick: () => {
+      const n = new Date();
+      applyDTValue(input, n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate(), n.getUTCHours(), n.getUTCMinutes());
+      closeDatePicker();
+    } }),
+    el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Clear", onclick: () => {
+      clearDTValue(input);
+      closeDatePicker();
+    } }),
+    el("button", { class: "btn btn-sm btn-primary", type: "button", text: "Apply", onclick: () => {
+      applyDTValue(input, state.sel.y, state.sel.mo, state.sel.d, state.h, state.mi);
+      closeDatePicker();
+    } }));
+  pop.append(foot);
+}
+
+// fieldDateInput builds the same field chrome as fieldInput but wires a
+// calendar+clock popover to a trailing button — manual typing still works,
+// the picker is a progressive-enhancement affordance over the same input.
+function fieldDateInput(label, name, size, placeholder, required) {
+  const input = el("input", { class: "input dt-input", name, placeholder: placeholder || "" });
+  const trigger = el("button", { class: "dt-trigger", type: "button", "aria-label": "Open calendar" },
+    icon("calendar", "dt-trigger-ic"));
+  trigger.addEventListener("click", (e) => { e.preventDefault(); toggleDatePicker(input, trigger); });
+  const wrap = el("div", { class: "dt-wrap" }, input, trigger);
+  return el("div", { class: "field field--" + size }, fieldLabel(label, required), wrap);
 }
 
 // parseSmartQuery turns "type:delete pk:1006 orders" into structured filters +
@@ -1064,8 +1268,8 @@ function renderForensics(params) {
   if (mode === "connection_history") {
     form.append(fieldInput("Host", "host", "md", "10.0.1.%"));
   }
-  form.append(fieldInput("Since", "since", "md", "YYYY-MM-DD HH:MM"));
-  form.append(fieldInput("Until", "until", "md", "YYYY-MM-DD HH:MM"));
+  form.append(fieldDateInput("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS"));
+  form.append(fieldDateInput("Until (UTC)", "until", "md", "YYYY-MM-DD HH:MM:SS"));
   form.append(fieldSelect("Limit", "limit", "sm", false, false, ["50", "100", "500"], null));
   form.append(fieldSelect("Order", "order", "sm", false, false, ["DESC", "ASC"], null));
   const actions = el("div", { class: "filter-actions" });
@@ -1361,8 +1565,8 @@ function renderRecover(params) {
   form.append(fieldSelect("Schema", "schema", "md", true, false, null, "— select —"));
   form.append(fieldInput("Table", "table", "md", "orders"));
   form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
-  form.append(fieldInput("Since", "since", "md", "YYYY-MM-DD HH:MM"));
-  form.append(fieldInput("Until", "until", "md", "YYYY-MM-DD HH:MM"));
+  form.append(fieldDateInput("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS"));
+  form.append(fieldDateInput("Until (UTC)", "until", "md", "YYYY-MM-DD HH:MM:SS"));
   const actions = el("div", { class: "filter-actions" });
   actions.append(el("button", { class: "btn btn-ghost", type: "button", text: "Preview rows",
     onclick: () => previewRecover(form) }));
@@ -1520,7 +1724,7 @@ function renderTimetravel(params) {
   form.append(fieldSelect("Schema", "schema", "md", true, false, null, "— select —"));
   form.append(fieldSelect("Table", "table", "md", false, true, null, null, true));
   form.append(fieldInput("PK", "pk", "sm", "42 or 42|7", true));
-  form.append(fieldInput("As of", "at", "md", "YYYY-MM-DD HH:MM (default: now)"));
+  form.append(fieldDateInput("As of (UTC)", "at", "md", "YYYY-MM-DD HH:MM:SS (default: now)"));
   const gapsField = el("div", { class: "field", style: "justify-content:flex-end" },
     el("label", { class: "check" }, el("input", { type: "checkbox", name: "allow_gaps" }), el("span", { text: "Continue even if some history is missing" })));
   form.append(gapsField);
