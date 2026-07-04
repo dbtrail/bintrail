@@ -9,14 +9,27 @@ jobs:
   # Detects which parts of the tree changed so the expensive jobs below can
   # skip themselves on PRs that can't possibly affect them (e.g. a console
   # JS/CSS-only change has no way to break the MySQL/MariaDB/Postgres capture
-  # path). Every downstream job below still gets job-level `if:`, NOT a
-  # top-level `on.pull_request.paths` filter — all of unit/integration/
-  # integration-mariadb-source/integration-postgres-source/console-e2e are
-  # REQUIRED status checks on main's branch protection, and a workflow that
-  # never triggers at all never reports those contexts, which leaves a PR
-  # stuck on "Expected — waiting for status to be reported" forever. A
-  # job-level `if:` still reports a `skipped` conclusion, which GitHub
-  # treats as satisfying a required check.
+  # path). NEVER add a top-level `on.pull_request.paths`/`paths-ignore` filter
+  # here — all of unit/integration/integration-mariadb-source/
+  # integration-postgres-source/console-e2e are REQUIRED status checks on
+  # main's branch protection, and a workflow that never triggers at all never
+  # reports those contexts, leaving a PR stuck on "Expected — waiting for
+  # status to be reported" forever.
+  #
+  # Non-matrix jobs (unit, integration-mariadb-source, console-e2e) use a
+  # JOB-level `if:` — its context name has no suffix, so a skipped job still
+  # reports under the exact name branch protection expects, which GitHub
+  # treats as satisfying the required check.
+  #
+  # Matrix jobs (integration, integration-postgres-source) do NOT: a job-level
+  # `if:` is evaluated BEFORE matrix expansion, so a false condition means the
+  # matrix never expands and the specifically-suffixed required contexts
+  # (`integration (8.0)`, `integration-postgres-source (14)`, etc.) never get
+  # created at all — verified live via a throwaway PR, whose mergeStateStatus
+  # stayed BLOCKED with those 6 contexts permanently missing even though every
+  # other job showed "skipped". Those two jobs instead push the same `if:`
+  # down to every step, so the matrix still expands into the correctly-named
+  # contexts and each just completes instantly with nothing executed.
   changes:
     runs-on: ubuntu-22.04
     permissions:
@@ -78,7 +91,6 @@ jobs:
 
   integration:
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-22.04
 
     # Two supported cells: the BYO contract floor (8.0) and the bundled index
@@ -100,9 +112,18 @@ jobs:
       BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
 
     steps:
+      # Step-level (not job-level) `if:` — see the note on the `changes` job.
+      # This job has a matrix, and a job-level `if:` evaluated before matrix
+      # expansion, which means the specifically-named required contexts
+      # (`integration (8.0)`, `integration (8.4)`) never got created at all
+      # on a skipped run, leaving those required checks permanently pending.
+      # Step-level `if:` lets the matrix still expand into both contexts;
+      # each just completes instantly with every step skipped.
       - uses: actions/checkout@v5
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
 
       - uses: actions/setup-go@v5
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
         with:
           go-version-file: go.mod
 
@@ -114,6 +135,7 @@ jobs:
       # command-line args). This mirrors the local setup in CONTRIBUTING.md so
       # CI and developer machines run against an identical container.
       - name: Start MySQL (bintrail-test-mysql, ${{ matrix.mysql }})
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
         run: |
           docker run -d --name bintrail-test-mysql \
             -e MYSQL_ROOT_PASSWORD=testroot \
@@ -141,6 +163,7 @@ jobs:
       # parser tests assert exact event counts). Serializing keeps each package
       # the sole writer during its run.
       - name: Integration tests (-tags=integration)
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
         run: go test -tags=integration -race -p 1 -count=1 ./...
 
   integration-mariadb-source:
@@ -222,7 +245,6 @@ jobs:
     # (TestOne_EndToEnd_PostgresToIndexToRecovery) streams PG changes INTO the
     # MySQL index and generates recovery SQL, so both servers must be present.
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-22.04
 
     # Spans the supported PostgreSQL range: 14 (declared minimum — PG13 is EOL)
@@ -247,13 +269,18 @@ jobs:
       BINTRAIL_REQUIRE_POSTGRES: "1"
 
     steps:
+      # Step-level (not job-level) `if:` — see the note on the `integration`
+      # job above; this job's matrix has the same requirement.
       - uses: actions/checkout@v5
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
 
       - uses: actions/setup-go@v5
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
         with:
           go-version-file: go.mod
 
       - name: Start MySQL index (bintrail-test-mysql, 8.4)
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
         run: |
           docker run -d --name bintrail-test-mysql \
             -e MYSQL_ROOT_PASSWORD=testroot \
@@ -271,6 +298,7 @@ jobs:
           exit 1
 
       - name: Start PostgreSQL source (bintrail-test-postgres, ${{ matrix.postgres }})
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
         run: |
           docker run -d --name bintrail-test-postgres \
             -e POSTGRES_PASSWORD=testpg \
@@ -304,6 +332,7 @@ jobs:
       # asserting the headline end-to-end test genuinely ran — not merely that
       # `go test` exited 0. pipefail keeps the go-test exit code through the tee.
       - name: PostgreSQL-source integration tests
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
         run: |
           set -o pipefail
           go test -tags=integration -race -p 1 -count=1 -v \
