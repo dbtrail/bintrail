@@ -167,6 +167,11 @@ try {
   // a render, then navigating exactly once, avoids the race while still
   // fixing the cache-poisoning switchServer would have fixed.
   await page.evaluate(() => closeServersModal());
+  // Let scenario 5's editServer() open/populate-form fetches (if any) fully
+  // settle before switching server + route — an in-flight one resolving
+  // after navigate("forensics") could otherwise touch shared state
+  // (capsCache, tablesCache) at the wrong moment.
+  await page.waitForLoadState("networkidle");
   await page.evaluate((id) => { setCurrentServer(id); serverGen++; schemaCache = null; tablesCache.clear(); }, byoId);
   await page.evaluate(() => navigate("forensics"));
   await page.waitForSelector("#fx-caps", { timeout: 5000 });
@@ -212,10 +217,12 @@ try {
     form.requestSubmit();
   });
   // The query itself is async (index fetch, possibly a lazy bundle open) —
-  // poll for either outcome (timeline rendered, or an error box) rather than
-  // a fixed sleep.
+  // poll for any outcome (timeline rendered, the "no changes found" empty
+  // state, or a rendered error) rather than a fixed sleep. Matches the
+  // actual classes renderError()/buildWhoChangedTimeline() use — NOT
+  // generic ".error"/".empty" names, which don't exist in this file.
   await page.waitForFunction(
-    () => !!document.getElementById("fx-timeline") || !!document.querySelector("#fx-out .error, #fx-out .empty"),
+    () => !!document.getElementById("fx-timeline") || !!document.querySelector("#fx-out .error-box, #fx-out .ev-empty, #fx-out .empty"),
     { timeout: 8000 },
   );
   const who = await page.evaluate(() => {
