@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`bintrail query --archive-s3` no longer logs a misleading WARN when `s3:GetBucketLocation` is denied** (#734). The archive-region auto-detection probe is denied under bintrail's own documented minimal least-privilege IAM policy (`docs/upload.md`), which intentionally omits that permission — so the resulting `AccessDenied` is expected, not a misconfiguration. It's now logged at debug level, and only a genuinely unexpected `GetBucketLocation` error (network failure, `NoSuchBucket`, throttling) still raises a WARN. Behavior is unchanged either way: the resolved default region (already IMDS-aware per #697) is used as the fallback.
+
 ## [0.29.0] - 2026-07-03
 
 ### Added

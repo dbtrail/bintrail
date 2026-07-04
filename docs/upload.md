@@ -121,6 +121,7 @@ The IAM principal (user or role) needs these S3 permissions on the destination b
 - `s3:PutObject` — required for uploading files
 - `s3:HeadObject` — required when using `--retry` to check if files already exist
 - `s3:GetObject` — required if you later query archives with `bintrail query --archive-s3`
+- `s3:GetBucketLocation` — **optional**, bucket-level (not scoped to `/archives/*`). `bintrail query --archive-s3` uses it only to cross-check the bucket's region against the one already resolved from the credential chain; without it, that check is skipped (logged at debug level, not a warning) and the resolved region is used as-is. Grant it only if the archive bucket lives in a different region than your EC2/ECS/EKS principal otherwise resolves — see [S3 Prerequisites](query-and-recovery.md#s3-prerequisites).
 
 ---
 
