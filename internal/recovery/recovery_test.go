@@ -1492,6 +1492,49 @@ func TestDecodeStoredBase64_nilNotGuessed(t *testing.T) {
 	}
 }
 
+func TestGenerateInsert_repairsHistoricalCorruptedTextValue(t *testing.T) {
+	// End-to-end regression pin for #736's actual reported symptom: a TEXT
+	// column value from an event indexed BEFORE the marshalRow fix, where the
+	// literal string "false" was mis-promoted and decoded back as a Go bool.
+	// Without the decodeStoredBase64 repair, FormatSQLValue's `case bool`
+	// would render this as the unquoted numeral 0 — exactly the corruption
+	// verify caught on the reporting user's WordPress index. This must
+	// produce the quoted string 'false', not 0.
+	tm := &metadata.TableMeta{
+		Schema: "wordpress",
+		Table:  "dbt_options",
+		Columns: []metadata.ColumnMeta{
+			{Name: "option_id", OrdinalPosition: 1, IsPK: true, DataType: "bigint"},
+			{Name: "option_value", OrdinalPosition: 2, DataType: "longtext"},
+		},
+		PKColumns: []string{"option_id"},
+	}
+	resolver := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"wordpress.dbt_options": tm,
+	})
+	g := New(nil, resolver)
+	row := query.ResultRow{
+		EventID:    26491,
+		SchemaName: "wordpress",
+		TableName:  "dbt_options",
+		EventType:  parser.EventInsert,
+		RowBefore: map[string]any{
+			"option_id":    json.Number("1509"),
+			"option_value": false, // historically-corrupted decode of the string "false"
+		},
+	}
+	stmt, err := g.generateInsert(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(stmt, "'false'") {
+		t.Errorf("expected repaired value 'false' in generated SQL, got: %s", stmt)
+	}
+	if strings.Contains(stmt, "(1509, 0)") {
+		t.Errorf("generated SQL still shows the unrepaired numeral 0 instead of 'false': %s", stmt)
+	}
+}
+
 func TestDecodeStoredBase64_jsonContainerUnaffected(t *testing.T) {
 	// #736 added "json" to base64StoredKind, so decodeStoredBase64 is now
 	// invoked for JSON-typed columns too — a genuine JSON object/array value

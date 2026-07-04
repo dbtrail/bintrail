@@ -2869,3 +2869,36 @@ func TestMapEventImagesDecodesExactlyOnce(t *testing.T) {
 		t.Errorf("body = %#v, want \"SGVsbG8=\" (decoded exactly once, not twice → \"Hello\")", got)
 	}
 }
+
+func TestMapEventImagesDecodesExactlyOnce_boolRepair(t *testing.T) {
+	// #736's bool/json.Number repair produces plain text ("true"/"false") that
+	// happens to be valid base64 alphabet — e.g. base64.StdEncoding.DecodeString
+	// ("true") succeeds (into 3 unrelated bytes) where "false"/"0"/"123" would
+	// fail and pass through unchanged. A single call must repair a historically
+	// mis-promoted bool to its correct text; every call site is documented and
+	// tested elsewhere to invoke this exactly once per event slice — a second
+	// call on the same image would re-interpret "true" as base64 and corrupt it,
+	// the same non-idempotency class the pre-existing base64-string case has.
+	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := &Handler{
+		logger: silent,
+		resolverFn: func() (*metadata.Resolver, error) {
+			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+				"appdb.docs": {Schema: "appdb", Table: "docs", Columns: []metadata.ColumnMeta{
+					{Name: "id", OrdinalPosition: 1, DataType: "int", IsPK: true},
+					{Name: "flag", OrdinalPosition: 2, DataType: "text"},
+				}},
+			}), nil
+		},
+	}
+	rows := []query.ResultRow{{
+		SchemaName:     "appdb",
+		TableName:      "docs",
+		EventTimestamp: time.Unix(1_700_000_000, 0).UTC(),
+		RowAfter:       map[string]any{"id": json.Number("1"), "flag": true},
+	}}
+	h.mapEventImages("appdb", "docs", rows)
+	if got := rows[0].RowAfter["flag"]; got != "true" {
+		t.Errorf("flag = %#v, want \"true\" (repaired once, not corrupted by a second decode pass)", got)
+	}
+}

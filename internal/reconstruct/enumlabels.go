@@ -66,7 +66,9 @@ func MapEventEnumLabels(db *sql.DB, latest *metadata.Resolver, schema, table str
 // would be corrupted). The full-table merge path (ReconstructTable, #668) calls
 // this too, on the full events slice before its change map is built — callers
 // must call it exactly once per events slice, since decodeStoredBase64 is not
-// idempotent and a second pass would double-decode.
+// idempotent and a second pass would double-decode — this now also covers
+// the #736 bool/json.Number repair output ("true"/"false" is valid base64
+// alphabet and would silently re-decode into unrelated bytes on a second pass).
 //
 // Each column is typed at the snapshot in effect at its event's timestamp
 // (#475-style epoch awareness, matching MapEventEnumLabels): whether a value is

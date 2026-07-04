@@ -339,6 +339,11 @@ func marshalRow(row map[string]any) ([]byte, error) {
 	// query.looksLikeJSONContainer, which guards the same ambiguity on the
 	// baseline/Parquet read side.
 	//
+	// go-mysql delivers only BLOB/TEXT, JSON, and GEOMETRY columns as []byte
+	// (VARCHAR/CHAR/VARBINARY/BINARY arrive as Go string; ENUM/SET as int64),
+	// so this branch is the full extent of what needs gating — no other
+	// column kind can reach it.
+	//
 	// Residual, accepted ambiguity (not fixed here, same limit as the
 	// baseline-side guard above): a plain TEXT/BLOB value whose content
 	// genuinely LOOKS like a JSON object/array (e.g. literal text

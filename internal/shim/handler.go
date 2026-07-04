@@ -1133,13 +1133,19 @@ func base64StoredKind(dataType string) (binary, ok bool) {
 // string. That value IS the column's original textual literal, so it is
 // restored directly. A value that decoded to Go nil (originally the string
 // "null") is NOT repairable — indistinguishable from a genuine SQL NULL —
-// and is left as nil. Likewise a bare JSON *string* scalar (bytes like
-// `"YWJj"`, quotes included) decodes to a plain Go string that still carries
-// those quote characters as content, indistinguishable from genuine base64
-// content — not repairable either. Both gaps apply not only to historical
-// data captured before #736, but also going forward to a genuine JSON
-// column whose top-level value is itself a bare scalar (legal MySQL, but
-// rare); a real fix belongs at the storage encoding, out of scope here.
+// and is left as nil. This nil case, and a bare JSON *string* scalar (bytes
+// like `"YWJj"`, quotes included) that was mis-promoted the same way, are
+// historical-only gaps: by the time this runs, the pre-#736 marshalRow had
+// already parsed the outer quotes away as ordinary JSON-string syntax, so
+// the value arriving here is the already-quote-stripped text (`YWJj`),
+// indistinguishable from genuine base64 content and wrongly re-decoded on
+// top of the original corruption — not repairable, a real fix belongs at
+// the storage encoding, out of scope here. A genuine JSON column captured
+// AFTER this fix with a bare string-scalar value does NOT hit this gap: it
+// takes the ordinary []byte-to-base64 path (same as any TEXT/BLOB), and this
+// function correctly reverses it to the original bytes, quotes included —
+// which is exactly the text MySQL needs to re-parse the value back into
+// that JSON column.
 func decodeStoredBase64(v any, binary bool) any {
 	var text string
 	switch val := v.(type) {
