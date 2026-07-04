@@ -75,14 +75,23 @@ and searching events:
    `schema.table` tokens) with an expandable **Filters** panel. Each row expands
    in place to a before→after diff; `j`/`k` move the cursor, `↵` expands, `u`
    jumps to Recover. Results carry **JSON / CSV** export — client-side over the
-   rows already on screen, so it stays within the result caps and — like the
-   on-screen rows — never includes `connection_id`, `query_text`, or `query_hash`.
+   rows already on screen, so it stays within the result caps. Rows and exports
+   include `connection_id` (the thread number Forensics resolves to a name) but
+   never `query_text`/`query_hash` — the originating statement is served only
+   through the Forensics view.
 3. **Time-travel** — single-row point-in-time reconstruct, drawn as a timeline
    (baseline snapshot → each change, with a **Restore to this state** jump to
    Recover). Appears **only when a baseline is configured**
    (`--baseline-dir`/`--baseline-s3`); otherwise it is hidden, never shown
    empty. See [Time-travel](#time-travel-reconstruct).
-4. **Recover** — filter schema / table / PK / time, preview the affected rows
+4. **Forensics** — "who changed this?": attribute indexed changes to database
+   sessions (user, host, client program) through the audit-log / live-session /
+   identity-cache cascade, plus the three investigation queries (user activity,
+   connection history, DDL history), a capabilities check of the source, and a
+   tailored setup guide. Refuses to answer while an RBAC access profile is
+   active — forensic output contains unredacted SQL and session identity. See
+   [Forensics](forensics.md).
+5. **Recover** — filter schema / table / PK / time, preview the affected rows
    with before→after diffs, then **Generate undo SQL** and copy/download the
    script. Arriving via an **Undo** action scopes it to that row and shows a
    context banner. When you undo a `DELETE` on a foreign-key **parent** whose
@@ -90,13 +99,13 @@ and searching events:
    Recover **auto-detects** it and folds the invisible children into the same
    script — no separate tab, no extra step. **Nothing is ever executed.** See
    [Recover and cascade](#cascade-recovery).
-5. **Status** — index health: partitions, coverage, stream lag, archives, and a
+6. **Status** — index health: partitions, coverage, stream lag, archives, and a
    first-class **stream-continuity** signal — a green "✓ No gaps in captured
    stream" badge when the captured range is contiguous, or a red "⚠ Events
    permanently lost" record when an unfillable gap (or a lost PostgreSQL slot)
    was detected. Both fire for any source family. See
    [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
-6. **Settings** (under `watch` only) — **Storage** (rotation policy,
+7. **Settings** (under `watch` only) — **Storage** (rotation policy,
    per-source S3 archiving, baseline snapshots, AWS credential signals — see
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
    rotation dialog).
@@ -512,16 +521,20 @@ itself:
   `POST /api/auth/setup`. Everything else needs a Bearer
   credential.
 
-## Open-core boundary
+## Forensics and the events API
 
-The console exposes only the free **query_explorer** surface (event query +
-recovery-SQL generation), available on every tier. It deliberately stays out of
-the paid **forensics** surface (who-changed / what-statement / attribution): the
-events API drops `connection_id` — the MySQL `pseudo_thread_id` of the writing
-transaction — and `query_text`/`query_hash` — the originating SQL statement and
-its normalized digest — from every response. There is no gating, RBAC, or
-license code in the binary; the boundary is simply what the API chooses to
-serve.
+The console ships the full **forensics** surface (see
+[Forensics](forensics.md)): the Forensics view and its `/api/forensics/*`
+endpoints serve who-changed attribution, the activity queries, capabilities,
+and the setup guide. Two boundaries remain:
+
+- The **events** API and its exports include `connection_id` (the thread
+  number Forensics resolves to a name) but never `query_text`/`query_hash` —
+  the originating SQL statement is served only through the forensics
+  endpoints.
+- The forensics endpoints **refuse while an RBAC access profile is active**:
+  forensic output contains unredacted SQL and session identity that the
+  redaction pipeline cannot cover.
 
 ## PostgreSQL sources
 
@@ -542,8 +555,8 @@ per server as `source` in [`/api/capabilities`](#api), derived from
   point and capture must be re-baselined to resume.
 - **Forensics note.** PostgreSQL logical replication (`pgoutput`) carries no
   backend connection id, so actor attribution (who-changed) is unavailable
-  *upstream* — not merely dropped by the open-core boundary above. The Events
-  page says so for PostgreSQL sources rather than leaving it an unexplained gap.
+  *upstream* — no console or capture setting can add it. The Events page says
+  so for PostgreSQL sources rather than leaving it an unexplained gap.
 - **Replication-health panel.** The Status page shows the replication slot's
   WAL-retention state (`wal_status`, retained WAL, the safe margin before
   invalidation) and whether every published table is at `REPLICA IDENTITY FULL`.

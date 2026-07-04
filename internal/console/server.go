@@ -2,11 +2,12 @@
 // bintrail index. It is the MCP server with a web face: the same query,
 // recovery, status, and metadata engines, reached over HTTP from a browser.
 //
-// The console exposes only the free query_explorer surface — event browsing and
-// recovery-SQL generation. It deliberately stays out of the paid forensics
-// surface: see dto.go, where connection_id (actor attribution) is dropped on the
-// way out. No endpoint ever executes SQL; recover generates a script for the
-// operator to review and apply by hand.
+// The console serves event browsing, recovery-SQL generation, and — since the
+// Forensics view — session attribution via /api/forensics/*. The events API
+// includes connection_id but never query_text/query_hash (see dto.go); the
+// originating statement is served only through the forensics endpoints, which
+// refuse under an active RBAC profile. No endpoint ever executes SQL; recover
+// generates a script for the operator to review and apply by hand.
 package console
 
 import (

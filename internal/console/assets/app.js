@@ -743,9 +743,8 @@ function renderEvents(params) {
 
   // Forensics-degraded note (#595): PostgreSQL logical replication (pgoutput)
   // carries no backend connection id, so actor attribution ("who changed this")
-  // is unavailable for PG sources. The free events surface never shows
-  // connection_id anyway (it is paid-forensics, dropped from eventDTO), but for
-  // PG it cannot be recovered upstream at all — say so rather than leave it an
+  // is unavailable for PG sources — unlike MySQL, it cannot be recovered
+  // upstream at all, so say so rather than leave the Forensics view an
   // unexplained gap. capsCache.source is resolved before this paints.
   if (capsCache.source === "postgresql") {
     v.append(el("div", { class: "warn-item" }, icon("warn"),
