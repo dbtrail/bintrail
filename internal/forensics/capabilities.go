@@ -182,9 +182,8 @@ func detectAuditLog(ctx context.Context, db *sql.DB) AuditLogCapabilities {
 		// Percona-exclusive (its PLUGIN_DESCRIPTION is just "Audit log",
 		// so the name/description substring check below would miss it).
 		switch {
-		case strings.EqualFold(name, "audit_log_filter"):
-			caps.Variant = "percona"
-		case strings.Contains(upperName, "PERCONA") || strings.Contains(strings.ToUpper(description), "PERCONA"):
+		case strings.EqualFold(name, "audit_log_filter") ||
+			strings.Contains(upperName, "PERCONA") || strings.Contains(strings.ToUpper(description), "PERCONA"):
 			caps.Variant = "percona"
 		case strings.Contains(upperName, "SERVER_AUDIT") || strings.Contains(upperName, "MARIADB"):
 			caps.Variant = "mariadb"
