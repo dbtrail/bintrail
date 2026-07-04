@@ -300,13 +300,11 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 	})
 	if locErr != nil {
 		if isBucketLocationAccessDenied(locErr) {
-			// Expected under bintrail's documented minimal least-privilege S3
-			// policy (docs/upload.md), which intentionally omits
-			// s3:GetBucketLocation — not a misconfiguration, so this doesn't
-			// warrant a WARN. cfg.Region already benefits from storage.
-			// LoadAWSConfig's IMDS fallback, so the resolved default is a
-			// reasonable region to proceed with.
-			slog.Debug("skipping S3 bucket region auto-detection: GetBucketLocation denied (expected under the minimal IAM policy); using resolved default region", "bucket", bucket, "region", cfg.Region)
+			// Expected — see isBucketLocationAccessDenied. Still logs locErr so
+			// the rarer non-benign case sharing this same error code (an SCP or
+			// VPC-endpoint-policy deny, a cross-account restriction) stays
+			// diagnosable at --log-level debug.
+			slog.Debug("skipping S3 bucket region auto-detection: GetBucketLocation denied (expected under the minimal IAM policy); using resolved default region", "bucket", bucket, "region", cfg.Region, "error", locErr)
 		} else {
 			slog.Warn("could not detect S3 bucket region, using default", "bucket", bucket, "error", locErr)
 		}
