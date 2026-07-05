@@ -273,6 +273,14 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 
 	engine := query.New(db)
 
+	// Refuse/warn on a stamped capture gap inside the window (#765): a
+	// query.GapError below only catches archive-coverage gaps (rotated hours
+	// with no archive); stream_state.gap_lost_at records events permanently
+	// lost at the source, which no archive can fill.
+	if err := reconstruct.CheckCaptureGap(cmd.Context(), db, recSchema, recTable, snapshotTime, at, recAllowGaps); err != nil {
+		return err
+	}
+
 	// The planner needs a database name derived from the DSN.
 	var dbName string
 	if cfg, parseErr := mysqldriver.ParseDSN(recIndexDSN); parseErr != nil {

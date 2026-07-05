@@ -390,6 +390,15 @@ func ReconstructTable(
 		return nil, err
 	}
 
+	// ── 3c. Refuse/warn on a stamped capture gap inside the window (#765) ──
+	// stream_state.gap_lost_at records an irreparable capture gap (source
+	// binlogs purged before the stream caught up); unlike the archive-coverage
+	// gap the fetch below already guards against, no amount of archive
+	// resolution can fill this — it must be checked directly.
+	if err := CheckCaptureGap(ctx, db, schema, table, snapshotTime, cfg.At, cfg.AllowGaps); err != nil {
+		return nil, err
+	}
+
 	// ── 4. Fetch events via the shared helper (gap-aware) ──────────────────
 	fetchOpts := query.Options{
 		Schema: schema,
