@@ -1397,41 +1397,75 @@ func TestClassifyEmptyS3Listing(t *testing.T) {
 		}
 	})
 
-	// TestClassifyEmptyS3Listing/until-only (#774): before the fix,
-	// generateDatePrefixes(prefix, nil, old) invented start=now-31d, and with
-	// `old` predating that window the negative span clamped to a single
-	// bogus day — a non-nil result that made this function treat the listing
-	// as "scoped" and run the stale-registration probe. The probe would find
-	// SOME unrelated parquet under the base prefix (present in this repo's
-	// archives generally) and conclude "source is healthy, zero rows" —
-	// silently discarding real matching data older than 31 days. With
-	// generateDatePrefixes now returning nil for since==nil, an until-only
-	// query is correctly unscoped: a zero-file listing already means the
-	// (unscoped, full-prefix) source truly has nothing, so this must fail
-	// loud with SourceEmptyError and must NOT invoke the probe.
-	t.Run("until-only listing, until older than 31 days → SourceEmpty directly, probe NOT called (#774)", func(t *testing.T) {
+	// TestClassifyEmptyS3Listing/until-only (post-review fix to #774, #876
+	// review): generateDatePrefixes(prefix, nil, old) now unconditionally
+	// returns nil for since==nil (correctly makes listS3ParquetScoped list
+	// the FULL prefix rather than inventing a bogus window). But that nil-ness
+	// is no longer the right signal for whether classifyEmptyS3Listing should
+	// probe: filterFilesByTimeRange runs downstream regardless of how the S3
+	// LIST call was scoped, and it alone can turn a non-empty raw listing
+	// into zero files whenever `until` excludes all real archived data (e.g.
+	// the archive's data starts after `until`). That is a healthy empty
+	// result, not a stale registration, and only the probe can tell them
+	// apart — so an until-only listing must still run it.
+	t.Run("until-only listing, until older than all data, probe finds nothing → SourceEmpty", func(t *testing.T) {
+		probed := false
 		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) {
-			t.Fatal("probe must not run for an until-only listing — it is unscoped since #774")
+			probed = true
 			return false, nil
 		}
 		old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 		_, err := classifyEmptyS3Listing(context.Background(), nil, source, nil, &old)
+		if !probed {
+			t.Fatal("expected the probe to run for an until-only listing")
+		}
 		var emptyErr *query.SourceEmptyError
 		if !errors.As(err, &emptyErr) {
 			t.Fatalf("err = %v, want *query.SourceEmptyError", err)
 		}
 	})
 
-	t.Run("unscoped listing (range > maxScopedDays) → SourceEmpty directly", func(t *testing.T) {
+	// This is the exact regression scenario: an until-only query whose
+	// window predates all real archived data (a healthy, legitimately empty
+	// result) must NOT be misclassified as SourceEmptyError just because
+	// since==nil made generateDatePrefixes return nil.
+	t.Run("until-only listing, until older than all data, probe finds parquet → healthy empty range, not SourceEmpty", func(t *testing.T) {
+		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) { return true, nil }
+		old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+		rows, err := classifyEmptyS3Listing(context.Background(), nil, source, nil, &old)
+		if err != nil || rows != nil {
+			t.Errorf("got rows=%v err=%v, want nil/nil (healthy empty range, real data exists elsewhere)", rows, err)
+		}
+	})
+
+	// Twin of the until-only fix: a wide (>maxScopedDays) bounded range has
+	// the same property — the S3 LIST call may be unscoped (full prefix),
+	// but filterFilesByTimeRange still narrows downstream and can legitimately
+	// zero out real data that falls outside [since, until]. Skipping the
+	// probe here was the same latent bug, just not the one #774 named.
+	t.Run("wide range (> maxScopedDays), probe finds nothing → SourceEmpty", func(t *testing.T) {
+		probed := false
 		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) {
-			t.Fatal("probe must not run for an unscoped wide range")
+			probed = true
 			return false, nil
 		}
 		wideSince := until.AddDate(0, 0, -(maxScopedDays + 5))
 		_, err := classifyEmptyS3Listing(context.Background(), nil, source, &wideSince, &until)
+		if !probed {
+			t.Fatal("expected the probe to run for a wide (>maxScopedDays) range")
+		}
 		var emptyErr *query.SourceEmptyError
 		if !errors.As(err, &emptyErr) {
 			t.Fatalf("err = %v, want *query.SourceEmptyError", err)
+		}
+	})
+
+	t.Run("wide range (> maxScopedDays), probe finds parquet → healthy empty range, not SourceEmpty", func(t *testing.T) {
+		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) { return true, nil }
+		wideSince := until.AddDate(0, 0, -(maxScopedDays + 5))
+		rows, err := classifyEmptyS3Listing(context.Background(), nil, source, &wideSince, &until)
+		if err != nil || rows != nil {
+			t.Errorf("got rows=%v err=%v, want nil/nil (healthy empty range, real data exists elsewhere)", rows, err)
 		}
 	})
 }

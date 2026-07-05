@@ -402,8 +402,16 @@ const maxScopedDays = 31
 // data older than that invented window when until fell within it, and
 // collapsed to a single bogus day when until was older still (#774). Listing
 // everything and letting until alone filter downstream (filterFilesByTimeRange)
-// is correct in both cases, just less scoped — the CLI's "since is required by
-// most codepaths" convention makes bare until-only queries rare in practice.
+// is correct in both cases, just less scoped.
+//
+// Until-only queries are NOT rare: no CLI command marks --since required
+// (query/recover/reconstruct/verify all accept --until alone), the MCP tool
+// schema marks Since optional (omitempty), the console's request builders
+// impose no such requirement, and #774's own reproduction is exactly this
+// shape (`bintrail query --until ...` with no --since, and the agent's
+// HandleRecover, which is TimeEnd-only). The real tradeoff: this trades some
+// S3 listing performance on that reachable path for correctness — no
+// listing scope narrower than "everything" is safe without a lower bound.
 func generateDatePrefixes(basePrefix string, since, until *time.Time) []string {
 	if since == nil {
 		return nil
@@ -434,15 +442,26 @@ func generateDatePrefixes(basePrefix string, since, until *time.Time) []string {
 }
 
 // classifyEmptyS3Listing decides what a zero-file S3 listing means (#383).
-// The listing is DATE-SCOPED when the query has a usable time range, so
-// "no files" is ambiguous: a healthy source with a legitimately empty
-// range (fine — empty result), or a REGISTERED source whose objects
-// vanished after archive_state was written (stale registration — must
-// fail loud: the planner already counted these hours as covered).
-// Disambiguates with one unscoped probe of the base prefix. When the
-// listing was NOT scoped (nil bounds, or range > maxScopedDays per
-// generateDatePrefixes), zero files already IS the unscoped truth — the
-// source is empty, no probe needed.
+// "No files" is ambiguous whenever ANY time bound is in play, so a healthy
+// source with a legitimately empty range (fine — empty result) must be told
+// apart from a REGISTERED source whose objects vanished after archive_state
+// was written (stale registration — must fail loud: the planner already
+// counted these hours as covered). Disambiguates with one unscoped probe of
+// the base prefix.
+//
+// The probe-vs-fail-fast decision is NOT based on whether generateDatePrefixes
+// scoped the S3 LIST call itself (that only controls how many objects get
+// listed, an optimization) — it is based on whether filterFilesByTimeRange
+// could have discarded real files after listing. filterFilesByTimeRange is a
+// true no-op only when BOTH since and until are nil (see its own since==nil
+// check): in every other case — including since==nil with a narrow/old
+// until, and the since!=nil/range>maxScopedDays case — the S3 listing may
+// have been unscoped (full-prefix) yet still have contained real files that
+// the downstream time filter removed. Skipping the probe there would
+// misclassify a query whose window simply predates (or excludes) all
+// archived data — a healthy empty result — as SourceEmptyError. Only when
+// there is no time bound at all does "zero files listed" already equal
+// "zero files after filtering", making the probe redundant.
 //
 // Extracted from Fetch's S3 branch so the decision table is unit-testable
 // with a faked s3BaseHasParquet (the function itself never touches the
@@ -452,7 +471,7 @@ func classifyEmptyS3Listing(ctx context.Context, client *s3.Client, source strin
 	if err != nil {
 		return nil, fmt.Errorf("parse S3 archive source: %w", err)
 	}
-	if generateDatePrefixes(prefix, since, until) != nil {
+	if since != nil || until != nil {
 		has, probeErr := s3BaseHasParquet(ctx, client, bucket, prefix)
 		if probeErr != nil {
 			return nil, fmt.Errorf("probe S3 archive source %s: %w", source, probeErr)
