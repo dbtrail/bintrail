@@ -765,12 +765,14 @@ func TestStreamParser_mixedSequenceGTIDOnly(t *testing.T) {
 
 // ─── Synchronous DDL hook (#396) ──────────────────────────────────────────────
 
-// TestStreamParser_syncDDLHookOrdering locks the #396 fix: the hook runs
-// synchronously inside Run — after the DDL is emitted, before ANY subsequent
-// event is decoded. Observable two ways: (1) when the hook runs, the output
-// channel holds exactly the DDL (the following event cannot have been
-// processed yet); (2) a resolver swapped inside the hook is what stamps the
-// NEXT event's SchemaVersion.
+// TestStreamParser_syncDDLHookOrdering locks the #396/#760 fix: the hook runs
+// synchronously inside Run — BEFORE the DDL itself is emitted, and before ANY
+// subsequent event is decoded (#760 reordered this from emit-then-hook to
+// hook-then-emit, so a hook failure can withhold the DDL event entirely — see
+// TestStreamParser_syncDDLHookErrorAbortsRun). Observable two ways: (1) when
+// the hook runs, the output channel is still empty (neither the DDL nor the
+// following event has been emitted yet); (2) a resolver swapped inside the
+// hook is what stamps the NEXT event's SchemaVersion.
 func TestStreamParser_syncDDLHookOrdering(t *testing.T) {
 	r1 := metadata.NewResolverFromTables(1, nil)
 	sp := NewStreamParser(r1, Filters{}, nil)
@@ -778,7 +780,7 @@ func TestStreamParser_syncDDLHookOrdering(t *testing.T) {
 	out := make(chan Event, 10)
 
 	hookRuns := 0
-	sp.SetSyncDDLHook(func(ev Event) {
+	sp.SetSyncDDLHook(func(ev Event) error {
 		hookRuns++
 		if ev.EventType != EventDDL {
 			t.Errorf("hook received %v, want EventDDL", ev.EventType)
@@ -786,13 +788,14 @@ func TestStreamParser_syncDDLHookOrdering(t *testing.T) {
 		if ev.SchemaVersion != 1 {
 			t.Errorf("first DDL SchemaVersion = %d, want pre-swap 1", ev.SchemaVersion)
 		}
-		// The DDL itself is emitted; the event AFTER it must not be yet.
-		if got := len(out); got != 1 {
-			t.Errorf("hook must run before the next event is processed; out holds %d events", got)
+		// The hook runs BEFORE the DDL itself is emitted (#760).
+		if got := len(out); got != 0 {
+			t.Errorf("hook must run before the DDL is emitted; out holds %d events", got)
 		}
 		// The snapshot-refresh stand-in: the very next decode must see this.
 		sp.SwapResolver(metadata.NewResolverFromTables(99, nil))
 		sp.SetSyncDDLHook(nil) // only assert the first DDL
+		return nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -816,6 +819,56 @@ func TestStreamParser_syncDDLHookOrdering(t *testing.T) {
 	}
 	if evs[1].SchemaVersion != 99 {
 		t.Errorf("post-hook event SchemaVersion = %d, want 99 (the in-hook swap must land before the next decode)", evs[1].SchemaVersion)
+	}
+}
+
+// TestStreamParser_syncDDLHookErrorAbortsRun locks the #760 fail-loud fix: a
+// hook error must abort Run WITHOUT ever emitting the DDL event itself, and
+// before it decodes any event that follows the DDL in the binlog.
+//
+// Why withholding the DDL event matters (not just the rows after it): the
+// stream consumer (streamLoop) advances the durable checkpoint's
+// binlogPos/GTID off events it actually receives, including EventDDL, whose
+// own commit boundary the consumer treats as safe to persist. If the DDL
+// event were emitted before the hook's failure is known, the checkpoint
+// could advance past the DDL before Run aborts; a restart would then resume
+// AFTER the DDL, never re-read the QUERY_EVENT that carries it, never re-run
+// this hook, and silently skip the following rows forever against the same
+// stale resolver — turning "permanent silent loss" into "one crash, then
+// permanent silent loss again". Withholding ddlEv on hook failure keeps the
+// checkpoint at (or before) the DDL, so a restart re-reads it, retries the
+// snapshot, and only then decodes the rows that follow.
+func TestStreamParser_syncDDLHookErrorAbortsRun(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	sentinel := errors.New("snapshot: connection refused")
+	sp.SetSyncDDLHook(func(ev Event) error {
+		return sentinel
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel,
+		makeQueryEvent("CREATE TABLE mydb.orders (id INT)"),
+		makeRowsEvent("mydb", "orders"), // must never be decoded
+	)
+
+	err := sp.Run(ctx, streamer, out)
+	if err == nil {
+		t.Fatal("Run returned nil, want the wrapped hook error")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("Run error = %v, want it to wrap %v", err, sentinel)
+	}
+
+	close(out)
+	var evs []Event
+	for ev := range out {
+		evs = append(evs, ev)
+	}
+	if len(evs) != 0 {
+		t.Fatalf("out = %v, want NO events (the DDL itself, and the row event that followed, must never be emitted/decoded)", typesOf(evs))
 	}
 }
 

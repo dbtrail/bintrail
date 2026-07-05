@@ -1632,11 +1632,23 @@ func One(ctx context.Context, cfg Config) error {
 	// (`CREATE TABLE t; INSERT INTO t;`), so the resolver must be refreshed
 	// before the parser decodes the events that FOLLOW the DDL — a
 	// consumer-side handler ran too late and the trailing rows were skipped
-	// as "table not in snapshot" (#396). Best-effort: failures are logged and
-	// streaming continues with the previous schema.
+	// as "table not in snapshot" (#396).
 	// TRUNCATE does not change schema structure, so it only records the change.
+	//
+	// Fail-loud on snapshot/resolver failure (#760, same philosophy as the
+	// #652 flush fix): a stale resolver here means every row event that
+	// follows this DDL in the binlog gets silently skipped as "column count
+	// mismatch" / "table not in snapshot" while streamLoop's checkpoint keeps
+	// advancing past them — a permanent, unmarked loss, since the checkpoint
+	// never revisits those events. Returning an error aborts sp.Run BEFORE it
+	// even emits this DDL event (see SetSyncDDLHook — the hook now runs
+	// before the DDL is sent, not after), so streamLoop never observes it and
+	// the checkpoint stays exactly where it was before this DDL. The process
+	// exits non-zero; a supervisor restart resumes from there, re-reads this
+	// same DDL off the binlog, retries the snapshot, and only then decodes
+	// the rows that follow — with a fresh resolver.
 	schemas := cfg.Deps.ParseSchemaList(cfg.Schemas)
-	sp.SetSyncDDLHook(func(ev parser.Event) {
+	sp.SetSyncDDLHook(func(ev parser.Event) error {
 		if ev.DDLType == parser.DDLTruncateTable {
 			slog.Info("DDL detected (no snapshot needed)",
 				"file", ev.BinlogFile, "pos", ev.EndPos,
@@ -1644,7 +1656,7 @@ func One(ctx context.Context, cfg Config) error {
 			if err := cfg.Deps.InsertSchemaChange(indexDB, ev, nil); err != nil {
 				slog.Warn("failed to record schema change", "error", err)
 			}
-			return
+			return nil
 		}
 
 		slog.Info("DDL detected — taking auto-snapshot",
@@ -1652,27 +1664,34 @@ func One(ctx context.Context, cfg Config) error {
 			"ddl_type", ev.DDLType, "schema", ev.Schema, "table", ev.Table)
 
 		stats, snapErr := metadata.TakeSnapshot(sourceDB, indexDB, schemas)
-		var snapID *int
 		if snapErr != nil {
-			slog.Error("auto-snapshot after DDL failed; subsequent events may use stale schema",
-				"error", snapErr, "ddl_type", ev.DDLType, "table", ev.Table)
-		} else {
-			snapID = &stats.SnapshotID
-			newResolver, resolverErr := metadata.NewResolver(indexDB, stats.SnapshotID)
-			if resolverErr != nil {
-				slog.Warn("failed to load new resolver after DDL snapshot", "error", resolverErr)
-			} else {
-				sp.SwapResolver(newResolver)
-				slog.Info("auto-snapshot taken; resolver updated",
-					"snapshot_id", stats.SnapshotID,
-					"tables", stats.TableCount,
-					"columns", stats.ColumnCount)
+			// Best-effort history record of the attempt, then abort — see the
+			// fail-loud rationale above.
+			if err := cfg.Deps.InsertSchemaChange(indexDB, ev, nil); err != nil {
+				slog.Warn("failed to record schema change", "error", err)
 			}
+			return fmt.Errorf("auto-snapshot after DDL on %s.%s: %w", ev.Schema, ev.Table, snapErr)
 		}
+
+		snapID := &stats.SnapshotID
+		newResolver, resolverErr := metadata.NewResolver(indexDB, stats.SnapshotID)
+		if resolverErr != nil {
+			if err := cfg.Deps.InsertSchemaChange(indexDB, ev, snapID); err != nil {
+				slog.Warn("failed to record schema change", "error", err)
+			}
+			return fmt.Errorf("load resolver after DDL snapshot on %s.%s: %w", ev.Schema, ev.Table, resolverErr)
+		}
+
+		sp.SwapResolver(newResolver)
+		slog.Info("auto-snapshot taken; resolver updated",
+			"snapshot_id", stats.SnapshotID,
+			"tables", stats.TableCount,
+			"columns", stats.ColumnCount)
 
 		if err := cfg.Deps.InsertSchemaChange(indexDB, ev, snapID); err != nil {
 			slog.Warn("failed to record schema change", "error", err)
 		}
+		return nil
 	})
 
 	events := make(chan parser.Event, 1000)

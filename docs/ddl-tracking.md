@@ -26,13 +26,13 @@ When a DDL is detected, dbtrail automatically takes a new snapshot from the live
 
 ### Error handling
 
-DDL handling is best-effort — a snapshot failure never aborts the stream. If the snapshot fails (e.g., the source DB is temporarily unreachable), the DDL is still recorded in `schema_changes` but without a `snapshot_id`. The parser continues with the old resolver, which may produce column count mismatches until the next successful snapshot.
+A snapshot (or resolver-reload) failure **aborts the stream**. The DDL is still recorded in `schema_changes` before the abort, but without a `snapshot_id`.
 
-Failures are logged at `slog.Error` level so they're visible in production monitoring:
+This used to be best-effort: the failure was only logged, and the parser kept decoding with the old resolver. In practice that meant every row event that followed the DDL in the binlog — an unbounded burst of INSERT/UPDATE/DELETE on the altered/created table — was silently skipped as a "column count mismatch" / "table not in snapshot", while the stream checkpoint kept advancing past them. Once healthy schema tracking resumed, those events were already behind the checkpoint and could never be re-streamed: a permanent, unmarked loss.
 
-```
-ERROR DDL snapshot failed schema=mydb table=users error="connection refused"
-```
+Aborting instead means the process exits non-zero *before the DDL event itself is even emitted* to the indexer, so the durable checkpoint (which only advances off events it actually receives) stays exactly where it was *before* this DDL. A supervisor restart (`bintrail-console watch`'s monitor, or an external process manager for standalone `bintrail stream`) resumes from that checkpoint, re-reads the same DDL off the binlog, retries the snapshot, and only then decodes the rows that follow — against a fresh resolver. No gap, no silent skip.
+
+The abort surfaces as the process's error output — `bintrail stream` prints it to stderr and exits 1; under `bintrail-console watch` the monitor logs it and applies its crash-loop backoff before retrying — so it's visible in production monitoring either way.
 
 ---
 

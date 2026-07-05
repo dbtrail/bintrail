@@ -5,6 +5,7 @@ package parser
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -23,10 +24,11 @@ type StreamParser struct {
 	filters       Filters
 	logger        *slog.Logger
 	schemaVersion atomic.Uint32 // actual snapshot_id from schema_snapshots; updated by SwapResolver
-	// onDDL, when set, runs SYNCHRONOUSLY inside Run after a DDL event is
-	// emitted and before ANY subsequent binlog event is decoded. See
-	// SetSyncDDLHook for why this must not move off the parse path.
-	onDDL atomic.Pointer[func(Event)]
+	// onDDL, when set, runs SYNCHRONOUSLY inside Run for a DDL event, BEFORE
+	// that event is emitted and before ANY subsequent binlog event is
+	// decoded. See SetSyncDDLHook for why this must not move off the parse
+	// path, and why the ordering (hook, then emit) is load-bearing for #760.
+	onDDL atomic.Pointer[func(Event) error]
 }
 
 // NewStreamParser creates a StreamParser that resolves column names via
@@ -52,8 +54,9 @@ func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
 	sp.resolver.Store(r)
 }
 
-// SetSyncDDLHook registers fn to run synchronously inside Run, after each DDL
-// event is emitted and BEFORE any subsequent binlog event is decoded.
+// SetSyncDDLHook registers fn to run synchronously inside Run, for each DDL
+// event, BEFORE that event is emitted on out and BEFORE any subsequent
+// binlog event is decoded.
 //
 // This is the ONLY correct place for the auto-snapshot-on-DDL work (#396):
 // the binlog is sequential — `CREATE TABLE t; INSERT INTO t;` puts the row
@@ -65,10 +68,25 @@ func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
 // snapshot and calls SwapResolver, so the very next row event decodes with
 // the post-DDL schema.
 //
+// fn returning a non-nil error aborts Run immediately, WITHOUT ever emitting
+// the DDL event (#760): if the post-DDL snapshot/resolver refresh failed, the
+// resolver is stale and every row event that follows this DDL in the binlog
+// would otherwise be silently skipped as "column count mismatch" / "table
+// not in snapshot" while the stream checkpoint keeps advancing past them — a
+// permanent, unmarked loss. The checkpoint (in this package's consumers)
+// advances off events it actually receives, including the DDL event itself;
+// withholding that event on hook failure means the checkpoint stays exactly
+// where it was BEFORE this DDL. A supervisor restart then resumes from
+// there, re-reads the same DDL off the binlog, re-runs this hook (retrying
+// the snapshot), and only then decodes the rows that follow — with a fresh
+// resolver. Emitting the DDL event first and running fn after would let the
+// checkpoint advance past the DDL before a failure is even known, defeating
+// the retry.
+//
 // While fn runs, no new events are produced (the replication connection
 // buffers server-side); consumers keep draining already-emitted events.
 // Safe to call concurrently with Run.
-func (sp *StreamParser) SetSyncDDLHook(fn func(Event)) {
+func (sp *StreamParser) SetSyncDDLHook(fn func(Event) error) {
 	if fn == nil {
 		sp.onDDL.Store(nil)
 		return
@@ -206,16 +224,29 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			currentQueryText = ""
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
 			if ddlEv, ok := parseDDL(sp.logger, currentFile, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), sp.schemaVersion.Load()); ok {
+				// Synchronous DDL hook runs BEFORE ddlEv is emitted (#760,
+				// reordered from emit-then-hook). The consumer (streamLoop)
+				// advances the durable checkpoint's binlogPos/GTID off events
+				// it receives, including EventDDL itself — so if ddlEv were
+				// emitted first and the hook then failed, the checkpoint
+				// would already have moved past this DDL by the time Run
+				// aborts. A restart would resume AFTER the DDL, never
+				// re-read the QUERY_EVENT that carries it, and never re-fire
+				// this hook — leaving the resolver stale forever while rows
+				// keep getting silently skipped as "column count mismatch".
+				// Running the hook first and returning its error WITHOUT
+				// ever sending ddlEv means a failure leaves the checkpoint
+				// exactly where it was before this DDL; a restart re-reads
+				// the DDL from the binlog and retries the snapshot.
+				if hook := sp.onDDL.Load(); hook != nil {
+					if err := (*hook)(ddlEv); err != nil {
+						return fmt.Errorf("sync DDL hook: %w", err)
+					}
+				}
 				select {
 				case out <- ddlEv:
 				case <-ctx.Done():
 					return ctx.Err()
-				}
-				// Synchronous DDL hook: the resolver refresh must complete
-				// before the next event is processed, or the rows that follow a
-				// CREATE/ALTER in the binlog are skipped as unknown (#396).
-				if hook := sp.onDDL.Load(); hook != nil {
-					(*hook)(ddlEv)
 				}
 				// Table DDL auto-commits its own GTID; EventDDL is the commit
 				// boundary the consumer acts on, so clear the in-flight GTID to keep
