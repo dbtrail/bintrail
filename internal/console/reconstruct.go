@@ -256,7 +256,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// 1. Locate the baseline at-or-before `at` and read the row's initial state.
-	path, snapshotTime, stale, err := reconstruct.FindBaseline(ctx, b.baselineSrc, schema, table, atTime)
+	path, snapshotTime, stale, err := b.findBaseline(ctx, schema, table, atTime)
 	if err != nil {
 		if errors.Is(err, reconstruct.ErrNoBaseline) {
 			writeJSONError(w, http.StatusNotFound,

@@ -97,6 +97,13 @@ type TableReport struct {
 	DeletesSkipped int64 // baseline rows whose PK matched a DELETE event
 	Files          []string
 	Duration       time.Duration
+	// BinlogOnly is true when the table had no baseline at all and was
+	// recovered entirely from the binlog (#766's ErrNoBaseline fallback,
+	// reconstructBinlogOnly). Files is non-empty in this case too, so
+	// ReconstructTables' shared-metadata-file selector must check this flag
+	// as well — a binlog-only report has no baseline GTID/binlog coordinates
+	// to embed in the metadata file.
+	BinlogOnly bool
 }
 
 // shouldWarnEvents reports whether a fetched event count should trigger the
@@ -242,11 +249,13 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	// the metadata file will reflect the first one and the rest will log
 	// a warning in ReconstructTable itself.
 	if len(reports) > 0 {
-		// Pick the first report that actually produced output files (skip
-		// tables that had no baseline and returned an empty report).
+		// Pick the first report that actually produced output files from a
+		// real baseline (skip tables that had no baseline: an empty report,
+		// or a #766 binlog-only report — neither has baseline GTID/binlog
+		// coordinates to embed in the metadata file).
 		var metaReport *TableReport
 		for _, r := range reports {
-			if len(r.Files) > 0 {
+			if len(r.Files) > 0 && !r.BinlogOnly {
 				metaReport = r
 				break
 			}
@@ -270,7 +279,7 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 					"table", tableName, "error", perr)
 			}
 		} else {
-			slog.Warn("all reconstructed tables were empty; metadata file not written")
+			slog.Warn("no reconstructed table has a real baseline (all empty or binlog-only); metadata file not written")
 		}
 	}
 
@@ -310,12 +319,11 @@ func ReconstructTable(
 		// No baseline exists for this table. This can happen when: (1) the
 		// table was empty at dump time and the baseline predates 0-row
 		// Parquet support, or (2) the table was created after the last
-		// baseline snapshot. Treat as empty rather than failing the entire
-		// reconstruct run.
-		slog.Warn("no baseline found; treating table as empty at dump time",
-			"schema", schema, "table", table)
-		rep.Duration = time.Since(start)
-		return rep, nil
+		// baseline snapshot. Case (2) can hold real binlog-only rows (#766),
+		// so fall back to a binlog-only reconstruction instead of silently
+		// emitting an empty report — parity with the shim's _snapshot→
+		// _flashback degrade (internal/shim/snapshot.go runSnapshotFullTable).
+		return reconstructBinlogOnly(ctx, cfg, schema, table, db, engine, resolver, dbName, rep, start)
 	}
 	slog.Debug("baseline selected",
 		"schema", schema, "table", table,
@@ -818,6 +826,220 @@ func checkChangesToast(changes map[string]*query.ResultRow) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// reconstructBinlogOnly is the ErrNoBaseline fallback for full-table
+// reconstruct (#766). A table created after the last baseline snapshot has no
+// Parquet to merge against; previously ReconstructTable stopped there and
+// returned an empty report, silently discarding every row that only ever
+// existed in the binlog — even a table with thousands of rows. This mirrors
+// the shim's binlog-only degrade (internal/shim/snapshot.go
+// runSnapshotFullTable falling back to runFullTable): fetch every event for
+// the table up to cfg.At and emit the latest surviving row per PK, skipping
+// DELETEs. There is no baseline Parquet to read a CREATE TABLE statement
+// from, and fabricating one from schema_snapshots column metadata risks
+// silently shipping a wrong PK/engine/charset/index definition as fact — so
+// the schema file records why it's missing instead, and the caller must
+// supply the table structure before loading the accompanying data file(s).
+func reconstructBinlogOnly(
+	ctx context.Context,
+	cfg FullTableConfig,
+	schema, table string,
+	db *sql.DB,
+	engine *query.Engine,
+	resolver *metadata.Resolver,
+	dbName string,
+	rep *TableReport,
+	start time.Time,
+) (*TableReport, error) {
+	tm, err := resolver.Resolve(schema, table)
+	if err != nil {
+		return nil, fmt.Errorf("resolve schema for %s.%s: %w; run `bintrail snapshot` to refresh", schema, table, err)
+	}
+	if len(tm.PKColumnMetas()) == 0 {
+		return nil, fmt.Errorf("%s.%s has no primary key in the loaded snapshot; full-table reconstruct requires a PK", schema, table)
+	}
+
+	// Generated columns can't be set explicitly in an INSERT, so exclude them
+	// from the emitted schema — same exclusion `bintrail baseline` applies.
+	colNames := make([]string, 0, len(tm.Columns))
+	for _, c := range tm.Columns {
+		if c.IsGenerated {
+			continue
+		}
+		colNames = append(colNames, c.Name)
+	}
+	if len(colNames) == 0 {
+		return nil, fmt.Errorf("%s.%s has no non-generated columns in the loaded snapshot", schema, table)
+	}
+
+	fetcher := cfg.ArchiveFetcher
+	if fetcher == nil {
+		fetcher = parquetquery.Fetch
+	}
+	events, _, err := query.FetchMerged(ctx, db, engine, query.FetchMergedOptions{
+		Opts: query.Options{
+			Schema: schema,
+			Table:  table,
+			Until:  &cfg.At,
+			// No Since — there is no baseline instant to anchor from; fetch
+			// the whole retained binlog-only window up to cfg.At.
+		},
+		DBName:         dbName,
+		NoArchive:      false,
+		AllowGaps:      cfg.AllowGaps,
+		ArchiveFetcher: fetcher,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fetch events: %w", err)
+	}
+	rep.EventsApplied = int64(len(events))
+	maybeWarnEventVolume(schema, table, len(events), cfg.WarnEventThreshold)
+
+	MapEventEnumLabels(db, resolver, schema, table, events)
+	DecodeEventBinaries(db, schema, table, events)
+
+	// Latest event per PK; events is already sorted by (event_timestamp,
+	// event_id) via query.MergeResults, so the last write wins naturally.
+	changes := make(map[string]*query.ResultRow, len(events))
+	for i := range events {
+		changes[events[i].PKValues] = &events[i]
+	}
+
+	// A table that only ever existed after the last baseline was very likely
+	// CREATEd during the retained binlog window, and the schema-drift guard
+	// (#700) records every CREATE TABLE's exact DDL text in schema_changes.
+	// Prefer that real, captured statement over a fabricated one; only fall
+	// back to the explanatory placeholder when no such record exists (e.g.
+	// the table predates schema_changes, or genuinely was never baselined
+	// for another reason).
+	createSQL, ddlFound, err := findCapturedCreateTableDDL(ctx, db, schema, table, cfg.At)
+	if err != nil {
+		slog.Warn("could not query schema_changes for a captured CREATE TABLE; using placeholder schema file",
+			"schema", schema, "table", table, "error", err)
+	}
+	if ddlFound {
+		// The captured DDL is from CREATE time; it does not reflect any ALTER
+		// applied later, up to cfg.At (that class of point-in-time schema
+		// drift is the separately-tracked #600/#601/#602 family). Label it so
+		// a reader doesn't mistake it for a verified-current definition.
+		createSQL = "-- bintrail: CREATE TABLE captured from schema_changes at table-creation time\n" +
+			"-- (binlog-only fallback, #766). If the table was ALTERed afterwards, this may\n" +
+			"-- not match the columns in the accompanying data file(s) — verify before loading.\n" +
+			createSQL
+	} else {
+		createSQL = binlogOnlySchemaPlaceholder(schema, table)
+	}
+
+	rep.BinlogOnly = true
+	if err := writeBinlogOnlyChanges(cfg.OutputDir, schema, table, colNames, cfg.ChunkSize, createSQL, changes, rep); err != nil {
+		return nil, err
+	}
+	rep.Duration = time.Since(start)
+
+	slog.Warn("full-table reconstruct: no baseline found for table; recovered via binlog-only fallback "+
+		"(rows outside the retained binlog window, if any, are not included)",
+		"schema", schema, "table", table,
+		"events_applied", rep.EventsApplied,
+		"inserts_emitted", rep.InsertsEmitted,
+		"deletes_skipped", rep.DeletesSkipped)
+
+	return rep, nil
+}
+
+// binlogOnlySchemaPlaceholder is the schema-file text used when no captured
+// CREATE TABLE DDL is available: fabricating one from column metadata risks
+// silently shipping a wrong PK/engine/charset/index definition as fact.
+func binlogOnlySchemaPlaceholder(schema, table string) string {
+	return fmt.Sprintf(
+		"-- bintrail: no baseline snapshot exists for %s.%s (table created after the last\n"+
+			"-- `bintrail baseline` run, or never baselined), and no CREATE TABLE statement for\n"+
+			"-- it was found in schema_changes either. The rows in the accompanying data\n"+
+			"-- file(s) were recovered entirely from the binlog (binlog-only fallback, #766);\n"+
+			"-- the table structure is deliberately NOT fabricated here. Create the table\n"+
+			"-- structure yourself before loading the data file(s).\n",
+		schema, table)
+}
+
+// findCapturedCreateTableDDL looks up the most recent CREATE TABLE statement
+// the schema-drift guard (#700) recorded for schema.table at-or-before at, in
+// schema_changes.ddl_query. found is false (with a nil error) when no such
+// row exists — the caller falls back to binlogOnlySchemaPlaceholder.
+func findCapturedCreateTableDDL(ctx context.Context, db *sql.DB, schema, table string, at time.Time) (ddl string, found bool, err error) {
+	row := db.QueryRowContext(ctx, `
+		SELECT ddl_query FROM schema_changes
+		WHERE schema_name = ? AND table_name = ? AND ddl_type = ? AND detected_at <= ?
+		ORDER BY detected_at DESC, id DESC
+		LIMIT 1`,
+		schema, table, event.DDLCreateTable, at)
+	if err := row.Scan(&ddl); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return ddl, true, nil
+}
+
+// writeBinlogOnlyChanges writes the reconstructBinlogOnly output: a schema
+// file (createSQL — either a real captured CREATE TABLE or the explanatory
+// placeholder, decided by the caller) and one data row per surviving entry in
+// changes, in deterministic PK order. Updates rep.InsertsEmitted/
+// DeletesSkipped/Files in place. Split out from reconstructBinlogOnly so it's
+// unit-testable without a MySQL index connection (it does no IO beyond
+// outputDir).
+func writeBinlogOnlyChanges(
+	outputDir, schema, table string,
+	colNames []string,
+	chunkSize int64,
+	createSQL string,
+	changes map[string]*query.ResultRow,
+	rep *TableReport,
+) error {
+	if err := checkChangesToast(changes); err != nil {
+		return err
+	}
+
+	mw, err := NewMydumperWriter(outputDir, schema, table, colNames, chunkSize)
+	if err != nil {
+		return fmt.Errorf("open mydumper writer: %w", err)
+	}
+	defer func() { _ = mw.Close() }() // no-op after the explicit Close below on the happy path
+
+	if err := mw.WriteSchema(createSQL); err != nil {
+		return err
+	}
+
+	// Deterministic order: sort by PK string so tests can assert on output
+	// without flakiness (mirrors the "new PKs" tail loop in mergeBaselineImages).
+	pks := make([]string, 0, len(changes))
+	for pk := range changes {
+		pks = append(pks, pk)
+	}
+	sort.Strings(pks)
+	for _, pk := range pks {
+		ev := changes[pk]
+		if ev.EventType == event.EventDelete {
+			rep.DeletesSkipped++
+			continue
+		}
+		if ev.RowAfter == nil {
+			slog.Error("event has nil RowAfter; skipping to avoid emitting all-NULL tuple",
+				"schema", schema, "table", table, "pk", pk,
+				"event_type", ev.EventType, "event_id", ev.EventID)
+			continue
+		}
+		if err := mw.WriteRow(rowAfterOrdered(ev.RowAfter, colNames, schema, table)); err != nil {
+			return err
+		}
+		rep.InsertsEmitted++
+	}
+
+	if err := mw.Close(); err != nil {
+		return fmt.Errorf("close mydumper writer: %w", err)
+	}
+	rep.Files = mw.Files()
 	return nil
 }
 

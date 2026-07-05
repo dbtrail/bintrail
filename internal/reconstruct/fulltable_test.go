@@ -2,10 +2,14 @@ package reconstruct
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/event"
@@ -530,10 +534,10 @@ func TestMergeBaseline_mixedAllEventTypes(t *testing.T) {
 // TestSplitSchemaTable covers the pure helper for parsing --tables entries.
 func TestSplitSchemaTable(t *testing.T) {
 	cases := []struct {
-		in      string
-		ok      bool
-		schema  string
-		table   string
+		in     string
+		ok     bool
+		schema string
+		table  string
 	}{
 		{"mydb.orders", true, "mydb", "orders"},
 		{"schema_with_underscore.table_name", true, "schema_with_underscore", "table_name"},
@@ -553,6 +557,167 @@ func TestSplitSchemaTable(t *testing.T) {
 			t.Errorf("splitSchemaTable(%q) = (%q, %q), want (%q, %q)",
 				c.in, s, tbl, c.schema, c.table)
 		}
+	}
+}
+
+// TestWriteBinlogOnlyChanges_insertsSkipsDeletes covers the #766 ErrNoBaseline
+// fallback core: with no baseline at all, every surviving (non-DELETE)
+// change is emitted as a row, in deterministic PK order, and the schema file
+// carries an explanatory placeholder instead of a fabricated CREATE TABLE.
+func TestWriteBinlogOnlyChanges_insertsSkipsDeletes(t *testing.T) {
+	outDir := t.TempDir()
+	colNames := []string{"id", "status"}
+
+	changes := map[string]*query.ResultRow{
+		pkStrForInt(1): {
+			EventType: parser.EventInsert,
+			PKValues:  pkStrForInt(1),
+			RowAfter:  map[string]any{"id": float64(1), "status": "binlog-only-1"},
+		},
+		pkStrForInt(2): {
+			EventType: parser.EventDelete,
+			PKValues:  pkStrForInt(2),
+			RowBefore: map[string]any{"id": float64(2), "status": "deleted"},
+		},
+		pkStrForInt(3): {
+			EventType: parser.EventUpdate,
+			PKValues:  pkStrForInt(3),
+			RowAfter:  map[string]any{"id": float64(3), "status": "binlog-only-3"},
+		},
+	}
+
+	rep := &TableReport{Schema: "mydb", Table: "orders"}
+	if err := writeBinlogOnlyChanges(outDir, "mydb", "orders", colNames, 0,
+		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, rep); err != nil {
+		t.Fatalf("writeBinlogOnlyChanges: %v", err)
+	}
+
+	if rep.InsertsEmitted != 2 {
+		t.Errorf("InsertsEmitted = %d, want 2", rep.InsertsEmitted)
+	}
+	if rep.DeletesSkipped != 1 {
+		t.Errorf("DeletesSkipped = %d, want 1", rep.DeletesSkipped)
+	}
+	if rep.BaselineRows != 0 || rep.UpdatesApplied != 0 {
+		t.Errorf("unexpected non-zero baseline/update counters: %+v", rep)
+	}
+	if len(rep.Files) == 0 {
+		t.Fatal("rep.Files is empty; expected at least the schema + one data chunk")
+	}
+
+	chunk := mustReadOnlyChunk(t, outDir)
+	if !strings.Contains(chunk, "(1, 'binlog-only-1')") || !strings.Contains(chunk, "(3, 'binlog-only-3')") {
+		t.Errorf("chunk missing surviving rows:\n%s", chunk)
+	}
+	if strings.Contains(chunk, "(2,") {
+		t.Errorf("chunk contains deleted row (id=2):\n%s", chunk)
+	}
+
+	schemaPath := filepath.Join(outDir, "mydb.orders-schema.sql")
+	b, err := os.ReadFile(schemaPath)
+	if err != nil {
+		t.Fatalf("read schema file: %v", err)
+	}
+	if !strings.Contains(string(b), "no baseline snapshot exists") || !strings.Contains(string(b), "#766") {
+		t.Errorf("schema file placeholder missing expected explanation:\n%s", b)
+	}
+}
+
+// TestWriteBinlogOnlyChanges_nilRowAfterSkipped verifies a corrupted event
+// (nil RowAfter on a non-DELETE) is dropped rather than emitting an all-NULL
+// row, mirroring mergeBaselineImages' own defensive skip.
+func TestWriteBinlogOnlyChanges_nilRowAfterSkipped(t *testing.T) {
+	outDir := t.TempDir()
+	colNames := []string{"id", "status"}
+
+	changes := map[string]*query.ResultRow{
+		pkStrForInt(1): {
+			EventType: parser.EventInsert,
+			PKValues:  pkStrForInt(1),
+			RowAfter:  nil,
+		},
+	}
+
+	rep := &TableReport{Schema: "mydb", Table: "orders"}
+	if err := writeBinlogOnlyChanges(outDir, "mydb", "orders", colNames, 0,
+		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, rep); err != nil {
+		t.Fatalf("writeBinlogOnlyChanges: %v", err)
+	}
+	if rep.InsertsEmitted != 0 {
+		t.Errorf("InsertsEmitted = %d, want 0 (nil RowAfter must be skipped)", rep.InsertsEmitted)
+	}
+}
+
+// TestFindCapturedCreateTableDDL_found verifies the happy path: a captured
+// CREATE TABLE row in schema_changes is returned verbatim.
+func TestFindCapturedCreateTableDDL_found(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	at := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	mock.ExpectQuery("SELECT ddl_query FROM schema_changes").
+		WithArgs("mydb", "orders", string(event.DDLCreateTable), at).
+		WillReturnRows(sqlmock.NewRows([]string{"ddl_query"}).
+			AddRow("CREATE TABLE `orders` (`id` int NOT NULL, PRIMARY KEY (`id`))"))
+
+	ddl, found, err := findCapturedCreateTableDDL(context.Background(), db, "mydb", "orders", at)
+	if err != nil {
+		t.Fatalf("findCapturedCreateTableDDL: %v", err)
+	}
+	if !found {
+		t.Fatal("found = false, want true")
+	}
+	if !strings.Contains(ddl, "CREATE TABLE `orders`") {
+		t.Errorf("ddl = %q, want the captured CREATE TABLE text", ddl)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestFindCapturedCreateTableDDL_notFound verifies that no matching row
+// (sql.ErrNoRows) reports found=false with a nil error, so the caller falls
+// back to the placeholder rather than treating "never captured" as a fault.
+func TestFindCapturedCreateTableDDL_notFound(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT ddl_query FROM schema_changes").
+		WillReturnRows(sqlmock.NewRows([]string{"ddl_query"}))
+
+	ddl, found, err := findCapturedCreateTableDDL(context.Background(), db, "mydb", "orders", time.Now())
+	if err != nil {
+		t.Fatalf("findCapturedCreateTableDDL: %v", err)
+	}
+	if found {
+		t.Errorf("found = true, want false; ddl = %q", ddl)
+	}
+}
+
+// TestFindCapturedCreateTableDDL_realErrorSurfaces verifies a genuine query
+// failure (not just "no rows") is returned to the caller, not swallowed.
+func TestFindCapturedCreateTableDDL_realErrorSurfaces(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	forcedErr := errors.New("connection reset")
+	mock.ExpectQuery("SELECT ddl_query FROM schema_changes").WillReturnError(forcedErr)
+
+	_, found, err := findCapturedCreateTableDDL(context.Background(), db, "mydb", "orders", time.Now())
+	if err == nil {
+		t.Fatal("expected the underlying query error to surface")
+	}
+	if found {
+		t.Error("found = true on a real error, want false")
 	}
 }
 

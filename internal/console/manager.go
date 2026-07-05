@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 // errNoServers is returned when a request arrives with no selectable server:
@@ -34,6 +36,13 @@ type bundle struct {
 	// baselineSrc is the resolved reconstruct baseline source (local dir wins
 	// over s3:// prefix); empty when reconstruct is not configured.
 	baselineSrc string
+	// baselineFallbackSrc is the S3 prefix to retry on ErrNoBaseline when a
+	// local dir was preferred as baselineSrc AND an S3 prefix is also
+	// configured; empty otherwise. Local baselines can be pruned by retention
+	// (#616) while a durable S3 copy remains — without this, a request for a
+	// table/time only covered by the S3 copy silently degraded to "no
+	// baseline" instead of finding it (#766).
+	baselineFallbackSrc string
 	// baselineConfigured gates the reconstruct surface per server: a baseline
 	// is present AND archives are enabled AND no RBAC profile is active. See
 	// the rationale on newBundleDerived.
@@ -224,17 +233,33 @@ func (cm *connManager) buildBundle(entry ServerEntry) (*bundle, error) {
 func newBundleDerived(db *sql.DB, dbName string, entry ServerEntry, profileActive bool) *bundle {
 	noArchive := entry.NoArchive || profileActive
 	src := entry.BaselineDir
+	fallback := ""
 	if src == "" {
 		src = entry.BaselineS3
+	} else if entry.BaselineS3 != "" {
+		fallback = entry.BaselineS3
 	}
 	return &bundle{
-		db:                 db,
-		dbName:             dbName,
-		engine:             query.New(db),
-		noArchive:          noArchive,
-		baselineSrc:        src,
-		baselineConfigured: src != "" && !noArchive,
+		db:                  db,
+		dbName:              dbName,
+		engine:              query.New(db),
+		noArchive:           noArchive,
+		baselineSrc:         src,
+		baselineFallbackSrc: fallback,
+		baselineConfigured:  src != "" && !noArchive,
 	}
+}
+
+// findBaseline locates a baseline for schema.table at-or-before at via
+// b.baselineSrc, falling back to b.baselineFallbackSrc (the durable S3 copy,
+// when both a local dir and an S3 prefix are configured) on ErrNoBaseline —
+// see the baselineFallbackSrc field doc (#766).
+func (b *bundle) findBaseline(ctx context.Context, schema, table string, at time.Time) (string, time.Time, reconstruct.StaleWarning, error) {
+	path, snapshotTime, stale, err := reconstruct.FindBaseline(ctx, b.baselineSrc, schema, table, at)
+	if b.baselineFallbackSrc == "" || !errors.Is(err, reconstruct.ErrNoBaseline) {
+		return path, snapshotTime, stale, err
+	}
+	return reconstruct.FindBaseline(ctx, b.baselineFallbackSrc, schema, table, at)
 }
 
 // loadResolver loads the latest schema snapshot, best-effort: a missing
