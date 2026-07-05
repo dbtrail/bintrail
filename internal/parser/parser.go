@@ -122,6 +122,13 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	var currentQueryText string
 
 	bp := replication.NewBinlogParser()
+	// Pin TIMESTAMP-column string rendering to UTC. go-mysql's default (nil
+	// location) formats fracTime.String() using the raw time.Unix(...) value,
+	// whose Location is the process's time.Local — leaking host-local wall
+	// clock into stored data even though DATETIME (decoded separately, always
+	// time.UTC) and the rest of the system (verify, shim, reconstruct) assume
+	// UTC at rest (#757).
+	bp.SetTimestampStringLocation(time.UTC)
 
 	// handleEvent processes one binlog event. It is recursive: with
 	// binlog_transaction_compression=ON the source wraps each transaction's

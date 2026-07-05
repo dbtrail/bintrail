@@ -1,0 +1,355 @@
+package baseline
+
+import (
+	"context"
+	"database/sql"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver — exercises the real read path
+)
+
+// TestParseSchemaExcludesGeneratedColumn pins the issue #767 fix at the source:
+// ParseSchema must drop STORED and VIRTUAL generated columns from the returned
+// column list entirely, because mydumper/mysqldump never emit their values in
+// the INSERT column-list or VALUES tuples. Before the fix, ParseSchema kept
+// them, so every column declared after a generated one was mapped to the
+// wrong positional slot in WriteRow.
+func TestParseSchemaExcludesGeneratedColumn(t *testing.T) {
+	const schema = "CREATE TABLE `orders` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `price` decimal(10,2) NOT NULL,\n" +
+		"  `total` decimal(10,2) GENERATED ALWAYS AS (`price` * 2) STORED,\n" +
+		"  `full_name` varchar(101) GENERATED ALWAYS AS (concat(`price`,`note`)) VIRTUAL,\n" +
+		"  `note` varchar(64) DEFAULT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB;\n"
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.orders-schema.sql")
+	if err := os.WriteFile(path, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cols, err := ParseSchema(path)
+	if err != nil {
+		t.Fatalf("ParseSchema: %v", err)
+	}
+
+	wantNames := []string{"id", "price", "note"}
+	if len(cols) != len(wantNames) {
+		t.Fatalf("got %d columns %v, want %d (%v) — generated columns must be excluded",
+			len(cols), colNames(cols), len(wantNames), wantNames)
+	}
+	for i, name := range wantNames {
+		if cols[i].Name != name {
+			t.Errorf("col[%d].Name = %q, want %q", i, cols[i].Name, name)
+		}
+	}
+}
+
+// TestParseSchemaExcludesGeneratedColumnMariaDBForm pins detection of
+// MariaDB's shorter accepted generated-column syntax — "AS (expr) PERSISTENT"
+// without the "GENERATED ALWAYS" prefix MySQL always emits — so a MariaDB
+// source's schema dump doesn't slip past generatedRe and reintroduce the
+// #767 shift for MariaDB users.
+func TestParseSchemaExcludesGeneratedColumnMariaDBForm(t *testing.T) {
+	const schema = "CREATE TABLE `orders` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `price` decimal(10,2) NOT NULL,\n" +
+		"  `total` decimal(10,2) AS (`price` * 2) PERSISTENT,\n" +
+		"  `note` varchar(64) DEFAULT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB;\n"
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.orders-schema.sql")
+	if err := os.WriteFile(path, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cols, err := ParseSchema(path)
+	if err != nil {
+		t.Fatalf("ParseSchema: %v", err)
+	}
+
+	wantNames := []string{"id", "price", "note"}
+	if len(cols) != len(wantNames) {
+		t.Fatalf("got %d columns %v, want %d (%v) — MariaDB-form generated column must be excluded",
+			len(cols), colNames(cols), len(wantNames), wantNames)
+	}
+	for i, name := range wantNames {
+		if cols[i].Name != name {
+			t.Errorf("col[%d].Name = %q, want %q", i, cols[i].Name, name)
+		}
+	}
+}
+
+func colNames(cols []Column) []string {
+	names := make([]string, len(cols))
+	for i, c := range cols {
+		names[i] = c.Name
+	}
+	return names
+}
+
+// TestProcessTableGeneratedColumnMiddle is the end-to-end arbiter for issue
+// #767: a table with a GENERATED STORED column sandwiched between two ordinary
+// columns must not shift the trailing column's value into the generated
+// column's old slot (or NULL it out). It drives the real production path
+// (processTable → ParseSchema + ReadSQLFile + WriteRow) with a mydumper-style
+// schema + data file pair, matching real dump output: the INSERT carries an
+// explicit column-list that already omits `total`.
+func TestProcessTableGeneratedColumnMiddle(t *testing.T) {
+	const schema = "CREATE TABLE `orders` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `price` decimal(10,2) NOT NULL,\n" +
+		"  `total` decimal(10,2) GENERATED ALWAYS AS (`price` * 2) STORED,\n" +
+		"  `note` varchar(64) DEFAULT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB;\n"
+	const data = "INSERT INTO `orders` (`id`,`price`,`note`) VALUES(1,10.50,'hello');\n"
+
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "shop.orders-schema.sql")
+	dataPath := filepath.Join(dir, "shop.orders.00000.sql")
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dataPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tf := TableFiles{
+		Database:   "shop",
+		Table:      "orders",
+		SchemaFile: schemaPath,
+		DataFiles:  []string{dataPath},
+		Format:     "sql",
+	}
+	outPath := filepath.Join(dir, "orders.parquet")
+	rowCount, err := processTable(context.Background(), tf, outPath, WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatalf("processTable: %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("rowCount = %d, want 1", rowCount)
+	}
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	safePath := strings.ReplaceAll(outPath, "'", "''")
+	var id int64
+	var price float64
+	var note any
+	row := db.QueryRowContext(context.Background(),
+		"SELECT id, price, note FROM parquet_scan('"+safePath+"')")
+	if err := row.Scan(&id, &price, &note); err != nil {
+		t.Fatalf("scan parquet_scan row: %v", err)
+	}
+
+	if id != 1 {
+		t.Errorf("id = %d, want 1", id)
+	}
+	if price != 10.50 {
+		t.Errorf("price = %v, want 10.50", price)
+	}
+	// The load-bearing assertion: before the fix, `note`'s value ("hello")
+	// landed in `total`'s Parquet slot (or an incompatible type caused a
+	// conversion error) and `note` itself read back NULL.
+	noteStr, ok := note.(string)
+	if !ok {
+		t.Fatalf("note scanned as %T (%v), want string %q — value likely shifted or lost", note, note, "hello")
+	}
+	if noteStr != "hello" {
+		t.Errorf("note = %q, want %q", noteStr, "hello")
+	}
+
+	// The Parquet schema itself must not carry a `total` column — it was never
+	// dumped, so there is no data to store for it.
+	rows, err := db.QueryContext(context.Background(), "DESCRIBE SELECT * FROM parquet_scan('"+safePath+"')")
+	if err != nil {
+		t.Fatalf("describe parquet_scan: %v", err)
+	}
+	defer rows.Close()
+	var gotCols []string
+	for rows.Next() {
+		var colName, colType string
+		var rest any
+		// DuckDB's DESCRIBE returns 6 columns; only the first (name) matters here.
+		dest := []any{&colName, &colType, &rest, &rest, &rest, &rest}
+		if err := rows.Scan(dest...); err != nil {
+			t.Fatalf("scan describe row: %v", err)
+		}
+		gotCols = append(gotCols, colName)
+	}
+	for _, c := range gotCols {
+		if c == "total" {
+			t.Errorf("Parquet schema contains %q, want it excluded (generated column)", gotCols)
+		}
+	}
+}
+
+// TestProcessTableGeneratedColumnMiddleTabFormat mirrors
+// TestProcessTableGeneratedColumnMiddle for mydumper's tab (--load-data)
+// output format, locking in that the same ParseSchema fix — the only place
+// the fix lives, shared by both readers — keeps the tab-format pipeline
+// aligned too.
+func TestProcessTableGeneratedColumnMiddleTabFormat(t *testing.T) {
+	const schema = "CREATE TABLE `orders` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `price` decimal(10,2) NOT NULL,\n" +
+		"  `total` decimal(10,2) GENERATED ALWAYS AS (`price` * 2) STORED,\n" +
+		"  `note` varchar(64) DEFAULT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB;\n"
+	const data = "1\t10.50\thello\n"
+
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "shop.orders-schema.sql")
+	dataPath := filepath.Join(dir, "shop.orders.00000.dat")
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dataPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tf := TableFiles{
+		Database:   "shop",
+		Table:      "orders",
+		SchemaFile: schemaPath,
+		DataFiles:  []string{dataPath},
+		Format:     "tab",
+	}
+	outPath := filepath.Join(dir, "orders_tab.parquet")
+	rowCount, err := processTable(context.Background(), tf, outPath, WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatalf("processTable: %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("rowCount = %d, want 1", rowCount)
+	}
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	safePath := strings.ReplaceAll(outPath, "'", "''")
+	var note any
+	row := db.QueryRowContext(context.Background(),
+		"SELECT note FROM parquet_scan('"+safePath+"')")
+	if err := row.Scan(&note); err != nil {
+		t.Fatalf("scan parquet_scan row: %v", err)
+	}
+	noteStr, ok := note.(string)
+	if !ok || noteStr != "hello" {
+		t.Errorf("note = %v (%T), want %q", note, note, "hello")
+	}
+}
+
+// TestProcessTableRowColumnCountMismatchFailsLoud pins the arity defense-in-
+// depth added alongside the #767 fix: if a row's value count ever disagrees
+// with the schema's column count — e.g. because a future DDL shape slips past
+// generatedRe — processTable must fail loud rather than let WriteRow silently
+// NULL-pad or shift the mismatch.
+func TestProcessTableRowColumnCountMismatchFailsLoud(t *testing.T) {
+	const schema = "CREATE TABLE `orders` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `price` decimal(10,2) NOT NULL,\n" +
+		"  `note` varchar(64) DEFAULT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB;\n"
+	// Only two values for a three-column schema.
+	const data = "INSERT INTO `orders` (`id`,`price`) VALUES(1,10.50);\n"
+
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "shop.orders-schema.sql")
+	dataPath := filepath.Join(dir, "shop.orders.00000.sql")
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dataPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tf := TableFiles{
+		Database:   "shop",
+		Table:      "orders",
+		SchemaFile: schemaPath,
+		DataFiles:  []string{dataPath},
+		Format:     "sql",
+	}
+	outPath := filepath.Join(dir, "orders.parquet")
+	_, err := processTable(context.Background(), tf, outPath, WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err == nil {
+		t.Fatal("processTable with a row/schema column-count mismatch: got nil error, want loud failure")
+	}
+	for _, want := range []string{"2", "3", "orders"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+// TestProcessTableCommentFalsePositiveFailsLoud pins the accepted trade-off
+// documented on generatedRe (schema.go): a COMMENT string that happens to
+// contain "as (...) stored" wrongly drops a real, dumped column from the
+// schema's column list. This must never re-corrupt data the way the original
+// #767 bug did — it must instead trip the arity check and fail loud, because
+// the dump's actual value count no longer matches the (wrongly shortened)
+// column list.
+func TestProcessTableCommentFalsePositiveFailsLoud(t *testing.T) {
+	const schema = "CREATE TABLE `orders` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `price` decimal(10,2) NOT NULL,\n" +
+		"  `note` varchar(64) DEFAULT NULL COMMENT 'compute as (x) stored value later',\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB;\n"
+	// The dump carries all three real values — `note` is not actually generated.
+	const data = "INSERT INTO `orders` (`id`,`price`,`note`) VALUES(1,10.50,'hello');\n"
+
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "shop.orders-schema.sql")
+	dataPath := filepath.Join(dir, "shop.orders.00000.sql")
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dataPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Confirm the false-positive actually happens at the ParseSchema level —
+	// otherwise this test would pass for the wrong reason.
+	cols, err := ParseSchema(schemaPath)
+	if err != nil {
+		t.Fatalf("ParseSchema: %v", err)
+	}
+	if len(cols) != 2 {
+		t.Fatalf("got %d columns %v, want 2 (id, price) — expected the COMMENT false-positive to drop `note`", len(cols), colNames(cols))
+	}
+
+	tf := TableFiles{
+		Database:   "shop",
+		Table:      "orders",
+		SchemaFile: schemaPath,
+		DataFiles:  []string{dataPath},
+		Format:     "sql",
+	}
+	outPath := filepath.Join(dir, "orders.parquet")
+	_, err = processTable(context.Background(), tf, outPath, WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err == nil {
+		t.Fatal("processTable with a COMMENT-triggered false-positive column drop: got nil error, want loud failure (silent-corruption regression)")
+	}
+	for _, want := range []string{"2", "3", "orders"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}

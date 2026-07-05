@@ -280,6 +280,13 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 	fmt.Fprintln(w, "-- IMPORTANT: Review carefully before applying to production.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "BEGIN;")
+	if g.dialect == MySQLDialect {
+		// TIMESTAMP/DATETIME literals in the statements below are rendered from
+		// the captured (UTC, #757) value with no explicit zone marker. Pin the
+		// session to UTC so a target with a non-UTC time_zone doesn't reinterpret
+		// the literal and reintroduce the shift capture just fixed.
+		fmt.Fprintln(w, "SET time_zone = '+00:00';")
+	}
 	if g.dialect == PostgresDialect {
 		// escapePGString relies on standard_conforming_strings=on (PostgreSQL's
 		// default), under which a backslash is literal. If the operator applies this

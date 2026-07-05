@@ -308,6 +308,17 @@ func processTable(ctx context.Context, tf TableFiles, outPath string, cfg Writer
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		// A row's value count must match the schema's column count exactly.
+		// WriteRow tolerates a short row by NULL-padding the missing tail
+		// (mysqlIdx >= len(nulls)) — a defensive bounds check, not a supported
+		// layout — so a genuine mismatch (e.g. ParseSchema's generated-column
+		// detection missing an unusual DDL shape) would otherwise shift or
+		// silently NULL a real column instead of failing loud (issue #767).
+		if len(values) != len(cols) {
+			return fmt.Errorf("row has %d values but schema %s has %d columns "+
+				"(generated columns are excluded from both) — dump/schema mismatch for %s.%s",
+				len(values), tf.SchemaFile, len(cols), tf.Database, tf.Table)
+		}
 		if err := w.WriteRow(values, nulls); err != nil {
 			return err
 		}
