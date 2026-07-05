@@ -311,9 +311,14 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 		}
 	}
 
-	// Only meaningful for the internal DB-fetch path: when ParentDeletes is
-	// caller-supplied (derived from baseRows), any truncation already happened
-	// on baseRows' own fetch and is surfaced by that caller's own warnings.
+	// This caveat text ("parent DELETE events were capped") describes the
+	// internal DB-fetch's own LIMIT clause, which only fires on that path
+	// (p.ParentDeletes == nil). When ParentDeletes is caller-supplied (derived
+	// from baseRows), any truncation happened on baseRows' OWN fetch instead —
+	// NOTE this is not currently surfaced by a dedicated caveat anywhere
+	// (handleRecover's warnings are coverage-gap hours from gapWarnings(plan),
+	// not a Limit-truncation signal); a baseRows-level truncation caveat is a
+	// pre-existing gap in the plain recover path too, out of scope here.
 	if p.ParentDeletes == nil && len(parentDeletes) >= limit {
 		caveats = append(caveats, fmt.Sprintf("parent DELETE events were capped at the limit (%d); narrow pk/since/until", limit))
 	}
