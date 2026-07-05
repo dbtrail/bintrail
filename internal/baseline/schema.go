@@ -37,6 +37,25 @@ type Column struct {
 // UNSIGNED from a hand-rolled schema must not silently fall through to signed.
 var colRe = regexp.MustCompile("^\\s+`([^`]+)`\\s+(\\w+)(?:\\s*\\([^)]*\\))?\\s*((?i:unsigned))?")
 
+// generatedRe matches a STORED/VIRTUAL/PERSISTENT generated column's defining
+// clause: MySQL's canonical "GENERATED ALWAYS AS (`price` * `qty`) STORED",
+// and the shorter form MariaDB's SHOW CREATE TABLE may emit without the
+// "GENERATED ALWAYS" prefix, e.g. "AS (`price` * `qty`) PERSISTENT"
+// (PERSISTENT is MariaDB's legacy alias for STORED). mysqldump and mydumper
+// both EXCLUDE generated columns from the INSERT column-list and VALUES
+// tuples they emit (see internal/consistency/checksum.go's tableColumns,
+// which drops them from the live-source fingerprint for the same reason) —
+// so a schema that still lists them shifts every subsequent column's
+// positional mapping in WriteRow (issue #767).
+//
+// Requiring the trailing VIRTUAL/STORED/PERSISTENT keyword (not just "AS (")
+// is a deliberate, accepted trade-off: it is possible in principle for a
+// COMMENT string to contain " as (...) stored" and false-trip this, but
+// unlike the #506 UNSIGNED false-positive (which silently mis-typed a real
+// column), the consequence here is the arity check in baseline.go failing
+// loud on a column-count mismatch — never silent corruption.
+var generatedRe = regexp.MustCompile(`(?i)\bAS\s*\(.*\)\s*(?:VIRTUAL|STORED|PERSISTENT)\b`)
+
 // ParseSchema reads a mydumper <db>.<table>-schema.sql file and returns the
 // ordered list of columns with their Parquet type mappings.
 func ParseSchema(path string) ([]Column, error) {
@@ -61,6 +80,11 @@ func ParseSchema(path string) ([]Column, error) {
 		}
 		m := colRe.FindStringSubmatch(line)
 		if m == nil {
+			continue
+		}
+		if generatedRe.MatchString(line) {
+			// STORED/VIRTUAL generated column — mydumper never dumps its value,
+			// so it must not occupy a slot in the positional column list either.
 			continue
 		}
 		name := m[1]
