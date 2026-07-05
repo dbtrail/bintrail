@@ -115,6 +115,97 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	return err
 }
 
+// deleteEventsSinceCheckpoint removes rows at or beyond (file, pos) from
+// binlog_events — the resume-time dedup for #759 (see the call site in One).
+// file == "" (no prior checkpoint) is a no-op. The `binlog_file > ?` half of
+// the WHERE clause relies on lexicographic filename ordering matching
+// chronological ordering, which holds for MySQL/MariaDB's default
+// fixed-width zero-padded sequence numbers (e.g. mysql-bin.000001).
+// binlog_events is partitioned by event_timestamp, not binlog_file, so this
+// is a full scan on every resume.
+func deleteEventsSinceCheckpoint(db *sql.DB, file string, pos uint64) (int64, error) {
+	if file == "" {
+		return 0, nil
+	}
+	res, err := db.Exec(`
+		DELETE FROM binlog_events
+		WHERE binlog_file > ? OR (binlog_file = ? AND start_pos >= ?)`,
+		file, file, pos)
+	if err != nil {
+		return 0, fmt.Errorf("delete events since checkpoint %s:%d: %w", file, pos, err)
+	}
+	return res.RowsAffected()
+}
+
+// deleteEventsSinceCheckpointGTID is the GTID-mode sibling of
+// deleteEventsSinceCheckpoint. GTID mode needs an extra pass: binlog_position
+// advances on EVERY event (streamLoop), but gtid_set only advances at commit
+// (#491), so a time-based checkpoint tick can persist a binlog_position that
+// sits mid-transaction — ahead of what the durable gtid_set covers. Rows from
+// that still-open transaction may already be flushed to binlog_events (batch
+// flushes are not commit-aligned) with start_pos BELOW the checkpoint's
+// binlog_position. On resume, StartSyncGTID replays the whole open
+// transaction from its start (GTID replay is transaction-, not
+// byte-aligned), so those straggler rows would duplicate.
+//
+// After the position-keyed delete, this scans the same binlog_file for
+// distinct GTIDs below pos and removes any not contained in savedSet — i.e.
+// transactions the checkpoint's gtid_set had not yet durably recorded.
+// Scoped to one file: a transaction never spans a binlog rotation, so an
+// open transaction's rows always live in the file the checkpoint was last
+// written against.
+func deleteEventsSinceCheckpointGTID(db *sql.DB, file string, pos uint64, savedSet gomysql.GTIDSet, flavor string) (int64, error) {
+	n, err := deleteEventsSinceCheckpoint(db, file, pos)
+	if err != nil || file == "" || savedSet == nil {
+		return n, err
+	}
+
+	rows, err := db.Query(`
+		SELECT DISTINCT gtid FROM binlog_events
+		WHERE binlog_file = ? AND start_pos < ? AND gtid IS NOT NULL`,
+		file, pos)
+	if err != nil {
+		return n, fmt.Errorf("scan pre-checkpoint gtids for stragglers: %w", err)
+	}
+	defer rows.Close()
+
+	var stragglers []string
+	for rows.Next() {
+		var g string
+		if err := rows.Scan(&g); err != nil {
+			return n, fmt.Errorf("scan straggler gtid: %w", err)
+		}
+		single, parseErr := parseGTIDSetForFlavor(flavor, g)
+		if parseErr != nil {
+			slog.Warn("dedup-on-resume: failed to parse a row's gtid; deleting it defensively as a possible straggler",
+				"gtid", g, "error", parseErr)
+			stragglers = append(stragglers, g)
+			continue
+		}
+		if !savedSet.Contain(single) {
+			stragglers = append(stragglers, g)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return n, fmt.Errorf("iterate straggler gtids: %w", err)
+	}
+	if len(stragglers) == 0 {
+		return n, nil
+	}
+
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(stragglers)), ",")
+	args := make([]any, len(stragglers))
+	for i, g := range stragglers {
+		args[i] = g
+	}
+	res, err := db.Exec(`DELETE FROM binlog_events WHERE gtid IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return n, fmt.Errorf("delete straggler gtid events: %w", err)
+	}
+	n2, err := res.RowsAffected()
+	return n + n2, err
+}
+
 // persistGapAutoAdvance durably records an unfillable-gap auto-advance. It stamps
 // gap_lost_at FIRST, then writes the advanced checkpoint — never the reverse.
 // Ordering is a data-loss-safety invariant: once the checkpoint is advanced past
@@ -1373,6 +1464,9 @@ func One(ctx context.Context, cfg Config) error {
 
 	// ── 6b. Detect binlog gap ────────────────────────────────────────────
 	// Only check for gaps when resuming from a saved checkpoint (not on first run).
+	// gtidAdvanced tracks whether the GTID auto-advance branch below ran — see
+	// the dedup-on-resume comment after this block for why it matters.
+	gtidAdvanced := false
 	if saved != nil {
 		var gap *gapResult
 		var gapErr error
@@ -1443,6 +1537,7 @@ func One(ctx context.Context, cfg Config) error {
 						return fmt.Errorf("failed to parse purged GTID set for auto-advance: %w", parseErr)
 					}
 					accGTID = gs
+					gtidAdvanced = true
 				}
 
 				// Durably record the loss and advance the checkpoint, in that order
@@ -1472,6 +1567,51 @@ func One(ctx context.Context, cfg Config) error {
 					cfg.Hooks.OnGapAutoAdvance(gap.Message)
 				}
 			}
+		}
+	}
+
+	// Dedup-on-resume (#759): batches flush to binlog_events independently of
+	// the checkpoint ticker, so a crash between a flush and the next
+	// checkpoint leaves already-indexed events beyond the durable checkpoint.
+	// Streaming resumes from that stale (behind) position and MySQL re-sends
+	// — and this process would re-insert — those same events under new
+	// event_ids. Since this is the only writer for this index, it is safe to
+	// delete anything at or beyond the actual replay start before streaming:
+	// it will be re-received and re-inserted cleanly.
+	//
+	// This MUST run after 6b (not right on load): position mode's replay
+	// start (startFile/startPos) only equals the saved checkpoint when no
+	// gap auto-advance happened; on an unfillable-gap advance it moves
+	// forward past purged binlogs, and events already captured in that
+	// purged range must be kept, not deleted, because the source can never
+	// re-send them. Keying the delete on the post-6b value handles both
+	// cases with one comparison.
+	//
+	// GTID mode has no equivalent post-advance binlog coordinate (the purge
+	// floor is a GTID set, not a (file,pos) tuple), so an advance there skips
+	// the delete rather than risk deleting captured pre-floor rows; the
+	// trade-off is a rare residual duplicate instead of destroyed data.
+	//
+	// Guarded to same-mode resumes only (saved.mode == mode): an explicit
+	// --start-file/--start-gtid mode switch is a deliberate one-off operator
+	// action, not the crash-replay case this fix targets, and the saved
+	// binlog coordinates don't correspond to the newly chosen start point.
+	if saved != nil && saved.mode == mode && mode == "position" {
+		if n, err := deleteEventsSinceCheckpoint(indexDB, startFile, uint64(startPos)); err != nil {
+			return fmt.Errorf("failed to dedup events since checkpoint: %w", err)
+		} else if n > 0 {
+			slog.Warn("deleted events at or beyond the replay start to avoid re-insert duplicates on resume",
+				"file", startFile, "pos", startPos, "rows_deleted", n)
+		}
+	} else if saved != nil && saved.mode == mode && mode == "gtid" {
+		if gtidAdvanced {
+			slog.Warn("skipping dedup-on-resume after GTID gap auto-advance; " +
+				"re-received events in this window may be duplicated")
+		} else if n, err := deleteEventsSinceCheckpointGTID(indexDB, saved.binlogFile, saved.binlogPos, accGTID, cfg.Flavor); err != nil {
+			return fmt.Errorf("failed to dedup events since checkpoint: %w", err)
+		} else if n > 0 {
+			slog.Warn("deleted events at or beyond the saved checkpoint (incl. any open-transaction stragglers) to avoid re-insert duplicates on resume",
+				"file", saved.binlogFile, "pos", saved.binlogPos, "rows_deleted", n)
 		}
 	}
 

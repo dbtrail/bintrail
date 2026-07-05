@@ -1301,3 +1301,118 @@ func TestResolveStartWithAutoDiscover_mutuallyExclusiveFlagsErrorPropagates(t *t
 		t.Errorf("expected mutually-exclusive error, got: %v", err)
 	}
 }
+
+// TestDeleteEventsSinceCheckpoint_noPriorCheckpointIsNoop verifies the
+// dedup-on-resume helper (#759) skips the DELETE entirely (and never touches
+// db) when there is no prior checkpoint file — the first-run case where
+// dedup does not apply.
+func TestDeleteEventsSinceCheckpoint_noPriorCheckpointIsNoop(t *testing.T) {
+	n, err := deleteEventsSinceCheckpoint(nil, "", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 rows affected, got %d", n)
+	}
+}
+
+// TestDeleteEventsSinceCheckpoint_deletesAtOrBeyond verifies the position-mode
+// dedup delete issues a single DELETE keyed on the given (file, pos) and
+// returns the affected row count.
+func TestDeleteEventsSinceCheckpoint_deletesAtOrBeyond(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectExec("DELETE FROM binlog_events").
+		WithArgs("mysql-bin.000005", "mysql-bin.000005", uint64(1234)).
+		WillReturnResult(sqlmock.NewResult(0, 3))
+
+	n, err := deleteEventsSinceCheckpoint(db, "mysql-bin.000005", 1234)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("expected 3 rows affected, got %d", n)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestDeleteEventsSinceCheckpointGTID_noStragglers verifies that when every
+// pre-checkpoint gtid found in the checkpoint's binlog file is already
+// contained in the saved GTID set, no straggler DELETE is issued.
+func TestDeleteEventsSinceCheckpointGTID_noStragglers(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	uuid := "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+	savedSet, err := gomysql.ParseMysqlGTIDSet(uuid + ":1-100")
+	if err != nil {
+		t.Fatalf("parse saved set: %v", err)
+	}
+
+	mock.ExpectExec("DELETE FROM binlog_events").
+		WithArgs("mysql-bin.000005", "mysql-bin.000005", uint64(1234)).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectQuery("SELECT DISTINCT gtid FROM binlog_events").
+		WithArgs("mysql-bin.000005", uint64(1234)).
+		WillReturnRows(sqlmock.NewRows([]string{"gtid"}).AddRow(uuid + ":50"))
+
+	n, err := deleteEventsSinceCheckpointGTID(db, "mysql-bin.000005", 1234, savedSet, gomysql.MySQLFlavor)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expected 2 rows affected (no stragglers), got %d", n)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestDeleteEventsSinceCheckpointGTID_deletesStragglers verifies that a
+// pre-checkpoint gtid NOT contained in the saved GTID set (a transaction that
+// was still open — flushed but not yet committed — when the checkpoint was
+// written) is deleted via a second, straggler-targeted DELETE.
+func TestDeleteEventsSinceCheckpointGTID_deletesStragglers(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	uuid := "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+	savedSet, err := gomysql.ParseMysqlGTIDSet(uuid + ":1-100")
+	if err != nil {
+		t.Fatalf("parse saved set: %v", err)
+	}
+	stragglerGTID := uuid + ":101"
+
+	mock.ExpectExec("DELETE FROM binlog_events").
+		WithArgs("mysql-bin.000005", "mysql-bin.000005", uint64(1234)).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectQuery("SELECT DISTINCT gtid FROM binlog_events").
+		WithArgs("mysql-bin.000005", uint64(1234)).
+		WillReturnRows(sqlmock.NewRows([]string{"gtid"}).AddRow(stragglerGTID))
+	mock.ExpectExec("DELETE FROM binlog_events WHERE gtid IN").
+		WithArgs(stragglerGTID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	n, err := deleteEventsSinceCheckpointGTID(db, "mysql-bin.000005", 1234, savedSet, gomysql.MySQLFlavor)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("expected 3 total rows affected (2 + 1 straggler), got %d", n)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
