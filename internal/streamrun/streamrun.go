@@ -1508,15 +1508,16 @@ func One(ctx context.Context, cfg Config) error {
 
 	// ── 7. Create BinlogSyncer ────────────────────────────────────────────────────
 	syncerCfg := replication.BinlogSyncerConfig{
-		ServerID:             cfg.ServerID,
-		Flavor:               cfg.Flavor,
-		Host:                 host,
-		Port:                 port,
-		User:                 user,
-		Password:             password,
-		HeartbeatPeriod:      30 * time.Second,
-		MaxReconnectAttempts: 0, // infinite retry
-		TLSConfig:            tlsCfg,
+		ServerID:                cfg.ServerID,
+		Flavor:                  cfg.Flavor,
+		Host:                    host,
+		Port:                    port,
+		User:                    user,
+		Password:                password,
+		HeartbeatPeriod:         30 * time.Second,
+		MaxReconnectAttempts:    0, // infinite retry
+		TLSConfig:               tlsCfg,
+		TimestampStringLocation: time.UTC, // see internal/parser/parser.go (#757)
 	}
 	if cfg.Flavor == "mariadb" {
 		// Ask the MariaDB source to send ANNOTATE_ROWS events (the original

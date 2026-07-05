@@ -509,3 +509,104 @@ func TestParseFile_contextCancellation(t *testing.T) {
 		}
 	}
 }
+
+// TestParseFile_timestampCapturedAsUTC pins #757: a TIMESTAMP column must be
+// captured at its true UTC wall-clock value regardless of the capturing host's
+// local timezone. go-mysql's default (no TimestampStringLocation) formats a
+// decoded TIMESTAMP via fracTime.String(), which falls back to the raw
+// time.Unix(...) value — constructed in time.Local — whenever the location is
+// unset. This test overrides the package-level time.Local (not the TZ env var,
+// which some earlier package-level time.Now() call may have already latched)
+// to a fixed non-UTC offset for the duration of parsing, so the test exercises
+// exactly the code path go-mysql uses without depending on tzdata availability
+// or env-var timing.
+func TestParseFile_timestampCapturedAsUTC(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE events (
+		id          INT PRIMARY KEY AUTO_INCREMENT,
+		happened_at TIMESTAMP(6) NOT NULL
+	)`)
+
+	stats, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshot failed: %v", err)
+	}
+	resolver, err := metadata.NewResolver(indexDB, stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("NewResolver failed: %v", err)
+	}
+
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+
+	currentBinlog, _, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition failed: %v", err)
+	}
+
+	// Pin the SOURCE session to UTC so the literal below lands at a known,
+	// deterministic UTC epoch regardless of the docker container's own
+	// system timezone — isolating the assertion to the CAPTURE-side bug.
+	testutil.MustExec(t, sourceDB, "SET SESSION time_zone = '+00:00'")
+	testutil.MustExec(t, sourceDB, "INSERT INTO events (happened_at) VALUES ('2024-06-15 12:00:00')")
+
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+
+	tmpDir := t.TempDir()
+	cpCmd := exec.Command("docker", "cp",
+		fmt.Sprintf("bintrail-test-mysql:/var/lib/mysql/%s", currentBinlog),
+		filepath.Join(tmpDir, currentBinlog),
+	)
+	if out, err := cpCmd.CombinedOutput(); err != nil {
+		t.Fatalf("docker cp %s failed: %v\n%s", currentBinlog, err, out)
+	}
+
+	// Simulate a bare-metal host running in a non-UTC timezone.
+	orig := time.Local
+	time.Local = time.FixedZone("TestNonUTC", -3*60*60)
+	defer func() { time.Local = orig }()
+
+	p := parser.New(tmpDir, resolver, parser.Filters{
+		Schemas: map[string]bool{sourceName: true},
+	}, nil)
+
+	events := make(chan parser.Event, 10)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(events)
+		errCh <- p.ParseFile(context.Background(), currentBinlog, events)
+	}()
+
+	got := dmlEvents(drainEvents(events))
+	if err := <-errCh; err != nil {
+		t.Fatalf("ParseFile returned error: %v", err)
+	}
+
+	var insertEvent *parser.Event
+	for i := range got {
+		if got[i].EventType == parser.EventInsert {
+			insertEvent = &got[i]
+			break
+		}
+	}
+	if insertEvent == nil {
+		t.Fatalf("expected an INSERT event, got %d DML events", len(got))
+	}
+
+	rawTS, ok := insertEvent.RowAfter["happened_at"]
+	if !ok {
+		t.Fatalf("RowAfter missing happened_at column: %+v", insertEvent.RowAfter)
+	}
+	tsStr, ok := rawTS.(string)
+	if !ok {
+		t.Fatalf("expected happened_at to decode as string, got %T (%v)", rawTS, rawTS)
+	}
+	if !strings.HasPrefix(tsStr, "2024-06-15 12:00:00") {
+		t.Errorf("TIMESTAMP column leaked host-local timezone: got %q, want prefix \"2024-06-15 12:00:00\" "+
+			"(the pre-fix bug would shift this to \"2024-06-15 09:00:00\" under TestNonUTC's -3h offset)", tsStr)
+	}
+}

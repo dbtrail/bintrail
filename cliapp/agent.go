@@ -593,14 +593,15 @@ func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer, fc
 	}
 
 	syncerCfg := replication.BinlogSyncerConfig{
-		ServerID:             agtServerID,
-		Flavor:               "mysql",
-		Host:                 host,
-		Port:                 port,
-		User:                 user,
-		Password:             password,
-		HeartbeatPeriod:      30 * time.Second,
-		MaxReconnectAttempts: 0,
+		ServerID:                agtServerID,
+		Flavor:                  "mysql",
+		Host:                    host,
+		Port:                    port,
+		User:                    user,
+		Password:                password,
+		HeartbeatPeriod:         30 * time.Second,
+		MaxReconnectAttempts:    0,
+		TimestampStringLocation: time.UTC, // see internal/parser/parser.go (#757)
 	}
 	syncer := replication.NewBinlogSyncer(syncerCfg)
 	defer syncer.Close()

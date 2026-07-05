@@ -1116,7 +1116,11 @@ func TestDialectForIndex_nilDB(t *testing.T) {
 
 // TestGeneratePG_ScriptWrapper pins the standard_conforming_strings guard: a PG-dialect
 // script SET LOCALs it (so the escaping is self-defending regardless of the target
-// session), and the MySQL script does NOT emit it.
+// session), and the MySQL script does NOT emit it. Conversely, a MySQL-dialect script
+// pins time_zone='+00:00' (#757 — the captured literals are UTC with no zone marker,
+// and a non-UTC target session would otherwise reinterpret them), and the PG script
+// does NOT emit that guard (PG's own SET LOCAL standard_conforming_strings covers its
+// escaping; timestamps there carry their own tz awareness).
 func TestGeneratePG_ScriptWrapper(t *testing.T) {
 	row := query.ResultRow{
 		EventID: 1, SchemaName: "public", TableName: "t",
@@ -1124,6 +1128,7 @@ func TestGeneratePG_ScriptWrapper(t *testing.T) {
 		RowBefore: map[string]any{"id": "1"},
 	}
 	const scs = "SET LOCAL standard_conforming_strings = on;"
+	const tz = "SET time_zone = '+00:00';"
 
 	var pgBuf bytes.Buffer
 	if _, err := NewForDialect(nil, nil, PostgresDialect).GenerateSQLFromRows([]query.ResultRow{row}, &pgBuf); err != nil {
@@ -1132,6 +1137,9 @@ func TestGeneratePG_ScriptWrapper(t *testing.T) {
 	if !strings.Contains(pgBuf.String(), scs) {
 		t.Errorf("PG script must contain %q, got:\n%s", scs, pgBuf.String())
 	}
+	if strings.Contains(pgBuf.String(), tz) {
+		t.Errorf("PG script must NOT emit the MySQL time_zone guard, got:\n%s", pgBuf.String())
+	}
 
 	var myBuf bytes.Buffer
 	if _, err := New(nil, nil).GenerateSQLFromRows([]query.ResultRow{row}, &myBuf); err != nil {
@@ -1139,6 +1147,9 @@ func TestGeneratePG_ScriptWrapper(t *testing.T) {
 	}
 	if strings.Contains(myBuf.String(), "standard_conforming_strings") {
 		t.Errorf("MySQL script must NOT emit the PG SCS guard, got:\n%s", myBuf.String())
+	}
+	if !strings.Contains(myBuf.String(), tz) {
+		t.Errorf("MySQL script must contain %q, got:\n%s", tz, myBuf.String())
 	}
 }
 
