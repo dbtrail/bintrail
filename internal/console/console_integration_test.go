@@ -734,7 +734,7 @@ func statements(sql string) []string {
 	var out []string
 	for _, line := range strings.Split(sql, "\n") {
 		l := strings.TrimSpace(line)
-		if l == "" || strings.HasPrefix(l, "--") || l == "BEGIN;" || l == "COMMIT;" {
+		if l == "" || strings.HasPrefix(l, "--") || l == "BEGIN;" || l == "COMMIT;" || l == "SET time_zone = '+00:00';" {
 			continue
 		}
 		out = append(out, l)
