@@ -146,7 +146,7 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 			// Per-file early termination: stop as soon as no remaining file
 			// can produce a row earlier than what we already have.
 			if opts.Limit > 0 && len(results) >= opts.Limit && i+1 < len(files) {
-				if canTerminateEarly(results, files[i+1:], opts.Limit) {
+				if canTerminateEarly(results, files[i+1:], opts.Limit, opts.Order) {
 					slog.Debug("early termination: collected enough results",
 						"collected", len(results), "limit", opts.Limit,
 						"remaining_files", len(files)-i-1)
@@ -391,22 +391,28 @@ func isBucketLocationAccessDenied(err error) bool {
 const maxScopedDays = 31
 
 // generateDatePrefixes returns date-scoped S3 prefixes for Hive-partitioned
-// archives (event_date=YYYY-MM-DD/). Returns nil when the range is too wide
-// or no time bounds are provided, signaling the caller to list the full prefix.
-// Assumes event_date= directories are directly under basePrefix (the layout
-// written by bintrail rotate --archive-dir).
+// archives (event_date=YYYY-MM-DD/). Returns nil when the range is too wide,
+// no time bounds are provided, or since is nil, signaling the caller to list
+// the full prefix. Assumes event_date= directories are directly under
+// basePrefix (the layout written by bintrail rotate --archive-dir).
+//
+// since is required to scope a start day: with since==nil (until-only, or no
+// bounds at all) there is no lower bound to anchor a start day on, so this
+// used to invent one (now - maxScopedDays). That silently dropped archived
+// data older than that invented window when until fell within it, and
+// collapsed to a single bogus day when until was older still (#774). Listing
+// everything and letting until alone filter downstream (filterFilesByTimeRange)
+// is correct in both cases, just less scoped — the CLI's "since is required by
+// most codepaths" convention makes bare until-only queries rare in practice.
 func generateDatePrefixes(basePrefix string, since, until *time.Time) []string {
-	if since == nil && until == nil {
+	if since == nil {
 		return nil
 	}
-	now := time.Now().UTC()
-	start := now.AddDate(0, 0, -maxScopedDays).Truncate(24 * time.Hour)
-	if since != nil {
-		start = since.Truncate(24 * time.Hour)
-	}
+	start := since.Truncate(24 * time.Hour)
+
 	// Use the end-of-day (truncate to day) for the until bound.
 	// When until is nil, include today fully.
-	end := now.Truncate(24 * time.Hour)
+	end := time.Now().UTC().Truncate(24 * time.Hour)
 	if until != nil {
 		end = until.Truncate(24 * time.Hour)
 	}
@@ -655,9 +661,24 @@ func sortFilesByHour(files []string) []string {
 
 // canTerminateEarly returns true when we've collected enough results for the
 // limit and all remaining files are from later hours. Since files are processed
-// in chronological order, if the limit-th result's timestamp is before the
-// next file's hour start, no future file can contain rows that would displace it.
-func canTerminateEarly(results []query.ResultRow, remainingFiles []string, limit int) bool {
+// in chronological (ASCENDING) order regardless of the requested output order
+// (sortFilesByHour always sorts oldest-first), this heuristic is only valid
+// when results are being accumulated in ascending time order: the limit-th
+// earliest result becomes a cutoff, and any remaining file starting after
+// that cutoff cannot contribute an earlier row.
+//
+// Under Order=DESC the caller wants the NEWEST rows, but iteration still
+// starts at the OLDEST hour — an ASC-shaped cutoff computed from the first
+// files read would sit inside the oldest hour and wrongly signal "done"
+// before the newest hours (the ones that actually matter for DESC) are ever
+// read (#773). There is no cheap symmetric cutoff here because file order
+// and the desired row order are inverted, so DESC simply never terminates
+// early — every candidate file is read and the final global sort+limit
+// (query.MergeAndTrim) picks the true newest rows. Correctness over speed.
+func canTerminateEarly(results []query.ResultRow, remainingFiles []string, limit int, order string) bool {
+	if query.OrderDirection(order) == "DESC" {
+		return false
+	}
 	if len(results) < limit || len(remainingFiles) == 0 {
 		return false
 	}
