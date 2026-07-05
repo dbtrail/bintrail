@@ -327,6 +327,103 @@ func TestIntegrationRecover_autoCascade_mixedEvents(t *testing.T) {
 	}
 }
 
+// TestIntegrationRecover_autoCascade_gtidScoped is the regression test for #772:
+// the combined recover path must scope its internal cascade parent-fetch to the
+// SAME filters (here, GTID) as the triggering recover request, so it can never
+// synthesize victims for a parent DELETE the operator did not ask to recover.
+//
+// Two independent parents are seeded on the same table, each deleted under its
+// own transaction (distinct GTID) and each with two cascade-deleted children.
+// Recovering by the FIRST parent's GTID alone (the natural "undo this one
+// transaction" flow, no since/until) must synthesize victims ONLY for that
+// parent's children. Before the fix, the internal parent-fetch dropped GTID and
+// searched the entire table history, pulling in the second (unrelated) parent's
+// deletion and synthesizing INSERTs for its children too — even though that
+// parent itself is never re-created by this recover, orphaning them once
+// FOREIGN_KEY_CHECKS is re-enabled.
+func TestIntegrationRecover_autoCascade_gtidScoped(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour)
+	gtidA := "3e11fa47-71ca-11e1-9e33-c80aa9429562:5"
+	gtidB := "3e11fa47-71ca-11e1-9e33-c80aa9429562:6"
+
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+
+	// Transaction A: parent id=1 deleted under gtidA, cascading children pid=1
+	// (id=10, id=11) — this is the ONLY transaction the recover request targets.
+	childATs := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	parentATs := h.Add(20 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, childATs, nil,
+		dbName, "child", 1 /*INSERT*/, "10", nil, nil, []byte(`{"id":10,"pid":1}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, childATs, nil,
+		dbName, "child", 1 /*INSERT*/, "11", nil, nil, []byte(`{"id":11,"pid":1}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, parentATs, &gtidA,
+		dbName, "parent", 3 /*DELETE*/, "1", nil, []byte(`{"id":1}`), nil)
+
+	// Transaction B: an UNRELATED parent id=2 deleted under gtidB, cascading its
+	// own children pid=2 (id=20, id=21). The recover request below never
+	// mentions gtidB, pk=2, or these children.
+	childBTs := h.Add(11 * time.Minute).Format("2006-01-02 15:04:05")
+	parentBTs := h.Add(21 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 400, 500, childBTs, nil,
+		dbName, "child", 1 /*INSERT*/, "20", nil, nil, []byte(`{"id":20,"pid":2}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 500, 600, childBTs, nil,
+		dbName, "child", 1 /*INSERT*/, "21", nil, nil, []byte(`{"id":21,"pid":2}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 600, 700, parentBTs, &gtidB,
+		dbName, "parent", 3 /*DELETE*/, "2", nil, []byte(`{"id":2}`), nil)
+
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
+		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
+		VALUES (1, 'fk_child', ?, 'child', 'pid', 1, ?, 'parent', 'id', 'CASCADE', 'RESTRICT')`,
+		dbName, dbName)
+
+	snapTs := h.Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "parent", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "pid", 2, "", "int", "YES")
+
+	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, NoArchive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Recover ONLY gtidA's transaction — no since/until, no pk.
+	rec, body := doReq(t, srv, "POST", "/api/recover",
+		`{"schema":"`+dbName+`","table":"parent","gtid":"`+gtidA+`"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+	if !resp.CascadeDetected {
+		t.Errorf("cascade_detected should be true for a GTID-scoped parent DELETE recover")
+	}
+	if resp.VictimCount != 2 {
+		t.Errorf("victim_count = %d, want 2 (only gtidA's children); a pre-fix regression would report 4 (both transactions' children)\n---\n%s", resp.VictimCount, resp.SQL)
+	}
+	for _, want := range []string{"VALUES (10, 1)", "VALUES (11, 1)"} {
+		if !strings.Contains(resp.SQL, want) {
+			t.Errorf("SQL missing %q (gtidA's own child)\n---\n%s", want, resp.SQL)
+		}
+	}
+	for _, notWant := range []string{"VALUES (20, 2)", "VALUES (21, 2)", "VALUES (2)"} {
+		if strings.Contains(resp.SQL, notWant) {
+			t.Errorf("SQL must NOT include %q — gtidB's parent/children are outside the recover request's scope\n---\n%s", notWant, resp.SQL)
+		}
+	}
+	if c := strings.Count(resp.SQL, "`"+dbName+"`.`child`"); c != 2 {
+		t.Errorf("want exactly 2 child INSERTs (gtidA's own), got %d\n---\n%s", c, resp.SQL)
+	}
+	if c := strings.Count(resp.SQL, "`"+dbName+"`.`parent`"); c != 1 {
+		t.Errorf("want the gtidA parent re-inserted exactly once (gtidB's parent must not appear), got %d\n---\n%s", c, resp.SQL)
+	}
+}
+
 // TestIntegrationRecover_autoCascade_setNull covers the SET NULL arm of the
 // combined path: a parent whose child FK is ON DELETE SET NULL. Recover on the
 // parent must fold an idempotent guarded UPDATE (… AND fk IS NULL) into the same

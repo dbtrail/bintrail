@@ -194,13 +194,24 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 // synthesizeCascade. A zero Lookback/MaxDepth falls back to the cascade engine's
 // defaults (30d / depth 5) — what the auto-detect path passes (the friction this
 // feature removes is making the operator know their FK graph, not tune knobs).
+//
+// GTID/ChangedColumn/Limit exist so the auto-detect path (cascadeRecover) can
+// scope its internal parent-fetch IDENTICALLY to the recover request that
+// triggered it (#772): without them, a GTID-scoped "undo this one transaction"
+// recover would still search the entire table history for cascade parents,
+// synthesizing victims for deletes the operator never asked to touch. The
+// explicit endpoint leaves these zero (its own request has no such fields),
+// which preserves its existing behavior exactly.
 type cascadeSynthParams struct {
 	Schema, Table string
 	PK            string
 	PKs           []string
+	GTID          string
+	ChangedColumn string
 	Since, Until  *time.Time
 	Lookback      time.Duration
 	MaxDepth      int
+	Limit         int // 0 = default (recoverDefaultLimit/recoverMaxLimit)
 }
 
 // cascadeSynthResult carries the synthesized invisible extras plus coverage
@@ -224,7 +235,7 @@ type cascadeSynthResult struct {
 // rows. A returned error is an operational fetch/FK-load failure (caller 500s);
 // a PARTIAL synthesis is reported via SynthErr + Caveats, never an error.
 func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynthParams) (cascadeSynthResult, error) {
-	limit := clampLimit(0, recoverDefaultLimit, recoverMaxLimit)
+	limit := clampLimit(p.Limit, recoverDefaultLimit, recoverMaxLimit)
 	del := event.EventDelete
 
 	// DenyTables/RedactColumns are attached for consistency but are empty here (an
@@ -235,6 +246,8 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 		PKValues:      p.PK,
 		PKValuesIn:    p.PKs,
 		EventType:     &del,
+		GTID:          p.GTID,
+		ChangedColumn: p.ChangedColumn,
 		Since:         p.Since,
 		Until:         p.Until,
 		Order:         "ASC",
@@ -368,8 +381,16 @@ func (s *Server) cascadeRecover(ctx context.Context, b *bundle, body recoverRequ
 		Schema: body.Schema,
 		Table:  body.Table,
 		PK:     body.PK,
-		Since:  opts.Since,
-		Until:  opts.Until,
+		// GTID/ChangedColumn/Limit mirror the SAME recover request that
+		// auto-detected this cascade, so the internal parent-fetch can never
+		// diverge from baseRows' scope (#772) — e.g. a GTID-scoped "undo this
+		// one transaction" recover must not synthesize victims for parent
+		// deletes outside that transaction.
+		GTID:          opts.GTID,
+		ChangedColumn: opts.ChangedColumn,
+		Since:         opts.Since,
+		Until:         opts.Until,
+		Limit:         opts.Limit,
 		// Lookback/MaxDepth left zero → cascade engine defaults (30d / depth 5).
 	})
 	if err != nil {
