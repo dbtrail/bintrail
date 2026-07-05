@@ -202,6 +202,23 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 // synthesizing victims for deletes the operator never asked to touch. The
 // explicit endpoint leaves these zero (its own request has no such fields),
 // which preserves its existing behavior exactly.
+//
+// ParentDeletes, when non-nil, is used AS-IS as the parent DELETE set instead
+// of the internal DB fetch in synthesizeCascade. This closes a residual gap
+// in the GTID/ChangedColumn/Limit threading above: matching the *numeric*
+// Limit does not guarantee the internal fetch is a subset of baseRows,
+// because baseRows is an ALL-event-types fetch while the internal fetch is
+// DELETE-only. Over the identical window, non-DELETE rows on the table
+// consume baseRows' Limit budget but never consume the DELETE-only fetch's
+// budget — so the DELETE-only fetch can rank a later DELETE inside the same
+// numeric Limit that baseRows' Limit already excluded, pulling in an
+// unrelated parent DELETE the recover request never actually returned (and
+// synthesizing orphan children for it). cascadeRecover (the auto-detect
+// path, which already has baseRows in hand) derives ParentDeletes by
+// filtering baseRows itself, so the parent set can never diverge from it —
+// no re-fetch, no Limit/ordering/EventType mismatch possible. The explicit
+// /api/recover-cascade endpoint has no baseRows to derive from, so it always
+// leaves this nil and keeps its existing DB-fetch behavior exactly.
 type cascadeSynthParams struct {
 	Schema, Table string
 	PK            string
@@ -212,6 +229,7 @@ type cascadeSynthParams struct {
 	Lookback      time.Duration
 	MaxDepth      int
 	Limit         int // 0 = default (recoverDefaultLimit/recoverMaxLimit)
+	ParentDeletes []query.ResultRow
 }
 
 // cascadeSynthResult carries the synthesized invisible extras plus coverage
@@ -238,28 +256,38 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 	limit := clampLimit(p.Limit, recoverDefaultLimit, recoverMaxLimit)
 	del := event.EventDelete
 
-	// DenyTables/RedactColumns are attached for consistency but are empty here (an
-	// RBAC profile is refused upstream of every caller of synthesizeCascade).
-	parentDeletes, err := b.engine.Fetch(ctx, query.Options{
-		Schema:        p.Schema,
-		Table:         p.Table,
-		PKValues:      p.PK,
-		PKValuesIn:    p.PKs,
-		EventType:     &del,
-		GTID:          p.GTID,
-		ChangedColumn: p.ChangedColumn,
-		Since:         p.Since,
-		Until:         p.Until,
-		Order:         "ASC",
-		Limit:         limit,
-		DenyTables:    s.denyTables,
-		RedactColumns: s.redactCols,
-	})
-	if err != nil {
-		return cascadeSynthResult{}, fmt.Errorf("fetch parent deletes: %w", err)
-	}
-
 	var caveats []string
+	var parentDeletes []query.ResultRow
+	if p.ParentDeletes != nil {
+		// Caller (cascadeRecover) already derived the parent DELETE set from its
+		// own baseRows — use it as-is rather than re-fetching (see the
+		// ParentDeletes doc comment on cascadeSynthParams for why a re-fetch,
+		// even with matched filters/Limit, cannot guarantee this subset).
+		parentDeletes = p.ParentDeletes
+	} else {
+		// DenyTables/RedactColumns are attached for consistency but are empty
+		// here (an RBAC profile is refused upstream of every caller of
+		// synthesizeCascade).
+		var err error
+		parentDeletes, err = b.engine.Fetch(ctx, query.Options{
+			Schema:        p.Schema,
+			Table:         p.Table,
+			PKValues:      p.PK,
+			PKValuesIn:    p.PKs,
+			EventType:     &del,
+			GTID:          p.GTID,
+			ChangedColumn: p.ChangedColumn,
+			Since:         p.Since,
+			Until:         p.Until,
+			Order:         "ASC",
+			Limit:         limit,
+			DenyTables:    s.denyTables,
+			RedactColumns: s.redactCols,
+		})
+		if err != nil {
+			return cascadeSynthResult{}, fmt.Errorf("fetch parent deletes: %w", err)
+		}
+	}
 
 	// Live-only trap (mirrors the CLI): probe archives UNCONDITIONALLY — the #569
 	// over-recovery guard is about whether archived partitions physically EXIST
@@ -283,7 +311,10 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 		}
 	}
 
-	if len(parentDeletes) >= limit {
+	// Only meaningful for the internal DB-fetch path: when ParentDeletes is
+	// caller-supplied (derived from baseRows), any truncation already happened
+	// on baseRows' own fetch and is surfaced by that caller's own warnings.
+	if p.ParentDeletes == nil && len(parentDeletes) >= limit {
 		caveats = append(caveats, fmt.Sprintf("parent DELETE events were capped at the limit (%d); narrow pk/since/until", limit))
 	}
 
@@ -369,6 +400,28 @@ type cascadeRecoverResult struct {
 	Caveats        []string
 }
 
+// parentDeletesOnTable filters rows down to the DELETE events on table — used
+// by cascadeRecover to derive the cascade parent set DIRECTLY from baseRows
+// (#772 residual gap) instead of re-fetching it from the index. A re-fetch
+// scoped by matching filters/Limit is NOT guaranteed to return the same set:
+// baseRows is an ALL-event-types fetch, so non-DELETE rows on the table
+// consume its Limit budget, while a DELETE-only re-fetch's budget is consumed
+// only by DELETEs — over the identical window and numeric Limit, the
+// DELETE-only fetch can therefore rank (and include) a DELETE further into
+// the window than baseRows' own cutoff reached, pulling in an unrelated
+// parent the operator's recover request never actually returned. Filtering
+// baseRows itself makes the parent set a subset BY CONSTRUCTION, independent
+// of Limit, ordering, or any filter mismatch.
+func parentDeletesOnTable(rows []query.ResultRow, table string) []query.ResultRow {
+	var out []query.ResultRow
+	for _, r := range rows {
+		if r.EventType == event.EventDelete && r.TableName == table {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // cascadeRecover composes ONE cascade-aware reversal script for a recover whose
 // target handleRecover auto-detected as a foreign-key parent: the base undo of
 // baseRows (already fetched — merged live+archive, RBAC-redacted, every event
@@ -381,11 +434,15 @@ func (s *Server) cascadeRecover(ctx context.Context, b *bundle, body recoverRequ
 		Schema: body.Schema,
 		Table:  body.Table,
 		PK:     body.PK,
-		// GTID/ChangedColumn/Limit mirror the SAME recover request that
-		// auto-detected this cascade, so the internal parent-fetch can never
-		// diverge from baseRows' scope (#772) — e.g. a GTID-scoped "undo this
-		// one transaction" recover must not synthesize victims for parent
-		// deletes outside that transaction.
+		// ParentDeletes is derived directly from baseRows (#772 residual gap —
+		// see parentDeletesOnTable), so the cascade parent set can never
+		// diverge from what this recover request actually returned.
+		ParentDeletes: parentDeletesOnTable(baseRows, body.Table),
+		// GTID/ChangedColumn/Since/Until/Limit are still threaded through for
+		// completeness (e.g. if ParentDeletes were ever nil), but are unused
+		// by synthesizeCascade whenever ParentDeletes is non-nil, which it
+		// always is here (rowsContainDeleteOn already guarantees baseRows has
+		// at least one qualifying DELETE before cascadeRecover is called).
 		GTID:          opts.GTID,
 		ChangedColumn: opts.ChangedColumn,
 		Since:         opts.Since,

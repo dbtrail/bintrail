@@ -424,6 +424,119 @@ func TestIntegrationRecover_autoCascade_gtidScoped(t *testing.T) {
 	}
 }
 
+// TestIntegrationRecover_autoCascade_limitTruncated is the regression test for
+// the residual #772 gap that matching the recover request's numeric Limit does
+// NOT close: baseRows is an ALL-event-types fetch, while the internal cascade
+// parent-fetch is DELETE-only. Over the identical window, non-DELETE rows on
+// the table consume baseRows' Limit budget but never consume the DELETE-only
+// fetch's budget — so a DELETE-only re-fetch using the SAME numeric Limit can
+// rank (and include) a DELETE further into the window than baseRows' own
+// cutoff reached, pulling in an unrelated parent the recover request never
+// actually returned and synthesizing orphan children for it.
+//
+// Seeded on table "parent", in this exact chronological order, with the
+// recover request's limit set to 3:
+//  1. DELETE id=1         (rank 1 of ALL events, rank 1 of DELETEs)
+//  2. INSERT id=99, noise (rank 2 of ALL events)
+//  3. INSERT id=98, noise (rank 3 of ALL events)
+//  4. DELETE id=2         (rank 4 of ALL events — excluded by baseRows'
+//     Limit=3 cutoff — but rank 2 of DELETEs, well within a DELETE-only
+//     fetch's own Limit=3)
+//
+// baseRows (Limit=3, ASC, all event types) therefore contains only
+// [DELETE id=1, noise, noise] — it never sees id=2's DELETE. A DELETE-only
+// re-fetch with the same Limit=3 returns BOTH deletes. The combined recover
+// must synthesize victims ONLY for id=1's children: id=2's parent is never
+// re-created by this recover (it's outside baseRows), so synthesizing its
+// children would orphan them once FOREIGN_KEY_CHECKS is re-enabled.
+func TestIntegrationRecover_autoCascade_limitTruncated(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+
+	childTs := h.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+	del1Ts := h.Add(20 * time.Minute).Format("2006-01-02 15:04:05")
+	noise1Ts := h.Add(21 * time.Minute).Format("2006-01-02 15:04:05")
+	noise2Ts := h.Add(22 * time.Minute).Format("2006-01-02 15:04:05")
+	del2Ts := h.Add(23 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// Children of BOTH parents (their own timestamps don't matter — the
+	// parent-fetch is table="parent"-scoped and never sees table="child" rows).
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, childTs, nil,
+		dbName, "child", 1 /*INSERT*/, "10", nil, nil, []byte(`{"id":10,"pid":1}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, childTs, nil,
+		dbName, "child", 1 /*INSERT*/, "11", nil, nil, []byte(`{"id":11,"pid":1}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, childTs, nil,
+		dbName, "child", 1 /*INSERT*/, "20", nil, nil, []byte(`{"id":20,"pid":2}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 400, 500, childTs, nil,
+		dbName, "child", 1 /*INSERT*/, "21", nil, nil, []byte(`{"id":21,"pid":2}`))
+
+	// The 4 "parent"-table events, in strict chronological order.
+	testutil.InsertEvent(t, db, "binlog.000001", 500, 600, del1Ts, nil,
+		dbName, "parent", 3 /*DELETE*/, "1", nil, []byte(`{"id":1}`), nil)
+	testutil.InsertEvent(t, db, "binlog.000001", 600, 700, noise1Ts, nil,
+		dbName, "parent", 1 /*INSERT, noise*/, "99", nil, nil, []byte(`{"id":99}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 700, 800, noise2Ts, nil,
+		dbName, "parent", 1 /*INSERT, noise*/, "98", nil, nil, []byte(`{"id":98}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 800, 900, del2Ts, nil,
+		dbName, "parent", 3 /*DELETE*/, "2", nil, []byte(`{"id":2}`), nil)
+
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
+		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
+		VALUES (1, 'fk_child', ?, 'child', 'pid', 1, ?, 'parent', 'id', 'CASCADE', 'RESTRICT')`,
+		dbName, dbName)
+
+	snapTs := h.Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "parent", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "pid", 2, "", "int", "YES")
+
+	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, NoArchive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Recover the whole table's history, capped at limit=3 — the exact numeric
+	// Limit that (pre-fix) let the internal DELETE-only parent-fetch see id=2's
+	// DELETE while baseRows' own Limit=3 cutoff never reached it.
+	rec, body := doReq(t, srv, "POST", "/api/recover",
+		`{"schema":"`+dbName+`","table":"parent","limit":3}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+	if !resp.CascadeDetected {
+		t.Errorf("cascade_detected should be true (baseRows contains id=1's DELETE)")
+	}
+	if resp.VictimCount != 2 {
+		t.Errorf("victim_count = %d, want 2 (only id=1's children); a pre-fix regression would report 4 "+
+			"(id=2's children too, even though id=2's own parent is never re-inserted)\n---\n%s", resp.VictimCount, resp.SQL)
+	}
+	for _, want := range []string{"VALUES (10, 1)", "VALUES (11, 1)"} {
+		if !strings.Contains(resp.SQL, want) {
+			t.Errorf("SQL missing %q (id=1's own child)\n---\n%s", want, resp.SQL)
+		}
+	}
+	for _, notWant := range []string{"VALUES (20, 2)", "VALUES (21, 2)"} {
+		if strings.Contains(resp.SQL, notWant) {
+			t.Errorf("SQL must NOT include %q — id=2's parent fell outside baseRows' Limit-truncated "+
+				"scope, so its children would be orphaned\n---\n%s", notWant, resp.SQL)
+		}
+	}
+	if strings.Contains(resp.SQL, "INSERT INTO `"+dbName+"`.`parent` (`id`) VALUES (2)") {
+		t.Errorf("SQL must NOT re-insert parent id=2 — it is outside this recover's Limit-truncated scope\n---\n%s", resp.SQL)
+	}
+	if c := strings.Count(resp.SQL, "`"+dbName+"`.`child`"); c != 2 {
+		t.Errorf("want exactly 2 child INSERTs (id=1's own), got %d\n---\n%s", c, resp.SQL)
+	}
+}
+
 // TestIntegrationRecover_autoCascade_setNull covers the SET NULL arm of the
 // combined path: a parent whose child FK is ON DELETE SET NULL. Recover on the
 // parent must fold an idempotent guarded UPDATE (… AND fk IS NULL) into the same
