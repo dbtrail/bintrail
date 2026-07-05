@@ -534,7 +534,11 @@ func TestEscapeString_combined(t *testing.T) {
 // ─── Generated column filtering ──────────────────────────────────────────────
 
 // newGenWithResolver returns a Generator backed by a resolver containing a
-// table with one STORED generated column ("line_total").
+// table with one STORED generated column ("line_total") and one ordinary
+// column with an expression default ("created_at TIMESTAMP DEFAULT
+// CURRENT_TIMESTAMP", IsGenerated: false) — the #758 DEFAULT_GENERATED trap:
+// MySQL's EXTRA column reports "DEFAULT_GENERATED" for created_at too, but it
+// is a real, captured data column and must NEVER be treated like line_total.
 func newGenWithResolver() *Generator {
 	tm := &metadata.TableMeta{
 		Schema: "shop",
@@ -544,6 +548,7 @@ func newGenWithResolver() *Generator {
 			{Name: "quantity", OrdinalPosition: 2, DataType: "int"},
 			{Name: "unit_price", OrdinalPosition: 3, DataType: "decimal"},
 			{Name: "line_total", OrdinalPosition: 4, DataType: "decimal", IsGenerated: true},
+			{Name: "created_at", OrdinalPosition: 5, DataType: "timestamp", IsGenerated: false},
 		},
 		PKColumns: []string{"order_id"},
 	}
@@ -564,7 +569,8 @@ func TestGenerateInsert_skipsGeneratedColumns(t *testing.T) {
 			"order_id":   float64(5),
 			"quantity":   float64(3),
 			"unit_price": float64(68.81),
-			"line_total": float64(206.43), // STORED generated — must be excluded
+			"line_total": float64(206.43),       // STORED generated — must be excluded
+			"created_at": "2024-01-01 00:00:00", // DEFAULT_GENERATED (expression default) — must be included (#758)
 		},
 	}
 	stmt, err := g.generateInsert(row)
@@ -575,6 +581,7 @@ func TestGenerateInsert_skipsGeneratedColumns(t *testing.T) {
 	assertSQL(t, stmt, "`order_id`")
 	assertSQL(t, stmt, "`quantity`")
 	assertSQL(t, stmt, "`unit_price`")
+	assertSQL(t, stmt, "`created_at`")
 	if strings.Contains(stmt, "line_total") {
 		t.Errorf("generated column 'line_total' must not appear in INSERT: %s", stmt)
 	}
@@ -591,13 +598,15 @@ func TestGenerateUpdate_skipsGeneratedColumns(t *testing.T) {
 			"order_id":   float64(5),
 			"quantity":   float64(2),
 			"unit_price": float64(68.81),
-			"line_total": float64(137.62), // STORED generated — must be excluded from SET
+			"line_total": float64(137.62),       // STORED generated — must be excluded from SET
+			"created_at": "2024-01-01 00:00:00", // DEFAULT_GENERATED — must be included (#758)
 		},
 		RowAfter: map[string]any{
 			"order_id":   float64(5),
 			"quantity":   float64(3),
 			"unit_price": float64(68.81),
 			"line_total": float64(206.43),
+			"created_at": "2024-01-02 00:00:00",
 		},
 	}
 	stmt, err := g.generateUpdate(row)
@@ -615,6 +624,9 @@ func TestGenerateUpdate_skipsGeneratedColumns(t *testing.T) {
 	setPart := stmt[setIdx:whereIdx]
 	if strings.Contains(setPart, "line_total") {
 		t.Errorf("generated column 'line_total' must not appear in SET clause: %s", setPart)
+	}
+	if !strings.Contains(setPart, "`created_at`") {
+		t.Errorf("DEFAULT_GENERATED column 'created_at' must appear in SET clause (#758): %s", setPart)
 	}
 }
 

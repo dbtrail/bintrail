@@ -612,7 +612,7 @@ type columnRow struct {
 	ordinalPosition                   int
 	columnKey, dataType, isNullable   string
 	columnType                        string // full COLUMN_TYPE (e.g. "datetime(6)"); needed by full-table reconstruct for PK precision
-	extra                             string
+	generationExpression              sql.NullString
 	columnDefault                     sql.NullString
 }
 
@@ -649,7 +649,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		query = `
 			SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
 			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, COLUMN_TYPE,
-			       IS_NULLABLE, COLUMN_DEFAULT, EXTRA
+			       IS_NULLABLE, COLUMN_DEFAULT, GENERATION_EXPRESSION
 			FROM information_schema.COLUMNS
 			WHERE TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
 			ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`
@@ -658,7 +658,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		query = fmt.Sprintf(`
 			SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
 			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, COLUMN_TYPE,
-			       IS_NULLABLE, COLUMN_DEFAULT, EXTRA
+			       IS_NULLABLE, COLUMN_DEFAULT, GENERATION_EXPRESSION
 			FROM information_schema.COLUMNS
 			WHERE TABLE_SCHEMA IN (%s)
 			ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`, placeholders)
@@ -681,7 +681,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		if err := srcRows.Scan(
 			&c.schemaName, &c.tableName, &c.columnName,
 			&c.ordinalPosition, &c.columnKey, &c.dataType, &c.columnType,
-			&c.isNullable, &c.columnDefault, &c.extra,
+			&c.isNullable, &c.columnDefault, &c.generationExpression,
 		); err != nil {
 			return SnapshotStats{}, fmt.Errorf("failed to scan column row: %w", err)
 		}
@@ -751,7 +751,16 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 			if c.columnDefault.Valid {
 				def = c.columnDefault.String
 			}
-			isGenerated := strings.Contains(strings.ToUpper(c.extra), "GENERATED")
+			// Generated-ness is read from GENERATION_EXPRESSION, not EXTRA: EXTRA
+			// also reports "DEFAULT_GENERATED" for an ordinary column with an
+			// expression default (e.g. created_at TIMESTAMP DEFAULT
+			// CURRENT_TIMESTAMP), so a substring match on "GENERATED" wrongly
+			// flags those real, captured data columns as generated and drops
+			// them from reverse INSERT/UPDATE SQL (#758). GENERATION_EXPRESSION
+			// is non-empty only for true VIRTUAL/STORED generated columns
+			// (empty in MySQL, NULL in MariaDB for everything else) — same
+			// signal consistency.tableColumns uses.
+			isGenerated := c.generationExpression.Valid && strings.TrimSpace(c.generationExpression.String) != ""
 			insertArgs = append(insertArgs,
 				nextID, snapshotTime, c.schemaName, c.tableName, c.columnName,
 				c.ordinalPosition, c.columnKey, c.dataType, c.columnType, c.isNullable, def, isGenerated,

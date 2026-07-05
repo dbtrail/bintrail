@@ -181,6 +181,51 @@ func TestTakeSnapshot_basic(t *testing.T) {
 	}
 }
 
+// TestTakeSnapshot_defaultGeneratedNotFlaggedGenerated is the #758 regression
+// test: information_schema.COLUMNS.EXTRA reports "DEFAULT_GENERATED" for an
+// ordinary column with an expression default (e.g. created_at TIMESTAMP
+// DEFAULT CURRENT_TIMESTAMP), not just for true VIRTUAL/STORED generated
+// columns. TakeSnapshot must tell these apart via GENERATION_EXPRESSION —
+// a substring match on EXTRA wrongly flags created_at as generated, which
+// makes recover silently omit it from reversal SQL (data corruption on
+// restore).
+func TestTakeSnapshot_defaultGeneratedNotFlaggedGenerated(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id         INT PRIMARY KEY,
+		total      DECIMAL(10,2) NOT NULL,
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		full_total DECIMAL(10,2) GENERATED ALWAYS AS (total * 1) STORED
+	) ENGINE=InnoDB`)
+
+	stats, err := TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	isGenerated := func(column string) bool {
+		var got bool
+		if err := indexDB.QueryRow(
+			`SELECT is_generated FROM schema_snapshots
+			 WHERE snapshot_id = ? AND schema_name = ? AND table_name = 'orders' AND column_name = ?`,
+			stats.SnapshotID, sourceName, column,
+		).Scan(&got); err != nil {
+			t.Fatalf("read is_generated for %s: %v", column, err)
+		}
+		return got
+	}
+
+	if isGenerated("created_at") {
+		t.Error("created_at (DEFAULT_GENERATED expression default) must NOT be flagged is_generated — it is a real, captured data column (#758)")
+	}
+	if !isGenerated("full_total") {
+		t.Error("full_total (STORED generated) must be flagged is_generated")
+	}
+}
+
 func TestTakeSnapshot_filteredSchemas(t *testing.T) {
 	// Two source DBs but only snapshot one.
 	sourceDB1, name1 := testutil.CreateTestDB(t)
