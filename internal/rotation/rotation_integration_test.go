@@ -3,6 +3,7 @@
 package rotation
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -12,7 +13,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/parquet-go/parquet-go"
 
+	"github.com/dbtrail/dbtrail/internal/archive"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
@@ -650,6 +653,186 @@ func TestPerformRotation_S3UploadSuccessPrunesAndDrops(t *testing.T) {
 		if p.Name == indexer.PartitionName(h1) {
 			t.Error("partition should have been dropped after a successful upload")
 		}
+	}
+}
+
+// TestPerformRotation_TruncatedArchiveRetryReArchives reproduces the OLD
+// buggy precondition from issue #802: a truncated (no valid Parquet footer)
+// file already sits at the Hive archive path with size>0 — as a crash
+// mid-write used to leave behind — but there is NO archive_state row for the
+// partition (that INSERT only ever happened after a completed write).
+// Before the fix, --retry's `fileExists(outPath)` trusted the truncated file,
+// skipped re-archiving AND skipped the archive_state INSERT, then uploaded
+// the corrupt bytes to S3 as-is; since no archive_state row ever existed, the
+// pending-upload guard saw nothing pending and rotation dropped the partition
+// and (with PruneLocalAfterUpload) deleted the local copy too — the hour of
+// data then existed only as an unreadable Parquet file in S3. The fixed code
+// must recognize the file is unverifiable (no archive_state row confirms its
+// row count) and re-archive it before ever uploading or dropping anything.
+func TestPerformRotation_TruncatedArchiveRetryReArchives(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
+
+	archiveDir := t.TempDir()
+	bintrailID := "test-uuid-truncated"
+	outPath, _ := HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the crash-mid-write leftover: a "parquet" file with content
+	// that has no valid footer, size>0, and (deliberately) no archive_state
+	// row inserted for it yet.
+	const garbage = "truncated-not-a-real-parquet-footer"
+	if err := os.WriteFile(outPath, []byte(garbage), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var uploadedBytes []byte
+	prev := uploadFileFunc
+	uploadFileFunc = func(ctx context.Context, client *s3.Client, path, bucket, key string) error {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		uploadedBytes = b
+		return nil
+	}
+	t.Cleanup(func() { uploadFileFunc = prev })
+
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur:          24 * time.Hour,
+		ArchiveDir:         archiveDir,
+		ArchiveS3:          "s3://fake-bucket/prefix/",
+		ArchiveS3Region:    "us-east-1",
+		BintrailID:         bintrailID,
+		ArchiveCompression: "none",
+		Format:             "json",
+		NoReplace:          true,
+		Retry:              true,
+	})
+	if err != nil {
+		t.Fatalf("Perform: %v", err)
+	}
+	if res.Dropped != 1 {
+		t.Errorf("Dropped = %d, want 1 (re-archived successfully, then uploaded and dropped)", res.Dropped)
+	}
+
+	if uploadedBytes == nil {
+		t.Fatal("expected an S3 upload to occur")
+	}
+	if string(uploadedBytes) == garbage {
+		t.Fatal("uploaded the truncated garbage file instead of re-archiving it first")
+	}
+	pf, err := parquet.OpenFile(bytes.NewReader(uploadedBytes), int64(len(uploadedBytes)))
+	if err != nil {
+		t.Fatalf("uploaded bytes are not a valid parquet file (footer): %v", err)
+	}
+	if pf.NumRows() != 1 {
+		t.Errorf("uploaded parquet NumRows = %d, want 1", pf.NumRows())
+	}
+
+	// archive_state must now record the real row count — the row a crash
+	// mid-write never got to insert.
+	var rowCount sql.NullInt64
+	if err := db.QueryRow(
+		`SELECT row_count FROM archive_state WHERE partition_name = ? AND bintrail_id = ?`,
+		indexer.PartitionName(h1), bintrailID,
+	).Scan(&rowCount); err != nil {
+		t.Fatalf("read archive_state: %v", err)
+	}
+	if !rowCount.Valid || rowCount.Int64 != 1 {
+		t.Errorf("archive_state.row_count = %v, want 1", rowCount)
+	}
+}
+
+// TestPerformRotation_ValidExistingArchiveRetrySkips pins the side of the
+// issue #802 fix that must NOT regress: a genuinely complete prior archive —
+// a Parquet file whose footer row count matches what archive_state recorded
+// for it — is still trusted and skipped under --retry, not needlessly
+// re-archived. The stricter verification added for #802 must reject only
+// unverifiable/corrupt files, never a legitimately complete one.
+func TestPerformRotation_ValidExistingArchiveRetrySkips(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
+
+	archiveDir := t.TempDir()
+	bintrailID := "test-uuid-valid-skip"
+	outPath, _ := HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Seed a genuinely complete, valid 1-row archive up front (as a prior
+	// successful run would have left it) and record it in archive_state —
+	// the state a legitimate --retry skip depends on.
+	if _, err := archive.ArchivePartition(context.Background(), db, dbName, indexer.PartitionName(h1), outPath, "none"); err != nil {
+		t.Fatalf("seed ArchivePartition: %v", err)
+	}
+	origBytes, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO archive_state
+		(partition_name, bintrail_id, local_path, row_count)
+		VALUES (?, ?, ?, 1)`, indexer.PartitionName(h1), bintrailID, outPath)
+
+	// A second live row lands in the partition after the archive was taken;
+	// it must NOT force a re-archive under --retry — the recorded row_count
+	// (1) still matches the file's own footer, so the file stays trusted.
+	ts2 := h1.Add(40 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, ts2, nil, "testdb", "users", 1, "2", nil, nil, []byte(`{"id":2}`))
+
+	var uploadedBytes []byte
+	prev := uploadFileFunc
+	uploadFileFunc = func(ctx context.Context, client *s3.Client, path, bucket, key string) error {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		uploadedBytes = b
+		return nil
+	}
+	t.Cleanup(func() { uploadFileFunc = prev })
+
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur:          24 * time.Hour,
+		ArchiveDir:         archiveDir,
+		ArchiveS3:          "s3://fake-bucket/prefix/",
+		ArchiveS3Region:    "us-east-1",
+		BintrailID:         bintrailID,
+		ArchiveCompression: "none",
+		Format:             "json",
+		NoReplace:          true,
+		Retry:              true,
+	})
+	if err != nil {
+		t.Fatalf("Perform: %v", err)
+	}
+	if res.Dropped != 1 {
+		t.Errorf("Dropped = %d, want 1", res.Dropped)
+	}
+	if !bytes.Equal(uploadedBytes, origBytes) {
+		t.Error("a valid, already-recorded archive was re-archived (bytes changed) instead of being skipped")
+	}
+
+	var rowCount int64
+	if err := db.QueryRow(
+		`SELECT row_count FROM archive_state WHERE partition_name = ? AND bintrail_id = ?`,
+		indexer.PartitionName(h1), bintrailID,
+	).Scan(&rowCount); err != nil {
+		t.Fatalf("read archive_state: %v", err)
+	}
+	if rowCount != 1 {
+		t.Errorf("archive_state.row_count = %d, want unchanged at 1 (a re-archive would have recomputed it to 2)", rowCount)
 	}
 }
 

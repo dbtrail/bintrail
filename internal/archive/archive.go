@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/parquet-go/parquet-go"
+
 	"github.com/dbtrail/dbtrail/internal/baseline"
 )
 
@@ -50,8 +52,17 @@ var BinlogEventColumns = []baseline.Column{
 // parseTime=true (i.e. via config.Connect) so DATETIME columns scan as
 // time.Time. Returns the number of rows written.
 //
-// On error the partial output file is removed before returning.
+// The file is written to outputPath+".tmp" and atomically renamed into place
+// only after the write completes and the writer is closed (issue #802): a
+// process kill, OOM, or host reboot mid-write can never leave a truncated,
+// no-footer file at outputPath — either the rename happened (a complete,
+// valid file) or it didn't (outputPath is untouched). A stale .tmp file left
+// by an earlier crash is silently overwritten by the next run (os.Create
+// truncates it) and is otherwise ignored — nothing ever reads from it.
+//
+// On error the partial .tmp output file is removed before returning.
 func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, outputPath, compression string) (int64, error) {
+	tmpPath := outputPath + ".tmp"
 	cfg := baseline.WriterConfig{
 		Compression:  compression,
 		RowGroupSize: 500_000,
@@ -62,7 +73,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		},
 	}
 
-	w, err := baseline.NewWriter(outputPath, BinlogEventColumns, cfg)
+	w, err := baseline.NewWriter(tmpPath, BinlogEventColumns, cfg)
 	if err != nil {
 		return 0, fmt.Errorf("create parquet writer: %w", err)
 	}
@@ -70,8 +81,8 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 	var closed bool
 	defer func() {
 		if !closed {
-			w.Close()             //nolint
-			os.Remove(outputPath) //nolint
+			w.Close()          //nolint
+			os.Remove(tmpPath) //nolint
 		}
 	}()
 
@@ -182,8 +193,40 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 
 	closed = true
 	if err := w.Close(); err != nil {
-		os.Remove(outputPath) //nolint
+		os.Remove(tmpPath) //nolint
 		return rowCount, fmt.Errorf("close writer: %w", err)
 	}
+	if err := os.Rename(tmpPath, outputPath); err != nil {
+		os.Remove(tmpPath) //nolint
+		return rowCount, fmt.Errorf("rename %s into place: %w", tmpPath, err)
+	}
 	return rowCount, nil
+}
+
+// ValidateArchiveFile opens the Parquet file at path just far enough to read
+// its trailing footer metadata (row-group index, schema, row count) without
+// decoding any row data. A file left partially written by a crash mid-write
+// (issue #802: kill -9, OOM, host reboot — none of which run Go's
+// defer-based cleanup) has no valid footer and parquet.OpenFile fails on it,
+// even though the file's size is greater than zero. Callers deciding whether
+// an on-disk archive can be trusted (e.g. rotation's --retry skip, or
+// deciding it is safe to drop the source partition) must not rely on
+// size > 0 alone — they should use this instead. Returns the row count
+// recorded in the footer on success.
+func ValidateArchiveFile(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	pf, err := parquet.OpenFile(f, info.Size())
+	if err != nil {
+		return 0, fmt.Errorf("invalid or truncated parquet footer: %w", err)
+	}
+	return pf.NumRows(), nil
 }

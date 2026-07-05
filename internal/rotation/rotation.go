@@ -141,7 +141,31 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 						return Result{}, fmt.Errorf("create archive directory for %s: %w", name, err)
 					}
 					var n int64
-					skipped := opts.Retry && fileExists(outPath)
+					skipped := false
+					if opts.Retry && fileExists(outPath) {
+						// A file existing at outPath with size>0 is NOT sufficient
+						// evidence it is a complete archive: a crash mid-write
+						// (kill -9, OOM, reboot) can leave a truncated, no-footer
+						// file here even though ArchivePartition now writes via a
+						// temp file + atomic rename (issue #802) — this guards
+						// leftovers from before that fix, or any other corruption.
+						// Only trust the file when archive_state independently
+						// recorded the same row count for this partition; a
+						// missing/mismatched row (exactly what a mid-write crash
+						// leaves, since that INSERT only happens after the write
+						// completes) means re-archive rather than silently
+						// skip-and-later-upload/drop a corrupt file.
+						verified, err := verifiedExistingArchive(ctx, db, outPath, name, opts.BintrailID)
+						if err != nil {
+							return Result{}, fmt.Errorf("verify existing archive for %s: %w", name, err)
+						}
+						if verified {
+							skipped = true
+						} else {
+							slog.Warn("existing archive file failed verification (truncated or unrecorded); re-archiving",
+								"partition", name, "file", outPath)
+						}
+					}
 					if skipped {
 						slog.Info("skipping existing archive (--retry)", "partition", name, "file", outPath)
 						if opts.Format != "json" {
@@ -460,9 +484,44 @@ func partitionArchived(ctx context.Context, db *sql.DB, partition string) (bool,
 }
 
 // fileExists reports whether a file exists and has a size greater than zero.
+// Existence alone does NOT mean the file is a complete archive — see
+// verifiedExistingArchive, which callers deciding whether to trust an
+// on-disk file (--retry skip, or before a DROP PARTITION) must use instead.
 func fileExists(path string) bool {
 	fi, err := os.Stat(path)
 	return err == nil && fi.Size() > 0
+}
+
+// verifiedExistingArchive reports whether the Parquet file at outPath can be
+// trusted as a complete, previously-finished archive of partition — i.e.
+// whether --retry may safely skip re-archiving it. It is trusted only when
+// BOTH: (1) archive_state records a row count for this partition (a
+// completed prior run inserts that row only after the write finishes — a
+// crash mid-write never reaches it), and (2) the file's own Parquet footer
+// opens cleanly and reports that same row count (issue #802: a truncated
+// file has no valid footer, even though its size is greater than zero). A
+// missing archive_state row or a footer/row-count mismatch both mean the
+// file cannot be trusted, so this returns false and the caller re-archives.
+func verifiedExistingArchive(ctx context.Context, db *sql.DB, outPath, partition, bintrailID string) (bool, error) {
+	var recordedRows sql.NullInt64
+	err := db.QueryRowContext(ctx,
+		`SELECT row_count FROM archive_state WHERE partition_name = ? AND bintrail_id = ?`,
+		partition, bintrailID,
+	).Scan(&recordedRows)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	if !recordedRows.Valid {
+		return false, nil
+	}
+	fileRows, err := archive.ValidateArchiveFile(outPath)
+	if err != nil {
+		return false, nil // truncated/invalid footer: not trusted, not a hard error
+	}
+	return fileRows == recordedRows.Int64, nil
 }
 
 // HiveArchivePath returns the Hive-partitioned path for a binlog_events partition

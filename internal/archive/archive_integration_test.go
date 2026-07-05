@@ -83,6 +83,57 @@ func TestArchivePartition_nullBinlogFile(t *testing.T) {
 	}
 }
 
+// TestArchivePartition_NoStrayTmpFileOnSuccess pins the issue #802 atomic-write
+// invariant on the success path: ArchivePartition must write to
+// outputPath+".tmp" and rename it into place, leaving no ".tmp" leftover once
+// it returns without error.
+func TestArchivePartition_NoStrayTmpFileOnSuccess(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	ts := "2026-02-19 14:00:00"
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts, nil, "mydb", "orders", 1, "1",
+		nil, nil, []byte(`{"id":1}`))
+
+	outPath := filepath.Join(t.TempDir(), "events.parquet")
+	if _, err := ArchivePartition(context.Background(), db, dbName, "p_future", outPath, "none"); err != nil {
+		t.Fatalf("ArchivePartition failed: %v", err)
+	}
+	if _, err := os.Stat(outPath); err != nil {
+		t.Fatalf("final output file must exist: %v", err)
+	}
+	if _, err := os.Stat(outPath + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("stray .tmp file left behind after a successful archive, stat err = %v", err)
+	}
+}
+
+// TestArchivePartition_QueryErrorLeavesNoFinalFile reproduces the failure
+// window issue #802 targets: an error partway through ArchivePartition (here,
+// querying a partition that doesn't exist) must never leave anything at the
+// final outputPath — only the (cleaned-up) .tmp file may have existed. Before
+// the tmp+rename fix, ArchivePartition wrote directly to outputPath, so a
+// crash after the writer was created but before Close() could leave a
+// truncated file exactly there; a process kill (which skips Go's defer-based
+// cleanup entirely) could not be caught by this test, but the underlying
+// write target can: the fixed code physically cannot reach outputPath except
+// via the final os.Rename.
+func TestArchivePartition_QueryErrorLeavesNoFinalFile(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	outPath := filepath.Join(t.TempDir(), "events.parquet")
+	_, err := ArchivePartition(context.Background(), db, dbName, "p_does_not_exist", outPath, "none")
+	if err == nil {
+		t.Fatal("expected an error archiving a nonexistent partition")
+	}
+	if _, statErr := os.Stat(outPath); !os.IsNotExist(statErr) {
+		t.Errorf("final output path must not exist after a failed archive, stat err = %v", statErr)
+	}
+	if _, statErr := os.Stat(outPath + ".tmp"); !os.IsNotExist(statErr) {
+		t.Errorf(".tmp file must be cleaned up after a failed archive, stat err = %v", statErr)
+	}
+}
+
 // TestArchivePartition_queryTextRoundTrip pins the #699 wiring through the
 // rotate path: the SELECT list, Scan targets, and the positional values/nulls
 // arrays must stay aligned — a transposition of queryText/queryHash would
