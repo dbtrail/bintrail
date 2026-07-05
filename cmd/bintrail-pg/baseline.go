@@ -21,14 +21,18 @@ one Parquet file per table (the PostgreSQL sibling of 'bintrail baseline' —
 no mydumper/pg_dump step; tables are COPYed inside one REPEATABLE READ
 transaction directly into Parquet).
 
-The snapshot is anchored to the WAL: pg_current_wal_lsn() is captured in the
-same statement that establishes the MVCC snapshot and embedded in each Parquet
-file's metadata, so reconstruct can apply the indexed deltas that start
-strictly after it. The replication slot (--slot) is ensured to exist BEFORE
-the snapshot opens — if it does not exist and --repl-dsn is given, it is
-created (the same slot 'bintrail-pg stream' will consume); without --repl-dsn
-a missing slot is a fatal error, because a baseline without a slot has no
-delta stream to anchor.
+The snapshot is anchored to the WAL: the replication slot's own
+confirmed_flush_lsn/restart_lsn is read just before the snapshot transaction
+opens and embedded in each Parquet file's metadata as the delta-replay floor,
+so reconstruct can apply the indexed deltas at or after it (#771 — not
+pg_current_wal_lsn(), and not a strictly-after cutoff: the slot floor is
+always at or before the snapshot's own live LSN, and any resulting overlap
+with rows already in the baseline is harmless because the merge is
+last-write-wins over full-row images). The replication slot (--slot) is
+ensured to exist BEFORE the snapshot opens — if it does not exist and
+--repl-dsn is given, it is created (the same slot 'bintrail-pg stream' will
+consume); without --repl-dsn a missing slot is a fatal error, because a
+baseline without a slot has no delta stream to anchor.
 
 Values are stored as raw PostgreSQL text, matching the pgoutput rendering the
 delta path indexes — no type conversion.
