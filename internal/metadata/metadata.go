@@ -193,7 +193,7 @@ type snapshotScanStats struct {
 	pre212Tables []string
 }
 
-// scanSnapshotRows consumes a schema_snapshots result set (the 9-column
+// scanSnapshotRows consumes a schema_snapshots result set (the 10-column
 // SELECT shared by NewResolver and NewLatestPerTableResolver) into tables,
 // keyed "schema.table", and reports the pre-#212 signals callers warn on.
 func scanSnapshotRows(rows *sql.Rows, tables map[string]*TableMeta) (snapshotScanStats, error) {
@@ -469,6 +469,22 @@ func (r *Resolver) MapRow(schema, table string, row []any) (map[string]any, erro
 //
 // TEXT/BLOB/JSON/GEOMETRY are unaffected: go-mysql already delivers those as
 // []byte, so they never reach this function as a string.
+//
+// Residual, accepted ambiguity (same class as marshalRow's
+// looksLikeJSONContainer gate, and #736's bool/json.Number repair): a
+// latin1/cp1252 value whose raw bytes happen to ALSO form valid UTF-8 (e.g.
+// latin1 bytes 0xC3 0xA9, which decode as UTF-8 "é") passes the
+// utf8.ValidString check and is left as-is — silently misread as the
+// wrong text, with no error, since bintrail cannot tell "genuinely UTF-8"
+// from "coincidentally valid UTF-8" from the bytes alone. Only reachable
+// content-sniffing, not a per-value type tag, distinguishes the two; a full
+// fix would need to carry the source encoding out-of-band, which is out of
+// scope for #756's reported corruption class (the common case — genuinely
+// mis-set charsets producing INVALID UTF-8 — is what this function fixes).
+// Charset support beyond latin1 is deliberately out of scope too: the issue
+// this closes only reports latin1, and its accepted "at minimum" fallback is
+// exactly the fail-loud default branch below — not silent corruption, and
+// not a guess at an unverified charset.
 func coerceTextEncoding(v any, col ColumnMeta) (any, error) {
 	switch strings.ToLower(col.DataType) {
 	case "binary", "varbinary":
@@ -486,6 +502,20 @@ func coerceTextEncoding(v any, col ColumnMeta) (any, error) {
 			decoded, err := charmap.Windows1252.NewDecoder().String(s)
 			if err != nil {
 				return nil, fmt.Errorf("failed to transcode latin1 (cp1252) value: %w", err)
+			}
+			// charmap.Windows1252's decoder is total — it never returns a
+			// non-nil error, even for the 5 cp1252 code points cp1252 itself
+			// leaves undefined (0x81, 0x8D, 0x8F, 0x90, 0x9D): those silently
+			// decode to U+FFFD instead. Left unchecked, that's the exact
+			// silent-corruption failure mode #756 exists to close, just
+			// narrowed to 5 specific bytes. A genuine latin1/cp1252 value
+			// never legitimately contains U+FFFD (MySQL's latin1 has no
+			// character at those 5 positions either), so its presence here
+			// means the source byte was one of the 5 undefined points, not a
+			// real transcoding — fail loud instead of embedding it.
+			if strings.ContainsRune(decoded, utf8.RuneError) {
+				return nil, fmt.Errorf(
+					"value contains a byte with no latin1 (cp1252) character assignment — cannot transcode without further corruption")
 			}
 			return decoded, nil
 		case "":

@@ -571,6 +571,22 @@ func (g *Generator) base64Cols(r *metadata.Resolver, schema, table string) map[s
 // raw Go string with no charset, which json.Marshal could silently corrupt to
 // U+FFFD), so they take the same []byte-to-base64 storage path as BLOB and
 // must be decoded the same way on the way back out.
+//
+// Retroactive-reclassification risk (#756, accepted — unlike BLOB/TEXT, which
+// were ALWAYS []byte-and-therefore-base64 from day one): a BINARY/VARBINARY
+// event indexed BEFORE this fix shipped was stored as a PLAIN (non-base64)
+// string, since go-mysql handed it to marshalRow as a Go string, not []byte.
+// decodeStoredBase64 cannot tell "pre-fix plain string" from "post-fix base64
+// string" — both are just strings in the stored JSON — so it now attempts to
+// base64-decode old values too. It silently no-ops on a string that isn't
+// valid base64 (see decodeStoredBase64), but a pre-fix value whose raw bytes
+// happen to satisfy the base64 alphabet and padding (astronomically unlikely
+// for genuinely random binary content, but plausible for a VARBINARY column
+// storing ASCII-like data, e.g. a hex-encoded token) decodes to DIFFERENT,
+// wrong bytes with no error. Fully closing this would need a per-event
+// storage-format marker (there is none), which is out of proportion to
+// #756's reported corruption class; this is the same class of accepted,
+// documented historical-data ambiguity as the #736 nil-case gap below.
 func base64StoredKind(dataType string) (binary, ok bool) {
 	switch strings.ToLower(dataType) {
 	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary":

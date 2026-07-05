@@ -934,14 +934,16 @@ func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Reso
 
 	if len(schemas) == 0 {
 		q = `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
-		            ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, EXTRA
+		            ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, EXTRA,
+		            COALESCE(CHARACTER_SET_NAME, '')
 		     FROM information_schema.COLUMNS
 		     WHERE TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
 		     ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`
 	} else {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
 		q = fmt.Sprintf(`SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
-		                         ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, EXTRA
+		                         ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, EXTRA,
+		                         COALESCE(CHARACTER_SET_NAME, '')
 		                  FROM information_schema.COLUMNS
 		                  WHERE TABLE_SCHEMA IN (%s)
 		                  ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`, placeholders)
@@ -958,9 +960,9 @@ func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Reso
 
 	tables := make(map[string]*metadata.TableMeta)
 	for rows.Next() {
-		var schema, table, column, colKey, dataType, extra string
+		var schema, table, column, colKey, dataType, extra, characterSet string
 		var ordinal int
-		if err := rows.Scan(&schema, &table, &column, &ordinal, &colKey, &dataType, &extra); err != nil {
+		if err := rows.Scan(&schema, &table, &column, &ordinal, &colKey, &dataType, &extra, &characterSet); err != nil {
 			return nil, fmt.Errorf("scan column row: %w", err)
 		}
 
@@ -980,6 +982,13 @@ func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Reso
 			IsPK:            isPK,
 			DataType:        dataType,
 			IsGenerated:     isGenerated,
+			// CharacterSet (#756) lets metadata.MapRow transcode an
+			// invalid-UTF-8 latin1 CHAR/VARCHAR value instead of failing loud
+			// on it — without this, every BYOS/agent-captured row from a
+			// legacy latin1 table would be silently dropped (warn-and-skip)
+			// even though the same table snapshotted via `bintrail snapshot`
+			// would transcode successfully.
+			CharacterSet: characterSet,
 		})
 		if isPK {
 			tm.PKColumns = append(tm.PKColumns, column)

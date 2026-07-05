@@ -243,6 +243,19 @@ func TestCoerceTextEncoding(t *testing.T) {
 		{"invalid utf8 latin1 transcoded", "Jos" + string([]byte{0xE9}), ColumnMeta{DataType: "varchar", CharacterSet: "latin1"}, "José", false},
 		{"invalid utf8 empty charset fails", invalid, ColumnMeta{DataType: "varchar"}, nil, true},
 		{"invalid utf8 unsupported charset fails", invalid, ColumnMeta{DataType: "char", CharacterSet: "koi8r"}, nil, true},
+		// charmap.Windows1252's decoder is total (never returns an error), so
+		// the 5 cp1252-undefined byte positions (0x81, 0x8D, 0x8F, 0x90, 0x9D)
+		// would otherwise decode "successfully" straight to U+FFFD — the exact
+		// silent-corruption class #756 exists to close. coerceTextEncoding
+		// must catch this itself and fail loud instead.
+		{"latin1 undefined cp1252 byte 0x81 fails loud", string([]byte{0x81}), ColumnMeta{DataType: "varchar", CharacterSet: "latin1"}, nil, true},
+		{"latin1 undefined cp1252 byte 0x9d fails loud", string([]byte{0x9D}), ColumnMeta{DataType: "char", CharacterSet: "latin1"}, nil, true},
+		// The reverse of the above: genuine cp1252-only printable characters
+		// (0x80-0x9F range that diverges from plain ISO-8859-1, e.g. the euro
+		// sign and a left double quotation mark) must transcode cleanly, not
+		// be mistaken for the undefined-byte case.
+		{"latin1 cp1252 euro sign transcoded", string([]byte{0x80}), ColumnMeta{DataType: "varchar", CharacterSet: "latin1"}, "€", false},
+		{"latin1 cp1252 left double quote transcoded", string([]byte{0x93}), ColumnMeta{DataType: "varchar", CharacterSet: "latin1"}, "“", false},
 		{"non-char/binary type untouched", int64(42), ColumnMeta{DataType: "int"}, int64(42), false},
 		{"non-string value on varchar passes through", int64(42), ColumnMeta{DataType: "varchar"}, int64(42), false},
 	}

@@ -339,10 +339,17 @@ func marshalRow(row map[string]any) ([]byte, error) {
 	// query.looksLikeJSONContainer, which guards the same ambiguity on the
 	// baseline/Parquet read side.
 	//
-	// go-mysql delivers only BLOB/TEXT, JSON, and GEOMETRY columns as []byte
-	// (VARCHAR/CHAR/VARBINARY/BINARY arrive as Go string; ENUM/SET as int64),
-	// so this branch is the full extent of what needs gating — no other
-	// column kind can reach it.
+	// go-mysql itself delivers only BLOB/TEXT, JSON, and GEOMETRY columns as
+	// []byte (VARCHAR/CHAR/VARBINARY/BINARY arrive as Go string from go-mysql;
+	// ENUM/SET as int64) — but metadata.MapRow now reinterprets BINARY/
+	// VARBINARY as []byte too (#756, before this function ever sees the row),
+	// so by the time a row reaches marshalRow, []byte covers those five kinds.
+	// They all go through the same looksLikeJSONContainer/json.Valid gate
+	// above: a BINARY/VARBINARY value whose first non-whitespace byte happens
+	// to be '{'/'[' and whose full content happens to be valid JSON would be
+	// promoted too, same residual ambiguity as a TEXT/BLOB value that
+	// genuinely looks like JSON (documented below) — astronomically unlikely
+	// for real binary content, and not fixable from bytes alone.
 	//
 	// Residual, accepted ambiguity (not fixed here, same limit as the
 	// baseline-side guard above): a plain TEXT/BLOB value whose content

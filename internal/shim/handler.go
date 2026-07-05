@@ -1112,6 +1112,15 @@ func (h *Handler) mapEventImages(schema, table string, rows []query.ResultRow) {
 // raw Go string with no charset, which json.Marshal could silently corrupt to
 // U+FFFD), so they take the same []byte-to-base64 storage path as BLOB and
 // must be decoded the same way here.
+//
+// Retroactive-reclassification risk (#756, accepted): unlike BLOB/TEXT (always
+// []byte-and-base64 from day one), a BINARY/VARBINARY event indexed BEFORE
+// this fix was stored as a plain, non-base64 string. decodeStoredBase64 can't
+// tell that apart from a post-fix base64 string, so a pre-fix value whose raw
+// bytes happen to satisfy the base64 alphabet+padding decodes to different,
+// wrong bytes with no error — astronomically unlikely for random binary
+// content, but plausible for a VARBINARY column storing ASCII-like data. See
+// the fuller rationale on the sibling copy in internal/recovery/recovery.go.
 func base64StoredKind(dataType string) (binary, ok bool) {
 	switch strings.ToLower(dataType) {
 	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary":

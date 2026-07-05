@@ -322,3 +322,46 @@ func TestByosStreamLoop_IdentityChangeAbortsLoop(t *testing.T) {
 		t.Errorf("unmet expectations: %v", err)
 	}
 }
+
+// TestBuildResolverFromSource_capturesCharacterSet pins #756 for the BYOS
+// agent path: buildResolverFromSource must capture CHARACTER_SET_NAME the
+// same way TakeSnapshot does, so a legacy latin1 CHAR/VARCHAR column
+// transcodes cleanly in metadata.MapRow instead of failing loud (or, before
+// #756, being silently corrupted) purely because the agent's own schema
+// resolver never learned the column's charset.
+func TestBuildResolverFromSource_capturesCharacterSet(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME").
+		WillReturnRows(sqlmock.NewRows(
+			[]string{"TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_KEY", "DATA_TYPE", "EXTRA", "COALESCE(CHARACTER_SET_NAME, '')"}).
+			AddRow("mydb", "customers", "id", 1, "PRI", "int", "", "").
+			AddRow("mydb", "customers", "name", 2, "", "varchar", "", "latin1").
+			AddRow("mydb", "customers", "token", 3, "", "binary", "", ""))
+
+	resolver, err := buildResolverFromSource(db, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	tm, err := resolver.Resolve("mydb", "customers")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	var gotCharset string
+	for _, c := range tm.Columns {
+		if c.Name == "name" {
+			gotCharset = c.CharacterSet
+		}
+	}
+	if gotCharset != "latin1" {
+		t.Errorf("name column CharacterSet = %q, want %q", gotCharset, "latin1")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
