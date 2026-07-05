@@ -20,13 +20,14 @@ import (
 
 // TestAllowGapsDefaultIsStrict pins the load-bearing claim of issue #257:
 // the shim CLI's --allow-gaps flag defaults to false. A regression that
-// flips this default (e.g. someone copy-pasting from `bintrail recover`,
-// which is intentionally permissive) would silently re-introduce the
-// silent-partial-result bug — archive failures absorbed as slog.Warn
-// while the connecting MySQL client gets an apparently-successful
-// resultset missing rows. This test exists specifically because the
-// default value is what the issue's fix turns on; framework wiring is
-// not the load-bearing claim.
+// flips this default would silently re-introduce the silent-partial-result
+// bug — archive failures absorbed as slog.Warn while the connecting MySQL
+// client gets an apparently-successful resultset missing rows. This test
+// exists specifically because the default value is what the issue's fix
+// turns on; framework wiring is not the load-bearing claim. `bintrail
+// recover` used to be the one intentionally-permissive exception to this
+// convention; it now defaults to strict too (see #761,
+// TestRecoverCmd_allowGapsDefaultIsStrict in recover_test.go).
 func TestAllowGapsDefaultIsStrict(t *testing.T) {
 	flag := shimCmd.Flags().Lookup("allow-gaps")
 	if flag == nil {

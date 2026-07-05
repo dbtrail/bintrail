@@ -42,6 +42,7 @@ func TestRecoverCmd_defaults(t *testing.T) {
 		{"limit", "1000"},
 		{"dry-run", "false"},
 		{"format", "text"},
+		{"allow-gaps", "false"},
 	}
 	for _, tc := range cases {
 		f := recoverCmd.Flag(tc.flag)
@@ -74,11 +75,28 @@ func TestRecoverCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"index-dsn", "schema", "table", "pk", "event-type",
 		"gtid", "since", "until", "flag", "output", "dry-run", "limit",
-		"no-archive", "column-eq",
+		"no-archive", "column-eq", "allow-gaps",
 	} {
 		if recoverCmd.Flag(name) == nil {
 			t.Errorf("flag --%s not registered on recoverCmd", name)
 		}
+	}
+}
+
+// TestRecoverCmd_allowGapsDefaultIsStrict pins the load-bearing claim of
+// issue #761: `recover` must default to strict coverage-gap handling like
+// `reconstruct`/`shim`/`recover-cascade`, not the old hardcoded
+// AllowGaps=true that let an incomplete reversal script exit 0. A
+// regression that flips this default back to permissive would silently
+// reintroduce the "operator applies a partial restore believing it
+// complete" failure mode.
+func TestRecoverCmd_allowGapsDefaultIsStrict(t *testing.T) {
+	f := recoverCmd.Flag("allow-gaps")
+	if f == nil {
+		t.Fatal("--allow-gaps flag not registered on recoverCmd")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("--allow-gaps default = %q, want %q (strict mode is the safe default; see #761)", f.DefValue, "false")
 	}
 }
 

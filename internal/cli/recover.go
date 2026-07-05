@@ -35,6 +35,13 @@ Reversal logic:
   UPDATE → UPDATE ... SET (row_before) WHERE (row_after, current state)
   INSERT → DELETE FROM ... WHERE (row_after, current state)
 
+Events are fetched from both live MySQL partitions and any Parquet archives
+auto-discovered via archive_state. Pass --no-archive to query MySQL only.
+By default, a coverage gap (an hour rotated out of MySQL with no archive, or
+an archive source that fails to fetch) aborts recovery before any SQL is
+generated; pass --allow-gaps to proceed with a warning and a possibly
+incomplete reversal script.
+
 Examples:
   # Recover deleted rows in a time window
   bintrail recover --index-dsn "..." \
@@ -74,6 +81,7 @@ var (
 	rNoArchive      bool
 	rColumnEq       []string
 	rMaxScriptBytes string
+	rAllowGaps      bool
 )
 
 func init() {
@@ -96,6 +104,7 @@ func init() {
 	recoverCmd.Flags().StringVar(&rFormat, "format", "text", "Output format: text or json")
 	recoverCmd.Flags().BoolVar(&rNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
 	recoverCmd.Flags().StringVar(&rMaxScriptBytes, "max-script-bytes", "2GB", "Refuse to generate a reversal script whose estimated row payload exceeds this size (e.g. 512MB, 4GB; 0 = unlimited). Bounds the rendered-script memory spike on BLOB/TEXT-heavy recoveries (#654).")
+	recoverCmd.Flags().BoolVar(&rAllowGaps, "allow-gaps", false, "Proceed even when the event index has coverage gaps (hours rotated out of MySQL with no archive) or an archive source fails (may produce an incomplete reversal script)")
 	AddDuckDBTuningFlags(recoverCmd)
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(recoverCmd)
@@ -255,10 +264,20 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		Opts:           opts,
 		DBName:         dbName,
 		NoArchive:      rNoArchive || rProfile != "",
-		AllowGaps:      true, // preserve recover's warn-and-continue behavior
+		AllowGaps:      rAllowGaps,
 		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
 	})
 	if err != nil {
+		// Surface CLI hints only at the CLI layer; the library types
+		// (query.GapError, query.SourceEmptyError) stay command-neutral.
+		var gapErr *query.GapError
+		if errors.As(err, &gapErr) {
+			return fmt.Errorf("%w; pass --allow-gaps to proceed with a possibly incomplete recovery", err)
+		}
+		var emptyErr *query.SourceEmptyError
+		if errors.As(err, &emptyErr) {
+			return fmt.Errorf("%w; run `bintrail archive reconcile` to re-sync archive_state with storage, or pass --allow-gaps to proceed without that source", err)
+		}
 		return err
 	}
 
