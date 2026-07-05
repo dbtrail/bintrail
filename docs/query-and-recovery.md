@@ -176,6 +176,14 @@ Three offline commands hold their working set in memory, so a BLOB/TEXT-heavy or
 
 The MCP server applies its own agent-facing row ceiling on the `query` tool — see [the MCP tool reference](mcp-server.md#tool-parameters-and-behavior-reference).
 
+### TRUNCATE / DROP / RENAME in the reconstruction window
+
+`TRUNCATE TABLE`, `DROP TABLE`, and `RENAME TABLE` emit no row-level binlog events — only an audit entry in `schema_changes`. Because `reconstruct --output-format mydumper` and the shim's `_snapshot` merge a baseline snapshot with the row events fetched in that window, one of these statements between the baseline and `--at` leaves nothing for the merge to apply: without a check, the baseline's pre-truncate rows would pass straight through and be reported as the table's state at `--at`, even though the real table had none of them ([#764](https://github.com/dbtrail/dbtrail/issues/764)).
+
+All three baseline-merging entry points — `reconstruct` single-row, `reconstruct --output-format mydumper` (full-table), and the shim's `_snapshot` (both single-row and full-table) — now query `schema_changes` for a `TRUNCATE TABLE`/`DROP TABLE`/`RENAME TABLE` on the target table in `(baseline snapshot time, --at]` and **refuse** the run with an error naming the DDL type and its detected timestamp, rather than silently resurrecting rows. Re-baseline the table after the DDL and reconstruct from the new baseline. A pre-DDL-tracking index (no `schema_changes` table) is not affected — the check treats a missing table as nothing to check, not a hard failure.
+
+This is an offline/`_snapshot` concern only — `_flashback` and `bintrail query`/`recover` read the row-event history directly and never claim a never-touched row still exists.
+
 ### DuckDB resource tuning (`--ultrafast`)
 
 When `query`, `recover`, or `reconstruct` scan Parquet archives, DuckDB runs under a conservative, container-safe budget by default: **2 threads and a 4 GB memory limit**, spilling to the OS temp directory when exceeded. These defaults keep bintrail alive in small shared containers; on a dedicated box with plenty of RAM they leave performance on the table.

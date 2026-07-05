@@ -262,6 +262,15 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ensure index schema: %w", err)
 	}
 
+	// Refuse if a TRUNCATE/DROP/RENAME hit this table in the window: it emits
+	// no row events, so folding the fetched deltas onto the baseline below
+	// would silently resolve a truncated-away row as if it still existed at
+	// --at (#764; same guard as the full-table path and the shim's
+	// _snapshot).
+	if err := reconstruct.CheckDestructiveDDL(cmd.Context(), db, recSchema, recTable, snapshotTime, at); err != nil {
+		return err
+	}
+
 	engine := query.New(db)
 
 	// The planner needs a database name derived from the DSN.

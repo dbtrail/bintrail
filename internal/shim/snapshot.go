@@ -124,6 +124,13 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		return nil, err
 	}
 
+	// Refuse if a TRUNCATE/DROP/RENAME hit this table in the window: it emits
+	// no row events, so the merge below would replay the baseline straight
+	// through and silently resurrect rows the DDL actually deleted (#764).
+	if err := reconstruct.CheckDestructiveDDL(ctx, h.indexDB, q.Schema, q.Table, snapshotTime, q.AsOf); err != nil {
+		return nil, err
+	}
+
 	// Fetch the latest event per PK from the snapshot instant up to AsOf.
 	// LimitPerPK=1 yields exactly the change map the merge needs (last write
 	// wins per PK); Since=snapshotTime drops pre-baseline events the baseline
@@ -385,6 +392,14 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		// A real baseline-source failure (unreadable dir, S3 outage) is a
 		// server-side fault: plain error → ER_UNKNOWN_ERROR (1105), the same
 		// user-vs-server split runPointInTime preserves for fetch failures.
+		return nil, err
+	}
+
+	// Refuse if a TRUNCATE/DROP/RENAME hit this table in the window: same
+	// blind spot as the full-table path — no row events to invalidate the
+	// baseline image, so the row would silently resolve as if it still
+	// existed after being truncated away (#764).
+	if err := reconstruct.CheckDestructiveDDL(ctx, h.indexDB, q.Schema, q.Table, snapshotTime, q.AsOf); err != nil {
 		return nil, err
 	}
 

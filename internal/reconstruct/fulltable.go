@@ -374,6 +374,14 @@ func ReconstructTable(
 		}
 	}
 
+	// ── 3b. Refuse if a TRUNCATE/DROP/RENAME hit this table in the window ──
+	// TRUNCATE/DROP emit no row events (#764): without this check the merge
+	// below would replay the baseline straight through and silently
+	// resurrect rows the DDL actually deleted.
+	if err := CheckDestructiveDDL(ctx, db, schema, table, snapshotTime, cfg.At); err != nil {
+		return nil, err
+	}
+
 	// ── 4. Fetch events via the shared helper (gap-aware) ──────────────────
 	fetchOpts := query.Options{
 		Schema: schema,
