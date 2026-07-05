@@ -123,12 +123,28 @@ func (f *Filters) Matches(schema, table string) bool {
 func BuildPKValues(pkColumns []metadata.ColumnMeta, row map[string]any) string {
 	parts := make([]string, 0, len(pkColumns))
 	for _, col := range pkColumns {
-		val := fmt.Sprintf("%v", row[col.Name])
+		val := formatPKValue(row[col.Name])
 		val = strings.ReplaceAll(val, `\`, `\\`)
 		val = strings.ReplaceAll(val, `|`, `\|`)
 		parts = append(parts, val)
 	}
 	return strings.Join(parts, "|")
+}
+
+// formatPKValue renders a single PK value for BuildPKValues. []byte needs its
+// own case: since #756, metadata.MapRow hands back a BINARY/VARBINARY value as
+// []byte (routing it through marshalRow's base64-safe path instead of a raw Go
+// string that json.Marshal could corrupt) — a real-world PK shape, e.g. a
+// BINARY(16) UUID primary key. Without this case, "%v" on a []byte prints Go's
+// bracketed decimal-byte representation (e.g. "[233 12 ...]") instead of the
+// raw bytes, which would silently change pk_hash/pk_values for every row with
+// such a PK. string(b) reproduces exactly what "%v" printed for that same
+// value before #756 (when it was still a raw Go string of the same bytes).
+func formatPKValue(v any) string {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 // ChangedColumns returns the sorted list of column names whose values differ

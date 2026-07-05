@@ -516,12 +516,14 @@ func columnNameSet(cols []metadata.ColumnMeta) map[string]bool {
 	return s
 }
 
-// base64Cols maps each column of a table that go-mysql delivers as []byte — the
-// BLOB and TEXT families (both binlog type MYSQL_TYPE_BLOB) — to whether it is
-// binary. marshalRow base64-encodes those non-JSON []byte values into the stored
-// JSON, so on recovery the value comes back as a base64 STRING that must be
-// decoded before emission or the reversal SQL writes the base64 text verbatim
-// (#653): binary → X'hex', text → a string literal.
+// base64Cols maps each column of a table that ends up stored as []byte — the
+// BLOB/TEXT families (both binlog type MYSQL_TYPE_BLOB, delivered as []byte by
+// go-mysql) plus BINARY/VARBINARY (reinterpreted as []byte by metadata.MapRow,
+// #756) — to whether it is binary. marshalRow base64-encodes those non-JSON
+// []byte values into the stored JSON, so on recovery the value comes back as a
+// base64 STRING that must be decoded before emission or the reversal SQL
+// writes the base64 text verbatim (#653): binary → X'hex', text → a string
+// literal.
 //
 // Returns nil (no coercion) for a non-MySQL dialect, a nil resolver, or an
 // unresolvable table. In the last two cases BLOB/TEXT values are still emitted as
@@ -563,9 +565,15 @@ func (g *Generator) base64Cols(r *metadata.Resolver, schema, table string) map[s
 // JSON container ({ or [), so a JSON column whose top-level value is itself a
 // bare scalar (rare, but legal) falls through to this same base64 path
 // instead of failing to round-trip.
+//
+// "binary"/"varbinary" are included (binary) since #756: metadata.MapRow now
+// reinterprets those two DataTypes as []byte (they arrive from go-mysql as a
+// raw Go string with no charset, which json.Marshal could silently corrupt to
+// U+FFFD), so they take the same []byte-to-base64 storage path as BLOB and
+// must be decoded the same way on the way back out.
 func base64StoredKind(dataType string) (binary, ok bool) {
 	switch strings.ToLower(dataType) {
-	case "blob", "tinyblob", "mediumblob", "longblob":
+	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary":
 		return true, true
 	case "text", "tinytext", "mediumtext", "longtext", "json":
 		return false, true

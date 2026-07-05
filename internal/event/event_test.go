@@ -19,6 +19,14 @@ func TestBuildPKValues(t *testing.T) {
 		{"composite", []metadata.ColumnMeta{{Name: "a"}, {Name: "b"}}, map[string]any{"a": 1, "b": 2}, "1|2"},
 		{"escape pipe and backslash", []metadata.ColumnMeta{{Name: "c"}},
 			map[string]any{"c": `x|y\z`}, `x\|y\\z`},
+		// #756: a BINARY(16) PK (e.g. a binary UUID) now arrives from
+		// metadata.MapRow as []byte rather than a raw Go string. "%v" on a
+		// []byte prints Go's bracketed decimal representation
+		// (e.g. "[222 173]"), not the raw bytes — BuildPKValues must special-
+		// case it so pk_values/pk_hash stay exactly what they were when the
+		// same bytes arrived as a string.
+		{"binary PK bytes preserved raw", []metadata.ColumnMeta{{Name: "id"}},
+			map[string]any{"id": []byte{0xDE, 0xAD}}, string([]byte{0xDE, 0xAD})},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

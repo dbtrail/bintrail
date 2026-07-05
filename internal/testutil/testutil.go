@@ -264,6 +264,7 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		column_key       VARCHAR(3)   NOT NULL,
 		data_type        VARCHAR(64)  NOT NULL,
 		column_type      TEXT         DEFAULT NULL,
+		character_set_name VARCHAR(32) DEFAULT NULL,
 		is_nullable      VARCHAR(3)   NOT NULL,
 		column_default   TEXT         DEFAULT NULL,
 		is_generated     TINYINT(1)   NOT NULL DEFAULT 0,

@@ -77,3 +77,15 @@ func TestBase64StoredKind_json(t *testing.T) {
 		t.Errorf("expected json => (binary=false, ok=true), got (%v, %v)", binary, ok)
 	}
 }
+
+// TestBase64StoredKind_binaryVarbinary pins #756: metadata.MapRow now
+// reinterprets BINARY/VARBINARY as []byte, so they take the same base64
+// storage path as BLOB and must be reported as decodable+binary here too.
+func TestBase64StoredKind_binaryVarbinary(t *testing.T) {
+	for _, dt := range []string{"binary", "varbinary", "BINARY", "VarBinary"} {
+		binary, ok := base64StoredKind(dt)
+		if !ok || !binary {
+			t.Errorf("base64StoredKind(%q) = (%v,%v), want (true,true)", dt, binary, ok)
+		}
+	}
+}

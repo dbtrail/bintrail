@@ -1106,9 +1106,15 @@ func (h *Handler) mapEventImages(schema, table string, rows []query.ResultRow) {
 // JSON container ({ or [), so a JSON column whose top-level value is itself a
 // bare scalar (rare, but legal) falls through to this same base64 path
 // instead of failing to round-trip.
+//
+// "binary"/"varbinary" are included (binary) since #756: metadata.MapRow now
+// reinterprets those two DataTypes as []byte (they arrive from go-mysql as a
+// raw Go string with no charset, which json.Marshal could silently corrupt to
+// U+FFFD), so they take the same []byte-to-base64 storage path as BLOB and
+// must be decoded the same way here.
 func base64StoredKind(dataType string) (binary, ok bool) {
 	switch strings.ToLower(dataType) {
-	case "blob", "tinyblob", "mediumblob", "longblob":
+	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary":
 		return true, true
 	case "text", "tinytext", "mediumtext", "longtext", "json":
 		return false, true

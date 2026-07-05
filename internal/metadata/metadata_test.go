@@ -115,6 +115,165 @@ func TestMapRow_success(t *testing.T) {
 	}
 }
 
+// TestMapRow_binaryToBytes verifies the #756 fix: go-mysql hands BINARY/
+// VARBINARY values back as a raw Go string with no charset applied, and a
+// value with the high bit set (an MD5 digest, a binary UUID) is frequently
+// invalid UTF-8. Before the fix, that string reached json.Marshal unchanged
+// and every invalid byte was silently replaced with U+FFFD. MapRow must now
+// reinterpret it as []byte instead, which routes it through marshalRow's
+// existing []byte-to-base64 path (byte-perfect, no corruption).
+func TestMapRow_binaryToBytes(t *testing.T) {
+	r := buildTestResolver(map[string]*TableMeta{
+		"mydb.users": {
+			Schema: "mydb", Table: "users",
+			Columns: []ColumnMeta{
+				{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "binary", ColumnType: "binary(16)"},
+				{Name: "token", OrdinalPosition: 2, DataType: "varbinary", ColumnType: "varbinary(16)"},
+			},
+			PKColumns: []string{"id"},
+		},
+	})
+
+	// An MD5-digest-shaped value with the high bit set on several bytes —
+	// invalid UTF-8 (a lone 0xFF is never a valid UTF-8 sequence).
+	rawID := string([]byte{0x00, 0x01, 0xFF, 0xFE, 0x7F, 0x80, 0x81, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01})
+	rawToken := string([]byte{0xDE, 0xAD, 0xBE, 0xEF})
+
+	named, err := r.MapRow("mydb", "users", []any{rawID, rawToken})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	gotID, ok := named["id"].([]byte)
+	if !ok {
+		t.Fatalf("id: want []byte, got %T", named["id"])
+	}
+	if string(gotID) != rawID {
+		t.Errorf("id: bytes not preserved: got %x, want %x", gotID, rawID)
+	}
+	gotToken, ok := named["token"].([]byte)
+	if !ok {
+		t.Fatalf("token: want []byte, got %T", named["token"])
+	}
+	if string(gotToken) != rawToken {
+		t.Errorf("token: bytes not preserved: got %x, want %x", gotToken, rawToken)
+	}
+}
+
+// TestMapRow_latin1Transcoding verifies scenario 1 from #756: a legacy latin1
+// CHAR/VARCHAR value ("José", stored as cp1252 bytes — MySQL's "latin1" is
+// actually Windows-1252, not ISO-8859-1) is transcoded to valid UTF-8 instead
+// of being corrupted by json.Marshal's silent U+FFFD replacement.
+func TestMapRow_latin1Transcoding(t *testing.T) {
+	r := buildTestResolver(map[string]*TableMeta{
+		"mydb.customers": {
+			Schema: "mydb", Table: "customers",
+			Columns: []ColumnMeta{
+				{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+				{Name: "name", OrdinalPosition: 2, DataType: "varchar", CharacterSet: "latin1"},
+			},
+			PKColumns: []string{"id"},
+		},
+	})
+
+	// "José" encoded as cp1252/latin1: J, o, s, 0xE9 ('é'), unlike its UTF-8
+	// encoding (0xC3 0xA9), so this string is invalid UTF-8 as-is.
+	rawName := "Jos" + string([]byte{0xE9})
+
+	named, err := r.MapRow("mydb", "customers", []any{int64(1), rawName})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if named["name"] != "José" {
+		t.Errorf("name: want %q, got %q", "José", named["name"])
+	}
+}
+
+// TestMapRow_invalidUTF8UnknownCharset_failsLoud verifies the "at minimum"
+// fallback from #756: a CHAR/VARCHAR value that is not valid UTF-8 and whose
+// column has no captured (or unsupported) character set is rejected with an
+// error rather than silently corrupted by json.Marshal. Callers (parser.go)
+// already warn-and-skip a MapRow error, turning this into a loud, actionable
+// log line instead of silent at-rest data loss.
+func TestMapRow_invalidUTF8UnknownCharset_failsLoud(t *testing.T) {
+	invalid := string([]byte{0xFF, 0xFE})
+
+	cases := []struct {
+		name         string
+		characterSet string
+	}{
+		{"pre-#756 snapshot: no character set captured", ""},
+		{"unsupported charset", "cp1251"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := buildTestResolver(map[string]*TableMeta{
+				"mydb.legacy": {
+					Schema: "mydb", Table: "legacy",
+					Columns: []ColumnMeta{
+						{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+						{Name: "name", OrdinalPosition: 2, DataType: "varchar", CharacterSet: tc.characterSet},
+					},
+					PKColumns: []string{"id"},
+				},
+			})
+			_, err := r.MapRow("mydb", "legacy", []any{int64(1), invalid})
+			if err == nil {
+				t.Fatal("expected error for invalid UTF-8 with no safe transcoding, got nil")
+			}
+		})
+	}
+}
+
+func TestCoerceTextEncoding(t *testing.T) {
+	valid := "shipped"
+	invalid := string([]byte{0xFF})
+
+	cases := []struct {
+		name    string
+		v       any
+		col     ColumnMeta
+		want    any
+		wantErr bool
+	}{
+		{"binary string reinterpreted as bytes", "\x00\xff", ColumnMeta{DataType: "binary"}, []byte("\x00\xff"), false},
+		{"varbinary string reinterpreted as bytes", "\xde\xad", ColumnMeta{DataType: "varbinary"}, []byte("\xde\xad"), false},
+		{"binary nil passthrough", nil, ColumnMeta{DataType: "binary"}, nil, false},
+		{"valid utf8 varchar unchanged", valid, ColumnMeta{DataType: "varchar", CharacterSet: "utf8mb4"}, valid, false},
+		{"valid utf8 varchar unchanged even with empty charset", valid, ColumnMeta{DataType: "varchar"}, valid, false},
+		{"invalid utf8 latin1 transcoded", "Jos" + string([]byte{0xE9}), ColumnMeta{DataType: "varchar", CharacterSet: "latin1"}, "José", false},
+		{"invalid utf8 empty charset fails", invalid, ColumnMeta{DataType: "varchar"}, nil, true},
+		{"invalid utf8 unsupported charset fails", invalid, ColumnMeta{DataType: "char", CharacterSet: "koi8r"}, nil, true},
+		{"non-char/binary type untouched", int64(42), ColumnMeta{DataType: "int"}, int64(42), false},
+		{"non-string value on varchar passes through", int64(42), ColumnMeta{DataType: "varchar"}, int64(42), false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := coerceTextEncoding(tc.v, tc.col)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil (result %#v)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			switch want := tc.want.(type) {
+			case []byte:
+				gb, ok := got.([]byte)
+				if !ok || string(gb) != string(want) {
+					t.Errorf("got %#v, want %#v", got, want)
+				}
+			default:
+				if got != tc.want {
+					t.Errorf("got %#v, want %#v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
 func TestCoerceUnsigned(t *testing.T) {
 	const maxU64 = uint64(18446744073709551615) // 2^64-1; int64(-1) bit pattern
 

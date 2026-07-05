@@ -2751,7 +2751,7 @@ func TestMapEventImagesDecodeEdgeCases(t *testing.T) {
 // TestBase64StoredKind and TestBase64Cols pin the pure type predicates the
 // #661 decode is gated on.
 func TestBase64StoredKind(t *testing.T) {
-	binaryFamily := []string{"blob", "tinyblob", "mediumblob", "longblob"}
+	binaryFamily := []string{"blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary"}
 	textFamily := []string{"text", "tinytext", "mediumtext", "longtext"}
 	for _, dt := range binaryFamily {
 		if binary, ok := base64StoredKind(dt); !ok || !binary {

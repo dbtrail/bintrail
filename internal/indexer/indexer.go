@@ -437,6 +437,21 @@ func EnsureSchema(db *sql.DB) error {
 	); err != nil {
 		return err
 	}
+	// character_set_name carries information_schema.COLUMNS.CHARACTER_SET_NAME
+	// (#756): NULL for BINARY/VARBINARY/numeric columns, populated for CHAR/
+	// VARCHAR. go-mysql delivers those four types as a raw Go string with no
+	// charset applied, and an invalid-UTF-8 value (a legacy latin1 table, a
+	// binary UUID/digest) previously reached json.Marshal, which silently
+	// replaces bad bytes with U+FFFD — at-rest data loss. Capturing the charset
+	// lets MapRow transcode a latin1 CHAR/VARCHAR value to UTF-8 (MySQL's
+	// "latin1" is actually cp1252) and fail loud instead of guess for any other
+	// non-UTF-8 charset; a pre-#756 snapshot has this column NULL, so its
+	// CHAR/VARCHAR columns keep failing loud on invalid UTF-8 until re-snapshotted.
+	if err := ensureColumn(db, "schema_snapshots", "character_set_name",
+		`ALTER TABLE schema_snapshots ADD COLUMN character_set_name VARCHAR(32) DEFAULT NULL COMMENT 'information_schema.COLUMNS.CHARACTER_SET_NAME; NULL for BINARY/VARBINARY/numeric columns; enables safe latin1-to-UTF8 transcoding of CHAR/VARCHAR values at index time instead of silent U+FFFD corruption (#756)' AFTER column_type`,
+	); err != nil {
+		return err
+	}
 	// pg_type_oid/pg_type_mod carry the PostgreSQL per-column type identity (pg_type
 	// OID + atttypmod) from a pgoutput RelationMessage (#533). They are captured at
 	// stream time because the offline recover path has no live PostgreSQL catalog to
