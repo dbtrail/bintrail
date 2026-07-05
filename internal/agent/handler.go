@@ -178,6 +178,15 @@ func (h *DefaultHandler) resolvePKFromArchive(ctx context.Context, item PKItem, 
 	return "", nil
 }
 
+// recoverEventLimit caps the number of events a single recover call may
+// reverse into one script. #763: silently trimming to this cap and
+// generating reversal SQL from the truncated set produces a script the
+// caller believes reverses the whole requested scope when it doesn't — the
+// remaining events are left half-reverted with no signal. We instead fetch
+// one row past the cap so an over-scoped request can be rejected outright
+// (see the fetch+check below) rather than silently emitting a partial script.
+const recoverEventLimit = 1000
+
 // HandleRecover generates reversal SQL for the specified events.
 //
 // Scope precedence: when GTID is set the agent honours it as the precise
@@ -202,7 +211,10 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 		Schema: req.Schema,
 		Table:  req.Table,
 		GTID:   req.GTID,
-		Limit:  1000,
+		// Fetch one past the cap so we can detect (and reject) an
+		// over-scoped request instead of silently truncating — see
+		// recoverEventLimit and the check below.
+		Limit: recoverEventLimit + 1,
 	}
 	// Pass time bounds verbatim when the caller supplied them.  Skip
 	// zero-value bounds entirely — passing year-1 to query.Fetch would
@@ -248,7 +260,12 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 		rows = append(rows, r...)
 	}
 
-	rows = query.MergeResults(rows, opts.Limit, opts.Order)
+	// Dedup+sort without capping yet — capping here would hide the very
+	// overflow we need to detect (#763).
+	rows = query.MergeResults(rows, 0, opts.Order)
+	if len(rows) > recoverEventLimit {
+		return "", fmt.Errorf("recover scope matches more than %d events; narrow the time range/GTID or split the recovery into smaller windows (refusing to emit a partial reversal script)", recoverEventLimit)
+	}
 
 	// Filter to requested pk_hashes if specified.
 	if len(req.PKHashes) > 0 {

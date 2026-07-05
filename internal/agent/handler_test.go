@@ -171,6 +171,101 @@ func TestHandleRecover_gtidNoMatch_largeFallback(t *testing.T) {
 	}
 }
 
+// TestHandleRecover_rejectsOverCap is the regression test for #763: a
+// recover scope matching more than recoverEventLimit events must be
+// rejected outright instead of silently emitting reversal SQL for only the
+// first recoverEventLimit of them. The prior behavior produced a script
+// that looked complete (its header even reported the truncated count) while
+// leaving the remaining matched rows half-reverted.
+func TestHandleRecover_rejectsOverCap(t *testing.T) {
+	now := time.Now().UTC()
+	buf := buffer.New(buffer.Config{MaxAge: time.Hour})
+	events := make([]parser.Event, 0, recoverEventLimit+1)
+	for i := 0; i < recoverEventLimit+1; i++ {
+		events = append(events, makeRecoverEvent(now, fmt.Sprintf("%d", i), fmt.Sprintf("abc:%d", i)))
+	}
+	buf.Insert(events)
+
+	h := &DefaultHandler{Buffer: buf}
+
+	_, err := h.HandleRecover(context.Background(), RecoverRequest{
+		Schema:    "shop",
+		Table:     "orders",
+		TimeStart: now.Add(-time.Hour),
+		TimeEnd:   now.Add(time.Hour),
+	})
+	if err == nil {
+		t.Fatalf("expected error for over-cap recover scope, got nil")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("more than %d events", recoverEventLimit)) {
+		t.Errorf("expected cap-exceeded error, got: %v", err)
+	}
+}
+
+// TestHandleRecover_pkHashesOverCap pins a deliberate trade-off: the cap
+// check runs on the raw scope fetch, BEFORE the client-side PKHashes
+// filter (handler.go applies PKHashes after MergeResults). So a
+// PK-targeted recover ("reverse these 3 rows") over a busy time window
+// with >recoverEventLimit total table events is rejected too, even though
+// only a handful of rows are actually wanted — checking after the PK
+// filter would let a wanted PK whose events fall past the cap boundary
+// silently get a truncated reversal, which is the exact failure mode #763
+// exists to prevent. Callers hitting this on a busy table should narrow
+// the time range instead of relying on PKHashes to narrow it for them.
+func TestHandleRecover_pkHashesOverCap(t *testing.T) {
+	now := time.Now().UTC()
+	buf := buffer.New(buffer.Config{MaxAge: time.Hour})
+	events := make([]parser.Event, 0, recoverEventLimit+1)
+	for i := 0; i < recoverEventLimit+1; i++ {
+		events = append(events, makeRecoverEvent(now, fmt.Sprintf("%d", i), fmt.Sprintf("abc:%d", i)))
+	}
+	buf.Insert(events)
+
+	h := &DefaultHandler{Buffer: buf}
+
+	_, err := h.HandleRecover(context.Background(), RecoverRequest{
+		Schema:    "shop",
+		Table:     "orders",
+		TimeStart: now.Add(-time.Hour),
+		TimeEnd:   now.Add(time.Hour),
+		PKHashes:  []string{byosPKHash("1")},
+	})
+	if err == nil {
+		t.Fatalf("expected error for over-cap scope even with a narrow PKHashes filter, got nil")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("more than %d events", recoverEventLimit)) {
+		t.Errorf("expected cap-exceeded error, got: %v", err)
+	}
+}
+
+// TestHandleRecover_atCapSucceeds confirms the cap check does not
+// misfire on a scope of exactly recoverEventLimit events — only scopes
+// that exceed the cap should be rejected.
+func TestHandleRecover_atCapSucceeds(t *testing.T) {
+	now := time.Now().UTC()
+	buf := buffer.New(buffer.Config{MaxAge: time.Hour})
+	events := make([]parser.Event, 0, recoverEventLimit)
+	for i := 0; i < recoverEventLimit; i++ {
+		events = append(events, makeRecoverEvent(now, fmt.Sprintf("%d", i), fmt.Sprintf("abc:%d", i)))
+	}
+	buf.Insert(events)
+
+	h := &DefaultHandler{Buffer: buf}
+
+	sql, err := h.HandleRecover(context.Background(), RecoverRequest{
+		Schema:    "shop",
+		Table:     "orders",
+		TimeStart: now.Add(-time.Hour),
+		TimeEnd:   now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("HandleRecover returned error for exactly-at-cap scope: %v", err)
+	}
+	if !strings.Contains(sql, "DELETE FROM `shop`") {
+		t.Errorf("expected reversal statements for the at-cap scope, got:\n%s", sql)
+	}
+}
+
 // TestRecoverRequestJSON_gtid pins the wire format: the SaaS side sends
 // “"gtid"“ (lowercase) and the agent must decode it into the GTID
 // field.  A typo in the JSON tag would silently drop the field again.
