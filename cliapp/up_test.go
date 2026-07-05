@@ -105,6 +105,54 @@ func TestPopulateStreamFlags(t *testing.T) {
 	}
 }
 
+// TestPopulateStreamFlags_respectsEnvBoundConfig reproduces #808: an operator
+// setting BINTRAIL_SSL_MODE/BINTRAIL_SSL_CA/BINTRAIL_START_GTID/
+// BINTRAIL_STREAM_GAP_TIMEOUT via .bintrail.env (the ONLY channel `up`
+// exposes for these — it has no --ssl-*/--start-gtid/--gap-timeout flags of
+// its own) must see those values survive populateStreamFlags, not get
+// silently clobbered back to up's hardcoded defaults (a silent TLS downgrade
+// for --ssl-mode/--ssl-ca specifically). TestPopulateStreamFlags (above)
+// pins the complementary case — nothing set, intentional defaults apply —
+// and must keep passing unmodified.
+func TestPopulateStreamFlags_respectsEnvBoundConfig(t *testing.T) {
+	origSSLMode, origSSLCA, origSSLCert, origSSLKey, origStartGTID, origGapTimeout :=
+		strmSSLMode, strmSSLCA, strmSSLCert, strmSSLKey, strmStartGTID, strmGapTimeout
+	t.Cleanup(func() {
+		strmSSLMode, strmSSLCA, strmSSLCert, strmSSLKey, strmStartGTID, strmGapTimeout =
+			origSSLMode, origSSLCA, origSSLCert, origSSLKey, origStartGTID, origGapTimeout
+		// bindCommandEnv marks these flags Changed via Flags().Set; reset
+		// that bit so it doesn't leak into later tests in this package that
+		// call populateStreamFlags against the same package-level streamCmd.
+		for _, name := range []string{"ssl-mode", "ssl-ca", "ssl-cert", "ssl-key", "start-gtid", "gap-timeout"} {
+			if f := streamCmd.Flags().Lookup(name); f != nil {
+				f.Changed = false
+			}
+		}
+	})
+
+	t.Setenv("BINTRAIL_SSL_MODE", "verify-ca")
+	t.Setenv("BINTRAIL_SSL_CA", "rds-ca.pem")
+	t.Setenv("BINTRAIL_SSL_CERT", "client-cert.pem")
+	t.Setenv("BINTRAIL_SSL_KEY", "client-key.pem")
+	t.Setenv("BINTRAIL_START_GTID", "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
+	t.Setenv("BINTRAIL_STREAM_GAP_TIMEOUT", "90")
+
+	// Mirrors what streamCmd's init() does at process startup: apply the
+	// env bindings onto the stream flags. This is what marks them Changed.
+	bindCommandEnv(streamCmd)
+
+	populateStreamFlags(4242)
+
+	assertStr(t, "strmSSLMode", strmSSLMode, "verify-ca")
+	assertStr(t, "strmSSLCA", strmSSLCA, "rds-ca.pem")
+	assertStr(t, "strmSSLCert", strmSSLCert, "client-cert.pem")
+	assertStr(t, "strmSSLKey", strmSSLKey, "client-key.pem")
+	assertStr(t, "strmStartGTID", strmStartGTID, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
+	if strmGapTimeout != 90 {
+		t.Errorf("strmGapTimeout = %d, want 90 (env-bound value, not up's hardcoded 30)", strmGapTimeout)
+	}
+}
+
 func assertStr(t *testing.T, name, got, want string) {
 	t.Helper()
 	if got != want {

@@ -222,24 +222,48 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 // populateStreamFlags copies every up* package global into the corresponding
 // strm* global, plus the resolved server-id. Extracted from runUpStream so the
 // up→strm fan-out is unit-testable.
+//
+// `up` has no --ssl-*/--start-gtid/--gap-timeout flags of its own, so
+// strmSSLMode/strmSSLCA/strmSSLCert/strmSSLKey/strmStartGTID/strmGapTimeout
+// are only pinned to up's hardcoded defaults when the operator hasn't
+// already configured them on streamCmd — via an explicit flag or (the only
+// channel `up` actually exposes) the BINTRAIL_SSL_MODE/BINTRAIL_SSL_CA/
+// BINTRAIL_SSL_CERT/BINTRAIL_SSL_KEY/BINTRAIL_START_GTID/
+// BINTRAIL_STREAM_GAP_TIMEOUT env vars, which bindCommandEnv(streamCmd)
+// applies via Flags().Set (marking the flag Changed). Overwriting an
+// already-Changed flag would silently downgrade e.g. BINTRAIL_SSL_MODE=
+// verify-ca to the unauthenticated "preferred" default, or drop a
+// configured mutual-TLS client cert/key (#808).
 func populateStreamFlags(serverID uint32) {
 	strmIndexDSN = upIndexDSN
 	strmSourceDSN = upSourceDSN
 	strmServerID = serverID
 	strmStartFile = ""
 	strmStartPos = 4
-	strmStartGTID = ""
+	if !streamCmd.Flags().Changed("start-gtid") {
+		strmStartGTID = ""
+	}
 	strmBatchSize = upBatchSize
 	strmSchemas = upSchemas
 	strmTables = upTables
 	strmCheckpoint = upCheckpoint
 	strmMetricsAddr = upMetricsAddr
-	strmSSLMode = "preferred"
-	strmSSLCA = ""
-	strmSSLCert = ""
-	strmSSLKey = ""
+	if !streamCmd.Flags().Changed("ssl-mode") {
+		strmSSLMode = "preferred"
+	}
+	if !streamCmd.Flags().Changed("ssl-ca") {
+		strmSSLCA = ""
+	}
+	if !streamCmd.Flags().Changed("ssl-cert") {
+		strmSSLCert = ""
+	}
+	if !streamCmd.Flags().Changed("ssl-key") {
+		strmSSLKey = ""
+	}
 	strmFormat = upFormat
 	strmReset = false
 	strmNoGapFill = false
-	strmGapTimeout = 30
+	if !streamCmd.Flags().Changed("gap-timeout") {
+		strmGapTimeout = 30
+	}
 }
