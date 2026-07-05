@@ -315,6 +315,51 @@ func TestGenerateDelete_nilRowAfter(t *testing.T) {
 	}
 }
 
+// TestGenerateDelete_allColsFallbackNullColumn pins #762: without a resolver
+// (all-columns WHERE fallback), a NULL column must render as `IS NULL`, never
+// `= NULL` — the latter is never true in SQL and silently no-ops the reversal
+// on any PK-less/unresolvable table with a NULL column.
+func TestGenerateDelete_allColsFallbackNullColumn(t *testing.T) {
+	g := newGen()
+	row := query.ResultRow{
+		EventID:    3,
+		SchemaName: "mydb",
+		TableName:  "orders",
+		EventType:  parser.EventInsert,
+		RowAfter:   map[string]any{"id": float64(99), "status": "new", "notes": nil},
+	}
+	stmt, err := g.generateDelete(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertSQL(t, stmt, "`notes` IS NULL")
+	if strings.Contains(stmt, "`notes` = NULL") {
+		t.Errorf("WHERE clause emits `col = NULL` (never matches): %s", stmt)
+	}
+}
+
+// TestGenerateUpdate_allColsFallbackNullColumn covers the same #762 fallback
+// for UPDATE reversals, whose WHERE is built from row_after.
+func TestGenerateUpdate_allColsFallbackNullColumn(t *testing.T) {
+	g := newGen()
+	row := query.ResultRow{
+		EventID:    4,
+		SchemaName: "mydb",
+		TableName:  "orders",
+		EventType:  parser.EventUpdate,
+		RowBefore:  map[string]any{"id": float64(1), "status": "pending", "notes": "hi"},
+		RowAfter:   map[string]any{"id": float64(1), "status": "shipped", "notes": nil},
+	}
+	stmt, err := g.generateUpdate(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertSQL(t, stmt, "`notes` IS NULL")
+	if strings.Contains(stmt, "`notes` = NULL") {
+		t.Errorf("WHERE clause emits `col = NULL` (never matches): %s", stmt)
+	}
+}
+
 // ─── GenerateSQL integration (no DB, exercising the output wrapper) ────────────
 
 func TestGenerateSQL_noRows(t *testing.T) {

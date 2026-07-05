@@ -310,12 +310,12 @@ For `UPDATE` and `DELETE` reversals, the generator needs a `WHERE` clause to ide
 UPDATE `mydb`.`orders` SET `status` = 'draft' WHERE `id` = 42
 ```
 
-**Without a snapshot (fallback)**: Uses every column in the row image. This is verbose but always correct for tables without duplicate rows:
+**Without a snapshot (fallback)**: Uses every column in the row image. This is verbose but uniquely identifies the row for tables without duplicate rows. A `NULL` column renders as `IS NULL` (not `= NULL`, which never matches in SQL):
 
 ```sql
 UPDATE `mydb`.`orders`
 SET `status` = 'draft'
-WHERE `id` = 42 AND `status` = 'published' AND `created_at` = '2026-02-19 14:01:00'
+WHERE `id` = 42 AND `status` = 'published' AND `created_at` = '2026-02-19 14:01:00' AND `notes` IS NULL
 ```
 
 The resolver is loaded best-effort in the `recover` command — a failure logs a warning and falls back to the all-columns strategy.

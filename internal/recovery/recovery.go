@@ -883,7 +883,16 @@ func (g *Generator) allColsWhere(row map[string]any) (clauses []string, cols []s
 	cols = sortedKeys(row)
 	parts := make([]string, len(cols))
 	for i, col := range cols {
-		parts[i] = g.quoteName(col) + " = " + g.formatValue(row[col])
+		v := row[col]
+		if v == nil {
+			// `col = NULL` is never true in SQL (NULL comparisons are UNKNOWN, not
+			// TRUE) — a `col = NULL` fallback WHERE would match zero rows, silently
+			// no-op'ing the reversal on any PK-less/unresolvable table with a NULL
+			// column (#762). `IS NULL` is the correct predicate for both dialects.
+			parts[i] = g.quoteName(col) + " IS NULL"
+			continue
+		}
+		parts[i] = g.quoteName(col) + " = " + g.formatValue(v)
 	}
 	return parts, cols
 }
