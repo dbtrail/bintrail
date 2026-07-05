@@ -24,11 +24,28 @@ const (
 	MetaKeyBinlogPos      = "bintrail.baseline_binlog_position"
 	MetaKeyGTIDSet        = "bintrail.baseline_gtid_set"
 	MetaKeyCreateTableSQL = "bintrail.create_table_sql"
-	// MetaKeyLSN anchors a PostgreSQL-source baseline: the WAL LSN at which the
-	// snapshot is consistent (the slot's consistent_point), stored as the decimal
-	// string of the uint64 LSN. Deltas for the table start strictly after this
-	// point. Absent on MySQL/MariaDB baselines (which use the binlog file/pos/GTID
-	// keys above) and on PG baselines taken before #593 slice A. Part of #593.
+	// MetaKeyLSN anchors a PostgreSQL-source baseline: a WAL LSN floor, stored as
+	// the decimal string of the uint64 LSN, such that deltas replayed AT OR AFTER
+	// this point reconstruct the table's state after the snapshot correctly.
+	//
+	// This is the replication slot's confirmed_flush_lsn/restart_lsn as of just
+	// before the snapshot transaction opened (pgcapture.SlotFloorLSN) — NOT the
+	// live pg_current_wal_lsn() read when the snapshot was taken (#771). The two
+	// can differ: a transaction committing concurrently with the snapshot can
+	// flush its commit WAL record at or before that live LSN while still being
+	// invisible to the snapshot's MVCC view (WAL flush happens before the
+	// transaction is removed from the procarray), so anchoring the delta window
+	// on the live LSN with a strict "after" comparison can silently exclude that
+	// transaction from BOTH the baseline and the deltas. The slot floor is always
+	// <= the live LSN (read earlier, before the snapshot began), so replaying
+	// from it never misses that transaction; any resulting overlap with rows
+	// already in the baseline is harmless because the merge is last-write-wins
+	// over full-row images. Consumers should therefore treat this value as an
+	// INCLUSIVE lower bound ("at or after"), not an exclusive one.
+	//
+	// Absent on MySQL/MariaDB baselines (which use the binlog file/pos/GTID keys
+	// above) and on PG baselines taken before #593 slice A. Part of #593; the
+	// floor-vs-live-LSN correction is #771.
 	MetaKeyLSN = "bintrail.baseline_lsn"
 	// MetaKeyRowCount and MetaKeyContentDigest record, per table, how many rows
 	// the baseline ingested and an order-independent content fingerprint of them
@@ -60,7 +77,7 @@ type DumpMetadata struct {
 	CreateTableSQL string // raw mydumper -schema.sql bytes; set for baselines written after #187
 	ContentDigest  string // version-tagged content fingerprint; set after #633, empty when absent (old baselines)
 	RowCount       int64  // rows ingested into this table's baseline; valid only when ContentDigest != ""
-	LSN            uint64 // PostgreSQL WAL LSN anchor (MetaKeyLSN); 0 = absent (MySQL baseline, or pre-#593 PG baseline)
+	LSN            uint64 // PostgreSQL WAL LSN delta-replay floor, inclusive (MetaKeyLSN, see its doc comment / #771); 0 = absent (MySQL baseline, or pre-#593 PG baseline)
 }
 
 // StartedAtMarkerFile is a bintrail-authored sidecar written into the mydumper

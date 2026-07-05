@@ -334,11 +334,18 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 
 	// Warn if there is a gap between the baseline position and the first indexed
 	// event — events in that gap are missing from the reconstruction. The
-	// comparable anchor is flavor-dependent (#593): PostgreSQL baselines anchor
-	// on the numeric WAL LSN (baseline.MetaKeyLSN); MySQL/MariaDB on binlog
-	// file+pos. PG LSN TEXT ("0/1A2B3C4") is NOT lexically ordered, so the
-	// binlog_file column must never be compared for a PG source — see
-	// reconstruct.GapDetected and resolveGapCheck.
+	// comparable anchor is flavor-dependent (#593): PostgreSQL baselines carry
+	// the numeric WAL LSN delta-replay floor (baseline.MetaKeyLSN — an
+	// INCLUSIVE lower bound, corrected by #771 to be the replication slot's
+	// own confirmed_flush_lsn/restart_lsn rather than the snapshot's live
+	// pg_current_wal_lsn(); see MetaKeyLSN's doc comment); MySQL/MariaDB on
+	// binlog file+pos. PG LSN TEXT ("0/1A2B3C4") is NOT lexically ordered, so
+	// the binlog_file column must never be compared for a PG source — see
+	// reconstruct.GapDetected and resolveGapCheck. NOTE: PG full-table/single-
+	// row reconstruct is not yet un-gated for Postgres sources (#593 slice D) —
+	// this gap check runs generically here but the PG merge path itself is not
+	// wired; whoever builds slice D must honor "replay at/after the floor", not
+	// "strictly after the snapshot's live LSN".
 	if len(events) > 0 {
 		first := events[0]
 		flavor, lineageGuard, anchorPresent, eventPosMissing := resolveGapCheck(

@@ -13,15 +13,24 @@ package reconstruct
 // TEXT form ("0/1A2B3C4"), which is NOT lexically ordered ("0/10" < "0/9"
 // lexically but not numerically), so the comparison must use the numeric LSN
 // that PG events carry in StartPos (internal/pgcapture rowEvent) against the
-// baseline's numeric anchor (baseline.MetaKeyLSN). baselineLSN == 0 means the
-// baseline predates the LSN anchor (#593 slice A) or is not a PG baseline at
-// all: the anchor is UNKNOWN, so no gap is flagged. That mirrors how this
-// path already treats missing coordinates — the caller's "baseline lacks
-// position metadata" branch skips detection with an informational message
-// rather than failing (and status's continuity verdict fails closed only
-// under an explicit --fail-on-gap) — and it can never silently produce wrong
-// data because this check only gates a WARNING, never the reconstruction
-// itself. Callers should log the skip (cli/reconstruct.go does).
+// baseline's numeric delta-replay floor (baseline.MetaKeyLSN — an INCLUSIVE
+// lower bound: the slot's confirmed_flush_lsn/restart_lsn as of just before
+// the snapshot, not the snapshot's own live pg_current_wal_lsn(); see that
+// key's doc comment and #771). baselineLSN == 0 means the baseline predates
+// the LSN floor (#593 slice A) or is not a PG baseline at all: the floor is
+// UNKNOWN, so no gap is flagged. That mirrors how this path already treats
+// missing coordinates — the caller's "baseline lacks position metadata"
+// branch skips detection with an informational message rather than failing
+// (and status's continuity verdict fails closed only under an explicit
+// --fail-on-gap) — and it can never silently produce wrong data because this
+// check only gates a WARNING, never the reconstruction itself. Callers should
+// log the skip (cli/reconstruct.go does).
+//
+// The strict "eventStartPos > baselineLSN" comparison below is unchanged by
+// #771: a baseline floor is a value below which no coverage gap can exist by
+// construction (deltas are read from at-or-after it), so "no gap" already
+// means eventStartPos <= baselineLSN — the same comparison as when this
+// value was (incorrectly) the live anchor.
 //
 // Any other flavor (MySQL, MariaDB, ""): the established two-key binlog
 // compare — file names ordered lexically (equal to numeric order for MySQL's

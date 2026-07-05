@@ -128,6 +128,15 @@ func TestPGBaseline_Integration(t *testing.T) {
 	if stats.AnchorLSN == 0 {
 		t.Error("stats.AnchorLSN = 0, want a real LSN")
 	}
+	// #771: DeltaStartLSN is the corrected, safe delta-replay floor (the
+	// slot's own confirmed_flush_lsn/restart_lsn, read before the snapshot
+	// began) and must never exceed the live snapshot anchor.
+	if stats.DeltaStartLSN == 0 {
+		t.Error("stats.DeltaStartLSN = 0, want a real LSN")
+	}
+	if stats.DeltaStartLSN > stats.AnchorLSN {
+		t.Errorf("stats.DeltaStartLSN %d > stats.AnchorLSN %d — safety invariant violated", stats.DeltaStartLSN, stats.AnchorLSN)
+	}
 
 	// ── Snapshot directory, markers, manifest ──
 	entries, err := os.ReadDir(outDir)
@@ -150,19 +159,22 @@ func TestPGBaseline_Integration(t *testing.T) {
 		}
 	}
 
-	// ── MetaKeyLSN: present, equals Stats.AnchorLSN, ≤ current WAL ──
+	// ── MetaKeyLSN: present, equals Stats.DeltaStartLSN (#771 — NOT
+	// Stats.AnchorLSN; they only coincide here because nothing else wrote WAL
+	// between slot creation and the snapshot anchor in this first run), ≤
+	// current WAL ──
 	pathA := filepath.Join(snapDir, "public", itTblA+".parquet")
 	md := readParquetMetadata(t, pathA)
 	lsnStr, ok := md[baseline.MetaKeyLSN]
 	if !ok {
 		t.Fatalf("MetaKeyLSN absent from %s metadata (%v)", pathA, md)
 	}
-	anchor, err := strconv.ParseUint(lsnStr, 10, 64)
+	embeddedLSN, err := strconv.ParseUint(lsnStr, 10, 64)
 	if err != nil {
 		t.Fatalf("MetaKeyLSN %q is not a decimal uint64: %v", lsnStr, err)
 	}
-	if anchor != stats.AnchorLSN {
-		t.Errorf("MetaKeyLSN %d != Stats.AnchorLSN %d", anchor, stats.AnchorLSN)
+	if embeddedLSN != stats.DeltaStartLSN {
+		t.Errorf("MetaKeyLSN %d != Stats.DeltaStartLSN %d", embeddedLSN, stats.DeltaStartLSN)
 	}
 	var curLSNText string
 	if err := setup.QueryRow(ctx, "SELECT pg_current_wal_lsn()::text").Scan(&curLSNText); err != nil {
@@ -172,8 +184,8 @@ func TestPGBaseline_Integration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse current LSN: %v", err)
 	}
-	if anchor > uint64(curLSN) {
-		t.Errorf("anchor LSN %d > current WAL LSN %d", anchor, uint64(curLSN))
+	if embeddedLSN > uint64(curLSN) {
+		t.Errorf("embedded delta-floor LSN %d > current WAL LSN %d", embeddedLSN, uint64(curLSN))
 	}
 	if md["bintrail.source_database"] != "public" || md["bintrail.source_table"] != itTblA {
 		t.Errorf("source metadata wrong: %v", md)
@@ -182,10 +194,12 @@ func TestPGBaseline_Integration(t *testing.T) {
 		t.Error("MetaKeyCreateTableSQL present — must be omitted for PG baselines")
 	}
 
-	// ── Ordering invariant: slot exists, confirmed_flush_lsn ≤ anchor ──
-	// The slot was created BEFORE the snapshot transaction, so its consistent
-	// point (= confirmed_flush_lsn on a fresh, never-acked slot) cannot be
-	// past the anchor; the overlap is redelivered and merged idempotently.
+	// ── Ordering invariant: slot exists, confirmed_flush_lsn ≤ embedded floor
+	// ≤ anchor ── The slot was created BEFORE the snapshot transaction, so its
+	// consistent point (= confirmed_flush_lsn on a fresh, never-acked slot)
+	// cannot be past the anchor; the overlap is redelivered and merged
+	// idempotently. Re-reading confirmed_flush_lsn here (nothing has consumed
+	// the slot since Run) should match what got embedded.
 	var flushText string
 	if err := setup.QueryRow(ctx, "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=$1", itSlot).Scan(&flushText); err != nil {
 		t.Fatalf("slot %s missing or unreadable after Run: %v", itSlot, err)
@@ -194,8 +208,8 @@ func TestPGBaseline_Integration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse confirmed_flush_lsn %q: %v", flushText, err)
 	}
-	if uint64(flush) > anchor {
-		t.Errorf("ORDERING INVARIANT VIOLATED: slot confirmed_flush_lsn %d > baseline anchor %d — deltas between them would be lost", uint64(flush), anchor)
+	if uint64(flush) != embeddedLSN {
+		t.Errorf("slot confirmed_flush_lsn %d != embedded delta-floor LSN %d (slot untouched since Run)", uint64(flush), embeddedLSN)
 	}
 
 	// ── Table A contents: TOAST value complete, escapes + multibyte intact ──
@@ -282,6 +296,44 @@ func TestPGBaseline_Integration(t *testing.T) {
 	b3v2 := rowByCol(t, rowsB2, "id", "3")
 	if got := b3v2["v"]; got == nil || *got != "updated" {
 		t.Errorf("re-baseline table B row 3 v = %v, want %q", strOrNull(got), "updated")
+	}
+
+	// ── #771 pin: the slot was never consumed (no StartReplication) between
+	// the two runs, so its floor cannot have moved even though the UPDATE
+	// above committed and durably advanced the live WAL anchor in between.
+	// This reproduces, deterministically, the exact shape of gap the bug
+	// left open: a value the LIVE anchor alone cannot distinguish from "no
+	// concurrent activity", but the slot floor correctly reflects. ──
+	if stats2.DeltaStartLSN > stats2.AnchorLSN {
+		t.Errorf("re-baseline DeltaStartLSN %d > AnchorLSN %d — safety invariant violated", stats2.DeltaStartLSN, stats2.AnchorLSN)
+	}
+	if stats2.DeltaStartLSN != stats.DeltaStartLSN {
+		t.Errorf("re-baseline DeltaStartLSN %d != first-run DeltaStartLSN %d — the slot floor must not move when nothing consumed it", stats2.DeltaStartLSN, stats.DeltaStartLSN)
+	}
+	md2 := readParquetMetadata(t, filepath.Join(snapDir2, "public", itTblB+".parquet"))
+	lsnStr2, ok := md2[baseline.MetaKeyLSN]
+	if !ok {
+		t.Fatalf("re-baseline MetaKeyLSN absent (%v)", md2)
+	}
+	embeddedLSN2, err := strconv.ParseUint(lsnStr2, 10, 64)
+	if err != nil {
+		t.Fatalf("re-baseline MetaKeyLSN %q is not a decimal uint64: %v", lsnStr2, err)
+	}
+	if embeddedLSN2 != stats2.DeltaStartLSN {
+		t.Errorf("re-baseline embedded MetaKeyLSN %d != Stats.DeltaStartLSN %d", embeddedLSN2, stats2.DeltaStartLSN)
+	}
+	// THE core #771 regression pin: pre-fix, this metadata held AnchorLSN —
+	// which, in this exact scenario (a commit lands between slot creation and
+	// the second run's live anchor read with the slot never consumed), would
+	// equal stats2.AnchorLSN and sit STRICTLY ABOVE the marker UPDATE's commit
+	// LSN once accounting for the invisible-commit race #771 describes,
+	// silently excluding a concurrently-committing transaction from the delta
+	// window. The corrected embedded value must be the smaller, safe slot
+	// floor — strictly below the live anchor here, since the UPDATE
+	// committed (and advanced the live WAL position) after the slot was
+	// created and with the slot never consumed since.
+	if embeddedLSN2 >= stats2.AnchorLSN {
+		t.Errorf("re-baseline embedded delta floor %d >= live anchor %d — want strictly less (an UPDATE committed between slot creation and this run's anchor read, with the slot never consumed)", embeddedLSN2, stats2.AnchorLSN)
 	}
 }
 

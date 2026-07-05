@@ -11,13 +11,18 @@
 // The dependency points the other way: pgbaseline imports internal/baseline
 // for the Writer, markers, and metadata keys.
 //
-// Anchoring: the output embeds baseline.MetaKeyLSN — pg_current_wal_lsn()
-// captured in the SAME statement that establishes the MVCC snapshot — so
-// deltas strictly after that LSN, applied by reconstruct, yield the table
-// state at any later time. The replication slot is ensured to exist BEFORE
-// the snapshot opens (ordering invariant: slot consistent_point ≤ anchor LSN);
-// the overlap is redelivered and is harmless because reconstruct's merge is
-// last-write-wins idempotent.
+// Anchoring: the output embeds baseline.MetaKeyLSN — a delta-replay FLOOR
+// (pgcapture.SlotFloorLSN: the replication slot's confirmed_flush_lsn/
+// restart_lsn, read BEFORE the snapshot transaction opens) — so deltas AT OR
+// AFTER that LSN, applied by reconstruct, yield the table state at any later
+// time (#771: the corrected contract is "from the floor forward", NOT
+// "strictly after the live pg_current_wal_lsn() anchor" — see Stats.AnchorLSN
+// and the snapshot-anchor comment below for why the live LSN alone cannot be
+// the cutoff). The replication slot is ensured to exist BEFORE the snapshot
+// opens (ordering invariant: the floor LSN, read at that point, is ≤ every
+// LSN read afterwards on the same connection, in particular the anchor LSN);
+// any resulting overlap is redelivered and is harmless because reconstruct's
+// merge is last-write-wins idempotent over full-row images.
 //
 // Values are stored as raw PostgreSQL text (Column.RawText — COPY text output,
 // unescaped): identical to the pgoutput text rendering the delta path indexes,
@@ -87,9 +92,24 @@ type Stats struct {
 	TablesProcessed int
 	RowsWritten     int64
 	FilesWritten    int
-	AnchorLSN       uint64    // pg_current_wal_lsn() at snapshot establishment
-	SnapshotTime    time.Time // DB now() at snapshot establishment (UTC)
-	SlotCreated     bool      // true when this run created the replication slot
+	// AnchorLSN is pg_current_wal_lsn() at snapshot establishment — informational
+	// only (roughly "where the snapshot's visible data sits in the WAL timeline").
+	// It is NOT the delta-replay cutoff (#771): a transaction committing
+	// concurrently with the snapshot can flush its commit record at or before
+	// this LSN while still being invisible to the snapshot's MVCC view, so using
+	// AnchorLSN as "deltas start strictly after here" can silently drop that
+	// transaction from both the baseline and the delta window. Use DeltaStartLSN
+	// (also embedded in the Parquet metadata as baseline.MetaKeyLSN) instead.
+	AnchorLSN uint64
+	// DeltaStartLSN is the safe floor for delta replay: the replication slot's
+	// confirmed_flush_lsn/restart_lsn (pgcapture.SlotFloorLSN), read BEFORE the
+	// snapshot transaction opened. It is always <= AnchorLSN. A consumer should
+	// replay deltas at or after DeltaStartLSN, not strictly after AnchorLSN;
+	// any overlap with data already in the baseline is harmless because the
+	// baseline+delta merge is last-write-wins over full-row images.
+	DeltaStartLSN uint64
+	SnapshotTime  time.Time // DB now() at snapshot establishment (UTC)
+	SlotCreated   bool      // true when this run created the replication slot
 }
 
 // Run takes a consistent baseline snapshot of every table the publication
@@ -138,9 +158,29 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		logger.Info("pgbaseline: created replication slot", "slot", cfg.SlotName)
 	}
 
+	// Read the delta-replay floor (#771) BEFORE opening the snapshot
+	// transaction: pgcapture.SlotFloorLSN reports the slot's own
+	// confirmed_flush_lsn/restart_lsn, which only ever advances past
+	// transactions already fully resolved in WAL order. Reading it here, on
+	// this same connection before BEGIN, guarantees it is <= every LSN read
+	// afterwards (including the anchor below) — the invariant that makes
+	// "replay deltas from this floor" safe regardless of the snapshot-vs-
+	// concurrent-commit race described on SlotFloorLSN.
+	floorLSN, err := pgcapture.SlotFloorLSN(ctx, conn, cfg.SlotName)
+	if err != nil {
+		return Stats{}, err
+	}
+
 	// Open the snapshot transaction. The FIRST statement both establishes the
 	// REPEATABLE READ MVCC snapshot and reads the WAL anchor + snapshot time,
-	// so (anchorLSN, snapshotTime, visible data) are fixed atomically.
+	// so (anchorLSN, snapshotTime, visible data) are fixed together — but
+	// anchorLSN is NOT the delta-replay cutoff (#771, see Stats.AnchorLSN):
+	// a transaction can flush its commit record at or before this LSN while
+	// still being invisible to this snapshot (WAL-flush happens before the
+	// transaction is removed from the procarray), so treating "strictly after
+	// anchorLSN" as the delta window can silently drop it from both the
+	// baseline AND the deltas. floorLSN (above), not anchorLSN, is what gets
+	// embedded as the delta-replay cutoff.
 	if _, err := conn.Exec(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"); err != nil {
 		return Stats{}, fmt.Errorf("pgbaseline: begin snapshot transaction: %w", err)
 	}
@@ -161,6 +201,18 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	snapshotTime = snapshotTime.UTC()
 	if testHookAfterSnapshot != nil {
 		testHookAfterSnapshot()
+	}
+
+	// deltaStartLSN is what actually gets embedded as the replay cutoff.
+	// floorLSN <= anchorLSN by construction (read earlier on the same
+	// connection); this clamp is defense in depth only — it must never
+	// trigger — so a violated assumption can never make the embedded
+	// metadata claim a LATER delta start than the snapshot boundary itself.
+	deltaStartLSN := floorLSN
+	if deltaStartLSN > anchorLSN {
+		logger.Warn("pgbaseline: slot floor LSN exceeded the snapshot anchor LSN (unexpected — clamping)",
+			"floor_lsn", uint64(floorLSN), "anchor_lsn", uint64(anchorLSN))
+		deltaStartLSN = anchorLSN
 	}
 
 	// Discovery + column resolution run INSIDE the snapshot transaction, so
@@ -226,7 +278,7 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		return Stats{}, fmt.Errorf("pgbaseline: could not write incomplete-snapshot marker in %s (refusing to copy without the crash-safety marker): %w", snapDir, err)
 	}
 
-	stats := Stats{AnchorLSN: uint64(anchorLSN), SnapshotTime: snapshotTime, SlotCreated: created}
+	stats := Stats{AnchorLSN: uint64(anchorLSN), DeltaStartLSN: uint64(deltaStartLSN), SnapshotTime: snapshotTime, SlotCreated: created}
 
 	var (
 		mu   sync.Mutex
@@ -274,7 +326,7 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 				if ctx.Err() != nil {
 					return
 				}
-				n, err := processTable(ctx, wconn, t, cfg.OutputDir, tsDir, tsStr, uint64(anchorLSN), compression, rowGroupSize, logger)
+				n, err := processTable(ctx, wconn, t, cfg.OutputDir, tsDir, tsStr, uint64(deltaStartLSN), compression, rowGroupSize, logger)
 				mu.Lock()
 				if err != nil {
 					logger.Error("pgbaseline: failed to process table",
@@ -344,7 +396,7 @@ func openWorkerConn(ctx context.Context, dsn, snapshotID string) (*pgx.Conn, err
 // would CRC-certify a stale or partial Parquet (possibly carrying another
 // anchor's MetaKeyLSN) into a _SUCCESS baseline. The CLI's --retry applies
 // only to baseline.Upload's S3 object skip, which keys on real object state.
-func processTable(ctx context.Context, conn *pgx.Conn, t tableInfo, outputDir, tsDir, tsStr string, anchorLSN uint64, compression string, rowGroupSize int, logger *slog.Logger) (int64, error) {
+func processTable(ctx context.Context, conn *pgx.Conn, t tableInfo, outputDir, tsDir, tsStr string, deltaStartLSN uint64, compression string, rowGroupSize int, logger *slog.Logger) (int64, error) {
 	outPath := filepath.Join(outputDir, tsDir, t.Schema, t.Table+".parquet")
 
 	md := map[string]string{
@@ -352,10 +404,18 @@ func processTable(ctx context.Context, conn *pgx.Conn, t tableInfo, outputDir, t
 		"bintrail.source_database":    t.Schema,
 		"bintrail.source_table":       t.Table,
 		"bintrail.bintrail_version":   baseline.Version,
-		// The LSN anchor (#593 slice A): deltas for this table start strictly
-		// after this point. MetaKeyCreateTableSQL is deliberately absent — it
-		// exists for full-table mydumper reconstruct, out of scope for PG.
-		baseline.MetaKeyLSN: strconv.FormatUint(anchorLSN, 10),
+		// The LSN delta-replay floor (#593 slice A, corrected by #771): deltas
+		// for this table replay from AT OR AFTER this point — the slot's own
+		// confirmed_flush_lsn/restart_lsn (pgcapture.SlotFloorLSN), NOT the
+		// live pg_current_wal_lsn() read when the snapshot was taken (that
+		// live LSN can be at-or-after a concurrently-committing transaction's
+		// commit record while the transaction is still invisible to the
+		// snapshot — see Stats.AnchorLSN). Any overlap this floor introduces
+		// with rows already in the baseline is harmless: the merge is
+		// last-write-wins over full-row images. MetaKeyCreateTableSQL is
+		// deliberately absent — it exists for full-table mydumper
+		// reconstruct, out of scope for PG.
+		baseline.MetaKeyLSN: strconv.FormatUint(deltaStartLSN, 10),
 	}
 
 	cols := make([]baseline.Column, len(t.Columns))

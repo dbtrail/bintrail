@@ -495,6 +495,62 @@ func EnsureSlotExists(ctx context.Context, queryConn *pgx.Conn, slotName string,
 	return true, nil
 }
 
+// SlotFloorLSN returns a safe lower bound for replaying this slot's changes as
+// deltas on top of a baseline snapshot — the fix for #771.
+//
+// It is deliberately NOT pg_current_wal_lsn() (a live read of "now"). Reading
+// pg_current_wal_lsn() inside the baseline's snapshot transaction does not
+// close the race between a concurrent transaction's WAL commit-record flush
+// and its later removal from the procarray (the moment it becomes visible to
+// new snapshots): a transaction can flush its commit record, and only
+// afterwards be removed from the procarray, so a snapshot taken in that
+// window correctly treats it as invisible while a same-transaction LSN read
+// moments later can already be >= its commit LSN. Anchoring "deltas start
+// here" on that live LSN can therefore silently exclude a transaction from
+// BOTH the baseline (correctly, per MVCC) AND the delta window (incorrectly).
+//
+// SlotFloorLSN instead reports the slot's own confirmed_flush_lsn (falling
+// back to restart_lsn when confirmed_flush_lsn is unset — a brand new slot
+// that has never streamed) — call it BEFORE the caller's snapshot
+// transaction begins. Logical decoding only advances these positions past
+// transactions it has already resolved in full WAL order, so no transaction
+// concurrent with (or later than) the caller's snapshot can have a commit
+// LSN below what this returns; the value is therefore always <= any LSN read
+// afterwards on the same connection (LSNs are monotonically non-decreasing),
+// including the caller's own live pg_current_wal_lsn() anchor. Replaying
+// deltas from this floor forward — rather than from the live anchor — may
+// redeliver some already-visible-in-the-baseline changes; that overlap is
+// harmless because the baseline+delta merge is last-write-wins over
+// full-row images (same idempotency EnsureSlotExists's ordering invariant
+// already relies on).
+func SlotFloorLSN(ctx context.Context, conn *pgx.Conn, slotName string) (pglogrepl.LSN, error) {
+	var restartText, confirmedText *string
+	err := conn.QueryRow(ctx, `
+		SELECT restart_lsn::text, confirmed_flush_lsn::text
+		FROM pg_replication_slots WHERE slot_name = $1`, slotName).
+		Scan(&restartText, &confirmedText)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("pgcapture: replication slot %q not found while reading its floor LSN", slotName)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("pgcapture: reading floor LSN for replication slot %q: %w", slotName, err)
+	}
+	var text string
+	switch {
+	case confirmedText != nil && *confirmedText != "":
+		text = *confirmedText
+	case restartText != nil && *restartText != "":
+		text = *restartText
+	default:
+		return 0, fmt.Errorf("pgcapture: replication slot %q has neither confirmed_flush_lsn nor restart_lsn set — cannot compute a safe delta floor", slotName)
+	}
+	lsn, err := pglogrepl.ParseLSN(text)
+	if err != nil {
+		return 0, fmt.Errorf("pgcapture: parsing floor LSN %q for replication slot %q: %w", text, slotName, err)
+	}
+	return lsn, nil
+}
+
 // queryScopedSlotState is querySlotState with slot IDENTITY checks: it reports
 // existence and wal_status only for a LOGICAL pgoutput slot belonging to the
 // CURRENT database. A same-named slot of any other kind is a loud, actionable

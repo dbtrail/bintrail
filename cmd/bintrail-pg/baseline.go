@@ -129,6 +129,7 @@ func runPGBaseline(cmd *cobra.Command, args []string) error {
 		"rows_written", stats.RowsWritten,
 		"files_written", stats.FilesWritten,
 		"anchor_lsn", stats.AnchorLSN,
+		"delta_start_lsn", stats.DeltaStartLSN,
 		"snapshot_time", stats.SnapshotTime)
 
 	var uploaded int
@@ -147,6 +148,7 @@ func runPGBaseline(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  rows       : %d\n", stats.RowsWritten)
 	fmt.Printf("  files      : %d\n", stats.FilesWritten)
 	fmt.Printf("  anchor LSN : %d\n", stats.AnchorLSN)
+	fmt.Printf("  delta start LSN: %d (embedded metadata; the safe replay floor — see MetaKeyLSN)\n", stats.DeltaStartLSN)
 	fmt.Printf("  snapshot   : %s\n", stats.SnapshotTime.Format("2006-01-02T15:04:05Z07:00"))
 	if pgbUpload != "" {
 		fmt.Printf("  uploaded   : %d files → %s\n", uploaded, pgbUpload)
