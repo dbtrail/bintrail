@@ -106,6 +106,14 @@ func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stat
 	}
 	defer os.RemoveAll(dumpDir)
 
+	// Captured immediately before invoking mydumper: since this pipeline runs
+	// mydumper and baseline.Run in the same process, we can pass our own UTC
+	// wall-clock time straight through as the snapshot anchor instead of
+	// letting baseline.Run re-parse mydumper's "Started dump at" metadata
+	// line — which is written in the dump host's LOCAL time and would
+	// otherwise be misread as UTC verbatim, skewing the replay window by the
+	// host's UTC offset (#768).
+	dumpStartedAt := time.Now().UTC()
 	if err := runMydumper(s.ctx, req.SourceDSN, req.Schemas, dumpDir); err != nil {
 		return baseline.Stats{}, 0, fmt.Errorf("dump: %w", err)
 	}
@@ -123,6 +131,7 @@ func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stat
 		InputDir:    dumpDir,
 		OutputDir:   outputDir,
 		Compression: "zstd",
+		Timestamp:   dumpStartedAt,
 	})
 	if err != nil {
 		return baseline.Stats{}, 0, fmt.Errorf("convert: %w", err)

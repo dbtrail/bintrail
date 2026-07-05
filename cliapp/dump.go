@@ -12,9 +12,11 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 )
@@ -255,6 +257,13 @@ func runDump(cmd *cobra.Command, args []string) error {
 	} else {
 		c.Stderr = &stderrBuf
 	}
+	// Captured immediately before invoking mydumper so it approximates
+	// mydumper's own dump-start instant, but as this process's UTC wall
+	// clock rather than mydumper's (possibly non-UTC, possibly
+	// containerized) local time. Recorded as a sidecar below so
+	// `bintrail baseline` can anchor on it instead of re-parsing mydumper's
+	// ambiguous "Started dump at" line (#768).
+	dumpStartedAt := time.Now().UTC()
 	if runErr := c.Run(); runErr != nil {
 		if stderr := strings.TrimSpace(stderrBuf.String()); stderr != "" {
 			return fmt.Errorf("mydumper failed: %w; stderr: %s", runErr, stderr)
@@ -263,6 +272,14 @@ func runDump(cmd *cobra.Command, args []string) error {
 	}
 
 	slog.Info("dump complete", "output_dir", dmpOutputDir)
+
+	// Best-effort: a write failure here just means baseline conversion falls
+	// back to mydumper's own (TZ-sensitive) "Started dump at" line rather
+	// than failing the dump itself.
+	if err := baseline.WriteStartedAtMarker(dmpOutputDir, dumpStartedAt); err != nil {
+		slog.Warn("could not write dump-start marker; baseline conversion will fall back to mydumper's local-time 'Started dump at' line",
+			"output_dir", dmpOutputDir, "error", err)
+	}
 
 	if dmpFormat == "json" {
 		return cliutil.OutputJSON(struct {

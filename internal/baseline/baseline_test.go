@@ -103,6 +103,76 @@ func TestParseMetadataNewFormat(t *testing.T) {
 	}
 }
 
+// TestParseMetadataPrefersStartedAtMarker verifies the #768 fix: when
+// `bintrail dump` has written its own process-captured UTC start-time
+// marker, ParseMetadata uses it instead of re-parsing mydumper's
+// "Started dump at" line as if it were UTC. Here the mydumper line encodes a
+// dump-host-local timestamp (e.g. a UTC+2 host writing "02:00:00" for an
+// event that actually happened at 00:00:00 UTC) — parsing it verbatim as UTC
+// would anchor the baseline 2 hours in the future and silently exclude the
+// intervening deltas from replay. The marker sidesteps that ambiguity.
+func TestParseMetadataPrefersStartedAtMarker(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	trueUTC := time.Date(2025, 2, 27, 22, 0, 0, 0, time.UTC) // 2h earlier than the (host-local) mydumper line
+	if err := WriteStartedAtMarker(dir, trueUTC); err != nil {
+		t.Fatalf("WriteStartedAtMarker: %v", err)
+	}
+
+	m, err := ParseMetadata(dir)
+	if err != nil {
+		t.Fatalf("ParseMetadata: %v", err)
+	}
+	if !m.StartedAt.Equal(trueUTC) {
+		t.Errorf("StartedAt = %v, want marker time %v (mydumper's ambiguous local-time line should have been overridden)", m.StartedAt, trueUTC)
+	}
+	// Other fields still come from mydumper's own metadata file.
+	if m.BinlogFile != "binlog.000042" {
+		t.Errorf("BinlogFile = %q, want %q", m.BinlogFile, "binlog.000042")
+	}
+}
+
+// TestParseMetadataFallsBackWithoutMarker pins the pre-#768 behavior for
+// mydumper dumps produced outside `bintrail dump` (no marker file): the
+// ambiguous "Started dump at" line is still parsed as UTC verbatim.
+func TestParseMetadataFallsBackWithoutMarker(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := ParseMetadata(dir)
+	if err != nil {
+		t.Fatalf("ParseMetadata: %v", err)
+	}
+	want := time.Date(2025, 2, 28, 0, 0, 0, 0, time.UTC)
+	if !m.StartedAt.Equal(want) {
+		t.Errorf("StartedAt = %v, want %v", m.StartedAt, want)
+	}
+}
+
+// TestParseMetadataCorruptMarkerFallsBack verifies that an unparseable
+// dump-start marker (e.g. truncated by a crash mid-write) is a no-op fallback,
+// not a hard failure: ParseMetadata still succeeds using mydumper's own line.
+func TestParseMetadataCorruptMarkerFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, StartedAtMarkerFile), []byte("not-a-timestamp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := ParseMetadata(dir)
+	if err != nil {
+		t.Fatalf("ParseMetadata: %v", err)
+	}
+	want := time.Date(2025, 2, 28, 0, 0, 0, 0, time.UTC)
+	if !m.StartedAt.Equal(want) {
+		t.Errorf("StartedAt = %v, want %v (fallback to mydumper's line)", m.StartedAt, want)
+	}
+}
+
 func TestParseMetadataMissingTimestamp(t *testing.T) {
 	const content = "SHOW MASTER STATUS:\n\tLog: binlog.000001\n\tPos: 100\n"
 	dir := t.TempDir()

@@ -63,6 +63,51 @@ type DumpMetadata struct {
 	LSN            uint64 // PostgreSQL WAL LSN anchor (MetaKeyLSN); 0 = absent (MySQL baseline, or pre-#593 PG baseline)
 }
 
+// StartedAtMarkerFile is a bintrail-authored sidecar written into the mydumper
+// output directory by `bintrail dump`, recording that process's own UTC
+// wall-clock time captured immediately before invoking mydumper.
+//
+// mydumper's own "Started dump at" metadata line is written in the dump
+// host's LOCAL time, but ParseMetadata parses it with ParseInLocation(...,
+// time.UTC) — i.e. verbatim, as if it already were UTC. On a dump host whose
+// clock isn't set to UTC, every reconstruct/verify/shim consumer that anchors
+// replay at this timestamp skews by the host's UTC offset (#768). When this
+// marker is present, ParseMetadata prefers it over the ambiguous mydumper
+// line, sidestepping the timezone question entirely. It is absent for
+// mydumper dumps produced outside `bintrail dump` (manual mydumper run, a
+// different tool) — see docs/dump-and-baseline.md for that case.
+const StartedAtMarkerFile = "bintrail_dump_started_at_utc"
+
+// WriteStartedAtMarker records t (converted to UTC) into inputDir as the
+// authoritative dump-start time. Called by `bintrail dump` right before
+// invoking mydumper; best-effort on the caller's side — a write failure just
+// means ParseMetadata falls back to mydumper's own local-time line.
+func WriteStartedAtMarker(inputDir string, t time.Time) error {
+	path := filepath.Join(inputDir, StartedAtMarkerFile)
+	if err := os.WriteFile(path, []byte(t.UTC().Format(time.RFC3339Nano)+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", StartedAtMarkerFile, err)
+	}
+	return nil
+}
+
+// readStartedAtMarker reads StartedAtMarkerFile from inputDir, if present and
+// parseable. Returns ok=false (never an error) when the marker is absent or
+// corrupt — callers fall back to mydumper's own metadata timestamp.
+func readStartedAtMarker(inputDir string) (t time.Time, ok bool) {
+	path := filepath.Join(inputDir, StartedAtMarkerFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	t, err = time.Parse(time.RFC3339Nano, strings.TrimSpace(string(data)))
+	if err != nil {
+		slog.Warn("dump-start marker present but unparseable; falling back to mydumper's 'Started dump at' line",
+			"path", path, "error", err)
+		return time.Time{}, false
+	}
+	return t.UTC(), true
+}
+
 // ParseMetadata reads the mydumper "metadata" file in inputDir and returns the
 // extracted dump timestamp and binlog position information.
 //
@@ -74,6 +119,10 @@ type DumpMetadata struct {
 //	    Pos: 12345
 //	    GTID: 3e11fa47-...:1-100
 //	Finished dump at: 2025-02-28 00:01:23
+//
+// If inputDir also carries StartedAtMarkerFile (written by `bintrail dump`),
+// its process-captured UTC time is preferred over the "Started dump at" line
+// above, which is ambiguous with respect to the dump host's timezone (#768).
 func ParseMetadata(inputDir string) (DumpMetadata, error) {
 	path := filepath.Join(inputDir, "metadata")
 	f, err := os.Open(path)
@@ -83,6 +132,11 @@ func ParseMetadata(inputDir string) (DumpMetadata, error) {
 	defer f.Close()
 
 	var m DumpMetadata
+	markerStartedAt, haveMarker := readStartedAtMarker(inputDir)
+	if haveMarker {
+		m.StartedAt = markerStartedAt
+	}
+
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -91,11 +145,13 @@ func ParseMetadata(inputDir string) (DumpMetadata, error) {
 		trimmed := strings.TrimPrefix(line, "# ")
 
 		if after, ok := strings.CutPrefix(trimmed, "Started dump at: "); ok {
-			t, err := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimSpace(after), time.UTC)
-			if err != nil {
-				return DumpMetadata{}, fmt.Errorf("parse dump timestamp %q: %w", after, err)
+			if !haveMarker {
+				t, err := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimSpace(after), time.UTC)
+				if err != nil {
+					return DumpMetadata{}, fmt.Errorf("parse dump timestamp %q: %w", after, err)
+				}
+				m.StartedAt = t
 			}
-			m.StartedAt = t
 		} else if after, ok := strings.CutPrefix(line, "\tLog: "); ok {
 			m.BinlogFile = strings.TrimSpace(after)
 		} else if after, ok := strings.CutPrefix(line, "\tPos: "); ok {

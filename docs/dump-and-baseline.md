@@ -216,7 +216,14 @@ For example:
 /data/baselines/2026-03-02T14-30-00Z/mydb/customers.parquet
 ```
 
-The timestamp defaults to the `Started dump at:` time from mydumper's metadata file. Override it with `--timestamp` if needed.
+The timestamp defaults to the dump's start time, resolved in this order:
+
+1. **The `bintrail dump` marker, if present.** `bintrail dump` records its own UTC wall-clock time immediately before invoking mydumper into a `bintrail_dump_started_at_utc` sidecar in the output directory. This is unambiguous — `bintrail baseline` prefers it whenever present.
+2. **mydumper's `Started dump at:` metadata line, otherwise.** This line is written in the **dump host's local time**, but `bintrail baseline` parses it as if it were already UTC. If you produced the mydumper dump yourself (outside `bintrail dump` — e.g. running mydumper directly, or from another tool), the dump host's clock **must** be set to UTC (`TZ=UTC`), or every reconstruct/verify/shim consumer that anchors replay on this snapshot will be off by the host's UTC offset — on a UTC+2 host, for example, deltas in the resulting 2-hour window are silently excluded from replay.
+
+The console's own **Create baseline** trigger runs mydumper and the Parquet conversion in the same process, so it passes its own captured UTC time straight through and is unaffected by the dump host's timezone either way.
+
+Override the resolved timestamp with `--timestamp` if needed.
 
 Each snapshot also records its **binlog anchor** (the file/position/GTID where the deltas on top of it begin) and, per table, a **content digest + row count** in the Parquet metadata (used by [`bintrail verify`](verify.md)). A `_SUCCESS` marker is written when the conversion completes; a partially-converted snapshot carries an `_INCOMPLETE` marker instead and is excluded from discovery (see [Pruning old local snapshots](#pruning-old-local-snapshots---baseline-retain)).
 
