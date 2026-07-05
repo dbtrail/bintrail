@@ -297,3 +297,59 @@ func TestProcessTableRowColumnCountMismatchFailsLoud(t *testing.T) {
 		}
 	}
 }
+
+// TestProcessTableCommentFalsePositiveFailsLoud pins the accepted trade-off
+// documented on generatedRe (schema.go): a COMMENT string that happens to
+// contain "as (...) stored" wrongly drops a real, dumped column from the
+// schema's column list. This must never re-corrupt data the way the original
+// #767 bug did — it must instead trip the arity check and fail loud, because
+// the dump's actual value count no longer matches the (wrongly shortened)
+// column list.
+func TestProcessTableCommentFalsePositiveFailsLoud(t *testing.T) {
+	const schema = "CREATE TABLE `orders` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `price` decimal(10,2) NOT NULL,\n" +
+		"  `note` varchar(64) DEFAULT NULL COMMENT 'compute as (x) stored value later',\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB;\n"
+	// The dump carries all three real values — `note` is not actually generated.
+	const data = "INSERT INTO `orders` (`id`,`price`,`note`) VALUES(1,10.50,'hello');\n"
+
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "shop.orders-schema.sql")
+	dataPath := filepath.Join(dir, "shop.orders.00000.sql")
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dataPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Confirm the false-positive actually happens at the ParseSchema level —
+	// otherwise this test would pass for the wrong reason.
+	cols, err := ParseSchema(schemaPath)
+	if err != nil {
+		t.Fatalf("ParseSchema: %v", err)
+	}
+	if len(cols) != 2 {
+		t.Fatalf("got %d columns %v, want 2 (id, price) — expected the COMMENT false-positive to drop `note`", len(cols), colNames(cols))
+	}
+
+	tf := TableFiles{
+		Database:   "shop",
+		Table:      "orders",
+		SchemaFile: schemaPath,
+		DataFiles:  []string{dataPath},
+		Format:     "sql",
+	}
+	outPath := filepath.Join(dir, "orders.parquet")
+	_, err = processTable(context.Background(), tf, outPath, WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err == nil {
+		t.Fatal("processTable with a COMMENT-triggered false-positive column drop: got nil error, want loud failure (silent-corruption regression)")
+	}
+	for _, want := range []string{"2", "3", "orders"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
