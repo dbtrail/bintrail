@@ -1,11 +1,47 @@
 # Verifying a recovery (`bintrail verify`)
 
-`bintrail verify` proves that the recovery chain — a baseline snapshot plus the
-indexed binlog deltas on top of it — would faithfully reproduce your data. It
-answers the question the rest of dbtrail assumes: *if I reconstructed this table,
-would I actually get the right rows back?*
+`bintrail verify` checks that reconstructing a table — merging a baseline
+snapshot with the indexed binlog deltas on top of it — reproduces the same
+row content as an independent reference (the next baseline, or the live
+source) at the specific anchor points being compared. It answers a narrower
+question than "would my recoveries work": *at these anchor points, for the
+tables and columns compared, does the full-table reconstruction/`_snapshot`
+merge agree with the reference?*
 
 It is read-only and never writes to your source or your index.
+
+## What a MATCH does and does not prove
+
+- **The comparison is a 64-bit, additive, non-cryptographic multiset
+  fingerprint** over each table's rows — not a cryptographic hash. An
+  accidental collision (two different row sets producing the same digest) has
+  roughly a 2⁻⁶⁴ chance, and the digest is trivially forgeable by anyone able
+  to write rows to the table being compared. A MATCH is strong evidence the
+  capture-and-reconstruct pipeline works; it is not tamper-evident or
+  forensic-grade proof.
+- **It does not exercise the `recover` path.** `verify` reconstructs full-table
+  state from the *latest* event per PK (`row_after`, `LimitPerPK=1`).
+  `recover`'s reversal SQL additionally depends on `row_before` images,
+  DELETE row images, and intermediate events later superseded by a newer event
+  on the same PK — none of which a table-content match touches. A corrupt
+  `row_before`, a corrupt DELETE image, or a corrupt superseded intermediate
+  event can all pass `verify` cleanly while still producing a wrong `recover`
+  reversal from that same data.
+- **It does not exercise point-in-time reconstruction to an arbitrary instant
+  between two anchors.** Baseline-anchored mode compares two baseline anchors
+  (or a baseline vs. the live source at scan time); there is no independent
+  ground truth for an arbitrary `--at`/`AS OF` instant in between, so nothing
+  checks one.
+- **It does not cover the restored *schema*.** `CREATE TABLE` definitions,
+  indexes, `AUTO_INCREMENT` state, triggers, and collations are outside the
+  row-content digest.
+- **In default (baseline-anchored) mode, a table with no baseline yet is out
+  of scope** — the same tables `reconstruct` also cannot materialize.
+  `verify` reports these `inconclusive`, never as proof of correctness.
+- **Live-source mode requires a quiescent source.** Any commit against the
+  table during the scan reads as drift and reports as MISMATCH, even when the
+  reconstruction itself is correct — the live table simply kept moving during
+  the read.
 
 ## The two modes
 
@@ -105,6 +141,21 @@ section in [Query & Recovery](query-and-recovery.md).
 See also: the stream-continuity "no data lost" signal in
 [`bintrail status`](rotation-and-status.md#stream-continuity-no-data-lost), which
 verifies the *other* half — that no events were dropped from the capture stream.
+
+## Connection charset affects the digest
+
+The row-content fingerprint is computed over the bytes MySQL returns for each
+column, which depend on the **connection's charset** (`character_set_results`
+and friends) at read time. Two digests are only directly comparable when
+computed against the same connection charset. On a source with non-`utf8mb4`
+columns (`latin1`, `sjis`, binary-collation `VARBINARY`-as-text, etc.), reading
+the two sides of a comparison under different effective charsets can produce a
+false **MISMATCH** even though the underlying bytes are identical — the digest
+differs because the client-side re-encoding differs, not because the data
+does. If you see mismatches concentrated on legacy-charset tables, this is the
+first thing to rule out; a future release will pin
+`character_set_results=binary` so the comparison is charset-independent by
+construction.
 
 ## Notes per source
 

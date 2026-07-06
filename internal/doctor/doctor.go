@@ -136,6 +136,7 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 	report.add(checkBinlogFormat(sourceDB))
 	report.add(checkBinlogRowImage(sourceDB))
 	report.add(checkBinlogRetention(sourceDB))
+	report.add(checkSyncBinlog(sourceDB))
 	report.add(checkStatementCapture(sourceDB))
 	report.add(checkRowMetadata(sourceDB))
 	report.add(checkReplicationGrants(ctx, sourceDB))
@@ -324,6 +325,38 @@ func checkBinlogRetention(db *sql.DB) CheckResult {
 		Name:   "Binlog retention >= 2 days",
 		Status: StatusPass,
 		Detail: fmt.Sprintf("%dh", seconds/3600),
+	}
+}
+
+// checkSyncBinlog warns when the source's sync_binlog is not 1: with
+// sync_binlog=0 (or N>1), an OS crash can drop committed transactions from the
+// binlog tail before bintrail's stream ever reads them — a fundamental,
+// source-side loss no amount of gap-detection on the index side can recover,
+// because the data never reached the binlog at all. This is advisory only
+// (never FAIL): it is the source operator's durability tradeoff, and the
+// cheapest thing bintrail can do is make sure they know about it.
+func checkSyncBinlog(db *sql.DB) CheckResult {
+	const name = "Source sync_binlog=1 (crash-safety)"
+	var val string
+	if err := db.QueryRow("SELECT @@sync_binlog").Scan(&val); err != nil {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not read @@sync_binlog: " + err.Error(),
+		}
+	}
+	if val == "1" {
+		return CheckResult{Name: name, Status: StatusPass, Detail: "sync_binlog=1"}
+	}
+	return CheckResult{
+		Name:   name,
+		Status: StatusWarn,
+		Detail: fmt.Sprintf("sync_binlog=%s — an OS crash can drop the binlog's tail of already-committed transactions before bintrail ever streams them; this loss happens upstream of bintrail and cannot be detected until a later `bintrail verify` reports a MISMATCH", val),
+		Remediation: "Set sync_binlog=1 on the source for crash-safe binary logging (fsyncs the binlog on every " +
+			"commit — a throughput/durability tradeoff you may already be making deliberately):\n\n" +
+			"  SET PERSIST sync_binlog = 1;\n\n" +
+			"If you keep sync_binlog at a weaker setting for throughput reasons, be aware that a source crash can " +
+			"silently lose committed data bintrail never had a chance to capture.",
 	}
 }
 

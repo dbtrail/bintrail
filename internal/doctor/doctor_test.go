@@ -341,6 +341,51 @@ func TestCheckBinlogRetention(t *testing.T) {
 	}
 }
 
+// TestCheckSyncBinlog pins the source-side sync_binlog advisory (#814):
+// PASS at sync_binlog=1, WARN (never FAIL) at any other value or on a read
+// error — a source crash-tail loss is a source-operator tradeoff bintrail can
+// only surface, not block on.
+func TestCheckSyncBinlog(t *testing.T) {
+	tests := []struct {
+		name            string
+		resp            mockSQLScalar
+		wantStatus      CheckStatus
+		wantDetailFrag  string
+		wantRemediation bool
+	}{
+		{name: "sync_binlog=1", resp: row("1"), wantStatus: StatusPass, wantDetailFrag: "sync_binlog=1"},
+		{name: "sync_binlog=0", resp: row("0"), wantStatus: StatusWarn, wantDetailFrag: "sync_binlog=0", wantRemediation: true},
+		{name: "sync_binlog=100", resp: row("100"), wantStatus: StatusWarn, wantDetailFrag: "sync_binlog=100", wantRemediation: true},
+		{name: "query error", resp: errResp("conn lost"), wantStatus: StatusWarn, wantDetailFrag: "could not read"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			exp := mock.ExpectQuery("SELECT @@sync_binlog")
+			tt.resp.apply(exp, "@@sync_binlog")
+
+			got := checkSyncBinlog(db)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
+			}
+			if tt.wantRemediation && got.Remediation == "" {
+				t.Error("expected remediation but got none")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
 // TestCheckStatementCapture pins the #699 advisory check: PASS when the
 // source logs statement text, WARN (never FAIL) when it doesn't, MariaDB
 // fallback probe when the MySQL variable is absent, SKIP when neither exists.

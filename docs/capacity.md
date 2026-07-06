@@ -118,6 +118,8 @@ When `rotate` archives a partition to Parquet before dropping it, the same event
 
 This is the economic core of the retention design: **keep days hot in MySQL, keep years cold in Parquet.** A year of the typical-OLTP example above is ~365M events ≈ **11 GB of Parquet** on S3 or local disk — versus ~480 GB if you tried to keep it live. Queries read both tiers transparently.
 
+> **If `bintrail init --s3-bucket` created your archive bucket, it silently caps this at one year.** `init --s3-bucket` provisions the bucket with a lifecycle rule (`bintrail-1yr-expiry`, `Expiration: {Days: 365}` over the whole bucket) that deletes every object — archived partitions **and baselines** — once it turns 365 days old, regardless of how long you intended to retain history. `archive_state`/your baseline listing keep pointing at the now-deleted objects: a `reconstruct`/`_snapshot` read fails loud (`SourceEmptyError`, with an `archive reconcile` hint), but `recover` under `--allow-gaps` degrades to warn-and-continue, silently producing a partial reversal script. If you want to "keep years cold," either bring your own bucket with your own lifecycle policy (`--s3-arn`), or remove/widen the `bintrail-1yr-expiry` rule after `init` creates the bucket (`aws s3api put-bucket-lifecycle-configuration` / delete the rule via the console). There is currently no flag to change the expiry at `init` time.
+
 ```
 required = live window (MySQL, expensive)  +  archive history (Parquet, cheap)
 ```

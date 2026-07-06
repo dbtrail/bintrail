@@ -60,9 +60,11 @@ bintrail index \
 `--source-dsn` lets `index` preflight the source (`binlog_format=ROW` and
 `binlog_row_image=FULL`, both required; `ON DELETE/UPDATE CASCADE` foreign keys
 are allowed but warned — InnoDB executes cascades below the binlog, so the
-cascaded child deletes are not captured and plain `recover` cannot reverse them;
-use `bintrail recover-cascade` to reconstruct them, see
-[Query & Recovery](query-and-recovery.md))
+cascaded child row changes are not captured and plain `recover` cannot reverse
+them. `bintrail recover-cascade` reconstructs **`ON DELETE CASCADE`/`SET NULL`**
+only — an `ON UPDATE CASCADE`/`SET NULL` is not synthesized (see
+[`recover-cascade` limitations](query-and-recovery.md#recover-cascade-limitations)
+in [Query & Recovery](query-and-recovery.md))
 and auto-snapshot if no snapshot exists yet. It is **required**
 unless you pass `--skip-source-validation` to index offline binlogs against an
 already-captured snapshot — the silent skip is gone so a non-`FULL` source can't

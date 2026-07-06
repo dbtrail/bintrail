@@ -331,10 +331,21 @@ correct. FK `ON DELETE CASCADE` / `SET NULL` cascades are visible in the stream
 (PostgreSQL performs them as ordinary row changes), so `recover` undoes them
 directly.
 
-> **Not yet for PostgreSQL:** full-table `reconstruct` and the time-travel
-> `shim` rely on a baseline snapshot, which is not yet wired for PostgreSQL
-> sources. `query` and `recover` (which work from the indexed deltas) are the
-> supported recovery surface for PostgreSQL in this release.
+> **Baseline snapshots exist for PostgreSQL, with a narrower scope than
+> MySQL.** `bintrail-pg baseline` takes a consistent Parquet snapshot directly
+> from a live PostgreSQL source, anchored to the replication slot's own LSN
+> floor. It feeds **single-row** `reconstruct` and the shim's **single-row**
+> `_snapshot` — both fold a PG baseline with binlog deltas with no
+> PostgreSQL-specific gate, so they run today. This path is **beta and
+> untested end-to-end** for PostgreSQL-specific types (`bytea`,
+> `timestamptz`, arrays) flowing through the fold — validate your own
+> round-trip before relying on it. **Full-table** `reconstruct`
+> (`--output-format mydumper`) and baseline-anchored `verify` remain
+> deliberately out of scope: a PG baseline does not carry the `CREATE TABLE`
+> metadata full-table reconstruct needs. `query` and `recover` (which work
+> from the indexed deltas alone, no baseline required) are the
+> fully-supported recovery surface for PostgreSQL in this release — see
+> [Beta limitations](#beta-limitations) for the complete picture.
 
 ---
 
@@ -518,8 +529,12 @@ your own round-trip.
   if the child table is published**. If a published parent has an unpublished
   cascade child, the cascade rewrites are not captured — bintrail-pg warns (startup
   + doctor); add the child to the publication.
-- **`TRUNCATE` is visible but not reversible from the stream.** It is decoded as
-  an event but carries no rows, so there is nothing for `recover` to put back.
+- **`TRUNCATE` is not captured at all — not even as an audit trail.** Unlike
+  MySQL's DDL, which lands a `schema_changes` row bintrail can at least warn
+  about, a PostgreSQL `TRUNCATE` produces only a transient `Warn` log line at
+  capture time ("TRUNCATE not indexed") and nothing persisted. There is
+  nothing for `recover` to put back, and — unlike the MySQL path — no durable
+  record that the truncate happened at all.
 - **Sequence cursors are not captured.** The materialized id values in your rows
   *are* captured; the sequence's own `last_value` (a separate catalog object) is
   not — logical decoding does not replicate sequences. After a restore, re-point
@@ -528,10 +543,14 @@ your own round-trip.
 - **`GENERATED ... AS IDENTITY` / generated columns** can need care on recovery
   (`GENERATED ALWAYS AS IDENTITY` rejects an explicit insert; `STORED` generated
   columns are absent from the stream before PostgreSQL 18). Treat as best-effort.
-- **`reconstruct`, time-travel `shim`, and the baseline-anchored mode of
-  `verify` are not wired for PostgreSQL** (no baseline yet) — see above.
-  (`recover` and `recover-cascade` work; cascades are captured as ordinary row
-  changes — see [Querying and recovering](#querying-and-recovering).)
+- **Full-table `reconstruct` and baseline-anchored `verify` are not wired for
+  PostgreSQL** — a PG baseline deliberately omits the `CREATE TABLE` metadata
+  full-table reconstruct needs (see above). **Single-row** `reconstruct` and
+  the shim's single-row `_snapshot` DO work against a PG baseline today, but
+  are beta/untested end-to-end for PostgreSQL-specific types. (`recover` and
+  `recover-cascade` work unconditionally, with no baseline needed; cascades
+  are captured as ordinary row changes — see
+  [Querying and recovering](#querying-and-recovering).)
 - **No connection/forensics attribution.** `pgoutput` does not carry the backend
   PID, so the per-connection forensics surface (available for MySQL) is empty
   for PostgreSQL.

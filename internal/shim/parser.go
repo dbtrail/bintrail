@@ -396,6 +396,14 @@ func parseDiffMatch(m []string, schema string) (TimeTravelQuery, error) {
 	}, nil
 }
 
+// parseTimeLiteral parses a time-travel literal. Zone-less formats (the
+// space-separated form, the zone-less RFC-3339-shaped form, and date-only)
+// are interpreted as UTC — ParseInLocation with time.UTC treats the literal
+// as if it already were UTC, it does not convert from any other zone. Only
+// the Z-suffixed RFC 3339 form is unambiguous by construction. Callers whose
+// wall clock is not UTC should either use that form or account for the
+// offset themselves; there is no per-session override (SET time_zone is
+// accepted as handshake noise and has no effect here — see handler.go).
 func parseTimeLiteral(s string) (time.Time, error) {
 	for _, f := range timeFormats {
 		if t, err := time.ParseInLocation(f, s, time.UTC); err == nil {
@@ -427,7 +435,7 @@ func parseTimeLiteral(s string) (time.Time, error) {
 		}
 		return time.Now().UTC().Add(-time.Duration(n) * unit), nil
 	}
-	return time.Time{}, fmt.Errorf("must be one of: %s, or a relative literal like '5 minutes ago'", strings.Join(timeFormats, ", "))
+	return time.Time{}, fmt.Errorf("must be one of: %s (zone-less forms are interpreted as UTC), or a relative literal like '5 minutes ago'", strings.Join(timeFormats, ", "))
 }
 
 func stripQuotes(s string) string {

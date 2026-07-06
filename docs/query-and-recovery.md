@@ -287,6 +287,38 @@ bintrail recover-cascade --index-dsn "..." \
   re-created a deleted parent, remove its `INSERT` from the output —
   `FOREIGN_KEY_CHECKS=0` does not suppress primary-key violations.
 
+#### `recover-cascade` limitations
+
+- **Only `ON DELETE CASCADE` / `ON DELETE SET NULL`.** `ON UPDATE CASCADE` /
+  `ON UPDATE SET NULL` (InnoDB rewrites a child's FK when the parent's
+  referenced key is `UPDATE`d) are not synthesized — reverting such a parent
+  `UPDATE` leaves the child FK pointing at the new value with no warning. The
+  gate is deliberate (it does not port a rule-conflation bug from the dbtrail
+  SaaS), but the result is real: `bintrail doctor`'s cascade check and this
+  page both cover `ON DELETE` only.
+- **Composite (multi-column) FKs are skipped, not reconstructed.** A
+  single-column victim match would mis-reconstruct a multi-column key, so a
+  composite FK is dropped and flagged in the output rather than silently
+  matched on one column.
+- **Phase-2 (baseline) FK-column type restriction.** The baseline scan binds
+  the parent key as a **string** against the child's FK column; DuckDB coerces
+  this reliably only for integer and character (`CHAR`/`VARCHAR`/`TEXT`/`ENUM`/
+  `SET`) families. A `DATETIME`, `DECIMAL`, `DATE`, or binary-typed FK column
+  refuses Phase-2 baseline augmentation (flagged as a coverage gap) rather than
+  risk a silent zero-match — so a `BINARY(16)`/UUID-as-binary FK loses Phase-2
+  entirely and falls back to Phase-1 (binlog-window only).
+- **Cross-schema FK children are excluded.** `recover-cascade` loads the FK
+  graph scoped to the parent's own `--schema` only; a child table living in a
+  *different* schema is never loaded, so its cascade victims are silently
+  absent from the graph rather than flagged. Point `--schema` at the child's
+  schema in a separate run if a cascade crosses a schema boundary.
+- **The FK graph reflects the latest schema snapshot, not the one in effect at
+  the delete being recovered.** If DDL changed the FK topology between the
+  delete and now, synthesis uses the newer graph. Acceptable in practice
+  because cascade-topology churn mid-recovery-window is rare, and the
+  `FOREIGN_KEY_CHECKS=0` wrapper tolerates the resulting over-/under-inclusion
+  (which the operator reviews before applying).
+
 ### Recovering many rows at once
 
 To reverse a specific set of primary keys, pass `--pks` (comma-separated) instead
@@ -318,13 +350,16 @@ For `UPDATE` and `DELETE` reversals, the generator needs a `WHERE` clause to ide
 UPDATE `mydb`.`orders` SET `status` = 'draft' WHERE `id` = 42
 ```
 
-**Without a snapshot (fallback)**: Uses every column in the row image. This is verbose but uniquely identifies the row for tables without duplicate rows. A `NULL` column renders as `IS NULL` (not `= NULL`, which never matches in SQL):
+**Without a snapshot (fallback)**: Uses every column in the row image. This is verbose, and is **not** a guarantee of correctness even for tables without duplicate rows:
 
 ```sql
 UPDATE `mydb`.`orders`
 SET `status` = 'draft'
 WHERE `id` = 42 AND `status` = 'published' AND `created_at` = '2026-02-19 14:01:00' AND `notes` IS NULL
 ```
+
+- A `NULL` column renders as `IS NULL` (not `= NULL`, which never matches in SQL) — but a row whose *other* columns are all non-`NULL` and identical to another row (no natural key, no snapshot) will match **both** rows, and the reversal over-applies. There is no runtime detection of this: the generator has no way to know the table has (or doesn't have) duplicate rows.
+- "Without duplicate rows" is a precondition the generator assumes, not something it checks. If you rely on this fallback (no schema snapshot available), verify the table has a natural uniqueness property before applying the generated script.
 
 The resolver is loaded best-effort in the `recover` command — a failure logs a warning and falls back to the all-columns strategy.
 
@@ -357,5 +392,17 @@ COMMIT;
 Key properties:
 - Wrapped in `BEGIN` / `COMMIT` — all changes apply atomically or not at all.
 - Comments before each statement showing the original event ID, type, table, PK, timestamp, and GTID.
-- Per-event generation errors emit a `-- ERROR ...` comment rather than halting — the script remains runnable (the transaction rolls back on the first error anyway). **Schema drift is the exception:** if a statement references a column dropped or renamed after the event, `recover` refuses up front — it writes nothing and exits non-zero (with `--output`, the target file is left empty), rather than emitting SQL that would fail at apply time. Always check the exit code before applying a generated file.
+- Per-event generation errors emit a `-- ERROR ...` comment rather than halting — the script remains runnable. Note that a SQL comment is **not** an apply-time failure: it does not roll back the transaction by itself, it simply means that one event's reversal is missing from the script (the surrounding `BEGIN`/`COMMIT` only rolls back if a *real* statement in the script errors at apply time). Read the `-- ERROR ...` lines before applying if completeness matters. **Schema drift is the exception:** if a statement references a column dropped or renamed after the event, `recover` refuses up front — it writes nothing and exits non-zero (with `--output`, the target file is left empty), rather than emitting SQL that would fail at apply time. Always check the exit code before applying a generated file.
 - **Never auto-executed**: dbtrail only generates the file. Applying it is always a manual step.
+- `bintrail` (MySQL) pins the apply session to `SET time_zone = '+00:00'` before the reversal statements, since TIMESTAMP/DATETIME literals in the script are rendered from the captured UTC value with no explicit zone marker — without the pin, a target session in a non-UTC `time_zone` would reinterpret them and reintroduce a shift. `bintrail-pg` (PostgreSQL) pins `standard_conforming_strings = on` for the same reason (its string-escaping assumes it). Neither pins anything else about the apply session — see [Restore limitations](#restore-limitations-mysql) below for what is **not** pinned or restored.
+
+## Restore limitations (MySQL)
+
+A `bintrail recover` script is applied as ordinary SQL by a normal client connection, so it inherits several effects that are easy to miss when treating "the script ran with no errors" as "the data is back exactly as it was":
+
+- **Triggers re-fire on apply.** Restoring a `DELETE` via `INSERT`, or reverting an `UPDATE`, fires the target table's `AFTER INSERT`/`AFTER UPDATE` triggers just like any other statement — producing **new** side effects (audit rows, counters, denormalized columns). Since the trigger's original side effects were themselves row-logged and are reverted as their own separate events in the same script, a table with side-effecting triggers can have those effects double-applied. MySQL has no session-level toggle to suppress triggers during an apply (this is a fundamental limitation for MySQL, unlike PostgreSQL's `session_replication_role`).
+- **`AUTO_INCREMENT` is not restored.** Reverting an `INSERT` deletes the row but does not decrement the table's `AUTO_INCREMENT` counter; reverting a `DELETE` re-inserts the row with its original (now possibly out-of-sequence) id, which can bump the counter further. The row data ends up identical to before, but the *next* auto-generated id may differ from what it would have been. If this matters, follow up with an explicit `ALTER TABLE ... AUTO_INCREMENT = N` once you know the correct value.
+- **`TRUNCATE TABLE` / `DROP TABLE` / `RENAME TABLE` cannot be undone by `recover`.** These emit no row-level binlog events (only an audit entry in `schema_changes`), so there is nothing for `recover` to reverse. The only path back is `bintrail baseline` + `bintrail reconstruct` to a point in time *before* the DDL — see [TRUNCATE / DROP / RENAME in the reconstruction window](#truncate--drop--rename-in-the-reconstruction-window) above, which is enforced (refuse, not silent) on every baseline-merging read path.
+- **A crash-tail loss on the source is invisible to `recover` and `reconstruct` alike.** If the source runs with `sync_binlog` other than `1`, an OS crash can drop committed transactions from the binlog tail before dbtrail ever sees them — there is nothing in the index to recover because the data never reached the binlog. `bintrail doctor` warns when the source isn't `sync_binlog=1`; `bintrail verify` is the only way to later notice the gap (as a MISMATCH).
+- **`reconstruct --at` cuts by a per-statement timestamp, not a transaction boundary.** Two statements inside the same transaction can carry different `event_timestamp` values (down to the second); slicing at an instant between them can, in principle, produce a row state that combines pieces of two different statements and never existed as a single consistent snapshot on the source. In practice this window is sub-second and rare, but it is not a transactional guarantee.
+- **There is no single command or flag that reports "history starts at `max(baseline, first captured event)`".** The oldest point you can reconstruct to is bounded by whichever is more recent: the oldest baseline snapshot you have, or the oldest event still in the index (live partitions plus any archives) — but nothing surfaces that combined floor directly. Check `bintrail status`'s earliest-indexed-event figure and your baseline listing (`--baseline-dir`) together to work it out for a given table.
