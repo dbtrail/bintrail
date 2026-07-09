@@ -1047,43 +1047,11 @@ func TestOne_PGTypeRoundTripMatrix(t *testing.T) {
 	}
 	t.Cleanup(func() { pg.Close(context.Background()) })
 
-	// name → (column type DDL, value SQL as it appears in VALUES). Values are chosen
-	// scary-first: precision (>2^53), scale (trailing zero), escaping (quote+backslash),
-	// and the format-bearing types (bytea \x, arrays, ranges, bit, inet, json).
-	type tc struct{ name, typeDDL, valSQL string }
-	cases := []tc{
-		{"smallint", "smallint", "32767"},
-		{"integer", "integer", "-2147483648"},
-		{"bigint", "bigint", "9223372036854775807"},
-		{"numeric_big", "numeric", "18446744073709551615"}, // > 2^53, precision
-		{"numeric_scale", "numeric(12,2)", "1.50"},         // trailing-zero scale
-		{"real", "real", "3.5"},
-		{"double", "double precision", "2.5"},
-		{"text_tricky", "text", `'O''Brien \ C:\back'`}, // quote + backslash escaping
-		{"varchar", "varchar(32)", "'hello world'"},
-		{"char", "char(5)", "'ab'"}, // trailing blanks are insignificant in bpchar (trimmed on ::text); proves coercion, not padding-through-capture
-		{"boolean", "boolean", "true"},
-		{"uuid", "uuid", "'11111111-2222-3333-4444-555555555555'"},
-		{"bytea", "bytea", `'\xdeadbeef00'`},
-		{"json", "json", `'{"k": "v"}'`},
-		{"jsonb", "jsonb", `'{"k": "v''s"}'`}, // embedded quote
-		{"date", "date", "'2026-06-22'"},
-		{"time", "time", "'12:34:56'"},
-		{"timestamp", "timestamp", "'2026-06-22 12:34:56'"},
-		{"timestamptz", "timestamptz", "'2026-06-22 12:34:56+00'"},
-		{"interval", "interval", "'1 day 02:03:04'"},
-		{"inet", "inet", "'192.168.1.10'"},
-		{"cidr", "cidr", "'10.0.0.0/8'"},
-		{"macaddr", "macaddr", "'08:00:2b:01:02:03'"},
-		{"bit", "bit(4)", "'1010'"},
-		{"varbit", "varbit", "'101'"},
-		{"int4range", "int4range", "'[1,10)'"},
-		{"int_array", "integer[]", "'{1,2,3}'"},
-		{"text_array", "text[]", `'{"a","b,c"}'`}, // element with a comma
-		{"point", "point", "'(1,2)'"},
-		{"money", "money", "'1.50'"}, // locale-dependent output ('$1.50'); same instance, so stable
-		{"enum", "mood", "'happy'"},  // custom enum (created below)
-	}
+	// The shared type matrix (pgTypeMatrixCases, typematrix_fold_integration_
+	// test.go): name → (column type DDL, value SQL as it appears in VALUES),
+	// scary-first. This test uses valSQL only; the fold test also exercises
+	// each case's second literal (updSQL).
+	cases := pgTypeMatrixCases
 
 	tblOf := func(name string) string { return "pgtype_" + name }
 	dropAll := func() {
