@@ -37,7 +37,14 @@ type QueryPlan struct {
 // Returns (nil, nil) when planning is not applicable (nil DB, no time range).
 // Returns (nil, error) when planning fails due to a database error.
 // dbName is the MySQL database name (needed for information_schema queries).
-func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Time) (*QueryPlan, error) {
+//
+// noArchive mirrors the caller's decision to exclude Parquet archives from the
+// fetch (--no-archive or an active RBAC profile). When true, archive_state
+// coverage is NOT read or counted: hours rotated out of live MySQL but present
+// only in archives are then classified as GAPS, because those archives will not
+// be fetched. Counting them as covered would let a strict (AllowGaps=false)
+// reconstruct silently return incomplete state.
+func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Time, noArchive bool) (*QueryPlan, error) {
 	if db == nil || dbName == "" {
 		return nil, nil
 	}
@@ -65,19 +72,36 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 
 	// Load archived partition names. Failure is non-fatal: archive_state may
 	// not exist in older indexes. Gap detection still works from live partitions.
-	archivedHours, err := loadArchivedHours(ctx, db)
-	if err != nil {
-		slog.Debug("archive_state not available for planning", "error", err)
-		archivedHours = nil
+	//
+	// Skipped entirely when noArchive: those archives are excluded from the
+	// fetch, so reading their coverage here would only mislabel rotated hours as
+	// covered. Leaving archivedHours nil makes buildPlan classify them as gaps.
+	var archivedHours []time.Time
+	if !noArchive {
+		archivedHours, err = loadArchivedHours(ctx, db)
+		if err != nil {
+			slog.Debug("archive_state not available for planning", "error", err)
+			archivedHours = nil
+		}
 	}
 
-	return buildPlan(liveHours, archivedHours, rangeStart, rangeEnd), nil
+	return buildPlan(liveHours, archivedHours, rangeStart, rangeEnd, noArchive), nil
 }
 
 // buildPlan is the pure-logic core of the planner. It classifies each hour in
 // [rangeStart, rangeEnd) as live, archived, or gap, then builds a QueryPlan.
 // This function is extracted from Plan() for testability.
-func buildPlan(liveHours, archivedHours []time.Time, rangeStart, rangeEnd time.Time) *QueryPlan {
+func buildPlan(liveHours, archivedHours []time.Time, rangeStart, rangeEnd time.Time, noArchive bool) *QueryPlan {
+	// When archives are excluded from the fetch (--no-archive / active profile),
+	// archive_state coverage must NOT count toward classification or half-open
+	// range inference: those hours are rotated out of live MySQL and will not be
+	// fetched, so they are real gaps. Dropping archivedHours here is the single
+	// authority for that rule (Plan also skips the archive_state read). Without
+	// it a strict AllowGaps=false reconstruct would silently omit them.
+	if noArchive {
+		archivedHours = nil
+	}
+
 	// Build sets for fast lookup.
 	liveSet := make(map[time.Time]bool, len(liveHours))
 	for _, h := range liveHours {
@@ -164,7 +188,9 @@ func (p *QueryPlan) SkipMySQL() bool {
 //
 // parseDSN is a function that extracts the database name from the DSN.
 func RunPlanAndWarn(ctx context.Context, db *sql.DB, dbName string, since, until *time.Time) *QueryPlan {
-	plan, err := Plan(ctx, db, dbName, since, until)
+	// Callers that exclude archives (bintrail query --no-archive) skip planning
+	// entirely, so this warn path is always archive-aware (noArchive=false).
+	plan, err := Plan(ctx, db, dbName, since, until, false)
 	if err != nil {
 		slog.Warn("query planner failed; coverage gaps may not be detected", "error", err)
 		return nil
