@@ -1210,6 +1210,53 @@ func TestPrepareDumpOutputDir_happyPaths(t *testing.T) {
 	})
 }
 
+// TestPrepareDumpOutputDir_preservesFixedDotOldBackup guards the #809 review
+// finding: moving a recognized prior dump aside must NOT delete a pre-existing
+// <dir>.old. The earlier fixed backup name did an unconditional
+// os.RemoveAll(<dir>.old), which would destroy either an operator's own backup
+// kept at that human-conventional suffix, or — in a failed-rollback chain — the
+// only good copy of the previous dump stranded there.
+func TestPrepareDumpOutputDir_preservesFixedDotOldBackup(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "metadata"), []byte("recognized dump"), 0o644); err != nil {
+		t.Fatalf("seed metadata: %v", err)
+	}
+	// A precious tree the user independently keeps at the conventional .old suffix.
+	precious := out + ".old"
+	if err := os.MkdirAll(precious, 0o755); err != nil {
+		t.Fatalf("mkdir precious: %v", err)
+	}
+	preciousFile := filepath.Join(precious, "do-not-delete.txt")
+	if err := os.WriteFile(preciousFile, []byte("keep me"), 0o644); err != nil {
+		t.Fatalf("seed precious: %v", err)
+	}
+
+	prep, err := prepareDumpOutputDir(out)
+	if err != nil {
+		t.Fatalf("prepareDumpOutputDir: %v", err)
+	}
+	// The fixed <dir>.old must be untouched.
+	if got, readErr := os.ReadFile(preciousFile); readErr != nil {
+		t.Fatalf("precious <dir>.old was deleted or altered: %v", readErr)
+	} else if string(got) != "keep me" {
+		t.Errorf("precious <dir>.old content changed = %q, want %q", got, "keep me")
+	}
+	// The backup must be a distinct unique sibling, never the fixed <dir>.old.
+	if prep.backup == precious {
+		t.Fatalf("backup collided with the pre-existing fixed <dir>.old: %q", prep.backup)
+	}
+	if prep.backup == "" {
+		t.Fatal("expected a backup path for a recognized prior dump")
+	}
+	if _, statErr := os.Stat(filepath.Join(prep.backup, "metadata")); statErr != nil {
+		t.Errorf("prior dump not preserved in unique backup: %v", statErr)
+	}
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 // argsContain reports whether args contains the string s.

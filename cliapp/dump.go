@@ -434,9 +434,22 @@ func prepareDumpOutputDir(dir string) (*dumpDirPrep, error) {
 			"Remove it yourself or point --output-dir elsewhere", dir, dumpDirMarkers[0])
 	}
 	// Recognizable prior dump: move it aside so a failed dump can restore it.
-	backup := filepath.Clean(dir) + ".old"
-	if err := os.RemoveAll(backup); err != nil {
-		return nil, fmt.Errorf("clear stale dump backup %q: %w", backup, err)
+	// Use a UNIQUE sibling path rather than a fixed dir.old — the earlier fixed
+	// name did an unconditional os.RemoveAll(dir.old), reintroducing exactly the
+	// unconditional-tree-deletion this guard exists to eliminate (#809 review):
+	//   (a) an operator's own precious backup at <dir>.old would be silently
+	//       destroyed the moment <dir> is recognized as a dump; and
+	//   (b) if a prior rollback() failed to remove partial output, the only good
+	//       copy of the previous dump is stranded at dir.old — and it IS a
+	//       recognizable dump — so the next run's RemoveAll(dir.old) would wipe
+	//       the last good copy before renaming the partial over it.
+	// A per-run suffix never collides with a pre-existing path, so we NEVER
+	// delete anything here — a leftover backup from a failed rollback stays put.
+	backup := fmt.Sprintf("%s.old-%d-%d", filepath.Clean(dir), os.Getpid(), time.Now().UnixNano())
+	if _, err := os.Lstat(backup); err == nil {
+		return nil, fmt.Errorf("dump backup path %q already exists; refusing to overwrite it", backup)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("stat dump backup path %q: %w", backup, err)
 	}
 	if err := os.Rename(dir, backup); err != nil {
 		return nil, fmt.Errorf("move existing dump %q aside to %q: %w", dir, backup, err)
