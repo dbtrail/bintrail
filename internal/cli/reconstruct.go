@@ -262,6 +262,23 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ensure index schema: %w", err)
 	}
 
+	// Single-row reconstruct (and the shim's _snapshot) run generically for a
+	// PostgreSQL source — there is no PG-specific gate, so this path is live
+	// today. It is validated for canonical, session-GUC-independent types; the
+	// GUC-sensitive and container types are beta and not yet proven end-to-end
+	// through the baseline↔delta fold (#593 slice D). Warn — never refuse (the
+	// path is honest-best-effort and a refusal would break the surface that DOES
+	// work). Detect PG by the recorded flavor OR the baseline's LSN anchor. This
+	// path reads baseline metadata LOCAL-only (see the ReadParquetMetadata guard
+	// above), so bmeta.LSN is 0 for an S3 baseline: the flavor clause catches S3
+	// PG baselines (and pre-#593 local baselines with LSN==0), while the LSN
+	// clause catches a LOCAL PG baseline whose flavor probe returns "" (an index
+	// with no stream_state row). Both clauses are load-bearing. --baseline-only
+	// returns above, before the DB is ever opened, so it never reaches this warn.
+	if pgReconstructBeta(query.SourceFlavor(db), bmeta.LSN) {
+		slog.Warn("single-row reconstruct for a PostgreSQL source is beta — validated for canonical types (int/numeric/bool/uuid/text/json/enum and the common PK types) but not yet proven end-to-end for timestamptz/float/bytea/interval/array types; verify the round-trip before relying on it (#593)")
+	}
+
 	// Refuse if a TRUNCATE/DROP/RENAME hit this table in the window: it emits
 	// no row events, so folding the fetched deltas onto the baseline below
 	// would silently resolve a truncated-away row as if it still existed at
@@ -341,11 +358,13 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	// pg_current_wal_lsn(); see MetaKeyLSN's doc comment); MySQL/MariaDB on
 	// binlog file+pos. PG LSN TEXT ("0/1A2B3C4") is NOT lexically ordered, so
 	// the binlog_file column must never be compared for a PG source — see
-	// reconstruct.GapDetected and resolveGapCheck. NOTE: PG full-table/single-
-	// row reconstruct is not yet un-gated for Postgres sources (#593 slice D) —
-	// this gap check runs generically here but the PG merge path itself is not
-	// wired; whoever builds slice D must honor "replay at/after the floor", not
-	// "strictly after the snapshot's live LSN".
+	// reconstruct.GapDetected and resolveGapCheck. NOTE: single-row reconstruct
+	// (and the shim's _snapshot) DO run for a PG source today — a beta warn
+	// fired above; full-table reconstruct stays gated for PG (#830/#597). The
+	// remaining slice-D GA hardening is end-to-end type-fidelity validation and
+	// pinning the baseline COPY vs pgoutput rendering GUCs so their text agrees;
+	// it must honor "replay at/after the floor", not "strictly after the
+	// snapshot's live LSN".
 	if len(events) > 0 {
 		first := events[0]
 		flavor, lineageGuard, anchorPresent, eventPosMissing := resolveGapCheck(
@@ -635,4 +654,15 @@ func resolveGapCheck(flavor string, bmeta baseline.DumpMetadata, firstFile strin
 		eventPosMissing = firstStartPos == 0
 	}
 	return flavor, lineageGuard, anchorPresent, eventPosMissing
+}
+
+// pgReconstructBeta reports whether a single-row reconstruct is running against
+// a PostgreSQL source — gate for the beta warning. Either the index records the
+// source flavor as "postgres", or the baseline carries an LSN anchor. Both
+// clauses are load-bearing: the flavor clause catches an S3 PG baseline (the
+// single-row path reads baseline metadata local-only, so bmeta.LSN is 0 for S3)
+// and a pre-#593 local baseline with LSN==0; the LSN clause catches a local PG
+// baseline whose flavor probe returns "" (an index with no stream_state row).
+func pgReconstructBeta(flavor string, baselineLSN uint64) bool {
+	return flavor == "postgres" || baselineLSN != 0
 }
