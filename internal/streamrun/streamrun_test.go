@@ -863,6 +863,11 @@ func TestDetectPositionGap_noGap(t *testing.T) {
 	if gap.HasGap {
 		t.Error("expected no gap when checkpoint is on latest file")
 	}
+	// Resuming in place: a same-named regrown binlog after a source rebuild is
+	// undetectable here, so the guard flag must be set (#780).
+	if !gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=true on an in-place position-mode resume")
+	}
 }
 
 // TestDetectPositionGap_fillable verifies that a fillable gap is reported when
@@ -892,6 +897,11 @@ func TestDetectPositionGap_fillable(t *testing.T) {
 	}
 	if !strings.Contains(gap.Message, "mysql-bin.000001") {
 		t.Errorf("expected checkpoint file in message, got: %s", gap.Message)
+	}
+	// Fillable gap still resumes reading the existing checkpoint file — rebuild
+	// undetectable (#780).
+	if !gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=true on a fillable position-mode gap")
 	}
 }
 
@@ -931,6 +941,11 @@ func TestDetectPositionGap_unfillable(t *testing.T) {
 	if !strings.Contains(gap.Message, "mysql-bin.000038") {
 		t.Errorf("expected checkpoint file in message, got: %s", gap.Message)
 	}
+	// A purged (unfillable) gap is already surfaced loudly and auto-advanced, so
+	// the rebuild-undetectable guard must NOT fire here (#780).
+	if gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=false on an unfillable/purged gap")
+	}
 }
 
 // TestDetectPositionGap_extraColumns verifies that SHOW BINARY LOGS with extra
@@ -956,6 +971,65 @@ func TestDetectPositionGap_extraColumns(t *testing.T) {
 	}
 	if !gap.Fillable {
 		t.Error("expected fillable gap")
+	}
+	if !gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=true on a fillable position-mode gap")
+	}
+}
+
+// TestDetectPositionGap_rebuildUndetectable pins the #780 guard: the source was
+// rebuilt (RESET MASTER + restore) and the same-named checkpoint binlog regrew
+// PAST the checkpoint offset. The file exists and checkpointPos < size, so the
+// check passes and the stream would resume reading a divergent history. Position
+// mode cannot tell — the guard flag is the only signal, and it must be set.
+func TestDetectPositionGap_rebuildUndetectable(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Checkpoint was mysql-bin.000001:5000. After a rebuild the source only has a
+	// regenerated mysql-bin.000001 that has already grown to 20000 bytes.
+	mock.ExpectQuery("SHOW BINARY LOGS").WillReturnRows(
+		sqlmock.NewRows([]string{"Log_name", "File_size"}).
+			AddRow("mysql-bin.000001", 20000))
+
+	gap, err := detectPositionGap(db, "mysql-bin.000001", 5000, 10*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gap.HasGap {
+		t.Error("expected no reported gap (checkpoint file is the latest and pos <= size)")
+	}
+	if !gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=true: a regrown same-named binlog is undetectable in position mode")
+	}
+}
+
+// TestDetectPositionGap_posExceedsSize verifies the pos>size branch (a truncated
+// or freshly-regenerated shorter file) is treated as an unfillable gap and does
+// NOT set the rebuild-undetectable guard — that path is already loud (#780).
+func TestDetectPositionGap_posExceedsSize(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW BINARY LOGS").WillReturnRows(
+		sqlmock.NewRows([]string{"Log_name", "File_size"}).
+			AddRow("mysql-bin.000001", 500))
+
+	gap, err := detectPositionGap(db, "mysql-bin.000001", 9000, 10*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gap.HasGap || gap.Fillable {
+		t.Fatalf("expected an unfillable gap when checkpoint pos exceeds file size, got %+v", gap)
+	}
+	if gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=false on the loud pos>size branch")
 	}
 }
 
