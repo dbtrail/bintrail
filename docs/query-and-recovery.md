@@ -184,6 +184,15 @@ All three baseline-merging entry points — `reconstruct` single-row, `reconstru
 
 This is an offline/`_snapshot` concern only — `_flashback` and `bintrail query`/`recover` read the row-event history directly and never claim a never-touched row still exists.
 
+### PK-changing UPDATE in the reconstruction window
+
+An `UPDATE` that changes a row's **primary key** (e.g. `UPDATE orders SET id = 2 WHERE id = 1`) is stored in the index keyed by its **before-image** PK (`pk_values` = the old key). `reconstruct` folds events into a change map keyed by that before-image PK, so a changed PK cannot be applied safely — the after-image row it would emit carries a *different* key than its map entry:
+
+- **Resurrection** — `UPDATE pk 1→2; DELETE pk=2`: the `DELETE` is keyed by the new PK (`2`) and never collides with the `UPDATE` entry (keyed by `1`), so a naive merge emits the `pk=2` after-image for a row the `DELETE` actually removed.
+- **Duplication** — `UPDATE pk 1→2; UPDATE pk=2`: `pk=2` is emitted twice, a `1062 Duplicate entry` that only surfaces when you load the dump.
+
+Rather than ship a silently duplicated/resurrected dump, **all full-table reconstruct entry points** — `reconstruct --output-format mydumper`, the shim's `_snapshot` (and `verify`, which reuses the same engine), and the binlog-only fallback for a never-baselined table — detect a PK-changing `UPDATE` in `(baseline snapshot time, --at]` up front and **refuse** the run with an error naming the table and the `old → new` key transition ([#782](https://github.com/dbtrail/dbtrail/issues/782)). **Single-row** `reconstruct` for the *new* key returns a clear "a PK-changing UPDATE in the window likely brought this PK into existence … cannot be resolved" message instead of the misleading `no row found in baseline` (the row *did* exist — under a different stored key). In every case: re-run `bintrail baseline` to capture a snapshot **at or after** the PK change, then reconstruct from the new baseline.
+
 ### DuckDB resource tuning (`--ultrafast`)
 
 When `query`, `recover`, or `reconstruct` scan Parquet archives, DuckDB runs under a conservative, container-safe budget by default: **2 threads and a 4 GB memory limit**, spilling to the OS temp directory when exceeded. These defaults keep bintrail alive in small shared containers; on a dedicated box with plenty of RAM they leave performance on the table.
