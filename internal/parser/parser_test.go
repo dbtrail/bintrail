@@ -385,9 +385,11 @@ func TestParseDDL_caseInsensitive(t *testing.T) {
 // the row image is absent and the change cannot be captured, so these must be
 // caught loud + metered rather than falling through silently.
 //
-// Callers give parseDDL first claim: TRUNCATE returns true here but is DDL and
-// is shadowed by parseDDL in the real handler, so it never reaches statementDML.
-// The ALTER/CREATE/DROP/RENAME verbs return false here (also DDL, handled by
+// Callers give parseDDL first claim. TRUNCATE must return false here: it never
+// produces row events under any binlog_format, so it is not row-DML that ROW
+// would have captured — and a comment-prefixed TRUNCATE that slips past parseDDL
+// must NOT trip the loss detector (#776 false-positive fix). The
+// ALTER/CREATE/DROP/RENAME verbs return false here (also DDL, handled by
 // parseDDL). Transaction-control and DCL must never match.
 func TestStatementDML(t *testing.T) {
 	tests := []struct {
@@ -406,7 +408,10 @@ func TestStatementDML(t *testing.T) {
 		{"/*+ HINT */\nUPDATE t SET x=1", "UPDATE"},
 		{"-- a note\nDELETE FROM t", "DELETE"},
 		{"# hash note\nINSERT INTO t VALUES (1)", "INSERT"},
-		{"TRUNCATE TABLE orders", "TRUNCATE"}, // true here, but parseDDL shadows it
+		// TRUNCATE never produces row events — must NOT match here, even with a
+		// leading trace comment that slips past parseDDL (#776 false positive).
+		{"TRUNCATE TABLE orders", ""},
+		{"/* trace-id */ TRUNCATE TABLE sessions", ""},
 		// DDL — handled by parseDDL, must NOT match here.
 		{"ALTER TABLE orders ADD c INT", ""},
 		{"CREATE TABLE t (id INT)", ""},

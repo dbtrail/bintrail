@@ -652,9 +652,14 @@ var ddlTableRe = regexp.MustCompile(
 // have been logged as ROW events (and captured). Seeing one as a QUERY_EVENT
 // means the source logged this DML in STATEMENT form (binlog_format=STATEMENT
 // or MIXED, or a session-level override) — the row image is NOT in the binlog
-// and the change cannot be captured. TRUNCATE is included for completeness but
-// is claimed by parseDDL first (it is DDL), so it never reaches statementDML.
-var dmlKeywords = []string{"INSERT", "UPDATE", "DELETE", "REPLACE", "LOAD DATA", "TRUNCATE"}
+// and the change cannot be captured. TRUNCATE is deliberately NOT here: it is
+// always statement-logged and never produces row events under any binlog_format,
+// so it is not a "row-DML that ROW format would have captured" and must never
+// trip this loss detector (a false increment of statement_dml_dropped reads as
+// data loss when nothing was lost). parseDDL claims TRUNCATE as DDL in the
+// no-comment case; a comment-prefixed TRUNCATE that slips past parseDDL must
+// still fall through here silently — again, nothing was lost.
+var dmlKeywords = []string{"INSERT", "UPDATE", "DELETE", "REPLACE", "LOAD DATA"}
 
 // statementDML reports whether queryStr is a data-modifying statement logged in
 // STATEMENT form — the DML that binlog_format=ROW would have captured as row
@@ -664,7 +669,8 @@ var dmlKeywords = []string{"INSERT", "UPDATE", "DELETE", "REPLACE", "LOAD DATA",
 // the dmlKeywords allowlist matches, so a keyword prefix on a non-DML statement
 // cannot false-positive. Returns the matched keyword (for the warning) and true,
 // or "" and false. Callers MUST give DDL (parseDDL) the chance to claim the
-// statement first — TRUNCATE is DDL and is handled there.
+// statement first. TRUNCATE is excluded (see dmlKeywords) — it never produces
+// row events, so it must return false here even when parseDDL misses it.
 func statementDML(queryStr string) (string, bool) {
 	upper := strings.ToUpper(stripLeadingSQLComments(queryStr))
 	for _, kw := range dmlKeywords {
