@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -618,13 +619,142 @@ func (g *Generator) base64Cols(r *metadata.Resolver, schema, table string) map[s
 	return m
 }
 
+// requireTypedColumns refuses to reverse an event whose table cannot be typed from
+// a schema snapshot on the MySQL dialect (#788). Without the snapshot a BLOB/TEXT/
+// BINARY/VARBINARY column's stored value is an opaque base64 STRING (marshalRow
+// encodes every []byte that way), so a reverse INSERT/UPDATE would write that base64
+// text verbatim into the column — a silent, applies-clean, post-apply corruption
+// (e.g. `aGVsbG8=` instead of `hello`). We cannot tell a base64-encoded BLOB from a
+// plain VARCHAR value without the column type, so the safe stance is to refuse the
+// event rather than risk emitting a base64 literal into a real column — the same
+// fail-loud posture as the schema-drift (#601) and script-budget (#654) refusals,
+// and it composes with the per-event refusal in GenerateSQLFromRows (#784).
+//
+// r is the EVENT-TIME resolver (resolverForRow), the same one base64Cols/geometryCols
+// consult, so this fires exactly when they would return an untyped map. Two cases are
+// deliberately NOT refused: (1) a nil resolver (New(nil,nil)) — the documented
+// schemaless all-columns fallback, opted into deliberately, where no column can be
+// typed and BLOB/TEXT are known to pass through (see base64Cols); (2) the PostgreSQL
+// dialect, whose values are stored as text (no base64) and are never at risk. Because
+// it keys on the event-time resolver, a table merely absent from the LATEST snapshot
+// (a scoped-out or dropped table whose event still carries its own schema_version) is
+// still typed from its own snapshot and NOT refused — preserving the deliberate
+// "degrade, don't refuse" behavior for that ambiguous case (#601).
+func (g *Generator) requireTypedColumns(r *metadata.Resolver, schema, table string, eventID uint64) error {
+	if g.dialect != MySQLDialect || r == nil {
+		return nil
+	}
+	if _, err := r.Resolve(schema, table); err != nil {
+		return fmt.Errorf("cannot reverse event %d on %s.%s: no schema snapshot describes this table, so its "+
+			"BLOB/TEXT/BINARY columns cannot be typed and a reverse INSERT/UPDATE would write their stored base64 "+
+			"text verbatim into the column (silent corruption). Take a fresh snapshot (`bintrail snapshot`) covering "+
+			"%s.%s and retry; if the table was dropped after the event, its rows cannot be recovered from the index "+
+			"alone", eventID, schema, table, schema, table)
+	}
+	return nil
+}
+
+// geometryCols maps each GEOMETRY-family column of a table to true, so buildInsert/
+// buildUpdate render it via geometryLiteral (ST_GeomFromWKB) instead of the base64
+// string path (#788). Returns nil (no coercion) for a non-MySQL dialect, a nil
+// resolver, or an unresolvable table — the same gating as base64Cols. GEOMETRY is
+// kept separate from base64Cols because its at-rest bytes are SRID+WKB, not a plain
+// blob: routing it through decodeStoredBase64 would emit X'hex' of the whole SRID+WKB
+// buffer, which a geometry column cannot load.
+func (g *Generator) geometryCols(r *metadata.Resolver, schema, table string) map[string]bool {
+	if g.dialect != MySQLDialect || r == nil {
+		return nil
+	}
+	tm, err := r.Resolve(schema, table)
+	if err != nil {
+		return nil
+	}
+	var m map[string]bool
+	for _, c := range tm.Columns {
+		if !isSpatialType(c.DataType) {
+			continue
+		}
+		if m == nil {
+			m = make(map[string]bool)
+		}
+		m[c.Name] = true
+	}
+	return m
+}
+
+// isSpatialType reports whether a DataType is in the MySQL GEOMETRY family. The
+// names match information_schema.COLUMNS.DATA_TYPE (MySQL 8.0.11+ reports a
+// GEOMETRYCOLLECTION column as "geomcollection"; older MySQL and MariaDB as
+// "geometrycollection" — both accepted), mirroring the spatial set already
+// enumerated in internal/verify.
+func isSpatialType(dataType string) bool {
+	switch strings.ToLower(dataType) {
+	case "geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection", "geomcollection":
+		return true
+	default:
+		return false
+	}
+}
+
+// geometryLiteral renders a stored GEOMETRY value as ST_GeomFromWKB(X'<wkb hex>', <srid>)
+// (#788). go-mysql delivers a geometry value as its at-rest MySQL bytes — SRID (4
+// bytes, little-endian) followed by the WKB — and marshalRow base64-encodes that
+// buffer into the stored JSON, so the value arrives here as a base64 STRING. We
+// base64-decode it, split off the 4-byte SRID, and pass the remaining WKB to
+// ST_GeomFromWKB with the SRID as its second argument (SRID 0 is emitted explicitly
+// too, so a re-load preserves the exact SRID). Without this the base64 string would
+// be emitted as a plain literal, which a geometry column cannot load — failing the
+// whole BEGIN/COMMIT reversal over a single geometry column.
+//
+// Returns ("", false) for a nil, non-string, non-decodable, or too-short (<4 bytes)
+// value so the caller falls back to ordinary formatting (nil → NULL); a malformed
+// stored value is thus no worse off than before this fix.
+func geometryLiteral(v any) (string, bool) {
+	s, ok := v.(string)
+	if !ok {
+		return "", false
+	}
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil || len(raw) < 4 {
+		return "", false
+	}
+	srid := binary.LittleEndian.Uint32(raw[:4])
+	wkb := raw[4:]
+	return fmt.Sprintf("ST_GeomFromWKB(X'%s', %d)", hex.EncodeToString(wkb), srid), true
+}
+
+// formatColumnValue renders one column's stored value as a MySQL literal, applying
+// the type-specific decode the stored JSON needs: a GEOMETRY column →
+// ST_GeomFromWKB(...) (#788), a BLOB/TEXT/BINARY/JSON column → base64-decoded then
+// formatted (#653/#736/#756), everything else formatted as-is. geom and b64 are the
+// per-table classification maps built by geometryCols/base64Cols (both nil when the
+// table is untyped, in which case the value formats as-is — the schemaless fallback).
+func (g *Generator) formatColumnValue(col string, v any, geom, b64 map[string]bool) string {
+	if geom[col] {
+		if lit, ok := geometryLiteral(v); ok {
+			return lit
+		}
+		// nil or malformed geometry: fall through to ordinary formatting
+		// (nil → NULL; anything else keeps its pre-#788 rendering).
+	}
+	if binary, ok := b64[col]; ok {
+		v = decodeStoredBase64(v, binary)
+	}
+	return g.formatValue(v)
+}
+
 // base64StoredKind reports whether a column's DataType is in the BLOB or TEXT
 // family — the ones go-mysql delivers as []byte so marshalRow base64-encodes them
 // in storage — and if so whether it is binary (true → emit X'hex') or text
 // (false → emit a string literal). go-mysql also delivers GEOMETRY/VECTOR as
-// []byte, but they are deliberately out of scope: a bare X'hex'/string literal
-// can't load them (they need ST_GeomFromWKB / STRING_TO_VECTOR), so reversing
-// their base64 is no better than leaving it — a separate concern from #653.
+// []byte, but they are NOT in this set: a bare X'hex'/string literal can't load
+// them. GEOMETRY is handled on its own path (geometryLiteral →
+// ST_GeomFromWKB(X'<wkb>', <srid>), #788) because its at-rest form is SRID+WKB.
+// VECTOR is still left as-is (its base64 fails loud at apply time against a real
+// VECTOR column) pending a verified STRING_TO_VECTOR decode of its packed-float
+// at-rest form — see the #788 PR note.
 //
 // "json" is included (non-binary) as a defense-in-depth companion to #736:
 // marshalRow now only promotes a []byte to raw JSON when it looks like a
@@ -736,8 +866,12 @@ func (g *Generator) buildInsert(row query.ResultRow) (string, []string, error) {
 		return "", nil, fmt.Errorf("row_before is nil for DELETE event (event_id=%d)", row.EventID)
 	}
 	r := g.resolverForRow(row)
+	if err := g.requireTypedColumns(r, row.SchemaName, row.TableName, row.EventID); err != nil {
+		return "", nil, err
+	}
 	genCols := generatedColsFromResolver(r, row.SchemaName, row.TableName)
 	b64 := g.base64Cols(r, row.SchemaName, row.TableName)
+	geom := g.geometryCols(r, row.SchemaName, row.TableName)
 	var cols, colParts, valParts []string
 	for _, col := range sortedKeys(row.RowBefore) {
 		if genCols[col] {
@@ -745,11 +879,7 @@ func (g *Generator) buildInsert(row query.ResultRow) (string, []string, error) {
 		}
 		cols = append(cols, col)
 		colParts = append(colParts, g.quoteName(col))
-		v := row.RowBefore[col]
-		if binary, ok := b64[col]; ok {
-			v = decodeStoredBase64(v, binary)
-		}
-		valParts = append(valParts, g.formatValue(v))
+		valParts = append(valParts, g.formatColumnValue(col, row.RowBefore[col], geom, b64))
 	}
 	overriding := ""
 	if g.dialect == PostgresDialect {
@@ -786,19 +916,19 @@ func (g *Generator) buildUpdate(row query.ResultRow) (string, []string, error) {
 	// cannot restore its before-image regardless — omitting it is the only valid choice.
 	// The WHERE clause still PK-targets the column.
 	r := g.resolverForRow(row)
+	if err := g.requireTypedColumns(r, row.SchemaName, row.TableName, row.EventID); err != nil {
+		return "", nil, err
+	}
 	skipCols := updateSetSkipCols(r, row.SchemaName, row.TableName)
 	b64 := g.base64Cols(r, row.SchemaName, row.TableName)
+	geom := g.geometryCols(r, row.SchemaName, row.TableName)
 	var cols, setParts []string
 	for _, col := range sortedKeys(row.RowBefore) {
 		if skipCols[col] {
 			continue
 		}
 		cols = append(cols, col)
-		v := row.RowBefore[col]
-		if binary, ok := b64[col]; ok {
-			v = decodeStoredBase64(v, binary)
-		}
-		setParts = append(setParts, g.quoteName(col)+" = "+g.formatValue(v))
+		setParts = append(setParts, g.quoteName(col)+" = "+g.formatColumnValue(col, row.RowBefore[col], geom, b64))
 	}
 
 	// WHERE uses row_after (current state), so the UPDATE finds the right row

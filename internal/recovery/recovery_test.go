@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -1750,5 +1752,193 @@ func TestBase64StoredKind_binaryVarbinary(t *testing.T) {
 		if !ok || !binary {
 			t.Errorf("base64StoredKind(%q) = (%v,%v), want (true,true)", dt, binary, ok)
 		}
+	}
+}
+
+// storedGeometry builds the at-rest MySQL geometry buffer (SRID little-endian + WKB)
+// that marshalRow base64-encodes into binlog_events, plus the base64 string a
+// recovery row would carry, for the #788 geometry tests.
+func storedGeometry(srid uint32, wkb []byte) string {
+	buf := make([]byte, 4+len(wkb))
+	binary.LittleEndian.PutUint32(buf[:4], srid)
+	copy(buf[4:], wkb)
+	return base64.StdEncoding.EncodeToString(buf)
+}
+
+// TestGeometryLiteral pins the pure at-rest decode (#788): a base64(SRID+WKB) value
+// renders as ST_GeomFromWKB(X'<wkb hex>', <srid>) with the SRID split off the front,
+// and a nil/non-string/too-short value declines (ok=false) so the caller falls back.
+func TestGeometryLiteral(t *testing.T) {
+	wkb := []byte{0x01, 0x01, 0x00, 0x00, 0x00, 0x9a, 0x99, 0x99, 0x3f}
+	stored := storedGeometry(4326, wkb)
+	want := "ST_GeomFromWKB(X'" + hex.EncodeToString(wkb) + "', 4326)"
+	if got, ok := geometryLiteral(stored); !ok || got != want {
+		t.Errorf("geometryLiteral(SRID 4326) = (%q,%v), want (%q,true)", got, ok, want)
+	}
+	// SRID 0 (the Cartesian default) is emitted explicitly, not dropped.
+	if got, ok := geometryLiteral(storedGeometry(0, wkb)); !ok ||
+		got != "ST_GeomFromWKB(X'"+hex.EncodeToString(wkb)+"', 0)" {
+		t.Errorf("geometryLiteral(SRID 0) = (%q,%v), want explicit ', 0)'", got, ok)
+	}
+	// Declines: nil, non-string, non-base64, and a value with no room for the 4-byte SRID.
+	for _, v := range []any{nil, 123, "!!not-base64!!", base64.StdEncoding.EncodeToString([]byte{0x01})} {
+		if got, ok := geometryLiteral(v); ok {
+			t.Errorf("geometryLiteral(%v) = (%q,true), want ok=false so the caller can fall back", v, got)
+		}
+	}
+}
+
+// resolverWith builds an in-memory resolver (no DB) for the #788 typed-column tests.
+// With db=nil, resolverForRow returns this resolver directly for every row, so
+// buildInsert/buildUpdate type their columns from it.
+func resolverWith(tables map[string]*metadata.TableMeta) *metadata.Resolver {
+	return metadata.NewResolverFromTables(1, tables)
+}
+
+// TestBuildInsert_geometryEmitsSTGeomFromWKB is the #788 acceptance for the geometry
+// half: a reverse INSERT for a table with a GEOMETRY column emits ST_GeomFromWKB(...)
+// — a loadable statement — instead of the raw base64 string, which a geometry column
+// cannot accept (and would topple the whole BEGIN/COMMIT script).
+func TestBuildInsert_geometryEmitsSTGeomFromWKB(t *testing.T) {
+	wkb := []byte{0x01, 0x01, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef}
+	stored := storedGeometry(4326, wkb)
+	g := New(nil, resolverWith(map[string]*metadata.TableMeta{
+		"db.places": {
+			Schema: "db", Table: "places",
+			Columns: []metadata.ColumnMeta{
+				{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+				{Name: "location", OrdinalPosition: 2, DataType: "geometry"},
+			},
+			PKColumns: []string{"id"},
+		},
+	}))
+	row := query.ResultRow{
+		EventID: 1, SchemaName: "db", TableName: "places",
+		EventType: parser.EventDelete,
+		RowBefore: map[string]any{"id": "1", "location": stored},
+	}
+	stmt, err := g.generateInsert(row)
+	if err != nil {
+		t.Fatalf("generateInsert: %v", err)
+	}
+	wantLit := "ST_GeomFromWKB(X'" + hex.EncodeToString(wkb) + "', 4326)"
+	if !strings.Contains(stmt, wantLit) {
+		t.Errorf("geometry column must emit %q, got:\n%s", wantLit, stmt)
+	}
+	if strings.Contains(stmt, stored) {
+		t.Errorf("geometry column must NOT emit the raw base64 string %q, got:\n%s", stored, stmt)
+	}
+}
+
+// TestBuildUpdate_geometryEmitsSTGeomFromWKB covers the reverse-UPDATE SET clause for
+// a geometry column (#788).
+func TestBuildUpdate_geometryEmitsSTGeomFromWKB(t *testing.T) {
+	wkb := []byte{0x01, 0x02, 0x00, 0x00, 0x00, 0xca, 0xfe}
+	stored := storedGeometry(0, wkb)
+	g := New(nil, resolverWith(map[string]*metadata.TableMeta{
+		"db.places": {
+			Schema: "db", Table: "places",
+			Columns: []metadata.ColumnMeta{
+				{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+				{Name: "location", OrdinalPosition: 2, DataType: "point"},
+			},
+			PKColumns: []string{"id"},
+		},
+	}))
+	row := query.ResultRow{
+		EventID: 2, SchemaName: "db", TableName: "places",
+		EventType: parser.EventUpdate,
+		RowBefore: map[string]any{"id": "1", "location": stored},
+		RowAfter:  map[string]any{"id": "1", "location": storedGeometry(0, []byte{0x09})},
+	}
+	stmt, err := g.generateUpdate(row)
+	if err != nil {
+		t.Fatalf("generateUpdate: %v", err)
+	}
+	wantLit := "`location` = ST_GeomFromWKB(X'" + hex.EncodeToString(wkb) + "', 0)"
+	if !strings.Contains(stmt, wantLit) {
+		t.Errorf("geometry SET must emit %q, got:\n%s", wantLit, stmt)
+	}
+}
+
+// TestBuildInsert_noSchemaBlobRefused is the #788 acceptance for the fail-loud half:
+// when a resolver is loaded but does not describe the event's table, its BLOB/TEXT
+// columns cannot be typed, so a reverse INSERT must REFUSE rather than emit the
+// stored base64 string as a literal (silent post-apply corruption). A generator with
+// NO resolver at all (the documented schemaless fallback) stays permissive.
+func TestBuildInsert_noSchemaBlobRefused(t *testing.T) {
+	const b64 = "aGVsbG8=" // base64("hello") — how a BLOB/TEXT value is stored
+	row := query.ResultRow{
+		EventID: 7, SchemaName: "db", TableName: "t",
+		EventType: parser.EventDelete,
+		RowBefore: map[string]any{"id": "1", "payload": b64},
+	}
+
+	// Resolver present but WITHOUT db.t (a stale/scoped snapshot, or a table created
+	// after the last snapshot): must refuse, name the corruption, and write nothing.
+	present := New(nil, resolverWith(map[string]*metadata.TableMeta{
+		"db.other": {
+			Schema: "db", Table: "other",
+			Columns:   []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}},
+			PKColumns: []string{"id"},
+		},
+	}))
+	stmt, err := present.generateInsert(row)
+	if err == nil {
+		t.Fatalf("untyped BLOB/TEXT table must be refused, got stmt:\n%s", stmt)
+	}
+	if stmt != "" {
+		t.Errorf("refusal must emit no statement, got: %q", stmt)
+	}
+	if !strings.Contains(err.Error(), "BLOB/TEXT") || !strings.Contains(err.Error(), "snapshot") {
+		t.Errorf("refusal message must explain the BLOB/TEXT-without-snapshot cause, got: %v", err)
+	}
+	if strings.Contains(err.Error(), b64) {
+		t.Errorf("refusal must not surface the base64 value, got: %v", err)
+	}
+
+	// End-to-end: the per-event refusal composes with #784 so the whole script is
+	// refused and no base64 literal reaches the writer.
+	var buf bytes.Buffer
+	if _, err := present.GenerateSQLFromRows([]query.ResultRow{row}, &buf); err == nil {
+		t.Errorf("GenerateSQLFromRows must refuse an untyped BLOB/TEXT table")
+	}
+	if strings.Contains(buf.String(), b64) {
+		t.Errorf("no base64 literal may reach the writer on refusal, got:\n%s", buf.String())
+	}
+
+	// Nil resolver = the documented schemaless all-columns fallback: NOT refused
+	// (New(nil,nil) is opted into deliberately and many callers rely on it).
+	if _, err := newGen().generateInsert(row); err != nil {
+		t.Errorf("nil-resolver schemaless fallback must stay permissive, got: %v", err)
+	}
+}
+
+// TestRequireTypedColumns_scoping pins exactly when the #788 refusal fires: MySQL
+// dialect + a resolver that cannot type the table. A nil resolver (schemaless
+// fallback) and the PostgreSQL dialect (values stored as text, no base64) never fire.
+func TestRequireTypedColumns_scoping(t *testing.T) {
+	typed := resolverWith(map[string]*metadata.TableMeta{
+		"db.t": {Schema: "db", Table: "t", Columns: []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}, PKColumns: []string{"id"}},
+	})
+	empty := resolverWith(map[string]*metadata.TableMeta{})
+	cases := []struct {
+		name    string
+		g       *Generator
+		wantErr bool
+	}{
+		{"mysql resolver missing table -> refuse", New(nil, empty), true},
+		{"mysql resolver has table -> ok", New(nil, typed), false},
+		{"mysql nil resolver -> permissive", New(nil, nil), false},
+		{"postgres resolver missing table -> permissive", NewForDialect(nil, empty, PostgresDialect), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := tc.g.resolverForRow(query.ResultRow{SchemaName: "db", TableName: "t"})
+			err := tc.g.requireTypedColumns(r, "db", "t", 1)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("requireTypedColumns err=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
 	}
 }

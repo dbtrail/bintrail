@@ -369,6 +369,16 @@ The resolver is loaded best-effort in the `recover` command — a failure logs a
 
 Generated columns (`STORED` or `VIRTUAL`) are computed by MySQL and cannot be set explicitly, so the generated script skips them in `INSERT`/`UPDATE` SET clauses — the script won't fail trying to assign a value MySQL owns.
 
+### Column type encodings (BLOB/TEXT, GEOMETRY, VECTOR)
+
+Columns that MySQL delivers as raw bytes are stored base64-encoded in the index, so `recover` decodes them back to a loadable literal using the column type from the schema snapshot:
+
+- **`BLOB`/`BINARY`/`VARBINARY`** → an `X'<hex>'` literal; **`TEXT`/`JSON`** → a decoded string literal.
+- **`GEOMETRY`** (and `POINT`, `LINESTRING`, `POLYGON`, … the whole spatial family) → `ST_GeomFromWKB(X'<wkb>', <srid>)`. The at-rest MySQL geometry value is `SRID` (4 bytes, little-endian) followed by the WKB; `recover` splits off the SRID and passes the WKB to `ST_GeomFromWKB` with the SRID as its second argument. Before this, a geometry column emitted its raw base64 string, which a geometry column cannot load — failing the entire `BEGIN`/`COMMIT` script over a single geometry value.
+- **`VECTOR`** (MySQL 9.0+) is **not yet** transformed. Its base64 value is emitted as-is, which a real `VECTOR` column rejects at apply time (a loud failure, not silent corruption). A `STRING_TO_VECTOR('[…]')` decode of its packed-float at-rest form is a follow-up.
+
+Typing these columns requires a schema snapshot that describes the table. If the loaded snapshot doesn't cover the event's table, `recover` **refuses** the event rather than risk writing a base64 string into a real column — take a fresh snapshot (`bintrail snapshot`) covering the table and retry. (Running `recover` with **no** snapshot at all falls back to the schemaless, all-columns mode, where `BLOB`/`TEXT` cannot be typed — always snapshot before recovering a table with binary or spatial columns.)
+
 ### Output Format
 
 The recovery output is a self-contained SQL script:
@@ -392,7 +402,7 @@ COMMIT;
 Key properties:
 - Wrapped in `BEGIN` / `COMMIT` — all changes apply atomically or not at all.
 - Comments before each statement showing the original event ID, type, table, PK, timestamp, and GTID.
-- **Per-event generation errors refuse the whole script.** If any event cannot be reversed — e.g. a malformed or truncated stored row image leaves `row_before`/`row_after` `NULL` — `recover` fails loud: it writes nothing and exits non-zero (with `--output`, the target file is left empty), and the error names every un-generatable event. It does **not** emit the rest as a runnable script with the failed events demoted to `-- ERROR ...` comments — a SQL comment has no apply-time effect, so a partial script would commit clean under `BEGIN`/`COMMIT` and silently deliver an *incomplete* reversal. **Schema drift** is the same: if a statement references a column dropped or renamed after the event, `recover` refuses up front rather than emitting SQL that would fail at apply time. Always check the exit code before applying a generated file.
+- **Per-event generation errors refuse the whole script.** If any event cannot be reversed — e.g. a malformed or truncated stored row image leaves `row_before`/`row_after` `NULL` — `recover` fails loud: it writes nothing and exits non-zero (with `--output`, the target file is left empty), and the error names every un-generatable event. It does **not** emit the rest as a runnable script with the failed events demoted to `-- ERROR ...` comments — a SQL comment has no apply-time effect, so a partial script would commit clean under `BEGIN`/`COMMIT` and silently deliver an *incomplete* reversal. **Schema drift** is the same: if a statement references a column dropped or renamed after the event, `recover` refuses up front rather than emitting SQL that would fail at apply time. **An untypeable `BLOB`/`TEXT`/`BINARY` table** is also refused: a schema snapshot is loaded, but it doesn't describe the event's table, so those columns' stored values (an opaque base64 string internally) can't be typed — emitting them as-is would write the base64 text *verbatim* into the column (e.g. `aGVsbG8=` instead of `hello`), a corruption that applies cleanly. `recover` refuses that event and tells you to take a fresh snapshot covering the table (see [Column type encodings](#column-type-encodings-blobtext-geometry-vector)). Always check the exit code before applying a generated file.
 - **Never auto-executed**: dbtrail only generates the file. Applying it is always a manual step.
 - `bintrail` (MySQL) pins the apply session to `SET time_zone = '+00:00'` before the reversal statements, since TIMESTAMP/DATETIME literals in the script are rendered from the captured UTC value with no explicit zone marker — without the pin, a target session in a non-UTC `time_zone` would reinterpret them and reintroduce a shift. `bintrail-pg` (PostgreSQL) pins `standard_conforming_strings = on` for the same reason (its string-escaping assumes it). Neither pins anything else about the apply session — see [Restore limitations](#restore-limitations-mysql) below for what is **not** pinned or restored.
 
