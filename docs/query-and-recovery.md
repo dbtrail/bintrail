@@ -307,11 +307,13 @@ bintrail recover-cascade --index-dsn "..." \
   refuses Phase-2 baseline augmentation (flagged as a coverage gap) rather than
   risk a silent zero-match — so a `BINARY(16)`/UUID-as-binary FK loses Phase-2
   entirely and falls back to Phase-1 (binlog-window only).
-- **Cross-schema FK children are excluded.** `recover-cascade` loads the FK
-  graph scoped to the parent's own `--schema` only; a child table living in a
-  *different* schema is never loaded, so its cascade victims are silently
-  absent from the graph rather than flagged. Point `--schema` at the child's
-  schema in a separate run if a cascade crosses a schema boundary.
+- **Cross-schema FK children are included.** A child table in a *different*
+  schema with an `ON DELETE CASCADE` / `SET NULL` FK to the `--schema` parent is
+  legal in MySQL (common in multi-tenant / reporting layouts) and is
+  reconstructed: `recover-cascade` scopes the FK-graph load by the *parent*
+  schema (`referenced_schema_name`) and walks it transitively, so multi-level
+  cross-schema cascades are covered too. (Earlier releases scoped the load by the
+  child's own schema and silently dropped cross-schema children — [#833](https://github.com/dbtrail/dbtrail/issues/833).)
 - **The FK graph reflects the latest schema snapshot, not the one in effect at
   the delete being recovered.** If DDL changed the FK topology between the
   delete and now, synthesis uses the newer graph. Acceptable in practice

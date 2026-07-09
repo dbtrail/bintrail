@@ -338,7 +338,7 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 	var res cascade.Result
 	var synthErr error
 	if len(parentDeletes) > 0 {
-		fks, lerr := cascade.LoadCascadeFKs(ctx, b.db, []string{p.Schema})
+		fks, lerr := cascade.LoadCascadeFKsForParent(ctx, b.db, p.Schema)
 		if lerr != nil {
 			return cascadeSynthResult{}, fmt.Errorf("load FK graph: %w", lerr)
 		}
@@ -367,20 +367,13 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 // cascadeParentDetect reports whether schema.table is the referenced (parent)
 // side of an ON DELETE CASCADE / SET NULL edge in the latest FK snapshot — the
 // cheap, one-index-query signal that a DELETE on it may have cascaded below the
-// binlog. Scoped to the parent's own schema, matching the synthesis (cascade only
-// reconstructs same-schema children). A detection error is returned so the caller
-// can log it and fall back to a plain recover; it must never abort one.
+// binlog. Matches on referenced_schema_name + referenced_table_name so a child in a
+// DIFFERENT schema is detected too (#833): a parent whose only cascade children are
+// cross-schema must still auto-route through cascade synthesis, not silently fall
+// back to plain recover. A detection error is returned so the caller can log it and
+// fall back to a plain recover; it must never abort one.
 func (s *Server) cascadeParentDetect(b *bundle, schema, table string) (bool, error) {
-	edges, err := metadata.CascadeConstraintsInIndex(b.db, []string{schema})
-	if err != nil {
-		return false, err
-	}
-	for _, e := range edges {
-		if e.ReferencedTable == table && (e.DeleteRule == "CASCADE" || e.DeleteRule == "SET NULL") {
-			return true, nil
-		}
-	}
-	return false, nil
+	return metadata.IsCascadeParentInIndex(b.db, schema, table)
 }
 
 // rowsContainDeleteOn reports whether any row is a DELETE on the given table — the
