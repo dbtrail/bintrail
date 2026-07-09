@@ -438,6 +438,16 @@ func ReconstructTable(
 	// slice (reconstruct warns, never refuses — the OOM at scale is unreproduced).
 	maybeWarnEventVolume(schema, table, len(events), cfg.WarnEventThreshold)
 
+	// Warn on a gap between the baseline anchor and the first indexed event.
+	// The single-row path already does this (cli/reconstruct.go); the full-table
+	// path previously emitted a dump silently missing that gap with no signal
+	// (#781). Same call/semantics as single-row: warn-only, --allow-gaps governs
+	// the coverage-gap fetch above and CheckCaptureGap, not this
+	// baseline-vs-first-event visibility warning. bmeta was read in step 2.
+	if len(events) > 0 {
+		WarnBaselineFirstEventGap(query.SourceFlavor(db), bmeta, events[0], schema, table)
+	}
+
 	// ENUM/SET ordinals → labels (#476), each delta decoded with the
 	// snapshot in effect at its event time (#475). Must run before the
 	// merge so the mydumper output writes labels — the same form the

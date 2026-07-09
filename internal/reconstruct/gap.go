@@ -1,5 +1,12 @@
 package reconstruct
 
+import (
+	"log/slog"
+
+	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/query"
+)
+
 // GapDetected reports whether there is a gap between a baseline's recorded
 // anchor and the first indexed event available for replay: events between the
 // anchor and the first event are missing from the reconstruction, so callers
@@ -45,4 +52,70 @@ func GapDetected(flavor string, eventFile string, eventStartPos uint64, baseline
 	}
 	return eventFile > baselineFile ||
 		(eventFile == baselineFile && eventStartPos > uint64(baselinePos))
+}
+
+// WarnBaselineFirstEventGap emits the baseline↔first-event gap warning for
+// callers that live in this package — the full-table reconstruct path (#781),
+// which previously produced a dump silently missing that gap while single-row
+// reconstruct at least warned. It is a DIRECT port of the check the single-row
+// CLI path runs (cli/reconstruct.go: resolveGapCheck + the GapDetected switch),
+// duplicated here because that logic lives in package cli, which this package
+// cannot import (cli imports reconstruct).
+//
+// Warn-only, identical to single-row: this check gates a WARNING, never the
+// reconstruction itself, so --allow-gaps is deliberately not consulted here —
+// it governs the coverage-gap fetch (query.FetchMerged) and CheckCaptureGap,
+// which run separately, not this baseline-vs-first-event visibility warning.
+//
+// flavor is query.SourceFlavor(db). first is the earliest fetched event
+// (events sorted by (event_timestamp, event_id)). schema/table are added to
+// every record so the warning is attributable when several tables reconstruct
+// concurrently.
+func WarnBaselineFirstEventGap(flavor string, bmeta baseline.DumpMetadata, first query.ResultRow, schema, table string) {
+	// Mirror of cli.resolveGapCheck: force PG semantics when the flavor read
+	// came back empty but the baseline carries an LSN anchor (its lineage is
+	// provably PostgreSQL — LSN text must never be compared lexically), then
+	// pick the flavor-correct anchor/position presence signals.
+	lineageGuard := false
+	if flavor == "" && bmeta.LSN != 0 {
+		flavor = "postgres"
+		lineageGuard = true
+	}
+	anchorPresent := bmeta.BinlogFile != ""
+	eventPosMissing := first.BinlogFile == ""
+	if flavor == "postgres" {
+		anchorPresent = bmeta.LSN != 0
+		eventPosMissing = first.StartPos == 0
+	}
+
+	if lineageGuard {
+		slog.Warn("source flavor unknown but baseline carries an LSN anchor — treating source as postgres for gap detection (LSN text is never compared lexically)",
+			"schema", schema, "table", table, "baseline_lsn", bmeta.LSN)
+	}
+	switch {
+	case !anchorPresent && flavor == "postgres":
+		slog.Warn("gap detection unavailable — this baseline predates LSN anchoring (no bintrail.baseline_lsn metadata); a gap between the baseline and the first indexed event would go undetected",
+			"schema", schema, "table", table, "flavor", flavor)
+	case !anchorPresent:
+		slog.Info("gap detection skipped — baseline lacks position metadata; consider re-running 'bintrail baseline' to embed position data",
+			"schema", schema, "table", table, "flavor", flavor)
+	case eventPosMissing:
+		slog.Warn("gap detection skipped — first indexed event lacks position metadata",
+			"schema", schema, "table", table,
+			"event_id", first.EventID,
+			"baseline_file", bmeta.BinlogFile,
+			"baseline_pos", bmeta.BinlogPos,
+			"baseline_lsn", bmeta.LSN,
+			"flavor", flavor)
+	case GapDetected(flavor, first.BinlogFile, first.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN):
+		slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
+			"schema", schema, "table", table,
+			"baseline_file", bmeta.BinlogFile,
+			"baseline_pos", bmeta.BinlogPos,
+			"baseline_gtid", bmeta.GTIDSet,
+			"baseline_lsn", bmeta.LSN,
+			"first_event_file", first.BinlogFile,
+			"first_event_pos", first.StartPos,
+			"flavor", flavor)
+	}
 }
