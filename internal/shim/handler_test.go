@@ -2049,9 +2049,11 @@ func (h *recordingHandler) atLevel(level slog.Level) []slog.Record {
 //   - reject single-column PK mismatch / composite PK / no PK
 //     declared: each is a distinct 1064 with a message the operator
 //     can act on.
-//   - permissive on missing snapshot / unknown table: preserves
-//     columnOrderFor's degradation contract. A broken snapshot
-//     lookup must not turn a working query into a 1064.
+//   - reject on missing snapshot / unresolved table / loader failure
+//     (#821): the shim can't confirm the WHERE column is the PK, so a
+//     column-qualified WHERE fails loud rather than silently answering
+//     against pk_values and returning a different row. The no-WHERE
+//     full-table path stays permissive.
 //   - hint-comment + _snapshot + _diff: per-shape regression guards
 //     so a future per-type refactor can't re-introduce the bug for
 //     one shape in isolation.
@@ -2197,25 +2199,56 @@ func TestValidatePKColumnRejectsNonPKWhere(t *testing.T) {
 		}
 	})
 
-	t.Run("permissive_when_table_missing_from_snapshot", func(t *testing.T) {
-		// A table created after the latest snapshot is the common
-		// case. Rejecting would break fresh-table queries until the
-		// next `bintrail snapshot` runs — much worse than the rare
-		// silent-wrong-row case the validator is preventing.
+	t.Run("reject_when_table_missing_from_snapshot", func(t *testing.T) {
+		// #821: a table created after the latest snapshot can't have
+		// its PK verified. A column-qualified WHERE must fail loud —
+		// permitting it would join the literal against pk_values and
+		// return a DIFFERENT row (re-opening #296 in the no-snapshot
+		// window). Re-snapshot converges; the no-WHERE full-table path
+		// (asserted below) still works meanwhile.
 		emptyResolver := func() (*metadata.Resolver, error) {
 			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{}), nil
 		}
 		h := &Handler{logger: silent, resolverFn: emptyResolver}
 		err := h.validatePKColumn(TimeTravelQuery{
 			Type: TypeFlashback, Schema: "myapp", Table: "brand_new_table",
-			PKColumn: "anything", PKValue: "1",
+			PKColumn: "customer_id", PKValue: "1",
 		})
-		if err != nil {
-			t.Errorf("missing-from-snapshot must NOT reject (preserves columnOrderFor degradation contract); got %v", err)
+		if err == nil {
+			t.Fatal("unresolved table + column WHERE must reject (documented guarantee); got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Fatalf("expected ER_PARSE_ERROR, got %v", err)
+		}
+		for _, want := range []string{"customer_id", "myapp.brand_new_table", "snapshot"} {
+			if !strings.Contains(myErr.Message, want) {
+				t.Errorf("error should contain %q for actionability; got %q", want, myErr.Message)
+			}
 		}
 	})
 
-	t.Run("permissive_when_resolver_load_fails", func(t *testing.T) {
+	t.Run("allow_full_table_when_table_missing_from_snapshot", func(t *testing.T) {
+		// The no-WHERE full-table AS OF path must stay permissive even
+		// for an unresolved table: it never joins a literal against
+		// pk_values, so there's nothing to get wrong (#821).
+		emptyResolver := func() (*metadata.Resolver, error) {
+			return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{}), nil
+		}
+		h := &Handler{logger: silent, resolverFn: emptyResolver}
+		err := h.validatePKColumn(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "brand_new_table",
+			PKColumn: "", PKValue: "",
+		})
+		if err != nil {
+			t.Errorf("full-table shape (no WHERE) must pass even when unresolved; got %v", err)
+		}
+	})
+
+	t.Run("reject_when_resolver_load_fails", func(t *testing.T) {
+		// #821: a resolver blip can't confirm the PK either. A
+		// column-qualified WHERE fails loud rather than risk the
+		// wrong-row answer.
 		failingResolver := func() (*metadata.Resolver, error) {
 			return nil, errors.New("transient db blip")
 		}
@@ -2224,8 +2257,51 @@ func TestValidatePKColumnRejectsNonPKWhere(t *testing.T) {
 			Type: TypeFlashback, Schema: "myapp", Table: "orders",
 			PKColumn: "customer_id", PKValue: "1",
 		})
+		if err == nil {
+			t.Fatal("resolver-load failure + column WHERE must reject; got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Fatalf("expected ER_PARSE_ERROR, got %v", err)
+		}
+		if !strings.Contains(myErr.Message, "customer_id") {
+			t.Errorf("error should name the user-supplied column; got %q", myErr.Message)
+		}
+	})
+
+	t.Run("reject_when_no_snapshots_yet", func(t *testing.T) {
+		// ErrNoSnapshots (fresh install) also can't verify the PK, so
+		// a column-qualified WHERE rejects with a distinct reason.
+		noSnapResolver := func() (*metadata.Resolver, error) {
+			return nil, metadata.ErrNoSnapshots
+		}
+		h := &Handler{logger: silent, resolverFn: noSnapResolver}
+		err := h.validatePKColumn(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			PKColumn: "customer_id", PKValue: "1",
+		})
+		if err == nil {
+			t.Fatal("no-snapshots + column WHERE must reject; got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Fatalf("expected ER_PARSE_ERROR, got %v", err)
+		}
+	})
+
+	t.Run("allow_full_table_when_resolver_load_fails", func(t *testing.T) {
+		// Full-table path returns before the resolver is consulted, so
+		// a resolver blip can't break it.
+		failingResolver := func() (*metadata.Resolver, error) {
+			return nil, errors.New("transient db blip")
+		}
+		h := &Handler{logger: silent, resolverFn: failingResolver}
+		err := h.validatePKColumn(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			PKColumn: "", PKValue: "",
+		})
 		if err != nil {
-			t.Errorf("loader failure must NOT reject (preserves graceful degradation); got %v", err)
+			t.Errorf("full-table shape must pass despite resolver failure; got %v", err)
 		}
 	})
 
