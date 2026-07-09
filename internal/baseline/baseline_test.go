@@ -688,6 +688,37 @@ func TestReadSQLRowMultiLineLayouts(t *testing.T) {
 	}
 }
 
+func TestReadSQLRowOversizedLine(t *testing.T) {
+	// A single tuple carrying a value larger than the old fixed 8 MB scanner
+	// buffer must parse, not abort with bufio.ErrTooLong. mydumper emits one
+	// tuple per physical line, so a LONGBLOB/JSON column produces exactly this
+	// shape (#801). The growable bufio.Reader has no artificial per-line cap.
+	big := strings.Repeat("A", 12<<20) // 12 MB, well over the old 8 MB limit
+	sqlData := "INSERT INTO `docs` VALUES(1,'" + big + "');\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.docs.00000.sql")
+	if err := os.WriteFile(path, []byte(sqlData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var rows [][]string
+	if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		rows = append(rows, append([]string(nil), values...))
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadSQLFile on oversized line: %v", err)
+	}
+	if len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("got rows=%d cols, want 1 row with 2 cols", len(rows))
+	}
+	if rows[0][0] != "1" {
+		t.Errorf("col 0 = %q, want 1", rows[0][0])
+	}
+	if len(rows[0][1]) != len(big) {
+		t.Errorf("col 1 length = %d, want %d (large value truncated/dropped)", len(rows[0][1]), len(big))
+	}
+}
+
 func TestReadSQLRowUnexpectedToken(t *testing.T) {
 	// A stray token where a tuple or ';' is expected must surface as a loud
 	// error, not silently truncate the fragment. With cross-line state, a

@@ -2,7 +2,9 @@ package baseline
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -37,63 +39,85 @@ func ReadSQLFile(path string, fn func(values []string, nulls []bool) error) erro
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 8<<20), 8<<20) // 8 MB per line
+	// A growable reader (not a fixed-buffer bufio.Scanner) so a single physical
+	// line larger than any preset cap — a LONGBLOB/JSON tuple, which mydumper
+	// emits as one tuple per line — parses instead of aborting with
+	// bufio.ErrTooLong. ReadString grows its buffer to the line length on
+	// demand; there is no artificial per-line limit (#801).
+	reader := bufio.NewReader(f)
 	lineNum := 0
 	inStatement := false // inside an INSERT whose ';' terminator hasn't been seen
-	for scanner.Scan() {
-		lineNum++
-		trimmed := strings.TrimSpace(scanner.Text())
-		if trimmed == "" {
-			continue
-		}
-
-		var fragment string
-		if inStatement {
-			// Continuation line of a multi-row INSERT: ",(...)" tuples, the
-			// last ending in ';'.
-			fragment = trimmed
-		} else {
-			upper := strings.ToUpper(trimmed)
-			// mysqldump --replace and mydumper --replace emit REPLACE INTO
-			// instead of INSERT INTO; both carry row data the same way. Skipping
-			// REPLACE lines silently dropped every such row.
-			if !strings.HasPrefix(upper, "INSERT") && !strings.HasPrefix(upper, "REPLACE") {
-				continue
+	for {
+		line, readErr := reader.ReadString('\n')
+		if len(line) > 0 {
+			lineNum++
+			if err := readSQLLine(path, lineNum, line, &inStatement, fn); err != nil {
+				return err
 			}
-			// Find VALUES keyword (after any column list).
-			valIdx := strings.Index(upper, " VALUES")
-			if valIdx < 0 {
-				// The line opens an INSERT/REPLACE but carries no VALUES clause.
-				// In a complete mydumper/mysqldump data file every INSERT/REPLACE
-				// statement has VALUES on this same line — so this is a truncated
-				// statement (a partial trailing line, #468 shape 1) or an
-				// unsupported layout (VALUES wrapped to a continuation line).
-				// Silently `continue`ing past it drops every row the statement
-				// carried with a clean exit and a short count — the #461 silent
-				// data-loss class at row granularity. Fail loud, matching the
-				// unterminated-INSERT guard below.
-				return fmt.Errorf("%s line %d: INSERT/REPLACE statement without a VALUES clause "+
-					"— dump file may be truncated or in an unsupported layout: %q",
-					path, lineNum, truncateForError(trimmed))
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
 			}
-			fragment = strings.TrimSpace(trimmed[valIdx+7:])
+			return fmt.Errorf("%s: reading line %d: %w", path, lineNum+1, readErr)
 		}
-
-		terminated, err := parseSQLTuples(fragment, fn)
-		if err != nil {
-			return fmt.Errorf("%s line %d: %w", path, lineNum, err)
-		}
-		inStatement = !terminated
-	}
-	if err := scanner.Err(); err != nil {
-		return err
 	}
 	// A file that ends mid-statement (no ';') is truncated: fail loudly rather
 	// than report a silently short row count.
 	if inStatement {
 		return fmt.Errorf("%s: unterminated INSERT statement (missing ';') — dump file may be truncated", path)
 	}
+	return nil
+}
+
+// readSQLLine processes one physical line of a mydumper SQL data file, feeding
+// its tuples to fn and advancing the cross-line *inStatement flag. Blank and
+// non-INSERT/REPLACE lines are no-ops. Extracted from ReadSQLFile's read loop so
+// the loop can use a growable bufio.Reader (see #801) without the two skip
+// branches tangling with EOF handling.
+func readSQLLine(path string, lineNum int, line string, inStatement *bool, fn func(values []string, nulls []bool) error) error {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return nil
+	}
+
+	var fragment string
+	if *inStatement {
+		// Continuation line of a multi-row INSERT: ",(...)" tuples, the
+		// last ending in ';'.
+		fragment = trimmed
+	} else {
+		upper := strings.ToUpper(trimmed)
+		// mysqldump --replace and mydumper --replace emit REPLACE INTO
+		// instead of INSERT INTO; both carry row data the same way. Skipping
+		// REPLACE lines silently dropped every such row.
+		if !strings.HasPrefix(upper, "INSERT") && !strings.HasPrefix(upper, "REPLACE") {
+			return nil
+		}
+		// Find VALUES keyword (after any column list).
+		valIdx := strings.Index(upper, " VALUES")
+		if valIdx < 0 {
+			// The line opens an INSERT/REPLACE but carries no VALUES clause.
+			// In a complete mydumper/mysqldump data file every INSERT/REPLACE
+			// statement has VALUES on this same line — so this is a truncated
+			// statement (a partial trailing line, #468 shape 1) or an
+			// unsupported layout (VALUES wrapped to a continuation line).
+			// Silently skipping past it drops every row the statement carried
+			// with a clean exit and a short count — the #461 silent data-loss
+			// class at row granularity. Fail loud, matching the
+			// unterminated-INSERT guard below.
+			return fmt.Errorf("%s line %d: INSERT/REPLACE statement without a VALUES clause "+
+				"— dump file may be truncated or in an unsupported layout: %q",
+				path, lineNum, truncateForError(trimmed))
+		}
+		fragment = strings.TrimSpace(trimmed[valIdx+7:])
+	}
+
+	terminated, err := parseSQLTuples(fragment, fn)
+	if err != nil {
+		return fmt.Errorf("%s line %d: %w", path, lineNum, err)
+	}
+	*inStatement = !terminated
 	return nil
 }
 

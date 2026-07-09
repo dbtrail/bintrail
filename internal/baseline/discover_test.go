@@ -3,6 +3,7 @@ package baseline
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -142,6 +143,58 @@ func TestIsView(t *testing.T) {
 			t.Errorf("isView(missing) = %v, want false", got)
 		}
 	})
+}
+
+func TestDiscoverTables_CompressedDumpRejected(t *testing.T) {
+	// mydumper --compress writes .sql.gz / .sql.zst; the baseline readers parse
+	// plain SQL/TSV only. Such a dump must fail loud with actionable guidance
+	// rather than fall through the classifier into an unhelpful "no tables
+	// found" (#801).
+	cases := []struct {
+		name       string
+		schemaFile string
+		dataFile   string
+	}{
+		{"gzip", "shop.orders-schema.sql.gz", "shop.orders.00000.sql.gz"},
+		{"zstd", "shop.orders-schema.sql.zst", "shop.orders.00000.sql.zst"},
+		{"tab-gzip", "shop.orders-schema.sql.gz", "shop.orders.00000.dat.gz"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, tc.schemaFile, "compressed bytes")
+			writeFile(t, dir, tc.dataFile, "compressed bytes")
+
+			_, err := DiscoverTables(dir)
+			if err == nil {
+				t.Fatal("expected error for compressed dump, got nil")
+			}
+			if !strings.Contains(err.Error(), "compressed") || !strings.Contains(err.Error(), "--compress") {
+				t.Errorf("error = %v, want it to mention 'compressed' and '--compress' guidance", err)
+			}
+		})
+	}
+}
+
+func TestIsCompressedDump(t *testing.T) {
+	tests := map[string]bool{
+		"shop.orders.00000.sql.gz":  true,
+		"shop.orders.00000.sql.zst": true,
+		"shop.orders.00000.dat.gz":  true,
+		"shop.orders.00000.dat.zst": true,
+		"shop.orders-schema.sql.gz": true,
+		"SHOP.ORDERS.00000.SQL.GZ":  true, // case-insensitive
+		"shop.orders.00000.sql":     false,
+		"shop.orders.00000.dat":     false,
+		"shop.orders-schema.sql":    false,
+		"metadata":                  false,
+		"unrelated-archive.tar.gz":  false, // bare .gz without .sql/.dat is not a dump file
+	}
+	for name, want := range tests {
+		if got := isCompressedDump(name); got != want {
+			t.Errorf("isCompressedDump(%q) = %v, want %v", name, got, want)
+		}
+	}
 }
 
 func writeFile(t *testing.T, dir, name, content string) {
