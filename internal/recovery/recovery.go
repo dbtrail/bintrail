@@ -973,6 +973,14 @@ func (g *Generator) buildDelete(row query.ResultRow) (string, []string, error) {
 		return "", nil, fmt.Errorf("row_after is nil for INSERT event (event_id=%d)", row.EventID)
 	}
 	r := g.resolverForRow(row)
+	// Symmetric with buildInsert/buildUpdate (#788): without usable type info the
+	// all-columns WHERE fallback would emit a BLOB/TEXT/BINARY column's stored base64
+	// string verbatim (e.g. `payload = 'aGVsbG8='`), which matches ZERO rows against the
+	// live decoded value — the reverse DELETE would commit clean and silently NOT undo
+	// the accidental INSERT. Refuse instead so the failure is loud.
+	if err := g.requireTypedColumns(r, row.SchemaName, row.TableName, row.EventID); err != nil {
+		return "", nil, err
+	}
 	whereParts, whereCols := g.pkWhereClause(r, row.SchemaName, row.TableName, row.RowAfter)
 	return fmt.Sprintf("DELETE FROM %s.%s WHERE %s",
 		g.quoteName(row.SchemaName), g.quoteName(row.TableName),

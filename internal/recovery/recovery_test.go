@@ -1929,6 +1929,71 @@ func TestBuildInsert_noSchemaBlobRefused(t *testing.T) {
 	}
 }
 
+// TestBuildDelete_noSchemaBlobRefused is the #788 acceptance for the INSERT-reversal
+// direction (buildDelete). Reversing an accidental INSERT on an untypeable BLOB/TEXT
+// table must REFUSE, not fall through to the all-columns WHERE where the stored base64
+// string (`payload = 'aGVsbG8='`) would match ZERO live rows — a reverse DELETE that
+// commits clean and silently leaves the inserted row in place. The refusal must fire
+// symmetrically with the DELETE/UPDATE directions and leak no base64 to the writer.
+func TestBuildDelete_noSchemaBlobRefused(t *testing.T) {
+	const b64 = "aGVsbG8=" // base64("hello") — how a BLOB/TEXT value is stored
+	row := query.ResultRow{
+		EventID: 9, SchemaName: "db", TableName: "t",
+		EventType: parser.EventInsert,
+		RowAfter:  map[string]any{"id": "1", "payload": b64},
+	}
+
+	// Resolver present but WITHOUT db.t (stale/scoped snapshot): must refuse.
+	present := New(nil, resolverWith(map[string]*metadata.TableMeta{
+		"db.other": {
+			Schema: "db", Table: "other",
+			Columns:   []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}},
+			PKColumns: []string{"id"},
+		},
+	}))
+	stmt, err := present.generateDelete(row)
+	if err == nil {
+		t.Fatalf("untyped BLOB/TEXT table must be refused on INSERT reversal, got stmt:\n%s", stmt)
+	}
+	if stmt != "" {
+		t.Errorf("refusal must emit no statement, got: %q", stmt)
+	}
+	if !strings.Contains(err.Error(), "BLOB/TEXT") || !strings.Contains(err.Error(), "snapshot") {
+		t.Errorf("refusal message must explain the BLOB/TEXT-without-snapshot cause, got: %v", err)
+	}
+	if strings.Contains(err.Error(), b64) {
+		t.Errorf("refusal must not surface the base64 value, got: %v", err)
+	}
+
+	// End-to-end: the whole script is refused and no base64 literal reaches the writer.
+	var buf bytes.Buffer
+	if _, err := present.GenerateSQLFromRows([]query.ResultRow{row}, &buf); err == nil {
+		t.Errorf("GenerateSQLFromRows must refuse an untyped BLOB/TEXT table on INSERT reversal")
+	}
+	if strings.Contains(buf.String(), b64) {
+		t.Errorf("no base64 literal may reach the writer on refusal, got:\n%s", buf.String())
+	}
+
+	// DB-less nil resolver = deliberate schemaless all-columns fallback: NOT refused.
+	if _, err := newGen().generateDelete(row); err != nil {
+		t.Errorf("db-less nil-resolver schemaless fallback must stay permissive, got: %v", err)
+	}
+
+	// DB-backed nil resolver = recover-WITHOUT-a-snapshot: MUST refuse, closing the
+	// INSERT-reversal silent-no-op path. SchemaVersion=0 keeps resolverForRow off the DB.
+	nilWithDB := New(new(sql.DB), nil)
+	if _, err := nilWithDB.generateDelete(row); err == nil {
+		t.Error("db-backed nil-resolver (recover without a snapshot) must refuse untyped BLOB/TEXT on INSERT reversal, got nil error")
+	}
+	var buf2 bytes.Buffer
+	if _, err := nilWithDB.GenerateSQLFromRows([]query.ResultRow{row}, &buf2); err == nil {
+		t.Error("db-backed nil-resolver GenerateSQLFromRows must refuse on INSERT reversal")
+	}
+	if strings.Contains(buf2.String(), b64) {
+		t.Errorf("no base64 literal may reach the writer on refusal, got:\n%s", buf2.String())
+	}
+}
+
 // TestRequireTypedColumns_scoping pins exactly when the #788 refusal fires: MySQL
 // dialect + no usable type info. A DB-backed generator refuses (recover WITHOUT a
 // snapshot, or a snapshot that omits the table); the DB-less schemaless fallback and
