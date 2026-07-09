@@ -78,6 +78,42 @@ func TestLimiterGlobalWindow(t *testing.T) {
 	}
 }
 
+func TestLimiterGlobalWindowExemptsLoopback(t *testing.T) {
+	l, _ := fakeLimiter(t)
+	// Drive the global counter to its cap using rotating REMOTE IPs, so no
+	// loopback IP accrues any per-IP failures — the only gate that could then
+	// deny loopback is the global one.
+	for i := 0; i < globalMax; i++ {
+		l.Fail(fmt.Sprintf("10.0.%d.%d", i/250, i%250))
+	}
+	// A remote IP is still gated by the tripped global window.
+	if ok, _ := l.Allow("192.168.1.1"); ok {
+		t.Error("remote IP not gated by the global window")
+	}
+	// Loopback callers (the operator on the same host) are exempt from the
+	// global gate — a sustained brute force must never lock them out.
+	for _, ip := range []string{"127.0.0.1", "::1"} {
+		if ok, _ := l.Allow(ip); !ok {
+			t.Errorf("loopback %s denied by the global window — operator locked out", ip)
+		}
+	}
+}
+
+func TestLimiterLoopbackStillPerIPThrottled(t *testing.T) {
+	l, _ := fakeLimiter(t)
+	// The loopback exemption is ONLY for the global gate; the per-IP gate must
+	// still apply to loopback callers.
+	for i := 0; i < ipShortMax; i++ {
+		if ok, _ := l.Allow("127.0.0.1"); !ok {
+			t.Fatalf("attempt %d denied early", i)
+		}
+		l.Fail("127.0.0.1")
+	}
+	if ok, _ := l.Allow("127.0.0.1"); ok {
+		t.Error("loopback escaped the per-IP short window — exemption too broad")
+	}
+}
+
 func TestLimiterSuccessClearsIP(t *testing.T) {
 	l, _ := fakeLimiter(t)
 	for i := 0; i < ipShortMax; i++ {
