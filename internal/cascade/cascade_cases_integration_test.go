@@ -132,6 +132,80 @@ func TestSynthesizeVictims_ruleGate(t *testing.T) {
 	}
 }
 
+// TestSynthesizeVictims_childFKColumnSkew pins the child-side DDL-skew guard
+// (#832): when a cascade OLDER than a child FK-column rename ("pid" -> "parent_id")
+// is recovered, the candidate scan uses the LATEST snapshot's column name against
+// events whose row-images still carry the old name, so ColumnEq matches 0 rows —
+// indistinguishable from "no children existed". Synthesis must NOT report a clean
+// Complete; it must flag skew (mirroring the parent-side "noref" caveat).
+func TestSynthesizeVictims_childFKColumnSkew(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+
+	T := time.Now().UTC()
+	h := T.Add(-30 * time.Minute).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	ts := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	// Child events predate the rename: their row-images carry the OLD name "pid".
+	// child 10 referenced parent 1 (via the column that is now called parent_id).
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, ts, nil, dbName, "child", 1, "10", nil, nil, []byte(`{"id":10,"pid":1}`))
+
+	// The FK graph is the LATEST snapshot: the column is already renamed parent_id.
+	fks := []cascade.CascadeFK{{
+		Schema: dbName, Table: "child", ConstraintName: "fk", Column: "parent_id",
+		ReferencedSchema: dbName, ReferencedTable: "parent", ReferencedColumn: "id",
+		DeleteRule: "CASCADE",
+	}}
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, fks, parentDelete(dbName, T), cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if len(res.Victims) != 0 {
+		t.Fatalf("renamed FK column must match 0 candidates, got %d: %v", len(res.Victims), victimList(res.Victims))
+	}
+	if res.Complete() || !strings.Contains(strings.Join(res.Incomplete, " "), "absent from every sampled") {
+		t.Errorf("child-side DDL-skew must flag incompleteness, not a clean Complete; Incomplete=%v", res.Incomplete)
+	}
+}
+
+// TestSynthesizeVictims_zeroChildrenNotFlaggedAsSkew is the control for the skew
+// guard: a parent with genuinely no matching children — but whose child table
+// carries the FK column under its snapshot name (referencing OTHER parents) — must
+// stay Complete. The skew probe must not turn a legitimate zero-victim result into
+// a false caveat.
+func TestSynthesizeVictims_zeroChildrenNotFlaggedAsSkew(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+
+	T := time.Now().UTC()
+	h := T.Add(-30 * time.Minute).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	ts := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	// child 10 references parent 2 (NOT the deleted parent 1); the FK column
+	// parent_id is present under its snapshot name.
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, ts, nil, dbName, "child", 1, "10", nil, nil, []byte(`{"id":10,"parent_id":2}`))
+
+	fks := []cascade.CascadeFK{{
+		Schema: dbName, Table: "child", ConstraintName: "fk", Column: "parent_id",
+		ReferencedSchema: dbName, ReferencedTable: "parent", ReferencedColumn: "id",
+		DeleteRule: "CASCADE",
+	}}
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, fks, parentDelete(dbName, T), cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if len(res.Victims) != 0 {
+		t.Fatalf("parent 1 has no children, got %d victims: %v", len(res.Victims), victimList(res.Victims))
+	}
+	if !res.Complete() {
+		t.Errorf("a genuine no-children result (FK column present) must stay Complete, got Incomplete=%v", res.Incomplete)
+	}
+}
+
 // TestSynthesizeVictims_setNull pins ON DELETE SET NULL: a child that referenced
 // the deleted parent (and survives) becomes a SetNullRestore (not a victim), and
 // it is NOT recursed (no row was deleted). A child re-pointed away is excluded.
