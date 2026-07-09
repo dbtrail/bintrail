@@ -315,6 +315,23 @@ func eventPredatesSnapshot(binlogEv *replication.BinlogEvent, resolver *metadata
 	return eventTime.Before(snapTime)
 }
 
+// snapshotExcludedSchemas are the system schemas metadata.TakeSnapshot always
+// omits (WHERE TABLE_SCHEMA NOT IN (...)). No resolver ever contains their
+// tables, so a row event on one of them (e.g. RDS binlogging periodic
+// mysql.rds_heartbeat2 UPDATEs with ~now timestamps) is a routine, permanent
+// skip with NO converging remediation — re-snapshotting still excludes them.
+// It must NOT escalate a file to 'failed' via the gap tracker (#778 regression),
+// only ever warn-and-skip. Keep this list byte-identical to the TakeSnapshot
+// NOT IN clause.
+func isSnapshotExcludedSchema(schema string) bool {
+	switch strings.ToLower(schema) {
+	case "information_schema", "performance_schema", "mysql", "sys":
+		return true
+	default:
+		return false
+	}
+}
+
 // handleRows processes a RowsEvent, resolving column names and dispatching to
 // the appropriate emit function. It is shared by Parser.ParseFile and StreamParser.Run.
 //
@@ -364,7 +381,7 @@ func handleRows(
 		// rows). Record it so ParseFile fails the file instead of completing it
 		// with an undetected gap (#778). Pre-snapshot events stay a warn-only
 		// historical skip.
-		if gapTracker != nil && !eventPredatesSnapshot(binlogEv, resolver) {
+		if gapTracker != nil && !isSnapshotExcludedSchema(schema) && !eventPredatesSnapshot(binlogEv, resolver) {
 			if gapTracker.record(fmt.Sprintf("%s.%s not in snapshot %d at %s:%d", schema, table, schemaVersion, filename, binlogEv.Header.LogPos)) {
 				logger.Error("schema gap: skipping rows for a table absent from the snapshot at-or-after snapshot time — the snapshot is stale; this file will be marked failed (run `bintrail snapshot`, then re-index)",
 					"file", filename, "pos", binlogEv.Header.LogPos, "schema", schema, "table", table)
@@ -389,7 +406,7 @@ func handleRows(
 		// and its consumer-side resolver swap landed too late for these buffered
 		// rows). Record it so ParseFile fails the file (#778). Pre-snapshot
 		// events stay a warn-only historical skip.
-		if gapTracker != nil && !eventPredatesSnapshot(binlogEv, resolver) {
+		if gapTracker != nil && !isSnapshotExcludedSchema(schema) && !eventPredatesSnapshot(binlogEv, resolver) {
 			if gapTracker.record(fmt.Sprintf("%s.%s column count %d vs snapshot %d at %s:%d", schema, table, rowsEv.Table.ColumnCount, len(tm.Columns), filename, binlogEv.Header.LogPos)) {
 				logger.Error("schema gap: skipping rows whose column count diverges from the snapshot at-or-after snapshot time — the snapshot is stale; this file will be marked failed (run `bintrail snapshot`, then re-index)",
 					"file", filename, "pos", binlogEv.Header.LogPos, "schema", schema, "table", table)

@@ -375,6 +375,11 @@ func TestHandleRows_schemaGapTrackerFileMode(t *testing.T) {
 		wantRecord bool
 	}{
 		{"table-absent at-or-after snapshot records a gap", gapRowsEvent("shop", "widgets", 2, afterTS), false, true},
+		// System schemas are always excluded from any snapshot (TakeSnapshot's
+		// NOT IN list), so a mysql.rds_heartbeat2 row event at-or-after snapshot
+		// time is a routine, non-convergent skip — it must NOT record a gap or
+		// the RDS / offline-binlog file would be marked 'failed' forever (#778).
+		{"excluded system schema at-or-after snapshot never records a gap", gapRowsEvent("mysql", "rds_heartbeat2", 2, afterTS), false, false},
 		{"table-absent predating snapshot is a silent historical skip", gapRowsEvent("shop", "widgets", 2, beforeTS), false, false},
 		{"table-absent with unknown event time stays strict", gapRowsEvent("shop", "widgets", 2, 0), false, true},
 		{"column-count mismatch at-or-after snapshot records a gap", gapRowsEvent("shop", "orders", 1, afterTS), false, true},
