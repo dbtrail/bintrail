@@ -264,12 +264,14 @@ func (c *Capturer) receiveLoop(ctx context.Context, replConn *pgconn.PgConn, dec
 				// A malformed logical message is stream desync, not noise — fail loud.
 				return fmt.Errorf("pgcapture: parse logical message at %s: %w", xld.WALStart, err)
 			}
-			ev, emit, err := decoder.Decode(logmsg)
+			evs, err := decoder.Decode(logmsg)
 			if err != nil {
 				return err
 			}
-			if emit {
-				if err := c.emit(ctx, replConn, out, ev, standbyTicker); err != nil {
+			// One message can yield several events (a TRUNCATE of multiple tables
+			// emits one EventDDL per in-scope relation); emit them in order.
+			for i := range evs {
+				if err := c.emit(ctx, replConn, out, evs[i], standbyTicker); err != nil {
 					return err
 				}
 			}

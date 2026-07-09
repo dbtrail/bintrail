@@ -70,11 +70,17 @@ func pkResolver(pkNames ...string) pgcapture.PKResolver {
 
 func mustDecode(t *testing.T, d *pgcapture.Decoder, msg pglogrepl.Message) (event.Event, bool) {
 	t.Helper()
-	ev, emit, err := d.Decode(msg)
+	evs, err := d.Decode(msg)
 	if err != nil {
 		t.Fatalf("Decode(%T): unexpected error: %v", msg, err)
 	}
-	return ev, emit
+	if len(evs) == 0 {
+		return event.Event{}, false
+	}
+	if len(evs) > 1 {
+		t.Fatalf("Decode(%T): mustDecode expects at most one event, got %d — use Decode directly for multi-event messages (TRUNCATE)", msg, len(evs))
+	}
+	return evs[0], true
 }
 
 // ─── happy-path decoding ──────────────────────────────────────────────────────
@@ -155,7 +161,7 @@ func TestDecode_Commit(t *testing.T) {
 	}
 
 	// After Commit the transaction is closed: a row without a fresh Begin must fail.
-	_, _, err := d.Decode(&pglogrepl.InsertMessage{RelationID: 1, Tuple: tuple(textCol("1"))})
+	_, err := d.Decode(&pglogrepl.InsertMessage{RelationID: 1, Tuple: tuple(textCol("1"))})
 	if err == nil {
 		t.Error("expected error for row event after Commit closed the transaction")
 	}
@@ -306,7 +312,7 @@ func TestDecode_BinaryDatumFailsLoud(t *testing.T) {
 	mustDecode(t, d, relMsg(1, "public", "t", "id", "v"))
 	mustDecode(t, d, beginMsg())
 
-	_, _, err := d.Decode(&pglogrepl.InsertMessage{
+	_, err := d.Decode(&pglogrepl.InsertMessage{
 		RelationID: 1, Tuple: tuple(textCol("1"), binaryCol([]byte{0x00, 0x01})),
 	})
 	if err == nil {
@@ -317,7 +323,7 @@ func TestDecode_BinaryDatumFailsLoud(t *testing.T) {
 func TestDecode_UnknownRelationFailsLoud(t *testing.T) {
 	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
 	mustDecode(t, d, beginMsg())
-	_, _, err := d.Decode(&pglogrepl.InsertMessage{RelationID: 99, Tuple: tuple(textCol("1"))})
+	_, err := d.Decode(&pglogrepl.InsertMessage{RelationID: 99, Tuple: tuple(textCol("1"))})
 	if err == nil {
 		t.Error("expected error for a row event referencing an unknown relation OID")
 	}
@@ -327,7 +333,7 @@ func TestDecode_RowOutsideTransactionFailsLoud(t *testing.T) {
 	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
 	mustDecode(t, d, relMsg(1, "public", "t", "id"))
 	// No Begin → no commit timestamp → would land in the wrong partition.
-	_, _, err := d.Decode(&pglogrepl.InsertMessage{RelationID: 1, Tuple: tuple(textCol("1"))})
+	_, err := d.Decode(&pglogrepl.InsertMessage{RelationID: 1, Tuple: tuple(textCol("1"))})
 	if err == nil {
 		t.Error("expected error for a row event outside a transaction")
 	}
@@ -337,7 +343,7 @@ func TestDecode_PKColumnDriftFailsLoud(t *testing.T) {
 	// The catalog reports a PK column absent from the relation's in-band columns
 	// (schema drift during stream lag) → fail loud rather than build a wrong PK.
 	d := pgcapture.NewDecoder(pkResolver("ghost"), event.Filters{}, nil)
-	_, _, err := d.Decode(relMsg(1, "public", "t", "id", "v"))
+	_, err := d.Decode(relMsg(1, "public", "t", "id", "v"))
 	if err == nil {
 		t.Error("expected error when a PK column is absent from the relation columns")
 	}
@@ -351,7 +357,7 @@ func TestDecode_NonFullReplicaIdentityRelationFailsLoud(t *testing.T) {
 	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
 	rel := relMsg(1, "public", "t", "id", "v")
 	rel.ReplicaIdentity = 'd' // default, not FULL
-	_, _, err := d.Decode(rel)
+	_, err := d.Decode(rel)
 	if err == nil {
 		t.Fatal("expected error for a relation not at REPLICA IDENTITY FULL")
 	}
@@ -365,7 +371,7 @@ func TestDecode_PKResolverErrorFailsLoud(t *testing.T) {
 		return nil, errBoom
 	})
 	d := pgcapture.NewDecoder(boom, event.Filters{}, nil)
-	_, _, err := d.Decode(relMsg(1, "public", "t", "id"))
+	_, err := d.Decode(relMsg(1, "public", "t", "id"))
 	if err == nil {
 		t.Error("expected error to propagate from a failing PKResolver (no silent empty PK)")
 	}
@@ -377,7 +383,7 @@ func TestDecode_ColumnCountMismatchFailsLoud(t *testing.T) {
 	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
 	mustDecode(t, d, relMsg(1, "public", "t", "id", "v")) // 2 columns
 	mustDecode(t, d, beginMsg())
-	_, _, err := d.Decode(&pglogrepl.InsertMessage{
+	_, err := d.Decode(&pglogrepl.InsertMessage{
 		RelationID: 1, Tuple: tuple(textCol("1")), // 1 column
 	})
 	if err == nil {
@@ -393,7 +399,7 @@ func TestDecode_UnchangedToastInUpdateBeforeImageFailsLoud(t *testing.T) {
 	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
 	mustDecode(t, d, relMsg(1, "public", "t", "id", "body"))
 	mustDecode(t, d, beginMsg())
-	_, _, err := d.Decode(&pglogrepl.UpdateMessage{
+	_, err := d.Decode(&pglogrepl.UpdateMessage{
 		RelationID:   1,
 		OldTupleType: pglogrepl.UpdateMessageTupleTypeOld,
 		OldTuple:     tuple(textCol("1"), toastCol()), // 'u' in the BEFORE image
@@ -408,7 +414,7 @@ func TestDecode_UnchangedToastInDeleteBeforeImageFailsLoud(t *testing.T) {
 	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
 	mustDecode(t, d, relMsg(1, "public", "t", "id", "body"))
 	mustDecode(t, d, beginMsg())
-	_, _, err := d.Decode(&pglogrepl.DeleteMessage{
+	_, err := d.Decode(&pglogrepl.DeleteMessage{
 		RelationID:   1,
 		OldTupleType: pglogrepl.DeleteMessageTupleTypeOld,
 		OldTuple:     tuple(textCol("1"), toastCol()), // 'u' in the DELETE before-image
@@ -424,22 +430,101 @@ func TestDecode_DeleteWithoutBeforeImageFailsLoud(t *testing.T) {
 	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
 	mustDecode(t, d, relMsg(1, "public", "t", "id"))
 	mustDecode(t, d, beginMsg())
-	_, _, err := d.Decode(&pglogrepl.DeleteMessage{RelationID: 1, OldTuple: nil})
+	_, err := d.Decode(&pglogrepl.DeleteMessage{RelationID: 1, OldTuple: nil})
 	if err == nil {
 		t.Error("expected fail-loud error for a DELETE carrying no before-image")
 	}
 }
 
-func TestDecode_TruncateNotIndexed(t *testing.T) {
-	// TRUNCATE has a real behavioral contract: it must be surfaced (warned) but
-	// NEVER indexed as a row event (DDL replay on the PG path is out of #530 scope).
+func TestDecode_TruncateIndexedAsDDL(t *testing.T) {
+	// TRUNCATE is now captured as a durable schema_changes audit entry (#827):
+	// one EventDDL / DDLTruncateTable per truncated table, stamped with the
+	// transaction's commit coordinates, so reconstruct/verify refuse to cross it.
 	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
-	_, emit, err := d.Decode(&pglogrepl.TruncateMessage{RelationNum: 1, RelationIDs: []uint32{1}})
+	mustDecode(t, d, relMsg(1, "public", "t", "id"))
+	mustDecode(t, d, beginMsg())
+
+	evs, err := d.Decode(&pglogrepl.TruncateMessage{RelationNum: 1, RelationIDs: []uint32{1}})
 	if err != nil {
 		t.Fatalf("TRUNCATE: unexpected error: %v", err)
 	}
-	if emit {
-		t.Error("TRUNCATE must not be indexed (DDL replay out of #530 scope) — emit should be false")
+	if len(evs) != 1 {
+		t.Fatalf("TRUNCATE of one table must emit exactly one event, got %d", len(evs))
+	}
+	ev := evs[0]
+	if ev.EventType != event.EventDDL {
+		t.Errorf("EventType = %v, want EventDDL", ev.EventType)
+	}
+	if ev.DDLType != event.DDLTruncateTable {
+		t.Errorf("DDLType = %q, want %q", ev.DDLType, event.DDLTruncateTable)
+	}
+	if ev.Schema != "public" || ev.Table != "t" {
+		t.Errorf("schema.table = %s.%s, want public.t", ev.Schema, ev.Table)
+	}
+	if ev.DDLQuery != "TRUNCATE TABLE public.t" {
+		t.Errorf("DDLQuery = %q, want %q", ev.DDLQuery, "TRUNCATE TABLE public.t")
+	}
+	if !ev.Timestamp.Equal(txnTime) {
+		t.Errorf("Timestamp = %s, want the commit time %s", ev.Timestamp, txnTime)
+	}
+	if ev.GTID != txnLSN.String() || ev.EndPos != uint64(txnLSN) {
+		t.Errorf("commit coords = GTID %q / EndPos %d, want %q / %d", ev.GTID, ev.EndPos, txnLSN.String(), uint64(txnLSN))
+	}
+}
+
+func TestDecode_TruncateMultiTable(t *testing.T) {
+	// TRUNCATE a, b carries several relation OIDs; each in-scope one gets its own
+	// event (schema_changes is one row per table), in the order pgoutput lists them.
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	mustDecode(t, d, relMsg(1, "public", "a", "id"))
+	mustDecode(t, d, relMsg(2, "public", "b", "id"))
+	mustDecode(t, d, beginMsg())
+
+	evs, err := d.Decode(&pglogrepl.TruncateMessage{RelationNum: 2, RelationIDs: []uint32{1, 2}})
+	if err != nil {
+		t.Fatalf("TRUNCATE multi: unexpected error: %v", err)
+	}
+	if len(evs) != 2 {
+		t.Fatalf("TRUNCATE of two tables must emit two events, got %d", len(evs))
+	}
+	if evs[0].Table != "a" || evs[1].Table != "b" {
+		t.Errorf("tables/order = %q,%q, want a,b", evs[0].Table, evs[1].Table)
+	}
+	for _, ev := range evs {
+		if ev.EventType != event.EventDDL || ev.DDLType != event.DDLTruncateTable {
+			t.Errorf("event %s.%s not an EventDDL/TRUNCATE: %+v", ev.Schema, ev.Table, ev)
+		}
+	}
+}
+
+func TestDecode_TruncateSkipsOutOfScope(t *testing.T) {
+	// A published-but-filtered-out table (excluded by --tables) is cached so its
+	// OID resolves, but must NOT produce a truncate audit event — exactly like row
+	// events skip it.
+	d := pgcapture.NewDecoder(pkResolver("id"),
+		event.Filters{Tables: map[string]bool{"public.a": true}}, nil)
+	mustDecode(t, d, relMsg(1, "public", "a", "id"))
+	mustDecode(t, d, relMsg(2, "public", "b", "id")) // cached (any OID resolvable), filtered out of emit
+	mustDecode(t, d, beginMsg())
+
+	evs, err := d.Decode(&pglogrepl.TruncateMessage{RelationNum: 2, RelationIDs: []uint32{1, 2}})
+	if err != nil {
+		t.Fatalf("TRUNCATE mixed-scope: unexpected error: %v", err)
+	}
+	if len(evs) != 1 || evs[0].Table != "a" {
+		t.Fatalf("only the in-scope table should emit; got %d events %+v", len(evs), evs)
+	}
+}
+
+func TestDecode_TruncateUnknownRelationFailsLoud(t *testing.T) {
+	// An OID with no preceding RelationMessage is a protocol-invariant violation —
+	// pgoutput emits a Relation before a relation's first change, TRUNCATE included.
+	// Fail loud like relationFor rather than silently drop a destructive DDL.
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	mustDecode(t, d, beginMsg())
+	_, err := d.Decode(&pglogrepl.TruncateMessage{RelationNum: 1, RelationIDs: []uint32{99}})
+	if err == nil {
+		t.Error("expected fail-loud error for a TRUNCATE of an unknown relation OID")
 	}
 }
 
@@ -652,7 +737,7 @@ func TestDecode_AttrResolverErrorFailsLoud(t *testing.T) {
 		pgcapture.WithAttrResolver(func(_ uint32, _, _ string) (map[string]pgcapture.ColumnAttrs, error) {
 			return nil, errBoom
 		}))
-	_, _, err := d.Decode(relMsg(1, "public", "t", "id", "v"))
+	_, err := d.Decode(relMsg(1, "public", "t", "id", "v"))
 	if err == nil {
 		t.Fatal("expected a loud error when the AttrResolver fails")
 	}
@@ -763,7 +848,7 @@ func TestDecode_TimescaleChunk_WarnsBeforeReplicaIdentityAbort(t *testing.T) {
 
 	rel := relMsg(10, "_timescaledb_internal", "_hyper_1_1_chunk", "ts", "v")
 	rel.ReplicaIdentity = 'd' // NOT full → cacheRelation will abort
-	_, _, err := d.Decode(rel)
+	_, err := d.Decode(rel)
 	if err == nil {
 		t.Fatal("expected a REPLICA IDENTITY FULL error for a non-FULL chunk relation")
 	}

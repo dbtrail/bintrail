@@ -444,10 +444,30 @@ func streamLoopPG(
 				// batch (pgoutput delivers them before the commit).
 				lastCommitLSN = ev.EndPos
 			case event.EventDDL:
+				// A destructive DDL on the PG path (today: TRUNCATE). Flush any
+				// batched rows that precede it so they are durable first, then
+				// persist a schema_changes audit row so the DDL is visible
+				// (list_schema_changes / status) and reconstruct + baseline-anchored
+				// verify REFUSE to cross it (reconstruct.CheckDestructiveDDL) instead
+				// of silently resurrecting the truncated rows from a baseline.
+				// snapshotID=nil: a TRUNCATE does not invalidate the schema snapshot
+				// (mirrors the MySQL consumer, streamrun.go). Its own txn, like the
+				// EventRelation snapshot write above — a crash before the next
+				// checkpoint re-delivers and re-inserts a benign duplicate audit row.
+				//
+				// The cursor is NOT advanced here: a TRUNCATE arrives inside its
+				// transaction, BEFORE the CommitMessage, and its EndPos is that txn's
+				// (not-yet-seen) commit LSN. Advancing lastCommitLSN now would let a
+				// ticker checkpoint ack that LSN to PostgreSQL (releasing WAL) while
+				// rows AFTER the truncate in the same transaction are still incoming —
+				// a crash would then lose them. The EventCommit that closes the txn
+				// advances the cursor to the same LSN once the whole txn is drained.
 				if err := flush(); err != nil {
 					return err
 				}
-				lastCommitLSN = ev.EndPos
+				if err := indexer.InsertSchemaChange(indexDB, ev, nil); err != nil {
+					return fmt.Errorf("pgstreamrun: persist schema change (%s on %s.%s): %w", ev.DDLType, ev.Schema, ev.Table, err)
+				}
 			case event.EventRelation:
 				// A relation's shape (#533): persist it as a schema snapshot and record
 				// its snapshot_id for stamping this table's subsequent rows. The snapshot

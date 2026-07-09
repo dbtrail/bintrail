@@ -98,24 +98,27 @@ func NewDecoder(resolvePK PKResolver, filters event.Filters, logger *slog.Logger
 	return d
 }
 
-// Decode processes one pgoutput message. It returns:
-//   - (event, true, nil) when the message produces a row or commit event;
-//   - (zero, false, nil) when the message is consumed for internal state only
-//     (Begin/Relation) or is deliberately not indexed (Truncate/Type/Origin);
-//   - (zero, false, err) on a decode-invariant violation (unknown relation, a row
-//     outside a transaction, a binary tuple datum, a tuple column-count mismatch,
-//     or a primary-key lookup failure). The caller must treat a non-nil error as
-//     fatal — never skip the message and continue, or the stream desynchronizes.
-func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
+// Decode processes one pgoutput message and returns the source-neutral events it
+// produces, in order:
+//   - a one-element slice for a row, commit, or relation event;
+//   - a MULTI-element slice for a TRUNCATE of several tables — one EventDDL per
+//     in-scope truncated relation (schema_changes is one row per table);
+//   - an empty (nil) slice when the message is consumed for internal state only
+//     (Begin), carries no row data (Type/Origin), or is a filtered-out relation;
+//   - (nil, err) on a decode-invariant violation (unknown relation, a row outside
+//     a transaction, a binary tuple datum, a tuple column-count mismatch, or a
+//     primary-key lookup failure). The caller must treat a non-nil error as fatal
+//     — never skip the message and continue, or the stream desynchronizes.
+func (d *Decoder) Decode(msg pglogrepl.Message) ([]event.Event, error) {
 	switch m := msg.(type) {
 	case *pglogrepl.BeginMessage:
 		// FinalLSN is the transaction's commit LSN; CommitTime its commit timestamp.
 		d.txn = txnContext{commitLSN: m.FinalLSN, commitTime: m.CommitTime, open: true}
-		return event.Event{}, false, nil
+		return nil, nil
 
 	case *pglogrepl.RelationMessage:
 		if err := d.cacheRelation(m); err != nil {
-			return event.Event{}, false, err
+			return nil, err
 		}
 		// Emit a schema snapshot for the consumer to persist (#533), but only for an
 		// in-scope relation: cacheRelation caches EVERY relation so row decoding can
@@ -123,9 +126,9 @@ func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
 		// stamp a SchemaVersion. Gate the EMIT, not the cache.
 		rel := d.relations[m.RelationID]
 		if !d.filters.Matches(rel.schema, rel.table) {
-			return event.Event{}, false, nil
+			return nil, nil
 		}
-		return relationEvent(rel), true, nil
+		return []event.Event{relationEvent(rel)}, nil
 
 	case *pglogrepl.InsertMessage:
 		return d.decodeInsert(m)
@@ -148,20 +151,15 @@ func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
 			EventType:  event.EventCommit,
 		}
 		d.txn = txnContext{}
-		return ev, true, nil
+		return []event.Event{ev}, nil
 
 	case *pglogrepl.TruncateMessage:
-		// DDL replay on the PostgreSQL path is out of #530 scope; surface a TRUNCATE
-		// loudly so it is never silently invisible in the index. (Open question:
-		// map to EventDDL/DDLTruncateTable later.)
-		d.logger.Warn("pgcapture: TRUNCATE not indexed (DDL replay out of scope)",
-			"relations", len(m.RelationIDs))
-		return event.Event{}, false, nil
+		return d.decodeTruncate(m)
 
 	case *pglogrepl.TypeMessage, *pglogrepl.OriginMessage:
 		// No row data. Type/Origin are not needed for capture fidelity under
 		// proto_version 1 (column names + text values arrive regardless).
-		return event.Event{}, false, nil
+		return nil, nil
 
 	default:
 		// The slice-2 capturer requests proto_version 1, which emits no in-progress-
@@ -170,8 +168,52 @@ func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
 		// future bump to proto v2 would route real row-bearing stream messages here —
 		// revisit this branch before negotiating v2.
 		d.logger.Debug("pgcapture: ignoring unhandled message", "type", fmt.Sprintf("%T", msg))
-		return event.Event{}, false, nil
+		return nil, nil
 	}
+}
+
+// decodeTruncate turns a pgoutput TRUNCATE into one EventDDL per in-scope
+// truncated relation, so the destructive DDL lands a durable schema_changes
+// audit row (queryable via list_schema_changes / status) and reconstruct /
+// baseline-anchored verify REFUSE to cross it (reconstruct.CheckDestructiveDDL)
+// instead of silently resurrecting the truncated rows from a baseline. This
+// mirrors the MySQL parser, which records TRUNCATE as an EventDDL /
+// DDLTruncateTable audit entry (parser.parseDDL) — no row-level events to
+// replay, but a durable, queryable record that the truncate happened.
+//
+// A `TRUNCATE a, b, c` carries several relation OIDs, so this returns one event
+// per in-scope table (CheckDestructiveDDL matches by schema_name/table_name).
+// Out-of-scope relations — published but excluded by --schemas/--tables — are
+// skipped, exactly like row events. An unknown OID is a protocol-invariant
+// violation (pgoutput emits a Relation message before a relation's first change,
+// TRUNCATE included) and fails loud via relationFor, which also enforces that a
+// TRUNCATE arrives inside an open transaction so its events carry the commit
+// timestamp (the correct event_timestamp for partitioning).
+func (d *Decoder) decodeTruncate(m *pglogrepl.TruncateMessage) ([]event.Event, error) {
+	var evs []event.Event
+	for _, oid := range m.RelationIDs {
+		rel, err := d.relationFor(oid)
+		if err != nil {
+			return nil, err
+		}
+		if !d.filters.Matches(rel.schema, rel.table) {
+			continue
+		}
+		lsn := d.txn.commitLSN.String()
+		evs = append(evs, event.Event{
+			BinlogFile: lsn,
+			StartPos:   uint64(d.txn.commitLSN),
+			EndPos:     uint64(d.txn.commitLSN),
+			Timestamp:  d.txn.commitTime,
+			GTID:       lsn,
+			Schema:     rel.schema,
+			Table:      rel.table,
+			EventType:  event.EventDDL,
+			DDLType:    event.DDLTruncateTable,
+			DDLQuery:   fmt.Sprintf("TRUNCATE TABLE %s.%s", rel.schema, rel.table),
+		})
+	}
+	return evs, nil
 }
 
 // cacheRelation records (or refreshes) a relation's columns + primary key. PG emits
@@ -324,30 +366,30 @@ func relationEvent(rel *relationInfo) event.Event {
 	}
 }
 
-func (d *Decoder) decodeInsert(m *pglogrepl.InsertMessage) (event.Event, bool, error) {
+func (d *Decoder) decodeInsert(m *pglogrepl.InsertMessage) ([]event.Event, error) {
 	rel, err := d.relationFor(m.RelationID)
 	if err != nil {
-		return event.Event{}, false, err
+		return nil, err
 	}
 	if !d.filters.Matches(rel.schema, rel.table) {
-		return event.Event{}, false, nil
+		return nil, nil
 	}
 	// INSERT carries only a new tuple, fully written — pgoutput never emits 'u' in
 	// an INSERT, so there is no before-image to resolve from.
 	after, err := d.decodeTuple(rel, m.Tuple, roleAfter, nil)
 	if err != nil {
-		return event.Event{}, false, err
+		return nil, err
 	}
-	return d.rowEvent(rel, event.EventInsert, nil, after), true, nil
+	return []event.Event{d.rowEvent(rel, event.EventInsert, nil, after)}, nil
 }
 
-func (d *Decoder) decodeUpdate(m *pglogrepl.UpdateMessage) (event.Event, bool, error) {
+func (d *Decoder) decodeUpdate(m *pglogrepl.UpdateMessage) ([]event.Event, error) {
 	rel, err := d.relationFor(m.RelationID)
 	if err != nil {
-		return event.Event{}, false, err
+		return nil, err
 	}
 	if !d.filters.Matches(rel.schema, rel.table) {
-		return event.Event{}, false, nil
+		return nil, nil
 	}
 	// OldTuple is the full old tuple ('O') under REPLICA IDENTITY FULL, a key-only
 	// tuple ('K') when a replica-identity column changed under a weaker identity, or
@@ -359,7 +401,7 @@ func (d *Decoder) decodeUpdate(m *pglogrepl.UpdateMessage) (event.Event, bool, e
 	if m.OldTuple != nil {
 		before, err = d.decodeTuple(rel, m.OldTuple, roleBefore, nil)
 		if err != nil {
-			return event.Event{}, false, err
+			return nil, err
 		}
 	}
 	// Resolve any 'u' in the new tuple from the before-image (Option B): under RI
@@ -368,18 +410,18 @@ func (d *Decoder) decodeUpdate(m *pglogrepl.UpdateMessage) (event.Event, bool, e
 	// changed_columns correct and needing zero downstream handling.
 	after, err := d.decodeTuple(rel, m.NewTuple, roleAfter, before)
 	if err != nil {
-		return event.Event{}, false, err
+		return nil, err
 	}
-	return d.rowEvent(rel, event.EventUpdate, before, after), true, nil
+	return []event.Event{d.rowEvent(rel, event.EventUpdate, before, after)}, nil
 }
 
-func (d *Decoder) decodeDelete(m *pglogrepl.DeleteMessage) (event.Event, bool, error) {
+func (d *Decoder) decodeDelete(m *pglogrepl.DeleteMessage) ([]event.Event, error) {
 	rel, err := d.relationFor(m.RelationID)
 	if err != nil {
-		return event.Event{}, false, err
+		return nil, err
 	}
 	if !d.filters.Matches(rel.schema, rel.table) {
-		return event.Event{}, false, nil
+		return nil, nil
 	}
 	// A DELETE's before-image is the ONLY source for its reversal INSERT. pgoutput
 	// always sends an old tuple for a DELETE (its decode requires 'K' or 'O'), and a
@@ -387,26 +429,27 @@ func (d *Decoder) decodeDelete(m *pglogrepl.DeleteMessage) (event.Event, bool, e
 	// replication at all — so a missing old tuple is a broken invariant, not a
 	// supported case: fail loud rather than index an un-keyed, un-reversible row.
 	if m.OldTuple == nil {
-		return event.Event{}, false, fmt.Errorf("pgcapture: DELETE on %s.%s carries no before-image (no replica identity?) — cannot index an un-reversible delete", rel.schema, rel.table)
+		return nil, fmt.Errorf("pgcapture: DELETE on %s.%s carries no before-image (no replica identity?) — cannot index an un-reversible delete", rel.schema, rel.table)
 	}
 	before, err := d.decodeTuple(rel, m.OldTuple, roleBefore, nil)
 	if err != nil {
-		return event.Event{}, false, err
+		return nil, err
 	}
-	return d.rowEvent(rel, event.EventDelete, before, nil), true, nil
+	return []event.Event{d.rowEvent(rel, event.EventDelete, before, nil)}, nil
 }
 
-// relationFor returns the cached relation for a row message, erroring if no
-// RelationMessage preceded it (a protocol invariant) or if no transaction is open
-// (a row must arrive between Begin and Commit; without an open txn the event would
-// get a zero commit timestamp and land in the wrong partition).
+// relationFor returns the cached relation for a change message (a row event or a
+// TRUNCATE), erroring if no RelationMessage preceded it (a protocol invariant) or
+// if no transaction is open (a change must arrive between Begin and Commit;
+// without an open txn the event would get a zero commit timestamp and land in the
+// wrong partition).
 func (d *Decoder) relationFor(oid uint32) (*relationInfo, error) {
 	if !d.txn.open {
-		return nil, fmt.Errorf("pgcapture: row event for relation OID %d outside a transaction (no preceding Begin)", oid)
+		return nil, fmt.Errorf("pgcapture: change for relation OID %d outside a transaction (no preceding Begin)", oid)
 	}
 	rel, ok := d.relations[oid]
 	if !ok {
-		return nil, fmt.Errorf("pgcapture: row event for unknown relation OID %d (no preceding Relation message)", oid)
+		return nil, fmt.Errorf("pgcapture: change for unknown relation OID %d (no preceding Relation message)", oid)
 	}
 	return rel, nil
 }
