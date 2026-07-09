@@ -444,10 +444,20 @@ func streamLoopPG(
 				// batch (pgoutput delivers them before the commit).
 				lastCommitLSN = ev.EndPos
 			case event.EventDDL:
-				if err := flush(); err != nil {
-					return err
+				// A DDL marker — on the PostgreSQL path today only a TRUNCATE audit
+				// record (#827). Persist it to schema_changes immediately, the
+				// source-neutral analog of the MySQL DDL path, so the truncate is a
+				// durable, queryable record (bintrail-mcp list_schema_changes / the
+				// schema_changes table) rather than a transient warn. Like the
+				// EventRelation snapshot it commits in its own statement, OUTSIDE the
+				// batch→checkpoint→ack sequence: it does NOT advance lastCommitLSN (the
+				// TRUNCATE is mid-transaction; the following EventCommit advances the
+				// cursor) and does NOT force a flush of the in-flight batch. A crash
+				// before the next checkpoint re-delivers the TRUNCATE and re-records a
+				// benign duplicate marker.
+				if err := indexer.InsertSchemaChange(indexDB, ev, nil); err != nil {
+					return fmt.Errorf("pgstreamrun: record TRUNCATE marker for %s.%s: %w", ev.Schema, ev.Table, err)
 				}
-				lastCommitLSN = ev.EndPos
 			case event.EventRelation:
 				// A relation's shape (#533): persist it as a schema snapshot and record
 				// its snapshot_id for stamping this table's subsequent rows. The snapshot

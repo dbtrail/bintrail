@@ -529,12 +529,17 @@ your own round-trip.
   if the child table is published**. If a published parent has an unpublished
   cascade child, the cascade rewrites are not captured — bintrail-pg warns (startup
   + doctor); add the child to the publication.
-- **`TRUNCATE` is not captured at all — not even as an audit trail.** Unlike
-  MySQL's DDL, which lands a `schema_changes` row bintrail can at least warn
-  about, a PostgreSQL `TRUNCATE` produces only a transient `Warn` log line at
-  capture time ("TRUNCATE not indexed") and nothing persisted. There is
-  nothing for `recover` to put back, and — unlike the MySQL path — no durable
-  record that the truncate happened at all.
+- **`TRUNCATE` is recorded as an audit marker, not a reversible change.** A
+  PostgreSQL `TRUNCATE` emits no per-row `DELETE`, so left uncaptured it would be
+  indistinguishable from "nothing happened". bintrail-pg records it as a
+  `schema_changes` row (`ddl_type = TRUNCATE TABLE`) — the same durable audit
+  trail MySQL's DDL leaves — surfaced by the `list_schema_changes` MCP tool and in
+  the `schema_changes` table. It is a *record that the truncate happened*, not a
+  reversible event: `recover` has no per-row before-images to put back, and a
+  `reconstruct` that crosses the truncate does not yet consume the marker (it can
+  still resurrect the pre-truncate rows from baseline + deltas). A multi-table
+  `TRUNCATE a, b` records one marker per published table; a truncate of an
+  out-of-scope table records nothing.
 - **Sequence cursors are not captured.** The materialized id values in your rows
   *are* captured; the sequence's own `last_value` (a separate catalog object) is
   not — logical decoding does not replicate sequences. After a restore, re-point

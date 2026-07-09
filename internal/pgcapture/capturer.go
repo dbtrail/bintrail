@@ -273,6 +273,14 @@ func (c *Capturer) receiveLoop(ctx context.Context, replConn *pgconn.PgConn, dec
 					return err
 				}
 			}
+			// Drain any events the message produced beyond its single return value.
+			// Only a multi-relation TRUNCATE (`TRUNCATE a, b`) fills this — one marker
+			// per in-scope relation past the first — so none is silently dropped (#827).
+			for _, pev := range decoder.TakePending() {
+				if err := c.emit(ctx, replConn, out, pev, standbyTicker); err != nil {
+					return err
+				}
+			}
 		}
 	}
 }
