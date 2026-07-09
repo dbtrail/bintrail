@@ -334,6 +334,22 @@ func ReconstructTable(
 	if err != nil {
 		return nil, fmt.Errorf("read baseline metadata: %w", err)
 	}
+	// PostgreSQL baselines deliberately omit CreateTableSQL (pgbaseline embeds
+	// an LSN anchor, not a mydumper CREATE TABLE), so the generic
+	// "re-run `bintrail baseline`" remediation below is impossible to satisfy
+	// for a PG source and sends the operator into a loop re-dumping baselines
+	// that will never carry that metadata. Full-table reconstruct is out of GA
+	// scope for PostgreSQL (#597). Detect PG via the LSN anchor first (no DB
+	// read; written only by pgbaseline) then the recorded source flavor
+	// (catches pre-#593 PG baselines with LSN==0), and fail with the correct
+	// message BEFORE the MySQL-only CreateTableSQL check so a genuine MySQL
+	// baseline missing that metadata still gets the "re-run `bintrail baseline`"
+	// guidance.
+	if bmeta.LSN != 0 || query.SourceFlavor(db) == "postgres" {
+		return nil, fmt.Errorf(
+			"full-table reconstruct is not yet supported for PostgreSQL sources (#597); " +
+				"use single-row `reconstruct` or the shim `_flashback` for PostgreSQL time-travel")
+	}
 	if bmeta.CreateTableSQL == "" {
 		return nil, fmt.Errorf(
 			"baseline at %s lacks bintrail.create_table_sql metadata; "+
