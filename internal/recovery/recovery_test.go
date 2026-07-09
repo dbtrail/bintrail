@@ -1211,17 +1211,19 @@ func TestGeneratePG_ScriptWrapper(t *testing.T) {
 }
 
 // TestGenerateMySQL_PinsSQLMode is the #786 acceptance test: the MySQL preamble
-// must pin a permissive sql_mode BEFORE the reversal statements, and that mode
-// must NOT include NO_BACKSLASH_ESCAPES (EscapeString uses backslash escapes, so
-// it would misparse the literals) nor a strict/NO_ZERO_DATE mode (which would
-// reject captured 0000-00-00 values and abort the apply). PG never emits sql_mode.
+// must pin a sql_mode BEFORE the reversal statements that (a) excludes
+// NO_BACKSLASH_ESCAPES (EscapeString uses backslash escapes, so it would misparse
+// the literals) and (b) excludes NO_ZERO_DATE/NO_ZERO_IN_DATE (so captured
+// 0000-00-00 values apply) — while KEEPING STRICT_TRANS_TABLES so a value that no
+// longer fits a narrowed column fails loud instead of being silently coerced.
+// PG never emits sql_mode.
 func TestGenerateMySQL_PinsSQLMode(t *testing.T) {
 	row := query.ResultRow{
 		EventID: 1, SchemaName: "db", TableName: "t",
 		EventType: parser.EventInsert, EventTimestamp: time.Unix(0, 0).UTC(),
 		RowAfter: map[string]any{"id": "1"},
 	}
-	const pin = "SET sql_mode = 'NO_ENGINE_SUBSTITUTION';"
+	const pin = "SET sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION';"
 
 	var myBuf bytes.Buffer
 	if _, err := New(nil, nil).GenerateSQLFromRows([]query.ResultRow{row}, &myBuf); err != nil {
@@ -1231,10 +1233,16 @@ func TestGenerateMySQL_PinsSQLMode(t *testing.T) {
 	if !strings.Contains(out, pin) {
 		t.Errorf("MySQL script must contain %q, got:\n%s", pin, out)
 	}
-	for _, banned := range []string{"NO_BACKSLASH_ESCAPES", "NO_ZERO_DATE", "STRICT_"} {
+	// The pin must NOT disable backslash escapes (EscapeString relies on them) nor
+	// reject zero-dates — but STRICT_TRANS_TABLES is kept so a captured value that
+	// no longer fits a narrowed column fails loud instead of being silently coerced.
+	for _, banned := range []string{"NO_BACKSLASH_ESCAPES", "NO_ZERO_DATE", "NO_ZERO_IN_DATE"} {
 		if strings.Contains(out, banned) {
 			t.Errorf("MySQL sql_mode pin must NOT include %q, got:\n%s", banned, out)
 		}
+	}
+	if !strings.Contains(out, "STRICT_TRANS_TABLES") {
+		t.Errorf("MySQL sql_mode pin must KEEP STRICT_TRANS_TABLES (fail-loud on bad values), got:\n%s", out)
 	}
 	// The pin must precede the reversal statement so the mode is active when the
 	// literals are parsed.

@@ -298,11 +298,16 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 		// EscapeString above renders string literals with backslash escapes
 		// (`\\`, `\'`, `\0`); a target session with NO_BACKSLASH_ESCAPES would
 		// misparse them and silently corrupt data. Zero-dates (0000-00-00)
-		// captured from legacy data would also be rejected under strict/
-		// NO_ZERO_DATE modes, aborting the whole apply. Pin a permissive
-		// sql_mode that includes neither — mirroring how the PG path defends
-		// its own escaping with standard_conforming_strings (#786).
-		fmt.Fprintln(w, "SET sql_mode = 'NO_ENGINE_SUBSTITUTION';")
+		// captured from legacy data would also be rejected under NO_ZERO_DATE/
+		// NO_ZERO_IN_DATE, aborting the whole apply. Pin a mode with neither
+		// NO_BACKSLASH_ESCAPES nor the zero-date rules — mirroring how the PG
+		// path defends its own escaping with standard_conforming_strings (#786).
+		// STRICT_TRANS_TABLES is KEPT deliberately: with the zero-date rules
+		// absent it still inserts 0000-00-00 cleanly, while truncation, out-of-
+		// range and invalid values stay fail-loud during the apply. Dropping
+		// strict entirely would silently coerce a captured value that no longer
+		// fits a since-narrowed column — data corruption at the worst moment.
+		fmt.Fprintln(w, "SET sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION';")
 	}
 	if g.dialect == PostgresDialect {
 		// escapePGString relies on standard_conforming_strings=on (PostgreSQL's
