@@ -17,6 +17,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/serverid"
 )
 
 // CheckStatus is the outcome of a single preflight check. Constrained to the
@@ -141,6 +142,7 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 	report.add(checkRowMetadata(ctx, sourceDB))
 	report.add(checkBinlogRowValueOptions(ctx, sourceDB))
 	report.add(checkReplicationGrants(ctx, sourceDB))
+	report.add(checkServerIDCollision(ctx, sourceDB, sourceDSN))
 	report.add(checkFKCascades(sourceDB, schemas))
 	report.add(checkSchemaVisibility(ctx, sourceDB, schemas))
 	report.add(checkPerformanceSchema(ctx, sourceDB))
@@ -313,6 +315,16 @@ func checkBinlogRowValueOptions(ctx context.Context, db *sql.DB) CheckResult {
 // the 2-day recommendation in docs/streaming.md — short windows can leave
 // bintrail unable to fill gaps after a restart.
 func checkBinlogRetention(ctx context.Context, db *sql.DB) CheckResult {
+	// On RDS/Aurora the effective retention is governed by the
+	// mysql.rds_configuration 'binlog retention hours' setting, NOT by
+	// @@binlog_expire_logs_seconds (which reports the engine default and can
+	// paint a green PASS while RDS purges binlogs as soon as replication no
+	// longer needs them — #812). When that row is queryable, base the verdict
+	// on it. Absent table/row (non-RDS) → fall through to the standard probe.
+	if raw, isRDS := rdsBinlogRetentionHours(ctx, db); isRDS {
+		return rdsBinlogRetentionVerdict("Binlog retention >= 2 days", raw)
+	}
+
 	var raw string
 	// binlog_expire_logs_seconds is MySQL 8.0+; older servers use expire_logs_days.
 	err := db.QueryRowContext(ctx, "SELECT @@binlog_expire_logs_seconds").Scan(&raw)
@@ -374,6 +386,116 @@ func checkBinlogRetention(ctx context.Context, db *sql.DB) CheckResult {
 		Name:   "Binlog retention >= 2 days",
 		Status: StatusPass,
 		Detail: fmt.Sprintf("%dh", seconds/3600),
+	}
+}
+
+// rdsBinlogRetentionHours reads the RDS/Aurora-managed binlog retention from
+// mysql.rds_configuration. isRDS is true only when that row is queryable (the
+// table exists AND the 'binlog retention hours' row is present) — the signal
+// that this is an RDS/Aurora source whose retention is governed here rather
+// than by the engine variable (#812). On RDS the value is NULL by default
+// (raw.Valid == false), which still means isRDS=true so the caller can WARN.
+// Any scan error (1146 no-such-table on a self-managed server, sql.ErrNoRows,
+// or a permission/transient failure) → isRDS=false, so the caller falls back
+// to the standard @@binlog_expire_logs_seconds probe.
+func rdsBinlogRetentionHours(ctx context.Context, db *sql.DB) (raw sql.NullString, isRDS bool) {
+	var v sql.NullString
+	if err := db.QueryRowContext(ctx,
+		"SELECT value FROM mysql.rds_configuration WHERE name = 'binlog retention hours'").Scan(&v); err != nil {
+		return sql.NullString{}, false
+	}
+	return v, true
+}
+
+// rdsBinlogRetentionVerdict turns the RDS-managed 'binlog retention hours'
+// value into a check result. NULL (the RDS default) or a sub-2-day value →
+// WARN with the CALL mysql.rds_set_configuration remediation; >= 2 days → PASS.
+func rdsBinlogRetentionVerdict(name string, raw sql.NullString) CheckResult {
+	const minHours = binlogRetentionMinSeconds / 3600 // 48
+	setRemediation := fmt.Sprintf(
+		"Set RDS/Aurora binlog retention to at least 2 days so bintrail can fill gaps after a restart:\n\n"+
+			"  CALL mysql.rds_set_configuration('binlog retention hours', %d);", minHours)
+
+	if !raw.Valid {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "RDS/Aurora 'binlog retention hours' is NULL (the default) — RDS purges binlogs as soon as replication no longer needs them, regardless of binlog_expire_logs_seconds",
+			Remediation: setRemediation,
+		}
+	}
+	hours, parseErr := strconv.Atoi(strings.TrimSpace(raw.String))
+	if parseErr != nil {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: fmt.Sprintf("could not parse RDS 'binlog retention hours'=%q: %v", raw.String, parseErr),
+		}
+	}
+	if hours*3600 < binlogRetentionMinSeconds {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: fmt.Sprintf("RDS 'binlog retention hours'=%d (below 2 days) — this, not binlog_expire_logs_seconds, governs binlog retention on RDS/Aurora", hours),
+			Remediation: setRemediation,
+		}
+	}
+	return CheckResult{
+		Name:   name,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("%dh (RDS binlog retention hours)", hours),
+	}
+}
+
+// checkServerIDCollision warns when the replication server-id bintrail derives
+// from --source-dsn (serverid.DeriveServerID, a deterministic sha256 of the
+// host:user:dbname triple) collides with the source's own @@server_id (#819).
+// The derivation is deterministic on purpose (clean resume across restarts),
+// but that means two bintrail instances pointed at the SAME source with the
+// same user derive the SAME server-id and MySQL disconnects the duplicate in a
+// reconnect loop — and a 1/2^32 hash collision with the source's own id kicks
+// the source off its own replica identity. Advisory only (WARN, never FAIL):
+// this is a topology property bintrail can surface but must not block boot on.
+func checkServerIDCollision(ctx context.Context, db *sql.DB, sourceDSN string) CheckResult {
+	const name = "Replication server-id collision"
+	derived, err := serverid.DeriveServerID(sourceDSN)
+	if err != nil {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not derive replication server-id from --source-dsn: " + err.Error(),
+		}
+	}
+	var srcRaw string
+	if err := db.QueryRowContext(ctx, "SELECT @@server_id").Scan(&srcRaw); err != nil {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: "could not read @@server_id: " + err.Error(),
+		}
+	}
+	srcID, parseErr := strconv.ParseUint(strings.TrimSpace(srcRaw), 10, 64)
+	if parseErr != nil {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: fmt.Sprintf("could not parse @@server_id=%q: %v", srcRaw, parseErr),
+		}
+	}
+	if srcID == uint64(derived) {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: fmt.Sprintf("derived replication server-id %d equals the source's own @@server_id — the replication connection would collide and MySQL would reject or flap the stream", derived),
+			Remediation: "The server-id is derived deterministically from --source-dsn (host|user|dbname). " +
+				"Vary the DSN's user or host form to shift the derived id off the source's @@server_id, " +
+				"or set an explicit --server-id on `stream`.",
+		}
+	}
+	return CheckResult{
+		Name:   name,
+		Status: StatusPass,
+		Detail: fmt.Sprintf("derived server-id %d (source @@server_id=%d) — note: any bintrail instance on this same --source-dsn derives this SAME id and would collide on the replication connection", derived, srcID),
 	}
 }
 

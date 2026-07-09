@@ -13,6 +13,8 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-sql-driver/mysql"
+
+	"github.com/dbtrail/dbtrail/internal/serverid"
 )
 
 func TestExtractGrantUser(t *testing.T) {
@@ -319,6 +321,11 @@ func TestCheckBinlogRetention(t *testing.T) {
 			}
 			defer db.Close()
 
+			// Non-RDS source: the rds_configuration probe (which runs first)
+			// errors with 1146 (no such table) so the standard probe path runs.
+			mock.ExpectQuery("mysql.rds_configuration").
+				WillReturnError(&mysql.MySQLError{Number: 1146, Message: "Table 'mysql.rds_configuration' doesn't exist"})
+
 			expect := mock.ExpectQuery("SELECT @@binlog_expire_logs_seconds")
 			tt.modern.apply(expect, "@@binlog_expire_logs_seconds")
 			if tt.modern.err != nil {
@@ -340,6 +347,138 @@ func TestCheckBinlogRetention(t *testing.T) {
 				t.Errorf("unmet expectations: %v", err)
 			}
 		})
+	}
+}
+
+// TestCheckBinlogRetentionRDS pins #812: on RDS/Aurora the effective binlog
+// retention is governed by mysql.rds_configuration 'binlog retention hours',
+// not @@binlog_expire_logs_seconds. When that row is queryable the verdict is
+// based on it (and @@binlog_expire_logs_seconds is never consulted). NULL (the
+// RDS default) or a sub-2-day value → WARN with the rds_set_configuration
+// remediation; >= 2 days → PASS.
+func TestCheckBinlogRetentionRDS(t *testing.T) {
+	tests := []struct {
+		name            string
+		value           sql.NullString // mysql.rds_configuration value column
+		wantStatus      CheckStatus
+		wantDetailFrag  string
+		wantRemediation bool
+	}{
+		{"NULL default", sql.NullString{}, StatusWarn, "is NULL", true},
+		{"below 2 days", sql.NullString{String: "24", Valid: true}, StatusWarn, "below 2 days", true},
+		{"exactly 2 days", sql.NullString{String: "48", Valid: true}, StatusPass, "48h (RDS binlog retention hours)", false},
+		{"well above", sql.NullString{String: "720", Valid: true}, StatusPass, "720h (RDS binlog retention hours)", false},
+		{"unparseable", sql.NullString{String: "later", Valid: true}, StatusWarn, "could not parse", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			rows := sqlmock.NewRows([]string{"value"})
+			if tt.value.Valid {
+				rows.AddRow(tt.value.String)
+			} else {
+				rows.AddRow(nil)
+			}
+			// Only the RDS probe runs — the standard @@binlog_expire_logs_seconds
+			// query must NOT be issued (ExpectationsWereMet would flag an
+			// unexpected one via a leftover, and we register none).
+			mock.ExpectQuery("mysql.rds_configuration").WillReturnRows(rows)
+
+			got := checkBinlogRetention(t.Context(), db)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
+			}
+			if tt.wantRemediation && got.Remediation == "" {
+				t.Error("expected remediation but got none")
+			}
+			if got.Status == StatusFail {
+				t.Error("binlog retention is advisory — the check must never FAIL")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+// TestCheckServerIDCollision pins #819: the check WARNs when the server-id
+// derived from --source-dsn equals the source's own @@server_id, PASSes
+// otherwise, and stays advisory (never FAIL). Read/parse failures degrade to
+// WARN so a stalled source cannot green-light a hidden collision.
+func TestCheckServerIDCollision(t *testing.T) {
+	const dsn = "user:pass@tcp(db.example.com:3306)/appdb"
+	derived, err := serverid.DeriveServerID(dsn)
+	if err != nil {
+		t.Fatalf("DeriveServerID: %v", err)
+	}
+	collidingID := fmt.Sprintf("%d", derived)
+
+	tests := []struct {
+		name           string
+		serverID       mockSQLScalar
+		wantStatus     CheckStatus
+		wantDetailFrag string
+	}{
+		{"no collision", row("1"), StatusPass, "derived server-id"},
+		{"collision with source @@server_id", row(collidingID), StatusWarn, "equals the source's own @@server_id"},
+		{"read error", errResp("driver: bad connection"), StatusWarn, "could not read @@server_id"},
+		{"unparseable server_id", row("not-a-number"), StatusWarn, "could not parse @@server_id"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			exp := mock.ExpectQuery("SELECT @@server_id")
+			tt.serverID.apply(exp, "@@server_id")
+
+			got := checkServerIDCollision(t.Context(), db, dsn)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
+			}
+			if got.Status == StatusFail {
+				t.Error("server-id collision is advisory — the check must never FAIL")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+// TestCheckServerIDCollisionBadDSN covers the DeriveServerID parse-error branch:
+// an unparseable --source-dsn cannot reach @@server_id, so the check WARNs
+// without issuing a query.
+func TestCheckServerIDCollisionBadDSN(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	got := checkServerIDCollision(t.Context(), db, "not-a-dsn")
+	if got.Status != StatusWarn {
+		t.Errorf("Status = %q, want %q", got.Status, StatusWarn)
+	}
+	if !strings.Contains(got.Detail, "could not derive replication server-id") {
+		t.Errorf("Detail = %q, want derive-error substring", got.Detail)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
