@@ -295,6 +295,14 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 		// session to UTC so a target with a non-UTC time_zone doesn't reinterpret
 		// the literal and reintroduce the shift capture just fixed.
 		fmt.Fprintln(w, "SET time_zone = '+00:00';")
+		// EscapeString above renders string literals with backslash escapes
+		// (`\\`, `\'`, `\0`); a target session with NO_BACKSLASH_ESCAPES would
+		// misparse them and silently corrupt data. Zero-dates (0000-00-00)
+		// captured from legacy data would also be rejected under strict/
+		// NO_ZERO_DATE modes, aborting the whole apply. Pin a permissive
+		// sql_mode that includes neither — mirroring how the PG path defends
+		// its own escaping with standard_conforming_strings (#786).
+		fmt.Fprintln(w, "SET sql_mode = 'NO_ENGINE_SUBSTITUTION';")
 	}
 	if g.dialect == PostgresDialect {
 		// escapePGString relies on standard_conforming_strings=on (PostgreSQL's

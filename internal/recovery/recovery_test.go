@@ -1210,6 +1210,52 @@ func TestGeneratePG_ScriptWrapper(t *testing.T) {
 	}
 }
 
+// TestGenerateMySQL_PinsSQLMode is the #786 acceptance test: the MySQL preamble
+// must pin a permissive sql_mode BEFORE the reversal statements, and that mode
+// must NOT include NO_BACKSLASH_ESCAPES (EscapeString uses backslash escapes, so
+// it would misparse the literals) nor a strict/NO_ZERO_DATE mode (which would
+// reject captured 0000-00-00 values and abort the apply). PG never emits sql_mode.
+func TestGenerateMySQL_PinsSQLMode(t *testing.T) {
+	row := query.ResultRow{
+		EventID: 1, SchemaName: "db", TableName: "t",
+		EventType: parser.EventInsert, EventTimestamp: time.Unix(0, 0).UTC(),
+		RowAfter: map[string]any{"id": "1"},
+	}
+	const pin = "SET sql_mode = 'NO_ENGINE_SUBSTITUTION';"
+
+	var myBuf bytes.Buffer
+	if _, err := New(nil, nil).GenerateSQLFromRows([]query.ResultRow{row}, &myBuf); err != nil {
+		t.Fatalf("MySQL GenerateSQLFromRows: %v", err)
+	}
+	out := myBuf.String()
+	if !strings.Contains(out, pin) {
+		t.Errorf("MySQL script must contain %q, got:\n%s", pin, out)
+	}
+	for _, banned := range []string{"NO_BACKSLASH_ESCAPES", "NO_ZERO_DATE", "STRICT_"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("MySQL sql_mode pin must NOT include %q, got:\n%s", banned, out)
+		}
+	}
+	// The pin must precede the reversal statement so the mode is active when the
+	// literals are parsed.
+	pinAt := strings.Index(out, pin)
+	stmtAt := strings.Index(out, "DELETE FROM")
+	if stmtAt < 0 {
+		t.Fatalf("expected a DELETE reversal statement, got:\n%s", out)
+	}
+	if pinAt < 0 || pinAt > stmtAt {
+		t.Errorf("sql_mode pin (index %d) must come before the reversal statement (index %d), got:\n%s", pinAt, stmtAt, out)
+	}
+
+	var pgBuf bytes.Buffer
+	if _, err := NewForDialect(nil, nil, PostgresDialect).GenerateSQLFromRows([]query.ResultRow{row}, &pgBuf); err != nil {
+		t.Fatalf("PG GenerateSQLFromRows: %v", err)
+	}
+	if strings.Contains(pgBuf.String(), "sql_mode") {
+		t.Errorf("PG script must NOT emit a sql_mode pin, got:\n%s", pgBuf.String())
+	}
+}
+
 // ─── FormatSetNullRestore ────────────────────────────────────────────────────
 
 func TestFormatSetNullRestore_singlePKIntValue(t *testing.T) {
