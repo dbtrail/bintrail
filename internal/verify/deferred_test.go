@@ -17,7 +17,13 @@ func TestIsDeferredType(t *testing.T) {
 	deferred := []string{
 		"enum", "set", "json",
 		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit",
-		"BLOB", "Enum", // case-insensitive
+		// #793: spatial family + VECTOR — binary (WKB / packed floats) in the
+		// event image, same base64-vs-raw gap as BLOB, so they must defer to
+		// Inconclusive rather than report a conclusive false-MISMATCH.
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon", "geometrycollection",
+		"vector",
+		"BLOB", "Enum", "GEOMETRY", // case-insensitive
 	}
 	for _, dt := range deferred {
 		if !isDeferredType(dt) {

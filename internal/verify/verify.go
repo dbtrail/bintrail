@@ -279,7 +279,9 @@ func hasDeferredRepr(cols []metadata.ColumnMeta) bool {
 // isDeferredType reports whether a column's event-image representation can differ
 // from how the baseline/source renders it in a way this version doesn't yet
 // normalize: ENUM/SET (ordinal vs label), JSON (MySQL-canonical text), binary
-// families (base64 in the event image vs raw bytes), BIT.
+// families (base64 in the event image vs raw bytes), BIT, and the spatial and
+// VECTOR types — whose values are binary (WKB / packed floats) in the event
+// image and so carry the same base64-vs-raw representation gap as BLOB (#793).
 //
 // TEXT is deliberately NOT here, despite being decoded by the same
 // DecodeEventBinaries call as BLOB (#672): once decoded, a TEXT value is just
@@ -294,7 +296,12 @@ func hasDeferredRepr(cols []metadata.ColumnMeta) bool {
 func isDeferredType(dataType string) bool {
 	switch strings.ToLower(dataType) {
 	case "enum", "set", "json",
-		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit":
+		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit",
+		// Spatial family (DATA_TYPE as reported by information_schema.COLUMNS)
+		// plus MySQL 9.0+ VECTOR: binary in the event image, no normalization yet.
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon", "geometrycollection",
+		"vector":
 		return true
 	}
 	return false
