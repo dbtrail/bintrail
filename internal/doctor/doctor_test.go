@@ -409,6 +409,33 @@ func TestCheckBinlogRetentionRDS(t *testing.T) {
 	}
 }
 
+// TestCheckBinlogRetentionRDSProbeError pins #812's silent-failure fix: a
+// permission/transient error reading mysql.rds_configuration must surface as WARN,
+// never be laundered into "not RDS" and fall through to the engine-variable PASS.
+func TestCheckBinlogRetentionRDSProbeError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	// A permission error (1142), not 1146 no-such-table: the check must WARN and
+	// must NOT fall through to the standard @@binlog_expire_logs_seconds probe
+	// (none is registered, so ExpectationsWereMet catches a stray one).
+	mock.ExpectQuery("mysql.rds_configuration").
+		WillReturnError(&mysql.MySQLError{Number: 1142, Message: "SELECT command denied to user 'x'@'%' for table 'rds_configuration'"})
+
+	got := checkBinlogRetention(t.Context(), db)
+	if got.Status != StatusWarn {
+		t.Errorf("Status = %q, want WARN (a permission error must not become a PASS)", got.Status)
+	}
+	if !strings.Contains(got.Detail, "could not read mysql.rds_configuration") {
+		t.Errorf("Detail = %q, want it to surface the probe error", got.Detail)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (did it fall through to the engine probe?): %v", err)
+	}
+}
+
 // TestCheckServerIDCollision pins #819: the check WARNs when the server-id
 // derived from --source-dsn equals the source's own @@server_id, PASSes
 // otherwise, and stays advisory (never FAIL). Read/parse failures degrade to

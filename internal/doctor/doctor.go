@@ -321,7 +321,19 @@ func checkBinlogRetention(ctx context.Context, db *sql.DB) CheckResult {
 	// paint a green PASS while RDS purges binlogs as soon as replication no
 	// longer needs them — #812). When that row is queryable, base the verdict
 	// on it. Absent table/row (non-RDS) → fall through to the standard probe.
-	if raw, isRDS := rdsBinlogRetentionHours(ctx, db); isRDS {
+	if raw, isRDS, probeErr := rdsBinlogRetentionHours(ctx, db); probeErr != nil {
+		// A permission/transient failure reading mysql.rds_configuration must not
+		// be laundered into "not RDS" (which would fall through to the engine
+		// variable and paint a misleading PASS). Surface it.
+		return CheckResult{
+			Name:   "Binlog retention >= 2 days",
+			Status: StatusWarn,
+			Detail: "could not read mysql.rds_configuration ('binlog retention hours'): " + probeErr.Error() +
+				" — if this is RDS/Aurora, the engine variable below can overstate the real retention",
+			Remediation: "On RDS/Aurora, grant the check user read access so bintrail can verify the managed retention:\n\n" +
+				"  GRANT SELECT ON mysql.rds_configuration TO '<user>'@'%';",
+		}
+	} else if isRDS {
 		return rdsBinlogRetentionVerdict("Binlog retention >= 2 days", raw)
 	}
 
@@ -390,21 +402,30 @@ func checkBinlogRetention(ctx context.Context, db *sql.DB) CheckResult {
 }
 
 // rdsBinlogRetentionHours reads the RDS/Aurora-managed binlog retention from
-// mysql.rds_configuration. isRDS is true only when that row is queryable (the
-// table exists AND the 'binlog retention hours' row is present) — the signal
-// that this is an RDS/Aurora source whose retention is governed here rather
-// than by the engine variable (#812). On RDS the value is NULL by default
-// (raw.Valid == false), which still means isRDS=true so the caller can WARN.
-// Any scan error (1146 no-such-table on a self-managed server, sql.ErrNoRows,
-// or a permission/transient failure) → isRDS=false, so the caller falls back
-// to the standard @@binlog_expire_logs_seconds probe.
-func rdsBinlogRetentionHours(ctx context.Context, db *sql.DB) (raw sql.NullString, isRDS bool) {
+// mysql.rds_configuration, distinguishing three outcomes so a permission failure
+// is never mistaken for "not RDS" (#812):
+//   - row read (value may be NULL, the RDS default) → isRDS=true, probeErr=nil.
+//   - sql.ErrNoRows (table exists, row unset) → still RDS → isRDS=true so the
+//     caller WARNs rather than trusting the engine variable.
+//   - 1146 no-such-table → a self-managed server, genuinely not RDS → isRDS=false.
+//   - any other error (1142 permission, transient) → probeErr set, so the caller
+//     surfaces it instead of falling back to the misleading engine-variable PASS.
+func rdsBinlogRetentionHours(ctx context.Context, db *sql.DB) (raw sql.NullString, isRDS bool, probeErr error) {
 	var v sql.NullString
-	if err := db.QueryRowContext(ctx,
-		"SELECT value FROM mysql.rds_configuration WHERE name = 'binlog retention hours'").Scan(&v); err != nil {
-		return sql.NullString{}, false
+	err := db.QueryRowContext(ctx,
+		"SELECT value FROM mysql.rds_configuration WHERE name = 'binlog retention hours'").Scan(&v)
+	switch {
+	case err == nil:
+		return v, true, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return sql.NullString{}, true, nil
+	default:
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1146 {
+			return sql.NullString{}, false, nil
+		}
+		return sql.NullString{}, false, err
 	}
-	return v, true
 }
 
 // rdsBinlogRetentionVerdict turns the RDS-managed 'binlog retention hours'
