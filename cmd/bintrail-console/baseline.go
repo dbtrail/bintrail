@@ -160,8 +160,15 @@ func runMydumper(ctx context.Context, sourceDSN string, schemas []string, dumpDi
 		return err
 	}
 
-	args := buildConsoleMydumperArgs(host, port, user, password, schemas, dumpDir)
+	args := buildConsoleMydumperArgs(host, port, user, schemas, dumpDir)
 	cmd := exec.CommandContext(ctx, "mydumper", args...)
+	// Deliver the source password out of band via MYSQL_PWD (honored by the
+	// MySQL client library mydumper links against) so it never lands on argv,
+	// where it would be world-readable in `ps aux` / /proc/<pid>/cmdline. The
+	// child's /proc/<pid>/environ is mode 0400 (#811).
+	if password != "" {
+		cmd.Env = append(os.Environ(), "MYSQL_PWD="+password)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if msg := strings.TrimSpace(string(out)); msg != "" {
@@ -188,7 +195,11 @@ const systemSchemaExcludeRegex = `^(?!(mysql|sys|performance_schema|information_
 // Schema selection: single → --database; multiple → an anchored --regex; none →
 // every user schema with the system schemas excluded. Extracted for unit testing
 // without a live mydumper.
-func buildConsoleMydumperArgs(host string, port uint16, user, password string, schemas []string, dumpDir string) []string {
+//
+// The source password is NEVER placed on argv (world-readable via `ps aux` /
+// /proc/<pid>/cmdline); runMydumper delivers it via MYSQL_PWD in the child env
+// (#811).
+func buildConsoleMydumperArgs(host string, port uint16, user string, schemas []string, dumpDir string) []string {
 	args := []string{
 		"--host", host,
 		"--port", strconv.Itoa(int(port)),
@@ -197,9 +208,6 @@ func buildConsoleMydumperArgs(host string, port uint16, user, password string, s
 		"--compress-protocol",
 		"--complete-insert",
 		"--sync-thread-lock-mode", "NO_LOCK", "--trx-tables",
-	}
-	if password != "" {
-		args = append(args, "--password", password)
 	}
 	switch {
 	case len(schemas) == 1:

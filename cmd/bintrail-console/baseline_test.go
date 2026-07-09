@@ -1,20 +1,24 @@
 package main
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 )
 
 // TestBuildConsoleMydumperArgs covers the schema-filter branches and the
-// invariants the dump relies on: a password only when present, and --outputdir
-// last (docker wrappers read the final arg as the mount path).
+// invariants the dump relies on: --outputdir last (docker wrappers read the
+// final arg as the mount path) and — the #811 guard — that the password never
+// appears on argv (runMydumper delivers it via MYSQL_PWD in the child env).
 func TestBuildConsoleMydumperArgs(t *testing.T) {
 	t.Run("consistent lock-free flags always present", func(t *testing.T) {
 		// These let a least-privilege replication user (no RELOAD/FLUSH_TABLES)
 		// dump consistently — verified against a real Percona 8.0 source. Their
 		// absence is the bug that produced a schema-only dump.
-		args := buildConsoleMydumperArgs("h", 3306, "u", "pw", []string{"x"}, "/out")
+		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"x"}, "/out")
 		if valueAfter(args, "--sync-thread-lock-mode") != "NO_LOCK" {
 			t.Errorf("missing --sync-thread-lock-mode NO_LOCK: %v", args)
 		}
@@ -24,7 +28,7 @@ func TestBuildConsoleMydumperArgs(t *testing.T) {
 	})
 
 	t.Run("no schema filter excludes system schemas", func(t *testing.T) {
-		args := buildConsoleMydumperArgs("h", 3306, "u", "pw", nil, "/out")
+		args := buildConsoleMydumperArgs("h", 3306, "u", nil, "/out")
 		if has(args, "--database") {
 			t.Errorf("no schema filter must not use --database: %v", args)
 		}
@@ -37,7 +41,7 @@ func TestBuildConsoleMydumperArgs(t *testing.T) {
 	})
 
 	t.Run("single schema uses --database", func(t *testing.T) {
-		args := buildConsoleMydumperArgs("h", 3306, "u", "pw", []string{"wordpress"}, "/out")
+		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"wordpress"}, "/out")
 		if v := valueAfter(args, "--database"); v != "wordpress" {
 			t.Errorf("--database = %q, want wordpress: %v", v, args)
 		}
@@ -47,7 +51,7 @@ func TestBuildConsoleMydumperArgs(t *testing.T) {
 	})
 
 	t.Run("multiple schemas use anchored --regex", func(t *testing.T) {
-		args := buildConsoleMydumperArgs("h", 3306, "u", "pw", []string{"a", "b"}, "/out")
+		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"a", "b"}, "/out")
 		if v := valueAfter(args, "--regex"); v != "^(a|b)\\." {
 			t.Errorf("--regex = %q, want ^(a|b)\\. : %v", v, args)
 		}
@@ -56,19 +60,65 @@ func TestBuildConsoleMydumperArgs(t *testing.T) {
 		}
 	})
 
-	t.Run("empty password omits --password", func(t *testing.T) {
-		args := buildConsoleMydumperArgs("h", 3306, "u", "", nil, "/out")
-		if has(args, "--password") {
-			t.Errorf("empty password must not add --password: %v", args)
+	t.Run("password never appears on argv (#811)", func(t *testing.T) {
+		for _, schemas := range [][]string{nil, {"wordpress"}, {"a", "b"}} {
+			args := buildConsoleMydumperArgs("h", 3306, "u", schemas, "/out")
+			if has(args, "--password") {
+				t.Errorf("schemas=%v: --password must never appear on argv: %v", schemas, args)
+			}
 		}
 	})
+}
 
-	t.Run("password present adds --password", func(t *testing.T) {
-		args := buildConsoleMydumperArgs("h", 3306, "u", "secret", nil, "/out")
-		if v := valueAfter(args, "--password"); v != "secret" {
-			t.Errorf("--password = %q, want secret", v)
+// TestRunMydumper_deliversPasswordViaEnvNotArgv is the end-to-end regression
+// guard for #811: the console's in-process dump passes the source password to
+// mydumper as MYSQL_PWD, never on argv (world-readable via ps aux / cmdline).
+func TestRunMydumper_deliversPasswordViaEnvNotArgv(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(dir, "record.txt")
+	t.Setenv("BINTRAIL_TEST_RECORD", record)
+
+	// Fake `mydumper` resolved via PATH. Uses only bash builtins (printf,
+	// redirection) so it needs nothing else on PATH.
+	fakeBin := filepath.Join(dir, "mydumper")
+	script := `#!/bin/bash
+printf 'ARGS: %s\n' "$*" > "$BINTRAIL_TEST_RECORD"
+printf 'MYSQL_PWD=%s\n' "$MYSQL_PWD" >> "$BINTRAIL_TEST_RECORD"
+exit 0
+`
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mydumper: %v", err)
+	}
+	t.Setenv("PATH", dir)
+
+	const pw = "consolesecretpw"
+	err := runMydumper(context.Background(), "root:"+pw+"@tcp(127.0.0.1:3306)/", nil, filepath.Join(dir, "out"))
+	if err != nil {
+		t.Fatalf("runMydumper: %v", err)
+	}
+
+	data, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	var argsLine, pwdLine string
+	for _, line := range strings.Split(string(data), "\n") {
+		switch {
+		case strings.HasPrefix(line, "ARGS: "):
+			argsLine = line
+		case strings.HasPrefix(line, "MYSQL_PWD="):
+			pwdLine = line
 		}
-	})
+	}
+	if strings.Contains(argsLine, pw) {
+		t.Errorf("password leaked onto argv: %q", argsLine)
+	}
+	if strings.Contains(argsLine, "--password") {
+		t.Errorf("--password must not appear on argv: %q", argsLine)
+	}
+	if pwdLine != "MYSQL_PWD="+pw {
+		t.Errorf("password not delivered via MYSQL_PWD env: got %q", pwdLine)
+	}
 }
 
 func has(args []string, flag string) bool { return slices.Contains(args, flag) }
