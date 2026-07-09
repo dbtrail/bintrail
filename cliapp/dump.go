@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
@@ -25,8 +26,11 @@ var dumpCmd = &cobra.Command{
 	Use:   "dump",
 	Short: "Invoke mydumper to create a logical dump of the source MySQL instance",
 	Long: `Invokes mydumper to create a logical dump of the source MySQL instance.
-Only one dump may run at a time (enforced by a lockfile). Any existing output
-directory is removed before the dump begins.`,
+Only one dump may run at a time (enforced by a lockfile). Source connectivity is
+verified before the output directory is touched. An existing output directory is
+only cleared when it is empty or a recognizable prior dump — a recognizable prior
+dump is moved aside and restored if this dump fails; a non-empty directory that
+is not a dump is refused rather than deleted.`,
 	RunE: runDump,
 }
 
@@ -204,6 +208,14 @@ func runDump(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// 2b. Validate source connectivity BEFORE the output directory is touched.
+	// A wrong host/port/credential (or an unreachable server) must fail here —
+	// never after the previous, only-good dump has already been destroyed
+	// (#809). Injectable via pingSource so unit tests can stub it.
+	if err := pingSource(dmpSourceDSN); err != nil {
+		return fmt.Errorf("cannot connect to source; refusing to touch --output-dir %q: %w", dmpOutputDir, err)
+	}
+
 	// 3. Parse schema and table filters.
 	schemas := cliutil.ParseSchemaList(dmpSchemas)
 	tables := cliutil.ParseSchemaList(dmpTables)
@@ -215,10 +227,25 @@ func runDump(cmd *cobra.Command, args []string) error {
 	}
 	defer releaseDumpLock(lockFile)
 
-	// 5. Remove existing output directory.
-	if err := os.RemoveAll(dmpOutputDir); err != nil {
-		return fmt.Errorf("failed to remove existing output directory %q: %w", dmpOutputDir, err)
+	// 5. Safely prepare the output directory (#809). Refuse to delete a
+	// non-empty directory that is not a recognizable prior mydumper/bintrail
+	// dump — a typo'd --output-dir (or a stray BINTRAIL_OUTPUT_DIR in a sibling
+	// .bintrail.env) must never wipe an arbitrary tree, including baselines
+	// that reconstruct/verify depend on. A recognizable prior dump is moved
+	// aside (dir → dir.old) and only deleted once THIS dump succeeds, so a
+	// failed dump restores the previous (only-good) output.
+	prep, err := prepareDumpOutputDir(dmpOutputDir)
+	if err != nil {
+		return err
 	}
+	dumpSucceeded := false
+	defer func() {
+		if dumpSucceeded {
+			prep.commit()
+		} else {
+			prep.rollback()
+		}
+	}()
 
 	// 6. Probe mydumper version and build args.
 	// --sync-thread-lock-mode and --trx-tables require mydumper >= 0.18 (see
@@ -304,6 +331,9 @@ func runDump(cmd *cobra.Command, args []string) error {
 	}
 
 	slog.Info("dump complete", "output_dir", dmpOutputDir)
+	// The dump succeeded: the deferred cleanup may now delete the moved-aside
+	// previous dump (dir.old) instead of restoring it (#809).
+	dumpSucceeded = true
 
 	// Best-effort: a write failure here just means baseline conversion falls
 	// back to mydumper's own (TZ-sensitive) "Started dump at" line rather
@@ -319,6 +349,128 @@ func runDump(cmd *cobra.Command, args []string) error {
 		}{OutputDir: dmpOutputDir})
 	}
 	return nil
+}
+
+// pingSource validates connectivity to the source before the dump does anything
+// destructive to --output-dir. It is a variable so tests can stub it without a
+// live server (mirroring dumpLockDir). #809.
+var pingSource = defaultPingSource
+
+// defaultPingSource opens and pings the source, then closes. The DSN's default
+// database is stripped: mydumper connects at the server level (it selects no
+// default schema and derives the dump set from --database/--regex/--tables-list),
+// so a database component that go-sql-driver would try to USE must not cause a
+// false "cannot connect" that blocks an otherwise-valid dump.
+func defaultPingSource(dsn string) error {
+	cfg, err := drivermysql.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("invalid --source-dsn: %w", err)
+	}
+	cfg.DBName = ""
+	db, err := config.Connect(cfg.FormatDSN())
+	if err != nil {
+		return err
+	}
+	return db.Close()
+}
+
+// dumpDirMarkers are filenames whose presence in a non-empty --output-dir marks
+// it as a recognizable prior mydumper/bintrail dump — safe to clear. mydumper
+// writes "metadata" on success and "metadata.partial" while running or after a
+// crash; `bintrail dump` adds its own started-at sidecar.
+var dumpDirMarkers = []string{"metadata", "metadata.partial", baseline.StartedAtMarkerFile}
+
+// looksLikeDumpDir reports whether the directory listing carries any marker that
+// identifies it as a prior mydumper/bintrail dump (#809).
+func looksLikeDumpDir(entries []os.DirEntry) bool {
+	for _, e := range entries {
+		name := e.Name()
+		for _, m := range dumpDirMarkers {
+			if name == m {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// dumpDirPrep records how the output directory was prepared so the caller can
+// commit (delete the moved-aside previous dump) on success or roll back
+// (restore it) on failure. When backup is empty, nothing was moved aside — the
+// directory was absent or already empty — and commit/rollback are no-ops.
+type dumpDirPrep struct {
+	dir    string // the requested --output-dir
+	backup string // where a recognizable prior dump was moved (dir.old), or ""
+}
+
+// prepareDumpOutputDir readies --output-dir for a fresh dump without ever
+// unconditionally deleting it (#809). An absent or empty directory needs no
+// preparation. A non-empty directory that is NOT a recognizable prior dump is
+// REFUSED (no deletion) with an actionable error. A recognizable prior dump is
+// moved aside to dir.old so a failed dump can restore it; commit() deletes the
+// backup only once the new dump succeeds.
+func prepareDumpOutputDir(dir string) (*dumpDirPrep, error) {
+	info, err := os.Stat(dir)
+	if os.IsNotExist(err) {
+		return &dumpDirPrep{dir: dir}, nil // mydumper creates it
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat --output-dir %q: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("--output-dir %q exists and is not a directory; "+
+			"remove it yourself or point --output-dir elsewhere", dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read --output-dir %q: %w", dir, err)
+	}
+	if len(entries) == 0 {
+		return &dumpDirPrep{dir: dir}, nil // empty: mydumper writes into it
+	}
+	if !looksLikeDumpDir(entries) {
+		return nil, fmt.Errorf("--output-dir %q is not empty and does not look like a prior "+
+			"bintrail/mydumper dump (no %q marker); refusing to delete it. "+
+			"Remove it yourself or point --output-dir elsewhere", dir, dumpDirMarkers[0])
+	}
+	// Recognizable prior dump: move it aside so a failed dump can restore it.
+	backup := filepath.Clean(dir) + ".old"
+	if err := os.RemoveAll(backup); err != nil {
+		return nil, fmt.Errorf("clear stale dump backup %q: %w", backup, err)
+	}
+	if err := os.Rename(dir, backup); err != nil {
+		return nil, fmt.Errorf("move existing dump %q aside to %q: %w", dir, backup, err)
+	}
+	return &dumpDirPrep{dir: dir, backup: backup}, nil
+}
+
+// commit finalizes a successful dump by deleting the moved-aside previous dump.
+// Best-effort: a leftover backup is a warning, not a failure of the dump.
+func (p *dumpDirPrep) commit() {
+	if p == nil || p.backup == "" {
+		return
+	}
+	if err := os.RemoveAll(p.backup); err != nil {
+		slog.Warn("dump succeeded but could not remove the previous dump's backup",
+			"backup", p.backup, "error", err)
+	}
+}
+
+// rollback restores the previous dump after a failed dump: it removes whatever
+// partial output the failed dump left, then renames the backup back into place.
+func (p *dumpDirPrep) rollback() {
+	if p == nil || p.backup == "" {
+		return
+	}
+	if err := os.RemoveAll(p.dir); err != nil {
+		slog.Warn("dump failed; could not remove partial output before restoring the previous dump — "+
+			"it remains at the backup path", "dir", p.dir, "backup", p.backup, "error", err)
+		return
+	}
+	if err := os.Rename(p.backup, p.dir); err != nil {
+		slog.Warn("dump failed; could not restore the previous dump from its backup — "+
+			"it remains at the backup path", "backup", p.backup, "dir", p.dir, "error", err)
+	}
 }
 
 // mydumperVersion runs `<path> --version` and parses the version triple via

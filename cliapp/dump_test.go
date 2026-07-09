@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/dbtrail/dbtrail/internal/baseline"
 )
 
 // ─── Cobra command wiring ─────────────────────────────────────────────────────
@@ -576,6 +578,7 @@ exit 1
 	dmpSourceDSN = "root:rootpw@tcp(127.0.0.1:3306)/"
 	dmpOutputDir = filepath.Join(dir, "out")
 	dmpFormat = "text"
+	stubPingSource(t)
 
 	dumpCmd.SetContext(context.Background())
 	err := runDump(dumpCmd, nil)
@@ -1002,6 +1005,7 @@ exit 0
 	dmpSourceDSN = "root:" + pw + "@tcp(127.0.0.1:3306)/"
 	dmpOutputDir = filepath.Join(dir, "out")
 	dmpFormat = "text"
+	stubPingSource(t)
 
 	dumpCmd.SetContext(context.Background())
 	if err := runDump(dumpCmd, nil); err != nil {
@@ -1030,6 +1034,180 @@ exit 0
 	if pwdLine != "MYSQL_PWD="+pw {
 		t.Errorf("password not delivered via MYSQL_PWD env: got %q", pwdLine)
 	}
+}
+
+// ─── #809: destructive-op guard on --output-dir ───────────────────────────────
+
+// stubPingSource replaces the source connectivity check with a no-op for the
+// duration of the test, so end-to-end runDump tests using a fake mydumper do
+// not require a live MySQL on 127.0.0.1:3306.
+func stubPingSource(t *testing.T) {
+	t.Helper()
+	saved := pingSource
+	pingSource = func(string) error { return nil }
+	t.Cleanup(func() { pingSource = saved })
+}
+
+func TestLooksLikeDumpDir(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+		want  bool
+	}{
+		{"metadata", []string{"metadata", "db.t.00000.sql"}, true},
+		{"metadata_partial", []string{"metadata.partial", "db.t-schema.sql"}, true},
+		{"bintrail_marker", []string{baseline.StartedAtMarkerFile}, true},
+		{"only_data_no_marker", []string{"db.t.00000.sql", "db-schema-create.sql"}, false},
+		{"unrelated_tree", []string{"ibdata1", "mysql", "important.txt"}, false},
+		{"empty", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range tc.files {
+				if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644); err != nil {
+					t.Fatalf("write %s: %v", f, err)
+				}
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("ReadDir: %v", err)
+			}
+			if got := looksLikeDumpDir(entries); got != tc.want {
+				t.Errorf("looksLikeDumpDir(%v) = %v, want %v", tc.files, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPrepareDumpOutputDir_refusesNonDumpDir is the core #809 guard: a non-empty
+// directory that is not a recognizable prior dump must be REFUSED with nothing
+// deleted — protecting an arbitrary tree hit by a typo'd --output-dir.
+func TestPrepareDumpOutputDir_refusesNonDumpDir(t *testing.T) {
+	dir := t.TempDir()
+	precious := filepath.Join(dir, "important.txt")
+	if err := os.WriteFile(precious, []byte("do not delete"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	prep, err := prepareDumpOutputDir(dir)
+	if err == nil {
+		t.Fatal("expected refusal for a non-dump non-empty directory, got nil")
+	}
+	if prep != nil {
+		t.Errorf("expected nil prep on refusal, got %+v", prep)
+	}
+	if !strings.Contains(err.Error(), "refusing to delete") {
+		t.Errorf("error should tell the user we refuse to delete, got: %v", err)
+	}
+	// Nothing was deleted.
+	if _, statErr := os.Stat(precious); statErr != nil {
+		t.Errorf("guard deleted a non-dump directory's contents: %v", statErr)
+	}
+}
+
+// TestPrepareDumpOutputDir_movesRecognizedDump verifies a recognizable prior
+// dump is moved aside (not deleted), and that commit deletes the backup while
+// rollback restores it.
+func TestPrepareDumpOutputDir_movesRecognizedDump(t *testing.T) {
+	t.Run("commit_deletes_backup", func(t *testing.T) {
+		dir := t.TempDir()
+		out := filepath.Join(dir, "out")
+		if err := os.MkdirAll(out, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(out, "metadata"), []byte("old"), 0o644); err != nil {
+			t.Fatalf("seed metadata: %v", err)
+		}
+
+		prep, err := prepareDumpOutputDir(out)
+		if err != nil {
+			t.Fatalf("prepareDumpOutputDir: %v", err)
+		}
+		if prep.backup == "" {
+			t.Fatal("expected a backup path for a recognized prior dump")
+		}
+		// The prior dump was moved aside, not deleted.
+		if _, statErr := os.Stat(filepath.Join(prep.backup, "metadata")); statErr != nil {
+			t.Errorf("prior dump not preserved in backup: %v", statErr)
+		}
+		if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+			t.Errorf("expected original dir moved away, stat err = %v", statErr)
+		}
+
+		// Simulate a fresh successful dump, then commit.
+		if err := os.MkdirAll(out, 0o755); err != nil {
+			t.Fatalf("recreate out: %v", err)
+		}
+		prep.commit()
+		if _, statErr := os.Stat(prep.backup); !os.IsNotExist(statErr) {
+			t.Errorf("commit should have removed the backup, stat err = %v", statErr)
+		}
+	})
+
+	t.Run("rollback_restores_previous_dump", func(t *testing.T) {
+		dir := t.TempDir()
+		out := filepath.Join(dir, "out")
+		if err := os.MkdirAll(out, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(out, "metadata"), []byte("old-good"), 0o644); err != nil {
+			t.Fatalf("seed metadata: %v", err)
+		}
+
+		prep, err := prepareDumpOutputDir(out)
+		if err != nil {
+			t.Fatalf("prepareDumpOutputDir: %v", err)
+		}
+		// Simulate a failed dump that left partial output.
+		if err := os.MkdirAll(out, 0o755); err != nil {
+			t.Fatalf("recreate out: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(out, "metadata.partial"), []byte("junk"), 0o644); err != nil {
+			t.Fatalf("seed partial: %v", err)
+		}
+		prep.rollback()
+
+		// The previous good dump is back, and the backup is gone.
+		got, readErr := os.ReadFile(filepath.Join(out, "metadata"))
+		if readErr != nil {
+			t.Fatalf("previous dump not restored: %v", readErr)
+		}
+		if string(got) != "old-good" {
+			t.Errorf("restored metadata = %q, want %q", got, "old-good")
+		}
+		if _, statErr := os.Stat(filepath.Join(out, "metadata.partial")); !os.IsNotExist(statErr) {
+			t.Errorf("partial output should have been discarded, stat err = %v", statErr)
+		}
+		if _, statErr := os.Stat(prep.backup); !os.IsNotExist(statErr) {
+			t.Errorf("backup should be consumed by rollback, stat err = %v", statErr)
+		}
+	})
+}
+
+// TestPrepareDumpOutputDir_happyPaths verifies the non-destructive fast paths:
+// an absent or empty directory needs no preparation and yields no backup.
+func TestPrepareDumpOutputDir_happyPaths(t *testing.T) {
+	t.Run("absent", func(t *testing.T) {
+		out := filepath.Join(t.TempDir(), "does-not-exist")
+		prep, err := prepareDumpOutputDir(out)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if prep.backup != "" {
+			t.Errorf("expected no backup for an absent dir, got %q", prep.backup)
+		}
+	})
+	t.Run("empty", func(t *testing.T) {
+		out := t.TempDir() // exists and empty
+		prep, err := prepareDumpOutputDir(out)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if prep.backup != "" {
+			t.Errorf("expected no backup for an empty dir, got %q", prep.backup)
+		}
+	})
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
