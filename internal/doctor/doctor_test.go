@@ -2,12 +2,14 @@ package doctor
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-sql-driver/mysql"
@@ -168,7 +170,7 @@ func TestEveryFailCheckCarriesRemediation(t *testing.T) {
 		{
 			name:  "checkLogBin/query error",
 			setup: func(m sqlmock.Sqlmock) { m.ExpectQuery("SELECT @@log_bin").WillReturnError(forcedErr) },
-			run:   func(db sqlDB) CheckResult { return checkLogBin(db) },
+			run:   func(db sqlDB) CheckResult { return checkLogBin(ctx, db) },
 		},
 		{
 			name:  "checkReplicationGrants/SHOW GRANTS error",
@@ -266,7 +268,7 @@ func TestCheckLogBin(t *testing.T) {
 				exp.WillReturnRows(sqlmock.NewRows([]string{"@@log_bin"}).AddRow(tt.returnVal))
 			}
 
-			got := checkLogBin(db)
+			got := checkLogBin(t.Context(), db)
 			if got.Status != tt.wantStatus {
 				t.Errorf("Status = %q, want %q", got.Status, tt.wantStatus)
 			}
@@ -324,7 +326,7 @@ func TestCheckBinlogRetention(t *testing.T) {
 				tt.legacy.apply(lexpect, "@@expire_logs_days")
 			}
 
-			got := checkBinlogRetention(db)
+			got := checkBinlogRetention(t.Context(), db)
 			if got.Status != tt.wantStatus {
 				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
 			}
@@ -369,7 +371,7 @@ func TestCheckSyncBinlog(t *testing.T) {
 			exp := mock.ExpectQuery("SELECT @@sync_binlog")
 			tt.resp.apply(exp, "@@sync_binlog")
 
-			got := checkSyncBinlog(db)
+			got := checkSyncBinlog(t.Context(), db)
 			if got.Status != tt.wantStatus {
 				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
 			}
@@ -423,7 +425,7 @@ func TestCheckStatementCapture(t *testing.T) {
 				tt.mariaVar.apply(mexp, "@@binlog_annotate_row_events")
 			}
 
-			got := checkStatementCapture(db)
+			got := checkStatementCapture(t.Context(), db)
 			if got.Status != tt.wantStatus {
 				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
 			}
@@ -444,6 +446,84 @@ func TestCheckStatementCapture(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// TestCheckBinlogRowValueOptions pins the #777 advisory check: PASS on the
+// empty default, WARN (never FAIL) on PARTIAL_JSON, SKIP when the variable is
+// absent (MySQL <8.0 / MariaDB), WARN on a transient read failure.
+func TestCheckBinlogRowValueOptions(t *testing.T) {
+	tests := []struct {
+		name            string
+		probe           mockSQLScalar
+		wantStatus      CheckStatus
+		wantDetailFrag  string
+		wantRemediation bool
+	}{
+		{"default empty", row(""), StatusPass, "full JSON row images", false},
+		{"PARTIAL_JSON", row("PARTIAL_JSON"), StatusWarn, `binlog_row_value_options="PARTIAL_JSON"`, true},
+		{"absent variable", mysqlErrResp(1193, "Unknown system variable 'binlog_row_value_options'"), StatusSkip, "not available", false},
+		{"transient read failure", errResp("driver: bad connection"), StatusWarn, "could not read binlog_row_value_options: driver: bad connection", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			exp := mock.ExpectQuery("SELECT @@binlog_row_value_options")
+			tt.probe.apply(exp, "@@binlog_row_value_options")
+
+			got := checkBinlogRowValueOptions(t.Context(), db)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
+			}
+			if tt.wantRemediation && got.Remediation == "" {
+				t.Error("expected remediation but got none")
+			}
+			if got.Status == StatusFail {
+				t.Error("binlog_row_value_options is optional — the check must never FAIL")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+// TestSourceChecksHonorContext pins #813: the source-side probes run their
+// queries under the caller's context, so a stalled source cannot hang doctor
+// indefinitely. With an already-canceled context and a query rigged to block,
+// checkLogBin returns at once (FAIL) instead of waiting on the socket — before
+// the fix these checks used QueryRow (no context) and would block on the delay.
+func TestSourceChecksHonorContext(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT @@log_bin").
+		WillDelayFor(time.Hour).
+		WillReturnRows(sqlmock.NewRows([]string{"@@log_bin"}).AddRow("1"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already canceled: QueryRowContext must return ctx.Err() at once
+
+	done := make(chan CheckResult, 1)
+	go func() { done <- checkLogBin(ctx, db) }()
+	select {
+	case got := <-done:
+		if got.Status != StatusFail {
+			t.Errorf("expected FAIL on a canceled context, got %q (detail=%q)", got.Status, got.Detail)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("checkLogBin ignored the canceled context and blocked on the delayed query — a stalled source would hang doctor")
+	}
+}
 
 // TestCheckRowMetadata pins the #700 advisory check: PASS on FULL, WARN
 // (never FAIL) on MINIMAL, SKIP when the variable does not exist.
@@ -472,7 +552,7 @@ func TestCheckRowMetadata(t *testing.T) {
 			exp := mock.ExpectQuery("SELECT @@binlog_row_metadata")
 			tt.probe.apply(exp, "@@binlog_row_metadata")
 
-			got := checkRowMetadata(db)
+			got := checkRowMetadata(t.Context(), db)
 			if got.Status != tt.wantStatus {
 				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
 			}

@@ -132,13 +132,14 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 	defer sourceDB.Close()
 
 	report.add(checkSourceConnection(ctx, sourceDB))
-	report.add(checkLogBin(sourceDB))
-	report.add(checkBinlogFormat(sourceDB))
-	report.add(checkBinlogRowImage(sourceDB))
-	report.add(checkBinlogRetention(sourceDB))
-	report.add(checkSyncBinlog(sourceDB))
-	report.add(checkStatementCapture(sourceDB))
-	report.add(checkRowMetadata(sourceDB))
+	report.add(checkLogBin(ctx, sourceDB))
+	report.add(checkBinlogFormat(ctx, sourceDB))
+	report.add(checkBinlogRowImage(ctx, sourceDB))
+	report.add(checkBinlogRetention(ctx, sourceDB))
+	report.add(checkSyncBinlog(ctx, sourceDB))
+	report.add(checkStatementCapture(ctx, sourceDB))
+	report.add(checkRowMetadata(ctx, sourceDB))
+	report.add(checkBinlogRowValueOptions(ctx, sourceDB))
 	report.add(checkReplicationGrants(ctx, sourceDB))
 	report.add(checkFKCascades(sourceDB, schemas))
 	report.add(checkSchemaVisibility(ctx, sourceDB, schemas))
@@ -198,9 +199,9 @@ func checkSourceConnection(ctx context.Context, db *sql.DB) CheckResult {
 	}
 }
 
-func checkLogBin(db *sql.DB) CheckResult {
+func checkLogBin(ctx context.Context, db *sql.DB) CheckResult {
 	var val string
-	err := db.QueryRow("SELECT @@log_bin").Scan(&val)
+	err := db.QueryRowContext(ctx, "SELECT @@log_bin").Scan(&val)
 	if err != nil {
 		return CheckResult{
 			Name:        "log_bin enabled",
@@ -224,8 +225,8 @@ func checkLogBin(db *sql.DB) CheckResult {
 	return CheckResult{Name: "log_bin enabled", Status: StatusPass, Detail: "ON"}
 }
 
-func checkBinlogFormat(db *sql.DB) CheckResult {
-	err := metadata.ValidateBinlogFormat(db)
+func checkBinlogFormat(ctx context.Context, db *sql.DB) CheckResult {
+	err := metadata.ValidateBinlogFormatContext(ctx, db)
 	if err != nil {
 		return CheckResult{
 			Name:   "binlog_format=ROW",
@@ -241,8 +242,8 @@ func checkBinlogFormat(db *sql.DB) CheckResult {
 	return CheckResult{Name: "binlog_format=ROW", Status: StatusPass, Detail: "ROW"}
 }
 
-func checkBinlogRowImage(db *sql.DB) CheckResult {
-	err := metadata.ValidateBinlogRowImage(db)
+func checkBinlogRowImage(ctx context.Context, db *sql.DB) CheckResult {
+	err := metadata.ValidateBinlogRowImageContext(ctx, db)
 	if err != nil {
 		return CheckResult{
 			Name:   "binlog_row_image=FULL",
@@ -260,17 +261,52 @@ func checkBinlogRowImage(db *sql.DB) CheckResult {
 	return CheckResult{Name: "binlog_row_image=FULL", Status: StatusPass, Detail: "FULL"}
 }
 
+// checkBinlogRowValueOptions warns when the source sets
+// binlog_row_value_options=PARTIAL_JSON. With that option MySQL logs partial
+// JSON updates (JSON_SET/JSON_REPLACE/JSON_REMOVE) as compact diff fragments in
+// the row image rather than the full column value; bintrail's parser cannot
+// apply those partial diffs and skips the affected JSON updates at runtime with
+// only a log warning — a silent capture gap for JSON columns (#777). Advisory
+// only (WARN, never FAIL): the option is harmless on sources with no
+// partially-updated JSON columns and is the operator's binlog-size tradeoff, but
+// they must know it can drop JSON updates. Absent variable (MySQL <8.0, MariaDB)
+// → SKIP; empty value (the default) → PASS.
+func checkBinlogRowValueOptions(ctx context.Context, db *sql.DB) CheckResult {
+	const name = "binlog_row_value_options (JSON capture)"
+	var val string
+	if err := db.QueryRowContext(ctx, "SELECT @@binlog_row_value_options").Scan(&val); err != nil {
+		// MySQL error 1193 (unknown system variable) means the server predates
+		// the option or is a flavor that lacks it — nothing to check, not a fault.
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1193 {
+			return CheckResult{Name: name, Status: StatusSkip, Detail: "binlog_row_value_options is not available on this server"}
+		}
+		return CheckResult{Name: name, Status: StatusWarn, Detail: "could not read binlog_row_value_options: " + err.Error()}
+	}
+	if strings.Contains(strings.ToUpper(val), "PARTIAL_JSON") {
+		return CheckResult{
+			Name:   name,
+			Status: StatusWarn,
+			Detail: fmt.Sprintf("binlog_row_value_options=%q — partial JSON updates are logged as diffs bintrail cannot apply, so those JSON updates are skipped at capture (silent for JSON columns)", val),
+			Remediation: "Disable partial-JSON binlog logging on the source so JSON updates are captured in full:\n\n" +
+				"  SET PERSIST binlog_row_value_options = '';\n\n" +
+				"This makes JSON UPDATEs log the whole column value (larger binlog) instead of an unappliable partial diff.",
+		}
+	}
+	return CheckResult{Name: name, Status: StatusPass, Detail: "full JSON row images"}
+}
+
 // checkBinlogRetention emits a WARN (not FAIL) when binlog retention is below
 // the 2-day recommendation in docs/streaming.md — short windows can leave
 // bintrail unable to fill gaps after a restart.
-func checkBinlogRetention(db *sql.DB) CheckResult {
+func checkBinlogRetention(ctx context.Context, db *sql.DB) CheckResult {
 	var raw string
 	// binlog_expire_logs_seconds is MySQL 8.0+; older servers use expire_logs_days.
-	err := db.QueryRow("SELECT @@binlog_expire_logs_seconds").Scan(&raw)
+	err := db.QueryRowContext(ctx, "SELECT @@binlog_expire_logs_seconds").Scan(&raw)
 	if err != nil {
 		// Try the legacy variable.
 		var days string
-		if dErr := db.QueryRow("SELECT @@expire_logs_days").Scan(&days); dErr == nil {
+		if dErr := db.QueryRowContext(ctx, "SELECT @@expire_logs_days").Scan(&days); dErr == nil {
 			d, parseErr := strconv.Atoi(days)
 			if parseErr != nil {
 				return CheckResult{
@@ -335,10 +371,10 @@ func checkBinlogRetention(db *sql.DB) CheckResult {
 // because the data never reached the binlog at all. This is advisory only
 // (never FAIL): it is the source operator's durability tradeoff, and the
 // cheapest thing bintrail can do is make sure they know about it.
-func checkSyncBinlog(db *sql.DB) CheckResult {
+func checkSyncBinlog(ctx context.Context, db *sql.DB) CheckResult {
 	const name = "Source sync_binlog=1 (crash-safety)"
 	var val string
-	if err := db.QueryRow("SELECT @@sync_binlog").Scan(&val); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT @@sync_binlog").Scan(&val); err != nil {
 		return CheckResult{
 			Name:   name,
 			Status: StatusWarn,
@@ -368,7 +404,7 @@ func checkSyncBinlog(db *sql.DB) CheckResult {
 // (validate, never set), variable absent on both probes → SKIP. Both probes use
 // SELECT @@var, which errors (MySQL 1193) rather than returning rows for a
 // variable the flavor doesn't have — the checkBinlogRetention fallback pattern.
-func checkStatementCapture(db *sql.DB) CheckResult {
+func checkStatementCapture(ctx context.Context, db *sql.DB) CheckResult {
 	const name = "Statement capture (query_text)"
 	isOn := func(val string) bool { return val == "1" || strings.EqualFold(val, "ON") }
 	// Only MySQL error 1193 (unknown system variable) means the variable is
@@ -380,7 +416,7 @@ func checkStatementCapture(db *sql.DB) CheckResult {
 	}
 
 	var val string
-	err := db.QueryRow("SELECT @@binlog_rows_query_log_events").Scan(&val)
+	err := db.QueryRowContext(ctx, "SELECT @@binlog_rows_query_log_events").Scan(&val)
 	if err == nil {
 		if isOn(val) {
 			return CheckResult{Name: name, Status: StatusPass, Detail: "binlog_rows_query_log_events=ON"}
@@ -404,7 +440,7 @@ func checkStatementCapture(db *sql.DB) CheckResult {
 	// MariaDB names the same capability binlog_annotate_row_events
 	// (default ON since 10.2.4). Note stream capture additionally requires
 	// `--source-flavor mariadb` so the syncer requests ANNOTATE events.
-	err = db.QueryRow("SELECT @@binlog_annotate_row_events").Scan(&val)
+	err = db.QueryRowContext(ctx, "SELECT @@binlog_annotate_row_events").Scan(&val)
 	if err == nil {
 		if isOn(val) {
 			return CheckResult{
@@ -446,10 +482,10 @@ func checkStatementCapture(db *sql.DB) CheckResult {
 // wrong column names. The setting is OPTIONAL, so this check never FAILs:
 // FULL → PASS, MINIMAL → WARN with an enable suggestion (validate, never
 // set), variable absent → SKIP.
-func checkRowMetadata(db *sql.DB) CheckResult {
+func checkRowMetadata(ctx context.Context, db *sql.DB) CheckResult {
 	const name = "Schema-drift detection (binlog_row_metadata)"
 	var val string
-	if err := db.QueryRow("SELECT @@binlog_row_metadata").Scan(&val); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT @@binlog_row_metadata").Scan(&val); err != nil {
 		// Only MySQL error 1193 (unknown system variable) means the server
 		// genuinely lacks the variable (MySQL 5.7, MariaDB <10.5). Any other
 		// failure is a read problem — surface the real error instead of a

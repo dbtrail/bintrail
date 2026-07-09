@@ -1110,8 +1110,14 @@ func validateTables(sourceDB *sql.DB, schemas []string, columns []columnRow) err
 
 // ValidateBinlogFormat checks that the source server has binlog_format=ROW.
 func ValidateBinlogFormat(db *sql.DB) error {
+	return ValidateBinlogFormatContext(context.Background(), db)
+}
+
+// ValidateBinlogFormatContext is ValidateBinlogFormat with a caller-supplied
+// context, so a stalled source cannot hang the probe indefinitely (#813).
+func ValidateBinlogFormatContext(ctx context.Context, db *sql.DB) error {
 	var varName, val string
-	err := db.QueryRow("SHOW VARIABLES LIKE 'binlog_format'").Scan(&varName, &val)
+	err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'binlog_format'").Scan(&varName, &val)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("binlog_format not found on source server")
 	}
@@ -1126,8 +1132,14 @@ func ValidateBinlogFormat(db *sql.DB) error {
 
 // ValidateBinlogRowImage checks that the source server has binlog_row_image=FULL.
 func ValidateBinlogRowImage(db *sql.DB) error {
+	return ValidateBinlogRowImageContext(context.Background(), db)
+}
+
+// ValidateBinlogRowImageContext is ValidateBinlogRowImage with a caller-supplied
+// context (#813).
+func ValidateBinlogRowImageContext(ctx context.Context, db *sql.DB) error {
 	var varName, val string
-	err := db.QueryRow("SHOW VARIABLES LIKE 'binlog_row_image'").Scan(&varName, &val)
+	err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'binlog_row_image'").Scan(&varName, &val)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("binlog_row_image not found on source server; MySQL 5.6+ with binlog_row_image=FULL is required")
 	}
