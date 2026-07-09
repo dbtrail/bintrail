@@ -512,9 +512,39 @@ type flushPipelineState struct {
 	payloadStatus     string // "ok" or "degraded"
 	lastMetadataFlush *time.Time
 	lastPayloadFlush  *time.Time
+
+	// Cumulative counts of events/batches permanently dropped after the
+	// in-process retries were exhausted. There is no on-disk spool yet (see
+	// the follow-up), so a batch that fails all retries is truncated and lost;
+	// these counters are the only durable, monotonic signal that this
+	// happened. The metadataStatus/payloadStatus bools flip back to "ok" on
+	// the next successful flush and erase the memory of the outage — the
+	// counters never reset. Metadata and payload are tracked separately
+	// because the two sinks fail independently: a nonzero skew between them
+	// means the hosted index and the client bucket now disagree about which
+	// row images exist.
+	metadataLostEvents  int64
+	metadataLostBatches int64
+	payloadLostEvents   int64
+	payloadLostBatches  int64
 }
 
-func (s *flushPipelineState) updateFlush(metaOK, payloadOK bool) {
+// flushLossTotals is a snapshot of the cumulative lost-event/lost-batch
+// counters, returned by updateFlush so the caller can log the running total
+// without re-acquiring the lock.
+type flushLossTotals struct {
+	metadataLostEvents  int64
+	metadataLostBatches int64
+	payloadLostEvents   int64
+	payloadLostBatches  int64
+}
+
+// updateFlush records the outcome of a sink flush. metaEvents/payloadEvents
+// are the batch sizes that were attempted; when a sink fails they are added to
+// its cumulative lost-event counter (the batch is dropped without a spool). It
+// returns a snapshot of the cumulative totals so the caller can log the
+// running total on a drop.
+func (s *flushPipelineState) updateFlush(metaOK, payloadOK bool, metaEvents, payloadEvents int) flushLossTotals {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
@@ -523,12 +553,22 @@ func (s *flushPipelineState) updateFlush(metaOK, payloadOK bool) {
 		s.lastMetadataFlush = &now
 	} else {
 		s.metadataStatus = "degraded"
+		s.metadataLostEvents += int64(metaEvents)
+		s.metadataLostBatches++
 	}
 	if payloadOK {
 		s.payloadStatus = "ok"
 		s.lastPayloadFlush = &now
 	} else {
 		s.payloadStatus = "degraded"
+		s.payloadLostEvents += int64(payloadEvents)
+		s.payloadLostBatches++
+	}
+	return flushLossTotals{
+		metadataLostEvents:  s.metadataLostEvents,
+		metadataLostBatches: s.metadataLostBatches,
+		payloadLostEvents:   s.payloadLostEvents,
+		payloadLostBatches:  s.payloadLostBatches,
 	}
 }
 
@@ -547,13 +587,17 @@ func (s *flushPipelineState) toFlushStatus() *agent.FlushStatus {
 	b := s.bufferBytes
 	e := s.sizeEvictions
 	return &agent.FlushStatus{
-		BufferEvents:      &n,
-		BufferBytes:       &b,
-		SizeEvictions:     &e,
-		MetadataStatus:    s.metadataStatus,
-		PayloadStatus:     s.payloadStatus,
-		LastMetadataFlush: s.lastMetadataFlush,
-		LastPayloadFlush:  s.lastPayloadFlush,
+		BufferEvents:        &n,
+		BufferBytes:         &b,
+		SizeEvictions:       &e,
+		MetadataStatus:      s.metadataStatus,
+		PayloadStatus:       s.payloadStatus,
+		LastMetadataFlush:   s.lastMetadataFlush,
+		LastPayloadFlush:    s.lastPayloadFlush,
+		MetadataLostEvents:  s.metadataLostEvents,
+		MetadataLostBatches: s.metadataLostBatches,
+		PayloadLostEvents:   s.payloadLostEvents,
+		PayloadLostBatches:  s.payloadLostBatches,
 	}
 }
 
@@ -823,7 +867,22 @@ func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig
 	}
 
 	if fc.state != nil {
-		fc.state.updateFlush(metaOK, payloadOK)
+		totals := fc.state.updateFlush(metaOK, payloadOK, len(metaBatch), len(payloadBatch))
+		if !metaOK || !payloadOK {
+			// A batch failed all retries and was dropped without a spool —
+			// permanent, irrecoverable loss. Escalate above the per-sink
+			// errors above with the running cumulative totals so the loss is
+			// an observable, monotonic signal rather than a single lost line.
+			slog.Error("BYOS batch dropped after retries — events permanently lost (no on-disk spool)",
+				"metadata_dropped", !metaOK,
+				"payload_dropped", !payloadOK,
+				"batch_events", len(metaBatch),
+				"cumulative_metadata_lost_events", totals.metadataLostEvents,
+				"cumulative_metadata_lost_batches", totals.metadataLostBatches,
+				"cumulative_payload_lost_events", totals.payloadLostEvents,
+				"cumulative_payload_lost_batches", totals.payloadLostBatches,
+				"sink_skew_events", totals.metadataLostEvents-totals.payloadLostEvents)
+		}
 	}
 	return nil
 }
