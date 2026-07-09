@@ -468,6 +468,42 @@ func TestServersAPISourceSecrecy(t *testing.T) {
 	}
 }
 
+// TestServersAPIUpdatePreservesSSL guards the regression the #879 schema change
+// could introduce: source-TLS is hand-edited into the registry YAML (no request
+// field yet), so once it is a TYPED field it no longer round-trips through the
+// Extra catch-all. handleServersUpdate must carry it over from the stored entry
+// or a plain UI edit silently wipes a configured verify-ca / mutual-TLS source.
+func TestServersAPIUpdatePreservesSSL(t *testing.T) {
+	srv := newRegistryServer(t)
+	created, err := srv.cm.reg.Add(ServerEntry{
+		Name:      "prod",
+		DSN:       "u:p@tcp(h:3306)/binlog_index",
+		SourceDSN: "repl:" + secretPW + "@tcp(db.prod:3306)/",
+		SSLMode:   "verify-ca",
+		SSLCA:     "/etc/ssl/ca.pem",
+		SSLCert:   "/etc/ssl/client-cert.pem",
+		SSLKey:    "/etc/ssl/client-key.pem",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An unrelated edit (rename) that carries no ssl_* fields must keep them.
+	rec, body := doServersReq(t, srv, "PUT", "/api/servers/"+created.ID,
+		`{"name":"prod-renamed","host":"h","user":"u","password":"p","dbname":"binlog_index"}`)
+	if rec.Code != 200 {
+		t.Fatalf("update: code=%d body=%s", rec.Code, body)
+	}
+	got, ok := srv.cm.reg.Get(created.ID)
+	if !ok {
+		t.Fatal("entry lost after update")
+	}
+	if got.SSLMode != "verify-ca" || got.SSLCA != "/etc/ssl/ca.pem" ||
+		got.SSLCert != "/etc/ssl/client-cert.pem" || got.SSLKey != "/etc/ssl/client-key.pem" {
+		t.Errorf("source TLS must survive an unrelated edit; got %+v", got)
+	}
+}
+
 func TestBuildSourceDSNValidation(t *testing.T) {
 	pw := "x"
 	cases := []struct {
