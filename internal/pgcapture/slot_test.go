@@ -5,6 +5,26 @@ import (
 	"testing"
 )
 
+func TestMissingPublishedOps(t *testing.T) {
+	cases := []struct {
+		name          string
+		ins, upd, del bool
+		want          string // comma-joined
+	}{
+		{"all published", true, true, true, ""},
+		{"insert only", true, false, false, "update,delete"},
+		{"missing delete", true, true, false, "delete"},
+		{"none published", false, false, false, "insert,update,delete"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := strings.Join(missingPublishedOps(c.ins, c.upd, c.del), ","); got != c.want {
+				t.Errorf("missingPublishedOps(%v,%v,%v) = %q, want %q", c.ins, c.upd, c.del, got, c.want)
+			}
+		})
+	}
+}
+
 func TestRestrictedPublicationError(t *testing.T) {
 	t.Run("empty is nil", func(t *testing.T) {
 		if err := restrictedPublicationError("p", nil); err != nil {

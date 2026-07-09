@@ -21,13 +21,20 @@ import (
 // publication that exists but omits a requested table would emit ZERO events for it,
 // silently and forever, so a coverage gap fails loud.
 func validatePublication(ctx context.Context, conn *pgx.Conn, pubname string, filters event.Filters) error {
-	var allTables bool
-	err := conn.QueryRow(ctx, `SELECT puballtables FROM pg_publication WHERE pubname = $1`, pubname).Scan(&allTables)
+	var allTables, pubIns, pubUpd, pubDel bool
+	err := conn.QueryRow(ctx, `SELECT puballtables, pubinsert, pubupdate, pubdelete FROM pg_publication WHERE pubname = $1`, pubname).Scan(&allTables, &pubIns, &pubUpd, &pubDel)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("pgcapture: publication %q does not exist — create it (CREATE PUBLICATION) covering the tables to capture", pubname)
 	}
 	if err != nil {
 		return fmt.Errorf("pgcapture: checking publication %q: %w", pubname, err)
+	}
+	// Operation completeness applies to EVERY publication shape — even FOR ALL TABLES
+	// can be created WITH (publish = 'insert'), which silently drops updates and deletes.
+	// Check before the allTables short-circuit.
+	if ops := missingPublishedOps(pubIns, pubUpd, pubDel); len(ops) > 0 {
+		return fmt.Errorf("pgcapture: publication %q does not publish %s — those changes would be silently lost; recreate it WITH (publish = 'insert, update, delete') or leave publish unset for all operations",
+			pubname, strings.Join(ops, ", "))
 	}
 	// FOR ALL TABLES covers everything and cannot carry per-table row filters or column
 	// lists (PostgreSQL rejects WHERE/column-lists on FOR ALL TABLES), so it is unambiguously safe.
@@ -156,6 +163,24 @@ func restrictedPublicationError(pubname string, restricted []restrictedTable) er
 	sort.Strings(parts)
 	return fmt.Errorf("pgcapture: publication %q applies a row filter or column list to table(s) [%s] — pgoutput would emit only a SUBSET of changes (filtered rows and unlisted columns are silently dropped, and updates crossing a row filter degrade to spurious INSERT/DELETE); bintrail cannot honor a partial publication — recreate it WITHOUT WHERE(...) / column lists so the full table is captured",
 		pubname, strings.Join(parts, ", "))
+}
+
+// missingPublishedOps returns the row-changing operations (insert/update/delete) a
+// publication does NOT publish. pgoutput emits nothing for an unpublished operation,
+// so bintrail would silently miss those changes. TRUNCATE is excluded deliberately —
+// bintrail does not rely on TRUNCATE row events. Pure, so the decision is unit-testable.
+func missingPublishedOps(ins, upd, del bool) []string {
+	var missing []string
+	if !ins {
+		missing = append(missing, "insert")
+	}
+	if !upd {
+		missing = append(missing, "update")
+	}
+	if !del {
+		missing = append(missing, "delete")
+	}
+	return missing
 }
 
 // validateReplicaIdentity is the PostgreSQL analog of metadata.ValidateBinlogRowImage:
