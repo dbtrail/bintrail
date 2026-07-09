@@ -169,8 +169,10 @@ func (g *Generator) resolverForRow(row query.ResultRow) *metadata.Resolver {
 
 // GenerateSQL fetches events matching opts, reverses their order (most-recent
 // first), and writes a BEGIN/COMMIT-wrapped SQL script to w.
-// Returns the number of SQL statements written (errors within a statement are
-// emitted as SQL comments rather than halting generation).
+// Returns the number of SQL statements written. A per-event generation error
+// (e.g. a malformed/truncated stored row image) makes the whole call refuse
+// up front — nothing is written and a non-nil error is returned (#784) — so a
+// partial reversal is never silently blessed.
 func (g *Generator) GenerateSQL(ctx context.Context, opts query.Options, w io.Writer) (int, error) {
 	rows, err := query.New(g.db).Fetch(ctx, opts)
 	if err != nil {
@@ -232,6 +234,7 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 	var body bytes.Buffer
 	drift := map[string]map[string]bool{} // "schema.table" -> set of drifted columns
 	var driftOrder []string               // table keys in first-seen order, for a stable message
+	var genFailures []genFailure          // per-event generation errors, in first-seen order (#784)
 
 	written := 0
 	for _, row := range rows {
@@ -252,14 +255,16 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 
 		stmt, cols, err := g.buildStatement(row)
 		if err != nil {
-			// Emit error as a SQL comment so the script remains runnable —
-			// this is a MISSING statement, not a guaranteed rollback: a SQL
-			// comment has no effect on the transaction, so the surrounding
-			// BEGIN/COMMIT only rolls back if a REAL statement later in the
-			// script fails at apply time. Review "-- ERROR ..." lines before
-			// applying if completeness matters (see docs/query-and-recovery.md
-			// § Output Format).
+			// Record the failure and keep the "-- ERROR ..." comment in the
+			// buffered body so the diagnosis lists EVERY un-generatable event,
+			// then refuse the whole script below (#784). Demoting the error to a
+			// comment and returning success is a silent incomplete recovery: a
+			// SQL comment has no apply-time effect, so a partial script commits
+			// clean under BEGIN/COMMIT and the operator never learns an event
+			// was skipped. Same fail-loud stance as the schema-drift (#601) and
+			// script-budget (#654) refusals — refuse up front, write nothing.
 			fmt.Fprintf(&body, "-- ERROR generating reversal for event %d: %v\n", row.EventID, err)
+			genFailures = append(genFailures, genFailure{eventID: row.EventID, err: err})
 			continue
 		}
 		if d := g.driftedEmitted(row, cols); len(d) > 0 {
@@ -274,6 +279,14 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 		}
 		fmt.Fprintln(&body, stmt+";")
 		written++
+	}
+
+	// Refuse before a single byte reaches w when any event failed to generate
+	// (#784) — checked ahead of the drift refusal because a nil/malformed row
+	// image is a more fundamental data-integrity problem than a since-renamed
+	// column, and both are fail-loud refusals returning zero statements.
+	if len(genFailures) > 0 {
+		return 0, partialGenerationError(genFailures)
 	}
 
 	if len(driftOrder) > 0 {
@@ -323,6 +336,30 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "COMMIT;")
 	return written, nil
+}
+
+// genFailure records one event that could not be turned into reversal SQL, so
+// partialGenerationError can name every failed event rather than only the first (#784).
+type genFailure struct {
+	eventID uint64
+	err     error
+}
+
+// partialGenerationError builds the fail-loud refusal for #784: one or more matched
+// events could not be reversed (e.g. a nil before/after image from a malformed or
+// truncated stored row), so emitting the remainder would silently commit an INCOMPLETE
+// reversal. It names every failed event and its reason. Same fail-loud stance as the
+// schema-drift (#601) and script-budget (#654) refusals — recover writes nothing and
+// exits non-zero rather than blessing a partial script.
+func partialGenerationError(failures []genFailure) error {
+	parts := make([]string, 0, len(failures))
+	for _, f := range failures {
+		parts = append(parts, fmt.Sprintf("event %d: %v", f.eventID, f.err))
+	}
+	return fmt.Errorf("recover: refusing to emit reversal SQL — %d of the matched event(s) could not be "+
+		"reversed (malformed or truncated stored row image), so the script would be a silently incomplete "+
+		"recovery: %s. Investigate the named event(s); narrow the recovery window (--since/--until, --pk/--pks) "+
+		"to exclude them if they are known-unrecoverable", len(failures), strings.Join(parts, "; "))
 }
 
 // schemaDriftError builds the fail-loud error for #601: the reversal SQL references
