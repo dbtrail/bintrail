@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -129,10 +131,34 @@ func S3ObjectExists(ctx context.Context, client *s3.Client, bucket, key string) 
 	return true, nil
 }
 
+// uploadReader streams body to s3://bucket/key via the AWS SDK managed
+// Uploader. The Uploader transparently switches to a multipart upload for
+// bodies larger than its part size (~5 MiB, retried and checksummed per part)
+// and falls back to a single PutObject for small bodies — so it is a drop-in
+// for a plain PutObject that also handles partitions above S3's 5 GiB
+// single-PUT ceiling (EntityTooLarge). Callers keep their existing
+// signatures; only the transport changes.
+//
+// Note: an interrupted multipart upload can leave orphaned parts in the
+// bucket. Operators should attach an AbortIncompleteMultipartUpload
+// lifecycle rule to the archive bucket to reap them (follow-up, documented in
+// docs/deployment.md).
+func uploadReader(ctx context.Context, client manager.UploadAPIClient, bucket, key string, body io.Reader) error {
+	uploader := manager.NewUploader(client)
+	_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   body,
+	})
+	return err
+}
+
 // UploadFile opens a single local file and uploads it to S3. It is a separate
 // function so that defer f.Close() runs when UploadFile returns — not when a
 // WalkDir callback returns — preventing file descriptor accumulation over
-// large directory trees.
+// large directory trees. Uploads stream through the managed Uploader, which
+// automatically uses a multipart upload for files above S3's 5 GiB single-PUT
+// limit.
 func UploadFile(ctx context.Context, client *s3.Client, path, bucket, key string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -140,11 +166,7 @@ func UploadFile(ctx context.Context, client *s3.Client, path, bucket, key string
 	}
 	defer f.Close()
 
-	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-		Body:   f,
-	}); err != nil {
+	if err := uploadReader(ctx, client, bucket, key, f); err != nil {
 		return fmt.Errorf("upload %s → s3://%s/%s: %w", path, bucket, key, err)
 	}
 	return nil

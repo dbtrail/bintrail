@@ -217,6 +217,16 @@ func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int
 	if reconRows != srcRows {
 		return StatusMismatch, fmt.Sprintf("row count differs: source=%d reconstructed=%d", srcRows, reconRows)
 	}
+	// Equal row count — the byte comparison below is only meaningful when both
+	// digests were produced under the SAME contract version (consistency.
+	// DigestVersion). A version skew (e.g. a persisted pre-charset-pin v1 baseline
+	// digest against a current v2 scan, issue #792) byte-differs even on identical
+	// data, so it must degrade to a needs-rebaseline signal, never a false
+	// MISMATCH. Row count is version-independent, so it stays checked first: real
+	// row loss/gain is still conclusive under a version skew.
+	if sv, rv := consistency.DigestVersionOf(srcDigest), consistency.DigestVersionOf(reconDigest); sv != rv {
+		return StatusInconclusive, fmt.Sprintf("digest contract skew (%q vs %q): the compared digests were produced under different versions; regenerate the baseline (bintrail baseline) so both sides use the current contract", sv, rv)
+	}
 	if reconDigest == srcDigest {
 		return StatusMatch, ""
 	}

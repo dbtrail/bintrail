@@ -96,6 +96,30 @@ func TestRowHasher_EmptyTable(t *testing.T) {
 	}
 }
 
+func TestDigestVersionOf(t *testing.T) {
+	cases := map[string]string{
+		"v2:0011223344556677": "v2:", // current contract tag
+		"v1:deadbeef":         "v1:", // a persisted pre-pin baseline digest
+		"":                    "",    // empty
+		"deadbeef":            "",    // untagged legacy value (no ':')
+		":abc":                ":",   // degenerate but tagged
+	}
+	for in, want := range cases {
+		if got := DigestVersionOf(in); got != want {
+			t.Errorf("DigestVersionOf(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// The exported contract tag must round-trip through DigestVersionOf, so a
+	// consumer comparing a freshly computed digest can detect its own version.
+	if got := DigestVersionOf(DigestVersion + "0000000000000000"); got != DigestVersion {
+		t.Errorf("DigestVersionOf(current digest) = %q, want %q", got, DigestVersion)
+	}
+	// Pin the #792 bump so an accidental revert to v1 is caught.
+	if DigestVersion != "v2:" {
+		t.Errorf("DigestVersion = %q, want \"v2:\" (charset-pin contract, #792)", DigestVersion)
+	}
+}
+
 func TestQuoteIdent(t *testing.T) {
 	cases := map[string]string{
 		"id":       "`id`",

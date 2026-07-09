@@ -81,12 +81,15 @@ type TableChecksum struct {
 // UNSIGNED integers print unsigned, DATETIME/TIMESTAMP carry their declared
 // fractional precision, DECIMAL is pre-formatted, JSON is normalized (MySQL;
 // MariaDB stores JSON as LONGTEXT and renders it verbatim) — so no
-// per-type canonicalization is reimplemented here. The Parquet side of the
-// comparison (#634) must reproduce this same contract: "MySQL text rendering,
-// session time zone UTC". Two digests are only comparable when computed against
-// the same connection charset and server family — string transcoding and
-// FLOAT/DOUBLE text rendering depend on both — which is the natural case since
-// the baseline and its verify run against the same source.
+// per-type canonicalization is reimplemented here. String columns are read with
+// character_set_results = binary, so their RAW STORED BYTES are hashed (no
+// transcoding to the connection charset) — matching mydumper's `SET NAMES
+// binary` dump contract (issue #792). The Parquet side of the comparison (#634)
+// must reproduce this same contract: "MySQL text rendering, session time zone
+// UTC, raw string bytes". Two digests remain FLOAT/DOUBLE-text-rendering and
+// server-family dependent, which is the natural case since the baseline and its
+// verify run against the same source; the charset dependency is now removed by
+// the binary pin.
 //
 // Generated columns (VIRTUAL/STORED) are excluded: mydumper does not dump them,
 // so they are absent from the baseline Parquet and must be absent here too.
@@ -135,6 +138,19 @@ func consistentTableChecksum(ctx context.Context, db *sql.DB, schema, table stri
 	// (TIMESTAMP is stored in UTC and rendered in the session zone).
 	if _, err := conn.ExecContext(ctx, "SET SESSION time_zone = '+00:00'"); err != nil {
 		return res, fmt.Errorf("set session time_zone: %w", err)
+	}
+
+	// Pin character_set_results = binary so the server returns each string
+	// column's RAW STORED BYTES without transcoding them to the connection
+	// charset (go-sql-driver's default is utf8mb4). This matches mydumper's
+	// `SET NAMES binary` dump contract, which the baseline Parquet is written
+	// under: a latin1 'é' (0xE9) then hashes as 0xE9 on BOTH the baseline side
+	// and this live-scan side, instead of the server transcoding it to utf8mb4
+	// (0xC3A9) here and producing a permanent, conclusive false-MISMATCH on
+	// every non-ASCII row of a legacy-charset table (issue #792). The pin is the
+	// v2 half of the digest contract — see digestVersion.
+	if _, err := conn.ExecContext(ctx, "SET SESSION character_set_results = binary"); err != nil {
+		return res, fmt.Errorf("set session character_set_results: %w", err)
 	}
 
 	// Open the consistent snapshot. Everything below reads the same view.
@@ -226,13 +242,39 @@ func consistentTableChecksum(ctx context.Context, db *sql.DB, schema, table stri
 
 // digestVersion tags the digest with the contract it was computed under — both
 // the Go-side encoding (field tagging, FNV-1a/64, additive fold) and the
-// MySQL-side rendering (text protocol, session tz UTC). Two digests are only
-// comparable when their tags match; because #634 compares with plain ==, an
-// incompatible contract fails loud instead of producing a false mismatch that
-// reads like real corruption. Persisted baselines (#633) carry this tag, so the
-// only free moment to introduce it is before the first baseline is written. Bump
-// to "v2:" if the encoding or rendering contract ever changes.
-const digestVersion = "v1:"
+// MySQL-side rendering (text protocol, session tz UTC, and
+// character_set_results = binary so string columns hash as their raw stored
+// bytes). Two digests are only comparable when their tags match; a version skew
+// must be treated as needs-rebaseline, not a false mismatch — DigestVersionOf
+// lets a consumer detect the skew before it byte-compares (see the verify
+// capstone's classify). Persisted baselines (#633) carry this tag.
+//
+// Bumped v1 → v2 for the character_set_results = binary pin (issue #792): the v1
+// live scan transcoded string columns to the connection charset (utf8mb4) while
+// the persisted baseline digest was always over mydumper's raw `SET NAMES
+// binary` bytes, so the two silently disagreed for any non-ASCII legacy-charset
+// value. v2 makes both sides read raw bytes. A v1 baseline digest is NOT
+// byte-comparable to a v2 scan — regenerate the baseline (its raw-byte content
+// is unchanged; only the tag differs).
+const digestVersion = "v2:"
+
+// DigestVersion is the current digest contract tag (see digestVersion). Exported
+// so a consumer comparing a persisted digest against a freshly computed one can
+// tell whether they share a contract.
+const DigestVersion = digestVersion
+
+// DigestVersionOf returns the "vN:" version-tag prefix of a digest produced by
+// this package (ConsistentTableChecksum / Hasher.Digest) — the text up to and
+// including the first ':'. It returns "" when the string carries no recognizable
+// tag (e.g. an empty or pre-tag legacy value). Comparing two digests whose tags
+// differ would byte-differ even on identical data, so a consumer must degrade to
+// a needs-rebaseline signal rather than report a false mismatch.
+func DigestVersionOf(digest string) string {
+	if i := strings.IndexByte(digest, ':'); i >= 0 {
+		return digest[:i+1]
+	}
+	return ""
+}
 
 // capturedGTID reads @@gtid_executed inside the snapshot. MySQL always exposes
 // this variable (empty string when gtid_mode=OFF); MariaDB does not have it, in

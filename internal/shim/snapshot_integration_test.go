@@ -1089,19 +1089,19 @@ func TestSnapshotBaseline_FullTableDoubleMerge(t *testing.T) {
 	}
 }
 
-// The three tests below close the coverage gap on the configured-but-degraded
-// full-table fallback branches of runSnapshotFullTable. Each configures a
-// baseline source (so we are past the no-source Debug branch) and asserts the
-// result equals the binlog-only set — i.e. the query degrades to runFullTable
-// rather than erroring or silently mis-merging. A never-touched baseline row
-// (present only in the baseline) being ABSENT is the discriminator that proves
-// the merge did NOT run.
+// The three tests below cover the configured-but-can't-merge full-table
+// branches of runSnapshotFullTable. Each configures a baseline source (so we
+// are past the no-source binlog-only branch) — meaning the operator explicitly
+// opted into full-table completeness — and asserts the query FAILS LOUD with a
+// wire error (ER_NO_PARTITION_FOR_GIVEN_VALUE / 1526) rather than silently
+// degrading to the binlog-activity-only set, which would be a partial table
+// indistinguishable from a complete one (#822).
 
-// TestSnapshotBaseline_FullTableUnsupportedPKDegrades: an unsupported PK type
-// (FLOAT) is rejected by reconstruct.SupportedPKType, so full-table _snapshot
-// must fall through to binlog-only even though a baseline with a never-touched
-// row exists.
-func TestSnapshotBaseline_FullTableUnsupportedPKDegrades(t *testing.T) {
+// TestSnapshotBaseline_FullTableUnsupportedPKRefuses: an unsupported PK type
+// (FLOAT) is rejected by reconstruct.SupportedPKType, so the baseline merge
+// cannot canonicalize it. With a baseline configured, full-table _snapshot must
+// refuse with a wire error instead of silently returning binlog-only rows.
+func TestSnapshotBaseline_FullTableUnsupportedPKRefuses(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 	if err := indexer.EnsureSchema(db); err != nil {
@@ -1133,24 +1133,20 @@ func TestSnapshotBaseline_FullTableUnsupportedPKDegrades(t *testing.T) {
 		AllowGaps: true, NoArchive: true, IndexDBName: dbName, BaselineDir: baselineDir,
 	}, slog.Default())
 
-	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "readings", AsOf: asOf})
-	if err != nil {
-		t.Fatalf("full-table _snapshot (unsupported PK) must degrade, not error: %v", err)
+	_, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "readings", AsOf: asOf})
+	if err == nil {
+		t.Fatal("full-table _snapshot (unsupported PK, baseline configured) must refuse, got nil")
 	}
-	got := rowsByKey(t, res.Resultset)
-	if _, merged := got["1.5"]; merged {
-		t.Errorf("unsupported-PK full-table _snapshot merged the baseline (never-touched k=1.5 present); must degrade to binlog-only: %v", got)
-	}
-	if got["2.5"] != "fresh" {
-		t.Errorf("unsupported-PK full-table _snapshot = %v, want only the binlog row k=2.5 fresh", got)
+	if me, ok := err.(*mysql.MyError); !ok || me.Code != mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE {
+		t.Errorf("unsupported-PK full-table _snapshot error = %v, want ER_NO_PARTITION_FOR_GIVEN_VALUE (1526)", err)
 	}
 }
 
-// TestSnapshotBaseline_FullTableUnresolvablePKDegrades: when the table is not
-// in the schema snapshot, pkColumnMetas can't determine the PK, so full-table
-// _snapshot must fall through to binlog-only rather than merging against an
-// empty/wrong PK set.
-func TestSnapshotBaseline_FullTableUnresolvablePKDegrades(t *testing.T) {
+// TestSnapshotBaseline_FullTableUnresolvablePKRefuses: when the table is not
+// in the schema snapshot, pkColumnMetas can't determine the PK. With a baseline
+// configured, full-table _snapshot must refuse with a wire error rather than
+// silently returning the binlog-only set (which omits never-touched rows).
+func TestSnapshotBaseline_FullTableUnresolvablePKRefuses(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 	if err := indexer.EnsureSchema(db); err != nil {
@@ -1174,25 +1170,23 @@ func TestSnapshotBaseline_FullTableUnresolvablePKDegrades(t *testing.T) {
 		AllowGaps: true, NoArchive: true, IndexDBName: dbName, BaselineDir: baselineDir,
 	}, slog.Default())
 
-	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "users", AsOf: asOf})
-	if err != nil {
-		t.Fatalf("full-table _snapshot (unresolvable PK) must degrade, not error: %v", err)
+	_, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "users", AsOf: asOf})
+	if err == nil {
+		t.Fatal("full-table _snapshot (unresolvable PK, baseline configured) must refuse, got nil")
 	}
-	got := rowsByKey(t, res.Resultset)
-	if _, merged := got["1"]; merged {
-		t.Errorf("unresolvable-PK full-table _snapshot merged the baseline (never-touched id=1 present); must degrade to binlog-only: %v", got)
-	}
-	if got["2"] != "fresh" {
-		t.Errorf("unresolvable-PK full-table _snapshot = %v, want only the binlog row id=2 fresh", got)
+	if me, ok := err.(*mysql.MyError); !ok || me.Code != mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE {
+		t.Errorf("unresolvable-PK full-table _snapshot error = %v, want ER_NO_PARTITION_FOR_GIVEN_VALUE (1526)", err)
 	}
 }
 
-// TestSnapshotBaseline_FullTableNoBaselineAtOrBeforeAsOfDegrades: a baseline
+// TestSnapshotBaseline_FullTableNoBaselineAtOrBeforeAsOfRefuses: a baseline
 // source IS configured, the table IS in the snapshot, but the only baseline
-// snapshot is dated AFTER AsOf — so FindBaseline returns ErrNoBaseline and
-// full-table _snapshot must degrade to binlog-only (distinct from the
-// no-source-configured case in TestSnapshotBaseline_FullTableNoBaselineFallsBack).
-func TestSnapshotBaseline_FullTableNoBaselineAtOrBeforeAsOfDegrades(t *testing.T) {
+// snapshot is dated AFTER AsOf — so FindBaseline returns ErrNoBaseline. Because
+// the operator opted into completeness by configuring a baseline, full-table
+// _snapshot must refuse with a wire error rather than silently degrade to
+// binlog-only (distinct from the no-source-configured case in
+// TestSnapshotBaseline_FullTableNoBaselineFallsBack).
+func TestSnapshotBaseline_FullTableNoBaselineAtOrBeforeAsOfRefuses(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 	if err := indexer.EnsureSchema(db); err != nil {
@@ -1220,16 +1214,12 @@ func TestSnapshotBaseline_FullTableNoBaselineAtOrBeforeAsOfDegrades(t *testing.T
 		AllowGaps: true, NoArchive: true, IndexDBName: dbName, BaselineDir: baselineDir,
 	}, slog.Default())
 
-	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "users", AsOf: asOf})
-	if err != nil {
-		t.Fatalf("full-table _snapshot (no baseline at-or-before AsOf) must degrade, not error: %v", err)
+	_, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "users", AsOf: asOf})
+	if err == nil {
+		t.Fatal("full-table _snapshot (no baseline at-or-before AsOf, baseline configured) must refuse, got nil")
 	}
-	got := rowsByKey(t, res.Resultset)
-	if _, merged := got["1"]; merged {
-		t.Errorf("no-baseline-at-or-before-AsOf full-table _snapshot merged a future baseline (id=1 present); must degrade to binlog-only: %v", got)
-	}
-	if got["2"] != "fresh" {
-		t.Errorf("no-baseline-at-or-before-AsOf full-table _snapshot = %v, want only the binlog row id=2 fresh", got)
+	if me, ok := err.(*mysql.MyError); !ok || me.Code != mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE {
+		t.Errorf("no-baseline-at-or-before-AsOf full-table _snapshot error = %v, want ER_NO_PARTITION_FOR_GIVEN_VALUE (1526)", err)
 	}
 }
 
