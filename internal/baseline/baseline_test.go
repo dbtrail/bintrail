@@ -688,6 +688,37 @@ func TestReadSQLRowMultiLineLayouts(t *testing.T) {
 	}
 }
 
+func TestReadSQLRowOversizedLine(t *testing.T) {
+	// A single tuple carrying a value larger than the old fixed 8 MB scanner
+	// buffer must parse, not abort with bufio.ErrTooLong. mydumper emits one
+	// tuple per physical line, so a LONGBLOB/JSON column produces exactly this
+	// shape (#801). The growable bufio.Reader has no artificial per-line cap.
+	big := strings.Repeat("A", 12<<20) // 12 MB, well over the old 8 MB limit
+	sqlData := "INSERT INTO `docs` VALUES(1,'" + big + "');\n"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shop.docs.00000.sql")
+	if err := os.WriteFile(path, []byte(sqlData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var rows [][]string
+	if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+		rows = append(rows, append([]string(nil), values...))
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadSQLFile on oversized line: %v", err)
+	}
+	if len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("got rows=%d cols, want 1 row with 2 cols", len(rows))
+	}
+	if rows[0][0] != "1" {
+		t.Errorf("col 0 = %q, want 1", rows[0][0])
+	}
+	if len(rows[0][1]) != len(big) {
+		t.Errorf("col 1 length = %d, want %d (large value truncated/dropped)", len(rows[0][1]), len(big))
+	}
+}
+
 func TestReadSQLRowUnexpectedToken(t *testing.T) {
 	// A stray token where a tuple or ';' is expected must surface as a loud
 	// error, not silently truncate the fragment. With cross-line state, a
@@ -1803,6 +1834,72 @@ func TestRunRetrySkipsExistingFiles(t *testing.T) {
 	}
 	if stats2.FilesWritten != 1 {
 		t.Errorf("retry Run: FilesWritten = %d, want 1 (counted as existing)", stats2.FilesWritten)
+	}
+}
+
+// TestRunRetryReconvertsTruncatedParquet is the #798 guard: on --retry a
+// nonzero-but-truncated Parquet (no footer, e.g. from an OOM/SIGKILL mid
+// processTable) must be RE-CONVERTED, not skipped. The pre-fix skip decision
+// was size-only, so it blessed the corrupt bytes; WriteManifest then CRC'd them
+// and _SUCCESS was published, exploding only at restore time. The skip must now
+// honor ReadParquetMetadata (footer parse) — skip only a file that parses.
+func TestRunRetryReconvertsTruncatedParquet(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(inputDir, "metadata"), []byte(sampleMetadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders-schema.sql"), []byte(sampleSchema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const sqlData = "INSERT INTO `orders` VALUES(1,10,'9.99','note','2025-01-01 00:00:00','2025-01-15');\n"
+	if err := os.WriteFile(filepath.Join(inputDir, "shop.orders.00000.sql"), []byte(sqlData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{
+		InputDir:     inputDir,
+		OutputDir:    outputDir,
+		Compression:  "none",
+		RowGroupSize: 100,
+	}
+
+	// First run: creates a valid Parquet file.
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+
+	outPath := filepath.Join(snapDir(t, outputDir), "shop", "orders.parquet")
+	if _, err := ReadParquetMetadata(outPath); err != nil {
+		t.Fatalf("sanity: first-run Parquet should parse, got %v", err)
+	}
+
+	// Simulate an OOM/SIGKILL that left a truncated (footerless) file: nonzero
+	// size but not a parseable Parquet.
+	if err := os.Truncate(outPath, 8); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if fi, err := os.Stat(outPath); err != nil || fi.Size() == 0 {
+		t.Fatalf("truncated file must remain nonzero size (stat err=%v)", err)
+	}
+	if _, err := ReadParquetMetadata(outPath); err == nil {
+		t.Fatal("sanity: truncated Parquet must fail to parse (the re-convert signal)")
+	}
+
+	// Retry run: must RE-CONVERT the corrupt file, not skip it. The skip path
+	// leaves RowsWritten==0; a re-conversion writes the row again.
+	cfg.Retry = true
+	stats, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("retry Run: %v", err)
+	}
+	if stats.RowsWritten != 1 {
+		t.Errorf("retry Run: RowsWritten = %d, want 1 (truncated file must be re-converted, not skipped)", stats.RowsWritten)
+	}
+	// The healed file must parse again.
+	if _, err := ReadParquetMetadata(outPath); err != nil {
+		t.Errorf("after retry the Parquet should parse, got %v", err)
 	}
 }
 

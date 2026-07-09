@@ -101,7 +101,7 @@ func scrapeIndexMetrics(ctx context.Context, db *sql.DB, dbName string, m *obser
 		archiveEarliest = data.Coverage.ArchiveEarliestHour
 	}
 	if since, until, ok := gapScrapeRange(snap.OldestEvent, archiveEarliest, newestExplicit); ok {
-		if plan, err := query.Plan(ctx, db, dbName, &since, &until); err != nil {
+		if plan, err := query.Plan(ctx, db, dbName, &since, &until, false); err != nil {
 			slog.Warn("index metrics scrape: could not plan gap hours", "error", err)
 		} else if plan != nil { // belt-and-suspenders: Plan can still return nil
 			snap.GapHours = len(plan.GapHours)

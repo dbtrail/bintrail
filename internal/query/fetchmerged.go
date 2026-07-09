@@ -87,10 +87,14 @@ type FetchMergedOptions struct {
 	DBName string
 
 	// NoArchive skips archive auto-discovery and the archive fetch loop. The
-	// query planner still runs when DBName and a time range are set — the
-	// planner only reads information_schema.PARTITIONS and archive_state and
-	// does not touch the archives themselves, so gap detection remains
-	// available under --no-archive.
+	// query planner still runs when DBName and a time range are set — it only
+	// reads information_schema.PARTITIONS (and, when archives ARE included,
+	// archive_state), never the archives themselves. Under NoArchive the
+	// planner ignores archive_state coverage: hours rotated out of live MySQL
+	// but present only in archives are counted as GAPS, since those archives
+	// will not be fetched. This yields a *GapError under AllowGaps=false and an
+	// slog.Warn under AllowGaps=true — without it a strict reconstruct would
+	// silently omit the archived-only hours.
 	NoArchive bool
 
 	// AllowGaps controls what happens when the planner reports coverage gaps
@@ -178,13 +182,14 @@ func FetchMerged(
 
 	// The query planner runs whenever the caller supplied a DBName and either
 	// has a time range or has resolved archive sources. It runs regardless of
-	// NoArchive because it only reads information_schema.PARTITIONS and
-	// archive_state — no actual data fetch. This preserves gap detection for
-	// --no-archive callers (observability win for recover, correctness win
-	// for reconstruct under AllowGaps=false).
+	// NoArchive — no actual data fetch, just partition/archive_state metadata.
+	// o.NoArchive is threaded in so that when archives are excluded, archived-
+	// only hours are classified as gaps rather than covered. This preserves gap
+	// detection for --no-archive callers (observability win for recover,
+	// correctness win for reconstruct under AllowGaps=false).
 	var plan *QueryPlan
 	if o.DBName != "" && (len(archSources) > 0 || o.Opts.Since != nil || o.Opts.Until != nil) {
-		p, err := Plan(ctx, db, o.DBName, o.Opts.Since, o.Opts.Until)
+		p, err := Plan(ctx, db, o.DBName, o.Opts.Since, o.Opts.Until, o.NoArchive)
 		if err != nil {
 			if !o.AllowGaps {
 				return nil, nil, fmt.Errorf("query planner failed, cannot verify coverage: %w", err)

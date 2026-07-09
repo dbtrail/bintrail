@@ -108,6 +108,39 @@ type Options struct {
 	ArchivesPresent bool
 }
 
+// skewSampleLimit bounds the child-side DDL-skew probe: how many child
+// row-images to sample when a candidate scan returns zero rows. A handful is
+// enough to tell "column exists under its snapshot name" from "renamed away";
+// the probe runs at most once per child FK column (skewChecked memo).
+const skewSampleLimit = 8
+
+// fkColumnAbsentFromAll reports whether col is present in NONE of the sampled
+// child row-images — the signal that the FK column was renamed/dropped since the
+// FK snapshot (DDL-skew) rather than that the parent genuinely had no children.
+// It returns false unless it actually inspected at least one image: an empty
+// sample (no child events in the window) or images with neither before nor after
+// map is inconclusive, never a skew claim (avoids flagging a legitimately empty
+// window). A single image carrying col — even for a different parent — proves the
+// column exists under its snapshot name, so it is not skew.
+func fkColumnAbsentFromAll(col string, sample []query.ResultRow) bool {
+	sawImage := false
+	for _, r := range sample {
+		if r.RowAfter != nil {
+			sawImage = true
+			if _, ok := r.RowAfter[col]; ok {
+				return false
+			}
+		}
+		if r.RowBefore != nil {
+			sawImage = true
+			if _, ok := r.RowBefore[col]; ok {
+				return false
+			}
+		}
+	}
+	return sawImage
+}
+
 func (o Options) withDefaults() Options {
 	if o.Lookback == 0 {
 		o.Lookback = 30 * 24 * time.Hour // CASCADE_LOOKBACK_DAYS=30
@@ -224,6 +257,12 @@ func SynthesizeVictims(
 
 	visited := map[string]bool{} // "schema.table|pkvalues" → processed as a parent
 	emitted := map[string]bool{} // "schema.table|pkvalues" → already emitted as a victim
+	// skewChecked memoizes the child-side DDL-skew probe per child FK column so a
+	// wide cascade with many childless parents samples each child table at most
+	// once. Only a CONCLUSIVE probe (a window that returned images) memoizes; an
+	// empty-window probe stays unmemoized so a later parent's window can detect
+	// skew (see the len(cands)==0 branch below).
+	skewChecked := map[string]bool{} // "schema.table.column" → skew probe already conclusive
 
 	// The cascade fires atomically at the ROOT delete's timestamp T, so every
 	// descendant existed at T and the lookback window must end at T for EVERY
@@ -340,6 +379,55 @@ func SynthesizeVictims(
 						"%s.%s has more than %d cascade victims for one parent; the excess (and their descendants) were NOT reconstructed",
 						fk.Schema, fk.Table, opts.CandidateLimit))
 					cands = cands[:opts.CandidateLimit]
+				}
+
+				// Child-side DDL-skew guard. A zero-candidate scan is ambiguous:
+				// either no child referenced this parent (normal — leave silent), or
+				// the child FK column was renamed since the FK snapshot so the
+				// ColumnEq JSON_EXTRACT('$.<snapshot-name>') never matched the old
+				// row-images (the column name in effect at event time differs). In
+				// the latter case synthesis would report 0 victims + Complete —
+				// indistinguishable from "no children existed". Mirror the parent-side
+				// "noref" caveat: sample the child images in the window WITHOUT the FK
+				// filter; if fk.Column is absent from every sampled image, the graph's
+				// column name doesn't exist here → flag, so a false-negative zero is
+				// never presented as a clean Complete.
+				if len(cands) == 0 {
+					skewKey := fk.Schema + "." + fk.Table + "." + fk.Column
+					if !skewChecked[skewKey] {
+						sample, serr := eng.Fetch(ctx, query.Options{
+							Schema: fk.Schema,
+							Table:  fk.Table,
+							Since:  &since,
+							Until:  &until,
+							Order:  "DESC",
+							Limit:  skewSampleLimit,
+						})
+						switch {
+						case serr != nil:
+							// Probe failure: the primary candidate scan already
+							// succeeded (0 rows), so this is not an operational error —
+							// only a caveat that we could not rule out skew here.
+							skewChecked[skewKey] = true
+							addIncomplete("skewprobe:"+skewKey, fmt.Sprintf(
+								"could not probe %s.%s for a renamed FK column %q (its zero-victim result is unverified): %v",
+								fk.Schema, fk.Table, fk.Column, serr))
+						case len(sample) == 0:
+							// No child events in this window: inconclusive. Leave
+							// unmemoized so another parent's window can still detect skew.
+						case fkColumnAbsentFromAll(fk.Column, sample):
+							skewChecked[skewKey] = true
+							addIncomplete("childskew:"+skewKey, fmt.Sprintf(
+								"FK column %q is absent from every sampled %s.%s row-image in the window "+
+									"(schema changed since the FK snapshot); its cascade-deleted rows could NOT be "+
+									"matched, so a zero-victim result here may be a false negative — NOT confirmation "+
+									"that no children existed",
+								fk.Column, fk.Schema, fk.Table))
+						default:
+							// fk.Column present under its snapshot name → not skewed.
+							skewChecked[skewKey] = true
+						}
+					}
 				}
 
 				// touched = every child PK with an event matching fk=parentPK in

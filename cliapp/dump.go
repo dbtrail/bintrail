@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
@@ -25,8 +26,11 @@ var dumpCmd = &cobra.Command{
 	Use:   "dump",
 	Short: "Invoke mydumper to create a logical dump of the source MySQL instance",
 	Long: `Invokes mydumper to create a logical dump of the source MySQL instance.
-Only one dump may run at a time (enforced by a lockfile). Any existing output
-directory is removed before the dump begins.`,
+Only one dump may run at a time (enforced by a lockfile). Source connectivity is
+verified before the output directory is touched. An existing output directory is
+only cleared when it is empty or a recognizable prior dump — a recognizable prior
+dump is moved aside and restored if this dump fails; a non-empty directory that
+is not a dump is refused rather than deleted.`,
 	RunE: runDump,
 }
 
@@ -112,8 +116,11 @@ func resolveMydumper(cmd *cobra.Command) (dumpResolution, error) {
 // buildDockerArgs constructs the full argument slice for invoking mydumper via
 // docker run. The output directory is bind-mounted at the same absolute path so
 // downstream tools need no path translation. When encryptKeyPath is non-empty,
-// the key file is also bind-mounted into the container.
-func buildDockerArgs(image, outputDir, host string, mydumperArgs []string, encryptKeyPath string) []string {
+// the key file is also bind-mounted into the container. When defaultsFile is
+// non-empty it is likewise bind-mounted read-only at the same path so the
+// container's mydumper can read the source password from it via --defaults-file
+// (keeping the secret off argv and out of `docker inspect`, #811).
+func buildDockerArgs(image, outputDir, host string, mydumperArgs []string, encryptKeyPath, defaultsFile string) []string {
 	absOutput, err := filepath.Abs(outputDir)
 	if err != nil {
 		absOutput = outputDir
@@ -131,6 +138,14 @@ func buildDockerArgs(image, outputDir, host string, mydumperArgs []string, encry
 			absKey = encryptKeyPath
 		}
 		args = append(args, "-v", absKey+":"+absKey+":ro")
+	}
+
+	if defaultsFile != "" {
+		absDefaults, err := filepath.Abs(defaultsFile)
+		if err != nil {
+			absDefaults = defaultsFile
+		}
+		args = append(args, "-v", absDefaults+":"+absDefaults+":ro")
 	}
 
 	if isLocalhost(host) {
@@ -193,6 +208,14 @@ func runDump(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// 2b. Validate source connectivity BEFORE the output directory is touched.
+	// A wrong host/port/credential (or an unreachable server) must fail here —
+	// never after the previous, only-good dump has already been destroyed
+	// (#809). Injectable via pingSource so unit tests can stub it.
+	if err := pingSource(dmpSourceDSN); err != nil {
+		return fmt.Errorf("cannot connect to source; refusing to touch --output-dir %q: %w", dmpOutputDir, err)
+	}
+
 	// 3. Parse schema and table filters.
 	schemas := cliutil.ParseSchemaList(dmpSchemas)
 	tables := cliutil.ParseSchemaList(dmpTables)
@@ -204,10 +227,25 @@ func runDump(cmd *cobra.Command, args []string) error {
 	}
 	defer releaseDumpLock(lockFile)
 
-	// 5. Remove existing output directory.
-	if err := os.RemoveAll(dmpOutputDir); err != nil {
-		return fmt.Errorf("failed to remove existing output directory %q: %w", dmpOutputDir, err)
+	// 5. Safely prepare the output directory (#809). Refuse to delete a
+	// non-empty directory that is not a recognizable prior mydumper/bintrail
+	// dump — a typo'd --output-dir (or a stray BINTRAIL_OUTPUT_DIR in a sibling
+	// .bintrail.env) must never wipe an arbitrary tree, including baselines
+	// that reconstruct/verify depend on. A recognizable prior dump is moved
+	// aside (dir → dir.old) and only deleted once THIS dump succeeds, so a
+	// failed dump restores the previous (only-good) output.
+	prep, err := prepareDumpOutputDir(dmpOutputDir)
+	if err != nil {
+		return err
 	}
+	dumpSucceeded := false
+	defer func() {
+		if dumpSucceeded {
+			prep.commit()
+		} else {
+			prep.rollback()
+		}
+	}()
 
 	// 6. Probe mydumper version and build args.
 	// --sync-thread-lock-mode and --trx-tables require mydumper >= 0.18 (see
@@ -230,17 +268,38 @@ func runDump(cmd *cobra.Command, args []string) error {
 			supportsLockMode = false
 		}
 	}
-	mydumperArgs := buildMydumperArgs(host, port, user, password, dmpOutputDir, dmpThreads, schemas, tables, encryptKeyPath, supportsLockMode)
+	// The source password must never reach mydumper's argv (visible in
+	// `ps aux` / /proc/<pid>/cmdline and, under Docker, in `docker inspect`).
+	// Docker mode delivers it via a 0600 defaults-file bind-mounted read-only;
+	// local mode delivers it via MYSQL_PWD in the child env below (#811).
+	var defaultsFile string
+	if password != "" && res.mode == dumpModeDocker {
+		var cleanup func()
+		var derr error
+		defaultsFile, cleanup, derr = writeMydumperDefaultsFile(password)
+		if derr != nil {
+			return derr
+		}
+		defer cleanup()
+	}
+	mydumperArgs := buildMydumperArgs(host, port, user, defaultsFile, dmpOutputDir, dmpThreads, schemas, tables, encryptKeyPath, supportsLockMode)
 
 	// 7. Build the final command depending on resolution mode.
 	var c *exec.Cmd
 	switch res.mode {
 	case dumpModeDocker:
-		dockerArgs := buildDockerArgs(res.image, dmpOutputDir, host, mydumperArgs, encryptKeyPath)
+		dockerArgs := buildDockerArgs(res.image, dmpOutputDir, host, mydumperArgs, encryptKeyPath, defaultsFile)
 		c = exec.CommandContext(cmd.Context(), res.path, dockerArgs...)
 		slog.Info("starting dump via Docker", "image", res.image, "output_dir", dmpOutputDir)
 	default:
 		c = exec.CommandContext(cmd.Context(), res.path, mydumperArgs...)
+		// Pass the password out of band so it stays off argv. MYSQL_PWD is
+		// honored by the MySQL client library mydumper links against and sits
+		// in the child's mode-0400 /proc/<pid>/environ, not world-readable
+		// cmdline (#811).
+		if password != "" {
+			c.Env = append(os.Environ(), "MYSQL_PWD="+password)
+		}
 		slog.Info("starting dump", "path", res.path, "output_dir", dmpOutputDir)
 	}
 
@@ -272,6 +331,9 @@ func runDump(cmd *cobra.Command, args []string) error {
 	}
 
 	slog.Info("dump complete", "output_dir", dmpOutputDir)
+	// The dump succeeded: the deferred cleanup may now delete the moved-aside
+	// previous dump (dir.old) instead of restoring it (#809).
+	dumpSucceeded = true
 
 	// Best-effort: a write failure here just means baseline conversion falls
 	// back to mydumper's own (TZ-sensitive) "Started dump at" line rather
@@ -287,6 +349,141 @@ func runDump(cmd *cobra.Command, args []string) error {
 		}{OutputDir: dmpOutputDir})
 	}
 	return nil
+}
+
+// pingSource validates connectivity to the source before the dump does anything
+// destructive to --output-dir. It is a variable so tests can stub it without a
+// live server (mirroring dumpLockDir). #809.
+var pingSource = defaultPingSource
+
+// defaultPingSource opens and pings the source, then closes. The DSN's default
+// database is stripped: mydumper connects at the server level (it selects no
+// default schema and derives the dump set from --database/--regex/--tables-list),
+// so a database component that go-sql-driver would try to USE must not cause a
+// false "cannot connect" that blocks an otherwise-valid dump.
+func defaultPingSource(dsn string) error {
+	cfg, err := drivermysql.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("invalid --source-dsn: %w", err)
+	}
+	cfg.DBName = ""
+	db, err := config.Connect(cfg.FormatDSN())
+	if err != nil {
+		return err
+	}
+	return db.Close()
+}
+
+// dumpDirMarkers are filenames whose presence in a non-empty --output-dir marks
+// it as a recognizable prior mydumper/bintrail dump — safe to clear. mydumper
+// writes "metadata" on success and "metadata.partial" while running or after a
+// crash; `bintrail dump` adds its own started-at sidecar.
+var dumpDirMarkers = []string{"metadata", "metadata.partial", baseline.StartedAtMarkerFile}
+
+// looksLikeDumpDir reports whether the directory listing carries any marker that
+// identifies it as a prior mydumper/bintrail dump (#809).
+func looksLikeDumpDir(entries []os.DirEntry) bool {
+	for _, e := range entries {
+		name := e.Name()
+		for _, m := range dumpDirMarkers {
+			if name == m {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// dumpDirPrep records how the output directory was prepared so the caller can
+// commit (delete the moved-aside previous dump) on success or roll back
+// (restore it) on failure. When backup is empty, nothing was moved aside — the
+// directory was absent or already empty — and commit/rollback are no-ops.
+type dumpDirPrep struct {
+	dir    string // the requested --output-dir
+	backup string // where a recognizable prior dump was moved (dir.old), or ""
+}
+
+// prepareDumpOutputDir readies --output-dir for a fresh dump without ever
+// unconditionally deleting it (#809). An absent or empty directory needs no
+// preparation. A non-empty directory that is NOT a recognizable prior dump is
+// REFUSED (no deletion) with an actionable error. A recognizable prior dump is
+// moved aside to dir.old so a failed dump can restore it; commit() deletes the
+// backup only once the new dump succeeds.
+func prepareDumpOutputDir(dir string) (*dumpDirPrep, error) {
+	info, err := os.Stat(dir)
+	if os.IsNotExist(err) {
+		return &dumpDirPrep{dir: dir}, nil // mydumper creates it
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat --output-dir %q: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("--output-dir %q exists and is not a directory; "+
+			"remove it yourself or point --output-dir elsewhere", dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read --output-dir %q: %w", dir, err)
+	}
+	if len(entries) == 0 {
+		return &dumpDirPrep{dir: dir}, nil // empty: mydumper writes into it
+	}
+	if !looksLikeDumpDir(entries) {
+		return nil, fmt.Errorf("--output-dir %q is not empty and does not look like a prior "+
+			"bintrail/mydumper dump (no %q marker); refusing to delete it. "+
+			"Remove it yourself or point --output-dir elsewhere", dir, dumpDirMarkers[0])
+	}
+	// Recognizable prior dump: move it aside so a failed dump can restore it.
+	// Use a UNIQUE sibling path rather than a fixed dir.old — the earlier fixed
+	// name did an unconditional os.RemoveAll(dir.old), reintroducing exactly the
+	// unconditional-tree-deletion this guard exists to eliminate (#809 review):
+	//   (a) an operator's own precious backup at <dir>.old would be silently
+	//       destroyed the moment <dir> is recognized as a dump; and
+	//   (b) if a prior rollback() failed to remove partial output, the only good
+	//       copy of the previous dump is stranded at dir.old — and it IS a
+	//       recognizable dump — so the next run's RemoveAll(dir.old) would wipe
+	//       the last good copy before renaming the partial over it.
+	// A per-run suffix never collides with a pre-existing path, so we NEVER
+	// delete anything here — a leftover backup from a failed rollback stays put.
+	backup := fmt.Sprintf("%s.old-%d-%d", filepath.Clean(dir), os.Getpid(), time.Now().UnixNano())
+	if _, err := os.Lstat(backup); err == nil {
+		return nil, fmt.Errorf("dump backup path %q already exists; refusing to overwrite it", backup)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("stat dump backup path %q: %w", backup, err)
+	}
+	if err := os.Rename(dir, backup); err != nil {
+		return nil, fmt.Errorf("move existing dump %q aside to %q: %w", dir, backup, err)
+	}
+	return &dumpDirPrep{dir: dir, backup: backup}, nil
+}
+
+// commit finalizes a successful dump by deleting the moved-aside previous dump.
+// Best-effort: a leftover backup is a warning, not a failure of the dump.
+func (p *dumpDirPrep) commit() {
+	if p == nil || p.backup == "" {
+		return
+	}
+	if err := os.RemoveAll(p.backup); err != nil {
+		slog.Warn("dump succeeded but could not remove the previous dump's backup",
+			"backup", p.backup, "error", err)
+	}
+}
+
+// rollback restores the previous dump after a failed dump: it removes whatever
+// partial output the failed dump left, then renames the backup back into place.
+func (p *dumpDirPrep) rollback() {
+	if p == nil || p.backup == "" {
+		return
+	}
+	if err := os.RemoveAll(p.dir); err != nil {
+		slog.Warn("dump failed; could not remove partial output before restoring the previous dump — "+
+			"it remains at the backup path", "dir", p.dir, "backup", p.backup, "error", err)
+		return
+	}
+	if err := os.Rename(p.backup, p.dir); err != nil {
+		slog.Warn("dump failed; could not restore the previous dump from its backup — "+
+			"it remains at the backup path", "backup", p.backup, "dir", p.dir, "error", err)
+	}
 }
 
 // mydumperVersion runs `<path> --version` and parses the version triple via
@@ -340,7 +537,14 @@ func mydumperSupportsLockMode(major, minor int) bool {
 // Table filtering: --tables-list with a comma-joined list.
 // When encryptKeyPath is non-empty, --exec-per-thread and
 // --exec-per-thread-extension are added for AES-256-CBC encryption.
-func buildMydumperArgs(host string, port uint16, user, password, outputDir string,
+//
+// The source password is NEVER placed on argv — it would be world-readable via
+// `ps aux` / /proc/<pid>/cmdline and, under Docker, in `docker inspect`. It is
+// delivered out of band: locally via MYSQL_PWD in the child env, and under
+// Docker via a 0600 defaults-file bind-mounted read-only. When defaultsFile is
+// non-empty its path is referenced with --defaults-file so mydumper reads the
+// password from it (#811).
+func buildMydumperArgs(host string, port uint16, user, defaultsFile, outputDir string,
 	threads int, schemas, tables []string, encryptKeyPath string, supportsLockMode bool) []string {
 
 	args := []string{
@@ -356,8 +560,8 @@ func buildMydumperArgs(host string, port uint16, user, password, outputDir strin
 		args = append(args, "--sync-thread-lock-mode", "NO_LOCK", "--trx-tables")
 	}
 
-	if password != "" {
-		args = append(args, "--password", password)
+	if defaultsFile != "" {
+		args = append(args, "--defaults-file", defaultsFile)
 	}
 
 	switch len(schemas) {
@@ -389,6 +593,53 @@ func buildMydumperArgs(host string, port uint16, user, password, outputDir strin
 	args = append(args, "--outputdir", outputDir)
 
 	return args
+}
+
+// writeMydumperDefaultsFile writes the source password to a fresh temp file in
+// MySQL option-file format (0600) so mydumper can read it via --defaults-file
+// instead of taking it on argv. Used by Docker mode, where a passed-through
+// MYSQL_PWD would still surface in `docker inspect` Config.Env. The returned
+// cleanup removes the file and must be deferred by the caller even on a later
+// error. os.CreateTemp opens O_EXCL with mode 0600, so creation is atomic and
+// the secret is never briefly world-readable (#811).
+func writeMydumperDefaultsFile(password string) (path string, cleanup func(), err error) {
+	f, err := os.CreateTemp("", "bintrail-mydumper-*.cnf")
+	if err != nil {
+		return "", nil, fmt.Errorf("create mydumper defaults file: %w", err)
+	}
+	name := f.Name()
+	cleanup = func() { _ = os.Remove(name) }
+	// Defensive: CreateTemp already uses 0600, but pin it in case of an
+	// unusual umask/implementation.
+	if chmodErr := f.Chmod(0o600); chmodErr != nil {
+		_ = f.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("chmod mydumper defaults file: %w", chmodErr)
+	}
+	// Password under both [client] and [mydumper] so any mydumper build picks
+	// it up regardless of which group it reads.
+	v := escapeMyCnfValue(password)
+	content := "[client]\npassword=" + v + "\n[mydumper]\npassword=" + v + "\n"
+	if _, werr := f.WriteString(content); werr != nil {
+		_ = f.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("write mydumper defaults file: %w", werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("close mydumper defaults file: %w", cerr)
+	}
+	return name, cleanup, nil
+}
+
+// escapeMyCnfValue encodes a value for a MySQL option file. The value is wrapped
+// in double quotes (so a '#', ';', or whitespace is not misread as a comment or
+// truncated) with backslash and double-quote escaped, matching the escape
+// sequences the option-file parser recognizes inside a quoted value.
+func escapeMyCnfValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	return `"` + v + `"`
 }
 
 // extractSchemasFromTables derives unique schema names from a list of

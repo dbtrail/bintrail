@@ -17,6 +17,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/observe"
 )
 
 // ─── Event types ─────────────────────────────────────────────────────────────
@@ -121,6 +122,16 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	// stale text when the variable is toggled off mid-transaction).
 	var currentQueryText string
 
+	// gaps records rows skipped because the snapshot is stale (a table absent
+	// from it, or a diverging column count) for events at-or-after the snapshot
+	// time. The file-mode DDL resolver swap runs consumer-side — one buffered
+	// channel behind the parser — so rows following an in-file CREATE/ALTER can
+	// decode against a stale resolver and be skipped before the swap lands. A
+	// non-empty tracker turns into a hard error below so the file is marked
+	// 'failed' (and re-indexed after a fresh snapshot) instead of silently
+	// 'completed' with an undetected gap (#778).
+	var gaps schemaGapTracker
+
 	bp := replication.NewBinlogParser()
 	// Pin TIMESTAMP-column string rendering to UTC. go-mysql's default (nil
 	// location) formats fracTime.String() using the raw time.Unix(...) value,
@@ -166,6 +177,19 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 				case <-ctx.Done():
 					return ctx.Err()
 				}
+			} else if kw, isDML := statementDML(string(ev.Query)); isDML {
+				// STATEMENT/MIXED-format DML (or a session flip off ROW): the row
+				// image is not in the binlog, so this change cannot be captured.
+				// Fail LOUD + metric, symmetric to the partial-image guard (#493).
+				// NOTE: never log the statement text — a DML statement embeds row
+				// VALUES; keyword + file/pos + connection_id locate it without
+				// leaking data into operator logs.
+				p.logger.Warn("statement-format DML in binlog — event NOT captured (bintrail requires binlog_format=ROW; a STATEMENT/MIXED format or a session-level override produced this)",
+					"file", filename,
+					"pos", binlogEv.Header.LogPos,
+					"statement_type", kw,
+					"connection_id", ev.SlaveProxyID)
+				observe.StatementDMLDropped()
 			}
 
 		case *replication.RowsQueryEvent:
@@ -182,7 +206,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			currentQueryText = event.SanitizeQueryText(string(ev.Query))
 
 		case *replication.RowsEvent:
-			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentQueryText, p.schemaVersion.Load(), events)
+			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentQueryText, p.schemaVersion.Load(), events, &gaps)
 			// The LAST rows event of a statement carries STMT_END_F — the
 			// actual statement boundary. Clearing here keeps one statement's
 			// text alive across its chained/split rows events, while a later
@@ -205,7 +229,19 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 		return nil
 	}
 
-	return bp.ParseFile(fullPath, 0, handleEvent)
+	if err := bp.ParseFile(fullPath, 0, handleEvent); err != nil {
+		return err
+	}
+	if gaps.count > 0 {
+		return fmt.Errorf(
+			"schema gap: %d row event(s) in %s were skipped because the schema snapshot is stale "+
+				"(first: %s) — these rows were NOT indexed. Run `bintrail snapshot` against the current "+
+				"schema and re-index this file (a failed file re-indexes from the start). This commonly "+
+				"follows a CREATE/ALTER TABLE within the file whose auto-snapshot landed too late for the "+
+				"buffered rows",
+			gaps.count, filename, gaps.first)
+	}
+	return nil
 }
 
 // rewriteInnerHeader stamps a Transaction_payload inner event's header with
@@ -246,8 +282,78 @@ func firstPartialImage(skipped [][]int) []int {
 	return nil
 }
 
+// schemaGapTracker records recoverable schema gaps: rows skipped because their
+// table is absent from the snapshot or its column count diverged, for an event
+// AT-OR-AFTER the snapshot time (a STALE snapshot, not a historical pre-snapshot
+// state). It is populated ONLY on the file-index path (Parser.ParseFile); the
+// stream path passes a nil tracker and keeps its warn-and-continue behavior,
+// which is backed by the synchronous DDL hook (SetSyncDDLHook). ParseFile turns
+// a non-empty tracker into a hard file-level error so the file is marked
+// 'failed' and re-indexed (after a fresh snapshot) rather than silently marked
+// 'completed' with an undetected gap — the file-mode DDL resolver swap runs
+// consumer-side, one buffered channel behind the parser, so post-DDL rows can
+// decode with a stale resolver and be skipped before the swap lands (#778).
+type schemaGapTracker struct {
+	count int
+	first string // human detail of the first gap, for the file-level error
+}
+
+// record notes one skipped-row schema gap and returns true if it was the first
+// (so callers escalate to a log line exactly once, not per skipped row). Nil-safe.
+func (t *schemaGapTracker) record(detail string) bool {
+	if t == nil {
+		return false
+	}
+	t.count++
+	if t.count == 1 {
+		t.first = detail
+		return true
+	}
+	return false
+}
+
+// eventPredatesSnapshot reports whether binlogEv safely predates the resolver's
+// snapshot — the lenient/historical case (mirrors the #700 name-drift
+// asymmetry). When true, a schema mismatch is a routine historical state
+// (re-indexing old binlogs, or a stream backlog written before a re-snapshot)
+// with no converging remediation, so it must NOT escalate to a file-level
+// failure. Unknown times (a zero event timestamp or a zero snapshot time) are
+// treated as NOT predating (strict), so an unknown age never takes the lenient
+// path.
+func eventPredatesSnapshot(binlogEv *replication.BinlogEvent, resolver *metadata.Resolver) bool {
+	snapTime := resolver.SnapshotTime()
+	if binlogEv.Header.Timestamp == 0 || snapTime.IsZero() {
+		return false
+	}
+	eventTime := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
+	return eventTime.Before(snapTime)
+}
+
+// snapshotExcludedSchemas are the system schemas metadata.TakeSnapshot always
+// omits (WHERE TABLE_SCHEMA NOT IN (...)). No resolver ever contains their
+// tables, so a row event on one of them (e.g. RDS binlogging periodic
+// mysql.rds_heartbeat2 UPDATEs with ~now timestamps) is a routine, permanent
+// skip with NO converging remediation — re-snapshotting still excludes them.
+// It must NOT escalate a file to 'failed' via the gap tracker (#778 regression),
+// only ever warn-and-skip. Keep this list byte-identical to the TakeSnapshot
+// NOT IN clause.
+func isSnapshotExcludedSchema(schema string) bool {
+	switch strings.ToLower(schema) {
+	case "information_schema", "performance_schema", "mysql", "sys":
+		return true
+	default:
+		return false
+	}
+}
+
 // handleRows processes a RowsEvent, resolving column names and dispatching to
 // the appropriate emit function. It is shared by Parser.ParseFile and StreamParser.Run.
+//
+// gapTracker is non-nil only on the file-index path: when a row event is skipped
+// because its table is absent from the snapshot or the column count diverged AND
+// the event is at-or-after the snapshot time (a stale snapshot), the skip is
+// recorded so ParseFile can fail the whole file rather than complete it with an
+// undetected gap (#778). The stream path passes nil.
 func handleRows(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -260,6 +366,7 @@ func handleRows(
 	queryText string,
 	schemaVersion uint32,
 	out chan<- Event,
+	gapTracker *schemaGapTracker,
 ) error {
 	schema := string(rowsEv.Table.Schema)
 	table := string(rowsEv.Table.Table)
@@ -282,6 +389,18 @@ func handleRows(
 			"file", filename,
 			"pos", binlogEv.Header.LogPos,
 			"error", err)
+		// File-index path only: an at-or-after-snapshot skip is a stale
+		// snapshot (e.g. a table created by a DDL earlier in this same file
+		// whose consumer-side resolver swap landed too late for these buffered
+		// rows). Record it so ParseFile fails the file instead of completing it
+		// with an undetected gap (#778). Pre-snapshot events stay a warn-only
+		// historical skip.
+		if gapTracker != nil && !isSnapshotExcludedSchema(schema) && !eventPredatesSnapshot(binlogEv, resolver) {
+			if gapTracker.record(fmt.Sprintf("%s.%s not in snapshot %d at %s:%d", schema, table, schemaVersion, filename, binlogEv.Header.LogPos)) {
+				logger.Error("schema gap: skipping rows for a table absent from the snapshot at-or-after snapshot time — the snapshot is stale; this file will be marked failed (run `bintrail snapshot`, then re-index)",
+					"file", filename, "pos", binlogEv.Header.LogPos, "schema", schema, "table", table)
+			}
+		}
 		return nil
 	}
 
@@ -296,6 +415,17 @@ func handleRows(
 			"table", table,
 			"binlog_columns", rowsEv.Table.ColumnCount,
 			"snapshot_columns", len(tm.Columns))
+		// File-index path only: an at-or-after-snapshot count divergence is a
+		// stale snapshot (a DDL earlier in this same file added/removed a column
+		// and its consumer-side resolver swap landed too late for these buffered
+		// rows). Record it so ParseFile fails the file (#778). Pre-snapshot
+		// events stay a warn-only historical skip.
+		if gapTracker != nil && !isSnapshotExcludedSchema(schema) && !eventPredatesSnapshot(binlogEv, resolver) {
+			if gapTracker.record(fmt.Sprintf("%s.%s column count %d vs snapshot %d at %s:%d", schema, table, rowsEv.Table.ColumnCount, len(tm.Columns), filename, binlogEv.Header.LogPos)) {
+				logger.Error("schema gap: skipping rows whose column count diverges from the snapshot at-or-after snapshot time — the snapshot is stale; this file will be marked failed (run `bintrail snapshot`, then re-index)",
+					"file", filename, "pos", binlogEv.Header.LogPos, "schema", schema, "table", table)
+			}
+		}
 		return nil
 	}
 
@@ -395,22 +525,27 @@ func handleRows(
 	endPos := uint64(binlogEv.Header.LogPos)
 	ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
 	pkCols := tm.PKColumnMetas()
+	// stmtEnd marks the last ROWS_EVENT of a statement (STMT_END_F). endPos is a
+	// valid POSITION-mode resume point only at a statement boundary — the stream
+	// consumer stamps this onto every emitted row event so its safe checkpoint
+	// never lands between the chunks of a split statement (#775).
+	stmtEnd := rowsEv.Flags&replication.RowsEventStmtEndFlag != 0
 
 	switch binlogEv.Header.EventType {
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2:
-		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2:
-		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
 		replication.UPDATE_ROWS_EVENTv2:
-		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	default:
 		// A RowsEvent whose type matches none of the above — e.g. MariaDB's
@@ -444,6 +579,7 @@ func emitInserts(
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
 	schemaVersion uint32,
+	stmtEnd bool,
 	out chan<- Event,
 ) error {
 	for _, row := range rows {
@@ -460,6 +596,7 @@ func emitInserts(
 			PKValues:      BuildPKValues(pkCols, named),
 			RowAfter:      named,
 			SchemaVersion: schemaVersion,
+			StmtEnd:       stmtEnd,
 		}
 		select {
 		case out <- ev:
@@ -482,6 +619,7 @@ func emitDeletes(
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
 	schemaVersion uint32,
+	stmtEnd bool,
 	out chan<- Event,
 ) error {
 	for _, row := range rows {
@@ -498,6 +636,7 @@ func emitDeletes(
 			PKValues:      BuildPKValues(pkCols, named),
 			RowBefore:     named,
 			SchemaVersion: schemaVersion,
+			StmtEnd:       stmtEnd,
 		}
 		select {
 		case out <- ev:
@@ -520,6 +659,7 @@ func emitUpdates(
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
 	schemaVersion uint32,
+	stmtEnd bool,
 	out chan<- Event,
 ) error {
 	// go-mysql delivers UPDATE rows as interleaved before/after pairs:
@@ -545,6 +685,7 @@ func emitUpdates(
 			RowBefore:     before,
 			RowAfter:      after,
 			SchemaVersion: schemaVersion,
+			StmtEnd:       stmtEnd,
 		}
 		select {
 		case out <- ev:
@@ -633,6 +774,85 @@ const (
 var ddlTableRe = regexp.MustCompile(
 	`(?i)(?:ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|RENAME\s+TABLE|TRUNCATE(?:\s+TABLE)?)\s+` +
 		"(?:`([^`]+)`\\.`([^`]+)`|`([^`]+)`|(\\w+)\\.(\\w+)|(\\w+))")
+
+// dmlKeywords are the statement prefixes that, under binlog_format=ROW, would
+// have been logged as ROW events (and captured). Seeing one as a QUERY_EVENT
+// means the source logged this DML in STATEMENT form (binlog_format=STATEMENT
+// or MIXED, or a session-level override) — the row image is NOT in the binlog
+// and the change cannot be captured. TRUNCATE is deliberately NOT here: it is
+// always statement-logged and never produces row events under any binlog_format,
+// so it is not a "row-DML that ROW format would have captured" and must never
+// trip this loss detector (a false increment of statement_dml_dropped reads as
+// data loss when nothing was lost). parseDDL claims TRUNCATE as DDL in the
+// no-comment case; a comment-prefixed TRUNCATE that slips past parseDDL must
+// still fall through here silently — again, nothing was lost.
+var dmlKeywords = []string{"INSERT", "UPDATE", "DELETE", "REPLACE", "LOAD DATA"}
+
+// statementDML reports whether queryStr is a data-modifying statement logged in
+// STATEMENT form — the DML that binlog_format=ROW would have captured as row
+// events. It trims leading whitespace and SQL comments, then matches a DML
+// keyword prefix on a word boundary. Transaction-control (BEGIN/COMMIT/ROLLBACK/
+// SAVEPOINT/XA/SET) and every DDL/DCL verb are excluded by construction: only
+// the dmlKeywords allowlist matches, so a keyword prefix on a non-DML statement
+// cannot false-positive. Returns the matched keyword (for the warning) and true,
+// or "" and false. Callers MUST give DDL (parseDDL) the chance to claim the
+// statement first. TRUNCATE is excluded (see dmlKeywords) — it never produces
+// row events, so it must return false here even when parseDDL misses it.
+func statementDML(queryStr string) (string, bool) {
+	upper := strings.ToUpper(stripLeadingSQLComments(queryStr))
+	for _, kw := range dmlKeywords {
+		if !strings.HasPrefix(upper, kw) {
+			continue
+		}
+		// Word boundary: the keyword must be the whole statement or be followed
+		// by whitespace, so INSERT matches "INSERT INTO ..." but not an
+		// identifier that merely starts with those letters.
+		if rest := upper[len(kw):]; rest == "" || isSQLSpace(rest[0]) {
+			return kw, true
+		}
+	}
+	return "", false
+}
+
+// stripLeadingSQLComments removes leading whitespace and SQL comments so the
+// DML-prefix check sees the first real keyword. Handles the three MySQL comment
+// forms (/* */ block, -- to EOL, # to EOL); loops because a statement can carry
+// several. The common case (no leading comment) returns after one TrimLeft.
+func stripLeadingSQLComments(s string) string {
+	for {
+		s = strings.TrimLeft(s, " \t\r\n\f\v")
+		switch {
+		case strings.HasPrefix(s, "/*"):
+			end := strings.Index(s[2:], "*/")
+			if end < 0 {
+				return "" // unterminated — no real statement follows
+			}
+			s = s[2+end+2:]
+		case strings.HasPrefix(s, "--"):
+			// MySQL treats -- as a comment only when followed by whitespace/EOL.
+			if len(s) > 2 && !isSQLSpace(s[2]) {
+				return s
+			}
+			nl := strings.IndexByte(s, '\n')
+			if nl < 0 {
+				return ""
+			}
+			s = s[nl+1:]
+		case strings.HasPrefix(s, "#"):
+			nl := strings.IndexByte(s, '\n')
+			if nl < 0 {
+				return ""
+			}
+			s = s[nl+1:]
+		default:
+			return s
+		}
+	}
+}
+
+func isSQLSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\r' || b == '\n' || b == '\f' || b == '\v'
+}
 
 // parseDDL parses a QUERY_EVENT for DDL statements and returns a DDL Event.
 // Returns zero Event and false if the query is not a DDL statement.

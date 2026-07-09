@@ -750,13 +750,21 @@ func TestPerformRotation_TruncatedArchiveRetryReArchives(t *testing.T) {
 	}
 }
 
-// TestPerformRotation_ValidExistingArchiveRetrySkips pins the side of the
-// issue #802 fix that must NOT regress: a genuinely complete prior archive —
-// a Parquet file whose footer row count matches what archive_state recorded
-// for it — is still trusted and skipped under --retry, not needlessly
-// re-archived. The stricter verification added for #802 must reject only
-// unverifiable/corrupt files, never a legitimately complete one.
-func TestPerformRotation_ValidExistingArchiveRetrySkips(t *testing.T) {
+// TestPerformRotation_GrownAfterArchiveDefersDropAndReArchives is the archive→
+// drop TOCTOU regression (issue #779), and simultaneously pins the #802 side
+// that must NOT regress: a genuinely complete prior archive — a Parquet file
+// whose footer row count matches what archive_state recorded — is still trusted
+// and skipped under --retry, never needlessly re-archived.
+//
+// Scenario: a valid 1-row archive already exists; then a second live row lands
+// in the same partition after the archive was taken (a backfilled gap replayed
+// with original binlog timestamps into the oldest RANGE partition). Cycle 1
+// under --retry correctly SKIPS re-archiving the still-valid file (#802), but
+// the drop must be DEFERRED, not taken: dropping now would erase the second row
+// from BOTH the index and the archive (#779). The now-incomplete staged archive
+// is discarded so cycle 2 re-archives the full (2-row) partition and only then
+// drops it — proving the "leave for the next cycle" path converges.
+func TestPerformRotation_GrownAfterArchiveDefersDropAndReArchives(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 
@@ -766,15 +774,16 @@ func TestPerformRotation_ValidExistingArchiveRetrySkips(t *testing.T) {
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
 
 	archiveDir := t.TempDir()
-	bintrailID := "test-uuid-valid-skip"
-	outPath, _ := HiveArchivePath(archiveDir, bintrailID, indexer.PartitionName(h1))
+	bintrailID := "test-uuid-toctou"
+	partName := indexer.PartitionName(h1)
+	outPath, _ := HiveArchivePath(archiveDir, bintrailID, partName)
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	// Seed a genuinely complete, valid 1-row archive up front (as a prior
 	// successful run would have left it) and record it in archive_state —
 	// the state a legitimate --retry skip depends on.
-	if _, err := archive.ArchivePartition(context.Background(), db, dbName, indexer.PartitionName(h1), outPath, "none"); err != nil {
+	if _, err := archive.ArchivePartition(context.Background(), db, dbName, partName, outPath, "none"); err != nil {
 		t.Fatalf("seed ArchivePartition: %v", err)
 	}
 	origBytes, err := os.ReadFile(outPath)
@@ -783,11 +792,9 @@ func TestPerformRotation_ValidExistingArchiveRetrySkips(t *testing.T) {
 	}
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count)
-		VALUES (?, ?, ?, 1)`, indexer.PartitionName(h1), bintrailID, outPath)
+		VALUES (?, ?, ?, 1)`, partName, bintrailID, outPath)
 
-	// A second live row lands in the partition after the archive was taken;
-	// it must NOT force a re-archive under --retry — the recorded row_count
-	// (1) still matches the file's own footer, so the file stays trusted.
+	// The second live row lands in the partition AFTER the archive was taken.
 	ts2 := h1.Add(40 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, ts2, nil, "testdb", "users", 1, "2", nil, nil, []byte(`{"id":2}`))
 
@@ -803,7 +810,7 @@ func TestPerformRotation_ValidExistingArchiveRetrySkips(t *testing.T) {
 	}
 	t.Cleanup(func() { uploadFileFunc = prev })
 
-	res, err := Perform(context.Background(), db, dbName, Options{
+	opts := Options{
 		RetainDur:          24 * time.Hour,
 		ArchiveDir:         archiveDir,
 		ArchiveS3:          "s3://fake-bucket/prefix/",
@@ -813,27 +820,96 @@ func TestPerformRotation_ValidExistingArchiveRetrySkips(t *testing.T) {
 		Format:             "json",
 		NoReplace:          true,
 		Retry:              true,
-	})
+	}
+
+	// ── Cycle 1: the partition grew since it was archived → defer the drop. ──
+	res, err := Perform(context.Background(), db, dbName, opts)
 	if err != nil {
-		t.Fatalf("Perform: %v", err)
+		t.Fatalf("Perform cycle 1: %v", err)
 	}
-	if res.Dropped != 1 {
-		t.Errorf("Dropped = %d, want 1", res.Dropped)
+	if res.Dropped != 0 {
+		t.Errorf("cycle 1 Dropped = %d, want 0 (partition grew since archive; must not be dropped)", res.Dropped)
 	}
+	if res.Deferred != 1 {
+		t.Errorf("cycle 1 Deferred = %d, want 1 (TOCTOU guard)", res.Deferred)
+	}
+	// #802 half: the still-valid 1-row file was skipped, not re-archived —
+	// the bytes uploaded are the original 1-row archive, unchanged.
 	if !bytes.Equal(uploadedBytes, origBytes) {
 		t.Error("a valid, already-recorded archive was re-archived (bytes changed) instead of being skipped")
 	}
-
-	var rowCount int64
+	// #779 half: the partition (and both rows) must survive the deferral.
+	if !partitionExists(t, db, dbName, partName) {
+		t.Errorf("partition %s must NOT have been dropped after the guard deferred it", partName)
+	}
+	if got := livePartitionCount(t, db, dbName, partName); got != 2 {
+		t.Errorf("live partition row count = %d, want 2 (both rows must survive the deferral)", got)
+	}
+	// The incomplete staged archive is discarded: no archive_state row and no
+	// local file, so cycle 2 re-archives from scratch rather than trusting it.
+	var stillRecorded bool
 	if err := db.QueryRow(
-		`SELECT row_count FROM archive_state WHERE partition_name = ? AND bintrail_id = ?`,
-		indexer.PartitionName(h1), bintrailID,
-	).Scan(&rowCount); err != nil {
-		t.Fatalf("read archive_state: %v", err)
+		`SELECT EXISTS(SELECT 1 FROM archive_state WHERE partition_name = ? AND bintrail_id = ?)`,
+		partName, bintrailID,
+	).Scan(&stillRecorded); err != nil {
+		t.Fatalf("check archive_state: %v", err)
 	}
-	if rowCount != 1 {
-		t.Errorf("archive_state.row_count = %d, want unchanged at 1 (a re-archive would have recomputed it to 2)", rowCount)
+	if stillRecorded {
+		t.Error("stale archive_state row must be discarded on deferral so --retry re-archives next cycle")
 	}
+	if _, statErr := os.Stat(outPath); !os.IsNotExist(statErr) {
+		t.Errorf("stale local archive %s must be removed on deferral; stat err = %v", outPath, statErr)
+	}
+
+	// ── Cycle 2: re-archive the full partition, then drop it (convergence). ──
+	uploadedBytes = nil
+	res, err = Perform(context.Background(), db, dbName, opts)
+	if err != nil {
+		t.Fatalf("Perform cycle 2: %v", err)
+	}
+	if res.Dropped != 1 {
+		t.Errorf("cycle 2 Dropped = %d, want 1 (re-archived the full partition, then dropped)", res.Dropped)
+	}
+	if partitionExists(t, db, dbName, partName) {
+		t.Errorf("partition %s should have been dropped in cycle 2 after a complete re-archive", partName)
+	}
+	if uploadedBytes == nil {
+		t.Fatal("cycle 2 must re-upload the re-archived partition")
+	}
+	pf, err := parquet.OpenFile(bytes.NewReader(uploadedBytes), int64(len(uploadedBytes)))
+	if err != nil {
+		t.Fatalf("cycle 2 uploaded bytes are not a valid parquet file: %v", err)
+	}
+	if pf.NumRows() != 2 {
+		t.Errorf("cycle 2 uploaded parquet NumRows = %d, want 2 (the full grown partition)", pf.NumRows())
+	}
+}
+
+// partitionExists reports whether binlog_events still has the named partition.
+func partitionExists(t *testing.T, db *sql.DB, dbName, name string) bool {
+	t.Helper()
+	parts, err := listPartitions(context.Background(), db, dbName)
+	if err != nil {
+		t.Fatalf("listPartitions: %v", err)
+	}
+	for _, p := range parts {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// livePartitionCount returns the live row count of a single partition.
+func livePartitionCount(t *testing.T, db *sql.DB, dbName, name string) int64 {
+	t.Helper()
+	var c int64
+	if err := db.QueryRow(
+		fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`binlog_events` PARTITION (`%s`)", dbName, name),
+	).Scan(&c); err != nil {
+		t.Fatalf("count partition %s: %v", name, err)
+	}
+	return c
 }
 
 // TestPerformRotation_LocalOnlyArchiveNotPruned pins the inverse invariant: with

@@ -838,17 +838,22 @@ func fullTableColumns(images []map[string]any, ddlOrder []string) []string {
 //     happen in tests that build a bare &Handler{}. Permissive so
 //     those tests stay representative of legacy paths.
 //   - resolver load fails (DB blip, ErrNoSnapshots, sticky-fallback
-//     mid-outage) → permissive. Preserves the columnOrderFor
-//     graceful-degradation contract: a broken snapshot lookup must
-//     not turn a working query into a 1064 error. The fetch still
-//     runs, the wire response still degrades to alphabetical column
-//     order, and operators see the same Debug/Warn split logs they
-//     get from columnOrderFor for the same condition.
-//   - table not in any snapshot → permissive, same rationale.
+//     mid-outage) → REJECT with 1064 (#821). The shim cannot confirm
+//     q.PKColumn is the table's PK, and the documented guarantee
+//     (a WHERE on a non-PK column is rejected, never silently answered
+//     against the wrong row — docs/time-travel-sql.md) outweighs the
+//     old graceful-degradation convenience: permitting the WHERE would
+//     join the literal against pk_values and return a DIFFERENT row
+//     with zero signal, re-opening #296 in the no-snapshot window. The
+//     no-WHERE full-table AS OF path (q.PKColumn == "", handled above)
+//     is unaffected and still runs. Logged at Warn with the reason.
+//   - table not in any snapshot → REJECT with 1064, same rationale.
 //     Tables created after the most recent snapshot (MySQL) or that
 //     have not yet seen DML on the stream (PostgreSQL, whose
-//     snapshots are written per RelationMessage) are common and
-//     self-fix on the next snapshot / first DML.
+//     snapshots are written per RelationMessage) can't have their PK
+//     verified, so a column-qualified WHERE must fail loud rather than
+//     answer against pk_values. Re-running `bintrail snapshot`
+//     converges; the no-WHERE full-table query keeps working meanwhile.
 //   - len(PKColumns) == 0 → table snapshot is present but has no PK
 //     declared. The shim can't safely correlate row state without a
 //     PK, so reject with 1064. validateTables enforces PK presence
@@ -875,23 +880,37 @@ func (h *Handler) validatePKColumn(q TimeTravelQuery) error {
 	}
 	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger)
 	if err != nil {
-		// Same split as columnOrderFor: ErrNoSnapshots is benign
-		// first-install state; anything else is a real config/infra
-		// problem the operator should see at default log-level info.
+		// Cannot confirm q.PKColumn is the table's PK. A
+		// column-qualified WHERE is guaranteed here (the full-table
+		// shape returned above), so fail loud rather than join the
+		// literal against pk_values and risk the wrong row (#821).
+		// ErrNoSnapshots (benign first-install state) still can't
+		// verify the PK, so it rejects too — only the no-WHERE
+		// full-table path is exempt. Was Debug/skip; raised to Warn.
+		reason := "schema_snapshots lookup failed"
 		if errors.Is(err, metadata.ErrNoSnapshots) {
-			h.logger.Debug("shim: no snapshots yet; skipping PK validation",
-				"schema", q.Schema, "table", q.Table)
-		} else {
-			h.logger.Warn("shim: schema_snapshots lookup failed; skipping PK validation",
-				"err", err, "schema", q.Schema, "table", q.Table)
+			reason = "no schema snapshots available yet"
 		}
-		return nil
+		h.logger.Warn("shim: cannot verify PK column; rejecting column-qualified WHERE",
+			"err", err, "reason", reason, "schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn)
+		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
+			"cannot verify WHERE column %s is the primary key of %s.%s (%s); refusing to run so a non-PK WHERE cannot silently return the wrong row",
+			q.PKColumn, q.Schema, q.Table, reason,
+		))
 	}
 	tm, err := r.Resolve(q.Schema, q.Table)
 	if err != nil {
-		h.logger.Debug("shim: table not in any snapshot; skipping PK validation",
-			"err", err, "schema", q.Schema, "table", q.Table)
-		return nil
+		// Table absent from every snapshot (created after the newest
+		// snapshot, or not yet seen on the stream). Can't verify the
+		// PK, so a column-qualified WHERE rejects rather than answer
+		// against pk_values and return a different row (#821). Re-run
+		// `bintrail snapshot`; the no-WHERE full-table path still works.
+		h.logger.Warn("shim: table not in any snapshot; rejecting column-qualified WHERE",
+			"err", err, "schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn)
+		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
+			"cannot verify WHERE column %s is the primary key of %s.%s (table not present in any indexed snapshot); refusing to run so a non-PK WHERE cannot silently return the wrong row",
+			q.PKColumn, q.Schema, q.Table,
+		))
 	}
 	if len(tm.PKColumns) == 0 {
 		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(

@@ -166,12 +166,14 @@ func TestResolveUpConsoleEnv(t *testing.T) {
 func TestWatchStreamConfig(t *testing.T) {
 	orig := struct {
 		src, idx, sch, tbl, fmtv, met string
+		ssl, sslCA, sslCert, sslKey   string
 		batch, chk, msi               int
-	}{upSourceDSN, upIndexDSN, upSchemas, upTables, upFormat, upMetricsAddr, upBatchSize, upCheckpoint, upMetricsScrapeInterval}
+	}{upSourceDSN, upIndexDSN, upSchemas, upTables, upFormat, upMetricsAddr, upSSLMode, upSSLCA, upSSLCert, upSSLKey, upBatchSize, upCheckpoint, upMetricsScrapeInterval}
 	t.Cleanup(func() {
 		upSourceDSN, upIndexDSN, upSchemas, upTables, upFormat = orig.src, orig.idx, orig.sch, orig.tbl, orig.fmtv
 		upBatchSize, upCheckpoint = orig.batch, orig.chk
 		upMetricsAddr, upMetricsScrapeInterval = orig.met, orig.msi
+		upSSLMode, upSSLCA, upSSLCert, upSSLKey = orig.ssl, orig.sslCA, orig.sslCert, orig.sslKey
 	})
 
 	upSourceDSN = "user:pass@tcp(source.example.com:3306)/src"
@@ -183,6 +185,13 @@ func TestWatchStreamConfig(t *testing.T) {
 	upFormat = "json"
 	upMetricsAddr = "" // primary stream gates index metrics on this being set
 	upMetricsScrapeInterval = 33
+	// Source TLS is user-configurable on watch (#879): set non-default values
+	// so a regression that re-hardcodes SSLMode or drops the cert/key wiring
+	// fails here rather than silently downgrading to unauthenticated TLS.
+	upSSLMode = "verify-ca"
+	upSSLCA = "/etc/ssl/ca.pem"
+	upSSLCert = "/etc/ssl/client-cert.pem"
+	upSSLKey = "/etc/ssl/client-key.pem"
 
 	const passedServerID uint32 = 4242424242
 	cfg := watchStreamConfig(passedServerID)
@@ -205,7 +214,11 @@ func TestWatchStreamConfig(t *testing.T) {
 	// Pinned defaults, not user-configurable from watch.
 	assertStr(t, "StartFile", cfg.StartFile, "")
 	assertStr(t, "StartGTID", cfg.StartGTID, "")
-	assertStr(t, "SSLMode", cfg.SSLMode, "preferred")
+	// Source TLS is user-configurable (#879) — it must propagate verbatim.
+	assertStr(t, "SSLMode", cfg.SSLMode, "verify-ca")
+	assertStr(t, "SSLCA", cfg.SSLCA, "/etc/ssl/ca.pem")
+	assertStr(t, "SSLCert", cfg.SSLCert, "/etc/ssl/client-cert.pem")
+	assertStr(t, "SSLKey", cfg.SSLKey, "/etc/ssl/client-key.pem")
 	// The daemon serves ONE /metrics endpoint for all streams; a per-stream
 	// bind here would conflict with it.
 	assertStr(t, "MetricsAddr", cfg.MetricsAddr, "")
@@ -286,6 +299,59 @@ func TestResolveUpConsoleEnvAuthTLS(t *testing.T) {
 	assertStr(t, "upConsoleAuthFile (flag)", upConsoleAuthFile, "/flag/auth.yaml")
 	assertStr(t, "upConsoleTLSCert (flag)", upConsoleTLSCert, "/flag/cert.pem")
 	assertStr(t, "upConsoleTLSKey (flag)", upConsoleTLSKey, "/flag/key.pem")
+}
+
+// TestWatchSSLEnvBinding locks the source-TLS override channel (#879): the
+// --ssl-mode/--ssl-ca/--ssl-cert/--ssl-key flags exist on the real watchCmd,
+// each is wired to its BINTRAIL_SSL_* env var in watchEnvBindings, and an env
+// value propagates to the up* globals via bindWatchEnv. Without this, watch's
+// source stream silently connects with ssl-mode=preferred and no override.
+func TestWatchSSLEnvBinding(t *testing.T) {
+	saved := [4]string{upSSLMode, upSSLCA, upSSLCert, upSSLKey}
+	t.Cleanup(func() { upSSLMode, upSSLCA, upSSLCert, upSSLKey = saved[0], saved[1], saved[2], saved[3] })
+
+	// The flags must exist on the REAL watchCmd — a rename in init() not
+	// mirrored in watchEnvBindings would silently drop the env override.
+	for _, name := range []string{"ssl-mode", "ssl-ca", "ssl-cert", "ssl-key"} {
+		if watchCmd.Flags().Lookup(name) == nil {
+			t.Fatalf("flag --%s not registered on watchCmd", name)
+		}
+	}
+	// …and each is mapped to its BINTRAIL_SSL_* env var.
+	wantEnv := map[string]string{
+		"ssl-mode": "BINTRAIL_SSL_MODE",
+		"ssl-ca":   "BINTRAIL_SSL_CA",
+		"ssl-cert": "BINTRAIL_SSL_CERT",
+		"ssl-key":  "BINTRAIL_SSL_KEY",
+	}
+	got := map[string]string{}
+	for _, b := range watchEnvBindings {
+		if _, ok := wantEnv[b.Flag]; ok {
+			got[b.Flag] = b.EnvVar
+		}
+	}
+	for flag, env := range wantEnv {
+		if got[flag] != env {
+			t.Errorf("watchEnvBindings[%q] = %q, want %q", flag, got[flag], env)
+		}
+	}
+
+	// bindWatchEnv applies the env to the bound flags (a throwaway cmd bound to
+	// the same globals, mirroring how init() binds watchCmd).
+	cmd := &cobra.Command{}
+	cmd.Flags().StringVar(&upSSLMode, "ssl-mode", "preferred", "")
+	cmd.Flags().StringVar(&upSSLCA, "ssl-ca", "", "")
+	cmd.Flags().StringVar(&upSSLCert, "ssl-cert", "", "")
+	cmd.Flags().StringVar(&upSSLKey, "ssl-key", "", "")
+	t.Setenv("BINTRAIL_SSL_MODE", "verify-identity")
+	t.Setenv("BINTRAIL_SSL_CA", "/env/ca.pem")
+	t.Setenv("BINTRAIL_SSL_CERT", "/env/cert.pem")
+	t.Setenv("BINTRAIL_SSL_KEY", "/env/key.pem")
+	bindWatchEnv(cmd)
+	assertStr(t, "upSSLMode (env)", upSSLMode, "verify-identity")
+	assertStr(t, "upSSLCA (env)", upSSLCA, "/env/ca.pem")
+	assertStr(t, "upSSLCert (env)", upSSLCert, "/env/cert.pem")
+	assertStr(t, "upSSLKey (env)", upSSLKey, "/env/key.pem")
 }
 
 // TestRotateTargets covers the per-source archive wiring: the boot index is

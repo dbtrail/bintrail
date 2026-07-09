@@ -67,7 +67,7 @@ func runHandleRowsWith(t *testing.T, resolver *metadata.Resolver, binlogEv *repl
 	t.Helper()
 	rowsEv := binlogEv.Event.(*replication.RowsEvent)
 	out := make(chan Event, 4)
-	err := handleRows(context.Background(), newTestLogger(logBuf), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, "", 9, out)
+	err := handleRows(context.Background(), newTestLogger(logBuf), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, "", 9, out, nil)
 	close(out)
 	var evs []Event
 	for ev := range out {
@@ -307,5 +307,131 @@ func TestHandleRows_namesPresentCountDiffersTakesCountGuard(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "column count mismatch") {
 		t.Errorf("expected the count-guard warn, got logs: %s", logBuf.String())
+	}
+}
+
+// ─── File-index schema-gap tracker (#778) ─────────────────────────────────────
+//
+// In file mode the DDL auto-snapshot resolver swap runs consumer-side, one
+// buffered channel behind the parser, so rows following an in-file CREATE/ALTER
+// can decode against a stale resolver and be skipped ("table not in snapshot" /
+// "column count mismatch") before the swap lands. handleRows records such a skip
+// on the passed schemaGapTracker ONLY when the event is at-or-after the snapshot
+// time (a stale snapshot with a converging remediation), mirroring the #700
+// name-drift asymmetry — never for a historical pre-snapshot event, and never
+// for the stream path (nil tracker). ParseFile turns a non-empty tracker into a
+// hard file-level error so the file is not silently marked 'completed'.
+
+// gapRowsEvent builds a WRITE_ROWS event with a controllable schema/table,
+// column count, and header timestamp. No column names → the #700 name check is
+// a no-op, isolating the table-absent / count-mismatch branches.
+func gapRowsEvent(schema, table string, columnCount uint64, ts uint32) *replication.BinlogEvent {
+	row := make([]any, columnCount)
+	for i := range row {
+		row[i] = int64(i + 1)
+	}
+	return &replication.BinlogEvent{
+		Header: &replication.EventHeader{
+			EventType: replication.WRITE_ROWS_EVENTv2,
+			LogPos:    200,
+			EventSize: 100,
+			Timestamp: ts,
+		},
+		Event: &replication.RowsEvent{
+			Table: &replication.TableMapEvent{
+				Schema:      []byte(schema),
+				Table:       []byte(table),
+				ColumnCount: columnCount,
+			},
+			Rows: [][]any{row},
+		},
+	}
+}
+
+// timedOrdersResolver returns a two-column shop.orders resolver stamped with
+// snapshotTime, so eventPredatesSnapshot can classify events by header time.
+func timedOrdersResolver(snapshotTime time.Time) *metadata.Resolver {
+	tm := &metadata.TableMeta{
+		Schema: "shop",
+		Table:  "orders",
+		Columns: []metadata.ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+			{Name: "amount", OrdinalPosition: 2, DataType: "int"},
+		},
+		PKColumns: []string{"id"},
+	}
+	return metadata.NewResolverFromTablesAt(9, snapshotTime, map[string]*metadata.TableMeta{"shop.orders": tm})
+}
+
+func TestHandleRows_schemaGapTrackerFileMode(t *testing.T) {
+	snapT := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	afterTS := uint32(snapT.Add(time.Hour).Unix())
+	beforeTS := uint32(snapT.Add(-time.Hour).Unix())
+
+	cases := []struct {
+		name       string
+		ev         *replication.BinlogEvent
+		nilTracker bool // stream path
+		wantRecord bool
+	}{
+		{"table-absent at-or-after snapshot records a gap", gapRowsEvent("shop", "widgets", 2, afterTS), false, true},
+		// System schemas are always excluded from any snapshot (TakeSnapshot's
+		// NOT IN list), so a mysql.rds_heartbeat2 row event at-or-after snapshot
+		// time is a routine, non-convergent skip — it must NOT record a gap or
+		// the RDS / offline-binlog file would be marked 'failed' forever (#778).
+		{"excluded system schema at-or-after snapshot never records a gap", gapRowsEvent("mysql", "rds_heartbeat2", 2, afterTS), false, false},
+		{"table-absent predating snapshot is a silent historical skip", gapRowsEvent("shop", "widgets", 2, beforeTS), false, false},
+		{"table-absent with unknown event time stays strict", gapRowsEvent("shop", "widgets", 2, 0), false, true},
+		{"column-count mismatch at-or-after snapshot records a gap", gapRowsEvent("shop", "orders", 1, afterTS), false, true},
+		{"column-count mismatch predating snapshot is a silent historical skip", gapRowsEvent("shop", "orders", 1, beforeTS), false, false},
+		{"nil tracker (stream path) never records", gapRowsEvent("shop", "widgets", 2, afterTS), true, false},
+		{"resolvable matching event records nothing", gapRowsEvent("shop", "orders", 2, afterTS), false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var tracker *schemaGapTracker
+			if !tc.nilTracker {
+				tracker = &schemaGapTracker{}
+			}
+			rowsEv := tc.ev.Event.(*replication.RowsEvent)
+			out := make(chan Event, 4)
+			err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), timedOrdersResolver(snapT),
+				&Filters{}, tc.ev, rowsEv, "binlog.000007", "", 0, "", 9, out, tracker)
+			close(out)
+			// A skip is never a hard error at the handleRows layer — the
+			// file-level failure is decided by ParseFile from the tracker.
+			if err != nil {
+				t.Fatalf("handleRows returned a hard error on a skip: %v", err)
+			}
+			got := tracker != nil && tracker.count > 0
+			if got != tc.wantRecord {
+				t.Fatalf("gap recorded = %v, want %v (tracker=%+v)", got, tc.wantRecord, tracker)
+			}
+		})
+	}
+}
+
+// A file with two stale-snapshot skips escalates the log exactly once (record
+// returns true only on the first gap) but counts every skipped event, so
+// ParseFile's error reports the full magnitude.
+func TestSchemaGapTracker_recordCountsAllEscalatesOnce(t *testing.T) {
+	var tr schemaGapTracker
+	if !tr.record("first gap") {
+		t.Fatal("first record must return true (escalate)")
+	}
+	if tr.record("second gap") {
+		t.Fatal("second record must return false (no re-escalation)")
+	}
+	if tr.count != 2 {
+		t.Fatalf("count = %d, want 2", tr.count)
+	}
+	if tr.first != "first gap" {
+		t.Fatalf("first = %q, want %q", tr.first, "first gap")
+	}
+	// Nil-safe: the stream path passes a nil tracker.
+	var nilTr *schemaGapTracker
+	if nilTr.record("x") {
+		t.Fatal("nil tracker record must return false")
 	}
 }

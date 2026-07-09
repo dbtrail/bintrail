@@ -863,6 +863,11 @@ func TestDetectPositionGap_noGap(t *testing.T) {
 	if gap.HasGap {
 		t.Error("expected no gap when checkpoint is on latest file")
 	}
+	// Resuming in place: a same-named regrown binlog after a source rebuild is
+	// undetectable here, so the guard flag must be set (#780).
+	if !gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=true on an in-place position-mode resume")
+	}
 }
 
 // TestDetectPositionGap_fillable verifies that a fillable gap is reported when
@@ -892,6 +897,11 @@ func TestDetectPositionGap_fillable(t *testing.T) {
 	}
 	if !strings.Contains(gap.Message, "mysql-bin.000001") {
 		t.Errorf("expected checkpoint file in message, got: %s", gap.Message)
+	}
+	// Fillable gap still resumes reading the existing checkpoint file — rebuild
+	// undetectable (#780).
+	if !gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=true on a fillable position-mode gap")
 	}
 }
 
@@ -931,6 +941,11 @@ func TestDetectPositionGap_unfillable(t *testing.T) {
 	if !strings.Contains(gap.Message, "mysql-bin.000038") {
 		t.Errorf("expected checkpoint file in message, got: %s", gap.Message)
 	}
+	// A purged (unfillable) gap is already surfaced loudly and auto-advanced, so
+	// the rebuild-undetectable guard must NOT fire here (#780).
+	if gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=false on an unfillable/purged gap")
+	}
 }
 
 // TestDetectPositionGap_extraColumns verifies that SHOW BINARY LOGS with extra
@@ -956,6 +971,65 @@ func TestDetectPositionGap_extraColumns(t *testing.T) {
 	}
 	if !gap.Fillable {
 		t.Error("expected fillable gap")
+	}
+	if !gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=true on a fillable position-mode gap")
+	}
+}
+
+// TestDetectPositionGap_rebuildUndetectable pins the #780 guard: the source was
+// rebuilt (RESET MASTER + restore) and the same-named checkpoint binlog regrew
+// PAST the checkpoint offset. The file exists and checkpointPos < size, so the
+// check passes and the stream would resume reading a divergent history. Position
+// mode cannot tell — the guard flag is the only signal, and it must be set.
+func TestDetectPositionGap_rebuildUndetectable(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Checkpoint was mysql-bin.000001:5000. After a rebuild the source only has a
+	// regenerated mysql-bin.000001 that has already grown to 20000 bytes.
+	mock.ExpectQuery("SHOW BINARY LOGS").WillReturnRows(
+		sqlmock.NewRows([]string{"Log_name", "File_size"}).
+			AddRow("mysql-bin.000001", 20000))
+
+	gap, err := detectPositionGap(db, "mysql-bin.000001", 5000, 10*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gap.HasGap {
+		t.Error("expected no reported gap (checkpoint file is the latest and pos <= size)")
+	}
+	if !gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=true: a regrown same-named binlog is undetectable in position mode")
+	}
+}
+
+// TestDetectPositionGap_posExceedsSize verifies the pos>size branch (a truncated
+// or freshly-regenerated shorter file) is treated as an unfillable gap and does
+// NOT set the rebuild-undetectable guard — that path is already loud (#780).
+func TestDetectPositionGap_posExceedsSize(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW BINARY LOGS").WillReturnRows(
+		sqlmock.NewRows([]string{"Log_name", "File_size"}).
+			AddRow("mysql-bin.000001", 500))
+
+	gap, err := detectPositionGap(db, "mysql-bin.000001", 9000, 10*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gap.HasGap || gap.Fillable {
+		t.Fatalf("expected an unfillable gap when checkpoint pos exceeds file size, got %+v", gap)
+	}
+	if gap.RebuildUndetectable {
+		t.Error("expected RebuildUndetectable=false on the loud pos>size branch")
 	}
 }
 
@@ -1414,5 +1488,92 @@ func TestDeleteEventsSinceCheckpointGTID_deletesStragglers(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// ─── #775: position-mode safe checkpoint never mid-statement ──────────────────
+
+// TestPositionCheckpoint_neverMidStatement is the unit guard for #775. In
+// POSITION mode the persisted checkpoint must be the last statement/commit/DDL
+// boundary, never a byte offset between the ROWS_EVENTs of one split statement
+// (a statement > binlog_row_event_max_size is split into several ROWS_EVENTs
+// under ONE TABLE_MAP — resuming StartSync mid-statement hits a rows event with
+// no preceding TABLE_MAP and crash-loops). It drives the same two decisions
+// streamLoop makes per event — the per-event binlogPos advance and the
+// boundary-gated safePos advance — then asserts checkpointPosition (what
+// saveCheckpoint persists) tracks the committed boundary.
+func TestPositionCheckpoint_neverMidStatement(t *testing.T) {
+	const file = "binlog.000001"
+	// Seeded at the resolved start boundary (pos 100), as One() does.
+	state := &streamState{mode: "position", binlogFile: file, binlogPos: 100, safeFile: file, safePos: 100}
+
+	// apply mirrors streamLoop's per-event position bookkeeping.
+	apply := func(ev parser.Event) {
+		if ev.BinlogFile != "" {
+			state.binlogFile = ev.BinlogFile
+		}
+		state.binlogPos = ev.EndPos
+		if isPositionCheckpointBoundary(ev) {
+			state.safeFile, state.safePos = state.binlogFile, ev.EndPos
+		}
+	}
+
+	// A bulk UPDATE split across two ROWS_EVENTs under one TABLE_MAP: the first
+	// chunk (no STMT_END) then a second chunk, still not the statement end.
+	apply(parser.Event{EventType: parser.EventUpdate, BinlogFile: file, EndPos: 300, StmtEnd: false})
+	apply(parser.Event{EventType: parser.EventUpdate, BinlogFile: file, EndPos: 500, StmtEnd: false})
+
+	// A ticker checkpoint fires HERE — mid-statement. It must persist the prior
+	// committed boundary (100), not the per-event offset (500).
+	if f, p := checkpointPosition(state); f != file || p != 100 {
+		t.Fatalf("mid-statement checkpoint must stay at the committed boundary %s:100, got %s:%d", file, f, p)
+	}
+	if state.binlogPos != 500 {
+		t.Fatalf("per-event binlogPos should still track the latest event for metrics/display, got %d", state.binlogPos)
+	}
+
+	// The statement's last chunk (STMT_END_F) arrives — safePos may now advance.
+	apply(parser.Event{EventType: parser.EventUpdate, BinlogFile: file, EndPos: 700, StmtEnd: true})
+	if _, p := checkpointPosition(state); p != 700 {
+		t.Fatalf("after STMT_END the safe checkpoint must advance to 700, got %d", p)
+	}
+
+	// EventGTID (transaction-start marker) is NOT a boundary.
+	apply(parser.Event{EventType: parser.EventGTID, BinlogFile: file, EndPos: 720})
+	if _, p := checkpointPosition(state); p != 700 {
+		t.Fatalf("EventGTID must not advance the safe checkpoint; want 700, got %d", p)
+	}
+
+	// EventCommit (XID) IS a boundary.
+	apply(parser.Event{EventType: parser.EventCommit, BinlogFile: file, EndPos: 750})
+	if _, p := checkpointPosition(state); p != 750 {
+		t.Fatalf("after commit the safe checkpoint must advance to 750, got %d", p)
+	}
+
+	// EventDDL (auto-commit) IS a boundary, and carries the new file after a rotate.
+	apply(parser.Event{EventType: parser.EventDDL, BinlogFile: "binlog.000002", EndPos: 900})
+	if f, p := checkpointPosition(state); f != "binlog.000002" || p != 900 {
+		t.Fatalf("EventDDL must advance the safe checkpoint to binlog.000002:900, got %s:%d", f, p)
+	}
+}
+
+// TestCheckpointPosition_gtidModeUsesPerEventPos pins that #775 does NOT change
+// GTID-mode checkpointing: there the per-event binlogPos is persisted (its resume
+// is transaction-aligned and deleteEventsSinceCheckpointGTID depends on the
+// offset), even when a stale safePos is present.
+func TestCheckpointPosition_gtidModeUsesPerEventPos(t *testing.T) {
+	state := &streamState{mode: "gtid", binlogFile: "binlog.000009", binlogPos: 4096, safeFile: "binlog.000009", safePos: 100}
+	if f, p := checkpointPosition(state); f != "binlog.000009" || p != 4096 {
+		t.Fatalf("GTID mode must persist the per-event position 4096, got %s:%d", f, p)
+	}
+}
+
+// TestCheckpointPosition_positionFallback pins the backward-compat fallback: a
+// position-mode state that never populated safe* (external/test callers) keeps
+// the pre-#775 behavior of persisting binlogFile/binlogPos.
+func TestCheckpointPosition_positionFallback(t *testing.T) {
+	state := &streamState{mode: "position", binlogFile: "binlog.000001", binlogPos: 4}
+	if f, p := checkpointPosition(state); f != "binlog.000001" || p != 4 {
+		t.Fatalf("unseeded safe* must fall back to binlog*, got %s:%d", f, p)
 	}
 }

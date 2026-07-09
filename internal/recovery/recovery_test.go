@@ -807,6 +807,68 @@ func TestGenerateSQLFromRows_unresolvedToastMarker(t *testing.T) {
 	}
 }
 
+// TestGenerateSQLFromRows_partialGenerationRefused is the #784 acceptance test: an
+// event whose stored image is malformed (here row_before is nil for a DELETE, as a
+// truncated/corrupt JSON payload would decode) must make recover FAIL LOUD — a hard
+// error naming the event and zero bytes written — never a script where the failed
+// event is demoted to a `-- ERROR ...` comment while the rest commits clean (a
+// silently incomplete reversal). The happy-path sibling in the same call must not
+// rescue it: one bad event refuses the whole script.
+func TestGenerateSQLFromRows_partialGenerationRefused(t *testing.T) {
+	g := newGen()
+	rows := []query.ResultRow{
+		{ // generatable
+			EventID: 1, SchemaName: "db", TableName: "t", EventType: parser.EventInsert,
+			PKValues: "1", RowAfter: map[string]any{"id": float64(1)},
+		},
+		{ // NOT generatable: DELETE with nil row_before (malformed/truncated image)
+			EventID: 2, SchemaName: "db", TableName: "t", EventType: parser.EventDelete,
+			PKValues: "2", RowBefore: nil,
+		},
+	}
+	var buf bytes.Buffer
+	n, err := g.GenerateSQLFromRows(rows, &buf)
+	if err == nil {
+		t.Fatalf("expected a loud refusal, got n=%d output:\n%s", n, buf.String())
+	}
+	if n != 0 {
+		t.Errorf("expected 0 statements on refusal, got %d", n)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("refusal must write NOTHING, got %d bytes:\n%s", buf.Len(), buf.String())
+	}
+	for _, want := range []string{"refusing to emit reversal SQL", "event 2", "row_before is nil"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q:\n%s", want, err)
+		}
+	}
+	// A malformed comment must never be the ONLY signal: the failed event must be
+	// named in the error, not just left as a demoted `-- ERROR ...` line.
+	if strings.Contains(err.Error(), "event 1") {
+		t.Errorf("only the un-generatable event should be named, not the healthy one:\n%s", err)
+	}
+}
+
+// TestGenerateSQLFromRows_multipleFailuresAllNamed proves the refusal lists EVERY
+// un-generatable event, not just the first — the diagnosis is complete (#784).
+func TestGenerateSQLFromRows_multipleFailuresAllNamed(t *testing.T) {
+	g := newGen()
+	rows := []query.ResultRow{
+		{EventID: 7, SchemaName: "db", TableName: "t", EventType: parser.EventUpdate, PKValues: "7", RowBefore: nil, RowAfter: map[string]any{"id": float64(7)}},
+		{EventID: 9, SchemaName: "db", TableName: "t", EventType: parser.EventInsert, PKValues: "9", RowAfter: nil},
+	}
+	var buf bytes.Buffer
+	_, err := g.GenerateSQLFromRows(rows, &buf)
+	if err == nil {
+		t.Fatalf("expected refusal, got nil (output:\n%s)", buf.String())
+	}
+	for _, want := range []string{"event 7", "event 9", "2 of the matched event(s)"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q:\n%s", want, err)
+		}
+	}
+}
+
 // ─── resolverForRow ──────────────────────────────────────────────────────────
 
 func TestResolverForRow_zeroVersionReturnsFallback(t *testing.T) {

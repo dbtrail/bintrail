@@ -430,16 +430,76 @@ func TestDecode_DeleteWithoutBeforeImageFailsLoud(t *testing.T) {
 	}
 }
 
-func TestDecode_TruncateNotIndexed(t *testing.T) {
-	// TRUNCATE has a real behavioral contract: it must be surfaced (warned) but
-	// NEVER indexed as a row event (DDL replay on the PG path is out of #530 scope).
+func TestDecode_TruncateEmitsAuditMarker(t *testing.T) {
+	// A TRUNCATE emits no per-row DELETE, so it must be recorded as a durable
+	// audit marker — an EventDDL(DDLTruncateTable) the consumer writes to
+	// schema_changes — carrying the truncated table and stamped with the txn's
+	// commit LSN/time (#827).
 	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
-	_, emit, err := d.Decode(&pglogrepl.TruncateMessage{RelationNum: 1, RelationIDs: []uint32{1}})
-	if err != nil {
-		t.Fatalf("TRUNCATE: unexpected error: %v", err)
+	mustDecode(t, d, relMsg(1, "public", "orders", "id", "amount"))
+	mustDecode(t, d, beginMsg())
+
+	ev, emit := mustDecode(t, d, &pglogrepl.TruncateMessage{RelationNum: 1, RelationIDs: []uint32{1}})
+	if !emit {
+		t.Fatal("TRUNCATE must emit an audit marker")
 	}
+	if ev.EventType != event.EventDDL || ev.DDLType != event.DDLTruncateTable {
+		t.Fatalf("TRUNCATE marker: type=%d ddl=%q, want EventDDL / %q", ev.EventType, ev.DDLType, event.DDLTruncateTable)
+	}
+	if ev.Schema != "public" || ev.Table != "orders" {
+		t.Fatalf("TRUNCATE marker table = %s.%s, want public.orders", ev.Schema, ev.Table)
+	}
+	if ev.DDLQuery != "TRUNCATE TABLE public.orders" {
+		t.Errorf("TRUNCATE marker DDLQuery = %q, want %q", ev.DDLQuery, "TRUNCATE TABLE public.orders")
+	}
+	if ev.EndPos != uint64(txnLSN) || !ev.Timestamp.Equal(txnTime) {
+		t.Errorf("TRUNCATE marker stamped EndPos=%d ts=%v, want %d / %v (commit coords)", ev.EndPos, ev.Timestamp, uint64(txnLSN), txnTime)
+	}
+	if p := d.TakePending(); len(p) != 0 {
+		t.Errorf("single-relation TRUNCATE must not buffer pending markers, got %d", len(p))
+	}
+}
+
+func TestDecode_TruncateMultiRelationBuffersPending(t *testing.T) {
+	// `TRUNCATE a, b` arrives as ONE message covering both relations; Decode
+	// returns the first marker and the second surfaces via TakePending so neither
+	// is silently dropped (#827).
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	mustDecode(t, d, relMsg(1, "public", "orders", "id"))
+	mustDecode(t, d, relMsg(2, "public", "items", "id"))
+	mustDecode(t, d, beginMsg())
+
+	ev, emit := mustDecode(t, d, &pglogrepl.TruncateMessage{RelationNum: 2, RelationIDs: []uint32{1, 2}})
+	if !emit || ev.Table != "orders" || ev.DDLType != event.DDLTruncateTable {
+		t.Fatalf("first marker = %s.%s (%q, emit=%v), want public.orders TRUNCATE TABLE", ev.Schema, ev.Table, ev.DDLType, emit)
+	}
+	pending := d.TakePending()
+	if len(pending) != 1 {
+		t.Fatalf("TakePending len = %d, want 1 (second truncated relation)", len(pending))
+	}
+	if pending[0].Table != "items" || pending[0].DDLType != event.DDLTruncateTable {
+		t.Errorf("pending marker = %s.%s (%q), want public.items TRUNCATE TABLE", pending[0].Schema, pending[0].Table, pending[0].DDLType)
+	}
+	if p := d.TakePending(); p != nil {
+		t.Errorf("TakePending must empty the buffer, second call returned %d events", len(p))
+	}
+}
+
+func TestDecode_TruncateFilteredOutRecordsNothing(t *testing.T) {
+	// A TRUNCATE of a table outside the capture filter records no marker (and
+	// buffers nothing) — the filter decides scope, same as the row paths.
+	d := pgcapture.NewDecoder(pkResolver("id"),
+		event.Filters{Tables: map[string]bool{"public.keep": true}}, nil)
+	mustDecode(t, d, relMsg(1, "public", "keep", "id"))
+	mustDecode(t, d, relMsg(2, "public", "skip", "id"))
+	mustDecode(t, d, beginMsg())
+
+	ev, emit := mustDecode(t, d, &pglogrepl.TruncateMessage{RelationNum: 1, RelationIDs: []uint32{2}})
 	if emit {
-		t.Error("TRUNCATE must not be indexed (DDL replay out of #530 scope) — emit should be false")
+		t.Errorf("TRUNCATE of a filtered-out table must not emit a marker, got %s.%s", ev.Schema, ev.Table)
+	}
+	if p := d.TakePending(); len(p) != 0 {
+		t.Errorf("filtered-out TRUNCATE must buffer no pending markers, got %d", len(p))
 	}
 }
 

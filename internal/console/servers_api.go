@@ -280,6 +280,15 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 		MonitorDesired: old.MonitorDesired,
 		SourceServerID: req.SourceServerID,
 		Schemas:        req.Schemas,
+		// Source TLS (#879) has no request field yet — it is hand-edited into
+		// the registry YAML. Carry it over from the stored entry so a plain UI
+		// edit does not wipe a configured verify-ca / mutual-TLS source
+		// connection. (These are typed fields now, so they no longer survive via
+		// the Extra catch-all the way an unknown key would.)
+		SSLMode: old.SSLMode,
+		SSLCA:   old.SSLCA,
+		SSLCert: old.SSLCert,
+		SSLKey:  old.SSLKey,
 	}
 	if err := s.cm.reg.Update(entry); err != nil {
 		writeJSONError(w, registryErrStatus(err), err.Error())

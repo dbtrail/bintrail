@@ -298,6 +298,52 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 						continue
 					}
 
+					// ── TOCTOU guard: the partition must be unchanged since it ──
+					// was archived. binlog_events is append-only — DROP PARTITION
+					// is the only thing that ever removes rows — so any difference
+					// between the count captured at archive time
+					// (archive_state.row_count == the rows written to the Parquet)
+					// and the partition's current live count means rows were
+					// INSERTED after the archive SELECT and during the
+					// possibly-minutes-long upload. That happens when a backfilled
+					// gap is replayed with original binlog timestamps and lands in
+					// this old RANGE partition while rotation is archiving it.
+					// Dropping now would erase those rows from BOTH the index and
+					// the archive. Instead defer the drop and discard the now-stale
+					// archive so the next cycle re-archives the full partition; the
+					// built-in loop's deferred-streak escalation surfaces a
+					// partition that keeps growing.
+					archived, err := archivedRowCount(ctx, db, name, opts.BintrailID)
+					if err != nil {
+						return Result{}, fmt.Errorf("read archived row count for %s: %w", name, err)
+					}
+					live, err := partitionRowCount(ctx, db, dbName, name)
+					if err != nil {
+						return Result{}, fmt.Errorf("recount partition %s before drop: %w", name, err)
+					}
+					if !archivedPartitionUnchanged(archived, live) {
+						slog.Warn("partition changed since it was archived; deferring drop and discarding the stale archive for re-archive next cycle",
+							"partition", name, "archived_rows", archived.Int64, "live_rows", live)
+						if opts.Format != "json" {
+							fmt.Fprintf(os.Stdout, "skipped drop for %s (partition changed since archive: %d → %d rows; will re-archive next cycle)\n",
+								name, archived.Int64, live)
+						}
+						// Discard the incomplete staged archive and its
+						// archive_state row so (a) --retry re-archives instead of
+						// trusting the stale file, and (b) no later drop-only cycle
+						// trusts this partition as safely archived.
+						if _, derr := db.ExecContext(ctx,
+							`DELETE FROM archive_state WHERE partition_name = ? AND bintrail_id = ?`,
+							name, opts.BintrailID); derr != nil {
+							return Result{}, fmt.Errorf("invalidate stale archive state for %s: %w", name, derr)
+						}
+						if rerr := os.Remove(outPath); rerr != nil && !os.IsNotExist(rerr) {
+							slog.Warn("could not remove stale local archive after deferring drop", "partition", name, "error", rerr)
+						}
+						deferredCount++
+						continue
+					}
+
 					// Drop this partition immediately after archiving.
 					if err := dropPartitions(ctx, db, dbName, []string{name}); err != nil {
 						return Result{}, fmt.Errorf("failed to drop partition %s: %w", name, err)
@@ -481,6 +527,41 @@ func partitionArchived(ctx context.Context, db *sql.DB, partition string) (bool,
 		`SELECT EXISTS (SELECT 1 FROM archive_state WHERE partition_name = ?)`,
 		partition).Scan(&has)
 	return has, err
+}
+
+// archivedRowCount returns the row count archive_state recorded for a
+// partition — the number of rows written to its Parquet archive at the moment
+// it was taken. A missing archive_state row yields an invalid NullInt64, which
+// archivedPartitionUnchanged treats as "cannot verify" (never safe to drop).
+func archivedRowCount(ctx context.Context, db *sql.DB, partition, bintrailID string) (sql.NullInt64, error) {
+	var rc sql.NullInt64
+	err := db.QueryRowContext(ctx,
+		`SELECT row_count FROM archive_state WHERE partition_name = ? AND bintrail_id = ?`,
+		partition, bintrailID).Scan(&rc)
+	if errors.Is(err, sql.ErrNoRows) {
+		return sql.NullInt64{}, nil
+	}
+	return rc, err
+}
+
+// partitionRowCount returns the live row count of a single binlog_events
+// partition. Used by the archive-then-drop path to re-check, right before
+// DROP PARTITION, that no rows landed in the partition after it was archived
+// (the archive→drop TOCTOU, issue #779).
+func partitionRowCount(ctx context.Context, db *sql.DB, dbName, partition string) (int64, error) {
+	q := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`binlog_events` PARTITION (`%s`)", dbName, partition)
+	var c int64
+	err := db.QueryRowContext(ctx, q).Scan(&c)
+	return c, err
+}
+
+// archivedPartitionUnchanged reports whether a partition is safe to drop after
+// archiving: only when its archived snapshot row count is known AND still
+// equals the partition's current live row count. binlog_events is append-only,
+// so any difference means rows were inserted after the archive SELECT and would
+// be lost by the drop; an unknown archived count is never safe.
+func archivedPartitionUnchanged(archived sql.NullInt64, live int64) bool {
+	return archived.Valid && archived.Int64 == live
 }
 
 // fileExists reports whether a file exists and has a size greater than zero.

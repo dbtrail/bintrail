@@ -202,6 +202,10 @@ func TestRegistrySourceFieldsRoundTrip(t *testing.T) {
 		SourceServerID: 4242,
 		Schemas:        "shop,billing",
 		MonitorDesired: true,
+		SSLMode:        "verify-ca",
+		SSLCA:          "/etc/ssl/ca.pem",
+		SSLCert:        "/etc/ssl/client-cert.pem",
+		SSLKey:         "/etc/ssl/client-key.pem",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -217,6 +221,11 @@ func TestRegistrySourceFieldsRoundTrip(t *testing.T) {
 	if got.SourceDSN != "repl:"+secretPW+"@tcp(db.prod:3306)/" ||
 		got.SourceServerID != 4242 || got.Schemas != "shop,billing" || !got.MonitorDesired {
 		t.Errorf("source fields round-trip mismatch: %+v", got)
+	}
+	// Source-TLS fields (#879) persist and reload like the other typed fields.
+	if got.SSLMode != "verify-ca" || got.SSLCA != "/etc/ssl/ca.pem" ||
+		got.SSLCert != "/etc/ssl/client-cert.pem" || got.SSLKey != "/etc/ssl/client-key.pem" {
+		t.Errorf("source TLS fields round-trip mismatch: %+v", got)
 	}
 }
 

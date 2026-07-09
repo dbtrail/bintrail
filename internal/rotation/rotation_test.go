@@ -1,6 +1,7 @@
 package rotation
 
 import (
+	"database/sql"
 	"os"
 	"strings"
 	"testing"
@@ -8,6 +9,36 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/indexer"
 )
+
+// ─── archive→drop TOCTOU guard decision (issue #779) ─────────────────────────
+
+// TestArchivedPartitionUnchanged pins the pure decision behind the guard that
+// refuses to drop a partition whose live row count has drifted from what was
+// archived. binlog_events is append-only, so a mismatch means rows landed after
+// the archive SELECT (e.g. a backfilled gap replayed with original timestamps
+// into the oldest RANGE partition during the upload window) and dropping would
+// destroy them. An unknown archived count is never safe to drop on.
+func TestArchivedPartitionUnchanged(t *testing.T) {
+	cases := []struct {
+		name     string
+		archived sql.NullInt64
+		live     int64
+		want     bool
+	}{
+		{"unchanged → safe to drop", sql.NullInt64{Int64: 100, Valid: true}, 100, true},
+		{"grew during upload → defer", sql.NullInt64{Int64: 100, Valid: true}, 150, false},
+		{"shrank (tampered/impossible) → defer", sql.NullInt64{Int64: 100, Valid: true}, 50, false},
+		{"empty partition unchanged → safe", sql.NullInt64{Int64: 0, Valid: true}, 0, true},
+		{"unknown archived count → defer", sql.NullInt64{Valid: false}, 100, false},
+		{"unknown archived, zero live → defer", sql.NullInt64{Valid: false}, 0, false},
+	}
+	for _, c := range cases {
+		if got := archivedPartitionUnchanged(c.archived, c.live); got != c.want {
+			t.Errorf("%s: archivedPartitionUnchanged(%+v, %d) = %v, want %v",
+				c.name, c.archived, c.live, got, c.want)
+		}
+	}
+}
 
 // ─── nextPartitionStart ─────────────────────────────────────────────────────────────
 

@@ -387,7 +387,26 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 			return fail(fmt.Errorf("derive server id: %w", err))
 		}
 	}
-	cfg := streamrun.Config{
+	cfg := sourceStreamConfig(e, serverID)
+	cfg.Hooks = job.streamHooks()
+
+	m.wg.Add(1)
+	go m.run(jobCtx, job, e, cfg)
+	return nil
+}
+
+// sourceStreamConfig builds the supervised stream's streamrun.Config from a
+// registry entry (Hooks are attached by the caller — they need the live job).
+// The source connection's TLS comes from the entry's ssl_* fields (#879): an
+// empty SSLMode defaults to "preferred", preserving pre-#879 behavior for
+// entries with no TLS configured. Pure — extracted from Start so the
+// entry→config fan-out (SSL especially) is unit-testable without a live DB.
+func sourceStreamConfig(e console.ServerEntry, serverID uint32) streamrun.Config {
+	sslMode := e.SSLMode
+	if sslMode == "" {
+		sslMode = "preferred"
+	}
+	return streamrun.Config{
 		IndexDSN:  e.DSN,
 		SourceDSN: e.SourceDSN,
 		ServerID:  serverID,
@@ -398,16 +417,14 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 		// for all supervised streams (per-stream binds would conflict).
 		MetricsSource: e.ID,
 		Checkpoint:    10,
-		SSLMode:       "preferred",
+		SSLMode:       sslMode,
+		SSLCA:         e.SSLCA,
+		SSLCert:       e.SSLCert,
+		SSLKey:        e.SSLKey,
 		Format:        "text",
 		GapTimeout:    30,
-		Hooks:         job.streamHooks(),
 		Deps:          streamdeps.Default(),
 	}
-
-	m.wg.Add(1)
-	go m.run(jobCtx, job, e, cfg)
-	return nil
 }
 
 // run supervises one stream with crash-loop backoff: a stream that errors is

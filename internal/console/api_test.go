@@ -101,6 +101,34 @@ func TestBuildOptionsAttachesRBAC(t *testing.T) {
 	}
 }
 
+// TestBuildOptionsThreadsProfileActive guards the #838 fix: a named profile —
+// even one that resolved to ZERO deny/redact rules — must set
+// query.Options.ProfileActive so the redaction pass fires and QueryText/
+// QueryHash are withheld (#699). Without a profile it must stay false so
+// query_text is visible on an unrestricted console.
+func TestBuildOptionsThreadsProfileActive(t *testing.T) {
+	// profileActive true even with no deny/redact rules → a zero-rule named
+	// profile still withholds query_text.
+	active := &Server{profileActive: true}
+	opts, err := active.buildOptions(filterParams{Schema: "app"}, 100, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.ProfileActive {
+		t.Error("ProfileActive must be true when a profile name was supplied (zero-rule profile still withholds query_text)")
+	}
+
+	// No profile → ProfileActive false (query_text visible).
+	none := &Server{}
+	opts, err = none.buildOptions(filterParams{Schema: "app"}, 100, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.ProfileActive {
+		t.Error("ProfileActive must be false with no profile configured")
+	}
+}
+
 // TestEventsHandlerIncludesConnectionID exercises handleEvents at the HTTP
 // layer with sqlmock and asserts the #701 D1 boundary move holds over real
 // data flow: the source row carries connection_id, and the response now does

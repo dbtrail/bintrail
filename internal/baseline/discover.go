@@ -41,6 +41,17 @@ func DiscoverTables(inputDir string) ([]TableFiles, error) {
 		name := e.Name()
 		path := filepath.Join(inputDir, name)
 
+		// Compressed mydumper output (--compress GZIP/ZSTD) writes
+		// <db>.<table>.<chunk>.sql.gz / .sql.zst (and matching -schema.sql.gz).
+		// The baseline readers parse plain SQL/TSV only, so such a file would
+		// fall through the classifier below and be silently skipped — the whole
+		// dump then surfaces as an unhelpful "no tables found". Fail loud with
+		// actionable guidance instead.
+		if isCompressedDump(name) {
+			return nil, fmt.Errorf("compressed mydumper dump detected (%s): compressed dumps are not supported — "+
+				"re-run mydumper without --compress, or decompress the dump first (e.g. gunzip *.gz / unzstd *.zst)", name)
+		}
+
 		// Schema file: <db>.<table>-schema.sql
 		if strings.HasSuffix(name, "-schema.sql") {
 			base := strings.TrimSuffix(name, "-schema.sql")
@@ -170,6 +181,20 @@ func isView(schemaPath string) bool {
 	}
 	// No CREATE statement found or I/O error — assume table rather than
 	// silently skipping, which is the exact failure mode of issue #226.
+	return false
+}
+
+// isCompressedDump reports whether name is a mydumper data or schema file
+// written with --compress: GZIP → ".gz", ZSTD → ".zst". Matching the full
+// ".sql.gz"/".dat.zst" shape (not a bare ".gz") avoids false-positives on
+// unrelated files that happen to sit in the dump directory.
+func isCompressedDump(name string) bool {
+	lower := strings.ToLower(name)
+	for _, suf := range []string{".sql.gz", ".sql.zst", ".dat.gz", ".dat.zst"} {
+		if strings.HasSuffix(lower, suf) {
+			return true
+		}
+	}
 	return false
 }
 
