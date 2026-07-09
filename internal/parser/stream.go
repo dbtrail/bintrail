@@ -280,7 +280,10 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			currentQueryText = event.SanitizeQueryText(string(ev.Query))
 
 		case *replication.RowsEvent:
-			err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentQueryText, sp.schemaVersion.Load(), out)
+			// nil gapTracker: the stream keeps its warn-and-continue skip
+			// behavior (the synchronous DDL hook, SetSyncDDLHook, is the
+			// stream's post-DDL correctness mechanism, not file-level failure).
+			err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentQueryText, sp.schemaVersion.Load(), out, nil)
 			// Statement boundary — see the file parser's RowsEvent case: the
 			// STMT_END_F clear prevents a ROWS_QUERY-less later statement in
 			// the same transaction from inheriting this statement's text.

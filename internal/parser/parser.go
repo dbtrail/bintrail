@@ -121,6 +121,16 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	// stale text when the variable is toggled off mid-transaction).
 	var currentQueryText string
 
+	// gaps records rows skipped because the snapshot is stale (a table absent
+	// from it, or a diverging column count) for events at-or-after the snapshot
+	// time. The file-mode DDL resolver swap runs consumer-side — one buffered
+	// channel behind the parser — so rows following an in-file CREATE/ALTER can
+	// decode against a stale resolver and be skipped before the swap lands. A
+	// non-empty tracker turns into a hard error below so the file is marked
+	// 'failed' (and re-indexed after a fresh snapshot) instead of silently
+	// 'completed' with an undetected gap (#778).
+	var gaps schemaGapTracker
+
 	bp := replication.NewBinlogParser()
 	// Pin TIMESTAMP-column string rendering to UTC. go-mysql's default (nil
 	// location) formats fracTime.String() using the raw time.Unix(...) value,
@@ -182,7 +192,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			currentQueryText = event.SanitizeQueryText(string(ev.Query))
 
 		case *replication.RowsEvent:
-			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentQueryText, p.schemaVersion.Load(), events)
+			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentQueryText, p.schemaVersion.Load(), events, &gaps)
 			// The LAST rows event of a statement carries STMT_END_F — the
 			// actual statement boundary. Clearing here keeps one statement's
 			// text alive across its chained/split rows events, while a later
@@ -205,7 +215,19 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 		return nil
 	}
 
-	return bp.ParseFile(fullPath, 0, handleEvent)
+	if err := bp.ParseFile(fullPath, 0, handleEvent); err != nil {
+		return err
+	}
+	if gaps.count > 0 {
+		return fmt.Errorf(
+			"schema gap: %d row event(s) in %s were skipped because the schema snapshot is stale "+
+				"(first: %s) — these rows were NOT indexed. Run `bintrail snapshot` against the current "+
+				"schema and re-index this file (a failed file re-indexes from the start). This commonly "+
+				"follows a CREATE/ALTER TABLE within the file whose auto-snapshot landed too late for the "+
+				"buffered rows",
+			gaps.count, filename, gaps.first)
+	}
+	return nil
 }
 
 // rewriteInnerHeader stamps a Transaction_payload inner event's header with
@@ -246,8 +268,61 @@ func firstPartialImage(skipped [][]int) []int {
 	return nil
 }
 
+// schemaGapTracker records recoverable schema gaps: rows skipped because their
+// table is absent from the snapshot or its column count diverged, for an event
+// AT-OR-AFTER the snapshot time (a STALE snapshot, not a historical pre-snapshot
+// state). It is populated ONLY on the file-index path (Parser.ParseFile); the
+// stream path passes a nil tracker and keeps its warn-and-continue behavior,
+// which is backed by the synchronous DDL hook (SetSyncDDLHook). ParseFile turns
+// a non-empty tracker into a hard file-level error so the file is marked
+// 'failed' and re-indexed (after a fresh snapshot) rather than silently marked
+// 'completed' with an undetected gap — the file-mode DDL resolver swap runs
+// consumer-side, one buffered channel behind the parser, so post-DDL rows can
+// decode with a stale resolver and be skipped before the swap lands (#778).
+type schemaGapTracker struct {
+	count int
+	first string // human detail of the first gap, for the file-level error
+}
+
+// record notes one skipped-row schema gap and returns true if it was the first
+// (so callers escalate to a log line exactly once, not per skipped row). Nil-safe.
+func (t *schemaGapTracker) record(detail string) bool {
+	if t == nil {
+		return false
+	}
+	t.count++
+	if t.count == 1 {
+		t.first = detail
+		return true
+	}
+	return false
+}
+
+// eventPredatesSnapshot reports whether binlogEv safely predates the resolver's
+// snapshot — the lenient/historical case (mirrors the #700 name-drift
+// asymmetry). When true, a schema mismatch is a routine historical state
+// (re-indexing old binlogs, or a stream backlog written before a re-snapshot)
+// with no converging remediation, so it must NOT escalate to a file-level
+// failure. Unknown times (a zero event timestamp or a zero snapshot time) are
+// treated as NOT predating (strict), so an unknown age never takes the lenient
+// path.
+func eventPredatesSnapshot(binlogEv *replication.BinlogEvent, resolver *metadata.Resolver) bool {
+	snapTime := resolver.SnapshotTime()
+	if binlogEv.Header.Timestamp == 0 || snapTime.IsZero() {
+		return false
+	}
+	eventTime := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
+	return eventTime.Before(snapTime)
+}
+
 // handleRows processes a RowsEvent, resolving column names and dispatching to
 // the appropriate emit function. It is shared by Parser.ParseFile and StreamParser.Run.
+//
+// gapTracker is non-nil only on the file-index path: when a row event is skipped
+// because its table is absent from the snapshot or the column count diverged AND
+// the event is at-or-after the snapshot time (a stale snapshot), the skip is
+// recorded so ParseFile can fail the whole file rather than complete it with an
+// undetected gap (#778). The stream path passes nil.
 func handleRows(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -260,6 +335,7 @@ func handleRows(
 	queryText string,
 	schemaVersion uint32,
 	out chan<- Event,
+	gapTracker *schemaGapTracker,
 ) error {
 	schema := string(rowsEv.Table.Schema)
 	table := string(rowsEv.Table.Table)
@@ -282,6 +358,18 @@ func handleRows(
 			"file", filename,
 			"pos", binlogEv.Header.LogPos,
 			"error", err)
+		// File-index path only: an at-or-after-snapshot skip is a stale
+		// snapshot (e.g. a table created by a DDL earlier in this same file
+		// whose consumer-side resolver swap landed too late for these buffered
+		// rows). Record it so ParseFile fails the file instead of completing it
+		// with an undetected gap (#778). Pre-snapshot events stay a warn-only
+		// historical skip.
+		if gapTracker != nil && !eventPredatesSnapshot(binlogEv, resolver) {
+			if gapTracker.record(fmt.Sprintf("%s.%s not in snapshot %d at %s:%d", schema, table, schemaVersion, filename, binlogEv.Header.LogPos)) {
+				logger.Error("schema gap: skipping rows for a table absent from the snapshot at-or-after snapshot time — the snapshot is stale; this file will be marked failed (run `bintrail snapshot`, then re-index)",
+					"file", filename, "pos", binlogEv.Header.LogPos, "schema", schema, "table", table)
+			}
+		}
 		return nil
 	}
 
@@ -296,6 +384,17 @@ func handleRows(
 			"table", table,
 			"binlog_columns", rowsEv.Table.ColumnCount,
 			"snapshot_columns", len(tm.Columns))
+		// File-index path only: an at-or-after-snapshot count divergence is a
+		// stale snapshot (a DDL earlier in this same file added/removed a column
+		// and its consumer-side resolver swap landed too late for these buffered
+		// rows). Record it so ParseFile fails the file (#778). Pre-snapshot
+		// events stay a warn-only historical skip.
+		if gapTracker != nil && !eventPredatesSnapshot(binlogEv, resolver) {
+			if gapTracker.record(fmt.Sprintf("%s.%s column count %d vs snapshot %d at %s:%d", schema, table, rowsEv.Table.ColumnCount, len(tm.Columns), filename, binlogEv.Header.LogPos)) {
+				logger.Error("schema gap: skipping rows whose column count diverges from the snapshot at-or-after snapshot time — the snapshot is stale; this file will be marked failed (run `bintrail snapshot`, then re-index)",
+					"file", filename, "pos", binlogEv.Header.LogPos, "schema", schema, "table", table)
+			}
+		}
 		return nil
 	}
 
