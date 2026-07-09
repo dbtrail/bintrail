@@ -66,6 +66,14 @@ type Config struct {
 	// applied to every query the console runs — on EVERY server.
 	DenyTables    []query.SchemaTable
 	RedactColumns []query.SchemaTableColumn
+	// ProfileActive is set by the caller whenever a profile NAME was supplied,
+	// even if it resolved to ZERO deny/redact rules (an empty profile). It forces
+	// query.Options.ProfileActive on every query so QueryText/QueryHash are
+	// withheld under EVERY named profile (#699), and — since Parquet archives do
+	// not run the redaction pass — couples with NoArchive so archive rows cannot
+	// leak that statement text either (#838). Independent of the rule count,
+	// which stays the signal for rbacActive() (cascade/reconstruct gating).
+	ProfileActive bool
 	// AllowedHosts is an optional allowlist of hostnames accepted in the Host
 	// header (in addition to IP literals and localhost), for operators who
 	// front the console with a DNS name.
@@ -136,11 +144,15 @@ type RotationDefaults struct {
 // gates) lives in a connManager bundle resolved per request from the
 // X-Bintrail-Server header.
 type Server struct {
-	listen       string
-	token        string
-	denyTables   []query.SchemaTable
-	redactCols   []query.SchemaTableColumn
-	allowedHosts []string
+	listen     string
+	token      string
+	denyTables []query.SchemaTable
+	redactCols []query.SchemaTableColumn
+	// profileActive is true when a profile NAME was supplied (even zero-rule).
+	// buildOptions threads it into query.Options.ProfileActive so query_text is
+	// withheld under every named profile (#699/#838).
+	profileActive bool
+	allowedHosts  []string
 	// monitorCtrl: non-nil only when this process is a control-plane
 	// supervisor (see Config.MonitorCtrl).
 	monitorCtrl MonitorController
@@ -252,14 +264,17 @@ func New(cfg Config) (*Server, error) {
 	// deny-table / redact-column rule must also disable archive auto-discovery
 	// — on every server, not just the boot entry. cmd/bintrail also sets
 	// NoArchive when a profile is active; this makes the invariant structural
-	// rather than caller-dependent.
-	profileActive := len(cfg.DenyTables) > 0 || len(cfg.RedactColumns) > 0
+	// rather than caller-dependent. A NAMED profile that resolved to zero rules
+	// counts too (cfg.ProfileActive): its query_text withholding (#699) must not
+	// be defeated by archive rows, which skip the redaction pass (#838).
+	profileActive := cfg.ProfileActive || len(cfg.DenyTables) > 0 || len(cfg.RedactColumns) > 0
 
 	s := &Server{
 		listen:           listen,
 		token:            token,
 		denyTables:       cfg.DenyTables,
 		redactCols:       cfg.RedactColumns,
+		profileActive:    profileActive,
 		allowedHosts:     cfg.AllowedHosts,
 		monitorCtrl:      cfg.MonitorCtrl,
 		baselineCtrl:     cfg.BaselineCtrl,

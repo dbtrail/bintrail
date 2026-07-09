@@ -546,6 +546,17 @@ type gapResult struct {
 
 	// For unfillable gaps in GTID mode: the purged GTID set to use as base.
 	PurgedGTIDSet string
+
+	// RebuildUndetectable is set by position-mode gap detection when it resumes
+	// reading from an existing binlog at a valid offset (no gap, or a fillable
+	// gap). In that case a source rebuild (RESET MASTER + restore) that regrew a
+	// same-named binlog past the checkpoint offset is INVISIBLE here — the file
+	// exists and checkpointPos <= size, so the check passes and the stream reads
+	// a potentially DIFFERENT history. GTID mode detects this divergence (the
+	// executed-set comparison in detectGTIDGap); position mode has no identity
+	// signal at gap-detection time. Callers surface this as an escalated warning.
+	// Never set by the GTID detectors — GTID resumes stay false.
+	RebuildUndetectable bool
 }
 
 // detectPositionGap queries the source MySQL for available binary logs and
@@ -616,13 +627,17 @@ func detectPositionGap(sourceDB *sql.DB, checkpointFile string, checkpointPos ui
 				}, nil
 			}
 			// File still exists and position is valid — gap is fillable.
+			// Either way we resume reading the existing file from checkpointPos,
+			// so a same-named regrown binlog after a source rebuild is undetectable
+			// here (see gapResult.RebuildUndetectable).
 			currentFile := logs[len(logs)-1].name
 			if checkpointFile == currentFile {
-				return &gapResult{HasGap: false}, nil
+				return &gapResult{HasGap: false, RebuildUndetectable: true}, nil
 			}
 			return &gapResult{
-				HasGap:   true,
-				Fillable: true,
+				HasGap:              true,
+				Fillable:            true,
+				RebuildUndetectable: true,
 				Message: fmt.Sprintf(
 					"gap detected: checkpoint is at %s:%d, source is at %s; replaying missed events",
 					checkpointFile, checkpointPos, currentFile),
@@ -1567,6 +1582,29 @@ func One(ctx context.Context, cfg Config) error {
 					cfg.Hooks.OnGapAutoAdvance(gap.Message)
 				}
 			}
+		}
+
+		// Position-mode resume cannot detect a source rebuild. When the checkpoint
+		// file still exists and checkpointPos <= size (no gap, or a fillable gap),
+		// detectPositionGap resumes reading from checkpointPos — but if the source
+		// was rebuilt (RESET MASTER + restore) and a same-named binlog regrew past
+		// that offset, we would silently index a DIFFERENT binlog history. GTID
+		// mode detects this (the executed-set comparison in detectGTIDGap
+		// diverges); position mode has no identity signal at gap-detection time.
+		// Escalate loudly rather than resume silently. Non-blocking: a hard error
+		// here would break every legitimate position-mode resume.
+		if gap != nil && gap.RebuildUndetectable {
+			slog.Warn("position-mode resume cannot detect a source rebuild: if the source was "+
+				"rebuilt (RESET MASTER + restore) and a same-named binlog regrew past the checkpoint "+
+				"offset, streaming will silently index a divergent binlog history. GTID mode detects "+
+				"this; position mode does not. To protect against rebuilds, run in GTID mode "+
+				"(start with --start-gtid); if this source was already rebuilt, pass --reset to "+
+				"discard the stale checkpoint before restarting.",
+				"checkpoint_file", startFile, "checkpoint_pos", startPos)
+			fmt.Printf("Warning: position-mode resume cannot verify the source was not rebuilt "+
+				"(RESET MASTER + restore) at %s:%d; if it was, streaming will index a divergent "+
+				"history. GTID mode (--start-gtid) detects this; pass --reset if the source was rebuilt.\n",
+				startFile, startPos)
 		}
 	}
 

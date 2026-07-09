@@ -66,6 +66,17 @@ type ServerEntry struct {
 	SourceServerID uint32 `yaml:"source_server_id,omitempty"`
 	// Schemas is the optional comma-separated schema filter for monitoring.
 	Schemas string `yaml:"schemas,omitempty"`
+
+	// ── Source TLS (#879) ──
+	// SSLMode/SSLCA/SSLCert/SSLKey configure the TLS the supervisor uses when
+	// connecting to the SOURCE MySQL. Empty SSLMode = the daemon default
+	// ("preferred"), preserving pre-#879 behavior; SSLCA/SSLCert/SSLKey are file
+	// paths on the daemon host (verify-ca / mutual TLS), not secrets like the
+	// DSNs. On binaries that predate these they round-trip untouched via Extra.
+	SSLMode string `yaml:"ssl_mode,omitempty"`
+	SSLCA   string `yaml:"ssl_ca,omitempty"`
+	SSLCert string `yaml:"ssl_cert,omitempty"`
+	SSLKey  string `yaml:"ssl_key,omitempty"`
 	// ArchiveS3 is the S3 destination (s3://bucket/prefix/) the daemon's
 	// built-in rotation uploads this source's rotated Parquet partitions to
 	// BEFORE dropping them — so the forensic record survives retention and

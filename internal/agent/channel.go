@@ -103,6 +103,14 @@ type FlushStatus struct {
 	PayloadStatus     string // "ok" or "degraded"
 	LastMetadataFlush *time.Time
 	LastPayloadFlush  *time.Time
+
+	// Cumulative events/batches permanently dropped after retries were
+	// exhausted (no on-disk spool). Monotonic — never reset — unlike the
+	// status strings above, which flip back to "ok" on the next success.
+	MetadataLostEvents  int64
+	MetadataLostBatches int64
+	PayloadLostEvents   int64
+	PayloadLostBatches  int64
 }
 
 // NewChannel creates a Channel. The handler is called for each command
@@ -365,6 +373,10 @@ func (ch *Channel) sendHeartbeat(ctx context.Context, conn *websocket.Conn) erro
 			hb.PayloadStatus = s.PayloadStatus
 			hb.LastMetadataFlush = s.LastMetadataFlush
 			hb.LastPayloadFlush = s.LastPayloadFlush
+			hb.MetadataLostEvents = s.MetadataLostEvents
+			hb.MetadataLostBatches = s.MetadataLostBatches
+			hb.PayloadLostEvents = s.PayloadLostEvents
+			hb.PayloadLostBatches = s.PayloadLostBatches
 		}
 	}
 	return writeJSON(ctx, conn, hb)

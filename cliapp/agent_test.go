@@ -244,7 +244,7 @@ func TestByosStreamLoopContextCancellation(t *testing.T) {
 func TestFlushPipelineStateToFlushStatus(t *testing.T) {
 	state := &flushPipelineState{}
 	state.setBufferStats(42, 8192, 5)
-	state.updateFlush(true, false)
+	state.updateFlush(true, false, 3, 3)
 
 	status := state.toFlushStatus()
 	if status.BufferEvents == nil || *status.BufferEvents != 42 {
@@ -267,6 +267,58 @@ func TestFlushPipelineStateToFlushStatus(t *testing.T) {
 	}
 	if status.LastPayloadFlush != nil {
 		t.Error("LastPayloadFlush should be nil when payload failed")
+	}
+	// The metadata sink succeeded, so nothing lost there; the payload sink
+	// failed with a 3-event batch, so exactly those are counted lost.
+	if status.MetadataLostEvents != 0 || status.MetadataLostBatches != 0 {
+		t.Errorf("metadata lost = (%d events, %d batches), want (0, 0)",
+			status.MetadataLostEvents, status.MetadataLostBatches)
+	}
+	if status.PayloadLostEvents != 3 || status.PayloadLostBatches != 1 {
+		t.Errorf("payload lost = (%d events, %d batches), want (3, 1)",
+			status.PayloadLostEvents, status.PayloadLostBatches)
+	}
+}
+
+// TestFlushPipelineStateLostCountersCumulative pins the durability guarantee:
+// the lost-event/lost-batch counters accumulate across flushes and are NOT
+// reset when a later flush succeeds (unlike the status strings, which flip
+// back to "ok" and erase the memory of the outage).
+func TestFlushPipelineStateLostCountersCumulative(t *testing.T) {
+	state := &flushPipelineState{}
+
+	// First outage: both sinks fail a 5-event batch.
+	got := state.updateFlush(false, false, 5, 5)
+	if got.metadataLostEvents != 5 || got.metadataLostBatches != 1 ||
+		got.payloadLostEvents != 5 || got.payloadLostBatches != 1 {
+		t.Fatalf("after first drop: %+v, want all (5 events, 1 batch)", got)
+	}
+
+	// Second outage: only the payload sink fails a 2-event batch. Metadata
+	// recovers ("ok") but its cumulative counter must NOT reset.
+	got = state.updateFlush(true, false, 2, 2)
+	if got.metadataLostEvents != 5 || got.metadataLostBatches != 1 {
+		t.Errorf("metadata counter reset on recovery: %+v, want (5 events, 1 batch)", got)
+	}
+	if got.payloadLostEvents != 7 || got.payloadLostBatches != 2 {
+		t.Errorf("payload lost = (%d events, %d batches), want (7, 2)",
+			got.payloadLostEvents, got.payloadLostBatches)
+	}
+
+	// A fully successful flush leaves the cumulative counters untouched even
+	// as it clears the degraded status.
+	got = state.updateFlush(true, true, 4, 4)
+	if got.metadataLostEvents != 5 || got.payloadLostEvents != 7 {
+		t.Errorf("counters changed on success: %+v, want metadata=5 payload=7", got)
+	}
+	status := state.toFlushStatus()
+	if status.MetadataStatus != "ok" || status.PayloadStatus != "ok" {
+		t.Errorf("status after success = (%q, %q), want (ok, ok)",
+			status.MetadataStatus, status.PayloadStatus)
+	}
+	if status.MetadataLostEvents != 5 || status.PayloadLostEvents != 7 {
+		t.Errorf("status lost = (meta %d, payload %d), want (5, 7)",
+			status.MetadataLostEvents, status.PayloadLostEvents)
 	}
 }
 

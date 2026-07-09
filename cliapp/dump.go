@@ -112,8 +112,11 @@ func resolveMydumper(cmd *cobra.Command) (dumpResolution, error) {
 // buildDockerArgs constructs the full argument slice for invoking mydumper via
 // docker run. The output directory is bind-mounted at the same absolute path so
 // downstream tools need no path translation. When encryptKeyPath is non-empty,
-// the key file is also bind-mounted into the container.
-func buildDockerArgs(image, outputDir, host string, mydumperArgs []string, encryptKeyPath string) []string {
+// the key file is also bind-mounted into the container. When defaultsFile is
+// non-empty it is likewise bind-mounted read-only at the same path so the
+// container's mydumper can read the source password from it via --defaults-file
+// (keeping the secret off argv and out of `docker inspect`, #811).
+func buildDockerArgs(image, outputDir, host string, mydumperArgs []string, encryptKeyPath, defaultsFile string) []string {
 	absOutput, err := filepath.Abs(outputDir)
 	if err != nil {
 		absOutput = outputDir
@@ -131,6 +134,14 @@ func buildDockerArgs(image, outputDir, host string, mydumperArgs []string, encry
 			absKey = encryptKeyPath
 		}
 		args = append(args, "-v", absKey+":"+absKey+":ro")
+	}
+
+	if defaultsFile != "" {
+		absDefaults, err := filepath.Abs(defaultsFile)
+		if err != nil {
+			absDefaults = defaultsFile
+		}
+		args = append(args, "-v", absDefaults+":"+absDefaults+":ro")
 	}
 
 	if isLocalhost(host) {
@@ -230,17 +241,38 @@ func runDump(cmd *cobra.Command, args []string) error {
 			supportsLockMode = false
 		}
 	}
-	mydumperArgs := buildMydumperArgs(host, port, user, password, dmpOutputDir, dmpThreads, schemas, tables, encryptKeyPath, supportsLockMode)
+	// The source password must never reach mydumper's argv (visible in
+	// `ps aux` / /proc/<pid>/cmdline and, under Docker, in `docker inspect`).
+	// Docker mode delivers it via a 0600 defaults-file bind-mounted read-only;
+	// local mode delivers it via MYSQL_PWD in the child env below (#811).
+	var defaultsFile string
+	if password != "" && res.mode == dumpModeDocker {
+		var cleanup func()
+		var derr error
+		defaultsFile, cleanup, derr = writeMydumperDefaultsFile(password)
+		if derr != nil {
+			return derr
+		}
+		defer cleanup()
+	}
+	mydumperArgs := buildMydumperArgs(host, port, user, defaultsFile, dmpOutputDir, dmpThreads, schemas, tables, encryptKeyPath, supportsLockMode)
 
 	// 7. Build the final command depending on resolution mode.
 	var c *exec.Cmd
 	switch res.mode {
 	case dumpModeDocker:
-		dockerArgs := buildDockerArgs(res.image, dmpOutputDir, host, mydumperArgs, encryptKeyPath)
+		dockerArgs := buildDockerArgs(res.image, dmpOutputDir, host, mydumperArgs, encryptKeyPath, defaultsFile)
 		c = exec.CommandContext(cmd.Context(), res.path, dockerArgs...)
 		slog.Info("starting dump via Docker", "image", res.image, "output_dir", dmpOutputDir)
 	default:
 		c = exec.CommandContext(cmd.Context(), res.path, mydumperArgs...)
+		// Pass the password out of band so it stays off argv. MYSQL_PWD is
+		// honored by the MySQL client library mydumper links against and sits
+		// in the child's mode-0400 /proc/<pid>/environ, not world-readable
+		// cmdline (#811).
+		if password != "" {
+			c.Env = append(os.Environ(), "MYSQL_PWD="+password)
+		}
 		slog.Info("starting dump", "path", res.path, "output_dir", dmpOutputDir)
 	}
 
@@ -340,7 +372,14 @@ func mydumperSupportsLockMode(major, minor int) bool {
 // Table filtering: --tables-list with a comma-joined list.
 // When encryptKeyPath is non-empty, --exec-per-thread and
 // --exec-per-thread-extension are added for AES-256-CBC encryption.
-func buildMydumperArgs(host string, port uint16, user, password, outputDir string,
+//
+// The source password is NEVER placed on argv — it would be world-readable via
+// `ps aux` / /proc/<pid>/cmdline and, under Docker, in `docker inspect`. It is
+// delivered out of band: locally via MYSQL_PWD in the child env, and under
+// Docker via a 0600 defaults-file bind-mounted read-only. When defaultsFile is
+// non-empty its path is referenced with --defaults-file so mydumper reads the
+// password from it (#811).
+func buildMydumperArgs(host string, port uint16, user, defaultsFile, outputDir string,
 	threads int, schemas, tables []string, encryptKeyPath string, supportsLockMode bool) []string {
 
 	args := []string{
@@ -356,8 +395,8 @@ func buildMydumperArgs(host string, port uint16, user, password, outputDir strin
 		args = append(args, "--sync-thread-lock-mode", "NO_LOCK", "--trx-tables")
 	}
 
-	if password != "" {
-		args = append(args, "--password", password)
+	if defaultsFile != "" {
+		args = append(args, "--defaults-file", defaultsFile)
 	}
 
 	switch len(schemas) {
@@ -389,6 +428,53 @@ func buildMydumperArgs(host string, port uint16, user, password, outputDir strin
 	args = append(args, "--outputdir", outputDir)
 
 	return args
+}
+
+// writeMydumperDefaultsFile writes the source password to a fresh temp file in
+// MySQL option-file format (0600) so mydumper can read it via --defaults-file
+// instead of taking it on argv. Used by Docker mode, where a passed-through
+// MYSQL_PWD would still surface in `docker inspect` Config.Env. The returned
+// cleanup removes the file and must be deferred by the caller even on a later
+// error. os.CreateTemp opens O_EXCL with mode 0600, so creation is atomic and
+// the secret is never briefly world-readable (#811).
+func writeMydumperDefaultsFile(password string) (path string, cleanup func(), err error) {
+	f, err := os.CreateTemp("", "bintrail-mydumper-*.cnf")
+	if err != nil {
+		return "", nil, fmt.Errorf("create mydumper defaults file: %w", err)
+	}
+	name := f.Name()
+	cleanup = func() { _ = os.Remove(name) }
+	// Defensive: CreateTemp already uses 0600, but pin it in case of an
+	// unusual umask/implementation.
+	if chmodErr := f.Chmod(0o600); chmodErr != nil {
+		_ = f.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("chmod mydumper defaults file: %w", chmodErr)
+	}
+	// Password under both [client] and [mydumper] so any mydumper build picks
+	// it up regardless of which group it reads.
+	v := escapeMyCnfValue(password)
+	content := "[client]\npassword=" + v + "\n[mydumper]\npassword=" + v + "\n"
+	if _, werr := f.WriteString(content); werr != nil {
+		_ = f.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("write mydumper defaults file: %w", werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("close mydumper defaults file: %w", cerr)
+	}
+	return name, cleanup, nil
+}
+
+// escapeMyCnfValue encodes a value for a MySQL option file. The value is wrapped
+// in double quotes (so a '#', ';', or whitespace is not misread as a comment or
+// truncated) with backslash and double-quote escaped, matching the escape
+// sequences the option-file parser recognizes inside a quoted value.
+func escapeMyCnfValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	return `"` + v + `"`
 }
 
 // extractSchemasFromTables derives unique schema names from a list of

@@ -73,7 +73,31 @@ var (
 		Help:      "Distribution of batch sizes (events per INSERT batch).",
 		Buckets:   prometheus.ExponentialBuckets(1, 2, 11), // 1, 2, 4, ..., 1024
 	}, []string{"source"})
+
+	// statementDMLDropped counts DML statements (INSERT/UPDATE/DELETE/REPLACE/
+	// LOAD DATA) seen in the binlog as a QUERY_EVENT rather than as ROW events —
+	// the signature of binlog_format=STATEMENT/MIXED or a session-level override
+	// away from ROW. Each such statement is a change bintrail could NOT capture
+	// (the row image is not in the binlog). It pairs with a loud slog.Warn at the
+	// parser capture boundary (#776), symmetric to the partial-image guard (#493).
+	//
+	// Deliberately top-level (no "stream" subsystem, no "source" label): the name
+	// renders exactly bintrail_statement_dml_dropped_total, which alerts key off,
+	// and the parser has no source handle to curry. Concurrent `watch` streams
+	// conflate into this single counter — the paired warn carries file/pos as the
+	// per-source disambiguator.
+	statementDMLDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "bintrail",
+		Name:      "statement_dml_dropped_total",
+		Help:      "DML statements seen in the binlog under STATEMENT/MIXED format (or a session override) — changes bintrail could not capture as row events.",
+	})
 )
+
+// StatementDMLDropped increments the statement-DML-dropped counter. Called from
+// the binlog parser's QUERY_EVENT handlers (file and stream paths) when a DML
+// statement — not DDL, not transaction-control — is observed, i.e. the
+// row-capture invariant (binlog_format=ROW) has been violated at the source.
+func StatementDMLDropped() { statementDMLDropped.Inc() }
 
 // StreamMetrics is the full set of stream metrics curried to one source
 // label — call sites keep the ergonomics of plain counters/gauges.

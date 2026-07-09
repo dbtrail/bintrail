@@ -103,6 +103,21 @@ func LoadProfileRules(ctx context.Context, db *sql.DB, profile string) ([]Schema
 	return denyTables, redactCols, nil
 }
 
+// ProfileExists reports whether a named RBAC profile row is present in the
+// profiles table. LoadProfileRules returns empty deny/redact slices WITHOUT an
+// error for a nonexistent profile name (a typo resolves to "enforce nothing"),
+// so a caller that must refuse an unknown profile — rather than silently
+// starting with RBAC that enforces nothing — probes existence with this first
+// (#838).
+func ProfileExists(ctx context.Context, db *sql.DB, profile string) (bool, error) {
+	var exists bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM profiles WHERE name = ?)`, profile).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check profile existence: %w", err)
+	}
+	return exists, nil
+}
+
 // ─── Options ─────────────────────────────────────────────────────────────────
 
 // BinlogPos is a binlog coordinate: a file name plus a byte position. It is used

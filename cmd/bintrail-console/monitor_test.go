@@ -37,6 +37,40 @@ func TestActiveJobs(t *testing.T) {
 	}
 }
 
+// TestSourceStreamConfig pins the registry-entry → supervised-stream config
+// fan-out, with the source-TLS wiring (#879) as the load-bearing case: an entry
+// with no ssl_* fields keeps the pre-#879 "preferred" default; an entry that
+// sets them propagates all four to the stream so the supervised source no
+// longer silently connects with an unauthenticated, unoverridable ssl-mode.
+func TestSourceStreamConfig(t *testing.T) {
+	// Default: no TLS config on the entry → "preferred", empty cert/key paths.
+	def := sourceStreamConfig(console.ServerEntry{
+		ID: "e1", DSN: "idx-dsn", SourceDSN: "src-dsn", Schemas: "shop",
+	}, 42)
+	if def.SSLMode != "preferred" {
+		t.Errorf("SSLMode = %q, want preferred (unset default)", def.SSLMode)
+	}
+	if def.SSLCA != "" || def.SSLCert != "" || def.SSLKey != "" {
+		t.Errorf("unset TLS paths must stay empty, got CA=%q Cert=%q Key=%q", def.SSLCA, def.SSLCert, def.SSLKey)
+	}
+	if def.IndexDSN != "idx-dsn" || def.SourceDSN != "src-dsn" || def.MetricsSource != "e1" ||
+		def.ServerID != 42 || def.Schemas != "shop" || def.BatchSize != 1000 || def.Checkpoint != 10 || def.GapTimeout != 30 {
+		t.Errorf("base fields wrong: %+v", def)
+	}
+	if def.Deps.ValidateBinlogFormat == nil {
+		t.Error("Deps must be wired (streamdeps.Default())")
+	}
+
+	// A registry entry's ssl_* fields propagate verbatim (#879).
+	got := sourceStreamConfig(console.ServerEntry{
+		ID: "e2", DSN: "idx-dsn", SourceDSN: "src-dsn",
+		SSLMode: "verify-ca", SSLCA: "/ca.pem", SSLCert: "/cert.pem", SSLKey: "/key.pem",
+	}, 7)
+	if got.SSLMode != "verify-ca" || got.SSLCA != "/ca.pem" || got.SSLCert != "/cert.pem" || got.SSLKey != "/key.pem" {
+		t.Errorf("registry TLS did not propagate to the stream config: %+v", got)
+	}
+}
+
 // ─── derived monitor states (#402) ───────────────────────────────────────────
 
 func TestMonitorJobSnapshot_stalledDerivation(t *testing.T) {

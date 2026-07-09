@@ -2,6 +2,7 @@ package console
 
 import (
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 )
@@ -82,7 +83,12 @@ func (l *loginLimiter) Allow(ip string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.global.observe(now, globalWindow) >= globalMax {
+	// The global window caps attacker-driven bcrypt CPU, but it must never
+	// lock out the operator (the file's throttle-only invariant). A loopback
+	// peer is the operator on the same host — ip is the real socket peer from
+	// r.RemoteAddr (never a spoofable X-Forwarded-For), so exempt it from the
+	// global gate. The per-IP gate below still applies to loopback callers.
+	if !isLoopbackIP(ip) && l.global.observe(now, globalWindow) >= globalMax {
 		l.logThrottledLocked(now, "global")
 		return false, l.global.retryAfter(now, globalWindow)
 	}
@@ -99,6 +105,14 @@ func (l *loginLimiter) Allow(ip string) (bool, time.Duration) {
 		return false, w.long.retryAfter(now, ipLongWindow)
 	}
 	return true, 0
+}
+
+// isLoopbackIP reports whether ip (the host part of r.RemoteAddr) is a
+// loopback address. A non-parseable value (never a real socket peer) is not
+// treated as loopback, so it stays subject to the global gate.
+func isLoopbackIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.IsLoopback()
 }
 
 // Fail records a failed attempt from ip.

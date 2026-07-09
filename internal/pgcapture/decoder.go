@@ -41,6 +41,13 @@ type Decoder struct {
 	relations map[uint32]*relationInfo
 	txn       txnContext
 
+	// pending buffers events a single Decode produced beyond its one return value.
+	// Only a multi-relation TRUNCATE fills it: `TRUNCATE a, b` arrives as ONE
+	// pgoutput message covering several relations, but Decode returns a single
+	// event — so the first in-scope marker is returned and the rest are queued here
+	// for the caller to drain via TakePending after every Decode (#827).
+	pending []event.Event
+
 	// timescaleWarned makes the TimescaleDB out-of-scope guard (#559) warn ONCE per
 	// stream: a busy hypertable has many chunk relations, and one warning per chunk
 	// would flood the log.
@@ -99,13 +106,19 @@ func NewDecoder(resolvePK PKResolver, filters event.Filters, logger *slog.Logger
 }
 
 // Decode processes one pgoutput message. It returns:
-//   - (event, true, nil) when the message produces a row or commit event;
+//   - (event, true, nil) when the message produces a row, commit, or DDL-marker
+//     event (a TRUNCATE covering several relations returns its first marker here
+//     and queues the rest for TakePending);
 //   - (zero, false, nil) when the message is consumed for internal state only
-//     (Begin/Relation) or is deliberately not indexed (Truncate/Type/Origin);
+//     (Begin/Relation) or produces nothing to index (Type/Origin, or a TRUNCATE
+//     whose relations are all out of scope);
 //   - (zero, false, err) on a decode-invariant violation (unknown relation, a row
 //     outside a transaction, a binary tuple datum, a tuple column-count mismatch,
 //     or a primary-key lookup failure). The caller must treat a non-nil error as
 //     fatal — never skip the message and continue, or the stream desynchronizes.
+//
+// After every Decode the caller MUST drain TakePending: a multi-relation TRUNCATE
+// buffers all but its first marker there.
 func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
 	switch m := msg.(type) {
 	case *pglogrepl.BeginMessage:
@@ -151,12 +164,41 @@ func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
 		return ev, true, nil
 
 	case *pglogrepl.TruncateMessage:
-		// DDL replay on the PostgreSQL path is out of #530 scope; surface a TRUNCATE
-		// loudly so it is never silently invisible in the index. (Open question:
-		// map to EventDDL/DDLTruncateTable later.)
-		d.logger.Warn("pgcapture: TRUNCATE not indexed (DDL replay out of scope)",
-			"relations", len(m.RelationIDs))
-		return event.Event{}, false, nil
+		// A TRUNCATE removes every row of each listed relation but emits NO per-row
+		// DELETE — so left uncaptured it is indistinguishable from "nothing happened",
+		// and a later reconstruct crossing it would silently resurrect the rows (#827).
+		// Record it as a durable audit MARKER: an EventDDL(DDLTruncateTable) the
+		// consumer writes to schema_changes, the source-neutral analog of the MySQL
+		// DDL path. This is a RECORD that the truncate happened, not a replayable
+		// change (DDL replay stays out of #530 scope; recover has no per-row images to
+		// put back). One message can list several relations (TRUNCATE a, b); emit one
+		// marker per in-scope relation, returning the first and buffering the rest for
+		// TakePending so none is silently dropped.
+		var first event.Event
+		haveFirst := false
+		for _, oid := range m.RelationIDs {
+			rel, ok := d.relations[oid]
+			if !ok {
+				// No cached shape (no preceding Relation message) — the relation cannot
+				// be named, so there is nothing meaningful to record. Warn rather than
+				// fabricate a blank marker.
+				d.logger.Warn("pgcapture: TRUNCATE on uncached relation OID — not recorded", "oid", oid)
+				continue
+			}
+			if !d.filters.Matches(rel.schema, rel.table) {
+				continue
+			}
+			ev := d.truncateEvent(rel)
+			if !haveFirst {
+				first, haveFirst = ev, true
+				continue
+			}
+			d.pending = append(d.pending, ev)
+		}
+		if !haveFirst {
+			return event.Event{}, false, nil
+		}
+		return first, true, nil
 
 	case *pglogrepl.TypeMessage, *pglogrepl.OriginMessage:
 		// No row data. Type/Origin are not needed for capture fidelity under
@@ -519,6 +561,41 @@ func (d *Decoder) rowEvent(rel *relationInfo, typ event.EventType, before, after
 		RowBefore:  before,
 		RowAfter:   after,
 	}
+}
+
+// truncateEvent builds the EventDDL(DDLTruncateTable) audit marker for one
+// truncated relation (#827), stamped with the in-flight transaction's commit LSN
+// and timestamp — a TRUNCATE always arrives between Begin and Commit, so d.txn
+// carries them. DDLQuery is a synthetic statement (pgoutput carries no SQL text)
+// so the schema_changes row reads naturally. Carries no row data: recover has
+// nothing to reverse; it is a record that the truncate happened.
+func (d *Decoder) truncateEvent(rel *relationInfo) event.Event {
+	lsn := d.txn.commitLSN.String()
+	return event.Event{
+		BinlogFile: lsn,
+		StartPos:   uint64(d.txn.commitLSN),
+		EndPos:     uint64(d.txn.commitLSN),
+		Timestamp:  d.txn.commitTime,
+		GTID:       lsn,
+		Schema:     rel.schema,
+		Table:      rel.table,
+		EventType:  event.EventDDL,
+		DDLType:    event.DDLTruncateTable,
+		DDLQuery:   fmt.Sprintf("TRUNCATE TABLE %s.%s", rel.schema, rel.table),
+	}
+}
+
+// TakePending returns and clears the events the last Decode buffered beyond its
+// single return value, then empties the buffer. Only a multi-relation TRUNCATE
+// fills it (one marker per in-scope relation past the first). The caller drains it
+// after every Decode; a nil return is the common no-op case.
+func (d *Decoder) TakePending() []event.Event {
+	if len(d.pending) == 0 {
+		return nil
+	}
+	p := d.pending
+	d.pending = nil
+	return p
 }
 
 // unchangedToastMarker is the structurally-distinct stand-in for an unchanged-TOAST

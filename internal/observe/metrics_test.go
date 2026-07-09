@@ -95,3 +95,27 @@ func TestForSource_batchSizeObserve(t *testing.T) {
 	m.BatchSize.Observe(500)
 	m.BatchSize.Observe(1000)
 }
+
+// TestStatementDMLDropped verifies the #776 statement-format DML counter
+// increments. It is a global-registry singleton other tests may touch, so the
+// assertion is a before/after delta, not an absolute value.
+func TestStatementDMLDropped(t *testing.T) {
+	read := func() float64 {
+		mfs, err := prometheus.DefaultGatherer.Gather()
+		if err != nil {
+			t.Fatalf("Gather: %v", err)
+		}
+		for _, mf := range mfs {
+			if mf.GetName() == "bintrail_statement_dml_dropped_total" {
+				return mf.GetMetric()[0].GetCounter().GetValue()
+			}
+		}
+		return 0
+	}
+	before := read()
+	observe.StatementDMLDropped()
+	observe.StatementDMLDropped()
+	if got := read(); got != before+2 {
+		t.Errorf("statement_dml_dropped_total = %v after two increments, want %v", got, before+2)
+	}
+}

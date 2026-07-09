@@ -66,6 +66,13 @@ type Heartbeat struct {
 	PayloadStatus     string     `json:"payload_status,omitempty"`  // "ok" or "degraded"
 	LastMetadataFlush *time.Time `json:"last_metadata_flush,omitempty"`
 	LastPayloadFlush  *time.Time `json:"last_payload_flush,omitempty"`
+
+	// Cumulative events/batches permanently dropped after retries were
+	// exhausted (BYOS mode; no on-disk spool). Monotonic; omitted while zero.
+	MetadataLostEvents  int64 `json:"metadata_lost_events,omitempty"`
+	MetadataLostBatches int64 `json:"metadata_lost_batches,omitempty"`
+	PayloadLostEvents   int64 `json:"payload_lost_events,omitempty"`
+	PayloadLostBatches  int64 `json:"payload_lost_batches,omitempty"`
 }
 
 // ─── Command payloads ────────────────────────────────────────────────────────

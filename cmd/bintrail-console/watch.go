@@ -62,6 +62,10 @@ var (
 	upTables                string
 	upBatchSize             int
 	upCheckpoint            int
+	upSSLMode               string
+	upSSLCA                 string
+	upSSLCert               string
+	upSSLKey                string
 	upMetricsAddr           string
 	upMetricsScrapeInterval int
 	upPartitions            int
@@ -122,6 +126,10 @@ var watchEnvBindings = []struct {
 	{"tables", "BINTRAIL_TABLES"},
 	{"server-id", "BINTRAIL_SERVER_ID"},
 	{"batch-size", "BINTRAIL_BATCH_SIZE"},
+	{"ssl-mode", "BINTRAIL_SSL_MODE"},
+	{"ssl-ca", "BINTRAIL_SSL_CA"},
+	{"ssl-cert", "BINTRAIL_SSL_CERT"},
+	{"ssl-key", "BINTRAIL_SSL_KEY"},
 	{"metrics-addr", "BINTRAIL_METRICS_ADDR"},
 	{"metrics-scrape-interval", "BINTRAIL_METRICS_SCRAPE_INTERVAL"},
 	{"rotate-retain", "BINTRAIL_ROTATE_RETAIN"},
@@ -160,6 +168,10 @@ func init() {
 	watchCmd.Flags().StringVar(&upTables, "tables", "", "Comma-separated tables to index (default: all)")
 	watchCmd.Flags().IntVar(&upBatchSize, "batch-size", 1000, "Events per batch INSERT")
 	watchCmd.Flags().IntVar(&upCheckpoint, "checkpoint", 10, "Checkpoint interval in seconds")
+	watchCmd.Flags().StringVar(&upSSLMode, "ssl-mode", "preferred", "TLS mode for the source connection: disabled, preferred, required, verify-ca, verify-identity")
+	watchCmd.Flags().StringVar(&upSSLCA, "ssl-ca", "", "Path to CA certificate file for source TLS verification (omit to use system CAs)")
+	watchCmd.Flags().StringVar(&upSSLCert, "ssl-cert", "", "Path to client certificate file for mutual TLS to the source")
+	watchCmd.Flags().StringVar(&upSSLKey, "ssl-key", "", "Path to client private key file for mutual TLS to the source")
 	watchCmd.Flags().StringVar(&upMetricsAddr, "metrics-addr", "", "Address to expose Prometheus metrics (e.g. :9090); empty = disabled")
 	watchCmd.Flags().IntVar(&upMetricsScrapeInterval, "metrics-scrape-interval", 60, "How often (seconds) to refresh the bintrail_index_* gauges from a status snapshot")
 	watchCmd.Flags().IntVar(&upPartitions, "partitions", 48, "Hourly partitions to create on first init")
@@ -568,12 +580,14 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 }
 
 // watchStreamConfig snapshots watch's flag values into the main stream's
-// streamrun.Config. The pinned values (StartPos 4, SSLMode preferred,
-// GapTimeout 30, …) replicate what core `up` produced via its
-// populateStreamFlags → streamConfigFromFlags fan-out: `watch`, like `up`,
-// deliberately exposes only the quickstart subset of stream's flags.
-// MetricsAddr stays empty on purpose — the daemon serves ONE /metrics
-// endpoint for all streams (see runUpStreamWithConsole).
+// streamrun.Config. The pinned values (StartPos 4, GapTimeout 30, …)
+// replicate what core `up` produced via its populateStreamFlags →
+// streamConfigFromFlags fan-out: `watch`, like `up`, deliberately exposes only
+// the quickstart subset of stream's flags. The source TLS settings ARE
+// configurable (--ssl-mode/--ssl-ca/--ssl-cert/--ssl-key or BINTRAIL_SSL_*,
+// #879); SSLMode defaults to "preferred" only when left unset, so the previous
+// behavior is unchanged. MetricsAddr stays empty on purpose — the daemon serves
+// ONE /metrics endpoint for all streams (see runUpStreamWithConsole).
 func watchStreamConfig(serverID uint32) streamrun.Config {
 	return streamrun.Config{
 		IndexDSN:   upIndexDSN,
@@ -586,7 +600,10 @@ func watchStreamConfig(serverID uint32) streamrun.Config {
 		Schemas:    upSchemas,
 		Tables:     upTables,
 		Checkpoint: upCheckpoint,
-		SSLMode:    "preferred",
+		SSLMode:    upSSLMode,
+		SSLCA:      upSSLCA,
+		SSLCert:    upSSLCert,
+		SSLKey:     upSSLKey,
 		Format:     upFormat,
 		GapTimeout: 30,
 		// The daemon serves /metrics centrally, so the primary stream sets

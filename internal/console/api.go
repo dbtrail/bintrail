@@ -140,6 +140,12 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 		Order:         order,
 		DenyTables:    s.denyTables,
 		RedactColumns: s.redactCols,
+		// ProfileActive forces the redaction pass even for a named profile that
+		// resolved to zero rules, so QueryText/QueryHash are withheld under EVERY
+		// named profile per the #699 contract (matching the CLI/MCP). Without
+		// this a `--profile <typo>` would leave query_text with sensitive
+		// literals visible (#838).
+		ProfileActive: s.profileActive,
 	}, nil
 }
 

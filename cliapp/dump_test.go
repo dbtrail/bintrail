@@ -72,7 +72,7 @@ func TestDumpCmd_allFlagsRegistered(t *testing.T) {
 // ─── buildMydumperArgs ────────────────────────────────────────────────────────
 
 func TestBuildMydumperArgs_basic(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "secret", "/tmp/dump", 4, nil, nil, "", true)
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "", true)
 	assertArgsContainPair(t, args, "--host", "127.0.0.1")
 	assertArgsContainPair(t, args, "--port", "3306")
 	assertArgsContainPair(t, args, "--user", "root")
@@ -177,10 +177,30 @@ func TestParseMydumperVersion(t *testing.T) {
 	}
 }
 
-func TestBuildMydumperArgs_noPassword(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "", true)
-	if argsContain(args, "--password") {
-		t.Error("expected --password to be absent when password is empty")
+// TestBuildMydumperArgs_neverPassword asserts the source password is NEVER put
+// on argv, regardless of whether a defaults-file is used — the whole point of
+// #811 (a password on argv is world-readable via ps aux / /proc/cmdline). The
+// function no longer even accepts a password, so it cannot leak one.
+func TestBuildMydumperArgs_neverPassword(t *testing.T) {
+	for _, defaultsFile := range []string{"", "/tmp/bintrail-mydumper-xyz.cnf"} {
+		args := buildMydumperArgs("127.0.0.1", 3306, "root", defaultsFile, "/tmp/dump", 4, nil, nil, "", true)
+		if argsContain(args, "--password") {
+			t.Errorf("defaultsFile=%q: --password must never appear on argv: %v", defaultsFile, args)
+		}
+	}
+}
+
+// TestBuildMydumperArgs_defaultsFile verifies that a non-empty defaults-file
+// path is passed via --defaults-file (Docker mode delivers the secret this way),
+// and omitted when empty (local mode delivers it via MYSQL_PWD env).
+func TestBuildMydumperArgs_defaultsFile(t *testing.T) {
+	const path = "/tmp/bintrail-mydumper-abc.cnf"
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", path, "/tmp/dump", 4, nil, nil, "", true)
+	assertArgsContainPair(t, args, "--defaults-file", path)
+
+	none := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, nil, nil, "", true)
+	if argsContain(none, "--defaults-file") {
+		t.Errorf("expected --defaults-file to be absent when no defaults file given: %v", none)
 	}
 }
 
@@ -210,9 +230,16 @@ func TestBuildMydumperArgs_multipleSchemas(t *testing.T) {
 	}
 }
 
-func TestBuildMydumperArgs_withPassword(t *testing.T) {
-	args := buildMydumperArgs("127.0.0.1", 3306, "root", "s3cr3t", "/tmp/dump", 4, nil, nil, "", true)
-	assertArgsContainPair(t, args, "--password", "s3cr3t")
+// TestBuildMydumperArgs_passwordNeverLeaksToArgv is a regression guard for #811:
+// even a password-shaped value must never appear anywhere in the argv (the
+// function delivers credentials out of band, so it takes no password at all).
+func TestBuildMydumperArgs_passwordNeverLeaksToArgv(t *testing.T) {
+	args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/tmp/dump", 4, []string{"mydb"}, nil, "", true)
+	for _, a := range args {
+		if a == "s3cr3t" || a == "--password" {
+			t.Errorf("password-related token leaked to argv: %q in %v", a, args)
+		}
+	}
 }
 
 func TestBuildMydumperArgs_noSchemasOrTables(t *testing.T) {
@@ -287,7 +314,7 @@ func TestBuildMydumperArgs_outputDirIsLast(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			args := buildMydumperArgs("127.0.0.1", 3306, "root", "pw", "/data/backup", 4, tc.schemas, tc.tables, tc.encrypt, true)
+			args := buildMydumperArgs("127.0.0.1", 3306, "root", "", "/data/backup", 4, tc.schemas, tc.tables, tc.encrypt, true)
 			n := len(args)
 			if n < 2 {
 				t.Fatalf("args too short: %v", args)
@@ -672,7 +699,7 @@ func TestResolveMydumper_dockerFallback(t *testing.T) {
 
 func TestBuildDockerArgs_basic(t *testing.T) {
 	mydumperArgs := []string{"--host", "db.example.com", "--port", "3306", "--user", "root", "--outputdir", "/tmp/dump"}
-	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", mydumperArgs, "")
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", mydumperArgs, "", "")
 
 	// Should start with docker run --rm
 	if len(args) < 3 || args[0] != "run" || args[1] != "--rm" {
@@ -704,7 +731,7 @@ func TestBuildDockerArgs_basic(t *testing.T) {
 
 func TestBuildDockerArgs_localhostNetworkHost(t *testing.T) {
 	for _, host := range []string{"localhost", "127.0.0.1", "::1"} {
-		args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", host, nil, "")
+		args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", host, nil, "", "")
 
 		// On Linux, --network host should be added; on macOS it should not.
 		hasNetwork := argsContain(args, "--network")
@@ -787,7 +814,7 @@ func TestBuildMydumperArgs_noEncrypt(t *testing.T) {
 }
 
 func TestBuildDockerArgs_encryptKeyMount(t *testing.T) {
-	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", nil, "/path/to/key")
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", nil, "/path/to/key", "")
 	found := false
 	for i, a := range args {
 		if a == "-v" && i+1 < len(args) && strings.Contains(args[i+1], "/key") && strings.HasSuffix(args[i+1], ":ro") {
@@ -801,13 +828,13 @@ func TestBuildDockerArgs_encryptKeyMount(t *testing.T) {
 }
 
 func TestBuildDockerArgs_userFlag(t *testing.T) {
-	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", nil, "")
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", nil, "", "")
 	want := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
 	assertArgsContainPair(t, args, "--user", want)
 }
 
 func TestBuildDockerArgs_noEncryptKeyMount(t *testing.T) {
-	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", nil, "")
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", nil, "", "")
 	// Should only have one -v (for output dir)
 	count := 0
 	for _, a := range args {
@@ -840,6 +867,168 @@ func TestResolveEncryptKey_defaultPath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "generate-key") {
 		t.Errorf("expected 'generate-key' hint in error, got: %v", err)
+	}
+}
+
+// ─── password out-of-band delivery (#811) ────────────────────────────────────
+
+func TestBuildDockerArgs_defaultsFileMount(t *testing.T) {
+	const path = "/tmp/bintrail-mydumper-x.cnf"
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com",
+		[]string{"--defaults-file", path}, "", path)
+	found := false
+	for i, a := range args {
+		if a == "-v" && i+1 < len(args) && strings.HasPrefix(args[i+1], path+":"+path) && strings.HasSuffix(args[i+1], ":ro") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected read-only bind mount for the defaults file, got %v", args)
+	}
+}
+
+func TestBuildDockerArgs_noDefaultsFileNoExtraMount(t *testing.T) {
+	// Without a defaults file, only the output-dir -v mount is present.
+	args := buildDockerArgs("mydumper/mydumper:latest", "/tmp/dump", "db.example.com", nil, "", "")
+	count := 0
+	for _, a := range args {
+		if a == "-v" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 -v mount without a defaults file, got %d: %v", count, args)
+	}
+}
+
+func TestEscapeMyCnfValue(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"simple", `"simple"`},
+		{"", `""`},
+		{`pa#ss;word`, `"pa#ss;word"`}, // # / ; safe inside quotes
+		{`a b`, `"a b"`},               // whitespace safe inside quotes
+		{`ba\ck`, `"ba\\ck"`},          // backslash escaped
+		{`quo"te`, `"quo\"te"`},        // double-quote escaped
+		{`x\y"z`, `"x\\y\"z"`},         // both, in order
+	}
+	for _, tc := range cases {
+		if got := escapeMyCnfValue(tc.in); got != tc.want {
+			t.Errorf("escapeMyCnfValue(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestWriteMydumperDefaultsFile(t *testing.T) {
+	const pw = `s3cr3t#p"w`
+	path, cleanup, err := writeMydumperDefaultsFile(pw)
+	if err != nil {
+		t.Fatalf("writeMydumperDefaultsFile: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat defaults file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("defaults file mode = %o, want 0600", perm)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read defaults file: %v", err)
+	}
+	s := string(data)
+	for _, group := range []string{"[client]", "[mydumper]"} {
+		if !strings.Contains(s, group) {
+			t.Errorf("defaults file missing %s group: %q", group, s)
+		}
+	}
+	want := "password=" + escapeMyCnfValue(pw)
+	if !strings.Contains(s, want) {
+		t.Errorf("defaults file missing escaped password %q: %q", want, s)
+	}
+	// The raw (unescaped) password must not be written verbatim if it needs
+	// escaping — the escaped form differs, guarding against a naive write.
+	if strings.Contains(s, "password="+pw+"\n") {
+		t.Errorf("defaults file wrote unescaped password: %q", s)
+	}
+
+	// cleanup removes the file.
+	cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("expected defaults file removed by cleanup, stat err = %v", err)
+	}
+}
+
+// TestRunDump_localDeliversPasswordViaEnvNotArgv is the end-to-end regression
+// guard for #811: in local mode the password reaches the child as MYSQL_PWD and
+// never appears on argv (world-readable via ps aux / /proc/cmdline).
+func TestRunDump_localDeliversPasswordViaEnvNotArgv(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(dir, "record.txt")
+	t.Setenv("BINTRAIL_TEST_RECORD", record)
+
+	fakeBin := filepath.Join(dir, "mydumper")
+	script := `#!/bin/bash
+if [ "$1" = "--version" ]; then
+  echo "mydumper 0.15.0"
+  exit 0
+fi
+{ echo "ARGS: $@"; echo "MYSQL_PWD=${MYSQL_PWD}"; } > "$BINTRAIL_TEST_RECORD"
+mkdir -p "${@: -1}"
+exit 0
+`
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mydumper: %v", err)
+	}
+
+	lockDir := t.TempDir()
+	savedLock := dumpLockDir
+	dumpLockDir = func() string { return lockDir }
+	t.Cleanup(func() { dumpLockDir = savedLock })
+
+	saved := struct{ path, dsn, outDir, format string }{dmpMydumperPath, dmpSourceDSN, dmpOutputDir, dmpFormat}
+	t.Cleanup(func() {
+		dmpMydumperPath = saved.path
+		dumpCmd.Flags().Set("mydumper-path", saved.path)
+		dmpSourceDSN = saved.dsn
+		dmpOutputDir = saved.outDir
+		dmpFormat = saved.format
+	})
+	dumpCmd.Flags().Set("mydumper-path", fakeBin)
+	const pw = "supersecretpw"
+	dmpSourceDSN = "root:" + pw + "@tcp(127.0.0.1:3306)/"
+	dmpOutputDir = filepath.Join(dir, "out")
+	dmpFormat = "text"
+
+	dumpCmd.SetContext(context.Background())
+	if err := runDump(dumpCmd, nil); err != nil {
+		t.Fatalf("runDump: %v", err)
+	}
+
+	data, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	var argsLine, pwdLine string
+	for _, line := range strings.Split(string(data), "\n") {
+		switch {
+		case strings.HasPrefix(line, "ARGS: "):
+			argsLine = line
+		case strings.HasPrefix(line, "MYSQL_PWD="):
+			pwdLine = line
+		}
+	}
+	if strings.Contains(argsLine, pw) {
+		t.Errorf("password leaked onto argv: %q", argsLine)
+	}
+	if strings.Contains(argsLine, "--password") {
+		t.Errorf("--password must not appear on argv: %q", argsLine)
+	}
+	if pwdLine != "MYSQL_PWD="+pw {
+		t.Errorf("password not delivered via MYSQL_PWD env: got %q", pwdLine)
 	}
 }
 
