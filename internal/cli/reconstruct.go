@@ -15,10 +15,23 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
+
+// pkChangeSuspected reports whether a single-row lookup that found no baseline
+// row is better explained by a PK-changing UPDATE than by a genuinely-absent
+// row (#782). Change events are stored keyed by their before-image PK, so an
+// `UPDATE pk old→new` never appears in a fetch filtered by `new`; the row still
+// looks absent even though it existed. Signature: the earliest fetched event
+// for the searched PK is an UPDATE or DELETE — the row was assumed to pre-exist
+// that event, yet the baseline (its only legitimate origin besides an INSERT)
+// has no such row. events must be sorted ascending (FetchMerged guarantees it).
+func pkChangeSuspected(events []query.ResultRow) bool {
+	return len(events) > 0 && events[0].EventType != event.EventInsert
+}
 
 var reconstructCmd = &cobra.Command{
 	Use:   "reconstruct",
@@ -231,12 +244,16 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("read baseline: %w", err)
 	}
-	if baselineRow == nil {
-		return fmt.Errorf("no row found in baseline %q matching pk filter %v", baselinePath, pkFilter)
-	}
-
-	// ── Baseline-only mode ─────────────────────────────────────────────────────
+	// A nil baselineRow (this PK absent from the snapshot) is NOT resolved here
+	// anymore: it flows past the event fetch below so the "no row found" error
+	// can be told apart from a PK-changing UPDATE that stored the row under a
+	// different (before-image) PK (#782). Baseline-only mode has no events to
+	// consult, so it keeps the original error immediately.
 	if recBaselineOnly {
+		if baselineRow == nil {
+			return fmt.Errorf("no row found in baseline %q matching pk filter %v", baselinePath, pkFilter)
+		}
+		// ── Baseline-only mode ───────────────────────────────────────────────────
 		if err := writeReconstructOutput(baselineRow, nil, snapshotTime, at, false, recFormat, os.Stdout); err != nil {
 			return err
 		}
@@ -342,6 +359,23 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("fetch binlog events: %w", err)
 	}
 	slog.Debug("fetched binlog events", "count", len(events))
+
+	// No baseline row for this PK. Refuse — but tell a genuinely-absent row apart
+	// from one whose existence traces to a PK-changing UPDATE the change map
+	// can't fold (#782): such an UPDATE is stored under its BEFORE-image PK, so a
+	// fetch by the (new) searched PK never retrieves it and the row looks absent.
+	// The earliest fetched event for the PK is the tell (see pkChangeSuspected).
+	if baselineRow == nil {
+		if pkChangeSuspected(events) {
+			return fmt.Errorf(
+				"reconstruct: no baseline row for %s.%s pk %q, yet the earliest indexed event for it is not an INSERT — "+
+					"a PK-changing UPDATE in the window likely brought this PK into existence under a different before-image key. "+
+					"reconstruct folds events by the before-image primary key and cannot follow an UPDATE into its new key, so this "+
+					"row cannot be resolved. Re-run `bintrail baseline` to capture a snapshot at or after the PK change, then reconstruct from there",
+				recSchema, recTable, recPK)
+		}
+		return fmt.Errorf("no row found in baseline %q matching pk filter %v", baselinePath, pkFilter)
+	}
 
 	// ENUM/SET ordinals → labels (#476), each delta decoded with the
 	// snapshot in effect at its event time (#475). No latest-resolver

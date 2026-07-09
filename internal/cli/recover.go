@@ -201,22 +201,41 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	if rSchema != "" {
 		cascadeScope = []string{rSchema}
 	}
+	warnCascade := false
+	var childTables []string
 	if edges, cerr := metadata.CascadeConstraintsInIndex(db, cascadeScope); cerr != nil {
 		slog.Warn("could not check the index for FK cascade constraints", "error", cerr)
 	} else if len(edges) > 0 {
+		warnCascade = true
 		seen := map[string]bool{}
-		var tables []string
 		for _, e := range edges {
 			if k := e.Schema + "." + e.Table; !seen[k] {
 				seen[k] = true
-				tables = append(tables, k)
+				childTables = append(childTables, k)
 			}
 		}
-		slog.Warn("target schema has FK ON DELETE CASCADE/SET NULL (or ON UPDATE CASCADE) "+
-			"constraints; plain `recover` cannot reconstruct cascade-deleted child rows or "+
-			"SET NULL'd FKs (they are never binlogged, MySQL Bug #32506); use "+
-			"`bintrail recover-cascade` to reconstruct them",
-			"cascade_child_tables", strings.Join(tables, ", "))
+	}
+	// Cross-schema parent side (#833): CascadeConstraintsInIndex scopes by the
+	// CHILD schema (schema_name = rSchema), so a parent whose only cascade
+	// children live in a DIFFERENT schema is invisible to it — the exact silent
+	// data-loss class this closes. Also probe whether the target table is the
+	// REFERENCED (parent) side via the same cross-schema-aware signal the console
+	// uses to auto-route (metadata.IsCascadeParentInIndex, matching
+	// referenced_schema_name + referenced_table_name), so a plain recover of a
+	// cross-schema cascade parent still gets nudged to `recover-cascade`.
+	if rSchema != "" && rTable != "" {
+		if isParent, perr := metadata.IsCascadeParentInIndex(db, rSchema, rTable); perr != nil {
+			slog.Warn("could not check the index for cross-schema FK cascade parents", "error", perr)
+		} else if isParent {
+			warnCascade = true
+		}
+	}
+	if warnCascade {
+		slog.Warn("target has FK ON DELETE CASCADE/SET NULL (or ON UPDATE CASCADE) "+
+			"constraints (including cross-schema children); plain `recover` cannot "+
+			"reconstruct cascade-deleted child rows or SET NULL'd FKs (they are never "+
+			"binlogged, MySQL Bug #32506); use `bintrail recover-cascade` to reconstruct them",
+			"cascade_child_tables", strings.Join(childTables, ", "))
 	}
 
 	if rProfile != "" {

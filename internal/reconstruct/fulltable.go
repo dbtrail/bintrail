@@ -58,11 +58,19 @@ import (
 // data already on disk — so they're deferred behind separate follow-up
 // issues.
 //
-// UPDATE events that mutate the primary key itself are NOT handled
-// correctly: the change map is keyed by the before-image PK, so a later
-// event on the old PK value may overwrite the UPDATE in the map and the
-// after-image row is dropped. Re-snapshot the baseline after schema
-// changes that reshape PKs.
+// UPDATE events that mutate the primary key itself cannot be folded safely:
+// the change map is keyed by the before-image PK, so a changed PK would emit
+// the after-image row under the OLD key and resurrect a row a later DELETE
+// removed, duplicate one another event already targets, or (when its old key is
+// reused) silently drop the moved row (#782). Rather than ship a silently wrong
+// dump, every full-table entry point detects such an UPDATE up front and
+// REFUSES the run with an actionable error. The authoritative check
+// (pkChangingUpdateInEvents) scans the RAW pre-collapse event slice — the map
+// alone would miss a PK-changing UPDATE whose old key a later event reused
+// (`UPDATE 1->2; INSERT 1`) — so the paths that fetch the full window (this dump
+// path and the binlog-only fallback) catch every case; pkChangingUpdate is a
+// cheap map backstop. Re-snapshot the baseline at or after the PK change and
+// reconstruct from there.
 type FullTableConfig struct {
 	IndexDSN    string    // DSN for the bintrail index database
 	BaselineSrc string    // local directory or s3:// URL of baselines
@@ -515,8 +523,11 @@ func ReconstructTable(
 		Table:             table,
 		PKCols:            pkCols,
 		Changes:           changes,
-		OutputDir:         cfg.OutputDir,
-		ChunkSize:         cfg.ChunkSize,
+		// Full-window fetch (no LimitPerPK) → hand the raw slice to the #782
+		// guard so a PK-changing UPDATE overwritten in the map is still caught.
+		Events:    events,
+		OutputDir: cfg.OutputDir,
+		ChunkSize: cfg.ChunkSize,
 	}, rep); err != nil {
 		return nil, err
 	}
@@ -542,8 +553,12 @@ type mergeInput struct {
 	Table             string
 	PKCols            []metadata.ColumnMeta
 	Changes           map[string]*query.ResultRow
-	OutputDir         string
-	ChunkSize         int64
+	// Events is the RAW, pre-collapse event slice (before it was folded into
+	// Changes). Set by full-window callers so the #782 PK-change guard is
+	// window-complete; nil falls back to the map-only backstop (pkChangingUpdate).
+	Events    []query.ResultRow
+	OutputDir string
+	ChunkSize int64
 }
 
 // mergeBaselineIntoWriter streams the local baseline Parquet via DuckDB,
@@ -569,6 +584,20 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 	// corruption.
 	if err := checkChangesToast(in.Changes); err != nil {
 		return err
+	}
+
+	// Fail loud on a PK-changing UPDATE (#782), before the writer opens: the
+	// change map is keyed by the before-image PK, so folding an UPDATE whose PK
+	// changed would duplicate, resurrect, or silently drop rows in the dump.
+	// Same up-front stance as the #592/#602 refusals. Scan the RAW event slice
+	// first (authoritative, window-complete — catches a PK-changing UPDATE whose
+	// old key a later event reused and thus overwrote in the map); the map scan
+	// is a backstop for any caller that didn't supply Events.
+	if b, a, ok := pkChangingUpdateInEvents(in.Events, in.PKCols); ok {
+		return pkChangingUpdateErr(in.Schema, in.Table, b, a)
+	}
+	if b, a, ok := pkChangingUpdate(in.Changes, in.PKCols); ok {
+		return pkChangingUpdateErr(in.Schema, in.Table, b, a)
 	}
 
 	colNames, err := readBaselineColumns(ctx, in.LocalBaselinePath)
@@ -825,6 +854,12 @@ type SnapshotFullTableInput struct {
 	// Changes maps pk_values string → the latest binlog event for that PK in
 	// (baseline, AsOf]. Drained by the merge.
 	Changes map[string]*query.ResultRow
+	// Events is the RAW event slice Changes was folded from, for the
+	// window-complete #782 PK-change guard. Callers fetching LimitPerPK=1 (shim
+	// `_snapshot`, verify) hand a slice already collapsed to the latest event
+	// per PK by the query, so their detection is bounded by that fetch; nil
+	// falls back to the map-only backstop (pkChangingUpdate).
+	Events []query.ResultRow
 }
 
 // SnapshotFullTableImages reconstructs the full row state of a table at the
@@ -847,6 +882,18 @@ func SnapshotFullTableImages(ctx context.Context, in SnapshotFullTableInput, emi
 	// baseline (possibly an S3 download); see mergeBaselineIntoWriter.
 	if err := checkChangesToast(in.Changes); err != nil {
 		return err
+	}
+
+	// PK-changing UPDATE (#782) → refuse before materializing the baseline, for
+	// the same reason as the mydumper writer path: the change map is keyed by
+	// the before-image PK, so a changed PK silently duplicates/resurrects rows.
+	// Authoritative raw-slice scan first (window-complete when the caller fetched
+	// the full window), map backstop second.
+	if b, a, ok := pkChangingUpdateInEvents(in.Events, in.PKCols); ok {
+		return pkChangingUpdateErr(in.Schema, in.Table, b, a)
+	}
+	if b, a, ok := pkChangingUpdate(in.Changes, in.PKCols); ok {
+		return pkChangingUpdateErr(in.Schema, in.Table, b, a)
 	}
 
 	localPath, cleanup, err := materializeBaselineLocal(ctx, in.BaselinePath)
@@ -881,6 +928,100 @@ func checkChangesToast(changes map[string]*query.ResultRow) error {
 		}
 	}
 	return nil
+}
+
+// pkChangedInEvent reports whether a single event is an UPDATE whose
+// before-image primary key differs from its after-image primary key (#782).
+// before/after are recomputed from the SAME event's images (not compared
+// against the stored map key) so a numeric-representation difference between
+// the parser-native stored key and the JSON-decoded images can't produce a
+// false positive. Non-UPDATE events, and UPDATEs missing a before OR after
+// image (a partial image under an unsupported non-FULL row image), report
+// changed=false — this bug needs both PKs.
+func pkChangedInEvent(ev *query.ResultRow, pkCols []metadata.ColumnMeta) (before, after string, changed bool) {
+	if ev == nil || ev.EventType != event.EventUpdate {
+		return "", "", false
+	}
+	if ev.RowBefore == nil || ev.RowAfter == nil {
+		return "", "", false
+	}
+	b := event.BuildPKValues(pkCols, ev.RowBefore)
+	a := event.BuildPKValues(pkCols, ev.RowAfter)
+	if b != a {
+		return b, a, true
+	}
+	return "", "", false
+}
+
+// pkChangingUpdateInEvents scans the RAW, pre-collapse event slice for a
+// PK-changing UPDATE (#782). This is the AUTHORITATIVE, window-complete check.
+// The change map every full-table entry point folds events into is keyed by the
+// BEFORE-image PK (the parser stores an UPDATE's pk_values from its before
+// image, parser.go), so a PK-changing UPDATE whose old key is later reused by
+// another event — e.g. `UPDATE pk 1→2; INSERT pk=1` (both stored under key 1) —
+// is OVERWRITTEN in the map by that later event and vanishes from a map-only
+// scan, silently DROPPING the moved row (pk=2) from the output. Scanning the
+// raw slice, before it collapses, sees every event and cannot miss it.
+//
+// The failure shapes a folded PK-changing UPDATE produces in the merged output:
+//
+//   - Resurrection: `UPDATE pk 1→2; DELETE pk=2` — the DELETE is keyed by the
+//     new PK (2), never colliding with the UPDATE entry (keyed by 1), so the
+//     merge emits the pk=2 after-image for a row the DELETE actually removed.
+//   - Duplication: `UPDATE pk 1→2; UPDATE pk=2` — pk=2 is emitted twice (once
+//     as the first UPDATE's after-image under key 1, once by the second event
+//     under key 2), a 1062 that only surfaces at restore time.
+//   - Silent drop: `UPDATE pk 1→2; INSERT pk=1` — the map-only scan misses the
+//     overwritten UPDATE, so the moved row (pk=2) is never emitted.
+//
+// The slice is already sorted ascending by (event_timestamp, event_id), so this
+// returns the EARLIEST offender deterministically. Callers that fetch the full
+// window (reconstruct dump, binlog-only fallback) pass their raw events here so
+// the check is window-complete; the map-scan backstop (pkChangingUpdate) covers
+// callers that don't. Note that callers fetching LimitPerPK=1 (shim `_snapshot`,
+// verify) hand a raw slice already collapsed by the query to the latest event
+// per PK, so their detection is bounded by that fetch, not by this scan.
+func pkChangingUpdateInEvents(events []query.ResultRow, pkCols []metadata.ColumnMeta) (before, after string, found bool) {
+	for i := range events {
+		if b, a, ok := pkChangedInEvent(&events[i], pkCols); ok {
+			return b, a, true
+		}
+	}
+	return "", "", false
+}
+
+// pkChangingUpdate scans a COLLAPSED full-table change map for a PK-changing
+// UPDATE (#782). It is a cheap BACKSTOP to pkChangingUpdateInEvents (the
+// authoritative raw-slice scan): the map is keyed by the before-image PK, so a
+// PK-changing UPDATE whose old key was reused by a later event is absent from
+// the map entirely and only the raw-slice scan catches it. This map scan still
+// catches the common cases where the PK-changing UPDATE is the surviving entry
+// for its old key, and guards callers that build a map without a raw slice.
+// Iterates in sorted key order for a deterministic first-offender result.
+func pkChangingUpdate(changes map[string]*query.ResultRow, pkCols []metadata.ColumnMeta) (before, after string, found bool) {
+	keys := make([]string, 0, len(changes))
+	for k := range changes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if b, a, ok := pkChangedInEvent(changes[k], pkCols); ok {
+			return b, a, true
+		}
+	}
+	return "", "", false
+}
+
+// pkChangingUpdateErr is the shared fail-loud error the full-table entry points
+// return when pkChangingUpdate finds a PK-changing UPDATE (#782).
+func pkChangingUpdateErr(schema, table, before, after string) error {
+	return fmt.Errorf(
+		"full-table reconstruct: %s.%s has a PK-changing UPDATE in the window "+
+			"(primary key %q → %q); reconstruct folds events by the before-image "+
+			"primary key and cannot safely apply a row whose PK changed — doing so "+
+			"would duplicate or resurrect rows in the output. Re-run `bintrail baseline` "+
+			"to capture a snapshot at or after the PK change, then reconstruct from there",
+		schema, table, before, after)
 }
 
 // reconstructBinlogOnly is the ErrNoBaseline fallback for full-table
@@ -987,7 +1128,7 @@ func reconstructBinlogOnly(
 	}
 
 	rep.BinlogOnly = true
-	if err := writeBinlogOnlyChanges(cfg.OutputDir, schema, table, colNames, cfg.ChunkSize, createSQL, changes, rep); err != nil {
+	if err := writeBinlogOnlyChanges(cfg.OutputDir, schema, table, tm.PKColumnMetas(), colNames, cfg.ChunkSize, createSQL, changes, events, rep); err != nil {
 		return nil, err
 	}
 	rep.Duration = time.Since(start)
@@ -1045,14 +1186,29 @@ func findCapturedCreateTableDDL(ctx context.Context, db *sql.DB, schema, table s
 // outputDir).
 func writeBinlogOnlyChanges(
 	outputDir, schema, table string,
+	pkCols []metadata.ColumnMeta,
 	colNames []string,
 	chunkSize int64,
 	createSQL string,
 	changes map[string]*query.ResultRow,
+	events []query.ResultRow,
 	rep *TableReport,
 ) error {
 	if err := checkChangesToast(changes); err != nil {
 		return err
+	}
+
+	// PK-changing UPDATE (#782): even without a baseline, the change map is
+	// keyed by the before-image PK, so an UPDATE whose PK changed emits its
+	// after-image under the OLD key and duplicates a row when another event
+	// targets the new key (or is dropped when its old key is reused). Refuse up
+	// front rather than ship a corrupt dump. Authoritative raw-slice scan first
+	// (this path fetches the full window), map backstop second.
+	if b, a, ok := pkChangingUpdateInEvents(events, pkCols); ok {
+		return pkChangingUpdateErr(schema, table, b, a)
+	}
+	if b, a, ok := pkChangingUpdate(changes, pkCols); ok {
+		return pkChangingUpdateErr(schema, table, b, a)
 	}
 
 	mw, err := NewMydumperWriter(outputDir, schema, table, colNames, chunkSize)

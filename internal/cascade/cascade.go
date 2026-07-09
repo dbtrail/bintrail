@@ -621,6 +621,113 @@ func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string) ([]C
 	return out, rows.Err()
 }
 
+// LoadCascadeFKsForParent loads the FK edges needed to reconstruct cascades rooted
+// at a DELETE in parentSchema — the loader the CLI/console cascade paths use.
+//
+// Unlike LoadCascadeFKs (which scopes by the CHILD schema, `schema_name`), this
+// scopes by the PARENT schema, `referenced_schema_name`. A child in schema B with
+// an ON DELETE CASCADE / SET NULL FK to a parent in schema A is legal in MySQL
+// (common in multi-tenant / reporting layouts). Scoping the load by the child's
+// schema silently drops that edge, so its cascade-deleted rows are never
+// synthesized and the run exits 0 "complete" — silent data-loss (#833). Scoping by
+// the referenced (parent) schema includes cross-schema children.
+//
+// It also walks the referenced-schema frontier TRANSITIVELY so multi-level
+// cross-schema cascades are covered: a grandchild in schema C whose FK references a
+// cross-schema child in schema B (which in turn references parentSchema A) is only
+// reachable once B is loaded as a parent schema. Starting from parentSchema, each
+// CASCADE/SET NULL edge's CHILD schema is added to the frontier (those children can
+// themselves be deleted and cascade further); RESTRICT/NO ACTION children never
+// cascade, so they do not widen the frontier. The closure terminates because each
+// schema is scoped at most once. Edges dedup by (schema, table, constraint, column).
+//
+// SynthesizeVictims keys its FK graph by the fully-qualified referenced
+// schema.table, so once these edges are loaded it traverses cross-schema children
+// with no further change. Over-inclusion (edges to non-victim tables in a scoped
+// schema) is harmless — byParent is only consulted for tables that actually appear
+// as a parent DELETE or a synthesized victim — so this never fabricates a victim; it
+// only stops dropping real ones.
+func LoadCascadeFKsForParent(ctx context.Context, indexDB *sql.DB, parentSchema string) ([]CascadeFK, error) {
+	return loadCascadeClosure(ctx, parentSchema, func(ctx context.Context, refSchemas []string) ([]CascadeFK, error) {
+		return loadCascadeFKsByReferencedSchema(ctx, indexDB, refSchemas)
+	})
+}
+
+// referencedSchemaLoader loads the FK edges whose PARENT (referenced_schema_name) is
+// in refSchemas. It is injected into loadCascadeClosure so the transitive-closure
+// orchestration is unit-testable without a database.
+type referencedSchemaLoader func(ctx context.Context, refSchemas []string) ([]CascadeFK, error)
+
+// loadCascadeClosure computes the transitive set of FK edges reachable from a DELETE
+// in parentSchema by expanding the referenced-schema frontier through the child
+// schemas of CASCADE/SET NULL edges. See LoadCascadeFKsForParent for the rationale.
+func loadCascadeClosure(ctx context.Context, parentSchema string, load referencedSchemaLoader) ([]CascadeFK, error) {
+	frontier := []string{parentSchema}
+	scoped := map[string]bool{parentSchema: true} // referenced schemas already loaded
+	seenEdge := map[string]bool{}
+	var out []CascadeFK
+	for len(frontier) > 0 {
+		batch, err := load(ctx, frontier)
+		if err != nil {
+			return nil, err
+		}
+		var next []string
+		for _, fk := range batch {
+			ek := fk.Schema + "\x00" + fk.Table + "\x00" + fk.ConstraintName + "\x00" + fk.Column
+			if !seenEdge[ek] {
+				seenEdge[ek] = true
+				out = append(out, fk)
+			}
+			// Only a CASCADE/SET NULL child can itself be deleted and cascade
+			// further, so only its schema widens the frontier.
+			if (fk.DeleteRule == "CASCADE" || fk.DeleteRule == "SET NULL") && !scoped[fk.Schema] {
+				scoped[fk.Schema] = true
+				next = append(next, fk.Schema)
+			}
+		}
+		frontier = next
+	}
+	return out, nil
+}
+
+// loadCascadeFKsByReferencedSchema reads every FK edge whose PARENT is in
+// refSchemas from the latest FK snapshot. It mirrors LoadCascadeFKs's SELECT (all
+// edges, rules included — SynthesizeVictims gates on DeleteRule) but filters on
+// referenced_schema_name instead of schema_name.
+func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refSchemas []string) ([]CascadeFK, error) {
+	if len(refSchemas) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(refSchemas)), ",")
+	q := `SELECT schema_name, table_name, constraint_name, column_name,
+	       referenced_schema_name, referenced_table_name, referenced_column_name,
+	       delete_rule, update_rule
+	FROM fk_constraints
+	WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM fk_constraints)
+	  AND referenced_schema_name IN (` + placeholders + `)
+	ORDER BY schema_name, table_name, constraint_name, ordinal_position`
+	args := make([]any, 0, len(refSchemas))
+	for _, s := range refSchemas {
+		args = append(args, s)
+	}
+	rows, err := indexDB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("load cascade FKs by referenced schema: %w", err)
+	}
+	defer rows.Close()
+	var out []CascadeFK
+	for rows.Next() {
+		var fk CascadeFK
+		if err := rows.Scan(&fk.Schema, &fk.Table, &fk.ConstraintName, &fk.Column,
+			&fk.ReferencedSchema, &fk.ReferencedTable, &fk.ReferencedColumn,
+			&fk.DeleteRule, &fk.UpdateRule); err != nil {
+			return nil, fmt.Errorf("scan cascade FK row: %w", err)
+		}
+		out = append(out, fk)
+	}
+	return out, rows.Err()
+}
+
 // valToString renders a JSON-decoded value the way MySQL's
 // JSON_UNQUOTE(JSON_EXTRACT(...)) does, so comparisons line up with the
 // ColumnEq SQL. The index read path decodes JSON numbers as json.Number

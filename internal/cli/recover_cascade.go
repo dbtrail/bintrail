@@ -329,7 +329,7 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	var res cascade.Result
 	var synthErr error
 	if len(parentDeletes) > 0 {
-		fks, lerr := cascade.LoadCascadeFKs(cmd.Context(), db, []string{rcSchema})
+		fks, lerr := cascade.LoadCascadeFKsForParent(cmd.Context(), db, rcSchema)
 		if lerr != nil {
 			return fmt.Errorf("load FK graph: %w", lerr)
 		}

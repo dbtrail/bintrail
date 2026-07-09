@@ -1,11 +1,128 @@
 package cascade
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"sort"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/query"
 )
+
+// TestLoadCascadeClosure pins the cross-schema FK loader (#833). Scoping the FK
+// graph by the child's own schema silently dropped a child living in a different
+// schema, so its cascade victims were never synthesized and the run exited 0
+// "complete" — silent data-loss. loadCascadeClosure scopes by the PARENT schema
+// (referenced_schema_name) and expands the referenced-schema frontier through the
+// child schemas of CASCADE/SET NULL edges, so direct AND multi-level cross-schema
+// children are loaded. The DB access is injected so this needs no database.
+func TestLoadCascadeClosure(t *testing.T) {
+	fk := func(childSchema, childTable, parentSchema, parentTable, rule string) CascadeFK {
+		return CascadeFK{
+			Schema: childSchema, Table: childTable, ConstraintName: "fk_" + childTable, Column: "pid",
+			ReferencedSchema: parentSchema, ReferencedTable: parentTable, ReferencedColumn: "id",
+			DeleteRule: rule, UpdateRule: "RESTRICT",
+		}
+	}
+	edgeKey := func(f CascadeFK) string { return f.Schema + "." + f.Table + "->" + f.ReferencedSchema + "." + f.ReferencedTable }
+
+	// graph indexes edges by their referenced (parent) schema — the frontier key.
+	byRef := func(edges ...CascadeFK) map[string][]CascadeFK {
+		m := map[string][]CascadeFK{}
+		for _, e := range edges {
+			m[e.ReferencedSchema] = append(m[e.ReferencedSchema], e)
+		}
+		return m
+	}
+	loaderFor := func(graph map[string][]CascadeFK) referencedSchemaLoader {
+		return func(_ context.Context, refSchemas []string) ([]CascadeFK, error) {
+			var out []CascadeFK
+			for _, s := range refSchemas {
+				out = append(out, graph[s]...)
+			}
+			return out, nil
+		}
+	}
+
+	cases := []struct {
+		name  string
+		graph map[string][]CascadeFK
+		want  []string // edgeKey set expected in the closure from parent schema "a"
+	}{
+		{
+			name:  "direct cross-schema child is loaded (the #833 regression)",
+			graph: byRef(fk("b", "reports", "a", "orders", "CASCADE")),
+			want:  []string{"b.reports->a.orders"},
+		},
+		{
+			name: "multi-level cross-schema grandchild in a third schema",
+			graph: byRef(
+				fk("b", "reports", "a", "orders", "CASCADE"),
+				fk("c", "lines", "b", "reports", "CASCADE"),
+			),
+			want: []string{"b.reports->a.orders", "c.lines->b.reports"},
+		},
+		{
+			name: "same-schema multi-level is loaded by the first query, unchanged",
+			graph: byRef(
+				fk("a", "orders", "a", "customers", "CASCADE"),
+				fk("a", "lines", "a", "orders", "CASCADE"),
+			),
+			want: []string{"a.orders->a.customers", "a.lines->a.orders"},
+		},
+		{
+			name: "RESTRICT cross-schema child does not widen the frontier",
+			graph: byRef(
+				fk("b", "reports", "a", "orders", "RESTRICT"),
+				fk("c", "lines", "b", "reports", "CASCADE"), // unreachable: b is a RESTRICT child
+			),
+			// The RESTRICT edge is still returned (SynthesizeVictims gates on the rule),
+			// but schema b is never scoped, so c.lines is not loaded.
+			want: []string{"b.reports->a.orders"},
+		},
+		{
+			name: "cycle terminates (a<->b) and dedups edges",
+			graph: byRef(
+				fk("b", "t1", "a", "t0", "CASCADE"),
+				fk("a", "t2", "b", "t1", "CASCADE"),
+			),
+			want: []string{"b.t1->a.t0", "a.t2->b.t1"},
+		},
+	}
+	for _, c := range cases {
+		got, err := loadCascadeClosure(context.Background(), "a", loaderFor(c.graph))
+		if err != nil {
+			t.Fatalf("%s: loadCascadeClosure: %v", c.name, err)
+		}
+		var keys []string
+		for _, e := range got {
+			keys = append(keys, edgeKey(e))
+		}
+		sort.Strings(keys)
+		want := append([]string(nil), c.want...)
+		sort.Strings(want)
+		if len(keys) != len(want) {
+			t.Fatalf("%s: got edges %v, want %v", c.name, keys, want)
+		}
+		for i := range want {
+			if keys[i] != want[i] {
+				t.Fatalf("%s: got edges %v, want %v", c.name, keys, want)
+			}
+		}
+	}
+}
+
+// TestLoadCascadeClosureLoaderError surfaces a loader failure instead of returning a
+// partial closure — a cascade recovery must never silently under-load its FK graph.
+func TestLoadCascadeClosureLoaderError(t *testing.T) {
+	boom := errors.New("index unreachable")
+	_, err := loadCascadeClosure(context.Background(), "a",
+		func(context.Context, []string) ([]CascadeFK, error) { return nil, boom })
+	if !errors.Is(err, boom) {
+		t.Fatalf("want loader error propagated, got %v", err)
+	}
+}
 
 // TestValToString covers every branch of the value renderer that backs the
 // re-parented comparison. The index read path decodes numbers as json.Number

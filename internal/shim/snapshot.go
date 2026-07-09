@@ -216,6 +216,10 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		Table:        q.Table,
 		PKCols:       pkCols,
 		Changes:      changes,
+		// rows was fetched LimitPerPK=1, so it is already collapsed to the latest
+		// event per PK; hand it to the #782 guard anyway (authoritative over what
+		// was fetched), bounded by that fetch (see pkChangingUpdateInEvents).
+		Events: rows,
 	}, func(rowMap map[string]any) error {
 		img := make(map[string]any, len(rowMap))
 		for k, v := range rowMap {

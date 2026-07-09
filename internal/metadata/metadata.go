@@ -1335,6 +1335,41 @@ func CascadeConstraintsInIndex(indexDB *sql.DB, schemas []string) ([]FKCascadeEd
 	return out, rows.Err()
 }
 
+// IsCascadeParentInIndex reports whether schema.table is the REFERENCED (parent)
+// side of an ON DELETE CASCADE / SET NULL foreign key in the latest FK snapshot,
+// INCLUDING children that live in a DIFFERENT schema (a cross-schema FK to
+// schema.table is legal in MySQL, #833). It matches on referenced_schema_name +
+// referenced_table_name, so it is not fooled by a same-named table in another
+// schema, and it is not scoped to the parent's own schema the way the child-scoped
+// CascadeConstraintsInIndex is. Used by the console to decide whether a DELETE on
+// schema.table should auto-route through cascade synthesis: a parent whose only
+// cascade children are cross-schema would otherwise report false and silently fall
+// back to plain recover, missing the cascade victims.
+//
+// Returns false (not an error) when fk_constraints is absent (index predates it).
+func IsCascadeParentInIndex(indexDB *sql.DB, schema, table string) (bool, error) {
+	var exists bool
+	if err := indexDB.QueryRow(
+		"SELECT COUNT(*) > 0 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fk_constraints'",
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check fk_constraints table: %w", err)
+	}
+	if !exists {
+		return false, nil
+	}
+	var isParent bool
+	if err := indexDB.QueryRow(
+		`SELECT COUNT(*) > 0 FROM fk_constraints
+			WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM fk_constraints)
+			  AND referenced_schema_name = ? AND referenced_table_name = ?
+			  AND delete_rule IN ('CASCADE', 'SET NULL')`,
+		schema, table,
+	).Scan(&isParent); err != nil {
+		return false, fmt.Errorf("failed to query cascade parent constraints: %w", err)
+	}
+	return isParent, nil
+}
+
 // EnsureResolver returns a Resolver loaded from the latest snapshot, taking a
 // new snapshot automatically if none exists (requires sourceDB != nil).
 func EnsureResolver(indexDB, sourceDB *sql.DB, schemas []string) (*Resolver, error) {
