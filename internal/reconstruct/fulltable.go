@@ -316,6 +316,17 @@ func ReconstructTable(
 		if !errors.Is(err, ErrNoBaseline) {
 			return nil, fmt.Errorf("find baseline: %w", err)
 		}
+		// Full-table reconstruct is out of GA scope for PostgreSQL (#597). With no
+		// baseline found the LSN anchor is unavailable, so detect PG by the recorded
+		// source flavor and refuse here too — otherwise a PG full-table reconstruct
+		// of a table absent from the baseline would fall through to the binlog-only
+		// (delta-only) report below, mislabeled as a full-table reconstruct (#916).
+		// Mirrors the with-baseline PG gate further down.
+		if query.SourceFlavor(db) == "postgres" {
+			return nil, fmt.Errorf(
+				"full-table reconstruct is not yet supported for PostgreSQL sources (#597); " +
+					"use single-row `reconstruct` or the shim `_flashback` for PostgreSQL time-travel")
+		}
 		// No baseline exists for this table. This can happen when: (1) the
 		// table was empty at dump time and the baseline predates 0-row
 		// Parquet support, or (2) the table was created after the last

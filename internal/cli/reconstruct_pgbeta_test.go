@@ -4,10 +4,9 @@ import "testing"
 
 // TestPGReconstructBeta pins the #829 beta-warn gate: single-row reconstruct
 // warns for a PostgreSQL source, detected by the recorded flavor OR the
-// baseline's LSN anchor. Both clauses are load-bearing: the flavor clause
-// catches an S3 PG baseline (bmeta.LSN is 0 for S3 on this local-only-metadata
-// path) and a pre-#593 local baseline (LSN==0); the LSN clause catches a local
-// PG baseline whose flavor probe returns "".
+// baseline's LSN anchor. Both clauses are load-bearing: the LSN clause catches
+// any PG baseline carrying an anchor (local or S3, since #916 reads S3 metadata);
+// the flavor clause catches a pre-#593 PG baseline with LSN==0.
 func TestPGReconstructBeta(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -16,7 +15,7 @@ func TestPGReconstructBeta(t *testing.T) {
 		want   bool
 	}{
 		{"postgres flavor, no lsn", "postgres", 0, true},
-		{"empty flavor, lsn set (local baseline, probe blank)", "", 42, true},
+		{"empty flavor, lsn set (anchored baseline, probe blank)", "", 42, true},
 		{"postgres flavor and lsn", "postgres", 99, true},
 		{"empty flavor, no lsn (MySQL file-index)", "", 0, false},
 		{"mysql flavor", "mysql", 0, false},

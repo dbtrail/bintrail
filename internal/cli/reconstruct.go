@@ -209,14 +209,19 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 	slog.Debug("found baseline snapshot", "path", baselinePath, "snapshot_time", snapshotTime.UTC().Format(time.RFC3339))
 
-	// Read baseline binlog position metadata (local files only).
+	// Read baseline position metadata (binlog file/pos for MySQL, the WAL LSN
+	// anchor for PG). ReadParquetMetadataAny reads S3 too — the same reader the
+	// full-table path uses (fulltable.go) — so an S3 baseline populates bmeta,
+	// which the old local-only read silently skipped: without it, gap detection
+	// and the PG beta warn below were disabled for every S3 baseline (#916). A
+	// read failure is non-fatal — warn and proceed with a zero bmeta (gap
+	// detection then reports "unavailable", the pre-#916 S3 behavior).
 	var bmeta baseline.DumpMetadata
-	if !strings.HasPrefix(baselinePath, "s3://") {
-		var metaErr error
-		bmeta, metaErr = baseline.ReadParquetMetadata(baselinePath)
-		if metaErr != nil {
-			slog.Warn("could not read baseline metadata", "error", metaErr)
-		} else if bmeta.BinlogFile != "" {
+	if bm, metaErr := baseline.ReadParquetMetadataAny(cmd.Context(), baselinePath); metaErr != nil {
+		slog.Warn("could not read baseline metadata", "error", metaErr)
+	} else {
+		bmeta = bm
+		if bmeta.BinlogFile != "" {
 			slog.Debug("baseline binlog position",
 				"file", bmeta.BinlogFile, "pos", bmeta.BinlogPos, "gtid", bmeta.GTIDSet)
 		}
@@ -268,13 +273,12 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	// GUC-sensitive and container types are beta and not yet proven end-to-end
 	// through the baseline↔delta fold (#593 slice D). Warn — never refuse (the
 	// path is honest-best-effort and a refusal would break the surface that DOES
-	// work). Detect PG by the recorded flavor OR the baseline's LSN anchor. This
-	// path reads baseline metadata LOCAL-only (see the ReadParquetMetadata guard
-	// above), so bmeta.LSN is 0 for an S3 baseline: the flavor clause catches S3
-	// PG baselines (and pre-#593 local baselines with LSN==0), while the LSN
-	// clause catches a LOCAL PG baseline whose flavor probe returns "" (an index
-	// with no stream_state row). Both clauses are load-bearing. --baseline-only
-	// returns above, before the DB is ever opened, so it never reaches this warn.
+	// work). Detect PG by the recorded flavor OR the baseline's LSN anchor (read
+	// from S3 too since #916). Both clauses are load-bearing: the LSN clause
+	// catches any PG baseline carrying an anchor (post-#593, local or S3); the
+	// flavor clause catches a pre-#593 PG baseline with LSN==0 (no anchor) and
+	// backstops a baseline whose metadata read failed. --baseline-only returns
+	// above, before the DB is ever opened, so it never reaches this warn.
 	if pgReconstructBeta(query.SourceFlavor(db), bmeta.LSN) {
 		slog.Warn("single-row reconstruct for a PostgreSQL source is beta — validated for canonical types (int/numeric/bool/uuid/text/json/enum and the common PK types) but not yet proven end-to-end for timestamptz/float/bytea/interval/array types; verify the round-trip before relying on it (#593)")
 	}
@@ -659,10 +663,10 @@ func resolveGapCheck(flavor string, bmeta baseline.DumpMetadata, firstFile strin
 // pgReconstructBeta reports whether a single-row reconstruct is running against
 // a PostgreSQL source — gate for the beta warning. Either the index records the
 // source flavor as "postgres", or the baseline carries an LSN anchor. Both
-// clauses are load-bearing: the flavor clause catches an S3 PG baseline (the
-// single-row path reads baseline metadata local-only, so bmeta.LSN is 0 for S3)
-// and a pre-#593 local baseline with LSN==0; the LSN clause catches a local PG
-// baseline whose flavor probe returns "" (an index with no stream_state row).
+// clauses are load-bearing: the LSN clause catches any PG baseline carrying an
+// anchor (post-#593, local or S3 — metadata is read from S3 too since #916); the
+// flavor clause catches a pre-#593 PG baseline with LSN==0 (no anchor) and
+// backstops a baseline whose metadata read failed.
 func pgReconstructBeta(flavor string, baselineLSN uint64) bool {
 	return flavor == "postgres" || baselineLSN != 0
 }

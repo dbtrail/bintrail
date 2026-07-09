@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
+
 	"github.com/dbtrail/dbtrail/internal/baseline"
 )
 
@@ -80,5 +82,34 @@ func TestReconstructTable_mysqlMissingCreateTableSQLUnchanged(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "PostgreSQL") {
 		t.Fatalf("MySQL baseline must not get the PG message: %v", err)
+	}
+}
+
+// TestReconstructTable_pgNoBaselineRefused is the #916 secondary guard: a
+// full-table reconstruct of a PG-flavored source (stream_state.flavor='postgres')
+// for a table with NO baseline must refuse (#597), not fall through to a
+// binlog-only report mislabeled as full-table. With no baseline there is no LSN
+// anchor, so detection is by the recorded source flavor alone.
+func TestReconstructTable_pgNoBaselineRefused(t *testing.T) {
+	dir := t.TempDir() // empty baseline source → FindBaseline returns ErrNoBaseline
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT flavor FROM stream_state").
+		WillReturnRows(sqlmock.NewRows([]string{"flavor"}).AddRow("postgres"))
+
+	cfg := FullTableConfig{BaselineSrc: dir, At: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)}
+	_, err = ReconstructTable(context.Background(), cfg, "shop", "orders", db, nil, nil, nil, "")
+	if err == nil {
+		t.Fatal("expected the PG no-baseline refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "not yet supported for PostgreSQL sources (#597)") {
+		t.Fatalf("PG no-baseline reconstruct got the wrong error: %v", err)
+	}
+	if merr := mock.ExpectationsWereMet(); merr != nil {
+		t.Errorf("unmet sqlmock expectations: %v", merr)
 	}
 }
