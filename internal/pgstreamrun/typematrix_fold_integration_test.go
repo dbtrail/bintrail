@@ -203,10 +203,26 @@ func TestOne_PGTypeMatrixThroughReconstructFold(t *testing.T) {
 			t.Fatalf("oracle %s: %v", set, err)
 		}
 	}
+	// The oracle reads the OUTPUT-FUNCTION rendering, not a ::text cast: the
+	// simple protocol returns text-format results, whose wire bytes ARE the
+	// type's output function under this session's (pinned) GUCs — the exact
+	// text a correct fold must produce. A ::text CAST diverges for some types
+	// (bool::text = "true"/"false" vs boolout's "t"/"f"; inet::text appends
+	// /32 to a host address; bpchar::text trims the padding), which would
+	// flag internally-consistent fold output as a mismatch.
 	oracle := func(tbl string, id int) string {
 		t.Helper()
-		var got string
-		if err := oracleConn.QueryRow(ctx, fmt.Sprintf("SELECT val::text FROM %s WHERE id=%d", tbl, id)).Scan(&got); err != nil {
+		rows, err := oracleConn.Query(ctx, fmt.Sprintf("SELECT val FROM %s WHERE id=%d", tbl, id), pgx.QueryExecModeSimpleProtocol)
+		if err != nil {
+			t.Fatalf("oracle %s id=%d: %v", tbl, id, err)
+		}
+		defer rows.Close()
+		if !rows.Next() {
+			t.Fatalf("oracle %s id=%d: no row (err=%v)", tbl, id, rows.Err())
+		}
+		got := string(rows.RawValues()[0]) // copy before Close invalidates it
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			t.Fatalf("oracle %s id=%d: %v", tbl, id, err)
 		}
 		return got
@@ -343,29 +359,23 @@ func TestOne_PGTypeMatrixThroughReconstructFold(t *testing.T) {
 				return valText(state["val"])
 			}
 
-			normalize := func(s string) string {
-				if c.name == "char" {
-					// bpchar: raw COPY/pgoutput text is space-padded to the
-					// declared width; ::text (the oracle) trims. Value
-					// equality modulo padding is the honest comparison.
-					return strings.TrimRight(s, " ")
-				}
-				return s
-			}
-
+			// Byte-equality against the output-function oracle — no per-type
+			// normalization needed (the simple-protocol oracle renders exactly
+			// what a correct fold produces, bpchar padding included).
+			//
 			// id=1 — baseline pass-through: the sharpest pre-pin failure (the
 			// baseline COPY rendered under the skewed session).
-			if got := fold("1", 0); normalize(got) != normalize(orig1[c.name]) {
+			if got := fold("1", 0); got != orig1[c.name] {
 				t.Errorf("id=1 baseline pass-through (%s):\n got  %q\n want %q", c.typeDDL, got, orig1[c.name])
 			}
 			// id=2 — baseline + UPDATE overlay: the delta row_after must win
 			// and be pin-rendered.
-			if got := fold("2", 1); normalize(got) != normalize(orig2[c.name]) {
+			if got := fold("2", 1); got != orig2[c.name] {
 				t.Errorf("id=2 baseline+delta overlay (%s):\n got  %q\n want %q", c.typeDDL, got, orig2[c.name])
 			}
 			// id=3 — delta-only: pre-pin failure under the DB-level skew (the
 			// walsender rendered under the skewed defaults).
-			if got := fold("3", 1); normalize(got) != normalize(orig3[c.name]) {
+			if got := fold("3", 1); got != orig3[c.name] {
 				t.Errorf("id=3 delta-only (%s):\n got  %q\n want %q", c.typeDDL, got, orig3[c.name])
 			}
 

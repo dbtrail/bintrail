@@ -27,7 +27,13 @@
 // Values are stored as raw PostgreSQL text (Column.RawText — COPY text output,
 // unescaped): identical to the pgoutput text rendering the delta path indexes,
 // so the PK join between baseline and deltas is an identity string match. No
-// type conversion, ever.
+// type conversion, ever. That identity only holds because BOTH sessions render
+// under the SAME session GUCs: every COPY connection here and the walsender
+// session are pinned to the canonical rendering GUCs (#593 slice D,
+// pgcapture/gucpin.go — TimeZone=UTC, DateStyle=ISO, extra_float_digits=3,
+// bytea_output=hex, IntervalStyle=postgres), and the pinned set is stamped
+// into the Parquet metadata (baseline.MetaKeyRenderGUCs) so readers can tell a
+// pre-pin baseline from a pinned one.
 package pgbaseline
 
 import (
@@ -134,7 +140,12 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		compression = "zstd"
 	}
 
-	conn, err := pgx.Connect(ctx, cfg.QueryDSN)
+	// Pinned rendering GUCs (#593 slice D, pgcapture/gucpin.go): this anchor
+	// connection runs the COPY itself when Parallelism==1, so its session GUCs
+	// determine the baseline text — pinned identically to the walsender.
+	// Startup-packet placement keeps the REPEATABLE READ anchor below intact
+	// (the pin is in effect before BEGIN; no SET inside the transaction).
+	conn, err := pgcapture.ConnectQueryPinned(ctx, cfg.QueryDSN)
 	if err != nil {
 		return Stats{}, fmt.Errorf("pgbaseline: connect (query DSN): %w", err)
 	}
@@ -147,7 +158,8 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	var replConnect func(context.Context) (*pgconn.PgConn, error)
 	if cfg.ReplDSN != "" {
 		replConnect = func(ctx context.Context) (*pgconn.PgConn, error) {
-			return pgconn.Connect(ctx, cfg.ReplDSN)
+			// Renders no rows (slot creation only); pinned for uniformity.
+			return pgcapture.ConnectReplPinned(ctx, cfg.ReplDSN)
 		}
 	}
 	created, err := pgcapture.EnsureSlotExists(ctx, conn, cfg.SlotName, replConnect)
@@ -371,7 +383,9 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 // openWorkerConn opens a connection whose transaction adopts the exported
 // snapshot, so a parallel worker sees exactly the anchor transaction's data.
 func openWorkerConn(ctx context.Context, dsn, snapshotID string) (*pgx.Conn, error) {
-	c, err := pgx.Connect(ctx, dsn)
+	// Every parallel worker runs COPYs — its session renders baseline text, so
+	// it gets the same rendering-GUC pin as the anchor (#593 slice D).
+	c, err := pgcapture.ConnectQueryPinned(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("pgbaseline: connect parallel worker: %w", err)
 	}
@@ -416,6 +430,11 @@ func processTable(ctx context.Context, conn *pgx.Conn, t tableInfo, outputDir, t
 		// deliberately absent — it exists for full-table mydumper
 		// reconstruct, out of scope for PG.
 		baseline.MetaKeyLSN: strconv.FormatUint(deltaStartLSN, 10),
+		// The rendering-GUC stamp (#593 slice D): records that this baseline's
+		// text was rendered under the pinned canonical GUCs. Readers use its
+		// ABSENCE to detect a pre-pin baseline whose GUC-sensitive text may
+		// not join post-pin deltas (warn + re-baseline guidance).
+		baseline.MetaKeyRenderGUCs: pgcapture.RenderGUCsStamp(),
 	}
 
 	cols := make([]baseline.Column, len(t.Columns))

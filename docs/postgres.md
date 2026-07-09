@@ -335,17 +335,27 @@ directly.
 > MySQL.** `bintrail-pg baseline` takes a consistent Parquet snapshot directly
 > from a live PostgreSQL source, anchored to the replication slot's own LSN
 > floor. It feeds **single-row** `reconstruct` and the shim's **single-row**
-> `_snapshot` — both fold a PG baseline with binlog deltas with no
-> PostgreSQL-specific gate, so they run today. This path is **beta and
-> untested end-to-end** for PostgreSQL-specific types (`bytea`,
-> `timestamptz`, arrays) flowing through the fold — validate your own
-> round-trip before relying on it. **Full-table** `reconstruct`
-> (`--output-format mydumper`) and baseline-anchored `verify` remain
-> deliberately out of scope: a PG baseline does not carry the `CREATE TABLE`
-> metadata full-table reconstruct needs. `query` and `recover` (which work
-> from the indexed deltas alone, no baseline required) are the
-> fully-supported recovery surface for PostgreSQL in this release — see
-> [Beta limitations](#beta-limitations) for the complete picture.
+> `_snapshot` — both fold a PG baseline with binlog deltas. This fold is
+> **validated end-to-end for scalar types**: the canonical set (`int2/4/8`,
+> `numeric`, `bool`, `uuid`, `text`/`varchar`/`char`, `json`, `jsonb`, enums)
+> **and** the GUC-sensitive set (`timestamptz`, `timestamp`/`date`/`time`,
+> `real`/`double precision`, `bytea`, `interval`), whose text rendering is
+> pinned identically on the baseline COPY connections and the logical-decoding
+> session (`TimeZone=UTC`, `DateStyle=ISO`, `extra_float_digits=3`,
+> `bytea_output=hex`, `IntervalStyle=postgres`). Container types (arrays
+> beyond the tested `integer[]`/`text[]`, composite, range/multirange,
+> `hstore`, geometric) remain untested through the fold — validate your own
+> round-trip. **Re-baseline after upgrading:** baselines taken before the
+> rendering-GUC pin were rendered under your server's session defaults; on a
+> server whose defaults differ from the pinned values, re-run
+> `bintrail-pg baseline` — the baseline↔delta merge is an exact text join.
+> **Full-table** `reconstruct` (`--output-format mydumper`) and
+> baseline-anchored `verify` remain deliberately out of scope: a PG baseline
+> does not carry the `CREATE TABLE` metadata full-table reconstruct needs.
+> `query` and `recover` (which work from the indexed deltas alone, no baseline
+> required) are the fully-supported recovery surface for PostgreSQL in this
+> release — see [Beta limitations](#beta-limitations) for the complete
+> picture.
 
 ---
 
@@ -455,22 +465,24 @@ value is stored verbatim as text — never reparsed through a numeric type in th
 index — the `numeric`-via-`float64` precision class that the MySQL path had to guard
 against simply cannot occur here.
 
-The following types are **round-trip tested** — insert → capture → index → `recover`
-→ re-execute the reversal against live PostgreSQL, asserting the column's canonical
-`::text` is byte-for-byte identical — in `internal/pgstreamrun`
-(`TestOne_PGTypeRoundTripMatrix`, run across the PG 14/15/16/17 CI matrix):
+The following types are **round-trip tested** two ways — insert → capture → index →
+`recover` → re-execute the reversal against live PostgreSQL, asserting the column's
+canonical `::text` is byte-for-byte identical (`TestOne_PGTypeRoundTripMatrix`), and
+through the **baseline+delta reconstruct fold** under deliberately skewed session
+GUCs (`TestOne_PGTypeMatrixThroughReconstructFold`) — in `internal/pgstreamrun`,
+run across the PG 14/15/16/17 CI matrix:
 
 | Category | Types | Notes |
 |---|---|---|
 | Integer | `smallint`, `integer`, `bigint` | exact |
 | Arbitrary precision | `numeric` (`decimal` is its alias) | full **precision and scale** preserved — values > 2^53 and trailing zeros (`1.50`) survive |
-| Floating point | `real`, `double precision` | |
+| Floating point | `real`, `double precision` | rendered under pinned `extra_float_digits=3` (shortest-precise) on both capture and baseline sessions |
 | Character | `text`, `varchar(n)`, `char(n)` | single quotes and backslashes escaped correctly (`standard_conforming_strings`); `char(n)` round-trips (trailing blanks are insignificant in `bpchar` — PostgreSQL trims them on cast to text) |
 | Boolean | `boolean` | |
 | UUID | `uuid` | |
-| Binary | `bytea` | hex (`\x…`) form |
+| Binary | `bytea` | hex (`\x…`) form — guaranteed by the pinned `bytea_output=hex`, no longer default-dependent |
 | JSON | `json`, `jsonb` | `jsonb` tested with an embedded quote |
-| Date / time | `date`, `time`, `timestamp`, `timestamptz`, `interval` | a `timestamptz`'s text form follows the server timezone (consistent within an instance) |
+| Date / time | `date`, `time`, `timestamp`, `timestamptz`, `interval` | rendered under pinned `TimeZone=UTC` / `DateStyle=ISO` / `IntervalStyle=postgres` on both capture and baseline sessions — no longer dependent on server defaults |
 | Network | `inet`, `cidr`, `macaddr` | |
 | Bit string | `bit(n)`, `varbit` | |
 | Range | `int4range` | the other built-in range types share the same text mechanism |
@@ -487,9 +499,10 @@ for a PostgreSQL source.
 
 **Untested / best-effort:** `hstore` and other extension-provided types are covered
 under [Extensions and custom types](#extensions-and-custom-types) below. Composite
-types, multi-dimensional arrays, and arrays containing `NULL` are not yet in the
-round-trip suite — they are captured as text and are expected to coerce, but verify
-your own round-trip.
+types, range types beyond `int4range`, multirange, geometric types beyond `point`,
+arrays beyond the tested `integer[]`/`text[]` (multi-dimensional, `NULL`-containing)
+are not yet in the round-trip suite — they are captured as text and are expected to
+coerce, but verify your own round-trip.
 
 ---
 
@@ -551,8 +564,11 @@ your own round-trip.
 - **Full-table `reconstruct` and baseline-anchored `verify` are not wired for
   PostgreSQL** — a PG baseline deliberately omits the `CREATE TABLE` metadata
   full-table reconstruct needs (see above). **Single-row** `reconstruct` and
-  the shim's single-row `_snapshot` DO work against a PG baseline today, but
-  are beta/untested end-to-end for PostgreSQL-specific types. (`recover` and
+  the shim's single-row `_snapshot` work against a PG baseline and are
+  validated end-to-end for scalar types — including the GUC-sensitive set,
+  rendered under session GUCs pinned identically at capture and baseline;
+  container types remain beta (see
+  [Querying and recovering](#querying-and-recovering)). (`recover` and
   `recover-cascade` work unconditionally, with no baseline needed; cascades
   are captured as ordinary row changes — see
   [Querying and recovering](#querying-and-recovering).)
@@ -567,10 +583,11 @@ your own round-trip.
 
 The data-safety items that gated **beta** are now closed (type fidelity,
 identity/generated recovery, slot/WAL monitoring, RI-FULL validation, DDL-drift
-handling, and the silent-loss coverage guards above). Source-aware console
-presentation, including the live replication-health panel, shipped in v0.20.1.
-The remaining limitation — full-table `reconstruct` / time-travel via a
-PostgreSQL baseline — is tracked toward **GA** in
+handling, the silent-loss coverage guards above, and the baseline↔delta
+rendering-GUC identity with its fold-validated type matrix, #593). Source-aware
+console presentation, including the live replication-health panel, shipped in
+v0.20.1. The remaining limitation — **full-table** `reconstruct` / time-travel
+via a PostgreSQL baseline — is tracked toward **GA** in
 [#597](https://github.com/dbtrail/dbtrail/issues/597). The managed-PostgreSQL
 smoke covers RDS and Aurora — see
 [Managed PostgreSQL](#managed-postgresql).

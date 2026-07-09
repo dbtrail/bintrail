@@ -65,6 +65,12 @@ const (
 	// never returned in a trustworthy-digest / untrustworthy-count combination.
 	MetaKeyRowCount      = "bintrail.baseline_row_count"
 	MetaKeyContentDigest = "bintrail.baseline_content_digest"
+	// MetaKeyRenderGUCs records the pinned PostgreSQL rendering-GUC set the
+	// baseline's text was produced under (pgcapture.RenderGUCsStamp, #593
+	// slice D). Its ABSENCE on an LSN-anchored (PG) baseline marks a pre-pin
+	// baseline whose GUC-sensitive text may not join post-pin deltas — readers
+	// warn and recommend re-baselining. Absent on MySQL/MariaDB baselines.
+	MetaKeyRenderGUCs = "bintrail.render_gucs"
 )
 
 // DumpMetadata contains information parsed from a mydumper metadata file or
@@ -78,6 +84,7 @@ type DumpMetadata struct {
 	ContentDigest  string // version-tagged content fingerprint; set after #633, empty when absent (old baselines)
 	RowCount       int64  // rows ingested into this table's baseline; valid only when ContentDigest != ""
 	LSN            uint64 // PostgreSQL WAL LSN delta-replay floor, inclusive (MetaKeyLSN, see its doc comment / #771); 0 = absent (MySQL baseline, or pre-#593 PG baseline)
+	RenderGUCs     string // pinned rendering-GUC stamp (MetaKeyRenderGUCs, #593 slice D); "" = pre-pin PG baseline or MySQL baseline
 }
 
 // StartedAtMarkerFile is a bintrail-authored sidecar written into the mydumper
@@ -249,6 +256,9 @@ func ReadParquetMetadata(path string) (DumpMetadata, error) {
 	if v, ok := pf.Lookup(MetaKeyContentDigest); ok {
 		m.ContentDigest = v
 	}
+	if v, ok := pf.Lookup(MetaKeyRenderGUCs); ok {
+		m.RenderGUCs = v
+	}
 	if v, ok := pf.Lookup(MetaKeyRowCount); ok {
 		n, parseErr := strconv.ParseInt(v, 10, 64)
 		if parseErr != nil {
@@ -330,6 +340,8 @@ func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, err
 			m.CreateTableSQL = val
 		case MetaKeyContentDigest:
 			m.ContentDigest = val
+		case MetaKeyRenderGUCs:
+			m.RenderGUCs = val
 		case MetaKeyRowCount:
 			if n, parseErr := strconv.ParseInt(val, 10, 64); parseErr == nil {
 				m.RowCount = n

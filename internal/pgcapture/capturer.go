@@ -113,7 +113,10 @@ func (c *Capturer) Run(ctx context.Context, out chan<- event.Event) error {
 		return fmt.Errorf("pgcapture: Run requires ReplDSN, QueryDSN, SlotName, and Publication")
 	}
 
-	replConn, err := pgconn.Connect(ctx, c.cfg.ReplDSN)
+	// Pinned rendering GUCs (#593 slice D, gucpin.go): the walsender session's
+	// GUCs determine pgoutput's tuple text, which must byte-match the baseline
+	// COPY text (pinned identically in internal/pgbaseline).
+	replConn, err := ConnectReplPinned(ctx, c.cfg.ReplDSN)
 	if err != nil {
 		return fmt.Errorf("pgcapture: connect replication: %w", err)
 	}
