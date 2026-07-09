@@ -21,7 +21,8 @@ func TestIsDeferredType(t *testing.T) {
 		// event image, same base64-vs-raw gap as BLOB, so they must defer to
 		// Inconclusive rather than report a conclusive false-MISMATCH.
 		"geometry", "point", "linestring", "polygon",
-		"multipoint", "multilinestring", "multipolygon", "geometrycollection",
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection", "geomcollection", // MySQL 8.0.11+ reports the latter
 		"vector",
 		"BLOB", "Enum", "GEOMETRY", // case-insensitive
 	}

@@ -300,7 +300,10 @@ func isDeferredType(dataType string) bool {
 		// Spatial family (DATA_TYPE as reported by information_schema.COLUMNS)
 		// plus MySQL 9.0+ VECTOR: binary in the event image, no normalization yet.
 		"geometry", "point", "linestring", "polygon",
-		"multipoint", "multilinestring", "multipolygon", "geometrycollection",
+		"multipoint", "multilinestring", "multipolygon",
+		// MySQL 8.0.11+ (WL#2388) reports a GEOMETRYCOLLECTION column's DATA_TYPE
+		// as "geomcollection"; MariaDB and pre-8.0.11 report "geometrycollection".
+		"geometrycollection", "geomcollection",
 		"vector":
 		return true
 	}
