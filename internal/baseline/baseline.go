@@ -154,22 +154,37 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 
 			if cfg.Retry {
 				if fi, err := os.Stat(outPath); err == nil && fi.Size() > 0 {
-					// A retry-skipped file keeps whatever digest it already has.
-					// A file written before #633 (or by an older binary across a
-					// mid-baseline upgrade) has none, and re-running --retry will
-					// not heal it — surface that so the operator knows the
-					// snapshot won't be fully verifiable without a fresh run.
-					if existing, mErr := ReadParquetMetadata(outPath); mErr == nil && existing.ContentDigest == "" {
-						slog.Warn("skipped existing file has no content digest; this table won't be verifiable without a fresh baseline",
+					// Size>0 alone is NOT proof the file is a usable Parquet
+					// (#798): an OOM/SIGKILL mid-processTable can leave a
+					// nonzero-but-truncated file with no footer. ReadParquetMetadata
+					// parses the footer, so its error is the exact signal that this
+					// "existing" file is corrupt — re-convert rather than bless the
+					// truncated bytes (WriteManifest would otherwise CRC them and
+					// publish _SUCCESS, exploding only at restore time). Only skip
+					// when the file both exists AND parses as valid Parquet.
+					existing, mErr := ReadParquetMetadata(outPath)
+					if mErr != nil {
+						slog.Warn("existing baseline file did not parse as valid Parquet (truncated/corrupt) — re-converting instead of skipping (--retry)",
+							"db", tf.Database, "table", tf.Table, "file", outPath, "error", mErr)
+						// fall through to re-convert
+					} else {
+						// A retry-skipped file keeps whatever digest it already has.
+						// A file written before #633 (or by an older binary across a
+						// mid-baseline upgrade) has none, and re-running --retry will
+						// not heal it — surface that so the operator knows the
+						// snapshot won't be fully verifiable without a fresh run.
+						if existing.ContentDigest == "" {
+							slog.Warn("skipped existing file has no content digest; this table won't be verifiable without a fresh baseline",
+								"db", tf.Database, "table", tf.Table, "file", outPath)
+						}
+						slog.Info("skipping existing file (--retry)",
 							"db", tf.Database, "table", tf.Table, "file", outPath)
+						mu.Lock()
+						stats.TablesProcessed++
+						stats.FilesWritten++
+						mu.Unlock()
+						return
 					}
-					slog.Info("skipping existing file (--retry)",
-						"db", tf.Database, "table", tf.Table, "file", outPath)
-					mu.Lock()
-					stats.TablesProcessed++
-					stats.FilesWritten++
-					mu.Unlock()
-					return
 				}
 			}
 
