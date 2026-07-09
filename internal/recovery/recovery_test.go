@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -2022,5 +2023,55 @@ func TestRequireTypedColumns_scoping(t *testing.T) {
 				t.Errorf("requireTypedColumns err=%v, wantErr=%v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestIsRefusal_classifiesByDesignRefusals pins the #917 error-classification seam:
+// every by-design refusal (untypeable columns #788, schema drift #601, oversized
+// script #654, malformed row images #784) reports as ErrRecoveryRefused so HTTP/MCP
+// callers map it to a 4xx, while a generic fault does not. It also proves the
+// untypeable refusal surfaces its OWN typed error through GenerateSQLFromRows — not the
+// malformed-row wrapper, whose wording would misdescribe a missing snapshot.
+func TestIsRefusal_classifiesByDesignRefusals(t *testing.T) {
+	if !IsRefusal(&ScriptBudgetError{EstimatedBytes: 2, Budget: 1}) {
+		t.Error("ScriptBudgetError must be a refusal")
+	}
+	if !IsRefusal(&UntypedColumnsError{Schema: "db", Table: "t", EventID: 1}) {
+		t.Error("UntypedColumnsError must be a refusal")
+	}
+	if !IsRefusal(schemaDriftError(map[string]map[string]bool{"db.t": {"c": true}}, []string{"db.t"})) {
+		t.Error("schemaDriftError must be a refusal")
+	}
+	if !IsRefusal(partialGenerationError([]genFailure{{eventID: 1, err: fmt.Errorf("boom")}})) {
+		t.Error("partialGenerationError must be a refusal")
+	}
+	if IsRefusal(fmt.Errorf("a real DB fault")) {
+		t.Error("a generic error must NOT be classified as a refusal")
+	}
+
+	// End-to-end: a DB-backed generator with no snapshot refuses an untyped table with
+	// its OWN typed error (errors.As), IS a refusal, and names the snapshot remedy
+	// rather than the malformed-row wording; nothing reaches the writer.
+	row := query.ResultRow{
+		EventID: 7, SchemaName: "app", TableName: "users", EventType: parser.EventInsert,
+		PKValues: "42", RowAfter: map[string]any{"id": float64(42)},
+	}
+	var buf bytes.Buffer
+	_, err := New(new(sql.DB), nil).GenerateSQLFromRows([]query.ResultRow{row}, &buf)
+	if err == nil {
+		t.Fatal("expected a refusal for a DB-backed untyped table")
+	}
+	if !IsRefusal(err) {
+		t.Errorf("untypeable refusal must be classified as a refusal, got: %v", err)
+	}
+	var ute *UntypedColumnsError
+	if !errors.As(err, &ute) {
+		t.Errorf("untypeable refusal must surface *UntypedColumnsError, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "snapshot") || strings.Contains(err.Error(), "malformed or truncated") {
+		t.Errorf("untypeable refusal must cite the snapshot remedy, not the malformed-row wording, got: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("a refusal must write nothing, got %d bytes", buf.Len())
 	}
 }

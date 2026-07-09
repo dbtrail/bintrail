@@ -337,6 +337,15 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// DialectForIndex defaults to MySQL on any read failure (#533/#573).
 	n, err := recovery.NewForDialect(b.db, b.resolver, dialect).GenerateSQLFromRows(rows, &buf)
 	if err != nil {
+		// A by-design refusal (no schema snapshot to type BLOB/TEXT/BINARY #788,
+		// schema drift #601, oversized script #654, malformed row images #784) is a
+		// caller-actionable condition — the request cannot be fulfilled as specified,
+		// not a server crash. Answer 422 with the actionable message; reserve 500 for
+		// genuine faults (DB errors, encode failures).
+		if recovery.IsRefusal(err) {
+			writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
