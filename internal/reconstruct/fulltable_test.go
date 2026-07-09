@@ -588,7 +588,7 @@ func TestWriteBinlogOnlyChanges_insertsSkipsDeletes(t *testing.T) {
 
 	rep := &TableReport{Schema: "mydb", Table: "orders"}
 	if err := writeBinlogOnlyChanges(outDir, "mydb", "orders", pkColsIntID(), colNames, 0,
-		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, rep); err != nil {
+		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, nil, rep); err != nil {
 		t.Fatalf("writeBinlogOnlyChanges: %v", err)
 	}
 
@@ -640,7 +640,7 @@ func TestWriteBinlogOnlyChanges_nilRowAfterSkipped(t *testing.T) {
 
 	rep := &TableReport{Schema: "mydb", Table: "orders"}
 	if err := writeBinlogOnlyChanges(outDir, "mydb", "orders", pkColsIntID(), colNames, 0,
-		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, rep); err != nil {
+		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, nil, rep); err != nil {
 		t.Fatalf("writeBinlogOnlyChanges: %v", err)
 	}
 	if rep.InsertsEmitted != 0 {
