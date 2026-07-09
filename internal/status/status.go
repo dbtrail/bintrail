@@ -422,6 +422,14 @@ type StatusData struct {
 	Servers   []ServerInfo
 	Stream    *StreamStateInfo
 	Baselines []BaselineInfo
+	// StreamErr records a failure to READ stream_state (transient timeout, revoked
+	// permission, an unexpected loadSourceHealth error) — as distinct from an empty
+	// table (Stream==nil, StreamErr==nil = no active stream). When set, the continuity
+	// verdict could not be evaluated: the output must show it as "unavailable" rather
+	// than silently omit the Stream section and its permanent-loss banner (fail visible,
+	// not silent). json:"-" — StatusData is rendered via the manual jsonSummary mapping,
+	// never marshalled directly; the tag is insurance against a future direct marshal.
+	StreamErr error `json:"-"`
 }
 
 // BaselineInfo holds metadata about a discovered baseline Parquet file.
@@ -465,6 +473,10 @@ func CollectStatus(ctx context.Context, db *sql.DB, dbName string) (*StatusData,
 
 	if stream, err := LoadStreamState(ctx, db); err != nil {
 		slog.Warn("could not load stream state", "error", err)
+		// Record the read failure so the continuity verdict reports "unavailable"
+		// instead of the output silently omitting the Stream section (and its
+		// permanent-loss banner) — a swallowed error must not read as "no stream".
+		d.StreamErr = err
 	} else {
 		d.Stream = stream
 	}
@@ -511,12 +523,27 @@ func LoadIndexSizeBytes(ctx context.Context, db *sql.DB, dbName string) (int64, 
 // Write writes the status data as a human-readable report to w.
 func (d *StatusData) Write(w io.Writer) {
 	WriteStatus(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream)
+	if d.Stream == nil && d.StreamErr != nil {
+		writeStreamUnavailable(w, d.StreamErr)
+	}
 	writeBaselines(w, d.Baselines)
+}
+
+// writeStreamUnavailable renders a visible Stream block when stream_state could not
+// be READ (StreamErr set, Stream nil). Distinct from an empty table (no block): here
+// the continuity verdict — and any permanent-loss banner — could not be evaluated, so
+// the operator sees "unavailable" rather than an absence they'd misread as "no loss".
+func writeStreamUnavailable(w io.Writer, err error) {
+	fmt.Fprintln(w, "=== Stream ===")
+	fmt.Fprintf(w, "  Continuity:      ⚠ unavailable (could not read stream state: %v)\n", err)
+	fmt.Fprintln(w, "  The gap/continuity state could not be read from the index; a permanent-loss")
+	fmt.Fprintln(w, "  banner can neither be shown nor ruled out. Re-run status to retry.")
+	fmt.Fprintln(w)
 }
 
 // WriteJSON writes the status data as JSON to w.
 func (d *StatusData) WriteJSON(w io.Writer) error {
-	return writeStatusJSONFull(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream, d.Baselines)
+	return writeStatusJSONFull(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream, d.Baselines, d.StreamErr)
 }
 
 // WriteStatus writes a multi-section status report (Servers, Stream, Indexed Files, Partitions, Archives, Coverage, Summary) to w.
@@ -783,10 +810,10 @@ func Truncate(s string, n int) string {
 
 // WriteStatusJSON writes the status data as a JSON object to w.
 func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo) error {
-	return writeStatusJSONFull(w, files, parts, archives, coverage, servers, stream, nil)
+	return writeStatusJSONFull(w, files, parts, archives, coverage, servers, stream, nil, nil)
 }
 
-func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo, baselines []BaselineInfo) error {
+func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo, baselines []BaselineInfo, streamErr error) error {
 	type jsonFile struct {
 		BinlogFile    string  `json:"binlog_file"`
 		Status        string  `json:"status"`
@@ -875,15 +902,25 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		Size         int64   `json:"size_bytes,omitempty"`
 		SizeHuman    string  `json:"size_human,omitempty"`
 	}
+	// jsonStreamError is emitted (under a distinct key, never a fake `stream` object —
+	// jsonStream's non-omitempty events_indexed:0/mode:"" would read as a real empty
+	// stream) when stream_state could not be READ. continuity.status is "unavailable":
+	// a consumer switching on continuity keeps the gap state OUT of "ok", and one that
+	// only checks stream presence still finds this loud sibling instead of silence.
+	type jsonStreamError struct {
+		Continuity jsonContinuity `json:"continuity"`
+		Error      string         `json:"error"`
+	}
 	type jsonSummary struct {
-		Servers   []jsonServer    `json:"servers,omitempty"`
-		Stream    *jsonStream     `json:"stream,omitempty"`
-		Files     []jsonFile      `json:"files"`
-		Parts     []jsonPartition `json:"partitions"`
-		Total     int64           `json:"total_events_estimate"`
-		Archives  *jsonArchives   `json:"archives,omitempty"`
-		Coverage  *jsonCoverage   `json:"coverage,omitempty"`
-		Baselines []jsonBaseline  `json:"baselines,omitempty"`
+		Servers     []jsonServer     `json:"servers,omitempty"`
+		Stream      *jsonStream      `json:"stream,omitempty"`
+		StreamError *jsonStreamError `json:"stream_error,omitempty"`
+		Files       []jsonFile       `json:"files"`
+		Parts       []jsonPartition  `json:"partitions"`
+		Total       int64            `json:"total_events_estimate"`
+		Archives    *jsonArchives    `json:"archives,omitempty"`
+		Coverage    *jsonCoverage    `json:"coverage,omitempty"`
+		Baselines   []jsonBaseline   `json:"baselines,omitempty"`
 	}
 
 	jf := make([]jsonFile, len(files))
@@ -969,6 +1006,13 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 			jstr.SourceHealth = json.RawMessage(stream.SourceHealth.String)
 		}
 		out.Stream = jstr
+	} else if streamErr != nil {
+		// stream_state could not be READ (nil stream + error) — surface it as a distinct
+		// "unavailable" verdict so the omitted Stream section is not misread as "no loss".
+		out.StreamError = &jsonStreamError{
+			Continuity: jsonContinuity{Status: "unavailable"},
+			Error:      streamErr.Error(),
+		}
 	}
 	if archives != nil && archives.TotalFiles > 0 {
 		out.Archives = &jsonArchives{

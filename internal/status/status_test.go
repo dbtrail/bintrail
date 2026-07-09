@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -1304,5 +1305,72 @@ func TestWriteStatusJSON_sourceHealth(t *testing.T) {
 	}
 	if strings.Contains(buf2.String(), "source_health") {
 		t.Errorf("a stream with no health snapshot must omit source_health:\n%s", buf2.String())
+	}
+}
+
+// ─── stream-state read failure (#815) ───────────────────────────────────────────
+//
+// A FAILURE to read stream_state (StreamErr set, Stream nil) must be distinguished
+// from an empty table (both nil = no active stream): the former could not evaluate
+// the continuity verdict, so it must surface "unavailable" — never silently omit the
+// Stream section and its permanent-loss banner, which an operator would misread as
+// "no loss". The empty-table happy path must stay clean (no false "unavailable").
+func TestStatusData_streamReadError_text(t *testing.T) {
+	// Read error → visible "unavailable" continuity block.
+	var buf bytes.Buffer
+	(&StatusData{StreamErr: errors.New("Error 1142: SELECT command denied on stream_state")}).Write(&buf)
+	out := buf.String()
+	for _, want := range []string{"=== Stream ===", "Continuity:", "unavailable", "SELECT command denied"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a stream-state read error must surface %q in the text report\n--- output ---\n%s", want, out)
+		}
+	}
+
+	// Empty table (no error) → NO stream block, NO false "unavailable".
+	var empty bytes.Buffer
+	(&StatusData{}).Write(&empty)
+	if strings.Contains(empty.String(), "unavailable") || strings.Contains(empty.String(), "=== Stream ===") {
+		t.Errorf("an empty stream_state (no read error) must not render a stream/unavailable block:\n%s", empty.String())
+	}
+}
+
+func TestStatusData_streamReadError_json(t *testing.T) {
+	// Read error → stream_error object with continuity.status "unavailable".
+	var buf bytes.Buffer
+	if err := (&StatusData{StreamErr: errors.New("read timeout")}).WriteJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Stream      *json.RawMessage `json:"stream"`
+		StreamError *struct {
+			Continuity struct {
+				Status string `json:"status"`
+			} `json:"continuity"`
+			Error string `json:"error"`
+		} `json:"stream_error"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if result.Stream != nil {
+		t.Errorf("a read error must not fabricate a stream object (would read as a real empty stream):\n%s", buf.String())
+	}
+	if result.StreamError == nil {
+		t.Fatalf("stream_error missing — the read failure was silently omitted:\n%s", buf.String())
+	}
+	if result.StreamError.Continuity.Status != "unavailable" {
+		t.Errorf("stream_error.continuity.status = %q, want \"unavailable\"", result.StreamError.Continuity.Status)
+	}
+	if !strings.Contains(result.StreamError.Error, "read timeout") {
+		t.Errorf("stream_error.error must carry the underlying cause, got %q", result.StreamError.Error)
+	}
+
+	// Empty table (no error) → stream_error omitted, and no false "ok" anywhere.
+	var empty bytes.Buffer
+	if err := (&StatusData{}).WriteJSON(&empty); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(empty.String(), "stream_error") || strings.Contains(empty.String(), "unavailable") {
+		t.Errorf("an empty stream_state (no read error) must omit stream_error:\n%s", empty.String())
 	}
 }
