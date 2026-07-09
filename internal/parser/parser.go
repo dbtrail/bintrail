@@ -525,22 +525,27 @@ func handleRows(
 	endPos := uint64(binlogEv.Header.LogPos)
 	ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
 	pkCols := tm.PKColumnMetas()
+	// stmtEnd marks the last ROWS_EVENT of a statement (STMT_END_F). endPos is a
+	// valid POSITION-mode resume point only at a statement boundary — the stream
+	// consumer stamps this onto every emitted row event so its safe checkpoint
+	// never lands between the chunks of a split statement (#775).
+	stmtEnd := rowsEv.Flags&replication.RowsEventStmtEndFlag != 0
 
 	switch binlogEv.Header.EventType {
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2:
-		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2:
-		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
 		replication.UPDATE_ROWS_EVENTv2:
-		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, out)
+		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	default:
 		// A RowsEvent whose type matches none of the above — e.g. MariaDB's
@@ -574,6 +579,7 @@ func emitInserts(
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
 	schemaVersion uint32,
+	stmtEnd bool,
 	out chan<- Event,
 ) error {
 	for _, row := range rows {
@@ -590,6 +596,7 @@ func emitInserts(
 			PKValues:      BuildPKValues(pkCols, named),
 			RowAfter:      named,
 			SchemaVersion: schemaVersion,
+			StmtEnd:       stmtEnd,
 		}
 		select {
 		case out <- ev:
@@ -612,6 +619,7 @@ func emitDeletes(
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
 	schemaVersion uint32,
+	stmtEnd bool,
 	out chan<- Event,
 ) error {
 	for _, row := range rows {
@@ -628,6 +636,7 @@ func emitDeletes(
 			PKValues:      BuildPKValues(pkCols, named),
 			RowBefore:     named,
 			SchemaVersion: schemaVersion,
+			StmtEnd:       stmtEnd,
 		}
 		select {
 		case out <- ev:
@@ -650,6 +659,7 @@ func emitUpdates(
 	ts time.Time,
 	pkCols []metadata.ColumnMeta,
 	schemaVersion uint32,
+	stmtEnd bool,
 	out chan<- Event,
 ) error {
 	// go-mysql delivers UPDATE rows as interleaved before/after pairs:
@@ -675,6 +685,7 @@ func emitUpdates(
 			RowBefore:     before,
 			RowAfter:      after,
 			SchemaVersion: schemaVersion,
+			StmtEnd:       stmtEnd,
 		}
 		select {
 		case out <- ev:

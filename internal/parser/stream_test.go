@@ -360,6 +360,55 @@ func TestStreamParser_mariadbGTIDThenXIDEmitsCommit(t *testing.T) {
 	}
 }
 
+// ─── STMT_END_F / split-statement boundary (#775) ────────────────────────────
+
+// TestStreamParser_stmtEndFlagMarksStatementBoundary verifies that Event.StmtEnd
+// mirrors the ROWS_EVENT's STMT_END_F flag. A statement larger than
+// binlog_row_event_max_size is split into several ROWS_EVENTs under ONE
+// TABLE_MAP, and only the LAST one sets STMT_END_F. The stream consumer keys its
+// POSITION-mode safe checkpoint off StmtEnd so a resume never lands on the byte
+// offset between two chunks (#775): the first (non-STMT_END) chunk must report
+// StmtEnd=false, the last (STMT_END) chunk StmtEnd=true.
+func TestStreamParser_stmtEndFlagMarksStatementBoundary(t *testing.T) {
+	sp := NewStreamParser(makeOrdersResolver(), Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	mkChunk := func(logPos uint32, stmtEnd bool) *replication.BinlogEvent {
+		var flags uint16
+		if stmtEnd {
+			flags = replication.RowsEventStmtEndFlag
+		}
+		return &replication.BinlogEvent{
+			Header: &replication.EventHeader{EventType: replication.WRITE_ROWS_EVENTv2, LogPos: logPos, EventSize: 100},
+			Event: &replication.RowsEvent{
+				Flags: flags,
+				Table: &replication.TableMapEvent{Schema: []byte("shop"), Table: []byte("orders"), ColumnCount: 2},
+				Rows:  [][]any{{int64(1), int64(10)}},
+			},
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// One split statement: first chunk (mid-statement, no STMT_END_F), then the
+	// last chunk (STMT_END_F set) — both under the same implied TABLE_MAP.
+	feedThenCancel(t, streamer, cancel, mkChunk(300, false), mkChunk(500, true))
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	evs := drainAll(out)
+	if len(evs) != 2 {
+		t.Fatalf("expected 2 row events, got %d: %v", len(evs), typesOf(evs))
+	}
+	if evs[0].StmtEnd {
+		t.Errorf("mid-statement ROWS_EVENT (no STMT_END_F, pos %d) must have StmtEnd=false", evs[0].EndPos)
+	}
+	if !evs[1].StmtEnd {
+		t.Errorf("final ROWS_EVENT (STMT_END_F, pos %d) must have StmtEnd=true", evs[1].EndPos)
+	}
+}
+
 // ─── QueryEvent / DDL ────────────────────────────────────────────────────────
 
 // TestStreamParser_queryEventNonDDL verifies that a non-DDL QUERY_EVENT

@@ -32,9 +32,20 @@ import (
 // streamState holds the current replication position and counters used for
 // checkpointing. It is persisted to stream_state after each checkpoint interval.
 type streamState struct {
-	mode          string // "position" or "gtid"
-	binlogFile    string
-	binlogPos     uint64
+	mode       string // "position" or "gtid"
+	binlogFile string
+	binlogPos  uint64 // per-EVENT byte offset — advances on every event (metrics/display; GTID-mode checkpoint + dedup)
+	// safeFile/safePos hold the last POSITION-mode SAFE resume point: a byte
+	// offset that only advances at a statement (STMT_END_F) / commit / DDL
+	// boundary, never mid-statement. saveCheckpoint persists these in position
+	// mode so a resume can never land between the ROWS_EVENTs of one split
+	// statement and crash StartSync with "invalid table id, no corresponding
+	// table map event" (#775). Mirrors the commit-only gtidSet semantics of #491,
+	// but works for non-GTID sources too (which emit no EventCommit). Unused in
+	// GTID mode (that path keeps checkpointing the per-event binlogPos, which
+	// deleteEventsSinceCheckpointGTID relies on).
+	safeFile      string
+	safePos       uint64
 	gtidSet       string // serialized GTID set (GTID mode only)
 	flavor        string // source flavor: "mysql" (default) or "mariadb"; selects the GTID parser on resume
 	eventsIndexed int64
@@ -75,6 +86,36 @@ func loadStreamState(db *sql.DB) (*streamState, error) {
 	return &s, nil
 }
 
+// checkpointPosition returns the (binlog_file, binlog_position) to persist for a
+// checkpoint. POSITION mode persists the last statement/commit/DDL boundary
+// (safeFile/safePos) instead of the per-event binlogFile/binlogPos, so a resume
+// never lands on a byte offset mid-statement — StartSync from between the
+// ROWS_EVENTs of one split statement closes the stream with "invalid table id, no
+// corresponding table map event" and crash-loops the supervisor (#775). GTID mode
+// keeps persisting the per-event binlogPos: its resume is transaction-aligned
+// (StartSyncGTID) and deleteEventsSinceCheckpointGTID relies on that offset. The
+// safeFile=="" fallback keeps external/test callers that never populate safe*
+// (e.g. a hand-built streamState) on the pre-#775 behavior.
+func checkpointPosition(state *streamState) (string, uint64) {
+	if state.mode == "position" && state.safeFile != "" {
+		return state.safeFile, state.safePos
+	}
+	return state.binlogFile, state.binlogPos
+}
+
+// isPositionCheckpointBoundary reports whether an event marks a valid POSITION-mode
+// resume point: a statement end (a row event of the ROWS_EVENT carrying STMT_END_F),
+// a transaction commit (EventCommit), or a DDL (EventDDL). Every other position —
+// notably the byte offset between two ROWS_EVENTs of one split statement — is unsafe
+// to resume from (#775).
+func isPositionCheckpointBoundary(ev parser.Event) bool {
+	switch ev.EventType {
+	case parser.EventCommit, parser.EventDDL:
+		return true
+	}
+	return ev.StmtEnd
+}
+
 // saveCheckpoint persists the current stream state to the stream_state table.
 func saveCheckpoint(db *sql.DB, state *streamState) error {
 	var gtidSet any
@@ -95,6 +136,9 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	if err != nil {
 		return err
 	}
+	// #775: in position mode this persists the last safe boundary, not the
+	// per-event offset (see checkpointPosition).
+	file, pos := checkpointPosition(state)
 	_, err = db.Exec(`
 		INSERT INTO stream_state
 		    (id, mode, binlog_file, binlog_position, gtid_set, flavor,
@@ -110,7 +154,7 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 		    last_checkpoint = UTC_TIMESTAMP(),
 		    server_id       = VALUES(server_id),
 		    bintrail_id     = VALUES(bintrail_id)`,
-		state.mode, state.binlogFile, state.binlogPos, gtidSet, flavor,
+		state.mode, file, pos, gtidSet, flavor,
 		state.eventsIndexed, lastEventTime, state.serverID, bintrailIDArg)
 	return err
 }
@@ -1147,6 +1191,13 @@ func streamLoop(
 				state.binlogFile = ev.BinlogFile
 			}
 			state.binlogPos = ev.EndPos
+			// Advance the POSITION-mode safe checkpoint only at statement/commit/DDL
+			// boundaries, never mid-statement — a resume from between the ROWS_EVENTs
+			// of one split statement crashes StartSync (#775). The per-event
+			// binlogPos above stays for metrics/display and GTID-mode checkpointing.
+			if isPositionCheckpointBoundary(ev) {
+				state.safeFile, state.safePos = state.binlogFile, ev.EndPos
+			}
 			if !ev.Timestamp.IsZero() {
 				state.lastEventTime = sql.NullTime{Time: ev.Timestamp, Valid: true}
 			}
@@ -1562,6 +1613,8 @@ func One(ctx context.Context, cfg Config) error {
 					mode:          mode,
 					binlogFile:    startFile,
 					binlogPos:     uint64(startPos),
+					safeFile:      startFile,
+					safePos:       uint64(startPos),
 					gtidSet:       startGTIDStr,
 					flavor:        cfg.Flavor,
 					serverID:      cfg.ServerID,
@@ -1657,9 +1710,14 @@ func One(ctx context.Context, cfg Config) error {
 		mode: mode,
 		// Seed the position with the resolved start so the first ticker
 		// checkpoint (which fires even before any event arrives) persists a
-		// valid resume point instead of an empty file / position 0.
+		// valid resume point instead of an empty file / position 0. safeFile/
+		// safePos seed identically — the resolved start is always a boundary, and
+		// this keeps the position-mode checkpoint at a valid resume point until the
+		// first statement/commit/DDL boundary advances it (#775).
 		binlogFile: startFile,
 		binlogPos:  uint64(startPos),
+		safeFile:   startFile,
+		safePos:    uint64(startPos),
 		flavor:     cfg.Flavor,
 		serverID:   cfg.ServerID,
 		accGTID:    accGTID,
