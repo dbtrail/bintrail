@@ -1,6 +1,8 @@
 package cliapp
 
 import (
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -285,5 +287,45 @@ func TestRunInit_missingDBName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--index-dsn must include a database name") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// ─── init --format json S3 error surfacing (issue #810) ───────────────────────
+
+func TestBuildInitResult_s3ErrorSurfaced(t *testing.T) {
+	r := buildInitResult("idx", []string{"binlog_events"}, nil, errors.New("head bucket: AccessDenied"))
+	if r.S3Bucket != nil {
+		t.Errorf("expected nil S3Bucket on error, got %v", *r.S3Bucket)
+	}
+	if r.S3Error == nil {
+		t.Fatal("expected S3Error to be populated on S3 failure")
+	}
+	if *r.S3Error != "head bucket: AccessDenied" {
+		t.Errorf("unexpected S3Error: %q", *r.S3Error)
+	}
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"s3_error":"head bucket: AccessDenied"`) {
+		t.Errorf("s3_error missing from JSON payload: %s", b)
+	}
+}
+
+func TestBuildInitResult_noS3Error_omitted(t *testing.T) {
+	s := "my-bucket (region: us-east-1)"
+	r := buildInitResult("idx", []string{"binlog_events"}, &s, nil)
+	if r.S3Error != nil {
+		t.Errorf("expected nil S3Error, got %v", *r.S3Error)
+	}
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "s3_error") {
+		t.Errorf("s3_error should be omitted when no S3 failure: %s", b)
+	}
+	if !strings.Contains(string(b), `"s3_bucket":"my-bucket (region: us-east-1)"`) {
+		t.Errorf("s3_bucket missing from JSON payload: %s", b)
 	}
 }

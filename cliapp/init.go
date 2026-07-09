@@ -114,11 +114,16 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	var s3Result *string
+	// s3Err captures a bucket setup/verify failure so it can be surfaced in
+	// JSON mode (an s3_error field + a non-zero exit). In text mode it stays
+	// non-fatal: a human reads the stderr warning and remediation and acts.
+	var s3Err error
 	if initS3Bucket != "" {
 		if initFormat != "json" {
 			fmt.Printf("\nSetting up S3 bucket...\n")
 		}
 		if err := setupS3Bucket(cmd.Context(), initS3Bucket, initS3Region); err != nil {
+			s3Err = err
 			if initFormat != "json" {
 				fmt.Fprintf(os.Stderr, "Warning: could not create S3 bucket %q: %v\n\n", initS3Bucket, err)
 				fmt.Fprint(os.Stderr, s3Instructions(initS3Bucket, initS3Region))
@@ -137,6 +142,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nVerifying existing S3 bucket...\n")
 		}
 		if err := verifyS3Bucket(cmd.Context(), s3ARNBucket, initS3Region); err != nil {
+			s3Err = err
 			if initFormat != "json" {
 				fmt.Fprintf(os.Stderr, "Warning: could not verify S3 bucket %q: %v\n\n", s3ARNBucket, err)
 				fmt.Fprint(os.Stderr, s3IAMInstructions(s3ARNBucket, s3ARNPartition))
@@ -151,20 +157,46 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	if initFormat == "json" {
-		result := struct {
-			Database      string   `json:"database"`
-			TablesCreated []string `json:"tables_created"`
-			S3Bucket      *string  `json:"s3_bucket,omitempty"`
-		}{
-			Database:      dbName,
-			TablesCreated: tablesCreated,
-			S3Bucket:      s3Result,
+		result := buildInitResult(dbName, tablesCreated, s3Result, s3Err)
+		if err := cliutil.OutputJSON(result); err != nil {
+			return err
 		}
-		return cliutil.OutputJSON(result)
+		// Fail hard in JSON mode so exit-code-only automation gets a signal:
+		// a zero exit with a silently-omitted bucket would make a pipeline
+		// believe archiving is provisioned when it is not (issue #810). Text
+		// mode stays non-fatal by design — the warning above is for a human.
+		if s3Err != nil {
+			return fmt.Errorf("S3 bucket setup failed: %w", s3Err)
+		}
+		return nil
 	}
 
 	fmt.Printf("\nInitialization complete. Index database: %s\n", dbName)
 	return nil
+}
+
+// initJSONResult is the --format json payload for the init command.
+type initJSONResult struct {
+	Database      string   `json:"database"`
+	TablesCreated []string `json:"tables_created"`
+	S3Bucket      *string  `json:"s3_bucket,omitempty"`
+	S3Error       *string  `json:"s3_error,omitempty"`
+}
+
+// buildInitResult assembles the JSON payload. A non-nil s3Err is surfaced in
+// the s3_error field so JSON consumers never see a silently-omitted bucket
+// (issue #810). s3Result and s3Err are mutually exclusive per invocation.
+func buildInitResult(dbName string, tables []string, s3Result *string, s3Err error) initJSONResult {
+	r := initJSONResult{
+		Database:      dbName,
+		TablesCreated: tables,
+		S3Bucket:      s3Result,
+	}
+	if s3Err != nil {
+		msg := s3Err.Error()
+		r.S3Error = &msg
+	}
+	return r
 }
 
 // setupS3Bucket creates a private S3 bucket with a 1-year lifecycle expiry policy.
