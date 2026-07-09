@@ -29,9 +29,28 @@ func validatePublication(ctx context.Context, conn *pgx.Conn, pubname string, fi
 	if err != nil {
 		return fmt.Errorf("pgcapture: checking publication %q: %w", pubname, err)
 	}
-	// FOR ALL TABLES covers everything; a nil table filter means "accept whatever the
-	// publication streams", so there is no requested set to verify coverage against.
-	if allTables || len(filters.Tables) == 0 {
+	// FOR ALL TABLES covers everything and cannot carry per-table row filters or column
+	// lists (PostgreSQL rejects WHERE/column-lists on FOR ALL TABLES), so it is unambiguously safe.
+	if allTables {
+		return nil
+	}
+
+	// A FOR TABLE publication MAY carry a row filter (PG15+ `... WHERE (...)`) or a column
+	// list on a published table. pgoutput then emits only a SUBSET of changes — filtered
+	// rows and unlisted columns are dropped, and updates crossing a row filter degrade to
+	// spurious INSERT/DELETE. bintrail cannot honor a partial publication, so fail loud
+	// regardless of the client --tables scope (the filter applies to whatever we stream).
+	restricted, err := publicationRestrictedTables(ctx, conn, pubname)
+	if err != nil {
+		return err
+	}
+	if perr := restrictedPublicationError(pubname, restricted); perr != nil {
+		return perr
+	}
+
+	// A nil table filter means "accept whatever the publication streams", so there is no
+	// requested set to verify coverage against.
+	if len(filters.Tables) == 0 {
 		return nil
 	}
 
@@ -64,6 +83,79 @@ func validatePublication(ctx context.Context, conn *pgx.Conn, pubname string, fi
 			pubname, strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+// restrictedTable names a published table that pgoutput would emit only partially,
+// because the publication attached a row filter (PG15+ `WHERE (...)`) and/or a column
+// list to it.
+type restrictedTable struct {
+	name       string // schema.table
+	hasFilter  bool   // pg_publication_rel.prqual is non-null
+	hasColList bool   // pg_publication_rel.prattrs is non-null (a partial column list)
+}
+
+// publicationRestrictedTables returns the published tables carrying a row filter or a
+// column list. prqual and prattrs exist only on PG15+, so on older servers (where
+// neither feature exists) it short-circuits to an empty result without touching the
+// missing columns.
+func publicationRestrictedTables(ctx context.Context, conn *pgx.Conn, pubname string) ([]restrictedTable, error) {
+	var verNum int
+	if err := conn.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&verNum); err != nil {
+		return nil, fmt.Errorf("pgcapture: reading server_version_num to check publication row filters: %w", err)
+	}
+	if verNum < 150000 {
+		return nil, nil // pg_publication_rel.prqual/prattrs do not exist before PG15
+	}
+
+	rows, err := conn.Query(ctx, `
+		SELECT n.nspname || '.' || c.relname, pr.prqual IS NOT NULL, pr.prattrs IS NOT NULL
+		FROM pg_publication p
+		JOIN pg_publication_rel pr ON pr.prpubid = p.oid
+		JOIN pg_class c ON c.oid = pr.prrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE p.pubname = $1 AND (pr.prqual IS NOT NULL OR pr.prattrs IS NOT NULL)`, pubname)
+	if err != nil {
+		return nil, fmt.Errorf("pgcapture: checking row filters/column lists for publication %q: %w", pubname, err)
+	}
+	defer rows.Close()
+
+	var restricted []restrictedTable
+	for rows.Next() {
+		var rt restrictedTable
+		if err := rows.Scan(&rt.name, &rt.hasFilter, &rt.hasColList); err != nil {
+			return nil, fmt.Errorf("pgcapture: scanning row filters/column lists for publication %q: %w", pubname, err)
+		}
+		restricted = append(restricted, rt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgcapture: checking row filters/column lists for publication %q: %w", pubname, err)
+	}
+	return restricted, nil
+}
+
+// restrictedPublicationError turns a non-empty restrictedTable list into a fatal,
+// operator-actionable error (nil when the list is empty). Split out as a pure function
+// so the decision/formatting is unit-testable without a live PostgreSQL server.
+func restrictedPublicationError(pubname string, restricted []restrictedTable) error {
+	if len(restricted) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(restricted))
+	for _, rt := range restricted {
+		var reason string
+		switch {
+		case rt.hasFilter && rt.hasColList:
+			reason = "row filter + column list"
+		case rt.hasFilter:
+			reason = "row filter"
+		default:
+			reason = "column list"
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s)", rt.name, reason))
+	}
+	sort.Strings(parts)
+	return fmt.Errorf("pgcapture: publication %q applies a row filter or column list to table(s) [%s] — pgoutput would emit only a SUBSET of changes (filtered rows and unlisted columns are silently dropped, and updates crossing a row filter degrade to spurious INSERT/DELETE); bintrail cannot honor a partial publication — recreate it WITHOUT WHERE(...) / column lists so the full table is captured",
+		pubname, strings.Join(parts, ", "))
 }
 
 // validateReplicaIdentity is the PostgreSQL analog of metadata.ValidateBinlogRowImage:
