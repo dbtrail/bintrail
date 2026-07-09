@@ -202,6 +202,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	var denyTables []query.SchemaTable
 	var redactCols []query.SchemaTableColumn
 	if conProfile != "" {
+		// LoadProfileRules resolves a nonexistent profile to zero rules WITHOUT
+		// an error, so a typo would start the console with RBAC that enforces
+		// nothing while the operator believes a profile is active. Refuse loudly
+		// on an unknown name before loading rules (#838).
+		exists, perr := query.ProfileExists(cmd.Context(), db, conProfile)
+		if perr != nil {
+			return fmt.Errorf("check profile %q: %w", conProfile, perr)
+		}
+		if !exists {
+			return fmt.Errorf("profile %q does not exist in the index; create it (bintrail flag/profile/access) or fix the typo — refusing to start with an RBAC profile that enforces nothing", conProfile)
+		}
 		denyTables, redactCols, err = query.LoadProfileRules(cmd.Context(), db, conProfile)
 		if err != nil {
 			return fmt.Errorf("load profile %q: %w", conProfile, err)
@@ -218,6 +229,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		NoArchive:     conNoArchive || conProfile != "",
 		DenyTables:    denyTables,
 		RedactColumns: redactCols,
+		// A named profile — even one resolving to zero rules — forces query_text
+		// withholding on every query (#699/#838).
+		ProfileActive: conProfile != "",
 		AllowedHosts:  conAllowedHosts,
 		BaselineDir:   conBaselineDir,
 		BaselineS3:    conBaselineS3,

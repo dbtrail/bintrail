@@ -49,3 +49,42 @@ func TestFetch_profileActiveBlanksQueryText(t *testing.T) {
 		t.Error("row images must not be touched when no redact rule matches")
 	}
 }
+
+// TestProfileExists pins the #838 detection primitive: LoadProfileRules cannot
+// distinguish an empty profile from a nonexistent one (both → zero rules, no
+// error), so callers that must refuse an unknown profile probe ProfileExists.
+// The console `serve` command turns a false result into a loud startup refusal.
+func TestProfileExists(t *testing.T) {
+	cases := []struct {
+		name  string
+		count int64
+		want  bool
+	}{
+		{"present", 1, true},
+		{"absent (typo)", 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			mock.ExpectQuery("SELECT EXISTS").
+				WithArgs("analysts").
+				WillReturnRows(sqlmock.NewRows([]string{"e"}).AddRow(tc.count))
+
+			got, err := ProfileExists(context.Background(), db, "analysts")
+			if err != nil {
+				t.Fatalf("ProfileExists: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ProfileExists = %v, want %v", got, tc.want)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
