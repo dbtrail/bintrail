@@ -459,7 +459,9 @@ func TestCheckBinlogRowValueOptions(t *testing.T) {
 		wantRemediation bool
 	}{
 		{"default empty", row(""), StatusPass, "full JSON row images", false},
+		{"whitespace only treated as empty", row("  "), StatusPass, "full JSON row images", false},
 		{"PARTIAL_JSON", row("PARTIAL_JSON"), StatusWarn, `binlog_row_value_options="PARTIAL_JSON"`, true},
+		{"unrecognized non-empty value warns, never PASS", row("SOMETHING_NEW"), StatusWarn, "is unrecognized", true},
 		{"absent variable", mysqlErrResp(1193, "Unknown system variable 'binlog_row_value_options'"), StatusSkip, "not available", false},
 		{"transient read failure", errResp("driver: bad connection"), StatusWarn, "could not read binlog_row_value_options: driver: bad connection", false},
 	}

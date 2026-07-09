@@ -283,7 +283,11 @@ func checkBinlogRowValueOptions(ctx context.Context, db *sql.DB) CheckResult {
 		}
 		return CheckResult{Name: name, Status: StatusWarn, Detail: "could not read binlog_row_value_options: " + err.Error()}
 	}
-	if strings.Contains(strings.ToUpper(val), "PARTIAL_JSON") {
+	up := strings.ToUpper(strings.TrimSpace(val))
+	if up == "" {
+		return CheckResult{Name: name, Status: StatusPass, Detail: "full JSON row images"}
+	}
+	if strings.Contains(up, "PARTIAL_JSON") {
 		return CheckResult{
 			Name:   name,
 			Status: StatusWarn,
@@ -293,7 +297,16 @@ func checkBinlogRowValueOptions(ctx context.Context, db *sql.DB) CheckResult {
 				"This makes JSON UPDATEs log the whole column value (larger binlog) instead of an unappliable partial diff.",
 		}
 	}
-	return CheckResult{Name: name, Status: StatusPass, Detail: "full JSON row images"}
+	// Any other non-empty value is unrecognized. A doctor check whose job is to
+	// surface capture gaps must not paint an unknown setting green — WARN rather
+	// than fall through to a reassuring PASS.
+	return CheckResult{
+		Name:   name,
+		Status: StatusWarn,
+		Detail: fmt.Sprintf("binlog_row_value_options=%q is unrecognized — verify it does not enable partial JSON row logging, or JSON updates may be skipped at capture", val),
+		Remediation: "If you did not set this deliberately, clear it for full JSON row images:\n\n" +
+			"  SET PERSIST binlog_row_value_options = '';",
+	}
 }
 
 // checkBinlogRetention emits a WARN (not FAIL) when binlog retention is below
