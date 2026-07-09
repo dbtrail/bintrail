@@ -17,6 +17,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/observe"
 )
 
 // ─── Event types ─────────────────────────────────────────────────────────────
@@ -166,6 +167,19 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 				case <-ctx.Done():
 					return ctx.Err()
 				}
+			} else if kw, isDML := statementDML(string(ev.Query)); isDML {
+				// STATEMENT/MIXED-format DML (or a session flip off ROW): the row
+				// image is not in the binlog, so this change cannot be captured.
+				// Fail LOUD + metric, symmetric to the partial-image guard (#493).
+				// NOTE: never log the statement text — a DML statement embeds row
+				// VALUES; keyword + file/pos + connection_id locate it without
+				// leaking data into operator logs.
+				p.logger.Warn("statement-format DML in binlog — event NOT captured (bintrail requires binlog_format=ROW; a STATEMENT/MIXED format or a session-level override produced this)",
+					"file", filename,
+					"pos", binlogEv.Header.LogPos,
+					"statement_type", kw,
+					"connection_id", ev.SlaveProxyID)
+				observe.StatementDMLDropped()
 			}
 
 		case *replication.RowsQueryEvent:
@@ -633,6 +647,79 @@ const (
 var ddlTableRe = regexp.MustCompile(
 	`(?i)(?:ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|RENAME\s+TABLE|TRUNCATE(?:\s+TABLE)?)\s+` +
 		"(?:`([^`]+)`\\.`([^`]+)`|`([^`]+)`|(\\w+)\\.(\\w+)|(\\w+))")
+
+// dmlKeywords are the statement prefixes that, under binlog_format=ROW, would
+// have been logged as ROW events (and captured). Seeing one as a QUERY_EVENT
+// means the source logged this DML in STATEMENT form (binlog_format=STATEMENT
+// or MIXED, or a session-level override) — the row image is NOT in the binlog
+// and the change cannot be captured. TRUNCATE is included for completeness but
+// is claimed by parseDDL first (it is DDL), so it never reaches statementDML.
+var dmlKeywords = []string{"INSERT", "UPDATE", "DELETE", "REPLACE", "LOAD DATA", "TRUNCATE"}
+
+// statementDML reports whether queryStr is a data-modifying statement logged in
+// STATEMENT form — the DML that binlog_format=ROW would have captured as row
+// events. It trims leading whitespace and SQL comments, then matches a DML
+// keyword prefix on a word boundary. Transaction-control (BEGIN/COMMIT/ROLLBACK/
+// SAVEPOINT/XA/SET) and every DDL/DCL verb are excluded by construction: only
+// the dmlKeywords allowlist matches, so a keyword prefix on a non-DML statement
+// cannot false-positive. Returns the matched keyword (for the warning) and true,
+// or "" and false. Callers MUST give DDL (parseDDL) the chance to claim the
+// statement first — TRUNCATE is DDL and is handled there.
+func statementDML(queryStr string) (string, bool) {
+	upper := strings.ToUpper(stripLeadingSQLComments(queryStr))
+	for _, kw := range dmlKeywords {
+		if !strings.HasPrefix(upper, kw) {
+			continue
+		}
+		// Word boundary: the keyword must be the whole statement or be followed
+		// by whitespace, so INSERT matches "INSERT INTO ..." but not an
+		// identifier that merely starts with those letters.
+		if rest := upper[len(kw):]; rest == "" || isSQLSpace(rest[0]) {
+			return kw, true
+		}
+	}
+	return "", false
+}
+
+// stripLeadingSQLComments removes leading whitespace and SQL comments so the
+// DML-prefix check sees the first real keyword. Handles the three MySQL comment
+// forms (/* */ block, -- to EOL, # to EOL); loops because a statement can carry
+// several. The common case (no leading comment) returns after one TrimLeft.
+func stripLeadingSQLComments(s string) string {
+	for {
+		s = strings.TrimLeft(s, " \t\r\n\f\v")
+		switch {
+		case strings.HasPrefix(s, "/*"):
+			end := strings.Index(s[2:], "*/")
+			if end < 0 {
+				return "" // unterminated — no real statement follows
+			}
+			s = s[2+end+2:]
+		case strings.HasPrefix(s, "--"):
+			// MySQL treats -- as a comment only when followed by whitespace/EOL.
+			if len(s) > 2 && !isSQLSpace(s[2]) {
+				return s
+			}
+			nl := strings.IndexByte(s, '\n')
+			if nl < 0 {
+				return ""
+			}
+			s = s[nl+1:]
+		case strings.HasPrefix(s, "#"):
+			nl := strings.IndexByte(s, '\n')
+			if nl < 0 {
+				return ""
+			}
+			s = s[nl+1:]
+		default:
+			return s
+		}
+	}
+}
+
+func isSQLSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\r' || b == '\n' || b == '\f' || b == '\v'
+}
 
 // parseDDL parses a QUERY_EVENT for DDL statements and returns a DDL Event.
 // Returns zero Event and false if the query is not a DDL statement.

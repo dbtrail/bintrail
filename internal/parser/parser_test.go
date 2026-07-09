@@ -378,6 +378,66 @@ func TestParseDDL_caseInsensitive(t *testing.T) {
 	}
 }
 
+// ─── statementDML (#776: statement-format DML not silently dropped) ────────────
+
+// TestStatementDML pins the allowlist detection of DML statements that appear
+// as QUERY_EVENTs (binlog_format=STATEMENT/MIXED, or a session flip off ROW) —
+// the row image is absent and the change cannot be captured, so these must be
+// caught loud + metered rather than falling through silently.
+//
+// Callers give parseDDL first claim: TRUNCATE returns true here but is DDL and
+// is shadowed by parseDDL in the real handler, so it never reaches statementDML.
+// The ALTER/CREATE/DROP/RENAME verbs return false here (also DDL, handled by
+// parseDDL). Transaction-control and DCL must never match.
+func TestStatementDML(t *testing.T) {
+	tests := []struct {
+		query string
+		want  string // "" means not-DML
+	}{
+		// STATEMENT-format DML — must be caught.
+		{"INSERT INTO orders VALUES (1)", "INSERT"},
+		{"insert into orders values (1)", "INSERT"},
+		{"  \t INSERT INTO orders VALUES (1)", "INSERT"},
+		{"UPDATE orders SET status='done'", "UPDATE"},
+		{"DELETE FROM orders WHERE id=1", "DELETE"},
+		{"REPLACE INTO orders VALUES (1)", "REPLACE"},
+		{"LOAD DATA INFILE '/tmp/x' INTO TABLE orders", "LOAD DATA"},
+		{"/* a leading comment */ INSERT INTO t VALUES (1)", "INSERT"},
+		{"/*+ HINT */\nUPDATE t SET x=1", "UPDATE"},
+		{"-- a note\nDELETE FROM t", "DELETE"},
+		{"# hash note\nINSERT INTO t VALUES (1)", "INSERT"},
+		{"TRUNCATE TABLE orders", "TRUNCATE"}, // true here, but parseDDL shadows it
+		// DDL — handled by parseDDL, must NOT match here.
+		{"ALTER TABLE orders ADD c INT", ""},
+		{"CREATE TABLE t (id INT)", ""},
+		{"DROP TABLE t", ""},
+		{"RENAME TABLE a TO b", ""},
+		{"CREATE DATABASE app", ""},
+		{"GRANT SELECT ON *.* TO u", ""},
+		// Transaction control / session — must NOT match.
+		{"BEGIN", ""},
+		{"COMMIT", ""},
+		{"ROLLBACK", ""},
+		{"SAVEPOINT sp1", ""},
+		{"XA COMMIT 'x'", ""},
+		{"SET autocommit=0", ""},
+		{"SELECT 1", ""},
+		// Word-boundary: an identifier that merely starts with a keyword.
+		{"INSERTED_LOG whatever", ""},
+		{"UPDATES SET x=1", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		kw, ok := statementDML(tt.query)
+		if (tt.want != "") != ok {
+			t.Errorf("statementDML(%q) ok=%v, want %v", tt.query, ok, tt.want != "")
+		}
+		if kw != tt.want {
+			t.Errorf("statementDML(%q) kw=%q, want %q", tt.query, kw, tt.want)
+		}
+	}
+}
+
 // ─── SwapResolver + schemaVersion ──────────────────────────────────────────────
 
 func TestParser_SwapResolver_updatesSchemaVersion(t *testing.T) {
