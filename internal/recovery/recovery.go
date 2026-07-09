@@ -593,10 +593,12 @@ func columnNameSet(cols []metadata.ColumnMeta) map[string]bool {
 // literal.
 //
 // Returns nil (no coercion) for a non-MySQL dialect, a nil resolver, or an
-// unresolvable table. In the last two cases BLOB/TEXT values are still emitted as
-// base64 — recover without usable schema metadata cannot type its columns; the
-// caller has already warned about the missing snapshot (resolverForRow /
-// pkWhereClause), so this does not warn again.
+// unresolvable table. For a DB-backed generator those untyped cases never reach
+// emission — requireTypedColumns refuses the event first (#788). Only the DB-less
+// schemaless fallback (New(nil, ...)) still emits BLOB/TEXT as their raw base64,
+// having deliberately opted out of schema typing; the caller has already warned
+// about the missing snapshot (resolverForRow / pkWhereClause), so this does not
+// warn again.
 func (g *Generator) base64Cols(r *metadata.Resolver, schema, table string) map[string]bool {
 	if g.dialect != MySQLDialect || r == nil {
 		return nil
@@ -631,18 +633,34 @@ func (g *Generator) base64Cols(r *metadata.Resolver, schema, table string) map[s
 // and it composes with the per-event refusal in GenerateSQLFromRows (#784).
 //
 // r is the EVENT-TIME resolver (resolverForRow), the same one base64Cols/geometryCols
-// consult, so this fires exactly when they would return an untyped map. Two cases are
-// deliberately NOT refused: (1) a nil resolver (New(nil,nil)) — the documented
-// schemaless all-columns fallback, opted into deliberately, where no column can be
-// typed and BLOB/TEXT are known to pass through (see base64Cols); (2) the PostgreSQL
-// dialect, whose values are stored as text (no base64) and are never at risk. Because
-// it keys on the event-time resolver, a table merely absent from the LATEST snapshot
-// (a scoped-out or dropped table whose event still carries its own schema_version) is
-// still typed from its own snapshot and NOT refused — preserving the deliberate
-// "degrade, don't refuse" behavior for that ambiguous case (#601).
+// consult, so this fires exactly when they would return an untyped map. A nil resolver
+// splits on whether the generator has a DB: a DB-BACKED caller with no usable snapshot
+// for the event's table is the #788 recover-without-a-snapshot case — every real caller
+// (recover CLI, MCP, console, agent, cascade) passes a DB — so it is REFUSED, closing
+// the primary silent-corruption path where BLOB/TEXT would be emitted as their raw
+// base64 string. A DB-LESS generator (New(nil, ...)) is the deliberate schemaless
+// all-columns fallback that hand-feeds its own rows and owns that trade-off, so it stays
+// permissive. The PostgreSQL dialect is never refused (values stored as text, no base64,
+// never at risk). Because it keys on the event-time resolver, a table merely absent from
+// the LATEST snapshot (a scoped-out or dropped table whose event still carries its own
+// schema_version) is still typed from its own snapshot and NOT refused — preserving the
+// deliberate "degrade, don't refuse" behavior for that ambiguous case (#601).
 func (g *Generator) requireTypedColumns(r *metadata.Resolver, schema, table string, eventID uint64) error {
-	if g.dialect != MySQLDialect || r == nil {
+	if g.dialect != MySQLDialect {
 		return nil
+	}
+	if r == nil {
+		// No usable snapshot for this event. A DB-less generator is the deliberate
+		// schemaless fallback (see above) — stay permissive. A DB-backed caller here ran
+		// against a real index yet resolved no snapshot for the table: refuse rather than
+		// emit a BLOB/TEXT/BINARY column's stored base64 string verbatim (#788).
+		if g.db == nil {
+			return nil
+		}
+		return fmt.Errorf("cannot reverse event %d on %s.%s: no schema snapshot is loaded for this table, so its "+
+			"BLOB/TEXT/BINARY columns cannot be typed and a reverse INSERT/UPDATE would write their stored base64 "+
+			"text verbatim into the column (silent corruption). Take a snapshot (`bintrail snapshot`) covering "+
+			"%s.%s and retry", eventID, schema, table, schema, table)
 	}
 	if _, err := r.Resolve(schema, table); err != nil {
 		return fmt.Errorf("cannot reverse event %d on %s.%s: no schema snapshot describes this table, so its "+

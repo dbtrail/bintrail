@@ -1907,16 +1907,32 @@ func TestBuildInsert_noSchemaBlobRefused(t *testing.T) {
 		t.Errorf("no base64 literal may reach the writer on refusal, got:\n%s", buf.String())
 	}
 
-	// Nil resolver = the documented schemaless all-columns fallback: NOT refused
-	// (New(nil,nil) is opted into deliberately and many callers rely on it).
+	// DB-less nil resolver = the deliberate schemaless all-columns fallback: NOT refused
+	// (New(nil,nil) is opted into deliberately and library/test callers hand-feed rows).
 	if _, err := newGen().generateInsert(row); err != nil {
-		t.Errorf("nil-resolver schemaless fallback must stay permissive, got: %v", err)
+		t.Errorf("db-less nil-resolver schemaless fallback must stay permissive, got: %v", err)
+	}
+
+	// DB-backed nil resolver = the #788 recover-WITHOUT-a-snapshot path (the real
+	// recover/MCP/console/agent callers all pass a DB): MUST refuse, closing the primary
+	// silent-corruption path. SchemaVersion=0 keeps resolverForRow from touching the DB.
+	nilWithDB := New(new(sql.DB), nil)
+	if _, err := nilWithDB.generateInsert(row); err == nil {
+		t.Error("db-backed nil-resolver (recover without a snapshot) must refuse untyped BLOB/TEXT, got nil error")
+	}
+	var buf2 bytes.Buffer
+	if _, err := nilWithDB.GenerateSQLFromRows([]query.ResultRow{row}, &buf2); err == nil {
+		t.Error("db-backed nil-resolver GenerateSQLFromRows must refuse")
+	}
+	if strings.Contains(buf2.String(), b64) {
+		t.Errorf("no base64 literal may reach the writer on refusal, got:\n%s", buf2.String())
 	}
 }
 
 // TestRequireTypedColumns_scoping pins exactly when the #788 refusal fires: MySQL
-// dialect + a resolver that cannot type the table. A nil resolver (schemaless
-// fallback) and the PostgreSQL dialect (values stored as text, no base64) never fire.
+// dialect + no usable type info. A DB-backed generator refuses (recover WITHOUT a
+// snapshot, or a snapshot that omits the table); the DB-less schemaless fallback and
+// the PostgreSQL dialect (values stored as text, no base64) never fire.
 func TestRequireTypedColumns_scoping(t *testing.T) {
 	typed := resolverWith(map[string]*metadata.TableMeta{
 		"db.t": {Schema: "db", Table: "t", Columns: []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}, PKColumns: []string{"id"}},
@@ -1929,7 +1945,8 @@ func TestRequireTypedColumns_scoping(t *testing.T) {
 	}{
 		{"mysql resolver missing table -> refuse", New(nil, empty), true},
 		{"mysql resolver has table -> ok", New(nil, typed), false},
-		{"mysql nil resolver -> permissive", New(nil, nil), false},
+		{"mysql nil resolver, db-less -> permissive", New(nil, nil), false},
+		{"mysql nil resolver, db-backed -> refuse", New(new(sql.DB), nil), true},
 		{"postgres resolver missing table -> permissive", NewForDialect(nil, empty, PostgresDialect), false},
 	}
 	for _, tc := range cases {
