@@ -290,6 +290,35 @@ func TestConsistentTableChecksum_MultibyteStringsDiffer(t *testing.T) {
 	}
 }
 
+func TestConsistentTableChecksum_Latin1RawBytesNotTranscoded(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// #792: the scan pins character_set_results = binary, so a latin1 column's
+	// stored bytes are hashed RAW (matching mydumper's SET NAMES binary dump
+	// contract the baseline Parquet is written under), NOT transcoded to the
+	// connection's utf8mb4. 'é' is one byte 0xE9 in latin1; under a transcode it
+	// would become two bytes 0xC3 0xA9. Proven by hashing a VARBINARY column that
+	// stores the raw byte X'E9' and asserting the two digests MATCH — they only
+	// match if no transcoding happened. Without the pin this is the permanent,
+	// conclusive false-MISMATCH class #792 describes.
+	testutil.MustExec(t, db, "CREATE TABLE lat (id INT PRIMARY KEY, s VARCHAR(8) CHARACTER SET latin1)")
+	testutil.MustExec(t, db, "CREATE TABLE raw (id INT PRIMARY KEY, s VARBINARY(8))")
+	testutil.MustExec(t, db, "INSERT INTO lat VALUES (1, _latin1 X'E9')") // 'é' → stored byte 0xE9
+	testutil.MustExec(t, db, "INSERT INTO raw VALUES (1, X'E9')")         // raw byte 0xE9
+
+	ctx := context.Background()
+	cl, err := ConsistentTableChecksum(ctx, db, schema, "lat")
+	if err != nil {
+		t.Fatalf("checksum lat: %v", err)
+	}
+	cr, err := ConsistentTableChecksum(ctx, db, schema, "raw")
+	if err != nil {
+		t.Fatalf("checksum raw: %v", err)
+	}
+	if cl.Digest != cr.Digest {
+		t.Errorf("latin1 byte was transcoded (charset pin not applied): latin1=%s raw=%s", cl.Digest, cr.Digest)
+	}
+}
+
 func TestConsistentTableChecksum_NullDistinctFromEmpty(t *testing.T) {
 	db, schema := testutil.CreateTestDB(t)
 	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, name VARCHAR(64))")
@@ -317,7 +346,7 @@ func TestConsistentTableChecksum_EmptyTable(t *testing.T) {
 	if c.RowCount != 0 {
 		t.Errorf("RowCount = %d, want 0", c.RowCount)
 	}
-	if c.Digest != "v1:0000000000000000" {
+	if c.Digest != digestVersion+"0000000000000000" {
 		t.Errorf("Digest = %q, want version-tagged all-zero for empty table", c.Digest)
 	}
 }
