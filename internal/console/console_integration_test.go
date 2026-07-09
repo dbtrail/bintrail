@@ -734,7 +734,11 @@ func statements(sql string) []string {
 	var out []string
 	for _, line := range strings.Split(sql, "\n") {
 		l := strings.TrimSpace(line)
-		if l == "" || strings.HasPrefix(l, "--") || l == "BEGIN;" || l == "COMMIT;" || l == "SET time_zone = '+00:00';" {
+		// Skip blanks, comments, the BEGIN/COMMIT wrapper, and any preamble SET
+		// (time_zone, sql_mode, …) — undo statements are only UPDATE/INSERT/DELETE,
+		// never a session pin, so stripping all SETs keeps this robust as the
+		// generator's preamble grows.
+		if l == "" || strings.HasPrefix(l, "--") || l == "BEGIN;" || l == "COMMIT;" || strings.HasPrefix(l, "SET ") {
 			continue
 		}
 		out = append(out, l)
