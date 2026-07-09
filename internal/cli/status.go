@@ -133,6 +133,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	if stFailOnGap {
 		cmd.SilenceUsage = true
 		switch {
+		case data.StreamErr != nil:
+			return fmt.Errorf("stream continuity: could not read stream state (%w); failing closed under --fail-on-gap", data.StreamErr)
 		case data.Stream == nil:
 			return fmt.Errorf("stream continuity: could not confirm gap state (no stream state loaded); failing closed under --fail-on-gap")
 		case !data.Stream.GapColumnsPresent:

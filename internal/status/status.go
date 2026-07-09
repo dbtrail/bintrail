@@ -334,9 +334,11 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 	// that has gap_lost but not yet source_health down to the base fallback (losing the
 	// loss record). The separate query degrades to "no health" on the unknown-column error
 	// (a legacy/un-migrated index) or an empty row; any OTHER error surfaces, since the core
-	// load already proved the DB reachable.
+	// load already proved the DB reachable; any hard error here is logged and ignored,
+	// keeping the already-loaded stream state (including gap_lost) visible rather than
+	// discarding it — that would re-hide the very GAP LOST banner #815 exists to surface.
 	if err := loadSourceHealth(ctx, db, s); err != nil {
-		return nil, err
+		slog.Warn("could not load source_health; keeping stream state without it", "error", err)
 	}
 	return s, nil
 }
