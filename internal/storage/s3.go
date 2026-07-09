@@ -14,7 +14,11 @@ import (
 )
 
 // s3API is the subset of the S3 client interface used by S3Backend.
-// Defined as an interface for testability.
+// Defined as an interface for testability. It embeds the multipart-upload
+// operations (UploadPart/CreateMultipartUpload/CompleteMultipartUpload/
+// AbortMultipartUpload) so the value satisfies manager.UploadAPIClient — Put
+// streams through the managed Uploader, which switches to a multipart upload
+// for bodies above S3's 5 GiB single-PUT ceiling (EntityTooLarge).
 type s3API interface {
 	PutObject(ctx context.Context, input *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	GetObject(ctx context.Context, input *s3.GetObjectInput, opts ...func(*s3.Options)) (*s3.GetObjectOutput, error)
@@ -22,6 +26,10 @@ type s3API interface {
 	HeadBucket(ctx context.Context, input *s3.HeadBucketInput, opts ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
 	DeleteObject(ctx context.Context, input *s3.DeleteObjectInput, opts ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 	ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	UploadPart(ctx context.Context, input *s3.UploadPartInput, opts ...func(*s3.Options)) (*s3.UploadPartOutput, error)
+	CreateMultipartUpload(ctx context.Context, input *s3.CreateMultipartUploadInput, opts ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput, opts ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+	AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput, opts ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
 }
 
 // S3Config holds the configuration for an S3 storage backend.
@@ -128,16 +136,14 @@ func (b *S3Backend) relKey(fullKey string) string {
 	return strings.TrimPrefix(fullKey, b.prefix)
 }
 
-// Put uploads the content from r to the given key.
+// Put uploads the content from r to the given key. Uploads stream through the
+// managed Uploader, which automatically switches to a multipart upload for
+// bodies above S3's 5 GiB single-PUT limit.
 func (b *S3Backend) Put(ctx context.Context, key string, r io.Reader) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
-	if _, err := b.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(b.bucket),
-		Key:    aws.String(b.fullKey(key)),
-		Body:   r,
-	}); err != nil {
+	if err := uploadReader(ctx, b.client, b.bucket, b.fullKey(key), r); err != nil {
 		return fmt.Errorf("storage: put %q: %w", key, err)
 	}
 	return nil

@@ -86,7 +86,9 @@ Results are **per table**, one of:
 - **inconclusive** — verify could not prove the table either way, and this is
   **never reported as a failure**. Causes include: no predecessor baseline yet,
   the index is behind the baseline anchor, an unsupported primary key, a coverage
-  gap, or a value class this version cannot yet compare.
+  gap, a digest-contract skew between a pre-pin baseline and the current scan
+  (regenerate the baseline — see below), or a value class this version cannot yet
+  compare.
 
 ## Exit codes (for cron / CI)
 
@@ -142,20 +144,32 @@ See also: the stream-continuity "no data lost" signal in
 [`bintrail status`](rotation-and-status.md#stream-continuity-no-data-lost), which
 verifies the *other* half — that no events were dropped from the capture stream.
 
-## Connection charset affects the digest
+## Charset contract: raw stored bytes
 
 The row-content fingerprint is computed over the bytes MySQL returns for each
-column, which depend on the **connection's charset** (`character_set_results`
-and friends) at read time. Two digests are only directly comparable when
-computed against the same connection charset. On a source with non-`utf8mb4`
-columns (`latin1`, `sjis`, binary-collation `VARBINARY`-as-text, etc.), reading
-the two sides of a comparison under different effective charsets can produce a
-false **MISMATCH** even though the underlying bytes are identical — the digest
-differs because the client-side re-encoding differs, not because the data
-does. If you see mismatches concentrated on legacy-charset tables, this is the
-first thing to rule out; a future release will pin
-`character_set_results=binary` so the comparison is charset-independent by
-construction.
+column. To make that byte stream independent of the connection charset, the
+checksum scan pins `character_set_results = binary`, so the server returns each
+string column's **raw stored bytes** with no transcoding — the same contract
+mydumper's `SET NAMES binary` writes the baseline Parquet under. A `latin1` `é`
+(byte `0xE9`) therefore hashes as `0xE9` on both the live-scan side and the
+baseline side, instead of the server transcoding it to utf8mb4 (`0xC3 0xA9`) on
+one side only. Without this pin, every non-ASCII row of a legacy-charset
+(`latin1`, `sjis`, …) table would differ in bytes even under a byte-correct
+restore — a permanent, conclusive false **MISMATCH**. The pin removes the
+charset dependency by construction.
+
+### Digest version tag
+
+Each digest carries a leading version tag (currently `v2:`) recording the
+contract it was computed under — the Go-side encoding plus the MySQL-side
+rendering (text protocol, session time zone UTC, and
+`character_set_results = binary`). Pinning the binary charset bumped the tag
+from `v1:` to `v2:`. Two digests are only byte-comparable when their tags match;
+a **version skew** — e.g. a persisted `v1:` baseline digest written before the
+pin, compared against a current `v2:` scan — is reported as **inconclusive**
+with a "regenerate the baseline" hint, never as a false MISMATCH. Re-run
+`bintrail baseline` to refresh the tag: the raw-byte content is unchanged, only
+the contract tag differs.
 
 ## Notes per source
 

@@ -2978,3 +2978,57 @@ func TestMapEventImagesDecodesExactlyOnce_boolRepair(t *testing.T) {
 		t.Errorf("flag = %#v, want \"true\" (repaired once, not corrupted by a second decode pass)", got)
 	}
 }
+
+// TestRunSnapshotFullTable_BaselineConfiguredRefusesWireError pins #822: when a
+// baseline source IS configured (the operator explicitly opted into full-table
+// completeness) but the baseline merge cannot run, full-table _snapshot must
+// FAIL LOUD with a wire error instead of silently degrading to the
+// binlog-activity-only set — a partial table indistinguishable from a complete
+// one. Two DB-free branches are exercised: no baseline at-or-before AsOf (a
+// valid PK resolves but the configured dir holds no snapshot → FindBaseline
+// returns ErrNoBaseline) and an unresolvable PK (the schema resolver errors).
+// Neither branch reaches indexDB before returning, so a nil DB is fine.
+func TestRunSnapshotFullTable_BaselineConfiguredRefusesWireError(t *testing.T) {
+	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
+	usersResolver := func() (*metadata.Resolver, error) {
+		return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+			"myapp.users": {Schema: "myapp", Table: "users", PKColumns: []string{"id"},
+				Columns: []metadata.ColumnMeta{
+					{Name: "id", OrdinalPosition: 1, DataType: "int", IsPK: true},
+					{Name: "name", OrdinalPosition: 2, DataType: "varchar"},
+				}},
+		}), nil
+	}
+	cases := []struct {
+		name       string
+		resolverFn func() (*metadata.Resolver, error)
+	}{
+		{"no baseline at-or-before AsOf", usersResolver},
+		{"unresolvable PK", func() (*metadata.Resolver, error) { return nil, errors.New("resolver unavailable") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{
+				logger: silent,
+				// A configured (but empty) baseline dir puts us past the
+				// no-source binlog-only branch; the empty dir makes FindBaseline
+				// return ErrNoBaseline for the valid-PK case.
+				cfg:        Config{BaselineDir: t.TempDir()},
+				resolverFn: tc.resolverFn,
+			}
+			_, err := h.runSnapshotFullTable(TimeTravelQuery{
+				Type: TypeSnapshot, Schema: "myapp", Table: "users", AsOf: time.Now(),
+			})
+			if err == nil {
+				t.Fatal("baseline configured but merge impossible: want a wire error, got nil (silent degrade)")
+			}
+			var myErr *gomysql.MyError
+			if !errors.As(err, &myErr) {
+				t.Fatalf("error = %T %v, want *mysql.MyError", err, err)
+			}
+			if myErr.Code != gomysql.ER_NO_PARTITION_FOR_GIVEN_VALUE {
+				t.Errorf("wire code = %d, want %d (ER_NO_PARTITION_FOR_GIVEN_VALUE)", myErr.Code, gomysql.ER_NO_PARTITION_FOR_GIVEN_VALUE)
+			}
+		})
+	}
+}

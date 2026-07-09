@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -25,6 +27,19 @@ type mockS3 struct {
 	headErr       error
 	deleteErr     error
 	listErr       error
+
+	// Multipart-upload state, exercised by the managed Uploader for bodies
+	// larger than its part size. mpMu guards concurrent UploadPart calls.
+	mpMu           sync.Mutex
+	mpUploads      map[string]*mpMockUpload
+	createMPUCount int // number of multipart uploads initiated
+	nextUploadID   int
+}
+
+// mpMockUpload accumulates the parts of one in-progress multipart upload.
+type mpMockUpload struct {
+	key   string
+	parts map[int32][]byte
 }
 
 func newMockS3() *mockS3 {
@@ -93,6 +108,66 @@ func (m *mockS3) ListObjectsV2(_ context.Context, input *s3.ListObjectsV2Input, 
 		Contents:    contents,
 		IsTruncated: aws.Bool(false),
 	}, nil
+}
+
+func (m *mockS3) CreateMultipartUpload(_ context.Context, input *s3.CreateMultipartUploadInput, _ ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error) {
+	if m.putErr != nil {
+		return nil, m.putErr
+	}
+	m.mpMu.Lock()
+	defer m.mpMu.Unlock()
+	if m.mpUploads == nil {
+		m.mpUploads = make(map[string]*mpMockUpload)
+	}
+	m.createMPUCount++
+	m.nextUploadID++
+	id := fmt.Sprintf("upload-%d", m.nextUploadID)
+	m.mpUploads[id] = &mpMockUpload{key: aws.ToString(input.Key), parts: make(map[int32][]byte)}
+	return &s3.CreateMultipartUploadOutput{UploadId: aws.String(id)}, nil
+}
+
+func (m *mockS3) UploadPart(_ context.Context, input *s3.UploadPartInput, _ ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
+	data, err := io.ReadAll(input.Body)
+	if err != nil {
+		return nil, err
+	}
+	m.mpMu.Lock()
+	defer m.mpMu.Unlock()
+	up, ok := m.mpUploads[aws.ToString(input.UploadId)]
+	if !ok {
+		return nil, fmt.Errorf("no such upload %q", aws.ToString(input.UploadId))
+	}
+	n := aws.ToInt32(input.PartNumber)
+	up.parts[n] = data
+	return &s3.UploadPartOutput{ETag: aws.String(fmt.Sprintf("\"etag-%d\"", n))}, nil
+}
+
+func (m *mockS3) CompleteMultipartUpload(_ context.Context, input *s3.CompleteMultipartUploadInput, _ ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error) {
+	m.mpMu.Lock()
+	defer m.mpMu.Unlock()
+	up, ok := m.mpUploads[aws.ToString(input.UploadId)]
+	if !ok {
+		return nil, fmt.Errorf("no such upload %q", aws.ToString(input.UploadId))
+	}
+	nums := make([]int32, 0, len(up.parts))
+	for n := range up.parts {
+		nums = append(nums, n)
+	}
+	slices.Sort(nums)
+	var buf []byte
+	for _, n := range nums {
+		buf = append(buf, up.parts[n]...)
+	}
+	m.objects[up.key] = buf
+	delete(m.mpUploads, aws.ToString(input.UploadId))
+	return &s3.CompleteMultipartUploadOutput{}, nil
+}
+
+func (m *mockS3) AbortMultipartUpload(_ context.Context, input *s3.AbortMultipartUploadInput, _ ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error) {
+	m.mpMu.Lock()
+	defer m.mpMu.Unlock()
+	delete(m.mpUploads, aws.ToString(input.UploadId))
+	return &s3.AbortMultipartUploadOutput{}, nil
 }
 
 func newTestBackend(t *testing.T, mock *mockS3, prefix string) *S3Backend {
@@ -494,3 +569,66 @@ func (m *paginatedMockS3) ListObjectsV2(_ context.Context, _ *s3.ListObjectsV2In
 
 // Verify S3Backend satisfies the Backend interface at compile time.
 var _ Backend = (*S3Backend)(nil)
+
+// TestS3BackendPutMultipart verifies Put routes through the managed Uploader:
+// small bodies take the single PutObject path, while bodies above the
+// Uploader's part size (~5 MiB) transparently switch to a multipart upload —
+// the fix for partitions above S3's 5 GiB single-PUT ceiling. The reassembled
+// object must byte-match the input (part ordering is load-bearing).
+func TestS3BackendPutMultipart(t *testing.T) {
+	tests := []struct {
+		name          string
+		size          int
+		wantMultipart bool
+	}{
+		{"small single-put", 4096, false},
+		{"large multipart", 6 * 1024 * 1024, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMockS3()
+			b := newTestBackend(t, mock, "prefix/")
+
+			payload := make([]byte, tc.size)
+			for i := range payload {
+				payload[i] = byte((i * 7) % 251) // position-dependent so misordered parts fail
+			}
+
+			if err := b.Put(context.Background(), "big.parquet", bytes.NewReader(payload)); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+
+			got := mock.objects["prefix/big.parquet"]
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("stored %d bytes, want %d (or wrong order)", len(got), len(payload))
+			}
+			if usedMultipart := mock.createMPUCount > 0; usedMultipart != tc.wantMultipart {
+				t.Fatalf("multipart used = %v (createMPUCount=%d), want %v", usedMultipart, mock.createMPUCount, tc.wantMultipart)
+			}
+		})
+	}
+}
+
+// TestUploadFileMultipart verifies the file-upload path (rotation archive /
+// baseline snapshots) also streams a large file through the multipart Uploader
+// rather than a single PutObject. It exercises uploadReader directly with the
+// multipart-capable mock so no *s3.Client is required.
+func TestUploadFileMultipart(t *testing.T) {
+	mock := newMockS3()
+	mock.objects = map[string][]byte{}
+
+	payload := make([]byte, 6*1024*1024)
+	for i := range payload {
+		payload[i] = byte((i * 13) % 251)
+	}
+
+	if err := uploadReader(context.Background(), mock, "bucket", "archive/big.parquet", bytes.NewReader(payload)); err != nil {
+		t.Fatalf("uploadReader: %v", err)
+	}
+	if mock.createMPUCount == 0 {
+		t.Fatal("expected multipart upload for a 6 MiB body, got single PutObject")
+	}
+	if got := mock.objects["archive/big.parquet"]; !bytes.Equal(got, payload) {
+		t.Fatalf("stored %d bytes, want %d (or wrong order)", len(got), len(payload))
+	}
+}

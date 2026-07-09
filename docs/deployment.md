@@ -411,6 +411,26 @@ Key log fields emitted by bintrail commands:
 
 Run `bintrail rotate` hourly (cron or systemd timer) so old partitions are dropped and future ones stay provisioned — otherwise the catch-all `p_future` accumulates every new event. The cron/timer setup, the `--retain`/`--add-future` semantics, and monitoring `p_future` via `bintrail status` are in [rotation-and-status.md → Automating Rotation](rotation-and-status.md#automating-rotation). (`bintrail up`/`bintrail-console watch` also run this loop built-in.)
 
+### S3 archive bucket: abort orphaned multipart uploads
+
+Archive and baseline uploads stream through the AWS multipart Uploader, which
+automatically splits objects larger than S3's 5 GiB single-PUT ceiling into
+parts. An upload interrupted mid-stream (crash, network loss, `SIGKILL`) can
+leave orphaned parts that you keep paying storage for but never see as a
+completed object. Attach an `AbortIncompleteMultipartUpload` lifecycle rule to
+the archive bucket to reap them automatically:
+
+```json
+{
+  "Rules": [{
+    "ID": "abort-incomplete-multipart",
+    "Status": "Enabled",
+    "Filter": {},
+    "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+  }]
+}
+```
+
 ## 9. Security
 
 ### Credential management

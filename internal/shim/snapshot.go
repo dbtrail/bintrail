@@ -59,19 +59,26 @@ var errFullTableCapExceeded = errors.New("full-table snapshot row cap exceeded")
 // the offline `bintrail reconstruct` produces, but streamed into an in-memory
 // resultset.
 //
-// It falls back to the binlog-only full-table path (runFullTable) — preserving
-// the documented "_snapshot degrades to _flashback" contract so a full-table
-// _snapshot never fails where _flashback would succeed — whenever a baseline
-// merge isn't possible:
-//   - no baseline source configured,
-//   - the table's PK can't be resolved from the schema snapshot, or it has no
-//     single/declared PK to canonicalize against,
+// When NO baseline source is configured it falls back to the binlog-only
+// full-table path (runFullTable) — the intended "_snapshot degrades to
+// _flashback" default, where binlog-only completeness is exactly what was
+// asked for.
+//
+// But when a baseline source IS configured the operator explicitly opted into
+// full-table completeness, so a merge that can't run must FAIL LOUD rather than
+// silently return a partial (binlog-activity-only) table indistinguishable from
+// a complete one — the same fail-loud contract as the shim's strict AllowGaps
+// default and the 1104 row cap (#822). These cases return an actionable wire
+// error (ER_NO_PARTITION_FOR_GIVEN_VALUE / 1526 — the same code wrapFetchError
+// uses for a coverage gap the index can't answer), pointing the operator at the
+// fix and at _flashback for a binlog-only view:
+//   - the table's PK can't be resolved from the schema snapshot (re-snapshot),
 //   - a PK column's type isn't supported by the baseline canonicalizer,
-//   - no baseline exists for this table at-or-before AsOf.
+//   - no baseline exists for this table at-or-before AsOf (take a baseline).
 //
 // Real faults (baseline source unreadable, fetch failure, a PK value the
-// canonicalizer can't translate) surface as errors, the same user-vs-server
-// split the single-row path preserves.
+// canonicalizer can't translate) surface as plain errors → ER_UNKNOWN_ERROR
+// (1105), the same user-vs-server split the single-row path preserves.
 func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 	src := h.baselineSource()
 	if src == "" {
@@ -82,21 +89,32 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 
 	pkCols, ok := h.pkColumnMetas(q.Schema, q.Table)
 	if !ok || len(pkCols) == 0 {
-		// A baseline source IS configured, so the operator opted into
-		// full-table completeness — but we can't determine the table's PK to
-		// canonicalize baseline rows against, so the result silently loses
-		// every never-touched baseline row. Warn (not Debug) so the
-		// degradation is visible; the usual cause is a stale/absent schema
-		// snapshot, fixable with `bintrail snapshot`.
-		h.logger.Warn("shim: full-table _snapshot cannot resolve a PK for the table; degrading to binlog-only (never-touched rows omitted)",
-			"schema", q.Schema, "table", q.Table)
-		return h.runFullTable(q)
+		// A baseline source IS configured, so the operator opted into full-table
+		// completeness — but we can't determine the table's PK to canonicalize
+		// baseline rows against. Degrading to runFullTable here would silently
+		// drop every never-touched baseline row and return a partial table
+		// indistinguishable from a complete one; that contradicts the shim's
+		// fail-loud contract (strict AllowGaps, the 1104 row cap). Refuse with an
+		// actionable wire error instead (#822). The usual cause is a stale/absent
+		// schema snapshot, fixable with `bintrail snapshot`; _flashback stays
+		// available for a binlog-only view.
+		return nil, mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, fmt.Sprintf(
+			"resolve %s: cannot determine the primary key of %s.%s from the schema snapshot; "+
+				"_snapshot cannot return a complete table (never-touched rows would be omitted) — "+
+				"run `bintrail snapshot` to refresh the schema, or use _flashback for a binlog-only view",
+			q.Type, q.Schema, q.Table))
 	}
 	for _, c := range pkCols {
 		if !reconstruct.SupportedPKType(c.DataType) {
-			h.logger.Warn("shim: full-table _snapshot PK type not supported by the baseline canonicalizer; using binlog-only path",
-				"schema", q.Schema, "table", q.Table, "pk_column", c.Name, "pk_type", c.DataType)
-			return h.runFullTable(q)
+			// Baseline configured but this PK type can't be canonicalized for the
+			// merge — same fail-loud reasoning as the unresolved-PK branch (#822):
+			// silently returning binlog-only rows would be a partial table the
+			// operator can't distinguish from a complete one.
+			return nil, mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, fmt.Sprintf(
+				"resolve %s: primary key column %s of %s.%s has type %s, which the baseline merge cannot canonicalize; "+
+					"_snapshot cannot return a complete table (never-touched rows would be omitted) — "+
+					"use _flashback for a binlog-only view",
+				q.Type, c.Name, q.Schema, q.Table, c.DataType))
 		}
 	}
 
@@ -109,15 +127,19 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	baselinePath, snapshotTime, _, err := reconstruct.FindBaseline(ctx, src, q.Schema, q.Table, q.AsOf)
 	if err != nil {
 		if errors.Is(err, reconstruct.ErrNoBaseline) {
-			// Source configured but no baseline exists for this table at-or-
-			// before AsOf (not yet baselined, or table created after the last
-			// snapshot). The full-table result then silently omits any
-			// never-touched row — Warn so the operator can tell the snapshot
-			// degraded to binlog-only rather than returning a complete table.
-			h.logger.Warn("shim: full-table _snapshot found no baseline at-or-before AsOf; degrading to binlog-only (never-touched rows omitted)",
-				"schema", q.Schema, "table", q.Table,
-				"as_of", q.AsOf.UTC().Format(time.RFC3339))
-			return h.runFullTable(q)
+			// Source configured but no baseline exists for this table at-or-before
+			// AsOf (not yet baselined, or the table was created after the last
+			// snapshot). Degrading to runFullTable would silently omit every
+			// never-touched row and return a partial table the caller can't
+			// distinguish from a complete one. Since the operator explicitly
+			// configured a baseline for full-table completeness, fail loud with an
+			// actionable wire error instead (#822) — mirroring the strict
+			// AllowGaps / 1104 row-cap contract.
+			return nil, mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, fmt.Sprintf(
+				"resolve %s: no baseline for %s.%s at or before %s; _snapshot cannot return a complete table "+
+					"(never-touched rows would be omitted) — take a baseline (`bintrail baseline`), "+
+					"or use _flashback for a binlog-only view",
+				q.Type, q.Schema, q.Table, q.AsOf.UTC().Format(time.RFC3339)))
 		}
 		// A real baseline-source failure is a server-side fault, same as the
 		// single-row path: plain error → ER_UNKNOWN_ERROR (1105).
