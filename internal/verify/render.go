@@ -6,8 +6,11 @@ package verify
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/bits"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +43,17 @@ import (
 func renderCell(v any, col metadata.ColumnMeta) []byte {
 	if v == nil {
 		return nil
+	}
+	// A BIT value from a binlog event image arrives as a NUMBER (go-mysql
+	// delivers BIT as an integer, kept as json.Number through the stored event
+	// JSON), while the baseline Parquet and the live source's text protocol
+	// both carry the RAW ceil(M/8)-byte big-endian string. Render the number
+	// into those exact bytes so a carried-but-unchanged BIT genuinely matches
+	// (#769). Baseline-origin []byte values fall through untouched.
+	if strings.EqualFold(strings.TrimSpace(col.DataType), "bit") {
+		if b, ok := renderBitBytes(v, col); ok {
+			return b
+		}
 	}
 	switch x := v.(type) {
 	case json.Number:
@@ -125,6 +139,78 @@ func temporalPrecision(columnType string) int {
 		return 0
 	}
 	return n
+}
+
+// renderBitBytes renders a numeric BIT value as the raw byte string MySQL's
+// text protocol (and mydumper, hence the baseline Parquet) carries for a
+// BIT(M) column: ceil(M/8) bytes, big-endian, zero-padded at the front. The
+// declared width comes from ColumnType ("bit(12)" → 2 bytes). ok=false — the
+// caller falls back to the generic decimal rendering, which the deferred gate
+// reports as unresolved — when the width is unavailable (pre-#212 snapshot
+// with an empty ColumnType) or the value is not an exact non-negative
+// integer. A value wider than the declared width is never truncated: it
+// renders at its natural width, so a genuinely divergent value still differs.
+func renderBitBytes(v any, col metadata.ColumnMeta) ([]byte, bool) {
+	u, ok := bitUint(v)
+	if !ok {
+		return nil, false
+	}
+	width := bitByteWidth(col.ColumnType)
+	if width == 0 {
+		return nil, false
+	}
+	if need := max((bits.Len64(u)+7)/8, 1); need > width {
+		width = need
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], u)
+	return buf[8-width:], true
+}
+
+// bitByteWidth returns ceil(M/8) for a "bit(M)" column-type declaration, 0
+// when M is unavailable or outside MySQL's 1..64 range. Reuses
+// temporalPrecision's parenthesized-integer extraction — same "(N)" shape.
+func bitByteWidth(columnType string) int {
+	m := temporalPrecision(columnType)
+	if m < 1 || m > 64 {
+		return 0
+	}
+	return (m + 7) / 8
+}
+
+// bitUint extracts an exact non-negative integer from the value shapes an
+// event image can carry for a BIT column. Mirrors metadata's ordinalValue
+// conservatism: fractional, negative, beyond-exact-precision, and textual
+// values all report !ok.
+func bitUint(v any) (uint64, bool) {
+	switch n := v.(type) {
+	case json.Number:
+		u, err := strconv.ParseUint(n.String(), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return u, true
+	case int64:
+		if n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	case uint64:
+		return n, true
+	case int32:
+		if n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	case uint32:
+		return uint64(n), true
+	case float64:
+		if n < 0 || n != math.Trunc(n) || n > 1<<53 {
+			return 0, false
+		}
+		return uint64(n), true
+	}
+	return 0, false
 }
 
 // isZeroDateSentinel reports whether b is MySQL's all-zero date pseudo-NULL

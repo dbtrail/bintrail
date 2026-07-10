@@ -141,8 +141,11 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 	if err != nil {
 		return nil, fmt.Errorf("fetch changes %s.%s: %w", p.Schema, p.Table, err)
 	}
-	// BLOB/TEXT base64 → real value, epoch-aware (#672). See verify.go's
-	// VerifyTable for the same wiring and its rationale.
+	// The SAME normalization passes VerifyBaselinePair ran before its digest
+	// (ENUM/SET labels #769, BLOB/TEXT base64 #672): without them this
+	// drill-down's row stream would differ from the one the digest hashed and
+	// the diff could disagree with the verdict.
+	reconstruct.MapEventEnumLabels(cfg.IndexDB, cfg.Resolver, p.Schema, p.Table, rows)
 	reconstruct.DecodeEventBinaries(cfg.IndexDB, p.Schema, p.Table, rows)
 	changes := make(map[string]*query.ResultRow, len(rows))
 	for i := range rows {

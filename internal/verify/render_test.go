@@ -264,3 +264,72 @@ func TestTemporalPrecision(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderCell_BitRendersSourceBytes pins the #769 BIT normalization: an
+// event-image BIT value (a number, since go-mysql delivers BIT as an integer
+// kept as json.Number through the stored JSON) renders as the raw
+// ceil(M/8)-byte big-endian string MySQL's text protocol and the baseline
+// Parquet carry — including the leading zero padding of the declared width.
+func TestRenderCell_BitRendersSourceBytes(t *testing.T) {
+	bit := func(ct string) metadata.ColumnMeta {
+		return metadata.ColumnMeta{Name: "flags", DataType: "bit", ColumnType: ct}
+	}
+	cases := []struct {
+		name string
+		v    any
+		col  metadata.ColumnMeta
+		want []byte
+	}{
+		{"bit(1) value 1", json.Number("1"), bit("bit(1)"), []byte{0x01}},
+		{"bit(8) value 5", json.Number("5"), bit("bit(8)"), []byte{0x05}},
+		// The padding case: BIT(12) stores 2 bytes; small values keep the
+		// leading zero byte, exactly as the text protocol returns them.
+		{"bit(12) value 5 pads to 2 bytes", json.Number("5"), bit("bit(12)"), []byte{0x00, 0x05}},
+		{"bit(64) max value", json.Number("18446744073709551615"), bit("bit(64)"),
+			[]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
+		// A value wider than the declared width is never truncated — a genuine
+		// divergence must still differ.
+		{"value wider than declared width", json.Number("300"), bit("bit(1)"), []byte{0x01, 0x2c}},
+		// Baseline-origin values are already the raw bytes; pass through.
+		{"[]byte passes through", []byte{0x00, 0x05}, bit("bit(12)"), []byte{0x00, 0x05}},
+		// Width unavailable (pre-#212 snapshot): fall back to the generic
+		// decimal rendering — the deferred gate reports it unresolved.
+		{"no ColumnType falls back to decimal", json.Number("5"), bit(""), []byte("5")},
+		{"non-integer falls back", json.Number("5.5"), bit("bit(8)"), []byte("5.5")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := renderCell(tc.v, tc.col)
+			if !bytes.Equal(got, tc.want) {
+				t.Errorf("renderCell(%v, %q/%q) = %q, want %q", tc.v, tc.col.DataType, tc.col.ColumnType, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestJSONRenderConclusive pins the gate's JSON rule: number-free,
+// canonicalizable documents are conclusive; any number literal, or a container
+// canonicalizeJSONContainer refuses, is not.
+func TestJSONRenderConclusive(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{`{"tags":["a","b"],"on":true,"note":null}`, true},
+		{`["x","y"]`, true},
+		{`"scalar"`, true},
+		{`true`, true},
+		{`{"price":1}`, false},   // could have been a JSONB double 1.0 at capture
+		{`{"price":1.5}`, false}, // float text form is renderer-dependent
+		{`[1]`, false},
+		{`3`, false},
+		{`{"a":1,"a":2}`, false}, // duplicate key: canonicalization refuses
+		{`not-json`, false},
+		{``, false},
+	}
+	for _, tc := range cases {
+		if got := jsonRenderConclusive([]byte(tc.in)); got != tc.want {
+			t.Errorf("jsonRenderConclusive(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

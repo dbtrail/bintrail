@@ -85,10 +85,22 @@ func MapEventEnumLabels(db *sql.DB, latest *metadata.Resolver, schema, table str
 // typing is unavailable — no snapshots, or a per-epoch resolver that fails to
 // load — the value is left as the base64 it was stored as, never decoded by a
 // guess.
-func DecodeEventBinaries(db *sql.DB, schema, table string, events []query.ResultRow) {
-	if len(events) == 0 || db == nil {
-		return
+//
+// The returned bool reports whether that degradation happened: true when every
+// event's timestamp resolved to a snapshot epoch whose resolver and table
+// lookup succeeded (so every base64-stored value was decoded), false when at
+// least one event's typing was unavailable and its values may still be stored
+// base64. Callers that only best-effort decode (recover, shim, reconstruct)
+// ignore it; verify uses it to keep a digest comparison honest — an undecoded
+// value is a representation gap, not a divergence (#769/#791).
+func DecodeEventBinaries(db *sql.DB, schema, table string, events []query.ResultRow) bool {
+	if len(events) == 0 {
+		return true
 	}
+	if db == nil {
+		return false
+	}
+	typed := true
 	epochs, err := metadata.LoadSnapshotEpochs(db)
 	if err != nil {
 		slog.Debug("snapshot epoch lookup failed; leaving BLOB/TEXT as stored base64",
@@ -98,29 +110,41 @@ func DecodeEventBinaries(db *sql.DB, schema, table string, events []query.Result
 	// The per-epoch BLOB/TEXT column map is memoized; the check sits before
 	// NewResolver so a snapshot whose resolver fails to load is probed at most
 	// once, not once per row.
-	memo := make(map[int]map[string]bool)
+	type binMemo struct {
+		cols map[string]bool
+		ok   bool // the epoch's resolver + table lookup succeeded (cols may still be nil: no BLOB/TEXT columns)
+	}
+	memo := make(map[int]binMemo)
 	binColsAt := func(t time.Time) map[string]bool {
 		id, ok := metadata.EpochAt(epochs, t)
 		if !ok {
+			typed = false
 			return nil // no snapshots → no safe typing → leave values as base64
 		}
 		if m, seen := memo[id]; seen {
-			return m
+			if !m.ok {
+				typed = false
+			}
+			return m.cols
 		}
-		var m map[string]bool
+		var m binMemo
 		if r, nerr := metadata.NewResolver(db, id); nerr == nil && r != nil {
 			if tm, rerr := r.Resolve(schema, table); rerr == nil {
-				m = binaryColsFromTableMeta(tm)
+				m = binMemo{cols: binaryColsFromTableMeta(tm), ok: true}
 			}
 		}
 		memo[id] = m
-		return m
+		if !m.ok {
+			typed = false
+		}
+		return m.cols
 	}
 	for i := range events {
 		binCols := binColsAt(events[i].EventTimestamp)
 		decodeImageBinaries(events[i].RowBefore, binCols)
 		decodeImageBinaries(events[i].RowAfter, binCols)
 	}
+	return typed
 }
 
 // decodeImageBinaries decodes the storage-side base64 of every BLOB/TEXT column

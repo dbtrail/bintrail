@@ -776,3 +776,120 @@ func TestVerifyTable_StaleZeroDateVsGenuineNull_AcceptedRisk(t *testing.T) {
 		t.Fatalf("status = %q (%s); this test pins the accepted-risk behavior — if this now fails, the zero-date normalization's blast radius changed and this comment/test pair needs re-evaluating, not just updating the assertion", got.Status, got.Detail)
 	}
 }
+
+// TestVerifyTable_DeferredColumnsResolved_RealDivergenceStaysMismatch is the
+// #791 repro + regression test for live-source mode. The old gate
+// (hasDeferredRepr(orderedCols) && len(changes) > 0) degraded EVERY content
+// difference to Inconclusive as soon as the table merely CONTAINED an
+// ENUM/SET/JSON/binary/BIT column and any event existed in the window — so an
+// in-place corruption of a plain INT/VARCHAR column (the sql_log_bin=0 drift
+// class live mode exists to catch) exited 0. With the event side normalized
+// at the root (ENUM labels, BIT raw bytes, canonical JSON), the same window:
+//
+//  1. genuinely MATCHes against the real MySQL text protocol (phase 1 —
+//     proving the normalization agrees with a live source, not just Parquet), and
+//  2. reports a conclusive MISMATCH once a non-deferred column is corrupted
+//     directly on the source (phase 2 — the finding's masked scenario).
+func TestVerifyTable_DeferredColumnsResolved_RealDivergenceStaysMismatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	for _, c := range []struct {
+		name             string
+		ord              int
+		key, dt, colType string
+	}{
+		{"id", 1, "PRI", "int", "int"},
+		{"status", 2, "", "varchar", "varchar(64)"},
+		{"state", 3, "", "enum", "enum('active','inactive')"},
+		{"flags", 4, "", "bit", "bit(12)"},
+		{"meta", 5, "", "json", "json"},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	// Live SOURCE at the FINAL (post-event) state. flags = b'101' (5) in a
+	// BIT(12): the text protocol returns ceil(12/8) = 2 raw bytes 0x00 0x05 —
+	// the empirical check that renderBitBytes' width/padding matches MySQL.
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"CREATE TABLE `%s`.`orders` (`id` INT PRIMARY KEY, `status` VARCHAR(64),"+
+			" `state` ENUM('active','inactive'), `flags` BIT(12), `meta` JSON)", dbName))
+	testutil.MustExec(t, db, fmt.Sprintf("INSERT INTO `%s`.`orders` VALUES"+
+		"(1,'a','active',b'101','{\"tags\": [\"x\"]}'),"+
+		"(2,'shipped','inactive',b'101','{\"tags\": [\"y\"]}')", dbName))
+
+	// Baseline Parquet at the INITIAL state: labels as strings, BIT as the raw
+	// 2-byte form, JSON as MySQL's text — what mydumper dumps.
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64),\n  `state` ENUM('active','inactive'),\n  `flags` BIT(12),\n  `meta` JSON,\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "status", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+		{Name: "state", MySQLType: "enum", ParquetType: baseline.MysqlToParquetNode("enum")},
+		{Name: "flags", MySQLType: "bit", ParquetType: baseline.MysqlToParquetNode("bit")},
+		{Name: "meta", MySQLType: "json", ParquetType: baseline.MysqlToParquetNode("json")},
+	}
+	baselineDir := t.TempDir()
+	now := time.Now().UTC()
+	h1 := now.Truncate(time.Hour).Add(-time.Hour)
+	writeTestBaseline(t, baselineDir, h1, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "a", "active", "\x00\x05", `{"tags": ["x"]}`},
+		{"2", "b", "inactive", "\x00\x05", `{"tags": ["y"]}`},
+	}, "", 0)
+
+	// One in-window UPDATE (id=2, status b→shipped). row_image=FULL: the
+	// row_after carries the untouched ENUM as its ordinal (2 = 'inactive'),
+	// the BIT as its integer (5), and the JSON document.
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, now.Truncate(time.Hour)})
+	ts1 := now.Add(-2 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, dbName, "orders", 2 /*UPDATE*/, "2", nil,
+		[]byte(`{"id":2,"status":"b","state":2,"flags":5,"meta":{"tags":["y"]}}`),
+		[]byte(`{"id":2,"status":"shipped","state":2,"flags":5,"meta":{"tags":["y"]}}`))
+
+	var uuid string
+	if err := db.QueryRow("SELECT @@server_uuid").Scan(&uuid); err != nil {
+		t.Fatalf("server_uuid: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO stream_state
+		(id, mode, gtid_set, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, UTC_TIMESTAMP(), 1)`, uuid+":1-1000000")
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := Config{
+		SourceDB: db, IndexDB: db, Resolver: resolver,
+		BaselineSource: baselineDir, IndexDBName: dbName, NoArchive: true,
+	}
+	ctx := context.Background()
+
+	// Phase 1: a faithful recovery genuinely MATCHes — mapped labels, BIT
+	// bytes and canonical JSON line up against MySQL's real text protocol.
+	got, err := VerifyTable(ctx, cfg, dbName, "orders")
+	if err != nil {
+		t.Fatalf("VerifyTable: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Fatalf("status = %q (%s); want match\n  source=%s rows=%d\n  recon =%s rows=%d",
+			got.Status, got.Detail, got.SourceDigest, got.SourceRows, got.ReconstructDigest, got.ReconstructRows)
+	}
+
+	// Phase 2: corrupt a NON-deferred column directly on the source. Before
+	// the fix this read Inconclusive (deferred columns present + a change in
+	// the window) and a cron run exited 0 with real divergence present.
+	testutil.MustExec(t, db, fmt.Sprintf("UPDATE `%s`.`orders` SET status='TAMPERED' WHERE id=1", dbName))
+	got2, err := VerifyTable(ctx, cfg, dbName, "orders")
+	if err != nil {
+		t.Fatalf("VerifyTable (2): %v", err)
+	}
+	if got2.Status != StatusMismatch {
+		t.Errorf("after tampering status = %q (%s); want mismatch — a real divergence on a non-deferred column must not be masked by the table containing deferred columns", got2.Status, got2.Detail)
+	}
+}

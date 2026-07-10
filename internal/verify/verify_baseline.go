@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
-	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -134,13 +133,28 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 		}
 		return res, fmt.Errorf("fetch changes %s.%s: %w", p.Schema, p.Table, err)
 	}
+	// ENUM/SET ordinals → labels, epoch-aware — the same pass every other
+	// reconstruction surface runs (#769): with row_image=FULL an UPDATE's
+	// row_after carries EVERY ENUM/SET column, so an unmapped ordinal would
+	// digest-differ from the baseline's label even when the column never
+	// changed — a false MISMATCH in the default verify mode.
+	reconstruct.MapEventEnumLabels(cfg.IndexDB, cfg.Resolver, p.Schema, p.Table, rows)
 	// BLOB/TEXT base64 → real value, epoch-aware (#672). See verify.go's
 	// VerifyTable for the same wiring and its rationale.
-	reconstruct.DecodeEventBinaries(cfg.IndexDB, p.Schema, p.Table, rows)
+	binariesTyped := reconstruct.DecodeEventBinaries(cfg.IndexDB, p.Schema, p.Table, rows)
 	changes := make(map[string]*query.ResultRow, len(rows))
 	for i := range rows {
 		changes[rows[i].PKValues] = &rows[i]
 	}
+
+	// Deferred-representation gate (#769) — computed BEFORE the reconstruction:
+	// SnapshotFullTableImages DRAINS the changes map, so evaluating the gate at
+	// classify time would always see it empty (the silent flaw that made the old
+	// ChangedColumns-based gate unreachable here). deferredReprUnresolved, not
+	// that old gate: a FULL row image carries every column, so what matters is
+	// whether a deferred value an event CARRIED is still unmappable — not
+	// whether the column was listed as changed.
+	deferredRepr := deferredReprUnresolved(orderedCols, changes, binariesTyped)
 
 	// Recovery side: reconstruct the previous baseline forward to the anchor.
 	// renderCellNormalized (not plain renderCell): both operands here come
@@ -163,41 +177,8 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	res.ReconstructDigest = reconDigest
 	res.ReconstructRows = reconCount
 
-	res.Status, res.Detail = classify(newDigest, newCount, reconDigest, reconCount, deferredReprChanged(orderedCols, changes))
+	res.Status, res.Detail = classify(newDigest, newCount, reconDigest, reconCount, deferredRepr)
 	return res, nil
-}
-
-// deferredReprChanged reports whether an ENUM/SET/JSON/binary column was actually
-// changed by an event in the window — the only case where the event-image renders
-// differently than the baseline reads it (ordinal vs label, base64 vs raw bytes,
-// canonical JSON). Gating on actual participation, not merely "the table contains
-// such a column and saw any change", keeps a real divergence on an unrelated
-// non-deferred column reportable as a mismatch instead of masking it inconclusive.
-func deferredReprChanged(cols []metadata.ColumnMeta, changes map[string]*query.ResultRow) bool {
-	deferred := make(map[string]bool)
-	for _, c := range cols {
-		if isDeferredType(c.DataType) {
-			deferred[c.Name] = true
-		}
-	}
-	if len(deferred) == 0 {
-		return false
-	}
-	for _, ev := range changes {
-		switch ev.EventType {
-		case event.EventInsert:
-			return true // an insert sets every column, including the deferred one
-		case event.EventUpdate:
-			for _, col := range ev.ChangedColumns {
-				if deferred[col] {
-					return true
-				}
-			}
-		}
-		// EventDelete removes the row from both sides — no value is rendered, so
-		// it cannot introduce a representation difference.
-	}
-	return false
 }
 
 // AnyBaseline reports whether at least one complete baseline snapshot exists
