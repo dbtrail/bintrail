@@ -353,6 +353,17 @@ func deferredValueUnresolved(v any, c metadata.ColumnMeta, binariesTyped bool) b
 		_, ok := renderBitBytes(v, c)
 		return !ok
 	case "json":
+		// JSON is one of the base64StoredKind text-decode targets
+		// DecodeEventBinaries degrades (internal/reconstruct/fulltable.go);
+		// an untyped epoch may leave the value as the raw base64 string it
+		// was stored as. jsonRenderConclusive happens to reject most such
+		// strings (base64's alphabet almost never forms valid bare JSON),
+		// but a base64 string equal to the literal "true"/"false"/"null"
+		// would slip through undetected as resolved — guard explicitly,
+		// matching the binary-family branch below.
+		if !binariesTyped {
+			return true // may still be stored base64 — DecodeEventBinaries degraded
+		}
 		// Key order is canonicalized on both sides; number literals are NOT
 		// provably faithful: go-mysql renders a JSONB double 1.0 as "1" at
 		// capture (the parser does not set UseFloatWithTrailingZero) while the
