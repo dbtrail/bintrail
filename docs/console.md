@@ -61,6 +61,14 @@ With an S3 baseline (`--baseline-s3`), the `watch` process reads S3 at request
 time using the ambient AWS credential chain — same as the standalone console,
 but note the plain stream daemon didn't need AWS credentials before.
 
+For a TLS-requiring source (RDS, Aurora, Cloud SQL), `watch`'s own stream
+accepts `--ssl-mode` / `--ssl-ca` / `--ssl-cert` / `--ssl-key` (env
+`BINTRAIL_SSL_MODE` / `BINTRAIL_SSL_CA` / `BINTRAIL_SSL_CERT` /
+`BINTRAIL_SSL_KEY`), same semantics as `bintrail stream` — see
+[streaming.md → TLS/SSL for managed MySQL](streaming.md#tlsssl-for-managed-mysql-rds-aurora-cloud-sql).
+The default stays `--ssl-mode preferred` (opportunistic, no certificate
+verification).
+
 Open that URL in a browser. A left **sidebar** groups the views (Time-travel
 appears only when a baseline is configured), with a **server switcher** at the
 top (see [Managing servers](#managing-servers)) and a **⌘K command palette**
@@ -223,8 +231,11 @@ source. Full per-privilege breakdown and the least-privilege (schema-scoped
   lineage comparison; monitoring both would double-index the same changes.
   Detection needs `gtid_mode=ON`; in position mode the check is skipped.
 - With `--metrics-addr`, the daemon serves one Prometheus `/metrics` endpoint
-  for all supervised streams; every series carries a `source` label set to
-  the entry ID (see [streaming.md](streaming.md)).
+  for all supervised streams; every stream series carries a `source` label set
+  to the entry ID (see [streaming.md](streaming.md)). Exception: the capture-loss
+  counter `bintrail_statement_dml_dropped_total` has **no** `source` label, so
+  concurrent streams conflate into one counter — see
+  [observability.md](observability.md).
 - **Archive to S3** (the `Archive to S3` field on a monitored source): set an
   `s3://bucket/prefix/` destination and the daemon's built-in rotation
   **uploads that source's rotated partitions as Parquet before dropping them**,
@@ -246,7 +257,15 @@ source. Full per-privilege breakdown and the least-privilege (schema-scoped
 - Registry fields: `source_dsn` (replication credentials — a secret with the
   same masking/keep-password discipline as the index DSN; `source_dsn: ""`
   clears it), `source_server_id` (0 = derived), `schemas`, `monitor_desired`,
-  `archive_s3` (the bucket above — non-secret, round-trips in the masked DTO).
+  `archive_s3` (the bucket above — non-secret, round-trips in the masked DTO),
+  and per-source TLS: `ssl_mode` / `ssl_ca` / `ssl_cert` / `ssl_key` (same
+  semantics as `bintrail stream`'s `--ssl-*` flags — see
+  [streaming.md → TLS/SSL for managed MySQL](streaming.md#tlsssl-for-managed-mysql-rds-aurora-cloud-sql)).
+  Setting these in the registry is the only way to get `verify-ca` / mutual
+  TLS on a "+ Add server" source; an empty `ssl_mode` means the default
+  `preferred` (opportunistic, no certificate verification).
+  `ssl_ca`/`ssl_cert`/`ssl_key` are certificate/key file paths **on the
+  daemon host**, not secrets.
 
 The standalone read-only `bintrail-console serve` never offers any of this:
 the `monitor` capability is false and the verbs return 403 there.
@@ -467,7 +486,9 @@ A running server accepts it on the next login — no restart needed.
   credential).
 - Login, setup, and password-change are throttled (per-IP 5 failures/min and
   20/15 min, 30/min globally, `Retry-After` on 429) and bcrypt-verified in
-  constant time with no username enumeration. There is no lockout — locking
+  constant time with no username enumeration. Loopback peers are exempt from
+  the **global** window only — the deliberate no-self-DoS guarantee for the
+  on-host operator; the per-IP windows still apply. There is no lockout — locking
   the single user out would hand an attacker a denial-of-service against the
   operator.
 - **Rotate or reset:** from the UI (⌘K → "Change console password", revokes
@@ -511,8 +532,14 @@ itself:
   `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`.
 - **Brute-force throttling** on the two bcrypt-verifying endpoints (login and
   change-password), counting failures per client IP plus a global window.
-  `X-Forwarded-For` is never trusted; behind a reverse proxy all clients share
-  one bucket — rate-limit at the proxy if that matters to you.
+  Loopback socket peers are exempt from the **global** window only (per-IP
+  windows still apply), so a remote attacker can never rate-limit the on-host
+  operator out. The exemption keys on the real socket peer —
+  `X-Forwarded-For` / `X-Real-IP` are never trusted — so it cannot be spoofed
+  remotely. Consequence: behind a same-host reverse proxy the socket peer *is*
+  loopback, so the global 30/min backstop does not apply and only the per-IP
+  buckets throttle — and all proxied clients share that one bucket; rate-limit
+  at the proxy if that matters to you.
 - **Result caps.** Every query is bounded — events default 100 (max 1000),
   recover default 1000 (max 10000). Never unlimited.
 - **Unauthenticated endpoints**: `/api/healthz` (liveness), `GET /api/auth`

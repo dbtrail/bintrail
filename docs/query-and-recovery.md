@@ -401,6 +401,8 @@ The recovery output is a self-contained SQL script:
 -- IMPORTANT: Review carefully before applying to production.
 
 BEGIN;
+SET time_zone = '+00:00';
+SET sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION';
 
 -- [47] reverse DELETE on mydb.orders pk=42 at 2026-02-19 14:03:00 gtid=3e11fa47-...:99
 INSERT INTO `mydb`.`orders` (`id`, `status`, `created_at`) VALUES (42, 'draft', '2026-02-19 14:01:00');
@@ -416,7 +418,7 @@ Key properties:
 - Comments before each statement showing the original event ID, type, table, PK, timestamp, and GTID.
 - **Per-event generation errors refuse the whole script.** If any event cannot be reversed — e.g. a malformed or truncated stored row image leaves `row_before`/`row_after` `NULL` — `recover` fails loud: it writes nothing and exits non-zero (with `--output`, the target file is left empty), and the error names every un-generatable event. It does **not** emit the rest as a runnable script with the failed events demoted to `-- ERROR ...` comments — a SQL comment has no apply-time effect, so a partial script would commit clean under `BEGIN`/`COMMIT` and silently deliver an *incomplete* reversal. **Schema drift** is the same: if a statement references a column dropped or renamed after the event, `recover` refuses up front rather than emitting SQL that would fail at apply time. Always check the exit code before applying a generated file.
 - **Never auto-executed**: dbtrail only generates the file. Applying it is always a manual step.
-- `bintrail` (MySQL) pins the apply session to `SET time_zone = '+00:00'` before the reversal statements, since TIMESTAMP/DATETIME literals in the script are rendered from the captured UTC value with no explicit zone marker — without the pin, a target session in a non-UTC `time_zone` would reinterpret them and reintroduce a shift. `bintrail-pg` (PostgreSQL) pins `standard_conforming_strings = on` for the same reason (its string-escaping assumes it). Neither pins anything else about the apply session — see [Restore limitations](#restore-limitations-mysql) below for what is **not** pinned or restored.
+- `bintrail` (MySQL) pins the apply session before the reversal statements: `SET time_zone = '+00:00'` (TIMESTAMP/DATETIME literals in the script are rendered from the captured UTC value with no explicit zone marker — without the pin, a target session in a non-UTC `time_zone` would reinterpret them and reintroduce a shift) and `SET sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'` — permissive where the script's own encoding needs it (no `NO_BACKSLASH_ESCAPES`, so the backslash-escaped string literals parse as written; no zero-date rules, so captured `0000-00-00` values apply verbatim) while keeping strict truncation/out-of-range checks, so a captured value that no longer fits a since-narrowed column fails loud instead of being silently coerced. `bintrail-pg` (PostgreSQL) pins `standard_conforming_strings = on` for the same reason (its string-escaping assumes it). Beyond these, nothing else about the apply session is pinned — see [Restore limitations](#restore-limitations-mysql) below for what is **not** pinned or restored.
 
 ## Restore limitations (MySQL)
 

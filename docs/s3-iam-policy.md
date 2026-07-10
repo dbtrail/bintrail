@@ -18,7 +18,8 @@ tuning.
         "s3:PutObject",
         "s3:GetObject",
         "s3:ListBucket",
-        "s3:DeleteObject"
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload"
       ],
       "Resource": [
         "arn:aws:s3:::my-bucket",
@@ -37,16 +38,18 @@ everything inside it). If your account isn't in the standard `aws` partition
 `bintrail init --s3-bucket <bucket>` prints this exact policy for you (with
 the partition already filled in) if it can't create/configure the bucket
 itself — so if you've already run that, you don't need to write this by
-hand.
+hand. Policies attached before `s3:AbortMultipartUpload` was added are still
+safe; add that action per the table below.
 
 ## What each permission is for
 
 | Action | Used by |
 |---|---|
-| `s3:PutObject` | `bintrail rotate --archive-s3`, `bintrail baseline --upload`, `bintrail upload` — writing Parquet archives/baselines to the bucket |
+| `s3:PutObject` | `bintrail rotate --archive-s3`, `bintrail baseline --upload`, `bintrail upload` — writing Parquet archives/baselines to the bucket. Large files stream as S3 multipart uploads, and the `CreateMultipartUpload`/`UploadPart`/`CompleteMultipartUpload` calls are all authorized by `s3:PutObject` — successful uploads of any size need nothing extra |
 | `s3:GetObject` | `bintrail query`/`recover --archive-s3`, `--baseline-s3`/`reconstruct` reads, and the `HeadObject` existence check `bintrail upload --retry` issues (S3 authorizes `HeadObject` under `s3:GetObject` — there's no separate `s3:HeadObject` action) |
 | `s3:ListBucket` | Enumerating archived partitions/baseline snapshots (`ListObjectsV2`), and the bucket-reachability check (`HeadBucket`) `bintrail init --s3-bucket` and `bintrail rotate` run |
 | `s3:DeleteObject` | Removing superseded archives during `archive reconcile --repair --prune`, and baseline upload's own cleanup of its in-progress marker. Optional but recommended — omit it if you'd rather archives/baselines only ever be deleted manually |
+| `s3:AbortMultipartUpload` | Cleaning up after a **failed or interrupted** large upload: the SDK automatically aborts the in-progress multipart upload, and without this permission that abort is `AccessDenied` — the orphaned parts stay in the bucket, invisible in listings but billed as storage. Never used on the success path. Pair it with an [`AbortIncompleteMultipartUpload` lifecycle rule](deployment.md#s3-archive-bucket-abort-orphaned-multipart-uploads) on the bucket as the backstop for uploads that die before the abort can run (crash, `SIGKILL`) |
 
 ## One thing this policy deliberately leaves out
 

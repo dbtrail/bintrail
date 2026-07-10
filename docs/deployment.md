@@ -431,6 +431,11 @@ the archive bucket to reap them automatically:
 }
 ```
 
+Additionally, grant `s3:AbortMultipartUpload` in the bucket IAM policy (see
+[s3-iam-policy.md](s3-iam-policy.md)) so the SDK can abort a failed multipart
+upload immediately when the process survives the failure; the lifecycle rule
+remains the backstop for uploads the process didn't get to clean up.
+
 ## 9. Security
 
 ### Credential management
@@ -476,7 +481,9 @@ When you run `ALTER TABLE` on the source:
    ```
 3. No stream restart is needed. The new snapshot is used for all subsequent queries and recovery.
 
-> **Note:** dbtrail logs a `column count mismatch` warning for events on a changed table until the snapshot is updated. Those events are skipped — they are not indexed. Take the snapshot promptly after DDL changes.
+> **Note:** during streaming, dbtrail logs a `column count mismatch` warning for events on a changed table until the snapshot is updated. Those events are skipped — they are not indexed. Take the snapshot promptly after DDL changes.
+>
+> During file-based indexing, `bintrail index` instead **fails loud**: when rows for a snapshot-eligible table are skipped (table absent from the snapshot, or diverging column count) and the event is at-or-after the snapshot time, the file errors with `schema gap: … the schema snapshot is stale` and is marked `failed` rather than silently completing with a gap. Remediation: re-run `bintrail snapshot`, then `bintrail index --all` — a failed file re-indexes from the start. Snapshot-excluded system schemas (`information_schema`, `performance_schema`, `mysql`, `sys` — e.g. `mysql.rds_heartbeat2` on RDS binlogs) stay warn-and-skip and never fail the file.
 
 ## 11. Backup and Recovery
 
@@ -570,7 +577,7 @@ If `stream_state` is empty (fresh install or lost), provide `--start-gtid` expli
 
 ### "column count mismatch" warnings
 
-Expected after `ALTER TABLE`. Run `bintrail snapshot` to update the schema. Events for that table are skipped until the snapshot is updated.
+Expected after `ALTER TABLE`. Run `bintrail snapshot` to update the schema. During streaming, events for that table are skipped (warn-and-skip) until the snapshot is updated. File-based `bintrail index` instead fails loud with `schema gap: … the schema snapshot is stale` and marks the file `failed` — see the note in [Schema Change Workflow](#10-schema-change-workflow).
 
 ### GTID gaps / duplicate server-id
 

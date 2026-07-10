@@ -14,8 +14,11 @@ bintrail stream --metrics-addr :9090 --index-dsn ... --source-dsn ... --server-i
 Under `bintrail-console watch` the daemon serves one `/metrics` endpoint for
 every monitored source; the per-source `source` label keeps them distinct.
 
-Every metric carries a `source` label (the supervisor's entry ID when
-monitored, else the resolved `bintrail_id`, or `default`).
+Every stream and index metric carries a `source` label (the supervisor's entry
+ID when monitored, else the resolved `bintrail_id`, or `default`). The one
+exception is the top-level capture-loss counter
+[`bintrail_statement_dml_dropped_total`](#capture-loss-bintrail_statement_dml_dropped_total),
+which has no `source` label.
 
 ## Stream metrics (`bintrail_stream_*`)
 
@@ -31,6 +34,26 @@ The live pipeline — emitted on the hot path as events flow.
 | `bintrail_stream_replication_lag_seconds` | gauge | Now minus the last processed event timestamp |
 | `bintrail_stream_errors_total` | counter | Errors, by `type` |
 | `bintrail_stream_batch_size` | histogram | Events per INSERT batch |
+
+## Capture loss (`bintrail_statement_dml_dropped_total`)
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `bintrail_statement_dml_dropped_total` | counter | DML statements (INSERT/UPDATE/DELETE/REPLACE/LOAD DATA) seen in the binlog as SQL text instead of row events — the signature of `binlog_format=STATEMENT`/`MIXED` or a session-level override away from ROW. Each one is a change bintrail could **not** capture. |
+
+**Nonzero means changes are being missed.** bintrail validates
+`binlog_format=ROW` at startup against the global value, but the variable is
+session-settable and MIXED falls back to STATEMENT for non-deterministic DML.
+The stream is not aborted — each dropped statement emits a loud warning
+(`statement-format DML in binlog — event NOT captured …`) plus one increment
+of this counter.
+
+This counter is deliberately **top-level**: it is not part of
+`bintrail_stream_*` and carries **no `source` label**, so under
+`bintrail-console watch` concurrent streams conflate into one counter. The
+paired warning carries the binlog file/position (and the statement type —
+never the SQL text, which embeds row values); use the log line to tell which
+source produced the drop.
 
 ## Index metrics (`bintrail_index_*`)
 
@@ -75,6 +98,13 @@ bintrail_index_retention_horizon_seconds < 7 * 24 * 3600
 
 ```promql
 bintrail_index_gap_hours > 0
+```
+
+**Changes slipping past capture** — statement-format DML the index will never
+contain (see [Capture loss](#capture-loss-bintrail_statement_dml_dropped_total)):
+
+```promql
+rate(bintrail_statement_dml_dropped_total[5m]) > 0
 ```
 
 **Index disk growth** — MySQL index size trend, to project a disk-full date
