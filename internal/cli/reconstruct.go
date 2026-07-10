@@ -301,13 +301,16 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	// above, before the DB is ever opened, so it never reaches these warns.
 	if pgReconstructBeta(query.SourceFlavor(db), bmeta.LSN) {
 		slog.Warn("single-row reconstruct for a PostgreSQL source: scalar types (including timestamptz/timestamp/date/time, float, bytea, interval — rendered under session GUCs pinned identically at capture and baseline) are validated end-to-end; container types (arrays beyond integer[]/text[], composite, range/multirange, hstore, geometric) remain beta — verify the round-trip before relying on them (#593)")
-		// A pre-pin PG baseline (LSN anchor present but no rendering-GUC
-		// stamp) was rendered under the server's session defaults; on a server
-		// whose defaults differ from the pin, its GUC-sensitive text will not
-		// join post-pin deltas — the merge is an exact text join. Warn with
-		// the remediation.
-		if bmeta.LSN != 0 && bmeta.RenderGUCs == "" {
-			slog.Warn("this baseline predates rendering-GUC pinning (#593) — on a server whose TimeZone/DateStyle/extra_float_digits/bytea_output/IntervalStyle defaults differ from the pinned values, its GUC-sensitive text will not match newer deltas; re-run `bintrail-pg baseline` to refresh it")
+		// A PG baseline whose rendering-GUC stamp is absent (pre-pin, rendered
+		// under the server's session defaults) OR different from the current
+		// pin was rendered under other GUCs; on a server whose defaults differ
+		// from the pin, its GUC-sensitive text will not join post-pin deltas —
+		// the merge is an exact text join. Warn with the remediation.
+		// (Comparing the VALUE, not mere presence, also catches a baseline
+		// produced by a binary with a different pinned set.)
+		if bmeta.LSN != 0 && bmeta.RenderGUCs != baseline.RenderGUCsPinned {
+			slog.Warn("this baseline's rendering-GUC stamp does not match the current pin (#593) — it predates GUC pinning or was produced under a different pin; on a server whose TimeZone/DateStyle/extra_float_digits/bytea_output/IntervalStyle defaults differ from the pinned values, its GUC-sensitive text will not match newer deltas; re-run `bintrail-pg baseline` to refresh it",
+				"baseline_render_gucs", bmeta.RenderGUCs)
 		}
 	}
 

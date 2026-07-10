@@ -143,17 +143,23 @@ func TestOne_PGTypeMatrixThroughReconstructFold(t *testing.T) {
 		"extra_float_digits": "0",
 		"bytea_output":       "'escape'",
 	}
+	// The RESET cleanup is registered BEFORE the skew loop: if an ALTER fails
+	// mid-loop (t.Fatalf), the already-applied skews still get reset rather
+	// than leaking database-level defaults into later tests of this `go test`
+	// invocation (-p 1 runs pgbaseline's package after this one).
+	t.Cleanup(func() {
+		bg := context.Background()
+		for k := range skews {
+			if _, err := pg.Exec(bg, fmt.Sprintf("ALTER DATABASE %s RESET %s", dbIdent, k)); err != nil {
+				t.Logf("skew cleanup: RESET %s failed: %v", k, err)
+			}
+		}
+	})
 	for k, v := range skews {
 		if _, err := pg.Exec(ctx, fmt.Sprintf("ALTER DATABASE %s SET %s TO %s", dbIdent, k, v)); err != nil {
 			t.Fatalf("skew %s: %v", k, err)
 		}
 	}
-	t.Cleanup(func() {
-		bg := context.Background()
-		for k := range skews {
-			_, _ = pg.Exec(bg, fmt.Sprintf("ALTER DATABASE %s RESET %s", dbIdent, k))
-		}
-	})
 
 	dropAll := func() {
 		bg := context.Background()

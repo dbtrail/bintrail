@@ -51,11 +51,24 @@ var renderGUCList = [5]struct{ name, value string }{
 // unpinned or differently-pinned rendering session is exactly the text-
 // mismatch corruption class this exists to kill; the override is logged).
 // params must be non-nil.
+//
+// The purge below is CASE-INSENSITIVE on purpose: PostgreSQL GUC names are
+// case-insensitive but Go map keys are not, so an operator DSN carrying
+// `?timezone=...` lands under a DIFFERENT map key than the pinned "TimeZone".
+// Both would then reach the startup packet in random map-iteration order, and
+// the server applies them last-writer-wins at equal source priority — leaving
+// roughly half of all connections silently unpinned, per connection. Every
+// case-variant of a pinned key is deleted before the pin is inserted.
 func PinRenderGUCs(params map[string]string) {
 	for _, g := range renderGUCList {
-		if old, ok := params[g.name]; ok && old != g.value {
-			slog.Debug("pgcapture: overriding operator-supplied rendering GUC with the pinned value",
-				"guc", g.name, "operator", old, "pinned", g.value)
+		for k, old := range params {
+			if strings.EqualFold(k, g.name) {
+				if old != g.value {
+					slog.Debug("pgcapture: overriding operator-supplied rendering GUC with the pinned value",
+						"guc", k, "operator", old, "pinned", g.value)
+				}
+				delete(params, k)
+			}
 		}
 		params[g.name] = g.value
 	}

@@ -348,7 +348,13 @@ directly.
 > round-trip. **Re-baseline after upgrading:** baselines taken before the
 > rendering-GUC pin were rendered under your server's session defaults; on a
 > server whose defaults differ from the pinned values, re-run
-> `bintrail-pg baseline` — the baseline↔delta merge is an exact text join.
+> `bintrail-pg baseline` — the baseline↔delta merge is an exact text join
+> (the reader warns when it meets a pre-pin baseline). Events indexed
+> **before** the upgrade also keep their pre-pin rendering: on such a server a
+> GUC-sensitive primary key (`timestamptz`, `float`) has two text identities
+> across the upgrade, so `--pk` lookups and `--history` can split there;
+> re-baselining resolves this going forward (deltas before the new anchor are
+> not replayed).
 > **Full-table** `reconstruct` (`--output-format mydumper`) and
 > baseline-anchored `verify` remain deliberately out of scope: a PG baseline
 > does not carry the `CREATE TABLE` metadata full-table reconstruct needs.

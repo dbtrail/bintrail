@@ -73,6 +73,15 @@ const (
 	MetaKeyRenderGUCs = "bintrail.render_gucs"
 )
 
+// RenderGUCsPinned is the canonical value the capture side stamps under
+// MetaKeyRenderGUCs (pgcapture.RenderGUCsStamp builds it from its pinned GUC
+// list; the two are cross-pinned by pgcapture's unit test). It lives here so
+// the READ layer can compare a baseline's stamp against the current pin
+// without importing pgcapture (which would link pgx into the MySQL binary).
+// A stamp that is absent OR different means the baseline's GUC-sensitive text
+// may not join deltas rendered under the current pin.
+const RenderGUCsPinned = "TimeZone=UTC;DateStyle=ISO;extra_float_digits=3;bytea_output=hex;IntervalStyle=postgres"
+
 // DumpMetadata contains information parsed from a mydumper metadata file or
 // from a baseline Parquet file's key-value metadata.
 type DumpMetadata struct {
