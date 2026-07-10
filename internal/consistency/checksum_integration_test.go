@@ -400,3 +400,141 @@ func TestConsistentTableChecksum_CapturesGTIDWhenEnabled(t *testing.T) {
 		t.Error("gtid_mode=ON but GTIDSet is empty")
 	}
 }
+
+// ─── MariaDB mirrors of the byte-exactness proofs (#620 sweep) ────────────────
+//
+// ConsistentTableChecksum's canonical form is MySQL-text-protocol rendering
+// (see the ConsistentTableChecksum doc comment) — a SQL-level concern, not a
+// binlog-decode one, so these mirror the MySQL byte-exactness assertions
+// against a live MariaDB source to confirm the same SELECT+CAST/binary-pin
+// contract holds there too. TestConsistentTableChecksum_RepresentationOnlyDiffMatches
+// is deliberately NOT mirrored: MariaDB stores JSON as LONGTEXT and renders it
+// verbatim (no server-side normalization, unlike MySQL's native JSON type) —
+// documented at ConsistentTableChecksum's doc comment ("JSON is normalized
+// (MySQL; MariaDB stores JSON as LONGTEXT and renders it verbatim)") and by
+// design mitigated one layer up, in internal/verify's
+// ConsistentTableChecksumNormalized + canonicalizeJSONContainer hook, not in
+// this bare primitive — so asserting digest equality here would fail by
+// design, not by bug.
+
+func TestConsistentTableChecksum_UnsignedHighValuesDiffer_MariaDB(t *testing.T) {
+	db, schema := testutil.CreateTestMariaDB(t)
+	// Same repro as the MySQL sibling: two BIGINT UNSIGNED values above 2^63
+	// differing by 1 must produce different digests (#490 class).
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, big BIGINT UNSIGNED)")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, big BIGINT UNSIGNED)")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, 18446744073709551615)")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, 18446744073709551614)")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest == cb.Digest {
+		t.Errorf("distinct high-unsigned values produced the same digest on MariaDB (UNSIGNED corruption escape): both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_BinaryBytesByteExact_MariaDB(t *testing.T) {
+	db, schema := testutil.CreateTestMariaDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, v VARBINARY(16))")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, v VARBINARY(16))")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, X'610062')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, X'610063')")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest == cb.Digest {
+		t.Errorf("binary values differing only past an embedded NUL produced the same digest on MariaDB (truncation escape): both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_DatetimeMicrosecondsDiffer_MariaDB(t *testing.T) {
+	db, schema := testutil.CreateTestMariaDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, ts DATETIME(6))")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, ts DATETIME(6))")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, '2021-01-01 00:00:00.000001')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, '2021-01-01 00:00:00.000002')")
+
+	ctx := context.Background()
+	ca, _ := ConsistentTableChecksum(ctx, db, schema, "a")
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("DATETIME(6) microsecond difference collapsed on MariaDB: both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_DoubleLastDigitDiffersAndStable_MariaDB(t *testing.T) {
+	db, schema := testutil.CreateTestMariaDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, d DOUBLE)")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, d DOUBLE)")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, 1.0000000000001)")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, 1.0000000000002)")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("DOUBLE last-digit difference collapsed on MariaDB: both %s", ca.Digest)
+	}
+	ca2, _ := ConsistentTableChecksum(ctx, db, schema, "a")
+	if ca.Digest != ca2.Digest {
+		t.Errorf("DOUBLE digest not stable across reads on MariaDB: %s != %s", ca.Digest, ca2.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_MultibyteStringsDiffer_MariaDB(t *testing.T) {
+	db, schema := testutil.CreateTestMariaDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, s VARCHAR(32)) CHARACTER SET utf8mb4")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, s VARCHAR(32)) CHARACTER SET utf8mb4")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, '日本語😀')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, '日本語😁')")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("distinct multibyte strings produced the same digest on MariaDB: both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_Latin1RawBytesNotTranscoded_MariaDB(t *testing.T) {
+	db, schema := testutil.CreateTestMariaDB(t)
+	// #792 class: the scan pins character_set_results = binary, so a latin1
+	// column's stored bytes are hashed RAW, not transcoded to utf8mb4.
+	testutil.MustExec(t, db, "CREATE TABLE lat (id INT PRIMARY KEY, s VARCHAR(8) CHARACTER SET latin1)")
+	testutil.MustExec(t, db, "CREATE TABLE raw (id INT PRIMARY KEY, s VARBINARY(8))")
+	testutil.MustExec(t, db, "INSERT INTO lat VALUES (1, _latin1 X'E9')")
+	testutil.MustExec(t, db, "INSERT INTO raw VALUES (1, X'E9')")
+
+	ctx := context.Background()
+	cl, err := ConsistentTableChecksum(ctx, db, schema, "lat")
+	if err != nil {
+		t.Fatalf("checksum lat: %v", err)
+	}
+	cr, err := ConsistentTableChecksum(ctx, db, schema, "raw")
+	if err != nil {
+		t.Fatalf("checksum raw: %v", err)
+	}
+	if cl.Digest != cr.Digest {
+		t.Errorf("latin1 byte was transcoded on MariaDB (charset pin not applied): latin1=%s raw=%s", cl.Digest, cr.Digest)
+	}
+}

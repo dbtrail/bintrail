@@ -352,13 +352,17 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	events, _, err := query.FetchMerged(cmd.Context(), db, engine, query.FetchMergedOptions{
+	// FetchEventsAtomic (not a plain query.FetchMerged) cuts the `--at` upper
+	// bound at the transaction boundary, not the row: a multi-statement
+	// transaction straddling `at` is excluded whole rather than half-applied
+	// (#783).
+	events, _, err := reconstruct.FetchEventsAtomic(cmd.Context(), db, engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         dbName,
 		NoArchive:      recNoArchive,
 		AllowGaps:      recAllowGaps,
 		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
-	})
+	}, at)
 	if err != nil {
 		// Surface CLI hints only at the CLI layer; the library types
 		// (query.GapError, query.SourceEmptyError) stay command-neutral.
