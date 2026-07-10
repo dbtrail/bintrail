@@ -86,6 +86,64 @@ func TestFetchEventsAtomic_splitTransactionExcludedWhole(t *testing.T) {
 	}
 }
 
+// TestFetchEventsAtomic_fractionalAtTruncatesToSecond pins the lookahead
+// probe's lower bound: it must use `at.Truncate(time.Second).Add(time.Second)`,
+// not `at.Add(time.Second)`. The index stores DATETIME(0) (whole seconds
+// only), so with a fractional `at` (12:00:00.5) and the continuation event
+// stored at exactly floor(at)+1 (12:00:01), `at.Add(1s)` would probe from
+// 12:00:01.5 — strictly AFTER the stored continuation — and wrongly report
+// "no continuation found", leaving the straddling transaction half-applied
+// (the exact bug #783 fixes). Only the truncated bound (12:00:01) catches it.
+func TestFetchEventsAtomic_fractionalAtTruncatesToSecond(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	const schema, table, pk = "shop", "orders", "1"
+	gtid := "3e11fa47-71ca-11e1-9e33-c80aa9429562:300"
+
+	snapshotTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	t1 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 1, 1, 12, 0, 1, 0, time.UTC)           // floor(at)+1, exactly
+	at := time.Date(2026, 1, 1, 12, 0, 0, 500_000_000, time.UTC) // fractional: 12:00:00.5
+
+	rowBefore1 := []byte(`{"id":1,"status":"new"}`)
+	rowAfter1 := []byte(`{"id":1,"status":"processing"}`)
+	rowBefore2 := []byte(`{"id":1,"status":"processing"}`)
+	rowAfter2 := []byte(`{"id":1,"status":"shipped"}`)
+
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200,
+		t1.Format("2006-01-02 15:04:05"), &gtid,
+		schema, table, uint8(event.EventUpdate), pk,
+		nil, rowBefore1, rowAfter1)
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300,
+		t2.Format("2006-01-02 15:04:05"), &gtid,
+		schema, table, uint8(event.EventUpdate), pk,
+		nil, rowBefore2, rowAfter2)
+
+	baselineState := map[string]any{"id": float64(1), "status": "new"}
+	engine := query.New(db)
+	opts := query.Options{
+		Schema:   schema,
+		Table:    table,
+		PKValues: pk,
+		Since:    &snapshotTime,
+		Until:    &at,
+	}
+	fm := query.FetchMergedOptions{Opts: opts, NoArchive: true, AllowGaps: true}
+
+	events, _, err := FetchEventsAtomic(context.Background(), db, engine, fm, at)
+	if err != nil {
+		t.Fatalf("FetchEventsAtomic: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("fractional `at`: want the straddling transaction fully excluded (0 events), got %d — the lookahead probe's lower bound is not truncating to the second correctly", len(events))
+	}
+	state := mustApplyAt(t, baselineState, events, at)
+	if state["status"] != "new" {
+		t.Errorf("fractional `at`: reconstructed state = %v, want %q", state["status"], "new")
+	}
+}
+
 // TestFetchEventsAtomic_completedTransactionIncludedWhole is the regression
 // guard: a transaction whose statements ALL execute at-or-before `at` must
 // still be included in full — the fix must not over-trigger and drop
