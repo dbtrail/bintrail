@@ -263,13 +263,25 @@ func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]arch
 	// into DeepUnverified. A failed open degrades exactly like a failed probe:
 	// row counts stay unset (warned) and the decision layer counts each object
 	// deep-unverified (#469) — the scan itself still completes.
+	//
+	// The chain secret resolves credentials at CREATE time, not per request
+	// (duckdbutil.EnableS3CredentialChain's docs explicitly warn against
+	// reusing it on a long-lived session under expiring roles). A large scan
+	// (thousands of hourly objects, 15-45min) can outlive an IMDS/STS role's
+	// credential lifetime, so the secret is re-issued periodically
+	// (s3FooterSecretRefreshInterval) instead of being frozen for the whole
+	// session — otherwise every remaining probe would 403 once the original
+	// credentials expire, degrading into the exact DeepUnverified symptom
+	// #807 was filed to fix.
 	var footerDB *sql.DB
+	var secretIssuedAt time.Time
 	if deep {
 		fdb, err := openS3FooterSession(ctx, cfg.Region)
 		if err != nil {
 			slog.Warn("reconcile: cannot open DuckDB session for --deep footer reads; row counts left unset", "error", err)
 		} else {
 			footerDB = fdb
+			secretIssuedAt = time.Now()
 			defer footerDB.Close()
 		}
 	}
@@ -303,6 +315,10 @@ func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]arch
 				f.LastModified = obj.LastModified.UTC()
 			}
 			if deep && footerDB != nil {
+				if dueForS3SecretRefresh(secretIssuedAt, time.Now(), s3FooterSecretRefreshInterval) {
+					duckdbutil.EnableS3CredentialChainRegion(ctx, footerDB, cfg.Region)
+					secretIssuedAt = time.Now()
+				}
 				if n, err := duckdbParquetRowCount(ctx, footerDB, "s3://"+bucket+"/"+*obj.Key); err == nil {
 					f.RowCount = sql.NullInt64{Int64: n, Valid: true}
 				} else {
@@ -320,11 +336,29 @@ func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]arch
 	return out, nil
 }
 
+// s3FooterSecretRefreshInterval bounds how long the shared --deep session's
+// AWS credential-chain secret is trusted before being re-issued. Chosen well
+// under the shortest common STS/IMDS credential lifetime (IMDS role
+// credentials ~6h, default STS session minimum 15min) so a rotation mid-scan
+// is caught before the original credentials expire — assuming the chain was
+// resolved from a session with at least that much life left when the scan
+// started; a knob, not a hard guarantee for every possible role config.
+var s3FooterSecretRefreshInterval = 10 * time.Minute
+
+// dueForS3SecretRefresh reports whether the shared footer session's
+// credential-chain secret, last (re)issued at last, is due for re-issuing at
+// now given interval. Split out from the scan loop so the threshold logic is
+// testable without a live DuckDB/AWS session.
+func dueForS3SecretRefresh(last, now time.Time, interval time.Duration) bool {
+	return !now.Before(last.Add(interval))
+}
+
 // openS3FooterSession opens the DuckDB session shared by all --deep S3 footer
 // probes of one scan: httpfs loaded and the credential-chain secret created
 // with the scan's region pinned (duckdbutil.EnableS3CredentialChainRegion,
 // #511 — the chain otherwise resolves region from the AWS SDK config, not the
-// bucket, and a mismatch 301s every probe).
+// bucket, and a mismatch 301s every probe). The scan loop re-issues the same
+// secret periodically (dueForS3SecretRefresh) as credentials age.
 func openS3FooterSession(ctx context.Context, region string) (*sql.DB, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {

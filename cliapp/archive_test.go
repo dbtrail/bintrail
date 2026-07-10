@@ -9,8 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/archive"
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 )
 
 // TestReconcileDryRunErrFlagsDeepUnverified pins #469: a --deep dry-run with
@@ -217,5 +219,72 @@ func TestOpenS3FooterSessionRegionPin(t *testing.T) {
 	}
 	if !strings.Contains(secretStr, "region=eu-west-1") {
 		t.Fatalf("chain secret does not carry the pinned region; got %q", secretStr)
+	}
+}
+
+// TestDueForS3SecretRefresh pins the follow-up to #807: the shared --deep
+// footer session's credential-chain secret must not be frozen for the whole
+// scan (duckdbutil.EnableS3CredentialChain explicitly warns it resolves
+// credentials at CREATE time, not per request), or an expiring IMDS/STS role
+// 403s every remaining probe partway through a long scan — the same
+// DeepUnverified symptom #807 was filed to fix.
+func TestDueForS3SecretRefresh(t *testing.T) {
+	last := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	interval := 10 * time.Minute
+
+	cases := []struct {
+		name string
+		now  time.Time
+		want bool
+	}{
+		{"just issued", last, false},
+		{"well within interval", last.Add(5 * time.Minute), false},
+		{"one second before due", last.Add(interval - time.Second), false},
+		{"exactly at interval", last.Add(interval), true},
+		{"well past interval", last.Add(45 * time.Minute), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := dueForS3SecretRefresh(last, c.now, interval); got != c.want {
+				t.Errorf("dueForS3SecretRefresh(%v, %v, %v) = %v, want %v", last, c.now, interval, got, c.want)
+			}
+		})
+	}
+}
+
+// TestS3FooterSessionSecretReissue pins the mechanism the #807 follow-up
+// relies on: re-issuing the credential-chain secret on an ALREADY-OPEN shared
+// session (not a fresh one) must succeed and leave the session usable, so a
+// long --deep scan can pick up rotated credentials mid-scan the same way the
+// pre-#807 per-object sessions did.
+func TestS3FooterSessionSecretReissue(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "<redacted>")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "testdummysecret")
+	t.Setenv("BINTRAIL_DUCKDB_NO_AWS_EXT", "")
+
+	db, err := openS3FooterSession(context.Background(), "eu-west-1")
+	if err != nil {
+		t.Skipf("httpfs unavailable (offline host?): %v", err)
+	}
+	defer db.Close()
+
+	var loaded bool
+	if err := db.QueryRow("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'aws'").Scan(&loaded); err != nil || !loaded {
+		t.Skip("aws extension unavailable (offline host) — secret reissue not exercised")
+	}
+
+	// Simulate the scan loop's periodic refresh on the SAME session.
+	duckdbutil.EnableS3CredentialChainRegion(context.Background(), db, "eu-west-1")
+
+	var one int
+	if err := db.QueryRow("SELECT 1").Scan(&one); err != nil || one != 1 {
+		t.Fatalf("session unusable after re-issuing the secret: %v (got %d)", err, one)
+	}
+	var secretStr string
+	if err := db.QueryRow("SELECT secret_string FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&secretStr); err != nil {
+		t.Fatalf("chain secret missing after re-issue: %v", err)
+	}
+	if !strings.Contains(secretStr, "region=eu-west-1") {
+		t.Fatalf("re-issued chain secret does not carry the pinned region; got %q", secretStr)
 	}
 }
