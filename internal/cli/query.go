@@ -21,7 +21,6 @@ import (
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
-	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -243,42 +242,43 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("schema migration: %w", err)
 	}
 
-	// ── Re-encode single-column --pk/--pks against the at-rest pk_values form ──
+	// ── Re-encode --pk/--pks against the at-rest pk_values form ────────────────
 	// (#957) binlog_events.pk_values is stored PIPE/BACKSLASH-ESCAPED
 	// (event.BuildPKValues escapes each PK component before joining with "|"),
-	// but --pk/--pks bind the raw flag value straight through. For a composite
-	// PK, the raw string's own "|" IS the user-typed delimiter between
-	// components (see the command's documented "--pk '12345|2'" usage) —
-	// escaping the whole string would corrupt that delimiter. It is only safe
-	// to escape the ENTIRE value when the target table's PK has exactly ONE
-	// column, because then the whole flag value IS that one component, with no
-	// delimiter ambiguity. 2+ column PKs with a literal pipe/backslash inside a
-	// component are left unescaped (unexpressible via today's single-flag
-	// syntax; out of scope here). The resolver load is best-effort (as
-	// elsewhere in this codebase) and gated on --pk/--pks actually being set,
-	// so a plain query without a PK filter never pays a snapshot lookup.
-	if qPK != "" || len(qPKs) > 0 {
-		resolver, rerr := metadata.NewResolver(db, 0) // 0 = latest snapshot
-		if rerr != nil {
-			slog.Warn("could not load schema snapshot; --pk/--pks with a literal pipe or backslash may not match", "error", rerr)
-			resolver = nil
+	// but --pk/--pks bind the raw flag value straight through. A value
+	// containing a literal "|"/"\" is ambiguous without knowing the live
+	// table's actual PK column count: it could be the user-typed delimiter
+	// between components of a composite PK (see the documented
+	// "--pk '12345|2'" usage — the raw, unescaped form is what's stored), or
+	// a literal character inside a single-column PK (the escaped form is
+	// what's stored). An earlier revision of this fix resolved that
+	// ambiguity from a schema_snapshots resolve, but a snapshot can be stale
+	// relative to the live table (e.g. an ALTER TABLE widened/narrowed the PK
+	// and no `bintrail snapshot` re-run happened yet since) — trusting it can
+	// silently corrupt a previously-correct composite lookup. Instead, match
+	// BOTH candidate encodings whenever escaping would actually change the
+	// value: event.EscapePKValue is a no-op unless the value contains "|" or
+	// "\", so the overwhelming common case (plain numeric/text PKs) emits the
+	// exact same query as before this feature existed — no snapshot lookup,
+	// no extra WHERE clause, and the pk_hash-indexed fast path stays intact.
+	// qPKs (the --pks labels) are deliberately left as the user's literal
+	// input: writeGroupedJSON matches each label against both its raw and
+	// escaped forms, so the "pk" field in grouped JSON output always echoes
+	// back what the user typed.
+	if opts.PKValues != "" {
+		if esc := event.EscapePKValue(opts.PKValues); esc != opts.PKValues {
+			opts.PKValuesAlt = esc
 		}
-		if resolver != nil {
-			if tm, terr := resolver.Resolve(qSchema, qTable); terr == nil && len(tm.PKColumnMetas()) == 1 {
-				if opts.PKValues != "" {
-					opts.PKValues = event.EscapePKValue(opts.PKValues)
-				}
-				for i, v := range opts.PKValuesIn {
-					opts.PKValuesIn[i] = event.EscapePKValue(v)
-				}
-				// writeGroupedJSON (the --pks --format json path) groups
-				// results by the raw qPKs, matched against each row's stored
-				// (escaped) pk_values — keep it in sync so a single-column
-				// PK containing a literal pipe/backslash still groups
-				// correctly instead of silently dropping out of every group.
-				qPKs = opts.PKValuesIn
+	}
+	if len(opts.PKValuesIn) > 0 {
+		expanded := make([]string, 0, len(opts.PKValuesIn))
+		for _, v := range opts.PKValuesIn {
+			expanded = append(expanded, v)
+			if esc := event.EscapePKValue(v); esc != v {
+				expanded = append(expanded, esc)
 			}
 		}
+		opts.PKValuesIn = expanded
 	}
 
 	if qProfile != "" {
@@ -622,9 +622,14 @@ func writeGroupedJSON(pks []string, rows []query.ResultRow, w io.Writer) (int, e
 	groups := make([]group, 0, len(pks))
 	total := 0
 	for _, pk := range pks {
-		evs := byPK[pk]
-		if evs == nil {
-			evs = []groupedEvent{}
+		// A row's stored pk_values may be the raw label (composite PK, or a
+		// single-column PK whose value needs no escaping) or its
+		// event.EscapePKValue form (single-column PK with a literal "|"/"\",
+		// #957) — match both, but always report the group under the user's
+		// literal --pks input.
+		evs := append([]groupedEvent{}, byPK[pk]...)
+		if esc := event.EscapePKValue(pk); esc != pk {
+			evs = append(evs, byPK[esc]...)
 		}
 		groups = append(groups, group{PK: pk, Events: evs})
 		total += len(evs)

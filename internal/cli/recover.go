@@ -268,27 +268,38 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		resolver = nil
 	}
 
-	// ── Re-encode single-column --pk/--pks against the at-rest pk_values form ──
+	// ── Re-encode --pk/--pks against the at-rest pk_values form ────────────────
 	// (#957) binlog_events.pk_values is stored PIPE/BACKSLASH-ESCAPED
 	// (event.BuildPKValues escapes each PK component before joining with "|"),
-	// but --pk/--pks bind the raw flag value straight through. For a composite
-	// PK, the raw string's own "|" IS the user-typed delimiter between
-	// components (see the command's documented "--pk '12345|2'" usage) —
-	// escaping the whole string would corrupt that delimiter. It is only safe
-	// to escape the ENTIRE value when the target table's PK has exactly ONE
-	// column, because then the whole flag value IS that one component, with no
-	// delimiter ambiguity. 2+ column PKs with a literal pipe/backslash inside a
-	// component are left unescaped (unexpressible via today's single-flag
-	// syntax; out of scope here).
-	if resolver != nil && (opts.PKValues != "" || len(opts.PKValuesIn) > 0) {
-		if tm, terr := resolver.Resolve(rSchema, rTable); terr == nil && len(tm.PKColumnMetas()) == 1 {
-			if opts.PKValues != "" {
-				opts.PKValues = event.EscapePKValue(opts.PKValues)
-			}
-			for i, v := range opts.PKValuesIn {
-				opts.PKValuesIn[i] = event.EscapePKValue(v)
+	// but --pk/--pks bind the raw flag value straight through. A value
+	// containing a literal "|"/"\" is ambiguous without knowing the live
+	// table's actual PK column count: it could be the user-typed delimiter
+	// between components of a composite PK (see the documented
+	// "--pk '12345|2'" usage — the raw, unescaped form is what's stored), or
+	// a literal character inside a single-column PK (the escaped form is
+	// what's stored). An earlier revision of this fix resolved that
+	// ambiguity from the schema resolver above, but its snapshot can be stale
+	// relative to the live table (e.g. an ALTER TABLE widened/narrowed the PK
+	// and no `bintrail snapshot` re-run happened yet since) — trusting it can
+	// silently corrupt a previously-correct composite lookup. Instead, match
+	// BOTH candidate encodings whenever escaping would actually change the
+	// value: event.EscapePKValue is a no-op unless the value contains "|" or
+	// "\", so the overwhelming common case (plain numeric/text PKs) emits the
+	// exact same query as before this feature existed.
+	if opts.PKValues != "" {
+		if esc := event.EscapePKValue(opts.PKValues); esc != opts.PKValues {
+			opts.PKValuesAlt = esc
+		}
+	}
+	if len(opts.PKValuesIn) > 0 {
+		expanded := make([]string, 0, len(opts.PKValuesIn))
+		for _, v := range opts.PKValuesIn {
+			expanded = append(expanded, v)
+			if esc := event.EscapePKValue(v); esc != v {
+				expanded = append(expanded, esc)
 			}
 		}
+		opts.PKValuesIn = expanded
 	}
 
 	// ── Fetch events (live + archives) ────────────────────────────────────────

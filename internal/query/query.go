@@ -135,14 +135,24 @@ type BinlogPos struct {
 // Options specifies the filter criteria for querying binlog_events.
 // All fields are optional; nil / zero values are ignored when building SQL.
 type Options struct {
-	Schema     string
-	Table      string
-	PKValues   string           // pipe-delimited PK, e.g. "12345" or "12345|2"
-	PKValuesIn []string         // multi-PK lookup (mutually exclusive with PKValues)
-	EventType  *event.EventType // nil = all types
-	GTID       string
-	Since      *time.Time
-	Until      *time.Time
+	Schema   string
+	Table    string
+	PKValues string // pipe-delimited PK, e.g. "12345" or "12345|2"
+	// PKValuesAlt, when set, is an alternate encoding of PKValues that is
+	// ALSO matched (OR'd) alongside it. (#957) A --pk value containing a
+	// literal "|"/"\" is ambiguous without the live table's actual PK column
+	// count: it could be the user-typed delimiter between components of a
+	// composite PK (PKValues, unescaped, is what's stored) or a literal
+	// character inside a single-column PK (its event.EscapePKValue form is
+	// what's stored). Rather than trust a schema snapshot resolve — which can
+	// be stale relative to the live table — callers set both candidates here
+	// so a stale snapshot never regresses a previously-correct lookup.
+	PKValuesAlt string
+	PKValuesIn  []string         // multi-PK lookup (mutually exclusive with PKValues)
+	EventType   *event.EventType // nil = all types
+	GTID        string
+	Since       *time.Time
+	Until       *time.Time
 	// UntilPos, when set, bounds events to those at-or-before an exact binlog
 	// coordinate (file + end position) — independent of wall-clock time. It is
 	// the precise upper bound for "reconstruct the table to exactly this point"
@@ -337,8 +347,17 @@ func buildQuery(opts Options) (string, []any) {
 	}
 	if opts.PKValues != "" {
 		// Use pk_hash for the index scan; pk_values for the collision guard.
-		where = append(where, "pk_hash = SHA2(?, 256) AND pk_values = ?")
-		args = append(args, opts.PKValues, opts.PKValues)
+		if opts.PKValuesAlt != "" {
+			// Match either candidate encoding (#957) — outer parens are
+			// load-bearing: where-entries are AND-joined by the caller, so an
+			// unparenthesized OR here would silently widen every other filter
+			// (schema/table/time range) into the second branch.
+			where = append(where, "((pk_hash = SHA2(?, 256) AND pk_values = ?) OR (pk_hash = SHA2(?, 256) AND pk_values = ?))")
+			args = append(args, opts.PKValues, opts.PKValues, opts.PKValuesAlt, opts.PKValuesAlt)
+		} else {
+			where = append(where, "pk_hash = SHA2(?, 256) AND pk_values = ?")
+			args = append(args, opts.PKValues, opts.PKValues)
+		}
 	} else if len(opts.PKValuesIn) > 0 {
 		// Multi-PK lookup. The pk_hash generated column index can't help with
 		// IN-lists, so the planner falls back to per-partition scans pruned by
