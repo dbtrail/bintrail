@@ -484,13 +484,17 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		opts.PKValuesIn = []string{encoded}
 	}
 	engine := query.New(h.indexDB)
-	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
+	// FetchEventsAtomic (not a plain query.FetchMerged) cuts the AsOf upper
+	// bound at the transaction boundary, not the row: a multi-statement
+	// transaction straddling AsOf is excluded whole rather than half-applied
+	// (#783).
+	rows, _, err := reconstruct.FetchEventsAtomic(ctx, h.indexDB, engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         h.cfg.IndexDBName,
 		NoArchive:      h.cfg.NoArchive,
 		AllowGaps:      h.cfg.AllowGaps,
 		ArchiveFetcher: h.archiveFetcher,
-	})
+	}, q.AsOf)
 	if err != nil {
 		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}

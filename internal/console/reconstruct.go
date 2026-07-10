@@ -289,13 +289,14 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		Order:    "", // ASC: ApplyAt/BuildHistory require chronological input.
 		Limit:    reconstructMaxEvents + 1,
 	}
-	rows, plan, err := query.FetchMerged(ctx, b.db, b.engine, query.FetchMergedOptions{
+	fmOpts := query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         b.dbName,
 		NoArchive:      b.noArchive,
 		AllowGaps:      allowGaps,
 		ArchiveFetcher: parquetquery.Fetch,
-	})
+	}
+	rows, plan, err := query.FetchMerged(ctx, b.db, b.engine, fmOpts)
 	if err != nil {
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) {
@@ -309,6 +310,15 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	if len(rows) > reconstructMaxEvents {
 		writeJSONError(w, http.StatusUnprocessableEntity,
 			fmt.Sprintf("too many events (>%d) for this row between the baseline and the target time to reconstruct safely; narrow the time or use the offline `bintrail reconstruct`", reconstructMaxEvents))
+		return
+	}
+	// Trim a trailing PARTIAL transaction AFTER the overflow check above, not
+	// before: trimming reduces len(rows), and running it first would let a
+	// window that's genuinely over the cap slip through the >reconstructMaxEvents
+	// check (#783).
+	rows, err = reconstruct.TrimPartialTailTransaction(ctx, b.db, b.engine, fmOpts, rows, atTime)
+	if err != nil {
+		writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 
