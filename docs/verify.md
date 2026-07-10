@@ -120,7 +120,7 @@ diff tool involved.
 | `--source-dsn` | *(empty)* | Live source DSN. Pass it for **live-source** mode; omit for **baseline-anchored** mode |
 | `--baseline-dir` | *(empty)* | Local directory of baseline Parquet snapshots |
 | `--baseline-s3` | *(empty)* | S3 URL prefix of baseline snapshots (e.g. `s3://bucket/baselines/`) |
-| `--tables` | *(all)* | Comma-separated `schema.table` list (default: all tables in the latest schema snapshot) |
+| `--tables` | *(all)* | Comma-separated `schema.table` list (default: all tables in the latest schema snapshot; in baseline-anchored mode, snapshot tables with no baseline report `inconclusive` — "never baselined") |
 | `--no-archive` | `false` | Query live MySQL partitions only; skip Parquet archive discovery |
 | `--explain` | `false` | On a baseline-anchored mismatch, print a per-row drill-down |
 

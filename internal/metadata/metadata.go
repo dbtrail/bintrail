@@ -395,6 +395,24 @@ func (r *Resolver) Tables(schema string) []*TableMeta {
 	return out
 }
 
+// AllTables returns every TableMeta in the snapshot, sorted by schema then
+// table for deterministic output. Used by verify's baseline-anchored mode to
+// enumerate the full table universe, so a snapshot table with no baseline
+// surfaces in the report instead of silently producing no row.
+func (r *Resolver) AllTables() []*TableMeta {
+	out := make([]*TableMeta, 0, len(r.tables))
+	for _, t := range r.tables {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Schema != out[j].Schema {
+			return out[i].Schema < out[j].Schema
+		}
+		return out[i].Table < out[j].Table
+	})
+	return out
+}
+
 // Resolve returns metadata for a given schema.table.
 // Returns an error if the table is not found in the snapshot.
 func (r *Resolver) Resolve(schema, table string) (*TableMeta, error) {

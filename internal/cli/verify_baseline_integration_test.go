@@ -171,6 +171,79 @@ func TestRunVerifyBaselinePair_EndToEnd_Mismatch(t *testing.T) {
 	}
 }
 
+// TestRunVerifyBaselinePair_EndToEnd_NeverBaselined locks the #770 fix on the
+// DEFAULT (no --tables) path: a table present in the latest schema snapshot
+// but absent from every baseline (baseline job scoped narrower than the
+// snapshot, or the table was created after the job was configured) must appear
+// in the report as inconclusive ("never baselined"). Before the fix it
+// produced no row at all and the run exited 0 with "1 match" — false assurance
+// over precisely the table reconstruct cannot materialize either. The exit
+// stays 0 (inconclusive, like prevOnly, does not by itself fail a run with
+// real matches) — the contract is visibility, not failure.
+func TestRunVerifyBaselinePair_EndToEnd_NeverBaselined(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		table, name, key, dt string
+		ord                  int
+	}{
+		{"orders", "id", "PRI", "int", 1}, {"orders", "status", "", "varchar", 2},
+		// payments is in the snapshot but will get NO baseline.
+		{"payments", "id", "PRI", "int", 1},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, ?, ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.table, c.name, c.ord, c.key, c.dt, c.dt)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64),\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "status", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	writeCLIBaseline(t, baseDir, prevTS, dbName, "orders", createSQL, cols, [][]string{{"1", "a"}, {"2", "b"}}, 200)
+	writeCLIBaseline(t, baseDir, newTS, dbName, "orders", createSQL, cols, [][]string{{"1", "a"}, {"2", "shipped"}}, 300)
+
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, prevTS.Add(30*time.Minute).Format("2006-01-02 15:04:05"),
+		nil, dbName, "orders", 2 /*UPDATE*/, "2", nil,
+		[]byte(`{"id":2,"status":"b"}`), []byte(`{"id":2,"status":"shipped"}`))
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	vfyNoArchive = true
+	t.Cleanup(func() { vfyNoArchive = false })
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{}); err != nil {
+		t.Fatalf("runVerifyBaselinePair: %v\noutput:\n%s", err, out.String())
+	}
+	o := out.String()
+	if !strings.Contains(o, "1 match") {
+		t.Errorf("expected '1 match' (orders still verified) in report, got:\n%s", o)
+	}
+	if !strings.Contains(o, dbName+".payments") || !strings.Contains(o, "never baselined") {
+		t.Errorf("expected the never-baselined payments table reported inconclusive, got:\n%s", o)
+	}
+	if !strings.Contains(o, "1 inconclusive") {
+		t.Errorf("expected '1 inconclusive' in the summary, got:\n%s", o)
+	}
+}
+
 // TestRunVerifyBaselinePair_Explain pins the --explain CLI wiring: on a mismatch
 // the drill-down prints BELOW the report, names the exact diff, AND the run still
 // exits non-zero on the mismatch — a drill-down must never mask the verdict's exit
