@@ -41,9 +41,13 @@ func TestParseRetain_invalid(t *testing.T) {
 		"d",   // no number
 		"7x",  // unknown unit
 		"7",   // no unit
-		"-1d", // negative
-		"0d",  // zero
-		"0h",  // zero hours
+		"-1d",   // negative
+		"0d",    // zero
+		"0h",    // zero hours
+		"1.5d",  // fractional — Sscanf silently truncated to 1d (#817)
+		"30 0d", // embedded space — Sscanf silently truncated to 30d (#817)
+		"7dd",   // trailing garbage before unit
+		" 7d",   // leading whitespace
 	}
 	for _, c := range cases {
 		if _, err := ParseRetain(c); err == nil {
