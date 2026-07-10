@@ -442,6 +442,17 @@ func ReconstructTable(
 		Until:  &cfg.At,
 		// No PKValues filter — we want every event for this table.
 	}
+	// Anchor the delta window's lower bound on the baseline's exact recorded
+	// binlog position instead of its imprecise dump-start DATETIME (#797): a
+	// transaction whose statement executed just before snapshotTime but
+	// committed just after it would otherwise fall through both the dump's
+	// MVCC snapshot AND a Since-only fetch, silently missing from the
+	// reconstruction. Older baselines that never recorded a position
+	// (BinlogFile=="" or BinlogPos==0, the established "absent" convention —
+	// see baseline.DumpMetadata) fall back to the plain Since-only fetch.
+	if bmeta.BinlogFile != "" && bmeta.BinlogPos > 0 {
+		fetchOpts.SincePos = &query.BinlogPos{File: bmeta.BinlogFile, Pos: uint64(bmeta.BinlogPos)}
+	}
 	// nil ArchiveFetcher → the container-safe parquetquery.Fetch. Resolved here
 	// at the point of use so both ReconstructTables and any direct
 	// ReconstructTable caller get the default (#510).

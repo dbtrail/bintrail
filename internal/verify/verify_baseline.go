@@ -36,6 +36,11 @@ type BaselinePair struct {
 	PrevSnapshot  time.Time
 	NewSnapshot   time.Time // new baseline's snapshot time — the coarse time bound paired with NewAnchor
 	NewAnchor     query.BinlogPos
+	// PrevAnchor is the PREVIOUS baseline's own recorded binlog position —
+	// where ITS deltas begin (#797). Zero value (File=="" or Pos==0) when the
+	// previous baseline predates position recording; callers must check before
+	// using it as a query.Options.SincePos, same convention as NewAnchor.
+	PrevAnchor query.BinlogPos
 }
 
 // VerifyBaselinePair proves, drift-free, that the recovery chain reproduces a
@@ -101,27 +106,33 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 		orderedCols = append(orderedCols, cm)
 	}
 
-	// Latest event per PK in (prev snapshot, new anchor]. Lower bound by the
-	// previous snapshot's wall-clock TIME (the baseline supersedes older events);
-	// upper bound by the exact binlog anchor (#641) so the reconstruction lands
-	// precisely on the new baseline's point.
+	// Latest event per PK in (prev anchor, new anchor]. Lower bound by the
+	// previous baseline's exact recorded binlog position (#797) when it has
+	// one — the DATETIME lower bound this used before could silently drop a
+	// transaction that executed just before the prev snapshot's wall-clock
+	// instant but committed (and got logged) just after it; upper bound by the
+	// exact binlog anchor (#641) so the reconstruction lands precisely on the
+	// new baseline's point.
 	//
-	// The lower bound is the prev snapshot's directory timestamp, NOT its exact
-	// binlog anchor (a position lower bound is a follow-up). So a reported
-	// MISMATCH could in principle be a lower-bound artifact — a change committed
-	// between the prev baseline's true anchor and its directory timestamp. A
-	// reported MATCH is unaffected (a too-wide lower bound can only add a
-	// superseded older event, never drop a real one).
+	// PrevAnchor's zero value (older baseline, no recorded position) falls back
+	// to the prev snapshot's directory timestamp as the lower bound, same as
+	// before #797 — a reported MISMATCH there could in principle still be a
+	// lower-bound artifact. A reported MATCH is unaffected either way (a too-wide
+	// lower bound can only add a superseded older event, never drop a real one).
 	engine := query.New(cfg.IndexDB)
+	fetchOpts := query.Options{
+		Schema:     p.Schema,
+		Table:      p.Table,
+		Since:      &p.PrevSnapshot,
+		Until:      &p.NewSnapshot, // coarse time bound: partition pruning + gap planner
+		UntilPos:   &p.NewAnchor,   // exact cut at the new baseline's binlog point
+		LimitPerPK: 1,
+	}
+	if p.PrevAnchor.File != "" && p.PrevAnchor.Pos != 0 {
+		fetchOpts.SincePos = &p.PrevAnchor
+	}
 	rows, _, err := query.FetchMerged(ctx, cfg.IndexDB, engine, query.FetchMergedOptions{
-		Opts: query.Options{
-			Schema:     p.Schema,
-			Table:      p.Table,
-			Since:      &p.PrevSnapshot,
-			Until:      &p.NewSnapshot, // coarse time bound: partition pruning + gap planner
-			UntilPos:   &p.NewAnchor,   // exact cut at the new baseline's binlog point
-			LimitPerPK: 1,
-		},
+		Opts:           fetchOpts,
 		DBName:         cfg.IndexDBName,
 		NoArchive:      cfg.NoArchive,
 		ArchiveFetcher: cfg.ArchiveFetcher,
@@ -287,6 +298,14 @@ func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair,
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("read new baseline metadata %s: %w", nf.Path, err)
 		}
+		// The previous baseline's OWN recorded binlog position — where ITS
+		// deltas begin (#797's PrevAnchor). A zero value (older baseline that
+		// never recorded one) is not an error; ReadParquetMetadataAny returns
+		// it directly and callers fall back to the timestamp bound.
+		prevMeta, err := baseline.ReadParquetMetadataAny(ctx, pf.Path)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("read prev baseline metadata %s: %w", pf.Path, err)
+		}
 		pairs = append(pairs, BaselinePair{
 			Schema:       nf.Schema,
 			Table:        nf.Table,
@@ -295,6 +314,7 @@ func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair,
 			PrevSnapshot: tPrev,
 			NewSnapshot:  tNew,
 			NewAnchor:    query.BinlogPos{File: meta.BinlogFile, Pos: uint64(meta.BinlogPos)},
+			PrevAnchor:   query.BinlogPos{File: prevMeta.BinlogFile, Pos: uint64(prevMeta.BinlogPos)},
 		})
 	}
 	// Symmetric to unpaired: tables in the prev snapshot the new one no longer

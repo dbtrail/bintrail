@@ -150,7 +150,29 @@ type Options struct {
 	// Until time bound: callers pair it with Until so MySQL/the archive listing
 	// can still prune partitions/files by time, then UntilPos cuts the boundary
 	// exactly. nil = no position bound.
-	UntilPos      *BinlogPos
+	UntilPos *BinlogPos
+	// SincePos, when set, bounds events to those at-or-after an exact binlog
+	// coordinate (file + start position) — the lower-bound analog of UntilPos,
+	// for baseline-anchored consumers (#797). A baseline's recorded "Started
+	// dump at" wall-clock time is NOT a precise anchor: row-event headers carry
+	// the statement's EXECUTION time, not its commit time, so a transaction that
+	// executed just before the snapshot instant but committed (and so was
+	// durably logged, gaining its binlog position) just after it is invisible to
+	// BOTH the dump's MVCC snapshot AND a naive `event_timestamp >= snapshotTime`
+	// delta fetch — silently lost. The baseline's recorded binlog file+position
+	// (bintrail.baseline_binlog_file/_position) is exact and immune to that skew.
+	//
+	// UNLIKE UntilPos, SincePos does not merely refine the paired Since time
+	// bound — it REPLACES its exact-filter role. When SincePos is set, buildQuery
+	// drops the exact `event_timestamp >= ?` filter and widens Since's coarse
+	// TO_SECONDS partition-pruning hint by one extra hour of lookback (see
+	// buildQuery), because that hint is keyed on the very execution-time column
+	// whose skew this field exists to route around — a too-tight time hint could
+	// prune away the very partition holding the row this field is meant to
+	// recover. The exact correctness gate is the position comparison alone.
+	// nil = no position bound; older baselines that never recorded one fall back
+	// to the plain Since time filter.
+	SincePos      *BinlogPos
 	ChangedColumn string     // column name; matched via JSON_CONTAINS
 	ColumnEq      []ColumnEq // match against values inside row_after / row_before
 	Flag          string     // return events from tables/columns carrying this flag
@@ -339,14 +361,43 @@ func buildQuery(opts Options) (string, []any) {
 	}
 	if opts.Since != nil {
 		since := *opts.Since
-		// Add an hour-aligned lower bound as a TO_SECONDS integer literal so
-		// MySQL can prune to the correct partition(s) at parse time. This hint
-		// is always required — MySQL cannot infer partition pruning from
-		// parameterised datetime comparisons, even when the value is hour-aligned.
-		outerSince := mysqlToSeconds(since.Truncate(time.Hour))
-		where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", outerSince))
-		where = append(where, "event_timestamp >= ?")
-		args = append(args, since)
+		if opts.SincePos != nil {
+			// SincePos governs correctness (below); this hint must be a SAFE,
+			// non-excluding lower bound only — never the exact cut. Truncate to
+			// the hour, then back off one MORE full hour: binlog_events
+			// partitions by event_timestamp (statement EXECUTION time), not
+			// binlog position, so a transaction that started before the
+			// anchor's hour but committed (and so was durably logged, gaining
+			// its binlog position) after it can have its row physically stored
+			// in an EARLIER partition than the anchor's own hour. See
+			// SincePos's doc comment.
+			outerSince := mysqlToSeconds(since.Truncate(time.Hour).Add(-time.Hour))
+			where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", outerSince))
+			// Deliberately no exact `event_timestamp >= ?` filter here — see
+			// SincePos.
+		} else {
+			// Add an hour-aligned lower bound as a TO_SECONDS integer literal so
+			// MySQL can prune to the correct partition(s) at parse time. This hint
+			// is always required — MySQL cannot infer partition pruning from
+			// parameterised datetime comparisons, even when the value is hour-aligned.
+			outerSince := mysqlToSeconds(since.Truncate(time.Hour))
+			where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", outerSince))
+			where = append(where, "event_timestamp >= ?")
+			args = append(args, since)
+		}
+	}
+	if opts.SincePos != nil {
+		// Exact binlog lower bound: events whose start position is at-or-after
+		// the anchor (a later file, or the same file at-or-after the position).
+		// MySQL's SHOW MASTER STATUS position is the NEXT-write position at
+		// snapshot time, so an event starting exactly there is a genuine
+		// post-snapshot delta. "Later file" is length-then-lexicographic (see
+		// BinlogPos), mirroring UntilPos's #840 rollover fix, inverted for a
+		// lower bound.
+		where = append(where, "(CHAR_LENGTH(binlog_file) > CHAR_LENGTH(?)"+
+			" OR (CHAR_LENGTH(binlog_file) = CHAR_LENGTH(?) AND binlog_file > ?)"+
+			" OR (binlog_file = ? AND start_pos >= ?))")
+		args = append(args, opts.SincePos.File, opts.SincePos.File, opts.SincePos.File, opts.SincePos.File, opts.SincePos.Pos)
 	}
 	if opts.Until != nil {
 		until := *opts.Until

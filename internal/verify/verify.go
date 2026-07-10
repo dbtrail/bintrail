@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/consistency"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
@@ -129,6 +131,18 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 		}
 		return res, fmt.Errorf("find baseline %s.%s: %w", schema, table, err)
 	}
+	// Read the baseline's exact recorded binlog position so the delta fetch
+	// below can anchor on it instead of the imprecise snapshotTime DATETIME
+	// (#797). Best-effort: a read failure just means SincePos stays unset and
+	// the fetch falls back to the plain Since-only window (the pre-#797
+	// behavior), same as an older baseline that never recorded a position.
+	var sincePos *query.BinlogPos
+	if bmeta, berr := baseline.ReadParquetMetadataAny(ctx, baselinePath); berr != nil {
+		slog.Warn("could not read baseline metadata for position-anchored delta fetch; falling back to timestamp-only Since",
+			"schema", schema, "table", table, "path", baselinePath, "error", berr)
+	} else if bmeta.BinlogFile != "" && bmeta.BinlogPos > 0 {
+		sincePos = &query.BinlogPos{File: bmeta.BinlogFile, Pos: uint64(bmeta.BinlogPos)}
+	}
 
 	// 4. Latest event per PK in (baseline, asOf] — the change map the merge needs.
 	engine := query.New(cfg.IndexDB)
@@ -137,6 +151,7 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 			Schema:     schema,
 			Table:      table,
 			Since:      &snapshotTime,
+			SincePos:   sincePos,
 			Until:      &asOf,
 			LimitPerPK: 1,
 		},

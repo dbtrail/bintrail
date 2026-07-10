@@ -1,19 +1,44 @@
 package shim
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
+
+// snapshotSincePos reads the baseline's exact recorded binlog position so a
+// _snapshot delta fetch can anchor its lower bound there instead of the
+// imprecise snapshotTime DATETIME (#797): a transaction whose statement
+// executed just before snapshotTime but committed (and got logged) just after
+// it would otherwise fall through both the dump's MVCC snapshot AND a
+// Since-only fetch, silently missing from the result. Best-effort: a read
+// failure or an older baseline that never recorded a position (BinlogFile==""
+// or BinlogPos==0) just means nil — callers fall back to the pre-#797
+// Since-only fetch.
+func snapshotSincePos(ctx context.Context, baselinePath string, logger *slog.Logger, schema, table string) *query.BinlogPos {
+	bmeta, err := baseline.ReadParquetMetadataAny(ctx, baselinePath)
+	if err != nil {
+		logger.Warn("shim: could not read baseline metadata for position-anchored delta fetch; falling back to timestamp-only Since",
+			"schema", schema, "table", table, "path", baselinePath, "error", err)
+		return nil
+	}
+	if bmeta.BinlogFile == "" || bmeta.BinlogPos <= 0 {
+		return nil
+	}
+	return &query.BinlogPos{File: bmeta.BinlogFile, Pos: uint64(bmeta.BinlogPos)}
+}
 
 // runSnapshot resolves a _snapshot query. _snapshot is the
 // baseline-aware sibling of _flashback (#355): on top of the
@@ -176,6 +201,7 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 			Schema:     q.Schema,
 			Table:      q.Table,
 			Since:      &snapshotTime,
+			SincePos:   snapshotSincePos(ctx, baselinePath, h.logger, q.Schema, q.Table),
 			Until:      &q.AsOf,
 			LimitPerPK: 1,
 		},
@@ -465,10 +491,11 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 	// the fetch scoped to the one row; keep the pk_hash fast path for the
 	// common non-empty case.
 	opts := query.Options{
-		Schema: q.Schema,
-		Table:  q.Table,
-		Since:  &snapshotTime,
-		Until:  &q.AsOf,
+		Schema:   q.Schema,
+		Table:    q.Table,
+		Since:    &snapshotTime,
+		SincePos: snapshotSincePos(ctx, baselinePath, h.logger, q.Schema, q.Table),
+		Until:    &q.AsOf,
 	}
 	// q.PKValue is raw/unescaped (#826). Unlike ReadBaselineRow above (which
 	// matches actual Parquet column values and must keep the raw value), this

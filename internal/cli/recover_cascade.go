@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cascade"
 	"github.com/dbtrail/dbtrail/internal/cascaderecover"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
@@ -42,6 +43,17 @@ func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, 
 			return cascade.BaselineLookup{}, false, nil // table not covered → Phase-1 only
 		}
 		return cascade.BaselineLookup{}, false, err
+	}
+	// The baseline's exact recorded binlog position, when it has one (#797) —
+	// see BaselineLookup.SincePos. Best-effort: a read failure just leaves the
+	// candidate-victim fetch anchored on SnapshotTime alone, same as before
+	// #797 — it must not block the (already-succeeded) baseline row scan below.
+	var sincePos *query.BinlogPos
+	if bmeta, berr := baseline.ReadParquetMetadataAny(ctx, path); berr != nil {
+		slog.Warn("cascade: could not read baseline metadata for position-anchored victim fetch; falling back to timestamp-only Since",
+			"schema", schema, "table", table, "path", path, "error", berr)
+	} else if bmeta.BinlogFile != "" && bmeta.BinlogPos > 0 {
+		sincePos = &query.BinlogPos{File: bmeta.BinlogFile, Pos: uint64(bmeta.BinlogPos)}
 	}
 
 	tm, err := p.resolver.Resolve(schema, table)
@@ -88,7 +100,7 @@ func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, 
 			Row:      r,
 		})
 	}
-	return cascade.BaselineLookup{SnapshotTime: snap, Rows: out, Truncated: trunc}, true, nil
+	return cascade.BaselineLookup{SnapshotTime: snap, Rows: out, Truncated: trunc, SincePos: sincePos}, true, nil
 }
 
 func columnDataType(tm *metadata.TableMeta, name string) string {

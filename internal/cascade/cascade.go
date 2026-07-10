@@ -73,6 +73,14 @@ type BaselineLookup struct {
 	SnapshotTime time.Time     // start of the delta window (widens the binlog scan)
 	Rows         []BaselineRow // child rows that referenced the parent at the snapshot
 	Truncated    bool          // more rows matched than the requested limit
+	// SincePos is the baseline's exact recorded binlog position, when it has
+	// one (#797) — the precise lower-bound analog of SnapshotTime, used
+	// instead of it to anchor the candidate-victim fetch below so a child
+	// whose statement executed just before SnapshotTime but committed (and
+	// got logged) just after it is not silently missed. nil for older
+	// baselines that never recorded a position; callers then fall back to
+	// SnapshotTime alone, same as before #797.
+	SincePos *query.BinlogPos
 }
 
 // BaselineProvider supplies Phase-2 baseline fallback: the child rows that
@@ -376,10 +384,11 @@ func SynthesizeVictims(
 				// time so the scan catches every child touched SINCE the baseline;
 				// the untouched ones are added after the scan.
 				var (
-					baseRows    []BaselineRow
-					baseSnap    time.Time
-					baseTrunc   bool
-					baseCovered bool
+					baseRows     []BaselineRow
+					baseSnap     time.Time
+					baseTrunc    bool
+					baseCovered  bool
+					baseSincePos *query.BinlogPos
 				)
 				if opts.Baseline != nil {
 					bl, covered, berr := opts.Baseline.BaselineChildren(ctx, fk.Schema, fk.Table, fk.Column, parentPK, item.rootTS, opts.CandidateLimit)
@@ -390,6 +399,7 @@ func SynthesizeVictims(
 					case covered:
 						baseCovered, baseSnap, baseRows, baseTrunc = true, bl.SnapshotTime, bl.Rows, bl.Truncated
 						since = bl.SnapshotTime
+						baseSincePos = bl.SincePos
 					default:
 						addIncomplete("nobaseline:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
 							"no baseline covers %s.%s; children untouched within the lookback window are not reconstructed", fk.Schema, fk.Table))
@@ -401,11 +411,16 @@ func SynthesizeVictims(
 				// pk_values. Fetch one MORE than CandidateLimit so an overflow is
 				// observable — with LimitPerPK=1 a plain LIMIT=CandidateLimit caps
 				// at exactly the limit and hides truncation.
+				//
+				// baseSincePos, when the baseline recorded one (#797), anchors the
+				// lower bound on the baseline's exact binlog position instead of
+				// its imprecise SnapshotTime DATETIME — see BaselineLookup.SincePos.
 				cands, qerr := eng.Fetch(ctx, query.Options{
 					Schema:     fk.Schema,
 					Table:      fk.Table,
 					ColumnEq:   []query.ColumnEq{{Column: fk.Column, Value: parentPK}},
 					Since:      &since,
+					SincePos:   baseSincePos,
 					Until:      &until,
 					Order:      "DESC",
 					LimitPerPK: 1,

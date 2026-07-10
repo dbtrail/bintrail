@@ -81,18 +81,23 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 	// entire S3 files in memory (outside memory_limit tracking), causing
 	// OOM kills in containers. Local reads use OS page cache / mmap.
 	if strings.HasPrefix(source, "s3://") {
-		files, maxSize, region, s3Client, err := listS3ParquetScoped(ctx, source, opts.Since, opts.Until)
+		// sinceHint, not opts.Since directly: when SincePos is set it widens the
+		// lower bound by a safety margin so file/date scoping can never prune
+		// away the very file a position-anchored fetch needs (see
+		// sinceLowerBoundHint).
+		sinceHint := sinceLowerBoundHint(opts)
+		files, maxSize, region, s3Client, err := listS3ParquetScoped(ctx, source, sinceHint, opts.Until)
 		if err != nil {
 			return nil, fmt.Errorf("list S3 archive files: %w", err)
 		}
 		// Pre-filter files by Hive partition values (event_date/event_hour)
 		// to avoid downloading parquet files outside the requested time range.
-		files = filterFilesByTimeRange(files, opts.Since, opts.Until)
+		files = filterFilesByTimeRange(files, sinceHint, opts.Until)
 		// Sort chronologically so we can terminate early when --limit is satisfied.
 		files = sortFilesByHour(files)
 		slog.Debug("files after time-range pruning", "count", len(files))
 		if len(files) == 0 {
-			return classifyEmptyS3Listing(ctx, s3Client, source, opts.Since, opts.Until)
+			return classifyEmptyS3Listing(ctx, s3Client, source, sinceHint, opts.Until)
 		}
 
 		// Ultrafast: read the S3 files directly via DuckDB httpfs in one
@@ -384,6 +389,24 @@ func isBucketLocationAccessDenied(err error) bool {
 	}
 	code := apiErr.ErrorCode()
 	return code == "AccessDenied" || code == "AccessDeniedException"
+}
+
+// sinceLowerBoundHint computes the coarse, deliberately over-inclusive
+// lower-bound hint used for archive file/date scoping when a caller pairs
+// Since with an exact SincePos binlog-coordinate anchor (see
+// query.Options.SincePos, #797). Mirrors internal/query's buildQuery: truncate
+// to the hour, then back off ONE MORE full hour — archived events partition by
+// event_timestamp (statement EXECUTION time), not binlog position, so a
+// transaction that started before the anchor's hour but committed (and so
+// gained its binlog position) after it can be filed under an earlier
+// date/hour than the anchor's own. Returns opts.Since unchanged when SincePos
+// is nil (nothing to widen for) or Since itself is nil.
+func sinceLowerBoundHint(opts query.Options) *time.Time {
+	if opts.Since == nil || opts.SincePos == nil {
+		return opts.Since
+	}
+	t := opts.Since.Truncate(time.Hour).Add(-time.Hour)
+	return &t
 }
 
 // maxScopedDays is the maximum number of days for prefix-scoped S3 listing.
@@ -899,7 +922,22 @@ func buildFilters(opts query.Options) ([]string, []any) {
 		where = append(where, "gtid = ?")
 		args = append(args, opts.GTID)
 	}
-	if opts.Since != nil {
+	if opts.SincePos != nil {
+		// Coarse, deliberately over-inclusive lower-bound filter only (mirrors
+		// internal/query's buildQuery) — never the exact cut; see SincePos and
+		// sinceLowerBoundHint. The exact correctness gate is the position
+		// comparison below.
+		if hint := sinceLowerBoundHint(opts); hint != nil {
+			where = append(where, "event_timestamp >= ?")
+			args = append(args, *hint)
+		}
+		// Exact binlog lower bound, mirroring UntilPos's rollover-safe file
+		// ordering (#840) below, inverted for a lower bound.
+		where = append(where, "(length(binlog_file) > length(?)"+
+			" OR (length(binlog_file) = length(?) AND binlog_file > ?)"+
+			" OR (binlog_file = ? AND start_pos >= ?))")
+		args = append(args, opts.SincePos.File, opts.SincePos.File, opts.SincePos.File, opts.SincePos.File, opts.SincePos.Pos)
+	} else if opts.Since != nil {
 		where = append(where, "event_timestamp >= ?")
 		args = append(args, *opts.Since)
 	}

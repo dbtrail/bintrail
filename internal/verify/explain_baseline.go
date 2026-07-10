@@ -122,18 +122,24 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 		orderedCols = append(orderedCols, cm)
 	}
 
-	// Latest event per PK in (prev snapshot, new anchor] — the same window
-	// VerifyBaselinePair reconstructs the recovery side over.
+	// Latest event per PK in (prev anchor, new anchor] — the same window
+	// VerifyBaselinePair reconstructs the recovery side over (#797: PrevAnchor,
+	// when recorded, replaces the imprecise PrevSnapshot DATETIME lower bound —
+	// see VerifyBaselinePair's comment).
 	engine := query.New(cfg.IndexDB)
+	fetchOpts := query.Options{
+		Schema:     p.Schema,
+		Table:      p.Table,
+		Since:      &p.PrevSnapshot,
+		Until:      &p.NewSnapshot,
+		UntilPos:   &p.NewAnchor,
+		LimitPerPK: 1,
+	}
+	if p.PrevAnchor.File != "" && p.PrevAnchor.Pos != 0 {
+		fetchOpts.SincePos = &p.PrevAnchor
+	}
 	rows, _, err := query.FetchMerged(ctx, cfg.IndexDB, engine, query.FetchMergedOptions{
-		Opts: query.Options{
-			Schema:     p.Schema,
-			Table:      p.Table,
-			Since:      &p.PrevSnapshot,
-			Until:      &p.NewSnapshot,
-			UntilPos:   &p.NewAnchor,
-			LimitPerPK: 1,
-		},
+		Opts:           fetchOpts,
 		DBName:         cfg.IndexDBName,
 		NoArchive:      cfg.NoArchive,
 		ArchiveFetcher: cfg.ArchiveFetcher,
@@ -275,7 +281,7 @@ func displayCell(b []byte) string {
 // cellEqual compares two canonical cell renderings with the SAME NULL-vs-empty
 // distinction the content digest uses (rowHasher tags a nil/NULL differently from
 // a zero-length value). bytes.Equal alone treats nil and []byte("") as equal,
-// which would make the drill-down miss a NULL↔'' divergence the digest flagged —
+// which would make the drill-down miss a NULL↔” divergence the digest flagged —
 // breaking the "the diff agrees with the verdict" invariant.
 func cellEqual(a, b []byte) bool {
 	if (a == nil) != (b == nil) {
