@@ -1,7 +1,6 @@
 package shim
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -118,8 +117,19 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
+
+	// Bound concurrent full-table reconstructions (#823). Taken here —
+	// AFTER the src=="" fallback above, which delegates to runFullTable
+	// (that path acquires the gate itself; acquiring before the branch
+	// would deadlock a cap-1 gate) and after the cheap fail-fast PK
+	// refusals — so the slot is held only for the heavy part:
+	// FindBaseline, the delta fetch, and the DuckDB baseline merge.
+	if err := h.cfg.FullTableGate.Acquire(ctx); err != nil {
+		return nil, h.fullTableGateError(q.Type, err)
+	}
+	defer h.cfg.FullTableGate.Release()
 
 	// Shim handling of the stale-fallback warning (#466) is intentionally
 	// minimal: FindBaseline already logs it server-side and an in-band MySQL
@@ -174,7 +184,7 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err)
 	}
 	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
 	// BEFORE the merge: the merged rowMap reaching the callback below has
@@ -403,7 +413,7 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		return h.runPointInTime(q)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
 
 	// Stale-fallback warning (#466) discarded here — see the full-table path.
@@ -470,7 +480,7 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err)
 	}
 
 	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),

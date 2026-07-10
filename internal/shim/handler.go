@@ -125,6 +125,12 @@ type Handler struct {
 	epochList       []metadata.SnapshotEpoch
 	epochListLoaded time.Time
 
+	// baseCtx is the per-connection context set by BindConnContext
+	// (#823). Every query context derives from it, so a client
+	// disconnect or daemon shutdown aborts in-flight fetches. nil means
+	// context.Background() (unit tests, pre-#823 embedders).
+	baseCtx context.Context
+
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
 }
@@ -292,6 +298,20 @@ type Config struct {
 	// _flashback).
 	BaselineDir string
 	BaselineS3  string
+	// QueryTimeout bounds each time-travel query end-to-end — planner,
+	// index fetch, archive/DuckDB fetch, and (for full-table queries)
+	// the wait for a FullTableGate slot (#823). Zero disables the
+	// deadline (pre-#823 behaviour). On expiry the client sees
+	// ER_QUERY_INTERRUPTED (1317).
+	QueryTimeout time.Duration
+	// FullTableGate caps concurrent full-table reconstructions
+	// (_flashback / _snapshot with no WHERE) across every connection of
+	// this shim process — the heaviest queries, each buffering up to
+	// FullTableRowCap rows post-merge (#823). nil admits everything
+	// (pre-#823 behaviour). Config is copied per connection, so wire ONE
+	// shared *Gate here at startup — a per-Handler gate would cap
+	// nothing.
+	FullTableGate *Gate
 }
 
 // NewHandler constructs a Handler bound to a bintrail index DSN with
@@ -313,6 +333,34 @@ func NewHandlerWithConfig(indexDB *sql.DB, cfg Config, logger *slog.Logger) *Han
 		archiveFetcher: parquetquery.Fetch,
 		resolverFn:     func() (*metadata.Resolver, error) { return metadata.NewLatestPerTableResolver(indexDB) },
 	}
+}
+
+// BindConnContext ties every subsequent query on this Handler to ctx —
+// the per-connection context the serving layer derives from the TCP
+// connection (#823): when the client disconnects or the daemon shuts
+// down, ctx is canceled and any in-flight FetchMerged aborts instead of
+// running to completion for a client that is gone. Call once before
+// serving commands; the Handler is per-connection and commands are
+// dispatched from the same goroutine, so no lock is needed. Handlers
+// without a bound context keep the pre-#823 context.Background()
+// behaviour.
+func (h *Handler) BindConnContext(ctx context.Context) {
+	h.baseCtx = ctx
+}
+
+// queryContext derives the context every run* entry point uses for one
+// query (#823): rooted at the connection context (BindConnContext) so
+// client disconnect / shutdown cancels it, with cfg.QueryTimeout as the
+// deadline when configured. The returned cancel must be deferred.
+func (h *Handler) queryContext() (context.Context, context.CancelFunc) {
+	base := h.baseCtx
+	if base == nil {
+		base = context.Background()
+	}
+	if h.cfg.QueryTimeout > 0 {
+		return context.WithTimeout(base, h.cfg.QueryTimeout)
+	}
+	return context.WithCancel(base)
 }
 
 // UseDB stores the schema the client selected. _flashback queries
@@ -404,13 +452,49 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 // Both branches prefix qType so an operator with multiple concurrent
 // shim sessions can attribute the error to a _flashback / _diff /
 // _snapshot query without correlating logs.
-func wrapFetchError(qType QueryType, err error) error {
+// Context errors (#823) get ER_QUERY_INTERRUPTED (1317) — MySQL's own
+// "Query execution was interrupted" — so monitoring can tell a reaped
+// query (deadline, client disconnect, shutdown) from a genuine server
+// fault (1105) or a user-input problem (1526/1064). ctx is the query
+// context the fetch ran under: when it is already dead, its error takes
+// over regardless of what the driver surfaced — go-sql-driver wraps
+// ctx.Err() but sqlmock and the DuckDB archive path return their own
+// cancellation sentinels, and the wire code must reflect WHY the query
+// died, not which driver noticed first. Pass context.Background() (or
+// any live ctx) to keep the pure error-classification behaviour.
+func wrapFetchError(ctx context.Context, qType QueryType, err error) error {
 	var gapErr *query.GapError
 	if errors.As(err, &gapErr) {
 		return mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE,
 			fmt.Sprintf("resolve %s: %s", qType, gapErr.Error()))
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return mysql.NewError(mysql.ER_QUERY_INTERRUPTED, fmt.Sprintf(
+			"resolve %s: query exceeded the shim's --query-timeout and was aborted; narrow the AS OF range, filter by PK, or raise --query-timeout", qType))
+	}
+	if errors.Is(err, context.Canceled) {
+		return mysql.NewError(mysql.ER_QUERY_INTERRUPTED, fmt.Sprintf(
+			"resolve %s: query canceled (client disconnected or shim shutting down)", qType))
+	}
 	return fmt.Errorf("resolve %s: %w", qType, err)
+}
+
+// fullTableGateError converts a FullTableGate.Acquire failure into the
+// wire error the client sees (#823). Saturation-until-deadline maps to
+// ER_TOO_MANY_USER_CONNECTIONS (1203) — distinct from the 1317 a slow
+// query's own fetch gets, so an operator can tell "the gate is full"
+// from "queries are slow".
+func (h *Handler) fullTableGateError(qType QueryType, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return mysql.NewError(mysql.ER_TOO_MANY_USER_CONNECTIONS, fmt.Sprintf(
+			"resolve %s: too many concurrent full-table time-travel queries (cap %d); retry later, filter by PK, or raise --max-fulltable-queries",
+			qType, h.cfg.FullTableGate.Cap()))
+	}
+	return mysql.NewError(mysql.ER_QUERY_INTERRUPTED, fmt.Sprintf(
+		"resolve %s: query canceled while waiting for a full-table slot (client disconnected or shim shutting down)", qType))
 }
 
 // runPointInTime resolves a _flashback query (binlog-only) against the
@@ -442,7 +526,7 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 		return h.runFullTable(q)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
 
 	// LimitPerPK=1 (not Limit=1) is the right knob: query.Engine emits
@@ -467,7 +551,7 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err)
 	}
 
 	// ENUM/SET ordinals → labels (#472/#475), so the historical row
@@ -627,8 +711,17 @@ func (h *Handler) runShowTablesFromVirtual(currentDB, virtualSchema string) (*my
 // those columns dropped — same behaviour as a regular MySQL
 // `SELECT *` after an ALTER TABLE that removed a column.
 func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
+
+	// Bound concurrent full-table reconstructions (#823). Acquire
+	// respects the query context, so an abandoned waiter is reaped at
+	// --query-timeout (or on client disconnect) instead of queuing
+	// forever behind the cap.
+	if err := h.cfg.FullTableGate.Acquire(ctx); err != nil {
+		return nil, h.fullTableGateError(q.Type, err)
+	}
+	defer h.cfg.FullTableGate.Release()
 
 	cap := h.cfg.FullTableRowCap
 	if cap <= 0 {
@@ -650,7 +743,7 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err)
 	}
 
 	if len(rows) > cap {
@@ -1368,7 +1461,7 @@ func selectImage(rows []query.ResultRow) map[string]any {
 // they need an audit-style view of "what changed to this row in this
 // time window".
 func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
 
 	// No row cap: a _diff query is already PK-scoped + time-windowed, so the
@@ -1392,7 +1485,7 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err)
 	}
 
 	// Compute the source-table column order once per query so the
