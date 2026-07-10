@@ -152,6 +152,10 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 	for i := range batch {
 		ev := &batch[i]
 
+		if err := checkPKValuesLength(ev.Schema, ev.Table, ev.PKValues); err != nil {
+			return 0, err
+		}
+
 		changed, err := marshalJSON(event.ChangedColumns(ev.RowBefore, ev.RowAfter))
 		if err != nil {
 			return 0, fmt.Errorf("marshal changed_columns for %s.%s: %w", ev.Schema, ev.Table, err)
@@ -191,6 +195,31 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 	}
 	n, _ := result.RowsAffected()
 	return n, nil
+}
+
+// checkPKValuesLength guards against a PK value that would overflow
+// binlog_events.pk_values (VARCHAR(512), event.MaxPKValuesLen). Without this
+// guard: under strict sql_mode (MySQL 8.0 default) the batch INSERT
+// hard-fails with an unhelpful Error 1406; under non-strict mode MySQL
+// silently truncates pk_values while pk_hash (a STORED generated column) is
+// computed over the truncated string and every read path binds the FULL
+// value — a permanent silent mismatch that makes the row invisible to
+// query/recover forever. This is not a new failure mode, just a clearer,
+// sql_mode-independent version of the failure strict mode already produces.
+//
+// Measured in runes (event.MaxPKValuesLen's contract), matching how VARCHAR
+// capacity is counted in characters, not bytes — a multibyte PK value must
+// not false-trip this on byte length alone.
+func checkPKValuesLength(schema, table, pkValues string) error {
+	if n := utf8.RuneCountInString(pkValues); n > event.MaxPKValuesLen {
+		return fmt.Errorf(
+			"event for %s.%s has a primary key %d characters long, exceeding the %d-character limit of binlog_events.pk_values (VARCHAR(%d)); "+
+				"this row's primary key (composite width or a wide single column) cannot be safely indexed — truncating it would silently corrupt "+
+				"the generated pk_hash and make the row permanently unrecoverable via query/recover; narrow the primary key (fewer or shorter "+
+				"columns) or contact support about a wider index schema",
+			schema, table, n, event.MaxPKValuesLen, event.MaxPKValuesLen)
+	}
+	return nil
 }
 
 // ─── Query-text enrichment (#699) ─────────────────────────────────────────────

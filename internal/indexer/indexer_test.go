@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -282,5 +283,42 @@ func TestNullOrUint32_nonZero(t *testing.T) {
 	got := nullOrUint32(42)
 	if got != uint32(42) {
 		t.Errorf("expected uint32(42), got %v", got)
+	}
+}
+
+// ─── checkPKValuesLength (#944) ──────────────────────────────────────────────
+
+func TestCheckPKValuesLength_multibyteAtLimit(t *testing.T) {
+	// 512 runes of a 3-byte-per-character UTF-8 string (CJK) — exactly at the
+	// rune limit, but ~1536 bytes. The guard is rune-based (matching how
+	// VARCHAR(512) counts capacity), so this must NOT trip even though its
+	// byte length is roughly 3x the limit.
+	pk := strings.Repeat("あ", 512)
+	if n := len(pk); n <= 512 {
+		t.Fatalf("test setup: expected byte length > 512, got %d", n)
+	}
+	if err := checkPKValuesLength("mydb", "orders", pk); err != nil {
+		t.Errorf("expected no error for 512 multibyte runes, got: %v", err)
+	}
+}
+
+func TestCheckPKValuesLength_asciiOverLimit(t *testing.T) {
+	// 513 ASCII runes — one over the limit, both by rune count and by byte
+	// count. Must trip, and the error must name the schema and table so an
+	// operator can find the offending source table.
+	pk := strings.Repeat("a", 513)
+	err := checkPKValuesLength("mydb", "orders", pk)
+	if err == nil {
+		t.Fatal("expected error for 513-rune ASCII PK, got nil")
+	}
+	if !strings.Contains(err.Error(), "mydb") || !strings.Contains(err.Error(), "orders") {
+		t.Errorf("expected error to name schema %q and table %q, got: %v", "mydb", "orders", err)
+	}
+}
+
+func TestCheckPKValuesLength_exactlyAtLimit(t *testing.T) {
+	pk := strings.Repeat("a", 512)
+	if err := checkPKValuesLength("mydb", "orders", pk); err != nil {
+		t.Errorf("expected no error at exactly the limit, got: %v", err)
 	}
 }
