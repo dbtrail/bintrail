@@ -264,3 +264,121 @@ func TestTemporalPrecision(t *testing.T) {
 		}
 	}
 }
+
+// TestNormalizeRenderedBytes_TimeFractionCanonical is the #794 fix: go-mysql's
+// timeFormat renders an integer-second TIME without any fractional suffix
+// regardless of the declared fsp, while MySQL's text protocol and mydumper pad
+// the fraction to the fsp ("09:00:00.000" for TIME(3)) — a conclusive false
+// MISMATCH in both verify modes. Every rendering of the same value must
+// normalize to the same minimal form, without needing the fsp (the live-scan
+// hook carries DATA_TYPE only), and value-bearing fraction digits must
+// survive so two DIFFERENT values never collapse.
+func TestNormalizeRenderedBytes_TimeFractionCanonical(t *testing.T) {
+	cases := []struct {
+		name     string
+		dataType string
+		in       string
+		want     string
+	}{
+		{"mysql/mydumper padded fsp3", "time", "09:00:00.000", "09:00:00"},
+		{"go-mysql integer-second", "time", "09:00:00", "09:00:00"},
+		{"padded nonzero fraction", "time", "09:00:00.120", "09:00:00.12"},
+		{"minimal nonzero fraction", "time", "09:00:00.12", "09:00:00.12"},
+		{"value-bearing trailing digit", "time", "09:00:00.001", "09:00:00.001"},
+		{"fsp6 all-zero fraction", "time", "-838:59:59.000000", "-838:59:59"},
+		{"seconds end in zero, no dot", "time", "10:00:20", "10:00:20"}, // TrimRight guard: must NOT become "10:00:2"
+		{"seconds end in zero, zero fraction", "time", "10:00:20.000", "10:00:20"},
+		{"case-insensitive DataType", "TIME", "09:00:00.000", "09:00:00"},
+		{"non-time dataType untouched", "varchar", "09:00:00.000", "09:00:00.000"},
+		{"decimal untouched", "decimal", "1.500", "1.500"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeRenderedBytes([]byte(tc.in), tc.dataType)
+			if !bytes.Equal(got, []byte(tc.want)) {
+				t.Errorf("normalizeRenderedBytes(%q, %q) = %q, want %q", tc.in, tc.dataType, got, tc.want)
+			}
+		})
+	}
+
+	// Anti-masking pin: two genuinely different TIME values stay different.
+	a := normalizeRenderedBytes([]byte("09:00:00.100"), "time")
+	b := normalizeRenderedBytes([]byte("09:00:00.010"), "time")
+	if bytes.Equal(a, b) {
+		t.Errorf("normalization collapsed distinct TIME values: %q == %q", a, b)
+	}
+}
+
+// TestRenderCellNormalized_TimeIntegerSecond_BothSidesAgree pins the #794
+// scenario end-to-end through the recon renderer: the event image's go-mysql
+// text and the baseline's mydumper text of the same TIME(3) value must render
+// identically.
+func TestRenderCellNormalized_TimeIntegerSecond_BothSidesAgree(t *testing.T) {
+	c := col("time", "time(3)")
+	event := renderCellNormalized("09:00:00", c)        // go-mysql event-image text
+	baseline := renderCellNormalized("09:00:00.000", c) // mydumper/baseline text
+	if !bytes.Equal(event, baseline) {
+		t.Errorf("event render %q != baseline render %q for the same TIME value", event, baseline)
+	}
+}
+
+// TestNormalizeRenderedBytes_FloatDoubleCanonical is the #795 fix: MySQL's
+// my_gcvt and Go's strconv render the same stored FLOAT/DOUBLE with different
+// exponent forms and thresholds ("1e16" vs "1e+16"), a permanent conclusive
+// false MISMATCH in live mode. Both texts must canonicalize to one rendering
+// at the column's own width; anything that isn't clean float text stays
+// untouched, and distinct values stay distinct (floats remain OUT of the
+// deferred set — this normalizes representation, it must never mask a value
+// divergence).
+func TestNormalizeRenderedBytes_FloatDoubleCanonical(t *testing.T) {
+	cases := []struct {
+		name     string
+		dataType string
+		in       string
+		want     string
+	}{
+		{"double mysql exponent", "double", "1e16", "1e+16"},
+		{"double go exponent stable", "double", "1e+16", "1e+16"},
+		{"double decimal-vs-exponent threshold", "double", "0.00001", "1e-05"},
+		{"double plain stable", "double", "2.25", "2.25"},
+		{"double integer-valued", "double", "12345", "12345"},
+		{"double negative zero", "double", "-0", "-0"},
+		{"float parsed at 32 bits", "float", "0.30000001192092896", "0.3"},
+		{"float plain stable", "float", "1.5", "1.5"},
+		{"case-insensitive DataType", "DOUBLE", "1e16", "1e+16"},
+		{"unparsable unchanged", "double", "not-a-float", "not-a-float"},
+		{"whitespace unchanged", "double", " 1e16", " 1e16"},
+		{"non-float dataType untouched", "varchar", "1e16", "1e16"},
+		{"decimal untouched", "decimal", "1.50", "1.50"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeRenderedBytes([]byte(tc.in), tc.dataType)
+			if !bytes.Equal(got, []byte(tc.want)) {
+				t.Errorf("normalizeRenderedBytes(%q, %q) = %q, want %q", tc.in, tc.dataType, got, tc.want)
+			}
+		})
+	}
+
+	// Anti-masking pin: two distinct float64 values keep distinct canonical
+	// forms — a real corruption still surfaces as a mismatch.
+	a := normalizeRenderedBytes([]byte("1e16"), "double")
+	b := normalizeRenderedBytes([]byte("1.0000000000000002e16"), "double")
+	if bytes.Equal(a, b) {
+		t.Errorf("normalization collapsed distinct DOUBLE values: %q == %q", a, b)
+	}
+}
+
+// TestRenderCellNormalized_DoubleEventAndBaselineAgree pins that all three
+// origins of the same DOUBLE value converge: a baseline float64 (DuckDB), an
+// event image's json.Number literal, and MySQL's my_gcvt raw text (through
+// normalizeRenderedBytes, as ConsistentTableChecksumNormalized applies it).
+func TestRenderCellNormalized_DoubleEventAndBaselineAgree(t *testing.T) {
+	c := col("double", "double")
+	fromBaseline := renderCellNormalized(float64(1e16), c)
+	fromEvent := renderCellNormalized(json.Number("1e+16"), c)
+	fromMySQL := normalizeRenderedBytes([]byte("1e16"), "double")
+	if !bytes.Equal(fromBaseline, fromEvent) || !bytes.Equal(fromEvent, fromMySQL) {
+		t.Errorf("renderings diverge: baseline=%q event=%q mysql=%q", fromBaseline, fromEvent, fromMySQL)
+	}
+}
