@@ -111,6 +111,13 @@ func TestDeferredReprUnresolved(t *testing.T) {
 			ch(upd(map[string]any{"meta": map[string]any{"tags": []any{"a"}}})), true, false},
 		{"json with a number literal", []metadata.ColumnMeta{jsonCol},
 			ch(upd(map[string]any{"meta": map[string]any{"price": json.Number("1")}})), true, true},
+		// JSON is a base64StoredKind text-decode target too (like BLOB): an
+		// untyped epoch may leave the value as the raw base64 string it was
+		// stored as. "true" is within the base64 alphabet and happens to also
+		// be valid bare JSON, so without an explicit binariesTyped guard it
+		// would slip through jsonRenderConclusive as "resolved".
+		{"json with typing unavailable", []metadata.ColumnMeta{jsonCol},
+			ch(upd(map[string]any{"meta": "true"})), false, true},
 
 		// Binary family: resolved only when the decode pass had epoch typing.
 		{"blob decoded (typed)", []metadata.ColumnMeta{blobCol},
