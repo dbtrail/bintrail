@@ -803,3 +803,79 @@ func TestSynthesizeVictims_setNullGuardProtectsRepointedRow(t *testing.T) {
 		t.Errorf("child 10 mgr should remain 2 (re-pointed), got %v", mgr)
 	}
 }
+
+// TestSynthesizeVictims_sameParentPKDeletedTwice is the regression for #831:
+// visited/emitted were keyed globally by (table, pk), so when the SAME parent
+// PK was deleted, re-created, and deleted again within the window, the second
+// root DELETE was silently skipped — children created between the two deletes
+// were never reconstructed, a child re-deleted with a newer image kept the
+// STALE first-root image, and NO Incomplete caveat was added (exit 0
+// "complete"). Keys are now per-root and cross-root duplicates collapse to the
+// newest image; the SET NULL sibling gets the same newest-wins treatment.
+func TestSynthesizeVictims_sameParentPKDeletedTwice(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+
+	T2 := time.Now().UTC()
+	T1 := T2.Add(-30 * time.Minute)
+	h := T1.Add(-30 * time.Minute).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h, h.Add(time.Hour), h.Add(2 * time.Hour)})
+	genA := T1.Add(-10 * time.Minute).Format("2006-01-02 15:04:05")
+	genB := T1.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// Generation A (cascade-deleted at T1): childc 10, 11; childn 50 nulled.
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, genA, nil, dbName, "childc", 1, "10", nil, nil, []byte(`{"id":10,"pid":1,"val":"a0"}`))
+	testutil.InsertEvent(t, db, "b.000001", 20, 30, genA, nil, dbName, "childc", 1, "11", nil, nil, []byte(`{"id":11,"pid":1,"val":"gen-a"}`))
+	testutil.InsertEvent(t, db, "b.000001", 30, 40, genA, nil, dbName, "childn", 1, "50", nil, nil, []byte(`{"id":50,"ref":1,"val":"n0"}`))
+	// Parent 1 re-created between the deletes; generation B (cascade-deleted at
+	// T2): childc 10 re-created with a NEWER image, childc 20 brand new, childn
+	// 50 re-created with a newer image.
+	testutil.InsertEvent(t, db, "b.000001", 40, 50, genB, nil, dbName, "childc", 1, "10", nil, nil, []byte(`{"id":10,"pid":1,"val":"a1"}`))
+	testutil.InsertEvent(t, db, "b.000001", 50, 60, genB, nil, dbName, "childc", 1, "20", nil, nil, []byte(`{"id":20,"pid":1,"val":"gen-b"}`))
+	testutil.InsertEvent(t, db, "b.000001", 60, 70, genB, nil, dbName, "childn", 1, "50", nil, nil, []byte(`{"id":50,"ref":1,"val":"n1"}`))
+
+	fks := []cascade.CascadeFK{
+		{Schema: dbName, Table: "childc", ConstraintName: "fkc", Column: "pid",
+			ReferencedSchema: dbName, ReferencedTable: "parent", ReferencedColumn: "id", DeleteRule: "CASCADE"},
+		{Schema: dbName, Table: "childn", ConstraintName: "fkn", Column: "ref",
+			ReferencedSchema: dbName, ReferencedTable: "parent", ReferencedColumn: "id", DeleteRule: "SET NULL"},
+	}
+	parents := append(parentDelete(dbName, T1), parentDelete(dbName, T2)...)
+
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, fks, parents, cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if !res.Complete() {
+		t.Errorf("both roots are fully reconstructable; want complete, got %v", res.Incomplete)
+	}
+	byPK := map[string]query.ResultRow{}
+	for _, v := range res.Victims {
+		if _, dup := byPK[v.TableName+":"+v.PKValues]; dup {
+			t.Errorf("victim %s:%s emitted more than once", v.TableName, v.PKValues)
+		}
+		byPK[v.TableName+":"+v.PKValues] = v
+	}
+	if len(res.Victims) != 3 {
+		t.Errorf("want victims childc:10,11,20 exactly once each, got %v", victimList(res.Victims))
+	}
+	if _, ok := byPK["childc:20"]; !ok {
+		t.Errorf("childc:20 (created between the two deletes) missing — second root silently skipped? victims: %v", victimList(res.Victims))
+	}
+	if _, ok := byPK["childc:11"]; !ok {
+		t.Errorf("childc:11 (first cascade) missing; victims: %v", victimList(res.Victims))
+	}
+	if v, ok := byPK["childc:10"]; !ok || v.RowBefore["val"] != "a1" {
+		t.Errorf("childc:10 must carry its NEWEST image val=a1, got %v — stale first-root image", v.RowBefore["val"])
+	}
+	// SET NULL sibling: exactly one restore for childn:50, built from the
+	// newest pre-null image.
+	if len(res.SetNullRows) != 1 {
+		t.Fatalf("want exactly one SET NULL restore for childn:50, got %+v", res.SetNullRows)
+	}
+	if sr := res.SetNullRows[0]; sr.PKValues != "50" || sr.Row["val"] != "n1" {
+		t.Errorf("childn:50 restore must use the newest image val=n1, got %+v", sr)
+	}
+}

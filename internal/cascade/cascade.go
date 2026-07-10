@@ -189,9 +189,11 @@ func (r Result) Complete() bool { return len(r.Incomplete) == 0 }
 //
 // It recurses: synthetic victims become the next layer's parents, so a
 // parent→child→grandchild cascade is fully reconstructed, bounded by MaxDepth
-// and a per-(table,pk) visited guard that also breaks self-referencing-FK
-// cycles. Multi-path cascades (diamonds, multiple FKs to the same parent) emit
-// each victim once via an emitted set, so recovery never double-INSERTs a PK.
+// and a per-(root, table, pk) visited guard that also breaks self-referencing-FK
+// cycles (per ROOT, not global: the same parent PK deleted twice in the window
+// is two distinct cascades, #831). Multi-path cascades (diamonds, multiple FKs
+// to the same parent) emit each victim once via an emitted set, and cross-root
+// duplicates collapse to the newest image, so recovery never double-INSERTs a PK.
 //
 // Coverage is best-effort: every gap is recorded in Result.Incomplete, and an
 // operational query failure additionally returns a non-nil error. The caller
@@ -211,7 +213,27 @@ func SynthesizeVictims(
 		incomplete  []string
 		errs        []error
 	)
-	setNullSeen := map[string]bool{} // "schema.table.column|pkvalues" → SET NULL restore emitted (per-COLUMN: one row may have several single-column SET NULL FKs)
+	// setNullSeen dedups SET NULL restores per (schema.table.column, pk) with
+	// NEWEST-WINS replacement: a child whose FK was nulled by one root, then
+	// re-pointed and nulled again by a later root must restore from its LATEST
+	// pre-null image, not whichever root happened to be walked first (#831).
+	// Per-COLUMN key: one row may have several single-column SET NULL FKs.
+	type setNullSlot struct {
+		idx int       // position in setNullRows
+		ts  time.Time // event/baseline time of the image behind it
+	}
+	setNullSeen := map[string]setNullSlot{} // "schema.table.column|pkvalues" → newest restore emitted
+	addSetNull := func(key string, ts time.Time, sr SetNullRestore) {
+		if slot, ok := setNullSeen[key]; ok {
+			if ts.After(slot.ts) {
+				setNullRows[slot.idx] = sr
+				setNullSeen[key] = setNullSlot{idx: slot.idx, ts: ts}
+			}
+			return
+		}
+		setNullSeen[key] = setNullSlot{idx: len(setNullRows), ts: ts}
+		setNullRows = append(setNullRows, sr)
+	}
 	// addIncomplete records a coverage caveat once per distinct key, so a wide
 	// cascade (many parent×FK iterations) cannot flood the list with near-
 	// identical strings and bury the important ones.
@@ -255,8 +277,15 @@ func SynthesizeVictims(
 			byParent[fk.ReferencedSchema+"."+fk.ReferencedTable], fk)
 	}
 
-	visited := map[string]bool{} // "schema.table|pkvalues" → processed as a parent
-	emitted := map[string]bool{} // "schema.table|pkvalues" → already emitted as a victim
+	// visited/emitted are keyed PER ROOT (the |rootTS suffix): the same parent
+	// PK deleted twice within the window (delete → re-insert → delete) is TWO
+	// distinct cascades with different [since, T] windows, so a global key
+	// would silently skip the second root's subtree — children created between
+	// the two deletes would never be reconstructed, with no Incomplete caveat
+	// (#831). Cross-root duplicates are collapsed AFTER the walk keeping the
+	// newest image (dedupVictimsNewest / setNullSeen's newest-wins slot).
+	visited := map[string]bool{} // "schema.table|pkvalues|rootTS" → processed as a parent under that root
+	emitted := map[string]bool{} // "schema.table|pkvalues|rootTS" → emitted as a victim under that root
 	// skewChecked memoizes the child-side DDL-skew probe per child FK column so a
 	// wide cascade with many childless parents samples each child table at most
 	// once. Only a CONCLUSIVE probe (a window that returned images) memoizes; an
@@ -284,7 +313,8 @@ func SynthesizeVictims(
 		var next []layerItem
 		for _, item := range layer {
 			pev := item.ev
-			pkey := pev.SchemaName + "." + pev.TableName + "|" + pev.PKValues
+			rootKey := strconv.FormatInt(item.rootTS.UnixNano(), 10)
+			pkey := pev.SchemaName + "." + pev.TableName + "|" + pev.PKValues + "|" + rootKey
 			if visited[pkey] {
 				continue
 			}
@@ -464,18 +494,14 @@ func SynthesizeVictims(
 						// parent (e.g. manager_id + mentor_id → user.id). A row-only
 						// key would let the first FK's restore swallow the second's,
 						// leaving a column permanently NULL with no caveat.
-						skey := fk.Schema + "." + fk.Table + "." + fk.Column + "|" + cev.PKValues
-						if setNullSeen[skey] {
-							continue
-						}
-						setNullSeen[skey] = true
-						setNullRows = append(setNullRows, SetNullRestore{
-							Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
-							Value: refVal, PKValues: cev.PKValues, Row: cev.RowAfter,
-						})
+						addSetNull(fk.Schema+"."+fk.Table+"."+fk.Column+"|"+cev.PKValues,
+							cev.EventTimestamp, SetNullRestore{
+								Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
+								Value: refVal, PKValues: cev.PKValues, Row: cev.RowAfter,
+							})
 						continue
 					}
-					vkey := fk.Schema + "." + fk.Table + "|" + cev.PKValues
+					vkey := fk.Schema + "." + fk.Table + "|" + cev.PKValues + "|" + rootKey
 					if emitted[vkey] {
 						// Reached via another cascade path (diamond / multiple FKs
 						// to the same parent); emit once so recovery never
@@ -531,18 +557,14 @@ func SynthesizeVictims(
 							}
 							if fk.DeleteRule == "SET NULL" {
 								// Per-COLUMN key (see the Phase-1 branch above).
-								skey := fk.Schema + "." + fk.Table + "." + fk.Column + "|" + br.PKValues
-								if setNullSeen[skey] {
-									continue
-								}
-								setNullSeen[skey] = true
-								setNullRows = append(setNullRows, SetNullRestore{
-									Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
-									Value: refVal, PKValues: br.PKValues, Row: br.Row,
-								})
+								addSetNull(fk.Schema+"."+fk.Table+"."+fk.Column+"|"+br.PKValues,
+									baseSnap, SetNullRestore{
+										Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
+										Value: refVal, PKValues: br.PKValues, Row: br.Row,
+									})
 								continue
 							}
-							vkey := fk.Schema + "." + fk.Table + "|" + br.PKValues
+							vkey := fk.Schema + "." + fk.Table + "|" + br.PKValues + "|" + rootKey
 							if emitted[vkey] {
 								continue
 							}
@@ -568,7 +590,32 @@ func SynthesizeVictims(
 		}
 		layer = next
 	}
-	return Result{Victims: victims, SetNullRows: setNullRows, Incomplete: incomplete}, errors.Join(errs...)
+	return Result{Victims: dedupVictimsNewest(victims), SetNullRows: setNullRows, Incomplete: incomplete}, errors.Join(errs...)
+}
+
+// dedupVictimsNewest collapses victims of the same (schema, table, pk) emitted
+// under DIFFERENT roots into one synthetic DELETE carrying the newest-timestamp
+// image — the child's last known state, which is what the restoring INSERT must
+// reproduce (#831; within one root the per-root emitted set already dedups).
+// First-seen order is preserved so the emitted SQL stays stable.
+func dedupVictimsNewest(victims []query.ResultRow) []query.ResultRow {
+	if len(victims) < 2 {
+		return victims
+	}
+	idx := make(map[string]int, len(victims))
+	out := victims[:0]
+	for _, v := range victims {
+		key := v.SchemaName + "." + v.TableName + "|" + v.PKValues
+		if j, ok := idx[key]; ok {
+			if v.EventTimestamp.After(out[j].EventTimestamp) {
+				out[j] = v
+			}
+			continue
+		}
+		idx[key] = len(out)
+		out = append(out, v)
+	}
+	return out
 }
 
 // LoadCascadeFKs reads the FK graph WITH referential rules from the INDEX's
