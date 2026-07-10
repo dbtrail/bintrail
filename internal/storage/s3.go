@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -155,10 +156,16 @@ func (b *S3Backend) Put(ctx context.Context, key string, r io.Reader) error {
 // PutIfAbsent uploads the content from r to the given key only if no object
 // exists there, using an S3 conditional write (If-None-Match: *). When an
 // object is already present S3 answers 412 and PutIfAbsent returns an error
-// wrapping ErrObjectExists. The body is buffered in memory — this is meant
-// for small control files (markers), not data uploads. S3-compatible services
-// that do not support conditional writes (NotImplemented/501) fall back to an
-// unconditional Put, i.e. the pre-conditional non-atomic behavior.
+// wrapping ErrObjectExists. S3 also documents a 409 ConditionalRequestConflict
+// response when a conflicting write races the same key during upload — the
+// exact two-writer scenario this method exists to protect — and that is
+// treated the same as the losing 412 case rather than surfaced as a hard
+// error. The body is buffered in memory — this is meant for small control
+// files (markers), not data uploads. S3-compatible services that do not
+// support conditional writes (NotImplemented/501) fall back to an
+// unconditional Put, i.e. the pre-conditional non-atomic behavior; that
+// fallback is logged so the loss of the atomicity guarantee is visible to
+// operators.
 func (b *S3Backend) PutIfAbsent(ctx context.Context, key string, r io.Reader) error {
 	if err := validateKey(key); err != nil {
 		return err
@@ -174,10 +181,13 @@ func (b *S3Backend) PutIfAbsent(ctx context.Context, key string, r io.Reader) er
 		IfNoneMatch: aws.String("*"),
 	})
 	if err != nil {
-		if isAPIErrorCode(err, "PreconditionFailed") || isHTTPStatus(err, http.StatusPreconditionFailed) {
+		if isAPIErrorCode(err, "PreconditionFailed") || isHTTPStatus(err, http.StatusPreconditionFailed) ||
+			isAPIErrorCode(err, "ConditionalRequestConflict") || isHTTPStatus(err, http.StatusConflict) {
 			return fmt.Errorf("storage: put-if-absent %q: %w", key, ErrObjectExists)
 		}
 		if isAPIErrorCode(err, "NotImplemented") || isHTTPStatus(err, http.StatusNotImplemented) {
+			slog.Warn("storage: backend does not support S3 conditional writes (If-None-Match); falling back to an unconditional Put — the put-if-absent atomicity guarantee is inactive for this key and a concurrent writer can silently overwrite it",
+				"key", key)
 			return b.Put(ctx, key, bytes.NewReader(body))
 		}
 		return fmt.Errorf("storage: put-if-absent %q: %w", key, err)

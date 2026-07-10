@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -34,6 +35,12 @@ type mockS3 struct {
 	// NotImplemented, like S3-compatible services without conditional-write
 	// support.
 	condUnsupported bool
+
+	// condConflict makes PutObject reject If-None-Match with the 409
+	// ConditionalRequestConflict AWS documents for a write racing another
+	// conditional write to the same key, instead of the more common 412
+	// PreconditionFailed.
+	condConflict bool
 
 	// Multipart-upload state, exercised by the managed Uploader for bodies
 	// larger than its part size. mpMu guards concurrent UploadPart calls.
@@ -64,6 +71,9 @@ func (m *mockS3) PutObject(_ context.Context, input *s3.PutObjectInput, _ ...fun
 	if aws.ToString(input.IfNoneMatch) == "*" {
 		if m.condUnsupported {
 			return nil, &smithy.GenericAPIError{Code: "NotImplemented", Message: "conditional writes not supported"}
+		}
+		if m.condConflict {
+			return nil, &smithy.GenericAPIError{Code: "ConditionalRequestConflict", Message: "a conflicting conditional operation is currently in progress against this resource"}
 		}
 		if _, exists := m.objects[*input.Key]; exists {
 			return nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "at least one of the pre-conditions you specified did not hold"}
@@ -694,11 +704,59 @@ func TestPutIfAbsentHTTP412Refused(t *testing.T) {
 	}
 }
 
+// TestPutIfAbsentConditionalRequestConflictRefused pins the #806 review
+// finding: AWS documents a 409 ConditionalRequestConflict response (as
+// opposed to the more common 412 PreconditionFailed) when a conflicting
+// write races the same key during upload — the exact two-writer race this
+// method exists to protect. Before the fix this error code fell through to
+// the generic error branch, so the losing writer of the race got a hard
+// error instead of ErrObjectExists and the caller's read-and-compare
+// fallback was never reached.
+func TestPutIfAbsentConditionalRequestConflictRefused(t *testing.T) {
+	mock := newMockS3()
+	mock.condConflict = true
+	b := newTestBackend(t, mock, "")
+	ctx := context.Background()
+
+	err := b.PutIfAbsent(ctx, "marker", strings.NewReader("intruder"))
+	if !errors.Is(err, ErrObjectExists) {
+		t.Fatalf("want ErrObjectExists for 409 ConditionalRequestConflict, got: %v", err)
+	}
+}
+
+// TestPutIfAbsentHTTP409Refused mirrors TestPutIfAbsentHTTP412Refused for the
+// generic-HTTP-status form of the same 409 ConditionalRequestConflict case,
+// for backends that surface it without an S3 error code.
+func TestPutIfAbsentHTTP409Refused(t *testing.T) {
+	mock := newMockS3()
+	b := newTestBackend(t, mock, "")
+	mock.putErr = &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{
+			Response: &http.Response{StatusCode: http.StatusConflict},
+		},
+		Err: fmt.Errorf("conditional request conflict"),
+	}
+
+	err := b.PutIfAbsent(context.Background(), "marker", strings.NewReader("x"))
+	if !errors.Is(err, ErrObjectExists) {
+		t.Fatalf("want ErrObjectExists for generic HTTP 409, got: %v", err)
+	}
+}
+
 func TestPutIfAbsentNotImplementedFallsBack(t *testing.T) {
 	mock := newMockS3()
 	mock.condUnsupported = true
 	b := newTestBackend(t, mock, "")
 	ctx := context.Background()
+
+	// Capture slog to assert the degraded-guarantee warning fired — before
+	// the fix this fallback was silent, so operators on S3-compatible
+	// backends without conditional-write support had no signal that the
+	// put-if-absent atomicity guarantee was inactive.
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
 
 	// Backends without conditional-write support degrade to a plain Put —
 	// the pre-conditional behavior — instead of failing the write.
@@ -707,6 +765,9 @@ func TestPutIfAbsentNotImplementedFallsBack(t *testing.T) {
 	}
 	if got := string(mock.objects["marker"]); got != "v1" {
 		t.Errorf("fallback Put did not store object, got %q", got)
+	}
+	if !strings.Contains(logBuf.String(), "does not support S3 conditional writes") {
+		t.Errorf("want a warning logged for the NotImplemented fallback, got log output: %q", logBuf.String())
 	}
 }
 
