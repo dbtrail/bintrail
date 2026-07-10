@@ -285,19 +285,33 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 
 	// Single-row reconstruct (and the shim's _snapshot) run generically for a
-	// PostgreSQL source — there is no PG-specific gate, so this path is live
-	// today. It is validated for canonical, session-GUC-independent types; the
-	// GUC-sensitive and container types are beta and not yet proven end-to-end
-	// through the baseline↔delta fold (#593 slice D). Warn — never refuse (the
-	// path is honest-best-effort and a refusal would break the surface that DOES
-	// work). Detect PG by the recorded flavor OR the baseline's LSN anchor (read
-	// from S3 too since #916). Both clauses are load-bearing: the LSN clause
-	// catches any PG baseline carrying an anchor (post-#593, local or S3); the
-	// flavor clause catches a pre-#593 PG baseline with LSN==0 (no anchor) and
+	// PostgreSQL source — there is no PG-specific gate. Scalar types INCLUDING
+	// the GUC-sensitive set (timestamptz/timestamp/date/time, float4/float8,
+	// bytea, interval) are proven end-to-end through the baseline↔delta fold
+	// under rendering GUCs pinned identically on the baseline COPY and
+	// walsender sessions (#593 slice D, pgcapture/gucpin.go,
+	// TestOne_PGTypeMatrixThroughReconstructFold); the residual beta surface
+	// is container types only. Warn — never refuse (the path is honest-best-
+	// effort and a refusal would break the surface that DOES work). Detect PG
+	// by the recorded flavor OR the baseline's LSN anchor (read from S3 too
+	// since #916). Both clauses are load-bearing: the LSN clause catches any
+	// PG baseline carrying an anchor (post-#593, local or S3); the flavor
+	// clause catches a pre-#593 PG baseline with LSN==0 (no anchor) and
 	// backstops a baseline whose metadata read failed. --baseline-only returns
-	// above, before the DB is ever opened, so it never reaches this warn.
+	// above, before the DB is ever opened, so it never reaches these warns.
 	if pgReconstructBeta(query.SourceFlavor(db), bmeta.LSN) {
-		slog.Warn("single-row reconstruct for a PostgreSQL source is beta — validated for canonical types (int/numeric/bool/uuid/text/json/enum and the common PK types) but not yet proven end-to-end for timestamptz/float/bytea/interval/array types; verify the round-trip before relying on it (#593)")
+		slog.Warn("single-row reconstruct for a PostgreSQL source: scalar types (including timestamptz/timestamp/date/time, float, bytea, interval — rendered under session GUCs pinned identically at capture and baseline) are validated end-to-end; container types (arrays beyond integer[]/text[], composite, range/multirange, hstore, geometric) remain beta — verify the round-trip before relying on them (#593)")
+		// A PG baseline whose rendering-GUC stamp is absent (pre-pin, rendered
+		// under the server's session defaults) OR different from the current
+		// pin was rendered under other GUCs; on a server whose defaults differ
+		// from the pin, its GUC-sensitive text will not join post-pin deltas —
+		// the merge is an exact text join. Warn with the remediation.
+		// (Comparing the VALUE, not mere presence, also catches a baseline
+		// produced by a binary with a different pinned set.)
+		if bmeta.LSN != 0 && bmeta.RenderGUCs != baseline.RenderGUCsPinned {
+			slog.Warn("this baseline's rendering-GUC stamp does not match the current pin (#593) — it predates GUC pinning or was produced under a different pin; on a server whose TimeZone/DateStyle/extra_float_digits/bytea_output/IntervalStyle defaults differ from the pinned values, its GUC-sensitive text will not match newer deltas; re-run `bintrail-pg baseline` to refresh it",
+				"baseline_render_gucs", bmeta.RenderGUCs)
+		}
 	}
 
 	// Refuse if a TRUNCATE/DROP/RENAME hit this table in the window: it emits

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **PostgreSQL rendering GUCs pinned on capture and baseline sessions** (#593 slice D). The baseline+delta reconstruct design rests on the identity *baseline COPY text ≡ pgoutput delta text* — the PK join and last-write-wins merge are exact string operations — but both sides render values through PostgreSQL's session-GUC-dependent output functions, and neither session pinned any GUC: the same logical value could render as different text on the two sides, silently breaking the merge for `timestamptz`/`timestamp`/`date`/`time`, `real`/`double precision`, `bytea`, and `interval`. Every connection that renders row text — the logical-decoding (walsender) session and the baseline COPY connections — is now pinned via startup parameters to `TimeZone=UTC`, `DateStyle=ISO`, `extra_float_digits=3`, `bytea_output=hex`, `IntervalStyle=postgres`; the pinned set is stamped into the baseline Parquet metadata (`bintrail.render_gucs`), and single-row `reconstruct` warns when it reads a pre-pin baseline. The full type matrix is now validated **through the single-row reconstruct fold** under deliberately skewed session GUCs on the PG 14–17 CI matrix (`TestOne_PGTypeMatrixThroughReconstructFold`); the single-row PG beta warning narrows to container types only.
+
+  **Upgrade note:** on servers whose defaults differ from the pinned values, baselines taken **before** this release were rendered under the unpinned session defaults and their GUC-sensitive text will not text-join deltas captured **after** the upgrade (worst case, a `timestamptz`/`float` value silently stops matching in the fold). Re-run `bintrail-pg baseline` after upgrading. Events indexed before the upgrade keep their original rendering and cannot be re-rendered; a fold window spanning the upgrade on such a server can mix renderings.
+
 ## [0.29.2] - 2026-07-05
 
 ### Fixed
