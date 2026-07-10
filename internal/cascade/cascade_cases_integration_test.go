@@ -880,6 +880,81 @@ func TestSynthesizeVictims_sameParentPKDeletedTwice(t *testing.T) {
 	}
 }
 
+// TestSynthesizeVictims_sameSecondRootsNotCollapsed is a follow-up regression
+// for #831: visited/emitted keyed the same-parent-PK-deleted-twice case by
+// event_timestamp truncated to whole seconds (DATETIME has no fractional
+// component), so two GENUINELY DISTINCT root deletes landing in the same
+// wall-clock second collided on an identical key and the second root's
+// cascade was silently never walked — reproducing #831 at sub-second
+// granularity despite the fix above. Roots are keyed by the root's own
+// EventID (the binlog_events auto-increment PK, always unique) instead.
+//
+// The FK references a non-PK unique column (unique_key) whose value differs
+// between the parent PK's two incarnations, so each root's cascade walk
+// matches a DIFFERENT child — this makes a collision observable without
+// relying on real-time sub-second timing: both DELETE events are inserted
+// with the IDENTICAL stored timestamp, deterministically, and the test would
+// be flaky-free either way.
+func TestSynthesizeVictims_sameSecondRootsNotCollapsed(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+
+	T := time.Now().UTC()
+	h := T.Add(-1 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h, h.Add(time.Hour)})
+	sameTS := T.Format("2006-01-02 15:04:05")
+	childTS := T.Add(-10 * time.Minute).Format("2006-01-02 15:04:05")
+
+	// Children referencing each incarnation's unique_key, both well within
+	// the lookback window of the (identical) root timestamp.
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, childTS, nil, dbName, "childc", 1, "10", nil, nil,
+		[]byte(`{"id":10,"ref_key":"A","val":"a0"}`))
+	testutil.InsertEvent(t, db, "b.000001", 20, 30, childTS, nil, dbName, "childc", 1, "20", nil, nil,
+		[]byte(`{"id":20,"ref_key":"B","val":"b0"}`))
+
+	// Two DISTINCT root deletes of parent pk=1, at the IDENTICAL stored
+	// second — the same PK re-created between them with a DIFFERENT
+	// unique_key ("A" then "B"), so each root's cascade is genuinely
+	// different despite sharing a timestamp.
+	testutil.InsertEvent(t, db, "b.000001", 30, 40, sameTS, nil, dbName, "parent", 3, "1", nil,
+		[]byte(`{"id":1,"unique_key":"A"}`), nil)
+	testutil.InsertEvent(t, db, "b.000001", 40, 50, sameTS, nil, dbName, "parent", 3, "1", nil,
+		[]byte(`{"id":1,"unique_key":"B"}`), nil)
+
+	del := event.EventDelete
+	parentDeletes := mustFetch(t, eng, query.Options{Schema: dbName, Table: "parent", EventType: &del, Order: "ASC"})
+	if len(parentDeletes) != 2 {
+		t.Fatalf("want 2 parent DELETE events, got %d", len(parentDeletes))
+	}
+	if !parentDeletes[0].EventTimestamp.Equal(parentDeletes[1].EventTimestamp) {
+		t.Fatalf("test setup requires both roots to share one stored second, got %v and %v",
+			parentDeletes[0].EventTimestamp, parentDeletes[1].EventTimestamp)
+	}
+	if parentDeletes[0].EventID == parentDeletes[1].EventID {
+		t.Fatalf("test setup requires two distinct EventIDs, got both = %d", parentDeletes[0].EventID)
+	}
+
+	fks := []cascade.CascadeFK{{
+		Schema: dbName, Table: "childc", ConstraintName: "fkc", Column: "ref_key",
+		ReferencedSchema: dbName, ReferencedTable: "parent", ReferencedColumn: "unique_key",
+		DeleteRule: "CASCADE",
+	}}
+
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, fks, parentDeletes, cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if !res.Complete() {
+		t.Errorf("both roots are fully reconstructable; want complete, got %v", res.Incomplete)
+	}
+	got := victimKeys(res.Victims)
+	if !got["childc:10"] || !got["childc:20"] {
+		t.Errorf("want both childc:10 (root A) and childc:20 (root B) reconstructed — a same-second root was silently skipped? got %v", victimList(res.Victims))
+	}
+}
+
 // insertFKRow inserts one fk_constraints edge directly, bypassing TakeSnapshot,
 // so tests can build a controlled FK snapshot history with explicit times.
 func insertFKRow(t *testing.T, db *sql.DB, snapshotID int, constraint, schema, table, column, refSchema, refTable, refColumn, deleteRule string) {
@@ -932,12 +1007,15 @@ func TestLoadCascadeFKs_snapshotInEffectAtDelete(t *testing.T) {
 	}
 
 	// The production loader resolves the same way, without a caveat.
-	fks, caveat, err := cascade.LoadCascadeFKsForParent(ctx, indexDB, "app", atDelete)
+	fks, snapID, caveat, err := cascade.LoadCascadeFKsForParent(ctx, indexDB, "app", atDelete)
 	if err != nil {
 		t.Fatalf("LoadCascadeFKsForParent(11:00): %v", err)
 	}
 	if len(fks) != 1 || fks[0].DeleteRule != "CASCADE" {
 		t.Errorf("ForParent between snapshots must use snapshot 1 (CASCADE), got %+v", fks)
+	}
+	if snapID != 1 {
+		t.Errorf("delete between snapshots must resolve snapshot 1, got snapshotID=%d", snapID)
 	}
 	if caveat != "" {
 		t.Errorf("a covered delete must carry no caveat, got %q", caveat)
@@ -945,14 +1023,98 @@ func TestLoadCascadeFKs_snapshotInEffectAtDelete(t *testing.T) {
 
 	// A delete BEFORE the first FK snapshot falls back to the earliest graph
 	// (closest approximation) and must say so — never silently.
-	fks, caveat, err = cascade.LoadCascadeFKsForParent(ctx, indexDB, "app", s1.Add(-time.Hour))
+	fks, snapID, caveat, err = cascade.LoadCascadeFKsForParent(ctx, indexDB, "app", s1.Add(-time.Hour))
 	if err != nil {
 		t.Fatalf("LoadCascadeFKsForParent(09:00): %v", err)
 	}
 	if len(fks) != 1 || fks[0].DeleteRule != "CASCADE" {
 		t.Errorf("pre-history delete must fall back to the EARLIEST graph, got %+v", fks)
 	}
+	if snapID != 1 {
+		t.Errorf("pre-history fallback must resolve the earliest snapshot (1), got snapshotID=%d", snapID)
+	}
 	if caveat == "" {
 		t.Error("pre-history fallback must surface a caveat")
+	}
+}
+
+// TestGroupParentDeletesByFKGraph_multiRootTopologyChange is the regression
+// for the follow-up to #834: a BATCH of parent deletes anchored on a single
+// (the earliest) root's FK graph can silently mis-recover a LATER root when
+// the FK topology changed mid-window. Root A's delete is correctly under
+// RESTRICT (no real cascade); root B's later delete is under CASCADE and has
+// a genuine cascade victim. Anchoring the whole batch on root A's (earlier,
+// RESTRICT) snapshot would silently drop root B's real victim with no
+// caveat — exit 0 "complete". Each root must resolve its OWN graph.
+func TestGroupParentDeletesByFKGraph_multiRootTopologyChange(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+
+	base := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
+	s1 := base                            // 09:00: RESTRICT
+	s2 := base.Add(30 * time.Minute)      // 09:30: CASCADE
+	rootA := base.Add(10 * time.Minute)   // 09:10: under RESTRICT, no real cascade
+	rootB := base.Add(60 * time.Minute)   // 10:00: under CASCADE, real cascade victim
+	childTS := base.Add(45 * time.Minute) // 09:45: after s2, before rootB
+	const fmtDT = "2006-01-02 15:04:05"
+
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{
+		base.Truncate(time.Hour), base.Add(time.Hour).Truncate(time.Hour),
+	})
+
+	testutil.InsertSnapshot(t, db, 1, s1.Format(fmtDT), dbName, "child", "id", 1, "PRI", "int", "NO")
+	insertFKRow(t, db, 1, "fk_child", dbName, "child", "pid", dbName, "parent", "id", "RESTRICT")
+	testutil.InsertSnapshot(t, db, 2, s2.Format(fmtDT), dbName, "child", "id", 1, "PRI", "int", "NO")
+	insertFKRow(t, db, 2, "fk_child", dbName, "child", "pid", dbName, "parent", "id", "CASCADE")
+
+	// Root B's real cascade victim: a child referencing parent pk=2, present
+	// before root B's delete (and after the CASCADE snapshot).
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, childTS.Format(fmtDT), nil, dbName, "child", 1, "100", nil, nil,
+		[]byte(`{"id":100,"pid":2,"val":"v0"}`))
+
+	testutil.InsertEvent(t, db, "b.000001", 20, 30, rootA.Format(fmtDT), nil, dbName, "parent", 3, "1", nil,
+		[]byte(`{"id":1}`), nil)
+	testutil.InsertEvent(t, db, "b.000001", 30, 40, rootB.Format(fmtDT), nil, dbName, "parent", 3, "2", nil,
+		[]byte(`{"id":2}`), nil)
+
+	del := event.EventDelete
+	parentDeletes := mustFetch(t, eng, query.Options{Schema: dbName, Table: "parent", EventType: &del, Order: "ASC"})
+	if len(parentDeletes) != 2 {
+		t.Fatalf("want 2 parent DELETE events, got %d", len(parentDeletes))
+	}
+
+	groups, caveats, err := cascade.GroupParentDeletesByFKGraph(ctx, db, dbName, parentDeletes)
+	if err != nil {
+		t.Fatalf("GroupParentDeletesByFKGraph: %v", err)
+	}
+	if len(caveats) != 0 {
+		t.Errorf("both roots are covered by an FK snapshot; want no caveats, got %v", caveats)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("root A (RESTRICT) and root B (CASCADE) must resolve DIFFERENT graphs, want 2 groups, got %d", len(groups))
+	}
+
+	results := make([]cascade.Result, 0, len(groups))
+	for _, g := range groups {
+		r, serr := cascade.SynthesizeVictims(ctx, eng, g.FKs, g.Roots, cascade.Options{})
+		if serr != nil {
+			t.Fatalf("SynthesizeVictims: %v", serr)
+		}
+		results = append(results, r)
+	}
+	res := cascade.MergeResults(results...)
+
+	if !res.Complete() {
+		t.Errorf("both roots are fully reconstructable; want complete, got %v", res.Incomplete)
+	}
+	got := victimKeys(res.Victims)
+	if !got["child:100"] {
+		t.Errorf("root B's real cascade victim child:100 is missing — batch-anchored on root A's (RESTRICT) graph? got %v", victimList(res.Victims))
+	}
+	if len(res.Victims) != 1 {
+		t.Errorf("root A (RESTRICT) must NOT fabricate a victim, want exactly 1 victim, got %v", victimList(res.Victims))
 	}
 }
