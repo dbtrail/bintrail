@@ -183,7 +183,7 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	// at the library boundary here means library callers (not just the CLI)
 	// also get the migration automatically.
 	if err := indexer.EnsureSchema(db); err != nil {
-		return nil, fmt.Errorf("ensure index schema: %w", err)
+		return nil, indexer.WrapSchemaMigrationErr(err)
 	}
 
 	// Derive DBName for the query planner.

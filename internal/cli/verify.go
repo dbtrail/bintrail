@@ -105,7 +105,7 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 	// an index last written by an older binary would otherwise fail with
 	// MySQL error 1054 — a false drift alert.
 	if err := indexer.EnsureSchema(indexDB); err != nil {
-		return fmt.Errorf("ensure index schema: %w", err)
+		return indexer.WrapSchemaMigrationErr(err)
 	}
 
 	var indexDBName string

@@ -234,7 +234,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 	// abort EVERY _flashback/_snapshot client query with MySQL error 1054
 	// until some unrelated writer command migrated the index.
 	if err := indexer.EnsureSchema(db); err != nil {
-		return fmt.Errorf("ensure index schema: %w", err)
+		return indexer.WrapSchemaMigrationErr(err)
 	}
 
 	listener, err := net.Listen("tcp", shListen)

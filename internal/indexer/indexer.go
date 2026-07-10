@@ -584,6 +584,35 @@ func EnsureSchema(db *sql.DB) error {
 	return nil
 }
 
+// WrapSchemaMigrationErr rewrites an EnsureSchema failure for the READ plane
+// (query, recover, verify, shim, reconstruct, whochanged, recover-cascade,
+// the MCP tools) into an actionable error.
+//
+// EnsureSchema issues ALTER TABLE / CREATE TABLE statements, which a
+// SELECT-only DSN — the natural pairing with the RBAC --profile feature —
+// lacks the privilege for. MySQL then returns errno 1142
+// (ER_TABLEACCESS_DENIED_ERROR) or 1044 (ER_DBACCESS_DENIED_ERROR), whose raw
+// message names neither the privilege cause nor the fix, so the read plane
+// refuses to read data it could otherwise serve with an unhelpful error.
+// Detect those two errors specifically and rewrite them to name both cause
+// and fix; every other EnsureSchema failure (connection drop, context
+// deadline, etc.) is not a privilege issue and passes through with a plain
+// "schema migration" wrap so it isn't misdiagnosed.
+//
+// The CAPTURE plane (index, stream, agent, rotate) legitimately requires a
+// privileged DSN and must keep failing hard on any EnsureSchema error — those
+// call sites must NOT use this helper.
+func WrapSchemaMigrationErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && (mysqlErr.Number == 1142 || mysqlErr.Number == 1044) {
+		return fmt.Errorf("index schema is out of date and this user's DSN cannot migrate it (missing ALTER/CREATE privilege) — run any capture-plane command (index, stream, agent, or rotate) once with a privileged DSN to bring the schema up to date: %w", err)
+	}
+	return fmt.Errorf("schema migration: %w", err)
+}
+
 // tableExists reports whether a base table named `table` exists in the current
 // database.
 func tableExists(db *sql.DB, table string) (bool, error) {

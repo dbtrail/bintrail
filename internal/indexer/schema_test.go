@@ -1,9 +1,14 @@
 package indexer
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 // ─── buildBinlogEventsDDL ───────────────────────────────────────────────────
@@ -210,5 +215,81 @@ func TestDDLSchemaChanges_hasIndex(t *testing.T) {
 	}
 	if !strings.Contains(ddlSchemaChanges, "idx_schema_table") {
 		t.Error("ddlSchemaChanges must contain idx_schema_table index")
+	}
+}
+
+// ─── WrapSchemaMigrationErr (#958) ─────────────────────────────────────────
+
+func TestWrapSchemaMigrationErr_nil(t *testing.T) {
+	if got := WrapSchemaMigrationErr(nil); got != nil {
+		t.Errorf("expected nil for nil input, got %v", got)
+	}
+}
+
+func TestWrapSchemaMigrationErr_privilegeErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		number uint16
+	}{
+		{"1142 table access denied", 1142},
+		{"1044 db access denied", 1044},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mysqlErr := &mysql.MySQLError{Number: tc.number, Message: "ALTER command denied to user"}
+			// EnsureSchema's own helpers (ensureColumn, ensureColumnWidened,
+			// the connection_cache CREATE) wrap the raw driver error at least
+			// once before it reaches the caller — mirror that here so the
+			// test exercises errors.As unwrapping through a wrapper, not
+			// just a bare *mysql.MySQLError.
+			wrapped := fmt.Errorf("add binlog_events.connection_id column: %w", mysqlErr)
+
+			got := WrapSchemaMigrationErr(wrapped)
+			if got == nil {
+				t.Fatal("expected a non-nil error")
+			}
+			msg := got.Error()
+			for _, want := range []string{"out of date", "privilege", "capture-plane", "privileged DSN"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("expected rewritten message to mention %q, got: %s", want, msg)
+				}
+			}
+			// The underlying MySQL error must still be reachable for
+			// errors.Is/errors.As-based logging or handling.
+			var reErr *mysql.MySQLError
+			if !errors.As(got, &reErr) {
+				t.Fatal("expected errors.As to still find the underlying *mysql.MySQLError")
+			}
+			if reErr.Number != tc.number {
+				t.Errorf("expected errno %d preserved, got %d", tc.number, reErr.Number)
+			}
+			if !errors.Is(got, mysqlErr) {
+				t.Error("expected errors.Is(got, mysqlErr) to hold (original error wrapped via %w)")
+			}
+		})
+	}
+}
+
+func TestWrapSchemaMigrationErr_nonPrivilegeErrorPassesThrough(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"context deadline exceeded", context.DeadlineExceeded},
+		{"connection refused", errors.New("dial tcp 127.0.0.1:3306: connect: connection refused")},
+		{"unrelated mysql errno (e.g. 1054 unknown column)", &mysql.MySQLError{Number: 1054, Message: "Unknown column 'x'"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := WrapSchemaMigrationErr(tc.err)
+			if got == nil {
+				t.Fatal("expected a non-nil error")
+			}
+			msg := got.Error()
+			if strings.Contains(msg, "privilege") || strings.Contains(msg, "capture-plane") {
+				t.Errorf("non-privilege error must not be misdiagnosed as a privilege issue, got: %s", msg)
+			}
+			if !errors.Is(got, tc.err) {
+				t.Error("expected errors.Is(got, original) to hold — the original error must not be lost")
+			}
+		})
 	}
 }

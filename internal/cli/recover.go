@@ -189,7 +189,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 
 	if err := indexer.EnsureSchema(db); err != nil {
-		return fmt.Errorf("schema migration: %w", err)
+		return indexer.WrapSchemaMigrationErr(err)
 	}
 
 	// Plain recover cannot reconstruct rows deleted by an FK ON DELETE CASCADE:

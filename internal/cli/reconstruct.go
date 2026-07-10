@@ -281,7 +281,7 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	// pre-upgrade index 1054s while full-table mode (which already calls
 	// EnsureSchema in reconstruct.ReconstructTable) self-heals.
 	if err := indexer.EnsureSchema(db); err != nil {
-		return fmt.Errorf("ensure index schema: %w", err)
+		return indexer.WrapSchemaMigrationErr(err)
 	}
 
 	// Single-row reconstruct (and the shim's _snapshot) run generically for a

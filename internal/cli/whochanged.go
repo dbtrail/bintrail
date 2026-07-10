@@ -127,7 +127,7 @@ func runWhoChanged(cmd *cobra.Command, args []string) error {
 	}
 	defer indexDB.Close()
 	if err := indexer.EnsureSchema(indexDB); err != nil {
-		return fmt.Errorf("schema migration: %w", err)
+		return indexer.WrapSchemaMigrationErr(err)
 	}
 
 	deps := forensics.WhoChangedDeps{IndexDB: indexDB}

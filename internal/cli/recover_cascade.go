@@ -242,7 +242,7 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 	if err := indexer.EnsureSchema(db); err != nil {
-		return fmt.Errorf("schema migration: %w", err)
+		return indexer.WrapSchemaMigrationErr(err)
 	}
 
 	// Resolver enables PK-only WHERE clauses. Best-effort for the CASCADE path

@@ -238,7 +238,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 
 	if err := indexer.EnsureSchema(db); err != nil {
-		return fmt.Errorf("schema migration: %w", err)
+		return indexer.WrapSchemaMigrationErr(err)
 	}
 
 	if qProfile != "" {

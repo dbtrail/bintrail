@@ -338,7 +338,7 @@ func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolReque
 		// (query_text/query_hash, #699) and the MCP server opens a fresh DB
 		// per tool call, so the migration has to run here.
 		if err := indexer.EnsureSchema(db); err != nil {
-			return errorResult(fmt.Errorf("ensure index schema: %w", err)), nil, nil
+			return errorResult(indexer.WrapSchemaMigrationErr(err)), nil, nil
 		}
 
 		opts, err := buildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
@@ -455,7 +455,7 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 		// commands call EnsureSchema at startup; the MCP server opens a
 		// fresh DB per tool call, so the migration has to run here.
 		if err := indexer.EnsureSchema(db); err != nil {
-			return errorResult(fmt.Errorf("ensure index schema: %w", err)), nil, nil
+			return errorResult(indexer.WrapSchemaMigrationErr(err)), nil, nil
 		}
 
 		defaultLimit := 1000
