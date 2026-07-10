@@ -362,16 +362,17 @@ For `UPDATE` and `DELETE` reversals, the generator needs a `WHERE` clause to ide
 UPDATE `mydb`.`orders` SET `status` = 'draft' WHERE `id` = 42
 ```
 
-**Without a snapshot (fallback)**: Uses every column in the row image. This is verbose, and is **not** a guarantee of correctness even for tables without duplicate rows:
+**Without a snapshot (fallback)**: Uses every column in the row image, capped at one row:
 
 ```sql
 UPDATE `mydb`.`orders`
 SET `status` = 'draft'
-WHERE `id` = 42 AND `status` = 'published' AND `created_at` = '2026-02-19 14:01:00' AND `notes` IS NULL
+WHERE `id` = 42 AND `status` = 'published' AND `created_at` = '2026-02-19 14:01:00' AND `notes` IS NULL LIMIT 1
 ```
 
-- A `NULL` column renders as `IS NULL` (not `= NULL`, which never matches in SQL) — but a row whose *other* columns are all non-`NULL` and identical to another row (no natural key, no snapshot) will match **both** rows, and the reversal over-applies. There is no runtime detection of this: the generator has no way to know the table has (or doesn't have) duplicate rows.
-- "Without duplicate rows" is a precondition the generator assumes, not something it checks. If you rely on this fallback (no schema snapshot available), verify the table has a natural uniqueness property before applying the generated script.
+- A `NULL` column renders as `IS NULL` (not `= NULL`, which never matches in SQL).
+- An all-columns `WHERE` matches **every byte-identical duplicate row** (PK-less table, no natural key), while the original event touched exactly one row. Fallback `UPDATE`/`DELETE` reversals therefore carry `LIMIT 1` on the MySQL dialect, so reversing one `INSERT` removes one copy instead of silently deleting all duplicates. Which physical copy is affected is undefined — and irrelevant, since the matching rows are identical on every referenced column.
+- PostgreSQL has no `UPDATE`/`DELETE ... LIMIT`, so PostgreSQL-dialect fallback statements remain unbounded: with byte-identical duplicate rows the reversal still over-applies there. If you rely on this fallback against PostgreSQL, verify the table has a natural uniqueness property before applying the generated script.
 
 The resolver is loaded best-effort in the `recover` command — a failure logs a warning and falls back to the all-columns strategy.
 
