@@ -10,6 +10,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/buffer"
 	"github.com/dbtrail/dbtrail/internal/parser"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // makeRecoverEvent builds a single INSERT-style parser.Event for the buffer.
@@ -301,5 +302,98 @@ func TestRecoverRequestJSON_backwardCompat(t *testing.T) {
 	}
 	if req.TimeStart.IsZero() {
 		t.Errorf("TimeStart should be parsed from JSON")
+	}
+}
+
+// TestHandleResolvePK_archiveFetchedOncePerTable is the regression test for
+// #818: the archive fallback used to fetch the ENTIRE archived table once
+// per batch item (per source). It must fetch each (source, schema, table)
+// exactly once per resolve_pk command and reuse the hash index for every
+// item in the batch.
+func TestHandleResolvePK_archiveFetchedOncePerTable(t *testing.T) {
+	calls := map[string]int{}
+	h := &DefaultHandler{
+		ArchiveSources: []string{"srcA"},
+		ArchiveFetcher: func(ctx context.Context, opts query.Options, source string) ([]query.ResultRow, error) {
+			calls[source+"|"+opts.Schema+"|"+opts.Table]++
+			if opts.Schema == "shop" && opts.Table == "orders" {
+				return []query.ResultRow{
+					{PKValues: "1"},
+					{PKValues: "1"}, // duplicate pk across events
+					{PKValues: "2"},
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	req := ResolvePKRequest{Items: []PKItem{
+		{PKHash: byosPKHash("1"), Schema: "shop", Table: "orders"},
+		{PKHash: byosPKHash("2"), Schema: "shop", Table: "orders"},
+		{PKHash: byosPKHash("999"), Schema: "shop", Table: "orders"}, // miss
+		{PKHash: byosPKHash("u1"), Schema: "shop", Table: "users"},   // different table
+	}}
+	results, err := h.HandleResolvePK(context.Background(), req)
+	if err != nil {
+		t.Fatalf("HandleResolvePK: %v", err)
+	}
+
+	if got := calls["srcA|shop|orders"]; got != 1 {
+		t.Errorf("shop.orders fetched %d times, want exactly 1 for the whole batch", got)
+	}
+	if got := calls["srcA|shop|users"]; got != 1 {
+		t.Errorf("shop.users fetched %d times, want 1", got)
+	}
+
+	want := []PKResult{
+		{PKHash: byosPKHash("1"), PKValues: "1", Found: true},
+		{PKHash: byosPKHash("2"), PKValues: "2", Found: true},
+		{PKHash: byosPKHash("999")},
+		{PKHash: byosPKHash("u1")},
+	}
+	for i, w := range want {
+		if results[i] != w {
+			t.Errorf("results[%d] = %+v, want %+v", i, results[i], w)
+		}
+	}
+}
+
+// TestHandleResolvePK_archiveErrorNotCached: a failing source is skipped for
+// the current item (warn-and-continue, unchanged behavior) and the failure is
+// NOT memoized — the next item retries it, and a later healthy source still
+// resolves the hash.
+func TestHandleResolvePK_archiveErrorNotCached(t *testing.T) {
+	fetches := map[string]int{}
+	h := &DefaultHandler{
+		ArchiveSources: []string{"bad", "good"},
+		ArchiveFetcher: func(ctx context.Context, opts query.Options, source string) ([]query.ResultRow, error) {
+			fetches[source]++
+			if source == "bad" {
+				return nil, fmt.Errorf("boom")
+			}
+			return []query.ResultRow{{PKValues: "42"}}, nil
+		},
+	}
+
+	req := ResolvePKRequest{Items: []PKItem{
+		{PKHash: byosPKHash("42"), Schema: "shop", Table: "orders"},
+		{PKHash: byosPKHash("nope"), Schema: "shop", Table: "orders"},
+	}}
+	results, err := h.HandleResolvePK(context.Background(), req)
+	if err != nil {
+		t.Fatalf("HandleResolvePK: %v", err)
+	}
+
+	if !results[0].Found || results[0].PKValues != "42" {
+		t.Errorf("results[0] = %+v, want found via healthy source", results[0])
+	}
+	if results[1].Found {
+		t.Errorf("results[1] = %+v, want not found", results[1])
+	}
+	if got := fetches["bad"]; got != 2 {
+		t.Errorf("failing source fetched %d times, want 2 (errors must not be cached)", got)
+	}
+	if got := fetches["good"]; got != 1 {
+		t.Errorf("healthy source fetched %d times, want 1 (memoized)", got)
 	}
 }
