@@ -464,6 +464,12 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 		if err != nil {
 			return errorResult(err), nil, nil
 		}
+		// When --limit truncates the matched window it must keep the most
+		// RECENT events (#785/#927): the ASC default would keep the OLDEST
+		// prefix, undoing old events underneath later un-reverted ones — a
+		// state that never historically existed. Rows are re-sorted ascending
+		// after the fetch, before generation (see below).
+		opts.Order = "DESC"
 
 		if args.Profile != "" {
 			denyTables, redactCols, err := query.LoadProfileRules(ctx, db, args.Profile)
@@ -512,6 +518,12 @@ func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolReq
 				return errorResult(err), nil, nil
 			}
 		}
+
+		// The fetch above ran Order=DESC so --limit kept the newest suffix of
+		// the window (#785/#927). Restore ascending order: GenerateSQLFromRows
+		// expects ASC input and reverses it internally to undo most-recent
+		// first.
+		rows = query.MergeResults(rows, 0, "ASC")
 
 		gen := recovery.NewForDialect(db, resolver, recovery.DialectForIndex(db))
 		var buf bytes.Buffer
