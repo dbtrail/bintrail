@@ -11,7 +11,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -257,18 +256,6 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 
 		stmt, cols, err := g.buildStatement(row)
 		if err != nil {
-			// The #788 untypeable-columns refusal is TABLE-level, not a per-row image
-			// defect: refuse the whole script immediately with its own typed,
-			// caller-actionable error (take a snapshot) rather than folding it into the
-			// malformed-row aggregation below, whose "malformed or truncated stored row
-			// image" wording would misdescribe a missing snapshot. Nothing has reached w
-			// (body is a separate buffer), so the refusal writes nothing — same fail-loud
-			// contract as the aggregation. It still wraps ErrRecoveryRefused, so callers
-			// classify it as a 4xx like the other refusals.
-			var ute *UntypedColumnsError
-			if errors.As(err, &ute) {
-				return 0, err
-			}
 			// Record the failure and keep the "-- ERROR ..." comment in the
 			// buffered body so the diagnosis lists EVERY un-generatable event,
 			// then refuse the whole script below (#784). Demoting the error to a
@@ -370,10 +357,10 @@ func partialGenerationError(failures []genFailure) error {
 	for _, f := range failures {
 		parts = append(parts, fmt.Sprintf("event %d: %v", f.eventID, f.err))
 	}
-	return refusalError{fmt.Errorf("recover: refusing to emit reversal SQL — %d of the matched event(s) could not be "+
+	return fmt.Errorf("recover: refusing to emit reversal SQL — %d of the matched event(s) could not be "+
 		"reversed (malformed or truncated stored row image), so the script would be a silently incomplete "+
 		"recovery: %s. Investigate the named event(s); narrow the recovery window (--since/--until, --pk/--pks) "+
-		"to exclude them if they are known-unrecoverable", len(failures), strings.Join(parts, "; "))}
+		"to exclude them if they are known-unrecoverable", len(failures), strings.Join(parts, "; "))
 }
 
 // schemaDriftError builds the fail-loud error for #601: the reversal SQL references
@@ -389,39 +376,11 @@ func schemaDriftError(drift map[string]map[string]bool, order []string) error {
 		sort.Strings(cols)
 		parts = append(parts, fmt.Sprintf("%s (%s)", key, strings.Join(cols, ", ")))
 	}
-	return refusalError{fmt.Errorf("recover: refusing to emit reversal SQL — it references column(s) that the latest schema "+
+	return fmt.Errorf("recover: refusing to emit reversal SQL — it references column(s) that the latest schema "+
 		"snapshot no longer has (dropped or renamed after the event was captured), so the SQL would not apply to "+
 		"the current table: %s. Re-snapshot if the table actually still has these columns; otherwise reconcile the "+
-		"column(s) by hand", strings.Join(parts, "; "))}
+		"column(s) by hand", strings.Join(parts, "; "))
 }
-
-// ─── Refusal classification ────────────────────────────────────────────────────
-
-// ErrRecoveryRefused marks a by-design, caller-actionable refusal to emit
-// reversal SQL — a request that cannot be fulfilled as specified, not an internal
-// fault. It covers every fail-loud refusal in this package: untypeable columns /
-// no snapshot (#788), schema drift (#601), an oversized script (#654), and
-// malformed/partial row images (#784). It is never returned on its own; the
-// concrete refusals wrap it so callers can classify them with a single
-// errors.Is. HTTP/MCP callers map a refusal to a 4xx / clear message and reserve
-// 500 for genuine faults (DB errors, encode failures) — see IsRefusal.
-var ErrRecoveryRefused = errors.New("recovery refused")
-
-// IsRefusal reports whether err is a by-design refusal to emit reversal SQL
-// (errors.Is against ErrRecoveryRefused) rather than an internal fault. The
-// console HTTP layer uses it to answer 422 instead of 500; other consumers can
-// use it to phrase a clear, non-crash message.
-func IsRefusal(err error) bool { return errors.Is(err, ErrRecoveryRefused) }
-
-// refusalError tags an fmt.Errorf-built refusal (partialGenerationError #784,
-// schemaDriftError #601) as an ErrRecoveryRefused WITHOUT altering its message —
-// .Error() delegates to the wrapped error, so the existing wording (and the
-// tests pinning it) is preserved, while errors.Is(err, ErrRecoveryRefused)
-// becomes true. The typed refusals (ScriptBudgetError, UntypedColumnsError)
-// carry their own Is method instead.
-type refusalError struct{ error }
-
-func (refusalError) Is(target error) bool { return target == ErrRecoveryRefused }
 
 // ─── Script-size budget (#654) ─────────────────────────────────────────────────
 
@@ -442,11 +401,6 @@ func (e *ScriptBudgetError) Error() string {
 		"(the events are already loaded). Narrow the recovery window, or raise/disable the budget (0 = unlimited)",
 		humanizeBytes(e.EstimatedBytes), humanizeBytes(e.Budget))
 }
-
-// Is reports this as an ErrRecoveryRefused (a by-design refusal), so callers can
-// classify it with errors.Is alongside the other refusals. errors.As(&ScriptBudgetError)
-// still matches the concrete type — this only adds the sentinel identity (#654).
-func (e *ScriptBudgetError) Is(target error) bool { return target == ErrRecoveryRefused }
 
 // EstimateScriptBytes returns a cheap estimate of the row payload
 // GenerateSQLFromRows will render into the in-memory script buffer (#654). It
@@ -639,12 +593,10 @@ func columnNameSet(cols []metadata.ColumnMeta) map[string]bool {
 // literal.
 //
 // Returns nil (no coercion) for a non-MySQL dialect, a nil resolver, or an
-// unresolvable table. For a DB-backed generator those untyped cases never reach
-// emission — requireTypedColumns refuses the event first (#788). Only the DB-less
-// schemaless fallback (New(nil, ...)) still emits BLOB/TEXT as their raw base64,
-// having deliberately opted out of schema typing; the caller has already warned
-// about the missing snapshot (resolverForRow / pkWhereClause), so this does not
-// warn again.
+// unresolvable table. In the last two cases BLOB/TEXT values are still emitted as
+// base64 — recover without usable schema metadata cannot type its columns; the
+// caller has already warned about the missing snapshot (resolverForRow /
+// pkWhereClause), so this does not warn again.
 func (g *Generator) base64Cols(r *metadata.Resolver, schema, table string) map[string]bool {
 	if g.dialect != MySQLDialect || r == nil {
 		return nil
@@ -666,84 +618,6 @@ func (g *Generator) base64Cols(r *metadata.Resolver, schema, table string) map[s
 	}
 	return m
 }
-
-// requireTypedColumns refuses to reverse an event whose table cannot be typed from
-// a schema snapshot on the MySQL dialect (#788). Without the snapshot a BLOB/TEXT/
-// BINARY/VARBINARY column's stored value is an opaque base64 STRING (marshalRow
-// encodes every []byte that way), so a reverse INSERT/UPDATE would write that base64
-// text verbatim into the column — a silent, applies-clean, post-apply corruption
-// (e.g. `aGVsbG8=` instead of `hello`). We cannot tell a base64-encoded BLOB from a
-// plain VARCHAR value without the column type, so the safe stance is to refuse the
-// event rather than risk emitting a base64 literal into a real column — the same
-// fail-loud posture as the schema-drift (#601) and script-budget (#654) refusals,
-// and it composes with the per-event refusal in GenerateSQLFromRows (#784).
-//
-// r is the EVENT-TIME resolver (resolverForRow), the same one base64Cols/geometryCols
-// consult, so this fires exactly when they would return an untyped map. A nil resolver
-// splits on whether the generator has a DB: a DB-BACKED caller with no usable snapshot
-// for the event's table is the #788 recover-without-a-snapshot case — every real caller
-// (recover CLI, MCP, console, agent, cascade) passes a DB — so it is REFUSED, closing
-// the primary silent-corruption path where BLOB/TEXT would be emitted as their raw
-// base64 string. A DB-LESS generator (New(nil, ...)) is the deliberate schemaless
-// all-columns fallback that hand-feeds its own rows and owns that trade-off, so it stays
-// permissive. The PostgreSQL dialect is never refused (values stored as text, no base64,
-// never at risk). Because it keys on the event-time resolver, a table merely absent from
-// the LATEST snapshot (a scoped-out or dropped table whose event still carries its own
-// schema_version) is still typed from its own snapshot and NOT refused — preserving the
-// deliberate "degrade, don't refuse" behavior for that ambiguous case (#601).
-func (g *Generator) requireTypedColumns(r *metadata.Resolver, schema, table string, eventID uint64) error {
-	if g.dialect != MySQLDialect {
-		return nil
-	}
-	if r == nil {
-		// No usable snapshot for this event. A DB-less generator is the deliberate
-		// schemaless fallback (see above) — stay permissive. A DB-backed caller here ran
-		// against a real index yet resolved no snapshot for the table: refuse rather than
-		// emit a BLOB/TEXT/BINARY column's stored base64 string verbatim (#788).
-		if g.db == nil {
-			return nil
-		}
-		return &UntypedColumnsError{Schema: schema, Table: table, EventID: eventID, Dropped: false}
-	}
-	if _, err := r.Resolve(schema, table); err != nil {
-		return &UntypedColumnsError{Schema: schema, Table: table, EventID: eventID, Dropped: true}
-	}
-	return nil
-}
-
-// UntypedColumnsError is the #788 fail-loud refusal returned by requireTypedColumns:
-// a MySQL-dialect, DB-backed generator has no usable schema snapshot to type the
-// table's BLOB/TEXT/BINARY columns, so a reverse INSERT/UPDATE/DELETE would emit their
-// stored base64 string verbatim into a real column (silent, applies-clean corruption).
-// It is caller-actionable — take a snapshot covering the table — so it reports as an
-// ErrRecoveryRefused (via Is); the console maps it to 422 and the CLI/MCP surface its
-// message rather than an opaque 500. Distinct from the malformed-row aggregation (#784),
-// whose "malformed or truncated stored row image" wording would misdescribe this cause.
-//
-// Dropped tells the two untyped cases apart: false = no snapshot is loaded at all
-// (recover ran without ever snapshotting); true = a snapshot IS loaded but omits this
-// table (dropped after the event, or scoped out of the snapshot).
-type UntypedColumnsError struct {
-	Schema, Table string
-	EventID       uint64
-	Dropped       bool
-}
-
-func (e *UntypedColumnsError) Error() string {
-	if e.Dropped {
-		return fmt.Sprintf("cannot reverse event %d on %s.%s: no schema snapshot describes this table, so its "+
-			"BLOB/TEXT/BINARY columns cannot be typed and a reverse INSERT/UPDATE would write their stored base64 "+
-			"text verbatim into the column (silent corruption). Take a fresh snapshot (`bintrail snapshot`) covering "+
-			"%s.%s and retry; if the table was dropped after the event, its rows cannot be recovered from the index "+
-			"alone", e.EventID, e.Schema, e.Table, e.Schema, e.Table)
-	}
-	return fmt.Sprintf("cannot reverse event %d on %s.%s: no schema snapshot is loaded for this table, so its "+
-		"BLOB/TEXT/BINARY columns cannot be typed and a reverse INSERT/UPDATE would write their stored base64 "+
-		"text verbatim into the column (silent corruption). Take a snapshot (`bintrail snapshot`) covering "+
-		"%s.%s and retry", e.EventID, e.Schema, e.Table, e.Schema, e.Table)
-}
-
-func (e *UntypedColumnsError) Is(target error) bool { return target == ErrRecoveryRefused }
 
 // geometryCols maps each GEOMETRY-family column of a table to true, so buildInsert/
 // buildUpdate render it via geometryLiteral (ST_GeomFromWKB) instead of the base64
@@ -957,9 +831,6 @@ func (g *Generator) buildInsert(row query.ResultRow) (string, []string, error) {
 		return "", nil, fmt.Errorf("row_before is nil for DELETE event (event_id=%d)", row.EventID)
 	}
 	r := g.resolverForRow(row)
-	if err := g.requireTypedColumns(r, row.SchemaName, row.TableName, row.EventID); err != nil {
-		return "", nil, err
-	}
 	genCols := generatedColsFromResolver(r, row.SchemaName, row.TableName)
 	b64 := g.base64Cols(r, row.SchemaName, row.TableName)
 	geom := g.geometryCols(r, row.SchemaName, row.TableName)
@@ -1007,9 +878,6 @@ func (g *Generator) buildUpdate(row query.ResultRow) (string, []string, error) {
 	// cannot restore its before-image regardless — omitting it is the only valid choice.
 	// The WHERE clause still PK-targets the column.
 	r := g.resolverForRow(row)
-	if err := g.requireTypedColumns(r, row.SchemaName, row.TableName, row.EventID); err != nil {
-		return "", nil, err
-	}
 	skipCols := updateSetSkipCols(r, row.SchemaName, row.TableName)
 	b64 := g.base64Cols(r, row.SchemaName, row.TableName)
 	geom := g.geometryCols(r, row.SchemaName, row.TableName)
@@ -1046,14 +914,6 @@ func (g *Generator) buildDelete(row query.ResultRow) (string, []string, error) {
 		return "", nil, fmt.Errorf("row_after is nil for INSERT event (event_id=%d)", row.EventID)
 	}
 	r := g.resolverForRow(row)
-	// Symmetric with buildInsert/buildUpdate (#788): without usable type info the
-	// all-columns WHERE fallback would emit a BLOB/TEXT/BINARY column's stored base64
-	// string verbatim (e.g. `payload = 'aGVsbG8='`), which matches ZERO rows against the
-	// live decoded value — the reverse DELETE would commit clean and silently NOT undo
-	// the accidental INSERT. Refuse instead so the failure is loud.
-	if err := g.requireTypedColumns(r, row.SchemaName, row.TableName, row.EventID); err != nil {
-		return "", nil, err
-	}
 	whereParts, whereCols := g.pkWhereClause(r, row.SchemaName, row.TableName, row.RowAfter)
 	return fmt.Sprintf("DELETE FROM %s.%s WHERE %s",
 		g.quoteName(row.SchemaName), g.quoteName(row.TableName),

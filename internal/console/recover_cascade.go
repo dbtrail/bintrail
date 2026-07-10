@@ -174,13 +174,6 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 		BaselineActive: synth.BaselineActive,
 	})
 	if err != nil {
-		// Same refusal-vs-fault split as handleRecover: an untypeable-table / schema-drift
-		// / oversized-script refusal from the generator is caller-actionable (422), not a
-		// server crash (500).
-		if recovery.IsRefusal(err) {
-			writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
-			return
-		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

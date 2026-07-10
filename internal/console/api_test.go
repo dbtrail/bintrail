@@ -2,7 +2,6 @@ package console
 
 import (
 	"encoding/json"
-	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
@@ -11,7 +10,6 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
-	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -221,8 +219,8 @@ func TestRecoverIsReadOnly(t *testing.T) {
 	}
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	// An INSERT event (event_type=1); its reversal is a DELETE built from
-	// row_after. schema_version=0 keeps recovery on the default resolver, so
-	// no per-row resolver query touches the DB.
+	// row_after. schema_version=0 keeps recovery on the default resolver (nil),
+	// so no per-row resolver query touches the DB.
 	resultRows := sqlmock.NewRows(cols).AddRow(
 		int64(1), "bin.000001", int64(4), int64(40), ts,
 		nil, nil, "app", "users", int64(parser.EventInsert), "42",
@@ -231,16 +229,9 @@ func TestRecoverIsReadOnly(t *testing.T) {
 	)
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(resultRows)
 
-	// newBootServer leaves dbName empty (disables the planner → no archive_state
-	// query). Give the boot bundle an in-memory schema snapshot typing app.users so
-	// the #788 guard can type its columns and recovery emits the DELETE: a DB-backed
-	// generator with NO usable snapshot refuses (BLOB/TEXT/BINARY can't be typed →
-	// base64-verbatim corruption risk), which is a 422, not the read-only success this
-	// test asserts. The resolver is built in-memory (NewResolverFromTables), so with
-	// schema_version=0 resolverForRow never queries the DB — the single fetch SELECT
-	// stays the ONLY DB interaction, which is exactly the read-only invariant here.
+	// newBootServer leaves dbName empty (disables the planner → no
+	// archive_state query) and the resolver nil (all-column WHERE fallback).
 	s := newBootServer(db)
-	s.cm.boot.resolver = usersResolver()
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/recover", strings.NewReader(`{"schema":"app","table":"users"}`))
@@ -261,69 +252,6 @@ func TestRecoverIsReadOnly(t *testing.T) {
 	}
 	if resp.StatementCount != 1 {
 		t.Errorf("StatementCount = %d, want 1", resp.StatementCount)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("read-only invariant violated — unexpected DB interaction: %v", err)
-	}
-}
-
-// usersResolver returns an in-memory schema snapshot typing app.users (id PK,
-// email) so a DB-backed recover can type the table's columns and clear the #788
-// guard. Built via NewResolverFromTables so it needs no DB round trip.
-func usersResolver() *metadata.Resolver {
-	return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
-		"app.users": {
-			Schema: "app", Table: "users",
-			Columns: []metadata.ColumnMeta{
-				{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
-				{Name: "email", OrdinalPosition: 2, DataType: "varchar"},
-			},
-			PKColumns: []string{"id"},
-		},
-	})
-}
-
-// TestRecoverUntypedTableRefused is the #788/#917 companion: a DB-backed recover with
-// NO usable schema snapshot for the target table must refuse — the table's BLOB/TEXT/
-// BINARY columns can't be typed, so a reverse write would emit stored base64 verbatim
-// (silent corruption). That refusal is caller-actionable, so the console answers 422
-// (not a generic 500), and the fetch stays the ONLY DB interaction (a refusal never
-// executes SQL). Guards against a regression back to 500 or to silently emitting the
-// unverifiable script.
-func TestRecoverUntypedTableRefused(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	cols := []string{
-		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
-		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
-		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
-	}
-	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	resultRows := sqlmock.NewRows(cols).AddRow(
-		int64(1), "bin.000001", int64(4), int64(40), ts,
-		nil, nil, "app", "users", int64(parser.EventInsert), "42",
-		nil, nil, []byte(`{"id":42,"email":"a@x"}`), int64(0),
-		nil, nil,
-	)
-	mock.ExpectQuery("FROM binlog_events").WillReturnRows(resultRows)
-
-	// newBootServer leaves the resolver nil while the boot bundle's db is set — a
-	// DB-backed generator with no usable snapshot, exactly the #788 refusal case.
-	s := newBootServer(db)
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/recover", strings.NewReader(`{"schema":"app","table":"users"}`))
-	s.handleRecover(rec, req)
-
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("recover status = %d, want 422 (by-design refusal); body = %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "snapshot") {
-		t.Errorf("422 body must explain the missing-snapshot cause, got: %s", rec.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("read-only invariant violated — unexpected DB interaction: %v", err)
