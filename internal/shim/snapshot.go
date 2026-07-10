@@ -184,7 +184,7 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(ctx, q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
 	// BEFORE the merge: the merged rowMap reaching the callback below has
@@ -480,7 +480,7 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(ctx, q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 
 	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),

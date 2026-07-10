@@ -222,3 +222,99 @@ func TestShim_ClientDisconnectCancelsInFlightFetch(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// TestShim_ShutdownCancelsInFlightFetch is the end-to-end proof of the
+// #823 daemon-shutdown path, as distinct from the two siblings above:
+// TestShim_QueryTimeoutWireError covers --query-timeout and
+// TestShim_ClientDisconnectCancelsInFlightFetch covers a client-initiated
+// close, but neither cancels serveLoop's own ctx (the SIGTERM path)
+// while a query is genuinely in flight inside handleConn. This test
+// drives serveLoop directly (bypassing startTestShimFull, whose
+// t.Cleanup only cancels ctx after the test body — too late to observe
+// the in-flight case) so it can cancel the parent ctx itself, with the
+// client context left live throughout. It proves both halves of the
+// handleConn contract: the connection's own goroutine returns (so
+// wg.Wait in serveLoop unblocks — asserted via done closing) and the
+// abandoned index fetch is actually aborted, not merely orphaned
+// (asserted via db.Stats().InUse dropping back to 0). Fails on a
+// regression that reverts handleConn to ignoring ctx (pre-#823): done
+// never closes and this test times out instead of passing quickly.
+func TestShim_ShutdownCancelsInFlightFetch(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	expectShimFetch(mock, 30*time.Second)
+
+	cfg := shim.Config{AllowGaps: true, NoArchive: true, IndexDBName: "bintrail_index"}
+	auth, err := shim.NewTenantAuth(map[string]string{"tenant_a": "pw"})
+	if err != nil {
+		t.Fatalf("NewTenantAuth: %v", err)
+	}
+	srv, err := shim.NewMySQLServer(cfg.AuthMethod)
+	if err != nil {
+		t.Fatalf("NewMySQLServer: %v", err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		serveLoop(ctx, listener, db, srv, auth, cfg,
+			map[string]string{"tenant_a": "myapp"}, 0)
+	}()
+
+	client, err := sql.Open("mysql", "tenant_a:pw@tcp("+listener.Addr().String()+")/?timeout=2s&readTimeout=60s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// The client's own context is never canceled — only the server-side
+	// (parent) ctx dies below — so any observed abort is attributable
+	// to the shutdown path, not to TestShim_ClientDisconnectCancelsInFlightFetch's
+	// mechanism.
+	qdone := make(chan struct{})
+	go func() {
+		defer close(qdone)
+		_, _ = client.Query("SELECT * FROM _flashback.orders AS OF '2026-01-01 00:00:00'")
+	}()
+
+	matched := time.Now().Add(5 * time.Second)
+	for mock.ExpectationsWereMet() != nil {
+		if time.Now().After(matched) {
+			t.Fatal("index fetch never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Simulate SIGTERM: cancel serveLoop's ctx and close the listener,
+	// exactly what runShim's shutdown sequence does.
+	cancel()
+	_ = listener.Close()
+
+	select {
+	case <-done:
+		// serveLoop's wg.Wait returned: handleConn's goroutine for the
+		// in-flight query exited instead of blocking forever.
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveLoop did not return within 5s of ctx cancel; " +
+			"handleConn is still blocked on the in-flight query, so wg.Wait never unblocks")
+	}
+	<-qdone
+
+	freed := time.Now().Add(5 * time.Second)
+	for db.Stats().InUse != 0 {
+		if time.Now().After(freed) {
+			t.Fatalf("server-side fetch still holds %d index connection(s) 5s after shutdown; "+
+				"daemon shutdown did not cancel the in-flight query", db.Stats().InUse)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}

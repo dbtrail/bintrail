@@ -462,13 +462,25 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 // cancellation sentinels, and the wire code must reflect WHY the query
 // died, not which driver noticed first. Pass context.Background() (or
 // any live ctx) to keep the pure error-classification behaviour.
-func wrapFetchError(ctx context.Context, qType QueryType, err error) error {
+//
+// The override discards whatever FetchMerged actually returned — which
+// can be a genuine failure (S3 AccessDenied, a DuckDB error, an index-DB
+// outage) that merely lost the race with the context deadline/cancel.
+// logger records that discarded error (Warn) before it's overwritten so
+// an operator can still find the real cause in the shim's own log even
+// though the client only sees "query interrupted"; nil logger is a no-op
+// for tests that don't care about log output.
+func wrapFetchError(ctx context.Context, qType QueryType, err error, logger *slog.Logger) error {
 	var gapErr *query.GapError
 	if errors.As(err, &gapErr) {
 		return mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE,
 			fmt.Sprintf("resolve %s: %s", qType, gapErr.Error()))
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
+		if logger != nil && !errors.Is(err, ctxErr) {
+			logger.Warn("shim: query context ended before fetch returned; discarding underlying error from the wire response",
+				"query_type", qType, "ctx_err", ctxErr, "underlying_err", err)
+		}
 		err = ctxErr
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -551,7 +563,7 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(ctx, q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 
 	// ENUM/SET ordinals → labels (#472/#475), so the historical row
@@ -743,7 +755,7 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(ctx, q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 
 	if len(rows) > cap {
@@ -1485,7 +1497,7 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(ctx, q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 
 	// Compute the source-table column order once per query so the
