@@ -284,6 +284,18 @@ services:
     volumes:
       - bintrail-state:/var/lib/bintrail
       - bintrail-index-secret:/run/secret:ro
+      # Read-only mount of the SAME named volume index-mysql writes its
+      # datadir to (#948). `doctor`'s disk-capacity check needs an OS-level
+      # `statfs` to measure free space — there is no SQL equivalent
+      # (information_schema/performance_schema expose no `df`) — but the
+      # bundled index lives in a SEPARATE container this service only ever
+      # reaches over TCP. A read-only bind of the same volume reports the
+      # real underlying filesystem's free space regardless of which
+      # container mounted it or in what mode: safe and standard. Only ever
+      # TRUSTED when BINTRAIL_INDEX_DATADIR_RO is set below — see that
+      # comment for the invariant that keeps this mount and the DSN in
+      # effect from drifting apart.
+      - bintrail-index-data:/var/lib/bintrail-index-ro:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -295,6 +307,19 @@ services:
         # would mask the substitution's exit status and build an empty password.
         if [ -z "$$INDEX_DSN" ]; then
           INDEX_DSN="root:$$(cat /run/secret/index_password)@tcp(index-mysql:3306)/bintrail_index"
+          # SAFETY INVARIANT (#948): this is set ONLY inside this branch —
+          # the ONE branch that also builds the bundled tcp(index-mysql:3306)
+          # DSN above — so the read-only mount above and the DSN actually in
+          # effect can never point at different volumes. A literal string
+          # assignment, so `export` here does not hide a failure the way it
+          # would for the `cat`-derived INDEX_DSN above. A BYO INDEX_DSN
+          # (operator-supplied, unrelated MySQL) skips this branch entirely,
+          # so this var stays unset for BYO — capacity.go then falls back to
+          # its loopback/hostname check and, failing that, the "not
+          # measurable" guidance PASS. Never let this var leak into the BYO
+          # path: that would report a random volume's free space as if it
+          # were the real index's.
+          export BINTRAIL_INDEX_DATADIR_RO=/var/lib/bintrail-index-ro
         fi
         # No token is generated: the console binds to loopback, so first run is
         # password SETUP — open the printed URL and create your console

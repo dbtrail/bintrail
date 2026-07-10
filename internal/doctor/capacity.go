@@ -286,14 +286,41 @@ func loadPartitionSamples(ctx context.Context, db *sql.DB, dbName string) ([]cap
 	return samples, rows.Err()
 }
 
-// indexDatadirFree probes the datadir's free space — ONLY when the index DSN
-// points at this same host (loopback or unix socket) AND the server's
-// @@hostname matches ours. A loopback DSN alone is not proof of locality: a
-// kubectl port-forward or ssh tunnel presents a REMOTE MySQL at 127.0.0.1,
-// and its datadir path could coincidentally exist on this host's filesystem —
-// statfs would then confidently measure the wrong volume. Any doubt degrades
-// to "not measurable" (the PASS-with-guidance path), never to a wrong number.
+// indexDatadirFree probes the datadir's free space. Two paths, tried in
+// order:
+//
+//  1. BINTRAIL_INDEX_DATADIR_RO (#948): set ONLY by the bundled
+//     docker-compose.yml stack's `bintrail` service entrypoint, and ONLY
+//     inside the branch that ALSO builds the bundled tcp(index-mysql:3306)
+//     DSN. In that topology the index MySQL runs in a separate container
+//     this process only reaches over TCP, so the loopback/hostname dance
+//     below can never succeed even though the index is "local" in every
+//     sense that matters — that's the bug #948 reports. The compose file
+//     instead bind-mounts the SAME named volume index-mysql writes its
+//     datadir to, read-only, into this container; `statfs` on that mount
+//     reports the real underlying filesystem's free space regardless of
+//     which container mounted it or in what mode. It is safe to trust
+//     without re-deriving locality from dsn/db here because the env var and
+//     the bundled DSN are written together, in the same conditional branch,
+//     by the same script — they cannot drift apart. A BYO INDEX_DSN
+//     (operator points at their own, unrelated MySQL) skips that branch
+//     entirely, so the var is simply never set there, and this path is
+//     silently skipped in favor of path 2.
+//  2. The loopback/hostname-match dance: the ONLY path for bare-metal and
+//     BYO installs, where there is no compose-provided mount to trust. ONLY
+//     when the index DSN points at this same host (loopback or unix socket)
+//     AND the server's @@hostname matches ours. A loopback DSN alone is not
+//     proof of locality: a kubectl port-forward or ssh tunnel presents a
+//     REMOTE MySQL at 127.0.0.1, and its datadir path could coincidentally
+//     exist on this host's filesystem — statfs would then confidently
+//     measure the wrong volume.
+//
+// Any doubt in either path degrades to "not measurable" (the
+// PASS-with-guidance path in capacityVerdict), never to a wrong number.
 func indexDatadirFree(ctx context.Context, db *sql.DB, dsn string) (uint64, bool) {
+	if free, ok := indexDatadirFreeFromEnv(); ok {
+		return free, true
+	}
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil || !dsnTargetsLocalhost(cfg) {
 		return 0, false
@@ -310,10 +337,46 @@ func indexDatadirFree(ctx context.Context, db *sql.DB, dsn string) (uint64, bool
 	if err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'datadir'").Scan(&varName, &datadir); err != nil {
 		return 0, false
 	}
-	if fi, err := os.Stat(datadir); err != nil || !fi.IsDir() {
+	return statfsDir(datadir)
+}
+
+// indexDatadirFreeFromEnv is indexDatadirFree's compose short-circuit — see
+// its doc comment for the safety invariant that makes this trustworthy
+// without any locality check of its own.
+//
+// Scope note: BINTRAIL_INDEX_DATADIR_RO is read via plain os.Getenv, which
+// cannot distinguish "set by the docker-compose entrypoint" from "present in
+// the process environment for any other reason" — e.g. bintrail's own
+// .bintrail.env / ~/.config/bintrail/config.env loader (internal/cli/env.go)
+// applies EVERY key=value line it finds to os.Setenv, unfiltered by
+// EnvBindings. This is not a NEW trust boundary: INDEX_DSN itself (the value
+// actually queried) is loadable the exact same way, so an operator/attacker
+// with write access to those files already controls which server this
+// entire check runs against. A stray BINTRAIL_INDEX_DATADIR_RO line there
+// would only skew this one advisory disk-capacity verdict, not what data is
+// read/written — deliberately not hardened further here to keep this fix
+// proportionate to #948 (see docker-compose.yml for the ACTUAL safety
+// invariant this exists to preserve: mount and DSN set together, in one
+// branch, by one script).
+func indexDatadirFreeFromEnv() (uint64, bool) {
+	dir := os.Getenv("BINTRAIL_INDEX_DATADIR_RO")
+	if dir == "" {
 		return 0, false
 	}
-	free, err := diskFree(datadir)
+	return statfsDir(dir)
+}
+
+// statfsDir is the shared "is this a real, statfs-able directory" tail used
+// by both indexDatadirFree paths above. A missing directory, a file instead
+// of a directory, or a statfs error all fall through to freeKnown=false
+// rather than panicking or erroring loud — free-space measurement is
+// best-effort advisory input, never worth failing the check over.
+func statfsDir(dir string) (uint64, bool) {
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		return 0, false
+	}
+	free, err := diskFree(dir)
 	if err != nil {
 		return 0, false
 	}

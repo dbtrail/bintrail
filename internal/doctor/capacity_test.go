@@ -1,6 +1,9 @@
 package doctor
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -249,6 +252,65 @@ func TestDSNTargetsLocalhost(t *testing.T) {
 		if got := dsnTargetsLocalhost(cfg); got != tc.want {
 			t.Errorf("dsnTargetsLocalhost(%s) = %v, want %v", tc.dsn, got, tc.want)
 		}
+	}
+}
+
+// TestIndexDatadirFreeFromEnv covers the #948 compose short-circuit in
+// isolation: env-var-set + real directory measures successfully, and a
+// stale/missing path degrades gracefully instead of panicking.
+func TestIndexDatadirFreeFromEnv(t *testing.T) {
+	t.Run("set and valid dir", func(t *testing.T) {
+		t.Setenv("BINTRAIL_INDEX_DATADIR_RO", t.TempDir())
+		free, ok := indexDatadirFreeFromEnv()
+		if !ok {
+			t.Fatal("expected freeKnown=true for a valid directory")
+		}
+		if free == 0 {
+			t.Error("expected a nonzero free byte count for a real filesystem")
+		}
+	})
+
+	t.Run("set but path does not exist", func(t *testing.T) {
+		t.Setenv("BINTRAIL_INDEX_DATADIR_RO", "/nonexistent/path/for/948/test")
+		if _, ok := indexDatadirFreeFromEnv(); ok {
+			t.Error("expected freeKnown=false when the mounted path does not exist")
+		}
+	})
+
+	t.Run("set but points at a file, not a directory", func(t *testing.T) {
+		f := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("BINTRAIL_INDEX_DATADIR_RO", f)
+		if _, ok := indexDatadirFreeFromEnv(); ok {
+			t.Error("expected freeKnown=false when the path is a file, not a directory")
+		}
+	})
+
+	t.Run("unset", func(t *testing.T) {
+		t.Setenv("BINTRAIL_INDEX_DATADIR_RO", "")
+		if _, ok := indexDatadirFreeFromEnv(); ok {
+			t.Error("expected freeKnown=false when the env var is unset")
+		}
+	})
+}
+
+// TestIndexDatadirFree_envShortCircuitsHostnameCheck confirms the env-var
+// path in indexDatadirFree runs BEFORE — and independent of — the
+// loopback/hostname-match logic: a non-loopback DSN and a nil *sql.DB (which
+// would panic if any of the hostname-matching queries ran) still measure
+// successfully once the env var is set. This is the exact scenario #948
+// describes (bundled compose reaches the index over tcp(index-mysql:3306),
+// never loopback).
+func TestIndexDatadirFree_envShortCircuitsHostnameCheck(t *testing.T) {
+	t.Setenv("BINTRAIL_INDEX_DATADIR_RO", t.TempDir())
+	free, ok := indexDatadirFree(context.Background(), nil, "root:x@tcp(index-mysql:3306)/bintrail_index")
+	if !ok {
+		t.Fatal("expected freeKnown=true via the env-var short-circuit, independent of the DSN/db")
+	}
+	if free == 0 {
+		t.Error("expected a nonzero free byte count")
 	}
 }
 

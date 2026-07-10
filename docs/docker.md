@@ -196,6 +196,32 @@ directly: `docker compose logs index-init index-mysql`. A "password" or
 "healthcheck" error there usually means the `bintrail-index-secret` volume was
 reset out of sync with `bintrail-index-data` — reset both together.
 
+**Disk-capacity monitoring (#948)** — `doctor`'s capacity check ([Capacity
+Planning](./capacity.md)) needs an OS-level `statfs` to report the index's
+free disk space, but the bundled index runs in its own `index-mysql`
+container, reachable from `bintrail` only over `tcp(index-mysql:3306)` — so
+the usual loopback/hostname check can never fire there. The compose file
+works around this with a **read-only bind mount of the same
+`bintrail-index-data` volume** into the `bintrail` service
+(`/var/lib/bintrail-index-ro`), plus a `BINTRAIL_INDEX_DATADIR_RO`
+environment variable that the entrypoint script sets **only** in the branch
+where it also builds the bundled `tcp(index-mysql:3306)` DSN — so the mount
+is trusted only when it is actually backing the index in effect, never for a
+BYO `INDEX_DSN`. You shouldn't need to touch this; it's mentioned here so the
+mount doesn't look mysterious in `docker compose config`. If you bring your
+own index (below), the whole mechanism is inert: your `INDEX_DSN` skips the
+branch that sets the env var, and `doctor` falls back to the loopback/hostname
+check and then the "not measurable" PASS-with-guidance.
+
+On **Docker Desktop** (macOS/Windows), named volumes are typically backed by
+one shared VM disk, so the free-space number this check reports is that VM
+disk's headroom — shared with `bintrail-state` and any other volumes, not
+space reserved exclusively for the index datadir. On native Linux Docker,
+each named volume is a directory on the host filesystem, so free space is
+the host filesystem's, which is the more precise reading. Either way it's
+the same number `df` on the volume's backing storage would show you — this
+check doesn't invent a more precise figure than the platform actually has.
+
 **Upgrading from a pre-8.4 bundled index** — the old eval index used a
 `mysql:8.0` container on the `index-mysql-data` volume. The new compose uses a
 **new** `bintrail-index-data` volume on 8.4 and leaves the old one untouched,
@@ -226,8 +252,11 @@ and all data volumes (`bintrail-index-data`, `bintrail-index-secret`,
 To run your own index instead of the bundled 8.4, set `INDEX_DSN` in `.env` to a MySQL 8.0+ you operate and
 remove the bundled index from the compose file: delete the `index-init` and
 `index-mysql` services, the `bintrail-index-data` / `bintrail-index-secret`
-volumes, the `bintrail-index-secret` mount and the `depends_on: index-mysql`
-on the `bintrail` service. dbtrail installs only its schema on your server;
+volumes, the `bintrail-index-secret` mount, the `bintrail-index-data`
+read-only mount (`/var/lib/bintrail-index-ro`, used only by `doctor`'s
+disk-capacity check against the *bundled* index — see above; harmless to
+leave but pointless once you delete the volume it points at), and the
+`depends_on: index-mysql` on the `bintrail` service. dbtrail installs only its schema on your server;
 its sizing, backups, and upgrades are yours — see
 [Capacity Planning](./capacity.md), [deployment.md](./deployment.md), and
 [SUPPORT.md](../SUPPORT.md). (The BYO contract floor stays MySQL **8.0+** —
