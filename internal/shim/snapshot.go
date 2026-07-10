@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -429,6 +430,9 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		return nil, err
 	}
 
+	// q.PKValue is passed RAW (unescaped) here — Parquet baseline rows store
+	// actual column values, not event.BuildPKValues-encoded pk_values, so this
+	// seam must NOT apply event.EscapePKValue (unlike the delta fetch below).
 	baselineRow, err := reconstruct.ReadBaselineRow(ctx, baselinePath, map[string]string{q.PKColumn: q.PKValue})
 	if err != nil {
 		return nil, err
@@ -456,10 +460,18 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		Since:  &snapshotTime,
 		Until:  &q.AsOf,
 	}
+	// q.PKValue is raw/unescaped (#826). Unlike ReadBaselineRow above (which
+	// matches actual Parquet column values and must keep the raw value), this
+	// delta fetch matches binlog_events.pk_values, which is
+	// event.BuildPKValues-encoded — re-encode with event.EscapePKValue so a
+	// backslash- or pipe-containing PK's post-baseline events are found
+	// instead of silently missing (which would serve a stale baseline image
+	// as the answer at AsOf).
+	encoded := event.EscapePKValue(q.PKValue)
 	if q.PKValue != "" {
-		opts.PKValues = q.PKValue
+		opts.PKValues = encoded
 	} else {
-		opts.PKValuesIn = []string{q.PKValue}
+		opts.PKValuesIn = []string{encoded}
 	}
 	engine := query.New(h.indexDB)
 	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{

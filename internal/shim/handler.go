@@ -452,12 +452,18 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	// ROW_NUMBER OVER (PARTITION BY pk_values ORDER BY event_timestamp
 	// DESC, event_id DESC) so the kept event for each PK is the most
 	// recent one — exactly what _flashback "row state at AsOf" needs.
+	// q.PKValue is the raw, MySQL-unescaped literal value (stripQuotes /
+	// unescapeStringLiteral, #826). Options.PKValues is matched against
+	// binlog_events.pk_values, which is stored in event.BuildPKValues-encoded
+	// form (backslash/pipe escaped). Re-encode with event.EscapePKValue here
+	// so a backslash- or pipe-containing PK still matches instead of
+	// silently missing (#826 follow-up).
 	engine := query.New(h.indexDB)
 	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
 		Opts: query.Options{
 			Schema:     q.Schema,
 			Table:      q.Table,
-			PKValues:   q.PKValue,
+			PKValues:   event.EscapePKValue(q.PKValue),
 			Until:      &q.AsOf,
 			LimitPerPK: 1,
 		},
@@ -1377,12 +1383,15 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 	// hand the customer a partial audit history with no signal — worse than
 	// the rare cost of a few thousand rows for an unusually hot row.
 	// Customers needing pagination can narrow the BETWEEN range.
+	// See the matching comment in runPointInTime: q.PKValue is raw/unescaped
+	// (#826); binlog_events.pk_values is BuildPKValues-encoded, so re-encode
+	// before matching.
 	engine := query.New(h.indexDB)
 	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
 		Opts: query.Options{
 			Schema:   q.Schema,
 			Table:    q.Table,
-			PKValues: q.PKValue,
+			PKValues: event.EscapePKValue(q.PKValue),
 			Since:    &q.Since,
 			Until:    &q.Until,
 		},
