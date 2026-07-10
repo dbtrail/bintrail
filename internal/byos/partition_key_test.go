@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 func TestEnsurePartitionKey_FirstRun(t *testing.T) {
@@ -264,4 +267,105 @@ func mustGet(ctx context.Context, b storageBackendGetter) io.ReadCloser {
 
 type storageBackendGetter interface {
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
+}
+
+// condMemBackend adds atomic create-if-absent on top of memBackend, mirroring
+// what S3Backend offers via conditional writes (If-None-Match: *).
+type condMemBackend struct {
+	*memBackend
+	putIfAbsentErr error // when set, PutIfAbsent returns it as-is
+}
+
+func (c *condMemBackend) PutIfAbsent(ctx context.Context, key string, r io.Reader) error {
+	if c.putIfAbsentErr != nil {
+		return c.putIfAbsentErr
+	}
+	ok, err := c.memBackend.Exists(ctx, key)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return fmt.Errorf("put-if-absent %q: %w", key, storage.ErrObjectExists)
+	}
+	return c.memBackend.Put(ctx, key, r)
+}
+
+// staleExistsBackend simulates the Exists→Put race window: Exists reports
+// absent even though another writer already created the marker.
+type staleExistsBackend struct {
+	*condMemBackend
+}
+
+func (s *staleExistsBackend) Exists(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func TestEnsurePartitionKey_ConditionalBackendFirstRun(t *testing.T) {
+	b := &condMemBackend{memBackend: newMemBackend()}
+	ctx := context.Background()
+
+	if err := EnsurePartitionKey(ctx, b, "srv-A"); err != nil {
+		t.Fatalf("first run on conditional backend: %v", err)
+	}
+	if err := EnsurePartitionKey(ctx, b, "srv-A"); err != nil {
+		t.Fatalf("second run with matching serverID: %v", err)
+	}
+}
+
+func TestEnsurePartitionKey_LostCreateRaceMismatchRefused(t *testing.T) {
+	// Two agents race the same empty prefix: agent A's marker lands first,
+	// but agent B's Exists check raced ahead of it and still saw "absent".
+	// With a plain Put, B silently overwrote A's marker — re-arming the #198
+	// cutover for A. With the conditional write B loses the create, re-reads
+	// the surviving marker, and must refuse the mismatched serverID.
+	cond := &condMemBackend{memBackend: newMemBackend()}
+	ctx := context.Background()
+	if err := EnsurePartitionKey(ctx, cond, "srv-A"); err != nil {
+		t.Fatalf("seed srv-A marker: %v", err)
+	}
+	before, _ := io.ReadAll(mustGet(ctx, cond))
+
+	err := EnsurePartitionKey(ctx, &staleExistsBackend{cond}, "srv-B")
+	if err == nil {
+		t.Fatal("racing agent with different serverID returned nil, want mismatch error")
+	}
+	if !strings.Contains(err.Error(), "partition key mismatch") {
+		t.Errorf("want 'partition key mismatch'; got: %v", err)
+	}
+
+	after, _ := io.ReadAll(mustGet(ctx, cond))
+	if !bytes.Equal(before, after) {
+		t.Errorf("marker overwritten by racing agent:\n  before = %s\n  after  = %s", before, after)
+	}
+}
+
+func TestEnsurePartitionKey_LostCreateRaceMatchOK(t *testing.T) {
+	cond := &condMemBackend{memBackend: newMemBackend()}
+	ctx := context.Background()
+	if err := EnsurePartitionKey(ctx, cond, "srv-A"); err != nil {
+		t.Fatalf("seed srv-A marker: %v", err)
+	}
+	before, _ := io.ReadAll(mustGet(ctx, cond))
+
+	if err := EnsurePartitionKey(ctx, &staleExistsBackend{cond}, "srv-A"); err != nil {
+		t.Fatalf("racing agent with same serverID: %v", err)
+	}
+
+	after, _ := io.ReadAll(mustGet(ctx, cond))
+	if !bytes.Equal(before, after) {
+		t.Errorf("marker rewritten by racing agent with same serverID")
+	}
+}
+
+func TestEnsurePartitionKey_ConditionalPutError(t *testing.T) {
+	sentinel := errors.New("s3 throttled")
+	b := &condMemBackend{memBackend: newMemBackend(), putIfAbsentErr: sentinel}
+
+	err := EnsurePartitionKey(context.Background(), b, "srv-A")
+	if err == nil || !errors.Is(err, sentinel) {
+		t.Fatalf("want wrapped sentinel, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "write partition-key marker") {
+		t.Errorf("error should name the operation; got: %v", err)
+	}
 }

@@ -115,7 +115,8 @@ The IAM principal (user or role) needs these S3 permissions on the destination b
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
-        "s3:GetObject"
+        "s3:GetObject",
+        "s3:AbortMultipartUpload"
       ],
       "Resource": "arn:aws:s3:::my-bucket/archives/*"
     }
@@ -125,6 +126,7 @@ The IAM principal (user or role) needs these S3 permissions on the destination b
 
 - `s3:PutObject` — required for uploading files
 - `s3:GetObject` — required for the `HeadObject` existence check `--retry` issues (AWS authorizes `HeadObject` under the `s3:GetObject` permission — there is no separate `s3:HeadObject` IAM action), and if you later query archives with `bintrail query --archive-s3`
+- `s3:AbortMultipartUpload` — uploads stream through the AWS SDK multipart Uploader (files above ~5 MiB are split into parts); when an upload fails or is interrupted, the SDK automatically aborts the multipart upload, which requires this permission. Without it, orphaned parts remain in the bucket and are billed. As a backstop for aborts that never run (crash, `SIGKILL`, network loss), attach the `AbortIncompleteMultipartUpload` lifecycle rule from [Deployment → S3 archive bucket: abort orphaned multipart uploads](deployment.md#s3-archive-bucket-abort-orphaned-multipart-uploads)
 - `s3:GetBucketLocation` — **optional**, bucket-level (not scoped to `/archives/*`). `bintrail query --archive-s3` uses it only to cross-check the bucket's region against the one already resolved from the credential chain; without it, that check is skipped (logged at debug level, not a warning) and the resolved region is used as-is. Grant it only if the archive bucket lives in a different region than your EC2/ECS/EKS principal otherwise resolves — see [S3 Prerequisites](query-and-recovery.md#s3-prerequisites).
 
 ---
@@ -208,7 +210,7 @@ bintrail upload \
 1. **Walk**: Recursively scans `--source` for `*.parquet` files
 2. **Key construction**: For each file, computes the S3 key by taking the path relative to `--source` and prepending the prefix from `--destination`
 3. **Retry check** (if `--retry`): Issues a `HeadObject` request — skips the file if it already exists in S3
-4. **Upload**: Uploads the file via `PutObject`
+4. **Upload**: Streams the file through the AWS SDK multipart Uploader — files above ~5 MiB upload as multipart (per-part retry), smaller files as a single `PutObject`
 5. **DB update** (if `--index-dsn`): For files matching the Hive archive path pattern, updates `archive_state` with the S3 bucket, key, and upload timestamp
 
 ---

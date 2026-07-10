@@ -909,9 +909,14 @@ func buildFilters(opts query.Options) ([]string, []any) {
 	}
 	if opts.UntilPos != nil {
 		// Exact binlog upper bound, mirroring the live-MySQL path (query.go):
-		// events whose end position is at-or-before the anchor.
-		where = append(where, "(binlog_file < ? OR (binlog_file = ? AND end_pos <= ?))")
-		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.Pos)
+		// events whose end position is at-or-before the anchor. File order is
+		// length-then-lexicographic so the .999999 → .1000000 suffix rollover
+		// doesn't invert the cut (#840); DuckDB's length() counts characters,
+		// matching MySQL's CHAR_LENGTH.
+		where = append(where, "(length(binlog_file) < length(?)"+
+			" OR (length(binlog_file) = length(?) AND binlog_file < ?)"+
+			" OR (binlog_file = ? AND end_pos <= ?))")
+		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.Pos)
 	}
 	if opts.ChangedColumn != "" {
 		needle, _ := json.Marshal(opts.ChangedColumn)

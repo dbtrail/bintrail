@@ -157,7 +157,7 @@ func TestCascadeRecoverySpike(t *testing.T) {
 	// ── Synthesize the victims ──
 	// Load the FK graph (with rules) from the INDEX — the productionized,
 	// source-less path. TakeSnapshot above populated fk_constraints.
-	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName})
+	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName}, time.Now())
 	if err != nil {
 		t.Fatalf("LoadCascadeFKs: %v", err)
 	}

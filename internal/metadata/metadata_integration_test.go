@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/testutil"
@@ -1006,4 +1008,102 @@ func newResolverCapturingWarnings(t *testing.T, db *sql.DB, snapshotID int, want
 		t.Errorf("pre-#212 UNSIGNED warning fired=%v, want %v (snapshot %d):\n%s", got, wantWarning, snapshotID, buf.String())
 	}
 	return r
+}
+
+// TestWritePGSnapshot_concurrentAllocatorSerialized pins the snapshot_id
+// allocator's concurrency contract (#844): N truly concurrent snapshot
+// writers must all succeed, each get a distinct snapshot_id, and never merge
+// rows under one id (which would double every table's columns in the
+// resolver and make it skip ALL events of those tables as "column count
+// mismatch").
+//
+// This subsumes an earlier version of this test that asserted a second
+// writer *blocks* behind an uncommitted one holding a `MAX(snapshot_id)+1
+// FOR UPDATE` lock. That FOR UPDATE design was replaced (still under #844)
+// because it reliably deadlocked (MySQL Error 1213) under 3+ concurrent
+// writers — see DDLSnapshotIDSeq. The new snapshot_id_seq AUTO_INCREMENT
+// allocator deliberately does NOT block one writer behind another (InnoDB's
+// AUTO_INCREMENT lock is held only for the allocating statement, not the
+// whole transaction), so "blocks behind an uncommitted writer" is no longer
+// the right invariant to test; "never collides, never deadlocks" is.
+func TestWritePGSnapshot_concurrentAllocatorSerialized(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	const writers = 8
+	ids := make([]int, writers)
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], errs[i] = WritePGSnapshot(indexDB, &PGRelationSchema{
+				Schema: "pgdb", Table: fmt.Sprintf("pgtable_%d", i),
+				Columns: []PGRelationColumn{{Name: "id", Ordinal: 1, IsPK: true, TypeOID: 23, TypeMod: -1}},
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	seen := make(map[int]bool, writers)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("WritePGSnapshot[%d]: %v (concurrent allocation must never error, including deadlock)", i, err)
+		}
+		if seen[ids[i]] {
+			t.Fatalf("snapshot_id collision: %d allocated more than once across %d concurrent writers", ids[i], writers)
+		}
+		seen[ids[i]] = true
+	}
+}
+
+// TestTakeSnapshot_concurrentAllocatorSerialized is the MySQL-path sibling of
+// TestWritePGSnapshot_concurrentAllocatorSerialized: TakeSnapshot's allocator
+// must hold the same concurrency contract (#844) — see that test's doc
+// comment for why this no longer asserts blocking behavior.
+func TestTakeSnapshot_concurrentAllocatorSerialized(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id INT PRIMARY KEY,
+		status VARCHAR(20) NOT NULL
+	) ENGINE=InnoDB`)
+
+	const writers = 8
+	stats := make([]SnapshotStats, writers)
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			stats[i], errs[i] = TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+		}(i)
+	}
+	wg.Wait()
+
+	seen := make(map[int]bool, writers)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("TakeSnapshot[%d]: %v (concurrent allocation must never error, including deadlock)", i, err)
+		}
+		id := stats[i].SnapshotID
+		if seen[id] {
+			t.Fatalf("snapshot_id collision: %d allocated more than once across %d concurrent writers", id, writers)
+		}
+		seen[id] = true
+
+		// Each writer's snapshot must hold exactly its own row set — no merge
+		// with any other writer's rows under the same snapshot_id.
+		var rowCount int
+		if err := indexDB.QueryRow("SELECT COUNT(*) FROM schema_snapshots WHERE snapshot_id = ? AND schema_name = ?", id, sourceName).Scan(&rowCount); err != nil {
+			t.Fatalf("count rows for snapshot_id %d: %v", id, err)
+		}
+		if rowCount != 2 { // orders.id + orders.status
+			t.Errorf("snapshot_id %d holds %d rows, want 2 (no merge with another concurrent writer)", id, rowCount)
+		}
+	}
 }

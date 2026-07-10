@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -161,10 +162,14 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 
 // deleteEventsSinceCheckpoint removes rows at or beyond (file, pos) from
 // binlog_events — the resume-time dedup for #759 (see the call site in One).
-// file == "" (no prior checkpoint) is a no-op. The `binlog_file > ?` half of
-// the WHERE clause relies on lexicographic filename ordering matching
-// chronological ordering, which holds for MySQL/MariaDB's default
-// fixed-width zero-padded sequence numbers (e.g. mysql-bin.000001).
+// file == "" (no prior checkpoint) is a no-op. "Later file" is
+// length-then-lexicographic (mirrors buildQuery's UntilPos cut in
+// internal/query/query.go, #840): MySQL pads the numeric suffix to a fixed
+// width, so after mysql-bin.999999 comes mysql-bin.1000000 and plain
+// `binlog_file > ?` would invert — a straight lexicographic compare puts the
+// pre-rollover file "greater" and wrongly deletes already-indexed rows on
+// every resume that straddles a rollover. Equal-length names — the same
+// padded width — keep the plain string comparison as the fast path.
 // binlog_events is partitioned by event_timestamp, not binlog_file, so this
 // is a full scan on every resume.
 func deleteEventsSinceCheckpoint(db *sql.DB, file string, pos uint64) (int64, error) {
@@ -173,8 +178,10 @@ func deleteEventsSinceCheckpoint(db *sql.DB, file string, pos uint64) (int64, er
 	}
 	res, err := db.Exec(`
 		DELETE FROM binlog_events
-		WHERE binlog_file > ? OR (binlog_file = ? AND start_pos >= ?)`,
-		file, file, pos)
+		WHERE (CHAR_LENGTH(binlog_file) > CHAR_LENGTH(?)
+		    OR (CHAR_LENGTH(binlog_file) = CHAR_LENGTH(?) AND binlog_file > ?))
+		    OR (binlog_file = ? AND start_pos >= ?)`,
+		file, file, file, file, pos)
 	if err != nil {
 		return 0, fmt.Errorf("delete events since checkpoint %s:%d: %w", file, pos, err)
 	}
@@ -504,6 +511,30 @@ func resolveStartForFlavor(
 				return "", "", "", 0, nil, fmt.Errorf("invalid saved gtid_set %q: %w", saved.gtidSet, parseErr)
 			}
 			return "gtid", "", normalized, 0, gs, nil
+		}
+		// stream_state.binlog_position is BIGINT UNSIGNED but COM_BINLOG_DUMP
+		// carries the offset as uint32, so a checkpoint past 4GiB (a single
+		// transaction larger than max_binlog_size delays rotation until commit)
+		// cannot be addressed in position mode. Casting would silently wrap to
+		// an arbitrary earlier offset and re-index history; fail loud instead.
+		//
+		// NOTE (#845): every current writer of binlogPos derives it from
+		// replication.EventHeader.LogPos, itself a uint32 wire field, so
+		// saved.binlogPos can in practice never exceed math.MaxUint32 through
+		// this codebase's own capture path — the wraparound happens upstream,
+		// at the source, before this value is ever read here. The guard that
+		// actually catches the wrap is in parser.StreamParser.Run
+		// (internal/parser/stream.go): it detects a same-file LogPos going
+		// backward with no intervening RotateEvent and fails loud LIVE, during
+		// streaming, before a corrupt checkpoint can ever be persisted. This
+		// check is kept as cheap defensive insurance (a hand-edited
+		// stream_state row, or a future writer that stops deriving from
+		// LogPos) — it must not be relied on as the primary fix.
+		if saved.binlogPos > math.MaxUint32 {
+			return "", "", "", 0, nil, fmt.Errorf(
+				"saved binlog position %d in %q exceeds 4GiB, the COM_BINLOG_DUMP protocol limit for position-mode resume; "+
+					"switch to GTID mode, which has no such limit: pass --start-gtid with the source's current executed GTID set (%s)",
+				saved.binlogPos, saved.binlogFile, parser.GTIDExecutedHint(flavor))
 		}
 		slog.Info("resuming from position", "file", saved.binlogFile, "pos", saved.binlogPos)
 		return "position", saved.binlogFile, "", uint32(saved.binlogPos), nil, nil
@@ -1860,6 +1891,11 @@ func One(ctx context.Context, cfg Config) error {
 
 	// ── 10. StreamParser + its synchronous DDL hook ──────────────────────────
 	sp := parser.NewStreamParser(resolver, filters, nil)
+	// cfg.Flavor is normalized (empty→"mysql") by this point (step 1 above) —
+	// wires the source flavor into the live position-wraparound guard inside
+	// Run (internal/parser/stream.go) so its GTID-mode remediation names the
+	// right system variable (#845).
+	sp.SetFlavor(cfg.Flavor)
 	idx := indexer.New(indexDB, cfg.BatchSize)
 
 	// ── 11. DDL auto-snapshot hook — registered BEFORE Run starts so even a

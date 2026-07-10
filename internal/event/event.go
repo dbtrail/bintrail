@@ -133,12 +133,22 @@ func (f *Filters) Matches(schema, table string) bool {
 func BuildPKValues(pkColumns []metadata.ColumnMeta, row map[string]any) string {
 	parts := make([]string, 0, len(pkColumns))
 	for _, col := range pkColumns {
-		val := formatPKValue(row[col.Name])
-		val = strings.ReplaceAll(val, `\`, `\\`)
-		val = strings.ReplaceAll(val, `|`, `\|`)
-		parts = append(parts, val)
+		parts = append(parts, EscapePKValue(formatPKValue(row[col.Name])))
 	}
 	return strings.Join(parts, "|")
+}
+
+// EscapePKValue applies the pipe/backslash escaping BuildPKValues uses for
+// each individual PK column value. Exported so callers holding a raw,
+// already-decoded single-column PK value (e.g. internal/shim, after
+// MySQL-unescaping a SQL string literal) can re-encode it into the same
+// at-rest form stored in binlog_events.pk_values before using it as a match
+// filter — the string-literal unescaping and this pipe-delimiter escaping
+// are two unrelated encodings, and neither implies the other.
+func EscapePKValue(val string) string {
+	val = strings.ReplaceAll(val, `\`, `\\`)
+	val = strings.ReplaceAll(val, `|`, `\|`)
+	return val
 }
 
 // formatPKValue renders a single PK value for BuildPKValues. []byte needs its

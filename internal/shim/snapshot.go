@@ -1,7 +1,6 @@
 package shim
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -118,8 +118,19 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
+
+	// Bound concurrent full-table reconstructions (#823). Taken here —
+	// AFTER the src=="" fallback above, which delegates to runFullTable
+	// (that path acquires the gate itself; acquiring before the branch
+	// would deadlock a cap-1 gate) and after the cheap fail-fast PK
+	// refusals — so the slot is held only for the heavy part:
+	// FindBaseline, the delta fetch, and the DuckDB baseline merge.
+	if err := h.cfg.FullTableGate.Acquire(ctx); err != nil {
+		return nil, h.fullTableGateError(q.Type, err)
+	}
+	defer h.cfg.FullTableGate.Release()
 
 	// Shim handling of the stale-fallback warning (#466) is intentionally
 	// minimal: FindBaseline already logs it server-side and an in-band MySQL
@@ -174,7 +185,7 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
 	// BEFORE the merge: the merged rowMap reaching the callback below has
@@ -403,7 +414,7 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		return h.runPointInTime(q)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
 
 	// Stale-fallback warning (#466) discarded here — see the full-table path.
@@ -429,6 +440,9 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		return nil, err
 	}
 
+	// q.PKValue is passed RAW (unescaped) here — Parquet baseline rows store
+	// actual column values, not event.BuildPKValues-encoded pk_values, so this
+	// seam must NOT apply event.EscapePKValue (unlike the delta fetch below).
 	baselineRow, err := reconstruct.ReadBaselineRow(ctx, baselinePath, map[string]string{q.PKColumn: q.PKValue})
 	if err != nil {
 		return nil, err
@@ -456,10 +470,18 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		Since:  &snapshotTime,
 		Until:  &q.AsOf,
 	}
+	// q.PKValue is raw/unescaped (#826). Unlike ReadBaselineRow above (which
+	// matches actual Parquet column values and must keep the raw value), this
+	// delta fetch matches binlog_events.pk_values, which is
+	// event.BuildPKValues-encoded — re-encode with event.EscapePKValue so a
+	// backslash- or pipe-containing PK's post-baseline events are found
+	// instead of silently missing (which would serve a stale baseline image
+	// as the answer at AsOf).
+	encoded := event.EscapePKValue(q.PKValue)
 	if q.PKValue != "" {
-		opts.PKValues = q.PKValue
+		opts.PKValues = encoded
 	} else {
-		opts.PKValuesIn = []string{q.PKValue}
+		opts.PKValuesIn = []string{encoded}
 	}
 	engine := query.New(h.indexDB)
 	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
@@ -470,7 +492,7 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 
 	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),

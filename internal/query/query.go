@@ -122,9 +122,11 @@ func ProfileExists(ctx context.Context, db *sql.DB, profile string) (bool, error
 
 // BinlogPos is a binlog coordinate: a file name plus a byte position. It is used
 // as an exact upper bound for "events up to this point" (see Options.UntilPos),
-// matching events whose end position is at-or-before it. File comparison is
-// lexicographic, which equals numeric order for MySQL's zero-padded binlog names
-// within one server's sequence (the case for a baseline anchor).
+// matching events whose end position is at-or-before it. Files are compared by
+// name length first, then lexicographically — for one server's sequence
+// (constant basename, numeric suffix zero-padded to a minimum width) this
+// equals numeric-suffix order, including past the .999999 → .1000000 rollover
+// where the suffix grows a digit and plain lexicographic order inverts (#840).
 type BinlogPos struct {
 	File string
 	Pos  uint64
@@ -359,8 +361,15 @@ func buildQuery(opts Options) (string, []any) {
 	if opts.UntilPos != nil {
 		// Exact binlog upper bound: events whose end position is at-or-before the
 		// anchor (an earlier file, or the same file no further than the position).
-		where = append(where, "(binlog_file < ? OR (binlog_file = ? AND end_pos <= ?))")
-		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.Pos)
+		// "Earlier file" is length-then-lexicographic (see BinlogPos): MySQL pads
+		// the numeric suffix to 6 digits, so after mysql-bin.999999 comes
+		// mysql-bin.1000000 and plain `binlog_file < ?` inverts the cut (#840).
+		// Equal-length names — the same padded width — keep the plain string
+		// comparison as the fast path.
+		where = append(where, "(CHAR_LENGTH(binlog_file) < CHAR_LENGTH(?)"+
+			" OR (CHAR_LENGTH(binlog_file) = CHAR_LENGTH(?) AND binlog_file < ?)"+
+			" OR (binlog_file = ? AND end_pos <= ?))")
+		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.Pos)
 	}
 	if opts.ChangedColumn != "" {
 		// json.Marshal produces the JSON string representation (with quotes),

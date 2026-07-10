@@ -2,6 +2,7 @@ package cliutil
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -13,8 +14,10 @@ func ParseRetain(s string) (time.Duration, error) {
 	}
 	unit := s[len(s)-1]
 	numStr := s[:len(s)-1]
-	var n int
-	if _, err := fmt.Sscanf(numStr, "%d", &n); err != nil || n <= 0 {
+	// strconv.Atoi (unlike fmt.Sscanf "%d") rejects unconsumed input, so
+	// "1.5d" or "30 0d" fail loud instead of silently truncating retention.
+	n, err := strconv.Atoi(numStr)
+	if err != nil || n <= 0 {
 		return 0, fmt.Errorf("invalid format %q; expected Nd (days) or Nh (hours), e.g. 7d", s)
 	}
 	switch unit {

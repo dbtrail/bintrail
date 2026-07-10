@@ -35,6 +35,14 @@ func startTestShim(t *testing.T, tenants map[string]string, userSchemas map[stri
 // behaviour is unchanged; tests that exercise an opt-in Config field
 // (e.g. AuthMethod for issue #274) call this directly.
 func startTestShimWithConfig(t *testing.T, tenants map[string]string, userSchemas map[string]string, cfg shim.Config) string {
+	return startTestShimFull(t, tenants, userSchemas, cfg, nil, 0)
+}
+
+// startTestShimFull is the fully parameterised form: db backs the
+// handlers' index queries (nil for tests whose wire paths never reach
+// the indexer — see startTestShim), and maxConns exercises the #823
+// connection cap (0 = unlimited, the pre-#823 behaviour).
+func startTestShimFull(t *testing.T, tenants map[string]string, userSchemas map[string]string, cfg shim.Config, db *sql.DB, maxConns int) string {
 	t.Helper()
 
 	auth, err := shim.NewTenantAuth(tenants)
@@ -58,9 +66,7 @@ func startTestShimWithConfig(t *testing.T, tenants map[string]string, userSchema
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		// indexDB=nil: handler construction does not dereference it
-		// and the test queries never reach a path that would.
-		serveLoop(ctx, listener, (*sql.DB)(nil), srv, auth, cfg, userSchemas)
+		serveLoop(ctx, listener, db, srv, auth, cfg, userSchemas, maxConns)
 	}()
 
 	t.Cleanup(func() {
