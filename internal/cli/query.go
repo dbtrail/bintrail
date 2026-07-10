@@ -19,7 +19,9 @@ import (
 	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -239,6 +241,44 @@ func runQuery(cmd *cobra.Command, args []string) error {
 
 	if err := indexer.EnsureSchema(db); err != nil {
 		return fmt.Errorf("schema migration: %w", err)
+	}
+
+	// ── Re-encode single-column --pk/--pks against the at-rest pk_values form ──
+	// (#957) binlog_events.pk_values is stored PIPE/BACKSLASH-ESCAPED
+	// (event.BuildPKValues escapes each PK component before joining with "|"),
+	// but --pk/--pks bind the raw flag value straight through. For a composite
+	// PK, the raw string's own "|" IS the user-typed delimiter between
+	// components (see the command's documented "--pk '12345|2'" usage) —
+	// escaping the whole string would corrupt that delimiter. It is only safe
+	// to escape the ENTIRE value when the target table's PK has exactly ONE
+	// column, because then the whole flag value IS that one component, with no
+	// delimiter ambiguity. 2+ column PKs with a literal pipe/backslash inside a
+	// component are left unescaped (unexpressible via today's single-flag
+	// syntax; out of scope here). The resolver load is best-effort (as
+	// elsewhere in this codebase) and gated on --pk/--pks actually being set,
+	// so a plain query without a PK filter never pays a snapshot lookup.
+	if qPK != "" || len(qPKs) > 0 {
+		resolver, rerr := metadata.NewResolver(db, 0) // 0 = latest snapshot
+		if rerr != nil {
+			slog.Warn("could not load schema snapshot; --pk/--pks with a literal pipe or backslash may not match", "error", rerr)
+			resolver = nil
+		}
+		if resolver != nil {
+			if tm, terr := resolver.Resolve(qSchema, qTable); terr == nil && len(tm.PKColumnMetas()) == 1 {
+				if opts.PKValues != "" {
+					opts.PKValues = event.EscapePKValue(opts.PKValues)
+				}
+				for i, v := range opts.PKValuesIn {
+					opts.PKValuesIn[i] = event.EscapePKValue(v)
+				}
+				// writeGroupedJSON (the --pks --format json path) groups
+				// results by the raw qPKs, matched against each row's stored
+				// (escaped) pk_values — keep it in sync so a single-column
+				// PK containing a literal pipe/backslash still groups
+				// correctly instead of silently dropping out of every group.
+				qPKs = opts.PKValuesIn
+			}
+		}
 	}
 
 	if qProfile != "" {
