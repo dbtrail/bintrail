@@ -121,6 +121,15 @@ func TestEmitSQL_generationFailureRefusesCleanly(t *testing.T) {
 	if !strings.Contains(err.Error(), "could not be reversed") {
 		t.Errorf("error should carry the #784 partial-generation refusal, got: %v", err)
 	}
+	// The failing row is a cascade-synthesized victim (EventID 0, per the row comment
+	// above) — the refusal must name it by schema.table+PK so multiple failing victims
+	// are distinguishable, not by the untraceable, always-identical "event 0".
+	if !strings.Contains(err.Error(), "shop.order_items pk=10") {
+		t.Errorf("error should name the failing victim by schema.table+PK, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "event 0:") {
+		t.Errorf("error should not use the untraceable 'event 0' form for a cascade-synthesized victim, got: %v", err)
+	}
 	if n != 0 {
 		t.Errorf("want 0 statements on refusal, got %d", n)
 	}

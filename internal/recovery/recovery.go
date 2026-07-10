@@ -265,7 +265,13 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 			// was skipped. Same fail-loud stance as the schema-drift (#601) and
 			// script-budget (#654) refusals — refuse up front, write nothing.
 			fmt.Fprintf(&body, "-- ERROR generating reversal for event %d: %v\n", row.EventID, err)
-			genFailures = append(genFailures, genFailure{eventID: row.EventID, err: err})
+			genFailures = append(genFailures, genFailure{
+				eventID:    row.EventID,
+				schemaName: row.SchemaName,
+				tableName:  row.TableName,
+				pkValues:   row.PKValues,
+				err:        err,
+			})
 			continue
 		}
 		if d := g.driftedEmitted(row, cols); len(d) > 0 {
@@ -342,8 +348,11 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 // genFailure records one event that could not be turned into reversal SQL, so
 // partialGenerationError can name every failed event rather than only the first (#784).
 type genFailure struct {
-	eventID uint64
-	err     error
+	eventID    uint64
+	schemaName string
+	tableName  string
+	pkValues   string
+	err        error
 }
 
 // partialGenerationError builds the fail-loud refusal for #784: one or more matched
@@ -352,9 +361,19 @@ type genFailure struct {
 // reversal. It names every failed event and its reason. Same fail-loud stance as the
 // schema-drift (#601) and script-budget (#654) refusals — recover writes nothing and
 // exits non-zero rather than blessing a partial script.
+//
+// Cascade-synthesized rows (cascaderecover, #835) never carry a real event_id — every
+// synthesized victim is EventID==0, so "event 0: ..." is byte-identical across every
+// failing victim and untraceable (and the remediation below, which tells the operator
+// to narrow --pk/--pks, selects the RECOVERY ROOT, not the victim). Name those failures
+// by schema.table + PK instead, using the fields the row already carries.
 func partialGenerationError(failures []genFailure) error {
 	parts := make([]string, 0, len(failures))
 	for _, f := range failures {
+		if f.eventID == 0 && f.schemaName != "" {
+			parts = append(parts, fmt.Sprintf("%s.%s pk=%s: %v", f.schemaName, f.tableName, f.pkValues, f.err))
+			continue
+		}
 		parts = append(parts, fmt.Sprintf("event %d: %v", f.eventID, f.err))
 	}
 	return fmt.Errorf("recover: refusing to emit reversal SQL — %d of the matched event(s) could not be "+
