@@ -433,7 +433,7 @@ func TestWrapFetchErrorClassifiesGapAsTyped(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := wrapFetchError(TypeFlashback, tc.in)
+			out := wrapFetchError(context.Background(), TypeFlashback, tc.in, slog.Default())
 			var myErr *gomysql.MyError
 			gotTyped := errors.As(out, &myErr)
 			if gotTyped != tc.isTyped {

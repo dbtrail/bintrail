@@ -75,14 +75,17 @@ password gate against the same cleartext. The default --listen of
 }
 
 var (
-	shListen      string
-	shIndexDSN    string
-	shShimConfig  string
-	shNoArchive   bool
-	shAllowGaps   bool
-	shAuthMethod  string
-	shBaselineDir string
-	shBaselineS3  string
+	shListen       string
+	shIndexDSN     string
+	shShimConfig   string
+	shNoArchive    bool
+	shAllowGaps    bool
+	shAuthMethod   string
+	shBaselineDir  string
+	shBaselineS3   string
+	shQueryTimeout time.Duration
+	shMaxConns     int
+	shMaxFullTable int
 )
 
 // monitorDeniedStats aggregates ER_ACCESS_DENIED_ERROR handshake failures
@@ -168,6 +171,9 @@ func init() {
 	shimCmd.Flags().StringVar(&shAuthMethod, "auth-method", "", "MySQL auth plugin to advertise during the handshake. Empty (default) keeps mysql_native_password for backwards compatibility. Set to 'caching_sha2_password' or 'sha256_password' on MySQL 8.4+ instances where mysql_native_password is disabled by default. Requires ProxySQL 2.7+ upstream.")
 	shimCmd.Flags().StringVar(&shBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots (from 'bintrail baseline'). Enables _snapshot baseline lookup so rows untouched within the retained binlog window still resolve at AS OF. _flashback stays binlog-only. Unset (default) makes _snapshot behave like _flashback.")
 	shimCmd.Flags().StringVar(&shBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/). Takes precedence over --baseline-dir. Uses the standard AWS credential chain. See --baseline-dir for what it enables.")
+	shimCmd.Flags().DurationVar(&shQueryTimeout, "query-timeout", 5*time.Minute, "Per-query deadline for time-travel queries (index fetch + archive/DuckDB fetch + full-table slot wait). On expiry the client sees MySQL error 1317. 0 disables the deadline.")
+	shimCmd.Flags().IntVar(&shMaxConns, "max-connections", 100, "Maximum concurrent client connections; further connections are refused with MySQL error 1040 'Too many connections'. 0 = unlimited.")
+	shimCmd.Flags().IntVar(&shMaxFullTable, "max-fulltable-queries", 4, "Maximum concurrent full-table time-travel reconstructions (the heaviest queries — up to 100k buffered rows each); excess queries wait for a slot up to --query-timeout, then fail with MySQL error 1203. 0 = unlimited.")
 	_ = shimCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(shimCmd)
 }
@@ -313,6 +319,11 @@ func runShim(cmd *cobra.Command, args []string) error {
 		AuthMethod:  shAuthMethod,
 		BaselineDir: shBaselineDir,
 		BaselineS3:  shBaselineS3,
+		// #823: per-query deadline + one process-wide gate on full-table
+		// reconstructions. Config is copied per connection; the *Gate is
+		// shared by pointer, which is what makes it a global cap.
+		QueryTimeout:  shQueryTimeout,
+		FullTableGate: shim.NewGate(shMaxFullTable),
 	}
 	// Build the *server.Server once at startup, not per connection:
 	//
@@ -330,7 +341,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("auth method: %w", err)
 	}
-	serveLoop(ctx, listener, db, srv, auth, cfg, userSchemas)
+	serveLoop(ctx, listener, db, srv, auth, cfg, userSchemas, shMaxConns)
 	// Block until the monitorDeniedTicker has run its final drain.
 	// serveLoop returning means ctx is cancelled; the ticker is
 	// observing the same ctx and will hit its `case <-ctx.Done()`
@@ -345,14 +356,24 @@ func runShim(cmd *cobra.Command, args []string) error {
 // (Handler holds per-connection state: the currently-selected
 // database).
 //
+// maxConns > 0 caps the concurrent connections (#823): a connection
+// beyond the cap is refused with a wire-protocol 1040 "Too many
+// connections" instead of being accepted into an unbounded goroutine
+// pile. 0 keeps the pre-#823 unlimited behaviour.
+//
 // Accept errors that aren't shutdown signals (ctx cancellation, listener
 // closed) are retried with exponential backoff so a transient kernel
 // hiccup doesn't burn CPU and a permanent listener wedge doesn't fill
 // the log at ~10 lines/sec. The backoff resets to zero on every
 // successful Accept so a brief spike doesn't poison the steady state.
-func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
+func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string, maxConns int) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
+
+	var connSem chan struct{}
+	if maxConns > 0 {
+		connSem = make(chan struct{}, maxConns)
+	}
 
 	var backoff time.Duration
 	for {
@@ -378,12 +399,53 @@ func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, srv *serv
 			continue
 		}
 		backoff = 0
+		if connSem != nil {
+			select {
+			case connSem <- struct{}{}:
+			default:
+				slog.Warn("connection refused: --max-connections reached",
+					"remote", conn.RemoteAddr(), "max_connections", maxConns)
+				refuseTooManyConnections(conn)
+				conn.Close()
+				continue
+			}
+		}
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			handleConn(c, db, srv, auth, cfg, userSchemas)
+			if connSem != nil {
+				defer func() { <-connSem }()
+			}
+			handleConn(ctx, c, db, srv, auth, cfg, userSchemas)
 		}(conn)
 	}
+}
+
+// refuseTooManyConnections writes the MySQL wire ERR packet a real
+// mysqld sends when max_connections is exhausted (1040 "Too many
+// connections"). It is sent INSTEAD of the initial handshake packet —
+// the protocol allows an ERR as the server's first packet, and client
+// libraries (go-sql-driver, libmysql, ProxySQL) surface it as error
+// 1040 rather than a bare TCP reset the operator can't attribute.
+// Pre-handshake the CLIENT_PROTOCOL_41 capability is not negotiated
+// yet, so the packet omits the '#'+SQLSTATE marker, matching mysqld's
+// own pre-handshake ERR format. Caller closes the conn.
+func refuseTooManyConnections(c net.Conn) {
+	code := uint16(gomysql.ER_CON_COUNT_ERROR) // 1040
+	msg := "Too many connections"
+	payload := make([]byte, 0, 3+len(msg))
+	payload = append(payload, 0xff, byte(code), byte(code>>8))
+	payload = append(payload, msg...)
+	pkt := make([]byte, 4, 4+len(payload))
+	pkt[0] = byte(len(payload))
+	pkt[1] = byte(len(payload) >> 8)
+	pkt[2] = byte(len(payload) >> 16)
+	pkt[3] = 0 // sequence id of the server's first packet
+	pkt = append(pkt, payload...)
+	// Best-effort with a short deadline: never let a slow/hostile peer
+	// wedge the accept loop's goroutine on the refusal write.
+	_ = c.SetWriteDeadline(time.Now().Add(time.Second))
+	_, _ = c.Write(pkt)
 }
 
 const (
@@ -627,11 +689,27 @@ func buildUserSchemas(tenantCfgs []shim.TenantConfig) map[string]string {
 // we don't know the tenant — and an explicit `USE` from the client
 // still wins because UseDB is called sequentially and overwrites the
 // seeded value.
-func handleConn(c net.Conn, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
+//
+// ctx is the daemon's serve context; handleConn derives a
+// per-connection context from it via watchConn (#823) and binds it to
+// the Handler, so a client disconnect OR a daemon shutdown cancels any
+// in-flight FetchMerged instead of letting it run to completion for a
+// reader that no longer exists.
+func handleConn(ctx context.Context, c net.Conn, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
 	defer c.Close()
 
+	wc, connCtx, stop := watchConn(ctx, c)
+	defer stop()
+	// Close the socket the moment the connection context dies — the
+	// parent ctx on SIGTERM, or the pump's disconnect detection.
+	// Without this, a graceful shutdown would block in wg.Wait forever
+	// on idle clients parked in HandleCommand's read.
+	stopCloser := context.AfterFunc(connCtx, func() { c.Close() })
+	defer stopCloser()
+
 	handler := shim.NewHandlerWithConfig(db, cfg, slog.Default())
-	mysqlConn, err := server.NewCustomizedConn(c, srv, auth, handler)
+	handler.BindConnContext(connCtx)
+	mysqlConn, err := server.NewCustomizedConn(wc, srv, auth, handler)
 	if err != nil {
 		level, msg, isMonitor := classifyHandshakeErr(err)
 		if isMonitor {
@@ -651,4 +729,61 @@ func handleConn(c net.Conn, db *sql.DB, srv *server.Server, auth shim.TenantAuth
 			return
 		}
 	}
+}
+
+// watchedConn is the net.Conn handed to go-mysql/server by handleConn:
+// writes, deadlines, addresses and Close delegate to the real TCP conn;
+// reads come from the pump goroutine's pipe (see watchConn).
+type watchedConn struct {
+	net.Conn
+	r *io.PipeReader
+}
+
+func (w *watchedConn) Read(p []byte) (int, error) { return w.r.Read(p) }
+
+// watchConn wires a client disconnect to context cancellation (#823).
+//
+// The MySQL protocol is strictly request/response: while HandleQuery is
+// resolving a time-travel query nothing reads the socket, so a client
+// that timed out and closed (FIN/RST) went unnoticed until the query
+// finished and the result write failed — the expensive FetchMerged
+// (index scan + S3/DuckDB archive fetch) kept running to completion for
+// a client that was gone, and a retrying ORM stacked those orphans
+// unbounded. watchConn moves ALL socket reads to a dedicated pump
+// goroutine that relays bytes into a synchronous pipe; the protocol
+// layer reads the pipe instead. The pump is therefore always parked in
+// Read on the real socket and observes EOF/RST the moment the client
+// disconnects — even mid-query — and cancels the returned context,
+// which handleConn binds to the Handler so in-flight fetches abort.
+//
+// io.Pipe is synchronous, so a client pipelining bytes ahead of the
+// protocol reads parks at most one io.Copy buffer (32 KiB) in the pump
+// — no unbounded queue. Read deadlines set on the wrapped conn would
+// land on the real socket and error the pump, but nothing in the shim
+// or go-mysql/server arms one (go-mysql only sets read deadlines when a
+// readTimeout option is configured, which the shim never does). TLS
+// upgrades (caching_sha2/sha256 auth) layer transparently over the
+// wrapped conn: TLS reads flow through the pipe, writes go straight to
+// the socket.
+//
+// The returned stop func must be deferred: it cancels the context and
+// closes the pipe's read side so a pump parked in a pipe write unblocks
+// once the protocol side stops reading (handleConn's deferred c.Close
+// unblocks a pump parked in the socket read).
+func watchConn(parent context.Context, c net.Conn) (net.Conn, context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	pr, pw := io.Pipe()
+	go func() {
+		_, err := io.Copy(pw, c)
+		if err == nil {
+			err = io.EOF // clean FIN: surface as EOF to the protocol reads
+		}
+		pw.CloseWithError(err)
+		cancel()
+	}()
+	stop := func() {
+		cancel()
+		pr.CloseWithError(net.ErrClosed)
+	}
+	return &watchedConn{Conn: c, r: pr}, ctx, stop
 }

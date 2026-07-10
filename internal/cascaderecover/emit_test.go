@@ -89,6 +89,86 @@ func TestEmitSQL_unresolvedToastMarkerRefusesCleanly(t *testing.T) {
 	}
 }
 
+// TestEmitSQL_generationFailureRefusesCleanly locks the #835 invariant: when any
+// parent/victim row cannot be turned into a reversal statement (here a
+// synthesized victim shape — DELETE with EventID 0 and a nil before image), the
+// generator's #784 refusal must surface as a loud error AND leave ZERO bytes on
+// the writer. Before the pre-preamble buffering, the refusal fired after the
+// preamble was written, stranding a dangling `SET FOREIGN_KEY_CHECKS=0` (with no
+// re-enable) in the output — in the CLI text path that partial script was
+// flushed to --output despite the non-zero exit.
+func TestEmitSQL_generationFailureRefusesCleanly(t *testing.T) {
+	hdr := cascaderecover.Header{Schema: "shop", Table: "orders", Parents: 1, Children: 1}
+	rows := []query.ResultRow{
+		{ // renderable parent DELETE
+			EventType:  event.EventDelete,
+			SchemaName: "shop", TableName: "orders",
+			PKValues:  "1",
+			RowBefore: map[string]any{"id": float64(1)},
+		},
+		{ // un-renderable synthesized victim: nil before image, EventID 0
+			EventType:  event.EventDelete,
+			SchemaName: "shop", TableName: "order_items",
+			PKValues: "10",
+		},
+	}
+
+	var buf bytes.Buffer
+	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, nil), rows, nil, nil, hdr)
+	if err == nil {
+		t.Fatalf("expected a loud error, got n=%d output:\n%s", n, buf.String())
+	}
+	if !strings.Contains(err.Error(), "could not be reversed") {
+		t.Errorf("error should carry the #784 partial-generation refusal, got: %v", err)
+	}
+	// The failing row is a cascade-synthesized victim (EventID 0, per the row comment
+	// above) — the refusal must name it by schema.table+PK so multiple failing victims
+	// are distinguishable, not by the untraceable, always-identical "event 0".
+	if !strings.Contains(err.Error(), "shop.order_items pk=10") {
+		t.Errorf("error should name the failing victim by schema.table+PK, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "event 0:") {
+		t.Errorf("error should not use the untraceable 'event 0' form for a cascade-synthesized victim, got: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("want 0 statements on refusal, got %d", n)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("refusal must write nothing (no dangling FK-disable), wrote %d bytes: %q", buf.Len(), buf.String())
+	}
+}
+
+// TestEmitSQL_rowsRenderBetweenPreambleAndFooter guards the pre-preamble
+// buffering reorder (#835) on the success path: with a real renderable row the
+// composition order must stay preamble → generator output → closing
+// FK-checks re-enable, and the statement count must equal the row count.
+func TestEmitSQL_rowsRenderBetweenPreambleAndFooter(t *testing.T) {
+	hdr := cascaderecover.Header{Schema: "shop", Table: "orders", Parents: 1, Children: 0}
+	rows := []query.ResultRow{{
+		EventType:  event.EventDelete,
+		SchemaName: "shop", TableName: "orders",
+		PKValues:  "1",
+		RowBefore: map[string]any{"id": float64(1)},
+	}}
+
+	got, n, err := emit(t, hdr, rows, nil, nil)
+	if err != nil {
+		t.Fatalf("EmitSQL: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("statement count = %d, want 1", n)
+	}
+	fkOff := strings.Index(got, "SET FOREIGN_KEY_CHECKS=0;")
+	insert := strings.Index(got, "INSERT INTO `shop`.`orders`")
+	fkOn := strings.Index(got, "SET FOREIGN_KEY_CHECKS=1;")
+	if fkOff < 0 || insert < 0 || fkOn < 0 {
+		t.Fatalf("missing section (fkOff=%d insert=%d fkOn=%d):\n%s", fkOff, insert, fkOn, got)
+	}
+	if !(fkOff < insert && insert < fkOn) {
+		t.Errorf("section order broken (fkOff=%d insert=%d fkOn=%d):\n%s", fkOff, insert, fkOn, got)
+	}
+}
+
 // TestEmitSQL_goldenPhase1 pins the byte-exact Phase-1 (no baseline) script: the
 // full preamble (including the literal em-dash in the Phase-1 line), the
 // FK-checks wrapper, and the empty-result body.

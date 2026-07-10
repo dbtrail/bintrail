@@ -181,6 +181,14 @@ var envSections = []envSection{
 		},
 	},
 	{
+		Header: "Shim limits (used by bintrail shim; see docs/time-travel-sql.md)",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_SHIM_QUERY_TIMEOUT", "5m"},
+			{"BINTRAIL_SHIM_MAX_CONNECTIONS", "100"},
+			{"BINTRAIL_SHIM_MAX_FULLTABLE_QUERIES", "4"},
+		},
+	},
+	{
 		Header: "Built-in rotation (used by bintrail up)",
 		Bindings: []envTemplateEntry{
 			{"BINTRAIL_ROTATE_RETAIN", "30d"},

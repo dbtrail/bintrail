@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/serverid"
 )
 
@@ -58,6 +59,7 @@ func CreateIndexTables(ctx context.Context, db *sql.DB, partitions int, encrypt 
 		{"schema_changes", ddlSchemaChanges},
 		{"fk_constraints", ddlFKConstraints},
 		{"connection_cache", ddlConnectionCache},
+		{"snapshot_id_seq", metadata.DDLSnapshotIDSeq},
 	}
 	for _, t := range ddls {
 		if _, err := db.Exec(t.ddl); err != nil {

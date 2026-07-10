@@ -5,15 +5,40 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
+
+// snapshotSincePos reads the baseline's exact recorded binlog position so a
+// _snapshot delta fetch can anchor its lower bound there instead of the
+// imprecise snapshotTime DATETIME (#797): a transaction whose statement
+// executed just before snapshotTime but committed (and got logged) just after
+// it would otherwise fall through both the dump's MVCC snapshot AND a
+// Since-only fetch, silently missing from the result. Best-effort: a read
+// failure or an older baseline that never recorded a position (BinlogFile==""
+// or BinlogPos==0) just means nil — callers fall back to the pre-#797
+// Since-only fetch.
+func snapshotSincePos(ctx context.Context, baselinePath string, logger *slog.Logger, schema, table string) *query.BinlogPos {
+	bmeta, err := baseline.ReadParquetMetadataAny(ctx, baselinePath)
+	if err != nil {
+		logger.Warn("shim: could not read baseline metadata for position-anchored delta fetch; falling back to timestamp-only Since",
+			"schema", schema, "table", table, "path", baselinePath, "error", err)
+		return nil
+	}
+	if bmeta.BinlogFile == "" || bmeta.BinlogPos <= 0 {
+		return nil
+	}
+	return &query.BinlogPos{File: bmeta.BinlogFile, Pos: uint64(bmeta.BinlogPos)}
+}
 
 // runSnapshot resolves a _snapshot query. _snapshot is the
 // baseline-aware sibling of _flashback (#355): on top of the
@@ -118,8 +143,19 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
+
+	// Bound concurrent full-table reconstructions (#823). Taken here —
+	// AFTER the src=="" fallback above, which delegates to runFullTable
+	// (that path acquires the gate itself; acquiring before the branch
+	// would deadlock a cap-1 gate) and after the cheap fail-fast PK
+	// refusals — so the slot is held only for the heavy part:
+	// FindBaseline, the delta fetch, and the DuckDB baseline merge.
+	if err := h.cfg.FullTableGate.Acquire(ctx); err != nil {
+		return nil, h.fullTableGateError(q.Type, err)
+	}
+	defer h.cfg.FullTableGate.Release()
 
 	// Shim handling of the stale-fallback warning (#466) is intentionally
 	// minimal: FindBaseline already logs it server-side and an in-band MySQL
@@ -165,6 +201,7 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 			Schema:     q.Schema,
 			Table:      q.Table,
 			Since:      &snapshotTime,
+			SincePos:   snapshotSincePos(ctx, baselinePath, h.logger, q.Schema, q.Table),
 			Until:      &q.AsOf,
 			LimitPerPK: 1,
 		},
@@ -174,7 +211,7 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
 	// BEFORE the merge: the merged rowMap reaching the callback below has
@@ -403,7 +440,7 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		return h.runPointInTime(q)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
 
 	// Stale-fallback warning (#466) discarded here — see the full-table path.
@@ -429,6 +466,9 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		return nil, err
 	}
 
+	// q.PKValue is passed RAW (unescaped) here — Parquet baseline rows store
+	// actual column values, not event.BuildPKValues-encoded pk_values, so this
+	// seam must NOT apply event.EscapePKValue (unlike the delta fetch below).
 	baselineRow, err := reconstruct.ReadBaselineRow(ctx, baselinePath, map[string]string{q.PKColumn: q.PKValue})
 	if err != nil {
 		return nil, err
@@ -451,26 +491,39 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 	// the fetch scoped to the one row; keep the pk_hash fast path for the
 	// common non-empty case.
 	opts := query.Options{
-		Schema: q.Schema,
-		Table:  q.Table,
-		Since:  &snapshotTime,
-		Until:  &q.AsOf,
+		Schema:   q.Schema,
+		Table:    q.Table,
+		Since:    &snapshotTime,
+		SincePos: snapshotSincePos(ctx, baselinePath, h.logger, q.Schema, q.Table),
+		Until:    &q.AsOf,
 	}
+	// q.PKValue is raw/unescaped (#826). Unlike ReadBaselineRow above (which
+	// matches actual Parquet column values and must keep the raw value), this
+	// delta fetch matches binlog_events.pk_values, which is
+	// event.BuildPKValues-encoded — re-encode with event.EscapePKValue so a
+	// backslash- or pipe-containing PK's post-baseline events are found
+	// instead of silently missing (which would serve a stale baseline image
+	// as the answer at AsOf).
+	encoded := event.EscapePKValue(q.PKValue)
 	if q.PKValue != "" {
-		opts.PKValues = q.PKValue
+		opts.PKValues = encoded
 	} else {
-		opts.PKValuesIn = []string{q.PKValue}
+		opts.PKValuesIn = []string{encoded}
 	}
 	engine := query.New(h.indexDB)
-	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
+	// FetchEventsAtomic (not a plain query.FetchMerged) cuts the AsOf upper
+	// bound at the transaction boundary, not the row: a multi-statement
+	// transaction straddling AsOf is excluded whole rather than half-applied
+	// (#783).
+	rows, _, err := reconstruct.FetchEventsAtomic(ctx, h.indexDB, engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         h.cfg.IndexDBName,
 		NoArchive:      h.cfg.NoArchive,
 		AllowGaps:      h.cfg.AllowGaps,
 		ArchiveFetcher: h.archiveFetcher,
-	})
+	}, q.AsOf)
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 
 	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),

@@ -1,16 +1,21 @@
 package verify
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/consistency"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -126,6 +131,18 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 		}
 		return res, fmt.Errorf("find baseline %s.%s: %w", schema, table, err)
 	}
+	// Read the baseline's exact recorded binlog position so the delta fetch
+	// below can anchor on it instead of the imprecise snapshotTime DATETIME
+	// (#797). Best-effort: a read failure just means SincePos stays unset and
+	// the fetch falls back to the plain Since-only window (the pre-#797
+	// behavior), same as an older baseline that never recorded a position.
+	var sincePos *query.BinlogPos
+	if bmeta, berr := baseline.ReadParquetMetadataAny(ctx, baselinePath); berr != nil {
+		slog.Warn("could not read baseline metadata for position-anchored delta fetch; falling back to timestamp-only Since",
+			"schema", schema, "table", table, "path", baselinePath, "error", berr)
+	} else if bmeta.BinlogFile != "" && bmeta.BinlogPos > 0 {
+		sincePos = &query.BinlogPos{File: bmeta.BinlogFile, Pos: uint64(bmeta.BinlogPos)}
+	}
 
 	// 4. Latest event per PK in (baseline, asOf] — the change map the merge needs.
 	engine := query.New(cfg.IndexDB)
@@ -134,6 +151,7 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 			Schema:     schema,
 			Table:      table,
 			Since:      &snapshotTime,
+			SincePos:   sincePos,
 			Until:      &asOf,
 			LimitPerPK: 1,
 		},
@@ -151,11 +169,19 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 		}
 		return res, fmt.Errorf("fetch changes %s.%s: %w", schema, table, err)
 	}
+	// ENUM/SET ordinals → labels, epoch-aware — the same pass every other
+	// reconstruction surface (reconstruct, shim, console) runs before folding
+	// events onto a baseline (#769/#791): with row_image=FULL an UPDATE's
+	// row_after carries EVERY ENUM/SET column, so an unmapped ordinal would
+	// digest-differ from the source's label even when the column never changed.
+	reconstruct.MapEventEnumLabels(cfg.IndexDB, cfg.Resolver, schema, table, rows)
 	// BLOB/TEXT base64 → real value, epoch-aware (#672; same helper #668 wired
 	// into the offline reconstruct writer path). SnapshotFullTableImages itself
 	// never decodes — every caller is responsible for decoding its own changes
 	// map first, same as the shim's runSnapshotFullTable does via mapEventImages.
-	reconstruct.DecodeEventBinaries(cfg.IndexDB, schema, table, rows)
+	// binariesTyped=false means some event's binary values may still be stored
+	// base64; the deferred gate below keeps such a comparison inconclusive.
+	binariesTyped := reconstruct.DecodeEventBinaries(cfg.IndexDB, schema, table, rows)
 	changes := make(map[string]*query.ResultRow, len(rows))
 	for i := range rows {
 		changes[rows[i].PKValues] = &rows[i]
@@ -178,14 +204,14 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 		}
 		orderedCols = append(orderedCols, cm)
 	}
-	// ENUM/SET, JSON and binary columns whose value was changed by an event in
-	// the window can render differently on the event side than the source reads
-	// them (ENUM ordinal vs label, MySQL-canonical JSON text, base64 vs raw
-	// bytes); their faithful event-image normalization is deferred. When such a
-	// table mismatches at EQUAL row count, the difference is not conclusive. A
-	// row-count difference is always conclusive (real loss/gain) and is never
-	// masked by this.
-	deferredRepr := hasDeferredRepr(orderedCols) && len(changes) > 0
+	// A deferred-type value an event carried that the normalization passes
+	// above provably could NOT resolve to the source's representation makes a
+	// content difference at equal row count inconclusive. Merely CONTAINING a
+	// deferred column no longer keeps the gate on (#791): that masked a real
+	// divergence on an unrelated non-deferred column as Inconclusive whenever
+	// any event existed in the window. A row-count difference is always
+	// conclusive (real loss/gain) and is never masked by this.
+	deferredRepr := deferredReprUnresolved(orderedCols, changes, binariesTyped)
 
 	reconDigest, reconCount, emitErr := reconstructDigest(ctx, baselinePath, schema, table, pkCols, changes, rows, orderedCols, renderCellNormalized)
 	if emitErr != nil {
@@ -231,7 +257,7 @@ func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int
 		return StatusMatch, ""
 	}
 	if deferredRepr {
-		return StatusInconclusive, "an ENUM/SET, JSON or binary column was changed by an event; its event-image normalization is deferred, so this content difference is not conclusive"
+		return StatusInconclusive, "an event carried an ENUM/SET, JSON, binary or BIT value that could not be normalized to the baseline/source representation, so this content difference is not conclusive"
 	}
 	return StatusMismatch, "content digest differs at equal row count (in-place value divergence)"
 }
@@ -274,17 +300,150 @@ func inconclusive(res TableResult, detail string) TableResult {
 	return res
 }
 
-// hasDeferredRepr reports whether any column's event-image representation can
-// differ from how the source renders it in a way this version does not yet
-// normalize: ENUM/SET (ordinal vs label), JSON (MySQL-canonical text), and
-// binary families (base64 in the event image vs raw bytes from the source).
-func hasDeferredRepr(cols []metadata.ColumnMeta) bool {
+// deferredReprUnresolved reports whether some change's row image carries a
+// deferred-representation value that could NOT be normalized to the form the
+// baseline/source renders — the only remaining case where a content-digest
+// difference at equal row count is not conclusive.
+//
+// This replaces two earlier, broader gates (#769/#791): gating on "the table
+// contains a deferred column and any change exists" (live mode) masked a REAL
+// divergence on an unrelated non-deferred column as Inconclusive, while gating
+// on ev.ChangedColumns (baseline mode) missed that a FULL row image carries
+// every column — a carried-but-unchanged ENUM ordinal digest-differed and read
+// as a false MISMATCH in the default mode. With the event side now normalized
+// at the root (MapEventEnumLabels, BIT → raw bytes, DecodeEventBinaries,
+// canonicalizeJSONContainer), the gate only stays on for a value those passes
+// provably could not resolve.
+//
+// Only INSERT/UPDATE row_after images matter: a DELETE removes the row from
+// both sides, so none of its values is rendered. binariesTyped is
+// DecodeEventBinaries' report — false means some event's BLOB/BINARY values
+// may still be stored base64 (epoch typing unavailable), so any non-nil
+// binary-family value stays unresolved.
+func deferredReprUnresolved(cols []metadata.ColumnMeta, changes map[string]*query.ResultRow, binariesTyped bool) bool {
+	var deferredCols []metadata.ColumnMeta
 	for _, c := range cols {
 		if isDeferredType(c.DataType) {
-			return true
+			deferredCols = append(deferredCols, c)
+		}
+	}
+	if len(deferredCols) == 0 {
+		return false
+	}
+	for _, ev := range changes {
+		if ev.EventType != event.EventInsert && ev.EventType != event.EventUpdate {
+			continue
+		}
+		for _, c := range deferredCols {
+			v, present := ev.RowAfter[c.Name]
+			if !present || v == nil {
+				continue // absent/NULL renders identically on both sides
+			}
+			if deferredValueUnresolved(v, c, binariesTyped) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// deferredValueUnresolved reports whether one deferred-typed value is still in
+// a representation the render side cannot make byte-faithful to the
+// baseline/source form. Unsure means unresolved — Inconclusive beats a false
+// MISMATCH — but a resolvable value must not keep the gate on, or a real
+// divergence elsewhere in the table stays masked (#791).
+func deferredValueUnresolved(v any, c metadata.ColumnMeta, binariesTyped bool) bool {
+	switch strings.ToLower(c.DataType) {
+	case "enum", "set":
+		// MapEventEnumLabels maps ordinals conservatively; a value still
+		// numeric is an ordinal it could not label (definition drift, epoch
+		// gap). A non-ASCII label is byte-comparable only when the table
+		// charset matches the snapshot's utf8 — not provable here.
+		s, ok := v.(string)
+		return !ok || !isASCII(s)
+	case "bit":
+		if _, ok := v.([]byte); ok {
+			return false // already the raw byte form both sides render
+		}
+		_, ok := renderBitBytes(v, c)
+		return !ok
+	case "json":
+		// JSON is one of the base64StoredKind text-decode targets
+		// DecodeEventBinaries degrades (internal/reconstruct/fulltable.go);
+		// an untyped epoch may leave the value as the raw base64 string it
+		// was stored as. jsonRenderConclusive happens to reject most such
+		// strings (base64's alphabet almost never forms valid bare JSON),
+		// but a base64 string equal to the literal "true"/"false"/"null"
+		// would slip through undetected as resolved — guard explicitly,
+		// matching the binary-family branch below.
+		if !binariesTyped {
+			return true // may still be stored base64 — DecodeEventBinaries degraded
+		}
+		// Key order is canonicalized on both sides; number literals are NOT
+		// provably faithful: go-mysql renders a JSONB double 1.0 as "1" at
+		// capture (the parser does not set UseFloatWithTrailingZero) while the
+		// source/baseline text keeps "1.0" — and after the round-trip the
+		// integer form is indistinguishable from a genuine integer.
+		return !jsonRenderConclusive(renderCell(v, c))
+	case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob":
+		if !binariesTyped {
+			return true // may still be stored base64 — DecodeEventBinaries degraded
+		}
+		switch v.(type) {
+		case string, []byte:
+			return false // decoded to the raw value; byte-comparable
+		default:
+			return true // #736 mis-promotion leftover the decode pass could not restore
+		}
+	default:
+		// Spatial family + VECTOR: []byte (WKB / packed floats) → stored
+		// base64, and no event-side decode exists for them yet (#793).
+		return true
+	}
+}
+
+// jsonRenderConclusive reports whether a rendered JSON value is byte-faithful
+// to how MySQL renders the same document: valid JSON, canonicalizable when a
+// container (so key order cannot differ), and free of number literals (see
+// deferredValueUnresolved's json case).
+func jsonRenderConclusive(b []byte) bool {
+	t := bytes.TrimSpace(b)
+	if len(t) == 0 || !json.Valid(t) {
+		return false
+	}
+	if t[0] == '{' || t[0] == '[' {
+		if _, ok := canonicalizeJSONContainer(t); !ok {
+			return false
+		}
+	}
+	return !jsonContainsNumber(t)
+}
+
+// jsonContainsNumber walks an already-valid JSON document's token stream and
+// reports whether any number literal appears (object keys are always strings,
+// so only value positions produce a json.Number token).
+func jsonContainsNumber(data []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return false // io.EOF ends the walk; validity was pre-checked
+		}
+		if _, isNum := tok.(json.Number); isNum {
+			return true
+		}
+	}
+}
+
+// isASCII reports whether s contains only 7-bit bytes.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // isDeferredType reports whether a column's event-image representation can differ

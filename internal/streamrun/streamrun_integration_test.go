@@ -254,6 +254,91 @@ func TestStreamState_emptyBintrailIDStoresNULL(t *testing.T) {
 	}
 }
 
+// ─── deleteEventsSinceCheckpoint: resume-time dedup rollover safety (#840) ────────────
+
+// TestDeleteEventsSinceCheckpoint_rolloverSafe pins the #840 fix on the
+// resume-time dedup DELETE against real MySQL: after mysql-bin.999999 the
+// server continues with mysql-bin.1000000, and plain lexicographic
+// binlog_file comparison inverts ('999999' > '1000000'). Resuming at
+// mysql-bin.1000000:300 must delete only the straggler row at-or-beyond that
+// checkpoint and must NOT touch the legitimately-indexed pre-rollover row —
+// pre-fix, the buggy `binlog_file > ?` matched the pre-rollover file and
+// permanently destroyed it.
+func TestDeleteEventsSinceCheckpoint_rolloverSafe(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	ts := "2026-02-19 14:00:00"
+	testutil.InsertEvent(t, db, "mysql-bin.999999", 100, 200, ts, nil, "mydb", "orders", 1, "1", nil, nil, []byte(`{"id":1}`))   // pre-rollover, pre-checkpoint (must survive)
+	testutil.InsertEvent(t, db, "mysql-bin.1000000", 100, 200, ts, nil, "mydb", "orders", 1, "2", nil, nil, []byte(`{"id":2}`)) // checkpoint file, below pos (must survive)
+	testutil.InsertEvent(t, db, "mysql-bin.1000000", 300, 400, ts, nil, "mydb", "orders", 1, "3", nil, nil, []byte(`{"id":3}`)) // checkpoint file, at-or-beyond pos (the straggler; must be deleted)
+
+	n, err := deleteEventsSinceCheckpoint(db, "mysql-bin.1000000", 300)
+	if err != nil {
+		t.Fatalf("deleteEventsSinceCheckpoint: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly 1 row deleted (the straggler), got %d", n)
+	}
+
+	rows, err := db.Query("SELECT pk_values FROM binlog_events ORDER BY pk_values")
+	if err != nil {
+		t.Fatalf("query surviving rows: %v", err)
+	}
+	defer rows.Close()
+	var survivors []string
+	for rows.Next() {
+		var pk string
+		if err := rows.Scan(&pk); err != nil {
+			t.Fatalf("scan pk_values: %v", err)
+		}
+		survivors = append(survivors, pk)
+	}
+	want := []string{"1", "2"}
+	if len(survivors) != len(want) || survivors[0] != want[0] || survivors[1] != want[1] {
+		t.Fatalf("expected surviving pks %v (pre-rollover row preserved), got %v", want, survivors)
+	}
+}
+
+// TestDeleteEventsSinceCheckpointGTID_rolloverSafe is the GTID-mode sibling
+// of TestDeleteEventsSinceCheckpoint_rolloverSafe: deleteEventsSinceCheckpointGTID
+// delegates its position-keyed delete to deleteEventsSinceCheckpoint, so the
+// same pre-rollover row must survive when resuming through the GTID entry
+// point too.
+func TestDeleteEventsSinceCheckpointGTID_rolloverSafe(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	ts := "2026-02-19 14:00:00"
+	uuid := "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+	gtid1 := uuid + ":1"
+	gtid2 := uuid + ":2"
+	testutil.InsertEvent(t, db, "mysql-bin.999999", 100, 200, ts, &gtid1, "mydb", "orders", 1, "1", nil, nil, []byte(`{"id":1}`))
+	testutil.InsertEvent(t, db, "mysql-bin.1000000", 100, 200, ts, &gtid2, "mydb", "orders", 1, "2", nil, nil, []byte(`{"id":2}`))
+	testutil.InsertEvent(t, db, "mysql-bin.1000000", 300, 400, ts, nil, "mydb", "orders", 1, "3", nil, nil, []byte(`{"id":3}`))
+
+	savedSet, err := gomysql.ParseMysqlGTIDSet(uuid + ":1-2")
+	if err != nil {
+		t.Fatalf("parse saved set: %v", err)
+	}
+
+	n, err := deleteEventsSinceCheckpointGTID(db, "mysql-bin.1000000", 300, savedSet, gomysql.MySQLFlavor)
+	if err != nil {
+		t.Fatalf("deleteEventsSinceCheckpointGTID: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly 1 row deleted (the straggler, no GTID stragglers), got %d", n)
+	}
+
+	var survives int
+	if err := db.QueryRow("SELECT COUNT(*) FROM binlog_events WHERE binlog_file = 'mysql-bin.999999' AND pk_values = '1'").Scan(&survives); err != nil {
+		t.Fatalf("query pre-rollover row: %v", err)
+	}
+	if survives != 1 {
+		t.Fatalf("expected the pre-rollover row to survive the GTID-mode dedup delete, got count=%d", survives)
+	}
+}
+
 // ─── streamLoop (in-memory, no live replication) ─────────────────────────────────────────
 
 // TestStreamLoop_flushAndCheckpoint verifies that streamLoop correctly batches

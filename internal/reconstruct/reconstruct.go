@@ -36,6 +36,15 @@ type StateEntry struct {
 // returning the final row state. Returns a nil state if the row was deleted.
 // Events must be sorted by (event_timestamp, event_id).
 //
+// The `ev.EventTimestamp.After(at)` check below is a defensive backstop, not
+// the transaction-boundary cut: callers are expected to have already fetched
+// events via FetchEventsAtomic (or trimmed them with
+// TrimPartialTailTransaction), which drops a trailing PARTIAL transaction —
+// one whose statements straddle `at` — wholesale rather than letting it be
+// half-applied here (#783). A caller that passes raw query.FetchMerged
+// output gets the pre-#783 per-row cut, which can apply half of a
+// multi-statement transaction.
+//
 // It fails loud on a residual unchanged-TOAST marker (#592) in any folded
 // event's row image: the marker means the capture invariant (REPLICA IDENTITY
 // FULL resolves every unchanged TOAST value at decode time) was violated, so
@@ -59,6 +68,11 @@ func ApplyAt(initialState map[string]any, events []query.ResultRow, at time.Time
 // for each state transition, starting with the baseline as the first entry.
 // Events must be sorted by (event_timestamp, event_id). Like ApplyAt, it fails
 // loud on a residual unchanged-TOAST marker (#592) in any folded event.
+//
+// Same transaction-boundary caveat as ApplyAt: pass events already fetched
+// via FetchEventsAtomic / trimmed via TrimPartialTailTransaction (#783), or
+// a straddling transaction can appear here as two history entries (T1, T2)
+// when it should appear as none.
 func BuildHistory(initialState map[string]any, baselineTime time.Time, events []query.ResultRow, at time.Time) ([]StateEntry, error) {
 	entries := []StateEntry{{
 		Time:   baselineTime,

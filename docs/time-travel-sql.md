@@ -257,6 +257,16 @@ journalctl -u bintrail-shim -f
 
 The shim should report `shim listening addr=127.0.0.1:3308 tenants=N` once it has loaded `shim.yaml`.
 
+### Resource limits
+
+The shim is a long-running daemon shared by every forensic session, so heavy or abandoned queries are bounded by three flags (all opt-out; the defaults are safe for a typical deployment):
+
+- **`--query-timeout`** (default `5m`, env `BINTRAIL_SHIM_QUERY_TIMEOUT`) — per-query deadline covering the index fetch, the archive/DuckDB fetch, and the wait for a full-table slot. A query that exceeds it fails with MySQL error **1317** (`ER_QUERY_INTERRUPTED`). `0` disables the deadline.
+- **`--max-connections`** (default `100`, env `BINTRAIL_SHIM_MAX_CONNECTIONS`) — concurrent client connections; a connection past the cap is refused with MySQL error **1040** (`Too many connections`), exactly like a real mysqld. `0` removes the cap.
+- **`--max-fulltable-queries`** (default `4`, env `BINTRAIL_SHIM_MAX_FULLTABLE_QUERIES`) — concurrent full-table reconstructions (the heaviest path: up to 100,000 buffered rows each). Excess full-table queries wait for a slot; a waiter that outlives `--query-timeout` fails with MySQL error **1203** (`ER_TOO_MANY_USER_CONNECTIONS`). `0` removes the cap. PK point-lookups and `_diff` are never gated.
+
+A client that disconnects mid-query (an ORM timeout, Ctrl+C in the mysql CLI) cancels the in-flight fetch immediately — the shim stops the index/S3 work instead of finishing a resultset nobody will read.
+
 ---
 
 ## Step 5 — Point your application at ProxySQL
@@ -310,6 +320,27 @@ SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00';
 -- All events for one row in a time window:
 SELECT * FROM _diff.orders BETWEEN '2026-05-01' AND '2026-05-02' WHERE id = 12345;
 ```
+
+> **The hint form is the only one that degrades silently.** `/*+ DBTRAIL_AT=... */`
+> is 100% valid vanilla MySQL (an unknown optimizer hint raises a warning, not an
+> error), so if the query never reaches the shim — the client points at MySQL's
+> port instead of ProxySQL's `:6033`, rules 990001-990006 are missing (e.g.
+> ProxySQL restarted without `SAVE MYSQL QUERY RULES TO DISK`), or a
+> lower-`rule_id` operator rule intercepts first — MySQL executes it against the
+> live table and returns **present-day data with no error**. You believe you are
+> reading the past; you are reading the present. The other shapes fail loud on
+> the same misroute (`_flashback.*` → `ER_BAD_DB` 1049; bare `AS OF` → 1064), so
+> prefer them whenever the client can emit them — reserve the hint form for
+> ORM/query-builder paths that reject `AS OF` syntax, and verify routing after
+> any ProxySQL change:
+>
+> ```sh
+> bintrail doctor --source-dsn "$SRC" --proxysql-admin 'admin:<pass>@tcp(127.0.0.1:6032)/'
+> ```
+>
+> The check confirms all six dbtrail rules are live in
+> `runtime_mysql_query_rules` (advisory `WARN` when they aren't — it never
+> changes doctor's exit code).
 
 Every quoted time literal — in `AS OF`, `DBTRAIL_AT`, and the `BETWEEN` bounds — accepts four absolute formats (`'2026-05-02 10:00:00'`, RFC 3339 `'2026-05-02T10:00:00Z'`, zone-less `'2026-05-02T10:00:00'`, and date-only `'2026-05-02'`), plus `'now'` and relative forms `'<n> seconds|minutes|hours|days ago'` (e.g. `AS OF '5 minutes ago'`), resolved against the wall clock at parse time. Larger units (weeks, months) are deliberately not parsed — spell them as days.
 
@@ -369,7 +400,9 @@ mysql -u admin -p -h 127.0.0.1 -P 6032 \
   -e "SELECT rule_id, match_pattern, destination_hostgroup FROM runtime_mysql_query_rules WHERE rule_id BETWEEN 990001 AND 990006;"
 ```
 
-You should see six rows targeting hostgroup 991 (one each for `_flashback.*`, `_diff.*`, `_snapshot.*`, the `/*+ DBTRAIL_AT=... */` hint-comment shape, `SHOW TABLES FROM` the virtual schemas, and the end-anchored bare `... AS OF '<ts>'` shape). If they're missing, re-apply `proxysql-setup.sql`. If they're present but the query still goes to MySQL, double-check that no operator rule with a smaller `rule_id` is intercepting `_flashback.*` first (ProxySQL evaluates rules in `rule_id` order).
+You should see six rows targeting hostgroup 991 (one each for `_flashback.*`, `_diff.*`, `_snapshot.*`, the `/*+ DBTRAIL_AT=... */` hint-comment shape, `SHOW TABLES FROM` the virtual schemas, and the end-anchored bare `... AS OF '<ts>'` shape). If they're missing, re-apply `proxysql-setup.sql`. If they're present but the query still goes to MySQL, double-check that no operator rule with a smaller `rule_id` is intercepting `_flashback.*` first (ProxySQL evaluates rules in `rule_id` order). `bintrail doctor --proxysql-admin '<admin-dsn>'` runs the six-rules check for you (advisory `WARN` when any is missing or inactive).
+
+Note this failure mode is only *visible* for the `_flashback.*`/`_diff.*`/`_snapshot.*` and bare `AS OF` shapes, which error out when misrouted to MySQL. The `/*+ DBTRAIL_AT */` hint form produces **no error at all** on the same misroute — MySQL treats the hint as unknown-and-ignorable and returns current data (see the warning under Step 6). If time-travel results ever look suspiciously like the present, check the rules above before trusting them.
 
 ### `connection refused` on the shim's port
 
@@ -390,6 +423,9 @@ The shim emits typed wire codes so ORMs and monitoring can distinguish *user inp
 - **1235 `ER_NOT_SUPPORTED_YET`** — a non-virtual-schema query reached the shim (typically a direct connection to `:3308` bypassing ProxySQL). Hostgroup routing is misconfigured.
 - **1526 `ER_NO_PARTITION_FOR_GIVEN_VALUE`** — two causes, distinguished by the message. Either the AS OF or BETWEEN range falls outside what this index retains (rotated out of MySQL with no archive coverage) — narrow the time range or check `archive_state` and the shim's `--allow-gaps` flag. Or a **full-table `_snapshot`** query found the configured baseline unusable (no baseline snapshot at-or-before the AS OF instant, or a primary key the baseline merge can't canonicalize) and refused rather than return a partial table — create or re-run `bintrail baseline` so a snapshot covers the AS OF, or query `_flashback` for a binlog-only view.
 - **1045 `ER_ACCESS_DENIED_ERROR`** — credential mismatch (see the section above).
+- **1317 `ER_QUERY_INTERRUPTED`** — the query exceeded `--query-timeout` (message names the flag), or its client disconnected / the shim shut down mid-query. Narrow the AS OF range, filter by PK, or raise the timeout.
+- **1203 `ER_TOO_MANY_USER_CONNECTIONS`** — too many concurrent full-table time-travel queries; the query waited for a slot until `--query-timeout`. Retry later or raise `--max-fulltable-queries`.
+- **1040 `ER_CON_COUNT_ERROR`** — the `--max-connections` cap was reached; the connection was refused before the handshake.
 - **1104 `ER_TOO_BIG_SELECT`** — full-table `_flashback` / `_snapshot` returned more than 100,000 rows. Narrow the AS OF or add a `WHERE <pk> = <value>` to fall back to the point-lookup path.
 - **1105 `ER_UNKNOWN_ERROR`** — real internal failure (DB timeout, archive S3 outage, build-resultset bug). This is the catch-all "the server is broken, retry" signal; persistent 1105s warrant inspecting the shim log.
 
