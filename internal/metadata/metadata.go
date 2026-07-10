@@ -395,6 +395,24 @@ func (r *Resolver) Tables(schema string) []*TableMeta {
 	return out
 }
 
+// AllTables returns every TableMeta in the snapshot, sorted by schema then
+// table for deterministic output. Used by verify's baseline-anchored mode to
+// enumerate the full table universe, so a snapshot table with no baseline
+// surfaces in the report instead of silently producing no row.
+func (r *Resolver) AllTables() []*TableMeta {
+	out := make([]*TableMeta, 0, len(r.tables))
+	for _, t := range r.tables {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Schema != out[j].Schema {
+			return out[i].Schema < out[j].Schema
+		}
+		return out[i].Table < out[j].Table
+	})
+	return out
+}
+
 // Resolve returns metadata for a given schema.table.
 // Returns an error if the table is not found in the snapshot.
 func (r *Resolver) Resolve(schema, table string) (*TableMeta, error) {
@@ -553,21 +571,25 @@ func coerceTextEncoding(v any, col ColumnMeta) (any, error) {
 // snapshots can't express signedness — NewResolver warns once in that case), or
 // when the value is not a signed integer (NULL, string, and DECIMAL/FLOAT/DOUBLE
 // UNSIGNED — which go-mysql returns as string/float — are returned unchanged).
-// BIT is also reinterpreted here: go-mysql decodes it as a signed int64, so a
-// BIT(64) with the high bit set comes back negative; it's mapped to uint64 (#497).
+// BIT and SET are also reinterpreted here: go-mysql decodes both as a signed
+// int64, so a BIT(64) — or a 64-member SET with member 64 active — comes back
+// negative; both are mapped to uint64 (#497, #846).
 func coerceUnsigned(v any, col ColumnMeta) any {
-	// BIT is an unsigned bit string. go-mysql decodes BIT(N) as int64, so BIT(64)
-	// with the high bit set comes back negative; reinterpret as uint64 — identity
-	// for BIT(1..63) (the value is non-negative as int64, so uint64() preserves
-	// it). BIT's ColumnType is "bit(N)" (no "unsigned"), so handle it before the
-	// unsigned gate below.
-	if strings.ToLower(col.DataType) == "bit" {
+	// BIT is an unsigned bit string and SET an unsigned member bitmask. go-mysql
+	// decodes both as int64 (littleDecodeBit), so BIT(64) — or a SET of exactly
+	// 64 members with member 64 active — comes back negative; reinterpret as
+	// uint64 — identity for smaller widths (the value is non-negative as int64,
+	// so uint64() preserves it). Neither ColumnType contains "unsigned"
+	// ("bit(N)" / "set('a',…)"), so handle them before the unsigned gate below.
+	// BIT was fixed in #497; SET is the same class (#846).
+	switch strings.ToLower(col.DataType) {
+	case "bit", "set":
 		if i, ok := v.(int64); ok {
 			return uint64(i)
 		}
-		// A NULL BIT arrives as nil and passes through here. Otherwise go-mysql
-		// always decodes BIT as int64, so a non-nil non-int64 value can't occur
-		// today; if a future go-mysql/MariaDB path delivered BIT as []byte/string,
+		// A NULL arrives as nil and passes through here. Otherwise go-mysql
+		// always decodes BIT/SET as int64, so a non-nil non-int64 value can't
+		// occur today; if a future go-mysql/MariaDB path delivered []byte/string,
 		// leave it uninterpreted rather than mis-coerce — the original value.
 		return v
 	}
@@ -667,6 +689,10 @@ func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot requires a relation with at least one column")
 	}
 
+	if err := ensureSnapshotIDSeqTable(db); err != nil {
+		return 0, err
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot begin: %w", err)
@@ -679,9 +705,11 @@ func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 	}()
 
 	// Allocate the next snapshot_id inside the transaction (same scheme as
-	// TakeSnapshot). MySQL and PG snapshots coexist in one table with distinct ids.
-	var nextID int
-	if err = tx.QueryRow("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots").Scan(&nextID); err != nil {
+	// TakeSnapshot). MySQL and PG snapshots coexist in one table with distinct
+	// ids. See DDLSnapshotIDSeq for why this is a dedicated AUTO_INCREMENT
+	// counter table rather than a MAX(snapshot_id)+1 FOR UPDATE read (#844).
+	nextID, err := allocateSnapshotID(tx)
+	if err != nil {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot allocate snapshot_id: %w", err)
 	}
 
@@ -752,8 +780,11 @@ type fkRow struct {
 // schema_snapshots and fk_constraints in the index database.
 //
 // If schemas is empty, all non-system schemas are captured. The new snapshot_id
-// is allocated inside the transaction via MAX(snapshot_id)+1, so concurrent
-// snapshot runs (rare in CLI usage) won't collide.
+// is allocated inside the transaction from the dedicated snapshot_id_seq
+// AUTO_INCREMENT counter table (see DDLSnapshotIDSeq), so concurrent snapshot
+// writers (watch DDL hook, manual snapshot, console baseline trigger) can't
+// merge their rows under one id (#844) — and, unlike an earlier
+// MAX(snapshot_id)+1 FOR UPDATE design, can't deadlock each other either.
 func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, error) {
 	// ── 1. Query information_schema on the source server ─────────────────────
 	var (
@@ -827,6 +858,10 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	}
 
 	// ── 2. Write snapshot atomically into the index database ─────────────────
+	if err := ensureSnapshotIDSeqTable(indexDB); err != nil {
+		return SnapshotStats{}, err
+	}
+
 	tx, err := indexDB.Begin()
 	if err != nil {
 		return SnapshotStats{}, fmt.Errorf("failed to begin transaction: %w", err)
@@ -837,14 +872,27 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		}
 	}()
 
-	// Allocate the next snapshot_id inside the transaction. The SELECT…FOR
-	// UPDATE is not needed here because snapshot runs are serial in CLI usage,
-	// but even concurrent runs would simply get the same next ID and produce
-	// two snapshots with distinct row content but same ID — acceptable.
-	var nextID int
-	if err = tx.QueryRow(
-		"SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots",
-	).Scan(&nextID); err != nil {
+	// Allocate the next snapshot_id inside the transaction (#844): snapshot
+	// writers are no longer serial — under the watch daemon the DDL hook
+	// auto-snapshot, a manual `bintrail snapshot`, and the console baseline
+	// trigger can run concurrently against the same index. Without
+	// serialization two writers could read the same MAX and merge both row
+	// sets under one snapshot_id; the resolver then sees every table with
+	// doubled columns and skips ALL its events ("column count mismatch")
+	// until the next snapshot.
+	//
+	// A first attempt serialized this with `SELECT MAX(snapshot_id)+1 ...
+	// FOR UPDATE`, which blocks a second allocator until the first commits —
+	// but that next-key lock reliably deadlocked (Error 1213) under 3+
+	// concurrent writers, and neither caller retries on a transient
+	// deadlock, so it crashed the ingestion daemon under exactly the
+	// concurrency it was meant to handle. allocateSnapshotID instead draws
+	// from a dedicated snapshot_id_seq AUTO_INCREMENT counter table: InnoDB's
+	// AUTO_INCREMENT allocation is a lightweight, statement-duration lock,
+	// not a row/gap lock held for the transaction's lifetime, so concurrent
+	// allocators serialize without ever deadlocking (see DDLSnapshotIDSeq).
+	nextID, err := allocateSnapshotID(tx)
+	if err != nil {
 		return SnapshotStats{}, fmt.Errorf("failed to allocate snapshot_id: %w", err)
 	}
 

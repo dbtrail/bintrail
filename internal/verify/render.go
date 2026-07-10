@@ -34,9 +34,22 @@ import (
 // MySQL normalizes differently than Go) renders best-effort and, for columns the
 // caller marks as deferred-representation, a resulting mismatch is reported
 // inconclusive rather than as a failure (see VerifyTable). FLOAT/DOUBLE are not
-// in the deferred set, so a float-only divergence surfaces as a (safe) mismatch,
-// never as a false match — there is intentionally no float-inconclusive downgrade
-// (that would create a masking path).
+// in the deferred set — there is intentionally no float-inconclusive downgrade
+// (that would create a masking path). Their known representation-only gap
+// (MySQL's my_gcvt vs Go's strconv exponent form, #795) is closed by
+// canonicalFloatText's value-preserving parse+reformat in renderCellNormalized,
+// so whatever divergence survives normalization is a genuine value difference
+// and surfaces as a (safe) mismatch, never as a false match. For FLOAT
+// specifically, canonicalFloatText alone is not sufficient on the live-source
+// side: MySQL's bare `SELECT f` already truncates FLOAT text to ~6
+// significant digits (FLT_DIG) before it ever reaches this package, which is
+// lossy relative to the true float32 value and cannot be recovered by
+// reformatting after the fact. Closing that requires reading more precision
+// from the source in the first place — internal/consistency's selectExpr
+// promotes FLOAT reads to DOUBLE arithmetic (`f+0e0`) specifically for the
+// cross-renderer (normalize != nil) caller VerifyTable uses, so the text
+// canonicalFloatText receives already carries enough digits to identify the
+// exact float32.
 func renderCell(v any, col metadata.ColumnMeta) []byte {
 	if v == nil {
 		return nil
@@ -300,7 +313,7 @@ func walkForDuplicateKeys(dec *json.Decoder) (bool, error) {
 }
 
 // renderCellNormalized renders a cell like renderCell, additionally
-// normalizing two known representation gaps between an event-image value and
+// normalizing the known representation gaps between an event-image value and
 // the SAME underlying data rendered independently on the comparison's other
 // side, so a pure representation difference doesn't register as a content
 // difference:
@@ -308,6 +321,16 @@ func walkForDuplicateKeys(dec *json.Decoder) (bool, error) {
 //   - a JSON object/array value (see canonicalizeJSONContainer) — Go's
 //     map[string]any decode loses object key order, which renderCell's
 //     default case then re-serializes alphabetically.
+//   - a TIME value's fractional suffix (see trimTimeFractionZeros) —
+//     go-mysql's event-image renderer omits the fraction entirely for an
+//     integer-second value while MySQL's text protocol and mydumper always
+//     pad it to the declared fsp (#794).
+//   - a FLOAT/DOUBLE text rendering (see canonicalFloatText) — MySQL's
+//     my_gcvt and Go's strconv disagree on exponent form and thresholds for
+//     the same stored value (#795). For FLOAT, this also depends on the
+//     source having been read with enough precision in the first place —
+//     see internal/consistency's selectExpr (promoteFloat) — since a
+//     truncated MySQL text can't be recovered by reformatting alone.
 //   - a DATE/DATETIME/TIMESTAMP zero-date sentinel (see isZeroDateSentinel)
 //     — internal/baseline.Writer.WriteRow deliberately maps MySQL's
 //     '0000-00-00'-family pseudo-NULL to Parquet NULL, unconditionally, for
@@ -373,8 +396,76 @@ func normalizeRenderedBytes(b []byte, dataType string) []byte {
 	if isZeroDateSentinel(b, col) {
 		return nil
 	}
+	// TIME/FLOAT/DOUBLE values are never JSON containers, so returning from
+	// these arms skips canonicalizeJSONContainer harmlessly.
+	switch strings.ToLower(strings.TrimSpace(dataType)) {
+	case "time":
+		return trimTimeFractionZeros(b)
+	case "float":
+		return canonicalFloatText(b, 32)
+	case "double":
+		return canonicalFloatText(b, 64)
+	}
 	if canon, ok := canonicalizeJSONContainer(b); ok {
 		return canon
 	}
 	return b
+}
+
+// trimTimeFractionZeros canonicalizes a TIME value's fractional suffix by
+// trimming trailing fractional zeros (and a then-empty '.') — the minimal
+// rendering of the same value. The renderers feeding a TIME comparison
+// disagree only in trailing zeros: MySQL's text protocol and mydumper pad
+// the fraction to the declared fsp ("09:00:00.000" for TIME(3)), while
+// go-mysql v1.13.0's timeFormat — the event-image renderer — omits the
+// suffix ENTIRELY when the microsecond part is zero (and pads to the fsp
+// otherwise), so every integer-second TIME(fsp>0) value was a conclusive
+// false MISMATCH in both verify modes (#794). Trimming rather than padding
+// to the fsp because the fsp isn't available here — the live-scan hook
+// carries only information_schema DATA_TYPE (see
+// ConsistentTableChecksumNormalized) — and it also holds for pre-#212
+// snapshots whose ColumnType is empty. Value-preserving by construction:
+// removing trailing zeros after the '.' never collapses two DIFFERENT
+// values. Bytes without a '.' return untouched — an unguarded TrimRight
+// would eat an integer-second value's own trailing zeros ("10:00:00" →
+// "10:00:").
+func trimTimeFractionZeros(b []byte) []byte {
+	if bytes.IndexByte(b, '.') < 0 {
+		return b
+	}
+	t := bytes.TrimRight(b, "0")
+	return bytes.TrimSuffix(t, []byte("."))
+}
+
+// canonicalFloatText re-renders a FLOAT/DOUBLE text value through Go's
+// shortest-round-trip formatter at the column's own width (32-bit for FLOAT,
+// 64-bit for DOUBLE), so MySQL's my_gcvt rendering ("1e16", "0.00001") and
+// Go's strconv rendering ("1e+16", "1e-05") of the SAME stored value compare
+// equal (#795) — live mode was a permanent conclusive MISMATCH on any intact
+// float outside the coinciding-render range. Distinct storable values of the
+// column's width have distinct shortest renderings, so parse+reformat
+// collapses representation only, never a value divergence — which is why
+// FLOAT/DOUBLE can stay OUT of the deferred-representation set (see the
+// renderCell doc: no inconclusive downgrade, no masking path). Bytes that do
+// not parse as a float of that width (never produced by either renderer for
+// an intact value) return unchanged and fall through to the raw byte
+// comparison.
+//
+// This function is value-preserving only when its input already carries
+// enough precision to identify the stored value uniquely. For DOUBLE, MySQL's
+// bare text protocol always does. For FLOAT it does NOT: a bare `SELECT f`
+// truncates to ~6 significant digits (my_gcvt's FLT_DIG default), which is
+// lossy for any float32 that needs more digits to round-trip — no reformat of
+// already-truncated text can recover the missing digits. That gap is closed
+// one layer up, at the SQL text this function receives: internal/consistency's
+// selectExpr promotes FLOAT reads to DOUBLE arithmetic (`f+0e0`) for the
+// cross-renderer (normalize != nil) caller, so by the time a FLOAT value's
+// text reaches here it already carries full double-precision digits and
+// parses back to the exact original float32.
+func canonicalFloatText(b []byte, bitSize int) []byte {
+	f, err := strconv.ParseFloat(string(b), bitSize)
+	if err != nil {
+		return b
+	}
+	return []byte(strconv.FormatFloat(f, 'g', -1, bitSize))
 }

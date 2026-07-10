@@ -9,8 +9,13 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"io"
 )
+
+// ErrObjectExists is returned by ConditionalPutter.PutIfAbsent when an object
+// already exists at the target key. Callers detect it with errors.Is.
+var ErrObjectExists = errors.New("storage: object already exists")
 
 // Backend defines the storage abstraction for Parquet file management.
 // All keys are relative paths (no leading slash). Implementations handle
@@ -36,4 +41,14 @@ type Backend interface {
 
 	// Exists checks whether an object exists at the given key.
 	Exists(ctx context.Context, key string) (bool, error)
+}
+
+// ConditionalPutter is an optional interface a Backend can implement when the
+// underlying service supports atomic create-if-absent writes. Callers assert
+// for it and fall back to a non-atomic Exists+Put when it is not implemented.
+type ConditionalPutter interface {
+	// PutIfAbsent uploads the content from r to the given key only if no
+	// object exists there, atomically. If an object is already present it
+	// returns an error wrapping ErrObjectExists and writes nothing.
+	PutIfAbsent(ctx context.Context, key string, r io.Reader) error
 }

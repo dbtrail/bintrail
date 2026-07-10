@@ -148,6 +148,11 @@ without `REPLICA IDENTITY FULL` fails loud rather than silently losing data.
 A **publication** is PostgreSQL's list of which tables get streamed. You create
 it; bintrail-pg validates that it exists and that it covers the tables you ask
 for, but **does not create it for you** (we never run DDL on your source).
+The publication must publish **all** of insert/update/delete (the default when
+`publish` is left unset) and must not attach a PG15+ row filter (`WHERE (...)`)
+or column list to any table — bintrail-pg refuses a partial publication at
+startup and in `doctor`, because pgoutput would silently drop the excluded
+changes.
 
 ```sql
 -- Specific tables (recommended — you control exactly what is captured):
@@ -648,6 +653,8 @@ which are plain SQL.
 | `publication "…" does not exist — create it` | Create the publication first (step 4) — bintrail-pg never creates it. |
 | `publication "…" does not cover requested table(s) […]` | Your `--schemas`/`--tables` include tables not in the publication; `ALTER PUBLICATION … ADD TABLE …` (or widen the publication). |
 | `table(s) not at REPLICA IDENTITY FULL […]` | Run `ALTER TABLE <t> REPLICA IDENTITY FULL` for the listed tables (step 3). |
+| `publication "…" applies a row filter or column list to table(s) […]` | A PG15+ `WHERE (...)` row filter or column list makes pgoutput emit only a subset of changes (silent data loss). Recreate the publication — or `ALTER PUBLICATION … SET TABLE …` re-listing the tables — without `WHERE (...)` / column lists. |
+| `publication "…" does not publish […] — those changes would be silently lost` | The publication was created with a narrowed `publish` option (e.g. `WITH (publish = 'insert')`). Run `ALTER PUBLICATION … SET (publish = 'insert, update, delete')`, or recreate it leaving `publish` unset (the default publishes all operations). |
 | `replication slot "…" is invalidated (wal_status=lost; max_slot_wal_keep_size exceeded)` | The source dropped WAL the slot still needed (slot was stopped too long). The data since the checkpoint is gone — `bintrail-pg reset` (drops the slot + clears the checkpoint), re-seed, and raise `max_slot_wal_keep_size` / keep the consumer running. `bintrail status` shows this as a loud `EVENTS PERMANENTLY LOST` banner. |
 | `resuming from a saved checkpoint but replication slot "…" no longer exists` | The slot was dropped while a checkpoint still pointed at it. Creating a fresh slot would skip data, so bintrail-pg refuses — `bintrail-pg reset --index-only` to clear the checkpoint and start fresh if the gap is acceptable. |
 | `must include replication=database` (connection error on `--repl-dsn`) | Add `replication=database` to the `--repl-dsn` connection string. |

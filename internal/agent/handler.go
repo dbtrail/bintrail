@@ -76,8 +76,19 @@ type DefaultHandler struct {
 	// resolve_pk and recover check the buffer first (fastest path).
 	Buffer *buffer.Buffer
 
+	// ArchiveFetcher fetches events from one Parquet archive source. Nil →
+	// parquetquery.Fetch (the container-safe DuckDB budget). A seam for tests.
+	ArchiveFetcher query.ArchiveFetcher
+
 	// Logger for handler operations. Nil falls back to slog.Default().
 	Logger *slog.Logger
+}
+
+func (h *DefaultHandler) archiveFetcher() query.ArchiveFetcher {
+	if h.ArchiveFetcher != nil {
+		return h.ArchiveFetcher
+	}
+	return parquetquery.Fetch
 }
 
 func (h *DefaultHandler) logger() *slog.Logger {
@@ -93,6 +104,13 @@ func (h *DefaultHandler) HandleResolvePK(ctx context.Context, req ResolvePKReque
 	if h.IndexDB == nil && len(h.ArchiveSources) == 0 && h.Buffer == nil {
 		return nil, fmt.Errorf("no data sources configured (need --index-dsn, --archive-dir/--archive-s3, or buffer)")
 	}
+
+	// pk_hash → pk_values per (source, schema, table), built from ONE
+	// full-table archive fetch and reused for every batch item (#818):
+	// Parquet archives have no SHA2 index, so the archive fallback scans
+	// the whole table client-side — doing that per item multiplied the
+	// full-table fetch by the batch size.
+	archiveIdx := make(map[archiveTableKey]map[string]string)
 
 	results := make([]PKResult, len(req.Items))
 	for i, item := range req.Items {
@@ -122,7 +140,7 @@ func (h *DefaultHandler) HandleResolvePK(ctx context.Context, req ResolvePKReque
 
 		// Fall back to Parquet archives.
 		for _, src := range h.ArchiveSources {
-			pkVal, err := h.resolvePKFromArchive(ctx, item, src)
+			pkVal, err := h.resolvePKFromArchive(ctx, item, src, archiveIdx)
 			if err != nil {
 				h.logger().Warn("archive query failed, skipping", "source", src, "error", err)
 				continue
@@ -157,25 +175,41 @@ func (h *DefaultHandler) resolvePKFromMySQL(ctx context.Context, item PKItem) (s
 	return pkValues, err
 }
 
-// resolvePKFromArchive scans Parquet archive rows for the given pk_hash.
-// Since Parquet files have no SHA2 index, we fetch all rows for the
-// schema.table and compute SHA-256 client-side to find the match.
-func (h *DefaultHandler) resolvePKFromArchive(ctx context.Context, item PKItem, source string) (string, error) {
-	opts := query.Options{
-		Schema: item.Schema,
-		Table:  item.Table,
-		Limit:  0, // no limit — need to scan for the hash
-	}
-	rows, err := parquetquery.Fetch(ctx, opts, source)
-	if err != nil {
-		return "", err
-	}
-	for _, r := range rows {
-		if byosPKHash(r.PKValues) == item.PKHash {
-			return r.PKValues, nil
+// archiveTableKey identifies one archived table within one archive source —
+// the memoization unit for resolve_pk's client-side hash index.
+type archiveTableKey struct {
+	source, schema, table string
+}
+
+// resolvePKFromArchive resolves a pk_hash against Parquet archive rows.
+// Since Parquet files have no SHA2 index, the first lookup for a
+// (source, schema, table) fetches all of the table's rows, hashes pk_values
+// client-side into cache, and every later item in the batch resolves against
+// that map instead of re-fetching the whole table (#818). Fetch errors are
+// not cached — a later item retries the source.
+func (h *DefaultHandler) resolvePKFromArchive(ctx context.Context, item PKItem, source string, cache map[archiveTableKey]map[string]string) (string, error) {
+	key := archiveTableKey{source: source, schema: item.Schema, table: item.Table}
+	idx, ok := cache[key]
+	if !ok {
+		opts := query.Options{
+			Schema: item.Schema,
+			Table:  item.Table,
+			Limit:  0, // no limit — need every row's pk_values to hash
 		}
+		rows, err := h.archiveFetcher()(ctx, opts, source)
+		if err != nil {
+			return "", err
+		}
+		idx = make(map[string]string, len(rows))
+		for _, r := range rows {
+			hash := byosPKHash(r.PKValues)
+			if _, seen := idx[hash]; !seen { // first match wins, as the pre-memoization scan did
+				idx[hash] = r.PKValues
+			}
+		}
+		cache[key] = idx
 	}
-	return "", nil
+	return idx[item.PKHash], nil
 }
 
 // recoverEventLimit caps the number of events a single recover call may

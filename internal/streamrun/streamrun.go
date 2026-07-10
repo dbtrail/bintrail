@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -504,6 +505,30 @@ func resolveStartForFlavor(
 				return "", "", "", 0, nil, fmt.Errorf("invalid saved gtid_set %q: %w", saved.gtidSet, parseErr)
 			}
 			return "gtid", "", normalized, 0, gs, nil
+		}
+		// stream_state.binlog_position is BIGINT UNSIGNED but COM_BINLOG_DUMP
+		// carries the offset as uint32, so a checkpoint past 4GiB (a single
+		// transaction larger than max_binlog_size delays rotation until commit)
+		// cannot be addressed in position mode. Casting would silently wrap to
+		// an arbitrary earlier offset and re-index history; fail loud instead.
+		//
+		// NOTE (#845): every current writer of binlogPos derives it from
+		// replication.EventHeader.LogPos, itself a uint32 wire field, so
+		// saved.binlogPos can in practice never exceed math.MaxUint32 through
+		// this codebase's own capture path — the wraparound happens upstream,
+		// at the source, before this value is ever read here. The guard that
+		// actually catches the wrap is in parser.StreamParser.Run
+		// (internal/parser/stream.go): it detects a same-file LogPos going
+		// backward with no intervening RotateEvent and fails loud LIVE, during
+		// streaming, before a corrupt checkpoint can ever be persisted. This
+		// check is kept as cheap defensive insurance (a hand-edited
+		// stream_state row, or a future writer that stops deriving from
+		// LogPos) — it must not be relied on as the primary fix.
+		if saved.binlogPos > math.MaxUint32 {
+			return "", "", "", 0, nil, fmt.Errorf(
+				"saved binlog position %d in %q exceeds 4GiB, the COM_BINLOG_DUMP protocol limit for position-mode resume; "+
+					"switch to GTID mode, which has no such limit: pass --start-gtid with the source's current executed GTID set (%s)",
+				saved.binlogPos, saved.binlogFile, parser.GTIDExecutedHint(flavor))
 		}
 		slog.Info("resuming from position", "file", saved.binlogFile, "pos", saved.binlogPos)
 		return "position", saved.binlogFile, "", uint32(saved.binlogPos), nil, nil
@@ -1860,6 +1885,11 @@ func One(ctx context.Context, cfg Config) error {
 
 	// ── 10. StreamParser + its synchronous DDL hook ──────────────────────────
 	sp := parser.NewStreamParser(resolver, filters, nil)
+	// cfg.Flavor is normalized (empty→"mysql") by this point (step 1 above) —
+	// wires the source flavor into the live position-wraparound guard inside
+	// Run (internal/parser/stream.go) so its GTID-mode remediation names the
+	// right system variable (#845).
+	sp.SetFlavor(cfg.Flavor)
 	idx := indexer.New(indexDB, cfg.BatchSize)
 
 	// ── 11. DDL auto-snapshot hook — registered BEFORE Run starts so even a

@@ -50,6 +50,11 @@ func seedCascadeIndex(t *testing.T) (*sql.DB, string, string) {
 		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
 		VALUES (1, 'fk_child', ?, 'child', 'pid', 1, ?, 'parent', 'id', 'CASCADE', 'RESTRICT')`,
 		dbName, dbName)
+	// Production writes fk_constraints and schema_snapshots in ONE transaction
+	// with the same snapshot_id; the FK-snapshot-at-delete selection (#834)
+	// reads the snapshot time from schema_snapshots, so the fixture must
+	// preserve that invariant (snapshot taken before the delete).
+	testutil.InsertSnapshot(t, db, 1, h.Format("2006-01-02 15:04:05"), dbName, "parent", "id", 1, "PRI", "int", "NO")
 
 	return db, dbName, testutil.IntegrationDSN(dbName)
 }

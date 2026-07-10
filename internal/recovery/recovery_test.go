@@ -362,6 +362,178 @@ func TestGenerateUpdate_allColsFallbackNullColumn(t *testing.T) {
 	}
 }
 
+// ─── #789: all-columns fallback caps reversal at one row (LIMIT 1) ───────────
+
+// TestGenerateDelete_allColsFallbackLimit1 pins #789: with the all-columns
+// WHERE fallback (no resolver), byte-identical duplicate rows all match — the
+// reverse DELETE of ONE INSERT must not delete every copy, so the MySQL
+// dialect emits a trailing LIMIT 1.
+func TestGenerateDelete_allColsFallbackLimit1(t *testing.T) {
+	g := newGen()
+	row := query.ResultRow{
+		EventID:    3,
+		SchemaName: "mydb",
+		TableName:  "orders",
+		EventType:  parser.EventInsert,
+		RowAfter:   map[string]any{"id": float64(99), "status": "new"},
+	}
+	stmt, err := g.generateDelete(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasSuffix(stmt, " LIMIT 1") {
+		t.Errorf("all-columns fallback DELETE must end with LIMIT 1 (#789): %s", stmt)
+	}
+}
+
+// TestGenerateUpdate_allColsFallbackLimit1 covers the same #789 cap for UPDATE
+// reversals — an unbounded all-columns WHERE would modify every duplicate.
+func TestGenerateUpdate_allColsFallbackLimit1(t *testing.T) {
+	g := newGen()
+	row := query.ResultRow{
+		EventID:    4,
+		SchemaName: "mydb",
+		TableName:  "orders",
+		EventType:  parser.EventUpdate,
+		RowBefore:  map[string]any{"id": float64(1), "status": "pending"},
+		RowAfter:   map[string]any{"id": float64(1), "status": "shipped"},
+	}
+	stmt, err := g.generateUpdate(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasSuffix(stmt, " LIMIT 1") {
+		t.Errorf("all-columns fallback UPDATE must end with LIMIT 1 (#789): %s", stmt)
+	}
+}
+
+// TestGenerateDelete_allColsFallbackPGWarning pins the PostgreSQL-dialect follow-up to
+// #789: PostgreSQL has no DELETE ... LIMIT, so the all-columns fallback stays unbounded
+// — the generated statement must carry a leading warning comment instead, since that's
+// the only runtime signal that reaches an operator reviewing --dry-run/--output.
+func TestGenerateDelete_allColsFallbackPGWarning(t *testing.T) {
+	g := NewForDialect(nil, nil, PostgresDialect)
+	row := query.ResultRow{
+		EventID:    5,
+		SchemaName: "mydb",
+		TableName:  "orders",
+		EventType:  parser.EventInsert,
+		RowAfter:   map[string]any{"id": float64(99), "status": "new"},
+	}
+	stmt, err := g.generateDelete(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(stmt, "-- WARNING:") {
+		t.Errorf("PG all-columns fallback DELETE must carry a leading warning comment: %s", stmt)
+	}
+	if strings.Contains(stmt, "LIMIT") {
+		t.Errorf("PostgreSQL dialect must never emit LIMIT: %s", stmt)
+	}
+}
+
+// TestGenerateUpdate_allColsFallbackPGWarning covers the same PG warning-comment
+// requirement for UPDATE reversals.
+func TestGenerateUpdate_allColsFallbackPGWarning(t *testing.T) {
+	g := NewForDialect(nil, nil, PostgresDialect)
+	row := query.ResultRow{
+		EventID:    6,
+		SchemaName: "mydb",
+		TableName:  "orders",
+		EventType:  parser.EventUpdate,
+		RowBefore:  map[string]any{"id": float64(1), "status": "pending"},
+		RowAfter:   map[string]any{"id": float64(1), "status": "shipped"},
+	}
+	stmt, err := g.generateUpdate(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(stmt, "-- WARNING:") {
+		t.Errorf("PG all-columns fallback UPDATE must carry a leading warning comment: %s", stmt)
+	}
+	if strings.Contains(stmt, "LIMIT") {
+		t.Errorf("PostgreSQL dialect must never emit LIMIT: %s", stmt)
+	}
+}
+
+// TestGeneratePG_pkResolved_noWarningComment ensures the warning comment is scoped to
+// the all-columns fallback only — a PK-resolved statement (the common case) must stay
+// clean.
+func TestGeneratePG_pkResolved_noWarningComment(t *testing.T) {
+	g := NewForDialect(nil, identityGenResolver(), PostgresDialect)
+	row := query.ResultRow{
+		EventID:    7,
+		SchemaName: "public",
+		TableName:  "t",
+		EventType:  parser.EventInsert,
+		RowAfter:   map[string]any{"id": float64(99), "v": "new"},
+	}
+	stmt, err := g.generateDelete(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(stmt, "WARNING") {
+		t.Errorf("PK-resolved PG statement must not carry the all-columns warning comment: %s", stmt)
+	}
+}
+
+// TestPKScopedWhere_noLimit: a PK-scoped WHERE uniquely identifies the row, so
+// no LIMIT is emitted — the clean statement shape documented in
+// docs/query-and-recovery.md stays unchanged.
+func TestPKScopedWhere_noLimit(t *testing.T) {
+	g := newGenWithResolver()
+	del := query.ResultRow{
+		EventID:    5,
+		SchemaName: "shop",
+		TableName:  "order_items",
+		EventType:  parser.EventInsert,
+		RowAfter:   map[string]any{"order_id": float64(5), "quantity": float64(3)},
+	}
+	stmt, err := g.generateDelete(del)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(stmt, "LIMIT") {
+		t.Errorf("PK-scoped DELETE must not carry LIMIT: %s", stmt)
+	}
+	upd := query.ResultRow{
+		EventID:    6,
+		SchemaName: "shop",
+		TableName:  "order_items",
+		EventType:  parser.EventUpdate,
+		RowBefore:  map[string]any{"order_id": float64(5), "quantity": float64(2)},
+		RowAfter:   map[string]any{"order_id": float64(5), "quantity": float64(3)},
+	}
+	stmt, err = g.generateUpdate(upd)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(stmt, "LIMIT") {
+		t.Errorf("PK-scoped UPDATE must not carry LIMIT: %s", stmt)
+	}
+}
+
+// TestGenerateDelete_pgFallbackNoLimit: PostgreSQL has no DELETE/UPDATE ...
+// LIMIT, so the PG-dialect fallback must stay unbounded (documented caveat)
+// rather than emit invalid SQL.
+func TestGenerateDelete_pgFallbackNoLimit(t *testing.T) {
+	g := NewForDialect(nil, nil, PostgresDialect)
+	row := query.ResultRow{
+		EventID:    7,
+		SchemaName: "mydb",
+		TableName:  "orders",
+		EventType:  parser.EventInsert,
+		RowAfter:   map[string]any{"id": float64(99), "status": "new"},
+	}
+	stmt, err := g.generateDelete(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(stmt, "LIMIT") {
+		t.Errorf("PostgreSQL DELETE must not carry LIMIT (invalid syntax): %s", stmt)
+	}
+}
+
 // ─── GenerateSQL integration (no DB, exercising the output wrapper) ────────────
 
 func TestGenerateSQL_noRows(t *testing.T) {

@@ -322,7 +322,8 @@ following IAM policy to the role or user running bintrail:
           "s3:PutObject",
           "s3:GetObject",
           "s3:ListBucket",
-          "s3:DeleteObject"
+          "s3:DeleteObject",
+          "s3:AbortMultipartUpload"
         ],
         "Resource": [
           "arn:%s:s3:::%s",
@@ -333,10 +334,11 @@ following IAM policy to the role or user running bintrail:
   }
 
 Minimum permissions explained:
-  s3:PutObject    — write Parquet archive files
-  s3:GetObject    — read back archive files
-  s3:ListBucket   — enumerate archived partitions
-  s3:DeleteObject — remove superseded archives (optional but recommended)
+  s3:PutObject             — write Parquet archive files
+  s3:GetObject             — read back archive files
+  s3:ListBucket            — enumerate archived partitions
+  s3:DeleteObject          — remove superseded archives (optional but recommended)
+  s3:AbortMultipartUpload  — clean up failed/interrupted large uploads (orphaned parts are billed)
 
 `, partition, bucket, partition, bucket)
 }

@@ -81,7 +81,7 @@ The `stream_state` table has exactly one row (enforced by a `CHECK (id = 1)` con
 |--------|-------------|
 | `mode` | `"position"` or `"gtid"` |
 | `binlog_file` | Current binlog filename |
-| `binlog_position` | Byte offset of last processed event |
+| `binlog_position` | Byte offset — in GTID mode, the last processed event; in position mode, the last **safe** statement/commit/DDL boundary, which may trail the last processed event |
 | `gtid_set` | Full accumulated GTID set (GTID mode only) |
 | `events_indexed` | Running count |
 | `last_event_time` | Timestamp of the last indexed event |
@@ -96,7 +96,7 @@ The `stream_state` table has exactly one row (enforced by a `CHECK (id = 1)` con
 
 **Checkpoint interval**: Default 10 seconds, configurable via `--checkpoint`. This is the maximum amount of data that could be re-received from MySQL if the process crashes — batches flush to `binlog_events` independently of the checkpoint ticker (whenever a batch fills or a DDL boundary is hit), so a crash between a flush and the next checkpoint can leave already-indexed events beyond the durable checkpoint. On resume, `bintrail stream` deletes any `binlog_events` rows at or beyond the actual replay start (the saved position, or the gap-auto-advanced position if a purge was detected) before streaming resumes, so the re-received events are re-inserted cleanly instead of duplicating (single-writer index, so this is safe). In GTID mode this also removes any rows from a transaction that was still open — flushed but not yet committed — when the last checkpoint was written, since GTID replay restarts a transaction from its beginning rather than from a byte offset.
 
-**Commit-boundary safety**: in GTID mode the checkpoint advances **only at transaction-commit boundaries**, never mid-transaction, so a saved `gtid_set` is always a set of fully-applied transactions — a crash can't persist a partial GTID that would skip the rest of that transaction on resume.
+**Checkpoint-boundary safety**: in GTID mode the checkpoint advances **only at transaction-commit boundaries**, never mid-transaction, so a saved `gtid_set` is always a set of fully-applied transactions — a crash can't persist a partial GTID that would skip the rest of that transaction on resume. In position mode the persisted `binlog_position` advances **only at a statement/commit/DDL boundary**, never mid-statement — it may trail the last processed event, and on resume nothing is re-applied mid-statement. The guarantee is statement-level (not commit-level) because sources with `gtid_mode=OFF` emit no commit event — which is exactly why it covers non-GTID sources.
 
 ### Mode switching
 
@@ -296,8 +296,10 @@ When `--metrics-addr :9090` is set, a Prometheus HTTP endpoint starts at `/metri
 | `bintrail_stream_errors_total{source,type}` | Counter | Errors by type: `batch_flush`, `checkpoint`, `gtid_update` |
 | `bintrail_stream_batch_size` | Histogram | Distribution of events per batch flush |
 
-Every metric carries a `source` label so concurrent streams in one process stay
-distinguishable. For a standalone `bintrail stream` it is the server's resolved
+Every metric in the table above carries a `source` label so concurrent streams
+in one process stay distinguishable (the top-level
+`bintrail_statement_dml_dropped_total` counter is the exception — see
+[observability.md](observability.md#capture-loss-bintrail_statement_dml_dropped_total)). For a standalone `bintrail stream` it is the server's resolved
 `bintrail_id` (`default` if unresolved); under `bintrail-console watch` it is the
 monitored entry's ID, and the **daemon** serves one `/metrics` endpoint covering
 all supervised streams (per-stream endpoints would fight over the bind).

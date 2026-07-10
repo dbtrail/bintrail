@@ -91,7 +91,11 @@ func TestStreamParser_rowsQueryTextAttachedToRows(t *testing.T) {
 		makeQueryEvent("BEGIN"),
 		makeRowsQueryEvent("INSERT INTO shop.orders VALUES (1, 10)"),
 		makeOrdersInsertEvent(1, 10),
-		makeXIDEvent(300),
+		// XID logPos matches makeOrdersInsertEvent's hardcoded LogPos:200 (not
+		// a realistic gap) — this test asserts QueryText propagation, not
+		// position tracking; must stay >= the preceding insert's LogPos so it
+		// doesn't trip the #845 same-file-backward-position guard.
+		makeXIDEvent(200),
 		// Transaction 2: variable toggled off — no ROWS_QUERY event.
 		makeGTIDEvent(2),
 		makeQueryEvent("BEGIN"),
