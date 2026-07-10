@@ -372,7 +372,7 @@ WHERE `id` = 42 AND `status` = 'published' AND `created_at` = '2026-02-19 14:01:
 
 - A `NULL` column renders as `IS NULL` (not `= NULL`, which never matches in SQL).
 - An all-columns `WHERE` matches **every byte-identical duplicate row** (PK-less table, no natural key), while the original event touched exactly one row. Fallback `UPDATE`/`DELETE` reversals therefore carry `LIMIT 1` on the MySQL dialect, so reversing one `INSERT` removes one copy instead of silently deleting all duplicates. Which physical copy is affected is undefined — and irrelevant, since the matching rows are identical on every referenced column.
-- PostgreSQL has no `UPDATE`/`DELETE ... LIMIT`, so PostgreSQL-dialect fallback statements remain unbounded: with byte-identical duplicate rows the reversal still over-applies there. If you rely on this fallback against PostgreSQL, verify the table has a natural uniqueness property before applying the generated script.
+- PostgreSQL has no `UPDATE`/`DELETE ... LIMIT`, so PostgreSQL-dialect fallback statements remain unbounded: with byte-identical duplicate rows the reversal still over-applies there. The generated script flags each affected statement with a leading `-- WARNING: unbounded all-columns WHERE, no per-statement row cap on this dialect ...` comment so the risk is visible in `--dry-run`/`--output` review, not just here. If you rely on this fallback against PostgreSQL, verify the table has a natural uniqueness property before applying the generated script.
 
 The resolver is loaded best-effort in the `recover` command — a failure logs a warning and falls back to the all-columns strategy.
 

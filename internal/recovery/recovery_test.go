@@ -407,6 +407,76 @@ func TestGenerateUpdate_allColsFallbackLimit1(t *testing.T) {
 	}
 }
 
+// TestGenerateDelete_allColsFallbackPGWarning pins the PostgreSQL-dialect follow-up to
+// #789: PostgreSQL has no DELETE ... LIMIT, so the all-columns fallback stays unbounded
+// — the generated statement must carry a leading warning comment instead, since that's
+// the only runtime signal that reaches an operator reviewing --dry-run/--output.
+func TestGenerateDelete_allColsFallbackPGWarning(t *testing.T) {
+	g := NewForDialect(nil, nil, PostgresDialect)
+	row := query.ResultRow{
+		EventID:    5,
+		SchemaName: "mydb",
+		TableName:  "orders",
+		EventType:  parser.EventInsert,
+		RowAfter:   map[string]any{"id": float64(99), "status": "new"},
+	}
+	stmt, err := g.generateDelete(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(stmt, "-- WARNING:") {
+		t.Errorf("PG all-columns fallback DELETE must carry a leading warning comment: %s", stmt)
+	}
+	if strings.Contains(stmt, "LIMIT") {
+		t.Errorf("PostgreSQL dialect must never emit LIMIT: %s", stmt)
+	}
+}
+
+// TestGenerateUpdate_allColsFallbackPGWarning covers the same PG warning-comment
+// requirement for UPDATE reversals.
+func TestGenerateUpdate_allColsFallbackPGWarning(t *testing.T) {
+	g := NewForDialect(nil, nil, PostgresDialect)
+	row := query.ResultRow{
+		EventID:    6,
+		SchemaName: "mydb",
+		TableName:  "orders",
+		EventType:  parser.EventUpdate,
+		RowBefore:  map[string]any{"id": float64(1), "status": "pending"},
+		RowAfter:   map[string]any{"id": float64(1), "status": "shipped"},
+	}
+	stmt, err := g.generateUpdate(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(stmt, "-- WARNING:") {
+		t.Errorf("PG all-columns fallback UPDATE must carry a leading warning comment: %s", stmt)
+	}
+	if strings.Contains(stmt, "LIMIT") {
+		t.Errorf("PostgreSQL dialect must never emit LIMIT: %s", stmt)
+	}
+}
+
+// TestGeneratePG_pkResolved_noWarningComment ensures the warning comment is scoped to
+// the all-columns fallback only — a PK-resolved statement (the common case) must stay
+// clean.
+func TestGeneratePG_pkResolved_noWarningComment(t *testing.T) {
+	g := NewForDialect(nil, identityGenResolver(), PostgresDialect)
+	row := query.ResultRow{
+		EventID:    7,
+		SchemaName: "public",
+		TableName:  "t",
+		EventType:  parser.EventInsert,
+		RowAfter:   map[string]any{"id": float64(99), "v": "new"},
+	}
+	stmt, err := g.generateDelete(row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(stmt, "WARNING") {
+		t.Errorf("PK-resolved PG statement must not carry the all-columns warning comment: %s", stmt)
+	}
+}
+
 // TestPKScopedWhere_noLimit: a PK-scoped WHERE uniquely identifies the row, so
 // no LIMIT is emitted — the clean statement shape documented in
 // docs/query-and-recovery.md stays unchanged.

@@ -901,7 +901,7 @@ func (g *Generator) buildUpdate(row query.ResultRow) (string, []string, error) {
 		strings.Join(whereParts, " AND "),
 	)
 	stmt += g.rowLimitSuffix(allCols)
-	return stmt, cols, nil
+	return g.allColsFallbackWarningComment(allCols) + stmt, cols, nil
 }
 
 // generateDelete reverses an INSERT event: delete the inserted row using its
@@ -922,7 +922,7 @@ func (g *Generator) buildDelete(row query.ResultRow) (string, []string, error) {
 		strings.Join(whereParts, " AND "),
 	)
 	stmt += g.rowLimitSuffix(allCols)
-	return stmt, whereCols, nil
+	return g.allColsFallbackWarningComment(allCols) + stmt, whereCols, nil
 }
 
 // rowLimitSuffix returns " LIMIT 1" for a reverse UPDATE/DELETE whose WHERE fell
@@ -934,6 +934,22 @@ func (g *Generator) buildDelete(row query.ResultRow) (string, []string, error) {
 func (g *Generator) rowLimitSuffix(allColsFallback bool) string {
 	if allColsFallback && g.dialect == MySQLDialect {
 		return " LIMIT 1"
+	}
+	return ""
+}
+
+// allColsFallbackWarningComment returns a leading SQL comment line flagging that the
+// statement below has no per-row cap, for the one dialect where rowLimitSuffix can't
+// supply one. PostgreSQL has no UPDATE/DELETE ... LIMIT, so the all-columns fallback
+// stays unbounded there (#789) with zero runtime signal otherwise — a PK-less table
+// with duplicate rows silently over-applies (reversing one INSERT deletes every
+// byte-identical copy) and the only prior warning was a docs paragraph. The comment
+// is emitted (rather than only a slog.Warn) because it travels with the script into
+// --dry-run/--output, which is where an operator actually reviews before applying.
+func (g *Generator) allColsFallbackWarningComment(allColsFallback bool) string {
+	if allColsFallback && g.dialect == PostgresDialect {
+		return "-- WARNING: unbounded all-columns WHERE, no per-statement row cap on this dialect " +
+			"- may affect every byte-identical duplicate row, not just the one this event touched\n"
 	}
 	return ""
 }
