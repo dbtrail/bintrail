@@ -256,9 +256,20 @@ func TestIntegrationRecoverMatchesGenerator(t *testing.T) {
 		t.Errorf("second undo statement should reverse the INSERT event, got: %s", stmts[1])
 	}
 
-	// Equivalence with the generator. Recovery always fetches oldest-first
-	// (ASC, the zero value), which is exactly what the console forces for the
-	// recover path — so the two scripts must match statement-for-statement.
+	// Equivalence with the generator. The console now fetches DESC (newest
+	// first) so a LIMIT truncation keeps the most recent events (#981), then
+	// re-sorts ASC before generation — whereas the generator call below fetches
+	// ASC (oldest-first, the zero value) under the same limit. Those two
+	// orderings diverge once the match set exceeds the limit: ASC-then-cap
+	// keeps the OLDEST rows, DESC-then-cap keeps the NEWEST. They agree here
+	// only because this fixture's 2 events sit far under recoverDefaultLimit,
+	// so nothing is actually truncated on either side — this is a same-input
+	// sanity check, not a general proof of equivalence. Guard that assumption
+	// explicitly so a future larger fixture doesn't silently start comparing
+	// two different truncation windows.
+	if len(stmts) >= recoverDefaultLimit {
+		t.Fatalf("fixture has grown to %d events, at/above recoverDefaultLimit (%d); the ASC/DESC equivalence below no longer holds — rewrite this check against the console's actual DESC-then-resort behavior", len(stmts), recoverDefaultLimit)
+	}
 	var buf bytes.Buffer
 	opts := query.Options{Schema: "app", Table: "users", Order: "", Limit: recoverDefaultLimit}
 	if _, err := recovery.New(srv.cm.boot.db, srv.cm.boot.resolver).GenerateSQL(context.Background(), opts, &buf); err != nil {
