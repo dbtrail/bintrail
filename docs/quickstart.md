@@ -80,6 +80,10 @@ export SRC="dbtrail:strong-password@tcp(127.0.0.1:3306)/"   # source MySQL
 export IDX="root:secret@tcp(127.0.0.1:3306)/binlog_index"   # the index
 ```
 
+> These examples point `$SRC` and `$IDX` at the same host for brevity. In
+> production, put the index on a [separate server](deployment.md#separate-server-recommended) —
+> if the source's disk dies, a co-located index dies with it.
+
 **Start capturing changes** — one command runs the preflight, creates the index,
 snapshots the schema, and streams in real time (and rotates old partitions
 hourly):

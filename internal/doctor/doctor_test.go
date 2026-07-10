@@ -554,6 +554,76 @@ func TestCheckSyncBinlog(t *testing.T) {
 	}
 }
 
+// TestCheckSourceIndexColocation pins the #978 advisory check: WARN when the
+// source and index resolve to the same host:port, PASS when they differ, and
+// a graceful SKIP (never a panic or an invented FAIL) on an unparseable DSN.
+func TestCheckSourceIndexColocation(t *testing.T) {
+	tests := []struct {
+		name           string
+		sourceDSN      string
+		indexDSN       string
+		wantStatus     CheckStatus
+		wantDetailFrag string
+	}{
+		{
+			name:           "same host:port",
+			sourceDSN:      "dbtrail:pass@tcp(127.0.0.1:3306)/",
+			indexDSN:       "root:secret@tcp(127.0.0.1:3306)/binlog_index",
+			wantStatus:     StatusWarn,
+			wantDetailFrag: "share a disk",
+		},
+		{
+			name:           "different host",
+			sourceDSN:      "dbtrail:pass@tcp(source.example.com:3306)/",
+			indexDSN:       "root:secret@tcp(index.example.com:3306)/binlog_index",
+			wantStatus:     StatusPass,
+			wantDetailFrag: "separate hosts",
+		},
+		{
+			name:           "same host, different port",
+			sourceDSN:      "dbtrail:pass@tcp(127.0.0.1:3306)/",
+			indexDSN:       "root:secret@tcp(127.0.0.1:3307)/binlog_index",
+			wantStatus:     StatusPass,
+			wantDetailFrag: "separate hosts",
+		},
+		{
+			name:           "same host, different case",
+			sourceDSN:      "dbtrail:pass@tcp(DB.EXAMPLE.COM:3306)/",
+			indexDSN:       "root:secret@tcp(db.example.com:3306)/binlog_index",
+			wantStatus:     StatusWarn,
+			wantDetailFrag: "share a disk",
+		},
+		{
+			name:           "unparseable source DSN",
+			sourceDSN:      "not-a-dsn",
+			indexDSN:       "root:secret@tcp(127.0.0.1:3306)/binlog_index",
+			wantStatus:     StatusSkip,
+			wantDetailFrag: "could not parse --source-dsn",
+		},
+		{
+			name:           "unparseable index DSN",
+			sourceDSN:      "dbtrail:pass@tcp(127.0.0.1:3306)/",
+			indexDSN:       "not-a-dsn",
+			wantStatus:     StatusSkip,
+			wantDetailFrag: "could not parse --index-dsn",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := checkSourceIndexColocation(tt.sourceDSN, tt.indexDSN)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
+			}
+			if got.Status == StatusFail {
+				t.Error("source/index colocation is advisory — the check must never FAIL")
+			}
+		})
+	}
+}
+
 // TestCheckStatementCapture pins the #699 advisory check: PASS when the
 // source logs statement text, WARN (never FAIL) when it doesn't, MariaDB
 // fallback probe when the MySQL variable is absent, SKIP when neither exists.

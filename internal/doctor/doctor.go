@@ -166,6 +166,7 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 				Remediation: "Add a database name to the DSN, e.g. user:pass@tcp(host:3306)/binlog_index",
 			})
 		} else {
+			report.add(checkSourceIndexColocation(sourceDSN, indexDSN))
 			report.add(checkIndexConnection(ctx, indexDSN, indexCfg.DBName))
 			report.add(checkIndexWriteAccess(ctx, indexDSN, indexCfg.DBName))
 			report.add(checkIndexCapacity(ctx, indexDSN, indexCfg.DBName, indexRetain))
@@ -1238,6 +1239,41 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 		Name:   "Index write access",
 		Status: StatusPass,
 		Detail: detail,
+	}
+}
+
+// checkSourceIndexColocation warns when the index resolves to the same
+// host:port as the source being captured (#978). bintrail's index is
+// self-contained by design — recovery never needs the original binlog files —
+// but that guarantee only holds if the index's disk can outlive the source's.
+// Co-locating them puts both on the same failure domain: if that disk dies,
+// the index dies with the source it exists to protect. Pure DSN parsing, no
+// live query needed — advisory only (never FAIL, and a garbage DSN degrades
+// to SKIP rather than panicking): a single-host demo or dev box is a
+// legitimate, deliberate choice bintrail can only flag, not block.
+func checkSourceIndexColocation(sourceDSN, indexDSN string) CheckResult {
+	const name = "Index co-located with source"
+	srcCfg, err := mysql.ParseDSN(sourceDSN)
+	if err != nil {
+		return CheckResult{Name: name, Status: StatusSkip, Detail: "could not parse --source-dsn: " + err.Error()}
+	}
+	idxCfg, err := mysql.ParseDSN(indexDSN)
+	if err != nil {
+		return CheckResult{Name: name, Status: StatusSkip, Detail: "could not parse --index-dsn: " + err.Error()}
+	}
+	if !strings.EqualFold(srcCfg.Addr, idxCfg.Addr) {
+		return CheckResult{
+			Name:   name,
+			Status: StatusPass,
+			Detail: fmt.Sprintf("source %s, index %s — separate hosts", srcCfg.Addr, idxCfg.Addr),
+		}
+	}
+	return CheckResult{
+		Name:   name,
+		Status: StatusWarn,
+		Detail: fmt.Sprintf("source and index both resolve to %s — they share a disk, so if it dies the index dies along with the source it was meant to protect, defeating the recovery safety net", srcCfg.Addr),
+		Remediation: "Run the index database on a separate MySQL instance from the source: " +
+			"docs/deployment.md#separate-server-recommended.",
 	}
 }
 
