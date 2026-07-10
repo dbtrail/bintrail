@@ -161,10 +161,14 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 
 // deleteEventsSinceCheckpoint removes rows at or beyond (file, pos) from
 // binlog_events — the resume-time dedup for #759 (see the call site in One).
-// file == "" (no prior checkpoint) is a no-op. The `binlog_file > ?` half of
-// the WHERE clause relies on lexicographic filename ordering matching
-// chronological ordering, which holds for MySQL/MariaDB's default
-// fixed-width zero-padded sequence numbers (e.g. mysql-bin.000001).
+// file == "" (no prior checkpoint) is a no-op. "Later file" is
+// length-then-lexicographic (mirrors buildQuery's UntilPos cut in
+// internal/query/query.go, #840): MySQL pads the numeric suffix to a fixed
+// width, so after mysql-bin.999999 comes mysql-bin.1000000 and plain
+// `binlog_file > ?` would invert — a straight lexicographic compare puts the
+// pre-rollover file "greater" and wrongly deletes already-indexed rows on
+// every resume that straddles a rollover. Equal-length names — the same
+// padded width — keep the plain string comparison as the fast path.
 // binlog_events is partitioned by event_timestamp, not binlog_file, so this
 // is a full scan on every resume.
 func deleteEventsSinceCheckpoint(db *sql.DB, file string, pos uint64) (int64, error) {
@@ -173,8 +177,10 @@ func deleteEventsSinceCheckpoint(db *sql.DB, file string, pos uint64) (int64, er
 	}
 	res, err := db.Exec(`
 		DELETE FROM binlog_events
-		WHERE binlog_file > ? OR (binlog_file = ? AND start_pos >= ?)`,
-		file, file, pos)
+		WHERE (CHAR_LENGTH(binlog_file) > CHAR_LENGTH(?)
+		    OR (CHAR_LENGTH(binlog_file) = CHAR_LENGTH(?) AND binlog_file > ?))
+		    OR (binlog_file = ? AND start_pos >= ?)`,
+		file, file, file, file, pos)
 	if err != nil {
 		return 0, fmt.Errorf("delete events since checkpoint %s:%d: %w", file, pos, err)
 	}

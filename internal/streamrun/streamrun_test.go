@@ -1401,7 +1401,7 @@ func TestDeleteEventsSinceCheckpoint_deletesAtOrBeyond(t *testing.T) {
 	defer db.Close()
 
 	mock.ExpectExec("DELETE FROM binlog_events").
-		WithArgs("mysql-bin.000005", "mysql-bin.000005", uint64(1234)).
+		WithArgs("mysql-bin.000005", "mysql-bin.000005", "mysql-bin.000005", "mysql-bin.000005", uint64(1234)).
 		WillReturnResult(sqlmock.NewResult(0, 3))
 
 	n, err := deleteEventsSinceCheckpoint(db, "mysql-bin.000005", 1234)
@@ -1433,7 +1433,7 @@ func TestDeleteEventsSinceCheckpointGTID_noStragglers(t *testing.T) {
 	}
 
 	mock.ExpectExec("DELETE FROM binlog_events").
-		WithArgs("mysql-bin.000005", "mysql-bin.000005", uint64(1234)).
+		WithArgs("mysql-bin.000005", "mysql-bin.000005", "mysql-bin.000005", "mysql-bin.000005", uint64(1234)).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectQuery("SELECT DISTINCT gtid FROM binlog_events").
 		WithArgs("mysql-bin.000005", uint64(1234)).
@@ -1470,7 +1470,7 @@ func TestDeleteEventsSinceCheckpointGTID_deletesStragglers(t *testing.T) {
 	stragglerGTID := uuid + ":101"
 
 	mock.ExpectExec("DELETE FROM binlog_events").
-		WithArgs("mysql-bin.000005", "mysql-bin.000005", uint64(1234)).
+		WithArgs("mysql-bin.000005", "mysql-bin.000005", "mysql-bin.000005", "mysql-bin.000005", uint64(1234)).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectQuery("SELECT DISTINCT gtid FROM binlog_events").
 		WithArgs("mysql-bin.000005", uint64(1234)).
