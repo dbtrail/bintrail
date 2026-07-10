@@ -165,3 +165,18 @@ CREATE TABLE IF NOT EXISTS connection_cache (
     cached_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Snapshot ID allocator (#844)
+-- Dedicated AUTO_INCREMENT counter for schema_snapshots.snapshot_id. InnoDB's
+-- AUTO_INCREMENT allocation is a lightweight, statement-duration lock (not a
+-- row/gap lock held for a transaction's lifetime), so concurrent snapshot
+-- writers (the watch daemon's DDL hook, a manual `bintrail snapshot`, and the
+-- console baseline trigger) allocate distinct ids without ever deadlocking —
+-- unlike an earlier `SELECT MAX(snapshot_id)+1 ... FOR UPDATE` design, which
+-- reliably deadlocked under 3+ concurrent writers. One row is inserted, never
+-- deleted, per snapshot ever allocated; see internal/metadata.DDLSnapshotIDSeq.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS snapshot_id_seq (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY
+) ENGINE=InnoDB;

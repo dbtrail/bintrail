@@ -671,6 +671,10 @@ func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot requires a relation with at least one column")
 	}
 
+	if err := ensureSnapshotIDSeqTable(db); err != nil {
+		return 0, err
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot begin: %w", err)
@@ -683,10 +687,11 @@ func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 	}()
 
 	// Allocate the next snapshot_id inside the transaction (same scheme as
-	// TakeSnapshot). MySQL and PG snapshots coexist in one table with distinct ids.
-	// FOR UPDATE serializes concurrent allocators (#844) — see TakeSnapshot.
-	var nextID int
-	if err = tx.QueryRow("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots FOR UPDATE").Scan(&nextID); err != nil {
+	// TakeSnapshot). MySQL and PG snapshots coexist in one table with distinct
+	// ids. See DDLSnapshotIDSeq for why this is a dedicated AUTO_INCREMENT
+	// counter table rather than a MAX(snapshot_id)+1 FOR UPDATE read (#844).
+	nextID, err := allocateSnapshotID(tx)
+	if err != nil {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot allocate snapshot_id: %w", err)
 	}
 
@@ -757,9 +762,11 @@ type fkRow struct {
 // schema_snapshots and fk_constraints in the index database.
 //
 // If schemas is empty, all non-system schemas are captured. The new snapshot_id
-// is allocated inside the transaction via MAX(snapshot_id)+1 FOR UPDATE, so
-// concurrent snapshot writers (watch DDL hook, manual snapshot, console
-// baseline trigger) can't merge their rows under one id (#844).
+// is allocated inside the transaction from the dedicated snapshot_id_seq
+// AUTO_INCREMENT counter table (see DDLSnapshotIDSeq), so concurrent snapshot
+// writers (watch DDL hook, manual snapshot, console baseline trigger) can't
+// merge their rows under one id (#844) — and, unlike an earlier
+// MAX(snapshot_id)+1 FOR UPDATE design, can't deadlock each other either.
 func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, error) {
 	// ── 1. Query information_schema on the source server ─────────────────────
 	var (
@@ -833,6 +840,10 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	}
 
 	// ── 2. Write snapshot atomically into the index database ─────────────────
+	if err := ensureSnapshotIDSeqTable(indexDB); err != nil {
+		return SnapshotStats{}, err
+	}
+
 	tx, err := indexDB.Begin()
 	if err != nil {
 		return SnapshotStats{}, fmt.Errorf("failed to begin transaction: %w", err)
@@ -843,19 +854,27 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		}
 	}()
 
-	// Allocate the next snapshot_id inside the transaction, FOR UPDATE (#844):
-	// snapshot writers are no longer serial — under the watch daemon the DDL
-	// hook auto-snapshot, a manual `bintrail snapshot`, and the console baseline
-	// trigger can run concurrently against the same index. Without the lock two
-	// writers read the same MAX and merge both row sets under one snapshot_id;
-	// the resolver then sees every table with doubled columns and skips ALL its
-	// events ("column count mismatch") until the next snapshot. The locking read
-	// blocks the second allocator until the first commits, so it sees the newly
-	// inserted rows and gets the next id.
-	var nextID int
-	if err = tx.QueryRow(
-		"SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots FOR UPDATE",
-	).Scan(&nextID); err != nil {
+	// Allocate the next snapshot_id inside the transaction (#844): snapshot
+	// writers are no longer serial — under the watch daemon the DDL hook
+	// auto-snapshot, a manual `bintrail snapshot`, and the console baseline
+	// trigger can run concurrently against the same index. Without
+	// serialization two writers could read the same MAX and merge both row
+	// sets under one snapshot_id; the resolver then sees every table with
+	// doubled columns and skips ALL its events ("column count mismatch")
+	// until the next snapshot.
+	//
+	// A first attempt serialized this with `SELECT MAX(snapshot_id)+1 ...
+	// FOR UPDATE`, which blocks a second allocator until the first commits —
+	// but that next-key lock reliably deadlocked (Error 1213) under 3+
+	// concurrent writers, and neither caller retries on a transient
+	// deadlock, so it crashed the ingestion daemon under exactly the
+	// concurrency it was meant to handle. allocateSnapshotID instead draws
+	// from a dedicated snapshot_id_seq AUTO_INCREMENT counter table: InnoDB's
+	// AUTO_INCREMENT allocation is a lightweight, statement-duration lock,
+	// not a row/gap lock held for the transaction's lifetime, so concurrent
+	// allocators serialize without ever deadlocking (see DDLSnapshotIDSeq).
+	nextID, err := allocateSnapshotID(tx)
+	if err != nil {
 		return SnapshotStats{}, fmt.Errorf("failed to allocate snapshot_id: %w", err)
 	}
 
