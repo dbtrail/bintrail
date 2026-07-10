@@ -1617,9 +1617,16 @@ function setSelectWhenReady(form, name, value, cb) {
 async function previewRecover(form) {
   const gen = serverGen;
   const container = $("#recover-preview", VIEW());
+  const warns = $("#recover-warnings", VIEW());
   const f = Object.fromEntries(new FormData(form).entries());
   const params = {};
   ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) params[k] = f[k].trim(); });
+  // Mirror /api/recover's EFFECTIVE fetch window (#967) so the preview shows
+  // the same events the undo script will actually reverse: newest-first, same
+  // limit as recoverDefaultLimit in internal/console/api.go. Hardcoded here —
+  // there is no Go-to-JS constant-sharing mechanism in this codebase.
+  params.limit = "1000";
+  params.order = "desc";
   try {
     const data = await api("/api/events?" + new URLSearchParams(params).toString());
     if (gen !== serverGen) return;
@@ -1633,6 +1640,16 @@ async function previewRecover(form) {
     buildEventRows(rows, data.events || []);
     list.append(rows);
     container.append(list);
+    // Truncation warning (#967): more matches than the preview's limit means
+    // the actual undo script (same limit, applied server-side) may cover more
+    // events than are shown here.
+    if (data.count >= data.limit) {
+      renderWarnings(warns, [
+        "Only the newest " + data.limit + " events are shown. The actual undo script may include more if you increase the limit."
+      ]);
+    } else {
+      clear(warns);
+    }
   } catch (err) {
     if (gen !== serverGen) return;
     renderError(container, err);

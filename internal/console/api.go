@@ -58,8 +58,9 @@ type recoverRequest struct {
 	Until         string `json:"until"`
 	ChangedColumn string `json:"changed_column"`
 	// Order is accepted for request symmetry with /api/events but IGNORED by
-	// recover: handleRecover forces oldest-first (ASC) input, which the undo
-	// generator requires. A client-supplied value has no effect.
+	// recover: handleRecover forces newest-first (DESC) input so a LIMIT
+	// truncation keeps the newest suffix of the window (#981); rows are
+	// re-sorted ASC before generation. A client-supplied value has no effect.
 	Order string `json:"order"`
 	Limit int    `json:"limit"`
 }
@@ -248,19 +249,18 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Recovery requires chronological (oldest-first) input: GenerateSQLFromRows
-	// reverses internally so the most-recent event is undone first. The browsing
-	// default (DESC) would invert the undo order for a PK touched multiple times.
-	//
-	// Forcing ASC here also means a LIMIT truncation keeps the OLDEST N events,
-	// NOT the newest N -- unlike the CLI, which fixed this for #785 by fetching
-	// DESC (newest-first, so LIMIT keeps the newest suffix) then re-sorting ASC
-	// before generation. The console still has the pre-#785 bug: a truncated
-	// console recover reverses only the earliest part of the matched window,
-	// leaving the target in the same kind of inconsistent partial state #785
-	// fixed for the CLI. Not addressed here -- see #785 and #927 for context
-	// on a follow-up fix.
-	opts.Order = ""
+	// When --limit truncates the window it must keep the most RECENT events
+	// (#981, mirroring the CLI's #785 fix in internal/cli/recover.go): fetching
+	// DESC means a LIMIT truncation keeps the newest suffix, rolling the data
+	// back to a consistent intermediate point. The ASC default would instead
+	// keep the OLDEST prefix — undoing old events underneath later
+	// un-reverted ones maps to no state that ever existed (the reverse
+	// UPDATE's row_after WHERE no longer matches, or the reverse DELETE
+	// removes a row a later event rewrote). Rows are re-sorted ascending
+	// below, before generation: GenerateSQLFromRows expects chronological
+	// (ASC) input and reverses internally so the most-recent event is undone
+	// first.
+	opts.Order = "DESC"
 
 	// Coverage gaps come back in plan.GapHours and are surfaced as warnings
 	// below — the recover UI renders them, so an incomplete-coverage undo is
@@ -271,6 +271,17 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	warnings := gapWarnings(plan)
+
+	// The fetch above ran Order=DESC so the limit kept the newest suffix of
+	// the window (#981). Detect truncation on the FETCHED row count — before
+	// generation, so the warning fires even when generation later refuses —
+	// then restore ascending order for GenerateSQLFromRows and the
+	// cascade-detection logic below, both of which expect chronological input.
+	if opts.Limit > 0 && len(rows) >= opts.Limit {
+		warnings = append(warnings,
+			fmt.Sprintf("Matched events were truncated at the limit (%d); only the most recent events of the window are being reversed.", opts.Limit))
+	}
+	rows = query.MergeResults(rows, 0, "ASC")
 
 	// Per-bundle dialect (the console is multi-server): MySQLDialect covers MySQL +
 	// MariaDB, PostgresDialect a PG-flavored index. Read once and reused below.
