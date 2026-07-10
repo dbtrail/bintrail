@@ -553,21 +553,25 @@ func coerceTextEncoding(v any, col ColumnMeta) (any, error) {
 // snapshots can't express signedness — NewResolver warns once in that case), or
 // when the value is not a signed integer (NULL, string, and DECIMAL/FLOAT/DOUBLE
 // UNSIGNED — which go-mysql returns as string/float — are returned unchanged).
-// BIT is also reinterpreted here: go-mysql decodes it as a signed int64, so a
-// BIT(64) with the high bit set comes back negative; it's mapped to uint64 (#497).
+// BIT and SET are also reinterpreted here: go-mysql decodes both as a signed
+// int64, so a BIT(64) — or a 64-member SET with member 64 active — comes back
+// negative; both are mapped to uint64 (#497, #846).
 func coerceUnsigned(v any, col ColumnMeta) any {
-	// BIT is an unsigned bit string. go-mysql decodes BIT(N) as int64, so BIT(64)
-	// with the high bit set comes back negative; reinterpret as uint64 — identity
-	// for BIT(1..63) (the value is non-negative as int64, so uint64() preserves
-	// it). BIT's ColumnType is "bit(N)" (no "unsigned"), so handle it before the
-	// unsigned gate below.
-	if strings.ToLower(col.DataType) == "bit" {
+	// BIT is an unsigned bit string and SET an unsigned member bitmask. go-mysql
+	// decodes both as int64 (littleDecodeBit), so BIT(64) — or a SET of exactly
+	// 64 members with member 64 active — comes back negative; reinterpret as
+	// uint64 — identity for smaller widths (the value is non-negative as int64,
+	// so uint64() preserves it). Neither ColumnType contains "unsigned"
+	// ("bit(N)" / "set('a',…)"), so handle them before the unsigned gate below.
+	// BIT was fixed in #497; SET is the same class (#846).
+	switch strings.ToLower(col.DataType) {
+	case "bit", "set":
 		if i, ok := v.(int64); ok {
 			return uint64(i)
 		}
-		// A NULL BIT arrives as nil and passes through here. Otherwise go-mysql
-		// always decodes BIT as int64, so a non-nil non-int64 value can't occur
-		// today; if a future go-mysql/MariaDB path delivered BIT as []byte/string,
+		// A NULL arrives as nil and passes through here. Otherwise go-mysql
+		// always decodes BIT/SET as int64, so a non-nil non-int64 value can't
+		// occur today; if a future go-mysql/MariaDB path delivered []byte/string,
 		// leave it uninterpreted rather than mis-coerce — the original value.
 		return v
 	}
@@ -680,8 +684,9 @@ func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 
 	// Allocate the next snapshot_id inside the transaction (same scheme as
 	// TakeSnapshot). MySQL and PG snapshots coexist in one table with distinct ids.
+	// FOR UPDATE serializes concurrent allocators (#844) — see TakeSnapshot.
 	var nextID int
-	if err = tx.QueryRow("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots").Scan(&nextID); err != nil {
+	if err = tx.QueryRow("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots FOR UPDATE").Scan(&nextID); err != nil {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot allocate snapshot_id: %w", err)
 	}
 
@@ -752,8 +757,9 @@ type fkRow struct {
 // schema_snapshots and fk_constraints in the index database.
 //
 // If schemas is empty, all non-system schemas are captured. The new snapshot_id
-// is allocated inside the transaction via MAX(snapshot_id)+1, so concurrent
-// snapshot runs (rare in CLI usage) won't collide.
+// is allocated inside the transaction via MAX(snapshot_id)+1 FOR UPDATE, so
+// concurrent snapshot writers (watch DDL hook, manual snapshot, console
+// baseline trigger) can't merge their rows under one id (#844).
 func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, error) {
 	// ── 1. Query information_schema on the source server ─────────────────────
 	var (
@@ -837,13 +843,18 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		}
 	}()
 
-	// Allocate the next snapshot_id inside the transaction. The SELECT…FOR
-	// UPDATE is not needed here because snapshot runs are serial in CLI usage,
-	// but even concurrent runs would simply get the same next ID and produce
-	// two snapshots with distinct row content but same ID — acceptable.
+	// Allocate the next snapshot_id inside the transaction, FOR UPDATE (#844):
+	// snapshot writers are no longer serial — under the watch daemon the DDL
+	// hook auto-snapshot, a manual `bintrail snapshot`, and the console baseline
+	// trigger can run concurrently against the same index. Without the lock two
+	// writers read the same MAX and merge both row sets under one snapshot_id;
+	// the resolver then sees every table with doubled columns and skips ALL its
+	// events ("column count mismatch") until the next snapshot. The locking read
+	// blocks the second allocator until the first commits, so it sees the newly
+	// inserted rows and gets the next id.
 	var nextID int
 	if err = tx.QueryRow(
-		"SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots",
+		"SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots FOR UPDATE",
 	).Scan(&nextID); err != nil {
 		return SnapshotStats{}, fmt.Errorf("failed to allocate snapshot_id: %w", err)
 	}

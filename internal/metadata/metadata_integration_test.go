@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
@@ -1006,4 +1007,128 @@ func newResolverCapturingWarnings(t *testing.T, db *sql.DB, snapshotID int, want
 		t.Errorf("pre-#212 UNSIGNED warning fired=%v, want %v (snapshot %d):\n%s", got, wantWarning, snapshotID, buf.String())
 	}
 	return r
+}
+
+// TestWritePGSnapshot_concurrentAllocatorSerialized pins the FOR UPDATE on the
+// snapshot_id allocation (#844): a second snapshot writer must block behind an
+// uncommitted one instead of reading the same MAX(snapshot_id) and merging both
+// row sets under one id (which doubles every table's columns in the resolver
+// and makes it skip ALL events of those tables as "column count mismatch").
+func TestWritePGSnapshot_concurrentAllocatorSerialized(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	// Simulate a concurrent snapshot writer mid-transaction: it computed MAX+1
+	// and inserted its rows but has not committed yet.
+	tx, err := indexDB.Begin()
+	if err != nil {
+		t.Fatalf("begin simulated writer tx: %v", err)
+	}
+	defer tx.Rollback()
+	var otherID int
+	if err := tx.QueryRow("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots").Scan(&otherID); err != nil {
+		t.Fatalf("simulated writer allocate: %v", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, is_nullable)
+		VALUES (?, NOW(), 'otherdb', 'othertable', 'c', 1, '', 'int', 'NO')`, otherID); err != nil {
+		t.Fatalf("simulated writer insert: %v", err)
+	}
+
+	done := make(chan struct{})
+	var gotID int
+	var writeErr error
+	go func() {
+		defer close(done)
+		gotID, writeErr = WritePGSnapshot(indexDB, &PGRelationSchema{
+			Schema: "pgdb", Table: "pgtable",
+			Columns: []PGRelationColumn{{Name: "id", Ordinal: 1, IsPK: true, TypeOID: 23, TypeMod: -1}},
+		})
+	}()
+
+	// The locking read must block behind the uncommitted writer. Without FOR
+	// UPDATE nothing blocks (the consistent read sees the old MAX and the INSERT
+	// touches no conflicting locks), so completing here means the allocation is
+	// not serialized.
+	select {
+	case <-done:
+		t.Fatalf("WritePGSnapshot completed while a concurrent snapshot writer was uncommitted (gotID=%d, otherID=%d, err=%v) — snapshot_id allocation is not serialized", gotID, otherID, writeErr)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit simulated writer: %v", err)
+	}
+	<-done
+	if writeErr != nil {
+		t.Fatalf("WritePGSnapshot: %v", writeErr)
+	}
+	if gotID == otherID {
+		t.Fatalf("snapshot_id collision: both writers allocated %d", gotID)
+	}
+	if gotID != otherID+1 {
+		t.Errorf("WritePGSnapshot allocated %d, want %d (committed writer's id + 1)", gotID, otherID+1)
+	}
+}
+
+// TestTakeSnapshot_concurrentAllocatorSerialized is the MySQL-path sibling of
+// TestWritePGSnapshot_concurrentAllocatorSerialized: TakeSnapshot's allocation
+// uses the same locking read (#844).
+func TestTakeSnapshot_concurrentAllocatorSerialized(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id INT PRIMARY KEY,
+		status VARCHAR(20) NOT NULL
+	) ENGINE=InnoDB`)
+
+	tx, err := indexDB.Begin()
+	if err != nil {
+		t.Fatalf("begin simulated writer tx: %v", err)
+	}
+	defer tx.Rollback()
+	var otherID int
+	if err := tx.QueryRow("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM schema_snapshots").Scan(&otherID); err != nil {
+		t.Fatalf("simulated writer allocate: %v", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, is_nullable)
+		VALUES (?, NOW(), 'otherdb', 'othertable', 'c', 1, '', 'int', 'NO')`, otherID); err != nil {
+		t.Fatalf("simulated writer insert: %v", err)
+	}
+
+	done := make(chan struct{})
+	var stats SnapshotStats
+	var snapErr error
+	go func() {
+		defer close(done)
+		stats, snapErr = TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	}()
+
+	select {
+	case <-done:
+		t.Fatalf("TakeSnapshot completed while a concurrent snapshot writer was uncommitted (id=%d, otherID=%d, err=%v) — snapshot_id allocation is not serialized", stats.SnapshotID, otherID, snapErr)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit simulated writer: %v", err)
+	}
+	<-done
+	if snapErr != nil {
+		t.Fatalf("TakeSnapshot: %v", snapErr)
+	}
+	if stats.SnapshotID == otherID {
+		t.Fatalf("snapshot_id collision: both writers allocated %d", otherID)
+	}
+	// The committed writer's snapshot must hold ONLY its own row — no merge.
+	var mixed int
+	if err := indexDB.QueryRow("SELECT COUNT(*) FROM schema_snapshots WHERE snapshot_id = ? AND schema_name = ?", otherID, sourceName).Scan(&mixed); err != nil {
+		t.Fatalf("count merged rows: %v", err)
+	}
+	if mixed != 0 {
+		t.Errorf("TakeSnapshot merged %d rows into the concurrent writer's snapshot_id %d", mixed, otherID)
+	}
 }
