@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
@@ -27,6 +29,11 @@ type mockS3 struct {
 	headErr       error
 	deleteErr     error
 	listErr       error
+
+	// condUnsupported makes PutObject reject If-None-Match with
+	// NotImplemented, like S3-compatible services without conditional-write
+	// support.
+	condUnsupported bool
 
 	// Multipart-upload state, exercised by the managed Uploader for bodies
 	// larger than its part size. mpMu guards concurrent UploadPart calls.
@@ -53,6 +60,14 @@ func (m *mockS3) HeadBucket(_ context.Context, _ *s3.HeadBucketInput, _ ...func(
 func (m *mockS3) PutObject(_ context.Context, input *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
 	if m.putErr != nil {
 		return nil, m.putErr
+	}
+	if aws.ToString(input.IfNoneMatch) == "*" {
+		if m.condUnsupported {
+			return nil, &smithy.GenericAPIError{Code: "NotImplemented", Message: "conditional writes not supported"}
+		}
+		if _, exists := m.objects[*input.Key]; exists {
+			return nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "at least one of the pre-conditions you specified did not hold"}
+		}
 	}
 	data, err := io.ReadAll(input.Body)
 	if err != nil {
@@ -630,5 +645,78 @@ func TestUploadFileMultipart(t *testing.T) {
 	}
 	if got := mock.objects["archive/big.parquet"]; !bytes.Equal(got, payload) {
 		t.Fatalf("stored %d bytes, want %d (or wrong order)", len(got), len(payload))
+	}
+}
+
+func TestPutIfAbsentCreatesWhenAbsent(t *testing.T) {
+	mock := newMockS3()
+	b := newTestBackend(t, mock, "bintrail")
+	ctx := context.Background()
+
+	if err := b.PutIfAbsent(ctx, "marker", strings.NewReader("v1")); err != nil {
+		t.Fatalf("PutIfAbsent: %v", err)
+	}
+	if got := string(mock.objects["bintrail/marker"]); got != "v1" {
+		t.Errorf("stored content under prefixed key = %q, want v1", got)
+	}
+}
+
+func TestPutIfAbsentExistingObjectRefused(t *testing.T) {
+	mock := newMockS3()
+	b := newTestBackend(t, mock, "")
+	ctx := context.Background()
+	mock.objects["marker"] = []byte("original")
+
+	err := b.PutIfAbsent(ctx, "marker", strings.NewReader("intruder"))
+	if !errors.Is(err, ErrObjectExists) {
+		t.Fatalf("want ErrObjectExists, got: %v", err)
+	}
+	if got := string(mock.objects["marker"]); got != "original" {
+		t.Errorf("existing object was overwritten: %q", got)
+	}
+}
+
+func TestPutIfAbsentHTTP412Refused(t *testing.T) {
+	mock := newMockS3()
+	b := newTestBackend(t, mock, "")
+	// Some S3-compatible backends surface the conditional-write conflict as
+	// a generic HTTP 412 without an S3 error code.
+	mock.putErr = &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{
+			Response: &http.Response{StatusCode: http.StatusPreconditionFailed},
+		},
+		Err: fmt.Errorf("precondition failed"),
+	}
+
+	err := b.PutIfAbsent(context.Background(), "marker", strings.NewReader("x"))
+	if !errors.Is(err, ErrObjectExists) {
+		t.Fatalf("want ErrObjectExists for generic HTTP 412, got: %v", err)
+	}
+}
+
+func TestPutIfAbsentNotImplementedFallsBack(t *testing.T) {
+	mock := newMockS3()
+	mock.condUnsupported = true
+	b := newTestBackend(t, mock, "")
+	ctx := context.Background()
+
+	// Backends without conditional-write support degrade to a plain Put —
+	// the pre-conditional behavior — instead of failing the write.
+	if err := b.PutIfAbsent(ctx, "marker", strings.NewReader("v1")); err != nil {
+		t.Fatalf("PutIfAbsent with NotImplemented backend: %v", err)
+	}
+	if got := string(mock.objects["marker"]); got != "v1" {
+		t.Errorf("fallback Put did not store object, got %q", got)
+	}
+}
+
+func TestPutIfAbsentOtherErrorPropagates(t *testing.T) {
+	mock := newMockS3()
+	b := newTestBackend(t, mock, "")
+	mock.putErr = errors.New("s3 down")
+
+	err := b.PutIfAbsent(context.Background(), "marker", strings.NewReader("x"))
+	if err == nil || errors.Is(err, ErrObjectExists) {
+		t.Fatalf("want plain propagated error, got: %v", err)
 	}
 }

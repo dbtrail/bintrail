@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -56,10 +57,17 @@ func EnsurePartitionKey(ctx context.Context, b storage.Backend, serverID string)
 		if err != nil {
 			return fmt.Errorf("marshal partition-key marker: %w", err)
 		}
-		if err := b.Put(ctx, partitionKeyMarker, bytes.NewReader(body)); err != nil {
+		created, err := putMarker(ctx, b, body)
+		if err != nil {
 			return fmt.Errorf("write partition-key marker: %w", err)
 		}
-		return nil
+		if created {
+			return nil
+		}
+		// Lost the create race: another agent wrote the marker between the
+		// Exists check and our conditional write. Fall through to
+		// read-and-compare so the surviving marker is validated instead of
+		// silently overwritten (which would re-arm the #198 cutover).
 	}
 
 	rc, err := b.Get(ctx, partitionKeyMarker)
@@ -120,4 +128,21 @@ func EnsurePartitionKey(ctx context.Context, b storage.Backend, serverID string)
 		)
 	}
 	return nil
+}
+
+// putMarker writes the marker body, atomically when the backend supports
+// conditional writes. Returns created=false with a nil error when another
+// writer created the marker first (the caller must then re-read and compare).
+// Backends without ConditionalPutter keep the pre-existing non-atomic
+// Exists→Put window.
+func putMarker(ctx context.Context, b storage.Backend, body []byte) (bool, error) {
+	cp, ok := b.(storage.ConditionalPutter)
+	if !ok {
+		return true, b.Put(ctx, partitionKeyMarker, bytes.NewReader(body))
+	}
+	err := cp.PutIfAbsent(ctx, partitionKeyMarker, bytes.NewReader(body))
+	if errors.Is(err, storage.ErrObjectExists) {
+		return false, nil
+	}
+	return err == nil, err
 }
