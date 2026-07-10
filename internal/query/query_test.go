@@ -143,10 +143,12 @@ func TestBuildQuery_untilPos(t *testing.T) {
 	opts := Options{Schema: "db", Table: "t", UntilPos: &BinlogPos{File: "binlog.000007", Pos: 4242}}
 	q, args := buildQuery(opts)
 
-	if !strings.Contains(q, "binlog_file < ?") || !strings.Contains(q, "end_pos <= ?") {
-		t.Errorf("expected position bound in query: %s", q)
+	if !strings.Contains(q, "CHAR_LENGTH(binlog_file) < CHAR_LENGTH(?)") ||
+		!strings.Contains(q, "binlog_file < ?") || !strings.Contains(q, "end_pos <= ?") {
+		t.Errorf("expected length-then-lexicographic position bound in query: %s", q)
 	}
-	// Args: file (twice, for the OR branches) and the position.
+	// Args: file x4 (two CHAR_LENGTH binds, the equal-length lexicographic
+	// branch, the same-file branch) and the position.
 	var files, hasPos int
 	for _, a := range args {
 		switch a {
@@ -156,8 +158,8 @@ func TestBuildQuery_untilPos(t *testing.T) {
 			hasPos++
 		}
 	}
-	if files != 2 || hasPos != 1 {
-		t.Errorf("expected file x2 + pos x1 in args, got files=%d pos=%d (%v)", files, hasPos, args)
+	if files != 4 || hasPos != 1 {
+		t.Errorf("expected file x4 + pos x1 in args, got files=%d pos=%d (%v)", files, hasPos, args)
 	}
 }
 
