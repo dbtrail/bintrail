@@ -219,15 +219,37 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 	for _, d := range prevOnly {
 		covered[d.Schema+"."+d.Table] = true
 	}
+	var uncovered []*metadata.TableMeta
 	for _, tm := range resolver.AllTables() {
 		key := tm.Schema + "." + tm.Table
 		if covered[key] || (want != nil && !want[key]) {
 			continue
 		}
-		results = append(results, verify.TableResult{
-			Schema: tm.Schema, Table: tm.Table, Status: verify.StatusInconclusive,
-			Detail: "never baselined; unrecoverable via reconstruct (extend the baseline job to cover this table)",
-		})
+		uncovered = append(uncovered, tm)
+	}
+	if len(uncovered) > 0 {
+		// A table can be absent from the two most recent snapshots yet still
+		// have an older one on disk/S3 — reconstruct.FindBaseline's
+		// stale-fallback path will still find and use it (with a
+		// StaleWarning), so it's recoverable, just not verifiable against
+		// the current top-2 window. Distinguish that from a table with zero
+		// baselines ever, which reconstruct genuinely cannot serve, so the
+		// message doesn't send an operator into unnecessary re-baselining
+		// panic for a table that's actually fine (just stale).
+		everBaselined, err := verify.EverBaselinedTables(cmd.Context(), baselineSrc)
+		if err != nil {
+			return fmt.Errorf("list baselines: %w", err)
+		}
+		for _, tm := range uncovered {
+			detail := "never baselined; unrecoverable via reconstruct (extend the baseline job to cover this table)"
+			if everBaselined[tm.Schema+"."+tm.Table] {
+				detail = "not covered by the two most recent baselines; reconstruct will fall back to an older snapshot (stale)"
+			}
+			results = append(results, verify.TableResult{
+				Schema: tm.Schema, Table: tm.Table, Status: verify.StatusInconclusive,
+				Detail: detail,
+			})
+		}
 	}
 	// A table named in --tables that is absent from the paired and unpaired
 	// sets AND the schema snapshot was never iterated above, so it would
