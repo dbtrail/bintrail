@@ -18,6 +18,7 @@
 package cascaderecover
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"strings"
@@ -54,20 +55,17 @@ type Header struct {
 // resolver supplies child PK columns for the SET NULL WHERE clauses; gen must be
 // built from the same (or an equivalent) resolver (recovery.New(db, resolver)).
 func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNullRows []cascade.SetNullRestore, resolver *metadata.Resolver, hdr Header) (int, error) {
-	// Enforce the recover script-size budget BEFORE writing a byte (#654): EmitSQL
-	// emits its preamble (including `SET FOREIGN_KEY_CHECKS=0`) ahead of the
-	// generator, so without an up-front check a budget refusal would leave that
-	// dangling FK-disable on the writer. Refusing here keeps "emit nothing on
-	// refusal" consistent with the plain recover path.
+	// Enforce the recover script-size budget first (#654). GenerateSQLFromRows
+	// re-checks it before rendering, but checking here keeps the refusal
+	// precedence stable (budget outranks a SET NULL build error below) and also
+	// bounds the pre-preamble render buffer (genBuf, further down).
 	if err := gen.CheckScriptBudget(rows); err != nil {
 		return 0, err
 	}
 
-	// Fail loud on a residual unchanged-TOAST marker (#592) BEFORE writing a
-	// byte, hoisted for the same reason as the budget check above: the preamble
-	// (including `SET FOREIGN_KEY_CHECKS=0`) hits the writer ahead of the
-	// generator, so GenerateSQLFromRows' own up-front refusal would come too
-	// late and leave a dangling FK-disable in the output.
+	// Fail loud on a residual unchanged-TOAST marker (#592) next, mirroring the
+	// generator's own up-front refusal so its precedence over the SET NULL
+	// build errors below is preserved.
 	for _, row := range rows {
 		if err := event.CheckUnresolvedToast(row.SchemaName, row.TableName, row.PKValues,
 			row.RowBefore, row.RowAfter); err != nil {
@@ -96,6 +94,28 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 			}
 			setNullStmts = append(setNullStmts, stmt)
 		}
+	}
+
+	// Render the CASCADE reversal statements into a buffer BEFORE the preamble
+	// touches w. GenerateSQLFromRows carries refusals that fire only while
+	// rendering (per-event generation failures #784, schema drift #601); with
+	// the preamble already on the writer such a refusal would strand a dangling
+	// `SET FOREIGN_KEY_CHECKS=0` with no re-enable — in the CLI text path that
+	// partial script is flushed to --output (#835). Buffering keeps EmitSQL
+	// all-or-nothing for every generator refusal, present and future. Peak
+	// memory stays bounded by the script budget enforced above.
+	var genBuf bytes.Buffer
+	n, err := gen.GenerateSQLFromRows(rows, &genBuf)
+	if err != nil {
+		return 0, err
+	}
+	// Reconcile the generated statement count against the parent+victim rows
+	// (#835): the generator emits exactly one statement per row or fails loud
+	// (#784), so a deficit here means a row — e.g. a synthesized cascade victim
+	// — vanished from the script without an error. Refusing makes a silently
+	// incomplete cascade recovery impossible even if the generator regresses.
+	if n != len(rows) {
+		return 0, fmt.Errorf("cascade recover: generator rendered %d of %d expected reversal statement(s); refusing to emit a script that silently drops row(s)", n, len(rows))
 	}
 
 	var b strings.Builder
@@ -133,8 +153,7 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 		return 0, err
 	}
 
-	n, err := gen.GenerateSQLFromRows(rows, w)
-	if err != nil {
+	if _, err := io.Copy(w, &genBuf); err != nil {
 		return 0, err
 	}
 
