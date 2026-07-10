@@ -221,6 +221,65 @@ daemon is now `bintrail-console watch`, in its own image), so a
 and all data volumes (`bintrail-index-data`, `bintrail-index-secret`,
 `bintrail-state`, including saved console servers) carry over unchanged.
 
+### Backing up / restoring the bundled index
+
+The bundled `index-mysql` container is your forensic system of record
+(`binlog_events` with full before/after images). dbtrail **ships** this MySQL
+but does not **operate** it — backups are yours ([SUPPORT.md](../SUPPORT.md)).
+Two paths:
+
+**Logical dump (online, no downtime).** `mysqldump` runs inside the container,
+reading the generated root password from the `bintrail-index-secret` volume:
+
+```bash
+docker compose exec index-mysql sh -c \
+  'mysqldump -uroot -p"$(cat /run/secret/index_password)" \
+     --single-transaction --routines --all-databases' > index-backup.sql
+```
+
+Restore the same way (`-T` disables the pseudo-TTY so the redirected file is
+read as stdin):
+
+```bash
+docker compose exec -T index-mysql sh -c \
+  'mysql -uroot -p"$(cat /run/secret/index_password)"' < index-backup.sql
+```
+
+**Offline volume snapshot (crash-consistent).** Stop the writers first, then
+copy the datadir and its secret in **one** archive. The index password is baked
+into the datadir at first init (see the compose file header), so
+`bintrail-index-data` and `bintrail-index-secret` must always be backed up and
+restored **as a pair** — a datadir paired with a mismatched secret breaks
+authentication:
+
+```bash
+docker compose stop bintrail index-mysql
+docker run --rm --volumes-from "$(docker compose ps -aq index-mysql)" \
+  -v "$PWD":/backup alpine \
+  tar czf /backup/index-volumes.tgz /var/lib/mysql /run/secret
+docker compose start bintrail index-mysql
+```
+
+To restore that archive, bring the stack down (`docker compose down` keeps the
+named volumes), extract the tarball back into the two volumes while nothing is
+writing, then `docker compose up -d` — never reload a datadir without its
+matching secret.
+
+**Verify** either restore with `bintrail status`. The core `bintrail` binary
+lives in the core image (the console image omits it), and `index-mysql`
+publishes no host port, so run it as a throwaway container that shares
+`index-mysql`'s network and secret:
+
+```bash
+docker run --rm \
+  --network "container:$(docker compose ps -q index-mysql)" \
+  --volumes-from "$(docker compose ps -q index-mysql)" \
+  --entrypoint sh ghcr.io/dbtrail/bintrail:latest -c \
+  'bintrail status --index-dsn "root:$(cat /run/secret/index_password)@tcp(127.0.0.1:3306)/bintrail_index"'
+```
+
+A healthy index lists its servers, a recent stream position, and its partitions.
+
 ### Connecting to an external index MySQL (bring your own)
 
 To run your own index instead of the bundled 8.4, set `INDEX_DSN` in `.env` to a MySQL 8.0+ you operate and

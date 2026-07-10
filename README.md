@@ -35,7 +35,8 @@ before/after images in a searchable index:
 - **[MCP server](docs/mcp-server.md)** — Claude or any MCP client can search history and draft recoveries
 
 Works with **MySQL**, **Percona Server for MySQL**, **Amazon RDS for MySQL**,
-**Amazon Aurora MySQL**, and **Google Cloud SQL for MySQL** — dbtrail connects
+and **Amazon Aurora MySQL** (verified); **Google Cloud SQL for MySQL** is
+expected to work — please report issues. dbtrail connects
 over the replication protocol, so it never needs the binlog files on disk
 (that's what makes managed cloud databases work). Requires MySQL 8.0+ with
 `binlog_format=ROW` and `binlog_row_image=FULL`; `bintrail doctor` checks both
@@ -79,3 +80,8 @@ See [the demo image](docs/demo.md).
 [Apache-2.0](LICENSE) — free for any use, including commercial and production.
 Contributions welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) (CLA required,
 prompted automatically on your first PR).
+
+Want the index server **operated** for you — sized, backed up, upgraded, kept
+alive on-call — instead of running it yourself? That is the managed service at
+[dbtrail.com](https://dbtrail.com). See [SUPPORT.md](SUPPORT.md) for the
+ship-vs-operate boundary.

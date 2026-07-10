@@ -18,6 +18,10 @@ it's the first section — the same four lines as the README.
   and `SELECT`.
 - An **index MySQL 8.0+** database for dbtrail's data (the Compose stack
   bundles one).
+- **Other sources:** besides MySQL, dbtrail can also capture from **MariaDB**
+  ([alpha](./mariadb.md) — 10.6+, 11.4 is the CI-tested target) and
+  **PostgreSQL** ([beta](./postgres.md) — 14+, via the separate `bintrail-pg`
+  binary). Each has its own prerequisites; see the linked guide.
 - Go 1.25+ (the module targets `go 1.25.11`) — only when building from source. The default `GOTOOLCHAIN=auto` fetches the right toolchain for you.
 
 ## Docker Compose (the bundled default)
@@ -228,10 +232,14 @@ For cron, systemd units, and Ansible recipes, see [deployment.md](./deployment.m
 | `snapshot` | Capture table and column metadata from the source server |
 | `index` | Parse binlog files from disk and write row events to the index |
 | `stream` | Connect as a replica and index row events in real-time |
+| `agent` | Connect to dbtrail and listen for commands |
 | `query` | Search the index with flexible filters (schema, table, PK, time range, GTID) |
 | `recover` | Generate reversal SQL for matching events |
+| `recover-cascade` | Generate reversal SQL for rows hit by a foreign-key ON DELETE CASCADE / SET NULL |
 | `reconstruct` | Rebuild row state at a point in time from baselines + binlog events |
+| `verify` | Verify that a recovery would reproduce the source |
 | `rotate` | Drop old partitions, add new ones, optionally archive to Parquet |
+| `archive reconcile` | Re-sync archive_state with the Parquet files actually on disk / in S3 |
 | `status` | Show indexed files, partition sizes, and event counts |
 | `dump` | Invoke mydumper to create a logical dump of the source server |
 | `baseline` | Convert mydumper output to Parquet snapshots |
@@ -240,6 +248,9 @@ For cron, systemd units, and Ansible recipes, see [deployment.md](./deployment.m
 | `init-shim` | Generate a `shim.yaml` for the time-travel SQL shim |
 | `proxysql-config` | Generate ProxySQL setup SQL for time-travel SQL routing |
 | `shim` | Run the in-process MySQL-protocol server for `_flashback`/`_diff`/`_snapshot` queries |
+| `who-changed` | Attribute binlog row changes to the database sessions that made them |
+| `user-activity` | Show a MySQL user's recent statements from performance_schema |
+| `connection-history` | Show current connections and account history for a user or host |
 | `profile` | Manage RBAC access profiles for query and recover |
 | `flag` | Label tables and columns (e.g. `pii`, `sensitive`) for access rules |
 | `access` | Link flags to profiles with allow/deny permissions |
