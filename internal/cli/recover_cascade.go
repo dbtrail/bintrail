@@ -329,9 +329,14 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	var res cascade.Result
 	var synthErr error
 	if len(parentDeletes) > 0 {
-		fks, lerr := cascade.LoadCascadeFKsForParent(cmd.Context(), db, rcSchema)
+		// FK graph in effect at the deletes being recovered, anchored on the
+		// earliest root so the graph predates every root in the batch (#834).
+		fks, fkCaveat, lerr := cascade.LoadCascadeFKsForParent(cmd.Context(), db, rcSchema, cascade.FKGraphAnchor(parentDeletes))
 		if lerr != nil {
 			return fmt.Errorf("load FK graph: %w", lerr)
+		}
+		if fkCaveat != "" {
+			caveats = append(caveats, fkCaveat)
 		}
 		res, synthErr = cascade.SynthesizeVictims(cmd.Context(), eng, fks, parentDeletes, cascade.Options{
 			Lookback:        lookback,

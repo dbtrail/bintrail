@@ -338,9 +338,14 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 	var res cascade.Result
 	var synthErr error
 	if len(parentDeletes) > 0 {
-		fks, lerr := cascade.LoadCascadeFKsForParent(ctx, b.db, p.Schema)
+		// FK graph in effect at the deletes being recovered, anchored on the
+		// earliest root so the graph predates every root in the batch (#834).
+		fks, fkCaveat, lerr := cascade.LoadCascadeFKsForParent(ctx, b.db, p.Schema, cascade.FKGraphAnchor(parentDeletes))
 		if lerr != nil {
 			return cascadeSynthResult{}, fmt.Errorf("load FK graph: %w", lerr)
+		}
+		if fkCaveat != "" {
+			caveats = append(caveats, fkCaveat)
 		}
 		res, synthErr = cascade.SynthesizeVictims(ctx, b.engine, fks, parentDeletes, cascade.Options{
 			Lookback:        p.Lookback,

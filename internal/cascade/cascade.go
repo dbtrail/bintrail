@@ -618,29 +618,90 @@ func dedupVictimsNewest(victims []query.ResultRow) []query.ResultRow {
 	return out
 }
 
+// fkSnapshotSlack widens the snapshot_time ≤ at comparison by 2 seconds:
+// binlog event timestamps are second-truncated while snapshot DATETIMEs are
+// rounded by MySQL, so a snapshot taken within the same second as the delete
+// can store a time up to ~1.5s AFTER the event's stored timestamp. Erring
+// toward the newer snapshot for that sliver (the pre-#834 behavior) beats
+// spuriously falling back to an older graph.
+const fkSnapshotSlack = 2 * time.Second
+
+// fkSnapshotIDAt resolves which fk_constraints snapshot was in effect at `at`:
+// the newest FK-bearing snapshot taken at or before `at`, via schema_snapshots'
+// snapshot_time (both tables share the snapshot_id, written in one
+// transaction). When no FK snapshot predates `at` (e.g. a backlog re-index
+// whose deletes precede the first snapshot), it falls back to the EARLIEST FK
+// snapshot — the closest available approximation — with approximated=true so
+// callers can surface a caveat. id 0 = no FK snapshot exists at all
+// (pre-cascade-recovery index): callers return an empty graph, as before.
+func fkSnapshotIDAt(ctx context.Context, indexDB *sql.DB, at time.Time) (id uint32, approximated bool, err error) {
+	var atID, minID sql.NullInt64
+	err = indexDB.QueryRowContext(ctx, `SELECT
+		(SELECT MAX(fc.snapshot_id) FROM fk_constraints fc
+		 WHERE EXISTS (SELECT 1 FROM schema_snapshots ss
+		               WHERE ss.snapshot_id = fc.snapshot_id AND ss.snapshot_time <= ?)),
+		(SELECT MIN(snapshot_id) FROM fk_constraints)`,
+		at.Add(fkSnapshotSlack)).Scan(&atID, &minID)
+	if err != nil {
+		return 0, false, fmt.Errorf("resolve FK snapshot at %s: %w", at.Format(time.RFC3339), err)
+	}
+	switch {
+	case atID.Valid:
+		return uint32(atID.Int64), false, nil
+	case minID.Valid:
+		return uint32(minID.Int64), true, nil
+	default:
+		return 0, false, nil
+	}
+}
+
+// FKGraphAnchor returns the timestamp to anchor FK-snapshot selection on for a
+// batch of parent deletes: the EARLIEST root, so the chosen graph is in effect
+// at or before every root being recovered (#834). Zero when the batch is empty
+// (callers skip synthesis entirely then).
+func FKGraphAnchor(parentDeletes []query.ResultRow) time.Time {
+	var at time.Time
+	for _, pd := range parentDeletes {
+		if at.IsZero() || pd.EventTimestamp.Before(at) {
+			at = pd.EventTimestamp
+		}
+	}
+	return at
+}
+
 // LoadCascadeFKs reads the FK graph WITH referential rules from the INDEX's
-// fk_constraints table (the latest snapshot that recorded FKs), optionally
-// scoped to schemas. It returns every FK edge — SynthesizeVictims gates on
-// DeleteRule itself — so it is also the loader a future SET NULL path uses.
+// fk_constraints table, optionally scoped to schemas. It returns every FK
+// edge — SynthesizeVictims gates on DeleteRule itself — so it is also the
+// loader a future SET NULL path uses.
 //
 // Source-less by design: `recover` never connects to the source, so the rules
 // come from the index (populated at snapshot time since cascade-recovery Slice
 // A). Pre-Slice-A snapshots whose delete_rule/update_rule are empty load as
 // non-cascade and are simply skipped by the synthesis.
 //
-// LIMITATION: the FK graph is taken from the LATEST snapshot that recorded FKs,
-// not the one in effect at the delete being recovered. If DDL changed the FK
-// topology between the delete and the latest snapshot, synthesis uses the newer
-// graph. Matching the FK graph to event time is deferred (see #548); acceptable
-// because cascade DDL churn mid-recovery-window is rare and the FK-checks-off
-// apply tolerates over-/under-inclusion that the operator reviews.
-func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string) ([]CascadeFK, error) {
+// The graph is taken from the FK snapshot in effect at `at` — the newest one
+// taken at or before the root delete being recovered (#834) — NOT the latest
+// snapshot, which would silently apply a post-delete topology: an ON DELETE
+// CASCADE FK dropped after the delete would leave its cascade victims
+// unreconstructed with no caveat (silent under-recovery), and an FK added
+// after it would synthesize victims that were never deleted. Residual
+// limitation: DDL between that snapshot and `at` is still invisible (snapshots
+// are the only FK history the index has); the FK-checks-off apply tolerates
+// the resulting over-/under-inclusion, which the operator reviews.
+func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string, at time.Time) ([]CascadeFK, error) {
+	snapID, _, err := fkSnapshotIDAt(ctx, indexDB, at)
+	if err != nil {
+		return nil, err
+	}
+	if snapID == 0 {
+		return nil, nil
+	}
 	q := `SELECT schema_name, table_name, constraint_name, column_name,
 	       referenced_schema_name, referenced_table_name, referenced_column_name,
 	       delete_rule, update_rule
 	FROM fk_constraints
-	WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM fk_constraints)`
-	var args []any
+	WHERE snapshot_id = ?`
+	args := []any{snapID}
 	if len(schemas) > 0 {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
 		q += " AND schema_name IN (" + placeholders + ")"
@@ -694,10 +755,29 @@ func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string) ([]C
 // schema) is harmless — byParent is only consulted for tables that actually appear
 // as a parent DELETE or a synthesized victim — so this never fabricates a victim; it
 // only stops dropping real ones.
-func LoadCascadeFKsForParent(ctx context.Context, indexDB *sql.DB, parentSchema string) ([]CascadeFK, error) {
-	return loadCascadeClosure(ctx, parentSchema, func(ctx context.Context, refSchemas []string) ([]CascadeFK, error) {
-		return loadCascadeFKsByReferencedSchema(ctx, indexDB, refSchemas)
+//
+// The graph comes from the FK snapshot in effect at `at` (see LoadCascadeFKs
+// and FKGraphAnchor, #834). The returned caveat is non-empty when no FK
+// snapshot predates `at` and the earliest one was used as an approximation —
+// callers MUST surface it alongside Result.Incomplete, never drop it.
+func LoadCascadeFKsForParent(ctx context.Context, indexDB *sql.DB, parentSchema string, at time.Time) ([]CascadeFK, string, error) {
+	snapID, approximated, err := fkSnapshotIDAt(ctx, indexDB, at)
+	if err != nil {
+		return nil, "", err
+	}
+	if snapID == 0 {
+		return nil, "", nil
+	}
+	caveat := ""
+	if approximated {
+		caveat = fmt.Sprintf(
+			"no FK snapshot predates the root delete (%s); used the earliest recorded FK graph, which may not reflect the FK topology in effect at delete time",
+			at.UTC().Format(time.RFC3339))
+	}
+	fks, err := loadCascadeClosure(ctx, parentSchema, func(ctx context.Context, refSchemas []string) ([]CascadeFK, error) {
+		return loadCascadeFKsByReferencedSchema(ctx, indexDB, refSchemas, snapID)
 	})
+	return fks, caveat, err
 }
 
 // referencedSchemaLoader loads the FK edges whose PARENT (referenced_schema_name) is
@@ -738,10 +818,11 @@ func loadCascadeClosure(ctx context.Context, parentSchema string, load reference
 }
 
 // loadCascadeFKsByReferencedSchema reads every FK edge whose PARENT is in
-// refSchemas from the latest FK snapshot. It mirrors LoadCascadeFKs's SELECT (all
-// edges, rules included — SynthesizeVictims gates on DeleteRule) but filters on
+// refSchemas from the given FK snapshot (resolved once by the caller via
+// fkSnapshotIDAt). It mirrors LoadCascadeFKs's SELECT (all edges, rules
+// included — SynthesizeVictims gates on DeleteRule) but filters on
 // referenced_schema_name instead of schema_name.
-func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refSchemas []string) ([]CascadeFK, error) {
+func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refSchemas []string, snapID uint32) ([]CascadeFK, error) {
 	if len(refSchemas) == 0 {
 		return nil, nil
 	}
@@ -750,10 +831,11 @@ func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refS
 	       referenced_schema_name, referenced_table_name, referenced_column_name,
 	       delete_rule, update_rule
 	FROM fk_constraints
-	WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM fk_constraints)
+	WHERE snapshot_id = ?
 	  AND referenced_schema_name IN (` + placeholders + `)
 	ORDER BY schema_name, table_name, constraint_name, ordinal_position`
-	args := make([]any, 0, len(refSchemas))
+	args := make([]any, 0, len(refSchemas)+1)
+	args = append(args, snapID)
 	for _, s := range refSchemas {
 		args = append(args, s)
 	}

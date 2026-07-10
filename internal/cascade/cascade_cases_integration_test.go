@@ -54,7 +54,7 @@ func TestLoadCascadeFKsFromIndex(t *testing.T) {
 		t.Fatalf("TakeSnapshot: %v", err)
 	}
 
-	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName})
+	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName}, time.Now())
 	if err != nil {
 		t.Fatalf("LoadCascadeFKs: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestLoadCascadeFKsFromIndex(t *testing.T) {
 	}
 
 	// Scope: an unrelated schema yields nothing.
-	none, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{"no_such_schema"})
+	none, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{"no_such_schema"}, time.Now())
 	if err != nil {
 		t.Fatalf("LoadCascadeFKs(none): %v", err)
 	}
@@ -380,7 +380,7 @@ func TestSynthesizeVictims_selfRefAndCompositePK(t *testing.T) {
 		t.Fatalf("want only the root node delete indexed, got %d: %v", len(nodeDeletes), pkList(nodeDeletes))
 	}
 
-	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName})
+	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName}, time.Now())
 	if err != nil {
 		t.Fatalf("LoadCascadeFKs: %v", err)
 	}
@@ -550,7 +550,7 @@ func TestSynthesizeVictims_multiPathDedup(t *testing.T) {
 	eng := query.New(indexDB)
 	del := event.EventDelete
 	parentDeletes := mustFetch(t, eng, query.Options{Schema: sourceName, Table: "p", EventType: &del})
-	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName})
+	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName}, time.Now())
 	if err != nil {
 		t.Fatalf("LoadCascadeFKs: %v", err)
 	}
@@ -615,7 +615,7 @@ func TestSynthesizeVictims_multiRootIndependentT(t *testing.T) {
 	paDel := mustFetch(t, eng, query.Options{Schema: sourceName, Table: "pa", EventType: &del})
 	pbDel := mustFetch(t, eng, query.Options{Schema: sourceName, Table: "pb", EventType: &del})
 	parentDeletes := append(append([]query.ResultRow{}, paDel...), pbDel...)
-	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName})
+	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName}, time.Now())
 	if err != nil {
 		t.Fatalf("LoadCascadeFKs: %v", err)
 	}
@@ -763,7 +763,7 @@ func TestSynthesizeVictims_setNullGuardProtectsRepointedRow(t *testing.T) {
 	if len(parentDeletes) != 1 || parentDeletes[0].PKValues != "1" {
 		t.Fatalf("want only the parent 1 delete indexed, got %v", pkList(parentDeletes))
 	}
-	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName})
+	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName}, time.Now())
 	if err != nil {
 		t.Fatalf("LoadCascadeFKs: %v", err)
 	}
@@ -877,5 +877,82 @@ func TestSynthesizeVictims_sameParentPKDeletedTwice(t *testing.T) {
 	}
 	if sr := res.SetNullRows[0]; sr.PKValues != "50" || sr.Row["val"] != "n1" {
 		t.Errorf("childn:50 restore must use the newest image val=n1, got %+v", sr)
+	}
+}
+
+// insertFKRow inserts one fk_constraints edge directly, bypassing TakeSnapshot,
+// so tests can build a controlled FK snapshot history with explicit times.
+func insertFKRow(t *testing.T, db *sql.DB, snapshotID int, constraint, schema, table, column, refSchema, refTable, refColumn, deleteRule string) {
+	t.Helper()
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
+		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
+		VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 'RESTRICT')`,
+		snapshotID, constraint, schema, table, column, refSchema, refTable, refColumn, deleteRule)
+}
+
+// TestLoadCascadeFKs_snapshotInEffectAtDelete is the regression for #834: the
+// FK graph must come from the snapshot in effect AT the root delete, not the
+// latest one. An ON DELETE CASCADE FK dropped (here: re-created as RESTRICT)
+// after the delete and re-snapshotted would otherwise silently erase its
+// cascade victims from the synthesis with no caveat.
+func TestLoadCascadeFKs_snapshotInEffectAtDelete(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	s1 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	s2 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	const fmtDT = "2006-01-02 15:04:05"
+	// Snapshot 1 (10:00): child.pid -> parent.id is ON DELETE CASCADE.
+	testutil.InsertSnapshot(t, indexDB, 1, s1.Format(fmtDT), "app", "child", "id", 1, "PRI", "int", "NO")
+	insertFKRow(t, indexDB, 1, "fk_child", "app", "child", "pid", "app", "parent", "id", "CASCADE")
+	// Snapshot 2 (12:00): the FK was dropped and re-added as RESTRICT.
+	testutil.InsertSnapshot(t, indexDB, 2, s2.Format(fmtDT), "app", "child", "id", 1, "PRI", "int", "NO")
+	insertFKRow(t, indexDB, 2, "fk_child", "app", "child", "pid", "app", "parent", "id", "RESTRICT")
+
+	// A delete at 11:00 (between the snapshots) must see the CASCADE edge.
+	atDelete := time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)
+	fks, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{"app"}, atDelete)
+	if err != nil {
+		t.Fatalf("LoadCascadeFKs(11:00): %v", err)
+	}
+	if len(fks) != 1 || fks[0].DeleteRule != "CASCADE" {
+		t.Errorf("delete between snapshots must use snapshot 1 (CASCADE), got %+v", fks)
+	}
+
+	// A delete at 13:00 (after snapshot 2) sees the current RESTRICT edge.
+	fks, err = cascade.LoadCascadeFKs(ctx, indexDB, []string{"app"}, s2.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("LoadCascadeFKs(13:00): %v", err)
+	}
+	if len(fks) != 1 || fks[0].DeleteRule != "RESTRICT" {
+		t.Errorf("delete after snapshot 2 must use snapshot 2 (RESTRICT), got %+v", fks)
+	}
+
+	// The production loader resolves the same way, without a caveat.
+	fks, caveat, err := cascade.LoadCascadeFKsForParent(ctx, indexDB, "app", atDelete)
+	if err != nil {
+		t.Fatalf("LoadCascadeFKsForParent(11:00): %v", err)
+	}
+	if len(fks) != 1 || fks[0].DeleteRule != "CASCADE" {
+		t.Errorf("ForParent between snapshots must use snapshot 1 (CASCADE), got %+v", fks)
+	}
+	if caveat != "" {
+		t.Errorf("a covered delete must carry no caveat, got %q", caveat)
+	}
+
+	// A delete BEFORE the first FK snapshot falls back to the earliest graph
+	// (closest approximation) and must say so — never silently.
+	fks, caveat, err = cascade.LoadCascadeFKsForParent(ctx, indexDB, "app", s1.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("LoadCascadeFKsForParent(09:00): %v", err)
+	}
+	if len(fks) != 1 || fks[0].DeleteRule != "CASCADE" {
+		t.Errorf("pre-history delete must fall back to the EARLIEST graph, got %+v", fks)
+	}
+	if caveat == "" {
+		t.Error("pre-history fallback must surface a caveat")
 	}
 }
