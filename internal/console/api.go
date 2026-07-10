@@ -251,7 +251,15 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// Recovery requires chronological (oldest-first) input: GenerateSQLFromRows
 	// reverses internally so the most-recent event is undone first. The browsing
 	// default (DESC) would invert the undo order for a PK touched multiple times.
-	// Forcing ASC here also makes the LIMIT select the oldest N, matching the CLI.
+	//
+	// Forcing ASC here also means a LIMIT truncation keeps the OLDEST N events,
+	// NOT the newest N -- unlike the CLI, which fixed this for #785 by fetching
+	// DESC (newest-first, so LIMIT keeps the newest suffix) then re-sorting ASC
+	// before generation. The console still has the pre-#785 bug: a truncated
+	// console recover reverses only the earliest part of the matched window,
+	// leaving the target in the same kind of inconsistent partial state #785
+	// fixed for the CLI. Not addressed here -- see #785 and #927 for context
+	// on a follow-up fix.
 	opts.Order = ""
 
 	// Coverage gaps come back in plan.GapHours and are surfaced as warnings

@@ -261,7 +261,7 @@ The status command produces a multi-section report. The sections, in order:
 | Section | Shown when | Contents |
 |---|---|---|
 | **Servers** | `bintrail_servers` has rows | Registered source servers — `bintrail_id`, host/port, server UUID, status |
-| **Stream** | `stream_state` has a checkpoint | Replication position/GTID, events indexed, last event/checkpoint, and the **continuity verdict** (below) |
+| **Stream** | `stream_state` has a checkpoint, **or** reading it failed | Replication position/GTID, events indexed, last event/checkpoint, and the **continuity verdict** (below). On a read failure the block shows only an `unavailable` verdict |
 | **Indexed Files** | always | Every row in `index_state`, with the `bintrail_id` that indexed each file |
 | **Partitions** | always | Each partition's boundary and estimated row count |
 | **Archives** | `archive_state` has data | Archived-file / S3-upload counts |
@@ -287,13 +287,14 @@ about gap-**contiguity** of the captured range; it is **not** a liveness/lag che
   Continuity:      no gaps in the captured range (not a liveness check)
 ```
 
-The verdict is one of three states:
+The verdict is one of four states:
 
 | Text | JSON `stream.continuity.status` | Meaning |
 |---|---|---|
 | `no gaps in the captured range` | `ok` | The captured range is contiguous — nothing was dropped |
 | `⚠ GAP LOST at <ts>` | `gap_lost` | An unfillable gap was stamped; the index is valid only up to the gap |
 | `not evaluated (legacy index …)` | `unknown` | A legacy index without the gap-detection columns — the state can't be confirmed (never a false "ok") |
+| `⚠ unavailable (could not read stream state: <err>)` | `unavailable`, under top-level `stream_error` (not `stream`) | `stream_state` could not be **read** (e.g. transient timeout) — distinct from an empty table, which shows no Stream block. The verdict, and any permanent-loss banner, could not be evaluated; re-run `status` to retry |
 
 When data was permanently lost, a loud banner follows the section:
 
@@ -324,6 +325,12 @@ whenever the `stream` object is — i.e. once a checkpoint exists — so a
 CI check uses `jq -e '.stream.continuity.status == "ok"'` (a `null` from a
 missing `stream` is itself a "can't confirm" signal). The green "no gaps" badge
 in the [web console](console.md) keys on `stream.continuity.status == "ok"`.
+
+When `stream_state` could not be **read**, the JSON output instead carries a
+top-level `stream_error` object — a **sibling** of `stream`, never a fake
+`stream` — shaped `{"continuity": {"status": "unavailable"}, "error": "..."}`.
+The jq check above stays fail-closed in this state: `.stream.continuity.status`
+is `null` because `stream` is absent.
 
 ### Sections in detail
 

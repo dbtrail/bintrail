@@ -19,10 +19,22 @@ relationships) into the index so events can be decoded into named columns.
   (`KEY_COLUMN_USAGE`, `REFERENTIAL_CONSTRAINTS`) — MySQL's metadata visibility
   is row-level, so if you can see a table's columns you can see its constraints.
 - **Re-snapshot after a schema change.** If an `ALTER TABLE` runs after the
-  snapshot, the binlog column count no longer matches; dbtrail warns and
-  **skips that table's events** rather than corrupting data. The fix is to
-  re-run `bintrail snapshot`. To automate this, see
-  [DDL tracking](ddl-tracking.md).
+  snapshot, the binlog column count no longer matches; dbtrail **skips that
+  table's events** rather than corrupting data. When such a skip (diverging
+  column count, or a table missing from the snapshot entirely) hits events
+  **at or after the snapshot's creation time**, `bintrail index` fails the
+  file loudly instead of letting the gap hide: the file is marked `failed`
+  (not `completed`) and the command errors with
+  `schema gap: N row event(s) in <file> were skipped because the schema
+  snapshot is stale … — these rows were NOT indexed`. The fix is to re-run
+  `bintrail snapshot`, then `bintrail index --all` — a failed file re-indexes
+  from the start, capturing the previously skipped rows. Two cases stay
+  warn-and-skip without failing the file: events *older* than the snapshot
+  (historical re-indexing that a fresh snapshot can't change), and tables in
+  schemas a snapshot never covers (`information_schema`,
+  `performance_schema`, `mysql`, `sys` — e.g. the periodic
+  `mysql.rds_heartbeat2` updates RDS writes to the binlog). To automate
+  re-snapshotting, see [DDL tracking](ddl-tracking.md).
 - **Same-count changes are the dangerous ones.** A column rename (or a
   `DROP COLUMN` + `ADD COLUMN` in one `ALTER`) keeps the count equal, so the
   count check can't see it — values would silently index under the wrong

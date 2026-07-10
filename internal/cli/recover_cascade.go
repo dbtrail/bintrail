@@ -329,16 +329,29 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	var res cascade.Result
 	var synthErr error
 	if len(parentDeletes) > 0 {
-		fks, lerr := cascade.LoadCascadeFKsForParent(cmd.Context(), db, rcSchema)
+		// FK graph resolved PER ROOT, not batch-anchored on the earliest root:
+		// a --pks/--since/--until batch can span an FK topology change, and a
+		// single earliest-anchored graph would silently mis-recover a later
+		// root (#834 applied per-root, not once for the whole batch).
+		groups, fkCaveats, lerr := cascade.GroupParentDeletesByFKGraph(cmd.Context(), db, rcSchema, parentDeletes)
 		if lerr != nil {
 			return fmt.Errorf("load FK graph: %w", lerr)
 		}
-		res, synthErr = cascade.SynthesizeVictims(cmd.Context(), eng, fks, parentDeletes, cascade.Options{
-			Lookback:        lookback,
-			MaxDepth:        rcMaxDepth,
-			Baseline:        baselineProvider,
-			ArchivesPresent: archivesExist,
-		})
+		caveats = append(caveats, fkCaveats...)
+		results := make([]cascade.Result, 0, len(groups))
+		for _, g := range groups {
+			r, serr := cascade.SynthesizeVictims(cmd.Context(), eng, g.FKs, g.Roots, cascade.Options{
+				Lookback:        lookback,
+				MaxDepth:        rcMaxDepth,
+				Baseline:        baselineProvider,
+				ArchivesPresent: archivesExist,
+			})
+			results = append(results, r)
+			if serr != nil {
+				synthErr = errors.Join(synthErr, serr)
+			}
+		}
+		res = cascade.MergeResults(results...)
 	}
 	caveats = append(caveats, res.Incomplete...)
 	if synthErr != nil {

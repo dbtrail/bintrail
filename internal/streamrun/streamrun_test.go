@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"math"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -147,6 +148,67 @@ func TestResolveStart_resumePosition(t *testing.T) {
 	}
 	if accGTID != nil {
 		t.Error("expected nil accGTID in position mode")
+	}
+}
+
+// TestResolveStart_resumePositionOver4GiBFailsLoud pins #845: a saved position
+// past uint32 (a >4GiB binlog from one oversized transaction) must error with a
+// pointer to GTID mode, never silently wrap via uint32() to an earlier offset.
+func TestResolveStart_resumePositionOver4GiBFailsLoud(t *testing.T) {
+	saved := &streamState{
+		mode:       "position",
+		binlogFile: "binlog.000005",
+		binlogPos:  math.MaxUint32 + 1,
+	}
+	_, _, _, _, _, err := resolveStart("", "", 4, saved)
+	if err == nil {
+		t.Fatal("expected error for saved position > MaxUint32, got nil")
+	}
+	if !strings.Contains(err.Error(), "GTID") {
+		t.Errorf("error should direct the operator to GTID mode, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "binlog.000005") {
+		t.Errorf("error should name the binlog file, got: %v", err)
+	}
+}
+
+func TestResolveStart_resumePositionExactlyMaxUint32(t *testing.T) {
+	saved := &streamState{
+		mode:       "position",
+		binlogFile: "binlog.000005",
+		binlogPos:  math.MaxUint32,
+	}
+	_, _, _, pos, _, err := resolveStart("", "", 4, saved)
+	if err != nil {
+		t.Fatalf("unexpected error at exactly MaxUint32: %v", err)
+	}
+	if pos != math.MaxUint32 {
+		t.Errorf("expected pos=MaxUint32, got %d", pos)
+	}
+}
+
+// TestResolveStart_positionOver4GiB_gtidFlagStillSwitches proves the remediation
+// the #845 error suggests actually works: --start-gtid takes the mode-switch
+// branch before the overflow guard, so an oversized saved position is escapable.
+func TestResolveStart_positionOver4GiB_gtidFlagStillSwitches(t *testing.T) {
+	saved := &streamState{
+		mode:       "position",
+		binlogFile: "binlog.000005",
+		binlogPos:  math.MaxUint32 + 1,
+	}
+	gtidSet := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-100"
+	mode, _, returnedGTID, _, accGTID, err := resolveStart("", gtidSet, 0, saved)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != "gtid" {
+		t.Errorf("expected mode=gtid, got %q", mode)
+	}
+	if returnedGTID != gtidSet {
+		t.Errorf("expected GTID=%q, got %q", gtidSet, returnedGTID)
+	}
+	if accGTID == nil {
+		t.Error("expected non-nil accGTID in gtid mode")
 	}
 }
 

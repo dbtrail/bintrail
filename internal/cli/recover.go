@@ -179,6 +179,15 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		Flag:       rFlag,
 		Limit:      rLimit,
 		LimitPerPK: rLimitPerPK,
+		// When --limit truncates the window it must keep the most RECENT
+		// events (#785): reversing a newest-suffix rolls the data back to a
+		// consistent intermediate point, whereas the ASC default would keep
+		// the OLDEST prefix — undoing old events underneath later un-reverted
+		// ones maps to no state that ever existed (the reverse UPDATE's
+		// row_after WHERE no longer matches, or the reverse DELETE removes a
+		// row a later event rewrote). The rows are re-sorted ascending after
+		// the fetch, before generation.
+		Order: "DESC",
 	}
 
 	// ── Connect to index database ─────────────────────────────────────────────
@@ -300,6 +309,18 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// The fetch above ran Order=DESC so --limit kept the newest suffix of the
+	// window (#785). Detect truncation on the FETCHED row count — before
+	// generation, so the warning fires even when generation later refuses —
+	// then restore ascending order: GenerateSQLFromRows expects ASC input and
+	// reverses it internally to undo most-recent first.
+	truncated := rLimit > 0 && len(rows) >= rLimit
+	if truncated {
+		slog.Warn("matched events truncated at --limit; only the most recent events of the window are reversed",
+			"limit", rLimit)
+	}
+	rows = query.MergeResults(rows, 0, "ASC")
+
 	// ── Generate recovery SQL ─────────────────────────────────────────────────
 	// Select the SQL dialect from the source flavor recorded in the index
 	// (single-source per stream_state) — PostgreSQL needs double-quoted identifiers
@@ -326,8 +347,9 @@ func runRecover(cmd *cobra.Command, args []string) error {
 			return cliutil.OutputJSON(struct {
 				Statements int    `json:"statements"`
 				DryRun     bool   `json:"dry_run"`
+				Truncated  bool   `json:"truncated"`
 				SQL        string `json:"sql"`
-			}{Statements: n, DryRun: true, SQL: buf.String()})
+			}{Statements: n, DryRun: true, Truncated: truncated, SQL: buf.String()})
 		}
 
 		n, err := gen.GenerateSQLFromRows(rows, os.Stdout)
@@ -341,8 +363,8 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		if n > 0 {
 			fmt.Fprintf(os.Stderr, "\n%d reversal statement(s) generated.\n", n)
 		}
-		if n >= rLimit {
-			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", rLimit)
+		if truncated {
+			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d events; only the most recent events of the window are reversed. Use a narrower time range or --limit to adjust.\n", rLimit)
 		}
 		return nil
 	}
@@ -372,8 +394,9 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		return cliutil.OutputJSON(struct {
 			Statements int    `json:"statements"`
 			DryRun     bool   `json:"dry_run"`
+			Truncated  bool   `json:"truncated"`
 			Output     string `json:"output"`
-		}{Statements: n, DryRun: false, Output: rOutput})
+		}{Statements: n, DryRun: false, Truncated: truncated, Output: rOutput})
 	}
 
 	if n == 0 {
@@ -381,8 +404,8 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "%d reversal statement(s) written to %s\n", n, rOutput)
 	}
-	if n >= rLimit {
-		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", rLimit)
+	if truncated {
+		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d events; only the most recent events of the window are reversed. Use a narrower time range or --limit to adjust.\n", rLimit)
 	}
 	return nil
 }

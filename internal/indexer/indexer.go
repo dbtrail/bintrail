@@ -16,6 +16,7 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/dbtrail/internal/event"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // Indexer consumes event.Events from a channel and batch-inserts them into
@@ -579,6 +580,25 @@ func EnsureSchema(db *sql.DB) error {
 	if !hasConnCache {
 		if _, err := db.Exec(ddlConnectionCache); err != nil {
 			return fmt.Errorf("failed to create connection_cache: %w", err)
+		}
+	}
+	// snapshot_id_seq post-dates the original schema (#844): a dedicated
+	// AUTO_INCREMENT counter table that lets metadata.TakeSnapshot/
+	// WritePGSnapshot allocate snapshot_id values without the deadlock-prone
+	// `MAX(snapshot_id)+1 FOR UPDATE` pattern it replaces (metadata.
+	// DDLSnapshotIDSeq has the full rationale). metadata.go's own callers
+	// also self-heal this table lazily on first use — the standalone
+	// `bintrail snapshot` command does not go through EnsureSchema — but
+	// creating it eagerly here means the daemon-driven writers named in
+	// #844 (the DDL hook, the console baseline trigger) never hit that lazy
+	// path under load.
+	hasSnapshotIDSeq, err := tableExists(db, "snapshot_id_seq")
+	if err != nil {
+		return err
+	}
+	if !hasSnapshotIDSeq {
+		if _, err := db.Exec(metadata.DDLSnapshotIDSeq); err != nil {
+			return fmt.Errorf("failed to create snapshot_id_seq: %w", err)
 		}
 	}
 	return nil

@@ -123,7 +123,7 @@ This dumps **every accessible schema** into `/tmp/mydumper-output` — bare `bin
 | Flag | Default | Description |
 |---|---|---|
 | `--source-dsn` | *(required)* | DSN for the source MySQL server |
-| `--output-dir` | *(required)* | Directory for mydumper output (removed and recreated on each run) |
+| `--output-dir` | *(required)* | Directory for mydumper output. Never blindly deleted: a non-empty directory that is not a recognizable prior dump is refused; a prior dump is moved aside and restored if the new dump fails (see [Output directory behavior](#output-directory-behavior)) |
 | `--schemas` | *(all)* | Comma-separated schema filter (e.g. `mydb,otherdb`) |
 | `--tables` | *(all)* | Comma-separated table filter (e.g. `mydb.orders,mydb.items`) |
 | `--mydumper-path` | `mydumper` | Path to the mydumper binary. When set, skips Docker fallback. |
@@ -157,11 +157,13 @@ dbtrail always passes these flags to mydumper:
 
 | mydumper flag | Purpose |
 |---|---|
-| `--host`, `--port`, `--user`, `--password` | Connection details (parsed from `--source-dsn`) |
+| `--host`, `--port`, `--user` | Connection details (parsed from `--source-dsn`). The password is **not** passed as a flag — see below. |
 | `--outputdir` | Output directory |
 | `--threads` | Parallelism |
 | `--compress-protocol` | Compress the MySQL protocol traffic |
 | `--complete-insert` | Generate `INSERT INTO table (col1, col2, ...) VALUES (...)` with column names — required for `bintrail baseline` to parse the output correctly |
+
+The source password never appears on mydumper's command line, so it is not visible in `ps aux` or (Docker mode) `docker inspect`. With a local mydumper binary it is delivered via `MYSQL_PWD` in the child process environment; in Docker mode it is written to a temporary `0600` MySQL option file bind-mounted read-only into the container, which mydumper reads via `--defaults-file`.
 
 ### Concurrency protection
 
@@ -169,7 +171,19 @@ Only one `bintrail dump` can run at a time. A lockfile at `$TMPDIR/bintrail-dump
 
 ### Output directory behavior
 
-The `--output-dir` is **removed and recreated** on each run. Do not point it at a directory containing other files you want to keep.
+`bintrail dump` never blindly deletes the `--output-dir`:
+
+- **Absent or empty** — used as-is (mydumper creates it if needed).
+- **Non-empty and recognizable as a prior dump** (contains a `metadata` or `metadata.partial` file, or the `bintrail_dump_started_at_utc` marker) — moved aside to a unique sibling `<dir>.old-<pid>-<nanos>` before the new dump starts. The backup is deleted only after the new dump **succeeds**; if the dump fails, the previous dump is restored in place.
+- **Non-empty and anything else** — the dump is **refused**:
+
+  ```
+  --output-dir "<dir>" is not empty and does not look like a prior bintrail/mydumper dump (no "metadata" marker); refusing to delete it. Remove it yourself or point --output-dir elsewhere
+  ```
+
+  This protects against a typo'd `--output-dir` (or a stray `BINTRAIL_OUTPUT_DIR` picked up from an env file) wiping an arbitrary directory — including baselines that `reconstruct`/`verify` depend on.
+
+Source connectivity is also validated **before** the output directory is touched (`cannot connect to source; refusing to touch --output-dir ...`), so a dump that fails to connect never disturbs the previous dump.
 
 ---
 
@@ -383,6 +397,7 @@ The dump frequency depends on your recovery and audit requirements. dbtrail's bi
 | `mydumper not found at "/custom/path"` | Explicit `--mydumper-path` points to a missing binary | Verify the path is correct and the binary is executable |
 | `found mydumper on $PATH but it appears to be a shell script wrapper` | A shell script named `mydumper` is on your PATH (e.g. a Docker wrapper) | Remove the wrapper script — dbtrail handles Docker invocation automatically. Or use `--mydumper-path` to point to the real binary. |
 | `another dump is already running` | A previous dump is still running or crashed | Wait for it to finish, or check if the PID in `$TMPDIR/bintrail-dump.lock` is still alive. Stale locks from crashed processes are cleaned up automatically on the next run. |
+| `--output-dir ... does not look like a prior bintrail/mydumper dump ... refusing to delete it` | The output directory is non-empty and carries no `metadata`/`metadata.partial`/`bintrail_dump_started_at_utc` marker — dbtrail refuses to delete unrecognized content | Point `--output-dir` at an empty or dedicated dump directory, or remove the existing contents yourself if you are sure they are disposable. |
 | `mydumper failed: exit status 2` | mydumper itself encountered an error (wrong credentials, unreachable host, etc.) | Check mydumper's stderr output for details. Verify the `--source-dsn` is correct. |
 | Docker: `permission denied` on `/var/run/docker.sock` | Current user is not in the `docker` group | Run `sudo usermod -aG docker $USER` and log out/in, or use `sudo bintrail dump ...` |
 | Docker: `Cannot connect to the Docker daemon` | Docker daemon is not running | Start Docker: `sudo systemctl start docker` (Linux) or open Docker Desktop (macOS) |

@@ -183,6 +183,137 @@ func TestParseStringPK(t *testing.T) {
 	}
 }
 
+// TestParseStringPKEscapes pins MySQL escape semantics inside string
+// literals (#826): the captured bytes must be the value MySQL would
+// store, not the escaped source text, or a backslash-containing PK
+// misses pk_values and AS OF falsely reports "the row didn't exist".
+func TestParseStringPKEscapes(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			"backslash path",
+			`SELECT * FROM _flashback.files AS OF '2026-05-02' WHERE path = 'C:\\temp\\new'`,
+			`C:\temp\new`,
+		},
+		{
+			"newline and tab",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = 'a\nb\tc'`,
+			"a\nb\tc",
+		},
+		{
+			"cr nul backspace ctrlZ",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = 'a\rb\0c\bd\Ze'`,
+			"a\rb\x00c\bd\x1ae",
+		},
+		{
+			"escaped double quote",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = 'a\"b'`,
+			`a"b`,
+		},
+		{
+			"LIKE escapes keep backslash",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = '100\%\_x'`,
+			`100\%\_x`,
+		},
+		{
+			"backslash before ordinary char dropped, case-sensitive z",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = '\a\z'`,
+			"az",
+		},
+		{
+			"no escapes untouched",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = 'plain value'`,
+			"plain value",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if q.PKValue != tc.want {
+				t.Errorf("PKValue = %q, want %q", q.PKValue, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseStringPKEscapesAllForms proves every stripQuotes call site —
+// _diff, the hint-comment form, and the bare AS OF form — unescapes,
+// not just the _flashback/_snapshot matcher.
+func TestParseStringPKEscapesAllForms(t *testing.T) {
+	const want = `C:\temp`
+	cases := []struct {
+		name string
+		sql  string
+	}{
+		{
+			"_diff",
+			`SELECT * FROM _diff.files BETWEEN '2026-05-01' AND '2026-05-02' WHERE path = 'C:\\temp'`,
+		},
+		{
+			"hint form",
+			`SELECT /*+ DBTRAIL_AT='2026-05-02' */ * FROM files WHERE path = 'C:\\temp'`,
+		},
+		{
+			"bare AS OF real table",
+			`SELECT * FROM files WHERE path = 'C:\\temp' AS OF '2026-05-02'`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if q.PKValue != want {
+				t.Errorf("PKValue = %q, want %q", q.PKValue, want)
+			}
+		})
+	}
+}
+
+// TestUnescapeStringLiteral covers branches unreachable through Parse
+// (the value regexes cannot capture a quote character): doubled quotes
+// and \' must still collapse per MySQL semantics, and a trailing lone
+// backslash must not be lost or panic.
+func TestUnescapeStringLiteral(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{`O''Brien`, `O'Brien`},
+		{`O\'Brien`, `O'Brien`},
+		{`trailing\`, `trailing\`},
+		{``, ``},
+	}
+	for _, tc := range cases {
+		if got := unescapeStringLiteral(tc.in); got != tc.want {
+			t.Errorf("unescapeStringLiteral(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestParseQuoteInStringPKStaysFailLoud pins that a literal containing
+// a quote character still misses the matcher and errors (1064 path) —
+// #826 must not silently change the fail-loud behavior into a
+// partial-parse.
+func TestParseQuoteInStringPKStaysFailLoud(t *testing.T) {
+	_, err := Parse(
+		`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = 'O\'Brien'`,
+		"myapp",
+	)
+	if err == nil {
+		t.Fatal("expected error for quote-containing literal, got nil")
+	}
+	if errors.Is(err, ErrNotTimeTravel) {
+		t.Fatalf("want malformed-query error (1064 path), got ErrNotTimeTravel")
+	}
+}
+
 func TestParseNegativePK(t *testing.T) {
 	q, err := Parse(
 		"SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE id = -42",

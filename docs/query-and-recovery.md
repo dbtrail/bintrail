@@ -362,16 +362,17 @@ For `UPDATE` and `DELETE` reversals, the generator needs a `WHERE` clause to ide
 UPDATE `mydb`.`orders` SET `status` = 'draft' WHERE `id` = 42
 ```
 
-**Without a snapshot (fallback)**: Uses every column in the row image. This is verbose, and is **not** a guarantee of correctness even for tables without duplicate rows:
+**Without a snapshot (fallback)**: Uses every column in the row image, capped at one row:
 
 ```sql
 UPDATE `mydb`.`orders`
 SET `status` = 'draft'
-WHERE `id` = 42 AND `status` = 'published' AND `created_at` = '2026-02-19 14:01:00' AND `notes` IS NULL
+WHERE `id` = 42 AND `status` = 'published' AND `created_at` = '2026-02-19 14:01:00' AND `notes` IS NULL LIMIT 1
 ```
 
-- A `NULL` column renders as `IS NULL` (not `= NULL`, which never matches in SQL) — but a row whose *other* columns are all non-`NULL` and identical to another row (no natural key, no snapshot) will match **both** rows, and the reversal over-applies. There is no runtime detection of this: the generator has no way to know the table has (or doesn't have) duplicate rows.
-- "Without duplicate rows" is a precondition the generator assumes, not something it checks. If you rely on this fallback (no schema snapshot available), verify the table has a natural uniqueness property before applying the generated script.
+- A `NULL` column renders as `IS NULL` (not `= NULL`, which never matches in SQL).
+- An all-columns `WHERE` matches **every byte-identical duplicate row** (PK-less table, no natural key), while the original event touched exactly one row. Fallback `UPDATE`/`DELETE` reversals therefore carry `LIMIT 1` on the MySQL dialect, so reversing one `INSERT` removes one copy instead of silently deleting all duplicates. Which physical copy is affected is undefined — and irrelevant, since the matching rows are identical on every referenced column.
+- PostgreSQL has no `UPDATE`/`DELETE ... LIMIT`, so PostgreSQL-dialect fallback statements remain unbounded: with byte-identical duplicate rows the reversal still over-applies there. The generated script flags each affected statement with a leading `-- WARNING: unbounded all-columns WHERE, no per-statement row cap on this dialect ...` comment so the risk is visible in `--dry-run`/`--output` review, not just here. If you rely on this fallback against PostgreSQL, verify the table has a natural uniqueness property before applying the generated script.
 
 The resolver is loaded best-effort in the `recover` command — a failure logs a warning and falls back to the all-columns strategy.
 
@@ -401,6 +402,8 @@ The recovery output is a self-contained SQL script:
 -- IMPORTANT: Review carefully before applying to production.
 
 BEGIN;
+SET time_zone = '+00:00';
+SET sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION';
 
 -- [47] reverse DELETE on mydb.orders pk=42 at 2026-02-19 14:03:00 gtid=3e11fa47-...:99
 INSERT INTO `mydb`.`orders` (`id`, `status`, `created_at`) VALUES (42, 'draft', '2026-02-19 14:01:00');
@@ -416,7 +419,7 @@ Key properties:
 - Comments before each statement showing the original event ID, type, table, PK, timestamp, and GTID.
 - **Per-event generation errors refuse the whole script.** If any event cannot be reversed — e.g. a malformed or truncated stored row image leaves `row_before`/`row_after` `NULL` — `recover` fails loud: it writes nothing and exits non-zero (with `--output`, the target file is left empty), and the error names every un-generatable event. It does **not** emit the rest as a runnable script with the failed events demoted to `-- ERROR ...` comments — a SQL comment has no apply-time effect, so a partial script would commit clean under `BEGIN`/`COMMIT` and silently deliver an *incomplete* reversal. **Schema drift** is the same: if a statement references a column dropped or renamed after the event, `recover` refuses up front rather than emitting SQL that would fail at apply time. Always check the exit code before applying a generated file.
 - **Never auto-executed**: dbtrail only generates the file. Applying it is always a manual step.
-- `bintrail` (MySQL) pins the apply session to `SET time_zone = '+00:00'` before the reversal statements, since TIMESTAMP/DATETIME literals in the script are rendered from the captured UTC value with no explicit zone marker — without the pin, a target session in a non-UTC `time_zone` would reinterpret them and reintroduce a shift. `bintrail-pg` (PostgreSQL) pins `standard_conforming_strings = on` for the same reason (its string-escaping assumes it). Neither pins anything else about the apply session — see [Restore limitations](#restore-limitations-mysql) below for what is **not** pinned or restored.
+- `bintrail` (MySQL) pins the apply session before the reversal statements: `SET time_zone = '+00:00'` (TIMESTAMP/DATETIME literals in the script are rendered from the captured UTC value with no explicit zone marker — without the pin, a target session in a non-UTC `time_zone` would reinterpret them and reintroduce a shift) and `SET sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'` — permissive where the script's own encoding needs it (no `NO_BACKSLASH_ESCAPES`, so the backslash-escaped string literals parse as written; no zero-date rules, so captured `0000-00-00` values apply verbatim) while keeping strict truncation/out-of-range checks, so a captured value that no longer fits a since-narrowed column fails loud instead of being silently coerced. `bintrail-pg` (PostgreSQL) pins `standard_conforming_strings = on` for the same reason (its string-escaping assumes it). Beyond these, nothing else about the apply session is pinned — see [Restore limitations](#restore-limitations-mysql) below for what is **not** pinned or restored.
 
 ## Restore limitations (MySQL)
 

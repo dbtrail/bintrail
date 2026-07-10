@@ -120,6 +120,31 @@ func TestDigestVersionOf(t *testing.T) {
 	}
 }
 
+// TestSelectExpr_FloatPromotion pins selectExpr's scoping of the #795 FLOAT
+// widening: unconditional promotion would break the byte-identity
+// ConsistentTableChecksum (nil normalize, baseline-dump-time fidelity check)
+// promises against mydumper's own unpromoted FLOAT text, so promoteFloat must
+// gate strictly on the cross-renderer (normalize != nil) caller.
+func TestSelectExpr_FloatPromotion(t *testing.T) {
+	f := column{name: "f", dataType: "float"}
+	if got, want := selectExpr(f, false), "`f`"; got != want {
+		t.Errorf("selectExpr(float, promoteFloat=false) = %q, want %q", got, want)
+	}
+	if got, want := selectExpr(f, true), "`f`+0e0"; got != want {
+		t.Errorf("selectExpr(float, promoteFloat=true) = %q, want %q", got, want)
+	}
+	// DOUBLE is unaffected either way — my_gcvt already renders it losslessly.
+	d := column{name: "d", dataType: "double"}
+	if got, want := selectExpr(d, true), "`d`"; got != want {
+		t.Errorf("selectExpr(double, promoteFloat=true) = %q, want %q", got, want)
+	}
+	// DATE/DATETIME/TIMESTAMP keep their CAST regardless of promoteFloat.
+	ts := column{name: "ts", dataType: "timestamp"}
+	if got, want := selectExpr(ts, true), "CAST(`ts` AS CHAR)"; got != want {
+		t.Errorf("selectExpr(timestamp, promoteFloat=true) = %q, want %q", got, want)
+	}
+}
+
 func TestQuoteIdent(t *testing.T) {
 	cases := map[string]string{
 		"id":       "`id`",
