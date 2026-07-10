@@ -1424,25 +1424,45 @@ func postBaselineColumns(changes map[string]*query.ResultRow, colNames []string)
 
 // droppedBaselineColumns is the symmetric counterpart of postBaselineColumns:
 // it returns, sorted and de-duplicated, the baseline column names ABSENT (key
-// missing — not value NULL) from some non-DELETE event's row_after image,
-// i.e. columns DROPPED from the source table after the baseline snapshot.
-// binlog_row_image=FULL (validated at index time) guarantees a complete
-// after-image, so key absence means the column no longer existed at event
-// time; a genuinely-NULL value is present in the map as a nil value and is
-// never flagged. mergeBaselineIntoWriter calls this up front to refuse the
-// run instead of letting rowAfterOrdered NULL-fill the column row by row
-// (#843). DELETE events carry no row_after and are skipped.
+// missing — not value NULL) from some event's row image, i.e. columns DROPPED
+// from the source table after the baseline snapshot. binlog_row_image=FULL
+// (validated at index time) guarantees a complete image, so key absence means
+// the column no longer existed at event time; a genuinely-NULL value is
+// present in the map as a nil value and is never flagged. mergeBaselineIntoWriter
+// calls this up front to refuse the run instead of letting rowAfterOrdered
+// NULL-fill the column row by row (#843).
+//
+// Both row_after AND row_before are scanned (#843 follow-up): a window whose
+// last event for a post-drop-touched PK is a DELETE carries no row_after, but
+// its row_before is itself a post-drop image (the row as it existed just
+// before deletion) and so still lacks the dropped column — checking only
+// row_after let such a window sail through with zero warning, silently
+// re-emitting the stale pre-drop value on every untouched pass-through row.
+// Per-PK this collapsed-map scan is sufficient: changes is keyed by PK with
+// the chronologically LAST event surviving, and time only moves forward, so
+// if any event for a PK is post-drop then so is that surviving one — there is
+// no ordering in which an earlier post-drop event's signal is lost behind a
+// later pre-drop entry for the same key. A PK with zero post-drop activity in
+// the window remains undetectable by construction (no image ever samples the
+// post-drop schema for it) and is out of scope here.
 func droppedBaselineColumns(changes map[string]*query.ResultRow, colNames []string) []string {
 	dropped := make(map[string]struct{})
-	for _, ev := range changes {
-		if ev == nil || ev.EventType == event.EventDelete || ev.RowAfter == nil {
-			continue
+	scan := func(img map[string]any) {
+		if img == nil {
+			return
 		}
 		for _, col := range colNames {
-			if _, ok := ev.RowAfter[col]; !ok {
+			if _, ok := img[col]; !ok {
 				dropped[col] = struct{}{}
 			}
 		}
+	}
+	for _, ev := range changes {
+		if ev == nil {
+			continue
+		}
+		scan(ev.RowAfter)
+		scan(ev.RowBefore)
 	}
 	if len(dropped) == 0 {
 		return nil
