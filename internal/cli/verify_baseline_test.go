@@ -13,6 +13,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // writeMinimalBaseline writes one complete baseline snapshot (one table, one
@@ -95,11 +96,11 @@ func TestRunVerifyBaselinePair_SingleBaseline(t *testing.T) {
 
 // TestRunVerifyBaselinePair_TablesAbsent locks the no-silent-omission contract
 // for --tables: a requested table that exists in neither the paired nor the
-// unpaired set must surface as an error and fail the run, not vanish while the
-// other tables' matches keep the exit at 0. Two baselines for `orders` form a
-// real pair; --tables names a table that isn't there, so every real pair is
-// filtered out (the index is never touched — nil DBs are safe) and the unseen
-// request is the only result, as a StatusError.
+// unpaired set NOR the schema snapshot must surface as an error and fail the
+// run, not vanish while the other tables' matches keep the exit at 0. Two
+// baselines for `orders` form a real pair; --tables names a table that isn't
+// there, so every real pair is filtered out (the index is never touched — a
+// nil DB is safe) and the unseen request is the only result, as a StatusError.
 func TestRunVerifyBaselinePair_TablesAbsent(t *testing.T) {
 	baseDir := t.TempDir()
 	base := time.Now().UTC().Truncate(time.Hour)
@@ -114,12 +115,53 @@ func TestRunVerifyBaselinePair_TablesAbsent(t *testing.T) {
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 
-	err := runVerifyBaselinePair(cmd, nil, nil, "", baseDir, duckdbutil.Tuning{})
+	err := runVerifyBaselinePair(cmd, nil, metadata.NewResolverFromTables(1, nil), "", baseDir, duckdbutil.Tuning{})
 	if err == nil {
 		t.Fatalf("want a non-nil error (non-zero exit) for an absent --tables request, got nil; output:\n%s", out.String())
 	}
 	if !strings.Contains(out.String(), "1 error") ||
 		!strings.Contains(out.String(), "not present in the latest baseline pair") {
 		t.Errorf("want the ghost table surfaced as an error, got output:\n%s", out.String())
+	}
+}
+
+// TestRunVerifyBaselinePair_NeverBaselined locks the #770 fix: a table that IS
+// in the latest schema snapshot but appears in NO baseline snapshot must show
+// up in the report as inconclusive ("never baselined"), not silently produce
+// no row. --tables filters to the never-baselined table only, so the real
+// `orders` pair is skipped and the index is never touched (a nil DB is safe);
+// before the fix this request fell through to the --tables-absent StatusError
+// path instead of the snapshot-aware inconclusive.
+func TestRunVerifyBaselinePair_NeverBaselined(t *testing.T) {
+	baseDir := t.TempDir()
+	base := time.Now().UTC().Truncate(time.Hour)
+	writeMinimalBaseline(t, baseDir, "mydb", "orders", base.Add(-2*time.Hour))
+	writeMinimalBaseline(t, baseDir, "mydb", "orders", base.Add(-1*time.Hour))
+
+	resolver := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"mydb.orders":   {Schema: "mydb", Table: "orders"},
+		"mydb.payments": {Schema: "mydb", Table: "payments"},
+	})
+
+	vfyTables = "mydb.payments"
+	t.Cleanup(func() { vfyTables = "" })
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	// Non-zero exit is expected here, but from the "nothing proven" gate (the
+	// only result is inconclusive), NOT from the --tables-absent error path.
+	err := runVerifyBaselinePair(cmd, nil, resolver, "", baseDir, duckdbutil.Tuning{})
+	if err == nil {
+		t.Fatalf("want a non-nil error (all-inconclusive run proves nothing), got nil; output:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "never baselined") ||
+		!strings.Contains(out.String(), "1 inconclusive") {
+		t.Errorf("want mydb.payments reported inconclusive as never baselined, got output:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "not present in the latest baseline pair") {
+		t.Errorf("a snapshot table must not hit the --tables-absent error path, got output:\n%s", out.String())
 	}
 }

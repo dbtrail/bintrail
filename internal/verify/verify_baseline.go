@@ -207,6 +207,35 @@ func deferredReprChanged(cols []metadata.ColumnMeta, changes map[string]*query.R
 // run (exactly one baseline, no predecessor yet → genuinely nothing to compare).
 // FindBaselinePair collapses both into nil, nil, nil, so the distinction has to
 // be recovered here.
+// EverBaselinedTables returns the set of "schema.table" keys that appear in
+// AT LEAST ONE baseline snapshot under source, at ANY snapshot time — not
+// just the two most recent ones FindBaselinePair uses to build its
+// pairs/unpaired/prevOnly sets. A table absent from that top-2 window but
+// present here still has an older snapshot on disk/S3: reconstruct.FindBaseline
+// (the function `bintrail reconstruct` and the shim's `_snapshot` actually use)
+// will fall back to it and return a StaleWarning, so the table IS recoverable
+// via reconstruct — just not verifiable against the current two-snapshot
+// window. Callers use this to distinguish that from a table with zero
+// baselines at any point in time, which reconstruct genuinely cannot serve.
+func EverBaselinedTables(ctx context.Context, source string) (map[string]bool, error) {
+	files, err := reconstruct.ListBaselines(ctx, source)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(files))
+	for _, f := range files {
+		out[f.Schema+"."+f.Table] = true
+	}
+	return out, nil
+}
+
+// AnyBaseline reports whether at least one complete baseline snapshot exists
+// under source. The CLI uses it on the "nothing to verify" path to tell two
+// physically different causes apart: a misconfigured or empty source (no
+// baselines at all — a broken baseline job → fail loud) from a legitimate first
+// run (exactly one baseline, no predecessor yet → genuinely nothing to compare).
+// FindBaselinePair collapses both into nil, nil, nil, so the distinction has to
+// be recovered here.
 func AnyBaseline(ctx context.Context, source string) (bool, error) {
 	files, err := reconstruct.ListBaselines(ctx, source)
 	if err != nil {

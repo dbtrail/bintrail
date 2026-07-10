@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -25,7 +26,9 @@ func TestLoadCascadeClosure(t *testing.T) {
 			DeleteRule: rule, UpdateRule: "RESTRICT",
 		}
 	}
-	edgeKey := func(f CascadeFK) string { return f.Schema + "." + f.Table + "->" + f.ReferencedSchema + "." + f.ReferencedTable }
+	edgeKey := func(f CascadeFK) string {
+		return f.Schema + "." + f.Table + "->" + f.ReferencedSchema + "." + f.ReferencedTable
+	}
 
 	// graph indexes edges by their referenced (parent) schema — the frontier key.
 	byRef := func(edges ...CascadeFK) map[string][]CascadeFK {
@@ -235,5 +238,40 @@ func TestFKColumnAbsentFromAll(t *testing.T) {
 		if got := fkColumnAbsentFromAll(c.col, c.sample); got != c.want {
 			t.Errorf("%s: fkColumnAbsentFromAll(%q, …) = %v, want %v", c.name, c.col, got, c.want)
 		}
+	}
+}
+
+// TestDedupVictimsNewest pins the cross-root collapse (#831): the same
+// (schema, table, pk) emitted under two roots keeps ONE victim carrying the
+// newest-timestamp image, in first-seen order; distinct keys are untouched.
+func TestDedupVictimsNewest(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	mk := func(table, pk string, ts time.Time, val string) query.ResultRow {
+		return query.ResultRow{SchemaName: "s", TableName: table, PKValues: pk,
+			EventTimestamp: ts, RowBefore: map[string]any{"v": val}}
+	}
+	got := dedupVictimsNewest([]query.ResultRow{
+		mk("a", "1", t0, "stale"),
+		mk("a", "2", t0, "only"),
+		mk("a", "1", t0.Add(time.Hour), "newest"), // same key, newer -> replaces in place
+		mk("b", "1", t0.Add(-time.Hour), "keep"),  // same pk, different table -> distinct
+		mk("a", "2", t0.Add(-time.Hour), "older"), // same key, older -> dropped
+	})
+	want := []struct{ table, pk, v string }{
+		{"a", "1", "newest"}, {"a", "2", "only"}, {"b", "1", "keep"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d victims, want %d: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		g := got[i]
+		if g.TableName != w.table || g.PKValues != w.pk || g.RowBefore["v"] != w.v {
+			t.Errorf("victim[%d] = %s:%s v=%v, want %s:%s v=%s",
+				i, g.TableName, g.PKValues, g.RowBefore["v"], w.table, w.pk, w.v)
+		}
+	}
+	one := []query.ResultRow{mk("a", "1", t0, "x")}
+	if out := dedupVictimsNewest(one); len(out) != 1 {
+		t.Fatalf("single victim must pass through, got %d", len(out))
 	}
 }

@@ -30,16 +30,18 @@ the exit code so 'doctor' is safe to run in CI as a smoke test.
 Examples:
 
   bintrail doctor --source-dsn "user:pass@tcp(source:3306)/"
-  bintrail doctor --source-dsn "$SRC" --index-dsn "$IDX" --schemas mydb`,
+  bintrail doctor --source-dsn "$SRC" --index-dsn "$IDX" --schemas mydb
+  bintrail doctor --source-dsn "$SRC" --proxysql-admin "admin:admin@tcp(127.0.0.1:6032)/"`,
 	RunE: runDoctor,
 }
 
 var (
-	docSourceDSN string
-	docIndexDSN  string
-	docSchemas   string
-	docFormat    string
-	docRetain    string
+	docSourceDSN     string
+	docIndexDSN      string
+	docSchemas       string
+	docFormat        string
+	docRetain        string
+	docProxySQLAdmin string
 )
 
 func init() {
@@ -48,6 +50,7 @@ func init() {
 	doctorCmd.Flags().StringVar(&docSchemas, "schemas", "", "Comma-separated schemas to check (default: all user schemas)")
 	doctorCmd.Flags().StringVar(&docFormat, "format", "text", "Output format: text or json")
 	doctorCmd.Flags().StringVar(&docRetain, "retain", "30d", "Retention window assumed by the index capacity projection (Nd/Nh; \"off\" if you don't rotate)")
+	doctorCmd.Flags().StringVar(&docProxySQLAdmin, "proxysql-admin", "", "ProxySQL admin DSN, e.g. admin:pass@tcp(127.0.0.1:6032)/ (optional; verifies the dbtrail time-travel routing rules are live — advisory WARN only)")
 	_ = doctorCmd.MarkFlagRequired("source-dsn")
 	bindCommandEnv(doctorCmd)
 	rootCmd.AddCommand(doctorCmd)
@@ -61,7 +64,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	return runDoctorTo(cmd.Context(), os.Stdout, docFormat, docSourceDSN, docIndexDSN, docSchemas, retain)
+	return runDoctorTo(cmd.Context(), os.Stdout, docFormat, docSourceDSN, docIndexDSN, docSchemas, retain, docProxySQLAdmin)
 }
 
 // parseDocRetain maps doctor's --retain value to the capacity projection's
@@ -83,11 +86,16 @@ func parseDocRetain(s string) (time.Duration, error) {
 // against sourceDSN (and optionally indexDSN), renders the report to w using
 // format ("text" or "json"), and returns a non-nil error iff any required
 // check failed. indexRetain is the rotation window the capacity projection
-// assumes (0 = no rotation). Callers wanting to route output (e.g. `bintrail
+// assumes (0 = no rotation). proxysqlAdminDSN, when non-empty, appends the
+// opt-in ProxySQL routing-rules check (#820; advisory, never affects the exit
+// code). Callers wanting to route output (e.g. `bintrail
 // up` sending preflight output to stderr to keep stdout clean for streaming)
 // pass their own writer here instead of going through the cobra entry point.
-func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDSN, schemasCSV string, indexRetain time.Duration) error {
+func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDSN, schemasCSV string, indexRetain time.Duration, proxysqlAdminDSN string) error {
 	report := doctor.Build(parent, sourceDSN, indexDSN, schemasCSV, indexRetain)
+	if proxysqlAdminDSN != "" {
+		report.Add(doctor.CheckProxySQLRules(parent, proxysqlAdminDSN))
+	}
 	if err := report.Write(w, format); err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}

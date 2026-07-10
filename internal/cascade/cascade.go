@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -189,9 +190,11 @@ func (r Result) Complete() bool { return len(r.Incomplete) == 0 }
 //
 // It recurses: synthetic victims become the next layer's parents, so a
 // parent→child→grandchild cascade is fully reconstructed, bounded by MaxDepth
-// and a per-(table,pk) visited guard that also breaks self-referencing-FK
-// cycles. Multi-path cascades (diamonds, multiple FKs to the same parent) emit
-// each victim once via an emitted set, so recovery never double-INSERTs a PK.
+// and a per-(root, table, pk) visited guard that also breaks self-referencing-FK
+// cycles (per ROOT, not global: the same parent PK deleted twice in the window
+// is two distinct cascades, #831). Multi-path cascades (diamonds, multiple FKs
+// to the same parent) emit each victim once via an emitted set, and cross-root
+// duplicates collapse to the newest image, so recovery never double-INSERTs a PK.
 //
 // Coverage is best-effort: every gap is recorded in Result.Incomplete, and an
 // operational query failure additionally returns a non-nil error. The caller
@@ -211,7 +214,27 @@ func SynthesizeVictims(
 		incomplete  []string
 		errs        []error
 	)
-	setNullSeen := map[string]bool{} // "schema.table.column|pkvalues" → SET NULL restore emitted (per-COLUMN: one row may have several single-column SET NULL FKs)
+	// setNullSeen dedups SET NULL restores per (schema.table.column, pk) with
+	// NEWEST-WINS replacement: a child whose FK was nulled by one root, then
+	// re-pointed and nulled again by a later root must restore from its LATEST
+	// pre-null image, not whichever root happened to be walked first (#831).
+	// Per-COLUMN key: one row may have several single-column SET NULL FKs.
+	type setNullSlot struct {
+		idx int       // position in setNullRows
+		ts  time.Time // event/baseline time of the image behind it
+	}
+	setNullSeen := map[string]setNullSlot{} // "schema.table.column|pkvalues" → newest restore emitted
+	addSetNull := func(key string, ts time.Time, sr SetNullRestore) {
+		if slot, ok := setNullSeen[key]; ok {
+			if ts.After(slot.ts) {
+				setNullRows[slot.idx] = sr
+				setNullSeen[key] = setNullSlot{idx: slot.idx, ts: ts}
+			}
+			return
+		}
+		setNullSeen[key] = setNullSlot{idx: len(setNullRows), ts: ts}
+		setNullRows = append(setNullRows, sr)
+	}
 	// addIncomplete records a coverage caveat once per distinct key, so a wide
 	// cascade (many parent×FK iterations) cannot flood the list with near-
 	// identical strings and bury the important ones.
@@ -255,8 +278,15 @@ func SynthesizeVictims(
 			byParent[fk.ReferencedSchema+"."+fk.ReferencedTable], fk)
 	}
 
-	visited := map[string]bool{} // "schema.table|pkvalues" → processed as a parent
-	emitted := map[string]bool{} // "schema.table|pkvalues" → already emitted as a victim
+	// visited/emitted are keyed PER ROOT (the |rootTS suffix): the same parent
+	// PK deleted twice within the window (delete → re-insert → delete) is TWO
+	// distinct cascades with different [since, T] windows, so a global key
+	// would silently skip the second root's subtree — children created between
+	// the two deletes would never be reconstructed, with no Incomplete caveat
+	// (#831). Cross-root duplicates are collapsed AFTER the walk keeping the
+	// newest image (dedupVictimsNewest / setNullSeen's newest-wins slot).
+	visited := map[string]bool{} // "schema.table|pkvalues|rootTS" → processed as a parent under that root
+	emitted := map[string]bool{} // "schema.table|pkvalues|rootTS" → emitted as a victim under that root
 	// skewChecked memoizes the child-side DDL-skew probe per child FK column so a
 	// wide cascade with many childless parents samples each child table at most
 	// once. Only a CONCLUSIVE probe (a window that returned images) memoizes; an
@@ -271,20 +301,40 @@ func SynthesizeVictims(
 	// after its parent's last event, and skewing the re-parented check). Each
 	// layer item therefore carries the originating root T down the recursion;
 	// distinct root deletes keep their own T.
+	//
+	// rootID (the root's own EventID, the binlog_events auto-increment PK) is
+	// carried alongside rootTS and combines with it to KEY visited/emitted:
+	// event_timestamp is a whole-second DATETIME (no fractional part), so two
+	// genuinely distinct root deletes of the same parent PK landing in the
+	// same wall-clock second would collide on rootTS alone — the second
+	// root's subtree would be silently skipped at the visited[] check,
+	// reproducing #831 at sub-second granularity. EventID (the DB's
+	// auto-increment PK) never collides across real distinct rows, so pairing
+	// it with rootTS closes that gap.
 	type layerItem struct {
 		ev     query.ResultRow
 		rootTS time.Time
+		rootID uint64
 	}
 	layer := make([]layerItem, 0, len(parentDeletes))
 	for _, pd := range parentDeletes {
-		layer = append(layer, layerItem{ev: pd, rootTS: pd.EventTimestamp})
+		layer = append(layer, layerItem{ev: pd, rootTS: pd.EventTimestamp, rootID: pd.EventID})
 	}
 
 	for depth := 0; depth < opts.MaxDepth && len(layer) > 0; depth++ {
 		var next []layerItem
 		for _, item := range layer {
 			pev := item.ev
-			pkey := pev.SchemaName + "." + pev.TableName + "|" + pev.PKValues
+			// Keyed by BOTH rootID and rootTS (not either alone): rootID
+			// disambiguates two real, distinct rows that share a stored
+			// second (EventID is the DB's auto-increment PK, always unique
+			// for real rows); rootTS keeps distinguishing roots built
+			// without a real EventID (e.g. synthetic fixtures in tests,
+			// where EventID defaults to its zero value) as long as their
+			// timestamps differ, preserving pre-existing behavior for that
+			// case. Two roots collide only if BOTH match.
+			rootKey := strconv.FormatUint(item.rootID, 10) + "@" + strconv.FormatInt(item.rootTS.UnixNano(), 10)
+			pkey := pev.SchemaName + "." + pev.TableName + "|" + pev.PKValues + "|" + rootKey
 			if visited[pkey] {
 				continue
 			}
@@ -464,18 +514,14 @@ func SynthesizeVictims(
 						// parent (e.g. manager_id + mentor_id → user.id). A row-only
 						// key would let the first FK's restore swallow the second's,
 						// leaving a column permanently NULL with no caveat.
-						skey := fk.Schema + "." + fk.Table + "." + fk.Column + "|" + cev.PKValues
-						if setNullSeen[skey] {
-							continue
-						}
-						setNullSeen[skey] = true
-						setNullRows = append(setNullRows, SetNullRestore{
-							Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
-							Value: refVal, PKValues: cev.PKValues, Row: cev.RowAfter,
-						})
+						addSetNull(fk.Schema+"."+fk.Table+"."+fk.Column+"|"+cev.PKValues,
+							cev.EventTimestamp, SetNullRestore{
+								Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
+								Value: refVal, PKValues: cev.PKValues, Row: cev.RowAfter,
+							})
 						continue
 					}
-					vkey := fk.Schema + "." + fk.Table + "|" + cev.PKValues
+					vkey := fk.Schema + "." + fk.Table + "|" + cev.PKValues + "|" + rootKey
 					if emitted[vkey] {
 						// Reached via another cascade path (diamond / multiple FKs
 						// to the same parent); emit once so recovery never
@@ -493,7 +539,7 @@ func SynthesizeVictims(
 					}
 					victims = append(victims, victim)
 					// May itself be a parent (grandchildren); keep the SAME root T.
-					next = append(next, layerItem{ev: victim, rootTS: item.rootTS})
+					next = append(next, layerItem{ev: victim, rootTS: item.rootTS, rootID: item.rootID})
 				}
 
 				// Phase-2 augmentation: add the baseline children that referenced
@@ -531,18 +577,14 @@ func SynthesizeVictims(
 							}
 							if fk.DeleteRule == "SET NULL" {
 								// Per-COLUMN key (see the Phase-1 branch above).
-								skey := fk.Schema + "." + fk.Table + "." + fk.Column + "|" + br.PKValues
-								if setNullSeen[skey] {
-									continue
-								}
-								setNullSeen[skey] = true
-								setNullRows = append(setNullRows, SetNullRestore{
-									Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
-									Value: refVal, PKValues: br.PKValues, Row: br.Row,
-								})
+								addSetNull(fk.Schema+"."+fk.Table+"."+fk.Column+"|"+br.PKValues,
+									baseSnap, SetNullRestore{
+										Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
+										Value: refVal, PKValues: br.PKValues, Row: br.Row,
+									})
 								continue
 							}
-							vkey := fk.Schema + "." + fk.Table + "|" + br.PKValues
+							vkey := fk.Schema + "." + fk.Table + "|" + br.PKValues + "|" + rootKey
 							if emitted[vkey] {
 								continue
 							}
@@ -556,7 +598,7 @@ func SynthesizeVictims(
 								RowBefore:      br.Row,
 							}
 							victims = append(victims, victim)
-							next = append(next, layerItem{ev: victim, rootTS: item.rootTS})
+							next = append(next, layerItem{ev: victim, rootTS: item.rootTS, rootID: item.rootID})
 						}
 					}
 				}
@@ -568,32 +610,233 @@ func SynthesizeVictims(
 		}
 		layer = next
 	}
-	return Result{Victims: victims, SetNullRows: setNullRows, Incomplete: incomplete}, errors.Join(errs...)
+	return Result{Victims: dedupVictimsNewest(victims), SetNullRows: setNullRows, Incomplete: incomplete}, errors.Join(errs...)
+}
+
+// dedupVictimsNewest collapses victims of the same (schema, table, pk) emitted
+// under DIFFERENT roots into one synthetic DELETE carrying the newest-timestamp
+// image — the child's last known state, which is what the restoring INSERT must
+// reproduce (#831; within one root the per-root emitted set already dedups).
+// First-seen order is preserved so the emitted SQL stays stable.
+func dedupVictimsNewest(victims []query.ResultRow) []query.ResultRow {
+	if len(victims) < 2 {
+		return victims
+	}
+	idx := make(map[string]int, len(victims))
+	out := victims[:0]
+	for _, v := range victims {
+		key := v.SchemaName + "." + v.TableName + "|" + v.PKValues
+		if j, ok := idx[key]; ok {
+			if v.EventTimestamp.After(out[j].EventTimestamp) {
+				out[j] = v
+			}
+			continue
+		}
+		idx[key] = len(out)
+		out = append(out, v)
+	}
+	return out
+}
+
+// fkSnapshotSlack widens the snapshot_time ≤ at comparison by 2 seconds:
+// binlog event timestamps are second-truncated while snapshot DATETIMEs are
+// rounded by MySQL, so a snapshot taken within the same second as the delete
+// can store a time up to ~1.5s AFTER the event's stored timestamp. Erring
+// toward the newer snapshot for that sliver (the pre-#834 behavior) beats
+// spuriously falling back to an older graph.
+const fkSnapshotSlack = 2 * time.Second
+
+// fkSnapshotIDAt resolves which fk_constraints snapshot was in effect at `at`:
+// the newest FK-bearing snapshot taken at or before `at`, via schema_snapshots'
+// snapshot_time (both tables share the snapshot_id, written in one
+// transaction). When no FK snapshot predates `at` (e.g. a backlog re-index
+// whose deletes precede the first snapshot), it falls back to the EARLIEST FK
+// snapshot — the closest available approximation — with approximated=true so
+// callers can surface a caveat. id 0 = no FK snapshot exists at all
+// (pre-cascade-recovery index): callers return an empty graph, as before.
+func fkSnapshotIDAt(ctx context.Context, indexDB *sql.DB, at time.Time) (id uint32, approximated bool, err error) {
+	var atID, minID sql.NullInt64
+	err = indexDB.QueryRowContext(ctx, `SELECT
+		(SELECT MAX(fc.snapshot_id) FROM fk_constraints fc
+		 WHERE EXISTS (SELECT 1 FROM schema_snapshots ss
+		               WHERE ss.snapshot_id = fc.snapshot_id AND ss.snapshot_time <= ?)),
+		(SELECT MIN(snapshot_id) FROM fk_constraints)`,
+		at.Add(fkSnapshotSlack)).Scan(&atID, &minID)
+	if err != nil {
+		return 0, false, fmt.Errorf("resolve FK snapshot at %s: %w", at.Format(time.RFC3339), err)
+	}
+	switch {
+	case atID.Valid:
+		return uint32(atID.Int64), false, nil
+	case minID.Valid:
+		return uint32(minID.Int64), true, nil
+	default:
+		return 0, false, nil
+	}
+}
+
+// FKGraphGroup is one batch of parent deletes that share the SAME FK-topology
+// snapshot, produced by GroupParentDeletesByFKGraph. Feed each group to its
+// own SynthesizeVictims call, then combine the per-group Results with
+// MergeResults.
+type FKGraphGroup struct {
+	FKs   []CascadeFK
+	Roots []query.ResultRow
+}
+
+// GroupParentDeletesByFKGraph resolves the FK graph independently for EACH
+// root delete's own timestamp, then buckets consecutive (in ascending root
+// time) roots that resolve to the identical FK snapshot into one group.
+//
+// An earlier version of this anchored the WHOLE batch on the single EARLIEST
+// root (FKGraphAnchor, #834's original fix) so the chosen graph would predate
+// every root in the batch. That is only correct when the FK topology never
+// changes across the batch: a multi-root recover-cascade (--pks spanning
+// several deletes, or a --since/--until window) whose FK topology changed
+// mid-window would recover a LATER root against an EARLIER root's stale
+// graph — silently dropping real cascade victims (an FK that became CASCADE
+// after the earliest root) or fabricating victims that never existed (an FK
+// that stopped being CASCADE), with no caveat. That is the exact
+// silent-under-recovery failure #834 was filed to eliminate, just shifted
+// from "any single delete vs. the latest graph" to "a later delete in a
+// batch vs. the batch's earliest-anchored graph". Resolving per root and
+// grouping fixes this while still making just ONE SynthesizeVictims call for
+// the common case where the topology never changes within the window.
+//
+// Groups are returned in ascending root-time order; MergeResults relies on
+// that order to merge SET NULL restores newest-wins across groups (a
+// SetNullRestore carries no timestamp of its own to compare directly).
+func GroupParentDeletesByFKGraph(
+	ctx context.Context,
+	indexDB *sql.DB,
+	parentSchema string,
+	parentDeletes []query.ResultRow,
+) (groups []FKGraphGroup, caveats []string, err error) {
+	if len(parentDeletes) == 0 {
+		return nil, nil, nil
+	}
+	sorted := append([]query.ResultRow{}, parentDeletes...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].EventTimestamp.Before(sorted[j].EventTimestamp)
+	})
+
+	type cacheEntry struct {
+		fks        []CascadeFK
+		snapshotID uint32
+		caveat     string
+	}
+	cache := map[int64]cacheEntry{}
+	seenCaveat := map[string]bool{}
+
+	var lastSnap uint32
+	haveLast := false
+	for _, pd := range sorted {
+		tsKey := pd.EventTimestamp.UnixNano()
+		e, ok := cache[tsKey]
+		if !ok {
+			fks, snapID, caveat, lerr := LoadCascadeFKsForParent(ctx, indexDB, parentSchema, pd.EventTimestamp)
+			if lerr != nil {
+				return nil, nil, lerr
+			}
+			e = cacheEntry{fks: fks, snapshotID: snapID, caveat: caveat}
+			cache[tsKey] = e
+			if caveat != "" && !seenCaveat[caveat] {
+				seenCaveat[caveat] = true
+				caveats = append(caveats, caveat)
+			}
+		}
+		if !haveLast || e.snapshotID != lastSnap {
+			groups = append(groups, FKGraphGroup{FKs: e.fks})
+			lastSnap = e.snapshotID
+			haveLast = true
+		}
+		gi := len(groups) - 1
+		groups[gi].Roots = append(groups[gi].Roots, pd)
+	}
+	return groups, caveats, nil
+}
+
+// MergeResults combines Results from separate SynthesizeVictims calls made
+// against DIFFERENT FK graphs for the same recovery run (see
+// GroupParentDeletesByFKGraph) — the case a single graph anchored on one
+// timestamp cannot handle correctly when the FK topology changes mid-batch
+// (#834). It applies the same cross-root newest-wins semantics
+// SynthesizeVictims applies within a single call: a child hit by more than
+// one group's cascade collapses to its newest image (by EventTimestamp for
+// Victims), and a SET NULL restore for the same (schema.table.column, pk)
+// keeps the LAST result's value — callers MUST pass results in the same
+// ascending root-time order GroupParentDeletesByFKGraph produced the groups
+// in, since SetNullRestore carries no timestamp for MergeResults to compare
+// directly.
+func MergeResults(results ...Result) Result {
+	if len(results) == 1 {
+		return results[0]
+	}
+	var victims []query.ResultRow
+	var incomplete []string
+	seenIncomplete := map[string]bool{}
+	setNullByKey := map[string]SetNullRestore{}
+	var setNullOrder []string
+	for _, r := range results {
+		victims = append(victims, r.Victims...)
+		for _, msg := range r.Incomplete {
+			if !seenIncomplete[msg] {
+				seenIncomplete[msg] = true
+				incomplete = append(incomplete, msg)
+			}
+		}
+		for _, sr := range r.SetNullRows {
+			key := sr.Schema + "." + sr.Table + "." + sr.Column + "|" + sr.PKValues
+			if _, ok := setNullByKey[key]; !ok {
+				setNullOrder = append(setNullOrder, key)
+			}
+			setNullByKey[key] = sr // later result (newer group) wins
+		}
+	}
+	setNullRows := make([]SetNullRestore, 0, len(setNullOrder))
+	for _, key := range setNullOrder {
+		setNullRows = append(setNullRows, setNullByKey[key])
+	}
+	return Result{
+		Victims:     dedupVictimsNewest(victims),
+		SetNullRows: setNullRows,
+		Incomplete:  incomplete,
+	}
 }
 
 // LoadCascadeFKs reads the FK graph WITH referential rules from the INDEX's
-// fk_constraints table (the latest snapshot that recorded FKs), optionally
-// scoped to schemas. It returns every FK edge — SynthesizeVictims gates on
-// DeleteRule itself — so it is also the loader a future SET NULL path uses.
+// fk_constraints table, optionally scoped to schemas. It returns every FK
+// edge — SynthesizeVictims gates on DeleteRule itself — so it is also the
+// loader a future SET NULL path uses.
 //
 // Source-less by design: `recover` never connects to the source, so the rules
 // come from the index (populated at snapshot time since cascade-recovery Slice
 // A). Pre-Slice-A snapshots whose delete_rule/update_rule are empty load as
 // non-cascade and are simply skipped by the synthesis.
 //
-// LIMITATION: the FK graph is taken from the LATEST snapshot that recorded FKs,
-// not the one in effect at the delete being recovered. If DDL changed the FK
-// topology between the delete and the latest snapshot, synthesis uses the newer
-// graph. Matching the FK graph to event time is deferred (see #548); acceptable
-// because cascade DDL churn mid-recovery-window is rare and the FK-checks-off
-// apply tolerates over-/under-inclusion that the operator reviews.
-func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string) ([]CascadeFK, error) {
+// The graph is taken from the FK snapshot in effect at `at` — the newest one
+// taken at or before the root delete being recovered (#834) — NOT the latest
+// snapshot, which would silently apply a post-delete topology: an ON DELETE
+// CASCADE FK dropped after the delete would leave its cascade victims
+// unreconstructed with no caveat (silent under-recovery), and an FK added
+// after it would synthesize victims that were never deleted. Residual
+// limitation: DDL between that snapshot and `at` is still invisible (snapshots
+// are the only FK history the index has); the FK-checks-off apply tolerates
+// the resulting over-/under-inclusion, which the operator reviews.
+func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string, at time.Time) ([]CascadeFK, error) {
+	snapID, _, err := fkSnapshotIDAt(ctx, indexDB, at)
+	if err != nil {
+		return nil, err
+	}
+	if snapID == 0 {
+		return nil, nil
+	}
 	q := `SELECT schema_name, table_name, constraint_name, column_name,
 	       referenced_schema_name, referenced_table_name, referenced_column_name,
 	       delete_rule, update_rule
 	FROM fk_constraints
-	WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM fk_constraints)`
-	var args []any
+	WHERE snapshot_id = ?`
+	args := []any{snapID}
 	if len(schemas) > 0 {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
 		q += " AND schema_name IN (" + placeholders + ")"
@@ -647,10 +890,35 @@ func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string) ([]C
 // schema) is harmless — byParent is only consulted for tables that actually appear
 // as a parent DELETE or a synthesized victim — so this never fabricates a victim; it
 // only stops dropping real ones.
-func LoadCascadeFKsForParent(ctx context.Context, indexDB *sql.DB, parentSchema string) ([]CascadeFK, error) {
-	return loadCascadeClosure(ctx, parentSchema, func(ctx context.Context, refSchemas []string) ([]CascadeFK, error) {
-		return loadCascadeFKsByReferencedSchema(ctx, indexDB, refSchemas)
+//
+// The graph comes from the FK snapshot in effect at `at` (see LoadCascadeFKs,
+// #834). Callers recovering a BATCH of parent deletes that may span an FK
+// topology change must call this once PER ROOT's own timestamp — via
+// GroupParentDeletesByFKGraph — rather than once for the whole batch anchored
+// on a single timestamp; see that function's doc for why. The returned
+// snapshotID identifies WHICH FK snapshot was resolved (0 = none found), so
+// callers can tell whether two roots share the identical graph without
+// comparing the FK slices themselves. The returned caveat is non-empty when
+// no FK snapshot predates `at` and the earliest one was used as an
+// approximation — callers MUST surface it alongside Result.Incomplete, never
+// drop it.
+func LoadCascadeFKsForParent(ctx context.Context, indexDB *sql.DB, parentSchema string, at time.Time) (fks []CascadeFK, snapshotID uint32, caveat string, err error) {
+	snapID, approximated, err := fkSnapshotIDAt(ctx, indexDB, at)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	if snapID == 0 {
+		return nil, 0, "", nil
+	}
+	if approximated {
+		caveat = fmt.Sprintf(
+			"no FK snapshot predates the root delete (%s); used the earliest recorded FK graph, which may not reflect the FK topology in effect at delete time",
+			at.UTC().Format(time.RFC3339))
+	}
+	fks, err = loadCascadeClosure(ctx, parentSchema, func(ctx context.Context, refSchemas []string) ([]CascadeFK, error) {
+		return loadCascadeFKsByReferencedSchema(ctx, indexDB, refSchemas, snapID)
 	})
+	return fks, snapID, caveat, err
 }
 
 // referencedSchemaLoader loads the FK edges whose PARENT (referenced_schema_name) is
@@ -691,10 +959,11 @@ func loadCascadeClosure(ctx context.Context, parentSchema string, load reference
 }
 
 // loadCascadeFKsByReferencedSchema reads every FK edge whose PARENT is in
-// refSchemas from the latest FK snapshot. It mirrors LoadCascadeFKs's SELECT (all
-// edges, rules included — SynthesizeVictims gates on DeleteRule) but filters on
+// refSchemas from the given FK snapshot (resolved once by the caller via
+// fkSnapshotIDAt). It mirrors LoadCascadeFKs's SELECT (all edges, rules
+// included — SynthesizeVictims gates on DeleteRule) but filters on
 // referenced_schema_name instead of schema_name.
-func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refSchemas []string) ([]CascadeFK, error) {
+func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refSchemas []string, snapID uint32) ([]CascadeFK, error) {
 	if len(refSchemas) == 0 {
 		return nil, nil
 	}
@@ -703,10 +972,11 @@ func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refS
 	       referenced_schema_name, referenced_table_name, referenced_column_name,
 	       delete_rule, update_rule
 	FROM fk_constraints
-	WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM fk_constraints)
+	WHERE snapshot_id = ?
 	  AND referenced_schema_name IN (` + placeholders + `)
 	ORDER BY schema_name, table_name, constraint_name, ordinal_position`
-	args := make([]any, 0, len(refSchemas))
+	args := make([]any, 0, len(refSchemas)+1)
+	args = append(args, snapID)
 	for _, s := range refSchemas {
 		args = append(args, s)
 	}

@@ -324,6 +324,14 @@ func TestCoerceUnsigned(t *testing.T) {
 		{"bit(64) high bit only", int64(-9223372036854775808), ColumnMeta{DataType: "bit", ColumnType: "bit(64)"}, uint64(9223372036854775808)},
 		{"bit(8) positive unchanged", int64(200), ColumnMeta{DataType: "bit", ColumnType: "bit(8)"}, uint64(200)},
 		{"bit null passthrough", nil, ColumnMeta{DataType: "bit", ColumnType: "bit(64)"}, nil},
+		// SET: go-mysql decodes the member bitmask as int64, so a 64-member SET
+		// with member 64 active comes back negative — same class as BIT(64),
+		// reinterpret as uint64 (#846). Smaller bitmasks are already positive
+		// (identity); NULL passes through.
+		{"set 64 members, member 64 active", int64(-9223372036854775808), ColumnMeta{DataType: "set", ColumnType: "set('m1','m64')"}, uint64(9223372036854775808)},
+		{"set 64 members, all active", int64(-1), ColumnMeta{DataType: "set", ColumnType: "set('m1','m64')"}, maxU64},
+		{"set small bitmask unchanged", int64(5), ColumnMeta{DataType: "set", ColumnType: "set('a','b','c')"}, uint64(5)},
+		{"set null passthrough", nil, ColumnMeta{DataType: "set", ColumnType: "set('a','b')"}, nil},
 	}
 
 	for _, tc := range cases {

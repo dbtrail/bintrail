@@ -168,14 +168,15 @@ func TestFormatGTID_anonymousEvent(t *testing.T) {
 	}
 }
 
-// ─── handleRows: unhandled (e.g. MariaDB compressed) row event type ───────────
+// ─── handleRows: unhandled row event type ─────────────────────────────────────
 
 // TestHandleRows_unhandledEventTypeLogsNotSilent verifies that a row event type
-// handleRows does not recognize — e.g. MariaDB's MARIADB_WRITE_ROWS_COMPRESSED_
-// EVENT_V1 — is logged at warn instead of being silently dropped. Before the
-// default arm the switch fell through to `return nil`, dropping every row with
-// no trace (a silent data-loss class). Decoding compressed rows is deferred to
-// beta; the alpha guarantee is only that they are never dropped silently.
+// handleRows does not recognize — e.g. PARTIAL_UPDATE_ROWS_EVENT, emitted under
+// binlog_row_value_options=PARTIAL_JSON (out of support) — is logged at warn
+// instead of being silently dropped. Before the default arm the switch fell
+// through to `return nil`, dropping every row with no trace (a silent data-loss
+// class). The guarantee is that unrecognized row events are never dropped
+// silently.
 func TestHandleRows_unhandledEventTypeLogsNotSilent(t *testing.T) {
 	tm := &metadata.TableMeta{
 		Schema:    "shop",
@@ -190,7 +191,7 @@ func TestHandleRows_unhandledEventTypeLogsNotSilent(t *testing.T) {
 
 	binlogEv := &replication.BinlogEvent{
 		Header: &replication.EventHeader{
-			EventType: replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1,
+			EventType: replication.PARTIAL_UPDATE_ROWS_EVENT,
 			LogPos:    200,
 			EventSize: 100,
 		},
@@ -221,6 +222,121 @@ func TestHandleRows_unhandledEventTypeLogsNotSilent(t *testing.T) {
 	}
 	if len(out) != 0 {
 		t.Errorf("unhandled event must emit no rows downstream, got %d", len(out))
+	}
+}
+
+// ─── handleRows: MariaDB compressed row event types (#520) ────────────────────
+
+// TestHandleRows_mariadbCompressedRowTypes verifies that MariaDB's
+// MARIADB_WRITE/UPDATE/DELETE_ROWS_COMPRESSED_EVENT_V1 (log_bin_compress=ON)
+// dispatch to the same emit path as their uncompressed siblings instead of the
+// warn-and-skip default arm (#520 — silent data loss). go-mysql v1.13.0
+// decompresses the payload during RowsEvent decoding, so handleRows receives
+// fully-decoded Rows with only the header EventType still saying "compressed" —
+// exactly what these fixtures model.
+func TestHandleRows_mariadbCompressedRowTypes(t *testing.T) {
+	tm := &metadata.TableMeta{
+		Schema: "shop",
+		Table:  "orders",
+		Columns: []metadata.ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+			{Name: "amount", OrdinalPosition: 2, DataType: "int"},
+		},
+		PKColumns: []string{"id"},
+	}
+
+	cases := []struct {
+		name      string
+		eventType replication.EventType
+		rows      [][]any
+		wantType  EventType
+		check     func(t *testing.T, ev Event)
+	}{
+		{
+			name:      "write_compressed",
+			eventType: replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1,
+			rows:      [][]any{{int64(1), int64(100)}},
+			wantType:  EventInsert,
+			check: func(t *testing.T, ev Event) {
+				if ev.RowBefore != nil || ev.RowAfter == nil {
+					t.Fatalf("INSERT must carry only an after image, got before=%v after=%v", ev.RowBefore, ev.RowAfter)
+				}
+				if got := ev.RowAfter["amount"]; got != int64(100) {
+					t.Errorf("after image amount = %v, want 100", got)
+				}
+			},
+		},
+		{
+			name:      "update_compressed",
+			eventType: replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1,
+			rows:      [][]any{{int64(1), int64(100)}, {int64(1), int64(200)}}, // before, after
+			wantType:  EventUpdate,
+			check: func(t *testing.T, ev Event) {
+				if ev.RowBefore == nil || ev.RowAfter == nil {
+					t.Fatalf("UPDATE must carry both images, got before=%v after=%v", ev.RowBefore, ev.RowAfter)
+				}
+				if b, a := ev.RowBefore["amount"], ev.RowAfter["amount"]; b != int64(100) || a != int64(200) {
+					t.Errorf("before/after amount = %v/%v, want 100/200", b, a)
+				}
+			},
+		},
+		{
+			name:      "delete_compressed",
+			eventType: replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1,
+			rows:      [][]any{{int64(1), int64(100)}},
+			wantType:  EventDelete,
+			check: func(t *testing.T, ev Event) {
+				if ev.RowBefore == nil || ev.RowAfter != nil {
+					t.Fatalf("DELETE must carry only a before image, got before=%v after=%v", ev.RowBefore, ev.RowAfter)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resolver := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{"shop.orders": tm})
+
+			var buf bytes.Buffer
+			logger := newTestLogger(&buf)
+
+			binlogEv := &replication.BinlogEvent{
+				Header: &replication.EventHeader{
+					EventType: tc.eventType,
+					LogPos:    400,
+					EventSize: 100,
+				},
+				Event: &replication.RowsEvent{
+					Table: &replication.TableMapEvent{
+						Schema:      []byte("shop"),
+						Table:       []byte("orders"),
+						ColumnCount: 2,
+					},
+					Rows: tc.rows,
+				},
+			}
+			rowsEv := binlogEv.Event.(*replication.RowsEvent)
+
+			out := make(chan Event, 4)
+			if err := handleRows(context.Background(), logger, resolver, &Filters{}, binlogEv, rowsEv, "mariadb-bin.000001", "0-1-1", 0, "", 1, out, nil); err != nil {
+				t.Fatalf("handleRows: %v", err)
+			}
+
+			if logged := buf.String(); strings.Contains(strings.ToLower(logged), "unhandled") {
+				t.Fatalf("compressed row event hit the warn-and-skip default arm, logs: %q", logged)
+			}
+			if len(out) != 1 {
+				t.Fatalf("expected exactly 1 emitted event, got %d", len(out))
+			}
+			ev := <-out
+			if ev.EventType != tc.wantType {
+				t.Fatalf("event type = %v, want %v", ev.EventType, tc.wantType)
+			}
+			if ev.PKValues == "" {
+				t.Error("emitted event carries no PK values")
+			}
+			tc.check(t, ev)
+		})
 	}
 }
 

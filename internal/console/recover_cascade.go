@@ -338,16 +338,29 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 	var res cascade.Result
 	var synthErr error
 	if len(parentDeletes) > 0 {
-		fks, lerr := cascade.LoadCascadeFKsForParent(ctx, b.db, p.Schema)
+		// FK graph resolved PER ROOT, not batch-anchored on the earliest root:
+		// a batch can span an FK topology change, and a single
+		// earliest-anchored graph would silently mis-recover a later root
+		// (#834 applied per-root, not once for the whole batch).
+		groups, fkCaveats, lerr := cascade.GroupParentDeletesByFKGraph(ctx, b.db, p.Schema, parentDeletes)
 		if lerr != nil {
 			return cascadeSynthResult{}, fmt.Errorf("load FK graph: %w", lerr)
 		}
-		res, synthErr = cascade.SynthesizeVictims(ctx, b.engine, fks, parentDeletes, cascade.Options{
-			Lookback:        p.Lookback,
-			MaxDepth:        p.MaxDepth,
-			Baseline:        baselineProvider,
-			ArchivesPresent: archivesExist,
-		})
+		caveats = append(caveats, fkCaveats...)
+		results := make([]cascade.Result, 0, len(groups))
+		for _, g := range groups {
+			r, serr := cascade.SynthesizeVictims(ctx, b.engine, g.FKs, g.Roots, cascade.Options{
+				Lookback:        p.Lookback,
+				MaxDepth:        p.MaxDepth,
+				Baseline:        baselineProvider,
+				ArchivesPresent: archivesExist,
+			})
+			results = append(results, r)
+			if serr != nil {
+				synthErr = errors.Join(synthErr, serr)
+			}
+		}
+		res = cascade.MergeResults(results...)
 	}
 	caveats = append(caveats, res.Incomplete...)
 	if synthErr != nil {

@@ -438,11 +438,72 @@ func parseTimeLiteral(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("must be one of: %s (zone-less forms are interpreted as UTC), or a relative literal like '5 minutes ago'", strings.Join(timeFormats, ", "))
 }
 
+// stripQuotes converts a regex-captured WHERE value into the raw bytes
+// matched against pk_values. Quoted string literals get standard MySQL
+// escape semantics (#826): without unescaping, a backslash-containing
+// PK — `WHERE path = 'C:\\temp\\new'` escaped MySQL-style — would
+// search for the literal escaped bytes, miss, and return an empty
+// resultset, which the documented AS OF semantics read as "the row
+// didn't exist at that instant" — a false forensic conclusion.
+// Unquoted (numeric) values pass through unchanged.
 func stripQuotes(s string) string {
 	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
-		return s[1 : len(s)-1]
+		return unescapeStringLiteral(s[1 : len(s)-1])
 	}
 	return s
+}
+
+// unescapeStringLiteral interprets the escape sequences MySQL recognises
+// inside a single-quoted string literal (String Literals, MySQL 8.0
+// reference §9.1.1): \0 \b \n \r \t \Z \\ \' \" translate to their
+// character; \% and \_ keep the backslash (they are only special in
+// LIKE patterns); a backslash before any other character is dropped
+// (escapes are case-sensitive: \Z is Ctrl+Z, \z is z); a doubled quote
+// ('') collapses to a single quote.
+//
+// Note the value regexes ('[^']*') cannot capture a literal containing
+// a quote character — such statements miss the full matcher and keep
+// the fail-loud 1064 path — so the \' and '' branches are for MySQL-
+// semantics completeness, not reachable through Parse today.
+func unescapeStringLiteral(s string) string {
+	if !strings.ContainsAny(s, `\'`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\\' && i+1 < len(s):
+			i++
+			switch s[i] {
+			case '0':
+				b.WriteByte(0)
+			case 'b':
+				b.WriteByte('\b')
+			case 'n':
+				b.WriteByte('\n')
+			case 'r':
+				b.WriteByte('\r')
+			case 't':
+				b.WriteByte('\t')
+			case 'Z':
+				b.WriteByte(0x1A)
+			case '%', '_':
+				b.WriteByte('\\')
+				b.WriteByte(s[i])
+			default:
+				// \\ \' \" and any other \x → x.
+				b.WriteByte(s[i])
+			}
+		case c == '\'' && i+1 < len(s) && s[i+1] == '\'':
+			b.WriteByte('\'')
+			i++
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // parseAsOfRealTable handles the bare time-travel form on a real table

@@ -892,14 +892,16 @@ func (g *Generator) buildUpdate(row query.ResultRow) (string, []string, error) {
 
 	// WHERE uses row_after (current state), so the UPDATE finds the right row
 	// even if the PK itself was changed in the original UPDATE.
-	whereParts, whereCols := g.pkWhereClause(r, row.SchemaName, row.TableName, row.RowAfter)
+	whereParts, whereCols, allCols := g.pkWhereClause(r, row.SchemaName, row.TableName, row.RowAfter)
 	cols = append(cols, whereCols...)
 
-	return fmt.Sprintf("UPDATE %s.%s SET %s WHERE %s",
+	stmt := fmt.Sprintf("UPDATE %s.%s SET %s WHERE %s",
 		g.quoteName(row.SchemaName), g.quoteName(row.TableName),
 		strings.Join(setParts, ", "),
 		strings.Join(whereParts, " AND "),
-	), cols, nil
+	)
+	stmt += g.rowLimitSuffix(allCols)
+	return g.allColsFallbackWarningComment(allCols) + stmt, cols, nil
 }
 
 // generateDelete reverses an INSERT event: delete the inserted row using its
@@ -914,11 +916,42 @@ func (g *Generator) buildDelete(row query.ResultRow) (string, []string, error) {
 		return "", nil, fmt.Errorf("row_after is nil for INSERT event (event_id=%d)", row.EventID)
 	}
 	r := g.resolverForRow(row)
-	whereParts, whereCols := g.pkWhereClause(r, row.SchemaName, row.TableName, row.RowAfter)
-	return fmt.Sprintf("DELETE FROM %s.%s WHERE %s",
+	whereParts, whereCols, allCols := g.pkWhereClause(r, row.SchemaName, row.TableName, row.RowAfter)
+	stmt := fmt.Sprintf("DELETE FROM %s.%s WHERE %s",
 		g.quoteName(row.SchemaName), g.quoteName(row.TableName),
 		strings.Join(whereParts, " AND "),
-	), whereCols, nil
+	)
+	stmt += g.rowLimitSuffix(allCols)
+	return g.allColsFallbackWarningComment(allCols) + stmt, whereCols, nil
+}
+
+// rowLimitSuffix returns " LIMIT 1" for a reverse UPDATE/DELETE whose WHERE fell
+// back to all columns. The original row event touched exactly ONE row, but an
+// all-columns WHERE matches every byte-identical duplicate (PK-less table, no
+// snapshot) — without the cap, reversing one INSERT deletes ALL copies (#789).
+// MySQL-dialect only: PostgreSQL has no UPDATE/DELETE ... LIMIT, so the PG
+// fallback stays unbounded (documented caveat in docs/query-and-recovery.md).
+func (g *Generator) rowLimitSuffix(allColsFallback bool) string {
+	if allColsFallback && g.dialect == MySQLDialect {
+		return " LIMIT 1"
+	}
+	return ""
+}
+
+// allColsFallbackWarningComment returns a leading SQL comment line flagging that the
+// statement below has no per-row cap, for the one dialect where rowLimitSuffix can't
+// supply one. PostgreSQL has no UPDATE/DELETE ... LIMIT, so the all-columns fallback
+// stays unbounded there (#789) with zero runtime signal otherwise — a PK-less table
+// with duplicate rows silently over-applies (reversing one INSERT deletes every
+// byte-identical copy) and the only prior warning was a docs paragraph. The comment
+// is emitted (rather than only a slog.Warn) because it travels with the script into
+// --dry-run/--output, which is where an operator actually reviews before applying.
+func (g *Generator) allColsFallbackWarningComment(allColsFallback bool) string {
+	if allColsFallback && g.dialect == PostgresDialect {
+		return "-- WARNING: unbounded all-columns WHERE, no per-statement row cap on this dialect " +
+			"- may affect every byte-identical duplicate row, not just the one this event touched\n"
+	}
+	return ""
 }
 
 // generatedColsFromResolver returns the set of STORED/VIRTUAL generated column
@@ -987,8 +1020,10 @@ func updateSetSkipCols(resolver *metadata.Resolver, schema, table string) map[st
 // It returns both the rendered clauses and the column names they reference, so
 // schema-drift detection (#601) checks exactly the columns the WHERE emits — a PK-scoped
 // WHERE whose PK still exists carries no drifted column even when some other column was
-// dropped, so that recovery is (correctly) not refused.
-func (g *Generator) pkWhereClause(resolver *metadata.Resolver, schema, table string, row map[string]any) (clauses []string, cols []string) {
+// dropped, so that recovery is (correctly) not refused. allColumns reports whether the
+// all-columns fallback was taken — callers cap those statements with LIMIT 1 (#789),
+// since an all-columns WHERE matches every byte-identical duplicate, not one row.
+func (g *Generator) pkWhereClause(resolver *metadata.Resolver, schema, table string, row map[string]any) (clauses []string, cols []string, allColumns bool) {
 	if resolver != nil {
 		tm, err := resolver.Resolve(schema, table)
 		if err != nil {
@@ -1017,14 +1052,17 @@ func (g *Generator) pkWhereClause(resolver *metadata.Resolver, schema, table str
 					names = append(names, pk.Name)
 				}
 				if allFound {
-					return parts, names
+					return parts, names, false
 				}
 			}
 		}
 	}
-	// Fallback: all columns — verbose but always uniquely identifies the row
-	// (assuming the table has no duplicates, which is true for well-formed data).
-	return g.allColsWhere(row)
+	// Fallback: all columns — verbose, and NOT unique when byte-identical
+	// duplicate rows exist (PK-less table, no snapshot). Callers bound the
+	// statement with LIMIT 1 on MySQL so the reversal touches exactly one
+	// row, like the original event did (#789).
+	clauses, cols = g.allColsWhere(row)
+	return clauses, cols, true
 }
 
 func (g *Generator) allColsWhere(row map[string]any) (clauses []string, cols []string) {

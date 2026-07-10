@@ -531,31 +531,39 @@ func handleRows(
 	// never lands between the chunks of a split statement (#775).
 	stmtEnd := rowsEv.Flags&replication.RowsEventStmtEndFlag != 0
 
+	// MariaDB's MARIADB_*_ROWS_COMPRESSED_EVENT_V1 (log_bin_compress=ON, #520)
+	// dispatch alongside their uncompressed siblings: go-mysql v1.13.0 already
+	// routes them into RowsEvent decoding and decompresses the payload
+	// (mysql.DecompressMariadbData in RowsEvent.DecodeData), so by the time the
+	// event reaches handleRows its Rows/SkippedColumns are fully decoded — only
+	// the header EventType still says "compressed".
 	switch binlogEv.Header.EventType {
 	case replication.WRITE_ROWS_EVENTv0,
 		replication.WRITE_ROWS_EVENTv1,
-		replication.WRITE_ROWS_EVENTv2:
+		replication.WRITE_ROWS_EVENTv2,
+		replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1:
 		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
-		replication.DELETE_ROWS_EVENTv2:
+		replication.DELETE_ROWS_EVENTv2,
+		replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1:
 		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
-		replication.UPDATE_ROWS_EVENTv2:
+		replication.UPDATE_ROWS_EVENTv2,
+		replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1:
 		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	default:
-		// A RowsEvent whose type matches none of the above — e.g. MariaDB's
-		// MARIADB_WRITE/UPDATE/DELETE_ROWS_COMPRESSED_EVENT_V1 (log_bin_compress=ON),
-		// or PARTIAL_UPDATE_ROWS_EVENT which a MySQL source emits under
+		// A RowsEvent whose type matches none of the above — e.g.
+		// PARTIAL_UPDATE_ROWS_EVENT, which a MySQL source emits under
 		// binlog_row_value_options=PARTIAL_JSON (out of support; binlog_row_image=FULL
 		// is required). Decoding these is deferred; warn loudly — including how many
 		// rows were skipped — rather than dropping them silently (a data-loss class).
-		// Standard MySQL ROW DML always matches a specific case above.
-		logger.Warn("unhandled row event type — rows skipped (e.g. MariaDB compressed-row events are not yet decoded)",
+		// Standard MySQL and MariaDB ROW DML always matches a specific case above.
+		logger.Warn("unhandled row event type — rows skipped",
 			"file", filename,
 			"pos", binlogEv.Header.LogPos,
 			"schema", schema,
