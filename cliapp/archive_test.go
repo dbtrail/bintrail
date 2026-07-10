@@ -2,7 +2,11 @@ package cliapp
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -145,5 +149,73 @@ func TestReconcileWiringFromReportDeepUnverified(t *testing.T) {
 	}
 	if !strings.Contains(textBuf.String(), "could not be deep-verified") {
 		t.Fatalf("text output must warn: %s", textBuf.String())
+	}
+}
+
+// TestDuckDBParquetRowCountSharedSession pins the #807 refactor: footer probes
+// run on ONE caller-owned DuckDB session (no per-object open/INSTALL/secret),
+// so successive probes — including a path needing quote-escaping — must all
+// work on the same handle. Local files stand in for S3 objects; only the
+// transport differs (the parquetquery queryFileList precedent).
+func TestDuckDBParquetRowCountSharedSession(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	files := map[string]int64{"a.parquet": 3, "b.parquet": 5, "it's.parquet": 1}
+	for name, n := range files {
+		p := strings.ReplaceAll(filepath.Join(dir, name), "'", "''")
+		if _, err := db.ExecContext(ctx,
+			fmt.Sprintf("COPY (SELECT * FROM range(%d)) TO '%s' (FORMAT PARQUET)", n, p)); err != nil {
+			t.Fatalf("write test parquet %s: %v", name, err)
+		}
+	}
+	for name, want := range files {
+		got, err := duckdbParquetRowCount(ctx, db, filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("probe %s on the shared session: %v", name, err)
+		}
+		if got != want {
+			t.Errorf("%s: row count %d, want %d", name, got, want)
+		}
+	}
+}
+
+// TestOpenS3FooterSessionRegionPin pins the #807 region fix: the shared --deep
+// session must come up usable and carry the scan's region IN the chain secret
+// (EnableS3CredentialChainRegion, #511) — without the pin, every probe on a
+// cross-region bucket 301s into permanent DeepUnverified. Dummy env creds make
+// the chain resolvable on creds-less CI; offline hosts skip (extension
+// download), mirroring the duckdbutil test convention.
+func TestOpenS3FooterSessionRegionPin(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIATESTDUMMY0000000")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "testdummysecret")
+	t.Setenv("BINTRAIL_DUCKDB_NO_AWS_EXT", "")
+
+	db, err := openS3FooterSession(context.Background(), "eu-west-1")
+	if err != nil {
+		t.Skipf("httpfs unavailable (offline host?): %v", err)
+	}
+	defer db.Close()
+
+	var one int
+	if err := db.QueryRow("SELECT 1").Scan(&one); err != nil || one != 1 {
+		t.Fatalf("session unusable after openS3FooterSession: %v (got %d)", err, one)
+	}
+	var loaded bool
+	if err := db.QueryRow("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'aws'").Scan(&loaded); err != nil || !loaded {
+		t.Skip("aws extension unavailable (offline host) — region pin not exercised")
+	}
+	var secretStr string
+	if err := db.QueryRow("SELECT secret_string FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&secretStr); err != nil {
+		t.Fatalf("chain secret missing after openS3FooterSession: %v", err)
+	}
+	if !strings.Contains(secretStr, "region=eu-west-1") {
+		t.Fatalf("chain secret does not carry the pinned region; got %q", secretStr)
 	}
 }
