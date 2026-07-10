@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -504,6 +505,18 @@ func resolveStartForFlavor(
 				return "", "", "", 0, nil, fmt.Errorf("invalid saved gtid_set %q: %w", saved.gtidSet, parseErr)
 			}
 			return "gtid", "", normalized, 0, gs, nil
+		}
+		// stream_state.binlog_position is BIGINT UNSIGNED but COM_BINLOG_DUMP
+		// carries the offset as uint32, so a checkpoint past 4GiB (a single
+		// transaction larger than max_binlog_size delays rotation until commit)
+		// cannot be addressed in position mode. Casting would silently wrap to
+		// an arbitrary earlier offset and re-index history; fail loud instead.
+		if saved.binlogPos > math.MaxUint32 {
+			return "", "", "", 0, nil, fmt.Errorf(
+				"saved binlog position %d in %q exceeds 4GiB, the COM_BINLOG_DUMP protocol limit for position-mode resume; "+
+					"switch to GTID mode, which has no such limit: pass --start-gtid with the source's current gtid_executed set "+
+					"(SELECT @@GLOBAL.gtid_executed)",
+				saved.binlogPos, saved.binlogFile)
 		}
 		slog.Info("resuming from position", "file", saved.binlogFile, "pos", saved.binlogPos)
 		return "position", saved.binlogFile, "", uint32(saved.binlogPos), nil, nil
