@@ -36,10 +36,20 @@ import (
 // inconclusive rather than as a failure (see VerifyTable). FLOAT/DOUBLE are not
 // in the deferred set — there is intentionally no float-inconclusive downgrade
 // (that would create a masking path). Their known representation-only gap
-// (MySQL's my_gcvt vs Go's strconv exponent form, #795) is instead closed by
+// (MySQL's my_gcvt vs Go's strconv exponent form, #795) is closed by
 // canonicalFloatText's value-preserving parse+reformat in renderCellNormalized,
 // so whatever divergence survives normalization is a genuine value difference
-// and surfaces as a (safe) mismatch, never as a false match.
+// and surfaces as a (safe) mismatch, never as a false match. For FLOAT
+// specifically, canonicalFloatText alone is not sufficient on the live-source
+// side: MySQL's bare `SELECT f` already truncates FLOAT text to ~6
+// significant digits (FLT_DIG) before it ever reaches this package, which is
+// lossy relative to the true float32 value and cannot be recovered by
+// reformatting after the fact. Closing that requires reading more precision
+// from the source in the first place — internal/consistency's selectExpr
+// promotes FLOAT reads to DOUBLE arithmetic (`f+0e0`) specifically for the
+// cross-renderer (normalize != nil) caller VerifyTable uses, so the text
+// canonicalFloatText receives already carries enough digits to identify the
+// exact float32.
 func renderCell(v any, col metadata.ColumnMeta) []byte {
 	if v == nil {
 		return nil
@@ -317,7 +327,10 @@ func walkForDuplicateKeys(dec *json.Decoder) (bool, error) {
 //     pad it to the declared fsp (#794).
 //   - a FLOAT/DOUBLE text rendering (see canonicalFloatText) — MySQL's
 //     my_gcvt and Go's strconv disagree on exponent form and thresholds for
-//     the same stored value (#795).
+//     the same stored value (#795). For FLOAT, this also depends on the
+//     source having been read with enough precision in the first place —
+//     see internal/consistency's selectExpr (promoteFloat) — since a
+//     truncated MySQL text can't be recovered by reformatting alone.
 //   - a DATE/DATETIME/TIMESTAMP zero-date sentinel (see isZeroDateSentinel)
 //     — internal/baseline.Writer.WriteRow deliberately maps MySQL's
 //     '0000-00-00'-family pseudo-NULL to Parquet NULL, unconditionally, for
@@ -437,6 +450,18 @@ func trimTimeFractionZeros(b []byte) []byte {
 // not parse as a float of that width (never produced by either renderer for
 // an intact value) return unchanged and fall through to the raw byte
 // comparison.
+//
+// This function is value-preserving only when its input already carries
+// enough precision to identify the stored value uniquely. For DOUBLE, MySQL's
+// bare text protocol always does. For FLOAT it does NOT: a bare `SELECT f`
+// truncates to ~6 significant digits (my_gcvt's FLT_DIG default), which is
+// lossy for any float32 that needs more digits to round-trip — no reformat of
+// already-truncated text can recover the missing digits. That gap is closed
+// one layer up, at the SQL text this function receives: internal/consistency's
+// selectExpr promotes FLOAT reads to DOUBLE arithmetic (`f+0e0`) for the
+// cross-renderer (normalize != nil) caller, so by the time a FLOAT value's
+// text reaches here it already carries full double-precision digits and
+// parses back to the exact original float32.
 func canonicalFloatText(b []byte, bitSize int) []byte {
 	f, err := strconv.ParseFloat(string(b), bitSize)
 	if err != nil {

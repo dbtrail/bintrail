@@ -345,6 +345,17 @@ func TestNormalizeRenderedBytes_FloatDoubleCanonical(t *testing.T) {
 		{"double negative zero", "double", "-0", "-0"},
 		{"float parsed at 32 bits", "float", "0.30000001192092896", "0.3"},
 		{"float plain stable", "float", "1.5", "1.5"},
+		// #795 FLOAT gap: MySQL's bare `SELECT f` truncates FLOAT text to ~6
+		// significant digits (my_gcvt's FLT_DIG), losing the 7th digit of a
+		// value like the float32 1.234567 entirely — no reformat of the
+		// already-truncated "1.23457" can recover it. The fix lives in
+		// internal/consistency's selectExpr (promoteFloat, `f+0e0`), which
+		// widens the SELECT to DOUBLE arithmetic so my_gcvt renders the full
+		// double-precision expansion; THAT text is what reaches this function.
+		// This case pins that once the source hands over enough digits,
+		// canonicalFloatText folds it to the same shortest float32 rendering
+		// the Go-side recon renderer (renderCell's float32 case) produces.
+		{"float promoted-source text folds to shortest float32 form", "float", "1.2345670461654663", "1.234567"},
 		{"case-insensitive DataType", "DOUBLE", "1e16", "1e+16"},
 		{"unparsable unchanged", "double", "not-a-float", "not-a-float"},
 		{"whitespace unchanged", "double", " 1e16", " 1e16"},
@@ -380,5 +391,33 @@ func TestRenderCellNormalized_DoubleEventAndBaselineAgree(t *testing.T) {
 	fromMySQL := normalizeRenderedBytes([]byte("1e16"), "double")
 	if !bytes.Equal(fromBaseline, fromEvent) || !bytes.Equal(fromEvent, fromMySQL) {
 		t.Errorf("renderings diverge: baseline=%q event=%q mysql=%q", fromBaseline, fromEvent, fromMySQL)
+	}
+}
+
+// TestRenderCellNormalized_FloatEventAndPromotedMySQLTextAgree is the FLOAT
+// sibling of TestRenderCellNormalized_DoubleEventAndBaselineAgree, pinning
+// the #795 fix end-to-end: a recon-side float32 (whether from a baseline or
+// an event image) must converge with MySQL's live-source text ONLY once that
+// text carries the extra precision internal/consistency's selectExpr
+// (promoteFloat, `f+0e0`) now supplies — a bare, un-promoted `SELECT f`
+// truncated to 6 significant digits never converges, which is the false
+// MISMATCH #795 was filed to eliminate.
+func TestRenderCellNormalized_FloatEventAndPromotedMySQLTextAgree(t *testing.T) {
+	c := col("float", "float")
+	fromBaseline := renderCellNormalized(float32(1.234567), c)
+	fromEvent := renderCellNormalized(json.Number("1.234567"), c)
+	// The text selectExpr(_, promoteFloat=true) now produces for this value
+	// (`f+0e0` widens the read to DOUBLE arithmetic).
+	fromPromotedMySQL := normalizeRenderedBytes([]byte("1.2345670461654663"), "float")
+	if !bytes.Equal(fromBaseline, fromEvent) || !bytes.Equal(fromEvent, fromPromotedMySQL) {
+		t.Errorf("renderings diverge: baseline=%q event=%q mysql(promoted)=%q", fromBaseline, fromEvent, fromPromotedMySQL)
+	}
+
+	// Anti-regression: the OLD un-promoted 6-sig-fig text must NOT match —
+	// pinning that this test would have failed before the selectExpr fix,
+	// so a future revert of promoteFloat is caught here too.
+	fromUnpromotedMySQL := normalizeRenderedBytes([]byte("1.23457"), "float")
+	if bytes.Equal(fromEvent, fromUnpromotedMySQL) {
+		t.Errorf("unpromoted 6-sig-fig MySQL text %q unexpectedly matched recon %q — this would hide a regression of selectExpr's promoteFloat", fromUnpromotedMySQL, fromEvent)
 	}
 }

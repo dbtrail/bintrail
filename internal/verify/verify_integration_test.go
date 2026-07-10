@@ -786,6 +786,12 @@ func TestVerifyTable_StaleZeroDateVsGenuineNull_AcceptedRisk(t *testing.T) {
 //     declared fsp ("11:00:00.000" for TIME(3)).
 //   - #795: a baseline-origin DOUBLE holding 1e16 renders "1e+16" through Go's
 //     strconv on the recon side but "1e16" through my_gcvt on the live scan.
+//   - #795 (FLOAT): a baseline-origin FLOAT holding 1.234567 (needing 7
+//     significant digits) is truncated by a bare `SELECT gauge` to "1.23457"
+//     (my_gcvt's ~6-sig-fig default) — lossy, not just differently
+//     formatted, so canonicalFloatText's parse+reformat alone cannot recover
+//     it. This exercises internal/consistency's selectExpr promoteFloat
+//     widening (`gauge+0e0`) end-to-end through the real live-source scan.
 //
 // Both were conclusive false MISMATCHes (neither type is in the deferred
 // set). After normalization the table must MATCH — and a genuinely different
@@ -806,6 +812,7 @@ func TestVerifyTable_TimeFspAndFloatText_IsAMatch(t *testing.T) {
 		{"id", 1, "PRI", "int", "int"},
 		{"start", 2, "", "time", "time(3)"},
 		{"factor", 3, "", "double", "double"},
+		{"gauge", 4, "", "float", "float"},
 	} {
 		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
 			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
@@ -818,12 +825,20 @@ func TestVerifyTable_TimeFspAndFloatText_IsAMatch(t *testing.T) {
 	// DOUBLE exercises #795), row 2 updated in-window to an integer-second
 	// TIME (exercises #794).
 	testutil.MustExec(t, db, fmt.Sprintf(
-		"CREATE TABLE `%s`.`appointments` (`id` INT PRIMARY KEY, `start` TIME(3), `factor` DOUBLE)", dbName))
+		"CREATE TABLE `%s`.`appointments` (`id` INT PRIMARY KEY, `start` TIME(3), `factor` DOUBLE, `gauge` FLOAT)", dbName))
+	// Row 1's gauge (2.25) needs no more than 6 significant digits, so it
+	// renders identically whether or not the SELECT is promoted — it is a
+	// control value, not an exercise of the fix. Row 2's gauge (1.234567)
+	// needs 7 — its final state comes from the in-window event below, not
+	// from the baseline, so it exercises the #795 FLOAT fix against an
+	// event-sourced value (the scenario the fix actually targets) without
+	// conflating it with mydumper's own separate, orthogonal FLOAT capture
+	// precision at dump time (see the baseline WriteRow comment below).
 	testutil.MustExec(t, db, fmt.Sprintf(
-		"INSERT INTO `%s`.`appointments` VALUES (1,'09:30:00.250',1e16),(2,'11:00:00',2.25)", dbName))
+		"INSERT INTO `%s`.`appointments` VALUES (1,'09:30:00.250',1e16,2.25),(2,'11:00:00',2.25,1.234567)", dbName))
 
 	// Baseline Parquet at the initial state, in mydumper's text forms: TIME
-	// padded to the declared fsp, DOUBLE as MySQL renders it.
+	// padded to the declared fsp, DOUBLE/FLOAT as MySQL renders them.
 	baselineDir := t.TempDir()
 	now := time.Now().UTC()
 	curHour := now.Truncate(time.Hour)
@@ -835,11 +850,12 @@ func TestVerifyTable_TimeFspAndFloatText_IsAMatch(t *testing.T) {
 	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
 		t.Fatalf("mkdir baseline: %v", err)
 	}
-	createSQL := "CREATE TABLE `appointments` (\n  `id` INT NOT NULL,\n  `start` TIME(3),\n  `factor` DOUBLE,\n  PRIMARY KEY (`id`)\n);\n"
+	createSQL := "CREATE TABLE `appointments` (\n  `id` INT NOT NULL,\n  `start` TIME(3),\n  `factor` DOUBLE,\n  `gauge` FLOAT,\n  PRIMARY KEY (`id`)\n);\n"
 	cols := []baseline.Column{
 		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
 		{Name: "start", MySQLType: "time", ParquetType: baseline.MysqlToParquetNode("time")},
 		{Name: "factor", MySQLType: "double", ParquetType: baseline.MysqlToParquetNode("double")},
+		{Name: "gauge", MySQLType: "float", ParquetType: baseline.MysqlToParquetNode("float")},
 	}
 	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "appointments.parquet"), cols,
 		baseline.WriterConfig{Compression: "zstd", RowGroupSize: 100,
@@ -847,11 +863,14 @@ func TestVerifyTable_TimeFspAndFloatText_IsAMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
+	// Row 2's baseline gauge (2.25, mydumper text) is superseded by the
+	// in-window event's row_after below (last-write-wins) — its exact value
+	// here is irrelevant to the final reconstructed state.
 	for _, row := range [][]string{
-		{"1", "09:30:00.250", "1e16"},
-		{"2", "10:30:00.000", "2.25"},
+		{"1", "09:30:00.250", "1e16", "2.25"},
+		{"2", "10:30:00.000", "2.25", "2.25"},
 	} {
-		if err := bw.WriteRow(row, []bool{false, false, false}); err != nil {
+		if err := bw.WriteRow(row, []bool{false, false, false, false}); err != nil {
 			t.Fatalf("WriteRow: %v", err)
 		}
 	}
@@ -864,8 +883,8 @@ func TestVerifyTable_TimeFspAndFloatText_IsAMatch(t *testing.T) {
 	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
 	ts1 := now.Add(-2 * time.Minute).Format("2006-01-02 15:04:05")
 	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, dbName, "appointments", 2 /*UPDATE*/, "2", nil,
-		[]byte(`{"id":2,"start":"10:30:00","factor":2.25}`),
-		[]byte(`{"id":2,"start":"11:00:00","factor":2.25}`))
+		[]byte(`{"id":2,"start":"10:30:00","factor":2.25,"gauge":2.25}`),
+		[]byte(`{"id":2,"start":"11:00:00","factor":2.25,"gauge":1.234567}`))
 
 	var uuid string
 	if err := db.QueryRow("SELECT @@server_uuid").Scan(&uuid); err != nil {
