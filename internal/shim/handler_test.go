@@ -1604,6 +1604,77 @@ func TestRunFullTableEnforcesCostCap(t *testing.T) {
 	}
 }
 
+// TestRunFullTable_Limit exercises the #997 LIMIT interaction on the binlog-only
+// full-table _flashback path (runFullTable), which is distinct code from the
+// _snapshot buffered LIMIT: a LIMIT at or below the cap bounds the fetch so the
+// query SUCCEEDS instead of tripping the cap, and a LIMIT above the cap keeps the
+// cap+1 overflow probe (a LIMIT never raises the cap). sqlmock returns exactly
+// what the real fetch would for the given Limit, since it doesn't honour the SQL
+// LIMIT clause itself.
+func TestRunFullTable_Limit(t *testing.T) {
+	run := func(t *testing.T, cap, limit, nRows int) (*gomysql.Result, error) {
+		t.Helper()
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		mock.MatchExpectationsInOrder(false)
+		mock.ExpectQuery("information_schema.PARTITIONS").
+			WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME", "PARTITION_DESCRIPTION"}))
+		rows := sqlmock.NewRows(binlogEventsColumns())
+		now := time.Now().UTC()
+		for i := 0; i < nRows; i++ {
+			rows.AddRow(
+				int64(i+1), "binlog.000001", int64(100), int64(200), now,
+				nil, nil, "myapp", "orders", parser.EventInsert,
+				fmt.Sprintf("%d", i+1), nil, nil,
+				fmt.Sprintf(`{"id":%d,"sku":"X"}`, i+1), 0, nil, nil,
+			)
+		}
+		mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
+		h := &Handler{
+			indexDB: db,
+			cfg: Config{AllowGaps: true, IndexDBName: "bintrail_index",
+				NoArchive: true, FullTableRowCap: cap},
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			archiveFetcher: func(ctx context.Context, _ query.Options, _ string) ([]query.ResultRow, error) {
+				return nil, nil
+			},
+		}
+		h.UseDB("myapp")
+		return h.runFullTable(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "orders", AsOf: now, Limit: limit,
+		})
+	}
+
+	t.Run("under_cap_succeeds", func(t *testing.T) {
+		res, err := run(t, 3, 2, 2) // LIMIT 2 <= cap 3 → fetch bounds to 2, no cap error
+		if err != nil {
+			t.Fatalf("LIMIT under cap should succeed, got %v", err)
+		}
+		if n := len(res.Resultset.RowDatas); n != 2 {
+			t.Errorf("rows = %d, want 2", n)
+		}
+	})
+	t.Run("at_cap_succeeds", func(t *testing.T) {
+		res, err := run(t, 3, 3, 3) // LIMIT == cap boundary → capped=false path
+		if err != nil {
+			t.Fatalf("LIMIT == cap should succeed, got %v", err)
+		}
+		if n := len(res.Resultset.RowDatas); n != 3 {
+			t.Errorf("rows = %d, want 3", n)
+		}
+	})
+	t.Run("above_cap_trips_cap", func(t *testing.T) {
+		_, err := run(t, 3, 5, 4) // LIMIT 5 > cap 3 → probe cap+1=4 → overflow
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_TOO_BIG_SELECT {
+			t.Fatalf("LIMIT above cap must trip ER_TOO_BIG_SELECT (a LIMIT never raises the cap); got %v", err)
+		}
+	})
+}
+
 // TestNewHandlerDefaultIsStrict pins the library-side counterpart of the
 // CLI default-pin in cmd/bintrail/shim_test.go: NewHandler must return a
 // Handler configured with AllowGaps=false. The CLI builds Config directly

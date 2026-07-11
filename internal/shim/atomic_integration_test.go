@@ -94,3 +94,57 @@ func TestRunPointInTime_TransactionAtomicCut(t *testing.T) {
 		}
 	})
 }
+
+// TestRunPointInTime_EmptyStringPK pins the #988 empty-PKValue split: a legit
+// `WHERE k = ''` against a NOT-NULL string PK must stay row-scoped via
+// PKValuesIn. A regression that let Options.PKValues == "" DISABLE the PK filter
+// (buildQuery's behaviour) would fold every event for the whole table onto one
+// state — here that would return the OTHER row's latest image instead of the
+// empty-key row's own.
+func TestRunPointInTime_EmptyStringPK(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	ts := snapTime.UTC().Format("2006-01-02 15:04:05")
+	// myapp.kv with a single-column string PK 'k'.
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "kv", "k", 1, "PRI", "varchar", "NO")
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "kv", "v", 2, "", "varchar", "YES")
+
+	fmtTS := func(x time.Time) string { return x.Format("2006-01-02 15:04:05") }
+	t0 := hourTop.Add(2 * time.Minute)
+	t1 := hourTop.Add(5 * time.Minute)
+	asOf := hourTop.Add(9 * time.Minute)
+
+	// pk_values is the single-column value verbatim: "" for k='', "other" for k='other'.
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, fmtTS(t0), nil,
+		"myapp", "kv", 1 /*insert*/, "", nil, nil, []byte(`{"k":"","v":"empty"}`))
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 200, 300, fmtTS(t0), nil,
+		"myapp", "kv", 1 /*insert*/, "other", nil, nil, []byte(`{"k":"other","v":"x"}`))
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 300, 400, fmtTS(t1), nil,
+		"myapp", "kv", 2 /*update*/, "other", nil,
+		[]byte(`{"k":"other","v":"x"}`), []byte(`{"k":"other","v":"x2"}`))
+
+	h := NewHandlerWithConfig(db, Config{AllowGaps: true, NoArchive: true, IndexDBName: dbName}, slog.Default())
+	res, err := h.runPointInTime(TimeTravelQuery{
+		Type: TypeFlashback, Schema: "myapp", Table: "kv", AsOf: asOf, PKColumn: "k", PKValue: "",
+	})
+	if err != nil {
+		t.Fatalf("runPointInTime: %v", err)
+	}
+	cells := rowCells(t, res.Resultset)
+	if len(cells) != 1 {
+		t.Fatalf("got %d rows, want exactly 1 (the empty-key row): %v", len(cells), cells)
+	}
+	// v is the discriminator: the empty-key row is "empty"; a disabled filter
+	// would fold the whole table and surface the 'other' row's latest ("x2").
+	if cells[0][1] != "empty" {
+		t.Errorf("WHERE k = '' returned %v, want v=\"empty\" — a disabled PK filter would return the 'other' row (\"x2\")", cells[0])
+	}
+}

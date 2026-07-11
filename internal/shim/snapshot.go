@@ -250,12 +250,21 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	// changes) — the `changes` map above — not O(table size), and the
 	// FullTableRowCap ceiling is lifted. A LIMIT keeps the bounded buffered path
 	// below (cheap browse); an unbound handler (unit tests, embedders that never
-	// call BindConn) also stays buffered. ddlOrder must be resolvable to fix the
-	// streamed column set before the first row; if it isn't, fall through to the
-	// buffered path (which derives columns from the images it has).
-	ddlOrder := h.columnOrderFor(q.Schema, q.Table)
-	if h.conn != nil && q.Limit == 0 && len(ddlOrder) > 0 {
-		return h.streamSnapshotFullTable(ctx, q, input, ddlOrder)
+	// call BindConn) also stays buffered.
+	//
+	// The streamed column set is fixed before the first row (the header must
+	// precede any row): the user's explicit projection verbatim when given (#313,
+	// matching the buffered imagesToResultVerbatim — a projected full-table query
+	// streams too, since a projection doesn't change the row count), else the
+	// table's newest-snapshot order. When neither is resolvable (empty projection
+	// is impossible; nil snapshot), fall through to the buffered path, which
+	// derives columns from the images it has.
+	streamCols := q.Columns
+	if streamCols == nil {
+		streamCols = h.columnOrderFor(q.Schema, q.Table)
+	}
+	if h.conn != nil && q.Limit == 0 && len(streamCols) > 0 {
+		return h.streamSnapshotFullTable(ctx, q, input, streamCols)
 	}
 
 	rowCap := h.cfg.FullTableRowCap
@@ -279,6 +288,13 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	// widens — "0.10000000149011612" vs the event side's "0.1"), and a baseline
 	// BIGINT UNSIGNED > 2^63 can't round-trip (baseline stores bigint as signed
 	// Int64). Stop at cap+1 so overflow is detectable.
+	// Residual unchanged-TOAST markers (#592) are caught upstream by
+	// SnapshotFullTableImages' checkChangesToast on the delta events (baseline
+	// rows can't carry a marker), NOT by buildImagesResult below: fullTableTextCell
+	// coerces every cell to text first, so a marker would already be a []byte by
+	// the time buildImagesResult's IsUnchangedToastMarker check runs and never
+	// match. Keep the upstream guard — the streaming sibling (projectCell) checks
+	// the raw value instead, which is the pattern to prefer.
 	images := make([]map[string]any, 0)
 	err = reconstruct.SnapshotFullTableImages(ctx, input, func(rowMap map[string]any) error {
 		img := make(map[string]any, len(rowMap))
@@ -313,13 +329,18 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 
 // streamSnapshotFullTable streams a full-table _snapshot resultset row-by-row
 // over the bound connection (#998), lifting the FullTableRowCap for the
-// baseline-merge path. It projects every merged row onto ddlOrder — the table's
-// newest snapshot column order — as a FIXED column set decided before the first
-// row, because the streaming header must be written before any row is seen. A
-// column dropped between AS OF and now (present in a row image but absent from
-// the current snapshot — the #600 case) is therefore NOT surfaced on the
-// streaming path; a LIMIT'd (buffered) query still surfaces it. Keys missing
-// from a row render as NULL, matching a real SELECT * over the current schema.
+// baseline-merge path. It projects every merged row onto cols — a FIXED column
+// set decided before the first row (the streaming header must be written before
+// any row is seen): the user's explicit projection when given (verbatim, like
+// imagesToResultVerbatim), else the table's newest-snapshot order. Keys missing
+// from a row render as NULL.
+//
+// SELECT * caveat: for the newest-snapshot column set, a column dropped between
+// AS OF and now (present in a row image but absent from the current snapshot —
+// the #600 case) is NOT surfaced on the streaming path, because the fixed set
+// can't append per-row image-only keys the way the buffered fullTableColumns
+// does; a LIMIT'd (buffered) SELECT * still surfaces it. An explicit projection
+// is unaffected — imagesToResultVerbatim never appends image-only keys either.
 //
 // Errors: reconstruct.SnapshotFullTableImages runs its TOAST / PK-changing-
 // UPDATE guards before materialising the baseline and emits nothing until the
@@ -327,11 +348,11 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 // first-packet ERR). A failure once rows are already on the wire returns an
 // error that go-mysql renders as an ERR packet mid-resultset — the client sees
 // no terminating EOF and reads it as an unambiguous failure (see streamWriter).
-func (h *Handler) streamSnapshotFullTable(ctx context.Context, q TimeTravelQuery, input reconstruct.SnapshotFullTableInput, ddlOrder []string) (*mysql.Result, error) {
-	sw := newStreamWriter(h.conn, ddlOrder)
-	cells := make([]any, len(ddlOrder)) // reused per row; writeRow encodes synchronously
+func (h *Handler) streamSnapshotFullTable(ctx context.Context, q TimeTravelQuery, input reconstruct.SnapshotFullTableInput, cols []string) (*mysql.Result, error) {
+	sw := newStreamWriter(h.conn, cols)
+	cells := make([]any, len(cols)) // reused per row; writeRow encodes synchronously
 	err := reconstruct.SnapshotFullTableImages(ctx, input, func(rowMap map[string]any) error {
-		for i, c := range ddlOrder {
+		for i, c := range cols {
 			v, cerr := h.projectCell(q.Schema, q.Table, c, rowMap[c])
 			if cerr != nil {
 				return cerr
@@ -605,9 +626,12 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		// Refusing beats serving the marker's JSON as the column value.
 		return nil, err
 	}
-	if state == nil {
-		// Either the row never existed at AsOf (no baseline image and no
-		// INSERT in the window) or its latest event was a DELETE.
+	if len(state) == 0 {
+		// Either the row never existed at AsOf (no baseline image and no INSERT
+		// in the window) or its latest event was a DELETE. A non-DELETE tail that
+		// folds to empty is a corrupt/partial row image — surfaced as a Warn, not
+		// silently (mirrors runPointInTime).
+		h.warnCorruptImageDrop(q.Schema, q.Table, rows)
 		return emptyResult(), nil
 	}
 

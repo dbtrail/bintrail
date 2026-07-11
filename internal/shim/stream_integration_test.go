@@ -208,4 +208,68 @@ func TestStreamSnapshotFullTable_OverWire(t *testing.T) {
 			t.Fatal("LIMIT 2 above cap 1 should trip ER_TOO_BIG_SELECT, got no error")
 		}
 	})
+
+	t.Run("column_list_streams_verbatim_projection", func(t *testing.T) {
+		// A column list on the LIMIT-less full-table shape must STREAM the
+		// requested columns only — not the full ddlOrder. Under cap=1 this also
+		// proves the projected query still streams (uncapped): a regression that
+		// fell back to the buffered path would trip ER_TOO_BIG_SELECT.
+		cols, data, err := queryShim(t, addr, "myapp", "SELECT id FROM _snapshot.users AS OF '"+asOfStr+"'")
+		if err != nil {
+			t.Fatalf("projected full-table _snapshot failed over the wire: %v", err)
+		}
+		if !slices.Equal(cols, []string{"id"}) {
+			t.Errorf("columns = %v, want [id] (projection must not stream all of ddlOrder)", cols)
+		}
+		ids := make(map[string]bool, len(data))
+		for _, r := range data {
+			ids[r[0]] = true
+		}
+		if len(data) != 3 || !ids["1"] || !ids["2"] || !ids["4"] {
+			t.Errorf("projected ids = %v, want the 3 live rows {1,2,4}", data)
+		}
+	})
+}
+
+// TestStreamSnapshotFullTable_EmptyOverWire pins the empty-resultset streaming
+// path over a real client: a full-table _snapshot whose rows are all deleted by
+// the AS OF instant must send a well-formed zero-row resultset (column
+// definitions + terminating EOF, no rows), not a malformed or hung response.
+func TestStreamSnapshotFullTable_EmptyOverWire(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+	asOfStr := asOf.Format("2006-01-02 15:04:05")
+
+	seedUsersSnapshot(t, db, snapTime)
+	// Baseline has one row; it is deleted before AS OF → zero live rows.
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "users", usersBaselineCols(), [][]string{
+		{"1", "alice"},
+	})
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "users", 3 /*delete*/, "1", nil,
+		[]byte(`{"id":1,"name":"alice"}`), nil)
+
+	cfg := Config{AllowGaps: true, NoArchive: true, IndexDBName: dbName, BaselineDir: baselineDir}
+	addr := startShimServer(t, db, cfg, "myapp")
+
+	cols, data, err := queryShim(t, addr, "myapp", "SELECT * FROM _snapshot.users AS OF '"+asOfStr+"'")
+	if err != nil {
+		t.Fatalf("empty streamed full-table _snapshot failed over the wire: %v", err)
+	}
+	if !slices.Equal(cols, []string{"id", "name"}) {
+		t.Errorf("columns = %v, want [id name] even for an empty result", cols)
+	}
+	if len(data) != 0 {
+		t.Errorf("expected zero rows (all deleted by AS OF), got %v", data)
+	}
 }

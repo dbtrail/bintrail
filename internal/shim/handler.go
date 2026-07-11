@@ -619,7 +619,9 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	}
 	if len(image) == 0 {
 		// Row never existed at AsOf (no event in the window), or its latest
-		// surviving event was a DELETE.
+		// surviving event was a DELETE. A non-DELETE tail that folds to empty is
+		// a corrupt/partial row image — surfaced as a Warn, not silently.
+		h.warnCorruptImageDrop(q.Schema, q.Table, rows)
 		return emptyResult(), nil
 	}
 	// When q.Columns is set (#313 user-supplied projection), bypass
@@ -1478,6 +1480,25 @@ func (h *Handler) epochResolver(id int) (*metadata.Resolver, error) {
 	}
 	h.epochResolvers[id] = r
 	return r, nil
+}
+
+// warnCorruptImageDrop logs when a single-row time-travel fold collapsed to an
+// empty state even though the latest surviving event for the PK was NOT a
+// DELETE — i.e. a non-DELETE event carried an empty row image (corrupt/partial
+// index, or a non-FULL binlog_row_image capture that `index` should have
+// refused). Without this the row is silently returned as "did not exist at
+// AsOf," indistinguishable from a real DELETE. Mirrors the sibling signals in
+// reconstruct.applyEvent (NULL event_type) and mergeBaselineImages (nil
+// RowAfter on INSERT/UPDATE). No-op for the legitimate empty cases: no events
+// at all, or a DELETE tail.
+func (h *Handler) warnCorruptImageDrop(schema, table string, rows []query.ResultRow) {
+	n := len(rows)
+	if n == 0 || rows[n-1].EventType == event.EventDelete {
+		return
+	}
+	h.logger.Warn("shim: single-row time-travel folded to an empty state though the latest event was not a DELETE (corrupt or partial row image?) — returning an empty resultset",
+		"schema", schema, "table", table,
+		"event_type", rows[n-1].EventType, "event_id", rows[n-1].EventID)
 }
 
 // runDiff resolves a _diff query: every event for the given PK
