@@ -75,6 +75,13 @@ func (h *Handler) baselineSource() string {
 // it is converted to ER_TOO_BIG_SELECT, mirroring runFullTable's cap path.
 var errFullTableCapExceeded = errors.New("full-table snapshot row cap exceeded")
 
+// errLimitReached short-circuits the buffered full-table merge once a user's
+// LIMIT (#997) has been satisfied. Like errFullTableCapExceeded it never
+// escapes runSnapshotFullTable — but it is a SUCCESS signal (the images slice
+// is already truncated to the LIMIT), distinct from the cap error, so it must
+// be checked before the cap-error translation.
+var errLimitReached = errors.New("full-table snapshot LIMIT reached")
+
 // runSnapshotFullTable resolves a full-table (no-WHERE) _snapshot query by
 // merging the baseline snapshot at-or-before AsOf with the post-snapshot
 // binlog deltas across the whole table (#362). The result is the table's true
@@ -225,6 +232,32 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		changes[rows[i].PKValues] = &rows[i]
 	}
 
+	input := reconstruct.SnapshotFullTableInput{
+		BaselinePath: baselinePath,
+		Schema:       q.Schema,
+		Table:        q.Table,
+		PKCols:       pkCols,
+		Changes:      changes,
+		// rows was fetched LimitPerPK=1, so it is already collapsed to the latest
+		// event per PK; hand it to the #782 guard anyway (authoritative over what
+		// was fetched), bounded by that fetch (see pkChangingUpdateInEvents).
+		Events: rows,
+	}
+
+	// #998: with a bound connection and no LIMIT, stream the merged rows straight
+	// to the wire. The baseline (potentially millions of rows) flows through the
+	// DuckDB merge cursor one row at a time, so peak shim memory is O(post-baseline
+	// changes) — the `changes` map above — not O(table size), and the
+	// FullTableRowCap ceiling is lifted. A LIMIT keeps the bounded buffered path
+	// below (cheap browse); an unbound handler (unit tests, embedders that never
+	// call BindConn) also stays buffered. ddlOrder must be resolvable to fix the
+	// streamed column set before the first row; if it isn't, fall through to the
+	// buffered path (which derives columns from the images it has).
+	ddlOrder := h.columnOrderFor(q.Schema, q.Table)
+	if h.conn != nil && q.Limit == 0 && len(ddlOrder) > 0 {
+		return h.streamSnapshotFullTable(ctx, q, input, ddlOrder)
+	}
+
 	rowCap := h.cfg.FullTableRowCap
 	if rowCap <= 0 {
 		rowCap = defaultFullTableRowCap
@@ -247,38 +280,70 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	// BIGINT UNSIGNED > 2^63 can't round-trip (baseline stores bigint as signed
 	// Int64). Stop at cap+1 so overflow is detectable.
 	images := make([]map[string]any, 0)
-	err = reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
-		BaselinePath: baselinePath,
-		Schema:       q.Schema,
-		Table:        q.Table,
-		PKCols:       pkCols,
-		Changes:      changes,
-		// rows was fetched LimitPerPK=1, so it is already collapsed to the latest
-		// event per PK; hand it to the #782 guard anyway (authoritative over what
-		// was fetched), bounded by that fetch (see pkChangingUpdateInEvents).
-		Events: rows,
-	}, func(rowMap map[string]any) error {
+	err = reconstruct.SnapshotFullTableImages(ctx, input, func(rowMap map[string]any) error {
 		img := make(map[string]any, len(rowMap))
 		for k, v := range rowMap {
 			img[k] = h.fullTableTextCell(q.Schema, q.Table, k, v)
 		}
 		images = append(images, img)
+		// Cap FIRST — a LIMIT never RAISES the cap (#997): overflow past rowCap
+		// aborts, and only then does a LIMIT at or below rowCap stop the merge
+		// early via the success sentinel, so the browse succeeds instead of
+		// tripping the cap.
 		if len(images) > rowCap {
 			return errFullTableCapExceeded
 		}
+		if q.Limit > 0 && len(images) >= q.Limit {
+			return errLimitReached
+		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, errLimitReached) {
 		if errors.Is(err, errFullTableCapExceeded) {
 			return nil, mysql.NewError(mysql.ER_TOO_BIG_SELECT, fmt.Sprintf(
-				"resolve %s: %s.%s at %s would return more than %d rows; narrow the AS OF range or filter by PK",
-				q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), rowCap,
+				"resolve %s: %s.%s at %s would return more than %d rows; add a LIMIT (e.g. LIMIT %d) to browse, narrow the AS OF range or filter by PK",
+				q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), rowCap, rowCap,
 			))
 		}
 		return nil, err
 	}
 
 	return h.fullTableResult(q, images)
+}
+
+// streamSnapshotFullTable streams a full-table _snapshot resultset row-by-row
+// over the bound connection (#998), lifting the FullTableRowCap for the
+// baseline-merge path. It projects every merged row onto ddlOrder — the table's
+// newest snapshot column order — as a FIXED column set decided before the first
+// row, because the streaming header must be written before any row is seen. A
+// column dropped between AS OF and now (present in a row image but absent from
+// the current snapshot — the #600 case) is therefore NOT surfaced on the
+// streaming path; a LIMIT'd (buffered) query still surfaces it. Keys missing
+// from a row render as NULL, matching a real SELECT * over the current schema.
+//
+// Errors: reconstruct.SnapshotFullTableImages runs its TOAST / PK-changing-
+// UPDATE guards before materialising the baseline and emits nothing until the
+// merge starts, so a setup failure returns before any wire write (a clean
+// first-packet ERR). A failure once rows are already on the wire returns an
+// error that go-mysql renders as an ERR packet mid-resultset — the client sees
+// no terminating EOF and reads it as an unambiguous failure (see streamWriter).
+func (h *Handler) streamSnapshotFullTable(ctx context.Context, q TimeTravelQuery, input reconstruct.SnapshotFullTableInput, ddlOrder []string) (*mysql.Result, error) {
+	sw := newStreamWriter(h.conn, ddlOrder)
+	cells := make([]any, len(ddlOrder)) // reused per row; writeRow encodes synchronously
+	err := reconstruct.SnapshotFullTableImages(ctx, input, func(rowMap map[string]any) error {
+		for i, c := range ddlOrder {
+			v, cerr := h.projectCell(q.Schema, q.Table, c, rowMap[c])
+			if cerr != nil {
+				return cerr
+			}
+			cells[i] = v
+		}
+		return sw.writeRow(cells)
+	})
+	if err != nil {
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
+	}
+	return sw.finish()
 }
 
 // pkColumnMetas returns the primary-key column metas of schema.table from its

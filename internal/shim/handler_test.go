@@ -592,95 +592,14 @@ func TestOrderColumnsEdgeCases(t *testing.T) {
 // non-DELETE events, or that reintroduces the row_before fallback for
 // DELETE (issue #287 regression), would silently return wrong row
 // state to the customer. The "delete_*" cases are the tripwires.
-func TestSelectImage(t *testing.T) {
-	after := map[string]any{"id": int64(1), "name": "after"}
-	before := map[string]any{"id": int64(1), "name": "before"}
-
-	cases := []struct {
-		name string
-		rows []query.ResultRow
-		want map[string]any
-	}{
-		{
-			name: "empty_input",
-			rows: nil,
-			want: nil,
-		},
-		{
-			name: "insert_returns_row_after",
-			rows: []query.ResultRow{{
-				EventType: parser.EventInsert,
-				RowAfter:  after,
-			}},
-			want: after,
-		},
-		{
-			name: "update_prefers_row_after",
-			rows: []query.ResultRow{{
-				EventType: parser.EventUpdate,
-				RowBefore: before,
-				RowAfter:  after,
-			}},
-			want: after,
-		},
-		{
-			// #287: a DELETE means the row did not exist at AsOf.
-			// Returning RowBefore here would resurrect the row for
-			// any AS OF after the deletion — the bug the issue
-			// describes. The Oracle AS OF semantic the docs already
-			// advertise (docs/time-travel-sql.md:242) demands nil.
-			name: "delete_returns_nil",
-			rows: []query.ResultRow{{
-				EventType: parser.EventDelete,
-				RowBefore: before,
-			}},
-			want: nil,
-		},
-		{
-			// Pin the len() > 0 vs != nil distinction on the
-			// non-DELETE fallback path. A future refactor that
-			// swapped len() for a nil-check would silently regress
-			// UPDATE handling if the indexer ever emitted an empty
-			// non-nil RowAfter (defensive map allocation upstream,
-			// redaction blanking every column, etc.). The DELETE
-			// cases don't cover this anymore — they short-circuit
-			// before reaching the image-presence checks.
-			name: "update_row_after_empty_map_falls_back_to_row_before",
-			rows: []query.ResultRow{{
-				EventType: parser.EventUpdate,
-				RowAfter:  map[string]any{},
-				RowBefore: before,
-			}},
-			want: before,
-		},
-		{
-			name: "both_empty_returns_nil",
-			rows: []query.ResultRow{{
-				EventType: parser.EventUpdate,
-				RowBefore: map[string]any{},
-				RowAfter:  map[string]any{},
-			}},
-			want: nil,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := selectImage(tc.rows)
-			if !equalMaps(got, tc.want) {
-				t.Errorf("selectImage = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
 // TestExtractFullTableImages pins the two skip rules of the
 // full-table reconstruction path (#276): DELETE events are dropped
 // (the row did not exist at AS OF) and INSERTs with a nil row_after
 // are dropped (corrupted index — emitting an all-null phantom row
-// would overstate the table's row count). selectImage shares the
-// DELETE-skip rule since #287; that convergence is asserted by
-// TestSelectImage's delete_returns_nil case.
+// would overstate the table's row count). The single-row _flashback
+// path shares the DELETE-skip rule through reconstruct.ApplyAt (a
+// DELETE folds to a nil state, #988), replacing the old selectImage
+// helper.
 func TestExtractFullTableImages(t *testing.T) {
 	deleteRow := query.ResultRow{
 		EventType: parser.EventDelete,
@@ -1972,25 +1891,6 @@ func driveClient(addr, user, password string) error {
 	return nil
 }
 
-// equalMaps compares two map[string]any by length and value identity
-// (==). Sufficient for the selectImage tests because they intentionally
-// pass the same map literal as both input and expected output, so a
-// pointer-equal value comparison detects "did selectImage return the
-// expected source map?". Returning a *different* map with equal contents
-// would fail this check — which is the correct outcome, since the
-// helper's contract is to hand back the input image unchanged, not a
-// copy.
-func equalMaps(a, b map[string]any) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, va := range a {
-		if vb, ok := b[k]; !ok || va != vb {
-			return false
-		}
-	}
-	return true
-}
 
 // recordingHandler is a minimal slog.Handler that captures every
 // emitted record into an in-memory slice. Used by tests that need

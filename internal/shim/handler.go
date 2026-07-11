@@ -23,6 +23,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 // showTablesFromVirtualRE matches the interactive `SHOW [FULL] TABLES
@@ -130,6 +131,14 @@ type Handler struct {
 	// disconnect or daemon shutdown aborts in-flight fetches. nil means
 	// context.Background() (unit tests, pre-#823 embedders).
 	baseCtx context.Context
+
+	// conn, when non-nil, lets the full-table _snapshot path stream its
+	// resultset row-by-row over the wire instead of buffering it and tripping
+	// FullTableRowCap (#998). Bound by BindConn after the server.Conn is
+	// constructed (per connection). nil — unit tests, or any embedder that
+	// never calls BindConn — keeps the bounded buffered+cap path, so streaming
+	// is strictly opt-in and cannot change behaviour for an unbound handler.
+	conn packetWriter
 
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
@@ -348,6 +357,16 @@ func (h *Handler) BindConnContext(ctx context.Context) {
 	h.baseCtx = ctx
 }
 
+// BindConn ties this Handler to the MySQL connection it serves so the
+// full-table _snapshot path can stream its resultset row-by-row (#998) rather
+// than buffering it into a *mysql.Result and tripping FullTableRowCap. Call
+// once, right after the server.Conn is constructed and before serving commands
+// (the Handler is per-connection, dispatched from one goroutine, so no lock is
+// needed). Handlers that never bind a conn keep the bounded buffered+cap path.
+func (h *Handler) BindConn(conn packetWriter) {
+	h.conn = conn
+}
+
 // queryContext derives the context every run* entry point uses for one
 // query (#823): rooted at the connection context (BindConnContext) so
 // client disconnect / shutdown cancels it, with cfg.QueryTimeout as the
@@ -513,9 +532,12 @@ func (h *Handler) fullTableGateError(qType QueryType, err error) error {
 // bintrail index + archives and reconstructs the row's state at q.AsOf.
 //
 // Two shapes are recognised, sharing this entry point:
-//   - q.PKColumn != "": single-row point-lookup. Returns the latest
-//     INSERT/UPDATE post-image, or an empty resultset when the latest
-//     event at-or-before AsOf is a DELETE.
+//   - q.PKColumn != "": single-row point-lookup. Folds the PK's event
+//     sequence up to AsOf onto its state, returning the row's image at AsOf
+//     (or an empty resultset when the latest surviving event is a DELETE).
+//     The cut is at the TRANSACTION boundary, not the row (#988): a
+//     multi-statement transaction straddling AsOf is excluded whole rather
+//     than half-applied — the same #783 fix the single-row _snapshot path uses.
 //   - q.PKColumn == "": full-table reconstruction (issue #276).
 //     Dispatches to runFullTable.
 //
@@ -541,42 +563,63 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	ctx, cancel := h.queryContext()
 	defer cancel()
 
-	// LimitPerPK=1 (not Limit=1) is the right knob: query.Engine emits
-	// the global result-set in ASC order by (event_timestamp, event_id),
-	// so a plain Limit=1 would return the *earliest* event in the
-	// time window, not the latest. LimitPerPK uses an inner
-	// ROW_NUMBER OVER (PARTITION BY pk_values ORDER BY event_timestamp
-	// DESC, event_id DESC) so the kept event for each PK is the most
-	// recent one — exactly what _flashback "row state at AsOf" needs.
-	// q.PKValue is the raw, MySQL-unescaped literal value (stripQuotes /
-	// unescapeStringLiteral, #826). Options.PKValues is matched against
-	// binlog_events.pk_values, which is stored in event.BuildPKValues-encoded
-	// form (backslash/pipe escaped). Re-encode with event.EscapePKValue here
-	// so a backslash- or pipe-containing PK still matches instead of
-	// silently missing (#826 follow-up).
+	// Fetch the PK's full ordered event sequence up to AsOf and cut it at the
+	// TRANSACTION boundary, not the row (#988). event_timestamp is a
+	// statement's execution time, so a plain LimitPerPK=1 could surface the
+	// latest event of a multi-statement transaction that had not fully
+	// committed as of AsOf — a row state that never existed at AsOf.
+	// reconstruct.FetchEventsAtomic (the #783 machinery the single-row
+	// _snapshot path already uses) drops a straddling trailing transaction
+	// whole, and reconstruct.ApplyAt folds the surviving events (INSERT/UPDATE
+	// → row_after, DELETE → deleted) onto the state at AsOf. No LimitPerPK: the
+	// fold needs the sequence, and trimming a single LimitPerPK=1 row would
+	// leave nothing to fall back to. The fetch is one-PK-scoped, so its size is
+	// bounded by how often this row changed in the retained window — the same
+	// bound _diff and the single-row _snapshot path already accept.
+	opts := query.Options{
+		Schema: q.Schema,
+		Table:  q.Table,
+		Until:  &q.AsOf,
+	}
+	// q.PKValue may legitimately be "" (`WHERE name = ''` against a NOT-NULL
+	// string PK). buildQuery DISABLES the PK filter when Options.PKValues == "",
+	// which would fold every event for the WHOLE TABLE onto one state — a silent
+	// wrong answer. Route "" through PKValuesIn (`pk_values IN (?)`), which keeps
+	// the fetch scoped to the one row; keep the pk_hash fast path otherwise.
+	// Mirrors runSnapshotPointInTime. q.PKValue is raw/unescaped (#826);
+	// pk_values is event.BuildPKValues-encoded, so re-encode with EscapePKValue.
+	encoded := event.EscapePKValue(q.PKValue)
+	if q.PKValue != "" {
+		opts.PKValues = encoded
+	} else {
+		opts.PKValuesIn = []string{encoded}
+	}
 	engine := query.New(h.indexDB)
-	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
-		Opts: query.Options{
-			Schema:     q.Schema,
-			Table:      q.Table,
-			PKValues:   event.EscapePKValue(q.PKValue),
-			Until:      &q.AsOf,
-			LimitPerPK: 1,
-		},
+	rows, _, err := reconstruct.FetchEventsAtomic(ctx, h.indexDB, engine, query.FetchMergedOptions{
+		Opts:           opts,
 		DBName:         h.cfg.IndexDBName,
 		NoArchive:      h.cfg.NoArchive,
 		AllowGaps:      h.cfg.AllowGaps,
 		ArchiveFetcher: h.archiveFetcher,
-	})
+	}, q.AsOf)
 	if err != nil {
 		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 
-	// ENUM/SET ordinals → labels (#472/#475), so the historical row
-	// renders the way the live table did when the event happened.
+	// ENUM/SET ordinals → labels (#472/#475) BEFORE the fold: ApplyAt replaces
+	// the image wholesale per event, so pre-mapped events make the final state
+	// carry labels the way the live table did when the event happened.
 	h.mapEventImages(q.Schema, q.Table, rows)
-	image := selectImage(rows)
-	if image == nil {
+	image, err := reconstruct.ApplyAt(nil, rows, q.AsOf)
+	if err != nil {
+		// Residual unchanged-TOAST marker (#592) — a capture-invariant
+		// violation, i.e. a server-side data fault: plain error →
+		// ER_UNKNOWN_ERROR (1105). Refusing beats serving the marker's JSON.
+		return nil, err
+	}
+	if len(image) == 0 {
+		// Row never existed at AsOf (no event in the window), or its latest
+		// surviving event was a DELETE.
 		return emptyResult(), nil
 	}
 	// When q.Columns is set (#313 user-supplied projection), bypass
@@ -746,6 +789,21 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 		cap = defaultFullTableRowCap
 	}
 
+	// #997: a LIMIT at or below the cap bounds the fetch directly, so the query
+	// SUCCEEDS instead of tripping the cap — the "add a LIMIT to browse" remedy
+	// the cap error suggests. A LIMIT never RAISES the cap (conservative
+	// default): a LIMIT above the cap keeps the cap+1 overflow probe, so the
+	// binlog full-table path can never buffer more than the cap. This path
+	// stays buffered (unlike the streaming _snapshot path, #998) because
+	// query.FetchMerged materialises the whole fetch regardless — streaming the
+	// wire without a cursor-based fetch would only relocate the OOM.
+	fetchLimit := cap + 1
+	capped := true
+	if q.Limit > 0 && q.Limit <= cap {
+		fetchLimit = q.Limit
+		capped = false
+	}
+
 	engine := query.New(h.indexDB)
 	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
 		Opts: query.Options{
@@ -753,7 +811,7 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 			Table:      q.Table,
 			Until:      &q.AsOf,
 			LimitPerPK: 1,
-			Limit:      cap + 1,
+			Limit:      fetchLimit,
 		},
 		DBName:         h.cfg.IndexDBName,
 		NoArchive:      h.cfg.NoArchive,
@@ -764,10 +822,10 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 
-	if len(rows) > cap {
+	if capped && len(rows) > cap {
 		return nil, mysql.NewError(mysql.ER_TOO_BIG_SELECT, fmt.Sprintf(
-			"resolve %s: %s.%s at %s would return more than %d rows; narrow the AS OF range or filter by PK",
-			q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), cap,
+			"resolve %s: %s.%s at %s would return more than %d rows; add a LIMIT (e.g. LIMIT %d) to browse, narrow the AS OF range, or filter by PK",
+			q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), cap, cap,
 		))
 	}
 
@@ -1420,54 +1478,6 @@ func (h *Handler) epochResolver(id int) (*metadata.Resolver, error) {
 	}
 	h.epochResolvers[id] = r
 	return r, nil
-}
-
-// selectImage picks the row image that represents the row's state at
-// the queried point in time, given the LimitPerPK=1 result of a
-// _flashback / _snapshot fetch.
-//
-// The caller passes whatever FetchMerged returned. Because we issue
-// the fetch with LimitPerPK=1 and a single PKValues filter, at most
-// one row reaches this helper — but selectImage tolerates an empty
-// or larger slice and only ever inspects rows[0], so a future caller
-// that loosens the limit cannot accidentally pick the wrong event.
-//
-// Returns nil — meaning the caller responds with an empty resultset —
-// in three cases: (1) no rows, (2) the latest event is a DELETE
-// (the row did not exist at AsOf; matches docs/time-travel-sql.md's
-// Oracle AS OF semantic and the full-table path), (3) both images
-// are empty on an INSERT/UPDATE (corrupted index — treated as "no
-// answer" rather than fabricating one).
-//
-// For non-DELETE events, row_after wins when present (the post-image
-// is the row's state at the event — true for INSERT, UPDATE, and the
-// EventSnapshot baseline rows _snapshot will surface in a future
-// iteration). row_before is the fallback used only when row_after is
-// missing — a path the regular indexer pipeline doesn't exercise for
-// INSERT/UPDATE since marshalRow always emits row_after, but kept
-// defensively.
-//
-// Extracted as a pure helper specifically so the rule can be
-// unit-tested without spinning up a real MySQL: a future refactor
-// that reintroduced the row_before fallback for DELETE would silently
-// return stale data on every "what does this row look like AS OF
-// after its deletion?" query, with the regression invisible to any
-// test that doesn't exercise this exact branch.
-func selectImage(rows []query.ResultRow) map[string]any {
-	if len(rows) == 0 {
-		return nil
-	}
-	latest := rows[0]
-	if latest.EventType == event.EventDelete {
-		return nil
-	}
-	if len(latest.RowAfter) > 0 {
-		return latest.RowAfter
-	}
-	if len(latest.RowBefore) > 0 {
-		return latest.RowBefore
-	}
-	return nil
 }
 
 // runDiff resolves a _diff query: every event for the given PK

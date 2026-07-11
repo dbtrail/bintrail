@@ -2,6 +2,7 @@ package shim
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -55,6 +56,66 @@ func TestParseFlashbackFullTable(t *testing.T) {
 			if q.PKColumn != "" || q.PKValue != "" {
 				t.Errorf("PKColumn/PKValue must be empty for full-table shape; got col=%q val=%q",
 					q.PKColumn, q.PKValue)
+			}
+		})
+	}
+}
+
+// TestParseAsOfLimit covers the optional trailing LIMIT clause on the
+// _flashback / _snapshot AS OF grammar (#997): it composes with the full-table,
+// PK-filtered, and column-list shapes; a missing clause is Limit 0; LIMIT 0,
+// negative, and out-of-range values are rejected as parse errors (not the
+// ErrNotTimeTravel sentinel); and _diff does not accept LIMIT.
+func TestParseAsOfLimit(t *testing.T) {
+	ok := []struct {
+		name      string
+		sql       string
+		wantType  QueryType
+		wantLimit int
+		wantPKCol string
+		wantCols  []string
+	}{
+		{"flashback_fulltable", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT 100", TypeFlashback, 100, "", nil},
+		{"snapshot_fulltable", "SELECT * FROM _snapshot.orders AS OF '2026-05-02 10:00:00' LIMIT 5", TypeSnapshot, 5, "", nil},
+		{"with_where", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 3 LIMIT 10", TypeFlashback, 10, "id", nil},
+		{"with_columns", "SELECT id, name FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT 2", TypeFlashback, 2, "", []string{"id", "name"}},
+		{"case_insensitive", "select * from _snapshot.orders as of '2026-05-02 10:00:00' limit 7", TypeSnapshot, 7, "", nil},
+		{"trailing_semicolon", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT 9;", TypeFlashback, 9, "", nil},
+		{"no_limit_is_zero", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00'", TypeFlashback, 0, "", nil},
+	}
+	for _, tc := range ok {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if q.Type != tc.wantType || q.Limit != tc.wantLimit || q.PKColumn != tc.wantPKCol {
+				t.Errorf("got type=%v limit=%d pkcol=%q; want type=%v limit=%d pkcol=%q",
+					q.Type, q.Limit, q.PKColumn, tc.wantType, tc.wantLimit, tc.wantPKCol)
+			}
+			if !slices.Equal(q.Columns, tc.wantCols) {
+				t.Errorf("Columns = %v, want %v", q.Columns, tc.wantCols)
+			}
+		})
+	}
+
+	bad := []struct {
+		name string
+		sql  string
+	}{
+		{"limit_zero", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT 0"},
+		{"limit_negative", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT -1"},
+		{"limit_overflow", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT 99999999999999999999"},
+		{"diff_rejects_limit", "SELECT * FROM _diff.orders BETWEEN '2026-05-01' AND '2026-05-02' WHERE id = 1 LIMIT 5"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.sql, "myapp")
+			if err == nil {
+				t.Fatalf("expected a parse error, got nil")
+			}
+			if errors.Is(err, ErrNotTimeTravel) {
+				t.Errorf("want a malformed-query error (non-sentinel), got ErrNotTimeTravel")
 			}
 		})
 	}

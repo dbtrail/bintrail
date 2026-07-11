@@ -718,6 +718,9 @@ func handleConn(ctx context.Context, c net.Conn, db *sql.DB, srv *server.Server,
 		slog.Log(context.Background(), level, msg, "err", err, "remote", c.RemoteAddr())
 		return
 	}
+	// Let the full-table _snapshot path stream its resultset over this
+	// connection instead of buffering it and tripping FullTableRowCap (#998).
+	handler.BindConn(mysqlConn)
 	if schema, ok := userSchemas[mysqlConn.GetUser()]; ok && schema != "" {
 		_ = handler.UseDB(schema)
 	}

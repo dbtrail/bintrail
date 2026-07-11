@@ -186,7 +186,7 @@ func handleFlashbackConn(ctx context.Context, srv *console.Server, c net.Conn, m
 		return
 	}
 
-	if err := bindFlashbackHandler(connCtx, srv, proxy, mysqlConn.GetUser(), gate, cfg, logger); err != nil {
+	if err := bindFlashbackHandler(connCtx, srv, proxy, mysqlConn, gate, cfg, logger); err != nil {
 		// Auth already succeeded; surface the routing failure on the client's
 		// first query (a typed MySQL error) rather than a bare disconnect.
 		proxy.fail = err
@@ -207,7 +207,8 @@ func handleFlashbackConn(ctx context.Context, srv *console.Server, c net.Conn, m
 // shim.Handler bound to that server's per-source index + baseline. A returned
 // error is a typed *mysql.MyError the caller stores on the proxy so the client
 // sees it on the first query.
-func bindFlashbackHandler(ctx context.Context, srv *console.Server, proxy *routingHandler, user string, gate *shim.Gate, cfg flashbackConfig, logger *slog.Logger) error {
+func bindFlashbackHandler(ctx context.Context, srv *console.Server, proxy *routingHandler, mysqlConn *server.Conn, gate *shim.Gate, cfg flashbackConfig, logger *slog.Logger) error {
+	user := mysqlConn.GetUser()
 	tgt, err := srv.ResolveFlashback(ctx, user)
 	if err != nil {
 		if errors.Is(err, console.ErrUnknownServer) {
@@ -235,6 +236,11 @@ func bindFlashbackHandler(ctx context.Context, srv *console.Server, proxy *routi
 
 	h := shim.NewHandlerWithConfig(tgt.IndexDB, shimCfg, logger)
 	h.BindConnContext(ctx)
+	// Stream full-table _snapshot resultsets over this connection instead of
+	// buffering them and tripping FullTableRowCap (#998). The conn is bound to
+	// the INNER handler (routingHandler forwards HandleQuery to it), so its
+	// streamed rows and go-mysql's trailing EOF share one packet sequence.
+	h.BindConn(mysqlConn)
 	// Seed the source schema so fully qualified `_flashback.<table>` queries
 	// work without a prior `USE <db>` (mirrors the standalone shim's #263
 	// behaviour). Best-effort: the boot entry has no registry SourceDSN.
