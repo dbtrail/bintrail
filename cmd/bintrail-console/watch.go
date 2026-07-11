@@ -476,7 +476,7 @@ func startFlashbackPort(ctx context.Context, srv *console.Server) (func(), error
 	}
 	done := make(chan struct{})
 	go func() {
-		if err := srv.ServeFlashback(ctx, ln, console.FlashbackConfig{}); err != nil {
+		if err := serveFlashback(ctx, srv, ln, flashbackConfig{}); err != nil {
 			slog.Warn("flashback port exited with error", "error", err)
 		}
 		close(done)

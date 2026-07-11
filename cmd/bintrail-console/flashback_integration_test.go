@@ -1,6 +1,6 @@
 //go:build integration
 
-package console
+package main
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
@@ -44,10 +45,10 @@ func seedFlashbackIndex(t *testing.T, name string, now time.Time) string {
 }
 
 // TestIntegrationFlashbackRoutesByServer proves the issue's acceptance criterion
-// 2: one embedded time-travel port, the same _flashback query, routed to two
-// monitored servers by the connection username, returns each server's own
-// per-source index data (#996). Auth is the shared console token; selection is
-// the username (registry id OR display name).
+// 2: one embedded time-travel port (serveFlashback), the same _flashback query,
+// routed to two monitored servers by the connection username, returns each
+// server's own per-source index data (#996). Auth is the shared console token;
+// selection is the username (registry id OR display name).
 func TestIntegrationFlashbackRoutesByServer(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	now := time.Now().UTC().Truncate(time.Hour)
@@ -55,22 +56,22 @@ func TestIntegrationFlashbackRoutesByServer(t *testing.T) {
 	dsnA := seedFlashbackIndex(t, "alice", now)
 	dsnB := seedFlashbackIndex(t, "bob", now)
 
-	reg, err := LoadRegistry(t.TempDir() + "/servers.yaml")
+	reg, err := console.LoadRegistry(t.TempDir() + "/servers.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// NoArchive keeps _flashback index-only (no archive_state planner path);
 	// SourceDSN seeds the default schema so the wire client needs no USE.
-	entA, err := reg.Add(ServerEntry{Name: "srva", DSN: dsnA, SourceDSN: "r:p@tcp(x:3306)/myapp", NoArchive: true})
+	entA, err := reg.Add(console.ServerEntry{Name: "srva", DSN: dsnA, SourceDSN: "r:p@tcp(x:3306)/myapp", NoArchive: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	entB, err := reg.Add(ServerEntry{Name: "srvb", DSN: dsnB, SourceDSN: "r:p@tcp(x:3306)/myapp", NoArchive: true})
+	entB, err := reg.Add(console.ServerEntry{Name: "srvb", DSN: dsnB, SourceDSN: "r:p@tcp(x:3306)/myapp", NoArchive: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	srv, err := New(Config{Listen: "127.0.0.1:0", Token: "tok", Registry: reg})
+	srv, err := console.New(console.Config{Listen: "127.0.0.1:0", Token: "tok", Registry: reg})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +82,7 @@ func TestIntegrationFlashbackRoutesByServer(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan struct{})
-	go func() { _ = srv.ServeFlashback(ctx, ln, FlashbackConfig{}); close(served) }()
+	go func() { _ = serveFlashback(ctx, srv, ln, flashbackConfig{}); close(served) }()
 	defer func() { cancel(); <-served }()
 
 	asOf := now.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
@@ -106,7 +107,7 @@ func TestIntegrationFlashbackRoutesByServer(t *testing.T) {
 	// data is). This fails two ways if the code regresses: a rejected handshake
 	// (pre-bind UseDB not stashed) or the decoy schema winning (replay dropped),
 	// either of which returns no rows instead of "alice".
-	entC, err := reg.Add(ServerEntry{Name: "srvc", DSN: dsnA, SourceDSN: "r:p@tcp(x:3306)/decoyschema", NoArchive: true})
+	entC, err := reg.Add(console.ServerEntry{Name: "srvc", DSN: dsnA, SourceDSN: "r:p@tcp(x:3306)/decoyschema", NoArchive: true})
 	if err != nil {
 		t.Fatal(err)
 	}
