@@ -99,11 +99,19 @@ func TestIntegrationFlashbackRoutesByServer(t *testing.T) {
 	}
 
 	// A client that sends a default database in the handshake
-	// (CLIENT_CONNECT_WITH_DB — mysql -D, a DSN /db path, JDBC) must connect:
-	// go-mysql calls UseDB DURING the handshake, before the handler is bound, so
-	// the proxy stashes it instead of aborting the connection (#996 review).
-	if got := queryFlashbackName(t, ln.Addr().String(), entA.ID, "tok", "myapp", q); got != "alice" {
-		t.Errorf("handshake with default DB: name = %q, want alice (pre-bind UseDB rejected the connection?)", got)
+	// (CLIENT_CONNECT_WITH_DB — mysql -D, a DSN /db path, JDBC) must connect AND
+	// its schema must WIN over the SourceDSN seed. entC points at server A's
+	// index but declares a DECOY source schema; connecting with handshake DB
+	// "myapp" must still resolve `_flashback.users` against myapp (where the
+	// data is). This fails two ways if the code regresses: a rejected handshake
+	// (pre-bind UseDB not stashed) or the decoy schema winning (replay dropped),
+	// either of which returns no rows instead of "alice".
+	entC, err := reg.Add(ServerEntry{Name: "srvc", DSN: dsnA, SourceDSN: "r:p@tcp(x:3306)/decoyschema", NoArchive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := queryFlashbackName(t, ln.Addr().String(), entC.ID, "tok", "myapp", q); got != "alice" {
+		t.Errorf("handshake DB must win over the SourceDSN seed: name = %q, want alice", got)
 	}
 
 	// A wrong password is rejected (auth is the console token).

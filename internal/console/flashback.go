@@ -43,7 +43,27 @@ type FlashbackConfig struct {
 	AuthMethod string
 }
 
-const defaultFlashbackQueryTimeout = 5 * time.Minute
+const (
+	defaultFlashbackQueryTimeout = 5 * time.Minute
+	defaultFlashbackMaxFullTable = 4
+)
+
+// withDefaults resolves the zero-value fields to their production defaults.
+// QueryTimeout is the load-bearing one: 0 means "unbounded", but the embedded
+// port has no client-disconnect pump, so a runaway query on a dropped
+// connection would never be reclaimed — the 5-minute default is the only
+// backstop. ServeFlashback always calls this, so the dangerous zero never
+// reaches the query path; keeping both substitutions here (rather than one
+// inline and one in a side variable) is why they can't drift apart.
+func (c FlashbackConfig) withDefaults() FlashbackConfig {
+	if c.QueryTimeout == 0 {
+		c.QueryTimeout = defaultFlashbackQueryTimeout
+	}
+	if c.MaxFullTable == 0 {
+		c.MaxFullTable = defaultFlashbackMaxFullTable
+	}
+	return c
+}
 
 // ServeFlashback runs a MySQL-protocol time-travel server on ln, routing every
 // connection to a monitored server's per-source index by the connection's
@@ -59,11 +79,11 @@ const defaultFlashbackQueryTimeout = 5 * time.Minute
 // token is). The connection's client library therefore connects as, e.g.,
 // `-u <server-id> -p<token>`.
 //
-// Auth requires a token: go-mysql recomputes the native / caching_sha2 scramble
-// server-side from the cleartext GetCredential returns (auth.go:57 in go-mysql
-// v1.13.0), and the console's bcrypt password store cannot produce that
-// cleartext. Callers that leave --token empty get an error here rather than an
-// unauthenticated port.
+// Auth requires a token: go-mysql validates the handshake by recomputing the
+// scramble from the cleartext GetCredential returns (the
+// compareNativePasswordAuthData path in go-mysql v1.13.0 server/auth.go), and
+// the console's bcrypt password store cannot produce that cleartext. Callers
+// that leave --token empty get an error here rather than an unauthenticated port.
 //
 // Blocks until ctx is cancelled (which closes ln and drains in-flight
 // connections) or ln fails unrecoverably.
@@ -71,22 +91,22 @@ func (s *Server) ServeFlashback(ctx context.Context, ln net.Listener, cfg Flashb
 	if s.token == "" {
 		return errors.New("flashback port requires an automation token: set --token or BINTRAIL_CONSOLE_TOKEN (the console password store cannot drive MySQL-protocol authentication)")
 	}
-	if cfg.QueryTimeout == 0 {
-		cfg.QueryTimeout = defaultFlashbackQueryTimeout
-	}
-	gateN := cfg.MaxFullTable
-	if gateN == 0 {
-		gateN = 4
-	}
+	cfg = cfg.withDefaults()
 
 	// One *server.Server for the whole port: it owns the caching_sha2_password
 	// cache and the RSA keypair (see shim.NewMySQLServer). One shared *Gate so
 	// the full-table cap is process-wide, not per-connection.
 	srv, err := shim.NewMySQLServer(cfg.AuthMethod)
 	if err != nil {
+		// ln is already bound by the caller; close it so a construction failure
+		// (an unsupported auth method) doesn't leak the listener nor leave the
+		// caller's "listening" banner pointing at a port that rejects every
+		// handshake. Unreachable from `watch` today (it passes an empty
+		// AuthMethod), but a latent trap if a --flashback-auth-method flag lands.
+		_ = ln.Close()
 		return fmt.Errorf("flashback: %w", err)
 	}
-	gate := shim.NewGate(gateN)
+	gate := shim.NewGate(cfg.MaxFullTable)
 	creds := flashbackCreds{s: s}
 	logger := slog.Default()
 
@@ -97,6 +117,9 @@ func (s *Server) ServeFlashback(ctx context.Context, ln net.Listener, cfg Flashb
 		_ = ln.Close()
 	}()
 
+	// No per-connection cap (the standalone shim's --max-connections has no
+	// equivalent here): this is a loopback-default, token-gated operator port,
+	// and the shared FullTableGate already bounds the memory-heavy queries.
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
@@ -278,10 +301,11 @@ func (s *Server) flashbackDefaultSchema(id string) string {
 	return cfg.DBName
 }
 
-// flashbackCreds authenticates the flashback port: any username that maps to a
-// selectable server is accepted, all sharing the console's static token as the
-// password. It holds *Server (not a snapshot) so the registry is consulted live
-// on every handshake.
+// flashbackCreds authenticates the flashback port on the shared console token
+// alone: every username is accepted at the handshake (so the error code cannot
+// enumerate servers), and the target server is validated AFTER the handshake in
+// bindFlashbackHandler, which reads the live registry via flashbackTarget. It
+// holds *Server to read s.token directly rather than snapshotting it.
 type flashbackCreds struct {
 	s *Server
 }
@@ -361,9 +385,9 @@ func (r *routingHandler) unresolved() error {
 
 // isFlashbackProbe reports whether a handshake error is a bare TCP probe
 // (health check / port scan) that closed before completing — logged at Debug
-// rather than Warn. Mirrors the standalone shim's classifyHandshakeErr probe
-// arm without the ProxySQL-monitor aggregator, which does not apply to an
-// embedded loopback port.
+// rather than Warn. Mirrors the `bintrail shim` command's classifyHandshakeErr
+// probe arm (internal/cli/shim.go) without the ProxySQL-monitor aggregator,
+// which does not apply to an embedded loopback port.
 func isFlashbackProbe(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, gomysql.ErrBadConn)
 }

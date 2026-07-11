@@ -589,6 +589,16 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("console: cannot bind %s: %w", upConsoleListen, err)
 	}
+	// Bind the flashback port BEFORE starting the console goroutine: its error
+	// (missing token, port conflict) must return before any goroutine touches
+	// the shared index db, so the deferred db.Close can never race an in-flight
+	// console request on a failed startup (runUpConsoleOnly binds it before its
+	// synchronous Serve for the same reason).
+	stopFlashback, err := startFlashbackPort(ctx, srv)
+	if err != nil {
+		return err
+	}
+
 	// The console is the secondary job: log a mid-run crash when it happens (not
 	// only at shutdown), but NEVER let it take down the stream, which is the
 	// primary data-capture job.
@@ -599,11 +609,6 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		}
 		consoleDone <- struct{}{}
 	}()
-
-	stopFlashback, err := startFlashbackPort(ctx, srv)
-	if err != nil {
-		return err
-	}
 	printConsoleBanner(srv, "Console (read-only) is running. Open:")
 
 	// Resume whatever the operator had monitoring before the restart —

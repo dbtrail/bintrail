@@ -2,6 +2,7 @@ package console
 
 import (
 	"context"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -167,6 +168,42 @@ func TestServeFlashbackRequiresToken(t *testing.T) {
 	err := s.ServeFlashback(context.Background(), nil, FlashbackConfig{})
 	if err == nil || !strings.Contains(err.Error(), "token") {
 		t.Fatalf("empty token: err = %v, want a token-required error", err)
+	}
+}
+
+// TestServeFlashbackDrainsActiveConn: ServeFlashback returns only after an
+// IN-FLIGHT connection has drained when ctx is cancelled — pinning the
+// wg.Add/wg.Wait drain (a regression dropping wg.Add would let ServeFlashback
+// return while a handler goroutine still runs, and this would still pass a
+// naive no-connection test).
+func TestServeFlashbackDrainsActiveConn(t *testing.T) {
+	s, _ := newFlashbackServer(t, "tok")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.ServeFlashback(ctx, ln, FlashbackConfig{}) }()
+
+	// Open a raw connection and read the server's handshake greeting: that
+	// confirms the accept loop has spawned an in-flight handler goroutine
+	// (wg > 0) before we cancel, so the drain is actually exercised.
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err != nil {
+		t.Fatalf("expected a handshake greeting from the flashback port: %v", err)
+	}
+
+	cancel() // daemon shutdown must drain the in-flight connection
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeFlashback did not drain the in-flight connection on ctx cancel")
 	}
 }
 
