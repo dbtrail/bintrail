@@ -7,11 +7,14 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/testutil"
@@ -176,4 +179,129 @@ func queryFlashbackName(t *testing.T, addr, user, pass, db, q string) string {
 	}
 	t.Fatalf("user %q: no name column in %v", user, cols)
 	return ""
+}
+
+// writeConsoleBaseline writes a baseline Parquet in the FindBaseline directory
+// layout and returns the root dir to set as ServerEntry.BaselineDir (mirrors the
+// shim package's writeBaselineSnapshot, which isn't importable from here).
+func writeConsoleBaseline(t *testing.T, snapTime time.Time, schema, table string, cols []baseline.Column, rows [][]string) string {
+	t.Helper()
+	root := t.TempDir()
+	dirName := snapTime.UTC().Format("2006-01-02T15-04-05") + "Z"
+	tableDir := filepath.Join(root, dirName, schema)
+	if err := os.MkdirAll(tableDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline layout: %v", err)
+	}
+	w, err := baseline.NewWriter(filepath.Join(tableDir, table+".parquet"), cols,
+		baseline.WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatalf("baseline.NewWriter: %v", err)
+	}
+	nulls := make([]bool, len(cols))
+	for _, r := range rows {
+		if err := w.WriteRow(r, nulls); err != nil {
+			t.Fatalf("WriteRow: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("baseline writer close: %v", err)
+	}
+	return root
+}
+
+// TestIntegrationFlashbackStreamsSnapshotFullTable proves the #998 streaming
+// full-table path survives the console's routingHandler proxy: a full-table
+// _snapshot AS OF query (no LIMIT) over the embedded flashback port returns the
+// whole merged table, streamed row-by-row through the BindConn(mysqlConn) seam
+// bindFlashbackHandler wires onto the inner handler. A framing/packet-sequence
+// bug in the proxied stream surfaces as a go-sql-driver error, not a silent pass
+// — the standalone shim tests would stay green while `bintrail-console watch`
+// shipped broken.
+func TestIntegrationFlashbackStreamsSnapshotFullTable(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	now := time.Now().UTC().Truncate(time.Hour)
+
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{now})
+	snapTS := now.Add(-time.Hour).Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "myapp", "users", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTS, "myapp", "users", "name", 2, "", "varchar", "YES")
+
+	snapTime := now.Add(1 * time.Minute)
+	eventTS := now.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+	// Baseline id=1 alice (never touched), id=2 bob (updated), id=3 carol (deleted).
+	baselineDir := writeConsoleBaseline(t, snapTime, "myapp", "users",
+		[]baseline.Column{
+			{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+			{Name: "name", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+		},
+		[][]string{{"1", "alice"}, {"2", "bob"}, {"3", "carol"}})
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 100, 200, eventTS, nil,
+		"myapp", "users", 2 /*update*/, "2", nil,
+		[]byte(`{"id":2,"name":"bob"}`), []byte(`{"id":2,"name":"bob2"}`))
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 200, 300, eventTS, nil,
+		"myapp", "users", 3 /*delete*/, "3", nil,
+		[]byte(`{"id":3,"name":"carol"}`), nil)
+	testutil.InsertEvent(t, db, "mysql-bin.000001", 300, 400, eventTS, nil,
+		"myapp", "users", 1 /*insert*/, "4", nil, nil,
+		[]byte(`{"id":4,"name":"dave"}`))
+
+	reg, err := console.LoadRegistry(t.TempDir() + "/servers.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent, err := reg.Add(console.ServerEntry{
+		Name: "srv", DSN: testutil.IntegrationDSN(dbName),
+		SourceDSN: "r:p@tcp(x:3306)/myapp", NoArchive: true, BaselineDir: baselineDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := console.New(console.Config{Listen: "127.0.0.1:0", Token: "tok", Registry: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan struct{})
+	go func() { _ = serveFlashback(ctx, srv, ln, flashbackConfig{}); close(served) }()
+	defer func() { cancel(); <-served }()
+
+	asOf := now.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	conn := openFlashback(t, ln.Addr().String(), ent.ID, "tok", "")
+	defer conn.Close()
+	rows, err := conn.Query("SELECT * FROM _snapshot.users AS OF '" + asOf + "'")
+	if err != nil {
+		t.Fatalf("streamed full-table _snapshot over the console proxy failed: %v", err)
+	}
+	defer rows.Close()
+
+	got := map[string]string{}
+	for rows.Next() {
+		var id, name sql.NullString
+		if err := rows.Scan(&id, &name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[id.String] = name.String
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("row iteration (a mid-stream framing error surfaces here): %v", err)
+	}
+	want := map[string]string{"1": "alice", "2": "bob2", "4": "dave"}
+	if len(got) != len(want) {
+		t.Fatalf("streamed %d rows %v through the proxy, want %d %v", len(got), got, len(want), want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("row id=%s = %q, want %q (full: %v)", k, got[k], v, got)
+		}
+	}
 }

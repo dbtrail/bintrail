@@ -53,9 +53,14 @@ var showTablesFromVirtualRE = regexp.MustCompile(
 // monitoring can distinguish it from a real shim crash, and operators
 // narrow the AS OF range or fall back to PK-filtered queries.
 //
-// Streaming the resultset (Conn.WriteFieldList + WriteRow per row,
-// removing the cap) is deferred per the scoping comment on #276;
-// cap+buffered is the bounded substitute for the MVP.
+// This cap governs the BUFFERED full-table paths: the binlog-only
+// `_flashback` full-table reconstruction (whose FetchMerged fetch is
+// itself buffered) and any LIMIT'd query. Full-table `_snapshot` with
+// no LIMIT now STREAMS row-by-row over a bound connection and is NOT
+// capped (#998, streamSnapshotFullTable) — the baseline flows through
+// the merge cursor, so peak memory is O(rows changed since the
+// baseline), not O(table size). The originally-deferred streaming path
+// (#276's scoping comment) shipped in #998.
 //
 // Per-Handler override lives on Config.FullTableRowCap (zero =
 // inherit this default) so unit tests can lower it without mutating

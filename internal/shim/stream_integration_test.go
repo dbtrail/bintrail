@@ -4,6 +4,7 @@ package shim
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"net"
 	"slices"
@@ -272,4 +273,63 @@ func TestStreamSnapshotFullTable_EmptyOverWire(t *testing.T) {
 	if len(data) != 0 {
 		t.Errorf("expected zero rows (all deleted by AS OF), got %v", data)
 	}
+}
+
+// TestRunFullTable_LimitBoundsFetchOverWire is the FAITHFUL binlog full-table
+// LIMIT test: unlike the sqlmock unit test (sqlmock ignores the SQL LIMIT), a
+// real MySQL honours it, so a table with MORE than the cap of live rows proves
+// LIMIT actually bounds the fetch. `_flashback` full-table (no baseline) is the
+// buffered binlog path (runFullTable), NOT the streaming _snapshot path.
+func TestRunFullTable_LimitBoundsFetchOverWire(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+	asOfStr := asOf.Format("2006-01-02 15:04:05")
+
+	seedUsersSnapshot(t, db, snapTime)
+	// Five live rows (distinct PKs), cap 3 → the table exceeds the cap.
+	for i := 1; i <= 5; i++ {
+		testutil.InsertEvent(t, db, "mysql-bin.000001", uint64(i*100), uint64(i*100+100), eventTS, nil,
+			"myapp", "users", 1 /*insert*/, fmt.Sprintf("%d", i), nil, nil,
+			[]byte(fmt.Sprintf(`{"id":%d,"name":"u%d"}`, i, i)))
+	}
+
+	// No baseline → _flashback full-table = the binlog buffered path.
+	cfg := Config{AllowGaps: true, NoArchive: true, IndexDBName: dbName, FullTableRowCap: 3}
+	addr := startShimServer(t, db, cfg, "myapp")
+
+	t.Run("limit_under_cap_bounds_fetch", func(t *testing.T) {
+		// LIMIT 2 <= cap 3: real MySQL returns exactly 2, no cap error. Without
+		// #997, the fetch would probe cap+1=4 rows (>cap) and trip the cap.
+		_, data, err := queryShim(t, addr, "myapp", "SELECT * FROM _flashback.users AS OF '"+asOfStr+"' LIMIT 2")
+		if err != nil {
+			t.Fatalf("_flashback full-table LIMIT 2 under cap should browse, got %v", err)
+		}
+		if len(data) != 2 {
+			t.Errorf("LIMIT 2 returned %d rows, want 2", len(data))
+		}
+	})
+	t.Run("no_limit_trips_cap", func(t *testing.T) {
+		// 5 live rows > cap 3, no LIMIT → ER_TOO_BIG_SELECT.
+		_, _, err := queryShim(t, addr, "myapp", "SELECT * FROM _flashback.users AS OF '"+asOfStr+"'")
+		if err == nil {
+			t.Fatal("5 rows > cap 3 with no LIMIT should trip ER_TOO_BIG_SELECT")
+		}
+	})
+	t.Run("limit_above_cap_trips_cap", func(t *testing.T) {
+		// LIMIT 5 > cap 3: a LIMIT never raises the cap → still errors.
+		_, _, err := queryShim(t, addr, "myapp", "SELECT * FROM _flashback.users AS OF '"+asOfStr+"' LIMIT 5")
+		if err == nil {
+			t.Fatal("LIMIT 5 above cap 3 should trip ER_TOO_BIG_SELECT")
+		}
+	})
 }

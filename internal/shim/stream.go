@@ -22,11 +22,13 @@ type packetWriter interface {
 }
 
 // streamWriter incrementally emits a MySQL text-protocol resultset over a
-// connection (#998): the column-count packet plus one column-definition packet
-// per field (mirroring go-mysql/server (*Conn).writeResultset's header framing
-// byte-for-byte — colCount, then each field.Dump(), with NO intermediate EOF,
-// since go-mysql servers negotiate CLIENT_DEPRECATE_EOF), then one packet per
-// row. The caller finishes the resultset by returning a mysql.Result whose
+// connection (#998): the column-count packet, one column-definition packet per
+// field, and the intermediate EOF that closes the column-definition block, then
+// one packet per row. This mirrors go-mysql/server's own writeFieldList
+// byte-for-byte — the intermediate EOF is REQUIRED, because the server never
+// advertises CLIENT_DEPRECATE_EOF (server_conf.go), so writeFieldList always
+// sends it (see writeHeader). The caller finishes the resultset by returning a
+// mysql.Result whose
 // Resultset carries Streaming=StreamingSelect and StreamingDone=true, so
 // go-mysql writes the trailing EOF and the packet sequence stays continuous.
 //

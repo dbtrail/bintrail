@@ -1675,6 +1675,40 @@ func TestRunFullTable_Limit(t *testing.T) {
 	})
 }
 
+// TestWarnCorruptImageDrop pins warnCorruptImageDrop's guard both directions: a
+// non-DELETE tail folding to an empty state (corrupt/partial image) Warns so the
+// silent drop is operator-visible, while the legitimate empty cases (DELETE tail,
+// no events at all) stay silent — a false Warn on every "row deleted before AsOf"
+// query would be noise. A refactor that flips the guard passes CI silently
+// without this.
+func TestWarnCorruptImageDrop(t *testing.T) {
+	newH := func() (*Handler, *recordingHandler) {
+		rec := newRecordingHandler()
+		return &Handler{logger: slog.New(rec)}, rec
+	}
+	t.Run("non_delete_tail_warns", func(t *testing.T) {
+		h, rec := newH()
+		h.warnCorruptImageDrop("s", "t", []query.ResultRow{{EventType: parser.EventInsert, EventID: 3}})
+		if got := len(rec.atLevel(slog.LevelWarn)); got != 1 {
+			t.Errorf("Warn count = %d, want 1 (non-DELETE tail folded to empty)", got)
+		}
+	})
+	t.Run("delete_tail_silent", func(t *testing.T) {
+		h, rec := newH()
+		h.warnCorruptImageDrop("s", "t", []query.ResultRow{{EventType: parser.EventDelete, EventID: 3}})
+		if got := len(rec.atLevel(slog.LevelWarn)); got != 0 {
+			t.Errorf("Warn count = %d, want 0 (legit DELETE tail = row absent at AsOf)", got)
+		}
+	})
+	t.Run("no_events_silent", func(t *testing.T) {
+		h, rec := newH()
+		h.warnCorruptImageDrop("s", "t", nil)
+		if got := len(rec.atLevel(slog.LevelWarn)); got != 0 {
+			t.Errorf("Warn count = %d, want 0 (never existed = no events)", got)
+		}
+	})
+}
+
 // TestNewHandlerDefaultIsStrict pins the library-side counterpart of the
 // CLI default-pin in cmd/bintrail/shim_test.go: NewHandler must return a
 // Handler configured with AllowGaps=false. The CLI builds Config directly

@@ -314,6 +314,10 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		}
 		return nil
 	})
+	// Keep the errLimitReached SUCCESS sentinel filtered out FIRST: images is
+	// already truncated to the LIMIT. A future refactor into sequential
+	// `if errors.Is(...)` branches must preserve this ordering, or a legit LIMIT
+	// success would be mistranslated into a wire error.
 	if err != nil && !errors.Is(err, errLimitReached) {
 		if errors.Is(err, errFullTableCapExceeded) {
 			return nil, mysql.NewError(mysql.ER_TOO_BIG_SELECT, fmt.Sprintf(
@@ -351,7 +355,37 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 func (h *Handler) streamSnapshotFullTable(ctx context.Context, q TimeTravelQuery, input reconstruct.SnapshotFullTableInput, cols []string) (*mysql.Result, error) {
 	sw := newStreamWriter(h.conn, cols)
 	cells := make([]any, len(cols)) // reused per row; writeRow encodes synchronously
+
+	// SELECT * degrades LOUDLY, not silently, for the #600 dropped-column case.
+	// The streamed header is fixed before the first row, so — unlike the buffered
+	// fullTableColumns — it can't append a per-row image-only key (a column
+	// present at AS OF but dropped from the current schema since). Rather than
+	// omit it silently (the shim Warns before degrading everywhere else —
+	// fullTableTextCell, tableMetaFor), Warn ONCE per query naming the column and
+	// pointing at the LIMIT'd buffered path that surfaces it. Only for SELECT *; a
+	// verbatim projection (q.Columns != nil) intentionally excludes unrequested
+	// columns. A full union header would need the baseline Parquet schema up
+	// front, i.e. a second full materialization of an S3 baseline — deferred.
+	var known map[string]struct{}
+	if q.Columns == nil {
+		known = make(map[string]struct{}, len(cols))
+		for _, c := range cols {
+			known[c] = struct{}{}
+		}
+	}
+	warnedDrop := false
+
 	err := reconstruct.SnapshotFullTableImages(ctx, input, func(rowMap map[string]any) error {
+		if known != nil && !warnedDrop {
+			for k := range rowMap {
+				if _, ok := known[k]; !ok {
+					h.logger.Warn("shim: streaming full-table _snapshot SELECT * omits a column present at AS OF but dropped from the current schema (the streamed column set is fixed before the first row) — re-run with a LIMIT to use the buffered path that surfaces it",
+						"schema", q.Schema, "table", q.Table, "omitted_column", k)
+					warnedDrop = true
+					break
+				}
+			}
+		}
 		for i, c := range cols {
 			v, cerr := h.projectCell(q.Schema, q.Table, c, rowMap[c])
 			if cerr != nil {
