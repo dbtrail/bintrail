@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -83,7 +84,13 @@ var (
 	upConsoleTLSKey         string
 	upConsoleAllowedHost    []string
 	upConsoleAllowSetup     bool
-	upArchiveStageDir       string
+	// upConsoleFlashbackListen opts into the embedded MySQL-protocol time-travel
+	// port (#996): _flashback/_snapshot/_diff for every monitored server, routed
+	// by the connection username, with no separate `bintrail shim` container.
+	// Empty (default) = off. Requires a console token (MySQL-protocol auth can't
+	// use the bcrypt password store). Env BINTRAIL_CONSOLE_FLASHBACK_LISTEN.
+	upConsoleFlashbackListen string
+	upArchiveStageDir        string
 	// upConsoleBaselineTrigger opts into in-process baseline creation from the
 	// console (#613). Env-only (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1) — off by
 	// default because it needs mydumper in the image and reaches the source DB.
@@ -188,6 +195,7 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleTLSKey, "console-tls-key", "", "TLS private key file (PEM; requires --console-tls-cert)")
 	watchCmd.Flags().StringSliceVar(&upConsoleAllowedHost, "console-allowed-hosts", nil, "Extra hostnames allowed in the Host header (for a TLS-terminating reverse proxy); IP literals and localhost are always allowed")
 	watchCmd.Flags().BoolVar(&upConsoleAllowSetup, "console-allow-setup", false, "Allow browser first-run password setup on a non-loopback bind (assert the bind is access-controlled, e.g. published only on the host loopback)")
+	watchCmd.Flags().StringVar(&upConsoleFlashbackListen, "flashback-listen", "", "Serve an embedded MySQL-protocol time-travel port (_flashback/_snapshot/_diff) for every monitored server, routed by the connection username (server id or name); e.g. 127.0.0.1:3308. Requires --console-token. Empty = off. Env BINTRAIL_CONSOLE_FLASHBACK_LISTEN.")
 	watchCmd.Flags().StringVar(&upArchiveStageDir, "archive-staging-dir", "", "Local staging directory for S3 archive uploads (default: OS temp dir). Rotated Parquet is written here, uploaded to a source's configured Archive S3 bucket, then pruned.")
 	watchCmd.Flags().StringVar(&upRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
 	watchCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
@@ -430,12 +438,51 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 		defer stopMetrics()
 	}
 
+	stopFlashback, err := startFlashbackPort(ctx, srv)
+	if err != nil {
+		return err
+	}
 	printConsoleBanner(srv, "Console is running — open it and add the MySQL servers to watch:")
 	go supervisor.Reconcile(registry)
 
 	serveErr := srv.Serve(ctx, ln)
+	stop()                // cancel ctx so the flashback listener unblocks even if Serve returned a non-signal error
+	stopFlashback()       // drain the flashback port before the deferred db.Close
 	supervisor.Shutdown() // final checkpoints for every monitored stream
 	return serveErr
+}
+
+// startFlashbackPort binds and serves the embedded MySQL-protocol time-travel
+// port (#996) when --flashback-listen is set, routing each connection to a
+// monitored server by its username. It returns a drain func (a no-op when the
+// port is disabled) the caller must invoke before closing the shared index DB,
+// so an in-flight time-travel query never races the deferred db.Close.
+//
+// The bind is synchronous so a port conflict or a missing token fails `watch`
+// fast, exactly like the console bind. Serving runs on the daemon context: ctx
+// cancellation closes the listener and drains open connections. A mid-run crash
+// is logged, never propagated — the flashback port is strictly secondary to the
+// console and the capture stream.
+func startFlashbackPort(ctx context.Context, srv *console.Server) (func(), error) {
+	if upConsoleFlashbackListen == "" {
+		return func() {}, nil
+	}
+	if srv.Token() == "" {
+		return nil, fmt.Errorf("--flashback-listen %s requires a console token: set --console-token or BINTRAIL_CONSOLE_TOKEN (MySQL-protocol auth cannot use the console password)", upConsoleFlashbackListen)
+	}
+	ln, err := net.Listen("tcp", upConsoleFlashbackListen)
+	if err != nil {
+		return nil, fmt.Errorf("flashback: cannot bind %s: %w", upConsoleFlashbackListen, err)
+	}
+	done := make(chan struct{})
+	go func() {
+		if err := srv.ServeFlashback(ctx, ln, console.FlashbackConfig{}); err != nil {
+			slog.Warn("flashback port exited with error", "error", err)
+		}
+		close(done)
+	}()
+	fmt.Fprintf(os.Stderr, "Time-travel SQL (MySQL protocol) is listening on %s — connect a MySQL client with user=<server id or name>, password=<console token>.\n", ln.Addr())
+	return func() { <-done }, nil
 }
 
 // runUpStreamWithConsole serves the read-only web console in this same process,
@@ -552,6 +599,11 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		}
 		consoleDone <- struct{}{}
 	}()
+
+	stopFlashback, err := startFlashbackPort(ctx, srv)
+	if err != nil {
+		return err
+	}
 	printConsoleBanner(srv, "Console (read-only) is running. Open:")
 
 	// Resume whatever the operator had monitoring before the restart —
@@ -575,6 +627,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	streamErr := streamrun.One(ctx, watchStreamConfig(serverID))
 	stop()                // drain the console even if the stream returned without a signal
 	<-consoleDone         // order the console goroutine's exit before the deferred db.Close()
+	stopFlashback()       // drain the flashback port before the deferred db.Close()
 	supervisor.Shutdown() // final checkpoints for every monitored stream
 	return streamErr
 }
@@ -675,6 +728,11 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 	if !cmd.Flags().Changed("console-allow-setup") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_ALLOW_SETUP"); v == "1" || v == "true" {
 			upConsoleAllowSetup = true
+		}
+	}
+	if !cmd.Flags().Changed("flashback-listen") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_FLASHBACK_LISTEN"); v != "" {
+			upConsoleFlashbackListen = v
 		}
 	}
 	if !cmd.Flags().Changed("archive-staging-dir") {

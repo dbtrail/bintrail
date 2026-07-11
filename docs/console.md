@@ -435,6 +435,10 @@ results a `verify` cron/CI run produced elsewhere:
   Off by default for a bare `watch` invocation; the bundled compose stack sets
   this on by default (see [docker.md](docker.md) — `VERIFY_TRIGGER=0` in
   `.env` opts out there).
+- `BINTRAIL_CONSOLE_FLASHBACK_LISTEN` (`watch` only) — same as `--flashback-listen`
+  (e.g. `127.0.0.1:3308`): serve an embedded MySQL-protocol time-travel port for
+  every monitored server, routed by the connection username. Off by default;
+  requires a console token. See [Time-travel over the MySQL protocol](#time-travel-over-the-mysql-protocol-flashback-port).
 
 There is deliberately **no** environment variable for the password itself —
 env vars leak through `docker inspect`, `ps e`, and `/proc`; the password is
@@ -720,6 +724,20 @@ truncated prefix.
 > aborts the strict-mode (`allow_gaps=false`) fetch — the request returns 500
 > naming the failed source — instead of folding an incomplete delta set into a
 > 200. Pass `allow_gaps=true` to fall back to warn-and-continue.
+
+### Time-travel over the MySQL protocol (flashback port)
+
+The reconstruct tab above is HTTP/browser-oriented. For a `mysql` client or an
+application that speaks `AS OF` SQL, `bintrail-console watch --flashback-listen
+<addr>` opens an embedded MySQL-protocol port that serves the `_flashback` /
+`_snapshot` / `_diff` virtual schemas for **every monitored server** — routed by
+the connection username (the server's registry id or display name), authenticated
+with the console token. It replaces running a separate `bintrail shim` per
+per-source index: the daemon already resolves each server's `bintrail_idx_<id>`
+and baseline, so one port covers them all. A token is required (`--console-token`
+/ `BINTRAIL_CONSOLE_TOKEN`) because MySQL-protocol auth cannot use the console's
+password store. Full setup, routing, and the `_snapshot` baseline-parity edge:
+[docs/time-travel-sql.md → the embedded port](time-travel-sql.md#the-embedded-port-multi-source).
 
 ### Coverage gaps and incomplete data
 

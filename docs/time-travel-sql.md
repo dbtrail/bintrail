@@ -19,21 +19,70 @@ The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a
                                 └──────────┘                   └────────────┘
 ```
 
-## Two ways to run time-travel SQL
+## Three ways to run time-travel SQL
 
-There are two ways to put `AS OF` SQL in front of your data; they differ only in
-*how the client connects*:
+There are three ways to put `AS OF` SQL in front of your data; they differ only
+in *how the client connects*:
 
-1. **A dedicated terminal — point `mysql` straight at the shim (no ProxySQL).**
-   Simplest. The shim already speaks the MySQL protocol, so an analyst connects
-   a `mysql` client directly to it and runs `_flashback` / `_snapshot` / `_diff`
-   queries. Trade-off: that connection answers *only* time-travel queries (a
-   normal `SELECT` against a real table returns `ER_NOT_SUPPORTED_YET`, 1235).
-   Use it when a person or tool just needs to read historical state.
-2. **Transparent routing — ProxySQL in front (the rest of this guide).** Needed
+1. **Embedded in `bintrail-console watch` — one port for every monitored server
+   (multi-source).** If you already run the daemon, add `--flashback-listen`
+   and it serves `_flashback` / `_snapshot` / `_diff` for *every* server in the
+   console, routed by the connection username. No separate `bintrail shim`
+   process, no hand-built index DSN. See [the embedded port](#the-embedded-port-multi-source)
+   below. Start here if you run `watch`.
+2. **A dedicated terminal — point `mysql` straight at a standalone shim (no
+   ProxySQL).** Simplest for a single index. The shim already speaks the MySQL
+   protocol, so an analyst connects a `mysql` client directly to it and runs
+   `_flashback` / `_snapshot` / `_diff` queries. Trade-off: that connection
+   answers *only* time-travel queries (a normal `SELECT` against a real table
+   returns `ER_NOT_SUPPORTED_YET`, 1235). Use it when a person or tool just needs
+   to read historical state from one index.
+3. **Transparent routing — ProxySQL in front (the rest of this guide).** Needed
    only when an application's *normal* connection must mix live queries and
    `AS OF` queries on the same endpoint. ProxySQL routes virtual-schema queries
    to the shim and everything else to your real MySQL.
+
+### The embedded port (multi-source)
+
+`bintrail-console watch` already holds the time-travel engine and, through its
+control plane, a resolved connection to every monitored server's *own* per-source
+index (`bintrail_idx_<id>`). `--flashback-listen` exposes a MySQL-protocol port
+wired to that same map, so one endpoint time-travels any server you monitor —
+no `bintrail shim` container, no `--profile flashback`, no per-source DSN to
+discover:
+
+```sh
+bintrail-console watch \
+  --index-dsn 'root:pw@tcp(127.0.0.1:3306)/bintrail_index' \
+  --console-token "$BINTRAIL_CONSOLE_TOKEN" \
+  --flashback-listen 127.0.0.1:3308            # or env BINTRAIL_CONSOLE_FLASHBACK_LISTEN
+```
+
+**Routing is by username, auth is the console token.** Connect as the target
+server — its registry **ID** (robust; the `X-Bintrail-Server` value shown in the
+console) or its display **name** — with the console token as the password:
+
+```sh
+# the console shows each server's id/name in the switcher
+mysql -h 127.0.0.1 -P 3308 -u 7f4d577430b48821 -p"$BINTRAIL_CONSOLE_TOKEN"
+mysql> USE myapp;   -- optional: seeded from the server's source DSN when known
+mysql> SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
+```
+
+Servers added in the console mid-session are reachable immediately (the registry
+is read live). A token is **required** — MySQL-protocol auth cannot use the
+console's password store — so set `--console-token` / `BINTRAIL_CONSOLE_TOKEN`;
+`watch` refuses to open the port otherwise. The default `127.0.0.1` bind keeps
+it host-local; do not expose it to untrusted networks.
+
+`_snapshot.*` parity: each server reads the baseline configured on its registry
+entry (or the daemon's `--baseline-dir` / `--baseline-s3`), exactly as the
+console's Time-travel tab does — with one edge: a server configured with *both*
+a local `--baseline-dir` **and** an `--baseline-s3` copy reads `_snapshot` only
+from the local dir on this port. If local baselines have been pruned (retention)
+while a durable S3 copy remains, use the console's Time-travel tab or a standalone
+shim pointed at the S3 prefix for those tables. Single-source baseline configs —
+the common case — have full parity.
 
 ### The dedicated terminal
 
