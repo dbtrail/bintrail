@@ -496,7 +496,9 @@ func (h *Handler) fullTableTextCell(schema, table, column string, v any) any {
 // canonicalization in the offline merge), so it is kept as a separate
 // matcher: a future change to one path's type support must not silently
 // move the other. Types reconstruct rejects outright (FLOAT, BLOB, BIT,
-// JSON, …) are not listed and therefore fall back to the binlog-only path.
+// JSON, …) are not listed and therefore fall back to the binlog-only path —
+// for MySQL-family sources. A PostgreSQL source bypasses this matcher entirely
+// (its data_type is "" and its baseline is raw text — see runSnapshotPointInTime).
 func baselinePKStringMatchable(dataType string) bool {
 	switch strings.ToLower(strings.TrimSpace(dataType)) {
 	case "int", "integer", "smallint", "tinyint", "mediumint", "bigint",
@@ -520,8 +522,10 @@ func baselinePKStringMatchable(dataType string) bool {
 // It falls back to the binlog-only point-lookup (runPointInTime) — with
 // a log line so the degradation is visible — in four cases:
 //   - no baseline source configured (the pre-#355 default),
-//   - the PK column's type isn't one the baseline matcher supports
-//     (a typed WHERE would silently miss the row),
+//   - the PK column's type isn't one the baseline matcher supports AND the
+//     source isn't PostgreSQL (a PG source carries an empty data_type but its
+//     raw-text baseline makes every PK a string-identity match — see the flavor
+//     bypass below; a typed WHERE would otherwise silently miss the row),
 //   - the schema resolver is unavailable (can't determine the PK type),
 //   - no baseline exists for this table at-or-before AsOf.
 //
@@ -554,10 +558,35 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 			"schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn)
 		return h.runPointInTime(q)
 	}
+	// PostgreSQL baselines store every column as raw pgoutput text
+	// (baseline.Column.RawText, #593), so ReadBaselineRow's string-bound
+	// `pkColumn = ?` match is a string-identity join that can only recover the
+	// right row or find nothing — never a wrong row — the same reason the offline
+	// reconstruct path treats all PG PK columns as string-matchable (#593 slice
+	// D). The MySQL DATA_TYPE token is empty for a PG source
+	// (schema_snapshots.data_type is "" — PG records pg_type_oid, not the MySQL
+	// type), so without this flavor bypass every PG _snapshot would silently
+	// degrade to binlog-only and the baseline fold the docs promise would never
+	// run (#1006). The flavor read is short-circuited so the MySQL hot path (a
+	// matchable type) never pays for the extra query.
 	if !baselinePKStringMatchable(dataType) {
-		h.logger.Warn("shim: _snapshot PK type not safe for baseline lookup; using binlog-only path",
-			"schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn, "pk_type", dataType)
-		return h.runPointInTime(q)
+		if flavor := query.SourceFlavor(h.indexDB); flavor != "postgres" {
+			if dataType == "" {
+				// The empty data_type is the PostgreSQL shape, so reaching here
+				// means a PG source whose flavor could not be confirmed (a
+				// transient stream_state read failure, or a legacy index missing
+				// the flavor column). Name that as the reason — blaming the
+				// (irrelevant, empty) PK type only misleads an operator debugging
+				// an empty _snapshot result.
+				h.logger.Warn("shim: _snapshot could not confirm a postgres source flavor (stream_state read empty or failed); "+
+					"baseline fold skipped, using binlog-only path — a row untouched within the binlog window will read as absent",
+					"schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn, "flavor", flavor)
+			} else {
+				h.logger.Warn("shim: _snapshot PK type not safe for baseline lookup; using binlog-only path",
+					"schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn, "pk_type", dataType)
+			}
+			return h.runPointInTime(q)
+		}
 	}
 
 	ctx, cancel := h.queryContext()

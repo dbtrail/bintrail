@@ -1321,3 +1321,155 @@ func TestSnapshotBaseline_EnumLabelsAcrossBaselineAndDeltas(t *testing.T) {
 		t.Errorf("_snapshot full-table = %v, want id=1 'pending' (baseline) and id=2 'shipped' (mapped delta)", got)
 	}
 }
+
+// setSourceFlavor stamps stream_state so query.SourceFlavor(db) reports the
+// given flavor. The single-row _snapshot PostgreSQL baseline bypass (#1006)
+// keys off it.
+func setSourceFlavor(t *testing.T, db *sql.DB, flavor string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO stream_state (id, mode, flavor, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, NOW(), 5001)
+		ON DUPLICATE KEY UPDATE flavor = VALUES(flavor)`, flavor); err != nil {
+		t.Fatalf("set source flavor: %v", err)
+	}
+}
+
+// TestSnapshotBaseline_PostgresPKTypeBypass is the #1006 guard. For a
+// PostgreSQL source, schema_snapshots.data_type is "" (PG records pg_type_oid,
+// not the MySQL type token), which the MySQL PK-type gate rejects. Without the
+// flavor bypass the single-row _snapshot silently degrades to binlog-only, so a
+// row present in the baseline but never touched in the binlog window resolves to
+// zero rows — the baseline fold the docs promise never runs. With
+// flavor='postgres' the fold runs (PG baselines are raw-text, so the PK match is
+// an identity string join for any type) and the row resolves, while _flashback
+// (binlog-only) still returns nothing for the same query.
+func TestSnapshotBaseline_PostgresPKTypeBypass(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	setSourceFlavor(t, db, "postgres")
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+
+	// PG-style schema snapshot: PRI id with an EMPTY data_type — the exact
+	// shape that tripped the gate — plus a plain column.
+	ts := snapTime.UTC().Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, ts, "public", "orders", "id", 1, "PRI", "", "NO")
+	testutil.InsertSnapshot(t, db, 1, ts, "public", "orders", "amount", 2, "", "", "YES")
+
+	// PG baselines store values as raw pgoutput text — represent id/amount as
+	// strings.
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+		{Name: "amount", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	// id=7 is in the baseline and never touched afterwards (pass-through fold).
+	// id=8 is in the baseline AND updated after it (delta fold) — the case that
+	// proves post-snapshot deltas actually merge onto a PG baseline through the
+	// bypassed gate, not just that the baseline was read.
+	baselineDir := writeBaselineSnapshot(t, snapTime, "public", "orders", cols, [][]string{
+		{"7", "77.77"},
+		{"8", "88.88"},
+	})
+	eventTS := hourTop.Add(5 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "pg-0/1000", 100, 200, eventTS, nil,
+		"public", "orders", 2 /*update*/, "8", nil,
+		[]byte(`{"id":"8","amount":"88.88"}`), []byte(`{"id":"8","amount":"314.15"}`))
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:   true,
+		NoArchive:   true,
+		IndexDBName: dbName,
+		BaselineDir: baselineDir,
+	}, slog.Default())
+
+	// _snapshot must fold the baseline (id=7 never touched → baseline image).
+	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "public", Table: "orders", PKColumn: "id", PKValue: "7", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("_snapshot id=7: %v", err)
+	}
+	cells := rowCells(t, res.Resultset)
+	if len(cells) != 1 {
+		t.Fatalf("_snapshot id=7: expected 1 row from the baseline fold, got %d (PG bypass regressed → binlog-only)", len(cells))
+	}
+	if want := []string{"7", "77.77"}; !slices.Equal(cells[0], want) {
+		t.Errorf("_snapshot id=7 row = %v, want %v", cells[0], want)
+	}
+
+	// _flashback (binlog-only) sees nothing for the never-touched row — the
+	// divergence that proves _snapshot actually consulted the baseline.
+	flash, err := h.runPointInTime(TimeTravelQuery{Type: TypeFlashback, Schema: "public", Table: "orders", PKColumn: "id", PKValue: "7", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("_flashback id=7: %v", err)
+	}
+	if got := len(flash.Resultset.RowDatas); got != 0 {
+		t.Errorf("_flashback id=7 (never touched): expected 0 rows, got %d — divergence with _snapshot lost", got)
+	}
+
+	// id=8: present in the baseline AND updated after it → the post-snapshot
+	// UPDATE folds onto the PG baseline image (delta wins). Proves the deltas
+	// actually merge on the PG path, not just that the baseline was read.
+	res8, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "public", Table: "orders", PKColumn: "id", PKValue: "8", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("_snapshot id=8: %v", err)
+	}
+	if cells8 := rowCells(t, res8.Resultset); len(cells8) != 1 || !slices.Equal(cells8[0], []string{"8", "314.15"}) {
+		t.Errorf("_snapshot id=8 = %v, want [[8 314.15]] (post-baseline UPDATE must fold onto the PG baseline)", cells8)
+	}
+}
+
+// TestSnapshotBaseline_NonPostgresPKTypeStaysGated is the load-bearing
+// complement to the #1006 PostgreSQL bypass: a NON-PostgreSQL source with a
+// non-matchable PK type must STILL degrade to binlog-only. This pins the flavor
+// term — a refactor that widened the gate for every source (dropping the
+// `!= "postgres"` clause, or bypassing on any empty/unsupported type) would let
+// a MySQL non-string PK reach the baseline match, the exact silent-wrong-answer
+// baselinePKStringMatchable exists to prevent. A never-touched baseline row must
+// therefore resolve to zero rows here, not to its baseline image.
+func TestSnapshotBaseline_NonPostgresPKTypeStaysGated(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	setSourceFlavor(t, db, "mysql")
+
+	hourTop := time.Now().UTC().Truncate(time.Hour)
+	addHourlyPartition(t, db, hourTop)
+	snapTime := hourTop.Add(1 * time.Minute)
+	asOf := hourTop.Add(10 * time.Minute)
+
+	// A MySQL source with a JSON primary key — non-matchable via
+	// baselinePKStringMatchable, and NOT postgres, so the gate must hold.
+	ts := snapTime.UTC().Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, ts, "myapp", "items", "id", 1, "PRI", "json", "NO")
+
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	baselineDir := writeBaselineSnapshot(t, snapTime, "myapp", "items", cols, [][]string{
+		{"7"},
+	})
+
+	h := NewHandlerWithConfig(db, Config{
+		AllowGaps:   true,
+		NoArchive:   true,
+		IndexDBName: dbName,
+		BaselineDir: baselineDir,
+	}, slog.Default())
+
+	// id=7 is in the baseline but never touched; with the gate held (non-PG,
+	// non-matchable type) _snapshot degrades to binlog-only → zero rows.
+	res, err := h.runSnapshot(TimeTravelQuery{Type: TypeSnapshot, Schema: "myapp", Table: "items", PKColumn: "id", PKValue: "7", AsOf: asOf})
+	if err != nil {
+		t.Fatalf("_snapshot id=7: %v", err)
+	}
+	if got := len(res.Resultset.RowDatas); got != 0 {
+		t.Errorf("_snapshot id=7 (non-PG, non-matchable PK): expected 0 rows (gate must hold), got %d — the PG bypass leaked to a non-PG source", got)
+	}
+}
