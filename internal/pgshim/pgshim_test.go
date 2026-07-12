@@ -35,6 +35,12 @@ func TestTextCell(t *testing.T) {
 		{"bool true", true, []byte("t")},
 		{"bool false", false, []byte("f")},
 		{"time UTC", time.Date(2026, 7, 12, 1, 2, 3, 0, time.UTC), []byte("2026-07-12 01:02:03")},
+		// Native numerics (baseline-origin cells): decimal/shortest round-trip,
+		// never the default fmt path's %g rounding surprises.
+		{"float64 plain", float64(1.5), []byte("1.5")},
+		{"float64 large", float64(1e21), []byte("1e+21")},
+		{"int64 max", int64(9223372036854775807), []byte("9223372036854775807")},
+		{"uint64 max", uint64(18446744073709551615), []byte("18446744073709551615")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -234,11 +240,61 @@ func TestPGWire_ConnectNegotiatesSSLAndAuthenticates(t *testing.T) {
 
 func TestPGWire_AuthFailureIsRejected(t *testing.T) {
 	addr := serveAddr(t, testAuth(t))
-	if _, err := connectPGWire(t, addr, testUser, "wrongpass"); err == nil {
-		t.Fatal("connect with a wrong password must fail")
+	// Both a wrong password and an unknown user must be rejected with SQLSTATE
+	// 28P01 (invalid_password), so the CODE never reveals which usernames exist.
+	// (The message echoes the SUPPLIED username — as real PostgreSQL does — which
+	// the client already knows; do not assert message equality across the two.)
+	for _, tc := range []struct{ user, pass string }{
+		{testUser, "wrongpass"},
+		{"ghost", testPass},
+	} {
+		_, err := connectPGWire(t, addr, tc.user, tc.pass)
+		pgErr := requirePgError(t, err)
+		if pgErr.Code != "28P01" {
+			t.Errorf("auth failure for %q: code = %s, want 28P01; msg=%s", tc.user, pgErr.Code, pgErr.Message)
+		}
 	}
-	if _, err := connectPGWire(t, addr, "ghost", testPass); err == nil {
-		t.Fatal("connect as an unknown user must fail")
+}
+
+// TestPGWire_ExtendedProtocolDeclinedThenResyncs pins the documented invariant
+// on the DEFAULT pgx client path (pgshim.go: "a default-mode client is not left
+// hanging"): a first cut speaks only the simple query protocol, so an
+// extended-protocol query is declined with 0A000 — NOT a hang — and the
+// connection resyncs on the client's trailing Sync so a following simple-protocol
+// query on the SAME connection succeeds.
+func TestPGWire_ExtendedProtocolDeclinedThenResyncs(t *testing.T) {
+	addr := serveAddr(t, testAuth(t))
+	cfg, err := pgx.ParseConfig(fmt.Sprintf("postgres://%s:%s@%s/public", testUser, testPass, addr))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	// DEFAULT exec mode = extended protocol (Parse/Bind/Describe/Execute/Sync) —
+	// the mode a naive pgx/ORM client uses.
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	conn, err := pgx.ConnectConfig(dialCtx, cfg)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() {
+		cc, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = conn.Close(cc)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Prepare unambiguously sends a Parse (a zero-arg Exec would be optimised to
+	// the simple protocol by pgx). The Parse is declined (not hung).
+	_, err = conn.Prepare(ctx, "probe_stmt", "SELECT 1")
+	pgErr := requirePgError(t, err)
+	if pgErr.Code != "0A000" {
+		t.Fatalf("extended-protocol decline: code = %s, want 0A000; msg=%s", pgErr.Code, pgErr.Message)
+	}
+	// The connection resynced (ReadyForQuery on the trailing Sync): a
+	// simple-protocol query on the SAME conn works.
+	if _, err := conn.Exec(ctx, "SET x=1", pgx.QueryExecModeSimpleProtocol); err != nil {
+		t.Fatalf("connection did not resync after the extended-protocol decline: %v", err)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -189,6 +190,28 @@ func textCell(col string, v any) ([]byte, error) {
 		return []byte(x), nil
 	case json.Number:
 		return []byte(x.String()), nil
+	// Native numeric types appear for a baseline-origin cell (ReadBaselineRow
+	// scans a typed Parquet column into a native Go value) — reachable when a
+	// MySQL/MariaDB-source index is served here and _snapshot returns a value
+	// untouched in the binlog window. Render them explicitly rather than via the
+	// default fmt path, whose %v on a float uses scientific notation for extreme
+	// magnitudes; strconv 'g'/-1 is the shortest round-trippable form and matches
+	// PostgreSQL's own float text. (A PG-source index stores every value as text,
+	// so it hits the string case above and never reaches here.)
+	case float64:
+		return strconv.AppendFloat(nil, x, 'g', -1, 64), nil
+	case float32:
+		return strconv.AppendFloat(nil, float64(x), 'g', -1, 32), nil
+	case int64:
+		return strconv.AppendInt(nil, x, 10), nil
+	case int32:
+		return strconv.AppendInt(nil, int64(x), 10), nil
+	case int:
+		return strconv.AppendInt(nil, int64(x), 10), nil
+	case uint64:
+		return strconv.AppendUint(nil, x, 10), nil
+	case uint32:
+		return strconv.AppendUint(nil, uint64(x), 10), nil
 	case bool:
 		if x {
 			return []byte("t"), nil

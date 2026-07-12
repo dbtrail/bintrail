@@ -406,7 +406,11 @@ Scope and behaviour track PostgreSQL's current time-travel maturity:
   the `CREATE TABLE` metadata full-table reconstruct needs (the same limit as
   `reconstruct --output-format mydumper` and baseline-anchored `verify`).
 - Columns render as **text** (the conservative first cut): read each one as a
-  string, or let your driver text-parse it into a typed target.
+  string, or let your driver text-parse it into a typed target. One caveat: a
+  binary/`bytea` value containing a `0x00` byte truncates at the first NUL in
+  `psql`/libpq (their text protocol uses NUL-terminated C strings); a driver that
+  reads the raw value (e.g. `pgx` scanning into `[]byte`) round-trips it intact.
+  Per-column type OIDs (so `bytea` arrives as `bytea`) are a follow-up.
 - Use the **simple query protocol** — `psql` does this by default; a `pgx`
   client sets `QueryExecModeSimpleProtocol`. The extended (prepared-statement)
   protocol is not yet implemented.

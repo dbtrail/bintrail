@@ -105,8 +105,12 @@ func classifyFetchError(ctx context.Context, qType QueryType, err error, logger 
 func mysqlResolveError(rerr *ResolveError) error {
 	switch rerr.Class {
 	case ResolveGap:
+		// %s (not .Error()) so a would-be &ResolveError{Class: ResolveGap} with a
+		// nil Err formats safely instead of panicking — the PG renderer's Gap
+		// branch is already nil-robust this way. Byte-identical for the reachable
+		// case (classifyFetchError always sets a non-nil Err).
 		return mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE,
-			fmt.Sprintf("resolve %s: %s", rerr.QType, rerr.Err.Error()))
+			fmt.Sprintf("resolve %s: %s", rerr.QType, rerr.Err))
 	case ResolveTimeout:
 		return mysql.NewError(mysql.ER_QUERY_INTERRUPTED, fmt.Sprintf(
 			"resolve %s: query exceeded the shim's --query-timeout and was aborted; narrow the AS OF range, filter by PK, or raise --query-timeout", rerr.QType))

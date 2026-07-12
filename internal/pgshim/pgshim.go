@@ -163,10 +163,21 @@ func nextBackoff(cur time.Duration) time.Duration {
 func handleConn(ctx context.Context, c net.Conn, cfg Config, logger *slog.Logger) {
 	defer c.Close()
 
-	// Per-connection context so shutdown / a mid-query client disconnect cancels
-	// in-flight resolves (QueryTimeout is the other backstop).
+	// Per-connection context: cancelling it aborts an in-flight resolve
+	// (QueryTimeout is the other backstop).
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// A blocking be.Receive() / ReceiveStartupMessage() is a ctx-unaware socket
+	// read, so cancelling connCtx alone cannot unblock an IDLE connection parked
+	// between queries (or pre-auth). Close the socket when connCtx ends — on
+	// SIGTERM shutdown or the deferred cancel on return — so the parked read
+	// errors out and this goroutine exits; otherwise Serve's wg.Wait() would hang
+	// graceful shutdown on every idle psql session. Mirrors the MySQL shim's
+	// watchConn (internal/cli/shim.go). stopClose prevents the AfterFunc from
+	// racing the normal-return path (it is a no-op once the func has run).
+	stopClose := context.AfterFunc(connCtx, func() { _ = c.Close() })
+	defer stopClose()
 
 	be := pgproto3.NewBackend(c, c)
 

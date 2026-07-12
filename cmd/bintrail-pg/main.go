@@ -6,7 +6,7 @@
 //
 // Why a separate binary rather than a subcommand of bintrail: the PostgreSQL
 // capture path links jackc/pgx + pglogrepl, which the core MySQL binary must
-// stay free of (cmd/bintrail/pgfree_test.go enforces this). Splitting the
+// stay free of (cliapp/pgfree_test.go enforces this). Splitting the
 // capture plane per source keeps each binary's dependency surface honest while
 // the read plane is shared code. The user wants a distinct `bintrail-pg` as the
 // recognizable artifact for the Postgres-recovery niche (#534).
