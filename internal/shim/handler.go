@@ -23,7 +23,6 @@ import (
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
-	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 // showTablesFromVirtualRE matches the interactive `SHOW [FULL] TABLES
@@ -387,6 +386,14 @@ func (h *Handler) queryContext() (context.Context, context.CancelFunc) {
 	return context.WithCancel(base)
 }
 
+// QueryContext exposes queryContext so a second wire front-end (the pgwire
+// server in internal/pgshim, #1008) roots each resolve at the same
+// per-connection context + QueryTimeout deadline the MySQL command loop uses.
+// The returned cancel must be deferred.
+func (h *Handler) QueryContext() (context.Context, context.CancelFunc) {
+	return h.queryContext()
+}
+
 // UseDB stores the schema the client selected. _flashback queries
 // without an explicit schema use this value.
 func (h *Handler) UseDB(dbName string) error {
@@ -495,27 +502,11 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 // though the client only sees "query interrupted"; nil logger is a no-op
 // for tests that don't care about log output.
 func wrapFetchError(ctx context.Context, qType QueryType, err error, logger *slog.Logger) error {
-	var gapErr *query.GapError
-	if errors.As(err, &gapErr) {
-		return mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE,
-			fmt.Sprintf("resolve %s: %s", qType, gapErr.Error()))
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		if logger != nil && !errors.Is(err, ctxErr) {
-			logger.Warn("shim: query context ended before fetch returned; discarding underlying error from the wire response",
-				"query_type", qType, "ctx_err", ctxErr, "underlying_err", err)
-		}
-		err = ctxErr
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return mysql.NewError(mysql.ER_QUERY_INTERRUPTED, fmt.Sprintf(
-			"resolve %s: query exceeded the shim's --query-timeout and was aborted; narrow the AS OF range, filter by PK, or raise --query-timeout", qType))
-	}
-	if errors.Is(err, context.Canceled) {
-		return mysql.NewError(mysql.ER_QUERY_INTERRUPTED, fmt.Sprintf(
-			"resolve %s: query canceled (client disconnected or shim shutting down)", qType))
-	}
-	return fmt.Errorf("resolve %s: %w", qType, err)
+	// Delegates to the wire-neutral classifier (#1008, resolve.go) so the MySQL
+	// and pgwire front-ends draw the SAME gap/deadline/cancel/fault split; the
+	// mysqlResolveError mapping keeps this byte-identical to the pre-#1008 form
+	// for every existing caller (runFullTable / runDiff / runSnapshotFullTable).
+	return mysqlResolveError(classifyFetchError(ctx, qType, err, logger))
 }
 
 // fullTableGateError converts a FullTableGate.Acquire failure into the
@@ -568,65 +559,17 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	ctx, cancel := h.queryContext()
 	defer cancel()
 
-	// Fetch the PK's full ordered event sequence up to AsOf and cut it at the
-	// TRANSACTION boundary, not the row (#988). event_timestamp is a
-	// statement's execution time, so a plain LimitPerPK=1 could surface the
-	// latest event of a multi-statement transaction that had not fully
-	// committed as of AsOf — a row state that never existed at AsOf.
-	// reconstruct.FetchEventsAtomic (the #783 machinery the single-row
-	// _snapshot path already uses) drops a straddling trailing transaction
-	// whole, and reconstruct.ApplyAt folds the surviving events (INSERT/UPDATE
-	// → row_after, DELETE → deleted) onto the state at AsOf. No LimitPerPK: the
-	// fold needs the sequence, and trimming a single LimitPerPK=1 row would
-	// leave nothing to fall back to. The fetch is one-PK-scoped, so its size is
-	// bounded by how often this row changed in the retained window — the same
-	// bound _diff and the single-row _snapshot path already accept.
-	opts := query.Options{
-		Schema: q.Schema,
-		Table:  q.Table,
-		Until:  &q.AsOf,
-	}
-	// q.PKValue may legitimately be "" (`WHERE name = ''` against a NOT-NULL
-	// string PK). buildQuery DISABLES the PK filter when Options.PKValues == "",
-	// which would fold every event for the WHOLE TABLE onto one state — a silent
-	// wrong answer. Route "" through PKValuesIn (`pk_values IN (?)`), which keeps
-	// the fetch scoped to the one row; keep the pk_hash fast path otherwise.
-	// Mirrors runSnapshotPointInTime. q.PKValue is raw/unescaped (#826);
-	// pk_values is event.BuildPKValues-encoded, so re-encode with EscapePKValue.
-	encoded := event.EscapePKValue(q.PKValue)
-	if q.PKValue != "" {
-		opts.PKValues = encoded
-	} else {
-		opts.PKValuesIn = []string{encoded}
-	}
-	engine := query.New(h.indexDB)
-	rows, _, err := reconstruct.FetchEventsAtomic(ctx, h.indexDB, engine, query.FetchMergedOptions{
-		Opts:           opts,
-		DBName:         h.cfg.IndexDBName,
-		NoArchive:      h.cfg.NoArchive,
-		AllowGaps:      h.cfg.AllowGaps,
-		ArchiveFetcher: h.archiveFetcher,
-	}, q.AsOf)
+	// The single-row fetch → ENUM/SET epoch map → transaction-atomic ApplyAt
+	// fold now lives in the wire-neutral ResolveFlashbackRow (#1008, resolve.go),
+	// shared with the pgwire front-end. A nil image means the row did not exist
+	// at AsOf (never created, or a DELETE tail); a fetch/coverage failure is a
+	// *ResolveError; an ApplyAt data-fault is raw. mysqlRenderErr maps both to
+	// the same wire codes the pre-#1008 inline path produced.
+	image, err := h.ResolveFlashbackRow(ctx, q)
 	if err != nil {
-		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
+		return nil, mysqlRenderErr(err)
 	}
-
-	// ENUM/SET ordinals → labels (#472/#475) BEFORE the fold: ApplyAt replaces
-	// the image wholesale per event, so pre-mapped events make the final state
-	// carry labels the way the live table did when the event happened.
-	h.mapEventImages(q.Schema, q.Table, rows)
-	image, err := reconstruct.ApplyAt(nil, rows, q.AsOf)
-	if err != nil {
-		// Residual unchanged-TOAST marker (#592) — a capture-invariant
-		// violation, i.e. a server-side data fault: plain error →
-		// ER_UNKNOWN_ERROR (1105). Refusing beats serving the marker's JSON.
-		return nil, err
-	}
-	if len(image) == 0 {
-		// Row never existed at AsOf (no event in the window), or its latest
-		// surviving event was a DELETE. A non-DELETE tail that folds to empty is
-		// a corrupt/partial row image — surfaced as a Warn, not silently.
-		h.warnCorruptImageDrop(q.Schema, q.Table, rows)
+	if image == nil {
 		return emptyResult(), nil
 	}
 	// When q.Columns is set (#313 user-supplied projection), bypass
@@ -1048,63 +991,12 @@ func fullTableColumns(images []map[string]any, ddlOrder []string) []string {
 //   - single-column PK that does NOT match → 1064 with an actionable
 //     message naming both the expected and the user-supplied column.
 func (h *Handler) validatePKColumn(q TimeTravelQuery) error {
-	if q.PKColumn == "" {
-		return nil
-	}
-	if h.resolverFn == nil {
-		return nil
-	}
-	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger)
-	if err != nil {
-		// Cannot confirm q.PKColumn is the table's PK. A
-		// column-qualified WHERE is guaranteed here (the full-table
-		// shape returned above), so fail loud rather than join the
-		// literal against pk_values and risk the wrong row (#821).
-		// ErrNoSnapshots (benign first-install state) still can't
-		// verify the PK, so it rejects too — only the no-WHERE
-		// full-table path is exempt. Was Debug/skip; raised to Warn.
-		reason := "schema_snapshots lookup failed"
-		if errors.Is(err, metadata.ErrNoSnapshots) {
-			reason = "no schema snapshots available yet"
-		}
-		h.logger.Warn("shim: cannot verify PK column; rejecting column-qualified WHERE",
-			"err", err, "reason", reason, "schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn)
-		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
-			"cannot verify WHERE column %s is the primary key of %s.%s (%s); refusing to run so a non-PK WHERE cannot silently return the wrong row",
-			q.PKColumn, q.Schema, q.Table, reason,
-		))
-	}
-	tm, err := r.Resolve(q.Schema, q.Table)
-	if err != nil {
-		// Table absent from every snapshot (created after the newest
-		// snapshot, or not yet seen on the stream). Can't verify the
-		// PK, so a column-qualified WHERE rejects rather than answer
-		// against pk_values and return a different row (#821). Re-run
-		// `bintrail snapshot`; the no-WHERE full-table path still works.
-		h.logger.Warn("shim: table not in any snapshot; rejecting column-qualified WHERE",
-			"err", err, "schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn)
-		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
-			"cannot verify WHERE column %s is the primary key of %s.%s (table not present in any indexed snapshot); refusing to run so a non-PK WHERE cannot silently return the wrong row",
-			q.PKColumn, q.Schema, q.Table,
-		))
-	}
-	if len(tm.PKColumns) == 0 {
-		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
-			"%s.%s has no primary key declared in the indexed snapshot; cannot resolve %s by PK",
-			q.Schema, q.Table, q.Type,
-		))
-	}
-	if len(tm.PKColumns) > 1 {
-		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
-			"%s.%s has a composite primary key (%s); WHERE %s = <value> shape supports only single-column PKs",
-			q.Schema, q.Table, strings.Join(tm.PKColumns, ", "), q.PKColumn,
-		))
-	}
-	if q.PKColumn != tm.PKColumns[0] {
-		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
-			"WHERE column must be the primary key of %s.%s (expected %s, got %s)",
-			q.Schema, q.Table, tm.PKColumns[0], q.PKColumn,
-		))
+	// The check itself is wire-neutral (#1008): PKColumnCheck returns the reason
+	// string, shared with the pgwire front-end (which wraps it in SQLSTATE
+	// 42601). Here we keep the historical ER_PARSE_ERROR (1064) wrapping and the
+	// exact message text, so MySQL behaviour is unchanged.
+	if msg, reject := h.PKColumnCheck(q); reject {
+		return mysql.NewError(mysql.ER_PARSE_ERROR, msg)
 	}
 	return nil
 }

@@ -42,6 +42,11 @@ in *how the client connects*:
    `AS OF` queries on the same endpoint. ProxySQL routes virtual-schema queries
    to the shim and everything else to your real MySQL.
 
+All three speak the **MySQL** protocol. A **PostgreSQL** operator can instead run
+single-row `AS OF` over the **PostgreSQL wire protocol** from `psql` with
+`bintrail-pg flashback` — same grammar, no MySQL client required. See
+[Interactive `AS OF` from `psql`](postgres.md#interactive-as-of-from-psql).
+
 ### The embedded port (multi-source)
 
 `bintrail-console watch` already holds the time-travel engine and, through its

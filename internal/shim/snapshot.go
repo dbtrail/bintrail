@@ -12,7 +12,6 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
-	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -534,167 +533,20 @@ func baselinePKStringMatchable(dataType string) bool {
 // the never-touched-since-before-the-window row, which is exactly what
 // the baseline lookup recovers when it is available.
 func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
-	src := h.baselineSource()
-	if src == "" {
-		h.logger.Debug("shim: _snapshot has no baseline source configured; using binlog-only path",
-			"schema", q.Schema, "table", q.Table)
-		return h.runPointInTime(q)
-	}
-
-	// Guard the PK type before attempting a baseline match. ReadBaselineRow
-	// matches `pkColumn = ?` against the *typed* Parquet column binding
-	// q.PKValue as a string and relying on DuckDB's implicit coercion — it
-	// does NOT canonicalize the way the full-table path does. Only types
-	// whose Parquet representation coerces cleanly from a string literal are
-	// safe here (see baselinePKStringMatchable); for the rest the comparison
-	// silently finds nothing and we would wrongly conclude the row never
-	// existed, so we fall back to the binlog-only path with a signal.
-	// validatePKColumn already confirmed q.PKColumn IS the table's
-	// single-column PK (or was permissive because the resolver was
-	// unavailable), so here we only need its type.
-	dataType, ok := h.pkDataType(q.Schema, q.Table, q.PKColumn)
-	if !ok {
-		h.logger.Debug("shim: _snapshot cannot resolve PK type; using binlog-only path",
-			"schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn)
-		return h.runPointInTime(q)
-	}
-	// PostgreSQL baselines store every column as raw pgoutput text
-	// (baseline.Column.RawText, #593), so ReadBaselineRow's string-bound
-	// `pkColumn = ?` match is a string-identity join that can only recover the
-	// right row or find nothing — never a wrong row — the same reason the offline
-	// reconstruct path treats all PG PK columns as string-matchable (#593 slice
-	// D). The MySQL DATA_TYPE token is empty for a PG source
-	// (schema_snapshots.data_type is "" — PG records pg_type_oid, not the MySQL
-	// type), so without this flavor bypass every PG _snapshot would silently
-	// degrade to binlog-only and the baseline fold the docs promise would never
-	// run (#1006). The flavor read is short-circuited so the MySQL hot path (a
-	// matchable type) never pays for the extra query.
-	if !baselinePKStringMatchable(dataType) {
-		if flavor := query.SourceFlavor(h.indexDB); flavor != "postgres" {
-			if dataType == "" {
-				// The empty data_type is the PostgreSQL shape, so reaching here
-				// means a PG source whose flavor could not be confirmed (a
-				// transient stream_state read failure, or a legacy index missing
-				// the flavor column). Name that as the reason — blaming the
-				// (irrelevant, empty) PK type only misleads an operator debugging
-				// an empty _snapshot result.
-				h.logger.Warn("shim: _snapshot could not confirm a postgres source flavor (stream_state read empty or failed); "+
-					"baseline fold skipped, using binlog-only path — a row untouched within the binlog window will read as absent",
-					"schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn, "flavor", flavor)
-			} else {
-				h.logger.Warn("shim: _snapshot PK type not safe for baseline lookup; using binlog-only path",
-					"schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn, "pk_type", dataType)
-			}
-			return h.runPointInTime(q)
-		}
-	}
-
 	ctx, cancel := h.queryContext()
 	defer cancel()
 
-	// Stale-fallback warning (#466) discarded here — see the full-table path.
-	baselinePath, snapshotTime, _, err := reconstruct.FindBaseline(ctx, src, q.Schema, q.Table, q.AsOf)
+	// The baseline lookup, the #1007 PostgreSQL flavor bypass, the fetch, the
+	// ENUM/SET epoch map, and the ApplyAt fold now live in the wire-neutral
+	// ResolveSnapshotRow (#1008, resolve.go), shared with the pgwire front-end.
+	// A nil state means the row did not exist at AsOf; a fetch/coverage failure
+	// is a *ResolveError; a baseline/ApplyAt data-fault is raw. mysqlRenderErr
+	// keeps this byte-identical to the pre-#1008 inline path.
+	state, err := h.ResolveSnapshotRow(ctx, q)
 	if err != nil {
-		if errors.Is(err, reconstruct.ErrNoBaseline) {
-			h.logger.Debug("shim: _snapshot found no baseline at-or-before AsOf; using binlog-only path",
-				"schema", q.Schema, "table", q.Table,
-				"as_of", q.AsOf.UTC().Format(time.RFC3339))
-			return h.runPointInTime(q)
-		}
-		// A real baseline-source failure (unreadable dir, S3 outage) is a
-		// server-side fault: plain error → ER_UNKNOWN_ERROR (1105), the same
-		// user-vs-server split runPointInTime preserves for fetch failures.
-		return nil, err
+		return nil, mysqlRenderErr(err)
 	}
-
-	// Refuse if a TRUNCATE/DROP/RENAME hit this table in the window: same
-	// blind spot as the full-table path — no row events to invalidate the
-	// baseline image, so the row would silently resolve as if it still
-	// existed after being truncated away (#764).
-	if err := reconstruct.CheckDestructiveDDL(ctx, h.indexDB, q.Schema, q.Table, snapshotTime, q.AsOf); err != nil {
-		return nil, err
-	}
-
-	// q.PKValue is passed RAW (unescaped) here — Parquet baseline rows store
-	// actual column values, not event.BuildPKValues-encoded pk_values, so this
-	// seam must NOT apply event.EscapePKValue (unlike the delta fetch below).
-	baselineRow, err := reconstruct.ReadBaselineRow(ctx, baselinePath, map[string]string{q.PKColumn: q.PKValue})
-	if err != nil {
-		return nil, err
-	}
-
-	// Fetch every event for this PK from the snapshot instant up to AsOf.
-	// Unlike the binlog-only path (LimitPerPK=1), we want the full ordered
-	// sequence so ApplyAt folds them onto the baseline image in commit order
-	// — matching `bintrail reconstruct`'s single-row semantics. Since=
-	// snapshotTime drops pre-baseline events the baseline already supersedes,
-	// making this strictly more correct than the binlog-only path for a row
-	// whose only events predate the snapshot.
-	//
-	// PK filter: q.PKValue may legitimately be the empty string (e.g.
-	// `WHERE name = ''` against a NOT-NULL string PK — the shape
-	// runPointInTime documents). buildQuery DISABLES the PK filter entirely
-	// when Options.PKValues == "", which would fold every event for the whole
-	// table onto the single baseline row — a silent wrong answer. Route the
-	// empty case through PKValuesIn, which emits `pk_values IN (?)` and keeps
-	// the fetch scoped to the one row; keep the pk_hash fast path for the
-	// common non-empty case.
-	opts := query.Options{
-		Schema:   q.Schema,
-		Table:    q.Table,
-		Since:    &snapshotTime,
-		SincePos: snapshotSincePos(ctx, baselinePath, h.logger, q.Schema, q.Table),
-		Until:    &q.AsOf,
-	}
-	// q.PKValue is raw/unescaped (#826). Unlike ReadBaselineRow above (which
-	// matches actual Parquet column values and must keep the raw value), this
-	// delta fetch matches binlog_events.pk_values, which is
-	// event.BuildPKValues-encoded — re-encode with event.EscapePKValue so a
-	// backslash- or pipe-containing PK's post-baseline events are found
-	// instead of silently missing (which would serve a stale baseline image
-	// as the answer at AsOf).
-	encoded := event.EscapePKValue(q.PKValue)
-	if q.PKValue != "" {
-		opts.PKValues = encoded
-	} else {
-		opts.PKValuesIn = []string{encoded}
-	}
-	engine := query.New(h.indexDB)
-	// FetchEventsAtomic (not a plain query.FetchMerged) cuts the AsOf upper
-	// bound at the transaction boundary, not the row: a multi-statement
-	// transaction straddling AsOf is excluded whole rather than half-applied
-	// (#783).
-	rows, _, err := reconstruct.FetchEventsAtomic(ctx, h.indexDB, engine, query.FetchMergedOptions{
-		Opts:           opts,
-		DBName:         h.cfg.IndexDBName,
-		NoArchive:      h.cfg.NoArchive,
-		AllowGaps:      h.cfg.AllowGaps,
-		ArchiveFetcher: h.archiveFetcher,
-	}, q.AsOf)
-	if err != nil {
-		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
-	}
-
-	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
-	// BEFORE the fold: ApplyAt replaces the image wholesale per event, so
-	// pre-mapped events make the final state carry labels. Only deltas
-	// need this — the baseline image already carries labels (mydumper
-	// dumps strings) and string values pass through the mapper untouched.
-	h.mapEventImages(q.Schema, q.Table, rows)
-	state, err := reconstruct.ApplyAt(baselineRow, rows, q.AsOf)
-	if err != nil {
-		// A residual unchanged-TOAST marker (#592) — a capture-invariant
-		// violation, i.e. a server-side data fault: plain error →
-		// ER_UNKNOWN_ERROR (1105), same as a baseline-source failure above.
-		// Refusing beats serving the marker's JSON as the column value.
-		return nil, err
-	}
-	if len(state) == 0 {
-		// Either the row never existed at AsOf (no baseline image and no INSERT
-		// in the window) or its latest event was a DELETE. A non-DELETE tail that
-		// folds to empty is a corrupt/partial row image — surfaced as a Warn, not
-		// silently (mirrors runPointInTime).
-		h.warnCorruptImageDrop(q.Schema, q.Table, rows)
+	if state == nil {
 		return emptyResult(), nil
 	}
 

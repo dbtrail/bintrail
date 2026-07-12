@@ -368,6 +368,57 @@ directly.
 > release — see [Beta limitations](#beta-limitations) for the complete
 > picture.
 
+### Interactive `AS OF` from `psql`
+
+The `_flashback` / `_snapshot` / `AS OF` time-travel grammar is also available
+over the **PostgreSQL wire protocol**, so you can run single-row time-travel
+straight from `psql` (or any PostgreSQL driver) rather than the MySQL-wire shim:
+
+```bash
+bintrail-pg flashback \
+  --index-dsn 'root:…@tcp(127.0.0.1:3306)/bintrail_index' \
+  --shim-config shim.yaml \
+  --baseline-dir ./baselines      # optional; enables _snapshot
+  # --listen 127.0.0.1:5433 is the default
+```
+
+Then connect and query. **Set `dbname` to your PostgreSQL schema** (e.g.
+`public`); choose flashback-vs-snapshot with the `_flashback.` / `_snapshot.`
+table prefix in the query, exactly like the MySQL shim:
+
+```
+psql "host=127.0.0.1 port=5433 user=<tenant> dbname=public"
+
+-- binlog-only view of one row at a past instant:
+SELECT * FROM _flashback.orders AS OF '5 minutes ago' WHERE id = 42;
+
+-- baseline-aware view (also resolves rows untouched in the retained window):
+SELECT * FROM _snapshot.orders  AS OF '2026-07-01 09:00:00' WHERE id = 42;
+
+-- the bare form on the real table works too:
+SELECT * FROM orders AS OF '5 minutes ago' WHERE id = 42;
+```
+
+Scope and behaviour track PostgreSQL's current time-travel maturity:
+
+- **Single-row `AS OF` only** — a `WHERE <primary-key> = <value>` predicate.
+  Full-table `AS OF` is refused with remediation: a PG baseline does not carry
+  the `CREATE TABLE` metadata full-table reconstruct needs (the same limit as
+  `reconstruct --output-format mydumper` and baseline-anchored `verify`).
+- Columns render as **text** (the conservative first cut): read each one as a
+  string, or let your driver text-parse it into a typed target.
+- Use the **simple query protocol** — `psql` does this by default; a `pgx`
+  client sets `QueryExecModeSimpleProtocol`. The extended (prepared-statement)
+  protocol is not yet implemented.
+- **Auth** mirrors the shim: a cleartext password per tenant from
+  `--shim-config` (`shim.yaml`). The default listen address is loopback; for a
+  non-loopback bind, front a TLS terminator — the same posture as the MySQL
+  shim behind ProxySQL.
+
+`bintrail-pg` still ships the MySQL-wire `shim` command as well, if you prefer
+to reach the index from MySQL tooling. See
+[Time-Travel SQL Setup](time-travel-sql.md) for the full grammar.
+
 ---
 
 ## Sequences after recovery
