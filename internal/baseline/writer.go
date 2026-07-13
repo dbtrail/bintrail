@@ -110,12 +110,12 @@ func NewWriter(path string, cols []Column, cfg WriterConfig) (*Writer, error) {
 // WriteRow converts a row of string values (in MySQL column order) into a
 // Parquet row and writes it to the file.
 func (w *Writer) WriteRow(values []string, nulls []bool) error {
-	// #503 item 4 (value/column-count desync) is enforced UPSTREAM of every
-	// WriteRow caller: the mydumper path fails loud on a strict len(values) !=
-	// len(cols) at baseline.go (issue #767), and the other callers (archive,
-	// buffer, byos, pgbaseline) build fixed-arity value slices by construction.
-	// WriteRow keeps its defensive NULL-pad for a short row (a bounds check, not
-	// a supported layout) and does not re-check here.
+	// #503 item 4 (value/column-count desync): every WriteRow caller must supply
+	// exactly len(cols) values. That invariant is enforced UPSTREAM — the mydumper
+	// path fails loud on a strict len(values) != len(cols) at baseline.go (issue
+	// #767, test-pinned), and the remaining callers build fixed-arity value slices
+	// by construction — so WriteRow does not re-check here; it keeps only its
+	// defensive NULL-pad for a short row (a bounds check, not a supported layout).
 	row := make(parquet.Row, len(w.parquetCols))
 	for parquetIdx, col := range w.parquetCols {
 		mysqlIdx := w.mysqlOrder[parquetIdx]
@@ -306,7 +306,8 @@ func convertValue(col Column, raw string) (parquet.Value, error) {
 		// for spatial columns is not verified end-to-end here (mydumper unavailable
 		// in the unit env); the type mapping is the safe floor.
 		"geometry", "point", "linestring", "polygon",
-		"multipoint", "multilinestring", "multipolygon", "geometrycollection":
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection", "geomcollection": // MySQL 8.0 canonicalizes the former to the latter
 		return parquet.ByteArrayValue(decodeBinaryLiteral(raw)), nil
 
 	default:

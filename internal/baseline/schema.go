@@ -185,7 +185,8 @@ func mysqlToParquetNode(typeToken string, unsigned bool) parquet.Node {
 		// #503 item 2. The exact mydumper spatial encoding is unverified end-to-end
 		// here; the binary type mapping is the safe floor.
 		"geometry", "point", "linestring", "polygon",
-		"multipoint", "multilinestring", "multipolygon", "geometrycollection":
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection", "geomcollection": // MySQL 8.0 canonicalizes the former to the latter
 		return parquet.Optional(parquet.Leaf(parquet.ByteArrayType))
 	default:
 		// Unknown type — treat as string to avoid data loss.

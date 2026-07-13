@@ -77,3 +77,30 @@ func TestReadSQLFile_BinaryIntroducerHex(t *testing.T) {
 		t.Errorf("_binary 0x… → vb=%q, want %q", got, "0x612C6229")
 	}
 }
+
+// Item 2 (#503): GEOMETRY and its subtypes must map to a binary Parquet leaf
+// (like blob), NOT the UTF-8 String default — otherwise non-UTF-8 WKB bytes would
+// be written under a STRING annotation. Guards the schema-node half of the fix,
+// which the convertValue test cannot see (it builds Columns with no ParquetType).
+func TestGeometryMapsToBinaryNode(t *testing.T) {
+	blob := MysqlToParquetNode2("blob", false)
+	str := MysqlToParquetNode2("varchar", false)
+	// Sanity: the assertion below must be able to tell a binary leaf from STRING
+	// in this parquet-go version, else it would false-pass.
+	if (blob.Type().LogicalType() == nil) == (str.Type().LogicalType() == nil) {
+		t.Fatal("cannot distinguish binary leaf from STRING via LogicalType — revisit the assertion")
+	}
+	for _, typ := range []string{
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection", "geomcollection",
+	} {
+		node := MysqlToParquetNode2(typ, false)
+		if node.Type().Kind() != blob.Type().Kind() {
+			t.Errorf("%s: node kind %v, want %v (binary leaf like blob)", typ, node.Type().Kind(), blob.Type().Kind())
+		}
+		if (node.Type().LogicalType() == nil) != (blob.Type().LogicalType() == nil) {
+			t.Errorf("%s: logical-type annotation differs from blob — likely mapped to STRING, storing WKB as UTF-8", typ)
+		}
+	}
+}
