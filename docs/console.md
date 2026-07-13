@@ -72,12 +72,15 @@ verification).
 > **Scope of `--ssl-mode` under `watch`.** The flag encrypts `watch`'s embedded
 > **stream** connections — the source replication and the index *write*. It does
 > **not** currently cover the console's own index *reads* (the connections the
-> multi-server manager opens to serve the web UI) or the embedded flashback port
-> (`--flashback-listen`). To encrypt those, add a `tls=` parameter to the
-> connection's DSN (`...?tls=true`, or `?tls=skip-verify` for self-signed dev
-> certs) — the same knob the offline read commands use. If your index MySQL is
-> reached over loopback or a private network this is moot; over an untrusted
-> network, set `tls=` on the index DSN in addition to `--ssl-mode`.
+> multi-server manager opens to serve the web UI) or the index reads behind the
+> embedded flashback port (`--flashback-listen`). Encrypt those index
+> connections by adding a `tls=` parameter to their DSN (`...?tls=true`, or
+> `?tls=skip-verify` for self-signed dev certs) — the same knob the offline read
+> commands use. (The flashback port's *inbound* MySQL-protocol listener — the
+> client→port leg — has no TLS option in this release; `tls=` only covers its
+> backend index reads.) If your index MySQL is reached over loopback or a
+> private network this is moot; over an untrusted network, set `tls=` on the
+> index DSN in addition to `--ssl-mode`.
 
 Open that URL in a browser. A left **sidebar** groups the views (Time-travel
 appears only when a baseline is configured), with a **server switcher** at the

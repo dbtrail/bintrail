@@ -247,7 +247,7 @@ Managed MySQL services often require TLS. `--ssl-mode` controls the security of 
 | `verify-ca` | Validate server certificate against CA (no hostname check) |
 | `verify-identity` | Full verification (certificate + hostname) |
 
-> **Scope.** `--ssl-mode` covers the streaming daemon (`stream`, `up`, `bintrail-console watch`) only. `required`/`verify-*` make TLS mandatory on both connections, so a server with TLS disabled fails fast with an actionable error rather than silently sending data in cleartext. The offline read commands (`query`, `recover`, `reconstruct`, `verify`, `shim`) have no `--ssl-mode` flag — encrypt their index connection with a DSN parameter instead (`...?tls=true`, or `?tls=skip-verify` for self-signed dev certs). An explicit `tls=` in a DSN always takes precedence over `--ssl-mode`.
+> **Scope.** `--ssl-mode` covers the streaming daemon (`stream`, `up`, `bintrail-console watch`) only. `required`/`verify-*` make TLS mandatory on both connections, so a server with TLS disabled fails fast with an actionable error rather than silently sending data in cleartext. The offline read commands (`query`, `recover`, `reconstruct`, `verify`, `shim`) have no `--ssl-mode` flag — encrypt their index connection with a DSN parameter instead (`...?tls=true`, or `?tls=skip-verify` for self-signed dev certs). An explicit `tls=` in a DSN takes precedence over `--ssl-mode` for the connections that honor it (the index write + source helper); the source **binlog replication stream** always uses `--ssl-mode` and ignores a `tls=` set on the source DSN.
 
 **Amazon RDS example** (download the [RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html) first):
 

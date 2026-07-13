@@ -368,11 +368,15 @@ func connectHelper(dsn, label, mode, ca, cert, key string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	// A tls= in the DSN wins (operator override) — but if it silently weakens a
-	// mandatory --ssl-mode, say so rather than failing open quietly (#946).
+	// A tls= in the DSN wins (operator override) — but under a mandatory
+	// --ssl-mode that override can silently WEAKEN the connection (e.g. a stale
+	// tls=skip-verify under --ssl-mode=verify-identity → encrypted but
+	// unauthenticated). Surface the precedence so it is a conscious choice. The
+	// message stays neutral: the DSN's own tls= may also be *stronger* than the
+	// mode, and we can't tell which here (#946).
 	if tlsHint(mode) != "" && config.DSNHasExplicitTLS(dsn) {
-		slog.Warn("the DSN sets its own tls= parameter, which overrides --ssl-mode "+
-			"for this connection; remove tls= from the DSN to enforce --ssl-mode",
+		slog.Warn("this connection's DSN sets its own tls= parameter, which takes "+
+			"precedence over --ssl-mode; verify it meets your security requirement",
 			"connection", label, "ssl_mode", mode)
 	}
 
@@ -380,11 +384,19 @@ func connectHelper(dsn, label, mode, ca, cert, key string) (*sql.DB, error) {
 	if err == nil {
 		return db, nil
 	}
+	// preferred: retry in cleartext ONLY when the server genuinely lacks TLS, and
+	// log it loudly (never the driver's silent AllowFallbackToPlaintext). An
+	// explicit tls= in the DSN survives this nil retry (applyTLS keeps it), so the
+	// retry re-attempts the same config and fails closed rather than downgrading.
 	if mode == "preferred" && isTLSUnsupportedError(err) {
 		slog.Warn("server does not support TLS; connecting WITHOUT encryption "+
 			"(--ssl-mode preferred) — credentials and data will be sent in cleartext",
 			"connection", label, "error", err)
-		return config.ConnectWithTLS(dsn, nil)
+		db, err = config.ConnectWithTLS(dsn, nil)
+		if err != nil {
+			return nil, fmt.Errorf("connect %s (cleartext retry): %w", label, err)
+		}
+		return db, nil
 	}
 	return nil, fmt.Errorf("connect %s%s: %w", label, tlsHint(mode), err)
 }

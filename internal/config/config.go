@@ -178,11 +178,14 @@ func normalizeDSN(dsn string) (*mysql.Config, error) {
 // attaches a programmatic TLS configuration to the connection. tlsCfg == nil
 // means no TLS (plaintext), identical to Connect.
 //
-// The connection FAILS (it never silently falls back to plaintext) if the server
-// cannot satisfy the requested TLS — the driver's own AllowFallbackToPlaintext is
-// deliberately NOT used. A caller that wants an opportunistic fallback must
-// detect the failure and retry with a nil tlsCfg itself, so any cleartext
-// downgrade is an explicit, loggable decision (#946/#947).
+// For the programmatic tlsCfg path the connection FAILS (it never silently falls
+// back to plaintext) if the server cannot satisfy the requested TLS — this
+// function never sets the driver's own AllowFallbackToPlaintext. A caller that
+// wants an opportunistic fallback must detect the failure and retry with a nil
+// tlsCfg itself, so any cleartext downgrade is an explicit, loggable decision
+// (#946/#947). (An operator who puts tls=preferred in the DSN itself opts into
+// the driver's own silent fallback — the DSN-precedence rule below hands that
+// case to the driver by design.)
 //
 // An explicit tls= parameter already present in the DSN takes precedence: if the
 // parsed config already carries any TLS setting, tlsCfg is ignored so an

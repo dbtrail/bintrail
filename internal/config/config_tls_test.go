@@ -91,3 +91,20 @@ func TestDSNHasExplicitTLS(t *testing.T) {
 		}
 	}
 }
+
+// Our TLS path must never enable the driver's own silent plaintext fallback —
+// flipping AllowFallbackToPlaintext to true is exactly the leak this pins
+// against, and no live test could catch it (the test MySQL has TLS on) (#946).
+func TestNormalizeDSN_NoSilentFallback(t *testing.T) {
+	cfg, err := normalizeDSN("u:p@tcp(h:3306)/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AllowFallbackToPlaintext {
+		t.Fatal("normalizeDSN must not enable AllowFallbackToPlaintext")
+	}
+	applyTLS(cfg, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test fixture
+	if cfg.AllowFallbackToPlaintext {
+		t.Fatal("applyTLS must not enable AllowFallbackToPlaintext")
+	}
+}
