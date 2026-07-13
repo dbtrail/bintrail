@@ -258,6 +258,60 @@ func TestPGStreamCmd_rotationOffDisables(t *testing.T) {
 	}
 }
 
+// TestMaintenanceCommandsRegisteredOnRoot pins the #951 contract on the REAL
+// bintrail-pg root: a PostgreSQL-only install must expose both `rotate` and
+// `archive` so it can bound its index without the core MySQL binary. This walks
+// the actual rootCmd (populated by main.go's init → cli.AddMaintenanceCommands),
+// not a throwaway command, so dropping the registration call — or one of the two
+// commands from it — fails here.
+func TestMaintenanceCommandsRegisteredOnRoot(t *testing.T) {
+	got := map[string]bool{}
+	for _, c := range rootCmd.Commands() {
+		got[c.Name()] = true
+	}
+	for _, want := range []string{"rotate", "archive"} {
+		if !got[want] {
+			t.Errorf("bintrail-pg root is missing the %q command (cli.AddMaintenanceCommands not wired?)", want)
+		}
+	}
+}
+
+// TestPGStreamCmd_rotateRetainExplicitWiring pins the flag `runPGStream` reads to
+// arm the upgrade guard. Setting --rotate-retain on streamCmd must flip
+// Changed("rotate-retain") to true, which is exactly the `explicit` argument
+// passed to rotation.ParseSettings — a wrong flag name there would engage the
+// guard even when the operator DID choose a retention, silently refusing drops.
+// Mirrors cliapp/up_rotation_test.go's TestRunUp_explicitRetentionWiring.
+func TestPGStreamCmd_rotateRetainExplicitWiring(t *testing.T) {
+	flag := streamCmd.Flags().Lookup("rotate-retain")
+	if flag == nil {
+		t.Fatal("--rotate-retain not registered on streamCmd")
+	}
+	savedChanged, savedValue := flag.Changed, flag.Value.String()
+	t.Cleanup(func() {
+		flag.Changed = savedChanged
+		_ = flag.Value.Set(savedValue)
+	})
+
+	// Never set → not explicit (guard armed, protects deep history).
+	flag.Changed = false
+	if s, _ := rotation.ParseSettings(flag.Value.String(), "1h", 3, streamCmd.Flags().Changed("rotate-retain")); s.Explicit {
+		t.Error("Explicit must be false when --rotate-retain was never set")
+	}
+
+	// Set through the flag set, exactly like CLI/env (BindCommandEnv) would.
+	if err := streamCmd.Flags().Set("rotate-retain", "7d"); err != nil {
+		t.Fatalf("Set(rotate-retain): %v", err)
+	}
+	s, err := rotation.ParseSettings(flag.Value.String(), "1h", 3, streamCmd.Flags().Changed("rotate-retain"))
+	if err != nil {
+		t.Fatalf("ParseSettings: %v", err)
+	}
+	if !s.Explicit {
+		t.Error(`Explicit must be true once --rotate-retain is set — the Changed("rotate-retain") call site is broken`)
+	}
+}
+
 // setPGRequired fills the PG-specific required settings so a test can exercise
 // downstream parsing (e.g. --start-lsn) without tripping the missing-settings
 // guard. Callers must resetPGFlags() first.

@@ -13,17 +13,20 @@ import (
 // ─── cobra command wiring ────────────────────────────────────────────────────
 
 func TestRotateCmd_registered(t *testing.T) {
+	// AddMaintenanceCommands must register BOTH rotate and archive — the #951
+	// contract is that a PostgreSQL-only install gains both `rotate` AND
+	// `archive reconcile`. Asserting only rotate would let a dropped
+	// archiveCmd registration pass CI while reconcile silently vanishes.
 	root := &cobra.Command{Use: "test"}
 	AddMaintenanceCommands(root)
-	found := false
+	got := map[string]bool{}
 	for _, cmd := range root.Commands() {
-		if cmd.Use == "rotate" {
-			found = true
-			break
-		}
+		got[cmd.Use] = true
 	}
-	if !found {
-		t.Error("expected 'rotate' command to be registered by AddMaintenanceCommands")
+	for _, want := range []string{"rotate", "archive"} {
+		if !got[want] {
+			t.Errorf("expected %q command to be registered by AddMaintenanceCommands", want)
+		}
 	}
 }
 
