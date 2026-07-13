@@ -64,18 +64,25 @@ func ensureSnapshotIDSeqTable(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// snapshotIDExecer is satisfied by both *sql.DB (plain autocommit) and *sql.Tx,
+// so allocateSnapshotID serves WritePGSnapshot (bounded autocommit, no wrapping
+// transaction) and TakeSnapshot (inside its own multi-statement tx) alike.
+type snapshotIDExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // allocateSnapshotID reserves the next snapshot_id by inserting a row into
-// snapshot_id_seq and reading back its AUTO_INCREMENT value, inside the
-// caller's already-open transaction. See DDLSnapshotIDSeq for why this
+// snapshot_id_seq and reading back its AUTO_INCREMENT value, on the caller's
+// db or transaction (see snapshotIDExecer). See DDLSnapshotIDSeq for why this
 // replaces the earlier FOR UPDATE design.
 //
 // res.LastInsertId() is read from the INSERT's own OK packet (not a
 // follow-up `SELECT LAST_INSERT_ID()`), so it is safe under connection
 // pooling regardless of pool size — no dependency on this statement and the
-// read landing on the same pooled connection (tx already pins one for the
-// whole transaction anyway).
-func allocateSnapshotID(ctx context.Context, tx *sql.Tx) (int, error) {
-	res, err := tx.ExecContext(ctx, "INSERT INTO snapshot_id_seq () VALUES ()")
+// read landing on the same pooled connection. That is exactly what lets
+// WritePGSnapshot allocate under plain autocommit with no wrapping transaction.
+func allocateSnapshotID(ctx context.Context, ex snapshotIDExecer) (int, error) {
+	res, err := ex.ExecContext(ctx, "INSERT INTO snapshot_id_seq () VALUES ()")
 	if err != nil {
 		return 0, fmt.Errorf("metadata: allocate snapshot_id: %w", err)
 	}

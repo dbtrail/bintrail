@@ -20,8 +20,8 @@ import (
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
-// WriteTimeout bounds a single index write (a batch INSERT or the checkpoint
-// UPSERT) so a mid-statement network stall surfaces as an error in minutes
+// WriteTimeout bounds a single index write (e.g. a batch INSERT, the checkpoint
+// UPSERT, or a statement-digest lookup) so a mid-statement network stall surfaces as an error in minutes
 // instead of the kernel's ~13-16 min TCP give-up. config.Connect sets only a
 // connect timeout, never a read/write deadline, so without this a frozen VM or
 // an idle-dropped NLB leaves the daemon blocked — healthy to `watch`, capturing

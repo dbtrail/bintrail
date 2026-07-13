@@ -684,15 +684,17 @@ type PGRelationSchema struct {
 // the empty string (both NOT NULL columns, so empty string not NULL), column_type and
 // column_default NULL, is_generated 0. The PostgreSQL type identity rides the nullable
 // pg_type_oid/pg_type_mod columns for the deferred type-faithful renderer.
-// The ctx bounds every write on this path — the ensureSnapshotIDSeqTable
-// existence check, the allocateSnapshotID insert, and the schema INSERT all run
-// under it — so a mid-statement stall on the index link is cut at the caller's
-// deadline (indexer.WriteTimeout) rather than freezing the PG stream loop on
-// kernel TCP retransmission (~13-16 min) (#959). BeginTx(ctx) alone is NOT
-// enough: a statement issued via a context-less tx.Exec holds the driver
-// connection's lock for its whole round-trip, so the transaction's
-// rollback-on-cancel goroutine parks behind it until TCP gives up — each
-// statement must carry the ctx itself.
+// Every write here is a bounded autocommit statement carrying the caller's ctx
+// (indexer.WriteTimeout) — ensureSnapshotIDSeqTable's checks, allocateSnapshotID's
+// counter INSERT, and the single multi-row schema INSERT — so a mid-statement
+// stall on the index link is cut at that deadline rather than freezing the PG
+// stream loop on kernel TCP retransmission (~13-16 min) (#959). No explicit
+// transaction is used, deliberately: the counter INSERT is concurrency-safe on
+// its own (AUTO_INCREMENT, and its value is never reclaimed on failure anyway)
+// and the schema rows are one atomic multi-row INSERT, so a tx bought no
+// atomicity — only an unbounded tx.Commit() round-trip (database/sql has no
+// CommitContext; BeginTx's ctx watcher is per-statement, not per-commit) that
+// reopened exactly this freeze window.
 func WritePGSnapshot(ctx context.Context, db *sql.DB, rel *PGRelationSchema) (int, error) {
 	if rel == nil || len(rel.Columns) == 0 {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot requires a relation with at least one column")
@@ -702,22 +704,12 @@ func WritePGSnapshot(ctx context.Context, db *sql.DB, rel *PGRelationSchema) (in
 		return 0, err
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("metadata: WritePGSnapshot begin: %w", err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	// Allocate the next snapshot_id inside the transaction (same scheme as
-	// TakeSnapshot). MySQL and PG snapshots coexist in one table with distinct
-	// ids. See DDLSnapshotIDSeq for why this is a dedicated AUTO_INCREMENT
-	// counter table rather than a MAX(snapshot_id)+1 FOR UPDATE read (#844).
-	nextID, err := allocateSnapshotID(ctx, tx)
+	// Allocate the next snapshot_id from the dedicated AUTO_INCREMENT counter
+	// (MySQL and PG snapshots coexist in one table with distinct ids; see
+	// DDLSnapshotIDSeq for why this beats a MAX(snapshot_id)+1 FOR UPDATE read,
+	// #844). Autocommit is safe: LastInsertId comes from this INSERT's own OK
+	// packet, with no dependency on a follow-up read hitting the same connection.
+	nextID, err := allocateSnapshotID(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot allocate snapshot_id: %w", err)
 	}
@@ -741,14 +733,9 @@ func WritePGSnapshot(ctx context.Context, db *sql.DB, rel *PGRelationSchema) (in
 			c.TypeOID, c.TypeMod, c.IsIdentityAlways,
 		)
 	}
-	if _, err = tx.ExecContext(ctx, insertSQL, args...); err != nil {
+	if _, err = db.ExecContext(ctx, insertSQL, args...); err != nil {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot insert %s.%s: %w", rel.Schema, rel.Table, err)
 	}
-
-	if err = tx.Commit(); err != nil {
-		return 0, fmt.Errorf("metadata: WritePGSnapshot commit: %w", err)
-	}
-	committed = true
 	return nextID, nil
 }
 
