@@ -1,4 +1,4 @@
-package cliapp
+package cli
 
 import (
 	"context"
@@ -97,9 +97,8 @@ func init() {
 	archiveReconcileCmd.Flags().DurationVar(&arcPruneMinAge, "prune-min-age", time.Hour, "Never prune rows whose archived_at is younger than this (concurrent-rotate safety margin)")
 	archiveReconcileCmd.Flags().StringVar(&arcFormat, "format", "text", "Output format: text or json")
 	_ = archiveReconcileCmd.MarkFlagRequired("index-dsn")
-	bindCommandEnv(archiveReconcileCmd)
+	BindCommandEnv(archiveReconcileCmd)
 	archiveCmd.AddCommand(archiveReconcileCmd)
-	rootCmd.AddCommand(archiveCmd)
 }
 
 func runArchiveReconcile(cmd *cobra.Command, args []string) error {
@@ -194,7 +193,7 @@ func scanLocalArchive(root string) ([]archive.ScannedFile, error) {
 		if d.IsDir() || !strings.HasSuffix(d.Name(), ".parquet") {
 			return nil
 		}
-		id, part := parseArchivePath(path)
+		id, part := archive.ParseArchivePath(path)
 		if id == "" {
 			slog.Debug("reconcile: parquet outside the archive layout, ignoring", "path", path)
 			return nil
@@ -299,7 +298,7 @@ func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]arch
 			if obj.Key == nil || !strings.HasSuffix(*obj.Key, ".parquet") {
 				continue
 			}
-			id, part := parseArchivePath(*obj.Key)
+			id, part := archive.ParseArchivePath(*obj.Key)
 			if id == "" {
 				slog.Debug("reconcile: s3 parquet outside the archive layout, ignoring", "key", *obj.Key)
 				continue

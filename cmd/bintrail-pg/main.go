@@ -66,6 +66,12 @@ func init() {
 	// shared verbatim with the core binary. The PostgreSQL capture command
 	// (stream) is registered in stream.go's init().
 	cli.AddReadCommands(rootCmd)
+	// The index-side maintenance plane (rotate, archive reconcile) — also
+	// source-agnostic, so a PostgreSQL-only install can bound its index growth
+	// with `bintrail-pg rotate` instead of needing the core MySQL binary against
+	// the same index DSN (#951). `bintrail-pg stream` additionally runs the
+	// built-in rotation loop for safe-by-default retention.
+	cli.AddMaintenanceCommands(rootCmd)
 }
 
 func main() {

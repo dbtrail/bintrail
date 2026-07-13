@@ -1,4 +1,4 @@
-package cliapp
+package cli
 
 import (
 	"context"
@@ -7,20 +7,23 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/spf13/cobra"
 )
 
 // ─── cobra command wiring ────────────────────────────────────────────────────
 
 func TestRotateCmd_registered(t *testing.T) {
+	root := &cobra.Command{Use: "test"}
+	AddMaintenanceCommands(root)
 	found := false
-	for _, cmd := range rootCmd.Commands() {
+	for _, cmd := range root.Commands() {
 		if cmd.Use == "rotate" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("expected 'rotate' command to be registered under rootCmd")
+		t.Error("expected 'rotate' command to be registered by AddMaintenanceCommands")
 	}
 }
 

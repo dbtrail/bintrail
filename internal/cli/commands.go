@@ -24,6 +24,21 @@ func AddReadCommands(root *cobra.Command) {
 	root.AddCommand(shimCmd)
 }
 
+// AddMaintenanceCommands registers the index-side maintenance commands: rotate
+// and archive reconcile. Both operate purely on the shared MySQL index
+// (partition rotation, archive_state reconciliation) and are source-agnostic,
+// so every capture binary registers them — the core bintrail AND bintrail-pg
+// (#951). Without this, a PostgreSQL-only install has no way to bound index
+// growth: its named partitions fill within ~2 days and every later event piles
+// into p_future unbounded, the disk-full mode #406/#420 closed for MySQL. The
+// long-running daemons (up, watch, and now bintrail-pg stream) additionally run
+// the built-in rotation loop; these standalone commands cover offline/manual
+// maintenance and the archive-then-drop retention path the loop does not.
+func AddMaintenanceCommands(root *cobra.Command) {
+	root.AddCommand(rotateCmd)
+	root.AddCommand(archiveCmd)
+}
+
 // AddForensicsCommands registers the forensics read commands: who-changed,
 // user-activity, and connection-history (#706).
 //

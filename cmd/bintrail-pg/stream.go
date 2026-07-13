@@ -16,6 +16,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/pgstreamrun"
+	"github.com/dbtrail/dbtrail/internal/rotation"
 )
 
 var streamCmd = &cobra.Command{
@@ -70,6 +71,10 @@ var (
 	pgBatchSize   int
 	pgCheckpoint  int
 	pgPartitions  int
+
+	pgRotateRetain    string
+	pgRotateInterval  string
+	pgRotateAddFuture int
 )
 
 func init() {
@@ -86,6 +91,14 @@ func init() {
 	streamCmd.Flags().DurationVar(&indexer.WriteTimeout, "write-timeout", indexer.DefaultWriteTimeout, "Deadline for each index write (batch INSERT, checkpoint, schema snapshot). A mid-statement network stall surfaces as an error within this window instead of freezing the stream on kernel TCP retransmission (~13-16 min). Raise for very large batches over a slow link")
 	streamCmd.Flags().IntVar(&pgCheckpoint, "checkpoint", 5, "Checkpoint interval in seconds")
 	streamCmd.Flags().IntVar(&pgPartitions, "partitions", 48, "binlog_events partitions for the one-time index bootstrap")
+	// Built-in index rotation (mirrors the core `up`/`watch` daemons). Because
+	// bintrail-pg has no `up` command, `stream` is a PostgreSQL install's only
+	// long-running daemon and must keep the index bounded itself (#951). Names,
+	// defaults, and env vars (BINTRAIL_ROTATE_*, already in cli.EnvBindings) match
+	// `up` so operators tune rotation identically across binaries.
+	streamCmd.Flags().StringVar(&pgRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
+	streamCmd.Flags().StringVar(&pgRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
+	streamCmd.Flags().IntVar(&pgRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
 	// index-dsn and server-id live in cli.EnvBindings, so BindCommandEnv both
 	// loads the env file (.bintrail.env) AND sets these flags from
 	// BINTRAIL_INDEX_DSN/BINTRAIL_SERVER_ID — which marks them Changed, so
@@ -170,6 +183,19 @@ func runPGStream(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Parse the built-in rotation settings before opening any connection so a
+	// typo fails fast. `explicit` (was --rotate-retain set on the CLI or via
+	// BINTRAIL_ROTATE_RETAIN?) drives the upgrade guard: an existing PG-beta
+	// index that predates built-in rotation has piled everything into p_future,
+	// and when this version first starts rotating at the 30d default the guard is
+	// the only thing preventing a surprise drop of deep history — it holds drops
+	// (still tops up future partitions) until the operator chooses a retention.
+	rotSettings, err := rotation.ParseSettings(pgRotateRetain, pgRotateInterval, pgRotateAddFuture,
+		cmd.Flags().Changed("rotate-retain"))
+	if err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
@@ -186,6 +212,23 @@ func runPGStream(cmd *cobra.Command, args []string) error {
 		case <-ctx.Done():
 		}
 	}()
+
+	// Built-in index rotation on the daemon lifecycle. Started on the same
+	// signal-cancellable ctx as the stream (so SIGINT/SIGTERM stops both) right
+	// before the blocking capture call. The loop only touches the MySQL index
+	// (source-agnostic), reads its settings once, and never fails the stream —
+	// rotation failures are logged and self-heal on the next tick. It is
+	// drop-only: a single static target with no per-source S3 archive config,
+	// mirroring core `up`; the standalone `bintrail-pg rotate --archive-s3`
+	// covers the archive-then-drop path.
+	//
+	// On a brand-new install the first cycle can briefly race pgstreamrun.One's
+	// index bootstrap (table not yet created); that cycle just logs a transient
+	// failure and self-heals on the next tick, well within the 48 hours of
+	// partitions the bootstrap lays down.
+	rotation.StartLoop(ctx,
+		func() rotation.Settings { return rotSettings },
+		func() []rotation.RotateTarget { return []rotation.RotateTarget{{DSN: cfg.IndexDSN}} })
 
 	return pgstreamrun.One(ctx, cfg)
 }

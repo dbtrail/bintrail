@@ -260,6 +260,9 @@ a final checkpoint).
 | `--batch-size` | no | Events per batch insert (default 1000). |
 | `--checkpoint` | no | Checkpoint interval in seconds (default 5). |
 | `--partitions` | no | Index partitions for the one-time bootstrap (default 48). |
+| `--rotate-retain` | no | Built-in rotation: drop index partitions older than this (`Nd`/`Nh`; `off` disables). Default `30d` (env `BINTRAIL_ROTATE_RETAIN`). |
+| `--rotate-interval` | no | Built-in rotation: how often a rotation cycle runs (default `1h`, env `BINTRAIL_ROTATE_INTERVAL`). |
+| `--rotate-add-future` | no | Built-in rotation: keep at least N future hourly partitions ready (default `3`, env `BINTRAIL_ROTATE_ADD_FUTURE`). |
 
 Every flag has a `BINTRAIL_*` environment equivalent and can be set in a
 `.bintrail.env` file (see [the env-file convention](install.md)).
@@ -294,6 +297,49 @@ Under the hood it is the two-system teardown that otherwise has to be done by ha
 (`SELECT pg_drop_replication_slot('bintrail_shop')` on the source +
 `DELETE FROM stream_state WHERE id = 1` on the index). After a reset, re-seed the
 baseline and re-run `bintrail-pg stream`.
+
+### Index rotation and retention
+
+The index table `binlog_events` is split into **hourly partitions**. New hours
+need new partitions or every event eventually lands in the catch-all `p_future`
+partition, which can never be dropped — so without rotation the index grows until
+the disk fills.
+
+`bintrail-pg stream` runs a **built-in rotation loop** so this is handled for you:
+by default it drops partitions older than **30 days** and keeps a few future
+partitions ready, running one cycle at startup and then every hour. Tune it with
+`--rotate-retain` / `--rotate-interval` / `--rotate-add-future` (or the
+`BINTRAIL_ROTATE_*` env vars), or turn it off with `--rotate-retain off` if you
+prefer to run retention separately.
+
+The built-in loop is **drop-only** — it does not archive partitions to S3 before
+dropping them. For an archive-then-drop retention policy, or for manual/offline
+maintenance, run the standalone command against the same index (it is the same
+index-side command the core `bintrail` binary exposes, now available on
+`bintrail-pg` too):
+
+```bash
+# One-off: drop partitions older than 7 days
+bintrail-pg rotate --index-dsn "$IDX" --retain 7d
+
+# Daemon: archive each expired partition to S3, then drop it
+bintrail-pg rotate --index-dsn "$IDX" --retain 30d --daemon \
+  --archive-dir /var/lib/bintrail/archives --archive-s3 s3://my-bucket/archives/
+
+# Re-sync the archive registry with the files actually on disk / in S3
+bintrail-pg archive reconcile --index-dsn "$IDX" \
+  --archive-dir /var/lib/bintrail/archives --archive-s3 s3://my-bucket/archives/
+```
+
+> **Upgrading an existing PostgreSQL install that predates built-in rotation.**
+> If you ran `bintrail-pg stream` before this feature, its index has no future
+> partitions and everything has piled into `p_future`. No data is lost — the loop
+> refuses to drop deep history until you choose a retention explicitly, and it
+> back-fills the missing partitions — but the first catch-up can be slow because
+> each cycle rewrites the large `p_future`. To catch up in one pass instead, run a
+> standalone rotation with enough headroom before (or alongside) the stream, e.g.
+> `bintrail-pg rotate --index-dsn "$IDX" --add-future <hours-since-first-event>`,
+> then set `--rotate-retain` explicitly (e.g. `30d`) so the loop begins pruning.
 
 ---
 

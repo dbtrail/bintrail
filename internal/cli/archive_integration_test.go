@@ -1,6 +1,6 @@
 //go:build integration
 
-package cliapp
+package cli
 
 import (
 	"context"
@@ -224,7 +224,7 @@ func TestParseArchivePathRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("rotation.HiveArchivePath(%v): %v", h, err)
 		}
-		gotID, gotPart := parseArchivePath(p)
+		gotID, gotPart := archive.ParseArchivePath(p)
 		if gotID != id || gotPart != indexer.PartitionName(h) {
 			t.Errorf("round-trip(%s): got (%s, %s), want (%s, %s)", p, gotID, gotPart, id, indexer.PartitionName(h))
 		}

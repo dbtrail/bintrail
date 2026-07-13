@@ -49,6 +49,11 @@ func init() {
 	// Register the source-agnostic read commands that have moved to internal/cli
 	// (#529) so a future bintrail-pg can register the same set. Today: status.
 	cli.AddReadCommands(rootCmd)
+	// Index-side maintenance (rotate, archive reconcile) — source-agnostic, so
+	// bintrail-pg registers the same set (#951). Previously these lived in this
+	// package and self-registered via init(); they moved to internal/cli so both
+	// binaries expose them.
+	cli.AddMaintenanceCommands(rootCmd)
 	// Forensics commands are MySQL-family-only (performance_schema, audit
 	// plugins), so they register here — like doctor — and NOT via
 	// AddReadCommands, which bintrail-pg shares (#706).
