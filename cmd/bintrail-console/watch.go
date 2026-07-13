@@ -175,7 +175,7 @@ func init() {
 	watchCmd.Flags().StringVar(&upTables, "tables", "", "Comma-separated tables to index (default: all)")
 	watchCmd.Flags().IntVar(&upBatchSize, "batch-size", 1000, "Events per batch INSERT")
 	watchCmd.Flags().IntVar(&upCheckpoint, "checkpoint", 10, "Checkpoint interval in seconds")
-	watchCmd.Flags().StringVar(&upSSLMode, "ssl-mode", "preferred", "TLS mode for the source connection: disabled, preferred, required, verify-ca, verify-identity")
+	watchCmd.Flags().StringVar(&upSSLMode, "ssl-mode", "preferred", "TLS mode for the source AND index connections: disabled, preferred, required, verify-ca, verify-identity")
 	watchCmd.Flags().StringVar(&upSSLCA, "ssl-ca", "", "Path to CA certificate file for source TLS verification (omit to use system CAs)")
 	watchCmd.Flags().StringVar(&upSSLCert, "ssl-cert", "", "Path to client certificate file for mutual TLS to the source")
 	watchCmd.Flags().StringVar(&upSSLKey, "ssl-key", "", "Path to client private key file for mutual TLS to the source")

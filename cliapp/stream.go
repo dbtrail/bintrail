@@ -87,7 +87,7 @@ func init() {
 	streamCmd.Flags().IntVar(&strmCheckpoint, "checkpoint", 10, "Checkpoint interval in seconds")
 	streamCmd.Flags().StringVar(&strmMetricsAddr, "metrics-addr", "", "Address to expose Prometheus metrics (e.g. :9090); empty = disabled")
 	streamCmd.Flags().IntVar(&strmMetricsScrapeInterval, "metrics-scrape-interval", 60, "How often (seconds) to refresh the bintrail_index_* gauges from a status snapshot")
-	streamCmd.Flags().StringVar(&strmSSLMode, "ssl-mode", "preferred", "TLS mode: disabled, preferred, required, verify-ca, verify-identity")
+	streamCmd.Flags().StringVar(&strmSSLMode, "ssl-mode", "preferred", "TLS mode for the source AND index connections: disabled, preferred, required, verify-ca, verify-identity")
 	streamCmd.Flags().StringVar(&strmSSLCA, "ssl-ca", "", "Path to CA certificate file for TLS verification (omit to use system CAs)")
 	streamCmd.Flags().StringVar(&strmSSLCert, "ssl-cert", "", "Path to client certificate file for mutual TLS")
 	streamCmd.Flags().StringVar(&strmSSLKey, "ssl-key", "", "Path to client private key file for mutual TLS")

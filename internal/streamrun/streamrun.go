@@ -17,6 +17,7 @@ import (
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
@@ -349,6 +350,79 @@ func buildTLSConfig(mode, ca, cert, key, serverName string) (*tls.Config, error)
 	}
 
 	return cfg, nil
+}
+
+// connectHelper opens an index or source helper connection (config.ConnectWithTLS)
+// honoring --ssl-mode, mirroring the binlog syncer's TLS via the same
+// buildTLSConfig. These connections carry full row images (PII) and credentials,
+// so --ssl-mode must protect them too — not only the replication stream (#946).
+// label names the connection in log/error messages.
+//
+// Under "preferred" it does the SAME explicit two-step as the syncer: try TLS,
+// and only if the server genuinely lacks TLS log a loud warning and retry in
+// cleartext — never the driver's OWN silent AllowFallbackToPlaintext, so every
+// connection that may send data unencrypted warns identically. required/verify-*
+// never retry: a TLS-incapable server fails closed with an actionable hint.
+func connectHelper(dsn, label, mode, ca, cert, key string) (*sql.DB, error) {
+	tlsCfg, err := buildTLSConfig(mode, ca, cert, key, config.DSNHost(dsn))
+	if err != nil {
+		return nil, err
+	}
+	// A tls= in the DSN wins (operator override) — but if it silently weakens a
+	// mandatory --ssl-mode, say so rather than failing open quietly (#946).
+	if tlsHint(mode) != "" && config.DSNHasExplicitTLS(dsn) {
+		slog.Warn("the DSN sets its own tls= parameter, which overrides --ssl-mode "+
+			"for this connection; remove tls= from the DSN to enforce --ssl-mode",
+			"connection", label, "ssl_mode", mode)
+	}
+
+	db, err := config.ConnectWithTLS(dsn, tlsCfg)
+	if err == nil {
+		return db, nil
+	}
+	if mode == "preferred" && isTLSUnsupportedError(err) {
+		slog.Warn("server does not support TLS; connecting WITHOUT encryption "+
+			"(--ssl-mode preferred) — credentials and data will be sent in cleartext",
+			"connection", label, "error", err)
+		return config.ConnectWithTLS(dsn, nil)
+	}
+	return nil, fmt.Errorf("connect %s%s: %w", label, tlsHint(mode), err)
+}
+
+// tlsHint returns a parenthetical remediation appended to a helper-connection
+// error when --ssl-mode mandates TLS, so a server that lacks TLS fails with an
+// actionable message instead of a bare handshake error (#946).
+func tlsHint(mode string) string {
+	switch mode {
+	case "required", "verify-ca", "verify-identity":
+		return fmt.Sprintf(" (--ssl-mode=%s requires TLS; enable TLS on the server, "+
+			"or use --ssl-mode=preferred to fall back to an unencrypted connection)", mode)
+	default:
+		return ""
+	}
+}
+
+// isTLSUnsupportedError reports whether err means the server does not support
+// TLS at all — the ONLY condition under which --ssl-mode=preferred may retry in
+// cleartext. The go-sql-driver helper connections return the sentinel
+// drivermysql.ErrNoTLS; the go-mysql binlog syncer returns a fixed message when
+// the server omits the CLIENT_SSL capability (client/auth.go); a mid-handshake
+// plaintext reply surfaces as tls.RecordHeaderError. Every other failure (auth
+// denied, unreachable host, bad binlog position) must NOT trigger a downgrade,
+// or credentials and data would be resent unencrypted on an unrelated error
+// (#947).
+func isTLSUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, drivermysql.ErrNoTLS) {
+		return true
+	}
+	var rhe tls.RecordHeaderError
+	if errors.As(err, &rhe) {
+		return true
+	}
+	return strings.Contains(err.Error(), "the MySQL Server does not support TLS")
 }
 
 // ─── Start position resolution ───────────────────────────────────────────────
@@ -1456,9 +1530,12 @@ func One(ctx context.Context, cfg Config) error {
 	defer cancel()
 
 	// ── 1. Connect to index database ─────────────────────────────────────────
-	indexDB, err := config.Connect(cfg.IndexDSN)
+	// #946: the index write connection carries full row images (PII) and the
+	// index credentials, so --ssl-mode must encrypt it too — not only the binlog
+	// syncer.
+	indexDB, err := connectHelper(cfg.IndexDSN, "index database", cfg.SSLMode, cfg.SSLCA, cfg.SSLCert, cfg.SSLKey)
 	if err != nil {
-		return fmt.Errorf("failed to connect to index database: %w", err)
+		return err
 	}
 	defer indexDB.Close()
 
@@ -1467,9 +1544,11 @@ func One(ctx context.Context, cfg Config) error {
 	}
 
 	// ── 2. Connect to source database: validate binlog_row_image ─────────────
-	sourceDB, err := config.Connect(cfg.SourceDSN)
+	// #946: same --ssl-mode TLS for the source helper connection (schema reads +
+	// source credentials) as for the binlog syncer built below.
+	sourceDB, err := connectHelper(cfg.SourceDSN, "source MySQL", cfg.SSLMode, cfg.SSLCA, cfg.SSLCert, cfg.SSLKey)
 	if err != nil {
-		return fmt.Errorf("failed to connect to source MySQL: %w", err)
+		return err
 	}
 	defer sourceDB.Close()
 
@@ -1835,17 +1914,21 @@ func One(ctx context.Context, cfg Config) error {
 
 	// ── 8. Start sync ───────────────────────────────────────────────────────────────
 	streamer, startErr := startStreamer()
-	if startErr != nil && cfg.SSLMode == "preferred" {
-		// preferred: TLS attempt failed — retry without TLS.
-		slog.Warn("initial connection failed; retrying without TLS (--ssl-mode preferred)", "error", startErr)
+	if startErr != nil && cfg.SSLMode == "preferred" && isTLSUnsupportedError(startErr) {
+		// #947: downgrade to plaintext ONLY when the server genuinely does not
+		// support TLS. Any other failure (auth denied, unreachable host, bad
+		// binlog position) must NOT retry unencrypted — that would resend the
+		// source credentials in the clear on an error unrelated to TLS. This
+		// path DOES transmit credentials unencrypted, so warn loudly.
+		slog.Warn("source does not support TLS; retrying WITHOUT encryption "+
+			"(--ssl-mode preferred) — credentials and data will be sent in cleartext",
+			"error", startErr)
 		syncer.Close()
 		syncerCfg.TLSConfig = nil
 		syncer = replication.NewBinlogSyncer(syncerCfg)
 		streamer, startErr = startStreamer()
-		if startErr != nil {
-			return startErr
-		}
-	} else if startErr != nil {
+	}
+	if startErr != nil {
 		return startErr
 	}
 

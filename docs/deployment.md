@@ -455,7 +455,7 @@ INDEX_DSN="bintrail:password@tcp(index-mysql:3306)/bintrail_index?tls=true"
 SOURCE_DSN="bintrail:password@tcp(source-mysql:3306)/?tls=true"
 ```
 
-For richer **source** TLS on `bintrail stream` — CA verification or mutual TLS — use the dedicated `--ssl-mode`/`--ssl-ca`/`--ssl-cert`/`--ssl-key` flags instead of the DSN parameter; see [streaming.md → TLS/SSL for managed MySQL](streaming.md#tlsssl-for-managed-mysql-rds-aurora-cloud-sql).
+For richer TLS on the streaming daemon (`bintrail stream`/`up`/`bintrail-console watch`) — CA verification or mutual TLS on **both** the source and index connections — use the dedicated `--ssl-mode`/`--ssl-ca`/`--ssl-cert`/`--ssl-key` flags; `--ssl-mode required` (or stricter) makes TLS mandatory on both. The DSN `?tls=` parameter above still works, takes precedence when set, and is the only TLS knob for the offline read commands (`query`/`recover`/`reconstruct`/`verify`/`shim`), which have no `--ssl-mode`. See [streaming.md → TLS/SSL for managed MySQL](streaming.md#tlsssl-for-managed-mysql-rds-aurora-cloud-sql).
 
 ### Metrics endpoint security
 

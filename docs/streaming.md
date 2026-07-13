@@ -237,7 +237,7 @@ RDS caps `binlog retention hours` at **720 (30 days)**. Values above the ceiling
 
 ### TLS/SSL for managed MySQL (RDS, Aurora, Cloud SQL)
 
-Managed MySQL services often require TLS. Use `--ssl-mode` to control the connection security:
+Managed MySQL services often require TLS. `--ssl-mode` controls the security of **both** connections the streaming daemon opens — the source replication stream **and** the index write connection, which carries full before/after row images (PII) plus the index credentials:
 
 | Mode | Behavior |
 |------|----------|
@@ -246,6 +246,8 @@ Managed MySQL services often require TLS. Use `--ssl-mode` to control the connec
 | `required` | TLS mandatory (no certificate verification), fail if unavailable |
 | `verify-ca` | Validate server certificate against CA (no hostname check) |
 | `verify-identity` | Full verification (certificate + hostname) |
+
+> **Scope.** `--ssl-mode` covers the streaming daemon (`stream`, `up`, `bintrail-console watch`) only. `required`/`verify-*` make TLS mandatory on both connections, so a server with TLS disabled fails fast with an actionable error rather than silently sending data in cleartext. The offline read commands (`query`, `recover`, `reconstruct`, `verify`, `shim`) have no `--ssl-mode` flag — encrypt their index connection with a DSN parameter instead (`...?tls=true`, or `?tls=skip-verify` for self-signed dev certs). An explicit `tls=` in a DSN always takes precedence over `--ssl-mode`.
 
 **Amazon RDS example** (download the [RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html) first):
 

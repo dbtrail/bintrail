@@ -69,6 +69,16 @@ accepts `--ssl-mode` / `--ssl-ca` / `--ssl-cert` / `--ssl-key` (env
 The default stays `--ssl-mode preferred` (opportunistic, no certificate
 verification).
 
+> **Scope of `--ssl-mode` under `watch`.** The flag encrypts `watch`'s embedded
+> **stream** connections — the source replication and the index *write*. It does
+> **not** currently cover the console's own index *reads* (the connections the
+> multi-server manager opens to serve the web UI) or the embedded flashback port
+> (`--flashback-listen`). To encrypt those, add a `tls=` parameter to the
+> connection's DSN (`...?tls=true`, or `?tls=skip-verify` for self-signed dev
+> certs) — the same knob the offline read commands use. If your index MySQL is
+> reached over loopback or a private network this is moot; over an untrusted
+> network, set `tls=` on the index DSN in addition to `--ssl-mode`.
+
 Open that URL in a browser. A left **sidebar** groups the views (Time-travel
 appears only when a baseline is configured), with a **server switcher** at the
 top (see [Managing servers](#managing-servers)) and a **⌘K command palette**
