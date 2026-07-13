@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -18,6 +19,24 @@ import (
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
+
+// WriteTimeout bounds a single index write (a batch INSERT or the checkpoint
+// UPSERT) so a mid-statement network stall surfaces as an error in minutes
+// instead of the kernel's ~13-16 min TCP give-up. config.Connect sets only a
+// connect timeout, never a read/write deadline, so without this a frozen VM or
+// an idle-dropped NLB leaves the daemon blocked — healthy to `watch`, capturing
+// nothing and advancing no checkpoint (#959). The window sits well above any
+// healthy batch INSERT and below the kernel give-up, and is tunable per
+// deployment via --write-timeout for the cases where a healthy write legitimately
+// runs long: a very large batch over a slow link, or index-side MDL contention
+// from a concurrent partition rotation (#959).
+const DefaultWriteTimeout = 3 * time.Minute
+
+// WriteTimeout is the effective deadline, set from --write-timeout at startup
+// (default DefaultWriteTimeout). A var (not const) so the flag can set it and
+// tests can shrink it — a test that mutates it must NOT call t.Parallel() (it is
+// a shared global).
+var WriteTimeout = DefaultWriteTimeout
 
 // Indexer consumes event.Events from a channel and batch-inserts them into
 // the binlog_events table.
@@ -189,8 +208,22 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 		)
 	}
 
-	result, err := idx.db.Exec(insertSQL, args...)
+	// #959: bound the write with a deadline so a mid-statement network stall
+	// surfaces as an error (ExecContext closes the connection on timeout) instead
+	// of blocking on kernel TCP retransmission for minutes while `watch` sees a
+	// healthy daemon capturing nothing.
+	ctx, cancel := context.WithTimeout(context.Background(), WriteTimeout)
+	defer cancel()
+	result, err := idx.db.ExecContext(ctx, insertSQL, args...)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			// Distinguish a slow-but-working link (a batch too large to transmit
+			// within WriteTimeout) from a genuine stall, so the operator knows the
+			// knob rather than chasing a phantom network fault (#959).
+			return 0, fmt.Errorf("batch INSERT of %d events exceeded the %s write deadline "+
+				"(a network stall, or a batch too large for the link — raise --write-timeout, "+
+				"or lower --batch-size / the server max_allowed_packet): %w", len(batch), WriteTimeout, err)
+		}
 		return 0, fmt.Errorf("batch INSERT of %d events failed: %w", len(batch), err)
 	}
 	n, _ := result.RowsAffected()
@@ -254,7 +287,17 @@ func (idx *Indexer) digestStatements(texts []string) map[string]string {
 		return nil
 	}
 
-	out, combinedErr := idx.digestCombined(candidates)
+	// #959: one deadline bounds the WHOLE digest phase (the combined query plus
+	// any per-text fallback), not each round-trip independently — otherwise a
+	// stall costs up to (K+1)×WriteTimeout before the batch INSERT even starts.
+	// Digests are best-effort query_hash enrichment (#699): this phase returns
+	// whatever it resolved and lets the bounded INSERT be the loud terminator.
+	// Kept deliberately SEPARATE from the INSERT's own deadline so a slow-but-
+	// healthy digest phase can never eat the durable write's budget.
+	ctx, cancel := context.WithTimeout(context.Background(), WriteTimeout)
+	defer cancel()
+
+	out, combinedErr := idx.digestCombined(ctx, candidates)
 	if combinedErr == nil {
 		return out
 	}
@@ -276,11 +319,19 @@ func (idx *Indexer) digestStatements(texts []string) map[string]string {
 	var lastErr error
 	for _, t := range candidates {
 		var v sql.NullString
-		if err := idx.db.QueryRow("SELECT STATEMENT_DIGEST(?)", t).Scan(&v); err != nil {
+		// The shared phase ctx bounds every probe together (#959). On a genuine
+		// stall the first probe exhausts the deadline and the rest would return
+		// DeadlineExceeded instantly — stop probing and let the INSERT surface the
+		// stall fatally rather than spinning through K no-op failures.
+		err := idx.db.QueryRowContext(ctx, "SELECT STATEMENT_DIGEST(?)", t).Scan(&v)
+		if err != nil {
 			failures++
 			lastErr = err
 			slog.Debug("STATEMENT_DIGEST failed for one statement — query_hash stays NULL for it",
 				"error", err, "statement_prefix", truncateForLog(t))
+			if errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
 			continue
 		}
 		if v.Valid {
@@ -321,7 +372,7 @@ func truncateForLog(s string) string {
 
 // digestCombined runs the single-round-trip form: one SELECT with one
 // STATEMENT_DIGEST expression per text.
-func (idx *Indexer) digestCombined(texts []string) (map[string]string, error) {
+func (idx *Indexer) digestCombined(ctx context.Context, texts []string) (map[string]string, error) {
 	var sb strings.Builder
 	sb.WriteString("SELECT STATEMENT_DIGEST(?)")
 	for range len(texts) - 1 {
@@ -336,7 +387,9 @@ func (idx *Indexer) digestCombined(texts []string) (map[string]string, error) {
 	for i := range vals {
 		ptrs[i] = &vals[i]
 	}
-	if err := idx.db.QueryRow(sb.String(), args...).Scan(ptrs...); err != nil {
+	// The caller's phase ctx bounds this round-trip together with any per-text
+	// fallback (#959) — see digestStatements.
+	if err := idx.db.QueryRowContext(ctx, sb.String(), args...).Scan(ptrs...); err != nil {
 		return nil, err
 	}
 	out := make(map[string]string, len(texts))
@@ -732,7 +785,10 @@ func InsertSchemaChange(db *sql.DB, ev event.Event, snapshotID *int) error {
 	if snapshotID != nil {
 		snapArg = *snapshotID
 	}
-	_, err := db.Exec(`
+	// #959: bound the DDL write like the other hot-loop index writes.
+	ctx, cancel := context.WithTimeout(context.Background(), WriteTimeout)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
 		INSERT INTO schema_changes
 			(detected_at, binlog_file, binlog_pos, gtid, schema_name, table_name, ddl_type, ddl_query, snapshot_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,

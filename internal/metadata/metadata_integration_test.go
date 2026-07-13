@@ -4,6 +4,7 @@ package metadata
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -342,13 +343,13 @@ func TestNewLatestPerTableResolver_pgPerTableSnapshots(t *testing.T) {
 	}
 
 	for _, tbl := range []string{"users", "orders"} {
-		if _, err := WritePGSnapshot(indexDB, rel(tbl, "v1")); err != nil {
+		if _, err := WritePGSnapshot(context.Background(), indexDB, rel(tbl, "v1")); err != nil {
 			t.Fatalf("WritePGSnapshot(%s): %v", tbl, err)
 		}
 	}
 	// users evolves (a later RelationMessage after an ALTER): its NEWEST
 	// per-table snapshot must win over its older one.
-	if _, err := WritePGSnapshot(indexDB, rel("users", "v1", "v2")); err != nil {
+	if _, err := WritePGSnapshot(context.Background(), indexDB, rel("users", "v1", "v2")); err != nil {
 		t.Fatalf("WritePGSnapshot(users v2): %v", err)
 	}
 
@@ -940,7 +941,7 @@ func TestWritePGSnapshot_OracleRoundTrip(t *testing.T) {
 			{Name: "amount", Ordinal: 3, IsPK: false, TypeOID: 1700, TypeMod: 100}, // numeric(p,s)
 		},
 	}
-	id, err := WritePGSnapshot(indexDB, rel)
+	id, err := WritePGSnapshot(context.Background(), indexDB, rel)
 	if err != nil {
 		t.Fatalf("WritePGSnapshot: %v", err)
 	}
@@ -1038,7 +1039,7 @@ func TestWritePGSnapshot_concurrentAllocatorSerialized(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ids[i], errs[i] = WritePGSnapshot(indexDB, &PGRelationSchema{
+			ids[i], errs[i] = WritePGSnapshot(context.Background(), indexDB, &PGRelationSchema{
 				Schema: "pgdb", Table: fmt.Sprintf("pgtable_%d", i),
 				Columns: []PGRelationColumn{{Name: "id", Ordinal: 1, IsPK: true, TypeOID: 23, TypeMod: -1}},
 			})

@@ -83,6 +83,11 @@ func One(ctx context.Context, cfg Config) error {
 	if cfg.IndexDSN == "" || cfg.ReplDSN == "" || cfg.QueryDSN == "" || cfg.SlotName == "" || cfg.Publication == "" {
 		return fmt.Errorf("pgstreamrun: One requires IndexDSN, ReplDSN, QueryDSN, SlotName, and Publication")
 	}
+	// A non-positive --write-timeout would make every index write's
+	// context.WithTimeout fire immediately (#959).
+	if indexer.WriteTimeout <= 0 {
+		return fmt.Errorf("pgstreamrun: invalid --write-timeout %s: must be a positive duration", indexer.WriteTimeout)
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -290,7 +295,10 @@ func buildProbeErrorJSON(probeErr string, checkedAt time.Time) ([]byte, error) {
 // a real checkpoint survives this write). Best-effort: a failed write is logged, never
 // fatal to the stream.
 func saveSourceHealth(db *sql.DB, serverID uint32, healthJSON []byte, logger *slog.Logger) {
-	_, err := db.Exec(`
+	// #959: bound the health write so a stalled index link cannot wedge the poll loop.
+	ctx, cancel := context.WithTimeout(context.Background(), indexer.WriteTimeout)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
 		INSERT INTO stream_state (id, mode, flavor, server_id, last_checkpoint, source_health)
 		VALUES (1, 'gtid', ?, ?, UTC_TIMESTAMP(), ?)
 		ON DUPLICATE KEY UPDATE
@@ -468,7 +476,9 @@ func streamLoopPG(
 				// already-persisted snapshot_ids — per-row schema_version makes a mixed
 				// batch correct). A crash before the next checkpoint just re-delivers and
 				// re-snapshots (a benign orphan id).
-				id, werr := metadata.WritePGSnapshot(indexDB, ev.Relation)
+				snapCtx, snapCancel := context.WithTimeout(context.Background(), indexer.WriteTimeout)
+				id, werr := metadata.WritePGSnapshot(snapCtx, indexDB, ev.Relation)
+				snapCancel()
 				if werr != nil {
 					return fmt.Errorf("pgstreamrun: persist schema snapshot for %s.%s: %w", ev.Schema, ev.Table, werr)
 				}
@@ -523,7 +533,11 @@ func saveCheckpointPG(db *sql.DB, state *pgStreamState, commitLSN uint64) error 
 	if state.lastEventTime.Valid {
 		lastEventTime = state.lastEventTime.Time
 	}
-	_, err := db.Exec(`
+	// #959: bound the checkpoint write so a mid-statement stall surfaces as an
+	// error within WriteTimeout instead of freezing the stream on TCP retransmit.
+	ctx, cancel := context.WithTimeout(context.Background(), indexer.WriteTimeout)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
 		INSERT INTO stream_state
 			(id, mode, binlog_file, binlog_position, gtid_set, flavor,
 			 events_indexed, last_event_time, last_checkpoint, server_id)

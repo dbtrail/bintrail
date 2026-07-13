@@ -28,11 +28,13 @@ func TestCheckIndexCapacity_skipsWithoutHistory(t *testing.T) {
 	}
 }
 
-// TestCheckIndexCapacity_measuresAndProjects seeds three completed hourly
-// partitions with rows and verifies the check produces a real projection
-// (shrunken measurement floors — information_schema row counts are estimates
-// and the fixture is small).
-func TestCheckIndexCapacity_measuresAndProjects(t *testing.T) {
+// TestCheckIndexCapacity_projectsAndSkipsUnmeasurableDisk seeds three completed
+// hourly partitions with rows and verifies the check computes a real projection
+// yet SKIPs the verdict because the index MySQL runs in a separate container
+// whose disk-free volume this host cannot measure (#948). Row counts are
+// information_schema estimates and the fixture is small, so measurement floors
+// apply.
+func TestCheckIndexCapacity_projectsAndSkipsUnmeasurableDisk(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 
@@ -59,8 +61,15 @@ func TestCheckIndexCapacity_measuresAndProjects(t *testing.T) {
 	testutil.MustExec(t, db, fmt.Sprintf("ANALYZE TABLE `%s`.`binlog_events`", dbName))
 
 	r := checkIndexCapacity(context.Background(), testutil.IntegrationDSN(dbName), dbName, 30*24*time.Hour)
-	if r.Status == StatusSkip || r.Status == StatusFail {
-		t.Fatalf("status = %s, want a real measurement (detail: %s)", r.Status, r.Detail)
+	// #948: the index MySQL is a separate container here, so the disk-free volume
+	// is not measurable from this host — the check SKIPs rather than reporting a
+	// PASS/WARN/FAIL verdict, but it still computes and carries the size
+	// projection. (The verdict thresholds themselves are exercised against a known
+	// free-byte value in TestCapacityVerdict, which needs no live disk.) Before
+	// #948 this path returned a misleading PASS, so this test passed without ever
+	// exercising a real measurement.
+	if r.Status != StatusSkip {
+		t.Fatalf("status = %s, want skip (index is a separate container; disk unmeasurable) (detail: %s)", r.Status, r.Detail)
 	}
 	if !strings.Contains(r.Detail, "projected steady-state") {
 		t.Errorf("detail should carry the projection, got: %s", r.Detail)

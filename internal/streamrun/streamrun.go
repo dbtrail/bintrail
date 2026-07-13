@@ -141,7 +141,12 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	// #775: in position mode this persists the last safe boundary, not the
 	// per-event offset (see checkpointPosition).
 	file, pos := checkpointPosition(state)
-	_, err = db.Exec(`
+	// #959: bound the checkpoint write with a deadline (see indexer.WriteTimeout)
+	// so a mid-statement network stall fails fast instead of freezing the daemon
+	// on kernel TCP retransmission — invisible to the supervisor.
+	ctx, cancel := context.WithTimeout(context.Background(), indexer.WriteTimeout)
+	defer cancel()
+	_, err = db.ExecContext(ctx, `
 		INSERT INTO stream_state
 		    (id, mode, binlog_file, binlog_position, gtid_set, flavor,
 		     events_indexed, last_event_time, last_checkpoint, server_id, bintrail_id)
@@ -1519,6 +1524,12 @@ func One(ctx context.Context, cfg Config) error {
 	// error whose recovery hint (`--reset`) discards the saved checkpoint.
 	if cfg.GapTimeout <= 0 {
 		return fmt.Errorf("invalid --gap-timeout %d: must be a positive number of seconds", cfg.GapTimeout)
+	}
+	// A non-positive --write-timeout would make every index write's
+	// context.WithTimeout fire immediately, turning each write into an instant
+	// failure instead of bounding a genuine stall (#959).
+	if indexer.WriteTimeout <= 0 {
+		return fmt.Errorf("invalid --write-timeout %s: must be a positive duration", indexer.WriteTimeout)
 	}
 	// Fail fast on an unwired dependency (named field) before opening any
 	// connection, rather than nil-panicking on first use further down.

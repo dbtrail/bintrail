@@ -684,16 +684,25 @@ type PGRelationSchema struct {
 // the empty string (both NOT NULL columns, so empty string not NULL), column_type and
 // column_default NULL, is_generated 0. The PostgreSQL type identity rides the nullable
 // pg_type_oid/pg_type_mod columns for the deferred type-faithful renderer.
-func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
+// The ctx bounds every write on this path — the ensureSnapshotIDSeqTable
+// existence check, the allocateSnapshotID insert, and the schema INSERT all run
+// under it — so a mid-statement stall on the index link is cut at the caller's
+// deadline (indexer.WriteTimeout) rather than freezing the PG stream loop on
+// kernel TCP retransmission (~13-16 min) (#959). BeginTx(ctx) alone is NOT
+// enough: a statement issued via a context-less tx.Exec holds the driver
+// connection's lock for its whole round-trip, so the transaction's
+// rollback-on-cancel goroutine parks behind it until TCP gives up — each
+// statement must carry the ctx itself.
+func WritePGSnapshot(ctx context.Context, db *sql.DB, rel *PGRelationSchema) (int, error) {
 	if rel == nil || len(rel.Columns) == 0 {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot requires a relation with at least one column")
 	}
 
-	if err := ensureSnapshotIDSeqTable(db); err != nil {
+	if err := ensureSnapshotIDSeqTable(ctx, db); err != nil {
 		return 0, err
 	}
 
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot begin: %w", err)
 	}
@@ -708,7 +717,7 @@ func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 	// TakeSnapshot). MySQL and PG snapshots coexist in one table with distinct
 	// ids. See DDLSnapshotIDSeq for why this is a dedicated AUTO_INCREMENT
 	// counter table rather than a MAX(snapshot_id)+1 FOR UPDATE read (#844).
-	nextID, err := allocateSnapshotID(tx)
+	nextID, err := allocateSnapshotID(ctx, tx)
 	if err != nil {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot allocate snapshot_id: %w", err)
 	}
@@ -732,7 +741,7 @@ func WritePGSnapshot(db *sql.DB, rel *PGRelationSchema) (int, error) {
 			c.TypeOID, c.TypeMod, c.IsIdentityAlways,
 		)
 	}
-	if _, err = tx.Exec(insertSQL, args...); err != nil {
+	if _, err = tx.ExecContext(ctx, insertSQL, args...); err != nil {
 		return 0, fmt.Errorf("metadata: WritePGSnapshot insert %s.%s: %w", rel.Schema, rel.Table, err)
 	}
 
@@ -858,7 +867,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	}
 
 	// ── 2. Write snapshot atomically into the index database ─────────────────
-	if err := ensureSnapshotIDSeqTable(indexDB); err != nil {
+	if err := ensureSnapshotIDSeqTable(context.Background(), indexDB); err != nil {
 		return SnapshotStats{}, err
 	}
 
@@ -891,7 +900,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	// AUTO_INCREMENT allocation is a lightweight, statement-duration lock,
 	// not a row/gap lock held for the transaction's lifetime, so concurrent
 	// allocators serialize without ever deadlocking (see DDLSnapshotIDSeq).
-	nextID, err := allocateSnapshotID(tx)
+	nextID, err := allocateSnapshotID(context.Background(), tx)
 	if err != nil {
 		return SnapshotStats{}, fmt.Errorf("failed to allocate snapshot_id: %w", err)
 	}

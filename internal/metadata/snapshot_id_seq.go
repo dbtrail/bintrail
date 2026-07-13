@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 )
@@ -47,9 +48,9 @@ const DDLSnapshotIDSeq = `CREATE TABLE IF NOT EXISTS snapshot_id_seq (
 // without going through EnsureSchema — so allocateSnapshotID's callers
 // self-heal here too, matching TakeSnapshot's existing tolerance for a
 // pre-#758 index missing fk_constraints.
-func ensureSnapshotIDSeqTable(db *sql.DB) error {
+func ensureSnapshotIDSeqTable(ctx context.Context, db *sql.DB) error {
 	var exists bool
-	if err := db.QueryRow(
+	if err := db.QueryRowContext(ctx,
 		"SELECT COUNT(*) > 0 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'snapshot_id_seq'",
 	).Scan(&exists); err != nil {
 		return fmt.Errorf("metadata: check snapshot_id_seq table: %w", err)
@@ -57,7 +58,7 @@ func ensureSnapshotIDSeqTable(db *sql.DB) error {
 	if exists {
 		return nil
 	}
-	if _, err := db.Exec(DDLSnapshotIDSeq); err != nil {
+	if _, err := db.ExecContext(ctx, DDLSnapshotIDSeq); err != nil {
 		return fmt.Errorf("metadata: create snapshot_id_seq: %w", err)
 	}
 	return nil
@@ -73,8 +74,8 @@ func ensureSnapshotIDSeqTable(db *sql.DB) error {
 // pooling regardless of pool size — no dependency on this statement and the
 // read landing on the same pooled connection (tx already pins one for the
 // whole transaction anyway).
-func allocateSnapshotID(tx *sql.Tx) (int, error) {
-	res, err := tx.Exec("INSERT INTO snapshot_id_seq () VALUES ()")
+func allocateSnapshotID(ctx context.Context, tx *sql.Tx) (int, error) {
+	res, err := tx.ExecContext(ctx, "INSERT INTO snapshot_id_seq () VALUES ()")
 	if err != nil {
 		return 0, fmt.Errorf("metadata: allocate snapshot_id: %w", err)
 	}
