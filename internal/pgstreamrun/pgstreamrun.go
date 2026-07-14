@@ -64,6 +64,24 @@ type Config struct {
 	Partitions  int           // binlog_events partitions for the one-time bootstrap (0 → 48)
 	Checkpoint  time.Duration // checkpoint interval (0 → 5s)
 	Logger      *slog.Logger
+	// Hooks, when non-nil, lets a supervisor observe this stream's liveness —
+	// a console-started PG stream flips pending→running once rows index or the
+	// checkpoint ticker fires. Mirrors streamrun.Hooks MINUS OnGapAutoAdvance: a
+	// lost PG slot is fatal (One returns it; the supervisor reconnects), not a
+	// continue-after-loss.
+	Hooks *Hooks
+}
+
+// Hooks are liveness callbacks a supervisor attaches to one PG stream. Both are
+// optional and invoked synchronously from the stream loop — keep them fast.
+type Hooks struct {
+	// OnCheckpoint fires after each successful checkpoint tick, INCLUDING an
+	// idle source with nothing committed (the ticker fires regardless) — the
+	// "attached and healthy" signal that flips a supervised job pending→running
+	// even before the first row.
+	OnCheckpoint func()
+	// OnIndexed fires after a batch flush that wrote rows.
+	OnIndexed func(n int64)
 }
 
 // pgStreamState mirrors the streamrun checkpoint row, scoped to what a PG source
@@ -164,7 +182,7 @@ func One(ctx context.Context, cfg Config) error {
 	probe := func(c context.Context) (pgcapture.HealthSnapshot, error) {
 		return pgcapture.ProbeHealth(c, cfg.QueryDSN, cfg.SlotName, cfg.Publication)
 	}
-	loopErr := streamLoopPG(ctx, events, idx, indexDB, cap, checkpointInterval, probe, healthPollInterval, state, logger)
+	loopErr := streamLoopPG(ctx, events, idx, indexDB, cap, checkpointInterval, probe, healthPollInterval, state, logger, cfg.Hooks)
 	cancel() // loop exited first → unblock the capturer's emit/receive so it returns
 
 	// Run returns nil on ctx-cancel; only a real capture error matters.
@@ -330,6 +348,7 @@ func streamLoopPG(
 	healthInterval time.Duration,
 	state *pgStreamState,
 	logger *slog.Logger,
+	hooks *Hooks,
 ) error {
 	batch := make([]event.Event, 0, idx.BatchSize())
 	ticker := time.NewTicker(checkpointInterval)
@@ -397,6 +416,10 @@ func streamLoopPG(
 		// checkpoint. If a future change ever retries or continues past a flush
 		// error, this clear must move into the success branch or those rows are lost.
 		batch = batch[:0]
+		// Liveness: any rows indexed flip a supervised job pending→running.
+		if err == nil && n > 0 && hooks != nil && hooks.OnIndexed != nil {
+			hooks.OnIndexed(n)
+		}
 		return err
 	}
 
@@ -427,6 +450,12 @@ func streamLoopPG(
 		case <-ticker.C:
 			if err := checkpoint(); err != nil {
 				return err
+			}
+			// Fire on the ticker, NOT inside checkpoint(): checkpoint early-returns
+			// at lastCommitLSN==0 for a connected-but-idle source, and liveness must
+			// still signal so the supervised job leaves "pending".
+			if hooks != nil && hooks.OnCheckpoint != nil {
+				hooks.OnCheckpoint()
 			}
 
 		case <-healthC:

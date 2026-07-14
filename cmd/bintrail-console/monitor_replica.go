@@ -49,6 +49,12 @@ type peerIdentity struct {
 // other monitored registry entry. Returns nil when there is nothing to
 // compare (no registry, no peers) — no card is shown then.
 func (m *monitorSupervisor) replicaOverlapCheck(ctx context.Context, e console.ServerEntry) *console.DoctorCheck {
+	// GTID-lineage overlap is a MySQL/MariaDB concept, read over a MySQL
+	// connection (@@gtid_mode / @@server_uuid); a PostgreSQL source has no analog
+	// and config.Connect would fail on its postgres:// DSN. Skip silently.
+	if e.SourceFlavor() == console.FlavorPostgres {
+		return nil
+	}
 	if m.registry == nil {
 		return nil
 	}

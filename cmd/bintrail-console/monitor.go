@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"regexp"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/doctor"
 	"github.com/dbtrail/dbtrail/internal/forensics"
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/pgstreamrun"
 	"github.com/dbtrail/dbtrail/internal/serverid"
 	"github.com/dbtrail/dbtrail/internal/streamdeps"
 	"github.com/dbtrail/dbtrail/internal/streamrun"
@@ -53,9 +55,12 @@ type monitorSupervisor struct {
 	// Doctor capacity projection assumes it (0 = rotation disabled). Set at
 	// construction so the supervisor never reads the cmd-layer upRotationCfg global.
 	rotateRetain time.Duration
-	// streamFn runs one supervised stream; a seam for unit tests, streamrun.One
-	// in production.
+	// streamFn runs one supervised MySQL/MariaDB stream; a seam for unit tests,
+	// streamrun.One in production.
 	streamFn func(ctx context.Context, cfg streamrun.Config) error
+	// pgStreamFn runs one supervised PostgreSQL stream; pgstreamrun.One in
+	// production, a seam for tests. Selected when the entry's flavor is postgres.
+	pgStreamFn func(ctx context.Context, cfg pgstreamrun.Config) error
 
 	mu   sync.Mutex
 	jobs map[string]*monitorJob
@@ -148,12 +153,23 @@ func (j *monitorJob) markLostPosition(detail string) {
 	j.mu.Unlock()
 }
 
-// streamHooks wires this job as its stream's liveness observer.
+// streamHooks wires this job as its MySQL stream's liveness observer.
 func (j *monitorJob) streamHooks() *streamrun.Hooks {
 	return &streamrun.Hooks{
 		OnCheckpoint:     j.progress,
 		OnIndexed:        func(int64) { j.progress() },
 		OnGapAutoAdvance: j.markLostPosition,
+	}
+}
+
+// pgStreamHooks wires this job as its PostgreSQL stream's liveness observer.
+// No OnGapAutoAdvance: a lost PG slot is fatal (pgstreamrun.One returns it and
+// the supervisor reconnects), not a continue-after-loss — the durable
+// gap_lost_detail persisted by the capturer is re-hydrated by Start instead.
+func (j *monitorJob) pgStreamHooks() *pgstreamrun.Hooks {
+	return &pgstreamrun.Hooks{
+		OnCheckpoint: j.progress,
+		OnIndexed:    func(int64) { j.progress() },
 	}
 }
 
@@ -193,6 +209,7 @@ func newMonitorSupervisor(baseCtx context.Context, bootIndexDSN string, reg *con
 		registry:     reg,
 		rotateRetain: retain,
 		streamFn:     streamrun.One,
+		pgStreamFn:   pgstreamrun.One,
 		jobs:         map[string]*monitorJob{},
 	}
 }
@@ -226,7 +243,23 @@ func (m *monitorSupervisor) Doctor(ctx context.Context, e console.ServerEntry) (
 	}
 	// The per-source databases are rotated by the daemon's built-in loop, so
 	// the capacity projection uses its window (0 when rotation is disabled).
-	r := doctor.Build(ctx, e.SourceDSN, e.DSN, e.Schemas, m.rotateRetain)
+	// PostgreSQL runs the pgstreamrun preflight (slot / wal_level / publication
+	// coverage / REPLICA IDENTITY FULL) instead, which returns the identical
+	// *doctor.Report shape so the mapping loop below is unchanged. A missing slot
+	// is a Skip (never blocks first start); a publication that doesn't cover the
+	// tables is a Fail — the operator must CREATE it (validate-don't-create).
+	var r *doctor.Report
+	switch e.SourceFlavor() {
+	case console.FlavorPostgres:
+		r = pgstreamrun.BuildPGReport(ctx, pgstreamrun.PGDoctorConfig{
+			QueryDSN:    e.SourceDSN,
+			SlotName:    e.SourceSlot,
+			Publication: e.SourcePublication,
+			Schemas:     e.Schemas,
+		})
+	default:
+		r = doctor.Build(ctx, e.SourceDSN, e.DSN, e.Schemas, m.rotateRetain)
+	}
 	out := &console.DoctorReport{
 		Passed:   r.Passed,
 		Failed:   r.Failed,
@@ -379,20 +412,80 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 	job.lockDB = lockDB
 
 	// ── Launch the supervised stream ─────────────────────────────────────
-	serverID := e.SourceServerID
-	if serverID == 0 {
-		serverID, err = serverid.DeriveServerID(e.SourceDSN)
-		if err != nil {
-			lockDB.Close()
-			return fail(fmt.Errorf("derive server id: %w", err))
-		}
+	// One circuit-breaker loop (run) drives either engine; the flavor only
+	// selects which One is called with which config + liveness hooks.
+	flavor := e.SourceFlavor()
+	serverID, err := m.deriveSourceIdentity(e, flavor)
+	if err != nil {
+		lockDB.Close()
+		return fail(err)
 	}
-	cfg := sourceStreamConfig(e, serverID)
-	cfg.Hooks = job.streamHooks()
+	var runOnce func(context.Context) error
+	switch flavor {
+	case console.FlavorPostgres:
+		pgcfg, cErr := sourcePGStreamConfig(e, serverID)
+		if cErr != nil {
+			lockDB.Close()
+			return fail(cErr)
+		}
+		pgcfg.Hooks = job.pgStreamHooks()
+		runOnce = func(c context.Context) error { return m.pgStreamFn(c, pgcfg) }
+	default:
+		cfg := sourceStreamConfig(e, serverID)
+		cfg.Hooks = job.streamHooks()
+		runOnce = func(c context.Context) error { return m.streamFn(c, cfg) }
+	}
 
 	m.wg.Add(1)
-	go m.run(jobCtx, job, e, cfg)
+	go m.run(jobCtx, job, e, flavor, runOnce)
 	return nil
+}
+
+// deriveSourceIdentity resolves the stream's server_id. MySQL/MariaDB derive it
+// from the source DSN (serverid.DeriveServerID parses a MySQL DSN and fails on a
+// postgres:// connstring). PostgreSQL identity is the replication slot, so
+// server_id is only a stream_state label — an explicit SourceServerID wins,
+// else a stable non-zero hash of the (registry-unique) entry id.
+func (m *monitorSupervisor) deriveSourceIdentity(e console.ServerEntry, flavor string) (uint32, error) {
+	if e.SourceServerID != 0 {
+		return e.SourceServerID, nil
+	}
+	if flavor == console.FlavorPostgres {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(e.ID))
+		if id := h.Sum32(); id != 0 {
+			return id, nil
+		}
+		return 1, nil
+	}
+	id, err := serverid.DeriveServerID(e.SourceDSN)
+	if err != nil {
+		return 0, fmt.Errorf("derive server id: %w", err)
+	}
+	return id, nil
+}
+
+// sourcePGStreamConfig builds the supervised PG stream's pgstreamrun.Config from
+// a registry entry (Hooks attached by the caller). The replication DSN is
+// derived from the stored query DSN (console.PGReplDSN adds replication=database
+// — the one place that derivation lives); the slot and publication are the
+// operator-supplied stored fields. Pure — unit-testable without a live DB.
+func sourcePGStreamConfig(e console.ServerEntry, serverID uint32) (pgstreamrun.Config, error) {
+	replDSN, err := console.PGReplDSN(e.SourceDSN)
+	if err != nil {
+		return pgstreamrun.Config{}, err
+	}
+	return pgstreamrun.Config{
+		IndexDSN:    e.DSN,
+		ReplDSN:     replDSN,
+		QueryDSN:    e.SourceDSN,
+		SlotName:    e.SourceSlot,
+		Publication: e.SourcePublication,
+		ServerID:    serverID,
+		BatchSize:   1000,
+		Schemas:     e.Schemas,
+		Checkpoint:  10 * time.Second,
+	}, nil
 }
 
 // sourceStreamConfig builds the supervised stream's streamrun.Config from a
@@ -436,7 +529,7 @@ func sourceStreamConfig(e console.ServerEntry, serverID uint32) streamrun.Config
 // breaker: permanent "failed", no more retries, advisory lock released —
 // Start (or a daemon restart) re-arms it. Cancellation (stop verb / daemon
 // shutdown) exits cleanly.
-func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.ServerEntry, cfg streamrun.Config) {
+func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.ServerEntry, flavor string, runOnce func(context.Context) error) {
 	defer m.wg.Done()
 	defer close(job.done)
 	defer func() {
@@ -453,7 +546,9 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 	// the events gap-fill indexes afterwards. Gate-checked at the surface
 	// (#701 D1); --attribution-retention 0 disables it inside the poller.
 	// The SourceDSN guard keeps direct run() callers (tests) poller-free.
-	if forensics.Enabled() && e.SourceDSN != "" {
+	// MySQL-only: pgoutput carries no connection id to attribute, and the poller
+	// opens e.SourceDSN with the MySQL driver, which errors on a postgres:// DSN.
+	if flavor != console.FlavorPostgres && forensics.Enabled() && e.SourceDSN != "" {
 		pollerCtx, stopPoller := context.WithCancel(ctx)
 		defer stopPoller()
 		forensics.StartConnCachePoller(pollerCtx, forensics.ConnCacheConfig{
@@ -468,7 +563,7 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 	for {
 		job.set("pending", "")
 		started := time.Now()
-		err := m.streamFn(ctx, cfg)
+		err := runOnce(ctx)
 		if ctx.Err() != nil || err == nil {
 			job.set("stopped", "")
 			return

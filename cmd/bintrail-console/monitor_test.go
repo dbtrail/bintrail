@@ -200,7 +200,7 @@ func TestMonitorRun_circuitBreakerGivesUp(t *testing.T) {
 	m.jobs["e1"] = job
 
 	m.wg.Add(1)
-	m.run(ctx, job, console.ServerEntry{ID: "e1", Name: "prod"}, streamrun.Config{})
+	m.run(ctx, job, console.ServerEntry{ID: "e1", Name: "prod"}, console.FlavorMySQL, func(c context.Context) error { return m.streamFn(c, streamrun.Config{}) })
 
 	select {
 	case <-job.done:
@@ -232,7 +232,7 @@ func TestMonitorRun_cleanStopBypassesBreaker(t *testing.T) {
 	job.set("pending", "")
 
 	m.wg.Add(1)
-	m.run(ctx, job, console.ServerEntry{ID: "e2", Name: "x"}, streamrun.Config{})
+	m.run(ctx, job, console.ServerEntry{ID: "e2", Name: "x"}, console.FlavorMySQL, func(c context.Context) error { return m.streamFn(c, streamrun.Config{}) })
 
 	if st := job.snapshot(); st.State != "stopped" {
 		t.Fatalf("state = %q, want stopped on cancellation", st.State)
@@ -395,7 +395,7 @@ func TestMonitorRun_healthyRunResetsBreaker(t *testing.T) {
 	job.set("pending", "")
 
 	m.wg.Add(1)
-	go m.run(ctx, job, console.ServerEntry{ID: "e3", Name: "flappy"}, streamrun.Config{})
+	go m.run(ctx, job, console.ServerEntry{ID: "e3", Name: "flappy"}, console.FlavorMySQL, func(c context.Context) error { return m.streamFn(c, streamrun.Config{}) })
 
 	// Let it flap well past monitorGiveUpAfter in wall-clock time.
 	time.Sleep(150 * time.Millisecond)

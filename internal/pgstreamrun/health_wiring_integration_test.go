@@ -38,7 +38,7 @@ func driveHealthOnce(t *testing.T, probe func(context.Context) (pgcapture.Health
 
 	done := make(chan error, 1)
 	go func() {
-		done <- streamLoopPG(ctx, events, idx, indexDB, nil, time.Hour, probe, 15*time.Millisecond, state, slog.New(slog.DiscardHandler))
+		done <- streamLoopPG(ctx, events, idx, indexDB, nil, time.Hour, probe, 15*time.Millisecond, state, slog.New(slog.DiscardHandler), nil)
 	}()
 
 	present := false
