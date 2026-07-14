@@ -50,6 +50,15 @@ type serverDTO struct {
 	SourceServerID    uint32 `json:"source_server_id,omitempty"`
 	Schemas           string `json:"schemas,omitempty"`
 	MonitorDesired    bool   `json:"monitor_desired"`
+	// Flavor is the source family ("mysql" | "mariadb" | "postgres"); the
+	// frontend gates per-server without opening the index. SourceDatabase /
+	// SourceSlot / SourcePublication are the PostgreSQL-only source parts (the
+	// database is decomposed from the source DSN — PG replication is
+	// per-database; slot/publication are stored fields). All non-secret.
+	Flavor            string `json:"flavor"`
+	SourceDatabase    string `json:"source_database,omitempty"`
+	SourceSlot        string `json:"source_slot,omitempty"`
+	SourcePublication string `json:"source_publication,omitempty"`
 	// MonitorState is the supervisor's live view (stopped|pending|running|
 	// stalled|lost_position|failed — see console.MonitorStatus); present only
 	// on a supervisor process for entries with a source.
@@ -100,6 +109,15 @@ type serverRequest struct {
 	SourcePassword *string `json:"source_password"`
 	SourceServerID uint32  `json:"source_server_id"`
 	Schemas        string  `json:"schemas"`
+	// Source family + PostgreSQL-only source config (#1019). Flavor is
+	// immutable after create (PUT rejects a change). SourceDatabase feeds the
+	// per-database PG query DSN; SourceSlot/SourcePublication are stored on the
+	// entry and always resent by the form (keep-semantics like Schemas, not
+	// the password's omitted=keep dance).
+	Flavor            string `json:"flavor"`
+	SourceDatabase    string `json:"source_database"`
+	SourceSlot        string `json:"source_slot"`
+	SourcePublication string `json:"source_publication"`
 }
 
 // testResponse is the probe result. HasIndex/SchemaCurrent are tri-state
@@ -179,8 +197,17 @@ func (s *Server) handleServersCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
-	sourceDSN, err := buildSourceDSN(req, "")
+	flavor, err := NormalizeFlavor(req.Flavor)
 	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sourceDSN, err := buildSourceDSN(req, "", flavor)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validatePGSourceMonitorConfig(flavor, sourceDSN, req.SourceSlot, req.SourcePublication); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -196,15 +223,18 @@ func (s *Server) handleServersCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry := ServerEntry{
-		Name:           strings.TrimSpace(req.Name),
-		DSN:            dsn,
-		BaselineDir:    req.BaselineDir,
-		BaselineS3:     req.BaselineS3,
-		NoArchive:      req.NoArchive,
-		ArchiveS3:      strings.TrimSpace(req.ArchiveS3),
-		SourceDSN:      sourceDSN,
-		SourceServerID: req.SourceServerID,
-		Schemas:        req.Schemas,
+		Name:              strings.TrimSpace(req.Name),
+		DSN:               dsn,
+		BaselineDir:       req.BaselineDir,
+		BaselineS3:        req.BaselineS3,
+		NoArchive:         req.NoArchive,
+		ArchiveS3:         strings.TrimSpace(req.ArchiveS3),
+		SourceDSN:         sourceDSN,
+		SourceServerID:    req.SourceServerID,
+		Schemas:           req.Schemas,
+		Flavor:            flavor,
+		SourceSlot:        strings.TrimSpace(req.SourceSlot),
+		SourcePublication: strings.TrimSpace(req.SourcePublication),
 	}
 	added, err := s.cm.reg.Add(entry)
 	if err != nil {
@@ -254,8 +284,26 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	sourceDSN, err := buildSourceDSN(req, old.SourceDSN)
+	// Flavor is immutable: the capture engine, per-source index DB layout, and
+	// stream_state are all keyed to it. Changing it means a fresh entry.
+	flavor := old.SourceFlavor()
+	if req.Flavor != "" {
+		reqFlavor, ferr := NormalizeFlavor(req.Flavor)
+		if ferr != nil {
+			writeJSONError(w, http.StatusBadRequest, ferr.Error())
+			return
+		}
+		if reqFlavor != flavor {
+			writeJSONError(w, http.StatusBadRequest, "source flavor cannot be changed; delete and re-create the server")
+			return
+		}
+	}
+	sourceDSN, err := buildSourceDSN(req, old.SourceDSN, flavor)
 	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validatePGSourceMonitorConfig(flavor, sourceDSN, req.SourceSlot, req.SourcePublication); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -277,9 +325,12 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 		SourceDSN:   sourceDSN,
 		// The verbs that flip monitoring intent arrive with the supervisor
 		// (phase 3); a plain edit must not silently start or stop anything.
-		MonitorDesired: old.MonitorDesired,
-		SourceServerID: req.SourceServerID,
-		Schemas:        req.Schemas,
+		MonitorDesired:    old.MonitorDesired,
+		SourceServerID:    req.SourceServerID,
+		Schemas:           req.Schemas,
+		Flavor:            flavor,
+		SourceSlot:        strings.TrimSpace(req.SourceSlot),
+		SourcePublication: strings.TrimSpace(req.SourcePublication),
 		// Source TLS (#879) has no request field yet — it is hand-edited into
 		// the registry YAML. Carry it over from the stored entry so a plain UI
 		// edit does not wipe a configured verify-ca / mutual-TLS source
@@ -688,15 +739,25 @@ func buildDSN(req serverRequest, stored string) (string, error) {
 	return cfg.FormatDSN(), nil
 }
 
-// buildSourceDSN assembles the stored SOURCE DSN (replication credentials)
-// for a create/update request. Tri-state on req.SourceDSN: nil → build from
-// the structured source fields layered over the stored source DSN (keep
-// semantics, password merged via req.SourcePassword's own tri-state); "" →
-// clear the source config entirely (back to a view-only entry); a value →
-// used verbatim. Validation differs from the index DSN: replication needs a
-// TCP address and a user, but NO database name (a source DSN is server-level,
-// e.g. user:pass@tcp(host:3306)/).
-func buildSourceDSN(req serverRequest, stored string) (string, error) {
+// buildSourceDSN assembles the stored SOURCE DSN for a create/update request,
+// dispatching on the source family. PostgreSQL builds a postgres:// query DSN
+// (per-database, buildPGSourceDSN in flavor.go); MySQL/MariaDB build a go-mysql
+// source DSN (buildMySQLSourceDSN below).
+func buildSourceDSN(req serverRequest, stored, flavor string) (string, error) {
+	if flavor == FlavorPostgres {
+		return buildPGSourceDSN(req, stored)
+	}
+	return buildMySQLSourceDSN(req, stored)
+}
+
+// buildMySQLSourceDSN assembles the stored MySQL/MariaDB SOURCE DSN (replication
+// credentials). Tri-state on req.SourceDSN: nil → build from the structured
+// source fields layered over the stored source DSN (keep semantics, password
+// merged via req.SourcePassword's own tri-state); "" → clear the source config
+// entirely (back to a view-only entry); a value → used verbatim. Validation
+// differs from the index DSN: replication needs a TCP address and a user, but NO
+// database name (a source DSN is server-level, e.g. user:pass@tcp(host:3306)/).
+func buildMySQLSourceDSN(req serverRequest, stored string) (string, error) {
 	if req.SourceDSN != nil {
 		raw := *req.SourceDSN
 		if raw == "" {
@@ -771,23 +832,26 @@ func buildSourceDSN(req serverRequest, stored string) (string, error) {
 // plus has_password. The DSN string itself never leaves the process.
 func (s *Server) entryDTO(e ServerEntry) serverDTO {
 	dto := serverDTO{
-		ID:             e.ID,
-		Name:           e.Name,
-		Kind:           "registry",
-		BaselineDir:    e.BaselineDir,
-		BaselineS3:     e.BaselineS3,
-		NoArchive:      e.NoArchive,
-		ArchiveS3:      e.ArchiveS3,
-		Reconstruct:    s.cm.capability(e),
-		Editable:       !s.cm.reg.ReadOnly(),
-		Deletable:      !s.cm.reg.ReadOnly(),
-		Connected:      s.cm.cached(e.ID),
-		SourceServerID: e.SourceServerID,
-		Schemas:        e.Schemas,
-		MonitorDesired: e.MonitorDesired,
+		ID:                e.ID,
+		Name:              e.Name,
+		Kind:              "registry",
+		BaselineDir:       e.BaselineDir,
+		BaselineS3:        e.BaselineS3,
+		NoArchive:         e.NoArchive,
+		ArchiveS3:         e.ArchiveS3,
+		Reconstruct:       s.cm.capability(e),
+		Editable:          !s.cm.reg.ReadOnly(),
+		Deletable:         !s.cm.reg.ReadOnly(),
+		Connected:         s.cm.cached(e.ID),
+		SourceServerID:    e.SourceServerID,
+		Schemas:           e.Schemas,
+		MonitorDesired:    e.MonitorDesired,
+		Flavor:            e.SourceFlavor(),
+		SourceSlot:        e.SourceSlot,
+		SourcePublication: e.SourcePublication,
 	}
 	fillDSNParts(&dto, e.DSN)
-	fillSourceDSNParts(&dto, e.SourceDSN)
+	fillSourceDSNParts(&dto, e.SourceDSN, e.SourceFlavor())
 	if s.monitorCtrl != nil && e.SourceDSN != "" {
 		dto.MonitorState = s.monitorCtrl.Status(e.ID).State
 	}
@@ -797,7 +861,11 @@ func (s *Server) entryDTO(e ServerEntry) serverDTO {
 // fillSourceDSNParts decomposes the source DSN into the masked DTO fields —
 // the replication credentials themselves never leave the process. Parse
 // failures leave the parts blank rather than leaking the raw string.
-func fillSourceDSNParts(dto *serverDTO, dsn string) {
+func fillSourceDSNParts(dto *serverDTO, dsn, flavor string) {
+	if flavor == FlavorPostgres {
+		fillPGSourceDSNParts(dto, dsn)
+		return
+	}
 	if dsn == "" {
 		return
 	}

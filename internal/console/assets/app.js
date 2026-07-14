@@ -2729,7 +2729,7 @@ async function loadServers() {
       const ordered = servers.filter((s) => s.kind !== "ephemeral")
         .concat(servers.filter((s) => s.kind === "ephemeral"));
       ordered.forEach((s) => {
-        const o = opt(s.id, serverLabel(s));
+        const o = opt(s.id, serverLabel(s) + (s.flavor && s.flavor !== "mysql" ? " · " + (s.flavor === "postgres" ? "PG" : "MariaDB") : ""));
         if (s.kind === "ephemeral") o.title = "The daemon's own index database (set with --index-dsn on the command line)";
         sel.append(o);
       });
@@ -2891,9 +2891,10 @@ function serverRow(s) {
   if (s.kind === "ephemeral") item.append(el("span", { class: "chip chip-cli", text: "CLI", title: "Set from the command line with --index-dsn" }));
   if (s.reconstruct) item.append(el("span", { class: "chip chip-tt", text: "TT", title: "Baseline configured: Time-travel available" }));
   if (s.monitor_state) item.append(el("span", { class: "chip chip-mon", text: s.monitor_state.replace("_", " ").toUpperCase(), title: MON_STATE_TITLES[s.monitor_state] || ("monitoring " + s.monitor_state) }));
+  if (s.flavor && s.flavor !== "mysql") item.append(el("span", { class: "chip", text: s.flavor === "postgres" ? "PG" : s.flavor.toUpperCase(), title: "Source type: " + s.flavor }));
 
   let desc;
-  if (s.has_source && s.source_host) desc = "watching " + s.source_user + "@" + s.source_host + ":" + (s.source_port || "3306") + (s.schemas ? " [" + s.schemas + "]" : "");
+  if (s.has_source && s.source_host) desc = "watching " + s.source_user + "@" + s.source_host + ":" + (s.source_port || (s.flavor === "postgres" ? "5432" : "3306")) + (s.source_database ? "/" + s.source_database : "") + (s.schemas ? " [" + s.schemas + "]" : "");
   else if (s.host) desc = s.user + "@" + s.host + ":" + (s.port || "3306") + "/" + s.dbname;
   else desc = s.dbname || "";
   item.append(el("span", { class: "srv-desc conn", text: desc }));
@@ -2924,6 +2925,20 @@ function srvField(label, name, opts) {
     el("input", { class: "input", name, type: opts.type || "text", placeholder: opts.placeholder || "", autocomplete: opts.autocomplete }));
 }
 
+// tagFlavor marks a form node visible only for the given space-separated source
+// families (e.g. "postgres" or "mysql mariadb"); applyFlavor toggles .flavor-on.
+function tagFlavor(node, families) { node.setAttribute("data-flavor", families); return node; }
+
+// applyFlavor reveals the [data-flavor] nodes matching the selected source
+// family, mirroring the capability cap-on gating EXACTLY — a class toggle over a
+// CSS :not() default-hide, never a [hidden]/style="display:none" toggle (the
+// documented display-bug class this codebase already hit).
+function applyFlavor(form) {
+  const f = (form.elements.flavor && form.elements.flavor.value) || "mysql";
+  $all("[data-flavor]", form).forEach((n) =>
+    n.classList.toggle("flavor-on", n.dataset.flavor.split(" ").includes(f)));
+}
+
 function buildServerForm() {
   const form = el("form", { class: "filters", id: "server-form", style: "display:block;margin-top:18px" });
   form.append(el("input", { type: "hidden", name: "id" }));
@@ -2935,27 +2950,51 @@ function buildServerForm() {
   form.append(top);
 
   const mon = el("fieldset", { class: "form-section", "data-capability": "monitor" });
-  mon.append(el("legend", { class: "form-legend", text: "Monitor a source MySQL" }));
+  mon.append(el("legend", { class: "form-legend", text: "Monitor a source database" }));
   mon.append(el("p", { class: "form-hint", text: "Paste the server you want to watch — dbtrail checks that it's ready, creates an index database for it automatically, and starts capturing changes. Nothing else to fill in beyond a name." }));
   const monGrid = el("div", { class: "form-grid" });
+  // Source family selector — reveals the PostgreSQL-only fields below.
+  monGrid.append(el("label", { class: "field" },
+    el("span", { class: "field-label", text: "Source type" }),
+    el("select", { class: "input", name: "flavor" },
+      opt("mysql", "MySQL"), opt("postgres", "PostgreSQL"), opt("mariadb", "MariaDB"))));
   monGrid.append(srvField("Source host", "source_host", { placeholder: "db.example.com" }));
   monGrid.append(srvField("Source port", "source_port", { placeholder: "3306" }));
   monGrid.append(srvField("Source user", "source_user", { placeholder: "repl" }));
   monGrid.append(srvField("Source password", "source_password", { type: "password", autocomplete: "new-password" }));
+  // PostgreSQL-only: a logical-replication connection is per-database, and the
+  // slot/publication are operator-created (validate-don't-create).
+  monGrid.append(tagFlavor(srvField("Database", "source_database", { placeholder: "appdb" }), "postgres"));
+  monGrid.append(tagFlavor(srvField("Replication slot", "source_slot", { placeholder: "bintrail_slot" }), "postgres"));
+  monGrid.append(tagFlavor(srvField("Publication", "source_publication", { placeholder: "bintrail_pub" }), "postgres"));
   monGrid.append(srvField("Schemas", "schemas", { placeholder: "(optional) shop,billing" }));
   monGrid.append(srvField("Archive to S3", "archive_s3", { placeholder: "(optional) s3://bucket/prefix/" }));
   mon.append(monGrid);
   // The source user is the #1 friction point — spell out the grant inline,
   // never behind a <details>. REPLICATION SLAVE/CLIENT drive the stream;
   // SELECT covers the information_schema snapshot of columns/PKs/FKs.
-  const grantHint = el("p", { class: "form-hint", style: "margin-top:10px" });
+  const grantHint = tagFlavor(el("p", { class: "form-hint", style: "margin-top:10px" }), "mysql mariadb");
   grantHint.append("Source user needs ");
   grantHint.append(el("code", { text: "REPLICATION SLAVE, REPLICATION CLIENT, SELECT" }));
   grantHint.append(". Create one on the source MySQL — copy and run:");
   mon.append(grantHint);
-  mon.append(el("pre", { class: "form-code", text:
+  mon.append(tagFlavor(el("pre", { class: "form-code", text:
     "CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';\n" +
-    "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';" }));
+    "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';" }), "mysql mariadb"));
+  // PostgreSQL prerequisites — the console reads them, it never runs CREATE
+  // PUBLICATION / ALTER SYSTEM (validate-don't-create; capture is pgoutput-only).
+  const pgHint = tagFlavor(el("p", { class: "form-hint", style: "margin-top:10px" }), "postgres");
+  pgHint.append("PostgreSQL source needs ");
+  pgHint.append(el("code", { text: "wal_level=logical" }));
+  pgHint.append(", a role with the ");
+  pgHint.append(el("code", { text: "REPLICATION" }));
+  pgHint.append(" attribute, a publication you create, and ");
+  pgHint.append(el("code", { text: "REPLICA IDENTITY FULL" }));
+  pgHint.append(" on replicated tables — copy and run on the source:");
+  mon.append(pgHint);
+  mon.append(tagFlavor(el("pre", { class: "form-code", text:
+    "CREATE PUBLICATION bintrail_pub FOR ALL TABLES;\n" +
+    "ALTER TABLE your_table REPLICA IDENTITY FULL;" }), "postgres"));
   mon.append(el("p", { class: "form-hint", style: "margin-top:10px", text: "Archive to S3: old data is uploaded here before it's deleted locally, so your history is kept and can still be searched. Needs AWS credentials set up on the daemon (environment variables or an IAM role)." }));
   form.append(mon);
 
@@ -2999,6 +3038,7 @@ function showServerForm(prefill) {
   $("#server-cancel", form).addEventListener("click", hideServerForm);
   $("#server-test", form).addEventListener("click", () => testServerForm(form));
   form.addEventListener("submit", (e) => { e.preventDefault(); saveServer(form); });
+  form.elements.flavor.addEventListener("change", () => applyFlavor(form));
 
   // Where the index connection is the whole form (serve-only process: no
   // monitor capability), or the entry being edited carries index fields,
@@ -3021,13 +3061,18 @@ function showServerForm(prefill) {
 
   if (prefill) {
     form.elements.id.value = prefill.id || "";
-    ["name", "host", "port", "user", "dbname", "baseline_dir", "baseline_s3", "archive_s3", "source_host", "source_port", "source_user", "schemas"].forEach((k) => {
+    ["name", "host", "port", "user", "dbname", "baseline_dir", "baseline_s3", "archive_s3", "source_host", "source_port", "source_user", "schemas", "source_database", "source_slot", "source_publication"].forEach((k) => {
       if (form.elements[k] && prefill[k] != null) form.elements[k].value = prefill[k];
     });
     if (form.elements.no_archive) form.elements.no_archive.checked = !!prefill.no_archive;
     form.elements.password.placeholder = prefill.has_password ? "(unchanged — leave blank to keep)" : "(none)";
     form.elements.source_password.placeholder = prefill.has_source_password ? "(unchanged — leave blank to keep)" : "";
   }
+  // Flavor init runs for both add and edit; it's immutable after create (the
+  // backend rejects a change on PUT), so disable the selector when editing.
+  form.elements.flavor.value = (prefill && prefill.flavor) || "mysql";
+  if (prefill && prefill.id) form.elements.flavor.disabled = true;
+  applyFlavor(form);
   form.elements.name.focus();
 }
 function hideServerForm() {
@@ -3048,12 +3093,15 @@ function serverFormBody(form) {
   const f = form.elements;
   const body = {
     name: f.name.value.trim(),
+    flavor: f.flavor.value,
     host: f.host.value.trim(), port: f.port.value.trim(), user: f.user.value.trim(), dbname: f.dbname.value.trim(),
     baseline_dir: f.baseline_dir.value.trim(), baseline_s3: f.baseline_s3.value.trim(),
     no_archive: !!f.no_archive.checked,
     archive_s3: f.archive_s3.value.trim(),
     source_host: f.source_host.value.trim(), source_port: f.source_port.value.trim(),
     source_user: f.source_user.value.trim(), schemas: f.schemas.value.trim(),
+    source_database: f.source_database.value.trim(),
+    source_slot: f.source_slot.value.trim(), source_publication: f.source_publication.value.trim(),
   };
   if (f.password.value !== "") body.password = f.password.value;
   if (f.source_password.value !== "") body.source_password = f.source_password.value;

@@ -1112,6 +1112,10 @@ button { font-family: inherit; }
    .cap-on. The :not() + !important hides by default and restores the
    element's own display once gated on — no flash, no per-element value. */
 [data-capability]:not(.cap-on) { display: none !important; }
+/* Source-family gating: a [data-flavor] form field is hidden until applyFlavor
+   marks it .flavor-on for the selected source type. Same :not() + !important
+   default-hide as capability gating — a class toggle, never a [hidden] toggle. */
+[data-flavor]:not(.flavor-on) { display: none !important; }
 
 /* Auth-kind gating, same pattern: [data-auth="session"] surfaces (the logout
    button) show only when applyAuthGate() confirms this tab holds a login

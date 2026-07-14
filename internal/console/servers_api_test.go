@@ -516,13 +516,13 @@ func TestBuildSourceDSNValidation(t *testing.T) {
 		{"structured without user", serverRequest{SourceHost: "h"}},
 	}
 	for _, tc := range cases {
-		if _, err := buildSourceDSN(tc.req, ""); err == nil {
+		if _, err := buildSourceDSN(tc.req, "", FlavorMySQL); err == nil {
 			t.Errorf("%s: expected error", tc.name)
 		}
 	}
 
 	// A source DSN needs NO database name (server-level), unlike the index DSN.
-	got, err := buildSourceDSN(serverRequest{SourceHost: "h", SourceUser: "repl"}, "")
+	got, err := buildSourceDSN(serverRequest{SourceHost: "h", SourceUser: "repl"}, "", FlavorMySQL)
 	if err != nil {
 		t.Fatalf("dbname-less source must be valid: %v", err)
 	}
