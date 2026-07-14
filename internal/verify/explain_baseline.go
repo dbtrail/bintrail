@@ -126,17 +126,24 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 	// VerifyBaselinePair reconstructs the recovery side over (#797: PrevAnchor,
 	// when recorded, replaces the imprecise PrevSnapshot DATETIME lower bound —
 	// see VerifyBaselinePair's comment).
+	pg := cfg.SourceFlavor == flavorPostgres
 	engine := query.New(cfg.IndexDB)
 	fetchOpts := query.Options{
 		Schema:     p.Schema,
 		Table:      p.Table,
 		Since:      &p.PrevSnapshot,
 		Until:      &p.NewSnapshot,
-		UntilPos:   &p.NewAnchor,
 		LimitPerPK: 1,
 	}
-	if p.PrevAnchor.File != "" && p.PrevAnchor.Pos != 0 {
-		fetchOpts.SincePos = &p.PrevAnchor
+	if pg {
+		// Time-bounded delta window for PostgreSQL (non-monotonic LSN in
+		// binlog_file); mirrors VerifyBaselinePair so the drill-down sees exactly
+		// the rows the verdict's digest saw.
+	} else {
+		fetchOpts.UntilPos = &p.NewAnchor
+		if p.PrevAnchor.File != "" && p.PrevAnchor.Pos != 0 {
+			fetchOpts.SincePos = &p.PrevAnchor
+		}
 	}
 	rows, _, err := query.FetchMerged(ctx, cfg.IndexDB, engine, query.FetchMergedOptions{
 		Opts:           fetchOpts,
@@ -160,14 +167,14 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 
 	// Truth side held fully (the new baseline as-is); recovery streamed against it
 	// so only one side is materialized in memory at a time.
-	truth, err := collectRowsByPK(ctx, p.NewPath, p.Schema, p.Table, pkCols, orderedCols, map[string]*query.ResultRow{})
+	truth, err := collectRowsByPK(ctx, p.NewPath, p.Schema, p.Table, pkCols, orderedCols, map[string]*query.ResultRow{}, pg)
 	if err != nil {
 		return nil, fmt.Errorf("read new baseline %s.%s: %w", p.Schema, p.Table, err)
 	}
 
-	ex := &MismatchExplanation{Schema: p.Schema, Table: p.Table, Anchor: fmt.Sprintf("%s:%d", p.NewAnchor.File, p.NewAnchor.Pos)}
+	ex := &MismatchExplanation{Schema: p.Schema, Table: p.Table, Anchor: anchorLabel(pg, p)}
 	seen := make(map[string]bool, len(truth))
-	err = streamRowsByPK(ctx, p.PrevPath, p.Schema, p.Table, pkCols, orderedCols, changes, rows, func(key string, rec rowCells) error {
+	err = streamRowsByPK(ctx, p.PrevPath, p.Schema, p.Table, pkCols, orderedCols, changes, rows, pg, func(key string, rec rowCells) error {
 		seen[key] = true
 		t, ok := truth[key]
 		if !ok {
@@ -222,7 +229,7 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 // the SAME renderCellNormalized reconstructDigest's baseline-anchored callers
 // use, so a row this drill-down shows as differing is exactly a row the digest
 // that flagged the mismatch also saw as differing (cellEqual's invariant).
-func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, events []query.ResultRow, emit func(key string, r rowCells) error) error {
+func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, events []query.ResultRow, pgTextPK bool, emit func(key string, r rowCells) error) error {
 	return reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
 		BaselinePath: baselinePath,
 		Schema:       schema,
@@ -230,6 +237,7 @@ func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkC
 		PKCols:       pkCols,
 		Changes:      changes,
 		Events:       events,
+		PGTextPK:     pgTextPK,
 	}, func(rowMap map[string]any) error {
 		key, pk := pkKeyAndDisplay(rowMap, pkCols)
 		cells := make(map[string][]byte, len(orderedCols))
@@ -240,9 +248,9 @@ func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkC
 	})
 }
 
-func collectRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow) (map[string]rowCells, error) {
+func collectRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, pgTextPK bool) (map[string]rowCells, error) {
 	out := make(map[string]rowCells)
-	err := streamRowsByPK(ctx, baselinePath, schema, table, pkCols, orderedCols, changes, nil, func(key string, r rowCells) error {
+	err := streamRowsByPK(ctx, baselinePath, schema, table, pkCols, orderedCols, changes, nil, pgTextPK, func(key string, r rowCells) error {
 		out[key] = r
 		return nil
 	})

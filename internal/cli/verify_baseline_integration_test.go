@@ -97,7 +97,7 @@ func TestRunVerifyBaselinePair_EndToEnd(t *testing.T) {
 	cmd.SetContext(context.Background())
 	var out bytes.Buffer
 	cmd.SetOut(&out)
-	if err := runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{}); err != nil {
+	if err := runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{}, ""); err != nil {
 		t.Fatalf("runVerifyBaselinePair: %v\noutput:\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "1 match") {
@@ -162,7 +162,7 @@ func TestRunVerifyBaselinePair_EndToEnd_Mismatch(t *testing.T) {
 	cmd.SetContext(context.Background())
 	var out bytes.Buffer
 	cmd.SetOut(&out)
-	err = runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{})
+	err = runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{}, "")
 	if err == nil {
 		t.Fatalf("want a non-nil error (non-zero exit) on divergence, got nil\noutput:\n%s", out.String())
 	}
@@ -229,7 +229,7 @@ func TestRunVerifyBaselinePair_EndToEnd_NeverBaselined(t *testing.T) {
 	cmd.SetContext(context.Background())
 	var out bytes.Buffer
 	cmd.SetOut(&out)
-	if err := runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{}); err != nil {
+	if err := runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{}, ""); err != nil {
 		t.Fatalf("runVerifyBaselinePair: %v\noutput:\n%s", err, out.String())
 	}
 	o := out.String()
@@ -314,7 +314,7 @@ func TestRunVerifyBaselinePair_EndToEnd_StaleButRecoverable(t *testing.T) {
 	cmd.SetContext(context.Background())
 	var out bytes.Buffer
 	cmd.SetOut(&out)
-	if err := runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{}); err != nil {
+	if err := runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{}, ""); err != nil {
 		t.Fatalf("runVerifyBaselinePair: %v\noutput:\n%s", err, out.String())
 	}
 	o := out.String()
@@ -395,7 +395,7 @@ func TestRunVerifyBaselinePair_Explain(t *testing.T) {
 	cmd.SetContext(context.Background())
 	var out bytes.Buffer
 	cmd.SetOut(&out)
-	err = runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{})
+	err = runVerifyBaselinePair(cmd, db, resolver, dbName, baseDir, duckdbutil.Tuning{}, "")
 	if err == nil {
 		t.Fatalf("--explain must not swallow the mismatch exit status, got nil error\noutput:\n%s", out.String())
 	}

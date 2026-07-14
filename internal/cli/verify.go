@@ -14,6 +14,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/verify"
 )
 
@@ -112,7 +113,7 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 	if cfg, parseErr := mysqldriver.ParseDSN(vfyIndexDSN); parseErr == nil {
 		indexDBName = cfg.DBName
 	}
-	resolver, err := metadata.NewResolver(indexDB, 0)
+	resolver, err := verify.ResolverFor(indexDB)
 	if err != nil {
 		return fmt.Errorf("load schema snapshot from index: %w", err)
 	}
@@ -121,15 +122,21 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	flavor := query.SourceFlavor(indexDB)
 	if vfySourceDSN != "" {
+		// Live-source verify fingerprints the source with MySQL-only SQL; refuse
+		// a PG source up front rather than reach a misleading inconclusive.
+		if flavor == "postgres" {
+			return fmt.Errorf("live-source verify (--source-dsn) is not supported for PostgreSQL sources; omit it to run baseline-anchored verify")
+		}
 		return runVerifyLive(cmd, indexDB, resolver, indexDBName, baselineSrc, duckTuning)
 	}
-	return runVerifyBaselinePair(cmd, indexDB, resolver, indexDBName, baselineSrc, duckTuning)
+	return runVerifyBaselinePair(cmd, indexDB, resolver, indexDBName, baselineSrc, duckTuning, flavor)
 }
 
 // runVerifyBaselinePair is the default, drift-free mode: compare the two most
 // recent baselines (#642). It reads no live source.
-func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName, baselineSrc string, duckTuning duckdbutil.Tuning) error {
+func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName, baselineSrc string, duckTuning duckdbutil.Tuning, flavor string) error {
 	pairs, unpaired, prevOnly, err := verify.FindBaselinePair(cmd.Context(), baselineSrc)
 	if err != nil {
 		return fmt.Errorf("discover baseline pair: %w", err)
@@ -162,6 +169,7 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 		IndexDBName:    indexDBName,
 		NoArchive:      vfyNoArchive,
 		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
+		SourceFlavor:   flavor,
 	}
 
 	results := make([]verify.TableResult, 0, len(pairs)+len(unpaired))

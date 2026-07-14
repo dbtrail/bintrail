@@ -61,7 +61,7 @@ func TestRunVerifyBaselinePair_NoBaselines(t *testing.T) {
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 
-	err := runVerifyBaselinePair(cmd, nil, nil, "", t.TempDir(), duckdbutil.Tuning{})
+	err := runVerifyBaselinePair(cmd, nil, nil, "", t.TempDir(), duckdbutil.Tuning{}, "")
 	if err == nil {
 		t.Fatalf("want a non-nil error (non-zero exit) for zero baselines, got nil; output:\n%s", out.String())
 	}
@@ -85,7 +85,7 @@ func TestRunVerifyBaselinePair_SingleBaseline(t *testing.T) {
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 
-	err := runVerifyBaselinePair(cmd, nil, nil, "", baseDir, duckdbutil.Tuning{})
+	err := runVerifyBaselinePair(cmd, nil, nil, "", baseDir, duckdbutil.Tuning{}, "")
 	if err != nil {
 		t.Fatalf("want nil error (exit 0) for a single baseline, got %v\noutput:\n%s", err, out.String())
 	}
@@ -115,7 +115,7 @@ func TestRunVerifyBaselinePair_TablesAbsent(t *testing.T) {
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 
-	err := runVerifyBaselinePair(cmd, nil, metadata.NewResolverFromTables(1, nil), "", baseDir, duckdbutil.Tuning{})
+	err := runVerifyBaselinePair(cmd, nil, metadata.NewResolverFromTables(1, nil), "", baseDir, duckdbutil.Tuning{}, "")
 	if err == nil {
 		t.Fatalf("want a non-nil error (non-zero exit) for an absent --tables request, got nil; output:\n%s", out.String())
 	}
@@ -153,7 +153,7 @@ func TestRunVerifyBaselinePair_NeverBaselined(t *testing.T) {
 
 	// Non-zero exit is expected here, but from the "nothing proven" gate (the
 	// only result is inconclusive), NOT from the --tables-absent error path.
-	err := runVerifyBaselinePair(cmd, nil, resolver, "", baseDir, duckdbutil.Tuning{})
+	err := runVerifyBaselinePair(cmd, nil, resolver, "", baseDir, duckdbutil.Tuning{}, "")
 	if err == nil {
 		t.Fatalf("want a non-nil error (all-inconclusive run proves nothing), got nil; output:\n%s", out.String())
 	}

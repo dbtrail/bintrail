@@ -138,7 +138,7 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 		return nil, fmt.Errorf("connect index: %w", err)
 	}
 	defer db.Close()
-	resolver, err := metadata.NewResolver(db, 0)
+	resolver, err := verify.ResolverFor(db)
 	if err != nil {
 		return nil, fmt.Errorf("load schema snapshot: %w", err)
 	}
@@ -147,6 +147,7 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 	cfg := verify.BaselineConfig{
 		IndexDB: db, Resolver: resolver, IndexDBName: indexDBName(indexDSN),
 		NoArchive: noArchive, ArchiveFetcher: parquetquery.Fetch,
+		SourceFlavor: query.SourceFlavor(db),
 	}
 
 	ex, err := verify.ExplainBaselinePairMismatch(s.ctx, cfg, pair)
@@ -191,7 +192,7 @@ func (s *verifySupervisor) run(req console.VerifyRequest, baselineSrc string) {
 		return
 	}
 	defer db.Close()
-	resolver, err := metadata.NewResolver(db, 0)
+	resolver, err := verify.ResolverFor(db)
 	if err != nil {
 		// Hard requirement, no fallback — mirrors internal/cli/verify.go: a
 		// missing schema snapshot means verify cannot resolve primary keys.
@@ -199,18 +200,27 @@ func (s *verifySupervisor) run(req console.VerifyRequest, baselineSrc string) {
 		return
 	}
 	dbName := indexDBName(req.IndexDSN)
+	flavor := query.SourceFlavor(db)
 
 	var runErr error
 	switch req.Mode {
 	case console.VerifyModeLiveSource:
-		runErr = s.runLiveSource(req, db, resolver, dbName)
+		// Live-source verify fingerprints the source with MySQL-only SQL; a PG
+		// source is refused with a clear verdict (not a misleading inconclusive).
+		// Baseline-anchored is the supported PG path. This is an engine-truth
+		// backstop; handleVerifyTrigger already rejects it at the API boundary.
+		if flavor == console.FlavorPostgres {
+			runErr = fmt.Errorf("live-source verify is not supported for PostgreSQL sources; use baseline-anchored verify")
+		} else {
+			runErr = s.runLiveSource(req, db, resolver, dbName)
+		}
 	default:
-		runErr = s.runBaselineAnchored(req, baselineSrc, db, resolver, dbName)
+		runErr = s.runBaselineAnchored(req, baselineSrc, db, resolver, dbName, flavor)
 	}
 	s.finish(req.ServerID, runErr)
 }
 
-func (s *verifySupervisor) runBaselineAnchored(req console.VerifyRequest, baselineSrc string, indexDB *sql.DB, resolver *metadata.Resolver, dbName string) error {
+func (s *verifySupervisor) runBaselineAnchored(req console.VerifyRequest, baselineSrc string, indexDB *sql.DB, resolver *metadata.Resolver, dbName, flavor string) error {
 	ctx := s.ctx
 	pairs, unpaired, prevOnly, err := verify.FindBaselinePair(ctx, baselineSrc)
 	if err != nil {
@@ -238,6 +248,7 @@ func (s *verifySupervisor) runBaselineAnchored(req console.VerifyRequest, baseli
 	cfg := verify.BaselineConfig{
 		IndexDB: indexDB, Resolver: resolver, IndexDBName: dbName,
 		NoArchive: req.NoArchive, ArchiveFetcher: parquetquery.Fetch,
+		SourceFlavor: flavor,
 	}
 
 	for _, p := range pairs {

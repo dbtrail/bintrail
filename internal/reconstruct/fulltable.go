@@ -720,6 +720,9 @@ type mergeCore struct {
 	Table             string
 	PKCols            []metadata.ColumnMeta
 	Changes           map[string]*query.ResultRow
+	// PGTextPK skips the MySQL PK canonicalizer for a PostgreSQL source (text
+	// PK on both baseline and delta sides). See SnapshotFullTableInput.PGTextPK.
+	PGTextPK bool
 }
 
 // mergeStats counts what mergeBaselineImages did, for the offline
@@ -807,9 +810,17 @@ func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string
 		// go-mysql-formatted string (#212). canonicalizePKMap does not
 		// mutate rowMap, so the emitted pass-through row keeps its original
 		// values.
-		pkMap, err := canonicalizePKMap(rowMap, in.PKCols)
-		if err != nil {
-			return stats, fmt.Errorf("canonicalize baseline PK for %s.%s: %w", in.Schema, in.Table, err)
+		// PostgreSQL: baseline COPY text and delta pgoutput text are the same
+		// bytes, so the PK match is string-identity — skip the MySQL DATA_TYPE
+		// canonicalizer, which errors on PG's empty DATA_TYPE token. MySQL still
+		// canonicalizes (DuckDB returns time.Time for a DATETIME/TIMESTAMP PK,
+		// which must become the indexer's stored string, #212).
+		pkMap := rowMap
+		if !in.PGTextPK {
+			var err error
+			if pkMap, err = canonicalizePKMap(rowMap, in.PKCols); err != nil {
+				return stats, fmt.Errorf("canonicalize baseline PK for %s.%s: %w", in.Schema, in.Table, err)
+			}
 		}
 		pk := event.BuildPKValues(in.PKCols, pkMap)
 
@@ -893,6 +904,13 @@ type SnapshotFullTableInput struct {
 	// per PK by the query, so their detection is bounded by that fetch; nil
 	// falls back to the map-only backstop (pkChangingUpdate).
 	Events []query.ResultRow
+	// PGTextPK marks a PostgreSQL source: the baseline Parquet and the delta
+	// pk_values BOTH store every column as raw text (pgbaseline COPY text ==
+	// pgoutput text), so the PK match is string-identity — skip the MySQL
+	// DATA_TYPE canonicalizer, which errors on PG's empty DATA_TYPE token. A
+	// caller that sets this must have skipped the SupportedPKType precondition
+	// accordingly. Zero value (false) preserves the MySQL path verbatim.
+	PGTextPK bool
 }
 
 // SnapshotFullTableImages reconstructs the full row state of a table at the
@@ -941,6 +959,7 @@ func SnapshotFullTableImages(ctx context.Context, in SnapshotFullTableInput, emi
 		Table:             in.Table,
 		PKCols:            in.PKCols,
 		Changes:           in.Changes,
+		PGTextPK:          in.PGTextPK,
 	}, emit)
 	return err
 }

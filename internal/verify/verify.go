@@ -213,7 +213,9 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	// conclusive (real loss/gain) and is never masked by this.
 	deferredRepr := deferredReprUnresolved(orderedCols, changes, binariesTyped)
 
-	reconDigest, reconCount, emitErr := reconstructDigest(ctx, baselinePath, schema, table, pkCols, changes, rows, orderedCols, renderCellNormalized)
+	// Live-source verify is MySQL-only (PostgreSQL is refused upstream), so the
+	// PK canonicalizer always applies here — pgTextPK is false.
+	reconDigest, reconCount, emitErr := reconstructDigest(ctx, baselinePath, schema, table, pkCols, changes, rows, orderedCols, false, renderCellNormalized)
 	if emitErr != nil {
 		return res, fmt.Errorf("reconstruct %s.%s: %w", schema, table, emitErr)
 	}
@@ -271,7 +273,7 @@ func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int
 // side of its own comparison): both sides of any one comparison must be
 // produced with the SAME render func so the digests are byte-comparable by
 // construction.
-func reconstructDigest(ctx context.Context, baselinePath, schema, table string, pkCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, events []query.ResultRow, orderedCols []metadata.ColumnMeta, render func(any, metadata.ColumnMeta) []byte) (string, int64, error) {
+func reconstructDigest(ctx context.Context, baselinePath, schema, table string, pkCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, events []query.ResultRow, orderedCols []metadata.ColumnMeta, pgTextPK bool, render func(any, metadata.ColumnMeta) []byte) (string, int64, error) {
 	hasher := consistency.NewHasher()
 	err := reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
 		BaselinePath: baselinePath,
@@ -280,6 +282,7 @@ func reconstructDigest(ctx context.Context, baselinePath, schema, table string, 
 		PKCols:       pkCols,
 		Changes:      changes,
 		Events:       events,
+		PGTextPK:     pgTextPK,
 	}, func(rowMap map[string]any) error {
 		cells := make([][]byte, len(orderedCols))
 		for i, c := range orderedCols {
