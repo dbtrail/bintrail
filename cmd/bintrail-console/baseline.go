@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/pgbaseline"
 )
 
 // baselineSupervisor implements console.BaselineController by running the
@@ -96,6 +98,9 @@ func (s *baselineSupervisor) run(req console.BaselineRequest) {
 // uploaded; for an S3 destination it is staged under a fresh temp dir, uploaded,
 // and the staging removed (so a re-run never re-uploads an old snapshot).
 func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stats, int, error) {
+	if req.Flavor == console.FlavorPostgres {
+		return s.executePG(req)
+	}
 	if err := os.MkdirAll(s.stagingDir, 0o755); err != nil {
 		return baseline.Stats{}, 0, fmt.Errorf("create staging dir: %w", err)
 	}
@@ -147,6 +152,71 @@ func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stat
 		}
 	}
 	return stats, uploaded, nil
+}
+
+// executePG produces a PostgreSQL baseline in-process via internal/pgbaseline —
+// COPY straight to Parquet, anchored at the slot's consistent-point LSN. No
+// mydumper subprocess and no #768 timestamp skew: pgbaseline self-stamps the
+// snapshot time from the database's own now(). Destination handling mirrors
+// execute(): a local dir is written persistently; S3-only stages in a temp dir,
+// uploads via the same source-agnostic baseline.Upload, and discards the staging.
+func (s *baselineSupervisor) executePG(req console.BaselineRequest) (baseline.Stats, int, error) {
+	if err := os.MkdirAll(s.stagingDir, 0o755); err != nil {
+		return baseline.Stats{}, 0, fmt.Errorf("create staging dir: %w", err)
+	}
+	outputDir := req.LocalDir
+	if outputDir == "" { // S3-only: stage then upload, discard staging
+		var err error
+		outputDir, err = os.MkdirTemp(s.stagingDir, "pgbaseline-")
+		if err != nil {
+			return baseline.Stats{}, 0, fmt.Errorf("create baseline staging dir: %w", err)
+		}
+		defer os.RemoveAll(outputDir)
+	}
+
+	cfg, err := pgBaselineConfig(req, outputDir)
+	if err != nil {
+		return baseline.Stats{}, 0, err
+	}
+	pgStats, err := pgbaseline.Run(s.ctx, cfg)
+	if err != nil {
+		return baseline.Stats{}, 0, fmt.Errorf("pg baseline: %w", err)
+	}
+
+	var uploaded int
+	if req.S3 != "" {
+		uploaded, err = baseline.Upload(s.ctx, outputDir, req.S3, "", false)
+		if err != nil {
+			return baseline.Stats{}, 0, fmt.Errorf("upload: %w", err)
+		}
+	}
+	return baseline.Stats{
+		TablesProcessed: pgStats.TablesProcessed,
+		RowsWritten:     pgStats.RowsWritten,
+		FilesWritten:    pgStats.FilesWritten,
+	}, uploaded, nil
+}
+
+// pgBaselineConfig builds the pgbaseline.Config for a PG source, mirroring
+// cmd/bintrail-pg's pgBaselineConfigFromFlags. The replication DSN is derived
+// from the stored query DSN (console.PGReplDSN — the one home for that
+// derivation), needed so pgbaseline can CREATE the slot when a user baselines
+// BEFORE the first monitor start; harmless if the slot already exists. Pure —
+// unit-testable without a live PG. The registry carries only a schema filter.
+func pgBaselineConfig(req console.BaselineRequest, outputDir string) (pgbaseline.Config, error) {
+	replDSN, err := console.PGReplDSN(req.SourceDSN)
+	if err != nil {
+		return pgbaseline.Config{}, err
+	}
+	return pgbaseline.Config{
+		QueryDSN:    req.SourceDSN,
+		ReplDSN:     replDSN,
+		SlotName:    req.Slot,
+		Publication: req.Publication,
+		Filters:     cliutil.BuildIndexFilters(strings.Join(req.Schemas, ","), ""),
+		OutputDir:   outputDir,
+		Compression: "zstd",
+	}, nil
 }
 
 // runMydumper invokes the bundled mydumper binary against the source DSN, writing

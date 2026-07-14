@@ -45,6 +45,16 @@ type BaselineRequest struct {
 	// the ambient AWS chain (env / ~/.aws / IAM role), like the rest of the
 	// console's S3 access.
 	S3 string
+	// Flavor selects the baseline producer: "postgres" runs internal/pgbaseline
+	// (COPY + the slot's pgoutput anchor); anything else runs mydumper. Plain
+	// strings keep internal/console pgx-free (the read-layer dependency guard).
+	Flavor string
+	// Slot / Publication are the PostgreSQL replication slot and publication
+	// (postgres flavor only); the producer stamps the snapshot at the slot's
+	// consistent-point LSN so Time-travel/reconstruct can replay deltas from it.
+	// Empty for MySQL/MariaDB.
+	Slot        string
+	Publication string
 }
 
 // BaselineStatus is the pollable state of a server's most recent baseline job.
@@ -82,14 +92,22 @@ func (s *Server) handleBaselineTrigger(w http.ResponseWriter, r *http.Request) {
 			"this server has no baseline location set up; set a baseline directory or S3 location first (Edit → Advanced)")
 		return
 	}
+	if e.IsPostgres() && (e.SourceSlot == "" || e.SourcePublication == "") {
+		writeJSONError(w, http.StatusBadRequest,
+			"this PostgreSQL server has no replication slot/publication configured; set them first (Edit → Source)")
+		return
+	}
 
 	req := BaselineRequest{
-		ServerID:   e.ID,
-		ServerName: e.Name,
-		SourceDSN:  e.SourceDSN,
-		Schemas:    splitSchemas(e.Schemas),
-		LocalDir:   e.BaselineDir,
-		S3:         e.BaselineS3,
+		ServerID:    e.ID,
+		ServerName:  e.Name,
+		SourceDSN:   e.SourceDSN,
+		Schemas:     splitSchemas(e.Schemas),
+		LocalDir:    e.BaselineDir,
+		S3:          e.BaselineS3,
+		Flavor:      e.SourceFlavor(),
+		Slot:        e.SourceSlot,
+		Publication: e.SourcePublication,
 	}
 	if err := s.baselineCtrl.Trigger(req); err != nil {
 		if errors.Is(err, ErrBaselineRunning) {
