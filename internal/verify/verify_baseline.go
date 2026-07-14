@@ -59,6 +59,34 @@ func anchorLabel(pg bool, p BaselinePair) string {
 	return fmt.Sprintf("%s:%d", p.NewAnchor.File, p.NewAnchor.Pos)
 }
 
+// baselineFetchOptions builds the delta-window query for reconstructing the
+// previous baseline forward to the new one. The window is ALWAYS time-bounded
+// (Since/Until on event_timestamp). MySQL additionally pins the exact binlog-
+// position cut — UntilPos at the new anchor, SincePos at the prev anchor when it
+// recorded one (#797). PostgreSQL does NOT: its events carry a non-monotonic
+// "X/Y" LSN in binlog_file that the length-lexicographic position filter cannot
+// bound correctly, so a PG window is time-bounded only (accepting the (prev,new]
+// boundary drift the live-source path documents; a numeric-LSN position filter
+// is a deferred refinement, #1022). "PG never sets a position bound" is the
+// load-bearing correctness invariant — kept in ONE place, shared by
+// VerifyBaselinePair and ExplainBaselinePairMismatch.
+func baselineFetchOptions(p BaselinePair, pg bool) query.Options {
+	opts := query.Options{
+		Schema:     p.Schema,
+		Table:      p.Table,
+		Since:      &p.PrevSnapshot,
+		Until:      &p.NewSnapshot,
+		LimitPerPK: 1,
+	}
+	if !pg {
+		opts.UntilPos = &p.NewAnchor
+		if p.PrevAnchor.File != "" && p.PrevAnchor.Pos != 0 {
+			opts.SincePos = &p.PrevAnchor
+		}
+	}
+	return opts
+}
+
 // BaselinePair is one table's previous + new baseline, with the new baseline's
 // recorded binlog anchor and the previous baseline's snapshot time — everything
 // VerifyBaselinePair needs to reconstruct prev→anchor and compare to new.
@@ -169,25 +197,7 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	// lower-bound artifact. A reported MATCH is unaffected either way (a too-wide
 	// lower bound can only add a superseded older event, never drop a real one).
 	engine := query.New(cfg.IndexDB)
-	fetchOpts := query.Options{
-		Schema:     p.Schema,
-		Table:      p.Table,
-		Since:      &p.PrevSnapshot,
-		Until:      &p.NewSnapshot, // coarse time bound: partition pruning + gap planner
-		LimitPerPK: 1,
-	}
-	if pg {
-		// PostgreSQL events carry a non-monotonic "X/Y" LSN in binlog_file, which
-		// the (length-lexicographic) position filter can't bound correctly, so the
-		// delta window is time-bounded only (Since/Until on event_timestamp). This
-		// accepts the (prev,new] boundary drift the live-source path already
-		// documents; a numeric-LSN position filter is a deferred refinement (#1022).
-	} else {
-		fetchOpts.UntilPos = &p.NewAnchor // exact cut at the new baseline's binlog point
-		if p.PrevAnchor.File != "" && p.PrevAnchor.Pos != 0 {
-			fetchOpts.SincePos = &p.PrevAnchor
-		}
-	}
+	fetchOpts := baselineFetchOptions(p, pg)
 	rows, _, err := query.FetchMerged(ctx, cfg.IndexDB, engine, query.FetchMergedOptions{
 		Opts:           fetchOpts,
 		DBName:         cfg.IndexDBName,

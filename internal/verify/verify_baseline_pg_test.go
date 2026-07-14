@@ -4,8 +4,10 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // pgResolver stubs a one-table schema whose PK column has an EMPTY DataType —
@@ -61,5 +63,43 @@ func TestVerifyBaselinePair_mysqlKeepsPKTypeGate(t *testing.T) {
 	}
 	if !strings.Contains(res.Detail, "unsupported by the baseline canonicalizer") {
 		t.Errorf("MySQL must keep the PK-type gate, got: %q", res.Detail)
+	}
+}
+
+// TestBaselineFetchOptions_pgNeverBoundsByPosition guards the load-bearing B4
+// invariant that VerifyBaselinePair and ExplainBaselinePairMismatch share: a PG
+// delta window is time-bounded ONLY (its binlog_file is a non-monotonic "X/Y"
+// LSN the position filter can't order), while MySQL pins the exact binlog cut.
+// A refactor that set a position bound for PG — the exact regression the review
+// flagged — fails here without a live DB.
+func TestBaselineFetchOptions_pgNeverBoundsByPosition(t *testing.T) {
+	p := BaselinePair{
+		Schema: "app", Table: "orders",
+		PrevSnapshot: time.Unix(100, 0).UTC(), NewSnapshot: time.Unix(200, 0).UTC(),
+		NewAnchor:  query.BinlogPos{File: "mysql-bin.000007", Pos: 4242},
+		PrevAnchor: query.BinlogPos{File: "mysql-bin.000006", Pos: 100},
+	}
+
+	pgOpts := baselineFetchOptions(p, true)
+	if pgOpts.UntilPos != nil || pgOpts.SincePos != nil {
+		t.Errorf("PG window must set NO position bound: UntilPos=%v SincePos=%v", pgOpts.UntilPos, pgOpts.SincePos)
+	}
+	if pgOpts.Since == nil || pgOpts.Until == nil || pgOpts.LimitPerPK != 1 {
+		t.Errorf("PG window must keep the time bounds + LimitPerPK: %+v", pgOpts)
+	}
+
+	myOpts := baselineFetchOptions(p, false)
+	if myOpts.UntilPos == nil || *myOpts.UntilPos != p.NewAnchor {
+		t.Errorf("MySQL window must cut at the new anchor, got %v", myOpts.UntilPos)
+	}
+	if myOpts.SincePos == nil || *myOpts.SincePos != p.PrevAnchor {
+		t.Errorf("MySQL window must lower-bound at the prev anchor, got %v", myOpts.SincePos)
+	}
+
+	// A MySQL baseline with no recorded prev anchor (#797) falls back to the time
+	// lower bound — SincePos stays nil.
+	p.PrevAnchor = query.BinlogPos{}
+	if got := baselineFetchOptions(p, false); got.SincePos != nil {
+		t.Errorf("a zero prev anchor must not set SincePos, got %v", got.SincePos)
 	}
 }

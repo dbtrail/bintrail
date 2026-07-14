@@ -128,23 +128,9 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 	// see VerifyBaselinePair's comment).
 	pg := cfg.SourceFlavor == flavorPostgres
 	engine := query.New(cfg.IndexDB)
-	fetchOpts := query.Options{
-		Schema:     p.Schema,
-		Table:      p.Table,
-		Since:      &p.PrevSnapshot,
-		Until:      &p.NewSnapshot,
-		LimitPerPK: 1,
-	}
-	if pg {
-		// Time-bounded delta window for PostgreSQL (non-monotonic LSN in
-		// binlog_file); mirrors VerifyBaselinePair so the drill-down sees exactly
-		// the rows the verdict's digest saw.
-	} else {
-		fetchOpts.UntilPos = &p.NewAnchor
-		if p.PrevAnchor.File != "" && p.PrevAnchor.Pos != 0 {
-			fetchOpts.SincePos = &p.PrevAnchor
-		}
-	}
+	// Same window as VerifyBaselinePair (time-bounded, position cut for MySQL
+	// only) so the drill-down sees exactly the rows the verdict's digest saw.
+	fetchOpts := baselineFetchOptions(p, pg)
 	rows, _, err := query.FetchMerged(ctx, cfg.IndexDB, engine, query.FetchMergedOptions{
 		Opts:           fetchOpts,
 		DBName:         cfg.IndexDBName,
