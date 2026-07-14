@@ -149,8 +149,9 @@ func validatePGQueryDSN(raw string) error {
 }
 
 // buildPGSourceDSN assembles the stored PostgreSQL SOURCE DSN (the query DSN)
-// for a create/update request, mirroring buildSourceDSN's tri-state on
-// req.SourceDSN. Unlike a MySQL source DSN (server-level, no database), a PG
+// for a create/update request, mirroring buildMySQLSourceDSN's tri-state on
+// req.SourceDSN (buildSourceDSN itself is now just the flavor dispatcher).
+// Unlike a MySQL source DSN (server-level, no database), a PG
 // query DSN MUST name a database because logical replication is per-database.
 // TLS beyond the libpq default is configured by pasting a raw source_dsn (the
 // #879 hand-edit precedent), not a dedicated form field.

@@ -191,6 +191,47 @@ func TestFillPGSourceDSNParts(t *testing.T) {
 	}
 }
 
+// TestPGSourceDSN_specialCharsRoundTrip drives a password carrying URL-significant
+// characters (@ : / — the classic DSN-corruption case) through the full path a
+// real source takes: structured build → stored query DSN → PGReplDSN (which
+// re-runs url.String() + q.Encode()) and → fillPGSourceDSNParts (the DTO decode).
+// url.UserPassword/u.User.Password() percent-encode/decode asymmetries are exactly
+// where a mis-encode would corrupt the live connection or the DTO echo.
+func TestPGSourceDSN_specialCharsRoundTrip(t *testing.T) {
+	const pw = "p@ss:w/rd"
+	stored, err := buildPGSourceDSN(serverRequest{
+		SourceHost: "pg.prod", SourceUser: "repl", SourcePassword: strPtr(pw), SourceDatabase: "appdb",
+	}, "")
+	if err != nil {
+		t.Fatalf("structured build: %v", err)
+	}
+	// The stored query DSN must decode back to the exact password.
+	if got, _ := mustParse(t, stored).User.Password(); got != pw {
+		t.Errorf("stored password did not round-trip: got %q want %q (dsn %q)", got, pw, stored)
+	}
+	// The derived replication DSN re-encodes the whole URL — creds must survive it.
+	repl, err := PGReplDSN(stored)
+	if err != nil {
+		t.Fatalf("PGReplDSN: %v", err)
+	}
+	ru := mustParse(t, repl)
+	if got, _ := ru.User.Password(); got != pw {
+		t.Errorf("repl password did not round-trip: got %q want %q (dsn %q)", got, pw, repl)
+	}
+	if ru.Query().Get("replication") != "database" {
+		t.Errorf("repl DSN missing replication=database: %q", repl)
+	}
+	// The DTO decode exposes host/user/db but never a raw password substring.
+	var dto serverDTO
+	fillPGSourceDSNParts(&dto, stored)
+	if dto.SourceUser != "repl" || dto.SourceHost != "pg.prod" || dto.SourceDatabase != "appdb" || !dto.HasSourcePassword {
+		t.Errorf("DTO decode wrong with special chars: %+v", dto)
+	}
+	if strings.Contains(dto.SourceHost+dto.SourceUser+dto.SourceDatabase+dto.SourcePort, "p@ss") {
+		t.Error("raw password substring leaked into a DTO part")
+	}
+}
+
 func TestBuildSourceDSNDispatch(t *testing.T) {
 	// buildSourceDSN routes postgres to the PG builder and mysql/mariadb to the
 	// MySQL builder (dbname-less server-level DSN).

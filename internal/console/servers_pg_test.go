@@ -51,14 +51,25 @@ func TestHandleServersCreate_postgres(t *testing.T) {
 
 // TestHandleServersCreate_postgresRequiresSlotPublication: a monitorable PG
 // source (a source DSN configured) with no slot/publication is a clear 400 —
-// capture cannot start without them.
+// capture cannot start without them. Missing either half fails (symmetric on the
+// slot/publication ||), and — the stronger contract — no incomplete entry is
+// persisted: a rejected create must not leave a half-written PG source behind.
 func TestHandleServersCreate_postgresRequiresSlotPublication(t *testing.T) {
 	srv := newRegistryServer(t)
-	body := `{"name":"pgnoslot","host":"idx","user":"bt","password":"ipw","dbname":"binlog_index",` +
-		`"flavor":"postgres","source_host":"pg.prod","source_user":"repl","source_password":"p","source_database":"appdb"}`
-	rec, resp := doServersReq(t, srv, "POST", "/api/servers", body)
-	if rec.Code != 400 {
-		t.Fatalf("pg create without slot/publication: code=%d, want 400 (body=%s)", rec.Code, resp)
+	const base = `{"name":"pgnoslot","host":"idx","user":"bt","password":"ipw","dbname":"binlog_index",` +
+		`"flavor":"postgres","source_host":"pg.prod","source_user":"repl","source_password":"p","source_database":"appdb"`
+	for _, tc := range []struct{ name, extra string }{
+		{"neither", `}`},
+		{"slot only", `,"source_slot":"bt_slot"}`},
+		{"publication only", `,"source_publication":"bt_pub"}`},
+	} {
+		rec, resp := doServersReq(t, srv, "POST", "/api/servers", base+tc.extra)
+		if rec.Code != 400 {
+			t.Fatalf("%s: code=%d, want 400 (body=%s)", tc.name, rec.Code, resp)
+		}
+	}
+	if n := srv.cm.reg.Len(); n != 0 {
+		t.Fatalf("a rejected PG create must not persist an entry, registry has %d", n)
 	}
 }
 
