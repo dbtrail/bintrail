@@ -52,7 +52,18 @@ This downloads the Compose stack, brings it up, waits for the console, and print
 what to do next. Then:
 
 1. Open **http://127.0.0.1:8090** — on first run, create a username and password (that's your login from now on).
-2. Click **+ Add server** and paste the MySQL you want to watch — host, user, password. dbtrail runs preflight checks, provisions an index, and starts streaming within the minute.
+2. Click **+ Add server**, pick the **source type** (MySQL, MariaDB, or PostgreSQL), and paste the database you want to watch — host, user, password. dbtrail runs preflight checks, provisions an index, and starts streaming within the minute.
+
+### PostgreSQL (beta) & MariaDB (alpha) sources
+
+The same one-line install — the console captures **PostgreSQL** and **MariaDB**
+sources too, not just MySQL. In **+ Add server**, choose the source type;
+PostgreSQL reveals fields for the database, replication slot, and publication.
+PostgreSQL needs a one-time source-side setup first (`wal_level = logical`,
+`REPLICA IDENTITY FULL`, and a publication — dbtrail validates these and never
+runs DDL on your source). Full walkthrough, incl. managed RDS/Aurora/Cloud SQL:
+**[PostgreSQL source (beta)](docs/postgres.md)** · **[MariaDB source
+(alpha)](docs/mariadb.md)**.
 
 **Just curious?** One container, zero setup, time-travel SQL in 30 seconds:
 

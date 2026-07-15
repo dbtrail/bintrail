@@ -20,8 +20,10 @@ it's the first section — the same four lines as the README.
   bundles one).
 - **Other sources:** besides MySQL, dbtrail can also capture from **MariaDB**
   ([alpha](./mariadb.md) — 10.6+, 11.4 is the CI-tested target) and
-  **PostgreSQL** ([beta](./postgres.md) — 14+, via the separate `bintrail-pg`
-  binary). Each has its own prerequisites; see the linked guide.
+  **PostgreSQL** ([beta](./postgres.md) — 14+). Both are first-class sources in
+  the web console (**+ Add server** → pick the source type); PostgreSQL also
+  ships a standalone `bintrail-pg` binary for headless/CLI deployments. Each has
+  its own prerequisites; see the linked guide.
 - Go 1.25+ (the module targets `go 1.25.11`) — only when building from source. The default `GOTOOLCHAIN=auto` fetches the right toolchain for you.
 
 ## Docker Compose (the bundled default)
@@ -60,11 +62,13 @@ First run — open the URL and create your console username and password.
 ```
 
 Open it and use **+ Add server** (the Servers screen opens itself on a
-fresh install): paste the MySQL to watch — host, user, password, optional
-schema filter (`host.docker.internal` reaches a MySQL on this same machine
-from inside Docker). dbtrail runs the preflight (failures come back as
-remediation cards), provisions a dedicated index for that source, and starts
-streaming. Repeat per server; everything you add resumes automatically when
+fresh install): pick the **source type** (MySQL, MariaDB, or PostgreSQL) and
+paste the database to watch — host, user, password, optional schema filter
+(`host.docker.internal` reaches a database on this same machine from inside
+Docker; a PostgreSQL source adds database/slot/publication fields —
+see [postgres.md](./postgres.md)). dbtrail runs the preflight (failures come
+back as remediation cards), provisions a dedicated index for that source, and
+starts streaming. Repeat per server; everything you add resumes automatically when
 the container restarts.
 
 Prefer to start streaming one source immediately at boot? Set `SOURCE_DSN`

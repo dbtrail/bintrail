@@ -41,6 +41,39 @@ The index MySQL has the same requirements as for any source — see
 
 ## Install
 
+The console captures PostgreSQL as a **first-class source** — the same
+`bintrail-console watch` stack the [Compose quickstart](install.md) stands up.
+There are two ways in: the **web console** (recommended — zero binaries to place)
+or the standalone **`bintrail-pg`** binary (for an existing index or a headless
+CLI deployment).
+
+### The web console — "+ Add server" (recommended)
+
+If you brought up the [Docker Compose stack](install.md) — the *same*
+`install.sh` MySQL uses — you already have everything. Do the [source-side
+setup](#postgresql-side-setup) below first, then:
+
+1. Open the console (**http://127.0.0.1:8090**) and sign in.
+2. **+ Add server** → set **Source type** to **PostgreSQL**. The PostgreSQL-only
+   fields appear: **Database**, **Replication slot**, and **Publication**.
+3. Fill in host, port, user, password, the database, the slot name (created for
+   you on first run), and the publication (the one you created above).
+   Optionally restrict **Schemas**.
+4. **Save.** dbtrail provisions a dedicated MySQL index for that source and
+   starts capturing **in-process** (the console runs the same PostgreSQL
+   preflight as `bintrail-pg doctor` — `wal_level`, publication coverage,
+   `REPLICA IDENTITY FULL`, slot health — and surfaces any failure as a
+   remediation card). Capture resumes automatically on restart.
+
+The **index stays MySQL**; only the *source* is PostgreSQL. The source type is
+fixed once saved — to change a server's capture engine, delete and re-create it.
+The form lives in `bintrail-console watch` (the Compose default); the read-only
+`serve` console browses an existing PostgreSQL-sourced index but does not add
+sources.
+
+### Standalone binary / image
+
+Prefer a headless deployment, or capturing into an index you already run?
 `bintrail-pg` ships as its own artifact alongside the core `bintrail` binary.
 
 **Docker image:**
