@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/img/header.png" alt="dbtrail — the open-source time-travel flashback for MySQL. Every change leaves a trail: follow it back." width="100%">
+<img src="docs/img/dbtrail _ header.png" alt="dbtrail — the open-source time-travel flashback for MySQL. Every change leaves a trail: follow it back." width="100%">
 
 **Point-in-time recovery for MySQL — no locks, no schema changes, no waiting for a restore.**
 
