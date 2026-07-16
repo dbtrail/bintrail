@@ -2,6 +2,7 @@ package cliapp
 
 import (
 	"os/exec"
+	"path"
 	"strings"
 	"testing"
 )
@@ -25,21 +26,32 @@ func TestAttributionCommandsNotOnCore(t *testing.T) {
 	}
 }
 
-// TestCoreBinaryIsAttributionFree is the anti-reintroduction guard, in the
-// style of TestCoreBinaryIsUIFree: the core bintrail binary must not link the
-// retired attribution library. Any new import path back into
-// internal/forensics, however indirect, fails this test.
-func TestCoreBinaryIsAttributionFree(t *testing.T) {
-	out, err := exec.Command("go", "list", "-deps",
-		"github.com/dbtrail/dbtrail/cmd/bintrail").CombinedOutput()
-	if err != nil {
-		t.Fatalf("go list -deps: %v\n%s", err, out)
+// TestShippedBinariesAreAttributionFree is the anti-reintroduction guard, in
+// the style of TestCoreBinaryIsUIFree: no shipped binary may link the retired
+// attribution library. Any new import path back into internal/forensics,
+// however indirect, fails this test. `go list -deps` only loads packages —
+// it never builds — so cmd/bintrail-console's CGO/DuckDB dependency is fine
+// here.
+func TestShippedBinariesAreAttributionFree(t *testing.T) {
+	binaries := []string{
+		"github.com/dbtrail/dbtrail/cmd/bintrail",
+		"github.com/dbtrail/dbtrail/cmd/bintrail-console",
+		"github.com/dbtrail/dbtrail/cmd/bintrail-mcp",
+		"github.com/dbtrail/dbtrail/cmd/bintrail-pg",
 	}
 	const banned = "github.com/dbtrail/dbtrail/internal/forensics"
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		pkg := strings.TrimSpace(line)
-		if pkg == banned || strings.HasPrefix(pkg, banned+"/") {
-			t.Errorf("cmd/bintrail links %s — the attribution surface was retired from the core", pkg)
-		}
+	for _, bin := range binaries {
+		t.Run(path.Base(bin), func(t *testing.T) {
+			out, err := exec.Command("go", "list", "-deps", bin).CombinedOutput()
+			if err != nil {
+				t.Fatalf("go list -deps %s: %v\n%s", bin, err, out)
+			}
+			for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+				pkg := strings.TrimSpace(line)
+				if pkg == banned || strings.HasPrefix(pkg, banned+"/") {
+					t.Errorf("%s links %s — the attribution surface was retired from the core", bin, pkg)
+				}
+			}
+		})
 	}
 }
