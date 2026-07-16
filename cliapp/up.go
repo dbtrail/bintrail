@@ -204,9 +204,14 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 		return []rotation.RotateTarget{{DSN: upIndexDSN}}
 	})
 	// Extension source jobs (ext.RegisterSourceJob) share the same lifecycle
-	// and contract as rotation: secondary daemon-scoped work that must never
-	// be fatal to the stream. No-op in the stock binary.
-	ext.RunSourceJobs(rotCtx, ext.SourceJobInfo{SourceDSN: upSourceDSN, IndexDSN: upIndexDSN, Flavor: "mysql"})
+	// and contract as rotation: secondary daemon-scoped
+	// work that must never be fatal to the stream. No-op in the stock binary.
+	// Flavor is the value the stream below actually runs with: `up` has no
+	// --source-flavor flag of its own, so strmFlavor holds streamCmd's default
+	// ("mysql") or the BINTRAIL_SOURCE_FLAVOR override, which bindCommandEnv
+	// (streamCmd) applied at flag-binding time; populateStreamFlags above
+	// deliberately leaves it untouched.
+	ext.RunSourceJobs(rotCtx, ext.SourceJobInfo{SourceDSN: upSourceDSN, IndexDSN: upIndexDSN, Flavor: strmFlavor})
 	return runStream(cmd, args)
 }
 

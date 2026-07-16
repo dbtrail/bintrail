@@ -20,8 +20,13 @@ var doctorChecks []func(ctx context.Context, sourceDSN, indexDSN string) []Docto
 // RegisterDoctorCheck registers a function that contributes extra checks to
 // `bintrail doctor` and to preflight surfaces built on it (`bintrail up`).
 // Same startup-only contract as the other seams: call from main() before
-// command dispatch. Functions run in registration order.
+// command dispatch. Functions run in registration order. Registering a nil
+// function panics immediately so the misuse fails at startup, not at the
+// first doctor run.
 func RegisterDoctorCheck(fn func(ctx context.Context, sourceDSN, indexDSN string) []DoctorCheck) {
+	if fn == nil {
+		panic("ext: nil doctor check function")
+	}
 	doctorChecks = append(doctorChecks, fn)
 }
 

@@ -3,6 +3,7 @@ package ext
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestRunSourceJobsNoRegistrationIsNoop(t *testing.T) {
@@ -14,28 +15,52 @@ func TestRunSourceJobsNoRegistrationIsNoop(t *testing.T) {
 	RunSourceJobs(context.Background(), SourceJobInfo{SourceDSN: "s", IndexDSN: "i", Flavor: "mysql"})
 }
 
-func TestRunSourceJobsInvokesInRegistrationOrder(t *testing.T) {
+func TestRunSourceJobsRunsEveryJobWithInfo(t *testing.T) {
 	orig := sourceJobs
 	sourceJobs = nil
 	t.Cleanup(func() { sourceJobs = orig })
 
-	var order []string
-	var gotSrc SourceJobInfo
-	RegisterSourceJob(func(_ context.Context, src SourceJobInfo) {
-		order = append(order, "first")
-		gotSrc = src
-	})
-	RegisterSourceJob(func(_ context.Context, _ SourceJobInfo) {
-		order = append(order, "second")
-	})
+	// Jobs run on their own goroutines (no ordering guarantee), so collect
+	// through a channel and assert both fire with the exact SourceJobInfo.
+	got := make(chan SourceJobInfo, 2)
+	RegisterSourceJob(func(_ context.Context, src SourceJobInfo) { got <- src })
+	RegisterSourceJob(func(_ context.Context, src SourceJobInfo) { got <- src })
 
-	want := SourceJobInfo{SourceDSN: "user:pass@tcp(h:3306)/db", IndexDSN: "idx-dsn", Flavor: "mysql"}
+	want := SourceJobInfo{SourceDSN: "user:pass@tcp(h:3306)/db", IndexDSN: "idx-dsn", Flavor: "mariadb"}
 	RunSourceJobs(context.Background(), want)
 
-	if len(order) != 2 || order[0] != "first" || order[1] != "second" {
-		t.Fatalf("jobs ran %v, want [first second]", order)
+	for i := range 2 {
+		select {
+		case src := <-got:
+			if src != want {
+				t.Errorf("job received %+v, want %+v", src, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for registered job %d to run", i+1)
+		}
 	}
-	if gotSrc != want {
-		t.Errorf("job received %+v, want %+v", gotSrc, want)
+}
+
+// TestRunSourceJobsPanicDoesNotPropagate pins the H-contract the core
+// enforces: a panicking job is recovered on its own goroutine (never
+// propagated to the daemon) and sibling jobs still run.
+func TestRunSourceJobsPanicDoesNotPropagate(t *testing.T) {
+	orig := sourceJobs
+	sourceJobs = nil
+	t.Cleanup(func() { sourceJobs = orig })
+
+	survivorRan := make(chan struct{})
+	RegisterSourceJob(func(context.Context, SourceJobInfo) { panic("source job boom") })
+	RegisterSourceJob(func(context.Context, SourceJobInfo) { close(survivorRan) })
+
+	// Must not panic the caller — the panic is contained per-goroutine. An
+	// uncontained goroutine panic would crash the whole test binary, so the
+	// package passing at all is the real assertion.
+	RunSourceJobs(context.Background(), SourceJobInfo{Flavor: "mysql"})
+
+	select {
+	case <-survivorRan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surviving job did not run after a sibling panicked")
 	}
 }

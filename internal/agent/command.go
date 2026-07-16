@@ -182,15 +182,51 @@ func dispatch(ctx context.Context, h Handler, cmd Command, deps ext.AgentDeps) R
 
 	default:
 		if handler, ok := ext.LookupAgentCommand(cmd.Type); ok {
-			result, err := handler(ctx, deps, cmd.Data)
-			if err != nil {
-				resp.Error = err.Error()
-				return resp
-			}
-			resp.Data = result
-			return resp
+			return runExtCommand(ctx, handler, cmd, deps)
 		}
 		resp.Error = fmt.Sprintf("unknown command type %q", cmd.Type)
 	}
+	return resp
+}
+
+// runExtCommand invokes an extension-registered command handler with two
+// containment layers the builtin cases don't need:
+//
+//   - Panic containment: a registry handler is externally-registered code
+//     reachable by a remote command. A panic must degrade to a per-command
+//     error response and a normal return — never kill the agent process
+//     (the in-memory BYOS buffer dies with it).
+//   - Response pre-marshaling: the handler's result is marshalled HERE, so a
+//     value json.Marshal rejects (NaN, channel, cyclic structure, ...)
+//     becomes a per-command error on the wire instead of failing later in
+//     writeJSON — which would tear down the connection and enter a reconnect
+//     loop that dies the same way on every redelivery. Response.Data carries
+//     the pre-marshalled bytes as json.RawMessage; the envelope marshal
+//     splices them verbatim, so writeJSON can no longer fail on handler
+//     output.
+func runExtCommand(ctx context.Context, handler ext.AgentCommandFunc, cmd Command, deps ext.AgentDeps) (resp Response) {
+	resp = Response{ID: cmd.ID, Type: cmd.Type}
+	defer func() {
+		if p := recover(); p != nil {
+			resp.Data = nil
+			resp.Error = fmt.Sprintf("command handler for %q panicked: %v", cmd.Type, p)
+		}
+	}()
+	result, err := handler(ctx, deps, cmd.Data)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp
+	}
+	if result == nil {
+		// (nil, nil) is a valid empty success: the response omits the data
+		// field entirely, indistinguishable on the wire from "no data".
+		return resp
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		resp.Error = fmt.Sprintf("marshal response for %q: %v", cmd.Type, err)
+		return resp
+	}
+	resp.Data = json.RawMessage(data)
 	return resp
 }

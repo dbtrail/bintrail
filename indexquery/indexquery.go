@@ -21,6 +21,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -41,12 +42,60 @@ type (
 	Tuning             = duckdbutil.Tuning
 )
 
+// EventType aliases the event-type vocabulary so external code can interpret
+// ResultRow.EventType without magic numbers. The numeric values are a
+// persistence contract (binlog_events.event_type) — never renumber.
+type EventType = event.EventType
+
+// The persisted event-type values a ResultRow can carry. (Capture-side
+// transient types — commit markers, PG relation messages — are never written
+// to binlog_events, so they cannot appear in query results.)
+const (
+	EventInsert   = event.EventInsert
+	EventUpdate   = event.EventUpdate
+	EventDelete   = event.EventDelete
+	EventDDL      = event.EventDDL
+	EventGTID     = event.EventGTID
+	EventSnapshot = event.EventSnapshot
+)
+
+// EventTypeName returns the canonical upper-case name for a persisted event
+// type ("INSERT", "UPDATE", "DELETE", "DDL", "GTID", "SNAPSHOT"), or
+// "UNKNOWN" for a value outside that vocabulary.
+func EventTypeName(t EventType) string {
+	switch t {
+	case EventInsert:
+		return "INSERT"
+	case EventUpdate:
+		return "UPDATE"
+	case EventDelete:
+		return "DELETE"
+	case EventDDL:
+		return "DDL"
+	case EventGTID:
+		return "GTID"
+	case EventSnapshot:
+		return "SNAPSHOT"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // New returns a query engine over the index database.
 func New(db *sql.DB) *Engine { return query.New(db) }
 
 // FetchMerged fetches events from live MySQL partitions and Parquet archives,
 // deduplicates and sorts them, and enforces coverage-gap detection according
 // to o.AllowGaps. See query.FetchMerged for the full failure-mode contract.
+//
+// Two caveats external callers cannot discover from the signature:
+//
+//   - Callers running with redaction options (an RBAC profile — DenyTables /
+//     RedactColumns / ProfileActive on o.Opts) must set o.NoArchive = true:
+//     Parquet archives store the raw rows, so the archive branch would serve
+//     unredacted columns.
+//   - The returned *QueryPlan may be nil when the planner didn't run (e.g. no
+//     DBName or no time range) — nil-check it before use.
 func FetchMerged(ctx context.Context, db *sql.DB, engine *Engine, o FetchMergedOptions) ([]ResultRow, *QueryPlan, error) {
 	return query.FetchMerged(ctx, db, engine, o)
 }

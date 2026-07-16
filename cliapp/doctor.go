@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -105,24 +106,60 @@ func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDS
 	return report.Err()
 }
 
+// extDoctorBudget bounds all registered extension checks together, matching
+// doctor.Build's internal 30-second budget for the built-in checks — a
+// hanging registered check must not stall the report indefinitely.
+const extDoctorBudget = 30 * time.Second
+
 // appendExtDoctorChecks appends the checks contributed by registered
 // extension check functions (ext.RegisterDoctorCheck) to report. No-op in
 // the stock binary, where nothing is registered. Both preflight surfaces —
 // `bintrail doctor` (runDoctorTo) and `bintrail up` phase 1 — call it, so a
 // registered check appears wherever the built-in checks do, with the same
 // FAIL-blocks-boot semantics.
+//
+// The registered checks run under a 30s timeout (extDoctorBudget), and a
+// panicking check function is converted into a FAIL entry on the report —
+// the already-computed built-in checks must still render either way.
 func appendExtDoctorChecks(ctx context.Context, report *doctor.Report, sourceDSN, indexDSN string) {
-	for _, c := range ext.RunDoctorChecks(ctx, sourceDSN, indexDSN) {
+	ctx, cancel := context.WithTimeout(ctx, extDoctorBudget)
+	defer cancel()
+	checks, panicked := runExtDoctorChecks(ctx, sourceDSN, indexDSN)
+	for _, c := range checks {
 		report.Add(extCheckResult(c))
+	}
+	if panicked != nil {
+		report.Add(doctor.CheckResult{
+			Name:   "extension doctor checks",
+			Status: doctor.StatusFail,
+			Detail: fmt.Sprintf("registered check panicked: %v", panicked),
+		})
 	}
 }
 
+// runExtDoctorChecks runs the registered extension check functions,
+// converting a panic into a returned value instead of letting it unwind
+// through the caller's report rendering. On panic the returned checks slice
+// is nil (the in-flight concatenation is lost); the report keeps its
+// built-in checks either way and gains a FAIL entry naming the battery.
+func runExtDoctorChecks(ctx context.Context, sourceDSN, indexDSN string) (checks []ext.DoctorCheck, panicked any) {
+	defer func() {
+		if p := recover(); p != nil {
+			panicked = p
+		}
+	}()
+	return ext.RunDoctorChecks(ctx, sourceDSN, indexDSN), nil
+}
+
 // extCheckResult converts an ext.DoctorCheck (Status as a plain string) to a
-// doctor.CheckResult. An unknown status string is coerced to WARN with a note
-// appended to Detail — Report.Add would otherwise log the malformed entry and
-// leave it out of every counter, silently weakening the report.
+// doctor.CheckResult. The status is normalized (trimmed, lowercased) before
+// matching, so "PASS" / " Fail " count as their canonical forms. A truly
+// unknown status string is coerced to WARN with a note appended to Detail —
+// Report.Add would otherwise log the malformed entry and leave it out of
+// every counter, silently weakening the report — and logged so the downgrade
+// is greppable.
 func extCheckResult(c ext.DoctorCheck) doctor.CheckResult {
-	status := doctor.CheckStatus(c.Status)
+	status := doctor.CheckStatus(strings.ToLower(strings.TrimSpace(c.Status)))
 	detail := c.Detail
 	switch status {
 	case doctor.StatusPass, doctor.StatusFail, doctor.StatusWarn, doctor.StatusSkip:
@@ -130,6 +167,8 @@ func extCheckResult(c ext.DoctorCheck) doctor.CheckResult {
 		note := fmt.Sprintf("registered check reported unknown status %q; treated as warn", c.Status)
 		detail = strings.TrimSpace(detail + " (" + note + ")")
 		status = doctor.StatusWarn
+		slog.Warn("ext: doctor check reported unknown status",
+			"check", c.Name, "status", c.Status)
 	}
 	return doctor.CheckResult{Name: c.Name, Status: status, Detail: detail, Remediation: c.Remediation}
 }
