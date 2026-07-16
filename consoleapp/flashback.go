@@ -1,4 +1,4 @@
-package main
+package consoleapp
 
 import (
 	"context"
@@ -18,7 +18,7 @@ import (
 )
 
 // This file is the MySQL-protocol serving layer for the embedded time-travel
-// port (issue #996). It lives in the binary — NOT in internal/console — because
+// port (issue #996). It lives in consoleapp — NOT in internal/console — because
 // it links go-mysql and internal/shim, which the read-layer guard (#528,
 // TestReadLayerDoesNotLinkGoMySQL) bars from internal/console. It consumes the
 // go-mysql-free seam console.Server exposes (Token, ResolveFlashback).

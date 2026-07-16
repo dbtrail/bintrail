@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Exported `consoleapp` package**: the web console's command layer (root command plus the `serve`/`watch`/`user` subcommands) moved from `cmd/bintrail-console` into the importable top-level `consoleapp` package, with `consoleapp.Main(version, commitSHA, buildDate)` as the entrypoint — the console sibling of `cliapp.Main`, for embedding distributions that import the OSS core and wrap it. `cmd/bintrail-console` is now a thin wrapper (the `-ldflags`-injected `main.*` build vars plus `os.Exit(consoleapp.Main(...))`), pinned by a guard test; binary behavior, flags, and the version string are unchanged.
+
 ## [0.34.0] - 2026-07-16
 
 ### Added

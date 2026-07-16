@@ -53,6 +53,7 @@ jobs:
               - '.github/workflows/ci.yml'
             console:
               - 'internal/console/**'
+              - 'consoleapp/**'
               - 'cmd/bintrail-console/**'
 
   unit:
