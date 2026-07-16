@@ -20,7 +20,9 @@ type AgentDeps struct {
 // AgentCommandFunc handles one agent WebSocket command type. The payload is
 // the raw command data — unmarshalling it is the handler's job. The returned
 // value is marshalled into the response's data field; a returned error
-// becomes the response's error string.
+// becomes the response's error string. Returning (nil, nil) is a valid empty
+// success — the response omits the data field, so it is indistinguishable on
+// the wire from "no data".
 type AgentCommandFunc func(ctx context.Context, deps AgentDeps, payload json.RawMessage) (any, error)
 
 // agentCommands is empty in the OSS build — unknown command types keep
@@ -32,8 +34,12 @@ var agentCommands = map[string]AgentCommandFunc{}
 // win — the registry is consulted only when no built-in case matches).
 // Registering the same cmdType twice replaces the earlier handler (last
 // wins). Same startup-only contract as the other seams: call from main()
-// before command dispatch.
+// before command dispatch. Registering a nil handler panics immediately so
+// the misuse fails at startup, not at first dispatch.
 func RegisterAgentCommand(cmdType string, h AgentCommandFunc) {
+	if h == nil {
+		panic("ext: nil agent command handler")
+	}
 	agentCommands[cmdType] = h
 }
 
