@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`ext.ConsoleAuth`: a pluggable external-auth provider seam for the web console** (#882). Embedding distributions — builds that import `cliapp` and wrap the OSS core — can install an external login flow (e.g. OIDC single sign-on) with `ext.SetConsoleAuth`, same startup-only contract as `ext.SetAuditSink`. The console mounts the provider's handler unauthenticated at `/api/auth/ext/` (behind the host guard and security headers; the provider owns its own CSRF/state protection), advertises it in `GET /api/auth` (`sso_name`/`sso_start`), and the sign-in screen shows a "Continue with \<name\>" entry. A successful external login mints the same in-memory session a password login does (same TTLs, logout, and revocation; it cannot claim the first console password — that stays with the static token), and an installed provider counts as a valid sole credential for a non-loopback bind. The stock binary has no provider: the probe fields are absent, the button never appears, and `/api/auth/ext/*` stays 401 behind the credential middleware.
+
 ## [0.34.0] - 2026-07-16
 
 ### Added

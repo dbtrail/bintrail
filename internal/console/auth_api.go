@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dbtrail/dbtrail/ext"
 )
 
 // maxLoginBody bounds the login/change-password request bodies; both are a
@@ -47,10 +49,34 @@ func requireJSONBody(w http.ResponseWriter, r *http.Request) bool {
 // The file is statted per request so `user set-password` against a live server
 // lights the login form up without a restart.
 func (s *Server) handleAuthInfo(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{
+	info := map[string]any{
 		"password_login": s.passwordLoginEnabled(),
 		"setup":          s.setupAllowed(),
-	})
+	}
+	// An installed external auth provider adds the login screen's
+	// "Continue with <name>" entry: its label and the initiation URL
+	// (extAuthPrefix + "start" by the ext.ConsoleAuthProvider contract).
+	// Both fields are absent when no provider is installed.
+	if p := ext.ConsoleAuth(); p != nil {
+		info["sso_name"] = p.DisplayName()
+		info["sso_start"] = extAuthPrefix + "start"
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+// extSessionIssuer adapts the session store to the ext.ConsoleSessionIssuer
+// contract: the installed provider calls it after verifying an identity, and
+// the returned token is a normal console session (same TTLs, same revocation).
+// The identity is logged for the operator's audit trail and never stored.
+func (s *Server) extSessionIssuer() ext.ConsoleSessionIssuer {
+	return func(identity string) (string, time.Time, error) {
+		token, expires, err := s.sessions.Issue()
+		if err != nil {
+			return "", time.Time{}, err
+		}
+		slog.Info("console external-auth login", "identity", identity)
+		return token, expires, nil
+	}
 }
 
 // passwordLoginEnabled re-checks the auth file at call time. A corrupt file

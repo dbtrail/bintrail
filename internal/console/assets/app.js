@@ -210,11 +210,11 @@ async function handleUnauthorized() {
   let auth = {};
   try { auth = await fetchAuthInfo(); } catch (_) {}
   // After a `user remove` the console can be back in first-run setup.
-  if (auth.setup) { showLoginOverlay({ setup: true }); return; }
+  if (auth.setup) { showLoginOverlay({ setup: true, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
   // Token mode has no session to expire and no form to "sign in" to — say what
   // actually happened (the stored token is no longer accepted).
   const msg = auth.password_login ? "Session expired — sign in again." : "This access token is no longer valid.";
-  showLoginOverlay({ passwordLogin: !!auth.password_login, message: msg });
+  showLoginOverlay({ passwordLogin: !!auth.password_login, message: msg, ssoName: auth.sso_name, ssoStart: auth.sso_start });
 }
 
 // clearAuthState drops every credential-scoped cache on sign-out. capsCache
@@ -270,6 +270,7 @@ function showLoginOverlay(opts) {
     form.append(msg);
     form.addEventListener("submit", (e) => { e.preventDefault(); submitSetup(form, msg); });
     panel.append(form);
+    appendSSOEntry(panel, opts);
     scrim.append(panel);
     mount.replaceChildren(scrim);
     form.elements.password.focus();
@@ -279,6 +280,7 @@ function showLoginOverlay(opts) {
   if (!opts.passwordLogin) {
     panel.append(el("p", { class: "modal-desc", text: opts.message || "" }));
     panel.append(el("p", { class: "modal-desc", text: "Open the link printed when bintrail-console started — it has the access token this page needs." }));
+    appendSSOEntry(panel, opts);
     scrim.append(panel);
     mount.replaceChildren(scrim);
     return;
@@ -301,9 +303,21 @@ function showLoginOverlay(opts) {
   form.append(msg);
   form.addEventListener("submit", (e) => { e.preventDefault(); submitLogin(form, msg); });
   panel.append(form);
+  appendSSOEntry(panel, opts);
   scrim.append(panel);
   mount.replaceChildren(scrim);
   form.elements.password.focus();
+}
+
+// appendSSOEntry adds the external-login entry ("Continue with <name>") under
+// whatever the gate mode rendered, when the /api/auth probe advertised a
+// provider (sso_start/sso_name → opts.ssoStart/opts.ssoName). A plain <a> on
+// purpose — full navigation, never fetch: the provider owns the whole flow
+// and lands back on /?token=<session>, reusing the existing token bootstrap.
+function appendSSOEntry(panel, opts) {
+  if (!opts.ssoStart) return;
+  panel.append(el("div", { class: "login-divider", text: "or" }));
+  panel.append(el("a", { class: "btn login-sso", href: opts.ssoStart, text: "Continue with " + (opts.ssoName || "single sign-on") }));
 }
 
 // submitSetup posts the first-run credential to /api/auth/setup (raw fetch:
@@ -325,9 +339,9 @@ async function submitSetup(form, msg) {
     // a CLI set it first). Unlike login, the setup endpoint self-disables —
     // re-probe and switch the gate to the sign-in form instead of leaving the
     // operator stuck re-posting to a now-closed endpoint.
-    let pw = false;
-    try { pw = !!(await fetchAuthInfo()).password_login; } catch (_) {}
-    showLoginOverlay({ passwordLogin: pw, message: "A password was already created — sign in." });
+    let auth = {};
+    try { auth = await fetchAuthInfo(); } catch (_) {}
+    showLoginOverlay({ passwordLogin: !!auth.password_login, message: "A password was already created — sign in.", ssoName: auth.sso_name, ssoStart: auth.sso_start });
     return;
   }
   if (!res.ok) {
@@ -3070,8 +3084,8 @@ async function init() {
   if (!TOKEN) {
     let auth = {};
     try { auth = await fetchAuthInfo(); } catch (_) { /* server down — fall through, the view will surface it */ }
-    if (auth.setup) { showLoginOverlay({ setup: true }); return; }
-    if (auth.password_login) { showLoginOverlay({ passwordLogin: true }); return; }
+    if (auth.setup) { showLoginOverlay({ setup: true, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
+    if (auth.password_login) { showLoginOverlay({ passwordLogin: true, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
     toast("No token in URL — open the link printed by `bintrail-console`.");
   }
 

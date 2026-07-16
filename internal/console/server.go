@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -182,6 +183,12 @@ type Server struct {
 // for the same reason Authorization is: a cross-site form POST cannot set it.
 const serverHeader = "X-Bintrail-Server"
 
+// extAuthPrefix is where an installed ext.ConsoleAuthProvider is mounted.
+// The provider's login-initiation endpoint lives at extAuthPrefix + "start"
+// (the login screen links there); see ext.ConsoleAuthProvider.Handler for
+// the mount contract.
+const extAuthPrefix = "/api/auth/ext/"
+
 // New validates the config, seeds the boot connection bundle, and assembles
 // the middleware/route tree. It does no network I/O — call Run to listen.
 func New(cfg Config) (*Server, error) {
@@ -217,10 +224,15 @@ func New(cfg Config) (*Server, error) {
 	// non-loopback binds legal. A non-loopback bind with no credential is
 	// refused UNLESS the operator asserts the bind is access-controlled
 	// (AllowSetup) — then it enters setup like a loopback bind would.
+	// An installed external auth provider (ext.ConsoleAuth) is a valid sole
+	// credential path — its login flow mints the same sessions password login
+	// does — so it also lifts the non-loopback refusal. It does NOT change
+	// willSetup/setupAllowed: browser first-run password setup stays gated on
+	// loopback (or the explicit AllowSetup assertion) exactly as before.
 	token := cfg.Token
 	noCredential := token == "" && !passwordCfg
 	willSetup := noCredential && (isLoopbackAddr(listen) || cfg.AllowSetup)
-	if noCredential && !willSetup {
+	if noCredential && !willSetup && ext.ConsoleAuth() == nil {
 		return nil, fmt.Errorf("authentication is required when binding to a non-loopback address %q: set a console password with `bintrail-console user set-password`, set --token / BINTRAIL_CONSOLE_TOKEN for automation, or pass --allow-setup if this bind is access-controlled (e.g. published only on the host's loopback)", listen)
 	}
 	// A missing auth file is the EXPECTED first-run state (browser setup creates
@@ -408,8 +420,18 @@ func (s *Server) buildHandler() http.Handler {
 	root.HandleFunc("GET /api/auth", s.handleAuthInfo)
 	root.HandleFunc("POST /api/auth/login", s.handleLogin)
 	root.HandleFunc("POST /api/auth/setup", s.handleSetup) // first-run, loopback-only, self-disables
-	root.Handle("/api/", s.tokenMiddleware(api))           // credential on all other /api/*
-	root.Handle("/", assetHandler())                       // static shell + assets
+	// External auth provider (ext seam): mounted UNAUTHENTICATED at
+	// extAuthPrefix, behind hostGuard and securityHeaders only. The provider
+	// owns its own CSRF/state protection, and the console's login rate
+	// limiter does not cover these routes. ServeMux specificity keeps this
+	// subtree more specific than the tokenMiddleware-wrapped "/api/"
+	// catch-all; with no provider installed the path falls into that
+	// catch-all and 401s — the desired behavior for the stock binary.
+	if p := ext.ConsoleAuth(); p != nil {
+		root.Handle(extAuthPrefix, p.Handler(extAuthPrefix, s.extSessionIssuer()))
+	}
+	root.Handle("/api/", s.tokenMiddleware(api)) // credential on all other /api/*
+	root.Handle("/", assetHandler())             // static shell + assets
 
 	return s.hostGuard(securityHeaders(root))
 }

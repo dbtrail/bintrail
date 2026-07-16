@@ -511,6 +511,17 @@ A running server accepts it on the next login — no restart needed.
   use `--tls-cert`/`--tls-key` or terminate TLS at a reverse proxy (with
   `--allowed-hosts`).
 
+### External login providers
+
+Embedding distributions — builds that import the OSS core — may install an
+external login flow (e.g. OIDC single sign-on) through the `ext.ConsoleAuth`
+seam. When one is installed, the sign-in screen adds a **"Continue with
+\<name\>"** button, and a successful external login mints the same in-memory
+session a password login does (same lifetime, logout, and revocation). The
+standalone `bintrail-console` binary has no provider installed: the button
+never appears, and the provider routes (`/api/auth/ext/*`) simply require a
+normal credential like any other `/api` path.
+
 ## Security model
 
 The binary has no Supabase/RBAC backend to lean on, so the console defends

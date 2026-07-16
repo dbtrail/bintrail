@@ -1139,6 +1139,13 @@ button { font-family: inherit; }
 .login-form .modal-foot { margin-top: 4px; }
 .login-form .modal-foot .btn { flex: 1; }
 .login-panel .form-msg { font-family: var(--f-ui); font-size: 13px; margin-top: 6px; }
+/* External-login entry under the gate (only when /api/auth advertises a
+   provider): a subtle "or" divider, then a full-width link styled as a
+   button — <a class="btn"> needs the underline stripped. */
+.login-divider { display: flex; align-items: center; gap: 10px; margin-top: 16px;
+  color: var(--ink-3); font-size: 12px; }
+.login-divider::before, .login-divider::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.login-sso { margin-top: 12px; width: 100%; text-decoration: none; }
 
 /* result/meta lines reused across Events, Recover, Reconstruct */
 .meta-line {
