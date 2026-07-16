@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/doctor"
 )
@@ -96,8 +98,38 @@ func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDS
 	if proxysqlAdminDSN != "" {
 		report.Add(doctor.CheckProxySQLRules(parent, proxysqlAdminDSN))
 	}
+	appendExtDoctorChecks(parent, report, sourceDSN, indexDSN)
 	if err := report.Write(w, format); err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}
 	return report.Err()
+}
+
+// appendExtDoctorChecks appends the checks contributed by registered
+// extension check functions (ext.RegisterDoctorCheck) to report. No-op in
+// the stock binary, where nothing is registered. Both preflight surfaces —
+// `bintrail doctor` (runDoctorTo) and `bintrail up` phase 1 — call it, so a
+// registered check appears wherever the built-in checks do, with the same
+// FAIL-blocks-boot semantics.
+func appendExtDoctorChecks(ctx context.Context, report *doctor.Report, sourceDSN, indexDSN string) {
+	for _, c := range ext.RunDoctorChecks(ctx, sourceDSN, indexDSN) {
+		report.Add(extCheckResult(c))
+	}
+}
+
+// extCheckResult converts an ext.DoctorCheck (Status as a plain string) to a
+// doctor.CheckResult. An unknown status string is coerced to WARN with a note
+// appended to Detail — Report.Add would otherwise log the malformed entry and
+// leave it out of every counter, silently weakening the report.
+func extCheckResult(c ext.DoctorCheck) doctor.CheckResult {
+	status := doctor.CheckStatus(c.Status)
+	detail := c.Detail
+	switch status {
+	case doctor.StatusPass, doctor.StatusFail, doctor.StatusWarn, doctor.StatusSkip:
+	default:
+		note := fmt.Sprintf("registered check reported unknown status %q; treated as warn", c.Status)
+		detail = strings.TrimSpace(detail + " (" + note + ")")
+		status = doctor.StatusWarn
+	}
+	return doctor.CheckResult{Name: c.Name, Status: status, Detail: detail, Remediation: c.Remediation}
 }

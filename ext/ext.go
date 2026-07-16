@@ -1,7 +1,8 @@
 // Package ext exposes the extension points that embedding distributions
 // — builds that import cliapp and wrap the OSS core — use to inject
-// behavior: an audit sink recording data-access operations, and
-// overrides for feature-entitlement gates.
+// behavior: an audit sink recording data-access operations, overrides
+// for feature-entitlement gates, extra doctor checks, agent WebSocket
+// commands, and daemon source jobs.
 //
 // Seams follow the same convention as the internal forensics.Enabled
 // gate: package-level variables set once at process startup (before any

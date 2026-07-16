@@ -60,6 +60,15 @@ func init() {
 	cli.AddForensicsCommands(rootCmd)
 }
 
+// AddCommands registers additional top-level commands on the bintrail root
+// command. Embedding distributions call it from main() before Main so their
+// commands dispatch alongside the built-in set — the same startup-only
+// contract as the ext package's setters: not safe for concurrent use with
+// command execution.
+func AddCommands(cmds ...*cobra.Command) {
+	rootCmd.AddCommand(cmds...)
+}
+
 // Main configures build metadata and runs the bintrail root command,
 // returning the process exit code. Callers (cmd/bintrail, and external
 // distributions embedding the CLI) are expected to pass their

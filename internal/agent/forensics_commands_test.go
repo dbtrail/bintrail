@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/forensics"
 )
 
@@ -36,7 +37,7 @@ func TestDispatch_forensicsCapabilities(t *testing.T) {
 		},
 	}
 	// No payload beyond the envelope — Data intentionally absent.
-	resp := dispatch(context.Background(), h, Command{ID: "c1", Type: "forensics_capabilities"})
+	resp := dispatch(context.Background(), h, Command{ID: "c1", Type: "forensics_capabilities"}, ext.AgentDeps{})
 
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -79,7 +80,7 @@ func TestDispatch_forensicsEnrich(t *testing.T) {
 	}
 	// SaaS wire shape: {"thread_ids": [...]}.
 	cmd := Command{ID: "e1", Type: "forensics_enrich", Data: json.RawMessage(`{"thread_ids":[42,7]}`)}
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -124,7 +125,7 @@ func TestDispatch_forensicsActivity(t *testing.T) {
 	raw := `{"query_type":"user_activity","user":"app","host":"10.0.0.5",` +
 		`"schema":"shop","since":"2026-07-01T00:00:00","until":"2026-07-02 00:00:00",` +
 		`"limit":25,"order":"ASC"}`
-	resp := dispatch(context.Background(), h, Command{ID: "a1", Type: "forensics_activity", Data: json.RawMessage(raw)})
+	resp := dispatch(context.Background(), h, Command{ID: "a1", Type: "forensics_activity", Data: json.RawMessage(raw)}, ext.AgentDeps{})
 
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -147,7 +148,7 @@ func TestDispatch_forensicsUsers(t *testing.T) {
 			return ForensicsUsersResult{Users: []string{"app", "root"}}, nil
 		},
 	}
-	resp := dispatch(context.Background(), h, Command{ID: "u1", Type: "forensics_users"})
+	resp := dispatch(context.Background(), h, Command{ID: "u1", Type: "forensics_users"}, ext.AgentDeps{})
 
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -188,7 +189,7 @@ func TestDispatch_forensicsAuditLog(t *testing.T) {
 	// which is OSS-only tuning.
 	raw := `{"since":"2026-07-01T00:00:00Z","user":"app","event_type":"query",` +
 		`"limit":100,"offset":10,"include_rotated":true,"tail_lines":5000}`
-	resp := dispatch(context.Background(), h, Command{ID: "l1", Type: "forensics_audit_log", Data: json.RawMessage(raw)})
+	resp := dispatch(context.Background(), h, Command{ID: "l1", Type: "forensics_audit_log", Data: json.RawMessage(raw)}, ext.AgentDeps{})
 
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -229,7 +230,7 @@ func TestDispatch_forensicsMalformedPayloads(t *testing.T) {
 	h := &stubHandler{}
 	for _, cmdType := range []string{"forensics_enrich", "forensics_activity", "forensics_audit_log"} {
 		t.Run(cmdType, func(t *testing.T) {
-			resp := dispatch(context.Background(), h, Command{ID: "m1", Type: cmdType, Data: json.RawMessage(`{invalid`)})
+			resp := dispatch(context.Background(), h, Command{ID: "m1", Type: cmdType, Data: json.RawMessage(`{invalid`)}, ext.AgentDeps{})
 			if !strings.Contains(resp.Error, "invalid "+cmdType+" payload") {
 				t.Errorf("error = %q, want 'invalid %s payload'", resp.Error, cmdType)
 			}
@@ -249,7 +250,7 @@ func TestDispatch_forensicsGateClosed(t *testing.T) {
 		"forensics_users", "forensics_audit_log",
 	} {
 		t.Run(cmdType, func(t *testing.T) {
-			resp := dispatch(context.Background(), h, Command{ID: "g1", Type: cmdType, Data: json.RawMessage(`{}`)})
+			resp := dispatch(context.Background(), h, Command{ID: "g1", Type: cmdType, Data: json.RawMessage(`{}`)}, ext.AgentDeps{})
 			if resp.Error != "forensics disabled in this build" {
 				t.Errorf("error = %q, want 'forensics disabled in this build'", resp.Error)
 			}
@@ -276,7 +277,7 @@ func TestDispatch_forensicsGateClosed_legacyQueryUngated(t *testing.T) {
 			return &ForensicsResult{}, nil
 		},
 	}
-	resp := dispatch(context.Background(), h, Command{ID: "g2", Type: "forensics_query", Data: json.RawMessage(`{"query":"recent_queries"}`)})
+	resp := dispatch(context.Background(), h, Command{ID: "g2", Type: "forensics_query", Data: json.RawMessage(`{"query":"recent_queries"}`)}, ext.AgentDeps{})
 	if resp.Error != "" {
 		t.Fatalf("legacy forensics_query must not be gated, got error: %s", resp.Error)
 	}
@@ -294,7 +295,7 @@ func TestDispatch_forensicsGateClosed_unknownTypeFallthrough(t *testing.T) {
 		if disable {
 			withForensicsDisabled(t)
 		}
-		resp := dispatch(context.Background(), h, Command{ID: "g3", Type: "forensics_nope", Data: json.RawMessage(`{}`)})
+		resp := dispatch(context.Background(), h, Command{ID: "g3", Type: "forensics_nope", Data: json.RawMessage(`{}`)}, ext.AgentDeps{})
 		if !strings.Contains(resp.Error, "unknown command type") {
 			t.Errorf("gate disabled=%v: error = %q, want 'unknown command type'", disable, resp.Error)
 		}

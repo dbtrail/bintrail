@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/forensics"
 )
 
@@ -232,8 +233,12 @@ func forensicsAttributionGate(cmdType string) string {
 }
 
 // dispatch routes a Command to the appropriate Handler method and returns
-// the Response to send back.
-func dispatch(ctx context.Context, h Handler, cmd Command) Response {
+// the Response to send back. A command type with no builtin case is looked
+// up in the extension registry (ext.RegisterAgentCommand) — builtin types
+// always win — and only fails as unknown when the registry has no handler
+// either. deps carries the connection handles registry handlers receive;
+// the zero value is fine when nothing is registered.
+func dispatch(ctx context.Context, h Handler, cmd Command, deps ext.AgentDeps) Response {
 	resp := Response{ID: cmd.ID, Type: cmd.Type}
 
 	// Entitlement gate for the forensics attribution family (#701 D1) —
@@ -341,6 +346,15 @@ func dispatch(ctx context.Context, h Handler, cmd Command) Response {
 		resp.Data = result
 
 	default:
+		if handler, ok := ext.LookupAgentCommand(cmd.Type); ok {
+			result, err := handler(ctx, deps, cmd.Data)
+			if err != nil {
+				resp.Error = err.Error()
+				return resp
+			}
+			resp.Data = result
+			return resp
+		}
 		resp.Error = fmt.Sprintf("unknown command type %q", cmd.Type)
 	}
 	return resp

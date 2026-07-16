@@ -16,6 +16,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/forensics"
 )
 
@@ -66,7 +67,7 @@ func TestDispatch_resolvePK(t *testing.T) {
 	data, _ := json.Marshal(ResolvePKRequest{Items: []PKItem{{PKHash: "abc", Schema: "db", Table: "t"}}})
 	cmd := Command{ID: "1", Type: "resolve_pk", Data: data}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if resp.ID != "1" {
 		t.Errorf("ID = %q, want %q", resp.ID, "1")
@@ -92,7 +93,7 @@ func TestDispatch_recover(t *testing.T) {
 	data, _ := json.Marshal(RecoverRequest{Schema: "db", Table: "t", TimeStart: time.Now(), TimeEnd: time.Now()})
 	cmd := Command{ID: "2", Type: "recover", Data: data}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -111,7 +112,7 @@ func TestDispatch_forensicsQuery(t *testing.T) {
 	data, _ := json.Marshal(ForensicsQueryRequest{Query: "recent_queries"})
 	cmd := Command{ID: "3", Type: "forensics_query", Data: data}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -122,7 +123,7 @@ func TestDispatch_unknownType(t *testing.T) {
 	h := &stubHandler{}
 	cmd := Command{ID: "4", Type: "nope", Data: json.RawMessage(`{}`)}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if !strings.Contains(resp.Error, "unknown command type") {
 		t.Errorf("error = %q, want 'unknown command type'", resp.Error)
@@ -133,7 +134,7 @@ func TestDispatch_invalidPayload(t *testing.T) {
 	h := &stubHandler{}
 	cmd := Command{ID: "5", Type: "resolve_pk", Data: json.RawMessage(`{invalid`)}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if !strings.Contains(resp.Error, "invalid resolve_pk payload") {
 		t.Errorf("error = %q, want 'invalid resolve_pk payload'", resp.Error)
@@ -521,7 +522,7 @@ func TestDispatch_handlerError(t *testing.T) {
 	data, _ := json.Marshal(ResolvePKRequest{Items: []PKItem{{PKHash: "abc", Schema: "db", Table: "t"}}})
 	cmd := Command{ID: "err-1", Type: "resolve_pk", Data: data}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if resp.ID != "err-1" {
 		t.Errorf("ID = %q, want %q", resp.ID, "err-1")

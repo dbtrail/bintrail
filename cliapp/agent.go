@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/agent"
 	"github.com/dbtrail/dbtrail/internal/buffer"
 	"github.com/dbtrail/dbtrail/internal/byos"
@@ -425,6 +426,16 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		statusFn = flushState.toFlushStatus
 	}
 	ch := agent.NewChannel(cfg, handler, nil, statusFn)
+	// Connection handles for extension-registered commands
+	// (ext.RegisterAgentCommand), built once here and passed by the dispatch
+	// loop to every registry handler. Fields are nil/empty for whatever this
+	// agent wasn't configured with — handlers nil-check.
+	ch.ExtDeps = ext.AgentDeps{
+		IndexDB:    indexDB,
+		SourceDB:   sourceDB,
+		SourceDSN:  agtSourceDSN,
+		SourceHost: handler.SourceHost,
+	}
 
 	slog.Info("starting agent",
 		"endpoint", agtEndpoint,

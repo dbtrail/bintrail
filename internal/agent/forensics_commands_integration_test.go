@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/forensics"
 	"github.com/dbtrail/dbtrail/internal/testutil"
@@ -36,7 +37,7 @@ func TestIntegrationDispatch_forensicsCapabilities(t *testing.T) {
 	h := integrationForensicsHandler(t)
 	ctx := t.Context()
 
-	resp := dispatch(ctx, h, Command{ID: "int-caps", Type: "forensics_capabilities"})
+	resp := dispatch(ctx, h, Command{ID: "int-caps", Type: "forensics_capabilities"}, ext.AgentDeps{})
 	if resp.Error != "" {
 		t.Fatalf("dispatch error: %s", resp.Error)
 	}
@@ -98,7 +99,7 @@ func TestIntegrationDispatch_forensicsEnrich(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
-	resp := dispatch(ctx, h, Command{ID: "int-enrich", Type: "forensics_enrich", Data: payload})
+	resp := dispatch(ctx, h, Command{ID: "int-enrich", Type: "forensics_enrich", Data: payload}, ext.AgentDeps{})
 	if resp.Error != "" {
 		t.Fatalf("dispatch error: %s", resp.Error)
 	}
@@ -140,7 +141,7 @@ func TestIntegrationDispatch_forensicsEnrich(t *testing.T) {
 func TestIntegrationDispatch_forensicsUsers(t *testing.T) {
 	h := integrationForensicsHandler(t)
 
-	resp := dispatch(t.Context(), h, Command{ID: "int-users", Type: "forensics_users"})
+	resp := dispatch(t.Context(), h, Command{ID: "int-users", Type: "forensics_users"}, ext.AgentDeps{})
 	if resp.Error != "" {
 		t.Fatalf("dispatch error: %s", resp.Error)
 	}
