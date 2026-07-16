@@ -237,8 +237,8 @@ func TestWrapSchemaMigrationErr_privilegeErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mysqlErr := &mysql.MySQLError{Number: tc.number, Message: "ALTER command denied to user"}
 			// EnsureSchema's own helpers (ensureColumn, ensureColumnWidened,
-			// the connection_cache CREATE) wrap the raw driver error at least
-			// once before it reaches the caller — mirror that here so the
+			// the presence-checked table CREATEs) wrap the raw driver error at
+			// least once before it reaches the caller — mirror that here so the
 			// test exercises errors.As unwrapping through a wrapper, not
 			// just a bare *mysql.MySQLError.
 			wrapped := fmt.Errorf("add binlog_events.connection_id column: %w", mysqlErr)

@@ -389,17 +389,6 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		snapshot_id     INT UNSIGNED DEFAULT NULL,
 		INDEX idx_detected_at (detected_at)
 	) ENGINE=InnoDB`)
-
-	MustExec(t, db, `CREATE TABLE IF NOT EXISTS connection_cache (
-		connection_id         BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-		user                  VARCHAR(128),
-		host                  VARCHAR(255),
-		db                    VARCHAR(128),
-		command               VARCHAR(64),
-		connection_attributes JSON,
-		cached_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		last_seen             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	) ENGINE=InnoDB`)
 }
 
 // InsertEvent inserts a single event into binlog_events using raw SQL.

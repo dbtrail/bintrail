@@ -38,19 +38,3 @@ func AddMaintenanceCommands(root *cobra.Command) {
 	root.AddCommand(rotateCmd)
 	root.AddCommand(archiveCmd)
 }
-
-// AddForensicsCommands registers the forensics read commands: who-changed,
-// user-activity, and connection-history (#706).
-//
-// Deliberately NOT part of AddReadCommands: these commands interrogate
-// MySQL-family sources (performance_schema, the audit-plugin family, binlog
-// connection ids), so registering them on the shared read plane would expose
-// dead commands on bintrail-pg. Only cmd/bintrail calls this — the same
-// scoping rule that keeps the MySQL-only doctor out of the shared set. Each
-// command's RunE checks forensics.Enabled() at entry (the entitlement seam,
-// epic #701 D1); the library underneath stays mechanism-only.
-func AddForensicsCommands(root *cobra.Command) {
-	root.AddCommand(whoChangedCmd)
-	root.AddCommand(userActivityCmd)
-	root.AddCommand(connectionHistoryCmd)
-}

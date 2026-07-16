@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Extension seams for embedding distributions** (#1029): the exported `indexquery` package (a read-plane facade over the index — query/merge/format/connect/schema helpers), `cliapp.AddCommands` (register extra top-level commands before `cliapp.Main`), and the `ext` registries `ext.RegisterSourceJob` (daemon-scoped source jobs, run at `up`'s wiring point), `ext.RegisterDoctorCheck` (extra preflight checks appended to `doctor` and `up`'s preflight), and `ext.RegisterAgentCommand` (agent WebSocket commands consulted for non-builtin types). All no-ops in the stock binary; same startup-only contract as the existing `ext` setters.
+
+### Removed
+- **The who-changed attribution surface is retired from the core distribution.** Removed: the `who-changed`, `user-activity`, and `connection-history` CLI commands; the console's Forensics view and its `/api/forensics/*` endpoints (and the `forensics` capability flag); the agent's `forensics_capabilities`/`forensics_enrich`/`forensics_activity`/`forensics_users`/`forensics_audit_log` WebSocket commands (those types now route to the `ext.RegisterAgentCommand` registry; unregistered they fail as unknown — the legacy `forensics_query` diagnostics command is unaffected); the doctor's `performance_schema (forensics)` and `Audit log plugin (forensics)` checks; the `connection_cache` session-identity poller, its table DDL, and the `--attribution-retention` flag / `BINTRAIL_ATTRIBUTION_RETENTION` env var; and `ext.SetForensicsEnabled` (the gate it set no longer exists). Existing installs keep any `connection_cache` table; the core no longer reads or writes it. **What stays in core:** the captured `query_text`/`query_hash`/`connection_id` columns and their RBAC redaction, the `Statement capture (query_text)` doctor check, and faithful indexing of all three fields. Embedding distributions provide the attribution surface through the seams above; it is available in the commercial distribution (dbtrail EE).
+
 ## [0.33.0] - 2026-07-14
 
 ### Added

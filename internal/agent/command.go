@@ -8,18 +8,12 @@
 //   - resolve_pk              — resolve pk_hash values to pk_values
 //   - recover                 — generate reversal SQL for scoped events
 //   - forensics_query         — fixed diagnostic queries (recent_queries,
-//     lock_waits, table_io)
-//   - forensics_capabilities  — detect forensic data sources on the source
-//     server (performance_schema, audit plugin, server variant)
-//   - forensics_enrich        — live thread/connection attribution for a
-//     set of connection IDs
-//   - forensics_activity      — user_activity / connection_history
-//     queries against performance_schema
-//   - forensics_users         — list known MySQL user accounts
-//   - forensics_audit_log     — parse the server's on-disk audit log
+//     lock_waits, table_io); predates the retired attribution surface and
+//     keeps its wire name
 //
-// The forensics_* attribution family (everything except the legacy
-// forensics_query) is gated behind forensics.Enabled() — see dispatch.
+// Any other command type is looked up in the extension registry
+// (ext.RegisterAgentCommand) — embedding distributions register their
+// commands there; unregistered types fail as unknown. See dispatch.
 package agent
 
 import (
@@ -29,7 +23,6 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/ext"
-	"github.com/dbtrail/dbtrail/internal/forensics"
 )
 
 // ─── Wire messages ───────────────────────────────────────────────────────────
@@ -127,76 +120,6 @@ type ForensicsResult struct {
 	Rows    []map[string]any `json:"rows"`
 }
 
-// ─── Forensics attribution payloads ──────────────────────────────────────────
-//
-// BYOS payload/metadata split: attribution results carry identity (user,
-// host, client program) and statement text — row-level-adjacent data. Like
-// `recover` results, they travel over this WebSocket channel only as a
-// response to an explicit SaaS command; they are NEVER part of the BYOS
-// metadata ingest stream (same consideration #699/#712 flag for query_text:
-// payload channel, never the metadata record).
-//
-// JSON field names mirror the SaaS wire contract (models/forensics.py);
-// response bodies marshal internal/forensics structs, whose tags already
-// match it.
-
-// ForensicsEnrichRequest is the payload for "forensics_enrich" commands.
-// The library caps ThreadIDs at 500 per call; larger sets must be chunked
-// by the caller.
-type ForensicsEnrichRequest struct {
-	ThreadIDs []int64 `json:"thread_ids"`
-}
-
-// ForensicsActivityRequest is the payload for "forensics_activity" commands.
-// QueryType selects the mode ("user_activity" or "connection_history"); the
-// remaining fields are mode-specific filters — see forensics.ActivityQuery
-// for which apply to which mode.
-type ForensicsActivityRequest struct {
-	QueryType string `json:"query_type"`
-	User      string `json:"user,omitempty"`
-	Host      string `json:"host,omitempty"`
-	// Since/Until accept MySQL DATETIME or ISO 8601 strings.
-	Since string `json:"since,omitempty"`
-	Until string `json:"until,omitempty"`
-	Limit int    `json:"limit,omitempty"`
-	Order string `json:"order,omitempty"` // "ASC" or "DESC" (default)
-}
-
-// ForensicsAuditLogRequest is the payload for "forensics_audit_log"
-// commands. Zero values disable the corresponding filter — see
-// forensics.AuditReadOptions for the exact semantics (limit clamping,
-// tail-mode defaults, rotated-file caps).
-type ForensicsAuditLogRequest struct {
-	Since          time.Time `json:"since,omitzero"`
-	Until          time.Time `json:"until,omitzero"`
-	User           string    `json:"user,omitempty"`
-	EventType      string    `json:"event_type,omitempty"`
-	Limit          int       `json:"limit,omitempty"`
-	Offset         int       `json:"offset,omitempty"`
-	IncludeRotated bool      `json:"include_rotated,omitempty"`
-	TailLines      int       `json:"tail_lines,omitempty"`
-	// Source selects where the audit log is read from ("" = auto: local file,
-	// then the RDS file API when SourceHost looks like an RDS/Aurora endpoint;
-	// "local"/"rds"/"cloudwatch" force a source). See forensics.AuditSource.
-	Source string `json:"source,omitempty"`
-	// SourceHost overrides the host used to detect/reach the RDS/CloudWatch
-	// remote audit sources. Empty => the agent's own source host (derived from
-	// its --source-dsn), so a BYOS agent on RDS/Aurora works without the caller
-	// knowing the endpoint.
-	SourceHost string `json:"source_host,omitempty"`
-	// CloudWatchLogGroup names the log group when Source="cloudwatch"
-	// (e.g. /aws/rds/instance/<id>/audit or /aws/rds/cluster/<id>/audit).
-	CloudWatchLogGroup string `json:"cloudwatch_log_group,omitempty"`
-}
-
-// ForensicsUsersResult holds the user accounts known to the source server,
-// for "forensics_users" commands. Mirrors the SaaS agent's HTTP response
-// shape ({"users": [...]}, minus the transport-level success flag — the
-// Response envelope's empty Error field carries that here).
-type ForensicsUsersResult struct {
-	Users []string `json:"users"`
-}
-
 // ─── Handler interface ───────────────────────────────────────────────────────
 
 // Handler processes commands received from dbtrail. Each method receives
@@ -206,30 +129,6 @@ type Handler interface {
 	HandleResolvePK(ctx context.Context, req ResolvePKRequest) ([]PKResult, error)
 	HandleRecover(ctx context.Context, req RecoverRequest) (string, error)
 	HandleForensicsQuery(ctx context.Context, req ForensicsQueryRequest) (*ForensicsResult, error)
-	HandleForensicsCapabilities(ctx context.Context) (forensics.Capabilities, error)
-	HandleForensicsEnrich(ctx context.Context, req ForensicsEnrichRequest) (forensics.EnrichResult, error)
-	HandleForensicsActivity(ctx context.Context, req ForensicsActivityRequest) (forensics.ActivityResult, error)
-	HandleForensicsUsers(ctx context.Context) (ForensicsUsersResult, error)
-	HandleForensicsAuditLog(ctx context.Context, req ForensicsAuditLogRequest) (forensics.AuditReadResult, error)
-}
-
-// forensicsAttributionGate returns a non-empty error message when cmd.Type
-// belongs to the forensics attribution family and forensics is disabled in
-// this build. The gate lives here — at the WS surface entry point — per the
-// #701 D1 entitlement seam: policy at the surface, mechanism-only library.
-//
-// The legacy "forensics_query" command is intentionally NOT gated: it
-// predates the forensics library (three fixed diagnostic aggregates in this
-// package, not attribution) and existing SaaS callers rely on it.
-func forensicsAttributionGate(cmdType string) string {
-	switch cmdType {
-	case "forensics_capabilities", "forensics_enrich", "forensics_activity",
-		"forensics_users", "forensics_audit_log":
-		if !forensics.Enabled() {
-			return "forensics disabled in this build"
-		}
-	}
-	return ""
 }
 
 // dispatch routes a Command to the appropriate Handler method and returns
@@ -240,13 +139,6 @@ func forensicsAttributionGate(cmdType string) string {
 // the zero value is fine when nothing is registered.
 func dispatch(ctx context.Context, h Handler, cmd Command, deps ext.AgentDeps) Response {
 	resp := Response{ID: cmd.ID, Type: cmd.Type}
-
-	// Entitlement gate for the forensics attribution family (#701 D1) —
-	// checked once, before any payload is unmarshalled or handler invoked.
-	if msg := forensicsAttributionGate(cmd.Type); msg != "" {
-		resp.Error = msg
-		return resp
-	}
 
 	switch cmd.Type {
 	case "resolve_pk":
@@ -282,63 +174,6 @@ func dispatch(ctx context.Context, h Handler, cmd Command, deps ext.AgentDeps) R
 			return resp
 		}
 		result, err := h.HandleForensicsQuery(ctx, req)
-		if err != nil {
-			resp.Error = err.Error()
-			return resp
-		}
-		resp.Data = result
-
-	case "forensics_capabilities":
-		// No payload beyond the envelope.
-		result, err := h.HandleForensicsCapabilities(ctx)
-		if err != nil {
-			resp.Error = err.Error()
-			return resp
-		}
-		resp.Data = result
-
-	case "forensics_enrich":
-		var req ForensicsEnrichRequest
-		if err := json.Unmarshal(cmd.Data, &req); err != nil {
-			resp.Error = fmt.Sprintf("invalid forensics_enrich payload: %v", err)
-			return resp
-		}
-		result, err := h.HandleForensicsEnrich(ctx, req)
-		if err != nil {
-			resp.Error = err.Error()
-			return resp
-		}
-		resp.Data = result
-
-	case "forensics_activity":
-		var req ForensicsActivityRequest
-		if err := json.Unmarshal(cmd.Data, &req); err != nil {
-			resp.Error = fmt.Sprintf("invalid forensics_activity payload: %v", err)
-			return resp
-		}
-		result, err := h.HandleForensicsActivity(ctx, req)
-		if err != nil {
-			resp.Error = err.Error()
-			return resp
-		}
-		resp.Data = result
-
-	case "forensics_users":
-		// No payload beyond the envelope.
-		result, err := h.HandleForensicsUsers(ctx)
-		if err != nil {
-			resp.Error = err.Error()
-			return resp
-		}
-		resp.Data = result
-
-	case "forensics_audit_log":
-		var req ForensicsAuditLogRequest
-		if err := json.Unmarshal(cmd.Data, &req); err != nil {
-			resp.Error = fmt.Sprintf("invalid forensics_audit_log payload: %v", err)
-			return resp
-		}
-		result, err := h.HandleForensicsAuditLog(ctx, req)
 		if err != nil {
 			resp.Error = err.Error()
 			return resp

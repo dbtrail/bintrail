@@ -252,9 +252,6 @@ For cron, systemd units, and Ansible recipes, see [deployment.md](./deployment.m
 | `init-shim` | Generate a `shim.yaml` for the time-travel SQL shim |
 | `proxysql-config` | Generate ProxySQL setup SQL for time-travel SQL routing |
 | `shim` | Run the in-process MySQL-protocol server for `_flashback`/`_diff`/`_snapshot` queries |
-| `who-changed` | Attribute binlog row changes to the database sessions that made them |
-| `user-activity` | Show a MySQL user's recent statements from performance_schema |
-| `connection-history` | Show current connections and account history for a user or host |
 | `profile` | Manage RBAC access profiles for query and recover |
 | `flag` | Label tables and columns (e.g. `pii`, `sensitive`) for access rules |
 | `access` | Link flags to profiles with allow/deny permissions |

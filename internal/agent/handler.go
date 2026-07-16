@@ -11,7 +11,6 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/buffer"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
-	"github.com/dbtrail/dbtrail/internal/forensics"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -22,11 +21,6 @@ import (
 // that runs against performance_schema and information_schema. Only these
 // are allowed — the agent never executes arbitrary SQL from dbtrail.
 // DO NOT modify at runtime — this is a security boundary.
-//
-// The forensics_* attribution commands (HandleForensicsCapabilities/
-// Enrich/Activity/Users/AuditLog below) hold the same line: each maps to
-// the fixed, parameterized queries inside internal/forensics — no SQL text
-// ever crosses the WebSocket channel in either direction of those commands.
 var allowedForensicsQueries = map[string]string{
 	"recent_queries": `SELECT DIGEST_TEXT, COUNT_STAR, SUM_TIMER_WAIT/1e12 AS total_seconds,
 		AVG_TIMER_WAIT/1e12 AS avg_seconds, LAST_SEEN
@@ -63,10 +57,9 @@ type DefaultHandler struct {
 	SourceDB *sql.DB
 
 	// SourceHost is the resolved host[:port] of the source server (from the
-	// agent's --source-dsn). It lets the audit-log tier reach the RDS/CloudWatch
-	// remote sources for a managed RDS/Aurora source whose audit log is not on
-	// a local filesystem. Empty => local-file audit reads only. A per-request
-	// ForensicsAuditLogRequest.SourceHost overrides it.
+	// agent's --source-dsn). The agent runner forwards it to extension-
+	// registered commands via ext.AgentDeps. Empty when no source is
+	// configured.
 	SourceHost string
 
 	// ArchiveSources lists Parquet archive paths (local dirs or s3:// URLs).
@@ -385,117 +378,6 @@ func (h *DefaultHandler) HandleForensicsQuery(ctx context.Context, req Forensics
 		result.Rows = append(result.Rows, row)
 	}
 	return result, sqlRows.Err()
-}
-
-// ─── Forensics attribution commands ──────────────────────────────────────────
-//
-// Thin wrappers over internal/forensics: validate the connection, call the
-// library, wrap the result. All validation of filters/caps lives in the
-// library (single source of truth); the entitlement gate lives in dispatch.
-// Results carry identity + statement text — see the payload/metadata note
-// on the request types in command.go.
-
-// requireSourceDB guards the forensics attribution handlers, which all
-// inspect the live source server. Returns a clear error when the agent
-// runs without --source-dsn (mirrors HandleForensicsQuery's guard).
-func (h *DefaultHandler) requireSourceDB() error {
-	if h.SourceDB == nil {
-		return fmt.Errorf("forensics commands require --source-dsn")
-	}
-	return nil
-}
-
-// HandleForensicsCapabilities detects the forensic data sources available
-// on the source server (performance_schema state, audit plugin variant and
-// config, server version/variant).
-func (h *DefaultHandler) HandleForensicsCapabilities(ctx context.Context) (forensics.Capabilities, error) {
-	if err := h.requireSourceDB(); err != nil {
-		return forensics.Capabilities{}, err
-	}
-	return forensics.DetectCapabilities(ctx, h.SourceDB)
-}
-
-// HandleForensicsEnrich looks up live thread/connection attribution for the
-// requested connection IDs from performance_schema.
-//
-// LIVE-ONLY: sessions that have already disconnected come back in NotFound
-// with fallback queries. The SaaS composes live results with its
-// connection-cache history in the who-changed engine — not here.
-func (h *DefaultHandler) HandleForensicsEnrich(ctx context.Context, req ForensicsEnrichRequest) (forensics.EnrichResult, error) {
-	if err := h.requireSourceDB(); err != nil {
-		return forensics.EnrichResult{}, err
-	}
-	return forensics.EnrichThreads(ctx, h.SourceDB, req.ThreadIDs)
-}
-
-// HandleForensicsActivity runs one of the two fixed activity queries
-// (user_activity, connection_history) against performance_schema on the
-// source server.
-func (h *DefaultHandler) HandleForensicsActivity(ctx context.Context, req ForensicsActivityRequest) (forensics.ActivityResult, error) {
-	if err := h.requireSourceDB(); err != nil {
-		return forensics.ActivityResult{}, err
-	}
-	return forensics.Activity(ctx, h.SourceDB, forensics.ActivityQuery{
-		Type:  req.QueryType,
-		User:  req.User,
-		Host:  req.Host,
-		Since: req.Since,
-		Until: req.Until,
-		Limit: req.Limit,
-		Order: req.Order,
-	})
-}
-
-// HandleForensicsUsers lists the MySQL user accounts known to the source
-// server (mysql.user merged with performance_schema.accounts).
-func (h *DefaultHandler) HandleForensicsUsers(ctx context.Context) (ForensicsUsersResult, error) {
-	if err := h.requireSourceDB(); err != nil {
-		return ForensicsUsersResult{}, err
-	}
-	users, err := forensics.ListUsers(ctx, h.SourceDB)
-	if err != nil {
-		return ForensicsUsersResult{}, err
-	}
-	return ForensicsUsersResult{Users: users}, nil
-}
-
-// HandleForensicsAuditLog discovers and parses the audit log configured on the
-// source server. In auto mode (req.Source==""), it reads local-filesystem files
-// and falls back to the RDS file API when the resolved host is an RDS/Aurora
-// endpoint; req.Source can force "local", "rds", or "cloudwatch". The host is
-// resolved via resolveAuditSourceHost (per-request req.SourceHost, else the
-// agent's own --source-dsn host), so a managed RDS/Aurora instance whose log is
-// not on local disk is reachable without the caller supplying the endpoint.
-func (h *DefaultHandler) HandleForensicsAuditLog(ctx context.Context, req ForensicsAuditLogRequest) (forensics.AuditReadResult, error) {
-	if err := h.requireSourceDB(); err != nil {
-		return forensics.AuditReadResult{}, err
-	}
-	host := resolveAuditSourceHost(req.SourceHost, h.SourceHost)
-	return forensics.ReadAuditLog(ctx, h.SourceDB, forensics.AuditReadOptions{
-		Since:              req.Since,
-		Until:              req.Until,
-		User:               req.User,
-		EventType:          req.EventType,
-		Limit:              req.Limit,
-		Offset:             req.Offset,
-		IncludeRotated:     req.IncludeRotated,
-		TailLines:          req.TailLines,
-		Source:             forensics.AuditSource(req.Source),
-		SourceHost:         host,
-		CloudWatchLogGroup: req.CloudWatchLogGroup,
-	})
-}
-
-// resolveAuditSourceHost picks the host used to reach the RDS/CloudWatch remote
-// audit sources: a per-request SourceHost wins, otherwise the agent's own source
-// host (from --source-dsn). Without a non-empty result the audit tier stays on
-// the local-file path — the wiring gap that made the RDS/Aurora reader dead code
-// before it was threaded through, so this fallback is pinned by a test.
-func resolveAuditSourceHost(reqHost, handlerHost string) string {
-	if reqHost != "" {
-		return reqHost
-	}
-	return handlerHost
 }
 
 // byosPKHash computes SHA-256 hex digest of pkValues, matching the

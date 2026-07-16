@@ -208,9 +208,8 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		defer db.Close()
 		sourceDB = db
 		handler.SourceDB = db
-		// Carry the source host so the forensics audit tier can reach the
-		// RDS/CloudWatch remote sources when this agent runs against a managed
-		// RDS/Aurora instance whose audit log is not on a local filesystem.
+		// Carry the resolved source host so extension-registered agent
+		// commands receive it via ext.AgentDeps.
 		if host, _, _, _, perr := config.ParseSourceDSN(agtSourceDSN); perr == nil {
 			handler.SourceHost = host
 		}
@@ -1123,7 +1122,7 @@ func validateServerUUID(s string) (string, error) {
 // (metadata) and customer S3 (payload) only when --s3-bucket is set. Without a
 // flush sink, the agent looks healthy on the WebSocket channel while every
 // event accumulates in memory and is dropped on restart, with no operator
-// signal — the SaaS Explorer / recover / who-changed flows return empty.
+// signal — the SaaS Explorer / recover flows return empty.
 //
 // We fail fast at startup rather than warn-and-continue: most operators don't
 // read agent logs proactively, and the steady-state symptom (empty Explorer)

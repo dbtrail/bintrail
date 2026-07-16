@@ -54,10 +54,6 @@ func init() {
 	// package and self-registered via init(); they moved to internal/cli so both
 	// binaries expose them.
 	cli.AddMaintenanceCommands(rootCmd)
-	// Forensics commands are MySQL-family-only (performance_schema, audit
-	// plugins), so they register here — like doctor — and NOT via
-	// AddReadCommands, which bintrail-pg shares (#706).
-	cli.AddForensicsCommands(rootCmd)
 }
 
 // AddCommands registers additional top-level commands on the bintrail root

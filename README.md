@@ -29,7 +29,7 @@ before/after images in a searchable index:
 - **Undo precisely** — generate exact reversal SQL for just the damaged rows
 - **Undo cascade deletes** — reconstruct child rows an `ON DELETE CASCADE` wiped out (and restore FKs an `ON DELETE SET NULL` cleared) that InnoDB removes *below* the binlog and most tools can't see — see [Query & Recovery](docs/query-and-recovery.md)
 - **Time-travel** — query any row (or table) as it was at any moment, from the web console or the `reconstruct` CLI; the live SQL `AS OF` interface additionally needs ProxySQL — see [Time-Travel SQL](docs/time-travel-sql.md)
-- **Who changed this?** — attribute any change to the database user, host, and client program behind it; honest about what it can prove with and without an audit plugin — see [Forensics](docs/forensics.md)
+- **Who changed this?** — session attribution (database user, host, and client program behind a change) is available in the commercial distribution (dbtrail EE)
 - **Prove the safety net holds** — `bintrail verify` checks (off-line, drift-free) that a recovery would actually reproduce the source, and `bintrail status` flags any gap in the captured stream — so you find out *before* you need it — see [Verify](docs/verify.md)
 - **Web console** — browse, recover, and add servers to monitor, all in the UI
 - **[MCP server](docs/mcp-server.md)** — Claude or any MCP client can search history and draft recoveries
@@ -84,7 +84,6 @@ See [the demo image](docs/demo.md).
 | | [MariaDB source (alpha)](docs/mariadb.md) · [PostgreSQL source (beta)](docs/postgres.md) | [Server identity](docs/server-identity.md) |
 | | [MCP server](docs/mcp-server.md) | [Parquet debugging](docs/parquet-debugging.md) |
 | | [Dump & Baseline](docs/dump-and-baseline.md) · [DDL tracking](docs/ddl-tracking.md) | |
-| | [Forensics — who changed this?](docs/forensics.md) | |
 
 ## License
 

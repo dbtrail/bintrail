@@ -164,9 +164,9 @@ func TestEventsHandlerIncludesConnectionID(t *testing.T) {
 		t.Fatalf("events status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	// #699 forensics fields ride the same open-core boundary as
-	// connection_id: the mock row above feeds a statement + digest through
-	// the handler, and neither key nor value may reach the wire.
+	// #699 statement-capture fields (query_text/query_hash): the mock row
+	// above feeds a statement + digest through the handler, and neither key
+	// nor value may reach the wire.
 	for _, banned := range []string{"query_text", "query_hash", "UPDATE users SET", "cafe0000"} {
 		if strings.Contains(body, banned) {
 			t.Errorf("events response must not contain %q: %s", banned, body)

@@ -22,7 +22,6 @@ import (
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/doctor"
-	"github.com/dbtrail/dbtrail/internal/forensics"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/rotation"
 	"github.com/dbtrail/dbtrail/internal/serverid"
@@ -109,8 +108,6 @@ var (
 	upRotateInterval  string
 	upRotateAddFuture int
 
-	upAttributionRetention time.Duration
-
 	// upRotationCfg holds the parsed built-in-rotation settings from runWatch's
 	// validation, read at the phase-3 start sites (the cobra-accumulator
 	// pattern; the parsing and the loop itself live in internal/rotation).
@@ -142,7 +139,6 @@ var watchEnvBindings = []struct {
 	{"rotate-retain", "BINTRAIL_ROTATE_RETAIN"},
 	{"rotate-interval", "BINTRAIL_ROTATE_INTERVAL"},
 	{"rotate-add-future", "BINTRAIL_ROTATE_ADD_FUTURE"},
-	{"attribution-retention", "BINTRAIL_ATTRIBUTION_RETENTION"},
 }
 
 // bindWatchEnv loads the env file (once) and applies BINTRAIL_* environment
@@ -201,7 +197,6 @@ func init() {
 	watchCmd.Flags().StringVar(&upRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
 	watchCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
 	watchCmd.Flags().IntVar(&upRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
-	watchCmd.Flags().DurationVar(&upAttributionRetention, "attribution-retention", forensics.DefaultRetention, "Forensics: keep disconnected-session identity (connection_cache) for this long; 0 disables the poller")
 	// --source-dsn is deliberately NOT required: the daemon may start
 	// source-less (zero-config install) and sources are added from the UI.
 	_ = watchCmd.MarkFlagRequired("index-dsn")
@@ -616,19 +611,6 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// desired state lives in the registry, positions in each per-source
 	// stream_state checkpoint.
 	go supervisor.Reconcile(registry)
-
-	// Forensics: session-identity poller for the main stream's source (each
-	// supervised per-source stream gets its own inside the supervisor). Same
-	// lifecycle and contract as rotation: a secondary job on the daemon
-	// context, never fatal to the stream. Gate-checked at the surface
-	// (#701 D1); --attribution-retention 0 disables it inside the poller.
-	if forensics.Enabled() {
-		forensics.StartConnCachePoller(ctx, forensics.ConnCacheConfig{
-			SourceDSN: upSourceDSN,
-			IndexDSN:  upIndexDSN,
-			Retention: upAttributionRetention,
-		})
-	}
 
 	streamErr := streamrun.One(ctx, watchStreamConfig(serverID))
 	stop()                // drain the console even if the stream returned without a signal

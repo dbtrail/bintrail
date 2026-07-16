@@ -4,8 +4,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-
-	"github.com/dbtrail/dbtrail/internal/forensics"
 )
 
 type captureSink struct {
@@ -44,20 +42,6 @@ func TestRecordStampsTimeAndForwards(t *testing.T) {
 	}
 	if ev.Action != "recover.generate" || ev.Detail["statements"] != "12" {
 		t.Errorf("event mangled: %+v", ev)
-	}
-}
-
-func TestSetForensicsEnabled(t *testing.T) {
-	orig := forensics.Enabled
-	t.Cleanup(func() { forensics.Enabled = orig })
-
-	SetForensicsEnabled(func() bool { return false })
-	if forensics.Enabled() {
-		t.Fatal("gate override did not take effect")
-	}
-	SetForensicsEnabled(func() bool { return true })
-	if !forensics.Enabled() {
-		t.Fatal("gate re-open did not take effect")
 	}
 }
 

@@ -145,8 +145,6 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 	report.add(checkServerIDCollision(ctx, sourceDB, sourceDSN))
 	report.add(checkFKCascades(sourceDB, schemas))
 	report.add(checkSchemaVisibility(ctx, sourceDB, schemas))
-	report.add(checkPerformanceSchema(ctx, sourceDB))
-	report.add(checkAuditPlugin(ctx, sourceDB))
 
 	// ── Index MySQL checks (optional) ─────────────────────────────────────────
 	if indexDSN != "" {
@@ -439,9 +437,9 @@ func rdsBinlogRetentionVerdict(name string, raw sql.NullString) CheckResult {
 
 	if !raw.Valid {
 		return CheckResult{
-			Name:   name,
-			Status: StatusWarn,
-			Detail: "RDS/Aurora 'binlog retention hours' is NULL (the default) — RDS purges binlogs as soon as replication no longer needs them, regardless of binlog_expire_logs_seconds",
+			Name:        name,
+			Status:      StatusWarn,
+			Detail:      "RDS/Aurora 'binlog retention hours' is NULL (the default) — RDS purges binlogs as soon as replication no longer needs them, regardless of binlog_expire_logs_seconds",
 			Remediation: setRemediation,
 		}
 	}
@@ -455,9 +453,9 @@ func rdsBinlogRetentionVerdict(name string, raw sql.NullString) CheckResult {
 	}
 	if hours*3600 < binlogRetentionMinSeconds {
 		return CheckResult{
-			Name:   name,
-			Status: StatusWarn,
-			Detail: fmt.Sprintf("RDS 'binlog retention hours'=%d (below 2 days) — this, not binlog_expire_logs_seconds, governs binlog retention on RDS/Aurora", hours),
+			Name:        name,
+			Status:      StatusWarn,
+			Detail:      fmt.Sprintf("RDS 'binlog retention hours'=%d (below 2 days) — this, not binlog_expire_logs_seconds, governs binlog retention on RDS/Aurora", hours),
 			Remediation: setRemediation,
 		}
 	}
@@ -896,178 +894,6 @@ func countVisibleSchemas(ctx context.Context, db *sql.DB, schemas []string) (int
 	var n int
 	err := db.QueryRowContext(ctx, query, args...).Scan(&n)
 	return n, err
-}
-
-// forensicsConsumers are the performance_schema setup_consumers rows the
-// user_activity forensic query reads from. Listed in the order they should
-// appear in the check detail.
-var forensicsConsumers = []string{"events_statements_history", "events_statements_history_long"}
-
-// checkPerformanceSchema reports whether performance_schema — and the two
-// statement-history consumers forensics reads — are available on the source.
-// Forensics is optional, so a missing or degraded source is WARN, never FAIL:
-// streaming must not be blocked because attribution data is unavailable.
-// Validate, never set: the check reports state with copy-pasteable
-// remediation; it never writes to the source server.
-func checkPerformanceSchema(ctx context.Context, db *sql.DB) CheckResult {
-	const name = "performance_schema (forensics)"
-
-	var varName, varValue string
-	err := db.QueryRowContext(ctx,
-		"SHOW GLOBAL VARIABLES LIKE 'performance_schema'").Scan(&varName, &varValue)
-	if err != nil {
-		return CheckResult{
-			Name:   name,
-			Status: StatusWarn,
-			Detail: "could not read the performance_schema variable: " + err.Error(),
-		}
-	}
-	if !strings.EqualFold(varValue, "ON") {
-		return CheckResult{
-			Name:   name,
-			Status: StatusWarn,
-			Detail: fmt.Sprintf("performance_schema=%s — forensic attribution (who-changed, user activity) unavailable", varValue),
-			Remediation: "Enable performance_schema in my.cnf and restart MySQL (it cannot be enabled at runtime):\n\n" +
-				"  [mysqld]\n" +
-				"  performance_schema = ON\n" +
-				"  performance-schema-consumer-events-statements-history = ON\n" +
-				"  performance-schema-consumer-events-statements-history-long = ON\n\n" +
-				"It is enabled by default on MySQL 8.0+. On RDS/Aurora, set the (static) performance_schema\n" +
-				"parameter in the parameter group and reboot; enabling Performance Insights also turns it on.",
-		}
-	}
-
-	// performance_schema is ON — check the statement-history consumers.
-	rows, err := db.QueryContext(ctx,
-		"SELECT NAME, ENABLED FROM performance_schema.setup_consumers "+
-			"WHERE NAME IN ('events_statements_history', 'events_statements_history_long')")
-	if err != nil {
-		return CheckResult{
-			Name:   name,
-			Status: StatusWarn,
-			Detail: "ON, but could not read setup_consumers: " + err.Error(),
-		}
-	}
-	defer rows.Close()
-
-	enabled := map[string]bool{}
-	for rows.Next() {
-		var consumer, state string
-		if err := rows.Scan(&consumer, &state); err != nil {
-			return CheckResult{
-				Name:   name,
-				Status: StatusWarn,
-				Detail: "ON, but could not scan setup_consumers: " + err.Error(),
-			}
-		}
-		enabled[consumer] = strings.EqualFold(state, "YES")
-	}
-	if err := rows.Err(); err != nil {
-		return CheckResult{
-			Name:   name,
-			Status: StatusWarn,
-			Detail: "ON, but could not read setup_consumers: " + err.Error(),
-		}
-	}
-
-	var off []string
-	for _, c := range forensicsConsumers {
-		if !enabled[c] {
-			off = append(off, c)
-		}
-	}
-	if len(off) == 0 {
-		return CheckResult{
-			Name:   name,
-			Status: StatusPass,
-			Detail: "ON (statement history consumers enabled)",
-		}
-	}
-	var updates strings.Builder
-	for _, c := range off {
-		fmt.Fprintf(&updates, "  UPDATE performance_schema.setup_consumers SET ENABLED = 'YES' WHERE NAME = '%s';\n", c)
-	}
-	return CheckResult{
-		Name:   name,
-		Status: StatusWarn,
-		Detail: fmt.Sprintf("ON, but consumer(s) disabled: %s — forensic statement history will be missing", strings.Join(off, ", ")),
-		Remediation: "Enable the statement-history consumer(s) at runtime:\n\n" +
-			updates.String() +
-			"\nAnd persist across restarts in my.cnf:\n\n" +
-			"  [mysqld]\n" +
-			"  performance-schema-consumer-events-statements-history = ON\n" +
-			"  performance-schema-consumer-events-statements-history-long = ON\n\n" +
-			"On RDS/Aurora there is NO parameter-group option for setup_consumers, so the runtime\n" +
-			"UPDATE does not survive a reboot — re-assert it after every reboot.",
-	}
-}
-
-// checkAuditPlugin reports whether an audit-log plugin (MariaDB server_audit /
-// its AWS RDS fork, Percona Audit Log, or MySQL Enterprise Audit) is active on
-// the source. An audit log is the strongest forensic attribution source
-// (persisted to disk, survives disconnects), but entirely optional — so absent
-// or unreadable is WARN, never FAIL. Validate, never set.
-func checkAuditPlugin(ctx context.Context, db *sql.DB) CheckResult {
-	const name = "Audit log plugin (forensics)"
-
-	rows, err := db.QueryContext(ctx,
-		"SELECT PLUGIN_NAME FROM information_schema.PLUGINS "+
-			"WHERE UPPER(PLUGIN_NAME) LIKE '%AUDIT%' AND PLUGIN_STATUS = 'ACTIVE'")
-	if err != nil {
-		return CheckResult{
-			Name:   name,
-			Status: StatusWarn,
-			Detail: "could not query information_schema.PLUGINS: " + err.Error(),
-		}
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var plugin string
-		if err := rows.Scan(&plugin); err != nil {
-			return CheckResult{
-				Name:   name,
-				Status: StatusWarn,
-				Detail: "could not scan plugin row: " + err.Error(),
-			}
-		}
-		// Skip the RDS internal audit plugin — it's not queryable via SQL.
-		if strings.Contains(strings.ToUpper(plugin), "RDS_SECURITY") {
-			continue
-		}
-		return CheckResult{
-			Name:   name,
-			Status: StatusPass,
-			Detail: plugin + " active",
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return CheckResult{
-			Name:   name,
-			Status: StatusWarn,
-			Detail: "could not read plugin rows: " + err.Error(),
-		}
-	}
-
-	return CheckResult{
-		Name:   name,
-		Status: StatusWarn,
-		Detail: "no audit log plugin active — forensic attribution falls back to performance_schema's in-memory ring buffers",
-		Remediation: "An audit plugin gives durable who-ran-what history. Pick the one for your server variant:\n\n" +
-			"  -- MariaDB (built in):\n" +
-			"  INSTALL SONAME 'server_audit';\n" +
-			"  SET GLOBAL server_audit_logging = ON;\n\n" +
-			"  -- Percona Server (free, Audit Log Filter plugin — supersedes the legacy audit_log plugin):\n" +
-			"  CREATE TABLE IF NOT EXISTS mysql.audit_log_filter (filter_id INT UNSIGNED NOT NULL AUTO_INCREMENT, name VARCHAR(255) NOT NULL, filter JSON NOT NULL, PRIMARY KEY (filter_id), UNIQUE KEY filter_name (name)) ENGINE=InnoDB;\n" +
-			"  CREATE TABLE IF NOT EXISTS mysql.audit_log_user (username VARCHAR(32) NOT NULL, userhost VARCHAR(255) NOT NULL, filtername VARCHAR(255) NOT NULL, PRIMARY KEY (username, userhost), FOREIGN KEY (filtername) REFERENCES mysql.audit_log_filter(name)) ENGINE=InnoDB;\n" +
-			"  INSTALL PLUGIN audit_log_filter SONAME 'audit_log_filter.so';\n" +
-			"  SELECT audit_log_filter_set_filter('log_all', '{\"filter\": {\"log\": true}}');\n" +
-			"  SELECT audit_log_filter_set_user('%', 'log_all');\n\n" +
-			"  -- MySQL Community: no free audit plugin; MySQL Enterprise Audit requires an Enterprise license.\n\n" +
-			"On RDS for MySQL, add the MARIADB_AUDIT_PLUGIN option to the instance's option group;\n" +
-			"on Aurora MySQL, set server_audit_logging=1 in the cluster parameter group.\n" +
-			"Run `bintrail doctor` again afterwards; the forensics setup guide has the full walkthrough.",
-	}
 }
 
 func checkIndexConnection(ctx context.Context, dsn, dbName string) CheckResult {

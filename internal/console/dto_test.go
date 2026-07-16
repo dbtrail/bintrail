@@ -12,11 +12,9 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
-// TestEventDTOIncludesConnectionID is the load-bearing open-core test,
-// updated for epic #701 decision D1: the events API now exposes connection_id
-// (the entitlement seam moved to internal/forensics.Enabled, checked at
-// surface entry points) but still omits query_text/query_hash — a distinct,
-// still-live boundary (#699) this epic does not touch.
+// TestEventDTOIncludesConnectionID is the load-bearing boundary test: the
+// events API exposes connection_id (a captured index column, #701 D1) but
+// still omits query_text/query_hash — a distinct, still-live boundary (#699).
 func TestEventDTOIncludesConnectionID(t *testing.T) {
 	cid := uint32(98765)
 	gtid := "uuid:1-10"

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
-	"github.com/dbtrail/dbtrail/internal/forensics"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -53,16 +52,6 @@ type capabilitiesResponse struct {
 	// profile cascade victim synthesis cannot honor redaction, so the endpoint
 	// refuses (see handleRecoverCascade). Process-global, like Monitor.
 	RecoverCascade bool `json:"recover_cascade"`
-	// Forensics: the who-changed/user-activity/connection-history
-	// investigation surface is available (epic #701). Gated by the single
-	// entitlement seam (forensics.Enabled) and, like RecoverCascade, refused
-	// while an RBAC redaction profile is active — forensic output includes
-	// unredacted SQL text and session identity. Process-global: it never needs
-	// the selected server's bundle — per-server "no source configured" is a
-	// property of the SELECTED server, handled inside the forensics endpoints
-	// themselves (who-changed degrades to index-only attribution; the other
-	// two modes have no fallback and error), not this process-wide flag.
-	Forensics bool `json:"forensics"`
 	// RecoverCascadeBaseline: cascade recovery's Phase-2 (recover children
 	// untouched within the window) is active for this server. Per-server, and gated
 	// EXACTLY like the handler builds its provider — a baseline source AND a schema
@@ -93,7 +82,7 @@ type capabilitiesResponse struct {
 	// or "mysql" — derived per-server from stream_state.flavor (the same field
 	// DialectForIndex reads). It drives source-aware PRESENTATION only: the
 	// frontend relabels stream vocabulary (LSN vs binlog file/pos/GTID) and shows
-	// a forensics-degraded note for PostgreSQL, whose pgoutput stream carries no
+	// a connection-id availability note for PostgreSQL, whose pgoutput stream carries no
 	// backend connection id. NOT a capability gate — it never hides a surface,
 	// only renames or annotates what one shows. Defaults to "mysql" when the
 	// bundle can't be resolved, so a degraded console reads as the common case.
@@ -132,7 +121,6 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// recover-cascade is the free tier (like recover) and process-global, gated
 		// only by the RBAC profile (which would make synthesis leak redacted data).
 		RecoverCascade: !s.rbacActive(),
-		Forensics:      forensics.Enabled() && !s.rbacActive(),
 		Auth:           authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
 		// Default until the bundle resolves: a degraded console renders MySQL
 		// vocabulary (the common case), never a blank source.

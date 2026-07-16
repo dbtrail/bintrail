@@ -71,6 +71,25 @@ func TestDispatchUnregisteredTypeStillUnknown(t *testing.T) {
 	}
 }
 
+// TestDispatchRetiredAttributionTypesFallThrough pins the retirement of the
+// who-changed attribution command family: the former builtin types have no
+// dispatch case anymore, so they fall through to the extension registry and
+// — unregistered — fail as unknown. An embedding distribution provides them
+// via ext.RegisterAgentCommand. The legacy forensics_query stays builtin
+// (see TestDispatch_forensicsQuery).
+func TestDispatchRetiredAttributionTypesFallThrough(t *testing.T) {
+	for _, typ := range []string{
+		"forensics_capabilities", "forensics_enrich", "forensics_activity",
+		"forensics_users", "forensics_audit_log",
+	} {
+		resp := dispatch(context.Background(), &DefaultHandler{},
+			Command{ID: "x5", Type: typ, Data: json.RawMessage(`{}`)}, ext.AgentDeps{})
+		if !strings.Contains(resp.Error, "unknown command type") {
+			t.Errorf("%s: error = %q, want unknown command type (retired builtin must route to the registry)", typ, resp.Error)
+		}
+	}
+}
+
 // TestDispatchBuiltinWinsOverRegistry pins the precedence contract: the
 // registry is consulted only in the default branch, so registering a builtin
 // type can never shadow the builtin handler.

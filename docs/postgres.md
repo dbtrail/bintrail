@@ -385,8 +385,8 @@ shared daemon for PostgreSQL sources in this release — one process per source
 
 You can **view and recover** PostgreSQL-captured data in the read-only web
 console (`bintrail-console`), which reads the shared index. The console presents
-PostgreSQL sources natively — LSN/slot vocabulary, a lost-slot badge, a forensics
-note, and a live replication-health panel (slot WAL-retention, lag, RI-FULL); see
+PostgreSQL sources natively — LSN/slot vocabulary, a lost-slot badge, a
+connection-id note, and a live replication-health panel (slot WAL-retention, lag, RI-FULL); see
 [PostgreSQL sources](console.md#postgresql-sources). What it does **not** drive is
 *capture*: the "+ Add server" / `watch` control plane is MySQL-oriented, so run
 `bintrail-pg stream` for the capture and use the console (or the `query`/`recover`
@@ -717,9 +717,9 @@ coerce, but verify your own round-trip.
   `recover-cascade` work unconditionally, with no baseline needed; cascades
   are captured as ordinary row changes — see
   [Querying and recovering](#querying-and-recovering).)
-- **No connection/forensics attribution.** `pgoutput` does not carry the backend
-  PID, so the per-connection forensics surface (available for MySQL) is empty
-  for PostgreSQL.
+- **No connection attribution.** `pgoutput` does not carry the backend PID, so
+  the `connection_id` column is empty for PostgreSQL sources — nothing upstream
+  can add it.
 - **One database per slot.** A logical slot is scoped to a single database; to
   capture multiple databases on one cluster, run one `bintrail-pg stream` (and
   slot/publication) per database.

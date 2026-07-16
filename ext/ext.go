@@ -1,31 +1,21 @@
 // Package ext exposes the extension points that embedding distributions
 // — builds that import cliapp and wrap the OSS core — use to inject
-// behavior: an audit sink recording data-access operations, overrides
-// for feature-entitlement gates, extra doctor checks, agent WebSocket
-// commands, and daemon source jobs.
+// behavior: an audit sink recording data-access operations, extra
+// doctor checks, agent WebSocket commands, and daemon source jobs.
 //
-// Seams follow the same convention as the internal forensics.Enabled
-// gate: package-level variables set once at process startup (before any
-// command runs), called by the core at surface entry points (CLI, MCP,
-// shim, console) — never inside the library layer. The OSS binary
-// leaves every seam at its default: auditing is a no-op and every
-// feature gate is open. Setters are not safe for concurrent use with
+// Seams share one convention: package-level registries or variables set
+// once at process startup (before any command runs), called by the core
+// at surface entry points (CLI, MCP, shim, console) or daemon wiring
+// points — never inside the library layer. The OSS binary leaves every
+// seam at its default: auditing is a no-op and no extra checks, commands,
+// or jobs are registered. Setters are not safe for concurrent use with
 // command execution; call them from main() before dispatch.
 package ext
 
 import (
 	"os"
 	"os/user"
-
-	"github.com/dbtrail/dbtrail/internal/forensics"
 )
-
-// SetForensicsEnabled overrides the forensics feature gate. The OSS
-// default is always-on; an embedding distribution may tie it to its own
-// entitlement model.
-func SetForensicsEnabled(f func() bool) {
-	forensics.Enabled = f
-}
 
 // ProcessActor returns the best available identity for locally-invoked
 // surfaces (CLI, stdio MCP): the operating-system user, plus the RBAC

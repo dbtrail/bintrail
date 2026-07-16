@@ -58,7 +58,6 @@ func CreateIndexTables(ctx context.Context, db *sql.DB, partitions int, encrypt 
 		{"archive_state", ddlArchiveState},
 		{"schema_changes", ddlSchemaChanges},
 		{"fk_constraints", ddlFKConstraints},
-		{"connection_cache", ddlConnectionCache},
 		{"snapshot_id_seq", metadata.DDLSnapshotIDSeq},
 	}
 	for _, t := range ddls {
@@ -279,26 +278,6 @@ const ddlFKConstraints = `CREATE TABLE IF NOT EXISTS fk_constraints (
     delete_rule              VARCHAR(16)  NOT NULL DEFAULT '' COMMENT 'ON DELETE rule (CASCADE/RESTRICT/SET NULL/NO ACTION); empty for pre-cascade-recovery snapshots',
     update_rule              VARCHAR(16)  NOT NULL DEFAULT '' COMMENT 'ON UPDATE rule; empty for pre-cascade-recovery snapshots',
     PRIMARY KEY (snapshot_id, schema_name, constraint_name, ordinal_position)
-) ENGINE=InnoDB`
-
-// ─── Forensics: connection identity cache ─────────────────────────────────────
-
-// ddlConnectionCache persists session identity (user/host/db/program) captured
-// from the source's performance_schema so forensic attribution of a binlog
-// event's connection_id survives disconnects (#703) — performance_schema rows
-// vanish the moment a session ends. Populated by the poller in
-// internal/forensics; rows unseen for --attribution-retention (default 24h)
-// are swept hourly. A separate table, not binlog_events columns, so the
-// Parquet archive/baseline schemas are untouched.
-const ddlConnectionCache = `CREATE TABLE IF NOT EXISTS connection_cache (
-    connection_id         BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-    user                  VARCHAR(128),
-    host                  VARCHAR(255),
-    db                    VARCHAR(128),
-    command               VARCHAR(64),
-    connection_attributes JSON,
-    cached_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_seen             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB`
 
 // ─── DDL tracking ─────────────────────────────────────────────────────────────

@@ -650,20 +650,6 @@ func EnsureSchema(db *sql.DB) error {
 			return err
 		}
 	}
-	// connection_cache post-dates the original schema (#703): the forensics
-	// poller persists session identity here so attribution survives
-	// disconnects. A whole-table migration, so it is presence-checked first —
-	// an up-to-date index keeps EnsureSchema write-free (ensureColumn's
-	// contract), which matters for index users without CREATE privilege.
-	hasConnCache, err := tableExists(db, "connection_cache")
-	if err != nil {
-		return err
-	}
-	if !hasConnCache {
-		if _, err := db.Exec(ddlConnectionCache); err != nil {
-			return fmt.Errorf("failed to create connection_cache: %w", err)
-		}
-	}
 	// snapshot_id_seq post-dates the original schema (#844): a dedicated
 	// AUTO_INCREMENT counter table that lets metadata.TakeSnapshot/
 	// WritePGSnapshot allocate snapshot_id values without the deadlock-prone
@@ -687,7 +673,7 @@ func EnsureSchema(db *sql.DB) error {
 }
 
 // WrapSchemaMigrationErr rewrites an EnsureSchema failure for the READ plane
-// (query, recover, verify, shim, reconstruct, whochanged, recover-cascade,
+// (query, recover, verify, shim, reconstruct, recover-cascade,
 // the MCP tools) into an actionable error.
 //
 // EnsureSchema issues ALTER TABLE / CREATE TABLE statements, which a

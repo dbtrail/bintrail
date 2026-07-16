@@ -13,18 +13,14 @@ const consoleTSFormat = "2006-01-02 15:04:05"
 // eventDTO is the JSON-serialisable view of a query.ResultRow exposed by the
 // console's read-only API.
 //
-// connection_id is INCLUDED (epic #701 decision D1): the scattered
-// per-field redaction that used to hide it here is retired in favor of a
-// single entitlement seam, internal/forensics.Enabled, checked at surface
-// entry points (this console's forensics_api.go among them). dbtrail OSS
-// ships forensics enabled today, so the general events surface carries the
-// same session-identity field the forensics surface does — there is no
-// separate "free" events view to protect it from anymore.
+// connection_id is INCLUDED: it is captured index data (the transaction's
+// originating connection id from the binlog), and the general events surface
+// carries it like any other indexed column.
 //
 // query_text and query_hash remain OMITTED. That is a distinct, still-live
-// boundary (#699, "what statement produced this row") that this epic does
-// NOT touch — this DTO has simply never grown a consumer for statement text.
-// Do not add them here without a surface that actually reads them.
+// boundary (#699, "what statement produced this row") — this DTO has simply
+// never grown a consumer for statement text. Do not add them here without a
+// surface that actually reads them.
 type eventDTO struct {
 	EventID        uint64         `json:"event_id"`
 	BinlogFile     string         `json:"binlog_file"`

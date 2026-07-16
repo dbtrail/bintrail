@@ -7,12 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/dbtrail/dbtrail/internal/forensics"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/recovery"
 	"github.com/dbtrail/dbtrail/internal/testutil"
@@ -67,9 +65,7 @@ func TestIntegrationEventsAPI(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("events code = %d, body = %s", rec.Code, body)
 	}
-	// #701 D1: connection_id is no longer a redacted field on the events API —
-	// the entitlement seam moved to forensics.Enabled, checked at surface entry
-	// points, not per-field here.
+	// connection_id is a regular indexed column on the events API (#701 D1).
 	if !strings.Contains(string(body), "connection_id") {
 		t.Errorf("events response must contain connection_id (#701 D1): %s", body)
 	}
@@ -79,115 +75,6 @@ func TestIntegrationEventsAPI(t *testing.T) {
 	}
 	if resp.Count != 2 {
 		t.Errorf("event count = %d, want 2", resp.Count)
-	}
-}
-
-// TestIntegrationForensicsCapabilitiesAndUsers_realSource drives GET
-// /api/forensics/capabilities and /api/forensics/users against a server whose
-// SourceDSN points at the real test MySQL — the "source configured and
-// reachable" success path forensics_api_test.go's sqlmock-based tests can't
-// reach (config.Connect opens a real DSN, not an injectable seam). Without
-// this, breaking openForensicsSource so it always reports "not configured"
-// would pass every existing test.
-func TestIntegrationForensicsCapabilitiesAndUsers_realSource(t *testing.T) {
-	srv, _ := seedConsoleData(t)
-	_, idxDBName := testutil.CreateTestDB(t)
-
-	rec, body := doReq(t, srv, "POST", "/api/servers", `{
-		"name":"fx-src",
-		"host":"127.0.0.1","port":"13306","user":"root","password":"testroot","dbname":"`+idxDBName+`",
-		"source_host":"127.0.0.1","source_port":"13306","source_user":"root","source_password":"testroot"
-	}`)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create server: status = %d, body = %s", rec.Code, body)
-	}
-	var created struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(body, &created); err != nil {
-		t.Fatal(err)
-	}
-
-	rec, body = doReqOn(t, srv, created.ID, "GET", "/api/forensics/capabilities", "")
-	if rec.Code != 200 {
-		t.Fatalf("capabilities: status = %d, body = %s", rec.Code, body)
-	}
-	var caps forensicsCapabilitiesResponse
-	if err := json.Unmarshal(body, &caps); err != nil {
-		t.Fatal(err)
-	}
-	if !caps.SourceConfigured {
-		t.Errorf("source_configured should be true for a server with a real, reachable source: %s", body)
-	}
-	if caps.ServerInfo.Version == "" {
-		t.Errorf("expected a real server_info.version detected from a live MySQL connection: %s", body)
-	}
-
-	rec, body = doReqOn(t, srv, created.ID, "GET", "/api/forensics/users", "")
-	if rec.Code != 200 {
-		t.Fatalf("users: status = %d, body = %s", rec.Code, body)
-	}
-	var usersResp forensicsUsersResponse
-	if err := json.Unmarshal(body, &usersResp); err != nil {
-		t.Fatal(err)
-	}
-	if len(usersResp.Users) == 0 {
-		t.Errorf("expected at least one real MySQL user account (root) from mysql.user: %s", body)
-	}
-}
-
-// TestIntegrationForensicsWhoChanged_UnreachableSource covers who-changed's
-// "configured but unreachable" behavior specifically — resolveOr and
-// openForensicsSource both key off the SAME selected server, so unlike the
-// other three forensics handlers (whose sqlmock unit tests can freely mix a
-// fake index with a fake source entry — see
-// TestForensicsHandlers_SourceConfiguredButUnreachable in
-// forensics_api_test.go) this needs a REAL, working index paired with a
-// genuinely unreachable source on the one registry entry. Without this, a
-// regression that silently swallowed the unreachable-source note (or dropped
-// back to erroring instead of degrading) would pass every sqlmock test.
-func TestIntegrationForensicsWhoChanged_UnreachableSource(t *testing.T) {
-	srv, _ := seedConsoleData(t)
-	idxDB, idxDBName := testutil.CreateTestDB(t)
-	testutil.InitIndexTables(t, idxDB)
-	testutil.InsertEvent(t, idxDB, "bin.000001", 4, 40, "2026-06-01 12:00:00", nil,
-		"app", "users", 2 /*UPDATE*/, "1", nil, nil, []byte(`{"id":1,"name":"alicia"}`))
-
-	rec, body := doReq(t, srv, "POST", "/api/servers", `{
-		"name":"fx-dead-src",
-		"host":"127.0.0.1","port":"13306","user":"root","password":"testroot","dbname":"`+idxDBName+`",
-		"source_host":"127.0.0.1","source_port":"1","source_user":"root","source_password":"testroot"
-	}`)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create server: status = %d, body = %s", rec.Code, body)
-	}
-	var created struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(body, &created); err != nil {
-		t.Fatal(err)
-	}
-
-	rec, body = doReqOn(t, srv, created.ID, "POST", "/api/forensics/who-changed",
-		`{"schema":"app","table":"users","since":"2000-01-01 00:00:00"}`)
-	if rec.Code != 200 {
-		t.Fatalf("who-changed: status = %d, want 200 (unreachable source degrades, it doesn't error): %s", rec.Code, body)
-	}
-	var res forensics.WhoChangedResult
-	if err := json.Unmarshal(body, &res); err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Events) != 1 {
-		t.Fatalf("expected the one seeded event from the real index, got %d: %s", len(res.Events), body)
-	}
-	found := false
-	for _, n := range res.Notes {
-		if strings.Contains(n, "could not be reached") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("Notes should record the unreachable source, got: %v", res.Notes)
 	}
 }
 
@@ -317,7 +204,7 @@ func TestIntegrationRecoverPGDialect(t *testing.T) {
 // TestIntegrationCapabilitiesSourcePostgres proves /api/capabilities reports the
 // source family per-server from stream_state.flavor (#595). The shared console
 // reads only the index, so this is the signal the frontend uses to present PG
-// vocabulary (LSN vs binlog file/pos/GTID) and the forensics-degraded note —
+// vocabulary (LSN vs binlog file/pos/GTID) and the connection-id availability note —
 // without ever probing the source database. A fresh/legacy index (no flavor row)
 // reads as "mysql" (the safe default); a PG-flavored index as "postgresql".
 func TestIntegrationCapabilitiesSourcePostgres(t *testing.T) {
