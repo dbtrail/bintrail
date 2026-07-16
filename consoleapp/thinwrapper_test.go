@@ -23,14 +23,27 @@ func TestConsoleBinaryIsThinWrapper(t *testing.T) {
 		t.Fatalf("go list -json: %v\n%s", err, out)
 	}
 	var pkg struct {
-		GoFiles []string
-		Imports []string
+		GoFiles        []string
+		CgoFiles       []string
+		IgnoredGoFiles []string
+		Imports        []string
 	}
 	if err := json.Unmarshal(out, &pkg); err != nil {
 		t.Fatalf("decoding go list -json output: %v", err)
 	}
 	if !slices.Equal(pkg.GoFiles, []string{"main.go"}) {
 		t.Errorf("cmd/bintrail-console compiles %v — the wrapper must stay exactly [main.go]; new command code belongs in consoleapp", pkg.GoFiles)
+	}
+	// GoFiles alone is blind to files the current build context excludes:
+	// go list reports cgo files under CgoFiles and build-constrained files
+	// (e.g. //go:build windows glue) under IgnoredGoFiles. Either would ship
+	// command logic in some build of the binary without ever appearing in
+	// GoFiles on the platform running this test.
+	if len(pkg.CgoFiles) != 0 {
+		t.Errorf("cmd/bintrail-console has cgo files %v — the wrapper must stay exactly [main.go]; new command code belongs in consoleapp", pkg.CgoFiles)
+	}
+	if len(pkg.IgnoredGoFiles) != 0 {
+		t.Errorf("cmd/bintrail-console has build-constrained files %v excluded on this platform — the wrapper must stay exactly [main.go] on every platform; new command code belongs in consoleapp", pkg.IgnoredGoFiles)
 	}
 	const seam = "github.com/dbtrail/dbtrail/consoleapp"
 	if !slices.Contains(pkg.Imports, seam) {
