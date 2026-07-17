@@ -57,6 +57,11 @@ func TestSourceStreamConfig(t *testing.T) {
 		def.ServerID != 42 || def.Schemas != "shop" || def.BatchSize != 1000 || def.Checkpoint != 10 || def.GapTimeout != 30 {
 		t.Errorf("base fields wrong: %+v", def)
 	}
+	// No Flavor on the entry resolves to "mysql" — the stream must run with the
+	// explicit flavor, not the empty string streamrun would silently normalize.
+	if def.Flavor != console.FlavorMySQL {
+		t.Errorf("Flavor = %q, want mysql (unset default)", def.Flavor)
+	}
 	if def.Deps.ValidateBinlogFormat == nil {
 		t.Error("Deps must be wired (streamdeps.Default())")
 	}
@@ -68,6 +73,15 @@ func TestSourceStreamConfig(t *testing.T) {
 	}, 7)
 	if got.SSLMode != "verify-ca" || got.SSLCA != "/ca.pem" || got.SSLCert != "/cert.pem" || got.SSLKey != "/key.pem" {
 		t.Errorf("registry TLS did not propagate to the stream config: %+v", got)
+	}
+
+	// A MariaDB entry must run the stream with the MariaDB flavor, not the MySQL
+	// GTID parser — the stream Flavor and the ext source job's flavor must agree.
+	maria := sourceStreamConfig(console.ServerEntry{
+		ID: "e3", DSN: "idx-dsn", SourceDSN: "src-dsn", Flavor: console.FlavorMariaDB,
+	}, 9)
+	if maria.Flavor != console.FlavorMariaDB {
+		t.Errorf("Flavor = %q, want mariadb", maria.Flavor)
 	}
 }
 

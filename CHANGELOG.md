@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Extension source jobs (`ext.RunSourceJobs`) now run under `bintrail-console watch` and its per-source monitor supervisor**, not only under `bintrail up`. A registered `ext.RegisterSourceJob` now fires for `watch`'s main `--source-dsn` stream and for every source the console control plane starts monitoring, each bound to that source's lifecycle context — so a job stops when its source stops (a monitored source's Stop, or daemon shutdown), and starts once per (re)start, never per stream reconnect. No behavior change for the stock binary: `RunSourceJobs` is a no-op with no registered jobs.
+- **Extension source jobs (`ext.RunSourceJobs`) now run under `bintrail-console watch` and its per-source monitor supervisor**, not only under `bintrail up`. A registered `ext.RegisterSourceJob` now fires for `watch`'s main `--source-dsn` stream and for every source the console control plane starts monitoring, each bound to that source's lifecycle context — so a job stops when its source stops (a monitored source's Stop, daemon shutdown, or the supervised stream's own terminal exit) and starts once per (re)start, never per stream reconnect. The monitor binds the job's lifetime to the source's advisory lock: when a stream gives up or exits, its jobs are cancelled together with the lock's release, so a second daemon that re-acquires the freed lock never double-runs them. A console-monitored MariaDB source now also captures with the MariaDB GTID parser and reports the matching flavor to its source jobs. No behavior change for the stock binary: `RunSourceJobs` is a no-op with no registered jobs.
 
 ## [0.37.0] - 2026-07-17
 

@@ -438,11 +438,14 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 
 	// Extension source jobs (ext.RegisterSourceJob) run alongside the supervised
 	// stream, bound to jobCtx — the per-source lifecycle context, created once per
-	// (re)start and cancelled on Stop or daemon shutdown. Placing this here (after
-	// index-DB provisioning and the advisory lock, before the stream goroutine)
-	// ties one set of jobs to each monitored source's lifetime: not per
-	// stream-reconnect (m.run reuses jobCtx, so no per-retry goroutine leak), and
-	// only for a source this daemon actually streams (the advisory lock holder).
+	// (re)start and cancelled on Stop, daemon shutdown, OR the supervised stream's
+	// own terminal exit (crash-loop give-up / clean return — m.run defers
+	// job.cancel(), see run). Placing this here (after index-DB provisioning and
+	// the advisory lock, before the stream goroutine) ties one set of jobs to each
+	// monitored source's lifetime: not per stream-reconnect (m.run reuses jobCtx,
+	// so no per-retry goroutine leak), and only for a source this daemon actually
+	// streams (the advisory lock holder) — jobCtx dies with the lock, so a second
+	// daemon that re-acquires the freed lock never double-runs these jobs.
 	// No-op in the stock binary.
 	ext.RunSourceJobs(jobCtx, ext.SourceJobInfo{SourceDSN: e.SourceDSN, IndexDSN: e.DSN, Flavor: flavor})
 
@@ -502,8 +505,13 @@ func sourcePGStreamConfig(e console.ServerEntry, serverID uint32) (pgstreamrun.C
 // registry entry (Hooks are attached by the caller — they need the live job).
 // The source connection's TLS comes from the entry's ssl_* fields (#879): an
 // empty SSLMode defaults to "preferred", preserving pre-#879 behavior for
-// entries with no TLS configured. Pure — extracted from Start so the
-// entry→config fan-out (SSL especially) is unit-testable without a live DB.
+// entries with no TLS configured. Flavor is the entry's resolved source flavor
+// ("mysql"/"mariadb" — this builder is only reached in the non-postgres branch):
+// without it the stream normalized an empty Flavor to "mysql", so a console-
+// monitored MariaDB source was captured with the MySQL GTID parser AND the ext
+// source job was told a flavor the pipeline did not actually run with. Pure —
+// extracted from Start so the entry→config fan-out (SSL especially) is
+// unit-testable without a live DB.
 func sourceStreamConfig(e console.ServerEntry, serverID uint32) streamrun.Config {
 	sslMode := e.SSLMode
 	if sslMode == "" {
@@ -513,6 +521,7 @@ func sourceStreamConfig(e console.ServerEntry, serverID uint32) streamrun.Config
 		IndexDSN:  e.DSN,
 		SourceDSN: e.SourceDSN,
 		ServerID:  serverID,
+		Flavor:    e.SourceFlavor(),
 		BatchSize: 1000,
 		Schemas:   e.Schemas,
 		// MetricsSource keys this stream's Prometheus series; MetricsAddr
@@ -539,6 +548,14 @@ func sourceStreamConfig(e console.ServerEntry, serverID uint32) streamrun.Config
 // breaker: permanent "failed", no more retries, advisory lock released —
 // Start (or a daemon restart) re-arms it. Cancellation (stop verb / daemon
 // shutdown) exits cleanly.
+//
+// Terminal exit (give-up or clean return) also cancels jobCtx via the
+// defer below, tearing down the ext source jobs launched on it in Start.
+// This keeps the job's lifetime bound to the advisory lock's: the deferred
+// lock release and the job cancellation fire together, so a source this
+// daemon stops streaming can never leave its source jobs running past the
+// lock — otherwise a second daemon that re-acquires the freed lock would
+// double-run them.
 func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.ServerEntry, flavor string, runOnce func(context.Context) error) {
 	defer m.wg.Done()
 	defer close(job.done)
@@ -547,6 +564,12 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 			job.lockDB.Close() // releases the advisory lock
 		}
 	}()
+	// Cancel jobCtx on every terminal return (give-up, clean exit, cancellation).
+	// Declared last so it runs first under LIFO — the ext source jobs stop before
+	// the advisory lock is released above. A no-op when jobCtx is already
+	// cancelled (Stop/Shutdown/daemon-cancel paths). Reconnects stay inside the
+	// for-loop below, so this never fires mid-retry.
+	defer job.cancel()
 
 	attempt := 0
 	var crashLoopSince time.Time // first failure of the current loop; zero = healthy

@@ -131,6 +131,77 @@ func TestIntegrationMonitorRunsExtSourceJob(t *testing.T) {
 	}
 }
 
+// TestIntegrationMonitorExtSourceJobTornDownOnStreamExit is the terminal-exit
+// half of THE LEAK CONTRACT that the Stop path above does NOT cover: when the
+// supervised stream ends on its own — here a clean return; the crash-loop
+// give-up shares the identical terminal path in run — the ext source job's
+// bound context must become Done with NO Stop call. run defers job.cancel(), so
+// jobCtx dies together with the advisory lock the deferred lockDB.Close()
+// releases. Without that defer the stream could exit and free the lock while the
+// source job kept running, and a second daemon re-acquiring the freed lock would
+// double-run it. The outer daemon ctx stays live throughout, so a Done here can
+// only come from the per-source cancel, not daemon teardown.
+func TestIntegrationMonitorExtSourceJobTornDownOnStreamExit(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, bootName := testutil.CreateTestDB(t)
+	bootDSN := testutil.IntegrationDSN(bootName)
+
+	sup := newMonitorSupervisor(ctx, bootDSN, nil, 0)
+	// A stream that returns nil immediately: run takes the clean-return terminal
+	// branch (err == nil) and, with the fix, cancels jobCtx via its defer.
+	sup.streamFn = func(_ context.Context, _ streamrun.Config) error { return nil }
+
+	sentinel := fmt.Sprintf("extjobexit%d", time.Now().UnixNano()%1e9)
+	infoCh, ctxCh := probeSourceJob(t, sentinel)
+
+	entry := console.ServerEntry{
+		ID:        sentinel,
+		Name:      "ext-source-job-exit",
+		SourceDSN: testutil.BaseDSN() + "/",
+	}
+	derived, err := sup.DeriveIndexDSN(entry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.DSN = derived
+	t.Cleanup(func() {
+		if db, err := sql.Open("mysql", bootDSN); err == nil {
+			_, _ = db.Exec("DROP DATABASE IF EXISTS bintrail_idx_" + entry.ID)
+			_ = db.Close()
+		}
+	})
+
+	if err := sup.Start(ctx, entry); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop(context.Background(), entry.ID) })
+
+	// The job fires once (RunSourceJobs is called once per Start, not per stream
+	// attempt). Capture its bound context — even if the stream already returned
+	// and cancelled jobCtx, the job still fired (RunSourceJobs launches
+	// unconditionally) and a cancelled context read here still reports Done.
+	var jobCtx context.Context
+	select {
+	case <-infoCh:
+		jobCtx = <-ctxCh
+	case <-time.After(15 * time.Second):
+		t.Fatal("ext source job never fired for the started source")
+	}
+
+	// THE CONTRACT: the stream exited on its own and no Stop was called, yet the
+	// job's bound context must be Done. The daemon ctx is still live, so this is
+	// the per-source cancel firing with the released advisory lock — not a leak.
+	select {
+	case <-jobCtx.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("source job context still live after the stream exited on its own — job outlived the released advisory lock (leak)")
+	}
+}
+
 // TestIntegrationMonitorExtSourceJobPGFlavor proves a PostgreSQL source carries
 // Flavor="postgres" into the ext source job. The PG stream is stubbed (no
 // reachable PostgreSQL needed); provisioning still runs against the real MySQL
