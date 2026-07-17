@@ -450,7 +450,14 @@ func (s *Server) buildHandler() http.Handler {
 		}
 	}
 	root.Handle("/api/", s.tokenMiddleware(api)) // credential on all other /api/*
-	root.Handle("/", assetHandler())             // static shell + assets
+	// MCP endpoint (#1039): the four read-only tools over Streamable HTTP,
+	// static-token-authenticated, routed per server by URL path. Carries its
+	// own auth check (token-only — see mcp.go) instead of tokenMiddleware,
+	// and sits on root so it inherits hostGuard + securityHeaders.
+	mcpH := s.mcpHandler()
+	root.Handle("/mcp", mcpH)
+	root.Handle("/mcp/{server}", mcpH)
+	root.Handle("/", assetHandler()) // static shell + assets
 
 	return s.hostGuard(securityHeaders(root))
 }

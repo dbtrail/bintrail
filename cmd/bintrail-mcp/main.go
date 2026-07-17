@@ -20,10 +20,14 @@
 //
 //	Set BINTRAIL_INDEX_DSN to the MySQL DSN for the index database,
 //	or pass index_dsn as a parameter on each tool call.
+//
+// The tool implementations live in internal/mcptools, shared with the
+// console's /mcp endpoint; this binary binds them to the standalone posture
+// (per-call DSN resolution, fresh connection per call, env-var archive
+// discovery, per-call profile parameter).
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -34,24 +38,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
-	"time"
 
-	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/dbtrail/dbtrail/ext"
-	"github.com/dbtrail/dbtrail/internal/cliutil"
-	"github.com/dbtrail/dbtrail/internal/config"
-	"github.com/dbtrail/dbtrail/internal/indexer"
-	"github.com/dbtrail/dbtrail/internal/metadata"
-	"github.com/dbtrail/dbtrail/internal/parquetquery"
+	"github.com/dbtrail/dbtrail/internal/mcptools"
 	"github.com/dbtrail/dbtrail/internal/query"
-	"github.com/dbtrail/dbtrail/internal/recovery"
-	"github.com/dbtrail/dbtrail/internal/status"
 )
 
 // mcpVersion is injected at build time via -ldflags.
@@ -70,15 +63,6 @@ func newServer() *mcp.Server {
 // variable and tool-level index_dsn parameter. This is used in multi-tenant
 // mode where the gateway resolves the DSN from the X-Bintrail-Tenant header.
 func newServerWithDSN(dsnOverride string) *mcp.Server {
-	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "bintrail",
-		Version: mcpVersion,
-	}, &mcp.ServerOptions{
-		Instructions: "Bintrail MCP server for querying indexed MySQL binlog events, " +
-			"generating recovery SQL, and viewing index status. " +
-			"Set BINTRAIL_INDEX_DSN environment variable or pass index_dsn on each tool call.",
-	})
-
 	// resolveFn picks the DSN: forced override > tool arg > env var.
 	resolveFn := func(argDSN string) (string, error) {
 		if dsnOverride != "" {
@@ -86,64 +70,21 @@ func newServerWithDSN(dsnOverride string) *mcp.Server {
 		}
 		return resolveDSN(argDSN)
 	}
-	connectFn := func(argDSN string) (*sql.DB, error) {
-		dsn, err := resolveFn(argDSN)
-		if err != nil {
-			return nil, err
-		}
-		return config.Connect(dsn)
+	return mcptools.NewServer(standaloneConfig(mcptools.DSNTarget(resolveFn)))
+}
+
+// standaloneConfig is the standalone-server tool posture: DSN and profile
+// parameters accepted, env-tunable query ceiling, uncapped recover limit.
+func standaloneConfig(resolve mcptools.ResolveTarget) mcptools.Config {
+	return mcptools.Config{
+		Version: mcpVersion,
+		Instructions: "Bintrail MCP server for querying indexed MySQL binlog events, " +
+			"generating recovery SQL, and viewing index status. " +
+			"Set BINTRAIL_INDEX_DSN environment variable or pass index_dsn on each tool call.",
+		Resolve:           resolve,
+		AllowDSNParam:     true,
+		AllowProfileParam: true,
 	}
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "query",
-		Description: "Search indexed MySQL binlog events with filters. " +
-			"Returns matching events showing row changes (before/after images), timestamps, and metadata. " +
-			"Use json format for full row data or table format for a human-readable summary.",
-		Annotations: &mcp.ToolAnnotations{
-			Title:          "Search binlog events",
-			ReadOnlyHint:   true,
-			IdempotentHint: true,
-		},
-	}, makeQueryTool(connectFn))
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "recover",
-		Description: "Generate reversal SQL to undo matching binlog events (dry-run only). " +
-			"Produces a BEGIN/COMMIT-wrapped SQL script that reverses events in reverse chronological order (most recent first): " +
-			"DELETE->INSERT, UPDATE->reverse UPDATE, INSERT->DELETE. " +
-			"Review carefully before applying to production.",
-		Annotations: &mcp.ToolAnnotations{
-			Title:          "Generate recovery SQL",
-			ReadOnlyHint:   true,
-			IdempotentHint: true,
-		},
-	}, makeRecoverTool(connectFn))
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "status",
-		Description: "Show the current state of the binlog index: " +
-			"which files have been indexed, partition layout with estimated row counts, " +
-			"and aggregate summary of indexed events.",
-		Annotations: &mcp.ToolAnnotations{
-			Title:          "Index status",
-			ReadOnlyHint:   true,
-			IdempotentHint: true,
-		},
-	}, makeStatusTool(resolveFn))
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "list_schema_changes",
-		Description: "List DDL schema changes (CREATE, ALTER, DROP, RENAME, TRUNCATE) " +
-			"recorded during binlog indexing or streaming. " +
-			"Returns the full DDL statement, binlog coordinates, and timestamp for each change.",
-		Annotations: &mcp.ToolAnnotations{
-			Title:          "List schema changes",
-			ReadOnlyHint:   true,
-			IdempotentHint: true,
-		},
-	}, makeSchemaChangesTool(connectFn))
-
-	return server
 }
 
 func main() {
@@ -262,56 +203,19 @@ func isClientDisconnect(err error) bool {
 	return errors.As(err, &wireErr) && wireErr.Code == errCodeServerClosing
 }
 
-// ─── Tool argument types ─────────────────────────────────────────────────────
+// ─── Compatibility shims over internal/mcptools ──────────────────────────────
+//
+// The tool argument types, handler factories, and helpers moved to
+// internal/mcptools (shared with the console's /mcp endpoint). The aliases
+// below keep this package's historical surface — exercised extensively by its
+// tests — identical, and pin the standalone posture the adapters bake in.
 
-type queryArgs struct {
-	IndexDSN      string   `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
-	Schema        string   `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
-	Table         string   `json:"table,omitempty" jsonschema:"Filter by table name"`
-	PK            string   `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys e.g. 123 or 123|2)"`
-	EventType     string   `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
-	GTID          string   `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
-	Since         string   `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	Until         string   `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	ChangedColumn string   `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
-	ColumnEq      []string `json:"column_eq,omitempty" jsonschema:"Filter events where a column in row_after or row_before equals the given value. Each entry is column=value. Repeat for AND. Literal NULL matches JSON null."`
-	Flag          string   `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
-	Format        string   `json:"format,omitempty" jsonschema:"Output format: json table or csv (default: json)"`
-	Limit         int      `json:"limit,omitempty" jsonschema:"Maximum number of events to return (default: 100)"`
-	Profile       string   `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
-	NoArchive     bool     `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
-}
-
-type recoverArgs struct {
-	IndexDSN      string   `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
-	Schema        string   `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
-	Table         string   `json:"table,omitempty" jsonschema:"Filter by table name"`
-	PK            string   `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys)"`
-	EventType     string   `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
-	GTID          string   `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
-	Since         string   `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	Until         string   `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	ChangedColumn string   `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
-	ColumnEq      []string `json:"column_eq,omitempty" jsonschema:"Filter events where a column in row_after or row_before equals the given value. Each entry is column=value. Repeat for AND. Literal NULL matches JSON null."`
-	Flag          string   `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
-	Limit         int      `json:"limit,omitempty" jsonschema:"Maximum number of events to reverse (default: 1000)"`
-	Profile       string   `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
-	NoArchive     bool     `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
-}
-
-type statusArgs struct {
-	IndexDSN string `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
-}
-
-type schemaChangesArgs struct {
-	IndexDSN string `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var."`
-	Schema   string `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
-	Table    string `json:"table,omitempty" jsonschema:"Filter by table name"`
-	DDLType  string `json:"ddl_type,omitempty" jsonschema:"Filter by DDL type: CREATE ALTER DROP RENAME or TRUNCATE"`
-	Since    string `json:"since,omitempty" jsonschema:"Filter changes at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	Until    string `json:"until,omitempty" jsonschema:"Filter changes at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	Limit    int    `json:"limit,omitempty" jsonschema:"Maximum number of changes to return (default: 100)"`
-}
+type (
+	queryArgs         = mcptools.QueryArgs
+	recoverArgs       = mcptools.RecoverArgs
+	statusArgs        = mcptools.StatusArgs
+	schemaChangesArgs = mcptools.SchemaChangesArgs
+)
 
 // connectFunc abstracts DSN resolution and DB connection for tool handlers.
 type connectFunc func(argDSN string) (*sql.DB, error)
@@ -319,413 +223,39 @@ type connectFunc func(argDSN string) (*sql.DB, error)
 // resolveFunc abstracts DSN resolution for handlers that need the raw DSN.
 type resolveFunc func(argDSN string) (string, error)
 
-// ─── Tool handler factories ──────────────────────────────────────────────────
-//
-// Each factory returns a closure that captures the DSN resolution function.
-// In single-tenant mode, the resolution falls through to the env var.
-// In multi-tenant mode, the DSN override is baked in at server creation time.
+// targetFromConnect adapts a connectFunc into the mcptools resolution seam
+// with the standalone posture: the call owns (and closes) the connection,
+// runs the idempotent schema migration, and consults the archive env vars.
+func targetFromConnect(connect connectFunc) mcptools.ResolveTarget {
+	return func(ctx context.Context, argDSN string) (*mcptools.Target, error) {
+		db, err := connect(argDSN)
+		if err != nil {
+			return nil, err
+		}
+		return &mcptools.Target{
+			DB:                  db,
+			CloseDB:             true,
+			EnsureSchema:        true,
+			EnvArchiveDiscovery: true,
+		}, nil
+	}
+}
 
 func makeQueryTool(connect connectFunc) func(context.Context, *mcp.CallToolRequest, queryArgs) (*mcp.CallToolResult, any, error) {
-	return func(ctx context.Context, req *mcp.CallToolRequest, args queryArgs) (*mcp.CallToolResult, any, error) {
-		db, err := connect(args.IndexDSN)
-		if err != nil {
-			return errorResult(err), nil, nil
-		}
-		defer db.Close()
-
-		// Same idempotent migration as the recover tool below: the query
-		// engine SELECTs post-initial-schema binlog_events columns
-		// (query_text/query_hash, #699) and the MCP server opens a fresh DB
-		// per tool call, so the migration has to run here.
-		if err := indexer.EnsureSchema(db); err != nil {
-			return errorResult(indexer.WrapSchemaMigrationErr(err)), nil, nil
-		}
-
-		opts, err := buildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
-			args.GTID, args.Since, args.Until, args.ChangedColumn, args.ColumnEq, args.Flag, args.Limit, 100)
-		if err != nil {
-			return errorResult(err), nil, nil
-		}
-
-		// Hard ceiling on an explicit, oversized limit (#654). buildQueryOptions
-		// already coerces limit<=0 to the default, so this only bounds a large
-		// EXPLICIT value an agent might pass. It is applied here, per-tool, on the
-		// local opts — NOT in the shared buildQueryOptions, because the recover
-		// tool must refuse on size, not silently cap a read.
-		ceiling := mcpQueryMaxLimit()
-		requestedLimit := opts.Limit
-		ceilingApplied := false
-		if c, did := applyQueryCeiling(opts.Limit, ceiling); did {
-			opts.Limit = c
-			ceilingApplied = true
-		}
-
-		if args.Profile != "" {
-			denyTables, redactCols, err := query.LoadProfileRules(ctx, db, args.Profile)
-			if err != nil {
-				return errorResult(fmt.Errorf("load profile rules: %w", err)), nil, nil
-			}
-			opts.DenyTables = denyTables
-			opts.RedactColumns = redactCols
-			opts.ProfileActive = true
-		}
-
-		format := args.Format
-		if format == "" {
-			format = "json"
-		}
-		if !cliutil.IsValidFormat(format) {
-			return errorResult(fmt.Errorf("invalid format %q; must be json, table, or csv", format)), nil, nil
-		}
-
-		engine := query.New(db)
-
-		// Skip archive auto-discovery when --no-archive is set or when RBAC
-		// profile is active (archive queries do not enforce rules).
-		var archSources []string
-		if !args.NoArchive && args.Profile == "" {
-			archSources = resolveArchiveSources(ctx, db)
-		}
-
-		var buf bytes.Buffer
-		var n int
-
-		if len(archSources) == 0 {
-			// Fast path: no archives, fetch and format in one step.
-			n, err = engine.Run(ctx, opts, format, &buf)
-			if err != nil {
-				return errorResult(err), nil, nil
-			}
-		} else {
-			// Fetch from live index + archives, merge, then format.
-			fetchOpts := opts
-			results, err := engine.Fetch(ctx, fetchOpts)
-			if err != nil {
-				return errorResult(err), nil, nil
-			}
-			for _, src := range archSources {
-				ar, err := parquetquery.Fetch(ctx, fetchOpts, src)
-				if err != nil {
-					slog.Warn("archive query failed, skipping", "source", src, "error", err)
-					continue
-				}
-				results = append(results, ar...)
-			}
-			results = query.MergeResults(results, opts.Limit, opts.Order)
-			n, err = query.Format(results, format, &buf)
-			if err != nil {
-				return errorResult(err), nil, nil
-			}
-		}
-
-		text := buf.String()
-		if n > 0 && format != "json" {
-			text += fmt.Sprintf("\n%d row(s)\n", n)
-		}
-		text += queryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit)
-
-		ext.Record(ctx, ext.AuditEvent{
-			Surface: "mcp",
-			Action:  "query.run",
-			Actor:   ext.ProcessActor(args.Profile),
-			Schema:  args.Schema,
-			Table:   args.Table,
-			Detail:  map[string]string{"results": strconv.Itoa(n), "format": format},
-		})
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: text},
-			},
-		}, nil, nil
-	}
+	return mcptools.MakeQueryTool(standaloneConfig(targetFromConnect(connect)))
 }
 
 func makeRecoverTool(connect connectFunc) func(context.Context, *mcp.CallToolRequest, recoverArgs) (*mcp.CallToolResult, any, error) {
-	return func(ctx context.Context, req *mcp.CallToolRequest, args recoverArgs) (*mcp.CallToolResult, any, error) {
-		db, err := connect(args.IndexDSN)
-		if err != nil {
-			return errorResult(err), nil, nil
-		}
-		defer db.Close()
-
-		// Run the idempotent schema migration before NewResolver. Since
-		// #212 NewResolver reads schema_snapshots.column_type and fails on
-		// pre-migration databases with Error 1054. Other long-running
-		// commands call EnsureSchema at startup; the MCP server opens a
-		// fresh DB per tool call, so the migration has to run here.
-		if err := indexer.EnsureSchema(db); err != nil {
-			return errorResult(indexer.WrapSchemaMigrationErr(err)), nil, nil
-		}
-
-		defaultLimit := 1000
-		opts, err := buildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
-			args.GTID, args.Since, args.Until, args.ChangedColumn, args.ColumnEq, args.Flag, args.Limit, defaultLimit)
-		if err != nil {
-			return errorResult(err), nil, nil
-		}
-		// When --limit truncates the matched window it must keep the most
-		// RECENT events (#785/#927): the ASC default would keep the OLDEST
-		// prefix, undoing old events underneath later un-reverted ones — a
-		// state that never historically existed. Rows are re-sorted ascending
-		// after the fetch, before generation (see below).
-		opts.Order = "DESC"
-
-		if args.Profile != "" {
-			denyTables, redactCols, err := query.LoadProfileRules(ctx, db, args.Profile)
-			if err != nil {
-				return errorResult(fmt.Errorf("load profile rules: %w", err)), nil, nil
-			}
-			opts.DenyTables = denyTables
-			opts.RedactColumns = redactCols
-			opts.ProfileActive = true
-		}
-
-		// Load schema resolver best-effort for PK-only WHERE clauses.
-		resolver, resolverErr := metadata.NewResolver(db, 0)
-		if resolverErr != nil {
-			resolver = nil
-		}
-
-		// Fetch events from live index + archives.
-		// Skip archive auto-discovery when --no-archive is set or when RBAC
-		// profile is active (archive queries do not enforce rules).
-		engine := query.New(db)
-		var archSources []string
-		if !args.NoArchive && args.Profile == "" {
-			archSources = resolveArchiveSources(ctx, db)
-		}
-
-		var rows []query.ResultRow
-		if len(archSources) > 0 {
-			fetchOpts := opts
-			rows, err = engine.Fetch(ctx, fetchOpts)
-			if err != nil {
-				return errorResult(err), nil, nil
-			}
-			for _, src := range archSources {
-				ar, err := parquetquery.Fetch(ctx, fetchOpts, src)
-				if err != nil {
-					slog.Warn("archive query failed, skipping", "source", src, "error", err)
-					continue
-				}
-				rows = append(rows, ar...)
-			}
-			rows = query.MergeResults(rows, opts.Limit, opts.Order)
-		} else {
-			rows, err = engine.Fetch(ctx, opts)
-			if err != nil {
-				return errorResult(err), nil, nil
-			}
-		}
-
-		// The fetch above ran Order=DESC so --limit kept the newest suffix of
-		// the window (#785/#927). Restore ascending order: GenerateSQLFromRows
-		// expects ASC input and reverses it internally to undo most-recent
-		// first.
-		rows = query.MergeResults(rows, 0, "ASC")
-
-		gen := recovery.NewForDialect(db, resolver, recovery.DialectForIndex(db))
-		var buf bytes.Buffer
-		n, err := gen.GenerateSQLFromRows(rows, &buf)
-		if err != nil {
-			return errorResult(err), nil, nil
-		}
-
-		text := buf.String()
-		if resolverErr != nil {
-			text += fmt.Sprintf("\n-- Note: schema snapshot unavailable (%v); WHERE clauses use all columns.\n", resolverErr)
-		}
-		if n > 0 {
-			text += fmt.Sprintf("\n-- %d reversal statement(s) generated.\n", n)
-		}
-		if n >= opts.Limit {
-			text += fmt.Sprintf("\n-- Warning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
-		}
-
-		ext.Record(ctx, ext.AuditEvent{
-			Surface: "mcp",
-			Action:  "recover.generate",
-			Actor:   ext.ProcessActor(args.Profile),
-			Schema:  args.Schema,
-			Table:   args.Table,
-			Detail: map[string]string{
-				"statements": strconv.Itoa(n),
-				"dry_run":    "true", // MCP recover always returns the script, never applies it
-				"gtid":       args.GTID,
-			},
-		})
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: text},
-			},
-		}, nil, nil
-	}
+	return mcptools.MakeRecoverTool(standaloneConfig(targetFromConnect(connect)))
 }
 
 func makeStatusTool(resolve resolveFunc) func(context.Context, *mcp.CallToolRequest, statusArgs) (*mcp.CallToolResult, any, error) {
-	return func(ctx context.Context, req *mcp.CallToolRequest, args statusArgs) (*mcp.CallToolResult, any, error) {
-		dsn, err := resolve(args.IndexDSN)
-		if err != nil {
-			return errorResult(err), nil, nil
-		}
-
-		cfg, err := mysqldriver.ParseDSN(dsn)
-		if err != nil {
-			return errorResult(fmt.Errorf("invalid DSN: %w", err)), nil, nil
-		}
-		dbName := cfg.DBName
-		if dbName == "" {
-			return errorResult(fmt.Errorf("DSN must include a database name")), nil, nil
-		}
-
-		db, err := config.Connect(dsn)
-		if err != nil {
-			return errorResult(fmt.Errorf("failed to connect: %w", err)), nil, nil
-		}
-		defer db.Close()
-
-		data, err := status.CollectStatus(ctx, db, dbName)
-		if err != nil {
-			return errorResult(err), nil, nil
-		}
-
-		var buf bytes.Buffer
-		data.Write(&buf)
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: buf.String()},
-			},
-		}, nil, nil
-	}
+	return mcptools.MakeStatusTool(standaloneConfig(mcptools.DSNTarget(resolve)))
 }
 
 func makeSchemaChangesTool(connect connectFunc) func(context.Context, *mcp.CallToolRequest, schemaChangesArgs) (*mcp.CallToolResult, any, error) {
-	return func(ctx context.Context, req *mcp.CallToolRequest, args schemaChangesArgs) (*mcp.CallToolResult, any, error) {
-		// Validate inputs before connecting.
-		sinceT, err := cliutil.ParseTime(args.Since)
-		if err != nil {
-			return errorResult(fmt.Errorf("invalid since: %w", err)), nil, nil
-		}
-		untilT, err := cliutil.ParseTime(args.Until)
-		if err != nil {
-			return errorResult(fmt.Errorf("invalid until: %w", err)), nil, nil
-		}
-
-		if args.DDLType != "" {
-			upper := strings.ToUpper(args.DDLType)
-			switch upper {
-			case "CREATE", "ALTER", "DROP", "RENAME", "TRUNCATE":
-				// valid
-			default:
-				return errorResult(fmt.Errorf("invalid ddl_type %q; must be CREATE, ALTER, DROP, RENAME, or TRUNCATE", args.DDLType)), nil, nil
-			}
-		}
-
-		limit := args.Limit
-		if limit <= 0 {
-			limit = 100
-		}
-
-		db, err := connect(args.IndexDSN)
-		if err != nil {
-			return errorResult(err), nil, nil
-		}
-		defer db.Close()
-
-		q := "SELECT id, detected_at, schema_name, table_name, ddl_type, ddl_query, binlog_file, binlog_pos, gtid FROM schema_changes WHERE 1=1"
-		var params []any
-
-		if args.Schema != "" {
-			q += " AND schema_name = ?"
-			params = append(params, args.Schema)
-		}
-		if args.Table != "" {
-			q += " AND table_name = ?"
-			params = append(params, args.Table)
-		}
-		if args.DDLType != "" {
-			// Match prefix: "ALTER" matches "ALTER TABLE", etc.
-			q += " AND ddl_type LIKE ?"
-			params = append(params, strings.ToUpper(args.DDLType)+"%")
-		}
-		if sinceT != nil {
-			q += " AND detected_at >= ?"
-			params = append(params, *sinceT)
-		}
-		if untilT != nil {
-			q += " AND detected_at <= ?"
-			params = append(params, *untilT)
-		}
-		q += " ORDER BY detected_at DESC LIMIT ?"
-		params = append(params, limit)
-
-		rows, err := db.QueryContext(ctx, q, params...)
-		if err != nil {
-			if strings.Contains(err.Error(), "doesn't exist") || strings.Contains(err.Error(), "1146") {
-				return errorResult(fmt.Errorf("schema_changes table not found; run `bintrail init` to create it")), nil, nil
-			}
-			return errorResult(fmt.Errorf("query schema_changes: %w", err)), nil, nil
-		}
-		defer rows.Close()
-
-		type schemaChange struct {
-			ID         int64  `json:"id"`
-			DetectedAt string `json:"detected_at"`
-			Schema     string `json:"schema_name"`
-			Table      string `json:"table_name"`
-			DDLType    string `json:"ddl_type"`
-			Statement  string `json:"statement"`
-			BinlogFile string `json:"binlog_file"`
-			BinlogPos  int64  `json:"binlog_pos"`
-			GTID       string `json:"gtid,omitempty"`
-		}
-
-		var results []schemaChange
-		for rows.Next() {
-			var sc schemaChange
-			var detectedAt time.Time
-			var gtid sql.NullString
-			if err := rows.Scan(&sc.ID, &detectedAt, &sc.Schema, &sc.Table, &sc.DDLType, &sc.Statement, &sc.BinlogFile, &sc.BinlogPos, &gtid); err != nil {
-				return errorResult(fmt.Errorf("scan: %w", err)), nil, nil
-			}
-			sc.DetectedAt = detectedAt.UTC().Format("2006-01-02 15:04:05")
-			if gtid.Valid {
-				sc.GTID = gtid.String
-			}
-			results = append(results, sc)
-		}
-		if err := rows.Err(); err != nil {
-			return errorResult(fmt.Errorf("rows iteration: %w", err)), nil, nil
-		}
-
-		out, err := json.MarshalIndent(results, "", "  ")
-		if err != nil {
-			return errorResult(fmt.Errorf("marshal: %w", err)), nil, nil
-		}
-
-		text := string(out)
-		n := len(results)
-		if n > 0 {
-			text += fmt.Sprintf("\n\n%d schema change(s)", n)
-		} else {
-			text = "No schema changes found."
-		}
-		if n >= limit {
-			text += fmt.Sprintf("\nWarning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.", limit)
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: text},
-			},
-		}, nil, nil
-	}
+	return mcptools.MakeSchemaChangesTool(standaloneConfig(targetFromConnect(connect)))
 }
-
-// ─── Shared helpers ──────────────────────────────────────────────────────────
 
 func resolveDSN(override string) (string, error) {
 	if override != "" {
@@ -738,130 +268,24 @@ func resolveDSN(override string) (string, error) {
 	return dsn, nil
 }
 
-func errorResult(err error) *mcp.CallToolResult {
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			&mcp.TextContent{Text: err.Error()},
-		},
-		IsError: true,
-	}
-}
+func errorResult(err error) *mcp.CallToolResult { return mcptools.ErrorResult(err) }
 
-// resolveArchiveSources returns Parquet archive source paths for use with
-// parquetquery.Fetch. It checks env vars BINTRAIL_ARCHIVE_S3 + BINTRAIL_ID
-// first (for explicit configuration — both must be set), then falls back to
-// auto-discovery from archive_state in the index database.
 func resolveArchiveSources(ctx context.Context, db *sql.DB) []string {
-	archiveS3 := os.Getenv("BINTRAIL_ARCHIVE_S3")
-	bintrailID := os.Getenv("BINTRAIL_ID")
-	if archiveS3 != "" && bintrailID != "" {
-		base := strings.TrimSuffix(archiveS3, "/") + "/bintrail_id=" + bintrailID
-		return []string{base}
-	}
-	if archiveS3 != "" || bintrailID != "" {
-		slog.Warn("partial archive env var config; both BINTRAIL_ARCHIVE_S3 and BINTRAIL_ID must be set",
-			"BINTRAIL_ARCHIVE_S3", archiveS3, "BINTRAIL_ID", bintrailID)
-	}
-
-	sources, err := query.ResolveArchiveSources(ctx, db)
-	if err != nil {
-		// The MCP tools are deliberately permissive (their own per-source
-		// fetch loops warn-and-continue too) — log and serve without
-		// archives rather than failing the tool call.
-		slog.Warn("archive auto-discovery failed; proceeding without archives", "error", err)
-		return nil
-	}
-	return sources
+	return mcptools.EnvArchiveSources(ctx, db)
 }
 
-// defaultMCPQueryMaxLimit is the hard row ceiling for the MCP query tool (#654):
-// a backstop against a pathological explicit limit OOMing the long-lived server.
-// ~1M rows is multiple GB worst-case at the project's per-row sizing — far above
-// any legitimate agent query, yet bounded. The unbounded escape hatch is the
-// `bintrail query` CLI, so this is deliberately not disengageable via env.
-const defaultMCPQueryMaxLimit = 1_000_000
+const defaultMCPQueryMaxLimit = mcptools.DefaultQueryMaxLimit
 
-// mcpQueryMaxLimit returns the MCP query-tool row ceiling. BINTRAIL_MCP_QUERY_MAX_LIMIT
-// raises or lowers it; an empty/invalid/<=0 value falls back to the default
-// rather than disabling the ceiling (the CLI is the unbounded path, not the
-// agent-facing tool).
-func mcpQueryMaxLimit() int {
-	if v := os.Getenv("BINTRAIL_MCP_QUERY_MAX_LIMIT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return defaultMCPQueryMaxLimit
-}
+func mcpQueryMaxLimit() int { return mcptools.EnvQueryMaxLimit() }
 
-// applyQueryCeiling caps limit to max, returning the (possibly capped) limit and
-// whether a cap was applied. max <= 0 disables capping.
 func applyQueryCeiling(limit, max int) (int, bool) {
-	if max > 0 && limit > max {
-		return max, true
-	}
-	return limit, false
+	return mcptools.ApplyQueryCeiling(limit, max)
 }
 
-// queryResultNotice composes the trailing warning appended to a query-tool
-// result. When the ceiling fired it SUPERSEDES the generic truncation notice —
-// telling an agent to "increase the limit" would be wrong, since the limit it
-// asked for is exactly the one that was capped (and after a cap n == limit makes
-// the generic arm true too, so order matters). Returns "" when no notice applies.
 func queryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit int) string {
-	switch {
-	case ceilingApplied:
-		return fmt.Sprintf("\nWarning: requested limit %d exceeds the MCP query ceiling of %d rows; capped to %d. "+
-			"Narrow your filters/time range, or run the `bintrail query` CLI for an unbounded export.\n", requestedLimit, ceiling, ceiling)
-	case n >= limit:
-		return fmt.Sprintf("\nWarning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", limit)
-	}
-	return ""
+	return mcptools.QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, limit)
 }
 
 func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol string, columnEq []string, flagVal string, limit, defaultLimit int) (query.Options, error) {
-	if pk != "" && (schema == "" || table == "") {
-		return query.Options{}, fmt.Errorf("pk requires both schema and table")
-	}
-	if changedCol != "" && (schema == "" || table == "") {
-		return query.Options{}, fmt.Errorf("changed_column requires both schema and table")
-	}
-	if len(columnEq) > 0 && (schema == "" || table == "") {
-		return query.Options{}, fmt.Errorf("column_eq requires both schema and table")
-	}
-
-	et, err := cliutil.ParseEventType(eventType)
-	if err != nil {
-		return query.Options{}, err
-	}
-	sinceT, err := cliutil.ParseTime(since)
-	if err != nil {
-		return query.Options{}, fmt.Errorf("invalid since: %w", err)
-	}
-	untilT, err := cliutil.ParseTime(until)
-	if err != nil {
-		return query.Options{}, fmt.Errorf("invalid until: %w", err)
-	}
-	parsedEq, err := query.ParseColumnEqs(columnEq)
-	if err != nil {
-		return query.Options{}, err
-	}
-
-	if limit <= 0 {
-		limit = defaultLimit
-	}
-
-	return query.Options{
-		Schema:        schema,
-		Table:         table,
-		PKValues:      pk,
-		EventType:     et,
-		GTID:          gtid,
-		Since:         sinceT,
-		Until:         untilT,
-		ChangedColumn: changedCol,
-		ColumnEq:      parsedEq,
-		Flag:          flagVal,
-		Limit:         limit,
-	}, nil
+	return mcptools.BuildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol, columnEq, flagVal, limit, defaultLimit)
 }

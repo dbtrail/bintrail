@@ -120,6 +120,11 @@ mobile; tokens refresh automatically.
 
 All four are read-only — annotated `ReadOnlyHint: true` and `IdempotentHint: true`,
 so the client knows they're safe to call repeatedly and never modify state.
+
+The same four tools are also served by the web console at `/mcp` (Streamable
+HTTP, console-token auth, per-server routing by URL path) — if you already run
+`bintrail-console`, you may not need this binary at all; see
+[console.md](console.md#mcp-endpoint).
 `list_schema_changes` accepts `schema`, `table`, `ddl_type`
 (`CREATE`/`ALTER`/`DROP`/`RENAME`/`TRUNCATE`, prefix-matched so `ALTER` matches
 `ALTER TABLE`), `since`, `until`, and `limit` (default 100); results come back

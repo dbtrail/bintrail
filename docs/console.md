@@ -631,6 +631,55 @@ per server as `source` in [`/api/capabilities`](#api), derived from
   **probe failing** with the reason rather than disappearing. For an on-demand,
   always-live check, use `bintrail-pg doctor`.
 
+## MCP endpoint
+
+The console serves the same four read-only MCP tools as
+[`bintrail-mcp`](mcp-server.md) — `query`, `recover`, `status`,
+`list_schema_changes` — over **Streamable HTTP**, on both `bintrail-console
+serve` and `bintrail-console watch`:
+
+| URL | Target |
+|---|---|
+| `/mcp` | The console's **default server** (same selection rules as the browser UI). |
+| `/mcp/{id-or-name}` | A named server from the registry (`default` = the command-line entry). Unknown → `404`. |
+
+MCP clients cannot reliably send custom headers, so the server choice lives in
+the URL path (mirroring how the [time-travel port](time-travel-sql.md) routes
+by username) instead of the `X-Bintrail-Server` header.
+
+Point any Streamable-HTTP-capable MCP client at it with the console token as a
+Bearer credential:
+
+```json
+{
+  "mcpServers": {
+    "bintrail-console": {
+      "type": "http",
+      "url": "http://127.0.0.1:8090/mcp",
+      "headers": { "Authorization": "Bearer <console token>" }
+    }
+  }
+}
+```
+
+Rules that differ from the standalone `bintrail-mcp` server:
+
+- **A static token is required.** Like the time-travel port, `/mcp` needs
+  `--token` / `BINTRAIL_CONSOLE_TOKEN`: password login is a browser credential
+  and cannot authenticate a headless MCP client. Without a configured token
+  the endpoint refuses every request with an actionable error.
+- **`index_dsn` and `profile` tool parameters are rejected.** Connections are
+  managed in the console (registry + path routing), and the RBAC posture is
+  fixed by the console process — an authenticated MCP client cannot point the
+  console at an arbitrary DSN or change redaction rules.
+- **The console's read boundary applies.** Result caps match the API (events
+  100 default / 1000 max, recover 1000 / 10000), each server's archive and
+  baseline posture is honored, and `query_text` / `query_hash` are withheld
+  from query results exactly as on the events API.
+
+The host-header allowlist (`--allowed-hosts`) covers `/mcp` like every other
+route.
+
 ## API
 
 All endpoints return JSON. `/api/*` (except `healthz`) require
