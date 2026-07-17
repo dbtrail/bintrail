@@ -80,11 +80,11 @@ type capabilitiesResponse struct {
 	VerifyLiveSource bool `json:"verify_live_source"`
 	// ExtensionViews lists console views contributed by an installed
 	// extension-view provider (an embedding distribution — a build that wraps the
-	// OSS core). Omitted in the stock binary (no provider) and whenever an RBAC
-	// profile is active (the provider's data routes are refused then, so the SPA
-	// must not advertise a nav item that would 403). The SPA reveals one nav item
-	// + route ("ext-<id>") per entry. Generic by construction — the core names no
-	// specific view.
+	// OSS core). Omitted in the stock binary (no provider) and whenever any named
+	// profile is active — even a zero-rule one (the provider's data routes are
+	// refused then via rbacViewGuard/profileActive, so the SPA must not advertise a
+	// nav item that would 403). The SPA reveals one nav item + route ("ext-<id>")
+	// per entry. Generic by construction — the core names no specific view.
 	ExtensionViews []extensionViewDTO `json:"extension_views,omitempty"`
 	Auth           authCapsInfo       `json:"auth"`
 	// Source names the selected server's source database family — "postgresql"
@@ -177,10 +177,12 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 	// Extension views (ext seam): advertise an installed provider's view so the
 	// SPA can reveal its nav item + route. Process-global, like Monitor. Suppressed
-	// under an active RBAC profile — the data routes are refused there (rbacViewGuard),
-	// so a nav item would only lead to a 403 — and for an invalid id, which
-	// buildHandler declined to mount (advertising it would 404 the data route).
-	if p := ext.ConsoleView(); p != nil && !s.rbacActive() && ext.ValidConsoleViewID(p.ID()) {
+	// under an active profile — keyed on s.profileActive (any named profile, even a
+	// zero-rule one) to match rbacViewGuard, which refuses the data routes there
+	// (advertising a nav item that only 403s would be a lie) — and for an invalid
+	// id, which buildHandler declined to mount (advertising it would 404 the data
+	// route).
+	if p := ext.ConsoleView(); p != nil && !s.profileActive && ext.ValidConsoleViewID(p.ID()) {
 		resp.ExtensionViews = []extensionViewDTO{{ID: p.ID(), Label: p.Label(), Script: p.Script()}}
 	}
 	writeJSON(w, http.StatusOK, resp)

@@ -2422,8 +2422,8 @@ async function gateCapabilities() {
   if (gen !== serverGen) return;
   capsCache = caps || {};
   // Extension views advertised for this server (embedding builds; empty in the
-  // stock binary and under an active RBAC profile). Rebuild the nav before the
-  // route renders so a deep-linked ext route resolves.
+  // stock binary and under any active profile — the backend omits them there).
+  // Rebuild the nav before the route renders so a deep-linked ext route resolves.
   extViews = Array.isArray(capsCache.extension_views) ? capsCache.extension_views : [];
   syncExtNav();
   $all("[data-capability]").forEach((node) => node.classList.toggle("cap-on", !!capsCache[node.dataset.capability]));

@@ -54,9 +54,12 @@ func (p *stubViewProvider) DataHandler(_ string, resolve ext.ConsoleQueryContext
 }
 
 // newViewServer installs p (may be nil) and builds a token-authenticated server
-// whose boot bundle wraps a sqlmock DB. deny drives the RBAC profile: a non-empty
-// slice makes rbacActive() true.
-func newViewServer(t *testing.T, p ext.ConsoleViewProvider, deny []query.SchemaTable) *Server {
+// whose boot bundle wraps a sqlmock DB. deny drives the RBAC rules: a non-empty
+// slice makes rbacActive() true. profileActiveOverride, when supplied, forces
+// s.profileActive independently of the rule count — the only way to express the
+// NAMED-but-zero-rule profile (#838 `--profile <typo>`) where profileActive is
+// true but rbacActive() is false; otherwise profileActive derives from deny.
+func newViewServer(t *testing.T, p ext.ConsoleViewProvider, deny []query.SchemaTable, profileActiveOverride ...bool) *Server {
 	t.Helper()
 	ext.SetConsoleView(p)
 	t.Cleanup(func() { ext.SetConsoleView(nil) })
@@ -65,6 +68,9 @@ func newViewServer(t *testing.T, p ext.ConsoleViewProvider, deny []query.SchemaT
 	t.Cleanup(closer)
 
 	profileActive := len(deny) > 0
+	if len(profileActiveOverride) > 0 {
+		profileActive = profileActiveOverride[0]
+	}
 	s := &Server{token: "t", denyTables: deny, profileActive: profileActive, cm: newConnManager(nil, profileActive)}
 	s.cm.boot = &bundle{db: db, engine: query.New(db), noArchive: true}
 	s.mux = s.buildHandler()
@@ -150,6 +156,34 @@ func TestExtensionViewDataHandlerRefusedUnderRBAC(t *testing.T) {
 	caps := capsJSON(t, s)
 	if _, ok := caps["extension_views"]; ok {
 		t.Errorf("capabilities advertises extension_views under an active RBAC profile: %v", caps)
+	}
+}
+
+// (c2) a NAMED but ZERO-RULE profile (profileActive true, no deny/redact rules —
+// the #838 `--profile <typo>` / empty-profile state) must ALSO refuse the data
+// route and omit the view from capabilities. rbacActive() is false here, so a
+// guard keyed on rule count would serve the surface and let a provider read
+// query_text/query_hash straight off the raw cqc.DB — precisely what a named
+// profile withholds on /api/events. The guard therefore keys on profileActive.
+func TestExtensionViewDataHandlerRefusedUnderZeroRuleProfile(t *testing.T) {
+	hit := false
+	// deny is nil (rbacActive()==false) but the profile NAME is active.
+	s := newViewServer(t, &stubViewProvider{id: "example", dataHit: &hit}, nil, true)
+	if s.rbacActive() {
+		t.Fatal("test precondition broken: rbacActive() must be false under a zero-rule profile")
+	}
+
+	rec := getPath(t, s, "127.0.0.1:8090", "/api/ext/example/ping", "t")
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("data route under a zero-rule named profile = %d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+	if hit {
+		t.Error("provider data handler ran under a zero-rule named profile — rbacViewGuard must refuse on profileActive, not rbacActive()")
+	}
+	// And capabilities must not advertise the view under a named profile either.
+	caps := capsJSON(t, s)
+	if _, ok := caps["extension_views"]; ok {
+		t.Errorf("capabilities advertises extension_views under a zero-rule named profile: %v", caps)
 	}
 }
 

@@ -322,6 +322,28 @@ try {
       { type: "text/javascript" },
     ));
 
+    // 0) Exercise gateCapabilities END-TO-END: the manual steps below fixture-drive
+    //    capsCache/extViews directly, which BYPASSES the one real backend→frontend
+    //    wiring line (extViews = capsCache.extension_views inside gateCapabilities).
+    //    Stub /api/capabilities so it advertises an extension view, call the real
+    //    gateCapabilities(), and assert extViews + the nav were populated FROM the
+    //    parsed response — so a one-sided read of a different property (or a rename)
+    //    fails a test instead of silently disabling the feature.
+    const realFetch = window.fetch;
+    window.fetch = (path, opts) => {
+      if (typeof path === "string" && path.startsWith("/api/capabilities")) {
+        return Promise.resolve(new Response(
+          JSON.stringify({ monitor: true, extension_views: [{ id: "gated", label: "Gated View", script: modURL("__extgate") }] }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ));
+      }
+      return realFetch(path, opts);
+    };
+    await gateCapabilities();
+    window.fetch = realFetch;
+    const gatedFromCaps = extViews.length === 1 && extViews[0].id === "gated";
+    const gatedNav = !!document.querySelector('.nav-item[data-route="ext-gated"]');
+
     // 1) Advertise one view and sync the nav (mirrors gateCapabilities).
     const script = modURL("__ext1");
     capsCache = { ...capsCache, extension_views: [{ id: "demo", label: "Demo View", script }] };
@@ -359,10 +381,15 @@ try {
     await p;
     const staleAborted = window.__ext2 === undefined;
 
-    // Leave the UI on a known-good route for the final no-errors assertion.
+    // Restore the console's REAL capabilities (the stock binary ships no provider,
+    // so this clears the stubbed ext nav) and leave the UI on a known-good route
+    // for the final no-errors assertion.
+    await gateCapabilities();
     navigate("overview");
-    return { navText, known, onRoute, mounted: !!mount, mountedText, rendered, navActive, navGone, redirected, staleAborted };
+    return { gatedFromCaps, gatedNav, navText, known, onRoute, mounted: !!mount, mountedText, rendered, navActive, navGone, redirected, staleAborted };
   });
+  extv.gatedFromCaps ? ok("ext-view: gateCapabilities populates extViews from /api/capabilities.extension_views") : bad("ext-view: gateCapabilities populates extViews from /api/capabilities.extension_views", "extViews not set from the parsed caps response");
+  extv.gatedNav ? ok("ext-view: gateCapabilities injects the nav item from the fetched caps") : bad("ext-view: gateCapabilities injects the nav item from the fetched caps", "no ext-gated nav item after gateCapabilities");
   extv.navText === "Demo View" ? ok("ext-view: nav item injected with the provider label") : bad("ext-view: nav item injected with the provider label", `navText=${extv.navText}`);
   extv.known ? ok("ext-view: isKnownRoute accepts a live ext-<id> route") : bad("ext-view: isKnownRoute accepts a live ext-<id> route", "ext-demo not known");
   extv.onRoute ? ok("ext-view: navigate routes to /ext-<id>") : bad("ext-view: navigate routes to /ext-<id>", "wrong route");

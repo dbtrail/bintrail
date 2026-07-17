@@ -34,10 +34,12 @@ func (s *Server) consoleQueryContext(r *http.Request) (ext.ConsoleQueryContext, 
 
 // consoleFetch returns the cross-source fetch closure handed to an extension
 // view, pre-bound to a selected server's bundle. It re-attaches the console's
-// RBAC rules to every Options as defense-in-depth: the RBAC guard already
+// RBAC rules to every Options as defense-in-depth: the profile guard already
 // refuses the whole extension surface while a profile is active (see
 // rbacViewGuard), but if that ever regresses, a provider fetching through this
-// closure still gets a redacted result set rather than raw rows. The field type
+// closure still gets a redacted result set rather than raw rows. It also sets
+// ProfileActive so query_text/query_hash stay withheld under a NAMED zero-rule
+// profile (#699/#838) — the same signal the guard now keys on. The field type
 // on ext.ConsoleQueryContext.Fetch is an alias of this signature, so the
 // returned value assigns directly.
 func (s *Server) consoleFetch(b *bundle) func(ctx context.Context, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
@@ -50,15 +52,23 @@ func (s *Server) consoleFetch(b *bundle) func(ctx context.Context, opts query.Op
 }
 
 // rbacViewGuard wraps an extension view's data handler so it refuses with 403 —
-// BEFORE the provider handler runs — whenever an RBAC access-control profile is
-// active. The console cannot guarantee a third-party handler honors table-deny /
+// BEFORE the provider handler runs — whenever a profile is active. It keys on
+// s.profileActive (a NAMED profile was supplied, even one that resolved to zero
+// deny/redact rules — the #838 `--profile <typo>` state), NOT s.rbacActive()
+// (rule count > 0). That distinction matters because the seam hands the provider
+// a raw *sql.DB (ext.ConsoleQueryContext.DB): a handler could run
+// `SELECT query_text, query_hash FROM binlog_events` directly and return the
+// originating SQL literals a named profile is contracted to withhold (#699/#838)
+// — the console's own /api/events blanks those under EVERY named profile via
+// ProfileActive, so the raw-DB path must refuse under the same condition. The
+// console cannot guarantee a third-party handler honors table-deny /
 // column-redaction rules on its own queries, so it withholds the entire surface
-// under a profile rather than risk a leak (the same posture recover-cascade
+// under any profile rather than risk a leak (the same posture recover-cascade
 // takes). This is the enforcement backstop; the SPA also hides the nav item
 // because capabilities omit the view under a profile.
 func (s *Server) rbacViewGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.rbacActive() {
+		if s.profileActive {
 			writeJSONError(w, http.StatusForbidden,
 				"this view is unavailable while an access-control profile is active")
 			return
