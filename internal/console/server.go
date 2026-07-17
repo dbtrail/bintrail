@@ -124,6 +124,11 @@ type Config struct {
 	// daemon; zero on the standalone serve (which runs no rotation loop and
 	// hides the panel).
 	RotationDefaults RotationDefaults
+	// Version is the running build's version string ("0.36.0", or "dev" on
+	// unversioned builds), reported in /api/capabilities so the frontend can
+	// link release artifacts (the .mcpb bundle) matching the running binary.
+	// Optional; empty reads as an unversioned build.
+	Version string
 }
 
 // RotationDefaults is the daemon-side built-in-rotation policy, surfaced to the
@@ -164,7 +169,9 @@ type Server struct {
 	// rotationDefaults are the daemon's --rotate-* values, the fallback GET
 	// /api/rotation reports when no console override is saved.
 	rotationDefaults RotationDefaults
-	cm               *connManager
+	// version is the running build's version string (Config.Version).
+	version string
+	cm      *connManager
 	mux              http.Handler
 	// Password login: authPath is the credential file (re-read per login so a
 	// live `user set-password` applies without restart); passwordCfg is its
@@ -290,6 +297,7 @@ func New(cfg Config) (*Server, error) {
 		baselineCtrl:     cfg.BaselineCtrl,
 		verifyCtrl:       cfg.VerifyCtrl,
 		rotationDefaults: cfg.RotationDefaults,
+		version:          cfg.Version,
 		cm:               newConnManager(cfg.Registry, profileActive),
 		authPath:         authPath,
 		passwordCfg:      passwordCfg,

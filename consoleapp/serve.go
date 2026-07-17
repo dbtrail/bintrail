@@ -239,6 +239,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		TLSCert:       conTLSCert,
 		TLSKey:        conTLSKey,
 		AllowSetup:    conAllowSetup,
+		Version:       appVersion,
 		// MonitorCtrl is intentionally left nil: bintrail-console serve is the
 		// read-only standalone console. A write-capable control-plane daemon
 		// wires a supervisor here instead; with nil, /api/capabilities reports

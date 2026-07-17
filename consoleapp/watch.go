@@ -982,6 +982,7 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 			Enabled:   upRotationCfg.Enabled,
 		},
 		AllowSetup: opts.AllowSetup,
+		Version:    appVersion,
 		// MonitorCtrl (the control-plane supervisor) is wired by the caller —
 		// runUpStreamWithConsole / runUpConsoleOnly — because it needs the
 		// registry and the daemon lifecycle context, which this config builder

@@ -1326,6 +1326,13 @@ button { font-family: inherit; }
   align-self: flex-start; overflow-x: auto; max-width: 100%;
 }
 
+/* Connect AI client (#1041) */
+.cn-urlrow { display: flex; gap: 8px; align-items: center; margin: 4px 0 10px; }
+.cn-url { flex: 1; align-self: auto; white-space: nowrap; }
+.cn-links { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.cn-snippet { display: block; margin: 8px 0 10px; white-space: pre; }
+.cn-other .form-hint { margin-top: 8px; }
+
 /* ============================================================
    date/time picker (Since/Until/At filters)
    ============================================================ */

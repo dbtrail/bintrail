@@ -87,6 +87,15 @@ type capabilitiesResponse struct {
 	// per entry. Generic by construction — the core names no specific view.
 	ExtensionViews []extensionViewDTO `json:"extension_views,omitempty"`
 	Auth           authCapsInfo       `json:"auth"`
+	// MCP: the /mcp endpoint is usable — a static console token is configured
+	// (the endpoint's only accepted credential; see mcp.go). Process-global,
+	// like Monitor. The frontend's "Connect AI client" card keys its
+	// ready-vs-explain state on this instead of ever probing /mcp itself.
+	MCP bool `json:"mcp"`
+	// Version is the running build's version string ("0.36.0"; "dev" or empty
+	// on unversioned builds). Presentation-only: the Connect AI client card
+	// derives the release-asset download link for the RUNNING version from it.
+	Version string `json:"version,omitempty"`
 	// Source names the selected server's source database family — "postgresql"
 	// or "mysql" — derived per-server from stream_state.flavor (the same field
 	// DialectForIndex reads). It drives source-aware PRESENTATION only: the
@@ -141,6 +150,10 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// only by the RBAC profile (which would make synthesis leak redacted data).
 		RecoverCascade: !s.rbacActive(),
 		Auth:           authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
+		// The MCP endpoint accepts only the static token (mcp.go refuses with
+		// 403 when none is configured), so token presence IS the capability.
+		MCP:     s.token != "",
+		Version: s.version,
 		// Default until the bundle resolves: a degraded console renders MySQL
 		// vocabulary (the common case), never a blank source.
 		Source: sourceMySQL,

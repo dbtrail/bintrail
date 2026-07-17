@@ -34,6 +34,12 @@ var (
 	logFormat string
 )
 
+// appVersion is the bare -ldflags-injected version ("0.36.0", or "dev"),
+// captured by Main for surfaces that need it un-decorated — the console
+// reports it in /api/capabilities so the UI can link release artifacts for
+// the running build (rootCmd.Version carries the human-formatted variant).
+var appVersion = "dev"
+
 var rootCmd = &cobra.Command{
 	Use:   "bintrail-console",
 	Short: "Read-only web console over the Bintrail binlog index",
@@ -63,6 +69,7 @@ func init() {
 // external distributions embedding the console) are expected to pass their
 // -ldflags-injected version values and os.Exit with the result.
 func Main(version, commitSHA, buildDate string) int {
+	appVersion = version
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", version, commitSHA, buildDate)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

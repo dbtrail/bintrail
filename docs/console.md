@@ -680,6 +680,13 @@ Rules that differ from the standalone `bintrail-mcp` server:
 The host-header allowlist (`--allowed-hosts`) covers `/mcp` like every other
 route.
 
+The UI's **Settings → Connect AI** page assembles all of this for you: the
+ready-to-copy `/mcp` URL for the selected server (the per-server form when
+more than one server is registered), the `.mcpb` bundle download for the
+running version, and the raw-config fallback above. When no token is
+configured it explains how to set one instead — the token value itself is
+never displayed.
+
 ## API
 
 All endpoints return JSON. `/api/*` (except `healthz`) require

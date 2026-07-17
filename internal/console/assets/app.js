@@ -39,7 +39,7 @@ const EVENT_CSV_COLUMNS = [
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
-const ROUTES = ["overview", "events", "timetravel", "recover", "status", "storage"];
+const ROUTES = ["overview", "events", "timetravel", "recover", "status", "storage", "connect"];
 
 const MON_STATE_TITLES = {
   failed: "connection is failing and retrying automatically; press Start for details",
@@ -635,6 +635,7 @@ function renderRoute() {
     case "recover": return renderRecover(params);
     case "status": return renderStatus();
     case "storage": return renderStorage();
+    case "connect": return renderConnect();
     default: return renderOverview();
   }
 }
@@ -2405,6 +2406,155 @@ function updateSrvNote() {
   if (n) n.hidden = !(serversEmpty && capsCache.monitor);
 }
 
+// ── Connect AI client (#1041) ────────────────────────────────────────────────
+//
+// Settings view for wiring an MCP client (Claude Desktop, claude.ai custom
+// connectors, any Streamable-HTTP client) to this console's /mcp endpoint.
+// Availability comes from capabilities.mcp — a static token is configured,
+// the endpoint's only accepted credential — and the token VALUE is never
+// rendered anywhere in this view.
+
+async function renderConnect() {
+  const gen = serverGen;
+  viewLoading();
+  // The server list only picks between /mcp and /mcp/{id-or-name}; a failure
+  // (or the registry-only 404 on an empty console) degrades to the bare
+  // default-server URL instead of blanking the page.
+  let servers = [];
+  try { servers = (await api("/api/servers")).servers || []; } catch (_) {}
+  if (gen !== serverGen) return;
+  try {
+    buildConnect(servers);
+  } catch (err) {
+    const v = VIEW(); clear(v); v.append(pageHead("Connect AI", null)); renderError(v, err);
+  }
+}
+
+// mcpSelector maps a server entry to its /mcp/{id-or-name} path selector: the
+// registry display name when set (readable), the id otherwise, and the
+// reserved "default" selector for the ephemeral boot (cli) entry.
+function mcpSelector(entry) {
+  if (!entry) return "";
+  if (entry.kind === "ephemeral") return "default";
+  return entry.name || entry.id || "";
+}
+
+// mcpURL builds the ready-to-copy endpoint URL from the BROWSER's origin, so
+// it is correct behind a reverse proxy for the common case. With one listed
+// server the bare /mcp (the console's default server) is enough; with several,
+// the per-server form pins the server currently selected in the sidebar.
+function mcpURL(servers) {
+  let path = "/mcp";
+  if ((servers || []).length > 1) {
+    const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
+    const sel = mcpSelector(cur);
+    if (sel) path += "/" + encodeURIComponent(sel);
+  }
+  return location.origin + path;
+}
+
+function copyText(text, what) {
+  navigator.clipboard.writeText(text).then(() => toast(what + " copied to clipboard"), () => toast("Copy failed."));
+}
+
+function buildConnect(servers) {
+  const v = VIEW(); clear(v);
+  const sub = el("p", { class: "page-sub" },
+    "Let an AI assistant query this console — the same read-only tools and result caps as this UI. ",
+    el("b", { text: "Your token is never shown here." }));
+  v.append(pageHead("Connect AI", sub));
+
+  const cards = el("div", { class: "cards" });
+  cards.append(mcpEndpointCard(servers));
+  cards.append(bundleCard());
+  v.append(cards);
+  if (capsCache.mcp) v.append(otherClientsPanel(servers));
+  viewEnter();
+}
+
+// mcpEndpointCard: the ready-to-copy URL when the endpoint is usable, or the
+// how-to-enable explanation when no token is configured (capabilities.mcp) —
+// never a URL presented as ready that would only ever answer 403.
+function mcpEndpointCard(servers) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "MCP endpoint" }));
+  if (!capsCache.mcp) {
+    card.append(el("p", { class: "stg-hint", text:
+      "MCP is not available: this console has no access token configured. The MCP endpoint authenticates with the console's static token — password login is a browser credential and cannot be used by an MCP client." }));
+    card.append(el("p", { class: "form-hint", text:
+      "To enable it, start the console with --token (or the BINTRAIL_CONSOLE_TOKEN environment variable; TOKEN in the compose stack) and reload this page." }));
+    return card;
+  }
+  const url = mcpURL(servers);
+  card.append(el("div", { class: "cn-urlrow" },
+    el("code", { class: "stg-code cn-url", text: url }),
+    el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(url, "MCP URL") })));
+  if ((servers || []).length > 1) {
+    card.append(el("p", { class: "form-hint", text:
+      "This URL targets the server selected in the sidebar; the bare /mcp targets the console's default server. Switch servers to get each one's URL." }));
+  }
+  card.append(el("p", { class: "form-hint", text:
+    "The credential is the console access token, sent as an Authorization: Bearer header — the same value set with --token / BINTRAIL_CONSOLE_TOKEN. It is never displayed here." }));
+  return card;
+}
+
+// bundleCard links the .mcpb bundle (one-click Claude Desktop install) for the
+// RUNNING version. Best-effort: a release that predates the bundle artifact
+// 404s the direct link, so a releases-page path is always offered too.
+function bundleCard() {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Claude Desktop bundle" }));
+  const ver = String(capsCache.version || "").replace(/^v/, "");
+  const released = /^\d+\.\d+\.\d+$/.test(ver);
+  card.append(el("p", { class: "stg-hint", text:
+    "Install the bundle in Claude Desktop (double-click), then paste the URL above and your console token — no config files to edit." }));
+  if (released) {
+    const asset = "dbtrail-" + guessPlatform() + ".mcpb";
+    card.append(el("div", { class: "cn-links" },
+      el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/download/v" + ver + "/" + asset, text: "Download " + asset }),
+      el("a", { class: "btn btn-sm btn-ghost", href: "https://github.com/dbtrail/dbtrail/releases/tag/v" + ver, target: "_blank", rel: "noopener", text: "All downloads for v" + ver })));
+    card.append(el("p", { class: "form-hint", text:
+      "The link matches this console's version (v" + ver + "). Older releases don't carry the bundle — if the download 404s, pick a newer release from the releases page." }));
+  } else {
+    card.append(el("div", { class: "cn-links" },
+      el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases", target: "_blank", rel: "noopener", text: "Open the releases page" })));
+    card.append(el("p", { class: "form-hint", text:
+      "This console is an unversioned build, so no exact bundle link can be derived — pick the bundle matching your platform from the latest release." }));
+  }
+  return card;
+}
+
+// guessPlatform maps the browser's environment to a release-artifact os-arch
+// pair. Best-effort presentation only (Apple Silicon is assumed on macOS); the
+// all-downloads link covers every other combination.
+function guessPlatform() {
+  const ua = navigator.userAgent || "";
+  if (/Windows/i.test(ua)) return "windows-amd64";
+  if (/Mac/i.test(ua)) return "darwin-arm64";
+  return "linux-amd64";
+}
+
+// otherClientsPanel: collapsed raw-config fallback for MCP clients that don't
+// install .mcpb bundles. The snippet carries a PLACEHOLDER for the token — the
+// real value is never rendered.
+function otherClientsPanel(servers) {
+  const url = mcpURL(servers);
+  const snippet = JSON.stringify({
+    mcpServers: {
+      dbtrail: { command: "bintrail-mcp", args: ["--connect", url, "--token", "YOUR_CONSOLE_TOKEN"] },
+    },
+  }, null, 2);
+  const panel = el("section", { class: "ov-panel cn-other", style: "margin-top:18px" });
+  const adv = el("details", { class: "form-advanced", style: "margin-top:0" },
+    el("summary", { class: "form-adv-summary", text: "Other clients (raw config)" }));
+  adv.append(el("p", { class: "form-hint", text:
+    "For claude_desktop_config.json — or any client that launches stdio MCP servers — bintrail-mcp bridges stdio to this console. Replace the placeholder with your console token:" }));
+  adv.append(el("pre", { class: "stg-code cn-snippet", text: snippet }));
+  adv.append(el("button", { class: "btn btn-sm", type: "button", text: "Copy snippet", onclick: () => copyText(snippet, "Config snippet") }));
+  adv.append(el("p", { class: "form-hint", text:
+    "If this console is reachable over public HTTPS, the same URL also works directly as a claude.ai custom connector — no bridge needed." }));
+  panel.append(adv);
+  return panel;
+}
+
 // ── capabilities gating ────────────────────────────────────────────────────
 
 async function gateCapabilities() {
@@ -3040,6 +3190,7 @@ function cmdkCommands() {
   ];
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Storage", run: () => navigate("storage") });
+  cmds.push({ group: "Navigate", label: "Connect AI", run: () => navigate("connect") });
   cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });
   if (capsCache.monitor) cmds.push({ group: "Actions", label: "Configure rotation…", run: () => { closeCmdk(); showRotationDialog(); } });
   if (capsCache.auth) {

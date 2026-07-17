@@ -1,6 +1,7 @@
 package console
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -145,6 +146,54 @@ func TestMCP_hiddenBootStillBacksDefault(t *testing.T) {
 	// selectable server anywhere else in the console either.
 	if rec := doMCP(t, s, "/mcp/default", "t"); rec.Code != 404 {
 		t.Fatalf("hidden-boot /mcp/default = %d, want 404", rec.Code)
+	}
+}
+
+// TestMCP_capabilityGatedOnToken: /api/capabilities advertises mcp iff a
+// static token is configured (the endpoint's only accepted credential — the
+// same condition mcpHandler refuses on), plus the running build version the
+// Connect AI card derives release links from.
+func TestMCP_capabilityGatedOnToken(t *testing.T) {
+	db, _, closer := newSQLMock(t)
+	defer closer()
+
+	caps := func(s *Server) capabilitiesResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.handleCapabilities(rec, httptest.NewRequest("GET", "/api/capabilities", nil))
+		if rec.Code != 200 {
+			t.Fatalf("capabilities = %d, want 200; body: %s", rec.Code, rec.Body.String())
+		}
+		var resp capabilitiesResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// Token configured: mcp advertised, version passed through.
+	s := newBootServer(db) // token "t"
+	s.version = "1.2.3"
+	got := caps(s)
+	if !got.MCP {
+		t.Error("mcp = false with a configured token, want true")
+	}
+	if got.Version != "1.2.3" {
+		t.Errorf("version = %q, want %q", got.Version, "1.2.3")
+	}
+
+	// Password-only / no-auth posture (no static token): mcp must be false —
+	// mcpHandler refuses every request there (TestMCP_requiresConfiguredToken),
+	// so advertising it would point the card at a dead endpoint.
+	s2 := &Server{token: "", cm: newConnManager(nil, false)}
+	s2.cm.boot = &bundle{db: db, engine: query.New(db), noArchive: true}
+	s2.mux = s2.buildHandler()
+	got2 := caps(s2)
+	if got2.MCP {
+		t.Error("mcp = true with no token configured, want false")
+	}
+	if got2.Version != "" {
+		t.Errorf("version = %q, want empty for an unversioned build", got2.Version)
 	}
 }
 
